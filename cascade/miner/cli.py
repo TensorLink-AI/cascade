@@ -87,7 +87,8 @@
 
 * ``cascade mine`` — the one-click optimisation loop (``optimize.py``):
   propose a variant of the best generator (``tune``: perturb config.json
-  weights; ``agent``: a coding agent edits the code), ``verify`` it, ``score``
+  weights; ``agent``: a coding agent edits the code; ``cmd``: your own
+  strategy command), ``verify`` it, ``score``
   it on one fixed pool/seed/init, keep it if better, repeat. Never submits
   unless ``--auto-submit`` AND the best beats the reference king by
   ``--submit-margin``. ``cascade mine-ui`` is the web front end for it.
@@ -1327,9 +1328,16 @@ def _add_mine(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--king", type=Path, default=None,
                    help="Reference king to score once on the same pool/seeds/init "
                         "(default: champions/king if present; 'none' to skip).")
-    p.add_argument("--proposer", choices=("tune", "agent"), default="tune",
+    p.add_argument("--proposer", choices=("tune", "agent", "cmd"), default="tune",
                    help="tune = perturb config.json weights/floats (no LLM); agent = a "
-                        "coding agent edits the code with the cascade-mine skill.")
+                        "coding agent edits the code with the cascade-mine skill; cmd = "
+                        "your own strategy (--propose-cmd).")
+    p.add_argument("--propose-cmd", default="",
+                   help="Your strategy for --proposer cmd: any command, run in the candidate "
+                        "dir (a copy of the best) with a JSON context on stdin and "
+                        "CASCADE_* env vars; it edits the files in place and exits 0. "
+                        "See docs/MINER_DOCKER.md.")
+    p.add_argument("--propose-timeout", type=float, default=1800.0)
     p.add_argument("--agent-cmd", default=DEFAULT_AGENT_CMD,
                    help="Agent command; gets the prompt on stdin, runs in the candidate dir "
                         "({dir} is substituted). Default: %(default)s")
@@ -1393,11 +1401,17 @@ def _cmd_mine(args: argparse.Namespace) -> int:
         pool_dir=args.pool_dir, pool_ref=args.pool_ref, train_hours=args.train_hours,
         n_windows=args.n_windows, device=args.device, warm_start=args.warm_start,
         agent_cmd=args.agent_cmd, agent_timeout=args.agent_timeout,
+        propose_cmd=args.propose_cmd, propose_timeout=args.propose_timeout,
         auto_submit=args.auto_submit, submit_margin=args.submit_margin, intake=args.intake,
         wallet_name=args.wallet_name, wallet_hotkey=args.wallet_hotkey, label=args.label,
     )
     try:
-        state = OptimizationLoop(lc, chain_cfg=cfg).run()
+        loop = OptimizationLoop(lc, chain_cfg=cfg)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    try:
+        state = loop.run()
     except Exception as e:  # noqa: BLE001
         print(f"mine failed: {type(e).__name__}: {e}", file=sys.stderr)
         return 1

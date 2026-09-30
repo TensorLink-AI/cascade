@@ -10,8 +10,9 @@ synthetic data generators that train it. Better data trains a better
 forecaster, and that is measured every round on private real-world windows.
 
 - Miners: [docs/MINER.md](docs/MINER.md) (five-command version:
-  [docs/MINER_FUNDED_QUICKSTART.md](docs/MINER_FUNDED_QUICKSTART.md); one-click
-  optimisation loop + UI + Docker image: [docs/ONE_CLICK_MINING.md](docs/ONE_CLICK_MINING.md))
+  [docs/MINER_FUNDED_QUICKSTART.md](docs/MINER_FUNDED_QUICKSTART.md); miner Docker
+  image + bring-your-own-strategy loop: [docs/MINER_DOCKER.md](docs/MINER_DOCKER.md); one-click
+  UI on top: [docs/ONE_CLICK_MINING.md](docs/ONE_CLICK_MINING.md))
 - Validators: [docs/VALIDATOR.md](docs/VALIDATOR.md)
 - Design: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), decisions in `decisions/`
 

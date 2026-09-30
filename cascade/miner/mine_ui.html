@@ -98,7 +98,12 @@ details summary { cursor: pointer; color: var(--muted); font-size: 13px; margin-
       <select id="proposer">
         <option value="tune">tune: config weights (no LLM)</option>
         <option value="agent">agent: Claude Code edits code</option>
+        <option value="cmd">cmd: my own strategy</option>
       </select>
+      <div id="cmdRow" hidden>
+        <label for="propose_cmd">Strategy command (runs in each candidate dir)</label>
+        <input id="propose_cmd" placeholder="python /work/my_strategy.py">
+      </div>
       <div class="row">
         <div><label for="iterations">Iterations</label><input id="iterations" type="number" min="1" value="20"></div>
         <div><label for="train_hours">Hours / candidate</label><input id="train_hours" type="number" step="0.05" min="0.01" value="0.25"></div>
@@ -182,7 +187,7 @@ const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<
 const dur = (s) => !s ? "" : s < 90 ? `${Math.round(s)}s` : s < 5400 ? `${Math.round(s / 60)}m` : `${(s / 3600).toFixed(1)}h`;
 
 // Remember form values per browser (a convenience; nothing here is a secret).
-const FIELDS = ["proposer", "iterations", "train_hours", "seeds", "device", "pool_dir", "start", "king",
+const FIELDS = ["propose_cmd", "proposer", "iterations", "train_hours", "seeds", "device", "pool_dir", "start", "king",
   "min_improvement", "n_windows", "intake", "wallet_name", "wallet_hotkey", "label"];
 try { const saved = JSON.parse(localStorage.getItem("cascade-mine") || "{}");
   for (const f of FIELDS) if (saved[f] != null) $(f).value = saved[f];
@@ -193,10 +198,13 @@ const saveForm = () => { try { const o = { live: $("live").checked };
 $("startBtn").onclick = async () => {
   saveForm();
   const b = {};
-  for (const f of ["proposer", "iterations", "train_hours", "seeds", "device", "pool_dir", "start", "king", "min_improvement", "n_windows"]) b[f] = $(f).value.trim();
+  for (const f of ["proposer", "propose_cmd", "iterations", "train_hours", "seeds", "device", "pool_dir", "start", "king", "min_improvement", "n_windows"]) b[f] = $(f).value.trim();
+  if (b.proposer !== "cmd") delete b.propose_cmd;
   if ($("live").checked) b.warm_start = "live";
   try { await api("/api/start", b); refresh(); } catch (e) { alert("start failed: " + e.message); }
 };
+const syncCmd = () => { $("cmdRow").hidden = $("proposer").value !== "cmd"; };
+$("proposer").onchange = syncCmd; syncCmd();
 $("stopBtn").onclick = () => api("/api/stop", {}).then(refresh).catch((e) => alert(e.message));
 $("killBtn").onclick = () => confirm("Kill the loop now? The current candidate is lost.") &&
   api("/api/stop", { force: true }).then(refresh).catch((e) => alert(e.message));

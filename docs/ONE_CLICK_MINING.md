@@ -9,7 +9,7 @@ can submit. It ships in three wrappers:
 |---|---|
 | `cascade mine` | the loop, headless (`cascade/miner/optimize.py`) |
 | `cascade mine-ui` | a local web UI: Start / Stop, live chart, candidate table, confirmed Submit (`cascade/miner/ui.py`) |
-| `deploy/miner.Dockerfile` | everything above plus pinned torch, the generator-runtime pins and Claude Code, in one image |
+| `deploy/miner.Dockerfile --target oneclick` | the [miner toolbox image](MINER_DOCKER.md) plus Claude Code and the skill, starting the UI |
 | `.claude/skills/cascade-mine` | the agent skill: drive the loop (driver mode) or be one proposal step inside it (proposer mode) |
 
 This is miner-side tooling only. It touches no consensus, contract or
@@ -17,13 +17,17 @@ validator path.
 
 ## Quick start (Docker, the "one click")
 
+The one-click image is the [toolbox image](MINER_DOCKER.md) with Claude Code,
+the skill and the UI added on top. Everything in MINER_DOCKER.md, including
+plugging in your own strategy, works here too.
+
 ```bash
-docker build -f deploy/miner.Dockerfile -t cascade-miner .
 docker run --gpus all -p 8765:8765 \
     -v "$PWD/mine:/work" \
     -v ~/.bittensor/wallets:/root/.bittensor/wallets:ro \
     -e LIUM_API_KEY -e ANTHROPIC_API_KEY \
-    cascade-miner
+    ghcr.io/tensorlink-ai/cascade-miner:oneclick
+# or build it: docker build -f deploy/miner.Dockerfile --target oneclick -t cascade-miner:oneclick .
 ```
 
 Open the `http://localhost:8765/?token=…` URL it prints and press **Start
@@ -38,7 +42,7 @@ container. Every key is optional:
 | wallet mount | **Submit** (signs the commit + intake request) |
 | `-v …/pool:/pool` | scoring on your own held-out data (`/pool` in the form) |
 
-Headless, same image: `docker run --gpus all -v "$PWD/mine:/work" cascade-miner mine --iterations 30 --warm-start live`.
+Headless, same image: `docker run --gpus all -v "$PWD/mine:/work" ghcr.io/tensorlink-ai/cascade-miner:oneclick mine --iterations 30 --warm-start live`.
 
 ## Without Docker
 
@@ -62,6 +66,9 @@ cascade mine --workdir ./mine-run --iterations 20 --warm-start live --pool-dir .
      change and writes a one-line note. Edits are confined to the
      candidate dir, and the only shell command allowed is
      `cascade verify`. Swap it with `--agent-cmd`.
+   - `cmd` runs your own strategy command; the contract is in
+     [MINER_DOCKER.md](MINER_DOCKER.md#plug-in-your-own-strategy). The UI
+     offers it as "cmd: my own strategy".
 2. **Verify.** The trainer's checks: layout, import guard, packed
    sources, hash-locked deps, determinism. A would-be-rejected candidate is
    recorded `rejected` and never scored.

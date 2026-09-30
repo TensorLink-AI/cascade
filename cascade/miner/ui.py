@@ -57,7 +57,7 @@ _START_FLAGS = {
     "train_hours": "--train-hours", "n_windows": "--n-windows", "device": "--device",
     "pool_dir": "--pool-dir", "pool_ref": "--pool", "warm_start": "--warm-start",
     "min_improvement": "--min-improvement", "start": "--start", "king": "--king",
-    "agent_cmd": "--agent-cmd",
+    "agent_cmd": "--agent-cmd", "propose_cmd": "--propose-cmd",
 }
 
 _PATH_KEYS = {"pool_dir", "start", "king"}
@@ -85,10 +85,9 @@ def _pid_alive(pid: object) -> bool:
 
 def _environment() -> dict:
     """What the miner has wired up — presence only, never values."""
-    gpu = False
-    with contextlib.suppress(Exception):
-        import torch
-        gpu = bool(torch.cuda.is_available())
+    # Device nodes, not `import torch`: the UI must answer in milliseconds and
+    # never pay a multi-second torch import on a status poll.
+    gpu = Path("/dev/nvidiactl").exists() or shutil.which("nvidia-smi") is not None
     wallets = Path(os.environ.get("BT_WALLET_PATH", Path.home() / ".bittensor" / "wallets"))
     names = sorted(p.name for p in wallets.iterdir() if p.is_dir()) if wallets.is_dir() else []
     return {
@@ -156,7 +155,7 @@ class MineUI:
                 v = body.get(key)
                 if v is None or v == "" or isinstance(v, dict | list):
                     continue
-                if key == "proposer" and v not in ("tune", "agent"):
+                if key == "proposer" and v not in ("tune", "agent", "cmd"):
                     return 400, {"error": f"bad proposer {v!r}"}
                 if key in _PATH_KEYS and str(v).lower() != "none":
                     # The child runs with cwd=workdir; anchor paths to where the UI runs.

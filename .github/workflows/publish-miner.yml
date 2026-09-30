@@ -1,0 +1,106 @@
+name: Publish cascade-miner image
+
+# Builds the miner image (deploy/miner.Dockerfile) and publishes both targets to
+# GHCR under this repo's org, so a miner can `docker pull` instead of building:
+#
+#   ghcr.io/<owner>/cascade-miner:<tag>            toolbox (the miner CLI, any strategy)
+#   ghcr.io/<owner>/cascade-miner:<tag>-oneclick   toolbox + Claude Code + UI default
+#
+# plus `latest` / `oneclick` on a release tag. Miner-side only: nothing
+# downstream pins this image, and it is not part of the training contract (that
+# is cascade-worker, publish-worker.yml).
+#
+# Trigger by pushing a tag like `miner-v0.1.0`, or run manually.
+
+on:
+  push:
+    tags:
+      - "miner-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag to apply (e.g. v0.1.0). The immutable sha- tag is always applied."
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write        # required to push to GHCR with GITHUB_TOKEN
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: toolbox
+            suffix: ""
+            floating: latest
+          - target: oneclick
+            suffix: "-oneclick"
+            floating: oneclick
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # The CUDA torch stack does not fit the runner's default free disk.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata (tags/labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/cascade-miner
+          flavor: |
+            latest=false
+            suffix=${{ matrix.suffix }},onlatest=false
+          tags: |
+            type=ref,event=tag
+            type=sha,prefix=sha-,format=short
+            type=raw,value=${{ inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.tag != '' }}
+            type=raw,value=${{ matrix.floating }},suffix=,enable=${{ startsWith(github.ref, 'refs/tags/miner-v') }}
+
+      - name: Build & push ${{ matrix.target }} (linux/amd64)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/miner.Dockerfile
+          target: ${{ matrix.target }}
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+
+      - name: Smoke test
+        run: |
+          img="$(echo '${{ steps.meta.outputs.tags }}' | head -n1)"
+          docker run --rm "$img" help | head -3
+          docker run --rm "$img" verify /opt/cascade/scripts/example_generator
+
+      - name: Report
+        run: |
+          {
+            echo "### cascade-miner (${{ matrix.target }}) published to GHCR"
+            echo ""
+            echo "**Digest:** \`${{ steps.build.outputs.digest }}\`"
+            echo ""
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

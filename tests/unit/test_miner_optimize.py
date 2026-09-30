@@ -374,3 +374,72 @@ def test_ui_stop_writes_stop_file(ui_server):
     app, base = ui_server
     assert _req(base + "/api/stop", body={})[0] == 200
     assert (app.workdir / opt.STOP_FILE).exists()
+
+
+# -- cmd proposer (bring-your-own strategy) ------------------------------------ #
+
+def test_cmd_proposer_contract_stdin_env_and_note(tmp_path):
+    script = tmp_path / "strategy.py"
+    script.write_text(
+        "import json, os, sys, pathlib\n"
+        "ctx = json.load(sys.stdin)\n"
+        "assert pathlib.Path.cwd() == pathlib.Path(os.environ['CASCADE_CANDIDATE_DIR'])\n"
+        "assert ctx['candidate_dir'] == os.environ['CASCADE_CANDIDATE_DIR']\n"
+        "assert int(os.environ['CASCADE_ITERATION']) == ctx['iteration']\n"
+        "assert float(os.environ['CASCADE_BEST_SCORE']) == ctx['best']['score']\n"
+        "assert ctx['king']['status'] == 'king' and os.environ['CASCADE_KING_SCORE']\n"
+        "assert pathlib.Path(os.environ['CASCADE_HISTORY']).is_file()\n"
+        "assert len(ctx['history']) >= 2\n"
+        "cfg = json.loads(pathlib.Path('config.json').read_text())\n"
+        "cfg['weights']['a'] += 0.5\n"
+        "pathlib.Path('config.json').write_text(json.dumps(cfg))\n"
+        "pathlib.Path(os.environ['CASCADE_NOTE_FILE']).write_text('a += 0.5')\n"
+    )
+    loop = _loop(tmp_path, iterations=2, proposer="cmd",
+                 propose_cmd=f"{sys.executable} {script}")
+    loop.proposer = opt.CommandProposer(loop.cfg, loop)
+    loop.run()
+    hist = opt.read_history(tmp_path / "run")
+    assert [h["note"] for h in hist[2:]] == ["cmd: a += 0.5"] * 2
+    assert all(h["accepted"] for h in hist[2:])
+    assert not (Path(hist[-1]["dir"]) / opt.AGENT_NOTE).exists()
+
+
+def test_cmd_proposer_falls_back_to_last_stdout_line(tmp_path):
+    script = tmp_path / "s.py"
+    script.write_text(
+        "import json, pathlib\n"
+        "c = json.loads(pathlib.Path('config.json').read_text()); c['weights']['a'] *= 2\n"
+        "pathlib.Path('config.json').write_text(json.dumps(c))\n"
+        "print('thinking...'); print('doubled a'); print()\n")
+    loop = _loop(tmp_path, iterations=1, proposer="cmd",
+                 propose_cmd=f"{sys.executable} {{dir}}/../../../s.py")
+    loop.proposer = opt.CommandProposer(loop.cfg, loop)
+    loop.run()
+    assert opt.read_history(tmp_path / "run")[-1]["note"] == "cmd: doubled a"
+
+
+def test_cmd_proposer_requires_a_command(tmp_path):
+    cfg = opt.LoopConfig(workdir=tmp_path / "run", start_dir=EXAMPLE, proposer="cmd")
+    with pytest.raises(ValueError, match="--propose-cmd"):
+        opt.OptimizationLoop(cfg, score_fn=_score_by_weight, verify_fn=lambda d: (True, ""))
+
+
+def test_example_strategy_coordinate_search(tmp_path):
+    """scripts/example_strategy.py through the real cmd proposer: walks one
+    family at a time, never repeats a move from the same parent, and pushes a
+    winning move again."""
+    strat = REPO / "scripts" / "example_strategy.py"
+    loop = _loop(tmp_path, iterations=6, proposer="cmd",
+                 propose_cmd=f"{sys.executable} {strat}")
+    loop.proposer = opt.CommandProposer(loop.cfg, loop)
+    loop.run()
+    hist = opt.read_history(tmp_path / "run")
+    moves = [h for h in hist[2:]]
+    assert all(h["status"] == "scored" for h in moves), [h["detail"] for h in moves]
+    assert moves[0]["note"] == "cmd: weights.a x2" and moves[0]["accepted"]
+    assert moves[1]["note"] == "cmd: weights.a x2"                 # pushes the winner
+    pairs = [(h["parent"], h["note"]) for h in moves]
+    assert len(pairs) == len(set(pairs))                            # never repeats
+    cfg = json.loads((tmp_path / "run" / "best" / "config.json").read_text())
+    assert sum(cfg["weights"].values()) == pytest.approx(1.0)

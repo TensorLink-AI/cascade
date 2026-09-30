@@ -3,10 +3,11 @@
 A local hill-climb over generator variants. Every iteration:
 
 1. **propose** — copy the current best into ``candidates/NNNN/`` and mutate it,
-   either with the built-in ``tune`` proposer (perturbs ``config.json`` mixture
-   weights and float knobs; no LLM, no network) or the ``agent`` proposer (runs
+   with the built-in ``tune`` proposer (perturbs ``config.json`` mixture
+   weights and float knobs; no LLM, no network), the ``agent`` proposer (runs
    a coding agent — Claude Code by default — in the candidate dir with the
-   ``cascade-mine`` skill and the loop's history as context);
+   ``cascade-mine`` skill and the loop's history as context), or ``cmd`` —
+   YOUR strategy, any executable (see :class:`CommandProposer`);
 2. **verify** — the same checks the trainer runs (layout, import guard,
    hash-locked deps, determinism); a candidate that would be rejected on chain
    is never scored;
@@ -97,6 +98,9 @@ class LoopConfig:
     tune_max_keys: int = 3
     # agent proposer
     agent_cmd: str = DEFAULT_AGENT_CMD
+    # cmd proposer (your own strategy; see CommandProposer)
+    propose_cmd: str = ""
+    propose_timeout: float = 1800.0
     agent_timeout: float = 1800.0
     # submission (never implicit)
     auto_submit: bool = False
@@ -324,32 +328,94 @@ Rules:
 """
 
 
-class AgentProposer:
-    name = "agent"
+class CommandProposer:
+    """Bring-your-own strategy: any executable edits the candidate in place.
 
-    def __init__(self, cfg: LoopConfig, loop: OptimizationLoop) -> None:
+    The command (``--propose-cmd``, shlex-split, never run through a shell) runs
+    with ``cwd`` = the candidate dir, which already holds a copy of the current
+    best. It gets:
+
+    * **stdin**: a JSON context document ``{iteration, candidate_dir, workdir,
+      history, best, king}``. ``history`` is every record so far, the same
+      rows as ``history.jsonl``.
+    * **env**: ``CASCADE_CANDIDATE_DIR``, ``CASCADE_ITERATION``,
+      ``CASCADE_WORKDIR``, ``CASCADE_HISTORY`` (path to ``history.jsonl``),
+      ``CASCADE_NOTE_FILE``, ``CASCADE_BEST_SCORE``, ``CASCADE_KING_SCORE``.
+    * ``{dir}`` in the command line is replaced with the candidate dir.
+
+    It edits files in place, may write a one-line description to
+    ``$CASCADE_NOTE_FILE`` (else the last line it prints is used), and exits 0.
+    A non-zero exit is recorded as an ``error`` candidate, never scored. The loop
+    then verifies, scores and accepts exactly as for the built-in proposers, so a
+    strategy only has to answer "what should I try next?".
+    """
+
+    name = "cmd"
+    label = "cmd"
+
+    def __init__(self, cfg: LoopConfig, loop: OptimizationLoop, command: str | None = None,
+                 timeout: float | None = None) -> None:
         self.cfg = cfg
         self.loop = loop
+        self.command = command if command is not None else cfg.propose_cmd
+        self.timeout = timeout if timeout is not None else cfg.propose_timeout
+        if not self.command.strip():
+            raise ValueError("--proposer cmd needs --propose-cmd (your strategy command)")
+
+    def stdin_for(self, cand_dir: Path, iteration: int, history: list[dict]) -> str:
+        return json.dumps({
+            "iteration": iteration, "candidate_dir": str(cand_dir),
+            "workdir": str(self.loop.workdir), "history": history,
+            "best": self.loop.best_record(), "king": self.loop.king_record(),
+        })
 
     def propose(self, cand_dir: Path, iteration: int, history: list[dict]) -> str:
         note_path = cand_dir / AGENT_NOTE
-        prompt = agent_prompt(cand_dir, note_path, history, self.loop.best_record(),
-                              self.loop.king_record())
-        argv = [a.replace("{dir}", str(cand_dir)) for a in shlex.split(self.cfg.agent_cmd)]
-        log.info("agent: %s (cwd=%s)", " ".join(argv), cand_dir)
-        agent_log = cand_dir.parent / f"{cand_dir.name}.agent.log"
-        with open(agent_log, "w", encoding="utf-8") as out:
+        stdin = self.stdin_for(cand_dir, iteration, history)
+        argv = [a.replace("{dir}", str(cand_dir)) for a in shlex.split(self.command)]
+        best, king = self.loop.best_record(), self.loop.king_record()
+        env = {
+            **os.environ,
+            "CASCADE_CANDIDATE_DIR": str(cand_dir), "CASCADE_ITERATION": str(iteration),
+            "CASCADE_WORKDIR": str(self.loop.workdir),
+            "CASCADE_HISTORY": str(self.loop.workdir / HISTORY_FILE),
+            "CASCADE_NOTE_FILE": str(note_path),
+            "CASCADE_BEST_SCORE": "" if not best else repr(best["score"]),
+            "CASCADE_KING_SCORE": "" if not king or king.get("score") is None
+            else repr(king["score"]),
+        }
+        log.info("%s: %s (cwd=%s)", self.label, " ".join(argv), cand_dir)
+        out_log = cand_dir.parent / f"{cand_dir.name}.{self.label}.log"
+        with open(out_log, "w", encoding="utf-8") as out:
             proc = subprocess.run(
-                argv, input=prompt, text=True, cwd=cand_dir, stdout=out,
-                stderr=subprocess.STDOUT, timeout=self.cfg.agent_timeout, check=False,
+                argv, input=stdin, text=True, cwd=cand_dir, stdout=out, env=env,
+                stderr=subprocess.STDOUT, timeout=self.timeout, check=False,
             )
         note = ""
         if note_path.is_file():
             note = note_path.read_text(encoding="utf-8").strip()
             os.replace(note_path, cand_dir.parent / f"{cand_dir.name}.note.md")
         if proc.returncode != 0:
-            raise RuntimeError(f"agent exited {proc.returncode} (see {agent_log})")
-        return "agent: " + (note.splitlines()[0] if note else "(no note written)")
+            raise RuntimeError(f"{self.label} exited {proc.returncode} (see {out_log})")
+        if not note:
+            lines = [ln.strip() for ln in out_log.read_text(encoding="utf-8").splitlines()]
+            note = next((ln for ln in reversed(lines) if ln), "")
+        return f"{self.label}: " + (note.splitlines()[0][:300] if note else "(no note written)")
+
+
+class AgentProposer(CommandProposer):
+    """The coding-agent preset of :class:`CommandProposer`: same contract, but
+    stdin is a natural-language prompt (the cascade-mine skill, proposer mode)."""
+
+    name = "agent"
+    label = "agent"
+
+    def __init__(self, cfg: LoopConfig, loop: OptimizationLoop) -> None:
+        super().__init__(cfg, loop, command=cfg.agent_cmd, timeout=cfg.agent_timeout)
+
+    def stdin_for(self, cand_dir: Path, iteration: int, history: list[dict]) -> str:
+        return agent_prompt(cand_dir, cand_dir / AGENT_NOTE, history,
+                            self.loop.best_record(), self.loop.king_record())
 
 
 # --------------------------------------------------------------------------- #
@@ -384,10 +450,12 @@ class OptimizationLoop:
             self.proposer = proposer
         elif cfg.proposer == "agent":
             self.proposer = AgentProposer(cfg, self)
+        elif cfg.proposer == "cmd":
+            self.proposer = CommandProposer(cfg, self)
         elif cfg.proposer == "tune":
             self.proposer = TuneProposer(cfg, run_seed=int(time.time()))
         else:
-            raise ValueError(f"unknown proposer {cfg.proposer!r} (tune | agent)")
+            raise ValueError(f"unknown proposer {cfg.proposer!r} (tune | agent | cmd)")
         self.history: list[dict] = read_history(self.workdir)
         self._warm_dir: Path | None = None
         self._init_label = "random init"

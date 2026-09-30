@@ -56,6 +56,8 @@ cascade verify ./champions/king                    # the env can import the king
 cascade mine --workdir ./mine-run --proposer tune --iterations 20 \
     --train-hours 0.25 --warm-start live --pool-dir <held-out .npy dir>
 # or: --proposer agent (each step invokes Claude Code in proposer mode)
+# or: --proposer cmd --propose-cmd "python my_strategy.py" (the person's own strategy;
+#     contract in docs/MINER_DOCKER.md, example scripts/example_strategy.py)
 cascade mine-ui --workdir ./mine-run               # watch it in a browser
 ```
 
@@ -93,4 +95,6 @@ the person asked for unattended submission.
 - Loop: `cascade/miner/optimize.py`; UI: `cascade/miner/ui.py`; docs:
   `docs/ONE_CLICK_MINING.md`.
 - Scoring internals: `cascade/miner/score.py` (same train → eval path as the heat).
-- Docker image: `deploy/miner.Dockerfile` (UI on :8765, workdir `/work`).
+- Docker image: `deploy/miner.Dockerfile`; the `toolbox` target (default) is
+  the CLI (docs/MINER_DOCKER.md), and `oneclick` adds Claude Code plus the
+  UI on :8765. Workdir `/work` in both.
