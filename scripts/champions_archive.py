@@ -77,6 +77,73 @@ def reigns_from_index(rows: list[dict]) -> list[dict]:
     return reigns
 
 
+def _latest_round_rows(rows: list[dict]) -> list[dict]:
+    scored = [r for r in rows if r.get("post_round_king_hotkey")]
+    if not scored:
+        return []
+    top = max(int(r.get("epoch_start_block") or 0) for r in scored)
+    return [r for r in scored if int(r.get("epoch_start_block") or 0) == top]
+
+
+def current_king_from_index(rows: list[dict]) -> dict | None:
+    """The king as the validators' newest signed receipts name it — the
+    moment a dethrone is scored, not a tempo later when incentive follows.
+
+    The newest boundary's ``post_round_king_hotkey`` by majority across the
+    validators that published it; its code ref is the newest row that names
+    that hotkey's generator: ``chal_gen_ref`` of the row that crowned it, or
+    ``king_gen_ref`` of a round it defended. ``None`` when the receipts
+    cannot name both, or the validators split (the caller falls back to the
+    incentive lookup).
+    """
+    latest = _latest_round_rows(rows)
+    if not latest:
+        return None
+    votes: dict[str, int] = {}
+    for r in latest:
+        hk = str(r["post_round_king_hotkey"])
+        votes[hk] = votes.get(hk, 0) + 1
+    ranked = sorted(votes.items(), key=lambda kv: -kv[1])
+    if len(ranked) > 1 and ranked[0][1] == ranked[1][1]:
+        return None
+    hk = ranked[0][0]
+    for r in reversed(rows):
+        if r.get("dethroned") and str(r.get("chal_hotkey")) == hk and r.get("chal_gen_ref"):
+            ref, uid, crowned = str(r["chal_gen_ref"]), r.get("chal_uid"), True
+        elif str(r.get("king_hotkey")) == hk and r.get("king_gen_ref"):
+            ref, uid, crowned = str(r["king_gen_ref"]), r.get("king_uid"), False
+        else:
+            continue
+        return {"hotkey": hk, "uid": uid, "gen_ref": ref, "digest": ref_digest(ref),
+                "round_id": str(r.get("round_id") or ""),
+                "epoch_start_block": int(r.get("epoch_start_block") or 0),
+                "published_at": str(r.get("published_at") or ""), "crowned_here": crowned}
+    return None
+
+
+def reign_for_digest(rows: list[dict], digest: str) -> dict | None:
+    """The reign record to file ``digest`` under. A reign the receipts already
+    list as king wins; otherwise a king crowned by the newest dethrone
+    receipt (not yet a manifest king) is filed as the NEXT reign number —
+    the number the receipts give it once it defends a round."""
+    reigns = reigns_from_index(rows)
+    hit = next((r for r in reversed(reigns) if ref_digest(r["gen_ref"]) == digest), None)
+    if hit is not None:
+        return hit
+    cur = current_king_from_index(rows)
+    if cur is None or cur["digest"] != digest or not cur["crowned_here"]:
+        return None
+    if reigns and reigns[-1]["hotkey"] == cur["hotkey"]:
+        return None
+    return {"reign": len(reigns) + 1, "hotkey": cur["hotkey"], "uid": cur["uid"],
+            "gen_ref": cur["gen_ref"], "digest": digest,
+            "first_round_id": cur["round_id"], "last_round_id": cur["round_id"],
+            "first_epoch_start_block": cur["epoch_start_block"],
+            "last_epoch_start_block": cur["epoch_start_block"],
+            "first_published_at": cur["published_at"], "last_published_at": cur["published_at"],
+            "rounds": 0}
+
+
 def folder_name(reign: int, hotkey: str) -> str:
     return f"{int(reign):02d}-{str(hotkey)[:12]}"
 

@@ -58,11 +58,34 @@ def main() -> int:
         venv_py = args.cascade_tree / ".venv" / "bin" / "python"
         args.python = venv_py if venv_py.is_file() else Path(sys.executable)
 
+    # The king per the validators' newest signed receipts (named the moment
+    # a dethrone is scored); the highest-incentive lookup — which lags a
+    # dethrone by the commit-reveal delay plus an epoch — is the fallback.
+    target, rows = "king", None
+    try:
+        import urllib.request
+
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import champions_archive as ca
+        rows = json.loads(urllib.request.urlopen(RECEIPTS_INDEX, timeout=60).read())
+        rows = rows if isinstance(rows, list) else (rows.get("rounds") or rows.get("rows"))
+        cur = ca.current_king_from_index(rows or [])
+        if cur is not None:
+            target = cur["gen_ref"]
+            print(f"king per receipts: uid {cur['uid']} {cur['hotkey'][:12]} "
+                  f"(round {cur['round_id']}) → {target}")
+        else:
+            print("receipts do not name the king unambiguously — using the "
+                  "highest-incentive lookup")
+    except Exception as e:  # noqa: BLE001 — the incentive path still works
+        print(f"receipts index unavailable ({e}) — using the highest-incentive lookup",
+              file=sys.stderr)
+
     with tempfile.TemporaryDirectory(prefix="king-sync-") as td:
         out = Path(td) / "king"
         env = {**os.environ, "PYTHONPATH": str(args.cascade_tree)}
         r = subprocess.run(
-            [str(args.python), "-m", "cascade.miner.cli", "fetch", "king",
+            [str(args.python), "-m", "cascade.miner.cli", "fetch", target,
              "--out", str(out), "--chain-toml", args.chain_toml,
              "--network", args.network],
             cwd=args.cascade_tree, env=env, capture_output=True, text=True)
@@ -165,10 +188,12 @@ def main() -> int:
             import urllib.request
 
             import champions_archive as ca
-            rows = json.loads(urllib.request.urlopen(RECEIPTS_INDEX, timeout=60).read())
-            rows = rows if isinstance(rows, list) else (rows.get("rounds") or rows.get("rows"))
-            reign = next((r for r in reversed(ca.reigns_from_index(rows))
-                          if ca.ref_digest(r["gen_ref"]) == digest), None)
+            if rows is None:
+                rows = json.loads(urllib.request.urlopen(RECEIPTS_INDEX, timeout=60).read())
+                rows = rows if isinstance(rows, list) else (rows.get("rounds") or rows.get("rows"))
+            # a king crowned by the newest dethrone receipt files now, under
+            # the reign number the receipts will give it
+            reign = ca.reign_for_digest(rows, digest)
             if reign is not None:
                 ARCHIVE.mkdir(parents=True, exist_ok=True)
                 folder = ca.write_reign(ARCHIVE, reign, DEST, findings,
