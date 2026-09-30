@@ -45,12 +45,15 @@ COPY . /opt/cascade
 # Same pinned torch build as the worker image (numerics), then the miner extras:
 # train (score), hippius (fetch/deploy), chain (commit/submit — bittensor pinned).
 # TORCH_INDEX is overridable (e.g. .../whl/cpu for a CPU-only image); the
-# default matches deploy/Dockerfile.
+# default matches deploy/Dockerfile. --no-sources stops pyproject's
+# [tool.uv.sources] from re-resolving torch against the cu124 index: the torch
+# installed just before already satisfies the ==2.4.1 pin.
 ARG TORCH_INDEX=https://download.pytorch.org/whl/cu124
 RUN uv venv --python 3.11 /opt/cascade/.venv \
     && uv pip install --python /opt/cascade/.venv/bin/python \
         torch==2.4.1 --index-url "$TORCH_INDEX" \
-    && uv pip install --python /opt/cascade/.venv/bin/python -e '.[train,hippius,chain]'
+    && uv pip install --python /opt/cascade/.venv/bin/python --no-sources \
+        -e '.[train,hippius,chain]'
 
 # Generator-runtime allowlist, pinned exactly as in deploy/Dockerfile, so your
 # generator (and the king: numba, scikit-learn, …) imports the way it does on a pod.
