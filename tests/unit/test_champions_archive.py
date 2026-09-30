@@ -150,3 +150,41 @@ def test_reign_for_digest_files_a_fresh_crown_as_the_next_reign():
 
 def test_reign_for_digest_unknown_digest_is_none():
     assert ca.reign_for_digest(_dethrone_rows(), "c" * 64) is None
+
+
+# ── king by the trainer's rule: one signed anchor receipt ───────────────────
+
+def _receipt(status="scored", king=_B, dethroned=True, entries=None):
+    entries = entries if entries is not None else [
+        {"role": "king", "miner_hotkey": _A, "miner_uid": 1, "gen_ref": _RA},
+        {"role": "challenger", "miner_hotkey": _B, "miner_uid": 2, "gen_ref": _RB},
+    ]
+    return {"status": status, "round_id": "r9", "epoch_start_block": 900,
+            "verdict": {"king_hotkey": king, "dethroned": dethroned},
+            "manifest": {"entries": entries}}
+
+
+def test_receipt_king_after_a_dethrone_is_the_winner_with_its_manifest_ref():
+    k = ca.king_from_receipt(_receipt())
+    assert k["hotkey"] == _B and k["gen_ref"] == _RB and k["uid"] == 2 and k["crowned_here"]
+
+
+def test_receipt_king_on_a_hold_is_the_defending_king():
+    k = ca.king_from_receipt(_receipt(king=_A, dethroned=False))
+    assert k["hotkey"] == _A and k["gen_ref"] == _RA and not k["crowned_here"]
+
+
+def test_receipt_king_ignores_unscored_receipts_and_forfeited_hotkeys():
+    assert ca.king_from_receipt(_receipt(status="rejected")) is None
+    assert ca.king_from_receipt(_receipt(), forfeited={_B}) is None
+
+
+def test_receipt_king_without_a_manifest_entry_has_no_ref():
+    k = ca.king_from_receipt(_receipt(king=_C, dethroned=False))
+    assert k["hotkey"] == _C and k["gen_ref"] == "" and not k["crowned_here"]
+
+
+def test_reign_for_digest_uses_the_resolved_receipt_king():
+    rows = [_row("r1", 100, "v1", _A, _RA, _A)]
+    k = ca.king_from_receipt(_receipt())
+    assert ca.reign_for_digest(rows, "b" * 64, current=k)["reign"] == 2

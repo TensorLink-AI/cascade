@@ -39,6 +39,29 @@ def sh(argv, **kw):
     return subprocess.run(argv, check=True, capture_output=True, text=True, **kw)
 
 
+def _anchor_receipt_king(args) -> dict | None:
+    """Fetch + signature-verify the anchor validator's latest receipt (public
+    read) and resolve the king by :func:`champions_archive.king_from_receipt`."""
+    import urllib.request
+
+    sys.path.insert(0, str(args.cascade_tree))
+    import champions_archive as ca
+    from cascade.shared.config import load_chain_config
+    from cascade.shared.hippius import receipt_latest_key
+    from cascade.shared.receipt import load_receipt, verify_receipt_signature
+
+    cfg = load_chain_config(args.cascade_tree / args.chain_toml)
+    anchor = str(cfg.manifest.validator_hotkey or "")
+    if not anchor:
+        raise ValueError("[manifest] validator_hotkey is unset — no receipt anchor")
+    base = f"{str(cfg.storage.s3_endpoint).rstrip('/')}/{cfg.storage.manifest_bucket}"
+    text = urllib.request.urlopen(f"{base}/{receipt_latest_key(anchor)}", timeout=60).read().decode()
+    if not verify_receipt_signature(load_receipt(text), anchor):
+        raise ValueError(f"receipt signature does not verify against the anchor {anchor[:12]}")
+    forfeited = frozenset(getattr(cfg.scoring, "forfeit_hotkeys", ()) or ())
+    return ca.king_from_receipt(json.loads(text), forfeited=forfeited)
+
+
 def main() -> int:
     import os
 
@@ -58,28 +81,32 @@ def main() -> int:
         venv_py = args.cascade_tree / ".venv" / "bin" / "python"
         args.python = venv_py if venv_py.is_file() else Path(sys.executable)
 
-    # The king per the validators' newest signed receipts (named the moment
-    # a dethrone is scored); the highest-incentive lookup — which lags a
-    # dethrone by the commit-reveal delay plus an epoch — is the fallback.
-    target, rows = "king", None
+    # The king by the TRAINER's rule (TrainerRunner._receipt_king): the anchor
+    # validator's latest SIGNED receipt ([manifest] validator_hotkey), status
+    # "scored", verdict.king_hotkey — named the moment a dethrone is scored —
+    # never a forfeited hotkey; code ref = its entry in that receipt's signed
+    # manifest, else its revealed commitment (fetch by hotkey). Like the
+    # trainer's sticky last-known king, an unreadable or unverifiable receipt
+    # keeps the archived king (no-op) rather than falling back to incentive,
+    # which lags a dethrone and would re-archive the deposed king; incentive
+    # is used only when nothing has been archived yet.
+    target, rows, cur = "king", None, None
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import champions_archive as ca
     try:
-        import urllib.request
-
-        sys.path.insert(0, str(Path(__file__).resolve().parent))
-        import champions_archive as ca
-        rows = json.loads(urllib.request.urlopen(RECEIPTS_INDEX, timeout=60).read())
-        rows = rows if isinstance(rows, list) else (rows.get("rounds") or rows.get("rows"))
-        cur = ca.current_king_from_index(rows or [])
-        if cur is not None:
-            target = cur["gen_ref"]
-            print(f"king per receipts: uid {cur['uid']} {cur['hotkey'][:12]} "
-                  f"(round {cur['round_id']}) → {target}")
-        else:
-            print("receipts do not name the king unambiguously — using the "
-                  "highest-incentive lookup")
-    except Exception as e:  # noqa: BLE001 — the incentive path still works
-        print(f"receipts index unavailable ({e}) — using the highest-incentive lookup",
-              file=sys.stderr)
+        cur = _anchor_receipt_king(args)
+    except Exception as e:  # noqa: BLE001
+        print(f"anchor receipt unusable: {e}", file=sys.stderr)
+    if cur is not None:
+        target = cur["gen_ref"] or cur["hotkey"]
+        print(f"king per the anchor's signed receipt (round {cur['round_id']}): "
+              f"uid {cur['uid']} {cur['hotkey'][:12]} → {target}")
+    elif PROVENANCE.is_file():
+        print("no usable king from the anchor receipt — keeping the archived king")
+        return 0
+    else:
+        print("no usable king from the anchor receipt and nothing archived — "
+              "using the highest-incentive lookup")
 
     with tempfile.TemporaryDirectory(prefix="king-sync-") as td:
         out = Path(td) / "king"
@@ -193,7 +220,7 @@ def main() -> int:
                 rows = rows if isinstance(rows, list) else (rows.get("rounds") or rows.get("rows"))
             # a king crowned by the newest dethrone receipt files now, under
             # the reign number the receipts will give it
-            reign = ca.reign_for_digest(rows, digest)
+            reign = ca.reign_for_digest(rows, digest, current=cur)
             if reign is not None:
                 ARCHIVE.mkdir(parents=True, exist_ok=True)
                 folder = ca.write_reign(ARCHIVE, reign, DEST, findings,

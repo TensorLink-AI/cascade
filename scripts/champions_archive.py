@@ -121,16 +121,45 @@ def current_king_from_index(rows: list[dict]) -> dict | None:
     return None
 
 
-def reign_for_digest(rows: list[dict], digest: str) -> dict | None:
+def king_from_receipt(receipt: dict, *, forfeited: frozenset | set = frozenset()) -> dict | None:
+    """The king named by ONE signed receipt — the trainer's rule
+    (``TrainerRunner._receipt_king``): a ``scored`` receipt's
+    ``verdict.king_hotkey`` (the post-round champion: a dethrone's winner the
+    moment it is scored). A forfeited hotkey (DEC-CA-0048) is never taken as
+    king. The code ref is that hotkey's entry in the receipt's signed
+    manifest — the ref the validators bound to its commitment as of its
+    train_block; ``gen_ref`` is "" when the manifest has no entry for it (a
+    forfeit successor), and the caller resolves its commitment instead."""
+    if str(receipt.get("status")) != "scored":
+        return None
+    v = receipt.get("verdict") or {}
+    hk = str(v.get("king_hotkey") or "")
+    if not hk or hk in forfeited:
+        return None
+    entries = [e for e in ((receipt.get("manifest") or {}).get("entries") or [])
+               if str(e.get("miner_hotkey")) == hk]
+    dethroned = bool(v.get("dethroned"))
+    entries.sort(key=lambda e: (e.get("role") != ("challenger" if dethroned else "king")))
+    e = entries[0] if entries else {}
+    ref = str(e.get("gen_ref") or "")
+    return {"hotkey": hk, "uid": e.get("miner_uid", v.get("king_uid")), "gen_ref": ref,
+            "digest": ref_digest(ref), "round_id": str(receipt.get("round_id") or ""),
+            "epoch_start_block": int(receipt.get("epoch_start_block") or 0),
+            "published_at": "",
+            "crowned_here": dethroned and e.get("role") == "challenger"}
+
+
+def reign_for_digest(rows: list[dict], digest: str, current: dict | None = None) -> dict | None:
     """The reign record to file ``digest`` under. A reign the receipts already
     list as king wins; otherwise a king crowned by the newest dethrone
     receipt (not yet a manifest king) is filed as the NEXT reign number —
-    the number the receipts give it once it defends a round."""
+    the number the receipts give it once it defends a round. ``current`` is
+    the resolved king (:func:`king_from_receipt`); default: the index's."""
     reigns = reigns_from_index(rows)
     hit = next((r for r in reversed(reigns) if ref_digest(r["gen_ref"]) == digest), None)
     if hit is not None:
         return hit
-    cur = current_king_from_index(rows)
+    cur = current if current is not None else current_king_from_index(rows)
     if cur is None or cur["digest"] != digest or not cur["crowned_here"]:
         return None
     if reigns and reigns[-1]["hotkey"] == cur["hotkey"]:
