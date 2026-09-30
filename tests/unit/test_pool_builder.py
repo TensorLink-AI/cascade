@@ -212,3 +212,114 @@ def test_require_source_rejects_unlabeled_series():
     # Default stays permissive: same unlabeled series builds fine.
     rec3, reason3 = prepare_series(_series("s3"), PoolBuildConfig(context_length=512, horizon=16))
     assert reason3 is None and "source" not in rec3.metadata
+
+
+# ── balanced selection (seeded round-robin across sources) ──────────────────
+
+
+def _src_series(src, i, domain="transport", freq="H"):
+    """A distinct series labelled with upstream feed ``src``."""
+    base = 10 + np.sin(np.arange(600) / (5.0 + i)) + (hash(src) % 97) * 0.01
+    return HarvestedSeries(f"{src}__{i}", base, freq, domain, 24, source=src)
+
+
+def _starved_catalog():
+    """Two big feeds listed first (20 series each), then 10 one-series feeds —
+    the shape that let catalog order starve a capped domain."""
+    items = [_src_series("big_a", i) for i in range(20)]
+    items += [_src_series("big_b", 100 + i) for i in range(20)]
+    items += [_src_series(f"small_{k}", 200 + k) for k in range(10)]
+    return items
+
+
+def _bal(**kw):
+    return PoolBuildConfig(context_length=512, horizon=16, min_context=64,
+                           selection="balanced", selection_seed="block:1", **kw)
+
+
+def test_first_come_starves_late_sources_under_a_domain_cap():
+    cfg = PoolBuildConfig(context_length=512, horizon=16, min_context=64,
+                          max_series_per_domain=12)
+    records, drops = collect_records([_ListSource(_starved_catalog())], CTX, cfg, fetch=None)
+    assert {r.metadata["source"] for r in records} == {"big_a"}   # the historical failure
+    assert drops["domain_cap"] == 38
+
+
+def test_balanced_spreads_a_capped_domain_across_sources():
+    records, drops = collect_records([_ListSource(_starved_catalog())], CTX,
+                                     _bal(max_series_per_domain=12), fetch=None)
+    srcs = [r.metadata["source"] for r in records]
+    assert len(records) == 12 and drops["domain_cap"] == 38
+    # 12 distinct feeds available ⇒ one series from each, none doubled up.
+    assert len(set(srcs)) == 12
+
+
+def test_balanced_second_pass_only_after_every_source_had_one():
+    records, _ = collect_records([_ListSource(_starved_catalog())], CTX,
+                                 _bal(max_series_per_domain=16), fetch=None)
+    from collections import Counter as C
+    per = C(r.metadata["source"] for r in records)
+    assert set(per) == {"big_a", "big_b", *(f"small_{k}" for k in range(10))}
+    # 12 in pass one, the remaining 4 can only come from the two big feeds.
+    assert per["big_a"] + per["big_b"] == 6 and max(per.values()) <= 3
+
+
+def test_balanced_respects_the_cell_cap_per_domain_freq():
+    hourly = [_src_series(f"h{k}", k) for k in range(6)]
+    daily = [_src_series(f"d{k}", 50 + k, freq="D") for k in range(3)]
+    records, drops = collect_records([_ListSource(hourly + daily)], CTX,
+                                     _bal(max_series_per_domain_freq=2), fetch=None)
+    freqs = sorted(r.metadata["freq"] for r in records)
+    assert freqs == ["D", "D", "H", "H"] and drops["domain_freq_cap"] == 5
+
+
+def test_balanced_is_deterministic_and_ignores_harvest_order():
+    items = _starved_catalog()
+    cfg = _bal(max_series_per_domain=12)
+    a, _ = collect_records([_ListSource(items)], CTX, cfg, fetch=None)
+    b, _ = collect_records([_ListSource(list(reversed(items)))], CTX, cfg, fetch=None)
+    assert [r.series_id for r in a] == [r.series_id for r in b]
+
+
+def test_balanced_seed_rotates_the_sample():
+    items = _starved_catalog()
+    picks = set()
+    for seed in ("block:1", "block:2", "block:3", "block:4"):
+        cfg = PoolBuildConfig(context_length=512, horizon=16, min_context=64,
+                              max_series_per_domain=12, selection="balanced",
+                              selection_seed=seed)
+        recs, _ = collect_records([_ListSource(items)], CTX, cfg, fetch=None)
+        picks.add(tuple(r.series_id for r in recs))
+    assert len(picks) > 1
+
+
+def test_balanced_without_caps_keeps_everything():
+    items = _starved_catalog()
+    first, _ = collect_records([_ListSource(items)], CTX,
+                               PoolBuildConfig(context_length=512, horizon=16, min_context=64),
+                               fetch=None)
+    bal, _ = collect_records([_ListSource(items)], CTX, _bal(), fetch=None)
+    assert [r.series_id for r in first] == [r.series_id for r in bal]
+
+
+def test_balanced_still_dedups_and_disambiguates():
+    a = HarvestedSeries("dup", 10 + np.sin(np.arange(600) / 5.0), "H", "x", 24, source="f1")
+    b = HarvestedSeries("dup", 10 + np.cos(np.arange(600) / 5.0), "H", "x", 24, source="f2")
+    c = HarvestedSeries("copy", 10 + np.sin(np.arange(600) / 5.0), "H", "x", 24, source="f3")
+    records, drops = collect_records([_ListSource([a, b, c])], CTX, _bal(), fetch=None)
+    assert sorted(r.series_id for r in records) == ["dup", "dup-2"]
+    assert drops["duplicate"] == 1
+
+
+def test_unknown_selection_mode_is_rejected():
+    cfg = PoolBuildConfig(context_length=512, horizon=16, selection="random")
+    with pytest.raises(ValueError, match="selection"):
+        collect_records([_ListSource([])], CTX, cfg, fetch=None)
+
+
+def test_balanced_seed_is_recorded_in_provenance(tmp_path):
+    cfg = _bal(max_series_per_domain=12)
+    build_pool([_ListSource(_starved_catalog())], tmp_path / "p", CTX, cfg, fetch=None)
+    prov = json.loads((tmp_path / "p" / "provenance.json").read_text())
+    assert prov["config"]["selection"] == "balanced"
+    assert prov["config"]["selection_seed"] == "block:1"

@@ -204,13 +204,22 @@ jobs:
           # --max-series-per-domain 600: outer bound — every domain is already
           #   multi-granularity (4-9 freqs), so the cell cap alone would let one
           #   domain span cells up to 300 x n_freqs; 600 absolute caps that.
-          #   Binds nothing in today's pool (largest post-cap domain ~367).
+          #   Binds transport (at 600 since late Sep).
+          # --selection balanced: when a cap binds, deal its slots round-robin
+          #   across SOURCES in an order seeded by the snapshot's effective block,
+          #   and take a seeded sample of each feed's panel rows. First-come
+          #   (catalog order) filled transport's 600 from 50 feeds while hundreds
+          #   more were eligible, and pinned the same alphabetically-first
+          #   stations into every snapshot.
+          #   Operator-side only: validators load whatever signed snapshot is
+          #   current (no release needed).
           TSFORGE_DIR=./tsforge cascade-pool publish \
             --chain-toml "$TOML" \
             --sources tsbench_forge \
             --max-panel-series-per-feed 25 \
             --max-series-per-domain-freq 300 \
             --max-series-per-domain 600 \
+            --selection balanced \
             --effective-block "$EFFECTIVE_BLOCK"
 
       # Public reveal: mirror RETIRED snapshot tars from the pool bucket to a

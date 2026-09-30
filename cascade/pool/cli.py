@@ -84,8 +84,19 @@ def _add_build_args(p: argparse.ArgumentParser) -> None:
         default=None,
         help="Cap panel-expanded series kept per catalog feed (tsbench_forge only; "
         "default: the source's built-in cap). Keeps the first N panel rows in the "
-        "source's deterministic sort order.",
+        "source's deterministic sort order, or a seeded sample of N under --selection balanced.",
     )
+    p.add_argument(
+        "--selection",
+        choices=("first", "balanced"),
+        default="first",
+        help="Who wins a capped slot: 'first' = harvest order (catalog order decides); "
+        "'balanced' = seeded round-robin across sources, plus a seeded per-feed panel "
+        "sample. Seed: --selection-seed, else the snapshot's effective block (publish) "
+        "or --as-of date (build).",
+    )
+    p.add_argument("--selection-seed", default=None,
+                   help="Override the balanced-selection seed (recorded in provenance.json).")
     p.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
     p.add_argument("--timeout", type=float, default=30.0, help="Per-request HTTP timeout (s).")
 
@@ -211,6 +222,15 @@ def _build(args: argparse.Namespace, cfg, *, out_dir: Path, overwrite: bool):
         for src in sources:
             if hasattr(src, "mv_pack"):   # tsbench_forge packs mv_channels to (C, L)
                 src.mv_pack = True
+    selection = getattr(args, "selection", "first") or "first"
+    seed = ""
+    if selection == "balanced":
+        seed = (getattr(args, "selection_seed", None)
+                or getattr(args, "_selection_seed_default", None)
+                or f"as_of:{_parse_date(args.as_of).isoformat()}")
+        for src in sources:
+            if hasattr(src, "panel_sample_seed"):   # tsbench_forge: seeded per-feed sample
+                src.panel_sample_seed = seed
     ctx = HarvestContext(
         as_of=_parse_date(args.as_of),
         span_days=args.span_days,
@@ -227,6 +247,8 @@ def _build(args: argparse.Namespace, cfg, *, out_dir: Path, overwrite: bool):
         max_series_per_domain_freq=args.max_series_per_domain_freq,
         max_series_total=args.max_series_total,
         max_channels=int(getattr(args, "max_channels", 1) or 1),
+        selection=selection,
+        selection_seed=seed,
     )
     return build_pool(
         sources, out_dir, ctx, build_cfg, fetch=HttpFetcher(timeout=args.timeout), overwrite=overwrite
@@ -316,6 +338,9 @@ def _cmd_publish(args: argparse.Namespace) -> int:
         from .sources.tsbench_forge import MAX_MV_CHANNELS
         args.max_channels = max(int(getattr(args, "max_channels", 1) or 1), MAX_MV_CHANNELS)
     print(f"mv-pack: {'ON' if pack else 'off'} ({why}); max_channels={getattr(args, 'max_channels', 1)}")
+    # Balanced selection draws from the snapshot's own effective block, so every
+    # snapshot rotates its sample and the seed is recoverable from the index.
+    args._selection_seed_default = f"block:{effective_block}"
 
     try:
         summary = _build(args, cfg, out_dir=args.out, overwrite=True)
