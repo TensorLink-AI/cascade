@@ -1779,3 +1779,55 @@ def test_settlement_never_publishes_a_foreign_king_entry(cfg, tmp_path):
     assert ops.manifests == [], "a manifest carrying the old king must never publish"
     assert sched.state.current.king_entry is None
     assert any(f.hotkey == "BRAV" for f in sched.state.finished)   # the leg waits
+
+
+# ── champion code goes public at dethrone adoption ──────────────────────────
+
+class _ChampionOps(FakeOps):
+    def __init__(self, tmp_path, clock):
+        super().__init__(tmp_path, clock)
+        self.champions: list[tuple[str, str]] = []
+
+    def publish_champion(self, gen, round_id):
+        self.champions.append((gen.hotkey, gen.ref))
+
+
+def test_dethrone_publishes_the_new_kings_code_before_the_next_settlement(cfg, tmp_path):
+    armed = _armed(cfg)
+    clock = Clock()
+    ops = _ChampionOps(tmp_path, clock)
+    sched, _ = _sched(armed, tmp_path, clock, ops=ops)
+    client = FakeClient()
+    q = ops.queue()
+    era_start = armed.round.rolling_from_block
+    b0 = era_start + 5
+    ops.commits.append(_commit("ALFA", REF["ALFA"], b0 - 100))
+    q.add("ALFA", REF["ALFA"], reveal_block=b0 - 100)
+    sched.tick(client, b0)
+    _join(sched)
+    b1 = era_start + EB
+    _advance(clock, ops, sched, client, from_block=b0, to_block=b1 + 1)
+    n_settled = len(ops.champions)                    # the settlement's own call
+    ops.king_hk = "ALFA"                              # validators crown ALFA
+    sched.tick(client, b1 + 2)
+    _join(sched)
+    assert ops.champions[n_settled:] == [("ALFA", REF["ALFA"])]
+    assert len(ops.manifests) == 1                    # no settlement in between
+
+
+def test_crowned_king_without_a_leg_here_publishes_once_its_ref_resolves(cfg, tmp_path):
+    armed = _armed(cfg)
+    clock = Clock()
+    ops = _ChampionOps(tmp_path, clock)
+    sched, _ = _sched(armed, tmp_path, clock, ops=ops)
+    client = FakeClient()
+    era_start = armed.round.rolling_from_block
+    b0 = era_start + 5
+    ops.commits.append(_commit("ALFA", REF["ALFA"], b0 - 100))
+    sched.tick(client, b0)
+    _join(sched)
+    ops.king_hk = ops.chain_king = "ALFA"             # crowned in an earlier era
+    sched.tick(client, b0 + 1)
+    _join(sched)
+    assert ("ALFA", REF["ALFA"]) in ops.champions
+    assert ops.manifests == []
