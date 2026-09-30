@@ -3,10 +3,13 @@ name: king-sync
 # Archives the subnet's current best generator (the king) into
 # champions/king/ — one commit per reign, scan-gated, provenance-stamped.
 #
-# Every run: resolve the king on-chain → fetch its exact code by digest →
+# Every run: resolve the king from the validators' newest signed receipts
+# (named the moment a dethrone is scored; the highest-incentive UID is the
+# fallback) → fetch its exact code by digest →
 # static security scan (scripts/scan_generator.py; high-severity findings
 # REFUSE the archive) → commit + push only when the digest changed. A quiet
-# run is a no-op, so the hourly schedule costs nothing between dethrones.
+# run is a no-op (~40 s), so the 15-minute schedule costs little between
+# dethrones and a new king lands here within ~15 min of its public ZIP.
 # `git log champions/king` is the subnet's reign timeline, each snapshot
 # independently verifiable against the on-chain commitment.
 #
@@ -19,7 +22,7 @@ name: king-sync
 
 on:
   schedule:
-    - cron: "23 * * * *"
+    - cron: "8,23,38,53 * * * *"
   workflow_dispatch:
     inputs:
       allow_findings:

@@ -88,3 +88,65 @@ def test_write_reign_and_readme_round_trip(tmp_path):
     assert entries[0]["scan_high"] == 1
     md = ca.render_readme(entries)
     assert "| 2 | [`02-5BBBBBBBBBBB`](02-5BBBBBBBBBBB/) | 2 |" in md and "2026-08-03 00:00" in md
+
+
+# ── king from receipts (fast sync) ──────────────────────────────────────────
+
+_A, _B, _C = "5A" + "A" * 46, "5B" + "B" * 46, "5C" + "C" * 46
+_RA, _RB = "vault/direct@sha256:" + "a" * 64, "vault/direct@sha256:" + "b" * 64
+
+
+def _row(rid, blk, val, king, kref, post, *, chal=None, cref=None, dethroned=False):
+    return {"round_id": rid, "epoch_start_block": blk, "validator_hotkey": val,
+            "king_hotkey": king, "king_uid": 1, "king_gen_ref": kref,
+            "post_round_king_hotkey": post, "chal_hotkey": chal, "chal_uid": 2,
+            "chal_gen_ref": cref, "dethroned": dethroned, "published_at": f"t{blk}"}
+
+
+def _dethrone_rows():
+    rows = [_row("r1", 100, v, _A, _RA, _A) for v in ("v1", "v2", "v3")]
+    rows += [_row("r2", 200, v, _A, _RA, _B, chal=_B, cref=_RB, dethroned=True)
+             for v in ("v1", "v2", "v3")]
+    return rows
+
+
+def test_current_king_is_named_by_the_dethrone_receipt():
+    cur = ca.current_king_from_index(_dethrone_rows())
+    assert cur["hotkey"] == _B and cur["gen_ref"] == _RB and cur["crowned_here"]
+    assert cur["round_id"] == "r2"
+
+
+def test_current_king_after_a_defended_round_uses_king_ref():
+    rows = _dethrone_rows() + [_row("r3", 300, "v1", _B, _RB, _B)]
+    cur = ca.current_king_from_index(rows)
+    assert cur["hotkey"] == _B and cur["gen_ref"] == _RB and not cur["crowned_here"]
+
+
+def test_current_king_refuses_a_validator_split():
+    rows = [_row("r1", 100, "v1", _A, _RA, _A),
+            _row("r1", 100, "v2", _A, _RA, _B, chal=_B, cref=_RB, dethroned=True)]
+    assert ca.current_king_from_index(rows) is None
+
+
+def test_current_king_majority_wins_over_a_lagging_validator():
+    rows = _dethrone_rows()
+    rows[-1] = _row("r2", 200, "v3", _A, _RA, _A)       # one validator behind
+    assert ca.current_king_from_index(rows)["hotkey"] == _B
+
+
+def test_current_king_none_when_no_ref_names_the_king():
+    rows = [_row("r1", 100, "v1", _A, _RA, _C)]         # e.g. a forfeit successor
+    assert ca.current_king_from_index(rows) is None
+
+
+def test_reign_for_digest_files_a_fresh_crown_as_the_next_reign():
+    rows = _dethrone_rows()
+    reign = ca.reign_for_digest(rows, "b" * 64)
+    assert reign["reign"] == 2 and reign["hotkey"] == _B and reign["first_round_id"] == "r2"
+    # once the receipts list it as king, the number is the same
+    later = rows + [_row("r3", 300, "v1", _B, _RB, _B)]
+    assert ca.reign_for_digest(later, "b" * 64)["reign"] == 2
+
+
+def test_reign_for_digest_unknown_digest_is_none():
+    assert ca.reign_for_digest(_dethrone_rows(), "c" * 64) is None
