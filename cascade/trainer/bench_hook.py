@@ -335,6 +335,35 @@ def sideload_bench_data(host: RemoteHost, plan: BenchPlan, *,
         return False
 
 
+# One benchmark sweep per POD at a time. Every launch pre-empts any running
+# `cascade-benchmark` on its host (PREEMPT_BENCHMARKS — it clears strays a
+# restart left behind), so two concurrent sweeps on one pod killed each other:
+# 2026-09-29 the operator's verification re-benches of uid 133 and uid 86 died
+# rc 143 the moment the next verification started on the same king pod. With
+# the lock the pre-emption only ever hits a stray from another process.
+_HOST_LOCKS: dict[str, threading.Lock] = {}
+_HOST_LOCKS_GUARD = threading.Lock()
+
+
+def _host_key(host) -> str:
+    return f"{getattr(host, 'host', '')}:{getattr(host, 'port', '')}"
+
+
+def host_bench_lock(host) -> threading.Lock:
+    """The lock that serializes benchmark sweeps on ``host``'s pod."""
+    key = _host_key(host)
+    with _HOST_LOCKS_GUARD:
+        lock = _HOST_LOCKS.get(key)
+        if lock is None:
+            lock = _HOST_LOCKS[key] = threading.Lock()
+        return lock
+
+
+def host_busy(host) -> bool:
+    """True while a sweep holds ``host``'s pod (callers defer rather than wait)."""
+    return host_bench_lock(host).locked()
+
+
 def run_post_round_benchmark(host: RemoteHost, round_id: str, arch_preset: str,
                              plan: BenchPlan, *, work_root: Path | None = None,
                              runner=None, role: str = "king") -> dict | None:
@@ -343,7 +372,17 @@ def run_post_round_benchmark(host: RemoteHost, round_id: str, arch_preset: str,
 
     Blocking (call it from :func:`launch_post_round_benchmark`'s thread).
     Returns ``None`` on any failure — this path must never raise into a round.
+    Serialized per pod (:func:`host_bench_lock`): a second sweep on the same
+    pod waits for the first instead of pre-empting it.
     """
+    with host_bench_lock(host):
+        return _run_post_round_benchmark(host, round_id, arch_preset, plan,
+                                         work_root=work_root, runner=runner, role=role)
+
+
+def _run_post_round_benchmark(host: RemoteHost, round_id: str, arch_preset: str,
+                              plan: BenchPlan, *, work_root: Path | None = None,
+                              runner=None, role: str = "king") -> dict | None:
     try:
         import os
 

@@ -1831,3 +1831,140 @@ def test_crowned_king_without_a_leg_here_publishes_once_its_ref_resolves(cfg, tm
     _join(sched)
     assert ("ALFA", REF["ALFA"]) in ops.champions
     assert ops.manifests == []
+
+
+# ── deferred payer-bench verification (2026-09-30) ──────────────────────────
+
+class _VerifyOps(_HeldKingOps):
+    """Payer benches that need the era king to verify; scripted verifier."""
+
+    def __init__(self, tmp_path, clock):
+        super().__init__(tmp_path, clock)
+        self.verify_status = "ok"
+        self.verify_calls: list[str] = []
+
+    def bench_challenger(self, entry, king, era):
+        self.benches.append(("challenger", entry.miner_hotkey, era.index, self.clock()))
+        payer = dict(self.bench_scores)
+        if king is None:
+            return {R.VERIFY_PENDING: {**payer, "_reason": "era king leg not trained yet"}}
+        return payer
+
+    def verify_bench(self, entry, payer, king, era):
+        self.verify_calls.append(entry.miner_hotkey)
+        if self.verify_status == "ok":
+            return "ok", {k: v + 0.001 for k, v in payer.items()}   # the operator's own numbers
+        if self.verify_status == "failed":
+            return "failed", {"error": "no scores"}
+        return self.verify_status, None
+
+
+def _wait_verify(sched, timeout=10.0):
+    end = time.time() + timeout
+    while sched._verify_thread is not None and sched._verify_thread.is_alive() and time.time() < end:
+        time.sleep(0.01)
+
+
+def _report_hotkeys(ops, round_id=None):
+    reps = [b for b in ops.benches if b[0] == "report" and (round_id is None or b[1] == round_id)]
+    return [hk for _, hk in reps[-1][2]] if reps else []
+
+
+def _pending_leg_setup(cfg, tmp_path):
+    armed = _armed(cfg)
+    clock = Clock()
+    ops = _VerifyOps(tmp_path, clock)
+    sched, _ = _sched(armed, tmp_path, clock, ops=ops)
+    client = FakeClient()
+    q = ops.queue()
+    era_start = armed.round.rolling_from_block
+    b0 = era_start + 5
+    ops.hold_kings = {"KING"}                   # the era king leg is still training
+    ops.commits.append(_commit("ALFA", REF["ALFA"], b0 - 100))
+    q.add("ALFA", REF["ALFA"], reveal_block=b0 - 100)
+    sched.tick(client, b0)
+    end = time.time() + 10
+    while "ALFA" in sched._threads and time.time() < end:
+        time.sleep(0.01)
+    return armed, clock, ops, sched, client, era_start, b0
+
+
+def test_leg_finishing_before_the_king_leg_queues_its_verification(cfg, tmp_path):
+    armed, clock, ops, sched, client, era_start, b0 = _pending_leg_setup(cfg, tmp_path)
+    f = next(x for x in sched.state.finished if x.hotkey == "ALFA")
+    assert f.bench is None
+    assert [q["hotkey"] for q in sched.state.verify_queue] == ["ALFA"]
+    assert "_reason" not in sched.state.verify_queue[0]["payer"]
+    sched.tick(client, b0 + 1)                  # still no king leg: nothing runs
+    _wait_verify(sched)
+    assert ops.verify_calls == []
+    ops.king_gate.set()                         # king leg lands
+    _join(sched)
+    sched.tick(client, b0 + 2)
+    _wait_verify(sched)
+    assert ops.verify_calls == ["ALFA"]
+    f = next(x for x in sched.state.finished if x.hotkey == "ALFA")
+    assert f.bench is not None and sched.state.verify_queue == []
+    # it rides its own settlement's bench report
+    _advance(clock, ops, sched, client, from_block=b0 + 2, to_block=era_start + EB + 1)
+    assert "ALFA" in _report_hotkeys(ops)
+
+
+def test_verification_after_settlement_republishes_that_rounds_report(cfg, tmp_path):
+    armed, clock, ops, sched, client, era_start, b0 = _pending_leg_setup(cfg, tmp_path)
+    ops.verify_status = "wait"                  # king pod unusable for now
+    ops.king_gate.set()
+    _join(sched)
+    _advance(clock, ops, sched, client, from_block=b0, to_block=era_start + EB + 1)
+    _wait_verify(sched)
+    rid = ops.manifests[-1].round_id
+    assert "ALFA" not in _report_hotkeys(ops, rid)
+    assert sched.state.verify_queue[0]["round_id"] == rid
+    assert sched.state.verify_queue[0]["tries"] == 0       # waiting costs no attempt
+    ops.verify_status = "ok"
+    sched.tick(client, era_start + EB + 2)
+    _wait_verify(sched)
+    assert "ALFA" in _report_hotkeys(ops, rid)             # same round, republished
+    assert "KING" in _report_hotkeys(ops, rid)             # earlier entries kept
+    assert sched.state.verify_queue == []
+
+
+def test_forged_payer_numbers_are_dropped(cfg, tmp_path):
+    armed, clock, ops, sched, client, era_start, b0 = _pending_leg_setup(cfg, tmp_path)
+    ops.verify_status = "forged"
+    ops.king_gate.set()
+    _join(sched)
+    sched.tick(client, b0 + 1)
+    _wait_verify(sched)
+    assert sched.state.verify_queue == []
+    assert next(x for x in sched.state.finished if x.hotkey == "ALFA").bench is None
+
+
+def test_failed_verification_is_retried_then_dropped(cfg, tmp_path):
+    armed, clock, ops, sched, client, era_start, b0 = _pending_leg_setup(cfg, tmp_path)
+    ops.verify_status = "failed"
+    ops.king_gate.set()
+    _join(sched)
+    for i in range(R.MAX_VERIFY_TRIES):
+        sched.tick(client, b0 + 1 + i)
+        _wait_verify(sched)
+    assert ops.verify_calls == ["ALFA"] * R.MAX_VERIFY_TRIES
+    assert sched.state.verify_queue == []
+
+
+def test_verify_queue_survives_a_restart(cfg, tmp_path):
+    armed, clock, ops, sched, client, era_start, b0 = _pending_leg_setup(cfg, tmp_path)
+    ops.king_gate.set()
+    _join(sched)
+    ops2 = _VerifyOps(tmp_path, clock)
+    ops2.commits = list(ops.commits)
+    sched2, _ = _sched(armed, tmp_path, clock, ops=ops2)
+    assert [q["hotkey"] for q in sched2.state.verify_queue] == ["ALFA"]
+
+
+def test_unsettled_verification_of_a_requeued_leg_is_dropped(cfg, tmp_path):
+    armed, clock, ops, sched, client, era_start, b0 = _pending_leg_setup(cfg, tmp_path)
+    with sched._lock:
+        sched.state.finished = []               # the era ended; the leg was requeued
+    sched._drain_verifies()
+    assert sched.state.verify_queue == []
