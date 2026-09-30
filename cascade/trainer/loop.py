@@ -131,6 +131,8 @@ log = logging.getLogger("cascade.trainer")
 # _funded_pod_identity_mismatch's reason when the payer's key is gone from the
 # vault: the leg paths class it _FundedKeyLost (auth), not _FundedTamper.
 KEY_LOST_REASON = "payer key unavailable to re-identify the pod"
+# How long a rollover teardown waits for a benchmark sweep on the old king pod.
+KING_RETIRE_WAIT_S = 3 * 3600
 
 
 class _FundedTamper(Exception):
@@ -7938,7 +7940,32 @@ class TrainerRunner:
 
     def _rolling_retire_king_pod(self, era) -> None:
         """Tear down an era's operator king pod (era over, or its pre-trained
-        king superseded)."""
+        king superseded) — but never under a running benchmark sweep: the
+        rollover teardown killed a verification mid-sweep (2026-09-29 22:04,
+        5HGxjV, then the second-best bench ever). A busy pod is retired by a
+        waiter thread once its sweep releases the pod lock (capped)."""
+        from .bench_hook import host_bench_lock, host_busy
+
+        host = self.__dict__.get("_rolling_king_hosts", {}).get(era.index)
+        if host is not None and host_busy(host):
+            log.info("rolling: era %d king pod busy benchmarking — teardown deferred until "
+                     "the sweep ends", era.index)
+
+            def _later() -> None:
+                lock = host_bench_lock(host)
+                got = lock.acquire(timeout=KING_RETIRE_WAIT_S)
+                if got:
+                    lock.release()
+                else:
+                    log.warning("rolling: era %d king pod still busy after %ds — tearing "
+                                "down anyway", era.index, KING_RETIRE_WAIT_S)
+                self._rolling_retire_king_pod_now(era)
+
+            threading.Thread(target=_later, name=f"retire-king-{era.index}", daemon=True).start()
+            return
+        self._rolling_retire_king_pod_now(era)
+
+    def _rolling_retire_king_pod_now(self, era) -> None:
         prefix = king_pod_name_prefix(self.cfg.subnet.netuid, str(era.base_seed))
         for pod in self._load_funded_ledger():
             if not pod.payer_hotkey and str(pod.instance_id).startswith(prefix + "-"):
@@ -7988,14 +8015,88 @@ class TrainerRunner:
                                            contract.arch_preset, role_dir=role_dir)
         if scores is None:
             return None
-        scored = {entry.trained_pointer: scores}
-        if getattr(host, "isolated", False):
-            self._payer_benched = {entry.trained_pointer}
-            duel = [e for e in (king, entry) if e is not None]
-            scored = self._verify_payer_benches(duel, scored, str(era.base_seed),
-                                                contract.arch_preset)
-        out = scored.get(entry.trained_pointer)
-        return dataclasses.asdict(out) if out is not None else None
+        if not getattr(host, "isolated", False):
+            return dataclasses.asdict(scores)              # operator lane: our own numbers
+        # A payer's pod: publish only numbers the operator reproduced on its
+        # own era king pod. When that cannot happen NOW (no era king leg yet,
+        # king pod busy benching, pod gone) the payer numbers are handed back
+        # for the scheduler's verification queue instead of being dropped
+        # (they were: 2026-09-29 the two best benches ever never published).
+        from .bench_hook import host_busy
+        from .rolling import VERIFY_PENDING
+
+        payer = dataclasses.asdict(scores)
+        if int(getattr(self.cfg.telemetry, "funded_bench_verify_top", 1)) <= 0:
+            log.info("round=%s: payer-pod bench for %s unverified (verification off) — "
+                     "not published", era.base_seed, entry.miner_hotkey[:12])
+            return None
+        if king is None:
+            return {VERIFY_PENDING: {**payer, "_reason": "era king leg not trained yet"}}
+        king_host = self._rolling_verify_host(king, era)
+        if king_host is not None and host_busy(king_host):
+            return {VERIFY_PENDING: {**payer, "_reason": "king pod busy"}}
+        status, ours = self._rolling_verify_payer(entry, payer, king, era)
+        if status == "ok":
+            return ours
+        if status == "forged":
+            return None
+        return {VERIFY_PENDING: {**payer, "_reason": f"verification {status}"}}
+
+    def _rolling_verify_host(self, king, era):
+        contract = self.cfg.throne_contracts()[0]
+        return (self._final_role_hosts.get(("king", contract.arch_preset, king.miner_hotkey))
+                or self.__dict__.get("_rolling_king_hosts", {}).get(era.index))
+
+    def _rolling_verify_payer(self, entry, payer: dict, king, era) -> tuple[str, dict | None]:
+        """Re-bench ONE payer-benched checkpoint on the era king's operator pod.
+
+        ``("ok", scores)`` — reproduced within tolerance: the OPERATOR's numbers;
+        ``("forged", None)`` — the payer's report beats ours by more than the
+        tolerance (tamper: dropped); ``("wait", None)`` — no usable king pod
+        yet (costs no attempt); ``("failed", {"error"})`` — the re-bench ran
+        and produced nothing. Bench runs on one pod are serialized
+        (bench_hook host lock), so this never pre-empts another sweep."""
+        import dataclasses
+
+        from ..eval.benchmarks import extract_bench_scores
+        from ..validator.cascade import cascade_score
+        from .bench_hook import push_checkpoint, run_post_round_benchmark
+
+        contract = self.cfg.throne_contracts()[0]
+        primary = contract.arch_preset
+        king_host = self._rolling_verify_host(king, era)
+        if king_host is None or self.cascade_bench_plan is None:
+            return "wait", None
+
+        def _score(d: dict) -> float:
+            return cascade_score(d["gifteval_crps"], d["gifteval_mase"], d["boom_crps"],
+                                 d["boom_mase"], d["time_crps"], d["time_mase"])
+
+        round_id = str(era.base_seed)
+        try:
+            local = self._fetch_checkpoint_dir(entry.trained_pointer)
+            role_dir = f"challenger-u{entry.miner_uid}-verify"
+            push_checkpoint(king_host, local, round_id, primary, role_dir)
+            report = run_post_round_benchmark(king_host, round_id, primary,
+                                              self.cascade_bench_plan,
+                                              work_root=self.work_root, role=role_dir)
+            raw = extract_bench_scores(report) if report is not None else None
+        except Exception as e:  # noqa: BLE001 — an attempt that ran and failed
+            return "failed", {"error": f"{type(e).__name__}: {str(e)[:160]}"}
+        if raw is None:
+            return "failed", {"error": "operator re-bench produced no scores"}
+        ours = dataclasses.asdict(BenchScores(**raw))
+        reported, actual = _score(payer), _score(ours)
+        tol = float(getattr(self.cfg.telemetry, "funded_bench_verify_tolerance", 0.02))
+        if reported < actual * (1.0 - tol):
+            log.error("round=%s: payer-pod bench for %s reported %.5f but the operator's "
+                      "re-bench scores %.5f — forged sweep; entry dropped (TAMPER)",
+                      round_id, entry.miner_hotkey[:12], reported, actual)
+            return "forged", None
+        log.info("round=%s: payer-pod bench for %s verified (payer %.5f, operator %.5f) — "
+                 "publishing the operator's numbers", round_id, entry.miner_hotkey[:12],
+                 reported, actual)
+        return "ok", ours
 
     def _rolling_publish_bench(self, round_id: str, created_block: int, pairs: list):
         from ..shared.bench_report import (

@@ -61,6 +61,15 @@ from .remote import error_tail
 
 log = logging.getLogger(__name__)
 
+# ``bench_challenger`` returns ``{VERIFY_PENDING: payer_scores}`` when the
+# payer-pod numbers exist but the operator's verification cannot run yet.
+VERIFY_PENDING = "_verify_pending"
+# Verification attempts that RAN and failed (push/sweep error, no scores)
+# before a queued entry is given up; waiting for a king leg/pod costs none.
+MAX_VERIFY_TRIES = 3
+# Settlement bench reports kept for late additions (4 eras of 4 settlements).
+KEEP_BENCH_REPORTS = 16
+
 BLOCK_SECONDS = 12.0
 # A booted king pod gets ONE retry after a non-transport failure (a Hippius
 # read stall is not necessarily the pod's fault); the next failure — or any
@@ -175,6 +184,16 @@ class RollingState:
     last_published_round_id: str = ""
     last_settled_boundary: int = 0
     rents: list[dict] = field(default_factory=list)              # roster: seniority at rent
+    # Deferred operator verification of payer-pod benches: {pointer, hotkey,
+    # entry, payer, round_id ("" until the leg settles), tries}. A leg whose
+    # verification cannot run when it finishes (no era king leg yet, king pod
+    # busy/gone) waits here instead of losing its bench numbers.
+    verify_queue: list[dict] = field(default_factory=list)
+    # The signed bench report of each recent settlement, so a late-verified
+    # number is ADDED to its own round's report (validators join bench numbers
+    # on (round_id, trained_pointer) and re-probe that report): {round_id:
+    # {"created_block": n, "pairs": [[entry, scores], ...]}}.
+    bench_reports: dict[str, dict] = field(default_factory=dict)
 
 
 def _entry_from_json(obj: dict) -> TrainedEntry:
@@ -216,6 +235,8 @@ def load_state(path: Path) -> RollingState:
         last_published_round_id=str(raw.get("last_published_round_id", "") or ""),
         last_settled_boundary=int(raw.get("last_settled_boundary", 0) or 0),
         rents=list(raw.get("rents", [])),
+        verify_queue=[dict(x) for x in raw.get("verify_queue", [])],
+        bench_reports={str(k): dict(v) for k, v in (raw.get("bench_reports") or {}).items()},
     )
 
 
@@ -229,6 +250,8 @@ def save_state(path: Path, state: RollingState) -> None:
         "last_published_round_id": state.last_published_round_id,
         "last_settled_boundary": state.last_settled_boundary,
         "rents": state.rents,
+        "verify_queue": state.verify_queue,
+        "bench_reports": state.bench_reports,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -422,6 +445,10 @@ class LegOps:
     def bench_king(self, entry: TrainedEntry, era: EraState) -> dict | None:
         return self.r._rolling_bench_king(entry, era)
 
+    def verify_bench(self, entry: TrainedEntry, payer: dict, king: TrainedEntry,
+                     era: EraState) -> tuple[str, dict | None]:
+        return self.r._rolling_verify_payer(entry, payer, king, era)
+
     def leg_failure(self, hotkey: str) -> tuple[str, bool, str, bool]:
         return self.r._funded_leg_failures.get(
             hotkey, ("challenger leg failed before dispatch", False, "infra", True))
@@ -534,6 +561,7 @@ class RollingScheduler:
         self._lock = threading.RLock()
         self._threads: dict[str, threading.Thread] = {}     # hotkey -> leg thread
         self._king_threads: dict[int, threading.Thread] = {}  # era index -> king leg thread
+        self._verify_thread: threading.Thread | None = None   # one operator verification at a time
         self._started = False
 
     # ── persistence ──────────────────────────────────────────────────────────
@@ -567,6 +595,7 @@ class RollingScheduler:
         self._settle(client, block, epoch_start)
         self._adopt_dethrone(client)
         self._maybe_king_legs(client, block, now)
+        self._drain_verifies()
         self._intake(client, block, now)
 
     # ── startup / restart ────────────────────────────────────────────────────
@@ -1290,6 +1319,13 @@ class RollingScheduler:
                 rolled = (self.state.current is not None
                           and era.index < self.state.current.index)
                 if not rolled:
+                    pending = (bench.get(VERIFY_PENDING) if isinstance(bench, dict) else None)
+                    if pending is not None:
+                        # Payer numbers the operator could not verify yet (no
+                        # era king leg / king pod busy or gone): queue them —
+                        # the numbers land once verified, never unverified.
+                        bench = None
+                        self._queue_verify(entry, pending)
                     self.state.finished.append(FinishedLeg(
                         hotkey=gen.hotkey, uid=gen.uid, ref=gen.ref, era_index=era.index,
                         started_block=block, reveal_block=gen.reveal_block,
@@ -1307,9 +1343,11 @@ class RollingScheduler:
                     queue.requeue(gen.hotkey, error="leg finished after its era ended",
                                   error_class="no_capacity", burn_attempt=False)
                 return
+            queued = any(q["pointer"] == entry.trained_pointer for q in self.state.verify_queue)
             log.info("rolling: %s's leg finished (era %d, target boundary %d)%s",
                      gen.hotkey[:12], era.index, target,
-                     "" if bench else " — no bench numbers")
+                     "" if bench else (" — bench verification queued" if queued
+                                       else " — no bench numbers"))
 
         def _run() -> None:
             try:
@@ -1591,6 +1629,7 @@ class RollingScheduler:
             report = self.ops.publish_bench(round_id, created_block, bench_entries)
             if report is not None:
                 cur.king_bench_published = cur.king_bench_published or cur.king_bench is not None
+        self._record_bench_report(round_id, created_block, bench_entries, ready)
         self.ops.record_bench_candidates(manifest, report)
         queue = self.ops.queue()
         gens = []
@@ -1648,6 +1687,132 @@ class RollingScheduler:
             era=era.spec().to_json(),
             prev_round_id=self.state.last_published_round_id,
         )
+
+    # ── deferred bench verification ──────────────────────────────────────────
+
+    def _queue_verify(self, entry: TrainedEntry, payer: dict) -> None:
+        """Park ``entry``'s payer-pod numbers until the operator can verify
+        them. Caller holds the lock."""
+        if any(q["pointer"] == entry.trained_pointer for q in self.state.verify_queue):
+            return
+        reason = str(payer.get("_reason", "") or "")
+        payer = {k: v for k, v in payer.items() if not str(k).startswith("_")}
+        self.state.verify_queue.append({
+            "pointer": entry.trained_pointer, "hotkey": entry.miner_hotkey,
+            "entry": _entry_to_json(entry), "payer": payer, "round_id": "", "tries": 0,
+        })
+        log.info("rolling: %s's payer-pod bench queued for operator verification%s",
+                 entry.miner_hotkey[:12], f" ({reason})" if reason else "")
+
+    def _record_bench_report(self, round_id: str, created_block: int, bench_entries: list,
+                             ready: list[FinishedLeg]) -> None:
+        """Remember what this settlement's bench report carries, and stamp the
+        settled legs' queued verifications with it: a late-verified number is
+        added to THIS report (validators join on (round_id, pointer))."""
+        import dataclasses as _dc
+
+        pointers = {_entry_from_json(f.entry).trained_pointer for f in ready}
+        with self._lock:
+            self.state.bench_reports[str(round_id)] = {
+                "created_block": int(created_block),
+                "pairs": [[_entry_to_json(e), _dc.asdict(b)] for e, b in bench_entries],
+            }
+            by_age = sorted(self.state.bench_reports,
+                            key=lambda r: int(self.state.bench_reports[r].get("created_block", 0)))
+            for old in by_age[:-KEEP_BENCH_REPORTS]:      # oldest first (state JSON is key-sorted)
+                self.state.bench_reports.pop(old, None)
+            for q in self.state.verify_queue:
+                if q["pointer"] in pointers and not q.get("round_id"):
+                    q["round_id"] = str(round_id)
+            self._save()
+
+    def _drain_verifies(self) -> None:
+        """Run the next queued verification — one at a time, on the current
+        era's king pod — once that era's king leg exists. Queue hygiene first:
+        an unsettled entry whose leg was requeued (era ended) has no report to
+        join and is dropped; so is one whose round report aged out."""
+        if self._verify_thread is not None and self._verify_thread.is_alive():
+            return
+        with self._lock:
+            finished = {_entry_from_json(f.entry).trained_pointer for f in self.state.finished}
+            keep = []
+            for q in self.state.verify_queue:
+                if not q.get("round_id") and q["pointer"] not in finished:
+                    log.warning("rolling: queued bench verification for %s dropped — its leg "
+                                "never settled (requeued)", q["hotkey"][:12])
+                elif q.get("round_id") and q["round_id"] not in self.state.bench_reports:
+                    log.warning("rolling: queued bench verification for %s dropped — round "
+                                "%s's report aged out", q["hotkey"][:12], q["round_id"])
+                else:
+                    keep.append(q)
+            if len(keep) != len(self.state.verify_queue):
+                self.state.verify_queue = keep
+                self._save()
+            cur = self.state.current
+            king = cur.king() if cur is not None else None
+            if not keep or king is None:
+                return
+            item = dict(keep[0])
+
+        def _run() -> None:
+            entry = _entry_from_json(item["entry"])
+            try:
+                status, scores = self.ops.verify_bench(entry, dict(item["payer"]), king, cur)
+            except Exception as e:  # noqa: BLE001 — counts as a failed attempt
+                status, scores = "failed", {"error": str(e)[:200]}
+            self._apply_verify(item["pointer"], status, scores)
+
+        t = threading.Thread(target=_run, name=f"verify-{item['hotkey'][:12]}", daemon=True)
+        self._verify_thread = t
+        t.start()
+
+    def _apply_verify(self, pointer: str, status: str, scores: dict | None) -> None:
+        from ..shared.manifest import BenchScores
+
+        republish = None
+        with self._lock:
+            q = next((x for x in self.state.verify_queue if x["pointer"] == pointer), None)
+            if q is None:
+                return
+            if status == "wait":
+                return                                    # king pod not usable yet
+            if status == "failed":
+                q["tries"] = int(q.get("tries", 0)) + 1
+                if q["tries"] < MAX_VERIFY_TRIES:
+                    log.warning("rolling: bench verification for %s failed (attempt %d/%d): %s",
+                                q["hotkey"][:12], q["tries"], MAX_VERIFY_TRIES,
+                                (scores or {}).get("error", ""))
+                    self._save()
+                    return
+                log.warning("rolling: bench verification for %s failed %d times — dropped",
+                            q["hotkey"][:12], q["tries"])
+            elif status == "forged":
+                log.error("rolling: %s's payer-pod bench did not reproduce on the operator's "
+                          "pod (TAMPER) — numbers dropped", q["hotkey"][:12])
+            self.state.verify_queue = [x for x in self.state.verify_queue if x is not q]
+            if status == "ok" and scores is not None:
+                leg = next((f for f in self.state.finished
+                            if _entry_from_json(f.entry).trained_pointer == pointer), None)
+                if leg is not None:
+                    leg.bench = dict(scores)              # rides its own settlement's report
+                    log.info("rolling: %s's bench verified — joins its settlement report",
+                             q["hotkey"][:12])
+                elif q.get("round_id") in self.state.bench_reports:
+                    rep = self.state.bench_reports[q["round_id"]]
+                    rep["pairs"] = [p for p in rep["pairs"]
+                                    if p[0].get("trained_pointer") != pointer]
+                    rep["pairs"].append([q["entry"], dict(scores)])
+                    republish = (q["round_id"], int(rep["created_block"]),
+                                 [(_entry_from_json(e), BenchScores(**b)) for e, b in rep["pairs"]])
+            self._save()
+        if republish is not None:
+            rid, cblock, pairs = republish
+            try:
+                self.ops.publish_bench(rid, cblock, pairs)
+                log.info("rolling: round %s bench report republished with %s's verified "
+                         "numbers (%d entries)", rid, pointer[-12:], len(pairs))
+            except Exception as e:  # noqa: BLE001 — telemetry; the numbers stay recorded
+                log.warning("rolling: republishing round %s's bench report failed: %s", rid, e)
 
     def _bench_entries(self, era: EraState, king: TrainedEntry, ready: list[FinishedLeg]) -> list:
         """``(entry, BenchScores)`` pairs for the settlement's bench report:

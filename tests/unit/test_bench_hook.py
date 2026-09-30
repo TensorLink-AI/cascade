@@ -328,3 +328,45 @@ def test_push_checkpoint_raises_on_a_failed_stream(tmp_path: Path):
 
     with pytest.raises(RuntimeError, match="checkpoint push"):
         push_checkpoint(HOST, tmp_path, "42", "toto2-4m", "king-verify", runner=runner)
+
+
+def test_sweeps_on_one_pod_are_serialized_and_other_pods_run_in_parallel():
+    """Every launch pre-empts running sweeps on its host (PREEMPT_BENCHMARKS),
+    so two sweeps on ONE pod must never overlap (2026-09-29: verification
+    re-benches killed each other, rc 143); different pods stay concurrent."""
+    import threading
+    import time
+
+    from cascade.trainer.bench_hook import host_busy
+
+    report = {"checkpoint": "x", "suites": []}
+    active: dict[str, int] = {}
+    peak: dict[str, int] = {}
+    guard = threading.Lock()
+
+    def runner_for(key):
+        def runner(argv, timeout):
+            if "cat " in " ".join(argv):
+                return CompletedProcess(argv, 0, stdout=json.dumps(report), stderr="")
+            with guard:
+                active[key] = active.get(key, 0) + 1
+                peak[key] = max(peak.get(key, 0), active[key])
+            time.sleep(0.15)
+            with guard:
+                active[key] -= 1
+            return CompletedProcess(argv, 0, stdout="", stderr="")
+        return runner
+
+    other = RemoteHost(name="pod2", host="5.6.7.8", workdir="/root/cascade", cuda_device="0")
+    threads = [threading.Thread(target=run_post_round_benchmark,
+                                args=(h, "42", "toto2-4m", BenchPlan()),
+                                kwargs={"runner": runner_for(h.host), "role": f"r{i}"})
+               for i, h in enumerate([HOST, HOST, HOST, other, other])]
+    for t in threads:
+        t.start()
+    time.sleep(0.05)
+    assert host_busy(HOST)
+    for t in threads:
+        t.join(5)
+    assert peak[HOST.host] == 1 and peak[other.host] == 1
+    assert not host_busy(HOST) and not host_busy(other)
