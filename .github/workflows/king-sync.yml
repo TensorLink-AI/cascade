@@ -3,9 +3,12 @@ name: king-sync
 # Archives the subnet's current best generator (the king) into
 # champions/king/ — one commit per reign, scan-gated, provenance-stamped.
 #
-# Every run: resolve the king from the validators' newest signed receipts
-# (named the moment a dethrone is scored; the highest-incentive UID is the
-# fallback) → fetch its exact code by digest →
+# Every run: resolve the king by the TRAINER's rule — the anchor validator's
+# latest signed receipt ([manifest] validator_hotkey; signature verified),
+# verdict.king_hotkey of a scored round (named the moment a dethrone is
+# scored), never a forfeited hotkey, code ref from that receipt's signed
+# manifest; an unusable receipt keeps the archived king → fetch its exact
+# code by digest →
 # static security scan (scripts/scan_generator.py; high-severity findings
 # REFUSE the archive) → commit + push only when the digest changed. A quiet
 # run is a no-op (~40 s), so the 15-minute schedule costs little between
