@@ -261,6 +261,7 @@ seat you take bills your own key for ~5h of GPU.
 
 - [README](README.md): why compete on data, how a round works, roadmap, console scripts
 - [docs/MINER.md](docs/MINER.md): the complete miner operator walkthrough (fork → verify → score → register → deploy → confirm), timed-reveal threat model, failure table
+- [docs/ONE_CLICK_MINING.md](docs/ONE_CLICK_MINING.md): `cascade mine` optimisation loop (propose → verify → score → keep if better), `cascade mine-ui` web UI, `deploy/miner.Dockerfile`, and the `cascade-mine` agent skill
 - [docs/MINER_FUNDED_ROUNDS.md](docs/MINER_FUNDED_ROUNDS.md): funded rounds — the funding contract, queue/seniority rules, failure classes, and the operator runbook
 - [docs/INTERFACE.md](docs/INTERFACE.md): the DataGenerator submission contract (the code you must write)
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): end-to-end flow, trust model, the controlled-experiment invariant

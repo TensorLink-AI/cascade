@@ -48,3 +48,7 @@ provision.toml
 
 # Editor / OS
 .DS_Store
+
+# `cascade mine` run directories — never baked into an image
+mine-run/
+**/mine-run/

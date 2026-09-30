@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cascade Mine</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --ink: #14171c; --muted: #5d6673; --line: #e2e5ea;
+  --accent: #2f6fde; --good: #1b8a4b; --bad: #c2362b; --warn: #b7791f; --king: #8a4fd6;
+  --dot: #9aa3af; --code: #f0f2f5;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1216; --panel: #171b21; --ink: #e7eaee; --muted: #9aa3af; --line: #272d36;
+    --accent: #5b93f0; --good: #3fbf73; --bad: #ef6a5f; --warn: #e0a84a; --king: #b18af0;
+    --dot: #5d6673; --code: #11151a;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 14px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
+header h1 { font-size: 17px; margin: 0; letter-spacing: .2px; }
+.pill { padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 600;
+  border: 1px solid var(--line); color: var(--muted); }
+.pill.running { color: var(--good); border-color: var(--good); }
+.pill.failed { color: var(--bad); border-color: var(--bad); }
+.chips { display: flex; gap: 6px; flex-wrap: wrap; margin-left: auto; }
+.chip { font-size: 12px; color: var(--muted); padding: 2px 8px; border-radius: 6px;
+  background: var(--code); }
+.chip.ok::before { content: "● "; color: var(--good); }
+.chip.no::before { content: "○ "; color: var(--muted); }
+main { max-width: 1180px; margin: 0 auto; padding: 16px; display: grid; gap: 16px;
+  grid-template-columns: 340px 1fr; }
+@media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  padding: 14px; min-width: 0; }
+h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted);
+  margin: 0 0 10px; }
+label { display: block; font-size: 12px; color: var(--muted); margin: 8px 0 3px; }
+input, select { width: 100%; padding: 7px 9px; border-radius: 7px; border: 1px solid var(--line);
+  background: var(--bg); color: var(--ink); font: inherit; }
+.row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.check { display: flex; gap: 8px; align-items: center; margin-top: 10px; font-size: 13px; }
+.check input { width: auto; }
+button { font: inherit; font-weight: 600; border-radius: 8px; padding: 9px 14px; cursor: pointer;
+  border: 1px solid var(--line); background: var(--bg); color: var(--ink); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; width: 100%;
+  padding: 12px; font-size: 15px; margin-top: 14px; }
+button.danger { color: var(--bad); border-color: var(--bad); }
+button:disabled { opacity: .45; cursor: not-allowed; }
+.btns { display: flex; gap: 8px; margin-top: 8px; }
+.btns button { flex: 1; }
+.hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
+.tiles { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 14px; }
+@media (max-width: 600px) { .tiles { grid-template-columns: repeat(2, 1fr); } }
+.tile { background: var(--code); border-radius: 8px; padding: 10px; }
+.tile .k { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
+.tile .v { font-size: 20px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.tile .s { font-size: 12px; color: var(--muted); }
+.good { color: var(--good); } .bad { color: var(--bad); }
+#chart { width: 100%; height: 240px; display: block; }
+#chart text { fill: var(--muted); font-size: 11px; }
+.tablewrap { overflow-x: auto; margin-top: 12px; max-height: 360px; overflow-y: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line);
+  vertical-align: top; }
+th { color: var(--muted); font-weight: 600; font-size: 12px; position: sticky; top: 0;
+  background: var(--panel); }
+td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+td.note { color: var(--muted); max-width: 520px; overflow-wrap: anywhere; }
+.st { font-size: 11px; font-weight: 700; text-transform: uppercase; }
+.st.scored { color: var(--ink); } .st.rejected, .st.error { color: var(--bad); }
+.st.baseline { color: var(--accent); } .st.king { color: var(--king); }
+tr.acc td:first-child { box-shadow: inset 3px 0 var(--good); }
+pre { background: var(--code); border-radius: 8px; padding: 10px; font-size: 12px;
+  max-height: 260px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; }
+.phase { color: var(--muted); font-size: 13px; }
+details summary { cursor: pointer; color: var(--muted); font-size: 13px; margin-top: 10px; }
+.wide { grid-column: 1 / -1; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Cascade · one-click mining</h1>
+  <span id="status" class="pill">idle</span>
+  <span id="phase" class="phase"></span>
+  <div class="chips" id="env"></div>
+</header>
+
+<main>
+  <div style="display:grid; gap:16px; align-content:start">
+    <section>
+      <h2>Run</h2>
+      <label for="proposer">Proposer</label>
+      <select id="proposer">
+        <option value="tune">tune: config weights (no LLM)</option>
+        <option value="agent">agent: Claude Code edits code</option>
+      </select>
+      <div class="row">
+        <div><label for="iterations">Iterations</label><input id="iterations" type="number" min="1" value="20"></div>
+        <div><label for="train_hours">Hours / candidate</label><input id="train_hours" type="number" step="0.05" min="0.01" value="0.25"></div>
+      </div>
+      <div class="row">
+        <div><label for="seeds">Seeds</label><input id="seeds" value="0"></div>
+        <div><label for="device">Device</label>
+          <select id="device"><option>auto</option><option>cuda</option><option>cpu</option></select></div>
+      </div>
+      <label for="pool_dir">Held-out pool dir (.npy/.npz)</label>
+      <input id="pool_dir" placeholder="empty = synthetic sample (weak signal)">
+      <div class="check"><input type="checkbox" id="live" checked><label for="live" style="margin:0">Train from the live round's init (needs network)</label></div>
+      <details><summary>Advanced</summary>
+        <label for="start">Start generator</label><input id="start" placeholder="default: champions/king">
+        <label for="king">Reference king</label><input id="king" placeholder="default: champions/king · 'none' to skip">
+        <label for="min_improvement">Min relative improvement</label><input id="min_improvement" type="number" step="0.0005" value="0.001">
+        <label for="n_windows">Eval windows</label><input id="n_windows" type="number" placeholder="default: heat_n_windows">
+      </details>
+      <button class="primary" id="startBtn">▶ Start mining</button>
+      <div class="btns">
+        <button id="stopBtn">Stop after candidate</button>
+        <button id="killBtn" class="danger">Kill</button>
+      </div>
+      <p class="hint">Scores are local and directional. Validators judge on a private pool,
+        so rotate your pool between runs.</p>
+    </section>
+
+    <section>
+      <h2>Submit best</h2>
+      <label for="intake">Intake</label><input id="intake" value="https://submissions.cascadesub.net">
+      <div class="row">
+        <div><label for="wallet_name">Wallet</label><input id="wallet_name" list="wallets"></div>
+        <div><label for="wallet_hotkey">Hotkey</label><input id="wallet_hotkey"></div>
+      </div>
+      <datalist id="wallets"></datalist>
+      <label for="label">Label</label><input id="label" maxlength="32" placeholder="optional">
+      <label for="confirm">Type SUBMIT to confirm</label><input id="confirm" autocomplete="off">
+      <button id="submitBtn" style="width:100%; margin-top:10px">Submit best privately</button>
+      <p class="hint" id="submitHint">Spends the hotkey. Funds the leg with $LIUM_API_KEY from the
+        container environment (keep ~6 h of GPU on the account).</p>
+    </section>
+  </div>
+
+  <div style="display:grid; gap:16px; align-content:start; min-width:0">
+    <section>
+      <h2>Progress</h2>
+      <div class="tiles">
+        <div class="tile"><div class="k">Baseline</div><div class="v" id="tBase">—</div><div class="s" id="tBaseS">&nbsp;</div></div>
+        <div class="tile"><div class="k">Best</div><div class="v" id="tBest">—</div><div class="s" id="tBestS">&nbsp;</div></div>
+        <div class="tile"><div class="k">Reference king</div><div class="v" id="tKing">—</div><div class="s">same pool · seeds · init</div></div>
+        <div class="tile"><div class="k">Best vs king</div><div class="v" id="tVs">—</div><div class="s" id="tVsS">&nbsp;</div></div>
+      </div>
+      <svg id="chart" role="img" aria-label="candidate scores over iterations"></svg>
+      <div class="tablewrap">
+        <table>
+          <thead><tr><th>#</th><th>Status</th><th>Score</th><th>Δ vs parent best</th><th>Time</th><th>Change</th></tr></thead>
+          <tbody id="rows"></tbody>
+        </table>
+      </div>
+    </section>
+    <section>
+      <h2>Log</h2>
+      <pre id="log">(no run yet)</pre>
+      <details id="subLogWrap"><summary>Submit log</summary><pre id="subLog"></pre></details>
+    </section>
+  </div>
+</main>
+
+<script>
+const TOKEN = __CASCADE_TOKEN__;
+const $ = (id) => document.getElementById(id);
+const api = (path, body) => fetch(path, {
+  method: body === undefined ? "GET" : "POST",
+  headers: { "X-Cascade-Token": TOKEN, "Content-Type": "application/json" },
+  body: body === undefined ? undefined : JSON.stringify(body),
+}).then(async (r) => { const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error(j.error || r.status); return j; });
+
+const fmt = (x) => x == null ? "—" : Number(x).toFixed(5);
+const pct = (x) => x == null ? "—" : (x >= 0 ? "+" : "") + (100 * x).toFixed(2) + "%";
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const dur = (s) => !s ? "" : s < 90 ? `${Math.round(s)}s` : s < 5400 ? `${Math.round(s / 60)}m` : `${(s / 3600).toFixed(1)}h`;
+
+// Remember form values per browser (a convenience; nothing here is a secret).
+const FIELDS = ["proposer", "iterations", "train_hours", "seeds", "device", "pool_dir", "start", "king",
+  "min_improvement", "n_windows", "intake", "wallet_name", "wallet_hotkey", "label"];
+try { const saved = JSON.parse(localStorage.getItem("cascade-mine") || "{}");
+  for (const f of FIELDS) if (saved[f] != null) $(f).value = saved[f];
+  if (saved.live != null) $("live").checked = saved.live; } catch (e) {}
+const saveForm = () => { try { const o = { live: $("live").checked };
+  for (const f of FIELDS) o[f] = $(f).value; localStorage.setItem("cascade-mine", JSON.stringify(o)); } catch (e) {} };
+
+$("startBtn").onclick = async () => {
+  saveForm();
+  const b = {};
+  for (const f of ["proposer", "iterations", "train_hours", "seeds", "device", "pool_dir", "start", "king", "min_improvement", "n_windows"]) b[f] = $(f).value.trim();
+  if ($("live").checked) b.warm_start = "live";
+  try { await api("/api/start", b); refresh(); } catch (e) { alert("start failed: " + e.message); }
+};
+$("stopBtn").onclick = () => api("/api/stop", {}).then(refresh).catch((e) => alert(e.message));
+$("killBtn").onclick = () => confirm("Kill the loop now? The current candidate is lost.") &&
+  api("/api/stop", { force: true }).then(refresh).catch((e) => alert(e.message));
+$("submitBtn").onclick = async () => {
+  saveForm();
+  const b = { confirm: $("confirm").value.trim() };
+  for (const f of ["intake", "wallet_name", "wallet_hotkey", "label"]) b[f] = $(f).value.trim();
+  try { await api("/api/submit", b); $("confirm").value = ""; $("subLogWrap").open = true; refresh(); }
+  catch (e) { alert("submit refused: " + e.message); }
+};
+
+function chart(hist, kingScore) {
+  const svg = $("chart"), W = svg.clientWidth || 700, H = 240, L = 58, R = 12, T = 12, B = 26;
+  const pts = hist.filter((h) => h.score != null && h.status !== "king");
+  if (!pts.length) { svg.innerHTML = `<text x="${W / 2}" y="${H / 2}" text-anchor="middle">no scores yet</text>`; return; }
+  const ys = pts.map((p) => p.score).concat(kingScore != null ? [kingScore] : []);
+  let lo = Math.min(...ys), hi = Math.max(...ys); const pad = (hi - lo) * 0.08 || lo * 0.01 || 0.01; lo -= pad; hi += pad;
+  const n = Math.max(...pts.map((p) => p.iteration), 1);
+  const X = (i) => L + (W - L - R) * (i / n), Y = (v) => T + (H - T - B) * (1 - (v - lo) / (hi - lo));
+  let g = "";
+  for (let k = 0; k <= 4; k++) { const v = lo + (hi - lo) * k / 4;
+    g += `<line x1="${L}" x2="${W - R}" y1="${Y(v)}" y2="${Y(v)}" stroke="var(--line)"/><text x="${L - 6}" y="${Y(v) + 4}" text-anchor="end">${v.toFixed(4)}</text>`; }
+  g += `<text x="${W - R}" y="${H - 6}" text-anchor="end">iteration</text>`;
+  if (kingScore != null) g += `<line x1="${L}" x2="${W - R}" y1="${Y(kingScore)}" y2="${Y(kingScore)}" stroke="var(--king)" stroke-dasharray="5 4"/><text x="${W - R - 2}" y="${Y(kingScore) - 5}" text-anchor="end" style="fill:var(--king)">king</text>`;
+  let best = Infinity, path = "";
+  for (const p of pts.slice().sort((a, b) => a.iteration - b.iteration)) {
+    if (p.accepted && p.score < best) { path += (path ? ` H${X(p.iteration)} V${Y(p.score)}` : `M${X(p.iteration)} ${Y(p.score)}`); best = p.score; }
+  }
+  if (path) g += `<path d="${path} H${X(n)}" fill="none" stroke="var(--good)" stroke-width="2"/>`;
+  for (const p of pts) g += `<circle cx="${X(p.iteration)}" cy="${Y(p.score)}" r="${p.accepted ? 4.5 : 3.2}" fill="${p.accepted ? "var(--good)" : "var(--dot)"}"><title>#${p.iteration} ${p.score.toFixed(5)} ${esc(p.note)}</title></circle>`;
+  svg.innerHTML = g;
+}
+
+function render(s) {
+  const st = s.state || {}, hist = s.history || [], env = s.env || {};
+  const status = s.running ? "running" : (st.status || "idle");
+  $("status").textContent = status; $("status").className = "pill " + status;
+  $("phase").textContent = s.running ? (st.phase || "") : (st.error ? "error: " + st.error : "");
+  $("startBtn").disabled = s.running; $("stopBtn").disabled = !s.running; $("killBtn").disabled = !s.running;
+  $("submitBtn").disabled = s.running || !s.has_best || s.submitting;
+
+  const chip = (ok, t) => `<span class="chip ${ok ? "ok" : "no"}">${esc(t)}</span>`;
+  $("env").innerHTML = chip(env.gpu, "GPU") + chip(env.claude_cli && env.anthropic_auth, "Claude agent") +
+    chip(env.lium_api_key, "LIUM_API_KEY") + chip((env.wallets || []).length, "wallet");
+  $("wallets").innerHTML = (env.wallets || []).map((w) => `<option value="${esc(w)}">`).join("");
+
+  const base = hist.find((h) => h.status === "baseline"), best = st.best, king = st.king;
+  $("tBase").textContent = fmt(base && base.score);
+  $("tBaseS").textContent = st.init || "";
+  $("tBest").textContent = fmt(best && best.score);
+  $("tBestS").textContent = best ? `#${best.iteration} · ${st.n_accepted || 0} accepted / ${st.n_candidates || 0}` : "";
+  $("tKing").textContent = fmt(king && king.score);
+  const vs = st.beats_king;
+  $("tVs").textContent = pct(vs); $("tVs").className = "v " + (vs == null ? "" : vs > 0 ? "good" : "bad");
+  $("tVsS").textContent = vs == null ? "" : vs > 0.01 ? "worth a submission" : vs > 0 ? "inside the noise band" : "keep climbing";
+
+  chart(hist, king && king.score);
+  let running = Infinity; const rows = [];
+  for (const h of hist) {
+    const prev = running;
+    if (h.accepted && h.score != null) running = Math.min(running, h.score);
+    const d = h.score != null && isFinite(prev) && h.status === "scored" ? (h.score - prev) / prev : null;
+    rows.push(`<tr class="${h.accepted ? "acc" : ""}"><td class="num">${h.iteration}</td><td><span class="st ${esc(h.status)}">${esc(h.status)}${h.accepted && h.status === "scored" ? " ✓" : ""}</span></td>` +
+      `<td class="num">${fmt(h.score)}</td><td class="num ${d == null ? "" : d < 0 ? "good" : "bad"}">${d == null ? "" : pct(d)}</td>` +
+      `<td class="num">${dur(h.seconds)}</td><td class="note">${esc(h.note)}${h.detail ? `<br><small>${esc(h.detail.slice(0, 300))}</small>` : ""}</td></tr>`);
+  }
+  $("rows").innerHTML = rows.reverse().join("") || `<tr><td colspan="6" class="note">Press Start. Pass 0 scores the baseline and the reference king.</td></tr>`;
+  const log = $("log"), atEnd = log.scrollTop + log.clientHeight >= log.scrollHeight - 4;
+  log.textContent = s.log || "(no run yet)"; if (atEnd) log.scrollTop = log.scrollHeight;
+  $("subLog").textContent = s.submit_log || "";
+  $("submitHint").textContent = env.lium_api_key
+    ? "Spends the hotkey. The leg is funded with $LIUM_API_KEY from the environment (keep ~6 h of GPU on the account)."
+    : "LIUM_API_KEY is not set: the code is stored and committed but the leg stays unfunded (run `cascade fund` later).";
+}
+
+let busy = false;
+async function refresh() {
+  if (busy) return; busy = true;
+  try { render(await api("/api/status")); } catch (e) { $("phase").textContent = "UI offline: " + e.message; }
+  finally { busy = false; }
+}
+refresh(); setInterval(refresh, 3000);
+</script>
+</body>
+</html>

@@ -85,6 +85,13 @@
   makes the operator forget your key. Needs the ``[chain]`` extra (wallet
   signing only — no chain connection is made).
 
+* ``cascade mine`` — the one-click optimisation loop (``optimize.py``):
+  propose a variant of the best generator (``tune``: perturb config.json
+  weights; ``agent``: a coding agent edits the code), ``verify`` it, ``score``
+  it on one fixed pool/seed/init, keep it if better, repeat. Never submits
+  unless ``--auto-submit`` AND the best beats the reference king by
+  ``--submit-margin``. ``cascade mine-ui`` is the web front end for it.
+
 * ``cascade submit <repo_dir> <intake_url>`` — the DIRECT path (DEC-CA-0036):
   verify locally, ZIP deterministically, POST the code straight to the
   operator's intake (with your Lium key in the same request when
@@ -1303,6 +1310,130 @@ def _cmd_fund(args: argparse.Namespace) -> int:
     return 1
 
 
+def _add_mine(sub: argparse._SubParsersAction) -> None:
+    from .optimize import DEFAULT_AGENT_CMD
+
+    p = sub.add_parser(
+        "mine",
+        help="One-click optimisation loop: propose a generator variant, verify, score "
+        "locally, keep it if better — repeat. See cascade/miner/optimize.py.",
+    )
+    p.add_argument("--workdir", type=Path, default=Path("./mine-run"),
+                   help="Run directory (state.json, history.jsonl, candidates/, best/). "
+                        "Re-running on the same workdir resumes from its best.")
+    p.add_argument("--start", type=Path, default=None,
+                   help="Generator to start from (default: champions/king if present, "
+                        "else scripts/example_generator).")
+    p.add_argument("--king", type=Path, default=None,
+                   help="Reference king to score once on the same pool/seeds/init "
+                        "(default: champions/king if present; 'none' to skip).")
+    p.add_argument("--proposer", choices=("tune", "agent"), default="tune",
+                   help="tune = perturb config.json weights/floats (no LLM); agent = a "
+                        "coding agent edits the code with the cascade-mine skill.")
+    p.add_argument("--agent-cmd", default=DEFAULT_AGENT_CMD,
+                   help="Agent command; gets the prompt on stdin, runs in the candidate dir "
+                        "({dir} is substituted). Default: %(default)s")
+    p.add_argument("--agent-timeout", type=float, default=1800.0)
+    p.add_argument("--iterations", type=int, default=20)
+    p.add_argument("--seeds", default="0",
+                   help="Comma-separated round seeds; a candidate's score is the mean over "
+                        "them (more seeds = less noise, proportionally slower).")
+    p.add_argument("--min-improvement", type=float, default=0.001,
+                   help="Relative improvement a candidate needs to replace the best.")
+    p.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
+    p.add_argument("--pool-dir", type=Path, default=None,
+                   help="Held-out .npy/.npz series to score on (strongly recommended).")
+    p.add_argument("--pool", default="", dest="pool_ref", help="Hub pool ref (repo@digest).")
+    p.add_argument("--train-hours", type=float, default=0.25,
+                   help="Per-candidate training budget (default %(default)s h).")
+    p.add_argument("--n-windows", type=int, default=None)
+    p.add_argument("--device", default="auto", help="auto | cuda | cpu")
+    p.add_argument("--warm-start", default=None, metavar="live|repo@digest|DIR",
+                   help="Init every candidate trains from (resolved once per run).")
+    p.add_argument("--auto-submit", action="store_true",
+                   help="At the end, `cascade submit` the best IF it beats the reference "
+                        "king by --submit-margin. Spends the hotkey and funds a leg "
+                        "($LIUM_API_KEY).")
+    p.add_argument("--submit-margin", type=float, default=0.01)
+    p.add_argument("--intake", default="https://submissions.cascadesub.net")
+    p.add_argument("--wallet-name", default="")
+    p.add_argument("--wallet-hotkey", default="")
+    p.add_argument("--label", default="")
+    p.set_defaults(func=_cmd_mine)
+
+
+def _default_start_and_king(args: argparse.Namespace) -> tuple[Path, Path | None]:
+    repo_root = Path(__file__).resolve().parents[2]
+    king = repo_root / "champions" / "king"
+    example = repo_root / "scripts" / "example_generator"
+    start = args.start or (king if king.is_dir() else example)
+    if args.king is not None and str(args.king).lower() == "none":
+        ref = None
+    else:
+        ref = args.king or (king if king.is_dir() else None)
+    return start, ref
+
+
+def _cmd_mine(args: argparse.Namespace) -> int:
+    import logging
+
+    from .optimize import LoopConfig, OptimizationLoop
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    cfg = load_chain_config(args.chain_toml)
+    start, king = _default_start_and_king(args)
+    try:
+        seeds = tuple(int(s) for s in str(args.seeds).split(",") if s.strip())
+    except ValueError:
+        print(f"error: --seeds must be comma-separated ints, got {args.seeds!r}", file=sys.stderr)
+        return 2
+    lc = LoopConfig(
+        workdir=args.workdir, start_dir=start, king_dir=king, proposer=args.proposer,
+        iterations=args.iterations, seeds=seeds or (0,), min_improvement=args.min_improvement,
+        pool_dir=args.pool_dir, pool_ref=args.pool_ref, train_hours=args.train_hours,
+        n_windows=args.n_windows, device=args.device, warm_start=args.warm_start,
+        agent_cmd=args.agent_cmd, agent_timeout=args.agent_timeout,
+        auto_submit=args.auto_submit, submit_margin=args.submit_margin, intake=args.intake,
+        wallet_name=args.wallet_name, wallet_hotkey=args.wallet_hotkey, label=args.label,
+    )
+    try:
+        state = OptimizationLoop(lc, chain_cfg=cfg).run()
+    except Exception as e:  # noqa: BLE001
+        print(f"mine failed: {type(e).__name__}: {e}", file=sys.stderr)
+        return 1
+    best, king_rec = state.get("best") or {}, state.get("king") or {}
+    print(f"\n{state.get('status')}: best={best.get('score')} (#{best.get('iteration')})  "
+          f"king={king_rec.get('score')}  → {args.workdir / 'best'}")
+    if state.get("beats_king") is not None:
+        print(f"  vs reference king: {state['beats_king']:+.2%} (positive = better)")
+    if state.get("submit"):
+        print(f"  submit: {state['submit']}")
+    return 0
+
+
+def _add_mine_ui(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser(
+        "mine-ui",
+        help="Local web UI for `cascade mine`: start/stop the loop, watch scores, "
+        "submit the best with one confirmed click.",
+    )
+    p.add_argument("--workdir", type=Path, default=Path("./mine-run"))
+    p.add_argument("--host", default="127.0.0.1",
+                   help="Bind address. A non-loopback bind requires a token (auto-generated "
+                        "unless --token / $CASCADE_UI_TOKEN).")
+    p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--token", default=None, help="Access token (default: $CASCADE_UI_TOKEN).")
+    p.add_argument("--chain-toml", type=Path, default=None)
+    p.set_defaults(func=_cmd_mine_ui)
+
+
+def _cmd_mine_ui(args: argparse.Namespace) -> int:
+    from .ui import serve
+
+    return serve(args.workdir, host=args.host, port=args.port, token=args.token,
+                 chain_toml=args.chain_toml)
+
+
 def main(argv: list[str] | None = None) -> int:
     from ..shared.env import load_env_files
     load_env_files()
@@ -1319,6 +1450,8 @@ def main(argv: list[str] | None = None) -> int:
     _add_duel(sub)
     _add_fund(sub)
     _add_submit(sub)
+    _add_mine(sub)
+    _add_mine_ui(sub)
     args = parser.parse_args(argv)
     return int(args.func(args))
 

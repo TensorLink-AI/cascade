@@ -15,6 +15,11 @@ write a generator → cascade verify → cascade score (optional)
   → watch cascade queue / cascade round → read cascade duel
 ```
 
+Want the loop run for you? `cascade mine` / `cascade mine-ui` (or the
+`deploy/miner.Dockerfile` image) hill-climbs a generator with `verify` +
+`score` and hands you a `best/` to submit. See
+[ONE_CLICK_MINING.md](ONE_CLICK_MINING.md).
+
 Rounds run every 12 h (boundaries ≈ 08:30 and 20:30 UTC). Mainnet is netuid 91.
 The intake is `https://submissions.cascadesub.net`.
 
