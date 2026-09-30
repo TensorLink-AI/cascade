@@ -953,6 +953,8 @@ class RollingScheduler:
             era.king_ref = ref
             era.king_uid = self._uid_of(client, era.king_hotkey)
             self._save()
+            if era is self.state.current:
+                self._publish_champion_now(era)   # a crowned king with no leg here yet
         gen = ResolvedGen(era.king_hotkey, era.king_uid, era.king_ref)
         cached = self.ops.cached_leg(era, "king", gen)
         if cached is not None:
@@ -1388,6 +1390,23 @@ class RollingScheduler:
                 self.state.next = None
             self._save()
         self.r._rolling_note_king_host(cur)
+        self._publish_champion_now(cur)
+
+    def _publish_champion_now(self, era: EraState) -> None:
+        """Run the champion-publication policy for ``era``'s king as soon as
+        its ref is known — at dethrone adoption (or once the new king's ref
+        resolves) — instead of waiting for the next settlement that carries a
+        manifest, which kept a crowned king's code private for hours. The
+        publisher is idempotent per (king, round), so the settlement's own
+        call afterwards is a no-op. Best-effort: never blocks the loop."""
+        if not era.king_hotkey or not era.king_ref:
+            return
+        try:
+            self.ops.publish_champion(ResolvedGen(era.king_hotkey, era.king_uid, era.king_ref),
+                                      str(self.state.last_published_round_id or ""))
+        except Exception as e:  # noqa: BLE001
+            log.warning("rolling: champion publish at dethrone failed (ignored; the next "
+                        "settlement retries): %s", e)
 
     # ── settlement ───────────────────────────────────────────────────────────
 
