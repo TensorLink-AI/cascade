@@ -66,6 +66,10 @@ cascade mine --workdir ./mine-run --iterations 20 --warm-start live --pool-dir .
      change and writes a one-line note. Edits are confined to the
      candidate dir, and the only shell command allowed is
      `cascade verify`. Swap it with `--agent-cmd`.
+   - `ralph` is a Ralph loop: Claude Code on Anthropic, Chutes, SayGM or any
+     Anthropic-compatible model rewrites the generator's **code**, with one
+     standing prompt and a persistent notebook. See
+     [RALPH_MINING.md](RALPH_MINING.md).
    - `cmd` runs your own strategy command; the contract is in
      [MINER_DOCKER.md](MINER_DOCKER.md#plug-in-your-own-strategy). The UI
      offers it as "cmd: my own strategy".

@@ -47,6 +47,10 @@ directory is `…/candidates/NNNN/`, a copy of the current best generator.
 6. Write ONE line describing the change to the note path the prompt gives
    you, e.g. `flow_recession weight x1.5; gauge rounding to 0.01 on 60% of rows`.
 
+In a Ralph loop (`cascade ralph`) the prompt is RALPH_PROMPT.md instead, and
+it carries the same rules. Read and update `.ralph-notes.md` there; it is
+your only memory between iterations.
+
 ## Mode B — driver (a person asked you to mine)
 
 Run the loop. Do not re-implement it.
@@ -56,6 +60,8 @@ cascade verify ./champions/king                    # the env can import the king
 cascade mine --workdir ./mine-run --proposer tune --iterations 20 \
     --train-hours 0.25 --warm-start live --pool-dir <held-out .npy dir>
 # or: --proposer agent (each step invokes Claude Code in proposer mode)
+# or: cascade ralph --llm-provider chutes|saygm|anthropic --llm-model <id> (run --check first;
+#     an LLM rewrites the generator code each iteration; docs/RALPH_MINING.md)
 # or: --proposer cmd --propose-cmd "python my_strategy.py" (the person's own strategy;
 #     contract in docs/MINER_DOCKER.md, example scripts/example_strategy.py)
 cascade mine-ui --workdir ./mine-run               # watch it in a browser

@@ -82,7 +82,7 @@ class LoopConfig:
     workdir: Path
     start_dir: Path
     king_dir: Path | None = None
-    proposer: str = "tune"                       # "tune" | "agent"
+    proposer: str = "tune"                       # "tune" | "agent" | "cmd" | "ralph"
     iterations: int = 20
     seeds: tuple[int, ...] = (0,)
     min_improvement: float = 0.001               # relative; 0.001 = 0.1 %
@@ -102,6 +102,15 @@ class LoopConfig:
     propose_cmd: str = ""
     propose_timeout: float = 1800.0
     agent_timeout: float = 1800.0
+    agent_max_turns: int = 0                     # 0 = Claude Code's default
+    # LLM backend for the agent/ralph proposers (see ralph.py): "anthropic" = Claude
+    # Code's own login; "chutes" / "saygm" / "custom" = an Anthropic-compatible
+    # endpoint. The key is read from the env var named by llm_key_env, never argv.
+    llm_provider: str = "anthropic"
+    llm_base_url: str = ""
+    llm_model: str = ""
+    llm_key_env: str = ""
+    llm_auth: str = ""                           # "bearer" | "x-api-key" ("" = preset)
     # submission (never implicit)
     auto_submit: bool = False
     submit_margin: float = 0.01                  # best must beat king by this (relative)
@@ -362,6 +371,21 @@ class CommandProposer:
         if not self.command.strip():
             raise ValueError("--proposer cmd needs --propose-cmd (your strategy command)")
 
+    # Hooks for presets (agent, ralph); no-ops for a plain strategy command.
+    def base_env(self) -> dict[str, str]:
+        """The environment the command starts from. A strategy command is the
+        miner's own code, so it inherits everything; the agent presets narrow it."""
+        return dict(os.environ)
+
+    def extra_env(self) -> dict[str, str]:
+        return {}
+
+    def prepare(self, cand_dir: Path, iteration: int) -> None:
+        pass
+
+    def finish(self, cand_dir: Path, iteration: int) -> None:
+        pass
+
     def stdin_for(self, cand_dir: Path, iteration: int, history: list[dict]) -> str:
         return json.dumps({
             "iteration": iteration, "candidate_dir": str(cand_dir),
@@ -374,8 +398,10 @@ class CommandProposer:
         stdin = self.stdin_for(cand_dir, iteration, history)
         argv = [a.replace("{dir}", str(cand_dir)) for a in shlex.split(self.command)]
         best, king = self.loop.best_record(), self.loop.king_record()
+        self.prepare(cand_dir, iteration)
         env = {
-            **os.environ,
+            **self.base_env(),
+            **self.extra_env(),
             "CASCADE_CANDIDATE_DIR": str(cand_dir), "CASCADE_ITERATION": str(iteration),
             "CASCADE_WORKDIR": str(self.loop.workdir),
             "CASCADE_HISTORY": str(self.loop.workdir / HISTORY_FILE),
@@ -386,15 +412,19 @@ class CommandProposer:
         }
         log.info("%s: %s (cwd=%s)", self.label, " ".join(argv), cand_dir)
         out_log = cand_dir.parent / f"{cand_dir.name}.{self.label}.log"
-        with open(out_log, "w", encoding="utf-8") as out:
-            proc = subprocess.run(
-                argv, input=stdin, text=True, cwd=cand_dir, stdout=out, env=env,
-                stderr=subprocess.STDOUT, timeout=self.timeout, check=False,
-            )
         note = ""
-        if note_path.is_file():
-            note = note_path.read_text(encoding="utf-8").strip()
-            os.replace(note_path, cand_dir.parent / f"{cand_dir.name}.note.md")
+        try:
+            with open(out_log, "w", encoding="utf-8") as out:
+                proc = subprocess.run(
+                    argv, input=stdin, text=True, cwd=cand_dir, stdout=out, env=env,
+                    stderr=subprocess.STDOUT, timeout=self.timeout, check=False,
+                )
+        finally:
+            # Even on a timeout: nothing the proposer writes for the loop ships.
+            if note_path.is_file():
+                note = note_path.read_text(encoding="utf-8").strip()
+                os.replace(note_path, cand_dir.parent / f"{cand_dir.name}.note.md")
+            self.finish(cand_dir, iteration)
         if proc.returncode != 0:
             raise RuntimeError(f"{self.label} exited {proc.returncode} (see {out_log})")
         if not note:
@@ -411,7 +441,19 @@ class AgentProposer(CommandProposer):
     label = "agent"
 
     def __init__(self, cfg: LoopConfig, loop: OptimizationLoop) -> None:
-        super().__init__(cfg, loop, command=cfg.agent_cmd, timeout=cfg.agent_timeout)
+        command = cfg.agent_cmd
+        if cfg.agent_max_turns > 0:
+            command += f" --max-turns {int(cfg.agent_max_turns)}"
+        super().__init__(cfg, loop, command=command, timeout=cfg.agent_timeout)
+        from .ralph import resolve_provider
+        self.provider = resolve_provider(cfg)
+
+    def base_env(self) -> dict[str, str]:
+        from .ralph import agent_base_env
+        return agent_base_env(self.provider, self.loop.workdir)
+
+    def extra_env(self) -> dict[str, str]:
+        return self.provider.claude_env()
 
     def stdin_for(self, cand_dir: Path, iteration: int, history: list[dict]) -> str:
         return agent_prompt(cand_dir, cand_dir / AGENT_NOTE, history,
@@ -452,10 +494,13 @@ class OptimizationLoop:
             self.proposer = AgentProposer(cfg, self)
         elif cfg.proposer == "cmd":
             self.proposer = CommandProposer(cfg, self)
+        elif cfg.proposer == "ralph":
+            from .ralph import RalphProposer
+            self.proposer = RalphProposer(cfg, self)
         elif cfg.proposer == "tune":
             self.proposer = TuneProposer(cfg, run_seed=int(time.time()))
         else:
-            raise ValueError(f"unknown proposer {cfg.proposer!r} (tune | agent | cmd)")
+            raise ValueError(f"unknown proposer {cfg.proposer!r} (tune | agent | cmd | ralph)")
         self.history: list[dict] = read_history(self.workdir)
         self._warm_dir: Path | None = None
         self._init_label = "random init"
@@ -613,20 +658,30 @@ class OptimizationLoop:
         except Exception as e:  # noqa: BLE001
             c.status, c.detail = "error", f"proposer: {type(e).__name__}: {e}"
             self._append(c)
+            self._report(c)
             return c
         if _dir_digest_equal(cdir, self.workdir / BEST_DIR):
             c.status, c.detail = "rejected", "proposal changed nothing"
             self._append(c)
+            self._report(c)
             return c
         self._evaluate(c)
         if c.status == "scored" and c.score < best["score"] * (1.0 - self.cfg.min_improvement):
             c.accepted = True
             self._promote(c)
         self._append(c)
+        self._report(c)
         log.info("#%d %s score=%s %s — %s", it, c.status,
                  "—" if c.score is None else f"{c.score:.5f}",
                  "ACCEPTED" if c.accepted else "", c.note)
         return c
+
+    def _report(self, c: Candidate) -> None:
+        """Tell a proposer that keeps its own memory (ralph) how its proposal did."""
+        hook = getattr(self.proposer, "on_result", None)
+        if hook is not None:
+            with contextlib.suppress(Exception):
+                hook(c.record(), self.best_record())
 
     def run(self) -> dict:
         with contextlib.suppress(FileNotFoundError):

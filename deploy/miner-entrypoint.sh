@@ -22,6 +22,9 @@ Your files live in /work (mount a host dir: -v "$PWD:/work").
   mine   --start ./my-gen --proposer cmd --propose-cmd "python my_strategy.py"
                                          YOUR strategy in the verify → score → keep loop
   mine   --start ./my-gen                built-in tune loop (config.json weights)
+  ralph  --llm-provider chutes|saygm|anthropic --llm-model ID [--check]
+                                         Ralph loop: an LLM rewrites the generator code
+                                         (oneclick image; key via -e CHUTES_API_KEY …)
   submit ./mine-run/best https://submissions.cascadesub.net \
          --wallet-name W --wallet-hotkey H          (spends the hotkey)
   round | queue | heat | duel | reveal-status       read-only chain / round views

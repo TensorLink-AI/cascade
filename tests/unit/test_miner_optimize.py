@@ -443,3 +443,28 @@ def test_example_strategy_coordinate_search(tmp_path):
     assert len(pairs) == len(set(pairs))                            # never repeats
     cfg = json.loads((tmp_path / "run" / "best" / "config.json").read_text())
     assert sum(cfg["weights"].values()) == pytest.approx(1.0)
+
+
+def test_ui_ralph_start_uses_ralph_subcommand_with_provider(ui_server, monkeypatch):
+    app, base = ui_server
+    seen = {}
+
+    class FakePopen:
+        def __init__(self, argv, **kw):
+            seen["argv"] = argv
+            self.pid = 1
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(ui_mod.subprocess, "Popen", FakePopen)
+    assert _req(base + "/api/start", body={"proposer": "ralph", "llm_provider": "openai"})[0] == 400
+    code, _ = _req(base + "/api/start", body={
+        "proposer": "ralph", "llm_provider": "chutes", "llm_model": "org/Coder",
+        "agent_max_turns": "40", "llm_key": "sk-should-be-ignored"})
+    assert code == 200
+    argv = seen["argv"]
+    assert argv[3] == "ralph"
+    assert argv[argv.index("--llm-provider") + 1] == "chutes"
+    assert argv[argv.index("--llm-model") + 1] == "org/Coder"
+    assert "sk-should-be-ignored" not in " ".join(argv)           # keys never via the UI

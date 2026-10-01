@@ -93,6 +93,11 @@
   unless ``--auto-submit`` AND the best beats the reference king by
   ``--submit-margin``. ``cascade mine-ui`` is the web front end for it.
 
+* ``cascade ralph`` — ``cascade mine --proposer ralph``: a Ralph loop where
+  Claude Code (Anthropic, or Chutes / SayGM / any Anthropic-compatible model
+  via ``--llm-provider``) rewrites the generator's code with one standing
+  prompt and a persistent notebook; ``--check`` preflights the backend.
+
 * ``cascade submit <repo_dir> <intake_url>`` — the DIRECT path (DEC-CA-0036):
   verify locally, ZIP deterministically, POST the code straight to the
   operator's intake (with your Lium key in the same request when
@@ -1312,13 +1317,33 @@ def _cmd_fund(args: argparse.Namespace) -> int:
 
 
 def _add_mine(sub: argparse._SubParsersAction) -> None:
-    from .optimize import DEFAULT_AGENT_CMD
-
     p = sub.add_parser(
         "mine",
         help="One-click optimisation loop: propose a generator variant, verify, score "
         "locally, keep it if better — repeat. See cascade/miner/optimize.py.",
     )
+    _mine_args(p, proposer_default="tune", iterations_default=20)
+    p.set_defaults(func=_cmd_mine)
+
+
+def _add_ralph(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser(
+        "ralph",
+        help="Ralph loop: Claude Code (on Anthropic, Chutes, SayGM or any Anthropic-"
+        "compatible model) rewrites the generator's code, same prompt every iteration, "
+        "memory in a notebook; the mine loop verifies/scores/keeps. See cascade/miner/ralph.py.",
+    )
+    _mine_args(p, proposer_default="ralph", iterations_default=100)
+    p.add_argument("--check", action="store_true",
+                   help="Only preflight the LLM backend (one tiny request) and exit.")
+    p.set_defaults(func=_cmd_ralph)
+
+
+def _mine_args(p: argparse.ArgumentParser, *, proposer_default: str,
+               iterations_default: int) -> None:
+    from .optimize import DEFAULT_AGENT_CMD
+    from .ralph import PROVIDERS
+
     p.add_argument("--workdir", type=Path, default=Path("./mine-run"),
                    help="Run directory (state.json, history.jsonl, candidates/, best/). "
                         "Re-running on the same workdir resumes from its best.")
@@ -1328,10 +1353,12 @@ def _add_mine(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--king", type=Path, default=None,
                    help="Reference king to score once on the same pool/seeds/init "
                         "(default: champions/king if present; 'none' to skip).")
-    p.add_argument("--proposer", choices=("tune", "agent", "cmd"), default="tune",
+    p.add_argument("--proposer", choices=("tune", "agent", "cmd", "ralph"),
+                   default=proposer_default,
                    help="tune = perturb config.json weights/floats (no LLM); agent = a "
                         "coding agent edits the code with the cascade-mine skill; cmd = "
-                        "your own strategy (--propose-cmd).")
+                        "your own strategy (--propose-cmd); ralph = Claude Code rewrites the "
+                        "generator code with a persistent notebook (cascade ralph).")
     p.add_argument("--propose-cmd", default="",
                    help="Your strategy for --proposer cmd: any command, run in the candidate "
                         "dir (a copy of the best) with a JSON context on stdin and "
@@ -1342,7 +1369,21 @@ def _add_mine(sub: argparse._SubParsersAction) -> None:
                    help="Agent command; gets the prompt on stdin, runs in the candidate dir "
                         "({dir} is substituted). Default: %(default)s")
     p.add_argument("--agent-timeout", type=float, default=1800.0)
-    p.add_argument("--iterations", type=int, default=20)
+    p.add_argument("--agent-max-turns", type=int, default=0,
+                   help="Cap agent turns per iteration (bounds cost; 0 = Claude Code default).")
+    p.add_argument("--llm-provider", choices=PROVIDERS, default="anthropic",
+                   help="Model backend for agent/ralph: anthropic (Claude Code login), "
+                        "chutes ($CHUTES_API_KEY), saygm ($SAYGM_API_KEY), custom.")
+    p.add_argument("--llm-model", default="",
+                   help="Model id (required for chutes/saygm/custom; optional for anthropic).")
+    p.add_argument("--llm-base-url", default="",
+                   help="Anthropic Messages root (Claude Code appends /v1/messages); "
+                        "overrides the provider preset.")
+    p.add_argument("--llm-key-env", default="",
+                   help="Env var holding the provider key (keys never go on the command line).")
+    p.add_argument("--llm-auth", choices=("bearer", "x-api-key"), default=None,
+                   help="How the key is sent (default: the provider preset's).")
+    p.add_argument("--iterations", type=int, default=iterations_default)
     p.add_argument("--seeds", default="0",
                    help="Comma-separated round seeds; a candidate's score is the mean over "
                         "them (more seeds = less noise, proportionally slower).")
@@ -1367,7 +1408,6 @@ def _add_mine(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--wallet-name", default="")
     p.add_argument("--wallet-hotkey", default="")
     p.add_argument("--label", default="")
-    p.set_defaults(func=_cmd_mine)
 
 
 def _default_start_and_king(args: argparse.Namespace) -> tuple[Path, Path | None]:
@@ -1382,30 +1422,56 @@ def _default_start_and_king(args: argparse.Namespace) -> tuple[Path, Path | None
     return start, ref
 
 
-def _cmd_mine(args: argparse.Namespace) -> int:
-    import logging
+def _loop_config(args: argparse.Namespace):
+    """Build the LoopConfig from `mine` / `ralph` args (ValueError on bad input)."""
+    from .optimize import LoopConfig
 
-    from .optimize import LoopConfig, OptimizationLoop
-
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    cfg = load_chain_config(args.chain_toml)
     start, king = _default_start_and_king(args)
     try:
         seeds = tuple(int(s) for s in str(args.seeds).split(",") if s.strip())
     except ValueError:
-        print(f"error: --seeds must be comma-separated ints, got {args.seeds!r}", file=sys.stderr)
-        return 2
-    lc = LoopConfig(
+        raise ValueError(f"--seeds must be comma-separated ints, got {args.seeds!r}") from None
+    return LoopConfig(
         workdir=args.workdir, start_dir=start, king_dir=king, proposer=args.proposer,
         iterations=args.iterations, seeds=seeds or (0,), min_improvement=args.min_improvement,
         pool_dir=args.pool_dir, pool_ref=args.pool_ref, train_hours=args.train_hours,
         n_windows=args.n_windows, device=args.device, warm_start=args.warm_start,
         agent_cmd=args.agent_cmd, agent_timeout=args.agent_timeout,
         propose_cmd=args.propose_cmd, propose_timeout=args.propose_timeout,
+        agent_max_turns=args.agent_max_turns, llm_provider=args.llm_provider,
+        llm_model=args.llm_model, llm_base_url=args.llm_base_url,
+        llm_key_env=args.llm_key_env, llm_auth=args.llm_auth or "",
         auto_submit=args.auto_submit, submit_margin=args.submit_margin, intake=args.intake,
         wallet_name=args.wallet_name, wallet_hotkey=args.wallet_hotkey, label=args.label,
     )
+
+
+def _cmd_ralph(args: argparse.Namespace) -> int:
+    from .ralph import preflight, resolve_provider
+
     try:
+        provider = resolve_provider(_loop_config(args))
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    ok, msg = preflight(provider)
+    print(f"llm preflight: {msg}", file=sys.stderr if not ok else sys.stdout)
+    if not ok:
+        return 3
+    if args.check:
+        return 0
+    return _cmd_mine(args)
+
+
+def _cmd_mine(args: argparse.Namespace) -> int:
+    import logging
+
+    from .optimize import OptimizationLoop
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    cfg = load_chain_config(args.chain_toml)
+    try:
+        lc = _loop_config(args)
         loop = OptimizationLoop(lc, chain_cfg=cfg)
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
@@ -1465,6 +1531,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_fund(sub)
     _add_submit(sub)
     _add_mine(sub)
+    _add_ralph(sub)
     _add_mine_ui(sub)
     args = parser.parse_args(argv)
     return int(args.func(args))

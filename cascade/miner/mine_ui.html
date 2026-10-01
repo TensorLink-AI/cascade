@@ -99,7 +99,24 @@ details summary { cursor: pointer; color: var(--muted); font-size: 13px; margin-
         <option value="tune">tune: config weights (no LLM)</option>
         <option value="agent">agent: Claude Code edits code</option>
         <option value="cmd">cmd: my own strategy</option>
+        <option value="ralph">ralph: LLM rewrites generator code</option>
       </select>
+      <div id="llmRow" hidden>
+        <div class="row">
+          <div><label for="llm_provider">LLM provider</label>
+            <select id="llm_provider">
+              <option value="anthropic">Anthropic</option>
+              <option value="chutes">Chutes</option>
+              <option value="saygm">SayGM</option>
+              <option value="custom">Custom</option>
+            </select></div>
+          <div><label for="llm_model">Model id</label><input id="llm_model" placeholder="provider model id"></div>
+        </div>
+        <label for="llm_base_url">Anthropic-compatible base URL (optional override)</label>
+        <input id="llm_base_url" placeholder="preset for chutes / saygm">
+        <label for="agent_max_turns">Max agent turns / iteration</label>
+        <input id="agent_max_turns" type="number" min="0" value="40">
+      </div>
       <div id="cmdRow" hidden>
         <label for="propose_cmd">Strategy command (runs in each candidate dir)</label>
         <input id="propose_cmd" placeholder="python /work/my_strategy.py">
@@ -187,7 +204,7 @@ const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<
 const dur = (s) => !s ? "" : s < 90 ? `${Math.round(s)}s` : s < 5400 ? `${Math.round(s / 60)}m` : `${(s / 3600).toFixed(1)}h`;
 
 // Remember form values per browser (a convenience; nothing here is a secret).
-const FIELDS = ["propose_cmd", "proposer", "iterations", "train_hours", "seeds", "device", "pool_dir", "start", "king",
+const FIELDS = ["llm_provider", "llm_model", "llm_base_url", "agent_max_turns", "propose_cmd", "proposer", "iterations", "train_hours", "seeds", "device", "pool_dir", "start", "king",
   "min_improvement", "n_windows", "intake", "wallet_name", "wallet_hotkey", "label"];
 try { const saved = JSON.parse(localStorage.getItem("cascade-mine") || "{}");
   for (const f of FIELDS) if (saved[f] != null) $(f).value = saved[f];
@@ -200,10 +217,13 @@ $("startBtn").onclick = async () => {
   const b = {};
   for (const f of ["proposer", "propose_cmd", "iterations", "train_hours", "seeds", "device", "pool_dir", "start", "king", "min_improvement", "n_windows"]) b[f] = $(f).value.trim();
   if (b.proposer !== "cmd") delete b.propose_cmd;
+  if (b.proposer === "agent" || b.proposer === "ralph")
+    for (const f of ["llm_provider", "llm_model", "llm_base_url", "agent_max_turns"]) b[f] = $(f).value.trim();
   if ($("live").checked) b.warm_start = "live";
   try { await api("/api/start", b); refresh(); } catch (e) { alert("start failed: " + e.message); }
 };
-const syncCmd = () => { $("cmdRow").hidden = $("proposer").value !== "cmd"; };
+const syncCmd = () => { const v = $("proposer").value;
+  $("cmdRow").hidden = v !== "cmd"; $("llmRow").hidden = v !== "agent" && v !== "ralph"; };
 $("proposer").onchange = syncCmd; syncCmd();
 $("stopBtn").onclick = () => api("/api/stop", {}).then(refresh).catch((e) => alert(e.message));
 $("killBtn").onclick = () => confirm("Kill the loop now? The current candidate is lost.") &&
@@ -248,6 +268,7 @@ function render(s) {
 
   const chip = (ok, t) => `<span class="chip ${ok ? "ok" : "no"}">${esc(t)}</span>`;
   $("env").innerHTML = chip(env.gpu, "GPU") + chip(env.claude_cli && env.anthropic_auth, "Claude agent") +
+    chip(env.chutes_api_key, "CHUTES_API_KEY") + chip(env.saygm_api_key, "SAYGM_API_KEY") +
     chip(env.lium_api_key, "LIUM_API_KEY") + chip((env.wallets || []).length, "wallet");
   $("wallets").innerHTML = (env.wallets || []).map((w) => `<option value="${esc(w)}">`).join("");
 

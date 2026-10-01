@@ -20,7 +20,9 @@ below in the pod's pinned numeric stack, and `cascade mine --proposer cmd`
 plugs your own search strategy into a verify → score → keep loop
 ([MINER_DOCKER.md](MINER_DOCKER.md)). Want the loop run for you? The
 `:oneclick` tag adds a web UI and a Claude Code proposer
-([ONE_CLICK_MINING.md](ONE_CLICK_MINING.md)).
+([ONE_CLICK_MINING.md](ONE_CLICK_MINING.md)), and `cascade ralph` runs a Ralph
+loop that rewrites your generator's code on Anthropic, Chutes or SayGM models
+([RALPH_MINING.md](RALPH_MINING.md)).
 
 Rounds run every 12 h (boundaries ≈ 08:30 and 20:30 UTC). Mainnet is netuid 91.
 The intake is `https://submissions.cascadesub.net`.

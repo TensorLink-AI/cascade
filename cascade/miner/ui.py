@@ -58,7 +58,11 @@ _START_FLAGS = {
     "pool_dir": "--pool-dir", "pool_ref": "--pool", "warm_start": "--warm-start",
     "min_improvement": "--min-improvement", "start": "--start", "king": "--king",
     "agent_cmd": "--agent-cmd", "propose_cmd": "--propose-cmd",
+    "llm_provider": "--llm-provider", "llm_model": "--llm-model",
+    "llm_base_url": "--llm-base-url", "agent_max_turns": "--agent-max-turns",
 }
+_PROPOSERS = ("tune", "agent", "cmd", "ralph")
+_LLM_PROVIDERS = ("anthropic", "chutes", "saygm", "custom")
 
 _PATH_KEYS = {"pool_dir", "start", "king"}
 
@@ -92,6 +96,8 @@ def _environment() -> dict:
     names = sorted(p.name for p in wallets.iterdir() if p.is_dir()) if wallets.is_dir() else []
     return {
         "lium_api_key": bool(os.environ.get("LIUM_API_KEY")),
+        "chutes_api_key": bool(os.environ.get("CHUTES_API_KEY")),
+        "saygm_api_key": bool(os.environ.get("SAYGM_API_KEY")),
         "anthropic_auth": bool(os.environ.get("ANTHROPIC_API_KEY")
                                or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")),
         "claude_cli": shutil.which("claude") is not None,
@@ -147,7 +153,10 @@ class MineUI:
         with self.lock:
             if self.running():
                 return 409, {"error": "a loop is already running in this workdir"}
-            argv = [sys.executable, "-m", "cascade.miner.cli", "mine",
+            # `ralph` = `mine --proposer ralph` + an LLM preflight whose diagnosis
+            # (bad URL / key / model) lands in loop.log before anything is spent.
+            sub = "ralph" if body.get("proposer") == "ralph" else "mine"
+            argv = [sys.executable, "-m", "cascade.miner.cli", sub,
                     "--workdir", str(self.workdir)]
             if self.chain_toml:
                 argv += ["--chain-toml", str(self.chain_toml)]
@@ -155,8 +164,10 @@ class MineUI:
                 v = body.get(key)
                 if v is None or v == "" or isinstance(v, dict | list):
                     continue
-                if key == "proposer" and v not in ("tune", "agent", "cmd"):
+                if key == "proposer" and v not in _PROPOSERS:
                     return 400, {"error": f"bad proposer {v!r}"}
+                if key == "llm_provider" and v not in _LLM_PROVIDERS:
+                    return 400, {"error": f"bad llm provider {v!r}"}
                 if key in _PATH_KEYS and str(v).lower() != "none":
                     # The child runs with cwd=workdir; anchor paths to where the UI runs.
                     v = Path(str(v)).expanduser().resolve()
