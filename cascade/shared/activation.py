@@ -53,6 +53,10 @@ such feature: its name is ``forfeit-<sha256(sorted hotkeys)[:8]>`` so a
 changed list is a fresh vote, and lock-in writes the resolved block into
 ``forfeit_from_block`` (:func:`apply_forfeit_activation`). A typed-in
 ``forfeit_from_block`` is the owner override, exactly as for the rollover.
+The DEC-CA-0049 dethrone bar v2 is the second such feature
+(``margin-v2-<sha256(start|end|blocks)[:8]>``): lock-in writes the rollover
+boundary into ``[scoring] margin_v2_from_block``
+(:func:`apply_margin_v2_activation`); a typed block is the owner override.
 """
 
 from __future__ import annotations
@@ -64,7 +68,12 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from .config import ChainConfig, check_rollover_alignment, effective_epoch_blocks
+from .config import (
+    ChainConfig,
+    check_rollover_alignment,
+    effective_epoch_blocks,
+    margin_v2_configured,
+)
 
 log = logging.getLogger("cascade.activation")
 
@@ -463,6 +472,68 @@ def apply_forfeit_activation(cfg: ChainConfig, block: int) -> ChainConfig:
                    activation=replace(cfg.activation, resolved_forfeit_block=block))
 
 
+def margin_v2_feature_name(start: float, end: float, warmup_blocks: int) -> str:
+    """``margin-v2-<sha256("<start>|<end>|<blocks>")[:8]>`` — the values ARE
+    the feature, so a changed bar is a fresh vote and two validators shipping
+    different bars never count each other. ``""`` when the bar is unset."""
+    if not (float(start) > 0.0 and float(end) > 0.0 and int(warmup_blocks) > 0):
+        return ""
+    body = f"{float(start)!r}|{float(end)!r}|{int(warmup_blocks)}"
+    return "margin-v2-" + hashlib.sha256(body.encode("utf-8")).hexdigest()[:8]
+
+
+def configured_margin_v2_block(cfg: ChainConfig) -> int:
+    """The margin-v2 block TYPED into chain.toml (0 = none / decided on
+    chain). A block written by :func:`apply_margin_v2_activation` is not typed
+    (``activation.resolved_margin_v2_block`` marks it)."""
+    if int(getattr(cfg.activation, "resolved_margin_v2_block", 0) or 0):
+        return 0
+    return int(getattr(cfg.scoring, "margin_v2_from_block", 0) or 0)
+
+
+def resolved_margin_v2_block(cfg: ChainConfig) -> int:
+    return int(getattr(cfg.activation, "resolved_margin_v2_block", 0) or 0)
+
+
+def margin_v2_feature(cfg: ChainConfig) -> FeatureSpec | None:
+    """The DEC-CA-0049 dethrone bar as a feature the fleet decides: present
+    when ``[activation]`` is on and the v2 bar is defined; ``typed_block`` =
+    the typed ``margin_v2_from_block`` (the override — then nothing is
+    signalled). ``None`` = no v2 bar in the config, or activation off."""
+    if not cfg.activation.enabled or not margin_v2_configured(cfg.scoring):
+        return None
+    sc = cfg.scoring
+    name = margin_v2_feature_name(sc.win_margin_start_v2, sc.win_margin_end_v2,
+                                  sc.margin_warmup_blocks_v2)
+    if not name:
+        return None
+    return FeatureSpec(name=name, typed_block=configured_margin_v2_block(cfg))
+
+
+def apply_margin_v2_activation(cfg: ChainConfig, block: int) -> ChainConfig:
+    """The config the owner would have typed for a v2 bar decided at rollover
+    ``block``: ``[scoring] margin_v2_from_block`` = that boundary — the one
+    AFTER the lock-in boundary, like the DEC-CA-0043 rollover, so the round in
+    which the count crossed is judged on the old bar. A typed block is
+    returned unchanged (the owner override); a block already applied is
+    idempotent; a different block after lock-in raises (one-way)."""
+    block = int(block or 0)
+    if block <= 0 or configured_margin_v2_block(cfg):
+        return cfg
+    if not margin_v2_configured(cfg.scoring):
+        return cfg
+    have = resolved_margin_v2_block(cfg)
+    if have == block:
+        return cfg
+    if have:
+        raise ValueError(f"margin v2 {have} already applied; a lock-in is one-way and cannot "
+                         f"move it to {block}")
+    if block % int(effective_epoch_blocks(cfg.round, block - 1)):
+        raise ValueError(f"margin v2 block {block} is not a settlement boundary")
+    return replace(cfg, scoring=replace(cfg.scoring, margin_v2_from_block=block),
+                   activation=replace(cfg.activation, resolved_margin_v2_block=block))
+
+
 def apply_activation(cfg: ChainConfig, block: int) -> ChainConfig:
     """The config the owner would have typed for a rollover at ``block``.
 
@@ -830,14 +901,22 @@ def apply_receipt_activation(cfg: ChainConfig, receipt: Any) -> ChainConfig:
     the loaded config cannot apply leaves it unchanged; the ``activation``
     check reports why."""
     block = int(getattr(receipt, "activation_block", 0) or 0)
-    if not block or configured_rollover(cfg) or not cfg.activation.enabled:
-        return cfg
-    try:
-        return apply_activation(cfg, block)
-    except ValueError as e:
-        log.warning("activation: receipt block %d not applied to the audit config (%s)",
-                    block, e)
-        return cfg
+    if block and not configured_rollover(cfg) and cfg.activation.enabled:
+        try:
+            cfg = apply_activation(cfg, block)
+        except ValueError as e:
+            log.warning("activation: receipt block %d not applied to the audit config (%s)",
+                        block, e)
+    # DEC-CA-0049: a receipt judged under a fleet-decided v2 bar records the
+    # block; replay under it (a typed block in the loaded config wins).
+    mv2 = int(getattr(receipt, "margin_v2_block", 0) or 0)
+    if mv2 and not configured_margin_v2_block(cfg) and margin_v2_configured(cfg.scoring):
+        try:
+            cfg = apply_margin_v2_activation(cfg, mv2)
+        except ValueError as e:
+            log.warning("activation: receipt margin-v2 block %d not applied to the audit "
+                        "config (%s)", mv2, e)
+    return cfg
 
 
 def _segment_for(spec: FeatureSpec, record: ActivationRecord | None) -> ReadySignal:
@@ -848,7 +927,8 @@ def _segment_for(spec: FeatureSpec, record: ActivationRecord | None) -> ReadySig
 
 
 def own_signal_payload(cfg: ChainConfig, record: ActivationRecord,
-                       forfeit_record: ActivationRecord | None = None) -> str | None:
+                       forfeit_record: ActivationRecord | None = None,
+                       margin_v2_record: ActivationRecord | None = None) -> str | None:
     """The note this node should have on chain right now (``None`` when
     signalling is off): plain readiness until lock-in, then the agreed block
     — per segment. With no forfeiture decided on chain the note is exactly
@@ -861,6 +941,9 @@ def own_signal_payload(cfg: ChainConfig, record: ActivationRecord,
     extras: list[ReadySignal] = []
     if forfeit is not None and forfeit.decided_on_chain:
         extras.append(_segment_for(forfeit, forfeit_record))
+    mv2 = margin_v2_feature(cfg)
+    if mv2 is not None and mv2.decided_on_chain:
+        extras.append(_segment_for(mv2, margin_v2_record))
     if not primary.decided_on_chain and not extras:
         return None                                  # typed-in rollover: the note is inert
     head = _segment_for(primary, record) if primary.decided_on_chain else ReadySignal(primary.name)
@@ -869,11 +952,12 @@ def own_signal_payload(cfg: ChainConfig, record: ActivationRecord,
 
 def ensure_signal(client: Any, cfg: ChainConfig, record: ActivationRecord, *,
                   hotkey: str, current: dict[str, str] | None = None,
-                  forfeit_record: ActivationRecord | None = None) -> bool:
+                  forfeit_record: ActivationRecord | None = None,
+                  margin_v2_record: ActivationRecord | None = None) -> bool:
     """Write this validator's note unless the chain already carries it.
     Returns True when a write happened. Never raises (a failed write is
     retried on the next call)."""
-    want = own_signal_payload(cfg, record, forfeit_record)
+    want = own_signal_payload(cfg, record, forfeit_record, margin_v2_record)
     if want is None:
         return False
     try:
@@ -890,7 +974,9 @@ def ensure_signal(client: Any, cfg: ChainConfig, record: ActivationRecord, *,
 
 def summary(cfg: ChainConfig, record: ActivationRecord, t: Tally | None,
             forfeit_record: ActivationRecord | None = None,
-            forfeit_tally: Tally | None = None) -> dict:
+            forfeit_tally: Tally | None = None,
+            margin_v2_record: ActivationRecord | None = None,
+            margin_v2_tally: Tally | None = None) -> dict:
     """Presentational block for ``status/chain.json`` / dashboards."""
     out: dict = {
         "feature": cfg.activation.feature,
@@ -915,4 +1001,20 @@ def summary(cfg: ChainConfig, record: ActivationRecord, t: Tally | None,
         if forfeit_tally is not None:
             fo["tally"] = forfeit_tally.to_json()
         out["forfeit"] = fo
+    mv2 = margin_v2_feature(cfg)
+    if mv2 is not None:
+        rec = margin_v2_record or ActivationRecord()
+        mo: dict = {
+            "feature": mv2.name,
+            "win_margin_start_v2": float(cfg.scoring.win_margin_start_v2),
+            "win_margin_end_v2": float(cfg.scoring.win_margin_end_v2),
+            "margin_warmup_blocks_v2": int(cfg.scoring.margin_warmup_blocks_v2),
+            "typed_block": int(mv2.typed_block),
+            "lock_block": int(rec.lock_block),
+            "activation_block": int(rec.activation_block),
+            "source": rec.source,
+        }
+        if margin_v2_tally is not None:
+            mo["tally"] = margin_v2_tally.to_json()
+        out["margin_v2"] = mo
     return out

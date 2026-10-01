@@ -743,6 +743,24 @@ cohort_maxt_increment_from_block = 0
 mv_score_from_block  = 9068400
 win_margin_end       = 0.005     # decayed floor (> 0!) — reached at margin_warmup_rounds
 margin_warmup_rounds = 8         # rounds of tenure to reach the floor (~4d at 12h rounds)
+# Dethrone bar v2 (DEC-CA-0049, owner 2026-10-01) — CONSENSUS. Since the
+# increment-unit LCB (DEC-CA-0039) went live the 1% -> 0.5% bar above is
+# trivially easy: recent increment LCBs span about -0.84..+0.47. From
+# margin_v2_from_block a fresh king's bar is win_margin_start_v2, decaying
+# linearly to win_margin_end_v2 over margin_warmup_blocks_v2 blocks of tenure
+# (18000 = 5 old 12 h rounds ≈ 2.5 d; counted per settlement on the grid in
+# force, like margin_warmup_blocks). DECIDED ON CHAIN: margin_v2_from_block = 0
+# ⇒ every validator on a release carrying this bar signals readiness
+# (DEC-CA-0045 note segment margin-v2-<hash of the three values>); at the first
+# boundary where 51% of eligible validator stake has signalled it locks in and
+# the bar applies from the NEXT boundary — no fork while the fleet is mixed,
+# nothing changes until the count crosses. A typed block is the owner override
+# (and the hold-back). Changing any of the three values is a fresh vote.
+# HARD GUARDRAIL: win_margin_end_v2 > 0 and start >= end (load-checked).
+win_margin_start_v2     = 0.4
+win_margin_end_v2       = 0.2
+margin_warmup_blocks_v2 = 18000
+margin_v2_from_block    = 0
 # Era king (DEC-CA-0043) — CONSENSUS, release-then-activate with the external
 # validators; audit replays each settlement under its own block. From a
 # settlement whose epoch boundary is >= this block the validator verifies the

@@ -1821,6 +1821,22 @@ class ScoringConfig:
     # (``king_resync_max_rounds`` counted settlements: 5 × 900 blocks trips in
     # 15 h, not the 60 h it meant). 0 = keep counting rounds.
     king_resync_max_blocks: int = 0
+    # Dethrone bar v2 (DEC-CA-0049, CONSENSUS). The increment-unit LCB
+    # (DEC-CA-0039) made the 1% -> 0.5% bar trivially easy (recent increment
+    # LCBs span about -0.84..+0.47), so from ``margin_v2_from_block`` a fresh
+    # king's bar is ``win_margin_start_v2`` decaying linearly to
+    # ``win_margin_end_v2`` over ``margin_warmup_blocks_v2`` blocks of tenure
+    # (per settlement on the grid in force, like ``margin_warmup_blocks``).
+    # All three set together or none (load-checked; end > 0 is the HARD
+    # guardrail, start >= end). ``margin_v2_from_block`` = 0 means DECIDED ON
+    # CHAIN: the validators signal readiness (DEC-CA-0045) and the lock-in
+    # writes the rollover boundary here; a typed block is the owner override.
+    # Rounds before the block, and the block-less steady state, are judged
+    # exactly as before.
+    win_margin_start_v2: float = 0.0
+    win_margin_end_v2: float = 0.0
+    margin_warmup_blocks_v2: int = 0
+    margin_v2_from_block: int = 0
 
 
 @dataclass(frozen=True)
@@ -2099,6 +2115,10 @@ class ActivationConfig:
     # into ``[scoring] forfeit_from_block`` (DEC-CA-0048 decided on chain),
     # so a resolved block is distinguishable from a typed-in one.
     resolved_forfeit_block: int = 0
+    # RUNTIME ONLY: the margin-v2 block ``apply_margin_v2_activation`` wrote
+    # into ``[scoring] margin_v2_from_block`` (DEC-CA-0049 decided on chain),
+    # so a resolved block is distinguishable from a typed-in one.
+    resolved_margin_v2_block: int = 0
 
     @property
     def enabled(self) -> bool:
@@ -2161,11 +2181,21 @@ class ChainConfig:
         from ..eval.koth import KothParams
         from .era import effective_margin_warmup_rounds
 
+        if margin_v2_active(self.scoring, block):
+            # DEC-CA-0049: the v2 bar, its decay counted in blocks on the grid
+            # in force at this round's block.
+            start = float(self.scoring.win_margin_start_v2)
+            end = float(self.scoring.win_margin_end_v2)
+            warmup = max(1, int(self.scoring.margin_warmup_blocks_v2)
+                         // max(1, int(effective_epoch_blocks(self.round, int(block)))))
+        else:
+            start = effective_win_margin_start(self.scoring, block)
+            end = self.scoring.win_margin_end
+            warmup = effective_margin_warmup_rounds(self.round, self.scoring, block)
         return KothParams(
-            win_margin_start=effective_win_margin_start(self.scoring, block),
-            win_margin_end=self.scoring.win_margin_end,
-            margin_warmup_rounds=effective_margin_warmup_rounds(
-                self.round, self.scoring, block),
+            win_margin_start=start,
+            win_margin_end=end,
+            margin_warmup_rounds=warmup,
             min_windows=self.scoring.min_windows,
             bootstrap_B=self.scoring.bootstrap_B,
             bootstrap_alpha=self.scoring.bootstrap_alpha,
@@ -2207,6 +2237,43 @@ def effective_win_margin_start(scoring: ScoringConfig, block: int | None) -> flo
         if scoring.win_margin_start_prev > 0.0:
             return float(scoring.win_margin_start_prev)
     return float(scoring.win_margin_start)
+
+
+def margin_v2_configured(scoring: ScoringConfig) -> bool:
+    """Whether the DEC-CA-0049 v2 bar is defined (all three values set)."""
+    return (float(getattr(scoring, "win_margin_start_v2", 0.0) or 0.0) > 0.0
+            and float(getattr(scoring, "win_margin_end_v2", 0.0) or 0.0) > 0.0
+            and int(getattr(scoring, "margin_warmup_blocks_v2", 0) or 0) > 0)
+
+
+def margin_v2_active(scoring: ScoringConfig, block: int | None) -> bool:
+    """CONSENSUS gate (DEC-CA-0049): the round at epoch boundary ``block`` is
+    judged under the v2 bar. False with no block (the steady state stays the
+    pre-v2 values), with the bar undefined, or before ``margin_v2_from_block``
+    (0 = not yet decided)."""
+    gate = int(getattr(scoring, "margin_v2_from_block", 0) or 0)
+    return (gate > 0 and block is not None and int(block) >= gate
+            and margin_v2_configured(scoring))
+
+
+def check_margin_v2(start: float, end: float, warmup_blocks: int, from_block: int) -> None:
+    """Load-time guardrails for the DEC-CA-0049 bar: all three values set
+    together or none; the floor strictly positive (a 0 floor turns the decay
+    into a term-limit lottery); start >= end; a typed block needs the bar."""
+    vals = (float(start) > 0.0, float(end) > 0.0, int(warmup_blocks) > 0)
+    if any(vals) and not all(vals):
+        raise ValueError("[scoring] win_margin_start_v2, win_margin_end_v2 and "
+                         "margin_warmup_blocks_v2 must all be set (> 0) or all unset")
+    if float(start) < 0.0 or float(end) < 0.0 or int(warmup_blocks) < 0:
+        raise ValueError("[scoring] margin v2 values must be non-negative")
+    if all(vals) and float(start) < float(end):
+        raise ValueError(f"[scoring] win_margin_start_v2={start} must be >= "
+                         f"win_margin_end_v2={end}")
+    if int(from_block) < 0:
+        raise ValueError(f"[scoring] margin_v2_from_block={from_block} must be >= 0")
+    if int(from_block) > 0 and not all(vals):
+        raise ValueError("[scoring] margin_v2_from_block is set but the v2 bar is not "
+                         "(win_margin_start_v2 / win_margin_end_v2 / margin_warmup_blocks_v2)")
 
 
 def cohort_maxt_active(scoring: ScoringConfig, block: int | None) -> bool:
@@ -2604,6 +2671,12 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
     # boundary rounds — refuse to load rather than fork the fleet. The same
     # check guards a rollover resolved at runtime from validator signals
     # (DEC-CA-0045, ``cascade.shared.activation.apply_activation``).
+    # Dethrone bar v2 (DEC-CA-0049): refuse a half-configured or floorless bar.
+    _mv2_start = float(s.get("win_margin_start_v2", 0.0) or 0.0)
+    _mv2_end = float(s.get("win_margin_end_v2", 0.0) or 0.0)
+    _mv2_blocks = int(s.get("margin_warmup_blocks_v2", 0) or 0)
+    _mv2_from = int(s.get("margin_v2_from_block", 0) or 0)
+    check_margin_v2(_mv2_start, _mv2_end, _mv2_blocks, _mv2_from)
     _rolling = max(0, int(r.get("rolling_from_block", 0) or 0))
     _era_king = max(0, int(s.get("era_king_from_block", 0) or 0))
     _tenure_blocks = max(0, int(s.get("tenure_blocks_from_block", 0) or 0))
@@ -2976,6 +3049,10 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             margin_warmup_blocks=max(0, int(s.get("margin_warmup_blocks", 0) or 0)),
             cascade_reign_blocks=max(0, int(s.get("cascade_reign_blocks", 0) or 0)),
             king_resync_max_blocks=max(0, int(s.get("king_resync_max_blocks", 0) or 0)),
+            win_margin_start_v2=_mv2_start,
+            win_margin_end_v2=_mv2_end,
+            margin_warmup_blocks_v2=_mv2_blocks,
+            margin_v2_from_block=_mv2_from,
         ),
         dependencies=DependencyConfig(
             max_packages=int(d["max_packages"]),
