@@ -1935,7 +1935,8 @@ class ValidatorRunner:
 
         # Decision parameters for THIS round's epoch: a scheduled margin
         # change resolves from the boundary block, never from restart timing.
-        base_params = self.cfg.koth_params(block=self._epoch_start_block(manifest))
+        epoch_block = self._epoch_start_block(manifest)
+        base_params = self.cfg.koth_params(block=epoch_block)
         # Score the shared warm-start init when either consumer needs it: the
         # increment margin (DEC-CA-0027) or the init-baseline floor
         # ([scoring] init_gate_mode). The increment fallback mutates only the
@@ -1950,7 +1951,9 @@ class ValidatorRunner:
             baseline_scores = self._score_increment_baseline(
                 manifest, paired_sizes, windows, score_records)
             if baseline_scores is None and base_params.margin_mode == "increment":
-                base_params = replace(base_params, margin_mode="level")
+                # Level units ⇒ the level bar (DEC-CA-0049: never the v2
+                # increment bar priced as a share of the absolute score).
+                base_params = self.cfg.judged_level_params(base_params, epoch_block)
             if baseline_scores is None and base_params.init_gate_mode != "off":
                 # No baseline (random-init round / size mismatch): the floor
                 # cannot run this round — recorded None, judged as if off.

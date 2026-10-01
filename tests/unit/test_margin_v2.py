@@ -204,8 +204,10 @@ def test_apply_writes_the_boundary_is_one_way_and_respects_the_typed_override(cf
     assert A.apply_margin_v2_activation(c1, B0 + 3600) is c1                       # idempotent
     with pytest.raises(ValueError, match="one-way"):
         A.apply_margin_v2_activation(c1, B0 + 7200)
-    with pytest.raises(ValueError, match="settlement boundary"):
+    with pytest.raises(ValueError, match="era start"):
         A.apply_margin_v2_activation(c, B0 + 3600 + 17)
+    with pytest.raises(ValueError, match="era start"):               # a settlement, not an era
+        A.apply_margin_v2_activation(c, B0 + 3600 + 900)
     typed = replace(c, scoring=replace(c.scoring, margin_v2_from_block=B0 + 900))
     assert A.apply_margin_v2_activation(typed, B0 + 3600) is typed                 # the override wins
     assert A.configured_margin_v2_block(typed) == B0 + 900
@@ -213,7 +215,7 @@ def test_apply_writes_the_boundary_is_one_way_and_respects_the_typed_override(cf
     assert A.apply_margin_v2_activation(_no_v2(c), B0 + 3600).scoring.margin_v2_from_block == 0
 
 
-def test_resolver_locks_in_and_the_bar_applies_from_the_next_boundary(cfg):
+def test_resolver_locks_in_and_the_bar_applies_from_the_next_era_start(cfg):
     c = _typed(cfg)
     spec = A.margin_v2_feature(c)
     note = A.format_signals(A.ReadySignal(PRIMARY), A.ReadySignal(spec.name))
@@ -221,11 +223,18 @@ def test_resolver_locks_in_and_the_bar_applies_from_the_next_boundary(cfg):
     res = A.resolve_activation(c, chain, now_block=B0 + 3600 + 5, record=A.ActivationRecord(),
                                feature=spec)
     assert res.record.locked and res.record.feature == spec.name
-    assert res.record.lock_block == B0 + 3600 and res.record.activation_block == B0 + 3600 + 900
+    # B0 + 3600 is itself an era start: a lock-in ON an era start takes the
+    # FOLLOWING one, so the era in which the count crossed stays on the old bar
+    assert res.record.lock_block == B0 + 3600 and res.record.activation_block == B0 + 7200
     armed = A.apply_margin_v2_activation(c, res.record.activation_block)
-    # the round in which the count crossed stays on the old bar; the next is judged at 0.4
-    assert armed.koth_params(block=B0 + 3600).win_margin_start == c.scoring.win_margin_start
-    assert armed.koth_params(block=B0 + 4500).win_margin_start == 0.4
+    for settlement in (B0 + 3600, B0 + 4500, B0 + 5400, B0 + 6300):  # the whole crossing era
+        assert armed.koth_params(block=settlement).win_margin_start == c.scoring.win_margin_start
+    assert armed.koth_params(block=B0 + 7200).win_margin_start == 0.4
+    # a lock-in MID-era (a settlement boundary) also waits for the next era start
+    mid = FakeChain(_fleet(60, 40), {"v1": note}, block=B0 + 5400 + 5)
+    res_mid = A.resolve_activation(c, mid, now_block=B0 + 5400 + 5, record=A.ActivationRecord(),
+                                   feature=spec)
+    assert res_mid.record.lock_block == B0 + 5400 and res_mid.record.activation_block == B0 + 7200
     # below the threshold nothing locks
     chain2 = FakeChain(_fleet(40, 60), {"v1": note}, block=B0 + 3600 + 5)
     res2 = A.resolve_activation(c, chain2, now_block=B0 + 3600 + 5, record=A.ActivationRecord(),
@@ -275,20 +284,21 @@ def test_validator_runner_decides_the_bar_on_chain_persists_restores_and_stamps(
     runner._activation_startup(chain)
     assert chain.written[0] == f"cascade-ready:1:{PRIMARY}:0:0:{spec.name}:0:0"
     assert chain.written[-1] == (f"cascade-ready:1:{PRIMARY}:0:0:{spec.name}:"
-                                 f"{B0 + 3600}:{B0 + 3600 + 900}")
+                                 f"{B0 + 3600}:{B0 + 7200}")
     assert runner._margin_v2.locked
-    assert runner.cfg.scoring.margin_v2_from_block == B0 + 3600 + 900
-    assert runner.margin_v2_block == B0 + 3600 + 900                 # stamped on receipts
+    assert runner.cfg.scoring.margin_v2_from_block == B0 + 7200
+    assert runner.margin_v2_block == B0 + 7200                       # stamped on receipts
     assert runner.activation_block == 0                              # the typed rollover records nothing
-    assert runner.cfg.koth_params(block=B0 + 4500).win_margin_start == 0.4
+    assert runner.cfg.koth_params(block=B0 + 4500).win_margin_start != 0.4
+    assert runner.cfg.koth_params(block=B0 + 7200).win_margin_start == 0.4
     saved = A.ActivationStore(tmp_path / "activation_margin_v2_state.json").load()
-    assert saved.activation_block == B0 + 3600 + 900
+    assert saved.activation_block == B0 + 7200
     # a restarted validator restores the lock-in from disk before touching the chain
     again = ValidatorRunner(cfg=c, activation_store=A.ActivationStore(tmp_path / "act.json"))
     dead = SimpleNamespace(current_block=lambda: (_ for _ in ()).throw(RuntimeError("down")),
                            hotkey_ss58=lambda: "v1")
     again._activation_startup(dead)
-    assert again.cfg.scoring.margin_v2_from_block == B0 + 3600 + 900
+    assert again.cfg.scoring.margin_v2_from_block == B0 + 7200
 
 
 def test_validator_runner_is_silent_on_a_typed_bar(cfg, tmp_path):
@@ -322,7 +332,7 @@ def test_audit_replays_a_stamped_receipt_under_the_v2_bar(cfg):
     from cascade.audit.checks import check_margin_v2
 
     c = _typed(cfg)
-    gate = B0 + 4500
+    gate = B0 + 7200                                                 # an era start
     pre = SimpleNamespace(activation_block=0, margin_v2_block=0, epoch_start_block=B0 + 3600)
     post = SimpleNamespace(activation_block=0, margin_v2_block=gate, epoch_start_block=gate)
     assert A.apply_receipt_activation(c, pre) is c
@@ -337,10 +347,111 @@ def test_audit_replays_a_stamped_receipt_under_the_v2_bar(cfg):
     chain = FakeChain(_fleet(60, 40), {"v1": note}, block=gate + 10)
     assert check_margin_v2(post, replayed, chain).status == "PASS"
     bad = FakeChain(_fleet(60, 40), {"v1": A.format_signals(
-        A.ReadySignal(PRIMARY), A.ReadySignal(spec.name, B0 + 7200, B0 + 8100))}, block=gate + 10)
+        A.ReadySignal(PRIMARY), A.ReadySignal(spec.name, B0 + 7200, B0 + 10800))}, block=gate + 10)
     assert check_margin_v2(post, replayed, bad).status == "FAIL"
     assert check_margin_v2(post, _no_v2(c)).status == "FAIL"         # the auditor's config has no bar
     typed = replace(c, scoring=replace(c.scoring, margin_v2_from_block=gate))
     assert check_margin_v2(post, typed).status == "PASS"
     assert check_margin_v2(post, replace(c, scoring=replace(
         c.scoring, margin_v2_from_block=gate + 900))).status == "FAIL"
+
+
+# ── era-start activation (owner 2026-10-01: "next clean fresh era") ─────────
+
+def test_era_alignment_rounds_up_to_the_next_era_start_and_leaves_boundary_specs_alone(cfg):
+    c = _typed(cfg)
+    era = 900 * int(c.round.era_settlements or 1)
+    assert era == 3600 and B0 % era == 0                      # the fixture's era grid
+    for lock in (B0 + 3600, B0 + 4500, B0 + 5400, B0 + 6300):  # on the era start and mid-era
+        assert A.activation_block_for(c.round, lock, "era") == B0 + 7200
+        assert A.valid_pair(c.round, lock, B0 + 7200, "era")
+        assert not A.valid_pair(c.round, lock, lock + 900, "era") or lock + 900 == B0 + 7200
+    # the rollover / forfeiture keep the next SETTLEMENT boundary, bit-identical
+    assert A.activation_block_for(c.round, B0 + 4500) == B0 + 5400
+    assert A.activation_block_for(c.round, B0 + 4500, "boundary") == B0 + 5400
+    assert A.valid_pair(c.round, B0 + 4500, B0 + 5400)
+    assert A.primary_feature(c).align == "boundary"
+    f = replace(c, scoring=replace(c.scoring, forfeit_hotkeys=(K,), forfeit_successor_hotkey=S))
+    assert A.forfeit_feature(f).align == "boundary"
+    assert A.margin_v2_feature(c).align == "era"
+
+
+def test_agreement_only_adopts_era_aligned_margin_notes(cfg):
+    c = _typed(cfg)
+    spec = A.margin_v2_feature(c)
+    good = A.format_signals(A.ReadySignal(PRIMARY), A.ReadySignal(spec.name, B0 + 4500, B0 + 7200))
+    stale = A.format_signals(A.ReadySignal(PRIMARY), A.ReadySignal(spec.name, B0 + 4500, B0 + 5400))
+    vs = _fleet(60, 40)
+    assert A.agreed_activation(spec.name, vs, {"v1": good}, threshold=0.51, block=B0 + 5000,
+                               round_cfg=c.round, align="era") == (B0 + 4500, B0 + 7200)
+    # a next-settlement pair (the pre-change rule) is inadmissible for the margin feature
+    assert A.agreed_activation(spec.name, vs, {"v1": stale}, threshold=0.51, block=B0 + 5000,
+                               round_cfg=c.round, align="era") is None
+    # the resolver adopts the era-aligned note from the fleet
+    chain = FakeChain(vs, {"v1": good}, block=B0 + 5000)
+    res = A.resolve_activation(c, chain, now_block=B0 + 5000, record=A.ActivationRecord(),
+                               feature=spec)
+    assert res.record.source == "signals" and res.record.activation_block == B0 + 7200
+
+
+# ── level fallback keeps the level bar (review fix) ─────────────────────────
+
+def test_level_fallback_uses_the_pre_v2_schedule_when_the_v2_bar_is_active(cfg):
+    from cascade.eval.koth import margin_for_tenure
+
+    c = A.apply_margin_v2_activation(_typed(cfg), B0 + 7200)
+    block = B0 + 7200
+    inc = c.koth_params(block=block)
+    assert inc.win_margin_start == 0.4 and inc.win_margin_end == 0.2
+    lvl = c.judged_level_params(inc, block)
+    assert lvl.margin_mode == "level"
+    assert lvl.win_margin_start == c.scoring.win_margin_start           # 1 %, not 40 %
+    assert lvl.win_margin_end == c.scoring.win_margin_end
+    assert lvl.margin_warmup_rounds == c.koth_params(block=B0 + 3600).margin_warmup_rounds
+    assert margin_for_tenure(lvl, 0) < 0.05 < margin_for_tenure(inc, 0)
+    # every non-margin field is untouched (alpha/k, gates, mv)
+    for f in ("bootstrap_alpha", "bootstrap_B", "min_windows", "init_gate_mode", "mv_score",
+              "margin_increment_floor", "dethrone_cp"):
+        assert getattr(lvl, f) == getattr(inc, f)
+
+
+def test_level_fallback_is_bit_identical_while_the_v2_bar_is_inactive(cfg):
+    c = _typed(cfg)
+    for block in (B0, B0 + 3600, B0 + 7200, None):
+        p = c.koth_params(block=block)
+        assert c.judged_level_params(p, block) == replace(p, margin_mode="level")
+
+
+def test_validator_and_audit_route_the_level_fallback_through_the_helper():
+    loop = (REPO / "cascade" / "validator" / "loop.py").read_text()
+    checks = (REPO / "cascade" / "audit" / "checks.py").read_text()
+    assert 'replace(base_params, margin_mode="level")' not in loop
+    assert "self.cfg.judged_level_params(base_params, epoch_block)" in loop
+    assert 'margin_mode="increment" if judged_increment else "level"' not in checks
+    assert checks.count("cfg.judged_level_params(") == 4
+
+
+def test_a_level_judged_round_under_the_v2_bar_stays_dethroneable(cfg):
+    """End to end through evaluate_round: a challenger ~20 % better in LEVEL
+    terms wins under the level fallback; judged at the raw 0.4 v2 bar in level
+    units it could not (40 % of the absolute score) — the bug this pins."""
+    import numpy as np
+
+    from cascade.eval.koth import evaluate_round
+    from cascade.eval.scoring import WindowScore
+
+    def scores(level, seed):
+        rng = np.random.default_rng(seed)
+        return [WindowScore(series_id=f"w{i}", mase=level * float(rng.uniform(0.98, 1.02)),
+                            qloss_per_q=level * rng.uniform(0.98, 1.02, 9),
+                            abs_target=10.0 + i, channel=0) for i in range(300)]
+
+    c = A.apply_margin_v2_activation(_typed(cfg), B0 + 7200)
+    inc = replace(c.koth_params(block=B0 + 7200), bootstrap_B=300, min_windows=5,
+                  init_gate_mode="off")
+    king, chal = scores(1.0, 1), scores(0.8, 2)
+    fixed = evaluate_round(king, chal, c.judged_level_params(inc, B0 + 7200), seed=3)
+    broken = evaluate_round(king, chal, replace(inc, margin_mode="level"), seed=3)
+    assert fixed.margin_mode == broken.margin_mode == "level"
+    assert fixed.margin < 0.05 and fixed.challenger_wins_round
+    assert broken.margin >= 0.2 and not broken.challenger_wins_round

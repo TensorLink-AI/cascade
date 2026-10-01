@@ -453,7 +453,8 @@ in-context.
   over `margin_warmup_blocks_v2 = 18000` blocks of tenure (CONSENSUS). The
   1%→0.5% bar is ≈"LCB > 0" in increment units. `margin_v2_from_block = 0` =
   decided on chain via a third readiness-note segment (51% stake, applies
-  from the next boundary); typed block = owner override; receipts stamp
+  from the next ERA START, never mid-era); typed block = owner override;
+  level-judged rounds keep the level bar; receipts stamp
   `margin_v2_block`, audit `margin-v2` check. Floor > 0 load-checked.
   (`decisions/DEC-CA-0049-margin-v2.md`)
 - Staged rollout + budget denomination + no-weights ceiling:

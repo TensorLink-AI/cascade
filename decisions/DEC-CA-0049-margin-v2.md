@@ -26,8 +26,16 @@ now", and "it should be a validator auto update as they update their code".
   — `margin-v2-<sha256("start|end|blocks")[:8]>` — beside the rollover and
   forfeiture segments. At the first boundary where 51% of eligible validator
   stake has signalled it LOCKS IN (one-way, persisted in
-  `activation_margin_v2_state.json`) and the bar applies from the NEXT
-  boundary — the round in which the count crossed finishes on the old bar.
+  `activation_margin_v2_state.json`) and the bar applies from the first ERA
+  START after the lock-in boundary (owner 2026-10-01: "next clean fresh era";
+  `FeatureSpec.align = "era"`). Every settlement of one era is judged under
+  one bar — never mid-era — and a lock-in exactly on an era start takes the
+  FOLLOWING era start, so the era in which the count crossed finishes on the
+  old bar. Worked example (900-block grid, 4 settlements per era = 3600-block
+  eras): lock-in at settlement 9187200 + 900 = 9188100 (mid era 2552) ⇒ bar
+  from 9190800 (era 2553 start); lock-in at 9187200 (era 2552's own start) ⇒
+  also 9190800. Notes naming any other `(lock, act)` pair for this feature are
+  inadmissible. The rollover and forfeiture keep their next-boundary rule.
   Changing any of the three values renames the feature (a fresh vote). A typed
   `margin_v2_from_block` is the owner override and the hold-back.
 * **Receipts + audit.** Validators stamp `margin_v2_block` (drop-when-default,
@@ -37,6 +45,12 @@ now", and "it should be a validator auto update as they update their code".
 * **Guardrails (load-checked).** All three values set or none; floor > 0 (a
   zero floor turns the decay into a term-limit lottery); start >= end; a
   typed block needs the bar.
+* **Level fallback keeps the level bar.** The v2 values are priced in
+  INCREMENT units. A round the validator must judge in LEVEL units (no init
+  baseline: a random-init round or a multi-size duel) is judged at the pre-v2
+  level schedule (`ChainConfig.judged_level_params`), never at a 0.4 LEVEL bar
+  (40 % of the absolute score = undethroneable). The audit replay applies the
+  same rule; receipts still record the unmodified config params.
 
 ## Why
 

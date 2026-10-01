@@ -307,7 +307,8 @@ def check_margin_v2(receipt: RoundReceipt, cfg: ChainConfig,
         return _warn(name, f"margin v2 from {block} recorded; chain read failed ({e})")
     agreed = agreed_activation(spec.name, validators, signals,
                                threshold=cfg.activation.threshold, block=now_block,
-                               dormant_after_blocks=cfg.activation.dormant_after_blocks)
+                               dormant_after_blocks=cfg.activation.dormant_after_blocks,
+                               round_cfg=cfg.round, align=spec.align)
     if agreed is None:
         return _warn(name, f"margin v2 from {block} recorded; validators holding "
                            f"{cfg.activation.threshold:.0%} of stake do not (yet) name one "
@@ -830,8 +831,9 @@ def check_duel_cohort(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
             duel_params.margin_mode == "increment" and baseline is not None
         )
         gate_on = str(getattr(duel_params, "init_gate_mode", "off") or "off") != "off"
-        mode_params = _dc_replace(
-            duel_params, margin_mode="increment" if judged_increment else "level"
+        mode_params = (
+            _dc_replace(duel_params, margin_mode="increment") if judged_increment
+            else cfg.judged_level_params(duel_params, receipt.epoch_start_block)
         )
         res = evaluate_round(
             king, chal, mode_params,
@@ -862,8 +864,9 @@ def check_duel_cohort(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
                 cfg.scoring, receipt.epoch_start_block) else None)
         # The UNMODIFIED recorded params (no alpha/k) with the judged margin
         # mode — the same pair the validator handed cohort_maxt_lcb_map.
-        maxt_params = _dc_replace(
-            params, margin_mode="increment" if judged_increment else "level")
+        maxt_params = (
+            _dc_replace(params, margin_mode="increment") if judged_increment
+            else cfg.judged_level_params(params, receipt.epoch_start_block))
         try:
             lcbs = _cohort_maxt_lcbs(receipt, manifest, maxt_params, maxt_baseline)
         except (ValueError, KeyError) as e:
@@ -1050,8 +1053,9 @@ def check_verdict(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
         duel_params.margin_mode == "increment" and baseline is not None
     )
     gate_on = str(getattr(duel_params, "init_gate_mode", "off") or "off") != "off"
-    duel_params = _dc_replace(
-        duel_params, margin_mode="increment" if judged_increment else "level"
+    duel_params = (
+        _dc_replace(duel_params, margin_mode="increment") if judged_increment
+        else cfg.judged_level_params(duel_params, receipt.epoch_start_block)
     )
     replay_baseline = (
         baseline if (judged_increment or (gate_on and baseline is not None))
@@ -1082,8 +1086,9 @@ def check_verdict(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
         maxt_baseline = (
             baseline if judged_increment and cohort_maxt_increment_active(
                 cfg.scoring, receipt.epoch_start_block) else None)
-        maxt_params = _dc_replace(
-            params, margin_mode="increment" if judged_increment else "level")
+        maxt_params = (
+            _dc_replace(params, margin_mode="increment") if judged_increment
+            else cfg.judged_level_params(params, receipt.epoch_start_block))
         try:
             lcbs = _cohort_maxt_lcbs(receipt, manifest, maxt_params, maxt_baseline)
         except (ValueError, KeyError) as e:

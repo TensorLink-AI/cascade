@@ -753,8 +753,10 @@ margin_warmup_rounds = 8         # rounds of tenure to reach the floor (~4d at 1
 # ⇒ every validator on a release carrying this bar signals readiness
 # (DEC-CA-0045 note segment margin-v2-<hash of the three values>); at the first
 # boundary where 51% of eligible validator stake has signalled it locks in and
-# the bar applies from the NEXT boundary — no fork while the fleet is mixed,
-# nothing changes until the count crosses. A typed block is the owner override
+# the bar applies from the NEXT ERA START (never mid-era; a lock-in on an era
+# start takes the following one) — no fork while the fleet is mixed, nothing
+# changes until the count crosses. Rounds judged in LEVEL units (no init
+# baseline) keep the level bar above, never the v2 increment bar. A typed block is the owner override
 # (and the hold-back). Changing any of the three values is a fresh vote.
 # HARD GUARDRAIL: win_margin_end_v2 > 0 and start >= end (load-checked).
 win_margin_start_v2     = 0.4

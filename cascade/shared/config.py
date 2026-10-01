@@ -1830,7 +1830,9 @@ class ScoringConfig:
     # All three set together or none (load-checked; end > 0 is the HARD
     # guardrail, start >= end). ``margin_v2_from_block`` = 0 means DECIDED ON
     # CHAIN: the validators signal readiness (DEC-CA-0045) and the lock-in
-    # writes the rollover boundary here; a typed block is the owner override.
+    # writes the first ERA START after the lock-in boundary here (never
+    # mid-era); a typed block is the owner override. Level-judged rounds keep
+    # the level bar (``ChainConfig.judged_level_params``).
     # Rounds before the block, and the block-less steady state, are judged
     # exactly as before.
     win_margin_start_v2: float = 0.0
@@ -2209,6 +2211,30 @@ class ChainConfig:
             init_gate_mode=self.scoring.init_gate_mode,
             init_gate_tolerance=self.scoring.init_gate_tolerance,
             mv_score=mv_score_active(self.scoring, block),
+        )
+
+    def judged_level_params(self, params: Any, block: int | None) -> Any:
+        """``params`` judged in LEVEL units for the round at ``block``: the
+        margin mode set to "level" and the margin schedule set to the pre-v2
+        level bar (``effective_win_margin_start`` / ``win_margin_end`` /
+        ``effective_margin_warmup_rounds``). DEC-CA-0049's v2 bar is priced in
+        INCREMENT units; a round that falls back to level (no init baseline:
+        a random-init round or a multi-size duel) must never be judged at a
+        0.4 LEVEL bar (40 % of the absolute score = undethroneable). Every
+        other field is kept. Bit-identical to ``replace(params,
+        margin_mode="level")`` while the v2 bar is not active. The validator's
+        in-round fallback and the audit replay both call this."""
+        from dataclasses import replace as _replace
+
+        from .era import effective_margin_warmup_rounds
+
+        return _replace(
+            params,
+            margin_mode="level",
+            win_margin_start=effective_win_margin_start(self.scoring, block),
+            win_margin_end=self.scoring.win_margin_end,
+            margin_warmup_rounds=effective_margin_warmup_rounds(
+                self.round, self.scoring, block),
         )
 
 
