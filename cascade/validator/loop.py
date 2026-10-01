@@ -40,10 +40,13 @@ from ..shared.activation import (
     Tally,
     apply_activation,
     apply_forfeit_activation,
+    apply_margin_v2_activation,
     ensure_signal,
     forfeit_feature,
+    margin_v2_feature,
     record_for,
     resolve_activation,
+    resolved_margin_v2_block,
     resolved_rollover,
 )
 from ..shared.activation import summary as activation_summary
@@ -381,6 +384,10 @@ class ValidatorRunner:
     # beside the rollover's (``activation_forfeit_state.json``).
     _forfeit: ActivationRecord = field(default_factory=ActivationRecord, repr=False)
     _forfeit_tally: Tally | None = field(default=None, repr=False)
+    # DEC-CA-0049 dethrone bar v2 decided on chain: its own record + tally,
+    # persisted beside the others (``activation_margin_v2_state.json``).
+    _margin_v2: ActivationRecord = field(default_factory=ActivationRecord, repr=False)
+    _margin_v2_tally: Tally | None = field(default=None, repr=False)
 
     # ── stake-weighted activation (DEC-CA-0045) ─────────────────────────────
 
@@ -435,6 +442,7 @@ class ValidatorRunner:
                 # The note now carries the agreed block for late joiners.
                 self._ensure_own_signal(client)
             self._forfeit_step(client, now_block=now_block)
+            self._margin_v2_step(client, now_block=now_block)
         except Exception as e:  # noqa: BLE001 — activation must never disturb a round
             log.warning("activation step failed (%s); retrying next poll", e)
 
@@ -478,6 +486,52 @@ class ValidatorRunner:
             self._ensure_own_signal(client)
 
 
+    @property
+    def margin_v2_block(self) -> int:
+        """The margin-v2 block resolved FROM VALIDATOR SIGNALS and applied to
+        the live config (0 = none, or typed into chain.toml) — stamped on
+        receipts so the audit replays the bar the fleet decided."""
+        return resolved_margin_v2_block(self.cfg)
+
+    def _margin_v2_store(self) -> ActivationStore | None:
+        store = self.activation_store
+        if store is None or store.path is None:
+            return None
+        return ActivationStore(store.path.with_name("activation_margin_v2_state.json"))
+
+    def apply_margin_v2_block(self, block: int) -> bool:
+        """Write the fleet-decided margin-v2 block into the live config
+        (``[scoring] margin_v2_from_block``). Returns True when it changed."""
+        new_cfg = apply_margin_v2_activation(self.cfg, block)
+        if new_cfg is self.cfg:
+            return False
+        self.cfg = new_cfg
+        sc = new_cfg.scoring
+        log.warning("activation: DEC-CA-0049 dethrone bar v2 ARMED at block %d — rounds from "
+                    "it on are judged at %.4f decaying to %.4f over %d blocks of tenure",
+                    sc.margin_v2_from_block, sc.win_margin_start_v2, sc.win_margin_end_v2,
+                    sc.margin_warmup_blocks_v2)
+        return True
+
+    def _margin_v2_step(self, client: object, *, now_block: int) -> None:
+        """The margin-v2 bar's own resolver pass (same tally rule, its own
+        record). No-op without a v2 bar or under a typed block."""
+        spec = margin_v2_feature(self.cfg)
+        if spec is None or not spec.decided_on_chain:
+            return
+        res = resolve_activation(self.cfg, client, now_block=int(now_block),
+                                 record=self._margin_v2, feature=spec)
+        if res.tally is not None:
+            self._margin_v2_tally = res.tally
+        if res.changed:
+            self._margin_v2 = res.record
+            store = self._margin_v2_store()
+            if store is not None:
+                store.save(res.record)
+        if (self._margin_v2.locked and self._margin_v2.source != "config"
+                and self.apply_margin_v2_block(self._margin_v2.activation_block)):
+            self._ensure_own_signal(client)
+
     def _ensure_own_signal(self, client: object) -> None:
         """Write this validator's note when it is not the one already on
         chain. One chain read per CHANGE of note, not per poll: the payload
@@ -486,7 +540,7 @@ class ValidatorRunner:
 
         if not self._signal_hotkey:
             return
-        want = own_signal_payload(self.cfg, self._activation, self._forfeit)
+        want = own_signal_payload(self.cfg, self._activation, self._forfeit, self._margin_v2)
         if want is None or want == self._signal_sent:
             return
         try:
@@ -500,6 +554,7 @@ class ValidatorRunner:
         # Written now, confirmed by the read on the next poll.
         ensure_signal(client, self.cfg, self._activation, hotkey=self._signal_hotkey,
                       forfeit_record=self._forfeit,
+                      margin_v2_record=self._margin_v2,
                       current=have)
 
     def _activation_startup(self, client: object) -> None:
@@ -516,6 +571,14 @@ class ValidatorRunner:
                          self._forfeit.lock_block, self._forfeit.activation_block,
                          self._forfeit.source)
                 self.apply_forfeit_block(self._forfeit.activation_block)
+        mstore, mspec = self._margin_v2_store(), margin_v2_feature(self.cfg)
+        if mstore is not None and mspec is not None:
+            self._margin_v2 = record_for(self.cfg, mstore.load(), mspec)
+            if self._margin_v2.locked and self._margin_v2.source != "config":
+                log.info("activation: restored margin-v2 lock-in (block %d, bar from %d, via %s)",
+                         self._margin_v2.lock_block, self._margin_v2.activation_block,
+                         self._margin_v2.source)
+                self.apply_margin_v2_block(self._margin_v2.activation_block)
         self._signal_hotkey = str(getattr(client, "hotkey_ss58", lambda: "")() or "")
         if self._activation.locked and self._activation.source != "config":
             log.info("activation: restored lock-in (block %d, rollover %d, via %s)",
@@ -1872,7 +1935,8 @@ class ValidatorRunner:
 
         # Decision parameters for THIS round's epoch: a scheduled margin
         # change resolves from the boundary block, never from restart timing.
-        base_params = self.cfg.koth_params(block=self._epoch_start_block(manifest))
+        epoch_block = self._epoch_start_block(manifest)
+        base_params = self.cfg.koth_params(block=epoch_block)
         # Score the shared warm-start init when either consumer needs it: the
         # increment margin (DEC-CA-0027) or the init-baseline floor
         # ([scoring] init_gate_mode). The increment fallback mutates only the
@@ -1887,7 +1951,9 @@ class ValidatorRunner:
             baseline_scores = self._score_increment_baseline(
                 manifest, paired_sizes, windows, score_records)
             if baseline_scores is None and base_params.margin_mode == "increment":
-                base_params = replace(base_params, margin_mode="level")
+                # Level units ⇒ the level bar (DEC-CA-0049: never the v2
+                # increment bar priced as a share of the absolute score).
+                base_params = self.cfg.judged_level_params(base_params, epoch_block)
             if baseline_scores is None and base_params.init_gate_mode != "off":
                 # No baseline (random-init round / size mismatch): the floor
                 # cannot run this round — recorded None, judged as if off.
@@ -2246,6 +2312,7 @@ class ValidatorRunner:
                 validator_hotkey=validator_hotkey,
                 era_start_block=era_start_block, era_base_seed=era_base_seed,
                 activation_block=self.activation_block,
+                margin_v2_block=self.margin_v2_block,
             )
         if outcome is None or windows is None:
             raise ValueError("a scored receipt needs both outcome and windows")
@@ -2276,6 +2343,7 @@ class ValidatorRunner:
             validator_hotkey=validator_hotkey,
             era_start_block=era_start_block, era_base_seed=era_base_seed,
             activation_block=self.activation_block,
+            margin_v2_block=self.margin_v2_block,
         )
 
     def _publish_round_receipt(
@@ -2427,7 +2495,8 @@ class ValidatorRunner:
         try:
             econ = getattr(client, "subnet_economics", lambda: None)()
             activation = (activation_summary(self.cfg, self._activation, self._activation_tally,
-                                             self._forfeit, self._forfeit_tally)
+                                             self._forfeit, self._forfeit_tally,
+                                             self._margin_v2, self._margin_v2_tally)
                           if self.cfg.activation.enabled else None)
             status = build_chain_status(
                 self.cfg,

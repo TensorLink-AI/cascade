@@ -30,11 +30,14 @@ K, S = "KINGKINGKINGKING", "SUCCESSORSUCCESSOR"
 
 @pytest.fixture
 def cfg():
-    """The shipped chain.toml with its DEC-CA-0048 forfeiture DISARMED: these tests
-    model the plain fleet (no forfeiture configured) and arm one explicitly."""
+    """The shipped chain.toml with its DEC-CA-0048 forfeiture and DEC-CA-0049
+    margin-v2 bar DISARMED: these tests model the plain fleet (neither
+    configured) and arm one explicitly."""
     c = load_chain_config(REPO / "chain.toml")
     return replace(c, scoring=replace(c.scoring, forfeit_hotkeys=(), forfeit_from_block=0,
-                                      forfeit_successor_hotkey=""))
+                                      forfeit_successor_hotkey="", win_margin_start_v2=0.0,
+                                      win_margin_end_v2=0.0, margin_warmup_blocks_v2=0,
+                                      margin_v2_from_block=0))
 
 
 def _typed(cfg):
