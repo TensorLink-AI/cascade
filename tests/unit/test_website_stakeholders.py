@@ -156,3 +156,52 @@ def test_links_to_and_from_the_technical_dashboard(html: str):
     assert 'href="index.html"' in html
     index = (REPO / "cascade" / "website" / "index.html").read_text(encoding="utf-8")
     assert f'href="{WEBSITE_STAKEHOLDERS_KEY}"' in index
+
+
+def _bench_entry_json_keys() -> set[str]:
+    """The keys a signed bench report entry actually carries on the wire —
+    taken from :meth:`BenchReport.canonical_body`, not transcribed."""
+    from cascade.shared.bench_report import BenchEntry, BenchReport
+    from cascade.shared.manifest import BenchScores
+
+    six = dict(gifteval_crps=0.5, gifteval_mase=0.8, boom_crps=0.4,
+               boom_mase=0.6, time_crps=0.5, time_mase=0.7)
+    entry = BenchEntry(role="challenger", size="toto2-4m", miner_hotkey="5Hk",
+                       miner_uid=133, trained_pointer="metro-v1:trained:hippius:cascade/x@sha256:ab",
+                       scores=BenchScores(**six))
+    body = json.loads(BenchReport(round_id="1", created_block=1, entries=(entry,)).canonical_body())
+    (wire,) = body["entries"]
+    return set(wire) | {f"scores.{k}" for k in wire["scores"]}
+
+
+def test_best_checkpoint_card_reads_the_report_wire_fields(html: str):
+    """The best-checkpoint card names the checkpoint from the report entry:
+    uid, hotkey and the Hub pointer. Rename one of those in
+    cascade.shared.bench_report and the card would silently render a nameless
+    checkpoint — this pins the names the page reads to the serialisation."""
+    keys = _bench_entry_json_keys()
+    for field in ("miner_uid", "miner_hotkey", "trained_pointer", "role"):
+        assert field in keys, f"bench report entries no longer carry {field!r}"
+        assert re.search(rf"\be\.{field}\b", html), f"the page no longer reads e.{field}"
+    for k in ("gifteval_crps", "gifteval_mase", "boom_crps", "boom_mase", "time_crps", "time_mase"):
+        assert f"scores.{k}" in keys
+        assert f'"{k}"' in html, f"the page no longer reads {k}"
+
+
+def test_best_checkpoint_card_strips_the_pointer_scheme(html: str):
+    """The card shows the bare Hub ``repo@digest`` (what a registry pull takes),
+    so the prefix it strips must be exactly the trained-pointer scheme."""
+    from cascade.shared.manifest import TRAINED_RE
+
+    m = re.search(r'var HUB_POINTER_PREFIX = "([^"]+)"', html)
+    assert m, "HUB_POINTER_PREFIX not found"
+    prefix = m.group(1)
+    ref = "cascade/ckpt-r1-challenger-toto2-4m-u133@sha256:" + "ab" * 32
+    parsed = TRAINED_RE.match(prefix + ref)
+    assert parsed and parsed.group("ref") == ref, "the trained-pointer scheme moved; update HUB_POINTER_PREFIX"
+
+
+def test_best_checkpoint_card_has_explicit_pending_state(html: str):
+    assert 'id="best-panel"' in html and 'id="best-answer"' in html
+    assert "Awaiting first benched checkpoint" in html
+    assert "renderBest()" in html

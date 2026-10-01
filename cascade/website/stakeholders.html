@@ -692,6 +692,18 @@ section.q{border-top:var(--line);margin-top:52px;padding-top:30px}
 .lede{color:var(--muted);font-size:13.5px;max-width:86ch;margin-bottom:18px;line-height:1.65}
 .lede b{color:var(--ink)}
 
+/* the best checkpoint: who set it, and the exact artifact to pull */
+.ckpt-ref{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:18px;
+  padding:12px 0 2px;border-top:var(--line-faint)}
+.ckpt-ref .ck{font-family:var(--font-mono);font-size:10px;font-weight:500;text-transform:uppercase;
+  letter-spacing:.08em;color:var(--faint)}
+.ckpt-ref code{font-family:var(--font-mono);font-size:12px;color:var(--ink);
+  overflow-wrap:anywhere;word-break:break-all;min-width:0;flex:1 1 320px}
+.ckpt-ref .cn{flex-basis:100%;font-family:var(--font-mono);font-size:10.5px;color:var(--faint)}
+.bench-six{grid-template-columns:repeat(3,1fr)}
+@media (max-width:1020px){.bench-six{grid-template-columns:repeat(2,1fr)}}
+@media (max-width:430px){.bench-six{grid-template-columns:1fr}}
+
 /* borderless measured-vs-guaranteed key */
 .figure-key{display:flex;gap:52px;flex-wrap:wrap;margin:0 0 8px}
 .fk{display:flex;flex-direction:column;gap:3px}
@@ -982,6 +994,31 @@ th.num{text-align:right}
         at full budget, while every Cascade checkpoint is trained under the round&rsquo;s fixed,
         published compute budget. And as everywhere on this page, these scores are
         <b>report-only</b> — rounds are still settled on hidden data, never on public benchmarks.</p>
+      </div>
+    </details>
+  </section>
+
+  <!-- the best checkpoint itself -->
+  <section class="q">
+    <div class="sec-head"><h2>Which checkpoint is the best so far?</h2>
+      <span class="when" id="best-when"></span></div>
+    <p class="answer" id="best-answer">--</p>
+    <div id="best-panel"></div>
+    <details>
+      <summary>How the best checkpoint is picked, and how to get it</summary>
+      <div class="detail-body">
+        <p>Every round&rsquo;s trainer-signed benchmark report
+        (<code>benchmarks/round-&lt;id&gt;.json</code>) scores its duel checkpoints on the same
+        six-number battery. The best checkpoint is the one with the <b>lowest combined score</b>
+        (the geometric mean of all six; lower is better) across the recent reports this page
+        loads &mdash; king or challenger, whoever set it. It is report-only: the throne is still
+        decided on hidden data, so the best-benched checkpoint need not be the current king.</p>
+        <p>Each metric is set against the official Toto2 reference doc at the same size; a
+        <b>sage</b> tile beats the official number, a <b>saffron</b> one still trails it.</p>
+        <p>The checkpoint is a content-addressed artifact on the Hippius Hub
+        (<code>repo@sha256:&hellip;</code>, the same pointer the manifest and receipts carry).
+        It is an <b>anonymous pull</b> from <code>registry.hippius.com</code> &mdash; no account
+        or key needed &mdash; and the digest pins the exact bytes that were benched.</p>
       </div>
     </details>
   </section>
@@ -1487,6 +1524,15 @@ function entrySizeKey(e, r){
   return k;
 }
 
+// A report entry's miner uid: the signed report serialises it as miner_uid
+// (cascade.shared.bench_report); older/hand-built entries may carry uid.
+function entryUid(e){
+  if(!e) return null;
+  if(e.miner_uid != null && isFinite(e.miner_uid)) return Number(e.miner_uid);
+  if(e.uid != null && isFinite(e.uid)) return Number(e.uid);
+  return null;
+}
+
 function benchView(){
   var rs = scoredRounds(), latest = null, best = null, bySize = {}, firstBySize = {};
   rs.forEach(function(r){
@@ -1499,12 +1545,16 @@ function benchView(){
       if(!six) return;
       var g = sixGeomean(six);
       if(g != null && (!best || g < best.geomean))
-        best = { geomean:g, six:six, role:String(e.role||""), uid:e.uid,
-                 round_id:r.round_id, at:r.published_at };
+        best = { geomean:g, six:six, role:String(e.role||""), uid:entryUid(e),
+                 hotkey:String(e.miner_hotkey||e.hotkey||""),
+                 pointer:String(e.trained_pointer||e.checkpoint||""),
+                 size:entrySizeKey(e, r), round_id:r.round_id, at:r.published_at };
       var sk = entrySizeKey(e, r);
       if(g != null && sk && (!bySize[sk] || g < bySize[sk].geomean))
-        bySize[sk] = { geomean:g, six:six, role:String(e.role||""),
-                       round_id:r.round_id, at:r.published_at };
+        bySize[sk] = { geomean:g, six:six, role:String(e.role||""), uid:entryUid(e),
+                       hotkey:String(e.miner_hotkey||e.hotkey||""),
+                       pointer:String(e.trained_pointer||e.checkpoint||""),
+                       size:sk, round_id:r.round_id, at:r.published_at };
       // rounds iterate oldest→newest: the first entry seen at a size is the
       // earliest published result — the meter's honest starting anchor
       if(g != null && sk && !firstBySize[sk])
@@ -1598,6 +1648,7 @@ function renderRef(){
       'the <b>identical benchmark battery</b> and published as reference docs, rather than quoting ' +
       'anyone&rsquo;s leaderboard numbers.</p></div>';
     document.getElementById("ref-when").textContent = "";
+    renderBest();
     return;
   }
 
@@ -1633,6 +1684,78 @@ function renderRef(){
     'initialisation under the round&rsquo;s fixed compute budget.</p>';
   document.getElementById("ref-when").textContent =
     pair ? (pair.rung.label + " head-to-head") : "";
+  renderBest();
+}
+// ── the best checkpoint itself ─────────────────────────────────────────────
+// benchView().best named, not just scored: who set it, when, the six numbers
+// against the official reference at its size, and the exact Hub artifact.
+var HUB_POINTER_PREFIX = "metro-v1:trained:hippius:";
+function hubPointer(p){
+  p = String(p || "");
+  return p.indexOf(HUB_POINTER_PREFIX) === 0 ? p.slice(HUB_POINTER_PREFIX.length) : p;
+}
+function copyText(text, btn){
+  var done = function(){ if(btn){ btn.textContent = "Copied"; setTimeout(function(){ btn.textContent = "Copy"; }, 1600); } };
+  var fallback = function(){
+    try{
+      var ta = document.createElement("textarea");
+      ta.value = text; ta.setAttribute("readonly", ""); ta.style.position = "absolute"; ta.style.left = "-9999px";
+      document.body.appendChild(ta); ta.select(); document.execCommand("copy"); document.body.removeChild(ta); done();
+    }catch(e){ if(btn) btn.textContent = "Select"; }
+  };
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(text).then(done, fallback);
+  } else { fallback(); }
+}
+function renderBest(){
+  var el = document.getElementById("best-panel");
+  if(!el) return;
+  var bv = benchView(), b = bv.best;
+  if(!b || b.geomean == null){
+    document.getElementById("best-answer").innerHTML =
+      "Awaiting first benched checkpoint &mdash; the best one is named here once a signed " +
+      "benchmark report is published.";
+    el.innerHTML = "";
+    document.getElementById("best-when").textContent = "";
+    return;
+  }
+  var ref = null;
+  refDocs().forEach(function(x){ if(x.rung.key === b.size) ref = x; });
+  var refSix = ref ? readSix(ref.doc) : null;
+  var pct = ref ? ref.geomean / b.geomean * 100 : null;
+  var who = (b.uid != null ? "uid " + esc(b.uid) : "an unnamed miner") +
+    (b.hotkey ? ' <span title="' + esc(b.hotkey) + '">(' + esc(b.hotkey.slice(0,8)) + "&hellip;)</span>" : "");
+  document.getElementById("best-answer").innerHTML =
+    "The best checkpoint benched so far is " + who + "&rsquo;s " + esc(b.role || "duel") +
+    " checkpoint from round " + esc(shortRound(b.round_id)) + " (" + esc(prettyDay(b.at)) + "): " +
+    "combined score <b>" + num(b.geomean,5) + "</b>" +
+    (pct != null
+      ? (pct >= 100
+          ? " &mdash; <b>beats the official Toto2-" + esc(ref.rung.label) + "</b> by " + signedPct(pct/100 - 1, 1) + "."
+          : " &mdash; <b>" + num(pct,1) + "%</b> of the official Toto2-" + esc(ref.rung.label) + "&rsquo;s score.")
+      : ".");
+  var rows = [
+    { k:"GIFT-Eval · CRPS", key:"gifteval_crps" }, { k:"BOOM · CRPS", key:"boom_crps" }, { k:"TIME · CRPS", key:"time_crps" },
+    { k:"GIFT-Eval · MASE", key:"gifteval_mase" }, { k:"BOOM · MASE", key:"boom_mase" }, { k:"TIME · MASE", key:"time_mase" }
+  ];
+  var cells = rows.map(function(r){
+    var v = b.six[r.key], o = refSix ? refSix[r.key] : null;
+    if(o == null) return cell({ k:r.k, v:num(v,4), q:"no official reference at this size", state:"off" });
+    var beats = v < o;
+    return cell({ k:r.k, v:num(v,4),
+      q:"official " + num(o,4) + " · " + (beats ? "beats by " : "trails by ") + signedPct(Math.abs(v/o - 1), 1).replace(/^[+−]/, ""),
+      state: beats ? "live" : "pend" });
+  });
+  var ptr = hubPointer(b.pointer);
+  var refHtml = ptr
+    ? '<div class="ckpt-ref"><span class="ck">Checkpoint</span><code id="best-ptr">' + esc(ptr) + '</code>' +
+        '<button type="button" class="btn" id="best-copy">Copy</button>' +
+        '<span class="cn">Anonymous pull from registry.hippius.com &mdash; the digest pins the exact benched bytes.</span></div>'
+    : '<div class="ckpt-ref"><span class="ck">Checkpoint</span><span class="cn">pointer not carried by this report</span></div>';
+  el.innerHTML = '<div class="bcells bench-six">' + cells.join("") + '</div>' + refHtml;
+  var btn = document.getElementById("best-copy");
+  if(btn) btn.addEventListener("click", function(){ copyText(ptr, btn); });
+  document.getElementById("best-when").textContent = "Report " + prettyDay(b.at);
 }
 function warmStart(){
   var m = _latest && _latest.manifest;
