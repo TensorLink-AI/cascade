@@ -563,6 +563,13 @@ class ValidatorRunner:
             return
         if self.activation_store is not None:
             self._activation = record_for(self.cfg, self.activation_store.load())
+        # Apply a restored rollover FIRST: it switches the settlement grid
+        # (3600 -> 900), and the forfeiture / margin-v2 blocks below are
+        # validated against the grid in force — restored before it, a forfeit
+        # block on the 900 grid reads as "not a settlement boundary" and the
+        # validator dies at startup (2026-10-01, forfeit at 9166500).
+        if self._activation.locked and self._activation.source != "config":
+            self.apply_activation_block(self._activation.activation_block)
         fstore, fspec = self._forfeit_store(), forfeit_feature(self.cfg)
         if fstore is not None and fspec is not None:
             self._forfeit = record_for(self.cfg, fstore.load(), fspec)
