@@ -63,7 +63,7 @@ docker run -d --name "$UI_NAME" -p 127.0.0.1::8765 -e CASCADE_UI_TOKEN=smoke \
   -v "$WORK:/work" "$IMG" ui >/dev/null
 PORT="$(docker port "$UI_NAME" 8765/tcp | head -1 | sed 's/.*://')"
 for _ in $(seq 1 30); do
-  curl -fsS -o /dev/null -H "X-Cascade-Token: smoke" "http://127.0.0.1:$PORT/api/status" && break
+  curl -fsS -o /dev/null -H "X-Cascade-Token: smoke" "http://127.0.0.1:$PORT/api/status" 2>/dev/null && break
   sleep 1
 done
 curl -fsS -H "X-Cascade-Token: smoke" "http://127.0.0.1:$PORT/api/status" \
