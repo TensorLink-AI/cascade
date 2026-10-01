@@ -41,7 +41,7 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
-from .optimize import AGENT_NOTE, AgentProposer, LoopConfig
+from .optimize import AGENT_NOTE, AgentProposer, LoopConfig, format_history_rows
 
 PROMPT_FILE = "RALPH_PROMPT.md"
 NOTES_FILE = "RALPH_NOTES.md"
@@ -286,20 +286,13 @@ Do not train or score; the loop does that.
 
 def _dynamic_section(loop, cand_dir: Path, iteration: int, history: list[dict]) -> str:
     best, king = loop.best_record(), loop.king_record()
-    rows = []
-    for h in history[-15:]:
-        s = "—" if h.get("score") is None else f"{h['score']:.5f}"
-        mark = " ACCEPTED" if h.get("accepted") and h.get("status") == "scored" else ""
-        why = "" if h.get("status") in ("scored", "baseline", "king") else \
-            f" [{(h.get('detail') or '').splitlines()[0][:120] if h.get('detail') else ''}]"
-        rows.append(f"  #{h['iteration']:>3} {h['status']:<9} {s}{mark}  "
-                    f"{h.get('note', '')[:140]}{why}")
+    rows = format_history_rows(history, 15, with_reason=True)
     best_s = "n/a" if not best else f"{best['score']:.5f} (#{best['iteration']})"
     king_s = "n/a" if not king or king.get("score") is None else f"{king['score']:.5f}"
     return (f"\n\n## This iteration: #{iteration}\n"
             f"Working directory: {cand_dir}\n"
             f"Current best: {best_s}. Reference king (same pool, seeds, init): {king_s}.\n"
-            f"Recent results (most recent last):\n{chr(10).join(rows) or '  (none yet)'}\n")
+            f"Recent results (most recent last):\n{rows}\n")
 
 
 class RalphProposer(AgentProposer):

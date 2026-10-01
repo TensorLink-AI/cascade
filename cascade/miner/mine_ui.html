@@ -114,6 +114,11 @@ details summary { cursor: pointer; color: var(--muted); font-size: 13px; margin-
         </div>
         <label for="llm_base_url">Anthropic-compatible base URL (optional override)</label>
         <input id="llm_base_url" placeholder="preset for chutes / saygm">
+        <div id="customRow" class="row" hidden>
+          <div><label for="llm_key_env">Key env var name</label><input id="llm_key_env" placeholder="MY_PROVIDER_KEY"></div>
+          <div><label for="llm_auth">Auth header</label>
+            <select id="llm_auth"><option value="">preset</option><option value="bearer">Bearer</option><option value="x-api-key">x-api-key</option></select></div>
+        </div>
         <label for="agent_max_turns">Max agent turns / iteration</label>
         <input id="agent_max_turns" type="number" min="0" value="40">
       </div>
@@ -204,7 +209,7 @@ const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<
 const dur = (s) => !s ? "" : s < 90 ? `${Math.round(s)}s` : s < 5400 ? `${Math.round(s / 60)}m` : `${(s / 3600).toFixed(1)}h`;
 
 // Remember form values per browser (a convenience; nothing here is a secret).
-const FIELDS = ["llm_provider", "llm_model", "llm_base_url", "agent_max_turns", "propose_cmd", "proposer", "iterations", "train_hours", "seeds", "device", "pool_dir", "start", "king",
+const FIELDS = ["llm_provider", "llm_model", "llm_base_url", "agent_max_turns", "llm_key_env", "llm_auth", "propose_cmd", "proposer", "iterations", "train_hours", "seeds", "device", "pool_dir", "start", "king",
   "min_improvement", "n_windows", "intake", "wallet_name", "wallet_hotkey", "label"];
 try { const saved = JSON.parse(localStorage.getItem("cascade-mine") || "{}");
   for (const f of FIELDS) if (saved[f] != null) $(f).value = saved[f];
@@ -218,12 +223,14 @@ $("startBtn").onclick = async () => {
   for (const f of ["proposer", "propose_cmd", "iterations", "train_hours", "seeds", "device", "pool_dir", "start", "king", "min_improvement", "n_windows"]) b[f] = $(f).value.trim();
   if (b.proposer !== "cmd") delete b.propose_cmd;
   if (b.proposer === "agent" || b.proposer === "ralph")
-    for (const f of ["llm_provider", "llm_model", "llm_base_url", "agent_max_turns"]) b[f] = $(f).value.trim();
+    for (const f of ["llm_provider", "llm_model", "llm_base_url", "agent_max_turns", "llm_key_env", "llm_auth"]) b[f] = $(f).value.trim();
   if ($("live").checked) b.warm_start = "live";
   try { await api("/api/start", b); refresh(); } catch (e) { alert("start failed: " + e.message); }
 };
 const syncCmd = () => { const v = $("proposer").value;
-  $("cmdRow").hidden = v !== "cmd"; $("llmRow").hidden = v !== "agent" && v !== "ralph"; };
+  $("cmdRow").hidden = v !== "cmd"; $("llmRow").hidden = v !== "agent" && v !== "ralph";
+  $("customRow").hidden = $("llm_provider").value !== "custom"; };
+$("llm_provider").onchange = () => syncCmd();
 $("proposer").onchange = syncCmd; syncCmd();
 $("stopBtn").onclick = () => api("/api/stop", {}).then(refresh).catch((e) => alert(e.message));
 $("killBtn").onclick = () => confirm("Kill the loop now? The current candidate is lost.") &&

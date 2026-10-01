@@ -40,27 +40,47 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=uv /uv /bin/uv
 
 WORKDIR /opt/cascade
-COPY . /opt/cascade
 
-# Same pinned torch build as the worker image (numerics), then the miner extras:
-# train (score), hippius (fetch/deploy), chain (commit/submit — bittensor pinned).
-# TORCH_INDEX is overridable (e.g. .../whl/cpu for a CPU-only image); the
-# default matches deploy/Dockerfile. --no-sources stops pyproject's
-# [tool.uv.sources] from re-resolving torch against the cu124 index: the torch
-# installed just before already satisfies the ==2.4.1 pin.
+# Layer order = cache order. Heavy, rarely-changing layers first: torch, the
+# pinned generator runtime, then the project's dependencies resolved from
+# pyproject.toml ALONE. Only then the source, so a code change rebuilds one
+# thin layer instead of re-downloading the CUDA stack.
+#
+# Same pinned torch build as the worker image (numerics). TORCH_INDEX is
+# overridable (e.g. .../whl/cpu for a CPU-only image); the default matches
+# deploy/Dockerfile.
 ARG TORCH_INDEX=https://download.pytorch.org/whl/cu124
 RUN uv venv --python 3.11 /opt/cascade/.venv \
     && uv pip install --python /opt/cascade/.venv/bin/python \
-        torch==2.4.1 --index-url "$TORCH_INDEX" \
-    && uv pip install --python /opt/cascade/.venv/bin/python --no-sources \
-        -e '.[train,hippius,chain]'
+        torch==2.4.1 --index-url "$TORCH_INDEX"
 
 # Generator-runtime allowlist, pinned exactly as in deploy/Dockerfile, so your
 # generator (and the king: numba, scikit-learn, …) imports the way it does on a pod.
-RUN uv pip install --python /opt/cascade/.venv/bin/python \
-        numpy==2.4.6 pandas==3.0.3 pyarrow==25.0.0 pyyaml==6.0.3 \
-        scipy==1.17.1 statsmodels==0.14.6 numba==0.66.0 \
-        scikit-learn==1.9.0 gpytorch==1.15.2 networkx==3.6.1
+ARG RUNTIME_PINS="numpy==2.4.6 pandas==3.0.3 pyarrow==25.0.0 pyyaml==6.0.3 \
+scipy==1.17.1 statsmodels==0.14.6 numba==0.66.0 scikit-learn==1.9.0 \
+gpytorch==1.15.2 networkx==3.6.1"
+RUN uv pip install --python /opt/cascade/.venv/bin/python $RUNTIME_PINS
+
+# The miner extras' dependencies: train (score), hippius (fetch/deploy), chain
+# (commit/submit; bittensor pinned). --no-sources stops pyproject's
+# [tool.uv.sources] from re-resolving torch against the cu124 index: the torch
+# installed above already satisfies the ==2.4.1 pin. The runtime pins are
+# restated so a dependency that wants another numpy/scipy fails the build
+# instead of silently moving a pin.
+COPY pyproject.toml /opt/cascade/pyproject.toml
+RUN uv pip install --python /opt/cascade/.venv/bin/python --no-sources \
+        -r pyproject.toml --extra train --extra hippius --extra chain \
+        torch==2.4.1 $RUNTIME_PINS
+
+# The source, last. --no-deps: everything it needs is already in place.
+COPY . /opt/cascade
+RUN uv pip install --python /opt/cascade/.venv/bin/python --no-sources --no-deps -e .
+
+ARG BUILD_SHA=unknown
+LABEL org.opencontainers.image.source="https://github.com/TensorLink-AI/cascade" \
+      org.opencontainers.image.revision="${BUILD_SHA}" \
+      org.opencontainers.image.title="cascade-miner"
+ENV CASCADE_MINER_BUILD_SHA=${BUILD_SHA}
 
 ENV PATH=/opt/cascade/.venv/bin:$PATH \
     CUBLAS_WORKSPACE_CONFIG=:4096:8 \

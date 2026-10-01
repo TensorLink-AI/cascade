@@ -1341,7 +1341,7 @@ def _add_ralph(sub: argparse._SubParsersAction) -> None:
 
 def _mine_args(p: argparse.ArgumentParser, *, proposer_default: str,
                iterations_default: int) -> None:
-    from .optimize import DEFAULT_AGENT_CMD
+    from .optimize import DEFAULT_AGENT_CMD, PROPOSERS
     from .ralph import PROVIDERS
 
     p.add_argument("--workdir", type=Path, default=Path("./mine-run"),
@@ -1353,7 +1353,7 @@ def _mine_args(p: argparse.ArgumentParser, *, proposer_default: str,
     p.add_argument("--king", type=Path, default=None,
                    help="Reference king to score once on the same pool/seeds/init "
                         "(default: champions/king if present; 'none' to skip).")
-    p.add_argument("--proposer", choices=("tune", "agent", "cmd", "ralph"),
+    p.add_argument("--proposer", choices=PROPOSERS,
                    default=proposer_default,
                    help="tune = perturb config.json weights/floats (no LLM); agent = a "
                         "coding agent edits the code with the cascade-mine skill; cmd = "
@@ -1389,6 +1389,10 @@ def _mine_args(p: argparse.ArgumentParser, *, proposer_default: str,
                         "them (more seeds = less noise, proportionally slower).")
     p.add_argument("--min-improvement", type=float, default=0.001,
                    help="Relative improvement a candidate needs to replace the best.")
+    p.add_argument("--rebaseline", action="store_true",
+                   help="Resuming a workdir whose scoring setup changed (init, pool, seeds, "
+                        "budget, device)? Re-score best/ and the king under the new setup "
+                        "instead of refusing. Scores never mix across setups.")
     p.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
     p.add_argument("--pool-dir", type=Path, default=None,
                    help="Held-out .npy/.npz series to score on (strongly recommended).")
@@ -1434,6 +1438,7 @@ def _loop_config(args: argparse.Namespace):
     return LoopConfig(
         workdir=args.workdir, start_dir=start, king_dir=king, proposer=args.proposer,
         iterations=args.iterations, seeds=seeds or (0,), min_improvement=args.min_improvement,
+        rebaseline=args.rebaseline,
         pool_dir=args.pool_dir, pool_ref=args.pool_ref, train_hours=args.train_hours,
         n_windows=args.n_windows, device=args.device, warm_start=args.warm_start,
         agent_cmd=args.agent_cmd, agent_timeout=args.agent_timeout,
@@ -1466,7 +1471,7 @@ def _cmd_ralph(args: argparse.Namespace) -> int:
 def _cmd_mine(args: argparse.Namespace) -> int:
     import logging
 
-    from .optimize import OptimizationLoop
+    from .optimize import OptimizationLoop, WorkdirBusy
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     cfg = load_chain_config(args.chain_toml)
@@ -1478,6 +1483,9 @@ def _cmd_mine(args: argparse.Namespace) -> int:
         return 2
     try:
         state = loop.run()
+    except WorkdirBusy as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     except Exception as e:  # noqa: BLE001
         print(f"mine failed: {type(e).__name__}: {e}", file=sys.stderr)
         return 1

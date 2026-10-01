@@ -30,6 +30,7 @@ import contextlib
 import hmac
 import json
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -42,7 +43,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from .optimize import BEST_DIR, read_history, read_state, request_stop
+from .optimize import (
+    BEST_DIR,
+    PROPOSERS,
+    read_history,
+    read_state,
+    request_stop,
+    workdir_lock_holder,
+)
+from .ralph import PROVIDERS
 
 PAGE = Path(__file__).with_name("mine_ui.html")
 LOOP_LOG = "loop.log"
@@ -60,9 +69,9 @@ _START_FLAGS = {
     "agent_cmd": "--agent-cmd", "propose_cmd": "--propose-cmd",
     "llm_provider": "--llm-provider", "llm_model": "--llm-model",
     "llm_base_url": "--llm-base-url", "agent_max_turns": "--agent-max-turns",
+    "llm_key_env": "--llm-key-env", "llm_auth": "--llm-auth",
 }
-_PROPOSERS = ("tune", "agent", "cmd", "ralph")
-_LLM_PROVIDERS = ("anthropic", "chutes", "saygm", "custom")
+_ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]{0,63}")
 
 _PATH_KEYS = {"pool_dir", "start", "king"}
 
@@ -75,16 +84,6 @@ def _tail(path: Path, n: int = LOG_TAIL_BYTES) -> str:
             return f.read().decode("utf-8", "replace")
     except OSError:
         return ""
-
-
-def _pid_alive(pid: object) -> bool:
-    if not isinstance(pid, int) or pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    return True
 
 
 def _environment() -> dict:
@@ -123,10 +122,12 @@ class MineUI:
 
     # -- status ------------------------------------------------------------- #
     def running(self) -> bool:
+        # A child still starting up has not taken the lock yet; after that the
+        # workdir lock is the truth (released by the kernel however the loop
+        # dies), never a pid read back from state.json.
         if self.proc is not None and self.proc.poll() is None:
             return True
-        st = read_state(self.workdir)
-        return st.get("status") == "running" and _pid_alive(st.get("pid"))
+        return workdir_lock_holder(self.workdir) is not None
 
     def environment(self) -> dict:
         ts, env = self._env_cache
@@ -164,10 +165,15 @@ class MineUI:
                 v = body.get(key)
                 if v is None or v == "" or isinstance(v, dict | list):
                     continue
-                if key == "proposer" and v not in _PROPOSERS:
+                if key == "proposer" and v not in PROPOSERS:
                     return 400, {"error": f"bad proposer {v!r}"}
-                if key == "llm_provider" and v not in _LLM_PROVIDERS:
+                if key == "llm_provider" and v not in PROVIDERS:
                     return 400, {"error": f"bad llm provider {v!r}"}
+                if key == "llm_auth" and v not in ("bearer", "x-api-key"):
+                    return 400, {"error": f"bad llm auth {v!r}"}
+                if key == "llm_key_env" and not _ENV_NAME.fullmatch(str(v)):
+                    return 400, {"error": "llm key env must be an env var NAME (the key "
+                                          "itself stays in the environment)"}
                 if key in _PATH_KEYS and str(v).lower() != "none":
                     # The child runs with cwd=workdir; anchor paths to where the UI runs.
                     v = Path(str(v)).expanduser().resolve()
@@ -183,12 +189,22 @@ class MineUI:
     def stop(self, body: dict) -> tuple[int, dict]:
         request_stop(self.workdir)
         if body.get("force"):
-            pid = self.proc.pid if self.proc and self.proc.poll() is None \
-                else read_state(self.workdir).get("pid")
-            if _pid_alive(pid):
+            if self.proc is not None and self.proc.poll() is None:
+                pid = self.proc.pid            # our child: its own session/group
                 with contextlib.suppress(OSError):
-                    os.killpg(os.getpgid(pid), signal.SIGTERM)
-            return 200, {"ok": True, "stopping": "killed"}
+                    os.killpg(pid, signal.SIGTERM)
+                return 200, {"ok": True, "stopping": "killed"}
+            pid = workdir_lock_holder(self.workdir)
+            if pid and pid > 0 and pid != os.getpid():
+                with contextlib.suppress(OSError):
+                    # Only a process that leads its own group gets the group
+                    # signal (a terminal-started loop may share ours).
+                    if os.getpgid(pid) == pid and pid != os.getpgrp():
+                        os.killpg(pid, signal.SIGTERM)
+                    else:
+                        os.kill(pid, signal.SIGTERM)
+                return 200, {"ok": True, "stopping": "killed"}
+            return 200, {"ok": True, "stopping": "nothing running"}
         return 200, {"ok": True, "stopping": "after the current candidate"}
 
     def submit(self, body: dict) -> tuple[int, dict]:

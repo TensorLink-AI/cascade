@@ -53,7 +53,11 @@ import numpy as np
 
 log = logging.getLogger("cascade.miner.optimize")
 
+PROPOSERS = ("tune", "agent", "cmd", "ralph")
+
 STATE_FILE = "state.json"
+SETUP_FILE = "setup.json"
+LOCK_FILE = ".lock"
 HISTORY_FILE = "history.jsonl"
 STOP_FILE = "STOP"
 BEST_DIR = "best"
@@ -82,10 +86,13 @@ class LoopConfig:
     workdir: Path
     start_dir: Path
     king_dir: Path | None = None
-    proposer: str = "tune"                       # "tune" | "agent" | "cmd" | "ralph"
+    proposer: str = "tune"                       # one of PROPOSERS
     iterations: int = 20
     seeds: tuple[int, ...] = (0,)
     min_improvement: float = 0.001               # relative; 0.001 = 0.1 %
+    # Re-score best/ and the king when the scoring setup (init, pool, seeds,
+    # budget, device) differs from the one this workdir's scores were taken under.
+    rebaseline: bool = False
     # scorer knobs (forwarded to score_generator)
     pool_dir: Path | None = None
     pool_ref: str = ""
@@ -140,10 +147,12 @@ class Candidate:
     accepted: bool = False
     detail: str = ""
     seconds: float = 0.0
+    epoch: int = 0                   # scoring-setup generation; scores compare within one
 
     def record(self) -> dict:
         return {
-            "iteration": self.iteration, "dir": str(self.dir), "parent": self.parent,
+            "iteration": self.iteration, "epoch": self.epoch, "dir": str(self.dir),
+            "parent": self.parent,
             "note": self.note, "status": self.status, "score": self.score,
             "per_seed": self.per_seed, "accepted": self.accepted, "detail": self.detail,
             "seconds": round(self.seconds, 1), "ts": time.time(),
@@ -185,6 +194,58 @@ def request_stop(workdir: Path | str) -> None:
     (Path(workdir) / STOP_FILE).write_text(str(time.time()), encoding="utf-8")
 
 
+class WorkdirBusy(RuntimeError):
+    """Another loop holds this workdir."""
+
+
+def _flock(fd: int, exclusive_nb: bool) -> bool:
+    try:
+        import fcntl
+    except ImportError:          # non-POSIX: no locking, behave as before
+        return True
+    try:
+        fcntl.flock(fd, (fcntl.LOCK_EX | fcntl.LOCK_NB) if exclusive_nb else fcntl.LOCK_UN)
+    except BlockingIOError:
+        return False
+    return True
+
+
+def workdir_lock_holder(workdir: Path | str) -> int | None:
+    """PID of the loop holding ``workdir``'s lock, or None if no loop is running.
+
+    The kernel releases a flock when its holder dies, however it dies, so this
+    cannot be fooled by a stale ``state.json`` or a recycled PID."""
+    p = Path(workdir) / LOCK_FILE
+    if not p.is_file():
+        return None
+    fd = os.open(p, os.O_RDONLY)
+    try:
+        if _flock(fd, True):
+            _flock(fd, False)
+            return None
+        try:
+            return int(p.read_text(encoding="utf-8").strip() or 0) or -1
+        except (OSError, ValueError):
+            return -1
+    finally:
+        os.close(fd)
+
+
+def format_history_rows(history: list[dict], n: int, *, with_reason: bool = False) -> str:
+    """The recent-results table both agent prompts show (most recent last)."""
+    rows = []
+    for h in history[-n:]:
+        s = "—" if h.get("score") is None else f"{h['score']:.5f}"
+        mark = " ACCEPTED" if h.get("accepted") and h.get("status") == "scored" else ""
+        why = ""
+        if with_reason and h.get("status") not in ("scored", "baseline", "king"):
+            first = (h.get("detail") or "").strip().splitlines()
+            why = f" [{first[0][:120]}]" if first else ""
+        rows.append(f"  #{h['iteration']:>3} {h['status']:<9} {s}{mark}  "
+                    f"{h.get('note', '')[:140]}{why}")
+    return "\n".join(rows) or "  (none yet)"
+
+
 # --------------------------------------------------------------------------- #
 # proposers                                                                    #
 # --------------------------------------------------------------------------- #
@@ -193,7 +254,10 @@ def _is_num(v: object) -> bool:
     return isinstance(v, int | float) and not isinstance(v, bool) and math.isfinite(v)
 
 
-_MIXTURE_HINTS = ("weight", "prob", "mix", "share", "frac", "prior")
+# Named like sampling weights. Deliberately narrow: "prior", "mix" or "frac" also
+# name hyperparameter dicts (a GP prior's lengthscale/variance) that must not be
+# renormalised as if they were shares.
+_MIXTURE_HINTS = ("weight", "prob", "mixture")
 
 
 def _is_mixture(d: object, key: object = None) -> bool:
@@ -308,11 +372,7 @@ class TuneProposer:
 def agent_prompt(cand_dir: Path, note_path: Path, history: list[dict], best: dict | None,
                  king: dict | None) -> str:
     """The instruction handed to the coding agent for one proposal."""
-    rows = []
-    for h in history[-12:]:
-        s = "—" if h.get("score") is None else f"{h['score']:.5f}"
-        mark = " ACCEPTED" if h.get("accepted") else ""
-        rows.append(f"  #{h['iteration']:>3} {h['status']:<9} {s}{mark}  {h.get('note', '')[:160]}")
+    rows = format_history_rows(history, 12, with_reason=True)
     best_s = "n/a" if not best else f"{best['score']:.5f} (#{best['iteration']})"
     king_s = "n/a" if not king or king.get("score") is None else f"{king['score']:.5f}"
     return f"""Use the cascade-mine skill (proposer mode).
@@ -324,7 +384,7 @@ forecaster trained on this generator's data; lower is better).
 
 Current best: {best_s}. Reference king: {king_s}.
 Recent attempts (most recent last):
-{chr(10).join(rows) or '  (none yet)'}
+{rows}
 
 Rules:
 - Edit files only inside {cand_dir} (the note file is removed before scoring). Keep generator.py / config.json /
@@ -442,18 +502,31 @@ class AgentProposer(CommandProposer):
 
     def __init__(self, cfg: LoopConfig, loop: OptimizationLoop) -> None:
         command = cfg.agent_cmd
-        if cfg.agent_max_turns > 0:
+        argv0 = (shlex.split(command) or [""])[0]
+        # Provider routing, env isolation and --max-turns are Claude Code
+        # features. Another agent (--agent-cmd "codex exec …", aider, …) is run
+        # as the miner's own tool: its own env, its own flags.
+        self.is_claude = Path(argv0).name == "claude"
+        if self.is_claude and cfg.agent_max_turns > 0:
             command += f" --max-turns {int(cfg.agent_max_turns)}"
         super().__init__(cfg, loop, command=command, timeout=cfg.agent_timeout)
         from .ralph import resolve_provider
-        self.provider = resolve_provider(cfg)
+        if self.is_claude:
+            self.provider = resolve_provider(cfg)
+        elif (cfg.llm_provider or "anthropic") != "anthropic":
+            raise ValueError("--llm-provider routes Claude Code only; with a non-claude "
+                             "--agent-cmd, configure that agent's model itself")
+        else:
+            self.provider = None
 
     def base_env(self) -> dict[str, str]:
+        if not self.is_claude:
+            return dict(os.environ)
         from .ralph import agent_base_env
         return agent_base_env(self.provider, self.loop.workdir)
 
     def extra_env(self) -> dict[str, str]:
-        return self.provider.claude_env()
+        return self.provider.claude_env() if self.is_claude else {}
 
     def stdin_for(self, cand_dir: Path, iteration: int, history: list[dict]) -> str:
         return agent_prompt(cand_dir, cand_dir / AGENT_NOTE, history,
@@ -500,25 +573,32 @@ class OptimizationLoop:
         elif cfg.proposer == "tune":
             self.proposer = TuneProposer(cfg, run_seed=int(time.time()))
         else:
-            raise ValueError(f"unknown proposer {cfg.proposer!r} (tune | agent | cmd | ralph)")
+            raise ValueError(f"unknown proposer {cfg.proposer!r} ({' | '.join(PROPOSERS)})")
         self.history: list[dict] = read_history(self.workdir)
+        self.epoch = max((int(h.get("epoch", 0)) for h in self.history), default=0)
+        self._lock_fd: int | None = None
         self._warm_dir: Path | None = None
         self._init_label = "random init"
         self._state: dict = {}
 
     # -- records ------------------------------------------------------------ #
+    def _current(self) -> list[dict]:
+        """History of the current scoring setup; earlier epochs are not comparable."""
+        return [h for h in self.history if int(h.get("epoch", 0)) == self.epoch]
+
     def best_record(self) -> dict | None:
-        acc = [h for h in self.history if h.get("accepted") and h.get("score") is not None]
+        acc = [h for h in self._current() if h.get("accepted") and h.get("score") is not None]
         return min(acc, key=lambda h: h["score"]) if acc else None
 
     def king_record(self) -> dict | None:
-        ks = [h for h in self.history if h.get("status") == "king"]
+        ks = [h for h in self._current() if h.get("status") == "king"]
         return ks[-1] if ks else None
 
     def _next_iteration(self) -> int:
         return 1 + max((h["iteration"] for h in self.history), default=-1)
 
     def _append(self, c: Candidate) -> None:
+        c.epoch = self.epoch
         rec = c.record()
         self.history.append(rec)
         with open(self.workdir / HISTORY_FILE, "a", encoding="utf-8") as f:
@@ -530,8 +610,10 @@ class OptimizationLoop:
         self._state.update(
             pid=os.getpid(), updated=time.time(), config=self.cfg.to_json(),
             best=best, king=king, init=self._init_label,
-            n_candidates=sum(1 for h in self.history if h["status"] not in ("baseline", "king")),
-            n_accepted=sum(1 for h in self.history
+            epoch=self.epoch,
+            n_candidates=sum(1 for h in self._current()
+                             if h["status"] not in ("baseline", "king")),
+            n_accepted=sum(1 for h in self._current()
                            if h.get("accepted") and h["status"] == "scored"),
             beats_king=self._beats_king(best, king),
         )
@@ -615,13 +697,52 @@ class OptimizationLoop:
         self._warm_dir, self._init_label = _resolve_warm_start(
             self.chain_cfg, self.cfg.warm_start, cache_dir=self.workdir / "_cache")
 
+    def setup_fingerprint(self) -> dict:
+        """Everything a score depends on besides the generator itself."""
+        pool = str(Path(self.cfg.pool_dir).resolve()) if self.cfg.pool_dir else ""
+        return {
+            "init": self._init_label, "pool_dir": pool, "pool_ref": self.cfg.pool_ref,
+            "seeds": list(self.cfg.seeds), "train_hours": self.cfg.train_hours,
+            "n_windows": self.cfg.n_windows, "device": self._resolve_device(),
+        }
+
+    def _check_setup(self) -> None:
+        """Scores only compare under one setup. A resumed workdir whose setup
+        changed (a new live init, another pool, more seeds, a longer budget)
+        either starts a new epoch (--rebaseline: best/ and the king are
+        re-scored) or is refused, never silently mixed."""
+        fp = self.setup_fingerprint()
+        path = self.workdir / SETUP_FILE
+        try:
+            prev = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            prev = None
+        if prev is not None and self.history and prev.get("fingerprint") != fp:
+            if not self.cfg.rebaseline:
+                old = prev.get("fingerprint") or {}
+                diff = ", ".join(f"{k}: {old.get(k)!r} -> {v!r}"
+                                 for k, v in fp.items() if old.get(k) != v)
+                raise RuntimeError(
+                    f"scoring setup changed since this workdir was scored ({diff}); "
+                    "scores would not be comparable. Use a new --workdir, or "
+                    "--rebaseline to re-score best/ and the king under the new setup")
+            self.epoch += 1
+            log.info("setup changed: epoch %d, re-scoring best/ and the king", self.epoch)
+        _write_json_atomic(path, {"epoch": self.epoch, "fingerprint": fp})
+
     def _baseline(self) -> None:
-        """Score the start generator (and the reference king) once per workdir."""
+        """Score the start generator (and the reference king) once per epoch."""
         if self.best_record() is None:
-            dst = self.workdir / CANDIDATES_DIR / "0000"
-            if not dst.exists():
-                shutil.copytree(self.cfg.start_dir, dst, ignore=_COPY_IGNORE)
-            c = self._evaluate(Candidate(0, dst, None, note=f"baseline: {self.cfg.start_dir}"))
+            # A new epoch re-scores the existing best; a first run (or a retry
+            # after a failed baseline) copies --start afresh.
+            src = self.workdir / BEST_DIR if self.epoch > 0 and (
+                self.workdir / BEST_DIR / "generator.py").is_file() else Path(self.cfg.start_dir)
+            it = self._next_iteration()
+            dst = self.workdir / CANDIDATES_DIR / f"{it:04d}"
+            shutil.rmtree(dst, ignore_errors=True)
+            shutil.copytree(src, dst, ignore=_COPY_IGNORE)
+            label = "rebaseline" if self.epoch > 0 else "baseline"
+            c = self._evaluate(Candidate(it, dst, None, note=f"{label}: {src}"))
             if c.status == "scored":
                 c.status, c.accepted = "baseline", True
                 self._promote(c)
@@ -683,12 +804,37 @@ class OptimizationLoop:
             with contextlib.suppress(Exception):
                 hook(c.record(), self.best_record())
 
+    def _acquire_lock(self) -> None:
+        fd = os.open(self.workdir / LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o644)
+        if not _flock(fd, True):
+            os.close(fd)
+            holder = workdir_lock_holder(self.workdir)
+            raise WorkdirBusy(f"another loop (pid {holder}) is running in {self.workdir}; "
+                              "stop it first or use another --workdir")
+        os.ftruncate(fd, 0)
+        os.write(fd, str(os.getpid()).encode())
+        self._lock_fd = fd
+
+    def _release_lock(self) -> None:
+        if self._lock_fd is not None:
+            _flock(self._lock_fd, False)
+            os.close(self._lock_fd)
+            self._lock_fd = None
+
     def run(self) -> dict:
+        self._acquire_lock()           # before touching any state
+        try:
+            return self._run_locked()
+        finally:
+            self._release_lock()
+
+    def _run_locked(self) -> dict:
         with contextlib.suppress(FileNotFoundError):
             (self.workdir / STOP_FILE).unlink()
         self._set_state(status="running", phase="starting", started=time.time(), error=None)
         try:
             self._prepare_init()
+            self._check_setup()
             self._baseline()
             done = 0
             while done < self.cfg.iterations and not self._stop_requested():

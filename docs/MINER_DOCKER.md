@@ -12,8 +12,25 @@ scoring, the loop and the submission.
 | `ghcr.io/tensorlink-ai/cascade-miner:latest` | `toolbox` | the miner CLI; no UI, no LLM |
 | `ghcr.io/tensorlink-ai/cascade-miner:oneclick` | `oneclick` | toolbox + Claude Code + the web UI ([ONE_CLICK_MINING.md](ONE_CLICK_MINING.md)) |
 
-Published by `.github/workflows/publish-miner.yml` on a `miner-v*` tag. To
-build it yourself:
+`.github/workflows/publish-miner.yml` keeps these tags fresh. `:latest` and
+`:oneclick` are rebuilt whenever a change that affects the image lands on
+main: code, the bundled king (`champions/king`, via king-sync), the
+Dockerfile, deps or the skill. They are also rebuilt every Monday, for a
+fresh CUDA base, security fixes and the latest Claude Code. Every build is
+smoke-tested (`deploy/miner-smoke.sh`) before anything is pushed. A pull
+request builds and smoke-tests without publishing.
+
+| Pin | When |
+|---|---|
+| `:latest` / `:oneclick` | always the newest passing build of main |
+| `:sha-<commit>` / `:sha-<commit>-oneclick` | immutable; pin this for reproducible runs |
+| `:v<X>` / `:v<X>-oneclick` | releases, from a `miner-v<X>` git tag |
+
+Check what you are running: `docker run --rm <image> python -c 'import os;
+print(os.environ["CASCADE_MINER_BUILD_SHA"])'`, or the
+`org.opencontainers.image.revision` label.
+
+To build it yourself:
 
 ```bash
 docker build -f deploy/miner.Dockerfile -t cascade-miner .                    # toolbox
@@ -114,7 +131,7 @@ mine-run/
 ```
 
 `cm mine-ui` is not needed for your own strategy, but it works on any
-workdir: `docker run -p 8765:8765 -v "$PWD:/work" cascade-miner ui`.
+workdir: `docker run -p 127.0.0.1:8765:8765 -v "$PWD:/work" cascade-miner ui`.
 
 ## Numbers are directional
 

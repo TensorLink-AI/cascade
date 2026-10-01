@@ -22,7 +22,7 @@ the skill and the UI added on top. Everything in MINER_DOCKER.md, including
 plugging in your own strategy, works here too.
 
 ```bash
-docker run --gpus all -p 8765:8765 \
+docker run --gpus all -p 127.0.0.1:8765:8765 \
     -v "$PWD/mine:/work" \
     -v ~/.bittensor/wallets:/root/.bittensor/wallets:ro \
     -e LIUM_API_KEY -e ANTHROPIC_API_KEY \
@@ -132,6 +132,12 @@ Then follow it as usual: `cascade reveal-status <hotkey> --watch`,
 `cascade queue`, `cascade duel --hotkey <you>`.
 
 ## UI security
+
+The token is the keys to the box. Whoever holds it can start loops,
+including `cmd`/`agent` commands of their choosing (shell access inside the
+container), and submit with the mounted wallet. Publish the port on
+loopback only (`-p 127.0.0.1:8765:8765`, as every example here does). Reach
+it from elsewhere through an SSH tunnel, never by opening the port.
 
 The UI can spend your compute, hotkey and Lium balance, so every API call
 needs a per-process token. On `127.0.0.1` the page embeds it and only a

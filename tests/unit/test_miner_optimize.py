@@ -468,3 +468,131 @@ def test_ui_ralph_start_uses_ralph_subcommand_with_provider(ui_server, monkeypat
     assert argv[argv.index("--llm-provider") + 1] == "chutes"
     assert argv[argv.index("--llm-model") + 1] == "org/Coder"
     assert "sk-should-be-ignored" not in " ".join(argv)           # keys never via the UI
+
+
+# -- review regressions ------------------------------------------------------------ #
+
+def test_workdir_lock_refuses_a_second_loop_and_clears_on_exit(tmp_path):
+    loop = _loop(tmp_path, iterations=1)
+    seen = {}
+    orig = loop.step
+
+    def step():
+        seen["holder"] = opt.workdir_lock_holder(tmp_path / "run")
+        other = _loop(tmp_path, iterations=1)
+        with pytest.raises(opt.WorkdirBusy, match="another loop"):
+            other.run()
+        return orig()
+
+    loop.step = step
+    loop.run()
+    import os as _os
+    assert seen["holder"] == _os.getpid()
+    assert opt.workdir_lock_holder(tmp_path / "run") is None          # released
+
+
+def test_changed_setup_is_refused_unless_rebaselined(tmp_path):
+    _loop(tmp_path, iterations=2).run()
+    changed = _loop(tmp_path, iterations=1, seeds=(0, 1))             # more seeds
+    with pytest.raises(RuntimeError, match="scoring setup changed.*seeds"):
+        changed.run()
+    rb = _loop(tmp_path, iterations=1, seeds=(0, 1), rebaseline=True)
+    st = rb.run()
+    hist = opt.read_history(tmp_path / "run")
+    ep1 = [h for h in hist if h["epoch"] == 1]
+    assert [h["status"] for h in ep1][:2] == ["baseline", "king"]
+    assert ep1[0]["note"].startswith("rebaseline:")                   # re-scored best/
+    assert len(ep1[0]["per_seed"]) == 2
+    # the epoch-1 best is measured under the new setup only
+    assert st["best"]["epoch"] == 1 and st["king"]["epoch"] == 1
+    assert json.loads((tmp_path / "run" / "setup.json").read_text())["epoch"] == 1
+
+
+def test_failed_baseline_retry_recopies_start(tmp_path):
+    loop = _loop(tmp_path)
+    loop._verify_fn = lambda d: (False, "FAIL: repo_layout")
+    with pytest.raises(RuntimeError, match="baseline"):
+        loop.run()
+    retry = _loop(tmp_path, iterations=0)       # (_loop re-seeds start/; fix it after)
+    start = tmp_path / "start"
+    cfg = json.loads((start / "config.json").read_text())
+    cfg["weights"]["a"] = 0.9                                          # miner fixes it
+    (start / "config.json").write_text(json.dumps(cfg))
+    retry.run()
+    hist = opt.read_history(tmp_path / "run")
+    assert [h["iteration"] for h in hist] == list(range(len(hist)))   # no duplicate #0
+    base = [h for h in hist if h["status"] == "baseline"][0]
+    assert json.loads((Path(base["dir"]) / "config.json").read_text())["weights"]["a"] == 0.9
+
+
+def test_non_claude_agent_cmd_keeps_its_env_and_flags(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
+    script = tmp_path / "other_agent.py"
+    script.write_text(
+        "import os, sys, pathlib\n"
+        "assert os.environ.get('OPENAI_API_KEY') == 'sk-openai'\n"
+        "assert '--max-turns' not in sys.argv\n"
+        "c = pathlib.Path('config.json'); c.write_text(c.read_text().replace('0.2', '0.3', 1))\n")
+    loop = _loop(tmp_path, iterations=1, agent_max_turns=40)
+    loop.cfg.agent_cmd = f"{sys.executable} {script}"
+    loop.proposer = opt.AgentProposer(loop.cfg, loop)
+    assert not loop.proposer.is_claude
+    loop.run()
+    assert opt.read_history(tmp_path / "run")[-1]["status"] == "scored"
+    with pytest.raises(ValueError, match="routes Claude Code only"):
+        bad = _loop(tmp_path / "b", llm_provider="chutes")
+        bad.cfg.agent_cmd = "aider --yes"
+        opt.AgentProposer(bad.cfg, bad)
+
+
+def test_hyperparameter_dicts_are_not_mixtures():
+    cfg = {"gp_prior": {"lengthscale": 2.0, "variance": 1.0},
+           "mix_lengths": {"short": 128, "long": 2048},
+           "family_weights": {"a": 0.4, "b": 0.6}}
+    for i in range(30):
+        new, _ = opt.tune_config(cfg, np.random.default_rng(i), sigma=0.8, max_keys=3)
+        assert new["mix_lengths"] == {"short": 128, "long": 2048}       # ints untouched
+        assert sum(new["family_weights"].values()) == pytest.approx(1.0)
+        gp = new["gp_prior"]
+        # moved independently, never co-renormalised to keep the sum at 3.0
+        if gp["lengthscale"] != 2.0 and gp["variance"] == 1.0:
+            break
+    else:
+        pytest.fail("a gp_prior float never moved on its own")
+
+
+def test_ui_liveness_ignores_stale_state_pid(ui_server):
+    app, base = ui_server
+    import os as _os
+    app.workdir.mkdir(parents=True, exist_ok=True)
+    (app.workdir / "state.json").write_text(json.dumps({"status": "running",
+                                                        "pid": _os.getpid()}))
+    assert app.running() is False                     # no lock held → not running
+    code, raw = _req(base + "/api/stop", body={"force": True})
+    assert code == 200 and json.loads(raw)["stopping"] == "nothing running"
+
+
+def test_ui_custom_provider_fields(ui_server, monkeypatch):
+    app, base = ui_server
+    seen = {}
+
+    class FakePopen:
+        def __init__(self, argv, **kw):
+            seen["argv"] = argv
+            self.pid = 1
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(ui_mod.subprocess, "Popen", FakePopen)
+    assert _req(base + "/api/start", body={
+        "proposer": "ralph", "llm_provider": "custom", "llm_key_env": "sk-literal-key"})[0] == 400
+    assert _req(base + "/api/start", body={
+        "proposer": "ralph", "llm_provider": "custom", "llm_auth": "basic"})[0] == 400
+    code, _ = _req(base + "/api/start", body={
+        "proposer": "ralph", "llm_provider": "custom", "llm_model": "m",
+        "llm_base_url": "https://gw", "llm_key_env": "MY_KEY", "llm_auth": "x-api-key"})
+    assert code == 200
+    argv = seen["argv"]
+    assert argv[argv.index("--llm-key-env") + 1] == "MY_KEY"
+    assert argv[argv.index("--llm-auth") + 1] == "x-api-key"

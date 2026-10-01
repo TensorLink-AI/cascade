@@ -28,7 +28,7 @@ Your files live in /work (mount a host dir: -v "$PWD:/work").
   submit ./mine-run/best https://submissions.cascadesub.net \
          --wallet-name W --wallet-hotkey H          (spends the hotkey)
   round | queue | heat | duel | reveal-status       read-only chain / round views
-  ui                                     web UI for `mine` (publish -p 8765:8765)
+  ui                                     web UI for `mine` (publish -p 127.0.0.1:8765:8765)
   bash | python …                        a shell / the image's python
 
 Starter files: /opt/cascade/scripts/example_generator,

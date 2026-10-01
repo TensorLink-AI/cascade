@@ -169,8 +169,12 @@ pathlib.Path(".mine-note.md").write_text(f"shrink AR noise (iter {it})\n")
 
 def _ralph_loop(tmp_path, monkeypatch, iterations=2):
     monkeypatch.setenv("CHUTES_API_KEY", "sk-test")
-    script = tmp_path / "fake_claude.py"
-    script.write_text(FAKE_CLAUDE)
+    # An executable named `claude`: provider routing / env isolation / --max-turns
+    # apply to Claude Code only, so the fake must look like it.
+    script = tmp_path / "bin" / "claude"
+    script.parent.mkdir()
+    script.write_text(f"#!{sys.executable}\n" + FAKE_CLAUDE)
+    script.chmod(0o755)
     monkeypatch.setenv("CASCADE_FAKE_LOG", str(tmp_path / "agent.log"))
     # Secrets that must never reach an agent talking to a third-party provider.
     for k, v in {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-SECRET", "LIUM_API_KEY": "lium",
@@ -181,7 +185,7 @@ def _ralph_loop(tmp_path, monkeypatch, iterations=2):
     shutil.copytree(EXAMPLE, start)
     cfg = opt.LoopConfig(
         workdir=tmp_path / "run", start_dir=start, proposer="ralph", iterations=iterations,
-        agent_cmd=f"{sys.executable} {script}", agent_max_turns=7,
+        agent_cmd=str(script), agent_max_turns=7,
         llm_provider="chutes", llm_model="org/Coder-1")
     scores = iter([0.9, 0.8, 0.85, 0.7, 0.75])
     return opt.OptimizationLoop(cfg, score_fn=lambda d, s: next(scores),
