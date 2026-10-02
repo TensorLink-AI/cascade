@@ -1,0 +1,3 @@
+# Local state of the compose stack: never committed (keys, receipts, pools, runs).
+work/
+secrets/
