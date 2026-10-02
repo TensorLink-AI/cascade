@@ -75,6 +75,7 @@ PROGRESS_CAPS = (("G4.5", 100.0), ("G4", 90.0), ("G3", 70.0), ("G2", 40.0))
 
 MAX_INFRA_RETRIES = 2
 HEARTBEAT_SECONDS = 300.0
+POOL_BUILD_ATTEMPTS = 3
 MAX_SHORTAGE_WAITS = 6              # ~1 h of back-off when the market has no GPU
 
 
@@ -814,12 +815,24 @@ class Gauntlet:
         self.save()
         return max(passers, key=lambda m: m["stages"]["G4"]["rel"]) if passers else None
 
-    @staticmethod
-    def _build_pool_cli(out: Path, as_of: str, sources: str) -> None:
-        argv = ["cascade-pool", "build", "--out", str(out), "--as-of", as_of, "--overwrite"]
+    def _build_pool_cli(self, out: Path, as_of: str, sources: str) -> None:
+        """``cascade-pool build`` with a patient per-request timeout, retried as a
+        whole: the builder aborts on any request that fails 3 times, and the
+        public sources do have transient failures (observed: one Open-Meteo
+        archive call)."""
+        argv = ["cascade-pool", "build", "--out", str(out), "--as-of", as_of, "--overwrite",
+                "--timeout", "60"]
         if sources:
             argv += ["--sources", sources]
-        subprocess.run(argv, check=True, timeout=7200)
+        for attempt in range(1, POOL_BUILD_ATTEMPTS + 1):
+            try:
+                subprocess.run(argv, check=True, timeout=7200)
+                return
+            except subprocess.CalledProcessError:
+                if attempt == POOL_BUILD_ATTEMPTS:
+                    raise
+                log.warning("pool C build failed (attempt %d); retrying", attempt)
+                self._interruptible_sleep(120.0 * attempt)
 
     def pool_c(self) -> Path | None:
         """Today's freshly built pool (built at most once a day, AFTER finalists froze)."""
