@@ -105,13 +105,26 @@ class Outcome:
     seconds: float = 0.0
 
 
+BRIEF_TITLES = {
+    "LINEAGE.md": "What has won so far (king lineage brief)",
+    "DETHRONES.md": "Why kings won (dethrones vs the eval data)",
+    "RESEARCH.md": "What the literature says (synthetic data for PFNs / TSFMs)",
+}
+
+
 def build_prompt(*, directives: str, notebook: str, outcomes: list[str], parent: str,
-                 lineage: str = "") -> str:
+                 briefs: list[tuple[str, str]] = (), lineage: str = "",
+                 brief_chars: int = 10000) -> str:
+    """The worker prompt. ``briefs`` are ``(file name, text)`` knowledge files
+    (operator/LINEAGE.md, DETHRONES.md, RESEARCH.md), each capped at
+    ``brief_chars`` so the prompt stays bounded."""
     rows = "\n".join(outcomes[-25:]) or "(none yet)"
-    brief = (f"\n## What has won so far (king lineage brief)\n{lineage.strip()[:14000]}\n"
-             if lineage.strip() else "")
+    items = list(briefs) + ([("LINEAGE.md", lineage)] if lineage.strip() else [])
+    knowledge = "".join(
+        f"\n## {BRIEF_TITLES.get(name, name)}\n{text.strip()[:brief_chars]}\n"
+        for name, text in items if text.strip())
     return (PROMPT
-            + brief
+            + knowledge
             + f"\n## Operator directives\n{directives.strip() or '(none)'}\n"
             + f"\n## Lessons from earlier workers\n{notebook.strip()[-6000:] or '(none yet)'}\n"
             + f"\n## Outcome log (most recent last)\n{rows}\n"

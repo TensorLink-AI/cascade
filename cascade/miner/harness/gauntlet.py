@@ -511,8 +511,9 @@ class Gauntlet:
     def propose(self, n: int) -> list[Proposal]:
         notebook = self.wd / "operator" / "NOTEBOOK.md"
         nb = notebook.read_text(encoding="utf-8") if notebook.is_file() else ""
-        lin = self.wd / "operator" / "LINEAGE.md"
-        lineage = lin.read_text(encoding="utf-8") if lin.is_file() else ""
+        briefs = [(name, (self.wd / "operator" / name).read_text(encoding="utf-8"))
+                  for name in self.h.search.briefs
+                  if (self.wd / "operator" / name).is_file()]
         outcomes = self.outcome_lines()
         props = []
         for parent in self.parents(n):
@@ -524,7 +525,7 @@ class Gauntlet:
                       "parent_digest": tree_digest(tree), "stages": {}, "created": self._now()})
             props.append(Proposal(cid, parent, tree, build_prompt(
                 directives=self._directives(), notebook=nb, outcomes=outcomes, parent=parent,
-                lineage=lineage)))
+                briefs=briefs, brief_chars=self.h.search.brief_chars)))
         self.save()
         return props
 

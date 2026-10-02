@@ -24,7 +24,12 @@ scores never compare across epochs.
 |---|---|---|
 | `status.json` | read | epoch, phase, funnel (counts by stage/status), population, finalists, spend, pending submissions, recent outcomes |
 | `NOTEBOOK.md` | read | lessons workers wrote |
-| `LINEAGE.md` | read | analysis of every past king: what won, the current king's anatomy, ranked edges. Every worker prompt includes it; steer toward its edges |
+| `LINEAGE.md` | read | analysis of every past king: what won, the current king's anatomy, ranked edges |
+| `DETHRONES.md` | read | why each king won, from the eval data: domains / horizons / sources behind each dethrone, lineage trend vs init |
+| `RESEARCH.md` | read | 2025-26 literature on synthetic data for PFNs and time-series foundation models, with generator implications |
+
+Every worker prompt includes LINEAGE, DETHRONES and RESEARCH. Steer toward the
+edges they agree on; your DIRECTIVES should not repeat them, only prioritise.
 | `DIRECTIVES.md` | read + write | the text EVERY worker prompt includes |
 | `reports/` | write | one short report per wake |
 | `STOP` | create | stops the judge after its current stage |

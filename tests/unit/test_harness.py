@@ -815,3 +815,16 @@ def test_progress_ignores_candidates_rejected_later(rcfg, tmp_path):
     g.put({"id": "c00091", "epoch": g.epoch, "status": "in_gauntlet",
            "stages": {"G2": {"pass": True, "rel": 0.005}}})
     assert g.progress() == {**g.progress(), "id": "c00091", "score": 20.0, "stage": "G2"}
+
+
+def test_every_brief_reaches_the_worker_prompt_capped(rcfg, tmp_path):
+    g, _, _, _ = _gauntlet(rcfg, tmp_path, script=[(1.6, 1.0)])
+    g.refresh_window(force=True)
+    op = g.wd / "operator"
+    (op / "LINEAGE.md").write_text("lineage: try X\n")
+    (op / "DETHRONES.md").write_text("dethrones: Y won on energy\n")
+    (op / "RESEARCH.md").write_text("research: " + "z" * 20000)
+    p = g.propose(1)[0].prompt
+    assert "king lineage brief" in p and "dethrones vs the eval data" in p
+    assert "synthetic data for PFNs" in p and "Y won on energy" in p
+    assert p.count("z") <= g.h.search.brief_chars              # capped

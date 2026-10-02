@@ -66,6 +66,11 @@ class SearchConfig:
     # The improvement over the king a submission needs (relative). Sets the
     # dethrone progress score's 100 (gauntlet.progress); ~ the live margin.
     target_improvement: float = 0.01
+    # Knowledge files in <workdir>/operator that every worker prompt includes
+    # (each capped at brief_chars): the king lineage, the dethrone analysis,
+    # the literature brief. Missing files are skipped.
+    briefs: tuple[str, ...] = ("LINEAGE.md", "DETHRONES.md", "RESEARCH.md")
+    brief_chars: int = 10000
     max_cycles: int = 0                   # 0 = run until STOP
 
 
