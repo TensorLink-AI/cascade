@@ -16,9 +16,9 @@
 # REQUIRED repo secrets:
 #   CASCADE_S3_ACCESS_KEY / CASCADE_S3_SECRET_KEY   read the manifest bucket
 #     (receipts/index.json); aliased into HIPPIUS_S3_* below.
-#   BACKUP_S3_ACCESS_KEY / BACKUP_S3_SECRET_KEY     WRITE the R2 king archive
-#     (the same R2 account chain.toml already uses for the manifest backup). The
-#     scraper falls back to this pair when KING_ARCHIVE_S3_* is unset.
+#   KING_ARCHIVE_S3_ACCESS_KEY / _SECRET_KEY        WRITE the R2 king archive
+#     (dedicated key). Fallback: BACKUP_S3_ACCESS_KEY / BACKUP_S3_SECRET_KEY
+#     (the manifest-backup R2 key), used only when KING_ARCHIVE_S3_* is unset.
 #   HIPPIUS_HUB_TOKEN                               pull PRIVATE Hub repos.
 #     Anonymous pull covers public repos only, and while king generators are
 #     public by design, the generators/ sweep archives EVERY participant ref
@@ -72,8 +72,10 @@ jobs:
       # Manifest-bucket read key, aliased into the HIPPIUS_S3_* the scraper reads.
       HIPPIUS_S3_ACCESS_KEY: ${{ secrets.CASCADE_S3_ACCESS_KEY }}
       HIPPIUS_S3_SECRET_KEY: ${{ secrets.CASCADE_S3_SECRET_KEY }}
-      # R2 king-archive WRITE key (scraper falls back to BACKUP_S3_* when
-      # KING_ARCHIVE_S3_* is unset).
+      # R2 king-archive WRITE key. The dedicated KING_ARCHIVE_S3_* pair wins;
+      # the scraper falls back to BACKUP_S3_* only when it is unset.
+      KING_ARCHIVE_S3_ACCESS_KEY: ${{ secrets.KING_ARCHIVE_S3_ACCESS_KEY }}
+      KING_ARCHIVE_S3_SECRET_KEY: ${{ secrets.KING_ARCHIVE_S3_SECRET_KEY }}
       BACKUP_S3_ACCESS_KEY: ${{ secrets.BACKUP_S3_ACCESS_KEY }}
       BACKUP_S3_SECRET_KEY: ${{ secrets.BACKUP_S3_SECRET_KEY }}
       # Hub pull auth: public repos pull anonymously, but participant refs can
@@ -96,8 +98,8 @@ jobs:
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
           RETRY_UNAVAILABLE: ${{ github.event.inputs.retry_unavailable || 'false' }}
         run: |
-          if [ -z "$BACKUP_S3_ACCESS_KEY" ]; then
-            echo "::error::BACKUP_S3_ACCESS_KEY not set — cannot write the R2 king archive."
+          if [ -z "$KING_ARCHIVE_S3_ACCESS_KEY" ] && [ -z "$BACKUP_S3_ACCESS_KEY" ]; then
+            echo "::error::neither KING_ARCHIVE_S3_ACCESS_KEY nor BACKUP_S3_ACCESS_KEY is set — cannot write the R2 king archive."
             exit 1
           fi
           if [ -z "$HIPPIUS_HUB_TOKEN" ]; then
