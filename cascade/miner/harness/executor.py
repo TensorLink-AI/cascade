@@ -539,7 +539,7 @@ class LiumExecutor:
             src = Path(v)
             if k in ("snapshot", "pool"):
                 # Pools are cached on the pod by folder name (a revealed folder
-                # is immutable; pool C is one folder per day): ~100 MB, once.
+                # is immutable): ~100 MB, sent once per pod.
                 dst = f"{REMOTE_JOBS}/cache/{src.name}"
                 have = self._ssh(pod.ip, pod.port,
                                  f"test -f {shlex.quote(dst)}/metadata.json", 60.0)

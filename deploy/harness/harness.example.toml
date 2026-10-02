@@ -26,7 +26,7 @@ g4_every_cycles   = 3
 g4_finalists      = 2
 g4_rounds         = 3                       # newest rounds replayed at the FULL contract
 g4_min_wins       = 2                       # rounds whose own rule the finalist must clear
-g45_enabled       = true                    # one-shot on a pool built today (needs network)
+g45_enabled       = true                    # one-shot on the newest revealed snapshot, fresh windows
 
 [search]
 population_k        = 4

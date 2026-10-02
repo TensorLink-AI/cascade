@@ -11,7 +11,8 @@ One CYCLE:
 3. **propose**: workers edit copies of population members (or the start tree).
 4. **G0–G3** for the new candidates (and any a crash left mid-gauntlet).
 5. **G4** every ``g4_every_cycles``: full-contract replays of the top members
-   against the receipt kings; the best passer goes to **G4.5** (pool C) and **G5**.
+   against the receipt kings; the best passer goes to **G4.5** (fresh windows of the
+   newest revealed snapshot) and **G5**.
 
 Everything is on disk under ``workdir`` and every stage result is written as
 soon as it exists, so a killed judge resumes where it stopped. Infrastructure
@@ -29,7 +30,6 @@ import json
 import logging
 import random
 import shutil
-import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import wait as futures_wait
@@ -75,7 +75,6 @@ PROGRESS_CAPS = (("G4.5", 100.0), ("G4", 90.0), ("G3", 70.0), ("G2", 40.0))
 
 MAX_INFRA_RETRIES = 2
 HEARTBEAT_SECONDS = 300.0
-POOL_BUILD_ATTEMPTS = 3
 MAX_SHORTAGE_WAITS = 6              # ~1 h of back-off when the market has no GPU
 
 
@@ -117,7 +116,7 @@ def _read_json(path: Path, default=None):
 class Gauntlet:
     def __init__(self, hcfg, *, chain_cfg=None, executor=None, workers=None, submitter=None,
                  index_fetch=None, text_fetch=None, list_folders=None, download=None,
-                 pool_builder=None, verify_fn=None, king_hooks=None, now=time.time,
+                 verify_fn=None, king_hooks=None, now=time.time,
                  sleep=time.sleep) -> None:
         from ...shared.config import load_chain_config
 
@@ -130,12 +129,11 @@ class Gauntlet:
         self.submitter = submitter
         self._fetch = {"index_fetch": index_fetch, "text_fetch": text_fetch}
         self._sync = {"list_folders": list_folders, "download": download}
-        self._pool_builder = pool_builder or self._build_pool_cli
         self._verify = verify_fn or self._static_verify
         self._king_hooks = king_hooks or {}
         self._meta_cache: dict[str, dict] | None = None
         self._now, self._sleep = now, sleep
-        for d in ("candidates", "epochs", "operator", "receipts", "pools"):
+        for d in ("candidates", "operator", "receipts"):
             (self.wd / d).mkdir(parents=True, exist_ok=True)
         self.state = _read_json(self.wd / "state.json", {}) or {
             "epoch": 0, "fingerprint": "", "window": None, "cycle": 0, "king_ready": False,
@@ -815,41 +813,17 @@ class Gauntlet:
         self.save()
         return max(passers, key=lambda m: m["stages"]["G4"]["rel"]) if passers else None
 
-    def _build_pool_cli(self, out: Path, as_of: str, sources: str,
-                        max_per_source: int = 0) -> None:
-        """``cascade-pool build`` with a patient per-request timeout, retried as a
-        whole: the builder aborts on any request that fails 3 times, and the
-        public sources do have transient failures (observed: one Open-Meteo
-        archive call)."""
-        argv = ["cascade-pool", "build", "--out", str(out), "--as-of", as_of, "--overwrite",
-                "--timeout", "60"]
-        if sources:
-            argv += ["--sources", sources]
-        if max_per_source:
-            argv += ["--max-series-per-source", str(int(max_per_source))]
-        for attempt in range(1, POOL_BUILD_ATTEMPTS + 1):
-            try:
-                subprocess.run(argv, check=True, timeout=7200)
-                return
-            except subprocess.CalledProcessError:
-                if attempt == POOL_BUILD_ATTEMPTS:
-                    raise
-                log.warning("pool C build failed (attempt %d); retrying", attempt)
-                self._interruptible_sleep(120.0 * attempt)
-
     def pool_c(self) -> Path | None:
-        """Today's freshly built pool (built at most once a day, AFTER finalists froze)."""
-        day = dt.datetime.fromtimestamp(self._now(), dt.UTC).strftime("%Y-%m-%d")
-        out = self.wd / "pools" / "C" / day
-        if (out / "metadata.json").is_file():
-            return out
-        try:
-            self._pool_builder(out, day, self.h.stages.g45_sources,
-                               self.h.stages.g45_max_series_per_source)
-        except Exception as e:  # noqa: BLE001
-            log.warning("pool C build failed: %s", e)
+        """The newest revealed eval-pool snapshot (the validators' own data, from
+        the Hugging Face eval-pool dataset). G4.5 draws fresh windows from it with
+        the day's seed, so it is not a set of windows any search stage scored."""
+        root = Path(self.h.rounds.snapshot_root)
+        blocks = local_snapshot_blocks(root)
+        if not blocks:
             return None
-        return out if (out / "metadata.json").is_file() else None
+        newest = max(blocks)
+        return next((d for d in sorted(root.glob("snapshots/*"))
+                     if d.name.endswith(f"-block-{newest}")), None)
 
     def _g45(self, m: dict) -> dict:
         from ...shared.receipt import load_receipt
@@ -860,14 +834,15 @@ class Gauntlet:
             return {"skipped": True}
         pool = self.pool_c()
         if pool is None or not ckpt.is_dir():
-            return {"pass": False, "unavailable": "no pool C" if pool is None
+            return {"pass": False, "unavailable": "no revealed snapshot" if pool is None
                     else "no kept G4 checkpoint"}
         manifest = load_receipt(newest.receipt_path.read_text(encoding="utf-8")
                                 ).load_embedded_manifest()
         king = next((e for e in manifest.entries_for_role("king")), None)
         if king is None:
             return {"pass": False, "unavailable": "newest round names no king checkpoint"}
-        day_seed = int(hashlib.sha256(pool.name.encode()).hexdigest()[:12], 16)
+        day = dt.datetime.fromtimestamp(self._now(), dt.UTC).strftime("%Y-%m-%d")
+        day_seed = int(hashlib.sha256(f"{day}:{pool.name}".encode()).hexdigest()[:12], 16)
         res = self._run_jobs([Job(f"{m['id']}-G45", {
             "kind": "eval_pool", "inputs": {"pool": str(pool), "ckpt_cand": str(ckpt)},
             "params": {"seed": day_seed, "block": newest.epoch_start_block,

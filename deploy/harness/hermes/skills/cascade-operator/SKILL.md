@@ -15,7 +15,7 @@ judge then runs it through: G0 verify/dedup → G1 throughput vs the king → G2
 short training screen on one past round (the number you see as `screen_rel`,
 positive = better than the king) → G3 confirmation on the newest rounds
 (pass/fail only) → G4 full-budget replays vs real kings → G4.5 a one-shot on
-data built today → G5 submission (human-approved or guard-railed autonomous).
+fresh windows of the newest revealed snapshot → G5 submission (human-approved or guard-railed autonomous).
 Members are candidates that passed G3. An epoch is one day's round window;
 scores never compare across epochs.
 

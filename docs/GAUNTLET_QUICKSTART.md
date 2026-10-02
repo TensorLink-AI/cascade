@@ -182,7 +182,7 @@ After a few approved finalists have actually won or lost on chain:
 [submit]
 mode        = "autonomous"
 hotkeys     = ["5F...", "5G..."]   # UNUSED hotkeys, consumed in order
-margin      = 0.01                 # improvement required on today's fresh pool
+margin      = 0.01                 # improvement required at the G4.5 one-shot
 max_per_day = 1
 ```
 

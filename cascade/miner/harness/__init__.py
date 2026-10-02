@@ -18,7 +18,7 @@ Stages (cost increases, only survivors advance — :mod:`.gauntlet`):
 ``G2`` short screen on one pool-A round (a fresh round per candidate) →
 ``G3`` confirm on the pool-B rounds (pass/fail only) → ``G4`` full-contract
 replays judged against the kings' signed receipt scores → ``G4.5`` one-shot on
-pool C (built AFTER the finalist froze) → ``G5`` submit (approval or
+fresh windows of the newest revealed snapshot → ``G5`` submit (approval or
 guard-railed autonomous, :mod:`.submit`).
 
 Pools are REPLAYED ROUNDS (:mod:`.rounds`): revealed eval snapshots + signed

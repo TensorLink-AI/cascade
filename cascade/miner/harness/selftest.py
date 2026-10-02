@@ -217,13 +217,10 @@ def build_selftest(root: Path, cfg, *, script, submit_mode="approval", n_rounds=
     compute = FakeCompute({str(gw / "receipts" / f"{r.round_id}.json"): k for r, k in made})
     sub = Submitter(h.submit, gw, runner=submit_runner or (lambda argv: 0))
 
-    def build_pool(out, day, sources, max_per_source=0):
-        out.mkdir(parents=True)
-        (out / "metadata.json").write_text("{}")
 
     g = Gauntlet(h, chain_cfg=cfg, executor=compute, workers=ScriptedWorkers(script),
                  submitter=sub, index_fetch=lambda: {"rounds": rows},
-                 text_fetch=texts.__getitem__, pool_builder=build_pool,
+                 text_fetch=texts.__getitem__,
                  verify_fn=lambda tree, chain: (True, ""))
     return g, compute, sub
 

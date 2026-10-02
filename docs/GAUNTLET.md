@@ -17,7 +17,7 @@ the Ralph worker setup, the Lium provisioner) into one loop:
                                             │ one edit each, fresh context
              ┌─ judge (deterministic, holds the keys) ───────────────────────┐
              │ G0 verify + dedup → G1 throughput → G2 screen → G3 confirm    │
-             │ → G4 full replays vs receipt kings → G4.5 pool C → G5 submit  │
+             │ → G4 full replays vs receipt kings → G4.5 one-shot → G5 submit │
              └──────────────────────────────┬────────────────────────────────┘
                                             │ jobs over SSH
                                  Lium pods (worker image) or this GPU
@@ -48,7 +48,7 @@ The judge keeps a **window** of the newest replayable rounds:
 |---|---|---|---|
 | A | `n_a` (6) older rounds | G2 screen, a different round per candidate | the screen number |
 | B | `n_b` (2) newest rounds | G3 confirm | pass / fail |
-| C | built today with `cascade-pool build`, after the finalist froze | G4.5 one-shot | pass / fail |
+| C | the newest revealed snapshot, windows drawn with the day's seed (not any round's) | G4.5 one-shot | pass / fail |
 
 The pool is published once a day, so the window slides once a day. Every slide,
 king change, `chain.toml` change or image change starts a new **epoch**: the
@@ -64,7 +64,7 @@ population member must pass G3 again or retire. Scores never mix across epochs.
 | G2 | `g2_hours` replay of one pool-A round, paired with the king's same-budget leg on that round | executor | improvement ≥ `g2_margin_floor` |
 | G3 | `g3_hours` replays of every pool-B round, pooled paired bootstrap | executor | mean improvement ≥ `g2_margin_floor` AND LCB > 0 |
 | G4 | full-contract replays of the newest `g4_rounds`, judged against each receipt's king under that round's own rules | executor | ≥ `g4_min_wins` round wins and mean improvement > 0 |
-| G4.5 | the finalist's G4 checkpoint vs the newest king's trained checkpoint, on today's pool C | executor | LCB > 0 and improvement > 0 |
+| G4.5 | the finalist's G4 checkpoint vs the newest king's trained checkpoint, on fresh windows of the newest revealed snapshot | executor | LCB > 0 and improvement > 0 |
 | G5 | submit | judge | see below |
 
 **The reference** (`[stages] reference`):
@@ -93,9 +93,10 @@ Statistical choices, and the failure each one prevents:
   them on different rounds and never reuses G2's numbers.
 - **Pass/fail only past G2.** Repeated queries leak a hidden pool's contents.
   Pools B and C feed back nothing numeric, and B rotates daily.
-- **One-shot pool C.** G4 compares several finalists, so the best of them clears
-  by luck more often. G4.5 measures only the chosen one, once, on data that did
-  not exist when it was written.
+- **One-shot final check.** G4 compares several finalists, so the best of them
+  clears by luck more often. G4.5 measures only the chosen one, once, on windows
+  no stage scored: the newest revealed snapshot (the validators' own data, from
+  the Hugging Face eval-pool dataset) drawn with the day's seed.
 - **`g2_explore_frac`** (off by default). A fraction of G2 losers go to G3 anyway. Their G3
   outcomes (`explore` events) show how often the cheap screen kills a real
   improvement.
@@ -228,7 +229,7 @@ gauntlet/
   events.jsonl            epochs, baselines, deaths, members, explore, G4, finalists, G5
   candidates/<id>/        tree/, meta.json (every stage result), ckpt/ (G4)
   epochs/<n>/king/        the king's legs this epoch (scores per round)
-  receipts/  pools/C/     cached receipts; today's pool C
+  receipts/               cached signed receipts
   spend.json  jobs/       ledger; per-job spec/result/log
   queue/                  worker queue (compose)
   operator/               status.json, DIRECTIVES.md, NOTEBOOK.md, reports/, STOP,
@@ -249,10 +250,7 @@ gauntlet/
   receipt measures that gap; do it before trusting G4.
 - G4 judges each finalist as the round's only challenger. A real cohort round
   applies a family-wise correction.
-- Pool C is built from the public `cascade-pool` sources (`g45_sources`,
-  default openmeteo + wikimedia), not the operator's forge mirror. It has fewer
-  domains than the real pool and no `source` cluster labels, so its bootstrap
-  treats every window as its own cluster (a slightly optimistic LCB). It
-  measures freshness, not the production domain mix.
+- G4.5's snapshot is the newest REVEALED one, so it is ~2 days old: it checks
+  generalisation to windows nobody scored, not to data newer than the reveal lag.
 - Generator code runs in the judge container for the static checks. G1 and
   later run it in the executor: on a pod for Lium, or locally for `local`.
