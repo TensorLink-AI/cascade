@@ -58,7 +58,7 @@ services:
     command: ["gauntlet", "worker", "--config", "/etc/gauntlet/worker.toml",
               "--home", "/queue-home"]
     deploy:
-      replicas: 4                      # = [search] proposals_per_cycle
+      replicas: ${WORKER_REPLICAS:-4}  # = [search] proposals_per_cycle
     volumes:
       - ./work/gauntlet/queue:/queue
       - ./worker.toml:/etc/gauntlet/worker.toml:ro
