@@ -207,12 +207,13 @@ def test_replay_trains_under_the_rounds_signed_contract(rcfg):
     rounds ran points+mv20 billing while the repo still read series_points)."""
     from cascade.shared.manifest import contract_digest, contract_payload
 
-    body = {**contract_payload(rcfg.training), "budget_denomination": "points+mv20"}
+    live = "points+mv30" if rcfg.training.budget_denomination == "points+mv20" else "points+mv20"
+    body = {**contract_payload(rcfg.training), "budget_denomination": live}
     manifest = replace(make_manifest(rcfg, base_seed=BASE_SEED), contract_body=body,
                        contract_digest=contract_digest(body))
     contract, match, over = replay_mod.round_contract(rcfg, manifest, None)
-    assert contract.budget_denomination == "points+mv20" and match
-    assert over == {"budget_denomination": "points+mv20"}
+    assert contract.budget_denomination == live and match
+    assert over == {"budget_denomination": live}
     # a body that does not hash to the manifest digest is flagged, not trusted silently
     _, match, _ = replay_mod.round_contract(
         rcfg, replace(manifest, contract_digest="0" * 64), None)

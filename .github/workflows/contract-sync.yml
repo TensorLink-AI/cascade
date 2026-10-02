@@ -1,0 +1,84 @@
+name: contract-sync
+
+# Keeps chain.toml's training contract in line with the LIVE one. The anchor
+# validator's latest signed receipt embeds the round's manifest, whose
+# contract_body hashes to its contract_digest; scripts/sync_contract.py
+# verifies both, rewrites the [training] fields that differ (plus [round]
+# funded_pod_image when the worker image moved) and checks the edited file
+# reproduces the live digest.
+#
+# It never pushes to main: chain.toml is consensus config, and a receipt shows
+# the EFFECTIVE contract, not how the deployment expresses it (a flat value vs
+# a scheduled switch). Drift becomes ONE pull request on bot/contract-sync,
+# refreshed on every run, for an owner to review. Tests that pin the old
+# values will fail on that PR; that is the signal to reconcile them.
+#
+# Note: a PR opened with GITHUB_TOKEN does not trigger other workflows (CI);
+# run CI on it by hand (workflow_dispatch) or push an empty commit to it.
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: contract-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install deps
+        run: |
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet -e ".[chain,hippius]" numpy
+
+      - name: Compare chain.toml with the live contract
+        id: sync
+        run: |
+          set +e
+          python scripts/sync_contract.py --summary "$RUNNER_TEMP/summary.md"
+          rc=$?
+          set -e
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          [ "$rc" = 0 ] || [ "$rc" = 10 ] || exit "$rc"
+
+      - name: Open or refresh the sync PR
+        if: steps.sync.outputs.rc == '10'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "contract-sync"
+          git config user.email "contract-sync@users.noreply.github.com"
+          git checkout -B bot/contract-sync
+          git add chain.toml
+          git commit -m "chain.toml: sync [training] to the live contract" \
+                     -m "$(cat "$RUNNER_TEMP/summary.md")"
+          git push --force origin bot/contract-sync
+          title="chain.toml: sync to the live contract"
+          if gh pr view bot/contract-sync --json state -q .state 2>/dev/null | grep -q OPEN; then
+            gh pr edit bot/contract-sync --body-file "$RUNNER_TEMP/summary.md"
+          else
+            gh pr create --base main --head bot/contract-sync --title "$title" \
+                         --body-file "$RUNNER_TEMP/summary.md"
+          fi
+          cat "$RUNNER_TEMP/summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: In sync
+        if: steps.sync.outputs.rc == '0'
+        run: echo "chain.toml matches the live contract" >> "$GITHUB_STEP_SUMMARY"
