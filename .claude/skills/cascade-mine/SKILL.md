@@ -1,6 +1,6 @@
 ---
 name: cascade-mine
-description: Mine on the cascade subnet (netuid 91) by running an optimisation loop over a time-series data generator — propose a change, verify, score locally, keep it if better, and (only with explicit confirmation) submit the best. Use when asked to mine cascade, improve/hill-climb a cascade generator, run or watch `cascade mine` / `cascade mine-ui`, or when a `cascade mine` agent-proposer prompt says "Use the cascade-mine skill (proposer mode)".
+description: Mine on the cascade subnet (netuid 91) by running an optimisation loop over a time-series data generator — propose a change, verify, score locally, keep it if better, and (only with explicit confirmation) submit the best. Use when asked to mine cascade, improve/hill-climb a cascade generator, run or watch `cascade mine` / `cascade mine-ui`, set up or operate the mining gauntlet (`cascade gauntlet`, deploy/harness), or when a `cascade mine` agent-proposer prompt says "Use the cascade-mine skill (proposer mode)".
 ---
 
 # cascade-mine
@@ -11,7 +11,7 @@ it and scores the result against the king. Lower score wins (geomean of
 CRPS/WQL and MASE). The mining loop lives in `cascade/miner/optimize.py` and
 is exposed as `cascade mine` (CLI) and `cascade mine-ui` (web UI).
 
-This skill has two modes. Work out which one you are in first.
+This skill has three modes. Work out which one you are in first.
 
 ## Mode A — proposer (you were invoked BY the loop)
 
@@ -95,6 +95,35 @@ cascade reveal-status <hotkey> --watch
 `cascade mine --auto-submit …` does the same at the end of a run, and only
 when the best beats the reference king by `--submit-margin`. Use it only when
 the person asked for unattended submission.
+
+## Mode C — setting up or operating the gauntlet
+
+The gauntlet (`cascade gauntlet`, docs/GAUNTLET.md) is the long-running harness:
+LLM workers propose, a judge replays real past rounds on rented Lium GPUs, and
+finalists wait for a person's approval. Follow docs/GAUNTLET_QUICKSTART.md, in
+this order, and stop where it says:
+
+1. **Free checks first.** `cascade gauntlet selftest` (must print `OK`),
+   `cascade gauntlet check --config <harness.toml>` (no `FAIL`), and the worker
+   model check (`cascade ralph --llm-provider <p> --llm-model <m> --check`).
+2. **Show the person the config and get an explicit "go"** before `tick`, `run`
+   or `docker compose up`: those rent GPUs. Confirm `[compute] daily_usd_cap`,
+   `total_usd_cap` and `max_price_per_hour` with them; never raise a cap yourself.
+3. **Keys only in `deploy/harness/.env`** (or the environment). Ask for each;
+   never print, log or commit one. Check `git check-ignore deploy/harness/.env`.
+4. If the host cannot reach huggingface.co, set `[rounds] sync_via = "executor"`.
+5. After starting: `cascade gauntlet status` (funnel, spend, the `dethrone [...]`
+   progress bar). The judge log has the same bar after G2, G3 and each cycle.
+
+Hard rules:
+- `[submit] mode` stays `approval` unless the person explicitly asks otherwise
+  in this conversation. Never run `cascade gauntlet approve` for them, never
+  mount or touch a wallet.
+- To pause: `cascade gauntlet stop` (it finishes the current stage and tears its
+  pods down). To stop everything: `docker compose down`. Then confirm with
+  `lium ps` that no pod with the configured `pod_prefix` is left running.
+- Report numbers honestly: G2 screens are noisy; only G3+ evidence matters, and
+  a finalist still needs a person's approval.
 
 ## Reference
 

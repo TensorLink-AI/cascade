@@ -4,6 +4,10 @@ This takes you from nothing to a running gauntlet that searches for a better
 generator and asks you before it submits anything. For how it works, see
 [GAUNTLET.md](GAUNTLET.md).
 
+**Setting it up with a coding agent?** Skip to
+[Set it up with an agent](#set-it-up-with-an-agent): one prompt, and the agent
+does the steps below, stopping before anything that costs money.
+
 There are two ways to run it:
 
 | | **A. Docker Compose (recommended)** | **B. One GPU machine, no Docker** |
@@ -114,7 +118,7 @@ docker compose run --rm worker ralph --llm-provider chutes --llm-model <model id
 Fix every `FAIL` before going on. The worker check tells you what's wrong: a bad
 key (401/403), an unknown model (400), a wrong URL (404) or no credit (429).
 
-### 6. First tick: build the window and baseline the king (spends GPU)
+### 6. First tick: build the window (cheap)
 
 ```bash
 docker compose run --rm judge gauntlet tick --config /work/harness.toml
@@ -122,12 +126,23 @@ docker compose run --rm judge gauntlet tick --config /work/harness.toml
 
 This step:
 1. downloads the newest signed receipts;
-2. downloads the revealed snapshots they need, into `work/eval-pool/`;
-3. rents pods and trains the king's short legs on every round in the window,
-   which is about 6 GPU-hours.
+2. downloads the revealed snapshots they need, into `work/eval-pool/` (with
+   `sync_via = "executor"` a short pod does the download);
+3. checks on the judge that each round replays faithfully.
+
+No king is trained up front: its same-budget legs are trained once per round,
+alongside the first candidate that needs them, and cached.
 
 It prints `baseline_ready: true` when done. If it says `waiting`, too few rounds
 have been revealed yet. Reveals lag about 48h; wait and re-run.
+
+### 6b. Give the workers the briefs
+
+Workers read `LINEAGE.md`, `DETHRONES.md` and `RESEARCH.md` from
+`work/gauntlet/operator/` (what past kings changed, why they won, and the
+literature). They are analyses, not code, and do not ship with the repo yet:
+copy them in from wherever they were generated. Without them the workers still
+run, on the attempt history alone.
 
 ### 7. Start it
 
@@ -137,6 +152,35 @@ docker compose logs -f judge          # Ctrl-C to stop following
 ```
 
 To run without the operator: `docker compose up -d judge worker updater`.
+
+## Set it up with an agent
+
+Any coding agent working in this repo (Claude Code, Codex, …) can do the setup.
+Claude Code also loads the `cascade-mine` skill, which has the gauntlet steps
+and its safety rules. Paste this, filling in the two numbers:
+
+```text
+Set up the cascade mining gauntlet from docs/GAUNTLET_QUICKSTART.md, Path A
+(docker compose) on this machine.
+
+- Spend limits: daily_usd_cap = <DAILY>, total_usd_cap = <TOTAL>; never raise them.
+- Submit mode: approval. Never switch to autonomous, never run `approve`, never
+  touch a wallet: I approve submissions myself.
+- Ask me for each API key (Lium, the worker LLM, the operator LLM) and write
+  them only into deploy/harness/.env. Never print them.
+- Use only free steps first: selftest, check, and the worker-model check.
+  Show me the results and the config, and wait for my "go" before `tick` or
+  `up`, which rent GPUs.
+- If this host cannot reach huggingface.co, set [rounds] sync_via = "executor".
+- After `up`, show me `gauntlet status` and the first progress bar, then stop.
+```
+
+What the agent should report back, and what to check:
+
+- `gauntlet selftest` → `OK`, and `gauntlet check` → no `FAIL` lines.
+- The `[compute]` caps and `[submit] mode = "approval"` in `work/harness.toml`.
+- After you say go: `tick` → `baseline_ready: true`, then `docker compose ps`
+  with four services up and a `dethrone [...]` bar in the judge log.
 
 ## Day to day
 
