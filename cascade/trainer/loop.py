@@ -1193,6 +1193,9 @@ class TrainerRunner:
     # transient fetch failures so the reign clock never flaps back to the
     # lagging incentive king mid-dethrone.
     _last_receipt_king: str | None = field(default=None, repr=False)
+    # Last receipt-read problem logged by _receipt_king (logged once per change,
+    # not every 120 s tick).
+    _receipt_problem: str = field(default="", repr=False)
     # Heat drops whose failure matched the storage layer (hotkey → gen ref),
     # reset each round: candidates for the burn exemption in _burn_hotkeys.
     _storage_dropped: dict = field(default_factory=dict, repr=False)
@@ -5687,27 +5690,63 @@ class TrainerRunner:
         king source) lags it 1-2 epochs. The last-known value is STICKY across
         transient fetch failures — during the lag window a blip that fell back
         to the stale incentive king would flap the engine's king view and
-        reset the reign clock twice. Best-effort; never raises."""
+        reset the reign clock twice. Best-effort; never raises.
+
+        Never SILENT: a receipt that is unreadable or fails its signature is
+        logged at ERROR (once per distinct problem) — the sticky king is then
+        possibly stale, and 2026-10-02 showed a silent stale king hides a
+        dethrone (a pre-#345 trainer could not verify margin_v2_block receipts
+        and kept the deposed king for 20 min). A receipt carrying fields this
+        code does not know is logged at WARNING: restart on current code."""
         try:
             from ..shared.hippius import RECEIPT_LATEST_KEY, receipt_latest_key
-            from ..shared.receipt import load_receipt, verify_receipt_signature
+            from ..shared.receipt import (
+                load_receipt,
+                receipt_has_unknown_fields,
+                verify_receipt_signature,
+            )
 
             anchor = self.cfg.manifest.validator_hotkey
             store = self.manifest_store()
+            problems: list[str] = []
             for key in (receipt_latest_key(anchor), RECEIPT_LATEST_KEY):
                 try:
                     receipt = load_receipt(store.get_text(key))
-                except Exception:  # noqa: BLE001 — absent/unreadable ⇒ next candidate
+                except Exception as e:  # noqa: BLE001 — absent/unreadable ⇒ next candidate
+                    problems.append(f"{key}: unreadable ({type(e).__name__}: {str(e)[:120]})")
                     continue
                 if anchor and not verify_receipt_signature(receipt, anchor):
+                    problems.append(f"{key}: round {receipt.round_id} fails the anchor "
+                                    "signature check")
                     continue
                 v = receipt.verdict
                 if receipt.status == "scored" and v is not None and v.king_hotkey:
+                    if receipt_has_unknown_fields(receipt):
+                        self._note_receipt_problem(
+                            f"receipt round {receipt.round_id} carries fields this trainer's "
+                            "code does not know — it was written by newer code; restart the "
+                            "trainer on current main", level=logging.WARNING)
+                    else:
+                        self._note_receipt_problem("")
                     self._last_receipt_king = str(v.king_hotkey)
                     return self._last_receipt_king
-        except Exception:  # noqa: BLE001 — the sticky/incentive fallbacks cover a miss
-            pass
+                problems.append(f"{key}: round {receipt.round_id} names no king "
+                                f"(status {receipt.status})")
+            self._note_receipt_problem(
+                "no verifiable receipt names a king — keeping the last known king "
+                f"{(self._last_receipt_king or '<none>')[:12]}, which may be STALE: "
+                + "; ".join(problems))
+        except Exception as e:  # noqa: BLE001 — the sticky/incentive fallbacks cover a miss
+            self._note_receipt_problem(f"receipt king read failed: {type(e).__name__}: {e}")
         return self._last_receipt_king
+
+    def _note_receipt_problem(self, msg: str, *, level: int = logging.ERROR) -> None:
+        """Log a receipt-read problem once per distinct message; "" clears it."""
+        if msg == self._receipt_problem:
+            return
+        self._receipt_problem = msg
+        if msg:
+            log.log(level, "receipt king: %s", msg)
 
     def _round_entry_king(self, client, commitments) -> str | None:
         """The king this round TRAINS: the validators' receipt king when it

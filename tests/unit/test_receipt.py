@@ -243,3 +243,67 @@ def test_signature_survives_dump_load():
     signed = sign_receipt(receipt, kp)
     loaded = load_receipt(dump_receipt(signed))
     assert verify_receipt_signature(loaded, kp.ss58_address) is True
+
+
+def _resign_raw(obj: dict, kp) -> str:
+    """Sign a raw receipt dict the way a NEWER validator would: over its exact
+    canonical serialisation, unknown fields included."""
+    body = {k: v for k, v in obj.items() if k != "signature"}
+    raw = json.dumps(body, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    obj = dict(body, signature=kp.sign(raw.encode("utf-8")).hex())
+    return json.dumps(obj, indent=2, sort_keys=True)
+
+
+def test_receipt_from_newer_code_still_verifies():
+    """2026-10-02: a pre-#345 trainer dropped the new margin_v2_block stamp,
+    re-serialised without it, failed the signature and kept the deposed king.
+    A field this code does not know — top-level or nested — must not break
+    verification; it is reported via receipt_has_unknown_fields instead."""
+    bt = pytest.importorskip("bittensor")
+    from cascade.shared.receipt import receipt_has_unknown_fields
+
+    kp = bt.Keypair.create_from_uri("//Alice")
+    receipt, _, _ = make_scored_receipt(validator_hotkey=kp.ss58_address)
+    current = load_receipt(dump_receipt(sign_receipt(receipt, kp)))
+    assert verify_receipt_signature(current, kp.ss58_address) is True
+    assert receipt_has_unknown_fields(current) is False
+
+    obj = json.loads(dump_receipt(sign_receipt(receipt, kp)))
+    obj["some_future_stamp"] = 9194400
+    obj["verdict"]["some_future_diag"] = {"x": 0.25}
+    newer = load_receipt(_resign_raw(obj, kp))
+    assert verify_receipt_signature(newer, kp.ss58_address) is True
+    assert receipt_has_unknown_fields(newer) is True
+    assert newer.verdict.king_hotkey == receipt.verdict.king_hotkey
+
+
+def test_received_body_still_dies_on_tamper():
+    """Verifying over the received bytes keeps every tamper fatal: editing a
+    known field, an unknown field, or the signer after signing all fail."""
+    bt = pytest.importorskip("bittensor")
+    kp = bt.Keypair.create_from_uri("//Alice")
+    receipt, _, _ = make_scored_receipt(validator_hotkey=kp.ss58_address)
+    obj = json.loads(dump_receipt(sign_receipt(receipt, kp)))
+    obj["some_future_stamp"] = 1
+    signed_text = _resign_raw(obj, kp)
+
+    for mutate in (
+        lambda o: o["verdict"].__setitem__("king_hotkey", "5Evil"),
+        lambda o: o.__setitem__("some_future_stamp", 2),
+        lambda o: o.__setitem__("injected", True),
+    ):
+        o = json.loads(signed_text)
+        mutate(o)
+        assert verify_receipt_signature(load_receipt(json.dumps(o)), kp.ss58_address) is False
+    other = bt.Keypair.create_from_uri("//Bob")
+    assert verify_receipt_signature(load_receipt(signed_text), other.ss58_address) is False
+
+
+def test_replaced_receipt_verifies_over_its_own_body():
+    """replace() on a loaded receipt must not reuse the received bytes."""
+    bt = pytest.importorskip("bittensor")
+    kp = bt.Keypair.create_from_uri("//Alice")
+    receipt, _, _ = make_scored_receipt(validator_hotkey=kp.ss58_address)
+    loaded = load_receipt(dump_receipt(sign_receipt(receipt, kp)))
+    tampered = replace(loaded, round_id="999")
+    assert verify_receipt_signature(tampered, kp.ss58_address) is False
