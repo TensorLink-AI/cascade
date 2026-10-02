@@ -114,6 +114,11 @@ class Submitter:
         """Hand a finalist to G5. Returns ``{"action": off|pending|submitted|failed}``."""
         if self.cfg.mode == "off":
             return {"action": "off"}
+        done = {r.get("id"): r.get("action") for r in self.history()}
+        if done.get(cand_id) in ("submitted", "failed", "rejected"):
+            return {"action": "already", "previous": done[cand_id]}
+        if (self.dir / "pending" / f"{cand_id}.json").is_file():
+            return {"action": "pending", "already": True}
         frozen = self.dir / "frozen" / cand_id
         if not frozen.is_dir():
             shutil.copytree(tree, frozen)

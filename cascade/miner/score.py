@@ -214,6 +214,7 @@ def train_and_evaluate(
     repo: Path, cfg, *, contract, token_budget: int, seeds, windows: list,
     warm_start_dir: Path | None, init_label: str, device: str, cache: Path,
     trainer_spec: str, hours_label: str, keep_dir: Path | None = None,
+    use_sandbox: bool = False,
 ) -> TrainEvalRun:
     """Train the fixed model on ``repo``'s corpus under ``contract`` and score the
     checkpoint on ``windows``. The shared core of :func:`score_generator` and the
@@ -234,7 +235,7 @@ def train_and_evaluate(
                  repo.name, hours_label, f"{token_budget:,}", init_label)
         with open_round_stream(
             contract.corpus_mode, repo, seeds.generation_seed, cfg.generator,
-            token_budget=token_budget, use_sandbox=False,      # local, trusted-own-code path
+            token_budget=token_budget, use_sandbox=use_sandbox,
             blocked=cfg.static_guard.blocked,
             seed_mix=int(getattr(contract, "gen_seed_mix", 1) or 1),
             budget_denomination=getattr(contract, "budget_denomination", "points"),

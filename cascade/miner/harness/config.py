@@ -41,16 +41,12 @@ class StagesConfig:
     #     (trained lazily, in the same batch as the first candidate needing it);
     #   "receipt": the king's signed full-budget scores, no king training at all,
     #     but a short leg differs from the receipt by ~±0.5% per round (measured),
-    #     which is larger than the screen margin;
-    #   "trained": legacy: every window round re-trained each epoch, plus σ legs.
+    #     which is larger than the screen margin.
     reference: str = "cached"
     g2_hours: float = 0.25                # short screen budget
-    g2_margin_floor: float = 0.002        # relative; the calibrated margin never goes below
-    g2_noise_z: float = 1.0               # screen margin = max(floor, z × σ)
-    g2_explore_frac: float = 0.1          # G2 losers promoted anyway (calibration)
+    g2_margin_floor: float = 0.002        # relative improvement G2 and G3 require
+    g2_explore_frac: float = 0.0          # G2 losers promoted anyway, to measure what G2 kills
     g3_hours: float = 1.0
-    g3_noise_z: float = 2.0               # confirm margin = max(floor, z × σ / √n_b)
-    calib_salts: int = 2                  # extra king seeds measured per epoch for σ
     g4_every_cycles: int = 3              # run G4 every N cycles when finalists exist
     g4_finalists: int = 2                 # population members sent to G4
     g4_rounds: int = 3                    # newest replayable rounds replayed at full budget
@@ -78,6 +74,10 @@ class SearchConfig:
 class ComputeConfig:
     executor: str = "local"
     device: str = "auto"                  # local executor torch device
+    # Local executor only: run candidate generators in the trainer's generation
+    # sandbox. Candidate code then runs on THIS host (which may hold the
+    # wallet); turn on when the host supports it. Lium pods hold no secrets.
+    local_sandbox: bool = False
     max_parallel: int = 1                 # concurrent jobs (local: GPUs; lium: pods)
     daily_usd_cap: float = 0.0            # REQUIRED for lium (0 refuses to start)
     total_usd_cap: float = 0.0            # lifetime ceiling across days (0 = none)
@@ -161,8 +161,8 @@ class HarnessConfig:
             raise ValueError("[submit] autonomous needs intake, wallet_name and a hotkeys pool")
         if s.mode == "autonomous" and s.margin < 0.005:
             raise ValueError("[submit] autonomous margin must be >= 0.005 (the duel's floor)")
-        if self.stages.reference not in ("cached", "receipt", "trained"):
-            raise ValueError("[stages] reference must be 'cached', 'receipt' or 'trained'")
+        if self.stages.reference not in ("cached", "receipt"):
+            raise ValueError("[stages] reference must be 'cached' or 'receipt'")
         if self.rounds.sync_via not in ("local", "executor"):
             raise ValueError("[rounds] sync_via must be 'local' or 'executor'")
         if self.rounds.n_a < 1 or self.rounds.n_b < 1:
@@ -183,6 +183,8 @@ def _section(cls, doc: dict, base: Path):
             p = Path(str(v)).expanduser()
             kw[k] = p if p.is_absolute() or k == "queue_dir" else base / p
         elif isinstance(default, tuple):
+            if not isinstance(v, list):
+                raise ValueError(f"{cls.__name__}.{k} must be a list, e.g. {k} = [\"…\"]")
             kw[k] = tuple(v)
         else:
             kw[k] = v

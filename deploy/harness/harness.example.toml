@@ -19,10 +19,9 @@ n_b           = 2                           # pool B: newest rounds, confirm (pa
 reference         = "cached"                # king leg per (round, budget) trained once; "receipt" = no king training
 g1_throughput_tol = 0.10                    # may be at most 10 % slower than the king
 g2_hours          = 0.25                    # screen budget
-g2_margin_floor   = 0.002                   # margins never go below 0.2 %
-g2_explore_frac   = 0.1                     # G2 losers sent on anyway (measures what G2 kills)
+g2_margin_floor   = 0.002                   # G2 and G3 require a 0.2 % improvement
+g2_explore_frac   = 0.0                     # >0: G2 losers sent on anyway (measures what G2 kills)
 g3_hours          = 1.0
-calib_salts       = 2                       # king re-runs per epoch that measure noise
 g4_every_cycles   = 3
 g4_finalists      = 2
 g4_rounds         = 3                       # newest rounds replayed at the FULL contract

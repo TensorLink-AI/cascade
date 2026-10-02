@@ -115,17 +115,29 @@ def find_snapshot_dir(root: Path | str, pool_sha256: str) -> Path:
         "(reveals lag ~48h; fetch the newest folders of the eval-pool dataset)")
 
 
+def _primary_king(cfg, receipt, manifest):
+    """``(size, king entry, king EntryScores)`` for the round's primary size."""
+    kings = {e.size: e for e in manifest.entries_for_role("king")}
+    primary = cfg.training.primary_size.arch_preset
+    size = next((s for s in (primary, "") if s in kings), None)
+    if size is None:
+        if len(kings) != 1:
+            raise ReplayError(f"cannot pick the primary king size from {sorted(kings)}")
+        size = next(iter(kings))
+    entry = kings[size]
+    rec = next((r for r in receipt.entry_scores
+                if r.role == "king" and r.size == size and r.hotkey == entry.miner_hotkey), None)
+    if rec is None:
+        raise ReplayError(f"receipt carries no king entry_scores for size {size!r}")
+    return size, entry, rec
+
+
 def receipt_king_scores(cfg, receipt_text: str) -> list:
     """The king's signed per-window scores (primary size) from a receipt."""
     from ..shared.receipt import load_receipt
 
     receipt = load_receipt(receipt_text)
-    manifest = receipt.load_embedded_manifest()
-    kings = {e.size: e for e in manifest.entries_for_role("king")}
-    primary = cfg.training.primary_size.arch_preset
-    size = next((s for s in (primary, "") if s in kings), None) or next(iter(kings))
-    rec = next(r for r in receipt.entry_scores if r.role == "king" and r.size == size
-               and r.hotkey == kings[size].miner_hotkey)
+    _, _, rec = _primary_king(cfg, receipt, receipt.load_embedded_manifest())
     return [w.to_score() for w in rec.scores]
 
 
@@ -184,19 +196,7 @@ def load_replay_round(cfg, receipt, snapshot_root: Path | str) -> ReplayRound:
     if receipt.status != "scored" or receipt.eval_context is None:
         raise ReplayError(f"round {receipt.round_id} was not scored ({receipt.status})")
     manifest = receipt.load_embedded_manifest()
-    kings = {e.size: e for e in manifest.entries_for_role("king")}
-    primary = cfg.training.primary_size.arch_preset
-    size = next((s for s in (primary, "") if s in kings), None)
-    if size is None:
-        if len(kings) != 1:
-            raise ReplayError(f"cannot pick the primary king size from {sorted(kings)}")
-        size = next(iter(kings))
-    king_entry = kings[size]
-    rec = next((r for r in receipt.entry_scores
-                if r.role == "king" and r.size == size and r.hotkey == king_entry.miner_hotkey),
-               None)
-    if rec is None:
-        raise ReplayError(f"receipt carries no king entry_scores for size {size!r}")
+    size, king_entry, rec = _primary_king(cfg, receipt, manifest)
     king_scores = [w.to_score() for w in rec.scores]
 
     pool_sha = manifest.eval_pool_sha256 or receipt.eval_context.pool_digest
@@ -215,6 +215,11 @@ def load_replay_round(cfg, receipt, snapshot_root: Path | str) -> ReplayRound:
                        training_seed=int(receipt.training_seed))
     contract_block = int(receipt.era_start_block) or None
     contract, match, over = round_contract(cfg, manifest, contract_block)
+    if isinstance(manifest.contract_body, dict) and not match:
+        # Never train under a contract the round did not run: a body field this
+        # checkout cannot express would silently change the leg.
+        raise ReplayError(f"round {receipt.round_id}: the rebuilt contract does not hash to "
+                          "the manifest's contract_digest (checkout too old for this round?)")
     return ReplayRound(
         receipt=receipt, snapshot_dir=snap, windows=windows, seeds=seeds,
         init_pointer=manifest.warm_start_ckpt or "",
@@ -226,9 +231,12 @@ def load_replay_round(cfg, receipt, snapshot_root: Path | str) -> ReplayRound:
     )
 
 
-def judge(rr: ReplayRound, chal_scores: list):
+def judge(rr: ReplayRound, chal_scores: list, cfg):
     """Judge ``chal_scores`` against the round's king under the round's recorded
-    params, exactly as ``cascade-audit`` replays a single-challenger verdict."""
+    params, as ``cascade-audit`` replays a single-challenger verdict: a round
+    without baseline rows falls back to LEVEL through the same
+    ``cfg.judged_level_params`` the validator uses (never a v2 increment bar
+    read as a level bar)."""
     from ..audit.checks import _bootstrap_seed
     from ..eval.koth import KothParams, evaluate_round
 
@@ -238,7 +246,9 @@ def judge(rr: ReplayRound, chal_scores: list):
     params = KothParams(**v.params)
     increment = params.margin_mode == "increment" and rr.baseline_scores is not None
     gate_on = str(getattr(params, "init_gate_mode", "off") or "off") != "off"
-    params = replace(params, margin_mode="increment" if increment else "level")
+    block = int(rr.receipt.epoch_start_block)
+    params = (replace(params, margin_mode="increment") if increment
+              else cfg.judged_level_params(params, block))
     return evaluate_round(
         rr.king_scores, chal_scores, params,
         seed=_bootstrap_seed(v.bootstrap_seed),
@@ -260,6 +270,7 @@ def score_replay(
     trainer_spec: str = "cascade.trainer.toto2_trainer:Toto2Trainer",
     seed_salt: int = 0,
     keep_checkpoint: Path | None = None,
+    use_sandbox: bool = False,
 ) -> ReplayResult:
     """Train ``repo_dir`` as a challenger of the replayed round and score it.
 
@@ -293,7 +304,7 @@ def score_replay(
         seeds=seeds, windows=rr.windows, warm_start_dir=ws_dir, init_label=init_label,
         device=device, cache=cache, trainer_spec=trainer_spec,
         hours_label="full contract" if full else f"{train_hours:.3g}h",
-        keep_dir=keep_checkpoint,
+        keep_dir=keep_checkpoint, use_sandbox=use_sandbox,
     )
     if len(run.scores) != len(rr.king_scores):
         raise ReplayError(f"candidate produced {len(run.scores)} scores vs the king's "
@@ -304,7 +315,7 @@ def score_replay(
         king_geomean=global_geomean(rr.king_scores),
         n_windows=len(run.scores),
         full_budget=full,
-        verdict=judge(rr, run.scores) if full and not seed_salt else None,
+        verdict=judge(rr, run.scores, cfg) if full and not seed_salt else None,
         corpus_digest=run.corpus_digest,
         train_seconds=run.train_seconds,
         init_label=init_label,

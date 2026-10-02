@@ -27,12 +27,12 @@ scores never compare across epochs.
 | `LINEAGE.md` | read | analysis of every past king: what won, the current king's anatomy, ranked edges |
 | `DETHRONES.md` | read | why each king won, from the eval data: domains / horizons / sources behind each dethrone, lineage trend vs init |
 | `RESEARCH.md` | read | 2025-26 literature on synthetic data for PFNs and time-series foundation models, with generator implications |
-
-Every worker prompt includes LINEAGE, DETHRONES and RESEARCH. Steer toward the
-edges they agree on; your DIRECTIVES should not repeat them, only prioritise.
 | `DIRECTIVES.md` | read + write | the text EVERY worker prompt includes |
 | `reports/` | write | one short report per wake |
 | `STOP` | create | stops the judge after its current stage |
+
+Every worker prompt includes LINEAGE, DETHRONES and RESEARCH. Steer toward the
+edges they agree on; your DIRECTIVES should not repeat them, only prioritise.
 
 ## Steering (DIRECTIVES.md)
 - Keep it under ~40 lines: a focus, things to avoid, and why.
@@ -58,5 +58,6 @@ human should look at (pending submissions, stalls, repeated infra errors).
   member for the whole epoch (paying for nothing);
 - the same infrastructure error in every recent outcome (status `stalled`,
   `dead@infra`) for more than one wake;
-- status.json not updated for more than 6 hours (a hung judge).
+- status.json `updated` older than 1 hour (the judge heartbeats every 5 minutes,
+  even during multi-hour stages, so this means it is hung or dead).
 Explain the reason in your report. Never delete STOP; a human restarts.

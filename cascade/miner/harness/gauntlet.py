@@ -32,6 +32,7 @@ import shutil
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait as futures_wait
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -73,6 +74,7 @@ def progress_bar(pr: dict, width: int = 30) -> str:
 PROGRESS_CAPS = (("G4.5", 100.0), ("G4", 90.0), ("G3", 70.0), ("G2", 40.0))
 
 MAX_INFRA_RETRIES = 2
+HEARTBEAT_SECONDS = 300.0
 MAX_SHORTAGE_WAITS = 6              # ~1 h of back-off when the market has no GPU
 
 
@@ -130,13 +132,13 @@ class Gauntlet:
         self._pool_builder = pool_builder or self._build_pool_cli
         self._verify = verify_fn or self._static_verify
         self._king_hooks = king_hooks or {}
+        self._meta_cache: dict[str, dict] | None = None
         self._now, self._sleep = now, sleep
         for d in ("candidates", "epochs", "operator", "receipts", "pools"):
             (self.wd / d).mkdir(parents=True, exist_ok=True)
         self.state = _read_json(self.wd / "state.json", {}) or {
             "epoch": 0, "fingerprint": "", "window": None, "cycle": 0, "king_ready": False,
-            "last_refresh": 0.0, "next_id": 1, "phase": "starting", "status": "",
-            "g4_done": []}
+            "last_refresh": 0.0, "next_id": 1, "phase": "starting", "status": ""}
 
     # ------------------------------------------------------------------ disk
     def save(self) -> None:
@@ -155,19 +157,26 @@ class Gauntlet:
         log.info("%s", text)
         self.save()
 
+    # Candidate metas are read from disk once, then served from memory (every
+    # write goes through put()). Edit meta.json files only while the judge is down.
+    def _metas(self) -> dict[str, dict]:
+        if self._meta_cache is None:
+            self._meta_cache = {}
+            for p in sorted((self.wd / "candidates").glob("*/meta.json")):
+                m = _read_json(p)
+                if m:
+                    self._meta_cache[m["id"]] = m
+        return self._meta_cache
+
     def meta(self, cid: str) -> dict:
-        return _read_json(self.wd / "candidates" / cid / "meta.json", {})
+        return json.loads(json.dumps(self._metas().get(cid, {})))
 
     def put(self, m: dict) -> None:
         _atomic_json(self.wd / "candidates" / m["id"] / "meta.json", m)
+        self._metas()[m["id"]] = json.loads(json.dumps(m))
 
     def all_metas(self) -> list[dict]:
-        out = []
-        for p in sorted((self.wd / "candidates").glob("*/meta.json")):
-            m = _read_json(p)
-            if m:
-                out.append(m)
-        return out
+        return [json.loads(json.dumps(self._metas()[k])) for k in sorted(self._metas())]
 
     @property
     def window(self) -> RoundWindow | None:
@@ -223,7 +232,8 @@ class Gauntlet:
                 self._sync_via_executor(needed, root)
             else:
                 sync_snapshots(needed, root, repo=r.hf_repo, **self._sync)
-        window = build_window(replayable_rounds(rdir, root), n_a=r.n_a, n_b=r.n_b)
+        refs = [ref for ref in replayable_rounds(rdir, root) if self._round_ok(ref)]
+        window = build_window(refs, n_a=r.n_a, n_b=r.n_b)
         if window is None:
             self.state["status"] = (f"waiting: fewer than {r.n_b + 1} replayable rounds "
                                     f"(receipts in {rdir}, snapshots in {root})")
@@ -235,12 +245,41 @@ class Gauntlet:
             self.save()
             return False
         self.state.update(epoch=self.epoch + 1, fingerprint=fp, window=window.to_json(),
-                          king_ready=False, g4_done=[], status="")
+                          king_ready=False, status="")
         self.event("epoch", epoch=self.epoch, rounds=[x.round_id for x in window.all])
         log.info("epoch %d: A=%s B=%s", self.epoch, [x.round_id for x in window.a],
                  [x.round_id for x in window.b])
         self.save()
         return True
+
+    def _round_ok(self, ref: RoundRef) -> bool:
+        """Can this checkout replay the round faithfully? Rebuilds its verdict
+        windows and contract on the judge (CPU, cached per round), so a round
+        whose draw or contract this code cannot reproduce never reaches a pod."""
+        cache = self.state.setdefault("round_ok", {})
+        if ref.round_id not in cache:
+            from ...shared.receipt import load_receipt
+            from ..replay import ReplayError, load_replay_round
+            try:
+                load_replay_round(self.chain, load_receipt(
+                    ref.receipt_path.read_text(encoding="utf-8")), ref.snapshot_dir)
+                cache[ref.round_id] = True
+            except ReplayError as e:
+                log.warning("round %s left out of the window: %s", ref.round_id, e)
+                self.event("round_unreplayable", round_id=ref.round_id, error=str(e)[:300])
+                cache[ref.round_id] = False
+        return bool(cache[ref.round_id])
+
+    def _newest_contract(self, window: RoundWindow | None = None) -> dict:
+        """The newest window round's signed ``contract_body`` ({} if unknown)."""
+        w = window or self.window
+        if w is None or not w.all:
+            return {}
+        try:
+            doc = json.loads(w.all[-1].receipt_path.read_text(encoding="utf-8"))
+            return doc["manifest"].get("contract_body") or {}
+        except (OSError, ValueError, KeyError):
+            return {}
 
     def _sync_worker_image(self, window: RoundWindow) -> None:
         """Rent the worker image the newest round's signed contract trained on
@@ -248,11 +287,7 @@ class Gauntlet:
         lag the live trainer by releases."""
         if self.h.compute.image or not hasattr(self.executor, "set_image"):
             return
-        try:
-            doc = json.loads(window.all[-1].receipt_path.read_text(encoding="utf-8"))
-            digest = (doc["manifest"].get("contract_body") or {}).get("train_image_digest", "")
-        except (OSError, ValueError, KeyError):
-            return
+        digest = self._newest_contract(window).get("train_image_digest", "")
         if not digest:
             return
         from .images import resolve_worker_image
@@ -273,13 +308,10 @@ class Gauntlet:
         if not want:
             return
         self.phase(f"fetching {len(want)} revealed snapshot(s) via the executor")
-        try:
-            res = self._run_jobs([Job("fetch-snapshots", {
-                "kind": "fetch_snapshots", "inputs": {},
-                "params": {"repo": self.h.rounds.hf_repo, "blocks": want},
-                "outputs": {"snapshots": str(root)}}, 0.25)])["fetch-snapshots"]
-        except BudgetWait:
-            return
+        res = self._run_jobs([Job("fetch-snapshots", {
+            "kind": "fetch_snapshots", "inputs": {},
+            "params": {"repo": self.h.rounds.hf_repo, "blocks": want},
+            "outputs": {"snapshots": str(root)}}, 0.25)])["fetch-snapshots"]
         if "error" in res:
             log.warning("snapshot fetch failed: %s", res["error"])
             self.state["status"] = f"snapshot fetch failed: {str(res['error'])[:300]}"
@@ -304,8 +336,9 @@ class Gauntlet:
 
     def _run_jobs(self, jobs: list[Job]) -> dict[str, dict]:
         """Run ``jobs`` in parallel on the executor; infra faults retry up to
-        :data:`MAX_INFRA_RETRIES`. Raises :class:`BudgetWait` (after the batch)
-        when the spend cap stopped any job."""
+        :data:`MAX_INFRA_RETRIES`, GPU shortages back off. A job the spend cap
+        refused comes back with ``budget_exhausted`` and arms
+        :meth:`_check_budget`, so every completed (paid) result is still recorded."""
         if not jobs:
             return {}
         results: dict[str, dict] = {}
@@ -317,6 +350,11 @@ class Gauntlet:
                 futs = {j.key: pool.submit(self.executor.run, j.spec,
                                            job_id=f"e{self.epoch}-{j.key}-a{attempt}",
                                            est_hours=j.est_hours) for j in pending}
+                while not all(f.done() for f in futs.values()):
+                    # Heartbeat: a full-budget batch can block for hours; the
+                    # operator reads `updated` to tell a slow judge from a hung one.
+                    futures_wait(list(futs.values()), timeout=HEARTBEAT_SECONDS)
+                    self.save()
                 done = {k: f.result() for k, f in futs.items()}
             attempt += 1
             retry, short = [], False
@@ -328,6 +366,8 @@ class Gauntlet:
                 if res.get("budget_exhausted"):
                     budget_hit = True
                     continue
+                if res.get("deterministic"):
+                    continue          # the round, not the pod: another try gives the same
                 log.warning("job %s infra fault (attempt %d): %s", j.key, attempt,
                             res["error"])
                 self.event("infra_fault", job=j.key, attempt=attempt,
@@ -350,13 +390,17 @@ class Gauntlet:
             if faults > MAX_INFRA_RETRIES:
                 break
         if budget_hit:
-            raise BudgetWait("daily spend cap reached")
+            # The paid results above are kept; the caller finishes recording
+            # them and the cycle stops at its next checkpoint.
+            self._budget_hit = True
         return results
 
-    # ------------------------------------------------------------- baseline
-    def _king_path(self, ref: RoundRef, tag: str) -> Path:
-        return self.wd / "epochs" / str(self.epoch) / "king" / f"{ref.round_id}.{tag}.json"
+    def _check_budget(self) -> None:
+        if getattr(self, "_budget_hit", False):
+            self._budget_hit = False
+            raise BudgetWait("spend cap reached")
 
+    # ------------------------------------------------------------- baseline
     def _cache_path(self, ref: RoundRef, hours: float) -> Path:
         # Keyed by king AND the image it trained on: a new worker release
         # re-trains the reference instead of mixing numerics.
@@ -386,75 +430,34 @@ class Gauntlet:
 
     def _king_ref(self, ref: RoundRef, tag: str, row: dict) -> tuple[float, list]:
         """``(king geomean, king per-window scores)`` the candidate in ``row`` is
-        compared with on ``ref``: the cached same-budget king leg, the receipt's
-        signed scores, or the legacy per-epoch trained leg."""
+        compared with on ``ref``: the cached same-budget king leg, or the
+        receipt's signed scores."""
         if self.h.stages.reference == "cached":
             hours = self.h.stages.g2_hours if tag == "g2" else self.h.stages.g3_hours
             doc = _read_json(self._cache_path(ref, hours))
             if not doc or "scores" not in doc:
                 raise KeyError(f"no cached king leg for round {ref.round_id} at {hours:g}h")
             return float(doc["geomean"]), scores_from_json(doc["scores"])
-        if self.h.stages.reference == "receipt":
-            from ..replay import receipt_king_scores
-            return float(row["king_geomean"]), receipt_king_scores(
-                self.chain, ref.receipt_path.read_text(encoding="utf-8"))
-        return (float(_read_json(self._king_path(ref, tag))["geomean"]),
-                self.king_scores(ref, tag))
-
-    def king_scores(self, ref: RoundRef, tag: str) -> list | None:
-        doc = _read_json(self._king_path(ref, tag))
-        return scores_from_json(doc["scores"]) if doc and "scores" in doc else None
+        from ..replay import receipt_king_scores
+        return float(row["king_geomean"]), receipt_king_scores(
+            self.chain, ref.receipt_path.read_text(encoding="utf-8"))
 
     def ensure_baseline(self) -> bool:
-        if self.state.get("king_ready"):
-            return True
-        w, s = self.window, self.h.stages
-        if s.reference in ("receipt", "cached"):
-            # Nothing to train up front: the receipts are the king's scores, or
-            # its short legs are trained lazily per round (cached). The stage
-            # margins are the configured floor.
-            self.state.update(king_ready=True, m2=s.g2_margin_floor, m3=s.g2_margin_floor,
-                              sigma2=None, sigma3=None)
-            self.event("baseline", epoch=self.epoch, reference="receipt",
-                       m2=s.g2_margin_floor, m3=s.g2_margin_floor)
+        """Per-epoch setup: the stage margins, then the population re-confirmed
+        on the new window. Nothing is trained up front (the receipts are the
+        king's scores, or its same-budget legs are trained lazily per round and
+        cached). The re-confirmation has its own flag, so a cap or a crash in
+        the middle of it resumes instead of skipping it."""
+        s = self.h.stages
+        if not self.state.get("king_ready"):
+            self.state.update(king_ready=True, m2=s.g2_margin_floor, m3=s.g2_margin_floor)
+            self.event("baseline", epoch=self.epoch, reference=s.reference,
+                       margin=s.g2_margin_floor)
             self.save()
+        if self.state.get("rebaselined_epoch") != self.epoch:
             self._rebaseline_population()
-            return True
-        king = self.tree("king")
-        want: list[tuple[RoundRef, str, float, int]] = (
-            [(r, "g2", s.g2_hours, 0) for r in w.a] + [(r, "g3", s.g3_hours, 0) for r in w.b]
-            + [(w.a[0], f"g2s{i}", s.g2_hours, i) for i in range(1, s.calib_salts + 1)]
-            + [(w.b[-1], f"g3s{i}", s.g3_hours, i) for i in range(1, s.calib_salts + 1)])
-        jobs = [Job(f"king-{r.round_id}-{tag}", self._replay_spec(king, r, h, salt=salt), h)
-                for r, tag, h, salt in want if not self._king_path(r, tag).is_file()]
-        self.phase(f"epoch {self.epoch}: baselining the king ({len(jobs)} legs)")
-        res = self._run_jobs(jobs)
-        for r, tag, _, _ in want:
-            doc = res.get(f"king-{r.round_id}-{tag}")
-            if doc and "scores" in doc:
-                _atomic_json(self._king_path(r, tag), doc)
-        missing = [f"{r.round_id}.{tag}" for r, tag, _, _ in want
-                   if not self._king_path(r, tag).is_file()]
-        if missing:
-            self.state["status"] = f"king baseline incomplete ({len(missing)} legs failed)"
+            self.state["rebaselined_epoch"] = self.epoch
             self.save()
-            return False
-
-        def sigma(ref: RoundRef, base: str, prefix: str) -> float:
-            g0 = _read_json(self._king_path(ref, base))["geomean"]
-            return stats.noise_sigma([
-                stats.rel_improvement(_read_json(self._king_path(ref, f"{prefix}{i}"))["geomean"], g0)
-                for i in range(1, s.calib_salts + 1)])
-
-        s2, s3 = sigma(w.a[0], "g2", "g2s"), sigma(w.b[-1], "g3", "g3s")
-        self.state.update(
-            sigma2=s2, sigma3=s3, king_ready=True,
-            m2=stats.margin(s2, z=s.g2_noise_z, floor=s.g2_margin_floor),
-            m3=stats.margin(s3, z=s.g3_noise_z, floor=s.g2_margin_floor, n=len(w.b)))
-        self.event("baseline", epoch=self.epoch, sigma2=s2, sigma3=s3,
-                   m2=self.state["m2"], m3=self.state["m3"])
-        self.save()
-        self._rebaseline_population()
         return True
 
     def _rebaseline_population(self) -> None:
@@ -571,6 +574,10 @@ class Gauntlet:
         """True when ``res`` ended the candidate (candidate fault) or stalled it."""
         if "error" not in res:
             return False
+        if res.get("budget_exhausted"):
+            m["status"] = "in_gauntlet"               # waits for the cap, never penalised
+            self.put(m)
+            return True
         if res.get("candidate_fault"):
             self._kill(m, stage, res["error"][:300])
         else:
@@ -629,16 +636,8 @@ class Gauntlet:
         return [m for m in metas if m["stages"].get("G1", {}).get("pass")]
 
     def _live_denomination(self) -> str | None:
-        """Billing rule of the newest window round's signed contract (the live
-        trainer's, which this checkout's chain.toml may not carry)."""
-        w = self.window
-        if w is None or not w.all:
-            return None
-        try:
-            doc = json.loads(w.all[-1].receipt_path.read_text(encoding="utf-8"))
-            return (doc["manifest"].get("contract_body") or {}).get("budget_denomination")
-        except (OSError, ValueError, KeyError):
-            return None
+        """Billing rule of the newest window round's signed contract."""
+        return self._newest_contract().get("budget_denomination")
 
     def _g2(self, metas: list[dict]) -> list[dict]:
         w, s = self.window, self.h.stages
@@ -733,30 +732,45 @@ class Gauntlet:
         return self.wd / "candidates" / cid / "ckpt" / ref.round_id
 
     def _g4(self) -> dict | None:
-        """Full-contract replays of the top members; returns the chosen finalist."""
+        """Full-contract replays of the top members not yet G4-judged this epoch;
+        returns the chosen finalist. Each leg's result is kept on the candidate
+        as soon as it exists, so a cap or crash never pays for the same leg twice.
+        Finalists and submitted trees are never re-run."""
         s, w = self.h.stages, self.window
-        done = set(self.state.get("g4_done", []))
-        finalists = [m for m in self.members() if m["id"] not in done][: s.g4_finalists]
+        finalists = [m for m in self.members() if m.get("status") == "member"
+                     and (m["stages"].get("G4") or {}).get("epoch") != self.epoch]
+        finalists = finalists[: s.g4_finalists]
         if not finalists:
             return None
         rounds = w.newest(s.g4_rounds)
         newest = rounds[-1]
-        self.phase(f"G4: {len(finalists)} finalist(s) × {len(rounds)} full-budget replays")
         # Budget bound: the contract's hard wall plus staging/eval slack.
         wall_h = float(self.chain.training.primary_size.max_train_seconds) / 3600.0 + 0.5
         jobs = [Job(f"{m['id']}-G4-{ref.round_id}", self._replay_spec(
             self.tree(m["id"]), ref, None,
             ckpt=self._ckpt_dir(m["id"], ref) if ref is newest else None), wall_h)
-            for m in finalists for ref in rounds]
+            for m in finalists for ref in rounds
+            if ref.round_id not in m.get("g4_legs", {})]
+        self.phase(f"G4: {len(finalists)} finalist(s), {len(jobs)} full-budget replay(s)")
         res = self._run_jobs(jobs)
         passers = []
         for m in finalists:
-            rows = [res[f"{m['id']}-G4-{ref.round_id}"] for ref in rounds]
-            bad = next((r for r in rows if "error" in r), None)
-            if bad is not None:
-                if bad.get("candidate_fault"):
-                    self._kill(m, "G4", bad["error"][:300])
-                continue                       # infra: try again next G4 cycle
+            legs = m.setdefault("g4_legs", {})
+            for ref in rounds:
+                r = res.get(f"{m['id']}-G4-{ref.round_id}")
+                if r is not None and "error" not in r:
+                    legs[ref.round_id] = {k: r.get(k) for k in
+                                          ("geomean", "king_geomean", "verdict")}
+            self.put(m)
+            bad = next((r for ref in rounds
+                        if (r := res.get(f"{m['id']}-G4-{ref.round_id}")) and "error" in r),
+                       None)
+            if bad is not None and bad.get("candidate_fault"):
+                self._kill(m, "G4", bad["error"][:300])
+                continue
+            if any(ref.round_id not in legs for ref in rounds):
+                continue                       # infra / cap: the missing legs run later
+            rows = [legs[ref.round_id] for ref in rounds]
             wins = sum(1 for r in rows if (r.get("verdict") or {}).get("wins"))
             rels = [stats.rel_improvement(r["geomean"], r["king_geomean"]) for r in rows]
             g4 = {"pass": wins >= s.g4_min_wins and stats.mean(rels) > 0, "wins": wins,
@@ -764,12 +778,10 @@ class Gauntlet:
                   "epoch": self.epoch,
                   "lcbs": [(r.get("verdict") or {}).get("lcb") for r in rows]}
             m["stages"]["G4"] = g4
-            done.add(m["id"])
             self.put(m)
             self.event("g4", id=m["id"], passed=g4["pass"], wins=wins)
             if g4["pass"]:
                 passers.append(m)
-        self.state["g4_done"] = sorted(done)
         self.save()
         return max(passers, key=lambda m: m["stages"]["G4"]["rel"]) if passers else None
 
@@ -847,10 +859,12 @@ class Gauntlet:
         """One cycle; returns ``"ran"``, ``"wait"`` or ``"budget"``."""
         try:
             self.refresh_window()
+            self._check_budget()
             if self.window is None:
                 return "wait"
             if not self.ensure_baseline():
                 return "wait"
+            self._check_budget()
             resumed = []
             for m in self.all_metas():
                 if m.get("status") == "proposed":
@@ -881,23 +895,27 @@ class Gauntlet:
             batch = resumed + fresh
             self.phase(f"cycle {self.state['cycle']}: G0-G1 on {len(batch)}")
             batch = self._g1(self._g0(batch))
+            self._check_budget()
             self.phase(f"cycle {self.state['cycle']}: G2 on {len(batch)}")
             batch = self._g2(batch)
             self._record_progress("G2")
+            self._check_budget()
             self.phase(f"cycle {self.state['cycle']}: G3 on {len(batch)}")
             self._g3(batch)
             self._record_progress("G3")
+            self._check_budget()
             self._trim_population()
             self.state["cycle"] = int(self.state["cycle"]) + 1
             if self.state["cycle"] % max(1, self.h.stages.g4_every_cycles) == 0:
                 chosen = self._g4()
+                self._check_budget()
                 if chosen is not None:
                     self.finalize(chosen)
             self._record_progress("cycle")
             self.phase("idle")
             return "ran"
         except BudgetWait:
-            self.state["status"] = "daily spend cap reached; waiting for 00:00 UTC"
+            self.state["status"] = "spend cap reached; waiting for 00:00 UTC"
             self.save()
             return "budget"
         finally:

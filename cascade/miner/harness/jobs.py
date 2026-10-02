@@ -77,7 +77,8 @@ def run_replay(cfg, spec: dict) -> dict:
     r = score_replay(Path(inp["gen"]), cfg, rr, train_hours=par.get("train_hours"),
                      device=_device(par.get("device", "auto")),
                      cache_dir=Path(par.get("cache_dir", "./_gauntlet_cache")),
-                     seed_salt=int(par.get("seed_salt", 0)), keep_checkpoint=keep)
+                     seed_salt=int(par.get("seed_salt", 0)), keep_checkpoint=keep,
+                     use_sandbox=bool(par.get("sandbox", False)))
     v = r.verdict
     return {
         "round_id": r.round_id, "geomean": r.geomean, "king_geomean": r.king_geomean,
@@ -93,7 +94,7 @@ def run_replay(cfg, spec: dict) -> dict:
 
 
 def measure_throughput(cfg, gen: Path, *, seconds: float, seed: int = 0,
-                       denomination: str | None = None) -> dict:
+                       denomination: str | None = None, use_sandbox: bool = False) -> dict:
     """Budget points per second ``gen`` streams, billed by the trainer's own rule
     (``element_points``) under ``denomination`` (default: the local contract's;
     the gauntlet passes the live round's, which can differ)."""
@@ -105,7 +106,7 @@ def measure_throughput(cfg, gen: Path, *, seconds: float, seed: int = 0,
     t0 = time.monotonic()
     with open_round_stream(
         contract.corpus_mode, gen, seed, cfg.generator,
-        token_budget=10**15, use_sandbox=False, blocked=cfg.static_guard.blocked,
+        token_budget=10**15, use_sandbox=use_sandbox, blocked=cfg.static_guard.blocked,
         seed_mix=int(getattr(contract, "gen_seed_mix", 1) or 1), budget_denomination=denom,
     ) as rs:
         for arr in rs.series():
@@ -129,11 +130,13 @@ def run_throughput(cfg, spec: dict) -> dict:
         return {"verify_ok": False, "verify": report.render()[-2000:]}
     seconds = float(par.get("seconds", 60.0))
     denom = par.get("budget_denomination") or None
+    box = bool(par.get("sandbox", False))
     out = {"verify_ok": True,
-           "gen": measure_throughput(cfg, Path(inp["gen"]), seconds=seconds, denomination=denom)}
+           "gen": measure_throughput(cfg, Path(inp["gen"]), seconds=seconds,
+                                     denomination=denom, use_sandbox=box)}
     if inp.get("king"):
         out["king"] = measure_throughput(cfg, Path(inp["king"]), seconds=seconds,
-                                         denomination=denom)
+                                         denomination=denom, use_sandbox=box)
     return out
 
 
@@ -160,20 +163,11 @@ def run_eval_pool(cfg, spec: dict) -> dict:
 
 
 def run_fetch_snapshots(cfg, spec: dict) -> dict:
-    from .rounds import _BLOCK_RE, _hf_download, _hf_list_folders
+    from .rounds import sync_snapshots
 
     par, out = spec.get("params", {}), Path(spec["outputs"]["snapshots"])
     out.mkdir(parents=True, exist_ok=True)
-    folders = _hf_list_folders(par["repo"])()
-    by_block = {int(m.group(1)): f for f in folders if (m := _BLOCK_RE.search(f))}
-    fetched, unrevealed = [], []
-    for b in sorted(int(x) for x in par["blocks"]):
-        if b not in by_block:
-            unrevealed.append(b)
-            continue
-        _hf_download(par["repo"])(by_block[b], out)
-        fetched.append(by_block[b])
-    return {"fetched": fetched, "unrevealed": unrevealed}
+    return sync_snapshots({int(b) for b in par["blocks"]}, out, repo=par["repo"])
 
 
 def run_job(spec: dict, cfg=None) -> dict:
@@ -207,11 +201,19 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as e:  # noqa: BLE001 — the judge classifies; never a bare traceback
         log.exception("job failed")
         res = {"kind": spec.get("kind"), "error": f"{type(e).__name__}: {e}",
-               "candidate_fault": _is_candidate_fault(e)}
+               "candidate_fault": _is_candidate_fault(e),
+               "deterministic": _is_deterministic(e)}
     tmp = Path(argv[1]).with_suffix(".tmp")
     tmp.write_text(json.dumps(res), encoding="utf-8")
     tmp.replace(argv[1])
     return 0 if "error" not in res else 1
+
+
+def _is_deterministic(e: Exception) -> bool:
+    """The ROUND cannot be replayed here (windows do not rebuild, contract
+    mismatch): retrying on another pod gives the same answer."""
+    from ..replay import ReplayError
+    return isinstance(e, ReplayError)
 
 
 def _is_candidate_fault(e: Exception) -> bool:

@@ -153,11 +153,12 @@ def test_sync_snapshots_downloads_only_revealed_missing_blocks(tmp_path):
     (root / "snapshots" / "2026-09-01-block-100").mkdir(parents=True)
     (root / "snapshots" / "2026-09-01-block-100" / SHA_MARKER).write_text("aa")
     got = []
-    n = hrounds.sync_snapshots(
+    res = hrounds.sync_snapshots(
         {100, 200, 300}, root, repo="x",
         list_folders=lambda: ["snapshots/2026-09-01-block-100", "snapshots/2026-09-02-block-200"],
         download=lambda folder, r: got.append(folder))
-    assert n == 1 and got == ["snapshots/2026-09-02-block-200"]   # 300 not revealed yet
+    assert got == ["snapshots/2026-09-02-block-200"]
+    assert res == {"fetched": ["snapshots/2026-09-02-block-200"], "unrevealed": [300]}
 
 
 # ── spend ledger + executors ─────────────────────────────────────────────────
@@ -510,11 +511,14 @@ def test_new_epoch_reconfirms_the_population(rcfg, tmp_path):
     g.h = hconfig.with_overrides(g.h, search={"proposals_per_cycle": 1})
     g.state["last_refresh"] = 0
     assert g.cycle() == "ran" and g.epoch == 2
-    # both re-ran G3 on the epoch-2 window and kept their places
-    for cid, status in (("c00001", "finalist"), ("c00002", "member")):
+    # both re-ran G3 on the epoch-2 window and kept their places; the finalist
+    # is NOT re-run through G4, so this epoch's G4 slot goes to c00002
+    for cid in ("c00001", "c00002"):
         m = g.meta(cid)
-        assert m["status"] == status and m["member_epoch"] == 2
+        assert m["status"] in ("member", "finalist") and m["member_epoch"] == 2
         assert m["stages"]["G3"]["epoch"] == 2
+    assert g.meta("c00001")["stages"]["G4"]["epoch"] == 1      # not repeated
+    assert g.meta("c00002")["stages"]["G4"]["epoch"] == 2
 
 
 def test_throughput_job_runs_the_real_stream(cfg):
@@ -648,42 +652,14 @@ def test_a_machine_that_fails_to_boot_is_never_rented_again(tmp_path):
     assert prov.launched[1].exclude_ids == ("m1",)
 
 
-def test_receipt_reference_trains_no_king_and_trained_mode_still_works(rcfg, tmp_path):
-    g, compute, _, _ = _gauntlet(rcfg, tmp_path / "r", script=[(1.6, 1.0), (0.8, 1.0)],
+def test_receipt_reference_trains_no_king(rcfg, tmp_path):
+    g, compute, _, _ = _gauntlet(rcfg, tmp_path, script=[(1.6, 1.0), (0.8, 1.0)],
                                  stages={"reference": "receipt"})
     assert g.cycle() == "ran"
     king_tree = str(g.tree("king"))
     assert not any(j["inputs"].get("gen") == king_tree for j in compute.jobs
                    if j["kind"] == "replay")                    # zero king training
     assert g.meta("c00001")["status"] == "finalist" and g.meta("c00002")["status"] == "dead"
-    g2, compute2, _, _ = _gauntlet(rcfg, tmp_path / "t", script=[(1.6, 1.0)],
-                                   stages={"reference": "trained"})
-    assert g2.cycle() == "ran" and g2.meta("c00001")["status"] == "finalist"
-    assert any(j["inputs"].get("gen") == str(g2.tree("king")) for j in compute2.jobs
-               if j["kind"] == "replay")
-
-
-def test_lineage_brief_reaches_every_worker_prompt(rcfg, tmp_path):
-    g, _, _, _ = _gauntlet(rcfg, tmp_path, script=[(1.6, 1.0)])
-    g.refresh_window(force=True)
-    (g.wd / "operator" / "LINEAGE.md").write_text("# King lineage brief\nEdge: try X\n")
-    props = g.propose(2)
-    assert all("king lineage brief" in p.prompt and "Edge: try X" in p.prompt for p in props)
-
-
-def test_a_worker_that_delivered_then_hit_max_turns_is_kept(tmp_path):
-    tree = _gen(tmp_path / "c" / "tree")
-
-    def runner(p, env):
-        (p.tree / "config.json").write_text('{"quality": 2.0}')
-        (p.tree / ".mine-note.md").write_text("raised the weight\n")
-        return 1                                 # "Error: Reached max turns"
-
-    o = run_agent(Proposal("c1", "king", tree, "p"), _wcfg(), home=tmp_path, runner=runner)
-    assert o.ok and o.note == "raised the weight"
-    o2 = run_agent(Proposal("c2", "king", _gen(tmp_path / "d" / "tree"), "p"), _wcfg(),
-                   home=tmp_path, runner=lambda p, env: 1)
-    assert not o2.ok                             # no deliverable: still a failure
 
 
 def test_cached_reference_trains_each_round_king_leg_once(rcfg, tmp_path):
@@ -828,3 +804,89 @@ def test_every_brief_reaches_the_worker_prompt_capped(rcfg, tmp_path):
     assert "king lineage brief" in p and "dethrones vs the eval data" in p
     assert "synthetic data for PFNs" in p and "Y won on energy" in p
     assert p.count("z") <= g.h.search.brief_chars              # capped
+
+
+def test_running_jobs_reserve_their_cost_so_parallel_jobs_cannot_overshoot(tmp_path):
+    clock = {"t": 1_790_000_000.0 - 1_790_000_000.0 % 86400 + 3600}
+    ex = _lium(tmp_path, _FakeProvider(), clock, cap=10.0, par=4)   # $2/h cap price
+    # a 2 h job reserves min(timeout, 2*1.25+0.5)=3 h x $2 = $6; a second can't fit
+    pod = ex._acquire(2.0)
+    assert ex._committed == pytest.approx(6.0)
+    with pytest.raises(Exception, match="reserved"):
+        ex._acquire(2.0)
+    ex._release(pod)
+    assert ex._committed == 0.0
+    assert ex._acquire(2.0)                       # fits again once the first is done
+
+
+def test_pods_get_the_harness_chain_toml(tmp_path):
+    clock = {"t": 1_790_000_000.0}
+    ex = _lium(tmp_path, _FakeProvider(), clock, cap=10.0)
+    toml = tmp_path / "my-chain.toml"
+    toml.write_text("x")
+    ex.chain_toml = toml
+    ex.run({"kind": "replay", "inputs": {}, "params": {}})
+    assert ex.transfer.pushed[-2].endswith("harness-chain.toml") or any(
+        d.endswith("harness-chain.toml") for d in ex.transfer.pushed)
+    spec = json.loads(next((tmp_path / "wd" / "jobs").glob("*/spec.remote.json")).read_text())
+    assert spec["params"]["chain_toml"].endswith("harness-chain.toml")
+
+
+def test_a_capped_batch_keeps_its_paid_results_and_g4_legs(rcfg, tmp_path):
+    g, compute, _, _ = _gauntlet(rcfg, tmp_path, script=[(1.6, 1.0)])
+    real = compute.run
+    state = {"cap": True}
+
+    def run(spec, **kw):
+        if (spec["kind"] == "replay" and spec["params"]["train_hours"] is None
+                and state["cap"] and spec["inputs"]["receipt"].endswith(
+                    g.window.newest(1)[0].receipt_path.name)):
+            return {"error": "daily cap", "candidate_fault": False, "budget_exhausted": True}
+        return real(spec, **kw)
+
+    compute.run = run
+    assert g.cycle() == "budget"                         # the newest G4 leg hit the cap
+    legs = g.meta("c00001")["g4_legs"]
+    assert len(legs) == 2                                # the two paid legs were kept
+    assert g.meta("c00001")["status"] == "member"
+    n = len(compute.jobs)
+    state["cap"] = False
+    g.workers = ScriptedWorkers([])
+    g.h = hconfig.with_overrides(g.h, search={"proposals_per_cycle": 0})
+    assert g.cycle() == "ran"
+    g4_jobs = [j for j in compute.jobs[n:] if j["kind"] == "replay"
+               and j["params"]["train_hours"] is None]
+    assert len(g4_jobs) == 1                             # only the missing leg re-ran
+    assert g.meta("c00001")["status"] == "finalist"
+
+
+def test_a_finalist_is_never_offered_twice(tmp_path, monkeypatch):
+    s, calls = _sub(tmp_path, mode="approval")
+    assert s.offer("c1", _gen(tmp_path / "a"), GOOD)["action"] == "pending"
+    assert s.offer("c1", _gen(tmp_path / "a"), GOOD) == {"action": "pending", "already": True}
+    s.reject("c1")
+    assert s.offer("c1", _gen(tmp_path / "a"), GOOD)["action"] == "already"
+
+
+def test_string_for_a_list_setting_is_refused(tmp_path):
+    p = tmp_path / "h.toml"
+    p.write_text('[submit]\nhotkeys = "5Fabc"\n')
+    with pytest.raises(ValueError, match="must be a list"):
+        hconfig.load_harness_config(p)
+
+
+def test_unreplayable_rounds_never_enter_the_window(rcfg, tmp_path):
+    g, compute, _, _ = _gauntlet(rcfg, tmp_path, script=[(1.6, 1.0)])
+    g.refresh_window(force=True)
+    first = g.window.all[0].round_id
+    g2, compute2, _, _ = _gauntlet(rcfg, tmp_path / "b", script=[(1.6, 1.0)])
+    # tamper one cached receipt's window ids: its draw no longer reproduces
+    g2.refresh_window(force=True)
+    target = next(p for p in (g2.wd / "receipts").glob("*.json") if p.stem == first)
+    doc = json.loads(target.read_text())
+    doc["eval_context"]["window_ids"] = list(reversed(doc["eval_context"]["window_ids"]))
+    target.write_text(json.dumps(doc))
+    g2.state["round_ok"] = {}
+    g2.refresh_window(force=True)
+    assert first not in [r.round_id for r in g2.window.all]
+    assert g2.state["round_ok"][first] is False

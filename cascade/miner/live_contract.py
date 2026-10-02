@@ -46,13 +46,11 @@ def with_live_contract(cfg, *, fetch=None):
 
 
 def _latest_receipt_manifest(cfg) -> dict | None:
-    """The manifest embedded in the anchor validator's latest public receipt
-    (manifests themselves are not public-read; receipts are)."""
-    from ..audit.main import _fetch_text
-    from ..shared.hippius import receipt_latest_key
+    """The manifest embedded in the anchor validator's latest public receipt,
+    signature-verified (manifests themselves are not public-read)."""
+    from .harness.king import anchor_receipt_text
 
-    anchor = str(getattr(cfg.manifest, "validator_hotkey", "") or "")
-    doc = json.loads(_fetch_text(cfg, receipt_latest_key(anchor)))
+    doc = json.loads(anchor_receipt_text(cfg))
     return doc.get("manifest") if isinstance(doc, dict) else None
 
 

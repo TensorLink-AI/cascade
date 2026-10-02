@@ -170,29 +170,31 @@ def _hf_download(repo: str) -> Download:
 
 def sync_snapshots(blocks: set[int], root: Path, *, repo: str,
                    list_folders: ListFolders | None = None,
-                   download: Download | None = None) -> int:
+                   download: Download | None = None) -> dict:
     """Download the revealed folders for snapshot ``blocks`` not yet under ``root``.
-    Returns how many were fetched; failures are logged (the round just waits)."""
+    Returns ``{"fetched": [folders], "unrevealed": [blocks]}``; failures are
+    logged (the round just waits)."""
     want = sorted(blocks - local_snapshot_blocks(root))
+    out: dict = {"fetched": [], "unrevealed": []}
     if not want:
-        return 0
+        return out
     try:
         folders = (list_folders or _hf_list_folders(repo))()
     except Exception as e:  # noqa: BLE001
         log.warning("cannot list revealed snapshots in %s: %s", repo, e)
-        return 0
+        return out
     by_block = {int(m.group(1)): f for f in folders if (m := _BLOCK_RE.search(f))}
-    got = 0
     for b in want:
         folder = by_block.get(b)
         if folder is None:
-            continue                      # not revealed yet (~48h lag)
+            out["unrevealed"].append(b)           # not revealed yet (~48h lag)
+            continue
         try:
             (download or _hf_download(repo))(folder, root)
-            got += 1
+            out["fetched"].append(folder)
         except Exception as e:  # noqa: BLE001
             log.warning("download of %s failed: %s", folder, e)
-    return got
+    return out
 
 
 # --------------------------------------------------------------------------- #

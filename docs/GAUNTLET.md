@@ -77,8 +77,10 @@ population member must pass G3 again or retire. Scores never mix across epochs.
   training at all. Measured: a 15-minute leg lands within ±0.5% of the receipt
   per round, which is larger than the 0.2% screen margin, so this mode can kill
   (or pass) a candidate on round bias alone.
-- `trained`: legacy, re-trains every window round each epoch plus salted legs
-  that measure σ (measured at 0.013%, far below the floor).
+
+Re-training the king under salted seeds measured the seed noise of a
+15-minute leg at 0.013%, far below the 0.2% margin, so the margin is a fixed
+floor (`g2_margin_floor`) rather than a per-epoch calibration.
 
 **The contract:** every replay trains under the round's own signed contract
 (the manifest's `contract_body`, digest-checked), not this checkout's
@@ -94,11 +96,18 @@ Statistical choices, and the failure each one prevents:
 - **One-shot pool C.** G4 compares several finalists, so the best of them clears
   by luck more often. G4.5 measures only the chosen one, once, on data that did
   not exist when it was written.
-- **`g2_explore_frac`.** A fraction of G2 losers go to G3 anyway. Their G3
+- **`g2_explore_frac`** (off by default). A fraction of G2 losers go to G3 anyway. Their G3
   outcomes (`explore` events) show how often the cheap screen kills a real
   improvement.
 - **Infrastructure faults retry and never count against a candidate.** Only a
-  candidate fault (rejected, crashed or stalled generator) kills it.
+  candidate fault (rejected, crashed or stalled generator) kills it. A round
+  this checkout cannot replay faithfully (its windows or contract do not
+  rebuild) is checked on the judge and left out of the window before any pod
+  is rented.
+- **Paid work is never thrown away.** A batch the spend cap stops keeps every
+  completed result; G4 keeps each full-budget leg on the candidate, so a rerun
+  pays only for the missing ones. Finalists and submitted trees are not
+  re-run or re-offered.
 
 ## Compute and spend
 
@@ -204,7 +213,9 @@ on the operator: without it, `DIRECTIVES.md` is just a file you edit by hand.
 
 ```
 gauntlet/
-  state.json              epoch, window, σ and margins, cycle, phase
+  state.json              epoch, window, margins, cycle, phase, progress
+  progress.jsonl          the dethrone progress score after G2, G3 and each cycle
+  king_cache/             the king's same-budget legs, per (king, image, round, budget)
   events.jsonl            epochs, baselines, deaths, members, explore, G4, finalists, G5
   candidates/<id>/        tree/, meta.json (every stage result), ckpt/ (G4)
   epochs/<n>/king/        the king's legs this epoch (scores per round)

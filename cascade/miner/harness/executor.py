@@ -44,6 +44,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 REMOTE_ROOT = "/root/cascade"
 REMOTE_JOBS = "/root/gauntlet"
 REMOTE_PY = f"{REMOTE_ROOT}/.venv/bin/python"
+REMOTE_HARNESS_TOML = f"{REMOTE_ROOT}/harness-chain.toml"
 
 
 def _infra_error(msg: str) -> dict:
@@ -56,12 +57,14 @@ class LocalExecutor:
 
     def __init__(self, workdir: Path, *, max_parallel: int = 1, device: str = "auto",
                  chain_toml: Path | None = None, timeout: float = 8 * 3600.0,
+                 sandbox: bool = False,
                  runner: Callable[[list[str], dict, float], int] | None = None) -> None:
         self.workdir = Path(workdir)
         self.capacity = max_parallel
         self.device = device
         self.chain_toml = chain_toml
         self.timeout = timeout
+        self.sandbox = sandbox
         self._slots = list(range(max_parallel))
         self._lock = threading.Condition()
         self._runner = runner or self._subprocess
@@ -78,6 +81,7 @@ class LocalExecutor:
         params = spec.setdefault("params", {})
         params.setdefault("device", self.device)
         params.setdefault("cache_dir", str(self.workdir / "cache"))
+        params.setdefault("sandbox", self.sandbox)
         if self.chain_toml:
             params.setdefault("chain_toml", str(self.chain_toml))
         (jd / "spec.json").write_text(json.dumps(spec, indent=1), encoding="utf-8")
@@ -195,6 +199,7 @@ class _Pod:
     last_used: float = field(default_factory=time.time)
     code_synced: bool = False
     image: str = ""
+    reserved: float = 0.0             # cap reservation of the job it is running
 
 
 SshFn = Callable[[str, int, str, float], subprocess.CompletedProcess]
@@ -257,11 +262,18 @@ class BudgetExhausted(RuntimeError):
 
 class LiumExecutor:
     def __init__(self, workdir: Path, cfg, *, provider=None, ssh: SshFn | None = None,
-                 transfer=None, now: Callable[[], float] = time.time,
+                 transfer=None, chain_toml: Path | None = None,
+                 now: Callable[[], float] = time.time,
                  sleep: Callable[[float], None] = time.sleep) -> None:
-        """``cfg`` is the ``[compute]`` section (:class:`ComputeConfig`)."""
+        """``cfg`` is the ``[compute]`` section (:class:`ComputeConfig`);
+        ``chain_toml`` (the harness's) is shipped to every pod so jobs run
+        under the same config as the judge."""
         self.workdir = Path(workdir)
         self.cfg = cfg
+        self.chain_toml = Path(chain_toml) if chain_toml else None
+        # Worst-case cost of jobs in flight: reserved against the caps so that
+        # parallel jobs can never jointly overshoot them.
+        self._committed = 0.0
         self.capacity = cfg.max_parallel
         if cfg.daily_usd_cap <= 0 or cfg.max_price_per_hour <= 0:
             raise ValueError("lium executor needs daily_usd_cap > 0 and max_price_per_hour > 0")
@@ -286,10 +298,10 @@ class LiumExecutor:
         self.reconcile()
 
     # -- plumbing ----------------------------------------------------------
-    @staticmethod
-    def _contract_image() -> str:
+    def _contract_image(self) -> str:
         from ...shared.config import load_chain_config
-        img = str(getattr(load_chain_config().round, "funded_pod_image", "") or "")
+        img = str(getattr(load_chain_config(self.chain_toml).round, "funded_pod_image", "")
+                  or "")
         if not img:
             raise ValueError("set [compute] image (a digest-pinned cascade-worker image)")
         return img
@@ -331,8 +343,13 @@ class LiumExecutor:
             self._bad_executors.add(str(machine))
             log.warning("excluding machine %s after pod %s failed", machine, name)
 
-    def _job_cost_bound(self, hours: float) -> float:
-        return hours * self.cfg.max_price_per_hour
+    def _job_hours(self, est_hours: float) -> float:
+        """The longest a job may run: its estimate with slack, never above
+        job_timeout. The SSH call enforces it, so the cap's reservation holds."""
+        return min(self.cfg.job_timeout / 3600.0, est_hours * 1.25 + 0.5)
+
+    def _job_cost_bound(self, est_hours: float) -> float:
+        return self._job_hours(est_hours) * self.cfg.max_price_per_hour
 
     def _launch(self) -> _Pod:
         from ...provision.core import LaunchSpec
@@ -378,31 +395,43 @@ class LiumExecutor:
         return pod
 
     def _acquire(self, est_hours: float) -> _Pod:
+        bound = self._job_cost_bound(est_hours)
         with self._cv:
             while True:
-                # The cap gates EVERY job, a warm pod included: a job keeps its
-                # pod alive, and a live pod bills.
+                # The cap gates EVERY job, a warm pod included (a job keeps its
+                # pod alive, and a live pod bills), and counts the worst case of
+                # every job already running, so parallel jobs cannot overshoot.
+                committed = self._committed + bound
                 spent = self.ledger.spent_today()
-                if spent + self._job_cost_bound(est_hours) > self.cfg.daily_usd_cap:
+                if spent + committed > self.cfg.daily_usd_cap:
                     raise BudgetExhausted(
-                        f"daily cap ${self.cfg.daily_usd_cap:.2f}: ${spent:.2f} accrued, a "
-                        f"{est_hours:.2g}h job may cost ${self._job_cost_bound(est_hours):.2f}")
-                total = self.ledger.spent_total()
+                        f"daily cap ${self.cfg.daily_usd_cap:.2f}: ${spent:.2f} accrued + "
+                        f"${self._committed:.2f} reserved by running jobs + this job's "
+                        f"${bound:.2f}")
                 cap = float(getattr(self.cfg, "total_usd_cap", 0.0) or 0.0)
-                if cap and total + self._job_cost_bound(est_hours) > cap:
+                total = self.ledger.spent_total()
+                if cap and total + committed > cap:
                     raise BudgetExhausted(
-                        f"total cap ${cap:.2f}: ${total:.2f} accrued, a {est_hours:.2g}h job "
-                        f"may cost ${self._job_cost_bound(est_hours):.2f}")
+                        f"total cap ${cap:.2f}: ${total:.2f} accrued + ${self._committed:.2f} "
+                        f"reserved + this job's ${bound:.2f}")
                 idle = [p for p in self._pods.values() if not p.busy]
                 if idle:
                     pod = idle[0]
-                    pod.busy = True
+                    pod.busy, pod.reserved = True, bound
+                    self._committed += bound
                     return pod
                 if len(self._pods) < self.capacity:
+                    self._committed += bound          # reserve before renting
                     break
                 self._cv.wait(timeout=60.0)
-        pod = self._launch()
-        pod.busy = True
+        try:
+            pod = self._launch()
+        except Exception:
+            with self._cv:
+                self._committed -= bound
+                self._cv.notify_all()
+            raise
+        pod.busy, pod.reserved = True, bound
         with self._cv:
             self._pods[pod.name] = pod
         return pod
@@ -425,6 +454,8 @@ class LiumExecutor:
 
     def _release(self, pod: _Pod, *, dead: bool = False) -> None:
         with self._cv:
+            self._committed = max(0.0, self._committed - pod.reserved)
+            pod.reserved = 0.0
             if dead or pod.image != self._image:
                 self._terminate(pod.name)
             else:
@@ -459,6 +490,8 @@ class LiumExecutor:
         for toml in ("chain.toml", "chain.testnet.toml"):
             if ok and (REPO_ROOT / toml).is_file():
                 ok = self.transfer.push(pod, REPO_ROOT / toml, f"{REMOTE_ROOT}/{toml}")
+        if ok and self.chain_toml is not None:
+            ok = self.transfer.push(pod, self.chain_toml, REMOTE_HARNESS_TOML)
         pod.code_synced = ok
         return ok
 
@@ -472,14 +505,14 @@ class LiumExecutor:
             return _infra_error(f"no pod: {e}")
         dead = False
         try:
-            return self._run_on(pod, spec, job_id)
+            return self._run_on(pod, spec, job_id, est_hours)
         except (subprocess.TimeoutExpired, OSError) as e:
             dead = True
             return _infra_error(f"pod {pod.name}: {e}")
         finally:
             self._release(pod, dead=dead)
 
-    def _run_on(self, pod: _Pod, spec: dict, job_id: str) -> dict:
+    def _run_on(self, pod: _Pod, spec: dict, job_id: str, est_hours: float = 1.0) -> dict:
         if not self._sync_code(pod):
             raise OSError("code sync failed")
         rj = f"{REMOTE_JOBS}/{job_id}"
@@ -505,6 +538,8 @@ class LiumExecutor:
         params = remote.setdefault("params", {})
         params.setdefault("device", "cuda")
         params.setdefault("cache_dir", f"{REMOTE_JOBS}/cache")
+        if self.chain_toml is not None:
+            params.setdefault("chain_toml", REMOTE_HARNESS_TOML)
         local_spec = self.workdir / "jobs" / job_id / "spec.remote.json"
         local_spec.parent.mkdir(parents=True, exist_ok=True)
         local_spec.write_text(json.dumps(remote), encoding="utf-8")
@@ -513,7 +548,7 @@ class LiumExecutor:
         cmd = (f"cd {REMOTE_ROOT} && CUBLAS_WORKSPACE_CONFIG=:4096:8 {REMOTE_PY} -m "
                f"cascade.miner.harness.jobs {rj}/spec.json {rj}/result.json "
                f"> {rj}/job.log 2>&1; true")
-        self._ssh(pod.ip, pod.port, cmd, self.cfg.job_timeout)
+        self._ssh(pod.ip, pod.port, cmd, self._job_hours(est_hours) * 3600.0)
         local_result = self.workdir / "jobs" / job_id / "result.json"
         self.transfer.pull_file(pod, f"{rj}/job.log", local_result.with_name("job.log"))
         if not self.transfer.pull_file(pod, f"{rj}/result.json", local_result):
@@ -528,6 +563,7 @@ class LiumExecutor:
 def make_executor(hcfg, workdir: Path):
     c = hcfg.compute
     if c.executor == "lium":
-        return LiumExecutor(workdir, c)
+        return LiumExecutor(workdir, c, chain_toml=hcfg.chain_toml)
     return LocalExecutor(workdir, max_parallel=c.max_parallel, device=c.device,
-                         chain_toml=hcfg.chain_toml, timeout=c.job_timeout)
+                         chain_toml=hcfg.chain_toml, timeout=c.job_timeout,
+                         sandbox=c.local_sandbox)

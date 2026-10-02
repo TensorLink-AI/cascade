@@ -127,8 +127,8 @@ def test_replay_judges_against_the_kings_receipt_scores(rcfg, tmp_path):
 
     much_better = [WindowScore(s.series_id, s.mase * 0.6, s.qloss_per_q * 0.6,
                                s.abs_target, source=s.source) for s in king]
-    assert replay_mod.judge(rr, much_better).challenger_wins_round
-    assert not replay_mod.judge(rr, king).challenger_wins_round
+    assert replay_mod.judge(rr, much_better, rcfg).challenger_wins_round
+    assert not replay_mod.judge(rr, king, rcfg).challenger_wins_round
 
 
 def test_replay_refuses_windows_that_do_not_match_the_receipt(rcfg, tmp_path):

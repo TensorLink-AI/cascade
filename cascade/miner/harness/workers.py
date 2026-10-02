@@ -113,16 +113,14 @@ BRIEF_TITLES = {
 
 
 def build_prompt(*, directives: str, notebook: str, outcomes: list[str], parent: str,
-                 briefs: list[tuple[str, str]] = (), lineage: str = "",
-                 brief_chars: int = 10000) -> str:
+                 briefs: list[tuple[str, str]] = (), brief_chars: int = 10000) -> str:
     """The worker prompt. ``briefs`` are ``(file name, text)`` knowledge files
     (operator/LINEAGE.md, DETHRONES.md, RESEARCH.md), each capped at
     ``brief_chars`` so the prompt stays bounded."""
     rows = "\n".join(outcomes[-25:]) or "(none yet)"
-    items = list(briefs) + ([("LINEAGE.md", lineage)] if lineage.strip() else [])
     knowledge = "".join(
         f"\n## {BRIEF_TITLES.get(name, name)}\n{text.strip()[:brief_chars]}\n"
-        for name, text in items if text.strip())
+        for name, text in briefs if text.strip())
     return (PROMPT
             + knowledge
             + f"\n## Operator directives\n{directives.strip() or '(none)'}\n"

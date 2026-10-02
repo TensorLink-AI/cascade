@@ -43,6 +43,15 @@ def king_from_receipt(doc: dict, *, forfeited: frozenset = frozenset()) -> dict 
             "round_id": str(doc.get("round_id") or "")}
 
 
+def anchor_receipt_text(chain_cfg, *, verified: bool = True) -> str:
+    """The anchor validator's latest public receipt; with ``verified`` its
+    signature must check out against ``[manifest] validator_hotkey``."""
+    text = _anchor_receipt_text(chain_cfg)
+    if verified and not _verify(chain_cfg, text):
+        raise ValueError("anchor receipt signature does not verify")
+    return text
+
+
 def _anchor_receipt_text(chain_cfg) -> str:
     from ...audit.main import _fetch_text
     from ...shared.hippius import receipt_latest_key
