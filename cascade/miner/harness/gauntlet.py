@@ -987,6 +987,8 @@ class Gauntlet:
         for m in self.all_metas():
             if m.get("epoch") != self.epoch and m.get("member_epoch") != self.epoch:
                 continue
+            if m.get("status") not in POPULATION + ("in_gauntlet",):
+                continue        # rejected at a later stage: its early pass no longer counts
             pr = self.candidate_progress(m)
             if pr["score"] > best["score"]:
                 best = {**pr, "id": m["id"]}

@@ -804,3 +804,14 @@ def test_dethrone_progress_is_capped_by_the_deepest_stage(rcfg, tmp_path):
     bar = progress_bar(pr)
     assert bar.startswith("dethrone [" + "█" * 30 + "] 100/100") and "c00001" in bar
     assert progress_bar({"score": 23.4, "id": None}).count("█") == 7
+
+
+def test_progress_ignores_candidates_rejected_later(rcfg, tmp_path):
+    g, _, _, _ = _gauntlet(rcfg, tmp_path, script=[(1.6, 1.0)])
+    g.refresh_window(force=True)
+    g.put({"id": "c00090", "epoch": g.epoch, "status": "dead", "reason": "G3: did not confirm",
+           "stages": {"G2": {"pass": True, "rel": 0.009}, "G3": {"pass": False, "rel": -0.001}}})
+    assert g.progress()["score"] == 0.0                 # passed G2, failed G3: counts nothing
+    g.put({"id": "c00091", "epoch": g.epoch, "status": "in_gauntlet",
+           "stages": {"G2": {"pass": True, "rel": 0.005}}})
+    assert g.progress() == {**g.progress(), "id": "c00091", "score": 20.0, "stage": "G2"}
