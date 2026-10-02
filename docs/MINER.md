@@ -22,7 +22,9 @@ plugs your own search strategy into a verify → score → keep loop
 `:oneclick` tag adds a web UI and a Claude Code proposer
 ([ONE_CLICK_MINING.md](ONE_CLICK_MINING.md)), and `cascade ralph` runs a Ralph
 loop that rewrites your generator's code on Anthropic, Chutes or SayGM models
-([RALPH_MINING.md](RALPH_MINING.md)).
+([RALPH_MINING.md](RALPH_MINING.md)). For an unattended, multi-stage search that
+replays real past rounds on rented GPUs and asks you before it submits, run
+the gauntlet ([GAUNTLET_QUICKSTART.md](GAUNTLET_QUICKSTART.md)).
 
 Rounds run every 12 h (boundaries ≈ 08:30 and 20:30 UTC). Mainnet is netuid 91.
 The intake is `https://submissions.cascadesub.net`.
@@ -142,11 +144,47 @@ cascade score ./king   --pool-dir ./my-heldout --warm-start live
 cascade score ./my-gen --pool-dir ./my-heldout --warm-start live
 ```
 
+`cascade score`, `cascade mine` and `cascade ralph` train under the **live**
+contract by default: the signed contract of the latest round (from the anchor
+validator's public receipt), which can differ from this checkout's
+`chain.toml`. The first line printed says which (`--contract local` forces
+`chain.toml`).
+
 The number is directional. Validators score on a private pool you never see,
 so use the local score to hill-climb, not as the verdict, and rotate your pool
 so you do not overfit it. `--warm-start live` trains from the init the current
 round uses; without it you train from random init, which ranks generators
 differently.
+
+### Replay a past round
+
+`--pool-dir` scoring draws single-horizon windows. The verdict draws the
+scored horizon ladder (`[eval] scored_horizons`) split evenly by domain.
+`--replay-round` scores exactly the way a past round was judged. Retired pool
+snapshots are revealed byte-for-byte, about 48h after they retire, at
+[Tensor-Link/cascade-eval-pool](https://huggingface.co/datasets/Tensor-Link/cascade-eval-pool).
+Each round's signed receipt carries its seeds, its window ids and the king's
+per-window scores:
+
+```bash
+# local copy of the revealed snapshots (folders snapshots/<as_of>-block-<N>/)
+huggingface-cli download Tensor-Link/cascade-eval-pool --repo-type dataset \
+    --include "snapshots/2026-09-2*" --local-dir ./eval-pool
+cascade score ./my-gen --replay-round <round_id> --snapshot-root ./eval-pool --device cuda
+```
+
+The replay trains only your generator, with the round's init, seeds and
+contract. It rebuilds the round's verdict windows and refuses to score unless
+they match the receipt's `window_ids`. It then judges you against the king's
+signed scores under the round's recorded margin rules. The king is never
+retrained. Without `--train-hours` it trains the full contract and prints a
+verdict. With `--train-hours` it prints the score but no verdict, because a
+short leg against a full-budget king measures the budget, not the data.
+
+It is still directional: your leg runs on your hardware, the king's ran on the
+operator's (the output names its GPU), and you are judged as the round's only
+challenger. Replaying the king's own generator against its receipt measures
+that gap.
 
 ## 4. Register a hotkey
 

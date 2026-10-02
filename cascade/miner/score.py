@@ -161,9 +161,6 @@ def score_generator(
     """
     from ..eval.scoring import global_geomean
     from ..trainer.contract import RoundSeeds
-    from ..trainer.main import _load_trainer
-    from ..trainer.stream import open_round_stream
-    from ..validator.evaluator import evaluate_checkpoint
 
     repo = Path(repo_dir)
     hours = train_hours if train_hours is not None else cfg.round.heat_train_hours
@@ -189,13 +186,52 @@ def score_generator(
         raise ValueError("scoring pool produced no windows (check --pool-dir / --pool contents)")
 
     ws_dir, init_label = _resolve_warm_start(cfg, warm_start, cache_dir=cache)
-    train_kwargs = {"warm_start_dir": ws_dir} if ws_dir is not None else {}
+    run = train_and_evaluate(
+        repo, cfg, contract=contract, token_budget=token_budget, seeds=seeds,
+        windows=windows, warm_start_dir=ws_dir, init_label=init_label, device=device,
+        cache=cache, trainer_spec=trainer_spec, hours_label=f"{hours:.3g}h",
+    )
+    return ScoreResult(
+        geomean=global_geomean(run.scores),
+        n_windows=len(run.scores),
+        corpus_digest=run.corpus_digest,
+        n_series=run.n_series,
+        train_seconds=run.train_seconds,
+        pool_label=pool_label,
+        init_label=init_label,
+    )
 
+
+@dataclass(frozen=True)
+class TrainEvalRun:
+    scores: list            # per-window WindowScore, in window order
+    corpus_digest: str
+    n_series: int
+    train_seconds: float
+
+
+def train_and_evaluate(
+    repo: Path, cfg, *, contract, token_budget: int, seeds, windows: list,
+    warm_start_dir: Path | None, init_label: str, device: str, cache: Path,
+    trainer_spec: str, hours_label: str, keep_dir: Path | None = None,
+) -> TrainEvalRun:
+    """Train the fixed model on ``repo``'s corpus under ``contract`` and score the
+    checkpoint on ``windows``. The shared core of :func:`score_generator` and the
+    round replay (:mod:`cascade.miner.replay`), so both train and evaluate
+    through the identical path. ``keep_dir`` keeps the trained checkpoint there
+    (default: a temp dir, deleted after scoring)."""
+    import shutil
+
+    from ..trainer.main import _load_trainer
+    from ..trainer.stream import open_round_stream
+    from ..validator.evaluator import evaluate_checkpoint
+
+    train_kwargs = {"warm_start_dir": warm_start_dir} if warm_start_dir is not None else {}
     base_trainer = _load_trainer(trainer_spec)
     with tempfile.TemporaryDirectory(dir=cache, prefix="ckpt-") as td:
         out_dir = Path(td)
-        log.info("training on %s at %.3gh (%s point-passes) from %s …",
-                 repo.name, hours, f"{token_budget:,}", init_label)
+        log.info("training on %s at %s (%s point-passes) from %s …",
+                 repo.name, hours_label, f"{token_budget:,}", init_label)
         with open_round_stream(
             contract.corpus_mode, repo, seeds.generation_seed, cfg.generator,
             token_budget=token_budget, use_sandbox=False,      # local, trusted-own-code path
@@ -212,13 +248,8 @@ def score_generator(
         scores = evaluate_checkpoint(
             result.local_dir, windows, num_samples=cfg.eval.num_samples, device=device
         )
-
-    return ScoreResult(
-        geomean=global_geomean(scores),
-        n_windows=len(scores),
-        corpus_digest=corpus_digest,
-        n_series=n_series,
-        train_seconds=result.train_seconds,
-        pool_label=pool_label,
-        init_label=init_label,
-    )
+        if keep_dir is not None:
+            shutil.rmtree(keep_dir, ignore_errors=True)
+            shutil.copytree(result.local_dir, keep_dir)
+    return TrainEvalRun(scores=list(scores), corpus_digest=corpus_digest,
+                        n_series=n_series, train_seconds=result.train_seconds)

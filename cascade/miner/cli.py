@@ -115,6 +115,7 @@ chain/network failure, 4 = registry upload/fetch failure.
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
@@ -221,17 +222,51 @@ def _add_score(sub: argparse._SubParsersAction) -> None:
                         "local checkpoint dir. Default: random init.")
     p.add_argument("--skip-verify", action="store_true",
                    help="Skip the pre-score determinism/guard check.")
+    p.add_argument("--contract", choices=("live", "local"), default="live",
+                   help="Training contract to score under: 'live' (default) = the latest "
+                        "published manifest's signed contract, which can differ from this "
+                        "checkout's chain.toml; 'local' = chain.toml as is.")
+    p.add_argument("--replay-round", default=None, metavar="ROUND_ID|latest|RECEIPT.json",
+                   help="Replay a past scored round: train this generator with the round's "
+                        "init, seeds and contract, score it on the round's exact verdict "
+                        "windows, and judge it against the king's signed receipt scores. "
+                        "Needs --snapshot-root. Replaces --pool-dir/--pool/--warm-start/"
+                        "--seed/--n-windows; without --train-hours it trains the FULL contract.")
+    p.add_argument("--snapshot-root", type=Path, default=None,
+                   help="Local copy of the revealed eval pool (a snapshot folder, its "
+                        "snapshots/ dir, or the dataset checkout) for --replay-round.")
+    p.add_argument("--validator", default="", metavar="HOTKEY",
+                   help="Read --replay-round's receipt from this validator's namespace.")
     p.set_defaults(func=_cmd_score)
 
 
 def _cmd_score(args: argparse.Namespace) -> int:
     cfg = load_chain_config(args.chain_toml)
+    if args.replay_round is not None:
+        clash = [f for f, v in (("--pool-dir", args.pool_dir), ("--pool", args.pool_ref),
+                                ("--warm-start", args.warm_start),
+                                ("--n-windows", args.n_windows)) if v]
+        if clash or args.seed != 0:
+            print(f"error: --replay-round takes the pool, init, seeds and windows from the "
+                  f"round; drop {', '.join(clash + (['--seed'] if args.seed else []))}",
+                  file=sys.stderr)
+            return 2
+        if args.snapshot_root is None:
+            print("error: --replay-round needs --snapshot-root (the revealed eval pool)",
+                  file=sys.stderr)
+            return 2
     if not args.skip_verify:
         report = verify_repo(args.repo_dir, cfg, skip_runtime=False)
         if not report.ok:
             print("verify failed — fix before scoring:", file=sys.stderr)
             print(report.render(), file=sys.stderr)
             return 1
+    if args.replay_round is not None:
+        return _cmd_score_replay(args, cfg)
+    if args.contract == "live":
+        from .live_contract import describe, with_live_contract
+        cfg, info = with_live_contract(cfg)
+        print(describe(info))
     try:
         r = _run_score(args, cfg)
     except ImportError as e:
@@ -250,6 +285,44 @@ def _cmd_score(args: argparse.Namespace) -> int:
         f"\ncompare against the king:  cascade fetch king --out ./king && "
         f"cascade score ./king {same}"
     )
+    return 0
+
+
+def _cmd_score_replay(args: argparse.Namespace, cfg) -> int:
+    from .replay import ReplayError, load_receipt_spec, load_replay_round, score_replay
+
+    try:
+        receipt = load_receipt_spec(args.replay_round, cfg, validator_hotkey=args.validator)
+        rr = load_replay_round(cfg, receipt, args.snapshot_root)
+        r = score_replay(args.repo_dir, cfg, rr, train_hours=args.train_hours,
+                         device=args.device)
+    except ReplayError as e:
+        print(f"replay refused: {e}", file=sys.stderr)
+        return 1
+    except ImportError as e:
+        print(f"error: `cascade score` needs the [train] extra (torch): {e}", file=sys.stderr)
+        return 2
+    except Exception as e:  # noqa: BLE001 — surface any train/eval failure cleanly
+        print(f"replay failed: {type(e).__name__}: {e}", file=sys.stderr)
+        return 1
+    rel = (r.king_geomean - r.geomean) / r.king_geomean if r.king_geomean else float("nan")
+    lines = [
+        f"\nreplay round {r.round_id}: geomean={r.geomean:.5f}  king={r.king_geomean:.5f}  "
+        f"({rel:+.2%} vs king, positive = better)",
+        f"  windows: {r.n_windows} (the round's exact verdict draw, verified)",
+        f"  init:    {r.init_label}",
+        f"  trained: {r.train_seconds:.0f}s  (king's leg ran on {r.king_gpu or 'unknown GPU'})",
+    ]
+    if r.verdict is None:
+        lines.append("  verdict: none — a --train-hours leg is not comparable with the "
+                     "full-budget king; drop --train-hours to judge")
+    else:
+        v = r.verdict
+        outcome = ("inconclusive" if v.inconclusive
+                   else "WOULD DETHRONE" if v.challenger_wins_round else "king holds")
+        lines.append(f"  verdict: {outcome}  (LCB {v.lcb:+.4f} vs margin {v.margin:.4f}, "
+                     "as the round's only challenger — directional, not the chain's verdict)")
+    print("\n".join(lines))
     return 0
 
 
@@ -327,6 +400,25 @@ def _resolve_fetch_ref(target: str, cfg, network: str) -> tuple[str, str]:
     return ref, label
 
 
+def fetch_generator(ref: str, out: Path, cfg) -> Path:
+    """Download the generator at ``ref`` (Hub ``repo@digest`` or a direct
+    ``vault/direct@…`` submission) into ``out``; raises ``StorageError``."""
+    import os
+
+    from ..funding.store import CHAMPION_BASE_ENV, is_vault_ref
+    from ..shared.hippius import HubConfig, fetch_from_hub
+
+    if is_vault_ref(ref) and not os.environ.get(CHAMPION_BASE_ENV):
+        # A direct (vault) submission resolves publicly ONLY through the
+        # published champions/ objects — point the fetch at the same
+        # anonymous endpoint the dashboards read.
+        endpoint = str(getattr(cfg.storage, "s3_endpoint", "") or "").rstrip("/")
+        bucket = str(getattr(cfg.storage, "manifest_bucket", "") or "")
+        if endpoint and bucket:
+            os.environ[CHAMPION_BASE_ENV] = f"{endpoint}/{bucket}"
+    return fetch_from_hub(ref, out, HubConfig.from_storage(cfg.storage))
+
+
 def _cmd_fetch(args: argparse.Namespace) -> int:
     cfg = load_chain_config(args.chain_toml)
     from ..shared.chain import ChainError
@@ -342,21 +434,11 @@ def _cmd_fetch(args: argparse.Namespace) -> int:
 
     out = args.out or Path(f"./fetched-{label}")
     print(f"fetching {ref}\n  → {out}")
-    import os
+    from ..funding.store import is_vault_ref
+    from ..shared.hippius import StorageError
 
-    from ..funding.store import CHAMPION_BASE_ENV, is_vault_ref
-    from ..shared.hippius import HubConfig, StorageError, fetch_from_hub
-
-    if is_vault_ref(ref) and not os.environ.get(CHAMPION_BASE_ENV):
-        # A direct (vault) submission resolves publicly ONLY through the
-        # published champions/ objects — point the fetch at the same
-        # anonymous endpoint the dashboards read.
-        endpoint = str(getattr(cfg.storage, "s3_endpoint", "") or "").rstrip("/")
-        bucket = str(getattr(cfg.storage, "manifest_bucket", "") or "")
-        if endpoint and bucket:
-            os.environ[CHAMPION_BASE_ENV] = f"{endpoint}/{bucket}"
     try:
-        dest = fetch_from_hub(ref, out, HubConfig.from_storage(cfg.storage))
+        dest = fetch_generator(ref, out, cfg)
     except StorageError as e:
         if is_vault_ref(ref):
             print("fetch failed: this is a direct (private) submission and its "
@@ -1344,6 +1426,10 @@ def _mine_args(p: argparse.ArgumentParser, *, proposer_default: str,
     from .optimize import DEFAULT_AGENT_CMD, PROPOSERS
     from .ralph import PROVIDERS
 
+    p.add_argument("--contract", choices=("live", "local"), default="live",
+                   help="Score under the live trainer's signed contract (default) or the "
+                        "local chain.toml.")
+
     p.add_argument("--workdir", type=Path, default=Path("./mine-run"),
                    help="Run directory (state.json, history.jsonl, candidates/, best/). "
                         "Re-running on the same workdir resumes from its best.")
@@ -1469,12 +1555,15 @@ def _cmd_ralph(args: argparse.Namespace) -> int:
 
 
 def _cmd_mine(args: argparse.Namespace) -> int:
-    import logging
 
     from .optimize import OptimizationLoop, WorkdirBusy
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     cfg = load_chain_config(args.chain_toml)
+    if getattr(args, "contract", "local") == "live":
+        from .live_contract import describe, with_live_contract
+        cfg, info = with_live_contract(cfg)
+        print(describe(info))
     try:
         lc = _loop_config(args)
         loop = OptimizationLoop(lc, chain_cfg=cfg)
@@ -1541,7 +1630,12 @@ def main(argv: list[str] | None = None) -> int:
     _add_mine(sub)
     _add_ralph(sub)
     _add_mine_ui(sub)
+    from .harness.cli import add_gauntlet
+    add_gauntlet(sub)
     args = parser.parse_args(argv)
+    if args.cmd == "gauntlet":
+        from .harness import install_logging
+        install_logging()
     return int(args.func(args))
 
 

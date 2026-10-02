@@ -59,10 +59,17 @@ class ProviderPreset:
 # Providers move these. `cascade ralph --check` tells you if one is wrong, and
 # --llm-base-url overrides it.
 PRESETS: dict[str, ProviderPreset] = {
-    "chutes": ProviderPreset("https://llm.chutes.ai", "CHUTES_API_KEY", "bearer"),
+    # Verified 2026-10-01: Chutes serves Anthropic Messages on claude.chutes.ai
+    # (llm.chutes.ai is its OpenAI-compatible host and 404s /v1/messages). It
+    # always answers as an SSE stream, which Claude Code consumes natively.
+    "chutes": ProviderPreset("https://claude.chutes.ai", "CHUTES_API_KEY", "bearer"),
     "saygm": ProviderPreset("https://api.saygm.com", "SAYGM_API_KEY", "bearer"),
+    # Engy (engy.ai/docs): an Anthropic-compatible gateway (Kimi, GLM, Qwen,
+    # DeepSeek, …) documented for Claude Code as ANTHROPIC_BASE_URL + a bearer
+    # ANTHROPIC_AUTH_TOKEN; model ids such as "kimi-k3".
+    "engy": ProviderPreset("https://api.engy.ai", "ENGY_API_KEY", "bearer"),
 }
-PROVIDERS = ("anthropic", "chutes", "saygm", "custom")
+PROVIDERS = ("anthropic", "chutes", "saygm", "engy", "custom")
 
 
 @dataclass(frozen=True)
@@ -183,6 +190,32 @@ def resolve_provider(cfg: LoopConfig) -> Provider:
     return Provider(name, base_url=base, model=cfg.llm_model, key_env=key_env, auth=auth)
 
 
+def _sse_message(raw: bytes) -> dict:
+    """Fold an Anthropic Messages SSE stream into the non-streaming shape."""
+    msg: dict = {}
+    blocks: dict[int, dict] = {}
+    for line in raw.decode("utf-8", "replace").splitlines():
+        if not line.startswith("data:"):
+            continue
+        try:
+            ev = json.loads(line[5:].strip())
+        except ValueError:
+            continue
+        t = ev.get("type")
+        if t == "message_start":
+            msg = dict(ev.get("message") or {})
+        elif t == "content_block_start":
+            blocks[ev.get("index", 0)] = dict(ev.get("content_block") or {})
+        elif t == "content_block_delta":
+            b = blocks.setdefault(ev.get("index", 0), {"type": "text", "text": ""})
+            d = ev.get("delta") or {}
+            if d.get("type") == "text_delta":
+                b["text"] = b.get("text", "") + d.get("text", "")
+    if msg:
+        msg["content"] = [blocks[i] for i in sorted(blocks)]
+    return msg
+
+
 def preflight(provider: Provider, *, timeout: float = 60.0) -> tuple[bool, str]:
     """One tiny Messages request through the exact URL/auth/model Claude Code will
     use, with a diagnosis instead of a stack trace. ``anthropic`` only checks the CLI."""
@@ -192,8 +225,10 @@ def preflight(provider: Provider, *, timeout: float = 60.0) -> tuple[bool, str]:
     if provider.name == "anthropic":
         return True, "claude CLI found; using Claude Code's own login / ANTHROPIC_API_KEY"
     url = provider.base_url + "/v1/messages"
+    # Claude Code strips a "[1m]"-style context suffix before sending; so do we.
+    model = __import__("re").sub(r"\[[0-9]+[km]\]$", "", provider.model)
     body = json.dumps({
-        "model": provider.model, "max_tokens": 16,
+        "model": model, "max_tokens": 16,
         "messages": [{"role": "user", "content": "Reply with the word OK."}],
     }).encode()
     headers = {"content-type": "application/json", "anthropic-version": "2023-06-01"}
@@ -204,7 +239,11 @@ def preflight(provider: Provider, *, timeout: float = 60.0) -> tuple[bool, str]:
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            doc = json.loads(r.read() or b"{}")
+            raw = r.read() or b"{}"
+            ctype = r.headers.get("content-type", "")
+        # Some endpoints (Chutes) stream even without "stream": true; Claude Code
+        # streams anyway, so an SSE reply is a valid Messages endpoint.
+        doc = _sse_message(raw) if "event-stream" in ctype else json.loads(raw)
     except urllib.error.HTTPError as e:
         detail = e.read()[:300].decode("utf-8", "replace")
         hint = {

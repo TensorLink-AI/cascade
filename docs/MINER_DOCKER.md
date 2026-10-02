@@ -11,6 +11,7 @@ scoring, the loop and the submission.
 |---|---|---|
 | `ghcr.io/tensorlink-ai/cascade-miner:latest` | `toolbox` | the miner CLI; no UI, no LLM |
 | `ghcr.io/tensorlink-ai/cascade-miner:oneclick` | `oneclick` | toolbox + Claude Code + the web UI ([ONE_CLICK_MINING.md](ONE_CLICK_MINING.md)) |
+| `cascade-miner:harness` (built locally by `deploy/harness/docker-compose.yml`) | `harness` | toolbox + the Lium CLI and SSH: the gauntlet judge ([GAUNTLET.md](GAUNTLET.md)) |
 
 `.github/workflows/publish-miner.yml` keeps these tags fresh. `:latest` and
 `:oneclick` are rebuilt whenever a change that affects the image lands on

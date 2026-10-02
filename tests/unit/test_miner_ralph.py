@@ -139,7 +139,7 @@ prompt = sys.stdin.read()
 log = pathlib.Path(os.environ["CASCADE_FAKE_LOG"])
 assert "Ralph: improve this cascade generator" in prompt
 assert "This iteration: #" in prompt
-assert os.environ["ANTHROPIC_BASE_URL"] == "https://llm.chutes.ai"
+assert os.environ["ANTHROPIC_BASE_URL"] == "https://claude.chutes.ai"
 assert os.environ["ANTHROPIC_MODEL"] == "org/Coder-1"
 assert os.environ["ANTHROPIC_AUTH_TOKEN"] == "sk-test"
 assert "--max-turns" in sys.argv and "7" in sys.argv
@@ -258,3 +258,23 @@ def test_third_party_agent_env_is_an_allowlist(tmp_path):
     env = ralph.agent_base_env(p, tmp_path, environ=src)
     assert set(env) == {"PATH", "HTTPS_PROXY", "CASCADE_WORKDIR", "CLAUDE_CONFIG_DIR"}
     assert env["CLAUDE_CONFIG_DIR"] == str(tmp_path / ".claude-agent")
+
+
+def test_sse_stream_counts_as_a_messages_reply():
+    raw = (b'event: message_start\ndata: {"type":"message_start","message":{"type":"message",'
+           b'"content":[]}}\n\nevent: content_block_start\ndata: {"type":"content_block_start",'
+           b'"index":0,"content_block":{"type":"text","text":""}}\n\nevent: content_block_delta\n'
+           b'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta",'
+           b'"text":"OK"}}\n\n')
+    doc = ralph._sse_message(raw)
+    assert doc["type"] == "message" and doc["content"][0]["text"] == "OK"
+
+
+def test_engy_and_chutes_presets(monkeypatch):
+    monkeypatch.setenv("ENGY_API_KEY", "k")
+    p = ralph.resolve_provider(opt.LoopConfig(workdir=Path("x"), start_dir=Path("y"),
+                                              llm_provider="engy", llm_model="kimi-k3"))
+    env = p.claude_env()
+    assert env["ANTHROPIC_BASE_URL"] == "https://api.engy.ai"
+    assert env["ANTHROPIC_AUTH_TOKEN"] == "k" and env["ANTHROPIC_MODEL"] == "kimi-k3"
+    assert ralph.PRESETS["chutes"].base_url == "https://claude.chutes.ai"

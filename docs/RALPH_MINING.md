@@ -48,12 +48,13 @@ same workdir resumes, including the notebook.
 | `--llm-provider` | Endpoint (Claude Code appends `/v1/messages`) | Key |
 |---|---|---|
 | `anthropic` | Claude Code's own login | `claude login` or `ANTHROPIC_API_KEY` |
-| `chutes` | `https://llm.chutes.ai` | `$CHUTES_API_KEY` |
+| `chutes` | `https://claude.chutes.ai` (verified; streams) | `$CHUTES_API_KEY` |
+| `engy` | `https://api.engy.ai` ([engy.ai/docs](https://engy.ai/docs); e.g. `kimi-k3`) | `$ENGY_API_KEY` |
 | `saygm` | `https://api.saygm.com` | `$SAYGM_API_KEY` |
 | `custom` | `--llm-base-url` | `--llm-key-env NAME` |
 
-The chutes and saygm URLs are best-known presets, not verified from this
-repo. **Run `--check` first.** It sends one Messages request through the
+The chutes URL was verified on 2026-10-01; the saygm URL is a best-known
+preset, not verified from this repo. **Run `--check` first.** It sends one Messages request through the
 exact URL, auth and model Claude Code will use, and names the problem: a
 wrong path (404), a bad key (401/403, or try `--llm-auth x-api-key`), an
 unknown model (400), no credit (429), or an endpoint that only speaks

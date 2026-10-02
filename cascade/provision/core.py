@@ -903,6 +903,8 @@ class LiumProvider:
     default_wall_seconds: float = 0.0
     # pod name → SKU it was launched on (sku_choices launches).
     _sku_by_name: dict = field(default_factory=dict, repr=False)
+    # pod name → listed $/h of the executor it launched on (spend accounting).
+    _price_by_name: dict = field(default_factory=dict, repr=False)
 
     def _subprocess_env(self) -> dict[str, str] | None:
         """Child env for CLI calls: the payer's key layered over ours, or None.
@@ -1061,6 +1063,11 @@ class LiumProvider:
         offers.sort(key=lambda o: (o[0], o[1], skus.index(o[2])))
         return [(sku, e) for _, _, sku, e in offers]
 
+    def price_of(self, pod_id: str) -> float | None:
+        """Listed $/h of the executor a pod launched on (this process's
+        launches only); None when the listing carried no price."""
+        return self._price_by_name.get(pod_id)
+
     def sku_of(self, pod_id: str) -> str:
         """GPU type a pod launched through ``sku_choices`` landed on (this
         process's launches only); "" when unknown."""
@@ -1162,6 +1169,7 @@ class LiumProvider:
                      if executor_price_per_hour(ex) is not None else "")
             self._executor_by_name[name] = str(ex.get("id"))
             self._sku_by_name[name] = landed
+            self._price_by_name[name] = executor_price_per_hour(ex)
             names.append(name)
         return names
 

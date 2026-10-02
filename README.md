@@ -175,6 +175,11 @@ Miner (`cascade`, no GPU):
   how much), and whether your reveal landed.
 - `fetch king | <uid> | <hotkey> | <repo@digest>`: download a public
   generator.
+- `score <dir> --replay-round <id> --snapshot-root <pool>`: replay a past round
+  exactly and judge your generator against that round's king.
+- `gauntlet run`: the long-running mining harness (LLM workers, staged
+  replays on Lium, approval-gated submission). Setup:
+  [docs/GAUNTLET_QUICKSTART.md](docs/GAUNTLET_QUICKSTART.md).
 
 Operator and validator:
 
