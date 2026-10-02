@@ -1,0 +1,19 @@
+# Build the stack's images from this checkout instead of pulling CI's:
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+# (Stop the updater first, or it will swap these back for the published images:
+#  docker compose stop updater.)
+
+x-image: &image_build
+  context: ../..
+  dockerfile: deploy/miner.Dockerfile
+
+services:
+  judge:
+    image: cascade-miner:harness
+    build: { <<: *image_build, target: harness }
+  worker:
+    image: cascade-miner:oneclick
+    build: { <<: *image_build, target: oneclick }
+  operator:
+    image: cascade-gauntlet-operator
+    build: { context: ./hermes }

@@ -1,0 +1,11 @@
+# Worker-container config: ONLY the [workers] section matters here. The worker
+# sees the proposal queue (/queue) and nothing else of the gauntlet.
+workdir = "/queue-home"
+
+[workers]
+mode            = "queue"
+queue_dir       = "/queue"
+llm_provider    = "engy"          # anthropic | chutes | saygm | engy | custom (same as harness.toml)
+llm_model       = "kimi-k3[1m]"       # a model your provider serves
+agent_max_turns = 120
+agent_timeout   = 1800

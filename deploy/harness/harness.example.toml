@@ -1,0 +1,64 @@
+# cascade mining gauntlet — docs/GAUNTLET.md
+# Relative paths resolve against THIS file's directory. In the compose stack
+# this file is /work/harness.toml, so "gauntlet" is /work/gauntlet.
+
+workdir   = "gauntlet"
+start_dir = "/opt/cascade/champions/king"   # first parent (inside the image)
+king_dir  = "/opt/cascade/champions/king"   # fallback until the first live fetch
+king_source = "live"                        # follow the anchor validator's signed receipt
+
+[rounds]
+snapshot_root = "eval-pool"                 # local copy of Tensor-Link/cascade-eval-pool
+sync_via      = "local"                     # "executor" if this host cannot reach huggingface.co
+hf_repo       = "Tensor-Link/cascade-eval-pool"
+sync_reveals  = true                        # download newly revealed folders as receipts need them
+n_a           = 6                           # pool A: search rounds
+n_b           = 2                           # pool B: newest rounds, confirm (pass/fail only)
+
+[stages]
+reference         = "cached"                # king leg per (round, budget) trained once; "receipt" = no king training
+g1_throughput_tol = 0.10                    # may be at most 10 % slower than the king
+g2_hours          = 0.25                    # screen budget
+g2_margin_floor   = 0.002                   # margins never go below 0.2 %
+g2_explore_frac   = 0.1                     # G2 losers sent on anyway (measures what G2 kills)
+g3_hours          = 1.0
+calib_salts       = 2                       # king re-runs per epoch that measure noise
+g4_every_cycles   = 3
+g4_finalists      = 2
+g4_rounds         = 3                       # newest rounds replayed at the FULL contract
+g4_min_wins       = 2                       # rounds whose own rule the finalist must clear
+g45_enabled       = true                    # one-shot on a pool built today (needs network)
+
+[search]
+population_k        = 4
+proposals_per_cycle = 4
+max_cycles          = 0                     # 0 = until `cascade gauntlet stop`
+
+[compute]
+executor           = "lium"                 # or "local" (this machine's GPU)
+max_parallel       = 4                      # concurrent pods (or local GPUs)
+daily_usd_cap      = 40.0                   # REQUIRED for lium: hard daily ceiling
+total_usd_cap      = 0                      # optional lifetime ceiling across days (0 = none)
+max_price_per_hour = 1.10                   # REQUIRED for lium: never rent above (pods are billed at their real price)
+sku                = "L40S"
+sku_choices        = ["L40S", "RTX6000", "RTX4090", "A100", "H100"]   # cheapest available wins; no Blackwell (pinned torch)
+idle_minutes       = 20
+ssh_key            = "/run/secrets/gauntlet_ssh"   # + .pub; `ssh-keygen -t ed25519 -f …`
+# image = "ghcr.io/tensorlink-ai/cascade-worker:…@sha256:…"   # default: the image the newest round's signed contract names
+
+[workers]
+mode            = "queue"                   # "inline" without docker compose
+llm_provider    = "engy"                    # anthropic | chutes | saygm | engy | custom
+llm_model       = "kimi-k3[1m]"                 # a strong coding model your provider serves
+agent_max_turns = 120
+agent_timeout   = 1800
+
+[submit]
+mode        = "approval"                    # off | approval | autonomous
+intake      = "https://submissions.cascadesub.net"
+wallet_name = ""
+hotkeys     = []                            # autonomous: a pool of UNUSED hotkeys
+margin      = 0.01                          # pool-C improvement required to auto-submit
+max_per_day = 1
+notify_url  = ""                            # optional webhook (JSON POST) for G5 events
+label       = "gauntlet"

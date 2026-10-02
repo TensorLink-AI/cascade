@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Smoke-test a built cascade-miner image BEFORE it is pushed (CI) or used.
 #
-#   deploy/miner-smoke.sh <image> [toolbox|oneclick]
+#   deploy/miner-smoke.sh <image> [toolbox|oneclick|harness]
 #
 # Exercises the real entrypoint, CLI, admission checks, the mine loop with the
 # shipped example strategy (scoring stubbed: a real score is GPU-minutes), the
-# UI, and for `oneclick` the Claude Code CLI. Exits non-zero on the first failure.
+# UI, a full gauntlet cycle on synthetic rounds, for `oneclick` the Claude Code
+# CLI and for `harness` the Lium CLI + SSH. Exits non-zero on the first failure.
 set -euo pipefail
 
-IMG="${1:?usage: miner-smoke.sh <image> [toolbox|oneclick]}"
+IMG="${1:?usage: miner-smoke.sh <image> [toolbox|oneclick|harness]}"
 TARGET="${2:-toolbox}"
 WORK="$(mktemp -d)"
 UI_NAME="cascade-miner-smoke-$$"
@@ -23,7 +24,7 @@ step "build provenance"
 run "$IMG" python -c 'import os; s = os.environ.get("CASCADE_MINER_BUILD_SHA", ""); print(s); assert s and s != "unknown"'
 
 step "CLI subcommands parse"
-for sub in verify score fetch mine ralph submit mine-ui; do
+for sub in verify score fetch mine ralph submit mine-ui gauntlet; do
   run "$IMG" "$sub" --help >/dev/null
 done
 
@@ -52,6 +53,13 @@ print("loop ok:", [(r["iteration"], r["status"], round(r["score"], 3)) for r in 
 EOF
 run "$IMG" python /work/smoke_mine.py
 
+step "gauntlet: one full cycle on synthetic rounds (fake compute, no GPU/LLM)"
+run "$IMG" gauntlet selftest | grep -q "gauntlet selftest OK"
+
+step "gauntlet: init writes a config that passes its own validation"
+run "$IMG" gauntlet init --dir /work/g >/dev/null
+run "$IMG" python -c 'from cascade.miner.harness.config import load_harness_config as l; l("/work/g/harness.toml")'
+
 step "ralph preflight fails cleanly without a key"
 if run -e CASCADE_NO_DOTENV=1 "$IMG" ralph --llm-provider chutes --llm-model m --check 2>"$WORK/err"; then
   echo "expected a missing-key error"; exit 1
@@ -74,6 +82,11 @@ if [ "$TARGET" = "oneclick" ]; then
   step "oneclick: Claude Code + skill present"
   run "$IMG" claude --version
   run "$IMG" bash -c 'test -f /root/.claude/skills/cascade-mine/SKILL.md'
+fi
+
+if [ "$TARGET" = "harness" ]; then
+  step "harness: Lium CLI + SSH client present"
+  run "$IMG" bash -c 'lium --help >/dev/null && command -v ssh && command -v tar'
 fi
 
 printf '\nsmoke OK: %s (%s)\n' "$IMG" "$TARGET"

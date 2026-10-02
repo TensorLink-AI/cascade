@@ -1,0 +1,93 @@
+# cascade mining gauntlet — docs/GAUNTLET.md
+#
+#   cd deploy/harness
+#   mkdir -p work secrets && cp harness.example.toml work/harness.toml   # then edit it
+#   ssh-keygen -t ed25519 -N '' -f secrets/gauntlet_ssh                  # pod access key
+#   cp .env.example .env && sed -i "s|^STACK_DIR=.*|STACK_DIR=$PWD|" .env   # keys, then edit
+#   docker compose pull && docker compose up -d
+#   docker compose exec judge cascade gauntlet status --config /work/harness.toml
+#
+# Images are the ones CI publishes (publish-miner.yml, publish-gauntlet-operator.yml),
+# rebuilt on every relevant change to main, every king change and weekly. To
+# build from this checkout instead:
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+#
+# Four containers, four trust levels. Each sees only what its job needs:
+#
+#   judge     the deterministic gauntlet. Holds LIUM_API_KEY, the pod SSH key,
+#             the receipts and the eval-pool copies. Never runs an LLM.
+#   worker    Claude Code on your LLM provider. Sees ONLY the proposal queue:
+#             no pool data, no receipts, no Lium key, no wallet.
+#   operator  Hermes Agent. Sees ONLY <workdir>/operator: status in, directives
+#             and reports out. No keys beyond its own LLM endpoint.
+#   updater   pulls new images every UPDATE_INTERVAL_SECONDS and recreates the
+#             stack on them, but only after the judge parks BETWEEN cycles
+#             (never mid-job). It holds the Docker socket, which is root on this
+#             host; remove the service (or `docker compose stop updater`) to
+#             update by hand with the same handshake: `./updater.sh --once`.
+#
+# The wallet is mounted nowhere by default. To submit from the judge (approval
+# via `cascade gauntlet approve`, or [submit] mode = "autonomous"), uncomment its
+# read-only mount below.
+
+name: cascade-gauntlet
+
+services:
+  judge:
+    image: ${JUDGE_IMAGE:-ghcr.io/tensorlink-ai/cascade-miner:harness}
+    restart: unless-stopped
+    command: ["gauntlet", "run", "--config", "/work/harness.toml", "--park-on-stop"]
+    volumes:
+      - ./work:/work
+      - ./secrets/gauntlet_ssh:/run/secrets/gauntlet_ssh:ro
+      - ./secrets/gauntlet_ssh.pub:/run/secrets/gauntlet_ssh.pub:ro
+      # - ~/.bittensor/wallets:/root/.bittensor/wallets:ro    # only for submitting
+    environment:
+      - LIUM_API_KEY
+      - HF_TOKEN
+    # Local executor instead of Lium: set [compute] executor = "local" and
+    # uncomment to give the judge this host's GPUs.
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices: [{ driver: nvidia, count: all, capabilities: [gpu] }]
+
+  worker:
+    image: ${WORKER_IMAGE:-ghcr.io/tensorlink-ai/cascade-miner:oneclick}
+    restart: unless-stopped
+    command: ["gauntlet", "worker", "--config", "/etc/gauntlet/worker.toml",
+              "--home", "/queue-home"]
+    deploy:
+      replicas: 4                      # = [search] proposals_per_cycle
+    volumes:
+      - ./work/gauntlet/queue:/queue
+      - ./worker.toml:/etc/gauntlet/worker.toml:ro
+    tmpfs:
+      - /queue-home                    # per-replica Claude Code config; never shared
+    environment:
+      - CHUTES_API_KEY
+      - SAYGM_API_KEY
+      - ENGY_API_KEY
+      - ANTHROPIC_API_KEY
+
+  operator:
+    image: ${OPERATOR_IMAGE:-ghcr.io/tensorlink-ai/cascade-gauntlet-operator:latest}
+    restart: unless-stopped
+    volumes:
+      - ./work/gauntlet/operator:/operator
+    environment:
+      - HERMES_MODEL
+      - HERMES_BASE_URL
+      - HERMES_API_KEY
+      - OPERATOR_INTERVAL_SECONDS=${OPERATOR_INTERVAL_SECONDS:-7200}
+
+  updater:
+    image: docker:27-cli
+    restart: unless-stopped
+    entrypoint: ["sh", "${STACK_DIR:?set STACK_DIR in .env to this directory}/updater.sh"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${STACK_DIR}:${STACK_DIR}      # same path as on the host, so ./ mounts resolve
+    environment:
+      - STACK_DIR
+      - UPDATE_INTERVAL_SECONDS=${UPDATE_INTERVAL_SECONDS:-21600}

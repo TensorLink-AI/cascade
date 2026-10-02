@@ -110,6 +110,15 @@ EXPOSE 8765
 CMD ["ui"]
 
 # --------------------------------------------------------------------------- #
+# The gauntlet judge (docs/GAUNTLET.md): toolbox + the Lium CLI and the SSH
+# client it dispatches jobs over (files travel as tar over SSH). No Claude Code: the judge never runs an LLM.
+FROM base AS harness
+RUN apt-get update && apt-get install -y --no-install-recommends openssh-client \
+    && rm -rf /var/lib/apt/lists/* \
+    && uv pip install --python /opt/cascade/.venv/bin/python lium.io
+CMD ["gauntlet", "run", "--config", "/work/harness.toml", "--park-on-stop"]
+
+# --------------------------------------------------------------------------- #
 # Last stage = what a plain `docker build` produces.
 FROM base AS toolbox
 CMD ["help"]

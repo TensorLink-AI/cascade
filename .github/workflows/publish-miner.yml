@@ -4,14 +4,17 @@ name: cascade-miner image
 # rebuilds it, each build is smoke-tested BEFORE anything is pushed, and a broken
 # build never reaches a tag miners pull.
 #
-#   tag                         target    moves when
-#   :latest / :oneclick         both      every main push that touches the image,
-#                                         a new archived king, the weekly refresh
-#   :sha-<short>[-oneclick]     both      every published build (immutable; pin this)
-#   :v<X>[-oneclick]            both      a `miner-v<X>` git tag (release)
+#   tag                           target    moves when
+#   :latest / :oneclick / :harness  all       every main push that touches the image,
+#                                             a new archived king, the weekly refresh
+#   :sha-<short>[-oneclick|-harness]  all     every published build (immutable; pin this)
+#   :v<X>[-oneclick|-harness]       all       a `miner-v<X>` git tag (release)
+#
+# :harness is the gauntlet judge (docs/GAUNTLET.md); its compose stack
+# (deploy/harness) follows these tags and self-updates between cycles.
 #
 # Triggers:
-#   push to main (image paths)  → build, smoke, publish :latest/:oneclick
+#   push to main (image paths)  → build, smoke, publish :latest/:oneclick/:harness
 #   pull_request (image paths)  → build + smoke only, never pushes
 #   king-sync completed         → rebuild only if champions/king actually changed
 #                                 (king-sync pushes with GITHUB_TOKEN, which never
@@ -28,6 +31,7 @@ on:
     branches: [main]
     tags: ["miner-v*"]
     paths:
+      - "deploy/harness/harness.example.toml"
       - "cascade/**"
       - "champions/king/**"
       - "scripts/example_generator/**"
@@ -44,6 +48,7 @@ on:
       - ".github/workflows/publish-miner.yml"
   pull_request:
     paths:
+      - "deploy/harness/harness.example.toml"
       - "cascade/**"
       - "champions/king/**"
       - "scripts/example_generator/**"
@@ -133,6 +138,9 @@ jobs:
           - target: oneclick
             suffix: "-oneclick"
             floating: oneclick
+          - target: harness
+            suffix: "-harness"
+            floating: harness
     steps:
       - uses: actions/checkout@v5
         with:

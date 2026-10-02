@@ -1,0 +1,99 @@
+name: gauntlet operator image
+
+# Keeps ghcr.io/<owner>/cascade-gauntlet-operator (Hermes Agent + the
+# cascade-operator skill, deploy/harness/hermes) fresh. Same discipline as
+# publish-miner.yml: build into the local daemon, smoke-test that exact image,
+# publish only a passing build.
+#
+#   :latest          every main push touching deploy/harness/hermes, weekly
+#   :sha-<short>     every published build (immutable; pin this)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "deploy/harness/hermes/**"
+      - ".github/workflows/publish-gauntlet-operator.yml"
+  pull_request:
+    paths:
+      - "deploy/harness/hermes/**"
+      - ".github/workflows/publish-gauntlet-operator.yml"
+  schedule:
+    - cron: "41 4 * * 1"          # Mondays 04:41 UTC (python base security fixes)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: gauntlet-operator-${{ github.event_name == 'pull_request' && github.ref || 'main' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PUSH: ${{ github.event_name != 'pull_request' }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: env.PUSH == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tags
+        id: tags
+        env:
+          OWNER: ${{ github.repository_owner }}
+          SHA: ${{ github.sha }}
+        run: |
+          img="ghcr.io/${OWNER,,}/cascade-gauntlet-operator"
+          echo "image=$img" >> "$GITHUB_OUTPUT"
+          echo "tags=$img:sha-${SHA::7},$img:latest" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: deploy/harness/hermes
+          load: true
+          push: false
+          tags: gauntlet-operator-ci:test
+          provenance: false
+
+      # The loop script, the pinned Hermes CLI surface it depends on, the skill,
+      # and one real wake against an unreachable endpoint (must fail cleanly,
+      # log, and keep the key file private).
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          IMG=gauntlet-operator-ci:test
+          docker run --rm --entrypoint sh "$IMG" -c '
+            hermes chat --help | grep -q -- "--query" &&
+            hermes chat --help | grep -q -- "--skills" &&
+            test -f /root/.hermes/skills/cascade-operator/SKILL.md &&
+            bash -n /usr/local/bin/operator-loop'
+          op="$(mktemp -d)"; echo '{"epoch": 1}' > "$op/status.json"
+          docker run --rm -v "$op:/operator" -e HERMES_MODEL=m \
+            -e HERMES_BASE_URL=http://127.0.0.1:9/v1 -e HERMES_API_KEY=sk-smoke \
+            -e OPERATOR_TIMEOUT_SECONDS=120 --entrypoint sh "$IMG" -c '
+              timeout 150 operator-loop & sleep 140
+              grep -q "operator wake" /operator/reports/operator.log
+              test "$(stat -c %a ~/.hermes/config.yaml)" = 600'
+          echo "smoke OK"
+
+      - name: Publish
+        if: env.PUSH == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: deploy/harness/hermes
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          provenance: false

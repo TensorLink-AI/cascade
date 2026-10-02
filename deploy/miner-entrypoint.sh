@@ -29,6 +29,8 @@ Your files live in /work (mount a host dir: -v "$PWD:/work").
          --wallet-name W --wallet-hotkey H          (spends the hotkey)
   round | queue | heat | duel | reveal-status       read-only chain / round views
   ui                                     web UI for `mine` (publish -p 127.0.0.1:8765:8765)
+  gauntlet run --config harness.toml     the multi-stage harness (docs/GAUNTLET.md;
+                                         compose stack: deploy/harness/)
   bash | python …                        a shell / the image's python
 
 Starter files: /opt/cascade/scripts/example_generator,
