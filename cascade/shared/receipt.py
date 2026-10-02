@@ -522,6 +522,11 @@ class RoundReceipt:
     # Stamped on every receipt from lock-in on, so the audit replays each
     # round under the block the fleet decided, not the config it runs with.
     activation_block: int = 0
+    # Dethrone bar v2 (DEC-CA-0049, drop-when-default): the
+    # ``margin_v2_from_block`` this validator resolved FROM VALIDATOR SIGNALS
+    # (0 = none resolved, or typed into chain.toml). Stamped from lock-in on so
+    # the audit replays each verdict under the bar the fleet decided.
+    margin_v2_block: int = 0
     receipt_version: int = RECEIPT_VERSION
     signature: str | None = None             # validator-hotkey signature over canonical_body
 
@@ -566,6 +571,8 @@ class RoundReceipt:
             body["era_base_seed"] = int(self.era_base_seed)
         if self.activation_block:
             body["activation_block"] = int(self.activation_block)
+        if self.margin_v2_block:
+            body["margin_v2_block"] = int(self.margin_v2_block)
         return json.dumps(
             body, sort_keys=True, separators=(",", ":"), allow_nan=False
         ).encode("utf-8")
@@ -591,6 +598,7 @@ def build_receipt(
     era_start_block: int = 0,
     era_base_seed: int = 0,
     activation_block: int = 0,
+    margin_v2_block: int = 0,
 ) -> RoundReceipt:
     """Assemble a receipt from live-loop objects (``seeds`` is a ``RoundSeeds``).
 
@@ -618,6 +626,7 @@ def build_receipt(
         era_start_block=int(era_start_block or 0),
         era_base_seed=int(era_base_seed or 0),
         activation_block=int(activation_block or 0),
+        margin_v2_block=int(margin_v2_block or 0),
     )
 
 
@@ -747,6 +756,7 @@ def load_receipt(text: str) -> RoundReceipt:
         era_start_block=int(obj.get("era_start_block", 0) or 0),
         era_base_seed=int(obj.get("era_base_seed", 0) or 0),
         activation_block=int(obj.get("activation_block", 0) or 0),
+        margin_v2_block=int(obj.get("margin_v2_block", 0) or 0),
         receipt_version=version,
         signature=obj.get("signature"),
     )
@@ -900,6 +910,8 @@ def summarize_receipt(receipt: RoundReceipt) -> dict:
         # DEC-CA-0045: the rollover block this validator resolved from
         # validator signals (0 = none / typed into chain.toml).
         "activation_block": int(receipt.activation_block or 0),
+        # DEC-CA-0049: the margin-v2 block resolved from validator signals.
+        "margin_v2_block": int(receipt.margin_v2_block or 0),
     }
 
 

@@ -30,11 +30,14 @@ K, S = "KINGKINGKINGKING", "SUCCESSORSUCCESSOR"
 
 @pytest.fixture
 def cfg():
-    """The shipped chain.toml with its DEC-CA-0048 forfeiture DISARMED: these tests
-    model the plain fleet (no forfeiture configured) and arm one explicitly."""
+    """The shipped chain.toml with its DEC-CA-0048 forfeiture and DEC-CA-0049
+    margin-v2 bar DISARMED: these tests model the plain fleet (neither
+    configured) and arm one explicitly."""
     c = load_chain_config(REPO / "chain.toml")
     return replace(c, scoring=replace(c.scoring, forfeit_hotkeys=(), forfeit_from_block=0,
-                                      forfeit_successor_hotkey=""))
+                                      forfeit_successor_hotkey="", win_margin_start_v2=0.0,
+                                      win_margin_end_v2=0.0, margin_warmup_blocks_v2=0,
+                                      margin_v2_from_block=0))
 
 
 def _typed(cfg):
@@ -266,3 +269,30 @@ def test_trainer_tick_adopts_the_forfeiture_block_from_the_notes_and_never_signa
     assert runner.promotion.scoring_cfg is runner.cfg.scoring
     assert chain.written == []
     assert A.ActivationStore(tmp_path / "activation_forfeit_state.json").load().source == "signals"
+
+
+def test_restart_restores_a_chain_decided_rollover_before_the_forfeiture(cfg, tmp_path):
+    """2026-10-01: the deployed rollover is DECIDED ON CHAIN (not typed), so the
+    900-block grid exists only once its persisted lock-in is re-applied. The
+    forfeiture lock-in sits on that grid (mid-era, not 3600-aligned); restored
+    first, it read as "not a settlement boundary" and the validator died at
+    startup. A restart must re-apply the rollover first, then the forfeiture."""
+    from cascade.validator.loop import ValidatorRunner
+
+    c = _forfeit(cfg)                                    # rollover NOT typed: decided on chain
+    assert A.configured_rollover(c) == 0
+    store = A.ActivationStore(tmp_path / "act.json")
+    store.save(A.ActivationRecord(feature=c.activation.feature, lock_block=B0 - GRID,
+                                  activation_block=B0, source="signals"))
+    forfeit_at = B0 + GRID + 900                         # a 900-grid boundary, not a 3600 one
+    assert forfeit_at % GRID and not forfeit_at % 900
+    spec = A.forfeit_feature(c)
+    A.ActivationStore(tmp_path / "activation_forfeit_state.json").save(
+        A.ActivationRecord(feature=spec.name, lock_block=B0 + GRID,
+                           activation_block=forfeit_at, source="signals"))
+    runner = ValidatorRunner(cfg=c, activation_store=store)
+    dead = FakeChain([], {}, block=B0 + 9000)
+    dead.validator_stakes = lambda block=None: (_ for _ in ()).throw(RuntimeError("down"))
+    runner._activation_startup(dead)                    # must not raise
+    assert runner.cfg.round.epoch_blocks == 900 and runner.activation_block == B0
+    assert runner.cfg.scoring.forfeit_from_block == forfeit_at

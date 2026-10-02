@@ -448,6 +448,15 @@ in-context.
   rounds up to an era's first settlement). `[round] blocked_hotkeys` refuses
   admissions trainer-side. Inert by default.
   (`decisions/DEC-CA-0048-king-forfeiture.md`)
+- **DEC-CA-0049** (proposed) — Dethrone bar v2 for the increment-unit LCB:
+  `[scoring] win_margin_start_v2 = 0.4` decaying to `win_margin_end_v2 = 0.2`
+  over `margin_warmup_blocks_v2 = 18000` blocks of tenure (CONSENSUS). The
+  1%→0.5% bar is ≈"LCB > 0" in increment units. `margin_v2_from_block = 0` =
+  decided on chain via a third readiness-note segment (51% stake, applies
+  from the next ERA START, never mid-era); typed block = owner override;
+  level-judged rounds keep the level bar; receipts stamp
+  `margin_v2_block`, audit `margin-v2` check. Floor > 0 load-checked.
+  (`decisions/DEC-CA-0049-margin-v2.md`)
 - Staged rollout + budget denomination + no-weights ceiling:
   `docs/SUBMISSION_SURFACE_ROADMAP.md`. FULLY IMPLEMENTED to the
   config-only-arming bar (2026-08-14, this branch): Stages 0–1 + the Stage 2

@@ -257,6 +257,70 @@ def check_activation(receipt: RoundReceipt, cfg: ChainConfig,
                      f">= {cfg.activation.threshold:.0%} of stake (lock-in at {lock})")
 
 
+def check_margin_v2(receipt: RoundReceipt, cfg: ChainConfig,
+                    client: object | None = None) -> CheckResult:
+    """DEC-CA-0049: the dethrone-bar-v2 block a receipt records was decided by
+    the validators, not invented by one — the same shape as
+    :func:`check_activation`. A receipt without ``margin_v2_block`` PASSES
+    (pre-field, or the block is typed into chain.toml). ``cfg`` already
+    carries the recorded block (``apply_receipt_activation``), so the
+    ``koth-params`` check replays the verdict under the v2 bar."""
+    from ..shared.activation import (
+        agreed_activation,
+        apply_margin_v2_activation,
+        configured_margin_v2_block,
+        margin_v2_feature,
+        resolved_margin_v2_block,
+    )
+
+    name = "margin-v2"
+    block = int(getattr(receipt, "margin_v2_block", 0) or 0)
+    if not block:
+        return _ok(name, "no chain-decided margin v2 recorded (typed-in config applies)")
+    typed = configured_margin_v2_block(cfg)
+    if typed:
+        if typed != block:
+            return _fail(name, f"recorded margin_v2_block {block} != the block typed into the "
+                               f"audit config ({typed})")
+        return _ok(name, f"margin v2 from {block} matches the typed-in config")
+    spec = margin_v2_feature(cfg)
+    if spec is None:
+        return _fail(name, f"receipt records margin_v2_block {block} but the loaded config "
+                           "defines no v2 bar (or [activation] is off)")
+    applied = resolved_margin_v2_block(cfg)
+    if applied != block:
+        try:
+            apply_margin_v2_activation(cfg, block)
+        except ValueError as e:
+            return _fail(name, f"recorded margin_v2_block {block} cannot be applied to the "
+                               f"audit config: {e}")
+        return _fail(name, f"recorded margin_v2_block {block} != the block the audit config "
+                           f"carries ({applied})")
+    if client is None:
+        return _warn(name, f"margin v2 from {block} recorded; validator agreement not "
+                           "verified (no chain)")
+    try:
+        validators = list(client.validator_stakes())  # type: ignore[attr-defined]
+        signals = dict(client.read_plain_commitments())  # type: ignore[attr-defined]
+        now_block = int(client.current_block())  # type: ignore[attr-defined]
+    except Exception as e:  # noqa: BLE001
+        return _warn(name, f"margin v2 from {block} recorded; chain read failed ({e})")
+    agreed = agreed_activation(spec.name, validators, signals,
+                               threshold=cfg.activation.threshold, block=now_block,
+                               dormant_after_blocks=cfg.activation.dormant_after_blocks,
+                               round_cfg=cfg.round, align=spec.align)
+    if agreed is None:
+        return _warn(name, f"margin v2 from {block} recorded; validators holding "
+                           f"{cfg.activation.threshold:.0%} of stake do not (yet) name one "
+                           "block in their notes")
+    lock, act = agreed
+    if act != block:
+        return _fail(name, f"recorded margin_v2_block {block} != the block validators agree "
+                           f"on ({act}, locked in at {lock})")
+    return _ok(name, f"margin v2 from {block} agreed by validators holding "
+                     f">= {cfg.activation.threshold:.0%} of stake (lock-in at {lock})")
+
+
 def check_era(receipt: RoundReceipt, cfg: ChainConfig, client: object | None = None) -> CheckResult:
     """DEC-CA-0043 era envelope, replayed under the receipt's own block.
 
@@ -767,8 +831,9 @@ def check_duel_cohort(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
             duel_params.margin_mode == "increment" and baseline is not None
         )
         gate_on = str(getattr(duel_params, "init_gate_mode", "off") or "off") != "off"
-        mode_params = _dc_replace(
-            duel_params, margin_mode="increment" if judged_increment else "level"
+        mode_params = (
+            _dc_replace(duel_params, margin_mode="increment") if judged_increment
+            else cfg.judged_level_params(duel_params, receipt.epoch_start_block)
         )
         res = evaluate_round(
             king, chal, mode_params,
@@ -799,8 +864,9 @@ def check_duel_cohort(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
                 cfg.scoring, receipt.epoch_start_block) else None)
         # The UNMODIFIED recorded params (no alpha/k) with the judged margin
         # mode — the same pair the validator handed cohort_maxt_lcb_map.
-        maxt_params = _dc_replace(
-            params, margin_mode="increment" if judged_increment else "level")
+        maxt_params = (
+            _dc_replace(params, margin_mode="increment") if judged_increment
+            else cfg.judged_level_params(params, receipt.epoch_start_block))
         try:
             lcbs = _cohort_maxt_lcbs(receipt, manifest, maxt_params, maxt_baseline)
         except (ValueError, KeyError) as e:
@@ -987,8 +1053,9 @@ def check_verdict(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
         duel_params.margin_mode == "increment" and baseline is not None
     )
     gate_on = str(getattr(duel_params, "init_gate_mode", "off") or "off") != "off"
-    duel_params = _dc_replace(
-        duel_params, margin_mode="increment" if judged_increment else "level"
+    duel_params = (
+        _dc_replace(duel_params, margin_mode="increment") if judged_increment
+        else cfg.judged_level_params(duel_params, receipt.epoch_start_block)
     )
     replay_baseline = (
         baseline if (judged_increment or (gate_on and baseline is not None))
@@ -1019,8 +1086,9 @@ def check_verdict(receipt: RoundReceipt, cfg: ChainConfig) -> CheckResult:
         maxt_baseline = (
             baseline if judged_increment and cohort_maxt_increment_active(
                 cfg.scoring, receipt.epoch_start_block) else None)
-        maxt_params = _dc_replace(
-            params, margin_mode="increment" if judged_increment else "level")
+        maxt_params = (
+            _dc_replace(params, margin_mode="increment") if judged_increment
+            else cfg.judged_level_params(params, receipt.epoch_start_block))
         try:
             lcbs = _cohort_maxt_lcbs(receipt, manifest, maxt_params, maxt_baseline)
         except (ValueError, KeyError) as e:
@@ -1308,6 +1376,7 @@ def run_tier0(
         check_round_seeds(receipt, cfg),
         check_epoch_alignment(receipt, cfg),
         check_activation(receipt, cfg, client),
+        check_margin_v2(receipt, cfg, client),
         check_era(receipt, cfg, client),
         check_block_hash_onchain(receipt, client),
         check_contract_digest(receipt, cfg),
