@@ -27,6 +27,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import math
 import os
 import shlex
 import subprocess
@@ -256,6 +257,9 @@ class TarSsh:
         return ssh.wait() == 0 and r.returncode == 0
 
 
+_RENT_REFUSED = __import__("re").compile(r'"status_code":\s*4\d\d|\bError:', __import__("re").I)
+
+
 class BudgetExhausted(RuntimeError):
     pass
 
@@ -371,8 +375,7 @@ class LiumExecutor:
             price = getattr(self.provider, "price_of", lambda n: None)(name)
             if price is not None and 0 < price <= self.cfg.max_price_per_hour:
                 self.ledger.set_price(name, price)        # bill what it really costs
-            if not self.provider.wait_ready(name, timeout=self.cfg.boot_timeout):
-                raise RuntimeError(f"pod {name} not ready after {self.cfg.boot_timeout:.0f}s")
+            self._wait_ready(name)
             addr = self.provider.get_ip(name)
             if addr is None:
                 raise RuntimeError(f"pod {name} has no address")
@@ -393,6 +396,20 @@ class LiumExecutor:
             raise RuntimeError(f"pod {name} failed its health check: {r.stderr[-300:]}")
         log.info("pod %s up at %s:%d", name, pod.ip, pod.port)
         return pod
+
+    def _wait_ready(self, name: str) -> None:
+        """Wait for the pod, but fail fast when Lium already refused the rental
+        (``lium up`` exits with a 4xx — e.g. "another rental is in progress on
+        this node") instead of sitting out the whole boot timeout."""
+        tail = getattr(self.provider, "_up_log_tail", None)
+        for _ in range(max(1, math.ceil(self.cfg.boot_timeout / 60.0))):
+            if self.provider.wait_ready(name, timeout=60.0):
+                return
+            text = tail(name) if callable(tail) else ""
+            if text and _RENT_REFUSED.search(text):
+                raise RuntimeError(f"lium refused the rental of {name}: "
+                                   f"{' '.join(text.split())[-200:]}")
+        raise RuntimeError(f"pod {name} not ready after {self.cfg.boot_timeout:.0f}s")
 
     def _acquire(self, est_hours: float) -> _Pod:
         bound = self._job_cost_bound(est_hours)

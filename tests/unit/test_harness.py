@@ -890,3 +890,22 @@ def test_unreplayable_rounds_never_enter_the_window(rcfg, tmp_path):
     g2.refresh_window(force=True)
     assert first not in [r.round_id for r in g2.window.all]
     assert g2.state["round_ok"][first] is False
+
+
+def test_a_refused_rental_fails_fast(tmp_path):
+    clock = {"t": 1_790_000_000.0}
+
+    class Refused(_FakeProvider):
+        calls = 0
+
+        def wait_ready(self, name, timeout):
+            Refused.calls += 1
+            clock["t"] += timeout
+            return False
+
+        def _up_log_tail(self, name):
+            return '{"status_code":400,"message":"Another rental is already in progress"}'
+
+    ex = _lium(tmp_path, Refused(), clock, cap=10.0)
+    res = ex.run({"kind": "replay", "inputs": {}, "params": {}})
+    assert "refused the rental" in res["error"] and Refused.calls == 1   # one poll, not 30 min
