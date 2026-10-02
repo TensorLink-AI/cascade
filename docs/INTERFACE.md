@@ -36,8 +36,11 @@ Channel economics, so you can decide what to emit:
   signal. Near-duplicate channels are flagged by the channel-redundancy
   telemetry (`channel_corr_mode = "shadow"` today; enforcement will follow it).
   So are unrelated rows stacked into one array: a channel whose innovations
-  are uncorrelated with every other channel is logged as unpartnered
-  (`channel_telemetry.frac_unpartnered`, shadow only).
+  are uncorrelated with every other channel at every lag within ±64 steps
+  is logged as unpartnered
+  (`channel_telemetry.frac_unpartnered`, shadow only). Its enforce lever,
+  `unpartnered_mode = "enforce"` against `max_unpartnered_frac` (off today),
+  rejects a run on the fraction of such series, never on one series.
 * A univariate generator stays fully legal — `C = 1` batches, budgets, and
   scores are byte-identical to the pre-raise behaviour.
 
