@@ -1411,7 +1411,7 @@ def _add_mine(sub: argparse._SubParsersAction) -> None:
 def _add_ralph(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser(
         "ralph",
-        help="Ralph loop: Claude Code (on Anthropic, Chutes, SayGM or any Anthropic-"
+        help="Ralph loop: Claude Code (on Anthropic, Chutes, SayGM, Engy or any Anthropic-"
         "compatible model) rewrites the generator's code, same prompt every iteration, "
         "memory in a notebook; the mine loop verifies/scores/keeps. See cascade/miner/ralph.py.",
     )

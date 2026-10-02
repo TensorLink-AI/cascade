@@ -298,6 +298,8 @@ transport, finance, epidemiology, sensors). Good directions:
   trains the model on fewer tokens. Never add per-series work without a reason.
 Pure mixture-weight reweighting is the `tune` proposer's job. Here, change
 what the series ARE.
+The eval rewards BREADTH: past winners spread their gain over most domains and all
+three horizons, while near misses packed a similar gain into one feed and lost.
 
 ## Hard rules (violations are rejected before scoring)
 - Deterministic in `seed` only: derive every RNG from it; no `hash()`, clock,

@@ -1,7 +1,7 @@
 # Ralph loop: an LLM rewrites your generator
 
 `cascade ralph` runs Claude Code in a loop on your generator's **code**. The
-model can be Anthropic's or any Anthropic-compatible one: Chutes, SayGM, or
+model can be Anthropic's or any Anthropic-compatible one: Chutes, SayGM, Engy, or
 a gateway of your own. Every iteration uses the same standing prompt and a
 fresh agent context, and memory lives in a notebook file (the Ralph
 pattern). After each iteration the existing `cascade mine` loop verifies,

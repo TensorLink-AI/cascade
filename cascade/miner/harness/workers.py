@@ -63,6 +63,9 @@ longer-range structure that matters at the 256/720 horizons; SPEED (data is
 streamed under a fixed wall clock, so a slower generator trains on less data —
 a slower candidate fails the throughput stage).
 
+The eval rewards BREADTH: past winners spread their gain over most domains and all
+three horizons, while near misses packed a similar gain into one feed and lost.
+
 ## Hard rules (violations are rejected before any GPU is spent)
 - Deterministic in `seed` only; no `hash()`, clock, `os.urandom`, network.
 - No blocked imports (socket, subprocess, pickle, multiprocessing, …), no code

@@ -117,7 +117,7 @@ own knobs, a population kept in your own state file under
 The built-in proposers use the same loop: `--proposer tune` (random
 log-normal steps on `config.json`, no LLM), `--proposer agent` (Claude
 Code, in the `oneclick` image), and `cascade ralph` (a Ralph loop on
-Anthropic, Chutes, SayGM or any Anthropic-compatible model;
+Anthropic, Chutes, SayGM, Engy or any Anthropic-compatible model;
 [RALPH_MINING.md](RALPH_MINING.md)).
 
 ### Reading results

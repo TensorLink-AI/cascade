@@ -66,7 +66,7 @@ cascade mine --workdir ./mine-run --iterations 20 --warm-start live --pool-dir .
      change and writes a one-line note. Edits are confined to the
      candidate dir, and the only shell command allowed is
      `cascade verify`. Swap it with `--agent-cmd`.
-   - `ralph` is a Ralph loop: Claude Code on Anthropic, Chutes, SayGM or any
+   - `ralph` is a Ralph loop: Claude Code on Anthropic, Chutes, SayGM, Engy or any
      Anthropic-compatible model rewrites the generator's **code**, with one
      standing prompt and a persistent notebook. See
      [RALPH_MINING.md](RALPH_MINING.md).

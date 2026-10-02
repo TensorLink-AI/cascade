@@ -26,15 +26,21 @@ directory is `…/candidates/NNNN/`, a copy of the current best generator.
 2. Read `config.json` and skim `generator.py` for the family registry and
    mixture weights. The king is ~19k lines: grep for it, do not read it
    end to end.
-3. Make **one** focused, explainable change. The good levers, roughly by
-   past payoff:
-   - mixture reweighting toward families that look like real held-out data
-     (energy, nature, sales, web, transport, finance, epidemiology);
-   - realism of the observation process: rounding to the published
-     resolution, holds or sticky values, missing bins, reporting cadence;
-   - a new family that covers a domain the corpus lacks;
-   - speed. The wall is the law (DEC-CA-0001), so a slow generator trains the
-     model on less data. Never add work per series without a reason.
+3. Make **one** focused, explainable change. What the eval data says wins
+   (the dethrone analysis: winners and near misses had the same ~1.5% median
+   gain; winners spread it over ≥6 domains, near misses packed it into one feed):
+   - **breadth**: changes that help many domains and all three horizons
+     (64/256/720), e.g. realism of the observation process (rounding to the
+     published resolution, holds or sticky values, missing bins, reporting
+     cadence, count data, saturation) or long multi-cycle structure for h720;
+   - the domains the lineage is stuck on (nature, energy, finance, h64);
+   - multichannel only with REAL cross-channel dependence (lagged links,
+     cointegration, shared drivers), near the eval's ~12% share: a C>1 series
+     is billed ~1.67× its length under points+mv20, and independent filler
+     channels measured worse;
+   - speed: the wall is the law (DEC-CA-0001), a slow generator trains on less.
+   Narrow single-family/single-feed reweighting rarely survives a longer
+   budget on new rounds; avoid it unless it is part of a broad change.
 4. Keep every hard rule (`docs/INTERFACE.md`, `docs/MINER.md`):
    - deterministic in `seed` only (no `hash()`, clock, `os.urandom`, network);
    - only allowlisted deps; blocked imports (`socket`, `subprocess`, `pickle`,
@@ -60,7 +66,7 @@ cascade verify ./champions/king                    # the env can import the king
 cascade mine --workdir ./mine-run --proposer tune --iterations 20 \
     --train-hours 0.25 --warm-start live --pool-dir <held-out .npy dir>
 # or: --proposer agent (each step invokes Claude Code in proposer mode)
-# or: cascade ralph --llm-provider chutes|saygm|anthropic --llm-model <id> (run --check first;
+# or: cascade ralph --llm-provider chutes|saygm|engy|anthropic --llm-model <id> (run --check first;
 #     an LLM rewrites the generator code each iteration; docs/RALPH_MINING.md)
 # or: --proposer cmd --propose-cmd "python my_strategy.py" (the person's own strategy;
 #     contract in docs/MINER_DOCKER.md, example scripts/example_strategy.py)
@@ -71,10 +77,13 @@ cascade mine-ui --workdir ./mine-run               # watch it in a browser
   `<workdir>/STOP` to stop after the current candidate.
 - Read progress from `<workdir>/state.json` (`best`, `king`, `beats_king`)
   and `<workdir>/history.jsonl`. `best/` is the tree you would submit.
-- Report scores with their caveat. Local scores are **directional**: they
-  come from the miner's pool, not the validators' private one. A best that
-  beats the reference king by less than ~1 % is inside the noise band. More
-  `--seeds` and a larger `--train-hours` tighten it.
+- Report scores with their caveat. Local scores are **directional**. Scoring
+  runs under the LIVE contract by default (the latest signed round's; the
+  first printed line says which). `cascade score <dir> --replay-round <id>
+  --snapshot-root <revealed pool>` scores on a real past round's exact windows
+  against that round's king; `--pool-dir` scores single-horizon windows of the
+  person's own data. A best that beats the reference king by less than ~1 % is
+  inside the noise band. More `--seeds` and a larger `--train-hours` tighten it.
 - Without `--pool-dir` the loop scores on an offline synthetic sample, which
   is a weak signal. Say so when that is what ran.
 
