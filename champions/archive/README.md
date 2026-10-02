@@ -22,3 +22,4 @@ One folder per reign, oldest first. `champions/king` is the sitting king; this a
 | 16 | [`16-5HDvXrTbUgK7`](16-5HDvXrTbUgK7/) | 105 | `5HDvXrTbUgK7…` | 2026-09-25 22:08 | 18 | `vault/direct@sha256:65e5b9dc80e58322b1c331489ccc` | 2 |
 | 17 | [`17-5D7LFfjyoTXF`](17-5D7LFfjyoTXF/) | 135 | `5D7LFfjyoTXF…` |  | 0 | `vault/direct@sha256:29894edda87b9bfe8318285262f4` | 0 |
 | 17 | [`17-5DZv2yrGtcc9`](17-5DZv2yrGtcc9/) | 111 | `5DZv2yrGtcc9…` | 2026-09-28 22:07 | 9 | `vault/direct@sha256:5b562f22d9eb051281dce83fa767` | 2 |
+| 17 | [`17-5EpwFZ4iMFwW`](17-5EpwFZ4iMFwW/) | 124 | `5EpwFZ4iMFwW…` |  | 0 | `vault/direct@sha256:4500367f1004fc38ca7c1fac1853` | 0 |
