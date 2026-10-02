@@ -975,6 +975,19 @@ class Gauntlet:
                         self._interruptible_sleep((midnight - now).total_seconds() + 60)
                     elif outcome == "wait":
                         self._interruptible_sleep(wait_seconds)
+                done = bool(max_cycles) and n >= max_cycles and not self.stopped()
+                if park_on_stop and done:
+                    # A service that finished its cycles must not exit: the
+                    # restart policy would start the next cycle at once.
+                    self.phase(f"finished {n} cycle(s): parked (raise max_cycles and "
+                               "restart to continue)")
+                    with contextlib.suppress(Exception):
+                        self.executor.close()
+                    while not self.stopped() and not (self.wd / RESTART_FILE).exists():
+                        self._sleep(30.0)
+                    if self._restart_requested():
+                        return
+                    break
                 if not (park_on_stop and self.stopped()):
                     break
                 self.phase("stopped: delete STOP to resume")

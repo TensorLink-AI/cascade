@@ -615,13 +615,17 @@ def test_park_on_stop_idles_until_stop_is_deleted(rcfg, tmp_path):
     sleeps = []
 
     def sleep(s):
-        sleeps.append(s)
-        assert g.state["phase"] == "stopped: delete STOP to resume"
-        (g.wd / "STOP").unlink()                 # a person resumes it
+        sleeps.append(g.state["phase"])
+        if len(sleeps) == 1:
+            assert g.state["phase"] == "stopped: delete STOP to resume"
+            (g.wd / "STOP").unlink()             # a person resumes it
+        else:
+            (g.wd / "STOP").touch()              # finished-and-parked: stop it for the test
 
     g._sleep = sleep
     g.run(max_cycles=1, park_on_stop=True)
-    assert sleeps == [30.0] and compute.jobs     # parked once, then ran a cycle
+    assert compute.jobs and sleeps[0].startswith("stopped")   # parked, then ran a cycle
+    assert sleeps[1].startswith("finished 1 cycle")           # then parked, never exited
 
 
 def test_total_cap_bounds_spend_across_days(tmp_path):
@@ -996,3 +1000,17 @@ def test_lium_rm_flags_follow_the_cli_version():
     p = LiumProvider(bin="lium", _run=run)
     p.terminate("pod-b")
     assert ["lium", "rm", "pod-b"] in seen                   # lium 0.0.x
+
+
+def test_a_service_that_finished_its_cycles_parks_instead_of_exiting(rcfg, tmp_path):
+    g, compute, _, _ = _gauntlet(rcfg, tmp_path, script=[(1.6, 1.0)])
+    naps = []
+
+    def sleep(s):
+        naps.append(s)
+        (g.wd / "STOP").touch()                  # a person stops it while parked
+
+    g._sleep = sleep
+    g.run(max_cycles=1, park_on_stop=True)
+    assert naps == [30.0]                         # parked, did not exit for a restart
+    assert g.state["cycle"] == 1                  # and ran no second cycle
