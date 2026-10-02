@@ -637,9 +637,41 @@ def dump_receipt(receipt: RoundReceipt) -> str:
     return json.dumps(body, indent=2, sort_keys=True)
 
 
+def _received_body(obj: dict) -> bytes:
+    """The signed bytes of a received receipt: its JSON minus ``signature``,
+    serialised exactly as :meth:`RoundReceipt.canonical_body` serialises (the
+    published JSON is ``canonical_body`` + signature, re-indented)."""
+    body = {k: v for k, v in obj.items() if k != "signature"}
+    return json.dumps(body, sort_keys=True, separators=(",", ":"),
+                      allow_nan=False).encode("utf-8")
+
+
+def receipt_has_unknown_fields(receipt: RoundReceipt) -> bool:
+    """True when a loaded receipt carries fields this code does not model —
+    written by NEWER code than is running here (e.g. a new drop-when-default
+    stamp). The receipt still verifies (see :func:`verify_receipt_signature`);
+    this is the operator's cue to restart on current code. False for a
+    receipt that was not loaded from text."""
+    received = getattr(receipt, "_received_body", None)
+    return received is not None and received != receipt.canonical_body()
+
+
 def load_receipt(text: str) -> RoundReceipt:
-    """Parse a receipt JSON string. Raises ``ValueError`` on schema problems."""
+    """Parse a receipt JSON string. Raises ``ValueError`` on schema problems.
+
+    The received body is kept on the returned receipt, so the signature is
+    checked over the bytes the validator actually signed. Fields this code
+    does not know (written by newer code) are ignored for parsing but stay
+    covered by the signature — an older reader can no longer fail
+    verification on a valid receipt (2026-10-02: the margin_v2_block stamp
+    made a pre-#345 trainer fall back to the deposed king for 20 min)."""
     obj = json.loads(text)
+    receipt = _receipt_from_obj(obj)
+    object.__setattr__(receipt, "_received_body", _received_body(obj))
+    return receipt
+
+
+def _receipt_from_obj(obj: dict) -> RoundReceipt:
     version = int(obj.get("receipt_version", 0))
     if version != RECEIPT_VERSION:
         raise ValueError(f"unsupported receipt_version {version}; need {RECEIPT_VERSION}")
@@ -949,8 +981,13 @@ def verify_receipt_signature(receipt: RoundReceipt, validator_hotkey: str) -> bo
         raise RuntimeError(
             "bittensor required to verify receipt signatures; install the [chain] extra"
         ) from e
+    # A receipt loaded from text verifies over the bytes it arrived with, so a
+    # field added by newer code cannot break an older reader. A constructed
+    # (or ``replace``-d) receipt carries no received body and verifies over
+    # its own canonical body — any field tamper still kills the signature.
+    body = getattr(receipt, "_received_body", None) or receipt.canonical_body()
     try:
         kp = Keypair(ss58_address=validator_hotkey)
-        return bool(kp.verify(receipt.canonical_body(), bytes.fromhex(receipt.signature)))
+        return bool(kp.verify(body, bytes.fromhex(receipt.signature)))
     except Exception:  # noqa: BLE001 — any malformed sig/address ⇒ untrusted
         return False

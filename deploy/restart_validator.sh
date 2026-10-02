@@ -101,3 +101,22 @@ if ! kill -0 "$NEW_PID" 2>/dev/null; then
   exit 1
 fi
 echo "verified: the only running $SERVICE is the new pid $NEW_PID (no strays)"
+
+# Shared-code skew guard (OPSLOG 2026-10-02 04:30): the validator and the
+# trainer read each other's signed artifacts through cascade/shared. A
+# validator restarted onto new shared code while the trainer kept running
+# older code left the trainer unable to verify new receipts — it held the
+# deposed king for 20 min. Warn (never act) when shared code changed after
+# the running trainer started: restart_trainer.sh too.
+TRAINER_PID="$(pgrep -f 'cascade-trainer' | head -1)"
+if [ -n "$TRAINER_PID" ]; then
+  T_START="$(ps -o lstart= -p "$TRAINER_PID" 2>/dev/null)"
+  if [ -n "$T_START" ]; then
+    CHANGED="$(git log --since="$T_START" --format='%h %s' -- cascade/shared 2>/dev/null)"
+    if [ -n "$CHANGED" ]; then
+      echo "WARNING: cascade/shared changed after the running trainer (pid $TRAINER_PID) started ($T_START):"
+      echo "$CHANGED" | sed 's/^/    /'
+      echo "  -> the trainer runs OLDER shared code than this validator: run ./restart_trainer.sh too."
+    fi
+  fi
+fi
