@@ -815,7 +815,8 @@ class Gauntlet:
         self.save()
         return max(passers, key=lambda m: m["stages"]["G4"]["rel"]) if passers else None
 
-    def _build_pool_cli(self, out: Path, as_of: str, sources: str) -> None:
+    def _build_pool_cli(self, out: Path, as_of: str, sources: str,
+                        max_per_source: int = 0) -> None:
         """``cascade-pool build`` with a patient per-request timeout, retried as a
         whole: the builder aborts on any request that fails 3 times, and the
         public sources do have transient failures (observed: one Open-Meteo
@@ -824,6 +825,8 @@ class Gauntlet:
                 "--timeout", "60"]
         if sources:
             argv += ["--sources", sources]
+        if max_per_source:
+            argv += ["--max-series-per-source", str(int(max_per_source))]
         for attempt in range(1, POOL_BUILD_ATTEMPTS + 1):
             try:
                 subprocess.run(argv, check=True, timeout=7200)
@@ -841,7 +844,8 @@ class Gauntlet:
         if (out / "metadata.json").is_file():
             return out
         try:
-            self._pool_builder(out, day, self.h.stages.g45_sources)
+            self._pool_builder(out, day, self.h.stages.g45_sources,
+                               self.h.stages.g45_max_series_per_source)
         except Exception as e:  # noqa: BLE001
             log.warning("pool C build failed: %s", e)
             return None

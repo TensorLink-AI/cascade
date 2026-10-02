@@ -54,6 +54,10 @@ class StagesConfig:
     g4_min_wins: int = 2                  # rounds that must clear the round's own rule
     g45_enabled: bool = True
     g45_sources: str = ""                 # `cascade-pool build --sources` ("" = defaults)
+    # Series per source for pool C. The one-shot needs a few hundred fresh
+    # series, not the validators' ~3000: a full Open-Meteo grid (~250 archive
+    # calls) trips the free tier's HOURLY quota (observed 429s); 300 is ~25 calls.
+    g45_max_series_per_source: int = 300
 
 
 @dataclass(frozen=True)
