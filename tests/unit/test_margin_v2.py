@@ -173,7 +173,7 @@ def test_backtest_this_weeks_dethrones():
                    min_windows=200, bootstrap_B=100, bootstrap_alpha=0.05, dethrone_cp=1)
     bar = margin_for_tenure(p, 3)
     assert 0.27 < bar < 0.30
-    assert 0.2166 < bar and 0.2462 < bar and 0.4667 > margin_for_tenure(p, 0)
+    assert bar > 0.2166 and bar > 0.2462 and margin_for_tenure(p, 0) < 0.4667
 
 
 # ── the feature ────────────────────────────────────────────────────
