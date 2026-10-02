@@ -50,6 +50,7 @@ class StagesConfig:
     g4_every_cycles: int = 3              # run G4 every N cycles when finalists exist
     g4_finalists: int = 2                 # population members sent to G4
     g4_rounds: int = 3                    # newest replayable rounds replayed at full budget
+    g4_hours: float | None = None         # None = the full contract; set only for smoke runs
     g4_min_wins: int = 2                  # rounds that must clear the round's own rule
     g45_enabled: bool = True
     g45_sources: str = ""                 # `cascade-pool build --sources` ("" = defaults)

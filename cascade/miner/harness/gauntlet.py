@@ -552,17 +552,11 @@ class Gauntlet:
     # ---------------------------------------------------------------- stages
     @staticmethod
     def _static_verify(tree: Path, chain) -> tuple[bool, str]:
-        """Every admission check, runtime (determinism) included, when this host
-        has the generator runtime (the judge image does): a broken candidate
-        dies here, before a pod is rented. Without the runtime pins (a dev
-        venv) only the static checks run and G1's on-pod verify decides."""
+        """Static admission checks only (layout, guard, config). Candidate code
+        never runs on the judge, which holds the keys: the runtime checks
+        (determinism) run in G1, on the executor."""
         from ..verify import verify_repo
-        r = verify_repo(tree, chain, skip_runtime=False)
-        if r.ok:
-            return True, ""
-        text = r.render()
-        if "ModuleNotFoundError" in text and "generator_import_failed" in text:
-            r = verify_repo(tree, chain, skip_runtime=True)   # local deps missing
+        r = verify_repo(tree, chain, skip_runtime=True)
         return r.ok, "" if r.ok else r.render()[-600:]
 
     def _kill(self, m: dict, stage: str, reason: str) -> None:
@@ -745,9 +739,11 @@ class Gauntlet:
         rounds = w.newest(s.g4_rounds)
         newest = rounds[-1]
         # Budget bound: the contract's hard wall plus staging/eval slack.
-        wall_h = float(self.chain.training.primary_size.max_train_seconds) / 3600.0 + 0.5
+        g4h = s.g4_hours
+        wall_h = (float(self.chain.training.primary_size.max_train_seconds) / 3600.0 + 0.5
+                  if g4h is None else g4h + 0.25)
         jobs = [Job(f"{m['id']}-G4-{ref.round_id}", self._replay_spec(
-            self.tree(m["id"]), ref, None,
+            self.tree(m["id"]), ref, g4h,
             ckpt=self._ckpt_dir(m["id"], ref) if ref is newest else None), wall_h)
             for m in finalists for ref in rounds
             if ref.round_id not in m.get("g4_legs", {})]
@@ -771,8 +767,12 @@ class Gauntlet:
             if any(ref.round_id not in legs for ref in rounds):
                 continue                       # infra / cap: the missing legs run later
             rows = [legs[ref.round_id] for ref in rounds]
-            wins = sum(1 for r in rows if (r.get("verdict") or {}).get("wins"))
             rels = [stats.rel_improvement(r["geomean"], r["king_geomean"]) for r in rows]
+            # A short (smoke) G4 leg carries no verdict: count "better than the
+            # receipt king" instead. Full-contract legs use the round's own rule.
+            wins = sum(1 for r, rel in zip(rows, rels, strict=True)
+                       if (r.get("verdict") or {}).get("wins")
+                       or (s.g4_hours is not None and rel > 0))
             g4 = {"pass": wins >= s.g4_min_wins and stats.mean(rels) > 0, "wins": wins,
                   "rounds": len(rows), "rel": stats.mean(rels), "rels": rels,
                   "epoch": self.epoch,
