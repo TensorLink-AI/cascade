@@ -57,6 +57,21 @@ log = logging.getLogger("cascade.miner.harness.gauntlet")
 STOP_FILE = "STOP"
 RESTART_FILE = "RESTART"            # the updater asks for a restart between cycles
 RESTART_ACK = "RESTART.ack"         # the judge: parked, safe to recreate
+def progress_bar(pr: dict, width: int = 30) -> str:
+    """``dethrone [███████░░░…] 23/100  best c00005 +0.32% @G3 (target +1.00%)``."""
+    score = float(pr.get("score") or 0.0)
+    fill = int(round(width * score / 100.0))
+    bar = "█" * fill + "░" * (width - fill)
+    tail = ""
+    if pr.get("id"):
+        tail = (f"  best {pr['id']} {pr['estimate']:+.2%} @{pr['stage']}"
+                f" (target {pr.get('target', 0.01):+.2%})")
+    return f"dethrone [{bar}] {score:3.0f}/100{tail}"
+
+
+# Dethrone progress: each stage's evidence can claim at most this much of 100.
+PROGRESS_CAPS = (("G4.5", 100.0), ("G4", 90.0), ("G3", 70.0), ("G2", 40.0))
+
 MAX_INFRA_RETRIES = 2
 MAX_SHORTAGE_WAITS = 6              # ~1 h of back-off when the market has no GPU
 
@@ -867,14 +882,17 @@ class Gauntlet:
             batch = self._g1(self._g0(batch))
             self.phase(f"cycle {self.state['cycle']}: G2 on {len(batch)}")
             batch = self._g2(batch)
+            self._record_progress("G2")
             self.phase(f"cycle {self.state['cycle']}: G3 on {len(batch)}")
             self._g3(batch)
+            self._record_progress("G3")
             self._trim_population()
             self.state["cycle"] = int(self.state["cycle"]) + 1
             if self.state["cycle"] % max(1, self.h.stages.g4_every_cycles) == 0:
                 chosen = self._g4()
                 if chosen is not None:
                     self.finalize(chosen)
+            self._record_progress("cycle")
             self.phase("idle")
             return "ran"
         except BudgetWait:
@@ -946,6 +964,42 @@ class Gauntlet:
         while (self._now() < end and not self.stopped()
                and not (self.wd / RESTART_FILE).exists()):
             self._sleep(min(60.0, max(0.0, end - self._now())))
+
+    # ---------------------------------------------------------- progress
+    def candidate_progress(self, m: dict) -> dict:
+        """``{score, stage, estimate}``: 0-100 toward beating the king.
+
+        ``stage cap × min(1, estimate / target_improvement)`` for the DEEPEST
+        stage the candidate passed, so cheap evidence can never score high
+        however good its number looks (a G2 screen tops out at 40)."""
+        need = max(1e-9, float(self.h.search.target_improvement))
+        stages = m.get("stages", {})
+        for stage, cap in PROGRESS_CAPS:
+            st = stages.get(stage) or {}
+            if st.get("pass") and isinstance(st.get("rel"), (int, float)):
+                frac = max(0.0, min(1.0, float(st["rel"]) / need))
+                return {"score": round(cap * frac, 1), "stage": stage, "estimate": st["rel"]}
+        return {"score": 0.0, "stage": None, "estimate": None}
+
+    def progress(self) -> dict:
+        """The best candidate's dethrone progress this epoch (and its id)."""
+        best = {"score": 0.0, "stage": None, "estimate": None, "id": None}
+        for m in self.all_metas():
+            if m.get("epoch") != self.epoch and m.get("member_epoch") != self.epoch:
+                continue
+            pr = self.candidate_progress(m)
+            if pr["score"] > best["score"]:
+                best = {**pr, "id": m["id"]}
+        best["target"] = self.h.search.target_improvement
+        return best
+
+    def _record_progress(self, after: str = "cycle") -> None:
+        pr = {"ts": self._now(), "epoch": self.epoch, "cycle": self.state.get("cycle"),
+              "after": after, **self.progress()}
+        self.state["progress"] = pr
+        with open(self.wd / "progress.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(pr) + "\n")
+        log.info("%s", progress_bar(pr))
 
     # ----------------------------------------------------------- operator
     def _write_operator_status(self) -> None:

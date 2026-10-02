@@ -786,3 +786,21 @@ def test_orphaned_proposals_are_retired(rcfg, tmp_path):
     g.cycle()
     assert g.meta("c00001")["status"] == "dead"
     assert "orphaned" in g.meta("c00001")["reason"]
+
+
+def test_dethrone_progress_is_capped_by_the_deepest_stage(rcfg, tmp_path):
+    g, _, _, _ = _gauntlet(rcfg, tmp_path, script=[(1.6, 1.0), (0.8, 1.0)])
+    cp = g.candidate_progress
+    assert cp({"stages": {"G2": {"pass": True, "rel": 0.05}}})["score"] == 40.0   # cheap: capped
+    assert cp({"stages": {"G2": {"pass": True, "rel": 0.05},
+                          "G3": {"pass": True, "rel": 0.005}}})["score"] == 35.0
+    assert cp({"stages": {"G4.5": {"pass": True, "rel": 0.02}}})["score"] == 100.0
+    assert cp({"stages": {"G2": {"pass": False, "rel": 0.05}}})["score"] == 0.0
+    assert g.cycle() == "ran"
+    pr = g.state["progress"]
+    assert pr["id"] == "c00001" and pr["stage"] == "G4.5" and pr["score"] == 100.0
+    assert (g.wd / "progress.jsonl").read_text().count("\n") == 3     # after G2, G3, cycle
+    from cascade.miner.harness.gauntlet import progress_bar
+    bar = progress_bar(pr)
+    assert bar.startswith("dethrone [" + "█" * 30 + "] 100/100") and "c00001" in bar
+    assert progress_bar({"score": 23.4, "id": None}).count("█") == 7

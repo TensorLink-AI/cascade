@@ -65,6 +65,10 @@ def _cmd_status(args) -> int:
         print(json.dumps(doc, indent=1))
         return 0
     print(f"epoch {doc['epoch']}  cycle {doc['cycle']}  phase: {doc['phase']}")
+    state = json.loads((Path(h.workdir) / "state.json").read_text())
+    if state.get("progress"):
+        from .gauntlet import progress_bar
+        print(progress_bar(state["progress"]))
     if doc.get("status"):
         print(f"status: {doc['status']}")
     if doc.get("spend_today_usd") is not None:

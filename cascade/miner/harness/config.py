@@ -63,6 +63,9 @@ class StagesConfig:
 class SearchConfig:
     population_k: int = 4
     proposals_per_cycle: int = 4
+    # The improvement over the king a submission needs (relative). Sets the
+    # dethrone progress score's 100 (gauntlet.progress); ~ the live margin.
+    target_improvement: float = 0.01
     max_cycles: int = 0                   # 0 = run until STOP
 
 
