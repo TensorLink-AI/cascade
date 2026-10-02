@@ -496,8 +496,10 @@ class Gauntlet:
         return [pool[i % len(pool)] for i in range(n)]
 
     def outcome_lines(self) -> list[str]:
+        """The last outcomes with their FULL failure reasons (a truncated reason
+        is how one worker repeated another's determinism bug)."""
         return [f"- {m['id']} from {m.get('parent')}: {m.get('note') or '(no note)'} "
-                f"→ {self.summary(m)}" for m in self.all_metas()[-40:]]
+                f"→ {self.summary(m)}" for m in self.all_metas()[-10:]]
 
     @staticmethod
     def summary(m: dict) -> str:
@@ -511,12 +513,39 @@ class Gauntlet:
             return f"{st} (passed G3{rel})" if st != "retired" else f"retired ({m.get('reason')})"
         return st
 
+    def write_knowledge(self) -> Path:
+        """``<workdir>/knowledge``, regenerated from the candidate records each
+        time (never edited by hand, so it cannot drift): the briefs from the
+        operator folder, and ``attempts.jsonl``, one line per candidate. Workers
+        see G2 numbers and G3+ pass/fail only, as everywhere else."""
+        kdir = self.wd / "knowledge"
+        kdir.mkdir(parents=True, exist_ok=True)
+        for name in self.h.search.briefs:
+            src = self.wd / "operator" / name
+            if src.is_file():
+                shutil.copyfile(src, kdir / name)
+        rows = []
+        for m in self.all_metas():
+            st = m.get("stages", {})
+            reached = next((k for k in ("G4.5", "G4", "G3", "G2", "G1", "G0") if k in st), None)
+            rows.append({
+                "id": m["id"], "parent": m.get("parent"), "epoch": m.get("epoch"),
+                "change": m.get("note") or "", "status": m.get("status"),
+                "furthest_stage": reached,
+                "throughput_vs_king": (st.get("G1") or {}).get("ratio"),
+                "screen_rel": (st.get("G2") or {}).get("rel"),
+                "passed": [k for k in ("G0", "G1", "G2", "G3", "G4", "G4.5")
+                           if (st.get(k) or {}).get("pass")],
+                "reason": m.get("reason") or ""})
+        tmp = kdir / "attempts.jsonl.tmp"
+        tmp.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+        tmp.replace(kdir / "attempts.jsonl")
+        return kdir
+
     def propose(self, n: int) -> list[Proposal]:
         notebook = self.wd / "operator" / "NOTEBOOK.md"
         nb = notebook.read_text(encoding="utf-8") if notebook.is_file() else ""
-        briefs = [(name, (self.wd / "operator" / name).read_text(encoding="utf-8"))
-                  for name in self.h.search.briefs
-                  if (self.wd / "operator" / name).is_file()]
+        kdir = self.write_knowledge()
         outcomes = self.outcome_lines()
         props = []
         for parent in self.parents(n):
@@ -527,8 +556,8 @@ class Gauntlet:
             self.put({"id": cid, "parent": parent, "epoch": self.epoch, "status": "proposed",
                       "parent_digest": tree_digest(tree), "stages": {}, "created": self._now()})
             props.append(Proposal(cid, parent, tree, build_prompt(
-                directives=self._directives(), notebook=nb, outcomes=outcomes, parent=parent,
-                briefs=briefs, brief_chars=self.h.search.brief_chars)))
+                directives=self._directives(), notebook=nb, outcomes=outcomes, parent=parent),
+                knowledge=kdir))
         self.save()
         return props
 
@@ -618,7 +647,7 @@ class Gauntlet:
             if self._fault(m, "G1", r):
                 continue
             if not r.get("verify_ok"):
-                self._kill(m, "G1", f"runtime verify: {r.get('verify', '')[-300:]}")
+                self._kill(m, "G1", f"runtime verify: {r.get('verify', '')[-800:]}")
                 continue
             gen, king = r["gen"]["points_per_sec"], r["king"]["points_per_sec"]
             ratio = gen / king if king > 0 else float("inf")

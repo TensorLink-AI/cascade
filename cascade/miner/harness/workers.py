@@ -87,11 +87,13 @@ class Proposal:
     id: str
     parent_id: str
     tree: Path                 # the copy to edit (the worker's cwd)
-    prompt: str
+    prompt: str                # may contain KNOWLEDGE_DIR, replaced at run time
+    knowledge: Path | None = None   # read-only reference folder (never inside the tree)
 
     def to_json(self) -> dict:
         d = asdict(self)
         d["tree"] = str(self.tree)
+        d["knowledge"] = str(self.knowledge) if self.knowledge else None
         return d
 
 
@@ -105,34 +107,42 @@ class Outcome:
     seconds: float = 0.0
 
 
-BRIEF_TITLES = {
-    "LINEAGE.md": "What has won so far (king lineage brief)",
-    "DETHRONES.md": "Why kings won (dethrones vs the eval data)",
-    "RESEARCH.md": "What the literature says (synthetic data for PFNs / TSFMs)",
-}
+KNOWLEDGE_DIR = "{KNOWLEDGE_DIR}"     # placeholder: the knowledge folder's real path
+
+KNOWLEDGE_STEP = f"""
+## Knowledge (read before you edit)
+`{KNOWLEDGE_DIR}` holds the reference material (read-only; it is not your tree):
+- `LINEAGE.md`: every past king, what it changed, the current king's anatomy, ranked edges.
+- `DETHRONES.md`: why each king won, from the eval data (domains, horizons, sources).
+- `RESEARCH.md`: 2025-26 literature on synthetic data for PFNs / time-series models.
+- `attempts.jsonl`: one line per earlier candidate here: its change, how far it got,
+  its screen number, and the exact reason it died.
+Before editing: read the three briefs, then grep `attempts.jsonl` for your idea. If
+it was tried, either pick another idea or say in your note why yours differs.
+"""
 
 
 def build_prompt(*, directives: str, notebook: str, outcomes: list[str], parent: str,
-                 briefs: list[tuple[str, str]] = (), brief_chars: int = 10000) -> str:
-    """The worker prompt. ``briefs`` are ``(file name, text)`` knowledge files
-    (operator/LINEAGE.md, DETHRONES.md, RESEARCH.md), each capped at
-    ``brief_chars`` so the prompt stays bounded."""
-    rows = "\n".join(outcomes[-25:]) or "(none yet)"
-    knowledge = "".join(
-        f"\n## {BRIEF_TITLES.get(name, name)}\n{text.strip()[:brief_chars]}\n"
-        for name, text in briefs if text.strip())
+                 knowledge: bool = True) -> str:
+    """The worker prompt: short by design. The briefs and the full attempt
+    history live in the knowledge folder; the prompt carries the operator's
+    directives, the last outcomes (with their full failure reasons) and the
+    tail of the lessons notebook."""
+    rows = "\n".join(outcomes[-10:]) or "(none yet)"
     return (PROMPT
-            + knowledge
+            + (KNOWLEDGE_STEP if knowledge else "")
             + f"\n## Operator directives\n{directives.strip() or '(none)'}\n"
-            + f"\n## Lessons from earlier workers\n{notebook.strip()[-6000:] or '(none yet)'}\n"
-            + f"\n## Outcome log (most recent last)\n{rows}\n"
+            + f"\n## Recent lessons\n{notebook.strip()[-2000:] or '(none yet)'}\n"
+            + f"\n## Last outcomes (all of them: {KNOWLEDGE_DIR}/attempts.jsonl)\n{rows}\n"
             + f"\n## This proposal\nParent: {parent}. Your working directory is the copy.\n")
 
 
-def _agent_argv(cfg) -> list[str]:
+def _agent_argv(cfg, knowledge: Path | None = None) -> list[str]:
     argv = shlex.split(DEFAULT_AGENT_CMD)
     if cfg.agent_max_turns > 0:
         argv += ["--max-turns", str(int(cfg.agent_max_turns))]
+    if knowledge is not None:
+        argv += ["--add-dir", str(knowledge)]      # readable; edits stay in the tree
     return argv
 
 
@@ -153,7 +163,9 @@ def run_agent(p: Proposal, cfg, *, home: Path, runner=None) -> Outcome:
             if runner is not None:
                 rc = runner(p, env)
             else:
-                rc = subprocess.run(_agent_argv(cfg), input=p.prompt, text=True, cwd=p.tree,
+                prompt = p.prompt.replace(KNOWLEDGE_DIR, str(p.knowledge or "(none)"))
+                rc = subprocess.run(_agent_argv(cfg, p.knowledge), input=prompt, text=True,
+                                    cwd=p.tree,
                                     stdout=out, stderr=subprocess.STDOUT, env=env,
                                     timeout=cfg.agent_timeout, check=False).returncode
         err = "" if rc == 0 else f"agent exited {rc} (see {log_path.name})"
@@ -205,6 +217,10 @@ class QueueWorkers:
             stage = self.q / "tmp" / p.id
             shutil.rmtree(stage, ignore_errors=True)
             shutil.copytree(p.tree, stage / "tree", ignore=_COPY_IGNORE)
+            if p.knowledge is not None and Path(p.knowledge).is_dir():
+                # The worker container sees only the queue: ship the knowledge
+                # next to the tree (never inside it).
+                shutil.copytree(p.knowledge, stage / "knowledge")
             (stage / "proposal.json").write_text(
                 json.dumps({"id": p.id, "parent_id": p.parent_id, "prompt": p.prompt}),
                 encoding="utf-8")
@@ -252,7 +268,9 @@ def serve_queue(queue_dir: Path, cfg, *, home: Path, once: bool = False, poll: f
             except OSError:
                 continue                                      # another worker took it
             meta = json.loads((run_dir / "proposal.json").read_text(encoding="utf-8"))
-            p = Proposal(meta["id"], meta["parent_id"], run_dir / "tree", meta["prompt"])
+            kdir = run_dir / "knowledge"
+            p = Proposal(meta["id"], meta["parent_id"], run_dir / "tree", meta["prompt"],
+                         knowledge=kdir if kdir.is_dir() else None)
             o = run_agent(p, cfg, home=home, runner=runner)
             dest = q / "done" / p.id
             shutil.rmtree(dest, ignore_errors=True)

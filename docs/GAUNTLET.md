@@ -190,6 +190,15 @@ Lium pods need no updating: the judge streams its own code onto every pod.
 `cascade gauntlet selftest` runs one full cycle on synthetic rounds with fake
 compute (no GPU, network or LLM). Run it after any change to the harness.
 
+## What workers know
+
+The prompt is short by design (~6k characters): the operator's directives, the
+last 10 outcomes with their full failure reasons, the tail of the lessons
+notebook, and one instruction: read the briefs and grep `attempts.jsonl` before
+editing. The briefs and the full history live in the read-only `knowledge/`
+folder (`--add-dir`; in Compose it travels with each queue item, next to the
+tree, never inside it). Workers see screen numbers and G3+ pass/fail only.
+
 ## The operator (Hermes)
 
 Hermes wakes every `OPERATOR_INTERVAL_SECONDS` (2h by default) with the
@@ -222,7 +231,11 @@ gauntlet/
   receipts/  pools/C/     cached receipts; today's pool C
   spend.json  jobs/       ledger; per-job spec/result/log
   queue/                  worker queue (compose)
-  operator/               status.json, DIRECTIVES.md, NOTEBOOK.md, reports/, STOP
+  operator/               status.json, DIRECTIVES.md, NOTEBOOK.md, reports/, STOP,
+                          and the briefs (LINEAGE.md, DETHRONES.md, RESEARCH.md)
+  knowledge/              what workers read (regenerated each proposal): the briefs +
+                          attempts.jsonl (every candidate: change, furthest stage,
+                          screen number, exact failure reason)
   submit/                 pending/, frozen/, history.jsonl, HOLD
   king/<digest>/          live kings (king_source = "live")
   STOP                    stop after the current stage

@@ -793,17 +793,53 @@ def test_progress_ignores_candidates_rejected_later(rcfg, tmp_path):
     assert g.progress() == {**g.progress(), "id": "c00091", "score": 20.0, "stage": "G2"}
 
 
-def test_every_brief_reaches_the_worker_prompt_capped(rcfg, tmp_path):
-    g, _, _, _ = _gauntlet(rcfg, tmp_path, script=[(1.6, 1.0)])
-    g.refresh_window(force=True)
+def test_knowledge_folder_holds_briefs_and_attempts_not_the_prompt(rcfg, tmp_path):
+    g, _, _, _ = _gauntlet(rcfg, tmp_path, script=[(1.6, 1.0), (0.8, 1.0)])
     op = g.wd / "operator"
     (op / "LINEAGE.md").write_text("lineage: try X\n")
     (op / "DETHRONES.md").write_text("dethrones: Y won on energy\n")
     (op / "RESEARCH.md").write_text("research: " + "z" * 20000)
-    p = g.propose(1)[0].prompt
-    assert "king lineage brief" in p and "dethrones vs the eval data" in p
-    assert "synthetic data for PFNs" in p and "Y won on energy" in p
-    assert p.count("z") <= g.h.search.brief_chars              # capped
+    assert g.cycle() == "ran"
+    g.put({"id": "c00099", "epoch": g.epoch, "status": "dead", "note": "GBFS fork",
+           "reason": "G1: runtime verify: NameError: name 'rng2' is not defined",
+           "stages": {"G0": {"pass": True}}})
+    p = g.propose(1)[0]
+    k = p.knowledge
+    assert (k / "LINEAGE.md").read_text() == "lineage: try X\n" and (k / "RESEARCH.md").is_file()
+    rows = [json.loads(x) for x in (k / "attempts.jsonl").read_text().splitlines()]
+    dead = next(r for r in rows if r["id"] == "c00099")
+    assert "NameError: name 'rng2'" in dead["reason"] and dead["furthest_stage"] == "G0"
+    win = next(r for r in rows if r["id"] == "c00001")
+    assert "G4.5" in win["passed"] and win["screen_rel"] is not None
+    assert "lcb" not in json.dumps(rows) and "rels" not in json.dumps(rows)  # G3+ stays pass/fail
+    assert "z" * 100 not in p.prompt and len(p.prompt) < 8000          # briefs are not inlined
+    assert "{KNOWLEDGE_DIR}/attempts.jsonl" in p.prompt and "NameError: name 'rng2'" in p.prompt
+
+
+def test_queue_ships_the_knowledge_next_to_the_tree(tmp_path):
+    q = tmp_path / "queue"
+    k = tmp_path / "know"
+    k.mkdir()
+    (k / "attempts.jsonl").write_text('{"id": "c1"}\n')
+    tree = _gen(tmp_path / "cands" / "c2" / "tree")
+    seen = {}
+
+    def runner(p, env):
+        seen["k"] = (p.knowledge / "attempts.jsonl").read_text()
+        seen["inside"] = (p.tree / "attempts.jsonl").exists()
+        return _editing_runner(p, env)
+
+    judge = QueueWorkers(q, timeout=30, poll=0.05)
+    out: list = []
+    t = threading.Thread(target=lambda: out.extend(
+        judge.run([Proposal("c2", "king", tree, "p", knowledge=k)])))
+    t.start()
+    while not any((q / "pending").iterdir()):
+        pass
+    serve_queue(q, _wcfg(), home=tmp_path / "wh", once=True, runner=runner)
+    t.join(10)
+    assert out[0].ok and seen == {"k": '{"id": "c1"}\n', "inside": False}
+    assert not (tree / "knowledge").exists()                           # never shipped
 
 
 def test_running_jobs_reserve_their_cost_so_parallel_jobs_cannot_overshoot(tmp_path):
