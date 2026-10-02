@@ -156,10 +156,12 @@ class _RecordingCli:
 
 
 def test_lium_terminate_uses_positional_target_without_yes_flag():
-    # `lium rm` has no --yes flag; passing one would error and we'd leak the pod.
+    # An old `lium rm` (0.0.x) has no --yes flag; passing one would error and we'd
+    # leak the pod. The flag set is probed once from `rm --help` (lium 0.9.x
+    # REQUIRES --yes without a TTY; see test_harness for that side).
     cli = _RecordingCli()
     LiumProvider(bin="lium", _run=cli).terminate("cascade-pod-0")
-    assert cli.calls == [["lium", "rm", "cascade-pod-0"]]
+    assert cli.calls == [["lium", "rm", "--help"], ["lium", "rm", "cascade-pod-0"]]
 
 
 def test_lium_launch_injects_ssh_pubkey_env_and_port():

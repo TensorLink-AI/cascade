@@ -115,7 +115,7 @@ CMD ["ui"]
 FROM base AS harness
 RUN apt-get update && apt-get install -y --no-install-recommends openssh-client \
     && rm -rf /var/lib/apt/lists/* \
-    && uv pip install --python /opt/cascade/.venv/bin/python lium.io
+    && uv pip install --python /opt/cascade/.venv/bin/python "lium.io==0.9.1"
 CMD ["gauntlet", "run", "--config", "/work/harness.toml", "--park-on-stop"]
 
 # --------------------------------------------------------------------------- #

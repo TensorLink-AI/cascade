@@ -905,6 +905,8 @@ class LiumProvider:
     _sku_by_name: dict = field(default_factory=dict, repr=False)
     # pod name → listed $/h of the executor it launched on (spend accounting).
     _price_by_name: dict = field(default_factory=dict, repr=False)
+    # Whether this CLI's `rm` needs --yes (None = not probed yet).
+    _rm_yes: bool | None = field(default=None, repr=False)
 
     def _subprocess_env(self) -> dict[str, str] | None:
         """Child env for CLI calls: the payer's key layered over ours, or None.
@@ -1345,13 +1347,24 @@ class LiumProvider:
         executor = self._executor_by_name.get(pod_id, "")
         return self._executor_hosts().get(executor, "") if executor else ""
 
+    def _rm_argv(self, pod_id: str) -> list[str]:
+        """``lium rm`` for this CLI. Old CLIs (≤0.0.x) take a bare target and
+        reject ``--yes``; newer ones (0.9.x) require ``--yes`` without a TTY and
+        otherwise exit 2 having removed NOTHING. Probed once from ``rm --help``."""
+        if self._rm_yes is None:
+            try:
+                helptext = self._cli(["rm", "--help"]).stdout or ""
+            except ProvisionError:
+                helptext = ""
+            self._rm_yes = "--yes" in helptext
+        return ["rm", pod_id, "--yes"] if self._rm_yes else ["rm", pod_id]
+
     def terminate(self, pod_id: str) -> None:
-        # `lium rm <target>` takes a positional target and does NOT prompt — there
-        # is no --yes flag (verified against the installed CLI). Passing one would
-        # error and we'd mistake a live pod for a terminated one, i.e. leak it.
+        # The flag set depends on the CLI version (see _rm_argv): sending the
+        # wrong one leaves the pod running while this call looks successful.
         executor = self._executor_of_pod(pod_id)      # before the pod vanishes
         try:
-            self._cli(["rm", pod_id])
+            self._cli(self._rm_argv(pod_id))
             log.info("lium rm %s", pod_id)
         except ProvisionError as e:
             # Idempotent: an already-gone pod is success, not a leak.

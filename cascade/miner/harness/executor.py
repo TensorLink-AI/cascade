@@ -334,12 +334,23 @@ class LiumExecutor:
                 self._terminate(name)
 
     def _terminate(self, name: str) -> None:
+        """Tear a pod down and BELIEVE THE LISTING, not the call: a teardown the
+        CLI did not perform (observed: lium 0.9.1 exits 2 on `rm` without --yes,
+        which the provider logs as "already terminated") keeps the pod in the
+        ledger, still billing, and the reaper retries it."""
+        from ...provision.funded import terminate_verified
+
         try:
-            self.provider.terminate(name)
+            gone = terminate_verified(self.provider, name)
         except Exception as e:  # noqa: BLE001
             log.error("terminate %s failed: %s (check the Lium console)", name, e)
-        self.ledger.close(name)
+            gone = False
         self._pods.pop(name, None)
+        if gone:
+            self.ledger.close(name)
+        else:
+            log.error("pod %s is STILL RUNNING after teardown; it stays in the spend "
+                      "ledger and is retried by the reaper", name)
 
     def _mark_bad(self, name: str) -> None:
         machine = getattr(self.provider, "machine_of", lambda n: None)(name)
@@ -480,7 +491,12 @@ class LiumExecutor:
             self._cv.notify_all()
 
     def reap(self) -> None:
-        """Tear down idle pods past ``idle_minutes``, and every idle pod at the cap."""
+        """Tear down idle pods past ``idle_minutes``, every idle pod at the cap,
+        and retry any pod a failed teardown left running (still in the ledger,
+        no longer held)."""
+        for name in self.ledger.live():
+            if name not in self._pods:
+                self._terminate(name)
         cap = float(getattr(self.cfg, "total_usd_cap", 0.0) or 0.0)
         at_cap = (self.ledger.spent_today() >= self.cfg.daily_usd_cap
                   or bool(cap and self.ledger.spent_total() >= cap))

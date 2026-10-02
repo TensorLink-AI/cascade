@@ -945,3 +945,54 @@ def test_a_refused_rental_fails_fast(tmp_path):
     ex = _lium(tmp_path, Refused(), clock, cap=10.0)
     res = ex.run({"kind": "replay", "inputs": {}, "params": {}})
     assert "refused the rental" in res["error"] and Refused.calls == 1   # one poll, not 30 min
+
+
+def test_a_teardown_the_cli_did_not_perform_is_not_trusted(tmp_path):
+    clock = {"t": 1_790_000_000.0}
+
+    class Sticky(_FakeProvider):
+        def __init__(self):
+            super().__init__()
+            self.live = set()
+
+        def launch(self, spec):
+            names = super().launch(spec)
+            self.live.update(names)
+            return names
+
+        def terminate(self, name):            # "succeeds" but leaves the pod running
+            self.terminated.append(name)
+
+        def list_tagged(self, prefix):
+            return [n for n in self.live if n.startswith(prefix)]
+
+    prov = Sticky()
+    ex = _lium(tmp_path, prov, clock, cap=10.0)
+    ex.run({"kind": "replay", "inputs": {}, "params": {}})
+    ex.close()
+    assert ex.ledger.live()                     # still billed: the pod is still there
+    prov.live.clear()                           # the CLI works again
+    ex.reap()
+    assert ex.ledger.live() == []
+
+
+def test_lium_rm_flags_follow_the_cli_version():
+    from cascade.provision.core import LiumProvider
+
+    def cli(help_text):
+        seen = []
+
+        def run(argv):
+            seen.append(argv)
+            out = help_text if argv[1:] == ["rm", "--help"] else ""
+            return SimpleNamespace(returncode=0, stdout=out, stderr="")
+        return run, seen
+
+    run, seen = cli("Options:\n  -y, --yes  Skip the confirmation prompt")
+    p = LiumProvider(bin="lium", _run=run)
+    p.terminate("pod-a")
+    assert ["lium", "rm", "pod-a", "--yes"] in seen          # lium 0.9.x
+    run, seen = cli("Usage: lium rm TARGET")
+    p = LiumProvider(bin="lium", _run=run)
+    p.terminate("pod-b")
+    assert ["lium", "rm", "pod-b"] in seen                   # lium 0.0.x
