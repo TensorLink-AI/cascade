@@ -1467,17 +1467,23 @@ def test_leg_finishing_after_its_era_is_requeued_at_finish_not_at_rollover(cfg, 
     assert (tmp_path / "leg_walls.json").exists()                  # its wall was still measured
 
 
-def test_leg_whose_bench_outlives_its_era_is_requeued_not_orphaned(cfg, tmp_path):
-    """2026-09-28 22:24–22:33: three legs finished TRAINING before the 22:03
-    rollover, benched ~80 min on their payer pods, and were filed under the
-    dead era after it — unjudgeable, stranded until the next rollover."""
+def test_leg_whose_bench_outlives_its_era_still_settles_in_it(cfg, tmp_path):
+    """2026-09-28 22:24 and 2026-10-02 22:03 (uid 156): legs finished TRAINING
+    before the rollover but benched ~1 h on their payer pods; filed only after
+    the bench, they missed their era and the miner paid for a second leg. The
+    leg is now recorded at training end and judged in its own era; the bench
+    (telemetry) lands later and is republished into that settlement's report."""
     armed = _armed(cfg)
     clock = Clock()
+    candidates = []
 
     class BenchHold(FakeOps):
         def bench_challenger(self, entry, king, era):
             self.hold["BENCH"].wait(10)
             return super().bench_challenger(entry, king, era)
+
+        def record_bench_candidates(self, manifest, report):
+            candidates.append((manifest.round_id, report.entries))
 
     sched, ops = _sched(armed, tmp_path, clock, ops=BenchHold(tmp_path, clock))
     client = FakeClient()
@@ -1490,16 +1496,42 @@ def test_leg_whose_bench_outlives_its_era_is_requeued_not_orphaned(cfg, tmp_path
     ops.hold = {"BENCH": threading.Event()}                         # training done, bench blocks
     sched.tick(client, b0)
     time.sleep(0.05)
-    assert q.get("ALFA").status == "in_flight"
+    assert any(f.hotkey == "ALFA" and f.bench is None for f in sched.state.finished)
     clock.t += era_len * R.BLOCK_SECONDS                            # the era rolls mid-bench
     sched.tick(client, era_start + era_len + 1)
     assert sched.state.current.index == armed.round.rolling_from_block // era_len + 1
+    settled = [m for m in ops.manifests if any(e.miner_hotkey == "ALFA" for e in m.entries)]
+    assert len(settled) == 1                                        # judged in its own era
+    assert q.get("ALFA").status == "done" and q.get("ALFA").attempts == 0
+    rid = settled[0].round_id
     ops.hold["BENCH"].set()
     _join(sched)
-    assert q.get("ALFA").status == "queued"                         # requeued when the bench ended
-    assert q.get("ALFA").attempts == 0
-    assert all(f.hotkey != "ALFA" for f in sched.state.finished)    # no orphan recorded
+    reports = [b for b in ops.benches if b[0] == "report" and b[1] == rid]
+    assert reports and ("challenger", "ALFA") in reports[-1][2]     # late numbers republished
+    assert candidates and candidates[-1][0] == rid                  # and offered to promotion
     assert ops.torn_down and ops.torn_down[0][0] == "ALFA"          # payer pod released once
+
+
+def test_bench_landing_before_its_settlement_rides_the_report(cfg, tmp_path):
+    """The common case is unchanged: a bench that finishes before the
+    boundary is published in that settlement's report, not republished."""
+    armed = _armed(cfg)
+    clock = Clock()
+    sched, ops = _sched(armed, tmp_path, clock)
+    client = FakeClient()
+    q = ops.queue()
+    era_start = armed.round.rolling_from_block
+    b0 = era_start + 5
+    ops.commits.append(_commit("ALFA", REF["ALFA"], b0 - 100))
+    q.add("ALFA", REF["ALFA"], reveal_block=b0 - 100)
+    sched.tick(client, b0)
+    _join(sched)
+    leg = next(f for f in sched.state.finished if f.hotkey == "ALFA")
+    assert leg.bench is not None                                    # numbers on the leg
+    clock.t += EB * R.BLOCK_SECONDS
+    sched.tick(client, era_start + EB + 1)
+    reports = [b for b in ops.benches if b[0] == "report"]
+    assert len(reports) == 1 and ("challenger", "ALFA") in reports[0][2]
 
 
 def test_finished_legs_stranded_under_a_dead_era_are_swept_at_the_next_tick(cfg, tmp_path):
@@ -1927,6 +1959,43 @@ def test_verification_after_settlement_republishes_that_rounds_report(cfg, tmp_p
     assert "ALFA" in _report_hotkeys(ops, rid)             # same round, republished
     assert "KING" in _report_hotkeys(ops, rid)             # earlier entries kept
     assert sched.state.verify_queue == []
+
+
+def test_payer_bench_landing_after_settlement_is_verified_into_that_round(cfg, tmp_path):
+    """A payer bench that outlives the boundary no longer holds the leg: the
+    leg settles, and the late unverified numbers queue for verification
+    stamped with the round that judged it, then republish into its report."""
+    armed = _armed(cfg)
+    clock = Clock()
+
+    class LatePayerBench(_VerifyOps):
+        def bench_challenger(self, entry, king, era):
+            self.hold["BENCH"].wait(10)
+            self.benches.append(("challenger", entry.miner_hotkey, era.index, self.clock()))
+            return {R.VERIFY_PENDING: {**dict(self.bench_scores), "_reason": "king pod busy"}}
+
+    ops = LatePayerBench(tmp_path, clock)
+    ops.hold = {"BENCH": threading.Event()}
+    sched, _ = _sched(armed, tmp_path, clock, ops=ops)
+    client = FakeClient()
+    q = ops.queue()
+    era_start = armed.round.rolling_from_block
+    b0 = era_start + 5
+    ops.commits.append(_commit("ALFA", REF["ALFA"], b0 - 100))
+    q.add("ALFA", REF["ALFA"], reveal_block=b0 - 100)
+    sched.tick(client, b0)
+    time.sleep(0.05)
+    _advance(clock, ops, sched, client, from_block=b0, to_block=era_start + EB + 1)
+    settled = [m for m in ops.manifests if any(e.miner_hotkey == "ALFA" for e in m.entries)]
+    assert len(settled) == 1 and q.get("ALFA").status == "done"
+    rid = settled[0].round_id
+    ops.hold["BENCH"].set()
+    _join(sched)
+    assert [x["round_id"] for x in sched.state.verify_queue] == [rid]
+    sched.tick(client, era_start + EB + 2)
+    _wait_verify(sched)
+    assert ops.verify_calls == ["ALFA"]
+    assert "ALFA" in _report_hotkeys(ops, rid) and sched.state.verify_queue == []
 
 
 def test_forged_payer_numbers_are_dropped(cfg, tmp_path):
