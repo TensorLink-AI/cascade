@@ -110,3 +110,26 @@ def test_idle_king_pod_is_torn_down_at_once():
     f._rolling_retire_king_pod_now = lambda era: retired.append(era.index)
     TrainerRunner._rolling_retire_king_pod(f, ERA)
     assert retired == [3]
+
+
+def test_released_king_pod_is_forgotten_so_verification_waits():
+    """2026-10-03: a released (torn-down) king pod must not stay mapped as the
+    verify host — a later verification would SSH into a dead pod and burn its
+    attempts. Once released, verification returns "wait" for the next pod."""
+    import threading
+
+    torn = []
+    f = _fake()
+    f.cfg.subnet = SimpleNamespace(netuid=91)
+    f._rolling_king_hosts = {3: KING_POD}
+    f._funded_king_lock = threading.Lock()
+    f._rolling_king_host_era = 3
+    f._funded_king_host = KING_POD
+    f._load_funded_ledger = lambda: [SimpleNamespace(payer_hotkey="", instance_id="cascade-n91-7-funded-king-0")]
+    f._teardown_operator_pod = lambda pod: torn.append(pod.instance_id)
+    assert f._rolling_verify_host(_entry("KING", "king"), ERA) is KING_POD
+    TrainerRunner._rolling_retire_king_pod_now(f, ERA)
+    assert torn == ["cascade-n91-7-funded-king-0"]
+    assert f._rolling_verify_host(_entry("KING", "king"), ERA) is None
+    assert ("challenger", "toto2-4m", "ALFA") in f._final_role_hosts   # other roles untouched
+    assert f._funded_king_host is None

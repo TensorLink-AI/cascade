@@ -459,6 +459,11 @@ class LegOps:
     def retire_king_pod(self, era: EraState) -> None:
         self.r._rolling_retire_king_pod(era)
 
+    def release_idle_king_pod(self, era: EraState) -> None:
+        """Same teardown as :meth:`retire_king_pod` (bench-lock aware), kept
+        separate so an idle release is never read as a throne/king change."""
+        self.r._rolling_retire_king_pod(era)
+
     def rotate_king_pod(self, era: EraState, reason: str) -> None:
         self.r._rolling_rotate_king_pod(era, reason)
 
@@ -562,6 +567,7 @@ class RollingScheduler:
         self._threads: dict[str, threading.Thread] = {}     # hotkey -> leg thread
         self._king_threads: dict[int, threading.Thread] = {}  # era index -> king leg thread
         self._verify_thread: threading.Thread | None = None   # one operator verification at a time
+        self._idle_released: set[int] = set()   # eras whose idle king pod was released early
         self._started = False
 
     # ── persistence ──────────────────────────────────────────────────────────
@@ -596,6 +602,7 @@ class RollingScheduler:
         self._adopt_dethrone(client)
         self._maybe_king_legs(client, block, now)
         self._drain_verifies()
+        self._release_idle_king_pods()
         self._intake(client, block, now)
 
     # ── startup / restart ────────────────────────────────────────────────────
@@ -1046,6 +1053,38 @@ class RollingScheduler:
         t = threading.Thread(target=_run, name=f"king-era{era.index}", daemon=True)
         self._king_threads[era.index] = t
         t.start()
+
+    def _release_idle_king_pods(self) -> None:
+        """Release an era's operator king pod the moment it has nothing to do.
+
+        The pod used to live for the whole era (about 15 h at about $1.30/h on an
+        H100) only to re-bench payer checkpoints that mostly never came
+        (2026-10-03: idle 11.5 h after its king leg and bench). Released when:
+        the era's king leg is in, its bench thread is done, no verification
+        is running or queued. A verification queued later waits ("wait" costs
+        no attempt) for the next king pod — the next era's pod is rented for
+        its own king leg anyway — and its numbers republish into their round's
+        report then. Never under a running sweep (``retire_king_pod`` defers
+        on the bench lock). Idempotent per process; a restart re-checks once."""
+        with self._lock:
+            if self._verify_thread is not None and self._verify_thread.is_alive():
+                return
+            if self.state.verify_queue:
+                return
+            eras = [e for e in (self.state.current, self.state.next) if e is not None]
+            idle = [e for e in eras
+                    if e.king_entry is not None
+                    and e.index not in self._king_threads
+                    and e.index not in self._idle_released]
+            for e in idle:
+                self._idle_released.add(e.index)
+        for e in idle:
+            log.info("rolling: era %d king pod released — king leg and bench done, nothing "
+                     "to verify (a later verification waits for the next king pod)", e.index)
+            try:
+                self.ops.release_idle_king_pod(e)
+            except Exception as ex:  # noqa: BLE001 — the rollover teardown still runs
+                log.warning("rolling: early release of era %d king pod failed: %s", e.index, ex)
 
     def _current_ref(self, client, hotkey: str, block: int) -> str | None:
         from ..validator.loop import ref_as_of
