@@ -85,6 +85,7 @@ class FakeOps(LegOps):
         self.leg_calls: list[tuple] = []
         self.torn_down: list[tuple[str, float]] = []
         self.retired: list[int] = []
+        self.released: list[int] = []
         self.manifests: list = []
         self.benches: list[tuple] = []
         self.rosters: list = []
@@ -158,6 +159,9 @@ class FakeOps(LegOps):
 
     def retire_king_pod(self, era):
         self.retired.append(era.index)
+
+    def release_idle_king_pod(self, era):
+        self.released.append(era.index)
 
     def rotate_king_pod(self, era, reason):
         self.rotated.append((era.index, reason))
@@ -2037,3 +2041,48 @@ def test_unsettled_verification_of_a_requeued_leg_is_dropped(cfg, tmp_path):
         sched.state.finished = []               # the era ended; the leg was requeued
     sched._drain_verifies()
     assert sched.state.verify_queue == []
+
+
+# ── idle king pod release (2026-10-03) ──────────────────────────────────────
+
+def test_idle_king_pod_is_released_once_its_leg_and_bench_are_done(cfg, tmp_path):
+    """The era king pod was kept the whole era (about 15 h of H100) though idle
+    after its king leg and bench. It is released as soon as it has nothing to
+    do — not while the leg trains, and only once per era."""
+    armed = _armed(cfg)
+    clock = Clock()
+    ops = _HeldKingOps(tmp_path, clock)
+    sched, _ = _sched(armed, tmp_path, clock, ops=ops)
+    client = FakeClient()
+    b0 = armed.round.rolling_from_block + 5
+    ops.hold_kings = {"KING"}
+    sched.tick(client, b0)                      # era king leg in flight
+    idx = sched.state.current.index
+    assert idx not in ops.released              # never under a running leg
+    ops.king_gate.set()
+    _join(sched)
+    sched.tick(client, b0 + 1)
+    assert ops.released.count(idx) == 1
+    sched.tick(client, b0 + 2)
+    assert ops.released.count(idx) == 1         # once per era
+    assert ops.retired == []                    # not read as a throne change
+
+
+def test_king_pod_is_kept_while_a_verification_is_queued(cfg, tmp_path):
+    """A queued payer-bench verification needs the pod: release waits until
+    the queue drains."""
+    armed, clock, ops, sched, client, era_start, b0 = _pending_leg_setup(cfg, tmp_path)
+    idx = sched.state.current.index
+    assert sched.state.verify_queue                 # ALFA's numbers wait for the king leg
+    ops.verify_status = "wait"                      # pod not usable yet
+    ops.king_gate.set()
+    _join(sched)
+    sched.tick(client, b0 + 1)
+    _wait_verify(sched)
+    assert idx not in ops.released                  # queue non-empty: kept
+    ops.verify_status = "ok"
+    sched.tick(client, b0 + 2)
+    _wait_verify(sched)
+    assert sched.state.verify_queue == []
+    sched.tick(client, b0 + 3)
+    assert ops.released.count(idx) == 1             # drained: released

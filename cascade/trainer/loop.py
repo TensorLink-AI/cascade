@@ -8009,7 +8009,12 @@ class TrainerRunner:
         for pod in self._load_funded_ledger():
             if not pod.payer_hotkey and str(pod.instance_id).startswith(prefix + "-"):
                 self._teardown_operator_pod(pod)
-        self.__dict__.get("_rolling_king_hosts", {}).pop(era.index, None)
+        host = self.__dict__.get("_rolling_king_hosts", {}).pop(era.index, None)
+        if host is not None:
+            # Forget role mappings onto the released pod: a later verification
+            # must "wait" for the next king pod, never SSH into a dead one.
+            for k in [k for k, h in self._final_role_hosts.items() if h is host]:
+                self._final_role_hosts.pop(k, None)
         with self._funded_king_lock:
             if self._rolling_king_host_era == era.index:
                 self._funded_king_host = None
