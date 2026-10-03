@@ -195,9 +195,13 @@ jobs:
           echo "publishing with $TOML (effective-block=$EFFECTIVE_BLOCK)"
           # SERIES CAPS (publish only — the reveal below mirrors the published
           # tar byte-for-byte and builds nothing, so no flag parity is needed).
-          # --max-panel-series-per-feed 25: each GBFS bike-share feed panel-expands
-          #   into ~200 station series (8 feeds put transport at ~73% of the pool);
-          #   25 per feed keeps the signal without the flood.
+          # --max-panel-series-per-feed 5: each GBFS bike-share feed panel-expands
+          #   into ~200 station series (8 feeds put transport at ~73% of the pool).
+          #   25 per feed (until 2026-10-03) still let 28 panel feeds supply ~26% of
+          #   the series but only ~2.5% of the clusters, and transport filled its
+          #   600 from ~50 sources. The KOTH bootstrap resamples whole feeds, so
+          #   evidence scales with distinct sources: 5 per feed makes the same caps
+          #   draw from ~2.4x more feeds and tightens the LCB.
           # --max-series-per-domain-freq 300: balance by domain AND granularity —
           #   no (domain, freq) cell can dominate, so an hourly flood inside a
           #   domain can't crowd out that domain's daily series either.
@@ -216,7 +220,7 @@ jobs:
           TSFORGE_DIR=./tsforge cascade-pool publish \
             --chain-toml "$TOML" \
             --sources tsbench_forge \
-            --max-panel-series-per-feed 25 \
+            --max-panel-series-per-feed 5 \
             --max-series-per-domain-freq 300 \
             --max-series-per-domain 600 \
             --selection balanced \
