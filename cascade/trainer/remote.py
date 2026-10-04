@@ -835,6 +835,32 @@ def probe_host_bench(host: RemoteHost, *,
     return None, "host bench probe printed no result"
 
 
+# The public-benchmark sidecar needs NVIDIA driver >= 580 (crusoe 535 and
+# Warsaw 570 hosts fail every bench in about a minute; 2026-10-04 the era-2559
+# king pod, driver 570, burned three payer verifications to "dropped").
+BENCH_MIN_DRIVER_MAJOR = 580
+
+
+def probe_driver_major(host: RemoteHost, *, timeout: float = 45.0) -> tuple[int | None, str]:
+    """``(major, "")`` for ``host``'s NVIDIA driver (e.g. 570 for 570.211.01),
+    or ``(None, why)`` when it could not be read."""
+    cmd = "nvidia-smi --query-gpu=driver_version --format=csv,noheader"
+    try:
+        proc = subprocess.run(build_ssh_argv(host, cmd), capture_output=True,
+                              text=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        return None, f"driver probe timed out after {timeout:.0f}s"
+    except OSError as e:
+        return None, f"driver probe could not start: {e}"
+    if proc.returncode != 0:
+        return None, f"driver probe failed rc={proc.returncode}: {(proc.stderr or '')[-160:]}"
+    for line in (proc.stdout or "").splitlines():
+        head = line.strip().split(".")[0]
+        if head.isdigit():
+            return int(head), ""
+    return None, "driver probe printed no version"
+
+
 def build_scp_argv(host: RemoteHost, local_path: str, remote_path: str) -> list[str]:
     """The local ``scp`` argv copying ``local_path`` to ``host:remote_path``
     under exactly :func:`build_ssh_argv`'s transport policy (a pinned host

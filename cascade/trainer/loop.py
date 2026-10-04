@@ -1012,6 +1012,31 @@ def _lium_provider(rnd, *, price_caps: dict | None = None, **kw):
     return apply_price_caps(prov, **(price_caps or {}))
 
 
+def host_cannot_bench(runner, host) -> str:
+    """Why ``host`` cannot run the public-benchmark sidecar, or ``""``.
+
+    Only checked when ``runner`` has benches configured. The NVIDIA driver
+    must be at least :data:`~cascade.trainer.remote.BENCH_MIN_DRIVER_MAJOR`;
+    a probe that cannot read it passes (never sink a pod on an ssh hiccup).
+    Cached per endpoint on the runner — a pod's driver does not change."""
+    if getattr(runner, "cascade_bench_plan", None) is None or host is None:
+        return ""
+    from .remote import BENCH_MIN_DRIVER_MAJOR, probe_driver_major
+
+    key = (str(getattr(host, "host", "")), int(getattr(host, "port", 0) or 0))
+    cache = runner.__dict__.setdefault("_bench_driver_cache", {})
+    if key not in cache:
+        major, err = probe_driver_major(host)
+        if major is None:
+            log.warning("host %s: driver probe unavailable (%s) — bench capability "
+                        "assumed", key[0], err)
+        cache[key] = major
+    major = cache[key]
+    if major is not None and major < BENCH_MIN_DRIVER_MAJOR:
+        return f"driver {major} < {BENCH_MIN_DRIVER_MAJOR}: cannot run the public benchmarks"
+    return ""
+
+
 def king_pod_name_prefix(netuid: int, round_id: str) -> str:
     """Name prefix of a round's JIT king pod (``<prefix>-0``). The n<netuid>
     token keeps it OUT of both the provisioner's reaper scheme (which must
@@ -3568,6 +3593,12 @@ class TrainerRunner:
                     # ~587M fleet median ⇒ 70 % of budget). Fresh rents only —
                     # an adopted pod already holds this round's checkpoint.
                     why = self._host_bench_below_floor(king_host, sku, f"king pod {pod_id}")
+                    if why:
+                        _fail_king(pod_id, f"king pod rejected: {why}")
+                    # The king pod also runs the era's public benches and the
+                    # payer verifications: a driver too old for the bench
+                    # sidecar burns every one of them (2026-10-04, driver 570).
+                    why = host_cannot_bench(self, king_host)
                     if why:
                         _fail_king(pod_id, f"king pod rejected: {why}")
                 except ProvisionError as e:
@@ -7977,6 +8008,10 @@ class TrainerRunner:
         if host is not None and era.king_hotkey:
             self._final_role_hosts[("king", contract.arch_preset, era.king_hotkey)] = host
 
+    def _rolling_king_pod_can_bench(self, era) -> bool:
+        host = self.__dict__.get("_rolling_king_hosts", {}).get(era.index)
+        return host is None or not host_cannot_bench(self, host)
+
     def _rolling_retire_king_pod(self, era) -> None:
         """Tear down an era's operator king pod (era over, or its pre-trained
         king superseded) — but never under a running benchmark sweep: the
@@ -8039,6 +8074,10 @@ class TrainerRunner:
         contract = self.cfg.throne_contracts()[0]
         host = self._final_role_hosts.get(("king", contract.arch_preset, entry.miner_hotkey))
         if host is None or self.cascade_bench_plan is None:
+            return None
+        why = host_cannot_bench(self, host)
+        if why:
+            log.warning("rolling: era %d king bench skipped — %s", era.index, why)
             return None
         scores = self._remote_bench_scores(host, entry, str(era.base_seed),
                                            contract.arch_preset, role_dir="king")
@@ -8111,6 +8150,8 @@ class TrainerRunner:
         king_host = self._rolling_verify_host(king, era)
         if king_host is None or self.cascade_bench_plan is None:
             return "wait", None
+        if host_cannot_bench(self, king_host):
+            return "wait", None          # never burn an attempt on a pod that cannot bench
 
         def _score(d: dict) -> float:
             return cascade_score(d["gifteval_crps"], d["gifteval_mase"], d["boom_crps"],

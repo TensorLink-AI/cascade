@@ -163,6 +163,9 @@ class FakeOps(LegOps):
     def release_idle_king_pod(self, era):
         self.released.append(era.index)
 
+    def king_pod_can_bench(self, era):
+        return getattr(self, "can_bench", True)
+
     def rotate_king_pod(self, era, reason):
         self.rotated.append((era.index, reason))
 
@@ -2086,3 +2089,18 @@ def test_king_pod_is_kept_while_a_verification_is_queued(cfg, tmp_path):
     assert sched.state.verify_queue == []
     sched.tick(client, b0 + 3)
     assert ops.released.count(idx) == 1             # drained: released
+
+
+def test_king_pod_that_cannot_bench_is_released_despite_queued_verifications(cfg, tmp_path):
+    """2026-10-04: the era-2559 king pod (driver 570) could not bench; queued
+    verifications must not pin an idle GPU — they wait for the next pod."""
+    armed, clock, ops, sched, client, era_start, b0 = _pending_leg_setup(cfg, tmp_path)
+    idx = sched.state.current.index
+    ops.verify_status = "wait"                      # what verify returns on such a pod
+    ops.can_bench = False
+    ops.king_gate.set()
+    _join(sched)
+    sched.tick(client, b0 + 1)
+    _wait_verify(sched)
+    assert sched.state.verify_queue                 # numbers kept for the next pod
+    assert ops.released.count(idx) == 1

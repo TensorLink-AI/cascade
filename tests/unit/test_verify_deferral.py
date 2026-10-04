@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from cascade.shared.manifest import BenchScores, TrainedEntry, format_trained_pointer
 from cascade.trainer import rolling as R
 from cascade.trainer.bench_hook import host_bench_lock
-from cascade.trainer.loop import TrainerRunner
+from cascade.trainer.loop import TrainerRunner, host_cannot_bench
 from cascade.trainer.remote import RemoteHost
 
 KING_POD = RemoteHost(name="king", host="8.8.8.8", workdir="/root/cascade", cuda_device="0")
@@ -133,3 +133,35 @@ def test_released_king_pod_is_forgotten_so_verification_waits():
     assert f._rolling_verify_host(_entry("KING", "king"), ERA) is None
     assert ("challenger", "toto2-4m", "ALFA") in f._final_role_hosts   # other roles untouched
     assert f._funded_king_host is None
+
+
+def test_king_pod_with_old_driver_never_burns_a_verification():
+    """Driver < 580 cannot run the bench sidecar: verification waits (no
+    attempt), the king bench is skipped, and the rent gate names the reason."""
+    f = _fake()
+    f.cascade_bench_plan = object()
+    f._bench_driver_cache = {("8.8.8.8", int(KING_POD.port or 0)): 570}
+    why = host_cannot_bench(f, KING_POD)
+    assert "driver 570 < 580" in why
+    status, scores = TrainerRunner._rolling_verify_payer(
+        f, _entry("ALFA", "challenger"), {"gifteval_crps": 0.5}, _entry("KING", "king"), ERA)
+    assert (status, scores) == ("wait", None)
+    f._bench_driver_cache = {("8.8.8.8", int(KING_POD.port or 0)): 580}
+    assert host_cannot_bench(f, KING_POD) == ""
+
+
+def test_driver_probe_parses_and_fails_open(monkeypatch):
+    import subprocess
+
+    from cascade.trainer import remote as RM
+
+    def run(out, rc=0):
+        return lambda *a, **k: subprocess.CompletedProcess(a, rc, stdout=out, stderr="")
+    monkeypatch.setattr(RM.subprocess, "run", run("570.211.01\n"))
+    assert RM.probe_driver_major(KING_POD) == (570, "")
+    monkeypatch.setattr(RM.subprocess, "run", run("", rc=255))
+    major, why = RM.probe_driver_major(KING_POD)
+    assert major is None and "rc=255" in why
+    f = SimpleNamespace(cascade_bench_plan=object())
+    monkeypatch.setattr(RM, "probe_driver_major", lambda host: (None, "ssh down"))
+    assert host_cannot_bench(f, KING_POD) == ""      # unreadable ⇒ passes

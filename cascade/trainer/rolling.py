@@ -459,6 +459,9 @@ class LegOps:
     def retire_king_pod(self, era: EraState) -> None:
         self.r._rolling_retire_king_pod(era)
 
+    def king_pod_can_bench(self, era: EraState) -> bool:
+        return self.r._rolling_king_pod_can_bench(era)
+
     def release_idle_king_pod(self, era: EraState) -> None:
         """Same teardown as :meth:`retire_king_pod` (bench-lock aware), kept
         separate so an idle release is never read as a throne/king change."""
@@ -1054,6 +1057,12 @@ class RollingScheduler:
         self._king_threads[era.index] = t
         t.start()
 
+    def _can_bench(self, era: EraState) -> bool:
+        try:
+            return bool(self.ops.king_pod_can_bench(era))
+        except Exception:  # noqa: BLE001 — unknown ⇒ keep the pod for its queue
+            return True
+
     def _release_idle_king_pods(self) -> None:
         """Release an era's operator king pod the moment it has nothing to do.
 
@@ -1064,23 +1073,32 @@ class RollingScheduler:
         is running or queued. A verification queued later waits ("wait" costs
         no attempt) for the next king pod — the next era's pod is rented for
         its own king leg anyway — and its numbers republish into their round's
-        report then. Never under a running sweep (``retire_king_pod`` defers
-        on the bench lock). Idempotent per process; a restart re-checks once."""
+        report then. A pod that cannot bench at all (driver too old) is
+        released even with verifications queued — they wait for the next pod.
+        Never under a running sweep (``retire_king_pod`` defers on the bench
+        lock). Idempotent per process; a restart re-checks once."""
         with self._lock:
             if self._verify_thread is not None and self._verify_thread.is_alive():
                 return
-            if self.state.verify_queue:
-                return
+            queued = bool(self.state.verify_queue)
             eras = [e for e in (self.state.current, self.state.next) if e is not None]
             idle = [e for e in eras
                     if e.king_entry is not None
                     and e.index not in self._king_threads
                     and e.index not in self._idle_released]
+        if queued:
+            # Queued verifications keep the pod — unless it cannot bench them at
+            # all (driver too old): then they wait for the next king pod instead
+            # of holding an idle GPU (2026-10-04).
+            idle = [e for e in idle if not self._can_bench(e)]
+        with self._lock:
             for e in idle:
                 self._idle_released.add(e.index)
         for e in idle:
-            log.info("rolling: era %d king pod released — king leg and bench done, nothing "
-                     "to verify (a later verification waits for the next king pod)", e.index)
+            log.info("rolling: era %d king pod released — king leg and bench done, %s "
+                     "(a later verification waits for the next king pod)", e.index,
+                     "its pod cannot bench the queued verifications" if queued
+                     else "nothing to verify")
             try:
                 self.ops.release_idle_king_pod(e)
             except Exception as ex:  # noqa: BLE001 — the rollover teardown still runs
