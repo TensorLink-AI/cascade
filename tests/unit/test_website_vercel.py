@@ -1,12 +1,12 @@
 """The Vercel routing config (``cascade/website/vercel.json``).
 
-Both dashboards read their data SAME-ORIGIN first — behind the Vercel origin
-that means every bucket prefix the pages fetch needs a rewrite here, or the
-request resolves to a static path that does not exist and 404s. The absolute
-Hippius endpoints are only a fallback (they additionally need bucket CORS), so
-a missing rewrite silently degrades a whole section of the page to its pending
-state — which is exactly how ``benchmarks/`` shipped: rewrites existed for
-``receipts/`` and ``status/`` only, and the Public benchmark cell stayed dashed.
+Since 2026-10-05 both dashboards read their data from the bucket DIRECTLY
+first (Hippius has CORS ``*``) and use the SAME-ORIGIN Vercel proxy only as the
+last-resort fallback: proxying every poll through Vercel was the site's whole
+data-transfer bill. The fallback still needs a rewrite per bucket prefix, or a
+Hippius outage degrades a section to its pending state — which is exactly how
+``benchmarks/`` once shipped: rewrites existed for ``receipts/`` and
+``status/`` only, and the Public benchmark cell stayed dashed.
 
 These tests derive the required prefixes FROM the pages, so adding a fetch of a
 new prefix fails here until the rewrite exists. Pure text/JSON; no network.
@@ -78,3 +78,20 @@ def test_scoreboard_routes_reach_the_stakeholder_page(vercel: dict):
     dests = {r["source"]: r["destination"] for r in vercel["rewrites"]}
     assert dests["/scoreboard"] == "/stakeholders.html"
     assert dests["/stakeholders"] == "/stakeholders.html"
+
+
+@pytest.mark.parametrize("page", PAGES)
+def test_pages_spare_the_vercel_proxy(page):
+    """2026-10-05: each open tab pulled ~11 MB through Vercel every 30 s (all
+    endpoints raced, ?t= cache-buster, background tabs polling). Guard the fix:
+    no per-request buster, the same-origin proxy tried last, ETag reuse, slower
+    polling paused while the tab is hidden."""
+    html = (WEBSITE / page).read_text(encoding="utf-8")
+    fetch_json = re.search(r"function fetchJSON\(.*?\n\}\n", html, re.S).group(0)
+    assert "Date.now()" not in fetch_json and "\"?t=\"" not in fetch_json   # no buster literal
+    assert "concat([SAME_ORIGIN])" in fetch_json
+    assert 'cache: immutable ? "default" : "no-cache"' in fetch_json
+    assert "_jsonMemo[path]" in fetch_json
+    assert int(re.search(r"POLL_MS\s*=\s*(\d+)", html).group(1)) >= 60000
+    assert "if(!document.hidden) poll();" in html
+    assert '"visibilitychange"' in html
