@@ -1298,7 +1298,7 @@ var HUB_BASE = "https://hub.hippius.com/models/";
 // the on-chain commitment (.github/workflows/king-sync.yml), one commit per reign.
 var KING_GITHUB = "https://github.com/TensorLink-AI/cascade/tree/main/champions/king";
 var HUB_REF = "main";
-var POLL_MS = 30000;
+var POLL_MS = 120000;
 var _index = null, _latest = null, _status = null, _roundStatus = null, _heat = null,
     _subsSeen = null, _chartMode = "geomean", _smooth = 0, _dataState = "loading",
     _wsHist = null, _roster = null;
@@ -1329,18 +1329,36 @@ function shortRoundId(id){ id=String(id||""); return id.length>12?id.slice(0,6)+
 function timeAgo(i){ if(!i) return "--"; var s=Math.floor((Date.now()-new Date(i).getTime())/1000); if(s<0)s=0; if(s<60)return s+"s ago"; var m=Math.floor(s/60); if(m<60)return m+"m ago"; var h=Math.floor(m/60); if(h<24)return h+"h ago"; return Math.floor(h/24)+"d ago"; }
 function ema(a,al){ if(al>=1||!a.length) return a.slice(); var o=[a[0]]; for(var i=1;i<a.length;i++)o.push(al*a[i]+(1-al)*o[i-1]); return o; }
 
+var _jsonMemo = {};
+var FETCH_TIMEOUT_MS = 15000;
 function fetchJSON(path, opts){
-  // opts.bust=false for immutable objects (per-round bench reports): lets the
-  // browser/CDN cache them instead of refetching on every poll.
-  var bust=(opts && opts.bust===false) ? "" : "?t="+Date.now();
-  return new Promise(function(resolve,reject){
-    var pending=ENDPOINTS.length, settled=false;
-    ENDPOINTS.forEach(function(base){
-      fetch(base+"/"+path+bust).then(function(r){ if(!r.ok) throw new Error("HTTP "+r.status); return r.json(); })
-        .then(function(d){ if(settled)return; settled=true; resolve(d); })
-        .catch(function(){ pending--; if(pending===0&&!settled) reject(new Error("all endpoints failed")); });
-    });
-  });
+  // Bandwidth (2026-10-05): the old version raced EVERY endpoint at once with a
+  // per-request ?t= cache-buster, so each poll pulled the 2 MB index and the
+  // 9 MB receipt through the Vercel proxy (billed transfer) and threw the
+  // losing copies away. Now: try endpoints IN ORDER (direct Hippius/R2 first,
+  // the same-origin Vercel proxy only as the last resort), revalidate with the
+  // object's ETag (cache:"no-cache" -> a 304 with no body when unchanged), and
+  // reuse the already-parsed object when the ETag has not moved.
+  var immutable = opts && opts.bust===false;
+  var order = ENDPOINTS.filter(function(b){ return b!==SAME_ORIGIN; }).concat([SAME_ORIGIN]);
+  var i = 0;
+  function attempt(){
+    if(i>=order.length) return Promise.reject(new Error("all endpoints failed"));
+    var base = order[i++];
+    var ctl = (typeof AbortController!=="undefined") ? new AbortController() : null;
+    var timer = ctl ? setTimeout(function(){ ctl.abort(); }, FETCH_TIMEOUT_MS) : null;
+    return fetch(base+"/"+path, {cache: immutable ? "default" : "no-cache", signal: ctl ? ctl.signal : undefined})
+      .then(function(r){
+        if(timer) clearTimeout(timer);
+        if(!r.ok) throw new Error("HTTP "+r.status);
+        var tag = r.headers.get("etag");
+        var hit = _jsonMemo[path];
+        if(tag && hit && hit.etag===tag) return hit.data;      // unchanged: skip the re-parse
+        return r.json().then(function(d){ _jsonMemo[path] = {etag: tag, data: d}; return d; });
+      })
+      .catch(function(){ if(timer) clearTimeout(timer); return attempt(); });
+  }
+  return attempt();
 }
 
 // ── domain ────────────────────────────────────────────────────────────────
@@ -2801,7 +2819,8 @@ function poll(){
     .catch(function(){});
 }
 poll();
-setInterval(poll, POLL_MS);
+setInterval(function(){ if(!document.hidden) poll(); }, POLL_MS);
+document.addEventListener("visibilitychange", function(){ if(!document.hidden) poll(); });
 setInterval(function(){ renderCountdown(); renderStage(); }, 1000);  // tick ETA + stage clock
 </script>
 
