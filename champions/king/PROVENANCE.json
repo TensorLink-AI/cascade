@@ -1,8 +1,8 @@
 {
-  "ref": "vault/direct@sha256:298591a20129a4b1326f4ffcd7b56ddda32fd28a06590db3f2322acd465113a2",
-  "digest": "298591a20129a4b1326f4ffcd7b56ddda32fd28a06590db3f2322acd465113a2",
+  "ref": "vault/direct@sha256:bc25aa4323c91d3313e038c1a62f4d720b5fb7af27da58c687aad2db565c31a4",
+  "digest": "bc25aa4323c91d3313e038c1a62f4d720b5fb7af27da58c687aad2db565c31a4",
   "network": "finney",
-  "fetched_at": "2026-10-04T14:29:40Z",
-  "previous_digest": "4500367f1004fc38ca7c1fac18532fe3f64da6ce477b8fc9fc09746cc4070310",
+  "fetched_at": "2026-10-06T10:47:04Z",
+  "previous_digest": "298591a20129a4b1326f4ffcd7b56ddda32fd28a06590db3f2322acd465113a2",
   "note": "archived by scripts/sync_king.py \u2014 read-only fetch; verify against the on-chain commitment and the round receipts (cascade-audit)"
 }
