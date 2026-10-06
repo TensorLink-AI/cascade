@@ -95,3 +95,16 @@ def test_pages_spare_the_vercel_proxy(page):
     assert int(re.search(r"POLL_MS\s*=\s*(\d+)", html).group(1)) >= 60000
     assert "if(!document.hidden) poll();" in html
     assert '"visibilitychange"' in html
+
+
+@pytest.mark.parametrize("page", PAGES)
+def test_a_missing_object_is_not_retried_on_every_endpoint(page):
+    """2026-10-06: the in-order fallback turned each missing bench/training doc
+    (76 of 240 on the training tab) into four sequential misses, the last through
+    Vercel, and the tab loaded far slower. A 403/404 is final; only network
+    errors, timeouts and 5xx move on to the next endpoint."""
+    html = (WEBSITE / page).read_text(encoding="utf-8")
+    fetch_json = re.search(r"function fetchJSON\(.*?\n\}\n", html, re.S).group(0)
+    assert "r.status===403||r.status===404" in fetch_json
+    assert "miss.missing=true" in fetch_json
+    assert "if(e&&e.missing) throw e;" in fetch_json

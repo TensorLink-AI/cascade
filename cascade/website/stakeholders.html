@@ -1264,13 +1264,16 @@ function fetchJSON(path, opts){
     return fetch(base+"/"+path, {cache: immutable ? "default" : "no-cache", signal: ctl ? ctl.signal : undefined})
       .then(function(r){
         if(timer) clearTimeout(timer);
+        // 403/404 = the object is not there. Every endpoint serves the same bucket,
+        // so asking the next one (Vercel last) only repeats the miss: stop here.
+        if(r.status===403||r.status===404){ var miss=new Error("HTTP "+r.status); miss.missing=true; throw miss; }
         if(!r.ok) throw new Error("HTTP "+r.status);
         var tag = r.headers.get("etag");
         var hit = _jsonMemo[path];
         if(tag && hit && hit.etag===tag) return hit.data;      // unchanged: skip the re-parse
         return r.json().then(function(d){ _jsonMemo[path] = {etag: tag, data: d}; return d; });
       })
-      .catch(function(){ if(timer) clearTimeout(timer); return attempt(); });
+      .catch(function(e){ if(timer) clearTimeout(timer); if(e&&e.missing) throw e; return attempt(); });
   }
   return attempt();
 }
