@@ -302,21 +302,53 @@ class Admission:
     cross_era: bool
 
 
+def era_end_block(round_cfg, era_start: int) -> int:
+    """The boundary of an era's LAST settlement: the next era's start."""
+    return int(era_start) + int(era_length_blocks(round_cfg, int(era_start)))
+
+
 def admit(round_cfg, *, block_now: int, now: float, wall_seconds: float,
-          margin_seconds: float, current_era: int) -> Admission:
+          margin_seconds: float, current_era: int,
+          max_wall_seconds: float | None = None) -> Admission:
     """Cross-era admission rule (DEC-CA-0043 Init §5): a leg whose wall +
     margin cannot clear the current era's last settlement is not started
     under this era's seeds; it starts under the next era's, no earlier than
     that era's pre-train window (wall + margin before its first boundary).
-    Within-era slips settle at the next boundary."""
+    Within-era slips settle at the next boundary.
+
+    ``max_wall_seconds`` (the contract's ``max_train_seconds``): a leg may
+    run that long however fast its SKU usually is. A slip past an INTRA-era
+    boundary just settles at the next one, but a slip past the era's LAST
+    settlement loses the leg — the next era trains from a different init, so
+    it can never be judged and the payer pays for a discarded leg
+    (2026-10-09 uid 205: admitted on the RTX4090's typical 3.75 h, ran
+    ~4.5 h, finished 22 min after the era rolled). So a leg that could
+    overrun the era end at its max wall starts under the next era instead."""
     b = target_boundary(round_cfg, block_now=block_now, now=now,
                         wall_seconds=wall_seconds, margin_seconds=margin_seconds)
     # The settlement at boundary B belongs to the era containing B − 1: an
     # era's last settlement is the next era's start block (settlement_era).
     era = settlement_era(round_cfg, b)
     if era.index <= current_era:
-        return Admission(target_boundary=b, era_index=era.index, start_after=now,
-                         cross_era=False)
+        end = era_end_block(round_cfg, era.start_block)
+        overruns = (max_wall_seconds is not None and float(max_wall_seconds) > 0
+                    and now + float(max_wall_seconds) + margin_seconds
+                    >= wall_of_block(end, now=now, block_now=block_now))
+        if not overruns:
+            return Admission(target_boundary=b, era_index=era.index, start_after=now,
+                             cross_era=False)
+        from ..shared.config import effective_epoch_blocks
+
+        # Could still be training when the era rolls: start it NOW under the
+        # next era's seeds (its era-start is ``end``), aimed at that era's
+        # first settlement or later — never this era's last one.
+        b2 = target_boundary(round_cfg, block_now=block_now, now=now,
+                             wall_seconds=wall_seconds, margin_seconds=margin_seconds)
+        first_next = end + int(effective_epoch_blocks(round_cfg, end))
+        b2 = max(b2, first_next)
+        era2 = settlement_era(round_cfg, b2)
+        return Admission(target_boundary=b2, era_index=era2.index, start_after=now,
+                         cross_era=True)
     # Lands in a later era: start in the pre-train window of that era.
     era_start = era.start_block
     window_open = wall_of_block(era_start, now=now, block_now=block_now) - wall_seconds - margin_seconds
@@ -535,6 +567,16 @@ class LegOps:
 
     def margin_seconds(self) -> float:
         return float(self.r.FUNDED_PUBLISH_MARGIN_SECONDS)
+
+    def max_wall_seconds(self) -> float | None:
+        """The longest a leg may run (the contract's ``max_train_seconds``),
+        whatever its SKU's typical wall — what admission must assume before
+        it lets a leg near an era's end (a slip past the era's last
+        settlement loses the leg). ``None`` when unknown."""
+        try:
+            return float(max(int(c.max_train_seconds) for c in self.r.cfg.throne_contracts()))
+        except Exception:  # noqa: BLE001 — no contract context: typical-wall behaviour
+            return None
 
     def fitting_skus(self) -> tuple[str, ...]:
         try:
@@ -1160,8 +1202,11 @@ class RollingScheduler:
             # fit on what THIS ref measured last time (max with the SKU wall) and
             # leave room for the post-round bench before the boundary
             entry_wall = self._leg_walls().fit_wall(entry.ref, wall)
+            max_wall = self.ops.max_wall_seconds()
             adm = admit(self.cfg.round, block_now=block, now=now, wall_seconds=entry_wall,
-                        margin_seconds=margin + self._bench_margin(), current_era=cur.index)
+                        margin_seconds=margin + self._bench_margin(), current_era=cur.index,
+                        max_wall_seconds=(max(float(max_wall), entry_wall)
+                                          if max_wall else None))
             if adm.start_after > now:
                 held.append(entry.hotkey)          # waits for the pre-train window
                 not_jumps.add(entry.hotkey)
