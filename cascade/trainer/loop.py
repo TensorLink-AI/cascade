@@ -171,6 +171,13 @@ class _FundedOperatorFallback(Exception):
     explicit, owner-armed exception to _FundedLegSkip's rule (2026-09-12)."""
 
 
+class _FundedOperatorRent(_FundedOperatorFallback):
+    """An operator-billed rolling leg with NO operator lane on file: rent a pod
+    on the OPERATOR's Lium account for it (``_run_operator_rented_leg``).
+    Raised only where the rolling challenger path opted in; every other
+    handler sees the parent class and behaves exactly as before."""
+
+
 class _LaneDeadlinePassed(Exception):
     """No operator lane came free before the round's latest safe start: a leg
     started now could not finish inside the epoch. Raised by the final lane
@@ -2744,6 +2751,10 @@ class TrainerRunner:
                              "(a retry adopts it; a complete checkpoint there "
                              "skips the retrain)", pod.instance_id)
                     continue
+                if keep_payers and self._is_operator_leg_pod_of(pod.instance_id, keep_payers):
+                    log.info("funded sweep: keeping %s — an operator-billed leg still "
+                             "in flight (re-attaches after a restart)", pod.instance_id)
+                    continue
                 self._teardown_operator_pod(pod)
             vault = self._payer_vault()
             if vault is None:
@@ -2803,9 +2814,15 @@ class TrainerRunner:
             # no lane on file the lane dispatch waits for one (its own
             # deadline), and a miss requeues the leg unburned as any lane
             # fault does; the payer is never charged for it.
+            lanes = self._operator_fallback_lanes()
+            if not lanes and self._operator_rent_allowed():
+                log.warning("final challenger %s: entry is OPERATOR-BILLED — no operator "
+                            "lane on file, renting a pod on the OPERATOR's account",
+                            gen.hotkey)
+                raise _FundedOperatorRent(gen.hotkey)
             log.warning("final challenger %s: entry is OPERATOR-BILLED (owner make-good) — "
                         "running on an operator lane (%d on file), never on the payer's key",
-                        gen.hotkey, len(self._operator_fallback_lanes()))
+                        gen.hotkey, len(lanes))
             raise _FundedOperatorFallback(gen.hotkey)
         rnd = self.cfg.round
         vault = self._payer_vault()
@@ -2837,6 +2854,21 @@ class TrainerRunner:
                             "on an OPERATOR lane (operator-billed; "
                             "funded_operator_fallback)", gen.hotkey)
                 raise _FundedOperatorFallback(gen.hotkey)
+            if self._operator_rent_allowed():
+                # Owner 2026-10-08 ("make sure for backlog pods that we fund
+                # round if their TTL expires"): a seated entrant whose key aged
+                # out while the marketplace was sold out is not dropped — with
+                # no operator lane on file the leg rents a pod on the
+                # OPERATOR's account. The entry is flagged so every retry stays
+                # on our bill; the miner is never burned for it.
+                log.warning("final challenger %s: no vaulted key (TTL expired) — "
+                            "operator-billed (payer key expired): renting a pod on the "
+                            "OPERATOR's account", gen.hotkey)
+                q = self._funded_queue()
+                if q is not None:
+                    with contextlib.suppress(Exception):
+                        q.set_operator_billed(gen.hotkey, True)
+                raise _FundedOperatorRent(gen.hotkey)
             self._record_funded_failure(
                 gen.hotkey, "no vaulted key for this hotkey (TTL expired or "
                 "never funded here) — re-fund to supply a fresh key",
@@ -3665,6 +3697,212 @@ class TrainerRunner:
         except Exception as e:  # noqa: BLE001
             log.error("operator pod %s teardown crashed (kept on ledger): %s",
                       pod.instance_id, e)
+
+    # ── operator-rented legs (payer key expired, no operator lane) ──────────
+
+    OPERATOR_LEG_POD_TAG = "op"
+
+    def _operator_rent_allowed(self) -> bool:
+        """True when an operator-billed leg with no lane on file may RENT an
+        operator pod: ``[round] funded_operator_fallback`` on, rent mode, and
+        the calling leg opted in (the rolling challenger path sets the
+        thread-local flag — every other caller keeps the old behaviour)."""
+        loc = self.__dict__.get("_leg_local_obj")
+        return bool(
+            getattr(self.cfg.round, "funded_operator_fallback", False)
+            and self._effective_funded_pods() == "rent"
+            and loc is not None and getattr(loc, "operator_rent_ok", False)
+        )
+
+    def _operator_leg_pod_prefix(self, round_id: str, hotkey: str) -> str:
+        from ..provision.funded import funded_pod_name
+
+        return (f"{funded_pod_name(str(round_id), hotkey, self.cfg.subnet.netuid)}"
+                f"-{self.OPERATOR_LEG_POD_TAG}")
+
+    def _is_operator_leg_pod_of(self, instance_id: str, hotkeys) -> bool:
+        """``instance_id`` is an operator-rented leg pod of one of ``hotkeys``
+        (the sweep keeps it while that leg is in flight)."""
+        import re
+
+        from ..provision.funded import _SLUG_RE
+
+        m = re.match(rf"^cascade-n{int(self.cfg.subnet.netuid)}-\d+-funded-([a-z0-9]+)"
+                     rf"-{self.OPERATOR_LEG_POD_TAG}(-|$)", str(instance_id))
+        if not m:
+            return False
+        slugs = {_SLUG_RE.sub("", str(h).lower())[:12] for h in hotkeys}
+        return m.group(1) in slugs
+
+    def _rent_operator_leg_host(self, round_id: str, gen):
+        """Rent ``gen``'s challenger leg pod on the OPERATOR's Lium account →
+        ``(RemoteHost, pod_id)``. Same guards as every other rent: the round's
+        SKU list (only types that still fit), the price caps, the CPU
+        blocklist, claimed executors, the king's first pick, the runtime
+        attestation and the host bench floor; a lemon is torn down and its
+        executor stays excluded. Adopts a pod of the same name that is still
+        up (a trainer restart mid-leg re-attaches to it). Raises
+        ``_FundedLegSkip`` (unburned, ``no_capacity``/``infra``) when nothing
+        usable can be had before the latest safe start."""
+        from ..provision.core import LaunchSpec, ProvisionError
+        from ..provision.funded import quarantine_lemon_host, terminate_verified
+        from ..provision.state import PodInstance
+        from .remote import RemoteHost, probe_worker_runtime
+
+        rnd = self.cfg.round
+        profile = self._funded_pod_profile()
+        key_path = Path(profile.key_path or "").expanduser()
+        ssh_pubkey = (key_path.parent / (key_path.name + ".pub")
+                      ).read_text(encoding="utf-8").strip()
+        skus = self._funded_skus_for_rent()
+        provider = _lium_provider(rnd, price_caps=self._funded_price_caps())
+        prefix = self._operator_leg_pod_prefix(round_id, gen.hotkey)
+        pod_id = f"{prefix}-0"
+        sku = skus[0] if skus else rnd.funded_pod_sku
+
+        def _remote(addr, host_key: str) -> RemoteHost:
+            # Credential-free and host-key pinned, exactly like the king pod:
+            # the pod runs miner code, the checkpoint is harvested from here.
+            return RemoteHost(
+                name=f"operator-leg-{gen.hotkey[:12]}", host=addr.ip, port=addr.ssh_port,
+                user=profile.user, key_path=profile.key_path,
+                remote_python=profile.remote_python, workdir=profile.workdir,
+                cuda_device="0", chain_toml=profile.chain_toml, forward_env=(),
+                isolated=True, ssh_options=profile.ssh_options,
+                pinned_host_key=host_key, stage="final")
+
+        def _ledger(s: str) -> None:
+            # payer_hotkey = "" is the operator marker: the boundary sweep
+            # tears it down through the operator path (kept while in flight).
+            self._ledger_add(PodInstance(
+                provider=provider.name, instance_id=pod_id, stage="funded",
+                rented_at_iso=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                sku=s, gpus=1, payer_hotkey=""))
+
+        def _skip(msg: str, cls: str) -> None:
+            self._record_funded_failure(gen.hotkey, msg, miner_fault=False,
+                                        error_class=cls, burn=False)
+            raise _FundedLegSkip(gen.hotkey)
+
+        def _lemon(why: str) -> None:
+            quarantine_lemon_host(provider, pod_id, why)
+            try:
+                if terminate_verified(provider, pod_id):
+                    self._ledger_remove(pod_id)
+                else:
+                    log.error("operator leg pod %s still LIVE after terminate — kept "
+                              "on ledger for the sweep", pod_id)
+            except Exception as te:  # noqa: BLE001 — row stays for the sweep
+                log.error("operator leg pod %s teardown failed (kept on ledger): %s",
+                          pod_id, te)
+            raise ProvisionError(why)
+
+        live = getattr(provider, "live_pod_address", None)
+        addr = live(pod_id) if live is not None else None
+        if addr is not None:
+            log.warning("operator leg pod %s for %s is still LIVE at %s:%d — adopting it",
+                        pod_id, gen.hotkey[:12], addr.ip, addr.ssh_port)
+            try:
+                host = self._push_deployed_chain_toml(
+                    _remote(addr, self._pin_king_host_key(pod_id, addr)))
+                why = probe_worker_runtime(host)
+                if not why:
+                    _ledger(sku)
+                    return host, pod_id
+                log.warning("adopted operator leg pod %s rejected (%s); renting fresh",
+                            pod_id, why)
+            except Exception as e:  # noqa: BLE001 — unreachable ⇒ rent fresh
+                log.warning("adopting operator leg pod %s failed (%s); renting fresh",
+                            pod_id, e)
+            with contextlib.suppress(ProvisionError):
+                _lemon("adopted operator leg pod unusable")
+
+        bad = 0
+        while True:
+            self._yield_to_king(f"operator leg {gen.hotkey[:12]}")
+            fit = self._skus_fitting_now(skus) or skus
+            if not self._provider_capacity(provider, fit, self._claimed_executors()):
+                waited = self._wait_for_funded_capacity(
+                    skus, describe=f"operator leg {gen.hotkey[:12]}", hotkey=gen.hotkey)
+                if waited is not True:
+                    _skip("operator-billed leg: no GPU on the operator's account before "
+                          "the latest safe start (requeued, operator-billed)", "no_capacity")
+            try:
+                with self._funded_rent_lock:
+                    with self._funded_exec_lock:
+                        claimed = tuple(sorted(self._funded_claimed_execs))
+                    fit = self._skus_fitting_now(skus) or skus
+                    _ledger(fit[0])                       # write-ahead (deterministic name)
+                    spec = LaunchSpec(sku=fit[0], count=1, image=rnd.funded_pod_image,
+                                      ssh_pubkey=ssh_pubkey, name_prefix=prefix,
+                                      gpus_per_pod=1, exclude_ids=claimed,
+                                      sku_choices=fit if len(fit) > 1 else ())
+                    pod_id = provider.launch(spec)[0]
+                    sku_fn = getattr(provider, "sku_of", None)
+                    sku = (str(sku_fn(pod_id) or "") if callable(sku_fn) else "") or fit[0]
+                    machine = provider.machine_of(pod_id) or ""
+                    if machine:
+                        with self._funded_exec_lock:
+                            self._funded_claimed_execs.add(machine)
+                    if not provider.wait_ready(pod_id, timeout=rnd.funded_ready_timeout_seconds):
+                        _lemon(f"operator leg pod {pod_id} not ready in time")
+                    addr = provider.get_ip(pod_id)
+                    if addr is None:
+                        _lemon(f"operator leg pod {pod_id} exposed no IP")
+                    try:
+                        host_key = self._pin_king_host_key(pod_id, addr)
+                    except ProvisionError as e:
+                        _lemon(str(e))
+                _ledger(sku)
+                host = self._push_deployed_chain_toml(_remote(addr, host_key))
+                why = (probe_worker_runtime(host)
+                       or self._host_bench_below_floor(host, sku, f"operator leg pod {pod_id}"))
+                if why:
+                    _lemon(f"operator leg pod rejected: {why}")
+                log.warning("operator leg pod %s ready at %s:%d for %s (sku=%s) — "
+                            "operator-billed (payer key expired)", pod_id, addr.ip,
+                            addr.ssh_port, gen.hotkey[:12], sku)
+                return host, pod_id
+            except ProvisionError as e:
+                bad += 1
+                now_fn = getattr(self, "_rent_wait_now", None) or time.time
+                if (bad >= self.FUNDED_MAX_STALE_PODS
+                        or now_fn() >= self._funded_rent_wait_deadline()):
+                    from ..funding.faults import classify_rent_failure
+
+                    cls = "no_capacity" if classify_rent_failure(str(e)) == "no_capacity" \
+                        else "infra"
+                    _skip(f"operator-billed leg: {bad} bad pod(s), last: {e}", cls)
+                log.warning("operator leg %s: rent attempt %d failed (%s); renting again",
+                            gen.hotkey[:12], bad, e)
+                sleep = getattr(self, "_rent_wait_sleep", None) or time.sleep
+                sleep(self.FUNDED_RENT_RETRY_SECONDS)
+
+    def _run_operator_rented_leg(self, disp, gen, seeds, block: int, contract, suffix: str,
+                                 *, warm_start_ref: str | None,
+                                 contract_block: int | None = None):
+        """Rent (or adopt) an operator pod → stage the vault ZIP → dispatch the
+        challenger leg → tear the pod down, whatever happened. The checkpoint
+        is harvested by the rolling dispatcher (credential-free pod)."""
+        from ..funding.store import parse_vault_ref
+        from ..provision.state import PodInstance
+
+        host, pod_id = self._rent_operator_leg_host(str(seeds.base_seed), gen)
+        try:
+            digest = parse_vault_ref(gen.ref)
+            if digest is not None:
+                host = self._stage_vault_zip_on(host, digest)
+            return disp.dispatch(
+                host, lane_count=1, gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
+                role="challenger", base_seed=seeds.base_seed, block=int(block),
+                arch_preset=contract.arch_preset, warm_start_ref=warm_start_ref,
+                contract_block=contract_block,
+                **({"repo_suffix": suffix} if suffix else {}),
+            )
+        finally:
+            self._teardown_operator_pod(PodInstance(
+                provider="lium", instance_id=pod_id, stage="funded",
+                rented_at_iso="", sku="", gpus=1, payer_hotkey=""))
 
     def _run_funded_leg(self, disp, gen: ResolvedGenerator, seeds, block: int,
                         contract, suffix: str, *, warm_start_ref: str | None,
@@ -7902,12 +8140,22 @@ class TrainerRunner:
         ws_ref = self._rolling_warm_start_ref(era, contract)
         disp = self._rolling_dispatcher()
         self._leg_local.end_wall = float(end_wall)
+        # Opt-in for _FundedOperatorRent: an operator-billed leg with no lane
+        # on file rents an operator pod (owner 2026-10-08) instead of dying.
+        self._leg_local.operator_rent_ok = True
         self._funded_field[gen.hotkey] = gen.ref
         try:
             try:
                 entry = self._run_funded_leg(disp, gen, seeds, int(block), contract, suffix,
                                              warm_start_ref=ws_ref,
                                              contract_block=self._era_contract_block(era))
+            except _FundedOperatorRent:
+                log.warning("rolling: %s — operator-billed (payer key expired / make-good) "
+                            "with no operator lane on file: renting an OPERATOR pod",
+                            gen.hotkey[:12])
+                entry = self._run_operator_rented_leg(
+                    disp, gen, seeds, int(block), contract, suffix, warm_start_ref=ws_ref,
+                    contract_block=self._era_contract_block(era))
             except _FundedOperatorFallback:
                 log.warning("rolling: %s — no marketplace capacity; running on an "
                             "OPERATOR lane (operator-billed)", gen.hotkey[:12])
@@ -7930,6 +8178,7 @@ class TrainerRunner:
                     self._final_role_hosts[("challenger", contract.arch_preset, gen.hotkey)] = used[-1]
         finally:
             self._leg_local.end_wall = None
+            self._leg_local.operator_rent_ok = False
             self._funded_field.pop(gen.hotkey, None)
         self._persist_completed_leg(entry, round_id=era.base_seed, contract=contract,
                                     role="challenger", hotkey=gen.hotkey, suffix=suffix,

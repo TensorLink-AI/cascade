@@ -113,9 +113,13 @@ def _runner(tmp_path, *, sku="RTX4090", image="ghcr.io/x/worker@sha256:" + "c" *
                  "_wait_for_funded_capacity", "_funded_rent_wait_deadline",
                  "_operator_fallback_lanes", "_funded_pod_code_mismatch",
                  "_funded_pod_too_slow", "_host_bench_below_floor",
-                 "_king_pending", "_yield_to_king", "_pin_king_host_key"):
+                 "_king_pending", "_yield_to_king", "_pin_king_host_key",
+                 "_operator_rent_allowed", "_operator_leg_pod_prefix",
+                 "_is_operator_leg_pod_of", "_rent_operator_leg_host",
+                 "_run_operator_rented_leg"):
         setattr(fake, name, getattr(TrainerRunner, name).__get__(fake))
     fake.FUNDED_MAX_STALE_PODS = TrainerRunner.FUNDED_MAX_STALE_PODS
+    fake.OPERATOR_LEG_POD_TAG = TrainerRunner.OPERATOR_LEG_POD_TAG
     # King pod host-key pin: a canned scanner (never ssh-keyscan in tests) and
     # no real retry sleeps; tests that exercise the scan override both.
     fake.KING_HOST_KEY_SCAN_TRIES = TrainerRunner.KING_HOST_KEY_SCAN_TRIES
