@@ -2241,13 +2241,17 @@ def test_era_last_target_that_fits_the_max_wall_is_admitted(cfg):
 def test_rent_deadline_is_capped_at_the_era_end_minus_the_max_wall():
     # rent time: a leg waiting for capacity must not START once its max wall
     # could carry it past its era's last settlement
-    from cascade.trainer.loop import TrainerRunner
+    from cascade.trainer.loop import _era_capped
 
     r = SimpleNamespace(_leg_local=SimpleNamespace(era_cap_deadline=5_000.0))
-    assert TrainerRunner._era_capped(r, 9_000.0) == 5_000.0
-    assert TrainerRunner._era_capped(r, 4_000.0) == 4_000.0
+    assert _era_capped(r, 9_000.0) == 5_000.0
+    assert _era_capped(r, 4_000.0) == 4_000.0          # only ever tightens
     r._leg_local.era_cap_deadline = None
-    assert TrainerRunner._era_capped(r, 9_000.0) == 9_000.0
+    assert _era_capped(r, 9_000.0) == 9_000.0
+    # fail-open: no thread-local, or a non-numeric stand-in, never moves a deadline
+    assert _era_capped(SimpleNamespace(), 9_000.0) == 9_000.0
+    assert _era_capped(SimpleNamespace(_leg_local=SimpleNamespace(era_cap_deadline=object())),
+                       9_000.0) == 9_000.0
 
 
 def test_era_cap_deadline_is_era_end_minus_max_wall_minus_margin(cfg, monkeypatch):

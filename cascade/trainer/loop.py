@@ -164,6 +164,20 @@ class _FundedLegSkip(Exception):
     operator fleet, which would silently move the bill."""
 
 
+def _era_capped(runner, deadline: float) -> float:
+    """``deadline`` no later than the leg's era-end cap: a rolling leg must not
+    START once its MAX wall (the contract's ``max_train_seconds``) could carry
+    it past its era's last settlement — the SKU's typical wall can
+    (2026-10-09 uid 205), and a leg that finishes after its era rolls is
+    discarded. Set per leg by ``_rolling_train_challenger``; absent elsewhere
+    (round mode, the king). A module function (getattr, fail-open) so partial
+    runners and test doubles never trip on it — it only ever tightens."""
+    cap = getattr(getattr(runner, "_leg_local", None), "era_cap_deadline", None)
+    if not isinstance(cap, (int, float)) or isinstance(cap, bool):
+        return float(deadline)
+    return min(float(deadline), float(cap))
+
+
 class _FundedOperatorFallback(Exception):
     """A funded leg (or the JIT king) that could not rent on the marketplace
     and — with ``[round] funded_operator_fallback`` ON and operator final
@@ -2138,19 +2152,9 @@ class TrainerRunner:
             wall = (self._leg_wall_seconds(sku) if sku
                     else float(max(int(c.max_train_seconds)
                                    for c in self.cfg.throne_contracts())))
-            return self._era_capped(base + (self._leg_wall_seconds(None) - wall))
+            return _era_capped(self, base + (self._leg_wall_seconds(None) - wall))
         except Exception:  # noqa: BLE001 — no contract context ⇒ the round-wide figure
             return base
-
-    def _era_capped(self, deadline: float) -> float:
-        """``deadline`` no later than the leg's era-end cap: a rolling leg must
-        not START once its MAX wall (the contract's ``max_train_seconds``)
-        could carry it past its era's last settlement — the SKU's typical
-        wall can (2026-10-09 uid 205), and a leg that finishes after its era
-        rolls is discarded. Set per leg by ``_rolling_train_challenger``;
-        absent elsewhere (round mode, the king)."""
-        cap = getattr(getattr(self, "_leg_local", None), "era_cap_deadline", None)
-        return min(float(deadline), float(cap)) if cap is not None else float(deadline)
 
     def _funded_rent_wait_deadline(self) -> float:
         """Latest wall-clock a rented leg may START and still finish inside the
@@ -2177,7 +2181,7 @@ class TrainerRunner:
                 # Fixed for the attempt: a later block stamp must not move the
                 # deadline (it drifted 17:33 → 17:49 on 2026-09-12).
                 self._funded_epoch_end_wall = end_wall
-            return self._era_capped(end_wall - leg_s - self.FUNDED_PUBLISH_MARGIN_SECONDS)
+            return _era_capped(self, end_wall - leg_s - self.FUNDED_PUBLISH_MARGIN_SECONDS)
         except Exception:  # noqa: BLE001 — a broken estimate must never hang a leg
             return now
 
