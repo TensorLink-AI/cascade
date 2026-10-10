@@ -2187,3 +2187,84 @@ def test_king_pod_that_cannot_bench_is_released_despite_queued_verifications(cfg
     _wait_verify(sched)
     assert sched.state.verify_queue                 # numbers kept for the next pod
     assert ops.released.count(idx) == 1
+
+
+# ── era-end overrun guard (2026-10-09 uid 205) ───────────────────────────────
+MAX_WALL = 18000.0            # [training] max_train_seconds: a leg may run this long
+
+
+def test_era_last_target_that_can_overrun_at_max_wall_starts_under_the_next_era(cfg):
+    # 16800 s before the era rolls: the typical wall (3.75 h + margin) clears
+    # the era's LAST settlement, the 5 h max wall does not. On 2026-10-09 a
+    # leg admitted like this ran ~4.5 h, finished after the era rolled and was
+    # discarded (payer re-billed). It must start under the next era instead.
+    armed = _armed(cfg)
+    now = 1_000_000.0
+    era_start = armed.round.rolling_from_block
+    era_len = EB * 4
+    cur = era_for_block(armed.round, era_start).index
+    late = era_start + era_len - 1400
+    old = admit(armed.round, block_now=late, now=now, wall_seconds=WALL,
+                margin_seconds=MARGIN, current_era=cur)
+    assert not old.cross_era and old.target_boundary == era_start + era_len  # the old rule
+    a = admit(armed.round, block_now=late, now=now, wall_seconds=WALL,
+              margin_seconds=MARGIN, current_era=cur, max_wall_seconds=MAX_WALL)
+    assert a.cross_era and a.era_index == cur + 1 and a.start_after == now
+    assert a.target_boundary >= era_start + era_len + EB      # never this era's last one
+
+
+def test_intra_era_target_is_unchanged_by_the_max_wall(cfg):
+    armed = _armed(cfg)
+    now = 1_000_000.0
+    era_start = armed.round.rolling_from_block
+    cur = era_for_block(armed.round, era_start).index
+    a_old = admit(armed.round, block_now=era_start + 10, now=now, wall_seconds=WALL,
+                  margin_seconds=MARGIN, current_era=cur)
+    a = admit(armed.round, block_now=era_start + 10, now=now, wall_seconds=WALL,
+              margin_seconds=MARGIN, current_era=cur, max_wall_seconds=MAX_WALL)
+    assert a == a_old and not a.cross_era and a.era_index == cur
+
+
+def test_era_last_target_that_fits_the_max_wall_is_admitted(cfg):
+    # 20400 s before the era rolls: even the 5 h max wall + margin clears it.
+    armed = _armed(cfg)
+    now = 1_000_000.0
+    era_start = armed.round.rolling_from_block
+    era_len = EB * 4
+    cur = era_for_block(armed.round, era_start).index
+    a = admit(armed.round, block_now=era_start + era_len - 1700, now=now, wall_seconds=WALL,
+              margin_seconds=MARGIN, current_era=cur, max_wall_seconds=MAX_WALL)
+    assert not a.cross_era and a.era_index == cur
+    assert a.target_boundary == era_start + era_len
+
+
+def test_rent_deadline_is_capped_at_the_era_end_minus_the_max_wall():
+    # rent time: a leg waiting for capacity must not START once its max wall
+    # could carry it past its era's last settlement
+    from cascade.trainer.loop import _era_capped
+
+    r = SimpleNamespace(_leg_local=SimpleNamespace(era_cap_deadline=5_000.0))
+    assert _era_capped(r, 9_000.0) == 5_000.0
+    assert _era_capped(r, 4_000.0) == 4_000.0          # only ever tightens
+    r._leg_local.era_cap_deadline = None
+    assert _era_capped(r, 9_000.0) == 9_000.0
+    # fail-open: no thread-local, or a non-numeric stand-in, never moves a deadline
+    assert _era_capped(SimpleNamespace(), 9_000.0) == 9_000.0
+    assert _era_capped(SimpleNamespace(_leg_local=SimpleNamespace(era_cap_deadline=object())),
+                       9_000.0) == 9_000.0
+
+
+def test_era_cap_deadline_is_era_end_minus_max_wall_minus_margin(cfg, monkeypatch):
+    from cascade.trainer.loop import TrainerRunner
+
+    armed = _armed(cfg)
+    era_start = armed.round.rolling_from_block
+    era_len = EB * 4
+    contract = SimpleNamespace(max_train_seconds=int(MAX_WALL))
+    r = SimpleNamespace(cfg=SimpleNamespace(round=armed.round, throne_contracts=lambda: [contract]),
+                        FUNDED_PUBLISH_MARGIN_SECONDS=900.0)
+    monkeypatch.setattr("cascade.trainer.loop.time.time", lambda: 1_000_000.0)
+    era = SimpleNamespace(start_block=era_start)
+    block = era_start + 100
+    got = TrainerRunner._rolling_era_cap_deadline(r, era, block)
+    assert got == 1_000_000.0 + (era_len - 100) * 12.0 - MAX_WALL - 900.0

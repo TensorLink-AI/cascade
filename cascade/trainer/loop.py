@@ -165,6 +165,20 @@ class _FundedLegSkip(Exception):
     operator fleet, which would silently move the bill."""
 
 
+def _era_capped(runner, deadline: float) -> float:
+    """``deadline`` no later than the leg's era-end cap: a rolling leg must not
+    START once its MAX wall (the contract's ``max_train_seconds``) could carry
+    it past its era's last settlement — the SKU's typical wall can
+    (2026-10-09 uid 205), and a leg that finishes after its era rolls is
+    discarded. Set per leg by ``_rolling_train_challenger``; absent elsewhere
+    (round mode, the king). A module function (getattr, fail-open) so partial
+    runners and test doubles never trip on it — it only ever tightens."""
+    cap = getattr(getattr(runner, "_leg_local", None), "era_cap_deadline", None)
+    if not isinstance(cap, (int, float)) or isinstance(cap, bool):
+        return float(deadline)
+    return min(float(deadline), float(cap))
+
+
 class _FundedOperatorFallback(Exception):
     """A funded leg (or the JIT king) that could not rent on the marketplace
     and — with ``[round] funded_operator_fallback`` ON and operator final
@@ -2165,7 +2179,7 @@ class TrainerRunner:
             wall = (self._leg_wall_seconds(sku) if sku
                     else float(max(int(c.max_train_seconds)
                                    for c in self.cfg.throne_contracts())))
-            return base + (self._leg_wall_seconds(None) - wall)
+            return _era_capped(self, base + (self._leg_wall_seconds(None) - wall))
         except Exception:  # noqa: BLE001 — no contract context ⇒ the round-wide figure
             return base
 
@@ -2194,7 +2208,7 @@ class TrainerRunner:
                 # Fixed for the attempt: a later block stamp must not move the
                 # deadline (it drifted 17:33 → 17:49 on 2026-09-12).
                 self._funded_epoch_end_wall = end_wall
-            return end_wall - leg_s - self.FUNDED_PUBLISH_MARGIN_SECONDS
+            return _era_capped(self, end_wall - leg_s - self.FUNDED_PUBLISH_MARGIN_SECONDS)
         except Exception:  # noqa: BLE001 — a broken estimate must never hang a leg
             return now
 
@@ -8165,6 +8179,22 @@ class TrainerRunner:
                 if era.warm_start_ckpt and era.warm_start_size == contract.arch_preset
                 else None)
 
+    def _rolling_era_cap_deadline(self, era, block: int) -> float | None:
+        """Latest wall-clock a challenger leg of ``era`` may START so that even
+        at its MAX wall (``max_train_seconds``) it finishes before ``era``'s
+        last settlement (the next era's start) — a leg that lands after its
+        era rolls can never be judged. ``None`` when unknown (no cap)."""
+        from ..shared.era import era_length_blocks
+
+        try:
+            start = int(era.start_block)
+            end = start + int(era_length_blocks(self.cfg.round, start))
+            cap = max(int(c.max_train_seconds) for c in self.cfg.throne_contracts())
+            end_wall = time.time() + (end - int(block)) * 12.0
+            return end_wall - cap - self.FUNDED_PUBLISH_MARGIN_SECONDS
+        except Exception:  # noqa: BLE001 — never block a leg on a broken estimate
+            return None
+
     def _rolling_train_challenger(self, gen, era, block: int, *, end_wall: float):
         """One funded challenger leg outside any round: payer pod (or the
         operator-lane fallback), the era's seeds and init, its own target
@@ -8177,6 +8207,7 @@ class TrainerRunner:
         ws_ref = self._rolling_warm_start_ref(era, contract)
         disp = self._rolling_dispatcher()
         self._leg_local.end_wall = float(end_wall)
+        self._leg_local.era_cap_deadline = self._rolling_era_cap_deadline(era, int(block))
         # Opt-in for _FundedOperatorRent: an operator-billed leg with no lane
         # on file rents an operator pod (owner 2026-10-08) instead of dying.
         self._leg_local.operator_rent_ok = True
@@ -8215,6 +8246,7 @@ class TrainerRunner:
                     self._final_role_hosts[("challenger", contract.arch_preset, gen.hotkey)] = used[-1]
         finally:
             self._leg_local.end_wall = None
+            self._leg_local.era_cap_deadline = None
             self._leg_local.operator_rent_ok = False
             self._funded_field.pop(gen.hotkey, None)
         self._persist_completed_leg(entry, round_id=era.base_seed, contract=contract,
