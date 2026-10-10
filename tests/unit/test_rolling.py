@@ -238,9 +238,11 @@ def _sched(cfg, tmp_path, clock, ops=None, provenance=None):
 
 def _join(sched, timeout=10.0):
     end = time.time() + timeout
-    while (sched._threads or sched._king_threads) and time.time() < end:
+    while ((sched._threads or sched._king_threads or sched._king_bench_threads)
+           and time.time() < end):
         time.sleep(0.01)
     assert not sched._threads and not sched._king_threads, "legs still running"
+    assert not sched._king_bench_threads, "king benches still running"
 
 
 def _advance(clock, ops, sched, client, *, from_block, to_block):
@@ -1764,6 +1766,87 @@ def test_old_king_leg_landing_after_a_dethrone_is_discarded_and_new_king_trains(
     cur = sched.state.current
     assert [c[0] for c in ops.king_calls] == ["KING", "ALFA"]
     assert cur.index == idx and cur.king().miner_hotkey == "ALFA"
+
+
+class _HeldBenchOps(_HeldKingOps):
+    """bench_king blocks on ``bench_gate`` for the hotkeys in ``hold_benches``
+    and returns per-hotkey scores, so a misattributed bench is visible."""
+
+    def __init__(self, tmp_path, clock):
+        super().__init__(tmp_path, clock)
+        self.bench_gate = threading.Event()
+        self.hold_benches: set[str] = set()
+        self.bench_finished: list[str] = []
+
+    def bench_king(self, entry, era):
+        self.benches.append(("king", entry.miner_hotkey, era.index, self.clock()))
+        if entry.miner_hotkey in self.hold_benches:
+            self.bench_gate.wait(10)
+        tag = 0.1 if entry.miner_hotkey == "KING" else 0.9
+        self.bench_finished.append(entry.miner_hotkey)
+        return {k: tag for k in self.bench_scores}
+
+
+def _wait(pred, timeout=5.0):
+    end = time.time() + timeout
+    while not pred() and time.time() < end:
+        time.sleep(0.01)
+    return pred()
+
+
+def test_dethrone_during_the_old_kings_bench_launches_the_new_king_leg_at_once(cfg, tmp_path):
+    """2026-10-06 era 2562: the deposed king's bench held the king-leg slot,
+    so the new king's leg waited out the sweep and the next settlement
+    published nothing. The new leg must launch on the very next tick."""
+    armed = _armed(cfg)
+    clock = Clock()
+    ops = _HeldBenchOps(tmp_path, clock)
+    sched, _ = _sched(armed, tmp_path, clock, ops=ops)
+    client = FakeClient()
+    era_start = armed.round.rolling_from_block
+    b0 = era_start + 5
+    ops.hold_benches = {"KING"}
+    ops.commits.append(_commit("ALFA", REF["ALFA"], b0 - 100))
+    sched.tick(client, b0)                       # KING's leg lands, its bench blocks
+    assert _wait(lambda: any(b[1] == "KING" for b in ops.benches))
+    ops.king_hk = ops.chain_king = "ALFA"        # crowned from an earlier era
+    try:
+        sched.tick(client, b0 + 1)               # adopt + relaunch
+        assert _wait(lambda: [c[0] for c in ops.king_calls] == ["KING", "ALFA"]), \
+            "the new king's leg waited on the deposed king's bench"
+    finally:
+        ops.bench_gate.set()
+    _join(sched)
+    cur = sched.state.current
+    assert cur.king().miner_hotkey == "ALFA"
+
+
+def test_deposed_kings_bench_never_lands_on_the_new_kings_era(cfg, tmp_path):
+    armed = _armed(cfg)
+    clock = Clock()
+    ops = _HeldBenchOps(tmp_path, clock)
+    sched, _ = _sched(armed, tmp_path, clock, ops=ops)
+    client = FakeClient()
+    era_start = armed.round.rolling_from_block
+    b0 = era_start + 5
+    ops.hold_benches = {"KING"}
+    ops.hold_kings = {"ALFA"}                    # ALFA's leg still training when KING's bench ends
+    ops.commits.append(_commit("ALFA", REF["ALFA"], b0 - 100))
+    sched.tick(client, b0)
+    assert _wait(lambda: any(b[1] == "KING" for b in ops.benches))
+    ops.king_hk = ops.chain_king = "ALFA"
+    sched.tick(client, b0 + 1)
+    cur = sched.state.current
+    assert cur.king_hotkey == "ALFA"
+    ops.bench_gate.set()                         # KING's sweep finishes under ALFA's throne
+    assert _wait(lambda: "KING" in ops.bench_finished)
+    time.sleep(0.3)                              # let the sweep's write (if any) land
+    assert cur.king_bench is None, "the deposed king's numbers landed on the new king's era"
+    sched.tick(client, b0 + 2)                   # (main: the slot only frees now)
+    ops.king_gate.set()                          # ALFA's leg lands and benches its own
+    _join(sched)
+    assert cur.king().miner_hotkey == "ALFA"
+    assert cur.king_bench is not None and set(cur.king_bench.values()) == {0.9}
 
 
 def test_foreign_king_entry_restored_from_disk_is_dropped_and_retrained(cfg, tmp_path):

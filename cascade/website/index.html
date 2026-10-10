@@ -1080,6 +1080,8 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
 .train-tiles .tile .tag { display:inline-block; margin-top:8px; font:700 9px/1 var(--font-mono); text-transform:uppercase; letter-spacing:0.05em; color:var(--good); border:1px solid var(--good); padding:3px 6px; border-radius:2px; }
 .train-tiles .tile { position:relative; }
 .train-tiles .empty { grid-column:1 / -1; }
+.train-tiles .row-h { grid-column:1 / -1; font:700 11px/1.3 var(--font-mono); text-transform:uppercase; letter-spacing:0.05em; color:var(--muted); margin-top:6px; }
+.train-tiles .row-h b { color:var(--ink); font-weight:700; }
 @media (max-width: 1000px) { .train-tiles { grid-template-columns:repeat(3, minmax(0,1fr)); } }
 @media (max-width: 640px)  { .train-tiles { grid-template-columns:repeat(3, minmax(0,1fr)); } }
 @media (max-width: 440px)  { .train-tiles { grid-template-columns:repeat(2, minmax(0,1fr)); } }
@@ -2683,19 +2685,39 @@ function renderTrainStats(rows, info){
     tiles.push(tile("Tokens vs Toto2",esc(fmtTokens(lin.tokens).replace(" tokens",""))+'<span class="u">/ '+esc(fmtTokens(toto2Tokens()).replace(" tokens",""))+'</span>',"",
       {title:"Tokens trained by the king's lineage compared with the official Toto2 pretraining run, which used "+fmtTokens(toto2Tokens())+" ("+fmtSteps(TOTO2_PRETRAIN.steps)+" × "+TOTO2_PRETRAIN.batch+" batch × "+TOTO2_PRETRAIN.channels+" channels × "+TOTO2_PRETRAIN.ctx+" context). The lineage has used "+effTxt+" of Toto2's pretraining tokens."}));
   }
-  // ── row two: the latest king checkpoint's six public-benchmark numbers ──
-  if(lastK){
-    var s=lastK.e.six, ref=trainReference(rows);
-    // tag a cell when the king's latest number is under the official Toto2 checkpoint's (lower is better)
+  // ── rows two and three: six public-benchmark numbers for the current king's
+  // latest checkpoint, then for the best checkpoint so far. The king retrains
+  // every era on a different init member, so its "beats Toto2" tags can flip
+  // era to era; the best row only moves when something genuinely beats it.
+  // "Best" = lowest combined score (geomean of the six) across the loaded
+  // reports, king or challenger: the same rule as the stakeholder page's
+  // "Which checkpoint is the best so far?" card.
+  var ref=(lastK||best)?trainReference(rows):null;
+  function benchRow(s, src, who, extra){
     function beat(key){ if(!ref) return ""; var rv=ref.six[key]; return (rv!=null&&s[key]<rv)?"beats Toto2":""; }
     function beatTxt(key){ if(!ref) return ""; var rv=ref.six[key]; return rv==null?"":(s[key]<rv?" This beats the official Toto2 "+ref.rung+" checkpoint's "+fmt(rv,4)+" by "+((rv-s[key])/rv*100).toFixed(1)+"%.":" The official Toto2 "+ref.rung+" checkpoint scores "+fmt(rv,4)+"."); }
     SUITES.forEach(function(su){
       var kc=su.key+"_crps", km=su.key+"_mase";
       tiles.push(tile(su.label+" CRPS",fmt(s[kc],4),"",
-        {tag:beat(kc),title:"How accurate the king's latest checkpoint's probabilistic forecasts are on the public "+su.label+" benchmark (CRPS, continuous ranked probability score). Lower is better. From "+lastK.row.label+"'s signed bench report."+beatTxt(kc)}));
+        {tag:beat(kc),title:"How accurate "+who+" probabilistic forecasts are on the public "+su.label+" benchmark (CRPS, continuous ranked probability score). Lower is better. From "+src+"'s signed bench report."+beatTxt(kc)+(extra?extra(kc):"")}));
       tiles.push(tile(su.label+" MASE",fmt(s[km],4),"",
-        {tag:beat(km),title:"How accurate the king's latest checkpoint's point forecasts are on the public "+su.label+" benchmark, relative to a simple seasonal-naive forecast (MASE, mean absolute scaled error): 1.0 matches the naive baseline, below 1.0 beats it. Lower is better. From "+lastK.row.label+"'s signed bench report."+beatTxt(km)}));
+        {tag:beat(km),title:"How accurate "+who+" point forecasts are on the public "+su.label+" benchmark, relative to a simple seasonal-naive forecast (MASE, mean absolute scaled error): 1.0 matches the naive baseline, below 1.0 beats it. Lower is better. From "+src+"'s signed bench report."+beatTxt(km)+(extra?extra(km):"")}));
     });
+  }
+  function whoOf(e){ return (e.role==="king"?"king":"challenger")+(e.uid!=null?" uid "+e.uid:""); }
+  if(lastK){
+    tiles.push('<div class="row-h">Current king &mdash; latest era &middot; <b>'+esc(whoOf(lastK.e))+'</b> &middot; '+esc(lastK.row.label)+
+      (lastK.e.geo!=null?' &middot; combined '+fmt(lastK.e.geo,5):'')+'</div>');
+    benchRow(lastK.e.six, lastK.row.label, "the king's latest checkpoint's", null);
+  }
+  if(best){
+    var kingSix=lastK?lastK.e.six:null, isKing=lastK&&best.e===lastK.e;
+    tiles.push('<div class="row-h">Best checkpoint so far &middot; <b>'+esc(whoOf(best.e))+'</b> &middot; '+esc(best.row.label)+
+      ' &middot; combined '+fmt(best.geo,5)+(isKing?' &middot; the current king':'')+'</div>');
+    benchRow(best.e.six, best.row.label, "the best checkpoint so far ("+whoOf(best.e)+", lowest combined score across the loaded reports)'s",
+      function(key){ if(!kingSix||isKing||!(kingSix[key]>0)||!(best.e.six[key]>0)) return "";
+        var d=(kingSix[key]/best.e.six[key]-1)*100;
+        return " Current king: "+fmt(kingSix[key],4)+" (king "+(d>=0?"+":"")+d.toFixed(1)+"% vs best)."; });
   }
   el.innerHTML=tiles.join("");
   wireTileHelp(el);
