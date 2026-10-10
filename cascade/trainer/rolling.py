@@ -569,6 +569,10 @@ class RollingScheduler:
         self._lock = threading.RLock()
         self._threads: dict[str, threading.Thread] = {}     # hotkey -> leg thread
         self._king_threads: dict[int, threading.Thread] = {}  # era index -> king leg thread
+        # (era index, king hotkey) -> that king leg's bench thread. Kept apart
+        # from _king_threads so a throne change never waits on the deposed
+        # king's bench before the new king's leg can launch (2026-10-06).
+        self._king_bench_threads: dict[tuple[int, str], threading.Thread] = {}
         self._verify_thread: threading.Thread | None = None   # one operator verification at a time
         self._idle_released: set[int] = set()   # eras whose idle king pod was released early
         self._started = False
@@ -1025,10 +1029,13 @@ class RollingScheduler:
                     self._save()
                 log.info("rolling: era %d king leg complete: %s", era.index,
                          entry.trained_pointer)
-                bench = self.ops.bench_king(entry, era)
-                with self._lock:
-                    era.king_bench = bench
-                    self._save()
+                # The bench runs in its OWN thread: the king-leg slot frees the
+                # moment training lands, so a dethrone adopted while this king
+                # benches launches the new king's leg at once instead of
+                # waiting out the sweep (2026-10-06: era 2562's new king leg
+                # waited ~35 min on the deposed king's bench and the 13:03
+                # settlement published nothing).
+                self._launch_king_bench(era, gen.hotkey, entry)
             except Exception as e:  # noqa: BLE001 — retried next tick; never kills the loop
                 log.error("rolling: era %d king leg FAILED: %s", era.index, e)
                 with self._lock:
@@ -1056,6 +1063,47 @@ class RollingScheduler:
         t = threading.Thread(target=_run, name=f"king-era{era.index}", daemon=True)
         self._king_threads[era.index] = t
         t.start()
+
+    def _launch_king_bench(self, era: EraState, hotkey: str, entry: TrainedEntry) -> None:
+        """Bench ``hotkey``'s era king checkpoint off the king-leg slot.
+
+        The numbers are written to ``era`` only if ``hotkey`` still holds its
+        throne AND ``entry`` is still its king entry when the sweep ends: a
+        sweep that outlived a dethrone must never land the deposed king's
+        numbers on the era now owned by the new king."""
+        key = (era.index, hotkey)
+
+        def _bench() -> None:
+            try:
+                if era.king_hotkey != hotkey:
+                    log.info("rolling: era %d king bench for %s skipped — the throne passed "
+                             "to %s before it started", era.index, hotkey[:12],
+                             (era.king_hotkey or "<vacant>")[:12])
+                    return
+                bench = self.ops.bench_king(entry, era)
+                with self._lock:
+                    current = (_entry_from_json(era.king_entry).trained_pointer
+                               if era.king_entry else "")
+                    if era.king_hotkey != hotkey or current != entry.trained_pointer:
+                        log.warning("rolling: era %d king bench for %s discarded — the "
+                                    "throne passed to %s while it ran (%s)", era.index,
+                                    hotkey[:12], (era.king_hotkey or "<vacant>")[:12],
+                                    entry.trained_pointer)
+                        return
+                    era.king_bench = bench
+                    self._save()
+            except Exception as e:  # noqa: BLE001 — telemetry; never kills the loop
+                log.error("rolling: era %d king bench for %s FAILED: %s", era.index,
+                          hotkey[:12], e)
+            finally:
+                self._king_bench_threads.pop(key, None)
+
+        t = threading.Thread(target=_bench, name=f"king-bench-era{era.index}", daemon=True)
+        self._king_bench_threads[key] = t
+        t.start()
+
+    def _king_benching(self, era_index: int) -> bool:
+        return any(idx == era_index for idx, _ in list(self._king_bench_threads))
 
     def _can_bench(self, era: EraState) -> bool:
         try:
@@ -1085,6 +1133,7 @@ class RollingScheduler:
             idle = [e for e in eras
                     if e.king_entry is not None
                     and e.index not in self._king_threads
+                    and not self._king_benching(e.index)
                     and e.index not in self._idle_released]
         if queued:
             # Queued verifications keep the pod — unless it cannot bench them at
