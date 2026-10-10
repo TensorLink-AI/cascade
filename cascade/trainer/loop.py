@@ -1093,6 +1093,102 @@ def king_pod_name_prefix(netuid: int, round_id: str) -> str:
     return f"cascade-n{netuid}-{round_id}-funded-king"
 
 
+def king_remote_host(profile, addr, host_key: str):
+    """The operator king pod as a :class:`~cascade.trainer.remote.RemoteHost`.
+
+    ``pinned_host_key``: every ssh/scp to the king pod runs
+    StrictHostKeyChecking=yes against a file holding ONLY the key scanned at
+    readiness — exactly like a payer leg. Without it the pod was reached
+    through the shared ~/.ssh/known_hosts with accept-new, and a Lium ip:port
+    reused by a fresh container (new host key) failed the very first mkdir
+    with "Host key verification failed" (2026-09-15 21:09, round 9075600: the
+    king leg died, the pod idled all night). Credential-free like a payer
+    pod: nothing from the orchestrator's environment reaches the king pod —
+    the generator (public Hub refs pull anonymously; vault refs are staged)
+    and the warm-start init need no login, and the checkpoint is harvested +
+    uploaded from here rather than pushed by the pod (2026-09-26: a pod that
+    runs miner code must not hold the bucket/Hub keys)."""
+    from .remote import RemoteHost
+
+    return RemoteHost(
+        name="funded-king", host=addr.ip, port=addr.ssh_port,
+        user=profile.user, key_path=profile.key_path,
+        remote_python=profile.remote_python, workdir=profile.workdir,
+        cuda_device="0", chain_toml=profile.chain_toml,
+        forward_env=(), isolated=True, ssh_options=profile.ssh_options,
+        pinned_host_key=host_key, stage="final")
+
+
+# A failed re-discovery is retried at most this often per era (the Lium list
+# call and an ssh-keyscan are not free, and the tick runs every few seconds).
+KING_REDISCOVER_RETRY_S = 600.0
+
+
+def rediscover_king_host(runner, era):
+    """The era's operator king pod host, re-discovered after a restart.
+
+    The host is only learned in memory when the king pod is rented or its leg
+    runs. A trainer restart AFTER the era's king leg completed (cached entry,
+    no re-run) therefore forgot it: queued payer verifications waited for a
+    king pod forever, and the idle release kept the pod for that queue
+    (2026-10-10 02:59 restart: the era-2569 H100 king pod sat idle at
+    0 % GPU for hours). The pod's name is deterministic
+    (:func:`king_pod_name_prefix` + ``-0``), so look it up on the operator's
+    account, pin its host key like a fresh rent, and register it for the
+    era and the era king's hotkey. ``None`` when the pod is gone, was
+    released on purpose, or cannot be reached — callers treat that as "no
+    usable king pod". Fail-safe on partial runners (test fakes)."""
+    d = getattr(runner, "__dict__", None)
+    if d is None or era is None:
+        return None
+    hosts = d.setdefault("_rolling_king_hosts", {})
+    host = hosts.get(era.index)
+    if host is not None:
+        return host
+    if era.index in d.get("_rolling_king_released", ()):
+        return None                    # released on purpose: never revive it
+    cfg = getattr(runner, "cfg", None)
+    if (cfg is None or not hasattr(runner, "_pin_king_host_key")
+            or not hasattr(runner, "_funded_pod_profile")):
+        return None
+    tried = d.setdefault("_rolling_king_rediscover_at", {})
+    now = time.monotonic()
+    last = tried.get(era.index)
+    if last is not None and now - last < KING_REDISCOVER_RETRY_S:
+        return None
+    tried[era.index] = now
+    pod_id = king_pod_name_prefix(cfg.subnet.netuid, str(era.base_seed)) + "-0"
+    try:
+        caps = runner._funded_price_caps() if hasattr(runner, "_funded_price_caps") else None
+        provider = _lium_provider(cfg.round, price_caps=caps)
+        live = getattr(provider, "live_pod_address", None)
+        addr = live(pod_id) if live is not None else None
+    except Exception as e:  # noqa: BLE001 — retried after the backoff
+        log.warning("rolling: era %d king pod %s lookup failed (%s) — retry in %ds",
+                    era.index, pod_id, e, int(KING_REDISCOVER_RETRY_S))
+        return None
+    if addr is None:
+        log.info("rolling: era %d king pod %s is not live — no king pod to re-attach",
+                 era.index, pod_id)
+        return None
+    try:
+        host = king_remote_host(runner._funded_pod_profile(), addr,
+                                runner._pin_king_host_key(pod_id, addr))
+    except Exception as e:  # noqa: BLE001 — unreachable ⇒ treated as no king pod
+        log.warning("rolling: era %d king pod %s found at %s:%d but unreachable (%s)",
+                    era.index, pod_id, addr.ip, addr.ssh_port, e)
+        return None
+    hosts[era.index] = host
+    king_hk = getattr(era, "king_hotkey", "") or ""
+    if king_hk and hasattr(cfg, "throne_contracts"):
+        preset = cfg.throne_contracts()[0].arch_preset
+        d.setdefault("_final_role_hosts", {})[("king", preset, king_hk)] = host
+    log.warning("rolling: era %d king pod %s re-discovered at %s:%d after a restart — "
+                "verifications and the idle release use it again",
+                era.index, pod_id, addr.ip, addr.ssh_port)
+    return host
+
+
 @dataclass
 class TrainerRunner:
     """Owner-operated trainer. ``base_trainer`` is the GPU backend (Protocol).
@@ -3500,28 +3596,7 @@ class TrainerRunner:
             name_prefix = king_pod_name_prefix(self.cfg.subnet.netuid, round_id)
 
             def _king_remote(addr, host_key: str) -> RemoteHost:
-                # pinned_host_key: every ssh/scp to the king pod runs
-                # StrictHostKeyChecking=yes against a file holding ONLY the key
-                # scanned at readiness — exactly like a payer leg. Without it
-                # the pod was reached through the shared ~/.ssh/known_hosts
-                # with accept-new, and a Lium ip:port reused by a fresh
-                # container (new host key) failed the very first mkdir with
-                # "Host key verification failed" (2026-09-15 21:09, round
-                # 9075600: the king leg died, the pod idled all night).
-                return RemoteHost(
-                    name="funded-king", host=addr.ip, port=addr.ssh_port,
-                    user=profile.user, key_path=profile.key_path,
-                    remote_python=profile.remote_python, workdir=profile.workdir,
-                    cuda_device="0", chain_toml=profile.chain_toml,
-                    # Credential-free like a payer pod: nothing from the
-                    # orchestrator's environment reaches the king pod — the
-                    # generator (public Hub refs pull anonymously; vault refs
-                    # are staged) and the warm-start init need no login, and
-                    # the checkpoint is harvested + uploaded from here rather
-                    # than pushed by the pod (2026-09-26: a pod that runs
-                    # miner code must not hold the bucket/Hub keys).
-                    forward_env=(), isolated=True, ssh_options=profile.ssh_options,
-                    pinned_host_key=host_key, stage="final")
+                return king_remote_host(profile, addr, host_key)
 
             def _ledger_king(pod_id: str) -> None:
                 self._ledger_add(PodInstance(
@@ -8327,8 +8402,15 @@ class TrainerRunner:
             self._final_role_hosts[("king", contract.arch_preset, era.king_hotkey)] = host
 
     def _rolling_king_pod_can_bench(self, era) -> bool:
-        host = self.__dict__.get("_rolling_king_hosts", {}).get(era.index)
-        return host is None or not host_cannot_bench(self, host)
+        """Whether the era's king pod can drain queued verifications. A pod
+        the trainer cannot locate (restart after the king leg, and the pod
+        cannot be re-discovered) never can: the idle release must not hold it
+        for a queue it will never run (2026-10-10). Verifications then wait
+        for the next king pod, like any unusable pod."""
+        contract = self.cfg.throne_contracts()[0]
+        host = (self._final_role_hosts.get(("king", contract.arch_preset, era.king_hotkey))
+                if getattr(era, "king_hotkey", "") else None) or rediscover_king_host(self, era)
+        return host is not None and not host_cannot_bench(self, host)
 
     def _rolling_retire_king_pod(self, era) -> None:
         """Tear down an era's operator king pod (era over, or its pre-trained
@@ -8362,6 +8444,7 @@ class TrainerRunner:
         for pod in self._load_funded_ledger():
             if not pod.payer_hotkey and str(pod.instance_id).startswith(prefix + "-"):
                 self._teardown_operator_pod(pod)
+        self.__dict__.setdefault("_rolling_king_released", set()).add(era.index)
         host = self.__dict__.get("_rolling_king_hosts", {}).pop(era.index, None)
         if host is not None:
             # Forget role mappings onto the released pod: a later verification
@@ -8446,7 +8529,7 @@ class TrainerRunner:
     def _rolling_verify_host(self, king, era):
         contract = self.cfg.throne_contracts()[0]
         return (self._final_role_hosts.get(("king", contract.arch_preset, king.miner_hotkey))
-                or self.__dict__.get("_rolling_king_hosts", {}).get(era.index))
+                or rediscover_king_host(self, era))
 
     def _rolling_verify_payer(self, entry, payer: dict, king, era) -> tuple[str, dict | None]:
         """Re-bench ONE payer-benched checkpoint on the era king's operator pod.
