@@ -509,6 +509,13 @@ class LegOps:
     def king_pod_can_bench(self, era: EraState) -> bool:
         return self.r._rolling_king_pod_can_bench(era)
 
+    def rediscover_king_pod(self, era: EraState):
+        """Re-attach the era's operator king pod after a restart (see
+        :func:`~cascade.trainer.loop.rediscover_king_host`); ``None`` = none."""
+        from .loop import rediscover_king_host
+
+        return rediscover_king_host(self.r, era)
+
     def release_idle_king_pod(self, era: EraState) -> None:
         """Same teardown as :meth:`retire_king_pod` (bench-lock aware), kept
         separate so an idle release is never read as a throne/king change."""
@@ -684,6 +691,7 @@ class RollingScheduler:
         dead = self._dead_era_flights(client, flights, done, block)
         self.ops.sweep_pods(keep_round_ids=keep_ids,
                             keep_payers={e.hotkey for e in flights} - set(dead))
+        self._rediscover_king_pods()
         for e in flights:
             if (e.hotkey, e.ref) in done:
                 continue                      # finished before the restart; settles normally
@@ -1168,6 +1176,24 @@ class RollingScheduler:
 
     def _king_benching(self, era_index: int) -> bool:
         return any(idx == era_index for idx, _ in list(self._king_bench_threads))
+
+    def _rediscover_king_pods(self) -> None:
+        """Restart re-entry for the era king pods the sweep just kept: an era
+        whose king leg already completed never re-runs it, so nothing else
+        would re-learn its pod — queued verifications would wait forever and
+        the idle release would hold the pod for them (2026-10-10). Best-effort:
+        a pod not found here is looked up again lazily, and treated as
+        unusable meanwhile."""
+        fn = getattr(self.ops, "rediscover_king_pod", None)
+        if fn is None:
+            return
+        for era in (self.state.current, self.state.next):
+            if era is None or era.king_entry is None:
+                continue
+            try:
+                fn(era)
+            except Exception as e:  # noqa: BLE001 — never blocks the restart
+                log.warning("rolling: era %d king pod re-discovery failed: %s", era.index, e)
 
     def _can_bench(self, era: EraState) -> bool:
         try:
