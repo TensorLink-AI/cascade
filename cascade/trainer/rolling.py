@@ -262,13 +262,28 @@ def save_state(path: Path, state: RollingState) -> None:
 # ── pure policy ──────────────────────────────────────────────────────────────
 
 
-def king_pod_should_rotate(exc: BaseException, failures: int) -> bool:
+def _step0_divergence(exc: BaseException) -> bool:
+    from .loop import is_step0_divergence
+
+    return is_step0_divergence(str(exc))
+
+
+def king_pod_should_rotate(exc: BaseException, failures: int, *,
+                           nan0_rotated: bool = False) -> bool:
     """Rotate the era king's pod after ``failures`` consecutive king-leg
     failures on it: at once when the failure is a transport one (the pod is
-    unreachable), else once the same-pod retry budget is spent."""
+    unreachable) or the era's FIRST step-0 non-finite loss (a faulty GPU's
+    signature — the same-pod retry only re-attached to the dead run,
+    2026-10-08 era 2567), else once the same-pod retry budget is spent.
+    ``nan0_rotated``: the era already rotated once for a step-0 NaN, so a
+    repeat falls back to the ordinary budget."""
     from .loop import _transport_failure
 
-    return _transport_failure(exc) or int(failures) > KING_SAME_POD_RETRIES
+    if _transport_failure(exc):
+        return True
+    if not nan0_rotated and _step0_divergence(exc):
+        return True
+    return int(failures) > KING_SAME_POD_RETRIES
 
 
 def wall_of_block(block: int, *, now: float, block_now: int) -> float:
@@ -611,6 +626,7 @@ class RollingScheduler:
         self._lock = threading.RLock()
         self._threads: dict[str, threading.Thread] = {}     # hotkey -> leg thread
         self._king_threads: dict[int, threading.Thread] = {}  # era index -> king leg thread
+        self._king_nan0_rotated: set[int] = set()  # eras already rotated for a step-0 NaN
         # (era index, king hotkey) -> that king leg's bench thread. Kept apart
         # from _king_threads so a throne change never waits on the deposed
         # king's bench before the new king's leg can launch (2026-10-06).
@@ -1085,7 +1101,13 @@ class RollingScheduler:
                     era.king_leg_failures += 1
                     failures = era.king_leg_failures
                     self._save()
-                if king_pod_should_rotate(e, failures):
+                nan0_rotated = era.index in self._king_nan0_rotated
+                if king_pod_should_rotate(e, failures, nan0_rotated=nan0_rotated):
+                    if not nan0_rotated and _step0_divergence(e):
+                        # One immediate rotation per era for a step-0 NaN: a
+                        # generator that NaNs everywhere must not quarantine
+                        # a fresh healthy host on every retry.
+                        self._king_nan0_rotated.add(era.index)
                     reason = (f"era {era.index} king leg failed {failures}x on this pod: "
                               f"{error_tail(e, 160)}")
                     log.warning("rolling: era %d king pod ROTATES after %d failure(s) — "

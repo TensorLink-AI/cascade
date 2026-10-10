@@ -24,6 +24,7 @@ import contextlib
 import json
 import logging
 import queue
+import re
 import shlex
 import subprocess
 import threading
@@ -339,18 +340,44 @@ STALL_CLASS = "stall"
 _STALL_MARKER = "generator_stalled"
 
 
+#: Error class for a loss that is non-finite at step 0 after 0 tokens. That
+#: signature is what a faulty GPU produces on its very first batch
+#: (2026-10-08 19:01: the era-2567 king leg NaN'd at step 0 on RTX4090 host
+#: 146.120.227.147, then trained clean on another host). It mirrors
+#: :data:`STALL_CLASS`: the first occurrence is unburned and requeued with
+#: the host quarantined, so the retry lands on a different machine; a second
+#: one for the same hotkey is the miner's fault. A NaN after real training
+#: steps never matches and stays the miner's shot.
+NAN0_CLASS = "nan0"
+_STEP0_NAN = re.compile(
+    re.escape(DIVERGED_MARKER)
+    + r": non-finite loss \([^)]*\) at step 0 after 0 tokens")
+
+
+def is_step0_divergence(text: str | None) -> bool:
+    """Whether ``text`` carries the step-0, zero-token non-finite-loss verdict."""
+    return bool(_STEP0_NAN.search(text or ""))
+
+
 def classify_funded_worker_failure(rc: int | None, text: str, *,
-                                   stalled_before: bool) -> tuple[bool, str, bool]:
+                                   stalled_before: bool,
+                                   nan0_before: bool = False) -> tuple[bool, str, bool]:
     """``(miner_fault, error_class, burn_attempt)`` for a funded worker exit.
 
     ``rc == 3`` is the worker's "miner submission rejected" exit (CorpusError).
     A rejection whose text is a stream STALL is classed :data:`STALL_CLASS`
     (infra-side, unburned) the first time and ``"generator"`` (the miner's
-    shot) only when this hotkey already stalled once before. Every other
-    rejection stays ``"generator"``; any other exit is ``"infra"`` and burns
-    one of the entry's retry attempts, as before.
+    shot) only when this hotkey already stalled once before. A step-0,
+    zero-token non-finite loss is classed :data:`NAN0_CLASS` (infra-side,
+    unburned) the first time and ``"generator"`` only when this hotkey's last
+    failure was already one (the caller quarantines the host, so that second
+    occurrence is on a different machine). Every other rejection stays
+    ``"generator"``; any other exit is ``"infra"`` and burns one of the
+    entry's retry attempts, as before.
     """
     if rc == 3:
+        if is_step0_divergence(text):
+            return (True, "generator", False) if nan0_before else (False, NAN0_CLASS, False)
         if _STALL_MARKER in (text or "") and not stalled_before:
             return False, STALL_CLASS, False
         return True, "generator", False
@@ -4042,10 +4069,20 @@ class TrainerRunner:
                     burn=False)
                 raise
             prior = self._funded_queue().get(gen.hotkey)
+            prior_class = prior.last_error_class if prior is not None else ""
             miner_fault, error_class, burn = classify_funded_worker_failure(
                 rc, text,
-                stalled_before=bool(prior is not None
-                                    and prior.last_error_class == STALL_CLASS))
+                stalled_before=prior_class == STALL_CLASS,
+                nan0_before=prior_class == NAN0_CLASS)
+            if error_class == NAN0_CLASS:
+                # Most likely the GPU, not the corpus: keep this machine out
+                # of the market so the unburned retry runs elsewhere — only a
+                # repeat there is the miner's fault.
+                log.warning("funded leg %s: non-finite loss at step 0 on %s — treated as a "
+                            "host fault the first time; host quarantined, leg requeued "
+                            "unburned for a different machine", gen.hotkey, host.host)
+                _quarantine_lane_host(host, f"funded leg {gen.hotkey[:12]}: non-finite "
+                                      f"loss at step 0 (suspected GPU fault)")
             self._record_funded_failure(gen.hotkey, text, miner_fault=miner_fault,
                                         error_class=error_class, burn=burn)
             raise
