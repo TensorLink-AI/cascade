@@ -100,6 +100,9 @@ commands) is in `docs/MINER_MULTICHANNEL_WALKTHROUGH.md`.
 - Only coupled channels teach the variate layers anything. Stacking unrelated
   series into one array is legal today, but it teaches no cross-channel
   structure, and the channel telemetry logs it (`frac_unpartnered`, shadow).
+  An enforce lever exists (`[generator] unpartnered_mode`, off today): once
+  armed, a run whose share of such series exceeds `max_unpartnered_frac` is
+  rejected. Couple your channels or emit them as separate series.
 - Eval windows have at most 8 channels regardless of your C.
 - Billing can also be `points+mv<N>` (check the round's `[training]
   budget_denomination`): every channel is then a budget point, a `(C, L)` series
