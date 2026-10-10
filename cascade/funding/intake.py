@@ -558,11 +558,16 @@ class FundingIntake:
             log.info("withdraw %s", hotkey)
             return 200, {"status": "withdrawn"}
         entry = self.queue.get(hotkey)
-        if entry is not None and entry.status == "in_round":
+        # A rolling leg in flight holds a pod rented with this key exactly like
+        # an in-round entry: forgetting the key now strands a live, billing pod
+        # the trainer can no longer stop or re-identify (2026-10-08 19:28,
+        # 5FHPFZ1x — the guard checked "in_round" only).
+        if entry is not None and entry.status in ("in_round", "in_flight"):
+            what = ("a training leg in flight" if entry.status == "in_flight"
+                    else "an entry already in a round")
             return 409, {"code": "not_queued",
-                         "message": "an entry already in a round runs to its "
-                                    "verdict — the key is retained until then "
-                                    "(teardown needs it)"}
+                         "message": f"{what} runs to its verdict — the key is "
+                                    "retained until then (teardown needs it)"}
         # No live entry: nothing to unqueue, but honor the custody half — a
         # terminal (done/failed) or absent entry has no teardown claim on the
         # key, so the miner can make us forget it NOW rather than waiting out

@@ -177,6 +177,34 @@ def test_withdraw_in_round_keeps_key_but_terminal_forgets_it(tmp_path):
     assert intake.vault.get(HK) is None
 
 
+def test_withdraw_in_flight_keeps_key_but_terminal_forgets_it(tmp_path):
+    """2026-10-08 19:28: a withdraw while a rolling leg was in flight fell
+    through the "in_round"-only guard and deleted the payer key while the leg's
+    pod was live — the trainer could no longer stop or re-identify it."""
+    intake, _ = make_intake(tmp_path)
+    headers = {"X-Miner-Hotkey": HK, "X-Commit-Ref": REF, "X-Lium-Api-Key": "sk"}
+    intake.fund(headers)
+    assert intake.queue.mark_in_flight(HK, REF, target_boundary=900,
+                                       era_index=1, started_block=10)
+    status, body = intake.withdraw({"X-Miner-Hotkey": HK, "X-Commit-Ref": REF})
+    assert (status, body["code"]) == (409, "not_queued")
+    assert "in flight" in body["message"]
+    assert intake.vault.get(HK) == "sk"           # the live pod's teardown needs it
+    assert intake.queue.get(HK).status == "in_flight"
+    intake.queue.mark_done(HK)                    # settled: no teardown claim left
+    status, body = intake.withdraw({"X-Miner-Hotkey": HK, "X-Commit-Ref": REF})
+    assert (status, body["status"]) == (200, "key-forgotten")
+    assert intake.vault.get(HK) is None
+
+
+def test_withdraw_without_entry_forgets_key(tmp_path):
+    intake, _ = make_intake(tmp_path)
+    intake.vault.insert(HK, "sk")
+    status, body = intake.withdraw({"X-Miner-Hotkey": HK, "X-Commit-Ref": REF})
+    assert (status, body["status"]) == (200, "key-forgotten")
+    assert intake.vault.get(HK) is None
+
+
 def test_canonical_message_rejects_unknown_action():
     with pytest.raises(ValueError):
         canonical_fund_message("steal", HK, REF, "0")
