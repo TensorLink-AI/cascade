@@ -93,6 +93,7 @@ def _runner(tmp_path, *, sku="RTX4090", image="ghcr.io/x/worker@sha256:" + "c" *
                  "_funded_checkpoint_mismatch", "_refuse_diverged_king",
                  "_effective_funded_pods", "_funded_queue", "_payer_vault", "_funded_pod_profile",
                  "_funded_admission_cap", "_probe_funded_capacity", "_claimed_executors",
+                 "_rent_slot", "_leg_rent_priority", "_capacity_sleep",
                  "_funded_skus_for_rent", "_funded_rent_wait_deadline_for",
                  "_funded_epoch_end_known", "_skus_fitting_now", "_leg_wall_seconds",
                  "_funded_price_caps", "_provider_capacity", "_operator_lane_deadline_fn",

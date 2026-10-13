@@ -75,6 +75,7 @@ from .contract import BaseTrainer, RoundSeeds, TrainResult, assert_train_image
 from .corpus import DIVERGED_MARKER, CorpusError, build_round_corpus
 from .host_probe import host_snapshot, host_summary_line
 from .remote import error_tail
+from .rent_queue import KING_PRIORITY, CapacityBeacon, SeniorityRentLock, leg_priority
 from .stream import open_round_stream
 from .wandb_sink import open_wandb_run
 
@@ -1381,8 +1382,15 @@ class TrainerRunner:
     # 429'd on the provider's create limit, every round. One rent at a time
     # makes each later rent see the earlier claims; training itself still
     # runs fully parallel, so wall-clock stays one leg + ~90s per seat.
-    _funded_rent_lock: threading.Lock = field(
-        default_factory=threading.Lock, repr=False)
+    # First come, first served (owner 2026-10-13): the slot goes to the most
+    # senior waiter (king, then earliest reveal block), not whichever thread
+    # the scheduler wakes first — see cascade/trainer/rent_queue.py.
+    _funded_rent_lock: SeniorityRentLock = field(
+        default_factory=SeniorityRentLock, repr=False)
+    # Wakes every leg polling for capacity the moment one of them sees a GPU,
+    # so the senior legs join the rent line instead of sleeping out 90 s.
+    _funded_capacity_beacon: CapacityBeacon = field(
+        default_factory=CapacityBeacon, repr=False)
     # Funded pods kept ALIVE past their leg for the post-publish bench
     # (payer hotkey → PodInstance; [telemetry] funded_bench). Each is torn
     # down the moment its own sweep ends (_bench_pod_group), and whatever is
@@ -2410,6 +2418,11 @@ class TrainerRunner:
                 if polled:
                     log.info("%s: %s capacity appeared (%d) after %d poll(s)",
                              describe, sku, n, polled)
+                # Wake every other polling leg: the rent line is ordered by
+                # seniority, so the senior ones must join it now, not 90 s later.
+                beacon = getattr(self, "_funded_capacity_beacon", None)
+                if beacon is not None:
+                    beacon.notify()
                 return True
             if not polled:
                 log.info("%s: no %s capacity on lium — polling every %.0fs until %s "
@@ -2417,7 +2430,8 @@ class TrainerRunner:
                          describe, sku, self.FUNDED_RENT_RETRY_SECONDS,
                          time.strftime("%H:%M:%SZ", time.gmtime(deadline)))
             polled += 1
-            sleep(max(0.0, min(self.FUNDED_RENT_RETRY_SECONDS, deadline - now_fn())))
+            self._capacity_sleep(max(0.0, min(self.FUNDED_RENT_RETRY_SECONDS,
+                                              deadline - now_fn())))
         if self._operator_fallback_lanes():
             # Past the latest safe start with operator lanes on file: the leg
             # goes to the lane pool, which hands out a lane only if one is
@@ -2428,6 +2442,38 @@ class TrainerRunner:
                      "if one is free now (operator-billed)", describe)
             return "operator"
         return False
+
+    def _leg_rent_priority(self, hotkey: str) -> tuple:
+        """First come, first served: a leg's rent rank is its funded-queue
+        seniority (earliest reveal block first — the queue's own drain
+        order). Unknown seniority ranks after every known leg."""
+        q = self._funded_queue()
+        e = None
+        if q is not None:
+            with contextlib.suppress(Exception):
+                e = q.get(hotkey)
+        return leg_priority(getattr(e, "reveal_block", None) if e is not None else None)
+
+    def _rent_slot(self, priority: tuple):
+        """The serialized rent phase, granted in seniority order. A plain
+        lock (older tests inject ``threading.Lock``) is honoured as-is."""
+        lock = self._funded_rent_lock
+        if hasattr(lock, "slot"):
+            return lock.slot(priority)
+        return lock
+
+    def _capacity_sleep(self, seconds: float) -> None:
+        """Sleep between capacity polls, waking early when another leg has
+        just seen a GPU (so senior legs join the rent line at once)."""
+        injected = getattr(self, "_rent_wait_sleep", None)
+        if injected is not None:
+            injected(seconds)
+            return
+        beacon = getattr(self, "_funded_capacity_beacon", None)
+        if beacon is None:
+            time.sleep(seconds)
+            return
+        beacon.wait(seconds)
 
     def _claimed_executors(self) -> tuple[str, ...]:
         """Executors this round's rents already claimed (never re-picked)."""
@@ -2472,6 +2518,11 @@ class TrainerRunner:
             if abort is not None and abort.is_set():
                 return
             sleep(max(0.0, min(self.KING_YIELD_POLL_SECONDS, deadline - now_fn())))
+        # The king is served: wake the legs sleeping in a capacity poll too,
+        # so every waiting leg re-probes and the rent line ranks them together.
+        beacon = getattr(self, "_funded_capacity_beacon", None)
+        if beacon is not None:
+            beacon.notify()
 
     def _operator_fallback_lanes(self) -> list:
         """Operator FINAL lanes a waiting funded leg may fall back to: fresh
@@ -3049,7 +3100,7 @@ class TrainerRunner:
             # King first: a challenger never takes the rent lock (or the last
             # GPU) while the round's JIT king still needs a pod.
             self._yield_to_king(f"funded leg {gen.hotkey[:12]}")
-            with self._funded_rent_lock:
+            with self._rent_slot(self._leg_rent_priority(gen.hotkey)):
                 with self._funded_exec_lock:
                     claimed = tuple(sorted(self._funded_claimed_execs))
                 from ..provision.core import scan_ssh_host_key
@@ -3693,7 +3744,7 @@ class TrainerRunner:
                     # Serialized with every funded rent (see _funded_rent_lock):
                     # the king's `lium up` must not race a challenger's for the
                     # same executor / create-rate window.
-                    with self._funded_rent_lock:
+                    with self._rent_slot(KING_PRIORITY):
                         with self._funded_exec_lock:
                             claimed = tuple(sorted(self._funded_claimed_execs))
                         fit = self._skus_fitting_now(skus) or skus
@@ -3944,7 +3995,7 @@ class TrainerRunner:
                     _skip("operator-billed leg: no GPU on the operator's account before "
                           "the latest safe start (requeued, operator-billed)", "no_capacity")
             try:
-                with self._funded_rent_lock:
+                with self._rent_slot(self._leg_rent_priority(gen.hotkey)):
                     with self._funded_exec_lock:
                         claimed = tuple(sorted(self._funded_claimed_execs))
                     fit = self._skus_fitting_now(skus) or skus
