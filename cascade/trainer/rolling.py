@@ -1328,7 +1328,7 @@ class RollingScheduler:
                 queue.fail(entry.hotkey, error="vault ref not owned by this hotkey",
                            error_class="ref_mismatch", expect_ref=entry.ref)
                 continue
-            if self._blocked_check(gen, block):
+            if self._blocked_check(gen, block, history):
                 continue
             if self._packed_source_check(gen, block):
                 continue
@@ -1385,20 +1385,44 @@ class RollingScheduler:
                 "passed_over": ahead, "at": self.clock()})
             self._save()
 
-    def _blocked_check(self, gen, block: int | None = None) -> bool:
-        """``[round] blocked_hotkeys`` (DEC-CA-0048): refused at the door, never
-        rents a pod. Terminal ``failed`` [blocked], no burn — the fee question is
-        policy, not code. Returns True when ``gen`` was dropped."""
+    def _blocked_check(self, gen, block: int | None = None, history=()) -> bool:
+        """``[round] blocked_hotkeys`` / ``blocked_coldkeys`` (DEC-CA-0048):
+        refused at the door, never rents a pod. Terminal ``failed`` [blocked],
+        no burn — the fee question is policy, not code. A coldkey match is read
+        from the hotkey's revealed commitment (metagraph coldkey); the reigning
+        king is exempt from it. Returns True when ``gen`` was dropped."""
         rnd = self.r.cfg.round
         blocked = rnd.blocked_at(block) if hasattr(rnd, "blocked_at") else frozenset()
-        if gen.hotkey not in blocked:
+        cold_blocked = (rnd.blocked_coldkeys_at(block)
+                        if hasattr(rnd, "blocked_coldkeys_at") else frozenset())
+        if gen.hotkey in blocked:
+            why, tag = "hotkey is on the operator's admission denylist ([round] blocked_hotkeys)", \
+                "blocked_hotkeys"
+        elif cold_blocked and not self._is_reigning_king(gen.hotkey) and \
+                self._coldkey_of(history, gen.hotkey) in cold_blocked:
+            why, tag = "coldkey is on the operator's admission denylist ([round] blocked_coldkeys)", \
+                "blocked_coldkeys"
+        else:
             return False
         q = self.ops.queue()
         if q is not None:
-            q.fail(gen.hotkey, error="hotkey is on the operator's admission denylist "
-                   "([round] blocked_hotkeys)", error_class="blocked", expect_ref=gen.ref)
-        log.warning("rolling: %s refused — blocked_hotkeys", gen.hotkey[:12])
+            q.fail(gen.hotkey, error=why, error_class="blocked", expect_ref=gen.ref)
+        log.warning("rolling: %s refused — %s", gen.hotkey[:12], tag)
         return True
+
+    def _is_reigning_king(self, hotkey: str) -> bool:
+        return any(e is not None and e.king_hotkey == hotkey
+                   for e in (self.state.current, self.state.next))
+
+    @staticmethod
+    def _coldkey_of(history, hotkey: str) -> str | None:
+        """The coldkey on the hotkey's most recent commitment (None if unknown)."""
+        best = None
+        for c in history or ():
+            if (c.hotkey == hotkey and getattr(c, "coldkey", None)
+                    and (best is None or int(c.commit_block) >= int(best.commit_block))):
+                best = c
+        return str(best.coldkey) if best is not None else None
 
     def _packed_source_check(self, gen, block: int | None = None) -> bool:
         """``[static_guard] packed_sources = "reject"``: a generator that ships
