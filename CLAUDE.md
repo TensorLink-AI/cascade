@@ -457,6 +457,20 @@ in-context.
   level-judged rounds keep the level bar; receipts stamp
   `margin_v2_block`, audit `margin-v2` check. Floor > 0 load-checked.
   (`decisions/DEC-CA-0049-margin-v2.md`)
+- **DEC-CA-0050** (proposed) — Staged-promotion carry (2026-10-14 wedge: a
+  dethrone erased staged gen 14, the record was re-timed on the new king's
+  clock, every era-2577 manifest `era_init_mismatch`). From `[scoring]
+  promotion_carry_from_block` (CONSENSUS; 0 = decided on chain via a fourth
+  readiness segment `promotion-carry`, next settlement BOUNDARY after
+  lock-in) `crown` carries `pending_*` + the previous reign's anchor, and a
+  prior-reign record is timed on that anchor (observed) or not at all,
+  never the current clock, current reign log out of its floor. Receipt
+  `promotion_carry_block`, audit `promotion-carry`. The 128-byte note was
+  full (116 B): the same release PINS the three decided lock-ins
+  (`[[activation.pinned]]`, armed at load via the existing apply functions —
+  receipts byte-identical; never re-tallied; no segment) so the note is
+  56 B / 68 B after lock-in. Old-release nodes must not lose activation state.
+  (`decisions/DEC-CA-0050-staged-promotion-carry.md`)
 - Staged rollout + budget denomination + no-weights ceiling:
   `docs/SUBMISSION_SURFACE_ROADMAP.md`. FULLY IMPLEMENTED to the
   config-only-arming bar (2026-08-14, this branch): Stages 0–1 + the Stage 2

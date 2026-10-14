@@ -527,6 +527,10 @@ class RoundReceipt:
     # (0 = none resolved, or typed into chain.toml). Stamped from lock-in on so
     # the audit replays each verdict under the bar the fleet decided.
     margin_v2_block: int = 0
+    # Staged-promotion carry (DEC-CA-0050, drop-when-default): the
+    # ``promotion_carry_from_block`` this validator resolved FROM VALIDATOR
+    # SIGNALS (0 = none resolved, or typed into chain.toml).
+    promotion_carry_block: int = 0
     receipt_version: int = RECEIPT_VERSION
     signature: str | None = None             # validator-hotkey signature over canonical_body
 
@@ -573,6 +577,8 @@ class RoundReceipt:
             body["activation_block"] = int(self.activation_block)
         if self.margin_v2_block:
             body["margin_v2_block"] = int(self.margin_v2_block)
+        if self.promotion_carry_block:
+            body["promotion_carry_block"] = int(self.promotion_carry_block)
         return json.dumps(
             body, sort_keys=True, separators=(",", ":"), allow_nan=False
         ).encode("utf-8")
@@ -599,6 +605,7 @@ def build_receipt(
     era_base_seed: int = 0,
     activation_block: int = 0,
     margin_v2_block: int = 0,
+    promotion_carry_block: int = 0,
 ) -> RoundReceipt:
     """Assemble a receipt from live-loop objects (``seeds`` is a ``RoundSeeds``).
 
@@ -627,6 +634,7 @@ def build_receipt(
         era_base_seed=int(era_base_seed or 0),
         activation_block=int(activation_block or 0),
         margin_v2_block=int(margin_v2_block or 0),
+        promotion_carry_block=int(promotion_carry_block or 0),
     )
 
 
@@ -789,6 +797,7 @@ def _receipt_from_obj(obj: dict) -> RoundReceipt:
         era_base_seed=int(obj.get("era_base_seed", 0) or 0),
         activation_block=int(obj.get("activation_block", 0) or 0),
         margin_v2_block=int(obj.get("margin_v2_block", 0) or 0),
+        promotion_carry_block=int(obj.get("promotion_carry_block", 0) or 0),
         receipt_version=version,
         signature=obj.get("signature"),
     )
@@ -944,6 +953,8 @@ def summarize_receipt(receipt: RoundReceipt) -> dict:
         "activation_block": int(receipt.activation_block or 0),
         # DEC-CA-0049: the margin-v2 block resolved from validator signals.
         "margin_v2_block": int(receipt.margin_v2_block or 0),
+        # DEC-CA-0050: the promotion-carry block resolved from validator signals.
+        "promotion_carry_block": int(receipt.promotion_carry_block or 0),
     }
 
 

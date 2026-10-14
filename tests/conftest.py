@@ -12,7 +12,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from cascade.shared.config import ChainConfig, load_chain_config  # noqa: E402
+from cascade.shared.config import ChainConfig  # noqa: E402
+from tests.unpinned import load_unpinned  # noqa: E402
 
 # Credentials that turn "fake" code paths real: with these present, code under
 # test that falls through to ``open_manifest_store`` (e.g. the receipt-index
@@ -51,7 +52,10 @@ def cfg() -> ChainConfig:
     """
     from dataclasses import replace
 
-    c = load_chain_config(REPO_ROOT / "chain.toml")
+    # Without the DEC-CA-0050 [[activation.pinned]] lock-ins: they arm the
+    # mainnet rollover / forfeiture / v2 bar at mainnet heights, which no
+    # fixture models (tests of the pins load the real file).
+    c = load_unpinned(REPO_ROOT / "chain.toml")
     return replace(c, training=replace(c.training, expected_gpu="",
                                        train_image_digest=""),
                    # corpus_target_points ships ARMED (DEC-CA-0031): a points-

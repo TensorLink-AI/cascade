@@ -1839,6 +1839,15 @@ class ScoringConfig:
     win_margin_end_v2: float = 0.0
     margin_warmup_blocks_v2: int = 0
     margin_v2_from_block: int = 0
+    # Staged-promotion carry (DEC-CA-0050, CONSENSUS). From settlements whose
+    # epoch boundary is >= this block a dethrone between a promotion being
+    # STAGED and its ``effective_era`` keeps the staged promotion (and records
+    # the previous reign's anchor), and a record that fired under an EARLIER
+    # reign is never judged against the new king's reign clock. 0 = DECIDED ON
+    # CHAIN (DEC-CA-0045 note segment ``promotion-carry``; lock-in writes the
+    # settlement boundary after the lock-in boundary here); a typed block is
+    # the owner override. Before the block: bit-identical to the old rule.
+    promotion_carry_from_block: int = 0
 
 
 @dataclass(frozen=True)
@@ -2121,6 +2130,16 @@ class ActivationConfig:
     # into ``[scoring] margin_v2_from_block`` (DEC-CA-0049 decided on chain),
     # so a resolved block is distinguishable from a typed-in one.
     resolved_margin_v2_block: int = 0
+    # RUNTIME ONLY: the promotion-carry block
+    # ``apply_promotion_carry_activation`` wrote into ``[scoring]
+    # promotion_carry_from_block`` (DEC-CA-0050 decided on chain).
+    resolved_promotion_carry_block: int = 0
+    # Pinned lock-ins (DEC-CA-0050 note budget): ``((feature, lock_block,
+    # activation_block), …)`` from ``[[activation.pinned]]``. A pinned feature
+    # is armed AT LOAD through the same apply function a lock-in uses (so the
+    # ``resolved_*`` markers, receipt stamps and audit replay are exactly the
+    # locked-in ones), is never tallied again, and carries no note segment.
+    pinned: tuple[tuple[str, int, int], ...] = ()
 
     @property
     def enabled(self) -> bool:
@@ -2280,6 +2299,14 @@ def margin_v2_active(scoring: ScoringConfig, block: int | None) -> bool:
     gate = int(getattr(scoring, "margin_v2_from_block", 0) or 0)
     return (gate > 0 and block is not None and int(block) >= gate
             and margin_v2_configured(scoring))
+
+
+def promotion_carry_active(scoring: ScoringConfig, block: int | None) -> bool:
+    """CONSENSUS gate (DEC-CA-0050): the settlement / dethrone at epoch
+    boundary ``block`` runs the staged-promotion carry rule. False with no
+    block, or before ``promotion_carry_from_block`` (0 = not yet decided)."""
+    gate = int(getattr(scoring, "promotion_carry_from_block", 0) or 0)
+    return gate > 0 and block is not None and int(block) >= gate
 
 
 def check_margin_v2(start: float, end: float, warmup_blocks: int, from_block: int) -> None:
@@ -2633,6 +2660,30 @@ def _init_gate_mode(value: object) -> str:
     return mode
 
 
+def _parse_activation_pins(entries: Any) -> tuple[tuple[str, int, int], ...]:
+    """``[[activation.pinned]]`` → ``((feature, lock_block, activation_block), …)``.
+    Shape checks only (the alignment and feature checks need the built
+    config — :func:`cascade.shared.activation.apply_pinned_activations`)."""
+    if isinstance(entries, dict) or not isinstance(entries, (list, tuple)):
+        raise ValueError("[[activation.pinned]] must be an array of tables")
+    out: list[tuple[str, int, int]] = []
+    for e in entries:
+        if not isinstance(e, dict):
+            raise ValueError("[[activation.pinned]] entries must be tables")
+        unknown = set(e) - {"feature", "lock_block", "activation_block"}
+        if unknown:
+            raise ValueError(f"[[activation.pinned]] unknown key(s) {sorted(unknown)}")
+        feat = str(e.get("feature", "") or "").strip()
+        lock, act = int(e.get("lock_block", 0) or 0), int(e.get("activation_block", 0) or 0)
+        if not feat or lock <= 0 or act <= lock:
+            raise ValueError(f"[[activation.pinned]] {feat or '<no feature>'}: needs a feature "
+                             f"and 0 < lock_block < activation_block (got {lock}, {act})")
+        out.append((feat, lock, act))
+    if len({f for f, _, _ in out}) != len(out):
+        raise ValueError("[[activation.pinned]] names a feature twice")
+    return tuple(out)
+
+
 def load_chain_config(path: Path | str | None = None) -> ChainConfig:
     """Load and parse ``chain.toml``. Raises on a missing file or unsupported
     (too-old) schema; warns and proceeds on a newer schema."""
@@ -2703,6 +2754,10 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
     _mv2_blocks = int(s.get("margin_warmup_blocks_v2", 0) or 0)
     _mv2_from = int(s.get("margin_v2_from_block", 0) or 0)
     check_margin_v2(_mv2_start, _mv2_end, _mv2_blocks, _mv2_from)
+    # Staged-promotion carry (DEC-CA-0050): 0 = decided on chain.
+    _pcarry_from = int(s.get("promotion_carry_from_block", 0) or 0)
+    if _pcarry_from < 0:
+        raise ValueError(f"[scoring] promotion_carry_from_block={_pcarry_from} must be >= 0")
     _rolling = max(0, int(r.get("rolling_from_block", 0) or 0))
     _era_king = max(0, int(s.get("era_king_from_block", 0) or 0))
     _tenure_blocks = max(0, int(s.get("tenure_blocks_from_block", 0) or 0))
@@ -2743,6 +2798,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             f"[activation] threshold={_act_threshold} must be in (0, 1] (a fraction "
             "of eligible validator stake)")
     _act_grid_after = max(0, int(ac.get("epoch_blocks_after", 0) or 0))
+    _act_pinned = _parse_activation_pins(ac.get("pinned", ()) or ())
     if _act_grid_after and _eb % _act_grid_after:
         raise ValueError(
             f"[activation] epoch_blocks_after={_act_grid_after} must divide "
@@ -2788,7 +2844,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
         for z in t.get("sizes", [])
     )
 
-    return ChainConfig(
+    cfg = ChainConfig(
         schema_version=schema,
         subnet=SubnetConfig(
             netuid=int(sub.get("netuid", 0)),
@@ -3079,6 +3135,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             win_margin_end_v2=_mv2_end,
             margin_warmup_blocks_v2=_mv2_blocks,
             margin_v2_from_block=_mv2_from,
+            promotion_carry_from_block=_pcarry_from,
         ),
         dependencies=DependencyConfig(
             max_packages=int(d["max_packages"]),
@@ -3146,6 +3203,12 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             threshold=_act_threshold,
             epoch_blocks_after=_act_grid_after,
             dormant_after_blocks=max(0, int(ac.get("dormant_after_blocks", 0) or 0)),
+            pinned=_act_pinned,
         ),
         raw=raw,
     )
+    if cfg.activation.pinned:
+        # Imported lazily: activation imports this module.
+        from .activation import apply_pinned_activations
+        cfg = apply_pinned_activations(cfg)
+    return cfg

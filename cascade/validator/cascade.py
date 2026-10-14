@@ -205,13 +205,20 @@ class CascadeState:
     pending_generation: int = 0
     pending_members: tuple[str, ...] = ()
     pending_effective_era: int = 0
+    # The PREVIOUS reign's anchor + attestation (DEC-CA-0050), recorded by a
+    # carrying :func:`crown` so a promotion record that fired under that
+    # reign is still timed against the clock it fired under, not the new
+    # king's. ``None``/False = unknown (pre-DEC-CA-0050 crown, an accepted
+    # promotion, or a carry-inactive dethrone).
+    prev_reign_start_block: int | None = None
+    prev_clock_observed: bool = False
 
 
 # ── pure transitions over CascadeState ───────────────────────────────────────
 
 
 def crown(state: CascadeState, *, king_hotkey: str, block: int,
-          observed: bool = True) -> CascadeState:
+          observed: bool = True, carry_pending: bool = False) -> CascadeState:
     """Re-crown for a newly-throned king: start the reign clock at ``block`` and
     clear the previous reign's checkpoint log. Called on every dethrone (Cascade
     reuses KOTH's dethrone signal rather than reimplementing it) and on every
@@ -219,7 +226,23 @@ def crown(state: CascadeState, *, king_hotkey: str, block: int,
     promotion (``generation``/``members``) is deliberately CARRIED OVER — the
     field trains from the live set no matter who holds the throne. ``observed``
     records whether this crowning comes from a transition the validator actually
-    watched (attesting clock) or an adoption (mid-reign join/restart)."""
+    watched (attesting clock) or an adoption (mid-reign join/restart).
+
+    ``carry_pending`` (DEC-CA-0050, consensus-gated by the caller on
+    ``promotion_carry_from_block``): also carry the STAGED promotion
+    (``pending_*``) — a dethrone between staging and the effective era must
+    not erase it — and record the outgoing reign's anchor
+    (``prev_reign_start_block`` / ``prev_clock_observed``). False is the
+    pre-DEC-CA-0050 rule, bit-identical: the staged promotion is dropped."""
+    if not carry_pending:
+        return CascadeState(
+            king_hotkey=king_hotkey,
+            reign_start_block=int(block),
+            checkpoints=(),
+            generation=state.generation,
+            members=state.members,
+            clock_observed=bool(observed),
+        )
     return CascadeState(
         king_hotkey=king_hotkey,
         reign_start_block=int(block),
@@ -227,6 +250,11 @@ def crown(state: CascadeState, *, king_hotkey: str, block: int,
         generation=state.generation,
         members=state.members,
         clock_observed=bool(observed),
+        pending_generation=state.pending_generation,
+        pending_members=state.pending_members,
+        pending_effective_era=state.pending_effective_era,
+        prev_reign_start_block=state.reign_start_block,
+        prev_clock_observed=bool(state.clock_observed and state.reign_start_block is not None),
     )
 
 
@@ -335,6 +363,11 @@ def dumps(state: CascadeState) -> str:
                 "pending_members": list(state.pending_members),
                 "pending_effective_era": state.pending_effective_era}
                if state.pending_generation else {}),
+            # DEC-CA-0050, drop-when-default: a state without a recorded
+            # previous reign serialises to exactly the pre-DEC-CA-0050 bytes.
+            **({"prev_reign_start_block": state.prev_reign_start_block,
+                "prev_clock_observed": state.prev_clock_observed}
+               if state.prev_reign_start_block is not None else {}),
             "checkpoints": [
                 {
                     "checkpoint_id": r.checkpoint_id,
@@ -381,6 +414,7 @@ def loads(text: str) -> CascadeState:
     # from before the promotion fields default to generation 0 / no members (the
     # legacy single-pointer adoption shim in the validator loop upgrades them).
     start_block = obj.get("reign_start_block")
+    prev_start = obj.get("prev_reign_start_block")
     return CascadeState(
         king_hotkey=obj.get("king_hotkey"),
         reign_start_block=None if start_block is None else int(start_block),
@@ -394,6 +428,8 @@ def loads(text: str) -> CascadeState:
         pending_generation=int(obj.get("pending_generation", 0) or 0),
         pending_members=tuple(str(m) for m in (obj.get("pending_members") or ())),
         pending_effective_era=int(obj.get("pending_effective_era", 0) or 0),
+        prev_reign_start_block=None if prev_start is None else int(prev_start),
+        prev_clock_observed=bool(obj.get("prev_clock_observed", False)),
     )
 
 
@@ -426,7 +462,8 @@ class CascadeController:
     # from ``tenure_blocks_from_block``); None ⇒ the fixed ``reign_days``.
     threshold_fn: Callable[[int], float] | None = None
 
-    def note_dethrone(self, new_king: str, *, block: int, observed: bool = True) -> None:
+    def note_dethrone(self, new_king: str, *, block: int, observed: bool = True,
+                      carry_pending: bool = False) -> None:
         """Reset the reign clock for a fresh king. Call this on — and only on — a
         KOTH dethrone (``StateTransition.dethroned``); it re-crowns Cascade's view
         so the reign starts at the epoch block the throne changed hands. The
@@ -434,9 +471,19 @@ class CascadeController:
         member set under the new king. Pass ``observed=False`` when the crowning
         is an ADOPTION (validator joined/restarted mid-reign and inherited the
         champion) rather than a watched verdict — an adopted clock measures its
-        own uptime and must not attest reign timing."""
+        own uptime and must not attest reign timing. ``carry_pending``
+        (DEC-CA-0050, consensus-gated by the caller) keeps a staged promotion
+        and records the outgoing reign's anchor — see :func:`crown`."""
+        dropped = (self.state.pending_generation if not carry_pending else 0)
         self.state = crown(self.state, king_hotkey=new_king, block=block,
-                           observed=observed)
+                           observed=observed, carry_pending=carry_pending)
+        if dropped:
+            log.warning("cascade: dethrone at block %d drops staged promotion gen=%d "
+                        "(pre-DEC-CA-0050 rule)", int(block), int(dropped))
+        elif carry_pending and self.state.pending_generation:
+            log.info("cascade: staged promotion gen=%d for era %d carried across the "
+                     "dethrone at block %d", self.state.pending_generation,
+                     self.state.pending_effective_era, int(block))
         self._persist()
         log.info("cascade: reign clock reset for new king %s at block %d (%s)",
                  (new_king or "?")[:12], int(block),
@@ -514,10 +561,41 @@ class CascadeController:
         state = self.state
         if state.king_hotkey is None or state.reign_start_block is None:
             return False
-        elapsed = reign_rounds(state, block, self.round_cfg)
+        return self._ripe_since(int(state.reign_start_block), block=block)
+
+    def _ripe_since(self, anchor: int, *, block: int) -> bool:
+        elapsed = reign_rounds(replace(self.state, reign_start_block=int(anchor)), block,
+                               self.round_cfg)
         threshold = (self.threshold_fn(int(block)) if self.threshold_fn is not None
                      else self.reign_days)
         return elapsed is not None and elapsed >= threshold
+
+    def fired_in_prior_reign(self, fired_block: int) -> bool:
+        """Whether a record that fired at ``fired_block`` predates the
+        CURRENT reign's anchor — it fired under an earlier king's clock, so
+        the current clock says nothing about its timing (DEC-CA-0050)."""
+        start = self.state.reign_start_block
+        return start is not None and int(fired_block) < int(start)
+
+    def prior_reign_anchor(self, fired_block: int) -> int | None:
+        """The anchor of the reign ``fired_block`` fell in, when this
+        validator recorded it from an OBSERVED transition (a carrying
+        dethrone): the previous reign's start, with ``prev <= fired_block <
+        current start``. ``None`` = not attestable (unknown or adopted
+        previous clock, or the record fired even earlier)."""
+        st = self.state
+        prev = st.prev_reign_start_block
+        if (prev is None or not st.prev_clock_observed or st.reign_start_block is None
+                or not (int(prev) <= int(fired_block) < int(st.reign_start_block))):
+            return None
+        return int(prev)
+
+    def is_ripe_since(self, anchor: int, *, block: int) -> bool:
+        """:meth:`is_ripe` against an explicit reign anchor (a previous
+        reign's, :meth:`prior_reign_anchor`) instead of the current one."""
+        if self.state.king_hotkey is None:
+            return False
+        return self._ripe_since(int(anchor), block=block)
 
     def can_verify_ripeness(self) -> bool:
         """Whether this validator's clock is in a position to judge reign

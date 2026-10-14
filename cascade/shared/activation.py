@@ -57,6 +57,14 @@ The DEC-CA-0049 dethrone bar v2 is the second such feature
 (``margin-v2-<sha256(start|end|blocks)[:8]>``): lock-in writes the first
 ERA START after the lock-in boundary into ``[scoring] margin_v2_from_block``
 (:func:`apply_margin_v2_activation`); a typed block is the owner override.
+The DEC-CA-0050 staged-promotion carry is the fourth (``promotion-carry``,
+a fixed name: the rule has no tunable values): lock-in writes the settlement
+BOUNDARY after the lock-in boundary into ``[scoring]
+promotion_carry_from_block`` (:func:`apply_promotion_carry_activation`); a
+typed block is the owner override. Its segment rides LAST, so the bytes of
+every earlier segment are unchanged; a note that would overflow the 128-byte
+commitment field drops the promotion-carry segment rather than fail the write
+(:data:`NOTE_MAX_BYTES`).
 """
 
 from __future__ import annotations
@@ -84,6 +92,11 @@ SIGNAL_VERSION = 1
 # when its as-of read fails (public finney endpoints discard state after
 # ~256 blocks); a younger failure is a transient and is retried as-is.
 PRUNED_AFTER_BLOCKS = 300
+# The plain-commitment field is ``Raw0..Raw128``: a longer note cannot be
+# written at all (the extrinsic is refused and the old note stays).
+NOTE_MAX_BYTES = 128
+# DEC-CA-0050: the staged-promotion carry rule's segment name.
+PROMOTION_CARRY_FEATURE = "promotion-carry"
 
 
 # ── the on-chain note ────────────────────────────────────────────────────────
@@ -398,15 +411,45 @@ class FeatureSpec:
     # DEC-CA-0048 forfeiture); "era" = the next ERA START (DEC-CA-0049 bar
     # v2 — every settlement of one era is judged under one bar).
     align: str = "boundary"
+    # A PINNED lock-in (``[[activation.pinned]]``): the feature was decided on
+    # chain earlier and the release now carries the decision. Armed at load
+    # through the same apply function, never tallied again, no note segment.
+    pinned_lock: int = 0
+    pinned_block: int = 0
 
     @property
     def decided_on_chain(self) -> bool:
         return bool(self.name) and not int(self.typed_block)
 
+    @property
+    def pinned(self) -> bool:
+        return bool(int(self.pinned_block))
+
+    @property
+    def signals(self) -> bool:
+        """Whether this feature carries a segment in the readiness note."""
+        return self.decided_on_chain and not self.pinned
+
+
+def pinned_pair(cfg: ChainConfig, name: str) -> tuple[int, int] | None:
+    """``(lock_block, activation_block)`` pinned for feature ``name``, else None."""
+    for feat, lock, act in getattr(cfg.activation, "pinned", ()) or ():
+        if feat == name:
+            return int(lock), int(act)
+    return None
+
+
+def _with_pin(cfg: ChainConfig, spec: FeatureSpec) -> FeatureSpec:
+    pin = pinned_pair(cfg, spec.name) if spec.name else None
+    if pin is None:
+        return spec
+    return replace(spec, pinned_lock=pin[0], pinned_block=pin[1])
+
 
 def primary_feature(cfg: ChainConfig) -> FeatureSpec:
     """The DEC-CA-0043 rollover feature (``[activation] feature``)."""
-    return FeatureSpec(name=str(cfg.activation.feature or ""), typed_block=configured_rollover(cfg))
+    return _with_pin(cfg, FeatureSpec(name=str(cfg.activation.feature or ""),
+                                      typed_block=configured_rollover(cfg)))
 
 
 def forfeit_feature_name(hotkeys, successor: str = "") -> str:
@@ -446,7 +489,7 @@ def forfeit_feature(cfg: ChainConfig) -> FeatureSpec | None:
                                 getattr(cfg.scoring, "forfeit_successor_hotkey", "") or "")
     if not name:
         return None
-    return FeatureSpec(name=name, typed_block=configured_forfeit_block(cfg))
+    return _with_pin(cfg, FeatureSpec(name=name, typed_block=configured_forfeit_block(cfg)))
 
 
 def forfeit_block_for(cfg: ChainConfig, activation_block: int) -> int:
@@ -521,7 +564,8 @@ def margin_v2_feature(cfg: ChainConfig) -> FeatureSpec | None:
                                   sc.margin_warmup_blocks_v2)
     if not name:
         return None
-    return FeatureSpec(name=name, typed_block=configured_margin_v2_block(cfg), align="era")
+    return _with_pin(cfg, FeatureSpec(name=name, typed_block=configured_margin_v2_block(cfg),
+                                      align="era"))
 
 
 def apply_margin_v2_activation(cfg: ChainConfig, block: int) -> ChainConfig:
@@ -548,6 +592,57 @@ def apply_margin_v2_activation(cfg: ChainConfig, block: int) -> ChainConfig:
                          "the bar only at a fresh era)")
     return replace(cfg, scoring=replace(cfg.scoring, margin_v2_from_block=block),
                    activation=replace(cfg.activation, resolved_margin_v2_block=block))
+
+
+def configured_promotion_carry_block(cfg: ChainConfig) -> int:
+    """The promotion-carry block TYPED into chain.toml (0 = none / decided on
+    chain). A block written by :func:`apply_promotion_carry_activation` is not
+    typed (``activation.resolved_promotion_carry_block`` marks it)."""
+    if int(getattr(cfg.activation, "resolved_promotion_carry_block", 0) or 0):
+        return 0
+    return int(getattr(cfg.scoring, "promotion_carry_from_block", 0) or 0)
+
+
+def resolved_promotion_carry_block(cfg: ChainConfig) -> int:
+    return int(getattr(cfg.activation, "resolved_promotion_carry_block", 0) or 0)
+
+
+def promotion_carry_feature(cfg: ChainConfig) -> FeatureSpec | None:
+    """The DEC-CA-0050 staged-promotion carry as a feature the fleet decides:
+    present when ``[activation]`` is on and Cascade promotion is on
+    (``[scoring] cascade_enabled`` — without promotions the rule has nothing
+    to carry); ``typed_block`` = the typed ``promotion_carry_from_block`` (the
+    override — then nothing is signalled). Aligned to the next settlement
+    BOUNDARY after lock-in: the rule only changes how a staged promotion
+    survives a dethrone and how a prior-reign record is timed, both judged
+    per settlement from that settlement's own boundary block, so no era needs
+    to finish on one rule."""
+    if not cfg.activation.enabled or not bool(getattr(cfg.scoring, "cascade_enabled", False)):
+        return None
+    return _with_pin(cfg, FeatureSpec(name=PROMOTION_CARRY_FEATURE,
+                                      typed_block=configured_promotion_carry_block(cfg),
+                                      align="boundary"))
+
+
+def apply_promotion_carry_activation(cfg: ChainConfig, block: int) -> ChainConfig:
+    """The config the owner would have typed for a promotion carry decided at
+    rollover ``block``: ``[scoring] promotion_carry_from_block`` = that
+    settlement boundary (the one after the lock-in boundary). A typed block is
+    returned unchanged (the owner override); a block already applied is
+    idempotent; a different block after lock-in raises (one-way)."""
+    block = int(block or 0)
+    if block <= 0 or configured_promotion_carry_block(cfg):
+        return cfg
+    have = resolved_promotion_carry_block(cfg)
+    if have == block:
+        return cfg
+    if have:
+        raise ValueError(f"promotion carry {have} already applied; a lock-in is one-way and "
+                         f"cannot move it to {block}")
+    if block % int(effective_epoch_blocks(cfg.round, block - 1)):
+        raise ValueError(f"promotion carry block {block} is not a settlement boundary")
+    return replace(cfg, scoring=replace(cfg.scoring, promotion_carry_from_block=block),
+                   activation=replace(cfg.activation, resolved_promotion_carry_block=block))
 
 
 def apply_activation(cfg: ChainConfig, block: int) -> ChainConfig:
@@ -613,6 +708,81 @@ def apply_activation(cfg: ChainConfig, block: int) -> ChainConfig:
     )
     return replace(cfg, round=new_round, scoring=new_scoring,
                    activation=replace(cfg.activation, resolved_block=block))
+
+
+def apply_pinned_activations(cfg: ChainConfig) -> ChainConfig:
+    """Arm every ``[[activation.pinned]]`` lock-in at LOAD, through the SAME
+    apply function a lock-in uses — so ``activation.resolved_*`` (and with
+    them the receipt stamps ``activation_block`` / ``margin_v2_block`` /
+    ``promotion_carry_block`` and the audit replay) are exactly what a
+    validator that tallied the lock-in runs with.
+
+    Order matters and mirrors the validator's startup restore: the rollover
+    first (it switches the grid), then the features validated against the
+    grid in force. Each pin must be an admissible pair for its feature
+    (:func:`valid_pair` with the feature's alignment — the one pair a lock-in
+    could have produced), the feature must be one this config decides on
+    chain (a typed block for it is a conflicting override and is refused),
+    and every pinned name must match a configured feature (a pin for a
+    renamed forfeit list / v2 bar is stale and refused). Raises ValueError."""
+    pins = {f: (int(lock), int(act)) for f, lock, act in (cfg.activation.pinned or ())}
+    if not pins:
+        return cfg
+    if not cfg.activation.enabled:
+        raise ValueError("[[activation.pinned]] needs [activation] feature (stake-weighted "
+                         "activation on)")
+    done: set[str] = set()
+
+    def _check(spec: FeatureSpec | None, what: str) -> tuple[int, int] | None:
+        if spec is None or spec.name not in pins:
+            return None
+        lock, act = pins[spec.name]
+        if spec.typed_block:
+            raise ValueError(f"[[activation.pinned]] {spec.name}: {what} is also typed "
+                             f"({spec.typed_block}) — pin OR type it, not both")
+        if not valid_pair(cfg.round, lock, act, spec.align):
+            raise ValueError(f"[[activation.pinned]] {spec.name}: ({lock}, {act}) is not a "
+                             f"pair a lock-in could produce (align={spec.align})")
+        done.add(spec.name)
+        return lock, act
+
+    pin = _check(primary_feature(cfg), "the DEC-CA-0043 rollover ([round] rolling_from_block)")
+    if pin is not None:
+        cfg = apply_activation(cfg, pin[1])
+    pin = _check(forfeit_feature(cfg), "[scoring] forfeit_from_block")
+    if pin is not None:
+        cfg = apply_forfeit_activation(cfg, pin[1])
+    pin = _check(margin_v2_feature(cfg), "[scoring] margin_v2_from_block")
+    if pin is not None:
+        cfg = apply_margin_v2_activation(cfg, pin[1])
+    pin = _check(promotion_carry_feature(cfg), "[scoring] promotion_carry_from_block")
+    if pin is not None:
+        cfg = apply_promotion_carry_activation(cfg, pin[1])
+    stale = sorted(set(pins) - done)
+    if stale:
+        raise ValueError(f"[[activation.pinned]] names {stale}, not a feature this config "
+                         "decides on chain (renamed forfeit list / v2 bar, or the feature is "
+                         "off) — a stale pin must never arm anything")
+    return cfg
+
+
+def _pinned_record(spec: FeatureSpec, record: ActivationRecord) -> ActivationRecord:
+    """The record for a pinned feature: a persisted lock-in on exactly the
+    pinned pair is kept as-is (its bytes and ``source`` unchanged); anything
+    else becomes the pinned lock-in (``source="pinned"``)."""
+    if (record.feature == spec.name and record.lock_block == spec.pinned_lock
+            and record.activation_block == spec.pinned_block):
+        return record
+    if record.locked and record.feature == spec.name:
+        log.warning("activation: persisted lock-in for %s (%d, %d) differs from the pinned "
+                    "(%d, %d); the pin wins", spec.name, record.lock_block,
+                    record.activation_block, spec.pinned_lock, spec.pinned_block)
+    return ActivationRecord(feature=spec.name, lock_block=spec.pinned_lock,
+                            activation_block=spec.pinned_block,
+                            last_checked_boundary=max(spec.pinned_lock,
+                                                      record.last_checked_boundary
+                                                      if record.feature == spec.name else 0),
+                            source="pinned")
 
 
 # ── persistence ──────────────────────────────────────────────────────────────
@@ -714,6 +884,11 @@ def resolve_activation(
             return Resolution(record=replace(record, feature=feature, activation_block=typed,
                                              source="config"), changed=True)
         return Resolution(record=record)
+    if spec.pinned:
+        # A pinned lock-in is never tallied or re-read from notes: the release
+        # carries the decision (DEC-CA-0050 note budget).
+        rec = _pinned_record(spec, record)
+        return Resolution(record=rec, changed=rec != record)
     if record.feature and record.feature != feature:
         record = ActivationRecord()                  # another feature's decision: blank
     if record.source == "config":
@@ -849,11 +1024,14 @@ def record_for(cfg: ChainConfig, record: ActivationRecord,
     """``record`` if it belongs to ``feature`` (default: this config's primary
     feature), else a blank one — a persisted decision for a renamed feature
     (or an edited forfeit list) must never arm anything."""
-    name = feature.name if feature is not None else str(cfg.activation.feature or "")
+    spec = feature if feature is not None else primary_feature(cfg)
+    name = spec.name
     if record.feature and record.feature != name:
         log.warning("activation: ignoring a persisted record for feature %r (config runs %r)",
                     record.feature, name)
-        return ActivationRecord()
+        record = ActivationRecord()
+    if spec.pinned:
+        return _pinned_record(spec, record)
     return record
 
 
@@ -933,6 +1111,14 @@ def apply_receipt_activation(cfg: ChainConfig, receipt: Any) -> ChainConfig:
         except ValueError as e:
             log.warning("activation: receipt margin-v2 block %d not applied to the audit "
                         "config (%s)", mv2, e)
+    # DEC-CA-0050: same for the fleet-decided promotion-carry block.
+    pc = int(getattr(receipt, "promotion_carry_block", 0) or 0)
+    if pc and not configured_promotion_carry_block(cfg):
+        try:
+            cfg = apply_promotion_carry_activation(cfg, pc)
+        except ValueError as e:
+            log.warning("activation: receipt promotion-carry block %d not applied to the "
+                        "audit config (%s)", pc, e)
     return cfg
 
 
@@ -945,36 +1131,57 @@ def _segment_for(spec: FeatureSpec, record: ActivationRecord | None) -> ReadySig
 
 def own_signal_payload(cfg: ChainConfig, record: ActivationRecord,
                        forfeit_record: ActivationRecord | None = None,
-                       margin_v2_record: ActivationRecord | None = None) -> str | None:
+                       margin_v2_record: ActivationRecord | None = None,
+                       promotion_carry_record: ActivationRecord | None = None) -> str | None:
     """The note this node should have on chain right now (``None`` when
     signalling is off): plain readiness until lock-in, then the agreed block
     — per segment. With no forfeiture decided on chain the note is exactly
     the single-segment v1 note; a typed-in rollover AND no forfeiture vote
-    makes it inert (``None``)."""
+    makes it inert (``None``). The DEC-CA-0050 promotion-carry segment rides
+    last and is DROPPED (logged) when the note would exceed
+    :data:`NOTE_MAX_BYTES` — the earlier segments keep their exact bytes and
+    the write still succeeds; the owner frees room by typing decided blocks
+    into chain.toml (a typed feature carries no segment)."""
     if not cfg.activation.enabled:
         return None
     primary = primary_feature(cfg)
     forfeit = forfeit_feature(cfg)
     extras: list[ReadySignal] = []
-    if forfeit is not None and forfeit.decided_on_chain:
+    if forfeit is not None and forfeit.signals:
         extras.append(_segment_for(forfeit, forfeit_record))
     mv2 = margin_v2_feature(cfg)
-    if mv2 is not None and mv2.decided_on_chain:
+    if mv2 is not None and mv2.signals:
         extras.append(_segment_for(mv2, margin_v2_record))
-    if not primary.decided_on_chain and not extras:
-        return None                                  # typed-in rollover: the note is inert
-    head = _segment_for(primary, record) if primary.decided_on_chain else ReadySignal(primary.name)
+    pc = promotion_carry_feature(cfg)
+    pc_seg = (_segment_for(pc, promotion_carry_record)
+              if pc is not None and pc.signals else None)
+    if not primary.signals and not extras and pc_seg is None:
+        return None                                  # typed/pinned rollover: the note is inert
+    # A typed or PINNED primary keeps a plain head (the note format needs one);
+    # its ``0:0`` is never tallied by a node running the pin.
+    head = _segment_for(primary, record) if primary.signals else ReadySignal(primary.name)
+    if pc_seg is not None:
+        full = format_signals(head, *extras, pc_seg)
+        if len(full.encode("utf-8")) <= NOTE_MAX_BYTES:
+            return full
+        log.warning("activation: the %s segment would make the note %d bytes (> %d) — "
+                    "signalling without it; type decided blocks into chain.toml to make room",
+                    pc.name, len(full.encode("utf-8")), NOTE_MAX_BYTES)
+        if not primary.signals and not extras:
+            return None
     return format_signals(head, *extras)
 
 
 def ensure_signal(client: Any, cfg: ChainConfig, record: ActivationRecord, *,
                   hotkey: str, current: dict[str, str] | None = None,
                   forfeit_record: ActivationRecord | None = None,
-                  margin_v2_record: ActivationRecord | None = None) -> bool:
+                  margin_v2_record: ActivationRecord | None = None,
+                  promotion_carry_record: ActivationRecord | None = None) -> bool:
     """Write this validator's note unless the chain already carries it.
     Returns True when a write happened. Never raises (a failed write is
     retried on the next call)."""
-    want = own_signal_payload(cfg, record, forfeit_record, margin_v2_record)
+    want = own_signal_payload(cfg, record, forfeit_record, margin_v2_record,
+                              promotion_carry_record)
     if want is None:
         return False
     try:
@@ -993,7 +1200,9 @@ def summary(cfg: ChainConfig, record: ActivationRecord, t: Tally | None,
             forfeit_record: ActivationRecord | None = None,
             forfeit_tally: Tally | None = None,
             margin_v2_record: ActivationRecord | None = None,
-            margin_v2_tally: Tally | None = None) -> dict:
+            margin_v2_tally: Tally | None = None,
+            promotion_carry_record: ActivationRecord | None = None,
+            promotion_carry_tally: Tally | None = None) -> dict:
     """Presentational block for ``status/chain.json`` / dashboards."""
     out: dict = {
         "feature": cfg.activation.feature,
@@ -1034,4 +1243,17 @@ def summary(cfg: ChainConfig, record: ActivationRecord, t: Tally | None,
         if margin_v2_tally is not None:
             mo["tally"] = margin_v2_tally.to_json()
         out["margin_v2"] = mo
+    pc = promotion_carry_feature(cfg)
+    if pc is not None:
+        rec = promotion_carry_record or ActivationRecord()
+        po: dict = {
+            "feature": pc.name,
+            "typed_block": int(pc.typed_block),
+            "lock_block": int(rec.lock_block),
+            "activation_block": int(rec.activation_block),
+            "source": rec.source,
+        }
+        if promotion_carry_tally is not None:
+            po["tally"] = promotion_carry_tally.to_json()
+        out["promotion_carry"] = po
     return out
