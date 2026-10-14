@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from cascade.eval.crps import DEFAULT_QUANTILE_LEVELS
 from cascade.eval.koth import KothParams
+from tests.unpinned import load_unpinned, strip_pins
 
 
 def test_config_loads(cfg):
@@ -311,7 +312,7 @@ def test_activation_block_must_be_on_both_grids(tmp_path):
 
     from cascade.shared.config import DEFAULT_CHAIN_TOML, load_chain_config
 
-    src = DEFAULT_CHAIN_TOML.read_text()
+    src = strip_pins(DEFAULT_CHAIN_TOML.read_text())
     p = tmp_path / "chain.toml"
     # The shipped template is in the steady state (0/0); build the scheduled
     # pair explicitly so the test does not depend on a live seam being armed.
@@ -335,7 +336,7 @@ def test_cadence_keys_must_be_set_together(tmp_path):
 
     from cascade.shared.config import DEFAULT_CHAIN_TOML, load_chain_config
 
-    src = DEFAULT_CHAIN_TOML.read_text()
+    src = strip_pins(DEFAULT_CHAIN_TOML.read_text())
     p = tmp_path / "chain.toml"
     steady = ("epoch_blocks_prev      = 0\nepoch_activation_block = 0")
     p.write_text(src.replace(steady, "epoch_blocks_prev      = 0\n"
@@ -351,9 +352,9 @@ def test_shipped_config_arms_points_denomination():
     """The shipped mainnet template arms corpus_target_points at today's
     corpus size in points (16384 × 4096) and splits the streaming stall
     window off the raised batch drain budget at its pre-split value."""
-    from cascade.shared.config import DEFAULT_CHAIN_TOML, load_chain_config
+    from cascade.shared.config import DEFAULT_CHAIN_TOML
 
-    c = load_chain_config(DEFAULT_CHAIN_TOML)
+    c = load_unpinned(DEFAULT_CHAIN_TOML)
     g = c.generator
     assert g.corpus_target_points == 16384 * 4096
     assert g.corpus_target_points <= g.max_total_points
@@ -377,7 +378,7 @@ def test_corpus_target_points_must_fit_the_point_cap(tmp_path):
 
     from cascade.shared.config import DEFAULT_CHAIN_TOML, load_chain_config
 
-    src = DEFAULT_CHAIN_TOML.read_text()
+    src = strip_pins(DEFAULT_CHAIN_TOML.read_text())
     p = tmp_path / "chain.toml"
     p.write_text(src.replace("corpus_target_points = 67_108_864",
                              "corpus_target_points = 3_000_000_000"))
@@ -391,10 +392,10 @@ def test_generator_budget_keys_stay_out_of_contract_digest():
     The digest hashes TrainingContractConfig only — assert the armed template's
     training digest is bit-equal to the same [training] with the drain armed
     or not (i.e. the generator block cannot reach it)."""
-    from cascade.shared.config import DEFAULT_CHAIN_TOML, load_chain_config
+    from cascade.shared.config import DEFAULT_CHAIN_TOML
     from cascade.shared.manifest import contract_digest
 
-    c = load_chain_config(DEFAULT_CHAIN_TOML)
+    c = load_unpinned(DEFAULT_CHAIN_TOML)
     assert "corpus_target_points" not in {
         f for f in c.training.__dataclass_fields__
     }

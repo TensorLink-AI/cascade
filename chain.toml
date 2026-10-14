@@ -857,6 +857,16 @@ cascade_reign_rounds = 5
 # with a materially worse init.
 cascade_top_k          = 3
 cascade_quality_epsilon = 0.05
+# Staged-promotion carry (DEC-CA-0050) — CONSENSUS. From this block a dethrone
+# between a promotion being STAGED and its effective_era keeps the staged
+# promotion, and a record that fired under an earlier reign is timed against
+# that reign's clock (or not at all when unattestable), never the new king's.
+# Fixes the 2026-10-14 wedge (gen 14 staged, dethrone, every era-2577 manifest
+# rejected era_init_mismatch). DECIDED ON CHAIN: 0 ⇒ validators signal the
+# DEC-CA-0045 note segment "promotion-carry"; at the first boundary where 51%
+# of eligible stake has signalled it locks in and applies from the NEXT
+# settlement boundary. A typed settlement boundary is the owner override.
+promotion_carry_from_block = 0
 # Block-gated contract transition (2026-08-20, WSD flip — DEC-CA-0018): rounds
 # whose epoch boundary precedes contract_from_block score against the pinned
 # PRIOR contract digest (the warmup_cosine contract every round through
@@ -1133,3 +1143,29 @@ epoch_blocks_after = 900
 # blocks at the tally, so a dead validator's stake cannot hold the number
 # down. 0 = count every permit holder.
 dormant_after_blocks = 0
+
+# PINNED lock-ins (DEC-CA-0050). The readiness note lives in a 128-byte
+# commitment field; the three features below were decided on chain and their
+# locked-in segments filled 116 bytes, leaving no room for the promotion-carry
+# segment. Each pin is armed AT LOAD through the same apply function a
+# lock-in uses, so receipts (activation_block / margin_v2_block), verdicts and
+# the audit replay are byte-identical to the tallied lock-in; a pinned feature
+# is never tallied again and carries no note segment. Each pair must be the
+# exact (lock, activation) the fleet locked in — the loader refuses any other
+# pair, a pin plus a typed block for the same feature, and a pin whose feature
+# no longer exists (edited forfeit list / v2 bar). Do NOT remove a pin while
+# the feature's keys stay 0: the feature would be tallied afresh.
+[[activation.pinned]]   # DEC-CA-0043/0045 rollover: locked 9133200, rolling eras from 9136800
+feature          = "rolling-era-king"
+lock_block       = 9133200
+activation_block = 9136800
+
+[[activation.pinned]]   # DEC-CA-0048 forfeiture: locked 9165600, forfeit at 9166500
+feature          = "forfeit-42b1a486"
+lock_block       = 9165600
+activation_block = 9166500
+
+[[activation.pinned]]   # DEC-CA-0049 dethrone bar v2: locked 9190800, bar from era start 9194400
+feature          = "margin-v2-d30eb443"
+lock_block       = 9190800
+activation_block = 9194400

@@ -231,6 +231,13 @@ def check_activation(receipt: RoundReceipt, cfg: ChainConfig,
     if block % max(1, grid_before):
         return _fail(name, f"activation_block {block} is not a boundary of the grid before "
                            f"it ({grid_before})")
+    from ..shared.activation import pinned_pair
+    pin = pinned_pair(cfg, cfg.activation.feature)
+    if pin is not None:
+        # The release pins the fleet's lock-in (DEC-CA-0050 note budget): the
+        # notes no longer carry it, the pinned pair is the agreement.
+        return _ok(name, f"rollover {block} matches the lock-in pinned in the audit config "
+                         f"(lock-in at {pin[0]})")
     if client is None:
         return _warn(name, f"rollover {block} recorded; validator agreement not verified "
                            "(no chain)")
@@ -296,6 +303,9 @@ def check_margin_v2(receipt: RoundReceipt, cfg: ChainConfig,
                                f"audit config: {e}")
         return _fail(name, f"recorded margin_v2_block {block} != the block the audit config "
                            f"carries ({applied})")
+    if spec.pinned:
+        return _ok(name, f"margin v2 from {block} matches the lock-in pinned in the audit "
+                         f"config (lock-in at {spec.pinned_lock})")
     if client is None:
         return _warn(name, f"margin v2 from {block} recorded; validator agreement not "
                            "verified (no chain)")
@@ -318,6 +328,72 @@ def check_margin_v2(receipt: RoundReceipt, cfg: ChainConfig,
         return _fail(name, f"recorded margin_v2_block {block} != the block validators agree "
                            f"on ({act}, locked in at {lock})")
     return _ok(name, f"margin v2 from {block} agreed by validators holding "
+                     f">= {cfg.activation.threshold:.0%} of stake (lock-in at {lock})")
+
+
+def check_promotion_carry(receipt: RoundReceipt, cfg: ChainConfig,
+                          client: object | None = None) -> CheckResult:
+    """DEC-CA-0050: the staged-promotion-carry block a receipt records was
+    decided by the validators, not invented by one — the same shape as
+    :func:`check_margin_v2`. A receipt without ``promotion_carry_block``
+    PASSES (pre-field, or the block is typed into chain.toml). ``cfg``
+    already carries the recorded block (``apply_receipt_activation``)."""
+    from ..shared.activation import (
+        agreed_activation,
+        apply_promotion_carry_activation,
+        configured_promotion_carry_block,
+        promotion_carry_feature,
+        resolved_promotion_carry_block,
+    )
+
+    name = "promotion-carry"
+    block = int(getattr(receipt, "promotion_carry_block", 0) or 0)
+    if not block:
+        return _ok(name, "no chain-decided promotion carry recorded (typed-in config applies)")
+    typed = configured_promotion_carry_block(cfg)
+    if typed:
+        if typed != block:
+            return _fail(name, f"recorded promotion_carry_block {block} != the block typed "
+                               f"into the audit config ({typed})")
+        return _ok(name, f"promotion carry from {block} matches the typed-in config")
+    spec = promotion_carry_feature(cfg)
+    if spec is None:
+        return _fail(name, f"receipt records promotion_carry_block {block} but the loaded "
+                           "config runs no Cascade promotion (or [activation] is off)")
+    applied = resolved_promotion_carry_block(cfg)
+    if applied != block:
+        try:
+            apply_promotion_carry_activation(cfg, block)
+        except ValueError as e:
+            return _fail(name, f"recorded promotion_carry_block {block} cannot be applied "
+                               f"to the audit config: {e}")
+        return _fail(name, f"recorded promotion_carry_block {block} != the block the audit "
+                           f"config carries ({applied})")
+    if spec.pinned:
+        return _ok(name, f"promotion carry from {block} matches the lock-in pinned in the "
+                         f"audit config (lock-in at {spec.pinned_lock})")
+    if client is None:
+        return _warn(name, f"promotion carry from {block} recorded; validator agreement not "
+                           "verified (no chain)")
+    try:
+        validators = list(client.validator_stakes())  # type: ignore[attr-defined]
+        signals = dict(client.read_plain_commitments())  # type: ignore[attr-defined]
+        now_block = int(client.current_block())  # type: ignore[attr-defined]
+    except Exception as e:  # noqa: BLE001
+        return _warn(name, f"promotion carry from {block} recorded; chain read failed ({e})")
+    agreed = agreed_activation(spec.name, validators, signals,
+                               threshold=cfg.activation.threshold, block=now_block,
+                               dormant_after_blocks=cfg.activation.dormant_after_blocks,
+                               round_cfg=cfg.round, align=spec.align)
+    if agreed is None:
+        return _warn(name, f"promotion carry from {block} recorded; validators holding "
+                           f"{cfg.activation.threshold:.0%} of stake do not (yet) name one "
+                           "block in their notes")
+    lock, act = agreed
+    if act != block:
+        return _fail(name, f"recorded promotion_carry_block {block} != the block validators "
+                           f"agree on ({act}, locked in at {lock})")
+    return _ok(name, f"promotion carry from {block} agreed by validators holding "
                      f">= {cfg.activation.threshold:.0%} of stake (lock-in at {lock})")
 
 
@@ -1377,6 +1453,7 @@ def run_tier0(
         check_epoch_alignment(receipt, cfg),
         check_activation(receipt, cfg, client),
         check_margin_v2(receipt, cfg, client),
+        check_promotion_carry(receipt, cfg, client),
         check_era(receipt, cfg, client),
         check_block_hash_onchain(receipt, client),
         check_contract_digest(receipt, cfg),

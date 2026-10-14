@@ -227,3 +227,54 @@ beside your state; `status/chain.json` shows the tally under `activation.forfeit
 release WITHOUT this section cannot read the extended note and counts you as not signed for the
 rollover either — install the release. A typed `forfeit_from_block` is the owner override; then every
 validator must carry the same value before that boundary or weights fork there.
+
+## Staged-promotion carry, decided on chain (DEC-CA-0050)
+
+A fix for the 2026-10-14 wedge: a Cascade promotion was STAGED for a future
+era, a dethrone landed before that era began, and the dethrone erased the
+staged promotion. The validator then re-judged the published record against
+the NEW king's reign clock (`promotion record gen=… fired before the reign
+clock ripened; ignored`) and rejected every manifest of that era with
+`era_init_mismatch: … declares generation N+1 …, the ledger names generation N`.
+
+From `[scoring] promotion_carry_from_block` a dethrone keeps the staged
+promotion, and a record that fired under an EARLIER reign is timed against
+that reign's clock (when your validator observed it) or not timed at all —
+never against the new king's. Signature, member cap, effective-era floor,
+provenance and quality are still checked. A promotion re-staged after its
+effective era already began is installed at the next settlement whose era is
+at or past it, so a wedged validator recovers on its own once the rule is on.
+
+`promotion_carry_from_block = 0` means DECIDED ON CHAIN, exactly like the
+other activations: your readiness note gains a LAST segment
+`promotion-carry:<l>:<a>`; the first boundary where 51% of eligible stake has
+signalled locks in (`activation_promotion_carry_state.json` beside your
+state), and the rule applies from the NEXT settlement boundary. Receipts
+stamp `promotion_carry_block` from then on; `cascade-audit` checks it
+(`promotion-carry`). Until lock-in nothing changes — upgraded and
+non-upgraded validators reach identical verdicts. The earlier segments keep
+their exact bytes.
+
+**Pinned lock-ins and the 128-byte note.** The commitment field holds at most
+128 bytes, and the three earlier decisions (rollover, forfeiture, margin v2),
+locked in with 7-digit blocks, already used 116. This release therefore PINS
+those three lock-ins in `chain.toml` (`[[activation.pinned]]`: the exact
+lock and activation blocks the fleet decided). A pin arms the feature at load
+through the same code a lock-in uses, so your verdicts, weights and receipts
+(including the `activation_block` / `margin_v2_block` stamps) are
+byte-identical to before; pinned features are never tallied again and drop
+out of your note, which becomes
+`cascade-ready:1:rolling-era-king:0:0:promotion-carry:0:0` (56 bytes; 68 after
+the promotion carry locks in). The loader refuses a pin that is not the
+decided pair, a pin plus a typed block for the same feature, or a pin whose
+feature you edited away — if you keep local edits to `chain.toml`, merge the
+`[[activation.pinned]]` tables verbatim.
+
+**Every validator must upgrade to this release.** A validator still on the
+old release keeps working from its saved activation state
+(`activation_state.json`, `activation_forfeit_state.json`,
+`activation_margin_v2_state.json`): do NOT delete those files. An old-release
+validator that loses them cannot catch up any more — the new notes no longer
+name the three lock-ins — and would fork; upgrade instead of wiping state. Old
+notes do not count toward the promotion carry, so it locks in only once 51% of
+stake runs this release.

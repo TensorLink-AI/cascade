@@ -147,9 +147,12 @@ def test_blocked_at(cfg):
 
 def _unarmed(path: Path) -> str:
     """The repo chain.toml with its shipped `forfeit_*` keys removed, so a test can
-    inject its own without tripping TOML's duplicate-key rule."""
+    inject its own without tripping TOML's duplicate-key rule. The DEC-CA-0050
+    pins go too: a pin for the shipped list is stale once the list changes."""
     import re
-    return re.sub(r"(?m)^forfeit_\w+\s*=.*\n", "", path.read_text())
+
+    from tests.unpinned import strip_pins
+    return re.sub(r"(?m)^forfeit_\w+\s*=.*\n", "", strip_pins(path.read_text()))
 
 
 def test_loader_parses_both_knobs(tmp_path):
@@ -165,9 +168,12 @@ def test_loader_parses_both_knobs(tmp_path):
     assert c.scoring.forfeit_successor_hotkey == S
     assert c.round.blocked_hotkeys == (K, X) and c.round.blocked_from_block == 9_190_800
     # the shipped chain.toml ARMS the forfeiture (owner 2026-09-28): one listed hotkey, a
-    # successor outside the list, block decided on chain
-    base = load_chain_config(root / "chain.toml")
+    # successor outside the list, block decided on chain — and since DEC-CA-0050 the
+    # fleet's lock-in (9166500) is PINNED in the release
+    from tests.unpinned import load_unpinned
+    base = load_unpinned(root / "chain.toml")
     assert len(base.scoring.forfeit_hotkeys) == 1 and base.scoring.forfeit_from_block == 0
+    assert load_chain_config(root / "chain.toml").scoring.forfeit_from_block == 9_166_500
     assert base.scoring.forfeit_successor_hotkey not in ("", *base.scoring.forfeit_hotkeys)
     assert base.round.blocked_hotkeys == () and base.round.blocked_from_block == 0
     assert base.round.blocked_hotkeys == () and base.round.blocked_from_block == 0

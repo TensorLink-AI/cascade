@@ -41,12 +41,15 @@ from ..shared.activation import (
     apply_activation,
     apply_forfeit_activation,
     apply_margin_v2_activation,
+    apply_promotion_carry_activation,
     ensure_signal,
     forfeit_feature,
     margin_v2_feature,
+    promotion_carry_feature,
     record_for,
     resolve_activation,
     resolved_margin_v2_block,
+    resolved_promotion_carry_block,
     resolved_rollover,
 )
 from ..shared.activation import summary as activation_summary
@@ -55,6 +58,7 @@ from ..shared.config import (
     cohort_maxt_active,
     cohort_maxt_increment_active,
     effective_epoch_blocks,
+    promotion_carry_active,
 )
 from ..shared.era import (
     EraSpec,
@@ -388,6 +392,10 @@ class ValidatorRunner:
     # persisted beside the others (``activation_margin_v2_state.json``).
     _margin_v2: ActivationRecord = field(default_factory=ActivationRecord, repr=False)
     _margin_v2_tally: Tally | None = field(default=None, repr=False)
+    # DEC-CA-0050 staged-promotion carry decided on chain: its own record +
+    # tally (``activation_promotion_carry_state.json``).
+    _promotion_carry: ActivationRecord = field(default_factory=ActivationRecord, repr=False)
+    _promotion_carry_tally: Tally | None = field(default=None, repr=False)
 
     # ── stake-weighted activation (DEC-CA-0045) ─────────────────────────────
 
@@ -443,6 +451,7 @@ class ValidatorRunner:
                 self._ensure_own_signal(client)
             self._forfeit_step(client, now_block=now_block)
             self._margin_v2_step(client, now_block=now_block)
+            self._promotion_carry_step(client, now_block=now_block)
         except Exception as e:  # noqa: BLE001 — activation must never disturb a round
             log.warning("activation step failed (%s); retrying next poll", e)
 
@@ -532,6 +541,56 @@ class ValidatorRunner:
                 and self.apply_margin_v2_block(self._margin_v2.activation_block)):
             self._ensure_own_signal(client)
 
+    @property
+    def promotion_carry_block(self) -> int:
+        """The promotion-carry block resolved FROM VALIDATOR SIGNALS and
+        applied to the live config (0 = none, or typed into chain.toml) —
+        stamped on receipts (DEC-CA-0050)."""
+        return resolved_promotion_carry_block(self.cfg)
+
+    def _promotion_carry_active(self, block: int | None) -> bool:
+        """CONSENSUS gate (DEC-CA-0050) for the settlement / dethrone at
+        epoch boundary ``block``."""
+        return promotion_carry_active(self.cfg.scoring, block)
+
+    def _promotion_carry_store(self) -> ActivationStore | None:
+        store = self.activation_store
+        if store is None or store.path is None:
+            return None
+        return ActivationStore(store.path.with_name("activation_promotion_carry_state.json"))
+
+    def apply_promotion_carry_block(self, block: int) -> bool:
+        """Write the fleet-decided promotion-carry block into the live config
+        (``[scoring] promotion_carry_from_block``). Returns True when it changed."""
+        new_cfg = apply_promotion_carry_activation(self.cfg, block)
+        if new_cfg is self.cfg:
+            return False
+        self.cfg = new_cfg
+        log.warning("activation: DEC-CA-0050 staged-promotion carry ARMED at block %d — from "
+                    "it on a dethrone keeps a staged promotion and a prior-reign record is "
+                    "never timed on the new king's clock",
+                    new_cfg.scoring.promotion_carry_from_block)
+        return True
+
+    def _promotion_carry_step(self, client: object, *, now_block: int) -> None:
+        """The promotion carry's own resolver pass (same tally rule, its own
+        record). No-op without Cascade promotion or under a typed block."""
+        spec = promotion_carry_feature(self.cfg)
+        if spec is None or not spec.decided_on_chain:
+            return
+        res = resolve_activation(self.cfg, client, now_block=int(now_block),
+                                 record=self._promotion_carry, feature=spec)
+        if res.tally is not None:
+            self._promotion_carry_tally = res.tally
+        if res.changed:
+            self._promotion_carry = res.record
+            store = self._promotion_carry_store()
+            if store is not None:
+                store.save(res.record)
+        if (self._promotion_carry.locked and self._promotion_carry.source != "config"
+                and self.apply_promotion_carry_block(self._promotion_carry.activation_block)):
+            self._ensure_own_signal(client)
+
     def _ensure_own_signal(self, client: object) -> None:
         """Write this validator's note when it is not the one already on
         chain. One chain read per CHANGE of note, not per poll: the payload
@@ -540,7 +599,8 @@ class ValidatorRunner:
 
         if not self._signal_hotkey:
             return
-        want = own_signal_payload(self.cfg, self._activation, self._forfeit, self._margin_v2)
+        want = own_signal_payload(self.cfg, self._activation, self._forfeit, self._margin_v2,
+                                  self._promotion_carry)
         if want is None or want == self._signal_sent:
             return
         try:
@@ -555,6 +615,7 @@ class ValidatorRunner:
         ensure_signal(client, self.cfg, self._activation, hotkey=self._signal_hotkey,
                       forfeit_record=self._forfeit,
                       margin_v2_record=self._margin_v2,
+                      promotion_carry_record=self._promotion_carry,
                       current=have)
 
     def _activation_startup(self, client: object) -> None:
@@ -586,6 +647,14 @@ class ValidatorRunner:
                          self._margin_v2.lock_block, self._margin_v2.activation_block,
                          self._margin_v2.source)
                 self.apply_margin_v2_block(self._margin_v2.activation_block)
+        pstore, pspec = self._promotion_carry_store(), promotion_carry_feature(self.cfg)
+        if pstore is not None and pspec is not None:
+            self._promotion_carry = record_for(self.cfg, pstore.load(), pspec)
+            if self._promotion_carry.locked and self._promotion_carry.source != "config":
+                log.info("activation: restored promotion-carry lock-in (block %d, carry from "
+                         "%d, via %s)", self._promotion_carry.lock_block,
+                         self._promotion_carry.activation_block, self._promotion_carry.source)
+                self.apply_promotion_carry_block(self._promotion_carry.activation_block)
         self._signal_hotkey = str(getattr(client, "hotkey_ss58", lambda: "")() or "")
         if self._activation.locked and self._activation.source != "config":
             log.info("activation: restored lock-in (block %d, rollover %d, via %s)",
@@ -759,7 +828,7 @@ class ValidatorRunner:
                 return ("era_init_mismatch: cascade is off, era must train from "
                         "random init")
             return None
-        self._refresh_pending_promotion(era)
+        self._refresh_pending_promotion(era, block=self._epoch_start_block(manifest))
         # Gating is PURE: the ledger in force for this era is derived here and
         # installed only once the settlement is handled (_install_era_promotion)
         # — a transient after the gate leaves the state untouched for the retry.
@@ -839,7 +908,7 @@ class ValidatorRunner:
         self._adopt_era_king(manifest)
         return outcome
 
-    def _refresh_pending_promotion(self, era: EraSpec) -> None:
+    def _refresh_pending_promotion(self, era: EraSpec, *, block: int | None = None) -> None:
         """Learn of a NEWER promotion record ahead of its effective era. The
         record must survive the DEC-CA-0013 envelope (signature, set cap,
         ripeness when attestable, member provenance) AND claim an
@@ -849,7 +918,22 @@ class ValidatorRunner:
         ``era_init_mismatch`` until a valid record exists. A record or bench
         report that cannot be READ raises :class:`StorageError` instead (a
         transient the poll loop retries): an unreadable ledger is not
-        evidence of a bad init."""
+        evidence of a bad init.
+
+        DEC-CA-0050 (from ``promotion_carry_from_block``, judged at this
+        settlement's boundary ``block``): a record that fired BEFORE the
+        current reign's anchor fired under an earlier king's clock, so it is
+        never timed against the current one. It is timed against the previous
+        reign's anchor when this validator recorded that reign from an
+        observed transition, and reign-scoped to it; otherwise the timing
+        check is skipped (the non-attesting rule). Either way the current
+        reign's checkpoint log stays out of its quality floor (that reign's
+        checkpoints were never its candidates). Signature, set cap,
+        effective-era floor, provenance and quality still apply. A record
+        fired within the current reign is judged exactly as before. A
+        promotion re-staged after its effective era began is installed at the
+        next handled settlement whose era is >= ``effective_era``
+        (:meth:`_era_ledger` / :meth:`_install_era_promotion`)."""
         from ..shared.promotion import verify_promotion_record_signature
 
         assert self.cascade is not None
@@ -878,17 +962,41 @@ class ValidatorRunner:
                         "earliest allowed %d (fired at block %d); ignored",
                         record.generation, record.effective_era, floor, record.fired_block)
             return
-        attesting = self.cascade.can_verify_ripeness()
-        if attesting and not self.cascade.is_ripe(block=int(record.fired_block)):
-            log.warning("cascade: promotion record gen=%d fired before the reign clock "
-                        "ripened (block %d); ignored", record.generation, record.fired_block)
-            return
+        fired = int(record.fired_block)
+        prior_reign = (self._promotion_carry_active(block)
+                       and self.cascade.fired_in_prior_reign(fired))
+        reign_anchor: int | None = None
+        if prior_reign:
+            reign_anchor = self.cascade.prior_reign_anchor(fired)
+            attesting = reign_anchor is not None
+            if attesting and not self.cascade.is_ripe_since(reign_anchor, block=fired):
+                log.warning("cascade: promotion record gen=%d fired before the previous "
+                            "reign's clock (anchored at %d) ripened (block %d); ignored",
+                            record.generation, reign_anchor, fired)
+                return
+            if not attesting:
+                log.info("cascade: promotion record gen=%d fired at block %d under an earlier "
+                         "reign (current anchor %s) whose clock this validator cannot "
+                         "attest; timing check skipped", record.generation, fired,
+                         self.cascade.state.reign_start_block)
+        else:
+            attesting = self.cascade.can_verify_ripeness()
+            if attesting and not self.cascade.is_ripe(block=fired):
+                log.warning("cascade: promotion record gen=%d fired before the reign clock "
+                            "ripened (block %d); ignored", record.generation, record.fired_block)
+                return
         # A StorageError out of the record fetch above or the member check
         # here propagates: the era gate cannot judge this manifest without
         # the provenance, and the poll loop retries the round (never a
         # receipt) — see _gate_read_failed.
-        member_reason = self._verify_members(record, enforce_reign_scope=attesting,
-                                             carried_exempt=True)
+        if prior_reign:
+            member_reason = self._verify_members(record, enforce_reign_scope=attesting,
+                                                 carried_exempt=True,
+                                                 reign_anchor=reign_anchor,
+                                                 use_reign_log=False)
+        else:
+            member_reason = self._verify_members(record, enforce_reign_scope=attesting,
+                                                 carried_exempt=True)
         if member_reason is not None:
             log.warning("cascade: promotion record gen=%d rejected: %s",
                         record.generation, member_reason)
@@ -1124,7 +1232,8 @@ class ValidatorRunner:
         return None
 
     def _verify_members(self, record: object, *, enforce_reign_scope: bool,
-                        carried_exempt: bool = False) -> str | None:
+                        carried_exempt: bool = False, reign_anchor: int | None = None,
+                        use_reign_log: bool = True) -> str | None:
         """Provenance + quality floor for every member of a promotion record.
 
         Each member must have trainer-signed bench numbers: from this
@@ -1164,16 +1273,22 @@ class ValidatorRunner:
         trainer's candidates (same signed reports), so a missing report can
         only loosen this validator's floor — an honest trainer passes every
         validator; only a cheating trainer splits the fleet, and splitting
-        loudly is the correct outcome there."""
+        loudly is the correct outcome there.
+
+        DEC-CA-0050 (prior-reign records only, caller-gated): ``reign_anchor``
+        scopes the fallback to THAT reign instead of the current one, and
+        ``use_reign_log=False`` keeps the current reign's log out of the
+        lookup and the floor. Defaults are the pre-DEC-CA-0050 behaviour."""
         from .cascade import best_score, cascade_score, log_record_for
 
         assert self.cascade is not None
         state = self.cascade.state
-        reign_start = state.reign_start_block
+        reign_start = state.reign_start_block if reign_anchor is None else int(reign_anchor)
+        scope_label = "current" if reign_anchor is None else "record's"
         carried = (set(state.members) | set(state.pending_members)) if carried_exempt else set()
         scores: dict[str, float] = {}
         for m in getattr(record, "members", ()):
-            rec = log_record_for(state, m.checkpoint_id)
+            rec = log_record_for(state, m.checkpoint_id) if use_reign_log else None
             if rec is not None:
                 scores[m.checkpoint_id] = rec.score
                 continue
@@ -1189,13 +1304,13 @@ class ValidatorRunner:
                 return (f"warm_start_member_out_of_reign: {m.checkpoint_id} was "
                         f"benched in round {m.source_round!r} (block "
                         f"{getattr(report, 'created_block', '?')}), before the "
-                        f"current reign anchored at block {reign_start}")
+                        f"{scope_label} reign anchored at block {reign_start}")
             s = be.scores
             scores[m.checkpoint_id] = cascade_score(
                 s.gifteval_crps, s.gifteval_mase, s.boom_crps,
                 s.boom_mase, s.time_crps, s.time_mase)
         floor_candidates = list(scores.values())
-        log_best = best_score(self.cascade.state)
+        log_best = best_score(self.cascade.state) if use_reign_log else None
         if log_best is not None:
             floor_candidates.append(log_best)
         floor = min(floor_candidates)
@@ -1835,11 +1950,15 @@ class ValidatorRunner:
             # adopted clock must not judge reign timing.
             dethroned = (outcome is not None and outcome.transition.dethroned
                          and outcome.transition.new_king_hotkey)
+            # DEC-CA-0050: from the carry gate a dethrone keeps the staged
+            # promotion (judged from this round's own boundary block).
+            carry = self._promotion_carry_active(block)
             if dethroned:
-                self.cascade.note_dethrone(outcome.transition.new_king_hotkey, block=block)
+                self.cascade.note_dethrone(outcome.transition.new_king_hotkey, block=block,
+                                           carry_pending=carry)
             elif self.cascade.state.king_hotkey is None and self.state.king_hotkey is not None:
                 self.cascade.note_dethrone(self.state.king_hotkey, block=block,
-                                           observed=False)
+                                           observed=False, carry_pending=carry)
             self.cascade.observe_round(block=block)
             # Earlier rounds first: reports published after those rounds'
             # cascade steps (the bench runs post-publish) land in the reign log
@@ -2320,6 +2439,7 @@ class ValidatorRunner:
                 era_start_block=era_start_block, era_base_seed=era_base_seed,
                 activation_block=self.activation_block,
                 margin_v2_block=self.margin_v2_block,
+                promotion_carry_block=self.promotion_carry_block,
             )
         if outcome is None or windows is None:
             raise ValueError("a scored receipt needs both outcome and windows")
@@ -2351,6 +2471,7 @@ class ValidatorRunner:
             era_start_block=era_start_block, era_base_seed=era_base_seed,
             activation_block=self.activation_block,
             margin_v2_block=self.margin_v2_block,
+            promotion_carry_block=self.promotion_carry_block,
         )
 
     def _publish_round_receipt(
@@ -2503,7 +2624,9 @@ class ValidatorRunner:
             econ = getattr(client, "subnet_economics", lambda: None)()
             activation = (activation_summary(self.cfg, self._activation, self._activation_tally,
                                              self._forfeit, self._forfeit_tally,
-                                             self._margin_v2, self._margin_v2_tally)
+                                             self._margin_v2, self._margin_v2_tally,
+                                             self._promotion_carry,
+                                             self._promotion_carry_tally)
                           if self.cfg.activation.enabled else None)
             status = build_chain_status(
                 self.cfg,
