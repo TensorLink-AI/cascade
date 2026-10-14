@@ -419,6 +419,20 @@ _PRIVATE_ERROR_SUBSTRINGS = (
 )
 
 
+def _is_private_vault_miss(text: str) -> bool:
+    """A ``vault/direct`` (private, DEC-CA-0036) submission this caller cannot
+    read: not in a local vault and either no champion base configured or no
+    published champion object for it (an uncrowned private submission is
+    never published — 404, or 403 on a bucket that hides missing keys). That
+    is the same story as a private Hub repo — permanent for the archive — not
+    a flake. A network failure on the champion GET (timeout, DNS, reset)
+    carries no HTTP status and stays TRANSIENT."""
+    if "generator_artifact_unreachable: vault digest" not in text:
+        return False
+    return ("no $cascade_champion_base configured" in text
+            or "http error 404" in text or "http error 403" in text)
+
+
 def classify_fetch_failure(exc: BaseException) -> str:
     """Coarse verdict on a failed Hub/HF fetch: is this ref worth retrying?
 
@@ -438,6 +452,8 @@ def classify_fetch_failure(exc: BaseException) -> str:
     if _is_retryable_hub_error(exc):
         return FETCH_TRANSIENT
     text = f"{type(exc).__name__}: {exc}".lower()
+    if _is_private_vault_miss(text):
+        return FETCH_PRIVATE
     if any(sub in text for sub in _PRIVATE_ERROR_SUBSTRINGS):
         return FETCH_PRIVATE
     if any(sub in text for sub in _GONE_ERROR_SUBSTRINGS):
