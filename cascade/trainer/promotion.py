@@ -231,8 +231,10 @@ def reign_tail(
     ``post_round_king_hotkey`` and are skipped. ``None`` when no usable row
     exists — the caller falls back to anchoring at the next boundary.
     """
+    from ..shared.hippius import receipt_index_window
+
     usable = [
-        r for r in rows
+        r for r in receipt_index_window(rows)
         if isinstance(r, dict) and r.get("status") == "scored"
         and r.get("post_round_king_hotkey")
         and int(r.get("epoch_start_block") or 0) > 0
