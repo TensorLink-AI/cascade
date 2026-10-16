@@ -51,6 +51,7 @@ Cron (hourly is ample — rounds are epoch-paced)::
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from collections import Counter
 from datetime import UTC, datetime
@@ -65,6 +66,26 @@ def _sample(refs) -> str:
     head = ", ".join(refs[:_SAMPLE_N])
     extra = len(refs) - _SAMPLE_N
     return f"{head}, … and {extra} more" if extra > 0 else head
+
+
+def _default_champion_base(storage) -> None:
+    """Point private (``vault/direct``) refs at the PUBLIC champions objects.
+
+    CI holds no payer/submission vault, so a private submission resolves only
+    through ``champions/<digest>.zip`` — published when it is crowned. Without
+    a base every private ref failed as "unreachable", which the archiver read
+    as transient and failed the whole run (Scrape kings red daily since
+    2026-09-13). Same default as ``cascade fetch``; an explicit
+    ``$CASCADE_CHAMPION_BASE`` wins. Uncrowned private submissions still miss
+    (404/403) and are tombstoned as private, never published by this path."""
+    from cascade.funding.store import CHAMPION_BASE_ENV
+
+    if os.environ.get(CHAMPION_BASE_ENV):
+        return
+    endpoint = str(getattr(storage, "s3_endpoint", "") or "").rstrip("/")
+    bucket = str(getattr(storage, "manifest_bucket", "") or "")
+    if endpoint and bucket:
+        os.environ[CHAMPION_BASE_ENV] = f"{endpoint}/{bucket}"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -97,6 +118,7 @@ def main(argv: list[str] | None = None) -> int:
     load_env_files()
     cfg = load_chain_config(args.chain_toml)
     storage = cfg.storage
+    _default_champion_base(storage)
 
     manifest_store = open_manifest_store(storage)
     try:
