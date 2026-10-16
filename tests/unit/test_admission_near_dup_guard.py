@@ -150,16 +150,17 @@ def test_near_duplicate_enforce_refuses_later_commit_and_earliest_keeps(tmp_path
     assert "vault/direct@sha256:" + "b" * 64 not in reg.entries
 
 
-def test_near_duplicate_shadow_logs_and_admits(tmp_path, trees, caplog):
+def test_near_duplicate_shadow_logs_and_admits(tmp_path, trees, monkeypatch):
     trees["vault/direct@sha256:" + "a" * 64] = _tree(tmp_path, "a", _body(2000))
     trees["vault/direct@sha256:" + "b" * 64] = _tree(tmp_path, "b", _body(2000, "b", changed=(5,)))
     reg = _reg(tmp_path, near_dup_mode="shadow")
     _admit(reg, "ALFA", "vault/direct@sha256:" + "a" * 64, 1000)
-    with caplog.at_level("WARNING"):
-        hit = _admit(reg, "BRAV", "vault/direct@sha256:" + "b" * 64, 1010)
+    lines: list[str] = []
+    monkeypatch.setattr(DR.log, "warning", lambda msg, *a: lines.append(msg % a))
+    hit = _admit(reg, "BRAV", "vault/direct@sha256:" + "b" * 64, 1010)
     assert hit == ("ALFA", NEAR_DUP_TIER, False)
     assert "vault/direct@sha256:" + "b" * 64 in reg.entries                  # admitted + on record
-    assert "near-duplicate shadow" in caplog.text and "J=" in caplog.text
+    assert any("near-duplicate shadow" in x and "J=" in x for x in lines)
 
 
 def test_threshold_lookback_and_off_mode(tmp_path, trees):
