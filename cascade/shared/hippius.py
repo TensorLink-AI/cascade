@@ -37,6 +37,7 @@ import contextlib
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -1340,9 +1341,13 @@ def update_receipt_index(
     rounds.sort(key=lambda r: (int(r.get("epoch_start_block", 0)),
                                str(r.get("round_id", "")),
                                str(r.get("validator_hotkey") or "")))
-    rounds = rounds[-max_keep:]
+    best = _best_bench_pins(doc)
+    _mark_best_bench(rounds, best)
+    rounds = _trim_keeping_pins(rounds, max_keep, best)
 
     out: dict = {"schema": RECEIPT_INDEX_SCHEMA, "rounds": rounds}
+    if best:
+        out[BEST_BENCH_PIN] = best
     if updated_at:
         out["updated_at"] = updated_at
     if subnet:
@@ -1350,13 +1355,185 @@ def update_receipt_index(
     if chain:
         out["chain"] = chain
 
-    text = json.dumps(out, indent=2, sort_keys=True)
+    _write_receipt_index(store, out)
+    return entry
+
+
+def _write_receipt_index(store: S3Store, doc: dict) -> None:
+    text = json.dumps(doc, indent=2, sort_keys=True)
     try:
         store.put_text(RECEIPT_INDEX_KEY, text, content_type="application/json", acl="public-read")
     except StorageError:
         # ACL unsupported on this backend: publish private rather than not at all.
         store.put_text(RECEIPT_INDEX_KEY, text, content_type="application/json")
-    return entry
+
+
+# ── best-bench pins (dashboard-facing) ─────────────────────────────────────
+#
+# The scoreboard's "best so far" card and its headline read the lowest
+# six-score geomean across the bench reports it can reach, and it can only
+# reach rounds the rolling index still lists. Left alone, the best checkpoint
+# ages out of the window and the headline drops although nothing regressed
+# (2026-10-16: 98.4 % → 98.2 % when u133's 0.59501 left the page's scan). So the
+# round holding the best geomean PER SIZE is pinned: its rows carry
+# ``pinned = "best_bench"`` + ``best_bench = {size: geomean}``, the header
+# keeps ``best_bench = {size: {round_id, geomean}}``, and the trim never evicts
+# a pinned round. Both copies exist because a peer validator on an older
+# release rebuilds the header from scratch (dropping the header copy) but
+# carries rows through verbatim; either copy restores the other on the next
+# write. Presentational only, like the rest of the index.
+
+BEST_BENCH_PIN = "best_bench"
+_SIX_KEYS = ("gifteval_crps", "gifteval_mase", "boom_crps",
+             "boom_mase", "time_crps", "time_mase")
+
+
+def bench_six_geomean(scores: object) -> float | None:
+    """Plain geometric mean of the six public-bench numbers — the same number
+    the scoreboard's ``sixGeomean`` ranks by (no clamp). None unless all six
+    are finite and positive."""
+    if not isinstance(scores, dict):
+        return None
+    total = 0.0
+    for k in _SIX_KEYS:
+        v = scores.get(k)
+        if (isinstance(v, bool) or not isinstance(v, (int, float))
+                or not math.isfinite(v) or v <= 0):
+            return None
+        total += math.log(v)
+    return math.exp(total / len(_SIX_KEYS))
+
+
+def best_bench_by_size(report: dict) -> dict[str, float]:
+    """``{size: lowest geomean}`` over one bench-report document's entries."""
+    out: dict[str, float] = {}
+    for e in (report or {}).get("entries") or []:
+        if not isinstance(e, dict):
+            continue
+        g = bench_six_geomean(e.get("scores"))
+        size = str(e.get("size") or "")
+        if g is not None and size and (size not in out or g < out[size]):
+            out[size] = g
+    return out
+
+
+def _best_bench_pins(doc: dict) -> dict[str, dict]:
+    """The current pins, from the header and the row marks (lowest wins)."""
+    best: dict[str, dict] = {}
+
+    def offer(size: str, rid: str, g: object) -> None:
+        if (not size or not rid or isinstance(g, bool)
+                or not isinstance(g, (int, float)) or not math.isfinite(g)):
+            return
+        if size not in best or float(g) < best[size]["geomean"]:
+            best[size] = {"round_id": rid, "geomean": float(g)}
+
+    header = doc.get(BEST_BENCH_PIN)
+    if isinstance(header, dict):
+        for size, pin in header.items():
+            if isinstance(pin, dict):
+                offer(str(size), str(pin.get("round_id") or ""), pin.get("geomean"))
+    for r in doc.get("rounds") or []:
+        marks = r.get(BEST_BENCH_PIN)
+        if r.get("pinned") == BEST_BENCH_PIN and isinstance(marks, dict):
+            for size, g in marks.items():
+                offer(str(size), str(r.get("round_id") or ""), g)
+    return best
+
+
+def _mark_best_bench(rounds: list[dict], best: dict[str, dict]) -> None:
+    """Make the row marks match ``best`` exactly (every validator's row of a
+    pinned round is marked; a row that lost its pin is unmarked)."""
+    by_round: dict[str, dict[str, float]] = {}
+    for size, pin in best.items():
+        by_round.setdefault(pin["round_id"], {})[size] = pin["geomean"]
+    for r in rounds:
+        marks = by_round.get(str(r.get("round_id")))
+        if marks:
+            r["pinned"] = BEST_BENCH_PIN
+            r[BEST_BENCH_PIN] = dict(marks)
+        elif r.get("pinned") == BEST_BENCH_PIN:
+            r.pop("pinned", None)
+            r.pop(BEST_BENCH_PIN, None)
+
+
+def _trim_keeping_pins(rounds: list[dict], max_keep: int,
+                       best: dict[str, dict]) -> list[dict]:
+    """The ``max_keep`` newest rows, plus every row of a pinned round that fell
+    off the front (still oldest-first, so the sort order holds)."""
+    if len(rounds) <= max_keep:
+        return rounds
+    pinned = {pin["round_id"] for pin in best.values()}
+    head, tail = rounds[:-max_keep], rounds[-max_keep:]
+    return [r for r in head if str(r.get("round_id")) in pinned] + tail
+
+
+def receipt_index_window(rows: list) -> list:
+    """``rows`` minus pinned best-bench rows that sit BEFORE the rolling window
+    (older than every unpinned row). Everything that reasons about the window
+    — reign tails, the former-king court, counts — reads this; only the
+    best-checkpoint views read the pinned rows. Same rule as the dashboards'
+    ``splitPinned``."""
+    floor = min((int(r.get("epoch_start_block") or 0) for r in rows
+                 if isinstance(r, dict) and r.get("pinned") != BEST_BENCH_PIN),
+                default=None)
+    if floor is None:
+        return list(rows)
+    return [r for r in rows
+            if not (isinstance(r, dict) and r.get("pinned") == BEST_BENCH_PIN
+                    and int(r.get("epoch_start_block") or 0) < floor)]
+
+
+def note_best_bench(store: S3Store, round_id: str, report: dict, *,
+                    reach_back: bool = True) -> dict[str, dict]:
+    """Offer one published bench report to the index's best-bench pins.
+
+    Called right after the report is published. A size's pin moves only when
+    this report beats it. A round the index lists with no SCORED row (a
+    validator-rejected round) never pins: the scoreboard reads scored rounds
+    only. A round not listed yet may pin; its rows get marked when they land.
+    ``reach_back``: when the index carries no pin at all (first run, or every
+    copy lost), seed the pins once from the reports of the rounds the index
+    still lists. Rewrites the index only when a pin changes. Best-effort and
+    presentational — returns the pins as stored."""
+    from .bench_report import bench_report_key
+
+    doc = read_receipt_index(store)
+    rounds = doc.get("rounds") or []
+    if not rounds:
+        # Absent OR unreadable (read_receipt_index maps a failed GET to empty):
+        # never write — a transient read error must not blank the index.
+        return {}
+    best = _best_bench_pins(doc)
+    before = {k: dict(v) for k, v in best.items()}
+    statuses: dict[str, set[str]] = {}
+    for r in rounds:
+        statuses.setdefault(str(r.get("round_id")), set()).add(str(r.get("status")))
+
+    def offer(rid: str, doc_: dict) -> None:
+        st = statuses.get(rid)
+        if st is not None and "scored" not in st:
+            return
+        for size, g in best_bench_by_size(doc_).items():
+            if size not in best or g < best[size]["geomean"]:
+                best[size] = {"round_id": rid, "geomean": g}
+
+    if reach_back and not best:
+        for rid in dict.fromkeys(str(r.get("round_id")) for r in rounds):
+            if rid == str(round_id) or "scored" not in statuses.get(rid, set()):
+                continue
+            try:
+                offer(rid, json.loads(store.get_text(bench_report_key(rid))))
+            except (StorageError, ValueError, TypeError):
+                continue
+    offer(str(round_id), report)
+    if best == before:
+        return best
+    _mark_best_bench(rounds, best)
+    doc["rounds"] = rounds
+    doc[BEST_BENCH_PIN] = best
+    _write_receipt_index(store, doc)
+    return best
 
 
 # ── static dashboard site ────────────────────────────────────────────────────

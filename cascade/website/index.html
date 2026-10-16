@@ -2412,7 +2412,22 @@ function sixGeomean(s){ var sum=0; for(var i=0;i<SIX_KEYS.length;i++){ if(!(s[SI
 function benchRounds(){
   // every round in the index (a validator-rejected round still benches — the
   // report follows the manifest, not the verdict), oldest first
-  return (_index&&_index.rounds||[]).slice().sort(function(a,b){ return (a.epoch_start_block||0)-(b.epoch_start_block||0); }).slice(-BENCH_SCAN_MAX);
+  var all=(_index&&_index.rounds||[]).slice().sort(function(a,b){ return (a.epoch_start_block||0)-(b.epoch_start_block||0); });
+  // pinned best-bench rounds (cascade.shared.hippius.note_best_bench) always load,
+  // so the "Best checkpoint so far" row matches the stakeholder page's card
+  return _pinnedOld.concat(all.slice(0,-BENCH_SCAN_MAX).filter(function(r){ return r.pinned==="best_bench"; })).concat(all.slice(-BENCH_SCAN_MAX));
+}
+// Pinned best-bench rows older than the rolling window: bench scan only, never
+// the window logic (reigns, timelines, counts). Same rule as stakeholders.html.
+var _pinnedOld=[];
+function splitPinned(d){
+  _pinnedOld=[];
+  if(!d||!Array.isArray(d.rounds)) return d;
+  var floor=null;
+  d.rounds.forEach(function(r){ if(r.pinned==="best_bench") return; var b=Number(r.epoch_start_block||0); if(floor===null||b<floor) floor=b; });
+  var keep=[];
+  d.rounds.forEach(function(r){ if(r.pinned==="best_bench"&&floor!==null&&Number(r.epoch_start_block||0)<floor) _pinnedOld.push(r); else keep.push(r); });
+  var out={}; for(var k in d) out[k]=d[k]; out.rounds=keep; return out;
 }
 function loadBench(){
   var rs=benchRounds(); if(!rs.length){ renderTrain(); return; }
@@ -2817,7 +2832,7 @@ function renderTrainTable(rows){
 })();
 
 function poll(){
-  fetchJSON("receipts/index.json").then(function(d){ _index=collapseByRound(d); _dataState="live"; renderAll(); loadWarmHistory(); if(_page==="train") loadBench(); })
+  fetchJSON("receipts/index.json").then(function(d){ _index=splitPinned(collapseByRound(d)); _dataState="live"; renderAll(); loadWarmHistory(); if(_page==="train") loadBench(); })
     .catch(function(){ _dataState="offline"; renderStatus(); });
   loadPromotion();
   fetchJSON("receipts/"+RECEIPT_ANCHOR+"/latest.json")

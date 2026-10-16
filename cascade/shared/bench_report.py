@@ -216,4 +216,21 @@ def publish_bench_report(store: object, report_text: str, round_id: str) -> str:
     except StorageError:
         # ACL unsupported on this backend: publish private rather than not at all.
         store.put_text(key, report_text, content_type="application/json")
+    _pin_best_bench(store, report_text, round_id)
     return key
+
+
+def _pin_best_bench(store: object, report_text: str, round_id: str) -> None:
+    """Offer the just-published report to the receipt index's best-bench pins
+    (:func:`cascade.shared.hippius.note_best_bench`) so the scoreboard's best
+    checkpoint never ages out of the rolling index. Presentational: any
+    failure is logged and swallowed — the report itself is already out."""
+    try:
+        from .hippius import note_best_bench
+
+        note_best_bench(store, str(round_id), json.loads(report_text))
+    except Exception as e:  # noqa: BLE001 — a dashboard pin never fails a publish
+        import logging
+
+        logging.getLogger("cascade.storage").warning(
+            "best-bench pin for round=%s skipped: %s", round_id, e)

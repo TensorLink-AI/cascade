@@ -260,10 +260,13 @@ def fetch_public_json(storage: object, key: str, *, timeout: float = 10.0) -> di
 def fetch_public_receipt_index(storage: object, *, timeout: float = 10.0) -> dict | None:
     """Anonymously GET the dashboard-facing ``receipts/index.json``. None on any
     failure (the dashboard then simply shows estimates)."""
-    from ..shared.hippius import RECEIPT_INDEX_KEY
+    from ..shared.hippius import RECEIPT_INDEX_KEY, receipt_index_window
 
     doc = fetch_public_json(storage, RECEIPT_INDEX_KEY, timeout=timeout)
-    return doc if doc is not None and isinstance(doc.get("rounds"), list) else None
+    if doc is None or not isinstance(doc.get("rounds"), list):
+        return None
+    # the rolling window only — a pinned best-bench row is not a recent round
+    return {**doc, "rounds": receipt_index_window(doc["rounds"])}
 
 
 def fetch_public_round_status(storage: object, *, timeout: float = 10.0) -> dict | None:

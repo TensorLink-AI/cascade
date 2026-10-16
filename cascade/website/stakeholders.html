@@ -1200,6 +1200,10 @@ var COMMUNITY = {
 };
 
 var _index = null, _latest = null, _chain = null, _state = "loading";
+// Best-bench rows the index keeps past its rolling window (pinned:"best_bench",
+// cascade.shared.hippius.note_best_bench): fed to the best-so-far card ONLY —
+// never to counts, reigns, timelines or atCap(), which read the window.
+var _pinnedOld = [];
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 (function initTheme(){
@@ -1300,6 +1304,30 @@ function collapseByRound(d){
   out.rounds=order.map(function(id){ return by[id]; });
   return out;
 }
+
+// Split pinned best-bench rows that sit BEFORE the rolling window (older than
+// every unpinned row) out of the index, so the window logic never sees them.
+// A pinned row inside the window stays where it is.
+function splitPinned(d){
+  _pinnedOld = [];
+  if(!d || !Array.isArray(d.rounds)) return d;
+  var floor = null;
+  d.rounds.forEach(function(r){
+    if(r.pinned === "best_bench") return;
+    var b = Number(r.epoch_start_block || 0);
+    if(floor === null || b < floor) floor = b;
+  });
+  var keep = [];
+  d.rounds.forEach(function(r){
+    if(r.pinned === "best_bench" && floor !== null && Number(r.epoch_start_block || 0) < floor)
+      _pinnedOld.push(r);
+    else keep.push(r);
+  });
+  var out = {}; for(var k in d) out[k] = d[k];
+  out.rounds = keep;
+  return out;
+}
+function pinnedOldScored(){ return _pinnedOld.filter(function(r){ return r.status === "scored"; }); }
 
 // ── domain ──────────────────────────────────────────────────────────────────
 function allRounds(){ return (_index && _index.rounds) || []; }
@@ -1512,6 +1540,10 @@ function sixGeomean(s){
 
 function scanBench(){
   var rs = scoredRounds(), recent = rs.slice(-BENCH_SCAN_MAX);
+  // pinned best-bench rounds always load, wherever they sit in the index
+  var pinned = pinnedOldScored().concat(rs.slice(0, -BENCH_SCAN_MAX).filter(function(r){
+    return r.pinned === "best_bench"; }));
+  recent = pinned.concat(recent);
   var newest = {};
   rs.slice(-BENCH_RETRY_NEWEST).forEach(function(r){ newest[String(r.round_id)] = 1; });
   recent.forEach(function(r){
@@ -1555,9 +1587,14 @@ function entryUid(e){
 
 function benchView(){
   var rs = scoredRounds(), latest = null, best = null, bySize = {}, firstBySize = {};
-  rs.forEach(function(r){
+  var old = {};
+  pinnedOldScored().forEach(function(r){ old[String(r.round_id)] = 1; });
+  pinnedOldScored().concat(rs).forEach(function(r){
     var rep = _benchReports[String(r.round_id)];
     if(!rep) return;
+    // a pinned row from before the window feeds best / bySize only: it is
+    // neither the meter's starting anchor nor the current leader's latest
+    var isOld = !!old[String(r.round_id)];
     var entries = rep.entries || rep.checkpoints || [];
     var wantRole = r.dethroned ? "challenger" : "king";
     entries.forEach(function(e){
@@ -1577,6 +1614,7 @@ function benchView(){
                        size:sk, round_id:r.round_id, at:r.published_at };
       // rounds iterate oldest→newest: the first entry seen at a size is the
       // earliest published result — the meter's honest starting anchor
+      if(isOld) return;
       if(g != null && sk && !firstBySize[sk])
         firstBySize[sk] = { geomean:g, at:r.published_at };
       if(String(e && e.role || "") === wantRole)
@@ -2505,7 +2543,7 @@ function poll(){
   // 10th poll (~10 min) so a freshly published baseline appears without a reload
   scanRefs(_pollN === 1 || _pollN % 10 === 0);
   fetchJSON("receipts/index.json")
-    .then(function(d){ _index = collapseByRound(d); _state = "live"; renderAll(); scanBench(); })
+    .then(function(d){ _index = splitPinned(collapseByRound(d)); _state = "live"; renderAll(); scanBench(); })
     .catch(function(){ _state = "offline"; renderChrome(); });
   // The anchored trail, not the shared last-writer-wins pointer: any validator
   // can overwrite receipts/latest.json, and the bench/warm-start reads below

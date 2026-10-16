@@ -3298,6 +3298,7 @@ def _bootstrap_state_from_receipts(
     from ..shared.hippius import (
         RECEIPT_INDEX_KEY,
         RECEIPT_LATEST_KEY,
+        receipt_index_window,
         receipt_latest_key,
         receipt_round_key,
     )
@@ -3328,7 +3329,8 @@ def _bootstrap_state_from_receipts(
     rows: list = []
     if throne is None or keep_former_kings > 0:
         try:
-            rows = json.loads(store.get_text(RECEIPT_INDEX_KEY)).get("rounds", [])
+            rows = receipt_index_window(
+                json.loads(store.get_text(RECEIPT_INDEX_KEY)).get("rounds", []))
         except Exception:  # noqa: BLE001 — no index ⇒ nothing beyond latest.json
             rows = []
     # Index rows are chronological (oldest first, capped at most-recent); walk
