@@ -160,6 +160,19 @@ class _FundedDiverged(Exception):
     a NaN entry would break every validator's verdict for the round."""
 
 
+# Rent-time guard verdicts that are the MINER's entry (terminal ``failed``,
+# never burned — DEC-CA-0048 amendment); "deferred" is not among them: a
+# coldkey over its seat cap is requeued with no attempt spent.
+GUARD_REFUSE_CLASSES = frozenset({"near_duplicate"})
+
+
+def _guard_rent_veto(runner, gen):
+    """``runner._funded_rent_veto(gen)`` when the runner has it (partial
+    runners and test doubles do not) — fail-open, like every guard."""
+    fn = getattr(runner, "_funded_rent_veto", None)
+    return fn(gen) if callable(fn) else None
+
+
 class _FundedLegSkip(Exception):
     """A funded challenger leg that settled its own queue verdict (rent/setup
     failure) and must simply be dropped from the round — never retried on the
@@ -2979,6 +2992,33 @@ class TrainerRunner:
         prefix = king_pod_name_prefix(self.cfg.subnet.netuid, str(round_id))
         return str(instance_id).startswith(prefix + "-")
 
+    def _funded_rent_veto(self, gen) -> tuple[str, str] | None:
+        """Rent-time admission re-check (``[round] near_dup_mode`` /
+        ``max_inflight_per_coldkey``) for a leg about to get a NEW pod:
+        ``(message, error_class)`` stops the rent, ``None`` proceeds. Only the
+        rolling scheduler holds the queue/era context; legacy rounds and every
+        fault proceed (fail-open)."""
+        sched = self.__dict__.get("_rolling_sched")
+        if sched is None or not hasattr(sched, "rent_veto"):
+            return None
+        try:
+            v = sched.rent_veto(gen.hotkey, gen.ref, started=self._funded_leg_started)
+        except Exception as e:  # noqa: BLE001 — a guard fault never blocks a rent
+            log.warning("rent-time guard check failed for %s (%s); renting",
+                        gen.hotkey[:12], e)
+            return None
+        return None if v is None else (v[0], v[1])
+
+    def _funded_leg_started(self, hotkey: str) -> bool:
+        """Whether ``hotkey``'s leg holds a REAL pod (a ledger row carrying a
+        platform pod id — the write-ahead intent row has none) or an operator
+        lane is running it."""
+        if any(p.payer_hotkey == hotkey and p.pod_uid for p in self._load_funded_ledger()):
+            return True
+        q = self._funded_queue()
+        e = q.get(hotkey) if q is not None else None
+        return bool(e is not None and getattr(e, "operator_billed", False))
+
     def _record_funded_failure(self, hotkey: str, msg: str, *, miner_fault: bool,
                                error_class: str, burn: bool) -> None:
         self._funded_leg_failures[hotkey] = (error_tail(msg, 500), miner_fault,
@@ -3115,6 +3155,7 @@ class TrainerRunner:
                     exclude_ids=claimed, host_key_scanner=scan_ssh_host_key,
                     cpu_blocklist=rnd.funded_cpu_blocklist,
                     skus=fit, price_caps=self._funded_price_caps(),
+                    before_launch=lambda: _guard_rent_veto(self, gen),
                 )
                 if result.ok and result.machine_id:
                     with self._funded_exec_lock:
@@ -3187,6 +3228,12 @@ class TrainerRunner:
                 # (operator-billed). The payer's write-ahead row goes (no pod
                 # was ever launched for it) and nothing is recorded as a fault.
                 self._ledger_remove(expected_id)
+                veto = _guard_rent_veto(self, gen)
+                if veto is not None:      # a fresh start: the guards re-check first
+                    self._record_funded_failure(
+                        gen.hotkey, veto[0], miner_fault=veto[1] in GUARD_REFUSE_CLASSES,
+                        error_class=veto[1], burn=False)
+                    raise _FundedLegSkip(gen.hotkey)
                 raise _FundedOperatorFallback(gen.hotkey)
             if not waited:
                 break
@@ -3202,7 +3249,9 @@ class TrainerRunner:
                         f"payer — run `lium rm {result.leaked_pod}` on your "
                         f"account]")
             self._record_funded_failure(
-                gen.hotkey, msg, miner_fault=(result.error_class == "auth"),
+                gen.hotkey, msg,
+                miner_fault=(result.error_class == "auth"
+                             or result.error_class in GUARD_REFUSE_CLASSES),
                 error_class=result.error_class, burn=result.burn_attempt)
             raise _FundedLegSkip(gen.hotkey)
         # Replace the intent row with the real pod record (same instance id).

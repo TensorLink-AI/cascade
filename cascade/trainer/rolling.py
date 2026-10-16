@@ -685,6 +685,10 @@ class RollingScheduler:
         reused, never retrained), sweep everything else."""
         keep_ids = tuple(str(e.base_seed) for e in (self.state.current, self.state.next) if e)
         self._seed_chain_root()
+        try:   # re-attached legs re-check their coldkey at rent (rent_veto)
+            self.__dict__["_last_history"] = self.ops.commitments(client)
+        except Exception as e:  # noqa: BLE001 — the first intake pass sets it
+            log.warning("rolling: commitments unavailable at startup (%s)", e)
         queue = self.ops.queue()
         flights = queue.in_flight() if queue is not None else []
         done = {(f.hotkey, f.ref) for f in self.state.finished}
@@ -1266,6 +1270,7 @@ class RollingScheduler:
         except Exception as e:  # noqa: BLE001
             log.warning("rolling: commitments unavailable (%s); intake waits", e)
             return
+        self.__dict__["_last_history"] = history     # the rent-time re-check reads it
         from ..validator.loop import ref_as_of
 
         # Pending reveals promote from chain truth (the intake's backstop).
@@ -1329,6 +1334,10 @@ class RollingScheduler:
                            error_class="ref_mismatch", expect_ref=entry.ref)
                 continue
             if self._blocked_check(gen, block, history):
+                continue
+            if self._coldkey_cap_check(gen, adm.era_index, history):
+                held.append(entry.hotkey)          # deferred: stays queued, unburned
+                not_jumps.add(entry.hotkey)
                 continue
             if self._packed_source_check(gen, block):
                 continue
@@ -1410,6 +1419,92 @@ class RollingScheduler:
         log.warning("rolling: %s refused — %s", gen.hotkey[:12], tag)
         return True
 
+    def _coldkey_legs(self, coldkey: str, era_index: int, history, *,
+                      exclude: str, started=None) -> int:
+        """Legs of ``coldkey`` in era ``era_index`` other than ``exclude``:
+        in flight (only those ``started(hotkey)`` accepts, when given) plus
+        legs already trained in that era."""
+        q = self.ops.queue()
+        flights = q.in_flight() if q is not None else []
+        hks = {e.hotkey for e in flights
+               if e.hotkey != exclude and int(e.era_index or 0) == int(era_index)
+               and (started is None or started(e.hotkey))}
+        with self._lock:
+            hks |= {f.hotkey for f in self.state.finished
+                    if f.hotkey != exclude and int(f.era_index) == int(era_index)}
+        return sum(1 for hk in hks if self._coldkey_of(history, hk) == coldkey)
+
+    def _coldkey_cap_check(self, gen, era_index: int, history=()) -> bool:
+        """``[round] max_inflight_per_coldkey``: True when ``gen``'s coldkey
+        already holds the cap in era ``era_index`` — the entry is DEFERRED
+        (left queued, unburned, no pod) until a seat frees. The reigning king
+        is exempt; an unknown coldkey is never counted."""
+        cap = int(getattr(self.cfg.round, "max_inflight_per_coldkey", 0) or 0)
+        if cap <= 0 or self._is_reigning_king(gen.hotkey):
+            return False
+        ck = self._coldkey_of(history, gen.hotkey)
+        if not ck:
+            return False
+        n = self._coldkey_legs(ck, era_index, history, exclude=gen.hotkey)
+        if n < cap:
+            return False
+        logged = self.__dict__.setdefault("_cap_logged", set())
+        if (gen.hotkey, int(era_index)) not in logged:
+            logged.add((gen.hotkey, int(era_index)))
+            log.warning("rolling: %s deferred — coldkey_cap (%s holds %d/%d legs in era %d)",
+                        gen.hotkey[:12], ck[:12], n, cap, int(era_index))
+        return True
+
+    def rent_veto(self, hotkey: str, ref: str, *, started) -> tuple[str, str, bool] | None:
+        """Rent-time re-check for a leg that holds NO live pod yet (called by
+        the funded rent path right before it would launch one — never for an
+        adopted, already-training pod). Covers legs admitted before a guard
+        was armed and legs re-attached after a restart. Returns
+        ``(message, error_class, miner_fault)``: a near-duplicate is refused
+        (``failed``, no burn); a coldkey over its cap is deferred (requeued,
+        no attempt burned). ``started(hotkey)`` says whether a sibling leg
+        already has a live pod. Fail-open on every error."""
+        if self._is_reigning_king(hotkey):
+            return None
+        q = self.ops.queue()
+        e = q.get(hotkey) if q is not None and hasattr(q, "get") else None
+        if e is None:
+            return None
+        # The reveal history the last intake pass read (never a chain call
+        # from a leg thread); empty before the first pass ⇒ coldkey unknown.
+        history = self.__dict__.get("_last_history") or ()
+        era_index = int(getattr(e, "era_index", 0) or 0)
+        cap = int(getattr(self.cfg.round, "max_inflight_per_coldkey", 0) or 0)
+        ck = self._coldkey_of(history, hotkey)
+        if cap > 0 and ck and era_index:
+            n = self._coldkey_legs(ck, era_index, history, exclude=hotkey, started=started)
+            if n >= cap:
+                log.warning("rolling: %s deferred at rent — coldkey_cap (%s has %d/%d legs "
+                            "started in era %d)", hotkey[:12], ck[:12], n, cap, era_index)
+                return (f"deferred: coldkey {ck} already has {n} leg(s) in era {era_index} "
+                        f"(max_inflight_per_coldkey={cap})", "deferred", False)
+        reg = self.ops.dedup_registry()
+        if reg is not None and hasattr(reg, "near_dup_verdict"):
+            from .dedup_registry import _commit_block
+
+            try:
+                cb = _commit_block(history, hotkey, ref) or int(getattr(e, "reveal_block", 0) or 0)
+                v = reg.near_dup_verdict(ref, hotkey=hotkey, commit_block=cb)
+            except Exception as ex:  # noqa: BLE001 — fail open
+                log.warning("rolling: near-duplicate re-check failed for %s (%s); leg proceeds",
+                            hotkey[:12], ex)
+                v = None
+            if v is not None:
+                matched, j, mode = v
+                log.warning("rolling: near-duplicate %s at rent — %s of %s (J=%.3f) [%s]",
+                            "refused" if mode == "enforce" else "shadow", hotkey[:12],
+                            matched[:12], j, mode)
+                if mode == "enforce":
+                    return (f"generator is a near-duplicate of the earlier submission of "
+                            f"{matched} (near_duplicate, J={j:.3f}); the earliest commit "
+                            "keeps the entry", "near_duplicate", True)
+        return None
+
     def _is_reigning_king(self, hotkey: str) -> bool:
         return any(e is not None and e.king_hotkey == hotkey
                    for e in (self.state.current, self.state.next))
@@ -1477,6 +1572,16 @@ class RollingScheduler:
                      gen.hotkey[:12], matched[:12], tier)
             return None
         q = self.ops.queue()
+        if tier == "near_duplicate":
+            # Similarity, not identity (DEC-CA-0048 amendment): refused at the
+            # door with NO burn and no pod — the fee question is policy.
+            if q is not None:
+                q.fail(gen.hotkey, error=f"generator is a near-duplicate of the earlier "
+                       f"submission of {matched} (near_duplicate); the earliest commit "
+                       "keeps the entry", error_class="near_duplicate", expect_ref=gen.ref)
+            log.warning("rolling: %s refused — near_duplicate of %s", gen.hotkey[:12],
+                        matched[:12])
+            return matched
         if q is not None:
             what = ("contains an earlier private submission's module"
                     if tier == "private_copy"
