@@ -95,6 +95,13 @@
   (crown / delay / dethrone); losers never do. ``cascade fetch king``
   resolves a published champion anonymously.
 
+* ``cascade check-similarity <dir_a> <dir_b> [--public <dir>]`` — offline
+  self-check with the same text-only fingerprint the admission near-duplicate
+  guard uses (comments, whitespace and numeric constants ignored; ``--public``
+  subtracts a public base such as the king first). Reads two of YOUR trees;
+  nothing is executed or uploaded. ``cascade queue`` explains every admission
+  outcome (``near_duplicate``, ``blocked``, ``deferred``, …) beside the class.
+
 Exit codes: 0 = success, 1 = checked but rejected, 2 = bad CLI usage, 3 =
 chain/network failure, 4 = registry upload/fetch failure.
 """
@@ -427,6 +434,32 @@ def _cmd_round(args: argparse.Namespace) -> int:
         return 3
 
 
+# What a queue/roster error class means for the miner (docs/MINER.md §8).
+# Presentational only — the class itself is what the trainer recorded.
+_CLASS_HINTS = {
+    "near_duplicate": "refused at admission: near-duplicate of an earlier submission "
+                      "from another hotkey (earliest commit keeps it); not burned, no pod",
+    "blocked": "refused at admission: hotkey/coldkey is on the operator's denylist; "
+               "not burned, no pod",
+    "deferred": "held: your coldkey already has the per-era maximum of legs in "
+                "flight; stays queued for a later era, nothing spent",
+    "duplicate": "dropped: identical to an earlier submission (earliest commit keeps it)",
+    "private_copy": "dropped: carries an earlier unpublished submission's module",
+    "ref_mismatch": "terminal: the vault ref is not owned by this hotkey",
+    "generator": "spent: your code failed on the pod or training diverged",
+    "auth": "released: invalid or revoked Lium key — fix the key and fund again",
+    "funding_expired": "terminal: entry outlived the key TTL — fund again",
+    "no_capacity": "infra: no GPU capacity in time — re-queued, nothing burned",
+    "rate_limited": "infra: Lium rate limit — raise the key's limits",
+}
+
+
+def _class_hint(error_class: str | None) -> str:
+    """`` — <explanation>`` for a known class, else ``""``."""
+    hint = _CLASS_HINTS.get(str(error_class or ""))
+    return f"  — {hint}" if hint else ""
+
+
 def _add_queue(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser(
         "queue",
@@ -486,16 +519,21 @@ def _cmd_queue(args: argparse.Namespace) -> int:
         for e in doc.get("seated") or []:
             print(f"    {e.get('hotkey')}{_label_of(e)}  reveal={e.get('reveal_block')}"
                   f"{_tag(str(e.get('hotkey')))}")
+        for e in doc.get("in_flight") or []:
+            # Rolling rosters: legs training now, and the settlement they target.
+            print(f"  in flight: {e.get('hotkey')}{_label_of(e)}  "
+                  f"reveal={e.get('reveal_block')} era={e.get('era_index')} "
+                  f"target={e.get('target_boundary')}{_tag(str(e.get('hotkey')))}")
         for e in doc.get("waiting") or []:
             print(f"  waiting: {e.get('hotkey')}{_label_of(e)}  "
                   f"reveal={e.get('reveal_block')}{_tag(str(e.get('hotkey')))}")
         for e in doc.get("outcomes") or []:
             extra = f" [{e.get('error_class')}]" if e.get("error_class") else ""
             print(f"  outcome: {e.get('hotkey')}  {e.get('outcome')}{extra}"
-                  f"{_tag(str(e.get('hotkey')))}")
+                  f"{_tag(str(e.get('hotkey')))}{_class_hint(e.get('error_class'))}")
         for e in doc.get("terminal") or []:
             print(f"  terminal: {e.get('hotkey')}  [{e.get('error_class')}]"
-                  f"{_tag(str(e.get('hotkey')))}")
+                  f"{_tag(str(e.get('hotkey')))}{_class_hint(e.get('error_class'))}")
         print("  (verify independently: reveal blocks are on-chain; "
               "`cascade-audit round <id>` cross-checks this roster against "
               "the signed manifest)")
@@ -520,7 +558,53 @@ def _cmd_queue(args: argparse.Namespace) -> int:
             err = f" [{e.get('last_error_class')}]" if e.get("last_error_class") else ""
             print(f"  {e.get('hotkey')}{_label_of(e)}  {e.get('status')}  "
                   f"reveal={e.get('reveal_block')} attempts={e.get('attempts')}"
-                  f"{err}{_tag(str(e.get('hotkey')))}")
+                  f"{err}{_tag(str(e.get('hotkey')))}"
+                  f"{_class_hint(e.get('last_error_class'))}")
+    return 0
+
+
+def _add_check_similarity(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser(
+        "check-similarity",
+        help="Offline self-check: how similar two of YOUR generator repos look to "
+        "the admission near-duplicate guard (same text-only fingerprint the "
+        "trainer uses; nothing is executed or uploaded). --public subtracts a "
+        "public base (e.g. `cascade fetch king --out ./king`), as the trainer does.",
+    )
+    p.add_argument("a", type=Path, help="First generator repo directory.")
+    p.add_argument("b", type=Path, help="Second generator repo directory.")
+    p.add_argument("--public", type=Path, action="append", default=[],
+                   help="Public code to subtract first (repeatable), e.g. the king.")
+    p.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
+    p.set_defaults(func=_cmd_check_similarity)
+
+
+def _cmd_check_similarity(args: argparse.Namespace) -> int:
+    from ..interface.near_dup import private_jaccard, signature_of_dir
+
+    for d in (args.a, args.b, *args.public):
+        if not Path(d).is_dir():
+            print(f"not a directory: {d}", file=sys.stderr)
+            return 2
+    try:
+        rnd = load_chain_config(args.chain_toml).round
+        threshold = float(getattr(rnd, "near_dup_threshold", 0.97))
+        min_private = int(getattr(rnd, "near_dup_min_private_shingles", 200))
+    except Exception:  # noqa: BLE001 — a local self-check needs no config
+        threshold, min_private = 0.97, 200
+    sa, sb = signature_of_dir(args.a), signature_of_dir(args.b)
+    public: frozenset[int] = frozenset()
+    for d in args.public:
+        public |= signature_of_dir(d)
+    j = private_jaccard(sa, sb, public, min_private=min_private)
+    if j is None:
+        print(f"similarity: n/a — after subtracting public code one side has fewer "
+              f"than {min_private} shingles of its own (mostly public lineage)")
+        return 0
+    flag = "WOULD be flagged" if j >= threshold else "below the threshold"
+    print(f"similarity: {j:.3f}  (threshold {threshold:.3f} in this chain.toml — {flag})")
+    print("note: the trainer compares against OTHER hotkeys' submissions from the "
+          "last era; the earliest commit keeps its entry.")
     return 0
 
 
@@ -1315,6 +1399,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_reveal_status(sub)
     _add_round(sub)
     _add_queue(sub)
+    _add_check_similarity(sub)
     _add_heat(sub)
     _add_duel(sub)
     _add_fund(sub)
