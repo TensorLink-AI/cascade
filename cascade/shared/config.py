@@ -1051,6 +1051,11 @@ class RoundConfig:
     # (0 = immediately once the list is non-empty). Their legs never rent a pod.
     blocked_hotkeys: tuple[str, ...] = ()
     blocked_from_block: int = 0
+    # Same denylist by COLDKEY (owner 2026-10-14): every hotkey the coldkey
+    # owns — including ones registered later — is refused at admission, read
+    # from the revealed commitment's metagraph coldkey. The reigning king is
+    # exempt (its king leg never passes admission anyway). Same gate block.
+    blocked_coldkeys: tuple[str, ...] = ()
     # 0 = every screened entrant seats; the provisioner sizes the final fleet
     # to fit the field inside the epoch (legs queue on each lane, see
     # duel_waves_that_fit) up to its pod ceiling, and the trainer seats what
@@ -1433,6 +1438,16 @@ class RoundConfig:
         if gate > 0 and (block is None or int(block) < gate):
             return frozenset()
         return frozenset(self.blocked_hotkeys)
+
+    def blocked_coldkeys_at(self, block: int | None) -> frozenset[str]:
+        """Coldkeys whose hotkeys are refused at admission at ``block`` — same
+        ``blocked_from_block`` gate as :meth:`blocked_at`."""
+        if not self.blocked_coldkeys:
+            return frozenset()
+        gate = int(self.blocked_from_block or 0)
+        if gate > 0 and (block is None or int(block) < gate):
+            return frozenset()
+        return frozenset(self.blocked_coldkeys)
 
     def duel_only(self, block: int | None) -> bool:
         """True when the round at epoch boundary ``block`` runs without a heat
@@ -2963,6 +2978,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             funded_bench_margin_seconds=max(0, int(r.get("funded_bench_margin_seconds", 0) or 0)),
             blocked_hotkeys=tuple(str(x) for x in r.get("blocked_hotkeys", ()) or ()),
             blocked_from_block=max(0, int(r.get("blocked_from_block", 0) or 0)),
+            blocked_coldkeys=tuple(str(x) for x in r.get("blocked_coldkeys", ()) or ()),
             duel_field_cap=validate_duel_field_cap(r.get("duel_field_cap", 0)),
             duel_seat_all=bool(r.get("duel_seat_all", True)),
             one_submission_per_hotkey=bool(r.get("one_submission_per_hotkey", True)),

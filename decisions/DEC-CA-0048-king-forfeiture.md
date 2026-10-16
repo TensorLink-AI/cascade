@@ -51,6 +51,11 @@ Two knobs, both inert by default:
 * **`[round] blocked_hotkeys = [...]`, `blocked_from_block`** — trainer-side, not consensus. Listed
   hotkeys are refused at rolling admission (`failed [blocked]`, NO burn — the fee is policy, not code),
   never rent a pod.
+* **`[round] blocked_coldkeys = [...]`** (amended 2026-10-14, owner) — same gate, keyed by the
+  COLDKEY on the hotkey's revealed commitment (metagraph coldkey), so hotkeys the coldkey registers
+  later are covered without editing the list. Motivated by one coldkey resubmitting a near-identical
+  generator under 30 hotkeys. The reigning king is exempt (its king leg never passes admission; the
+  throne is stripped only by forfeiture, which is consensus). Unknown coldkey ⇒ admitted (no guessing).
 
 ## Why the throne cannot be stripped from the trainer alone
 

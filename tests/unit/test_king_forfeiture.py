@@ -141,6 +141,9 @@ def test_blocked_at(cfg):
     assert r.blocked_at(100) == frozenset({K, X})
     assert replace(r, blocked_from_block=0).blocked_at(1) == frozenset({K, X})          # 0 = immediately
     assert cfg.round.blocked_at(10**9) == frozenset()
+    rc = replace(cfg.round, blocked_coldkeys=(K,), blocked_from_block=100)
+    assert rc.blocked_coldkeys_at(99) == frozenset() and rc.blocked_coldkeys_at(100) == frozenset({K})
+    assert cfg.round.blocked_coldkeys_at(10**9) == frozenset()
 
 
 # ── loader ───────────────────────────────────────────────────────────────────
@@ -160,13 +163,14 @@ def test_loader_parses_both_knobs(tmp_path):
     import re
     text = _unarmed(root / "chain.toml")
     text = re.sub(r"(?m)^\[scoring\]$", f'[scoring]\nforfeit_hotkeys = ["{K}"]\nforfeit_from_block = 9190800\nforfeit_successor_hotkey = "{S}"', text, count=1)
-    text = re.sub(r"(?m)^\[round\]$", f'[round]\nblocked_hotkeys = ["{K}", "{X}"]\nblocked_from_block = 9190800', text, count=1)
+    text = re.sub(r"(?m)^\[round\]$", f'[round]\nblocked_hotkeys = ["{K}", "{X}"]\nblocked_coldkeys = ["{S}"]\nblocked_from_block = 9190800', text, count=1)
     p = tmp_path / "chain.toml"
     p.write_text(text)
     c = load_chain_config(p)
     assert c.scoring.forfeit_hotkeys == (K,) and c.scoring.forfeit_from_block == 9_190_800
     assert c.scoring.forfeit_successor_hotkey == S
     assert c.round.blocked_hotkeys == (K, X) and c.round.blocked_from_block == 9_190_800
+    assert c.round.blocked_coldkeys == (S,)
     # the shipped chain.toml ARMS the forfeiture (owner 2026-09-28): one listed hotkey, a
     # successor outside the list, block decided on chain — and since DEC-CA-0050 the
     # fleet's lock-in (9166500) is PINNED in the release

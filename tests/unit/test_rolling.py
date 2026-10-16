@@ -1336,6 +1336,58 @@ def test_blocked_hotkey_is_refused_at_the_door_without_a_pod(cfg, tmp_path):
     assert q2.get("ALFA").status == "in_flight"
 
 
+def _ccommit(hk: str, ref: str, block: int, coldkey: str) -> Commitment:
+    return replace(_commit(hk, ref, block), coldkey=coldkey)
+
+
+def test_blocked_coldkey_refuses_every_hotkey_it_owns(cfg, tmp_path):
+    armed = _armed(cfg)
+    b0 = armed.round.rolling_from_block + 5
+    armed = replace(armed, round=replace(armed.round, blocked_coldkeys=("COLD-SPAM",)))
+    sched, ops = _sched(armed, tmp_path, Clock())
+    q = ops.queue()
+    # ALFA + CHAR share the blocked coldkey (CHAR stands in for a hotkey
+    # registered AFTER the list was written); BRAV is someone else's
+    ops.commits.append(_ccommit("ALFA", REF["ALFA"], b0 - 100, "COLD-SPAM"))
+    ops.commits.append(_ccommit("BRAV", REF["BRAV"], b0 - 90, "COLD-OK"))
+    ops.commits.append(_ccommit("CHAR", REF["CHAR"], b0 - 80, "COLD-SPAM"))
+    for hk, rb in (("ALFA", b0 - 100), ("BRAV", b0 - 90), ("CHAR", b0 - 80)):
+        q.add(hk, REF[hk], reveal_block=rb)
+    sched.tick(FakeClient(), b0)
+    _join(sched)
+    for hk in ("ALFA", "CHAR"):
+        assert q.get(hk).status == "failed" and q.get(hk).last_error_class == "blocked"
+        assert "blocked_coldkeys" in q.get(hk).last_error
+        assert hk not in ops.burnt
+    assert q.get("BRAV").status == "in_flight"
+
+
+def test_blocked_coldkey_respects_the_gate_and_exempts_the_king(cfg, tmp_path):
+    armed = _armed(cfg)
+    b0 = armed.round.rolling_from_block + 5
+    gated = replace(armed, round=replace(armed.round, blocked_coldkeys=("COLD-SPAM",),
+                                         blocked_from_block=b0 + 1))
+    sched, ops = _sched(gated, tmp_path, Clock())
+    ops.commits.append(_ccommit("ALFA", REF["ALFA"], b0 - 100, "COLD-SPAM"))
+    ops.queue().add("ALFA", REF["ALFA"], reveal_block=b0 - 100)
+    sched.tick(FakeClient(), b0)
+    _join(sched)
+    assert ops.queue().get("ALFA").status == "in_flight"      # before the gate: admitted
+    # the reigning king's hotkey is never refused by the coldkey rule
+    armed2 = replace(armed, round=replace(armed.round, blocked_coldkeys=("COLD-SPAM",)))
+    sched2, ops2 = _sched(armed2, tmp_path / "k", Clock())
+    sched2.tick(FakeClient(), b0)
+    _join(sched2)
+    king = sched2.state.current.king_hotkey
+    assert king
+    assert sched2._is_reigning_king(king)
+    commits = [_ccommit(king, "x", b0 - 1, "COLD-SPAM")]
+    gen = SimpleNamespace(hotkey=king, ref="x")
+    assert sched2._blocked_check(gen, b0, commits) is False
+    # an unknown coldkey (no metagraph data) is admitted, not guessed
+    assert sched2._coldkey_of([_commit("ALFA", REF["ALFA"], 1)], "ALFA") is None
+
+
 def test_forfeited_king_gets_no_king_leg(cfg, tmp_path):
     armed = _armed(cfg)
     b0 = armed.round.rolling_from_block + 5
