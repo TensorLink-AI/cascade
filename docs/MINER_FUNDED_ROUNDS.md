@@ -440,6 +440,27 @@ the resolved block (hold back, or pin the decided block afterwards).
 Before relying on 51 %, check the owner validator's own share of stake —
 over half and the count is one operator. See `docs/VALIDATOR.md`.
 
+## Admission guard (DEC-CA-0048 amendment, PR #367 / #369)
+
+Trainer-side only (no consensus, no validator restart); read at trainer
+startup. Miner-facing rules: [MINER.md](MINER.md) §6 "Admission rules".
+
+| `[round]` key | effect | mainnet (2026-10-16) |
+|---|---|---|
+| `blocked_hotkeys` / `blocked_coldkeys` | refuse at admission, `failed [blocked]`, no burn, no pod; the reigning king is exempt from the coldkey list | 30 hotkeys; coldkeys empty |
+| `max_inflight_per_coldkey` | defer a coldkey's entries past N legs per era (stays queued, `[deferred]` at rent) | 3 |
+| `near_dup_mode` / `near_dup_threshold` / `near_dup_lookback_eras` | fuzzy source similarity vs other hotkeys' commits in the lookback, public lineage subtracted; earliest commit wins; `enforce` refuses `failed [near_duplicate]`, no burn | enforce / 0.985 / 1 |
+
+Both guards run at admission AND at the rent step for any leg without a
+live pod, so entries admitted before arming (or re-attached by a restart)
+are covered; a training pod is never touched. Fail-open on guard errors.
+Log lines to grep: `refused — blocked_*`, `deferred — coldkey_cap`,
+`near-duplicate refused|shadow`. Calibration (2026-10-16, 419 on-box
+submissions): no threshold refuses only the known spray clusters — at
+0.985 / 1 era about 20 % of other submissions also match (many are
+themselves same-block multi-hotkey bursts). Re-check the shadow log before
+lowering the threshold.
+
 ## Miner flow
 
 Documented once, in [MINER.md](MINER.md) §5 (submitting and funding) and §8

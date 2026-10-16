@@ -237,11 +237,11 @@ An unfunded boundary runs no round; the king holds.
 
 ### After the rolling switch
 
-The next release replaces the boundary round with **rolling intake**
-(DEC-CA-0043). The switch is not on a date the owner announces: it happens
-when validators holding **51 % of stake** are running the release
-(DEC-CA-0045), at the round boundary after that count is reached. Until
-then everything above applies unchanged. From the switch:
+**Rolling intake is live on mainnet** (DEC-CA-0043, switched on by the
+DEC-CA-0045 stake vote); the boundary round above describes the pre-switch
+behaviour. The switch happened when validators holding **51 % of stake**
+ran the release, at the round boundary after that count was reached. Since
+the switch:
 
 1. **Your leg starts when it is funded**, not at the next boundary. It runs
    on your pod for the full budget and lands in the first *settlement* it
@@ -305,6 +305,42 @@ the moment it finishes, with no attempt consumed. A generator it has never
 seen is fitted on the GPU's estimate — keep your generator fast enough for the
 SKU, or expect the first leg to be the measurement.
 
+### Admission rules
+
+Every funded entry passes these checks when it is admitted, and again right
+before a pod is rented for it (so an entry admitted earlier, or re-attached
+after a trainer restart, is held to the same rules). A leg that is already
+training is never stopped. None of these refusals burns your entry's fee or
+rents a pod.
+
+| rule | what happens | `cascade queue` shows |
+|---|---|---|
+| **Per-coldkey cap** | A coldkey may have at most **3** legs in flight per era (`[round] max_inflight_per_coldkey`). Further entries from the same coldkey are **deferred**: they stay queued, unspent, and run in a later era. The reigning king is exempt. | `queued [deferred]` |
+| **Near-duplicate** | Your generator's source is compared with other hotkeys' submissions committed in the 12 h (one era, `near_dup_lookback_eras = 1`) before yours. Comments, docstrings, whitespace and numeric constants are ignored, and public code (the reigning king, published champions, public Hub generators) is subtracted first, so building on the king never counts. At similarity **≥ 0.985** (`near_dup_threshold`, `near_dup_mode = "enforce"`) the **earliest commit** keeps its entry and later ones are **refused**. | `failed [near_duplicate]` |
+| **Denylist** | A hotkey (`blocked_hotkeys`) or coldkey (`blocked_coldkeys`) the operator has listed is refused. | `failed [blocked]` |
+
+The near-duplicate rule exists because one operator submitted the same
+twenty-thousand-line generator under dozens of hotkeys, each copy changed
+by a few lines. Exact-identity dedup cannot see that. Similarity is
+evidence, not proof. Public lineage is subtracted before the comparison, so
+improving on the published king is never a near-duplicate of anyone; what
+collides is code two entries share that is NOT public. Submitting variants
+of your own idea from several hotkeys within 12 h will collide: the first
+commit is the one that trains. Space variants more than an era apart, or
+merge them into one generator.
+
+Check two of your own trees offline before you submit:
+
+```bash
+cascade fetch king --out ./king
+cascade check-similarity ./my-gen-v1 ./my-gen-v2 --public ./king
+# similarity: 0.412  (threshold 0.985 in this chain.toml — below the threshold)
+```
+
+It uses the same fingerprint as the trainer, reads only the directories you
+name, and executes nothing. The values above are the mainnet settings as
+of 2026-10-16; the operator announces changes.
+
 ## 7. How the verdict works
 
 - **Metric.** Geometric mean of CRPS and MASE over the private windows, on a
@@ -343,6 +379,9 @@ What happens to your entry when a leg does not produce a judged checkpoint:
 | generator | your code raised, a series failed the checks, the loss went non-finite | **spent** |
 | tamper | pod replaced under the same name, checkpoint altered | **spent** |
 | ref_mismatch / burned / funding_expired | you re-revealed a different ref / hotkey already used / entry outlived the 36 h key TTL | terminal; re-fund (a burned hotkey needs a fresh one) |
+| deferred | your coldkey already has the per-era maximum of legs in flight | **kept**, queued for a later era; nothing burned |
+| near_duplicate | near-duplicate of an earlier submission from another hotkey (see Admission rules) | refused; **not burned**, no pod |
+| blocked | hotkey or coldkey on the operator's denylist | refused; **not burned**, no pod |
 
 `cascade queue` shows the class beside a failed entry. A rate-limit streak
 longer than 6 h turns terminal; raise the key's limits and fund again.
@@ -357,8 +396,9 @@ cascade fetch king --out ./king          # the reigning king
 cascade fetch <uid|hotkey|repo@digest>   # a public competitor
 ```
 
-Copying is unrewarding by construction: the earliest reveal owns a ref, and a
-byte-identical corpus is dropped before it trains. You win by improving on
+Copying is unrewarding by construction: the earliest reveal owns a ref, a
+byte-identical corpus is dropped before it trains, and a near-identical one
+is refused at admission (see "Admission rules" in §6). You win by improving on
 the visible best.
 
 What is *not* allowed is code that was never public. A private (vault)
@@ -400,6 +440,9 @@ that were never published.
 | `400 bad_label` | label too long or has characters outside `[A-Za-z0-9._-]` |
 | `generator_artifact_unreachable` | your Hippius project is private; make it public |
 | funded but never seated | more senior reveals filled the seats, or the GPU market is thin; you wait unspent |
+| `queued [deferred]` | your coldkey hit the per-era leg cap (3); the entry runs in a later era, unspent |
+| `failed [near_duplicate]` | an earlier commit from another hotkey is ≥ 0.985 similar after public code is subtracted; check with `cascade check-similarity`, change the idea, not the constants |
+| `failed [blocked]` | the hotkey or its coldkey is on the operator's denylist |
 | `failed [generator]` | your code failed on the pod or training diverged; check the training log, fix, submit from a fresh hotkey |
 | `failed [rate_limited]` | your Lium key was rate-limited for 6 h; raise limits, fund again |
 | loses every duel | the pool is broad real-world data; widen the prior rather than fitting one shape. `cascade duel --hotkey <you>` shows which domains you lost and by how much; `--history` shows whether that is changing |
