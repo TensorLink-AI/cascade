@@ -261,6 +261,15 @@ def validate_real_corpus_ref(value: object) -> str:
 DEDUP_MODES = ("off", "shadow", "enforce")
 
 
+def _unit_interval(value, key: str) -> float:
+    """``value`` as a float in (0, 1]; a typo'd threshold must not silently
+    flag everything (0) or nothing (>1)."""
+    v = float(value)
+    if not 0.0 < v <= 1.0:
+        raise ValueError(f"{key}={value!r} invalid; expected 0 < {key} <= 1")
+    return v
+
+
 def validate_dedup_mode(mode: str, key: str = "dedup_mode") -> str:
     """Return ``mode`` if it is a known dedup mode, else raise ValueError.
 
@@ -1056,6 +1065,27 @@ class RoundConfig:
     # from the revealed commitment's metagraph coldkey. The reigning king is
     # exempt (its king leg never passes admission anyway). Same gate block.
     blocked_coldkeys: tuple[str, ...] = ()
+    # Per-coldkey seat cap (owner 2026-10-16, after one operator sprayed ten
+    # near-identical variants across ten hotkeys in one block): a coldkey
+    # with this many legs already in flight or trained in an era has its
+    # further entries DEFERRED — they stay queued, unburned, no pod — until a
+    # seat frees. Re-checked at rent time, so a leg admitted before the cap
+    # (or re-attached after a restart without a live pod) defers too. The
+    # reigning king is exempt; an unknown coldkey is not counted. 0 = off.
+    max_inflight_per_coldkey: int = 0
+    # Near-duplicate admission guard (DEC-CA-0048 amendment 2026-10-16): line
+    # shingles of the normalised .py source (comments/docstrings stripped,
+    # numeric literals masked), PUBLIC material (published champions, the
+    # kings, public Hub trees) subtracted, Jaccard against every other
+    # hotkey's registered entry committed within `near_dup_lookback_eras`.
+    # Similarity is information, not proof (DEC-CA-0008): "shadow" logs only;
+    # "enforce" refuses failed [near_duplicate] — no burn, no pod — and the
+    # earliest commit keeps the entry. Needs dedup_mode shadow/enforce (the
+    # registry). Also re-checked at rent time for legs with no live pod.
+    near_dup_mode: str = "off"
+    near_dup_threshold: float = 0.97
+    near_dup_lookback_eras: int = 4
+    near_dup_min_private_shingles: int = 200
     # 0 = every screened entrant seats; the provisioner sizes the final fleet
     # to fit the field inside the epoch (legs queue on each lane, see
     # duel_waves_that_fit) up to its pod ceiling, and the trainer seats what
@@ -2979,6 +3009,14 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             blocked_hotkeys=tuple(str(x) for x in r.get("blocked_hotkeys", ()) or ()),
             blocked_from_block=max(0, int(r.get("blocked_from_block", 0) or 0)),
             blocked_coldkeys=tuple(str(x) for x in r.get("blocked_coldkeys", ()) or ()),
+            max_inflight_per_coldkey=max(0, int(r.get("max_inflight_per_coldkey", 0) or 0)),
+            near_dup_mode=validate_dedup_mode(
+                str(r.get("near_dup_mode", "off")), "near_dup_mode"),
+            near_dup_threshold=_unit_interval(
+                r.get("near_dup_threshold", 0.97), "near_dup_threshold"),
+            near_dup_lookback_eras=max(1, int(r.get("near_dup_lookback_eras", 4) or 4)),
+            near_dup_min_private_shingles=max(
+                0, int(r.get("near_dup_min_private_shingles", 200))),
             duel_field_cap=validate_duel_field_cap(r.get("duel_field_cap", 0)),
             duel_seat_all=bool(r.get("duel_seat_all", True)),
             one_submission_per_hotkey=bool(r.get("one_submission_per_hotkey", True)),

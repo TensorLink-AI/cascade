@@ -56,6 +56,23 @@ Two knobs, both inert by default:
   later are covered without editing the list. Motivated by one coldkey resubmitting a near-identical
   generator under 30 hotkeys. The reigning king is exempt (its king leg never passes admission; the
   throne is stripped only by forfeiture, which is consensus). Unknown coldkey ⇒ admitted (no guessing).
+* **`[round] max_inflight_per_coldkey`, `near_dup_mode` / `near_dup_threshold` /
+  `near_dup_lookback_eras` / `near_dup_min_private_shingles`** (amended 2026-10-16, owner: "put
+  in a guard to prevent this" after one operator committed ten variants of one ~21k-line
+  generator under ten hotkeys in ONE block, and another thirty under a second coldkey) —
+  trainer-side, not consensus, inert by default. The cap DEFERS a coldkey's extra entries
+  (queued, unburned, no pod) while it holds N legs in an era. The near-duplicate tier
+  compares line-shingle signatures of the normalised `.py` source (comments/docstrings
+  stripped, numbers masked) with PUBLIC material (kings, published champions, public Hub
+  trees) subtracted, so building on the king never reads as a copy; the earliest commit by
+  `(commit_block, hotkey)` keeps the entry, "enforce" refuses `failed [near_duplicate]` with
+  NO burn. Both re-check at RENT time for any leg that holds no live pod yet (legs admitted
+  before arming; legs re-attached after a restart) — an adopted, training pod is never
+  touched. **Evidence caveat:** similarity is information, not proof (DEC-CA-0008, which
+  removed a 0.99 ratio bar for false-dropping a finalist). On the on-box history the tier
+  also matches many clusters outside the two spray coldkeys (see the PR's calibration), so
+  arming `enforce` is an owner policy act, not a measurement; shadow first unless the owner
+  directs otherwise.
 
 ## Why the throne cannot be stripped from the trainer alone
 

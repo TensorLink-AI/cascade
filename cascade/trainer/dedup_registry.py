@@ -26,6 +26,7 @@ TIERS = (("tree_sha256", "tree_identical"), ("token_sha256", "token_identical"),
          ("masked_sha256", "rename_identical"))
 PRIVATE_COPY_TIER = "private_copy"
 EMBEDDED_TIERS = ("embedded_token_identical", "embedded_rename_identical")
+NEAR_DUP_TIER = "near_duplicate"
 CHAMPION_INDEX_TTL_SECONDS = 300.0
 
 
@@ -59,6 +60,25 @@ class DedupRegistry:
     def _emb_mode(self) -> str:
         rnd = getattr(getattr(self.r, "cfg", None), "round", None)
         return str(getattr(rnd, "dedup_embedded_mode", "off") or "off").lower()
+
+    # ── near-duplicate tier config ───────────────────────────────────────────
+    def _nd_mode(self) -> str:
+        rnd = getattr(getattr(self.r, "cfg", None), "round", None)
+        return str(getattr(rnd, "near_dup_mode", "off") or "off").lower()
+
+    def _nd_threshold(self) -> float:
+        rnd = getattr(getattr(self.r, "cfg", None), "round", None)
+        return float(getattr(rnd, "near_dup_threshold", 0.97))
+
+    def _nd_min_private(self) -> int:
+        rnd = getattr(getattr(self.r, "cfg", None), "round", None)
+        return int(getattr(rnd, "near_dup_min_private_shingles", 200))
+
+    def _nd_lookback_blocks(self) -> int:
+        cfg = getattr(self.r, "cfg", None)
+        rnd = getattr(cfg, "round", None)
+        eras = int(getattr(rnd, "near_dup_lookback_eras", 4) or 4)
+        return eras * int(getattr(rnd, "epoch_blocks", 3600) or 3600)
 
     # ── persistence ──────────────────────────────────────────────────────────
 
@@ -126,12 +146,153 @@ class DedupRegistry:
 
                 out["modules"] = module_sketches(
                     d, min_tokens=self._pc_min_tokens(), max_text_mb=rnd.dedup_max_text_mb)
+            if self._nd_mode() != "off":
+                from ..interface.near_dup import signature_of_dir
+
+                self._store_nd_sig(ref, signature_of_dir(d, max_text_mb=rnd.dedup_max_text_mb))
+                out["nd_sig"] = True
             return out
         except Exception as e:  # noqa: BLE001
             log.warning("dedup registry: %s unfetchable/unfingerprintable (%s)", ref[:60], e)
             return None
         finally:
             shutil.rmtree(root, ignore_errors=True)
+
+    # ── near-duplicate signatures (sidecar files: a signature is ~20k ints,
+    #    far too big for the registry JSON that is rewritten on every save) ──
+
+    def _nd_dir(self) -> Path:
+        return Path(self.r.work_root) / "_near_dup_sigs"
+
+    def _nd_path(self, ref: str) -> Path:
+        import hashlib
+
+        return self._nd_dir() / (hashlib.sha256(ref.encode("utf-8")).hexdigest()[:32] + ".json")
+
+    def _store_nd_sig(self, ref: str, sig: frozenset[int]) -> None:
+        p = self._nd_path(ref)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(sorted(sig)), encoding="utf-8")
+        tmp.replace(p)
+        self.__dict__.setdefault("_nd_cache", {})[ref] = sig
+
+    def nd_sig(self, ref: str) -> frozenset[int] | None:
+        """The cached signature of ``ref`` (None when never computed)."""
+        cache = self.__dict__.setdefault("_nd_cache", {})
+        if ref in cache:
+            return cache[ref]
+        try:
+            sig = frozenset(int(x) for x in json.loads(self._nd_path(ref).read_text("utf-8")))
+        except Exception:  # noqa: BLE001 — missing/torn ⇒ recompute
+            return None
+        cache[ref] = sig
+        return sig
+
+    def backfill_nd(self) -> None:
+        """Compute the signature of every registered entry that lacks one —
+        vault ZIPs are on this box, so it is local. Once per process; every
+        entry fails open on its own."""
+        if self.__dict__.get("_nd_backfilled") or self._nd_mode() == "off":
+            return
+        self.__dict__["_nd_backfilled"] = True
+        todo = [ref for ref in self.entries if self.nd_sig(ref) is None]
+        n = 0
+        for ref in todo:
+            if self.compute_nd_sig(ref) is not None:
+                self.entries[ref]["nd_sig"] = True
+                n += 1
+        if n:
+            self._save()
+            log.info("dedup registry: near-duplicate signatures backfilled for %d entries", n)
+
+    def compute_nd_sig(self, ref: str) -> frozenset[int] | None:
+        """Fetch ``ref`` (vault refs resolve to the on-box ZIP) and store its
+        near-duplicate signature only — no digests, no archive. Text only;
+        the tree is deleted afterwards. ``None`` on any failure (fail open)."""
+        from ..interface.near_dup import signature_of_dir
+        from ..shared.hippius import fetch_from_hub
+
+        root = Path(self.r.work_root) / "_dedup_registry" / ("nd_" + ref.replace("/", "_").replace(":", "_")[:117])
+        try:
+            d = Path(fetch_from_hub(ref, root, hub=self.r.hub()))
+            sig = signature_of_dir(d, max_text_mb=self.r.cfg.round.dedup_max_text_mb)
+            self._store_nd_sig(ref, sig)
+            return sig
+        except Exception as e:  # noqa: BLE001
+            log.warning("dedup registry: near-duplicate signature for %s failed (%s)", ref[:60], e)
+            return None
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def _nd_public(self) -> frozenset[int]:
+        """Shingles of PUBLIC material — published champions, every king the
+        registry has seen, public (non-vault) Hub trees — which no newcomer is
+        flagged for sharing: building on the king is the design."""
+        u: set[int] = set()
+        for ref, rec in self.entries.items():
+            if rec.get("kind") in ("king", "champion") or not self._is_private(ref, rec):
+                sig = self.nd_sig(ref)
+                if sig:
+                    u |= sig
+        return frozenset(u)
+
+    def match_near_dup(self, ref: str, *, hotkey: str, commit_block: int
+                       ) -> tuple[str, float, int, str] | None:
+        """``(hotkey, J, commit_block, ref)`` of the earliest-committed OTHER
+        hotkey's registered queue entry whose private signature is at least
+        ``near_dup_threshold`` Jaccard-similar to ``ref``'s, committed within
+        the lookback window and STRICTLY earlier by ``(commit_block, hotkey)``
+        (a same-block burst keeps exactly one entry). Kings and published
+        champions are never rivals here. ``None`` when nothing matches or the
+        signature is unavailable (fail open)."""
+        from ..interface.near_dup import private_jaccard
+
+        mine = self.nd_sig(ref)
+        if mine is None:
+            return None
+        thr, min_priv = self._nd_threshold(), self._nd_min_private()
+        public = self._nd_public()
+        lo = int(commit_block) - self._nd_lookback_blocks() if commit_block else None
+        me = (int(commit_block or 0), hotkey)
+        best = None
+        for their_ref, rec in self.entries.items():
+            their_hk = str(rec.get("hotkey") or "")
+            if their_ref == ref or their_hk == hotkey or rec.get("kind") in ("king", "champion"):
+                continue
+            cb = int(rec.get("commit_block") or 0)
+            if commit_block and (cb == 0 or (lo is not None and cb < lo)):
+                continue
+            if commit_block and (cb, their_hk) >= me:
+                continue
+            theirs = self.nd_sig(their_ref)
+            if not theirs or min(len(mine), len(theirs)) < thr * max(len(mine), len(theirs)):
+                continue      # Jaccard <= size ratio: cannot reach the threshold
+            j = private_jaccard(mine, theirs, public, min_private=min_priv)
+            if j is None or j < thr:
+                continue
+            cand = (cb, their_hk, j, their_ref)
+            if best is None or cand[:2] < best[:2]:
+                best = cand
+        if best is None:
+            return None
+        return best[1], best[2], best[0], best[3]
+
+    def near_dup_verdict(self, ref: str, *, hotkey: str, commit_block: int
+                         ) -> tuple[str, float, str] | None:
+        """Rent-time re-check for a leg admitted earlier (or re-attached after
+        a restart): ``(matched hotkey, J, mode)`` when ``ref`` near-duplicates
+        an earlier entry and the tier is on, else ``None``. Fail-open."""
+        mode = self._nd_mode()
+        if mode not in ("shadow", "enforce"):
+            return None
+        self.backfill_nd()
+        if self.nd_sig(ref) is None:
+            self.compute_nd_sig(ref)
+        hit = self.match_near_dup(ref, hotkey=hotkey, commit_block=commit_block)
+        if hit is None:
+            return None
+        return hit[0], hit[1], mode
 
     # ── registry ─────────────────────────────────────────────────────────────
 
@@ -419,6 +580,18 @@ class DedupRegistry:
                     self.register(gen.ref, hotkey=gen.hotkey, commit_block=my_block,
                                   kind="queue", digests=digests, coldkey=coldkey)
                 return pc[0], pc[1], pc_mode == "enforce"
+        nd_mode = self._nd_mode()
+        if nd_mode in ("shadow", "enforce"):
+            self.backfill_nd()
+            nd = self.match_near_dup(gen.ref, hotkey=gen.hotkey, commit_block=my_block)
+            if nd is not None:
+                log.warning("rolling: near-duplicate %s — %s of %s (J=%.3f, earlier commit "
+                            "%d) [%s]", "refused" if nd_mode == "enforce" else "shadow",
+                            gen.hotkey[:12], nd[0][:12], nd[1], nd[2], nd_mode)
+                if nd_mode != "enforce":
+                    self.register(gen.ref, hotkey=gen.hotkey, commit_block=my_block,
+                                  kind="queue", digests=digests, coldkey=coldkey)
+                return nd[0], NEAR_DUP_TIER, nd_mode == "enforce"
         self.register(gen.ref, hotkey=gen.hotkey, commit_block=my_block, kind="queue",
                       digests=digests, coldkey=coldkey)
         return None

@@ -209,8 +209,15 @@ def rent_funded_pod(
     provider_factory: Callable[[str], Provider] = lium_provider_for_key,
     now_iso: Callable[[], str] = lambda: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     host_key_scanner: Callable[[str, int], str] | None = None,
+    before_launch: Callable[[], tuple[str, str] | None] | None = None,
 ) -> FundedRentResult:
     """Rent ONE pod for ``hotkey``'s challenger leg on ``hotkey``'s own key.
+
+    ``before_launch`` (the admission guards' rent-time re-check) runs only
+    when NO live pod of this leg exists — i.e. right before a NEW pod would
+    be launched; an adopted, possibly-training pod is never vetoed. It
+    returns ``(message, error_class)`` to stop the rent (nothing launched,
+    no attempt burned) or ``None`` to proceed; an exception proceeds.
 
     Success returns the ledgered :class:`PodInstance` (stage ``"funded"``,
     ``payer_hotkey`` set — the caller appends it to the round ledger and saves
@@ -293,6 +300,20 @@ def rent_funded_pod(
         except Exception as e:  # noqa: BLE001 — never tear the live pod down; retry later
             res = _fail(f"live pod {live_name} could not be adopted: {e}")
             return replace(res, error_class="infra", burn_attempt=False)
+
+    if before_launch is not None:
+        try:
+            veto = before_launch()
+        except Exception as e:  # noqa: BLE001 — a guard fault never blocks a rent
+            log.warning("funded rent for %s: pre-launch check failed (%s) — renting",
+                        hotkey, str(e)[-200:])
+            veto = None
+        if veto is not None:
+            msg, cls = veto
+            log.warning("funded rent for %s stopped before launch [%s]: %s", hotkey, cls,
+                        msg[-300:])
+            return FundedRentResult(hotkey=hotkey, ok=False, error=msg[-500:],
+                                    error_class=cls, burn_attempt=False)
 
     choices = tuple(skus) if len(tuple(skus)) > 1 else ()
     spec = LaunchSpec(
