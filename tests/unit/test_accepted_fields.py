@@ -317,6 +317,116 @@ def test_drain_enforces_corr_gate():
         )
 
 
+# ── unpartnered-channel enforce gate ─────────────────────────────────────────
+
+
+def _partner_cfg(mode: str, frac: float = 0.5) -> GeneratorConfig:
+    return GeneratorConfig(
+        corpus_n_series=1, min_length=10, max_length=200, max_total_points=100_000,
+        max_generate_seconds=10, max_memory_mb=256, max_channels=2,
+        unpartnered_mode=mode, max_unpartnered_frac=frac,
+    )
+
+
+def _glued(rng, n: int = 200) -> np.ndarray:
+    # Two unrelated random walks stacked on the channel axis.
+    return np.ascontiguousarray(rng.standard_normal((2, n)).cumsum(axis=1))
+
+
+def _coupled(rng, n: int = 200) -> np.ndarray:
+    drive = rng.standard_normal(n)
+    own = rng.standard_normal((2, n))
+    return np.ascontiguousarray((0.8 * drive + 0.6 * own).cumsum(axis=1))
+
+
+def test_unpartnered_gate_off_and_shadow_do_nothing():
+    from cascade.trainer.channel_stats import corr_enforce_gate
+
+    assert corr_enforce_gate(_partner_cfg("off")) is None
+    assert corr_enforce_gate(_partner_cfg("shadow")) is None
+
+
+def test_unpartnered_gate_rejects_glued_rows_after_warmup():
+    from cascade.trainer.channel_stats import corr_enforce_gate
+
+    gate = corr_enforce_gate(_partner_cfg("enforce"))
+    rng = np.random.default_rng(0)
+    for i in range(63):                   # below the 64-series warmup: judged later
+        gate(_glued(rng), i)
+    with pytest.raises(ValueError, match="max_unpartnered_frac"):
+        gate(_glued(rng), 63)
+
+
+def test_unpartnered_gate_passes_coupled_channels():
+    from cascade.trainer.channel_stats import corr_enforce_gate
+
+    gate = corr_enforce_gate(_partner_cfg("enforce"))
+    rng = np.random.default_rng(1)
+    for i in range(300):
+        gate(_coupled(rng), i)
+
+
+def test_unpartnered_gate_admits_lagged_coupling():
+    # Channel 1 follows channel 0's innovations 12 steps late: honest lagged
+    # coupling that a lag-0 read would reject.
+    from cascade.trainer.channel_stats import corr_enforce_gate
+
+    gate = corr_enforce_gate(_partner_cfg("enforce"))
+    rng = np.random.default_rng(5)
+    for i in range(200):
+        drive = rng.standard_normal(200)
+        lagged = np.concatenate([rng.standard_normal(12), drive[:-12]])
+        arr = np.stack([drive.cumsum(), (lagged + 0.5 * rng.standard_normal(200)).cumsum()])
+        gate(np.ascontiguousarray(arr), i)
+
+
+def test_unpartnered_gate_tolerates_a_fraction_under_the_bar():
+    # 40% glued, 60% coupled: under a 0.5 bar the run is admitted.
+    from cascade.trainer.channel_stats import corr_enforce_gate
+
+    gate = corr_enforce_gate(_partner_cfg("enforce", frac=0.5))
+    rng = np.random.default_rng(2)
+    for i in range(300):
+        gate(_glued(rng) if i % 5 < 2 else _coupled(rng), i)
+
+
+def test_unpartnered_gate_ignores_univariate_series():
+    from cascade.trainer.channel_stats import corr_enforce_gate
+
+    gate = corr_enforce_gate(_partner_cfg("enforce", frac=0.0))
+    rng = np.random.default_rng(3)
+    for i in range(200):
+        gate(np.atleast_2d(rng.standard_normal(200).cumsum()), i)
+
+
+def test_drain_enforces_unpartnered_gate():
+    from cascade.trainer.channel_stats import corr_enforce_gate
+
+    rng = np.random.default_rng(4)
+    items = [_glued(rng) for _ in range(80)]
+    with pytest.raises(ValueError, match="max_unpartnered_frac"):
+        drain_generator(
+            _Gen(items=items), 80, max_channels=2,
+            extra_series_check=corr_enforce_gate(_partner_cfg("enforce")), **KW
+        )
+
+
+def test_chain_ships_unpartnered_gate_off_and_rejects_typos(tmp_path):
+    from pathlib import Path
+
+    from cascade.shared.config import load_chain_config
+
+    shipped = Path(__file__).resolve().parents[2] / "chain.toml"
+    g = load_chain_config(shipped).generator
+    assert g.unpartnered_mode == "off"
+    assert g.max_unpartnered_frac == 0.5
+    bad = tmp_path / "chain.toml"
+    bad.write_text(shipped.read_text().replace(
+        'unpartnered_mode     = "off"', 'unpartnered_mode     = "enfroce"'))
+    with pytest.raises(ValueError, match="unpartnered_mode"):
+        load_chain_config(bad)
+
+
 # ── trainer consumption (torch) ──────────────────────────────────────────────
 
 
