@@ -53,6 +53,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ..shared.era import promotion_install_block, reign_anchor
 from ..shared.promotion import (
     PromotedMember,
     PromotionRecord,
@@ -297,6 +298,11 @@ class TrainerPromotion:
     member_meta: dict[str, Candidate] = field(default_factory=dict)
     king_hotkey: str | None = None
     reign_start_block: int | None = None
+    # Block the live generation is (or will be) INSTALLED by validators — the
+    # start of its effective era (``promotion_install_block``). Validators
+    # reset the reign clock there, so the trainer's anchor never precedes it
+    # (``reign_anchor``). ``None`` = pre-era generation / unknown.
+    live_install_block: int | None = None
     candidates: tuple[Candidate, ...] = ()
     # The last fired promotion's record, held (and persisted) until the caller
     # confirms it published: state advances at fire time, so a publish failure
@@ -348,6 +354,8 @@ class TrainerPromotion:
         self.king_hotkey = obj.get("king_hotkey") or None
         rsb = obj.get("reign_start_block")
         self.reign_start_block = None if rsb is None else int(rsb)
+        lib = obj.get("live_install_block")
+        self.live_install_block = None if lib is None else int(lib)
         self.candidates = tuple(
             _candidate_from_json(c) for c in (obj.get("candidates") or ())
         )
@@ -448,10 +456,14 @@ class TrainerPromotion:
         with self._lock:
             if king_hotkey != self.king_hotkey:
                 self.king_hotkey = king_hotkey
-                self.reign_start_block = int(epoch_block)
+                # A crowning BEFORE the live generation's install is reset
+                # again by validators at the install (DEC-CA-0050 carries the
+                # staged generation across the dethrone).
+                self.reign_start_block = reign_anchor(
+                    crown_block=int(epoch_block), install_block=self.live_install_block)
                 self.candidates = ()
                 log.info("trainer promotion: reign clock reset for king %s at block %d",
-                         (king_hotkey or "?")[:12], int(epoch_block))
+                         (king_hotkey or "?")[:12], int(self.reign_start_block))
             elif self.reign_start_block is None and king_hotkey is not None:
                 self.reign_start_block = int(epoch_block)
             self._persist()
@@ -618,7 +630,16 @@ class TrainerPromotion:
         )
         self.member_meta = {c.checkpoint_id: c for c in selected}
         self.candidates = ()
-        self.reign_start_block = int(epoch_block)
+        # Validators reset the clock where they INSTALL this generation (its
+        # effective era's start), not at this fire — anchoring here would
+        # ripen the next generation a full notice era early and every
+        # attesting validator would ignore it (2026-10-17 gen-15 split).
+        install = (promotion_install_block(self.round_cfg, int(effective_era or 0),
+                                           fired_block=int(epoch_block))
+                   if self.round_cfg is not None else None)
+        self.live_install_block = install
+        self.reign_start_block = reign_anchor(crown_block=int(epoch_block),
+                                              install_block=install)
         record = PromotionRecord(
             generation=self.generation,
             king_hotkey=self.king_hotkey or "",
@@ -632,12 +653,38 @@ class TrainerPromotion:
         self._write_pointer()
         log.info(
             "PROMOTION fired: generation=%d reign=%.2f rounds members=[%s]; "
-            "king %s persists, reign clock reset",
+            "king %s persists, reign clock reset to block %d (validator install)",
             self.generation, elapsed,
             ", ".join(f"{m.checkpoint_id} ({m.score:.5f})" for m in self.members),
-            (self.king_hotkey or "?")[:12],
+            (self.king_hotkey or "?")[:12], int(self.reign_start_block),
         )
         return record
+
+    def withdraw_to(self, prev_record: PromotionRecord, *, reign_start_block: int,
+                    install_block: int | None = None) -> None:
+        """Owner-run recovery (trainer STOPPED): undo a fired-but-rejected
+        generation and return the engine to ``prev_record``'s generation, its
+        members, a cleared candidate log (the boundary replay re-ingests the
+        reign's bench reports), no pending record, and the reign clock at
+        ``reign_start_block`` — the anchor the VALIDATORS hold (their
+        ``cascade_state.json``), so the next fire is judged ripe on their
+        clock. Carried members' selection metadata is kept."""
+        with self._lock:
+            if int(prev_record.generation) != self.generation - 1:
+                raise ValueError(
+                    f"withdraw_to gen {prev_record.generation} from engine gen "
+                    f"{self.generation}: not the previous generation")
+            ids = {m.checkpoint_id for m in prev_record.members}
+            self.generation = int(prev_record.generation)
+            self.members = tuple(prev_record.members)
+            self.member_meta = {k: v for k, v in self.member_meta.items() if k in ids}
+            self.candidates = ()
+            self.pending_record = None
+            self.reign_start_block = int(reign_start_block)
+            self.live_install_block = (int(install_block) if install_block is not None
+                                       else int(reign_start_block))
+            self._persist()
+            self._write_pointer()
 
     def _member_candidate(self, m: PromotedMember) -> Candidate:
         """The live member as a selection candidate: its recorded selection
@@ -710,6 +757,7 @@ class TrainerPromotion:
             "members": [member_to_json(m) for m in self.members],
             "king_hotkey": self.king_hotkey,
             "reign_start_block": self.reign_start_block,
+            "live_install_block": self.live_install_block,
             "candidates": [_candidate_to_json(c) for c in self.candidates],
             "member_meta": [_candidate_to_json(c) for c in self.member_meta.values()],
             "pending_record": None if self.pending_record is None else {
