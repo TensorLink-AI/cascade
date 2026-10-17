@@ -269,7 +269,7 @@ class _NDReg:
             return self.matched, NEAR_DUP_TIER, self.mode == "enforce"
         return None
 
-    def near_dup_verdict(self, ref, *, hotkey, commit_block):
+    def near_dup_verdict(self, ref, *, hotkey, commit_block, coldkey=None):
         return (self.matched, 0.991, self.mode) if hotkey == "BRAV" else None
 
 

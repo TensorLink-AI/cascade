@@ -1084,8 +1084,16 @@ class RoundConfig:
     # registry). Also re-checked at rent time for legs with no live pod.
     near_dup_mode: str = "off"
     near_dup_threshold: float = 0.97
+    # Lookback in ERAS (era = epoch_blocks x era_settlements at the commit
+    # block — not settlements); 0 = no lookback limit.
     near_dup_lookback_eras: int = 4
     near_dup_min_private_shingles: int = 200
+    # Same-coldkey rule: two entries on ONE coldkey are compared on their FULL
+    # signatures (public lineage NOT subtracted) — one operator submitting
+    # near-identical trees under several hotkeys is variant spraying even
+    # when both are ~all published-champion code. Cross-coldkey pairs keep
+    # the private-only comparison (building on the king stays legitimate).
+    near_dup_same_coldkey: bool = False
     # 0 = every screened entrant seats; the provisioner sizes the final fleet
     # to fit the field inside the epoch (legs queue on each lane, see
     # duel_waves_that_fit) up to its pod ceiling, and the trainer seats what
@@ -3014,9 +3022,10 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
                 str(r.get("near_dup_mode", "off")), "near_dup_mode"),
             near_dup_threshold=_unit_interval(
                 r.get("near_dup_threshold", 0.97), "near_dup_threshold"),
-            near_dup_lookback_eras=max(1, int(r.get("near_dup_lookback_eras", 4) or 4)),
+            near_dup_lookback_eras=max(0, int(r.get("near_dup_lookback_eras", 4))),
             near_dup_min_private_shingles=max(
                 0, int(r.get("near_dup_min_private_shingles", 200))),
+            near_dup_same_coldkey=bool(r.get("near_dup_same_coldkey", False)),
             duel_field_cap=validate_duel_field_cap(r.get("duel_field_cap", 0)),
             duel_seat_all=bool(r.get("duel_seat_all", True)),
             one_submission_per_hotkey=bool(r.get("one_submission_per_hotkey", True)),
