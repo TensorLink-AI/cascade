@@ -644,6 +644,22 @@ class FundedQueue:
                 self._save(entries)
             return touched
 
+    def note(self, hotkey: str, *, error: str, error_class: str) -> bool:
+        """Record WHY a still-``queued`` entry is waiting (e.g. ``deferred`` by
+        the coldkey cap) without changing its state or attempts — the roster
+        and ``cascade queue`` then show a reason instead of a bare wait.
+        Returns whether an entry was updated."""
+        with self._locked() as entries:
+            e = entries.get(hotkey)
+            if e is None or e.status != "queued":
+                return False
+            if e.last_error == error[:500] and e.last_error_class == error_class:
+                return False
+            entries[hotkey] = replace(e, last_error=error[:500],
+                                      last_error_class=error_class)
+            self._save(entries)
+            return True
+
     def fail(self, hotkey: str, *, error: str, error_class: str = "",
              expect_ref: str | None = None) -> bool:
         """Terminal failure (e.g. an auth-class key the miner must replace).

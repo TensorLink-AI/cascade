@@ -1453,6 +1453,17 @@ class RollingScheduler:
             logged.add((gen.hotkey, int(era_index)))
             log.warning("rolling: %s deferred — coldkey_cap (%s holds %d/%d legs in era %d)",
                         gen.hotkey[:12], ck[:12], n, cap, int(era_index))
+            # Visible to the miner (`cascade queue`): the entry stays queued
+            # and unburned, with the reason on record instead of a bare wait.
+            q = self.ops.queue()
+            note = getattr(q, "note", None)
+            if callable(note):
+                try:
+                    note(gen.hotkey, error=f"deferred: coldkey {ck} already has {n} leg(s) "
+                         f"in era {int(era_index)} (max_inflight_per_coldkey={cap})",
+                         error_class="deferred")
+                except Exception as e:  # noqa: BLE001 — a note never blocks admission
+                    log.debug("rolling: deferral note for %s failed (%s)", gen.hotkey[:12], e)
         return True
 
     def rent_veto(self, hotkey: str, ref: str, *, started) -> tuple[str, str, bool] | None:
@@ -1489,7 +1500,7 @@ class RollingScheduler:
 
             try:
                 cb = _commit_block(history, hotkey, ref) or int(getattr(e, "reveal_block", 0) or 0)
-                v = reg.near_dup_verdict(ref, hotkey=hotkey, commit_block=cb)
+                v = reg.near_dup_verdict(ref, hotkey=hotkey, commit_block=cb, coldkey=ck)
             except Exception as ex:  # noqa: BLE001 — fail open
                 log.warning("rolling: near-duplicate re-check failed for %s (%s); leg proceeds",
                             hotkey[:12], ex)

@@ -74,11 +74,28 @@ class DedupRegistry:
         rnd = getattr(getattr(self.r, "cfg", None), "round", None)
         return int(getattr(rnd, "near_dup_min_private_shingles", 200))
 
-    def _nd_lookback_blocks(self) -> int:
+    def _nd_lookback_blocks(self, block: int = 0) -> int | None:
+        """The lookback window in BLOCKS at ``block``: ``near_dup_lookback_eras``
+        ERAS (``epoch_blocks × era_settlements`` in force there — after the
+        900-block grid switch an era is 3600 blocks, not one settlement).
+        ``None`` = no limit (``near_dup_lookback_eras = 0``)."""
         cfg = getattr(self.r, "cfg", None)
         rnd = getattr(cfg, "round", None)
-        eras = int(getattr(rnd, "near_dup_lookback_eras", 4) or 4)
-        return eras * int(getattr(rnd, "epoch_blocks", 3600) or 3600)
+        eras = int(getattr(rnd, "near_dup_lookback_eras", 4))
+        if eras <= 0:
+            return None
+        try:
+            from ..shared.era import era_length_blocks
+
+            era = int(era_length_blocks(rnd, int(block or 0)))
+        except Exception:  # noqa: BLE001 — partial configs (tests): the grid alone
+            era = int(getattr(rnd, "epoch_blocks", 3600) or 3600) * max(
+                1, int(getattr(rnd, "era_settlements", 0) or 0))
+        return eras * era
+
+    def _nd_same_coldkey(self) -> bool:
+        rnd = getattr(getattr(self.r, "cfg", None), "round", None)
+        return bool(getattr(rnd, "near_dup_same_coldkey", False))
 
     # ── persistence ──────────────────────────────────────────────────────────
 
@@ -237,7 +254,8 @@ class DedupRegistry:
                     u |= sig
         return frozenset(u)
 
-    def match_near_dup(self, ref: str, *, hotkey: str, commit_block: int
+    def match_near_dup(self, ref: str, *, hotkey: str, commit_block: int,
+                       coldkey: str | None = None
                        ) -> tuple[str, float, int, str] | None:
         """``(hotkey, J, commit_block, ref)`` of the earliest-committed OTHER
         hotkey's registered queue entry whose private signature is at least
@@ -253,8 +271,22 @@ class DedupRegistry:
             return None
         thr, min_priv = self._nd_threshold(), self._nd_min_private()
         public = self._nd_public()
-        lo = int(commit_block) - self._nd_lookback_blocks() if commit_block else None
+        span = self._nd_lookback_blocks(int(commit_block or 0))
+        lo = int(commit_block) - span if (commit_block and span is not None) else None
         me = (int(commit_block or 0), hotkey)
+        my_ck = coldkey or (self.entries.get(ref) or {}).get("coldkey") or None
+        same_ck = self._nd_same_coldkey() and bool(my_ck)
+        if len(mine - public) < min_priv:
+            # Mostly published lineage: the private-only comparison has
+            # nothing to compare (fail open) — say so, once per ref, so a
+            # silent pass is visible in the log.
+            seen = self.__dict__.setdefault("_nd_lineage_logged", set())
+            if ref not in seen:
+                seen.add(ref)
+                log.info("dedup registry: %s is mostly public lineage (%d private shingles "
+                         "< %d) — cross-coldkey near-duplicate check not applicable%s",
+                         hotkey[:12], len(mine - public), min_priv,
+                         "; same-coldkey full check applies" if same_ck else "")
         best = None
         for their_ref, rec in self.entries.items():
             their_hk = str(rec.get("hotkey") or "")
@@ -268,7 +300,13 @@ class DedupRegistry:
             theirs = self.nd_sig(their_ref)
             if not theirs or min(len(mine), len(theirs)) < thr * max(len(mine), len(theirs)):
                 continue      # Jaccard <= size ratio: cannot reach the threshold
-            j = private_jaccard(mine, theirs, public, min_private=min_priv)
+            if same_ck and rec.get("coldkey") == my_ck:
+                # One operator, two hotkeys: the FULL trees are compared —
+                # sharing the public lineage is no excuse within a coldkey.
+                union = len(mine | theirs)
+                j = (len(mine & theirs) / union) if union else None
+            else:
+                j = private_jaccard(mine, theirs, public, min_private=min_priv)
             if j is None or j < thr:
                 continue
             cand = (cb, their_hk, j, their_ref)
@@ -278,7 +316,8 @@ class DedupRegistry:
             return None
         return best[1], best[2], best[0], best[3]
 
-    def near_dup_verdict(self, ref: str, *, hotkey: str, commit_block: int
+    def near_dup_verdict(self, ref: str, *, hotkey: str, commit_block: int,
+                         coldkey: str | None = None
                          ) -> tuple[str, float, str] | None:
         """Rent-time re-check for a leg admitted earlier (or re-attached after
         a restart): ``(matched hotkey, J, mode)`` when ``ref`` near-duplicates
@@ -289,7 +328,8 @@ class DedupRegistry:
         self.backfill_nd()
         if self.nd_sig(ref) is None:
             self.compute_nd_sig(ref)
-        hit = self.match_near_dup(ref, hotkey=hotkey, commit_block=commit_block)
+        hit = self.match_near_dup(ref, hotkey=hotkey, commit_block=commit_block,
+                                  coldkey=coldkey)
         if hit is None:
             return None
         return hit[0], hit[1], mode
@@ -583,7 +623,8 @@ class DedupRegistry:
         nd_mode = self._nd_mode()
         if nd_mode in ("shadow", "enforce"):
             self.backfill_nd()
-            nd = self.match_near_dup(gen.ref, hotkey=gen.hotkey, commit_block=my_block)
+            nd = self.match_near_dup(gen.ref, hotkey=gen.hotkey, commit_block=my_block,
+                                     coldkey=coldkey)
             if nd is not None:
                 log.warning("rolling: near-duplicate %s — %s of %s (J=%.3f, earlier commit "
                             "%d) [%s]", "refused" if nd_mode == "enforce" else "shadow",
