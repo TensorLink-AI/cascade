@@ -496,6 +496,11 @@ class LegOps:
                      era: EraState) -> tuple[str, dict | None]:
         return self.r._rolling_verify_payer(entry, payer, king, era)
 
+    def note_payer_reported(self, pointer: str) -> None:
+        note = getattr(self.r, "_note_payer_reported", None)
+        if note is not None:
+            note(pointer)
+
     def leg_failure(self, hotkey: str) -> tuple[str, bool, str, bool]:
         return self.r._funded_leg_failures.get(
             hotkey, ("challenger leg failed before dispatch", False, "infra", True))
@@ -2083,11 +2088,29 @@ class RollingScheduler:
             if len(keep) != len(self.state.verify_queue):
                 self.state.verify_queue = keep
                 self._save()
+            if keep and bool(getattr(getattr(self.cfg, "telemetry", None),
+                                     "funded_bench_unverified", False)):
+                # Verification is off: every queued payer number publishes as
+                # reported (no king-pod re-bench). Never touches a running
+                # verification (returned above while its thread is alive).
+                drain = [dict(q) for q in keep]
+            else:
+                drain = []
             cur = self.state.current
             king = cur.king() if cur is not None else None
-            if not keep or king is None:
+            if not drain and (not keep or king is None):
                 return
-            item = dict(keep[0])
+            item = dict(keep[0]) if keep else None
+        if drain:
+            for q in drain:
+                note = getattr(self.ops, "note_payer_reported", None)
+                if note is not None:
+                    note(q["pointer"])
+                log.info("rolling: %s's queued payer-pod bench published as reported "
+                         "(verification skipped: [telemetry] funded_bench_unverified)",
+                         q["hotkey"][:12])
+                self._apply_verify(q["pointer"], "ok", dict(q["payer"]))
+            return
 
         def _run() -> None:
             entry = _entry_from_json(item["entry"])

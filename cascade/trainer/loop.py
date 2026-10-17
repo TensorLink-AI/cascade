@@ -6489,7 +6489,6 @@ class TrainerRunner:
         from ..shared.bench_report import (
             BenchEntry,
             BenchReport,
-            dump_bench_report,
             publish_bench_report,
             sign_bench_report,
         )
@@ -6531,7 +6530,7 @@ class TrainerRunner:
         else:
             log.warning("publishing an UNSIGNED bench report (no wallet); "
                         "validators will ignore it")
-        key = publish_bench_report(self.manifest_store(), dump_bench_report(report),
+        key = publish_bench_report(self.manifest_store(), self._dump_bench_with_provenance(report),
                                    manifest.round_id)
         log.info("published bench report round=%s roles=[%s] signed=%s → s3://%s/%s",
                  manifest.round_id, ", ".join(e.role for e in entries),
@@ -6652,6 +6651,12 @@ class TrainerRunner:
         """
         payer = {p for p in getattr(self, "_payer_benched", ()) if p in scored}
         if not payer:
+            return scored
+        if bool(getattr(self.cfg.telemetry, "funded_bench_unverified", False)):
+            for p in sorted(payer):
+                self._note_payer_reported(p)
+            log.info("round=%s: %d payer-pod bench(es) published as reported (verification "
+                     "skipped: [telemetry] funded_bench_unverified)", round_id, len(payer))
             return scored
         from ..eval.benchmarks import extract_bench_scores
         from ..validator.cascade import cascade_score
@@ -8610,6 +8615,12 @@ class TrainerRunner:
         from .rolling import VERIFY_PENDING
 
         payer = dataclasses.asdict(scores)
+        if bool(getattr(self.cfg.telemetry, "funded_bench_unverified", False)):
+            self._note_payer_reported(entry.trained_pointer)
+            log.info("round=%s: payer-pod bench for %s published as reported (verification "
+                     "skipped: [telemetry] funded_bench_unverified)", era.base_seed,
+                     entry.miner_hotkey[:12])
+            return payer
         if int(getattr(self.cfg.telemetry, "funded_bench_verify_top", 1)) <= 0:
             log.info("round=%s: payer-pod bench for %s unverified (verification off) — "
                      "not published", era.base_seed, entry.miner_hotkey[:12])
@@ -8625,6 +8636,50 @@ class TrainerRunner:
         if status == "forged":
             return None
         return {VERIFY_PENDING: {**payer, "_reason": f"verification {status}"}}
+
+    # ── payer-reported bench provenance ([telemetry] funded_bench_unverified) ──
+
+    def _payer_reported_path(self):
+        from pathlib import Path
+
+        return Path(self.work_root) / "payer_reported_benches.json"
+
+    def _payer_reported_pointers(self) -> set[str]:
+        try:
+            return set(json.loads(self._payer_reported_path().read_text("utf-8")))
+        except Exception:  # noqa: BLE001 — missing/torn ⇒ none recorded
+            return set()
+
+    def _note_payer_reported(self, pointer: str) -> None:
+        """Remember that ``pointer``'s bench numbers are the payer's own
+        (unverified), so every report carrying them says so. Best-effort."""
+        with contextlib.suppress(Exception):
+            known = self._payer_reported_pointers()
+            if pointer in known:
+                return
+            known.add(str(pointer))
+            path = self._payer_reported_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(sorted(known)), encoding="utf-8")
+            tmp.replace(path)
+
+    def _dump_bench_with_provenance(self, report) -> str:
+        """``dump_bench_report`` plus, when the report carries payer-reported
+        (unverified) numbers, an UNSIGNED top-level ``payer_reported_pointers``
+        list. The signed canonical body is untouched — every loader ignores the
+        extra key and verifies the signature exactly as before — and a report
+        with no such entries is byte-identical to the plain dump."""
+        from ..shared.bench_report import dump_bench_report
+
+        text = dump_bench_report(report)
+        known = self._payer_reported_pointers()
+        mine = sorted({e.trained_pointer for e in report.entries} & known) if known else []
+        if not mine:
+            return text
+        obj = json.loads(text)
+        obj["payer_reported_pointers"] = mine
+        return json.dumps(obj, indent=2, sort_keys=True)
 
     def _rolling_verify_host(self, king, era):
         contract = self.cfg.throne_contracts()[0]
@@ -8688,7 +8743,6 @@ class TrainerRunner:
         from ..shared.bench_report import (
             BenchEntry,
             BenchReport,
-            dump_bench_report,
             publish_bench_report,
             sign_bench_report,
         )
@@ -8702,7 +8756,7 @@ class TrainerRunner:
                              entries=entries)
         if self.wallet is not None:
             report = sign_bench_report(report, self.wallet)
-        key = publish_bench_report(self.manifest_store(), dump_bench_report(report), round_id)
+        key = publish_bench_report(self.manifest_store(), self._dump_bench_with_provenance(report), round_id)
         log.info("published bench report round=%s roles=[%s] signed=%s → s3://%s/%s",
                  round_id, ", ".join(e.role for e in entries), report.signature is not None,
                  self.cfg.storage.manifest_bucket, key)

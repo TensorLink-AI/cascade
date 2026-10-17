@@ -2226,6 +2226,51 @@ def test_king_pod_is_kept_while_a_verification_is_queued(cfg, tmp_path):
     assert ops.released.count(idx) == 1             # drained: released
 
 
+class _NotingVerifyOps(_VerifyOps):
+    def __init__(self, tmp_path, clock):
+        super().__init__(tmp_path, clock)
+        self.payer_reported: list[str] = []
+
+    def note_payer_reported(self, pointer):
+        self.payer_reported.append(pointer)
+
+
+def test_unverified_mode_publishes_queued_payer_numbers_and_frees_the_pod(cfg, tmp_path):
+    """Owner 2026-10-17 ([telemetry] funded_bench_unverified): a queued payer
+    bench is published AS REPORTED — no king-pod re-bench — and the drained
+    queue lets the era king pod go."""
+    armed = _armed(cfg)
+    clock = Clock()
+    ops = _NotingVerifyOps(tmp_path, clock)
+    sched, _ = _sched(armed, tmp_path, clock, ops=ops)
+    client = FakeClient()
+    q = ops.queue()
+    b0 = armed.round.rolling_from_block + 5
+    ops.hold_kings = {"KING"}
+    ops.commits.append(_commit("ALFA", REF["ALFA"], b0 - 100))
+    q.add("ALFA", REF["ALFA"], reveal_block=b0 - 100)
+    sched.tick(client, b0)
+    end = time.time() + 10
+    while "ALFA" in sched._threads and time.time() < end:
+        time.sleep(0.01)
+    assert [x["hotkey"] for x in sched.state.verify_queue] == ["ALFA"]
+    payer = dict(sched.state.verify_queue[0]["payer"])
+    idx = sched.state.current.index
+    sched.cfg = replace(sched.cfg, telemetry=replace(sched.cfg.telemetry,
+                                                     funded_bench_unverified=True))
+    ops.king_gate.set()
+    _join(sched)
+    sched.tick(client, b0 + 1)
+    _wait_verify(sched)
+    assert ops.verify_calls == []                       # never re-benched
+    assert sched.state.verify_queue == []
+    f = next(x for x in sched.state.finished if x.hotkey == "ALFA")
+    assert f.bench == payer                             # the payer's own numbers
+    assert ops.payer_reported == [f.entry["trained_pointer"]]
+    sched.tick(client, b0 + 2)
+    assert ops.released.count(idx) == 1                 # nothing left to verify: released
+
+
 def test_king_pod_that_cannot_bench_is_released_despite_queued_verifications(cfg, tmp_path):
     """2026-10-04: the era-2559 king pod (driver 570) could not bench; queued
     verifications must not pin an idle GPU — they wait for the next pod."""

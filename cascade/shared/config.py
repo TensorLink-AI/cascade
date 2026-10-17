@@ -2086,6 +2086,14 @@ class TelemetryConfig:
     funded_bench: bool = True
     funded_bench_verify_top: int = 1
     funded_bench_verify_tolerance: float = 0.02
+    # Owner 2026-10-17: publish payer-pod numbers WITHOUT the operator's
+    # king-pod re-bench (each re-bench held the operator's king pod ~50 min,
+    # most of them for near-duplicate spray legs). The numbers are signed as
+    # reported — a payer can forge a score to win a promotion-pool seat
+    # (accepted). Published reports list such pointers under the UNSIGNED
+    # top-level `payer_reported_pointers` key (the signed body is unchanged,
+    # so every validator release verifies the report as before).
+    funded_bench_unverified: bool = False
 
 
 @dataclass(frozen=True)
@@ -3251,6 +3259,7 @@ def load_chain_config(path: Path | str | None = None) -> ChainConfig:
             funded_bench_verify_top=int(tm.get("funded_bench_verify_top", 1)),
             funded_bench_verify_tolerance=float(
                 tm.get("funded_bench_verify_tolerance", 0.02)),
+            funded_bench_unverified=bool(tm.get("funded_bench_unverified", False)),
         ),
         activation=ActivationConfig(
             feature=str(ac.get("feature", "") or "").strip(),
