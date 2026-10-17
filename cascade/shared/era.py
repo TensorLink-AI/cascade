@@ -194,6 +194,32 @@ def min_effective_era(round_cfg: RoundConfig, created_block: int) -> int:
     return era_index_of(round_cfg, created_block) + 2
 
 
+def promotion_install_block(round_cfg: RoundConfig, effective_era: int, *,
+                            fired_block: int) -> int | None:
+    """Block at which validators INSTALL an era-effective promotion: the start
+    of its ``effective_era`` (``EraSpec.start_block`` = index × era length).
+    The validator's era gate installs a staged promotion at the first handled
+    settlement of that era and re-crowns the persisting king there with a
+    FRESH reign clock (``_install_era_promotion`` → ``note_promotion`` with
+    ``era.start_block``) — not at the block the trainer fired it. ``None`` for
+    a pre-era record (``effective_era`` 0: installed at acceptance)."""
+    if int(effective_era or 0) <= 0:
+        return None
+    return int(effective_era) * era_length_blocks(round_cfg, int(fired_block))
+
+
+def reign_anchor(*, crown_block: int | None, install_block: int | None) -> int | None:
+    """The reign clock's anchor as a validator holds it: the LATER of the
+    king's crowning and the live generation's install, because both reset the
+    clock (``crown`` at the verdict, ``accept_promotion`` at the install). A
+    trainer that anchors anywhere earlier ripens early, and every attesting
+    validator then ignores its record forever (ripeness is judged at the
+    record's ``fired_block``) — the 2026-09-25 gen-12 and 2026-10-17 gen-15
+    clock splits."""
+    blocks = [int(b) for b in (crown_block, install_block) if b is not None]
+    return max(blocks) if blocks else None
+
+
 def member_index_for_era(era_index: int, k: int) -> int:
     """DEC-CA-0013's ``epoch_index % k`` rotation, re-keyed on the era."""
     return int(era_index) % max(1, int(k))
