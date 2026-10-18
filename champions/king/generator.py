@@ -5,6 +5,103 @@ from pathlib import Path
 
 import numpy as np
 
+_FC_M32 = 0xFFFFFFFF
+
+def _fc_words(v):
+    v = int(v)
+    if v < 0:
+        raise ValueError("negative entropy")
+    if v == 0:
+        return [0]
+    out = []
+    while v > 0:
+        out.append(v & _FC_M32)
+        v >>= 32
+    return out
+
+class _FastCoin:
+
+    __slots__ = ("_pool", "_hc", "_cache")
+
+    def __init__(self, entropy):
+        run = []
+        for e in entropy:
+            run += _fc_words(e)
+        if len(run) < 4:
+            run += [0] * (4 - len(run))
+        hc = 0x43B0D7E5
+        pool = []
+        for i in range(4):
+            v = (run[i] ^ hc) & _FC_M32
+            hc = (hc * 0x931E8875) & _FC_M32
+            v = (v * hc) & _FC_M32
+            pool.append(v ^ (v >> 16))
+        for s in range(4):
+            for d in range(4):
+                if s != d:
+                    v = (pool[s] ^ hc) & _FC_M32
+                    hc = (hc * 0x931E8875) & _FC_M32
+                    v = (v * hc) & _FC_M32
+                    v ^= v >> 16
+                    r = (0xCA01F9DD * pool[d] - 0x4973F715 * v) & _FC_M32
+                    pool[d] = r ^ (r >> 16)
+        for s in range(4, len(run)):
+            for d in range(4):
+                v = (run[s] ^ hc) & _FC_M32
+                hc = (hc * 0x931E8875) & _FC_M32
+                v = (v * hc) & _FC_M32
+                v ^= v >> 16
+                r = (0xCA01F9DD * pool[d] - 0x4973F715 * v) & _FC_M32
+                pool[d] = r ^ (r >> 16)
+        self._pool = tuple(pool)
+        self._hc = hc
+        self._cache = {}
+
+    def _consts(self, n_spawn):
+        c = self._cache.get(n_spawn)
+        if c is None:
+            hc = self._hc
+            seq = []
+            for _ in range(4 * n_spawn):
+                a = hc
+                hc = (hc * 0x931E8875) & _FC_M32
+                seq.append((a, hc))
+            hb = 0x8B51F9DD
+            out = []
+            for _ in range(8):
+                a = hb
+                hb = (hb * 0x58F38DED) & _FC_M32
+                out.append((a, hb))
+            c = (tuple(seq), tuple(out))
+            self._cache[n_spawn] = c
+        return c
+
+_FC_POOL = {}
+
+def _fcx_get(seed, tag):
+    key = (seed, tag)
+    e = _FC_POOL.get(key)
+    if e is None:
+        c = _FastCoin([seed, tag])
+        seq, outc = c._consts(1)
+        e = (c, np.array(c._pool, dtype=np.uint64), np.array(seq, dtype=np.uint64).reshape(4, 2),
+             np.array(outc, dtype=np.uint64).reshape(8, 2))
+        _FC_POOL[key] = e
+    return e
+
+def _fcx_coin(seed, tag, i):
+    if type(seed) is int and type(tag) is int and type(i) is int and seed >= 0 and tag >= 0 and 0 <= i <= _FC_M32:
+        c, p, q, o = _fcx_get(seed, tag)
+        return _fcx_nb_one(p, q, o, i)
+    return np.random.default_rng(np.random.SeedSequence([seed, tag], spawn_key=(i,))).random()
+
+def _fcx_coins(seed, tag, i, size):
+    if (type(seed) is int and type(tag) is int and type(i) is int and type(size) is int and seed >= 0 and tag >= 0
+            and 0 <= i <= _FC_M32 and size >= 0):
+        c, p, q, o = _fcx_get(seed, tag)
+        return _fcx_nb_many(p, q, o, i, size)
+    return np.random.default_rng(np.random.SeedSequence([seed, tag], spawn_key=(i,))).random(size)
+
 from cascade.interface import DataGenerator
 
 import os as _h393_os
@@ -24,6 +121,248 @@ from threading import Event, Lock, Thread, local
 from typing import Any
 
 from numba import njit
+
+@njit(cache=False, fastmath=False, nogil=True)
+def _v2_ar1_fill(y, p):
+    n = y.shape[0]
+    k = 1
+    while k < n and abs(p) > 1e-12:
+        for t in range(n - 1, k - 1, -1):
+            y[t] = y[t] + p * y[t - k]
+        p = p * p
+        k *= 2
+
+@njit(cache=False, fastmath=False, nogil=True)
+def _v2_all_finite(a):
+    for k in range(a.shape[0]):
+        if not np.isfinite(a[k]):
+            return False
+    return True
+
+@njit(cache=False, fastmath=False, nogil=True)
+def _v2_all_equal_first(a):
+    v = a[0]
+    for k in range(a.shape[0]):
+        if not (a[k] == v):
+            return False
+    return True
+
+@njit(cache=False, fastmath=False, nogil=True)
+def _v2_pw_block(a, lo, n):
+    if n < 8:
+        res = 0.0
+        for i in range(n):
+            res += a[lo + i]
+        return res
+    r0 = a[lo]; r1 = a[lo + 1]; r2 = a[lo + 2]; r3 = a[lo + 3]
+    r4 = a[lo + 4]; r5 = a[lo + 5]; r6 = a[lo + 6]; r7 = a[lo + 7]
+    i = 8
+    m = n - (n % 8)
+    while i < m:
+        r0 += a[lo + i]; r1 += a[lo + i + 1]; r2 += a[lo + i + 2]; r3 += a[lo + i + 3]
+        r4 += a[lo + i + 4]; r5 += a[lo + i + 5]; r6 += a[lo + i + 6]; r7 += a[lo + i + 7]
+        i += 8
+    res = ((r0 + r1) + (r2 + r3)) + ((r4 + r5) + (r6 + r7))
+    while i < n:
+        res += a[lo + i]
+        i += 1
+    return res
+
+@njit(cache=False, fastmath=False, nogil=True)
+def _v2_pw(a, lo, n):
+    if n <= 128:
+        return _v2_pw_block(a, lo, n)
+    f_lo = np.empty(128, dtype=np.int64)
+    f_n = np.empty(128, dtype=np.int64)
+    f_st = np.empty(128, dtype=np.int64)
+    vs = np.empty(128, dtype=np.float64)
+    sp = 1
+    vp = 0
+    f_lo[0] = lo
+    f_n[0] = n
+    f_st[0] = 0
+    while sp > 0:
+        t = sp - 1
+        lo_ = f_lo[t]
+        n_ = f_n[t]
+        if n_ <= 128:
+            sp -= 1
+            vs[vp] = _v2_pw_block(a, lo_, n_)
+            vp += 1
+        else:
+            n2 = n_ // 2
+            n2 -= n2 % 8
+            st = f_st[t]
+            if st == 0:
+                f_st[t] = 1
+                f_lo[sp] = lo_
+                f_n[sp] = n2
+                f_st[sp] = 0
+                sp += 1
+            elif st == 1:
+                f_st[t] = 2
+                f_lo[sp] = lo_ + n2
+                f_n[sp] = n_ - n2
+                f_st[sp] = 0
+                sp += 1
+            else:
+                sp -= 1
+                vs[vp - 2] = vs[vp - 2] + vs[vp - 1]
+                vp -= 1
+    return vs[0]
+
+@njit(cache=False, fastmath=False, nogil=True)
+def _v2_var_nb(x):
+    n = x.shape[0]
+    m = (0.0 + _v2_pw(x, 0, n)) / n
+    d = np.empty(n, dtype=np.float64)
+    for k in range(n):
+        t = x[k] - m
+        d[k] = t * t
+    return (0.0 + _v2_pw(d, 0, n)) / n
+
+@njit(cache=False, fastmath=False, nogil=True)
+def _v2_mean_nb(x):
+    return (0.0 + _v2_pw(x, 0, x.shape[0])) / x.shape[0]
+
+_V2_F64 = np.dtype(np.float64)
+
+def _v2_ok(x):
+    return type(x) is np.ndarray and x.dtype == _V2_F64 and x.ndim == 1 and x.shape[0] > 0 and x.flags.c_contiguous
+
+def _v2_std(x):
+    if _v2_ok(x):
+        return np.float64(np.sqrt(_v2_var_nb(x)))
+    return np.std(x)
+
+def _v2_var(x):
+    if _v2_ok(x):
+        return np.float64(_v2_var_nb(x))
+    return np.var(x)
+
+def _v2_mean(x):
+    if _v2_ok(x):
+        return np.float64(_v2_mean_nb(x))
+    return np.mean(x)
+
+def _v2_stdm(x):
+    if _v2_ok(x):
+        return np.float64(np.sqrt(_v2_var_nb(x)))
+    return x.std()
+
+def _v2_varm(x):
+    if _v2_ok(x):
+        return np.float64(_v2_var_nb(x))
+    return x.var()
+
+def _v2_meanm(x):
+    if _v2_ok(x):
+        return np.float64(_v2_mean_nb(x))
+    return x.mean()
+
+@njit(cache=False, fastmath=False, nogil=True)
+def _fcx_nb_state(pool, seqc, outc, i):
+    m32 = np.uint64(0xFFFFFFFF)
+    s16 = np.uint64(16)
+    s32 = np.uint64(32)
+    s63 = np.uint64(63)
+    one = np.uint64(1)
+    ml = np.uint64(0xCA01F9DD)
+    mr = np.uint64(0x4973F715)
+    w = np.uint64(i)
+    p0 = pool[0]
+    p1 = pool[1]
+    p2 = pool[2]
+    p3 = pool[3]
+    v = ((w ^ seqc[0, 0]) * seqc[0, 1]) & m32
+    v = v ^ (v >> s16)
+    r = (ml * p0 - mr * v) & m32
+    p0 = r ^ (r >> s16)
+    v = ((w ^ seqc[1, 0]) * seqc[1, 1]) & m32
+    v = v ^ (v >> s16)
+    r = (ml * p1 - mr * v) & m32
+    p1 = r ^ (r >> s16)
+    v = ((w ^ seqc[2, 0]) * seqc[2, 1]) & m32
+    v = v ^ (v >> s16)
+    r = (ml * p2 - mr * v) & m32
+    p2 = r ^ (r >> s16)
+    v = ((w ^ seqc[3, 0]) * seqc[3, 1]) & m32
+    v = v ^ (v >> s16)
+    r = (ml * p3 - mr * v) & m32
+    p3 = r ^ (r >> s16)
+    ws = np.empty(8, dtype=np.uint64)
+    for j in range(8):
+        jj = j & 3
+        if jj == 0:
+            p = p0
+        elif jj == 1:
+            p = p1
+        elif jj == 2:
+            p = p2
+        else:
+            p = p3
+        v = ((p ^ outc[j, 0]) * outc[j, 1]) & m32
+        ws[j] = v ^ (v >> s16)
+    sh = (ws[1] << s32) | ws[0]
+    sl = (ws[3] << s32) | ws[2]
+    ih0 = (ws[5] << s32) | ws[4]
+    il0 = (ws[7] << s32) | ws[6]
+    ih = (ih0 << one) | (il0 >> s63)
+    il = (il0 << one) | one
+    lo = il + sl
+    hi = ih + sh + (one if lo < il else np.uint64(0))
+    return hi, lo, ih, il
+
+@njit(cache=False, fastmath=False, nogil=True)
+def _fcx_nb_mulhi(a, b):
+    m32 = np.uint64(0xFFFFFFFF)
+    s32 = np.uint64(32)
+    a0 = a & m32
+    a1 = a >> s32
+    b0 = b & m32
+    b1 = b >> s32
+    p00 = a0 * b0
+    p01 = a0 * b1
+    p10 = a1 * b0
+    p11 = a1 * b1
+    mid = (p00 >> s32) + (p01 & m32) + (p10 & m32)
+    return p11 + (p01 >> s32) + (p10 >> s32) + (mid >> s32)
+
+@njit(cache=False, fastmath=False, nogil=True)
+def _fcx_nb_step(hi, lo, ih, il):
+    mh = np.uint64(2549297995355413924)
+    mlo = np.uint64(4865540595714422341)
+    one = np.uint64(1)
+    nhi = _fcx_nb_mulhi(lo, mlo) + lo * mh + hi * mlo
+    nlo = lo * mlo
+    rlo = nlo + il
+    rhi = nhi + ih + (one if rlo < nlo else np.uint64(0))
+    return rhi, rlo
+
+@njit(cache=False, fastmath=False, nogil=True)
+def _fcx_nb_out(hi, lo):
+    x = hi ^ lo
+    rot = hi >> np.uint64(58)
+    o = (x >> rot) | (x << ((np.uint64(64) - rot) & np.uint64(63)))
+    return np.float64(o >> np.uint64(11)) * (1.0 / 9007199254740992.0)
+
+@njit(cache=False, fastmath=False, nogil=True)
+def _fcx_nb_one(pool, seqc, outc, i):
+    hi, lo, ih, il = _fcx_nb_state(pool, seqc, outc, i)
+    hi, lo = _fcx_nb_step(hi, lo, ih, il)
+    hi, lo = _fcx_nb_step(hi, lo, ih, il)
+    return _fcx_nb_out(hi, lo)
+
+@njit(cache=False, fastmath=False, nogil=True)
+def _fcx_nb_many(pool, seqc, outc, i, size):
+    hi, lo, ih, il = _fcx_nb_state(pool, seqc, outc, i)
+    hi, lo = _fcx_nb_step(hi, lo, ih, il)
+    out = np.empty(size, dtype=np.float64)
+    for k in range(size):
+        hi, lo = _fcx_nb_step(hi, lo, ih, il)
+        out[k] = _fcx_nb_out(hi, lo)
+    return out
+
 from scipy.signal import lfilter
 
 MASK32 = 0xFFFFFFFF
@@ -5948,7 +6287,7 @@ def _sparse_admin_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray
         prof = np.exp((rng.random(7) - 0.5) * rng.uniform(0.3, 0.9))
         wk = rng.choice(7, size=2, replace=False)
         prof[wk] *= rng.uniform(0.55, 0.85)
-        prof /= prof.mean()
+        prof /= _v2_meanm(prof)
         level = float(np.exp(rng.uniform(0.2, 2.4)))
         trend = np.exp(
             np.sin(2.0 * np.pi * t / (L * rng.uniform(0.6, 2.5))
@@ -6046,7 +6385,7 @@ def _store_sales_panel(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
         wk = rng.choice(7, size=2, replace=False)
         soft = {0: (0.55, 0.85), 1: (0.5, 0.8), 2: (0.65, 0.95)}[store]
         prof[wk] *= rng.uniform(*soft)
-        prof /= max(float(prof.mean()), 1e-9)
+        prof /= max(float(_v2_meanm(prof)), 1e-9)
         open_mask = np.ones(L, dtype=bool)
         for _ in range(int(rng.poisson(rng.uniform(0.5, 3.0)))):
             z0 = int(rng.integers(0, L))
@@ -6059,7 +6398,7 @@ def _store_sales_panel(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
         cust[~open_mask] = 0.0
         active = open_mask & (cust > 0)
         if active.any():
-            cust[active] /= float(np.mean(cust[active]))
+            cust[active] /= float(_v2_mean(cust[active]))
         ticket = float(np.exp(rng.uniform(*[(0.5, 2.0), (1.0, 5.0), (2.0, 12.0)][store])))
         sales = level * cust * ticket
         for _ in range(int(rng.poisson(rng.uniform(0.3, 2.0)))):
@@ -6164,7 +6503,7 @@ def _web_traffic_plateau(rng: np.random.Generator, n: int, L: int) -> np.ndarray
         prof = np.exp((rng.random(7) - 0.5) * rng.uniform(0.3, 0.9))
         wk = rng.choice(7, size=2, replace=False)
         prof[wk] *= rng.uniform(0.55, 0.85)
-        prof /= prof.mean()
+        prof /= _v2_meanm(prof)
         level = float(np.exp(rng.uniform(2.0, 8.0)))
         lam = level * prof[dow]
         fano = rng.uniform(1.5, 6.0)
@@ -6211,7 +6550,7 @@ def _biz_day_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
         low = np.log(0.8) if listed else np.log(5.0)
         level = float(np.exp(rng.uniform(low, np.log(300.0))))
         drift = np.cumsum(rng.normal(0.0, rng.uniform(0.001, 0.012), size=m))
-        drift -= drift.mean()
+        drift -= _v2_meanm(drift)
         annual = rng.uniform(0.0, 0.35) * np.sin(
             2.0 * np.pi * day[:m] / 365.0 + rng.uniform(0.0, 2.0 * np.pi))
         lam = level * base * np.exp(np.clip(drift + annual, -2.5, 2.5))
@@ -6249,7 +6588,7 @@ def _weekly_web_counts(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
             if len(seg):
                 lv = logtrend[seg[-1]]
             prev = cp
-        logtrend -= logtrend.mean()
+        logtrend -= _v2_meanm(logtrend)
         level = float(np.exp(rng.uniform(np.log(50.0), np.log(1e6))))
         wk_dip = float(rng.uniform(0.30, 0.75))
         prof = np.exp(rng.normal(0.0, 0.06, size=7))
@@ -6342,7 +6681,7 @@ def _web_session_attr(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
             if seg.size > 1:
                 decay = np.exp(-np.arange(seg.size) / max(seg.size * rng.uniform(0.3, 1.2), 1.0))
                 shape[start:end] = seg * decay
-        m = float(np.mean(shape[active])) if active.any() else 1.0
+        m = float(_v2_mean(shape[active])) if active.any() else 1.0
         if m > 0:
             shape[active] /= m
         out[i] = np.round(np.maximum(level * day_scale * shape, 0.0))
@@ -6369,7 +6708,7 @@ def _broadband_path_attr(rng: np.random.Generator, n: int, L: int) -> np.ndarray
             zl = int(rng.integers(1, max(2, L // 20)))
             path[z0:z0 + zl] = 0.0
         path = np.maximum(path, 0.0)
-        m = float(np.mean(path[path > 0])) if np.any(path > 0) else 1.0
+        m = float(_v2_mean(path[path > 0])) if np.any(path > 0) else 1.0
         if m > 0:
             path = path / m
         out[i] = base * path
@@ -6400,7 +6739,7 @@ def _cluster_job_attr(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
             shape[:alive_len] *= day[:alive_len]
         active = shape > 0
         if active.any():
-            shape[active] /= float(np.mean(shape[active]))
+            shape[active] /= float(_v2_mean(shape[active]))
         series = level * shape
         if job == 0 and rng.random() < 0.25 and alive_len < L - 2:
             z0 = int(rng.integers(alive_len, L))
@@ -7407,9 +7746,9 @@ class _BaseGenerator(DataGenerator):
 
                                 unit = []
                                 for part in parts:
-                                    s = float(np.mean(np.abs(part)))
+                                    s = float(_v2_mean(np.abs(part)))
                                     unit.append(part / s if s > 1e-12 else part)
-                                source_scale = float(np.mean(np.abs(source)))
+                                source_scale = float(_v2_mean(np.abs(source)))
                                 combined = weights[0] * unit[0]
                                 for j, part in enumerate(unit[1:]):
                                     combined = combined + weights[j + 1] * part
@@ -7506,7 +7845,8 @@ class _BaseGenerator(DataGenerator):
             stop.set()
             producer.join(timeout=1.0)
 
-def _ar1_kernel(innov: np.ndarray, phi: np.ndarray) -> np.ndarray:
+@njit(cache=False, fastmath=False, nogil=True)
+def _ar1_kernel_nb(innov: np.ndarray, phi: np.ndarray) -> np.ndarray:
     n, L = innov.shape
     x = np.empty((n, L), dtype=np.float64)
     for i in range(n):
@@ -7516,6 +7856,23 @@ def _ar1_kernel(innov: np.ndarray, phi: np.ndarray) -> np.ndarray:
             prev = innov[i, t] + p * prev
             x[i, t] = prev
     return x
+
+def _ar1_kernel_py(innov: np.ndarray, phi: np.ndarray) -> np.ndarray:
+    n, L = innov.shape
+    x = np.empty((n, L), dtype=np.float64)
+    for i in range(n):
+        p = phi[i]
+        prev = 0.0
+        for t in range(L):
+            prev = innov[i, t] + p * prev
+            x[i, t] = prev
+    return x
+
+def _ar1_kernel(innov: np.ndarray, phi: np.ndarray) -> np.ndarray:
+    if (type(innov) is np.ndarray and type(phi) is np.ndarray and innov.dtype == np.float64
+            and phi.dtype == np.float64 and innov.ndim == 2 and phi.ndim == 1 and phi.shape[0] >= innov.shape[0]):
+        return _ar1_kernel_nb(innov, phi)
+    return _ar1_kernel_py(innov, phi)
 
 def _cycle_profile(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     if n <= 0:
@@ -7538,8 +7895,8 @@ def _cycle_profile(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
             ) / 4.0
         knot_y = np.concatenate([knot_y, knot_y[:1]])
         profile = np.interp(np.arange(period, dtype=np.float64), knot_x, knot_y)
-        profile -= profile.mean()
-        profile /= max(float(profile.std()), 1e-9)
+        profile -= _v2_meanm(profile)
+        profile /= max(float(_v2_stdm(profile)), 1e-9)
 
         phase = int(rng.integers(0, period))
         shifted = t + phase
@@ -7701,7 +8058,50 @@ def _linspace_segments(L: int, k: int) -> tuple:
         for j in range(k - 1)
     )
 
+_V2_ILS = {}
+
+def _v2_ils_plan(L, k):
+    key = (L, k)
+    e = _V2_ILS.get(key)
+    if e is None:
+        segs = _linspace_segments(L, k)
+        starts = np.array([sg[1] for sg in segs], dtype=np.int64)
+        stops = np.array([sg[2] for sg in segs], dtype=np.int64)
+        dts = np.array([sg[4] for sg in segs], dtype=np.float64)
+        toff = np.zeros(L, dtype=np.float64)
+        for sg in segs:
+            toff[sg[1]:sg[2]] = sg[3]
+        e = (starts, stops, dts, toff)
+        if len(_V2_ILS) < 64:
+            _V2_ILS[key] = e
+    return e
+
+@njit(cache=False, fastmath=False, nogil=True)
+def _v2_ils_fill(knot_a, starts, stops, dts, toff, out):
+    n = knot_a.shape[0]
+    L = out.shape[1]
+    k = knot_a.shape[1]
+    for j in range(starts.shape[0]):
+        st = starts[j]
+        sp = stops[j]
+        dt = dts[j]
+        for i in range(n):
+            sl = (knot_a[i, j + 1] - knot_a[i, j]) / dt
+            kj = knot_a[i, j]
+            for t in range(st, sp):
+                out[i, t] = sl * toff[t] + kj
+    for i in range(n):
+        out[i, L - 1] = knot_a[i, k - 1]
+
 def _interp_linspace_rows(knot_a: np.ndarray, L: int) -> np.ndarray:
+    if (type(knot_a) is np.ndarray and knot_a.dtype == np.float64 and knot_a.ndim == 2
+            and isinstance(L, (int, np.integer)) and not isinstance(L, bool)
+            and int(L) >= 2 and knot_a.shape[1] >= 2 and knot_a.shape[0] > 0):
+        L = int(L)
+        starts, stops, dts, toff = _v2_ils_plan(L, int(knot_a.shape[1]))
+        out = np.empty((knot_a.shape[0], L), dtype=np.float64)
+        _v2_ils_fill(np.ascontiguousarray(knot_a), starts, stops, dts, toff, out)
+        return out
     out = np.empty((knot_a.shape[0], L), dtype=np.float64)
     for j, start, stop, toff, dt in _linspace_segments(L, knot_a.shape[1]):
         slope = ((knot_a[:, j + 1] - knot_a[:, j]) / dt)[:, None]
@@ -8116,7 +8516,7 @@ def _measurement_artifacts(
             for row in drift_rows:
                 n_knots = int(rng.integers(3, 8))
                 knot_a = np.cumsum(rng.normal(0.0, 0.15, size=n_knots))
-                knot_a = knot_a - knot_a.mean()
+                knot_a = knot_a - _v2_meanm(knot_a)
                 by_k.setdefault(n_knots, []).append(knot_a)
                 row_by_k.setdefault(n_knots, []).append(int(row))
             for n_knots, knots in by_k.items():
@@ -9333,8 +9733,8 @@ def _tirex2_marginal_augments(
 
         steps = warp_rng.normal(0.0, 1.0, size=L).cumsum()
         bridge = steps - (t / max(L - 1, 1)) * steps[-1]
-        bridge = bridge - bridge.mean()
-        bstd = float(bridge.std()) or 1.0
+        bridge = bridge - _v2_meanm(bridge)
+        bstd = float(_v2_stdm(bridge)) or 1.0
         amp = float(warp_rng.uniform(0.5, 3.0))
         lag = amp * (bridge / bstd)
         src = np.clip(t + lag, 0.0, float(L - 1))
@@ -9426,17 +9826,113 @@ def _empirical_cycle_tail(history, lag, length, rng, mode):
 _LONG_CYCLE_ENABLED = True
 _LONG_CYCLE_LAGS = tuple(range(97, 257))
 
+@njit(cache=False, fastmath=False, nogil=True)
+def _v2_lcp_template(history, lag, count, out):
+    rows = history.shape[0]
+    base = history.shape[1] - count * lag
+    for r in range(rows):
+        for p in range(lag):
+            q = base + p
+            if count == 7:
+                a0 = history[r, q]; a1 = history[r, q + lag]; a2 = history[r, q + 2 * lag]
+                a3 = history[r, q + 3 * lag]; a4 = history[r, q + 4 * lag]; a5 = history[r, q + 5 * lag]
+                a6 = history[r, q + 6 * lag]
+                t = a0 if a0 < a5 else a5; a5 = a5 if a0 < a5 else a0; a0 = t
+                t = a0 if a0 < a3 else a3; a3 = a3 if a0 < a3 else a0; a0 = t
+                t = a1 if a1 < a6 else a6; a6 = a6 if a1 < a6 else a1; a1 = t
+                t = a2 if a2 < a4 else a4; a4 = a4 if a2 < a4 else a2; a2 = t
+                t = a0 if a0 < a1 else a1; a1 = a1 if a0 < a1 else a0; a0 = t
+                t = a3 if a3 < a5 else a5; a5 = a5 if a3 < a5 else a3; a3 = t
+                t = a2 if a2 < a6 else a6; a6 = a6 if a2 < a6 else a2; a2 = t
+                t = a2 if a2 < a3 else a3; a3 = a3 if a2 < a3 else a2; a2 = t
+                t = a3 if a3 < a6 else a6; a6 = a6 if a3 < a6 else a3; a3 = t
+                t = a4 if a4 < a5 else a5; a5 = a5 if a4 < a5 else a4; a4 = t
+                t = a1 if a1 < a4 else a4; a4 = a4 if a1 < a4 else a1; a1 = t
+                t = a1 if a1 < a3 else a3; a3 = a3 if a1 < a3 else a1; a1 = t
+                t = a3 if a3 < a4 else a4; a4 = a4 if a3 < a4 else a3; a3 = t
+                out[r, p] = a3
+            elif count == 5:
+                a0 = history[r, q]; a1 = history[r, q + lag]; a2 = history[r, q + 2 * lag]
+                a3 = history[r, q + 3 * lag]; a4 = history[r, q + 4 * lag]
+                t = a0 if a0 < a1 else a1; a1 = a1 if a0 < a1 else a0; a0 = t
+                t = a3 if a3 < a4 else a4; a4 = a4 if a3 < a4 else a3; a3 = t
+                t = a0 if a0 < a3 else a3; a3 = a3 if a0 < a3 else a0; a0 = t
+                t = a1 if a1 < a4 else a4; a4 = a4 if a1 < a4 else a1; a1 = t
+                t = a1 if a1 < a2 else a2; a2 = a2 if a1 < a2 else a1; a1 = t
+                t = a2 if a2 < a3 else a3; a3 = a3 if a2 < a3 else a2; a2 = t
+                t = a1 if a1 < a2 else a2; a2 = a2 if a1 < a2 else a1; a1 = t
+                out[r, p] = a2
+            elif count == 3:
+                a0 = history[r, q]; a1 = history[r, q + lag]; a2 = history[r, q + 2 * lag]
+                t = a0 if a0 < a1 else a1; a1 = a1 if a0 < a1 else a0; a0 = t
+                t = a1 if a1 < a2 else a2; a2 = a2 if a1 < a2 else a1; a1 = t
+                t = a0 if a0 < a1 else a1; a1 = a1 if a0 < a1 else a0; a0 = t
+                out[r, p] = a1
+            else:
+                out[r, p] = history[r, q]
+
 def _long_cycle_predict(history, lag, length):
     history = np.asarray(history, dtype=float)
     if history.ndim != 2 or lag < 1 or length < 1 or lag > history.shape[1]:
         raise ValueError('Need a 2-D history, available positive lag and length')
     count = min(7, history.shape[1] // lag)
     count -= int(count % 2 == 0)
+    if count in (1, 3, 5, 7) and history.dtype == np.float64 and history.shape[0] > 0 and bool(np.isfinite(history).all()):
+        template = np.empty((history.shape[0], lag), dtype=np.float64)
+        _v2_lcp_template(np.ascontiguousarray(history), int(lag), int(count), template)
+        return template[:, np.arange(length) % lag]
     cycles = history[:, -count * lag:].reshape(len(history), count, lag)
     template = np.partition(cycles, count // 2, axis=1)[:, count // 2, :]
     return template[:, np.arange(length) % lag]
 
+@njit(cache=False, fastmath=False, nogil=True)
+def _v2_lcv_kernel(history, observed, lag, count, span, error, hold, away):
+    rows = history.shape[0]
+    H = history.shape[1]
+    m = observed.shape[1]
+    tmpl = np.empty((rows, lag), dtype=np.float64)
+    _v2_lcp_template(history, lag, count, tmpl)
+    d = np.empty(m, dtype=np.float64)
+    b16 = np.empty(16, dtype=np.float64)
+    for r in range(rows):
+        for t in range(m):
+            d[t] = abs(observed[r, t] - tmpl[r, t % lag])
+        error[r] = ((0.0 + _v2_pw(d, 0, m)) / m) / span[r]
+        for k in range(16):
+            x = history[r, H - 16 + k]
+            j = k
+            while j > 0 and b16[j - 1] > x:
+                b16[j] = b16[j - 1]
+                j -= 1
+            b16[j] = x
+        anchor = (0.0 + ((0.0 + b16[7]) + b16[8])) / 2.0
+        for t in range(m):
+            d[t] = abs(observed[r, t] - anchor)
+        hold[r] = ((0.0 + _v2_pw(d, 0, m)) / m) / span[r]
+        thr = .05 * span[r]
+        c = 0
+        for t in range(H):
+            if abs(history[r, t] - anchor) > thr:
+                c += 1
+        away[r] = c / H
+
 def _long_cycle_validation(history, observed, lag, span):
+    if (type(history) is np.ndarray and type(observed) is np.ndarray and type(span) is np.ndarray
+            and history.dtype == np.float64 and observed.dtype == np.float64 and span.dtype == np.float64
+            and history.ndim == 2 and observed.ndim == 2 and span.ndim == 1
+            and history.shape[0] == observed.shape[0] == span.shape[0] and history.shape[0] > 0
+            and history.shape[1] >= 16 and observed.shape[1] >= 1 and type(lag) is int and 1 <= lag <= history.shape[1]):
+        cnt = min(7, history.shape[1] // lag)
+        cnt -= int(cnt % 2 == 0)
+        if cnt in (1, 3, 5, 7) and bool(np.isfinite(history).all()) and bool(np.isfinite(observed).all()):
+            n_ = history.shape[0]
+            error = np.empty(n_, dtype=np.float64)
+            hold = np.empty(n_, dtype=np.float64)
+            away = np.empty(n_, dtype=np.float64)
+            _v2_lcv_kernel(np.ascontiguousarray(history), np.ascontiguousarray(observed), lag, cnt,
+                           np.ascontiguousarray(span), error, hold, away)
+            accepted = (error <= .12) & (error <= .75 * hold) & (away >= .15)
+            return error, accepted
     anchor = np.median(history[:, -16:], axis=1)
     error = np.mean(np.abs(observed - _long_cycle_predict(history, lag, observed.shape[1])), axis=1) / span
     hold = np.mean(np.abs(observed - anchor[:, None]), axis=1) / span
@@ -9514,6 +10010,62 @@ def _pairwise_sum(a, n):
     raise ValueError("unsupported validation length")
 
 @njit(cache=False, nogil=True)
+def _v2_cm_medians(h, base, lag, count, start, stop, median, buf):
+    if count == 7:
+        for p in range(start, stop):
+            q = base + p
+            a0 = h[q]; a1 = h[q + lag]; a2 = h[q + 2 * lag]; a3 = h[q + 3 * lag]
+            a4 = h[q + 4 * lag]; a5 = h[q + 5 * lag]; a6 = h[q + 6 * lag]
+            t = a0 if a0 < a5 else a5; a5 = a5 if a0 < a5 else a0; a0 = t
+            t = a0 if a0 < a3 else a3; a3 = a3 if a0 < a3 else a0; a0 = t
+            t = a1 if a1 < a6 else a6; a6 = a6 if a1 < a6 else a1; a1 = t
+            t = a2 if a2 < a4 else a4; a4 = a4 if a2 < a4 else a2; a2 = t
+            t = a0 if a0 < a1 else a1; a1 = a1 if a0 < a1 else a0; a0 = t
+            t = a3 if a3 < a5 else a5; a5 = a5 if a3 < a5 else a3; a3 = t
+            t = a2 if a2 < a6 else a6; a6 = a6 if a2 < a6 else a2; a2 = t
+            t = a2 if a2 < a3 else a3; a3 = a3 if a2 < a3 else a2; a2 = t
+            t = a3 if a3 < a6 else a6; a6 = a6 if a3 < a6 else a3; a3 = t
+            t = a4 if a4 < a5 else a5; a5 = a5 if a4 < a5 else a4; a4 = t
+            t = a1 if a1 < a4 else a4; a4 = a4 if a1 < a4 else a1; a1 = t
+            t = a1 if a1 < a3 else a3; a3 = a3 if a1 < a3 else a1; a1 = t
+            t = a3 if a3 < a4 else a4; a4 = a4 if a3 < a4 else a3; a3 = t
+            median[p] = a3
+    elif count == 5:
+        for p in range(start, stop):
+            q = base + p
+            a0 = h[q]; a1 = h[q + lag]; a2 = h[q + 2 * lag]; a3 = h[q + 3 * lag]; a4 = h[q + 4 * lag]
+            t = a0 if a0 < a1 else a1; a1 = a1 if a0 < a1 else a0; a0 = t
+            t = a3 if a3 < a4 else a4; a4 = a4 if a3 < a4 else a3; a3 = t
+            t = a0 if a0 < a3 else a3; a3 = a3 if a0 < a3 else a0; a0 = t
+            t = a1 if a1 < a4 else a4; a4 = a4 if a1 < a4 else a1; a1 = t
+            t = a1 if a1 < a2 else a2; a2 = a2 if a1 < a2 else a1; a1 = t
+            t = a2 if a2 < a3 else a3; a3 = a3 if a2 < a3 else a2; a2 = t
+            t = a1 if a1 < a2 else a2; a2 = a2 if a1 < a2 else a1; a1 = t
+            median[p] = a2
+    elif count == 3:
+        for p in range(start, stop):
+            q = base + p
+            a0 = h[q]; a1 = h[q + lag]; a2 = h[q + 2 * lag]
+            t = a0 if a0 < a1 else a1; a1 = a1 if a0 < a1 else a0; a0 = t
+            t = a1 if a1 < a2 else a2; a2 = a2 if a1 < a2 else a1; a1 = t
+            t = a0 if a0 < a1 else a1; a1 = a1 if a0 < a1 else a0; a0 = t
+            median[p] = a1
+    elif count == 1:
+        for p in range(start, stop):
+            median[p] = h[base + p]
+    else:
+        mid = count // 2
+        for p in range(start, stop):
+            for c in range(count):
+                x = h[base + p + c * lag]
+                k = c
+                while k > 0 and buf[k - 1] > x:
+                    buf[k] = buf[k - 1]
+                    k -= 1
+                buf[k] = x
+            median[p] = buf[mid]
+
+@njit(cache=False, nogil=True)
 def _cycle_menu_errors(history, observed, span, limit, lags, cols, count, fit_points, errors):
 
     rows = history.shape[0]
@@ -9522,12 +10074,13 @@ def _cycle_menu_errors(history, observed, span, limit, lags, cols, count, fit_po
     median = np.empty(points, dtype=np.float64)
     diff = np.empty(points, dtype=np.float64)
     buf = np.empty(count, dtype=np.float64)
-    mid = count // 2
     for r in range(rows):
         if not limit[r] >= 0.0:
             for j in range(lags.shape[0]):
                 errors[r, cols[j]] = np.inf
             continue
+        h = history[r]
+        o = observed[r]
         for j in range(lags.shape[0]):
             lag = lags[j]
             base = fit_points - count * lag
@@ -9539,18 +10092,18 @@ def _cycle_menu_errors(history, observed, span, limit, lags, cols, count, fit_po
                 lo = leaf * 128
                 hi = lo + 128
                 need = hi if hi < lag else lag
-                while done < need:
-                    for c in range(count):
-                        x = history[r, base + done + c * lag]
-                        k = c
-                        while k > 0 and buf[k - 1] > x:
-                            buf[k] = buf[k - 1]
-                            k -= 1
-                        buf[k] = x
-                    median[done] = buf[mid]
-                    done += 1
-                for v in range(lo, hi):
-                    diff[v] = abs(observed[r, v] - median[v % lag])
+                if done < need:
+                    _v2_cm_medians(h, base, lag, count, done, need, median, buf)
+                    done = need
+                v = lo
+                while v < hi:
+                    m0 = v % lag
+                    seg = hi - v
+                    if lag - m0 < seg:
+                        seg = lag - m0
+                    for t in range(seg):
+                        diff[v + t] = abs(o[v + t] - median[m0 + t])
+                    v += seg
                 value = _pairwise_leaf(diff, lo, 128)
                 if leaves == 2:
                     bound = value if leaf == 0 else partial + value
@@ -10152,16 +10705,6 @@ def _pull_counter_ramp(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
     base = np.rint(base_rate * rel)
     return base + np.cumsum(inc, axis=1)
 
-"""intraday_event_counts -- coverage family for the pool class
-``intraday_event_counts_lowcorr`` (288 eval windows over 3 chain panels,
-99 series / 80 source clusters: 911 / fire / police dispatch and CAD volumes,
-crime-incident and 311 request feeds, jail bookings, naloxone/crisis calls,
-DOI / package / CVE / malware-sample registration streams and TfL
-arrival-prediction feeds).  Self-contained: ``numpy`` only, every random
-number comes from the ``rng`` argument.  Style follows the c030 isolated
-stream builders (``_weekday_ledger_counts`` etc.).
-"""
-
 def _intraday_event_counts_body(rng: np.random.Generator, n: int, L: int,
                                 emit_empty: bool = False):
     if n <= 0:
@@ -10310,11 +10853,6 @@ def _intraday_event_counts_body(rng: np.random.Generator, n: int, L: int,
         is_event = ~is_c[:, 0]
         return y, trunc[:, 0] & is_event, is_event
     return y
-
-"""intraday_spot_price -- coverage family for the electricity_price_intraday
-pool class (day-ahead / market-index / hourly spot / real-time dispatch prices
-at 5-30 min and hourly cadence).  Deterministic seeded numpy only.
-"""
 
 def _isp_ar1(innov: np.ndarray, phi: np.ndarray) -> np.ndarray:
     n, L = innov.shape
@@ -11069,7 +11607,7 @@ def _pt_harmonics_plus_ar_noise(rng, n):
 def _pt_poisson_exp_gp_counts(rng, n):
     base_rate = float(np.exp(rng.uniform(np.log(0.05), np.log(60.0))))
     gp_multiplier = np.exp(0.6 * _pt_random_kernel_gp_draw(rng, n) * rng.uniform(0.3, 1.2))
-    rate = base_rate * gp_multiplier / max(1e-09, gp_multiplier.mean())
+    rate = base_rate * gp_multiplier / max(1e-09, _v2_meanm(gp_multiplier))
     x = rng.poisson(np.clip(rate, 0.0, 1000000.0)).astype(np.float64)
     if rng.random() < 0.3:
         keep_mask = rng.random(n) < rng.uniform(0.6, 0.97)
@@ -11180,7 +11718,7 @@ def _pt_warp_increments_stochastic_vol(rng, x, vol_strength):
     n = d.size
     ln = _pt_ar1_filter(n, rng.standard_normal(n) * np.sqrt(1.0 - 0.995 ** 2), 0.995, 0.0)
     vol_multiplier = np.exp(vol_strength * ln)
-    vol_multiplier = vol_multiplier / np.sqrt(np.mean(vol_multiplier * vol_multiplier))
+    vol_multiplier = vol_multiplier / np.sqrt(_v2_mean(vol_multiplier * vol_multiplier))
     return np.concatenate([[x[0]], x[0] + np.cumsum(d * vol_multiplier)])
 
 def _pt_add_heavy_tailed_level_shifts(rng, x, shift_rate, shift_scale):
@@ -11188,7 +11726,7 @@ def _pt_add_heavy_tailed_level_shifts(rng, x, shift_rate, shift_scale):
     k = int(rng.poisson(max(0.0, shift_rate * n)))
     if k <= 0 or n < 8:
         return x
-    step_scale = float(np.std(np.diff(x))) or float(np.std(x)) or 1.0
+    step_scale = float(_v2_std(np.diff(x))) or float(_v2_std(x)) or 1.0
     at = np.sort(rng.integers(1, n, size=k))
     shift_sizes = rng.standard_t(2.5, size=k) * step_scale * shift_scale
     level_offset = np.zeros(n)
@@ -11268,7 +11806,7 @@ def _pt_diurnal_activity_shape(rng, period, steady):
     else:
         floor = np.exp(rng.normal(np.log(0.012), 1.2))
     shape = floor + (1.0 - floor) * shape / shape.max()
-    return shape / shape.mean()
+    return shape / _v2_meanm(shape)
 
 def _pt_hourly_profile_counts(rng, n, steady):
     steps_per_day = 24
@@ -11276,7 +11814,7 @@ def _pt_hourly_profile_counts(rng, n, steady):
     phase_offset = int(rng.integers(0, steps_per_day))
     day_profile = _pt_diurnal_activity_shape(rng, steps_per_day, steady)
     wk = np.exp(rng.normal(0.0, 0.035 if steady else 0.08, 7))
-    wk /= wk.mean()
+    wk /= _v2_meanm(wk)
     day_index = (t + phase_offset) // steps_per_day
     seasonal_factor = day_profile[(t + phase_offset) % steps_per_day] * wk[(day_index + int(rng.integers(0, 7))) % 7]
     if steady:
@@ -11315,7 +11853,7 @@ def _pt_ixp_traffic_5min(rng, n):
     trough_frac = float(np.clip(np.exp(rng.normal(np.log(0.3), 0.7)), 0.05, 0.97))
     harmonic_shape = _pt_normalized_harmonic_profile(rng, steps_per_day, int(rng.integers(2, 6)), 1.0) ** rng.uniform(0.5, 1.3)
     day_profile = trough_frac + (1.0 - trough_frac) * harmonic_shape
-    day_profile /= day_profile.mean()
+    day_profile /= _v2_meanm(day_profile)
     phase_offset = int(rng.integers(0, steps_per_day))
     wk = np.ones(7)
     wd = int(rng.integers(0, 7))
@@ -11367,7 +11905,7 @@ def _pt_daily_download_counts(rng, n):
     wk = np.array([1.0, 1.04, 1.04, 1.03, 1.0, weekend_factor, weekend_factor * rng.uniform(0.95, 1.1)])
     wk[4] = rng.uniform(0.8, 0.95)
     wk *= np.exp(rng.normal(0.0, 0.015, 7))
-    wk /= wk.mean()
+    wk /= _v2_meanm(wk)
     weekday_offset = int(rng.integers(0, 7))
     weekday_factor = wk[(t + weekday_offset) % 7]
     lg = np.log(10.0) * rng.uniform(4.6, 8.0)
@@ -11401,7 +11939,7 @@ def _pt_half_hourly_cumulative_counter(rng, n):
     daily_cycle = 1.0 + rng.uniform(0.0, 0.3) * np.cos(_pt_WEB_TWO_PI * (t / steps_per_day + rng.random()))
     weekend_factor = rng.uniform(0.15, 0.6)
     wk = np.array([1.0, 1.0, 1.0, 1.0, 1.0, weekend_factor, weekend_factor])
-    wk /= wk.mean()
+    wk /= _v2_meanm(wk)
     seasonal_factor = daily_cycle * wk[(t // steps_per_day + int(rng.integers(0, 7))) % 7]
     seasonal_factor *= np.exp(rng.normal(-0.4, 0.4) * (t / n - 0.5))
     rate = mu * seasonal_factor * np.exp(_pt_interpolated_coarse_ar1(rng, n, steps_per_day, rng.uniform(0.3, 0.8), rng.uniform(0.1, 0.5)) + _pt_stationary_ar1_noise(rng, n, rng.uniform(0.85, 0.99), rng.uniform(0.2, 0.7)))
@@ -11441,7 +11979,7 @@ def _pt_env_smooth_noise(rng, n, corr_len, beta=2.0):
         y = np.interp(np.arange(n, dtype=np.float64) / coarse_step, np.arange(nc, dtype=np.float64), y)
     else:
         y = y[:n]
-    s = y.std()
+    s = _v2_stdm(y)
     return y / s if s > 0 else y
 
 def _pt_env_diurnal_bump(cycle_phase, peak_phase, concentration):
@@ -11599,7 +12137,7 @@ def _pt_hydro_rain_runoff_series(rng, n):
     if kind == 3:
         fast_decay = np.exp(-1.0 / max(2.0, rng.uniform(0.5, 3.0) * steps_per_day))
         routing_decay = np.exp(-1.0 / max(2.0, rng.uniform(2.0, 10.0) * steps_per_day))
-    mean_rain = float(u.mean()) if n_storms else 0.0
+    mean_rain = float(_v2_meanm(u)) if n_storms else 0.0
     w0 = float(np.exp(rng.normal(0.0, 0.5)))
     q1 = lfilter([1.0 - fast_decay], [1.0, -fast_decay], u, zi=[fast_decay * mean_rain * w0])[0]
     quickflow = lfilter([1.0 - routing_decay], [1.0, -routing_decay], q1, zi=[routing_decay * mean_rain * w0])[0]
@@ -11743,7 +12281,7 @@ def _pt_rainfall_or_air_pollutant(rng, n):
         daily_profile = 0.6 * np.exp(3.0 * (np.cos(_pt_ENV_TWO_PI * (day_phase - 0.33)) - 1)) + 0.8 * np.exp(2.5 * (np.cos(_pt_ENV_TWO_PI * (day_phase - 0.8)) - 1))
     else:
         daily_profile = np.exp(2.0 * (np.cos(_pt_ENV_TWO_PI * (day_phase - 0.6)) - 1))
-    log_signal = rng.uniform(0.3, 0.8) * ep + rng.uniform(0.2, 0.9) * (daily_profile - daily_profile.mean()) + rng.uniform(0.15, 0.45) * lfilter([1.0], [1.0, -rng.uniform(0.6, 0.92)], rng.standard_normal(n)) * 0.5
+    log_signal = rng.uniform(0.3, 0.8) * ep + rng.uniform(0.2, 0.9) * (daily_profile - _v2_meanm(daily_profile)) + rng.uniform(0.15, 0.45) * lfilter([1.0], [1.0, -rng.uniform(0.6, 0.92)], rng.standard_normal(n)) * 0.5
     x = scale * np.exp(log_signal)
     s = rng.random(n) < rng.uniform(0.0, 0.01)
     x = x + s * scale * rng.exponential(2.0, n)
@@ -11775,8 +12313,8 @@ def _pt_gaussian_lowpass_noise(rng, n, sigma_steps):
     f = np.fft.rfftfreq(m)
     spectrum *= np.exp(-0.5 * (_pt_ENERGY_TWO_PI * f * sigma_steps) ** 2)
     y = np.fft.irfft(spectrum, m)[:n]
-    y -= y.mean()
-    s = y.std()
+    y -= _v2_meanm(y)
+    s = _v2_stdm(y)
     return y / s if s > 1e-12 else y
 
 class _pt_DayClock:
@@ -11861,7 +12399,7 @@ def _pt_grid_net_load(rng, n):
     wn = rng.standard_t(rng.uniform(3.0, 6.0), n) if q > 1 else 0.0
     net_shape = demand - solar_gen
     g = np.abs(np.diff(net_shape, append=net_shape[-1]))
-    ramp_noise_scale = 0.25 + np.minimum(g / (g.mean() + 1e-12), 4.0)
+    ramp_noise_scale = 0.25 + np.minimum(g / (_v2_meanm(g) + 1e-12), 4.0)
     net_load += L0 * (0.4 + 0.6 * D) * ramp_noise_scale * (rng.uniform(0.04, 0.12) * hourly_noise + rng.uniform(0.01, 0.035) * wn)
     stale_mask = rng.random(n) < rng.uniform(0.0, 0.05)
     stale_mask[0] = False
@@ -12289,12 +12827,12 @@ def _pt_diurnal_activity_counts(rng, n):
         phase_offset = int(rng.integers(0, period * 7))
         ph = (t + phase_offset) % period
         day = (t + phase_offset) // period % 7
-        lg = log_profile[ph] + log_profile.mean() * 0.0
+        lg = log_profile[ph] + _v2_meanm(log_profile) * 0.0
         lg += rng.uniform(0.05, 0.3) * _pt_knot_interpolated_noise(rng, n, rng.uniform(1.0, 4.0) * period)
         if period in (24, 144, 288):
             lg += np.where(day >= 5, np.log(rng.uniform(0.25, 1.1)), 0.0)
         mu = _pt_counts_log_uniform(rng, 1.0, 200.0)
-        mean_rate = mu * np.exp(lg - lg.mean())
+        mean_rate = mu * np.exp(lg - _v2_meanm(lg))
         if rng.random() < 0.35:
             mean_rate *= 1.0 + _pt_decaying_spike_train(rng, n, _pt_counts_log_uniform(rng, 0.002, 0.02), 2.0, 60.0, rng.uniform(0.3, 0.9))
         c = _pt_negative_binomial_counts(rng, mean_rate, _pt_counts_log_uniform(rng, 2.0, 50.0))
@@ -12310,7 +12848,7 @@ def _pt_diurnal_activity_counts(rng, n):
         lg = log_profile[ph] + np.where(day >= 5, np.log(rng.uniform(0.95, 1.2)), 0.0)
         lg += rng.uniform(0.03, 0.2) * _pt_knot_interpolated_noise(rng, n, rng.uniform(1.0, 5.0) * period)
         lg += lfilter([1.0], [1.0, -0.97], rng.normal(0.0, rng.uniform(0.001, 0.006), n))
-        x = np.round(_pt_counts_log_uniform(rng, 500.0, 500000.0) * np.exp(lg - lg.mean()))
+        x = np.round(_pt_counts_log_uniform(rng, 500.0, 500000.0) * np.exp(lg - _v2_meanm(lg)))
         hold_mask = rng.random(n) < rng.uniform(0.02, 0.2)
         hold_mask[0] = False
         src_index = np.where(hold_mask, 0, t)
@@ -12343,7 +12881,7 @@ def _pt_market_price_series(rng, n):
         t = np.arange(n)
         lg += rng.uniform(0.0, 0.08) * np.sin(_pt_COUNTS_TWO_PI * t / 252.0 + rng.uniform(0, _pt_COUNTS_TWO_PI))
         lg += (rng.uniform(0.0, 0.012) if rng.random() < 0.5 else 0.0) * rng.standard_normal(n)
-        x = base_price * np.exp(lg - lg.mean())
+        x = base_price * np.exp(lg - _v2_meanm(lg))
         hold_mask = rng.random(n) < (rng.uniform(0.0, 0.1) if rng.random() < 0.3 else 0.0)
         hold_mask[0] = False
         x = x[np.maximum.accumulate(np.where(hold_mask, 0, t))]
@@ -12377,7 +12915,7 @@ def _pt_smooth_random_curve(rng, n, length_scale):
     spectral_gain[0] = 0.0
     c = (rng.standard_normal(len(f)) + 1j * rng.standard_normal(len(f))) * spectral_gain
     y = np.fft.irfft(c, m)[:n]
-    s = y.std()
+    s = _v2_stdm(y)
     return y / s if s > 1e-12 else y
 _pt_TOD_BIN_COUNT = 1024
 _pt_TOD_BIN_CENTERS = (np.arange(_pt_TOD_BIN_COUNT) + 0.5) / _pt_TOD_BIN_COUNT
@@ -12390,7 +12928,7 @@ def _pt_smooth_random_curve_pair(rng, n, length_scale):
     w = rng.standard_normal((2, len(f))) * spectral_gain
     z = np.fft.fft(np.concatenate((w[0] + 1j * w[1], np.zeros(m - len(f)))))[:n]
     a, b = (z.real, z.imag)
-    return (a / max(a.std(), 1e-12), b / max(b.std(), 1e-12))
+    return (a / max(_v2_stdm(a), 1e-12), b / max(_v2_stdm(b), 1e-12))
 
 def _pt_daily_gaussian_bump(tod_bin, center, width):
     d = (_pt_TOD_BIN_CENTERS - center + 0.5) % 1.0 - 0.5
@@ -12489,7 +13027,7 @@ def _pt_dock_and_parking_availability(rng, n):
     am_pm_asymmetry = rng.uniform(0.15, 0.8) * (1.0 if rng.random() < 0.5 else -1.0)
     midday_weight = rng.uniform(0.2, 1.2)
     activity_profile = activity_floor + wk * (am + pm) + midday_weight * np.where(is_weekend, 1.5, 0.6) * midday_bump
-    activity_profile = activity_profile / activity_profile.mean()
+    activity_profile = activity_profile / _v2_meanm(activity_profile)
     flow_imbalance = wk * am_pm_asymmetry * (am - pm)
     imbalance_noise, activity_noise = _pt_smooth_random_curve_pair(rng, n, rng.uniform(1.5, 4.0) * steps_per_day)
     flow_imbalance = flow_imbalance + rng.uniform(0.05, 0.4) * imbalance_noise
@@ -12579,13 +13117,13 @@ def _pt_diurnal_counts_or_occupancy(rng, n):
         weekday_factors[int(rng.integers(0, 7))] *= rng.uniform(1.05, 1.5)
         log_level_drift = rng.uniform(0.5, 1.4) * _pt_smooth_random_curve(rng, n, rng.uniform(15.0, 90.0))
         base_rate = _pt_mobility_log_uniform(rng, 0.5, 20.0)
-        rate = base_rate * weekday_factors[dow] * np.exp(log_level_drift - 0.5 * log_level_drift.var())
+        rate = base_rate * weekday_factors[dow] * np.exp(log_level_drift - 0.5 * _v2_varm(log_level_drift))
         return _pt_overdispersed_poisson_counts(rng, rate, _pt_mobility_log_uniform(rng, 2.0, 40.0))
     steps_per_day = _pt_pick_option_by_weight(rng, (24.0, 48.0, 96.0, 288.0), (0.5, 0.3, 0.1, 0.1))
     tod, dow = _pt_time_of_day_and_weekday(rng, n, steps_per_day)
     lo = rng.uniform(0.4, 0.85)
     diurnal_profile = lo + (1.0 - lo) * (_pt_daily_gaussian_bump(tod, rng.uniform(0.55, 0.85), rng.uniform(0.12, 0.25)) + rng.uniform(0.0, 0.5) * _pt_daily_gaussian_bump(tod, rng.uniform(0.35, 0.45), 0.08))
-    diurnal_profile = diurnal_profile / diurnal_profile.mean()
+    diurnal_profile = diurnal_profile / _v2_meanm(diurnal_profile)
     wk = np.exp(rng.normal(0.0, 0.06, 7))[dow]
     slow_drift = np.exp(rng.uniform(0.1, 0.45) * _pt_smooth_random_curve(rng, n, rng.uniform(3.0, 20.0) * steps_per_day))
     if mode == 0:
@@ -12739,17 +13277,17 @@ def _pt_periodic_profile_series(rng, n):
         slow_wave = rng.normal() * np.sin(t * (_pt_PROFILE_TWO_PI / (p * rng.uniform(0.6, 5.0))) + rng.uniform(0, _pt_PROFILE_TWO_PI))
         for _ in range(2):
             slow_wave += rng.normal() * np.sin(t * (_pt_PROFILE_TWO_PI / (p * rng.uniform(0.6, 5.0))) + rng.uniform(0, _pt_PROFILE_TWO_PI))
-        profile = profile + rng.uniform(0.15, 0.6) * profile.std() * slow_wave / (slow_wave.std() + 1e-12)
+        profile = profile + rng.uniform(0.15, 0.6) * _v2_stdm(profile) * slow_wave / (_v2_stdm(slow_wave) + 1e-12)
     level_scale = np.exp(rng.normal(np.log(80.0), 2.2))
     x = level_scale * profile
-    signal_sd = level_scale * profile.std()
+    signal_sd = level_scale * _v2_stdm(profile)
     rl = rng.random()
     if rl >= 0.15:
         drift_amp = signal_sd * (rng.uniform(0.05, 0.3) if rl < 0.6 else rng.uniform(0.3, 0.9))
         x += drift_amp * _pt_slow_sine_mixture(rng, t, n, int(rng.integers(1, 3)))
     if rng.random() < 0.1:
         x += signal_sd * rng.normal(0.0, 0.6) * (t / n - 0.5)
-    series_sd = x.std() + 1e-12 * (1.0 + level_scale)
+    series_sd = _v2_stdm(x) + 1e-12 * (1.0 + level_scale)
     ev = rng.random()
     if ev < 0.12:
         k = int(rng.integers(n // 5, 4 * n // 5))
@@ -12761,7 +13299,7 @@ def _pt_periodic_profile_series(rng, n):
         k = int(rng.integers(n // 4, 3 * n // 4))
         g = np.ones(n)
         g[k:] = rng.uniform(0.15, 0.5)
-        x = (x - x.mean()) * g + x.mean()
+        x = (x - _v2_meanm(x)) * g + _v2_meanm(x)
     if p <= 7:
         noise_frac = rng.uniform(0.03, 0.22)
     elif rng.random() < (0.62 if p <= 48 else 0.5):
@@ -12782,7 +13320,7 @@ def _pt_periodic_profile_series(rng, n):
     if rq < 0.25:
         q = 1.0 if rq < 0.1 and series_sd > 60.0 else series_sd / float(np.exp(rng.uniform(np.log(20.0), np.log(2000.0))))
         xq = np.round(x / q) * q
-        if np.mean(np.diff(xq) == 0) < 0.045:
+        if _v2_mean(np.diff(xq) == 0) < 0.045:
             x = xq
     x = np.where(np.isfinite(x), x, 0.0)
     return x.astype(np.float64)
@@ -12802,7 +13340,7 @@ def _pt_ar_smoothed_unit_noise(rng, n, timescale, n_passes):
     y = _pt_ar1_filter_stationary(rng.standard_normal(n), ar_coef)
     if n_passes == 2:
         y = _pt_ar1_filter_stationary(y, ar_coef)
-    s = y.std()
+    s = _v2_stdm(y)
     return y / s if s > 0 else y
 
 def _pt_ar1_student_t_noise(rng, n):
@@ -12954,12 +13492,12 @@ def _pt_smooth_log_level_series(rng, n):
     x = x * (10.0 ** lg / median_abs)
     if lg > 2.3 and rng.random() < 0.35:
         r = np.round(x)
-        if np.mean(np.diff(r) == 0) < 0.03:
+        if _v2_mean(np.diff(r) == 0) < 0.03:
             x = r
     elif rng.random() < 0.5:
         q = 10.0 ** (np.floor(lg) - 3)
         r = np.round(x / q) * q
-        if np.mean(np.diff(r) == 0) < 0.03:
+        if _v2_mean(np.diff(r) == 0) < 0.03:
             x = r
     x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
     return np.ascontiguousarray(x, dtype=np.float64)
@@ -13380,7 +13918,7 @@ def _pt_interconnector_net_flow(rng, n):
     z = z + float(rng.uniform(0.02, 0.09)) * rng.standard_normal(n)
     if rng.random() < 0.4:
         z = z + float(rng.uniform(-0.4, 0.4)) * (z * z - 1.0)
-    sd = float(np.std(z)) + 1e-12
+    sd = float(_v2_std(z)) + 1e-12
     z = z / sd
     mu = flow_scale * float(rng.uniform(-0.9, 0.9))
     flow_spread = flow_scale * float(rng.uniform(0.12, 0.6))
@@ -13530,10 +14068,10 @@ def _pt_outlier_contaminated_noise(rng, n, scale):
 def _pt_zero_diff_fraction(x):
     if x.shape[0] < 2:
         return 0.0
-    return float(np.mean(np.diff(x) == 0.0))
+    return float(_v2_mean(np.diff(x) == 0.0))
 
 def _pt_is_rounded_to_constant(y, x):
-    return float(np.std(x)) > 0.0 and float(np.std(y)) == 0.0
+    return float(_v2_std(x)) > 0.0 and float(_v2_std(y)) == 0.0
 
 def _pt_quantize_to_flat_fraction(rng, x, target_flat_frac):
     if rng.random() < _pt_QUANT_SKIP_PROB:
@@ -13743,11 +14281,11 @@ def _pt_sparse_pulse_response_series(rng, n):
     noise_timescale = float(np.exp(rng.uniform(np.log(30.0), np.log(600.0))))
     noise_ar_coef = float(np.clip(np.exp(-1.0 / noise_timescale), 0.0, 0.99999))
     ar_noise = _pt_weighted_dual_ar1_sum(rng.standard_normal(n) * np.sqrt(max(1e-12, 1.0 - noise_ar_coef * noise_ar_coef)), np.zeros(n), noise_ar_coef, 0.0, 1.0, 0.0)
-    ms = float(np.std(ar_noise))
+    ms = float(_v2_std(ar_noise))
     log_level = log_level + rng.uniform(0.0, 0.2) * pulse_decades * ar_noise / (ms if ms > 0 else 1.0)
     log_level += _pt_outlier_contaminated_noise(rng, n, rng.uniform(0.00015, 0.0022) if sharp_regime else rng.uniform(0.0008, 0.016))
     base_level = float(np.exp(rng.uniform(np.log(0.03), np.log(400.0))))
-    x = base_level * np.exp(log_level - log_level.mean())
+    x = base_level * np.exp(log_level - _v2_meanm(log_level))
     mode = rng.random()
     if mode < 0.35:
         x = np.sign(x) * np.abs(x) ** rng.uniform(0.35, 0.65)
@@ -13755,7 +14293,7 @@ def _pt_sparse_pulse_response_series(rng, n):
         if rng.random() < 0.75:
             x = x + float(np.exp(rng.uniform(np.log(0.5), np.log(8000.0))))
         elif rng.random() < 0.4:
-            x = x - rng.uniform(0.2, 4.0) * float(np.std(x) + 1e-09)
+            x = x - rng.uniform(0.2, 4.0) * float(_v2_std(x) + 1e-09)
     elif mode < 0.5:
         x = x - x.min() + float(np.exp(rng.uniform(np.log(1.0), np.log(300.0))))
     target_flat_frac = float(np.clip(rng.beta(3.0, 2.6), 0.02, 0.94))
@@ -13771,7 +14309,7 @@ def _pt_integrated_ar_mixture_series(rng, n):
     mean_reversion = float(np.exp(rng.uniform(np.log(2e-05), np.log(0.003))))
     e = rng.standard_normal(n)
     x = _pt_leaky_integrate_ar1_velocity(e, velocity_ar_coef, mean_reversion)
-    s = float(np.std(x))
+    s = float(_v2_std(x))
     if s <= 0.0:
         s = 1.0
     x = x / s
@@ -13797,10 +14335,10 @@ def _pt_integrated_ar_mixture_series(rng, n):
     noise_timescale = float(np.exp(rng.uniform(np.log(20.0), np.log(400.0))))
     noise_ar_coef = float(np.clip(np.exp(-1.0 / noise_timescale), 0.0, 0.99999))
     ar_noise = _pt_weighted_dual_ar1_sum(rng.standard_normal(n) * np.sqrt(max(1e-12, 1.0 - noise_ar_coef * noise_ar_coef)), np.zeros(n), noise_ar_coef, 0.0, 1.0, 0.0)
-    ms = float(np.std(ar_noise))
+    ms = float(_v2_std(ar_noise))
     x = x + rng.uniform(0.0, 0.7) * ar_noise / (ms if ms > 0 else 1.0)
     x = x + _pt_outlier_contaminated_noise(rng, n, float(np.exp(rng.uniform(np.log(0.0025), np.log(0.1)))))
-    x = x / (float(np.std(x)) + 1e-12)
+    x = x / (float(_v2_std(x)) + 1e-12)
     cv = float(np.exp(rng.uniform(np.log(0.005), np.log(1.5))))
     base_level = float(np.exp(rng.uniform(np.log(0.05), np.log(1500.0))))
     x = base_level * (1.0 + cv * x)
@@ -13825,7 +14363,7 @@ def _pt_two_timescale_weather_series(rng, n):
     n1 = np.sqrt(max(1e-12, 1.0 - a1 * a1))
     n2 = np.sqrt(max(1e-12, 1.0 - a2 * a2))
     ar_mix = _pt_weighted_dual_ar1_sum(rng.standard_normal(n) * n1, rng.standard_normal(n) * n2, a1, a2, 1.0 - slow_weight, slow_weight)
-    rs = float(np.std(ar_mix))
+    rs = float(_v2_std(ar_mix))
     ar_mix = ar_mix / (rs if rs > 0 else 1.0)
     nh = 1 + int(rng.integers(0, 3))
     a0 = float(np.exp(rng.uniform(np.log(0.1), np.log(3.0))))
@@ -13840,8 +14378,8 @@ def _pt_two_timescale_weather_series(rng, n):
         slow_wave = _pt_slow_sine_with_end_phase(rng, n, P * float(np.exp(rng.uniform(np.log(20.0), np.log(400.0)))), rng.uniform(0.15, 1.1), 0.6)
     y = seasonal + ar_mix + slow_wave
     y = y + _pt_outlier_contaminated_noise(rng, n, rng.uniform(0.0015, 0.055))
-    y = y - y.mean()
-    ys = float(np.std(y))
+    y = y - _v2_meanm(y)
+    ys = float(_v2_std(y))
     y = y / (ys if ys > 0 else 1.0)
     sensor_kind = _pt_draw_weighted_value(rng, np.array([0, 1, 2, 3, 4]), np.array([0.44, 0.1, 0.08, 0.14, 0.24]))
     if sensor_kind == 0:
@@ -13863,7 +14401,7 @@ def _pt_two_timescale_weather_series(rng, n):
         target_flat_frac = float(np.clip(rng.beta(2.2, 7.0), 0.01, 0.6))
     else:
         slow_baseline = _pt_weighted_dual_ar1_sum(rng.standard_normal(n) * np.sqrt(max(1e-12, 1.0 - a2 * a2)), np.zeros(n), min(0.99999, float(np.exp(-1.0 / (slow_timescale * rng.uniform(3.0, 30.0))))), 0.0, 1.0, 0.0)
-        bs = float(np.std(slow_baseline))
+        bs = float(_v2_std(slow_baseline))
         slow_baseline = slow_baseline / (bs if bs > 0 else 1.0)
         x = rng.uniform(4.0, 30.0) + slow_baseline * rng.uniform(0.3, 6.0) + 0.05 * y
         target_flat_frac = float(np.clip(rng.beta(2.5, 6.0), 0.01, 0.7))
@@ -13881,7 +14419,7 @@ def _pt_markov_intermittent_precip_series(rng, n):
     envelope_timescale = float(np.exp(rng.uniform(np.log(30.0), np.log(600.0))))
     envelope_ar_coef = float(np.clip(np.exp(-1.0 / envelope_timescale), 0.0, 0.9999))
     envelope = _pt_weighted_dual_ar1_sum(rng.standard_normal(n) * np.sqrt(max(1e-12, 1.0 - envelope_ar_coef * envelope_ar_coef)), np.zeros(n), envelope_ar_coef, 0.0, 1.0, 0.0)
-    es = float(np.std(envelope))
+    es = float(_v2_std(envelope))
     envelope = np.exp(rng.uniform(0.3, 1.4) * envelope / (es if es > 0 else 1.0) + _pt_slow_sine_with_end_phase(rng, n, max(200.0, n * rng.uniform(0.4, 2.0)), rng.uniform(0.0, 0.9), 0.68))
     intensity_ar_coef = float(np.clip(rng.uniform(0.0, 0.85), 0.0, 0.99))
     lm = _pt_weighted_dual_ar1_sum(rng.standard_normal(n) * np.sqrt(max(1e-12, 1.0 - intensity_ar_coef * intensity_ar_coef)), np.zeros(n), intensity_ar_coef, 0.0, 1.0, 0.0)
@@ -14105,7 +14643,7 @@ def _pt_occupancy_arrival_departure_counts(rng, n):
     wk = np.where(is_weekend, rng.uniform(0.25, 0.85), 1.0)
     flow_profile = baseline_flow + wk * (rng.uniform(0.5, 1.0) * am + rng.uniform(0.5, 1.0) * pm)
     flow_profile = flow_profile + rng.uniform(0.3, 1.1) * np.where(is_weekend, 1.4, 0.7) * midday
-    flow_profile = flow_profile / max(flow_profile.mean(), 1e-09)
+    flow_profile = flow_profile / max(_v2_meanm(flow_profile), 1e-09)
     flow_skew = rng.uniform(0.1, 0.65) * (1.0 if rng.random() < 0.5 else -1.0)
     flow_skew = flow_skew * wk * (am - pm) / max(float(np.abs(am - pm).max()), 1e-09)
     log_rate_noise = _pt_occ_ar1_noise(rng, n, rng.uniform(0.4, 3.0) * steps_per_day, rng.uniform(0.1, 0.4))
@@ -14225,10 +14763,10 @@ def _pt_random_daily_profile(rng: np.random.Generator, p: int) -> np.ndarray:
     floor = 10.0 ** rng.uniform(-2.3, -0.03)
     gamma = rng.uniform(0.6, 1.5)
     profile = floor + (1.0 - floor) * b ** gamma
-    profile /= profile.mean()
+    profile /= _v2_meanm(profile)
     if rng.random() < 0.3:
         profile = 1.0 + rng.uniform(0.12, 0.85) * (profile - 1.0)
-    return profile / profile.mean()
+    return profile / _v2_meanm(profile)
 
 def _pt_poisson_or_overdispersed_counts(rng: np.random.Generator, mu: np.ndarray) -> np.ndarray:
     mu = np.maximum(mu, 0.0)
@@ -14278,7 +14816,7 @@ def _pt_daily_profile_counts_with_drift(rng: np.random.Generator, n: int) -> np.
             log_drift[s:] += rng.uniform(-0.35, 0.35)
     ar_noise = _pt_ar1_noise_from_coef(rng, n, rng.uniform(0.55, 0.95), rng.uniform(0.03, 0.42))
     base_level = 10.0 ** (rng.uniform(4.0, 6.0) if rng.random() < 0.15 else rng.uniform(0.6, 4.0))
-    mu = base_level * seasonal * np.exp(log_drift + ar_noise - 0.5 * ar_noise.var())
+    mu = base_level * seasonal * np.exp(log_drift + ar_noise - 0.5 * _v2_varm(ar_noise))
     x = _pt_poisson_or_overdispersed_counts(rng, mu)
     median_count = float(np.median(x))
     if rng.random() < 0.35 and median_count > 8.0:
@@ -14306,7 +14844,7 @@ def _pt_long_period_seasonal_levels(rng: np.random.Generator, n: int) -> np.ndar
     n_harmonics = int(rng.integers(2, 4))
     for h in range(1, n_harmonics + 1):
         shape += rng.uniform(0.35, 1.0) / h * np.cos(2.0 * np.pi * h * t / p + rng.uniform(0.0, 2.0 * np.pi))
-    sd = float(shape.std())
+    sd = float(_v2_stdm(shape))
     if sd > 1e-12:
         shape *= season_amp / sd
     slow_wander = _pt_ar1_noise_from_coef(rng, n, min(0.9999, float(np.exp(-rng.uniform(1.5, 8.0) / max(n, 2)))), rng.uniform(0.03, 0.22))
@@ -14384,7 +14922,7 @@ def _pt_cumulative_download_counter(rng: np.random.Generator, n: int) -> np.ndar
         rate[s:] *= rng.uniform(0.45, 2.2)
     start_total = 10.0 ** rng.uniform(5.0, 11.0)
     growth_frac = max(10.0 ** rng.uniform(-2.75, -1.5), 120.0 / start_total)
-    m = rate.mean()
+    m = _v2_meanm(rate)
     rate = rate * (start_total * growth_frac / n / (m if m > 1e-12 else 1.0))
     increments = _pt_poisson_or_overdispersed_counts(rng, rate)
     if rng.random() < 0.1:
@@ -14461,11 +14999,11 @@ def _pt_epidemic_weekly_sums(rng, n):
     g = 10.0 ** (-rng.uniform(0.5, 1.7) * np.clip((ramp_in_end - t) / max(ramp_in_end, 1.0), 0.0, 1.0)) * 10.0 ** (-rng.uniform(0.5, 1.9) * np.clip((t - ramp_out_start) / max(m - ramp_out_start, 1.0), 0.0, 1.0))
     count_scale = 10.0 ** float(np.clip(rng.normal(2.25, 0.76), 0.95, 3.25))
     log_noise = rng.uniform(0.08, 0.3) * _pt_smooth_random_curve(rng, m + 6, rng.uniform(25.0, 90.0))
-    daily_mean = count_scale * (background_frac * g + (1.0 - background_frac) * wave_curve) * np.exp(log_noise - 0.5 * log_noise.var())
+    daily_mean = count_scale * (background_frac * g + (1.0 - background_frac) * wave_curve) * np.exp(log_noise - 0.5 * _v2_varm(log_noise))
     dow = (np.arange(m + 6, dtype=np.int64) + int(rng.integers(0, 7))) % 7
     wk = np.exp(rng.normal(0.0, rng.uniform(0.04, 0.16), 7))
     wk[5:] *= rng.uniform(0.7, 0.97)
-    daily_mean = daily_mean * (wk[dow] / wk.mean())
+    daily_mean = daily_mean * (wk[dow] / _v2_meanm(wk))
     c = _pt_overdispersed_poisson_counts(rng, np.maximum(daily_mean, 0.0) / 7.0, float(np.exp(rng.uniform(np.log(3.0), np.log(45.0)))))
     x = np.rint(np.convolve(c, _pt_SEVEN_DAY_SUM_KERNEL, mode='valid'))
     np.maximum(x, 0.0, out=x)
@@ -14569,7 +15107,7 @@ class _pt_Generator(DataGenerator):
         if fam in _pt_NATIVE_SCALE_FAMILIES:
             return x
         if fam not in ('poisson_gp_intensity_counts', 'bounded_integer_walk', 'weekday_poisson_counts'):
-            sd = float(x.std())
+            sd = float(_v2_stdm(x))
             if sd > 1e-12:
                 x = x / sd
             x = x * float(np.exp(rng.uniform(np.log(0.05), np.log(500.0))))
@@ -14608,7 +15146,7 @@ class _pt_Generator(DataGenerator):
                 x = self._randomize_scale(rng, x, fam)
             if was_integer:
                 x = np.round(x)
-            repeat_frac = float(np.mean(np.diff(x) == 0.0)) if x.size > 1 else 1.0
+            repeat_frac = float(_v2_mean(np.diff(x) == 0.0)) if x.size > 1 else 1.0
             hold_allowed = (repeat_frac >= self._hold_gate_min_repeat_frac) | (rng.random() < self._hold_gate_bypass_prob)
             if rng.random() < self._tail_hold_prob and (not is_raw) and hold_allowed:
                 x = _pt_apply_tail_hold(rng, x, self._tail_hold_max_len)
@@ -15167,11 +15705,11 @@ class _TeachStream:
 def _teach_pair_ok(a, b):
     if a.ndim != 1 or b.shape != a.shape or not np.isfinite(a).all() or not np.isfinite(b).all():
         return False
-    sa = float(a.std())
-    sb = float(b.std())
+    sa = float(_v2_stdm(a))
+    sb = float(_v2_stdm(b))
     if sa <= 1e-9 * (float(np.abs(a).mean()) + 1e-12) or sb <= 1e-9 * (float(np.abs(b).mean()) + 1e-12):
         return False
-    c = float(np.dot(a - a.mean(), b - b.mean()) / (a.size * sa * sb))
+    c = float(np.dot(a - _v2_meanm(a), b - _v2_meanm(b)) / (a.size * sa * sb))
     return abs(c) < 0.99
 
 import math
@@ -16101,11 +16639,11 @@ def _w9q_rki_endemic_sums(rng, n):
     count_scale = 10.0 ** float(np.clip(rng.normal(2.25, 0.76), 0.95, 3.25))
     log_noise = rng.uniform(0.08, 0.3) * _pt_smooth_random_curve(rng, m + 6, rng.uniform(25.0, 90.0))
     daily_mean = count_scale * (background_frac * g + (1.0 - background_frac) * wave_curve) \
-        * np.exp(log_noise - 0.5 * log_noise.var())
+        * np.exp(log_noise - 0.5 * _v2_varm(log_noise))
     dow = (np.arange(m + 6, dtype=np.int64) + int(rng.integers(0, 7))) % 7
     wk = np.exp(rng.normal(0.0, rng.uniform(0.04, 0.16), 7))
     wk[5:] *= rng.uniform(0.7, 0.97)
-    daily_mean = daily_mean * (wk[dow] / wk.mean())
+    daily_mean = daily_mean * (wk[dow] / _v2_meanm(wk))
     c = _pt_overdispersed_poisson_counts(rng, np.maximum(daily_mean, 0.0) / 7.0,
                                          float(np.exp(rng.uniform(np.log(3.0), np.log(45.0)))))
     x = np.rint(np.convolve(c, _pt_SEVEN_DAY_SUM_KERNEL, mode='valid'))
@@ -16136,8 +16674,7 @@ class Generator(DataGenerator):
 
     def _partner_row(self, i, it1):
         self._cpl_off = False
-        if _TMIX > 0.0 and (_TMIX >= 1.0 or np.random.default_rng(
-                np.random.SeedSequence([self._seed, _TMIX_TAG], spawn_key=(i,))).random() < _TMIX):
+        if _TMIX > 0.0 and (_TMIX >= 1.0 or _fcx_coin(self._seed, _TMIX_TAG, i) < _TMIX):
             y = np.asarray(self._teach.next(), dtype=np.float64)
 
             self._cpl_off = self._teach.last_name == "slow_level"
@@ -16162,7 +16699,7 @@ class Generator(DataGenerator):
                 except StopIteration:
                     return
                 if live and _Q > 0.0:
-                    u = np.random.default_rng(np.random.SeedSequence([self._seed, _TAG], spawn_key=(i,))).random()
+                    u = _fcx_coin(self._seed, _TAG, i)
                     if u < _Q:
                         try:
                             y = self._partner_row(i, it1)
@@ -16172,13 +16709,13 @@ class Generator(DataGenerator):
                             a = x.reshape(-1, x.shape[-1]); b = y.reshape(-1, y.shape[-1]); L = min(a.shape[-1], b.shape[-1])
                             z = np.concatenate([a[:, a.shape[-1] - L:], b[:, b.shape[-1] - L:]], axis=0)
                             if _CPL > 0.0 and z.shape[0] == 2 and not self._cpl_off:
-                                d0 = np.diff(z[0]); s0 = float(np.std(d0)); d1 = np.diff(z[1]); s1 = float(np.std(d1))
+                                d0 = np.diff(z[0]); s0 = float(_v2_std(d0)); d1 = np.diff(z[1]); s1 = float(_v2_std(d1))
                                 if s0 > 0.0 and s1 > 0.0 and np.isfinite(s0) and np.isfinite(s1):
-                                    zz = np.concatenate([[0.0], np.clip((d0 - d0.mean()) / s0, -6.0, 6.0)])
+                                    zz = np.concatenate([[0.0], np.clip((d0 - _v2_meanm(d0)) / s0, -6.0, 6.0)])
                                     p = int(np.argmax(z[1] != z[1][0]))
                                     zz[:p] = 0.0
                                     z = np.stack([z[0], z[1] + (_CPL * s1) * zz])
-                            if np.all(np.std(z, axis=1) > 1e-9 * (np.abs(z).mean(axis=1) + 1e-12)) and np.std(z[0] - z[1]) > 1e-9 * (np.abs(z).mean() + 1e-12):
+                            if np.all(np.std(z, axis=1) > 1e-9 * (np.abs(z).mean(axis=1) + 1e-12)) and _v2_std(z[0] - z[1]) > 1e-9 * (np.abs(z).mean() + 1e-12):
                                 x = np.ascontiguousarray(z)
                 yield x
         finally:
@@ -16191,18 +16728,65 @@ _BAND_MIX = {"ixp_traffic": 0.30, "signed_flow": 0.0, "web_counter": 0.30, "seas
              "sparse_counts": 0.0, "ed_visit_share": 0.30}
 _FORK_DEDUP_TAG = 1110103
 
+_K87_MEMO = {}
+
 def _k87_quiet(r):
 
     recent = np.asarray(r[-192:], dtype=np.float64)
     if recent.size < 64:
         return False
+    key = (recent.shape, recent.tobytes())
+    hit = _K87_MEMO.get(key)
+    if hit is not None:
+        return hit
+    if len(_K87_MEMO) >= 4096:
+        _K87_MEMO.clear()
+    out = _k87_quiet_eval(recent)
+    _K87_MEMO[key] = out
+    return out
+
+def _k87_quiet_slow(recent):
     d = np.abs(np.diff(recent))
     q10, q90 = np.quantile(recent, (0.10, 0.90)); peak = float(np.max(np.abs(recent)))
     span = max(float(q90 - q10), peak * 1e-12, 1e-12); tol = max(peak * 1e-12, 1e-12)
-    if float(np.mean(d <= tol)) >= 0.35:
+    if float(_v2_mean(d <= tol)) >= 0.35:
         return True
     drift = abs(float(np.median(recent[-32:]) - np.median(recent[:32]))) / span
     return float(np.quantile(d, 0.90)) / span <= 0.03 and drift <= 0.12
+
+def _k87_lin(s, q):
+    v = (s.size - 1) * q
+    j = int(np.floor(v))
+    g = v - float(j)
+    a = s[j]
+    b = s[j + 1]
+    diff = b - a
+    if g >= 0.5:
+        return b - diff * (1 - g)
+    return a + diff * g
+
+def _k87_quiet_eval(recent):
+    if recent.ndim != 1 or recent.size < 64:
+        return _k87_quiet_slow(recent)
+    s = np.sort(recent)
+    lo = s[0]
+    hi = s[-1]
+    if not (np.isfinite(lo) and np.isfinite(hi)):
+        return _k87_quiet_slow(recent)
+    d = np.abs(np.diff(recent))
+    q10 = _k87_lin(s, 0.10)
+    q90 = _k87_lin(s, 0.90)
+    peak = float(max(abs(lo), abs(hi)))
+    span = max(float(q90 - q10), peak * 1e-12, 1e-12); tol = max(peak * 1e-12, 1e-12)
+    if np.count_nonzero(d <= tol) / d.size >= 0.35:
+        return True
+    sd = np.sort(d)
+    if not np.isfinite(sd[-1]):
+        return _k87_quiet_slow(recent)
+    m1 = np.sort(recent[-32:])
+    m0 = np.sort(recent[:32])
+    drift = abs(float((m1[15] + m1[16]) / 2 - (m0[15] + m0[16]) / 2)) / span
+    return float(_k87_lin(sd, 0.90)) / span <= 0.03 and drift <= 0.12
 
 def _band_weights():
     w = np.array([float(_BAND_MIX.get(name, 0.0)) for name, _ in _TEACH_FAMILIES], dtype=np.float64)
@@ -16243,21 +16827,21 @@ class Generator(_PublishedGenerator):
         try:
             for i, x in enumerate(base):
                 if _BAND_Q > 0.0 and np.ndim(x) == 1:
-                    v = np.random.default_rng(np.random.SeedSequence([self._seed, _BAND_TAG], spawn_key=(i,))).random()
+                    v = _fcx_coin(self._seed, _BAND_TAG, i)
                     if v < _BAND_Q and not _k87_quiet(x):
                         y = np.asarray(self._bteach.next(), dtype=np.float64)
                         a = np.asarray(x, dtype=np.float64).reshape(1, -1); b = y.reshape(-1, y.shape[-1])
                         L = min(a.shape[-1], b.shape[-1])
                         z = np.concatenate([a[:, a.shape[-1] - L:], b[:, b.shape[-1] - L:]], axis=0)
                         if _CPL > 0.0 and z.shape[0] == 2:
-                            d0 = np.diff(z[0]); s0 = float(np.std(d0)); d1 = np.diff(z[1]); s1 = float(np.std(d1))
+                            d0 = np.diff(z[0]); s0 = float(_v2_std(d0)); d1 = np.diff(z[1]); s1 = float(_v2_std(d1))
                             if s0 > 0.0 and s1 > 0.0 and np.isfinite(s0) and np.isfinite(s1):
-                                zz = np.concatenate([[0.0], np.clip((d0 - d0.mean()) / s0, -6.0, 6.0)])
+                                zz = np.concatenate([[0.0], np.clip((d0 - _v2_meanm(d0)) / s0, -6.0, 6.0)])
                                 p = int(np.argmax(z[1] != z[1][0]))
                                 zz[:p] = 0.0
                                 z = np.stack([z[0], z[1] + (_CPL * s1) * zz])
                         if (np.all(np.std(z, axis=1) > 1e-9 * (np.abs(z).mean(axis=1) + 1e-12))
-                                and np.std(z[0] - z[1]) > 1e-9 * (np.abs(z).mean() + 1e-12)):
+                                and _v2_std(z[0] - z[1]) > 1e-9 * (np.abs(z).mean() + 1e-12)):
                             x = np.ascontiguousarray(z)
                 yield x
         finally:
@@ -16345,7 +16929,7 @@ def _w86e2_smooth2(r, m, tau):
 
     phi = float(np.exp(-1.0 / max(tau, 1.0)))
     y = _w86e2_ar_e(_w86e2_ar_e(r.standard_normal(m + int(4 * tau) + 8), phi), phi)[-m:]
-    return y / (float(np.std(y)) + 1e-12)
+    return y / (float(_v2_std(y)) + 1e-12)
 
 def _w86e2_holds(r, x, p):
     if p <= 0.0:
@@ -16899,7 +17483,7 @@ def _w86c_day_profile(rng, P, office):
     span = lp.max() - lp.min()
     lp = (lp - lp.max()) / (span if span > 1e-9 else 1.0) * np.log(1.0 / trough)
     p = np.exp(lp)
-    return p / p.mean()
+    return p / _v2_meanm(p)
 
 def _w86c_event_hourly(rng, n):
     P = 48 if rng.random() < 0.2 else 24
@@ -16918,7 +17502,7 @@ def _w86c_event_hourly(rng, n):
         else:
             wk[4:6] *= rng.uniform(1.0, 1.15)
             wk[6] *= rng.uniform(0.85, 1.05)
-        wk /= wk.mean()
+        wk /= _v2_meanm(wk)
         dow = (day + int(rng.integers(0, 7))) % 7
 
         nd = int(day.max()) + 1
@@ -17047,7 +17631,7 @@ def _w86a_pollutant(r, S):
     h, day = _w86a_clock(r, S, P, prof, key)
     dow = (day + int(r.integers(0, 7))) % 7
     pr = prof(h)
-    pr = pr - pr.mean()
+    pr = pr - _v2_meanm(pr)
     wk = np.ones(S)
     if sp in ('no2', 'no', 'co'):
         wk = np.where(dow >= 5, np.log(r.uniform(0.6, 0.9)), 0.0)
@@ -17329,10 +17913,22 @@ def _w86b_rates_one(r):
     kind = 'policy' if r.random() < _W86B_POL_P else 'mkt'
     return _w86r_record(r, _pt_sample_series_length(r), kind)
 
+_W86B_MEMO = {}
+
 def _w86b_intlike(x):
 
     t = np.asarray(x[-512:], dtype=np.float64)
-    return bool(t.size and np.mean(t == np.round(t)) >= 0.98)
+    if not t.size:
+        return False
+    key = (t.shape, t.tobytes())
+    hit = _W86B_MEMO.get(key)
+    if hit is not None:
+        return hit
+    if len(_W86B_MEMO) >= 4096:
+        _W86B_MEMO.clear()
+    out = bool(np.count_nonzero(t == np.round(t)) / t.size >= 0.98)
+    _W86B_MEMO[key] = out
+    return out
 
 _W86B_FAMILIES = (("w86b_energy", _w86b_energy_one, 0.40), ("w86b_civic", _w86b_civic_one, 0.20),
                   ("w86b_rates", _w86b_rates_one, 0.20), ("w86b_air", _w86b_air_one, 0.20))
@@ -17385,7 +17981,7 @@ def _w86b_add(stream, x):
     z[0] = x
     z[1] = y
     if (np.all(np.isfinite(z)) and np.all(np.std(z, axis=1) > 1e-9 * (np.abs(z).mean(axis=1) + 1e-12))
-            and np.std(z[0] - z[1]) > 1e-9 * (np.abs(z).mean() + 1e-12) and np.array_equal(z[0], x)):
+            and _v2_std(z[0] - z[1]) > 1e-9 * (np.abs(z).mean() + 1e-12) and np.array_equal(z[0], x)):
         return z
     stream.last_fam = -1
     return None
@@ -17411,7 +18007,7 @@ class Generator(_W86BParent):
         try:
             for i, x in enumerate(base):
                 if _W86B_Q > 0.0 and np.ndim(x) == 1:
-                    u = np.random.default_rng(np.random.SeedSequence([seed, _W86B_COIN_TAG], spawn_key=(i,))).random()
+                    u = _fcx_coin(seed, _W86B_COIN_TAG, i)
                     if u < _W86B_Q and not _k87_quiet(x) and not _w86b_intlike(x):
                         z = _w86b_add(self._w86b_stream, x)
                         if z is not None:
@@ -17438,13 +18034,25 @@ _P25_CUM = np.cumsum([w for _, w in _P25_FAMILIES])
 def _p25_len(r, lo, hi):
     return int(r.integers(lo, hi + 1))
 
+@njit(cache=False, fastmath=False, nogil=True)
+def _fcx_ar1_fill(out, e, phi):
+    for t in range(1, out.shape[0]):
+        out[t] = phi * out[t - 1] + e[t]
+
+def _fcx_ar1(out, e, phi):
+    if (type(out) is np.ndarray and out.dtype == np.float64 and out.ndim == 1 and type(e) is np.ndarray
+            and e.dtype == np.float64 and e.ndim == 1 and e.shape[0] >= out.shape[0] and type(phi) in (float, np.float64)):
+        _fcx_ar1_fill(out, np.ascontiguousarray(e), float(phi))
+        return
+    for t in range(1, out.shape[0]):
+        out[t] = phi * out[t - 1] + e[t]
+
 def _p25_ar1(r, n, phi, sd):
     phi = float(np.clip(phi, -0.99, 0.99))
     e = r.standard_normal(n) * sd * np.sqrt(max(1.0 - phi * phi, 1e-8))
     out = np.empty(n, dtype=np.float64)
     out[0] = r.standard_normal() * sd
-    for t in range(1, n):
-        out[t] = phi * out[t - 1] + e[t]
+    _fcx_ar1(out, e, phi)
     return out
 
 def _p25_daily_share(r):
@@ -17485,7 +18093,7 @@ def _p25_weekday_counts(r):
     if r.random() < 0.25:
         dow[5] = r.uniform(0.7, 1.15)
         dow[6] = r.uniform(0.55, 1.05)
-    dow = dow / dow.mean()
+    dow = dow / _v2_meanm(dow)
     phase = int(r.integers(0, 7))
     rate = mu * dow[(np.arange(n) + phase) % 7]
     rate = rate * np.exp(_p25_ar1(r, n, r.uniform(0.2, 0.65), r.uniform(0.15, 0.45)))
@@ -17546,7 +18154,7 @@ def _p25_held_intraday(r):
         n = _p25_len(r, 800, 4096)
         mu = float(np.exp(r.uniform(np.log(1.0), np.log(80.0))))
         prof = 0.35 + 0.9 * np.clip(np.sin(2.0 * np.pi * (np.arange(p) / p - r.uniform(0.15, 0.4))), 0, None)
-        prof = prof / max(prof.mean(), 1e-6)
+        prof = prof / max(_v2_meanm(prof), 1e-6)
         rate = mu * prof[np.arange(n) % p]
         x = r.poisson(np.clip(rate, 0, 1e6)).astype(np.float64)
         h = r.random(n) < r.uniform(0.08, 0.4)
@@ -17625,7 +18233,7 @@ def _p25_add(stream, x):
     z[0] = x
     z[1] = y
     if (np.all(np.isfinite(z)) and np.all(np.std(z, axis=1) > 1e-9 * (np.abs(z).mean(axis=1) + 1e-12))
-            and np.std(z[0] - z[1]) > 1e-9 * (np.abs(z).mean() + 1e-12) and np.array_equal(z[0], x)):
+            and _v2_std(z[0] - z[1]) > 1e-9 * (np.abs(z).mean() + 1e-12) and np.array_equal(z[0], x)):
         return z
     return None
 
@@ -17650,7 +18258,7 @@ class Generator(_P25Parent):
         try:
             for i, x in enumerate(base):
                 if _P25_Q > 0.0 and np.ndim(x) == 1:
-                    u = np.random.default_rng(np.random.SeedSequence([seed, _P25_COIN_TAG], spawn_key=(i,))).random()
+                    u = _fcx_coin(seed, _P25_COIN_TAG, i)
                     if u < _P25_Q and not _k87_quiet(x) and not _w86b_intlike(x):
                         z = _p25_add(self._p25_stream, x)
                         if z is not None:
@@ -17712,7 +18320,7 @@ class Generator(_KParent):
         try:
             for i, x in enumerate(base):
                 if _K_Q > 0.0 and np.ndim(x) == 1 and np.asarray(x).size >= 64:
-                    u = np.random.default_rng(np.random.SeedSequence([seed, _K_COIN_TAG], spawn_key=(i,))).random()
+                    u = _fcx_coin(seed, _K_COIN_TAG, i)
                     if u < _K_Q and not _k87_quiet(x):
                         r = np.random.default_rng(np.random.SeedSequence([self._k_seed, _K_TAG], spawn_key=(self._k_n,)))
                         self._k_n += 1
@@ -17757,7 +18365,7 @@ class Generator(_K2Parent):
         try:
             for i, x in enumerate(base):
                 if _K2_Q > 0.0 and np.ndim(x) == 2 and np.shape(x)[0] == 2 and np.shape(x)[1] >= 64:
-                    u = np.random.default_rng(np.random.SeedSequence([seed, _K2_COIN_TAG], spawn_key=(i,))).random()
+                    u = _fcx_coin(seed, _K2_COIN_TAG, i)
                     if u < _K2_Q and not _k87_quiet(np.asarray(x)[0]):
                         r = np.random.default_rng(np.random.SeedSequence([self._k2_seed, _K2_TAG], spawn_key=(self._k2_n,)))
                         self._k2_n += 1
@@ -17829,7 +18437,7 @@ class Generator(_S1Parent):
         try:
             for i, x in enumerate(base):
                 if _S1_Q > 0.0 and np.ndim(x) == 1:
-                    u = np.random.default_rng(np.random.SeedSequence([seed, _S1_COIN_TAG], spawn_key=(i,))).random()
+                    u = _fcx_coin(seed, _S1_COIN_TAG, i)
                     if u < _S1_Q and not _k87_quiet(x) and not _w86b_intlike(x):
                         z = _w86b_add(self._s1_stream, x)
                         if z is not None:
@@ -17925,7 +18533,7 @@ _S2_CUM = np.cumsum([w for _, _, w in _S2_FAMILIES]) / sum(w for _, _, w in _S2_
 
 def _s2_corr(r, x):
     x = np.asarray(x, dtype=np.float64)
-    if x.size and np.mean(x[-512:] == np.round(x[-512:])) >= 0.98 and np.nanmin(x) >= 0.0:
+    if x.size and _v2_mean(x[-512:] == np.round(x[-512:])) >= 0.98 and np.nanmin(x) >= 0.0:
         cap = float(np.nanmax(x)) + float(r.integers(0, 6))
         dock = np.maximum(cap - x, 0.0)
         return dock[None, :]
@@ -17967,7 +18575,7 @@ class Generator(_S2Parent):
         try:
             for i, x in enumerate(base):
                 if _S2_Q > 0.0 and np.ndim(x) == 1 and np.asarray(x).size >= 64:
-                    u = np.random.default_rng(np.random.SeedSequence([seed, _S2_COIN_TAG], spawn_key=(i,))).random()
+                    u = _fcx_coin(seed, _S2_COIN_TAG, i)
                     if u < _S2_Q and not _k87_quiet(x):
                         r = self._s2_stream.rng()
                         f = int(np.searchsorted(_S2_CUM, r.random() * 0.999999))
@@ -18153,12 +18761,12 @@ def _c128_tidal_fnoise(r, n, f_corner, order=2.0, peak=None):
     spec = (r.standard_normal(f.size) + 1j * r.standard_normal(f.size)) * amp
     spec[0] = 0.0
     x = np.fft.irfft(spec, m)[:n]
-    s = float(x.std())
+    s = float(_v2_stdm(x))
     return x / s if s > 0 else x
 
 def _c128_tidal_rough(r, n, d_sd, lo=2.0, hi=15.0):
     z = _c128_tidal_fnoise(r, n, 1.0 / (_C128_TIDAL_TWO_PI * r.uniform(lo, hi)), order=2.0)
-    dz = float(np.std(np.diff(z))) if n > 2 else 1.0
+    dz = float(_v2_std(np.diff(z))) if n > 2 else 1.0
     return z * (d_sd / max(dz, 1e-12))
 
 def _c128_tidal_quant(x, q):
@@ -18227,7 +18835,7 @@ def _c128_tidal_gauge(r, L):
             if a_tot < 0.08 and r.random() < 0.5:
                 amp_s = amp_s * r.uniform(1.5, 4.0)
             env = np.exp(0.45 * _c128_tidal_fnoise(r, n, cad / (60.0 * 18.0), order=2.0))
-            x = x + amp_s * env / max(float(np.sqrt(np.mean(env * env))), 1e-9) * \
+            x = x + amp_s * env / max(float(np.sqrt(_v2_mean(env * env))), 1e-9) * \
                 _c128_tidal_fnoise(r, n, 0.0, peak=(1.0 / p_s, 1.0 / (p_s * q)))
 
     if r.random() < 0.8:
@@ -18236,7 +18844,7 @@ def _c128_tidal_gauge(r, L):
         s_w = _c128_tidal_lu(r, 0.01, 0.05)
     if r.random() < 0.35:
         e = r.standard_t(float(r.uniform(2.5, 6.0)), n)
-        e = e / max(float(e.std()), 1e-9)
+        e = e / max(float(_v2_stdm(e)), 1e-9)
     else:
         e = r.standard_normal(n)
     x = x + s_w * e
@@ -18328,11 +18936,11 @@ def _c128_tidal_press(r, L):
         d_sd = _c128_tidal_lu(r, 0.008, 0.035)
         x = x + _c128_tidal_rough(r, n, d_sd, 1.5, 10.0)
         e = r.standard_t(float(r.uniform(2.2, 4.0)), n)
-        x = x + d_sd * r.uniform(0.2, 0.6) * e / max(float(e.std()), 1e-9)
+        x = x + d_sd * r.uniform(0.2, 0.6) * e / max(float(_v2_stdm(e)), 1e-9)
     else:
         x = x + _c128_tidal_rough(r, n, r.uniform(0.2, 0.6), 1.2, 5.0)
         e = r.standard_t(float(r.uniform(2.2, 4.0)), n)
-        x = x + r.uniform(0.05, 0.25) * e / max(float(e.std()), 1e-9)
+        x = x + r.uniform(0.05, 0.25) * e / max(float(_v2_stdm(e)), 1e-9)
     x = level + x
     v = r.random()
     if cad <= 1.0:
@@ -18356,9 +18964,9 @@ def _c128_tidal_buoy(r, L):
     diel = np.cos(_C128_TIDAL_TWO_PI * (t / day + r.random()))
     syn = _c128_tidal_fnoise(r, n, 1.0 / (_C128_TIDAL_TWO_PI * r.uniform(0.8, 6.0) * day), 1.7)
     syn = syn + r.uniform(0.0, 1.2) * r.choice(np.array([-1.0, 1.0])) * (t / max(n, 1) - 0.5)
-    syn = syn / max(float(syn.std()), 1e-9)
+    syn = syn / max(float(_v2_stdm(syn)), 1e-9)
     ht = r.standard_t(float(r.uniform(2.2, 5.0)), n)
-    ht = ht / max(float(ht.std()), 1e-9)
+    ht = ht / max(float(_v2_stdm(ht)), 1e-9)
     if kind < 0.3:
         lg = np.log(r.uniform(0.3, 1.5)) + r.uniform(0.35, 0.7) * syn
         k = int(r.poisson(max(n / (day * r.uniform(4.0, 12.0)), 0.3)))
@@ -18625,7 +19233,7 @@ def _c128_hydro_geomag(r, n):
     sq = np.exp(-0.5 * (d / w) ** 2)
     d2 = (tod - c - r.uniform(0.15, 0.3) + 0.5) % 1.0 - 0.5
     sq = sq - r.uniform(0.0, 0.4) * np.exp(-0.5 * (d2 / r.uniform(0.06, 0.15)) ** 2)
-    sq = (sq - sq.mean()) / max(np.ptp(sq), 1e-9)
+    sq = (sq - _v2_meanm(sq)) / max(np.ptp(sq), 1e-9)
     pp = _c128_hydro_logu(r, 15.0, 70.0) * (-1.0 if r.random() < 0.75 else 1.0)
     x = lvl + pp * sq * _c128_hydro_dayfac(r, n, int(P), r.uniform(0.08, 0.3))
     x += r.uniform(-4.0, 4.0) * t / P
@@ -18842,6 +19450,9 @@ def _c128_infra_ar1_t(r, n, phi, sd, tail):
 
 def _c128_infra_ar1_filter(e, phi):
     y = np.array(e, dtype=np.float64)
+    if y.ndim == 1 and y.flags.c_contiguous:
+        _v2_ar1_fill(y, float(phi))
+        return y
     n = y.size
     k = 1
     p = float(phi)
@@ -18899,7 +19510,7 @@ def _c128_infra_daily(r, n, P, depth, wk_amp, wk_lvl, day_sd):
     dav = np.interp(fr, grid, _c128_infra_ar1(r, nd, r.uniform(0.3, 0.9), 1.3 * day_sd))
     amp = (1.0 - depth) * np.exp(dav) * np.where(weekend, wk_amp, 1.0)
     env = (depth + amp * prof) * np.exp(dlv) * np.where(weekend, wk_lvl, 1.0)
-    return env / max(env.mean(), 1e-12)
+    return env / max(_v2_meanm(env), 1e-12)
 
 def _c128_infra_ixp_period(r):
     u = r.random()
@@ -19391,7 +20002,7 @@ def _c128_mobility_dock(r, L):
     dayenv = _c128_mobility_sig((ph - r.uniform(0.22, 0.30)) / 0.02) * _c128_mobility_sig((r.uniform(0.85, 0.97) - ph) / 0.03)
     com = r.uniform(0.0, 1.0) * (_c128_mobility_bump(ph, r.uniform(0.30, 0.37), 0.03) + _c128_mobility_bump(ph, r.uniform(0.70, 0.77), 0.04))
     act = (qn + (1.0 - qn) * (dayenv * r.uniform(0.4, 1.0) + com)) * np.exp(_c128_mobility_ar1(r, n, r.uniform(0.99, 0.999), r.uniform(0.3, 1.2)))
-    p_ev = np.clip(lam * act / max(float(act.mean()), 1e-9), 0.0, 0.9)
+    p_ev = np.clip(lam * act / max(float(_v2_meanm(act)), 1e-9), 0.0, 0.9)
     ev = np.flatnonzero(r.random(n) < p_ev)
     beta, phs = r.uniform(0.0, 0.35), r.uniform(0.0, 1.0)
     pplus = (0.5 + beta * np.sin(2.0 * np.pi * (ph[ev] - phs))).tolist()
@@ -19604,7 +20215,7 @@ def _xa_series(r, n, kind):
     c3 = r.uniform(0.0, 0.25)
     prof = (np.cos(_XA_TWO_PI * (hh - p1) / 24.0) + c2 * np.cos(2.0 * _XA_TWO_PI * (hh - p2) / 24.0)
             + c3 * np.cos(3.0 * _XA_TWO_PI * (hh - r.uniform(0.0, 24.0)) / 24.0))
-    prof *= sig * r.uniform(*K['prof']) / float(np.sqrt(np.mean(prof * prof)))
+    prof *= sig * r.uniform(*K['prof']) / float(np.sqrt(_v2_mean(prof * prof)))
     nd = int(day[-1]) + 1
     dayf = np.clip(1.0 + r.uniform(0.25, 0.60) * r.standard_normal(nd), 0.15, 2.4)
     wk = np.zeros(7)
@@ -19622,7 +20233,7 @@ def _xa_series(r, n, kind):
     else:
         x = np.exp(np.clip(z, -12.0, 12.0))
     level = _xa_lu(r, 0.2, 50.0)
-    x *= level / float(np.mean(x))
+    x *= level / float(_v2_mean(x))
 
     rho = _xa_lu(r, *K['grid'])
     u_odd, u_dec = r.random(), r.random()
@@ -19695,6 +20306,9 @@ def _xb_lu(u, lo, hi):
 
 def _xb_ar1(e, phi):
     y = np.array(e, dtype=np.float64)
+    if y.ndim == 1 and y.flags.c_contiguous:
+        _v2_ar1_fill(y, float(phi))
+        return y
     n = y.size
     k = 1
     p = float(phi)
@@ -19758,8 +20372,8 @@ def _xb_co2(r, n, a, sod, day, dow0):
     rest = (0.1 + 0.5 * u[6]) * _xb_bump(74.0 + 10.0 * u[7], 5.0 + 6.0 * u[8]) + 0.3 * u[9] * _xb_bump(28.0 + 6.0 * u[10], 4.0 + 5.0 * u[11])
     sun = 0.25 + 0.75 * r.beta(1.5 + 2.5 * u[12], 0.8 + 1.0 * u[13], nd)
     prof = rest[sod] - dip[sod] * sun[day]
-    prof = prof - float(prof.mean())
-    prof = prof / max(float(prof.std()), 1e-9)
+    prof = prof - float(_v2_meanm(prof))
+    prof = prof / max(float(_v2_stdm(prof)), 1e-9)
     slow = _xb_ou2(r, n, _xb_lu(u[14], 50.0, 260.0), 2.0 + 4.0 * u[15])
     res = _xb_ou2(r, n, _xb_lu(u[16], 5.0, 22.0), 1.0 + 2.5 * u[17], tail=0.15 + 0.5 * u[18])
     z = float(np.sqrt(qp)) * prof + float(np.sqrt(1.0 - qp)) * (float(np.sqrt(fs)) * slow + float(np.sqrt(1.0 - fs)) * res)
@@ -19792,7 +20406,7 @@ def _xb_wind(r, n, a, sod, day, dow0):
     nk = n // 48 + 3
     vol = np.exp((0.25 + 0.5 * u[1]) * np.interp(a - a[0], np.arange(nk, dtype=np.float64) * 48.0, _xb_ou(r, nk, 3.0)))
     g = _xb_ou2(r, n, _xb_lu(u[2], 30.0, 150.0), 1.0 + 4.5 * u[3], tail=0.3 * u[4], vol=vol)
-    g = g / max(float(g.std()), 1e-9)
+    g = g / max(float(_v2_stdm(g)), 1e-9)
     z = g + _xb_lu(u[5], 0.02, 0.12) * _xb_ou(r, n, 1.5 + 8.0 * u[6])
     if u[7] < 0.5:
         z = z + (0.05 + 0.35 * u[8]) * (_xb_bump(96.0 * u[9], 14.0 + 10.0 * u[10]) - 0.3)[sod]
@@ -19860,9 +20474,9 @@ def _xb_load(r, n, a, sod, day, dow0):
         evb = (0.5 + 0.5 * u[10]) * _xb_bump(70.0 + 12.0 * u[11], 6.0 + 6.0 * u[12])
         wd = (0.5 + 0.5 * u[2]) * _xb_bump(28.0 + 10.0 * u[3], 6.0 + 6.0 * u[13]) + md + evb - ng
         we = (0.2 + 0.4 * u[2]) * _xb_bump(34.0 + 10.0 * u[3], 8.0 + 6.0 * u[13]) + md + evb - ng
-    sc = max(float(wd.std()), 1e-9)
-    wd = (wd - float(wd.mean())) / sc
-    we = (we - float(we.mean())) / sc
+    sc = max(float(_v2_stdm(wd)), 1e-9)
+    wd = (wd - float(_v2_meanm(wd))) / sc
+    we = (we - float(_v2_meanm(we))) / sc
     depth = 0.06 + 0.12 * u[14]
     wkmix = sat * (0.5 + 0.5 * u[15]) + sun
     amp = (1.0 - wkmix * (0.1 + 0.4 * u[16])) * np.exp(0.06 * r.standard_normal(nd))
@@ -19945,6 +20559,9 @@ def _xc_lu(r, lo, hi):
 
 def _xc_filt(e, phi):
     y = np.array(e, dtype=np.float64)
+    if y.ndim == 1 and y.flags.c_contiguous:
+        _v2_ar1_fill(y, float(phi))
+        return y
     n = y.size
     k = 1
     p = float(phi)
@@ -20102,7 +20719,7 @@ def _xc_rate_std(r, n):
     fast = _xc_ar1(r, n, _xc_lu(r, 4.0, 30.0), 0.020 * q * _xc_lu(r, 0.6, 1.7), r.uniform(0.0, 0.6))
     z = z + _xc_box(fast, int(r.integers(3, 8)))
 
-    lx = lc + lvl + z * np.exp(-r.uniform(0.2, 0.7) * (lc - float(lc.mean())))
+    lx = lc + lvl + z * np.exp(-r.uniform(0.2, 0.7) * (lc - float(_v2_meanm(lc))))
     size = 0.08 * q ** 0.5 * _xc_lu(r, 0.5, 2.0)
     lx = lx + _xc_steps(r, n, _xc_count(r, 0.3, 0.5, 5.0), 15.0, 300.0, 0.3 * size, 4.0 * size, 0.8)
     lx = lx + _xc_steps(r, n, _xc_count(r, 0.2, 1.0, 12.0), 2.0, 14.0, 0.2 * size, 2.5 * size, 0.9)
@@ -20209,7 +20826,7 @@ def _xc_tide(r, L):
     s_w = _xc_lu(r, 0.0005, 0.01) if r.random() < 0.8 else _xc_lu(r, 0.01, 0.05)
     if r.random() < 0.35:
         e = r.standard_t(float(r.uniform(2.5, 6.0)), n)
-        e = e / max(float(e.std()), 1e-9)
+        e = e / max(float(_v2_stdm(e)), 1e-9)
     else:
         e = r.standard_normal(n)
     x = x + s_w * e
@@ -20486,6 +21103,9 @@ def _xe_lu(r, lo, hi):
 
 def _xe_ar1(e, phi):
     y = np.array(e, dtype=np.float64)
+    if y.ndim == 1 and y.flags.c_contiguous:
+        _v2_ar1_fill(y, float(phi))
+        return y
     n = y.size
     k = 1
     p = float(phi)
@@ -20726,7 +21346,7 @@ class Generator(_XZParent):
         try:
             for i, x in enumerate(base):
                 if fams:
-                    u = np.random.default_rng(np.random.SeedSequence([seed, _XZ_TAG], spawn_key=(i,))).random(slots)
+                    u = _fcx_coins(seed, _XZ_TAG, i, slots)
                     for k, q, f in fams:
                         if u[k] >= q:
                             continue
@@ -20749,24 +21369,7 @@ class Generator(_XZParent):
         finally:
             base.close()
 
-
-# ═══════════════ c-acuh: official air / USDA prices / health / CO2 series ADDED as channel 3 under moving 3-channel rows ═══════════════
-# Every record of the parent (uid220 = king171 + c91/c124 hold layers + c128) is yielded unchanged, in order, except: an exactly
-# THREE-channel float64 record (length >= 256, all finite) whose channel 0 is moving (not constant, not _k87_quiet, not
-# _w86b_intlike — the lineage's own helpers, unchanged) gains ONE extra channel (channel 3). Channels 0-2 are the record itself,
-# byte-identical. No existing function, table or weight is changed; univariate and 2-channel records (held / quiet / integer rows)
-# are never touched.
-# Why: on the real duel windows uid220 (and its init) are miscalibrated exactly where its corpus has no matching builder — official
-# air quality (forecast too low, upper band too narrow: future pollution episodes break above the past range), USDA daily price
-# panels (prices turn down below the band), health surveillance (waves end below the band) and CO2 intensity (band too narrow:
-# multi-day weather regimes). The four builders are calibrated to pool statistics (cadence, history length, level, daily profile,
-# persistence, episode rate/size, turn rate, quantisation); each content series is generated at a real-like length and LEFT-PADDED
-# with its first value, as the validator pads short histories. Statistics only: no real values or sequences are embedded.
-# Record i's draws come only from SeedSequence([seed, _ACUH_TAG], spawn_key=(i,)), so every parent RNG advances exactly as without
-# this block. A 4-channel record is billed at points+mv20 (4 x L x 100/120 instead of 3 x L x 100/120).
-
 _ACUH_TWO_PI = 2.0 * np.pi
-
 
 def _acuh_pad(x, L):
     out = np.empty(L, dtype=np.float64)
@@ -20778,34 +21381,25 @@ def _acuh_pad(x, L):
         out[L - n:] = x
     return out
 
-
 def _acuh_ar1(r, n, phi, sd):
     e = r.standard_normal(n) * sd
     x = np.empty(n)
     x[0] = e[0] / max(np.sqrt(1.0 - phi * phi), 1e-3)
-    for t in range(1, n):
-        x[t] = phi * x[t - 1] + e[t]
+    _fcx_ar1(x, e, phi)
     return x
 
-
 def _acuh_smooth_noise(r, n, corner):
-    """unit-sd low-pass noise (corner in cycles/sample)"""
     m = 1 << int(np.ceil(np.log2(max(2 * n, 64))))
     f = np.fft.rfftfreq(m)
     spec = (r.standard_normal(f.size) + 1j * r.standard_normal(f.size)) / (1.0 + (f / max(corner, 1e-9)) ** 2)
     spec[0] = 0.0
     x = np.fft.irfft(spec, m)[:n]
-    s = float(np.std(x))
+    s = float(_v2_std(x))
     return x / s if s > 0 else x
-
 
 def _acuh_quantise(x, q):
     return np.round(x / q) * q if q > 0 else x
 
-
-# ───────────────────────────── official air quality ─────────────────────────────
-# pollutant: (weight, median level lo/hi, daily profile shape, profile amplitude (log) lo/hi, hourly AR phi lo/hi,
-#             episode rate per 1000 h lo/hi, episode log-amplitude mean, zero-floor share, integer-feed probability, quantum)
 _ACUH_AIR_P = {
     "no2":  (0.29, (6.0, 30.0), "traffic", (0.25, 0.9), (0.80, 0.90), (10, 34), 0.9, 0.00, 0.15, 0.1),
     "pm25": (0.21, (3.0, 9.0), "morning", (0.15, 0.45), (0.90, 0.95), (13, 25), 1.0, 0.00, 0.10, 0.1),
@@ -20820,9 +21414,7 @@ _ACUH_AIR_P = {
 _ACUH_AIR_NAMES = tuple(_ACUH_AIR_P)
 _ACUH_AIR_CUM = np.cumsum([_ACUH_AIR_P[k][0] for k in _ACUH_AIR_NAMES]) / sum(_ACUH_AIR_P[k][0] for k in _ACUH_AIR_NAMES)
 
-
 def _acuh_air_profile(r, shape, hours):
-    """log-scale diurnal profile (zero mean, unit peak-to-peak) at the given hours of day"""
     h = hours % 24.0
     if shape == "traffic":
         p = np.exp(-0.5 * ((h - r.uniform(6.5, 8.5)) / r.uniform(1.0, 2.0)) ** 2) + \
@@ -20831,13 +21423,12 @@ def _acuh_air_profile(r, shape, hours):
         p = np.exp(-0.5 * ((h - r.uniform(13.0, 16.0)) / r.uniform(2.5, 4.0)) ** 2)
     elif shape == "midday":
         p = np.exp(-0.5 * ((h - r.uniform(10.0, 13.0)) / r.uniform(2.0, 4.0)) ** 2)
-    else:  # morning + night accumulation (PM)
+    else:
         p = np.exp(-0.5 * ((h - r.uniform(6.0, 9.0)) / r.uniform(1.5, 3.0)) ** 2) + \
             r.uniform(0.3, 0.9) * np.exp(-0.5 * ((((h - r.uniform(21.0, 24.0)) + 12) % 24 - 12) / r.uniform(2.0, 4.0)) ** 2)
-    p = p - p.mean()
+    p = p - _v2_meanm(p)
     rng = np.ptp(p)
     return p / rng if rng > 0 else p
-
 
 def _acuh_air(r, L):
     k = _ACUH_AIR_NAMES[int(np.searchsorted(_ACUH_AIR_CUM, r.random() * 0.999999, side="right"))]
@@ -20848,13 +21439,13 @@ def _acuh_air(r, L):
     hours = t + r.uniform(0, 24)
     base = np.log(np.exp(r.uniform(np.log(lev[0]), np.log(lev[1]))))
     prof = _acuh_air_profile(r, shape, hours) * r.uniform(*amp) * 1.25
-    wk = r.uniform(0.0, 0.15) * (((hours // 24) % 7) < 5) if shape == "traffic" else 0.0     # weekday traffic uplift
-    syn = _acuh_smooth_noise(r, n, 1.0 / r.uniform(48, 240)) * r.uniform(0.15, 0.45)              # multi-day weather regimes
-    drift = np.linspace(0.0, r.normal(0.0, 0.6), n)                                          # slow seasonal drift, either sign
+    wk = r.uniform(0.0, 0.15) * (((hours // 24) % 7) < 5) if shape == "traffic" else 0.0
+    syn = _acuh_smooth_noise(r, n, 1.0 / r.uniform(48, 240)) * r.uniform(0.15, 0.45)
+    drift = np.linspace(0.0, r.normal(0.0, 0.6), n)
     ph = r.uniform(*phi)
     noise = _acuh_ar1(r, n, ph, r.uniform(0.10, 0.25) * np.sqrt(1 - ph * ph) * 1.5)
     lx = base + prof + wk + syn + drift + noise
-    # episodes: Poisson onsets, fast rise, exponential decay; multi-day smog events (rarer, longer) on top
+
     ep = np.zeros(n)
     nep = r.poisson(n * r.uniform(*rate) / 1000.0)
     for s in r.integers(0, n, nep):
@@ -20868,10 +21459,10 @@ def _acuh_air(r, L):
             env = np.sin(np.linspace(0, np.pi, d)) ** 2 * r.uniform(0.4, 1.3)
             e = min(n, s + d); lx[s:e] += env[:e - s]
     x = np.exp(lx) * (1.0 + ep)
-    if zfloor > 0:                                                                            # detection floor -> exact zeros
+    if zfloor > 0:
         thr = np.quantile(x, r.uniform(0.6, 1.4) * zfloor)
         x = np.where(x < thr, 0.0, x)
-    signed = k in ("no2", "no", "o3", "other") and zfloor < 0.3 and r.random() < 0.3       # sensors reporting around zero (offset noise)
+    signed = k in ("no2", "no", "o3", "other") and zfloor < 0.3 and r.random() < 0.3
     if signed:
         x = x + r.normal(0.0, r.uniform(0.3, 2.0)) * 0.3 + r.standard_normal(n) * r.uniform(0.2, 1.2)
     if r.random() < p_int:
@@ -20884,37 +21475,33 @@ def _acuh_air(r, L):
         x = x + _acuh_quantise(np.abs(r.standard_normal(n)) * 0.1, 0.1)
     return _acuh_pad(x, L)
 
-
-# ───────────────────────────── USDA daily price panels ─────────────────────────────
 def _acuh_usda(r, L):
     n = int(r.integers(440, 720))
     t = np.arange(n, dtype=np.float64)
     level = np.exp(r.uniform(np.log(80.0), np.log(850.0)))
     cv = np.exp(r.uniform(np.log(0.05), np.log(0.4)))
-    # smooth trend: a few slow cycles (seasonal price cycles) + slow random walk -> ~3-10 turns per 100 days of a 15-day slope
+
     tr = np.zeros(n)
-    tr += np.sin(_ACUH_TWO_PI * t / r.uniform(230.0, 280.0) + r.uniform(0, _ACUH_TWO_PI)) * r.uniform(0.6, 1.2)   # annual cycle (business days)
+    tr += np.sin(_ACUH_TWO_PI * t / r.uniform(230.0, 280.0) + r.uniform(0, _ACUH_TWO_PI)) * r.uniform(0.6, 1.2)
     for _ in range(int(r.integers(1, 4))):
         per = r.uniform(30.0, 120.0)
         tr += r.uniform(0.15, 0.6) * np.sin(_ACUH_TWO_PI * t / per + r.uniform(0, _ACUH_TWO_PI))
     tr += _acuh_ar1(r, n, r.uniform(0.97, 0.995), r.uniform(0.0, 0.05))
-    tr = (tr - tr.mean()) / (tr.std() + 1e-12)
-    w_noise = r.uniform(0.06, 0.35) if r.random() < 0.85 else r.uniform(0.6, 1.4)            # some panels are noise-dominated
+    tr = (tr - _v2_meanm(tr)) / (_v2_stdm(tr) + 1e-12)
+    w_noise = r.uniform(0.06, 0.35) if r.random() < 0.85 else r.uniform(0.6, 1.4)
     noise = _acuh_ar1(r, n, r.uniform(0.0, 0.4), w_noise)
-    if r.random() < 0.35:                                                                     # weekly/print-day effect
+    if r.random() < 0.35:
         noise += r.uniform(0.05, 0.3) * np.where((t % 5) == r.integers(0, 5), 1.0, 0.0)
     z = tr + noise
-    if r.random() < 0.12:                                                                     # price-list / contract step
+    if r.random() < 0.12:
         s = int(r.integers(n // 5, 4 * n // 5)); z[s:] += r.normal(0, 0.6)
-    x = level * (1.0 + cv * z / (np.std(z) + 1e-12))
+    x = level * (1.0 + cv * z / (_v2_std(z) + 1e-12))
     x = np.maximum(x, level * 0.05)
     x = _acuh_quantise(x, 0.01 if r.random() < 0.9 else 1.0)
-    if r.random() < 0.06:                                                                     # missing-report zeros (rare)
+    if r.random() < 0.06:
         x[r.random(n) < r.uniform(0.01, 0.08)] = 0.0
     return _acuh_pad(x, L)
 
-
-# ───────────────────────────── CO2 intensity / grid mix ─────────────────────────────
 def _acuh_co2(r, L):
     u = r.random()
     kind = "ec" if u < 0.55 else ("dk" if u < 0.65 else "gb")
@@ -20929,11 +21516,11 @@ def _acuh_co2(r, L):
         level = np.exp(r.uniform(np.log(50.0), np.log(120.0)))
     else:
         level = np.exp(r.uniform(np.log(40.0), np.log(500.0)))
-    # daily profile: evening peak / solar dip, amplitude varies day to day
+
     shape = np.cos(_ACUH_TWO_PI * day + phase) + r.uniform(0.0, 0.6) * np.cos(2 * _ACUH_TWO_PI * day + r.uniform(0, _ACUH_TWO_PI))
     amp_d = np.exp(_acuh_smooth_noise(r, n, 1.0 / (P * r.uniform(2, 6))) * r.uniform(0.05, 0.25))
     prof = shape / (np.ptp(shape) + 1e-12) * r.uniform(0.15, 1.0) * amp_d
-    # multi-day weather (wind / solar) regimes: big level swings, either direction
+
     reg = _acuh_smooth_noise(r, n, 1.0 / (P * r.uniform(1.5, 6.0))) * r.uniform(0.15, 0.45)
     lx = np.log(level) + prof + reg
     if kind == "gb":
@@ -20952,15 +21539,12 @@ def _acuh_co2(r, L):
         x = _acuh_quantise(x, 0.1 if level > 20 else 0.01)
     return _acuh_pad(x, L)
 
-
-# ───────────────────────────── health surveillance ─────────────────────────────
 def _acuh_waves(r, n, n_waves, rise, fall):
-    """seasonal epidemic waves: roughly annual centres (365 +- 30 days, random phase) with random sizes"""
     t = np.arange(n, dtype=np.float64)
     w = np.zeros(n)
     c0 = r.uniform(-365.0, 0.0)
     centres = [c0 + 365.0 * k + r.normal(0, 30) for k in range(int(n / 365) + 3)]
-    if r.random() < 0.4:                                                                      # an extra off-season wave (e.g. summer COVID)
+    if r.random() < 0.4:
         centres.append(r.uniform(0, n))
     for c in centres:
         a = float(np.exp(r.normal(-0.5, 0.6)))
@@ -20968,45 +21552,41 @@ def _acuh_waves(r, n, n_waves, rise, fall):
         w += a * np.where(t < c, np.exp(-np.minimum(np.abs(c - t) / ru, 400.0) ** 1.3), np.exp(-np.minimum(np.abs(t - c) / fa, 400.0) ** 1.1))
     return w
 
-
 def _acuh_health(r, L):
     u = r.random()
-    if u < 0.70:                                                                              # CDC-like daily percentages
+    if u < 0.70:
         n = int(r.integers(500, 540))
         base = np.exp(r.uniform(np.log(0.02), np.log(8.0)))
         w = _acuh_waves(r, n, 0, (20, 60), (25, 80))
         smooth = base * (r.uniform(0.01, 0.3) + np.exp(r.uniform(np.log(2.0), np.log(25.0))) * w)
         noise = 1.0 + _acuh_ar1(r, n, r.uniform(0.0, 0.4), r.uniform(0.04, 0.18))
         x = smooth * np.maximum(noise, 0.05)
-        if r.random() < 0.3:                                                                  # weekday visit mix
+        if r.random() < 0.3:
             x *= 1.0 + r.uniform(0.01, 0.06) * np.cos(_ACUH_TWO_PI * np.arange(n) / 7 + r.uniform(0, _ACUH_TWO_PI))
-        if r.random() < 0.5:                                                                  # end-of-feed reporting dip
+        if r.random() < 0.5:
             k = int(r.integers(2, 10)); x[-k:] *= np.linspace(1.0, r.uniform(0.6, 0.95), k)
         x = _acuh_quantise(x, 0.01 if base < 5 else 0.1)
-    else:                                                                                     # RKI-like integer counts
+    else:
         n = int(r.integers(2300, min(L, 2420) + 1)) if r.random() < 0.8 else int(r.integers(780, 3200))
         n = min(n, L)
         base = np.exp(r.uniform(np.log(0.5), np.log(300.0)))
         w = _acuh_waves(r, n, 0, (25, 80), (30, 120))
         lam = base * (r.uniform(0.01, 0.2) + np.exp(r.uniform(np.log(2.0), np.log(25.0))) * w)
         x = r.poisson(np.maximum(lam, 0.0)).astype(np.float64)
-        if r.random() < 0.35:                                                                 # weekly reporting: value held for the week
+        if r.random() < 0.35:
             idx = np.arange(n) // 7 * 7
             x = x[np.minimum(idx + int(r.integers(0, 7)), n - 1)]
-        if r.random() < 0.5:                                                                  # end-of-feed reporting lag
+        if r.random() < 0.5:
             k = int(r.integers(3, 15)); x[-k:] = np.floor(x[-k:] * np.linspace(1.0, r.uniform(0.3, 0.9), k))
     if np.ptp(x) == 0:
         x = x + np.round(np.abs(r.standard_normal(x.size)))
     return _acuh_pad(np.asarray(x, dtype=np.float64), L)
 
-
-
-
 _ACUH_FAMS = (
-    ("air", 0.50, _acuh_air),        # official hourly air quality (NO2, PM2.5, O3, NO, PM10, BC, CO, SO2)
-    ("usda", 0.20, _acuh_usda),      # daily price panels
-    ("health", 0.15, _acuh_health),  # CDC-like daily percentages / RKI-like daily counts
-    ("co2", 0.15, _acuh_co2),        # CO2 intensity / grid mix (5 / 15 / 30 min)
+    ("air", 0.50, _acuh_air),
+    ("usda", 0.20, _acuh_usda),
+    ("health", 0.15, _acuh_health),
+    ("co2", 0.15, _acuh_co2),
 )
 _ACUH_CUM = np.cumsum([w for _, w, _ in _ACUH_FAMS]) / sum(w for _, w, _ in _ACUH_FAMS)
 _ACUH_TAG = 0xAC0E5A01
@@ -21014,10 +21594,7 @@ _ACUH_Q = 1.0
 _ACUH_HOST_C = 3
 _ACUH_MIN_LEN = 256
 
-
 def _acuh_eligible(x):
-    """Host test: an exactly _ACUH_HOST_C-channel float64 record (length >= _ACUH_MIN_LEN, all finite) whose channel 0 is moving:
-    not constant, not _k87_quiet, not _w86b_intlike (the lineage's helpers, unchanged)."""
     if not (isinstance(x, np.ndarray) and x.ndim == 2 and x.shape[0] == _ACUH_HOST_C and x.dtype == np.float64
             and x.shape[1] >= _ACUH_MIN_LEN):
         return False
@@ -21028,25 +21605,38 @@ def _acuh_eligible(x):
         return False
     return not _k87_quiet(x0) and not _w86b_intlike(x0)
 
-
 def _acuh_keep(w, x):
-    """The added series is kept only as an array of exactly (L,), all finite, not constant and not a copy of any channel."""
     L = int(x.shape[1])
     if not (isinstance(w, np.ndarray) and w.shape == (L,) and bool(np.all(np.isfinite(w))) and not bool(np.all(w == w[0]))):
         return False
+    wc = None
+    ww = 0.0
+    wok = False
     for c in range(x.shape[0]):
         a = x[c]
-        if np.std(a) > 0 and abs(float(np.corrcoef(a, w)[0, 1])) >= 0.999:
-            return False
+        sa = _v2_std(a)
+        if sa > 0:
+            if wc is None:
+                wm = _v2_meanm(w)
+                wc = w - wm
+                ww = float(np.dot(wc, wc))
+                wok = (math.isfinite(ww) and 1e-150 < ww < 1e150
+                       and float(np.sqrt(ww / L)) > 1e-6 * float(np.max(np.abs(w))))
+            if wok and math.isfinite(float(sa)) and float(sa) > 1e-6 * float(np.max(np.abs(a))):
+                ac = a - _v2_meanm(a)
+                aa = float(np.dot(ac, ac))
+                aw = float(np.dot(ac, wc))
+                if math.isfinite(aa) and math.isfinite(aw) and 1e-150 < aa < 1e150:
+                    est = abs(aw) / (math.sqrt(aa) * math.sqrt(ww))
+                    if est < 0.98:
+                        continue
+            if abs(float(np.corrcoef(a, w)[0, 1])) >= 0.999:
+                return False
     return True
-
 
 _ACUHParent = Generator
 
-
 class Generator(_ACUHParent):
-    """Parent records unchanged; an exactly three-channel float record whose channel 0 is moving gains ONE extra channel (an air /
-    USDA / health / CO2 series) as channel 3. Channels 0-2 stay byte-identical; univariate and 2-channel records are never touched."""
 
     @property
     def name(self) -> str:
@@ -21078,3 +21668,6641 @@ class Generator(_ACUHParent):
                 yield x
         finally:
             base.close()
+
+_YA_TWO_PI = 2.0 * np.pi
+_YA_N_LONG = (770, 990)
+_YA_N_SHORT = (128, 770)
+_YA_N_FWD = (990, 1500)
+_YA_N_CUM = np.cumsum([0.36, 0.54, 0.10])
+_YA_KIND_CUM = np.cumsum([0.38, 0.30, 0.12, 0.12, 0.08])
+
+_YA_KINDS = (
+    dict(sig=(0.578, 0.71), slow=(0.018, 0.045), shift=(1.17, 1.83), wcy=(0.229, 0.413), tau=(2.5, 5.5),
+         sm=(0.324, 0.756), syn=(0.627, 0.855), jmp=(0.015, 0.045), jsz=(0.375, 0.844), rev=0.1, noi=(0.11, 0.22),
+         df=(2.6, 4.5), prof=(0.242, 0.462), h2=(0.35, 2.2), wk=(0.51, 0.93), lam=(0.04, 0.22), grid=(0.001, 0.06),
+         gap=(0.5, 8.0), glong=0.02),
+    dict(sig=(0.515, 0.625), slow=(0.037, 0.075), shift=(2.15, 2.44), wcy=(0.276, 0.459), tau=(5.0, 9.0),
+         sm=(0.432, 1.08), syn=(0.57, 0.855), jmp=(0.015, 0.045), jsz=(0.45, 0.9), rev=0.7, noi=(0.088, 0.165),
+         df=(3.4, 6.0), prof=(0.165, 0.352), h2=(0.1, 0.6), wk=(0.832, 1.0), lam=(0.0, 0.06), grid=(0.003, 0.15),
+         gap=(1.0, 8.0), glong=0.02),
+    dict(sig=(0.445, 0.539), slow=(0.022, 0.06), shift=(1.97, 2.49), wcy=(0.276, 0.459), tau=(3.5, 6.5),
+         sm=(0.27, 0.648), syn=(0.513, 0.798), jmp=(0.018, 0.0525), jsz=(0.562, 1.22), rev=0.4, noi=(0.205, 0.329),
+         df=(2.35, 3.4), prof=(0.264, 0.484), h2=(0.1, 0.6), wk=(0.79, 1.0), lam=(0.0, 0.06), grid=(0.035, 0.08),
+         gap=(2.0, 10.0), glong=0.02),
+    dict(sig=(0.624, 0.756), slow=(0.037, 0.075), shift=(1.74, 2.31), wcy=(0.183, 0.367), tau=(4.0, 8.0),
+         sm=(0.27, 0.648), syn=(0.57, 0.821), jmp=(0.018, 0.0525), jsz=(0.375, 0.75), rev=0.25, noi=(0.226, 0.349),
+         df=(2.55, 3.6), prof=(0.22, 0.418), h2=(0.3, 1.5), wk=(0.51, 0.93), lam=(0.03, 0.18), grid=(0.006, 0.02),
+         gap=(1.0, 7.0), glong=0.05),
+    dict(sig=(0.195, 0.256), slow=(0.045, 0.09), shift=(1.99, 2.81), wcy=(0.276, 0.459), tau=(5.0, 11.0),
+         sm=(0.324, 0.81), syn=(0.57, 0.855), jmp=(0.012, 0.0375), jsz=(0.75, 1.69), rev=0.4, noi=(0.176, 0.323),
+         df=(2.25, 3.4), prof=(0.198, 0.396), h2=(0.6, 2.4), wk=(0.888, 1.0), lam=(0.0, 0.06), grid=(0.05, 0.13),
+         gap=(3.0, 16.0), glong=0.15),
+)
+_YA_P_SHIFT = 0.96
+_YA_P_UP = 0.5
+_YA_P_RAMP = 0.85
+_YA_T0R = (0.49, 0.77)
+_YA_WR = (0.12, 0.30)
+_YA_T0S = (0.30, 0.70)
+_YA_WS = (6.0, 60.0)
+_YA_WPER = (5.5, 8.0)
+_YA_WRHO = (0.65, 0.88)
+_YA_P_QUIET = 0.7
+_YA_DAYF = (0.25, 0.60)
+_YA_P_FLOOR = (0.10, 0.30, 0.15, 0.05, 0.40)
+_YA_KPEAK = np.arange(1.0, 33.0)
+_YA_GAP_LEN = np.array([1, 2, 3, 4, 5, 6])
+_YA_GAP_CUM = np.cumsum([0.58, 0.21, 0.10, 0.05, 0.03, 0.03])
+
+def _ya_lu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+def _ya_ar1(e, phi):
+
+    n = e.size
+    if phi <= 1e-9:
+        return e.copy()
+    k = -float(np.log(phi))
+    b = n if k * n < 500.0 else max(8, int(500.0 / k))
+    w = np.exp(k * np.arange(min(b, n), dtype=np.float64))
+    if b >= n:
+        return np.cumsum(e * w) / w
+    out = np.empty(n, dtype=np.float64)
+    c = 0.0
+    for a in range(0, n, b):
+        ww = w[:min(b, n - a)]
+        seg = (np.cumsum(e[a:a + b] * ww) + phi * c) / ww
+        out[a:a + b] = seg
+        c = float(seg[-1])
+    return out
+
+def _ya_series(r, n, kind, p_shift=_YA_P_SHIFT, size=1.0):
+    K = _YA_KINDS[kind]
+    t = np.arange(n, dtype=np.int64) + int(r.integers(0, 168))
+    hod = t % 24
+    day = t // 24
+    sig = r.uniform(*K['sig'])
+
+    tau_s = _ya_lu(r, 190.0, 1440.0)
+    phi = float(np.exp(-1.0 / tau_s))
+    s_sd = sig * r.uniform(*K['slow'])
+    e = r.standard_normal(n) * (s_sd * np.sqrt(1.0 - phi * phi))
+    e[0] = r.standard_normal() * s_sd
+    z = _ya_ar1(e, phi)
+
+    u_shift, u_sign, u_ramp = r.random(), r.random(), r.random()
+    a_shift = sig * r.uniform(*K['shift']) * size
+    nref = float(max(n, 720))
+    if u_ramp < _YA_P_RAMP:
+        t0 = r.uniform(*_YA_T0R) * nref
+        w_shift = r.uniform(*_YA_WR) * nref
+    else:
+        t0 = r.uniform(*_YA_T0S) * nref
+        w_shift = _ya_lu(r, *_YA_WS)
+    if u_shift < p_shift:
+        if u_sign >= _YA_P_UP:
+            a_shift = -a_shift
+        z += a_shift / (1.0 + np.exp(np.clip((t0 - np.arange(n)) / w_shift, -40.0, 40.0)))
+
+    nd = int(t[-1] // 24) + 2
+    per = r.uniform(*_YA_WPER)
+    rho = r.uniform(*_YA_WRHO)
+    a1, a2 = 2.0 * rho * float(np.cos(_YA_TWO_PI / per)), -rho * rho
+    v_w = (1.0 - a2) / ((1.0 + a2) * ((1.0 - a2) ** 2 - a1 * a1))
+    ew = (r.standard_normal(nd + 12) * (sig * r.uniform(*K['wcy']) / float(np.sqrt(v_w)))).tolist()
+    yw = [0.0, 0.0]
+    for d in range(2, nd + 12):
+        yw.append(a1 * yw[-1] + a2 * yw[-2] + ew[d])
+    z += np.interp(t / 24.0, np.arange(nd, dtype=np.float64), np.array(yw[12:], dtype=np.float64))
+
+    tau_m = r.uniform(*K['tau'])
+    phi = float(np.exp(-1.0 / tau_m))
+    ph1 = float(np.exp(-1.0 / r.uniform(*K['sm'])))
+    nb = int(6.0 * tau_m) + 8
+    m_sd = sig * r.uniform(*K['syn'])
+    v_ar2 = (1.0 + ph1 * phi) / ((1.0 - ph1 * phi) * (1.0 - ph1 * ph1) * (1.0 - phi * phi))
+    e = r.standard_normal(n + nb) * (m_sd / float(np.sqrt(v_ar2)))
+    p_j = r.uniform(*K['jmp'])
+    j_sz = sig * r.uniform(*K['jsz']) / float(((phi ** _YA_KPEAK - ph1 ** _YA_KPEAK) / (phi - ph1)).max())
+    e += (r.random(n + nb) < p_j) * np.minimum(r.exponential(j_sz, n + nb), 2.5 * j_sz)
+    m = _ya_ar1(_ya_ar1(e, ph1), phi)[nb:]
+    z += m[::-1] if r.random() < K['rev'] else m
+
+    hh = np.arange(24, dtype=np.float64)
+    p2 = r.uniform(0.0, 24.0)
+    p1 = p2 + r.uniform(4.0, 14.0)
+    c2 = r.uniform(*K['h2'])
+    c3 = r.uniform(0.0, 0.25)
+    prof = (np.cos(_YA_TWO_PI * (hh - p1) / 24.0) + c2 * np.cos(2.0 * _YA_TWO_PI * (hh - p2) / 24.0)
+            + c3 * np.cos(3.0 * _YA_TWO_PI * (hh - r.uniform(0.0, 24.0)) / 24.0))
+    prof *= sig * r.uniform(*K['prof']) / float(np.sqrt(_v2_mean(prof * prof)))
+    if r.random() < _YA_P_QUIET:
+        prof = np.roll(prof, (int(hod[0]) + int(r.integers(-4, 5)) - int(np.argmin(prof))) % 24)
+    nd = int(day[-1]) + 1
+    dayf = np.clip(1.0 + r.uniform(*_YA_DAYF) * r.standard_normal(nd), 0.15, 2.4)
+    wk = np.zeros(7)
+    w_lo = r.uniform(*K['wk'])
+    wk[5] = np.log(0.5 * (1.0 + w_lo))
+    wk[6] = np.log(w_lo)
+    z += prof[hod] * dayf[day] + wk[day % 7]
+
+    df = r.uniform(*K['df'])
+    z += np.clip(r.standard_t(df, n), -8.0, 8.0) * (sig * r.uniform(*K['noi']) * float(np.sqrt((df - 2.0) / df)))
+
+    lam = r.uniform(*K['lam'])
+    if lam > 0.02:
+        x = np.maximum(1.0 + lam * z, 0.03) ** (1.0 / lam)
+    else:
+        x = np.exp(np.clip(z, -12.0, 12.0))
+    level = _ya_lu(r, 0.2, 50.0)
+    x *= level / float(_v2_mean(x))
+
+    rel = _ya_lu(r, *K['grid'])
+    u_odd, u_dec = r.random(), r.random()
+    k10 = int(np.floor(np.log10(rel * level)))
+    mant = rel * level / 10.0 ** k10
+    if u_odd < 0.15:
+        q = rel * level
+        dec = int(min(max(3 - k10, 2), 8)) if u_dec < 0.5 else int(min(max(2 - k10, 1), 8))
+    else:
+        if mant < 1.6:
+            q, dec = 1.0, -k10
+        elif mant < 3.6:
+            q, dec = 2.5, 1 - k10
+        elif mant < 7.0:
+            q, dec = 5.0, -k10
+        else:
+            q, dec = 10.0, -k10 - 1
+        q *= 10.0 ** k10
+        dec = int(min(max(dec, 0), 8))
+    x = np.maximum(np.round(x / q), 1.0) * q
+
+    u_fl, p_fl = r.random(), r.uniform(0.005, 0.10)
+    if u_fl < _YA_P_FLOOR[kind] and n > 64:
+        fl = float(np.partition(x, int(p_fl * (n - 1)))[int(p_fl * (n - 1))])
+        x[:n - 4] = np.maximum(x[:n - 4], fl)
+
+    n_gap = int(r.poisson(n * r.uniform(*K['gap']) / 1000.0))
+    if n_gap > 0 and n > 64:
+        ln = _YA_GAP_LEN[np.searchsorted(_YA_GAP_CUM, r.random(n_gap) * _YA_GAP_CUM[-1])]
+        ln = np.where(r.random(n_gap) < K['glong'], r.integers(8, 41, n_gap), ln)
+        st = r.integers(1, n - 44, n_gap)
+        miss = np.zeros(n, dtype=bool)
+        for a, g in zip(st.tolist(), ln.tolist()):
+            miss[a:a + g] = True
+        miss[0] = False
+        miss[n - 3:] = False
+        idx = np.arange(n, dtype=np.float64)
+        keep = ~miss
+        x[miss] = np.interp(idx[miss], idx[keep], x[keep])
+    return np.round(x, int(min(dec + 3, 10)))
+
+def _ya_airq(r, L, p_shift=_YA_P_SHIFT, size=1.0):
+    L = int(L)
+    if L < 256:
+        return None
+    u = r.random()
+    if u < _YA_N_CUM[0]:
+        n = int(r.integers(_YA_N_LONG[0], _YA_N_LONG[1] + 1))
+    elif u < _YA_N_CUM[1]:
+        lo, hi = _YA_N_SHORT
+        n = int(r.uniform(lo, hi)) if r.random() < 0.5 else int(_ya_lu(r, lo, hi))
+    else:
+        n = int(r.integers(_YA_N_FWD[0], _YA_N_FWD[1] + 1))
+    n = int(min(max(n, 96), L - 32))
+    kind = int(np.searchsorted(_YA_KIND_CUM, r.random() * _YA_KIND_CUM[-1], side='right'))
+    x = _ya_series(r, n, min(kind, len(_YA_KINDS) - 1), p_shift, size)
+    if not (np.all(np.isfinite(x)) and float(x.max()) > float(x.min()) and float(x.min()) > 0.0):
+        return None
+    out = np.empty(L, dtype=np.float64)
+    out[:L - n] = x[0]
+    out[L - n:] = x
+    return out
+
+def _ya_airqm(r, L):
+    return _ya_airq(r, L, 0.6, 0.6)
+
+def _ya_airq0(r, L):
+    return _ya_airq(r, L, 0.0, 1.0)
+
+_YB_SOD = np.arange(96, dtype=np.float64)
+_YB_UG = np.linspace(0.0, 1.0, 129)
+_YB_KINDS = ("co2", "solar", "wind", "price", "load")
+_YB_KIND_CUM = np.cumsum([0.28, 0.20, 0.17, 0.19, 0.16])
+_YB_P_TAIL = (1.0, 0.0, 0.07, 0.0, 0.12)
+_YB_P_BLIP = (0.25, 0.0, 0.12, 0.0, 0.10)
+_YB_BLIP_MAX = (13, 0, 13, 0, 4)
+_YB_P_FULL = 0.65
+
+def _yb_lu(u, lo, hi):
+    return float(lo * (hi / lo) ** u)
+
+def _yb_ar1(e, phi):
+    y = np.array(e, dtype=np.float64)
+    if y.ndim == 1 and y.flags.c_contiguous:
+        _v2_ar1_fill(y, float(phi))
+        return y
+    n = y.size
+    k = 1
+    p = float(phi)
+    while k < n and abs(p) > 1e-12:
+        y[k:] = y[k:] + p * y[:-k]
+        p = p * p
+        k *= 2
+    return y
+
+def _yb_ou(r, m, tau, tail=0.0):
+    phi = float(np.exp(-1.0 / max(tau, 0.2)))
+    e = r.standard_normal(m)
+    if tail > 0.0:
+        e *= np.exp(tail * r.standard_normal(m) - tail * tail)
+    e0 = float(e[0])
+    e *= float(np.sqrt(max(1.0 - phi * phi, 1e-12)))
+    e[0] = e0
+    return _yb_ar1(e, phi)
+
+def _yb_ou2(r, m, tau1, tau2, tail=0.0, vol=None):
+    b = int(4.0 * tau2) + 4
+    p1 = float(np.exp(-1.0 / max(tau1, 0.2)))
+    p2 = float(np.exp(-1.0 / max(tau2, 0.2)))
+    e = r.standard_normal(m + b)
+    if tail > 0.0:
+        e *= np.exp(tail * r.standard_normal(m + b) - tail * tail)
+    if vol is not None:
+        e[b:] *= vol
+    e0 = float(e[0])
+    e *= float(np.sqrt(max(1.0 - p1 * p1, 1e-12)))
+    e[0] = e0
+    y = _yb_ar1(_yb_ar1(e, p1), p2)[b:]
+    return y * float(np.sqrt((1.0 - p2 * p2) * (1.0 - p1 * p2) / (1.0 + p1 * p2)))
+
+def _yb_unit(z):
+    return z / max(float(_v2_stdm(z)), 1e-9)
+
+def _yb_bump(c, w):
+    d = np.abs((_YB_SOD - c + 48.0) % 96.0 - 48.0)
+    return np.exp(-0.5 * (d / w) ** 2)
+
+def _yb_plateau(c, w, e):
+    d = np.abs((_YB_SOD - c + 48.0) % 96.0 - 48.0)
+    return 1.0 / (1.0 + np.exp((d - w) / e))
+
+def _yb_dayline(a, f, lo=22.0, hi=86.0):
+    nd = f.size
+    d = np.arange(nd, dtype=np.float64) * 96.0
+    xp = np.empty(2 * nd, dtype=np.float64)
+    xp[0::2] = d + lo
+    xp[1::2] = d + hi
+    return np.interp(a, xp, np.repeat(f, 2))
+
+def _yb_days(r, nd, phi, sd):
+    e = r.standard_normal(nd) * (sd * float(np.sqrt(max(1.0 - phi * phi, 1e-12))))
+    e[0] = e[0] / float(np.sqrt(max(1.0 - phi * phi, 1e-12)))
+    return _yb_ar1(e, phi)
+
+def _yb_rough(r, m, tail):
+    return r.standard_normal(m) * np.exp(tail * r.standard_normal(m) - tail * tail)
+
+def _yb_co2(r, n, a, sod, day, dow0):
+    u = r.random(30)
+    nd = int(day[-1]) + 1
+    base = _yb_lu(u[0], 22.0, 640.0)
+    c = 0.07 + 0.42 * u[1]
+    qp = 0.02 + 1.12 * u[2] if u[2] < 0.25 else 0.3 + 0.8 * (u[2] - 0.25)
+    fs = 0.55 + 0.4 * u[3]
+
+    dip = _yb_plateau(48.0 + 6.0 * u[4], 17.0 + 9.0 * u[5], 1.0 + 2.5 * u[26])
+    rest = (0.1 + 0.5 * u[6]) * _yb_bump(72.0 + 10.0 * u[7], 6.0 + 8.0 * u[8]) + 0.3 * u[9] * _yb_bump(28.0 + 6.0 * u[10], 5.0 + 6.0 * u[11])
+    sun = 0.25 + 0.75 * r.beta(1.5 + 2.5 * u[12], 0.8 + 1.0 * u[13], nd)
+    prof = rest[sod] - dip[sod] * sun[day]
+    prof = _yb_unit(prof - float(_v2_meanm(prof)))
+    slow = _yb_ou2(r, n, _yb_lu(u[14], 30.0, 300.0) if qp < 0.3 else _yb_lu(u[14], 120.0, 500.0), 3.0 + 6.0 * u[15])
+    g = _yb_lu(u[21], 0.03, 1.0)
+
+    o = _yb_ou(r, n, _yb_lu(u[20], 6.0, 30.0))
+    vol = 1.0 + (2.0 + 4.0 * u[19]) * (o > float(np.quantile(o, 0.85 - 0.6 * u[27])))
+    ps = 0.08 + 0.55 * u[24]
+    vol = vol * ((r.random(n) < ps) / float(np.sqrt(ps)))
+    res = _yb_unit(_yb_ou2(r, n, _yb_lu(u[16], 6.0, 36.0) * (1.0 + 1.5 * g), (1.5 + 3.5 * u[17]) * (1.0 + 1.5 * g), tail=0.2 + 0.4 * u[18], vol=vol))
+    z = float(np.sqrt(qp)) * prof + float(np.sqrt(1.0 - qp)) * (float(np.sqrt(fs)) * slow + float(np.sqrt(1.0 - fs)) * res)
+    we = (((np.arange(nd) + dow0) % 7) >= 5).astype(np.float64)
+    z = z + (-0.6 + 0.7 * u[28]) * _yb_dayline(a, we, 4.0, 92.0)
+
+    k = 0.1 + 0.75 * u[25] ** 2
+    z = np.tanh(k * z) / k
+    lam = -0.7 + 1.05 * u[23]
+    if abs(lam) > 0.02:
+        z = (np.exp(lam * z) - 1.0) / lam
+    z = _yb_unit(z - float(_v2_meanm(z)))
+    ds = float(np.diff(z).std())
+    z = z + g * min(ds, 0.075) * np.clip(_yb_rough(r, n, 0.55 + 0.6 * g + 0.25 * u[22]), -12.0, 12.0)
+
+    return np.round(base * np.exp(c * z) + 0.03 * r.standard_normal(n), 1)
+
+def _yb_solar(r, n, a, sod, day, dow0):
+    u = r.random(24)
+    nd = int(day[-1]) + 1
+    cap = _yb_lu(u[0], 30.0, 60000.0)
+    noon = 44.0 + 8.0 * u[1]
+
+    hw = 23.0 + 9.0 * u[2] + (2.0 + 6.0 * u[3]) * ((nd - 1) - np.arange(nd, dtype=np.float64)) / 43.0
+    hw = np.clip(hw, 18.0, 40.0)
+    uu = (sod - (noon - hw[day])) / (2.0 * hw[day])
+    bell = np.interp(uu, _YB_UG, np.sin(np.pi * _YB_UG) ** (0.9 + 1.2 * u[4]))
+
+    m = _yb_lu(u[5], 0.05, 0.6)
+    kc = _yb_lu(u[6], 1.0, 8.0)
+    clear = 1.0 - 0.88 * r.beta(m * kc, (1.0 - m) * kc, nd)
+    sig = _yb_lu(u[7], 0.03, 0.45)
+    cloud = np.minimum(np.exp(sig * _yb_ou2(r, n, _yb_lu(u[8], 3.0, 16.0), 1.0 + 2.0 * u[9], tail=0.4 * u[10])), 1.35)
+    x = cap * bell * clear[day] * cloud
+    x = x * np.maximum(1.0 + _yb_lu(u[18], 0.001, 0.09) * _yb_rough(r, n, 0.3), 0.0)
+    if u[11] < 0.25:
+        kq = cap * (0.5 + 0.4 * u[12])
+        x = kq * np.tanh(x / kq)
+    if u[13] < 0.28:
+        fl = cap * _yb_lu(u[14], 0.002, 0.04)
+        x = np.maximum(x, fl * (1.0 + (0.01 + 0.1 * u[15]) * _yb_ou(r, n, 6.0 + 30.0 * u[16])))
+    return np.round(x, 1 if (u[17] < 0.8 or cap < 600.0) else 0)
+
+def _yb_wind(r, n, a, sod, day, dow0):
+    u = r.random(24)
+    cap = _yb_lu(u[0], 150.0, 25000.0)
+    nk = n // 48 + 3
+    vol = np.exp((0.15 + 1.0 * u[1] ** 1.5) * np.interp(a - a[0], np.arange(nk, dtype=np.float64) * 48.0, _yb_ou(r, nk, 3.0)))
+    g = _yb_ou2(r, n, _yb_lu(u[2], 36.0, 115.0), 1.0 + 5.5 * u[3], tail=0.3 * u[4], vol=vol)
+    g = _yb_unit(g)
+    z = g + _yb_lu(u[5], 0.02, 0.12) * _yb_ou(r, n, 1.5 + 8.0 * u[6])
+    if u[7] < 0.95:
+        z = z + (0.2 + 1.2 * u[8] ** 2) * (_yb_bump(96.0 * u[9], 14.0 + 10.0 * u[10]) - 0.3)[sod]
+    x = cap / (1.0 + np.exp(-((0.9 + 1.0 * u[11]) * z + (-1.9 + 1.5 * u[12]))))
+    if u[13] < 0.25:
+        x = np.maximum(x - cap * _yb_lu(u[14], 0.003, 0.04), 0.0)
+    else:
+        x = x + cap * _yb_lu(u[14], 0.002, 0.01) * np.exp(0.5 * _yb_ou(r, n, 4.0))
+    return np.round(x, 1 if (u[15] < 0.78 or cap < 400.0) else 0)
+
+def _yb_price(r, n, a, sod, day, dow0):
+    u = r.random(48)
+    nd = int(day[-1]) + 1
+    lev = 60.0 + 130.0 * u[0] if u[1] < 0.8 else _yb_lu(u[0], 25.0, 60.0)
+    nordic = u[2] < 0.25
+    dow = (np.arange(nd) + dow0) % 7
+    we = (dow >= 5).astype(np.float64)
+    lv = _yb_days(r, nd, 0.5 + 0.4 * u[3], (0.2 + 0.3 * u[4]) if nordic else (0.06 + 0.12 * u[4]))
+    lv = lv + np.where(dow == 5, np.log(0.8 + 0.17 * u[5]), 0.0) + np.where(dow == 6, np.log(0.65 + 0.28 * u[6]), 0.0)
+    dv = np.exp((0.25 + 0.4 * u[43]) * r.standard_normal(nd))
+    an = (0.3 + 0.4 * u[7]) if nordic else (0.5 + 0.6 * u[7])
+
+    am = (0.1 + 0.25 * u[8]) * float(u[47] < 0.6) * _yb_plateau(30.0 + 6.0 * u[9], 5.0 + 5.0 * u[10], 2.0 + 2.5 * u[38])
+    ev = (0.3 + 0.6 * u[11]) * _yb_plateau(70.0 + 8.0 * u[12], 8.0 + 8.0 * u[13], 2.0 + 2.5 * u[39])
+    ng = (0.1 + 0.3 * u[14]) * _yb_bump(10.0 + 8.0 * u[15], 10.0 + 6.0 * u[16])
+    sol = _yb_plateau(48.0 + 6.0 * u[17], 10.0 + 8.0 * u[18], 2.0 + 3.0 * u[40])
+    sd_ = np.exp((0.1 + 0.25 * u[19]) * r.standard_normal(nd))
+    scar = np.exp((0.1 + 0.3 * u[20]) * np.abs(r.standard_normal(nd)) * (r.random(nd) < 0.15))
+    sunny = r.beta(2.0 + 2.0 * u[21], 0.7 + 0.7 * u[22], nd) * (1.0 + 0.4 * we)
+    S = (0.3 + 0.7 * u[23]) if (not nordic or u[24] < 0.35) else 0.25 * u[23]
+    shape = (am[sod] - ng[sod]) * sd_[day] + ev[sod] * (sd_ * scar)[day]
+
+    st = np.flatnonzero((a % 4) == 0)
+    if st.size == 0 or st[0] != 0:
+        st = np.concatenate(([0], st))
+    hr = (a // 4) - int(a[0] // 4)
+    hn = (0.03 + 0.10 * u[29]) * _yb_ou(r, st.size, _yb_lu(u[27], 2.0, 12.0), tail=0.3 + 0.4 * u[28])
+    hn = hn + (0.02 + 0.07 * u[44]) * _yb_ou(r, st.size, _yb_lu(u[45], 0.3, 1.5), tail=0.6 + 0.4 * u[46])
+    y = np.clip(_yb_dayline(a, lv) + (an * shape + (2.0 if nordic else 1.0) * hn[hr]) * dv[day], -6.0, 6.0)
+    lam = -0.3 + 0.75 * u[36]
+    p = lev * (1.0 + ((np.exp(lam * y) - 1.0) / lam if abs(lam) > 0.02 else y)) - lev * S * sunny[day] * sol[sod]
+
+    cnt = np.diff(np.concatenate((st, [n])))
+    m = np.add.reduceat(p, st) / cnt
+    kap = 0.0 if u[25] < 0.03 else 1.2 + 2.0 * u[26]
+    x = m[hr] + kap * (p - m[hr])
+    if kap > 0.0:
+        x = x + lev * (0.01 + 0.05 * u[34]) * _yb_ou2(r, n, _yb_lu(u[35], 8.0, 48.0), 1.0 + 2.0 * u[42], tail=0.2 + 0.3 * u[37])
+        e = r.standard_normal(n) * np.exp(0.7 * r.standard_normal(n) - 0.49)
+        x = x + lev * _yb_lu(u[30], 0.004, 0.03) * e
+
+        idx = np.where(r.random(n) < _yb_lu(u[41], 0.003, 0.06), 0, np.arange(n))
+        x = x[np.maximum.accumulate(idx)]
+    if u[31] < 0.3:
+        x = np.maximum(x, 0.0)
+    else:
+        F = lev * (0.02 + 0.1 * u[32])
+        neg = x < 0.0
+        x[neg] = -F * np.log1p(-x[neg] / F)
+        zz = lev * (0.004 + 0.026 * u[33])
+        x = np.where((np.abs(x) < zz) & (r.random(n) < 0.75), 0.0, x)
+    return np.round(x, 2)
+
+def _yb_load(r, n, a, sod, day, dow0):
+    u = r.random(44)
+    nd = int(day[-1]) + 1
+    lev = _yb_lu(u[0], 900.0, 45000.0)
+    dow = (np.arange(nd) + dow0) % 7
+    sat = (dow == 5).astype(np.float64)
+    sun = (dow == 6).astype(np.float64)
+    if u[1] < 0.3:
+        wd = _yb_plateau(52.0 + 16.0 * u[2], 14.0 + 10.0 * u[3], 2.5 + 3.0 * u[41]) - (0.1 + 0.3 * u[4]) * _yb_bump(12.0 + 8.0 * u[5], 8.0 + 4.0 * u[6])
+        we = wd
+    else:
+        ng = (0.3 + 0.5 * u[4]) * _yb_bump(10.0 + 10.0 * u[5], 8.0 + 6.0 * u[6])
+        md = (0.2 + 0.6 * u[7]) * _yb_bump(46.0 + 10.0 * u[8], 8.0 + 6.0 * u[9])
+        evb = (0.5 + 0.5 * u[10]) * _yb_bump(70.0 + 12.0 * u[11], 6.0 + 6.0 * u[12])
+        wd = (0.5 + 0.5 * u[2]) * _yb_bump(28.0 + 10.0 * u[3], 6.0 + 6.0 * u[13]) + md + evb - ng
+        we = (0.2 + 0.4 * u[2]) * _yb_bump(34.0 + 10.0 * u[3], 8.0 + 6.0 * u[13]) + md + evb - ng
+    sc = max(float(_v2_stdm(wd)), 1e-9)
+    wd = (wd - float(_v2_meanm(wd))) / sc
+    we = (we - float(_v2_meanm(we))) / sc
+    depth = 0.05 + 0.12 * u[14]
+    wkmix = sat * (0.5 + 0.5 * u[15]) + sun
+    amp = (1.0 - wkmix * (0.1 + 0.4 * u[16])) * np.exp(_yb_lu(u[35], 0.03, 0.15) * r.standard_normal(nd))
+    lv = _yb_days(r, nd, 0.6 + 0.35 * u[17], 0.015 + 0.045 * u[18]) + sat * np.log(0.88 + 0.09 * u[19]) + sun * np.log(0.84 + 0.11 * u[20])
+    lv = lv + (-0.08 + 0.16 * u[26]) * np.linspace(-0.5, 0.5, nd)
+    shape = wd[sod] * (1.0 - wkmix[day]) + we[sod] * wkmix[day]
+    x = lev * np.exp(_yb_dayline(a, lv)) * (1.0 + depth * amp[day] * shape)
+    x = x * (1.0 + _yb_lu(u[21], 0.003, 0.06) * _yb_ou2(r, n, _yb_lu(u[22], 4.0, 40.0), 0.7 + 2.0 * u[23]))
+    if u[28] < 0.3:
+        hr = (a // 4) - int(a[0] // 4)
+        x = x * (1.0 + _yb_lu(u[29], 0.002, 0.012) * _yb_ou(r, int(hr[-1]) + 1, _yb_lu(u[30], 1.0, 4.0))[hr])
+    x = x + lev * _yb_lu(u[24], 0.001, 0.004) * _yb_rough(r, n, 0.2 + 0.4 * u[27])
+    if u[36] < 0.15:
+        x = x + lev * _yb_lu(u[37], 0.05, 0.13) * _yb_ou2(r, n, _yb_lu(u[38], 2.0, 8.0), 0.6 + 1.6 * u[39], tail=0.3)
+    elif u[36] < 0.4:
+        x = x + lev * _yb_lu(u[37], 0.006, 0.04) * _yb_ou(r, n, _yb_lu(u[38], 3.0, 10.0), tail=0.2 + 0.4 * u[39])
+    if u[31] < 0.22:
+        sp = np.cumsum((r.random(n) < _yb_lu(u[32], 0.0003, 0.003)) * r.standard_normal(n))
+        k = 2 + int(6.0 * u[40])
+        sp[k:] = sp[k:] - sp[:-k].copy()
+        x = x * np.maximum(1.0 + _yb_lu(u[33], 0.15, 0.6) * sp, 0.05)
+    x = np.maximum(x, 0.02 * lev)
+    if u[34] < 0.04:
+        st = np.flatnonzero((a % 4) == 0)
+        if st.size == 0 or st[0] != 0:
+            st = np.concatenate(([0], st))
+        x = (np.add.reduceat(x, st) / np.diff(np.concatenate((st, [n]))))[(a // 4) - int(a[0] // 4)]
+        return np.round(x, 1)
+    return np.round(x, 0 if u[25] < 0.78 else 1)
+
+_YB_BUILD = (_yb_co2, _yb_solar, _yb_wind, _yb_price, _yb_load)
+
+def _yb_tail_len(r):
+    v = r.random(2)
+    if v[0] < 0.85:
+        return int(min(max(round(83.5 + 6.0 * float(r.standard_normal())), 69), 103))
+    if v[0] < 0.93:
+        return 50 + int(13 * v[1])
+    if v[0] < 0.97:
+        return 100 + int(13 * v[1])
+    return 126 + int(11 * v[1]) if v[1] < 0.6 else 190 + int(32.5 * (v[1] - 0.6))
+
+def _yb_draw(r, L):
+    L = int(L)
+    u = r.random(12)
+    kind = min(int(np.searchsorted(_YB_KIND_CUM, u[0], side="right")), len(_YB_KINDS) - 1)
+    hv = (64, 256, 720)[min(int(3.0 * u[1]), 2)]
+    feed = L + 64 if u[2] < _YB_P_FULL else int(1100.0 + (L + 64 - 1100.0) * u[3])
+    n = int(max(min(L, feed - hv), min(L, 384)))
+    s_end = 86 + int(13.0 * u[4])
+    if hv == 720:
+        s_end -= 48
+    a = np.arange(n, dtype=np.int64) + int((s_end - (n - 1)) % 96)
+    x = np.asarray(_YB_BUILD[kind](r, n, a, a % 96, a // 96, int(7.0 * u[5])), dtype=np.float64)
+    end = n
+    if u[6] < _YB_P_TAIL[kind]:
+        T = _yb_tail_len(r)
+        if n - T >= 256:
+            x[n - T:] = x[n - T - 1]
+            end = n - T
+    if u[7] < _YB_P_BLIP[kind]:
+        nc = (end - 96) // 64
+        if nc >= 4:
+            nb = 1 + int(3.0 * u[8])
+            cells = r.choice(nc, size=min(nb, nc), replace=False)
+            v = r.random((cells.size, 3))
+            for j in range(cells.size):
+                m = min(2 + int(6.0 * v[j, 0]) if v[j, 1] < 0.7 else 8 + int(8.0 * v[j, 0] ** 2), _YB_BLIP_MAX[kind])
+                s = 64 + 64 * int(cells[j]) + int(32.0 * v[j, 2])
+                x[s:s + m] = x[s - 1]
+    return x, kind
+
+def _yb_grid15(r, L):
+    L = int(L)
+    if L < 512:
+        return None
+    x, _ = _yb_draw(r, L)
+    n = x.size
+    if n > L:
+        x = x[n - L:]
+        n = L
+    out = np.empty(L, dtype=np.float64)
+    out[:L - n] = x[0]
+    out[L - n:] = x
+    if not bool(np.all(np.isfinite(out))) or float(out.max()) <= float(out.min()):
+        return None
+    return out
+
+_YC_P = 1440
+_YC_TWO_PI = 2.0 * np.pi
+_YC_MIX = (0.85, 0.15)
+_YC_RATE_KINDS = np.cumsum([0.84, 0.07, 0.05, 0.04])
+
+_YC_HMED = np.array([0.452, 0.099, 0.115, 0.041, 0.028])
+_YC_HLSD = np.array([0.19, 0.34, 0.60, 0.66, 0.67])
+_YC_HPSI = np.array([3.57, 2.16, 0.99, 5.93, 5.26])
+_YC_HPSD = np.array([0.20, 0.57, 1.04, 1.08, 1.28])
+_YC_HDA = np.array([0.15, 0.35, 0.45, 0.5, 0.5])
+_YC_HDP = np.array([0.15, 0.5, 0.8, 1.0, 1.0])
+_YC_HCOS = np.cos(np.arange(1.0, 7.0)[:, None] * np.arange(_YC_P, dtype=np.float64)[None, :] * (_YC_TWO_PI / _YC_P))
+_YC_HSIN = np.sin(np.arange(1.0, 7.0)[:, None] * np.arange(_YC_P, dtype=np.float64)[None, :] * (_YC_TWO_PI / _YC_P))
+_YC_WIN = np.cumsum([0.05, 0.20, 0.55, 0.20])
+
+_YC_TIDE_PER = np.array([745.236072, 720.0, 759.50085, 1436.068182, 1549.160502, 1612.101402,
+                         372.618036, 366.206358, 248.412024, 490.628394])
+
+def _yc_lu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+def _yc_filt(e, phi):
+    y = np.array(e, dtype=np.float64)
+    if y.ndim == 1 and y.flags.c_contiguous:
+        _v2_ar1_fill(y, float(phi))
+        return y
+    n = y.size
+    k = 1
+    p = float(phi)
+    while k < n and abs(p) > 1e-12:
+        y[k:] = y[k:] + p * y[:-k]
+        p = p * p
+        k *= 2
+    return y
+
+def _yc_ar1(r, n, tau, sd, tail=0.0):
+    n = int(n)
+    phi = float(np.exp(-1.0 / max(float(tau), 0.05)))
+    e = r.standard_normal(n)
+    if tail > 0.0:
+        e = e * np.exp(tail * r.standard_normal(n) - tail * tail)
+    e = e * (sd * np.sqrt(max(1.0 - phi * phi, 1e-12)))
+    e[0] = r.standard_normal() * sd
+    return _yc_filt(e, phi)
+
+def _yc_box(x, m):
+    m = min(int(m), x.size)
+    if m <= 1:
+        return x
+    c = np.cumsum(np.concatenate(([0.0], x)))
+    out = np.empty(x.size, dtype=np.float64)
+    out[m - 1:] = (c[m:] - c[:-m]) / m
+    out[:m - 1] = c[1:m] / np.arange(1, m)
+    return out
+
+def _yc_pad(x, L):
+    out = np.empty(L, dtype=np.float64)
+    n = x.size
+    if n >= L:
+        out[:] = x[n - L:]
+    else:
+        out[:L - n] = x[0]
+        out[L - n:] = x
+    return out
+
+def _yc_store(r, x, p_dec):
+    if r.random() < p_dec:
+        return np.round(x, int(r.integers(2, 4)))
+    return x.astype(np.float32).astype(np.float64)
+
+def _yc_smooth(r, n, tau, sd):
+    step = max(1, int(tau / 6.0))
+    m = n // step + 3
+    z = np.interp(np.arange(n, dtype=np.float64) / step + r.random(), np.arange(m, dtype=np.float64),
+                  _yc_ar1(r, m, tau / step, sd))
+    return _yc_box(z, step)
+
+def _yc_hshape(a, psi):
+    amp = np.concatenate(([1.0], a))
+    ph = np.concatenate(([0.0], psi))
+    p = ((amp * np.cos(ph))[:, None] * _YC_HCOS - (amp * np.sin(ph))[:, None] * _YC_HSIN).sum(0)
+    lo = float(p.min())
+    return (p - lo) / max(float(p.max()) - lo, 1e-9)
+
+def _yc_cycle(r, n, s_amp, s_lvl, s_warp, blend, h_scale):
+
+    a = _YC_HMED * h_scale * np.exp(_YC_HLSD * r.standard_normal(5))
+    psi = _YC_HPSI + _YC_HPSD * r.standard_normal(5)
+    ta = _yc_hshape(a, psi)
+    tb = _yc_hshape(a * np.exp(_YC_HDA * r.standard_normal(5)), psi + _YC_HDP * r.standard_normal(5))
+    u = (np.arange(n, dtype=np.float64) + float(r.integers(0, _YC_P))) / float(_YC_P)
+    nd = int(u[-1]) + 2
+    grid = np.arange(nd, dtype=np.float64)
+    half = np.arange(2 * nd, dtype=np.float64) * 0.5
+    warp = np.interp(u, half, r.normal(0.0, s_warp, 2 * nd))
+    g = ((u + warp) % 1.0) * _YC_P
+    i0 = np.minimum(g.astype(np.int64), _YC_P - 1)
+    f = g - i0
+    i1 = (i0 + 1) % _YC_P
+    w = np.interp(u, grid, blend * r.random(nd))
+    pa = ta[i0] * (1.0 - f) + ta[i1] * f
+    pb = tb[i0] * (1.0 - f) + tb[i1] * f
+    prof = (pa + w * (pb - pa)) * np.exp(np.interp(u, grid, r.normal(0.0, s_amp, nd)))
+    return prof, np.interp(u, grid, r.normal(0.0, s_lvl, nd))
+
+def _yc_count(r, p_none, lo, hi):
+    if r.random() < p_none:
+        return 0
+    return int(r.poisson(_yc_lu(r, lo, hi)))
+
+def _yc_steps(r, n, k, w_lo, w_hi, a_lo, a_hi, p_up):
+    if k <= 0:
+        return 0.0
+    i0 = r.integers(0, n, k)
+    w = np.exp(r.uniform(np.log(w_lo), np.log(w_hi), k)).astype(np.int64) + 1
+    a = np.exp(r.uniform(np.log(a_lo), np.log(a_hi), k)) * np.where(r.random(k) < p_up, 1.0, -1.0)
+    d = np.bincount(i0, weights=a, minlength=n + 1) - np.bincount(np.minimum(i0 + w, n), weights=a, minlength=n + 1)
+    return np.cumsum(d)[:n]
+
+def _yc_needles(r, lx, k, d_lo, d_hi):
+    if k <= 0:
+        return lx
+    idx = r.integers(0, lx.size, k)
+    lx[idx] += np.log1p(-np.exp(r.uniform(np.log(d_lo), np.log(d_hi), k)))
+    return lx
+
+def _yc_events(r, lx, k_plat, k_bump, k_needle, size):
+    n = lx.size
+    lx = lx + _yc_steps(r, n, k_plat, 15.0, 300.0, 0.3 * size, 3.0 * size, 0.75)
+    lx = lx + _yc_steps(r, n, k_bump, 1.0, 14.0, 0.3 * size, 4.0 * size, 0.85)
+    return _yc_needles(r, lx, k_needle, 0.05, 0.9)
+
+def _yc_window(r, x):
+    k = int(np.searchsorted(_YC_WIN, r.random(), side="right"))
+    x = _yc_box(x, min(k, 3) + 2)
+    return _yc_box(x, 2) if r.random() < 0.25 else x
+
+def _yc_rate_std(r, n):
+    base = float(np.clip(np.exp(r.normal(np.log(0.27), 0.42)), 0.07, 0.62))
+    q = float(np.exp(r.normal(0.0, 0.4)))
+    prof, lvl = _yc_cycle(r, n, _yc_lu(r, 0.01, 0.12), _yc_lu(r, 0.005, 0.06), _yc_lu(r, 0.003, 0.025),
+                          r.uniform(0.5, 1.0), 1.0)
+    lc = np.log(base + (1.0 - base) * prof)
+    z = _yc_smooth(r, n, _yc_lu(r, 200.0, 1000.0), 0.015 * q * _yc_lu(r, 0.5, 2.0))
+    z = z + _yc_smooth(r, n, _yc_lu(r, 30.0, 150.0), 0.03 * q * _yc_lu(r, 0.5, 2.0))
+    z = z + _yc_ar1(r, n, _yc_lu(r, 0.3, 3.0), 0.022 * q * _yc_lu(r, 0.5, 2.0), r.uniform(0.0, 0.5))
+
+    lx = lc + lvl + z * np.exp(-r.uniform(0.2, 0.7) * (lc - float(_v2_meanm(lc))))
+    lx = _yc_events(r, lx, _yc_count(r, 0.25, 1.0, 6.0), _yc_count(r, 0.1, 3.0, 25.0), _yc_count(r, 0.3, 1.0, 10.0),
+                    0.08 * q ** 0.5 * _yc_lu(r, 0.5, 2.0))
+    if r.random() < 0.15:
+        lx = lx + _yc_steps(r, n, int(r.integers(1, 3)), 60.0, 600.0, 0.08, 0.4, 0.7)
+    if r.random() < 0.10:
+        lx[int(r.integers(0, n)):] += r.normal(0.0, 0.06)
+    level = 10.0 ** (r.uniform(8.3, 9.4) if r.random() < 0.18 else r.uniform(3.0, 5.0))
+    return _yc_store(r, _yc_window(r, level * np.exp(lx)), 0.25)
+
+def _yc_pulses(r, n, rate, w_lo, w_hi, h_lo, h_hi):
+    k = int(r.poisson(rate * n))
+    if k <= 0:
+        return np.zeros(n)
+    i0 = r.integers(0, n, k)
+    w = np.exp(r.uniform(np.log(w_lo), np.log(w_hi), k)).astype(np.int64) + 1
+    h = np.exp(r.uniform(np.log(h_lo), np.log(h_hi), k))
+    d = np.bincount(i0, weights=h, minlength=n + 1) - np.bincount(np.minimum(i0 + w, n), weights=h, minlength=n + 1)
+    return np.maximum(np.cumsum(d)[:n], 0.0)
+
+def _yc_rate_burst(r, n):
+    base = float(np.clip(np.exp(r.normal(np.log(0.55), 0.3)), 0.2, 0.85))
+    prof, lvl = _yc_cycle(r, n, _yc_lu(r, 0.05, 0.25), _yc_lu(r, 0.02, 0.1), _yc_lu(r, 0.005, 0.03), 1.0, 1.3)
+    lx = np.log(base + (1.0 - base) * prof) + lvl
+    lx = lx + _yc_smooth(r, n, _yc_lu(r, 150.0, 800.0), _yc_lu(r, 0.04, 0.12))
+    lx = lx + _yc_smooth(r, n, _yc_lu(r, 20.0, 100.0), _yc_lu(r, 0.08, 0.22))
+    lx = lx + _yc_ar1(r, n, _yc_lu(r, 0.3, 3.0), _yc_lu(r, 0.03, 0.1), r.uniform(0.0, 0.5))
+    lx = _yc_events(r, lx, _yc_count(r, 0.1, 2.0, 10.0), 0, _yc_count(r, 0.5, 0.5, 4.0), 0.2)
+    x = np.exp(lx) * (1.0 + _yc_pulses(r, n, _yc_lu(r, 0.02, 0.12), 1.0, 14.0, 0.1, 0.8))
+    level = 10.0 ** r.uniform(4.0, 5.0)
+    x = _yc_window(r, level * x)
+    return _yc_store(r, _yc_box(x, 2) if r.random() < 0.5 else x, 0.25)
+
+def _yc_rate_shallow(r, n):
+    base = float(r.uniform(0.68, 0.9))
+    prof, lvl = _yc_cycle(r, n, _yc_lu(r, 0.05, 0.25), _yc_lu(r, 0.01, 0.05), _yc_lu(r, 0.005, 0.03), 1.0, 1.3)
+    lx = np.log(base + (1.0 - base) * prof) + lvl
+    if r.random() < 0.8:
+        k = float(r.choice(np.array([3.0, 4.0, 4.0, 4.0, 6.0])))
+        amp = -np.log(base) * 0.5 * _yc_lu(r, 0.4, 1.4)
+        lx = lx + amp * np.cos(np.arange(n) * (_YC_TWO_PI * k / _YC_P) + r.uniform(0.0, _YC_TWO_PI))
+    sw = float(_v2_std(lx))
+    lx = lx + _yc_smooth(r, n, _yc_lu(r, 150.0, 800.0), sw * _yc_lu(r, 0.15, 0.5))
+    lx = lx + _yc_smooth(r, n, _yc_lu(r, 15.0, 90.0), sw * _yc_lu(r, 0.5, 1.2))
+    lx = lx + _yc_ar1(r, n, _yc_lu(r, 0.5, 4.0), sw * _yc_lu(r, 0.25, 0.6), r.uniform(0.3, 0.8))
+    lx = _yc_events(r, lx, _yc_count(r, 0.1, 2.0, 10.0), _yc_count(r, 0.2, 2.0, 15.0), 0, sw * _yc_lu(r, 0.5, 1.5))
+    level = 10.0 ** r.uniform(4.3, 6.1)
+    x = _yc_window(r, level * np.exp(lx))
+    return _yc_store(r, _yc_box(x, 2) if r.random() < 0.5 else x, 0.4)
+
+def _yc_rate_error(r, n):
+    base = float(r.uniform(0.15, 0.7))
+    prof, lvl = _yc_cycle(r, n, _yc_lu(r, 0.05, 0.3), _yc_lu(r, 0.01, 0.1), _yc_lu(r, 0.003, 0.02), 1.0, 1.3)
+    lx = np.log(base + (1.0 - base) * prof) + lvl
+    lx = lx + _yc_smooth(r, n, _yc_lu(r, 30.0, 300.0), _yc_lu(r, 0.1, 0.3))
+    lx = lx + _yc_ar1(r, n, _yc_lu(r, 0.3, 2.0), _yc_lu(r, 0.05, 0.22), r.uniform(0.2, 0.9))
+    x = np.exp(lx) * (1.0 + _yc_pulses(r, n, _yc_lu(r, 0.002, 0.03), 1.0, 8.0, 0.4, 6.0))
+    if r.random() < 0.3:
+        x = _yc_window(r, x)
+    level = 10.0 ** r.uniform(-0.6, 0.4)
+    return _yc_store(r, level * x, 0.0)
+
+def _yc_rate(r, L):
+    u = r.random()
+    n = L if (u < 0.72 or L <= 3440) else (int(r.integers(3440, L)) if u < 0.9 else int(r.integers(2900, 3440)))
+    k = int(np.searchsorted(_YC_RATE_KINDS, r.random() * _YC_RATE_KINDS[-1], side="right"))
+    if k <= 0:
+        x = _yc_rate_std(r, n)
+    elif k == 1:
+        x = _yc_rate_burst(r, n)
+    elif k == 2:
+        x = _yc_rate_shallow(r, n)
+    else:
+        x = _yc_rate_error(r, n)
+    return _yc_pad(np.maximum(x, 0.0), L)
+
+def _yc_tide(r, L):
+    n = L if (r.random() < 0.33 or L <= 1024) else int(_yc_lu(r, 400.0, float(L)))
+    n = max(64, min(n, L))
+    t = np.arange(n, dtype=np.float64) + r.uniform(0.0, 5e5)
+    a2 = _yc_lu(r, 0.03, 1.4)
+    form = float(np.clip(np.exp(r.normal(np.log(0.52), 0.95)), 0.03, 8.0))
+    s2 = a2 * 0.46 * float(np.exp(r.normal(0.0, 0.35)))
+    a1 = form * (a2 + s2)
+    k1 = a1 * r.uniform(0.5, 0.66)
+    shallow = r.random() < 0.15
+    r4 = r.uniform(0.07, 0.3) if shallow else float(min(np.exp(r.normal(np.log(0.03), 0.8)), 0.25))
+    amps = np.array([a2, s2, a2 * 0.19 * float(np.exp(r.normal(0.0, 0.3))), k1, a1 - k1,
+                     (a1 - k1) * 0.19 * float(np.exp(r.normal(0.0, 0.3))), a2 * r4, a2 * r4 * r.uniform(0.3, 0.7),
+                     a2 * (r.uniform(0.03, 0.1) if shallow else float(min(np.exp(r.normal(np.log(0.012), 0.8)), 0.08))),
+                     a2 * float(min(np.exp(r.normal(np.log(0.03), 0.8)), 0.2))])
+    ph = r.uniform(0.0, _YC_TWO_PI, amps.size)
+    x = np.zeros(n)
+    for j in range(amps.size):
+        x += amps[j] * np.cos(t * (_YC_TWO_PI / _YC_TIDE_PER[j]) + ph[j])
+    a_tot = float(a2 + s2 + a1)
+
+    s_surge = float(np.clip(a_tot * np.exp(r.normal(np.log(0.1), 0.6)), 0.006, 0.35)) + _yc_lu(r, 0.003, 0.025)
+    x = x + _yc_smooth(r, n, r.uniform(120.0, 1440.0), s_surge)
+    if r.random() < 0.65:
+        p_s = _yc_lu(r, 8.0, 90.0)
+        amp_s = _yc_lu(r, 0.0015, 0.035) * (r.uniform(1.5, 4.0) if (a_tot < 0.1 and r.random() < 0.5) else 1.0)
+        env = np.exp(_yc_smooth(r, n, 18.0 * 60.0 / 3.0, 0.45))
+        psi = np.cumsum(r.standard_normal(n)) * float(np.sqrt(_YC_TWO_PI / (p_s * r.uniform(4.0, 25.0))))
+        x = x + amp_s * env * np.cos(t * (_YC_TWO_PI / p_s) + psi)
+
+    noisy = r.random() < 0.15
+    s_w = a_tot * float(np.exp(r.normal(np.log(0.18), 0.5) if noisy else r.normal(np.log(0.008), 1.5)))
+    s_w = min(max(s_w, 0.0003), 0.25)
+    if noisy or r.random() < 0.35:
+        e = r.standard_t(float(r.uniform(2.1, 3.5) if noisy else r.uniform(2.5, 6.0)), n)
+        e = e / max(float(_v2_stdm(e)), 1e-9)
+    else:
+        e = r.standard_normal(n)
+    fw = r.uniform(0.5, 1.0) if noisy else r.uniform(0.0, 0.75)
+    x = x + s_w * (fw * e + np.sqrt(1.0 - fw * fw) * _yc_ar1(r, n, _yc_lu(r, 1.5, 8.0), 1.0))
+    if r.random() < 0.12:
+        k = int(r.poisson(max(n * r.uniform(0.0002, 0.001), 0.5))) + 1
+        idx = r.integers(0, n, k)
+        x[idx] += np.where(r.random(k) < 0.5, -1.0, 1.0) * r.uniform(4.0, 30.0, k) * max(s_w, 0.004)
+    if r.random() < 0.04:
+        x[int(r.integers(n // 8, n - n // 8)):] += (1.0 if r.random() < 0.5 else -1.0) * r.uniform(0.02, 0.3)
+    half = 1.1 * float(np.max(np.abs(x)))
+    u = r.random()
+    if u < 0.66:
+        datum = half * r.uniform(0.9, 2.0) + r.uniform(0.0, 0.6)
+    elif u < 0.72:
+        datum = r.uniform(2.0, 4.5)
+    elif u < 0.93:
+        datum = -r.uniform(1.2, 8.5)
+    else:
+        datum = half * r.uniform(-0.8, 0.8)
+    u = r.random()
+    q = 0.001 if u < 0.9 else 0.0001
+    return _yc_pad(np.round((x + datum) / q) * q, L)
+
+def _yc_min1440(r, L):
+    try:
+        L = int(L)
+        if L < 256:
+            return None
+        with np.errstate(all="ignore"):
+            w = _yc_rate(r, L) if r.random() < _YC_MIX[0] else _yc_tide(r, L)
+        if (isinstance(w, np.ndarray) and w.shape == (L,) and bool(np.all(np.isfinite(w)))
+                and float(w.max()) > float(w.min()) and float(np.max(np.abs(w))) < 1e12):
+            return np.ascontiguousarray(w, dtype=np.float64)
+    except Exception:
+        pass
+    return None
+
+_YD_KIND_CUM = (0.45, 0.905)
+_YD_POST = 0.95
+
+_YD_LEN_CUM = ((0.69, 0.74, 0.81, 1.00), (0.53, 0.545, 0.56, 1.00), (0.28, 0.28, 0.40, 0.93))
+_YD_LEN_LO = (2380, 2720, 800, 380)
+_YD_LEN_HI = (2720, 3100, 2380, 800)
+_YD_SHORT_HI = (640, 800, 640)
+_YD_MKT_CUM = (0.57, 0.72)
+_YD_MIRROR = 0.04
+_YD_GRID = (0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.125, 0.5, 0.1, 0.05)
+
+def _yd_lu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+def _yd_len(r, L, kind):
+    c = _YD_LEN_CUM[kind]
+    u = r.random()
+    j = 0
+    while j < 4 and u >= c[j]:
+        j += 1
+    if j >= 4:
+        return int(L)
+    n = int(r.integers(_YD_LEN_LO[j], (_YD_SHORT_HI[kind] if j == 3 else _YD_LEN_HI[j]) + 1))
+    return int(max(64, min(n, L)))
+
+def _yd_pad(x, L):
+    out = np.empty(L, dtype=np.float64)
+    n = x.size
+    if n >= L:
+        out[:] = x[n - L:]
+    else:
+        out[:L - n] = x[0]
+        out[L - n:] = x
+    return out
+
+def _yd_ou(z, tau, x0):
+    n = z.size
+    tau = max(float(tau), 8.0, n / 600.0)
+    g = np.exp(np.arange(n, dtype=np.float64) / tau)
+    return (x0 + np.cumsum(z * g)) / g
+
+def _yd_volreg(r, n, mean_len, s):
+    k = int(n / mean_len * 1.6) + 8
+    lens = (1.0 + r.exponential(mean_len, k)).astype(np.int64)
+    v = np.exp(r.normal(0.0, s, k) - s * s)
+    out = np.repeat(v, lens)
+    if out.size < n:
+        out = np.concatenate((out, np.full(n - out.size, v[-1])))
+    return out[:n]
+
+def _yd_smooth(x, w):
+    h = int(w) // 2
+    if h < 1 or x.size < 2:
+        return x
+    c = np.cumsum(np.concatenate((np.full(h + 1, x[0]), x, np.full(h, x[-1]))))
+    return (c[2 * h + 1:] - c[:-(2 * h + 1)]) / float(2 * h + 1)
+
+def _yd_carry(r, x, p):
+    n = x.size
+    if p <= 0.0 or n < 3:
+        return x
+    h = r.random(n) < p
+    h[0] = False
+    return x[np.maximum.accumulate(np.where(h, 0, np.arange(n)))]
+
+def _yd_cycle(r, tb, f):
+
+    d_rise = r.uniform(230.0, 560.0)
+    d_top = r.uniform(60.0, 340.0)
+    d_ret = r.uniform(240.0, 660.0)
+    if r.random() < _YD_POST:
+        e = r.uniform(430.0, 800.0)
+    else:
+        e = r.uniform(-(d_top + 0.9 * d_rise), 1900.0)
+    t_ret = -e
+    t_top = t_ret - d_top
+    t_rise = t_top - d_rise
+    top2 = 1.0 + r.uniform(-0.05, 0.05)
+    kt = [t_rise, t_rise + 0.45 * d_rise, t_top, t_ret, t_ret + 0.4 * d_ret, t_ret + d_ret]
+    kv = [0.0, r.uniform(0.48, 0.72), 1.0, top2, top2 - f * r.uniform(0.42, 0.7), top2 - f]
+    if r.random() < 0.35:
+        a0 = r.uniform(0.12, 0.5)
+        t2e = t_rise - r.uniform(200.0, 1300.0)
+        t2s = t2e - r.uniform(120.0, 450.0)
+        t1e = t2s - r.uniform(40.0, 400.0)
+        t1s = t1e - r.uniform(200.0, 650.0)
+        c0 = r.uniform(-0.1, 0.2)
+        kt = [t1s, t1e, t2s, t2e] + kt
+        kv = [c0, c0 + a0, c0 + a0, r.uniform(-0.08, 0.12)] + kv
+    else:
+        kt = [t_rise - r.uniform(600.0, 2600.0)] + kt
+        kv = [r.uniform(-0.1, 0.25)] + kv
+    if r.random() < 0.40:
+        t3 = kt[-1] + r.uniform(30.0, 350.0)
+        kt = kt + [t3, t3 + r.uniform(60.0, 350.0)]
+        kv = kv + [kv[-1], kv[-1] + r.uniform(-0.15, 0.25)]
+    return np.interp(tb, np.array(kt), np.array(kv))
+
+def _yd_stairs(r, lvl, gap, q):
+    n = lvl.size
+    k = int(n / (0.8 * gap)) + 3
+    m = np.concatenate(([0.0], np.cumsum(r.uniform(0.8, 1.25, k) * gap))) - r.uniform(0.0, 0.8 * gap)
+    v = np.round(lvl[np.clip(m, 0.0, n - 1.0).astype(np.int64)] / q) * q
+    return v[np.searchsorted(m, np.arange(n, dtype=np.float64), side="right") - 1]
+
+def _yd_round(r, x, cum):
+    u = r.random()
+    return np.round(x, 2 if u < cum[0] else 3 if u < cum[1] else 4 if u < cum[2] else 5)
+
+def _yd_mkt(r, n):
+
+    tb = np.arange(n, dtype=np.float64) - float(n - 1)
+    u = r.random()
+    sub = 0 if u < _YD_MKT_CUM[0] else 1 if u < _YD_MKT_CUM[1] else 2
+    c = r.random()
+    e = r.uniform(-1.0, 1.0)
+    mir = r.random() < _YD_MIRROR
+    if sub == 0:
+        f = -0.3 + 0.8 * c + 0.08 * e
+    elif sub == 1:
+        f = 0.15 + 0.6 * c + 0.08 * e
+    else:
+        f = 0.2 + 0.6 * c + 0.08 * e if r.random() < 0.85 else r.uniform(-0.1, 0.2)
+    if mir:
+        f = max(f, 0.1 + 0.4 * c)
+    g = r.uniform(0.85, 1.15)
+    lvl = _yd_cycle(r, tb, f)
+    amp = r.uniform(2.0, 5.0)
+    base = -r.uniform(0.05, 0.95) if r.random() < 0.5 else r.uniform(0.0, 2.5)
+    act = np.clip(lvl, 0.0, 1.0)
+    if sub == 0:
+        path = _yd_smooth(lvl, r.integers(20, 140))
+        sd = amp * (0.026 - 0.014 * c) * g
+        rho = r.uniform(0.45, 0.8)
+        w1 = r.uniform(0.15, 0.45)
+        tau2 = _yd_lu(r, 40.0, 300.0)
+        cum = (0.25, 0.33, 0.75)
+    elif sub == 1:
+        lam = r.uniform(0.0, 0.6)
+        st = _yd_stairs(r, lvl, r.uniform(28.0, 60.0), 0.25 / amp)
+        path = _yd_smooth(lam * st + (1.0 - lam) * lvl, r.integers(10, 80))
+        sd = amp * (0.022 - 0.008 * c) * g
+        rho = r.uniform(0.3, 0.7)
+        w1 = r.uniform(0.0, 0.2)
+        tau2 = _yd_lu(r, 400.0, 3000.0)
+        cum = (0.35, 0.5, 0.7)
+    else:
+        lam = r.uniform(0.4, 1.0)
+        st = _yd_stairs(r, lvl, r.uniform(28.0, 60.0), (0.25 if r.random() < 0.8 else 0.5) / amp)
+        path = _yd_smooth(lam * st + (1.0 - lam) * lvl, r.integers(3, 40))
+        sd = amp * (0.005 - 0.0025 * c) * g
+        rho = r.uniform(0.35, 1.0)
+        w1 = r.uniform(0.0, 0.3)
+        tau2 = _yd_lu(r, 60.0, 600.0)
+        cum = (0.85, 0.95, 0.98)
+    if mir:
+        path = 1.0 - path
+    env = rho + (1.0 - rho) * act
+    vol = sd * env * _yd_volreg(r, n, r.uniform(20.0, 120.0), r.uniform(0.35, 0.6))
+    z1 = r.standard_normal(n) * vol
+    z2 = r.standard_normal(n) * vol
+    jp = r.random(n) < r.uniform(0.0, 0.012)
+    z2 = np.where(jp, z2 * r.uniform(2.5, 4.5), z2)
+    s1 = np.sqrt(w1)
+    s2 = np.sqrt(1.0 - w1)
+    x0 = r.standard_normal() * s2 * sd * rho * np.sqrt(0.5 * min(tau2, 600.0))
+    x = base + amp * path + _yd_ou(s1 * z1, r.uniform(12.0, 50.0), 0.0) + _yd_ou(s2 * z2, tau2, x0)
+    if sub == 2:
+        sm = r.uniform(0.4, 0.8)
+        eta = amp * (0.026 - 0.01 * c) * g * env * np.exp(sm * r.standard_normal(n) - sm * sm)
+        x = x + np.where(r.random(n) < r.uniform(0.25, 0.6), eta * r.standard_normal(n), 0.0)
+    x = _yd_round(r, x, cum)
+    return _yd_carry(r, x, r.uniform(0.0, 0.02))
+
+def _yd_fx(r, n):
+    s = _yd_lu(r, 0.0022, 0.0085)
+    vol = s * _yd_volreg(r, n, r.uniform(10.0, 40.0), r.uniform(0.2, 0.45))
+    z1 = r.standard_normal(n) * vol
+    z2 = r.standard_normal(n) * vol
+    jp = r.random(n) < r.uniform(0.0, 0.015)
+    z1 = np.where(jp, z1 * r.uniform(2.0, 4.0), z1)
+    w_rw = r.uniform(0.15, 0.7)
+    tau_s = _yd_lu(r, 200.0, 1500.0)
+    tau_f = r.uniform(10.0, 80.0)
+    c_f = r.uniform(0.0, 0.5)
+    s_rw = np.sqrt(w_rw)
+    s_sl = np.sqrt(1.0 - w_rw)
+    y = (np.cumsum(s_rw * z1) + c_f * s_rw * _yd_ou(z1, tau_f, 0.0)
+         + _yd_ou(s_sl * z2, tau_s, r.standard_normal() * s_sl * s * np.sqrt(0.5 * tau_s)))
+    if r.random() < 0.05:
+        y = y + r.uniform(-1.0, 1.0) * r.uniform(0.5, 2.0) * np.arange(n, dtype=np.float64) / max(n, 1)
+    u = r.random()
+    lev = _yd_lu(r, 0.1, 15.0) if u < 0.75 else _yd_lu(r, 0.0005, 0.1) if u < 0.93 else _yd_lu(r, 15.0, 200.0)
+    x = lev * np.exp(y - y[-1])
+    dp = int(np.clip(int(r.integers(4, 7)) - 1 - np.floor(np.log10(lev)), 2, 6))
+    x = np.round(x, dp)
+    return _yd_carry(r, x, r.uniform(0.0, 0.012) if r.random() < 0.85 else r.uniform(0.03, 0.1))
+
+def _yd_pol(r, n):
+    tb = np.arange(n, dtype=np.float64) - float(n - 1)
+    u = r.random()
+    f = r.uniform(0.3, 0.65) if u < 0.85 else r.uniform(0.0, 0.3)
+    lvl = _yd_cycle(r, tb, f)
+    if r.random() < _YD_MIRROR:
+        lvl = 1.0 - lvl
+    amp = r.uniform(1.5, 5.5)
+    q = _YD_GRID[int(r.integers(0, len(_YD_GRID)))]
+    base = np.round((-r.uniform(0.0, 1.0) if r.random() < 0.4 else r.uniform(0.0, 4.0)) / q) * q
+    x = base + _yd_stairs(r, amp * lvl, r.uniform(28.0, 75.0), q)
+    if r.random() < 0.3:
+        x = x + r.choice([-0.75, -0.5, -0.1, 0.1, 0.5, 0.75])
+    if not np.any(x != x[0]):
+        k = int(r.integers(max(1, n // 4), max(2, n - 8)))
+        x[k:] = x[k:] + (q if r.random() < 0.5 else -q)
+    return np.round(x, 3)
+
+def _yd_draw(r, L):
+    u = r.random()
+    kind = 0 if u < _YD_KIND_CUM[0] else 1 if u < _YD_KIND_CUM[1] else 2
+    n = _yd_len(r, L, kind)
+    x = _yd_mkt(r, n) if kind == 0 else _yd_fx(r, n) if kind == 1 else _yd_pol(r, n)
+    return kind, x
+
+def _yd_rates(r, L):
+    L = int(L)
+    if L < 64:
+        return None
+    try:
+        _, x = _yd_draw(r, L)
+        x = np.asarray(x, dtype=np.float64)
+        if x.ndim != 1 or x.size < 2 or x.size > L or not bool(np.all(np.isfinite(x))):
+            return None
+        if float(np.max(np.abs(x))) > 1e12 or not bool(np.any(x != x[0])):
+            return None
+        return _yd_pad(x, L)
+    except Exception:
+        return None
+
+_YE_KIND_CUM = np.cumsum([0.44, 0.32, 0.24])
+_YE_TWO_PI = 2.0 * np.pi
+_YE_LAM_LO = 0.02
+_YE_LAM_HI = 5.0e4
+_YE_LEN = ((5.92, 1.2), (6.68, 2.1), (7.0, 1.4))
+
+def _ye_lu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+def _ye_hump(m, pk, w_lo, w_hi):
+    d = float(np.log(m / pk))
+    return float(np.exp(-0.5 * (d / (w_lo if d < 0.0 else w_hi)) ** 2))
+
+def _ye_ar1(e, phi):
+    y = np.array(e, dtype=np.float64)
+    if y.ndim == 1 and y.flags.c_contiguous:
+        _v2_ar1_fill(y, float(phi))
+        return y
+    n = y.size
+    k = 1
+    p = float(phi)
+    while k < n and abs(p) > 1e-12:
+        y[k:] = y[k:] + p * y[:-k]
+        p = p * p
+        k *= 2
+    return y
+
+def _ye_ou(r, n, tau, sd):
+    phi = float(np.exp(-1.0 / max(tau, 0.2)))
+    e = r.standard_normal(n) * (sd * np.sqrt(max(1.0 - phi * phi, 1e-9)))
+    e[0] = r.standard_normal() * sd
+    return _ye_ar1(e, phi)
+
+def _ye_len(zl, L, kind):
+    mu, sd = _YE_LEN[kind]
+    return int(min(L, round(320.0 + float(np.exp(mu + sd * min(max(zl, -6.0), 6.0))))))
+
+def _ye_head(n, amp, c, span):
+    t = np.arange(n, dtype=np.float64)
+    w = 1.0 - np.log1p(t / c) / np.log1p(span / c)
+    return amp * np.maximum(w, 0.0)
+
+def _ye_cycle(r, n, per, amp, p_end, sd_end):
+
+    ph_end = 0.5 + r.normal(0.0, sd_end) if r.random() < p_end else r.random()
+    ph = (np.arange(n, dtype=np.float64) - (n - 1)) / per + ph_end
+    h2 = r.uniform(0.0, 0.3)
+    return amp * (np.cos(_YE_TWO_PI * ph) + h2 * np.cos(2.0 * _YE_TWO_PI * ph + r.uniform(0.0, _YE_TWO_PI)))
+
+def _ye_episodes(r, n, rate, dur_lo, dur_hi, amp_lo, amp_hi, plateau):
+    out = np.zeros(n, dtype=np.float64)
+    k = int(min(r.poisson(rate * n), 40))
+    if k <= 0:
+        return out
+    t = np.arange(n, dtype=np.float64)
+    for _ in range(k):
+        i = int(r.integers(0, n))
+        d = _ye_lu(r, dur_lo, dur_hi)
+        a = r.uniform(amp_lo, amp_hi)
+        if r.random() < plateau:
+            j = int(min(n, i + int(d) + 1))
+            out[i:j] += a
+        else:
+            j = int(min(n, i + int(6.0 * d) + 2))
+            out[i:j] += a * np.exp(-(t[i:j] - i) / d)
+    return out
+
+def _ye_ztp(r, lam):
+    lam = np.minimum(np.maximum(lam, _YE_LAM_LO), _YE_LAM_HI)
+    p1 = -np.expm1(-lam)
+    t1 = -np.log1p(-r.random(lam.size) * p1) / lam
+    return 1.0 + r.poisson(lam * np.maximum(1.0 - t1, 0.0)).astype(np.float64)
+
+def _ye_rate(m):
+    lam = m
+    for _ in range(12):
+        lam = m * (1.0 - float(np.exp(-lam)))
+    return max(lam, 0.05)
+
+def _ye_trade(r, n, kind, fresh, m):
+
+    q = min(max((m - 2.0) / 5.0, 0.0), 1.0)
+    if kind == 0:
+        v = 0.30 + 1.15 * _ye_hump(m, 8.5, 0.95, 0.18)
+        day = 1440.0
+        fw = 0.68 - 0.36 * q + 0.25 * min(max((m - 12.0) / 12.0, 0.0), 1.0)
+        f1, f2, f3 = 0.14 + 0.24 * q, 0.07 + 0.02 * q, 0.05 + 0.01 * q
+    else:
+
+        v = 0.30 + 0.95 * _ye_hump(m, 6.5, 0.6, 0.5)
+        v *= 1.2 - 0.5 * min(max(float(np.log(n / 600.0)) / 1.92, 0.0), 1.0)
+        day = 8640.0
+        fw, f1, f2, f3 = 0.60 - 0.07 * q, 0.15 + 0.02 * q, 0.10 + 0.02 * q, 0.10 + 0.02 * q
+    h = np.zeros(n, dtype=np.float64)
+    if fresh:
+
+        if kind == 0:
+            pb = min(max((m - 4.0) / 3.0, 0.03), 0.92) * (0.45 if n > 2048 else 1.0)
+            c, span = _ye_lu(r, 5.0, 60.0), _ye_lu(r, 150.0, 1000.0)
+            a0 = 1.0 + 0.5 * min(max((m - 6.0) / 6.0, 0.0), 1.0)
+        else:
+            pb = min(max((m - 4.0) / 3.0, 0.04), 0.9) * (0.7 + 0.3 * min(max((n - 600.0) / 1200.0, 0.0), 1.0))
+            c, span = _ye_lu(r, 1.5, 12.0), _ye_lu(r, 60.0, 500.0)
+            a0 = 1.3
+        if r.random() < pb:
+
+            h = _ye_head(n, min(max(r.normal(a0, 0.55), 0.15), 3.0), c, span)
+            v = max(v - 0.5 * float(_v2_var(h)), 0.5 * v)
+            h -= 0.6 * float(np.log(_v2_mean(np.exp(h))))
+        else:
+            a_thin = r.normal(-0.25, 0.35) if kind == 0 else r.normal(-0.15, 0.3)
+            h = _ye_head(n, a_thin, _ye_lu(r, 2.0, 12.0), _ye_lu(r, 20.0, 250.0))
+    v *= _ye_lu(r, 0.85, 1.2)
+    sw = float(np.sqrt(v * fw * r.uniform(0.8, 1.2)))
+    s1 = float(np.sqrt(v * f1 * r.uniform(0.6, 1.4)))
+    s2 = float(np.sqrt(v * f2 * r.uniform(0.6, 1.4)))
+    s3 = float(np.sqrt(v * f3 * r.uniform(0.4, 1.6)))
+    x = h + (np.log(_ye_rate(m)) - 0.5 * (sw * sw + s1 * s1 + s2 * s2 + s3 * s3))
+    x += _ye_ou(r, n, _ye_lu(r, 0.6, 4.0), s1)
+    x += _ye_ou(r, n, _ye_lu(r, 6.0, 50.0), s2)
+    x += _ye_ou(r, n, _ye_lu(r, 80.0, max(300.0, 0.5 * n)), s3)
+
+    if kind == 0:
+        x += _ye_cycle(r, n, day, r.uniform(0.12, 0.50), 0.6, 0.10)
+    else:
+        x += _ye_cycle(r, n, day, r.uniform(0.15, 0.55), 0.85, 0.10)
+
+    x += _ye_episodes(r, n, _ye_lu(r, 0.001, 0.008), 2.0, 40.0, 0.4, 1.4, 0.2)
+
+    e = sw * r.standard_normal(n)
+    e += (r.random(n) < _ye_lu(r, 0.003, 0.03)) * r.exponential(r.uniform(0.3, 0.7), n)
+    return _ye_ztp(r, np.exp(np.minimum(x + e, 11.0)))
+
+def _ye_edits(r, n, fresh, m):
+    big = m > 40.0
+    lm = 0.0 if big else min(max(float(np.log2(m / 3.0)) / 2.5, 0.0), 1.0)
+    if big:
+        sw = r.uniform(0.55, 0.80)
+        s1, s2, s3 = (_ye_lu(r, 0.3, 0.6) * r.uniform(lo, hi) for lo, hi in ((0.15, 0.4), (0.4, 0.8), (0.1, 0.3)))
+        cyc = r.uniform(0.10, 0.40)
+    else:
+
+        v = (0.50 + 2.00 * lm * lm) * _ye_lu(r, 0.7, 1.4)
+        sw = float(np.sqrt(v * (0.62 - 0.52 * lm) * r.uniform(0.8, 1.2)))
+        s1 = float(np.sqrt(v * (0.25 - 0.17 * lm) * r.uniform(0.6, 1.4)))
+        s2 = float(np.sqrt(v * (0.08 + 0.22 * lm) * r.uniform(0.6, 1.4)))
+        s3 = float(np.sqrt(v * (0.02 + 0.10 * lm) * r.uniform(0.6, 1.4)))
+        cyc = r.uniform(0.10, 0.40) + lm * r.uniform(0.35, 0.85)
+    x = _ye_ou(r, n, _ye_lu(r, 1.5, 6.0), s1)
+    x += _ye_ou(r, n, _ye_lu(r, 10.0, 60.0), s2)
+    x += _ye_ou(r, n, _ye_lu(r, 100.0, 400.0), s3)
+
+    per = 1440.0 * (1.0 if m > 7.0 else r.uniform(0.72, 1.0))
+    x += _ye_cycle(r, n, per, cyc, 0.75, 0.12)
+    if fresh:
+        amp = -r.exponential(0.8 if 3.0 < m <= 40.0 else 0.3) if r.random() < 0.75 else r.normal(0.1, 0.25)
+        x += _ye_head(n, max(amp, -2.0), _ye_lu(r, 3.0, 20.0), _ye_lu(r, 100.0, 600.0))
+
+    x += _ye_episodes(r, n, _ye_lu(r, 0.0002, 0.002) * (0.3 if big else 1.0 - 0.6 * lm), 4.0, 300.0, 0.3, 1.2, 0.7)
+    x += sw * r.standard_normal(n)
+
+    k = 1.6 if big else 3.0 - 1.2 * lm
+    if k < 2.4:
+        x = np.where(x > 0.0, k * np.log1p(np.maximum(x, 0.0) / k), x)
+    if not big:
+        x += (r.random(n) < _ye_lu(r, 0.004, 0.04) * (1.0 - 0.95 * lm)) * r.exponential(r.uniform(0.3, 0.65), n)
+    x = np.minimum(x, 9.0)
+    lam = np.exp(np.minimum(np.log(_ye_rate(m)) + x - float(np.log(_v2_mean(np.exp(x)))), 11.0))
+    if big:
+
+        d = r.uniform(0.03, 0.30)
+        flip = np.cumsum(r.random(n) < r.uniform(0.0, 0.05))
+        lam = lam * np.exp(d * np.where((np.arange(n) + flip) % 2 == 0, 1.0, -1.0))
+        lam = lam * np.where(r.random(n) < r.uniform(0.0, 0.12), r.uniform(0.01, 0.4, n), 1.0)
+    y = _ye_ztp(r, lam)
+    if big and r.random() < 0.6:
+        y = np.minimum(y, float((250, 500, 500, 1000)[int(r.integers(0, 4))]))
+    return y
+
+def _ye_series(r, L, kind):
+
+    z = float(r.standard_normal())
+    if kind == 0:
+        m = min(max(9.0 * float(np.exp((0.35 if z > 0.0 else 0.80) * z)), 1.3), 40.0)
+    elif kind == 1:
+        m = min(max(6.6 * float(np.exp(0.62 * z)), 1.25), 60.0)
+    elif z > 1.3:
+        m = _ye_lu(r, 60.0, 300.0)
+    else:
+        m = max(4.1 * float(np.exp((1.25 if z > 0.0 else 0.70) * z)), 1.8 + 0.3 * r.random())
+    rho = (0.0, 0.3, 0.8)[kind]
+    n = _ye_len(rho * z + float(np.sqrt(1.0 - rho * rho)) * float(r.standard_normal()), L, kind)
+    if n < 8:
+        return None
+    fresh = n < L
+    y = _ye_trade(r, n, kind, fresh, m) if kind < 2 else _ye_edits(r, n, fresh, m)
+    if fresh:
+        u = r.random()
+        short = kind == 0 and n < 512
+        if kind < 2 and u < (0.10 if short else 0.22 if kind == 0 else 0.16):
+            y[0] = float(np.floor(y[0] * _ye_lu(r, 2.0, 8.0) + 0.5))
+        elif u < (0.90 if short else (0.85, 0.75, 0.50)[kind]):
+            y[0] = max(1.0, float(np.floor(y[0] * r.uniform(0.45 if short else 0.1 if kind < 2 else 0.0, 1.0) + 0.5)))
+    if r.random() < (0.6 if kind < 2 else 0.85):
+        y[-1] = max(1.0, float(np.floor(y[-1] * r.uniform(0.05, 1.0) + 0.5)))
+    return y
+
+def _ye_counts(r, L):
+    L = int(L)
+    if L < 64 or L > 65536:
+        return None
+    kind = min(int(np.searchsorted(_YE_KIND_CUM, r.random() * _YE_KIND_CUM[-1], side="right")), 2)
+    y = _ye_series(r, L, kind)
+    if y is None or y.size < 8 or y.size > L:
+        return None
+    out = np.empty(L, dtype=np.float64)
+    n = y.size
+    out[:L - n] = y[0]
+    out[L - n:] = y
+    if not bool(np.all(np.isfinite(out))) or float(out.max()) <= float(out.min()):
+        return None
+    return out
+
+_YF_TWO_PI = 2.0 * np.pi
+_YF_KIND_CUM = np.cumsum([0.40, 0.40, 0.20])
+_YF_P_FULL = 0.70
+_YF_N_SHORT = (600, 3500)
+
+_YF_A_PER = np.array([24, 96, 288, 1440, 48, 144])
+_YF_A_PER_CUM = np.cumsum([0.25, 0.25, 0.20, 0.12, 0.10, 0.08])
+_YF_A_DEC_CUM = np.cumsum([0.25, 0.25, 0.30, 0.20])
+_YF_A_Q = (3.0e-4, 0.30)
+_YF_A_P_NOISY = 0.15
+_YF_A_P_SKEW = 0.60
+_YF_A_P_UP = 0.5
+
+_YF_A_P_NOBLIP = 0.25
+_YF_A_BLIP_RATE = (0.002, 0.08)
+_YF_A_BLIP2 = 0.86
+_YF_A_BLIP_PAR = 3.5
+_YF_A_BLIP_MAX = 31
+_YF_A_FRZ_MIN = 128
+_YF_A_FRZ_ADD = (1.0, 1400.0)
+_YF_A_GAP = 320
+
+_YF_A_P_TAIL = 0.35
+_YF_A_AFTER = 64
+
+_YF_B_PER = np.array([288, 1440, 96, 48])
+_YF_B_PER_CUM = np.cumsum([0.50, 0.25, 0.15, 0.10])
+_YF_B_RATE = (0.005, 1.0, 2.2)
+_YF_B_SIG = (0.3, 1.2)
+_YF_B_TAU = (100.0, 2000.0)
+_YF_B_P_CYC = 0.6
+_YF_B_CYC = (0.2, 1.4)
+_YF_B_OPEN = 64
+_YF_B_OPEN_RATE = 0.15
+_YF_B_P_MARGIN = 0.5
+_YF_B_MARGIN = 0.6
+_YF_B_P_TT = 0.27
+_YF_B_CLOSED = (0.10, 0.45)
+_YF_B_P_LEAKY = 0.45
+_YF_B_LEAK = (0.10, 0.50)
+
+_YF_C_P_SLOT = 0.30
+_YF_C_PER = np.array([48, 24, 96])
+_YF_C_OPEN = 4
+_YF_C_GAP_MAX = 512.0
+
+def _yf_lu(u, lo, hi):
+    return float(lo * (hi / lo) ** u)
+
+def _yf_ar1(e, phi):
+    y = np.array(e, dtype=np.float64)
+    if y.ndim == 1 and y.flags.c_contiguous:
+        _v2_ar1_fill(y, float(phi))
+        return y
+    n = y.size
+    k = 1
+    p = float(phi)
+    while k < n and abs(p) > 1e-12:
+        y[k:] = y[k:] + p * y[:-k]
+        p = p * p
+        k *= 2
+    return y
+
+def _yf_ou(r, m, tau, tail=0.0):
+    phi = float(np.exp(-1.0 / max(tau, 0.05)))
+    e = r.standard_normal(m)
+    if tail > 0.0:
+        e *= np.exp(tail * r.standard_normal(m) - tail * tail)
+    e0 = float(e[0])
+    e *= float(np.sqrt(max(1.0 - phi * phi, 1e-12)))
+    e[0] = e0
+    return _yf_ar1(e, phi)
+
+def _yf_unit(z):
+    z = z - float(_v2_meanm(z))
+    return z / max(float(_v2_stdm(z)), 1e-12)
+
+def _yf_mask(n, a, b):
+    a = np.clip(np.asarray(a, dtype=np.int64), 0, n)
+    b = np.clip(np.asarray(b, dtype=np.int64), 0, n)
+    d = np.bincount(a, minlength=n + 1) - np.bincount(b, minlength=n + 1)
+    return np.cumsum(d[:n]) > 0
+
+def _yf_fill(x, held):
+    src = np.where(held, 0, np.arange(x.size))
+    return x[np.maximum.accumulate(src)]
+
+def _yf_cycle(r, t, P, n_harm, day_sd):
+    v = r.random((n_harm, 2))
+    ph = t * (_YF_TWO_PI / P)
+    c = np.zeros(t.size, dtype=np.float64)
+    for k in range(n_harm):
+        c += (0.35 + v[k, 0]) / (k + 1.0) ** 1.3 * np.cos((k + 1.0) * ph + _YF_TWO_PI * v[k, 1])
+    nd = int(t[-1] // P) + 2
+    f = np.exp(day_sd * r.standard_normal(nd))
+    c *= np.interp(t, (np.arange(nd, dtype=np.float64) + 0.5) * P, f)
+    return _yf_unit(c)
+
+def _yf_stale_base(r, n):
+    u = r.random(20)
+    P = int(_YF_A_PER[min(int(np.searchsorted(_YF_A_PER_CUM, u[0], side="right")), _YF_A_PER.size - 1)])
+    t = np.arange(n, dtype=np.float64) + float(int(u[1] * P))
+    vp = 0.95 * u[2] ** 2.2
+    wn = 0.6 + 0.4 * u[3] if u[16] < _YF_A_P_NOISY else _yf_lu(u[3], 0.0003, 0.5)
+    wn = wn * (1.0 - vp)
+    ws = max(1.0 - vp - wn, 0.0)
+    z = np.sqrt(vp) * _yf_cycle(r, t, P, 1 + int(3.0 * u[4]), 0.1 + 0.4 * u[5])
+    z += np.sqrt(ws) * _yf_unit(_yf_ou(r, n, np.sqrt(P) * _yf_lu(u[6], 1.5, 150.0)))
+    z += np.sqrt(wn) * _yf_unit(_yf_ou(r, n, 0.2 + 9.0 * u[7] ** 3, 0.5 * u[8]))
+    if u[9] < _YF_A_P_SKEW:
+        z = np.exp((0.2 + 0.7 * u[10]) * _yf_unit(z))
+        if u[17] >= _YF_A_P_UP:
+            z = float(z.max()) * (1.0 + u[18]) - z
+        lvl = 0.0
+    else:
+        z = _yf_unit(z)
+        lvl = 6.0 * (u[10] - 0.5) if u[11] < 0.25 else _yf_lu(u[10], 2.5, 60.0)
+    dec = min(int(np.searchsorted(_YF_A_DEC_CUM, u[12], side="right")), 3)
+    sdd = max(float(np.diff(z).std()), 1e-12)
+    sc = 10.0 ** (-dec) / (_yf_lu(u[13], _YF_A_Q[0], _YF_A_Q[1]) * sdd)
+    x = np.round((z + lvl) * sc, dec) + 0.0
+    if u[14] >= _YF_A_P_NOBLIP:
+        v = r.random((3, n))
+        s = np.flatnonzero(v[0] < _yf_lu(u[15], _YF_A_BLIP_RATE[0], _YF_A_BLIP_RATE[1]))
+        s = s[s >= 1]
+        if s.size:
+            ln = np.where(v[1, s] < _YF_A_BLIP2, 2.0,
+                          np.minimum(np.floor(3.0 * (1.0 - v[2, s]) ** (-1.0 / _YF_A_BLIP_PAR)), _YF_A_BLIP_MAX))
+            x = _yf_fill(x, _yf_mask(n, s + 1, s + ln.astype(np.int64)))
+    return x
+
+def _yf_stale(r, n):
+    x = _yf_stale_base(r, n)
+    u = r.random(3)
+    F = _YF_A_FRZ_MIN + int(np.floor(_yf_lu(u[0], _YF_A_FRZ_ADD[0], _YF_A_FRZ_ADD[1])))
+    if u[1] < _YF_A_P_TAIL:
+        F = min(F, n - _YF_A_GAP)
+        s = n - F
+    else:
+        F = min(F, n - _YF_A_GAP - _YF_A_AFTER)
+        s = _YF_A_GAP - 1 + int(u[2] * (n - _YF_A_AFTER - F - _YF_A_GAP + 2))
+    x = _yf_fill(x, _yf_mask(n, [s + 1], [s + F]))
+    return x, [(int(s), int(F))]
+
+def _yf_station(r, n):
+    u = r.random(24)
+    P = int(_YF_B_PER[min(int(np.searchsorted(_YF_B_PER_CUM, u[0], side="right")), _YF_B_PER.size - 1)])
+    off = int(u[1] * P)
+    t = np.arange(n, dtype=np.float64) + float(off)
+    cap = 3 + int(_yf_lu(u[2], 1.0, 220.0))
+
+    lam = np.log(_YF_B_RATE[0] + _YF_B_RATE[1] * u[3] ** _YF_B_RATE[2])
+    sig = _YF_B_SIG[0] + (_YF_B_SIG[1] - _YF_B_SIG[0]) * u[4]
+    lam = lam + sig * _yf_ou(r, n, _yf_lu(u[5], _YF_B_TAU[0], _YF_B_TAU[1]))
+    if u[6] < _YF_B_P_CYC:
+        amp = _YF_B_CYC[0] + (_YF_B_CYC[1] - _YF_B_CYC[0]) * u[7]
+        lam = lam + amp * _yf_cycle(r, t, P, 1 + int(2.0 * u[8]), 0.1 + 0.3 * u[9])
+    lam = np.minimum(np.exp(lam), 0.97)
+    lam[:_YF_B_OPEN] = np.maximum(lam[:_YF_B_OPEN], _YF_B_OPEN_RATE)
+    v = r.random((4, n))
+    ev = v[0] < lam
+    frz = []
+    if P <= 288 and u[10] < _YF_B_P_TT:
+        nd = (n + off) // P + 2
+        w = r.random((3, nd))
+        jit = max(1.0, P * (0.005 + 0.075 * u[11]))
+        day = np.arange(nd, dtype=np.int64)
+        a = day * P + int(u[12] * P) - off + np.round(jit * (2.0 * w[0] - 1.0)).astype(np.int64)
+        b = a + int((_YF_B_CLOSED[0] + (_YF_B_CLOSED[1] - _YF_B_CLOSED[0]) * u[13]) * P) \
+            + np.round(jit * (2.0 * w[1] - 1.0)).astype(np.int64)
+        if u[14] < _YF_B_P_LEAKY:
+            keep = w[2] >= (_YF_B_LEAK[0] + (_YF_B_LEAK[1] - _YF_B_LEAK[0]) * u[15])
+            a, b = a[keep], b[keep]
+        closed = _yf_mask(n, a, b)
+        ev &= ~closed
+        e = np.flatnonzero(np.diff(np.concatenate(([False], closed, [False])).astype(np.int8)))
+        frz = [(int(s) - 1, int(q - s) + 1) for s, q in zip(e[0::2], e[1::2]) if s >= 1]
+    k = np.where(v[1] < 0.66, 1.0, np.where(v[1] < 0.79, 2.0, 3.0 + np.floor(-2.0 * np.log(1.0 - v[2]))))
+    d = np.where(ev, np.where(v[3] < 0.5, k, -k), 0.0)
+    s = float(int(u[18] * (cap + 1))) + np.cumsum(d)
+
+    m = float(int(cap * _YF_B_MARGIN * u[19])) if u[20] < _YF_B_P_MARGIN else 0.0
+    W = cap + 2.0 * m
+    x = np.clip(W - np.abs(np.mod(s + m, 2.0 * W) - W) - m, 0.0, float(cap))
+    if float(x.max()) <= float(x.min()):
+        j = 1 + int(u[21] * (n - 1))
+        x[j:] += 1.0 if x[0] <= 0.0 or (x[0] < cap and u[22] < 0.5) else -1.0
+        frz = []
+    return x, frz
+
+def _yf_stair(r, n):
+    u = r.random(16)
+    dec = 1 + min(int(np.searchsorted((0.2, 0.6), u[0], side="right")), 2)
+    lvl = np.floor(_yf_lu(u[1], 30.0, 5000.0))
+    if u[2] < _YF_C_P_SLOT:
+        P = int(_YF_C_PER[min(int(3.0 * u[3]), 2)])
+        nd = n // P + 2
+        day = np.flatnonzero(r.random(nd) < 0.2 + 0.7 * u[4])
+        tm = day * P + int(u[5] * P) - int(u[6] * P)
+    else:
+        med = _yf_lu(u[3], 5.0, 120.0)
+        sg = 0.8 + 0.7 * u[4]
+        mean = med * float(np.exp(0.5 * sg * sg))
+        burn = int(8.0 * mean)
+        iv = np.ceil(med * np.exp(sg * r.standard_normal(min(8000, 16 + int(3.0 * (n + burn) / med)))))
+        iv = np.minimum(iv, _YF_C_GAP_MAX)
+        tm = np.cumsum(iv).astype(np.int64) - burn
+
+    tm = np.unique(np.concatenate((1 + (r.random(_YF_C_OPEN) * 60.0).astype(np.int64), tm[(tm >= 1) & (tm < n)])))
+    v = r.random((2, tm.size))
+    base = min(max(1.0, lvl * _yf_lu(u[8], 0.002, 0.04)), max(1.0, 0.3 * lvl / np.sqrt(tm.size)))
+    k = np.maximum(1.0, np.round(base * np.exp(0.5 * r.standard_normal(tm.size))))
+    step = np.where(v[0] < 0.5, k, -k)
+    x = lvl + np.cumsum(np.bincount(tm, weights=step, minlength=n)[:n])
+    lo = float(x.min())
+    if lo < 1.0:
+        x = x + (1.0 - lo)
+    x = x / 10.0 ** dec
+    e = np.concatenate(([0], tm, [n]))
+    return x, [(int(a), int(b - a)) for a, b in zip(e[:-1], e[1:])]
+
+_YF_BUILD = (_yf_stale, _yf_station, _yf_stair)
+
+def _yf_draw(r, L):
+    L = int(L)
+    u = r.random(3)
+    kind = min(int(np.searchsorted(_YF_KIND_CUM, u[0], side="right")), len(_YF_BUILD) - 1)
+    n = L if u[1] < _YF_P_FULL else min(L, int(_YF_N_SHORT[0] + (_YF_N_SHORT[1] - _YF_N_SHORT[0]) * u[2]))
+    x, frz = _YF_BUILD[kind](r, n)
+    return np.asarray(x, dtype=np.float64), kind, frz
+
+def _yf_freeze(r, L):
+    L = int(L)
+    if L < 1024:
+        return None
+    x, _, _ = _yf_draw(r, L)
+    n = x.size
+    out = np.empty(L, dtype=np.float64)
+    out[:L - n] = x[0]
+    out[L - n:] = x
+    if not bool(np.all(np.isfinite(out))) or float(out.max()) <= float(out.min()):
+        return None
+    return out
+
+_YE2_KIND_CUM = np.cumsum([0.44, 0.32, 0.24])
+_YE2_TWO_PI = 2.0 * np.pi
+_YE2_LAM_LO = 0.02
+_YE2_LAM_HI = 5.0e4
+_YE2_LEN = ((5.92, 1.2), (6.68, 2.1), (7.0, 1.4))
+_YE2_CYC = (0.5, 0.8, 0.7)
+_YE2_HEAD = (1.3, 1.0, 0.5)
+_YE2_RISE = 0.3
+_YE2_S1 = (1.05, 1.0, 1.1)
+_YE2_S2 = (1.45, 1.0, 1.0)
+_YE2_OFF = (0.0, -0.15, 0.0)
+_YE2_S3_TAU = (80.0, 300.0)
+
+def _ye2_lu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+def _ye2_hump(m, pk, w_lo, w_hi):
+    d = float(np.log(m / pk))
+    return float(np.exp(-0.5 * (d / (w_lo if d < 0.0 else w_hi)) ** 2))
+
+def _ye2_ar1(e, phi):
+    y = np.array(e, dtype=np.float64)
+    if y.ndim == 1 and y.flags.c_contiguous:
+        _v2_ar1_fill(y, float(phi))
+        return y
+    n = y.size
+    k = 1
+    p = float(phi)
+    while k < n and abs(p) > 1e-12:
+        y[k:] = y[k:] + p * y[:-k]
+        p = p * p
+        k *= 2
+    return y
+
+def _ye2_ou(r, n, tau, sd):
+    phi = float(np.exp(-1.0 / max(tau, 0.2)))
+    e = r.standard_normal(n) * (sd * np.sqrt(max(1.0 - phi * phi, 1e-9)))
+    e[0] = r.standard_normal() * sd
+    return _ye2_ar1(e, phi)
+
+def _ye2_len(zl, L, kind):
+    mu, sd = _YE2_LEN[kind]
+    return int(min(L, round(320.0 + float(np.exp(mu + sd * min(max(zl, -6.0), 6.0))))))
+
+def _ye2_rises(u):
+
+    return (u * 1073741824.0) % 1.0 < 0.5
+
+def _ye2_head(n, size, c, span, rises):
+
+    t = np.arange(n, dtype=np.float64)
+    w = np.maximum(1.0 - np.log1p(t / c) / np.log1p(span / c), 0.0)
+    if not rises:
+        return size * w
+    mirror = np.log(2.0 - np.exp(size * (w - 1.0))) - float(np.log(2.0 - np.exp(-size)))
+    return -_YE2_RISE * size * w + (1.0 - _YE2_RISE) * mirror
+
+def _ye2_cycle(r, n, per, amp):
+    r.random()
+    ph_end = r.random()
+    ph = (np.arange(n, dtype=np.float64) - (n - 1)) / per + ph_end
+    h2 = r.uniform(0.0, 0.3)
+    return amp * (np.cos(_YE2_TWO_PI * ph) + h2 * np.cos(2.0 * _YE2_TWO_PI * ph + r.uniform(0.0, _YE2_TWO_PI)))
+
+def _ye2_episodes(r, n, rate, dur_lo, dur_hi, amp_lo, amp_hi, plateau):
+    out = np.zeros(n, dtype=np.float64)
+    k = int(min(r.poisson(rate * n), 40))
+    if k <= 0:
+        return out
+    t = np.arange(n, dtype=np.float64)
+    for _ in range(k):
+        i = int(r.integers(0, n))
+        d = _ye2_lu(r, dur_lo, dur_hi)
+        a = r.uniform(amp_lo, amp_hi)
+        if r.random() < plateau:
+            j = int(min(n, i + int(d) + 1))
+            out[i:j] += a
+        else:
+            j = int(min(n, i + int(6.0 * d) + 2))
+            out[i:j] += a * np.exp(-(t[i:j] - i) / d)
+    return out
+
+def _ye2_ztp(r, lam):
+    lam = np.minimum(np.maximum(lam, _YE2_LAM_LO), _YE2_LAM_HI)
+    p1 = -np.expm1(-lam)
+    t1 = -np.log1p(-r.random(lam.size) * p1) / lam
+    return 1.0 + r.poisson(lam * np.maximum(1.0 - t1, 0.0)).astype(np.float64)
+
+def _ye2_rate(m):
+    lam = m
+    for _ in range(12):
+        lam = m * (1.0 - float(np.exp(-lam)))
+    return max(lam, 0.05)
+
+def _ye2_trade(r, n, kind, fresh, m):
+
+    q = min(max((m - 2.0) / 5.0, 0.0), 1.0)
+    if kind == 0:
+        v = 0.30 + 1.15 * _ye2_hump(m, 8.5, 0.95, 0.18)
+        day = 1440.0
+        fw = 0.68 - 0.36 * q + 0.25 * min(max((m - 12.0) / 12.0, 0.0), 1.0)
+        f1, f2, f3 = 0.14 + 0.24 * q, 0.07 + 0.02 * q, 0.05 + 0.01 * q
+    else:
+
+        v = 0.30 + 0.95 * _ye2_hump(m, 6.5, 0.6, 0.5)
+        v *= 1.2 - 0.5 * min(max(float(np.log(n / 600.0)) / 1.92, 0.0), 1.0)
+        day = 8640.0
+        fw, f1, f2, f3 = 0.60 - 0.07 * q, 0.15 + 0.02 * q, 0.10 + 0.02 * q, 0.10 + 0.02 * q
+    h = np.zeros(n, dtype=np.float64)
+    if fresh:
+
+        if kind == 0:
+            pb = min(max((m - 4.0) / 3.0, 0.03), 0.92) * (0.45 if n > 2048 else 1.0)
+            c, span = _ye2_lu(r, 5.0, 60.0), _ye2_lu(r, 150.0, 1000.0)
+            a0 = 1.0 + 0.5 * min(max((m - 6.0) / 6.0, 0.0), 1.0)
+        else:
+            pb = min(max((m - 4.0) / 3.0, 0.04), 0.9) * (0.7 + 0.3 * min(max((n - 600.0) / 1200.0, 0.0), 1.0))
+            c, span = _ye2_lu(r, 1.5, 12.0), _ye2_lu(r, 60.0, 500.0)
+            a0 = 1.3
+        u = r.random()
+        rises = _ye2_rises(u)
+        if u < pb:
+
+            h = _ye2_head(n, _YE2_HEAD[kind] * min(max(r.normal(a0, 0.55), 0.15), 3.0), c, span, rises)
+            v = max(v - 0.5 * float(_v2_var(h)), 0.5 * v)
+            h -= 0.6 * float(np.log(_v2_mean(np.exp(h))))
+        else:
+            a_small = r.normal(-0.25, 0.35) if kind == 0 else r.normal(-0.15, 0.3)
+            h = _ye2_head(n, _YE2_HEAD[kind] * abs(a_small), _ye2_lu(r, 2.0, 12.0), _ye2_lu(r, 20.0, 250.0), rises)
+    v *= _ye2_lu(r, 0.85, 1.2)
+    sw = float(np.sqrt(v * fw * r.uniform(0.8, 1.2)))
+    s1 = _YE2_S1[kind] * float(np.sqrt(v * f1 * r.uniform(0.6, 1.4)))
+    s2 = _YE2_S2[kind] * float(np.sqrt(v * f2 * r.uniform(0.6, 1.4)))
+    s3 = float(np.sqrt(v * f3 * r.uniform(0.4, 1.6)))
+    x = h + (np.log(_ye2_rate(m)) - 0.5 * (sw * sw + s1 * s1 + s2 * s2 + s3 * s3))
+    x += _ye2_ou(r, n, _ye2_lu(r, 0.6, 4.0), s1)
+    x += _ye2_ou(r, n, _ye2_lu(r, 6.0, 50.0), s2)
+    x += _YE2_OFF[kind]
+    x += _ye2_ou(r, n, _ye2_lu(r, _YE2_S3_TAU[0], _YE2_S3_TAU[1]), s3)
+
+    if kind == 0:
+        x += _YE2_CYC[0] * _ye2_cycle(r, n, day, r.uniform(0.12, 0.50))
+    else:
+        x += _YE2_CYC[1] * _ye2_cycle(r, n, day, r.uniform(0.15, 0.55))
+
+    x += _ye2_episodes(r, n, _ye2_lu(r, 0.001, 0.008), 2.0, 40.0, 0.4, 1.4, 0.2)
+
+    e = sw * r.standard_normal(n)
+    e += (r.random(n) < _ye2_lu(r, 0.003, 0.03)) * r.exponential(r.uniform(0.3, 0.7), n)
+    return _ye2_ztp(r, np.exp(np.minimum(x + e, 11.0)))
+
+def _ye2_edits(r, n, fresh, m):
+    big = m > 40.0
+    lm = 0.0 if big else min(max(float(np.log2(m / 3.0)) / 2.5, 0.0), 1.0)
+    if big:
+        sw = r.uniform(0.55, 0.80)
+        s1, s2, s3 = (_ye2_lu(r, 0.3, 0.6) * r.uniform(lo, hi) for lo, hi in ((0.15, 0.4), (0.4, 0.8), (0.1, 0.3)))
+        cyc = r.uniform(0.10, 0.40)
+    else:
+
+        v = (0.50 + 2.00 * lm * lm) * _ye2_lu(r, 0.7, 1.4)
+        sw = float(np.sqrt(v * (0.62 - 0.52 * lm) * r.uniform(0.8, 1.2)))
+        s1 = _YE2_S1[2] * float(np.sqrt(v * (0.25 - 0.17 * lm) * r.uniform(0.6, 1.4)))
+        s2 = float(np.sqrt(v * (0.08 + 0.22 * lm) * r.uniform(0.6, 1.4)))
+        s3 = float(np.sqrt(v * (0.02 + 0.10 * lm) * r.uniform(0.6, 1.4)))
+        cyc = r.uniform(0.10, 0.40) + lm * r.uniform(0.35, 0.85)
+    x = _ye2_ou(r, n, _ye2_lu(r, 1.5, 6.0), s1)
+    x += _ye2_ou(r, n, _ye2_lu(r, 10.0, 60.0), s2)
+    x += _ye2_ou(r, n, _ye2_lu(r, 100.0, 400.0), s3)
+
+    per = 1440.0 * (1.0 if m > 7.0 else r.uniform(0.72, 1.0))
+    x += _YE2_CYC[2] * _ye2_cycle(r, n, per, cyc)
+    if fresh:
+        u = r.random()
+        amp = -r.exponential(0.8 if 3.0 < m <= 40.0 else 0.3) if u < 0.75 else r.normal(0.1, 0.25)
+        x += _ye2_head(n, _YE2_HEAD[2] * abs(max(amp, -2.0)), _ye2_lu(r, 3.0, 20.0), _ye2_lu(r, 100.0, 600.0),
+                       _ye2_rises(u))
+
+    x += _ye2_episodes(r, n, _ye2_lu(r, 0.0002, 0.002) * (0.3 if big else 1.0 - 0.6 * lm), 4.0, 300.0, 0.3, 1.2, 0.7)
+    x += sw * r.standard_normal(n)
+
+    k = 1.6 if big else 3.0 - 1.2 * lm
+    if k < 2.4:
+        x = np.where(x > 0.0, k * np.log1p(np.maximum(x, 0.0) / k), x)
+    if not big:
+        x += (r.random(n) < _ye2_lu(r, 0.004, 0.04) * (1.0 - 0.95 * lm)) * r.exponential(r.uniform(0.3, 0.65), n)
+    x = np.minimum(x, 9.0)
+    lam = np.exp(np.minimum(np.log(_ye2_rate(m)) + x - float(np.log(_v2_mean(np.exp(x)))), 11.0))
+    if big:
+
+        d = r.uniform(0.03, 0.30)
+        flip = np.cumsum(r.random(n) < r.uniform(0.0, 0.05))
+        lam = lam * np.exp(d * np.where((np.arange(n) + flip) % 2 == 0, 1.0, -1.0))
+        lam = lam * np.where(r.random(n) < r.uniform(0.0, 0.12), r.uniform(0.01, 0.4, n), 1.0)
+    y = _ye2_ztp(r, lam)
+    if big and r.random() < 0.6:
+        y = np.minimum(y, float((250, 500, 500, 1000)[int(r.integers(0, 4))]))
+    return y
+
+def _ye2_series(r, L, kind):
+
+    z = float(r.standard_normal())
+    if kind == 0:
+        m = min(max(9.0 * float(np.exp((0.35 if z > 0.0 else 0.80) * z)), 1.3), 40.0)
+    elif kind == 1:
+        m = min(max(6.6 * float(np.exp(0.62 * z)), 1.25), 60.0)
+    elif z > 1.3:
+        m = _ye2_lu(r, 60.0, 300.0)
+    else:
+        m = max(4.1 * float(np.exp((1.25 if z > 0.0 else 0.70) * z)), 1.8 + 0.3 * r.random())
+    rho = (0.0, 0.3, 0.8)[kind]
+    n = _ye2_len(rho * z + float(np.sqrt(1.0 - rho * rho)) * float(r.standard_normal()), L, kind)
+    if n < 8:
+        return None
+    fresh = n < L
+    y = _ye2_trade(r, n, kind, fresh, m) if kind < 2 else _ye2_edits(r, n, fresh, m)
+    if fresh:
+        u = r.random()
+        short = kind == 0 and n < 512
+        if kind < 2 and u < (0.10 if short else 0.22 if kind == 0 else 0.16):
+            y[0] = float(np.floor(y[0] * _ye2_lu(r, 2.0, 8.0) + 0.5))
+        elif u < (0.90 if short else (0.85, 0.75, 0.50)[kind]):
+            y[0] = max(1.0, float(np.floor(y[0] * r.uniform(0.45 if short else 0.1 if kind < 2 else 0.0, 1.0) + 0.5)))
+
+    return y
+
+def _ye_counts2(r, L):
+    L = int(L)
+    if L < 64 or L > 65536:
+        return None
+    kind = min(int(np.searchsorted(_YE2_KIND_CUM, r.random() * _YE2_KIND_CUM[-1], side="right")), 2)
+    y = _ye2_series(r, L, kind)
+    if y is None or y.size < 8 or y.size > L:
+        return None
+    out = np.empty(L, dtype=np.float64)
+    n = y.size
+    out[:L - n] = y[0]
+    out[L - n:] = y
+    if not bool(np.all(np.isfinite(out))) or float(out.max()) <= float(out.min()):
+        return None
+    return out
+
+_YG_P = 1440
+_YG_TWO_PI = 2.0 * np.pi
+_YG_MIX = (0.85, 0.15)
+_YG_RATE_KINDS = np.cumsum([0.80, 0.08, 0.07, 0.05])
+
+_YG_TIDE_PER = np.array([745.236072, 720.0, 759.50085, 1436.068182, 1549.160502, 1612.101402,
+                         372.618036, 366.206358, 248.412024, 490.628394])
+
+def _yg_lu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+def _yg_filt(e, phi):
+    y = np.array(e, dtype=np.float64)
+    if y.ndim == 1 and y.flags.c_contiguous:
+        _v2_ar1_fill(y, float(phi))
+        return y
+    n = y.size
+    k = 1
+    p = float(phi)
+    while k < n and abs(p) > 1e-12:
+        y[k:] = y[k:] + p * y[:-k]
+        p = p * p
+        k *= 2
+    return y
+
+def _yg_ar1(r, n, tau, sd, tail=0.0):
+    n = int(n)
+    phi = float(np.exp(-1.0 / max(float(tau), 0.05)))
+    e = r.standard_normal(n)
+    if tail > 0.0:
+        e = e * np.exp(tail * r.standard_normal(n) - tail * tail)
+    e = e * (sd * np.sqrt(max(1.0 - phi * phi, 1e-12)))
+    e[0] = r.standard_normal() * sd
+    return _yg_filt(e, phi)
+
+def _yg_box(x, m):
+    m = min(int(m), x.size)
+    if m <= 1:
+        return x
+    c = np.cumsum(np.concatenate(([0.0], x)))
+    out = np.empty(x.size, dtype=np.float64)
+    out[m - 1:] = (c[m:] - c[:-m]) / m
+    out[:m - 1] = c[1:m] / np.arange(1, m)
+    return out
+
+def _yg_cbox(p, h):
+    h = int(h)
+    if h <= 0:
+        return p
+    g = p.size
+    c = np.cumsum(np.concatenate(([0.0], p[g - h:], p, p[:h])))
+    return (c[2 * h + 1:2 * h + 1 + g] - c[:g]) / (2 * h + 1)
+
+def _yg_pad(x, L):
+    out = np.empty(L, dtype=np.float64)
+    n = x.size
+    if n >= L:
+        out[:] = x[n - L:]
+    else:
+        out[:L - n] = x[0]
+        out[L - n:] = x
+    return out
+
+def _yg_store(r, x, mode):
+    if mode == 1:
+        return np.round(x)
+    if mode == 2:
+        return np.round(x, int(r.integers(1, 4)))
+    return x.astype(np.float32).astype(np.float64)
+
+def _yg_knots(r):
+    d0 = r.uniform(0.0, 0.04)
+    m1 = d0 + r.uniform(0.10, 0.22)
+    m2 = r.uniform(0.55, 0.72)
+    m3 = m2 + r.uniform(0.03, 0.09)
+    m4 = min(m3 + r.uniform(0.10, 0.22), 1.0 - d0)
+    if r.random() < 0.3:
+        v1 = r.uniform(0.25, 0.5)
+        v2 = r.uniform(max(v1, 0.4), 0.8)
+    else:
+        v1 = r.uniform(0.5, 0.85)
+        v2 = r.uniform(0.55, 0.9)
+    kx = [0.0, d0, m1, m2, m3, m4, 1.0]
+    kv = [0.0, r.uniform(0.0, 0.04), v1, v2, 1.0, r.uniform(0.0, 0.05), 0.0]
+    if r.random() < 0.35:
+        kx.insert(3, m1 + (m2 - m1) * r.uniform(0.3, 0.7))
+        kv.insert(3, 0.5 * (v1 + v2) * r.uniform(0.8, 1.15))
+    return np.array(kx), np.array(kv)
+
+def _yg_shape(kx, kv, h1, h2):
+    p = np.interp(np.arange(_YG_P) / float(_YG_P), kx, kv)
+    p = _yg_cbox(_yg_cbox(p, h1), h2)
+    lo = float(p.min())
+    hi = float(p.max())
+    return (p - lo) / max(hi - lo, 1e-9)
+
+def _yg_cycle(r, n, s_amp, s_lvl, s_warp, blend):
+    kx, kv = _yg_knots(r)
+    h1 = int(r.uniform(0.012, 0.045) * _YG_P)
+    h2 = int(r.uniform(0.004, 0.03) * _YG_P)
+    ta = _yg_shape(kx, kv, h1, h2)
+    jx = kx.copy()
+    jv = kv.copy()
+    jx[2:-1] = np.sort(np.clip(kx[2:-1] + r.normal(0.0, 0.015, kx.size - 3), kx[1] + 0.02, 0.97))
+    jv[2:-2] = np.clip(kv[2:-2] + r.normal(0.0, 0.08, kx.size - 4), 0.15, 1.0)
+    tb = _yg_shape(jx, jv, h1, h2)
+    u = (np.arange(n, dtype=np.float64) + float(r.integers(0, _YG_P))) / float(_YG_P)
+    nd = int(u[-1]) + 2
+    grid = np.arange(nd, dtype=np.float64)
+    half = np.arange(2 * nd, dtype=np.float64) * 0.5
+    warp = np.interp(u, half, r.normal(0.0, s_warp, 2 * nd))
+    g = ((u + warp) % 1.0) * _YG_P
+    i0 = np.minimum(g.astype(np.int64), _YG_P - 1)
+    f = g - i0
+    i1 = (i0 + 1) % _YG_P
+    w = np.interp(u, grid, blend * r.random(nd))
+    pa = ta[i0] * (1.0 - f) + ta[i1] * f
+    pb = tb[i0] * (1.0 - f) + tb[i1] * f
+    prof = (pa + w * (pb - pa)) * np.exp(np.interp(u, grid, r.normal(0.0, s_amp, nd)))
+    return prof, np.interp(u, grid, r.normal(0.0, s_lvl, nd))
+
+def _yg_smooth(r, n, tau, sd):
+    step = max(1, int(tau / 6.0))
+    m = n // step + 3
+    z = np.interp(np.arange(n, dtype=np.float64) / step + r.random(), np.arange(m, dtype=np.float64),
+                  _yg_ar1(r, m, tau / step, sd))
+    return _yg_box(z, step)
+
+def _yg_count(r, p_none, lo, hi):
+    if r.random() < p_none:
+        return 0
+    return int(r.poisson(_yg_lu(r, lo, hi)))
+
+def _yg_steps(r, n, k, w_lo, w_hi, a_lo, a_hi, p_up):
+    if k <= 0:
+        return 0.0
+    i0 = r.integers(0, n, k)
+    w = np.exp(r.uniform(np.log(w_lo), np.log(w_hi), k)).astype(np.int64) + 1
+    a = np.exp(r.uniform(np.log(a_lo), np.log(a_hi), k)) * np.where(r.random(k) < p_up, 1.0, -1.0)
+    d = np.bincount(i0, weights=a, minlength=n + 1) - np.bincount(np.minimum(i0 + w, n), weights=a, minlength=n + 1)
+    return np.cumsum(d)[:n]
+
+def _yg_needles(r, lx, k, d_lo, d_hi):
+    if k <= 0:
+        return lx
+    n = lx.size
+    idx = r.integers(0, n - 3, k)
+    a = np.log1p(-np.exp(r.uniform(np.log(d_lo), np.log(d_hi), k)))
+    lx[idx] += a
+    lx[idx + 1] += a * r.uniform(0.0, 0.8, k)
+    lx[idx + 2] += a * r.uniform(0.0, 0.35, k) * (r.random(k) < 0.5)
+    return lx
+
+def _yg_dips(r, lx, k, size):
+    n = lx.size
+    for _ in range(int(k)):
+        i = int(r.integers(0, n))
+        tau = _yg_lu(r, 1.5, 30.0)
+        w = min(n - i, int(7.0 * tau) + 2)
+        lx[i:i + w] -= size * _yg_lu(r, 0.2, 1.5) * np.exp(-np.arange(w) / tau)
+    return lx
+
+def _yg_rate_std(r, n):
+    base = float(np.clip(np.exp(r.normal(np.log(0.27), 0.42)), 0.07, 0.62))
+    q = float(np.exp(r.normal(0.0, 0.6)))
+    prof, lvl = _yg_cycle(r, n, _yg_lu(r, 0.008, 0.10), _yg_lu(r, 0.003, 0.05), _yg_lu(r, 0.002, 0.02),
+                          r.random() if r.random() < 0.6 else 0.0)
+    lc = np.log(base + (1.0 - base) * prof)
+    z = _yg_smooth(r, n, _yg_lu(r, 200.0, 1000.0), 0.012 * q * _yg_lu(r, 0.5, 2.0))
+    z = z + _yg_smooth(r, n, _yg_lu(r, 30.0, 150.0), 0.015 * q * _yg_lu(r, 0.5, 2.0))
+    fast = _yg_ar1(r, n, _yg_lu(r, 4.0, 30.0), 0.020 * q * _yg_lu(r, 0.6, 1.7), r.uniform(0.0, 0.6))
+    z = z + _yg_box(fast, int(r.integers(3, 8)))
+
+    lx = lc + lvl + z * np.exp(-r.uniform(0.2, 0.7) * (lc - float(_v2_meanm(lc))))
+    size = 0.08 * q ** 0.5 * _yg_lu(r, 0.5, 2.0)
+    lx = lx + _yg_steps(r, n, _yg_count(r, 0.3, 0.5, 5.0), 15.0, 300.0, 0.3 * size, 4.0 * size, 0.8)
+    lx = lx + _yg_steps(r, n, _yg_count(r, 0.2, 1.0, 12.0), 2.0, 14.0, 0.2 * size, 2.5 * size, 0.9)
+    lx = _yg_dips(r, lx, _yg_count(r, 0.5, 0.4, 4.0), 2.0 * size)
+    lx = _yg_needles(r, lx, _yg_count(r, 0.2, 1.0, 10.0), 0.03, 0.85)
+    if r.random() < 0.10:
+        lx[int(r.integers(0, n)):] += r.normal(0.0, 0.06)
+    is_bytes = r.random() < 0.18
+    level = 10.0 ** (r.uniform(8.3, 9.4) if is_bytes else r.uniform(3.0, 5.0))
+    u = r.random()
+    return _yg_store(r, level * np.exp(lx), 1 if (is_bytes or u < 0.12) else (2 if u < 0.35 else 0))
+
+def _yg_pulses(r, n, rate, w_lo, w_hi, h_lo, h_hi):
+    k = int(r.poisson(rate * n))
+    if k <= 0:
+        return np.zeros(n)
+    i0 = r.integers(0, n, k)
+    w = np.exp(r.uniform(np.log(w_lo), np.log(w_hi), k)).astype(np.int64) + 1
+    h = np.exp(r.uniform(np.log(h_lo), np.log(h_hi), k))
+    d = np.bincount(i0, weights=h, minlength=n + 1) - np.bincount(np.minimum(i0 + w, n), weights=h, minlength=n + 1)
+    return np.maximum(np.cumsum(d)[:n], 0.0)
+
+def _yg_rate_burst(r, n):
+    base = float(np.clip(np.exp(r.normal(np.log(0.33), 0.35)), 0.12, 0.7))
+    prof, lvl = _yg_cycle(r, n, _yg_lu(r, 0.02, 0.15), _yg_lu(r, 0.005, 0.05), _yg_lu(r, 0.003, 0.02), r.random())
+    lx = np.log(base + (1.0 - base) * prof) + lvl
+    lx = lx + _yg_ar1(r, n, _yg_lu(r, 100.0, 800.0), _yg_lu(r, 0.01, 0.06))
+    lx = lx + _yg_box(_yg_ar1(r, n, _yg_lu(r, 2.0, 15.0), _yg_lu(r, 0.01, 0.04), r.uniform(0.0, 0.6)), int(r.integers(2, 6)))
+    x = np.exp(lx) * (1.0 + _yg_pulses(r, n, _yg_lu(r, 0.01, 0.08), 1.0, 14.0, 0.08, 1.2))
+    lx = _yg_events(r, np.log(x), _yg_count(r, 0.5, 0.5, 4.0), 0, 0, _yg_count(r, 0.3, 1.0, 20.0), 0.3)
+    level = 10.0 ** r.uniform(3.5, 5.2)
+    return _yg_store(r, level * np.exp(lx), 2 if r.random() < 0.25 else 0)
+
+def _yg_rate_shallow(r, n):
+    base = float(r.uniform(0.55, 0.88))
+    prof, lvl = _yg_cycle(r, n, _yg_lu(r, 0.03, 0.2), _yg_lu(r, 0.004, 0.03), _yg_lu(r, 0.003, 0.02), r.random())
+    lx = np.log(base + (1.0 - base) * prof) + lvl
+    lx = lx + _yg_ar1(r, n, _yg_lu(r, 60.0, 600.0), _yg_lu(r, 0.01, 0.05))
+    lx = lx + _yg_ar1(r, n, _yg_lu(r, 6.0, 40.0), _yg_lu(r, 0.006, 0.03))
+    lx = lx + _yg_box(_yg_ar1(r, n, _yg_lu(r, 2.0, 12.0), _yg_lu(r, 0.004, 0.015), r.uniform(0.0, 0.9)), int(r.integers(2, 6)))
+    lx = _yg_events(r, lx, _yg_count(r, 0.1, 2.0, 12.0), _yg_count(r, 0.5, 0.5, 4.0), _yg_count(r, 0.5, 0.5, 6.0),
+                    _yg_count(r, 0.3, 1.0, 12.0), _yg_lu(r, 0.04, 0.2))
+    level = 10.0 ** r.uniform(4.2, 6.1)
+    return _yg_store(r, level * np.exp(lx), 2 if r.random() < 0.4 else 0)
+
+def _yg_rate_error(r, n):
+    base = float(r.uniform(0.35, 0.8))
+    prof, lvl = _yg_cycle(r, n, _yg_lu(r, 0.05, 0.3), _yg_lu(r, 0.01, 0.1), _yg_lu(r, 0.003, 0.02), r.random())
+    lx = np.log(base + (1.0 - base) * prof) + lvl
+    lx = lx + _yg_ar1(r, n, _yg_lu(r, 30.0, 400.0), _yg_lu(r, 0.03, 0.15))
+    lx = lx + _yg_ar1(r, n, _yg_lu(r, 0.5, 4.0), _yg_lu(r, 0.05, 0.25), r.uniform(0.2, 0.9))
+    x = np.exp(lx) * (1.0 + _yg_pulses(r, n, _yg_lu(r, 0.004, 0.05), 1.0, 30.0, 0.3, 6.0))
+    level = 10.0 ** r.uniform(-0.6, 0.4)
+    return _yg_store(r, level * x, 0)
+
+def _yg_rate(r, L):
+    n = L if (r.random() < 0.7 or L <= 3440) else int(r.integers(3440, L))
+    k = int(np.searchsorted(_YG_RATE_KINDS, r.random() * _YG_RATE_KINDS[-1], side="right"))
+    if k <= 0:
+        x = _yg_rate_std(r, n)
+    elif k == 1:
+        x = _yg_rate_burst(r, n)
+    elif k == 2:
+        x = _yg_rate_shallow(r, n)
+    else:
+        x = _yg_rate_error(r, n)
+    return _yg_pad(np.maximum(x, 0.0), L)
+
+def _yg_tide(r, L):
+    u = r.random()
+    if u < 0.30 or L <= 1024:
+        n = L
+    elif u < 0.72:
+        n = int(_yg_lu(r, 900.0, 1750.0))
+    else:
+        n = int(_yg_lu(r, 400.0, float(L)))
+    n = max(64, min(n, L))
+    t = np.arange(n, dtype=np.float64) + r.uniform(0.0, 5e5)
+    a2 = _yg_lu(r, 0.03, 1.4)
+    form = float(np.clip(np.exp(r.normal(np.log(0.45), 0.9)), 0.03, 6.0))
+    s2 = a2 * 0.46 * float(np.exp(r.normal(0.0, 0.35)))
+    a1 = form * (a2 + s2)
+    k1 = a1 * r.uniform(0.5, 0.66)
+    shallow = r.random() < 0.15
+    r4 = r.uniform(0.07, 0.3) if shallow else float(min(np.exp(r.normal(np.log(0.03), 0.8)), 0.25))
+    amps = np.array([a2, s2, a2 * 0.19 * float(np.exp(r.normal(0.0, 0.3))), k1, a1 - k1,
+                     (a1 - k1) * 0.19 * float(np.exp(r.normal(0.0, 0.3))), a2 * r4, a2 * r4 * r.uniform(0.3, 0.7),
+                     a2 * (r.uniform(0.03, 0.1) if shallow else float(min(np.exp(r.normal(np.log(0.012), 0.8)), 0.08))),
+                     a2 * float(min(np.exp(r.normal(np.log(0.03), 0.8)), 0.2))])
+    ph = r.uniform(0.0, _YG_TWO_PI, amps.size)
+    x = np.zeros(n)
+    for j in range(amps.size):
+        x += amps[j] * np.cos(t * (_YG_TWO_PI / _YG_TIDE_PER[j]) + ph[j])
+    a_tot = float(a2 + s2 + a1)
+
+    x = x + _yg_smooth(r, n, r.uniform(120.0, 1440.0), float(np.clip(a_tot * np.exp(r.normal(np.log(0.1), 0.6)), 0.006, 0.35))
+                       + _yg_lu(r, 0.003, 0.025))
+    if r.random() < 0.6:
+        p_s = _yg_lu(r, 8.0, 90.0)
+        amp_s = _yg_lu(r, 0.0015, 0.035) * (r.uniform(1.5, 4.0) if (a_tot < 0.1 and r.random() < 0.5) else 1.0)
+        env = np.exp(_yg_smooth(r, n, 18.0 * 60.0 / 3.0, 0.45))
+        psi = np.cumsum(r.standard_normal(n)) * float(np.sqrt(_YG_TWO_PI / (p_s * r.uniform(4.0, 25.0))))
+        x = x + amp_s * env * np.cos(t * (_YG_TWO_PI / p_s) + psi)
+    s_w = _yg_lu(r, 0.0005, 0.01) if r.random() < 0.8 else _yg_lu(r, 0.01, 0.05)
+    if r.random() < 0.35:
+        e = r.standard_t(float(r.uniform(2.5, 6.0)), n)
+        e = e / max(float(_v2_stdm(e)), 1e-9)
+    else:
+        e = r.standard_normal(n)
+    x = x + s_w * e
+    if r.random() < 0.12:
+        k = int(r.poisson(max(n * r.uniform(0.0002, 0.001), 0.5))) + 1
+        idx = r.integers(0, n, k)
+        x[idx] += np.where(r.random(k) < 0.5, -1.0, 1.0) * r.uniform(4.0, 30.0, k) * max(s_w, 0.004)
+    if r.random() < 0.04:
+        x[int(r.integers(n // 8, n - n // 8)):] += (1.0 if r.random() < 0.5 else -1.0) * r.uniform(0.02, 0.3)
+    half = 1.1 * float(np.max(np.abs(x)))
+    u = r.random()
+    if u < 0.6:
+        datum = half * r.uniform(0.9, 2.2) + r.uniform(0.0, 1.6)
+    elif u < 0.76:
+        datum = r.uniform(2.5, 7.0)
+    elif u < 0.92:
+        datum = -r.uniform(1.2, 8.5)
+    else:
+        datum = half * r.uniform(-0.8, 0.8)
+    u = r.random()
+    q = 0.001 if u < 0.87 else (0.01 if u < 0.94 else 0.0001)
+    return _yg_pad(np.round((x + datum) / q) * q, L)
+
+def _yg_min1440(r, L):
+    try:
+        L = int(L)
+        if L < 256:
+            return None
+        with np.errstate(all="ignore"):
+            w = _yg_rate(r, L) if r.random() < _YG_MIX[0] else _yg_tide(r, L)
+        if (isinstance(w, np.ndarray) and w.shape == (L,) and bool(np.all(np.isfinite(w)))
+                and float(w.max()) > float(w.min()) and float(np.max(np.abs(w))) < 1e12):
+            return np.ascontiguousarray(w, dtype=np.float64)
+    except Exception:
+        pass
+    return None
+
+_YH_KIND_CUM = np.cumsum([0.44, 0.32, 0.24])
+_YH_TWO_PI = 2.0 * np.pi
+_YH_LAM_LO = 0.02
+_YH_LAM_HI = 5.0e4
+
+def _yh_lu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+def _yh_ar1(e, phi):
+    y = np.array(e, dtype=np.float64)
+    if y.ndim == 1 and y.flags.c_contiguous:
+        _v2_ar1_fill(y, float(phi))
+        return y
+    n = y.size
+    k = 1
+    p = float(phi)
+    while k < n and abs(p) > 1e-12:
+        y[k:] = y[k:] + p * y[:-k]
+        p = p * p
+        k *= 2
+    return y
+
+def _yh_ou(r, n, tau, sd):
+    phi = float(np.exp(-1.0 / max(tau, 0.2)))
+    e = r.standard_normal(n) * (sd * np.sqrt(max(1.0 - phi * phi, 1e-9)))
+    e[0] = r.standard_normal() * sd
+    return _yh_ar1(e, phi)
+
+def _yh_len(u, L, kind):
+    lo = float(min(320, L))
+    if kind == 0:
+        full, a, b = 0.03, 320.0, 2000.0
+    elif kind == 1:
+        full, a, b = 0.24, 320.0, 1600.0
+        if 0.66 <= u < 0.76:
+            return int(min(L, max(lo, round(1500.0 * (4096.0 / 1500.0) ** ((u - 0.66) / 0.10)))))
+    else:
+        full, a, b = 0.27, 330.0, 3300.0
+    if u >= 1.0 - full:
+        return L
+    q = u / (0.66 if kind == 1 else 1.0 - full)
+    return int(min(L, max(lo, round(a * (b / a) ** min(q, 1.0)))))
+
+def _yh_head(n, amp, c, span):
+    t = np.arange(n, dtype=np.float64)
+    w = 1.0 - np.log1p(t / c) / np.log1p(span / c)
+    return amp * np.maximum(w, 0.0)
+
+def _yh_cycle(r, n, per, amp, p_end, sd_end):
+    ph_end = 0.5 + r.normal(0.0, sd_end) if r.random() < p_end else r.random()
+    ph = (np.arange(n, dtype=np.float64) - (n - 1)) / per + ph_end
+    h2 = r.uniform(0.0, 0.3)
+    return amp * (np.cos(_YH_TWO_PI * ph) + h2 * np.cos(2.0 * _YH_TWO_PI * ph + r.uniform(0.0, _YH_TWO_PI)))
+
+def _yh_episodes(r, n, rate, dur_lo, dur_hi, amp_lo, amp_hi, plateau):
+    out = np.zeros(n, dtype=np.float64)
+    k = int(min(r.poisson(rate * n), 40))
+    if k <= 0:
+        return out
+    t = np.arange(n, dtype=np.float64)
+    for _ in range(k):
+        i = int(r.integers(0, n))
+        d = _yh_lu(r, dur_lo, dur_hi)
+        a = r.uniform(amp_lo, amp_hi)
+        if r.random() < plateau:
+            j = int(min(n, i + int(d) + 1))
+            out[i:j] += a
+        else:
+            j = int(min(n, i + int(6.0 * d) + 2))
+            out[i:j] += a * np.exp(-(t[i:j] - i) / d)
+    return out
+
+def _yh_ztp(r, lam):
+    lam = np.minimum(np.maximum(lam, _YH_LAM_LO), _YH_LAM_HI)
+    p1 = -np.expm1(-lam)
+    t1 = -np.log1p(-r.random(lam.size) * p1) / lam
+    return 1.0 + r.poisson(lam * np.maximum(1.0 - t1, 0.0)).astype(np.float64)
+
+def _yh_rate(m):
+    lam = m
+    for _ in range(12):
+        lam = m * (1.0 - float(np.exp(-lam)))
+    return max(lam, 0.05)
+
+def _yh_trade(r, n, kind, fresh, m):
+    calm = min(1.0, (9.0 / m) ** 0.5)
+    gain = min(max(0.5 + 0.23 * float(np.log2(m / 2.0)), 0.35), 1.3)
+    if kind == 0:
+        sw = r.uniform(0.45, 0.85) * calm
+        day = 1440.0
+        g = _yh_lu(r, 0.6, 1.7) * gain
+    else:
+        sw = r.uniform(0.50, 0.95) * calm
+        day = 8640.0
+        g = _yh_lu(r, 0.6, 1.7) * gain
+    s1 = g * r.uniform(0.30, 0.70)
+    s2 = g * r.uniform(0.15, 0.45)
+    s3 = g * _yh_lu(r, 0.06, 0.50)
+    x = np.full(n, np.log(_yh_rate(m)) - 0.5 * (sw * sw + s1 * s1 + s2 * s2 + s3 * s3))
+    x += _yh_ou(r, n, _yh_lu(r, 0.6, 4.0), s1)
+    x += _yh_ou(r, n, _yh_lu(r, 6.0, 50.0), s2)
+    x += _yh_ou(r, n, _yh_lu(r, 80.0, max(300.0, 0.5 * n)), s3)
+    x += _yh_cycle(r, n, day, r.uniform(0.15, 0.65) if kind == 0 else r.uniform(0.25, 0.90), 0.8, 0.10)
+    if fresh:
+
+        if r.random() < min(max((m - 4.0) / 8.0, 0.0), 0.95) * (1.0 if kind == 0 else 0.8):
+            amp = min(r.normal(1.2, 0.8) if kind == 0 else r.normal(0.9, 0.7), 3.6)
+            span = _yh_lu(r, 60.0, 600.0) if kind == 0 else _yh_lu(r, 20.0, 250.0)
+        else:
+            amp = r.normal(-0.3, 0.35)
+            span = _yh_lu(r, 20.0, 250.0)
+        x += _yh_head(n, amp, _yh_lu(r, 2.0, 12.0), span)
+
+    x += _yh_episodes(r, n, _yh_lu(r, 0.0005, 0.005), 3.0, 60.0, 0.4, 1.5, 0.25)
+
+    e = sw * r.standard_normal(n)
+    e += (r.random(n) < _yh_lu(r, 0.003, 0.03)) * r.exponential(r.uniform(0.3, 0.7), n)
+    return _yh_ztp(r, np.exp(np.minimum(x + e, 11.0)))
+
+def _yh_edits(r, n, fresh, m):
+    big = m > 40.0
+    if big:
+        sw = r.uniform(0.15, 0.45)
+        g = _yh_lu(r, 0.4, 1.0)
+        cyc = r.uniform(0.05, 0.30)
+    else:
+        gain = min(max(0.35 + 0.33 * float(np.log2(m / 2.0)), 0.25), 1.5)
+        sw = r.uniform(0.40, 0.75) * (1.0 + 0.5 * max(0.0, 1.0 - m / 4.0))
+        g = _yh_lu(r, 0.5, 1.5) * gain
+        cyc = r.uniform(0.25, 0.85) * min(1.0, 0.3 + 0.7 * gain)
+    s1 = g * r.uniform(0.15, 0.40)
+    s2 = g * r.uniform(0.05, 0.25)
+    s3 = g * r.uniform(0.03, 0.15)
+    x = np.full(n, np.log(_yh_rate(m)) - 0.5 * (sw * sw + s1 * s1 + s2 * s2 + s3 * s3))
+    x += _yh_ou(r, n, _yh_lu(r, 1.0, 6.0), s1)
+    x += _yh_ou(r, n, _yh_lu(r, 8.0, 60.0), s2)
+    x += _yh_ou(r, n, _yh_lu(r, 80.0, 400.0), s3)
+
+    per = 1440.0 * (1.0 if m > 7.0 else r.uniform(0.72, 1.0))
+    x += _yh_cycle(r, n, per, cyc, 0.6, 0.12)
+    if fresh:
+        amp = -r.exponential(0.9 if 3.0 < m <= 40.0 else 0.35) if r.random() < 0.8 else r.normal(0.1, 0.25)
+        x += _yh_head(n, max(amp, -2.2), _yh_lu(r, 3.0, 20.0), _yh_lu(r, 100.0, 600.0))
+
+    x += _yh_episodes(r, n, _yh_lu(r, 0.0002, 0.002), 4.0, 300.0, 0.4, 1.5, 0.7)
+    e = sw * r.standard_normal(n)
+    e += (r.random(n) < _yh_lu(r, 0.002, 0.02)) * r.exponential(r.uniform(0.3, 0.6), n)
+    lam = np.exp(np.minimum(x + e, 11.0))
+    if big:
+
+        d = r.uniform(0.05, 0.45)
+        flip = np.cumsum(r.random(n) < r.uniform(0.0, 0.05))
+        lam = lam * np.exp(d * np.where((np.arange(n) + flip) % 2 == 0, 1.0, -1.0))
+        lam = lam * np.where(r.random(n) < r.uniform(0.0, 0.12), r.uniform(0.01, 0.4, n), 1.0)
+    y = _yh_ztp(r, lam)
+    if big and r.random() < 0.6:
+        y = np.minimum(y, float((250, 500, 500, 1000)[int(r.integers(0, 4))]))
+    return y
+
+def _yh_series(r, L, kind):
+
+    z = float(r.standard_normal())
+    if kind == 0:
+        m = min(max(9.2 * float(np.exp((0.52 if z > 0.0 else 0.82) * z)), 1.3), 45.0)
+    elif kind == 1:
+        m = min(max(5.65 * float(np.exp(0.72 * z)), 1.25), 60.0)
+    elif z > 1.5:
+        m = _yh_lu(r, 60.0, 300.0)
+    else:
+        m = max(4.35 * float(np.exp((1.25 if z > 0.0 else 0.48) * z)), 1.5)
+    rho = (0.0, 0.35, 0.7)[kind]
+    zl = rho * z + float(np.sqrt(1.0 - rho * rho)) * float(r.standard_normal())
+    n = _yh_len(1.0 / (1.0 + float(np.exp(-1.702 * zl))), L, kind)
+    if n < 8:
+        return None
+    fresh = n < L
+    y = _yh_trade(r, n, kind, fresh, m) if kind < 2 else _yh_edits(r, n, fresh, m)
+    if fresh and r.random() < (0.5 if kind < 2 else 0.7):
+        y[0] = max(1.0, float(np.floor(y[0] * r.uniform(0.05, 1.0) + 0.5)))
+    if r.random() < (0.6 if kind < 2 else 0.85):
+        y[-1] = max(1.0, float(np.floor(y[-1] * r.uniform(0.05, 1.0) + 0.5)))
+    return y
+
+def _yh_counts(r, L):
+    L = int(L)
+    if L < 64:
+        return None
+    kind = min(int(np.searchsorted(_YH_KIND_CUM, r.random() * _YH_KIND_CUM[-1], side="right")), 2)
+    y = _yh_series(r, L, kind)
+    if y is None or y.size < 8 or y.size > L:
+        return None
+    out = np.empty(L, dtype=np.float64)
+    n = y.size
+    out[:L - n] = y[0]
+    out[L - n:] = y
+    if not bool(np.all(np.isfinite(out))) or float(out.max()) <= float(out.min()):
+        return None
+    return out
+
+_YI_TWO_PI = 2.0 * np.pi
+_YI_KIND_CUM = np.cumsum([0.60, 0.09, 0.14, 0.12, 0.05])
+_YI_PATHS = ("ari", "covid", "flu", "rsv")
+
+_YI_WAVES = {
+    "ari": ((-15.0, 20.0, 1.00, np.log(1.3), 0.35, (12.0, 25.0), (40.0, 80.0), (0.9, 1.3), (0.7, 1.0)),
+            (-115.0, 12.0, 0.80, np.log(0.5), 0.35, (4.0, 10.0), (120.0, 240.0), (1.0, 1.4), (0.8, 1.1)),
+            (215.0, 30.0, 0.50, np.log(0.2), 0.50, (10.0, 20.0), (15.0, 35.0), (1.0, 1.3), (0.8, 1.1))),
+    "covid": ((-10.0, 30.0, 0.90, np.log(7.0), 0.90, (16.0, 34.0), (12.0, 26.0), (0.9, 1.2), (0.8, 1.1)),
+              (215.0, 30.0, 0.90, np.log(6.0), 0.90, (16.0, 34.0), (12.0, 26.0), (0.9, 1.2), (0.8, 1.1)),
+              (100.0, 40.0, 0.25, np.log(3.0), 0.80, (16.0, 34.0), (12.0, 26.0), (0.9, 1.2), (0.8, 1.1))),
+    "flu": ((0.0, 28.0, 1.00, np.log(70.0), 0.50, (8.0, 15.0), (9.0, 18.0), (0.9, 1.3), (0.6, 0.9)),
+            (50.0, 20.0, 0.50, np.log(20.0), 0.60, (8.0, 15.0), (9.0, 18.0), (0.9, 1.3), (0.6, 0.9))),
+    "rsv": ((-25.0, 25.0, 1.00, np.log(40.0), 0.50, (16.0, 28.0), (15.0, 28.0), (0.9, 1.2), (0.7, 1.0)),),
+}
+
+_YI_BASE = {"ari": ((5.0, 8.5), (0.06, 0.18), -40.0, (0.005, 0.03)),
+            "covid": ((0.10, 0.25), (0.05, 0.35), 0.0, (0.05, 0.20)),
+            "flu": ((0.025, 0.12), (0.20, 0.60), -10.0, (0.005, 0.05)),
+            "rsv": ((0.006, 0.05), (0.20, 0.60), -30.0, (0.005, 0.05))}
+
+def _yi_lu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+def _yi_ar1(e, phi):
+    y = np.array(e, dtype=np.float64)
+    if y.ndim == 1 and y.flags.c_contiguous:
+        _v2_ar1_fill(y, float(phi))
+        return y
+    n = y.size
+    k = 1
+    p = float(phi)
+    while k < n and abs(p) > 1e-12:
+        y[k:] = y[k:] + p * y[:-k]
+        p = p * p
+        k *= 2
+    return y
+
+def _yi_ou(r, n, tau, sd):
+    phi = float(np.exp(-1.0 / max(tau, 0.2)))
+    e = r.standard_normal(n) * (sd * np.sqrt(max(1.0 - phi * phi, 1e-9)))
+    e[0] = r.standard_normal() * sd
+    return _yi_ar1(e, phi)
+
+def _yi_wave(t, c, a, wr, wf, pr, pf, out, rad=5.0):
+    n = out.size
+    lo = int(max(0.0, np.floor(c - rad - wr * 9.3 ** (1.0 / pr))))
+    hi = int(min(float(n), np.ceil(c + rad + wf * 9.3 ** (1.0 / pf)) + 1.0))
+    if hi <= lo:
+        return
+    d = t[lo:hi] - c
+    q = np.sqrt(d * d + rad * rad) - rad
+    out[lo:hi] += a * np.exp(-np.where(d < 0.0, (q / wr) ** pr, (q / wf) ** pf))
+
+def _yi_season(r, n, s0, path, wscale=1.0, jscale=1.0, size=1.0):
+    t = np.arange(n, dtype=np.float64)
+    g = np.zeros(n, dtype=np.float64)
+    for k in range(-1, n // 365 + 2):
+        for mu, sd, p, lm, ls, wr, wf, pr, pf in _YI_WAVES[path]:
+            if r.random() >= p:
+                continue
+            c = 365.0 * k + mu - s0 + r.normal(0.0, sd * jscale)
+            a = size * float(np.exp(r.normal(lm, ls)))
+            _yi_wave(t, c, a, r.uniform(*wr) * wscale, r.uniform(*wf) * wscale, r.uniform(*pr), r.uniform(*pf), g,
+                     r.uniform(5.0, 25.0))
+    return g
+
+def _yi_weekday(r, n, a_lo, a_hi):
+    d = np.arange(n, dtype=np.float64) * (_YI_TWO_PI / 7.0)
+    return (r.uniform(a_lo, a_hi) * np.cos(d + r.uniform(0.0, _YI_TWO_PI))
+            + r.uniform(0.0, 0.4 * a_hi) * np.cos(2.0 * d + r.uniform(0.0, _YI_TWO_PI)))
+
+def _yi_slow(r, n, sd_trend, sd_ou):
+    return (np.linspace(0.0, 1.0, n) * r.normal(0.0, sd_trend * n / 365.0)
+            + _yi_ou(r, n, r.uniform(20.0, 80.0), r.uniform(0.3, 1.0) * sd_ou))
+
+def _yi_noise(r, n, sd_lo, sd_hi, phi_lo, phi_hi):
+    return _yi_ou(r, n, -1.0 / np.log(r.uniform(phi_lo, phi_hi) + 1e-9), r.uniform(sd_lo, sd_hi))
+
+def _yi_share(r, n, path, national):
+    s0 = r.uniform(0.0, 365.0)
+    (b_lo, b_hi), (c_lo, c_hi), c_mu, (o_lo, o_hi) = _YI_BASE[path]
+    t = np.arange(n, dtype=np.float64)
+    base = _yi_lu(r, b_lo, b_hi)
+    lx = r.uniform(c_lo, c_hi) * np.cos(_YI_TWO_PI * (t + s0 - c_mu) / 365.0)
+    lx += _yi_slow(r, n, 0.10, 0.12)
+    if national:
+        lx += _yi_weekday(r, n, 0.05, 0.10)
+        g = _yi_season(r, n, s0, path, r.uniform(1.1, 1.4), 0.6)
+        N = _yi_lu(r, 1.0e5, 6.0e5)
+        lx += _yi_noise(r, n, 0.006, 0.02, 0.3, 0.7)
+    else:
+        lx += _yi_weekday(r, n, 0.02, 0.09)
+        g = _yi_season(r, n, s0, path)
+        N = _yi_lu(r, 1200.0, 25000.0)
+        lx += _yi_noise(r, n, o_lo, o_hi, 0.01, 0.4)
+    p = np.minimum(base * np.exp(lx) * (1.0 + g), 60.0)
+    k = r.poisson(N * p / 100.0).astype(np.float64)
+    return np.round(k * (100.0 / N), 2)
+
+def _yi_covid_long(r, n, e_lo, e_hi, size):
+    t = np.arange(n, dtype=np.float64)
+    t_mid = r.uniform(450.0, 1000.0)
+    env = r.uniform(e_lo, e_hi) / (1.0 + np.exp((t - t_mid) / r.uniform(60.0, 200.0)))
+    g = _yi_season(r, n, r.uniform(0.0, 365.0), "covid", 1.0, 1.0, size)
+    c = r.uniform(20.0, 120.0)
+    while c < t_mid + 100.0 and c < n + 60.0:
+        _yi_wave(t, c, size * float(np.exp(r.normal(np.log(8.0), 0.6))), r.uniform(8.0, 22.0), r.uniform(10.0, 28.0),
+                 r.uniform(1.0, 1.4), r.uniform(0.9, 1.2), g, r.uniform(3.0, 12.0))
+        c += r.uniform(180.0, 300.0)
+    start = 1.0 / (1.0 + np.exp(-(t - r.uniform(10.0, 60.0)) / r.uniform(4.0, 15.0)))
+    return np.exp(env + _yi_slow(r, n, 0.05, 0.15)) * (1.0 + g) * start
+
+def _yi_roll7(c):
+    s = np.cumsum(c)
+    s[7:] = s[7:] - s[:-7]
+    return s
+
+def _yi_hosp7(r, n):
+    lam = _yi_lu(r, 0.01, 1.0) * _yi_covid_long(r, n, 0.8, 2.0, r.uniform(3.0, 7.0))
+    c = r.poisson(lam * np.exp(_yi_noise(r, n, 0.05, 0.2, 0.01, 0.3))).astype(np.float64)
+    return _yi_roll7(c)
+
+def _yi_uk(r, L):
+    u = r.random()
+    if u < 0.20:
+        n = min(L, int(r.integers(880, 1021)))
+        s0 = r.uniform(0.0, 365.0)
+        t = np.arange(n + 6, dtype=np.float64)
+        c_lo, c_hi = _YI_BASE["ari"][1]
+        c_mu = _YI_BASE["ari"][2]
+        lx = r.uniform(c_lo, c_hi) * np.cos(_YI_TWO_PI * (t + s0 - c_mu) / 365.0) + _yi_slow(r, n + 6, 0.08, 0.10)
+        lx += _yi_weekday(r, n + 6, 0.05, 0.15) + _yi_noise(r, n + 6, 0.05, 0.12, 0.1, 0.5)
+        lam = _yi_lu(r, 700.0, 3000.0) * np.exp(lx) * (1.0 + _yi_season(r, n + 6, s0, "ari"))
+        return np.round(_yi_roll7(r.poisson(lam).astype(np.float64))[6:] / 7.0, 2), "ari_ed"
+    n = min(L, int(r.integers(2150, 2471)))
+    if u < 0.55:
+        lam = _yi_lu(r, 30.0, 500.0) * _yi_covid_long(r, n, 3.0, 6.0, r.uniform(0.3, 1.0))
+        lam *= np.exp(_yi_weekday(r, n, 0.10, 0.30) + _yi_noise(r, n, 0.05, 0.12, 0.2, 0.6))
+        return r.poisson(lam).astype(np.float64), "cases"
+    lam = _yi_lu(r, 15.0, 200.0) * _yi_covid_long(r, n, 1.0, 2.5, r.uniform(0.3, 1.0))
+    if u < 0.80:
+        lam = lam * np.exp(_yi_weekday(r, n, 0.06, 0.16) + _yi_noise(r, n, 0.08, 0.16, 0.4, 0.8))
+        return r.poisson(lam).astype(np.float64), "admissions"
+    los = r.uniform(6.0, 14.0)
+    b = _yi_ar1(lam, float(np.exp(-1.0 / los))) * (1.0 - float(np.exp(-1.0 / los)))
+    b = b * los * np.exp(_yi_ou(r, n, r.uniform(2.0, 8.0), r.uniform(0.01, 0.035)) + _yi_weekday(r, n, 0.005, 0.02))
+    return np.round(b), "beds"
+
+def _yi_rkinat(r, n):
+    path = "flu" if r.random() < 0.6 else "rsv"
+    s0 = r.uniform(0.0, 365.0)
+    t = np.arange(n + 6, dtype=np.float64)
+    (c_lo, c_hi), c_mu = _YI_BASE[path][1:3]
+    lx = r.uniform(c_lo, c_hi) * np.cos(_YI_TWO_PI * (t + s0 - c_mu) / 365.0) + _yi_slow(r, n + 6, 0.10, 0.12)
+    g = 1.0 + _yi_season(r, n + 6, s0, path, r.uniform(1.2, 2.0), 0.6)
+    if r.random() < 0.5:
+        lam = _yi_lu(r, 4.0, 80.0) * np.exp(lx[6:] + _yi_noise(r, n, 0.15, 0.35, 0.1, 0.5)) * g[6:]
+        wk = np.exp(r.uniform(-0.25, 0.25, 7))
+        we = int(r.integers(0, 7))
+        wk[we] *= r.uniform(0.0, 0.08)
+        wk[(we + 1) % 7] *= r.uniform(0.0, 0.08)
+        lam = lam * wk[(np.arange(n) + int(r.integers(0, 7))) % 7]
+        if r.random() < 0.6:
+            z = int(r.integers(15, 50))
+            s = int(r.integers(20, 70))
+            wf = np.where(r.random(s // 7 + 1) < 0.4, 0.0, r.uniform(0.05, 1.0, s // 7 + 1))
+            lam[:z] = 0.0
+            lam[z:z + s] *= wf[np.arange(lam[z:z + s].size) // 7]
+        return r.poisson(lam).astype(np.float64), "cases"
+    lam = _yi_lu(r, 0.005, 0.05) * np.exp(lx + _yi_noise(r, n + 6, 0.12, 0.3, 0.1, 0.4)) * g
+    return np.round(_yi_roll7(lam)[6:], 2), "incidence"
+
+def _yi_series(r, L):
+    kind = min(int(np.searchsorted(_YI_KIND_CUM, r.random() * _YI_KIND_CUM[-1], side="right")), 4)
+    if kind == 0:
+        n = int(r.integers(505, 536)) if r.random() < 0.85 else int(r.integers(300, 1101))
+        path = _YI_PATHS[int(r.integers(0, 4))]
+        return _yi_share(r, min(n, L), path, False), "state/" + path
+    if kind == 1:
+        path = _YI_PATHS[int(r.integers(0, 4))]
+        return _yi_share(r, min(int(r.integers(1380, 1561)), L), path, True), "national/" + path
+    if kind == 2:
+        n = int(r.integers(2340, 2441)) if r.random() < 0.85 else int(r.integers(700, 2341))
+        return _yi_hosp7(r, min(n, L)), "hosp7/covid_hosp_7d"
+    if kind == 3:
+        x, sub = _yi_uk(r, L)
+        return x, "uk/" + sub
+    x, sub = _yi_rkinat(r, min(int(r.integers(430, 481)), L))
+    return x, "rkinat/" + sub
+
+def _yi_health(r, L):
+    L = int(L)
+    if L < 256:
+        return None
+    x, _ = _yi_series(r, L)
+    x = np.asarray(x, dtype=np.float64)[-L:]
+    if float(x.max()) <= float(x.min()):
+        x = x + (r.random(x.size) < 0.05)
+    out = np.empty(L, dtype=np.float64)
+    n = x.size
+    out[:L - n] = x[0]
+    out[L - n:] = x
+    return out
+
+_YJ_TWO_PI = 2.0 * np.pi
+_YJ_KIND_CUM = np.cumsum([0.28, 0.32, 0.04, 0.36])
+_YJ_MIN_N = 320
+_YJ_LAM_CAP = 5000.0
+_YJ_MAX_CAL = 40960
+
+_YJ_SHAPE_CUM_S = np.cumsum([0.20, 0.50, 0.05, 0.25])
+_YJ_SHAPE_CUM_D = np.cumsum([0.25, 0.45, 0.10, 0.20])
+_YJ_AMP = ((1.2, 3.2), (0.4, 1.5), (0.8, 2.0), (0.0, 0.3))
+
+def _yj_lu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+def _yj_pick(r, cum):
+    return min(int(np.searchsorted(cum, r.random() * cum[-1], side="right")), cum.size - 1)
+
+def _yj_ar1(e, phi):
+    y = np.array(e, dtype=np.float64)
+    if y.ndim == 1 and y.flags.c_contiguous:
+        _v2_ar1_fill(y, float(phi))
+        return y
+    n = y.size
+    k = 1
+    p = float(phi)
+    while k < n and abs(p) > 1e-12:
+        y[k:] = y[k:] + p * y[:-k]
+        p = p * p
+        k *= 2
+    return y
+
+def _yj_ou(r, n, tau, sd):
+    phi = float(np.exp(-1.0 / max(tau, 0.2)))
+    e = r.standard_normal(n) * (sd * np.sqrt(max(1.0 - phi * phi, 1e-9)))
+    e[0] = r.standard_normal() * sd
+    return _yj_ar1(e, phi)
+
+def _yj_slow(r, nd, per, tau_d, sd):
+    d = _yj_ou(r, nd + 1, tau_d, sd)
+    return np.interp(np.arange(nd * per, dtype=np.float64) / per, np.arange(nd + 1, dtype=np.float64), d)
+
+def _yj_episodes(r, m, rate, a_lo, a_hi, tau):
+    k = int(min(r.poisson(rate * m), 400))
+    if k <= 0:
+        return None
+    imp = np.zeros(m, dtype=np.float64)
+    np.add.at(imp, r.integers(0, m, k), r.uniform(a_lo, a_hi, k))
+    return _yj_ar1(imp, float(np.exp(-1.0 / tau)))
+
+def _yj_dayshape(r, shape, P):
+    h = (np.arange(P, dtype=np.float64) + 0.5) * (24.0 / P)
+    if shape == 0:
+        a, b, w = r.uniform(6.0, 9.0), r.uniform(15.5, 20.5), r.uniform(0.5, 1.8)
+        s = 1.0 / (1.0 + np.exp(-(h - a) / w)) - 1.0 / (1.0 + np.exp(-(h - b) / w))
+        s = s + r.uniform(0.0, 0.3) * np.exp(-0.5 * ((h - r.uniform(9.0, 12.0)) / 1.5) ** 2)
+    elif shape == 1:
+        pk = r.uniform(12.0, 19.0)
+        s = np.cos(_YJ_TWO_PI * (h - pk) / 24.0) + r.uniform(0.0, 0.4) * np.cos(2.0 * _YJ_TWO_PI * (h - pk - r.uniform(-3.0, 3.0)) / 24.0)
+    elif shape == 2:
+        d = (h - r.uniform(20.0, 24.5) + 12.0) % 24.0 - 12.0
+        s = np.exp(-0.5 * (d / r.uniform(2.0, 4.5)) ** 2) + r.uniform(0.0, 0.3) * np.cos(_YJ_TWO_PI * (h - 15.0) / 24.0)
+    else:
+        s = r.normal(0.0, 1.0) * np.cos(_YJ_TWO_PI * (h - r.uniform(0.0, 24.0)) / 24.0) + 0.3 * r.standard_normal(P)
+    s = s - _v2_meanm(s)
+    pp = float(np.ptp(s))
+    return s / pp if pp > 0 else s
+
+def _yj_gaps(r, keep, rate, len_hi):
+    m = keep.size
+    k = int(min(r.poisson(rate * m), 60))
+    for _ in range(k):
+        i = int(r.integers(0, m))
+        keep[i:i + int(_yj_lu(r, 1.0, len_hi))] = False
+
+def _yj_gamma(r, m, cv):
+    if cv < 0.02:
+        return 1.0
+    k = 1.0 / (cv * cv)
+    return r.gamma(k, 1.0 / k, m)
+
+def _yj_count(r, lam, keep_zero):
+    lam = np.minimum(np.maximum(lam, 1e-9), 1e6)
+    if keep_zero:
+        return np.ones(lam.size, dtype=bool), r.poisson(lam).astype(np.float64)
+    p1 = -np.expm1(-lam)
+    listed = r.random(lam.size) < p1
+    la, pa = lam[listed], p1[listed]
+    t1 = -np.log1p(-r.random(la.size) * pa) / la
+    return listed, 1.0 + r.poisson(la * np.maximum(1.0 - t1, 0.0)).astype(np.float64)
+
+def _yj_subdaily(r, n, P, dense):
+    hh = P == 48
+    if dense:
+        z = float(r.standard_normal())
+        if hh:
+            base = float(np.exp(min(max(np.log(7.0) + 0.45 * z, np.log(2.4)), np.log(60.0))))
+            shape = 1
+        else:
+            base = float(np.exp(min(max(np.log(10.0) + (0.65 if z < 0.0 else 1.2) * z, np.log(2.4)), np.log(400.0))))
+            shape = _yj_pick(r, _YJ_SHAPE_CUM_D)
+    else:
+        base = float(np.exp(min(max(r.normal(np.log(0.55), 0.7), np.log(0.08)), np.log(2.4))))
+        shape = _yj_pick(r, _YJ_SHAPE_CUM_S)
+    p_est = max(1.0 - float(np.exp(-0.75 * base)), 0.04)
+    nd = int(min(n / p_est * 1.2 + 2 * P, _YJ_MAX_CAL) // P) + 2
+    m = nd * P
+    h0, d0 = int(r.integers(0, P)), int(r.integers(0, 7))
+    slot = (np.arange(m) + h0) % P
+    day = (np.arange(m) + h0) // P
+    dow = (day + d0) % 7
+
+    s = _yj_dayshape(r, shape, P) * (r.uniform(0.8, 1.2) if hh else r.uniform(*_YJ_AMP[shape]))
+    if shape in (1, 3) and r.random() < (0.2 if dense else 0.15):
+        s[0 if r.random() < 0.7 else P // 2] += np.log(r.uniform(1.4, 3.0))
+    wk = r.normal(0.0, 0.04, 7)
+    amp_w = np.ones(7)
+    if shape == 0:
+        wk[5] += np.log(r.uniform(0.3, 0.8))
+        wk[6] = wk[5] + np.log(r.uniform(0.7, 1.05))
+        wk[0] += r.uniform(0.0, 0.15)
+        amp_w[5:] = r.uniform(0.3, 0.8)
+    elif shape == 2:
+        wk[4:6] += r.uniform(0.1, 0.45)
+    else:
+        wk[5:] += r.normal(0.0, 0.08)
+    amp_d = np.exp(r.normal(0.0, r.uniform(0.03, 0.2), nd + 1))
+    lday = _yj_ou(r, nd + 1, _yj_lu(r, 0.5, 6.0), r.uniform(0.01, 0.06) if hh else _yj_lu(r, 0.02, 0.25))
+    x = s[slot] * amp_w[dow] * amp_d[day] + wk[dow] + lday[day]
+    x += _yj_slow(r, nd, P, _yj_lu(r, 6.0, 120.0), r.uniform(0.01, 0.05) if hh else _yj_lu(r, 0.01, 0.45))
+    if r.random() < (0.85 if dense else 0.7):
+        x += _yj_ou(r, m, _yj_lu(r, 2.0, 48.0) * P / 24.0, r.uniform(0.0, 0.1) if hh else
+                    (r.uniform(0.03, 0.25) if shape == 0 else r.uniform(0.05, 0.45) if dense else r.uniform(0.0, 0.35)))
+    if r.random() < (0.3 if shape == 0 else 0.6):
+        ep = _yj_episodes(r, m, _yj_lu(r, 0.0002, 0.003) * 24.0 / P, 0.3, 1.2, _yj_lu(r, 1.0, 24.0) * P / 24.0)
+        if ep is not None:
+            x += ep
+    if not dense:
+        if r.random() < 0.3:
+            ep = _yj_episodes(r, m, _yj_lu(r, 0.0002, 0.002), 1.0, 3.0, _yj_lu(r, 6.0, 96.0))
+            if ep is not None:
+                x += ep
+        if r.random() < 0.25:
+            x += (r.random(m) < _yj_lu(r, 0.002, 0.02)) * r.uniform(1.0, 3.0, m)
+    if r.random() < (0.03 if hh else 0.15):
+        x[int(r.integers(m // 8, m)):] += r.normal(0.0, 0.5 if dense else 0.8)
+    lam = base * np.exp(np.minimum(x - np.log(_v2_mean(np.exp(x))), 12.0))
+    cv = r.uniform(0.05, 0.3) if hh else (r.uniform(0.03, 0.25) if shape == 0 else r.uniform(0.03, 0.4) if dense else r.uniform(0.0, 0.5))
+    lam = lam * _yj_gamma(r, m, cv)
+    listed, c = _yj_count(r, np.minimum(lam, _YJ_LAM_CAP), False)
+    if not hh and r.random() < 0.35:
+        keep = np.ones(m, dtype=bool)
+        _yj_gaps(r, keep, _yj_lu(r, 0.0003, 0.003) * 24.0 / P, 72.0 * P / 24.0)
+        c = c[keep[listed]]
+    return c
+
+def _yj_daily(r, n):
+    office = r.random() < 0.5
+    base = float(np.exp(min(max(r.normal(np.log(18.0), 1.9), np.log(0.15)), np.log(4000.0))))
+    keep_zero = r.random() < 0.03
+    wk = r.normal(0.0, 0.05 if office else _yj_lu(r, 0.015, 0.1), 7)
+    if office:
+        wk[5] = np.log(_yj_lu(r, 0.001, 0.6))
+        wk[6] = wk[5] + np.log(r.uniform(0.2, 1.0))
+        wk[0] += r.uniform(0.0, 0.15)
+        wk[4] -= r.uniform(0.0, 0.2)
+    p_est = max(1.0 - float(np.exp(-0.7 * base)), 0.05) * (5.0 / 7.0 if office else 1.0)
+    m = int(min(n / p_est * 1.25 + 14, 8192))
+    t = np.arange(m, dtype=np.float64)
+    dow = (np.arange(m) + int(r.integers(0, 7))) % 7
+    x = wk[dow]
+    nh = int(r.poisson(m / 365.0 * (r.uniform(6.0, 12.0) if office else r.uniform(0.0, 6.0))))
+    if nh > 0:
+        hd = r.integers(0, m, nh)
+        if office:
+            x[hd] += r.uniform(np.log(0.002), np.log(0.05), nh) if r.random() < 0.5 else r.uniform(np.log(0.1), np.log(0.5), nh)
+            if r.random() < 0.5:
+                x[np.minimum(hd + 1, m - 1)] += np.log(r.uniform(1.1, 1.6))
+        else:
+            x[hd] += np.log(r.uniform(0.6, 1.3, nh))
+    if r.random() < 0.5:
+        x += r.uniform(0.0, 0.25) * np.cos(_YJ_TWO_PI * t / 365.25 + r.uniform(0.0, _YJ_TWO_PI))
+    x += _yj_ou(r, m, _yj_lu(r, 15.0, 400.0), r.uniform(0.05, 0.35))
+    x += np.linspace(0.0, r.normal(0.0, 0.25), m)
+    if r.random() < 0.6:
+        x += _yj_ou(r, m, _yj_lu(r, 1.0, 6.0), r.uniform(0.0, 0.2))
+    if r.random() < 0.2:
+        ep = _yj_episodes(r, m, _yj_lu(r, 0.003, 0.03), 0.7, 2.3, 0.3)
+        if ep is not None:
+            x += ep
+    if r.random() < 0.15:
+        x[int(r.uniform(0.2, 0.95) * m):] += (1.0 if r.random() < 0.5 else -1.0) * r.uniform(1.5, 5.0)
+    lam = base * np.exp(np.minimum(x - np.log(_v2_mean(np.exp(x))), 12.0)) * _yj_gamma(r, m, _yj_lu(r, 0.03, 0.6))
+    listed, c = _yj_count(r, np.minimum(lam, 4.0 * _YJ_LAM_CAP), keep_zero)
+    if r.random() < 0.35:
+        keep = np.ones(m, dtype=bool)
+        _yj_gaps(r, keep, _yj_lu(r, 0.0005, 0.004), 20.0)
+        c = c[keep[listed]]
+    return c
+
+def _yj_civic(r, L):
+    L = int(L)
+    if L < 256:
+        return None
+    kind = _yj_pick(r, _YJ_KIND_CUM)
+    if kind == 0:
+        u = r.random()
+        n = L if u < 0.30 else (int(_yj_lu(r, _YJ_MIN_N, 700.0)) if u < 0.475 else int(r.uniform(min(700.0, L), L)))
+        y = _yj_subdaily(r, n, 24, False)
+    elif kind == 1:
+        n = L if r.random() < 0.32 else int(_yj_lu(r, min(600.0, L), L))
+        y = _yj_subdaily(r, n, 24, True)
+    elif kind == 2:
+        n = int(_yj_lu(r, _YJ_MIN_N, 420.0)) if r.random() < 0.35 else int(r.uniform(min(3500.0, L), L))
+        y = _yj_subdaily(r, n, 48, r.random() < 0.8)
+    else:
+        n = int(min(max(np.exp(r.normal(np.log(820.0), 0.55)), _YJ_MIN_N), 2600.0))
+        y = _yj_daily(r, n)
+    n = min(n, L, y.size)
+    y = y[y.size - n:]
+    out = np.empty(L, dtype=np.float64)
+    out[:L - n] = y[0] if n > 0 else 1.0
+    out[L - n:] = y
+    if float(np.ptp(out)) == 0.0:
+        out[L - 1 - int(r.integers(0, max(n, 1)))] += 1.0
+    return out
+
+_YK_TWO_PI = 2.0 * np.pi
+_YK_MIN_L = 256
+_YK_KIND_CUM = np.cumsum([0.48, 0.24, 0.17, 0.11])
+_YK_PADS = (0, 192, 656)
+_YK_PAD_CUM = np.cumsum([0.40, 0.30, 0.30])
+_YK_P_FULL = (0.80, 0.82, 0.92, 0.12)
+_YK_N_SHORT = (320.0, 3600.0)
+_YK_N_REG = (500.0, 2100.0)
+_YK_CAD = ((96, 288, 144, 48), (96, 48), (96, 288), (24, 96))
+_YK_CAD_CUM = (np.cumsum([0.77, 0.12, 0.05, 0.06]), np.cumsum([0.88, 0.12]), np.cumsum([0.94, 0.06]),
+               np.cumsum([0.85, 0.15]))
+
+_YK_ST_STYLE = ((0.515, 0.001, (0.03, 3.0), (12.0, 500.0)),
+                (0.11, 0.001, (3.0, 150.0), (20.0, 600.0)),
+                (0.005, 0.001, (-1.2, 0.2), (30.0, 600.0)),
+                (0.21, 1.0, (15.0, 900.0), (6.0, 120.0)),
+                (0.01, 1.0, (-60.0, 20.0), (6.0, 80.0)),
+                (0.12, 0.01, (1.0, 30.0), (30.0, 700.0)),
+                (0.03, 0.005, (0.2, 10.0), (20.0, 400.0)))
+_YK_ST_CUM = np.cumsum([s[0] for s in _YK_ST_STYLE])
+
+_YK_FL_STYLE = ((0.33, 0.001, (0.005, 0.6)), (0.12, 0.01, (0.05, 4.0)), (0.55, 0.0, (0.3, 3.0e5)))
+_YK_FL_CUM = np.cumsum([s[0] for s in _YK_FL_STYLE])
+_YK_P_BIG = 0.25
+_YK_TP = (0.4, 30.0)
+_YK_TP_BIG = (24.0, 120.0)
+_YK_STORM_H = (0.5, 6.0)
+_YK_DRIFT_SD = 0.8
+_YK_WANDER = (0.05, 0.6)
+_YK_BASE_ST = (0.2, 6.0)
+_YK_BASE_FL = (0.5, 20.0)
+_YK_BASE_FL3 = (1.5, 25.0)
+_YK_P_BIG_FL = 0.40
+_YK_P_NOISY_FL = 0.12
+_YK_P_SLUICE = 0.15
+_YK_ST_NOISE = (0.08, 1.0)
+_YK_RAIN_TICK = np.array([0.01, 0.2, 0.1, 0.5, 0.254])
+_YK_RAIN_TICK_CUM = np.cumsum([0.80, 0.09, 0.05, 0.03, 0.03])
+_YK_REG_TICK = np.array([0.01, 0.001, 0.003048, 0.0032808, 0.005])
+_YK_REG_TICK_CUM = np.cumsum([0.55, 0.15, 0.10, 0.10, 0.10])
+
+def _yk_lu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+def _yk_pick(r, cum):
+    return min(int(np.searchsorted(cum, r.random() * cum[-1], side="right")), cum.size - 1)
+
+def _yk_pad(x, L):
+    out = np.empty(L, dtype=np.float64)
+    n = x.size
+    if n >= L:
+        out[:] = x[n - L:]
+    else:
+        out[:L - n] = x[0]
+        out[L - n:] = x
+    return out
+
+def _yk_len(r, L, kind):
+    if r.random() < _YK_P_FULL[kind]:
+        n = L - _YK_PADS[_yk_pick(r, _YK_PAD_CUM)]
+    elif kind == 3:
+        n = int(_yk_lu(r, *_YK_N_REG))
+    else:
+        n = int(_yk_lu(r, *_YK_N_SHORT))
+    return int(min(max(n, 128), L))
+
+def _yk_ar1(e, phi):
+    x = e.copy()
+    a = phi
+    k = 1
+    n = x.size
+    while k < n:
+        x[k:] += a * x[:-k]
+        a = a * a
+        k *= 2
+    return x
+
+def _yk_slow(r, m, tau):
+    step = max(1.0, tau / 8.0)
+    k = int(m / step) + 43
+    phi = float(np.exp(-step / max(tau, 1.0)))
+    z = _yk_ar1(_yk_ar1(r.standard_normal(k) * np.sqrt(1.0 - phi * phi), phi) * (1.0 - phi), phi)[40:]
+    z = z - _v2_meanm(z)
+    sd = float(_v2_stdm(z))
+    z = z / sd if sd > 0 else z
+    return np.interp(np.arange(m, dtype=np.float64) / step, np.arange(z.size, dtype=np.float64), z)
+
+def _yk_spells(r, m, P, wet_d, dry_d):
+    k = int(3.0 * m / (P * (wet_d + dry_d))) + 6
+    d = np.maximum(dry_d * P * np.exp(0.8 * r.standard_normal(k)), 1.0)
+    w = np.maximum(wet_d * P * np.exp(0.7 * r.standard_normal(k)), 1.0)
+    seg = np.empty(2 * k)
+    seg[0::2] = d
+    seg[1::2] = w
+    edges = np.cumsum(seg) - r.uniform(0.0, seg[0] + seg[1])
+    idx = np.searchsorted(edges, np.arange(m, dtype=np.float64), side="right")
+    return (idx % 2) == 1
+
+def _yk_storms(r, m, P, wet, rate_w, rate_d, dur_h, depth_sd, cap=8.0):
+    lam_max = max(rate_w, rate_d, 1e-9)
+    N = int(r.poisson(lam_max * m / P))
+    t0 = r.integers(0, m, N)
+    lam = np.where(wet[t0], rate_w, rate_d)
+    keep = r.random(N) * lam_max < lam
+    t0 = t0[keep]
+    N = t0.size
+    D = np.maximum(np.rint(dur_h * P / 24.0 * np.exp(0.7 * r.standard_normal(N))), 1.0).astype(np.int64)
+    depth = np.minimum(np.exp(depth_sd * r.standard_normal(N)), cap)
+    du = np.zeros(m + 1)
+    np.add.at(du, t0, depth / D)
+    np.add.at(du, np.minimum(t0 + D, m), -depth / D)
+    return np.maximum(np.cumsum(du[:m]), 0.0)
+
+def _yk_river(r, n, P, base, p_big, drift_sd=_YK_DRIFT_SD, wander=_YK_WANDER, p_mid=0.28, p_strong=0.07, dsd=(0.7, 1.3),
+              cap=8.0):
+    M = 1024 * (-(-(n + 1024) // 1024))
+    big = r.random() < p_big
+    wet = _yk_spells(r, M, P, _yk_lu(r, 1.0, 6.0), _yk_lu(r, 2.0, 14.0))
+    rate_w = _yk_lu(r, 0.4, 3.0)
+    u0 = _yk_storms(r, M, P, wet, rate_w, rate_w * r.uniform(0.0, 0.12), _yk_lu(r, *_YK_STORM_H), r.uniform(*dsd), cap)
+    ub0 = float(_v2_meanm(u0))
+    if ub0 <= 0:
+        u0 = u0 + 1.0
+        ub0 = 1.0
+    w = np.exp(np.arange(M // 2 + 1) * (-_YK_TWO_PI * 1j / M))
+
+    phs = float(np.exp(-1.0 / (_yk_lu(r, 2.0, 20.0) * P)))
+    S = np.fft.irfft(np.fft.rfft(u0 - ub0) * ((1.0 - phs) / (1.0 - phs * w)), M) / ub0 + 1.0
+    u = u0 * (r.uniform(0.15, 1.0) + np.maximum(S, 0.0) ** r.uniform(0.3, 1.0))
+    ub = float(_v2_meanm(u))
+
+    a = r.uniform(1.2, 4.0)
+    tp = _yk_lu(r, *(_YK_TP_BIG if big else _YK_TP)) * P / 24.0
+    tt = (np.arange(M, dtype=np.float64) + 0.5) * ((a - 1.0) / tp)
+    g = np.exp((a - 1.0) * np.log(tt) - tt)
+    phi_i = float(np.exp(-1.0 / (_yk_lu(r, 0.5, 6.0) * P)))
+    phi_b = float(np.exp(-1.0 / (_yk_lu(r, 10.0, 80.0) * P)))
+    wf = r.uniform(0.45, 0.9) * (0.5 if big else 1.0)
+    wi = r.uniform(0.1, 0.7) * (1.0 - wf)
+    wb = 1.0 - wf - wi
+    H = wf * np.fft.rfft(g / g.sum()) + wi * (1.0 - phi_i) / (1.0 - phi_i * w) + wb * (1.0 - phi_b) / (1.0 - phi_b * w)
+    q = np.fft.irfft(np.fft.rfft(u - ub) * H, M)[:n] + ub
+    q = np.maximum(q, 0.0) / ub
+
+    t = np.arange(n, dtype=np.float64)
+    lin = 1.0 + np.clip(r.normal(0.0, drift_sd), -1.8, 1.8) * (t / n - 0.5)
+    q = _yk_lu(r, *base) * lin * np.exp(r.uniform(*wander) * _yk_slow(r, n, P * _yk_lu(r, 3.0, 20.0))) + q
+
+    u_amp = r.random()
+    amp = _yk_lu(r, 0.001, 0.02) if u_amp < 1.0 - p_mid - p_strong else \
+        (_yk_lu(r, 0.02, 0.1) if u_amp < 1.0 - p_strong else _yk_lu(r, 0.1, 0.3))
+    ph = r.uniform(0.0, _YK_TWO_PI)
+    cyc = np.cos(_YK_TWO_PI * t / P + ph) + r.uniform(0.0, 0.5) * np.cos(2.0 * _YK_TWO_PI * t / P + r.uniform(0.0, _YK_TWO_PI))
+    q = q * (1.0 + amp * cyc / 1.5)
+    return q
+
+def _yk_gapfill(r, x, rate):
+    n = x.size
+    k = int(r.poisson(rate * n / 1000.0))
+    if k == 0 or n < 80:
+        return x
+    s = r.integers(1, n - 40, k)
+    ln = np.minimum(np.rint(np.exp(r.uniform(np.log(2.0), np.log(30.0), k))).astype(np.int64), n - 4 - s)
+    for a, w in zip(s.tolist(), ln.tolist()):
+        if w < 1:
+            continue
+        b = a + w
+        x[a:b] = x[a - 1] + (x[b] - x[a - 1]) * (np.arange(1, w + 1) / (w + 1.0))
+    return x
+
+def _yk_stuck(r, x):
+    n = x.size
+    w = int(_yk_lu(r, 16.0, 400.0))
+    if n < w + 160:
+        return x
+    a = int(r.integers(1, n - w - 64))
+    x[a:a + w] = x[a - 1]
+    return x
+
+def _yk_glitch(r, x, scale):
+    n = x.size
+    k = int(r.integers(1, 4))
+    at = r.integers(1, n - 1, k)
+    x[at] = x[at] + scale * r.choice(np.array([-1.0, 1.0]), k) * np.exp(r.uniform(np.log(0.5), np.log(2.5), k))
+    return x
+
+def _yk_quant(x, tick):
+    y = np.round(x / tick) * tick
+    if tick >= 1.0:
+        return y
+    dec = int(round(-np.log10(tick)))
+    return np.round(y, dec) if abs(10.0 ** -dec - tick) < 1e-12 else y
+
+def _yk_sig3(x):
+    ax = np.abs(x)
+    e = np.where(ax > 0, 10.0 ** (np.floor(np.log10(np.maximum(ax, 1e-300))) - 2.0), 1.0)
+    return np.round(x / e) * e
+
+def _yk_artefacts(r, x, tick, span):
+    x = _yk_gapfill(r, x, _yk_lu(r, 0.05, 3.0))
+    if r.random() < 0.10:
+        x = _yk_stuck(r, x)
+    if r.random() < 0.06:
+        x = _yk_glitch(r, x, span)
+    return x
+
+def _yk_sluice(r, n):
+    k = int(r.integers(1, 7))
+    at = r.integers(0, n, k)
+    size = r.choice(np.array([-1.0, 1.0]), k) * np.exp(r.uniform(np.log(0.03), np.log(0.4), k))
+    dur = np.exp(r.uniform(np.log(8.0), np.log(2000.0), k)).astype(np.int64)
+    rev = r.random(k) < 0.6
+    d = np.zeros(n + 1)
+    np.add.at(d, at, size)
+    np.add.at(d, np.where(rev, np.minimum(at + dur, n), n), np.where(rev, -size, 0.0))
+    return np.cumsum(d[:n])
+
+def _yk_stage(r, n, P):
+    q = _yk_river(r, n, P, _YK_BASE_ST, _YK_P_BIG)
+    hr = q ** r.uniform(0.25, 0.6)
+    t = np.arange(n, dtype=np.float64)
+    lo, hi = np.quantile(hr, [0.01, 0.99])
+    if hi <= lo:
+        hi = lo + 1.0
+    hn = (hr - lo) / (hi - lo)
+    if r.random() < _YK_P_SLUICE:
+        hn = hn + _yk_sluice(r, n)
+    if r.random() < 0.06:
+        hn = hn + r.uniform(0.05, 0.4) * np.cos(_YK_TWO_PI * t / (P * 12.4206 / 24.0) + r.uniform(0.0, _YK_TWO_PI)) \
+            * (1.0 + 0.3 * np.cos(_YK_TWO_PI * t / (P * 14.765) + r.uniform(0.0, _YK_TWO_PI)))
+    _, tick, (m_lo, m_hi), (a_lo, a_hi) = _YK_ST_STYLE[_yk_pick(r, _YK_ST_CUM)]
+    A = _yk_lu(r, a_lo, a_hi)
+    med = _yk_lu(r, m_lo, m_hi) if m_lo > 0 else r.uniform(m_lo, m_hi)
+    h = med + tick * A * (hn - np.median(hn))
+    if m_lo > 0 and h.min() < 0.0:
+        h = h - h.min() + tick * A * r.uniform(0.02, 0.3)
+    noise = r.standard_normal(n) * _yk_lu(r, *_YK_ST_NOISE)
+    if r.random() < 0.10:
+        phi = r.uniform(0.3, 0.9)
+        noise = noise + _yk_ar1(r.standard_normal(n) * np.sqrt(1.0 - phi * phi), phi) * _yk_lu(r, 0.5, 3.0)
+    h = h + tick * noise
+    h = _yk_artefacts(r, h, tick, tick * A)
+    y = _yk_quant(h, tick)
+    return y if float(np.ptp(y)) > 0.0 else _yk_quant(h, tick / 10.0)
+
+def _yk_flow(r, n, P):
+    _, rnd, (m_lo, m_hi) = _YK_FL_STYLE[_yk_pick(r, _YK_FL_CUM)]
+    if rnd > 0:
+        q = _yk_river(r, n, P, _YK_BASE_FL, _YK_P_BIG, 0.25, (0.03, 0.2), 0.15, 0.0, (0.4, 0.8), 4.0)
+    else:
+        q = _yk_river(r, n, P, _YK_BASE_FL3, _YK_P_BIG_FL, 0.15, (0.03, 0.15), 0.15, 0.0, (0.4, 0.8), 4.0)
+    if r.random() < 0.50:
+        beta = r.uniform(0.35, 0.7)
+        hr = q ** beta
+        st = (np.quantile(hr, 0.99) - np.quantile(hr, 0.01)) / _yk_lu(r, 20.0, 400.0)
+        if st > 0:
+            hr = hr + st * _yk_lu(r, 0.05, 0.6) * r.standard_normal(n)
+            q = np.maximum(np.round(hr / st) * st, 0.0) ** (1.0 / beta)
+    else:
+        q = q * np.exp(r.standard_normal(n) * _yk_lu(r, 0.001, 0.02))
+    if r.random() < _YK_P_NOISY_FL:
+        q = q * np.exp(r.standard_normal(n) * _yk_lu(r, 0.01, 0.08))
+    q = q * (_yk_lu(r, m_lo, m_hi) / max(float(np.median(q)), 1e-12))
+    if r.random() < 0.03:
+        q = np.maximum(q - np.quantile(q, r.uniform(0.2, 0.6)), 0.0)
+    lo, hi = np.quantile(q, [0.05, 0.95])
+    q = _yk_artefacts(r, q, rnd, float(hi - lo))
+    q = np.maximum(q, 0.0)
+    y = _yk_quant(q, rnd) if rnd > 0 else _yk_sig3(q)
+    return y if float(np.ptp(y)) > 0.0 else _yk_sig3(q)
+
+def _yk_rain(r, n, P):
+    wet = _yk_spells(r, n, P, _yk_lu(r, 1.5, 8.0), _yk_lu(r, 0.7, 4.0))
+    rate_w = _yk_lu(r, 1.2, 6.0)
+    rate_d = rate_w * r.uniform(0.0, 0.1)
+    lam_max = rate_w
+    N = int(r.poisson(lam_max * n / P))
+    t0 = r.integers(0, n, N)
+    keep = r.random(N) * lam_max < np.where(wet[t0], rate_w, rate_d)
+    t0 = t0[keep]
+    N = t0.size
+    D = np.maximum(np.rint(_yk_lu(r, 0.5, 4.0) * P / 24.0 * np.exp(0.8 * r.standard_normal(N))), 1.0).astype(np.int64)
+    inten = np.minimum(np.exp(r.uniform(1.2, 1.8) * r.standard_normal(N)), 30.0)
+    du = np.zeros(n + 1)
+    np.add.at(du, t0, inten)
+    np.add.at(du, np.minimum(t0 + D, n), -inten)
+    I = np.maximum(np.cumsum(du[:n]), 0.0)
+    phi = r.uniform(0.4, 0.9)
+    z = _yk_ar1(r.standard_normal(n) * np.sqrt(1.0 - phi * phi), phi)
+    I = I * np.exp(np.minimum(r.uniform(0.8, 1.4) * z, 3.0))
+    I = I * _yk_spells(r, n, 1, _yk_lu(r, 3.5, 12.0), _yk_lu(r, 1.2, 4.5))
+    k = _yk_pick(r, _YK_RAIN_TICK_CUM)
+    tick = float(_YK_RAIN_TICK[k])
+    I = I * tick * (_yk_lu(r, 2.0, 15.0) if tick < 0.05 else _yk_lu(r, 0.6, 3.0))
+    if r.random() < 0.8:
+        I = I + tick * (r.random(n) < _yk_lu(r, 0.05, 1.0) / P)
+    v = np.floor(I / tick + r.random(n)) * tick
+    v = np.round(v, 3)
+    if not np.any(v > 0):
+        v[int(r.integers(0, n))] = tick
+    return v
+
+def _yk_reg(r, n, P):
+    t = np.arange(n, dtype=np.float64)
+    clock = t * 24.0 / P + r.uniform(0.0, 24.0)
+    hod = clock % 24.0
+    day = np.floor(clock / 24.0).astype(np.int64)
+    nd = int(day.max()) + 1
+    s_h = r.uniform(6.0, 15.0)
+    w_h = r.uniform(3.0, 11.0)
+    win = np.clip(np.minimum(hod - s_h, s_h + w_h - hod) * (P / 24.0) + 0.5, 0.0, 1.0)
+    dow0 = int(r.integers(0, 7))
+    wk = np.where(((np.arange(nd) + dow0) % 7) >= 5, r.uniform(0.2, 1.0), 1.0)
+    rd = np.exp(r.uniform(0.15, 0.5) * r.standard_normal(nd)) * wk * (r.random(nd) >= r.uniform(0.0, 0.25))
+    rel = win * rd[day]
+    if r.random() < 0.85:
+        rel = rel / max(float(rel.sum()) / max(nd, 1), 1e-9)
+        net = r.choice(np.array([-1.0, 1.0])) * _yk_lu(r, 0.5, 5.0)
+        nseg = int(r.integers(1, 4))
+        cps = np.sort(r.integers(0, n, nseg - 1))
+        mult = np.exp(0.5 * r.standard_normal(nseg)) * np.where(r.random(nseg) < 0.2, -1.0, 1.0)
+        mult[0] = abs(mult[0])
+        seg = np.searchsorted(cps, t, side="right")
+        inflow = (1.0 + net * mult[seg]) / P * (1.0 + r.uniform(0.0, 0.4) * _yk_slow(r, n, P * 3.0))
+        lvl = np.cumsum(inflow - rel)
+        lvl = lvl + r.uniform(0.0, 0.05) * _yk_slow(r, n, max(P / 4.0, 2.0))
+        k = _yk_pick(r, _YK_REG_TICK_CUM)
+        tick = float(_YK_REG_TICK[k])
+        span = float(np.ptp(lvl)) if np.ptp(lvl) > 0 else 1.0
+        x = _yk_lu(r, 150.0, 1300.0) + (lvl - lvl[0]) * tick * _yk_lu(r, 80.0, 1500.0) / span
+        x = x + tick * _yk_lu(r, 0.1, 0.8) * r.standard_normal(n)
+        x = _yk_gapfill(r, x, _yk_lu(r, 0.1, 4.0))
+        return _yk_quant(x, tick)
+
+    G = _yk_lu(r, 5.0, 3.0e4)
+    x = G * (_yk_lu(r, 0.02, 0.3) + rel) * np.exp(r.standard_normal(n) * _yk_lu(r, 0.002, 0.03))
+    x = _yk_gapfill(r, x, _yk_lu(r, 0.1, 4.0))
+    return _yk_sig3(x) if r.random() < 0.6 else np.round(x, 1)
+
+_YK_BUILD = (_yk_stage, _yk_flow, _yk_rain, _yk_reg)
+
+def _yk_draw(r, L):
+    kind = _yk_pick(r, _YK_KIND_CUM)
+    n = _yk_len(r, L, kind)
+    P = int(_YK_CAD[kind][_yk_pick(r, _YK_CAD_CUM[kind])])
+    x = _YK_BUILD[kind](r, n, P)
+    return x, kind, n, P
+
+def _yk_hydro(r, L):
+    L = int(L)
+    if L < _YK_MIN_L:
+        return None
+    x, _, _, _ = _yk_draw(r, L)
+    x = np.asarray(x, dtype=np.float64)
+    if x.size < 2 or not bool(np.all(np.isfinite(x))) or float(np.ptp(x)) <= 0.0:
+        x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0) + np.round(np.abs(r.standard_normal(x.size)), 2)
+    return _yk_pad(x, L) + 0.0
+
+_YL_P_1MIN = 0.25
+_YL_STEP = ((1440, 60), (288, 12))
+
+_YL_LEN = (
+    ((0.658, 99999, 99999), (0.010, 320, 400), (0.004, 400, 500), (0.061, 500, 800), (0.150, 800, 960),
+     (0.029, 960, 1200), (0.029, 1200, 2000), (0.026, 2000, 3000), (0.032, 3000, 4160)),
+    ((0.375, 99999, 99999), (0.012, 320, 420), (0.363, 420, 486), (0.011, 486, 800), (0.070, 800, 1200),
+     (0.031, 1200, 2000), (0.070, 2000, 3000), (0.068, 3000, 4160)),
+)
+_YL_LEN_CUM = tuple(np.cumsum([b[0] for b in bands]) / sum(b[0] for b in bands) for bands in _YL_LEN)
+_YL_ACT = ((4.6, 1.85, 1.55), (3.65, 3.4, 1.6))
+_YL_ACT_LIM = (0.05, 2500.0)
+_YL_CAP = ((2.8, 2.6), 0.33, 0.42)
+_YL_CAP_MAX = 80
+_YL_ZONE = (0.05, 0.12)
+_YL_ZONE_ACT = ((3.0, 60.0), (0.2, 30.0))
+_YL_ZONE_CAP = (1.0, 12.0)
+_YL_ZONE_FILL = (0.0, 0.45)
+_YL_P_BIG = 0.01
+_YL_SDF = (0.10, 0.45)
+_YL_FILL = ((1.1, 1.6), (0.85, 1.5))
+_YL_K = (0.7, 60.0)
+_YL_TAU_MIN_H = (0.6, 2.5)
+_YL_TYPE_CUM = np.cumsum([0.32, 0.28, 0.22, 0.18])
+_YL_NIGHT = (0.45, 1.0)
+_YL_IMB = ((0.10, 0.45), (0.05, 0.20))
+_YL_XB = ((0.08, 0.55), 0.9, 300.0, (1.0, 1.0), (0.6, 0.25), (0.25, 0.8))
+
+_YL_REB_DAY = (0.1, 3.0)
+_YL_P_REB = 0.75
+_YL_REB_TRIG = (0.3, 0.7)
+_YL_DIP = (0.0003, 0.008)
+_YL_NOISY = (0.25, 0.0, 0.02, 0.10, 0.3, 3.0)
+
+_YL_P_DIP = 0.55
+_YL_DIP_LEN = (6.0, 2.5)
+_YL_DIP_DOWN = 0.6
+_YL_DIP_SIZE = (0.25, 0.8)
+_YL_FLICK = (0.01, 0.2)
+_YL_FLICK_FADE = 0.35
+_YL_P_STALE = 0.15
+_YL_STALE_H = (1.0, 30.0)
+_YL_WANDER = 0.18
+_YL_WANDER_D = (1.0, 6.0)
+
+def _yl_lu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+def _yl_ar1(e, phi):
+    y = np.array(e, dtype=np.float64)
+    if y.ndim == 1 and y.flags.c_contiguous:
+        _v2_ar1_fill(y, float(phi))
+        return y
+    n = y.size
+    k = 1
+    p = float(phi)
+    while k < n and abs(p) > 1e-12:
+        y[k:] = y[k:] + p * y[:-k]
+        p = p * p
+        k *= 2
+    return y
+
+def _yl_wall(v, tau):
+    pos = v > 0.0
+    if not pos.any():
+        return np.zeros(v.size, dtype=np.float64)
+    t = np.arange(v.size, dtype=np.float64) / tau
+    g = np.where(pos, np.log(np.where(pos, v, 1.0)) + t, -np.inf)
+    return np.exp(np.maximum.accumulate(g) - t)
+
+def _yl_len(r, L, cad):
+    cum = _YL_LEN_CUM[cad]
+    b = _YL_LEN[cad][min(int(np.searchsorted(cum, r.random(), side="right")), len(cum) - 1)]
+    if b[1] >= L:
+        return int(L)
+    return int(min(L, r.integers(b[1], b[2])))
+
+def _yl_gauss(h, c, w):
+    d = (h - c + 12.0) % 24.0 - 12.0
+    return np.exp(-0.5 * (d / w) ** 2)
+
+def _yl_profiles(r, per_day, kind):
+    h = np.arange(per_day, dtype=np.float64) * (24.0 / per_day)
+    u = r.random(12)
+    m_c, e_c = 7.0 + 2.0 * u[0], 16.5 + 2.5 * u[1]
+    night = _YL_NIGHT[0] + (_YL_NIGHT[1] - _YL_NIGHT[0]) * u[2]
+    nd = 1.0 / (1.0 + np.exp(-(np.abs((h - 3.5 + 12.0) % 24.0 - 12.0) - 3.5) / 0.8))
+    base = night + (1.0 - night) * nd
+    am = 0.3 + 1.5 * u[3]
+    pm = 0.3 + 1.5 * u[4]
+    wk = base * (1.0 + am * _yl_gauss(h, m_c, 1.0 + 0.6 * u[5]) + pm * _yl_gauss(h, e_c, 1.4 + 1.0 * u[6])
+                 + 0.4 * u[7] * _yl_gauss(h, 12.5, 2.5))
+    we = base * (1.0 + (0.5 + 1.0 * u[8]) * _yl_gauss(h, 14.0, 3.0 + 1.0 * u[9]))
+    wk = wk / _v2_meanm(wk)
+    we = we / _v2_meanm(we) * (0.6 + 0.7 * u[10])
+    lo, hi = _YL_IMB[0] if kind < 2 else _YL_IMB[1]
+    amp = (lo + (hi - lo) * u[11]) if kind < 3 else 0.0
+    sgn = -1.0 if kind == 0 else 1.0
+    s = sgn * (_yl_gauss(h, m_c, 1.3) - _yl_gauss(h, e_c, 1.8))
+    if kind == 2:
+        s = _yl_gauss(h, 11.0, 2.0) - _yl_gauss(h, 17.0, 2.0)
+    s = s - np.sum(s * wk) / np.sum(wk)
+    m = float(np.abs(s).max())
+    dk = amp * s / m if m > 0 else s
+    s = s - np.sum(s * we) / np.sum(we)
+    de = 0.5 * amp * s / m if m > 0 else s
+    return wk, np.clip(dk, -0.9, 0.9), we, np.clip(de, -0.9, 0.9)
+
+def _yl_bike_draw(r, L):
+    L = int(L)
+    u = r.random(16)
+    cad = 0 if u[0] < _YL_P_1MIN else 1
+    per_day, per_h = _YL_STEP[cad]
+    n = _yl_len(r, L, cad)
+    z = float(r.standard_normal())
+    c, s_lo, s_hi = _YL_ACT[cad]
+    ev_day = float(np.clip(np.exp(c + (s_lo if z < 0.0 else s_hi) * z), *_YL_ACT_LIM))
+    zone = u[12] < _YL_ZONE[cad]
+    noisy = (not zone) and u[11] < _YL_NOISY[cad] and z > _YL_NOISY[4]
+    if noisy:
+        ev_day = min(ev_day * _YL_NOISY[5], _YL_ACT_LIM[1])
+    if zone:
+        ev_day = _yl_lu(r, *_YL_ZONE_ACT[cad])
+        cap = int(round(_yl_lu(r, *_YL_ZONE_CAP)))
+    elif u[1] < _YL_P_BIG:
+        cap = int(r.integers(60, 201))
+    else:
+        cap = int(np.clip(round(np.exp(_YL_CAP[0][cad] + _YL_CAP[1] * z + _YL_CAP[2] * r.standard_normal())), 1, _YL_CAP_MAX))
+    kind = 3 if zone else min(int(np.searchsorted(_YL_TYPE_CUM, u[2], side="right")), 3)
+    wk, dk, we, de = _yl_profiles(r, per_day, kind)
+
+    a = np.arange(n, dtype=np.int64) + int(u[3] * per_day) - (n - 1) + 7 * per_day * 4
+    sod = a % per_day
+    weekend = ((a // per_day + int(7 * u[4])) % 7) >= 5
+    act = np.where(weekend, we[sod], wk[sod])
+    imb = np.where(weekend, de[sod], dk[sod])
+    nd = n // per_day + 2
+    dayf = np.exp(0.25 * r.standard_normal(nd) * u[5])
+    lam = (ev_day / per_day) * act * dayf[(a // per_day) - (a[0] // per_day)]
+    A = r.poisson(lam * (0.5 + 0.5 * imb)).astype(np.float64)
+    D = r.poisson(lam * (0.5 - 0.5 * imb)).astype(np.float64)
+    xm = (r.uniform(*_YL_XB[0]) + _YL_XB[1] * r.random() * min(1.0, ev_day / _YL_XB[2])) * _YL_XB[3][cad]
+    pb = 1.0 / (1.0 + xm)
+    for M in (A, D):
+        i = np.flatnonzero(M > 0)
+        if i.size:
+            e = r.geometric(pb, i.size) - 1.0
+            sp = np.minimum(r.binomial(e.astype(np.int64), _YL_XB[4][cad]), e)
+            M[i] += e - sp
+            j = i + r.geometric(_YL_XB[5][cad], i.size)
+            k = j < n
+            np.add.at(M, j[k], sp[k])
+    inc = A - D
+
+    s2 = 1.0 + 2.0 * xm * (1.0 + xm) / max(pb, 1e-3) * 0.5
+    sdf = _yl_lu(r, *_YL_SDF) * cap
+    K = float(np.clip(2.0 * sdf * sdf / s2, *_YL_K))
+    tau = float(np.clip(K / max(float(_v2_meanm(lam)), 1e-9), per_h * _yl_lu(r, *_YL_TAU_MIN_H), 14.0 * per_day))
+    phi = float(np.exp(-1.0 / tau))
+    sd0 = float(np.sqrt(max(float(_v2_meanm(lam)), 1e-9) * s2 * 0.5 * tau))
+    inc[0] += r.standard_normal() * min(sd0, 0.6 * cap)
+    y = _yl_ar1(inc, phi)
+    fill = r.uniform(*_YL_ZONE_FILL) if zone else r.beta(*_YL_FILL[cad]) * cap
+
+    nh = n // per_h + 3
+    pw = float(np.exp(-1.0 / (_yl_lu(r, *_YL_WANDER_D) * 24.0)))
+    wh = _yl_ar1(r.standard_normal(nh) * np.sqrt(1.0 - pw * pw), pw)
+    wh[0] = r.standard_normal()
+    w = np.interp(np.arange(n, dtype=np.float64) / per_h, np.arange(nh, dtype=np.float64), wh) * (cap * _YL_WANDER * u[7])
+    lvl = fill + w + y
+
+    lvl = lvl + _yl_wall(-0.45 - lvl, tau) - _yl_wall(lvl - (cap + 0.45), tau)
+
+    if u[8] < _YL_P_REB and not zone:
+        k = int(min(r.poisson(_yl_lu(r, *_YL_REB_DAY) * n / per_day), 40))
+        if k > 0:
+            ts = np.sort(r.integers(1, n, k))
+            jm = np.zeros(n, dtype=np.float64)
+            tj, aj = [], []
+            for t in ts.tolist():
+                s = float(lvl[t]) + sum(ja * phi ** (t - tt) for tt, ja in zip(tj, aj))
+                if s < _YL_REB_TRIG[0] * cap:
+                    tgt = cap * r.uniform(0.4, 0.95)
+                elif s > _YL_REB_TRIG[1] * cap:
+                    tgt = cap * r.uniform(0.05, 0.6)
+                else:
+                    continue
+                j = float(np.round(tgt - s))
+                tj.append(t)
+                aj.append(j)
+                jm[t] += j
+            if tj:
+                lvl = lvl + _yl_ar1(jm, phi)
+    x = np.clip(np.round(lvl), 0.0, float(cap))
+
+    if noisy or u[9] < _YL_P_DIP:
+        g = _yl_lu(r, *_YL_NOISY[2:4]) if noisy else _yl_lu(r, *_YL_DIP)
+        k = int(min(r.poisson(g * ev_day * n / per_day), 600))
+        if k > 0:
+            s = r.integers(0, n, k)
+            e = np.minimum(s + r.geometric(1.0 / (1.0 + _YL_DIP_LEN[cad] * r.random()), k), n)
+            off = np.zeros(n + 1, dtype=np.float64)
+            dn = r.random(k) < _YL_DIP_DOWN
+            fr = r.uniform(*_YL_DIP_SIZE, k)
+            g = np.floor(np.where(dn, -fr * x[s], fr * (cap - x[s])) + r.random(k))
+            np.add.at(off, s, g)
+            np.add.at(off, e, -g)
+            x = np.clip(x + np.cumsum(off)[:n], 0.0, float(cap))
+
+    mr = float(_v2_mean(np.diff(x) != 0)) if n > 1 else 0.0
+    fl = _yl_lu(r, *_YL_FLICK) * mr * max(0.1, 1.0 - mr / _YL_FLICK_FADE)
+    if fl > 0:
+        i = np.flatnonzero(r.random(n) < fl)
+        if i.size:
+            x[i] = np.clip(x[i] + np.where(r.random(i.size) < 0.5, -1.0, 1.0), 0.0, float(cap))
+
+    if u[10] < _YL_P_STALE:
+        for _ in range(1 + int(r.poisson(0.7))):
+            m = int(_yl_lu(r, *_YL_STALE_H) * per_h)
+            if m < n // 2:
+                s = int(r.integers(1, n - m))
+                x[s:s + m] = x[s - 1]
+    if float(x.max()) <= float(x.min()):
+        s = int(r.integers(1, n))
+        x[s:] = x[s:] + (1.0 if x[0] < cap else -1.0)
+    return x, cad
+
+def _yl_bike(r, L):
+    L = int(L)
+    if L < 256:
+        return None
+    x, _ = _yl_bike_draw(r, L)
+    n = x.size
+    if n > L:
+        x = x[n - L:]
+        n = L
+    out = np.empty(L, dtype=np.float64)
+    out[:L - n] = x[0]
+    out[L - n:] = x
+    return out
+
+_YM_MIN_N = 320
+_YM_MADRID = 0.20
+_YM_TYPE_CUM_P = np.cumsum([0.18, 0.17, 0.65, 0.00])
+_YM_TYPE_CUM_M = np.cumsum([0.04, 0.36, 0.38, 0.22])
+_YM_UNIT_CUM_P = np.cumsum([0.50, 0.08, 0.32, 0.10])
+_YM_UNIT_CUM_M = np.cumsum([0.46, 0.12, 0.24, 0.18])
+_YM_MAX_STEP = 150.0
+
+def _ym_lu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+def _ym_pick(r, cum):
+    return min(int(np.searchsorted(cum, r.random() * cum[-1], side="right")), cum.size - 1)
+
+def _ym_target(r, nd, K, sig, dsd, jrate, jlo, jhi, pshift):
+    ns = nd * K
+    phi = float(np.exp(-1.0 / (r.uniform(8.0, 40.0) * K)))
+    e = r.standard_normal(ns) * (dsd / K * np.sqrt(1.0 - phi * phi))
+    v = np.empty(ns)
+    a = float(r.standard_normal() * dsd / K)
+    for i in range(ns):
+        a = phi * a + e[i]
+        v[i] = a
+    v += (sig / np.sqrt(K)) * r.standard_normal(ns)
+    if jrate > 0.0:
+        k = int(r.poisson(jrate * nd))
+        if k > 0:
+            np.add.at(v, r.integers(0, ns, k), np.where(r.random(k) < 0.5, -1.0, 1.0)
+                      * np.exp(r.uniform(np.log(jlo), np.log(jhi), k)))
+    rho = 1.0 - 1.0 / (r.uniform(20.0, 60.0) * K)
+    w = np.empty(ns)
+    a = 0.0
+    for i in range(ns):
+        a = rho * a + v[i]
+        w[i] = a
+    if r.random() < pshift:
+        w[int(r.integers(1, max(ns, 2))):] += (1.0 if r.random() < 0.5 else -1.0) * r.uniform(30.0, 100.0)
+    return w - w[0] + r.normal(0.0, 3.0)
+
+def _ym_times(r, nd, Pd, phases, jit, rate, dayf, bern=False):
+    lam = np.minimum(rate * dayf, 60.0)
+    k = (r.random(nd) < lam).astype(np.int64) if bern else r.poisson(lam)
+    tot = int(k.sum())
+    if tot == 0:
+        return np.zeros(0)
+    day = np.repeat(np.arange(nd, dtype=np.float64), k)
+    if jit is None:
+        ph = r.uniform(0.0, Pd, tot)
+    else:
+        ph = np.asarray(phases)[r.integers(0, len(phases), tot)] + r.normal(0.0, jit, tot)
+    return np.sort(day * Pd + ph)
+
+def _ym_quant(r, a, d, unit):
+    v = a + d
+    if unit == 0:
+        new = a + 10.0 * np.round(d / 10.0)
+    elif unit == 1:
+        new = a + 5.0 * np.round(d / 5.0)
+    elif unit == 2:
+        b = np.floor(v / 10.0) * 10.0
+        c = np.array((b - 1.0, b + 5.0, b + 9.0))
+        new = float(c[int(np.argmin(np.abs(c - v)))])
+    elif r.random() < 0.5:
+        new = np.round((v - 9.0) / 10.0) * 10.0 + 9.0
+    else:
+        new = float(np.round(v))
+    s = float(new - a)
+    return s if abs(s) >= 1.0 else 0.0
+
+def _ym_base(r, times, slot, w, band, unit, p0, cap):
+    nt = times.size
+    idx = np.zeros(2 * nt, dtype=np.int64)
+    stp = np.zeros(2 * nt)
+    pre = 0.15 if unit >= 2 else 0.0
+    cur = 0.0
+    m = 0
+    sl = np.minimum((times / slot).astype(np.int64), w.size - 1)
+    for j in range(nt):
+        d = w[sl[j]] - cur
+        if abs(d) < band:
+            continue
+        s = _ym_quant(r, p0 + cur, min(max(d, -cap), cap), unit)
+        if s == 0.0:
+            continue
+        cur += s
+        if abs(s) >= 10.0 and r.random() < pre:
+            e = (1.0, 2.0, 4.0)[int(r.integers(0, 3))] * (1.0 if s > 0 else -1.0)
+            idx[m], stp[m] = int(times[j]), e
+            idx[m + 1], stp[m + 1] = int(times[j] + _ym_lu(r, 10.0, 300.0)), s - e
+            m += 2
+            continue
+        idx[m] = int(times[j])
+        stp[m] = s
+        m += 1
+    return idx[:m], stp[:m]
+
+def _ym_station(r, n, madrid, typ):
+    Pd = r.uniform(94.0, 95.0)
+    nd = int((n + 2) / Pd) + 3
+    m = int(nd * Pd)
+    off = r.uniform(0.0, Pd)
+    dow = (np.arange(nd) + int(r.integers(0, 7))) % 7
+    dayf = np.where(dow == 5, r.uniform(0.6, 1.0), np.where(dow == 6, r.uniform(0.3, 0.75), 1.0))
+    level = r.normal(1.80, 0.10) if madrid else r.normal(1.92, 0.10)
+    p0 = float(np.round(min(max(level, 1.40), 2.30) / 0.001))
+    u = r.random()
+    if u < 0.72:
+        p0 += 9.0 - p0 % 10.0
+    elif u < 0.80:
+        p0 += 5.0 - p0 % 10.0
+    unit = _ym_pick(r, _YM_UNIT_CUM_M if madrid else _YM_UNIT_CUM_P)
+    ph = r.uniform(0.0, Pd)
+    phases = (ph, (ph + Pd * r.uniform(0.45, 0.55)) % Pd) if r.random() < 0.25 else (ph,)
+    K, cap, jr, jlo, jhi, bern = 1, _YM_MAX_STEP, 0.0, 1.0, 1.0, False
+    sched = typ == 0 or (typ == 1 and not madrid and r.random() < 0.6)
+    if sched:
+        sig, dsd = (_ym_lu(r, 8.0, 18.0), r.uniform(2.0, 8.0)) if madrid else (_ym_lu(r, 4.0, 11.0), r.uniform(3.0, 9.0))
+        rate, band, jit, phases, bern = r.uniform(0.85, 1.0), r.uniform(2.5, 5.0), r.uniform(0.0, 0.6), (ph,), True
+    else:
+
+        if madrid and typ in (1, 3):
+            S, T, K, rate, jit = _ym_lu(r, 6.0, 20.0), _ym_lu(r, 0.3, 0.8), 4, _ym_lu(r, 1.5, 5.0), None
+            jr, jlo, jhi, cap = r.uniform(0.0, 0.3), 20.0, 120.0, _ym_lu(r, 20.0, 70.0)
+        elif madrid:
+            S, T, K, rate = _ym_lu(r, 20.0, 60.0), _ym_lu(r, 0.5, 2.0), 4, _ym_lu(r, 2.0, 6.0)
+            jit = None if r.random() < 0.85 else r.uniform(10.0, 30.0)
+            jr, jlo, jhi, cap = _ym_lu(r, 0.1, 0.6), 30.0, 150.0, _ym_lu(r, 40.0, 120.0)
+        elif typ == 1:
+            S, T, rate, jit = _ym_lu(r, 8.0, 30.0), _ym_lu(r, 1.0, 4.0), _ym_lu(r, 1.0, 3.0), _ym_lu(r, 1.5, 25.0)
+        else:
+            S, T, rate, jit = _ym_lu(r, 8.0, 40.0), _ym_lu(r, 1.0, 6.0), _ym_lu(r, 1.0, 3.0), _ym_lu(r, 1.5, 25.0)
+        sig = min(0.75 * S / np.sqrt(T), 30.0 if madrid else 16.0)
+        dsd = min((r.uniform(0.0, 0.3) if madrid else r.uniform(0.4, 1.2)) * S / T, 10.0 if madrid else 7.0)
+        band = r.uniform(0.6, 0.9) * S
+    w = _ym_target(r, nd, K, sig, dsd, jr, jlo, jhi, 0.15 if madrid else 0.1)
+    times = _ym_times(r, nd, Pd, phases, jit, rate, dayf, bern) - off
+    times = times[(times >= 1.0) & (times < m)]
+    idx, stp = _ym_base(r, times + off, Pd / K, w, band, unit, p0, cap)
+    idx = idx - int(off)
+    inc = np.zeros(m + 64)
+    ok = (idx >= 1) & (idx < m)
+    np.add.at(inc, idx[ok], stp[ok])
+    if typ == 1 and not madrid:
+        amp = (10.0, 10.0, 10.0, 10.0, 10.0, 20.0, 20.0, 5.0)[int(r.integers(0, 8))] * (1.0 if r.random() < 0.5 else -1.0)
+        D0 = 12.0 if r.random() < 0.35 else _ym_lu(r, 8.0, 45.0)
+        px = r.uniform(0.6, 1.0)
+        p1 = r.uniform(0.0, Pd)
+        slots = [(p1, px)]
+        if r.random() < 0.45:
+            slots.append(((p1 + r.uniform(0.3, 0.7) * Pd) % Pd, px * r.uniform(0.3, 1.0)))
+        xj = r.uniform(2.0, 20.0)
+        for pk_ph, pk in slots:
+            st = _ym_times(r, nd, Pd, (pk_ph,), xj, pk, dayf, True) - off
+            st = st[(st >= 1.0) & (st < m)].astype(np.int64)
+            if st.size == 0:
+                continue
+            dur = np.maximum(np.round(D0 + r.normal(0.0, 1.0, st.size)), 2.0).astype(np.int64)
+            sg = np.where(r.random(st.size) < 0.1, -amp, amp)
+            np.add.at(inc, st, sg)
+            np.add.at(inc, np.minimum(st + dur, m + 63), -sg)
+    elif typ == 3:
+        amp = (5.0, 10.0, 10.0, 10.0, 10.0, 20.0)[int(r.integers(0, 6))] * (1.0 if r.random() < 0.5 else -1.0)
+        cyc = _ym_lu(r, 30.0, 80.0)
+        h = cyc * r.uniform(0.1, 0.5)
+        k = int(2 * m / cyc) + 8
+        g = np.empty(2 * k)
+        g[0::2] = r.geometric(1.0 / (cyc - h), k)
+        g[1::2] = r.geometric(1.0 / h, k)
+        sw = np.cumsum(g).astype(np.int64)
+        sw = sw[sw < m]
+        np.add.at(inc, sw, np.where(np.arange(sw.size) % 2 == 0, amp, -amp))
+    x = p0 + np.cumsum(inc[:m])
+    return np.maximum(x[m - n:], 400.0)
+
+def _ym_draw(r, L):
+    madrid = r.random() < _YM_MADRID
+    if madrid:
+        typ = _ym_pick(r, _YM_TYPE_CUM_M)
+        n = 828 if r.random() < 0.9 else L
+    else:
+        typ = _ym_pick(r, _YM_TYPE_CUM_P)
+        n = int(r.uniform(560.0, 1300.0)) if r.random() < 0.7 else int(r.uniform(1300.0, max(L, 1301)))
+    n = max(min(n, L), min(_YM_MIN_N, L))
+    y = np.round(_ym_station(r, n, madrid, typ))
+    if float(np.ptp(y)) == 0.0:
+        y[int(r.integers(1, n)):] += 10.0 * (1.0 if r.random() < 0.5 else -1.0)
+    return y, madrid
+
+def _ym_fuel(r, L):
+    L = int(L)
+    if L < 256:
+        return None
+    y, _ = _ym_draw(r, L)
+    n = y.size
+    out = np.empty(L, dtype=np.float64)
+    out[:L - n] = y[0]
+    out[L - n:] = y
+    return out * 0.001
+
+_YN_KIND_CUM = np.cumsum([0.62, 0.16, 0.22])
+_YN_MIN_N = 320
+_YN_TWO_PI = 2.0 * np.pi
+
+def _yn_lu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+def _yn_ar1(e, phi):
+    y = np.array(e, dtype=np.float64)
+    if y.ndim == 1 and y.flags.c_contiguous:
+        _v2_ar1_fill(y, float(phi))
+        return y
+    n = y.size
+    k = 1
+    p = float(phi)
+    while k < n and abs(p) > 1e-12:
+        y[k:] = y[k:] + p * y[:-k]
+        p = p * p
+        k *= 2
+    return y
+
+def _yn_ou(r, n, tau, sd):
+    phi = float(np.exp(-1.0 / max(tau, 0.2)))
+    e = r.standard_normal(n) * (sd * np.sqrt(max(1.0 - phi * phi, 1e-9)))
+    e[0] = r.standard_normal() * sd
+    return _yn_ar1(e, phi)
+
+def _yn_t(r, n, df):
+    return r.standard_t(df, n) * np.sqrt((df - 2.0) / df)
+
+def _yn_ffill(r, x, p):
+    if p <= 0.0:
+        return x
+    keep = r.random(x.size) >= p
+    keep[0] = True
+    idx = np.maximum.accumulate(np.where(keep, np.arange(x.size), 0))
+    return x[idx]
+
+def _yn_tick(r, lvl, lo, hi):
+    d = int(np.round(r.uniform(lo, hi) - np.log10(lvl)))
+    u = r.random()
+    return (1.0 if u < 0.92 else (2.0 if u < 0.96 else 5.0)) * 10.0 ** (-d)
+
+def _yn_token(r, n, small):
+    u = r.random()
+    P, dt = (24, 1.0) if u < 0.8 else ((96, 0.25) if u < 0.9 else (60, 1.0 / 60.0))
+    if small:
+        lvl = 10.0 ** r.uniform(-3.3, -1.9)
+        sig = _yn_lu(r, 0.0055, 0.03) * np.sqrt(dt)
+    else:
+        lvl = 10.0 ** (r.uniform(-6.3, -4.6) if r.random() < 0.75 else r.uniform(-4.6, -3.3))
+        sig = _yn_lu(r, 0.0055, 0.0125) * np.sqrt(dt)
+    t = np.arange(n, dtype=np.float64)
+
+    if small:
+        h = _yn_ou(r, n, _yn_lu(r, 3.0, 20.0), r.uniform(0.35, 0.7))
+    else:
+        h = _yn_ou(r, n, _yn_lu(r, 2.0, 10.0), r.uniform(0.25, 0.5))
+    h += _yn_ou(r, n, _yn_lu(r, 50.0, 500.0), r.uniform(0.03, 0.2))
+    h += r.uniform(0.2, 0.6) * np.cos(_YN_TWO_PI * (t + r.uniform(0.0, P)) / P)
+    k = int(min(r.poisson(n * _yn_lu(r, 0.0003, 0.002)), 40))
+    if k > 0:
+        imp = np.zeros(n)
+        np.add.at(imp, r.integers(0, n, k), r.uniform(0.4, 1.2, k))
+        h += _yn_ar1(imp, float(np.exp(-1.0 / _yn_lu(r, 2.0, 24.0))))
+    if r.random() < 0.2:
+        h[int(r.integers(n // 8, n)):] += r.uniform(-0.5, 0.5)
+    vol = sig * np.exp(h - np.log(_v2_mean(np.exp(h))))
+    e = vol * _yn_t(r, n, r.uniform(3.0, 8.0) if small else r.uniform(5.0, 15.0))
+    k = int(min(r.poisson(n * (_yn_lu(r, 0.0003, 0.006) if small else _yn_lu(r, 0.0001, 0.0015))), 40))
+    if k > 0:
+        np.add.at(e, r.integers(0, n, k), np.where(r.random(k) < 0.5, -1.0, 1.0) * sig * r.uniform(4.0, 9.0, k))
+    if r.random() < (0.15 if small else 0.7):
+        y = _yn_ar1(e, float(np.exp(-1.0 / (n * _yn_lu(r, 0.12, 2.0)))))
+    else:
+        y = np.cumsum(e)
+    y += np.linspace(0.0, r.normal(0.0, 0.5 if small else 0.3) * sig * np.sqrt(n), n)
+    if r.random() < (0.4 if small else 0.3):
+        for _ in range(int(r.integers(1, 3))):
+            t0 = int(r.integers(0, n))
+            a = (1.0 if r.random() < 0.5 else -1.0) * _yn_lu(r, 0.03, 0.4 if small else 0.2)
+            seg = t[t0:] - t0
+            y[t0:] += a * -np.expm1(-seg / _yn_lu(r, 0.7, 6.0)) * np.exp(-seg / _yn_lu(r, 6.0, 200.0))
+            vol[t0:] *= 1.0 + 1.5 * np.exp(-seg / 12.0)
+    kap = 0.0 if r.random() < 0.3 else r.uniform(0.05, 0.45)
+    lp = y + kap * vol * r.standard_normal(n)
+    x = lvl * np.exp(lp - np.median(lp))
+    p_st = (_yn_lu(r, 0.005, 0.45) if r.random() < 0.5 else 0.0) if small else (_yn_lu(r, 0.003, 0.06) if r.random() < 0.4 else 0.0)
+    x = _yn_ffill(r, x, p_st)
+    tick = _yn_tick(r, lvl, 2.8, 3.6) if small else _yn_tick(r, lvl, 3.0, 3.7)
+    return np.maximum(np.round(x / tick), 1.0) * tick
+
+def _yn_fx(r, n):
+    lvl = 10.0 ** r.uniform(-4.3, -1.7)
+    sig = _yn_lu(r, 0.0027, 0.006)
+    h = _yn_ou(r, n, _yn_lu(r, 2.0, 15.0), r.uniform(0.2, 0.45)) + _yn_ou(r, n, _yn_lu(r, 50.0, 400.0), r.uniform(0.03, 0.15))
+    vol = sig * np.exp(h - np.log(_v2_mean(np.exp(h))))
+    e = vol * _yn_t(r, n, r.uniform(6.0, 20.0))
+    k = int(min(r.poisson(n * _yn_lu(r, 0.00005, 0.001)), 10))
+    if k > 0:
+        np.add.at(e, r.integers(0, n, k), np.where(r.random(k) < 0.5, -1.0, 1.0) * sig * r.uniform(3.0, 7.0, k))
+    w = r.uniform(0.4, 0.95)
+    y = np.sqrt(w) * np.cumsum(e) + np.sqrt(1.0 - w) * _yn_ar1(e, float(np.exp(-1.0 / _yn_lu(r, 60.0, 800.0))))
+    y += np.linspace(0.0, r.normal(0.0, 0.3) * sig * np.sqrt(n), n)
+    x = lvl * np.exp(y - np.median(y))
+    x = _yn_ffill(r, x, r.uniform(0.0, 0.03))
+    tick = _yn_tick(r, lvl, 1.8, 2.2) if r.random() < 0.33 else _yn_tick(r, lvl, 2.9, 3.9)
+    return np.maximum(np.round(x / tick), 1.0) * tick
+
+def _yn_micro(r, L):
+    L = int(L)
+    if L < 256:
+        return None
+    kind = min(int(np.searchsorted(_YN_KIND_CUM, r.random() * _YN_KIND_CUM[-1], side="right")), 2)
+    lo = min(_YN_MIN_N, L)
+    if kind < 2:
+        u = r.random()
+        n = int(_yn_lu(r, lo, max(lo, min(700.0, L)))) if u < 0.12 else (
+            int(_yn_lu(r, min(700.0, L), min(1500.0, L))) if u < 0.9 else int(r.uniform(min(1500.0, L), L + 1)))
+        y = _yn_token(r, max(n, 2), kind == 1)
+    else:
+        n = int(r.uniform(min(500.0, L), min(900.0, L))) if r.random() < 0.25 else int(r.uniform(min(2300.0, L), min(2800.0, L)))
+        y = _yn_fx(r, max(n, 2))
+    n = min(max(n, 2), L, y.size)
+    y = y[y.size - n:]
+    out = np.empty(L, dtype=np.float64)
+    out[:L - n] = y[0]
+    out[L - n:] = y
+    if float(np.ptp(out)) == 0.0:
+        tk = float(np.min(np.abs(out))) * 1e-3
+        out[L - 1] += tk if tk > 0 else 1e-9
+    return out
+
+_YO_TWO_PI = 2.0 * np.pi
+_YO_KIND_CUM = np.cumsum([0.40, 0.20, 0.40])
+_YO_CAD_CUM = np.cumsum([0.85, 0.10, 0.05])
+_YO_CAD_HP = (24, 12, 6)
+_YO_MIN_N = 320
+_YO_SAT = 999.9
+
+def _yo_lu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+def _yo_pick(r, cum):
+    return min(int(np.searchsorted(cum, r.random() * cum[-1], side="right")), cum.size - 1)
+
+def _yo_ar1(e, phi):
+    y = np.array(e, dtype=np.float64)
+    if y.ndim == 1 and y.flags.c_contiguous:
+        _v2_ar1_fill(y, float(phi))
+        return y
+    n = y.size
+    k = 1
+    p = float(phi)
+    while k < n and abs(p) > 1e-12:
+        y[k:] = y[k:] + p * y[:-k]
+        p = p * p
+        k *= 2
+    return y
+
+def _yo_ou(r, n, tau, sd):
+    phi = float(np.exp(-1.0 / max(tau, 0.2)))
+    e = r.standard_normal(n) * (sd * np.sqrt(max(1.0 - phi * phi, 1e-9)))
+    e[0] = r.standard_normal() * sd
+    return _yo_ar1(e, phi)
+
+def _yo_smooth(r, n, tau, sd):
+    phi = float(np.exp(-2.0 / max(tau, 0.4)))
+    nb = int(3.0 * tau) + 8
+    y = _yo_ar1(_yo_ar1(r.standard_normal(n + nb), phi), phi)[nb:]
+    s = float(_v2_std(y))
+    return y * (sd / s) if s > 0 else y
+
+def _yo_window(a, b, soft):
+    hh = np.arange(24, dtype=np.float64) + 0.5
+    w = (((hh - a) % 24.0) < ((b - a) % 24.0)).astype(np.float64)
+    k = max(int(round(soft)), 1)
+    for _ in range(k):
+        w = 0.5 * w + 0.25 * (np.roll(w, 1) + np.roll(w, -1))
+    return w
+
+def _yo_bump(lo, rise):
+    x = (np.arange(24, dtype=np.float64) + 0.5 - lo) % 24.0
+    return np.where(x < rise, -np.cos(np.pi * x / rise), np.cos(np.pi * (x - rise) / (24.0 - rise)))
+
+def _yo_quant(r, x, q, p_odd):
+    y = np.round(x / q) * q
+    if p_odd > 0.0:
+        m = r.random(x.size) < p_odd
+        d = 2.0 if r.random() < 0.5 else 3.0
+        y[m] = np.round(np.round(x[m] * d / q) * q / d, 2)
+    return y
+
+def _yo_nox(r, n, h0, d0, mean, smooth):
+    t = np.arange(n, dtype=np.int64) + h0
+    h = t % 24
+    day = t // 24
+    nd = int(day[-1]) + 2
+    nid = (t + 12) // 24
+    hh = np.arange(24, dtype=np.float64) + 0.5
+    hm, he = r.uniform(6.0, 8.5), r.uniform(16.0, 19.5)
+    tr = (r.uniform(0.15, 0.5) + np.exp(-0.5 * ((hh - hm) / r.uniform(0.8, 1.8)) ** 2)
+          + r.uniform(0.4, 1.1) * np.exp(-0.5 * ((hh - he) / r.uniform(1.2, 2.8)) ** 2))
+    wk = np.ones(7)
+    wk[5] = r.uniform(0.55, 0.95)
+    wk[6] = wk[5] * r.uniform(0.55, 0.95)
+    win = _yo_window(r.uniform(16.5, 19.5), r.uniform(7.5, 10.5), r.uniform(1.0, 3.0))
+    dayx = 1.0 - r.uniform(0.3, 0.8) * (1.0 - win)
+    dd = (hh - r.uniform(12.0, 15.5) + 12.0) % 24.0 - 12.0
+    trough = np.exp(-0.5 * (dd / r.uniform(2.5, 4.5)) ** 2)
+    calm = 1.0 / (1.0 + np.exp(-(r.uniform(-1.2, 1.2) + _yo_ou(r, nd + 1, _yo_lu(r, 0.3, 1.2), r.uniform(1.0, 2.0)))))
+    lx = np.log(tr * dayx)[h] + np.log(wk)[(day + d0) % 7] + r.uniform(0.5, 1.4) * calm[nid] * win[h]
+    lx -= (r.uniform(1.0, 3.0) * np.exp(r.normal(0.0, 0.8, nd)))[day] * trough[h]
+    lx += _yo_ou(r, nd, _yo_lu(r, 0.2, 0.7), r.uniform(0.3, 0.7))[day]
+    lx += _yo_ou(r, n, r.uniform(1.0, 3.0), r.uniform(0.05, 0.2) if smooth else r.uniform(0.4, 0.75))
+    ns = r.random(n) < (0.0 if smooth else _yo_lu(r, 0.008, 0.08))
+    lx += ns * r.uniform(0.5, 1.5, n)
+    x = np.exp(np.minimum(lx - lx.max(), 0.0))
+    x *= mean / max(float(_v2_meanm(x)), 1e-12)
+    return (40.0 * mean) * np.tanh(x / (40.0 * mean)), h, day
+
+def _yo_start(r):
+    return int(r.integers(12, 18)) if r.random() < 0.5 else int(r.integers(0, 24))
+
+def _yo_o3(r, n):
+    h0, d0 = _yo_start(r), int(r.integers(0, 7))
+    no, h, day = _yo_nox(r, n, h0, d0, _yo_lu(r, 1.2, 10.0), True)
+    nd = int(day[-1]) + 2
+    hx = np.arange(24, dtype=np.float64) + 0.5
+    pk = r.uniform(13.0, 16.5)
+    dd = (hx - pk + 12.0) % 24.0 - 12.0
+    G = np.exp(-0.5 * (dd / np.where(dd < 0.0, r.uniform(3.0, 5.5), r.uniform(2.5, 4.5))) ** 2)
+    ri = r.uniform(12.0, 17.0)
+    w = r.uniform(0.2, 0.8)
+    S = w * (G - _v2_meanm(G)) / float(np.ptp(G)) + (1.0 - w) * 0.5 * _yo_bump(pk - ri, ri)
+    S = (S - _v2_meanm(S)) / float(np.ptp(S))
+    a_d = np.maximum(1.0 + _yo_ou(r, nd, _yo_lu(r, 1.0, 4.0), r.uniform(0.2, 0.4)), 0.1)
+    td = (np.arange(n, dtype=np.float64) + h0) / 24.0
+    rel = r.uniform(0.3, 0.7) * a_d[day] * S[h]
+    rel += _yo_smooth(r, n, _yo_lu(r, 5.0, 16.0), r.uniform(0.22, 0.4))
+    rel += np.interp(td, np.arange(nd + 1, dtype=np.float64), _yo_ou(r, nd + 1, _yo_lu(r, 8.0, 40.0), r.uniform(0.005, 0.04)))
+    rel += _yo_ou(r, n, r.uniform(0.7, 2.0), r.uniform(0.005, 0.025))
+    x = np.maximum(1.0 + rel, 0.03) / (1.0 + (no / r.uniform(5.0, 14.0)) ** r.uniform(2.2, 4.0))
+    x *= float(np.exp(min(max(r.normal(np.log(47.0), 0.15), np.log(18.0)), np.log(95.0)))) / float(_v2_mean(x))
+    x = np.maximum(x, r.uniform(0.3, 2.5))
+    u = r.random()
+    q = 0.5 if u < 0.65 else (1.0 if u < 0.9 else 0.1)
+    return _yo_quant(r, x, q, r.uniform(0.0, 0.03) if q == 0.5 else 0.0)
+
+def _yo_no(r, n):
+    h0, d0 = _yo_start(r), int(r.integers(0, 7))
+    x, _, _ = _yo_nox(r, n, h0, d0, _yo_lu(r, 0.8, 12.0), False)
+    if r.random() < 0.15:
+        x = np.maximum(x, 0.5 if r.random() < 0.5 else 1.0)
+    u = r.random()
+    q = 0.5 if u < 0.8 else (1.0 if u < 0.9 else 0.1)
+    return _yo_quant(r, x, q, r.uniform(0.0, 0.03) if q == 0.5 else 0.0)
+
+def _yo_pm(r, n, Hp):
+    nh = n // Hp + 3
+    nd = nh // 24 + 2
+    off = int(r.integers(0, Hp))
+    th = np.arange(nh, dtype=np.int64) + int(r.integers(0, 24))
+    hh = th % 24
+    day = th // 24
+
+    z = _yo_ou(r, nh, _yo_lu(r, 36.0, 200.0), r.uniform(0.3, 0.8))
+    pk = r.uniform(18.0, 31.0)
+    hx = np.arange(24, dtype=np.float64) + 0.5
+    prof = np.cos(_YO_TWO_PI * (hx - pk) / 24.0) + r.uniform(0.0, 0.5) * np.cos(2.0 * _YO_TWO_PI * (hx - r.uniform(0.0, 24.0)) / 24.0)
+    prof /= max(float(np.ptp(prof)), 1e-9)
+    z += r.uniform(0.1, 1.3) * prof[hh] * np.exp(r.normal(0.0, 0.45, nd))[day]
+    z += _yo_ou(r, nh, r.uniform(1.0, 6.0), r.uniform(0.1, 0.45))
+
+    ke = int(min(r.poisson(nh / 24.0 * _yo_lu(r, 0.03, 0.5)), 40))
+    for _ in range(ke):
+        s = int(r.integers(0, nh))
+        a = min(r.exponential(r.uniform(0.5, 1.2)), 4.0)
+        ru, pl, fa = r.uniform(1.0, 12.0), r.uniform(0.0, 12.0), r.uniform(0.5, 3.0)
+        e = min(nh, s + int(ru + pl + fa) + 2)
+        x = np.arange(e - s, dtype=np.float64)
+        z[s:e] += a * np.clip(np.minimum(x / ru, (ru + pl + fa - x) / fa), 0.0, 1.0)
+    kf = int(min(r.poisson(nh / 24.0 * _yo_lu(r, 0.02, 0.4)), 30))
+    for _ in range(kf):
+        s = int(r.integers(0, nh))
+        a, fa, tau = r.uniform(0.5, 2.2), r.uniform(0.5, 3.0), r.uniform(6.0, 72.0)
+        x = np.arange(nh - s, dtype=np.float64)
+        z[s:] -= a * np.minimum(x / fa, 1.0) * np.exp(-np.maximum(x - fa, 0.0) / tau)
+    lv = float(min(max(r.normal(np.log(4.8), 0.95), np.log(0.25)), np.log(90.0)))
+    u = r.random()
+    kind = 0 if u < 0.87 else (1 if u < 0.90 else (2 if u < 0.93 else (3 if u < 0.96 else 4)))
+    if kind == 3:
+        lv = float(np.log(_yo_lu(r, 60.0, 800.0)))
+    z += lv - float(np.median(z))
+    zc = np.interp((np.arange(n, dtype=np.float64) + off) / Hp, np.arange(nh, dtype=np.float64), z)
+    zc += _yo_ou(r, n, r.uniform(1.0, 8.0), r.uniform(0.02, 0.12))
+    v = np.exp(np.minimum(zc, np.log(5.0 * _YO_SAT)))
+
+    q = 1.0 if (Hp == 6 and r.random() < 0.8) else 0.1
+    p1 = r.uniform(0.02, 0.5) if r.random() < 0.85 else 1.0
+    p2 = r.uniform(0.0, 0.35) if r.random() < 0.35 else 0.0
+    p4 = r.uniform(0.0, 0.3) if r.random() < 0.25 else 0.0
+    c = 3 - (r.random(n) < p1) * 2
+    c = np.where((c == 3) & (r.random(n) < p2), 2, c)
+    c = np.where((c == 3) & (r.random(n) < p4), 4, c)
+    if q == 1.0:
+        c = np.ones(n, dtype=np.int64)
+    noisy = r.random() < (0.5 if Hp == 6 else 0.16)
+    sm = r.uniform(0.15, 0.8) if noisy else r.uniform(0.01, 0.07)
+    sa = r.uniform(0.0, 0.08) * (1.0 + 4.0 * noisy)
+    fl = q if r.random() < 0.8 else (0.2 if q < 1.0 and r.random() < 0.75 else 0.0)
+    df = r.uniform(2.5, 8.0)
+    e = np.clip(r.standard_t(df, (n, 4)), -8.0, 8.0) * float(np.sqrt((df - 2.0) / df))
+    rd = v[:, None] * (1.0 + sm * e) + sa * r.standard_normal((n, 4))
+    rd = np.minimum(np.maximum(np.round(rd / q) * q, fl), _YO_SAT)
+    cs = np.cumsum(rd, axis=1)
+    y = cs[np.arange(n), c - 1] / c
+    if kind == 1:
+        y = np.full(n, float(r.choice((0.1, 0.2, 0.3, 0.5))) if q < 1.0 else 1.0)
+        m = r.random(n) < _yo_lu(r, 0.002, 0.03)
+        y[m] += np.round(np.exp(r.uniform(-2.0, 2.5, int(m.sum()))), 1)
+    elif kind == 2:
+        y[1::2] *= r.uniform(0.45, 0.8)
+    if r.random() < 0.9:
+        m = r.random(n) < (_yo_lu(r, 0.001, 0.015) if noisy else _yo_lu(r, 0.0001, 0.003))
+        y[m] = np.minimum(y[m] * np.exp(r.uniform(0.5, 2.5, int(m.sum()))), _YO_SAT)
+    if kind == 4:
+        m = r.random(n) < _yo_lu(r, 0.003, 0.05)
+        y[m] = 0.0
+    return np.round(y, 2)
+
+def _yo_ozone(r, L):
+    L = int(L)
+    if L < 256:
+        return None
+    kind = _yo_pick(r, _YO_KIND_CUM)
+    if kind < 2:
+        u = r.random()
+        n = (int(r.uniform(780.0, 1120.0)) if u < 0.75 else int(_yo_lu(r, _YO_MIN_N, 780.0)) if u < 0.90
+             else int(r.uniform(1120.0, 2600.0)))
+        n = min(n, L)
+        y = _yo_o3(r, n) if kind == 0 else _yo_no(r, n)
+    else:
+        Hp = _YO_CAD_HP[_yo_pick(r, _YO_CAD_CUM)]
+        u = r.random()
+        if Hp == 24:
+            n = L if u < 0.40 else (int(_yo_lu(r, _YO_MIN_N, 1100.0)) if u < 0.55 else int(r.uniform(min(1100.0, L), L)))
+        else:
+            n = int(r.uniform(450.0, 3000.0)) if Hp == 12 else int(_yo_lu(r, _YO_MIN_N, 1100.0))
+        n = min(max(n, min(_YO_MIN_N, L)), L)
+        y = _yo_pm(r, n, Hp)
+    n = min(n, y.size)
+    y = np.asarray(y[y.size - n:], dtype=np.float64)
+    out = np.empty(L, dtype=np.float64)
+    out[:L - n] = y[0]
+    out[L - n:] = y
+    if not np.all(np.isfinite(out)):
+        out = np.where(np.isfinite(out), out, 0.0)
+    if float(np.ptp(out)) == 0.0:
+        out[L - 1 - int(r.integers(0, max(n, 1)))] += 0.5
+    return out
+
+_YP_TWO_PI = 2.0 * np.pi
+
+def _yp_profile(r):
+    h = np.arange(24, dtype=np.float64)
+    kind = r.integers(4)
+    if kind == 0:
+        s = np.exp(-0.5 * ((h - r.uniform(7, 9)) / r.uniform(1.0, 2.0)) ** 2) + r.uniform(0.6, 1.2) * np.exp(-0.5 * ((h - r.uniform(16, 18.5)) / r.uniform(1.0, 2.5)) ** 2)
+    elif kind == 1:
+        s = np.exp(-0.5 * ((h - r.uniform(11, 15)) / r.uniform(2.5, 4.5)) ** 2)
+    elif kind == 2:
+        s = np.exp(-0.5 * (((h - r.uniform(18, 22) + 12) % 24 - 12) / r.uniform(2.0, 3.5)) ** 2)
+    else:
+        s = 0.5 + 0.5 * np.cos(_YP_TWO_PI * (h - r.uniform(10, 16)) / 24.0)
+    s = (s - s.min()) / max(s.max() - s.min(), 1e-9)
+    p = np.exp(r.uniform(1.0, 3.5) * (s - 1.0))
+    return p / _v2_meanm(p)
+
+def _yp_hourly0(r, L):
+    L = int(L)
+    if L < 256:
+        return None
+    if r.random() < 0.85:
+        n = int(np.exp(r.uniform(np.log(580), np.log(2000))))
+    else:
+        n = int(r.uniform(2000, max(2001, L)))
+    n = max(256, min(n, L))
+    days = n // 24 + 3
+    prof = _yp_profile(r)
+    wk = np.ones(7)
+    wk[5:] = r.uniform(0.4, 1.4)
+    wk /= _v2_meanm(wk)
+    h0, d0 = int(r.integers(24)), int(r.integers(7))
+    day_lvl = np.exp(r.normal(0.0, r.uniform(0.1, 0.4), days))
+    tau, sd = r.uniform(3.0, 20.0), r.uniform(0.05, 0.3)
+    a = np.exp(-1.0 / tau)
+    e = r.normal(0.0, sd * np.sqrt(1.0 - a * a), days)
+    slow = np.empty(days)
+    slow[0] = r.normal(0.0, sd)
+    for i in range(1, days):
+        slow[i] = a * slow[i - 1] + e[i]
+    t = np.arange(n) + h0
+    d = t // 24
+    lam = np.exp(r.uniform(np.log(1.0), np.log(12.0))) * prof[t % 24] * wk[(d + d0) % 7] * day_lvl[d] * np.exp(slow[d] - sd * sd / 2)
+    k = r.uniform(2.0, 30.0)
+    y = r.poisson(lam * r.gamma(k, 1.0 / k, n)).astype(np.float64)
+    if float(y.max()) <= float(y.min()):
+        y[int(r.integers(n))] += 1.0
+    out = np.empty(L, dtype=np.float64)
+    out[: L - n] = y[0]
+    out[L - n:] = y
+    return out
+
+_YQ_TWO_PI = 2.0 * np.pi
+
+_YQ_KIND_CUM = np.cumsum([0.55, 0.13, 0.08, 0.04, 0.02, 0.09, 0.03, 0.03, 0.03])
+_YQ_MIN_N = 320
+
+_YQ_BLEN = (
+    ((0.66, 99999, 99999), (0.01, 320, 400), (0.06, 500, 800), (0.15, 800, 960), (0.03, 960, 1200), (0.03, 1200, 2000),
+     (0.03, 2000, 3000), (0.03, 3000, 4160)),
+    ((0.37, 99999, 99999), (0.012, 320, 420), (0.36, 420, 486), (0.011, 486, 800), (0.07, 800, 1200), (0.031, 1200, 2000),
+     (0.07, 2000, 3000), (0.068, 3000, 4160)),
+)
+_YQ_BLEN_CUM = tuple(np.cumsum([b[0] for b in bands]) for bands in _YQ_BLEN)
+
+def _yq_lu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+def _yq_pick(r, cum):
+    return min(int(np.searchsorted(cum, r.random() * cum[-1], side="right")), cum.size - 1)
+
+def _yq_scan(phi, u, y0):
+    A = np.array(phi, dtype=np.float64)
+    B = np.array(u, dtype=np.float64)
+    n = A.size
+    k = 1
+    while k < n:
+        B[k:] = B[k:] + A[k:] * B[:-k]
+        A[k:] = A[k:] * A[:-k]
+        k *= 2
+    return A * y0 + B
+
+def _yq_ou(r, n, tau, sd):
+    phi = float(np.exp(-1.0 / max(tau, 0.2)))
+    e = r.standard_normal(n) * (sd * np.sqrt(max(1.0 - phi * phi, 1e-9)))
+    return _yq_scan(np.full(n, phi), e, r.standard_normal() * sd)
+
+def _yq_bump(h, c, w):
+    d = (h - c + 12.0) % 24.0 - 12.0
+    return np.exp(-0.5 * (d / w) ** 2)
+
+def _yq_clock(r, n, P):
+    s0 = int(r.integers(0, P))
+    i = np.arange(n) + s0
+    return (i % P) * (24.0 / P), i // P, (i // P + int(r.integers(0, 7))) % 7
+
+def _yq_holidays(r, nd, per_year):
+    hol = np.zeros(nd + 1, dtype=bool)
+    k = int(r.poisson(per_year * nd / 365.0))
+    if k > 0:
+        hol[r.integers(0, nd + 1, k)] = True
+    return hol
+
+def _yq_commute(r, hr, sharp):
+    w = (0.5, 1.2, 0.7, 1.6) if sharp else (0.8, 1.6, 1.0, 2.0)
+    s = _yq_bump(hr, r.uniform(7.0, 9.0), r.uniform(w[0], w[1])) + r.uniform(0.6, 1.2) * _yq_bump(hr, r.uniform(16.3, 18.8), r.uniform(w[2], w[3])) \
+        + r.uniform(0.1, 0.5) * _yq_bump(hr, r.uniform(11.5, 14.0), 2.5)
+    return s / max(float(s.max()), 1e-9)
+
+def _yq_counts(r, lam, cv):
+    if cv > 0.02:
+        lam = lam * r.gamma(1.0 / (cv * cv), cv * cv, lam.size)
+    return r.poisson(np.minimum(lam, 1e7)).astype(np.float64)
+
+def _yq_bike(r, n, cad):
+    P = 1440 if cad == 0 else 288
+    hr, day, dow = _yq_clock(r, n, P)
+    nd = int(day[-1]) + 1
+    wkend = (dow >= 5) | _yq_holidays(r, nd, 10.0)[day]
+
+    typ = _yq_pick(r, np.cumsum([0.45, 0.35, 0.20]))
+    nu = _yq_lu(r, 0.04, 0.7) if cad else _yq_lu(r, 0.02, 0.5)
+    if typ == 0:
+        sh = _yq_commute(r, hr, False)
+    elif typ == 1:
+        sh = _yq_bump(hr, r.uniform(13.0, 17.0), r.uniform(2.5, 4.5))
+    else:
+        sh = 0.5 + 0.5 * _yq_bump(hr, r.uniform(11.0, 18.0), r.uniform(4.0, 7.0))
+    w_we = r.uniform(0.35, 1.3) if typ == 0 else r.uniform(0.7, 1.6)
+    act = nu + (1.0 - nu) * np.where(wkend, w_we * _yq_bump(hr, r.uniform(12.5, 16.5), r.uniform(2.5, 4.5)), sh)
+    act = act * np.exp(r.normal(0.0, r.uniform(0.05, 0.35), nd + 1)[day])
+    act = act / max(float(_v2_meanm(act)), 1e-9)
+    z = r.standard_normal()
+    ev_day = float(np.exp((np.log(400.0) if cad == 0 else np.log(90.0)) + z * ((1.6, 1.5) if cad == 0 else (2.4, 1.45))[z > 0]))
+    ev_day = min(max(ev_day, 0.5), 4000.0)
+    k = r.poisson(act * (ev_day / P)).astype(np.float64)
+    cap = int(min(max(np.exp(r.normal(np.log(13.0 if cad else 15.0) + 0.15 * np.log(ev_day / 60.0), 0.55)), 2.0), 90.0))
+    f0 = r.beta(0.9, 1.7)
+
+    amp = (r.uniform(0.05, 0.45) if typ == 0 else r.uniform(0.0, 0.15)) * (1.0 if r.random() < 0.5 else -1.0) * (1.0 if cad else 1.4)
+    sig = 1.0 / (1.0 + np.exp(-(hr - r.uniform(7.5, 10.0)) / 0.8)) - 1.0 / (1.0 + np.exp(-(hr - r.uniform(16.5, 19.5)) / 1.0))
+    m = cap * (f0 + amp * (sig - 0.4) * np.where(wkend, r.uniform(0.0, 0.5), 1.0) + _yq_ou(r, nd + 1, _yq_lu(r, 1.0, 8.0), r.uniform(0.0, 0.3 if cad else 0.4))[day])
+    K = _yq_lu(r, 3.0, 45.0) * (1.0 + (0.3 if cad else 0.55) * np.log1p(ev_day / 100.0))
+    a = np.minimum(k / K, 0.85)
+    if r.random() < 0.7:
+        vis = r.random(n) < _yq_lu(r, 0.05, 2.5) / P * np.where((hr > 5.0) & (hr < 22.0), 1.4, 0.3)
+        a = np.where(vis, r.uniform(0.5, 0.95), a)
+        m = np.where(vis, cap * r.uniform(0.3, 0.75), m)
+    eta = r.uniform(0.5, 0.85) * np.sqrt(k) * r.standard_normal(n)
+    nb = r.random(n) < 1.0 - np.exp(-_yq_lu(r, 0.002, 0.05) * k)
+    if nb.any():
+        eta[nb] += (r.geometric(r.uniform(0.25, 0.6), int(nb.sum())) + 1.0) * np.where(r.random(int(nb.sum())) < 0.5, -1.0, 1.0)
+    y = _yq_scan(1.0 - a, a * m + eta, cap * f0 + r.normal(0.0, 1.0))
+    dis = np.zeros(n)
+    if r.random() < 0.5:
+        dis = np.clip(np.rint(np.cumsum(r.normal(0.0, 1.0, n) * (r.random(n) < _yq_lu(r, 0.2, 4.0) / P)) + r.uniform(0.0, 2.5)),
+                      0.0, max(cap // 4, 1))
+    bikes = np.minimum(np.clip(np.rint(y), 0.0, cap), cap - dis)
+    if r.random() < 0.6:
+        f = np.flatnonzero(r.random(n) < 1.0 - np.exp(-_yq_lu(r, 0.002, 0.25) * k - 0.002))
+        if f.size:
+            bikes[f] = np.clip(bikes[f] + np.where(r.random(f.size) < 0.5, -1.0, 1.0), 0.0, cap - dis[f])
+    if r.random() < 0.5:
+        for i in r.integers(0, n, int(min(r.poisson(_yq_lu(r, 0.02, 1.5) * (1.0 + ev_day / 200.0) * n / P), 60))):
+            ln = 1 + int(r.geometric(0.5 if cad else 0.25))
+            bikes[i:i + ln] = np.maximum(bikes[i:i + ln] - float(r.integers(1, 4)), 0.0) if r.random() < 0.6 else \
+                np.minimum(bikes[i:i + ln] + 1.0, cap - dis[i:i + ln])
+    if r.random() < 0.12:
+        for _ in range(int(r.integers(1, 3))):
+            i = int(r.integers(0, n))
+            ln = int(_yq_lu(r, 1.0, 30.0) * P / 24.0)
+            bikes[i:i + ln] = bikes[i]
+            dis[i:i + ln] = dis[i]
+    eb = np.zeros(n)
+    if r.random() < 0.6:
+        eb = np.minimum(np.rint(bikes * np.clip(r.beta(1.5, 3.0) + _yq_ou(r, nd + 1, 2.0, 0.08)[day], 0.0, 1.0)), bikes)
+    return np.vstack([bikes, cap - dis - bikes, eb, dis])
+
+def _yq_hourly(r, n, flow):
+    hr, day, dow = _yq_clock(r, n, 24)
+    nd = int(day[-1]) + 1
+    hol = _yq_holidays(r, nd, r.uniform(6.0, 14.0))
+    dtype = np.where(hol[day] | (dow == 6), 2, np.where(dow == 5, 1, 0))
+    sparse = flow and r.random() < 0.25
+    shape = _yq_pick(r, np.cumsum([0.5, 0.3, 0.2] if not flow else [0.45, 0.2, 0.35]))
+    if shape == 0:
+        wd = _yq_commute(r, hr, not flow)
+    elif shape == 1:
+        wd = _yq_bump(hr, r.uniform(12.0, 15.5), r.uniform(3.0, 5.0)) + r.uniform(0.0, 0.4) * _yq_bump(hr, r.uniform(18.0, 21.0), 1.5)
+    else:
+        wd = 0.6 * _yq_bump(hr, r.uniform(7.0, 9.0), r.uniform(1.5, 2.5)) + _yq_bump(hr, r.uniform(15.0, 18.0), r.uniform(2.0, 3.5)) \
+            + 0.4 * _yq_bump(hr, 12.5, 3.0)
+    wd = wd / max(float(wd.max()), 1e-9)
+    we = _yq_bump(hr, r.uniform(11.5, 15.5), r.uniform(2.5, 4.5))
+    night = _yq_lu(r, 0.002, 0.05) if not flow else _yq_lu(r, 0.01, 0.25)
+    wf = (r.uniform(0.3, 0.9), r.uniform(0.2, 0.8)) if shape != 1 else (r.uniform(0.8, 1.6), r.uniform(0.6, 1.4))
+    prof = np.where(dtype == 0, wd, np.where(dtype == 1, wf[0], wf[1]) * we)
+    x = np.log(night + (1.0 - night) * prof)
+    x += _yq_ou(r, nd + 1, _yq_lu(r, 0.5, 4.0), _yq_lu(r, 0.03, 0.25) if not flow else r.uniform(0.03, 0.25))[day]
+    if not flow and r.random() < 0.8:
+        rain = r.random(nd + 1) < r.uniform(0.03, 0.2)
+        x += np.where(rain[day], np.log(r.uniform(0.3, 0.9)) * prof, 0.0)
+    x += _yq_ou(r, nd + 1, _yq_lu(r, 10.0, 60.0), r.uniform(0.04, 0.3))[day]
+    if r.random() < 0.5:
+        x += r.uniform(0.0, 0.35) * np.cos(_YQ_TWO_PI * (day / 365.25) + r.uniform(0.0, _YQ_TWO_PI))
+    if r.random() < 0.06:
+        x[int(r.integers(n // 6, n)):] += r.normal(0.0, 0.4)
+    if sparse:
+        base = _yq_lu(r, 0.3, 3.0)
+    elif flow:
+        base = float(np.exp(r.normal(np.log(1500.0), 1.6)))
+    else:
+        base = float(np.exp(r.normal(np.log(45.0), 1.8)))
+    base = min(max(base, 0.2), 3.0e5)
+    lam = base * np.exp(np.minimum(x - np.log(_v2_mean(np.exp(x))), 8.0))
+    if flow and not sparse and base > 80.0:
+        tot = np.rint(lam * np.exp(r.normal(0.0, r.uniform(0.01, 0.08), n)))
+    else:
+        tot = _yq_counts(r, lam, r.uniform(0.0, 0.3) if flow else r.uniform(0.03, 0.45))
+    if sparse:
+        tot = np.maximum(tot, 1.0) if r.random() < 0.7 else tot
+    s = np.clip(0.5 + r.uniform(0.0, 0.3) * (1.0 if r.random() < 0.5 else -1.0) * (_yq_bump(hr, 8.0, 2.0) - _yq_bump(hr, 17.5, 2.0)), 0.02, 0.98)
+    A = r.binomial(np.minimum(tot, 1e9).astype(np.int64), s).astype(np.float64)
+    if not flow and r.random() < 0.06:
+        i = int(r.integers(0, n))
+        ln = int(_yq_lu(r, 6.0, 120.0))
+        tot[i:i + ln] = 0.0
+        A[i:i + ln] = 0.0
+    return np.vstack([tot, A, tot - A])
+
+def _yq_daily(r, n, low):
+    t = np.arange(n, dtype=np.float64)
+    dow = (np.arange(n) + int(r.integers(0, 7))) % 7
+    wk = r.normal(0.0, 0.04, 7)
+    if r.random() < (0.45 if not low else 0.6):
+        wk[5] += np.log(_yq_lu(r, 0.15, 1.5))
+        wk[6] = wk[5] + np.log(r.uniform(0.5, 1.1))
+    hol = _yq_holidays(r, n, 10.0)[:n]
+    x = np.where(hol, wk[6] + r.normal(0.0, 0.1, n), wk[dow])
+    x += r.uniform(0.0, 0.45) * np.cos(_YQ_TWO_PI * t / 365.25 + r.uniform(0.0, _YQ_TWO_PI))
+    x += _yq_ou(r, n, _yq_lu(r, 1.0, 5.0), r.uniform(0.03, 0.3))
+    x += _yq_ou(r, n, _yq_lu(r, 30.0, 300.0), r.uniform(0.03, 0.3) if not low else r.uniform(0.3, 1.0))
+    if r.random() < 0.15:
+        x[int(r.uniform(0.1, 0.95) * n):] += r.normal(0.0, 0.7)
+    base = float(np.exp(r.normal(0.0, 1.3))) if low else float(np.exp(r.normal(np.log(300.0), 3.0)))
+    lam = min(max(base, 0.05), 3.0e6) * np.exp(np.minimum(x - np.log(_v2_mean(np.exp(x))), 8.0))
+    c = _yq_counts(r, lam, r.uniform(0.0, 0.25) if base < 5000 else 0.0)
+    if not low and r.random() < 0.15:
+        c = np.round(lam / _v2_mean(lam) * 100.0 * np.exp(r.normal(0.0, 0.02, n)), 1)
+    return np.vstack([c, _yq_counts(r, lam * r.uniform(0.1, 0.9), 0.1)])
+
+def _yq_metric(r, n, P, style):
+    hr, day, dow = _yq_clock(r, n, P)
+    nd = int(day[-1]) + 1
+    dc = _yq_commute(r, hr, False) if r.random() < 0.6 else _yq_bump(hr, r.uniform(11.0, 17.0), r.uniform(3.0, 5.0))
+    wkend = dow >= 5
+    if style == 0:
+        hi = _yq_lu(r, 30.0, 2000.0)
+        y = np.rint(r.random(n) * hi * (1.0 + r.uniform(0.0, 0.3) * (dc - 0.5))) if r.random() < 0.7 else \
+            np.rint(np.exp(r.normal(np.log(hi / 3.0), r.uniform(0.3, 1.2), n)))
+        mu = np.full(n, hi / 2.0)
+    elif style == 1:
+        lvl = r.uniform(15.0, 110.0)
+        mu = lvl * (1.0 - r.uniform(0.0, 0.4) * dc * np.where(wkend, 0.3, 1.0)) * np.exp(_yq_ou(r, n, _yq_lu(r, 5.0, 300.0), r.uniform(0.02, 0.15)))
+        y = mu * np.exp(r.normal(0.0, r.uniform(0.02, 0.2), n))
+        if r.random() < 0.4:
+            y = np.where(r.random(n) < r.uniform(0.05, 0.4), 0.0, y)
+        y = np.rint(y)
+    elif style == 2:
+        lvl = float(np.exp(r.normal(np.log(300.0), 1.4)))
+        mu = lvl * (1.0 + r.uniform(0.05, 0.5) * (dc - 0.5) * np.where(wkend, 0.5, 1.0)) * np.exp(_yq_ou(r, n, _yq_lu(r, 10.0, 2000.0), r.uniform(0.01, 0.15)))
+        y = mu + r.normal(0.0, 1.0, n) * np.sqrt(mu) * r.uniform(0.1, 1.5)
+        y = np.round(y, 3) / 100.0 if r.random() < 0.08 else np.rint(np.maximum(y, 0.0))
+        if r.random() < 0.6:
+            keep = r.random(n) < r.uniform(0.2, 0.9)
+            keep[0] = True
+            y = y[np.maximum.accumulate(np.where(keep, np.arange(n), 0))]
+    elif style == 3:
+        ks = int(r.integers(2, 12))
+        stp = 1.0 if ks <= 3 else float(r.choice([5.0, 10.0, 20.0, 60.0]))
+        lv = (np.arange(ks) - int(r.integers(0, 2))) * stp
+        sw = r.random(n) < r.uniform(0.05, 0.6)
+        sw[0] = True
+        st = np.where(sw, r.integers(0, ks, n), 0)
+        y = lv[st[np.maximum.accumulate(np.where(sw, np.arange(n), 0))]]
+        mu = np.full(n, float(_v2_meanm(lv)))
+    elif style == 4:
+        base = r.uniform(45.0, 80.0)
+        mu = base - r.uniform(8.0, 25.0) * (_yq_bump(hr, r.uniform(13.0, 16.0), r.uniform(3.0, 5.0)) - 0.4) \
+            + _yq_ou(r, nd + 1, _yq_lu(r, 2.0, 10.0), r.uniform(4.0, 12.0))[day] + _yq_ou(r, n, P / 6.0, r.uniform(0.5, 3.0))
+        y = np.clip(np.rint(mu), 5.0, 100.0)
+    elif style == 5:
+        lvl = _yq_lu(r, 0.03, 0.25)
+        mu = lvl * np.exp(_yq_ou(r, n, _yq_lu(r, 4.0, 30.0), r.uniform(0.4, 0.8)) + r.uniform(0.0, 0.4) * (dc - 0.5))
+        y = np.round(np.where(r.random(n) < r.uniform(0.0, 0.08), 0.0, mu), 3)
+    elif style == 6:
+        lam = _yq_lu(r, 0.4, 5.0) * np.exp(r.uniform(0.0, 1.2) * (dc - 0.5) + _yq_ou(r, n, _yq_lu(r, 2.0, P), r.uniform(0.1, 0.5)))
+        y = _yq_counts(r, lam, r.uniform(0.0, 0.4))
+        if r.random() < 0.6:
+            y = np.maximum(y, 1.0)
+        if r.random() < 0.4:
+            keep = r.random(n) < r.uniform(0.3, 0.8)
+            keep[0] = True
+            y = y[np.maximum.accumulate(np.where(keep, np.arange(n), 0))]
+        mu = lam
+    else:
+        on = _yq_ou(r, n, _yq_lu(r, 3.0, 40.0), 1.0) > r.uniform(0.8, 2.0)
+        mu = r.uniform(3.0, 15.0) * np.ones(n)
+        y = np.where(on, np.round(mu * np.exp(r.normal(0.0, 0.3, n)), 1), 0.0)
+    y = np.asarray(y, dtype=np.float64)
+    if P >= 288 and style in (0, 1, 2, 3) and r.random() < 0.3:
+        off = (_yq_bump(hr, r.uniform(2.0, 4.5), r.uniform(1.0, 2.5)) > 0.5) & (r.random(n) < r.uniform(0.4, 0.9))
+        if r.random() < 0.6:
+            y = y[np.maximum.accumulate(np.where(off, 0, np.arange(n)))]
+        else:
+            y = np.where(off, 0.0, y)
+    sib = np.round(y * r.uniform(0.3, 1.0) + r.normal(0.0, 1.0, n) * _v2_std(y) * r.uniform(0.05, 0.5), 3)
+    return np.vstack([y, sib, np.round(np.asarray(mu, dtype=np.float64), 3)])
+
+def _yq_transport_draw(r, L, C=1):
+    L = int(L)
+    kind = _yq_pick(r, _YQ_KIND_CUM)
+    u = r.random()
+    if kind == 0:
+        cad = 0 if r.random() < 0.25 else 1
+        b = _YQ_BLEN[cad][_yq_pick(r, _YQ_BLEN_CUM[cad])]
+        n = L if b[2] > 9999 else int(r.integers(b[1], b[2]))
+        z = _yq_bike(r, min(n, L), cad)
+        D, lab = (1440, "bike1") if cad == 0 else (288, "bike5")
+    elif kind in (1, 2):
+        n = (int(np.exp(r.normal(np.log(900.0), 0.55))) if u < 0.96 else L) if kind == 1 else \
+            (int(r.uniform(1700.0, 2400.0)) if u < 0.6 else int(_yq_lu(r, 340.0, 1700.0)))
+        z = _yq_hourly(r, max(min(n, L), _YQ_MIN_N), kind == 2)
+        D, lab = 24, ("countH" if kind == 1 else "other_H")
+    elif kind == 3:
+        n = L if u < 0.35 else int(np.exp(r.normal(np.log(1800.0), 0.6)))
+        z = _yq_daily(r, max(min(n, L), _YQ_MIN_N), False)
+        D, lab = 7, "other_D"
+    elif kind == 4:
+        z = _yq_daily(r, max(min(int(np.exp(r.normal(np.log(560.0), 0.4))), L), _YQ_MIN_N), True)
+        D, lab = 7, "countD"
+    else:
+        P = {5: 1440, 6: 288, 7: 48, 8: 96}[kind]
+        if kind == 5:
+            n = L if u < 0.25 else (int(_yq_lu(r, 280.0, 1200.0)) if u < 0.8 else int(r.uniform(1200.0, max(L, 1201))))
+            style = _yq_pick(r, np.cumsum([0.3, 0.2, 0.3, 0.2]))
+        elif kind == 6:
+            n = L if u < 0.1 else int(_yq_lu(r, 320.0, 1000.0))
+            style = (2, 6, 7)[_yq_pick(r, np.cumsum([0.4, 0.35, 0.25]))]
+        elif kind == 7:
+            n = int(r.uniform(1000.0, 2100.0))
+            style = 5 if r.random() < 0.75 else 6
+        else:
+            n = L if u < 0.4 else int(_yq_lu(r, 280.0, 2400.0))
+            style = 4 if r.random() < 0.7 else 6
+        z = _yq_metric(r, max(min(n, L), _YQ_MIN_N), P, style)
+        D, lab = P, {1440: "other_min", 288: "other_5min", 48: "other_30min", 96: "other_15min"}[P]
+    n = min(z.shape[1], L)
+    z = z[:, z.shape[1] - n:]
+    if C == 1:
+        return z[0], D, lab
+    rows = [c % z.shape[0] for c in range(C)]
+    if kind == 0 and C == 2 and r.random() < 0.15:
+        rows[1] = 2
+    return z[rows], D, lab
+
+def _yq_pad(y, L):
+    n = y.shape[-1]
+    out = np.empty(y.shape[:-1] + (L,), dtype=np.float64)
+    out[..., :L - n] = y[..., :1]
+    out[..., L - n:] = y
+    return out
+
+def _yq_transport(r, L):
+    L = int(L)
+    if L < 256:
+        return None
+    y, D, lab = _yq_transport_draw(r, L)
+    out = _yq_pad(np.asarray(y, dtype=np.float64), L)
+    if float(np.ptp(out)) == 0.0:
+        out[L - 1 - int(r.integers(0, max(y.size, 1)))] += 1.0
+    return out
+
+def _yq_transport_mc(r, L, C):
+    L, C = int(L), int(C)
+    if L < 256:
+        return None
+    if C <= 1:
+        return _yq_transport(r, L).reshape(1, L)
+    z, D, lab = _yq_transport_draw(r, L, C)
+    out = _yq_pad(np.asarray(z, dtype=np.float64), L)
+    for c in range(C):
+        if float(np.ptp(out[c])) == 0.0:
+            out[c, L - 1 - int(r.integers(0, max(z.shape[1], 1)))] += 1.0
+    return out
+
+_YR_TWO_PI = 2.0 * np.pi
+_YR_KIND_CUM = np.cumsum([0.48, 0.24, 0.16, 0.12])
+_YR_MIN_N = 320
+_YR_MAX_CAL = 32768
+_YR_SUB_P = (288, 1440, 144, 24)
+_YR_SUB_CUM = np.cumsum([0.40, 0.25, 0.15, 0.20])
+
+def _yr_lu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+def _yr_pick(r, cum):
+    return min(int(np.searchsorted(cum, r.random() * cum[-1], side="right")), cum.size - 1)
+
+def _yr_ar1(e, phi):
+    y = np.array(e, dtype=np.float64)
+    if y.ndim == 1 and y.flags.c_contiguous:
+        _v2_ar1_fill(y, float(phi))
+        return y
+    n = y.size
+    k = 1
+    p = float(phi)
+    while k < n and abs(p) > 1e-12:
+        y[k:] = y[k:] + p * y[:-k]
+        p = p * p
+        k *= 2
+    return y
+
+def _yr_ou(r, n, tau, sd):
+    phi = float(np.exp(-1.0 / max(tau, 0.2)))
+    e = r.standard_normal(n) * (sd * np.sqrt(max(1.0 - phi * phi, 1e-9)))
+    e[0] = r.standard_normal() * sd
+    return _yr_ar1(e, phi)
+
+def _yr_level(r, m, unit, tau_lo, tau_hi, sd_lo, sd_hi, drift_sd, p_step, step_lo, step_hi):
+    nd = int(m / unit) + 2
+    d = _yr_ou(r, nd, _yr_lu(r, tau_lo, tau_hi), _yr_lu(r, sd_lo, sd_hi))
+    x = np.interp(np.arange(m, dtype=np.float64) / unit, np.arange(nd, dtype=np.float64), d)
+    x += np.linspace(0.0, r.normal(0.0, drift_sd), m)
+    if r.random() < p_step:
+        x[int(r.uniform(0.15, 0.95) * m):] += (1.0 if r.random() < 0.5 else -1.0) * r.uniform(step_lo, step_hi)
+    return x
+
+def _yr_gamma(r, m, cv):
+    if cv < 0.02:
+        return np.ones(m)
+    k = 1.0 / (cv * cv)
+    return r.gamma(k, 1.0 / k, m)
+
+def _yr_bursts(r, m, rate, lo, hi):
+    out = np.zeros(m)
+    k = int(min(r.poisson(rate * m), 200))
+    if k > 0:
+        out[r.integers(0, m, k)] = np.log(r.uniform(lo, hi, k))
+    return out
+
+def _yr_count(r, lam, keep_zero):
+    lam = np.minimum(np.maximum(lam, 1e-9), 1e6)
+    if keep_zero:
+        return r.poisson(lam).astype(np.float64)
+    p1 = -np.expm1(-lam)
+    listed = r.random(lam.size) < p1
+    la, pa = lam[listed], p1[listed]
+    t1 = -np.log1p(-r.random(la.size) * pa) / la
+    return 1.0 + r.poisson(la * np.maximum(1.0 - t1, 0.0)).astype(np.float64)
+
+def _yr_round(r, v, p_nice, p_units):
+    a = np.maximum(np.abs(v), 1e-9)
+    nice = r.random(v.size) < p_nice
+    q = np.where(nice, 10.0 ** (np.floor(np.log10(a)) - r.integers(1, 3, v.size)), 1.0 if r.random() < p_units else 0.01)
+    q = np.maximum(q, 0.01)
+    return np.round(v / q) * q
+
+def _yr_cnt_daily(r, n):
+    z = float(r.standard_normal())
+    base = float(np.exp(min(max(np.log(8.0) + (1.5 if z < 0.0 else 2.2) * z, np.log(0.5)), np.log(1500.0))))
+    keep_zero = r.random() < 0.06
+    p_est = max(1.0 - float(np.exp(-0.6 * base)), 0.05)
+    m = int(min(n / p_est * 1.25 + 16, 12000))
+    x = _yr_level(r, m, 1.0, 10.0, 250.0, 0.03, 0.2, 0.1, 0.12, 0.25, 1.0)
+    if r.random() < 0.35:
+        wk = r.normal(0.0, 0.05, 7)
+        wk[5] += np.log(r.uniform(0.01, 0.15))
+        wk[6] = wk[5] + np.log(r.uniform(0.3, 1.2))
+        x += wk[(np.arange(m) + int(r.integers(0, 7))) % 7]
+        hd = r.integers(0, m, int(r.poisson(m / 365.0 * r.uniform(6.0, 11.0))))
+        x[hd] += np.log(r.uniform(0.005, 0.05, hd.size))
+    elif r.random() < 0.3:
+        P = 5 if r.random() < 0.5 else 7
+        x += r.normal(0.0, _yr_lu(r, 0.02, 0.12), P)[(np.arange(m) + int(r.integers(0, P))) % P]
+    if r.random() < 0.6:
+        thin = r.random(m) < _yr_lu(r, 0.02, 0.2)
+        x[thin] += np.log(r.uniform(0.05, 0.6, int(thin.sum())))
+    if r.random() < 0.15:
+        x += _yr_bursts(r, m, _yr_lu(r, 0.002, 0.02), 2.0, 15.0)
+    cv = _yr_lu(r, 0.2, 0.9) * (1.0 if base < 30.0 else 0.6)
+    lam = base * np.exp(np.minimum(x - np.log(_v2_mean(np.exp(x))), 8.0)) * _yr_gamma(r, m, cv)
+    c = r.poisson(np.minimum(lam, 50000.0)).astype(np.int64)
+    if r.random() < 0.5:
+        cr = r.binomial(c, r.uniform(0.03, 0.2))
+        c = c - cr
+        c[1:] += cr[:-1]
+    c = c.astype(np.float64)
+    return c if keep_zero else c[c > 0]
+
+def _yr_val(r, m, unit, single, lvl, s, p_units):
+    df = r.uniform(2.5, 8.0)
+    mu = np.log(lvl) + _yr_level(r, m, unit, 15.0, 400.0, 0.04 * s, 0.35 * s, 0.25 * s, 0.12, 0.3 * s + 0.1, 1.2 * s + 0.3)
+    if single:
+        k = np.ones(m, dtype=np.int64)
+        agg = 0
+    else:
+        k = 1 + r.poisson(_yr_lu(r, 0.2, 8.0), m)
+        agg = 0 if r.random() < 0.8 else 1
+    tot = int(k.sum())
+    t = r.standard_t(df, tot) * np.sqrt((df - 2.0) / df)
+    day = np.repeat(np.arange(m), k)
+    lv = mu[day] + np.clip(s * t, -9.0, 8.0)
+    if r.random() < 0.6:
+        low = r.random(tot) < _yr_lu(r, 0.01, 0.25)
+        lv[low] -= r.uniform(1.0, 8.0, int(low.sum()))
+    if r.random() < 0.3:
+        lv += _yr_bursts(r, tot, _yr_lu(r, 0.002, 0.03), 5.0, 200.0)
+    p_nice = r.uniform(0.3, 0.95) if r.random() < 0.8 * p_units else 0.0
+    v = _yr_round(r, np.exp(np.minimum(lv, np.log(5.0e9))), p_nice, p_units)
+    if single:
+        out = v
+    elif agg == 0:
+        out = np.bincount(day, weights=v, minlength=m) / k
+    else:
+        o = np.argsort(day * 4.0 + (v / (v.max() + 1.0)), kind="stable")
+        st = np.r_[0, np.cumsum(k)[:-1]]
+        out = 0.5 * (v[o][st + (k - 1) // 2] + v[o][st + k // 2])
+    if not single and r.random() < 0.6:
+        out = np.round(out, 2 if r.random() < 0.5 else 0)
+    if r.random() < 0.35:
+        out[r.random(m) < _yr_lu(r, 0.005, 0.2)] = 0.0
+    return out
+
+def _yr_val_daily(r, n):
+    single = r.random() < 0.3
+    lvl = float(np.exp(min(max(r.normal(np.log(2.5e5), 1.3), np.log(2.0e3)), np.log(8.0e6))))
+    return _yr_val(r, n, 1.0, single, lvl, _yr_lu(r, 0.5, 2.2) if single else _yr_lu(r, 0.3, 1.2), 0.8)
+
+def _yr_cnt_sub(r, n):
+    P = _YR_SUB_P[_yr_pick(r, _YR_SUB_CUM)]
+    z = float(r.standard_normal())
+    base = float(np.exp(min(max(np.log(0.9) + (0.9 if z < 0.0 else 1.2) * z, np.log(0.12)), np.log(30.0))))
+    keep_zero = r.random() < 0.3
+    p_est = 1.0 if keep_zero else max(1.0 - float(np.exp(-0.85 * base)), 0.05)
+    m = int(min(n / p_est * 1.15 + 2 * min(P, 288), _YR_MAX_CAL))
+    x = _yr_level(r, m, float(P), 1.0, 30.0, 0.01, 0.1, 0.06, 0.05, 0.3, 1.0)
+    if r.random() < 0.6:
+        h = (np.arange(m) % P) * (_YR_TWO_PI / P)
+        x += r.uniform(0.0, 0.8) * np.cos(h - r.uniform(0.0, _YR_TWO_PI))
+    if r.random() < 0.35:
+        x += _yr_bursts(r, m, _yr_lu(r, 0.0005, 0.02), 3.0, 150.0)
+    lam = base * np.exp(np.minimum(x - np.log(_v2_mean(np.exp(x))), 8.0)) * _yr_gamma(r, m, _yr_lu(r, 0.05, 0.8))
+    return _yr_count(r, np.minimum(lam, 5000.0), keep_zero)
+
+def _yr_val_sub(r, n):
+    if r.random() < 0.6:
+        unit = float(_YR_SUB_P[_yr_pick(r, _YR_SUB_CUM)])
+        return _yr_val(r, n, unit, True, _yr_lu(r, 3.0, 3.0e4), _yr_lu(r, 0.3, 2.5), 0.3)
+    c0 = _yr_lu(r, 1.0, 1.0e7) * (-1.0 if r.random() < 0.2 else 1.0)
+    kc = int(r.integers(1, 7))
+    sp = _yr_lu(r, 1e-4, 0.15) * abs(c0)
+    cen = c0 + r.normal(0.0, 3.0, kc) * sp
+    w = r.dirichlet(np.ones(kc))
+    g = np.minimum(np.searchsorted(np.cumsum(w), r.random(n)), kc - 1)
+    v = cen[g] + r.normal(0.0, 1.0, n) * sp * r.uniform(0.2, 1.0, kc)[g]
+    q = min(10.0 ** np.floor(np.log10(max(sp, 1e-12)) - r.uniform(1.0, 4.0)), 1.0)
+    return np.round(v / q) * q
+
+def _yr_sales(r, L):
+    L = int(L)
+    if L < 256:
+        return None
+    kind = _yr_pick(r, _YR_KIND_CUM)
+    if kind == 0:
+        n = int(min(max(np.exp(r.normal(np.log(640.0), 0.36)), _YR_MIN_N), 1500.0))
+        y = _yr_cnt_daily(r, n)
+    elif kind == 1:
+        n = int(min(max(np.exp(r.normal(np.log(480.0), 0.36)), _YR_MIN_N), 1400.0))
+        y = _yr_val_daily(r, n)
+    elif kind == 2:
+        n = L if r.random() < 0.22 else int(min(max(np.exp(r.normal(np.log(700.0), 0.55)), _YR_MIN_N), L))
+        y = _yr_cnt_sub(r, n)
+    else:
+        n = int(min(max(np.exp(r.normal(np.log(450.0), 0.4)), _YR_MIN_N), 1800.0))
+        y = _yr_val_sub(r, n)
+    n = min(n, L, y.size)
+    y = y[y.size - n:]
+    out = np.empty(L, dtype=np.float64)
+    out[:L - n] = y[0] if n > 0 else 1.0
+    out[L - n:] = y
+    if not np.all(np.isfinite(out)):
+        out = np.where(np.isfinite(out), out, 0.0)
+    if float(np.ptp(out)) == 0.0:
+        out[L - 1 - int(r.integers(0, max(n, 1)))] += 1.0
+    return out
+
+_YS_TWO_PI = 2.0 * np.pi
+
+_YS_CELLS = (("demand", 5, 0.12), ("demand", 15, 0.035), ("demand", 30, 0.05), ("demand", 60, 0.035),
+             ("gen", 5, 0.10), ("gen", 10, 0.02), ("gen", 15, 0.13), ("gen", 30, 0.13), ("gen", 60, 0.02),
+             ("flow", 5, 0.05), ("flow", 15, 0.06), ("flow", 60, 0.01),
+             ("price", 5, 0.035), ("price", 15, 0.02), ("price", 30, 0.075), ("price", 60, 0.05),
+             ("co2", 5, 0.02), ("co2", 30, 0.03))
+_YS_CELL_CUM = np.cumsum([c[2] for c in _YS_CELLS])
+
+_YS_NQ = np.array([0.0, 0.10, 0.25, 0.50, 0.75, 0.90, 1.0])
+_YS_NKNOT = {5: (300.0, 1396.0, 3440.0, 3904.0, 4096.0, 4096.0, 4096.0),
+             10: (300.0, 700.0, 758.0, 900.0, 1600.0, 3000.0, 4096.0),
+             15: (300.0, 804.0, 1956.0, 3440.0, 3904.0, 4096.0, 4096.0),
+             30: (300.0, 623.0, 1087.0, 2456.0, 3440.0, 3904.0, 4096.0),
+             60: (300.0, 676.0, 1164.0, 1593.0, 1833.0, 2175.0, 4096.0)}
+
+_YS_GEN = ("thermal", "coal", "nuclear", "ror", "peak", "pumped", "inter", "other", "unit", "solar", "wind", "total")
+_YS_GEN_W = {5: (0.12, 0.04, 0.08, 0.05, 0.02, 0.03, 0.18, 0.10, 0.20, 0.04, 0.14, 0.0),
+             10: (0.20, 0.05, 0.05, 0.0, 0.05, 0.0, 0.0, 0.05, 0.60, 0.0, 0.0, 0.0),
+             15: (0.10, 0.03, 0.03, 0.07, 0.10, 0.22, 0.14, 0.03, 0.12, 0.05, 0.06, 0.05),
+             30: (0.20, 0.05, 0.10, 0.06, 0.05, 0.06, 0.12, 0.06, 0.02, 0.12, 0.12, 0.04),
+             60: (0.30, 0.05, 0.05, 0.10, 0.10, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.10)}
+_YS_PSCALE = {5: (20.0, 60.0), 15: (40.0, 250.0), 30: (10.0, 90.0), 60: (200.0, 1200.0)}
+
+def _ys_lu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+def _ys_pick(r, w):
+    c = np.cumsum(w)
+    return min(int(np.searchsorted(c, r.random() * c[-1], side="right")), len(w) - 1)
+
+def _ys_ar1(e, phi):
+    y = np.array(e, dtype=np.float64)
+    if y.ndim == 1 and y.flags.c_contiguous:
+        _v2_ar1_fill(y, float(phi))
+        return y
+    n = y.size
+    k = 1
+    p = float(phi)
+    while k < n and abs(p) > 1e-12:
+        y[k:] = y[k:] + p * y[:-k]
+        p = p * p
+        k *= 2
+    return y
+
+def _ys_ou(r, n, tau, sd):
+    phi = float(np.exp(-1.0 / max(tau, 0.2)))
+    e = r.standard_normal(n) * (sd * np.sqrt(max(1.0 - phi * phi, 1e-9)))
+    e[0] = r.standard_normal() * sd
+    return _ys_ar1(e, phi)
+
+def _ys_ou2(r, n, tau1, tau2, sd):
+    b = int(3.0 * max(tau1, tau2)) + 4
+    y = _ys_ar1(_ys_ar1(r.standard_normal(n + b), float(np.exp(-1.0 / max(tau1, 0.2)))), float(np.exp(-1.0 / max(tau2, 0.2))))[b:]
+    s = float(_v2_stdm(y))
+    return y * (sd / s) if s > 0 else y
+
+def _ys_sig(z):
+    return 1.0 / (1.0 + np.exp(-np.clip(z, -40.0, 40.0)))
+
+def _ys_bump(h, c, w):
+    d = (h - c + 12.0) % 24.0 - 12.0
+    return np.exp(-0.5 * (d / w) ** 2)
+
+def _ys_daily(v, day, frac):
+    return np.interp(day + frac, np.arange(v.size, dtype=np.float64), v)
+
+def _ys_daymean(x, day, nd):
+    s = np.bincount(day, weights=x, minlength=nd)
+    c = np.maximum(np.bincount(day, minlength=nd), 1)
+    return (s / c)[day]
+
+def _ys_cal(r, n, P):
+    pos = np.arange(n) + int(r.integers(0, P))
+    day = pos // P
+    nd = int(day[-1]) + 1
+    frac = (pos % P + 0.5) / P
+    dow = (np.arange(nd) + int(r.integers(0, 7))) % 7
+    dt = np.where(dow == 5, 1, np.where(dow == 6, 2, 0))
+    hol = (r.random(nd) < r.uniform(0.005, 0.03)) & (dt == 0)
+    dt[hol] = 2
+    doy = r.uniform(0.0, 365.0) + np.arange(nd + 1, dtype=np.float64)
+    return {"n": n, "P": P, "day": day, "nd": nd, "frac": frac, "hour": 24.0 * frac, "dt": dt, "doy": doy,
+            "slot": np.minimum((frac * P).astype(np.int64), P - 1)}
+
+def _ys_sun(r, cal):
+    lat = np.radians(r.uniform(20.0, 62.0))
+    dec = np.radians(23.44) * np.sin(_YS_TWO_PI * (cal["doy"][cal["day"]] - 81.0) / 365.0)
+    ha = np.radians(15.0) * (cal["hour"] - 12.0 - r.uniform(-1.5, 1.5))
+    se = np.sin(lat) * np.sin(dec) + np.cos(lat) * np.cos(dec) * np.cos(ha)
+    return np.maximum(se, 0.0) ** r.uniform(1.0, 1.5)
+
+def _ys_cloud(r, cal):
+    nd, P = cal["nd"], cal["P"]
+    kd = 0.12 + 0.88 * _ys_sig(r.uniform(-0.3, 2.2) + _ys_ou(r, nd + 1, r.uniform(0.7, 3.0), r.uniform(0.8, 1.8)))
+    k = _ys_daily(kd, cal["day"], cal["frac"])
+    k = k * np.exp(_ys_ou2(r, cal["n"], r.uniform(0.2, 1.0) * P / 24.0, r.uniform(0.3, 2.0) * P / 24.0, r.uniform(0.03, 0.2)))
+    return np.minimum(k, 1.08)
+
+def _ys_wind(r, cal, offshore=False):
+    nd, P = cal["nd"], cal["P"]
+    z = _ys_daily(_ys_ou(r, nd + 1, r.uniform(1.2, 4.0), r.uniform(0.6, 1.1)), cal["day"], cal["frac"])
+    z = z + _ys_ou2(r, cal["n"], r.uniform(1.0, 4.0) * P / 24.0, r.uniform(2.0, 10.0) * P / 24.0, r.uniform(0.3, 0.7))
+    if not offshore:
+        z = z + r.uniform(0.0, 0.35) * np.cos(_YS_TWO_PI * (cal["hour"] - r.uniform(12.0, 17.0)) / 24.0)
+    cf = _ys_sig(r.uniform(1.6, 2.6) * z + r.uniform(-1.4, 0.6))
+    if r.random() < 0.15:
+        cf = np.minimum(cf, r.uniform(0.6, 0.9))
+    return cf
+
+def _ys_temp(r, cal):
+    nd = cal["nd"]
+    d = cal["doy"]
+    ts = r.uniform(4.0, 26.0) + r.uniform(2.0, 12.0) * np.cos(_YS_TWO_PI * (d - 200.0) / 365.0)
+    ts = ts + _ys_ou(r, nd + 1, r.uniform(2.0, 7.0), r.uniform(1.5, 4.0))
+    return _ys_daily(ts, cal["day"], cal["frac"]) + r.uniform(2.0, 7.0) * np.cos(_YS_TWO_PI * (cal["hour"] - 15.0) / 24.0)
+
+def _ys_profiles(r, P):
+    h = (np.arange(P) + 0.5) * (24.0 / P)
+    up, dn = r.uniform(5.0, 8.0), r.uniform(20.0, 23.8)
+    wu, wd = r.uniform(0.8, 2.0), r.uniform(0.9, 2.4)
+    a_m, c_m, s_m = r.uniform(0.0, 0.45), r.uniform(8.0, 11.5), r.uniform(1.0, 2.5)
+    a_l, c_l = (r.uniform(0.0, 0.25) if r.random() < 0.4 else 0.0), r.uniform(12.0, 13.5)
+    a_e, c_e, s_e = r.uniform(0.05, 0.7), r.uniform(17.5, 20.8), r.uniform(1.0, 2.6)
+    out = np.empty((3, P))
+    for k, (shift, scale, km, kl) in enumerate(((0.0, 1.0, 1.0, 1.0), (r.uniform(0.3, 1.5), r.uniform(0.55, 0.95), 0.6, 0.3),
+                                                (r.uniform(0.6, 2.2), r.uniform(0.4, 0.88), 0.4, 0.0))):
+        pl = _ys_sig((h - up - shift) / wu) - _ys_sig((h - dn) / wd)
+        out[k] = scale * pl + km * a_m * _ys_bump(h, c_m + shift, s_m) - kl * a_l * _ys_bump(h, c_l, 0.8) + \
+            a_e * _ys_bump(h, c_e, s_e)
+    w = 0.5 - 0.5 * np.cos(_YS_TWO_PI * h / 24.0)
+    out[1:] = out[0] + w * (out[1:] - out[0])
+    pl0 = (_ys_sig((h - up) / wu) - _ys_sig((h - dn) / wd)) * w
+    m = out[0].mean()
+    pp = max(float(np.ptp(out[0])), 1e-9)
+    return (out - m) / pp, pl0
+
+def _ys_demand(r, cal, sun=None, cloud=None):
+    P, nd, day, frac = cal["P"], cal["nd"], cal["day"], cal["frac"]
+    prof, pl0 = _ys_profiles(r, P)
+    amp = r.uniform(0.2, 0.55)
+    ampd = amp * np.exp(_ys_ou(r, nd + 1, r.uniform(3.0, 30.0), r.uniform(0.02, 0.08)))
+    dtd = cal["dt"][day]
+    wk = np.array([0.0, -r.uniform(0.02, 0.10), -r.uniform(0.05, 0.18)]) * (0.4 if P == 24 else 1.0)
+    x = 1.0 + _ys_daily(ampd, day, frac) * prof[dtd, cal["slot"]] + wk[dtd] * pl0[cal["slot"]]
+    T = _ys_temp(r, cal)
+    th, tc = r.uniform(12.0, 18.0), r.uniform(19.0, 25.0)
+    ks = 1.0 if P == 24 else 0.5
+    x = x + ks * (r.uniform(0.0, 0.015) * np.maximum(th - T, 0.0) + r.uniform(0.0, 0.02) * np.maximum(T - tc, 0.0))
+    slow = r.uniform(0.06, 0.2) if P == 24 else r.uniform(0.003, 0.02)
+    x = x + _ys_daily(_ys_ou(r, nd + 1, r.uniform(15.0, 60.0), slow) +
+                      _ys_ou(r, nd + 1, r.uniform(0.5, 2.5), r.uniform(0.02, 0.07)), day, frac)
+    x = x + _ys_ou2(r, cal["n"], r.uniform(0.3, 2.0) * P / 24.0, r.uniform(0.5, 4.0) * P / 24.0, r.uniform(0.004, 0.025))
+    if P >= 96:
+        x = x + _ys_ou(r, cal["n"], r.uniform(0.3, 2.0), r.uniform(0.0, 0.006))
+    if sun is not None and r.random() < 0.35:
+        x = x - r.uniform(0.05, 0.3) * sun * (cloud if cloud is not None else 1.0)
+    return np.maximum(x, 0.05)
+
+def _ys_system(r, cal, wcap=0.45, wlo=0.0):
+    sun = _ys_sun(r, cal)
+    cloud = _ys_cloud(r, cal)
+    D = _ys_demand(r, cal, sun, cloud)
+    S = r.uniform(0.0, 0.45) * sun * cloud / max(float(sun.max()), 1e-6)
+    W = r.uniform(wlo, wcap) * _ys_wind(r, cal)
+    P, nd = cal["P"], cal["nd"]
+    M = _ys_daily(_ys_ou(r, nd + 1, r.uniform(1.0, 5.0), r.uniform(0.02, 0.08)), cal["day"], cal["frac"])
+    M = M + _ys_ou2(r, cal["n"], r.uniform(0.5, 3.0) * P / 24.0, r.uniform(2.0, 8.0) * P / 24.0, r.uniform(0.01, 0.05))
+    M = M - r.uniform(0.0, 0.5) * S
+    return {"sun": sun, "D": D, "S": S, "W": W, "M": M, "R": D - S - W - M}
+
+def _ys_onoff(r, n, P, on_h, off_h):
+    st = np.zeros(n, dtype=bool)
+    i, on = 0, r.random() < on_h / (on_h + off_h)
+    while i < n:
+        m = 1 + int(r.exponential((on_h if on else off_h) * P / 24.0))
+        st[i:i + m] = on
+        i += m
+        on = not on
+    return st
+
+def _ys_gen(r, cal, sub):
+    P, nd, day, n = cal["P"], cal["nd"], cal["day"], cal["n"]
+    if sub == "solar":
+        return r.uniform(0.3, 1.0) * _ys_sun(r, cal) * _ys_cloud(r, cal)
+    if sub == "wind":
+        return _ys_wind(r, cal, r.random() < 0.3)
+    if sub == "nuclear" or sub == "other":
+        x = np.ones(n)
+        k = int(r.poisson(nd / r.uniform(25.0, 120.0)))
+        for _ in range(min(k, 12)):
+            a = int(r.integers(0, n))
+            x[a:a + int(r.uniform(0.3, 25.0) * P)] -= r.uniform(0.1, 0.6) if sub == "nuclear" else r.uniform(0.1, 1.0)
+        x = np.maximum(x, 0.0)
+        if sub == "other":
+            x = x * np.exp(_ys_daily(_ys_ou(r, nd + 1, r.uniform(2.0, 20.0), r.uniform(0.02, 0.2)), day, cal["frac"]))
+        return x * (1.0 + _ys_ou2(r, n, r.uniform(0.5, 3.0) * P / 24.0, r.uniform(1.0, 12.0) * P / 24.0, r.uniform(0.003, 0.03)))
+    if sub == "ror":
+        z = _ys_daily(_ys_ou(r, nd + 1, r.uniform(4.0, 30.0), r.uniform(0.15, 0.5)), day, cal["frac"])
+        x = np.exp(z) * (1.0 + _ys_ou2(r, n, r.uniform(0.5, 3.0) * P / 24.0, r.uniform(1.0, 12.0) * P / 24.0, r.uniform(0.005, 0.05)))
+        if r.random() < 0.4:
+            x = x * (1.0 + r.uniform(0.05, 0.4) * np.cos(_YS_TWO_PI * (cal["hour"] - r.uniform(8.0, 20.0)) / 24.0))
+        return x
+    sy = _ys_system(r, cal, 0.6, 0.0) if P == 96 else _ys_system(r, cal, 1.2, 0.1)
+    R, D = sy["R"], sy["D"]
+    if sub == "total":
+        return np.maximum(D - sy["M"], 0.02)
+    if sub == "inter":
+        return np.tanh(-sy["M"] / r.uniform(0.04, 0.15) + r.uniform(-1.0, 1.0) + r.uniform(-0.6, 0.6) * (D - _v2_meanm(D)) / max(float(_v2_stdm(D)), 1e-6))
+    T = np.maximum(R - r.uniform(0.0, 0.35), 0.02)
+    if sub == "thermal":
+        lo = r.uniform(0.0, 0.3) * float(_v2_meanm(T))
+        g = np.maximum(T - r.uniform(0.0, 0.5) * float(_v2_meanm(T)), lo)
+        if r.random() < 0.3:
+            a = float(np.exp(-1.0 / (0.05 * P)))
+            g = _ys_ar1(g * (1.0 - a), a)
+        return g
+    if sub == "coal":
+        a = float(np.exp(-1.0 / (0.4 * P)))
+        b = _ys_ar1(T * (1.0 - a), a)
+        u = r.uniform(0.05, 0.25) * float(_v2_meanm(b))
+        return np.round(b * r.uniform(0.3, 0.8) / u) * u + _ys_ou2(r, n, 2.0, 0.1 * P, r.uniform(0.03, 0.15) * u)
+    if sub == "peak":
+        q = _ys_daymean(T, day, nd)
+        return np.maximum(T - q * r.uniform(0.95, 1.2), 0.0) + (r.uniform(0.0, 0.1) * float(_v2_meanm(T)) if r.random() < 0.5 else 0.0)
+    if sub == "pumped":
+        q = _ys_daymean(T, day, nd)
+        s = (T - q) / max(float(_v2_stdm(T)), 1e-6)
+        dz = r.uniform(0.2, 1.0)
+        x = np.where(s > dz, s - dz, np.where(s < -dz, s + dz, 0.0))
+        mode = r.random()
+        if mode < 0.35:
+            x = np.minimum(x, 0.0)
+        elif mode < 0.6:
+            x = np.maximum(x, 0.0)
+        return np.clip(x, -2.0, 2.0)
+
+    st = _ys_onoff(r, n, P, _ys_lu(r, 4.0, 200.0), _ys_lu(r, 2.0, 300.0)) if r.random() < 0.75 else np.ones(n, dtype=bool)
+    pmin = r.uniform(0.2, 0.7)
+    if r.random() < 0.5:
+        x = 1.0 + _ys_ou2(r, n, r.uniform(0.5, 3.0) * P / 24.0, r.uniform(1.0, 12.0) * P / 24.0, r.uniform(0.002, 0.03))
+    else:
+        x = pmin + (1.0 - pmin) * (T - T.min()) / max(float(np.ptp(T)), 1e-6)
+    return np.where(st, np.maximum(x, 0.0), 0.0)
+
+def _ys_price(r, cal, mins):
+    P, nd, day, n = cal["P"], cal["nd"], cal["day"], cal["n"]
+    R = _ys_system(r, cal, r.uniform(0.2, 0.8))["R"]
+    z = (R - _v2_meanm(R)) / max(float(_v2_stdm(R)), 1e-6)
+    tau, sd = {5: ((1.0, 6.0), (0.03, 0.15)), 15: ((0.5, 3.0), (0.15, 0.4)), 30: ((1.0, 8.0), (0.08, 0.3)),
+               60: ((20.0, 60.0), (0.08, 0.25))}[mins]
+    lv = _ys_ou(r, nd + 1, r.uniform(*tau), r.uniform(*sd))
+    lv[:nd] += np.where(cal["dt"] > 0, np.log(r.uniform(0.5, 0.9) if mins == 15 else r.uniform(0.9, 1.0) if mins in (5, 60) else r.uniform(0.8, 1.0)), 0.0)
+    lvl = np.exp(_ys_daily(lv, day, cal["frac"]))
+    slope = {5: (0.4, 0.9), 15: (0.3, 0.8), 30: (0.15, 0.5), 60: (0.2, 0.45)}[mins]
+    p = lvl * (1.0 + r.uniform(*slope) * z + r.uniform(0.0, 0.2) * np.maximum(z, 0.0) ** 2)
+    if r.random() < {5: 0.3, 15: 0.6, 30: 0.4, 60: 0.1}[mins]:
+        f = r.uniform(-0.1, 0.25)
+        p = np.where(p < f, f + (p - f) * r.uniform(0.05, 0.4), p)
+    else:
+        p = np.maximum(p, r.uniform(0.0, 0.3))
+    rt = mins == 5 or (mins == 30 and r.random() < 0.3)
+    if mins in (15, 30) and not rt and r.random() < (0.12 if mins == 15 else 0.05):
+        k = 60 // mins
+        b = (np.arange(n) + int(r.integers(0, k))) // k
+        p = (np.bincount(b, weights=p) / np.bincount(b))[b]
+    if mins != 5:
+        p = _ys_white(r, p, "price15" if mins == 15 else "price")
+    if rt:
+        p = p + _ys_ou(r, n, r.uniform(0.3, 1.5), r.uniform(0.1, 0.4))
+        m = int(r.poisson(n * _ys_lu(r, 0.001, 0.012)))
+        if m > 0:
+            at = r.integers(0, n, 4 * m)
+            at = at[r.random(at.size) < _ys_sig(2.0 * z[at] - 1.0)][:m]
+            imp = np.zeros(n)
+            np.add.at(imp, at, np.exp(r.normal(np.log(r.uniform(1.5, 8.0)), 1.3, at.size)) *
+                      np.where(r.random(at.size) < 0.85, 1.0, -0.3))
+            p = p + _ys_ar1(imp, r.uniform(0.5, 0.9))
+        if r.random() < 0.6:
+            keep = r.random(n) >= r.uniform(0.02, 0.12)
+            keep[0] = True
+            p = p[np.maximum.accumulate(np.where(keep, np.arange(n), 0))]
+    elif r.random() < (0.2 if mins == 60 else 0.5):
+        m = int(r.poisson(nd * r.uniform(0.05, 0.4)))
+        for _ in range(min(m, 40)):
+            a = int(r.integers(0, n))
+            p[a:a + int(r.uniform(0.5, 3.0) * P / 24.0) + 1] *= r.uniform(1.3, 3.0)
+    if mins == 30 and not rt and r.random() < 0.5:
+        p = p * r.uniform(0.6, 1.0) + r.uniform(0.2, 0.6) * _ys_sig((cal["hour"] - 16.0) * 4.0) * _ys_sig((19.0 - cal["hour"]) * 4.0)
+    if mins == 60 and r.random() < 0.7:
+        keep = r.random(n) < r.uniform(0.5, 0.85)
+        keep[0] = True
+        p = p[np.maximum.accumulate(np.where(keep, np.arange(n), 0))]
+    return p
+
+def _ys_flow(r, cal, mins):
+    P, nd, day, n = cal["P"], cal["nd"], cal["day"], cal["n"]
+    R = _ys_system(r, cal, 0.35)["R"]
+    beta = r.uniform(0.0, 0.35) if mins == 5 else r.uniform(0.2, 0.8)
+    u = r.uniform(-1.6, 1.6) + beta * (1.0 if r.random() < 0.5 else -1.0) * (R - _v2_meanm(R)) / max(float(_v2_stdm(R)), 1e-6)
+    u = u + _ys_daily(_ys_ou(r, nd + 1, r.uniform(1.0, 6.0), r.uniform(0.3, 0.8) if mins == 5 else r.uniform(0.05, 0.3)), day, cal["frac"])
+    u = u + _ys_ou2(r, n, r.uniform(0.3, 2.0) * P / 24.0, r.uniform(1.0, 8.0) * P / 24.0, r.uniform(0.08, 0.35))
+    u = u + _ys_ou2(r, n, r.uniform(0.5, 2.0), r.uniform(1.0, 4.0), r.uniform(0.02, 0.12))
+    if r.random() < (0.8 if mins == 5 else 0.4):
+        k = max(P // 24, 1)
+        hb = (np.arange(n) + int(r.integers(0, k))) // k
+        m = int(hb[-1]) + 1
+        tl = r.uniform(0.3, 1.0) if mins == 5 else 0.0
+        st = r.standard_normal(m) * np.exp(tl * r.standard_normal(m) - tl * tl) * r.uniform(0.03, 0.2 if mins == 5 else 0.08) * \
+            (r.random(m) < r.uniform(0.1, 0.6))
+        u = u + _ys_ar1(st, float(np.exp(-1.0 / r.uniform(3.0, 24.0))))[hb]
+    if r.random() < (0.35 if mins == 5 else 0.15):
+        return np.clip(u, -r.uniform(0.6, 1.6), r.uniform(0.6, 1.6))
+    return np.tanh(u)
+
+def _ys_co2(r, cal, mins):
+    sy = _ys_system(r, cal, 1.8, 0.6) if mins == 5 else _ys_system(r, cal, 1.0, 0.2)
+    R = sy["R"]
+    th = _ys_sig(r.uniform(-1.0, 1.0) + r.uniform(0.6, 1.6) * (R - _v2_meanm(R)) / max(float(_v2_stdm(R)), 1e-6))
+    coal = r.uniform(0.0, 0.5)
+    x = th * (r.uniform(0.35, 0.45) * (1.0 - coal) + r.uniform(0.8, 1.0) * coal) + r.uniform(0.0, 0.05)
+    if mins == 5:
+        x = x + _ys_ou2(r, cal["n"], r.uniform(0.5, 1.5), r.uniform(1.0, 3.0), float(np.diff(x).std()) * r.uniform(0.5, 1.5))
+    else:
+        x = _ys_white(r, x, "co2")
+    if r.random() < 0.5:
+        m = int(r.poisson(cal["nd"] * r.uniform(0.1, 0.6)))
+        for _ in range(min(m, 60)):
+            a = int(r.integers(0, cal["n"]))
+            x[a:a + int(r.integers(1, 4))] *= np.exp(r.normal(0.0, 0.4))
+    if mins == 5 and r.random() < 0.7:
+        k = cal["P"] // 24
+        pj = r.uniform(0.0, 0.2, k)
+        hold = r.random(cal["n"]) < pj[(np.arange(cal["n"])) % k]
+        hold[0] = False
+        x = x[np.maximum.accumulate(np.where(hold, 0, np.arange(cal["n"])))]
+    return x
+
+_YS_WHITE = {"demand": (0.0, 0.45), "demand15": (0.1, 0.7), "demand5": (0.3, 0.9), "gen": (0.05, 0.6), "gen15": (0.2, 0.9), "gen30": (0.2, 1.0), "flow": (0.1, 0.7), "flow5": (0.0, 0.3),
+             "price": (0.1, 0.9), "price15": (0.6, 1.6), "co2": (0.3, 1.2)}
+
+def _ys_white(r, x, kind):
+    d = np.diff(x)
+    nz = x != 0.0
+    sdd = float(d[nz[1:]].std()) if np.count_nonzero(nz[1:]) > 8 else 0.0
+    if sdd <= 0.0:
+        return x
+    t = r.uniform(0.0, 0.4) if kind.startswith("demand") else r.uniform(0.2, 0.9)
+    kind = kind if kind in _YS_WHITE else kind.rstrip("0123456789")
+    e = r.standard_normal(x.size) * np.exp(t * r.standard_normal(x.size) - t * t)
+    return np.where(nz, x + e * sdd * r.uniform(*_YS_WHITE[kind]), x)
+
+def _ys_observe(r, x, kind, mins, signed):
+    n = x.size
+    if kind == "demand":
+        sc = _ys_lu(r, 60.0, 60000.0)
+    elif kind == "price":
+        sc = _ys_lu(r, *_YS_PSCALE.get(mins, (20.0, 300.0)))
+    elif kind == "co2":
+        sc = _ys_lu(r, 250.0, 1000.0)
+    elif kind == "flow":
+        sc = _ys_lu(r, 0.4, 4.0) if (mins == 15 and r.random() < 0.8) else _ys_lu(r, 100.0, 3000.0)
+    else:
+        sc = _ys_lu(r, 30.0, 20000.0)
+    y = x * sc
+    if (signed and r.random() < 0.5) or (kind == "gen" and mins == 15 and not signed and r.random() < 0.55):
+        y = -y
+    pst = {5: 0.15, 10: 0.1, 15: 0.04, 30: 0.03, 60: 0.0}[mins] * (1.0 if kind == "gen" else 0.3)
+    if r.random() < pst:
+        k = int(r.integers(2, 13 if mins == 5 else 5))
+        ph = int(r.integers(0, k))
+        y = y[np.clip((np.arange(n) + ph) // k * k - ph, 0, n - 1)]
+    if r.random() < (0.15 if kind == "demand" else 0.3):
+        m = int(r.poisson(n * _ys_lu(r, 0.0005, 0.005)))
+        for _ in range(min(m, 40)):
+            a = int(r.integers(1, n))
+            y[a:a + int(r.integers(1, 7))] = y[a - 1]
+    u = r.random()
+    big = float(np.median(np.abs(y))) > 50.0
+    if kind == "price":
+        y = np.round(y, 2) if (u < 0.85 or mins != 60) else np.round(y)
+    elif kind == "flow":
+        y = np.round(y, 3) if sc < 10.0 else (np.round(y) if u < 0.2 else np.round(y, 2) if u < 0.7 else y)
+    elif u < (0.15 if mins == 15 and kind == "gen" else 0.8 if big else 0.4):
+        y = np.round(y)
+    elif u < 0.92:
+        y = np.round(y, 1)
+    else:
+        y = y.astype(np.float32).astype(np.float64)
+    return y
+
+def _ys_len(r, mins, L):
+    return int(min(max(np.interp(r.random(), _YS_NQ, _YS_NKNOT[mins]), 256.0), L))
+
+def _ys_series(r, kind, mins, n):
+    cal = _ys_cal(r, n, 1440 // mins)
+    signed = False
+    if kind == "demand":
+        x = _ys_demand(r, cal, _ys_sun(r, cal), None) if r.random() < 0.4 else _ys_demand(r, cal)
+    elif kind == "gen":
+        sub = _YS_GEN[_ys_pick(r, _YS_GEN_W[mins])]
+        x = _ys_gen(r, cal, sub)
+        signed = sub in ("pumped", "inter")
+    elif kind == "flow":
+        x = _ys_flow(r, cal, mins)
+        signed = True
+    elif kind == "price":
+        x = _ys_price(r, cal, mins)
+    else:
+        x = _ys_co2(r, cal, mins)
+    if kind == "demand" and mins == 5:
+        d = np.diff(x)
+        x = x + _ys_ou2(r, n, r.uniform(0.5, 1.5), r.uniform(1.0, 3.0), float(_v2_stdm(d)) * r.uniform(0.6, 2.0))
+    elif kind == "demand" and mins == 15:
+        x = _ys_white(r, np.asarray(x, dtype=np.float64), "demand15")
+    elif kind in ("demand", "gen", "flow"):
+        x = _ys_white(r, np.asarray(x, dtype=np.float64), kind + ("30" if mins >= 30 and kind == "gen" else "15" if mins == 15 and kind == "gen" else "5" if mins == 5 and kind == "flow" else ""))
+    return _ys_observe(r, np.asarray(x, dtype=np.float64), kind, mins, signed)
+
+def _ys_energy(r, L):
+    L = int(L)
+    if L < 256:
+        return None
+    kind, mins, _ = _YS_CELLS[min(int(np.searchsorted(_YS_CELL_CUM, r.random() * _YS_CELL_CUM[-1], side="right")),
+                                  len(_YS_CELLS) - 1)]
+    n = _ys_len(r, mins, L)
+    y = _ys_series(r, kind, mins, n)
+    out = np.empty(L, dtype=np.float64)
+    out[:L - n] = y[0]
+    out[L - n:] = y
+    if not bool(np.all(np.isfinite(out))):
+        out = np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+    if float(np.ptp(out)) == 0.0:
+        out[L - 1] += 1.0
+    return out
+
+_YS_MC_CAD = ((5, 0.2), (15, 0.15), (30, 0.5), (60, 0.15))
+
+def _ys_mc_area(r, cal, C):
+    P, nd, day, n = cal["P"], cal["nd"], cal["day"], cal["n"]
+    sun, cloud = _ys_sun(r, cal), _ys_cloud(r, cal)
+    D = _ys_demand(r, cal, sun, cloud)
+    S = r.uniform(0.0, 0.5) * sun * cloud / max(float(sun.max()), 1e-6)
+    W = r.uniform(0.0, 0.5) * _ys_wind(r, cal)
+    N = r.uniform(0.0, 0.3) * _ys_gen(r, cal, "nuclear")
+    Hy = r.uniform(0.02, 0.15) * _ys_gen(r, cal, "ror")
+    M = _ys_daily(_ys_ou(r, nd + 1, r.uniform(1.0, 5.0), r.uniform(0.02, 0.06)), day, cal["frac"]) - r.uniform(0.0, 0.3) * S
+    R = D - S - W - N - Hy - M
+    q = _ys_daymean(R, day, nd)
+    ps = r.uniform(0.0, 0.12) * np.clip((R - q) / max(float(_v2_stdm(R)), 1e-6), -1.5, 1.5)
+    ps = np.where(np.abs(ps) < r.uniform(0.0, 0.03), 0.0, ps)
+    T = np.maximum(R - ps, r.uniform(0.02, 0.15))
+    pool = [T, S, W, N, Hy, ps, -M]
+    order = [0] + list(1 + r.permutation(len(pool) - 1))
+    return [D] + [pool[k] for k in order[:C - 1]], [False] + [order[k] in (5, 6) for k in range(min(C - 1, len(order)))]
+
+def _ys_mc_zones(r, cal, C):
+    P, n = cal["P"], cal["n"]
+    D0 = _ys_demand(r, cal)
+    out = []
+    for _ in range(C):
+        k = int(r.integers(-P // 24, P // 24 + 1)) if r.random() < 0.5 else 0
+        z = np.roll(D0, k) if k else D0.copy()
+        if k > 0:
+            z[:k] = D0[0]
+        elif k < 0:
+            z[k:] = D0[-1]
+        out.append(z ** r.uniform(0.6, 1.6) * (1.0 + _ys_ou2(r, n, r.uniform(0.5, 3.0), r.uniform(0.1, 1.0) * P / 24.0, r.uniform(0.01, 0.05))))
+    return out, [False] * C
+
+def _ys_mc_pair(r, cal, C):
+    P, nd, day, n = cal["P"], cal["nd"], cal["day"], cal["n"]
+    sun = _ys_sun(r, cal)
+    D = _ys_demand(r, cal, sun, None)
+    a = float(np.exp(-1.0 / max(0.02 * P, 1.0)))
+    out = [D]
+    for j in range(C - 1):
+        v = r.random()
+        if v < 0.4:
+            f = _ys_ar1(D * (1.0 - a), a)
+            out.append(f * (1.0 + _ys_ou(r, n, r.uniform(0.1, 1.0) * P, r.uniform(0.005, 0.03))))
+        elif v < 0.75:
+            out.append(np.maximum(D - r.uniform(0.05, 0.35) * sun * _ys_cloud(r, cal) - r.uniform(0.0, 0.2) * _ys_wind(r, cal), 0.02))
+        else:
+            cap = 1.25 + _ys_daily(_ys_ou(r, nd + 1, r.uniform(2.0, 10.0), 0.05), day, cal["frac"])
+            out.append(np.maximum(cap + 0.1 * (D - _v2_meanm(D)) + np.round(_ys_ou(r, n, P, 0.05) / 0.02) * 0.02, D * 1.02))
+    return out, [False] * C
+
+def _ys_energy_mc(r, L, C):
+    L, C = int(L), int(C)
+    if L < 256 or C < 1:
+        return None
+    if C == 1:
+        y = _ys_energy(r, L)
+        return None if y is None else y[None, :]
+    mins = _YS_MC_CAD[_ys_pick(r, [w for _, w in _YS_MC_CAD])][0]
+    n = _ys_len(r, mins, L)
+    cal = _ys_cal(r, n, 1440 // mins)
+    v = r.random()
+    xs, sg = _ys_mc_area(r, cal, C) if v < 0.6 else (_ys_mc_zones(r, cal, C) if v < 0.8 else _ys_mc_pair(r, cal, C))
+    while len(xs) < C:
+        xs.append(xs[len(xs) % max(len(xs), 1)] * r.uniform(0.3, 0.9) * (1.0 + _ys_ou(r, n, cal["P"] / 12.0, 0.02)))
+        sg.append(False)
+    sc = _ys_lu(r, 300.0, 60000.0)
+    unit = r.random()
+    out = np.empty((C, L), dtype=np.float64)
+    for c in range(C):
+        y = _ys_white(r, np.asarray(xs[c], dtype=np.float64), "demand" if c == 0 else "gen") * sc
+        if sg[c] and r.random() < 0.5:
+            y = -y
+        y = np.round(y) if unit < 0.8 else np.round(y, 1)
+        if not bool(np.all(np.isfinite(y))):
+            y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
+        out[c, :L - n] = y[0]
+        out[c, L - n:] = y
+        if float(np.ptp(out[c])) == 0.0:
+            out[c, L - 1] += 1.0
+    return out
+
+_YT_TWO_PI = 2.0 * np.pi
+_YT_KIND_CUM = np.cumsum([0.22, 0.17, 0.18, 0.20, 0.20, 0.03])
+_YT_MIN_N = 320
+_YT_SIG_CUM = np.cumsum([0.35, 0.45, 0.20])
+_YT_SIG_CUM_H = np.cumsum([0.60, 0.30, 0.10])
+_YT_SIG_CUM_I = np.cumsum([0.60, 0.30, 0.10])
+_YT_STEP_Q = np.array([0.25, 0.5, 0.1, 0.125, 0.05, 0.15])
+_YT_STEP_CUM = np.cumsum([0.90, 0.05, 0.02, 0.01, 0.01, 0.01])
+_YT_ICAD = ((1440, 0.71), (288, 0.07), (96, 0.20), (48, 0.02))
+_YT_ICUM = np.cumsum([w for _, w in _YT_ICAD])
+_YT_IVOL = {1440: (0.0003, 0.0009), 288: (0.0008, 0.0016), 96: (0.002, 0.0065), 48: (0.0022, 0.0075)}
+
+def _yt_lu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(max(hi, lo)))))
+
+def _yt_pick(r, cum):
+    return min(int(np.searchsorted(cum, r.random() * cum[-1], side="right")), cum.size - 1)
+
+def _yt_ar1(e, phi):
+    y = np.array(e, dtype=np.float64)
+    if y.ndim == 1 and y.flags.c_contiguous:
+        _v2_ar1_fill(y, float(phi))
+        return y
+    n = y.size
+    k = 1
+    p = float(phi)
+    while k < n and abs(p) > 1e-12:
+        y[k:] = y[k:] + p * y[:-k]
+        p = p * p
+        k *= 2
+    return y
+
+def _yt_ou(r, n, tau, sd):
+    phi = float(np.exp(-1.0 / max(tau, 0.2)))
+    e = r.standard_normal(n) * (sd * np.sqrt(max(1.0 - phi * phi, 1e-9)))
+    e[0] = r.standard_normal() * sd
+    return _yt_ar1(e, phi)
+
+def _yt_sv(r, n, ts, ss, tf, sf):
+    lv = _yt_ou(r, n, ts, ss) + (_yt_ou(r, n, tf, sf) if sf > 0.0 else 0.0)
+    v = np.exp(lv - lv.max())
+    return v / np.sqrt(max(float(_v2_mean(v * v)), 1e-300))
+
+def _yt_t(r, n, nu):
+    return r.standard_t(nu, n) * np.sqrt((nu - 2.0) / nu)
+
+def _yt_jumps(r, n, p, size):
+    j = r.random(n) < p
+    return np.where(j, size * r.uniform(1.0, 2.5, n) * np.where(r.random(n) < 0.5, -1.0, 1.0), 0.0)
+
+def _yt_ma1(e, th):
+    out = np.array(e, dtype=np.float64)
+    out[1:] += th * e[:-1]
+    return out
+
+def _yt_stale(r, x, p):
+    h = r.random(x.size) < p
+    h[0] = False
+    return x[np.maximum.accumulate(np.where(h, 0, np.arange(x.size)))]
+
+def _yt_tick(x, lvl, sig):
+    t = 10.0 ** (np.floor(np.log10(max(lvl, 1e-12))) - (sig - 1))
+    return np.round(x / t) * t, t
+
+def _yt_daycycle(r, n, P, amp):
+    ph = (np.arange(n) + int(r.integers(0, P))) * (_YT_TWO_PI / P)
+    return amp * np.cos(ph - r.uniform(0.0, _YT_TWO_PI)) + 0.4 * amp * r.random() * np.cos(2.0 * ph - r.uniform(0.0, _YT_TWO_PI))
+
+def _yt_weekend(r, n, P):
+    day = (np.arange(n) + int(r.integers(0, P))) // P
+    return ((day + int(r.integers(0, 7))) % 7) >= 5
+
+def _yt_stairs(r, n, cal):
+    q = float(_YT_STEP_Q[_yt_pick(r, _YT_STEP_CUM)])
+    u = r.random()
+    lvl = r.uniform(0.1, 4.0) if u < 0.78 else r.uniform(4.0, 11.0) if u < 0.91 else r.uniform(-0.75, 0.1)
+    lvl = float(np.round(lvl / q) * q)
+    floor = 0.0 if (lvl >= 0.0 and r.random() < 0.8) else -0.75
+    gap = (7.0 * float(r.integers(6, 9))) if cal else r.uniform(32.0, 45.0)
+    p_start, p_end, p_move = r.uniform(0.05, 0.3), r.uniform(0.05, 0.25), r.uniform(0.7, 0.97)
+    big = r.uniform(0.0, 0.4)
+    state = 0 if r.random() < 0.5 else (1 if r.random() < 0.5 else -1)
+    t = -r.uniform(0.0, gap)
+    meets, vals = [], []
+    while t < n:
+        t += gap * (r.uniform(0.95, 1.05) if not cal else 1.0) * (2.0 if r.random() < 0.06 else 1.0)
+        if state == 0:
+            if r.random() < p_start:
+                state = 1 if r.random() < 0.5 else -1
+        elif r.random() < p_end:
+            state = 0
+        if state != 0 and r.random() < p_move:
+            k = 1 + (int(r.integers(1, 3)) if r.random() < big else 0)
+            lvl = max(lvl + state * k * q, floor)
+        elif state == 0 and r.random() < 0.02:
+            lvl = max(lvl + (q if r.random() < 0.5 else -q), floor)
+        meets.append(t)
+        vals.append(lvl)
+    m = np.array(meets)
+    v = np.array(vals)
+    i = np.searchsorted(m, np.arange(n, dtype=np.float64), side="right") - 1
+    start = v[0] - (v[1] - v[0] if v.size > 1 else 0.0)
+    path = np.where(i >= 0, v[np.maximum(i, 0)], start)
+    return np.round(path, 4), q
+
+def _yt_admin(r, n):
+    cal = r.random() < 0.35
+    x, q = _yt_stairs(r, n, cal)
+    u = r.random()
+    if u < 0.3:
+        x = x + float(r.choice([-0.75, -0.5, -0.25, -0.1, 0.1, 0.25, 0.5, 0.75]))
+    if not np.any(x != x[0]):
+        k = int(r.integers(n // 8, max(n // 8 + 1, n - 8)))
+        x[k:] = x[k:] + (q if r.random() < 0.5 else -q)
+    return np.round(x, 3 if r.random() < 0.2 else 2)
+
+def _yt_rate(r, n):
+    u = r.random()
+    sub = 0 if u < 0.65 else 1 if u < 0.80 else 2
+    base = _yt_lu(r, 0.024, 0.07)
+    nu = r.uniform(5.0, 12.0)
+    v = _yt_sv(r, n, _yt_lu(r, 30.0, 400.0), r.uniform(0.3, 0.65), _yt_lu(r, 3.0, 25.0), r.uniform(0.35, 0.75))
+    e = base * v * _yt_t(r, n, nu) + base * _yt_jumps(r, n, _yt_lu(r, 2e-4, 2e-3), r.uniform(3.0, 6.0))
+    if sub == 1:
+        st, _ = _yt_stairs(r, n, r.random() < 0.3)
+        w = r.uniform(0.05, 0.4)
+        sp = _yt_ou(r, n, _yt_lu(r, 5.0, 60.0), base * r.uniform(0.5, 2.5))
+        x = st + r.normal(0.0, 0.15) + sp + w * np.cumsum(e) * r.uniform(0.2, 0.6)
+        if r.random() < 0.5:
+            mlen = r.uniform(20.5, 22.5)
+            pos = (np.arange(n) + r.uniform(0.0, mlen)) / mlen
+            me = np.floor(pos[1:]) > np.floor(pos[:-1])
+            me = np.concatenate(([False], me))
+            qe = me & ((np.floor(pos) % 3) == 0)
+            s = (1.0 if r.random() < 0.5 else -1.0) * _yt_lu(r, 0.01, 0.12)
+            x = x + s * (me * (r.random(n) < 0.7) + 1.5 * qe)
+    else:
+        u = r.random()
+        lv = r.uniform(0.1, 3.0) if u < 0.62 else r.uniform(3.0, 6.0) if u < 0.80 else r.uniform(6.0, 12.0) if u < 0.85 else r.uniform(-0.8, 0.3)
+        x = lv + np.cumsum(_yt_ma1(e, r.normal(-0.02, 0.06)))
+        if sub == 2:
+            x = x + r.uniform(0.5, 4.0) * base * r.standard_normal(n)
+    if r.random() < 0.05:
+        x = x * _yt_lu(r, 10.0, 300.0)
+    dec = 2 if r.random() < 0.5 else 3 if r.random() < 0.6 else 4
+    x = np.round(x, dec)
+    return _yt_stale(r, x, r.uniform(0.0, 0.012) if r.random() < 0.88 else r.uniform(0.02, 0.1))
+
+def _yt_fx(r, n):
+    base = _yt_lu(r, 0.0030, 0.0072)
+    nu = r.uniform(6.0, 20.0)
+    v = _yt_sv(r, n, _yt_lu(r, 20.0, 300.0), r.uniform(0.2, 0.45), _yt_lu(r, 3.0, 15.0), r.uniform(0.05, 0.4))
+    e = base * v * _yt_t(r, n, nu)
+    if r.random() < 0.35:
+        e = e + base * _yt_jumps(r, n, _yt_lu(r, 2e-4, 2e-3), r.uniform(3.0, 5.0))
+    y = np.cumsum(_yt_ma1(e, r.normal(-0.02, 0.07)))
+    lvl = 10.0 ** float(np.clip(r.normal(0.0, 1.0), -2.8, 2.6))
+    x = lvl * np.exp(y - y[0])
+    x, _ = _yt_tick(x, lvl, 4 + _yt_pick(r, _YT_SIG_CUM))
+    return _yt_stale(r, x, r.uniform(0.0, 0.015) if r.random() < 0.85 else r.uniform(0.02, 0.07))
+
+def _yt_spot(r, n, P, base, fxlike, intra):
+    nu = r.uniform(4.5, 12.0)
+    lv = np.log(_yt_sv(r, n, _yt_lu(r, 3.0, 40.0) * P, r.uniform(0.3, 0.6), _yt_lu(r, 4.0, 60.0), r.uniform(0.35, 0.75)))
+    lv = lv + _yt_daycycle(r, n, P, r.uniform(0.2, 0.6) if intra else r.uniform(0.1, 0.45))
+    wk = _yt_weekend(r, n, P)
+    wf = r.uniform(0.05, 0.3) if fxlike else r.uniform(0.25, 0.7) if intra else r.uniform(0.6, 1.0)
+    lv = lv + np.where(wk, np.log(wf), 0.0)
+    m = np.exp(lv - lv.max())
+    e = base * (m / np.sqrt(max(float(_v2_mean(m * m)), 1e-300))) * _yt_t(r, n, nu)
+    if r.random() < 0.5:
+        e = e + base * _yt_jumps(r, n, _yt_lu(r, 1e-4, 1.5e-3), r.uniform(4.0, 8.0))
+    y = np.cumsum(e)
+    if r.random() < (0.5 if intra else 0.7):
+        y = y + (r.uniform(0.05, 0.3) if intra else r.uniform(0.1, 0.5)) * base * r.standard_normal(n)
+    lvl = 10.0 ** float(np.clip(r.normal(2.0, 1.8), -2.0, 5.2) if intra else np.clip(r.normal(-0.4, 1.5), -2.9, 5.2))
+    x = lvl * np.exp(y - y[0])
+    x, _ = _yt_tick(x, lvl, (5 if intra else 4) + _yt_pick(r, _YT_SIG_CUM_I if intra else _YT_SIG_CUM_H))
+    u = r.random()
+    if intra:
+        ps = r.uniform(0.0, 0.02) if u < 0.5 else r.uniform(0.02, 0.15) if u < 0.9 else r.uniform(0.15, 0.5)
+    else:
+        ps = r.uniform(0.0, 0.008) if u < 0.65 else r.uniform(0.008, 0.08) if u < 0.92 else r.uniform(0.1, 0.55)
+    if fxlike:
+        ps = np.where(wk, r.uniform(0.5, 0.95), ps)
+    return _yt_stale(r, x, ps)
+
+def _yt_stress(r, n):
+    v = _yt_sv(r, n, _yt_lu(r, 20.0, 200.0), r.uniform(0.2, 0.4), _yt_lu(r, 3.0, 15.0), r.uniform(0.2, 0.45))
+    m = _yt_ar1(_yt_t(r, n, r.uniform(2.6, 4.0)), r.uniform(0.6, 0.85))
+    m = m / max(float(_v2_std(m)), 1e-9)
+    z = _yt_ar1(r.uniform(0.09, 0.16) * v * m, float(np.exp(-1.0 / _yt_lu(r, 40.0, 120.0))))
+    z = z + r.uniform(0.08, 0.16) * v * _yt_t(r, n, 4.0)
+    x = 10.0 ** r.uniform(-1.7, -1.2) * np.exp(z - _v2_meanm(z))
+    return np.round(x, 5)
+
+def _yt_draw(r, L):
+    kind = _yt_pick(r, _YT_KIND_CUM)
+    if kind == 0:
+        n = int(np.clip(np.exp(r.normal(np.log(1230.0), 0.70)), _YT_MIN_N, 2750))
+        return kind, "D", _yt_fx(r, min(n, L))
+    if kind == 1:
+        u = r.random()
+        n = int(_yt_lu(r, 380.0, 900.0)) if u < 0.25 else int(r.uniform(2600.0, 2720.0)) if u < 0.92 else int(r.uniform(900.0, max(L, 900)))
+        return kind, "D", _yt_rate(r, min(max(n, _YT_MIN_N), L))
+    if kind == 2:
+        u = r.random()
+        n = int(_yt_lu(r, _YT_MIN_N, 700.0)) if u < 0.3 else int(r.uniform(1000.0, 2720.0)) if u < 0.75 else L
+        return kind, "D", _yt_admin(r, min(max(n, _YT_MIN_N), L))
+    if kind == 3:
+        u = r.random()
+        n = int(r.uniform(860.0, 1010.0)) if u < 0.65 else int(r.uniform(1150.0, 1300.0)) if u < 0.88 else int(_yt_lu(r, 1300.0, L))
+        fxlike = r.random() < 0.05
+        base = _yt_lu(r, 0.001, 0.004) if fxlike else _yt_lu(r, 0.0062, 0.02)
+        return kind, "H", _yt_spot(r, min(n, L), 24, base, fxlike, False)
+    if kind == 4:
+        j = _yt_pick(r, _YT_ICUM)
+        P = _YT_ICAD[j][0]
+        n = L if r.random() < 0.88 else int(_yt_lu(r, 870.0, L))
+        lo, hi = _YT_IVOL[P]
+        return kind, {1440: "min", 288: "5min", 96: "15min", 48: "30min"}[P], _yt_spot(r, min(n, L), P, _yt_lu(r, lo, hi), False, True)
+    n = int(_yt_lu(r, 380.0, 900.0)) if r.random() < 0.3 else int(r.uniform(2950.0, 3080.0))
+    return kind, "D", _yt_stress(r, min(max(n, _YT_MIN_N), L))
+
+def _yt_econ(r, L):
+    L = int(L)
+    if L < 256:
+        return None
+    _, _, y = _yt_draw(r, L)
+    y = np.asarray(y, dtype=np.float64)
+    n = min(y.size, L)
+    y = y[y.size - n:]
+    out = np.empty(L, dtype=np.float64)
+    out[:L - n] = y[0]
+    out[L - n:] = y
+    if not np.all(np.isfinite(out)):
+        out = np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+    if float(np.ptp(out)) == 0.0:
+        out[L - 1] += max(abs(out[L - 1]) * 1e-3, 0.01)
+    return out
+
+_YU_SOD = np.arange(96, dtype=np.float64)
+_YU_UG = np.linspace(0.0, 1.0, 129)
+_YU_KINDS = ("co2", "solar", "wind", "price", "load", "power", "flow")
+_YU_KIND_CUM = np.cumsum([0.12, 0.15, 0.15, 0.25, 0.07, 0.17, 0.09])
+_YU_FULL = (0.72, 0.93, 0.87, 0.97, 0.71, 0.65, 0.05)
+_YU_SHORT = ((1450, 2700), (1500, 3300), (700, 3300), (1500, 3300), (300, 2600), (1150, 2250), (1350, 2950))
+_YU_P_TAIL = (0.20, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+_YU_P_BLIP = (0.25, 0.0, 0.10, 0.0, 0.0, 0.0, 0.0)
+_YU_BLIP_MAX = (10, 0, 12, 0, 0, 0, 0)
+
+def _yu_lu(u, lo, hi):
+    return float(lo * (hi / lo) ** u)
+
+def _yu_ar1(e, phi):
+    y = np.array(e, dtype=np.float64)
+    if y.ndim == 1 and y.flags.c_contiguous:
+        _v2_ar1_fill(y, float(phi))
+        return y
+    n = y.size
+    k = 1
+    p = float(phi)
+    while k < n and abs(p) > 1e-12:
+        y[k:] = y[k:] + p * y[:-k]
+        p = p * p
+        k *= 2
+    return y
+
+def _yu_ou(r, m, tau, tail=0.0):
+    phi = float(np.exp(-1.0 / max(tau, 0.2)))
+    e = r.standard_normal(m)
+    if tail > 0.0:
+        e *= np.exp(tail * r.standard_normal(m) - tail * tail)
+    e0 = float(e[0])
+    e *= float(np.sqrt(max(1.0 - phi * phi, 1e-12)))
+    e[0] = e0
+    return _yu_ar1(e, phi)
+
+def _yu_ou2(r, m, tau1, tau2, tail=0.0, vol=None):
+    b = int(4.0 * tau2) + 4
+    p1 = float(np.exp(-1.0 / max(tau1, 0.2)))
+    p2 = float(np.exp(-1.0 / max(tau2, 0.2)))
+    e = r.standard_normal(m + b)
+    if tail > 0.0:
+        e *= np.exp(tail * r.standard_normal(m + b) - tail * tail)
+    if vol is not None:
+        e[b:] *= vol
+    e0 = float(e[0])
+    e *= float(np.sqrt(max(1.0 - p1 * p1, 1e-12)))
+    e[0] = e0
+    y = _yu_ar1(_yu_ar1(e, p1), p2)[b:]
+    return y * float(np.sqrt((1.0 - p2 * p2) * (1.0 - p1 * p2) / (1.0 + p1 * p2)))
+
+def _yu_unit(z):
+    return z / max(float(_v2_stdm(z)), 1e-9)
+
+def _yu_bump(c, w):
+    d = np.abs((_YU_SOD - c + 48.0) % 96.0 - 48.0)
+    return np.exp(-0.5 * (d / w) ** 2)
+
+def _yu_plateau(c, w, e):
+    d = np.abs((_YU_SOD - c + 48.0) % 96.0 - 48.0)
+    return 1.0 / (1.0 + np.exp((d - w) / e))
+
+def _yu_dayline(a, f, lo=22.0, hi=86.0):
+    nd = f.size
+    d = np.arange(nd, dtype=np.float64) * 96.0
+    xp = np.empty(2 * nd, dtype=np.float64)
+    xp[0::2] = d + lo
+    xp[1::2] = d + hi
+    return np.interp(a, xp, np.repeat(f, 2))
+
+def _yu_days(r, nd, phi, sd):
+    e = r.standard_normal(nd) * (sd * float(np.sqrt(max(1.0 - phi * phi, 1e-12))))
+    e[0] = e[0] / float(np.sqrt(max(1.0 - phi * phi, 1e-12)))
+    return _yu_ar1(e, phi)
+
+def _yu_rough(r, m, tail):
+    return r.standard_normal(m) * np.exp(tail * r.standard_normal(m) - tail * tail)
+
+def _yu_hourstep(r, a, tau, tail=0.3):
+    hr = (a // 4) - int(a[0] // 4)
+    return _yu_ou(r, int(hr[-1]) + 1, tau, tail=tail)[hr]
+
+def _yu_holdsome(r, x, p):
+    idx = np.where(r.random(x.size) < p, 0, np.arange(x.size))
+    return x[np.maximum.accumulate(idx)]
+
+def _yu_co2(r, n, a, sod, day, dow0):
+    u = r.random(40)
+    nd = int(day[-1]) + 1
+    base = _yu_lu(u[0], 40.0, 700.0)
+    c = 0.07 + 0.42 * u[1]
+    qp = 0.02 + 1.12 * u[2] if u[2] < 0.25 else 0.3 + 0.8 * (u[2] - 0.25)
+    fs = 0.55 + 0.4 * u[3]
+    dip = _yu_plateau(48.0 + 6.0 * u[4], 17.0 + 9.0 * u[5], 1.0 + 2.5 * u[26])
+    rest = ((0.1 + 0.5 * u[6]) * _yu_bump(72.0 + 10.0 * u[7], 6.0 + 8.0 * u[8]) + (0.1 + 0.5 * u[9]) * _yu_bump(28.0 + 6.0 * u[10], 5.0 + 6.0 * u[11])
+            - (0.4 * u[37]) * _yu_bump(8.0 + 10.0 * u[38], 6.0 + 6.0 * u[39]))
+    sun = 0.25 + 0.75 * r.beta(1.5 + 2.5 * u[12], 0.8 + 1.0 * u[13], nd)
+    prof = rest[sod] - dip[sod] * sun[day]
+    prof = _yu_unit(prof - float(_v2_meanm(prof)))
+    slow = _yu_ou2(r, n, _yu_lu(u[14], 30.0, 300.0) if qp < 0.3 else _yu_lu(u[14], 120.0, 500.0), 3.0 + 6.0 * u[15])
+    g = _yu_lu(u[21], 0.03, 1.0)
+    o = _yu_ou(r, n, _yu_lu(u[20], 6.0, 30.0))
+    vol = 1.0 + (2.0 + 4.0 * u[19]) * (o > float(np.quantile(o, 0.85 - 0.6 * u[27])))
+    ps = 0.08 + 0.55 * u[24]
+    vol = vol * ((r.random(n) < ps) / float(np.sqrt(ps)))
+    res = _yu_unit(_yu_ou2(r, n, _yu_lu(u[16], 6.0, 36.0) * (1.0 + 1.5 * g), (1.5 + 3.5 * u[17]) * (1.0 + 1.5 * g), tail=0.3 + 0.5 * u[18], vol=vol))
+    z = float(np.sqrt(qp)) * prof + float(np.sqrt(1.0 - qp)) * (float(np.sqrt(fs)) * slow + float(np.sqrt(1.0 - fs)) * res)
+    we = (((np.arange(nd) + dow0) % 7) >= 5).astype(np.float64)
+    z = z + (-0.6 + 0.7 * u[28]) * _yu_dayline(a, we, 4.0, 92.0)
+    k = 0.1 + 0.75 * u[25] ** 2
+    z = np.tanh(k * z) / k
+    lam = -0.7 + 1.05 * u[23]
+    if abs(lam) > 0.02:
+        z = (np.exp(lam * z) - 1.0) / lam
+    z = _yu_unit(z - float(_v2_meanm(z)))
+    if u[30] < 0.28:
+
+        duty = 8.0 + 6.0 * u[31]
+        ph = 24.0 * u[32]
+        d6 = np.abs(((a.astype(np.float64) - ph) % 24.0) - 12.0)
+        sq = 1.0 / (1.0 + np.exp((d6 - 0.5 * duty) / (0.5 + 0.9 * u[33])))
+        amp = (0.5 + 1.1 * u[34]) * np.exp(0.35 * _yu_days(r, nd, 0.7, 1.0))[day]
+        z = z * (0.6 + 0.3 * u[35]) + amp * (sq - float(_v2_meanm(sq))) + (0.05 + 0.1 * u[36]) * _yu_rough(r, n, 0.4)
+        z = _yu_unit(z - float(_v2_meanm(z)))
+    else:
+        ds = float(np.diff(z).std())
+        z = z + g * min(ds, 0.075) * np.clip(_yu_rough(r, n, 0.55 + 0.6 * g + 0.25 * u[22]), -12.0, 12.0)
+    return np.round(base * np.exp(c * z) + 0.03 * r.standard_normal(n), 1)
+
+def _yu_solar(r, n, a, sod, day, dow0, noon):
+    u = r.random(30)
+    nd = int(day[-1]) + 1
+    cap = _yu_lu(u[0], 3.0, 60000.0)
+
+    hw = 25.0 + 9.0 * u[2] + (2.0 + 5.0 * u[3]) * ((nd - 1) - np.arange(nd, dtype=np.float64)) / 43.0
+    hw = np.clip(hw, 20.0, 40.0)
+    uu = (sod - (noon - hw[day])) / (2.0 * hw[day])
+    bell = np.interp(uu, _YU_UG, np.sin(np.pi * _YU_UG) ** (1.2 + 2.0 * u[4]))
+    m = _yu_lu(u[5], 0.05, 0.6)
+    kc = _yu_lu(u[6], 1.0, 8.0)
+    clear = 1.0 - 0.88 * r.beta(m * kc, (1.0 - m) * kc, nd)
+    sig = _yu_lu(u[7], 0.03, 0.5)
+    cloud = np.minimum(np.exp(sig * _yu_ou2(r, n, _yu_lu(u[8], 2.0, 16.0), 0.7 + 2.0 * u[9], tail=0.4 * u[10])), 1.35)
+    x = cap * bell * clear[day] * cloud
+    x = x * np.maximum(1.0 + _yu_lu(u[18], 0.001, 0.06) * _yu_rough(r, n, 0.35), 0.0)
+    if u[11] < 0.25:
+        kq = cap * (0.5 + 0.4 * u[12])
+        x = kq * np.tanh(x / kq)
+    if u[13] < 0.30:
+        fl = cap * _yu_lu(u[14], 0.002, 0.04)
+        x = np.maximum(x, fl * (1.0 + (0.01 + 0.1 * u[15]) * _yu_ou(r, n, 6.0 + 30.0 * u[16])))
+    if u[19] < 0.15:
+        x = _yu_holdsome(r, x, 0.1 + 0.3 * u[20])
+    return np.round(x, 1 if (u[17] < 0.75 or cap < 600.0) else 0)
+
+def _yu_wind(r, n, a, sod, day, dow0):
+    u = r.random(30)
+    cap = _yu_lu(u[0], 250.0, 30000.0)
+    nk = n // 48 + 3
+    vol = np.exp((0.15 + 1.0 * u[1] ** 1.5) * np.interp(a - a[0], np.arange(nk, dtype=np.float64) * 48.0, _yu_ou(r, nk, 3.0)))
+    g = _yu_ou2(r, n, _yu_lu(u[2], 40.0, 160.0), 1.0 + 5.5 * u[3], tail=0.3 * u[4], vol=vol)
+    g = _yu_unit(g)
+    z = g + _yu_lu(u[5], 0.02, 0.12) * _yu_ou(r, n, 1.5 + 8.0 * u[6])
+
+    nd = int(day[-1]) + 1
+    dd = (0.35 + _yu_days(r, nd, 0.4 + 0.4 * u[21], 1.0))[day]
+    A = _yu_lu(u[8], 0.35, 2.2) if u[7] < 0.96 else 0.1
+    z = z + A * dd * (_yu_bump(96.0 * u[9], 12.0 + 12.0 * u[10]) - 0.35)[sod]
+    x = cap / (1.0 + np.exp(-((0.9 + 1.0 * u[11]) * z + (-1.9 + 1.5 * u[12]))))
+    if u[13] < 0.25:
+        x = np.maximum(x - cap * _yu_lu(u[14], 0.003, 0.04), 0.0)
+    else:
+        x = x + cap * _yu_lu(u[14], 0.002, 0.01) * np.exp(0.5 * _yu_ou(r, n, 4.0))
+    if u[15] < 0.2:
+        on = (_yu_ou(r, n, 6.0 + 20.0 * u[16]) < 1.6 + 0.6 * u[17]).astype(np.float64)
+        x = x * (1.0 - (0.1 + 0.4 * u[18]) * (1.0 - on))
+    return np.round(x, 1 if (u[19] < 0.75 or cap < 400.0) else 0)
+
+def _yu_price(r, n, a, sod, day, dow0):
+    u = r.random(52)
+    nd = int(day[-1]) + 1
+    lev = 60.0 + 130.0 * u[0] if u[1] < 0.8 else _yu_lu(u[0], 25.0, 60.0)
+    nordic = u[2] < 0.25
+    dow = (np.arange(nd) + dow0) % 7
+    we = (dow >= 5).astype(np.float64)
+    lv = _yu_days(r, nd, 0.5 + 0.4 * u[3], (0.2 + 0.3 * u[4]) if nordic else (0.06 + 0.12 * u[4]))
+    lv = lv + np.where(dow == 5, np.log(0.8 + 0.17 * u[5]), 0.0) + np.where(dow == 6, np.log(0.65 + 0.28 * u[6]), 0.0)
+    dv = np.exp((0.25 + 0.4 * u[43]) * r.standard_normal(nd))
+    an = (0.3 + 0.4 * u[7]) if nordic else (0.5 + 0.6 * u[7])
+    am = (0.1 + 0.3 * u[8]) * float(u[47] < 0.85) * _yu_plateau(30.0 + 6.0 * u[9], 5.0 + 5.0 * u[10], 2.0 + 2.5 * u[38])
+    ev = (0.3 + 0.6 * u[11]) * _yu_plateau(70.0 + 8.0 * u[12], 8.0 + 8.0 * u[13], 2.0 + 2.5 * u[39])
+    ng = (0.1 + 0.3 * u[14]) * _yu_bump(10.0 + 8.0 * u[15], 10.0 + 6.0 * u[16])
+    sol = _yu_plateau(48.0 + 6.0 * u[17], 10.0 + 8.0 * u[18], 2.0 + 3.0 * u[40])
+    sd_ = np.exp((0.1 + 0.25 * u[19]) * r.standard_normal(nd))
+    scar = np.exp((0.1 + 0.3 * u[20]) * np.abs(r.standard_normal(nd)) * (r.random(nd) < 0.15))
+    sunny = r.beta(2.0 + 2.0 * u[21], 0.7 + 0.7 * u[22], nd) * (1.0 + 0.4 * we)
+    S = (0.3 + 0.7 * u[23]) if (not nordic or u[24] < 0.35) else 0.25 * u[23]
+    shape = (am[sod] - ng[sod]) * sd_[day] + ev[sod] * (sd_ * scar)[day]
+    st = np.flatnonzero((a % 4) == 0)
+    if st.size == 0 or st[0] != 0:
+        st = np.concatenate(([0], st))
+    hr = (a // 4) - int(a[0] // 4)
+    hn = (0.03 + 0.10 * u[29]) * _yu_ou(r, st.size, _yu_lu(u[27], 2.0, 12.0), tail=0.35 + 0.4 * u[28])
+    hn = hn + (0.02 + 0.07 * u[44]) * _yu_ou(r, st.size, _yu_lu(u[45], 0.3, 1.5), tail=0.65 + 0.4 * u[46])
+    y = np.clip(_yu_dayline(a, lv) + (an * shape + (2.0 if nordic else 1.0) * hn[hr]) * dv[day], -6.0, 6.0)
+    lam = -0.3 + 0.75 * u[36]
+    p = lev * (1.0 + ((np.exp(lam * y) - 1.0) / lam if abs(lam) > 0.02 else y)) - lev * S * sunny[day] * sol[sod]
+    cnt = np.diff(np.concatenate((st, [n])))
+    m = np.add.reduceat(p, st) / cnt
+    kap = 0.0 if u[25] < 0.03 else 1.2 + 2.0 * u[26]
+    x = m[hr] + kap * (p - m[hr])
+    if kap > 0.0:
+        x = x + lev * (0.01 + 0.05 * u[34]) * _yu_ou2(r, n, _yu_lu(u[35], 8.0, 48.0), 1.0 + 2.0 * u[42], tail=0.2 + 0.3 * u[37])
+        e = r.standard_normal(n) * np.exp(0.8 * r.standard_normal(n) - 0.64)
+        x = x + lev * _yu_lu(u[30], 0.004, 0.03) * e
+        x = _yu_holdsome(r, x, _yu_lu(u[41], 0.003, 0.15))
+    if u[31] < 0.3:
+        x = np.maximum(x, 0.0)
+    else:
+        F = lev * (0.02 + 0.1 * u[32])
+        neg = x < 0.0
+        x[neg] = -F * np.log1p(-x[neg] / F)
+        zz = lev * (0.004 + 0.026 * u[33])
+        x = np.where((np.abs(x) < zz) & (r.random(n) < 0.75), 0.0, x)
+    x = np.round(x, 2)
+    if u[48] < 0.8:
+        x = np.where(r.random(n) < _yu_lu(u[49], 0.01, 0.25), np.round(x), x)
+    return x
+
+def _yu_load(r, n, a, sod, day, dow0):
+    u = r.random(48)
+    nd = int(day[-1]) + 1
+    lev = _yu_lu(u[0], 700.0, 15000.0)
+    dow = (np.arange(nd) + dow0) % 7
+    sat = (dow == 5).astype(np.float64)
+    sun = (dow == 6).astype(np.float64)
+    if u[1] < 0.15:
+        wd = _yu_plateau(52.0 + 16.0 * u[2], 14.0 + 10.0 * u[3], 2.5 + 3.0 * u[41]) - (0.1 + 0.3 * u[4]) * _yu_bump(12.0 + 8.0 * u[5], 8.0 + 4.0 * u[6])
+        we = wd
+    else:
+        ng = (0.3 + 0.5 * u[4]) * _yu_bump(10.0 + 10.0 * u[5], 8.0 + 6.0 * u[6])
+        md = (0.1 + 0.4 * u[7]) * _yu_bump(46.0 + 10.0 * u[8], 8.0 + 6.0 * u[9])
+        evb = (0.5 + 0.5 * u[10]) * _yu_bump(70.0 + 12.0 * u[11], 6.0 + 6.0 * u[12])
+        wd = (0.5 + 0.5 * u[2]) * _yu_bump(28.0 + 10.0 * u[3], 6.0 + 6.0 * u[13]) + md + evb - ng
+        we = (0.2 + 0.4 * u[2]) * _yu_bump(34.0 + 10.0 * u[3], 8.0 + 6.0 * u[13]) + md + evb - ng
+    sc = max(float(_v2_stdm(wd)), 1e-9)
+    wd = (wd - float(_v2_meanm(wd))) / sc
+    we = (we - float(_v2_meanm(we))) / sc
+    depth = 0.05 + 0.12 * u[14]
+    wkmix = sat * (0.5 + 0.5 * u[15]) + sun
+    amp = (1.0 - wkmix * (0.1 + 0.4 * u[16])) * np.exp(_yu_lu(u[35], 0.05, 0.3) * r.standard_normal(nd))
+    lv = _yu_days(r, nd, 0.6 + 0.35 * u[17], 0.015 + 0.045 * u[18]) + sat * np.log(0.88 + 0.09 * u[19]) + sun * np.log(0.84 + 0.11 * u[20])
+    shape = wd[sod] * (1.0 - wkmix[day]) + we[sod] * wkmix[day]
+    x = lev * np.exp(_yu_dayline(a, lv)) * (1.0 + depth * amp[day] * shape)
+    x = x * (1.0 + _yu_lu(u[21], 0.003, 0.03) * _yu_ou2(r, n, _yu_lu(u[22], 4.0, 40.0), 0.7 + 2.0 * u[23]))
+    if u[28] < 0.4:
+        x = x * (1.0 + _yu_lu(u[29], 0.002, 0.012) * _yu_hourstep(r, a, _yu_lu(u[30], 1.0, 4.0)))
+
+    ds = float(np.diff(x).std())
+    x = x + ds * _yu_lu(u[24], 0.4, 2.5) * _yu_ou2(r, n, _yu_lu(u[42], 1.0, 4.0), 0.5 + 1.0 * u[43], tail=0.4 + 0.4 * u[27])
+    if u[36] < 0.25:
+        x = x + lev * _yu_lu(u[37], 0.004, 0.03) * _yu_ou(r, n, _yu_lu(u[38], 1.0, 6.0), tail=0.2 + 0.4 * u[39])
+    if u[31] < 0.15:
+        sp = np.cumsum((r.random(n) < _yu_lu(u[32], 0.0003, 0.003)) * r.standard_normal(n))
+        k = 2 + int(6.0 * u[40])
+        sp[k:] = sp[k:] - sp[:-k].copy()
+        x = x * np.maximum(1.0 + _yu_lu(u[33], 0.05, 0.3) * sp, 0.05)
+    x = np.maximum(x, 0.02 * lev)
+    return np.round(x, 1 if u[25] < 0.95 else 0)
+
+def _yu_signed(r, n, a, sod, day, dow0, unit):
+    u = r.random(40)
+    nd = int(day[-1]) + 1
+    dow = (np.arange(nd) + dow0) % 7
+
+    semi = u[34] < (0.75 if unit == "gw" else 0.5)
+    c2 = 96.0 * u[0] + (48.0 + 12.0 * (u[3] - 0.5)) if semi else 96.0 * u[3]
+    if u[35] < 0.6:
+        e1, e2 = 0.3 + 1.5 * u[36], 0.3 + 1.5 * u[37]
+        pr = _yu_plateau(96.0 * u[0], 6.0 + 14.0 * u[1], e1) + (0.3 + 0.9 * u[2]) * (1.0 if semi else -1.0) * _yu_plateau(c2, 4.0 + 12.0 * u[4], e2)
+    else:
+        pr = _yu_bump(96.0 * u[0], 8.0 + 14.0 * u[1]) + (0.3 + 0.9 * u[2]) * (1.0 if semi else -1.0) * _yu_bump(c2, 6.0 + 12.0 * u[4])
+    pr = _yu_unit(pr - float(_v2_meanm(pr)))
+    dsc = np.exp((0.1 + 0.4 * u[5]) * _yu_days(r, nd, 0.5, 1.0))
+    wk = np.where(dow >= 5, -0.3 + 0.8 * u[6], 0.0) * float(u[7] < 0.5)
+    qd = (0.75 * u[8] ** 1.2) if unit == "gw" else (0.6 * u[8] ** 1.5)
+    prof = pr[sod] * dsc[day] + _yu_dayline(a, wk, 4.0, 92.0)
+    slow = _yu_ou2(r, n, _yu_lu(u[9], 60.0, 600.0), 4.0 + 8.0 * u[10], tail=0.2 * u[33])
+    mid = _yu_ou2(r, n, _yu_lu(u[11], 4.0, 30.0), 1.0 + 2.0 * u[12], tail=0.2 + 0.3 * u[13])
+    z = float(np.sqrt(qd)) * prof + float(np.sqrt(1.0 - qd)) * (_yu_lu(u[14], 0.4, 1.2) * slow + _yu_lu(u[15], 0.2, 0.9) * mid)
+    z = _yu_unit(z - float(_v2_meanm(z)))
+    if u[38] < (0.08 if unit == "gw" else 0.25):
+        d6 = np.abs(((a.astype(np.float64) - 24.0 * u[39]) % 24.0) - 12.0)
+        sq = 1.0 / (1.0 + np.exp((d6 - (3.0 + 4.0 * u[36])) / (0.4 + 1.0 * u[37])))
+        z = z + (0.4 + 1.2 * u[35]) * np.exp(0.3 * _yu_days(r, nd, 0.7, 1.0))[day] * (sq - float(_v2_meanm(sq)))
+    if u[16] < (0.45 if unit == "gw" else 0.3):
+        z = z + _yu_lu(u[17], 0.05, 0.4) * _yu_hourstep(r, a, _yu_lu(u[18], 0.5, 3.0))
+
+    ds = float(np.diff(z).std())
+    if u[30] < 0.12:
+        z = z + ds * _yu_lu(u[19], 0.5, 4.0) * np.clip(_yu_rough(r, n, 0.2 + 0.4 * u[20]), -10.0, 10.0)
+    else:
+        z = z + ds * _yu_lu(u[19], 0.6, 2.2) * _yu_ou2(r, n, _yu_lu(u[31], 1.0, 4.0), 0.5 + 1.0 * u[32], tail=0.4 + 0.4 * u[20])
+    mu = (-1.0 + 2.0 * u[21]) * (2.6 if u[22] < 0.5 else 1.2)
+    if unit == "gw":
+        lv = _yu_lu(u[23], 0.35, 3.0)
+        x = lv * (mu + 0.8 * z)
+        if u[24] < 0.06:
+            x = x[np.maximum(np.arange(n) - (a % 4), 0)]
+        if u[25] < 0.2:
+            lim = lv * (abs(mu) + 1.2 + 0.8 * u[26])
+            x = np.clip(x, -lim, lim)
+        return np.round(x, 3)
+    lv = _yu_lu(u[23], 30.0, 4000.0)
+    x = lv * (mu + 0.8 * z)
+    if u[27] < 0.2:
+        x = _yu_holdsome(r, x, 0.1 + 0.3 * u[28])
+    return np.round(x, 1 if u[29] < 0.85 else 0)
+
+def _yu_pump(r, n, a, sod, day, dow0):
+    u = r.random(40)
+    nd = int(day[-1]) + 1
+    cap = _yu_lu(u[0], 20.0, 3000.0)
+    on = np.zeros(n, dtype=bool)
+    rel = sod.astype(np.float64)
+    dows = (np.arange(nd) + dow0) % 7
+    wk = 1.0 + (0.4 * u[8] - 0.2) * (dows >= 5)
+    blocks = []
+    if u[1] < 0.3:
+        kb = 4 if u[2] < 0.65 else 3
+        for j in range(kb):
+            blocks.append((96.0 * u[3] + j * 96.0 / kb, 4.0 + 6.0 * u[6], 0.75 + 0.25 * u[7]))
+    else:
+        blocks.append((88.0 + 20.0 * u[2], 14.0 + 26.0 * u[3], 0.8 + 0.2 * u[7]))
+        if u[4] < 0.7:
+            blocks.append((38.0 + 14.0 * u[5], 6.0 + 18.0 * u[6], 0.15 + 0.45 * u[26]))
+    jit = 0.2 + 1.5 * u[9] ** 3
+    for s0, ln, pon in blocks:
+        go = r.random(nd) < np.clip(pon * wk, 0.0, 1.0)
+        js = np.round(s0 + jit * r.standard_normal(nd)) % 96.0
+        jl = np.maximum(np.round(ln * np.exp((0.05 + 0.25 * u[10]) * r.standard_normal(nd))), 2.0)
+        e = js + jl
+        on |= go[day] & (rel >= js[day]) & (rel < e[day])
+        prv = np.concatenate(([False], go[:-1]))[day]
+        on |= prv & (rel < (np.concatenate(([0.0], e[:-1]))[day] - 96.0))
+    if u[11] < 0.25:
+        on |= _yu_ou(r, n, 3.0 + 6.0 * u[12]) > 2.0 + 0.5 * u[13]
+    m = on.astype(np.float64)
+    ramp = 1 + int(2.5 * u[22] ** 2)
+    if ramp > 1:
+        m = np.convolve(m, np.ones(ramp) / ramp)[:n]
+
+    f = np.clip(0.75 + (0.1 + 0.25 * u[15]) * _yu_ou2(r, n, _yu_lu(u[16], 2.0, 12.0), 1.0 + 2.0 * u[28], tail=0.3), 0.08, 1.0)
+    if u[14] < 0.5:
+        K = 2 + int(5.0 * u[23])
+        f = np.ceil(f * K) / K
+    x = cap * m * f * (1.0 + _yu_lu(u[24], 0.001, 0.015) * _yu_rough(r, n, 0.4))
+    if u[17] < 0.2:
+        aux = _yu_holdsome(r, cap * _yu_lu(u[18], 0.01, 0.06) * np.exp(0.4 * _yu_ou(r, n, 4.0)), 0.3 + 0.4 * u[27])
+        zr = _yu_ou(r, n, _yu_lu(u[25], 2.0, 20.0)) < -1.5 + 1.0 * u[19]
+        x = np.where(m > 0.0, x, np.where(zr, 0.0, aux))
+    x = -x if u[20] < 0.85 else x
+    return np.round(x, 0 if u[21] < 0.4 else 1)
+
+def _yu_power(r, n, a, sod, day, dow0):
+    if r.random() < 0.5:
+        return _yu_pump(r, n, a, sod, day, dow0)
+    return _yu_signed(r, n, a, sod, day, dow0, "mw")
+
+def _yu_flow(r, n, a, sod, day, dow0):
+    return _yu_signed(r, n, a, sod, day, dow0, "gw")
+
+def _yu_tail_len(r):
+    return int(min(max(round(18.0 + 4.5 * float(r.standard_normal())), 8), 28))
+
+def _yu_draw(r, L):
+    L = int(L)
+    u = r.random(12)
+    kind = min(int(np.searchsorted(_YU_KIND_CUM, u[0], side="right")), len(_YU_KINDS) - 1)
+    hv = (64, 256, 720)[min(int(3.0 * u[1]), 2)]
+    lo, hi = _YU_SHORT[kind]
+    feed = L + 64 if u[2] < _YU_FULL[kind] else int(lo + hv + (hi - lo) * u[3])
+    n = int(max(min(L, feed - hv), min(L, 256)))
+
+    s_end = (30.0 + 12.0 * u[4]) if hv != 720 else (46.0 + 12.0 * u[4])
+    s_end = int(round(s_end + 2.0 * float(r.standard_normal())))
+    a = np.arange(n, dtype=np.int64) + int((s_end - (n - 1)) % 96)
+    dow0 = int(7.0 * u[5])
+    if kind == 1:
+        x = _yu_solar(r, n, a, a % 96, a // 96, dow0, 40.0 + 10.0 * u[8])
+    else:
+        x = (_yu_co2, None, _yu_wind, _yu_price, _yu_load, _yu_power, _yu_flow)[kind](r, n, a, a % 96, a // 96, dow0)
+    x = np.asarray(x, dtype=np.float64)
+    end = n
+    if u[6] < _YU_P_TAIL[kind]:
+        T = _yu_tail_len(r)
+        if n - T >= 256:
+            x[n - T:] = x[n - T - 1]
+            end = n - T
+    if u[7] < _YU_P_BLIP[kind]:
+        nc = (end - 96) // 64
+        if nc >= 4:
+            nb = 1 + int(3.0 * u[9])
+            cells = r.choice(nc, size=min(nb, nc), replace=False)
+            v = r.random((cells.size, 3))
+            for j in range(cells.size):
+                m = min(2 + int(6.0 * v[j, 0]) if v[j, 1] < 0.7 else 8 + int(8.0 * v[j, 0] ** 2), _YU_BLIP_MAX[kind])
+                s = 64 + 64 * int(cells[j]) + int(32.0 * v[j, 2])
+                x[s:s + m] = x[s - 1]
+    if kind == 5 and u[10] < 0.04 and n > 600:
+        T = 40 + int(95.0 * u[11])
+        x[n - T:] = x[n - T - 1]
+    return x, kind
+
+def _yu_grid15v2(r, L):
+    L = int(L)
+    if L < 512:
+        return None
+    x, _ = _yu_draw(r, L)
+    n = x.size
+    if n > L:
+        x = x[n - L:]
+        n = L
+    out = np.empty(L, dtype=np.float64)
+    out[:L - n] = x[0]
+    out[L - n:] = x
+    if not bool(np.all(np.isfinite(out))) or float(out.max()) <= float(out.min()):
+        return None
+    return out
+
+import json as _yz_json
+import os as _yz_os
+
+_YZ_TAG = 0x59A0_0001
+_YZ_L = 4096
+_YZ_MAX_SHARE = 0.25
+_YZ_FAMS = (("yairq", "_ya_airq"), ("ygrid15", "_yb_grid15"), ("ymin1440", "_yc_min1440"), ("yrates", "_yd_rates"),
+            ("ycounts", "_ye_counts"),
+
+            ("yairqm", "_ya_airqm"), ("yairq0", "_ya_airq0"),
+
+            ("yfreeze", "_yf_freeze"), ("ycounts2", "_ye_counts2"),
+
+            ("ymin1440r1", "_yg_min1440"), ("ycountsr1", "_yh_counts"),
+
+            ("ycivic", "_yj_civic"), ("ybike", "_yl_bike"), ("yhealth", "_yi_health"), ("yhydro", "_yk_hydro"),
+
+            ("ymicro", "_yn_micro"), ("yfuel", "_ym_fuel"),
+            ("yozone", "_yo_ozone"),
+            ("yhourly0", "_yp_hourly0"),
+            ("yecon", "_yt_econ"),
+            ("ysales", "_yr_sales"),
+            ("yenergy", "_ys_energy"),
+            ("ytransport", "_yq_transport"),
+            ("ygrid15v2", "_yu_grid15v2"))
+
+_YZ_CHILD_BUDGET = 13_320_000_000
+
+def _yz_points(x) -> int:
+    try:
+        c = 1 if np.ndim(x) == 1 else int(np.shape(x)[0])
+        n = int(np.size(x))
+    except Exception:
+        return 0
+    return -(-n * 100 // 120) if c > 1 else n
+
+def _yz_num(v, default: float) -> float:
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return default
+    return v if np.isfinite(v) and v >= 0.0 else default
+
+_YZParent = Generator
+
+class Generator(_YZParent):
+
+    def __init__(self, config_dir: str, *, seed: int) -> None:
+        super().__init__(config_dir, seed=seed)
+        cfg: dict = {}
+        try:
+            with open(_yz_os.path.join(config_dir, "config.json"), encoding="utf-8") as fh:
+                got = _yz_json.load(fh).get("y_insert", {})
+            cfg = got if isinstance(got, dict) else {}
+        except (OSError, ValueError, TypeError, AttributeError):
+            cfg = {}
+        mult = min(_yz_num(cfg.get("rate", 1.0), 1.0), 20.0)
+        fams = []
+        for k, (key, fn) in enumerate(_YZ_FAMS):
+            q = min(_yz_num(cfg.get(key, 0.0), 0.0) * mult, _YZ_MAX_SHARE)
+            f = globals().get(fn)
+            if q > 0.0 and callable(f):
+                fams.append((k, q, f))
+        self._yz_fams = tuple(fams)
+
+        self._yz_open = min(max(_yz_num(cfg.get("open", 0.0), 0.0), 0.0), 0.95)
+
+    @property
+    def name(self) -> str:
+        return "c000"
+
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        n = int(n_series)
+        if n <= 0:
+            return
+        fams = self._yz_fams
+        seed = int(self._seed) & ((1 << 64) - 1)
+        slots = len(_YZ_FAMS)
+        out = 0
+        lo = self._yz_open * _YZ_CHILD_BUDGET
+        pos = 0
+        base = super().generate(n)
+        try:
+            for i, x in enumerate(base):
+                fams = self._yz_fams
+                if fams and (lo <= 0 or pos >= lo):
+                    u = _fcx_coins(seed, _YZ_TAG, i, slots)
+                    for k, q, f in fams:
+                        if u[k] >= q:
+                            continue
+                        w = None
+                        try:
+                            with np.errstate(all="ignore"):
+                                w = f(np.random.default_rng(np.random.SeedSequence([seed, _YZ_TAG, k + 1], spawn_key=(i,))), _YZ_L)
+                        except Exception:
+                            w = None
+                        if (isinstance(w, np.ndarray) and w.ndim == 1 and w.size == _YZ_L and w.dtype.kind == "f"
+                                and bool(np.all(np.isfinite(w))) and float(w.max()) > float(w.min())):
+                            yield np.ascontiguousarray(w, dtype=np.float64)
+                            out += 1
+                            if lo > 0:
+                                pos += _YZ_L
+                            if out >= n:
+                                return
+                yield x
+                if lo > 0:
+                    pos += _yz_points(x)
+                out += 1
+                if out >= n:
+                    return
+        finally:
+            base.close()
+
+import json as _yc_json
+import os as _yc_os
+
+_YC_TAG = 0x59C0_0001
+_YC_MIN_LEN = 256
+_YC_MAX_SHARE = 0.5
+_YC_HOSTS = (1, 2, 3, 4)
+
+_YC_FAMS = (("ch_airqm", "_ya_airqm"), ("ch_airq0", "_ya_airq0"), ("ch_grid15", "_yb_grid15"), ("ch_min1440", "_yc_min1440"),
+            ("ch_rates", "_yd_rates"), ("ch_freeze", "_yf_freeze"), ("ch_counts2", "_ye_counts2"),
+            ("ch_civic", "_yj_civic"), ("ch_bike", "_yl_bike"), ("ch_health", "_yi_health"), ("ch_hydro", "_yk_hydro"),
+            ("ch_micro", "_yn_micro"), ("ch_fuel", "_ym_fuel"), ("ch_ozone", "_yo_ozone"),
+            ("ch_hourly0", "_yp_hourly0"), ("ch_econ", "_yt_econ"), ("ch_sales", "_yr_sales"), ("ch_energy", "_ys_energy"), ("ch_transport", "_yq_transport"))
+
+def _yc_num(v, default: float) -> float:
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return default
+    return v if np.isfinite(v) and v >= 0.0 else default
+
+def _yc_host(x, hosts=_YC_HOSTS) -> bool:
+    if not isinstance(x, np.ndarray) or x.dtype != np.float64:
+        return False
+    c = 1 if x.ndim == 1 else (x.shape[0] if x.ndim == 2 else 0)
+    if c not in hosts or x.shape[-1] < _YC_MIN_LEN:
+        return False
+    if x.flags.c_contiguous:
+        if not _v2_all_finite(x.reshape(-1)):
+            return False
+    elif not bool(np.all(np.isfinite(x))):
+        return False
+    x0 = x if x.ndim == 1 else x[0]
+    if x0.flags.c_contiguous:
+        if _v2_all_equal_first(x0):
+            return False
+    elif bool(np.all(x0 == x0[0])):
+        return False
+    for h in ("_k87_quiet", "_w86b_intlike"):
+        f = globals().get(h)
+        if callable(f):
+            try:
+                if f(x0):
+                    return False
+            except Exception:
+                return False
+    return True
+
+_YCParent = Generator
+
+class Generator(_YCParent):
+
+    def __init__(self, config_dir: str, *, seed: int) -> None:
+        super().__init__(config_dir, seed=seed)
+        cfg: dict = {}
+        try:
+            with open(_yc_os.path.join(config_dir, "config.json"), encoding="utf-8") as fh:
+                got = _yc_json.load(fh).get("y_channel", {})
+            cfg = got if isinstance(got, dict) else {}
+        except (OSError, ValueError, TypeError, AttributeError):
+            cfg = {}
+        mult = min(_yc_num(cfg.get("rate", 1.0), 1.0), 20.0)
+        fams = []
+        for k, (key, fn) in enumerate(_YC_FAMS):
+            q = min(_yc_num(cfg.get(key, 0.0), 0.0) * mult, _YC_MAX_SHARE)
+            f = globals().get(fn)
+            if q > 0.0 and callable(f):
+                fams.append((k, q, f))
+        self._yc_fams = tuple(fams)
+        try:
+            hs = tuple(int(h) for h in cfg.get("hosts", _YC_HOSTS))
+        except (TypeError, ValueError):
+            hs = _YC_HOSTS
+        self._yc_hosts = tuple(h for h in hs if 1 <= h <= 7) or _YC_HOSTS
+
+        self._yc_open = min(max(_yc_num(cfg.get("open", 0.0), 0.0), 0.0), 0.95)
+
+    @property
+    def name(self) -> str:
+        return "c000"
+
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        n = int(n_series)
+        if n <= 0:
+            return
+        fams = self._yc_fams
+        seed = int(self._seed) & ((1 << 64) - 1)
+        slots = len(_YC_FAMS)
+        lo = self._yc_open * _YZ_CHILD_BUDGET if "_YZ_CHILD_BUDGET" in globals() else 0.0
+        pos = 0
+        base = super().generate(n)
+        try:
+            for i, x in enumerate(base):
+                fams = self._yc_fams
+                if fams and (lo <= 0 or pos >= lo) and _yc_host(x, self._yc_hosts):
+                    u = _fcx_coins(seed, _YC_TAG, i, slots)
+                    for k, q, f in fams:
+                        if u[k] >= q:
+                            continue
+                        L = int(x.shape[-1])
+                        w = None
+                        try:
+                            with np.errstate(all="ignore"):
+                                w = f(np.random.default_rng(np.random.SeedSequence([seed, _YC_TAG, k + 1], spawn_key=(i,))), L)
+                        except Exception:
+                            w = None
+                        if (isinstance(w, np.ndarray) and w.ndim == 1 and w.size == L and w.dtype.kind == "f"
+                                and bool(np.all(np.isfinite(w))) and float(w.max()) > float(w.min())):
+                            h = x.reshape(1, L) if x.ndim == 1 else x
+                            z = np.empty((h.shape[0] + 1, L), dtype=np.float64)
+                            z[:-1] = h
+                            z[-1] = w
+                            x = z
+                            break
+                if lo > 0:
+                    pos += _yz_points(x)
+                yield x
+        finally:
+            base.close()
+
+import json as _yac_json
+import os as _yac_os
+
+_YAC_TAG = 0x59E0_0001
+
+def _yac_moving(c) -> bool:
+    d = np.diff(c)
+    return bool(_v2_mean(d == 0.0) < 0.3) and not bool(np.all(c == np.round(c)))
+
+def _yac_couple(x, r):
+    C, L = x.shape
+    d0 = np.diff(x[0])
+    s0 = float(_v2_std(d0))
+    if not np.isfinite(s0) or s0 <= 0.0 or not _yac_moving(x[0]):
+        return None
+    z0 = d0 / s0
+    out = x.copy()
+    for k in range(1, C):
+        xk = x[k]
+        dk = np.diff(xk)
+        sk = float(_v2_std(dk))
+        if not np.isfinite(sk) or sk <= 0.0 or not _yac_moving(xk):
+            continue
+        lag = int(r.integers(0, 4))
+        zl = np.concatenate([np.zeros(lag), z0[: len(z0) - lag]]) if lag else z0
+        rho = float(np.clip(r.beta(4.0, 3.0), 0.2, 0.95)) * (1.0 if r.random() < 0.85 else -1.0)
+        own = (dk - _v2_meanm(dk)) / sk
+        dn = rho * zl + np.sqrt(1.0 - rho * rho) * own
+        y = np.concatenate([[xk[0]], xk[0] + np.cumsum(dn * sk + _v2_meanm(dk))])
+        if bool(np.all(xk >= 0.0)):
+            y = np.maximum(y, 0.0)
+        if bool(np.all(np.isfinite(y))) and float(y.max()) > float(y.min()):
+            out[k] = y
+    return out
+
+_YACParent = Generator
+
+class Generator(_YACParent):
+
+    def __init__(self, config_dir: str, *, seed: int) -> None:
+        super().__init__(config_dir, seed=seed)
+        try:
+            with open(_yac_os.path.join(config_dir, "config.json"), encoding="utf-8") as fh:
+                got = _yac_json.load(fh).get("y_couple", {})
+            cfg = got if isinstance(got, dict) else {}
+        except (OSError, ValueError, TypeError, AttributeError):
+            cfg = {}
+        try:
+            q = float(cfg.get("q", 0.0))
+        except (TypeError, ValueError):
+            q = 0.0
+        self._yac_q = q if np.isfinite(q) and 0.0 <= q <= 1.0 else 0.0
+
+    @property
+    def name(self) -> str:
+        return "c000"
+
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        n = int(n_series)
+        if n <= 0:
+            return
+        q = self._yac_q
+        seed = int(self._seed) & ((1 << 64) - 1)
+        base = super().generate(n)
+        try:
+            for i, x in enumerate(base):
+                q = self._yac_q
+                if q > 0.0 and isinstance(x, np.ndarray) and x.dtype == np.float64 and x.ndim == 2 and x.shape[0] >= 2 and x.shape[1] >= 256:
+                    r = np.random.default_rng(np.random.SeedSequence([seed, _YAC_TAG], spawn_key=(i,)))
+                    if r.random() < q:
+                        try:
+                            with np.errstate(all="ignore"):
+                                z = _yac_couple(x, r)
+                            if z is not None and bool(np.all(np.isfinite(z))):
+                                x = z
+                        except Exception:
+                            pass
+                yield x
+        finally:
+            base.close()
+
+import json as _ybq_json
+import os as _ybq_os
+
+_YBQ_TAG = 0x59E0_0002
+
+def _ybq_round(c, r):
+    if bool(np.all(c == np.round(c))):
+        return c
+    lvl = float(np.median(np.abs(c)))
+    if not np.isfinite(lvl) or lvl <= 0.0:
+        return c
+    if lvl >= 20.0 and r.random() < 0.5:
+        y = np.round(c)
+    else:
+        digits = 3 if r.random() < 0.5 else 4
+        step = 10.0 ** (np.floor(np.log10(lvl)) - digits + 1)
+        y = np.round(c / step) * step
+    return y if float(y.max()) > float(y.min()) else c
+
+_YBQParent = Generator
+
+class Generator(_YBQParent):
+
+    def __init__(self, config_dir: str, *, seed: int) -> None:
+        super().__init__(config_dir, seed=seed)
+        try:
+            with open(_ybq_os.path.join(config_dir, "config.json"), encoding="utf-8") as fh:
+                got = _ybq_json.load(fh).get("y_quant", {})
+            cfg = got if isinstance(got, dict) else {}
+        except (OSError, ValueError, TypeError, AttributeError):
+            cfg = {}
+        try:
+            q = float(cfg.get("q", 0.0))
+        except (TypeError, ValueError):
+            q = 0.0
+        self._ybq_q = q if np.isfinite(q) and 0.0 <= q <= 1.0 else 0.0
+
+    @property
+    def name(self) -> str:
+        return "c000"
+
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        n = int(n_series)
+        if n <= 0:
+            return
+        q = self._ybq_q
+        seed = int(self._seed) & ((1 << 64) - 1)
+        base = super().generate(n)
+        try:
+            for i, x in enumerate(base):
+                q = self._ybq_q
+                if q > 0.0 and isinstance(x, np.ndarray) and x.dtype == np.float64 and x.ndim in (1, 2):
+                    r = np.random.default_rng(np.random.SeedSequence([seed, _YBQ_TAG], spawn_key=(i,)))
+                    if r.random() < q:
+                        try:
+                            h = x.reshape(1, -1) if x.ndim == 1 else x
+                            z = np.stack([_ybq_round(c, r) for c in h])
+                            if bool(np.all(np.isfinite(z))):
+                                x = z[0] if x.ndim == 1 else z
+                        except Exception:
+                            pass
+                yield x
+        finally:
+            base.close()
+
+import json as _ycs_json
+import os as _ycs_os
+
+_YCS_TAG = 0x59E0_0003
+
+_YCS_KNOTS = ((200, 0.0), (316, 0.03), (501, 0.115), (1000, 0.375), (1995, 0.52), (3981, 0.69))
+
+def _ycs_draw(r):
+    u = r.random()
+    if u >= _YCS_KNOTS[-1][1]:
+        return None
+    for (a, fa), (b, fb) in zip(_YCS_KNOTS, _YCS_KNOTS[1:]):
+        if u < fb:
+            t = (u - fa) / max(fb - fa, 1e-9)
+            return int(np.exp(np.log(a) + t * (np.log(b) - np.log(a))))
+    return None
+
+_YCSParent = Generator
+
+class Generator(_YCSParent):
+
+    def __init__(self, config_dir: str, *, seed: int) -> None:
+        super().__init__(config_dir, seed=seed)
+        try:
+            with open(_ycs_os.path.join(config_dir, "config.json"), encoding="utf-8") as fh:
+                got = _ycs_json.load(fh).get("y_short", {})
+            cfg = got if isinstance(got, dict) else {}
+        except (OSError, ValueError, TypeError, AttributeError):
+            cfg = {}
+        try:
+            q = float(cfg.get("q", 0.0))
+        except (TypeError, ValueError):
+            q = 0.0
+        self._ycs_q = q if np.isfinite(q) and 0.0 <= q <= 1.0 else 0.0
+
+    @property
+    def name(self) -> str:
+        return "c000"
+
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        n = int(n_series)
+        if n <= 0:
+            return
+        q = self._ycs_q
+        seed = int(self._seed) & ((1 << 64) - 1)
+        base = super().generate(n)
+        try:
+            for i, x in enumerate(base):
+                q = self._ycs_q
+                if q > 0.0 and isinstance(x, np.ndarray) and x.dtype == np.float64 and x.ndim in (1, 2) and x.shape[-1] >= 512:
+                    r = np.random.default_rng(np.random.SeedSequence([seed, _YCS_TAG], spawn_key=(i,)))
+                    if r.random() < q:
+                        m = _ycs_draw(r)
+                        if m is not None:
+                            h = x.reshape(1, -1) if x.ndim == 1 else x
+                            L = h.shape[1]
+                            c0 = h[0]
+                            moved = np.flatnonzero(c0 != c0[0])
+                            real = L - (int(moved[0]) - 1 if moved.size else L)
+                            if 64 <= m < real:
+                                z = np.empty_like(h)
+                                z[:, : L - m] = h[:, L - m: L - m + 1]
+                                z[:, L - m:] = h[:, L - m:]
+                                if bool(np.all(np.isfinite(z))) and float(z[0].max()) > float(z[0].min()):
+                                    x = z[0].copy() if x.ndim == 1 else z
+                yield x
+        finally:
+            base.close()
+
+import json as _ydh_json
+import os as _ydh_os
+
+_YDH_TAG = 0x59E0_0004
+
+def _ydh_apply(c, r, lo, hi, alpha):
+    L = c.shape[0]
+    mv0 = np.flatnonzero(c != c[0])
+    if not mv0.size:
+        return None
+    r0 = max(0, int(mv0[0]) - 1)
+    hi = min(hi, L - r0 - 256)
+    if hi <= lo:
+        return None
+    for _ in range(6):
+        E = int(np.exp(r.uniform(np.log(lo), np.log(hi))))
+        s = L - E
+        past = c[r0:s]
+        if past.size < 256 or float(_v2_mean(np.diff(past) != 0.0)) < 0.3:
+            continue
+        sd = float(_v2_std(past))
+        if not np.isfinite(sd) or sd <= 0.0:
+            continue
+        z = abs(float(c[s]) - float(_v2_mean(past))) / sd
+        if not 0.3 <= z <= 2.5:
+            continue
+        D = int(10.0 * (1.0 - r.random()) ** (-1.0 / alpha))
+        y = c.copy()
+        if D >= E:
+            y[s:] = c[s]
+        else:
+            e = s + D
+            y[s:e] = c[s]
+            y[e:] = c[s] + (c[e:] - c[e])
+        return y
+    return None
+
+_YDHParent = Generator
+
+class Generator(_YDHParent):
+
+    def __init__(self, config_dir: str, *, seed: int) -> None:
+        super().__init__(config_dir, seed=seed)
+        try:
+            with open(_ydh_os.path.join(config_dir, "config.json"), encoding="utf-8") as fh:
+                got = _ydh_json.load(fh).get("y_hold", {})
+            cfg = got if isinstance(got, dict) else {}
+        except (OSError, ValueError, TypeError, AttributeError):
+            cfg = {}
+        def num(k, d):
+            try:
+                v = float(cfg.get(k, d))
+                return v if np.isfinite(v) else d
+            except (TypeError, ValueError):
+                return d
+        q = num("q", 0.0)
+        self._ydh_q = q if 0.0 <= q <= 1.0 else 0.0
+        self._ydh_lo, self._ydh_hi = max(16, int(num("min", 100))), int(num("max", 3000))
+        self._ydh_alpha = min(max(num("alpha", 0.45), 0.2), 3.0)
+
+    @property
+    def name(self) -> str:
+        return "c000"
+
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        n = int(n_series)
+        if n <= 0:
+            return
+        seed = int(self._seed) & ((1 << 64) - 1)
+        base = super().generate(n)
+        try:
+            for i, x in enumerate(base):
+                q = self._ydh_q
+                if q > 0.0 and isinstance(x, np.ndarray) and x.dtype == np.float64 and x.ndim in (1, 2) and x.shape[-1] >= 512:
+                    r = np.random.default_rng(np.random.SeedSequence([seed, _YDH_TAG], spawn_key=(i,)))
+                    if r.random() < q:
+                        try:
+                            c0 = x if x.ndim == 1 else x[0]
+                            if bool(np.all(np.isfinite(c0))):
+                                y = _ydh_apply(c0, r, self._ydh_lo, self._ydh_hi, self._ydh_alpha)
+                                if y is not None and float(y.max()) > float(y.min()):
+                                    if x.ndim == 1:
+                                        x = y
+                                    else:
+                                        x = x.copy(); x[0] = y
+                        except Exception:
+                            pass
+                yield x
+        finally:
+            base.close()
+
+import json as _yu_json
+import os as _yu_os
+
+_YU_TAG = 0x59D0_0001
+_YU_MIN_KEEP = 256
+
+def _yu_num(v, default: float) -> float:
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return default
+    return v if np.isfinite(v) and v >= 0.0 else default
+
+_YUParent = Generator
+
+class Generator(_YUParent):
+
+    def __init__(self, config_dir: str, *, seed: int) -> None:
+        super().__init__(config_dir, seed=seed)
+        cfg: dict = {}
+        try:
+            with open(_yu_os.path.join(config_dir, "config.json"), encoding="utf-8") as fh:
+                got = _yu_json.load(fh).get("y_unfreeze", {})
+            cfg = got if isinstance(got, dict) else {}
+        except (OSError, ValueError, TypeError, AttributeError):
+            cfg = {}
+        self._yu_q = min(_yu_num(cfg.get("q", 0.0), 0.0), 1.0)
+        self._yu_min = max(int(_yu_num(cfg.get("min_hold", 100), 100)), 16)
+        self._yu_med = max(_yu_num(cfg.get("med", 10.0), 10.0), 1.0)
+        self._yu_max = max(int(_yu_num(cfg.get("max", 100), 100)), 1)
+
+    @property
+    def name(self) -> str:
+        return "c000"
+
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        n = int(n_series)
+        if n <= 0:
+            return
+        q = self._yu_q
+        seed = int(self._seed) & ((1 << 64) - 1)
+        p_geo = 1.0 - 0.5 ** (1.0 / self._yu_med)
+        base = super().generate(n)
+        try:
+            for i, x in enumerate(base):
+                q = self._yu_q
+                if q > 0.0 and isinstance(x, np.ndarray) and x.dtype == np.float64 and x.ndim in (1, 2) and x.shape[-1] >= 2 * _YU_MIN_KEEP:
+                    try:
+                        c0 = x if x.ndim == 1 else x[0]
+                        L = int(c0.shape[0])
+                        ch = np.flatnonzero(c0 != c0[-1])
+                        if ch.size and L - 1 - int(ch[-1]) >= self._yu_min:
+                            r = np.random.default_rng(np.random.SeedSequence([seed, _YU_TAG], spawn_key=(i,)))
+                            if r.random() < q:
+                                k = min(int(r.geometric(p_geo)), self._yu_max)
+                                t = int(ch[-1]) + 1 + k
+                                if _YU_MIN_KEEP <= t < L:
+                                    h = x.reshape(1, L) if x.ndim == 1 else x
+                                    z = np.empty_like(h)
+                                    z[:, : L - t] = h[:, :1]
+                                    z[:, L - t:] = h[:, :t]
+                                    if bool(np.all(np.isfinite(z))):
+                                        x = z[0].copy() if x.ndim == 1 else z
+                    except Exception:
+                        pass
+                yield x
+        finally:
+            base.close()
+
+import json as _yss_json
+import os as _yss_os
+
+_YSS_GLOBALS = ("_K_Q", "_K2_Q", "_S1_Q", "_S2_Q", "_W86B_Q", "_P25_Q", "_C128_Q", "_BAND_Q", "_ACUH_Q", "_C91_P",
+                "_C91_OPEN_NUM", "_C124B2_QMIN")
+_YSS_ATTRS = {"y_short": "_ycs_q", "y_quant": "_ybq_q", "y_couple": "_yac_q", "y_unfreeze": "_yu_q", "y_hold": "_ydh_q"}
+
+def _yss_fams(block, table, cap):
+    try:
+        mult = min(max(float(block.get("rate", 1.0)), 0.0), 20.0)
+    except (TypeError, ValueError):
+        mult = 1.0
+    out = []
+    for k, (key, fn) in enumerate(table):
+        try:
+            q = min(max(float(block.get(key, 0.0)), 0.0) * mult, cap)
+        except (TypeError, ValueError):
+            q = 0.0
+        f = globals().get(fn)
+        if q > 0.0 and callable(f):
+            out.append((k, q, f))
+    return tuple(out)
+
+_YSSParent = Generator
+
+class Generator(_YSSParent):
+
+    def __init__(self, config_dir: str, *, seed: int) -> None:
+        super().__init__(config_dir, seed=seed)
+        try:
+            with open(_yss_os.path.join(config_dir, "config.json"), encoding="utf-8") as fh:
+                got = _yss_json.load(fh).get("y_sched", {})
+            cfg = got if isinstance(got, dict) else {}
+        except (OSError, ValueError, TypeError, AttributeError):
+            cfg = {}
+        ph = []
+        for p in cfg.get("phases", []) if isinstance(cfg.get("phases", []), list) else []:
+            try:
+                fr = float(p.get("from"))
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if 0.0 < fr < 1.0:
+                ph.append((fr, p))
+        self._yss_phases = sorted(ph, key=lambda t: t[0])
+
+    @property
+    def name(self) -> str:
+        return "c000"
+
+    def _yss_apply(self, p: dict) -> None:
+        g_ = globals()
+        for k, v in (p.get("globals") or {}).items():
+            if k in _YSS_GLOBALS and k in g_:
+                try:
+                    g_[k] = type(g_[k])(v)
+                except (TypeError, ValueError):
+                    pass
+        for blk, attr in _YSS_ATTRS.items():
+            if isinstance(p.get(blk), dict) and hasattr(self, attr):
+                try:
+                    q = float(p[blk].get("q", 0.0))
+                    if 0.0 <= q <= 1.0:
+                        setattr(self, attr, q)
+                except (TypeError, ValueError):
+                    pass
+        if isinstance(p.get("y_insert"), dict) and hasattr(self, "_yz_fams") and "_YZ_FAMS" in g_:
+            self._yz_fams = _yss_fams(p["y_insert"], _YZ_FAMS, _YZ_MAX_SHARE)
+        if isinstance(p.get("y_channel"), dict) and hasattr(self, "_yc_fams") and "_YC_FAMS" in g_:
+            self._yc_fams = _yss_fams(p["y_channel"], _YC_FAMS, _YC_MAX_SHARE)
+
+        if isinstance(p.get("x_insert"), dict) and hasattr(self, "_xz_fams") and "_XZ_FAMS" in g_:
+            self._xz_fams = _yss_fams(p["x_insert"], _XZ_FAMS, _XZ_MAX_SHARE)
+
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        n = int(n_series)
+        if n <= 0:
+            return
+        todo = list(self._yss_phases)
+        budget = _YZ_CHILD_BUDGET if "_YZ_CHILD_BUDGET" in globals() else 13_320_000_000
+        pos = 0
+        base = super().generate(n)
+        try:
+            for x in base:
+                yield x
+                if todo:
+                    pos += _yz_points(x)
+                    while todo and pos >= todo[0][0] * budget:
+                        self._yss_apply(todo.pop(0)[1])
+        finally:
+            base.close()
+
+_C91_OPEN_NUM = 1
+
+_KNC91OPEN1Parent = Generator
+
+class Generator(_KNC91OPEN1Parent):
+
+    @property
+    def name(self) -> str:
+        return "c000"
+
+_K2_Q = 0.0
+
+_KNK2Parent = Generator
+
+class Generator(_KNK2Parent):
+
+    @property
+    def name(self) -> str:
+        return "c000"
+
+ACTIVE_KEYS = tuple(ACTIVE_KEYS) + (("year",) if "year" not in ACTIVE_KEYS else ())
+
+_YCParent = Generator
+
+class Generator(_YCParent):
+
+    @property
+    def name(self) -> str:
+        return "c1823"
+
+_RAParent = Generator
+
+class Generator(_RAParent):
+
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        if type(self).generate is not _RA_GENERATE:
+            yield from _RAParent.generate(self, n_series)
+            return
+        n = int(n_series)
+        if n <= 0:
+            return
+        prev = getattr(self, "_ra_prev", None)
+        if prev is not None and prev[0].is_alive():
+            if not prev[1].is_set():
+                yield from _RAParent.generate(self, n)
+                return
+            prev[0].join()
+        q = Queue(maxsize=64)
+        stop = Event()
+        done = object()
+
+        def put(item) -> bool:
+            while not stop.is_set():
+                try:
+                    q.put(item, timeout=0.05)
+                    return True
+                except Full:
+                    continue
+            return False
+
+        def run() -> None:
+            it = None
+            try:
+                it = _RAParent.generate(self, n)
+                for x in it:
+                    if not put(x):
+                        break
+            except BaseException as exc:
+                put(exc)
+            finally:
+                if it is not None:
+                    try:
+                        it.close()
+                    except BaseException:
+                        pass
+                put(done)
+
+        th = Thread(target=run, daemon=True, name="cascade-runahead")
+        try:
+            th.start()
+        except RuntimeError:
+            yield from _RAParent.generate(self, n)
+            return
+        self._ra_prev = (th, stop)
+        try:
+            while True:
+                item = q.get()
+                if item is done:
+                    break
+                if isinstance(item, BaseException):
+                    raise item
+                yield item
+        finally:
+            stop.set()
+            th.join(timeout=5.0)
+
+_RA_GENERATE = Generator.generate
+
+import json as _yqh_json
+import os as _yqh_os
+
+_YQH_TAG = 0x59E0_0011
+_YQH_DEF = {"q": 0.0, "p": 0.9, "min_run": 32, "min_d": 64, "mean_d": 96.0, "max_d": 512, "max_total": 2048,
+            "w": 256, "qmin": 0.95, "min_n": 16, "cap": 100.0, "alpha": 0.0, "couple": 0.5}
+
+def _yqh_station(s, cap):
+    if s.dtype.kind != "f" or not np.all(np.isfinite(s)):
+        return False
+    d = np.diff(s)
+    mv = np.flatnonzero(d != 0.0)
+    if mv.size < 4:
+        return False
+    real = s[int(mv[0]):]
+    if real.size < 256 or float(real.min()) < 0.0 or float(real.max()) > cap:
+        return False
+    if float(np.mean(real == np.rint(real))) < 0.98:
+        return False
+    return float(np.median(np.abs(d[mv]))) <= 1.0
+
+def _yqh_groups(rows, st, thr):
+    C, L = rows.shape
+    cps = [np.flatnonzero(rows[c, 1:] != rows[c, :-1]) for c in range(C)]
+    groups, used = [], set()
+    for c in st:
+        if c in used:
+            continue
+        a = cps[c]
+        g = [c]
+        for o in range(C):
+            b = cps[o]
+            if o == c or a.size == 0 or b.size == 0:
+                continue
+            sh = int(np.intersect1d(a, b, assume_unique=True).size)
+            if sh >= thr * min(a.size, b.size) and sh >= 3.0 * a.size * b.size / max(L - 1, 1):
+                g.append(o)
+        if any(o in used for o in g[1:]):
+            used.update(g)
+            continue
+        used.update(g)
+        groups.append(g)
+    return groups
+
+def _yqh_extend(v, r, k):
+    L = int(v.shape[1])
+    same = np.all(v[:, 1:] == v[:, :-1], axis=0)
+    ch = np.flatnonzero(~same) + 1
+    starts = np.concatenate(([0], ch)).tolist()
+    ends = np.concatenate((ch, [L])).tolist()
+    cand = [(s, e) for s, e in zip(starts, ends) if s > 0 and e - s >= k["min_run"]]
+    if not cand:
+        return None
+    ceq = np.concatenate(([0], np.cumsum(same)))
+    chosen, ins = {}, 0
+    for j in r.permutation(len(cand)).tolist():
+        if r.random() >= k["p"]:
+            continue
+        if k["alpha"] > 0.0:
+            d = int(min(k["min_d"] * (1.0 - r.random()) ** (-1.0 / k["alpha"]), k["max_d"]))
+        else:
+            d = int(min(k["min_d"] + int(r.geometric(1.0 / k["mean_d"])), k["max_d"]))
+        s = cand[j][0]
+        a = max(1, s - k["w"])
+        nd = s - a
+        if nd < k["min_n"] or int(ceq[s - 1] - ceq[a - 1]) < k["qmin"] * nd:
+            continue
+        if ins + d > k["max_total"]:
+            continue
+        chosen[j] = d
+        ins += d
+    if ins == 0:
+        return None
+    pieces, prev = [], 0
+    for j, (s, e) in enumerate(cand):
+        d = chosen.get(j)
+        if d is None:
+            continue
+        pieces.append(v[:, prev:e])
+        pieces.append(np.repeat(v[:, e - 1:e], d, axis=1))
+        prev = e
+    pieces.append(v[:, prev:])
+    w = np.concatenate(pieces, axis=1)[:, ins:]
+    return w if w.shape[1] == L else None
+
+_YQHParent = Generator
+
+class Generator(_YQHParent):
+
+    def __init__(self, config_dir: str, *, seed: int) -> None:
+        super().__init__(config_dir, seed=seed)
+        try:
+            with open(_yqh_os.path.join(config_dir, "config.json"), encoding="utf-8") as fh:
+                got = _yqh_json.load(fh).get("y_qhold", {})
+            cfg = got if isinstance(got, dict) else {}
+        except (OSError, ValueError, TypeError, AttributeError):
+            cfg = {}
+        k = dict(_YQH_DEF)
+        for key, dv in _YQH_DEF.items():
+            try:
+                v = float(cfg.get(key, dv))
+                k[key] = v if np.isfinite(v) else dv
+            except (TypeError, ValueError):
+                pass
+        for key in ("min_run", "min_d", "max_d", "max_total", "w", "min_n"):
+            k[key] = max(1, int(k[key]))
+        k["q"] = min(max(k["q"], 0.0), 1.0)
+        k["p"] = min(max(k["p"], 0.0), 1.0)
+        self._yqh = k
+
+    @property
+    def name(self) -> str:
+        return "c1859"
+
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        n = int(n_series)
+        if n <= 0:
+            return
+        seed = int(self._seed) & ((1 << 64) - 1)
+        k = self._yqh
+        lo = _C91_OPEN_NUM * int(_C91_CHILD_BUDGET)
+        pos = 0
+        base = super().generate(n)
+        try:
+            for i, x in enumerate(base):
+                if (k["q"] > 0.0 and _C91_OPEN_DEN * pos >= lo and isinstance(x, np.ndarray) and x.dtype == np.float64
+                        and x.ndim == 2 and x.shape[0] > 1 and x.shape[1] >= 256):
+                    st = [c for c in range(x.shape[0]) if _yqh_station(x[c], k["cap"])]
+                    if st:
+                        out = None
+                        for g in _yqh_groups(x, st, k["couple"]):
+                            r = np.random.default_rng(np.random.SeedSequence([seed, _YQH_TAG], spawn_key=(i, g[0])))
+                            if r.random() >= k["q"]:
+                                continue
+                            try:
+                                w = _yqh_extend(x[g], r, k)
+                            except Exception:
+                                w = None
+                            if w is not None and np.all(np.isfinite(w)):
+                                if out is None:
+                                    out = x.copy()
+                                out[g] = w
+                        if out is not None:
+                            x = out
+                pos += _c91_points(x)
+                yield x
+        finally:
+            base.close()
+
+import json as _sl_json
+import os as _sl_os
+
+_SLParent = Generator
+
+class Generator(_SLParent):
+
+    def __init__(self, config_dir: str, *, seed: int) -> None:
+        salt = 0
+        try:
+            with open(_sl_os.path.join(config_dir, "config.json"), encoding="utf-8") as fh:
+                salt = int(_sl_json.load(fh).get("salt", 0)) & ((1 << 64) - 1)
+        except (OSError, ValueError, TypeError, AttributeError):
+            salt = 0
+        super().__init__(config_dir, seed=((int(seed) ^ salt) & ((1 << 64) - 1)) if salt else seed)
+
+    @property
+    def name(self) -> str:
+        return "c1933"
