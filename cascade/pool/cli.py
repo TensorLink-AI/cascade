@@ -56,6 +56,9 @@ def _add_build_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--horizon", type=int, default=None, help="Override [eval] horizon.")
     p.add_argument("--min-context", type=int, default=256, help="Minimum context a kept window affords.")
     p.add_argument("--max-missing-frac", type=float, default=0.2, help="Drop series gappier than this.")
+    p.add_argument("--no-data-sentinel", type=float, action="append", default=None,
+                   help="Numeric no-data code counted as missing (repeatable). "
+                        "Default: -999999 (USGS NWIS). Pass --no-data-sentinel nan to disable.")
     p.add_argument("--mv-pack", action="store_true",
                    help="DEC-CA-0041: pack each tagged source's mv_channels into one "
                         "(C, L) multivariate series (else project to the first channel). "
@@ -243,6 +246,7 @@ def _build(args: argparse.Namespace, cfg, *, out_dir: Path, overwrite: bool):
         horizon=horizon,
         min_context=args.min_context,
         max_missing_frac=args.max_missing_frac,
+        no_data_sentinels=_no_data_sentinels(getattr(args, "no_data_sentinel", None)),
         max_series_per_domain=args.max_series_per_domain,
         max_series_per_domain_freq=args.max_series_per_domain_freq,
         max_series_total=args.max_series_total,
@@ -253,6 +257,14 @@ def _build(args: argparse.Namespace, cfg, *, out_dir: Path, overwrite: bool):
     return build_pool(
         sources, out_dir, ctx, build_cfg, fetch=HttpFetcher(timeout=args.timeout), overwrite=overwrite
     )
+
+
+def _no_data_sentinels(values: list[float] | None) -> tuple[float, ...]:
+    """CLI ``--no-data-sentinel`` → ``PoolBuildConfig.no_data_sentinels``:
+    unset keeps the builder default; ``nan`` alone disables the mapping."""
+    if values is None:
+        return PoolBuildConfig().no_data_sentinels
+    return tuple(float(v) for v in values if v == v)   # drop NaN (the "disable" token)
 
 
 def _warn_if_small(summary, cfg) -> None:

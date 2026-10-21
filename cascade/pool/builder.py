@@ -14,6 +14,9 @@ tar). That reproducibility is the audit hook — anyone can re-build and compare
 
 Cleaning rules (a series is **dropped**, never silently corrupted, if it fails):
 
+* numeric no-data codes (``no_data_sentinels``, e.g. USGS NWIS ``-999999``)
+  are treated as missing, exactly like NaN — a provider's "no reading" code is
+  not data, and a finite sentinel used to slip past the missingness gate;
 * gaps (NaN/None) are linearly interpolated per channel, but a series with more
   than ``max_missing_frac`` missing is dropped (too unreliable to score on);
 * it is truncated to the freshest ``context_length + horizon`` points (older
@@ -49,7 +52,7 @@ import numpy as np
 from ..eval.seasonality import get_seasonality
 from .source import DataSource, FetchJson, HarvestContext, HarvestedSeries, HttpFetcher
 
-BUILDER_VERSION = "cascade-pool/1"
+BUILDER_VERSION = "cascade-pool/2"   # /2: no_data_sentinels count as missing
 SELECTION_MODES = ("first", "balanced")
 
 _SAFE_ID = re.compile(r"[^A-Za-z0-9._-]+")
@@ -73,6 +76,12 @@ class PoolBuildConfig:
     # backbone (hourly) sources fill the full context.
     min_context: int = 256
     max_missing_frac: float = 0.2
+    # Exact numeric no-data codes mapped to NaN before interpolation, so they
+    # count toward ``max_missing_frac`` instead of entering the pool as values.
+    # -999999 is the USGS NWIS noDataValue (seen at up to 96% of a series in
+    # every snapshot since block 8640000). Exact match only: a real reading
+    # never lands on the code by chance at float32.
+    no_data_sentinels: tuple[float, ...] = (-999999.0,)
     max_channels: int = 1
     min_std: float = 1e-8
     keep_tail: bool = True
@@ -184,6 +193,10 @@ def prepare_series(
     n_channels, length = arr.shape
     if n_channels > cfg.max_channels:
         return None, "too_many_channels"
+
+    if cfg.no_data_sentinels:
+        arr = np.where(np.isin(arr, np.asarray(cfg.no_data_sentinels, dtype=arr.dtype)),
+                       np.nan, arr)
 
     cleaned = np.empty_like(arr)
     worst_missing = 0.0
