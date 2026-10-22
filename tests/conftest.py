@@ -38,6 +38,13 @@ def _no_live_credentials(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _isolated_sku_outage_file(monkeypatch, tmp_path):
+    """The GPU-type outage cooldown persists under ~/.cache on the live box —
+    point every test at its own file so a suite run never steers real rents."""
+    monkeypatch.setenv("CASCADE_LIUM_SKU_OUTAGE_FILE", str(tmp_path / "sku_outage.json"))
+
+
 @pytest.fixture(scope="session")
 def cfg() -> ChainConfig:
     """The mainnet template with its ENFORCING pins neutralized.

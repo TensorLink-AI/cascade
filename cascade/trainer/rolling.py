@@ -585,8 +585,9 @@ class LegOps:
         else:
             self.r._rolling_publish_roster(round_id, roster)
 
-    def live_pods(self) -> dict[str, float]:
-        fn = getattr(self.r, "_rolling_live_pods", None)
+    def leg_phases(self) -> dict:
+        """hotkey → (phase, since_unix, sku) recorded where each phase happens."""
+        fn = getattr(self.r, "_rolling_leg_phases", None)
         return fn() if fn is not None else {}
 
     def promotion_boundary(self, king_hotkey: str, epoch_start: int, round_id: str,
@@ -2320,25 +2321,31 @@ class RollingScheduler:
 
         entries = queue.entries() if queue is not None else []
         try:
-            pods = self.ops.live_pods()
+            phases = self.ops.leg_phases()
         except Exception as e:  # noqa: BLE001 — the phase is presentational
-            log.warning("rolling: live pod lookup for the roster failed (%s)", e)
-            pods = {}
+            log.warning("rolling: leg phase lookup for the roster failed (%s)", e)
+            phases = {}
         finished = {f.hotkey for f in self.state.finished}
+        running = set(getattr(self, "_threads", {}) or {})
         seated = [{"hotkey": f.hotkey, "ref": f.ref, "reveal_block": f.reveal_block,
                    "label": f.label, "started_block": f.started_block}
                   for f in sorted(ready, key=lambda f: (f.reveal_block, f.hotkey))]
 
         def _status(e) -> dict:
-            rented = pods.get(e.hotkey[:12].lower(), 0.0)
-            if rented and e.funded_at and rented < e.funded_at:
-                rented = 0.0   # an older submission's pod (e.g. an unstoppable stale one)
-            phase = leg_phase(e.status, e.last_error_class, e.attempts,
-                              pod_live=bool(rented), finished=e.hotkey in finished)
-            since = rented if phase in ("training", "benching") and rented else e.last_active
+            seen = phases.get(e.hotkey) if e.status == "in_flight" else None
+            since = 0.0
+            if e.hotkey in finished:
+                # the leg's own thread runs the bench after training ends
+                phase = "benching" if e.hotkey in running else "awaiting_settlement"
+            elif seen:
+                phase, since = seen[0], float(seen[1] or 0.0)
+            else:
+                phase = leg_phase(e.status, e.last_error_class, e.attempts,
+                                  pod_live=False, finished=False)
             return {"phase": phase, "phase_detail": PHASE_DETAIL.get(phase, ""),
                     "attempts": int(e.attempts or 0),
                     "error_class": e.last_error_class or "",
+                    "started_block": int(e.started_block or 0),
                     "since": _iso(since) if since else ""}
 
         return {
