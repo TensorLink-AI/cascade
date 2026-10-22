@@ -14,7 +14,6 @@ from cascade.provision.state import PodInstance
 from cascade.trainer import rolling as R
 from cascade.trainer.loop import TrainerRunner
 
-
 # ── phase rule ──────────────────────────────────────────────────────────────
 
 def test_leg_phase_matrix():

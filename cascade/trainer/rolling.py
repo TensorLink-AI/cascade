@@ -110,8 +110,10 @@ def leg_phase(status: str, error_class: str, attempts: int, *, pod_live: bool,
 def _iso(ts: float) -> str:
     import datetime as _dt
 
-    return _dt.datetime.fromtimestamp(float(ts), tz=_dt.timezone.utc).strftime(
+    return _dt.datetime.fromtimestamp(float(ts), tz=_dt.UTC).strftime(
         "%Y-%m-%dT%H:%M:%SZ")
+
+
 # A booted king pod gets ONE retry after a non-transport failure (a Hippius
 # read stall is not necessarily the pod's fault); the next failure — or any
 # transport failure at once — rotates it: host quarantined, pod torn down,
