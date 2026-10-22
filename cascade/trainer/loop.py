@@ -8790,16 +8790,44 @@ class TrainerRunner:
             return None
         return int(getattr(rec, "effective_era", 0) or 0)
 
-    def _rolling_publish_roster(self, round_id: str, roster: dict) -> None:
+    def _rolling_publish_roster(self, round_id: str, roster: dict, *, live: bool = False) -> None:
+        """Publish the funded roster. At a settlement (``live=False``) it goes to
+        ``funded/round-<id>.json`` (what cascade-audit cross-checks) AND
+        ``funded/latest.json``; a between-settlements refresh (``live=True``)
+        rewrites ``funded/latest.json`` only — the per-round audit record stays
+        the settlement's own."""
         from ..shared.heat_status import _publish_public_json
 
         doc = {"funded_pods": self.cfg.round.funded_pods, **roster}
+        keys = ("funded/latest.json",) if live else (
+            f"funded/round-{round_id}.json", "funded/latest.json")
         try:
             store = self.manifest_store()
-            for key in (f"funded/round-{round_id}.json", "funded/latest.json"):
+            for key in keys:
                 _publish_public_json(store, key, doc)
         except Exception as e:  # noqa: BLE001 — transparency must not sink a settlement
             log.warning("funded roster publish failed (ignored): %s", e)
+
+    def _rolling_live_pods(self) -> dict[str, float]:
+        """Challenger pods on the funded ledger right now: lower-cased 12-char
+        hotkey prefix (as in the ``…-funded-<prefix>-<n>`` instance name) →
+        newest ``rented_at`` (unix seconds). King pods are excluded. Read-only;
+        an unreadable ledger reads as no pods."""
+        import re
+        from datetime import datetime
+
+        out: dict[str, float] = {}
+        for p in self._load_funded_ledger():
+            m = re.search(r"-funded-([a-z0-9]{12})-\d+$", str(getattr(p, "instance_id", "")))
+            if not m:
+                continue
+            try:
+                ts = datetime.fromisoformat(
+                    str(p.rented_at_iso).replace("Z", "+00:00")).timestamp()
+            except (TypeError, ValueError):
+                ts = 0.0
+            out[m.group(1)] = max(out.get(m.group(1), 0.0), ts)
+        return out
 
     def _rolling_dedup_registry(self):
         from .dedup_registry import DedupRegistry

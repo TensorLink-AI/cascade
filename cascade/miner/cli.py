@@ -505,7 +505,9 @@ def _cmd_queue(args: argparse.Namespace) -> int:
               "funded_mode is not 'required' yet)")
     else:
         adm = doc.get("admission") or {}
-        print(f"round {doc.get('round_id')} — funded roster")
+        live = " (live)" if doc.get("live") else ""
+        upd = f", updated {doc.get('updated_at')}" if doc.get("updated_at") else ""
+        print(f"round {doc.get('round_id')} — funded roster{live}{upd}")
         sku = adm.get("sku") or "?"
         caps = adm.get("sku_capacities")
         if caps:
@@ -519,14 +521,29 @@ def _cmd_queue(args: argparse.Namespace) -> int:
         for e in doc.get("seated") or []:
             print(f"    {e.get('hotkey')}{_label_of(e)}  reveal={e.get('reveal_block')}"
                   f"{_tag(str(e.get('hotkey')))}")
+        def _phase(e: dict) -> str:
+            # Live rosters carry the leg's phase + why (presentational).
+            ph = e.get("phase")
+            if not ph:
+                return ""
+            bits = [str(ph)]
+            if e.get("since"):
+                bits.append(f"since {e.get('since')}")
+            if int(e.get("attempts") or 0):
+                bits.append(f"attempts {e.get('attempts')}")
+            out = "  [" + ", ".join(bits) + "]"
+            if e.get("phase_detail"):
+                out += f" — {e.get('phase_detail')}"
+            return out
+
         for e in doc.get("in_flight") or []:
             # Rolling rosters: legs training now, and the settlement they target.
             print(f"  in flight: {e.get('hotkey')}{_label_of(e)}  "
                   f"reveal={e.get('reveal_block')} era={e.get('era_index')} "
-                  f"target={e.get('target_boundary')}{_tag(str(e.get('hotkey')))}")
+                  f"target={e.get('target_boundary')}{_tag(str(e.get('hotkey')))}{_phase(e)}")
         for e in doc.get("waiting") or []:
             print(f"  waiting: {e.get('hotkey')}{_label_of(e)}  "
-                  f"reveal={e.get('reveal_block')}{_tag(str(e.get('hotkey')))}")
+                  f"reveal={e.get('reveal_block')}{_tag(str(e.get('hotkey')))}{_phase(e)}")
         for e in doc.get("outcomes") or []:
             extra = f" [{e.get('error_class')}]" if e.get("error_class") else ""
             print(f"  outcome: {e.get('hotkey')}  {e.get('outcome')}{extra}"
