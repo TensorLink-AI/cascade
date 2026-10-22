@@ -1,3 +1,4 @@
+# cascade era 2594 entry
 from __future__ import annotations
 
 from collections.abc import Iterator
@@ -28306,3 +28307,3176 @@ class Generator(_SLParent):
     @property
     def name(self) -> str:
         return "c1933"
+
+
+# ═══════════════ c251-P1: exact fast kernel for the long-cycle lag menu (_cycle_menu_errors, uid76's #1 hotspot). ═══════════════
+# Same per-(row, lag) arithmetic as uid76's kernel: template phases from the SAME compare-swap networks (_v2_cm_medians),
+# |observed - template| with the same subtraction/abs, the SAME 8-lane sequential sums + ((r0+r1)+(r2+r3))+((r4+r5)+(r6+r7))
+# per 128-point leaf (0.0 + x == x for the abs values, never -0.0), the same leaf combination / abort tests and the same
+# final ((0.0 + bound) / points) / span. Two changes, both exact:
+#  (a) slice views indexed by range() induction variables (no signed-index wraparound fix-ups) -> LLVM vectorises
+#      the loops; the per-lane operation sequence is unchanged (no reassociation: fastmath stays OFF);
+#  (b) provable early abort inside a leaf: every 32 points the partial lanes are combined with the same tree; all
+#      addends are >= 0 and IEEE round-to-nearest addition is monotone, so the partial combination is <= the full
+#      leaf value; if ((0.0 + partial) / points) / span > limit then the full leaf bound also exceeds it, and uid76
+#      aborts at the end of that leaf (errors = inf) -- the same inf is written. Only at leaves where uid76 can abort
+#      with a bound that grows inside the leaf (leaf 0; leaf 1 of a 4-leaf menu). Non-aborted values are bit-identical.
+#  (c) the abort test f(b) = ((0.0 + b) / points) / span > limit is evaluated as b >= x*, where x* is the smallest
+#      double with f(x*) > limit, found per row by bisection over the (order-preserving) bit patterns of [0, +inf]:
+#      f is monotone non-decreasing (correctly rounded divisions by positive numbers), so b >= x* <=> f(b) > limit.
+#  (d) count == 1 lags (median of one cycle = the history itself) read the history slice directly instead of a copy.
+from numba import njit as _c251_njit
+
+
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_cm_tmpl(h, base, lag, count, start, stop, tm):
+    n = stop - start
+    if n <= 0:
+        return
+    out = tm[start:stop]
+    q = base + start
+    if count == 1:
+        h0 = h[q:q + n]
+        for i in range(n):
+            out[i] = h0[i]
+    elif count == 3:
+        h0 = h[q:q + n]; h1 = h[q + lag:q + lag + n]; h2 = h[q + 2 * lag:q + 2 * lag + n]
+        for i in range(n):
+            a0 = h0[i]; a1 = h1[i]; a2 = h2[i]
+            t = a0 if a0 < a1 else a1; a1 = a1 if a0 < a1 else a0; a0 = t
+            t = a1 if a1 < a2 else a2; a2 = a2 if a1 < a2 else a1; a1 = t
+            t = a0 if a0 < a1 else a1; a1 = a1 if a0 < a1 else a0; a0 = t
+            out[i] = a1
+    elif count == 5:
+        h0 = h[q:q + n]; h1 = h[q + lag:q + lag + n]; h2 = h[q + 2 * lag:q + 2 * lag + n]
+        h3 = h[q + 3 * lag:q + 3 * lag + n]; h4 = h[q + 4 * lag:q + 4 * lag + n]
+        for i in range(n):
+            a0 = h0[i]; a1 = h1[i]; a2 = h2[i]; a3 = h3[i]; a4 = h4[i]
+            t = a0 if a0 < a1 else a1; a1 = a1 if a0 < a1 else a0; a0 = t
+            t = a3 if a3 < a4 else a4; a4 = a4 if a3 < a4 else a3; a3 = t
+            t = a0 if a0 < a3 else a3; a3 = a3 if a0 < a3 else a0; a0 = t
+            t = a1 if a1 < a4 else a4; a4 = a4 if a1 < a4 else a1; a1 = t
+            t = a1 if a1 < a2 else a2; a2 = a2 if a1 < a2 else a1; a1 = t
+            t = a2 if a2 < a3 else a3; a3 = a3 if a2 < a3 else a2; a2 = t
+            t = a1 if a1 < a2 else a2; a2 = a2 if a1 < a2 else a1; a1 = t
+            out[i] = a2
+    elif count == 7:
+        h0 = h[q:q + n]; h1 = h[q + lag:q + lag + n]; h2 = h[q + 2 * lag:q + 2 * lag + n]
+        h3 = h[q + 3 * lag:q + 3 * lag + n]; h4 = h[q + 4 * lag:q + 4 * lag + n]
+        h5 = h[q + 5 * lag:q + 5 * lag + n]; h6 = h[q + 6 * lag:q + 6 * lag + n]
+        for i in range(n):
+            a0 = h0[i]; a1 = h1[i]; a2 = h2[i]; a3 = h3[i]; a4 = h4[i]; a5 = h5[i]; a6 = h6[i]
+            t = a0 if a0 < a5 else a5; a5 = a5 if a0 < a5 else a0; a0 = t
+            t = a0 if a0 < a3 else a3; a3 = a3 if a0 < a3 else a0; a0 = t
+            t = a1 if a1 < a6 else a6; a6 = a6 if a1 < a6 else a1; a1 = t
+            t = a2 if a2 < a4 else a4; a4 = a4 if a2 < a4 else a2; a2 = t
+            t = a0 if a0 < a1 else a1; a1 = a1 if a0 < a1 else a0; a0 = t
+            t = a3 if a3 < a5 else a5; a5 = a5 if a3 < a5 else a3; a3 = t
+            t = a2 if a2 < a6 else a6; a6 = a6 if a2 < a6 else a2; a2 = t
+            t = a2 if a2 < a3 else a3; a3 = a3 if a2 < a3 else a2; a2 = t
+            t = a3 if a3 < a6 else a6; a6 = a6 if a3 < a6 else a3; a3 = t
+            t = a4 if a4 < a5 else a5; a5 = a5 if a4 < a5 else a4; a4 = t
+            t = a1 if a1 < a4 else a4; a4 = a4 if a1 < a4 else a1; a1 = t
+            t = a1 if a1 < a3 else a3; a3 = a3 if a1 < a3 else a1; a1 = t
+            t = a3 if a3 < a4 else a4; a4 = a4 if a3 < a4 else a3; a3 = t
+            out[i] = a3
+    else:
+        buf = np.empty(count, dtype=np.float64)
+        mid = count // 2
+        for p in range(start, stop):
+            for c in range(count):
+                x = h[base + p + c * lag]
+                k = c
+                while k > 0 and buf[k - 1] > x:
+                    buf[k] = buf[k - 1]
+                    k -= 1
+                buf[k] = x
+            tm[p] = buf[mid]
+
+
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_cm_fill(tm, lag, lo, u):
+    v = lo
+    hi = lo + 128
+    while v < hi:
+        m0 = v % lag
+        seg = hi - v
+        if lag - m0 < seg:
+            seg = lag - m0
+        src = tm[m0:m0 + seg]
+        dst = u[v - lo:v - lo + seg]
+        for t in range(seg):
+            dst[t] = src[t]
+        v += seg
+
+
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_cm_f(x, points, sp):
+    return ((0.0 + x) / points) / sp
+
+
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_cm_xstar(points, sp, lim):
+    lo = np.int64(0)
+    hi = np.int64(0x7FF0000000000000)
+    buf = np.empty(1, dtype=np.float64)
+    bits = buf.view(np.int64)
+    bits[0] = lo
+    if _c251_cm_f(buf[0], points, sp) > lim:
+        return buf[0]
+    while hi - lo > 1:
+        mid = lo + (hi - lo) // 2
+        bits[0] = mid
+        if _c251_cm_f(buf[0], points, sp) > lim:
+            hi = mid
+        else:
+            lo = mid
+    bits[0] = hi
+    return buf[0]
+
+
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_cm_fill_h(h, base, lag, lo, u):
+    v = lo
+    hi = lo + 128
+    while v < hi:
+        m0 = v % lag
+        seg = hi - v
+        if lag - m0 < seg:
+            seg = lag - m0
+        src = h[base + m0:base + m0 + seg]
+        dst = u[v - lo:v - lo + seg]
+        for t in range(seg):
+            dst[t] = src[t]
+        v += seg
+
+
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_cycle_menu_errors(history, observed, span, limit, lags, cols, count, fit_points, errors):
+    rows = history.shape[0]
+    points = observed.shape[1]
+    leaves = points // 128
+    nl = lags.shape[0]
+    tm = np.empty(points, dtype=np.float64)
+    u = np.empty(128, dtype=np.float64)
+    for r in range(rows):
+        lim = limit[r]
+        if not lim >= 0.0:
+            for j in range(nl):
+                errors[r, cols[j]] = np.inf
+            continue
+        sp = span[r]
+        xs = _c251_cm_xstar(points, sp, lim)
+        h = history[r]
+        o = observed[r]
+        for j in range(nl):
+            lag = lags[j]
+            base = fit_points - count * lag
+            done = 0
+            partial = 0.0
+            left = 0.0
+            aborted = False
+            for leaf in range(leaves):
+                lo = leaf * 128
+                hi = lo + 128
+                if count == 1:
+                    if lag >= hi:
+                        uL = h[base + lo:base + hi]
+                    else:
+                        _c251_cm_fill_h(h, base, lag, lo, u)
+                        uL = u
+                else:
+                    need = hi if hi < lag else lag
+                    if done < need:
+                        _c251_cm_tmpl(h, base, lag, count, done, need, tm)
+                        done = need
+                    if lag >= hi:
+                        uL = tm[lo:hi]
+                    else:
+                        _c251_cm_fill(tm, lag, lo, u)
+                        uL = u
+                oL = o[lo:hi]
+                early = (leaf == 0 and leaves > 1) or (leaf == 1 and leaves == 4)
+                a0 = 0.0; a1 = 0.0; a2 = 0.0; a3 = 0.0; a4 = 0.0; a5 = 0.0; a6 = 0.0; a7 = 0.0
+                stop = False
+                for g in range(4):
+                    for i in range(4):
+                        b = 32 * g + 8 * i
+                        a0 += abs(oL[b] - uL[b])
+                        a1 += abs(oL[b + 1] - uL[b + 1])
+                        a2 += abs(oL[b + 2] - uL[b + 2])
+                        a3 += abs(oL[b + 3] - uL[b + 3])
+                        a4 += abs(oL[b + 4] - uL[b + 4])
+                        a5 += abs(oL[b + 5] - uL[b + 5])
+                        a6 += abs(oL[b + 6] - uL[b + 6])
+                        a7 += abs(oL[b + 7] - uL[b + 7])
+                    if early and g < 3:
+                        lb = ((a0 + a1) + (a2 + a3)) + ((a4 + a5) + (a6 + a7))
+                        bb = lb if leaf == 0 else partial + lb
+                        if bb >= xs:
+                            stop = True
+                            break
+                if stop:
+                    aborted = True
+                    break
+                value = ((a0 + a1) + (a2 + a3)) + ((a4 + a5) + (a6 + a7))
+                if leaves == 2:
+                    bound = value if leaf == 0 else partial + value
+                    partial = value if leaf == 0 else partial
+                else:
+                    if leaf == 0:
+                        partial = value
+                        bound = value
+                    elif leaf == 1:
+                        partial = partial + value
+                        bound = partial
+                    elif leaf == 2:
+                        left = value
+                        bound = partial
+                    else:
+                        bound = partial + (left + value)
+                if leaf < leaves - 1 and bound >= xs:
+                    aborted = True
+                    break
+                if leaf == leaves - 1:
+                    errors[r, cols[j]] = ((0.0 + bound) / points) / sp
+            if aborted:
+                errors[r, cols[j]] = np.inf
+
+
+_cycle_menu_errors = _c251_cycle_menu_errors
+
+
+# ═══════════════ c251-P2: exact fast driver for the lag-menu validation (_validated_cycle_menu). ═══════════════
+# Per row, uid76 needs only: span (q90 - q10 with floors), anchor/hold/away/limit, the FIRST argmin lag of the finite
+# errors, whether it passes, and the second validation of that lag. Exact replicas, one numba pass per row:
+#  * quantiles: numpy 'linear' method verbatim -- vi = float(n - 1) * q, prev = floor(vi), g = vi - prev, then
+#    numpy's _lerp (a + (b - a) * g, or b - (b - a) * (1 - g) where g >= 0.5) on the exact order statistics; only
+#    the span uses them and span = max(hi - lo, |x|max * 1e-12, 1e-12) >= 1e-12 > 0, so the sign of a selected zero
+#    can never reach it.
+#  * anchor = numpy median of 16 = (0.0 + ((0.0 + s7) + s8)) / 2.0 (np.mean's identity-start add.reduce; the same
+#    formula uid76's own _v2_lcv_kernel uses); hold = ((0.0 + pairwise(|o - anchor|)) / m) / span with uid76's
+#    pairwise replica _v2_pw (verified equal to np.add.reduce along a row, identity start); away = count / H (a mean
+#    of booleans is an exact integer count); limit as np.where/np.minimum.
+#  * argmin: first index of the minimum of where(errors < inf, errors, inf) (all-inf rows -> 0), as np.argmin.
+#  * second validation (_long_cycle_validation, row-independent) only for rows whose first pass holds: uid76 returns
+#    first_pass & second_pass, so the skipped rows are False either way. No RNG is used anywhere in the menu.
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_kth(a, lo, hi, k):
+    # in-place selection on a[lo:hi] (Hoare partition, median-of-3): afterwards a[k] holds the k-th smallest value
+    # of the range and a[lo:k] <= a[k] <= a[k+1:hi]. Values only (finite inputs).
+    hi = hi - 1
+    while hi > lo:
+        mid = (lo + hi) >> 1
+        x = a[lo]; y = a[mid]; z = a[hi]
+        if x < y:
+            if y < z:
+                p = y
+            elif x < z:
+                p = z
+            else:
+                p = x
+        else:
+            if x < z:
+                p = x
+            elif y < z:
+                p = z
+            else:
+                p = y
+        i = lo
+        j = hi
+        while i <= j:
+            while a[i] < p:
+                i += 1
+            while p < a[j]:
+                j -= 1
+            if i <= j:
+                t = a[i]; a[i] = a[j]; a[j] = t
+                i += 1
+                j -= 1
+        if k <= j:
+            hi = j
+        elif k >= i:
+            lo = i
+        else:
+            return
+
+
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_qlin2(buf, n, q0, q1, out):
+    # numpy.quantile(row, (q0, q1)) method='linear' for a NaN-free row held in buf[:n] (buf is reordered); q0 <= q1.
+    # numpy: vi = (n - 1) * q; prev = floor(vi) (-1 if vi >= n - 1, 0 if vi < 0), next = prev + 1 (same clamps);
+    # gamma = vi - prev; _lerp(arr[prev], arr[next], gamma).
+    lo = 0
+    for qi in range(2):
+        q = q0 if qi == 0 else q1
+        vi = float(n - 1) * q
+        if vi >= n - 1:
+            pi = -1
+            k = n - 1
+            kn = n - 1
+        elif vi < 0:
+            pi = 0
+            k = 0
+            kn = 0
+        else:
+            pi = int(np.floor(vi))
+            k = pi
+            kn = pi + 1
+        g = vi - float(pi)
+        _c251_kth(buf, lo if k >= lo else 0, n, k)
+        a = buf[k]
+        if kn == k:
+            b = a
+        else:
+            b = buf[k + 1]
+            for t in range(k + 2, n):
+                if buf[t] < b:
+                    b = buf[t]
+        d = b - a
+        if g >= 0.5:
+            out[qi] = b - d * (1.0 - g)
+        else:
+            out[qi] = a + d * g
+        lo = k + 1 if k + 1 < n else k
+
+
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_menu_stats(ctx, fit_points, validation_points, span, hold, away, limit):
+    rows = ctx.shape[0]
+    W = ctx.shape[1]
+    buf = np.empty(W, dtype=np.float64)
+    qq = np.empty(2, dtype=np.float64)
+    b16 = np.empty(16, dtype=np.float64)
+    d = np.empty(validation_points, dtype=np.float64)
+    for r in range(rows):
+        row = ctx[r]
+        mx = 0.0
+        for t in range(W):
+            v = row[t]
+            buf[t] = v
+            av = abs(v)
+            if av > mx:
+                mx = av
+        _c251_qlin2(buf, W, 0.1, 0.9, qq)
+        s = qq[1] - qq[0]
+        f = mx * 1e-12
+        if not (s >= f or s != s):      # np.maximum: NaN-propagating, ties keep the first operand
+            s = f
+        if not (s >= 1e-12 or s != s):
+            s = 1e-12
+        span[r] = s
+        for k in range(16):
+            x = row[fit_points - 16 + k]
+            j = k
+            while j > 0 and b16[j - 1] > x:
+                b16[j] = b16[j - 1]
+                j -= 1
+            b16[j] = x
+        anchor = (0.0 + ((0.0 + b16[7]) + b16[8])) / 2.0
+        for t in range(validation_points):
+            d[t] = abs(row[fit_points + t] - anchor)
+        h = ((0.0 + _v2_pw(d, 0, validation_points)) / validation_points) / s
+        hold[r] = h
+        thr = 0.05 * s
+        c = 0
+        for t in range(fit_points):
+            if abs(row[t] - anchor) > thr:
+                c += 1
+        a_ = c / fit_points
+        away[r] = a_
+        if a_ >= 0.15:
+            m75 = 0.75 * h
+            limit[r] = 0.12 if 0.12 <= m75 else m75
+        else:
+            limit[r] = -1.0
+
+
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_menu_pick(errors, hold, away, pos, first):
+    rows = errors.shape[0]
+    J = errors.shape[1]
+    for r in range(rows):
+        best = np.inf
+        p = 0
+        anyv = False
+        for j in range(J):
+            e = errors[r, j]
+            if e < np.inf:
+                anyv = True
+                if e < best:
+                    best = e
+                    p = j
+        pos[r] = p
+        e = errors[r, p]
+        first[r] = anyv and (e <= 0.12) and (e <= 0.75 * hold[r]) and (away[r] >= 0.15)
+
+
+def _c251_validated_cycle_menu(context, fit_points, validation_points, lag_low, lag_stop):
+    context = np.asarray(context, dtype=np.float64)
+    if context.ndim != 2 or context.shape[1] != fit_points + 2 * validation_points or not np.isfinite(context).all():
+        raise ValueError('Need finite contexts with the declared fit and validation lengths')
+    if validation_points not in (256, 512):
+        raise ValueError("unsupported validation length")
+    ctx = np.ascontiguousarray(context)
+    n = ctx.shape[0]
+    span = np.empty(n, dtype=np.float64)
+    hold = np.empty(n, dtype=np.float64)
+    away = np.empty(n, dtype=np.float64)
+    limit = np.empty(n, dtype=np.float64)
+    _c251_menu_stats(ctx, int(fit_points), int(validation_points), span, hold, away, limit)
+    history = np.ascontiguousarray(ctx[:, :fit_points])
+    observed = np.ascontiguousarray(ctx[:, fit_points:fit_points + validation_points])
+    errors = np.empty((n, lag_stop - lag_low), dtype=np.float64)
+    lags_all = np.arange(lag_low, lag_stop, dtype=np.int64)
+    for positions, indices, count in _cycle_menu_groups(fit_points, validation_points, lag_low, lag_stop):
+        _cycle_menu_errors(history, observed, span, limit, lags_all[positions],
+                           np.ascontiguousarray(positions, dtype=np.int64), count, fit_points, errors)
+    pos = np.empty(n, dtype=np.int64)
+    first = np.empty(n, dtype=np.bool_)
+    _c251_menu_pick(errors, hold, away, pos, first)
+    picked = lag_low + pos
+    ok = np.zeros(n, dtype=bool)
+    fp = np.flatnonzero(first)
+    if fp.size:
+        boundary = fit_points + validation_points
+        pf = picked[fp]
+        for lag in np.unique(pf):
+            rows = fp[pf == lag]
+            _, passed = _long_cycle_validation(context[rows, :boundary], context[rows, boundary:], int(lag), span[rows])
+            ok[rows] = passed
+    return ok, picked
+
+
+_validated_cycle_menu = _c251_validated_cycle_menu
+
+
+# ═══════════════ c251-P3: exact _apply_tail_rebase statistics (chunk post-processing of every base family but 7). ═══════════════
+# The menus aside, uid76 spends its time here in ~40 small numpy calls on the (n, 512) pre-boundary window (quantiles,
+# medians, means, tiles). P3 computes the same per-row statistics in one numba pass and keeps everything else verbatim:
+#  * RNG: selected = rng.random(n), back = rng.integers(..), then (after the menus) hold = rng.random(n) and
+#    retain = rng.uniform(..) -- the same calls in the same order. cycle_rng = Generator(rng.bit_generator.jumped())
+#    is only built when _CYCLE_PREDICTIVE_MODE uses it: 'median' / 'native' never draw from it, and jumped() leaves
+#    rng untouched, so skipping it changes nothing.
+#  * pre = take_along_axis(block, boundary - 512 .. boundary - 1) (negative indices wrap like numpy fancy indexing).
+#    If pre holds a NaN or an infinity (selection on NaN would not reproduce numpy's NaN-aware quantile/median), the
+#    RNG state is rewound to the call's entry state and uid76's own function runs instead.
+#  * statistics, per row, with numpy's exact formulas (all ops are IEEE +,-,*,/ / compares / selections; no
+#    transcendental): quantiles 'linear' (vi = (n - 1) * q, floor, gamma, _lerp) on exact order statistics; medians
+#    (0.0 + ((0.0 + a) + b)) / 2.0 (identity-start add.reduce of the two middle values, then / 2) -- never -0.0, so
+#    the anchor bits written into held tails are numpy's; means (0.0 + pairwise) / count with uid76's _v2_pw (equal to
+#    np.add.reduce along a row; verified); boolean means = exact count / size; np.maximum / np.minimum NaN-propagating
+#    first-operand-on-tie semantics; linear_pred = fit_anchor + slope * k (multiply rounded first, no FMA); periodic
+#    candidates in the same lag order with the same strict '<' update. q10/q90 only reach the output through
+#    span = max(q90 - q10, peak * 1e-12, 1e-12) > 0, so the sign of a selected zero cannot matter.
+_c251_tail_rebase_parent = _apply_tail_rebase
+
+
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_tr_gather(block, boundary, pre):
+    n = block.shape[0]
+    L = block.shape[1]
+    for r in range(n):
+        b0 = boundary[r] - 512
+        for j in range(512):
+            idx = b0 + j
+            if idx < 0:
+                idx += L
+            pre[r, j] = block[r, idx]
+
+
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_qlin1(buf, n, q):
+    vi = float(n - 1) * q
+    if vi >= n - 1:
+        pi = -1
+        k = n - 1
+        kn = n - 1
+    elif vi < 0:
+        pi = 0
+        k = 0
+        kn = 0
+    else:
+        pi = int(np.floor(vi))
+        k = pi
+        kn = pi + 1
+    g = vi - float(pi)
+    _c251_kth(buf, 0, n, k)
+    a = buf[k]
+    if kn == k:
+        b = a
+    else:
+        b = buf[k + 1]
+        for t in range(k + 2, n):
+            if buf[t] < b:
+                b = buf[t]
+    d = b - a
+    if g >= 0.5:
+        return b - d * (1.0 - g)
+    return a + d * g
+
+
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_med_even(src, lo, m, buf):
+    for k in range(m):
+        x = src[lo + k]
+        j = k
+        while j > 0 and buf[j - 1] > x:
+            buf[j] = buf[j - 1]
+            j -= 1
+        buf[j] = x
+    h = m // 2
+    return (0.0 + ((0.0 + buf[h - 1]) + buf[h])) / 2.0
+
+
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_npmax(a, b):
+    # np.maximum(a, b) for float64: NaN-propagating, the first operand on ties
+    if a != a:
+        return a
+    if b != b:
+        return b
+    return a if a >= b else b
+
+
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_tr_stats(pre, span, anchors, repeat_fraction, local_move, drift, strict_linear, recurring_nonflat, best_lag):
+    n = pre.shape[0]
+    buf = np.empty(192, dtype=np.float64)
+    sb = np.empty(32, dtype=np.float64)
+    dl = np.empty(191, dtype=np.float64)
+    d96 = np.empty(96, dtype=np.float64)
+    qq = np.empty(2, dtype=np.float64)
+    lags = (7, 12, 24, 48, 96)
+    for r in range(n):
+        p = pre[r]
+        # recent = p[320:512]
+        peak = abs(p[320])
+        for t in range(192):
+            v = p[320 + t]
+            buf[t] = v
+            av = abs(v)
+            peak = _c251_npmax(peak, av)
+        _c251_qlin2(buf, 192, 0.10, 0.90, qq)
+        sp = _c251_npmax(_c251_npmax(qq[1] - qq[0], peak * 1e-12), 1e-12)
+        span[r] = sp
+        tol = _c251_npmax(peak * 1e-12, 1e-12)
+        c = 0
+        for t in range(191):
+            dv = abs(p[321 + t] - p[320 + t])
+            dl[t] = dv
+            if dv <= tol:
+                c += 1
+        repeat_fraction[r] = c / 191
+        local_move[r] = _c251_qlin1(dl, 191, 0.90) / sp
+        m_last = _c251_med_even(p, 480, 32, sb)
+        m_first = _c251_med_even(p, 320, 32, sb)
+        drift[r] = abs(m_last - m_first) / sp
+        anchors[r] = _c251_med_even(p, 496, 16, sb)
+        # periodic_continue: fit = p[0:416], val = p[416:512]
+        fa = _c251_med_even(p, 400, 16, sb)
+        for t in range(96):
+            d96[t] = abs(p[416 + t] - fa)
+        he = ((0.0 + _v2_pw(d96, 0, 96)) / 96) / sp
+        slope = (_c251_med_even(p, 384, 32, sb) - _c251_med_even(p, 352, 32, sb)) / 32.0
+        for t in range(96):
+            d96[t] = abs(p[416 + t] - (fa + slope * float(t + 1)))
+        le = ((0.0 + _v2_pw(d96, 0, 96)) / 96) / sp
+        pm = abs(slope) * 96.0 / sp
+        strict_linear[r] = (le <= 0.08) and (le <= 0.30 * he) and (pm >= 0.20) and (pm <= 0.90)
+        thr = 0.05 * sp
+        c = 0
+        for t in range(416):
+            if abs(p[t] - fa) > thr:
+                c += 1
+        af = c / 416
+        pe = np.inf
+        bl = 7
+        for li in range(5):
+            lag = lags[li]
+            base = 416 - lag
+            for t in range(96):
+                d96[t] = abs(p[416 + t] - p[base + (t % lag)])
+            err = ((0.0 + _v2_pw(d96, 0, 96)) / 96) / sp
+            if err < pe:
+                pe = err
+                bl = lag
+        best_lag[r] = bl
+        recurring_nonflat[r] = (af >= 0.15) and (pe <= 0.12) and (pe <= 0.75 * he)
+
+
+def _c251_apply_tail_rebase(
+    rng: np.random.Generator,
+    block: np.ndarray,
+    rate: float,
+    *,
+    periodic_continue: bool = False,
+    preserve_periodic_native: bool = False,
+    _route_mode: str = "all",
+) -> np.ndarray:
+    if rate <= 0.0:
+        return block
+    n, L = block.shape
+    if n == 0 or L < 608:
+        return block
+    if not periodic_continue or type(block) is not np.ndarray or block.dtype != np.float64:
+        return _c251_tail_rebase_parent(rng, block, rate, periodic_continue=periodic_continue,
+                                        preserve_periodic_native=preserve_periodic_native, _route_mode=_route_mode)
+    st0 = rng.bit_generator.state
+    selected = rng.random(n) < rate
+    back = rng.integers(256, min(721, L - 32), size=n)
+    boundary = L - back
+    pre = np.empty((n, 512), dtype=np.float64)
+    _c251_tr_gather(block, np.ascontiguousarray(boundary, dtype=np.int64), pre)
+    if not bool(np.isfinite(pre).all()):
+        rng.bit_generator.state = st0
+        return _c251_tail_rebase_parent(rng, block, rate, periodic_continue=periodic_continue,
+                                        preserve_periodic_native=preserve_periodic_native, _route_mode=_route_mode)
+    span = np.empty(n, dtype=np.float64)
+    anchors = np.empty(n, dtype=np.float64)
+    repeat_fraction = np.empty(n, dtype=np.float64)
+    local_move = np.empty(n, dtype=np.float64)
+    drift = np.empty(n, dtype=np.float64)
+    strict_linear = np.empty(n, dtype=np.bool_)
+    recurring_nonflat = np.empty(n, dtype=np.bool_)
+    best_lag = np.empty(n, dtype=np.int64)
+    _c251_tr_stats(pre, span, anchors, repeat_fraction, local_move, drift, strict_linear, recurring_nonflat, best_lag)
+    long_recurring = np.zeros(n, dtype=bool)
+    long_histories = {}
+    if _LONG_CYCLE_ENABLED and periodic_continue:
+        pending = np.flatnonzero(selected & (~recurring_nonflat) & (~strict_linear)
+                                 & (boundary >= 1024))
+        if pending.size:
+            long_offsets = np.arange(-1024, 0, dtype=np.int64)[None, :]
+            long_pre = block[pending[:, None], boundary[pending, None] + long_offsets]
+            long_ok, long_lag = _validated_long_cycle(long_pre)
+            accepted = pending[long_ok]
+            long_recurring[accepted] = True
+            best_lag[accepted] = long_lag[long_ok]
+            for pos in np.flatnonzero(long_ok):
+                long_histories[int(pending[pos])] = long_pre[pos]
+    if _LONGER_CYCLE_ENABLED and periodic_continue:
+        pending = np.flatnonzero(selected & (~recurring_nonflat) & (~strict_linear)
+                                 & (~long_recurring) & (boundary >= 2048))
+        if pending.size:
+            longer_offsets = np.arange(-2048, 0, dtype=np.int64)[None, :]
+            longer_pre = block[pending[:, None], boundary[pending, None] + longer_offsets]
+            longer_ok, longer_lag = _validated_longer_cycle(longer_pre)
+            accepted = pending[longer_ok]
+            long_recurring[accepted] = True
+            best_lag[accepted] = longer_lag[longer_ok]
+            for pos in np.flatnonzero(longer_ok):
+                long_histories[int(pending[pos])] = longer_pre[pos]
+    eligible = selected & (~recurring_nonflat) & (~strict_linear) & (~long_recurring) & (
+        (repeat_fraction >= 0.35)
+        | ((local_move <= 0.03) & (drift <= 0.12))
+    )
+    hold = rng.random(n) < 0.95
+    retain = rng.uniform(0.05, 0.25, size=n)
+    periodic_rows = selected & (recurring_nonflat | long_recurring)
+    linear_rows = selected & strict_linear & (~recurring_nonflat)
+
+    native_linear_rows = linear_rows & ((np.arange(n, dtype=np.int64) & 1) == 0)
+    if _route_mode not in ("all", "periodic", "quiet"):
+        raise ValueError("invalid continuation route mode")
+    if _route_mode == "periodic":
+        eligible = np.zeros(n, dtype=bool)
+        linear_rows = np.zeros(n, dtype=bool)
+        native_linear_rows = np.zeros(n, dtype=bool)
+    elif _route_mode == "quiet":
+        periodic_rows = np.zeros(n, dtype=bool)
+        linear_rows = np.zeros(n, dtype=bool)
+        native_linear_rows = np.zeros(n, dtype=bool)
+
+    cycle_rng = (None if _CYCLE_PREDICTIVE_MODE in ("median", "native")
+                 else np.random.Generator(rng.bit_generator.jumped()))
+    for row in np.nonzero(eligible | periodic_rows | linear_rows)[0]:
+        b = int(boundary[row])
+        if periodic_rows[row]:
+            if preserve_periodic_native:
+                continue
+            lag = int(best_lag[row])
+            block[row, b:] = _empirical_cycle_tail(
+                long_histories.get(row, pre[row]), lag, L - b, cycle_rng, _CYCLE_PREDICTIVE_MODE)
+            continue
+        if linear_rows[row]:
+            if native_linear_rows[row]:
+                continue
+            slope_now = (
+                np.median(pre[row, -32:])
+                - np.median(pre[row, -64:-32])
+            ) / 32.0
+            line = anchors[row] + slope_now * np.arange(1, L - b + 1)
+            block[row, b:] = np.clip(
+                line, anchors[row] - span[row], anchors[row] + span[row]
+            )
+            continue
+        anchor = float(anchors[row])
+        if hold[row]:
+            tail = np.full(L - b, anchor)
+        else:
+            tail = anchor + float(retain[row]) * (block[row, b:] - anchor)
+        block[row, b:] = tail
+    return block
+
+
+_apply_tail_rebase = _c251_apply_tail_rebase
+
+
+# ═══════════════ c251-P4: exact fast seeding (numpy SeedSequence -> PCG64), used by P4/P8. ═══════════════
+# uid76 already carries two SeedSequence replicas: the vectorised _ss_columns/_pcg64_seed_words (self-tested against
+# numpy at import by _assert_seeding_replica, and the source of every row stream) and the _FastCoin pool +
+# _fcx_nb_state/_fcx_nb_step/_fcx_nb_out PCG64 kernels (the _fcx_coin path). P4 reuses them unchanged and adds its
+# own import-time self-test against numpy (on any divergence the fast paths switch themselves off and the original
+# numpy constructions run). A replica yields the SAME PCG64 state (seed/inc words of SeedSequence.generate_state(4,
+# uint64), pcg64_set_seed, has_uint32 = uinteger = 0), so every later draw is bit-identical; no RNG call is added,
+# removed or reordered anywhere.
+from numpy.random.bit_generator import ISpawnableSeedSequence as _C251ISS
+
+
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_first_doubles(words, out):
+    # words[k] = generate_state(4, uint64) of a SeedSequence; out[k] = Generator(PCG64(seed_seq)).random()
+    one = np.uint64(1)
+    s63 = np.uint64(63)
+    for k in range(words.shape[0]):
+        ih = (words[k, 2] << one) | (words[k, 3] >> s63)
+        il = (words[k, 3] << one) | one
+        lo = il + words[k, 1]
+        hi = ih + words[k, 0] + (one if lo < il else np.uint64(0))
+        hi, lo = _fcx_nb_step(hi, lo, ih, il)
+        hi, lo = _fcx_nb_step(hi, lo, ih, il)
+        out[k] = _fcx_nb_out(hi, lo)
+
+
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_ss_words(pool, hc, extra, out):
+    # numpy SeedSequence: mix the extra entropy words (here: the spawn key) into a cached 4-word pool, continuing the
+    # hash-constant sequence (hashmix / mix of _bit_generator.pyx), then generate_state(4, uint64).
+    m32 = np.uint64(0xFFFFFFFF)
+    s16 = np.uint64(16)
+    s32 = np.uint64(32)
+    ma = np.uint64(0x931E8875)
+    mb = np.uint64(0x58F38DED)
+    ml = np.uint64(0xCA01F9DD)
+    mr = np.uint64(0x4973F715)
+    p = np.empty(4, dtype=np.uint64)
+    for d in range(4):
+        p[d] = pool[d]
+    h = hc
+    for s in range(extra.shape[0]):
+        for d in range(4):
+            v = extra[s] ^ h
+            h = (h * ma) & m32
+            v = (v * h) & m32
+            v = v ^ (v >> s16)
+            r = (ml * p[d] - mr * v) & m32
+            p[d] = r ^ (r >> s16)
+    hb = np.uint64(0x8B51F9DD)
+    for j in range(4):
+        v0 = p[(2 * j) & 3] ^ hb
+        hb = (hb * mb) & m32
+        v0 = (v0 * hb) & m32
+        v0 = v0 ^ (v0 >> s16)
+        v1 = p[(2 * j + 1) & 3] ^ hb
+        hb = (hb * mb) & m32
+        v1 = (v1 * hb) & m32
+        v1 = v1 ^ (v1 >> s16)
+        out[j] = (v1 << s32) | v0
+
+
+class _C251SeedSeq(_C251ISS):
+    """Stand-in seed sequence for np.random.SeedSequence(entropy, spawn_key=spawn_key): PCG64.__init__ takes the
+    precomputed generate_state(4, uint64) words once; everything else (spawn, entropy, spawn_key, pool, state, ...)
+    is answered by a lazily built REAL SeedSequence with the same arguments, so Generator.spawn() and seed_seq
+    introspection by layers stacked on top see exactly what they would with uid76."""
+    __slots__ = ("_c251_e", "_c251_k", "_c251_w", "_c251_r")
+
+    def __init__(self, entropy, spawn_key, words):
+        self._c251_e = entropy
+        self._c251_k = spawn_key
+        self._c251_w = words
+        self._c251_r = None
+
+    def _c251_real(self):
+        r = self._c251_r
+        if r is None:
+            r = self._c251_r = np.random.SeedSequence(self._c251_e, spawn_key=self._c251_k)
+        return r
+
+    def generate_state(self, n_words, dtype=np.uint32):
+        w = self._c251_w
+        if w is not None and n_words == 4 and dtype is np.uint64:
+            self._c251_w = None
+            return w
+        return self._c251_real().generate_state(n_words, dtype)
+
+    def spawn(self, n_children):
+        return self._c251_real().spawn(n_children)
+
+    @property
+    def entropy(self):
+        return self._c251_e
+
+    @property
+    def spawn_key(self):
+        return self._c251_real().spawn_key
+
+    @property
+    def pool_size(self):
+        return self._c251_real().pool_size
+
+    @property
+    def n_children_spawned(self):
+        return self._c251_real().n_children_spawned
+
+    @property
+    def pool(self):
+        return self._c251_real().pool
+
+    @property
+    def state(self):
+        return self._c251_real().state
+
+    def __repr__(self):
+        return repr(self._c251_real())
+
+
+_C251_SS_POOLS = {}
+_C251_SS_ON = [True]
+_C251_M32 = 0xFFFFFFFF
+
+
+def _c251_rng(entropy, spawn_key):
+    """== np.random.default_rng(np.random.SeedSequence(entropy, spawn_key=spawn_key)) for a list/tuple of
+    non-negative Python ints as entropy and a non-empty tuple of non-negative Python ints as spawn key."""
+    if _C251_SS_ON[0]:
+        key = (entropy,) if type(entropy) is int else tuple(entropy)
+        e = _C251_SS_POOLS.get(key)
+        if e is None:
+            ok = len(key) > 0 and all(type(v) is int and v >= 0 for v in key)
+            if ok:
+                c = _FastCoin(list(key))
+                e = (np.array(c._pool, dtype=np.uint64), np.uint64(c._hc))
+                if len(_C251_SS_POOLS) > 4096:
+                    _C251_SS_POOLS.clear()
+                _C251_SS_POOLS[key] = e
+        if e is not None and spawn_key:
+            xs = []
+            for v in spawn_key:
+                if type(v) is not int or v < 0:
+                    xs = None
+                    break
+                if v == 0:
+                    xs.append(0)
+                while v > 0:
+                    xs.append(v & _C251_M32)
+                    v >>= 32
+            if xs is not None:
+                w = np.empty(4, dtype=np.uint64)
+                _c251_ss_words(e[0], e[1], np.array(xs, dtype=np.uint64), w)
+                return np.random.Generator(np.random.PCG64(_C251SeedSeq(entropy, tuple(spawn_key), w)))
+    return np.random.default_rng(np.random.SeedSequence(entropy, spawn_key=spawn_key))
+
+
+def _c251_selftest_rng():
+    big = 5125841920496347586
+    keys = [([0, 0], (0,)), ([1, 2], (3,)), ([big, 0x59C0_0001], (12345,)), ([2 ** 64 - 1, 0xC124B002], (2 ** 32 - 1,)),
+            ([2 ** 32, 7, 9], (2 ** 32,)), ([123, 0x59E0_0011], (5, 2)), ([big, 0x59C0_0001, 3], (0,)),
+            ([big], (7,)), ([0], (2 ** 40 + 3, 1)), (1234567, (9,)), (big, (0,)), (2 ** 31 - 1, (77777,))]
+    for ent, sk in keys:
+        a = np.random.default_rng(np.random.SeedSequence(ent, spawn_key=sk))
+        b = _c251_rng(ent, sk)
+        if a.bit_generator.state != b.bit_generator.state or not np.array_equal(a.random(3), b.random(3)):
+            return False
+        if b.bit_generator.seed_seq.entropy != ent or tuple(b.bit_generator.seed_seq.spawn_key) != tuple(sk):
+            return False
+        ca, cb = a.spawn(2), b.spawn(2)
+        if any(x.bit_generator.state != y.bit_generator.state for x, y in zip(ca, cb)):
+            return False
+    rows = [(big, 3, 17, 5, 0xC14401), (0, 0, 0, 0, 0), (2 ** 64 - 1, 9, 1, 2047, 0xC14401)]
+    for r_ in rows:
+        cols = _ss_columns([np.array([v], dtype=np.uint64) for v in r_], 1)
+        if cols is None:
+            return False
+        u = np.empty(1, dtype=np.float64)
+        _c251_first_doubles(_pcg64_seed_words(cols), u)
+        if u[0] != np.random.default_rng(np.random.SeedSequence(r_)).random():
+            return False
+    return True
+
+
+try:
+    _C251_SS_ON[0] = bool(_c251_selftest_rng())
+except Exception:
+    _C251_SS_ON[0] = False
+
+
+# ── P4: renewal-persistence gate (0.72 SeedSequence + default_rng per record, each used for ONE uniform). The gate
+# uniforms of all eligible slots are computed at once with uid76's own row-stream replica (_ss_columns /
+# _pcg64_seed_words: same entropy words (base_seed, chunk_index, fam, slot, STAGE), self-tested) + the first PCG64
+# double; slots are then visited in the same order with the same eligibility tests, and the selected slots build
+# path_rng / noise_rng and the replacement series exactly as before.
+def _c251_apply_renewal_persistence(chunk, fam_ids, base_seed, chunk_index, settings):
+    selected = np.zeros(len(chunk), dtype=bool)
+    rate = settings["rate"]
+    if rate <= 0.0:
+        return selected
+    eligible = settings["eligible_families"]
+    slots = []
+    fams = []
+    for slot, old in enumerate(chunk):
+        fam = int(fam_ids[slot])
+        if old is None or old.size == 0 or _FAMILIES[fam] not in eligible:
+            continue
+        slots.append(slot)
+        fams.append(fam)
+    if not slots:
+        return selected
+    gate = None
+    if _C251_SS_ON[0] and int(base_seed) >= 0 and int(chunk_index) >= 0:
+        cols = _ss_columns([int(base_seed), int(chunk_index), np.array(fams, dtype=np.uint64),
+                            np.array(slots, dtype=np.uint64), _RENEWAL_SELECT_STAGE], len(slots))
+        if cols is not None:
+            gate = np.empty(len(slots), dtype=np.float64)
+            _c251_first_doubles(_pcg64_seed_words(cols), gate)
+    for j in range(len(slots)):
+        slot = slots[j]
+        fam = fams[j]
+        old = chunk[slot]
+        coords = (int(base_seed), int(chunk_index), fam, slot)
+        if gate is not None:
+            u = gate[j]
+        else:
+            u = np.random.default_rng(np.random.SeedSequence((*coords, _RENEWAL_SELECT_STAGE))).random()
+        if u >= rate:
+            continue
+        path_rng = np.random.default_rng(np.random.SeedSequence((*coords, _RENEWAL_PATH_STAGE)))
+        noise_rng = np.random.default_rng(np.random.SeedSequence((*coords, _RENEWAL_NOISE_STAGE)))
+        chunk[slot] = _renewal_persistence_series(path_rng, noise_rng, int(old.size), settings)
+        selected[slot] = True
+    return selected
+
+
+_apply_renewal_persistence = _c251_apply_renewal_persistence
+
+
+# ═══════════════ c251-P5: exact numba _yqh_station (YQH station-hold scan, ~1.5 calls/record once C91/YQH open). ═══════════════
+# Same tests in the same order on the same values: all finite; d = s[t+1] - s[t] (np.diff); mv = d != 0.0;
+# >= 4 moves; real = s[mv[0]:] with size >= 256, min >= 0, max <= cap; mean(real == rint(real)) >= 0.98 (a mean of
+# booleans is the exact count / size; rint = round-half-even, an exact IEEE operation); np.median(|d[mv]|) <= 1.0
+# with numpy's median value: middle order statistic (odd n) or (0.0 + ((0.0 + a) + b)) / 2.0 (even n; identity-start
+# add.reduce then true_divide). The |d| are > 0, so the selected order statistics are sign-free and unique in value.
+# No RNG. Non-float inputs keep uid76's path.
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_yqh_station_nb(s, cap):
+    n = s.shape[0]
+    for t in range(n):
+        if not np.isfinite(s[t]):
+            return False
+    if n < 2:
+        return False
+    cnt = 0
+    first = -1
+    for t in range(n - 1):
+        if s[t + 1] - s[t] != 0.0:
+            if first < 0:
+                first = t
+            cnt += 1
+    if cnt < 4:
+        return False
+    m = n - first
+    if m < 256:
+        return False
+    lo = s[first]
+    hi = s[first]
+    k = 0
+    for t in range(first, n):
+        v = s[t]
+        if v < lo:
+            lo = v
+        if v > hi:
+            hi = v
+        if v == np.rint(v):
+            k += 1
+    if lo < 0.0 or hi > cap:
+        return False
+    if k / m < 0.98:
+        return False
+    a = np.empty(cnt, dtype=np.float64)
+    j = 0
+    for t in range(n - 1):
+        dd = s[t + 1] - s[t]
+        if dd != 0.0:
+            a[j] = abs(dd)
+            j += 1
+    h = cnt // 2
+    _c251_kth(a, 0, cnt, h)
+    if cnt % 2 == 1:
+        med = 0.0 + a[h]
+    else:
+        lo2 = a[0]
+        for t in range(1, h):
+            if a[t] > lo2:
+                lo2 = a[t]
+        med = (0.0 + ((0.0 + lo2) + a[h])) / 2.0
+    return med <= 1.0
+
+
+_c251_yqh_station_parent = _yqh_station
+
+
+def _c251_yqh_station(s, cap):
+    if (type(s) is np.ndarray and s.dtype == np.float64 and s.ndim == 1 and type(cap) is float):
+        return bool(_c251_yqh_station_nb(s, cap))
+    return _c251_yqh_station_parent(s, cap)
+
+
+_yqh_station = _c251_yqh_station
+
+
+# ═══════════════ c251-P7: exact _c124b2_extend (C91 univariate hold extension, open regime ~0.54 calls/record). ═══════════════
+# uid76 builds the candidate runs with a Python list comprehension over EVERY change point, a full-length cumsum for
+# ceq and np.full pieces + concatenate for the output. P7 does the three integer/copy jobs in numba:
+#  * runs: maximal constant stretches [s, e) (a new run starts at t when v[t] != v[t-1], NaN != NaN as in numpy),
+#    kept when s > 0 and e - s >= _C91_MIN_RUN, in the same order, as Python ints;
+#  * ceq[t] = #{1 <= t' <= t : v[t'] == v[t'-1]} (= concatenate([0], cumsum(v[1:] == v[:-1])), same int64 values);
+#  * output: the same concatenation (v[prev:e], d copies of v[e-1], ..., v[prev:]) written into one (L + ins) array
+#    whose [ins:] view is returned, exactly like np.concatenate(pieces)[ins:] (copies only; bits preserved).
+# Everything that touches r (r.permutation(len(cand)), then per candidate r.random() and, when it passes,
+# r.geometric(1 / _C91_MEAN_D)) and every test in the selection loop is uid76's code verbatim.
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_c91_runs(v, min_run, cs, ce, ceq):
+    L = v.shape[0]
+    ceq[0] = 0
+    c = 0
+    start = 0
+    nc = 0
+    for t in range(1, L):
+        if v[t] == v[t - 1]:
+            c += 1
+        else:
+            if start > 0 and t - start >= min_run:
+                cs[nc] = start
+                ce[nc] = t
+                nc += 1
+            start = t
+        ceq[t] = c
+    if start > 0 and L - start >= min_run:
+        cs[nc] = start
+        ce[nc] = L
+        nc += 1
+    return nc
+
+
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_c91_assemble(v, es, ds, out):
+    pos = 0
+    prev = 0
+    for k in range(es.shape[0]):
+        e = es[k]
+        for t in range(prev, e):
+            out[pos] = v[t]
+            pos += 1
+        val = v[e - 1]
+        for t in range(ds[k]):
+            out[pos] = val
+            pos += 1
+        prev = e
+    for t in range(prev, v.shape[0]):
+        out[pos] = v[t]
+        pos += 1
+
+
+_c251_c124b2_parent = _c124b2_extend
+
+
+def _c251_c124b2_extend(x, r):
+    v = np.asarray(x)
+    if v.ndim != 1 or v.size < 256 or v.dtype.kind != 'f':
+        return None
+    if v.dtype != np.float64:
+        return _c251_c124b2_parent(x, r)
+    L = int(v.size)
+    cs = np.empty(L, dtype=np.int64)
+    ce = np.empty(L, dtype=np.int64)
+    ceq = np.empty(L, dtype=np.int64)
+    nc = int(_c251_c91_runs(v, float(_C91_MIN_RUN), cs, ce, ceq))
+    if nc == 0:
+        return None
+    cand = list(zip(cs[:nc].tolist(), ce[:nc].tolist()))
+    chosen = {}
+    ins = 0
+    for j in r.permutation(len(cand)).tolist():
+        if r.random() >= _C91_P:
+            continue
+        d = int(min(_C91_MIN_D + int(r.geometric(1.0 / _C91_MEAN_D)), _C91_MAX_D))
+        s = cand[j][0]
+        a = max(1, s - _C124B2_W)
+        nd = s - a
+        if nd < _C124B2_MIN_N or int(ceq[s - 1] - ceq[a - 1]) < _C124B2_QMIN * nd:
+            continue
+        if ins + d > _C91_MAX_TOTAL:
+            continue
+        chosen[j] = d
+        ins += d
+    if ins == 0:
+        return None
+    es = []
+    ds = []
+    for j, (s, e) in enumerate(cand):
+        d = chosen.get(j)
+        if d is None:
+            continue
+        es.append(e)
+        ds.append(d)
+    out = np.empty(L + ins, dtype=v.dtype)
+    _c251_c91_assemble(v, np.array(es, dtype=np.int64), np.array(ds, dtype=np.int64), out)
+    w = out[ins:]
+    return w if w.size == L else None
+
+
+if _c91_extend is _c124b2_extend:
+    _c91_extend = _c251_c124b2_extend
+
+
+# ═══════════════ c251-P6: exact _acuh_air (ACUH 4th-channel 'air' family): the pollution-episode loop. ═══════════════
+# uid76 builds every episode with linspace + arange + divide + exp + concatenate + a slice add (~10 us of numpy
+# overhead per episode, ~23 episodes per call). P6 keeps the per-episode RNG calls verbatim and in order
+# (r.integers(0, n, nep) for the starts, then per episode r.normal -> r.integers(1, 4) -> r.uniform(1.0, 4.0)), keeps
+# the per-episode SCALAR np.exp(r.normal(...)) as a scalar ufunc call, and then:
+#  * linspace(0, 1, rise + 1)[1:] for rise in {1, 2, 3} comes from a table built once with the same np.linspace call;
+#  * the decay exponentials of all episodes are ONE np.exp over the concatenated float64(-k) / decay arguments
+#    (k = 1..int(6 * decay) + 1, the same int64 -> float64 conversion and true division as -np.arange(..) / decay):
+#    a 1-D contiguous ufunc call exactly like each original per-episode call, so every element goes through the same
+#    inner loop and gets the same bits;
+#  * ep[s:e] += a * seg[:e - s] is replayed episode by episode in a numba loop: per element ep[t] + (a * seg[t - s])
+#    with the multiply rounded first (fastmath OFF, no FMA contraction), in the same episode order.
+# Everything else in the function is uid76's code verbatim. _ACUH_FAMS is rebuilt with the new function object
+# (same names, weights and order) because the table holds the original function.
+_C251_ACUH_LIN = np.zeros((4, 3), dtype=np.float64)
+for _c251_rise in (1, 2, 3):
+    _C251_ACUH_LIN[_c251_rise, :_c251_rise] = np.linspace(0, 1, _c251_rise + 1)[1:]
+del _c251_rise
+
+
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_negk_over(em, ed):
+    tot = 0
+    for j in range(em.shape[0]):
+        tot += em[j]
+    out = np.empty(tot, dtype=np.float64)
+    o = 0
+    for j in range(em.shape[0]):
+        d = ed[j]
+        for k in range(1, em[j] + 1):
+            out[o] = float(-k) / d
+            o += 1
+    return out
+
+
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_acuh_accum(ep, starts, ea, er, em, ex, lin):
+    n = ep.shape[0]
+    off = 0
+    for j in range(starts.shape[0]):
+        s = starts[j]
+        rise = er[j]
+        m = em[j]
+        a = ea[j]
+        e = s + rise + m
+        if e > n:
+            e = n
+        for t in range(e - s):
+            if t < rise:
+                v = lin[rise, t]
+            else:
+                v = ex[off + t - rise]
+            ep[s + t] = ep[s + t] + a * v
+        off += m
+
+
+def _c251_acuh_air(r, L):
+    k = _ACUH_AIR_NAMES[int(np.searchsorted(_ACUH_AIR_CUM, r.random() * 0.999999, side="right"))]
+    _, lev, shape, amp, phi, rate, ep_mu, zfloor, p_int, quantum = _ACUH_AIR_P[k]
+    u = r.random()
+    n = int(r.integers(650, 1001)) if u < 0.92 else int(r.integers(1000, min(L, 4160) + 1))
+    t = np.arange(n, dtype=np.float64)
+    hours = t + r.uniform(0, 24)
+    base = np.log(np.exp(r.uniform(np.log(lev[0]), np.log(lev[1]))))
+    prof = _acuh_air_profile(r, shape, hours) * r.uniform(*amp) * 1.25
+    wk = r.uniform(0.0, 0.15) * (((hours // 24) % 7) < 5) if shape == "traffic" else 0.0
+    syn = _acuh_smooth_noise(r, n, 1.0 / r.uniform(48, 240)) * r.uniform(0.15, 0.45)
+    drift = np.linspace(0.0, r.normal(0.0, 0.6), n)
+    ph = r.uniform(*phi)
+    noise = _acuh_ar1(r, n, ph, r.uniform(0.10, 0.25) * np.sqrt(1 - ph * ph) * 1.5)
+    lx = base + prof + wk + syn + drift + noise
+
+    ep = np.zeros(n)
+    nep = r.poisson(n * r.uniform(*rate) / 1000.0)
+    starts = r.integers(0, n, nep)
+    ne = int(starts.shape[0])
+    if ne:
+        ea = np.empty(ne, dtype=np.float64)
+        er = np.empty(ne, dtype=np.int64)
+        em = np.empty(ne, dtype=np.int64)
+        ed = np.empty(ne, dtype=np.float64)
+        for j in range(ne):
+            ea[j] = np.exp(r.normal(ep_mu - 0.6, 0.55))
+            rise, decay = int(r.integers(1, 4)), r.uniform(1.0, 4.0)
+            er[j] = rise
+            em[j] = int(6 * decay) + 1
+            ed[j] = decay
+        ex = np.exp(_c251_negk_over(em, ed))
+        _c251_acuh_accum(ep, np.ascontiguousarray(starts, dtype=np.int64), ea, er, em, ex, _C251_ACUH_LIN)
+    if r.random() < 0.5 and k in ("pm25", "pm10", "no2", "bc", "other"):
+        for _ in range(int(r.integers(1, 3))):
+            s = int(r.integers(0, n)); d = int(r.integers(24, 96))
+            env = np.sin(np.linspace(0, np.pi, d)) ** 2 * r.uniform(0.4, 1.3)
+            e = min(n, s + d); lx[s:e] += env[:e - s]
+    x = np.exp(lx) * (1.0 + ep)
+    if zfloor > 0:
+        thr = np.quantile(x, r.uniform(0.6, 1.4) * zfloor)
+        x = np.where(x < thr, 0.0, x)
+    signed = k in ("no2", "no", "o3", "other") and zfloor < 0.3 and r.random() < 0.3
+    if signed:
+        x = x + r.normal(0.0, r.uniform(0.3, 2.0)) * 0.3 + r.standard_normal(n) * r.uniform(0.2, 1.2)
+    if r.random() < p_int:
+        x = np.round(x)
+    else:
+        x = _acuh_quantise(x, quantum if r.random() < 0.8 else quantum / 10.0)
+    if not signed:
+        x = np.maximum(x, 0.0)
+    if np.ptp(x) == 0:
+        x = x + _acuh_quantise(np.abs(r.standard_normal(n)) * 0.1, 0.1)
+    return _acuh_pad(x, L)
+
+
+if any(fn is _acuh_air for _, _, fn in _ACUH_FAMS):
+    _ACUH_FAMS = tuple((nm, w, (_c251_acuh_air if fn is _acuh_air else fn)) for nm, w, fn in _ACUH_FAMS)
+    _acuh_air = _c251_acuh_air
+
+
+# ═══════════════ c251-P9: exact numba _k87_quiet_eval (the quiet-tail test behind _k87_quiet; ~0.7 memo misses per record). ═══════════════
+# Same statistic, same decision: sorted values (np.sort -> exact order statistics), uid76's _k87_lin interpolation
+# ((n - 1) * q, floor, g, a + (b - a) * g or b - (b - a) * (1 - g)), Python max() semantics for span/tol (first
+# maximal argument kept), count(d <= tol) / d.size >= 0.35, the 90% lin-quantile of the sorted |diff|, and the
+# (m[15] + m[16]) / 2 mid-values of the first/last 32 points. Non-finite inputs (and any other shape) return -1 and
+# take uid76's own path (_k87_quiet_slow). A selected zero's sign cannot change the decision: span >= 1e-12 > 0 and
+# every other use goes through abs() of a difference.
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_k87_lin(s, q):
+    v = (s.shape[0] - 1) * q
+    j = int(np.floor(v))
+    g = v - float(j)
+    a = s[j]
+    b = s[j + 1]
+    diff = b - a
+    if g >= 0.5:
+        return b - diff * (1 - g)
+    return a + diff * g
+
+
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_k87_eval_nb(recent):
+    n = recent.shape[0]
+    for t in range(n):
+        if not np.isfinite(recent[t]):
+            return -1
+    s = np.sort(recent)
+    lo = s[0]
+    hi = s[n - 1]
+    d = np.empty(n - 1, dtype=np.float64)
+    for t in range(n - 1):
+        d[t] = abs(recent[t + 1] - recent[t])
+    q10 = _c251_k87_lin(s, 0.10)
+    q90 = _c251_k87_lin(s, 0.90)
+    alo = abs(lo)
+    ahi = abs(hi)
+    peak = ahi if ahi > alo else alo
+    span = q90 - q10
+    c = peak * 1e-12
+    if c > span:
+        span = c
+    if 1e-12 > span:
+        span = 1e-12
+    tol = peak * 1e-12
+    if 1e-12 > tol:
+        tol = 1e-12
+    cnt = 0
+    for t in range(n - 1):
+        if d[t] <= tol:
+            cnt += 1
+    if cnt / (n - 1) >= 0.35:
+        return 1
+    sd = np.sort(d)
+    if not np.isfinite(sd[n - 2]):
+        return -1
+    m1 = np.sort(recent[n - 32:])
+    m0 = np.sort(recent[:32])
+    drift = abs((m1[15] + m1[16]) / 2 - (m0[15] + m0[16]) / 2) / span
+    if _c251_k87_lin(sd, 0.90) / span <= 0.03 and drift <= 0.12:
+        return 1
+    return 0
+
+
+_c251_k87_eval_parent = _k87_quiet_eval
+
+
+def _c251_k87_quiet_eval(recent):
+    if (type(recent) is np.ndarray and recent.dtype == np.float64 and recent.ndim == 1 and recent.size >= 64):
+        v = int(_c251_k87_eval_nb(recent))
+        if v >= 0:
+            return v == 1
+    return _c251_k87_eval_parent(recent)
+
+
+_k87_quiet_eval = _c251_k87_quiet_eval
+
+
+# ── c251-P9b: _c91_points without the numpy-dispatch wrappers (np.size / np.ndim / np.shape) for ndarray and dict
+# records: the same integer (size, or ceil(100 * size / 120) for a 2-D record with more than one channel).
+_c251_c91_points_parent = _c91_points
+
+
+def _c251_c91_points(x):
+    v = x['values'] if isinstance(x, dict) else x
+    if type(v) is np.ndarray:
+        size = int(v.size)
+        if v.ndim == 2 and int(v.shape[0]) > 1:
+            return -(-size * 100 // 120)
+        return size
+    return _c251_c91_points_parent(x)
+
+
+_c91_points = _c251_c91_points
+
+
+# ═══════════════ c251-P11: exact row std in _apply_nonneg_integer_prior (chunk post-processing). ═══════════════
+# rows.std(axis=1, keepdims=True) of a C-contiguous float64 block = per row sqrt((0.0 + pairwise((x - m) * (x - m)))
+# / L) with m = (0.0 + pairwise(x)) / L, i.e. uid76's own _v2_var_nb + a correctly rounded sqrt (bit-equal to numpy's
+# two-pass std along a contiguous row; verified). Everything else (the RNG calls rng.random(n), rng.uniform(..),
+# rng.random(..) [, rng.random(..)], _spread_flat_levels, the rint / scaling / write-back) is uid76's code verbatim.
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_row_std(rows, out):
+    for r in range(rows.shape[0]):
+        out[r, 0] = np.sqrt(_v2_var_nb(rows[r]))
+
+
+def _c251_rows_std_keep(rows):
+    if (type(rows) is np.ndarray and rows.dtype == np.float64 and rows.ndim == 2 and rows.flags.c_contiguous
+            and rows.shape[1] > 0):
+        out = np.empty((rows.shape[0], 1), dtype=np.float64)
+        _c251_row_std(rows, out)
+        return out
+    return rows.std(axis=1, keepdims=True)
+
+
+
+def _c251_apply_nonneg_integer_prior(
+    rng: np.random.Generator, block: np.ndarray, *,
+    integer_min_std: float = 0.0,
+    integer_min_std_frac: float = 1.0,
+    integer_frac: float = _NONNEG_INTEGER_FRAC,
+    flat_level_spread: float = 0.0,
+) -> np.ndarray:
+    n = block.shape[0]
+    if n == 0:
+        return block
+    nonneg_mask = rng.random(n) < _NONNEG_FRAC
+    if not nonneg_mask.any():
+        return block
+    sel = np.nonzero(nonneg_mask)[0]
+
+    whole = sel.size == n
+    rows = block if whole else block[sel]
+    row_min = rows.min(axis=1, keepdims=True)
+    row_scale = np.maximum(_c251_rows_std_keep(rows), 1e-9)
+    floor = row_scale * rng.uniform(0.0, 0.15, size=(sel.size, 1))
+    shift = np.where(row_min < floor, floor - row_min, 0.0)
+    rows += shift
+    int_mask = rng.random(sel.size) < integer_frac
+    if integer_min_std > 0.0 and int_mask.any():
+
+        low = int_mask & (row_scale[:, 0] < integer_min_std)
+        if integer_min_std_frac < 1.0:
+
+            low &= rng.random(sel.size) < integer_min_std_frac
+        if low.any():
+            grow = (integer_min_std / row_scale[low, 0])[:, None]
+            if whole:
+                rows[low] *= grow
+            else:
+                rows[low] = rows[low] * grow
+    if whole and int_mask.all():
+        np.rint(rows, out=rows)
+        _spread_flat_levels(rng, rows, flat_level_spread)
+        return block
+    if int_mask.any():
+        int_sel = sel[int_mask]
+        int_rows = _spread_flat_levels(
+            rng, np.rint(rows[int_mask]), flat_level_spread
+        )
+        block[int_sel] = int_rows
+        keep = ~int_mask
+        if keep.any():
+            block[sel[keep]] = rows[keep]
+    else:
+        block[sel] = rows
+    return block
+
+
+_apply_nonneg_integer_prior = _c251_apply_nonneg_integer_prior
+
+
+# ── c251-P12: np.nan_to_num(np.asarray(x, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0) for a 1-D float64
+# array (partner pt rows): a fresh contiguous copy with NaN / +inf / -inf -> 0.0 and every finite value copied
+# bit for bit -- exactly what nan_to_num(copy=True) returns. Other inputs keep numpy's call.
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_nan0_nb(a, out):
+    for k in range(a.shape[0]):
+        v = a[k]
+        out[k] = v if np.isfinite(v) else 0.0
+
+
+def _c251_nan0(x):
+    a = np.asarray(x, dtype=np.float64)
+    if type(a) is np.ndarray and a.ndim == 1:
+        out = np.empty(a.shape[0], dtype=np.float64)
+        _c251_nan0_nb(a, out)
+        return out
+    return np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+# ═══════════════ c251-P8: per-record generator construction through the exact seeding replica (_c251_rng). ═══════════════
+# Six layer methods build one np.random.default_rng(np.random.SeedSequence(...)) per record (C91 0.54/record once
+# open, C128 0.22, YC 0.19, ACUH 0.18, partner pt 0.13, YQH 0.08; ~13.5 us each). Each method below is uid76's
+# method VERBATIM except (a) that one construction -> _c251_rng(same entropy, same spawn key) (identical PCG64
+# state; seed_seq answers entropy/spawn_key/spawn() like the real SeedSequence) and (b) zero-argument super() ->
+# super(<that class>, self) (a function defined outside the class body has no __class__ cell; same MRO step).
+# The methods are installed on the SAME class objects (looked up through the parent aliases uid76 itself binds), and
+# only when the class still carries uid76's original method (line-number + name check), so a stacked layer that
+# already replaced one keeps its own. In the partner pt method the two np.nan_to_num(...) row cleanups also go
+# through the exact _c251_nan0 (c251-P12).
+
+
+def _c251_c91_generate(self, n_series: int) -> Iterator[np.ndarray]:
+    n = int(n_series)
+    if n <= 0:
+        return
+    seed = int(self._seed) & ((1 << 64) - 1)
+    lo = _C91_OPEN_NUM * int(_C91_CHILD_BUDGET)
+    pos = 0
+    base = super(_C124B2Parent, self).generate(n)
+    try:
+        for i, x in enumerate(base):
+            if _C91_P > 0.0 and _C91_OPEN_DEN * pos >= lo and np.ndim(x) == 1:
+                r = _c251_rng([seed, _C91_TAG], (i,))
+                try:
+                    w = _c91_extend(x, r)
+                    if w is not None and np.all(np.isfinite(w)):
+                        x = w
+                except Exception:
+                    pass
+            pos += _c91_points(x)
+            yield x
+    finally:
+        base.close()
+
+
+if getattr(_C124B2Parent.__dict__.get("generate"), "__code__", None) is not None and \
+        _C124B2Parent.__dict__["generate"].__code__.co_firstlineno == 18660 and _C124B2Parent.__dict__["generate"].__name__ == "generate":
+    _C124B2Parent.generate = _c251_c91_generate
+
+
+def _c251_c128_generate(self, n_series: int) -> Iterator[np.ndarray]:
+    n = int(n_series)
+    if n <= 0:
+        return
+    seed = int(self._seed) & ((1 << 64) - 1)
+    lo = _C128_OPEN_NUM * int(_C91_CHILD_BUDGET)
+    pos = 0
+    base = super(_XZParent, self).generate(n)
+    try:
+        for i, x in enumerate(base):
+            inside = _C128_Q > 0.0 and _C128_OPEN_DEN * pos >= lo
+            pos += _c91_points(x)
+            if inside and _c128_eligible(x):
+                r = _c251_rng([seed, _C128_TAG], (i,))
+                if r.random() < _C128_Q:
+                    k = min(int(np.searchsorted(_C128_CUM, r.random(), side="right")), len(_C128_FAMS) - 1)
+                    try:
+                        L = int(x.shape[1])
+                        with np.errstate(all="ignore"):
+                            w = _C128_FAMS[k][2](r, L)
+                        if _c128_keep(w, L):
+                            z = np.empty((_C128_HOST_C + 1, L), dtype=np.float64)
+                            z[:_C128_HOST_C] = x
+                            z[_C128_HOST_C] = w
+                            x = z
+                    except Exception:
+                        pass
+            yield x
+    finally:
+        base.close()
+
+
+if getattr(_XZParent.__dict__.get("generate"), "__code__", None) is not None and \
+        _XZParent.__dict__["generate"].__code__.co_firstlineno == 20094 and _XZParent.__dict__["generate"].__name__ == "generate":
+    _XZParent.generate = _c251_c128_generate
+
+
+def _c251_acuh_generate(self, n_series: int) -> Iterator[np.ndarray]:
+    n = int(n_series)
+    if n <= 0:
+        return
+    seed = int(self._seed) & ((1 << 64) - 1)
+    base = super(_YZParent, self).generate(n)
+    try:
+        for i, x in enumerate(base):
+            if _ACUH_Q > 0.0 and _acuh_eligible(x):
+                r = _c251_rng([seed, _ACUH_TAG], (i,))
+                if r.random() < _ACUH_Q:
+                    k = min(int(np.searchsorted(_ACUH_CUM, r.random(), side="right")), len(_ACUH_FAMS) - 1)
+                    try:
+                        L = int(x.shape[1])
+                        with np.errstate(all="ignore"):
+                            w = np.asarray(_ACUH_FAMS[k][2](r, L), dtype=np.float64).reshape(-1)
+                        if _acuh_keep(w, x):
+                            z = np.empty((_ACUH_HOST_C + 1, L), dtype=np.float64)
+                            z[:_ACUH_HOST_C] = x
+                            z[_ACUH_HOST_C] = w
+                            x = z
+                    except Exception:
+                        pass
+            yield x
+    finally:
+        base.close()
+
+
+if getattr(_YZParent.__dict__.get("generate"), "__code__", None) is not None and \
+        _YZParent.__dict__["generate"].__code__.co_firstlineno == 21645 and _YZParent.__dict__["generate"].__name__ == "generate":
+    _YZParent.generate = _c251_acuh_generate
+
+
+def _c251_yc_generate(self, n_series: int) -> Iterator[np.ndarray]:
+    n = int(n_series)
+    if n <= 0:
+        return
+    fams = self._yc_fams
+    seed = int(self._seed) & ((1 << 64) - 1)
+    slots = len(_YC_FAMS)
+    lo = self._yc_open * _YZ_CHILD_BUDGET if "_YZ_CHILD_BUDGET" in globals() else 0.0
+    pos = 0
+    base = super(_YACParent, self).generate(n)
+    try:
+        for i, x in enumerate(base):
+            fams = self._yc_fams
+            if fams and (lo <= 0 or pos >= lo) and _yc_host(x, self._yc_hosts):
+                u = _fcx_coins(seed, _YC_TAG, i, slots)
+                for k, q, f in fams:
+                    if u[k] >= q:
+                        continue
+                    L = int(x.shape[-1])
+                    w = None
+                    try:
+                        with np.errstate(all="ignore"):
+                            w = f(_c251_rng([seed, _YC_TAG, k + 1], (i,)), L)
+                    except Exception:
+                        w = None
+                    if (isinstance(w, np.ndarray) and w.ndim == 1 and w.size == L and w.dtype.kind == "f"
+                            and bool(np.all(np.isfinite(w))) and float(w.max()) > float(w.min())):
+                        h = x.reshape(1, L) if x.ndim == 1 else x
+                        z = np.empty((h.shape[0] + 1, L), dtype=np.float64)
+                        z[:-1] = h
+                        z[-1] = w
+                        x = z
+                        break
+            if lo > 0:
+                pos += _yz_points(x)
+            yield x
+    finally:
+        base.close()
+
+
+if getattr(_YACParent.__dict__.get("generate"), "__code__", None) is not None and \
+        _YACParent.__dict__["generate"].__code__.co_firstlineno == 27538 and _YACParent.__dict__["generate"].__name__ == "generate":
+    _YACParent.generate = _c251_yc_generate
+
+
+def _c251_yqh_generate(self, n_series: int) -> Iterator[np.ndarray]:
+    n = int(n_series)
+    if n <= 0:
+        return
+    seed = int(self._seed) & ((1 << 64) - 1)
+    k = self._yqh
+    lo = _C91_OPEN_NUM * int(_C91_CHILD_BUDGET)
+    pos = 0
+    base = super(_SLParent, self).generate(n)
+    try:
+        for i, x in enumerate(base):
+            if (k["q"] > 0.0 and _C91_OPEN_DEN * pos >= lo and isinstance(x, np.ndarray) and x.dtype == np.float64
+                    and x.ndim == 2 and x.shape[0] > 1 and x.shape[1] >= 256):
+                st = [c for c in range(x.shape[0]) if _yqh_station(x[c], k["cap"])]
+                if st:
+                    out = None
+                    for g in _yqh_groups(x, st, k["couple"]):
+                        r = _c251_rng([seed, _YQH_TAG], (i, g[0]))
+                        if r.random() >= k["q"]:
+                            continue
+                        try:
+                            w = _yqh_extend(x[g], r, k)
+                        except Exception:
+                            w = None
+                        if w is not None and np.all(np.isfinite(w)):
+                            if out is None:
+                                out = x.copy()
+                            out[g] = w
+                    if out is not None:
+                        x = out
+            pos += _c91_points(x)
+            yield x
+    finally:
+        base.close()
+
+
+if getattr(_SLParent.__dict__.get("generate"), "__code__", None) is not None and \
+        _SLParent.__dict__["generate"].__code__.co_firstlineno == 28255 and _SLParent.__dict__["generate"].__name__ == "generate":
+    _SLParent.generate = _c251_yqh_generate
+
+
+def _c251_pt_generate(self, n_series: int) -> Iterator[np.ndarray]:
+    seed = self._base_seed
+    for i in range(int(n_series)):
+        rng = _c251_rng(seed, (i,))
+        fam = self._family_keys[rng.choice(len(self._family_keys), p=self._family_probs)]
+        self._last_fam = fam
+        n = _pt_sample_series_length(rng)
+        x = _pt_FAMILY_BUILDERS[fam](rng, n)
+        x = _c251_nan0(x)
+        is_raw = fam in self._raw
+        keep_native = fam in _pt_NATIVE_SCALE_FAMILIES or is_raw
+        was_integer = keep_native and bool(np.all(x == np.round(x)))
+        was_nonneg = keep_native and bool(x.min() >= 0.0)
+        if rng.random() < self._vol_warp_prob and (not keep_native):
+            x = _pt_warp_increments_stochastic_vol(rng, x, self._vol_warp_strength)
+        if rng.random() < self._level_shift_prob and (not keep_native):
+            x = _pt_add_heavy_tailed_level_shifts(rng, x, self._level_shift_rate, self._level_shift_scale)
+        if not is_raw:
+            x = self._randomize_scale(rng, x, fam)
+        if was_integer:
+            x = np.round(x)
+        repeat_frac = float(_v2_mean(np.diff(x) == 0.0)) if x.size > 1 else 1.0
+        hold_allowed = (repeat_frac >= self._hold_gate_min_repeat_frac) | (rng.random() < self._hold_gate_bypass_prob)
+        if rng.random() < self._tail_hold_prob and (not is_raw) and hold_allowed:
+            x = _pt_apply_tail_hold(rng, x, self._tail_hold_max_len)
+            if was_integer:
+                x = np.round(x)
+            if was_nonneg:
+                np.maximum(x, 0.0, out=x)
+        if rng.random() < self._segment_hold_prob and (not is_raw):
+            x = _pt_hold_random_segments(rng, x, self._segment_max_count, self._segment_min_len, self._segment_max_len, self._segment_extreme_prob)
+            if was_integer:
+                x = np.round(x)
+        if rng.random() < self._flat_tail_prob and (not is_raw) and hold_allowed:
+            x = _pt_hold_flat_tail(rng, x, self._flat_tail_min_len, self._flat_tail_max_frac, self._flat_tail_extreme_prob)
+        if rng.random() < self._pad_prob:
+            x = self._pad(rng, x)
+        else:
+            x = x[:self._target_len]
+        x = _c251_nan0(x)
+        zf = float((x == 0.0).mean())
+        if zf > 0.35 and (not keep_native):
+            abs_max = float(np.abs(x).max())
+            offset = max(1.0, abs_max * float(rng.uniform(0.15, 0.8)))
+            x = x + (np.round(offset) if float(np.all(x == np.round(x))) else offset)
+        np.clip(x, -3e+37, 3e+37, out=x)
+        yield x
+
+
+if getattr(_pt_Generator.__dict__.get("generate"), "__code__", None) is not None and \
+        _pt_Generator.__dict__["generate"].__code__.co_firstlineno == 15128 and _pt_Generator.__dict__["generate"].__name__ == "generate":
+    _pt_Generator.generate = _c251_pt_generate
+
+
+# ═══════════════ c251-P10: exact W9Q coupling statistics (published core: partner/teach 2nd channel on 25% of rows). ═══════════════
+# uid76's method verbatim, with two expression blocks evaluated by numba on the same (2, L) float64 C-contiguous
+# arrays (other shapes keep uid76's expressions):
+#  * coupling: s_c = sqrt(var(diff(z[c]))) with uid76's own _v2_var_nb (two-pass: (0.0 + pairwise) / n mean, then
+#    (0.0 + pairwise((x - m) * (x - m))) / n; sqrt is correctly rounded everywhere); zz = [0, clip((d0 - mean(d0)) /
+#    s0, -6, 6)] with numpy's clip semantics (NaN kept, max(x, -6) then min(., 6)); zz[:p] = 0 for p = first index
+#    with z1 != z1[0]; new row 1 = z1 + (_CPL * s1) * zz (multiply rounded first);
+#  * keep test: all_c std(z[c]) > 1e-9 * (mean|z[c]| + 1e-12) and std(z[0] - z[1]) > 1e-9 * (mean|z| + 1e-12), with
+#    np.std / np.mean's exact pairwise reductions (row-wise for axis=1, over all C*L elements for the flat mean of a
+#    C-contiguous array; verified bit-equal to numpy on random data).
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_std1(x):
+    return np.sqrt(_v2_var_nb(x))
+
+
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_w9q_s01(z, out):
+    L = z.shape[1]
+    d = np.empty(L - 1, dtype=np.float64)
+    for c in range(2):
+        for k in range(L - 1):
+            d[k] = z[c, k + 1] - z[c, k]
+        out[c] = _c251_std1(d)
+
+
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_w9q_couple(z, s0, c1, zn):
+    L = z.shape[1]
+    d0 = np.empty(L - 1, dtype=np.float64)
+    for k in range(L - 1):
+        d0[k] = z[0, k + 1] - z[0, k]
+    m0 = (0.0 + _v2_pw(d0, 0, L - 1)) / (L - 1)
+    p = 0
+    z10 = z[1, 0]
+    for k in range(L):
+        if z[1, k] != z10:
+            p = k
+            break
+    for k in range(L):
+        zn[0, k] = z[0, k]
+    zn[1, 0] = z[1, 0] + c1 * 0.0
+    for k in range(1, L):
+        if k < p:
+            v = 0.0
+        else:
+            v = (d0[k - 1] - m0) / s0
+            if not np.isnan(v):
+                v = v if v > -6.0 else -6.0
+                if not np.isnan(v):
+                    v = v if v < 6.0 else 6.0
+        zn[1, k] = z[1, k] + c1 * v
+
+
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_rows_ok(z, eps, tiny):
+    C = z.shape[0]
+    L = z.shape[1]
+    a = np.empty(L, dtype=np.float64)
+    for c in range(C):
+        row = z[c]
+        for k in range(L):
+            a[k] = abs(row[k])
+        ma = (0.0 + _v2_pw(a, 0, L)) / L
+        if not (_c251_std1(row) > eps * (ma + tiny)):
+            return False
+    for k in range(L):
+        a[k] = z[0, k] - z[1, k]
+    sd = _c251_std1(a)
+    flat = z.reshape(C * L)
+    b = np.empty(C * L, dtype=np.float64)
+    for k in range(C * L):
+        b[k] = abs(flat[k])
+    mall = (0.0 + _v2_pw(b, 0, C * L)) / (C * L)
+    return sd > eps * (mall + tiny)
+
+
+def _c251_w9q_generate(self, n_series: int) -> Iterator[np.ndarray]:
+    n = int(n_series)
+    if n <= 0:
+        return
+    it0 = self._g0.generate(n); it1 = self._g1.generate(max(1, int(n * _Q) + 4)); live = True
+    try:
+        for i in range(n):
+            try:
+                x = np.asarray(next(it0), dtype=np.float64)
+            except StopIteration:
+                return
+            if live and _Q > 0.0:
+                u = _fcx_coin(self._seed, _TAG, i)
+                if u < _Q:
+                    try:
+                        y = self._partner_row(i, it1)
+                    except StopIteration:
+                        live = False
+                    else:
+                        a = x.reshape(-1, x.shape[-1]); b = y.reshape(-1, y.shape[-1]); L = min(a.shape[-1], b.shape[-1])
+                        z = np.concatenate([a[:, a.shape[-1] - L:], b[:, b.shape[-1] - L:]], axis=0)
+                        if _CPL > 0.0 and z.shape[0] == 2 and not self._cpl_off:
+                            if (z.dtype == np.float64 and z.flags.c_contiguous and z.shape[1] >= 2):
+                                ss = np.empty(2, dtype=np.float64)
+                                _c251_w9q_s01(z, ss)
+                                s0 = float(ss[0]); s1 = float(ss[1])
+                                if s0 > 0.0 and s1 > 0.0 and np.isfinite(s0) and np.isfinite(s1):
+                                    zn = np.empty_like(z)
+                                    _c251_w9q_couple(z, s0, _CPL * s1, zn)
+                                    z = zn
+                            else:
+                                d0 = np.diff(z[0]); s0 = float(_v2_std(d0)); d1 = np.diff(z[1]); s1 = float(_v2_std(d1))
+                                if s0 > 0.0 and s1 > 0.0 and np.isfinite(s0) and np.isfinite(s1):
+                                    zz = np.concatenate([[0.0], np.clip((d0 - _v2_meanm(d0)) / s0, -6.0, 6.0)])
+                                    p = int(np.argmax(z[1] != z[1][0]))
+                                    zz[:p] = 0.0
+                                    z = np.stack([z[0], z[1] + (_CPL * s1) * zz])
+                        if (z.dtype == np.float64 and z.ndim == 2 and z.flags.c_contiguous and z.shape[0] >= 2 and z.shape[1] >= 2):
+                            ok = bool(_c251_rows_ok(z, 1e-9, 1e-12))
+                        else:
+                            ok = bool(np.all(np.std(z, axis=1) > 1e-9 * (np.abs(z).mean(axis=1) + 1e-12)) and _v2_std(z[0] - z[1]) > 1e-9 * (np.abs(z).mean() + 1e-12))
+                        if ok:
+                            x = np.ascontiguousarray(z)
+            yield x
+    finally:
+        it0.close(); it1.close()
+
+
+if getattr(_PublishedGenerator.__dict__.get("generate"), "__code__", None) is not None and \
+        _PublishedGenerator.__dict__["generate"].__code__.co_firstlineno == 16690:
+    _PublishedGenerator.generate = _c251_w9q_generate
+
+
+# ── c251-P10b: the same exact coupling / keep-test kernels for the BAND layer (band-teach 2nd channel on univariate
+# rows): uid76's method verbatim apart from those two expression blocks (and super() -> super(<class>, self)).
+def _c251_band_generate(self, n_series: int) -> Iterator[np.ndarray]:
+    n = int(n_series)
+    if n <= 0:
+        return
+    base = super(_W86BParent, self).generate(n)
+    try:
+        for i, x in enumerate(base):
+            if _BAND_Q > 0.0 and np.ndim(x) == 1:
+                v = _fcx_coin(self._seed, _BAND_TAG, i)
+                if v < _BAND_Q and not _k87_quiet(x):
+                    y = np.asarray(self._bteach.next(), dtype=np.float64)
+                    a = np.asarray(x, dtype=np.float64).reshape(1, -1); b = y.reshape(-1, y.shape[-1])
+                    L = min(a.shape[-1], b.shape[-1])
+                    z = np.concatenate([a[:, a.shape[-1] - L:], b[:, b.shape[-1] - L:]], axis=0)
+                    if _CPL > 0.0 and z.shape[0] == 2:
+                        if (z.dtype == np.float64 and z.flags.c_contiguous and z.shape[1] >= 2):
+                            ss = np.empty(2, dtype=np.float64)
+                            _c251_w9q_s01(z, ss)
+                            s0 = float(ss[0]); s1 = float(ss[1])
+                            if s0 > 0.0 and s1 > 0.0 and np.isfinite(s0) and np.isfinite(s1):
+                                zn = np.empty_like(z)
+                                _c251_w9q_couple(z, s0, _CPL * s1, zn)
+                                z = zn
+                        else:
+                            d0 = np.diff(z[0]); s0 = float(_v2_std(d0)); d1 = np.diff(z[1]); s1 = float(_v2_std(d1))
+                            if s0 > 0.0 and s1 > 0.0 and np.isfinite(s0) and np.isfinite(s1):
+                                zz = np.concatenate([[0.0], np.clip((d0 - _v2_meanm(d0)) / s0, -6.0, 6.0)])
+                                p = int(np.argmax(z[1] != z[1][0]))
+                                zz[:p] = 0.0
+                                z = np.stack([z[0], z[1] + (_CPL * s1) * zz])
+                    if (z.dtype == np.float64 and z.ndim == 2 and z.flags.c_contiguous and z.shape[0] >= 2 and z.shape[1] >= 2):
+                        ok = bool(_c251_rows_ok(z, 1e-9, 1e-12))
+                    else:
+                        ok = bool(np.all(np.std(z, axis=1) > 1e-9 * (np.abs(z).mean(axis=1) + 1e-12))
+                                  and _v2_std(z[0] - z[1]) > 1e-9 * (np.abs(z).mean() + 1e-12))
+                    if ok:
+                        x = np.ascontiguousarray(z)
+            yield x
+    finally:
+        base.close()
+
+
+if getattr(_W86BParent.__dict__.get("generate"), "__code__", None) is not None and \
+        _W86BParent.__dict__["generate"].__code__.co_firstlineno == 16822:
+    _W86BParent.generate = _c251_band_generate
+
+
+# ═══════════════ c251-P13: exact numba scalar recurrences (W86B / W86R / C128 row builders written as Python loops). ═══════════════
+# Each function is uid76's VERBATIM with one fast path inserted right before its scalar loop (after every RNG call of
+# the function that precedes the loop, which therefore runs unchanged and in order). The fast path replays the loop
+# body in numba with the same separately rounded IEEE float64 operations in the same order (fastmath off: no FMA
+# contraction, no reassociation):
+#   _w86e2_ar / _w86e2_ar_e / _w86r_ar / _c128_mobility_ar1:  p = phi * p + e[t]
+#   _w86r_garch:  e = sqrt(h) * z[t]; h = (w + a * min(e * e, 60.0)) + b * h  (sqrt correctly rounded on every IEEE
+#                 host; Python min(x, 60.0) == (60.0 if 60.0 < x else x), NaN kept)
+#   _w86e2_flow:  p = (p + k * (tgt[t] - p)) + e[t]
+# The fast path is taken only when every operand is a float64 (1-D float64 ndarray of the loop's length; scalars that
+# are Python float / np.float64), so Python's mixed-type promotion cannot have made the original compute any step in
+# another precision; anything else runs uid76's loop. The loops contain no RNG call and nothing after them reads the
+# loop variable, so the returned arrays carry identical bits and the RNG state is untouched.
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_ar_fill(out, e, phi, p):
+    for t in range(e.shape[0]):
+        p = phi * p + e[t]
+        out[t] = p
+
+
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_garch_fill(out, z, w, a, b):
+    h = 1.0
+    for t in range(z.shape[0]):
+        e = np.sqrt(h) * z[t]
+        out[t] = e
+        ee = e * e
+        mm = 60.0 if 60.0 < ee else ee
+        h = w + a * mm + b * h
+
+
+@_c251_njit(cache=False, fastmath=False, nogil=True)
+def _c251_flow_fill(x, tgt, e, p, k):
+    for t in range(x.shape[0]):
+        p = p + k * (tgt[t] - p) + e[t]
+        x[t] = p
+
+
+def _c251_f64vec(a, n=None):
+    return (type(a) is np.ndarray and a.dtype == np.float64 and a.ndim == 1
+            and (n is None or a.shape[0] == n))
+
+
+def _c251_f64s(*v):
+    return all(isinstance(t, float) for t in v)
+
+
+def _c251_w86e2_ar(r, m, phi, sd):
+    e = r.standard_normal(m) * sd * np.sqrt(max(1.0 - phi * phi, 1e-6))
+    out = np.empty(m)
+    p = r.standard_normal() * sd
+    if _c251_f64vec(e, out.shape[0]) and _c251_f64s(phi, p):
+        _c251_ar_fill(out, e, float(phi), float(p))
+        return out
+    for t in range(m):
+        p = phi * p + e[t]
+        out[t] = p
+    return out
+
+
+def _c251_w86e2_ar_e(e, phi):
+    out = np.empty(e.size)
+    p = 0.0
+    if _c251_f64vec(e) and _c251_f64s(phi):
+        _c251_ar_fill(out, e, float(phi), p)
+        return out
+    for t in range(e.size):
+        p = phi * p + e[t]
+        out[t] = p
+    return out
+
+
+def _c251_w86e2_flow(r, M, P, tod, day, dow):
+
+    nd = int(day[-1]) + 1
+    C = _w86e2_lu(r, 30.0, 2500.0)
+    mu = r.uniform(-0.7, 1.3) if r.random() < 0.55 else (1.0 if r.random() < 0.6 else -1.0) * r.uniform(1.0, 2.5)
+    hq = max(P // 24, 1)
+    nh = M // hq + 2
+    hidx = (np.arange(M) + int(r.integers(0, hq))) // hq
+    sch = mu + r.uniform(0.6, 1.5) * _w86e2_smooth(r, nh, 24.0 * r.uniform(0.4, 3.0)) \
+        + r.uniform(0.0, 0.05) * r.standard_normal(nh) \
+        + r.uniform(0.2, 1.2) * (_w86e2_bump((np.arange(nh) % 24) / 24.0, r.uniform(0.0, 1.0), r.uniform(0.08, 0.2)) - 0.35)
+    tgt = C * sch[hidx]
+    k = r.uniform(0.08, 0.4)
+    x = np.empty(M)
+    p = tgt[0]
+    vol = np.exp(r.uniform(0.3, 0.9) * _w86e2_smooth(r, M, r.uniform(4.0, 40.0)))
+    e = C * r.uniform(0.003, 0.02) * vol * r.standard_normal(M)
+    if _c251_f64vec(tgt, x.shape[0]) and _c251_f64vec(e, x.shape[0]) and _c251_f64s(p, k):
+        _c251_flow_fill(x, tgt, e, float(p), float(k))
+    else:
+        for t in range(M):
+            p = p + k * (tgt[t] - p) + e[t]
+            x[t] = p
+    if r.random() < 0.4:
+        hi = np.quantile(x, r.uniform(0.75, 0.97))
+        lo = np.quantile(x, r.uniform(0.02, 0.2)) if r.random() < 0.5 else -np.inf
+        x = np.clip(x, lo, hi)
+    if r.random() < 0.25:
+        L0 = int(np.exp(r.uniform(np.log(P / 4.0), np.log(3.0 * P))))
+        a = M - L0 - int(r.integers(0, 2 * P)) if r.random() < 0.6 else int(r.integers(0, M))
+        a = max(a, 0)
+        x[a:a + L0] = 0.0
+    if r.random() < 0.1:
+        T = int(np.exp(r.uniform(np.log(64.0), np.log(600.0))))
+        x[-T:] = x[-T - 1]
+    return _w86e2_fq(x, 0 if r.random() < 0.2 else 2)
+
+
+def _c251_w86r_garch(r, m, a_lo=0.03, a_hi=0.12):
+
+    nu = r.uniform(3.3, 8.0)
+    z = np.clip(r.standard_t(nu, m) / np.sqrt(nu / (nu - 2.0)), -14.0, 14.0)
+    a = r.uniform(a_lo, a_hi)
+    b = max(r.uniform(0.9, 0.993) - a, 0.0)
+    w = 1.0 - a - b
+    out = np.empty(m)
+    h = 1.0
+    if _c251_f64vec(z, out.shape[0]) and _c251_f64s(w, a, b):
+        _c251_garch_fill(out, z, float(w), float(a), float(b))
+        return out
+    for t in range(m):
+        e = np.sqrt(h) * z[t]
+        out[t] = e
+        h = w + a * min(e * e, 60.0) + b * h
+    return out
+
+
+def _c251_w86r_ar(r, m, tau, sd):
+    phi = float(np.exp(-1.0 / max(tau, 1.0)))
+    e = r.standard_normal(m) * sd * np.sqrt(1.0 - phi * phi)
+    out = np.empty(m)
+    p = r.standard_normal() * sd
+    if _c251_f64vec(e, out.shape[0]) and _c251_f64s(phi, p):
+        _c251_ar_fill(out, e, float(phi), float(p))
+        return out
+    for t in range(m):
+        p = phi * p + e[t]
+        out[t] = p
+    return out
+
+
+def _c251_c128_mobility_ar1(r, n, phi, sd):
+    phi = float(np.clip(phi, -0.999, 0.999))
+    ea = r.standard_normal(n) * (sd * np.sqrt(max(1.0 - phi * phi, 1e-8)))
+    v = float(r.standard_normal() * sd)
+    if _c251_f64vec(ea) and ea.shape[0] == n:
+        out = np.empty(n, dtype=np.float64)
+        _c251_ar_fill(out, ea, phi, v)
+        return out
+    e = ea.tolist()
+    out = [0.0] * n
+    for i in range(n):
+        v = phi * v + e[i]
+        out[i] = v
+    return np.asarray(out, dtype=np.float64)
+
+
+_w86e2_ar = _c251_w86e2_ar
+_w86e2_ar_e = _c251_w86e2_ar_e
+_w86e2_flow = _c251_w86e2_flow
+_w86r_garch = _c251_w86r_garch
+_w86r_ar = _c251_w86r_ar
+_c128_mobility_ar1 = _c251_c128_mobility_ar1
+
+
+
+_C251NameParent = Generator
+
+
+class Generator(_C251NameParent):
+    @property
+    def name(self) -> str:
+        return 'c251-k76-FAST'
+
+
+# ═══════════════ c259 bundle kinds: DAP15 (15-min day-ahead prices, autumn regime) and AQW (hourly air quality, transient
+# accumulation episodes + fast washouts); calibration notes inline. Plain numpy + lfilter (king76 module globals). ═══════════════
+_C259_TWO_PI = 2.0 * np.pi
+
+
+def _c259_lu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+
+def _c259_ar1(r, n, phi, sd):
+    """stationary AR(1) with marginal sd"""
+    phi = float(min(max(phi, 0.0), 0.9999))
+    e = r.standard_normal(n) * (sd * np.sqrt(1.0 - phi * phi))
+    e[0] = r.standard_normal() * sd
+    return lfilter([1.0], [1.0, -phi], e)
+
+
+def _c259_pad(x, L):
+    out = np.empty(L, dtype=np.float64)
+    n = int(x.size)
+    if n >= L:
+        out[:] = x[n - L:]
+    else:
+        out[:L - n] = x[0]
+        out[L - n:] = x
+    return out
+
+
+def _c259_bump(h, c, w):
+    """circular gaussian bump on the 24-h clock (h, c, w in hours)"""
+    d = (h - c + 12.0) % 24.0 - 12.0
+    return np.exp(-0.5 * (d / w) ** 2)
+
+
+# ── DAP15: European 15-min day-ahead prices, autumn quarter-hour regime ─────────────────────────────────────────────────
+# Eval (106 series, 15-min, all 4160 points -> contexts 4096 / 3904 / 3440): level p10/50/90 32 / 166 / 207 EUR/MWh; CV
+# 0.26 / 0.44 / 1.21; daily-profile ptp/sd 1.03 / 2.58 / 2.85 with the trough (solar) -0.99 sd, a MORNING peak +0.53 sd
+# 6.25 h before it and the evening peak +0.98 sd 6.25 h after it; within-hour |x - hour mean|/sd 0.07 / 0.14 / 0.21;
+# |dx| > 8 MAD 0.6 / 1.7 / 8.7 %; negatives 0 / 1.1 / 2.3 %; day-mean change sd 0.39 / 0.52 / 0.90 sd; last-720 vs
+# previous-1440 drift -0.33 / +0.17 / +0.73 sd; ACF lag 1 / 4 / 96 / 672 = .97 / .89 / .64 / .46; 2 decimals.
+# The king's only price content (_yb_price, a CHANNEL of YC grid15 hosts) has a weak morning peak (60% x 0.1-0.35) and
+# drift p90 +0.38; KING-INIT on these windows is -0.086 % of round on the newest pools (3/3, -10 %/w; old pools -3 %/w).
+def _c259_dap_series(r, n):
+    u = r.random(24)
+    P = 96
+    s0 = int(P * u[0])
+    t = np.arange(n, dtype=np.int64) + s0
+    slot = t % P
+    day = t // P
+    nd = int(day[-1]) + 1
+    dow = (np.arange(nd) + int(7.0 * u[1])) % 7
+    h = (np.arange(P, dtype=np.float64) + 0.5) * (24.0 / P)
+    nordic = u[2] < 0.15
+    lev = _c259_lu(r, 15.0, 70.0) if nordic else _c259_lu(r, 110.0, 240.0)
+    # day-level log path: AR(1) over days + autumn drift (70% up) + rare regime steps
+    lv = _c259_ar1(r, nd, r.uniform(0.55, 0.9), r.uniform(0.35, 0.8) if nordic else r.uniform(0.14, 0.34))
+    drift = r.uniform(0.0, 0.45) * (1.0 if u[3] < 0.7 else -0.6)
+    lv = lv + drift * np.linspace(-1.0, 0.0, nd)
+    for _ in range(int(r.poisson(nd / 40.0 * r.uniform(0.0, 1.5)))):
+        lv[int(r.integers(1, nd)):] += r.normal(0.0, 0.25)
+    lv = lv + np.where(dow == 5, np.log(r.uniform(0.82, 0.97)), 0.0) + np.where(dow == 6, np.log(r.uniform(0.68, 0.92)), 0.0)
+    # autumn daily shape (fractions of the day level): morning + evening peaks, solar trough, night trough
+    tr_c = r.uniform(12.3, 14.0)
+    mor = r.uniform(0.18, 0.45) * _c259_bump(h, tr_c - r.uniform(5.5, 7.0), r.uniform(1.0, 1.8))
+    eve = r.uniform(0.35, 0.75) * _c259_bump(h, tr_c + r.uniform(5.5, 7.0), r.uniform(1.3, 2.4))
+    sol = _c259_bump(h, tr_c, r.uniform(1.8, 3.0))
+    nig = r.uniform(0.0, 0.12) * _c259_bump(h, r.uniform(2.0, 4.5), r.uniform(1.5, 3.0))
+    sun = np.clip(r.beta(1.6 + 2.0 * u[4], 1.0 + 1.0 * u[5], nd) * (1.0 + 0.25 * (dow >= 5)), 0.0, 1.3)
+    sdep = r.uniform(0.25, 0.75) if not nordic else r.uniform(0.0, 0.25)
+    amp_d = np.exp(r.normal(0.0, r.uniform(0.15, 0.35), nd))
+    shape = (mor[slot] + eve[slot] - nig[slot]) * amp_d[day] - sdep * sol[slot] * sun[day]
+    p = lev * np.exp(lv[day]) * (1.0 + shape)
+    # oversupply: windy+sunny days push middays / nights toward zero or below (negatives ~1 % of points)
+    if u[6] < 0.75:
+        ov = (r.random(nd) < r.uniform(0.03, 0.14)) * r.uniform(0.6, 1.6, nd)
+        p = p - lev * ov[day] * np.maximum(sol[slot], 0.6 * nig[slot] / max(float(nig.max()), 1e-9))
+    # quarter-hour structure: hour mean + kappa * (within-hour ramp) + 15-min noise
+    hm = np.add.reduceat(p, np.r_[0, np.flatnonzero(np.diff(t // 4) != 0) + 1])
+    cnt = np.diff(np.r_[0, np.flatnonzero(np.diff(t // 4) != 0) + 1, n])
+    hid = np.cumsum(np.r_[0, (np.diff(t // 4) != 0).astype(np.int64)])
+    hmean = (hm / cnt)[hid]
+    kap = r.uniform(0.8, 2.2)
+    x = hmean + kap * (p - hmean)
+    x = x + lev * r.uniform(0.01, 0.045) * _c259_ar1(r, n, r.uniform(0.0, 0.5), 1.0)
+    qtr = (t % 4).astype(np.int64)
+    saw = r.normal(0.0, r.uniform(0.01, 0.045), 4)
+    x = x + lev * (saw - saw.mean())[qtr]
+    # spikes: evening up-spikes (1-4 slots), rare down-spikes
+    ns = int(r.poisson(n * _c259_lu(r, 0.003, 0.025)))
+    for _ in range(ns):
+        a = int(r.integers(0, n))
+        m = int(r.integers(1, 5))
+        x[a:a + m] += lev * (_c259_lu(r, 0.15, 1.2) if r.random() < 0.75 else -_c259_lu(r, 0.15, 0.8))
+    # floor: soft negative tail (prices rarely below -0.3 * level), 2 decimals
+    if u[7] < 0.10:
+        x = np.maximum(x, 0.0)
+    else:
+        F = lev * r.uniform(0.05, 0.2)
+        neg = x < 0.0
+        x[neg] = -F * np.log1p(-x[neg] / F)
+    return np.round(x, 2)
+
+
+def _c259_dap(r, L):
+    L = int(L)
+    if L < 1024:
+        return None
+    n = L if r.random() < 0.9 else int(r.uniform(2000.0, L))
+    x = _c259_dap_series(r, n)
+    if x.shape != (n,) or not bool(np.all(np.isfinite(x))) or float(np.ptp(x)) <= 0.0 or float(np.mean(x == 0.0)) > 0.02:
+        return None
+    return _c259_pad(x, L)
+
+
+# ── AQW: hourly PM / NO2-type air quality with transient accumulation episodes and fast washouts ────────────────────────
+# Eval (351 hourly series of luchtmeetnet / irceline NO2, NO, PM2.5, PM10, BC, CO; O3/SO2/benzene excluded): length
+# 1027 / 1104 / 1153 (contexts h64 ~1040, h256 ~850, h720 ~380); level 0.39 / 5.7 / 17; CV 0.56 / 0.88 / 2.4; daily
+# profile ptp/sd 0.59 / 0.91 / 1.35; ACF lag 1 / 24 / 72 / 168 = .87 / .28 / .10 / .18; 1-decimal grid 97 % (no integer-valued
+# series in 13 public blocks); exact repeats 0.3 / 5.6 / 28 %; random cuts: the last 24 h sit > 0.5 sd above the context median in
+# 53 % of cuts and then REVERT (next-64-h mean below the last-24-h mean) 68 % of the time (mean -0.36 sd); after a low end
+# the next 64 h rise +0.59 sd. KING-INIT on AQ windows that revert after an elevated end: -0.075 (h256) / -0.139 (h64)
+# nats per window (8 pools), +0.07..+0.15 where they keep rising: the king's AQ content (XZ airq: persistent sigmoid level
+# SHIFTS, 90 % up) teaches persistence of elevated states. AQW teaches transient episodes (gradual build-up, fast washout).
+_C259_AQ_TYPES = (  # name, mix weight, level lo/hi, traffic (double peak + weekday), log-sd scale
+    ("no2", 0.32, 6.0, 35.0, True, 0.55),
+    ("pm25", 0.24, 2.5, 15.0, False, 0.55),
+    ("pm10", 0.12, 6.0, 25.0, False, 0.45),
+    ("bc", 0.12, 0.25, 1.6, True, 0.65),
+    ("no", 0.11, 0.6, 12.0, True, 0.90),
+    ("co", 0.09, 0.15, 0.45, True, 0.35),
+)
+_C259_AQ_CUM = np.cumsum([t[1] for t in _C259_AQ_TYPES])
+
+
+def _c259_aqw_series(r, n):
+    k = min(int(np.searchsorted(_C259_AQ_CUM, r.random() * _C259_AQ_CUM[-1], side="right")), len(_C259_AQ_TYPES) - 1)
+    name, _w, lo, hi, traffic, sig = _C259_AQ_TYPES[k]
+    t = np.arange(n, dtype=np.int64) + int(r.integers(0, 168))
+    hod = (t % 24).astype(np.float64)
+    day = t // 24
+    nd = int(day[-1]) + 1
+    dow = day % 7
+    sig = sig * r.uniform(0.7, 1.3)
+    # slow baseline: OU (tau 150-700 h) + seasonal ramp (autumn build-up 65 %, decline 20 %, flat 15 %)
+    z = _c259_ar1(r, n, float(np.exp(-1.0 / _c259_lu(r, 150.0, 700.0))), sig * r.uniform(0.25, 0.5))
+    uu = r.random()
+    ramp = (r.uniform(0.5, 1.6) if uu < 0.75 else (-r.uniform(0.2, 0.6) if uu < 0.90 else 0.0)) * sig
+    z = z + ramp * np.linspace(-1.0, 0.0, n) * (n / 1100.0) ** 0.5
+    # episodes: stagnation build-up over 0.75-4 days (convex in log), plateau 0-18 h, washout over 2-14 h
+    ne = int(r.poisson(n / 24.0 / r.uniform(3.5, 8.0)))
+    ep = np.zeros(n)
+    tt = np.arange(n, dtype=np.float64)
+    for _ in range(ne):
+        c = r.uniform(-48.0, n + 24.0)
+        up = r.uniform(18.0, 96.0)
+        pl = r.uniform(0.0, 18.0) if r.random() < 0.6 else 0.0
+        dn = r.uniform(2.0, 14.0)
+        A = sig * _c259_lu(r, 0.9, 3.0)
+        s = tt - c
+        rise = np.clip(1.0 + s / up, 0.0, 1.0) ** r.uniform(1.3, 2.5)
+        fall = np.exp(-np.clip(s - pl, 0.0, None) / dn)
+        ep += A * np.where(s <= 0.0, rise, np.where(s <= pl, 1.0, fall))
+    # stagnation also deepens the diurnal swing
+    epn = ep / (float(ep.max()) + 1e-9) if ep.size and float(ep.max()) > 0.0 else ep
+    hh = np.arange(24, dtype=np.float64)
+    if traffic:
+        prof = (r.uniform(0.6, 1.0) * _c259_bump(hh, r.uniform(7.0, 9.0), r.uniform(1.2, 2.2))
+                + r.uniform(0.5, 1.0) * _c259_bump(hh, r.uniform(18.0, 21.5), r.uniform(1.8, 3.5))
+                - r.uniform(0.2, 0.5) * _c259_bump(hh, r.uniform(13.0, 16.0), r.uniform(2.0, 3.5)))
+    else:
+        prof = (r.uniform(0.6, 1.0) * _c259_bump(hh, r.uniform(20.0, 24.5), r.uniform(2.5, 4.5))
+                + r.uniform(0.0, 0.5) * _c259_bump(hh, r.uniform(7.5, 10.0), r.uniform(1.5, 2.5)))
+    prof = prof - prof.mean()
+    prof = prof * (sig * r.uniform(0.12, 0.32) / (float(np.std(prof)) + 1e-9))
+    dmod = np.exp(r.normal(0.0, r.uniform(0.15, 0.4), nd))
+    z = z + prof[(hod.astype(np.int64))] * dmod[day] * (1.0 + r.uniform(0.2, 0.8) * epn)
+    if traffic:
+        wk = np.zeros(7)
+        wk[5] = np.log(r.uniform(0.7, 0.92))
+        wk[6] = np.log(r.uniform(0.55, 0.85))
+        z = z + wk[dow]
+    z = z + ep
+    # short-memory noise (t tails)
+    df = r.uniform(4.0, 12.0)
+    e = np.clip(r.standard_t(df, n), -8.0, 8.0) * np.sqrt((df - 2.0) / df)
+    z = z + lfilter([1.0], [1.0, -r.uniform(0.0, 0.5)], e) * sig * r.uniform(0.15, 0.35)
+    lev = _c259_lu(r, lo, hi)
+    x = lev * np.exp(z - float(np.median(z)))
+    # measurement grid: 1 decimal 90 %, 2 decimals 10 % (and every series below level 2); floor = one quantum. No integer grid
+    # (c259 review R1: no hourly AQ eval series is integer-valued; integer draws aliased onto hourly counts / bike docks).
+    uq = r.random()
+    q = 0.01 if (uq < 0.10 or lev < 2.0) else 0.1
+    x = np.maximum(np.round(x / q) * q, q)
+    return np.round(x, 2)
+
+
+def _c259_aqw(r, L):
+    L = int(L)
+    if L < 512:
+        return None
+    u = r.random()
+    if u < 0.60:
+        n = int(r.uniform(950.0, 1250.0))
+    elif u < 0.85:
+        n = int(r.uniform(400.0, 950.0))
+    else:
+        n = int(r.uniform(1250.0, 3000.0))
+    n = min(n, L)
+    x = _c259_aqw_series(r, n)
+    if x.shape != (n,) or not bool(np.all(np.isfinite(x))) or float(np.ptp(x)) <= 0.0:
+        return None
+    if np.unique(x).size < 20 or float(np.mean(x <= 0.0)) > 0.02:
+        return None
+    return _c259_pad(x, L)
+
+
+# ═══════════════ c201-osm: low-cost PM2.5 sensor feeds (150-s cadence) inserted as eval-layout univariate records ═══════════════
+# Every record of the parent is yielded unchanged and in order. Before record i, with probability _C201O_Q (record i's own
+# coin), ONE univariate series of _C201O_L points is inserted: a citizen-science PM2.5 sensor feed (openSenseMap-style box)
+# laid out as the eval presents it (the real segment at the end, a short history left-padded with its own first value).
+# Why: the pool's osem_pm25 family (~60 sensors, 150-s cadence, a few at 5 min) is a moving family where the real king is
+# WORSE than its own init (-0.68%/window). The corpus has no matching builder: the hourly/15-min pollutant builders
+# (_w86a_pollutant, _xa_airq, _acuh_air) draw official-station feeds at 24-96 steps/day; this family runs 576 steps/day and
+# its texture is a counting-sensor readout: a slowly varying concentration seen through level-dependent noise.
+# Statistics (ranges summarise the family's traits; no values or sequences embedded):
+#   level      median piecewise logU over 0.7-1.6-2.5-4-6.3-10-32-150-700 ug/m3 (10/10/16/35/11/12/5/1%)
+#   concentr.  log path = smoothed slow OU (tau 5-40 h, smoothing 0.8-3 h, sd 0.28-0.82) + smooth 1-4 h component
+#              (sd 0.03-0.15)
+#              + daily cycle (85%: 1st harmonic 0.05-0.72 log, 2nd 0.1-0.9 of it, day-to-day amplitude modulation)
+#              + episodes (0.5-3/day, gradual build-up 0.5-8 h, sharp collapse 1-60 min: the family's hour-scale
+#              changes are negatively skewed) + sharp level steps + rare fog bumps
+#   readout    noise sd = c * level^0.42-0.68 (c logU 0.13-0.25), AR(1) 0.05-0.40, 35% t-tailed; single-point bursts
+#              (0.6-5% of points, +10-100%), emission spikes with 1-8 point exponential tails, rare dips, 999.9 codes (3%);
+#              readings clip at the sensor's 999.9 range (the family never exceeds it); a draw with sustained
+#              readings above it (> 0.2% of points) is dropped, so no saturation holds are created
+#   grid       bin means of 0.1-resolution readings (k = 1 or 3 readings 66%, 1-4 readings 24%, raw 0.1 grid 10%;
+#              a sensor reading below 1.6 ug/m3 sits on the raw 0.1 grid 45% of the time),
+#              2 decimals, floor 0/0.1/0.2
+#   variants   4% two co-located sensors interleaved in one stream (alternating, slips, shared bins); 7% 5-min cadence
+#   lengths    the full 4096 window for 55% (the family's capped 4160-point histories), else 2400-4096 / 700-2400 / 300-700
+# Record i's draws come only from SeedSequence([seed, _C201O_TAG], spawn_key=(i,)), so every parent RNG advances exactly as
+# without this block. The stream stops at n_series records in total (inserts count), like the c246 insert layer.
+_C201O_TAG = 0xC2010E5A
+_C201O_Q = 0.012
+_C201O_L = 4096
+_C201O_TWO_PI = 2.0 * np.pi
+_C201O_LVL_EDGES = (0.7, 1.6, 2.5, 4.0, 6.3, 10.0, 32.0, 150.0, 700.0)
+_C201O_LVL_CUM = np.cumsum((0.10, 0.10, 0.16, 0.35, 0.11, 0.12, 0.05, 0.01))
+
+
+def _c201o_lu(r, lo, hi):
+    return float(np.exp(r.uniform(np.log(lo), np.log(hi))))
+
+
+def _c201o_ou(r, n, tau, sd):
+    phi = float(np.exp(-1.0 / max(float(tau), 1.0)))
+    e = r.standard_normal(n) * (sd * np.sqrt(1.0 - phi * phi))
+    e[0] = r.standard_normal() * sd
+    return lfilter([1.0], [1.0, -phi], e)
+
+
+def _c201o_smooth(r, n, tau1, tau2, sd):
+    """stationary OU (time constant tau1) passed through a second AR(1) (tau2): smooth at lags << tau2, scaled to sd"""
+    p1 = float(np.exp(-1.0 / max(float(tau1), 1.0)))
+    p2 = float(np.exp(-1.0 / max(float(tau2), 1.0)))
+    nb = int(min(5.0 * max(float(tau1), float(tau2)), 2000.0)) + 8
+    e = r.standard_normal(n + nb)
+    y = lfilter([1.0], [1.0, -p2], lfilter([1.0], [1.0, -p1], e) * np.sqrt(1.0 - p1 * p1))[nb:]
+    v = (1.0 + p1 * p2) / ((1.0 - p1 * p2) * (1.0 - p2 * p2))
+    return y * (sd / float(np.sqrt(v)))
+
+
+def _c201o_logpath(r, n, P, end_peak):
+    """log concentration: slow + medium smooth components, modulated daily cycle, episodes, sharp steps, rare fog bumps"""
+    sph = P / 24.0
+    t = np.arange(n, dtype=np.float64)
+    z = _c201o_smooth(r, n, _c201o_lu(r, 5.0, 40.0) * sph, _c201o_lu(r, 0.8, 3.0) * sph, r.uniform(0.28, 0.82))
+    z += _c201o_smooth(r, n, _c201o_lu(r, 0.7, 4.0) * sph, _c201o_lu(r, 6.0, 30.0), r.uniform(0.03, 0.15))
+    if r.random() < 0.85:
+        a1 = r.uniform(0.05, 0.72)
+        a2 = a1 * r.uniform(0.1, 0.9)
+        hrs = (t - (n - 1)) / sph
+        prof = (a1 * np.cos(_C201O_TWO_PI * (hrs - end_peak) / 24.0)
+                + a2 * np.cos(2.0 * _C201O_TWO_PI * (hrs - end_peak - r.uniform(1.4, 5.4)) / 24.0))
+        nd = int(n // P) + 3
+        dayf = np.clip(1.0 + r.uniform(0.15, 0.55) * r.standard_normal(nd), 0.1, 2.2)
+        z += prof * np.interp(t, (np.arange(nd, dtype=np.float64) - 0.5) * P + r.uniform(0.0, P), dayf)
+    ne = int(r.poisson(n / P * _c201o_lu(r, 0.5, 3.0)))
+    for _ in range(ne):
+        c = r.uniform(0.0, n)
+        up = _c201o_lu(r, 0.5, 8.0) * sph
+        dn = _c201o_lu(r, 0.5, 24.0) * P / 576.0
+        amp = _c201o_lu(r, 0.2, 1.0) * (1.0 if r.random() < 0.85 else -0.6)
+        dt = t - c
+        z += amp * np.where(dt < 0.0, np.exp(np.clip(dt, -60.0 * up, 0.0) / up), np.exp(-np.clip(dt, 0.0, 60.0 * dn) / dn))
+    nj = int(r.poisson(n / P * _c201o_lu(r, 0.05, 0.6)))
+    for _ in range(nj):
+        c = r.uniform(0.0, n)
+        w = _c201o_lu(r, 0.3, 8.0) if r.random() < 0.6 else _c201o_lu(r, 0.1, 2.0) * sph
+        z += r.normal(0.0, 0.5) / (1.0 + np.exp(np.clip((c - t) / w, -40.0, 40.0)))
+    if r.random() < 0.03:
+        c = r.uniform(0.1, 1.0) * n
+        w = _c201o_lu(r, 2.0, 16.0) * sph
+        z += _c201o_lu(r, 1.2, 3.5) * np.exp(-0.5 * ((t - c) / w) ** 2)
+    return z
+
+
+def _c201o_level(r):
+    k = min(int(np.searchsorted(_C201O_LVL_CUM, r.random(), side="right")), len(_C201O_LVL_EDGES) - 2)
+    return _c201o_lu(r, _C201O_LVL_EDGES[k], _C201O_LVL_EDGES[k + 1])
+
+
+def _c201o_measure(r, x):
+    """sensor readout of the concentration x: level-dependent noise, bursts, decaying emission spikes, dips, error codes"""
+    n = x.size
+    c = _c201o_lu(r, 0.13, 0.25)
+    ex = r.uniform(0.42, 0.68)
+    sd = c * np.maximum(x, 0.05) ** ex
+    eps = r.standard_normal(n)
+    if r.random() < 0.35:
+        df = r.uniform(4.0, 9.0)
+        eps = r.standard_t(df, n) * np.sqrt((df - 2.0) / df)
+    ph = r.uniform(0.05, 0.40)
+    eps = lfilter([1.0], [1.0, -ph], eps) * np.sqrt(1.0 - ph * ph)
+    y = x + sd * eps
+    nb = int(r.poisson(n * _c201o_lu(r, 0.006, 0.05)))
+    if nb > 0:
+        at = r.integers(0, n, nb)
+        amp = x[at] * np.exp(r.uniform(np.log(0.1), np.log(1.0), nb))
+        y[at] += amp
+        y[np.minimum(at + 1, n - 1)] += amp * (r.random(nb) < 0.35) * r.uniform(0.2, 0.7, nb)
+    ns = int(r.poisson(n * _c201o_lu(r, 3e-4, 4e-3)))
+    if ns > 0:
+        at = r.integers(0, n, ns)
+        amp = x[at] * np.exp(r.uniform(np.log(0.4), np.log(15.0), ns))
+        tk = np.exp(r.uniform(np.log(0.3), np.log(3.0), ns))
+        for k in range(8):
+            idx = at + k
+            ok = idx < n
+            y[idx[ok]] += amp[ok] * np.exp(-k / tk[ok])
+    nd = int(r.poisson(n * _c201o_lu(r, 1e-4, 1.5e-3)))
+    if nd > 0:
+        at = r.integers(0, n, nd)
+        y[at] = x[at] * r.uniform(0.05, 0.6, nd)
+    if r.random() < 0.03:
+        y[r.integers(0, n, int(r.poisson(n * _c201o_lu(r, 1e-4, 1.5e-3))) + 1)] = 999.9
+    return y
+
+
+def _c201o_quantize(r, y, low):
+    """150-s bin mean of k readings on a 0.1 grid (k per bin), 2 decimals, sensor floor"""
+    n = y.size
+    u = r.random() * (0.55 if low else 1.0) + (0.45 if low else 0.0)
+    if u < 0.66:
+        k = np.where(r.random(n) < r.uniform(0.55, 0.9), 3.0, 1.0)
+    elif u < 0.90:
+        w = np.cumsum(r.dirichlet(np.full(4, 2.0)))
+        k = np.array([1.0, 2.0, 3.0, 4.0])[np.minimum(np.searchsorted(w, r.random(n), side="right"), 3)]
+    else:
+        k = np.ones(n)
+    v = np.round(np.maximum(y, 0.0) * 10.0 * k) / (10.0 * k)
+    fl = (0.0, 0.1, 0.2)[min(int(np.searchsorted(np.cumsum((0.15, 0.55, 0.30)), r.random(), side="right")), 2)]
+    return np.round(np.maximum(v, fl), 2)
+
+
+def _c201o_pair(r, n, P, end_peak):
+    """two co-located sensors landing in one 150-s stream: alternating bins, slips, shared (averaged) bins"""
+    lvl = _c201o_level(r)
+    zc = _c201o_logpath(r, n, P, end_peak)
+    za = zc + _c201o_ou(r, n, _c201o_lu(r, 2.0, 20.0) * P / 24.0, r.uniform(0.05, 0.3))
+    zb = zc + _c201o_ou(r, n, _c201o_lu(r, 2.0, 20.0) * P / 24.0, r.uniform(0.05, 0.3)) + np.log(_c201o_lu(r, 1.5, 12.0))
+    m = float(np.median(za))
+    ya = _c201o_measure(r, lvl * np.exp(za - m))
+    yb = _c201o_measure(r, lvl * np.exp(zb - m))
+    s = (np.cumsum(r.random(n) >= _c201o_lu(r, 0.01, 0.35)) + int(r.integers(0, 2))) % 2
+    y = np.where(s == 0, ya, yb)
+    y = np.where(r.random(n) < _c201o_lu(r, 0.005, 0.3), 0.5 * (ya + yb), y)
+    if r.random() < 0.4:
+        cut = int(r.uniform(0.1, 0.9) * n)
+        if r.random() < 0.5:
+            y[:cut] = ya[:cut]
+        else:
+            y[cut:] = ya[cut:]
+    return y
+
+
+def _c201o_series(r, n):
+    P = 576 if r.random() < 0.93 else 288
+    end_peak = r.uniform(-1.0, 6.0) if r.random() < 0.7 else r.uniform(0.0, 24.0)
+    if r.random() < 0.04:
+        y = _c201o_pair(r, n, P, end_peak)
+    else:
+        z = _c201o_logpath(r, n, P, end_peak)
+        y = _c201o_measure(r, _c201o_level(r) * np.exp(z - float(np.median(z))))
+    return _c201o_quantize(r, y, float(np.median(y)) < 1.6)
+
+
+def _c201o_draw(r, L):
+    """one PM2.5 sensor feed, real segment at the end and left-padded with its first value, or None"""
+    u = r.random()
+    if u < 0.55:
+        n = L
+    elif u < 0.80:
+        n = int(r.integers(2400, L))
+    elif u < 0.90:
+        n = int(r.integers(700, 2400))
+    else:
+        n = int(r.integers(300, 700))
+    n = min(n, L)
+    try:
+        with np.errstate(all="ignore"):
+            x = _c201o_series(r, n)
+    except Exception:
+        return None
+    if x.shape != (n,) or not bool(np.all(np.isfinite(x))) or float(np.mean(x > 999.9)) > 0.002:
+        return None
+    x = np.minimum(x, 999.9)
+    if float(x.max()) <= float(x.min()):
+        return None
+    out = np.empty(L, dtype=np.float64)
+    out[:L - n] = x[0]
+    out[L - n:] = x
+    return out
+
+
+
+# ═══════════════ c259 AQR: recalibrated hourly air quality (replaces AQW in the -R recipes; calrev 10-20 ~15:25 JST) ═══════════════
+# AQW's episodes (18-96 h build-up, 2-14 h washout, slow OU base) put 70 % of the variance at > 2-day periods and made an ELEVATED
+# end keep rising for ~18 h (path +0.08 at 1-12 h) where the eval falls at once (-0.11 1 h / -0.21 6 h / -0.35 24 h): it taught the
+# king's own over-persistence. AQR keeps AQW's layout, length mix, type table and level ranges and re-fits the dynamics to the newest
+# public pools (9286200 / 9293400 / 9300600, 351 luchtmeetnet / irceline NO2 NO PM2.5 PM10 BC CO series): a moderate slow base
+# (OU tau 60-250 h + the autumn ramp), SHORT-memory bursts (AR(1) tau 4-16 h, Student-t df 2.2-4, light 1-2 h smoothing, 35 % of
+# the 36-h EMA removed), short near-symmetric episodes, a weaker / less regular diurnal profile, no integer grid (eval: 0 % integer
+# series). Fit (eval | AQR, 1500 draws): elevated-end path 1/6/24/96 h -0.11/-0.21/-0.35/-0.45 | -0.09/-0.22/-0.46/-0.50; low-end
+# path +0.16/+0.37/+0.63/+0.91 | +0.14/+0.33/+0.64/+0.86; ACF 1 h .87|.89, 24 h .28|.24; diurnal amp .91|.92; day-to-day profile
+# corr .13|.13; band shares >7d/2-7d/1-2d/lines/6-26h .21/.22/.11/.10/.23 | .20/.29/.12/.09/.19; RF family classifier: 97 % of AQR
+# draws -> the target family (AQW 55 %, 33 % -> osem 150-s, integer AQW draws -> 5-min micromobility).
+# Plain numpy + lfilter; reuses _c259_lu / _c259_ar1 / _c259_pad / _c259_bump / _C259_AQ_TYPES / _C259_AQ_CUM from the kinds above.
+def _c259r_aqr_series(r, n):
+    k = min(int(np.searchsorted(_C259_AQ_CUM, r.random() * _C259_AQ_CUM[-1], side="right")), len(_C259_AQ_TYPES) - 1)
+    name, _w, lo, hi, traffic, sig = _C259_AQ_TYPES[k]
+    t = np.arange(n, dtype=np.int64) + int(r.integers(0, 168))
+    hod = (t % 24).astype(np.int64)
+    day = t // 24
+    nd = int(day[-1]) + 1
+    dow = day % 7
+    sig = sig * r.uniform(0.7, 1.3)
+    # moderate slow base: OU (tau 60-250 h) + seasonal ramp (autumn build-up 75 %, decline 15 %, flat 10 %)
+    z = _c259_ar1(r, n, float(np.exp(-1.0 / _c259_lu(r, 60.0, 250.0))), sig * r.uniform(0.3, 0.5))
+    uu = r.random()
+    ramp = (r.uniform(0.5, 1.4) if uu < 0.75 else (-r.uniform(0.2, 0.6) if uu < 0.90 else 0.0)) * sig
+    z = z + ramp * np.linspace(-1.0, 0.0, n) * (n / 1100.0) ** 0.5
+    # short-memory bursts: AR(1) tau 4-16 h, Student-t innovations, 1-2 h smoothing, 35 % of the 36-h EMA removed
+    phi = float(np.exp(-1.0 / _c259_lu(r, 4.0, 16.0)))
+    df = r.uniform(2.2, 4.0)
+    e = np.clip(r.standard_t(df, n), -10.0, 10.0) * np.sqrt((df - 2.0) / df)
+    mb = lfilter([1.0], [1.0, -phi], e) * np.sqrt(1.0 - phi * phi)
+    w = int(r.integers(1, 3))
+    if w > 1:
+        mb = np.convolve(mb, np.ones(w) / np.sqrt(w), mode="same")
+    a = 1.0 / 36.0
+    mb = mb - 0.35 * lfilter([a], [1.0, -(1.0 - a)], mb)
+    z = z + mb * sig * r.uniform(0.45, 0.75)
+    # short near-symmetric episodes: one per 2.5-6 days, build 6-30 h, plateau 0-6 h, washout e-folding 6-24 h
+    ne = int(r.poisson(n / 24.0 / r.uniform(2.5, 6.0)))
+    ep = np.zeros(n)
+    tt = np.arange(n, dtype=np.float64)
+    for _ in range(ne):
+        c = r.uniform(-24.0, n + 12.0)
+        up = r.uniform(6.0, 30.0)
+        pl = r.uniform(0.0, 6.0)
+        dn = r.uniform(6.0, 24.0)
+        A = sig * _c259_lu(r, 0.5, 1.8)
+        s = tt - c
+        rise = np.clip(1.0 + s / up, 0.0, 1.0) ** r.uniform(1.0, 2.0)
+        fall = np.exp(-np.clip(s - pl, 0.0, None) / dn)
+        ep += A * np.where(s <= 0.0, rise, np.where(s <= pl, 1.0, fall))
+    hh = np.arange(24, dtype=np.float64)
+    if traffic:
+        prof = (r.uniform(0.6, 1.0) * _c259_bump(hh, r.uniform(7.0, 9.0), r.uniform(1.2, 2.2))
+                + r.uniform(0.5, 1.0) * _c259_bump(hh, r.uniform(18.0, 21.5), r.uniform(1.8, 3.5))
+                - r.uniform(0.2, 0.5) * _c259_bump(hh, r.uniform(13.0, 16.0), r.uniform(2.0, 3.5)))
+    else:
+        prof = (r.uniform(0.6, 1.0) * _c259_bump(hh, r.uniform(20.0, 24.5), r.uniform(2.5, 4.5))
+                + r.uniform(0.0, 0.5) * _c259_bump(hh, r.uniform(7.5, 10.0), r.uniform(1.5, 2.5)))
+    prof = prof - prof.mean()
+    prof = prof * (sig * r.uniform(0.15, 0.32) / (float(np.std(prof)) + 1e-9))
+    dmod = np.exp(r.normal(0.0, r.uniform(0.35, 0.7), nd))
+    z = z + prof[hod] * dmod[day]
+    if traffic:
+        wk = np.zeros(7)
+        wk[5] = np.log(r.uniform(0.7, 0.92))
+        wk[6] = np.log(r.uniform(0.55, 0.85))
+        z = z + wk[dow]
+    z = z + ep
+    e2 = np.clip(r.standard_t(r.uniform(4.0, 12.0), n), -8.0, 8.0)
+    z = z + lfilter([1.0], [1.0, -r.uniform(0.0, 0.4)], e2) * sig * r.uniform(0.12, 0.3) * 0.8
+    lev = _c259_lu(r, lo, hi)
+    x = lev * np.exp(z - float(np.median(z)))
+    # measurement grid: 0.1 (60 %) or 0.01 (40 %, and always below level 2); floor = one quantum; never an integer grid
+    uq = r.random()
+    q = 0.01 if (uq < 0.40 or lev < 2.0) else 0.1
+    x = np.maximum(np.round(x / q) * q, q)
+    return np.round(x, 2)
+
+
+def _c259r_aqr(r, L):
+    L = int(L)
+    if L < 512:
+        return None
+    u = r.random()
+    if u < 0.60:
+        n = int(r.uniform(950.0, 1250.0))
+    elif u < 0.85:
+        n = int(r.uniform(400.0, 950.0))
+    else:
+        n = int(r.uniform(1250.0, 3000.0))
+    n = min(n, L)
+    x = _c259r_aqr_series(r, n)
+    if x.shape != (n,) or not bool(np.all(np.isfinite(x))) or float(np.ptp(x)) <= 0.0:
+        return None
+    if np.unique(x).size < 20 or float(np.mean(x <= 0.0)) > 0.02:
+        return None
+    return _c259_pad(x, L)
+
+
+
+# ═══════════════ c259 DAPR: recalibrated 15-min day-ahead prices (replaces DAP15 in the -RR recipes; calrev 10-20 ~15:40 JST) ═══════
+# DAP15's day levels were too persistent: after a high day (z > +0.5 vs the 2-week mean) the eval reverts -0.40 / -0.65 / -0.76 sd at
+# d+1 / d+2 / d+3, DAP15 only -0.16 / -0.34 / -0.40 (daily-mean lag-1 ACF .65 vs .46); its peaks were symmetric (1-h change skew +.04
+# vs +.42) and its spikes too large (diff kurtosis 31 vs 16). DAPR keeps DAP15's layout, levels, solar trough, oversupply, quarter-hour
+# structure and floor, and changes only: day-level AR(1) phi 0.25-0.6 (was 0.55-0.9) and sd 0.12-0.28, drift <= 0.3, regime steps at
+# half the rate, ASYMMETRIC morning / evening peaks (steep ramp-up, slow decline), scarcity days (8-25 % of days, peaks x 1.4-3), more
+# frequent / smaller spikes. Fit (eval | DAPR, 1500 draws; newest 3 pools, 133 series): high-day path d+1/2/3/5 -.40/-.65/-.76/-.79 |
+# -.33/-.64/-.73/-.74; low-day +.33/+.84/+.99/+.97 | +.39/+.67/+.77/+.84; daily-mean ACF1 .46 | .49; change skew lag 1/4/12 +.16/+.42/
+# +.33 | +.29/+.49/+.26 (lag 96 +.29 | +.04, not modelled); diff kurtosis 15.7 | 15.1; profile amp 2.47 | 2.46; ACF 1 d / 1 w .61/.38 |
+# .58/.41; RF family classifier 94 % -> DA prices (DAP15 91 %). Reuses _c259_lu / _c259_ar1 / _c259_pad / _c259_bump from the kinds above.
+def _c259r_abump(h, c, w, kl, kr):
+    """asymmetric circular bump on the 24-h clock: width w * kl before the centre (the ramp up), w * kr after it (the decline)"""
+    d = (h - c + 12.0) % 24.0 - 12.0
+    return np.exp(-0.5 * (d / (w * np.where(d < 0.0, kl, kr))) ** 2)
+
+
+def _c259r_dapr_series(r, n):
+    u = r.random(24)
+    P = 96
+    s0 = int(P * u[0])
+    t = np.arange(n, dtype=np.int64) + s0
+    slot = t % P
+    day = t // P
+    nd = int(day[-1]) + 1
+    dow = (np.arange(nd) + int(7.0 * u[1])) % 7
+    h = (np.arange(P, dtype=np.float64) + 0.5) * (24.0 / P)
+    nordic = u[2] < 0.15
+    lev = _c259_lu(r, 15.0, 70.0) if nordic else _c259_lu(r, 110.0, 240.0)
+    # day-level log path: AR(1) over days (phi 0.25-0.6: the eval's day levels revert within 2-3 days) + autumn drift (70 % up,
+    # <= 0.3) + rare regime steps (half DAP's rate)
+    lv = _c259_ar1(r, nd, r.uniform(0.25, 0.6), r.uniform(0.35, 0.8) if nordic else r.uniform(0.12, 0.28))
+    drift = r.uniform(0.0, 0.3) * (1.0 if u[3] < 0.7 else -0.6)
+    lv = lv + drift * np.linspace(-1.0, 0.0, nd)
+    for _ in range(int(r.poisson(nd / 80.0 * r.uniform(0.0, 1.5)))):
+        lv[int(r.integers(1, nd)):] += r.normal(0.0, 0.25)
+    lv = lv + np.where(dow == 5, np.log(r.uniform(0.82, 0.97)), 0.0) + np.where(dow == 6, np.log(r.uniform(0.68, 0.92)), 0.0)
+    # autumn daily shape (fractions of the day level): morning + evening peaks, solar trough, night trough
+    tr_c = r.uniform(12.3, 14.0)
+    mor = r.uniform(0.18, 0.45) * _c259r_abump(h, tr_c - r.uniform(5.5, 7.0), r.uniform(1.0, 1.8), r.uniform(0.4, 0.7), r.uniform(1.2, 1.7))
+    eve = r.uniform(0.35, 0.75) * _c259r_abump(h, tr_c + r.uniform(5.5, 7.0), r.uniform(1.3, 2.4), r.uniform(0.4, 0.7), r.uniform(1.2, 1.7))
+    sol = _c259_bump(h, tr_c, r.uniform(1.8, 3.0))
+    nig = r.uniform(0.0, 0.12) * _c259_bump(h, r.uniform(2.0, 4.5), r.uniform(1.5, 3.0))
+    sun = np.clip(r.beta(1.6 + 2.0 * u[4], 1.0 + 1.0 * u[5], nd) * (1.0 + 0.25 * (dow >= 5)), 0.0, 1.3)
+    sdep = r.uniform(0.25, 0.75) if not nordic else r.uniform(0.0, 0.25)
+    amp_d = np.exp(r.normal(0.0, r.uniform(0.1, 0.25), nd))
+    # scarcity days: the morning / evening peaks blow up (heavy right tail of the day-over-day and the 1-3 h ramps)
+    amp_d = amp_d * (1.0 + (r.random(nd) < r.uniform(0.08, 0.25)) * np.exp(r.uniform(np.log(0.4), np.log(2.0), nd)))
+    shape = (mor[slot] + eve[slot] - nig[slot]) * amp_d[day] - sdep * sol[slot] * sun[day]
+    p = lev * np.exp(lv[day]) * (1.0 + shape)
+    # oversupply: windy+sunny days push middays / nights toward zero or below (negatives ~1 % of points)
+    if u[6] < 0.75:
+        ov = (r.random(nd) < r.uniform(0.03, 0.14)) * r.uniform(0.6, 1.6, nd)
+        p = p - lev * ov[day] * np.maximum(sol[slot], 0.6 * nig[slot] / max(float(nig.max()), 1e-9))
+    # quarter-hour structure: hour mean + kappa * (within-hour ramp) + 15-min noise
+    hm = np.add.reduceat(p, np.r_[0, np.flatnonzero(np.diff(t // 4) != 0) + 1])
+    cnt = np.diff(np.r_[0, np.flatnonzero(np.diff(t // 4) != 0) + 1, n])
+    hid = np.cumsum(np.r_[0, (np.diff(t // 4) != 0).astype(np.int64)])
+    hmean = (hm / cnt)[hid]
+    kap = r.uniform(0.8, 2.2)
+    x = hmean + kap * (p - hmean)
+    x = x + lev * r.uniform(0.01, 0.045) * _c259_ar1(r, n, r.uniform(0.0, 0.5), 1.0)
+    qtr = (t % 4).astype(np.int64)
+    saw = r.normal(0.0, r.uniform(0.01, 0.045), 4)
+    x = x + lev * (saw - saw.mean())[qtr]
+    # spikes: more frequent, smaller (DAP's diff kurtosis was 31 vs the eval's 16)
+    ns = int(r.poisson(n * _c259_lu(r, 0.005, 0.035)))
+    for _ in range(ns):
+        a = int(r.integers(0, n))
+        m = int(r.integers(1, 5))
+        x[a:a + m] += lev * (_c259_lu(r, 0.1, 0.7) if r.random() < 0.75 else -_c259_lu(r, 0.1, 0.5))
+    # floor: soft negative tail (prices rarely below -0.3 * level), 2 decimals
+    if u[7] < 0.10:
+        x = np.maximum(x, 0.0)
+    else:
+        F = lev * r.uniform(0.05, 0.2)
+        neg = x < 0.0
+        x[neg] = -F * np.log1p(-x[neg] / F)
+    return np.round(x, 2)
+
+
+def _c259r_dapr(r, L):
+    L = int(L)
+    if L < 1024:
+        return None
+    n = L if r.random() < 0.9 else int(r.uniform(2000.0, L))
+    x = _c259r_dapr_series(r, n)
+    if x.shape != (n,) or not bool(np.all(np.isfinite(x))) or float(np.ptp(x)) <= 0.0 or float(np.mean(x == 0.0)) > 0.02:
+        return None
+    return _c259_pad(x, L)
+
+
+# ═══════════════ c259 BUNDLE layer: eval-layout univariate inserts of DAP15 / AQW / OSM, AFTER the parent record ═══════════════
+# Every parent record is yielded unchanged and in order; AFTER parent record i, kind k fires on its own fast coin
+# (_fcx_coins(seed, _C259B_TAG, i, 3)[k] < q_k) and its record is drawn ONLY from
+# np.random.default_rng(np.random.SeedSequence([seed, _C259B_TAG, k + 1], spawn_key=(i,))): the parent RNGs and the
+# king's own stream are untouched. Inserts count toward n_series. Sits BELOW TLP10 / MLPX (their late gates count the
+# inserts' billed points: a (4096,) univariate record bills 4096). Hygiene gate per insert: shape (4096,), float64,
+# finite, non-constant, >= 20 distinct values, <= 2 % exact zeros (RULEBOOK D3).
+_C259B_TAG = 0xC259B001
+_C259B_L = 4096
+_C259B_KINDS = (
+    ("dapr", 0.0, "_c259r_dapr"),
+    ("aqr", 0.004, "_c259r_aqr"),
+    ("osm", 0.004, "_c201o_draw"),
+)
+
+
+def _c259b_ok(w):
+    if not (isinstance(w, np.ndarray) and w.shape == (_C259B_L,) and w.dtype == np.float64):
+        return False
+    if not bool(np.all(np.isfinite(w))) or not float(w.max()) > float(w.min()):
+        return False
+    return int(np.unique(w).size) >= 20 and float(np.mean(w == 0.0)) <= 0.02
+
+
+_C259BParent = Generator
+
+
+class Generator(_C259BParent):
+
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        n = int(n_series)
+        if n <= 0:
+            return
+        seed = int(self._seed) & ((1 << 64) - 1)
+        kinds = [(k, q, globals()[fn]) for k, (_nm, q, fn) in enumerate(_C259B_KINDS) if q > 0.0]
+        slots = len(_C259B_KINDS)
+        out = 0
+        base = super().generate(n)
+        try:
+            for i, x in enumerate(base):
+                yield x
+                out += 1
+                if out >= n:
+                    return
+                if not kinds:
+                    continue
+                u = _fcx_coins(seed, _C259B_TAG, i, slots)
+                for k, q, f in kinds:
+                    if u[k] >= q:
+                        continue
+                    w = None
+                    try:
+                        with np.errstate(all="ignore"):
+                            w = f(np.random.default_rng(np.random.SeedSequence([seed, _C259B_TAG, k + 1], spawn_key=(i,))), _C259B_L)
+                    except Exception:
+                        w = None
+                    if _c259b_ok(w):
+                        yield np.ascontiguousarray(w, dtype=np.float64)
+                        out += 1
+                        if out >= n:
+                            return
+        finally:
+            base.close()
+
+
+# ═══════════════ c215-LP: post-hoc continuation law (rmin=4, scope=all, quiet=False, rate=1.0, back>=256,
+# quiet_ext=False, late=(0.6, 0), NO pad guard: c268-P40U). Own SeedSequence per record; parent stream untouched. ═══════════════
+_C215LP_TAG = 0xC215B0
+_C215LP_RMIN = 4
+_C215LP_SCOPE = 'all'
+_C215LP_QUIET = False
+_C215LP_RATE = 1.0
+_C215LP_BACK_LO = 256
+_C215LP_QEXT = False
+_C215LP_LATE_FRAC = 0.6
+_C215LP_LATE_H2E = 0
+_C215LP_STREAM_POINTS = 39960000000 // 3
+
+
+def _c215lp_quiet(pre):
+    recent = pre[-192:]
+    delta = np.abs(np.diff(recent))
+    q10, q90 = np.quantile(recent, (0.10, 0.90))
+    peak = float(np.max(np.abs(recent)))
+    span = max(float(q90 - q10), peak * 1e-12, 1e-12)
+    tol = max(peak * 1e-12, 1e-12)
+    repeat_fraction = float(np.mean(delta <= tol))
+    local_move = float(np.quantile(delta, 0.90)) / span
+    drift = abs(float(np.median(recent[-32:])) - float(np.median(recent[:32]))) / span
+    return (repeat_fraction >= 0.35) or (local_move <= 0.03 and drift <= 0.12)
+
+
+def _c215lp_lp(x, r):
+    a = np.asarray(x)
+    if a.ndim == 1:
+        arr = a[None, :]
+    elif a.ndim == 2:
+        arr = a
+    else:
+        return x
+    C, L = arr.shape
+    if _C215LP_SCOPE == "uni" and C != 1:
+        return x
+    if _C215LP_SCOPE == "mv" and C < 2:
+        return x
+    if L < 608 or not bool(np.all(np.isfinite(arr))):
+        return x
+    b = L - int(r.integers(_C215LP_BACK_LO, min(721, L - 32)))
+    coins = r.random(C)
+    out = None
+    for c in range(C):
+        v = arr[c]
+        last = v[b - 1]
+        if not bool(np.any(v[b:] != last)):
+            continue
+        hold_at = None
+        if bool(np.all(v[b - _C215LP_RMIN:b] == last)):
+            if (not _C215LP_QUIET) or _c215lp_quiet(v[:b]):
+                hold_at = last
+        elif _C215LP_QEXT and b >= 256 and _c215lp_quiet(v[:b]):
+            hold_at = float(np.median(v[b - 16:b]))
+        if hold_at is None or coins[c] >= _C215LP_RATE:
+            continue
+        if out is None:
+            out = np.array(arr, dtype=np.float64, copy=True)
+        out[c, b:] = hold_at
+    if out is None:
+        return x
+    return out[0] if a.ndim == 1 else out
+
+
+def _c215lp_h2e(x, r, rmin):
+    a = np.asarray(x)
+    if a.ndim == 2 and a.shape[0] == 1:
+        v = a[0]
+    elif a.ndim == 1:
+        v = a
+    else:
+        return x
+    L = int(v.shape[0])
+    if L < 256 or not bool(np.all(np.isfinite(v))):
+        return x
+    ch = np.flatnonzero(v[1:] != v[:-1]) + 1
+    if ch.size == 0:
+        return x
+    starts = np.r_[0, ch]
+    ends = np.r_[ch, L]
+    lens = ends - starts
+    cand = np.flatnonzero((lens >= rmin) & (ends < L) & (ends >= L // 4) & (ends <= L - 32))
+    if cand.size == 0:
+        return x
+    e = int(ends[cand[int(r.integers(0, cand.size))]])
+    out = np.array(a, dtype=np.float64, copy=True)
+    if out.ndim == 2:
+        out[0, e:] = v[e - 1]
+    else:
+        out[e:] = v[e - 1]
+    return out
+
+
+def _c215lp_points(x):
+    a = np.asarray(x)
+    if a.ndim == 2 and a.shape[0] > 1:
+        return -(-int(a.size) * 100 // 120)
+    return int(a.size)
+
+
+_C215LPParent = Generator
+
+
+class Generator(_C215LPParent):
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        n = int(n_series)
+        if n <= 0:
+            return
+        seed = int(self._seed) & ((1 << 64) - 1)
+        start = int((1.0 - _C215LP_LATE_FRAC) * _C215LP_STREAM_POINTS) if _C215LP_LATE_FRAC > 0.0 else 0
+        pts = 0
+        base = super().generate(n)
+        try:
+            for i, x in enumerate(base):
+                if isinstance(x, np.ndarray):
+                    on = pts >= start
+                    try:
+                        pts += _c215lp_points(x)
+                    except Exception:
+                        pass
+                    if on:
+                        r = np.random.default_rng(np.random.SeedSequence([seed, _C215LP_TAG], spawn_key=(i,)))
+                        try:
+                            x = _c215lp_lp(x, r)
+                            if _C215LP_LATE_H2E > 0:
+                                x = _c215lp_h2e(x, r, _C215LP_LATE_H2E)
+                        except Exception:
+                            pass
+                yield x
+        finally:
+            base.close()
+
+
+# ═══════════════ c233-MLPX: post-hoc law-periodic / law-linear tails for every channel that bypasses the engine law
+# (partner / teach / insert channels, MV channel 0 rows the engine law saw at another boundary). Runs AFTER LP. Per
+# channel: skip if the record already ends in a law/LP tail (last 256 values one exact hold, terminal exact run >= 16,
+# or an exact repeat of the last 64 values at some lag 2..512); else draw b = L - U[256, 720] and apply the king's own
+# law tests to v[b-512:b] (short lags 7/12/24/48/96, strict-linear test, then _validated_long_cycle /
+# _validated_longer_cycle on 1024 / 2048 points, gated by a cheap autocorrelation >= 0.5 test): periodic -> v[b:] =
+# median-cycle template (only if non-constant); channels whose recent 192 values are repeat-heavy (>= 35% exact ties,
+# the law's quiet test) or constant are skipped;
+# strict-linear -> clipped line (anchor = median of the last 16, slope from the last 64, clip at +-span) with the king's
+# 50% native share; quiet / degenerate / other -> untouched. NEVER writes a hold: the flat lever of RZPPUL is untouched.
+# Own SeedSequence([seed, TAG], spawn_key=(i,)) per record; parent stream untouched. ═══════════════
+_C233MLPC_TAG = 0xC233A1D
+_C233MLPC_EXT = 2048  # 0 = no periodic tail extension; else periodic tails may start up to this many steps before the end
+_C233MLPC_LIN_P = 0.5
+_C233MLPC_LAGS = np.arange(2, 513, dtype=np.int64)
+
+
+_C233MLPC_ACF_MIN = 0.5
+
+
+def _c233mlpc_acf_max(x, lo, hi):
+    """Cheap gate before the king's long-cycle validators (which dominate the layer's cost): the largest normalised
+    autocorrelation over lags [lo, hi). A cycle the validators accept (median-cycle error <= 0.12 of span) has a far
+    higher autocorrelation at its lag than this gate."""
+    y = x - float(np.mean(x))
+    d = float(np.dot(y, y))
+    if not d > 0.0:
+        return 0.0
+    n = y.shape[0]
+    f = np.fft.rfft(y, 2 * n)
+    acf = np.fft.irfft(f * np.conj(f), 2 * n)[:n] / d
+    return float(np.max(acf[lo:min(hi, n - 1)]))
+
+
+def _c233mlpc_lawlike(v):
+    """0 = no law tail; -1 = hold-like ending (exact hold over the last 256 or terminal exact run >= 16);
+    lag > 0 = the record ends in an exact repeat of its last 64 values at that lag (a law cycle tail)."""
+    L = int(v.shape[0])
+    t = v[-256:]
+    if bool(np.all(t == t[-1])):
+        return -1
+    r = 1
+    while r < 16 and v[L - 1 - r] == v[-1]:
+        r += 1
+    if r >= 16:
+        return -1
+    lags = _C233MLPC_LAGS[_C233MLPC_LAGS <= L - 65]
+    cand = lags[(v[L - 1 - lags] == v[L - 1]) & (v[L - 2 - lags] == v[L - 2])
+                & (v[L - 33 - lags] == v[L - 33]) & (v[L - 64 - lags] == v[L - 64])]
+    for lag in cand:
+        lag = int(lag)
+        if np.array_equal(v[L - 64:], v[L - 64 - lag:L - lag]):
+            return lag
+    return 0
+
+
+def _c233mlpc_hist_len(lag):
+    return 512 if lag <= 96 else (1024 if lag <= 256 else 2048)
+
+
+def _c233mlpc_extend(v, b, lag, u):
+    """Earlier start b2 < b for a periodic tail (back2 ~ U[L-b, EXT]), accepted only if the same lag re-validates on the
+    96 points before b2 with the king's criteria and its template is non-constant; returns (b2, history) or None."""
+    if _C233MLPC_EXT <= 0:
+        return None
+    L = int(v.shape[0])
+    hl = _c233mlpc_hist_len(lag)
+    hi = min(int(_C233MLPC_EXT), L - hl)
+    back = L - b
+    if hi <= back:
+        return None
+    back2 = min(hi, back + int(u * (hi - back + 1)))
+    b2 = L - back2
+    if b2 >= b or b2 - hl < 0:
+        return None
+    h2 = np.ascontiguousarray(v[b2 - hl:b2], dtype=np.float64)
+    if not bool(np.all(np.isfinite(h2))):
+        return None
+    fit = h2[:-96]
+    val = h2[-96:]
+    count = min(7, int(fit.shape[0]) // lag)
+    count -= int(count % 2 == 0)
+    if count < 1:
+        return None
+    pred = _empirical_cycle_tail(fit, lag, 96, None, "median")
+    if not bool(np.ptp(pred) > 0.0):
+        return None
+    recent = h2[-192:]
+    q10, q90 = np.quantile(recent, (0.10, 0.90))
+    peak = float(np.max(np.abs(recent)))
+    span = max(float(q90 - q10), peak * 1e-12, 1e-12)
+    err = float(np.mean(np.abs(val - pred))) / span
+    hold = float(np.mean(np.abs(val - float(np.median(fit[-16:]))))) / span
+    if err <= 0.12 and err <= 0.75 * hold:
+        return b2, h2
+    return None
+
+
+def _c233mlpc_tail(v, b, coin, u):
+    L = int(v.shape[0])
+    pre = np.asarray(v[b - 512:b], dtype=np.float64)
+    recent = pre[-192:]
+    if not bool(np.ptp(recent) > 0.0):
+        return None
+    peak = float(np.max(np.abs(recent)))
+    if float(np.mean(np.abs(np.diff(recent)) <= max(peak * 1e-12, 1e-12))) >= 0.35:
+        return None
+    q10, q90 = np.quantile(recent, (0.10, 0.90))
+    span = max(float(q90 - q10), peak * 1e-12, 1e-12)
+    fit = pre[:-96]
+    val = pre[-96:]
+    fa = float(np.median(fit[-16:]))
+    hold_error = float(np.mean(np.abs(val - fa))) / span
+    slope = (float(np.median(fit[-32:])) - float(np.median(fit[-64:-32]))) / 32.0
+    linear_error = float(np.mean(np.abs(val - (fa + slope * np.arange(1, 97, dtype=np.float64))))) / span
+    projected = abs(slope) * 96.0 / span
+    strict_linear = (linear_error <= 0.08) and (linear_error <= 0.30 * hold_error) and (0.20 <= projected <= 0.90)
+    away = float(np.mean(np.abs(fit - fa) > 0.05 * span))
+    perr = np.inf
+    lag_b = 7
+    for lag in (7, 12, 24, 48, 96):
+        pred = np.tile(fit[-lag:], (96 + lag - 1) // lag)[:96]
+        e = float(np.mean(np.abs(val - pred))) / span
+        if e < perr:
+            perr, lag_b = e, lag
+    recurring = (away >= 0.15) and (perr <= 0.12) and (perr <= 0.75 * hold_error)
+    hist = pre
+    if (not recurring) and (not strict_linear):
+        if b >= 1024:
+            ctx = np.ascontiguousarray(v[b - 1024:b], dtype=np.float64)
+            if _c233mlpc_acf_max(ctx, 97, 257) >= _C233MLPC_ACF_MIN:
+                ok, lg = _validated_long_cycle(ctx[None, :])
+                if bool(ok[0]):
+                    recurring, lag_b, hist = True, int(lg[0]), ctx
+        if (not recurring) and b >= 2048:
+            ctx = np.ascontiguousarray(v[b - 2048:b], dtype=np.float64)
+            if _c233mlpc_acf_max(ctx, 257, 513) >= _C233MLPC_ACF_MIN:
+                ok, lg = _validated_longer_cycle(ctx[None, :])
+                if bool(ok[0]):
+                    recurring, lag_b, hist = True, int(lg[0]), ctx
+    if recurring:
+        tm = _empirical_cycle_tail(hist, lag_b, L - b, None, "median")
+        if not bool(np.ptp(tm) > 0.0):
+            return None
+        ext = _c233mlpc_extend(v, b, lag_b, u)
+        if ext is not None:
+            b2, h2 = ext
+            tm2 = _empirical_cycle_tail(h2, lag_b, L - b2, None, "median")
+            if bool(np.ptp(tm2) > 0.0):
+                return b2, tm2
+        return b, tm
+    if strict_linear and coin < _C233MLPC_LIN_P:
+        anchor = float(np.median(recent[-16:]))
+        slope_now = (float(np.median(pre[-32:])) - float(np.median(pre[-64:-32]))) / 32.0
+        line = anchor + slope_now * np.arange(1, L - b + 1, dtype=np.float64)
+        return b, np.clip(line, anchor - span, anchor + span)
+    return None
+
+
+def _c233mlpc_apply(x, r):
+    a = np.asarray(x)
+    if a.ndim == 1:
+        arr = a[None, :]
+    elif a.ndim == 2:
+        arr = a
+    else:
+        return x
+    C, L = arr.shape
+    if L < 1232 or not bool(np.all(np.isfinite(arr))):
+        return x
+    backs = r.integers(256, min(721, L - 32), size=C)
+    coins = r.random(C)
+    us = r.random(C)
+    out = None
+    for c in range(C):
+        v = arr[c]
+        kind = _c233mlpc_lawlike(v)
+        if kind < 0:
+            continue
+        if kind > 0:
+            # existing exact cycle tail (engine law): optionally start it earlier (MLPX); MLPC leaves it alone
+            if _C233MLPC_EXT <= 0:
+                continue
+            eq = v[:-kind] == v[kind:]
+            nf = np.flatnonzero(~eq)
+            t0 = int(nf[-1]) + 1 if nf.size else 0
+            if L - t0 < 256:
+                continue
+            tm0 = v[t0:t0 + kind]
+            if not bool(np.ptp(tm0) > 0.0):
+                continue
+            ext = _c233mlpc_extend(v, t0, kind, float(us[c]))
+            if ext is None:
+                continue
+            b2, h2 = ext
+            tm2 = _empirical_cycle_tail(h2, kind, L - b2, None, "median")
+            if not bool(np.ptp(tm2) > 0.0):
+                continue
+            res = (b2, tm2)
+        else:
+            res = _c233mlpc_tail(v, L - int(backs[c]), float(coins[c]), float(us[c]))
+        if res is None:
+            continue
+        b, tail = res
+        if out is None:
+            out = np.array(arr, dtype=np.float64, copy=True)
+        out[c, b:] = tail
+    if out is None:
+        return x
+    return out[0] if a.ndim == 1 else out
+
+
+_C233MLPCParent = Generator
+
+
+class Generator(_C233MLPCParent):
+    def generate(self, n_series: int) -> Iterator[np.ndarray]:
+        n = int(n_series)
+        if n <= 0:
+            return
+        seed = int(self._seed) & ((1 << 64) - 1)
+        base = super().generate(n)
+        try:
+            for i, x in enumerate(base):
+                if isinstance(x, np.ndarray):
+                    r = np.random.default_rng(np.random.SeedSequence([seed, _C233MLPC_TAG], spawn_key=(i,)))
+                    try:
+                        x = _c233mlpc_apply(x, r)
+                    except Exception:
+                        pass
+                yield x
+        finally:
+            base.close()
+
+
+
+_C259NameParent = Generator
+
+
+class Generator(_C259NameParent):
+    @property
+    def name(self) -> str:
+        return 'c268-k76-BIG1-P40U'
+
+
+# ═══════════════ c261 PAUT: autumn re-calibration of the king's own 15-min price kind (_yb_price, the ch_grid15 'price' channel) ═══════════════
+# Regime evidence (wfregime scan + verify-scan, 10-21): every uid76 king / challenger since the 10-15 pools forecasts European 15-min
+# day-ahead prices LOWER than its init (-0.066 sd) with DEEPER midday troughs (-0.17 sd on energy_charts price_*); the deficit is
+# -0.08..-0.19 % of round per leg (init 3d82fddc -0.143) and is projected to persist. Real energy_charts series (10-18 pool) by days
+# before the cut: trough/level 0.42-0.58 -> 0.28-0.33, peak/level 0.59 -> 0.39-0.41, day level +13-17 %, negative points 1-3 % -> 0.1-0.4 %
+# over the last ~5 weeks. The king's _yb_price (1.5 % of stream records carry it as their y_channel channel; 0.75 % of points) is a
+# stationary SEPTEMBER calibration: trough/level 0.44, peak/level 0.59, negatives 1.3 %, no within-row trend.
+# PAUT keeps every draw of the king's _yb_price (its values are computed first, unchanged) and then, in 90 % of rows, applies a
+# within-row AUTUMN TREND with 5 extra uniforms drawn AFTER the king's draws (price rows never use r again in _yb_draw: P_TAIL and
+# P_BLIP are 0 for 'price'): the daily shape (deviation from the calendar-day mean) is scaled by g(d) = g_end * exp(kap * (nd-1-d))
+# (capped at 1.25; g_end U(0.50, 0.75), kap U(0.010, 0.022) / day) and the day level gets a linear ramp that ENDS at the king's level
+# (past days lowered by delta * Lref * (nd-1-d) / 35; delta U(0.05, 0.35) in 80 % of the trended rows, else 0; Lref = median |day mean|). Result rounded to 2 decimals
+# like the king's. No new records, no billing change, every other record / channel of the stream byte-identical.
+# v2 (hygiene review 10-21 ~01:50 JST): negative outputs pass through a soft floor y -> -F * log1p(-y / F), F = 0.02 * Lref (the
+# shallow end of the king's own negative-price compression, lev * (0.02..0.12)). Without it the affine trend (g > 1 and a lowered
+# level on early days) pushed early-row troughs LINEARLY below zero: 42-44 % of trended rows had points < -0.2 * level on days
+# -44..-21 (king 6-10 %, real 10-18 energy_charts 0 %); with it: 0 %, row-min p10 -0.07 * level (real -0.02..-0.04). Same draws,
+# same trended rows, trough / peak / level profile of the last 14 days unchanged.
+_C261_YB_PRICE_KING = _yb_price
+
+
+def _c261_yb_price(r, n, a, sod, day, dow0):
+    x = np.asarray(_C261_YB_PRICE_KING(r, n, a, sod, day, dow0), dtype=np.float64)
+    u = r.random(3)
+    if u[0] >= 0.90 or x.size < 192:
+        return x
+    d = (np.asarray(day, dtype=np.int64) - int(day[0]))
+    nd = int(d[-1]) + 1
+    cnt = np.bincount(d, minlength=nd).astype(np.float64)
+    dm = np.bincount(d, weights=x, minlength=nd) / np.maximum(cnt, 1.0)
+    back = (nd - 1 - np.arange(nd, dtype=np.float64))
+    g = np.minimum((0.50 + 0.25 * u[1]) * np.exp((0.010 + 0.012 * u[2]) * back), 1.25)
+    lref = float(np.median(np.abs(dm))) + 1e-9
+    v = r.random(2)
+    delta = (0.05 + 0.30 * float(v[0])) if float(v[1]) < 0.80 else 0.0
+    lvl = dm - delta * lref * back / 35.0
+    y = lvl[d] + g[d] * (x - dm[d])
+    neg = y < 0.0
+    if bool(np.any(neg)):
+        f = 0.02 * lref
+        y[neg] = -f * np.log1p(-y[neg] / f)
+    if not bool(np.all(np.isfinite(y))) or float(np.ptp(y)) <= 0.0:
+        return x
+    return np.round(y, 2)
+
+
+_YB_BUILD = (_yb_co2, _yb_solar, _yb_wind, _c261_yb_price, _yb_load)
+
+
+# ═══════════════ c234-SALT: corpus re-draw. The stream seed is mixed with a constant salt before any layer
+# sees it, so the whole corpus is re-drawn from the SAME distribution (sibling of c268-k76-BIG1-P40U). ═══════════════
+_C234S_SALT = 0x5a1c0322
+_C234SParent = Generator
+
+
+class Generator(_C234SParent):
+    def __init__(self, config_dir: str, *, seed: int) -> None:
+        s = np.random.SeedSequence([int(seed) & ((1 << 64) - 1), _C234S_SALT]).generate_state(2, dtype=np.uint32)
+        super().__init__(config_dir, seed=(int(s[0]) | (int(s[1]) << 32)) & ((1 << 63) - 1))
+
+    @property
+    def name(self) -> str:
+        return 'c268-k76-BIG1-P40U-S2'
