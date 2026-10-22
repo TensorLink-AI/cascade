@@ -1203,6 +1203,56 @@ def rediscover_king_host(runner, era):
     return host
 
 
+# ── leg phases (live roster) + GPU-type outage cooldown ─────────────────────
+# Module functions, not methods: the rent path also runs on lightweight
+# stand-ins in tests, and a phase/outage record must never break a rent.
+
+def _leg_phase_map(runner) -> dict:
+    """hotkey → (phase, since_unix, sku), set where each phase HAPPENS (rent
+    intent, capacity wait, pod ready/adopted). Presentational: only the live
+    roster reads it. ``since`` 0.0 = unknown (a pod adopted after a restart)."""
+    return runner.__dict__.setdefault("_leg_phase_map", {})
+
+
+def _set_leg_phase(runner, hotkey: str, phase: str, sku: str = "", *,
+                   since: float | None = None) -> None:
+    m = _leg_phase_map(runner)
+    if not phase:
+        m.pop(hotkey, None)
+        return
+    prev = m.get(hotkey)
+    if prev is not None and prev[0] == phase and (not sku or prev[2] == sku):
+        return                       # repeated poll: keep the original "since"
+    m[hotkey] = (phase, time.time() if since is None else float(since),
+                 sku or (prev[2] if prev else ""))
+
+
+def _note_pod_loss(sku: str, pod: str, reason: str) -> None:
+    from ..provision.sku_outage import record_pod_loss
+
+    try:
+        record_pod_loss(sku, pod, error_tail(str(reason), 200))
+    except Exception as e:  # noqa: BLE001 — rent-policy telemetry only
+        log.warning("pod loss record failed (ignored): %s", e)
+
+
+def _prefer_healthy_skus(runner, skus: tuple[str, ...]) -> tuple[str, ...]:
+    from ..provision.sku_outage import prefer_healthy
+
+    try:
+        kept = prefer_healthy(skus)
+    except Exception as e:  # noqa: BLE001 — never block a rent on telemetry
+        log.warning("sku outage check failed (ignored): %s", e)
+        return skus
+    if kept != skus:
+        dropped = tuple(sorted(set(skus) - set(kept)))
+        if runner.__dict__.get("_sku_cool_logged") != dropped:
+            runner.__dict__["_sku_cool_logged"] = dropped
+            log.warning("lium: %s in an outage cooldown — renting %s first",
+                        "/".join(dropped), "/".join(kept))
+    return kept
+
+
 @dataclass
 class TrainerRunner:
     """Owner-operated trainer. ``base_trainer`` is the GPU backend (Protocol).
@@ -2217,12 +2267,15 @@ class TrainerRunner:
     def _funded_skus_for_rent(self) -> tuple[str, ...]:
         """GPU types a rent may pick: the round's locked SKU, or — with
         ``[round] funded_sku_per_leg`` (owner 2026-09-20: open the market) —
-        every listed type, cheapest fitting executor first."""
+        every listed type, cheapest fitting executor first. A type in a
+        correlated-loss outage cooldown (``provision.sku_outage``) is moved out
+        while another type remains, so a supply outage steers rents elsewhere
+        instead of onto the next dying machine of that type (2026-10-21)."""
         rnd = self.cfg.round
         if self._sku_per_leg_active():
             skus = tuple(getattr(rnd, "funded_pod_skus", ()) or ())
             if skus:
-                return skus
+                return _prefer_healthy_skus(self, skus)
         locked = getattr(self, "_funded_round_sku", "") or rnd.funded_pod_sku
         return (locked,) if locked else ()
 
@@ -3023,6 +3076,14 @@ class TrainerRunner:
                                error_class: str, burn: bool) -> None:
         self._funded_leg_failures[hotkey] = (error_tail(msg, 500), miner_fault,
                                              error_class, burn)
+        if "pod unreachable" in str(msg):
+            # A pod lost mid-leg counts toward its GPU type's outage cooldown.
+            sku = (_leg_phase_map(self).get(hotkey) or (None, 0.0, ""))[2]
+            _note_pod_loss(sku, f"funded-{hotkey[:12]}", msg)
+        _set_leg_phase(self, hotkey, "")
+
+    def _rolling_leg_phases(self) -> dict:
+        return dict(_leg_phase_map(self))
 
     def _rent_funded_host(self, round_id: str, gen: ResolvedGenerator):
         """Rent ``gen``'s leg pod on ITS payer's key → ``(RemoteHost, PodInstance)``.
@@ -3132,6 +3193,7 @@ class TrainerRunner:
             provider="lium", instance_id=expected_id, stage="funded",
             rented_at_iso=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             sku=round_sku, gpus=1, payer_hotkey=gen.hotkey))
+        _set_leg_phase(self, gen.hotkey, "starting", round_sku)
         # One rent at a time (see _funded_rent_lock): later rents must SEE
         # earlier claims, or every concurrent pair picks the market's same
         # top executor and races one create-rate window.
@@ -3147,6 +3209,7 @@ class TrainerRunner:
 
                 # Open market: only the types a leg started now still fits.
                 fit = self._skus_fitting_now(skus) or skus
+                _set_leg_phase(self, gen.hotkey, "starting")
                 result = rent_funded_pod(
                     round_id=str(round_id), hotkey=gen.hotkey, api_key=api_key,
                     sku=fit[0], image=rnd.funded_pod_image,
@@ -3221,6 +3284,7 @@ class TrainerRunner:
             # Sold out RIGHT NOW is not a verdict: wait for a GPU (outside the
             # rent lock, so sibling legs that find one proceed) and rent again.
             # Only the round's latest safe start turns this into a requeue.
+            _set_leg_phase(self, gen.hotkey, "waiting_gpu")
             waited = self._wait_for_funded_capacity(
                 skus, describe=f"funded leg {gen.hotkey[:12]}", hotkey=gen.hotkey)
             if waited == "operator":
@@ -3256,6 +3320,10 @@ class TrainerRunner:
             raise _FundedLegSkip(gen.hotkey)
         # Replace the intent row with the real pod record (same instance id).
         self._ledger_add(result.pod)
+        # An ADOPTED pod (restart re-attach) started training before this
+        # process: its true start is unknown here, so publish no "since".
+        _set_leg_phase(self, gen.hotkey, "training", str(getattr(result.pod, "sku", "") or ""),
+                            since=0.0 if getattr(result, "adopted", False) else None)
         # Least-privilege credential for a payer-controlled box: a per-pod Hub
         # robot (push-only, checkpoint project, revoked at teardown) and
         # NOTHING from the orchestrator's environment (cascade.funding.robots).
@@ -3825,6 +3893,7 @@ class TrainerRunner:
                     _ledger_king(pod_id)
                     log.info("king pod %s ready at %s:%d (operator-billed, sku=%s, "
                              "host key pinned)", pod_id, addr.ip, addr.ssh_port, sku)
+                    self.__dict__["_king_pod_sku"] = str(sku or "")
                     king_host = _king_remote(addr, host_key)
                     # JIT pod ⇒ no provisioner config push: deliver the deployed
                     # chain.toml (correct train_image_digest pin) before the probe.
@@ -8572,6 +8641,10 @@ class TrainerRunner:
                     host = self._funded_king_host
         if host is not None:
             _quarantine_lane_host(host, f"king pod {getattr(host, 'name', host)}: {reason}")
+        if "unreachable" in str(reason):
+            # A king pod lost mid-leg counts toward its GPU type's cooldown.
+            _note_pod_loss(str(self.__dict__.get("_king_pod_sku", "") or ""),
+                           f"king-era{era.index}", reason)
         self._rolling_retire_king_pod(era)
 
     def _rolling_bench_king(self, entry, era) -> dict | None:
@@ -8807,27 +8880,6 @@ class TrainerRunner:
                 _publish_public_json(store, key, doc)
         except Exception as e:  # noqa: BLE001 — transparency must not sink a settlement
             log.warning("funded roster publish failed (ignored): %s", e)
-
-    def _rolling_live_pods(self) -> dict[str, float]:
-        """Challenger pods on the funded ledger right now: lower-cased 12-char
-        hotkey prefix (as in the ``…-funded-<prefix>-<n>`` instance name) →
-        newest ``rented_at`` (unix seconds). King pods are excluded. Read-only;
-        an unreadable ledger reads as no pods."""
-        import re
-        from datetime import datetime
-
-        out: dict[str, float] = {}
-        for p in self._load_funded_ledger():
-            m = re.search(r"-funded-([a-z0-9]{12})-\d+$", str(getattr(p, "instance_id", "")))
-            if not m:
-                continue
-            try:
-                ts = datetime.fromisoformat(
-                    str(p.rented_at_iso).replace("Z", "+00:00")).timestamp()
-            except (TypeError, ValueError):
-                ts = 0.0
-            out[m.group(1)] = max(out.get(m.group(1), 0.0), ts)
-        return out
 
     def _rolling_dedup_registry(self):
         from .dedup_registry import DedupRegistry
