@@ -71,6 +71,49 @@ MAX_VERIFY_TRIES = 3
 KEEP_BENCH_REPORTS = 16
 
 BLOCK_SECONDS = 12.0
+# Live roster (funded/latest.json between settlements): republish at most this
+# often on a change, and at least this often regardless (fresh ``updated_at``).
+ROSTER_LIVE_MIN_SECONDS = 60.0
+ROSTER_LIVE_HEARTBEAT_SECONDS = 900.0
+
+# A funded leg's phase, as published on the roster. Presentational only —
+# nothing consumes it; the queue status and the signed manifest stay the truth.
+PHASE_DETAIL = {
+    "queued": "queued — dispatches in reveal order",
+    "deferred": "waiting for this coldkey's leg in flight to settle",
+    "requeued": "requeued after an infrastructure fault (submission not burned)",
+    "starting": "renting a GPU pod",
+    "waiting_gpu": "no GPU capacity on the marketplace yet — retrying every 90 s",
+    "training": "training on its GPU pod",
+    "benching": "training done — public benchmark running; settles at the next boundary",
+    "awaiting_settlement": "training done — judged at the next settlement",
+}
+
+
+def leg_phase(status: str, error_class: str, attempts: int, *, pod_live: bool,
+              finished: bool) -> str:
+    """Phase of one funded queue entry for the public roster (pure)."""
+    error_class = (error_class or "").lower()
+    if finished:
+        return "benching" if pod_live else "awaiting_settlement"
+    if status == "in_flight":
+        if pod_live:
+            return "training"
+        return "waiting_gpu" if error_class == "no_capacity" else "starting"
+    if error_class in ("deferred", "coldkey_cap"):   # queue.note(error_class="deferred")
+        return "deferred"
+    if int(attempts or 0) > 0 or error_class in ("infra", "no_capacity"):
+        return "requeued"
+    return "queued"
+
+
+def _iso(ts: float) -> str:
+    import datetime as _dt
+
+    return _dt.datetime.fromtimestamp(float(ts), tz=_dt.UTC).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+
+
 # A booted king pod gets ONE retry after a non-transport failure (a Hippius
 # read stall is not necessarily the pod's fault); the next failure — or any
 # transport failure at once — rotates it: host quarantined, pod torn down,
@@ -536,8 +579,15 @@ class LegOps:
     def publish_bench(self, round_id: str, created_block: int, entries: list) -> object | None:
         return self.r._rolling_publish_bench(round_id, created_block, entries)
 
-    def publish_roster(self, round_id: str, roster: dict) -> None:
-        self.r._rolling_publish_roster(round_id, roster)
+    def publish_roster(self, round_id: str, roster: dict, *, live: bool = False) -> None:
+        if live:
+            self.r._rolling_publish_roster(round_id, roster, live=True)
+        else:
+            self.r._rolling_publish_roster(round_id, roster)
+
+    def live_pods(self) -> dict[str, float]:
+        fn = getattr(self.r, "_rolling_live_pods", None)
+        return fn() if fn is not None else {}
 
     def promotion_boundary(self, king_hotkey: str, epoch_start: int, round_id: str,
                            effective_era: int) -> None:
@@ -681,6 +731,7 @@ class RollingScheduler:
         self._drain_verifies()
         self._release_idle_king_pods()
         self._intake(client, block, now)
+        self._maybe_publish_live_roster(now)
 
     # ── startup / restart ────────────────────────────────────────────────────
 
@@ -1993,6 +2044,7 @@ class RollingScheduler:
             roster = self._roster(round_id, ready, queue)
             self.state.rents = []
             self._save()
+        roster["updated_at"] = _iso(self.clock())
         self.ops.publish_roster(round_id, roster)
         try:
             self.ops.publish_champion(ResolvedGen(cur.king_hotkey, cur.king_uid, cur.king_ref),
@@ -2267,18 +2319,66 @@ class RollingScheduler:
         from ..funding.queue import select_field
 
         entries = queue.entries() if queue is not None else []
+        try:
+            pods = self.ops.live_pods()
+        except Exception as e:  # noqa: BLE001 — the phase is presentational
+            log.warning("rolling: live pod lookup for the roster failed (%s)", e)
+            pods = {}
+        finished = {f.hotkey for f in self.state.finished}
         seated = [{"hotkey": f.hotkey, "ref": f.ref, "reveal_block": f.reveal_block,
                    "label": f.label, "started_block": f.started_block}
                   for f in sorted(ready, key=lambda f: (f.reveal_block, f.hotkey))]
+
+        def _status(e) -> dict:
+            rented = pods.get(e.hotkey[:12].lower(), 0.0)
+            if rented and e.funded_at and rented < e.funded_at:
+                rented = 0.0   # an older submission's pod (e.g. an unstoppable stale one)
+            phase = leg_phase(e.status, e.last_error_class, e.attempts,
+                              pod_live=bool(rented), finished=e.hotkey in finished)
+            since = rented if phase in ("training", "benching") and rented else e.last_active
+            return {"phase": phase, "phase_detail": PHASE_DETAIL.get(phase, ""),
+                    "attempts": int(e.attempts or 0),
+                    "error_class": e.last_error_class or "",
+                    "since": _iso(since) if since else ""}
+
         return {
             "round_id": round_id, "mode": "rolling",
             "seated": seated,
             "in_flight": [{"hotkey": e.hotkey, "reveal_block": e.reveal_block,
                            "target_boundary": e.target_boundary, "era_index": e.era_index,
-                           "label": e.label} for e in entries if e.status == "in_flight"],
-            "waiting": [{"hotkey": e.hotkey, "reveal_block": e.reveal_block, "label": e.label}
+                           "label": e.label, **_status(e)}
+                          for e in entries if e.status == "in_flight"],
+            "waiting": [{"hotkey": e.hotkey, "reveal_block": e.reveal_block, "label": e.label,
+                         **_status(e)}
                         for e in select_field(entries, cap=0)],
             "terminal": [{"hotkey": e.hotkey, "error_class": e.last_error_class}
                          for e in entries if e.status == "failed"],
             "rents": list(self.state.rents),
         }
+
+    def _maybe_publish_live_roster(self, now: float) -> None:
+        """Republish ``funded/latest.json`` between settlements so a miner sees
+        the leg's phase (waiting for a GPU, training, benching, requeued + why)
+        within about a minute, not up to an era later. Rate-limited, and only
+        on a change (plus a heartbeat so ``updated_at`` stays fresh). Never
+        touches the per-round audit record."""
+        last = self.__dict__.get("_roster_live_last")  # (published_at, body_key)
+        if last is not None and now - last[0] < ROSTER_LIVE_MIN_SECONDS:
+            return
+        queue = self.ops.queue()
+        with self._lock:
+            round_id = str(self.state.last_published_round_id or "")
+            if not round_id:
+                return
+            roster = self._roster(round_id, [], queue)
+        body_key = json.dumps(roster, sort_keys=True, default=str)
+        if (last is not None and body_key == last[1]
+                and now - last[0] < ROSTER_LIVE_HEARTBEAT_SECONDS):
+            return
+        roster["live"] = True
+        roster["updated_at"] = _iso(now)
+        self.__dict__["_roster_live_last"] = (now, body_key)
+        try:
+            self.ops.publish_roster(round_id, roster, live=True)
+        except Exception as e:  # noqa: BLE001 — transparency must not sink the loop
+            log.warning("rolling: live roster publish failed (ignored): %s", e)

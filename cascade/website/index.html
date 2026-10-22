@@ -1680,7 +1680,14 @@ function heatStatusMeta(s){
   if(s==="waiting") return {cls:"wait",label:"Waiting — next round"};
   // rolling eras (funded/latest.json roster): the leg's state inside the era
   if(s==="training") return {cls:"adv",label:"● Training"};
-  if(s==="renting") return {cls:"wait",label:"Renting a pod"};
+  if(s==="renting"||s==="starting") return {cls:"wait",label:"Renting a pod"};
+  // live-roster phases (funded/latest.json between settlements)
+  if(s==="waiting_gpu") return {cls:"wait",label:"Waiting for a GPU"};
+  if(s==="benching") return {cls:"adv",label:"Trained · benchmarking"};
+  if(s==="awaiting_settlement") return {cls:"adv",label:"Trained · next settlement"};
+  if(s==="requeued") return {cls:"wait",label:"Requeued (not burned)"};
+  if(s==="deferred") return {cls:"wait",label:"Deferred · coldkey cap"};
+  if(s==="queued") return {cls:"wait",label:"Queued"};
   if(s==="failed") return {cls:"nofit",label:"Failed"};
   return {cls:"screened",label:s||"--"};
 }
@@ -1714,7 +1721,8 @@ function heatRoundSettled(esb){
 function rosterRows(){
   var d=_roster; if(!d||String(d.mode)!=="rolling") return null;
   var out=[];
-  function add(list,status){ (Array.isArray(list)?list:[]).forEach(function(e){ if(e&&e.hotkey) out.push({e:e,status:status}); }); }
+  // A live roster stamps each entry's phase; older documents fall back to the list's status.
+  function add(list,status){ (Array.isArray(list)?list:[]).forEach(function(e){ if(e&&e.hotkey) out.push({e:e,status:(e.phase&&status!=="seated"&&status!=="failed")?String(e.phase):status}); }); }
   add(d.in_flight,"training"); add(d.rents,"renting"); add(d.waiting,"waiting"); add(d.seated,"seated"); add(d.terminal,"failed");
   return out;
 }
@@ -1725,12 +1733,14 @@ function renderRoster(cn){
   rows.forEach(function(x){ n[x.status]=(n[x.status]||0)+1; });
   if(title) title.innerHTML="Era field &mdash; rolling";
   var rn=cn?roundNoOfBlock(cn.eraStart):null;
-  var counts=["training","renting","waiting","seated","failed"].filter(function(k){ return n[k]; }).map(function(k){ return n[k]+" "+k; }).join(" · ");
-  when.textContent=(rn?"era r"+rn+" · ":"")+(counts||"empty")+" · roster from settlement "+shortRoundId(d.round_id);
+  var order=["training","benching","awaiting_settlement","starting","renting","waiting_gpu","requeued","deferred","queued","waiting","seated","failed"];
+  var counts=order.filter(function(k){ return n[k]; }).map(function(k){ return n[k]+" "+k.replace(/_/g," "); }).join(" · ");
+  var src=(d.live&&d.updated_at)?"live · updated "+esc(String(d.updated_at).replace("T"," ").replace("Z"," UTC")):"roster from settlement "+shortRoundId(d.round_id);
+  when.textContent=(rn?"era r"+rn+" · ":"")+(counts||"empty")+" · "+src;
   if(!rows.length){
     panel.className="";
     panel.innerHTML='<div class="heat-empty"><div class="he-glyph">· · ·</div><div class="he-head">No entrants on the roster</div>'+
-      '<p>Funded entries seat the moment they are revealed; the roster republishes at every settlement.</p></div>';
+      '<p>Funded entries seat the moment they are revealed; the roster updates live (about every minute) between settlements.</p></div>';
     return true;
   }
   panel.className="panel";
@@ -1738,7 +1748,9 @@ function renderRoster(cn){
     var e=x.e, m=heatStatusMeta(x.status), tb=Number(e.target_boundary), std=m.label;
     if(x.status==="failed"&&e.error_class) std+=" · "+esc(e.error_class);
     if(x.status==="seated") std+=" · judged at "+esc(shortRoundId(d.round_id));
-    var live=x.status==="training"||x.status==="renting", tgt='<span class="muted">--</span>';
+    if(e.since&&x.status!=="seated"&&x.status!=="failed") std+=" · since "+esc(String(e.since).slice(11,16))+" UTC";
+    if(Number(e.attempts)>0) std+=" · attempt "+esc(e.attempts);
+    var live=["training","renting","starting","waiting_gpu","benching","awaiting_settlement"].indexOf(x.status)>=0, tgt='<span class="muted">--</span>';
     if(live&&tb>0){
       // The leg targets a boundary; once that boundary has passed it settles
       // at the next one after it lands.
@@ -1747,7 +1759,7 @@ function renderRoster(cn){
     }
     return '<tr><td class="num">'+(i+1)+'</td>'+
       '<td title="'+esc(e.hotkey||"")+'">'+esc(shortHk(e.hotkey))+(e.label?' <span class="sub-tag">'+esc(e.label)+'</span>':'')+'</td>'+
-      '<td><span class="heat-pill '+m.cls+'">'+std+'</span></td>'+
+      '<td><span class="heat-pill '+m.cls+'"'+(e.phase_detail?' title="'+esc(e.phase_detail)+'"':'')+'>'+std+'</span></td>'+
       '<td>'+tgt+'</td>'+
       '<td class="num">'+(e.reveal_block!=null?esc(e.reveal_block):"--")+'</td></tr>';
   }).join("");
