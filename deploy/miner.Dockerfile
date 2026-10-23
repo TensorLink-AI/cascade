@@ -25,7 +25,7 @@
 
 ARG BASE_IMAGE=nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 # Where the uv binary comes from. Docker Hub mirror: --build-arg UV_IMAGE=astral/uv:latest
-ARG UV_IMAGE=ghcr.io/astral-sh/uv:latest
+ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.13.4@sha256:f0a9c230906ab004ce4786b6e0c60995e30b2bdf585c51377026838573720993
 
 FROM ${UV_IMAGE} AS uv
 
@@ -74,7 +74,9 @@ RUN uv pip install --python /opt/cascade/.venv/bin/python --no-sources \
 
 # The source, last. --no-deps: everything it needs is already in place.
 COPY . /opt/cascade
-RUN uv pip install --python /opt/cascade/.venv/bin/python --no-sources --no-deps -e .
+RUN uv pip install --python /opt/cascade/.venv/bin/python --no-sources --no-deps -e . \
+    && uv pip install --python /opt/cascade/.venv/bin/python certifi==2026.10.19 \
+    && /opt/cascade/.venv/bin/python scripts/check_tls_trust.py
 
 ARG BUILD_SHA=unknown
 LABEL org.opencontainers.image.source="https://github.com/TensorLink-AI/cascade" \
@@ -98,8 +100,9 @@ ENTRYPOINT ["/usr/local/bin/cascade-miner"]
 FROM base AS oneclick
 
 # Claude Code for the `agent` proposer (native installer; no Node needed).
-RUN curl -fsSL https://claude.ai/install.sh | bash \
-    && ln -sf /root/.local/bin/claude /usr/local/bin/claude
+RUN curl -fsSL https://claude.ai/install.sh | bash -s -- 2.1.303 \
+    && ln -sf /root/.local/bin/claude /usr/local/bin/claude \
+    && claude --version | grep -E '^2\.1\.303([[:space:]]|$)'
 
 # The agent skill, user-level: the agent runs inside candidate dirs under /work,
 # outside this repo, so a project-level .claude/ would not be found.
@@ -115,7 +118,8 @@ CMD ["ui"]
 FROM base AS harness
 RUN apt-get update && apt-get install -y --no-install-recommends openssh-client \
     && rm -rf /var/lib/apt/lists/* \
-    && uv pip install --python /opt/cascade/.venv/bin/python "lium.io==0.9.1"
+    && uv pip install --python /opt/cascade/.venv/bin/python "lium.io==0.9.1" certifi==2026.10.19 \
+    && /opt/cascade/.venv/bin/python /opt/cascade/scripts/check_tls_trust.py
 CMD ["gauntlet", "run", "--config", "/work/harness.toml", "--park-on-stop"]
 
 # --------------------------------------------------------------------------- #

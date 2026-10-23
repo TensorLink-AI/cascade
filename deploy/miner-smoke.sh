@@ -13,7 +13,17 @@ IMG="${1:?usage: miner-smoke.sh <image> [toolbox|oneclick|harness]}"
 TARGET="${2:-toolbox}"
 WORK="$(mktemp -d)"
 UI_NAME="cascade-miner-smoke-$$"
-trap 'docker rm -f "$UI_NAME" >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT
+cleanup() {
+  local status=$?
+  docker rm -f "$UI_NAME" >/dev/null 2>&1 || true
+  # Root inside the image owns some bind-mounted fixtures. Delete those in
+  # the same image, confined to this test's temporary directory.
+  docker run --rm --network none --user 0 --entrypoint find \
+    -v "$WORK:/cleanup" "$IMG" /cleanup -mindepth 1 -delete
+  rm -rf -- "$WORK"
+  return "$status"
+}
+trap cleanup EXIT
 run() { docker run --rm -v "$WORK:/work" "$@"; }
 step() { printf '\n== %s\n' "$*"; }
 
