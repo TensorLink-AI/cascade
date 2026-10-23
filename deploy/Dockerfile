@@ -30,7 +30,7 @@ RUN printf 'PermitRootLogin prohibit-password\nPasswordAuthentication no\n' \
         > /etc/ssh/sshd_config.d/cascade.conf
 
 # uv for a reproducible pinned Python + deps (matches the repo's uv toolchain).
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.13.4@sha256:f0a9c230906ab004ce4786b6e0c60995e30b2bdf585c51377026838573720993 /uv /bin/uv
 
 WORKDIR /root/cascade
 COPY . /root/cascade
@@ -99,3 +99,7 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 
 EXPOSE 22
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+
+# Refuse a worker image with compromised certificate roots.
+RUN uv pip install --python /root/cascade/.venv/bin/python certifi==2026.10.19 \
+    && /root/cascade/.venv/bin/python scripts/check_tls_trust.py
