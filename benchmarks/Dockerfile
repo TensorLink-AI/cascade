@@ -20,7 +20,8 @@ FROM python:3.11-slim
 # git: uv needs it to install the timebench git dependency.
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-RUN pip install --no-cache-dir uv==0.10.4
+RUN python -m pip --cert /etc/ssl/certs/ca-certificates.crt install --no-cache-dir --upgrade \
+    "pip>=26.2.2" "certifi>=2026.10.19" uv==0.13.4
 
 WORKDIR /app
 ENV UV_LINK_MODE=copy
@@ -28,6 +29,9 @@ ENV UV_LINK_MODE=copy
 # 1. dependencies (locked; project itself not yet installed)
 COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --frozen --no-install-project --extra time
+
+COPY check_tls_trust.py /tmp/check_tls_trust.py
+RUN .venv/bin/python /tmp/check_tls_trust.py
 
 # 2. benchmark data at the PINNED revisions — datasets.py is the single source
 #    of truth for which revisions, so this layer rebuilds exactly when they bump.
