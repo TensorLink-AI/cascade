@@ -16,7 +16,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 RUN python -m pip --cert /etc/ssl/certs/ca-certificates.crt install --no-cache-dir --upgrade "pip>=26.2.2" "certifi>=2026.10.19"
 
 ARG HERMES_VERSION="0.19.0"
-RUN pip install --no-cache-dir "hermes-agent${HERMES_VERSION:+==$HERMES_VERSION}" "certifi>=2026.10.19"
+# Hermes 0.19.0 pins the compromised CA data. Preserve its tested CLI and
+# override only that certificate-data pin until a patched Hermes release ships.
+# pip check will report this one intentional upstream metadata conflict.
+RUN pip install --no-cache-dir "hermes-agent${HERMES_VERSION:+==$HERMES_VERSION}" \
+    && pip install --no-cache-dir --no-deps --upgrade certifi==2026.10.19
 COPY check_tls_trust.py /tmp/check_tls_trust.py
 RUN python /tmp/check_tls_trust.py
 
