@@ -11,8 +11,14 @@
 # hence the pin. Re-check operator-loop.sh before bumping it.
 FROM python:3.12-slim
 
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+RUN python -m pip --cert /etc/ssl/certs/ca-certificates.crt install --no-cache-dir --upgrade "pip>=26.2.2" "certifi>=2026.10.19"
+
 ARG HERMES_VERSION="0.19.0"
-RUN pip install --no-cache-dir "hermes-agent${HERMES_VERSION:+==$HERMES_VERSION}"
+RUN pip install --no-cache-dir "hermes-agent${HERMES_VERSION:+==$HERMES_VERSION}" "certifi>=2026.10.19"
+COPY check_tls_trust.py /tmp/check_tls_trust.py
+RUN python /tmp/check_tls_trust.py
 
 COPY skills/cascade-operator /root/.hermes/skills/cascade-operator
 COPY OPERATOR_PROMPT.md /opt/operator/OPERATOR_PROMPT.md
