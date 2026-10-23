@@ -8634,18 +8634,64 @@ class TrainerRunner:
         a lemon HOST: quarantine its IP (Lium relists the same machine under
         fresh executor ids) and tear the pod down, so the next king-leg
         attempt re-rents elsewhere instead of looping into the same wall."""
+        # Identify the FAILED pod now, never by waiting on the rent lock: a
+        # re-rent in flight holds it, and a host read after it is the
+        # REPLACEMENT. 2026-10-22 19:43–21:02 this deferred rotation quarantined
+        # and tore down four fresh king pods seconds after each came up (same
+        # pod name, so the by-name teardown hit the new one) — the era-2595 king
+        # could never train until a restart cleared it.
         host = self.__dict__.get("_rolling_king_hosts", {}).get(era.index)
-        if host is None:
-            with self._funded_king_lock:
-                if self._rolling_king_host_era == era.index:
-                    host = self._funded_king_host
+        if host is None and self._rolling_king_host_era == era.index:
+            host = self._funded_king_host          # unlocked snapshot (atomic read)
+        sku = str(self.__dict__.get("_king_pod_sku", "") or "")
         if host is not None:
             _quarantine_lane_host(host, f"king pod {getattr(host, 'name', host)}: {reason}")
         if "unreachable" in str(reason):
             # A king pod lost mid-leg counts toward its GPU type's cooldown.
-            _note_pod_loss(str(self.__dict__.get("_king_pod_sku", "") or ""),
-                           f"king-era{era.index}", reason)
+            _note_pod_loss(sku, f"king-era{era.index}", reason)
+        held = self._king_slot_still_holds(era, host)
+        if held is None:
+            # The rent lock is busy: decide later, off this thread, and only
+            # against the pod identified above — never whatever holds the slot
+            # when the lock frees.
+            def _later() -> None:
+                if self._king_slot_still_holds(era, host, timeout=KING_RETIRE_WAIT_S):
+                    self._rolling_retire_king_pod(era)
+                else:
+                    log.warning("rolling: era %d king pod rotation — a replacement pod "
+                                "took the king slot; the failed pod's teardown is skipped "
+                                "(its host is quarantined)", era.index)
+            threading.Thread(target=_later, name=f"rotate-king-{era.index}",
+                             daemon=True).start()
+            return
+        if not held:
+            log.warning("rolling: era %d king pod rotation — a replacement pod holds the "
+                        "king slot; the failed pod's teardown is skipped (its host is "
+                        "quarantined)", era.index)
+            return
         self._rolling_retire_king_pod(era)
+
+    def _king_slot_still_holds(self, era, failed_host, *, timeout: float = 0.0):
+        """Whether the era's king slot still holds the FAILED pod (or nothing)
+        — the only state in which a by-name king teardown cannot hit a
+        replacement pod. ``None`` = the rent lock stayed busy for ``timeout``
+        seconds (0 = do not wait), i.e. a (re-)rent may be in progress."""
+        got = (self._funded_king_lock.acquire(blocking=False) if timeout <= 0
+               else self._funded_king_lock.acquire(timeout=timeout))
+        if not got:
+            return None
+        try:
+            cur = self.__dict__.get("_rolling_king_hosts", {}).get(era.index)
+            if cur is None and self._rolling_king_host_era == era.index:
+                cur = self._funded_king_host
+        finally:
+            self._funded_king_lock.release()
+        if cur is None or failed_host is None:
+            return cur is None
+        if cur is failed_host:
+            return True
+        return ((getattr(cur, "host", None), getattr(cur, "port", None))
+                == (getattr(failed_host, "host", None), getattr(failed_host, "port", None)))
 
     def _rolling_bench_king(self, entry, era) -> dict | None:
         import dataclasses
