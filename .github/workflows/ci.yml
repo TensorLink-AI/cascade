@@ -21,6 +21,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Prepare isolated TLS trust for the CI job
+        run: python3 scripts/prepare_ci_tls.py "$RUNNER_TEMP/cascade-ca" >> "$GITHUB_ENV"
+
       - name: Install uv
         uses: astral-sh/setup-uv@v5
         with:

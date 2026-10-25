@@ -1375,6 +1375,12 @@ requests. Before installing dependencies, `--system-only` checks OS/custom
 trust without requiring certifi. A clean result covers these stores in that
 interpreter; it does not establish whether earlier traffic was intercepted.
 
+Hosted CI uses `scripts/prepare_ci_tls.py` before dependency downloads. It
+copies the runner's CA bundle into a job-local store, removes only the four
+known affected root fingerprints, and points Python, Git and HTTP clients at
+that store. The unchanged trust checker must then pass. This does not modify
+the runner's OS store or replace patching production hosts.
+
 The pod bootstrap transfers the orchestrator's patched `uv` over SSH and
 checks its SHA-256 before use. The local binary and worker must use compatible
 CPU architectures; `CASCADE_UV_BIN` can select the vetted binary. It checks
