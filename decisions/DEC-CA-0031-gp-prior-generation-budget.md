@@ -50,7 +50,7 @@ entire −11.77%. The priors were *permitted* but not *expressible*.
    threads and `multiprocessing` stays blocked — multi-core BLAS burns the
    budget faster, which is now documented instead of discovered.
 
-3. **The factorisation is documented, not discovered** (docs/MINER.md §1a):
+3. **The factorisation is documented, not discovered** (docs/INTERFACE.md, "Compute-heavy priors"):
    relative-jitter Cholesky — diagonal nudge scaled to the kernel's mean
    diagonal, escalating ×10 per retry — replaces the Cholesky→SVD fallback
    pattern. Measured: ~5× per GP draw, SVD fallbacks 47 → 0 per corpus.

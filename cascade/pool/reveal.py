@@ -49,13 +49,16 @@ SENTINEL_MIN_BLOCK = 10**11
 SHA_MARKER = "POOL_SHA256"
 
 
-def reveal_dir_name(meta: PoolSnapshotMeta) -> str:
+def reveal_dir_name(meta: PoolSnapshotMeta, prefix: str = "pool") -> str:
     """HF folder for one revealed snapshot. Date-prefixed so listings sort
     chronologically; block-suffixed so the mapping to a round's pinned
     ``pool_ref`` is explicit. Distinct from the legacy date-only dirs, which
-    were non-exact rebuilds and are left untouched."""
+    were non-exact rebuilds and are left untouched. A non-lane-A pool
+    (e.g. MarketCast's ``[marketcast] pool_prefix``) reveals under its own
+    ``<prefix>/`` folder."""
     day = meta.as_of or "unknown"
-    return f"snapshots/{day}-block-{meta.effective_block}"
+    base = f"snapshots/{day}-block-{meta.effective_block}"
+    return base if prefix == "pool" else f"{prefix}/{base}"
 
 
 def select_reveals(
@@ -86,6 +89,7 @@ def reveal_snapshots(
     keep_newest: int = 2,
     max_reveal: int = 6,
     work_dir: Path | str = "./_reveal_stage",
+    prefix: str = "pool",
 ) -> int:
     """Mirror retired snapshot tars from the pool bucket to the public HF repo.
 
@@ -104,7 +108,7 @@ def reveal_snapshots(
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
     from huggingface_hub import HfApi  # hippius extra; lazy like the HF script
 
-    index = read_pool_index(store)
+    index = read_pool_index(store) if prefix == "pool" else read_pool_index(store, prefix)
     candidates = select_reveals(index, keep_newest=keep_newest)
     if not candidates:
         log.info("reveal: no retired snapshots to reveal (index has %d entries)", len(index))
@@ -119,7 +123,7 @@ def reveal_snapshots(
         if revealed >= max_reveal:
             log.info("reveal: max_reveal=%d reached; remaining backlog next run", max_reveal)
             break
-        dir_name = reveal_dir_name(meta)
+        dir_name = reveal_dir_name(meta, prefix)
         if api.file_exists(hf_repo, f"{dir_name}/{SHA_MARKER}", repo_type="dataset"):
             newest_done = meta
             continue
@@ -136,7 +140,8 @@ def reveal_snapshots(
                 f"reveal_digest_mismatch for {meta.key}: bucket tar {got} != index {meta.sha256}"
             )
 
-        stage = Path(work_dir) / f"block-{meta.effective_block}"
+        stage = Path(work_dir) / (f"block-{meta.effective_block}" if prefix == "pool"
+                                  else f"{prefix}-block-{meta.effective_block}")
         unpack_tar_to_dir(data, stage)
         tar_name = f"block-{meta.effective_block}.tar"
         (stage / tar_name).write_bytes(data)
@@ -164,7 +169,7 @@ def reveal_snapshots(
 
         api.upload_file(
             path_or_fileobj=io.BytesIO(_card(newest_done).encode("utf-8")),
-            path_in_repo="README.md",
+            path_in_repo="README.md" if prefix == "pool" else f"{prefix}/README.md",
             repo_id=hf_repo,
             repo_type="dataset",
             commit_message=f"refresh card (through block-{newest_done.effective_block})",

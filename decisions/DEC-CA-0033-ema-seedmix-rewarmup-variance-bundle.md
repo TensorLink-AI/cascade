@@ -2,16 +2,17 @@
 id: DEC-CA-0033
 type: decision
 title: "The measured variance bundle: EMA finished-form checkpoints, N-seed generation mix, warm-started re-warmup — shipped inert behind drop-when-default"
-status: proposed
+status: accepted
+note: "ema_decay and gen_seed_mix are armed in chain.toml; rewarmup_fraction stays unarmed."
 date: 2026-08-26
 tags: [cascade, training-recipe, seed-variance, ema, lr-schedule, wsd, contract-digest, fairness]
 revisit_when: "A testnet cascade runs a full round cycle with ema_decay (and optionally gen_seed_mix; rewarmup_fraction stays unarmed per the measured verdict) armed — the gate for the mainnet cut, now folded into DEC-CA-0035's single-cut checklist; or DEC-CA-0029's fork-anneal is chosen for the finished-form role instead (then ema_decay stays 0 forever — never arm both); or the 22M size seam arms (re-measure decay=0.999 at size — it was calibrated on ~48k-step heat runs at 4M)"
-relations: {depends_on: DEC-CA-0018, informs: DEC-CA-0017, alternative_to: DEC-CA-0029, measurement_superseded_by: DEC-CA-0035}
+relations: {depends_on: DEC-CA-0018, informs: DEC-CA-0017, alternative_to: DEC-CA-0029}
 ---
 Measured 2026-08-26 on a rented 4×4090 pod: 3 r41 finalist generators × 4
 seed combos × heat-length runs, all scored on the round's exact heat slice
-(bit-deterministic eval; full grid + method in
-docs/notes/2026-08-26-seed-variance-ema.md). Findings that force the design:
+(bit-deterministic eval; full grid + method in a
+working note, never committed). Findings that force the design:
 
 - **Generation seed is the heat's dominant noise term**: a single corpus
   redraw moves an entrant 0.0046–0.0111 geomean — 5–20× the real skill gaps

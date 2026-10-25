@@ -1,16 +1,16 @@
-# systemd unit for the cascade per-round pod provisioner.
+# systemd unit for the cascade provisioner (eval pod + hosts.toml keeper).
 #
 #   cp deploy/cascade-provisioner.service /etc/systemd/system/
 #   systemctl daemon-reload && systemctl enable --now cascade-provisioner
 #
 # DELIBERATELY independent of any trainer unit: the two services meet only
 # through files (hosts.toml, the shared work-root) and either can restart,
-# lag, or die without taking the other down. The trainer without a
-# provisioner trains locally; the provisioner without a trainer still tears
-# its pods down on TTL. Do NOT add Requires=/BindsTo= a trainer unit.
+# lag, or die without taking the other down; the provisioner without a
+# trainer still tears its pods down on TTL. Do NOT add Requires=/BindsTo= a
+# trainer unit.
 
 [Unit]
-Description=cascade per-round GPU pod provisioner (rents heat/final/eval pods, publishes hosts.toml + eval_hosts.toml, tears down per stage)
+Description=cascade provisioner (rents the validator eval pod, publishes hosts.toml + eval_hosts.toml, reaps its ledger)
 Wants=network-online.target
 After=network-online.target
 

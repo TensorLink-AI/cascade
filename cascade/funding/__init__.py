@@ -30,7 +30,7 @@ from .faults import (
     parse_retry_secs,
     should_recover,
 )
-from .queue import FundedEntry, FundedQueue, rounds_needed, select_field
+from .queue import FundedEntry, FundedQueue, select_field
 from .vault import PayerKeyVault
 
 __all__ = [
@@ -42,7 +42,6 @@ __all__ = [
     "is_no_capacity",
     "is_rate_limited",
     "parse_retry_secs",
-    "rounds_needed",
     "select_field",
     "should_recover",
 ]

@@ -1,16 +1,18 @@
-"""``cascade-provisioner`` console script — the per-round pod-rental service.
+"""``cascade-provisioner`` console script — the validator's eval pod and the
+operator's hosts files.
 
-Runs BESIDE the trainer (same box or same work-root mount), never inside it:
-the trainer holds the wallet and the round logic; this service holds only
-provider API keys and an SSH key, and its whole job is to make the trainer's
-``--remote-hosts`` file point at healthy rented GPUs at the right time and to
-make the bill stop the moment each stage is done.
+Runs BESIDE the trainer, never inside it: this service holds only provider API
+keys and an SSH key. It rents the validator's eval-offload pod per published
+round (``[provisioner.eval]``), keeps the trainer's ``hosts.toml`` rendered
+from the operator's static fragment and hand-added lanes, and reaps what its
+ledger owns. The trainer rents its own pods (payer legs, the era king).
 
-Configuration is a small TOML (see ``scripts/provision.example.toml``) for the
-rental policy plus the trainer's own ``chain.toml`` for the round shape
-(``[round] epoch_blocks``, ``[training] target_train_hours``, the image-digest
-pin). ``--dry-run`` walks the full trigger→count→size→budget pipeline and logs
-what it WOULD rent, renting nothing.
+Configuration is a small TOML (see ``scripts/provision.example.toml``) plus the
+trainer's ``chain.toml`` (epoch grid for the TTL, the image-digest pin).
+``--dry-run`` logs what it WOULD rent, renting nothing. Tables and keys of the
+retired per-round heat/final fleet (``[provisioner.heat]``,
+``[provisioner.final]``, ``trigger_*``, ``escalate_deadline_s``, …) are
+accepted and ignored.
 """
 
 from __future__ import annotations
@@ -36,7 +38,7 @@ from .core import (
     wait_ssh_reachable,
 )
 from .health import PROVISIONED_SENTINEL, HealthGate, HealthReport, _sha256_of
-from .loop import PodProfile, ProvisionerLoop, RenderSettings, parse_plan_output
+from .loop import PodProfile, ProvisionerLoop, RenderSettings
 from .policy import ProvisionPolicy, SkuCandidate, StagePolicy
 
 log = logging.getLogger("cascade.provision.main")
@@ -46,7 +48,7 @@ log = logging.getLogger("cascade.provision.main")
 
 
 def build_stage_policy(raw: dict, stage: str) -> StagePolicy:
-    """One ``[provisioner.heat|final|eval]`` table → a validated :class:`StagePolicy`."""
+    """One ``[provisioner.<stage>]`` table → a validated :class:`StagePolicy`."""
     sku = str(raw.get("sku", "")).strip()
     if not sku:
         raise ProvisionError(f"[provisioner.{stage}] sku must be non-empty (the exact "
@@ -64,12 +66,6 @@ def build_stage_policy(raw: dict, stage: str) -> StagePolicy:
     providers = tuple(str(p) for p in raw.get("providers", ("lium", "shadeform")))
     if not providers:
         raise ProvisionError(f"[provisioner.{stage}] providers must list at least one adapter")
-    overhead = float(raw.get("slot_overhead", 1.3))
-    if overhead < 1.0:
-        raise ProvisionError(f"[provisioner.{stage}] slot_overhead must be >= 1.0; got {overhead}")
-    min_slots = int(raw.get("min_slots", 0))
-    if min_slots < 0:
-        raise ProvisionError(f"[provisioner.{stage}] min_slots must be >= 0; got {min_slots}")
     candidates = []
     for i, c in enumerate(raw.get("candidate", ())):
         csku = str(c.get("sku", "")).strip()
@@ -83,106 +79,42 @@ def build_stage_policy(raw: dict, stage: str) -> StagePolicy:
         candidates.append(SkuCandidate(sku=csku, market_sku=str(c.get("market_sku", "")).strip(),
                                        gpus_per_pod=cgpus, max_price_hr=cprice))
     return StagePolicy(sku=sku, gpus_per_pod=gpus, max_pods=max_pods,
-                       providers=providers, max_price_hr=price, slot_overhead=overhead,
-                       min_slots=min_slots,
+                       providers=providers, max_price_hr=price,
                        market_sku=str(raw.get("market_sku", "")).strip(),
                        candidates=tuple(candidates))
 
 
-def build_policy(raw: dict, *, epoch_blocks: int) -> ProvisionPolicy:
+def build_policy(raw: dict) -> ProvisionPolicy:
     """The ``[provisioner]`` tree → a validated :class:`ProvisionPolicy`.
 
-    ``epoch_blocks`` comes from chain.toml so the margin check runs against the
-    REAL round cadence: a margin >= the epoch would trigger permanently.
-    """
+    ``[provisioner.eval]`` is optional — absent (or ``max_pods = 0``) the eval
+    stage does not exist and validators eval locally."""
     top = raw.get("provisioner", raw)
-    for stage in ("heat", "final"):
-        if stage not in top:
-            raise ProvisionError(f"provision config needs a [provisioner.{stage}] table")
-    # [provisioner.eval] is OPTIONAL — the elastic validator eval pod. Absent
-    # (or max_pods = 0) the stage does not exist: pre-eval configs keep their
-    # exact behaviour, which is why it is not in the required loop above.
     eval_sp = build_stage_policy(top["eval"], "eval") if "eval" in top else None
-    # Size-conditional final stages (DEC-CA-0027): any NAMED sub-table of
-    # [provisioner.final] carrying a "sku" key (e.g. [provisioner.final.large])
-    # is an alternate final fleet, selected at startup when the throne size's
-    # per-size expected_gpu names its silicon (see policy.select_final_stage).
-    # [[provisioner.final.candidate]] is an array (not a dict), so the SKU
-    # ladder never parses as an alternate.
-    final_alternates = tuple(
-        build_stage_policy(sub, f"final.{name}")
-        for name, sub in top["final"].items()
-        if isinstance(sub, dict) and "sku" in sub
-    )
-    offset = int(top.get("trigger_offset_blocks", 0))
-    if offset:
-        if not 0 < offset < epoch_blocks:
-            raise ProvisionError(
-                f"trigger_offset_blocks={offset} must be in (0, epoch_blocks={epoch_blocks})")
-        # Derived per tick from the epoch in force; this is the startup value.
-        margin = epoch_blocks - offset
-    else:
-        margin = int(top.get("trigger_margin_blocks", 25))
-        if not 0 < margin < epoch_blocks:
-            raise ProvisionError(
-                f"trigger_margin_blocks={margin} must be in (0, epoch_blocks={epoch_blocks}). "
-                "A PINNED margin does not survive a cadence change — prefer "
-                "trigger_offset_blocks (blocks after the boundary), which tracks it.")
     max_spend = float(top.get("max_spend_per_round", 0))
     if max_spend <= 0:
         raise ProvisionError(f"max_spend_per_round must be > 0 USD; got {max_spend}")
     ttl_epochs = int(top.get("ttl_epochs", 1))
     if ttl_epochs < 1:
         raise ProvisionError(f"ttl_epochs must be >= 1; got {ttl_epochs}")
-    return ProvisionPolicy(
-        heat=build_stage_policy(top["heat"], "heat"),
-        final=build_stage_policy(top["final"], "final"),
-        final_alternates=final_alternates,
-        eval=eval_sp,
-        trigger_margin_blocks=margin,
-        trigger_offset_blocks=offset,
-        max_spend_per_round=max_spend,
-        ttl_epochs=ttl_epochs,
-    )
+    return ProvisionPolicy(max_spend_per_round=max_spend, ttl_epochs=ttl_epochs, eval=eval_sp)
+
+
+def provider_names(raw: dict, policy: ProvisionPolicy) -> list[str]:
+    """Every provider adapter the service needs: the eval stage's, plus any a
+    retired ``[provisioner.heat|final]`` table names — a ledger leftover of
+    the old fleet must still be reachable for its TTL teardown and the
+    orphan reaper."""
+    top = raw.get("provisioner", raw)
+    names = list(policy.eval.providers) if policy.eval is not None else []
+    for stage in ("heat", "final"):
+        names += [str(p) for p in (top.get(stage, {}) or {}).get("providers", ())]
+    return list(dict.fromkeys(names))
 
 
 # ── real boundaries (adapter surface, not unit-tested) ───────────────────────
 
 
-def plan_argv(chain_toml: Path | None, work_root: Path, network: str | None) -> list[str]:
-    """The exact ``--plan-only`` invocation. The network MUST be forwarded:
-    the trainer CLI defaults to finney, so an unforwarded testnet provisioner
-    counts the field on MAINNET's netuid — someone else's subnet — and plans
-    eligible=0 every round (observed live: three consecutive windows)."""
-    argv = ["uv", "run", "cascade-trainer", "--plan-only", "--work-root", str(work_root)]
-    if chain_toml is not None:
-        argv += ["--chain-toml", str(chain_toml)]
-    if network is not None:
-        argv += ["--network", network]
-    return argv
-
-
-def make_plan_fn(chain_toml: Path | None, work_root: Path,
-                 network: str | None = None) -> callable:
-    """The COUNT boundary: run ``cascade-trainer --plan-only`` and parse its JSON.
-
-    Through ``uv run`` so the trainer resolves in the project venv regardless
-    of how the provisioner itself was launched (systemd's PATH is minimal).
-    The subprocess needs no wallet and no GPU — it only counts the field.
-    """
-    argv = plan_argv(chain_toml, work_root, network)
-
-    def plan() -> dict:
-        try:
-            proc = subprocess.run(argv, capture_output=True, text=True, timeout=600)
-        except subprocess.TimeoutExpired as e:
-            raise ProvisionError("--plan-only timed out after 600s") from e
-        if proc.returncode != 0:
-            raise ProvisionError(
-                f"--plan-only failed (rc={proc.returncode}): {(proc.stderr or '')[-500:]}")
-        return parse_plan_output(proc.stdout or "")
-
-    return plan
 
 
 def make_health_check(policy: ProvisionPolicy, render: RenderSettings, *,
@@ -200,11 +132,11 @@ def make_health_check(policy: ProvisionPolicy, render: RenderSettings, *,
               sku: str = "", gpus: int = 0, attested_digest: str = "",
               adopted: bool = False) -> HealthReport:
         prof = render.profile_for(provider)
-        sp = {"heat": policy.heat, "final": policy.final, "eval": policy.eval}.get(stage)
+        sp = policy.eval if stage == "eval" else None
         # The gate asserts what was ACTUALLY rented — with SKU fallback the
-        # round's device can be any configured candidate, not just the primary.
-        # The loop always passes the rented candidate's sku/gpus, so the stage
-        # policy is only a fallback (and eval's may legitimately be None).
+        # device can be any configured candidate, not just the primary. The
+        # loop always passes the rented sku/gpus (adopted pods: the ledger's),
+        # so the stage policy is only a fallback.
         gate_sku = sku or (sp.sku if sp is not None else "")
         gate_gpus = gpus or (sp.gpus_per_pod if sp is not None else 1)
         key = (stage, provider, gate_sku, gate_gpus)
@@ -236,34 +168,6 @@ def make_health_check(policy: ProvisionPolicy, render: RenderSettings, *,
     return check
 
 
-def make_live_legs_probe(render: RenderSettings, *, timeout: float = 60.0) -> callable:
-    """``live_legs(addr, provider) -> int | None`` over the same ssh transport.
-
-    Counts processes whose command line names the training worker module
-    (``pgrep -fc``; the dispatch wrapper matches too, which only inflates a
-    non-zero count). ``pgrep`` exits 1 for "no match" (⇒ 0 legs); any other
-    failure — ssh refused, timeout, remote error — is ``None``: an
-    unreachable pod is not proof that it is idle.
-    """
-    from ..trainer.remote import RemoteHost, build_ssh_argv, run_ssh
-
-    def probe(addr, provider: str = "") -> int | None:
-        prof = render.profile_for(provider)
-        host = RemoteHost(name="legs-probe", host=addr.ip, port=addr.ssh_port,
-                          user=prof.user, key_path=render.key_path, workdir=prof.workdir)
-        argv = ["pgrep", "-fc", "cascade[.]trainer[.]worker"]
-        proc = run_ssh(build_ssh_argv(host, shlex.join(argv)), timeout=timeout)
-        if proc.returncode == 0:
-            try:
-                return int((proc.stdout or "0").strip() or 0)
-            except ValueError:
-                return None
-        if proc.returncode == 1:
-            return 0
-        return None
-
-    return probe
-
 
 def make_bootstrap(script: Path, render: RenderSettings, *,
                    timeout_s: float, pod_user: str,
@@ -281,11 +185,8 @@ def make_bootstrap(script: Path, render: RenderSettings, *,
 
     def _auth_ready(addr, user: str) -> bool:
         """Marketplace pods inject SSH keys well AFTER sshd answers TCP — lium
-        ~30-60s, hyperstack VMs (shadeform VM-mode) 7-8+ MINUTES of cloud-init
-        (observed live 2026-07-15: eval pod killed at t+27s pre-gate; then a
-        healthy 4xA6000s burned at 180s AND 420s — auth landed ~1 min after
-        the 420s expiry). Poll a no-op ssh
-        until auth lands or the wait expires."""
+        ~30-60s, hyperstack VMs (shadeform VM-mode) 7-8+ MINUTES of cloud-init.
+        Poll a no-op ssh until auth lands or the wait expires."""
         import time as _t
 
         argv = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10",
@@ -297,8 +198,7 @@ def make_bootstrap(script: Path, render: RenderSettings, *,
         #  * "Connection refused" = sshd/port DOWN. The pod already passed the
         #    TCP reachability gate before bootstrap, so a port that is now
         #    refused is a lemon that won't recover; fail fast (dead_port_cap)
-        #    so the replacement rents while the market still has offers
-        #    (a 15-min wait on a dead port dried up lium's 2x pool, 2026-07-15).
+        #    so the replacement rents while the market still has offers.
         dead_port_cap = min(150.0, auth_wait_s)
         t0 = _t.monotonic()
         last_err = ""
@@ -348,33 +248,13 @@ def make_bootstrap(script: Path, render: RenderSettings, *,
     return bootstrap
 
 
-def _compose_pod_hooks(*hooks) -> callable | None:
-    """Run several post-health-gate pod hooks in order, isolating failures —
-    one hook's error must never eat the next (each is independently
-    best-effort). None entries drop; all-None composes to None."""
-    live = [h for h in hooks if h is not None]
-    if not live:
-        return None
-    if len(live) == 1:
-        return live[0]
-
-    def run(addr, stage: str, provider: str = "") -> None:
-        for h in live:
-            try:
-                h(addr, stage, provider)
-            except Exception as e:  # noqa: BLE001 — hooks never gate a healthy pod
-                log.warning("pod hook %s errored on %s (ignored): %s",
-                            getattr(h, "__name__", h), addr.ip, e)
-
-    return run
-
 
 def digest_env_command(digest: str, *, user: str = "root") -> str:
     """The remote ``sh`` payload that PINS ``CASCADE_TRAIN_IMAGE_DIGEST`` on a pod.
 
     Idempotent by construction: any existing assignment line is sed-deleted
     before the fresh one appends, so re-running (re-gated pod, provisioner
-    restart, next round on a survivor) converges instead of accumulating.
+    restart, a later rental on a survivor) converges instead of accumulating.
     Two targets, both needed:
 
     * ``/etc/environment`` — pam_env applies it to every new SSH session, so
@@ -415,20 +295,17 @@ def make_config_push(render: RenderSettings, *, box_chain_toml: str,
     ``.bashrc`` over the same SSH channel (``image_digest``, the chain.toml
     ``[training] train_image_digest`` pin; empty ⇒ skipped).
 
-    The env pin is the permanent fix for the r47/r48 shadeform VM-boot
-    failure: the launch-time ``CASCADE_TRAIN_IMAGE_DIGEST`` env never lands
-    in ``/etc/environment`` on VM-boot pods, so SSH dispatches inherited the
-    STALE digest the image baked at CI time and final-mode workers refused
-    the round (TrainImageMismatch) — worked around by a manual ssh patcher
-    script every round until this hook.
+    The env pin exists because the launch-time ``CASCADE_TRAIN_IMAGE_DIGEST``
+    env never lands in ``/etc/environment`` on VM-boot pods, so SSH dispatches
+    would inherit the STALE digest the image baked at CI time and workers
+    refuse to train (TrainImageMismatch).
 
     Image-boot pods carry the chain.toml the worker image was BUILT with,
     while the box's deployed copy is the operational authority and drifts
-    legitimately between image rotations — [storage] hf_backup_repo arming
-    (2026-08-27) being the live example: the checkpoint-upload HF fallback
-    stayed silently dark on every new pod because the baked copy still said
-    "". [training] is identical in both by invariant (a divergence would
-    break the round's contract digest before this hook could matter); the
+    legitimately between image rotations (e.g. arming [storage]
+    hf_backup_repo would stay silently dark on every new pod). [training] is
+    identical in both by invariant (a divergence would break the contract
+    digest before this hook could matter); the
     push keeps the OTHER sections honest without an image rotation.
     Best-effort: a failed push leaves the baked copy — exactly the pre-hook
     behaviour."""
@@ -489,55 +366,6 @@ def make_config_push(render: RenderSettings, *, box_chain_toml: str,
     return config_push
 
 
-def make_bench_prewarm(render: RenderSettings, *, pod_user: str) -> callable:
-    """The bench-data PRE-WARM hook: fire a detached benchmark-data download on
-    a freshly gated FINAL pod, so the multi-hour final training — not the bench
-    window — absorbs the cold ~4.4G pull (the exit-124 king-leg failure mode,
-    three rounds running). Best-effort and fast: the SSH only LAUNCHES the
-    detached download (60s cap); any failure is logged and ignored — the
-    bench's own marker-guarded download remains the backstop, exactly as
-    before this hook existed.
-
-    The download authenticates with ``$HF_BENCH_TOKEN`` — NEVER ``$HF_TOKEN``.
-    The pre-warm runs concurrently with the round's generator fetches, which
-    share one account quota per token; on 2026-08-30 (r51) the pre-warm's
-    thousands of tiny-file API calls pinned ``HF_TOKEN``'s quota at zero and
-    429-starved both finalists' HF-hosted generator fetches to the brink of a
-    terminal drop. Unset, the download runs anonymous (per-IP quota, a
-    separate pool) — slower, but the bench-time marker guard remains the
-    backstop and runs post-duel when the shared token is idle."""
-    import os
-
-    def prewarm(addr, stage: str, provider: str = "") -> None:
-        if stage != "final":
-            return
-        token = os.environ.get("HF_BENCH_TOKEN") or None
-        prof = render.profile_for(provider)
-        user = prof.user if provider else pod_user
-        from ..trainer.bench_hook import build_prewarm_remote_command
-
-        cmd = build_prewarm_remote_command(prof.workdir, hf_token=token is not None)
-        argv = ["ssh", "-p", str(addr.ssh_port), "-i", os.path.expanduser(render.key_path),
-                "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
-                "-o", "ConnectTimeout=15", f"{user}@{addr.ip}", cmd]
-        payload = f"HF_TOKEN={shlex.quote(token)}\n" if token else None
-        try:
-            proc = subprocess.run(argv, input=payload, capture_output=True,
-                                  text=True, timeout=60)
-        except subprocess.TimeoutExpired:
-            log.warning("bench pre-warm launch timed out on %s:%s (ignored)",
-                        addr.ip, addr.ssh_port)
-            return
-        if proc.returncode != 0:
-            log.warning("bench pre-warm launch failed on %s:%s (rc=%d, ignored): %s",
-                        addr.ip, addr.ssh_port, proc.returncode,
-                        (proc.stderr or "")[-300:])
-        else:
-            log.info("bench pre-warm launched on final pod %s:%s",
-                     addr.ip, addr.ssh_port)
-
-    return prewarm
-
 
 def make_hippius_probe(storage) -> callable:
     """A reachability probe for the manifest store (health check #6).
@@ -566,17 +394,17 @@ def make_hippius_probe(storage) -> callable:
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="cascade-provisioner",
-        description="Per-round GPU pod provisioner for the cascade trainer.",
+        description="Eval-pod provisioner + hosts-file keeper for cascade.",
     )
     p.add_argument("--config", type=Path, required=True,
                    help="Provisioner TOML (see scripts/provision.example.toml).")
     p.add_argument("--chain-toml", type=Path, default=None,
-                   help="The trainer's chain.toml (round cadence, budgets, image pin).")
+                   help="The trainer's chain.toml (epoch grid, image pin).")
     p.add_argument("--work-root", type=Path, default=Path("./_train_work"),
-                   help="The TRAINER's work root (shared): heat_complete.json is watched here.")
+                   help="Default home of the ledger (provisioner_state.json).")
     p.add_argument("--network", default="finney")
     p.add_argument("--dry-run", action="store_true",
-                   help="Walk trigger→count→size→budget and log intended rentals; rent nothing.")
+                   help="Log intended rentals; rent nothing.")
     p.add_argument("--once", action="store_true", help="Run a single cycle and exit.")
     p.add_argument("--log-level", default="INFO",
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
@@ -592,14 +420,13 @@ def main(argv: list[str] | None = None) -> int:
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     # UNMUTABLE service logging: bittensor's in-process logging machinery
     # reconfigures the root logger when the chain client first connects, which
-    # silently swallowed every provisioner log after cycle 1 (observed live
-    # 2026-07-14: 3h of invisible-but-working loop, then an invisible trigger
-    # failure). Give the cascade tree its OWN handler and stop propagating —
-    # nothing bittensor does to root can mute us again.
+    # would silently swallow every provisioner log after cycle 1. Give the
+    # cascade tree its OWN handler and stop propagating — nothing bittensor
+    # does to root can mute us again.
     # bittensor's logging init STRIPS handlers and raises the level to
-    # CRITICAL on named loggers whenever a chain client connects (verified
-    # live 2026-07-14: same logger object, handlers=[] and level=50 after
-    # ChainClient.from_config). A one-time setup therefore cannot survive —
+    # CRITICAL on named loggers whenever a chain client connects (handlers=[]
+    # and level=50 after ChainClient.from_config). A one-time setup therefore
+    # cannot survive —
     # ensure_service_logging() re-asserts idempotently and the loop calls it
     # at EVERY cycle start (ProvisionerLoop.on_cycle).
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -690,37 +517,7 @@ def _run(args) -> int:
 
     raw = tomllib.loads(Path(args.config).read_text(encoding="utf-8"))
     top = raw.get("provisioner", {})
-    policy = build_policy(raw, epoch_blocks=cfg.round.epoch_blocks)
-
-    # Size-conditional final fleet (DEC-CA-0027): resolve the throne sizes'
-    # per-size GPU pin against the configured final stages, once, at startup —
-    # a throne-size change is release-then-activate (chain.toml edit +
-    # restart), so this never needs to move mid-service. A multi-size throne
-    # duels on ONE fleet, so mixed per-size pins are unsupportable — the
-    # LAST throne size (the largest, by convention) wins with a loud warning.
-    throne = cfg.throne_contracts()
-    throne_pins = [c.expected_gpu for c in throne if c.expected_gpu]
-    if len(set(throne_pins)) > 1:
-        log.warning(
-            "throne sizes pin DIFFERENT GPUs %s — one final fleet cannot serve "
-            "both; renting for %r (the last throne size). Split the sizes "
-            "across rounds or align their pins.", throne_pins, throne_pins[-1])
-    from dataclasses import replace as _dc_replace
-
-    from .policy import select_final_stage
-
-    final_sp = select_final_stage(policy, throne_pins[-1] if throne_pins else "")
-    if final_sp is not policy.final:
-        log.info("size-conditional final: throne pins %r -> [provisioner.final] "
-                 "alternate %d×%s(%dx)", throne_pins[-1], final_sp.max_pods,
-                 final_sp.sku, final_sp.gpus_per_pod)
-        policy = _dc_replace(policy, final=final_sp)
-    elif throne_pins and throne_pins[-1] != policy.final.sku:
-        log.warning(
-            "throne size pins %r but no [provisioner.final] stage serves it "
-            "(base final rents %r and its pods will FAIL the health gate) — "
-            "add a [provisioner.final.<name>] alternate with sku = %r",
-            throne_pins[-1], policy.final.sku, throne_pins[-1])
+    policy = build_policy(raw)
 
     image = str(top.get("image", ""))
     if not top.get("bootstrap_script"):
@@ -748,10 +545,8 @@ def _run(args) -> int:
         raise ProvisionError("[provisioner] ssh_key_path is required (private key for hosts.toml)")
     # Per-provider pod profiles MUST attach before anything closes over render:
     # RenderSettings is frozen, so replace() makes a NEW object — a consumer
-    # built earlier keeps the profile-less one. That exact bug ran every
-    # shadeform bootstrap as root@ (default profile) while the config said
-    # user="shadeform": three healthy 4xA6000s burned across two rental
-    # windows before the probe's stderr exposed the wrong user (2026-07-15).
+    # built earlier keeps the profile-less one (and would bootstrap a
+    # shadeform pod as root@ while the config says user="shadeform").
     profiles = {
         name: PodProfile(
             user=str(t.get("user", "root")),
@@ -762,29 +557,6 @@ def _run(args) -> int:
     }
     if profiles:
         render = replace(render, profiles=profiles)
-
-    # Rules of escalation (loop tunables, not policy — see
-    # ProvisionerLoop._rent_stage_escalating for the rules themselves).
-    escalate_deadline_s = float(top.get("escalate_deadline_s", 1800.0))
-    if escalate_deadline_s < 0:
-        raise ProvisionError(
-            f"escalate_deadline_s must be >= 0 (0 disables escalation); "
-            f"got {escalate_deadline_s}")
-    min_viable_fleet = float(top.get("min_viable_fleet", 0.5))
-    if not 0.0 <= min_viable_fleet <= 1.0:
-        raise ProvisionError(
-            f"min_viable_fleet must be in [0, 1] (0 disables top-up); "
-            f"got {min_viable_fleet}")
-    rent_retry_cooldown_s = float(top.get("rent_retry_cooldown_s", 900.0))
-    if rent_retry_cooldown_s < 0:
-        raise ProvisionError(
-            f"rent_retry_cooldown_s must be >= 0 (0 disables within-round "
-            f"retry); got {rent_retry_cooldown_s}")
-    final_rent_on = str(top.get("final_rent_on", "margin"))
-    if final_rent_on not in ("margin", "heat_complete"):
-        raise ProvisionError(
-            f"final_rent_on must be 'margin' or 'heat_complete'; got {final_rent_on!r}")
-    max_duds_per_stage = int(top.get("max_duds_per_stage", 8))
 
     hosts_path = Path(top.get("hosts_path", "hosts.toml"))
     work_root = Path(args.work_root)
@@ -802,14 +574,14 @@ def _run(args) -> int:
         raise ProvisionError("eval_hosts_path must differ from hosts_path — the "
                              "validator's eval file must never clobber the trainer's fleet")
 
-    # Operator's static [[host]] entries (e.g. a long-lived final pod) — appended
+    # Operator's static [[host]] entries (e.g. a long-lived operator lane) — appended
     # verbatim to every hosts.toml publish so provisioner activity never drops them.
     static_hosts_text = ""
     static_path = None
     if top.get("static_hosts"):
         static_path = Path(top["static_hosts"])
         static_hosts_text = static_path.read_text(encoding="utf-8")
-        from ..trainer.remote import load_hosts  # validate NOW, not mid-round
+        from ..trainer.remote import load_hosts  # validate NOW, not mid-service
         try:
             load_hosts(static_path)
         except Exception as e:
@@ -827,14 +599,10 @@ def _run(args) -> int:
             pod_user=str(top.get("pod_user", "root")),
         )
 
-    provider_names = list(dict.fromkeys([
-        *policy.heat.providers, *policy.final.providers,
-        *(policy.eval.providers if policy.eval is not None else ()),
-    ]))
     provider_opts: dict[str, dict] = {}
     if top.get("shadeform_ssh_key_id"):
         provider_opts["shadeform"] = {"ssh_key_id": str(top["shadeform_ssh_key_id"])}
-    providers = {p.name: p for p in build_providers(provider_names, provider_opts)}
+    providers = {p.name: p for p in build_providers(provider_names(raw, policy), provider_opts)}
 
     hippius_probe = None
     manifest_store = None
@@ -851,7 +619,6 @@ def _run(args) -> int:
         providers=providers,
         chain_client=ChainClient.from_config(cfg, network=args.network),
         chain_client_factory=lambda: ChainClient.from_config(cfg, network=args.network),
-        plan_fn=make_plan_fn(args.chain_toml, work_root, args.network),
         render=render,
         hosts_path=hosts_path,
         work_root=work_root,
@@ -860,11 +627,6 @@ def _run(args) -> int:
         epoch_blocks_prev=cfg.round.epoch_blocks_prev,
         epoch_activation_block=cfg.round.epoch_activation_block,
         activation_fn=_activation_fn,
-        # Per-size budget hours (DEC-CA-0027): the final's time envelope is the
-        # longest throne size's target_train_hours (SizeSpec override or the
-        # base) — with a single primary-size throne this is exactly the old
-        # cfg.training.target_train_hours.
-        final_hours=max(c.target_train_hours for c in throne),
         manifest_store=manifest_store,
         eval_hosts_path=eval_hosts_path,
         receipt_prefix=receipt_prefix,
@@ -876,29 +638,13 @@ def _run(args) -> int:
             code_fingerprint=cfg.round.worker_code_fingerprint,
         ),
         bootstrap=bootstrap,
-        prewarm=_compose_pod_hooks(
-            make_config_push(render, box_chain_toml=str(args.chain_toml),
-                             pod_user=str(top.get("pod_user", "root")),
-                             image_digest=cfg.training.train_image_digest),
-            (make_bench_prewarm(render,
-                                pod_user=str(top.get("pod_user", "root")))
-             if cfg.scoring.cascade_enabled else None),
-        ),
+        prewarm=make_config_push(render, box_chain_toml=str(args.chain_toml),
+                                 pod_user=str(top.get("pod_user", "root")),
+                                 image_digest=cfg.training.train_image_digest),
         static_hosts_text=static_hosts_text,
         static_hosts_path=static_path,
-        live_legs=make_live_legs_probe(render),
         ssh_probe=lambda ip, port: wait_ssh_reachable(ip, port, timeout=300.0),
         poll_seconds=float(top.get("poll_seconds", 30.0)),
-        escalate_deadline_s=escalate_deadline_s,
-        min_viable_fleet=min_viable_fleet,
-        rent_retry_cooldown_s=rent_retry_cooldown_s,
-        final_rent_on=final_rent_on,
-        max_duds_per_stage=max_duds_per_stage,
-        # Cascade duel-bench teardown hold: armed ONLY while [scoring]
-        # cascade_enabled — off, the trainer never writes the marker and this
-        # stays 0, so final-pod teardown is byte-identical to before.
-        bench_hold_max_hours=(cfg.eval.bench_hold_max_hours
-                              if cfg.scoring.cascade_enabled else 0.0),
         dry_run=bool(args.dry_run),
         on_cycle=globals().get("_ensure_service_logging"),
     )
@@ -906,12 +652,9 @@ def _run(args) -> int:
                  or eval_hosts_path is None
                  else f"{policy.eval.max_pods}×{policy.eval.sku}"
                       f"({policy.eval.gpus_per_pod}x)→{eval_hosts_path}")
-    log.info("provisioner up: heat=%d×%s(%dx) final=%d×%s(%dx) eval=%s margin=%d blocks "
-             "cap=$%.2f/round ttl=%d epoch(s)%s",
-             policy.heat.max_pods, policy.heat.sku, policy.heat.gpus_per_pod,
-             policy.final.max_pods, policy.final.sku, policy.final.gpus_per_pod,
-             eval_desc, policy.trigger_margin_blocks, policy.max_spend_per_round,
-             policy.ttl_epochs, " [DRY RUN]" if args.dry_run else "")
+    log.info("provisioner up: eval=%s cap=$%.2f/rental ttl=%d epoch(s)%s",
+             eval_desc, policy.max_spend_per_round, policy.ttl_epochs,
+             " [DRY RUN]" if args.dry_run else "")
     if args.once:
         loop.run_once()
         return 0

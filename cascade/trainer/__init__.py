@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from .contract import BaseTrainer, RoundSeeds, TrainResult
 from .corpus import CorpusError, CorpusResult, assert_corpus_reproducible, build_corpus
-from .loop import ResolvedGenerator, RoundPlan, TrainerRunner, plan_round, resolve_commitments
+from .loop import ResolvedGenerator, TrainerRunner
 
 __all__ = [
     "BaseTrainer",
@@ -19,8 +19,5 @@ __all__ = [
     "assert_corpus_reproducible",
     "build_corpus",
     "ResolvedGenerator",
-    "RoundPlan",
     "TrainerRunner",
-    "plan_round",
-    "resolve_commitments",
 ]

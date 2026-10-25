@@ -170,10 +170,6 @@ class ChannelStatsAccumulator:
         if partner_z is not None:
             self._partner_z.append(partner_z)
 
-    @property
-    def n_observed(self) -> int:
-        return len(self._corrs)
-
     def summary(self) -> dict | None:
         """One log-ready record, or ``None`` when no multichannel series was
         seen — the trainer then omits the key entirely, keeping univariate

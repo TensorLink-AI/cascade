@@ -1,10 +1,9 @@
 """Starvation + deadline telemetry — the timed corpus shim in the trainer, the
-new metrics, the per-step record field, and the per-round roll-up line.
+new metrics, the per-step record field, and the per-run telemetry line.
 
 TrainResult.metrics never crosses the remote boundary (the worker's receipt is
 a metrics-less TrainedEntry), so the per-run key=value line emitted from
-``_train_checkpoint`` is the remote telemetry channel; the roll-up aggregates
-whatever trained in-process.
+``_train_checkpoint`` is the remote telemetry channel.
 """
 
 from __future__ import annotations
@@ -15,8 +14,6 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-
-from cascade.trainer.loop import telemetry_rollup_line
 
 torch = pytest.importorskip("torch")
 
@@ -82,51 +79,15 @@ def test_per_step_record_carries_data_wait_frac(tmp_path: Path, monkeypatch):
     assert all(r["data_wait_frac"] >= 0.0 for r in steps)
 
 
-# ── roll-up line (pure aggregation) ───────────────────────────────────────────
+# ── a leg emits the per-run line (the remote telemetry channel) ──────────────
 
 
-def test_rollup_line_counts_hits_and_percentiles():
-    heats = [
-        {"deadline_hit": True, "data_wait_frac": 0.9},
-        {"deadline_hit": False, "data_wait_frac": 0.1},
-        {"deadline_hit": False, "data_wait_frac": 0.1},
-    ]
-    finals = [
-        {"deadline_hit": True, "data_wait_frac": 0.5},
-        {"deadline_hit": False, "data_wait_frac": 0.1},
-    ]
-    line = telemetry_rollup_line(7, heats, finals)
-    assert line.startswith("round=7 telemetry: deadline_hit 1/3 heats + 1/2 finals")
-    assert "p50=0.100" in line
-    assert "p95=0.820" in line                # interpolated tail over [.1,.1,.1,.5,.9]
-    assert "(5/5 runs reported metrics)" in line
-
-
-def test_rollup_line_skips_metricless_entries_and_notes_count():
-    # A custom BaseTrainer without the telemetry keys, or an empty dict, must
-    # not poison the aggregation — it is skipped and the reported count says so.
-    heats = [{"deadline_hit": False, "data_wait_frac": 0.2}, {"final_loss": 0.1}, {}]
-    line = telemetry_rollup_line("9", heats, [])
-    assert "deadline_hit 0/1 heats + 0/0 finals" in line
-    assert "(1/3 runs reported metrics)" in line
-
-
-def test_rollup_line_without_wait_values_says_na():
-    line = telemetry_rollup_line(1, [{"deadline_hit": True}], [])
-    assert "data_wait_frac n/a" in line
-
-
-# ── the round emits the roll-up + per-run line for local runs ─────────────────
-
-
-def test_round_logs_per_run_line_and_rollup(cfg, tmp_path, monkeypatch, caplog):
-    from cascade.shared.chain import Commitment
+def test_leg_logs_the_per_run_telemetry_line(cfg, tmp_path, monkeypatch, caplog):
     from cascade.shared.hippius import HubRef, HubUpload
     from cascade.trainer import loop as loop_mod
-    from cascade.trainer.contract import TrainResult
-    from cascade.trainer.loop import TrainerRunner
+    from cascade.trainer.contract import RoundSeeds, TrainResult
+    from cascade.trainer.loop import ResolvedGenerator, TrainerRunner
 
-    ref_a = "alice/gen-a@sha256:" + "a" * 64
     ref_b = "bob/gen-b@sha256:" + "b" * 64
     ref_out = "cascade/ckpt-out@sha256:" + "e" * 64
 
@@ -164,17 +125,11 @@ def test_round_logs_per_run_line_and_rollup(cfg, tmp_path, monkeypatch, caplog):
     )
     runner = TrainerRunner(cfg=cfg, base_trainer=_Trainer(), work_root=tmp_path,
                            use_sandbox=False)
-    commits = [
-        Commitment(uid=0, hotkey="a", coldkey=None,
-                   payload=f"metro-v1:gen:hippius:{ref_a}", commit_block=5),
-        Commitment(uid=1, hotkey="b", coldkey=None,
-                   payload=f"metro-v1:gen:hippius:{ref_b}", commit_block=6),
-    ]
     with caplog.at_level("INFO", logger="cascade.trainer"):
-        runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+        runner.train_one(ResolvedGenerator("b", 1, ref_b), "challenger",
+                         RoundSeeds.derive(1, cfg.training), 10)
     msgs = [r.message for r in caplog.records]
-    # one parseable key=value line per run (this is the remote channel too)
+    # one parseable key=value line per run — the only channel a pod run's
+    # telemetry has back to the orchestrator
     assert any("telemetry: deadline_hit=True tokens_frac=0.4 data_wait_s=12.3 "
                "data_wait_frac=0.61" in m for m in msgs)
-    # and the per-round roll-up over everything that trained in-process
-    assert any("round=1 telemetry: deadline_hit" in m and "finals" in m for m in msgs)

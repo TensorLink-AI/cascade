@@ -7,9 +7,6 @@ once at the end. This is what GIFT-Eval reports as "CRPS" and is the
 cascade-canonical default — it is robust to near-zero-mean windows in a way
 that a per-window divide is not. The paired bootstrap in :mod:`.bootstrap`
 resamples the components and applies the divide once per bag.
-
-``crps_ensemble_numpy`` is the Gneiting & Raftery sorted-samples identity,
-``E|X−y| − ½E|X−X'|``, kept for tests and as a per-cell ground-truth CRPS.
 """
 
 from __future__ import annotations
@@ -144,24 +141,3 @@ def geomean_wql_from_components(
         return float("nan")
     return float(np.exp(np.log(np.maximum(wql[valid], floor)).mean()))
 
-
-def crps_ensemble_numpy(samples: np.ndarray, obs: np.ndarray) -> np.ndarray:
-    """Per-cell CRPS via the Gneiting–Raftery sorted-samples identity.
-
-    For m sorted samples, ``CRPS = (1/m) sum_i |x_i - y|
-    - (1/m^2) sum_i (2i - 1 - m) x_(i)``. Returns shape ``(B, H)``.
-    """
-    if samples.ndim != 3:
-        raise ValueError(f"samples must be (B, m, H); got {samples.shape}")
-    if obs.shape != (samples.shape[0], samples.shape[2]):
-        raise ValueError(
-            f"obs shape {obs.shape} incompatible with samples {samples.shape}"
-        )
-    m = samples.shape[1]
-    abs_dev = np.abs(samples - obs[:, None, :])      # (B, m, H)
-    t1 = abs_dev.mean(axis=1)                        # (B, H)
-    sorted_samples = np.sort(samples, axis=1)
-    i = np.arange(1, m + 1, dtype=np.float64)[None, :, None]
-    weights = (2.0 * i - 1.0 - m) / (m * m)
-    t2 = (weights * sorted_samples).sum(axis=1)      # (B, H)
-    return t1 - t2

@@ -1,24 +1,31 @@
 # Building the held-out eval pool
 
-Validators score the king's and challenger's trained models on a **private,
+Validators score the king's and challengers' trained models on a **private,
 rotating pool of real-world series** (`[eval] window_pool`, a Hippius Hub
 `repo@digest`). This doc covers the **producer** side — turning real data into
-that pool — with `cascade.pool` and the `cascade-pool` CLI. The consumer side
+that pool — with `cascade.pool` and the `cascade-pool` CLI. This is an operator
+guide, not a source of training data for miners. The consumer side
 (fetch ref → slice into windows) lives in `cascade.validator.pool` / `.windows`.
+
+**Workflow:** [build locally](#quick-start) → [publish a future-effective snapshot](#daily-rotation--consensus)
+→ [check source coverage](#sources-shipped). MarketCast uses its own
+[forward-observation snapshots](#the-marketcast-pool---lane-mkt-dec-ca-0064).
 
 ## Why this design is hard to game
 
-The eval is only contamination-resistant if a miner's generator cannot
-**distribution-match** the eval set and the trained model cannot **memorise** it.
-The pool leans on three levers:
+The private test should be difficult to reconstruct or memorize before a
+submission. Three choices reduce that risk:
 
-1. **Privacy** — owner-controlled, never published as a named public benchmark.
+1. **Privacy** — active windows stay private; retired windows can be published
+   later. A public benchmark is not a replacement for this pool.
 2. **Freshness** — sources harvest *recent* data up to an `as_of` cutoff; you
-   re-build periodically so each pinned pool rotates in time. Data that didn't
-   exist at submission can't be matched or memorised. (The validator also rotates
-   the *slice* per round via the block hash.)
-3. **Breadth** — multiple real domains at sub-daily frequency, so the only way to
-   score well is to forecast generally, not to fit one distribution.
+   rebuild periodically so snapshots change over time. A/B snapshots may
+   include observations that existed before submission; they do not have
+   MarketCast's strict future-window guarantee. The validator also changes
+   the selected slice each settlement using the block hash.
+3. **Breadth** — multiple real domains reduce the value of fitting one narrow
+   distribution. These controls reduce contamination risk; they do not prove
+   that no miner could reconstruct a source.
 
 Do **not** point the pool at a fixed public benchmark (GIFT-Eval, Monash, …):
 those are the easiest thing for a generator to overfit, and they overlap what
@@ -61,57 +68,50 @@ Window geometry (`context_length` / `horizon`) defaults to `[eval]` in
 `cascade-pool publish` builds a fresh pool, packs it to a deterministic tar,
 uploads it to the pool bucket, and appends it to `pool/index.json` stamped with
 an **`effective_block`** — the epoch-boundary block from which the snapshot is
-active. Each validator, for a round, computes that round's epoch-boundary block
+active. Each validator, for a settlement, computes its epoch-boundary block
 (`created_block` floored to the epoch grid, from the shared manifest) and selects
 the snapshot with the greatest `effective_block ≤ that block` — the **same**
 deterministic choice on every validator, so two validators that polled at
 different times around the daily rollover still score the *identical* pool for a
-given round (no latest-wins divergence). Integrity is the tar's sha256, verified
-on fetch.
+given settlement. Integrity is the tar's sha256, verified on fetch.
 
 The sha256 lives in `pool/index.json`, which is unsigned — so on its own it
 protects against corruption, not against a hostile holder of the bucket's
-write credentials. The trainer therefore **pins** the round's snapshot into
-the signed manifest (`eval_pool_key` + `eval_pool_sha256`, resolved from the
-same pool source its heat screen used): each validator's own snapshot
-selection must match the pinned pair or the round is rejected
+write credentials. The trainer therefore **pins** the settlement's snapshot into
+the signed manifest (`eval_pool_key` + `eval_pool_sha256`, resolved by the
+same selection rule from the trainer's pool source): each validator's own
+snapshot selection must match the pinned pair or the settlement is rejected
 (`pool_pin_mismatch`), so pool integrity descends from the trainer signature
-validators already trust, not from storage ACLs. Unpinned manifests (a
-trainer predating the field, or one running without a pool source) keep the
-legacy index-trust behaviour. Rollout order matters once: deploy this
-validator code everywhere **before** starting a pinning trainer — the pin is
-inside the signed body, so older validators would fail signature verification
-on pinned manifests. Operationally, never publish a snapshot whose
-`effective_block` is at or before an in-flight round's epoch boundary
-(`--effective-block auto` already guarantees this): it would flip validators'
-selection away from the pinned snapshot mid-round.
+validators already trust, not from storage ACLs. A manifest without a pin
+falls back to trusting the index. Never publish a snapshot whose
+`effective_block` is at or before a pending settlement's boundary
+(`--effective-block auto` guarantees this): it would flip validators'
+selection away from the pinned snapshot.
 
 > **Why the block, not the round id.** A round id is the epoch-boundary block
 > *hash* folded to a 64-bit seed (`ChainClient.block_seed`) — deliberately
 > unpredictable, hence non-monotonic. Ordering snapshots by "greatest
 > `effective_round ≤ round_id`" over random seeds is meaningless. The epoch
 > block *number* is monotonic and every validator derives the same value from
-> the manifest's `created_block`, so it is the correct consensus key. (Pool
-> index schema v2 made this switch; a v1 index keyed by `effective_round` still
-> parses — a redeploy republishes under `effective_block`.)
+> the manifest's `created_block`, so it is the correct consensus key. (A v1
+> index keyed by `effective_round` still parses.)
 
 **Invariant the publisher must hold:** a new snapshot's `effective_block` is in
-a *future* epoch (later than the current round). `--effective-block auto` enforces
-this by reading the manifest `latest.json` `created_block`, flooring it to the
-epoch grid, and adding `--round-buffer` epochs (default 1). Never publish a
-snapshot that becomes active for an already-scored round, or validators would
-disagree. (`--effective-round` remains as a deprecated alias; its value is now a
-block.)
+a *future* epoch (later than the latest settlement). `--effective-block auto`
+enforces this by reading the manifest `latest.json` `created_block`, flooring it
+to the epoch grid, and adding `--round-buffer` epochs (default 1). Never publish
+a snapshot that becomes active for an already-scored settlement, or validators
+would disagree. (`--effective-round` is a deprecated alias taking a block.)
 
 Example daily cron on the orchestrator:
 
 ```bash
-# 03:00 UTC daily — fresh windows, active from the next round onward.
+# 03:00 UTC daily — fresh windows, active from the next settlement onward.
 0 3 * * *  cascade-pool publish --as-of "$(date -u +\%F)" --effective-block auto
 ```
 
 Validators pick up new snapshots automatically (they re-read the index each
-round and fetch a snapshot once, cached by digest). No restart, no `chain.toml`
+settlement and fetch a snapshot once, cached by digest). No restart, no `chain.toml`
 change.
 
 ### Backend: Hippius S3 or Cloudflare R2
@@ -196,19 +196,12 @@ versioned here (v1):
 > held-out forecast of a channel beyond its own lags (contemporaneous
 > correlation alone does not admit).
 
-Forge ships the tags first — **inert**, because cascade's builder drops
-multichannel today; cascade's Phase-2 builder reading `mv_channels` and packing
-`(C, L)` windows is the activation, paired with `[scoring] mv_score_from_block`
-(release-then-activate). Until then a tagged source is scored exactly as now.
-
-**When packing turns on.** `cascade-pool publish` packs iff the snapshot's
-`effective_block` is at or past `[scoring] mv_score_from_block` (`--no-mv-pack`
-forces off, `--mv-pack` forces on) — the pool and the scoring rule flip on the
-same epoch boundary by construction. The daily cron targets the NEXT boundary
-after the latest manifest, so the flip boundary itself needs one manual
-`workflow_dispatch` with `effective_block = <mv_score_from_block>` before that
-boundary; every later daily snapshot packs on its own. `--max-channels` is
-raised to the `mv_channels` cap (8) automatically when packing.
+**Packing.** `cascade-pool publish` packs `mv_channels` groups into `(C, L)`
+windows iff the snapshot's `effective_block` is at or past `[scoring]
+mv_score_from_block` (`--no-mv-pack` forces off, `--mv-pack` forces on), so the
+pool and the multivariate scoring rule switch on the same boundary by
+construction. `--max-channels` is raised to the `mv_channels` cap (8)
+automatically when packing.
 
 **Two consumers, deliberately different accounting.** Forge's own benchmark
 expands a coupled group into C univariate challenges (C slots, group-level
@@ -240,9 +233,10 @@ Properties worth knowing:
   are skipped; panel-expanded feeds are capped at 200 series per source.
 
 The defaults produce **~3000 raw series** (Open-Meteo's global grid dominates),
-which clears `[eval] n_windows = 2000` with margin after validation drops — and
-leaves the pool larger than `n_windows`, so each round draws a *different* 2000
-slice (intra-day rotation), on top of the daily snapshot rotation.
+which clears `[eval] n_windows` with margin after validation drops and leaves
+the pool larger than any one draw, so each settlement scores a *different*
+slice — a jittered domain mix of `[eval] mix_target_windows` windows
+(DEC-CA-0019, DEC-CA-0032) — on top of the daily snapshot rotation.
 
 **Scale the pool by data, not code**: make the Open-Meteo grid denser
 (`global_grid(lat_step, lon_step)`), extend `VARIABLES` / `ARTICLES`, or add a
@@ -250,6 +244,79 @@ source. One Open-Meteo call per grid point returns all variables, so a denser
 grid is the cheapest lever. The CLI warns if the pool falls below
 `[scoring] min_windows`. (At ~252 grid points that's ~252 API calls + ~85 for
 Wikimedia per daily build — well within the keyless free tiers.)
+
+### v2 primary pool (DEC-CA-0050)
+
+tsbench-forge is already the only source the production publish cron
+(`.github/workflows/publish-pool.yml`) builds from, so making it the v2
+primary pool is an operator step plus two build-time checks — no validator
+change. Lane B judges each leg per domain, so v2 adds:
+
+* `--require-domain` — drop series whose catalog entry carries no domain
+  (the forge source labels those `unknown`); counted as `missing_domain` in
+  provenance drops. Every window a lane-B verdict reads then has a real label.
+* `--min-series-per-domain N` — the DEC-CA-0032 Part A capacity floor: the
+  build REFUSES to write a snapshot in which any labeled domain holds fewer
+  than `N` series (one window candidate each). v2 uses 300. A refused build
+  publishes nothing, so the previous snapshot stays current — fix the
+  catalog (add feeds to the thin domain), never the floor, per DEC-CA-0032.
+* `--require-source` — the CLI switch for the existing `require_source`
+  builder rule (every series carries its cluster key); turn it on with the
+  other two.
+
+Operator steps:
+
+1. Add the three flags to the `cascade-pool publish` call in
+   `publish-pool.yml`:
+
+   ```bash
+   TSFORGE_DIR=./tsforge cascade-pool publish \
+     --chain-toml "$TOML" --sources tsbench_forge \
+     --max-panel-series-per-feed 5 --max-series-per-domain-freq 300 \
+     --max-series-per-domain 600 --selection balanced \
+     --require-domain --require-source --min-series-per-domain 300 \
+     --effective-block "$EFFECTIVE_BLOCK"
+   ```
+
+2. Dry-run first with `cascade-pool build --out /tmp/v2pool ...` (same flags)
+   against the current mirror and read the `by domain:` line — any domain under
+   300 must be fixed in the forge catalog before the cron flips.
+3. Raise `[scoring] min_clusters` toward ~30 (see the cluster-labels note
+   above) in the same coordinated release that arms lane B.
+
+Signed window scores now carry each window's `domain`
+(`WindowScoreRecord.domain`, drop-when-default), so per-domain statistics and
+lane-B verdicts can be replayed from a receipt alone
+(`cascade.eval.expert_lane.judge_expert_leg` over the paired signed scores).
+
+## The MarketCast pool (`--lane mkt`, DEC-CA-0064)
+
+Lane C has no pool of its own: the DEC-CA-0056 public-feed `pool_c` (and
+`cascade-pool publish --lane c`) is retired, because its windows could be
+scraped and memorised. Lane C's only competition, MarketCast, reads a
+separate signed snapshot of realized market bars under `[marketcast]
+pool_prefix` (`pool_mkt`), built by the main validator (`[netconfig]
+owner_hotkey`):
+
+```bash
+*/1 * * * *  cascade-pool mkt-record-alpha --out /srv/cascade/alpha.jsonl   # one dTAO sample per subnet
+*/5 * * * *  cascade-pool mkt-record --store /srv/cascade/bars              # closed Hyperliquid 1m bars + funding
+30 */6 * * * cascade-pool publish --lane mkt --alpha-rows /srv/cascade/alpha.jsonl \
+                 --bar-store /srv/cascade/bars --wallet-name owner --wallet-hotkey main
+50 5 * * *   cascade-pool reveal  --lane mkt --hf-repo <org>/cascade-eval-pool
+```
+
+- `mkt-record` must run forward from at least `[marketcast] snapshot_days`
+  (21) before arming: Hyperliquid serves only ~3.6 days of 1m candles, so
+  `publish --lane mkt` refuses to run without `--bar-store` (`--allow-cold`
+  builds from the API alone, for testing only). Each pass re-fetches the last
+  `--lookback-hours` (at most ~83 h, the API's 1m depth), so a missed pass
+  inside that window is healed.
+- `publish --lane mkt` signs the snapshot with the given hotkey
+  (`--wallet-*`) and refuses a signer other than `[netconfig] owner_hotkey`
+  (validators would refuse it); `--effective-block` works as for lane A, and
+  `--anchor-block` (default: the chain head) and `--snapshot-days` override
+  what it reads from the chain and `[marketcast]`.
 
 ## Adding a source
 
@@ -269,11 +336,14 @@ future-unknowable but near-random-walk, so use it as a minor domain only.
 
 - **On-disk format** matches `cascade.validator.pool` exactly: one
   `<series_id>.npy` per series (float32; loader upcasts), `metadata.json` keyed by
-  `series_id` → `{freq, seasonal_period, domain}`, plus a `provenance.json` the
+  `series_id` → `{freq, seasonal_period, domain}` with `source` and `dgp_class`
+  when supplied, plus a `provenance.json` the
   loader ignores.
 - **Determinism**: same harvested inputs ⇒ byte-identical directory ⇒ the same
   content pushed to the same Hub repo yields the same OCI `repo@digest`. Re-build
   to audit.
-- **Cleaning**: gaps interpolated (series dropped above `--max-missing-frac`),
-  truncated to the freshest `context_length + horizon` points, short/constant/
-  multi-channel series dropped, exact duplicates de-duplicated.
+- **Cleaning**: gaps interpolated per channel (series dropped above
+  `--max-missing-frac`), tails truncated under the configured keep length,
+  short/constant/invalid series dropped, and exact duplicates removed.
+  Multichannel series are allowed up to the effective `max_channels` limit;
+  a coupled group is not rejected merely for having several channels.

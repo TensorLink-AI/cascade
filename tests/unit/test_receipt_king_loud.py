@@ -21,7 +21,7 @@ from cascade.trainer.loop import TrainerRunner
 
 from .receipt_fixture import make_scored_receipt
 
-bt = pytest.importorskip("bittensor")
+bt = pytest.importorskip("bittensor.sp_core")  # 11.x: Keypair lives in sp_core
 ALICE = bt.Keypair.create_from_uri("//Alice")
 BOB = bt.Keypair.create_from_uri("//Bob")
 

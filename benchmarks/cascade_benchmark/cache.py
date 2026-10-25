@@ -15,9 +15,12 @@ never an error.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
+import math
 import os
 import re
+import tempfile
 from pathlib import Path
 
 
@@ -41,7 +44,38 @@ def cache_key(cache_dir: Path, name: str, term: str, pred_len, n_q: int) -> Path
     data + grid (dataset name, term, prediction length, quantile-grid size); the
     data for a released config is immutable, so this key is stable across rounds."""
     raw = f"{name}__{term}__pl{pred_len}__q{n_q}"
-    return cache_dir / (re.sub(r"[^A-Za-z0-9_.-]", "_", raw) + ".json")
+    suffix = hashlib.sha256(raw.encode()).hexdigest()[:20]
+    return cache_dir / (re.sub(r"[^A-Za-z0-9_.-]", "_", raw)[:160] + f"-{suffix}.json")
+
+
+def scoped_baseline_cache_dir(settings: dict) -> Path | None:
+    """No persistent reuse for unknown/partial data; bind task and scorer too."""
+    from importlib.metadata import PackageNotFoundError, version
+
+    from .datasets import recorded_revision
+
+    root = os.environ.get("CASCADE_BENCH_TIME_DATASET") or os.environ.get("TIME_DATASET")
+    revision = recorded_revision(root) if root else None
+    if not revision or revision == "unknown" or "partial" in revision:
+        return None
+    base = baseline_cache_dir()
+    if base is None:
+        return None
+    try:
+        timebench_version = version("timebench")
+    except PackageNotFoundError:
+        return None  # Unknown numerical dependency identity cannot establish reuse.
+    identity = {"revision": revision, "settings": settings, "timebench": timebench_version,
+                "aggregate": hashlib.sha256((Path(__file__).parent / "aggregate.py").read_bytes()).hexdigest(),
+                "scorer": hashlib.sha256(
+                    (Path(__file__).parent / "suites/time_bench.py").read_bytes()).hexdigest()}
+    digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+    path = base / digest
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+    except OSError:
+        return None
 
 
 def load_baseline(cache_dir: Path | None, name, term, pred_len, n_q: int) -> dict | None:
@@ -52,7 +86,8 @@ def load_baseline(cache_dir: Path | None, name, term, pred_len, n_q: int) -> dic
     if not p.is_file():
         return None
     try:
-        return {k: float(v) for k, v in json.loads(p.read_text(encoding="utf-8")).items()}
+        metrics = {k: float(v) for k, v in json.loads(p.read_text(encoding="utf-8")).items()}
+        return metrics if metrics and all(math.isfinite(v) for v in metrics.values()) else None
     except Exception:  # noqa: BLE001 — a corrupt cache entry just misses
         return None
 
@@ -62,7 +97,15 @@ def store_baseline(cache_dir: Path | None, name, term, pred_len, n_q: int, metri
     if cache_dir is None:
         return
     # A cache write must never fail a task.
-    with contextlib.suppress(Exception):
-        cache_key(cache_dir, name, term, pred_len, n_q).write_text(
-            json.dumps(metrics), encoding="utf-8"
-        )
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", dir=cache_dir, delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(json.dumps(metrics, allow_nan=False))
+        os.replace(temporary, cache_key(cache_dir, name, term, pred_len, n_q))
+    except Exception:  # best-effort cache
+        pass
+    finally:
+        if temporary is not None:
+            with contextlib.suppress(OSError):
+                temporary.unlink(missing_ok=True)

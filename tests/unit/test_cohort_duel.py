@@ -1,9 +1,7 @@
 """The tie-aware cohort duel (DEC-CA-0012).
 
-Covers the three halves of the decision that are shippable ahead of the trainer's
-run-off: the generalised heat tie statistic, the validator judging a whole cohort
-under a family-wise alpha, and the audit verifying the *selection* rather than
-just the verdict.
+Covers the validator judging a whole cohort under a family-wise alpha and the
+audit verifying the *selection* rather than just the verdict.
 
 The invariant that matters most for rollout is that a cohort of ONE is
 bit-identical to the pre-DEC-CA-0012 rule — that is what lets the validator ship
@@ -15,7 +13,6 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from cascade.eval.heat import screen_diagnostics, tied_set
 from cascade.eval.scoring import WindowScore
 from cascade.shared.manifest import (
     TrainedEntry,
@@ -134,57 +131,6 @@ def test_cohort_keeps_only_the_maximal_common_size_set(cfg):
     cohort, sizes = m.duel_cohort()
     assert [hk for hk, _ in cohort] == ["a_hk"]
     assert sizes == ["toto2-4m", "toto2-22m"]
-
-
-# ── the generalised tie statistic ─────────────────────────────────────────────
-
-
-def _ranked(entrants):
-    return [(k, v) for k, v in entrants]
-
-
-def test_lcb_vs_reproduces_leader_lcb_at_the_runner_up():
-    """``leader_lcb`` is the DEC-CA-0006 headline number; generalising it must not
-    move it."""
-    base = _scores(1.0, 3)
-    ranked = _ranked([("a", _rescale(base, 0.5)), ("b", base), ("c", _rescale(base, 1.4))])
-    d = screen_diagnostics(ranked, seed=1, B=400)
-    assert d is not None
-    assert d.runner_up_key == "b"
-    assert d.lcb_vs["b"] == pytest.approx(d.leader_lcb)
-    assert set(d.lcb_vs) == {"b", "c"}
-
-
-def test_decisive_field_yields_a_tied_set_of_one():
-    base = _scores(1.0, 4)
-    # A clear leader: uniformly half the error of everyone else on every window.
-    ranked = _ranked([("a", _rescale(base, 0.5)), ("b", base), ("c", _rescale(base, 1.1))])
-    d = screen_diagnostics(ranked, seed=1, B=400)
-    assert all(v > 0 for v in d.lcb_vs.values())
-    assert tied_set(d, [k for k, _ in ranked], cap=3) == ["a"]
-
-
-def test_identical_entrants_are_all_tied():
-    base = _scores(1.0, 5)
-    ranked = _ranked([("a", base), ("b", list(base)), ("c", list(base))])
-    d = screen_diagnostics(ranked, seed=1, B=400)
-    # Identical scores ⇒ zero relative improvement ⇒ the bound cannot clear 0.
-    assert all(v <= 0 for v in d.lcb_vs.values())
-    assert tied_set(d, [k for k, _ in ranked], cap=3) == ["a", "b", "c"]
-
-
-def test_tied_set_respects_the_cap_and_rank_order():
-    base = _scores(1.0, 6)
-    ranked = _ranked([(k, list(base)) for k in ("a", "b", "c", "d", "e")])
-    d = screen_diagnostics(ranked, seed=1, B=400)
-    assert tied_set(d, [k for k, _ in ranked], cap=2) == ["a", "b"]
-    assert tied_set(d, [k for k, _ in ranked], cap=0) == []
-
-
-def test_tied_set_degrades_to_the_leader_without_diagnostics():
-    """A scalar-only screener or an unpaired field must fall back to exactly the
-    pre-DEC-CA-0012 behaviour, never to a wider cohort."""
-    assert tied_set(None, ["a", "b", "c"], cap=3) == ["a"]
 
 
 # ── the cohort duel ───────────────────────────────────────────────────────────
@@ -802,3 +748,118 @@ def test_cohort_maxt_increment_units_validator_to_audit(cfg):
     off = replace(armed, scoring=replace(armed.scoring, cohort_maxt_increment_from_block=0))
     assert C.check_duel_cohort(receipt, off).status == C.FAIL
     assert C.check_verdict(receipt, off).status == C.FAIL
+
+
+# ── mainnet: the increment-unit max-T comes with the resolved rollover ───────
+
+
+def _mainnet():
+    """chain.toml as shipped (the ``cfg`` fixture blanks the funded-rent keys
+    the rollover needs)."""
+    from pathlib import Path
+
+    from cascade.shared.config import load_chain_config
+
+    return load_chain_config(Path(__file__).resolve().parents[2] / "chain.toml")
+
+
+def _mainnet_rollover(cfg) -> int:
+    """A rollover block the mainnet [activation] could resolve: a boundary of
+    the loaded 3600 grid, an era start of the 900 × 4 grid after it, after
+    cohort_maxt_from_block."""
+    era = int(cfg.round.epoch_blocks) * int(cfg.round.era_settlements)
+    return (int(cfg.scoring.cohort_maxt_from_block) // era + 10) * era
+
+
+def test_mainnet_v2_cohort_settlement_is_judged_in_increment_units(cfg):
+    """chain.toml types ``cohort_maxt_increment_from_block = 0``, but the
+    mainnet era machinery is decided on chain (DEC-CA-0045) and
+    ``apply_activation`` fills that key with the rollover block (the era king
+    is judged under the increment-unit max-T, load-checked ``era_king >=
+    cohort_maxt_increment >= cohort_maxt``). Every v2 settlement follows the
+    rollover, so a v2 cohort settlement (k > 1) on the mainnet config the
+    validator and the audit actually run is judged in INCREMENT units — the
+    joint bound matches the increment-unit v2 bar, and the lane-A tier code
+    labels the crowning "increment". Before the rollover (pre-v2, toto2) the
+    rule is unchanged: level units."""
+    from dataclasses import replace
+
+    from cascade.audit import checks as C
+    from cascade.eval.koth import cohort_maxt_lcb_map
+    from cascade.shared.activation import apply_activation, apply_receipt_activation
+    from cascade.shared.config import cohort_maxt_increment_active
+    from cascade.validator.loop import ValidatorRunner
+
+    main = _mainnet()
+    assert main.scoring.cohort_maxt_increment_from_block == 0     # as typed
+    R = _mainnet_rollover(main)
+    resolved = apply_activation(main, R)
+    s = resolved.scoring
+    assert s.cohort_maxt_increment_from_block == R and s.era_king_from_block == R
+    # the audit replays the same config from the receipt's recorded block
+    from types import SimpleNamespace
+
+    audit_cfg = apply_receipt_activation(main, SimpleNamespace(activation_block=R))
+    assert audit_cfg.scoring.cohort_maxt_increment_from_block == R
+    v2_block = R + 10 * int(resolved.round.epoch_blocks) * int(resolved.round.era_settlements)
+    assert cohort_maxt_increment_active(s, v2_block)                 # v2: increment
+    assert cohort_maxt_increment_active(s, R)                        # live era king: as today
+    assert not cohort_maxt_increment_active(s, R - 1)                # pre-rollover: level
+    assert not cohort_maxt_increment_active(main.scoring, v2_block)  # typed alone: level
+
+    # end to end with the resolved cohort gates (the era envelope itself is
+    # exercised elsewhere): the validator judges the joint bound in increment
+    # units, the audit reproduces it, the crowning is labelled "increment"
+    armed = replace(cfg, scoring=replace(
+        cfg.scoring, cohort_maxt_from_block=s.cohort_maxt_from_block,
+        increment_from_block=s.increment_from_block,
+        cohort_maxt_increment_from_block=s.cohort_maxt_increment_from_block))
+    block = v2_block
+    king = _scores(1.0, 0)
+    base = _noisy(king, 1.6, 44)
+    chals = {"a_hk": _noisy(king, 0.7, 11), "b_hk": _noisy(king, 0.6, 22)}
+
+    def fake_eval(entry, windows):
+        if entry.miner_hotkey == ValidatorRunner.BASELINE_HOTKEY:
+            return base
+        return king if entry.role == "king" else chals[entry.miner_hotkey]
+
+    m = replace(_cohort_manifest(armed, [("a_hk", 1, 0), ("b_hk", 2, 1)]),
+                created_block=block, warm_start_ckpt=format_trained_pointer(CID2))
+    runner = _runner(armed, fake_eval)
+    outcome = runner.process_round(m, windows=[], base_seed=7)
+    receipt = runner.build_round_receipt(
+        m, base_seed=7, epoch_start_block=block, epoch_block_hash="0x" + "ab" * 32,
+        outcome=outcome, windows=[],
+    )
+    assert receipt.verdict.params["margin_mode"] == "increment"
+    params = armed.koth_params(block=block)
+    inc = cohort_maxt_lcb_map(king, [("a_hk", chals["a_hk"]), ("b_hk", chals["b_hk"])],
+                              params, seed=7, baseline_scores=base)
+    assert abs(receipt.verdict.lcb - inc["b_hk"]) < 1e-9
+    assert C.check_duel_cohort(receipt, armed).status == C.PASS
+    assert C.check_verdict(receipt, armed).status == C.PASS
+    assert C.receipt_crown_units(receipt, armed) == "increment"
+    # the typed-only config (no resolved rollover) would replay level units
+    typed = replace(armed, scoring=replace(armed.scoring, cohort_maxt_increment_from_block=0))
+    assert C.receipt_crown_units(receipt, typed) == "level"
+    assert C.check_duel_cohort(receipt, typed).status == C.FAIL
+
+
+def test_mainnet_cohort_increment_gate_cannot_trail_the_rollover(cfg):
+    """Why chain.toml does not type ``cohort_maxt_increment_from_block = "v2"``:
+    a gate later than the rollover breaks the load-checked ordering ``era_king
+    >= cohort_maxt_increment`` — ``apply_activation`` refuses it — and would
+    move the live pre-v2 era-king settlements back to level units."""
+    from dataclasses import replace
+
+    from cascade.shared.activation import apply_activation
+
+    main = _mainnet()
+    R = _mainnet_rollover(main)
+    assert apply_activation(main, R).scoring.cohort_maxt_increment_from_block == R
+    era_after = 900 * int(main.round.era_settlements)
+    late = replace(main, scoring=replace(main.scoring,
+                                         cohort_maxt_increment_from_block=R + 10 * era_after))
+    with pytest.raises(ValueError, match="cohort_maxt_increment_from_block"):
+        apply_activation(late, R)

@@ -1,70 +1,33 @@
-"""The cascade-provisioner service loop — rent per round, tear down per stage.
+"""The cascade-provisioner service loop — the validator's eval pod, the
+hosts files, and the pod ledger.
 
 One cycle of the machine (each ``poll_seconds``, ~30s):
 
-    WAIT   poll the chain block until :func:`policy.should_trigger` fires
-           (inside the last ``trigger_margin_blocks`` of the epoch, once per
-           round — that is when timed reveals have landed and the field is
-           countable);
-    COUNT  ask the trainer for the round plan (``plan_fn``; real impl runs
-           ``cascade-trainer --plan-only`` and parses its JSON line);
-    SIZE   :func:`policy.size_fleet` — slot-based heat fleet off the eligible
-           field, one multi-GPU final pod for king + finalists; with
-           ``final_rent_on = "heat_complete"`` the final is NOT rented here —
-           it defers to the trainer's heat_complete marker (sized off the
-           marker's ACTUAL finalist list) unless the pinned SKU's primary
-           rung probes scarce at the margin, the early-rental exception
-           (see ``_maybe_rent_final_jit`` / ``_final_primary_has_capacity``);
-    RENT   in a WORKER THREAD (the loop keeps ticking — boot waits must never
-           starve teardown/heartbeat/reconcile, the 2026-07-14 lesson): the
-           stage's SKU ladder × provider priority order, with escalation — a
-           rung that delivers NO healthy pod (failed launch, or every pod
-           and its replacement a dud) falls to the next (candidate × provider)
-           rung under a per-attempt deadline, and a fleet below viability gets
-           one same-candidate top-up (see ``_rent_stage_escalating``); every
-           pod is named/tagged ``cascade-{round_id}-…`` so reconcile can find
-           strays;
-    BOOT   provider-ready → SSH reachable → the seven-check health gate; a
-           failed pod is terminated and replaced ONCE, then dropped;
-    PUBLISH atomically write hosts.toml (heat + final entries) — the trainer
-           picks it up at round start (``--hosts-wait-seconds`` covers boot);
-    RETRY  a stage that rented NOTHING re-enters pick→budget→rent every
-           ``rent_retry_cooldown_s`` while enough of the round remains for
-           it to matter (the orchestrator is CPU-only — an un-retried failed
-           rental is a lost round, not a degraded one); the rent-once latch
-           still guards plan_fn and the poll cadence (``_maybe_retry_stages``);
-    WATCH  the two teardown signals: the trainer's ``heat_complete.json``
-           marker under the shared work-root, and the round manifest in the
-           store;
-    TEARDOWN per stage — heat pods die on the marker while the final still
-           runs (hosts.toml is re-rendered final-only); final pods die on the
-           manifest; the TTL (one epoch from rent) is the hard backstop; and
-    RECONCILE every cycle: live pods tagged ``cascade-`` that the ledger does
-           not own are terminated (a crash between launch and ledger-save must
-           not leak a billing box).
+    RE-GATE  ledger pods adopted on restart re-run the health gate against
+             the config loaded at THIS startup (a previous run's pass is not
+             trusted);
+    RECONCILE live pods named in this service's scheme that the ledger does
+             not own are terminated (a crash between launch and ledger-save
+             must not leak a billing box);
+    TEARDOWN an eval pod dies when its round's receipt lands or a newer
+             manifest supersedes it; every pod dies at its TTL;
+    ACTIVATE the DEC-CA-0045 grid switch is learned in-loop (no restart);
+    EVAL     a NEW round manifest in the store rents the round's eval pod —
+             in a worker thread, since a boot wait must never starve the
+             loop: SKU ladder × provider priority, provider-ready → SSH →
+             the health gate, one replacement for a dud — and publishes it
+             to the VALIDATOR's ``eval_hosts_path`` (never the trainer's
+             ``hosts_path``). ``last_evaled_round`` persists in the ledger so
+             restarts never double-rent.
 
-The optional EVAL stage rides the opposite phase of the same machine: renting
-is triggered by a NEW round manifest appearing in the store (that is when the
-validator's heavy evals — GIFT-Eval gate, cascade bench — start needing GPU),
-the pod is published to a SEPARATE ``eval_hosts_path`` file that the validator
-re-reads lazily per eval (never the trainer's ``hosts_path``), and teardown
-comes from the round's receipt publishing under ``receipt_prefix`` (the
-validator is done), a newer manifest superseding the round, or the same TTL
-backstop. ``last_evaled_round`` persists in the ledger so restarts never
-double-rent. See ``_maybe_provision_eval``.
+The trainer's ``hosts_path`` is rendered from the operator's static fragment
+plus any hand-added operator lanes already in the file (preserved by address),
+plus any ledger pods still alive; the trainer rents its own pods (payer legs,
+the era king — see :mod:`cascade.provision.funded`).
 
-Round-id note: the provisioner keys rounds by the upcoming BOUNDARY BLOCK
-(knowable before the round starts), while the trainer keys them by base_seed
-(the boundary block's hash — knowable only after). The two are reconciled at
-the marker: any ``heat_complete.json`` under the work-root NEWER than our rent
-time is this round's (only one round runs at a time), and its directory name
-IS the base_seed, which then lets us poll ``manifests/round-<base_seed>.json``
-directly. Until a marker appears we also watch ``latest.json`` for a round_id
-change since rent — either signal ends the round.
-
-Every boundary is injected (chain client, plan_fn, providers, manifest store,
-health check, ssh probe, clock, sleep), so the whole cycle is unit-tested with
-fakes; the loop itself is thin glue over ``policy``/``state``/``health``.
+Every boundary is injected (chain client, providers, manifest store, health
+check, ssh probe, clock, sleep), so the whole cycle is unit-tested with fakes;
+the loop itself is thin glue over ``policy``/``state``/``health``.
 """
 
 from __future__ import annotations
@@ -73,7 +36,6 @@ import contextlib
 import hashlib
 import json
 import logging
-import math
 import re
 import subprocess
 import threading
@@ -83,7 +45,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ..shared.hippius import MANIFEST_LATEST_KEY, manifest_round_key
+from ..shared.hippius import MANIFEST_LATEST_KEY
 from .core import (
     DEFAULT_FORWARD_ENV,
     DEFAULT_READY_TIMEOUT,
@@ -92,17 +54,13 @@ from .core import (
     DEFAULT_WORKDIR,
     LaunchSpec,
     PodAddress,
-    ProvisionError,
     render_hosts_toml,
 )
 from .health import HealthReport
 from .hostsfile import clear_hosts, parse_host_entries, render_host_entries, write_hosts
 from .policy import (
     ProvisionPolicy,
-    bench_hold_active,
     pods_for_slots,
-    should_trigger,
-    size_fleet,
     teardown_due,
 )
 from .state import (
@@ -126,13 +84,13 @@ POD_TAG = "cascade-"                       # every rented pod's name starts with
 # trainer's own cascade-n<netuid>-<round_id>-funded-<slug> scheme, NOT this
 # one). The orphan reaper matches on
 # this — never on the bare POD_TAG prefix, which operators' hand-rented pods
-# (cascade-worker, cascade-final-b, cascade-heat-2) legitimately share. Reaping
-# by bare prefix terminated a live hand-rented final pod on 2026-07-13.
+# (cascade-worker, cascade-final-b, cascade-heat-2) legitimately share.
 # NEVER add "funded" here: funded pods (payer legs AND the trainer's JIT
 # operator king) are the TRAINER's, ledgered in funded_pods.json and named
 # under the deployment-scoped cascade-n<netuid>-… scheme — a provisioner that
-# matched them would reap the live king mid-round (it can't see the trainer's
-# ledger; review 2026-09-02, the 2026-07-13 over-reap class).
+# matched them would reap the live king mid-leg (it can't see the trainer's
+# ledger). heat/final stay in the pattern so a ledger leftover of the retired
+# per-round fleet is still reaped.
 _PROVISIONER_POD_RE = re.compile(r"^cascade-\d+-(heat|final|eval)(-|$)")
 # The exact lane-name shape render_hosts_toml gives THIS service's pods
 # (``cascade-<round>-<stage>-<i>-g<g>``, integer slot). A hosts.toml entry of
@@ -150,7 +108,7 @@ def lane_pod_name(provider: str, instance_id: str) -> str:
     the round id or the pod's position — so a pod carried across publishes
     (a second rental, a teardown of a sibling, a round boundary) keeps its
     name and the trainer's name-keyed lane pool never sees a renamed twin
-    (the 2026-09-06 09:05 double dispatch). Hex-uuid ids (shadeform) use
+    (which would double-dispatch onto it). Hex-uuid ids (shadeform) use
     their first 8 chars so the name is greppable against the provider
     console; anything else (lium names) is hashed to 8 hex."""
     iid = str(instance_id)
@@ -159,41 +117,15 @@ def lane_pod_name(provider: str, instance_id: str) -> str:
     prov = re.sub(r"[^a-z0-9]", "", str(provider).lower()) or "pod"
     return f"{POD_TAG}{prov}-{key}"
 
-# Boot slack folded into the "is there still time?" checks for late rentals
-# (JIT final rental and within-round retries). Sized from the REAL delivery
-# budget, not the happy path: ready wait (≤15 min) + auth-injection lag
-# (≤15 min, hyperstack VMs observed at 7-8) + bootstrap (≤30 min) + health
-# gate lands one pod in ~15-25 min typically but 45-70 min when a dud forces
-# its replacement or a rung escalates — so a stage is only worth renting
-# while its training hours PLUS a full hour remain. This also keeps the JIT
-# refusal tighter than the trainer's pre-duel hosts wait (launched at 90
-# min): a rental the provisioner starts, the trainer will still be waiting
-# for.
-BOOT_MARGIN_HOURS = 1.0
-
 # Adopted-pod re-gate (the restart path): a pod resumed from the ledger passed
 # its health gate under the config of WHOEVER rented it — possibly a stale
-# image pin (2026-08-28: a zombie provisioner gated pods against its own stale
-# pin; adoption honored those passes and wrong-image pods reached the final
-# fleet, whose workers refused to run). The old pass is therefore worthless:
+# image pin. The old pass is therefore worthless:
 # every adopted pod re-runs the SAME gate against the config loaded at THIS
 # startup before it stays in the published fleet. The bounded retry exists for
 # the mid-training pod: an ssh blip during the re-gate must not read as a bad
 # pod, while a deterministic mismatch (wrong digest) fails every attempt.
 ADOPT_REGATE_ATTEMPTS = 3
 ADOPT_REGATE_RETRY_S = 30.0
-
-
-def _heat_field(payload: dict) -> int:
-    """How many challengers the heat will actually train.
-
-    ``screened_challengers`` is the count AFTER the trainer's content-dedup
-    screen ([round] dedup_mode); sizing off the pre-screen count rents pods for
-    copies that never train. Older trainers (and ``dedup_mode = "off"``) omit
-    the key, so fall back to the raw eligible count.
-    """
-    n = payload.get("screened_challengers")
-    return int(n) if n is not None else int(payload["eligible_challengers"])
 
 
 def is_provisioner_pod_name(name: str) -> bool:
@@ -207,8 +139,7 @@ def _scrub_known_host(ip: str, port: int = 22) -> None:
     Marketplace providers recycle IPs and the worker image generates fresh host
     keys per boot (``ssh-keygen -A`` in the entrypoint), so a stale entry makes
     every ``accept-new`` connection hard-fail with "Host key verification
-    failed" (2026-07-15: killed a replacement pod that re-drew its dud's IP).
-    Scrubbing at rent time keeps trust-on-first-use for the dispatch path."""
+    failed". Scrubbing at rent time keeps trust-on-first-use for the dispatch path."""
     targets = [ip] if port == 22 else [ip, f"[{ip}]:{port}"]
     for t in targets:
         with contextlib.suppress(Exception):
@@ -250,8 +181,7 @@ class ProvisionerLoop:
     """One provisioner service instance. All I/O boundaries are injected fields.
 
     ``providers`` maps name → adapter (the core ``Provider`` verbs, optionally
-    ``list_tagged``/``offer_price``); ``plan_fn`` returns the trainer's
-    ``--plan-only`` payload dict; ``manifest_store`` duck-types
+    ``list_tagged``/``offer_price``); ``manifest_store`` duck-types
     ``S3Store.get_text``; ``health_check(addr, stage)`` returns a
     :class:`HealthReport` (``None`` ⇒ gate skipped, e.g. tests/dry-run);
     ``ssh_probe(ip, port)`` is the TCP reachability wait. ``clock`` is seconds
@@ -261,13 +191,11 @@ class ProvisionerLoop:
     policy: ProvisionPolicy
     providers: dict[str, object]
     chain_client: object                                    # .current_block() -> int
-    plan_fn: Callable[[], dict]
     render: RenderSettings
     hosts_path: Path
     work_root: Path
     state_path: Path
     epoch_blocks: int
-    final_hours: float                                      # [training] target_train_hours
     # Scheduled cadence change, mirroring [round] epoch_blocks_prev /
     # epoch_activation_block. Both 0 ⇒ epoch_blocks always applies. Resolved
     # per tick (never cached) so the provisioner flips at the same block as the
@@ -277,8 +205,8 @@ class ProvisionerLoop:
     # Stake-weighted activation (DEC-CA-0045): called every cycle with
     # ``(chain_client, block)``; returns ``(epoch_blocks, epoch_blocks_prev,
     # epoch_activation_block)`` the moment the fleet's lock-in applies, else
-    # None. Resolved IN the loop so no operator restart (and no restart inside
-    # the pre-boundary trigger window) is ever needed to learn the grid switch.
+    # None. Resolved IN the loop so no operator restart is ever needed to
+    # learn the grid switch.
     activation_fn: object | None = None
     manifest_store: object | None = None
     # The VALIDATOR's eval-offload hosts file (never the trainer's hosts_path):
@@ -299,9 +227,8 @@ class ProvisionerLoop:
     # Returns False on failure (the pod is treated like a health-gate dud).
     bootstrap: Callable[[PodAddress, str], bool] | None = None
     # Fired once per healthy pod AFTER the health gate (addr, stage, provider):
-    # best-effort warm-up work that must never gate the pod — today the final
-    # pods' detached benchmark-data download (make_bench_prewarm), so the cold
-    # pull overlaps training instead of eating the bench window.
+    # best-effort warm-up work that must never gate the pod (the deployed
+    # chain.toml push, the benchmark-data prewarm).
     prewarm: Callable[[PodAddress, str, str], None] | None = None
     # Raw [[host]] TOML appended verbatim to EVERY hosts.toml publish — the
     # operator's static pods (e.g. a long-lived final pod) that the provisioner
@@ -313,14 +240,6 @@ class ProvisionerLoop:
     # edit lands without a restart); ``static_hosts_text`` is the last-good
     # copy used when the file is missing or fails to parse.
     static_hosts_path: Path | None = None
-    # ``live_legs(addr, provider) -> int | None``: how many training-worker
-    # processes are running on a pod right now (None = could not tell). The
-    # teardown sweep asks it before terminating a heat/final pod whose signal
-    # is due: a pod with live legs — or one it cannot reach — is deferred to
-    # the next cycle, the TTL staying the only unconditional kill. Closes the
-    # 2026-09-04 20:30 class: the OLD round's manifest+bench signals judged
-    # pods the NEW round had already dispatched onto. None disables the guard.
-    live_legs: Callable[[PodAddress, str], int | None] | None = None
     # Called at the top of EVERY cycle (never raises consequences — errors are
     # suppressed): the logging self-heal hook. bittensor's logging init strips
     # handlers and raises the level (to CRITICAL) on NAMED loggers when a chain
@@ -330,60 +249,20 @@ class ProvisionerLoop:
     ssh_probe: Callable[[str, int], bool] = field(default=lambda ip, port: True)
     # Rebuilds chain_client when the block number freezes: a bittensor
     # websocket can die QUIETLY and keep answering current_block() with a
-    # stale value — the loop then cycles forever without ever seeing the
-    # trigger window (observed live 2026-07-14: 2h19m of silent no-trigger).
+    # stale value — the loop then cycles forever on a frozen chain view.
     # None disables the refresh (tests with static FakeChain blocks).
     chain_client_factory: Callable[[], object] | None = None
     stale_block_after_s: float = 300.0
     heartbeat_every_s: float = 600.0
     ready_timeout: float = DEFAULT_READY_TIMEOUT
     poll_seconds: float = 30.0
-    # Rules of escalation (see _rent_stage_escalating): how long ONE rent
-    # attempt may keep walking the SKU ladder (0 = a rung that fails is
-    # final — the pre-escalation behaviour), and the fraction of demanded
-    # slots below which a partial fleet earns its one same-candidate top-up
-    # batch (0 = never top up). Renting runs off-thread; the deadline bounds
-    # the single worker so JIT/retry/next-round triggers are never starved.
-    escalate_deadline_s: float = 1800.0
-    min_viable_fleet: float = 0.5
-    # Within-round retry (see _maybe_retry_stages): a stage that rented
-    # NOTHING re-attempts the whole pick→budget→rent pipeline on this
-    # cadence, for as long as enough of the round remains for the stage to
-    # still matter. 0 = the pre-retry behaviour (one attempt per round). The
-    # rent-once latch still guards plan_fn and the 30s poll cadence.
-    # Probe-only failures (no capacity anywhere) retry at this flat cadence
-    # all round — they cost API calls, nothing more. Attempts that LAUNCHED
-    # pods which all failed the gate double the stage's cooldown per attempt
-    # (capped 8×): a zombie pool gets slower, cheaper bites, not a hard stop.
-    rent_retry_cooldown_s: float = 900.0
-    # The money backstop for zombie markets: once a stage has burned this
-    # many dud pods (launched, failed boot/health, terminated) in one round,
-    # it stops RENTING for the round — every dud bills minutes the budget
-    # breaker does not model. <= 0 disables the cap.
-    max_duds_per_stage: int = 8
-    # When to rent the FINAL fleet: "margin" (with the heat, at the epoch
-    # boundary — the pre-phased behaviour) or "heat_complete" (just-in-time,
-    # when the trainer's marker says the finalists are known — see
-    # _maybe_rent_final_jit). JIT sizes the fleet off the marker's ACTUAL
-    # finalist list and stops paying for a final pod that idles through the
-    # whole heat.
-    final_rent_on: str = "margin"
-    # Cascade post-publish duel bench hold ([eval] bench_hold_max_hours): keep
-    # the FINAL pods past the manifest-driven teardown while the trainer's
-    # bench_pending.json marker is live, up to this many hours, then reap
-    # regardless (see policy.bench_hold_active). Wired from chain.toml ONLY
-    # when [scoring] cascade_enabled; 0 (the default) disables the hold — no
-    # other pod class is ever held.
-    bench_hold_max_hours: float = 0.0
     dry_run: bool = False
     clock: Callable[[], float] = time.time
     sleep: Callable[[float], None] = time.sleep
 
     # internal (rebuilt from the ledger on restart)
     _state: RoundState | None = field(default=None, init=False, repr=False)
-    _provisioned_round: int | None = field(default=None, init=False, repr=False)
     _addrs: dict[str, PodAddress] = field(default_factory=dict, init=False, repr=False)
-    _manifest_baseline: str | None = field(default=None, init=False, repr=False)
     _last_block: int | None = field(default=None, init=False, repr=False)
     _block_changed_at: float = field(default=0.0, init=False, repr=False)
     _last_heartbeat_at: float = field(default=0.0, init=False, repr=False)
@@ -391,76 +270,19 @@ class ProvisionerLoop:
     _eval_thread: object = field(default=None, init=False, repr=False)
     _state_lock: object = field(default_factory=__import__("threading").RLock,
                                 init=False, repr=False)
-    _learned_round_id: str | None = field(default=None, init=False, repr=False)
-    # Stale-manifest guard for same-round-id reruns: sha256 of any manifest
-    # ALREADY published at round-<id>.json on the first poll after the heat
-    # marker taught us the id (None = key was absent then). Only a CHANGED
-    # manifest reads as round-over.
-    _round_manifest_baseline: str | None = field(default=None, init=False, repr=False)
-    _round_baseline_for: str | None = field(default=None, init=False, repr=False)
-    # Cache of the base_seed the CURRENT round's heat marker must carry, derived
-    # from the boundary block's hash (chain_client.block_seed). Keyed by the
-    # boundary so it recomputes once per round; None when the client can't
-    # answer (offline fakes) and the mtime heuristic stands in.
-    _expected_seed: str | None = field(default=None, init=False, repr=False)
-    _expected_seed_for: int | None = field(default=None, init=False, repr=False)
-    # One-shot log latch for the bench hold (the sweep runs every cycle;
-    # announcing the hold once per activation is enough), plus when the live
-    # pending marker was FIRST observed on the injected clock — the hold cap
-    # counts from there (file mtimes are wall-clock and would not compose
-    # with the injected clock). ``_bench_hold_for`` identifies WHICH marker
-    # the latch was armed for, as (round dir, marker mtime): a marker for a
-    # different round — or the same round republished — re-arms the latch,
-    # so one round's expired hold can never deny the next round's bench its
-    # own hold (the sweep stops calling _bench_hold once the ledger empties,
-    # so the latch cannot rely on being reset between rounds).
-    _bench_hold_logged: bool = field(default=False, init=False, repr=False)
-    _bench_hold_since: float | None = field(default=None, init=False, repr=False)
-    _bench_hold_for: tuple | None = field(default=None, init=False, repr=False)
-    # The eval stage's rent-once latch (mirrors _provisioned_round for the
-    # boundary stages): the manifest round an eval pod was last rented — or
+    # The eval stage's rent-once latch: the manifest round an eval pod was
+    # last rented — or
     # deliberately skipped — for. Restored from the ledger so restarts never
     # double-rent; in dry-run it lives in memory only (no disk mutation).
     _last_evaled_round: str = field(default="", init=False, repr=False)
-    # Per-round rental bookkeeping for retry/JIT. _round_plan caches the
-    # trigger's --plan-only payload (retries must not re-run the trainer);
-    # _stage_failed holds stages that rented NOTHING and are eligible for a
-    # cooldown retry; _committed maps successfully-rented stages to their
-    # approved worst-case USD so later rentals budget against them;
-    # _final_pending mirrors the ledger's stage-phased flag;
-    # _heat_marker_latched pins the marker sighting across the teardown that
-    # removes the heat instances the marker scan anchors on.
-    _round_plan: dict | None = field(default=None, init=False, repr=False)
-    _stage_failed: set = field(default_factory=set, init=False, repr=False)
-    _committed: dict = field(default_factory=dict, init=False, repr=False)
-    _final_pending: bool = field(default=False, init=False, repr=False)
-    _heat_marker_latched: bool = field(default=False, init=False, repr=False)
-    # The rent worker (mirrors the eval thread): renting runs OFF the loop
-    # thread so boot waits and ladder escalation never starve teardown/
-    # heartbeat/reconcile ticks. One worker at a time (_rent_inflight);
-    # _rent_abort is set when the round's manifest publishes mid-rent so the
-    # worker stops escalating and skips the publish (its ledgered pods die
-    # in the next teardown sweep).
-    _rent_inflight: bool = field(default=False, init=False, repr=False)
-    _rent_thread: object = field(default=None, init=False, repr=False)
-    _rent_abort: object = field(default_factory=threading.Event, init=False, repr=False)
-    # Per-stage retry pacing: next allowed attempt time, the backoff
-    # multiplier (doubles per dud-launching attempt, capped), and the
-    # round's dud-pod count feeding max_duds_per_stage.
-    _next_retry_at: dict = field(default_factory=dict, init=False, repr=False)
-    _retry_backoff: dict = field(default_factory=dict, init=False, repr=False)
-    _dud_pods: dict = field(default_factory=dict, init=False, repr=False)
     # pod id → names of the health checks it failed (set by _boot_and_gate,
     # consumed once by the replacement path's facility-exclusion decision).
     _gate_failures: dict = field(default_factory=dict, init=False, repr=False)
     # Addresses of pods this service terminated (any path) — their hosts.toml
     # entries must never be preserved as "operator lanes" on a republish.
     _retired_ips: set = field(default_factory=set, init=False, repr=False)
-    # Pods whose teardown was deferred on live legs (INFO once, DEBUG after).
-    _defer_logged: set = field(default_factory=set, init=False, repr=False)
     # Operator lanes already announced as preserved (log once per name).
     _foreign_logged: set = field(default_factory=set, init=False, repr=False)
-    _pending_logged_at: float = field(default=0.0, init=False, repr=False)
     # Ledger-adopted pods awaiting their re-gate against the CURRENT config
     # (see _maybe_regate_adopted): set on resume, cleared when the re-gate
     # worker is spawned on the first cycle.
@@ -472,16 +294,7 @@ class ProvisionerLoop:
         if self._state is not None:
             log.info("resumed ledger %s: round=%s, %d instance(s)",
                      self.state_path, self._state.round_id, len(self._state.instances))
-            if self._state.round_id.isdigit():
-                self._provisioned_round = int(self._state.round_id)
             self._last_evaled_round = self._state.last_evaled_round
-            self._final_pending = self._state.final_pending
-            # A restart that resumed a final-pending round with NO heat
-            # instances left means the heat already tore down — i.e. the
-            # marker (the JIT trigger) fired while we were away. Latch it:
-            # the marker scan anchors on heat rent times we no longer have.
-            self._heat_marker_latched = self._final_pending and not any(
-                i.stage == "heat" for i in self._state.instances)
             # Adoption is NOT trust: these pods passed the gate under the
             # config of the run that RENTED them, which may have carried a
             # different image pin. Flag them for a re-gate against the config
@@ -490,36 +303,6 @@ class ProvisionerLoop:
             self._adopt_pending = bool(self._state.instances)
 
     # ── properties ───────────────────────────────────────────────────────────
-
-    def epoch_at(self, block: int) -> int:
-        """Round length in force AT ``block`` — see
-        :func:`cascade.shared.config.effective_epoch_blocks`, which this
-        mirrors so the fleet flips on the same block as the trainer."""
-        if (self.epoch_activation_block and self.epoch_blocks_prev > 0
-                and int(block) < self.epoch_activation_block):
-            return max(1, self.epoch_blocks_prev)
-        return max(1, self.epoch_blocks)
-
-    def trigger_margin_at(self, block: int) -> int:
-        """Blocks-before-boundary that open the rent window.
-
-        Derived from ``trigger_offset_blocks`` (blocks AFTER the boundary to
-        start renting) when set, so it tracks the epoch length automatically.
-        A PINNED margin is the trap: 7100 was correct at 7200 and is a hard
-        startup failure at 3600 (``build_policy`` rejects margin >= epoch), and
-        a pinned 3500 silently delays renting to mid-round at 7200. The offset
-        form cannot be wrong in either direction."""
-        offset = int(getattr(self.policy, "trigger_offset_blocks", 0) or 0)
-        if offset > 0:
-            return max(1, self.epoch_at(block) - offset)
-        return int(self.policy.trigger_margin_blocks)
-
-    def epoch_hours_at(self, block: int) -> float:
-        return self.epoch_at(block) * 12.0 / 3600.0         # 12s block time
-
-    @property
-    def epoch_hours(self) -> float:
-        return self.epoch_blocks * 12.0 / 3600.0            # 12s block time
 
     @property
     def ttl_hours(self) -> float:
@@ -538,7 +321,8 @@ class ProvisionerLoop:
     # ── the cycle ────────────────────────────────────────────────────────────
 
     def run_once(self) -> None:
-        """One poll tick: reconcile strays, tear down what's due, maybe rent.
+        """One poll tick: reconcile strays, tear down what's due, maybe rent
+        the eval pod.
 
         Teardown runs before the eval check on purpose: a newer manifest
         first kills the previous round's eval pod, then (same tick) the new
@@ -551,8 +335,7 @@ class ProvisionerLoop:
         if now - self._last_heartbeat_at >= self.heartbeat_every_s:
             # Cycle-START heartbeat: every phase below makes network calls
             # that can crawl on a bad night — liveness must never depend on
-            # reaching any of them (2026-07-14, twice: starved heartbeats
-            # masked a wedged loop through two rental windows).
+            # reaching any of them.
             log.info("heartbeat: cycle start, last_block=%s, owned_pods=%d",
                      self._last_block if self._last_block is not None else "?",
                      len(self._state.instances) if self._state else 0)
@@ -562,29 +345,13 @@ class ProvisionerLoop:
         self._teardown_due_pods()
         block = self._current_block()
         # Re-assert AFTER the chain read: constructing the bittensor client
-        # strips the cascade tree's handlers, so everything below (rent, boot,
-        # health, teardown) logged into the void whenever a round triggered on
-        # cycle 1 — the cycle-start hook alone is too early to cover it.
+        # strips the cascade tree's handlers, so everything below would log
+        # into the void — the cycle-start hook alone is too early.
         if self.on_cycle is not None:
             with contextlib.suppress(Exception):
                 self.on_cycle()
         self._maybe_apply_activation(block)
         self._maybe_provision_eval()
-        if should_trigger(block, self.epoch_at(block),
-                          self.trigger_margin_at(block), self._provisioned_round):
-            if self._rent_inflight:
-                # A rent worker (previous round's retry, most likely) is still
-                # running. The rent-once latch is only set inside
-                # _provision_round, so the trigger simply re-fires next tick —
-                # the worker's escalation deadline bounds the wait.
-                log.warning("trigger window open but a rent worker is still "
-                            "running; deferring the round trigger one tick")
-            else:
-                _eb = self.epoch_at(block)
-                round_id = (block // _eb + 1) * _eb
-                self._provision_round(round_id)
-        self._maybe_rent_final_jit(block)
-        self._maybe_retry_stages(block)
 
     @staticmethod
     def _with_deadline(fn, seconds: float):
@@ -592,16 +359,11 @@ class ProvisionerLoop:
 
         bittensor's websocket calls can hang indefinitely (no client-side
         timeout) — four rental windows were lost to silent chain-source stalls.
-        A timed-out call leaks its helper thread (daemon; it dies with the
-        process), which is an acceptable cost for a loop that must never
-        block. Raises ``TimeoutError`` on deadline."""
-        import concurrent.futures
+        A timeout bounds the caller's wait but does not stop the underlying
+        call. Shared with the trainer through ``shared.concurrency``."""
+        from ..shared.concurrency import call_with_deadline
 
-        ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        try:
-            return ex.submit(fn).result(timeout=seconds)
-        finally:
-            ex.shutdown(wait=False)
+        return call_with_deadline(fn, seconds)
 
     def _maybe_apply_activation(self, block: int) -> None:
         """DEC-CA-0045: learn the fleet's rollover (once it locks in) and
@@ -670,459 +432,14 @@ class ProvisionerLoop:
                 log.exception("provisioner cycle failed (retrying): %s", e)
             self.sleep(self.poll_seconds)
 
-    # ── COUNT → SIZE → RENT → PUBLISH ────────────────────────────────────────
-
-    def _provision_round(self, round_id: int) -> None:
-        try:
-            payload = self.plan_fn()
-        except Exception as e:  # noqa: BLE001 — plan failure retries next tick
-            log.warning("plan_fn failed (will retry next poll): %s", e)
-            return
-        # Rent-once latch: set as soon as we HAVE a plan, so failures below
-        # (no capacity, over budget) don't hammer providers every 30s poll.
-        # A stage that rents NOTHING gets bounded re-attempts on the
-        # rent_retry_cooldown_s cadence instead (see _maybe_retry_stages) —
-        # on a CPU-only orchestrator there is no real local fallback, so a
-        # failed rental left un-retried is a lost round.
-        self._provisioned_round = round_id
-        self._round_plan = dict(payload)
-        self._stage_failed = set()
-        self._committed = {}
-        self._next_retry_at = {}
-        self._retry_backoff = {}
-        self._dud_pods = {}
-        self._final_pending = False
-        self._heat_marker_latched = False
-        self._rent_abort.clear()
-
-        fleet = size_fleet(
-            _heat_field(payload),
-            int(payload["finalists"]),
-            float(payload["heat_train_hours"]),
-            self.epoch_hours_at(round_id),
-            self.final_hours,
-            self.policy,
-            # DEC-CA-0012: size the final off the tie-aware cohort CAP so the
-            # pre-phased fleet and the budget breaker cover the worst case
-            # (absent from a pre-cap plan payload ⇒ 0 ⇒ finalists alone).
-            max_finalists=int(payload.get("max_finalists", 0)),
-            # Duel-only round: no heat fleet; the final seats king + cap.
-            no_heat=bool(payload.get("duel_only", False)),
-        )
-        log.info("round %d plan: eligible=%s screened=%s%s → heat %d pod(s)/%d slot(s), "
-                 "final %d pod(s)/%d slot(s)",
-                 round_id, payload["eligible_challengers"],
-                 payload.get("screened_challengers", "n/a"),
-                 " (duel-only)" if payload.get("duel_only") else "",
-                 fleet.heat.pods, fleet.heat.slots, fleet.final.pods, fleet.final.slots)
-
-        wants: dict[str, int] = {}
-        if fleet.heat.pods > 0:
-            wants["heat"] = fleet.heat.slots
-        if fleet.final.pods > 0:
-            # Stage-phased rental: with final_rent_on = "heat_complete" the
-            # final fleet is deferred to the trainer's marker (which carries
-            # the ACTUAL finalist list — the fleet then matches the real
-            # duel, not the plan's prediction) UNLESS the pinned SKU's
-            # primary rung looks scarce RIGHT NOW — then early rental is the
-            # exception that locks capacity while any exists. A round with
-            # no heat pods rents the final at the margin regardless: no heat
-            # fleet means no rent-time anchor for the marker scan.
-            defer = (self.final_rent_on == "heat_complete" and fleet.heat.pods > 0)
-            if defer and self._final_primary_has_capacity(fleet.final.slots):
-                self._final_pending = True
-                log.info("round %d: deferring final rental until heat_complete "
-                         "(JIT; the primary %s rung has capacity)", round_id,
-                         self.policy.final.sku)
-            else:
-                if defer:
-                    log.warning("round %d: primary %s rung has NO capacity at the "
-                                "margin — scarce market, renting the final EARLY "
-                                "via the ladder", round_id, self.policy.final.sku)
-                wants["final"] = fleet.final.slots
-
-        if not self.dry_run:
-            # Baseline the manifest pointer BEFORE renting: any later change
-            # means a round published after our rent — the teardown signal
-            # that needs no base_seed knowledge.
-            self._manifest_baseline = self._latest_round_id()
-            self._learned_round_id = None
-            # Reset EVERY piece of per-round baseline state together: a
-            # same-round-id relearn that cleared only _learned_round_id kept a
-            # stale (None) manifest baseline, so the marker re-teaching the id
-            # made the PREVIOUS run's manifest read as a fresh publish and tore
-            # down the just-rented final pod (Round 8690400, 2026-07-23). The
-            # marker re-learn then re-baselines any leftover manifest as stale,
-            # exactly as on a first learn.
-            self._round_baseline_for = None
-            self._round_manifest_baseline = None
-            with self._state_lock:
-                self._state = (RoundState(round_id=str(round_id)) if self._state is None
-                               else replace(self._state, round_id=str(round_id),
-                                            published=False))
-                self._state = replace(self._state, final_pending=self._final_pending)
-                self._save()
-        self._spawn_rent(round_id, wants)
-
-    def _spawn_rent(self, round_id: int | str, wants: dict[str, int]) -> None:
-        """Run ``_rent_stages`` in a daemon worker — renting never blocks the loop.
-
-        The same discipline the eval stage earned on 2026-07-14 (a boot wait
-        swallowed a trigger window), applied to the boundary stages: provider
-        ready-waits and ladder escalation can run for many minutes, and the
-        loop must keep tearing down, heartbeating, and reconciling meanwhile.
-        One worker at a time (``_rent_inflight`` — the JIT/retry phases skip
-        their tick while one runs); the ledger write-ahead inside
-        ``_rent_stage`` keeps a crash mid-worker reconcilable, exactly as on
-        the old inline path.
-        """
-        def _worker() -> None:
-            try:
-                self._rent_stages(round_id, wants)
-            except Exception as e:  # noqa: BLE001 — a failed rent never kills the loop
-                log.exception("round %s rent worker failed: %s", round_id, e)
-            finally:
-                self._rent_inflight = False
-
-        self._rent_inflight = True
-        t = threading.Thread(target=_worker, name=f"rent-{round_id}", daemon=True)
-        self._rent_thread = t                     # tests join() for determinism
-        t.start()
-
-    def _rent_stages(self, round_id: int | str, wants: dict[str, int]) -> None:
-        """Pick → budget → rent (with escalation) → publish, for ``wants``.
-
-        ``wants`` maps stage name to slot demand. The shared rental pipeline
-        for all three callers — the margin trigger, the cooldown retry, and
-        the JIT final — so they cannot drift: per stage the first (SKU
-        candidate × provider) combination with capacity for the WHOLE fleet
-        wins (a stage never mixes SKUs — within-round fairness by
-        construction), the round budget is gated against stages ALREADY
-        rented this round (``_committed``), and publishing re-renders from
-        the ledger so a JIT/retry rental never clobbers a surviving fleet.
-        Stages that rent nothing land in ``_stage_failed`` for the cooldown
-        retry.
-        """
-        sps = {"heat": self.policy.heat, "final": self.policy.final}
-        chosen: dict[str, tuple[object, float, object, int]] = {}
-        offer_iters: dict[str, object] = {}
-        for stage, slots in wants.items():
-            offers = self._iter_offers(sps[stage], slots, stage)
-            picked = next(offers, None)
-            if picked is None:
-                log.error("round %s: no provider has capacity for the %s stage",
-                          round_id, stage)
-                self._note_stage_failure(stage, launched_duds=False)
-            else:
-                chosen[stage] = picked
-                offer_iters[stage] = offers
-        if not chosen:
-            if wants:
-                log.error("round %s: nothing rentable this attempt; publishing "
-                          "static fleet only (retry on cooldown)", round_id)
-            self._republish_from_ledger()
-            return
-
-        projected = sum(pods * price * self.ttl_hours
-                        for (_prov, price, _cand, pods) in chosen.values())
-        committed = sum(usd for st, usd in self._committed.items() if st not in chosen)
-        offers_log = {stage: price for stage, (_p, price, _c, _n) in chosen.items()}
-        if projected + committed > self.policy.max_spend_per_round:
-            log.error("round %s REFUSED by budget breaker: worst-case $%.2f "
-                      "(+$%.2f already committed) > cap $%.2f (offers %s)",
-                      round_id, projected, committed,
-                      self.policy.max_spend_per_round, offers_log)
-            for stage in chosen:
-                self._note_stage_failure(stage, launched_duds=False)
-            self._republish_from_ledger()
-            return
-        log.info("round %s budget ok: worst-case $%.2f + $%.2f committed <= cap $%.2f",
-                 round_id, projected, committed, self.policy.max_spend_per_round)
-
-        if self.dry_run:
-            for stage, (prov, price, cand, pods) in chosen.items():
-                log.info("[dry-run] round %s %s: WOULD rent %d × %d-GPU %s pod(s) on %s "
-                         "@ $%.2f/hr (tag cascade-%s-%s)", round_id, stage, pods,
-                         cand.gpus_per_pod, cand.sku, prov.name,
-                         price, round_id, stage)
-            return
-
-        rented_any = False
-        for stage in list(chosen):
-            if self._rent_abort.is_set():
-                log.warning("round %s: manifest published mid-rent — aborting the "
-                            "remaining stage rental(s)", round_id)
-                break
-            duds_before = self._dud_pods.get(stage, 0)
-            healthy = self._rent_stage_escalating(
-                round_id, stage, chosen, offer_iters[stage], wants[stage])
-            if healthy:
-                rented_any = True
-                _prov, price, _cand, pods = chosen[stage]   # escalation-updated
-                self._committed[stage] = pods * price * self.ttl_hours
-                self._stage_failed.discard(stage)
-                self._retry_backoff.pop(stage, None)
-                self._next_retry_at.pop(stage, None)
-            else:
-                self._note_stage_failure(
-                    stage, launched_duds=self._dud_pods.get(stage, 0) > duds_before)
-        if self._rent_abort.is_set():
-            # Round over: whatever this attempt ledgered dies in the next
-            # teardown sweep; publishing it would only list doomed pods.
-            return
-        if not rented_any:
-            log.error("round %s: every rented pod failed its health gate; "
-                      "publishing surviving fleet only (retry on cooldown)", round_id)
-            self._republish_from_ledger()
-            return
-        self._republish_from_ledger()
-        with self._state_lock:
-            self._state = replace(self._state, published=True)
-            self._save()
-
-    def _note_stage_failure(self, stage: str, *, launched_duds: bool) -> None:
-        """Mark a stage failed and pace its next retry.
-
-        Probe-only failures (no capacity, over budget) keep the flat
-        ``rent_retry_cooldown_s`` cadence — they cost a few API calls and the
-        round should keep watching the market all day. An attempt that
-        LAUNCHED pods which all died doubles the stage's cooldown (capped 8×):
-        a zombie pool gets slower, cheaper bites instead of a hard stop, and
-        ``max_duds_per_stage`` is the money backstop behind it.
-        """
-        self._stage_failed.add(stage)
-        if self.rent_retry_cooldown_s <= 0:
-            return
-        backoff = self._retry_backoff.get(stage, 1.0)
-        if launched_duds:
-            backoff = min(backoff * 2.0, 8.0)
-            self._retry_backoff[stage] = backoff
-            log.warning("%s stage launched only duds; retry cooldown backed off "
-                        "to %.0fs", stage, self.rent_retry_cooldown_s * backoff)
-        self._next_retry_at[stage] = self.clock() + self.rent_retry_cooldown_s * backoff
-
-    # ── within-round retry + JIT final (the late-rental phases) ──────────────
-
-    def _round_closes_at(self) -> int | None:
-        """The block at which the provisioned round ends.
-
-        ``_provisioned_round`` is the boundary NEXT after rent time, so its
-        meaning follows the trigger form: the post-boundary offset trigger
-        rents just after the round opens (boundary = END), while the
-        pre-boundary margin trigger rents just before it opens (boundary =
-        START, round closes one epoch later). Treating it as START under the
-        offset form double-counted the epoch (+12h, 2026-07-29)."""
-        if self._provisioned_round is None:
-            return None
-        if int(getattr(self.policy, "trigger_offset_blocks", 0) or 0) > 0:
-            return self._provisioned_round
-        return self._provisioned_round + self.epoch_at(self._provisioned_round)
-
-    def _remaining_epoch_hours(self, block: int) -> float:
-        """Hours left until the provisioned round's epoch boundary closes."""
-        closes_at = self._round_closes_at()
-        if closes_at is None:
-            return 0.0
-        return (closes_at - block) * 12.0 / 3600.0
-
-    def _final_primary_has_capacity(self, slots: int) -> bool:
-        """Cheap availability pre-check — list offers, rent nothing.
-
-        Probes ONLY the final's primary rung: the JIT gamble (rent hours
-        after the margin) is safe when the pinned SKU looks liquid NOW, and
-        only-fallback-shapes-available is already a thin-market signal that
-        argues for renting early. Probe errors read as scarce — conservative,
-        because the cost of a wrong "scarce" is merely the pre-phased
-        behaviour (an idle final pod through the heat).
-        """
-        sp = self.policy.final
-        primary = sp.sku_candidates[0]
-        pods = pods_for_slots(slots, primary.gpus_per_pod, sp.max_pods)
-        if pods <= 0:
-            return False
-        for name in sp.providers:
-            prov = self.providers.get(name)
-            if prov is None:
-                continue
-            try:
-                if prov.available(primary.marketplace_sku, pods,
-                                  gpus=primary.gpus_per_pod):
-                    return True
-            except Exception as e:  # noqa: BLE001 — unknown market reads as scarce
-                log.warning("provider %s availability pre-check failed (%s)", name, e)
-        return False
-
-    def _final_slots_now(self) -> int:
-        """The final's slot demand at rent time: king + the ACTUAL finalists.
-
-        The trainer's ``heat_complete.json`` carries the finalist hotkeys —
-        the whole point of deferring: the fleet matches the real duel (48
-        eligible may still produce 1 finalist). Markers are only trusted when
-        THIS round's marker is known to have fired (``_learned_round_id`` /
-        ``_heat_marker_latched``): the work-root keeps every previous round's
-        marker too, and sizing a pre-marker retry off a stale one both
-        mis-sizes the duel and can blow the retry's budget gate outright.
-        Pre-marker (or marker unreadable) ⇒ the plan's prediction; no plan
-        either (restart) ⇒ king + one challenger, the minimal duel.
-        """
-        try:
-            if self._learned_round_id:
-                p = Path(self.work_root) / self._learned_round_id / "heat_complete.json"
-                return 1 + len(json.loads(p.read_text(encoding="utf-8"))["finalists"])
-            if self._heat_marker_latched:
-                # Restart path: the marker fired but the round id that names
-                # its directory was lost with the process — newest wins.
-                markers = sorted(Path(self.work_root).glob("*/heat_complete.json"),
-                                 key=lambda m: m.stat().st_mtime)
-                if markers:
-                    return 1 + len(json.loads(
-                        markers[-1].read_text(encoding="utf-8"))["finalists"])
-        except Exception:  # noqa: BLE001 — a torn/odd marker falls back to the plan
-            pass
-        if self._round_plan is not None:
-            # Pre-marker prediction: cover the tie-aware cohort CAP
-            # (DEC-CA-0012) — the marker, once it fires, shrinks this to the
-            # actual finalist list. The cap is itself capped by the revealed
-            # field (r48, 2026-08-28): zero fresh submissions can only ever
-            # produce a king-only duel, so never rent beyond 1 + the field.
-            cohort = max(int(self._round_plan["finalists"]),
-                         int(self._round_plan.get("max_finalists", 0)))
-            with contextlib.suppress(Exception):
-                cohort = min(cohort, _heat_field(self._round_plan))
-            return 1 + cohort
-        return 2
-
-    def _maybe_rent_final_jit(self, block: int) -> None:
-        """Rent the deferred final fleet when the heat settles.
-
-        The trigger is the trainer's own ``heat_complete.json`` (the
-        trainer-pull channel: the same marker that tears the heat down says
-        the duel is about to need GPUs — finalists are chosen and the final
-        dispatch starts as soon as final-tagged hosts appear). The trainer
-        waits ``--hosts-wait-seconds`` for those hosts, and boot is 10-15
-        min, so just-in-time is comfortably inside its patience. No marker ⇒
-        the heat is still running (or the trainer died, in which case a
-        final fleet would idle-bill for nothing) — keep waiting; the next
-        round's trigger resets the pending flag either way.
-        """
-        if not self._final_pending:
-            return
-        if self._rent_inflight:
-            return                               # a rent worker is already busy
-        remaining = self._remaining_epoch_hours(block)
-        if remaining < self.final_hours + BOOT_MARGIN_HOURS:
-            # Watchdog terminal state: the heat never completed and the duel
-            # can no longer fit — say so LOUDLY instead of waiting silently
-            # into the next round (a crashed trainer looks exactly like a
-            # slow heat until this moment).
-            log.error("round %s: final still PENDING but its window closed "
-                      "(%.1fh left < final %.1fh + %.1fh boot) — the heat never "
-                      "completed; giving up on the final",
-                      self._provisioned_round, remaining, self.final_hours,
-                      BOOT_MARGIN_HOURS)
-            self._final_pending = False
-            self._persist_final_pending(False)
-            return
-        if not (self._heat_marker_latched or self._heat_marker_seen()):
-            # Watchdog heartbeat: a pending final is invisible in the pod
-            # lists, so put its existence in the log on the same cadence as
-            # the loop heartbeat.
-            now = self.clock()
-            if now - self._pending_logged_at >= self.heartbeat_every_s:
-                self._pending_logged_at = now
-                log.info("round %s: final rental pending on heat_complete "
-                         "(%.1fh left in the round)", self._provisioned_round,
-                         remaining)
-            return
-        self._final_pending = False
-        self._persist_final_pending(False)
-        slots = self._final_slots_now()
-        log.info("round %s: heat settled — renting the final fleet JIT "
-                 "(%d slot(s): king + actual finalists; %.1fh left)",
-                 self._provisioned_round, slots, remaining)
-        self._spawn_rent(self._provisioned_round, {"final": slots})
-
-    def _maybe_retry_stages(self, block: int) -> None:
-        """Bounded re-attempts for stages that rented NOTHING this round.
-
-        The rent-once latch stops 30s hammering, but on a CPU-only
-        orchestrator a stage left failed is a lost round — so failed stages
-        re-enter the full pick→budget→rent pipeline every
-        ``rent_retry_cooldown_s``, for as long as the stage can still matter:
-        the heat while at least one serial screening wave fits in what
-        remains of its window (the fleet is RE-SIZED to that shrunken window
-        — a late heat wants more parallel slots), the final while its full
-        training hours plus boot margin remain. A stage whose window closed
-        is dropped from the retry set — at that point nothing rentable can
-        help the round.
-        """
-        if not self._stage_failed or self._provisioned_round is None:
-            return
-        if self.rent_retry_cooldown_s <= 0 or self._rent_inflight:
-            return
-        now = self.clock()
-        remaining = self._remaining_epoch_hours(block)
-        wants: dict[str, int] = {}
-        for stage in ("heat", "final"):         # heat first: the time-critical stage
-            if stage not in self._stage_failed:
-                continue
-            if now < self._next_retry_at.get(stage, 0.0):
-                continue                        # this stage's (backed-off) cooldown
-            duds = self._dud_pods.get(stage, 0)
-            if self.max_duds_per_stage > 0 and duds >= self.max_duds_per_stage:
-                self._stage_failed.discard(stage)
-                log.error("round %s: %s stage burned %d dud pod(s) — the market is "
-                          "selling broken pods; giving up RENTING for this round "
-                          "(money backstop, max_duds_per_stage=%d)",
-                          self._provisioned_round, stage, duds, self.max_duds_per_stage)
-                continue
-            if stage == "heat":
-                plan = self._round_plan
-                heat_hours = float(plan["heat_train_hours"]) if plan else 0.0
-                if plan is None or remaining - self.final_hours < heat_hours:
-                    self._stage_failed.discard("heat")
-                    log.error("round %s: heat window closed (%.1fh left) — giving up "
-                              "on the heat fleet%s", self._provisioned_round, remaining,
-                              "" if plan else " (no cached plan after restart)")
-                    continue
-                refleet = size_fleet(_heat_field(plan),
-                                     int(plan["finalists"]), heat_hours,
-                                     remaining, self.final_hours, self.policy,
-                                     max_finalists=int(plan.get("max_finalists", 0)),
-                                     no_heat=bool(plan.get("duel_only", False)))
-                if refleet.heat.pods > 0:
-                    wants["heat"] = refleet.heat.slots
-                else:
-                    self._stage_failed.discard("heat")
-            elif stage == "final":
-                if remaining < self.final_hours + BOOT_MARGIN_HOURS:
-                    self._stage_failed.discard("final")
-                    log.error("round %s: final window closed (%.1fh left) — giving up "
-                              "on the final fleet", self._provisioned_round, remaining)
-                else:
-                    wants["final"] = self._final_slots_now()
-        if wants:
-            log.warning("round %s: retrying failed stage(s) %s (%.1fh left in the round)",
-                        self._provisioned_round, sorted(wants), remaining)
-            self._spawn_rent(self._provisioned_round, wants)
-
-    def _persist_final_pending(self, value: bool) -> None:
-        """Write the stage-phased flag through to the ledger (never in dry-run)."""
-        if self.dry_run or self._state is None:
-            return
-        with self._state_lock:
-            self._state = replace(self._state, final_pending=value)
-            self._save()
+    # ── PICK (the SKU ladder × provider priority) ────────────────────────────
 
     def _iter_offers(self, sp, slots: int, stage: str):
         """Yield every viable ``(provider, price, candidate, pods)``, ladder order.
 
         Candidates in the stage's configured order, providers in priority order
-        within each candidate — this IS the escalation ladder. Lazy on purpose:
-        capacity is probed when the consumer advances, so a rung reached ten
-        minutes into a failed rent sees the market as it is THEN, not as it was
-        at pick time. The pod count is re-derived per candidate — an 8×
-        fallback needs fewer pods for the same slots than a 4× primary. Any
+        within each candidate. Lazy on purpose: capacity is probed when the
+        consumer advances. The pod count is re-derived per candidate. Any
         adapter fault just skips that provider: a broken adapter means fewer
         offers, never a dead provisioner.
         """
@@ -1164,131 +481,6 @@ class ProvisionerLoop:
         """First viable rung of :meth:`_iter_offers`, or ``None`` (no capacity)."""
         return next(self._iter_offers(sp, slots, stage), None)
 
-    def _rent_stage_escalating(self, round_id: int | str, stage: str,
-                               chosen: dict, offers, slots: int,
-                               ) -> list[tuple[PodInstance, PodAddress]]:
-        """Rent one stage, escalating down the SKU ladder when a rung fails.
-
-        The rules of escalation, cheapest signal first:
-
-        1. A pod that fails boot/health gets ONE same-rung replacement, its
-           machine excluded from the re-pick (inside :meth:`_rent_stage`).
-        2. A stage that comes up EMPTY — the launch call failed, or every pod
-           AND its replacement was a dud — re-enters the offer ladder at the
-           next (candidate × provider) rung: capacity is probed at escalation
-           time (the iterator is lazy) and each new rung is re-checked against
-           the round budget with the other stages' current offers
-           (:meth:`_escalation_budget_ok`); an over-cap rung is skipped, not
-           fatal — a cheaper one may sit further down.
-        3. A stage that comes up PARTIAL below ``min_viable_fleet`` of its
-           slot demand gets ONE same-candidate top-up batch
-           (:meth:`_maybe_top_up`) — never a different SKU, so the
-           stage-never-mixes-candidates fairness invariant holds.
-
-        Everything is bounded by a wall-clock deadline (``escalate_deadline_s``
-        from this attempt's start), not an attempt count. Renting runs in a
-        worker thread, so the deadline no longer protects loop liveness; what
-        it bounds now is ONE attempt's lifetime: only one rent worker runs at
-        a time, so a wedged attempt would block the JIT final, the cooldown
-        retries, and — worst — the NEXT round's margin trigger. Ending the
-        attempt hands control to the retry machinery, which re-probes the
-        whole market fresh and paces itself with dud-aware backoff. Deadline
-        or ladder exhausted ⇒ the stage degrades for this attempt — fewer
-        (or no) pods — and the retry takes it from there.
-        """
-        deadline = self.clock() + self.escalate_deadline_s
-        prov, _price, cand, pods = chosen[stage]
-        attempt = 0
-        while True:
-            suffix = "" if attempt == 0 else f"-e{attempt}"
-            healthy = self._rent_stage(round_id, stage, prov, cand, pods, suffix=suffix)
-            if healthy:
-                return self._maybe_top_up(round_id, stage, prov, cand, pods,
-                                          healthy, slots, deadline, attempt)
-            while True:
-                if self._rent_abort.is_set():
-                    log.warning("round %s %s: manifest published mid-escalation; "
-                                "aborting", round_id, stage)
-                    return []
-                if self.clock() >= deadline:
-                    log.error("round %s %s: escalation deadline (%.0fs) spent with no "
-                              "healthy fleet this attempt; retry takes over on its "
-                              "cooldown", round_id, stage, self.escalate_deadline_s)
-                    return []
-                nxt = next(offers, None)
-                if nxt is None:
-                    log.error("round %s %s: SKU ladder exhausted with no healthy fleet; "
-                              "degrading (trainer covers the round)", round_id, stage)
-                    return []
-                if self._escalation_budget_ok(stage, nxt[1], nxt[3], chosen):
-                    break
-            prov, _price, cand, pods = nxt
-            chosen[stage] = nxt          # later stages' budget math sees the switch
-            attempt += 1
-            log.warning("round %s %s: rung delivered nothing; escalating to %d × %dx%s "
-                        "on %s (attempt %d)", round_id, stage, pods, cand.gpus_per_pod,
-                        cand.sku, prov.name, attempt)
-
-    def _maybe_top_up(self, round_id: int | str, stage: str, prov: object, cand,
-                      pods: int, healthy: list, slots: int, deadline: float,
-                      attempt: int) -> list[tuple[PodInstance, PodAddress]]:
-        """Escalation rule 3: ONE same-candidate top-up below viability.
-
-        ``min_viable_fleet`` is the fraction of the stage's intended slots —
-        ``min(slots, pods × gpus_per_pod)``, demand as clamped by the rung's
-        own shape — under which serial waves start threatening the heat
-        window. The top-up re-rents only the MISSING pods, on the same
-        provider and candidate: no SKU mixing, and the pod count never
-        exceeds what the budget breaker approved for this rung. One batch
-        only — a market that failed a pod and its replacement is thin, and
-        the deadline applies here like everywhere else. Whatever the top-up
-        yields is accepted: on a CPU-only orchestrator any GPU fleet, however
-        thin, beats the trainer-local path.
-        """
-        target = min(slots, pods * cand.gpus_per_pod)
-        have = len(healthy) * cand.gpus_per_pod
-        need = math.ceil(self.min_viable_fleet * target)
-        missing = pods - len(healthy)
-        if have >= need or missing <= 0:
-            return healthy
-        if self.clock() >= deadline:
-            log.warning("round %s %s: fleet below viability (%d/%d slots) but the "
-                        "escalation deadline is spent; proceeding partial",
-                        round_id, stage, have, target)
-            return healthy
-        log.warning("round %s %s: fleet below viability (%d/%d slots, need %d); "
-                    "topping up %d × %dx%s pod(s) on %s", round_id, stage, have,
-                    target, need, missing, cand.gpus_per_pod, cand.sku, prov.name)
-        healthy = healthy + self._rent_stage(round_id, stage, prov, cand, missing,
-                                             suffix=f"-t{attempt}")
-        have = len(healthy) * cand.gpus_per_pod
-        if have < need:
-            log.error("round %s %s: still below viability after top-up (%d/%d slots); "
-                      "proceeding partial (serial waves)", round_id, stage, have, target)
-        return healthy
-
-    def _escalation_budget_ok(self, stage: str, price: float, pods: int,
-                              chosen: dict) -> bool:
-        """Re-run the round budget gate for an escalated rung.
-
-        Same worst-case arithmetic as the round-level gate (every pod billed
-        the full TTL): THIS stage at the proposed rung, every other stage at
-        its current offer, plus whatever earlier rentals this round already
-        committed (``_committed`` — the JIT final budgets against the live
-        heat). Duds already terminated billed minutes, not TTLs — like the
-        replacement path, that sliver is accepted rather than modelled.
-        """
-        others = sum(n * pr * self.ttl_hours
-                     for st, (_p, pr, _c, n) in chosen.items() if st != stage)
-        others += sum(usd for st, usd in self._committed.items() if st not in chosen)
-        projected = others + pods * float(price) * self.ttl_hours
-        if projected > self.policy.max_spend_per_round:
-            log.warning("%s escalation rung refused by budget: worst-case $%.2f > cap "
-                        "$%.2f; trying the next rung", stage, projected,
-                        self.policy.max_spend_per_round)
-            return False
-        return True
-
     @staticmethod
     def _offer_price(prov: object, sku: str) -> float | None:
         fn = getattr(prov, "offer_price", None)
@@ -1306,10 +498,9 @@ class ProvisionerLoop:
     def _rent_stage(self, round_id: int | str, stage: str, prov: object,
                     cand, pods: int, suffix: str = "",
                     ) -> list[tuple[PodInstance, PodAddress]]:
-        # round_id is the boundary block for heat/final and the manifest round
-        # id for eval — both digits, both satisfying _PROVISIONER_POD_RE.
-        # ``suffix`` distinguishes escalation (-eN) / top-up (-tN) batches from
-        # the first attempt's pods (same regex, distinct names).
+        # round_id is the manifest round id — digits, satisfying
+        # _PROVISIONER_POD_RE. ``suffix`` distinguishes a batch's names from
+        # an earlier attempt's (same regex, distinct names).
         spec = LaunchSpec(
             sku=cand.marketplace_sku, count=pods, image=self.render.image,
             ssh_pubkey=self.render.ssh_pubkey, ssh_port=self.render.ssh_port,
@@ -1339,18 +530,15 @@ class ProvisionerLoop:
                 continue
             # Terminate the dud and try ONE replacement — marketplace pods are
             # lemon-prone, but retrying forever would chase a bad batch all day.
-            self._dud_pods[stage] = self._dud_pods.get(stage, 0) + 1
             log.warning("round %s %s: pod %s failed boot/health; replacing once",
                         round_id, stage, pid)
             # Exclude the lemon's machine from the replacement pick — offer
             # listings are deterministic, so the same spec re-rents the same
-            # failed executor (observed: eval pod + replacement both dead on
-            # 63243c2c…, round 5052267627071284702).
+            # failed executor.
             lemon = getattr(prov, "machine_of", lambda _p: None)(pid)
             # An image_digest failure means the FACILITY's host image cache is
             # serving a stale template — a same-region replacement predictably
-            # re-boots the same wrong image (r51, 2026-08-30: kansascity served
-            # v0.6.0 twice against the v0.7.0 pin). Walk the replacement to a
+            # re-boots the same wrong image. Walk the replacement to a
             # different region instead of a different machine.
             # A fresh_boot failure (recycled container) is the same facility
             # property — the container cache, not the machine.
@@ -1384,7 +572,6 @@ class ProvisionerLoop:
                 log.error("round %s %s: replacement %s also failed; dropping the slot",
                           round_id, stage, rid)
                 self._gate_failures.pop(rid, None)
-                self._dud_pods[stage] = self._dud_pods.get(stage, 0) + 1
                 self._terminate_and_drop(prov, rid)
         return healthy
 
@@ -1446,10 +633,10 @@ class ProvisionerLoop:
 
         A restart adopts still-running rentals from the ledger instead of
         re-renting — but their health-gate pass belongs to the run that rented
-        them, possibly under a stale image pin (the 2026-08-28 incident: see
-        ``ADOPT_REGATE_ATTEMPTS``). The re-gate runs the SAME injected
+        them, possibly under a stale image pin (see ``ADOPT_REGATE_ATTEMPTS``).
+        The re-gate runs the SAME injected
         ``health_check`` fresh rentals use — bound at startup to the current
-        pin — in a daemon worker like the rent/eval legs, so gate ssh
+        pin — in a daemon worker like the eval rent, so gate ssh
         round-trips never block the poll loop. A pod that fails gets the dud
         treatment (terminate, drop from the ledger) and the affected hosts
         file re-renders without it. Skipped when the gate itself is disabled
@@ -1552,11 +739,10 @@ class ProvisionerLoop:
     def _write_hosts(self, sections: list[str]) -> None:
         """Publish dynamic sections + the operator's static entries.
 
-        The static text rides along on EVERY publish — including the
-        heat-teardown re-render and the nothing-rented paths — so a long-lived
-        hand-rented pod (e.g. the static final) is never dropped by provisioner
-        activity. Only with no static text AND no dynamic pods does the file
-        clear (the trainer's local-fallback signal).
+        The static text rides along on EVERY publish, so a long-lived
+        hand-rented pod is never dropped by provisioner activity. Only with
+        no static text, no operator lanes AND no dynamic pods does the file
+        clear.
         """
         foreign = self._foreign_hosts_text(sections)
         content = "".join([self._static_hosts(), *sections, foreign])
@@ -1582,8 +768,8 @@ class ProvisionerLoop:
     def _foreign_hosts_text(self, sections: list[str]) -> str:
         """Entries in the CURRENT hosts.toml that this service does not own.
 
-        An operator who appends hand-rented lanes to hosts.toml (the 2026-09-04
-        flip-round fleet) must not lose them on the next provisioner publish.
+        An operator who appends hand-rented lanes to hosts.toml must not lose
+        them on the next provisioner publish.
         Ownership is by ADDRESS, not name: an entry is ours iff its host is a
         ledger pod's address (re-rendered from the ledger anyway) or one we
         terminated. Everything else is preserved verbatim-in-substance —
@@ -1625,18 +811,12 @@ class ProvisionerLoop:
                          e["name"], e["host"])
         return render_host_entries(keep)
 
-    def _live_legs_on(self, inst: PodInstance) -> int | None:
-        """Training-worker count on a pod, or None when it cannot be determined."""
-        if self.live_legs is None:
-            return None
-        try:
-            addr = self._addr_for(inst)
-            if addr is None:
-                return None
-            return self.live_legs(addr, inst.provider)
-        except Exception as e:  # noqa: BLE001 — unreachable ≠ idle
-            log.debug("live-leg probe on %s errored: %s", inst.instance_id, e)
-            return None
+    def _stage_gpus(self, stage: str) -> int:
+        """The pod shape to fan a ledger row out to when the row records no
+        ``gpus``: the stage policy's ``gpus_per_pod`` (1 for a stage with no
+        policy — the retired heat/final fleet)."""
+        sp = getattr(self.policy, stage, None)
+        return max(1, int(getattr(sp, "gpus_per_pod", 1) or 1)) if sp is not None else 1
 
     def _publish_hosts(self, by_stage: dict[str, list[tuple[PodInstance, PodAddress]]]) -> None:
         sections = []
@@ -1644,7 +824,7 @@ class ProvisionerLoop:
             entries = by_stage.get(stage)
             if not entries:
                 continue
-            fleet_gpus = entries[0][0].gpus or _gpus_for(self.policy, stage)
+            fleet_gpus = entries[0][0].gpus or self._stage_gpus(stage)
             prof = self.render.profile_for(entries[0][0].provider)
             sections.append(render_hosts_toml(
                 [addr for _inst, addr in entries],
@@ -1671,10 +851,8 @@ class ProvisionerLoop:
     def _republish_from_ledger(self) -> None:
         """Re-render hosts.toml from the surviving instances (post-teardown).
 
-        The re-render path after the heat marker: heat entries disappear,
-        final entries stay, and the trainer's next ``_hosts_for("final")``
-        sees only live pods. With nothing left, clear — an empty file is the
-        trainer's local-fallback signal and never lists a dead box.
+        Only live ledger pods are listed (plus the static fragment and the
+        operator lanes) — the file never lists a dead box.
         """
         if self._state is None:
             self._write_hosts([])                # static-only / empty file
@@ -1715,16 +893,14 @@ class ProvisionerLoop:
     def _maybe_provision_eval(self) -> None:
         """Rent the round's eval pod when a NEW manifest appears in the store.
 
-        The eval stage is manifest-triggered, not boundary-triggered: the
-        validator only needs GPU once a round has PUBLISHED (the GIFT-Eval
-        gate and cascade bench score the manifest's checkpoints), which is
-        exactly when the trainer fleet is being torn down. ``latest.json``
-        moving to a round we have not yet served is the rent signal.
+        The eval stage is manifest-triggered: the validator only needs GPU
+        once a round has PUBLISHED (the GIFT-Eval gate and cascade bench score
+        the manifest's checkpoints). ``latest.json`` moving to a round we have
+        not yet served is the rent signal.
 
         The ``_last_evaled_round`` latch is set the moment we act — including
         on no-capacity and dry-run — so a failure degrades the round to local
-        validator evals instead of hammering providers every poll (same
-        discipline as the boundary stages' ``_provisioned_round``). It is
+        validator evals instead of hammering providers every poll. It is
         persisted (write-ahead, before launch) so a crash mid-rent never
         double-rents on restart. A round whose receipt ALREADY exists is
         latched without renting: a provisioner restarted between rounds must
@@ -1757,16 +933,14 @@ class ProvisionerLoop:
             self._persist_eval_latch(latest)
             return
         prov, price, cand, pods = picked
-        # The round spend breaker historically ignored eval (bounded only by
-        # its own max_pods × price cap). Close the gap one-way: eval respects
-        # what heat/final already committed this round; skipping is cheap
-        # because the validator's local CPU evals are genuinely viable.
+        # Worst-case spend breaker (every pod billed for the full TTL);
+        # skipping is cheap because the validator's local CPU evals are
+        # genuinely viable.
         projected = pods * float(price) * self.ttl_hours
-        committed = sum(self._committed.values())
-        if projected + committed > self.policy.max_spend_per_round:
-            log.warning("round %s eval: skipped by budget — $%.2f eval + $%.2f "
-                        "committed > cap $%.2f (validator evals run locally)",
-                        latest, projected, committed, self.policy.max_spend_per_round)
+        if projected > self.policy.max_spend_per_round:
+            log.warning("round %s eval: skipped by budget — $%.2f > cap $%.2f "
+                        "(validator evals run locally)",
+                        latest, projected, self.policy.max_spend_per_round)
             self._persist_eval_latch(latest)
             return
         if self.dry_run:
@@ -1776,9 +950,7 @@ class ProvisionerLoop:
             return
         self._persist_eval_latch(latest)
         # Rent + boot + health can take 15+ minutes (provider readiness alone
-        # is a 900s wait) and MUST NOT block the loop: on 2026-07-14 an eval
-        # pod's boot wait swallowed the round-5 heat-trigger window whole.
-        # The slow leg runs in a daemon worker; the loop keeps cycling (the
+        # is a 900s wait) and MUST NOT block the loop. The slow leg runs in a daemon worker; the loop keeps cycling (the
         # ledger write-ahead in _rent_stage keeps a crash reconcilable, and
         # _eval_inflight stops a second manifest from double-renting).
         import threading
@@ -1836,7 +1008,7 @@ class ProvisionerLoop:
             name_prefix=f"{POD_TAG}{self._last_evaled_round}-eval",
             provider=inst.provider,
             stage="any",
-            gpus_per_pod=inst.gpus or 1,
+            gpus_per_pod=inst.gpus or self._stage_gpus("eval"),
         )
         write_hosts(self.eval_hosts_path, text)
         log.info("published %s: %d eval pod(s) for round %s",
@@ -1870,21 +1042,12 @@ class ProvisionerLoop:
     # ── WATCH + TEARDOWN ─────────────────────────────────────────────────────
 
     def _teardown_due_pods(self) -> None:
+        """Terminate every owned pod whose teardown is due: an eval pod once
+        its round's receipt lands (or a newer manifest supersedes it), any
+        pod once its TTL elapses (the backstop that needs no signal)."""
         if self._state is None or not self._state.instances:
             return
         now = self.clock()
-        marker = self._heat_marker_seen()
-        if marker:
-            # Latch for the JIT final trigger: this same sweep is about to
-            # drop the heat instances the marker scan anchors its mtime
-            # comparison on, so a later cycle could no longer re-detect it.
-            self._heat_marker_latched = True
-        manifest = self._manifest_seen()
-        if manifest:
-            # Round over: tell any in-flight rent worker to stop escalating
-            # and skip its publish — its already-ledgered pods die right here
-            # in this sweep (or the next one).
-            self._rent_abort.set()
         # The eval pod's two signals are only worth store round-trips while an
         # eval pod is actually owned. ``newer_manifest`` compares the CURRENT
         # latest pointer against the round the pod was rented for.
@@ -1894,55 +1057,29 @@ class ProvisionerLoop:
             latest = self._latest_round_id()
             newer = (bool(self._last_evaled_round) and latest is not None
                      and latest != self._last_evaled_round)
-        # The bench hold only matters when the manifest is about to kill a
-        # final pod, and its marker scan is disk I/O — skip it otherwise.
-        bench_hold = (manifest and any(i.stage == "final" for i in self._state.instances)
-                      and self._bench_hold())
         dead: set[str] = set()
         for inst in self._state.instances:
-            if teardown_due(inst.stage, heat_marker_seen=marker, manifest_seen=manifest,
-                            receipt_seen=receipt, newer_manifest=newer,
-                            rented_at=_iso_ts(inst.rented_at_iso), now=now,
-                            ttl_hours=self.ttl_hours, bench_hold=bench_hold):
-                ttl_hit = now - _iso_ts(inst.rented_at_iso) >= self.ttl_hours * 3600.0
-                if (not ttl_hit and inst.stage in ("heat", "final")
-                        and self.live_legs is not None):
-                    # Liveness guard: signals say the round is over, but the
-                    # NEXT round may already be training here (the trainer
-                    # flips at the boundary block; this service flips at
-                    # plan time ~20 min later). Ask the pod. Only the TTL
-                    # kills a pod with live legs — or one that cannot answer.
-                    legs = self._live_legs_on(inst)
-                    if legs is None or legs > 0:
-                        why = ("unreachable — not proof of idleness" if legs is None
-                               else f"{legs} live training leg(s)")
-                        lvl = (logging.DEBUG if inst.instance_id in self._defer_logged
-                               else logging.INFO)
-                        self._defer_logged.add(inst.instance_id)
-                        log.log(lvl, "teardown of %s pod %s deferred: %s (TTL %.1fh "
-                                "remains the backstop)", inst.stage, inst.instance_id,
-                                why, self.ttl_hours)
-                        continue
-                self._defer_logged.discard(inst.instance_id)
-                log.info("tearing down %s pod %s (marker=%s manifest=%s receipt=%s "
-                         "newer=%s bench_hold=%s ttl=%.1fh)", inst.stage, inst.instance_id,
-                         marker, manifest, receipt, newer, bench_hold, self.ttl_hours)
-                prov = self.providers.get(inst.provider)
-                if prov is None:
-                    log.error("no adapter for provider %r — pod %s may be LEAKED",
-                              inst.provider, inst.instance_id)
-                    continue
-                if self.dry_run:
-                    log.info("[dry-run] WOULD terminate %s pod %s", inst.stage,
-                             inst.instance_id)
-                    continue
-                try:
-                    prov.terminate(inst.instance_id)
-                except Exception as e:  # noqa: BLE001 — keep tearing down the rest
-                    log.error("terminate %s failed (may be leaked!): %s", inst.instance_id, e)
-                    continue
-                dead.add(inst.instance_id)
-                self._retire_addr(inst.instance_id)
+            if not teardown_due(inst.stage, receipt_seen=receipt, newer_manifest=newer,
+                                rented_at=_iso_ts(inst.rented_at_iso), now=now,
+                                ttl_hours=self.ttl_hours):
+                continue
+            log.info("tearing down %s pod %s (receipt=%s newer=%s ttl=%.1fh)",
+                     inst.stage, inst.instance_id, receipt, newer, self.ttl_hours)
+            prov = self.providers.get(inst.provider)
+            if prov is None:
+                log.error("no adapter for provider %r — pod %s may be LEAKED",
+                          inst.provider, inst.instance_id)
+                continue
+            if self.dry_run:
+                log.info("[dry-run] WOULD terminate %s pod %s", inst.stage, inst.instance_id)
+                continue
+            try:
+                prov.terminate(inst.instance_id)
+            except Exception as e:  # noqa: BLE001 — keep tearing down the rest
+                log.error("terminate %s failed (may be leaked!): %s", inst.instance_id, e)
+                continue
+            dead.add(inst.instance_id)
+            self._retire_addr(inst.instance_id)
         if dead:
             dead_eval = {i.instance_id for i in self._state.instances
                          if i.instance_id in dead and i.stage == "eval"}
@@ -1955,208 +1092,6 @@ class ProvisionerLoop:
                 self._republish_from_ledger()
             if dead_eval:
                 self._clear_eval_hosts()
-
-    def _expected_base_seed(self) -> str | None:
-        """The base_seed the CURRENT round's heat marker must carry, or None.
-
-        The trainer keys its work-dir by base_seed — the hash of the epoch
-        boundary block — and the provisioner keys the round by that same
-        boundary (``_provisioned_round``). Once the boundary is on-chain the
-        provisioner can derive the exact seed (``chain_client.block_seed``) and
-        so tell THIS round's marker from a DIFFERENT round's. Cached per
-        boundary (the hash is immutable). Returns None when the client can't
-        answer — boundary not yet finalised, no ``block_seed`` (offline fakes),
-        or a chain hiccup — leaving the mtime heuristic as the fallback."""
-        closes_at = self._round_closes_at()
-        if closes_at is None:
-            return None
-        # The trainer seeds the round off the block that OPENS it. Under the
-        # offset trigger _provisioned_round is the END boundary — deriving
-        # from it named a marker that could never match, and mid-round its
-        # hash doesn't even exist yet (2026-07-29 JIT incident: the marker was
-        # skipped every cycle and the final fell back to heat 4090s).
-        boundary = closes_at - self.epoch_at(closes_at)
-        if boundary == self._expected_seed_for:
-            return self._expected_seed
-        seed_fn = getattr(self.chain_client, "block_seed", None)
-        if seed_fn is None:
-            return None
-        try:
-            # Under the same hard deadline as every other chain read: a hung
-            # block_seed must not wedge the teardown sweep (this runs each cycle
-            # until the boundary is on-chain and the seed caches).
-            hash_fn = getattr(self.chain_client, "block_hash", None)
-            if hash_fn is not None and not self._with_deadline(
-                    lambda: hash_fn(boundary), 30.0):
-                # No hash for the boundary (not on-chain / node behind):
-                # block_seed would silently hash None into a plausible garbage
-                # seed — never derive from a missing hash.
-                return None
-            seed = str(int(self._with_deadline(lambda: seed_fn(boundary), 30.0)))
-        except Exception:  # noqa: BLE001 — boundary not on-chain yet / client down / hung
-            return None
-        self._expected_seed_for = boundary
-        self._expected_seed = seed
-        return seed
-
-    def _heat_marker_seen(self) -> bool:
-        """This round's ``heat_complete.json`` has landed — heat pods can go.
-
-        The trainer writes ``work_root/<base_seed>/heat_complete.json``. The
-        marker must both postdate our earliest rent (freshness) AND belong to
-        the round we are actually serving: mtime alone let a zombie trainer
-        re-touching an OLD round's marker read as this round's heat completing
-        and tear the fleet down (fix: match the marker's work-dir base_seed to
-        ``_expected_base_seed``). When the expected seed can't be derived
-        (offline fakes without ``block_seed``) the mtime heuristic stands in —
-        the directory name still teaches us the base_seed for manifest polling.
-
-        Only heat/final rents anchor the comparison: an eval pod is rented at
-        the PREVIOUS round's manifest — before this round's fleet — and
-        anchoring on it could resurrect the previous round's marker as a
-        false teardown signal.
-        """
-        if self._state is None:
-            return False
-        rents = [_iso_ts(i.rented_at_iso) for i in self._state.instances if i.stage != "eval"]
-        if not rents:
-            return False
-        rent_ts = min(rents)
-        expected = self._expected_base_seed()
-        try:
-            markers = sorted(Path(self.work_root).glob("*/heat_complete.json"))
-        except OSError:
-            return False
-        for m in markers:
-            if expected is not None and m.parent.name != expected:
-                continue                        # a different round's marker (zombie re-touch)
-            try:
-                if m.stat().st_mtime >= rent_ts:
-                    self._learned_round_id = m.parent.name
-                    return True
-            except OSError:
-                continue
-        return False
-
-    def _bench_hold(self) -> bool:
-        """The Cascade post-publish duel bench is still running — hold the
-        FINAL pods (see ``policy.bench_hold_active`` / ``teardown_due``).
-
-        The trainer drops ``work_root/<round_id>/bench_pending.json`` just
-        before publishing the manifest and ``bench_complete.json`` (removing
-        the pending marker) when the bench report is uploaded or the bench
-        fails — the same shared-work-root marker mechanism as
-        ``heat_complete.json``, with the same anti-zombie guards: the marker
-        must postdate this round's earliest boundary rent AND (when the
-        expected base_seed is derivable) belong to the round being served, so
-        an old round's leftover marker can never hold a new fleet.
-        """
-        if self.bench_hold_max_hours <= 0 or self._state is None:
-            self._reset_bench_hold_latch()
-            return False
-        rents = [_iso_ts(i.rented_at_iso) for i in self._state.instances if i.stage != "eval"]
-        if not rents:
-            self._reset_bench_hold_latch()
-            return False
-        rent_ts = min(rents)
-        expected = self._expected_base_seed()
-        try:
-            markers = sorted(Path(self.work_root).glob("*/bench_pending.json"))
-        except OSError:
-            return False
-        now = self.clock()
-        for m in markers:
-            if expected is not None and m.parent.name != expected:
-                continue                        # a different round's marker
-            try:
-                mtime = m.stat().st_mtime
-            except OSError:
-                continue
-            if mtime < rent_ts:
-                continue                        # stale marker from an earlier round
-            if (m.parent / "bench_complete.json").exists():
-                continue                        # bench finished: hold released
-            # Arm (or RE-arm) the cap clock when this is a different marker
-            # than the one the latch was armed for — a new round, or the same
-            # round republished. Without this, one round's expired hold would
-            # read every later round's marker as already-expired.
-            ident = (m.parent.name, mtime)
-            if self._bench_hold_since is None or self._bench_hold_for != ident:
-                self._bench_hold_since, self._bench_hold_for = now, ident
-                self._bench_hold_logged = False
-            if bench_hold_active(held_since=self._bench_hold_since, bench_done=False,
-                                 now=now, hold_max_hours=self.bench_hold_max_hours):
-                if not self._bench_hold_logged:
-                    self._bench_hold_logged = True
-                    log.info("final pod teardown held for the cascade duel bench "
-                             "(round=%s, cap %.1fh)", m.parent.name, self.bench_hold_max_hours)
-                return True
-            log.warning("cascade duel bench hold expired after %.1fh (round=%s); "
-                        "reaping the final pod regardless", self.bench_hold_max_hours,
-                        m.parent.name)
-            return False
-        self._reset_bench_hold_latch()
-        return False
-
-    def _reset_bench_hold_latch(self) -> None:
-        self._bench_hold_since = None
-        self._bench_hold_for = None
-        self._bench_hold_logged = False
-
-    def _manifest_seen(self) -> bool:
-        """The round's manifest is published — the round is over.
-
-        Two detectors, either suffices: (a) once the marker taught us the
-        base_seed, probe ``manifests/round-<base_seed>.json`` directly;
-        (b) ``latest.json``'s round_id changed from the pre-rent baseline
-        (works even if we never saw a marker; survives nothing — a restart
-        loses the baseline, which is fine because (a) re-learns from the
-        still-on-disk marker and the TTL backstops everything).
-
-        Detector (a) is CONTENT-baselined, not existence-based: on a
-        same-round-id rerun the previous run's manifest is still sitting at
-        ``round-<id>.json``, and a legitimate publish can only happen after
-        the final duel — hours past the heat marker that teaches us the id.
-        So a manifest already present on the first poll after learning the id
-        is a stale leftover: record its hash and fire only when the bytes
-        change (2026-07-15: the stale morning manifest satisfied the old
-        existence check 21s after duel dispatch and killed both pods). The
-        one blind spot — restarting after a real publish baselines the real
-        manifest — is backstopped by the TTL like every other lost baseline.
-        """
-        if self.manifest_store is None:
-            return False
-        if self._learned_round_id:
-            try:
-                text: str | None = self.manifest_store.get_text(
-                    manifest_round_key(self._learned_round_id))
-            except Exception:  # noqa: BLE001 — not there yet (or store down: TTL backstops)
-                text = None
-            if self._round_baseline_for != self._learned_round_id:
-                self._round_baseline_for = self._learned_round_id
-                self._round_manifest_baseline = (
-                    None if text is None
-                    else hashlib.sha256(text.encode("utf-8")).hexdigest())
-                if text is not None:
-                    log.warning("stale manifest already at %s when the marker "
-                                "taught us the round id — baselining it, will "
-                                "only tear down on a NEW publish",
-                                manifest_round_key(self._learned_round_id))
-            if text is not None:
-                digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
-                if digest != self._round_manifest_baseline:
-                    return True
-        current = self._latest_round_id()
-        if (self._manifest_baseline is None or current is None
-                or current == self._manifest_baseline):
-            return False
-        # latest.json moved — but only OUR round's publish ends this round. A
-        # PREVIOUS round's late manifest also moves the pointer, and reading
-        # that as "round over" swept a freshly rented next-round fleet
-        # (2026-07-29: round-8733600 final + eval pods killed 49min into
-        # their round by round-8730000's post-wall publish).
-        expected = self._expected_base_seed()
-        return expected is None or current == expected
 
     def _latest_round_id(self) -> str | None:
         if self.manifest_store is None:
@@ -2183,7 +1118,7 @@ class ProvisionerLoop:
         lost track of," not "pods that look cascade-related." And like every
         provider mutation, termination is gated on ``dry_run``.
         """
-        if self._rent_inflight or self._eval_inflight:
+        if self._eval_inflight:
             # A rent worker is between a provider's create call and its
             # ledger write-ahead at unpredictable moments — reaping now could
             # kill a pod that is owned but not yet recorded. Skipping a tick
@@ -2248,38 +1183,5 @@ class ProvisionerLoop:
             save_state(self.state_path, self._state)
 
 
-def _sku_for(policy: ProvisionPolicy, stage: str) -> str:
-    return policy.heat.sku if stage == "heat" else policy.final.sku
-
-
-def _market_sku_for(policy: ProvisionPolicy, stage: str) -> str:
-    sp = policy.heat if stage == "heat" else policy.final
-    return sp.marketplace_sku
-
-
-def _gpus_for(policy: ProvisionPolicy, stage: str) -> int:
-    return policy.heat.gpus_per_pod if stage == "heat" else policy.final.gpus_per_pod
-
-
 def _iso_ts(iso: str) -> float:
     return datetime.fromisoformat(iso).timestamp()
-
-
-def parse_plan_output(text: str) -> dict:
-    """The last JSON object line of ``cascade-trainer --plan-only`` output.
-
-    The trainer prints exactly one JSON line, but bittensor/logging banners can
-    precede it on stdout — scan from the end, same trick as the worker-receipt
-    parse (``remote.parse_receipt``).
-    """
-    for line in reversed((text or "").splitlines()):
-        line = line.strip()
-        if not (line.startswith("{") and line.endswith("}")):
-            continue
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(payload, dict):
-            return payload
-    raise ProvisionError("no JSON plan payload found in --plan-only output")

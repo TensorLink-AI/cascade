@@ -66,6 +66,8 @@ class PodInstance:
     # Platform-assigned pod identity (Lium pod id). Names are owner-chosen and
     # reusable; this is not — the trainer re-checks it around a funded leg.
     pod_uid: str = ""
+    # Opaque vault reference; keeps identity/teardown on the original account.
+    payer_credential_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -81,10 +83,8 @@ class RoundState:
     round id an eval pod was last rented for. Persisted so a restart while
     that round is still live never rents a SECOND pod for the same manifest
     (the crash-safety twin of the in-memory latch). ``""`` = never evaled.
-    ``final_pending`` records a stage-phased round whose FINAL fleet is
-    deliberately not rented yet (waiting on the trainer's heat_complete
-    marker) — persisted so a restart keeps waiting instead of concluding the
-    final was never wanted.
+    ``final_pending`` belonged to the retired per-round heat/final fleet; it
+    is still read and written so an older ledger round-trips unchanged.
     """
 
     round_id: str
@@ -165,6 +165,7 @@ def save_state(path: Path | str, state: RoundState) -> None:
                 **({"payer_hotkey": i.payer_hotkey} if i.payer_hotkey else {}),
                 **({"robot_id": i.robot_id} if i.robot_id else {}),
                 **({"pod_uid": i.pod_uid} if i.pod_uid else {}),
+                **({"payer_credential_id": i.payer_credential_id} if i.payer_credential_id else {}),
             }
             for i in state.instances
         ],
@@ -202,6 +203,7 @@ def load_state(path: Path | str) -> RoundState | None:
                 payer_hotkey=str(i.get("payer_hotkey", "")),
                 robot_id=int(i.get("robot_id", 0) or 0),
                 pod_uid=str(i.get("pod_uid", "")),
+                payer_credential_id=str(i.get("payer_credential_id", "")),
             )
             for i in raw.get("instances", [])
         ),

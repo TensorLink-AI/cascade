@@ -107,8 +107,15 @@ jobs:
       # hippius extra's boto3>=1.34 sent pip's resolver into a long backtracking
       # storm over botocore versions — the install stalled until the job hit
       # "The operation was canceled". Rely on the pre-installed v2 instead.
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.13.4"
+
       - name: Install cascade (pool-forge + hippius extras)
-        run: pip install -e ".[pool-forge,hippius]"
+        run: |
+          python scripts/check_tls_trust.py --system-only
+          uv pip install --system --python "$(which python)" "pip==26.2.2" -e ".[pool-forge,hippius]"
+          python scripts/check_tls_trust.py
 
       # The forge mirror is date-partitioned parquet (<feed>/<date>.parquet,
       # immutable once written), but the runner is ephemeral — without a cache
@@ -226,6 +233,34 @@ jobs:
             --selection balanced \
             --effective-block "$EFFECTIVE_BLOCK"
 
+      # DEC-CA-0056 lane C: the per-target fine-tune pool, built by the SAME
+      # builder from the same mirror but published under [lane_c] pool_prefix
+      # (pool_c/index.json + pool_c/snapshots/) with its OWN balanced-selection
+      # seed (lane-c:block:<N>), so its windows never mirror the main pool's.
+      # Inert until the toml types [lane_c] from_block (the step exits 0).
+      # Prints per-target coverage and warns for any target under
+      # [lane_c] min_target_windows.
+      - name: Build + publish LANE-C snapshot  (CASCADE key; inert until armed)
+        env:
+          NETWORK: ${{ github.event.inputs.network || 'mainnet' }}
+          EFFECTIVE_BLOCK: ${{ github.event.inputs.effective_block || 'auto' }}
+          BACKUP_S3_ACCESS_KEY: ${{ secrets.BACKUP_S3_ACCESS_KEY }}
+          BACKUP_S3_SECRET_KEY: ${{ secrets.BACKUP_S3_SECRET_KEY }}
+        run: |
+          TOML=chain.toml
+          [ "$NETWORK" = "testnet" ] && TOML=chain.testnet.toml
+          if ! python -c "import sys; from cascade.shared.config import load_chain_config as l; sys.exit(0 if l('$TOML').lane_c.from_block else 1)"; then
+            echo "[lane_c] from_block unset in $TOML — no lane-C pool"; exit 0
+          fi
+          TSFORGE_DIR=./tsforge cascade-pool publish --lane c \
+            --chain-toml "$TOML" \
+            --out ./_pool_stage_c \
+            --sources tsbench_forge \
+            --max-panel-series-per-feed 5 \
+            --max-series-per-domain-freq 300 \
+            --max-series-per-domain 600 \
+            --effective-block "$EFFECTIVE_BLOCK"
+
       # Public reveal: mirror RETIRED snapshot tars from the pool bucket to a
       # public HF dataset — the EXACT bytes validators scored, sha256-verified
       # against pool/index.json (the hash round receipts pin). Nothing is
@@ -252,3 +287,9 @@ jobs:
           TOML=chain.toml
           [ "$NETWORK" = "testnet" ] && TOML=chain.testnet.toml
           cascade-pool reveal --chain-toml "$TOML" --hf-repo "$HF_EVAL_REPO"
+          # DEC-CA-0056: the lane-C pool's retired snapshots, under pool_c/ in
+          # the same dataset (inert until [lane_c] from_block is typed)
+          if python -c "import sys; from cascade.shared.config import load_chain_config as l; sys.exit(0 if l('$TOML').lane_c.from_block else 1)"; then
+            cascade-pool reveal --lane c --chain-toml "$TOML" --hf-repo "$HF_EVAL_REPO" \
+              --out ./_reveal_stage_c
+          fi

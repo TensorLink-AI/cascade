@@ -173,17 +173,16 @@ def verify_promotion_record_signature(record: PromotionRecord, trainer_hotkey: s
     is unavailable so a caller never silently accepts an unverified record."""
     if not record.signature or not trainer_hotkey:
         return False
-    try:
-        from bittensor import Keypair  # type: ignore
-    except ImportError as e:  # pragma: no cover - validator has bittensor
-        raise RuntimeError(
-            "bittensor required to verify promotion-record signatures; install the [chain] extra"
-        ) from e
-    try:
-        kp = Keypair(ss58_address=trainer_hotkey)
-        return bool(kp.verify(record.canonical_body(), bytes.fromhex(record.signature)))
-    except Exception:  # noqa: BLE001 — any malformed sig/address ⇒ untrusted
-        return False
+    from .sr25519 import verify_hotkey
+
+    return verify_hotkey(trainer_hotkey, record.canonical_body(), record.signature)
+
+
+class PromotionRecordConflict(ValueError):
+    """``promotions/gen-<n>.json`` already holds a DIFFERENT signed body for
+    this generation. Validators judge whichever body they read first and
+    never re-judge a staged generation, so overwriting it would split the
+    fleet; the publish is refused (operator reconciliation)."""
 
 
 def publish_promotion_record(store: object, record_text: str, generation: int) -> str:
@@ -195,10 +194,34 @@ def publish_promotion_record(store: object, record_text: str, generation: int) -
     roster from the record (inferring the cycle from receipts breaks at every
     generation boundary), and trust comes from the record's signature, not the
     ACL. Same fallback as the receipt publisher: a backend without canned ACLs
-    publishes private rather than not at all."""
-    from .hippius import StorageError
+    publishes private rather than not at all.
+
+    One body per generation: a record already published at the key with a
+    different ``canonical_body`` raises :class:`PromotionRecordConflict`
+    (nothing is written); the same body is re-put (an idempotent retry of a
+    publish whose acknowledgement was lost). An unparseable object at the key
+    is replaced — validators read it as "malformed, ignored", never as a
+    staged generation."""
+    from .hippius import ObjectNotFound, StorageError
 
     key = promotion_record_key(generation)
+    try:
+        existing = store.get_text(key)
+    except ObjectNotFound:
+        existing = None
+    except StorageError:
+        raise           # cannot tell what is there: no blind overwrite, retried
+    except Exception:  # noqa: BLE001 — a store without the absent-object class
+        existing = None
+    if existing is not None:
+        try:
+            published = load_promotion_record(existing).canonical_body()
+        except Exception:  # noqa: BLE001 — malformed: replaced
+            published = None
+        if published is not None and published != load_promotion_record(record_text).canonical_body():
+            raise PromotionRecordConflict(
+                f"{key} already holds a different record for generation {int(generation)}; "
+                "refusing to overwrite a published promotion")
     index_text = json.dumps({"latest_generation": int(generation)}, sort_keys=True)
     for k, text in ((key, record_text), (promotion_index_key(), index_text)):
         try:

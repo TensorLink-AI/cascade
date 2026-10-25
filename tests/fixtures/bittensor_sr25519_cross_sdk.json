@@ -1,0 +1,17 @@
+{
+ "message_hex": "63617363616465204445432d43412d3030353120737232353531392063726f73732d53444b20666978747572653a207b22726f756e645f6964223a22313233227d",
+ "//Alice": {
+  "ss58": "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+  "sig10": "82c0c92f8b908575447883eb0cea110c76df695d3e58a0df0693ec9a647a1f3e4fead05aba10443fc0bbe14e39998b5c4df9160c3d2580a7bb2a9cd100c6028a",
+  "sig11": "945dc97c6c0d194069ad08dd97fb08fdda4deca4e92d37b4e5e146188cff4336e67cd4471e007f4f3570819da81674c72bf76e67efa059efe7ae88bd15cb0e87"
+ },
+ "//Trainer": {
+  "ss58": "5DpzeqS6r8xy5ajWGJfsPxKEsWEj7bPTN6Bz6knnvez5PPiU",
+  "sig10": "b2dbf9f14f6c6acae7e16e8347c47900d8dc1304edba4dd4bc2561419e9b1b6fc7ca2bbc3037e68a5c1b3ef76d34cb6eeb2cf65db1ea5102146d466c22156e8c",
+  "sig11": "50fdadf326248217c436e980156dfff29bb01a5e5a1d5ae383d1e60311a07e6ac6e31d065f2cba006a54b883367aad279eaaff9bc482ed392a25d4865dd30c88"
+ },
+ "source": {
+  "sig10": "bittensor==10.5.0 bt.Keypair.create_from_uri(uri).sign(message)",
+  "sig11": "bittensor==11.3.0 bittensor.sp_core.Keypair.create_from_uri(uri).sign(message)"
+ }
+}

@@ -1,7 +1,7 @@
 """The measured variance bundle (DEC-CA-0033): EMA finished-form checkpoints,
 N-seed generation mix, and the warm-started re-warmup.
 
-Measured 2026-08-26 (docs/notes/2026-08-26-seed-variance-ema.md): EMA-0.999
+Measured 2026-08-26 (recorded in DEC-CA-0033): EMA-0.999
 shrinks entrant-specific generation-seed noise 4–11× and improves the
 absolute geomean ~7%; the seed mix averages N corpus realizations (~√N on
 the residual); base_lr against fresh optimizer state on a warm-started wsd

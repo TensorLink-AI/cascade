@@ -11,7 +11,6 @@ import pytest
 
 from cascade.shared import era as E
 from cascade.shared.config import load_chain_config
-from tests.unpinned import load_unpinned, strip_pins
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -151,7 +150,7 @@ def test_era_spec_json_round_trip():
 # ── loader ───────────────────────────────────────────────────────────────────
 
 def _toml_with(path: Path, tmp_path: Path, **overrides) -> Path:
-    text = strip_pins(path.read_text())
+    text = path.read_text()
     raw = tomllib.loads(text)
     out = []
     for line in text.splitlines():
@@ -187,7 +186,7 @@ def _toml_with(path: Path, tmp_path: Path, **overrides) -> Path:
 
 
 def test_shipped_tomls_parse_the_knobs():
-    main = load_unpinned(REPO / "chain.toml")
+    main = load_chain_config(REPO / "chain.toml")
     assert main.round.rolling_from_block == 0
     assert main.scoring.era_king_from_block == 0
     assert main.scoring.tenure_blocks_from_block == 0

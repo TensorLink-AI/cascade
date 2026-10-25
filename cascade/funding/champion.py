@@ -4,7 +4,7 @@ The sn100/PRISM ``top-model/`` pattern applied to cascade (DEC-CA-0036):
 direct submissions live privately in the operator's
 :class:`~cascade.funding.store.SubmissionStore`; the throne is what publishes.
 ``champions/<digest>.zip`` plus a ``champions/index.json`` land public-read on
-the same store the heat standings ride, and ``cascade fetch king`` reads them
+the manifest store, and ``cascade fetch king`` reads them
 anonymously — "beat the visible best" survives, but only ever for the best.
 
 WHEN a king's code reveals is `[round] champion_publish` policy:
@@ -164,7 +164,7 @@ class ChampionPublisher:
         """Idempotently push the ZIP + index entry public-read; False on failure.
 
         Best-effort by contract: a throne must never be blocked by a bucket.
-        The ACL fallback mirrors ``heat_status._publish_public_json`` (some
+        The ACL fallback mirrors ``hippius.publish_public_json`` (some
         backends reject canned ACLs).
         """
         from ..shared.hippius import StorageError

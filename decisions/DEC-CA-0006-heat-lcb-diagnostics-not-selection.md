@@ -2,7 +2,8 @@
 id: DEC-CA-0006
 type: decision
 title: "Heat screen: LCB machinery is a diagnostic, never the selection rule"
-status: active
+status: superseded
+note: "Superseded by DEC-CA-0037, then DEC-CA-0043. The heat screen was removed with the legacy round modes; nothing ranks a field before the duel."
 date: 2026-07-25
 tags: [koth, heat, scoring, bootstrap, eval]
 revisit_when: "logged heat diagnostics show leader_lcb routinely at or below 0 (the screen is not separating first from second), or [round] finalists rises above 1 — at which point 'advance the statistically tied set' becomes a real choice rather than a no-op"

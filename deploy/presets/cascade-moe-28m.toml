@@ -1,0 +1,60 @@
+# Cascade-MOE-28M [training] preset (DEC-CA-0050, P1).
+#
+# Live as the post-v2 contract: these keys are the [v2.training] table of
+# chain.toml / chain.testnet.toml, effective for every era starting at or
+# after [v2] from_block (DEC-CA-0050 go-live; contract_digest moves AT the
+# block, not at the release). Architecture change ⇒ a new lineage from random
+# init (spec §7); the toto2 lineage is never warm-started into this model.
+#
+# base_arch_digest is pinned by tests/unit/test_moe_trainer.py
+# (test_preset_digest_matches_source): any edit to cascade/trainer/moe_model.py
+# fails that test until this value is re-pinned.
+
+[training]
+base_arch          = "cascade_moe"
+arch_preset        = "cascade-moe-28m"
+base_arch_digest   = "767b9525666d7f49eeec24de7642c4f8fe5e007de2b14657312e6c5795d3e877"
+d_model            = 512
+num_layers         = 10
+num_heads          = 8
+head_dim           = 64
+patch_size         = 32
+mlp_expansion      = 2            # unused by cascade_moe (FFN widths live in moe_model.py)
+d_ff               = 1104         # dense FFN width = 8 × 92 + 368 (active MoE width)
+num_quantiles      = 9
+masking            = "contiguous_patch"
+cpm_c_max          = 16           # 16 patches × 32 = up to 512 points per span
+cpm_p_max          = 0.4          # up to 40% of patches
+input_transform    = "arcsinh_causal"
+context_length     = 4096
+horizon            = 64
+target_train_hours          = 3.0
+ref_throughput_tokens_per_s = 3700000  # PLACEHOLDER — MEASURE MoE-28M on the pinned L40S first
+warmup_fraction             = 0.0042   # ≈ 80 steps × 2.1M points at a 40B budget; recompute from the measured budget
+batch_size                  = 64       # 64 groups × 8 channels × 4096 points per update
+batch_denomination          = "series"
+budget_denomination         = "series_points"  # OPEN (master plan Q1): "points" = channel-time points
+optimizer          = "normuon_adamw"
+base_lr            = 0.0025       # NorMuon LR (spec §4)
+adamw_lr_scale     = 0.2          # AdamW LR 5e-4 = 0.0025 × 0.2
+weight_decay       = 2e-8
+muon_momentum      = 0.96
+muon_row_beta2     = 0.999
+adamw_beta1        = 0.91
+adamw_beta2        = 0.972
+grad_clip          = 7.0
+lr_schedule        = "wsd"        # 80-step warmup, then constant; cooldown at milestones
+umup_base_d_model  = 512          # µP base width
+mup_lr_exponent    = 1.42         # µP width correction on the NorMuon LR (1.0 at d_model 512)
+warm_lr_scale      = 1.0
+train_seed_salt    = 1337
+max_train_seconds  = 18000
+corpus_mode        = "stream_cpu"
+micro_batches      = 2            # ~56 GiB in one pass > 48 GB L40S; 2 × 32 groups fits
+power_ema_sigma_rels = [0.05, 0.10]
+power_ema_eval     = 0            # the 5% EMA is the scored artifact — king and challenger alike
+copula_loss_cap    = 0.1          # energy score ≤ 0.1 × the marginal gradient norm
+copula_samples     = 8
+copula_patches     = 2
+router_lr_scale       = 0.1       # slow router once the lane-B routing gate has opened
+route_bias_rate_scale = 0.25      # (full rate before; owner-tunable)

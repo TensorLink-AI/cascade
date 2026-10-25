@@ -2,7 +2,7 @@
 id: DEC-CA-0045
 type: decision
 title: "Stake-weighted activation: validators signal readiness on chain, the DEC-CA-0043 rollover locks in at the first boundary where 51% of eligible validator stake has signalled and flips at the next boundary — no typed-in block"
-status: proposed
+status: accepted
 date: 2026-09-21
 tags: [consensus, block-gate, rollout, validators, stake, rolling, era-king]
 revisit_when: "the owner validator's own share of permit-holding stake on netuid 91 is over the threshold (then 51% is one operator deciding — raise the threshold, exclude the owner hotkey from the denominator, or accept it as the typed-in block with extra steps); or a lock-in fires while under half the external validators are upgraded and the ones left behind hold weight for more than one round (raise the lock-in-to-rollover delay from one boundary to one era); or a second feature needs its own signal (the note format carries one feature — generalise to a list before then); or the public finney endpoint stops serving metagraph reads at a boundary block a few minutes old (a node then never counts for itself — boundaries are tallied in order and a boundary it cannot read is retried, never skipped — and every node's decision rides on the notes alone)"

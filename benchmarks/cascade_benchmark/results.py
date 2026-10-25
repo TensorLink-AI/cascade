@@ -9,6 +9,21 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 
+# Reporting metadata only: these describe the EXISTING scoring contracts.
+# Parallel execution must not replace them with a faster approximation.
+METHODOLOGY = {
+    "gift-eval": {"metrics": "reference GIFT-Eval metrics",
+                  "aggregate": "official Seasonal-Naive-normalized shifted geometric mean"},
+    "boom": {"metrics": "reference GIFT-Eval metrics over BOOM tasks",
+             "aggregate": "official BOOM baseline and low-variance exclusions"},
+    "time": {"metrics": "upstream timebench metric engine",
+             "aggregate": "Cascade Seasonal-Naive-normalized shifted geometric mean"},
+    "fev": {"metrics": "cascade-fev/1: pooled nine-quantile WQL and seasonal MASE",
+            "aggregate": "Seasonal-Naive-normalized geometric mean",
+            "scope": "univariate targets; covariates unused; multivariate targets reported as scope skips",
+            "official_fev_leaderboard_equivalent": False},
+}
+
 
 @dataclass
 class SuiteResult:
@@ -26,20 +41,19 @@ class SuiteResult:
     # rows ``{"full": name/term, "num_variates", "prediction_length", "CRPS",
     # "MASE", "snaive_CRPS", "snaive_MASE"}`` — enough for uni/multi splits.
     rows: list = field(default_factory=list)
-    # Skip accounting (2026-09-18: every cascade GIFT-Eval report silently
-    # covered 74 of the 97 official configs for two months — the per-config
-    # ``except: continue`` left no trace, so the headline read as
-    # leaderboard-comparable when it was not). One dict per config that was
+    # Skip accounting, so a partial sweep can never read as
+    # leaderboard-comparable. One dict per config that was
     # requested but produced no row: ``{"full": name/freq/term, "stage":
     # "load" | "score", "reason": "<ExcType>: <message>"}``. ``n_expected`` is
     # the number of configs the sweep set out to score; a consumer compares it
     # with ``n_series`` to see whether the headline covers the whole benchmark.
     skipped: list = field(default_factory=list)
     n_expected: int = 0
+    max_series: int = 0
 
     @property
     def partial(self) -> bool:
-        return bool(self.n_expected) and self.n_series < self.n_expected
+        return bool(self.max_series) or bool(self.n_expected) and self.n_series < self.n_expected
 
 
 @dataclass
@@ -53,6 +67,8 @@ class BenchmarkReport:
     def to_dict(self) -> dict:
         return {
             "checkpoint": self.checkpoint,
-            "suites": [asdict(s) for s in self.suites],
+            "suites": [{**asdict(s), "partial": s.partial} for s in self.suites],
             "data_revisions": dict(self.data_revisions),
+            "methodology": {s.suite: METHODOLOGY[s.suite] for s in self.suites
+                            if s.suite in METHODOLOGY},
         }

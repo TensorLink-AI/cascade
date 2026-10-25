@@ -101,22 +101,19 @@ def test_decode_json_body_survives_proxy_html():
 
 
 def test_cascade_queue_renders_roster_and_marks_you(capsys, monkeypatch, tmp_path):
-    """`cascade queue` prints the published roster (sku, capacities, seniority
-    order, outcomes) and marks the caller's rows — the miner-side half of the
-    funded transparency contract (the audit's funded-roster check is the
-    other)."""
+    """`cascade queue` prints the published rolling roster (settled legs in
+    seniority order, legs still training, the waiting queue, failures) and
+    marks the caller's rows — the miner-side half of the funded transparency
+    contract (the audit's funded-roster check is the other)."""
     import argparse
 
     from cascade.miner import cli as cli_mod
 
-    doc = {"round_id": "77",
-           "admission": {"cap": 8, "configured_cap": 8, "market_capacity": 17,
-                         "reserve": 1, "sku": "RTX4090",
-                         "sku_capacities": {"RTX4090": 17, "A6000": 1}},
+    doc = {"round_id": "77", "mode": "rolling",
            "seated": [{"hotkey": "hkME", "ref": "r", "reveal_block": 10}],
+           "in_flight": [{"hotkey": "hkF", "reveal_block": 15, "target_boundary": 900}],
            "waiting": [{"hotkey": "hkW", "reveal_block": 20}],
-           "terminal": [{"hotkey": "hkBad", "error_class": "auth"}],
-           "outcomes": [{"hotkey": "hkME", "outcome": "trained"}]}
+           "terminal": [{"hotkey": "hkBad", "error_class": "auth"}]}
     monkeypatch.setattr("cascade.miner.dashboard.fetch_public_json",
                         lambda storage, key, **kw: doc)
     monkeypatch.setattr(cli_mod, "load_chain_config",
@@ -125,7 +122,9 @@ def test_cascade_queue_renders_roster_and_marks_you(capsys, monkeypatch, tmp_pat
         chain_toml=None, round=None, intake=None, hotkey="hkME"))
     out = capsys.readouterr().out
     assert rc == 0
-    assert "RTX4090=17" in out and "A6000=1" in out
     assert "hkME  reveal=10  ← you" in out
+    assert "admitted (historical): hkF  reveal=15  target was 900" in out
+    assert "settlement snapshot, not live status" in out
+    assert "waiting: hkW  reveal=20" in out
     assert "hkBad  [auth]" in out
     assert "cascade-audit round" in out

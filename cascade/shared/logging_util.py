@@ -8,6 +8,10 @@ validator services, which makes them look hung when they are working fine.
 :func:`restore_cascade_logging` imports bittensor (forcing that one-time silence
 to happen now) and then puts the ``cascade.*`` loggers back at the requested
 level. Call it once in a service ``main`` before entering the run loop.
+
+bittensor 11.x (DEC-CA-0051) no longer touches logging configuration (it only
+attaches a NullHandler to ``bittensor``); this stays as an idempotent,
+harmless guard so a service never depends on the SDK's logging behaviour.
 """
 
 from __future__ import annotations

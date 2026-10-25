@@ -88,7 +88,6 @@ def test_accumulator_skips_univariate_and_summarises_mv():
     for _ in range(10):
         acc.observe(rng.standard_normal(100))          # 1-D: ignored
         acc.observe(rng.standard_normal((1, 100)))     # (1, L): ignored
-    assert acc.n_observed == 0
     assert acc.summary() is None
 
     base = rng.standard_normal(300)

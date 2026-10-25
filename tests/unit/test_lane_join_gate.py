@@ -167,7 +167,6 @@ def _runner_for_gate(monkeypatch, *, rc=0, out="LANE_OK\n", runtime="", slow="")
                             returncode=rc, stdout=out, stderr="refused" if rc else ""))
     monkeypatch.setattr("cascade.trainer.remote.probe_worker_runtime", lambda h, **k: runtime)
     fake = SimpleNamespace(cfg=SimpleNamespace(round=SimpleNamespace(funded_pod_sku="RTX4090")),
-                           _funded_round_sku="",
                            _host_bench_below_floor=lambda host, sku, label: slow)
     return TrainerRunner._operator_lane_gate.__get__(fake)
 
@@ -190,11 +189,6 @@ def test_operator_lane_gate_checks_ssh_runtime_and_floor(monkeypatch):
 
 # ── kept payer pods across a round failure ───────────────────────────────────
 
-def test_kept_pods_survive_a_failure_inside_the_epoch_only():
-    now = 1_000_000.0
-    assert L._kept_pods_survive_failure(now + 3600.0, now)
-    assert not L._kept_pods_survive_failure(now - 1.0, now)
-    assert not L._kept_pods_survive_failure(None, now)
 
 
 def test_dispatch_retry_skips_a_sibling_lane_handed_back_by_a_peer(monkeypatch):

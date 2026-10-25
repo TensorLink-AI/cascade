@@ -1,7 +1,7 @@
 """Host-side run telemetry — what the POD contributed to a run, apart from the
 submission.
 
-A heat screens generators on the compute their corpus bought, and the wall is
+A leg trains on the compute its generator's corpus bought, and the wall is
 priced in generator speed deliberately (DEC-CA-0001). That pricing is only a
 measurement of the *generator* if the device under every entrant is the same.
 The fleet is rented per round, sometimes across several marketplaces, so it is
@@ -342,7 +342,7 @@ def host_bench(device: str) -> dict:
     import torch
 
     dev = torch.device(device)
-    if dev.type == "cuda" and not torch.cuda.is_available():
+    if dev.type == "cuda" and (not torch.cuda.is_available() or (dev.index is not None and dev.index >= torch.cuda.device_count())):
         # A custom backend can name a device this box does not have. Falling back
         # keeps the CPU leg — losing every leg over one bad device string would
         # discard the telemetry exactly on the hosts most worth looking at.

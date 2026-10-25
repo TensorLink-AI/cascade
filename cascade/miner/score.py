@@ -1,23 +1,23 @@
 """Local generator scoring — the fast miner iteration loop.
 
 `cascade score` closes the loop the on-chain round can't: train the fixed model
-on your generator's data at the cheap **heat** budget (minutes, not the ~3h
-final) and score it on a pool you control, entirely offline — no chain, no TAO,
+on your generator's data at a cheap local budget (``[round] heat_train_hours``:
+minutes, not the ~3h leg) and score it on a pool you control, entirely offline — no chain, no TAO,
 no ~12h round. It reuses the exact pieces the trainer/validator use
 (``open_round_stream`` → the reference ``BaseTrainer`` → ``evaluate_checkpoint``
-→ ``global_geomean``), so the number tracks how the heat screener would rank you.
+→ ``global_geomean``), so the number tracks the metric the duel judges.
 
 The score is **directional, not the verdict**: you score on a public/sample pool,
 while the validator scores on its private rotating pool. By default this trains
 from random init; live rounds train from the promoted cascade warm-start once a
-generation is live, so pass ``--warm-start live`` (the init the current round
-trains from, read from the public round status) or an explicit ``repo@digest`` /
+generation is live, so pass ``--warm-start live`` (the current era init from
+fresh trainer status, with its matching effective training contract) or an explicit ``repo@digest`` /
 local checkpoint dir to train the way the live round does — same starting
 weights AND the warm-started recipe (``warm_lr_scale``, wsd warmup-once). Use it
 to hill-climb locally, then let the real eval rank you. Pair it with
 ``cascade fetch king`` to score the reigning king the same way and compare.
 
-Needs the ``[train]`` extra (torch) and, ideally, a GPU — the heat budget keeps
+Needs the ``[train]`` extra (torch) and, ideally, a GPU — the cheap budget keeps
 it to minutes.
 """
 
@@ -40,6 +40,8 @@ class ScoreResult:
     train_seconds: float
     pool_label: str
     init_label: str = "random init"
+    contract_digest: str = ""
+    train_tokens: int = 0
 
 
 def _load_pool_windows(cfg, *, pool_dir, pool_ref, n_windows, seed, cache_dir):
@@ -90,12 +92,19 @@ def _load_pool_windows(cfg, *, pool_dir, pool_ref, n_windows, seed, cache_dir):
 LIVE_WARM_START = "live"
 
 
+def resolve_live_warm_start(cfg) -> str | None:
+    """Require the same current contract/init pair as every live scoring entry point."""
+    from .training_context import live_context
+
+    return live_context(cfg)[1]
+
+
 def _resolve_warm_start(cfg, warm_start, *, cache_dir) -> tuple[Path | None, str]:
     """Resolve ``warm_start`` to a local checkpoint dir for the trainer.
 
-    ``None``/empty ⇒ random init. ``"live"`` ⇒ the promoted init THIS round
-    trains from, read from the trainer's public round-status doc (a random-init
-    round resolves to random init). A ``metro-v1:trained:hippius:…`` pointer or
+    ``None``/empty ⇒ random init. ``"live"`` ⇒ the current era init from
+    fresh trainer/chain status with its effective contract; unavailable evidence
+    never silently means random init. A ``metro-v1:trained:hippius:…`` pointer or
     a bare ``repo@digest`` is fetched from the Hub into ``cache_dir``; anything
     else must be an existing local directory holding the checkpoint weights.
     Returns ``(dir_or_None, label)``.
@@ -105,14 +114,9 @@ def _resolve_warm_start(cfg, warm_start, *, cache_dir) -> tuple[Path | None, str
     spec = str(warm_start).strip()
 
     if spec.lower() == LIVE_WARM_START:
-        from .dashboard import fetch_public_round_status
-
-        doc = fetch_public_round_status(cfg.storage)
-        ws = doc.get("warm_start") if isinstance(doc, dict) else None
-        init = ws.get("init_checkpoint") if isinstance(ws, dict) else None
+        init = resolve_live_warm_start(cfg)
         if not init:
-            log.info("warm-start live: the current round trains from random init")
-            return None, "random init (live round is not warm-started)"
+            return None, "random init (live init has no checkpoint)"
         spec = str(init)
 
     from ..shared.hippius import HubConfig, HubRef, fetch_from_hub, is_hub_ref
@@ -146,31 +150,38 @@ def score_generator(
     cache_dir: Path | str = "./_score_work",
     trainer_spec: str = "cascade.trainer.toto2_trainer:Toto2Trainer",
     warm_start: str | Path | None = None,
+    at_block: int | None = None,
 ) -> ScoreResult:
-    """Train the fixed model on ``repo_dir``'s corpus at the heat budget and score
-    it on the resolved pool. Returns a :class:`ScoreResult` (lower geomean better).
+    """Train the fixed model on ``repo_dir``'s corpus at a cheap local budget and
+    score it on the resolved pool. Returns a :class:`ScoreResult` (lower geomean better).
 
-    ``train_hours`` defaults to ``[round] heat_train_hours`` (the cheap screen);
-    ``n_windows`` to ``[round] heat_n_windows``. Reuses the round's contract at the
-    screen size, so the number mirrors the heat screener's ranking.
+    ``train_hours`` defaults to ``[round] heat_train_hours`` (the cheap local
+    budget); ``n_windows`` to ``[round] heat_n_windows``. Reuses the round's
+    contract at the primary size, scaled down to that budget.
 
     ``warm_start`` (see :func:`_resolve_warm_start`) replaces the seeded random
-    init with a promoted cascade checkpoint — ``"live"`` for the one the current
-    round trains from — and switches the trainer to the warm-started recipe, so
+    init with a promoted cascade checkpoint — ``"live"`` for the current era init — and switches the trainer to the warm-started recipe, so
     the run mirrors a live warm-started round instead of a from-scratch one.
     """
     from ..eval.scoring import global_geomean
+    from ..shared.manifest import contract_digest
     from ..trainer.contract import RoundSeeds
     from ..trainer.main import _load_trainer
-    from ..trainer.stream import open_round_stream
     from ..validator.evaluator import evaluate_checkpoint
+    from .local_corpus import local_round_stream
+    from .training_context import configured_context, live_context
+
+    if str(warm_start).lower() == LIVE_WARM_START:
+        cfg, warm_start, _ = live_context(cfg)
+    else:
+        cfg = configured_context(cfg, at_block)
 
     repo = Path(repo_dir)
     hours = train_hours if train_hours is not None else cfg.round.heat_train_hours
     # for_hours scales the wall-clock cap down with the budget (same contract +
-    # [round] guard knobs the heat screener trains under), so a bug that stalls
-    # your generator fails in minutes locally, and a slow generator shows the
-    # same deadline truncation here that it would suffer in the real heat.
+    # [round] guard knobs), so a bug that stalls your generator fails in
+    # minutes locally, and a slow generator shows deadline truncation here
+    # proportional to what it would suffer on a real leg.
     contract = cfg.screen_contract().for_hours(           # primary/screen size
         hours,
         guard_factor=cfg.round.heat_guard_factor,
@@ -192,16 +203,21 @@ def score_generator(
     train_kwargs = {"warm_start_dir": ws_dir} if ws_dir is not None else {}
 
     base_trainer = _load_trainer(trainer_spec)
+    if hasattr(base_trainer, "device"):
+        base_trainer.device = device
     with tempfile.TemporaryDirectory(dir=cache, prefix="ckpt-") as td:
         out_dir = Path(td)
         log.info("training on %s at %.3gh (%s point-passes) from %s …",
                  repo.name, hours, f"{token_budget:,}", init_label)
-        with open_round_stream(
+        with local_round_stream(
             contract.corpus_mode, repo, seeds.generation_seed, cfg.generator,
+            generation=cfg.generation,
             token_budget=token_budget, use_sandbox=False,      # local, trusted-own-code path
             blocked=cfg.static_guard.blocked,
             seed_mix=int(getattr(contract, "gen_seed_mix", 1) or 1),
             budget_denomination=getattr(contract, "budget_denomination", "points"),
+            corpus_epochs=int(getattr(contract, "corpus_epochs", 0) or 0),
+            **({"continuation_protocol": contract.continuation_protocol} if getattr(contract, "continuation_protocol", "") else {}),
         ) as rs:
             result = base_trainer.train(
                 rs.series(), contract,
@@ -221,4 +237,6 @@ def score_generator(
         train_seconds=result.train_seconds,
         pool_label=pool_label,
         init_label=init_label,
+        contract_digest=contract_digest(contract),
+        train_tokens=token_budget,
     )

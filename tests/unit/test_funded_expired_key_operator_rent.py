@@ -9,6 +9,7 @@ unchanged.
 """
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -18,7 +19,6 @@ from cascade.provision import funded as funded_mod
 from cascade.trainer.loop import (
     TrainerRunner,
     _FundedLegSkip,
-    _FundedOperatorFallback,
     _FundedOperatorRent,
 )
 from tests.unit.test_funded_pod_wiring import _challenger, _runner, _vault
@@ -29,18 +29,20 @@ VAULT_REF = "vault/direct@sha256:" + "d" * 64
 
 
 def _bind(r):
-    for name in ("_operator_rent_allowed", "_operator_leg_pod_prefix",
+    for name in ("_operator_rent_allowed", "_operator_recovery_available", "_operator_leg_pod_prefix",
                  "_is_operator_leg_pod_of", "_rent_operator_leg_host",
                  "_run_operator_rented_leg"):
         setattr(r, name, getattr(TrainerRunner, name).__get__(r))
     r.OPERATOR_LEG_POD_TAG = TrainerRunner.OPERATOR_LEG_POD_TAG
+    r.OPERATOR_FAULT_RETRIES = TrainerRunner.OPERATOR_FAULT_RETRIES
     return r
 
 
 def _expired_runner(tmp_path, *, on=True, opted_in=True, queue=True):
     r = _bind(_runner(tmp_path, funded_operator_fallback=on))
     r.remote_hosts_path = None
-    r.remote_hosts = []                                    # no operator lane on file
+    # the pod profile only — no operator lane on file
+    r.remote_hosts = [replace(r.remote_hosts[0], profile_only=True)]
     r._operator_fallback_lanes = TrainerRunner._operator_fallback_lanes.__get__(r)
     r._leg_local_obj = SimpleNamespace(operator_rent_ok=opted_in)
     (tmp_path / "pv").mkdir(exist_ok=True)                 # vault exists, key does not
@@ -105,11 +107,23 @@ def test_an_operator_billed_entry_with_no_lane_rents_on_the_operator(tmp_path, m
     q.set_operator_billed("hkA", True)
     with pytest.raises(_FundedOperatorRent):
         r._rent_funded_host("777", _challenger("hkA"))
-    # not opted in ⇒ the plain lane fallback, exactly as before
+    # Without opt-in or a real operator lane no make-good can ever run: the leg
+    # retries on the payer's key with a new pod instead of waiting forever.
     r._leg_local_obj = SimpleNamespace(operator_rent_ok=False)
-    with pytest.raises(_FundedOperatorFallback) as ei:
+    with pytest.raises(Exception, match="payer rent"):
         r._rent_funded_host("777", _challenger("hkA"))
-    assert not isinstance(ei.value, _FundedOperatorRent)
+    assert not q.get("hkA").operator_billed and q.get("hkA").operator_faults == 1
+    # A recurring operator-side cause must not keep billing the miner.
+    for _ in range(r.OPERATOR_FAULT_RETRIES - 2):
+        q.set_operator_billed("hkA", True)
+        with pytest.raises(Exception, match="payer rent"):
+            r._rent_funded_host("777", _challenger("hkA"))
+    q.set_operator_billed("hkA", True)
+    assert q.get("hkA").operator_faults == r.OPERATOR_FAULT_RETRIES
+    with pytest.raises(_FundedLegSkip):
+        r._rent_funded_host("777", _challenger("hkA"))
+    assert r._funded_leg_failures["hkA"][2:] == ("operator", False)
+    assert "paused after" in r._funded_leg_failures["hkA"][0]
 
 
 # ── the operator rent itself ─────────────────────────────────────────────────

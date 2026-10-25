@@ -102,13 +102,24 @@ def test_interval_zero_disables(cfg):
     assert runner._last_weight_block is None
 
 
-def test_failed_push_still_stamps_no_hammer(cfg):
-    # A dropped extrinsic must NOT retry every poll tick — next attempt comes
-    # after one interval (~27 attempts remain before the activity cutoff).
+def test_failed_push_retries_after_a_short_backoff(cfg):
+    # A dropped extrinsic is not recorded as a weight set (the validator would
+    # otherwise sit an interval with stale weights), but it does not hammer
+    # every poll tick either: it retries after WEIGHT_RETRY_BLOCKS.
+    from cascade.validator.weights import WEIGHT_RETRY_BLOCKS
+
     client = _Client(block=1200, uids={KING: 7}, fail=True)
     runner = _runner(cfg, genesis(KING, 7))
-    runner._maybe_reassert_weights(client)  # _apply_weights swallows the error
-    assert runner._last_weight_block == 1200
+    runner._maybe_reassert_weights(client)
+    assert runner._last_weight_block is None
+    n = len(client.set_calls)
+    client.block = 1200 + WEIGHT_RETRY_BLOCKS - 1
+    runner._maybe_reassert_weights(client)
+    assert len(client.set_calls) == n                   # inside the backoff
+    client.block = 1200 + WEIGHT_RETRY_BLOCKS
+    client.fail = False
+    runner._maybe_reassert_weights(client)
+    assert runner._last_weight_block == 1200 + WEIGHT_RETRY_BLOCKS
 
 
 def test_round_weight_set_resets_timer(cfg):

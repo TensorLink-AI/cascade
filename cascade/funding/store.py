@@ -475,8 +475,8 @@ def fetch_vault_snapshot(ref: HubRef, dest_dir: Path | str) -> Path:
     # PID-only name let each lane's rmtree delete the other's mid-extract).
     tmp = dest.parent / f".{dest.name}.vault-{os.getpid()}-{uuid.uuid4().hex[:8]}"
     # This is the FETCH path: fetch_from_hub's whole contract is "raises
-    # StorageError on failure", and its callers (the dedup screen, promotion,
-    # heat-status publish) catch StorageError to degrade gracefully. So ANY
+    # StorageError on failure", and its callers (the dedup registry, promotion)
+    # catch StorageError to degrade gracefully. So ANY
     # failure here — including the operator OSError/MemoryError that
     # extract_zip_safely deliberately propagates raw for the INTAKE path
     # (→500) — must become a StorageError so a trainer-side disk/OOM hiccup

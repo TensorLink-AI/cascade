@@ -1,21 +1,10 @@
-"""Content-level duplicate screen — fingerprints, pairwise verdicts, and the
-trainer wiring (fetch faked; no Hub, no GPU)."""
+"""Content fingerprints (DEC-CA-0008): the exact-identity digests and packed
+components the rolling admission registry compares (fetch faked; no Hub)."""
 
 from __future__ import annotations
 
-import json
+from cascade.interface.dedup import fingerprint_dir, iter_normalized_tokens
 
-import pytest
-
-from cascade.interface.dedup import (
-    KING_UID,
-    fingerprint_dir,
-    normalized_tokens,
-    screen_duplicates,
-)
-
-# A generator body long enough that a one-line edit stays above a 0.99 token
-# ratio (the near-duplicate tier) while structural rewrites fall well below.
 BASE_SOURCE = "\n".join(
     ["import numpy as np", "", "class Generator:", "    def __init__(self, cfg):",
      "        self.cfg = cfg"]
@@ -34,12 +23,6 @@ def _repo(tmp_path, name: str, source: str, extra: dict[str, str] | None = None)
         (d / fname).write_text(content)
     return d
 
-
-def _entry(tmp_path, name, uid, source, extra=None):
-    return (name, uid, fingerprint_dir(_repo(tmp_path, name, source, extra)))
-
-
-# ── fingerprints ─────────────────────────────────────────────────────────────
 
 def test_comment_and_whitespace_shuffle_is_token_identical(tmp_path):
     a = fingerprint_dir(_repo(tmp_path, "a", BASE_SOURCE))
@@ -67,197 +50,8 @@ def test_identical_tree_reupload_matches(tmp_path):
 
 
 def test_tokenize_fallback_on_syntax_error():
-    toks = normalized_tokens("def broken(:\n  pass")
+    toks = tuple(iter_normalized_tokens("def broken(:\n  pass"))
     assert toks  # stable fingerprint even for unparsable source
-
-
-# ── pairwise screen ──────────────────────────────────────────────────────────
-
-def test_near_copy_with_a_real_token_delta_is_kept(tmp_path):
-    # POLICY: there is no similarity threshold — a ratio bar is gameable by
-    # spacing edits under it and it false-positived a round's finalist. A
-    # 1-token edit is a different program; it is kept. (Zero-delta re-rolls
-    # are caught by the identical tiers / the behavioral probe instead.)
-    tweaked = BASE_SOURCE.replace("size=64", "size=65", 1)
-    entries = [
-        _entry(tmp_path, "orig", 10, BASE_SOURCE),
-        _entry(tmp_path, "twk", 42, tweaked),
-    ]
-    result = screen_duplicates(entries, None)
-    assert result.kept_hotkeys == ("orig", "twk")
-    assert not result.dropped
-
-
-def test_copy_of_king_dropped(tmp_path):
-    king = fingerprint_dir(_repo(tmp_path, "king", BASE_SOURCE))
-    entries = [_entry(tmp_path, "c", 7, "# defend the throne\n" + BASE_SOURCE)]
-    result = screen_duplicates(entries, king)
-    assert result.kept_hotkeys == ()
-    (v,) = result.dropped
-    assert v.matched_uid == KING_UID and v.tier == "token_identical"
-
-
-def test_template_variants_are_kept(tmp_path):
-    # Same scaffold, genuinely different data process — kept, no verdicts.
-    variant = BASE_SOURCE
-    for i in range(0, 120, 17):
-        variant = variant.replace(f"* 0.5 + {i % 7}", f"* 1.5 - {i % 5}")
-        variant = variant.replace(f"rng.normal(0.0, 1.0, size=64) * self.w{i}",
-                                  f"rng.laplace(0.0, 2.0, size=32) * self.w{i}")
-    entries = [
-        _entry(tmp_path, "orig", 1, BASE_SOURCE),
-        _entry(tmp_path, "variant", 2, variant),
-    ]
-    result = screen_duplicates(entries, None)
-    assert result.kept_hotkeys == ("orig", "variant")
-    assert not result.dropped and not result.shadow
-
-
-def test_distinct_generators_kept_silently(tmp_path):
-    other = "\n".join(f"value_{i} = {i} ** 2" for i in range(200))
-    entries = [
-        _entry(tmp_path, "a", 1, BASE_SOURCE),
-        _entry(tmp_path, "b", 2, other),
-    ]
-    result = screen_duplicates(entries, None)
-    assert result.kept_hotkeys == ("a", "b")
-    assert not result.dropped and not result.shadow
-
-
-def test_dropped_copies_never_become_rivals(tmp_path):
-    # b and c are both copies of a. Each must be judged against KEPT entries
-    # (a) — never chained through another dropped copy.
-    entries = [
-        _entry(tmp_path, "a", 1, BASE_SOURCE),
-        _entry(tmp_path, "b", 2, "# reup one\n" + BASE_SOURCE),
-        _entry(tmp_path, "c", 3, "# reup two\n" + BASE_SOURCE),
-    ]
-    result = screen_duplicates(entries, None)
-    assert result.kept_hotkeys == ("a",)
-    assert [(v.hotkey, v.matched_hotkey) for v in result.dropped] == [
-        ("b", "a"), ("c", "a")]
-
-
-def test_shadow_mode_drops_nothing(tmp_path):
-    entries = [
-        _entry(tmp_path, "orig", 1, BASE_SOURCE),
-        _entry(tmp_path, "copy", 2, BASE_SOURCE),
-    ]
-    result = screen_duplicates(entries, None, enforce=False)
-    assert result.kept_hotkeys == ("orig", "copy")  # kept…
-    assert [v.hotkey for v in result.dropped] == ["copy"]  # …but the verdict logs
-
-
-# ── trainer wiring ───────────────────────────────────────────────────────────
-
-@pytest.fixture
-def dedup_runner(cfg, tmp_path, monkeypatch):
-    """A TrainerRunner whose fetch resolves refs to local fixture dirs."""
-    from dataclasses import replace
-
-    from cascade.trainer import loop as loop_mod
-    from cascade.trainer.loop import ResolvedGenerator, TrainerRunner
-
-    repos = {}
-    transport_fail: set[str] = set()
-
-    def add(name, uid, source, reveal_block=0):
-        ref = f"{name}/gen@sha256:{name[0] * 64}"
-        repos[ref] = _repo(tmp_path / "repos", name, source)
-        return ResolvedGenerator(hotkey=name, uid=uid, ref=ref,
-                                 reveal_block=reveal_block)
-
-    def fake_fetch(ref, dest, hub=None):
-        from types import SimpleNamespace
-
-        from cascade.shared.hippius import StorageError
-
-        ref = str(ref)
-        if ref in transport_fail:
-            raise StorageError(f"fetch of {ref}: connection reset by peer")
-        if ref not in repos:
-            cause = RuntimeError("not found")
-            cause.response = SimpleNamespace(status_code=404)
-            raise StorageError(f"fetch of {ref}") from cause
-        return repos[ref]
-
-    class _FakeLogs:
-        def __init__(self):
-            self.puts = {}
-
-        def put_text(self, key, text, **kwargs):
-            self.puts[key] = text
-
-    fake_logs = _FakeLogs()
-    add.transport_fail = transport_fail
-    add.logs = fake_logs
-    monkeypatch.setattr(loop_mod, "fetch_from_hub", fake_fetch)
-    monkeypatch.setattr(loop_mod.TrainerRunner, "logs_store", lambda self: fake_logs)
-    dedup_cfg = replace(cfg, round=replace(cfg.round, dedup_mode="enforce",
-                                           dedup_probe_mode="off",
-                                           dedup_probe_series=0))
-    runner = TrainerRunner(cfg=dedup_cfg, base_trainer=object(),
-                           work_root=tmp_path / "work", use_sandbox=False)
-    monkeypatch.setattr(TrainerRunner, "hub", lambda self: None)
-    return runner, add
-
-
-def test_runner_screen_drops_copy_and_writes_report(dedup_runner, tmp_path):
-    runner, add = dedup_runner
-    king = add("king", 0, BASE_SOURCE)
-    orig = add("alice", 3, "\n".join(f"v{i} = {i} + 1" for i in range(200)))
-    copy = add("mallory", 9, "# resubmit\n" + BASE_SOURCE)  # copy of the king
-
-    kept = runner._screen_duplicate_entrants(king, [orig, copy], base_seed=77)
-    assert [c.hotkey for c in kept] == ["alice"]
-
-    report = json.loads((runner.work_root / "77" / "dedup_report.json").read_text())
-    assert report["mode"] == "enforce"
-    assert [d["hotkey"] for d in report["dropped"]] == ["mallory"]
-    assert report["dropped"][0]["matched_hotkey"] == "king"
-    # fetched trees are cleaned up after screening
-    assert not (runner.work_root / "77" / "dedup").exists()
-    # the report is also published to the logs store (shadow evidence must
-    # not depend on orchestrator disk)
-    assert "logs/round-77/dedup_report.json" in add.logs.puts
-
-
-def test_runner_denied_or_missing_ref_dropped_in_enforce(dedup_runner):
-    from cascade.trainer.loop import ResolvedGenerator
-
-    runner, add = dedup_runner
-    ok = add("alice", 3, BASE_SOURCE)
-    # The fake fetch raises a StorageError chained to an HTTP 404 for unknown
-    # refs — the miner's fault (missing/denied), so enforce drops it.
-    ghost = ResolvedGenerator(hotkey="ghost", uid=8,
-                              ref="ghost/gen@sha256:" + "9" * 64)
-    kept = runner._screen_duplicate_entrants(None, [ok, ghost], base_seed=78)
-    assert [c.hotkey for c in kept] == ["alice"]
-
-
-def test_runner_transport_fetch_failure_fails_open(dedup_runner):
-    runner, add = dedup_runner
-    ok = add("alice", 3, BASE_SOURCE)
-    flaky = add("frank", 8, OTHER_SOURCE)
-    add.transport_fail.add(flaky.ref)
-
-    # Pods fetch refs themselves — an orchestrator-side transport failure
-    # must NOT cost the entrant its slot (or its burn), even in enforce.
-    kept = runner._screen_duplicate_entrants(None, [ok, flaky], base_seed=85)
-    assert [c.hotkey for c in kept] == ["alice", "frank"]
-    report = json.loads((runner.work_root / "85" / "dedup_report.json").read_text())
-    assert [u["hotkey"] for u in report["unscreened"]] == ["frank"]
-    assert report["fetch_failed"] == []
-
-
-def test_runner_mode_off_is_a_no_op(dedup_runner):
-    from dataclasses import replace
-
-    runner, add = dedup_runner
-    a = add("alice", 3, BASE_SOURCE)
-    b = add("bobby", 4, BASE_SOURCE)
-    runner.cfg = replace(runner.cfg, round=replace(runner.cfg.round, dedup_mode="off"))
-    assert runner._screen_duplicate_entrants(None, [a, b], base_seed=79) == [a, b]
 
 
 # ── config files in the fingerprint ──────────────────────────────────────────
@@ -281,14 +75,14 @@ def test_json_reformat_and_requirements_order_are_cosmetic(tmp_path):
 def test_deeply_nested_json_does_not_crash_the_fingerprinter(tmp_path):
     # json.loads on attacker-chosen bytes raises RecursionError (not a
     # ValueError) past ~stack-depth nesting; a 4KB file of brackets must fall
-    # back to whitespace normalization, not escape and sink the screen.
+    # back to whitespace normalization, not escape and sink admission.
     depth = 2000
     hostile = "[" * depth + "]" * depth
     a = fingerprint_dir(_repo(tmp_path, "a", BASE_SOURCE,
                               {"config.json": hostile}))
     b = fingerprint_dir(_repo(tmp_path, "b", BASE_SOURCE,
                               {"config.json": hostile}))
-    assert a.token_sha256 == b.token_sha256  # still screened, still identical
+    assert a.token_sha256 == b.token_sha256  # still fingerprinted, still identical
 
 
 def test_config_value_delta_is_a_real_delta_not_identical(tmp_path):
@@ -314,6 +108,7 @@ def test_different_requirements_are_not_rename_identical(tmp_path):
 
 # ── cache/VCS junk exclusion ─────────────────────────────────────────────────
 
+
 def test_cache_junk_does_not_change_the_tree_digest(tmp_path):
     a_dir = _repo(tmp_path, "a", BASE_SOURCE)
     b_dir = _repo(tmp_path, "b", BASE_SOURCE)
@@ -331,243 +126,8 @@ def test_cache_junk_does_not_change_the_tree_digest(tmp_path):
     assert a.token_sha256 == b.token_sha256
 
 
-# ── absolute token-delta floor ───────────────────────────────────────────────
+# ── cost bounds: the digests stay exact ──────────────────────────────────────
 
-# ── config_only tier ─────────────────────────────────────────────────────────
-
-def test_config_only_shadow_label_by_default(tmp_path):
-    entries = [
-        _entry(tmp_path, "orig", 1, BASE_SOURCE, {"config.json": '{"alpha": 0.095}'}),
-        _entry(tmp_path, "swp", 2, BASE_SOURCE, {"config.json": '{"alpha": 0.10}'}),
-    ]
-    result = screen_duplicates(entries, None)
-    # Identical code + differing configs: kept, labeled, with the absolute
-    # config delta recorded so the log separates a version-string A/B from a
-    # real re-parameterization.
-    assert result.kept_hotkeys == ("orig", "swp")
-    assert not result.dropped
-    (v,) = [s for s in result.shadow if s.tier == "config_only"]
-    assert v.hotkey == "swp" and v.matched_hotkey == "orig"
-    assert v.abs_delta is not None and v.abs_delta >= 1
-
-
-def test_config_only_large_rewrite_survives_with_label(tmp_path):
-    # A config rewrite big enough to fall under the ratio bar: identical code,
-    # genuinely different parameterization — kept, with the label recorded.
-    big_a = json.dumps({f"w{i}": i * 0.095 for i in range(400)})
-    big_b = json.dumps({f"w{i}": (i % 7) * 1.31 + 40 for i in range(400)})
-    entries = [
-        _entry(tmp_path, "orig", 1, BASE_SOURCE, {"config.json": big_a}),
-        _entry(tmp_path, "rew", 2, BASE_SOURCE, {"config.json": big_b}),
-    ]
-    result = screen_duplicates(entries, None)
-    assert result.kept_hotkeys == ("orig", "rew")
-    assert not result.dropped
-    assert [s.tier for s in result.shadow if s.hotkey == "rew"].count("config_only") == 1
-
-
-def test_config_only_enforced_drops(tmp_path):
-    entries = [
-        _entry(tmp_path, "orig", 1, BASE_SOURCE, {"config.json": '{"alpha": 0.095}'}),
-        _entry(tmp_path, "swp", 2, BASE_SOURCE, {"config.json": '{"alpha": 0.10}'}),
-    ]
-    result = screen_duplicates(entries, None, config_only_enforce=True)
-    assert result.kept_hotkeys == ("orig",)
-    (v,) = result.dropped
-    assert v.tier == "config_only" and v.hotkey == "swp"
-
-
-# ── behavioral probe ─────────────────────────────────────────────────────────
-
-def test_collapse_identical_behavior_pure():
-    from cascade.interface.dedup import collapse_identical_behavior
-
-    kept, dropped = collapse_identical_behavior(
-        [("carol", 9, "dg1"), ("alice", 3, "dg1"), ("bob", 5, "dg2"),
-         ("kcopy", 7, "KING")],
-        king_digest="KING",
-    )
-    assert kept == ("alice", "bob")
-    assert {(v.hotkey, v.matched_hotkey, v.tier) for v in dropped} == {
-        ("carol", "alice", "behavior_identical"),
-        ("kcopy", "king", "behavior_identical"),
-    }
-
-
-@pytest.fixture
-def probe_runner(dedup_runner, monkeypatch):
-    """dedup_runner with the probe on and build_round_corpus faked: the digest
-    comes from a BEHAVIOR file in the repo, and a NONDET file makes every draw
-    unique (a generator seeding from entropy)."""
-    from dataclasses import replace
-    from itertools import count
-
-    from cascade.trainer import loop as loop_mod
-    from cascade.trainer.corpus import CorpusError
-
-    runner, add = dedup_runner
-    # build_round_corpus is faked below, but the probe gate cannot know that:
-    # use_sandbox=False means "run generator code in this process", the weakest
-    # posture there is, so the fixture has to accept it out loud.
-    runner.cfg = replace(runner.cfg,
-                         round=replace(runner.cfg.round, dedup_probe_series=4,
-                                       dedup_probe_mode="enforce",
-                                       dedup_probe_allow_weak_sandbox=True))
-    ticks = count()
-
-    class _Result:
-        def __init__(self, digest):
-            self.digest = digest
-
-    captured_cfgs = []
-
-    def fake_build(repo_dir, seed, cfg, mode, *, use_sandbox=True, blocked=(),
-                   allow_netns=True):
-        captured_cfgs.append(cfg)
-        repo = repo_dir
-        if (repo / "BROKEN").exists():
-            raise CorpusError("generator_import_failed")
-        if (repo / "INFRA").exists():
-            raise CorpusError("sandbox_crashed (rc=137): oom or missing image")
-        if (repo / "NONDET").exists():
-            return _Result(f"entropy-{next(ticks)}")
-        marker = repo / "BEHAVIOR"
-        return _Result(marker.read_text() if marker.exists() else f"seeded-{seed}-{repo.name}")
-
-    add.captured_cfgs = captured_cfgs
-    monkeypatch.setattr(loop_mod, "build_round_corpus", fake_build)
-    return runner, add
-
-
-def test_probe_drops_nondeterministic_generator(probe_runner, tmp_path):
-    runner, add = probe_runner
-    ok = add("alice", 3, BASE_SOURCE)
-    bad = add("edgar", 5, OTHER_SOURCE)
-    (tmp_path / "repos" / "edgar" / "NONDET").write_text("")
-
-    kept = runner._screen_duplicate_entrants(None, [ok, bad], base_seed=80)
-    assert [c.hotkey for c in kept] == ["alice"]
-    report = json.loads((runner.work_root / "80" / "dedup_report.json").read_text())
-    assert report["probe_dropped"][0]["hotkey"] == "edgar"
-    assert report["probe_dropped"][0]["tier"] == "nondeterministic"
-
-
-def test_probe_infra_fault_is_never_the_miners_problem(probe_runner, tmp_path):
-    # A sandbox_crashed / missing-image CorpusError is OUR infrastructure, not
-    # a generator verdict — under probe enforce it must keep the entrant, or a
-    # bad image on the orchestrator burns the whole field.
-    runner, add = probe_runner
-    ok = add("alice", 3, BASE_SOURCE)
-    unlucky = add("edgar", 5, OTHER_SOURCE)
-    (tmp_path / "repos" / "edgar" / "INFRA").write_text("")
-
-    kept = runner._screen_duplicate_entrants(None, [ok, unlucky], base_seed=82)
-    assert sorted(c.hotkey for c in kept) == ["alice", "edgar"]
-    report = json.loads((runner.work_root / "82" / "dedup_report.json").read_text())
-    assert report["probe_dropped"] == []
-
-
-def test_probe_collapses_same_behavior_different_code(probe_runner, tmp_path):
-    runner, add = probe_runner
-    a = add("alice", 3, BASE_SOURCE)
-    b = add("bobby", 6, OTHER_SOURCE)  # different code (sim < 0.99) …
-    (tmp_path / "repos" / "alice" / "BEHAVIOR").write_text("same-bytes")
-    (tmp_path / "repos" / "bobby" / "BEHAVIOR").write_text("same-bytes")
-
-    kept = runner._screen_duplicate_entrants(None, [a, b], base_seed=81)
-    assert [c.hotkey for c in kept] == ["alice"]  # … but the same process
-    report = json.loads((runner.work_root / "81" / "dedup_report.json").read_text())
-    behav = [d for d in report["dropped"] if d["tier"] == "behavior_identical"]
-    assert behav and behav[0]["hotkey"] == "bobby" and behav[0]["matched_hotkey"] == "alice"
-
-
-def test_probe_matches_king_behavior(probe_runner, tmp_path):
-    runner, add = probe_runner
-    king = add("king", 0, BASE_SOURCE)
-    c = add("carla", 4, OTHER_SOURCE)
-    (tmp_path / "repos" / "king" / "BEHAVIOR").write_text("royal-bytes")
-    (tmp_path / "repos" / "carla" / "BEHAVIOR").write_text("royal-bytes")
-
-    kept = runner._screen_duplicate_entrants(king, [c], base_seed=82)
-    assert kept == []
-
-
-def test_probe_uses_its_own_wall_clock(probe_runner, tmp_path):
-    from dataclasses import replace
-
-    runner, add = probe_runner
-    runner.cfg = replace(runner.cfg, round=replace(
-        runner.cfg.round, dedup_probe_generate_seconds=90))
-    a = add("alice", 3, BASE_SOURCE)
-    runner._screen_duplicate_entrants(None, [a], base_seed=86)
-
-    # Every probe draw runs under the probe's OWN generation deadline — never
-    # the full-corpus 1800s budget (execution is paid even in shadow mode, so
-    # a hostile generator must not be able to stall the orchestrator).
-    assert add.captured_cfgs, "probe never ran"
-    assert all(c.max_generate_seconds == 90 for c in add.captured_cfgs)
-    assert all(c.corpus_n_series == 4 for c in add.captured_cfgs)
-
-
-def test_probe_failure_drops_in_enforce(probe_runner, tmp_path):
-    runner, add = probe_runner
-    ok = add("alice", 3, BASE_SOURCE)
-    broken = add("brock", 5, OTHER_SOURCE)
-    (tmp_path / "repos" / "brock" / "BROKEN").write_text("")
-
-    kept = runner._screen_duplicate_entrants(None, [ok, broken], base_seed=83)
-    assert [c.hotkey for c in kept] == ["alice"]
-
-
-def test_probe_shadow_mode_drops_nothing(probe_runner, tmp_path):
-    from dataclasses import replace
-
-    runner, add = probe_runner
-    runner.cfg = replace(runner.cfg,
-                         round=replace(runner.cfg.round, dedup_probe_mode="shadow"))
-    a = add("alice", 3, BASE_SOURCE)
-    b = add("bobby", 6, OTHER_SOURCE)
-    (tmp_path / "repos" / "alice" / "BEHAVIOR").write_text("same-bytes")
-    (tmp_path / "repos" / "bobby" / "BEHAVIOR").write_text("same-bytes")
-
-    # Static tiers still ENFORCE; the probe observes: the behavior_identical
-    # verdict is logged in the report but bobby keeps its heat slot.
-    kept = runner._screen_duplicate_entrants(None, [a, b], base_seed=84)
-    assert [c.hotkey for c in kept] == ["alice", "bobby"]
-    report = json.loads((runner.work_root / "84" / "dedup_report.json").read_text())
-    behav = [d for d in report["dropped"] if d["tier"] == "behavior_identical"]
-    assert behav and behav[0]["enforced"] is False
-
-
-@pytest.mark.parametrize("dedup_mode", ["off", "shadow", "enforce"])
-@pytest.mark.parametrize("probe_mode", ["off", "shadow", "enforce"])
-def test_mode_matrix_static_and_probe_gate_independently(
-        probe_runner, tmp_path, dedup_mode, probe_mode):
-    """All 9 (dedup_mode × dedup_probe_mode) combinations: static drops apply
-    iff dedup_mode == enforce, probe drops iff dedup_probe_mode == enforce,
-    and dedup_mode == off disables the whole screen."""
-    from dataclasses import replace
-
-    runner, add = probe_runner
-    runner.cfg = replace(runner.cfg, round=replace(
-        runner.cfg.round, dedup_mode=dedup_mode, dedup_probe_mode=probe_mode))
-    alice = add("alice", 3, BASE_SOURCE)
-    copy = add("copyc", 7, "# reupload\n" + BASE_SOURCE)   # token-identical → static tier
-    nondet = add("nondt", 9, OTHER_SOURCE)                 # entropy-seeded → probe tier
-    (tmp_path / "repos" / "nondt" / "NONDET").write_text("")
-
-    kept = [c.hotkey for c in runner._screen_duplicate_entrants(
-        None, [alice, copy, nondet], base_seed=90)]
-
-    expected = {"alice", "copyc", "nondt"}
-    if dedup_mode == "enforce":
-        expected -= {"copyc"}
-    if dedup_mode != "off" and probe_mode == "enforce":
-        expected -= {"nondt"}
-    assert set(kept) == expected
-
-
-# ── cost caps: the screen must not become the cheapest way to stall a round ──
 
 def _big_repo(tmp_path, name, nlines, extra=""):
     """A repo whose token stream is far past any sane cap."""
@@ -576,35 +136,15 @@ def _big_repo(tmp_path, name, nlines, extra=""):
     return _repo(tmp_path, name, src + extra)
 
 
-def test_oversize_stream_is_not_scoreable_and_keeps_exact_digests(tmp_path):
-    # difflib is O(n²) in tokens, so a stream past the cap must not reach it —
-    # but the digests are fed incrementally and stay exact regardless.
-    a = fingerprint_dir(_big_repo(tmp_path, "a", 2000), max_tokens=500)
-    b = fingerprint_dir(_big_repo(tmp_path, "b", 2000), max_tokens=500)
-    c = fingerprint_dir(_big_repo(tmp_path, "c", 2000, extra="    y = 1\n"),
-                        max_tokens=500)
-    assert not a.scoreable and a.tokens == ()      # nothing retained
-    assert a.n_tokens > 500                        # but the count is real
-    assert a.token_sha256 == b.token_sha256        # identical trees still collide
-    assert a.token_sha256 != c.token_sha256        # a real edit still differs
-
-
-def test_padding_past_the_cap_does_not_evade_the_exact_tiers(tmp_path):
-    # Digests are streamed, never taken from the retained prefix — so a copy
-    # inflated past the token cap still collides on the token tier, while a
-    # padded repo with a REAL edit is kept (policy: no similarity threshold;
-    # an edit is a different program).
-    orig = ("orig", 1, fingerprint_dir(_big_repo(tmp_path, "orig", 2000),
-                                       max_tokens=500))
-    copy = ("copy", 2, fingerprint_dir(          # comment shuffle: new tree bytes
-        _big_repo(tmp_path, "copy", 2000, extra="# reupload comment\n"),
-        max_tokens=500))
-    edit = ("edit", 3, fingerprint_dir(
-        _big_repo(tmp_path, "edit", 2000, extra="    y = 1\n"), max_tokens=500))
-    result = screen_duplicates([orig, copy, edit], None)
-    assert result.kept_hotkeys == ("orig", "edit")
-    (v,) = result.dropped
-    assert v.hotkey == "copy" and v.tier == "token_identical"
+def test_large_streams_keep_exact_digests(tmp_path):
+    # Digests are fed incrementally, never from a retained buffer, so a large
+    # identical tree still collides and a one-line edit still differs.
+    a = fingerprint_dir(_big_repo(tmp_path, "a", 2000))
+    b = fingerprint_dir(_big_repo(tmp_path, "b", 2000, extra="# reupload comment\n"))
+    c = fingerprint_dir(_big_repo(tmp_path, "c", 2000, extra="    y = 1\n"))
+    assert a.n_tokens > 10_000
+    assert a.token_sha256 == b.token_sha256
+    assert a.token_sha256 != c.token_sha256
 
 
 def test_undecoded_files_enter_the_digests_as_opaque_content(tmp_path):
@@ -618,210 +158,6 @@ def test_undecoded_files_enter_the_digests_as_opaque_content(tmp_path):
     fb = fingerprint_dir(b, max_text_mb=0)
     assert fa.token_sha256 != fb.token_sha256
     assert fa.tree_sha256 != fb.tree_sha256
-    # …and with both budgets high enough, the same repo tokenizes normally
-    assert fingerprint_dir(a, max_text_mb=64, max_tokens=0).scoreable
-
-
-# ── shadow mode is a true counterfactual of enforce ──────────────────────────
-
-def test_shadow_verdicts_name_the_rival_enforce_would_have_used(tmp_path):
-    # A dropped entry must not become a rival for later entries: otherwise the
-    # shadow log measures a chain enforce would never produce, and it is the
-    # log that would calibrate any future enforcement.
-    entries = [
-        _entry(tmp_path, "orig", 1, BASE_SOURCE),
-        _entry(tmp_path, "cop2", 2, "# a\n" + BASE_SOURCE),
-        _entry(tmp_path, "cop3", 3, "# b\n" + BASE_SOURCE),
-    ]
-    shadow = screen_duplicates(entries, None, enforce=False)
-    enforced = screen_duplicates(entries, None, enforce=True)
-    assert shadow.kept_hotkeys == ("orig", "cop2", "cop3")   # nothing drops
-    assert enforced.kept_hotkeys == ("orig",)
-    # same verdicts, same rivals, in both modes
-    assert ([(v.hotkey, v.matched_hotkey, v.tier) for v in shadow.dropped]
-            == [(v.hotkey, v.matched_hotkey, v.tier) for v in enforced.dropped]
-            == [("cop2", "orig", "token_identical"),
-                ("cop3", "orig", "token_identical")])
-
-
-def test_config_only_needs_actual_python(tmp_path):
-    # Two repos with no .py at all share an empty code digest; collapsing them
-    # on that basis would be a false positive.
-    a = ("a", 1, fingerprint_dir(_repo_no_py(tmp_path, "a", '{"lr": 1}')))
-    b = ("b", 2, fingerprint_dir(_repo_no_py(tmp_path, "b", '{"lr": 2}')))
-    result = screen_duplicates([a, b], None, config_only_enforce=True)
-    assert result.kept_hotkeys == ("a", "b")
-    assert not [v for v in result.dropped + result.shadow if v.tier == "config_only"]
-
-
-def _repo_no_py(tmp_path, name, config):
-    d = tmp_path / name
-    d.mkdir(parents=True)
-    (d / "config.json").write_text(config)
-    return d
-
-
-# ── trainer wiring: the screen's own cost and blast radius ───────────────────
-
-def test_runner_skips_oversize_repos_without_fingerprinting(dedup_runner, monkeypatch):
-    # A repo over [generator] max_repo_mb fails its heat run anyway, so the
-    # screen must not spend fingerprint time on input the miner chooses.
-    from dataclasses import replace
-
-    from cascade.interface import dedup as dedup_mod
-
-    runner, add = dedup_runner
-    runner.cfg = replace(runner.cfg,
-                         generator=replace(runner.cfg.generator, max_repo_mb=0))
-    seen = []
-    real = dedup_mod.fingerprint_dir
-    monkeypatch.setattr(dedup_mod, "fingerprint_dir",
-                        lambda d, **kw: seen.append(d) or real(d, **kw))
-
-    alice = add("alice", 3, BASE_SOURCE)
-    copy = add("mallory", 9, BASE_SOURCE)
-    kept = runner._screen_duplicate_entrants(None, [alice, copy], base_seed=91)
-
-    assert [c.hotkey for c in kept] == ["alice", "mallory"]   # kept, not dropped
-    assert seen == []                                         # and never hashed
-    report = json.loads((runner.work_root / "91" / "dedup_report.json").read_text())
-    assert [o["hotkey"] for o in report["oversize"]] == ["alice", "mallory"]
-
-
-def test_runner_screen_deadline_fails_open(dedup_runner, monkeypatch):
-    # The screen's inputs are attacker-chosen (repo bytes, generator runtime),
-    # so it runs under a wall clock — and an expired screen must not sink the
-    # round it exists to protect.
-    from cascade.trainer.loop import TrainerRunner
-
-    runner, add = dedup_runner
-    budget = []
-
-    def boom(fn, seconds):
-        budget.append(seconds)
-        raise TimeoutError("screen overran")
-
-    monkeypatch.setattr(TrainerRunner, "_with_deadline", staticmethod(boom))
-    alice = add("alice", 3, BASE_SOURCE)
-    copy = add("mallory", 9, BASE_SOURCE)          # would drop if the screen ran
-
-    kept = runner._screen_duplicate_entrants(None, [alice, copy], base_seed=92)
-    assert [c.hotkey for c in kept] == ["alice", "mallory"]
-    assert budget == [runner.cfg.round.dedup_phase_seconds]
-
-
-def test_probe_refuses_a_weak_sandbox(probe_runner, tmp_path):
-    # The probe executes untrusted generator code on the box that holds the
-    # eval pool and the wallet. Shadow mode gates the DROPS, not the execution,
-    # so a soft sandbox must disable the probe outright.
-    from dataclasses import replace
-
-    runner, add = probe_runner
-    runner.use_sandbox = True         # the real path, not the in-process one
-    runner.cfg = replace(
-        runner.cfg,
-        generator=replace(runner.cfg.generator, sandbox_mode="subprocess",
-                          sandbox_strict=False),
-        round=replace(runner.cfg.round, dedup_probe_allow_weak_sandbox=False))
-    ok = add("alice", 3, BASE_SOURCE)
-    bad = add("edgar", 5, OTHER_SOURCE)
-    (tmp_path / "repos" / "edgar" / "NONDET").write_text("")
-
-    kept = runner._screen_duplicate_entrants(None, [ok, bad], base_seed=93)
-    assert [c.hotkey for c in kept] == ["alice", "edgar"]   # probe never ran
-    report = json.loads((runner.work_root / "93" / "dedup_report.json").read_text())
-    assert report["probe_mode"] == "off"
-    assert report["probe_dropped"] == []
-    assert add.captured_cfgs == []
-
-
-@pytest.mark.parametrize("posture", [
-    {"sandbox_mode": "container"},                    # kernel-enforced
-    {"sandbox_mode": "subprocess", "sandbox_strict": True},   # netns or refuse
-])
-def test_probe_runs_under_hard_isolation(probe_runner, tmp_path, posture):
-    from dataclasses import replace
-
-    runner, add = probe_runner
-    runner.use_sandbox = True
-    runner.cfg = replace(runner.cfg,
-                         generator=replace(runner.cfg.generator, **posture))
-    ok = add("alice", 3, BASE_SOURCE)
-    bad = add("edgar", 5, OTHER_SOURCE)
-    (tmp_path / "repos" / "edgar" / "NONDET").write_text("")
-
-    kept = runner._screen_duplicate_entrants(None, [ok, bad], base_seed=94)
-    assert [c.hotkey for c in kept] == ["alice"]
-
-
-def test_probe_weak_sandbox_opt_in_is_explicit(probe_runner, tmp_path):
-    # Testnet's escape hatch: run the probe on a soft box, deliberately.
-    from dataclasses import replace
-
-    runner, add = probe_runner
-    runner.use_sandbox = True
-    runner.cfg = replace(
-        runner.cfg,
-        generator=replace(runner.cfg.generator, sandbox_mode="subprocess",
-                          sandbox_strict=False),
-        round=replace(runner.cfg.round, dedup_probe_allow_weak_sandbox=True))
-    ok = add("alice", 3, BASE_SOURCE)
-    bad = add("edgar", 5, OTHER_SOURCE)
-    (tmp_path / "repos" / "edgar" / "NONDET").write_text("")
-
-    kept = runner._screen_duplicate_entrants(None, [ok, bad], base_seed=95)
-    assert [c.hotkey for c in kept] == ["alice"]
-
-
-def test_probe_per_draw_clock_is_derived_from_the_stage_budget(probe_runner):
-    # N hostile entrants each burning the per-draw clock must not stretch the
-    # stage without bound: the share shrinks with the number of waves.
-    from dataclasses import replace
-
-    from cascade.trainer.loop import _PROBE_WORKERS
-
-    runner, add = probe_runner
-    runner.cfg = replace(runner.cfg, round=replace(
-        runner.cfg.round, dedup_probe_generate_seconds=120,
-        dedup_probe_budget_seconds=240))
-    # structurally distinct bodies: all 8 must SURVIVE the static tiers, or the
-    # wave count (and so the derived clock) would not be what this asserts
-    entrants = [add(f"m{i:03d}", i,
-                    "\n".join(f"z{i}_{j} = {j * (i + 1)} ** {i + 2} + {j % (i + 3)}"
-                              for j in range(40 + 25 * i)))
-                for i in range(_PROBE_WORKERS * 2)]     # 2 waves → 240/(2*2) = 60s
-
-    runner._screen_duplicate_entrants(None, entrants, base_seed=96)
-    # 240s / (2 waves * 2 draws) = 60s share, minus the 30s subprocess spawn
-    # grace the sandbox spends ON TOP of max_generate_seconds — the stage must
-    # fund it or it overruns its own budget and trips the phase deadline.
-    assert {c.max_generate_seconds for c in add.captured_cfgs} == {30}
-    report = json.loads((runner.work_root / "96" / "dedup_report.json").read_text())
-    assert report["probe_seconds_per_draw"] == 30
-
-
-def test_probe_skips_when_the_budget_cannot_fund_the_floor(probe_runner):
-    # A field too large for the stage budget must cost the PROBE, never the
-    # screen: overrunning would trip the outer dedup_phase_seconds deadline
-    # and discard the static verdicts with it.
-    from dataclasses import replace
-
-    from cascade.trainer.loop import _PROBE_WORKERS
-
-    runner, add = probe_runner
-    runner.cfg = replace(runner.cfg, round=replace(
-        runner.cfg.round, dedup_probe_generate_seconds=120,
-        dedup_probe_budget_seconds=100))   # 100/(2*2) - 30 < 30s floor
-    entrants = [add(f"m{i:03d}", i,
-                    "\n".join(f"z{i}_{j} = {j * (i + 1)} ** {i + 2} + {j % (i + 3)}"
-                              for j in range(40 + 25 * i)))
-                for i in range(_PROBE_WORKERS * 2)]
-
-    kept = runner._screen_duplicate_entrants(None, entrants, base_seed=97)
-    assert not add.captured_cfgs           # no sandbox was ever spawned
-    assert len(kept) == len(entrants)      # static tiers judged, probe skipped
-    report = json.loads((runner.work_root / "97" / "dedup_report.json").read_text())
-    assert report["probe_seconds_per_draw"] == 0
 
 
 def test_decode_budget_keeps_the_digests_exact(tmp_path):
@@ -832,344 +168,17 @@ def test_decode_budget_keeps_the_digests_exact(tmp_path):
     orig = _repo(tmp_path, "orig", "def run():\n" + body)
     copy = _repo(tmp_path, "copy", "def run():\n" + body)
     edit = _repo(tmp_path, "edit", "def run():\n" + body + "\n    extra = 1\n")
-    fo = fingerprint_dir(orig, max_text_mb=0.05, max_tokens=500)
-    fc = fingerprint_dir(copy, max_text_mb=0.05, max_tokens=500)
-    fe = fingerprint_dir(edit, max_text_mb=0.05, max_tokens=500)
+    fo = fingerprint_dir(orig, max_text_mb=0.05)
+    fc = fingerprint_dir(copy, max_text_mb=0.05)
+    fe = fingerprint_dir(edit, max_text_mb=0.05)
 
-    assert fo.truncated and not fo.scoreable      # the file was cut short…
+    assert fo.truncated                           # the file was cut short…
     assert fo.token_sha256 == fc.token_sha256     # …an exact copy still collides
     assert fo.token_sha256 != fe.token_sha256     # …and a real edit still differs
-    result = screen_duplicates(
-        [("orig", 1, fo), ("copy", 2, fc), ("edit", 3, fe)], None)
-    assert result.kept_hotkeys == ("orig", "edit")
-    assert result.dropped[0].tier in ("tree_identical", "token_identical")
 
 
-def test_over_cap_entrants_are_named_in_the_report(dedup_runner):
-    # Honest submissions run ~100KB; bulk past the token cap (exact digest
-    # tiers only) is a pattern worth being able to see build up over rounds.
-    from dataclasses import replace
+# ── packed components: a generator inside a string constant ─────────────────
 
-    runner, add = dedup_runner
-    runner.cfg = replace(runner.cfg,
-                         round=replace(runner.cfg.round, dedup_max_tokens=100))
-    alice = add("alice", 3, BASE_SOURCE)
-
-    runner._screen_duplicate_entrants(None, [alice], base_seed=97)
-    report = json.loads((runner.work_root / "97" / "dedup_report.json").read_text())
-    assert report["over_token_cap"][0]["hotkey"] == "alice"
-    assert report["over_token_cap"][0]["n_tokens"] > 100
-
-
-# ── commit order: who submitted a generator FIRST ────────────────────────────
-
-class _WitnessClient:
-    """A chain client whose sealed-commit view the test drives directly."""
-
-    def __init__(self, sealed=None):
-        self.sealed = dict(sealed or {})
-
-    def poll_pending_commits(self):
-        return dict(self.sealed)
-
-
-def test_witness_freezes_the_commit_block_when_the_seal_disappears(dedup_runner):
-    # The chain deletes a commit's block at reveal, so the witness has to catch
-    # it while sealed and hold it: seen-sealed → pending, gone → committed.
-    runner, _ = dedup_runner
-    client = _WitnessClient({"alice": 100, "bob": 140})
-
-    w = runner.witness_commits(client)
-    assert w["alice"] == {"pending": 100, "committed": None}
-
-    del client.sealed["alice"]                     # alice's reveal lands
-    w = runner.witness_commits(client)
-    assert w["alice"] == {"pending": None, "committed": 100}
-    assert w["bob"] == {"pending": 140, "committed": None}   # bob still sealed
-
-
-def test_witness_survives_a_restart(dedup_runner, tmp_path):
-    # The record only exists on our disk; losing it on restart would silently
-    # drop the whole round back to reveal order.
-    from cascade.trainer.loop import TrainerRunner
-
-    runner, _ = dedup_runner
-    client = _WitnessClient({"alice": 100})
-    runner.witness_commits(client)
-    client.sealed.clear()
-    runner.witness_commits(client)
-
-    fresh = TrainerRunner(cfg=runner.cfg, base_trainer=object(),
-                          work_root=runner.work_root, use_sandbox=False)
-    assert fresh.witness_commits(_WitnessClient())["alice"]["committed"] == 100
-
-
-def test_a_new_seal_replaces_the_previous_pending_commit(dedup_runner):
-    # Re-committing claims a NEW submission; the old commit's priority must not
-    # follow the hotkey onto it.
-    runner, _ = dedup_runner
-    client = _WitnessClient({"alice": 100})
-    runner.witness_commits(client)
-    client.sealed["alice"] = 500                   # re-commit, still sealed
-    w = runner.witness_commits(client)
-    assert w["alice"]["pending"] == 500
-
-
-def test_witness_tolerates_a_client_without_the_read(dedup_runner):
-    runner, _ = dedup_runner
-    assert runner.witness_commits(object()) == {}
-
-
-def test_commit_priority_falls_back_to_reveal_block(dedup_runner):
-    # An entrant we merely failed to observe must not be expropriated for it:
-    # reveal order is the same units and still puts a copyist behind the repo
-    # they copied (copying a revealed repo means revealing after it).
-    runner, add = dedup_runner
-    seen = add("alice", 3, BASE_SOURCE, reveal_block=900)
-    unseen = add("bobby", 4, OTHER_SOURCE, reveal_block=880)
-    runner.witness_commits(_WitnessClient({"alice": 100}))
-    runner.witness_commits(_WitnessClient())       # alice reveals
-
-    prio = runner._commit_priority([seen, unseen])
-    assert prio == {"alice": 100, "bobby": 880}
-
-
-def test_earliest_commit_keeps_the_slot_over_a_lower_uid(tmp_path):
-    # The expropriation this exists to stop: Bittensor recycles deregistered
-    # UIDs, so a newcomer can hold a LOWER uid than the miner they copy. Order
-    # by when each was submitted, not by which slot they inherited.
-    entries = [
-        _entry(tmp_path, "victim", 200, BASE_SOURCE),        # high uid, committed first
-        _entry(tmp_path, "copyist", 12, "# mine now\n" + BASE_SOURCE),
-    ]
-    by_uid = screen_duplicates(entries, None)
-    assert by_uid.kept_hotkeys == ("copyist",)               # the old rule
-
-    by_commit = screen_duplicates(entries, None,
-                                  priority={"victim": 100, "copyist": 400})
-    assert by_commit.kept_hotkeys == ("victim",)
-    (v,) = by_commit.dropped
-    assert v.hotkey == "copyist" and v.matched_hotkey == "victim"
-
-
-def test_uid_still_breaks_a_tie_at_the_same_block(tmp_path):
-    entries = [
-        _entry(tmp_path, "aaa", 9, BASE_SOURCE),
-        _entry(tmp_path, "bbb", 4, "# copy\n" + BASE_SOURCE),
-    ]
-    result = screen_duplicates(entries, None, priority={"aaa": 100, "bbb": 100})
-    assert result.kept_hotkeys == ("bbb",)
-
-
-def test_runner_screen_orders_on_the_witnessed_commit(dedup_runner):
-    # End to end: the copyist holds the lower UID, but committed later.
-    runner, add = dedup_runner
-    victim = add("victim", 200, BASE_SOURCE, reveal_block=980)
-    copyist = add("copyst", 12, "# resubmit\n" + BASE_SOURCE, reveal_block=995)
-    runner.witness_commits(_WitnessClient({"victim": 100, "copyst": 400}))
-    runner.witness_commits(_WitnessClient())       # both reveal
-
-    kept = runner._screen_duplicate_entrants(None, [victim, copyist], base_seed=98)
-    assert [c.hotkey for c in kept] == ["victim"]
-    report = json.loads((runner.work_root / "98" / "dedup_report.json").read_text())
-    assert report["dropped"][0]["hotkey"] == "copyst"
-
-
-# ── audit regressions ────────────────────────────────────────────────────────
-
-def test_repos_with_no_functional_content_do_not_collide(tmp_path):
-    # Every repo with no .py and no config shares the empty-stream digest, so
-    # the token tiers would call two unrelated junk repos copies of each other
-    # — and the loser burns its one lifetime submission on a false verdict.
-    def _docs(name, text):
-        d = tmp_path / name
-        d.mkdir()
-        (d / "README.md").write_text(text)
-        return fingerprint_dir(d)
-
-    a, b = _docs("a", "one thing\n"), _docs("b", "a totally different thing\n")
-    assert a.token_sha256 == b.token_sha256      # the collision is real…
-    result = screen_duplicates([("a", 1, a), ("b", 2, b)], None)
-    assert result.kept_hotkeys == ("a", "b")     # …and must not be a verdict
-    assert not result.dropped
-
-    # byte-identical junk is still a genuine duplicate (the tree tier)
-    c, d = _docs("c", "same\n"), _docs("d", "same\n")
-    assert screen_duplicates([("c", 1, c), ("d", 2, d)],
-                             None).dropped[0].tier == "tree_identical"
-
-
-def test_unknown_submission_block_sorts_last_not_first(dedup_runner):
-    # Mapping "we know nothing" to block 0 would sort it FIRST and let that
-    # entrant win every collision it appears in.
-    runner, add = dedup_runner
-    known = add("alice", 200, BASE_SOURCE, reveal_block=900)
-    nothing = add("ghost", 12, "# copy\n" + BASE_SOURCE)    # no reveal block
-
-    prio = runner._commit_priority([known, nothing])
-    assert prio == {"alice": 900}                            # ghost omitted
-    kept = runner._screen_duplicate_entrants(None, [known, nothing], base_seed=99)
-    assert [c.hotkey for c in kept] == ["alice"]
-
-
-def test_witness_does_not_freeze_commits_on_a_failed_read(dedup_runner):
-    # "I could not look" is not evidence that every pending commit revealed.
-    runner, _ = dedup_runner
-
-    class _Failing:
-        def poll_pending_commits(self):
-            return None          # read failed, per ChainClient's contract
-
-    class _Raising:
-        def poll_pending_commits(self):
-            raise RuntimeError("websocket died")
-
-    runner.witness_commits(_WitnessClient({"alice": 100}))
-    for client in (_Failing(), _Raising()):
-        w = runner.witness_commits(client)
-        assert w["alice"] == {"pending": 100, "committed": None}, client
-
-
-# ── config-delta bounds (the recurring screen-timeout fix) ───────────────────
-# The delta pass is the ONE difflib call left, it runs on attacker-chosen token
-# streams, and it repeatedly blew the whole screen's dedup_phase_seconds budget
-# (OPSLOG 2026-08-26..28, five bites — each published a round's field
-# UNSCREENED). These tests pin the fences: exact dups short-circuit, oversized
-# and slow pairs FAIL OPEN to a delta-less label, and the config_only VERDICT
-# never depends on the delta being measurable.
-
-
-def _fp(tokens, *, sha, py="samepy", scoreable=True):
-    from cascade.interface.dedup import RepoFingerprint
-
-    return RepoFingerprint(
-        tree_sha256="tree-" + sha, token_sha256="tok-" + sha,
-        masked_sha256="mask-" + sha, py_sha256=py,
-        tokens=tuple(tokens), n_tokens=len(tokens), scoreable=scoreable)
-
-
-def test_delta_exact_duplicate_short_circuits_without_difflib(monkeypatch):
-    # Hash-identical streams are delta 0 by definition of the digest — the
-    # quadratic pass must not even start (patched to prove it is never called).
-    from cascade.interface import dedup as dedup_mod
-
-    monkeypatch.setattr(dedup_mod, "_abs_token_delta",
-                        lambda a, b: (_ for _ in ()).throw(AssertionError("ran")))
-    a = _fp(["x"] * 50, sha="same")
-    b = _fp(["x"] * 50, sha="same")
-    assert dedup_mod._safe_abs_token_delta(a, b) == 0
-
-
-def test_delta_near_duplicate_still_measured_exactly():
-    # Normal-sized near-dup pairs keep their EXACT delta — the fences must not
-    # degrade the shadow evidence on honest input (7–11k-token repos).
-    from cascade.interface.dedup import _abs_token_delta, _safe_abs_token_delta
-
-    a = _fp([f"t{i}" for i in range(2000)], sha="a")
-    toks = [f"t{i}" for i in range(2000)]
-    toks[1000] = "edited"
-    b = _fp(toks, sha="b")
-    assert _safe_abs_token_delta(a, b) == _abs_token_delta(a, b) == 1
-
-
-def test_delta_oversized_pair_fails_open_to_none():
-    from cascade.interface.dedup import _safe_abs_token_delta
-
-    a = _fp([f"t{i}" for i in range(300)], sha="a")
-    b = _fp([f"u{i}" for i in range(300)], sha="b")
-    assert _safe_abs_token_delta(a, b, max_tokens=100) is None   # over the band
-    assert _safe_abs_token_delta(a, b, max_tokens=0) is not None  # 0 = uncapped
-
-
-def test_delta_budget_expiry_fails_open_quickly(monkeypatch):
-    # A pathological pair (difflib grinding for minutes) costs at most the pair
-    # budget, then the label carries no delta — the screen moves on.
-    import time as _time
-
-    from cascade.interface import dedup as dedup_mod
-
-    monkeypatch.setattr(dedup_mod, "_abs_token_delta",
-                        lambda a, b: _time.sleep(30) or 0)
-    a = _fp(["x"] * 10, sha="a")
-    b = _fp(["y"] * 10, sha="b")
-    t0 = _time.monotonic()
-    assert dedup_mod._safe_abs_token_delta(a, b, budget_seconds=0.2) is None
-    assert _time.monotonic() - t0 < 5.0
-
-
-def test_delta_exception_fails_open_to_none(monkeypatch):
-    from cascade.interface import dedup as dedup_mod
-
-    monkeypatch.setattr(dedup_mod, "_abs_token_delta",
-                        lambda a, b: (_ for _ in ()).throw(RuntimeError("boom")))
-    a = _fp(["x"] * 10, sha="a")
-    b = _fp(["y"] * 10, sha="b")
-    assert dedup_mod._safe_abs_token_delta(a, b) is None
-
-
-def test_screen_survives_a_pathological_delta_pair(tmp_path, monkeypatch):
-    # End to end: identical code + differing configs where the delta pass would
-    # grind — the screen finishes inside its budget, both entries are KEPT, and
-    # the config_only label lands with abs_delta=None (fail open, not fail dark).
-    import time as _time
-
-    from cascade.interface import dedup as dedup_mod
-
-    monkeypatch.setattr(dedup_mod, "_abs_token_delta",
-                        lambda a, b: _time.sleep(30) or 0)
-    monkeypatch.setattr(dedup_mod, "DELTA_PAIR_BUDGET_SECONDS", 0.2)
-    entries = [
-        _entry(tmp_path, "orig", 1, BASE_SOURCE, {"config.json": '{"alpha": 0.095}'}),
-        _entry(tmp_path, "swp", 2, BASE_SOURCE, {"config.json": '{"alpha": 0.10}'}),
-    ]
-    t0 = _time.monotonic()
-    result = screen_duplicates(entries, None)
-    assert _time.monotonic() - t0 < 10.0
-    assert result.kept_hotkeys == ("orig", "swp")
-    (v,) = [s for s in result.shadow if s.tier == "config_only"]
-    assert v.hotkey == "swp" and v.abs_delta is None
-
-
-def test_config_only_enforce_still_drops_when_the_delta_degrades(
-        tmp_path, monkeypatch):
-    # The VERDICT rides on _same_code (exact py-digest equality), never on the
-    # delta: a degraded delta must not weaken enforcement.
-    import time as _time
-
-    from cascade.interface import dedup as dedup_mod
-
-    monkeypatch.setattr(dedup_mod, "_abs_token_delta",
-                        lambda a, b: _time.sleep(30) or 0)
-    monkeypatch.setattr(dedup_mod, "DELTA_PAIR_BUDGET_SECONDS", 0.2)
-    entries = [
-        _entry(tmp_path, "orig", 1, BASE_SOURCE, {"config.json": '{"alpha": 0.095}'}),
-        _entry(tmp_path, "swp", 2, BASE_SOURCE, {"config.json": '{"alpha": 0.10}'}),
-    ]
-    result = screen_duplicates(entries, None, config_only_enforce=True)
-    assert result.kept_hotkeys == ("orig",)
-    (v,) = result.dropped
-    assert v.tier == "config_only" and v.abs_delta is None
-
-
-def test_delta_phase_budget_bounds_the_whole_screen(tmp_path, monkeypatch):
-    # Many pathological pairs cost the PHASE budget in total, not per pair —
-    # the outer dedup_phase_seconds fence (whose expiry publishes the field
-    # unscreened) can no longer be eaten by delta measurements alone.
-    from cascade.interface import dedup as dedup_mod
-
-    monkeypatch.setattr(dedup_mod, "DELTA_PHASE_BUDGET_SECONDS", 0.0)
-    entries = [
-        _entry(tmp_path, "orig", 1, BASE_SOURCE, {"config.json": '{"alpha": 0.095}'}),
-        _entry(tmp_path, "swp", 2, BASE_SOURCE, {"config.json": '{"alpha": 0.10}'}),
-    ]
-    result = screen_duplicates(entries, None)
-    assert result.kept_hotkeys == ("orig", "swp")   # verdicts unchanged
-    (v,) = [s for s in result.shadow if s.tier == "config_only"]
-    assert v.abs_delta is None                       # only the metric degrades
-
-
-# ── embedded tiers: a generator packed into a string constant ────────────────
-# (DEC-CA-0008 amended 2026-09-26: exact identity only, either direction)
 
 def _wrap(source: str, *, how: str = "plain") -> str:
     import base64
@@ -1181,13 +190,7 @@ def _wrap(source: str, *, how: str = "plain") -> str:
     return f"import base64, zlib\n_P = {blob}\nexec(compile(_P, '<p>', 'exec'))\n"
 
 
-def _screen(entries, king=None, **kw):
-    from cascade.interface.dedup import screen_duplicates
-    return screen_duplicates(entries, king, **kw)
-
-
 def test_component_digest_equals_one_file_repo_py_digest(tmp_path):
-    from cascade.interface.dedup import fingerprint_dir
     plain = fingerprint_dir(_repo(tmp_path, "plain", BASE_SOURCE))
     wrap = fingerprint_dir(_repo(tmp_path, "wrap", _wrap(BASE_SOURCE)))
     assert len(wrap.components) == 1
@@ -1202,69 +205,14 @@ def test_component_digest_equals_one_file_repo_py_digest(tmp_path):
     assert wrap.py_sha256 != plain.py_sha256
 
 
-@pytest.mark.parametrize("how", ["plain", "b64", "b64z"])
-def test_wrapper_of_plain_repo_matches_embedded_token(tmp_path, how):
-    from cascade.interface.dedup import fingerprint_dir
-    plain = _entry(tmp_path, "plain", 1, BASE_SOURCE)
-    wrap = ("wrap", 2, fingerprint_dir(_repo(tmp_path, f"wrap-{how}", _wrap(BASE_SOURCE, how=how))))
-    prio = {"plain": 100, "wrap": 200}
-    r = _screen([plain, wrap], priority=prio, embedded_mode="enforce")
-    assert r.kept_hotkeys == ("plain",)
-    assert [(v.hotkey, v.matched_hotkey, v.tier) for v in r.dropped] == [
-        ("wrap", "plain", "embedded_token_identical")]
-    # shadow: same verdict, nothing dropped
-    r = _screen([plain, wrap], priority=prio, embedded_mode="shadow")
-    assert r.kept_hotkeys == ("plain", "wrap") and r.dropped == ()
-    assert [(v.hotkey, v.tier) for v in r.shadow] == [("wrap", "embedded_token_identical")]
-    # off (the default): the tiers do not exist
-    r = _screen([plain, wrap], priority=prio)
-    assert r.kept_hotkeys == ("plain", "wrap") and r.dropped == () and r.shadow == ()
-
-
-def test_plain_repo_of_someones_blob_matches_the_other_direction(tmp_path):
-    from cascade.interface.dedup import fingerprint_dir
-    wrap = ("wrap", 1, fingerprint_dir(_repo(tmp_path, "wrap", _wrap(BASE_SOURCE))))
-    plain = _entry(tmp_path, "plain", 2, BASE_SOURCE)
-    r = _screen([wrap, plain], priority={"wrap": 100, "plain": 200}, embedded_mode="enforce")
-    assert r.kept_hotkeys == ("wrap",)
-    assert [(v.hotkey, v.matched_hotkey, v.tier) for v in r.dropped] == [
-        ("plain", "wrap", "embedded_token_identical")]
-
-
-def test_renamed_blob_matches_embedded_rename(tmp_path):
-    from cascade.interface.dedup import fingerprint_dir
-    plain = _entry(tmp_path, "plain", 1, BASE_SOURCE)
-    renamed = BASE_SOURCE.replace("self.w", "self.v").replace("rng", "gen")
-    wrap = ("wrap", 2, fingerprint_dir(_repo(tmp_path, "wrap", _wrap(renamed))))
-    r = _screen([plain, wrap], priority={"plain": 100, "wrap": 200}, embedded_mode="enforce")
-    assert [(v.hotkey, v.tier) for v in r.dropped] == [("wrap", "embedded_rename_identical")]
-    # a real edit inside the blob is not identity
-    edited = BASE_SOURCE.replace("size=64", "size=65")
-    wrap2 = ("wrap2", 3, fingerprint_dir(_repo(tmp_path, "wrap2", _wrap(edited))))
-    r = _screen([plain, wrap2], priority={"plain": 100, "wrap2": 200}, embedded_mode="enforce")
-    assert r.dropped == () and r.shadow == ()
-
-
-def test_two_wrappers_of_the_same_blob_match(tmp_path):
-    from cascade.interface.dedup import fingerprint_dir
-    a = ("a", 1, fingerprint_dir(_repo(tmp_path, "a", _wrap(BASE_SOURCE, how="b64"))))
-    b = ("b", 2, fingerprint_dir(_repo(tmp_path, "b", "# other wrapper\n" + _wrap(BASE_SOURCE))))
-    r = _screen([a, b], priority={"a": 1, "b": 2}, embedded_mode="enforce")
-    assert [(v.hotkey, v.tier) for v in r.dropped] == [("b", "embedded_token_identical")]
-
-
-def test_wrapper_of_the_king_is_dropped(tmp_path):
-    from cascade.interface.dedup import KING_UID, fingerprint_dir
-    king = fingerprint_dir(_repo(tmp_path, "king", BASE_SOURCE))
-    wrap = ("wrap", 2, fingerprint_dir(_repo(tmp_path, "wrap", _wrap(BASE_SOURCE))))
-    r = _screen([wrap], king, embedded_mode="enforce")
-    assert r.kept_hotkeys == ()
-    assert [(v.matched_hotkey, v.matched_uid, v.tier) for v in r.dropped] == [
-        ("king", KING_UID, "embedded_token_identical")]
+def test_two_wrappers_of_the_same_blob_share_a_component(tmp_path):
+    a = fingerprint_dir(_repo(tmp_path, "a", _wrap(BASE_SOURCE, how="b64")))
+    b = fingerprint_dir(_repo(tmp_path, "b", "# other wrapper\n" + _wrap(BASE_SOURCE)))
+    assert a.token_sha256 != b.token_sha256
+    assert {c.token_sha256 for c in a.components} == {c.token_sha256 for c in b.components}
 
 
 def test_strings_that_are_not_generators_are_not_components(tmp_path):
-    from cascade.interface.dedup import fingerprint_dir
     doc = '"""' + "A long docstring that explains the generator. " * 20 + '"""\n'
     tiny = "_S = " + repr("def f(x):\n    return x + 1\n" * 3) + "\n"      # parses, < 200 tokens
     nodef = "_T = " + repr("x = 1\n" * 200) + "\n"                          # parses, no def/class
@@ -1274,7 +222,6 @@ def test_strings_that_are_not_generators_are_not_components(tmp_path):
 
 
 def test_nested_packing_is_found(tmp_path):
-    from cascade.interface.dedup import fingerprint_dir
     plain = fingerprint_dir(_repo(tmp_path, "plain", BASE_SOURCE))
     outer = fingerprint_dir(_repo(tmp_path, "outer", _wrap(_wrap(BASE_SOURCE), how="b64z")))
     # packed1 is the middle wrapper (a dozen tokens: not a component);
@@ -1284,7 +231,6 @@ def test_nested_packing_is_found(tmp_path):
 
 
 def test_components_respect_the_decode_budget_without_moving_digests(tmp_path):
-    from cascade.interface.dedup import fingerprint_dir
     # a compressed blob: the FILE is a few KB, the decoded source ~13 KB
     d = _repo(tmp_path, "wrap", _wrap(BASE_SOURCE, how="b64z"))
     size = (d / "generator.py").stat().st_size
@@ -1297,13 +243,3 @@ def test_components_respect_the_decode_budget_without_moving_digests(tmp_path):
     assert tight.truncated and not full.truncated
     assert (tight.tree_sha256, tight.token_sha256, tight.masked_sha256, tight.py_sha256) == (
         full.tree_sha256, full.token_sha256, full.masked_sha256, full.py_sha256)
-
-
-def test_embedded_tier_helper_direct(tmp_path):
-    from cascade.interface.dedup import embedded_tier, fingerprint_dir
-    plain = fingerprint_dir(_repo(tmp_path, "plain", BASE_SOURCE))
-    other = fingerprint_dir(_repo(tmp_path, "other", BASE_SOURCE.replace("size=64", "size=65")))
-    wrap = fingerprint_dir(_repo(tmp_path, "wrap", _wrap(BASE_SOURCE)))
-    assert embedded_tier(plain, wrap) == embedded_tier(wrap, plain) == "embedded_token_identical"
-    assert embedded_tier(plain, other) is None       # neither side has components
-    assert embedded_tier(other, wrap) is None        # different code

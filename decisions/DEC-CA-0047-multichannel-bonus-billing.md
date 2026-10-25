@@ -2,7 +2,7 @@
 id: DEC-CA-0047
 type: decision
 title: "Token billing with a proportional width bonus: budget_denomination = \"points+mv<PCT>\" bills every channel and discounts C > 1 series by 100/(100+PCT), so the budget (not the wall, not the GPU drawn) decides every leg's tokens"
-status: proposed
+status: accepted
 date: 2026-09-27
 tags: [training, multivariate, budget, contract, fairness, trainer, audit]
 revisit_when: "an ablation at equal tokens shows two-channel corpora do not beat univariate ones (then the bonus pays for nothing and the rule should be plain \"points\"), or funded legs land on SKUs whose speed spread makes even token billing wall-bound"

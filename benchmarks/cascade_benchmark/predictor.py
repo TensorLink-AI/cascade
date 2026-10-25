@@ -29,7 +29,7 @@ jena_weather hourly long) carry NaN in the history — the ``_with_missing``
 sets by design, the others as late-start padding. The cascade wrapper is the
 validator's trusted inference path and the private pool has no gaps, so it
 propagates NaN → a NaN forecast → gluonts raises ``Forecast contains NaN
-values`` → the whole config was dropped (silently, until 2026-09-18). Every
+values`` → the whole config is dropped. Every
 leaderboard model handles gaps its own way (Toto 2 takes a ``target_mask``
 and masks missing points out of its scaler and attention — no imputation);
 ours is ``impute_history``: forward-fill, then
@@ -50,7 +50,6 @@ from gluonts.dataset import Dataset
 from gluonts.dataset.field_names import FieldName
 from gluonts.model.forecast import Forecast, QuantileForecast, SampleForecast
 from gluonts.model.predictor import Predictor
-
 
 # The grid the gluonts metrics are configured with (suites/_common.py's
 # QUANTILE_LEVELS — kept local because the suites import this module).
@@ -98,6 +97,39 @@ def _load_wrapper(checkpoint_dir: Path, device: str):
     return Wrapper(str(checkpoint_dir), device=device)
 
 
+# One loaded wrapper per (checkpoint, device) per process. The GIFT-Eval / BOOM
+# path used to build a fresh ``CheckpointPredictor`` — re-importing the wrapper
+# and reloading the weights — for every one of its ~100 / ~2,800 configs; a
+# sweep worker now loads each checkpoint once. Reuse is numerically inert for
+# cascade's wrappers: they are stateless after ``__init__`` (``eval()`` mode,
+# ``no_grad``; the quantile head is deterministic and the sample path seeds a
+# fresh generator per window from the history bytes), so the Nth call returns
+# what a freshly loaded wrapper would. A wrapper that kept RNG state across
+# calls would not be — the validator only ever benches the release's own
+# byte-pinned wrapper (``cascade.eval.checkpoint_guard``).
+_WRAPPER_CACHE: dict[tuple[str, str], object] = {}
+
+
+def _cache_key(checkpoint_dir, device: str) -> tuple[str, str]:
+    return str(Path(checkpoint_dir).resolve()), str(device)
+
+
+def load_wrapper_cached(checkpoint_dir, device: str = "cpu"):
+    """:func:`_load_wrapper`, memoised per ``(resolved checkpoint dir, device)``
+    for the life of the process. A load that raises is not cached (the next
+    caller retries and sees the same error)."""
+    key = _cache_key(checkpoint_dir, device)
+    hit = _WRAPPER_CACHE.get(key)
+    if hit is None:
+        hit = _WRAPPER_CACHE[key] = _load_wrapper(Path(checkpoint_dir), device)
+    return hit
+
+
+def clear_wrapper_cache() -> None:
+    """Drop every cached wrapper (tests; a long-lived caller between sweeps)."""
+    _WRAPPER_CACHE.clear()
+
+
 class CheckpointPredictor(Predictor):
     """gluonts predictor backed by a cascade checkpoint's forecast wrapper."""
 
@@ -114,7 +146,7 @@ class CheckpointPredictor(Predictor):
         self.num_samples = int(num_samples)
         self.device = device
         self.batch_size = max(1, int(batch_size))
-        self._wrapper = _load_wrapper(Path(checkpoint_dir), device)
+        self._wrapper = load_wrapper_cached(checkpoint_dir, device)
         # A wrapper that advertises ``handles_missing = True`` takes the raw
         # history and turns non-finite entries into its own observation mask
         # (the CPM mask channel); everything else gets ``impute_history``.
@@ -176,11 +208,8 @@ class CheckpointPredictor(Predictor):
         for start, item_id, ndim, n_time, hs in pending:
             rows = q[i : i + len(hs)]
             i += len(hs)
-            if ndim == 1:
-                arrays = rows[0].T  # (num_q, h)
-            else:
-                # gluonts multivariate layout: (num_q, h, num_variates)
-                arrays = np.stack([r.T for r in rows], axis=-1)
+            # univariate (num_q, h); gluonts multivariate layout (num_q, h, num_variates)
+            arrays = rows[0].T if ndim == 1 else np.stack([r.T for r in rows], axis=-1)
             yield QuantileForecast(
                 forecast_arrays=arrays,
                 forecast_keys=self._forecast_keys,

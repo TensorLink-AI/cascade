@@ -11,6 +11,8 @@ venv/
 .coverage
 htmlcov/
 _train_work/
+_audit_work/
+_eval_ckpts/
 validator_state.db
 *.db
 .DS_Store

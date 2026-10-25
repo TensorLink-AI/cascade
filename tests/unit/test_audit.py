@@ -22,7 +22,7 @@ from .receipt_fixture import (
     make_scored_receipt,
 )
 
-bt = pytest.importorskip("bittensor")
+bt = pytest.importorskip("bittensor.sp_core")  # 11.x: Keypair lives in sp_core
 
 TRAINER_KP = bt.Keypair.create_from_uri("//Trainer")
 VALIDATOR_KP = bt.Keypair.create_from_uri("//Validator")
@@ -585,7 +585,7 @@ def test_fetch_receipt_exits_cleanly_when_unresolvable(cfg, monkeypatch):
 
 
 def _diverged_receipt(audit_cfg):
-    from cascade.shared.chain import equal_share_vector
+    from cascade.shared.chain import decayed_share_vector
 
     receipt, _, _ = make_scored_receipt(
         audit_cfg, validator_hotkey=VALIDATOR_KP.ss58_address, trainer_wallet=TRAINER_KP
@@ -598,7 +598,7 @@ def _diverged_receipt(audit_cfg):
     return replace(
         receipt, verdict=v,
         reward_uids=(0,),                              # vote = manifest king uid
-        weights=tuple(equal_share_vector([0], 4, burn_uid=0)),
+        weights=tuple(decayed_share_vector([0], 4, burn_uid=0, decay=1.0)),
     )
 
 
@@ -614,11 +614,11 @@ def test_king_divergence_weights_vote_manifest_king(audit_cfg):
 
 
 def test_no_dethrone_vote_elsewhere_fails_weights(audit_cfg):
-    from cascade.shared.chain import equal_share_vector
+    from cascade.shared.chain import decayed_share_vector
 
     receipt = _diverged_receipt(audit_cfg)
     tampered = replace(receipt, reward_uids=(5,),
-                       weights=tuple(equal_share_vector([5], 8, burn_uid=0)))
+                       weights=tuple(decayed_share_vector([5], 8, burn_uid=0, decay=1.0)))
     r = C.check_weights(tampered, audit_cfg)
     assert r.status == C.FAIL and "king vote" in r.detail
 
@@ -626,9 +626,28 @@ def test_no_dethrone_vote_elsewhere_fails_weights(audit_cfg):
 def test_dethrone_vote_goes_to_new_king(audit_cfg, signed_receipt):
     # the dethroned fixture votes the new (state) king — uid 1 — so a reward
     # set that omits it fails even when the vector itself recomputes
-    from cascade.shared.chain import equal_share_vector
+    from cascade.shared.chain import decayed_share_vector
 
     tampered = replace(signed_receipt, reward_uids=(0,),
-                       weights=tuple(equal_share_vector([0], 4, burn_uid=0)))
+                       weights=tuple(decayed_share_vector([0], 4, burn_uid=0, decay=1.0)))
     r = C.check_weights(tampered, audit_cfg)
     assert r.status == C.FAIL and "king vote" in r.detail
+
+
+def test_recorded_bench_gate_block_replays(signed_receipt, audit_cfg):
+    """DEC-CA-0054: the audit applies the recorded bench-gate outcome (it does
+    not replay the rows), as it does the gift gate's."""
+    v = signed_receipt.verdict
+    assert v.challenger_wins_round
+    blocked = replace(signed_receipt, verdict=replace(
+        v, challenger_wins_round=False, bench_gate_passed=False,
+        params={**dict(v.params), "bench_gate_mode": "enforce"}))
+    assert C.check_verdict(blocked, audit_cfg).status != C.FAIL
+    held = replace(signed_receipt, verdict=replace(
+        v, challenger_wins_round=False, inconclusive=True,
+        params={**dict(v.params), "bench_gate_mode": "enforce"}))
+    assert C.check_verdict(held, audit_cfg).status != C.FAIL
+    # off: a blocked win is still a tamper
+    off = replace(signed_receipt, verdict=replace(v, challenger_wins_round=False,
+                                                  bench_gate_passed=False))
+    assert C.check_verdict(off, audit_cfg).status == C.FAIL

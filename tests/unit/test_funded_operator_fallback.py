@@ -13,8 +13,8 @@ import pytest
 
 from cascade.provision import funded as funded_mod
 from cascade.shared.config import RoundConfig
-from cascade.trainer.loop import ResolvedGenerator, TrainerRunner, _FundedOperatorFallback
-from cascade.trainer.remote import RemoteHost, is_profile_only, load_hosts
+from cascade.trainer.loop import TrainerRunner, _FundedOperatorFallback
+from cascade.trainer.remote import is_profile_only, load_hosts
 from tests.unit.test_funded_pod_wiring import _challenger, _runner, _vault
 from tests.unit.test_funded_rent_wait import _arm_wait
 
@@ -48,9 +48,31 @@ def test_profile_only_hosts_are_never_lanes(tmp_path):
     assert [is_profile_only(h) for h in hosts] == [True, True, False]
 
 
+def test_funded_pod_profile_rereads_hosts_toml(tmp_path):
+    """The pod profile rented pods mirror is read from hosts.toml on every
+    call (like the FINAL lanes), not frozen at startup; an unreadable file
+    falls back to the startup snapshot."""
+    startup = SimpleNamespace(name="startup", stage="final")
+    p = tmp_path / "hosts.toml"
+    me = SimpleNamespace(remote_hosts=[startup], remote_hosts_path=p)
+    # file not written yet -> the startup snapshot
+    assert TrainerRunner._funded_pod_profile(me).name == "startup"
+    p.write_text('[[host]]\nname = "early"\nhost = "10.0.0.1"\nstage = "heat"\n'
+                 '[[host]]\nname = "prof"\nhost = "10.1.1.1"\nprofile_only = true\n',
+                 encoding="utf-8")
+    assert TrainerRunner._funded_pod_profile(me).name == "prof"   # final/any first
+    me.remote_hosts_path = None
+    assert TrainerRunner._funded_pod_profile(me).name == "startup"
+
+
 def _fallback_runner(tmp_path, *, on: bool, lanes_file: str | None):
     r = _runner(tmp_path, funded_operator_fallback=on)
     if lanes_file is not None:
+        # hosts.toml carries the pod profile too (the provisioner writes both),
+        # and the profile is re-read from it: give it the operator identity.
+        lanes_file = lanes_file.replace(
+            'name = "funded-pod-profile"\n',
+            f'name = "funded-pod-profile"\nkey_path = "{tmp_path / "op_key"}"\n')
         p = tmp_path / "hosts.toml"
         p.write_text(lanes_file, encoding="utf-8")
         r.remote_hosts_path = p
@@ -94,52 +116,6 @@ def test_funded_rent_falls_back_and_drops_the_write_ahead_row(tmp_path, monkeypa
 # ── the dispatcher: fallback legs run on the operator lane with vault staging ─
 
 
-def test_train_remote_runs_fallback_legs_on_operator_lanes(cfg, tmp_path, monkeypatch):
-    import threading
-
-    from tests.unit.test_trainer_round import _FakeBaseTrainer
-
-    rnd = replace(cfg.round, funded_mode="required", funded_pods="rent", funded_king_rent=True,
-                  funded_activation_block=0, funded_operator_fallback=True)
-    runner = TrainerRunner(cfg=replace(cfg, round=rnd), base_trainer=_FakeBaseTrainer(),
-                           work_root=tmp_path, trainer_spec="m:C")
-    lane = RemoteHost(name="sf-l40s-0", host="10.9.9.9", port=2222, stage="final",
-                      workdir="/root/cascade")
-    runner.remote_hosts = [RemoteHost(name="funded-pod-profile", host="127.0.0.1", stage="final"),
-                           lane]
-    runner._funded_field = {"c": VAULT_REF}
-    runner._funded_leg_failures = {}
-    runner._funded_roster = {"seated": [], "waiting": [], "terminal": [], "outcomes": []}
-    runner._funded_king_lock = threading.Lock()
-    runner._funded_king_host = None
-    runner._final_role_hosts = {}
-    # Both the king and the funded leg give up on the marketplace.
-    runner._rent_king_host = lambda rid: (_ for _ in ()).throw(_FundedOperatorFallback("king"))
-    runner._run_funded_leg = lambda *a, **k: (_ for _ in ()).throw(_FundedOperatorFallback("c"))
-    staged = []
-    runner._stage_vault_zip_on = lambda host, digest: (
-        staged.append((host.name, digest)) or replace(
-            host, static_env=(("CASCADE_VAULT_DIR", f"{host.workdir}/_vault_stage"),)))
-    seen = []
-
-    class _D:
-        def __init__(self, **kw):
-            pass
-
-        def dispatch(self, host, **kw):
-            seen.append((host, kw["role"]))
-            return SimpleNamespace(hotkey=kw["hotkey"], role=kw["role"])
-
-    monkeypatch.setattr("cascade.trainer.remote.RemoteDispatcher", _D)
-    contract = cfg.throne_contracts()[0]
-    king = ResolvedGenerator(hotkey="k", uid=0, ref=REF_A)
-    chal = ResolvedGenerator(hotkey="c", uid=1, ref=VAULT_REF)
-    out = runner._train_remote([(king, "king"), (chal, "challenger")],
-                               SimpleNamespace(base_seed=1), 10, contract, contract.train_tokens)
-    assert {e.role for e in out} == {"king", "challenger"}
-    hosts_used = {h.name for h, _ in seen}
-    assert hosts_used == {"sf-l40s-0"}                          # never the profile entry
-    assert staged == [("sf-l40s-0", "d" * 64)]                  # vault ZIP staged for the leg
 
 
 # ── Lium first, Shadeform for the spillover (owner 2026-09-19) ───────────────
@@ -221,12 +197,24 @@ def test_an_operator_billed_entry_never_rents_on_the_payers_key(tmp_path, monkey
     with pytest.raises(_FundedOperatorFallback):
         r._rent_funded_host("777", _challenger("hkA"))            # never reached the payer rent
     assert "hkA" not in r._funded_leg_failures
-    # the flag, not the lanes, decides: no lane on file still keeps the payer's key out
+    # No lane on file and no operator rental: a make-good can never run, so the
+    # leg retries on the payer's key with a new pod rather than waiting forever.
     r_nolane = _fallback_runner(tmp_path, on=True, lanes_file=None)
     r_nolane._operator_fallback_lanes = TrainerRunner._operator_fallback_lanes.__get__(r_nolane)
     r_nolane._funded_queue = lambda: q
-    with pytest.raises(_FundedOperatorFallback):
+    reached = []
+
+    def payer_path():
+        reached.append(True)
+        raise _Reached("payer path")
+
+    r_nolane._funded_pod_profile = payer_path
+    from cascade.trainer.faults import _FundedLegSkip
+
+    with pytest.raises(_FundedLegSkip):     # the payer path wraps the stub's error
         r_nolane._rent_funded_host("777", _challenger("hkA"))
+    assert reached and not q.get("hkA").operator_billed
+    q.set_operator_billed("hkA", True)
     # unflagged: the payer's key rents as before
     q.set_operator_billed("hkA", False)
     with pytest.raises(_Reached):

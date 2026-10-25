@@ -1,11 +1,22 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "rewrites": [
-    { "source": "/scoreboard", "destination": "/stakeholders.html" },
-    { "source": "/stakeholders", "destination": "/stakeholders.html" },
+    {
+      "source": "/scoreboard",
+      "destination": "/stakeholders.html"
+    },
+    {
+      "source": "/stakeholders",
+      "destination": "/stakeholders.html"
+    },
     {
       "source": "/receipts/:path*",
-      "has": [{ "type": "host", "value": "testnet\\..*" }],
+      "has": [
+        {
+          "type": "host",
+          "value": "testnet\\..*"
+        }
+      ],
       "destination": "https://s3.hippius.com/cascade-testnet-manifests/receipts/:path*"
     },
     {
@@ -14,7 +25,12 @@
     },
     {
       "source": "/status/:path*",
-      "has": [{ "type": "host", "value": "testnet\\..*" }],
+      "has": [
+        {
+          "type": "host",
+          "value": "testnet\\..*"
+        }
+      ],
       "destination": "https://s3.hippius.com/cascade-testnet-manifests/status/:path*"
     },
     {
@@ -23,7 +39,12 @@
     },
     {
       "source": "/benchmarks/:path*",
-      "has": [{ "type": "host", "value": "testnet\\..*" }],
+      "has": [
+        {
+          "type": "host",
+          "value": "testnet\\..*"
+        }
+      ],
       "destination": "https://s3.hippius.com/cascade-testnet-manifests/benchmarks/:path*"
     },
     {
@@ -31,8 +52,27 @@
       "destination": "https://s3.hippius.com/cascade-manifests/benchmarks/:path*"
     },
     {
+      "source": "/bench_v/:path*",
+      "has": [
+        {
+          "type": "host",
+          "value": "testnet\\..*"
+        }
+      ],
+      "destination": "https://s3.hippius.com/cascade-testnet-manifests/bench_v/:path*"
+    },
+    {
+      "source": "/bench_v/:path*",
+      "destination": "https://s3.hippius.com/cascade-manifests/bench_v/:path*"
+    },
+    {
       "source": "/promotions/:path*",
-      "has": [{ "type": "host", "value": "testnet\\..*" }],
+      "has": [
+        {
+          "type": "host",
+          "value": "testnet\\..*"
+        }
+      ],
       "destination": "https://s3.hippius.com/cascade-testnet-manifests/promotions/:path*"
     },
     {
@@ -41,7 +81,12 @@
     },
     {
       "source": "/funded/:path*",
-      "has": [{ "type": "host", "value": "testnet\\..*" }],
+      "has": [
+        {
+          "type": "host",
+          "value": "testnet\\..*"
+        }
+      ],
       "destination": "https://s3.hippius.com/cascade-testnet-manifests/funded/:path*"
     },
     {
@@ -50,7 +95,12 @@
     },
     {
       "source": "/mix/:path*",
-      "has": [{ "type": "host", "value": "testnet\\..*" }],
+      "has": [
+        {
+          "type": "host",
+          "value": "testnet\\..*"
+        }
+      ],
       "destination": "https://s3.hippius.com/cascade-testnet-manifests/mix/:path*"
     },
     {
@@ -59,7 +109,12 @@
     },
     {
       "source": "/training/:path*",
-      "has": [{ "type": "host", "value": "testnet\\..*" }],
+      "has": [
+        {
+          "type": "host",
+          "value": "testnet\\..*"
+        }
+      ],
       "destination": "https://s3.hippius.com/cascade-testnet-manifests/training/:path*"
     },
     {
@@ -71,55 +126,104 @@
     {
       "source": "/receipts/(.*)",
       "headers": [
-        { "key": "Cache-Control", "value": "public, max-age=0, s-maxage=15, stale-while-revalidate=30" }
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=0, s-maxage=15, stale-while-revalidate=30"
+        }
       ]
     },
     {
       "source": "/status/(.*)",
       "headers": [
-        { "key": "Cache-Control", "value": "public, max-age=0, s-maxage=10, stale-while-revalidate=20" }
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=0, s-maxage=10, stale-while-revalidate=20"
+        }
       ]
     },
     {
       "source": "/benchmarks/(.*)",
       "headers": [
-        { "key": "Cache-Control", "value": "public, max-age=0, s-maxage=60, stale-while-revalidate=300" }
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=0, s-maxage=60, stale-while-revalidate=300"
+        }
+      ]
+    },
+    {
+      "source": "/bench_v/(.*)",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=0, s-maxage=60, stale-while-revalidate=300"
+        }
       ]
     },
     {
       "source": "/promotions/(.*)",
       "headers": [
-        { "key": "Cache-Control", "value": "public, max-age=0, s-maxage=60, stale-while-revalidate=300" }
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=0, s-maxage=60, stale-while-revalidate=300"
+        }
       ]
     },
     {
       "source": "/funded/(.*)",
       "headers": [
-        { "key": "Cache-Control", "value": "public, max-age=0, s-maxage=10, stale-while-revalidate=20" }
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=0, s-maxage=10, stale-while-revalidate=20"
+        }
       ]
     },
     {
       "source": "/mix/(.*)",
       "headers": [
-        { "key": "Cache-Control", "value": "public, max-age=0, s-maxage=60, stale-while-revalidate=300" }
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=0, s-maxage=60, stale-while-revalidate=300"
+        }
       ]
     },
     {
       "source": "/training/(.*)",
       "headers": [
-        { "key": "Cache-Control", "value": "public, max-age=0, s-maxage=60, stale-while-revalidate=300" }
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=0, s-maxage=60, stale-while-revalidate=300"
+        }
       ]
     },
     {
       "source": "/(index.html)?",
       "headers": [
-        { "key": "Cache-Control", "value": "public, max-age=60" }
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=60"
+        }
       ]
     },
     {
       "source": "/stakeholders.html",
       "headers": [
-        { "key": "Cache-Control", "value": "public, max-age=60" }
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=60"
+        }
+      ]
+    },
+    {
+      "source": "/llms.txt",
+      "headers": [
+        {
+          "key": "Content-Type",
+          "value": "text/plain; charset=utf-8"
+        },
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=60"
+        }
       ]
     }
   ]

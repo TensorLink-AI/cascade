@@ -10,14 +10,12 @@ import numpy as np
 import pytest
 
 from cascade.eval.scoring import WindowScore
-from cascade.shared.chain import Commitment
 from cascade.shared.manifest import (
     TrainedEntry,
     TrainingManifest,
     contract_digest,
     format_trained_pointer,
 )
-from cascade.trainer.loop import plan_round, resolve_commitments
 from cascade.validator.loop import ValidatorRunner
 from cascade.validator.state import genesis
 
@@ -209,7 +207,7 @@ def test_reward_uids_include_registered_former_kings(cfg):
     # only fk1 is still registered (fk2 deregistered ⇒ dropped).
     state = ChampionState(king_hotkey="king_hk", king_uid=0, former_kings=("fk1", "fk2"))
     runner = ValidatorRunner(cfg=cfg, state=state, evaluate_fn=lambda e, w: [], verify_signatures=False)
-    client = types.SimpleNamespace(uid_for_hotkey=lambda hk: {"fk1": 5}.get(hk))
+    client = types.SimpleNamespace(uid_for_hotkey=lambda hk: {"king_hk": 0, "fk1": 5}.get(hk))
     uids = runner._reward_uids(_manifest(cfg), None, client)
     assert uids == [0, 5]
 
@@ -481,25 +479,3 @@ def test_off_mode_skips_gate_entirely(cfg):
     outcome = runner.process_round(_manifest(cfg), windows=[], base_seed=7)
     assert outcome.transition.dethroned  # default cfg ships gift_gate_mode = "off"
     assert calls == []
-
-
-def test_trainer_pairing_logic():
-    commits = [
-        Commitment(uid=0, hotkey="a", coldkey=None, payload=f"metro-v1:gen:hippius:{CID}", commit_block=5),
-        Commitment(uid=1, hotkey="b", coldkey=None, payload=f"metro-v1:gen:hippius:{CID2}", commit_block=6),
-        Commitment(uid=2, hotkey="c", coldkey=None, payload="garbage", commit_block=7),
-    ]
-    resolved = resolve_commitments(commits)
-    assert len(resolved) == 2  # garbage dropped
-    plan = plan_round(resolved, king_hotkey="a")
-    assert plan.king.hotkey == "a"
-    assert [c.hotkey for c in plan.challengers] == ["b"]
-
-
-def test_trainer_pairing_promotes_interim_king_when_absent():
-    commits = [
-        Commitment(uid=3, hotkey="x", coldkey=None, payload=f"metro-v1:gen:hippius:{CID}", commit_block=5),
-    ]
-    plan = plan_round(resolve_commitments(commits), king_hotkey=None)
-    assert plan.king.hotkey == "x"
-    assert plan.challengers == []

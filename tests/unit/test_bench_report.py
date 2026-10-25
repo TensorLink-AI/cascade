@@ -62,8 +62,8 @@ def test_round_trip_preserves_everything():
     loaded = load_bench_report(dump_bench_report(signed))
     assert loaded == signed
     assert loaded.round_id == "777" and loaded.created_block == 9000
-    assert loaded.entry_for("king").scores == KING_SCORES
-    assert loaded.entry_for("challenger").scores == CHALL_SCORES
+    assert loaded.entry_for_pointer(PTR_K).scores == KING_SCORES
+    assert loaded.entry_for_pointer(PTR_C).scores == CHALL_SCORES
     # The signature survives the round trip AND the canonical body is stable.
     assert loaded.signature == signed.signature
     assert loaded.canonical_body() == signed.canonical_body()
@@ -78,8 +78,7 @@ def test_sign_covers_canonical_body_and_excludes_signature():
 
 def test_entry_lookups():
     r = _report()
-    assert r.entry_for("king", size="toto2-4m").miner_hotkey == "king_hk"
-    assert r.entry_for("king", size="toto2-22m") is None
+    assert r.entry_for_pointer(PTR_K).miner_hotkey == "king_hk"
     assert r.entry_for_pointer(PTR_C).role == "challenger"
     assert r.entry_for_pointer("metro-v1:trained:hippius:x/y@sha256:" + "0" * 64) is None
 
@@ -88,8 +87,8 @@ def test_partial_report_is_legitimate():
     only_king = (BenchEntry(role="king", size="toto2-4m", miner_hotkey="king_hk",
                             miner_uid=1, trained_pointer=PTR_K, scores=KING_SCORES),)
     loaded = load_bench_report(dump_bench_report(_report(entries=only_king)))
-    assert loaded.entry_for("king") is not None
-    assert loaded.entry_for("challenger") is None
+    assert loaded.entry_for_pointer(PTR_K) is not None
+    assert loaded.entry_for_pointer(PTR_C) is None
 
 
 def test_load_rejects_unknown_version():

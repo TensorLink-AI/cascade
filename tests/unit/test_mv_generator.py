@@ -36,7 +36,7 @@ def test_deterministic_in_seed_and_index():
 
 
 def test_passes_check_series_at_a_raised_cap():
-    s = next(iter(_gen(length=300, max_channels=4).generate(1)))
+    s = next(iter(_gen(length=300, min_channels=2, max_channels=4).generate(1)))
     # C>1 only passes once max_channels is raised (the Phase-4 gate); the array
     # itself is otherwise valid (finite, in-band length).
     check_series(s, min_length=64, max_length=4096, max_channels=8)

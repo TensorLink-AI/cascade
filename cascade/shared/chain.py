@@ -1,13 +1,12 @@
 """Bittensor chain client — commitment polling and weight setting.
 
-Wraps the minimal subtensor surface cascade needs:
+Wraps the minimal subtensor surface cascade needs (bittensor 11.x —
+DEC-CA-0051; the 10.5 → 11 traps are documented where they bite):
 
 * :meth:`ChainClient.poll_commitments` — read every miner's revealed generator
   pointer for the netuid.
-* :meth:`ChainClient.commit_submission` — miner-side ``set_reveal_commitment``
-  with the generator pointer string.
-* :meth:`ChainClient.set_winner_take_all_weights` — push the KOTH weight vector
-  (1.0 on the champion, 0.0 elsewhere).
+* :meth:`ChainClient.commit_submission` — miner-side timelock commitment of
+  the generator pointer string (10.5's ``set_reveal_commitment`` encoding).
 * :meth:`ChainClient.set_equal_share_weights` — split weight equally across the
   current king plus registered prior kings (teutonic-style payout), burning to
   ``burn_uid`` when none are registered.
@@ -22,6 +21,7 @@ reach it.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -78,16 +78,6 @@ def decayed_share_vector(
     return weights
 
 
-def equal_share_vector(
-    reward_uids: list[int], n_uids: int, *, burn_uid: int = 0
-) -> list[float]:
-    """Equal split across the distinct, in-range ``reward_uids`` (burns to
-    ``burn_uid`` if none). The ``decay = 1.0`` case of
-    :func:`decayed_share_vector`, kept as a named helper for the winner-take-all
-    path and back-compat."""
-    return decayed_share_vector(reward_uids, n_uids, decay=1.0, burn_uid=burn_uid)
-
-
 def blocks_until_boundary_reveal(
     current_block: int,
     epoch_blocks: int,
@@ -99,14 +89,12 @@ def blocks_until_boundary_reveal(
     """The ``blocks_until_reveal`` delay that lands a timelock reveal just
     before the next epoch boundary.
 
-    Eligibility gates on the REVEAL block strictly before the boundary
-    (:func:`cascade.trainer.loop.resolve_commitments`), so a reveal that lands
-    at/after the boundary silently costs the miner the round. The target is
-    therefore ``boundary − margin_blocks``: hidden for (almost) the whole
-    submission window, public only for the last ``margin_blocks`` — long enough
-    to absorb commit-inclusion and drand reveal jitter, short enough that a
-    copier cannot fetch + re-commit + land their own reveal before the same
-    boundary.
+    A leg is admitted only once its reveal is on chain, and copy contests
+    resolve on the earlier reveal block, so the target is
+    ``boundary − margin_blocks``: hidden for (almost) the whole submission
+    window, public only for the last ``margin_blocks`` — long enough to absorb
+    commit-inclusion and drand reveal jitter, short enough that a copier cannot
+    fetch + re-commit + land their own reveal before the same boundary.
 
     When the current block is already inside the margin, floors to
     ``min_blocks`` (reveal now): the residual exposure is below the margin
@@ -145,27 +133,21 @@ def seed_from_block_hash(block_hash: str) -> int:
     )
 
 
-def _defuse_substrate_destructor() -> None:
-    """Neuter async_substrate_interface's hanging ``__del__``.
-
-    Its destructor closes the websocket, whose close handshake ``join()``s a
-    thread with NO timeout — on a dead connection that join never returns, and
-    because ``__del__`` runs wherever garbage collection happens to fire, it
-    hangs the MAIN thread of whatever service triggered it. Observed live
-    2026-07-14: the validator froze mid-poll for 5.5h (rounds went unscored)
-    with the main thread parked in ``__del__ → close → join``. A leaked socket
-    on GC is harmless (the process's daemon threads die at exit); a hang is
-    fatal. Idempotent, best-effort, version-tolerant.
-    """
-    try:
-        from async_substrate_interface import sync_substrate
-
-        for cls_name in ("SubstrateInterface",):
-            cls = getattr(sync_substrate, cls_name, None)
-            if cls is not None and getattr(cls, "__del__", None) is not None:
-                cls.__del__ = lambda self: None  # type: ignore[assignment]
-    except Exception:  # noqa: BLE001 — defusal must never break client construction
-        pass
+# The SDK line this module is written against (DEC-CA-0051). 11.x is a
+# ground-up rewrite: no ``get_current_block`` / ``metagraph`` / ``.substrate``
+# / ``set_reveal_commitment`` — an older install fails LOUDLY here instead of
+# with an AttributeError deep inside a round.
+_SDK_MAJOR = 11
+# 10.5.0's ``bittensor.core.settings.version_as_int`` — the weights version key
+# every 10.5 validator sent implicitly. Kept so an 11.x validator's extrinsic
+# carries the same key (the chain only checks ``>= weights_version``; 0 today).
+_V10_WEIGHTS_VERSION_KEY = 10005000
+_RAO_PER_TAO = 10**9
+# Storage descriptors as plain ``(pallet, item)`` pairs — all 11.x's
+# ``query``/``query_map`` read (and importable without the SDK).
+_REVEALED_COMMITMENTS = ("Commitments", "RevealedCommitments")
+_COMMITMENT_OF = ("Commitments", "CommitmentOf")
+_WEIGHTS = ("SubtensorModule", "Weights")
 
 
 def _import_bittensor():
@@ -176,7 +158,67 @@ def _import_bittensor():
             "bittensor not installed; install the [chain] extra to run "
             "validator / trainer / miner against a live network"
         ) from e
+    if not hasattr(bittensor, "SyncClient") or not hasattr(bittensor, "calls"):
+        ver = getattr(bittensor, "__version__", "?")
+        raise ChainError(
+            f"bittensor {ver} is installed but cascade needs the {_SDK_MAJOR}.x SDK "
+            "(pyproject pins bittensor==11.3.0); re-sync the [chain] extra"
+        )
     return bittensor
+
+
+def open_wallet(name: str | None, hotkey: str | None, path: str | None = None) -> Any:
+    """A ``bittensor.Wallet`` for signing, passing only the arguments given.
+
+    11.x's ``Wallet`` takes ``path`` as a plain string default — an explicit
+    ``path=None`` (what argparse hands over when ``--wallet-path`` is unset)
+    would break key loading, so None means "SDK default", as it did in 10.5.
+    """
+    import bittensor  # type: ignore
+
+    kwargs: dict[str, Any] = {}
+    if name is not None:
+        kwargs["name"] = name
+    if hotkey is not None:
+        kwargs["hotkey"] = hotkey
+    if path is not None:
+        kwargs["path"] = path
+    return bittensor.Wallet(**kwargs)
+
+
+def encrypt_reveal_commitment(payload: str, blocks_until_reveal: int,
+                              block_time: float = 12.0) -> tuple[bytes, int]:
+    """Timelock-seal a submission pointer exactly as 10.5's
+    ``set_reveal_commitment`` did: ``(inner TLE ciphertext, drand round)``.
+
+    The sealed plaintext MUST be SCALE ``compact(len) + UTF-8`` — the shape the
+    chain reveals into ``RevealedCommitments`` and that
+    :meth:`ChainClient._decode_reveal_entries` strips. ``bittensor_core``'s
+    ``get_encrypted_commitment`` produces it (byte-identical to 10.5's
+    ``bittensor_drand``). NEVER ``bittensor.timelock.encrypt``: it seals raw
+    UTF-8 with no prefix, so the decoder eats a real byte and the miner is
+    silently skipped every round (DEC-CA-0051).
+    """
+    try:
+        import bittensor_core  # type: ignore
+    except ImportError as e:
+        raise ChainError("bittensor_core missing; install the [chain] extra") from e
+    encrypted, reveal_round = bittensor_core.get_encrypted_commitment(
+        payload, int(blocks_until_reveal), float(block_time))
+    return bytes(encrypted), int(reveal_round)
+
+
+def float32_weights(weights: list[float]) -> list[float]:
+    """The weight vector rounded through float32, as Python floats.
+
+    10.5 quantised weights to u16 from a float32 array; 11.x quantises from
+    float64, which moves ±1 LSB on one uid for ~4% of vectors. Feeding 11.x
+    the float32-rounded values reproduces 10.5's u16 vector exactly, so mixed
+    10.5/11.x validators commit bit-identical weights (DEC-CA-0051).
+    """
+    import numpy as np
+
+    return [float(w) for w in np.asarray(weights, dtype=np.float32)]
 
 
 @dataclass(frozen=True)
@@ -191,7 +233,9 @@ class Commitment:
     (:func:`blocks_until_boundary_reveal`).
     """
 
-    uid: int
+    # None only from ``poll_commitments(include_deregistered=True)``: a
+    # hotkey that revealed but is no longer in the head metagraph.
+    uid: int | None
     hotkey: str
     coldkey: str | None
     payload: str
@@ -237,26 +281,18 @@ class ChainClient:
     def subtensor(self):
         if self._subtensor is None:
             bt = _import_bittensor()
-            _defuse_substrate_destructor()
-            # bittensor <9 exposed a lowercase ``subtensor`` factory; 9+/10 only
-            # ship the ``Subtensor`` class. Support both so the client works
-            # across the ``bittensor>=8`` range pyproject allows.
-            subtensor_factory = getattr(bt, "subtensor", None) or bt.Subtensor
-            self._subtensor = subtensor_factory(network=self.network)
+            # 11.x: a cold, lazily-connecting blocking client (its own daemon
+            # loop thread; torn down on GC — no hanging websocket destructor
+            # to defuse any more, unlike 10.5's async_substrate_interface).
+            self._subtensor = bt.Subtensor(self.network)
         return self._subtensor
 
     def wallet(self):
         if self._wallet is None:
             if self.wallet_name is None or self.wallet_hotkey is None:
                 raise ChainError("wallet_name and wallet_hotkey are required")
-            bt = _import_bittensor()
-            kwargs: dict[str, Any] = {"name": self.wallet_name, "hotkey": self.wallet_hotkey}
-            if self.wallet_path is not None:
-                kwargs["path"] = self.wallet_path
-            # bittensor <9 exposed a lowercase ``wallet`` factory; 9+/10 only ship
-            # the ``Wallet`` class. Support both (matches the subtensor shim above).
-            wallet_factory = getattr(bt, "wallet", None) or bt.Wallet
-            self._wallet = wallet_factory(**kwargs)
+            _import_bittensor()
+            self._wallet = open_wallet(self.wallet_name, self.wallet_hotkey, self.wallet_path)
         return self._wallet
 
     def reconnect(self) -> None:
@@ -265,21 +301,50 @@ class ChainClient:
         A long-lived bittensor websocket can go quietly stale — serving a
         ~20-minute-old block or hanging without erroring — and the only
         reliable recovery is a fresh connection. Mirrors the provisioner's
-        chain_client_factory rebuild (cascade.provision.loop._current_block)."""
-        self._subtensor = None
+        chain_client_factory rebuild (cascade.provision.loop._current_block).
+        The dropped client is closed best-effort in the background: a hung
+        socket's close must never block the caller (the reason we reconnect)."""
+        old, self._subtensor = self._subtensor, None
+        close = getattr(old, "close", None)
+        if close is not None:
+            import contextlib
+            import threading
+
+            def _close() -> None:
+                # 11.x's close/GC teardown waits up to ~10s on a hung loop;
+                # explicit close here also detaches that GC finalizer.
+                with contextlib.suppress(Exception):
+                    close()
+
+            threading.Thread(target=_close, name="cascade-chain-close", daemon=True).start()
 
     def current_block(self) -> int:
         try:
-            return int(self.subtensor().get_current_block())
+            return int(self.subtensor().block)
         except Exception as e:  # noqa: BLE001
             raise ChainError(f"get_current_block_failed: {e}") from e
+
+    def finalized_block(self) -> int:
+        try:
+            return int(self.subtensor().finalized_block)
+        except Exception as exc:
+            raise ChainError(f"get_finalized_block_failed: {exc}") from exc
+
+    def block_timestamp(self, block: int | None = None) -> float:
+        """UTC seconds from the chain's Timestamp pallet, independent of local time."""
+        value = self.subtensor().timestamp(block=block)
+        return float(value.timestamp())
 
     def block_hash(self, block: int | None = None) -> str:
         """The chain block hash at ``block`` (current block when None)."""
         sub = self.subtensor()
         try:
             blk = int(self.current_block()) if block is None else int(block)
-            return str(sub.get_block_hash(blk))
+            info = sub.block_info(blk)
+            h = getattr(info, "hash", None)
+            if not h:
+                raise ValueError(f"no block hash for block {blk}")
+            return str(h)
         except Exception as e:  # noqa: BLE001
             raise ChainError(f"get_block_hash_failed: {e}") from e
 
@@ -293,97 +358,51 @@ class ChainClient:
         """
         return seed_from_block_hash(self.block_hash(block))
 
+    def _metagraph(self, block: int | None = None) -> Any:
+        """The netuid's typed 11.x metagraph (``subnets.metagraph``) at
+        ``block`` (head when None), without the commitments pallet reads.
+        Neurons are uid-ordered; this is the ONE stake source (DEC-CA-0051:
+        ``neurons[i].total_stake`` == 10.5's ``metagraph.S``; the
+        ``neurons.all`` runtime call's ``total_stake`` is a different
+        quantity and must never feed the activation tally)."""
+        sub = self.subtensor()
+        try:
+            meta = sub.subnets.metagraph(
+                self.netuid, block=None if block is None else int(block), commitments=False)
+        except Exception as e:  # noqa: BLE001
+            raise ChainError(f"metagraph_failed: {e}") from e
+        if meta is None:
+            raise ChainError(f"metagraph_failed: netuid {self.netuid} does not exist")
+        return meta
+
     def highest_incentive_hotkey(self) -> str | None:
         """The reigning king's hotkey: the UID with the highest incentive on the
         metagraph (validators set this via weights). None on an empty metagraph."""
-        sub = self.subtensor()
-        try:
-            meta = sub.metagraph(netuid=self.netuid, lite=True)
-        except Exception as e:  # noqa: BLE001
-            raise ChainError(f"metagraph_failed: {e}") from e
-        n = int(meta.n)
+        neurons = list(self._metagraph().neurons)
+        n = len(neurons)
         if n == 0:
             return None
-        incentive = list(meta.incentive)
-        best_uid = max(range(n), key=lambda u: float(incentive[u]))
-        if float(incentive[best_uid]) <= 0.0:
+        incentive = [float(nn.incentive) for nn in neurons]
+        best_uid = max(range(n), key=lambda u: incentive[u])
+        if incentive[best_uid] <= 0.0:
             return None  # vacant throne — let the trainer pick an interim king
-        return str(meta.hotkeys[best_uid])
-
-    def poll_pending_commits(self) -> dict[str, int] | None:
-        """``{hotkey: commit_block}`` for every timelock commit still ENCRYPTED
-        on chain, in one ``query_map``.
-
-        ``Commitments::CommitmentOf`` carries the encrypted payload and the
-        block it landed at; the pallet CONSUMES the record when drand reveals
-        it, and ``RevealedCommitments`` keeps only ``(payload, reveal_block)``.
-        So the commit block — the only on-chain evidence of who submitted a
-        given generator FIRST — is destroyed before any round screens on it,
-        and the sole way to have it is to have looked while the payload was
-        still sealed. That is what this read is for; see
-        :meth:`cascade.trainer.loop.TrainerRunner.witness_commits`.
-
-        Timed reveals keep a payload sealed for most of its epoch
-        (``reveal_margin_blocks`` before the boundary), so any polling cadence
-        finer than that window observes every commit — and a submitter cannot
-        shorten the window without also committing late, which is precisely
-        what the ordering is meant to penalise.
-
-        Best-effort by contract: returns ``None`` on a failed read rather than
-        raising, and ``{}`` only when the chain genuinely holds no sealed
-        commit. The caller must not conflate them — "I could not look" is not
-        evidence that every pending commit revealed.
-        """
-        try:
-            sub = self.subtensor()
-            qm = sub.substrate.query_map(module="Commitments",
-                                         storage_function="CommitmentOf",
-                                         params=[self.netuid], page_size=200)
-        except Exception as e:  # noqa: BLE001 — advisory read; never break a round
-            log.warning("pending-commit poll failed (%s); commit-order evidence "
-                        "for this tick is lost", e)
-            return None
-        out: dict[str, int] = {}
-        for key, value in qm:
-            try:
-                hotkey = str(getattr(key, "value", key))
-                v = getattr(value, "value", value) or {}
-                block = int(v.get("block") or 0)
-                if not block:
-                    continue
-                fields = (v.get("info") or {}).get("fields") or []
-                sealed = any(isinstance(f, dict) and f.get("TimelockEncrypted")
-                             for f in fields)
-                if sealed:
-                    out[hotkey] = block
-            except Exception:  # noqa: BLE001 — one bad entry is not the field
-                continue
-        return out
+        return str(neurons[best_uid].hotkey)
 
     def n_uids(self) -> int:
         """Number of UIDs registered on the netuid (for the weight vector)."""
-        sub = self.subtensor()
-        try:
-            return int(sub.metagraph(netuid=self.netuid, lite=True).n)
-        except Exception as e:  # noqa: BLE001
-            raise ChainError(f"metagraph_failed: {e}") from e
+        return len(self._metagraph().neurons)
 
     def registered_hotkeys(self) -> list[str]:
-        """Every hotkey currently registered on the netuid (lite metagraph).
+        """Every hotkey currently registered on the netuid.
 
         The intake's registration gate reads this — membership, not weights.
         """
-        sub = self.subtensor()
-        try:
-            meta = sub.metagraph(netuid=self.netuid, lite=True)
-        except Exception as e:  # noqa: BLE001
-            raise ChainError(f"metagraph_failed: {e}") from e
-        return [str(hk) for hk in meta.hotkeys]
+        return [str(nn.hotkey) for nn in self._metagraph().neurons]
 
     def subnet_economics(self) -> dict | None:
         """Live pool economics for the netuid, or None when unavailable.
 
-        Reads the subnet's ``DynamicInfo`` and returns::
+        Returns::
 
             {"alpha_price_tao": float,          # TAO per alpha (pool price)
              "tao_in_emission_per_day": float,  # TAO/block injected × 7200
@@ -391,27 +410,30 @@ class ChainClient:
 
         Presentational only (feeds ``status/chain.json`` for the dashboards) —
         returns None instead of raising on any shape drift or chain flake, so
-        a publisher can simply omit the field. Balance-typed fields are read
-        via their ``.tao`` accessor with a float() fallback.
+        a publisher can simply omit the field. The price is the swap's spot
+        price (``SwapRuntimeApi.current_alpha_price`` — 10.5's
+        ``get_subnet_price``); the emission is ``DynamicInfo.tao_in_emission``.
         """
         BLOCKS_PER_DAY = 86400 / 12.0  # bittensor block time is 12s
 
-        def _tao(v: object) -> float | None:
-            try:
-                return float(getattr(v, "tao", v))
-            except (TypeError, ValueError):
-                return None
-
         try:
+            bt = _import_bittensor()
             sub = self.subtensor()
-            dyn = sub.subnet(self.netuid)
-            if dyn is None:
-                return None
-            price = _tao(getattr(dyn, "price", None))
-            tao_in = _tao(getattr(dyn, "tao_in_emission", None))
+            price: float | None
+            try:
+                price = float(sub.prices.alpha_price(self.netuid)["tao_per_alpha"])
+            except Exception:  # noqa: BLE001
+                price = None
+            tao_in: float | None
+            try:
+                dyn = sub.runtime(bt.runtime_api.SubnetInfoRuntimeApi.get_dynamic_info,
+                                  [self.netuid])
+                tao_in = int(dyn["tao_in_emission"]) / _RAO_PER_TAO
+            except Exception:  # noqa: BLE001
+                tao_in = None
             if price is None and tao_in is None:
                 return None
-            out: dict = {"as_of_block": int(sub.get_current_block())}
+            out: dict = {"as_of_block": int(sub.block)}
             if price is not None:
                 out["alpha_price_tao"] = price
             if tao_in is not None:
@@ -422,54 +444,68 @@ class ChainClient:
 
     def uid_for_hotkey(self, hotkey: str) -> int | None:
         """Resolve a hotkey to its UID on the netuid, or None if absent."""
-        sub = self.subtensor()
-        try:
-            meta = sub.metagraph(netuid=self.netuid, lite=True)
-        except Exception as e:  # noqa: BLE001
-            raise ChainError(f"metagraph_failed: {e}") from e
-        for uid in range(int(meta.n)):
-            if str(meta.hotkeys[uid]) == hotkey:
+        for uid, nn in enumerate(self._metagraph().neurons):
+            if str(nn.hotkey) == hotkey:
+                return uid
+        return None
+
+    def uid_for_hotkey_at_block(self, hotkey: str, block: int) -> int | None:
+        for uid, neuron in enumerate(self._metagraph(block).neurons):
+            if str(neuron.hotkey) == hotkey:
                 return uid
         return None
 
     def weights_for_hotkey(self, hotkey: str) -> list[float] | None:
         """The weight row a validator hotkey currently has on chain, or None.
 
-        Reads the full (non-lite) metagraph and returns ``hotkey``'s row of the
-        weight matrix as floats (chain-normalised; callers comparing against a
-        receipt should compare the *support* — which UIDs carry weight — not
-        magnitudes). None when the hotkey is not registered. Used by
-        ``cascade-audit`` to cross-check a receipt's recorded weight vector.
-        """
-        sub = self.subtensor()
-        try:
-            meta = sub.metagraph(netuid=self.netuid, lite=False)
-        except Exception as e:  # noqa: BLE001
-            raise ChainError(f"metagraph_failed: {e}") from e
-        uid = next(
-            (u for u in range(int(meta.n)) if str(meta.hotkeys[u]) == hotkey), None
-        )
-        if uid is None:
-            return None
-        # bittensor 9/10 expose the weight matrix as ``W`` (property) with the
-        # raw attribute ``weights``; accept either for version tolerance.
-        matrix = getattr(meta, "W", None)
-        if matrix is None:
-            matrix = getattr(meta, "weights", None)
-        if matrix is None:
-            raise ChainError("metagraph carries no weight matrix (lite node?)")
-        return [float(w) for w in matrix[uid]]
+        Returns ``hotkey``'s row of the weight matrix as floats (chain-
+        normalised; callers comparing against a receipt should compare the
+        *support* — which UIDs carry weight — not magnitudes). None when the
+        hotkey is not registered. Used by ``cascade-audit`` to cross-check a
+        receipt's recorded weight vector.
 
-    def poll_commitments(self, include_history: bool = False) -> list[Commitment]:
+        Reads the raw u16 row (``SubtensorModule::Weights``) and normalises it
+        exactly as 10.5's ``metagraph.W`` did: a float32 row of length n,
+        divided by its float32 sum — so the floats are bit-identical too.
+        """
+        import numpy as np
+
+        meta = self._metagraph()
+        hotkeys = [str(nn.hotkey) for nn in meta.neurons]
+        if hotkey not in hotkeys:
+            return None
+        uid = hotkeys.index(hotkey)
+        n = len(hotkeys)
+        try:
+            row = self.subtensor().query(_WEIGHTS, [self.netuid, uid], block=int(meta.block))
+        except Exception as e:  # noqa: BLE001
+            raise ChainError(f"weights_query_failed: {e}") from e
+        vec = np.zeros(n, dtype=np.float32)
+        for target, value in row or []:
+            t = int(target)
+            if 0 <= t < n:
+                vec[t] = float(value)
+        total = vec.sum()
+        if total > 0:
+            vec /= total
+        return [float(w) for w in vec]
+
+    def poll_commitments(self, include_history: bool = False,
+                         include_deregistered: bool = False) -> list[Commitment]:
         """Return the revealed generator pointer for every UID on the netuid.
         UIDs without a commitment are omitted.
 
-        Miners write via ``set_reveal_commitment`` (timelock commit-reveal), so the
-        payload lands in the *revealed*-commitment store — NOT the plain commitment
-        store that ``get_commitment`` reads. We therefore read
-        ``get_all_revealed_commitments`` (one call for the whole netuid) and map
-        each hotkey back to its UID, taking the latest reveal per hotkey. Falls
-        back to the per-UID ``get_commitment`` path on older bittensor builds.
+        Miners write a timelock commitment (:meth:`commit_submission`), so the
+        payload lands in the *revealed*-commitment store
+        (``Commitments::RevealedCommitments``) — NOT the plain store. ONE
+        ``query_map`` reads the whole netuid (~1s), decoded per entry by the
+        tolerant both-renderings decoder (:meth:`_decode_reveal_entries`), and
+        each hotkey is mapped back to its UID, taking the latest reveal per
+        hotkey. (10.5's SDK batch decoder raised for the WHOLE netuid on one
+        malformed entry; this path never had that failure mode and is the
+        primary one since DEC-CA-0051.) If the map read itself fails, falls
+        back to one ``RevealedCommitments`` read per registered hotkey,
+        skipping only the unreadable ones.
 
         ``include_history=True`` returns EVERY retained reveal per hotkey (one
         ``Commitment`` each) instead of only the latest. Any caller applying an
@@ -477,106 +513,81 @@ class ChainClient:
         audit cross-checks) needs the history: collapsing to the latest reveal
         FIRST erases a miner whose newest commit landed after the cutoff, even
         though their eligible pre-cutoff reveal is still on chain.
+
+        ``include_deregistered=True`` also keeps the reveals of hotkeys absent
+        from the head metagraph (deregistered since), with ``uid=None`` and
+        ``coldkey=None`` — keyed by hotkey, for callers binding a ref as of a
+        PAST block (the era gate's ``train_block``), where a miner
+        deregistered after training still had that reveal. Default off: every
+        uid-keyed caller keeps registered UIDs only. Bulk read only — the
+        per-hotkey fallback can only enumerate registered hotkeys.
         """
         sub = self.subtensor()
+        meta = self._metagraph()
+        hotkeys = [str(nn.hotkey) for nn in meta.neurons]
+        uid_by_hotkey = {hk: u for u, hk in enumerate(hotkeys)}
+        coldkeys = [str(nn.coldkey) for nn in meta.neurons]
+        block = int(meta.block)
         try:
-            meta = sub.metagraph(netuid=self.netuid, lite=True)
+            return self._revealed_raw_map(sub, uid_by_hotkey, coldkeys,
+                                          include_history=include_history, block=block,
+                                          include_deregistered=include_deregistered)
         except Exception as e:  # noqa: BLE001
-            raise ChainError(f"metagraph_failed: {e}") from e
+            # Once per distinct cause: a flaky map read would otherwise warn
+            # on EVERY poll (~2 min) on every node — noise that hides a real
+            # problem.
+            cause = f"{type(e).__name__}: {e}"[:200]
+            if cause not in _bulk_decode_warned:
+                _bulk_decode_warned.add(cause)
+                log.warning("bulk revealed-commitment read failed (%s); falling back to "
+                            "per-hotkey reads (this warning repeats only when the "
+                            "cause changes)", e)
+            else:
+                log.debug("bulk revealed-commitment read failed (%s); per-hotkey", e)
+            return self._revealed_per_uid(sub, hotkeys, coldkeys,
+                                          include_history=include_history, block=block)
 
-        uid_by_hotkey = {str(meta.hotkeys[u]): u for u in range(int(meta.n))}
-        coldkeys = list(meta.coldkeys) if hasattr(meta, "coldkeys") else None
+    def _raw_revealed_entries(self, sub: Any, hotkey: str,
+                              block: int | None = None) -> list[tuple[int, str]]:
+        """Read ONE hotkey's ``Commitments::RevealedCommitments`` entry and
+        decode BOTH substrate renderings. Returns ``[(block, payload)]``."""
+        v = sub.query(_REVEALED_COMMITMENTS, [self.netuid, hotkey], block=block)
+        return self._entries_without_notes(getattr(v, "value", v))
 
-        get_revealed = getattr(sub, "get_all_revealed_commitments", None)
-        out: list[Commitment] = []
-        if get_revealed is not None:
-            try:
-                revealed = get_revealed(self.netuid) or {}
-            except Exception as e:  # noqa: BLE001
-                # One miner's malformed (non-hex) revealed commitment makes
-                # bittensor's BATCH decoder raise for the WHOLE netuid — which
-                # would blind the trainer to every other miner's submission (a
-                # field-wide DoS from a single bad commit). Read the raw store
-                # ourselves: ONE query_map for the netuid, tolerant per-entry
-                # decode (~1s), instead of N per-UID queries (~13 min live —
-                # long enough to blow the provisioner's rental window).
-                # Once per distinct cause: one malformed on-chain commit makes
-                # this fire on EVERY poll (~2 min) on every node — noise that
-                # hides a real problem. The raw path names the offending uid.
-                cause = f"{type(e).__name__}: {e}"[:200]
-                if cause not in _bulk_decode_warned:
-                    _bulk_decode_warned.add(cause)
-                    log.warning("bulk revealed-commitment decode failed (%s); reading "
-                                "the raw store map (this warning repeats only when the "
-                                "cause changes)", e)
-                else:
-                    log.debug("bulk revealed-commitment decode failed (%s); raw store map", e)
-                try:
-                    return self._revealed_raw_map(sub, uid_by_hotkey, coldkeys,
-                                                  include_history=include_history)
-                except Exception as e2:  # noqa: BLE001
-                    log.warning("raw store map failed (%s); "
-                                "falling back to per-UID decode", e2)
-                    return self._revealed_per_uid(sub, meta, coldkeys,
-                                                  include_history=include_history)
-            for hotkey, reveals in revealed.items():
-                uid = uid_by_hotkey.get(str(hotkey))
-                if uid is None or not reveals:
-                    continue
-                # ``reveals`` is a sequence of (block, payload).
-                picked = reveals if include_history else \
-                    [max(reveals, key=lambda r: int(r[0]))]
-                for block, payload in picked:
-                    if not isinstance(payload, str) or not payload:
-                        continue
-                    out.append(
-                        Commitment(
-                            uid=uid,
-                            hotkey=str(hotkey),
-                            coldkey=str(coldkeys[uid]) if coldkeys else None,
-                            payload=payload,
-                            commit_block=int(block),
-                        )
-                    )
-            return out
-
-        # No bulk API (older bittensor): decode per-UID.
-        return self._revealed_per_uid(sub, meta, coldkeys,
-                                      include_history=include_history)
-
-    def _raw_revealed_entries(self, sub: Any, hotkey: str) -> list[tuple[int, str]]:
-        """Read ``Commitments::RevealedCommitments`` directly and decode BOTH
-        substrate renderings — the escape hatch for bittensor's decoder bug.
-
-        py-substrate-interface returns storage bytes as a ``0x…`` hex string
-        UNLESS the bytes happen to be valid UTF-8, in which case it returns the
-        decoded string — and whether a reveal's bytes are UTF-8-valid depends
-        on its SCALE length prefix, i.e. on the PAYLOAD LENGTH
-        (``(4·len+1) mod 256 < 128`` ⇒ raw). bittensor's
-        ``decode_revealed_commitment`` assumes hex and raises ``fromhex`` on the
-        raw rendering, silently costing that miner every round (observed live:
-        7 UIDs skipped purely by pointer-length lottery — ``@hf:`` pointers at
-        91 chars raw, ``@sha256:`` at 109 hex). Returns ``[(block, payload)]``.
-        """
-        q = sub.substrate.query(module="Commitments",
-                                storage_function="RevealedCommitments",
-                                params=[self.netuid, hotkey])
-        return self._decode_reveal_entries(getattr(q, "value", None))
+    @classmethod
+    def _entries_without_notes(cls, v: Any) -> list[tuple[int, str]]:
+        """Decoded reveals minus any validator activation note (DEC-CA-0045):
+        a note is never a submission and must never reach a field builder."""
+        return [(b, p) for b, p in cls._decode_reveal_entries(v) if not is_signal_payload(p)]
 
     @staticmethod
     def _decode_reveal_entries(v: Any) -> list[tuple[int, str]]:
-        """Decode a RevealedCommitments storage value (either rendering) into
-        ``[(block, payload)]``, skipping undecodable entries."""
+        """Decode a RevealedCommitments storage value into
+        ``[(block, payload)]``, skipping undecodable entries.
+
+        The stored bytes are SCALE ``compact(len) + UTF-8`` (what
+        :func:`encrypt_reveal_commitment` seals). The transport hands them over
+        as a ``0x…`` hex string UNLESS the bytes happen to be valid UTF-8, in
+        which case it returns the decoded string — and whether a reveal's bytes
+        are UTF-8-valid depends on its SCALE length prefix, i.e. on the PAYLOAD
+        LENGTH (``(4·len+1) mod 256 < 128`` ⇒ raw). 10.5's SDK decoder assumed
+        hex and raised on the raw rendering (observed live: 7 UIDs skipped
+        purely by pointer-length lottery); this one takes either, plus bytes.
+        """
         out: list[tuple[int, str]] = []
         for entry in (v or []):
             try:
                 com, block = entry
-                if not isinstance(com, str) or not com:
+                if isinstance(com, (bytes, bytearray)):
+                    raw = bytes(com)
+                elif not isinstance(com, str) or not com:
                     continue
-                if com.startswith("0x"):  # noqa: SIM108 — explicit branch reads clearer here
+                elif com.startswith("0x"):
                     raw = bytes.fromhex(com[2:])
                 else:
                     raw = com.encode("utf-8")
+                if not raw:
+                    continue
                 # strip the SCALE compact length prefix (mode in the low 2 bits)
                 mode = raw[0] & 0b11
                 offset = 1 if mode == 0 else 2 if mode == 1 else 4
@@ -589,130 +600,108 @@ class ChainClient:
 
     def _revealed_raw_map(self, sub: Any, uid_by_hotkey: dict[str, int],
                           coldkeys: list | None,
-                          include_history: bool = False) -> list[Commitment]:
+                          include_history: bool = False,
+                          block: int | None = None,
+                          include_deregistered: bool = False) -> list[Commitment]:
         """All revealed commitments for the netuid in ONE ``query_map``, with the
         tolerant both-renderings decode per entry.
 
-        Verified live on testnet: 38 hotkeys in ~1.1s where the per-UID path
+        Verified live on testnet: 38 hotkeys in ~1.1s where a per-UID walk
         takes ~13 minutes — the difference between making and missing the
-        provisioner's pre-boundary rental window."""
-        qm = sub.substrate.query_map(module="Commitments",
-                                     storage_function="RevealedCommitments",
-                                     params=[self.netuid], page_size=200)
+        provisioner's pre-boundary rental window. Verified live on netuid 91
+        (DEC-CA-0051): identical to 10.5's read over 867 hotkeys."""
+        qm = sub.query_map(_REVEALED_COMMITMENTS, [self.netuid], block=block)
         out: list[Commitment] = []
         for key, value in qm:
             hotkey = str(getattr(key, "value", key))
             uid = uid_by_hotkey.get(hotkey)
-            if uid is None:
+            if uid is None and not include_deregistered:
                 continue
-            entries = self._decode_reveal_entries(getattr(value, "value", value))
+            entries = self._entries_without_notes(getattr(value, "value", value))
             if not entries:
                 continue
             picked = entries if include_history else \
                 [max(entries, key=lambda r: int(r[0]))]
-            for block, payload in picked:
+            for blk, payload in picked:
                 out.append(Commitment(uid=uid, hotkey=hotkey,
-                                      coldkey=str(coldkeys[uid]) if coldkeys else None,
-                                      payload=payload, commit_block=int(block)))
+                                      coldkey=(str(coldkeys[uid])
+                                               if coldkeys and uid is not None else None),
+                                      payload=payload, commit_block=int(blk)))
         return out
 
-    def _revealed_per_uid(self, sub: Any, meta: Any, coldkeys: list | None,
-                          include_history: bool = False) -> list[Commitment]:
-        """Decode each UID's revealed commitment individually — robust to a single
-        malformed entry that would poison bittensor's batch decoder.
-
-        Prefers the per-UID *revealed* store (``get_revealed_commitment``, the
-        timelock reveal path miners actually write to); falls back to the plain
-        commitment store (``get_commitment``) on older builds. An entry that won't
-        decode is skipped with a warning, never fatal — so one garbage commitment
+    def _revealed_per_uid(self, sub: Any, hotkeys: list[str], coldkeys: list | None,
+                          include_history: bool = False,
+                          block: int | None = None) -> list[Commitment]:
+        """Read each registered hotkey's revealed commitment individually — the
+        fallback when the one-shot map read fails. An entry that won't read or
+        decode is skipped with a warning, never fatal — so one bad commitment
         costs exactly that one UID, not the whole field."""
-        per_uid = getattr(sub, "get_revealed_commitment", None)
         out: list[Commitment] = []
-        for uid in range(int(meta.n)):
-            hotkey = str(meta.hotkeys[uid])
+        for uid, hotkey in enumerate(hotkeys):
             coldkey = str(coldkeys[uid]) if coldkeys else None
-            if per_uid is not None:
-                try:
-                    reveals = per_uid(self.netuid, uid)
-                except Exception as e:  # noqa: BLE001 — try the raw store before skipping
-                    # bittensor's decoder chokes on the raw substrate rendering
-                    # (see _raw_revealed_entries) — read the store ourselves so a
-                    # miner is never skipped for their pointer's LENGTH.
-                    try:
-                        reveals = self._raw_revealed_entries(sub, hotkey)
-                    except Exception:  # noqa: BLE001
-                        reveals = None
-                    if not reveals:
-                        log.warning("skipping uid %d: revealed-commitment decode failed: %s",
-                                    uid, e)
-                        continue
-                    log.info("uid %d: recovered reveal via raw store (bittensor "
-                             "decoder bug — payload-length lottery)", uid)
-                if reveals:
-                    picked = reveals if include_history else \
-                        [max(reveals, key=lambda r: int(r[0]))]
-                    for block, payload in picked:
-                        if isinstance(payload, str) and payload:
-                            out.append(Commitment(uid=uid, hotkey=hotkey, coldkey=coldkey,
-                                                  payload=payload, commit_block=int(block)))
-                    continue
-            # Last resort: the plain commitment store (older bittensor).
             try:
-                rec = sub.get_commitment(netuid=self.netuid, uid=uid)
-            except Exception:  # noqa: BLE001
-                rec = None
-            if not rec:
+                reveals = self._raw_revealed_entries(sub, hotkey, block=block)
+            except Exception as e:  # noqa: BLE001
+                log.warning("skipping uid %d: revealed-commitment read failed: %s", uid, e)
                 continue
-            payload, reveal_block = _split_commitment(rec)
-            if payload is None:
+            if not reveals:
                 continue
-            # A validator's activation note (DEC-CA-0045) lives in this store;
-            # it is not a submission and must never reach a field builder.
-            if is_signal_payload(payload):
-                continue
-            out.append(Commitment(uid=uid, hotkey=hotkey, coldkey=coldkey,
-                                  payload=payload, commit_block=int(reveal_block)))
+            picked = reveals if include_history else \
+                [max(reveals, key=lambda r: int(r[0]))]
+            for blk, payload in picked:
+                out.append(Commitment(uid=uid, hotkey=hotkey, coldkey=coldkey,
+                                      payload=payload, commit_block=int(blk)))
         return out
+
+    def pending_commitment(self, hotkey: str) -> dict | None:
+        """The hotkey's raw ``Commitments::CommitmentOf`` record (``{deposit,
+        block, info: {fields: [...]}}``), or None. Read-only. While a timelock
+        commit is still sealed this is where it lives; it is consumed on
+        reveal."""
+        try:
+            v = self.subtensor().query(_COMMITMENT_OF, [self.netuid, hotkey])
+        except Exception as e:  # noqa: BLE001
+            raise ChainError(f"commitment_query_failed: {e}") from e
+        v = getattr(v, "value", v)
+        return v if isinstance(v, dict) else None
+
+    def plain_commitment(self, hotkey: str) -> tuple[str, int] | None:
+        """``(payload, block)`` of the hotkey's PLAIN commitment, or None.
+
+        ``block`` is the block the chain recorded the commitment at — the
+        timestamp the direct-MoE network config anchors to (DEC-CA-0052 §9)."""
+        v = self.pending_commitment(hotkey)
+        payload = _decode_raw_commitment(v)
+        if not payload:
+            return None
+        return payload, int(v["block"])
 
     # ── stake-weighted activation (DEC-CA-0045) ──────────────────────────────
 
     def validator_stakes(self, block: int | None = None) -> list:
         """Every registered hotkey's ``(stake, validator_permit, last_update)``
         as of ``block`` (the current metagraph when None), for the activation
-        tally. Version-tolerant: ``S`` / ``stake`` for stake, missing
-        ``validator_permit`` ⇒ False, missing ``last_update`` ⇒ 0."""
+        tally.
+
+        Stake is the typed metagraph's ``neurons[i].total_stake`` — the SAME
+        quantity as 10.5's ``metagraph.S`` — rounded through float32 exactly
+        as 10.5 stored ``S``, so a mixed 10.5/11.x fleet tallies bit-identical
+        stake (DEC-CA-0051). NOT ``neurons.all(...).total_stake``: that is a
+        different number (live: 330,736 vs 485,193 for one uid) and would
+        flip the 51% lock-in between versions."""
+        import numpy as np
+
         from .activation import ValidatorStake
 
-        sub = self.subtensor()
-        try:
-            kwargs = {"netuid": self.netuid, "lite": True}
-            if block is not None:
-                kwargs["block"] = int(block)
-            meta = sub.metagraph(**kwargs)
-        except Exception as e:  # noqa: BLE001
-            raise ChainError(f"metagraph_failed: {e}") from e
-        n = int(meta.n)
-        stakes = getattr(meta, "S", None)
-        if stakes is None:
-            stakes = getattr(meta, "stake", None)
-        permits = getattr(meta, "validator_permit", None)
-        updates = getattr(meta, "last_update", None)
-
-        def _at(seq: Any, i: int, default: Any) -> Any:
-            if seq is None:
-                return default
-            try:
-                return seq[i]
-            except (IndexError, TypeError, KeyError):
-                return default
-
+        meta = self._metagraph(block)
         out = []
-        for uid in range(n):
+        for nn in meta.neurons:
+            rao = int(getattr(nn.total_stake, "rao", 0) or 0)
             out.append(ValidatorStake(
-                hotkey=str(meta.hotkeys[uid]),
-                stake=float(_at(stakes, uid, 0.0) or 0.0),
-                permit=bool(_at(permits, uid, False)),
-                last_update=int(_at(updates, uid, 0) or 0),
+                hotkey=str(nn.hotkey),
+                stake=float(np.float32(rao / _RAO_PER_TAO)),
+                permit=bool(nn.validator_permit),
+                last_update=int(nn.last_update or 0),
             ))
         return out
 
@@ -722,20 +711,14 @@ class ChainClient:
         use) as of ``block`` (current when None). Every hotkey's, unfiltered —
         the activation tally parses and filters."""
         # ONE ``query_map`` of ``Commitments::CommitmentOf`` at the block,
-        # decoded here: the SDK's ``get_all_commitments`` runs its decoder
-        # over every entry and logs an ERROR for each sealed (timelock) miner
-        # commit it cannot read — one line per miner per read, on every
-        # node, at every boundary. Only ``Raw*`` fields carry a note; sealed
-        # fields are skipped silently. A failure is a ChainError the caller
-        # retries next poll — never a per-uid walk (≈13 min on a full
+        # decoded here: only ``Raw*`` fields carry a note; sealed (timelock)
+        # miner fields are skipped silently. A failure is a ChainError the
+        # caller retries next poll — never a per-uid walk (≈13 min on a full
         # metagraph), which would stall the poll loop this runs in.
         sub = self.subtensor()
         try:
-            kwargs: dict[str, Any] = {"module": "Commitments", "name": "CommitmentOf",
-                                      "params": [self.netuid]}
-            if block is not None:
-                kwargs["block"] = int(block)
-            qm = sub.query_map(**kwargs)
+            qm = sub.query_map(_COMMITMENT_OF, [self.netuid],
+                               block=None if block is None else int(block))
         except Exception as e:  # noqa: BLE001
             raise ChainError(f"commitments_query_failed: {e}") from e
         out: dict[str, str] = {}
@@ -749,29 +732,32 @@ class ChainClient:
                 out[hotkey] = payload
         return out
 
-    def set_plain_commitment(self, payload: str) -> None:
-        """Validator-side: write ``payload`` to the plain commitment store
-        (``set_commitment``; ``commit`` on older bittensor). One slot per
-        hotkey — the activation note replaces whatever was there."""
+    def _submit_commitment(self, fields: list, what: str) -> Any:
+        """Sign ``Commitments.set_commitment(netuid, {fields})`` with the
+        HOTKEY (the commitment is keyed by the signer — the 11.x raw-call
+        default is the coldkey) and wait for inclusion, as 10.5 did. Returns
+        the SDK result; raises ChainError on a transport/SDK exception."""
+        bt = _import_bittensor()
         sub = self.subtensor()
         w = self.wallet()
-        writer = getattr(sub, "set_commitment", None) or getattr(sub, "commit", None)
-        if writer is None:
-            raise ChainError("set_commitment unavailable on this bittensor build")
+        call = bt.calls.Commitments.set_commitment(netuid=self.netuid, info={"fields": fields})
+        try:
+            return sub.submit_call(call, w, signer="hotkey",
+                                   wait_for_inclusion=True, wait_for_finalization=False)
+        except Exception as e:  # noqa: BLE001
+            raise ChainError(f"{what}_failed: {e}") from e
+
+    def set_plain_commitment(self, payload: str) -> None:
+        """Validator-side: write ``payload`` to the plain commitment store
+        (a ``Raw<len>`` field). One slot per hotkey — the activation note
+        replaces whatever was there."""
         data = str(payload)
+        raw = data.encode("utf-8")
         # Preview before signing (the chain-mutation rule): intent, then call.
         log.info("chain: set_commitment intent netuid=%d hotkey=%s data=%r",
                  self.netuid, self.hotkey_ss58(), data)
-        try:
-            try:
-                resp = writer(wallet=w, netuid=self.netuid, data=data,
-                              wait_for_inclusion=True, wait_for_finalization=False)
-            except TypeError:
-                resp = writer(wallet=w, netuid=self.netuid, data=data)
-        except Exception as e:  # noqa: BLE001
-            raise ChainError(f"set_commitment_failed: {e}") from e
-        # The SDK returns a response object (``raise_error=False`` default):
-        # a rejected extrinsic (rate limit, RPC error) is a failure, not a
+        resp = self._submit_commitment([{f"Raw{len(raw)}": raw}], "set_commitment")
+        # A rejected extrinsic (rate limit, RPC error) is a failure, not a
         # note on chain.
         ok, msg = _extrinsic_outcome(resp)
         if ok is False:
@@ -785,28 +771,23 @@ class ChainClient:
             return ""
 
     def commit_submission(self, payload: str, blocks_until_reveal: int = 1) -> None:
-        """Miner-side: write the generator pointer via ``set_reveal_commitment``."""
-        sub = self.subtensor()
-        w = self.wallet()
-        try:
-            sub.set_reveal_commitment(
-                wallet=w,
-                netuid=self.netuid,
-                data=payload,
-                blocks_until_reveal=blocks_until_reveal,
-            )
-        except Exception as e:  # noqa: BLE001
-            raise ChainError(f"set_reveal_commitment_failed: {e}") from e
-
-    def set_winner_take_all_weights(self, champion_uid: int, n_uids: int) -> None:
-        """Push a weight vector with 1.0 on ``champion_uid`` and 0.0 elsewhere."""
-        if not (0 <= champion_uid < n_uids):
-            raise ChainError(f"champion_uid {champion_uid} out of range [0,{n_uids})")
-        self._set_weights(equal_share_vector([champion_uid], n_uids))
+        """Miner-side: timelock-commit the generator pointer (10.5's
+        ``set_reveal_commitment``: seal ``payload`` to the drand round
+        ``blocks_until_reveal`` 12-second blocks out, write it as a
+        ``TimelockEncrypted`` commitment signed by the hotkey). The chain
+        reveals it into ``RevealedCommitments`` at that round. A rejected
+        extrinsic is a ChainError (the miner CLI reports it and exits 3)."""
+        encrypted, reveal_round = encrypt_reveal_commitment(payload, blocks_until_reveal)
+        resp = self._submit_commitment(
+            [{"TimelockEncrypted": {"encrypted": encrypted, "reveal_round": reveal_round}}],
+            "set_reveal_commitment")
+        ok, msg = _extrinsic_outcome(resp)
+        if ok is False:
+            raise ChainError(f"set_reveal_commitment_rejected: {msg}")
 
     def set_equal_share_weights(
         self, reward_uids: list[int], n_uids: int, *, decay: float = 1.0, burn_uid: int = 0
-    ) -> None:
+    ) -> bool:
         """Push a (geometrically decayed) share vector across ``reward_uids``.
 
         ``reward_uids`` is the current king first, then any registered prior
@@ -815,24 +796,60 @@ class ChainClient:
         highest-incentive UID); ``decay = 1.0`` is the flat equal split.
         Duplicates and out-of-range UIDs are dropped; when none survive, all
         weight burns to ``burn_uid`` so emission still leaves the network.
+        Returns :meth:`_set_weights`'s success flag.
         """
-        self._set_weights(decayed_share_vector(reward_uids, n_uids, decay=decay, burn_uid=burn_uid))
+        return self._set_weights(
+            decayed_share_vector(reward_uids, n_uids, decay=decay, burn_uid=burn_uid))
 
-    def _set_weights(self, weights: list[float]) -> None:
+    def set_weight_vector(self, weights: list[float]) -> bool:
+        """Push an explicit, already-normalised weight vector (DEC-CA-0050:
+        the combined lane-A + lane-B vector). Returns :meth:`_set_weights`'s
+        success flag."""
+        if (not weights or any(not math.isfinite(w) or w < 0 for w in weights)
+                or abs(sum(weights) - 1.0) > 1e-6):
+            raise ChainError(f"weight vector must be non-negative and sum to 1; got sum={sum(weights)}")
+        return self._set_weights(list(weights))
+
+    def _set_weights(self, weights: list[float]) -> bool:
+        """Submit ``weights`` (index = uid) via 11.x ``SetWeights``, which
+        picks plain vs timelocked commit-reveal from the subnet's config.
+
+        Two 10.5 behaviours are preserved deliberately:
+
+        * u16 quantisation: the vector is rounded through float32 first
+          (:func:`float32_weights`) so the committed u16 values are
+          bit-identical to a 10.5 validator's.
+        * failure semantics: 10.5's ``set_weights`` returned an unsuccessful
+          response (rate limit, chain rejection) WITHOUT raising, and only a
+          transport exception surfaced as ChainError. 11.x raises its own
+          ``ChainError`` for those preflight/chain rejections; they are logged
+          here and swallowed (never raised, as before) — but reported: the
+          return value is ``False`` for a rejected / explicitly unsuccessful
+          submission, so the caller does not record a push that did not
+          happen and retries it. ``True`` = submitted (``wait_for_inclusion``
+          stays False: inclusion is not awaited, an unknown outcome counts as
+          submitted). Anything else is wrapped in ChainError (the validator
+          logs "weight set failed" and retries next round).
+        """
+        bt = _import_bittensor()
         sub = self.subtensor()
         w = self.wallet()
         uids = list(range(len(weights)))
+        intent = bt.SetWeights(netuid=self.netuid, uids=uids, weights=float32_weights(weights),
+                               version_key=_V10_WEIGHTS_VERSION_KEY)
         try:
-            sub.set_weights(
-                wallet=w,
-                netuid=self.netuid,
-                uids=uids,
-                weights=weights,
-                wait_for_inclusion=False,
-                wait_for_finalization=False,
-            )
+            result = sub.execute(intent, w, wait_for_inclusion=False,
+                                 wait_for_finalization=False)
+        except bt.ChainError as e:
+            log.warning("set_weights rejected (netuid=%d): %s", self.netuid, e)
+            return False
         except Exception as e:  # noqa: BLE001
             raise ChainError(f"set_weights_failed: {e}") from e
+        ok, msg = _extrinsic_outcome(result)
+        if ok is False:
+            log.warning("set_weights unsuccessful (netuid=%d): %s", self.netuid, msg)
+            return False
+        return True
 
 
 def _decode_raw_commitment(v: Any) -> str | None:
@@ -877,25 +894,3 @@ def _extrinsic_outcome(resp: Any) -> tuple[bool | None, str]:
     if isinstance(resp, tuple) and resp:
         return bool(resp[0]), str(resp[1] if len(resp) > 1 else "")
     return None, ""
-
-
-def _split_commitment(rec: Any) -> tuple[str | None, int]:
-    """Best-effort extraction of ``(payload, reveal_block)`` across bittensor
-    versions: a plain string, a 2-tuple, a dict, or an object with attrs."""
-    if rec is None:
-        return None, 0
-    if isinstance(rec, str):
-        return rec, 0
-    if isinstance(rec, tuple) and len(rec) >= 2 and isinstance(rec[0], str):
-        return rec[0], int(rec[1])
-    if isinstance(rec, dict):
-        data = rec.get("data") or rec.get("payload")
-        block = rec.get("block") or rec.get("commit_block") or 0
-        if isinstance(data, str):
-            return data, int(block)
-        return None, 0
-    data = getattr(rec, "data", None) or getattr(rec, "payload", None)
-    block = getattr(rec, "block", None) or getattr(rec, "commit_block", None) or 0
-    if isinstance(data, str):
-        return data, int(block)
-    return None, 0

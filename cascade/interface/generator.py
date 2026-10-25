@@ -7,7 +7,8 @@ whatever arbitrary synthetic-data process the miner has designed.
 The contract is intentionally narrow:
 
 * construction takes the local repo directory and a deterministic ``seed``
-* ``generate(n_series)`` yields exactly ``n_series`` univariate float series
+* ``generate(n_series)`` yields exactly ``n_series`` float series, each with
+  the channel count required by the effective generator policy (v2: 8–32)
 * output is bounded: per-series length in ``[min_length, max_length]`` and a
   global cap on total emitted points, both enforced by the trainer
 
@@ -176,9 +177,10 @@ class DataGenerator(ABC):
         interchangeable.
 
         The values array is a ``float`` ``np.ndarray`` (finite, no NaN or
-        inf), either 1-D ``(L,)`` (univariate) or 2-D ``(C, L)`` (``C`` variates
-        of length ``L``). A 1-D series is treated as a single channel ``(1, L)``.
-        ``C`` must not exceed the configured ``max_channels`` (1 today), and the
+        inf), 2-D ``(C, L)`` (``C`` variates of length ``L``) for v2, with
+        8–32 channels per yield. Historical policies can also admit 1-D
+        ``(L,)`` arrays, which count as one channel ``(1, L)``.
+        ``C`` must satisfy the effective configured channel range, and the
         length ``L`` must fall within ``[min_length, max_length]``; the trainer
         validates every series with :func:`check_series` and aborts the round if
         any fails.
@@ -209,12 +211,25 @@ class DataGenerator(ABC):
 CAST_SAFE_MAX_FLOAT32 = 3.4028234663852886e38
 
 
+def check_channel_count(arr, *, min_channels=1, max_channels=1, index=None):
+    """Cheap parent-side check; untrusted generator children cannot waive it."""
+    where = "" if index is None else f" (series {index})"
+    if not isinstance(arr, np.ndarray) or arr.ndim not in (1, 2):
+        raise ValueError(f"series must be a 1-D or 2-D array{where}")
+    channels = 1 if arr.ndim == 1 else int(arr.shape[0])
+    if not 1 <= min_channels <= max_channels:
+        raise ValueError("invalid generator channel bounds")
+    if not min_channels <= channels <= max_channels:
+        raise ValueError(f"series has {channels} channels outside [{min_channels}, {max_channels}]{where}")
+
+
 def check_series(
     arr: object,
     *,
     min_length: int,
     max_length: int,
     max_channels: int = 1,
+    min_channels: int = 1,
     max_abs: float | None = None,
     reject_constant: bool = False,
     index: int | None = None,
@@ -223,7 +238,7 @@ def check_series(
 
     Accepts a 1-D ``(L,)`` series (univariate) or a 2-D ``(C, L)`` series
     (``C`` variates of length ``L``); a 1-D series counts as one channel. The
-    length band applies to ``L`` and ``C`` must be in ``[1, max_channels]``.
+    length band applies to ``L`` and ``C`` must be in ``[min_channels, max_channels]``.
 
     Two optional *data-quality* gates (both off by default so direct callers and
     ``cascade verify``'s static path are unchanged; the trainer turns them on
@@ -252,11 +267,7 @@ def check_series(
         raise ValueError(f"series must be 1-D (L,) or 2-D (C, L){where}; got shape {arr.shape}")
     if not np.issubdtype(arr.dtype, np.floating):
         raise ValueError(f"series dtype must be floating{where}; got {arr.dtype}")
-    channels = 1 if arr.ndim == 1 else int(arr.shape[0])
-    if channels < 1 or channels > max_channels:
-        raise ValueError(
-            f"series has {channels} channels outside [1, {max_channels}]{where}"
-        )
+    check_channel_count(arr, min_channels=min_channels, max_channels=max_channels, index=index)
     n = int(arr.shape[-1])
     if n < min_length or n > max_length:
         raise ValueError(
@@ -436,6 +447,7 @@ class SeriesValidator:
         min_length: int,
         max_length: int,
         max_channels: int = 1,
+        min_channels: int = 1,
         max_abs: float | None = None,
         reject_constant: bool = False,
         accepted_fields: tuple[str, ...] | list[str] = (),
@@ -448,6 +460,7 @@ class SeriesValidator:
         self.min_length = int(min_length)
         self.max_length = int(max_length)
         self.max_channels = int(max_channels)
+        self.min_channels = int(min_channels)
         self.max_abs = max_abs
         self.reject_constant = bool(reject_constant)
         self.accepted_fields = tuple(accepted_fields)
@@ -469,6 +482,7 @@ class SeriesValidator:
             min_length=cfg.min_length,
             max_length=cfg.max_length,
             max_channels=cfg.max_channels,
+            min_channels=cfg.min_channels,
             max_abs=cfg.max_abs_value or CAST_SAFE_MAX_FLOAT32,
             reject_constant=cfg.reject_constant,
             accepted_fields=tuple(cfg.accepted_fields),
@@ -486,7 +500,7 @@ class SeriesValidator:
         arr = rec[VALUES_FIELD] if isinstance(rec, dict) else rec
         check_series(
             arr, min_length=self.min_length, max_length=self.max_length,
-            max_channels=self.max_channels, max_abs=self.max_abs,
+            max_channels=self.max_channels, min_channels=self.min_channels, max_abs=self.max_abs,
             reject_constant=self.reject_constant, index=index,
         )
         if isinstance(rec, dict):
@@ -538,6 +552,7 @@ def drain_generator(
     max_length: int,
     max_total_points: int,
     max_channels: int = 1,
+    min_channels: int = 1,
     max_abs: float | None = None,
     reject_constant: bool = False,
     max_dup_fraction: float = 1.0,
@@ -603,7 +618,7 @@ def drain_generator(
     if n_series <= 0:
         raise ValueError(f"n_series must be positive; got {n_series}")
     validator = SeriesValidator(
-        min_length=min_length, max_length=max_length, max_channels=max_channels,
+        min_length=min_length, max_length=max_length, max_channels=max_channels, min_channels=min_channels,
         max_abs=max_abs, reject_constant=reject_constant,
         accepted_fields=accepted_fields, max_missing_frac=max_missing_frac,
         allow_future_known=allow_future_known,

@@ -20,6 +20,7 @@ competitor code; a clean scan is still not a license to run it unsandboxed.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import shutil
 import subprocess
@@ -46,6 +47,7 @@ def _anchor_receipt_king(args) -> dict | None:
 
     sys.path.insert(0, str(args.cascade_tree))
     import champions_archive as ca
+
     from cascade.shared.config import load_chain_config
     from cascade.shared.hippius import receipt_latest_key
     from cascade.shared.receipt import load_receipt, verify_receipt_signature
@@ -133,8 +135,8 @@ def main() -> int:
         if not digest:
             # Without the digest the idempotence check cannot run: an hourly
             # cron would re-commit a fresh "unknown-ref" reign EVERY run,
-            # forever, and poison future idempotence with an empty digest
-            # (review 2026-09-02). Fail loudly instead — this only happens if
+            # forever, and poison future idempotence with an empty digest.
+            # Fail loudly instead — this only happens if
             # the CLI's output format changes, which a human must look at.
             print("could not parse the resolved king ref from the CLI output "
                   "— refusing to archive without provenance. CLI said:\n"
@@ -143,10 +145,9 @@ def main() -> int:
 
         prev = {}
         if PROVENANCE.is_file():
-            try:
+            # A torn record must not block a sync.
+            with contextlib.suppress(Exception):
                 prev = json.loads(PROVENANCE.read_text())
-            except Exception:  # noqa: BLE001 — a torn record must not block a sync
-                pass
         dirty = subprocess.run(
             ["git", "-C", str(REPO), "status", "--porcelain", str(DEST)],
             capture_output=True, text=True).stdout.strip()
@@ -176,7 +177,7 @@ def main() -> int:
 
         # Stage the full replacement BESIDE the destination, then swap: a
         # copy that dies mid-way (disk full) must not leave a half-replaced
-        # champions/king/ behind (review 2026-09-02). Symlinks are dropped
+        # champions/king/ behind. Symlinks are dropped
         # from the copy UNCONDITIONALLY — the scan flags them high, but an
         # --allow-findings run (accepting some unrelated finding) must never
         # let copytree's default dereference commit HOST file contents into

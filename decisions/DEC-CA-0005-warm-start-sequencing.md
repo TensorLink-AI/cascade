@@ -2,7 +2,8 @@
 id: DEC-CA-0005
 type: decision
 title: "Cascade warm-start: revert on testnet, sequence reign-clock determinism before consumption"
-status: active
+status: superseded
+note: "Superseded by DEC-CA-0004 (persist the throne) and DEC-CA-0013 (propose-and-verify)."
 date: 2026-07-21
 tags: [cascade, warm-start, trainer, determinism, audit]
 revisit_when: "block-anchored reign clock + manifest-derived reign log land and survive a full testnet cascade with no trainer/validator king divergence — then implement trainer consumption (Problem 1) and re-evaluate arming"
@@ -41,7 +42,7 @@ DECISION — three parts, in order:
    cascade-audit re-derives from the pinned checkpoint (fetch failure must
    NOT silently fall back to random init — that breaks byte-exact audit).
 3. **Mainnet stays unarmed** until both land and a full testnet cascade
-   completes cleanly (checklist item in `docs/MAINNET_LAUNCH.md`).
+   completes cleanly (a checklist item in the mainnet launch runbook; runbook retired, in git history before cleanup/sweep).
 
 Rationale for the sequencing: consumption without a deterministic reign clock
 means fleet validators can disagree on WHICH init a round trains from —

@@ -60,7 +60,7 @@ state has NO automatic reconvergence — divergent kings mean divergent weight
 vectors and a forked receipt trail until a both-branch dethrone or a manual
 resync. Full protocol, restart-window timing, monitoring via per-validator
 receipt comparison, and the rollback boundary (safe only until the first
-genuine decay-dethrone) live in docs/MARGIN_DECAY_ROLLOUT.md. Testnet first:
+genuine decay-dethrone) lived in the rollout runbook (retired; in git history before cleanup/sweep). Testnet first:
 chain.testnet.toml carries the candidate schedule; one full ramp (tenure past
 warmup, margin walking down on receipts, promotion NOT resetting it, audit
 replay clean) gates the mainnet release.

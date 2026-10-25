@@ -1,6 +1,6 @@
 """Checkpoint ingest guard: a trained checkpoint is DATA, never code.
 
-Every scorer of a checkpoint — the validator's verdict, the post-publish bench,
+Every scorer of a checkpoint — the validator's verdict, the trainer's bench,
 the audit replay — historically imported and executed two Python files
 shipped INSIDE the checkpoint directory (``forecast_wrapper.py`` and
 ``model.py``) and built the model from the checkpoint's own ``config.json``.
@@ -15,7 +15,9 @@ validator and on the operator's king pod. This module closes that:
   any other ``.py`` in the checkpoint is refused outright. Executing the
   checkpoint's copies after this check is exactly executing repo code;
 * ``config.json``'s model config must equal the config the contract derives
-  for the entry's size (``Toto2Config.from_contract``) — no shape games;
+  for the entry's size (``Toto2Config.from_contract``, or
+  ``CascadeMoEConfig.from_contract`` for ``base_arch = "cascade_moe"``,
+  DEC-CA-0050) — no shape games;
 * ``weights.safetensors`` is checked by its HEADER (tensor names, dtypes,
   shapes must equal the pinned model's state dict) and by size (a byte
   budget from the pinned parameter count, PRISM's ``n_params × k`` shape)
@@ -63,7 +65,6 @@ __all__ = [
 ]
 
 WEIGHTS_FILE = "weights.safetensors"
-CODE_FILES = ("model.py", "forecast_wrapper.py")
 # The safetensors header is JSON metadata; 4M-param models need a few KB.
 MAX_HEADER_BYTES = 4 * 1024 * 1024
 # Byte budget multiplier over fp32 param bytes: weights are fp32 (×4/param);
@@ -83,8 +84,7 @@ class CheckpointDiverged(RuntimeError):
     """The checkpoint's weights hold NaN/inf: the training run diverged.
 
     Not tampering — the contract's own loop produces this when a corpus
-    overflows its numerics (2026-09-14: a funded leg's loss went NaN at step
-    150 of 152400 and trained on for 2.5 h) — but a checkpoint no scorer can
+    overflows its numerics — but a checkpoint no scorer can
     use: NaN weights forecast NaN samples, and the validator's scorer refuses
     non-finite samples for the whole entry. Caught at ingest so it never
     reaches a manifest."""
@@ -97,9 +97,20 @@ class CheckpointReport:
     n_tensors: int
 
 
-def expected_checkpoint_code() -> dict[str, bytes]:
-    """The exact bytes this repo writes into every checkpoint's code files."""
-    from ..trainer import toto2_model, toto2_trainer
+def expected_checkpoint_code(base_arch: str = "toto2") -> dict[str, bytes]:
+    """The exact bytes this repo writes into a ``base_arch`` checkpoint's code
+    files (DEC-CA-0050: ``cascade_moe`` ships ``moe_model.py`` + the MoE
+    wrapper; every other value is the toto2 pair)."""
+    from ..trainer import toto2_trainer
+
+    if base_arch == "cascade_moe":
+        from ..trainer import moe_model, moe_trainer
+
+        return {
+            "model.py": Path(moe_model.__file__).read_bytes(),
+            "forecast_wrapper.py": moe_trainer._MOE_FORECAST_WRAPPER_PY.encode("utf-8"),
+        }
+    from ..trainer import toto2_model
 
     return {
         "model.py": Path(toto2_model.__file__).read_bytes(),
@@ -107,15 +118,33 @@ def expected_checkpoint_code() -> dict[str, bytes]:
     }
 
 
-def verify_checkpoint_code(checkpoint_dir: Path | str) -> None:
+KNOWN_ARCHES = ("toto2", "cascade_moe")
+
+
+def checkpoint_arch(checkpoint_dir: Path | str) -> str:
+    """Which known architecture's ``model.py`` this checkpoint carries
+    (byte-identity), or ``"toto2"`` when it matches none — the full check in
+    :func:`verify_checkpoint_code` then refuses it."""
+    p = Path(checkpoint_dir) / "model.py"
+    got = p.read_bytes() if p.is_file() else b""
+    for arch in KNOWN_ARCHES:
+        if got == expected_checkpoint_code(arch)["model.py"]:
+            return arch
+    return "toto2"
+
+
+def verify_checkpoint_code(checkpoint_dir: Path | str) -> str:
     """Refuse a checkpoint whose Python is not byte-identical to the repo's.
 
-    Also refuses ANY other ``.py`` file (there is no legitimate one) and a
-    missing wrapper — the scorer would otherwise fail later with a less
-    honest error.
+    The model file picks the architecture (toto2 or cascade_moe); the wrapper
+    must then be THAT architecture's — no mixing. Also refuses ANY other
+    ``.py`` file (there is no legitimate one) and a missing wrapper — the
+    scorer would otherwise fail later with a less honest error. Returns the
+    architecture.
     """
     d = Path(checkpoint_dir)
-    expected = expected_checkpoint_code()
+    arch = checkpoint_arch(d)
+    expected = expected_checkpoint_code(arch)
     extra = sorted(p.name for p in d.rglob("*.py") if p.name not in expected)
     if extra:
         raise CheckpointTampered(f"unexpected python in checkpoint: {extra}")
@@ -125,7 +154,7 @@ def verify_checkpoint_code(checkpoint_dir: Path | str) -> None:
             raise CheckpointTampered(f"checkpoint is missing {name}")
         got = p.read_bytes()
         if got != want:
-            if (name == "forecast_wrapper.py"
+            if (arch == "toto2" and name == "forecast_wrapper.py"
                     and hashlib.sha256(got).hexdigest() in _HISTORICAL_WRAPPER_SHA256):
                 # A previous release's exact wrapper: refresh it in place so
                 # the load below executes THIS release's copy (same weights,
@@ -137,6 +166,7 @@ def verify_checkpoint_code(checkpoint_dir: Path | str) -> None:
             raise CheckpointTampered(
                 f"{name} differs from this release's copy — a checkpoint's "
                 "code is never executed unless it is byte-identical")
+    return arch
 
 
 def verify_weights_finite(checkpoint_dir: Path | str) -> None:
@@ -187,12 +217,28 @@ def safetensors_header(path: Path | str) -> dict:
     return header
 
 
+def _model_for_contract(contract):
+    """The pinned model + its config dict for ``contract`` (no weights). The
+    MoE model is built on the meta device — its shapes are all the guard
+    needs, and 191M params need not be allocated per ingest."""
+    if str(getattr(contract, "base_arch", "") or "") == "cascade_moe":
+        import torch
+
+        from ..trainer.moe_model import CascadeMoEConfig, CascadeMoEModel
+
+        cfg = CascadeMoEConfig.from_contract(contract)
+        with torch.device("meta"):
+            return CascadeMoEModel(cfg), "moe", cfg.to_dict()
+    from ..trainer.toto2_model import Toto2Config, Toto2Model
+
+    cfg = Toto2Config.from_contract(contract)
+    return Toto2Model(cfg), "toto2", cfg.to_dict()
+
+
 def _expected_state_spec(contract) -> tuple[dict[str, tuple[str, tuple[int, ...]]], int]:
     """``{name: (dtype, shape)}`` of the pinned model for ``contract`` and its
     parameter count — built on CPU from the repo's own model code."""
-    from ..trainer.toto2_model import Toto2Config, Toto2Model
-
-    model = Toto2Model(Toto2Config.from_contract(contract))
+    model, _, _ = _model_for_contract(contract)
     spec = {}
     n_params = 0
     for name, t in model.state_dict().items():
@@ -214,7 +260,13 @@ def verify_checkpoint(checkpoint_dir: Path | str, contract=None, *,
     bound its shape; every live scorer should pass the contract.
     """
     d = Path(checkpoint_dir)
-    verify_checkpoint_code(d)
+    arch = verify_checkpoint_code(d)
+    if contract is not None:
+        want_arch = ("cascade_moe" if str(getattr(contract, "base_arch", "") or "")
+                     == "cascade_moe" else "toto2")
+        if arch != want_arch:
+            raise CheckpointTampered(f"checkpoint carries the {arch} model; the "
+                                     f"contract pins {want_arch}")
     weights = d / WEIGHTS_FILE
     if not weights.is_file():
         raise CheckpointTampered(f"checkpoint is missing {WEIGHTS_FILE}")
@@ -225,14 +277,12 @@ def verify_checkpoint(checkpoint_dir: Path | str, contract=None, *,
 
     # config.json must be exactly what the contract derives — the validator
     # rebuilds the model from ITS config, never from the checkpoint's.
-    from ..trainer.toto2_model import Toto2Config
-
+    _, cfg_key, want = _model_for_contract(contract)
     try:
         cfg_obj = json.loads((d / "config.json").read_text(encoding="utf-8"))
-        shipped = dict(cfg_obj["toto2"])
+        shipped = dict(cfg_obj[cfg_key])
     except (OSError, ValueError, KeyError, TypeError) as e:
         raise CheckpointTampered(f"config.json unreadable or malformed: {e}") from e
-    want = Toto2Config.from_contract(contract).to_dict()
     if shipped != want:
         diff = sorted(k for k in set(shipped) | set(want) if shipped.get(k) != want.get(k))
         raise CheckpointTampered(f"config.json model config differs from the "

@@ -78,11 +78,7 @@ def _dump_pending_commitment(client: ChainClient, netuid: int, hotkey: str, when
     past block. Run this before AND after a probe's reveal to learn whether the
     record (and its ``block`` field) survives the reveal or is cleaned up."""
     try:
-        substrate = client.subtensor().substrate
-        rec = substrate.query(
-            module="Commitments", storage_function="CommitmentOf", params=[netuid, hotkey]
-        )
-        value = getattr(rec, "value", rec)
+        value = client.pending_commitment(hotkey)
         print(f"pending-store [{when}]: {value!r}"[:600])
     except Exception as e:  # noqa: BLE001 — a diagnostic must never abort the probe
         print(f"pending-store [{when}]: unreadable ({type(e).__name__}: {e})")

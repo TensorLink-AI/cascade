@@ -51,7 +51,9 @@ def contract_for_replay(receipt: RoundReceipt, cfg: ChainConfig) -> TrainingCont
     declared_from = int(cfg.scoring.declared_contract_from_block)
     if not (declared_from and isinstance(body, dict)
             and int(receipt.epoch_start_block) >= declared_from):
-        return cfg.training
+        from .checks import receipt_training
+
+        return receipt_training(receipt, cfg)   # the era's contract (DEC-CA-0050 v2)
     kwargs = {}
     for f in dc_fields(cfg.training):
         if f.name in body:
@@ -109,15 +111,32 @@ def _rederive_digest(
     max_wall_seconds: int | None = None,
     seed_mix: int = 1,
     budget_denomination: str = "points",
+    corpus_epochs: int = 0,
+    corpus_dir: Path | None = None,
 ) -> str:
     """Re-derive one corpus digest exactly as the trainer derived it — under
     the round's OWN budget denomination (DEC-CA-0042): it decides where the
-    budget-capped stream stops, hence which prefix the rolling digest covers."""
+    budget-capped stream stops, hence which prefix the rolling digest covers.
+
+    ``shards`` (DEC-CA-0053): no generator runs — the shards in
+    ``corpus_dir`` are sha256-verified and the same budget-capped stream the
+    trainer read is digested. Regenerating the shards from the generator and
+    the per-child counts in ``corpus.json`` is a separate, heavier check, not
+    done here."""
     if mode == "cache_reuse" and int(seed_mix or 1) == 1:
+        import dataclasses
+        import math
+
         from ..trainer.corpus import build_round_corpus
 
+        gen_cfg = cfg.generator
+        if corpus_epochs:
+            # the trainer's rule (stream.open_round_stream): unique corpus =
+            # budget / epochs points
+            gen_cfg = dataclasses.replace(
+                gen_cfg, corpus_target_points=int(math.ceil(token_budget / corpus_epochs)))
         return build_round_corpus(
-            repo_dir, generation_seed, cfg.generator, "cache_reuse",
+            repo_dir, generation_seed, gen_cfg, "cache_reuse",
             use_sandbox=True, blocked=cfg.static_guard.blocked,
         ).digest
     # stream_cpu — or ANY mode under a seed mix (DEC-CA-0033), where the
@@ -132,6 +151,8 @@ def _rederive_digest(
         max_wall_seconds=max_wall_seconds,
         seed_mix=seed_mix,
         budget_denomination=budget_denomination,
+        corpus_epochs=corpus_epochs,
+        corpus_dir=corpus_dir,
     ) as rs:
         for _ in rs.series():
             pass
@@ -144,8 +165,13 @@ def run_tier1(
     *,
     workdir: Path,
     full_stream: bool = False,
+    corpus_root: Path | None = None,
 ) -> list[CheckResult]:
-    """Re-derive every trained entry's corpus digest from its pinned generator."""
+    """Re-derive every trained entry's corpus digest from its pinned generator.
+
+    A ``shards`` entry (DEC-CA-0053) is re-derived from its materialised
+    corpus at ``corpus_root/<hotkey>/`` (``corpus.json`` + shards) instead;
+    absent ⇒ WARN, since only crowned kings' corpora are published."""
     if receipt.status == "rejected":
         return [CheckResult("corpus", SKIP, "rejected round; nothing was trained")]
     try:
@@ -157,6 +183,9 @@ def run_tier1(
     # declared regime covers it — the local chain.toml stops being the
     # authority the moment a declared term legitimately moves.
     training = contract_for_replay(receipt, cfg)
+    from dataclasses import replace
+
+    cfg = replace(cfg, generator=cfg.generator_for_contract(training))
     registry = training.size_registry
     results: list[CheckResult] = []
     digest_cache: dict[tuple, str] = {}
@@ -179,7 +208,31 @@ def run_tier1(
                             f"(~{contract.train_tokens:,} points); pass --full-stream to "
                             "re-stream and byte-compare"))
             continue
-        cache_key = (entry.gen_ref, mode, contract.train_tokens if mode != "cache_reuse" else 0)
+        epochs = int(getattr(contract, "corpus_epochs", 0) or 0)
+        if mode == "shards":
+            cdir = (corpus_root / entry.hotkey) if corpus_root is not None else None
+            if cdir is None or not (cdir / "corpus.json").is_file():
+                results.append(CheckResult(
+                    name, WARN, "shards corpus not available locally (only crowned "
+                                "kings' corpora are published); pass corpus_root"))
+                continue
+            try:
+                digest = _rederive_digest(
+                    cdir, receipt.generation_seed, cfg, mode=mode,
+                    token_budget=contract.train_tokens,
+                    budget_denomination=getattr(contract, "budget_denomination", "points"),
+                    corpus_epochs=epochs, corpus_dir=cdir)
+            except Exception as e:  # noqa: BLE001 — a bad shard set fails the audit
+                results.append(CheckResult(
+                    name, FAIL, f"shards corpus fails verification ({type(e).__name__}: {e})"))
+                continue
+            results.append(CheckResult(name, *(
+                (PASS, f"corpus digest {digest[:16]}… re-derives from the shards")
+                if digest == entry.corpus_digest else
+                (FAIL, f"shards digest {digest[:16]}… != recorded {entry.corpus_digest[:16]}…"))))
+            continue
+        cache_key = (entry.gen_ref, mode,
+                     contract.train_tokens if (mode != "cache_reuse" or epochs) else 0)
         try:
             if cache_key in digest_cache:
                 digest = digest_cache[cache_key]
@@ -193,6 +246,7 @@ def run_tier1(
                     max_wall_seconds=contract.max_train_seconds,
                     seed_mix=int(getattr(contract, "gen_seed_mix", 1) or 1),
                     budget_denomination=getattr(contract, "budget_denomination", "points"),
+                    corpus_epochs=epochs,
                 )
                 digest_cache[cache_key] = digest
         except Exception as e:  # noqa: BLE001 — fetch/build failure is a WARN, not proof
@@ -266,6 +320,9 @@ def run_tier2(
     # image_matched and silently change byte-exact into tolerance comparison).
     training = contract_for_replay(receipt, cfg)
     pinned_img = _image_sha256(training.train_image_digest)
+    from dataclasses import replace
+
+    cfg = replace(cfg, generator=cfg.generator_for_contract(training))
     runtime_img = _image_sha256(os.environ.get(TRAIN_IMAGE_DIGEST_ENV, ""))
     image_matched = pinned_img is not None and runtime_img == pinned_img
 
@@ -320,6 +377,8 @@ def run_tier2(
                 max_wall_seconds=contract.max_train_seconds,
                 seed_mix=int(getattr(contract, "gen_seed_mix", 1) or 1),
                 budget_denomination=getattr(contract, "budget_denomination", "points"),
+                corpus_epochs=int(getattr(contract, "corpus_epochs", 0) or 0),
+                **({"continuation_protocol": contract.continuation_protocol} if getattr(contract, "continuation_protocol", "") else {}),
             ) as rs:
                 base_trainer.train(
                     rs.series(), contract,

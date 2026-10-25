@@ -1,4 +1,4 @@
-"""Multi-horizon calibration telemetry (docs/notes/2026-08-31-multi-horizon-eval.md).
+"""Multi-horizon calibration telemetry (calibrates DEC-CA-0037's scored ladder).
 
 Log-only measurement for the planned scored 16/64/256/720 ladder: seeded
 even-by-domain eligibility-filtered draws, production-scorer geomeans, paired

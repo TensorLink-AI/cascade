@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8">
+<link rel="alternate" type="text/plain" href="llms.txt" title="Agent mining guide">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>cascade · SN91</title>
 <link rel="icon" type="image/svg+xml" href="favicon.svg">
@@ -750,6 +751,7 @@
    ============================================================ */
 
 *, *::before, *::after { box-sizing: border-box; }
+[hidden] { display: none !important; }
 
 body {
   margin: 0;
@@ -796,6 +798,11 @@ code, kbd, samp { font-family: var(--font-mono); font-size: 0.92em; }
   color: var(--clay);
 }
 
+
+.info-icon { display:inline-flex; align-items:center; justify-content:center; padding:2px 4px; margin-left:4px; border:0; background:transparent; color:var(--muted); font:15px/1 var(--font-sans); vertical-align:middle; cursor:help; text-transform:none; }
+.info-icon:hover, .info-icon:focus-visible { color:var(--ink); }
+.info-icon:focus-visible { outline:2px solid var(--good); outline-offset:2px; }
+.info-tooltip { position:fixed; z-index:100; width:min(360px,calc(100vw - 24px)); max-height:calc(100vh - 24px); overflow:auto; padding:12px 14px; border:1px solid var(--muted); background:var(--paper); color:var(--ink); box-shadow:0 4px 18px rgba(0,0,0,.15); font:13px/1.55 var(--font-sans); white-space:normal; text-transform:none; letter-spacing:normal; pointer-events:none; }
 </style>
 <style>
 :root {
@@ -832,13 +839,13 @@ body {
   -webkit-font-smoothing: antialiased;
   transition: background .2s, color .2s;
 }
-.page { width: 100%; max-width: 1200px; padding: 30px 44px 88px; display: flex; flex-direction: column; gap: 52px; }
+.page { width: 100%; max-width: 1200px; padding: 30px 44px 64px; display: flex; flex-direction: column; gap: 28px; }
 /* the tab panes hold the actual sections — without their own flex gap the
    sections stack edge-to-edge (the page-level gap can't reach inside them) */
-#page-main, #page-train { display: flex; flex-direction: column; gap: 68px; }
-#page-main[hidden], #page-train[hidden] { display: none; }
+#page-main, #page-train, #page-laneb, #page-lanec { display: flex; flex-direction: column; gap: 32px; }
+#page-main[hidden], #page-train[hidden], #page-lanec[hidden] { display: none; }
 /* two narrow tables share a row on desktop so the page scrolls shorter */
-.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 68px 44px; align-items: stretch; min-width: 0; }
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 32px; align-items: stretch; min-width: 0; }
 .grid-2 > div { min-width: 0; display: flex; flex-direction: column; }
 .grid-2 .panel { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 .grid-2 .panel .scroll-box { flex: 1; max-height: 268px; }
@@ -959,15 +966,10 @@ th.num { text-align: right; }
 .empty { color: var(--muted); text-transform: uppercase; padding: 12px 0; text-align: center; }
 .crown { font-weight: 700; color: var(--chal); }
 
-/* heat screen — informational standings for every entrant */
+/* era field — the rolling roster */
 .heat-note { font-family: var(--font-mono); font-size: 12px; color: var(--muted); margin-bottom: 14px; max-width: 84ch; line-height: 1.6; }
-.heat-bar-cell { display: flex; align-items: center; gap: 8px; min-width: 130px; }
-.heat-bar { flex: 1; height: 6px; background: var(--surface); border: var(--line-faint); border-radius: 3px; overflow: hidden; min-width: 56px; }
-.heat-bar > i { display: block; height: 100%; }
-.heat-rel { font-family: var(--font-mono); font-size: 11px; color: var(--muted); min-width: 46px; text-align: right; }
 .heat-pill { display: inline-block; font-family: var(--font-mono); font-weight: 700; font-size: 10px; letter-spacing: 0.04em; text-transform: uppercase; padding: 2px 9px; border-radius: 2px; border: 1px dashed currentColor; white-space: nowrap; }
 .heat-pill.adv { color: var(--good); }
-.heat-pill.screened { color: var(--muted); }
 .heat-pill.nofit { color: #BF5B3D; }
 .heat-empty { border: var(--line); background: var(--surface); padding: 26px; text-align: center; display: flex; flex-direction: column; align-items: center; gap: 6px; }
 .heat-empty .he-glyph { font-family: var(--font-mono); font-size: 18px; color: var(--muted); letter-spacing: 0.3em; }
@@ -1026,13 +1028,32 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
    palette checks on the light card (#F8FAF6) and the dark card (#29343F);
    dark steps are the same hues re-stepped, not a flip. Colour follows the
    series identity, never its position in the current selection. */
-:root { --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a; --s4:#eda100; --s5:#e87ba4; --s6:#4a3aa7; --s7:#e34948; }
-:root[data-theme="dark"] { --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#c98500; --s5:#d55181; --s6:#9085e9; --s7:#e66767; }
+:root { --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a; --s4:#eda100; --s5:#e87ba4; --s6:#4a3aa7; --s7:#e34948; --s8:#137b83; --s9:#8b6528; }
+:root[data-theme="dark"] { --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#c98500; --s5:#d55181; --s6:#9085e9; --s7:#e66767; --s8:#4abcc4; --s9:#d5ab65; }
 .chip { display:inline-flex; align-items:center; gap:7px; background:none; border:var(--line); color:var(--ink); font:600 10px/1 var(--font-mono); text-transform:uppercase; letter-spacing:0.05em; padding:5px 9px; cursor:pointer; opacity:0.55; }
 .chip i { width:14px; height:3px; display:inline-block; background:var(--sc); }
 .chip.on { opacity:1; outline:2px solid var(--sc); outline-offset:-2px; }
 .train-filters { display:flex; gap:18px; align-items:center; flex-wrap:wrap; margin:0 0 14px; font-family:var(--font-mono); font-size:10px; text-transform:uppercase; letter-spacing:0.05em; color:var(--muted); }
 .train-filters .grp { display:inline-flex; gap:6px; align-items:center; flex-wrap:wrap; }
+.pareto-control { display:grid; gap:6px; min-width:165px; flex:0 1 210px; }
+.pareto-control select { width:100%; min-height:42px; padding:10px 30px 10px 12px; border:var(--line); border-radius:0; background:var(--surface); color:var(--ink); font:13px var(--font-mono); }
+.pareto-history { display:flex; align-items:center; gap:8px; margin-top:20px; min-height:42px; cursor:pointer; text-transform:none; font-size:12px; }
+.pareto-history input { accent-color:var(--accent); width:16px; height:16px; }
+.pareto-reference { border-radius:50%; background:var(--muted); }
+.pareto-king { background:var(--brand-coral); transform:rotate(45deg); }
+.train-legend .pareto-reference, .train-legend .pareto-king { width:9px; height:9px; }
+.train-legend .swatch.pareto-reference { background:var(--accent); border-radius:50%; }
+.train-legend .swatch.pareto-king { background:var(--brand-coral); border-radius:0; }
+.train-legend .swatch.hollow { width:9px; height:9px; background:transparent; border:1.5px solid var(--brand-coral); border-radius:50%; }
+.pareto-detail { margin-top:12px; padding:12px 14px; border:var(--line); background:var(--surface); font:12px/1.7 var(--font-mono); }
+.pareto-detail .muted { margin-left:8px; }
+.pareto-list { margin-top:16px; font:12px var(--font-mono); }
+.pareto-list summary { cursor:pointer; padding:12px 0; color:var(--muted); }
+.pareto-list table { min-width:540px; width:100%; }
+.pareto-point { cursor:pointer; outline:none; }
+.pareto-point:focus .point-ring { stroke:var(--ink); stroke-width:2; fill:var(--surface); }
+#pareto-status { font:11px/1.6 var(--font-mono); }
+@media(max-width:640px) { .pareto-control { min-width:0; flex:1 1 130px; } .pareto-history { margin-top:0; } .train-filters { gap:12px; } .pareto-detail .muted { display:block; margin-left:0; } }
 .train-big ~ .chart-meta .legend span { white-space:nowrap; }
 .train-big .chart-wrap svg { width:100%; height:100%; }
 .train-filters .btn.active { outline:2px solid #7E9B7E; outline-offset:-2px; }
@@ -1051,7 +1072,6 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
 .train-tip .r b { font-weight:700; }
 .train-tip .r .k { display:inline-block; width:14px; height:3px; margin-right:6px; vertical-align:middle; }
 .train-tip .r .k.chal { height:0; border-top:2px dashed var(--chal-line); }
-.train-tip .r .k.scratch { height:3px; background:var(--muted); }
 .train-tip .r .k.king { background:var(--king); }
 .train-tip .r .who { color:var(--muted); overflow:hidden; text-overflow:ellipsis; }
 .train-note { font-family:var(--font-mono); font-size:12px; color:var(--muted); margin-top:10px; }
@@ -1060,18 +1080,23 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
 .train-big ~ .chart-meta .legend { gap:14px 20px; flex-wrap:wrap; }
 .train-big ~ .chart-meta .swatch { width:18px; height:3px; }
 .train-legend .swatch.dashed { height:0; border-top:2px dashed var(--ink); background:transparent; }
-.train-legend .swatch.diamond { width:9px; height:9px; background:var(--muted); transform:rotate(45deg); }
-.train-tiles { display:grid; grid-template-columns:repeat(6, minmax(0,1fr)); gap:12px; }
+.chart-meta > .legend { flex-wrap:wrap; max-width:100%; }
+.train-tiles { display:grid; grid-template-columns:repeat(5, minmax(0,1fr)); gap:12px; }
+.score-matrix, .lineage-heading { grid-column:1 / -1; }
+.lineage-heading { font:11px var(--font-mono); color:var(--muted); margin-top:12px; text-transform:uppercase; }
+.benchmark-matrix { width:100%; min-width:0; table-layout:fixed; border:var(--line); background:var(--surface); }
+.benchmark-matrix th, .benchmark-matrix td { text-align:center; padding:14px 8px; }
+.benchmark-matrix th { position:static; }
+.benchmark-matrix thead th:first-child { width:80px; }
+.benchmark-matrix tbody th { font:11px var(--font-mono); color:var(--muted); white-space:nowrap; }
+.benchmark-matrix td { font:clamp(14px,2.2vw,26px)/1.3 var(--font-mono); }
+.benchmark-matrix .tag { display:block; margin-top:6px; font:9px/1.4 var(--font-mono); color:var(--good); white-space:normal; }
+.benchmark-matrix .info-icon { font-size:12px; padding:0; margin-left:3px; }
+@media (max-width:640px) { .benchmark-matrix th, .benchmark-matrix td { padding:12px 4px; } .benchmark-matrix thead th:first-child { width:60px; } .benchmark-matrix thead th { font-size:9px; } }
+#train-ref-status { font:12px var(--font-mono); margin:10px 0; }
 .train-tiles .tile { border:var(--line); border-color:var(--ink); background:var(--surface); padding:14px 16px 12px; min-width:0; min-height:108px; box-sizing:border-box; }
 .train-tiles .tile .k { font-family:var(--font-mono); font-size:10.5px; text-transform:uppercase; letter-spacing:0.05em; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .train-tiles { position:relative; }
-.train-tiles .tile[data-help] .k { cursor:help; border-bottom:1px dotted var(--muted); display:inline-block; max-width:100%; }
-.train-tiles .tile.open .k { border-bottom-color:var(--ink); color:var(--ink); }
-.tile-help { position:absolute; z-index:6; box-sizing:border-box; width:min(420px, 100%); background:var(--surface); border:1px solid var(--ink); padding:14px 40px 14px 16px; font:14px/1.55 var(--font-sans); color:var(--ink); box-shadow:0 6px 24px rgba(0,0,0,0.16); }
-.tile-help .h { font:700 11px/1 var(--font-mono); text-transform:uppercase; letter-spacing:0.05em; color:var(--muted); margin-bottom:8px; }
-.tile-help .x { position:absolute; top:6px; right:8px; background:none; border:none; color:var(--muted); font:700 18px/1 var(--font-mono); cursor:pointer; padding:4px 6px; }
-.tile-help .x:hover { color:var(--ink); }
-.tile-help .pin { display:block; margin-top:8px; font:10px/1 var(--font-mono); text-transform:uppercase; letter-spacing:0.05em; color:var(--muted); }
 .train-tiles .tile .v { font-family:var(--font-mono); font-size:clamp(20px, 2.2vw, 26px); line-height:1.15; margin-top:8px; color:var(--ink); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .train-tiles .tile .v .u { font-size:11px; color:var(--muted); margin-left:4px; }
 .train-tiles .tile .s { font-family:var(--font-mono); font-size:11px; color:var(--muted); margin-top:6px; line-height:1.35; }
@@ -1080,16 +1105,186 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
 .train-tiles .tile .tag { display:inline-block; margin-top:8px; font:700 9px/1 var(--font-mono); text-transform:uppercase; letter-spacing:0.05em; color:var(--good); border:1px solid var(--good); padding:3px 6px; border-radius:2px; }
 .train-tiles .tile { position:relative; }
 .train-tiles .empty { grid-column:1 / -1; }
-.train-tiles .row-h { grid-column:1 / -1; font:700 11px/1.3 var(--font-mono); text-transform:uppercase; letter-spacing:0.05em; color:var(--muted); margin-top:6px; }
-.train-tiles .row-h b { color:var(--ink); font-weight:700; }
 @media (max-width: 1000px) { .train-tiles { grid-template-columns:repeat(3, minmax(0,1fr)); } }
-@media (max-width: 640px)  { .train-tiles { grid-template-columns:repeat(3, minmax(0,1fr)); } }
+@media (max-width: 640px)  { .train-tiles { grid-template-columns:repeat(2, minmax(0,1fr)); } }
 @media (max-width: 440px)  { .train-tiles { grid-template-columns:repeat(2, minmax(0,1fr)); } }
 .role-pill { display:inline-block; font-family:var(--font-mono); font-weight:700; font-size:10px; letter-spacing:0.04em; text-transform:uppercase; padding:2px 8px; border-radius:2px; border:1px dashed currentColor; color:var(--muted); white-space:nowrap; }
 .role-pill.king { color:var(--ink); border-style:solid; }
 .role-pill.chal { color:var(--chal-line); }
-.role-pill.scratch { color:var(--muted); }
 @media (max-width: 900px) { .train-grid { grid-template-columns:1fr; } }
+/* ── v2 (DEC-CA-0050): the go-live strip and the lane-B page ── */
+.v2-strip { border: var(--line); background: var(--surface); padding: 12px 16px; display: grid;
+  grid-template-columns: auto minmax(0,1fr) auto; gap: 10px 22px; align-items: center; }
+.v2-strip .v2-state { font-family: var(--font-mono); font-weight: 700; font-size: 11px; text-transform: uppercase;
+  letter-spacing: 0.06em; padding: 4px 10px; border: 1px dashed currentColor; border-radius: 2px; white-space: nowrap; color: var(--muted); }
+.v2-strip .v2-state.live { color: var(--good); border-style: solid; }
+.v2-strip .v2-state.scheduled { color: var(--warning-fg); }
+.v2-strip .v2-body { font-family: var(--font-mono); font-size: 12px; color: var(--muted); min-width: 0; }
+.v2-strip .v2-body b { color: var(--ink); }
+.v2-strip .v2-split { min-width: 180px; }
+.split-bar { display: flex; height: 8px; border-radius: 2px; overflow: hidden; background: var(--hatch); }
+.split-bar i { display: block; height: 100%; }
+.split-bar .a { background: var(--king); }
+.split-bar .b { background: var(--chal-line); }
+.split-bar .c { background: var(--s3); }
+.split-bar .x { background: repeating-linear-gradient(45deg, var(--muted) 0 2px, transparent 2px 5px); opacity: .6; }
+.split-key { display: flex; gap: 10px; flex-wrap: wrap; font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; color: var(--muted); margin-top: 5px; }
+@media (max-width: 720px) { .v2-strip { grid-template-columns: 1fr; } }
+#page-laneb { display: flex; flex-direction: column; gap: 56px; }
+#page-laneb[hidden] { display: none; }
+.lb-note { font-family: var(--font-mono); font-size: 12px; color: var(--muted); max-width: 90ch; line-height: 1.6; }
+.lb-note b { color: var(--ink); }
+.lb-note code, .lb-enter code { font-family: var(--font-mono); background: var(--paper); border: var(--line-faint); padding: 1px 6px; color: var(--ink); overflow-wrap: anywhere; }
+.progress { position: relative; height: 10px; border-radius: 2px; background: var(--hatch); overflow: hidden; margin: 8px 0 4px; }
+.progress i { position: absolute; left: 0; top: 0; bottom: 0; background: var(--chal-line); }
+.progress.full i { background: var(--good); }
+.gate-row { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 16px 26px; }
+@media (max-width: 860px) { .gate-row { grid-template-columns: 1fr; } }
+.gate-cell .k { font-family: var(--font-mono); font-size: 10.5px; text-transform: uppercase; color: var(--muted); letter-spacing: 0.05em; }
+.gate-cell .v { font-family: var(--font-mono); font-size: 20px; color: var(--ink); margin-top: 4px; }
+.gate-cell .s { font-family: var(--font-mono); font-size: 11px; color: var(--muted); margin-top: 3px; overflow-wrap: anywhere; }
+.chart-sm { width: 100%; aspect-ratio: 3/1; }
+.chart-sm svg { width: 100%; height: 100%; display: block; }
+@media (max-width: 720px) { .chart-sm { aspect-ratio: 3/2; } }
+.lyr-cells { display: inline-flex; gap: 2px; vertical-align: middle; }
+.lyr-cells i { display: inline-block; width: 12px; height: 12px; border-radius: 1px; background: var(--good); }
+.lyr-cells i.bad { background: #BF5B3D; }
+.lyr-cells i.na { background: var(--hatch); outline: 1px dotted var(--muted); }
+.dom-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 16px; }
+@media (max-width: 400px) { .dom-grid { grid-template-columns: 1fr; } }
+.dom-card { border: var(--line); background: var(--surface); padding: 14px 16px; min-width: 0; display: flex; flex-direction: column; gap: 10px; }
+.dom-card .dh { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.dom-card .dn { font-family: var(--font-mono); font-weight: 700; font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em; }
+.dom-card .row { font-family: var(--font-mono); font-size: 12px; color: var(--muted); display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.dom-card .row b { color: var(--ink); }
+.dom-card .sec-k { font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); border-top: var(--line-faint); padding-top: 8px; }
+.dom-card table { min-width: 0; font-size: 11.5px; }
+.dom-card td, .dom-card th { padding: 5px 10px 5px 0; }
+.dom-card td { white-space: normal; }
+.mult-bar { height: 6px; background: var(--hatch); border-radius: 2px; overflow: hidden; }
+.mult-bar i { display: block; height: 100%; background: var(--good); }
+.heatmap { display: grid; gap: 2px; }
+.heatmap .hm-row { display: grid; grid-template-columns: 54px minmax(0,1fr) ; gap: 8px; align-items: center; }
+.heatmap .hm-l { font-family: var(--font-mono); font-size: 11px; color: var(--muted); text-align: right; }
+.heatmap .hm-cells { display: grid; grid-template-columns: repeat(32, minmax(0,1fr)); gap: 1px; }
+.heatmap .hm-cells i { display: block; height: 16px; background: #BF5B3D; }
+.heatmap .hm-cells i.dead { background: transparent; outline: 1px dotted var(--muted); outline-offset: -1px; }
+.hm-key { display: flex; align-items: center; gap: 8px; font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; color: var(--muted); margin-top: 8px; flex-wrap: wrap; }
+.hm-key .ramp { width: 120px; height: 8px; background: linear-gradient(90deg, rgba(191,91,61,0.08), rgba(191,91,61,1)); }
+.lb-enter { display: grid; gap: 10px; }
+.lb-enter pre { font-family: var(--font-mono); font-size: 12px; background: var(--paper); border: var(--line-faint); padding: 10px 12px; overflow-x: auto; white-space: pre; color: var(--ink); }
+
+/* Dashboard adaptation of https://www.cascade.industries/styles/cascade-v2.css.
+   Keep the landing site's Manrope/Fraunces/IBM Plex Mono roles and forest palette. */
+:root {
+  --font-sans:'Manrope',system-ui,-apple-system,sans-serif;
+  --font-body:var(--font-sans);
+  --paper:#F3EFE6; --surface:#FCF9F2; --ink:#141B17;
+  --muted:#596258; --faint:#737B70;
+  --line:1px solid rgba(20,27,23,.22); --line-faint:1px solid rgba(20,27,23,.12);
+  --chal:#485F50; --chal-line:#485F50; --good:#3F6550;
+  --accent:#485F50; --accent-deep:#3F6550; --brand-coral:#EE6254;
+  --king:#141B17; --hatch:rgba(72,95,80,.07);
+}
+:root[data-theme="dark"] {
+  --paper:#141B17; --surface:#1B2520; --ink:#E8E1D3;
+  --muted:#AFAF9F; --faint:#929B8E;
+  --line:1px solid rgba(232,225,211,.25); --line-faint:1px solid rgba(232,225,211,.12);
+  --chal:#485F50; --chal-line:#A9C1A9; --good:#A9C1A9;
+  --accent:#A9C1A9; --accent-deep:#A9C1A9; --king:#E8E1D3;
+  --hatch:rgba(169,193,169,.08); --bar:rgba(232,225,211,.24);
+  --bar-us:#A9C1A9; --track:rgba(169,193,169,.16);
+}
+body { font-family:var(--font-sans); font-size:14px; }
+a:hover { color:var(--brand-coral); }
+::selection { background:var(--brand-coral); color:#141B17; }
+:focus-visible { outline:2px solid var(--brand-coral); outline-offset:3px; }
+.page { gap:28px; }
+.header { align-items:flex-start; text-align:left; }
+.header .wordmark, .wordmark { color:var(--ink); font-family:var(--font-display); font-weight:600; }
+.header .meta { align-items:flex-start; text-align:left; margin-top:4px; text-transform:none; }
+.header .tagline { color:var(--muted); font-family:var(--font-mono); letter-spacing:.12em; }
+.section-label { border-bottom:var(--line-faint); margin-bottom:16px; }
+.section-label > span:first-child, .kicker > span:first-child {
+  font-family:var(--font-title); font-size:20px; font-weight:800;
+  letter-spacing:-.04em; text-transform:none;
+}
+.kicker { align-items:center; }
+.btn, #theme-toggle { min-height:34px; padding:9px 12px; font-family:var(--font-mono); font-weight:400; letter-spacing:.09em; border:var(--line); }
+.page-tabs { gap:8px; }
+.page-tabs .btn { min-height:40px; padding:12px 16px; }
+.page-tabs .btn.active, .btn.on { background:#485F50; color:#E8E1D3; border-color:#485F50; }
+.btn:hover, #theme-toggle:hover { background:var(--brand-coral); color:#141B17; border-color:var(--brand-coral); }
+.panel, .verdict, .dom-card, .train-tiles .tile { border:var(--line); background:var(--surface); }
+.stat .k, .tile .k, .lineage-heading { font-family:var(--font-mono); font-weight:400; letter-spacing:.08em; }
+.train-tiles .tile .k { display:flex; align-items:center; justify-content:space-between; gap:4px; white-space:normal; overflow:visible; }
+.info-icon { flex:none; color:var(--muted); }
+.info-icon:hover, .info-icon[aria-expanded="true"] { color:var(--brand-coral); }
+.benchmark-matrix thead th { color:var(--ink); font-family:var(--font-title); font-size:15px; font-weight:800; letter-spacing:-.025em; text-transform:none; }
+.benchmark-matrix tbody th { text-align:left; }
+.benchmark-matrix td { color:var(--ink); padding-top:20px; padding-bottom:20px; }
+.benchmark-matrix tr:last-child td, .benchmark-matrix tr:last-child th { border-bottom:0; }
+.lineage-heading { margin-top:16px; }
+.tile .v, .stat .v { font-family:var(--font-mono); }
+.hero .hv { font-family:var(--font-title); font-weight:800; letter-spacing:-.045em; }
+.v2-state.live { color:var(--good); }
+@media (max-width:640px) {
+  .section-label > span:first-child, .kicker > span:first-child { font-size:17px; }
+  .page-tabs .btn { padding:10px; min-height:38px; letter-spacing:.04em; }
+  .benchmark-matrix thead th { font-size:11px; }
+  .benchmark-matrix td { font-size:15px; padding-top:16px; padding-bottom:16px; }
+}
+
+
+/* Numeric summaries share a frame and fine internal rules, like a table. */
+.tiles { grid-template-columns:repeat(5,minmax(0,1fr)); }
+.header .meta a { overflow-wrap:anywhere; }
+th + th, td + td { border-inline-start:var(--line-faint); }
+th, td, .stat .v, .tile .v, .gate-cell .v { font-variant-numeric:tabular-nums; }
+.benchmark-matrix th, .benchmark-matrix td { border-bottom:var(--line-faint); }
+.benchmark-matrix th, .benchmark-matrix td, .benchmark-matrix tbody tr:hover td { background:var(--surface); }
+.benchmark-matrix tbody tr:hover { background:var(--surface); }
+#train-stats { display:block; }
+.lineage-heading { padding:4px 0 12px; }
+.lineage-grid, .tiles { gap:0; border:var(--line); overflow:hidden; }
+.lineage-grid > .tile, .tiles > .tile { border:0; border-inline-end:var(--line-faint); min-height:88px; padding:14px 16px; }
+.lineage-grid > .tile:last-child, .tiles > .tile:last-child { border-inline-end:0; }
+.lineage-grid > .tile.hl { border-inline-end:var(--line-faint); background:var(--surface); }
+.verdict { padding:0; gap:0; overflow:hidden; }
+.verdict::before { display:none; }
+.verdict > .stat { padding:14px 16px; border-inline-end:var(--line-faint); border-bottom:var(--line-faint); min-height:80px; }
+.stat .k { display:flex; align-items:center; justify-content:space-between; gap:4px; white-space:normal; overflow:visible; }
+.gate-row { gap:0; border:var(--line-faint); }
+.gate-row:has(> .gate-cell:nth-child(4)) { grid-template-columns:repeat(4,minmax(0,1fr)); }
+.gate-cell { min-width:0; padding:14px; border-inline-end:var(--line-faint); }
+.gate-cell:last-child { border-inline-end:0; }
+.dom-card { gap:0; }
+.dom-card .dh { padding-bottom:12px; border-bottom:var(--line-faint); }
+.dom-card .row { padding:8px 0; border-bottom:var(--line-faint); }
+.dom-card .sec-k { margin-top:12px; padding:10px 0; border-top:0; }
+@media (max-width:1000px) and (min-width:641px) {
+  .tiles { grid-template-columns:repeat(3,minmax(0,1fr)); }
+  .lineage-grid > .tile, .tiles > .tile { border-bottom:var(--line-faint); }
+  .lineage-grid > .tile:nth-child(3), .tiles > .tile:nth-child(3) { border-inline-end:0; }
+  .lineage-grid > .tile:nth-child(n+4), .tiles > .tile:nth-child(n+4) { border-bottom:0; }
+  .lineage-grid > .tile:last-child, .tiles > .tile:last-child { grid-column:span 2; }
+}
+@media (max-width:860px) {
+  .gate-row, .gate-row:has(> .gate-cell:nth-child(4)) { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .gate-cell { border-bottom:var(--line-faint); }
+  .gate-cell:nth-child(2n) { border-inline-end:0; }
+  .gate-cell:last-child:nth-child(odd) { grid-column:span 2; }
+  .gate-cell:last-child { border-bottom:0; }
+  .gate-row:has(> .gate-cell:nth-child(4)) .gate-cell:nth-child(n+3) { border-bottom:0; }
+}
+@media (max-width:640px) {
+  .tiles { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .lineage-grid > .tile, .tiles > .tile { border-bottom:var(--line-faint); padding:12px; }
+  .lineage-grid > .tile:nth-child(2n), .tiles > .tile:nth-child(2n) { border-inline-end:0; }
+  .lineage-grid > .tile:last-child, .tiles > .tile:last-child { grid-column:span 2; border-bottom:0; }
+  .verdict > .stat, .gate-cell { padding:12px; }
+}
+
 </style>
 </head>
 <body>
@@ -1105,6 +1300,7 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
     </div>
     <div class="tb-group">
       <a class="btn" href="stakeholders.html">Scoreboard &rarr;</a>
+      <a class="btn" href="llms.txt">Agents</a>
       <button id="theme-toggle">DARK</button>
     </div>
   </div>
@@ -1116,20 +1312,35 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
       <img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzNDcgMjg4IiB3aWR0aD0iMzQ3IiBoZWlnaHQ9IjI4OCI+CjxwYXRoIGZpbGw9IiNFODU3NEYiIGZpbGwtcnVsZT0iZXZlbm9kZCIgZD0iTTEyOC43LDdMMTQzLjcsN0wxNDUuMyw4TDE0OSw4TDE1OS43LDEyLjNMMTY5LjMsMTlMMTcwLjcsMTlMMTg0LjMsMjhMMTg3LjcsMjlMMTg4LDMwTDE5Mi43LDMyTDE5MywzM0wyOTUuMyw5NEwyOTYuNyw5NEwzMjMuNywxMTFMMzMxLDEyMC43TDMzNCwxMzFMMzM0LDE3MC4zTDMzMCwxNjEuM0wzMjIsMTUzTDMyMiwxMzEuN0wzMjAsMTI1LjdMMzE1LjcsMTIwTDMwOC43LDExNUwyOTguNywxMTBMMjU5LjcsODZMMjU4LjMsODZMMTk1LjcsNDhMMTk0LjMsNDhMMTgwLjcsMzlMMTcyLjMsMzVMMTYyLDI4TDE1MSwyMkwxNDUsMjBMMTI4LjMsMjBMMTIyLjMsMjJMNTkuNyw1OUw1OC4zLDU5TDU0LjcsNjJMMzQuMyw3M0wyMyw4MS4zTDIwLDg3LjNMMjAsOTMuM0wyNSwxMDBMMzMuMywxMDVMMzQuNywxMDdMMzYuNywxMDdMNDYsMTExLjdMNjUuMywxMjMuN0w2Ny43LDEyNEw3OC43LDEzMUw4NCwxMzNMOTIuMywxMzlMMTEwLDE0OC4zTDExMS4zLDE1MEwxMjEsMTU0TDEyNC4zLDE1N0wxMjcuNywxNThMMTI4LDE1OUwxNTksMTc3TDE2MywxODEuM0wxNjYsMTg3LjNMMTY3LDE5MkwxNjcsMjI2LjdMMTY2LDIyOS4zTDE2NSwyMjlMMTY0LDIyNkwxNTUsMjE4LjdMMTU1LDE5NEwxNTMsMTg5LjNMMTQ4LDE4NEwxMjEuMywxNjlMMTE3LjcsMTY2TDkzLjMsMTUzTDg5LjcsMTUwTDc5LjMsMTQ1TDc1LjcsMTQyTDU2LjMsMTMyTDQ1LjcsMTI1TDQyLjMsMTI0TDM4LjcsMTIxTDI1LjMsMTE0TDIwLjMsMTEwTDE5LDExMEwxOSwxMzQuN0wyMSwxMzkuN0wyNS4zLDE0NC43TDIzLjcsMTQ1LjdMMTkuMywxNDUuN0wxOC43LDE0Ni43TDEyLjcsMTQ1TDkuMywxNDFMOC43LDEzNi43TDcsMTM2LjNMNyw4Ny4zTDksODAuM0wxMyw3My4zTDI0LjcsNjRMNzksMzNMODQuMywyOUw5MywyNUw5My4zLDI0TDExOC4zLDEwTDEyOC43LDdaIj48L3BhdGg+CjxwYXRoIGZpbGw9IiMzRDYwODgiIGZpbGwtcnVsZT0iZXZlbm9kZCIgZD0iTTEzMSw1MUwxNDMsNTFMMTU3LjcsNTZMMjgzLjMsMTMxTDI4Ni43LDEzMkwzMjAuMywxNTNMMzIyLjMsMTUzTDMzMCwxNjEuM0wzMzQsMTcwLjNMMzM0LDIzOUwzMzMsMjAzLjNMMzMyLDIwMUwzMjksMTk4LjNMMzIxLjMsMTkzLjdMMzIyLjcsMTgzLjdMMzIyLDE3My4zTDMxOSwxNjYuM0wzMTYsMTYzTDI1OC43LDEyOUwyNTcuMywxMjlMMjUyLDEyNUwyNDUuMywxMjJMMjM1LDExNUwyMjMuMywxMDlMMjEzLDEwMkwyMDEuMyw5NkwxNTMuNyw2N0wxNDYuNyw2NEwxMzkuNyw2M0wxMjksNjRMMTE2LjMsNzBMMTA3LjcsNzZMMTA0LjMsNzdMNjcuNyw5OUw0NywxMTBMNDUuNywxMTJMMzMuMywxMDUuN0wzOS4zLDEwMUw0Niw5OEw1Ni43LDkxTDYwLDkwTDYwLjMsODlMODAuNyw3OEw4NC4zLDc1TDg3LjcsNzRMMTE1LjMsNTdMMTIzLjMsNTNMMTMxLDUxWk0xMzQsOTVMMTQ0LjMsOTUuN0wxMjYuNyw5N0wxMzQsOTVaTTE1NSw5OEwxNjIuNywxMDFMMTczLjMsMTA4TDE3MCwxMDdMMTY5LjcsMTA2TDE1NSw5OFpNMTE5LjMsOTlMMTIwLjMsOTkuN0w5Mi43LDExNUwxMTkuMyw5OVpNMTczLjcsMTA4TDIwOS4zLDEyOC43TDIwOC4zLDEyOUwyMDgsMTI4TDE5OSwxMjMuN0wxOTgsMTIyTDE3Ni4zLDExMC43TDE3My43LDEwOFpNMTYwLjMsMTEzTDE2Ni4zLDExN0wxNjEuMywxMTQuN0wxNjAuMywxMTNaTTkxLjMsMTE1TDkyLjMsMTE1LjdMODUuMywxMTlMODUsMTIwTDgzLjMsMTIwTDc4LjcsMTIzLjdMNzcsMTIzLjdMOTEuMywxMTVaTTEwMC4zLDEyM0wxMDAuNywxMjRMOTQuNywxMjdMMTAwLjMsMTIzWk0xNzcsMTIzTDE3OC43LDEyM0wxODUuMywxMjhMMTc3LjMsMTI0TDE3NywxMjNaTTIwOS43LDEyOUwyMTQuNywxMzFMMjUxLjMsMTUzTDI0MS4zLDE0OEwyMzYsMTQ0TDIzNC4zLDE0NEwyMzAuNywxNDFMMjI1LjMsMTM5TDIyMC4zLDEzNUwyMTUuMywxMzNMMjA5LjcsMTI5Wk0xOTQuNywxMzNMMjA2LjMsMTQwTDE5Ni4zLDEzNUwxOTQuMywxMzMuN0wxOTQuNywxMzNaTTIxMiwxNDNMMjQxLjcsMTYwTDIzOC4zLDE1OUwyMzQuNywxNTZMMjE3LjMsMTQ3TDIxMiwxNDNaTTE4LjMsMTU0LjNMMTkuMywxNTQuN0wxOSwxNzkuN0wxOCwxNzZMMTguMywxNTQuM1pNMjU2LjcsMTU2TDI2OC43LDE2Mi43TDI2My4zLDE2MC43TDI1Ni43LDE1NlpNMjQ3LDE2M0wyNTEuNywxNjVMMjYwLjMsMTcxTDI1Mi4zLDE2N0wyNDcsMTYzWk0yNjkuMywxNjNMMzA4LjcsMTg1TDMyMSwxOTNMMzEwLjMsMTg3LjdMMzA5LDE4NkwyOTcsMTc5TDI5NS4zLDE3OUwyOTEuNywxNzZMMjkwLDE3NkwyODQuNywxNzJMMjgzLDE3MkwyNjkuMywxNjNaTTI2Ny43LDE3NS4zTDI3MSwxNzYuM0wyNzQuMywxNzlMMjY3LjcsMTc1LjNaTTI3NC43LDE3OUwyODAuMywxODEuM0wyODMsMTg0TDI3NC43LDE3OVpNMzA0LDE5NUwzMTYuNywyMDJMMzE5LjcsMjA2TDMxNS43LDIwMkwzMDcuMywxOThMMzA0LDE5NVpNMzIwLDIwNi43TDMyMywyMTEuN0wzMjIuNywyMjdMMzIyLDIxMUwzMjAsMjA2LjdaTTMwNy43LDIyNEwzMTQuMywyMjcuN0wzMDcuNywyMjRaTTE2Ni4zLDIyNi43TDE2Ni43LDI0Ni4zTDE2NS43LDIzMC43TDE2Ni4zLDIyNi43Wk0zMjguMywyNzBMMzI5LDI3MC4zTDMyOCwyNzEuN0wzMjMuMywyNzVMMzI4LjMsMjcwWk0yOTYsMjgxLjNMMzA4LjcsMjgxLjdMMjk2LDI4MS4zWiI+PC9wYXRoPgo8cGF0aCBmaWxsPSIjNkE4RkI1IiBmaWxsLXJ1bGU9ImV2ZW5vZGQiIGQ9Ik0xMzgsOTUuN0wxNTEsOTYuN0wxNTkuMywxMDBMMTg1LjcsMTE2TDE5OCwxMjJMMTk5LDEyMy43TDIwMSwxMjRMMjA4LjMsMTI5TDIwOS43LDEyOC43TDIxMS4zLDEzMC43TDIyMC4zLDEzNUwyMjUuMywxMzlMMjMwLjcsMTQxTDIzNC4zLDE0NEwyMzYsMTQ0TDI0MS4zLDE0OEwyNDQuNywxNDlMMjY3LDE2Mi43TDI2OSwxNjIuN0wyODMsMTcyTDI4NC43LDE3MkwyOTAsMTc2TDI5MS43LDE3NkwyOTUuMywxNzlMMjk3LDE3OUwzMDQsMTgzTDMxMC4zLDE4Ny43TDMyMS4zLDE5M0wzMjMsMTk1TDMyOSwxOTguM0wzMzIsMjAxTDMzMywyMDMuM0wzMzQsMjM5TDMzMy4zLDI0Mi43TDMzMiwyNDIuN0wzMzAsMjM4TDMyMi43LDIzMS43TDMyMywyMTEuN0wzMTkuNywyMDVMMzE2LjcsMjAyTDMwOC4zLDE5OEwzMDUsMTk1TDMwMi43LDE5NUwyOTgsMTkxLjNMMjk0LjMsMTkwLjNMMjkwLjcsMTg3TDI4OC4zLDE4N0wyODYuNywxODVMMjgzLjMsMTg0LjNMMjgyLDE4Mi4zTDI3OCwxODBMMjc0LjMsMTc5TDI2OSwxNzUuM0wyNjcuMywxNzUuM0wyNjUuNywxNzMuM0wyNjQsMTczLjNMMjY0LDE3Mi4zTDI2Mi4zLDE3Mi4zTDI2Mi4zLDE3MS4zTDI2MC4zLDE3MUwyNTEuNywxNjVMMjQzLjMsMTYxLjdMMjQzLDE2MC4zTDI0MS4zLDE2MC4zTDI0MS43LDE1OS4zTDI0MCwxNTguM0wyMzUuNywxNTZMMjM0LjMsMTU2LjNMMjM0LjcsMTU1LjNMMjIyLDE0OUwyMTQuNywxNDRMMjExLjcsMTQzLjNMMjA4LDE0MC4zTDIwNi4zLDE0MC4zTDIwNi4zLDEzOS4zTDE5NS43LDEzM0wxOTQsMTMzLjNMMTkzLjcsMTMyTDE4NywxMjkuM0wxODYuNywxMjhMMTg1LjcsMTI4LjNMMTc4LjcsMTIzTDE3Ni43LDEyMy4zTDE3NC43LDEyMUwxNzMuMywxMjEuM0wxNjkuNywxMThMMTY2LjMsMTE3LjNMMTY2LDExNkwxNjMuMywxMTUuM0wxNjAuNywxMTNMMTU5LjcsMTEzLjNMMTU5LjMsMTEyLjNMMTU3LjcsMTEyLjNMMTU3LjcsMTExLjNMMTU1LjcsMTExLjNMMTU1LjMsMTEwLjNMMTUzLjMsMTEwTDE1My43LDEwOS4zTDE1MS43LDEwOS4zTDE1MS4zLDEwOC4zTDE0OC4zLDEwNy4zTDE0MC43LDEwNi4zTDEzMCwxMDdMMTI5LjMsMTA4LjNMMTI3LDEwOC4zTDEyNC43LDExMC4zTDEyMS4zLDExMUwxMjAuNywxMTIuM0wxMTksMTEyLjNMMTE2LDExNUwxMTQuMywxMTVMMTEzLjcsMTE2LjNMMTEyLjMsMTE2TDEwMy4zLDEyMi4zTDEwMC4zLDEyM0w5NC43LDEyN0w5Mi43LDEyNy4zTDkyLjcsMTI4LjNMODcsMTMwTDg0LjcsMTMyLjdMNzkuMywxMzFMNzIuMywxMjYuN0w5MiwxMTZMOTIuMywxMTVMOTQsMTE1TDk0LjMsMTE0TDEwMi43LDExMEwxMjEsOTguN0wxMjIuNyw5OUwxMjYuMyw5N0wxMzgsOTUuN1oiPjwvcGF0aD4KPHBhdGggZmlsbD0iIzdCQTM5MSIgZmlsbC1ydWxlPSJldmVub2RkIiBkPSJNNy43LDEzNi4zTDksMTM3LjNMOS4zLDE0MUwxMi43LDE0NUwxOC43LDE0Ni43TDE5LjMsMTQ1LjdMMjYsMTQ0LjdMMjksMTQ2LjdMMjksMTQ3LjdMMzEsMTQ3LjdMMzAuNywxNDguN0wzNiwxNTAuN0w0Ni43LDE1Ny43TDQ4LjMsMTU3LjdMNDguMywxNTguN0w1MCwxNTguN0w1MCwxNTkuN0w1MS43LDE1OS43TDU1LDE2Mi43TDU3LDE2Mi43TDY0LjMsMTY3LjdMNjYsMTY3LjdMNzMsMTcyLjdMNzUsMTczTDc0LjcsMTczLjdMNzYuMywxNzMuN0w3Ni4zLDE3NC43TDgxLjMsMTc2LjdMODIsMTc4TDg1LDE3OC43TDkyLjMsMTgzLjdMOTQsMTgzLjdMOTcuMywxODYuN0wxMDEsMTg3LjdMMTAyLjMsMTg5LjdMMTA2LDE5MC43TDEwNiwxOTEuN0wxMDcuNywxOTEuN0wxMTEuMywxOTQuN0wxMTMsMTk0LjdMMTE1LDE5Ni43TDExOC4zLDE5Ny43TDExOC4zLDE5OC43TDEyNCwyMDFMMTI1LjMsMjAyLjdMMTI3LDIwMi43TDEzNC4zLDIwNy43TDEzNiwyMDcuN0wxMzYsMjA4LjdMMTQwLjMsMjEwTDE0MS4zLDIxMS43TDE0NC43LDIxMi43TDE0Ni4zLDIxNC43TDE0OC4zLDIxNC43TDE1MC4zLDIxNi43TDE1NSwyMThMMTU2LDIyMEwxNjQsMjI2TDE2NiwyMzAuN0wxNjYuNywyNDYuN0wxNjUuMywyNTUuM0wxNjQuMywyNTZMMTYzLDI2MS4zTDE1OS4zLDI2NS4zTDE1NC43LDI2OEwxNDcuMywyNjguN0wxNDEuNywyNjdMMTQyLDI2Ni4zTDE0MC4zLDI2Ni4zTDE0MCwyNjUuM0wxMzcuNywyNjVMMTMwLjcsMjYwLjNMMTI2LjcsMjU5TDEyNSwyNThMMTI1LjMsMjU3LjNMMTIxLDI1NkwxMjEuMywyNTUuM0wxMjAsMjU1LjNMMTE5LjcsMjU0LjNMMTE0LjcsMjUyLjNMMTE0LjcsMjUxLjNMMTEyLDI1MUwxMTAuNywyNDkuM0wxMDksMjQ5LjNMMTA4LjcsMjQ4LjNMOTYuNywyNDIuM0w5Ni4zLDI0MS4zTDk0LjcsMjQxLjNMOTQuNywyNDAuM0w5MywyNDAuM0w5MSwyMzguM0w4OC43LDIzOEw4NS43LDIzNS4zTDgwLDIzM0w3OC43LDIzMS4zTDczLjMsMjI5LjNMNzEuNywyMjcuM0w2NS43LDIyNUw1NywyMTkuM0w1NC43LDIxOUw0OCwyMTQuM0w0NiwyMTRMNDYuMywyMTMuM0w0NC43LDIxMy4zTDQ0LjcsMjEyLjNMNDQsMjEzTDQyLjcsMjExLjNMNDEuMywyMTEuN0wzOC43LDIwOS4zTDIzLjcsMjAyTDE1LDE5Ni4zTDEzLDE5NC4zTDEyLjcsMTkyLjNMMTEuNywxOTIuM0wxMS43LDE5MUwxMCwxOTBMNy43LDE4M0w3LjcsMTM2LjNaTTE0MSwxMzhMMTU2LjcsMTM5TDE1OC4zLDE0MC43TDE2NC4zLDE0Mi43TDE2NC4zLDE0My43TDE2OS43LDE0NS43TDE2OS43LDE0Ni43TDE3MS43LDE0Ni43TDE3MS43LDE0Ny43TDE3OC43LDE1MC43TDE3OC43LDE1MS43TDE4My4zLDE1My43TDE4My4zLDE1NC43TDE4NywxNTUuN0wxODcuMywxNTYuN0wxODguNywxNTYuM0wxOTIuNywxNTkuN0wxOTQuMywxNTkuN0wxOTQuMywxNjAuN0wxOTkuMywxNjIuN0wxOTkuMywxNjMuN0wyMDMsMTY0LjdMMjAzLDE2NS43TDIwNi43LDE2Ni43TDIwOC43LDE2OC43TDIxMC4zLDE2OC43TDIxMiwxNzAuN0wyMTQsMTcwLjdMMjE0LDE3MS43TDIxOC43LDE3My43TDIxOC43LDE3NC43TDIyMSwxNzQuN0wyMzMuMywxODIuN0wyMzcsMTgzLjdMMjM4LjcsMTg1LjdMMjQyLDE4Ni43TDI0NywxOTAuN0wyNDksMTkwLjdMMjQ5LDE5MS43TDI1MC43LDE5MS43TDI1MSwxOTIuN0wyNTQuMywxOTMuN0wyNTQuMywxOTQuN0wyNTYsMTk0LjdMMjU2LDE5NS43TDI2My4zLDE5OC43TDI2My4zLDE5OS43TDI2NC43LDE5OS4zTDI2NS4zLDIwMC43TDI2Ni4zLDIwMC4zTDI3MiwyMDQuN0wyNzQsMjA0LjdMMjc0LDIwNS43TDI3Ny4zLDIwNi43TDI3Ny4zLDIwNy43TDI4Mi43LDIwOS43TDI4My4zLDIxMUwyODUuMywyMTFMMjkwLDIxMy43TDI5MCwyMTQuN0wyOTcsMjE3LjdMMjk3LDIxOC43TDI5OC43LDIxOC43TDMwOS4zLDIyNS43TDMxNi4zLDIyOC43TDMxNi4zLDIyOS43TDMxOCwyMjkuN0wzMjEuMywyMzJMMzIyLjcsMjMxTDMyMy4zLDIzMi43TDMzMCwyMzhMMzMyLDI0Mi43TDMzNCwyNDNMMzM0LDI1OS4zTDMzMy4zLDI1OUwzMzMsMjYzLjNMMzMwLjMsMjY4LjNMMzI5LjMsMjY4LjNMMzI5LjMsMjY5LjdMMzIyLDI3Ni4zTDMxMy4zLDI4MC4zTDMwOS4zLDI4MS4zTDI5NS4zLDI4MS4zTDI5My43LDI4MC4zTDI5MCwyODAuM0wyODkuMywyNzkuM0wyODQsMjc4TDI4My43LDI3N0wyODIuMywyNzcuN0wyNzcuNywyNzQuM0wyNzYuMywyNzQuN0wyNzUuNywyNzMuM0wyNzQsMjczLjNMMjc0LDI3Mi4zTDI2NiwyNjlMMjY0LjcsMjY3LjNMMjU3LDI2NEwyNTcuMywyNjMuM0wyNTYsMjYzLjNMMjU1LjcsMjYyLjNMMjU0LDI2Mi4zTDI0Ni4zLDI1Ny4zTDI0NC43LDI1Ny4zTDI0MywyNTUuM0wyNDEuMywyNTUuM0wyNDEsMjU0LjNMMjI2LDI0N0wyMjYuMywyNDYuM0wyMjUsMjQ2LjNMMjI0LjcsMjQ1LjNMMjIwLjcsMjQ0TDIxOS43LDI0Mi4zTDIxOCwyNDJMMjE3LDIzOS43TDIxNy43LDIzNS43TDIyMC4zLDIzMy43TDIzMS4zLDIzMi43TDIzMi43LDIzMS43TDIzNiwyMzJMMjM3LjcsMjMwLjdMMjQxLjMsMjMwLjdMMjQxLjMsMjI5LjdMMjUwLjMsMjI3LjdMMjUwLjMsMjI2LjdMMjUzLjcsMjI2LjdMMjUzLjcsMjI1LjdMMjYwLjcsMjIzLjdMMjYxLDIyMi43TDI2NC43LDIyMS43TDI3MywyMTYuM0wyNzAsMjE1LjNMMjY5LjcsMjE0TDI2OCwyMTRMMjY4LjMsMjEzLjNMMjY2LjcsMjEzLjNMMjY2LjcsMjEyLjNMMjY1LDIxMi4zTDI2NC43LDIxMUwyNjMuMywyMTEuN0wyNjIuNywyMTAuM0wyNTUuNywyMDcuM0wyNTUuNywyMDYuM0wyNTQsMjA2LjNMMjUzLjcsMjA1LjNMMjUwLjcsMjA0LjNMMjUwLjcsMjAzLjNMMjQ4LjcsMjAzLjNMMjQ1LDIwMC4zTDIzOS43LDE5OC4zTDIzOCwxOTYuM0wyMzIuMywxOTQuM0wyMzAuNywxOTIuM0wyMjcuMywxOTEuN0wyMjcsMTkwLjNMMjE1LjcsMTg1TDIxNC43LDE4My4zTDIwNy43LDE4MC4zTDIwNy43LDE3OS4zTDIwMiwxNzcuM0wyMDEuNywxNzYuM0wxOTguNywxNzUuM0wxOTguNywxNzQuM0wxOTUuMywxNzMuN0wxOTMuNywxNzEuM0wxOTAuNywxNzFMMTg5LjcsMTY5LjNMMTg4LDE2OS4zTDE4OCwxNjguM0wxODYuMywxNjguM0wxODYsMTY3LjNMMTgyLjcsMTY2LjNMMTgyLjcsMTY1LjNMMTc2LjMsMTYzTDE2OS43LDE1OC4zTDE1NiwxNTEuM0wxNDcuMywxNTBMMTQ3LjcsMTQ5LjNMMTQwLjcsMTQ5LjNMMTQxLDE1MEwxMzAsMTUyLjNMMTIzLjcsMTU2TDExNiwxNTEuM0wxMTEuMywxNTBMMTEzLjMsMTQ3LjNMMTE2LjcsMTQ2LjdMMTE3LjMsMTQ1LjNMMTI0LjcsMTQyLjdMMTI1LjcsMTQxLjNMMTI3LDE0MS43TDEyOCwxNDAuM0wxMzMuNywxMzkuN0wxMzUuMywxMzguM0wxNDEuMywxMzguN0wxNDEsMTM4Wk0xOC43LDE1NC4zTDE4LjMsMTc5LjdMMjAuMywxODUuM0wyNi4zLDE5MUwyOCwxOTAuN0wzMS4zLDE5My43TDM2LjMsMTk1LjdMMzgsMTk3LjdMNDMuNywxOTkuN0w0NS4zLDIwMS43TDUwLjMsMjAzLjdMNTAuMywyMDQuN0w1Mi4zLDIwNC43TDUyLjMsMjA1LjdMNTUuMywyMDYuM0w1NiwyMDcuN0w2MywyMTAuN0w2Ni43LDIxMy43TDY4LjMsMjEzLjdMNjguMywyMTQuN0w3Ni4zLDIxOEw3Ny43LDIxOS43TDgzLDIyMkw4Mi43LDIyMi43TDg4LDIyNC43TDkwLjMsMjI3TDkyLjMsMjI3TDk3LDIzMC43TDk4LjcsMjMwLjdMOTksMjMxLjdMMTA0LDIzMy43TDEwNC4zLDIzNC43TDEwNi4zLDIzNUwxMDYsMjM1LjdMMTA3LjcsMjM1LjdMMTExLjMsMjM4LjdMMTE0LjMsMjM5LjNMMTE1LDI0MC43TDExOC4zLDI0MS43TDEyMC4zLDI0My43TDEyNCwyNDQuN0wxMjkuMywyNDguN0wxMzYuMywyNTEuN0wxMzYuMywyNTIuN0wxMzcuNywyNTIuM0wxMzguMywyNTMuN0wxNDAsMjUzLjdMMTQwLjMsMjU0LjdMMTQ2LjMsMjU3LjdMMTUxLDI1Ni43TDE1My43LDI1M0wxNTQuMywyNDFMMTUzLjcsMjM0TDE0OS43LDIyOC4zTDEzOC43LDIyMS4zTDEzNywyMjEuM0wxMzMsMjE4LjNMMTI4LDIxNi4zTDEyNy43LDIxNS4zTDEyNC43LDIxNC4zTDEyNC43LDIxMy4zTDEyMS4zLDIxMi4zTDEyMS4zLDIxMS4zTDExNi43LDIxMEwxMTMuNywyMDcuM0wxMTAuNywyMDYuM0wxMTAuNywyMDUuM0wxMDksMjA1LjNMMTA4LjcsMjA0LjNMMTA4LDIwNUwxMDEuNywyMDAuM0w5OCwxOTkuM0w5OC4zLDE5OC4zTDk2LjcsMTk4LjNMOTQuNywxOTYuM0w5MS43LDE5NS43TDkxLDE5NC4zTDg1LDE5Mkw4My43LDE5MC4zTDc1LDE4Nkw3NS4zLDE4NS4zTDczLDE4NUw3MS43LDE4My4zTDcwLjcsMTgzLjdMNjUuMywxODAuN0w2NC43LDE3OS4zTDU5LDE3N0w1OS4zLDE3Ni4zTDU0LDE3NC4zTDUwLjcsMTcxLjNMNDUuNywxNjkuM0w0NS43LDE2OC4zTDQzLDE2OEwzOS43LDE2NUwzOC43LDE2NS4zTDM2LjMsMTYzLjNMMzIuNywxNjIuM0wzMi43LDE2MS4zTDMxLDE2MS4zTDMwLjcsMTYwLjNMMTguNywxNTQuM1pNMjgzLjcsMjI0TDI3OSwyMjdMMjc4LjMsMjI2LjNMMjc1LjMsMjI5TDI2NywyMzIuM0wyNjcuMywyMzNMMjY1LDIzNEwyNjQuMywyMzMuM0wyNjMuNywyMzQuN0wyNTMuMywyMzcuM0wyNTMsMjM4LjNMMjQ2LDIzOS4zTDI0NS4zLDI0MC4zTDI0MS4zLDI0MEwyMzguMywyNDEuN0wyNDAsMjQxLjdMMjQyLDI0NEwyNDQuNywyNDQuM0wyNDcsMjQ2LjdMMjQ4LjMsMjQ2LjdMMjQ4LjMsMjQ3LjdMMjQ5LjcsMjQ3LjNMMjUwLjMsMjQ4LjdMMjUyLDI0OC43TDI1MiwyNDkuN0wyNTUuMywyNTAuN0wyNTUuMywyNTEuN0wyNTksMjUyLjdMMjU5LDI1My43TDI2Ni4zLDI1Ni43TDI2Ni4zLDI1Ny43TDI3MiwyNTkuN0wyNzIuMywyNjAuN0wyNzUuMywyNjEuN0wyNzUuMywyNjIuN0wyNzcuMywyNjIuN0wyNzcuMywyNjMuN0wyNzkuMywyNjMuN0wyNzkuMywyNjQuN0wyODEuMywyNjQuN0wyODEuMywyNjUuN0wyODcuNywyNjcuN0wyODgsMjY4LjdMMjkwLjMsMjY4LjdMMjkxLDI2OS43TDMwNS4zLDI3MC43TDMwNS43LDI2OS43TDMxMS43LDI2OUwzMTIuNywyNjcuN0wzMTcuNywyNjUuN0wzMTguNywyNjMuN0wzMTkuNywyNjMuN0wzMjIuNywyNTcuM0wzMjEuNywyNDcuM0wzMjAuNywyNDdMMzE5LjcsMjQ0TDMxNS43LDI0MC4zTDMxNC4zLDI0MC43TDMxMy43LDIzOS4zTDMxMi43LDIzOS43TDMwNi43LDIzNS4zTDMwNS43LDIzNS43TDMwMi43LDIzMy4zTDI5NC43LDIzMEwyOTAsMjI2LjNMMjgzLjcsMjI0WiI+PC9wYXRoPgo8L3N2Zz4=" width="50" height="41" alt="" style="align-self:center">
       <span class="wordmark" id="chain-name">cascade</span>
     </div>
-    <div class="tagline">King-of-the-hill · compete on synthetic data · Bittensor</div>
+    <div class="tagline">Synthetic data competition · SN91</div>
     <div class="meta">
       <span><span class="crown">♛</span> KING GENERATOR: <a id="king-link" href="https://github.com/TensorLink-AI/cascade/tree/main/champions/king" target="_blank" rel="noopener" title="The king's generator code, archived on GitHub (champions/king — one commit per reign)">TensorLink-AI/cascade · champions/king</a> <span id="king-hotkey" class="muted"></span></span>
-      <span>FIXED MODEL: <b id="base-arch">toto2</b> · SIZES <b id="sizes">--</b></span>
-      <span><a href="https://github.com/TensorLink-AI/cascade" target="_blank">GitHub</a> · <span title="Verify any round with the audit CLI">AUDIT: <code>cascade-audit latest</code></span></span>
+      <span>Warm start: <a id="warm-start-link" target="_blank" rel="noopener" hidden></a><span id="warm-start-state">awaiting status</span></span>
+      <span><b id="base-arch">toto2</b> · <b id="sizes">--</b></span>
     </div>
   </div>
 
+  <!-- v2 (DEC-CA-0050): go-live state, the model, and the emission split — above every tab -->
+  <div class="v2-strip" id="v2-strip">
+    <span class="v2-state" id="v2-state">v2 · --</span>
+    <span class="v2-body" id="v2-body">Loading the v2 status&hellip;</span>
+    <span class="v2-split" id="v2-split"></span>
+  </div>
+
   <div class="page-tabs">
-    <button class="btn active" data-ptab="main">Dashboard</button>
-    <button class="btn" data-ptab="train">Training</button>
+    <button class="btn active" data-ptab="main">Lane A &middot; king</button>
+    <button class="btn" data-ptab="laneb">Lane B &middot; experts</button>
+    <button class="btn" data-ptab="lanec">Lane C &middot; MarketCast</button>
+    <button class="btn" data-ptab="train">Benchmarks</button>
   </div>
 
   <div id="page-main">
+
+  <!-- DEC-CA-0055: the lane-A king ladder, former-king court, key slash, last king check -->
+  <div id="la-ladder-wrap" hidden>
+    <div class="section-label"><span>King rewards</span><span id="la-ladder-when" class="muted"></span></div>
+    <div class="panel" id="la-ladder"></div>
+  </div>
 
   <div>
     <div class="section-label"><span id="verdict-title">Latest round</span><span class="muted"><span id="next-round"></span><span id="verdict-when"></span></span></div>
@@ -1150,10 +1361,9 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
     </div>
   </div>
 
-  <!-- section order is the read order: NOW (verdict, live round, this round's
-       heat) → TREND (error chart) → REFERENCE (reigns/field, warm-start, history) -->
+  <!-- section order is the read order: NOW (verdict, live era, its field) → TREND (error chart) → REFERENCE (reigns/field, warm-start, history) -->
   <div>
-    <div class="section-label"><span id="heat-title">Heat &mdash; screening</span><span id="heat-when" class="muted"></span></div>
+    <div class="section-label"><span id="heat-title">Era field</span><span id="heat-when" class="muted"></span></div>
     <div id="heat-panel"></div>
   </div>
 
@@ -1207,42 +1417,106 @@ tr.is-new td { background: rgba(126, 155, 126, 0.13); }
 
   </div><!-- /page-main -->
 
+  <div id="page-laneb" hidden>
+
+    <div>
+      <div class="section-label"><span>Lane B gate</span><span id="lb-gate-when" class="muted"></span></div>
+      <div class="panel" id="lb-gate"><div class="empty">Loading&hellip;</div></div>
+    </div>
+
+    <div>
+      <div class="section-label">
+        <span id="lb-sat-title">Routing stability</span>
+        <span class="controls">
+          <button class="btn active" data-satm="overlap" title="Token-level top-k overlap: mean |top-k(prev) ∩ top-k(cur)| / k">Top-k overlap</button>
+          <button class="btn" data-satm="jaccard" title="Jaccard of the two kings' ESFT expert selections">ESFT Jaccard</button>
+        </span>
+      </div>
+      <div class="chart-sm"><svg id="lb-sat-svg" preserveAspectRatio="none"></svg></div>
+      <div class="chart-meta"><span class="legend" id="lb-sat-legend"></span><span id="lb-sat-note">--</span></div>
+    </div>
+
+    <div>
+      <div class="section-label"><span>Expert slots</span><span id="lb-dom-when" class="muted"></span></div>
+      <div id="lb-domains"><div class="empty">Loading&hellip;</div></div>
+    </div>
+
+    <div class="grid-2">
+      <div>
+        <div class="section-label"><span id="lb-pay-title">Payout schedule</span><span id="lb-pay-when" class="muted"></span></div>
+        <div class="panel">
+          <div class="chart-sm"><svg id="lb-pay-svg" preserveAspectRatio="none"></svg></div>
+          <div class="lb-note" id="lb-pay-note" style="margin-top:8px"></div>
+        </div>
+      </div>
+      <div>
+        <div class="section-label"><span id="lb-enter-title">Enter lane B</span></div>
+        <div class="panel lb-enter" id="lb-enter"></div>
+      </div>
+    </div>
+
+    <div>
+      <div class="section-label"><span>Expert utilisation</span><span id="lb-moe-when" class="muted"></span></div>
+      <div class="panel" id="lb-moe"><div class="empty">Loading&hellip;</div></div>
+    </div>
+
+  </div><!-- /page-laneb -->
+
+  <div id="page-lanec" hidden>
+
+    <div>
+      <div class="section-label"><span id="lc-title">MarketCast</span><span id="lc-status-when" class="muted"></span></div>
+      <div class="panel" id="lc-status"><div class="empty">Loading&hellip;</div></div>
+    </div>
+
+    <div>
+      <div class="section-label"><span>Target slots</span><span id="lc-targets-when" class="muted"></span></div>
+      <div id="lc-targets"><div class="empty">Loading&hellip;</div></div>
+    </div>
+
+    <div>
+      <div class="section-label"><span>Queue</span><span id="lc-queue-when" class="muted"></span></div>
+      <div class="panel" id="lc-queue"><div class="empty">Loading&hellip;</div></div>
+    </div>
+
+  </div><!-- /page-lanec -->
+
+
 
   <div id="page-train" hidden>
 
     <div>
-      <div class="section-label"><span>Training &mdash; the king&rsquo;s checkpoint on the public benchmarks</span><span id="train-when" class="muted"></span></div>
+      <div class="section-label"><span>Public benchmarks</span><span id="train-when" class="muted"></span></div>
+      <div class="muted" id="train-ref-status">Loading model references…</div>
       <div class="train-tiles" id="train-stats"><div class="empty">Loading bench reports&hellip;</div></div>
     </div>
 
     <div>
       <div class="train-filters">
-        <span class="grp" id="train-chips"></span>
-        <span class="grp">View
-          <button class="btn active" data-tview="values" title="Each benchmark's own score; lower is better">Values</button>
-          <button class="btn" data-tview="relative" title="Change against the first generation's best king, per benchmark — one axis for every series">Relative</button>
-        </span>
-        <span class="grp">Show
-          <button class="btn active" data-tscope="king" title="Only the king's checkpoints — the lineage">King lineage</button>
-          <button class="btn" data-tscope="all" title="Every checkpoint the trainer benched: the king's, each challenger's, and the from-scratch controls">Everything trained</button>
-        </span>
+        <label class="pareto-control">Benchmark<select id="pareto-benchmark"><option value="gifteval">GIFT-Eval</option><option value="boom">BOOM</option><option value="time">TIME</option><option value="fev">FEV</option></select></label>
+        <label class="pareto-control">Compare<select id="pareto-axes"><option value="size-mase">Size × MASE</option><option value="size-crps">Size × CRPS</option><option value="mase-crps">MASE × CRPS</option></select></label>
+        <label class="pareto-history"><input type="checkbox" id="pareto-history" checked>King trajectory</label>
+        <span id="pareto-help"></span>
       </div>
-      <div id="train-charts" class="train-big"><div class="train-chart"><div class="chart-wrap"><svg id="train-svg" viewBox="0 0 1000 455"></svg></div><div class="train-tip" hidden></div></div></div>
+      <div id="train-charts" class="train-big"><div class="train-chart"><div class="chart-wrap"><svg id="train-svg" role="img" aria-label="Model Pareto frontier and king trajectory" viewBox="0 0 1000 455"></svg></div><div class="train-tip" role="status" hidden></div></div></div>
       <div class="chart-meta">
         <span class="legend train-legend" id="train-legend">
-          <span><i class="swatch" style="background:var(--ink)"></i>Best king per generation</span>
-          <span id="train-legend-chal"><i class="swatch hollow" style="border-color:var(--ink)"></i>Challenger checkpoint</span>
-          <span id="train-legend-scratch" hidden><i class="swatch diamond" style="background:var(--ink)"></i>Scratch control</span>
-          <span><i class="swatch" style="background:var(--chal);height:1px"></i>Dethrone</span>
-          <span id="train-legend-ref" hidden><i class="swatch dashed" style="border-color:var(--ink)"></i><span id="train-legend-ref-label">Official Toto2</span></span>
+          <span><i class="swatch pareto-reference"></i>Reference model</span>
+          <span><i class="swatch dashed"></i>Pareto frontier</span>
+          <span><i class="swatch pareto-king"></i>Current king</span>
+          <span><i class="swatch hollow"></i>Prior kings</span>
         </span>
+        <span id="pareto-status" class="muted" aria-live="polite"></span>
       </div>
+      <div id="pareto-detail" class="pareto-detail" hidden></div>
+      <details class="pareto-list"><summary>Models and scores</summary><div class="scroll-box"><table><thead><tr><th>Model</th><th class="num">Parameters</th><th class="num">MASE</th><th class="num">CRPS</th><th>Status</th></tr></thead><tbody id="pareto-rows"></tbody></table></div></details>
     </div>
 
     <div>
-      <div class="section-label"><span>Every benched checkpoint</span><span id="train-table-when" class="muted"></span></div>
+      <div class="section-label"><span>Checkpoints</span><span id="train-table-when" class="muted"></span></div>
+      <div class="train-filters"><span class="grp"><button class="btn active" data-tscope="king">Kings</button><button class="btn" data-tscope="all">All checkpoints</button></span></div>
       <div class="panel"><div class="scroll-box scroll-hist">
-        <table><thead><tr><th>Round</th><th>Role</th><th>Miner</th><th>Size</th><th class="num" title="GIFT-Eval CRPS">GIFT CRPS</th><th class="num" title="GIFT-Eval MASE">GIFT MASE</th><th class="num">BOOM CRPS</th><th class="num">BOOM MASE</th><th class="num">TIME CRPS</th><th class="num">TIME MASE</th><th class="num" title="Six-number geomean — the promotion score">Geomean</th><th class="num" title="Geomean relative to the king's checkpoint of the same round; negative = better than the king">vs king</th></tr></thead>
+        <table><thead><tr><th>Round</th><th>Role</th><th>Miner</th><th>Size</th><th class="num" title="GIFT-Eval CRPS">GIFT CRPS</th><th class="num" title="GIFT-Eval MASE">GIFT MASE</th><th class="num">BOOM CRPS</th><th class="num">BOOM MASE</th><th class="num">TIME CRPS</th><th class="num">TIME MASE</th><th class="num">FEV CRPS</th><th class="num">FEV MASE</th><th class="num" title="Six-number geomean — the promotion score">Geomean</th><th class="num" title="Geomean relative to the king's checkpoint of the same round; negative = better than the king">vs king</th></tr></thead>
         <tbody id="train-rows"></tbody></table>
       </div></div>
     </div>
@@ -1301,7 +1575,7 @@ var HUB_BASE = "https://hub.hippius.com/models/";
 var KING_GITHUB = "https://github.com/TensorLink-AI/cascade/tree/main/champions/king";
 var HUB_REF = "main";
 var POLL_MS = 120000;
-var _index = null, _latest = null, _status = null, _roundStatus = null, _heat = null,
+var _index = null, _latest = null, _status = null,
     _subsSeen = null, _chartMode = "geomean", _smooth = 0, _dataState = "loading",
     _wsHist = null, _roster = null;
 
@@ -1312,7 +1586,7 @@ var _index = null, _latest = null, _status = null, _roundStatus = null, _heat = 
 // ── helpers ────────────────────────────────────────────────────────────────
 (function initTheme(){
   var saved = localStorage.getItem("cascDashTheme");
-  var dark = saved ? saved === "dark" : false;
+  var dark = saved !== "light";
   document.documentElement.dataset.theme = dark ? "dark" : "light";
 })();
 function esc(s){ return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
@@ -1397,13 +1671,73 @@ function renderHeader(){
   var sizes="", rs=_index&&_index.rounds||[];
   for(var i=rs.length-1;i>=0&&!sizes;i--){ if(rs[i].sizes&&rs[i].sizes.length) sizes=rs[i].sizes.filter(Boolean).join(" · "); }
   document.getElementById("sizes").textContent=sizes||"--";
+  document.getElementById("base-arch").textContent=v2ModelName();
+  renderWarmStartLink();
+}
+function renderWarmStartLink(){
+  var link=document.getElementById("warm-start-link"), state=document.getElementById("warm-start-state");
+  var live=_v2&&_v2.warm_start, m=_latest&&_latest.manifest, cn=chainNow();
+  var w=live||(m&&Object.prototype.hasOwnProperty.call(m,"warm_start_ckpt")?{pointer:m.warm_start_ckpt, era_start_block:m.era&&m.era.start_block, mode:m.warm_start_ckpt?"checkpoint":"random_init"}:null);
+  link.hidden=true; link.href=""; state.hidden=false;
+  if(!w){ state.textContent="awaiting status"; return; }
+  if(!cn){ state.textContent="awaiting chain status"; return; }
+  if(cn&&(w.era_start_block==null||Number(w.era_start_block)!==cn.eraStart)){
+    state.textContent="awaiting this era's checkpoint"; return;
+  }
+  if(w.mode==="random_init"&&!w.pointer){ state.textContent="random initialisation"; return; }
+  var match=/^metro-v1:trained:hippius:([^@]+)@sha256:([0-9a-f]{64})$/.exec(String(w.pointer||""));
+  if(!match){ state.textContent="checkpoint unavailable"; return; }
+  link.href=hubUrl(match[1].split("/").map(encodeURIComponent).join("/"));
+  link.textContent=match[1].replace(/^cascade\//,"")+" · "+match[2].slice(0,8);
+  link.title=w.pointer; link.hidden=false; state.hidden=true;
 }
 // o.title = hover tooltip (the long explanation lives there, not in the label);
 // o.wide  = span two grid columns; o.range = compact one-line multi-part value.
+// Explanations live behind an info icon: hover, keyboard focus, or tap.
+function infoTip(label, text){
+  if(!text) return "";
+  return '<button type="button" class="info-icon" aria-label="About '+esc(label)+'" aria-expanded="false" data-info="'+esc(text)+'"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="8" cy="8" r="6.5" stroke="currentColor"/><path d="M8 7v4M8 4.5v.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg></button>';
+}
+(function infoHelp(){
+  var active=null, box=null, pinned=false;
+  function hide(){
+    if(active){ active.setAttribute("aria-expanded","false"); active.removeAttribute("aria-describedby"); }
+    if(box) box.hidden=true;
+    active=null; pinned=false;
+  }
+  function show(button, pin){
+    if(active!==button) hide();
+    if(!box){ box=document.createElement("div"); box.id="info-tooltip"; box.className="info-tooltip"; box.setAttribute("role","tooltip"); document.body.appendChild(box); }
+    active=button; pinned=!!pin; box.textContent=button.dataset.info; box.hidden=false;
+    button.setAttribute("aria-expanded","true"); button.setAttribute("aria-describedby",box.id);
+    position();
+  }
+  function position(){
+    if(!active||!box||box.hidden) return;
+    var r=active.getBoundingClientRect(), w=box.offsetWidth, h=box.offsetHeight;
+    if(!active.isConnected||r.bottom<0||r.top>window.innerHeight){ hide(); return; }
+    box.style.left=Math.max(12,Math.min(r.left,window.innerWidth-w-12))+"px";
+    box.style.top=Math.max(12,r.bottom+h+20>window.innerHeight?r.top-h-8:r.bottom+8)+"px";
+  }
+  function trigger(event){ return event.target.closest&&event.target.closest(".info-icon"); }
+  document.addEventListener("mouseover",function(event){ var b=trigger(event); if(b&&!pinned) show(b,false); });
+  document.addEventListener("mouseout",function(event){ if(trigger(event)===active&&!pinned) hide(); });
+  document.addEventListener("focusin",function(event){ var b=trigger(event); if(b) show(b,false); });
+  document.addEventListener("focusout",function(event){ if(trigger(event)===active) hide(); });
+  document.addEventListener("click",function(event){
+    var b=trigger(event);
+    if(!b){ hide(); return; }
+    if(active===b&&pinned) hide(); else show(b,true);
+  });
+  document.addEventListener("keydown",function(event){ if(event.key==="Escape") hide(); });
+  window.addEventListener("resize",position);
+  window.addEventListener("scroll",position,true);
+})();
+
 function stat(k,v,o){
   o=o||{};
-  return '<div class="stat'+(o.wide?' wide':'')+'"'+(o.title?' title="'+esc(o.title)+'"':'')+'>'+
-    '<div class="k">'+esc(k)+'</div><div class="v'+(o.range?' range':'')+'">'+v+'</div></div>';
+  return '<div class="stat'+(o.wide?' wide':'')+'">'+
+    '<div class="k">'+esc(k)+infoTip(k,o.title)+'</div><div class="v'+(o.range?' range':'')+'">'+v+'</div></div>';
 }
 function renderVerdict(){
   var rs=_index&&_index.rounds||[], r=rs.length?rs[rs.length-1]:null, el=document.getElementById("verdict");
@@ -1658,99 +1992,54 @@ function renderField(){
       '<td>'+refLink(p.gen_ref)+'</td><td class="num">'+p.commit_block+'</td></tr>';
   }).join("");
 }
-// Heat = the cheap screen that ranks every eligible challenger; only the top
-// `finalists` advance to the final vs the king. The trainer otherwise throws
-// these scores away, so this panel is a non-finalist miner's only feedback.
-//
-// Two sources, same field shape (see cascade.shared.heat_status): the trainer's
-// LIVE mirror (status/heat.json), written the moment the heat settles, and the
-// settled round's receipt (_latest.manifest.heat). The live one is preferred
-// whenever it describes a round the receipt hasn't superseded — the duel and its
-// validation run for hours after the heat, and waiting for the receipt used to
-// hide a miner's placement until well past its next submission deadline.
+// The era field: one pill per roster standing — the leg's state inside the era.
 function heatStatusMeta(s){
-  if(s==="advanced") return {cls:"adv",label:"▲ Advanced"};
-  if(s==="screened") return {cls:"screened",label:"Screened"};
-  if(s==="failed_train") return {cls:"nofit",label:"Did not train"};
-  if(s==="failed_screen") return {cls:"nofit",label:"Screen error"};
-  if(s==="duplicate") return {cls:"nofit",label:"Duplicate"};
-  // duel-only rounds (DEC-CA-0037): no screen ran — seated entrants duel the
-  // king directly, waiting ones carry to a later round with their submission.
-  if(s==="seated") return {cls:"adv",label:"● Seated — duels the king"};
-  if(s==="waiting") return {cls:"wait",label:"Waiting — next round"};
-  // rolling eras (funded/latest.json roster): the leg's state inside the era
   if(s==="training") return {cls:"adv",label:"● Training"};
-  if(s==="renting"||s==="starting") return {cls:"wait",label:"Renting a pod"};
-  // live-roster phases (funded/latest.json between settlements)
-  if(s==="waiting_gpu") return {cls:"wait",label:"Waiting for a GPU"};
-  if(s==="benching") return {cls:"adv",label:"Trained · benchmarking"};
-  if(s==="awaiting_settlement") return {cls:"adv",label:"Trained · next settlement"};
-  if(s==="requeued") return {cls:"wait",label:"Requeued (not burned)"};
-  if(s==="deferred") return {cls:"wait",label:"Deferred · coldkey cap"};
-  if(s==="queued") return {cls:"wait",label:"Queued"};
+  if(s==="renting") return {cls:"wait",label:"Renting a pod"};
+  if(s==="waiting") return {cls:"wait",label:"Waiting for a lane"};
+  if(s==="seated") return {cls:"adv",label:"● Seated"};
   if(s==="failed") return {cls:"nofit",label:"Failed"};
-  return {cls:"screened",label:s||"--"};
-}
-function heatSource(){
-  var rec=_latest&&_latest.manifest&&_latest.manifest.heat;
-  var recSrc=rec?{doc:rec, round:_latest.round_id, esb:Number(_latest.epoch_start_block),
-                  live:false, asOf:_latest.published_at||null}:null;
-  var live=(_heat&&Array.isArray(_heat.entrants))
-    ?{doc:_heat, round:_heat.round_id, esb:Number(_heat.epoch_start_block),
-      live:true, asOf:_heat.as_of}:null;
-  // Rolling eras: a live doc from before the current era is the pre-rollover
-  // field, not this era's — never show it as live.
-  var cn=chainNow();
-  if(live&&cn&&cn.rolling&&isFinite(live.esb)&&live.esb<cn.eraStart) live=null;
-  if(!live) return recSrc;
-  if(!recSrc) return live;
-  // Both present: the newer round wins. An unparseable epoch block on either
-  // side falls back to the receipt — the signed source is the safer default.
-  return (isFinite(live.esb)&&isFinite(recSrc.esb)&&live.esb>=recSrc.esb)?live:recSrc;
-}
-// Whether a receipt for the standings' own round is already public: a live doc
-// for an unsettled round is labelled "duel in flight", which is the whole point.
-function heatRoundSettled(esb){
-  return (_index&&_index.rounds||[]).some(function(r){ return Number(r.epoch_start_block)===Number(esb); });
+  return {cls:"",label:s||"--"};
 }
 // Rolling eras: the trainer publishes the era roster (funded/latest.json) at
 // every settlement — who is still training (and the boundary the leg targets),
 // renting a pod, waiting for one, seated (judged at that settlement) or failed.
-// In rolling mode the field panel renders the roster; the heat/duel-field doc
-// is the pre-rollover source.
 function rosterRows(){
   var d=_roster; if(!d||String(d.mode)!=="rolling") return null;
   var out=[];
-  // A live roster stamps each entry's phase; older documents fall back to the list's status.
-  function add(list,status){ (Array.isArray(list)?list:[]).forEach(function(e){ if(e&&e.hotkey) out.push({e:e,status:(e.phase&&status!=="seated"&&status!=="failed")?String(e.phase):status}); }); }
+  function add(list,status){ (Array.isArray(list)?list:[]).forEach(function(e){ if(e&&e.hotkey) out.push({e:e,status:status}); }); }
   add(d.in_flight,"training"); add(d.rents,"renting"); add(d.waiting,"waiting"); add(d.seated,"seated"); add(d.terminal,"failed");
   return out;
 }
 function renderRoster(cn){
   var panel=document.getElementById("heat-panel"), when=document.getElementById("heat-when"), title=document.getElementById("heat-title");
-  var rows=rosterRows(); if(rows===null) return false;
+  var rows=rosterRows();
+  if(rows===null){
+    if(title) title.innerHTML="Era field";
+    when.textContent="";
+    panel.className="";
+    panel.innerHTML='<div class="heat-empty"><div class="he-glyph">· · ·</div><div class="he-head">No roster published yet</div>'+
+      '<p>Awaiting the first settlement.</p></div>';
+    return;
+  }
   var d=_roster, n={};
   rows.forEach(function(x){ n[x.status]=(n[x.status]||0)+1; });
-  if(title) title.innerHTML="Era field &mdash; rolling";
+  if(title) title.innerHTML="Era field"+infoTip("Era field","Each funded entry trains on its own GPU and is judged against the era king at the first settlement after training finishes. Seated entries were judged in the named settlement; their scores are in the verdict above.");
   var rn=cn?roundNoOfBlock(cn.eraStart):null;
-  var order=["training","benching","awaiting_settlement","starting","renting","waiting_gpu","requeued","deferred","queued","waiting","seated","failed"];
-  var counts=order.filter(function(k){ return n[k]; }).map(function(k){ return n[k]+" "+k.replace(/_/g," "); }).join(" · ");
-  var src=(d.live&&d.updated_at)?"live · updated "+esc(String(d.updated_at).replace("T"," ").replace("Z"," UTC")):"roster from settlement "+shortRoundId(d.round_id);
-  when.textContent=(rn?"era r"+rn+" · ":"")+(counts||"empty")+" · "+src;
+  var counts=["training","renting","waiting","seated","failed"].filter(function(k){ return n[k]; }).map(function(k){ return n[k]+" "+k; }).join(" · ");
+  when.textContent=(rn?"era r"+rn+" · ":"")+(counts||"empty")+" · roster from settlement "+shortRoundId(d.round_id);
   if(!rows.length){
     panel.className="";
     panel.innerHTML='<div class="heat-empty"><div class="he-glyph">· · ·</div><div class="he-head">No entrants on the roster</div>'+
-      '<p>Funded entries seat the moment they are revealed; the roster updates live (about every minute) between settlements.</p></div>';
-    return true;
+      '</div>';
+    return;
   }
   panel.className="panel";
   var body=rows.map(function(x,i){
     var e=x.e, m=heatStatusMeta(x.status), tb=Number(e.target_boundary), std=m.label;
     if(x.status==="failed"&&e.error_class) std+=" · "+esc(e.error_class);
     if(x.status==="seated") std+=" · judged at "+esc(shortRoundId(d.round_id));
-    if(e.since&&x.status!=="seated"&&x.status!=="failed") std+=" · since "+esc(String(e.since).slice(11,16))+" UTC";
-    if(Number(e.attempts)>0) std+=" · attempt "+esc(e.attempts);
-    var live=["training","renting","starting","waiting_gpu","benching","awaiting_settlement"].indexOf(x.status)>=0, tgt='<span class="muted">--</span>';
+    var live=x.status==="training"||x.status==="renting", tgt='<span class="muted">--</span>';
     if(live&&tb>0){
       // The leg targets a boundary; once that boundary has passed it settles
       // at the next one after it lands.
@@ -1759,101 +2048,15 @@ function renderRoster(cn){
     }
     return '<tr><td class="num">'+(i+1)+'</td>'+
       '<td title="'+esc(e.hotkey||"")+'">'+esc(shortHk(e.hotkey))+(e.label?' <span class="sub-tag">'+esc(e.label)+'</span>':'')+'</td>'+
-      '<td><span class="heat-pill '+m.cls+'"'+(e.phase_detail?' title="'+esc(e.phase_detail)+'"':'')+'>'+std+'</span></td>'+
+      '<td><span class="heat-pill '+m.cls+'">'+std+'</span></td>'+
       '<td>'+tgt+'</td>'+
       '<td class="num">'+(e.reveal_block!=null?esc(e.reveal_block):"--")+'</td></tr>';
   }).join("");
-  panel.innerHTML='<div class="heat-note">Rolling era — no screen. Every funded entry trains the full budget on its own pod and is judged '+
-    'against the era king at the first settlement after its leg lands. Seated rows were judged at the settlement named; '+
-    'their scores are in the verdict panel above.</div>'+
-    '<div class="scroll-box scroll-field"><table><thead><tr><th class="num">#</th><th>Miner</th><th>Standing</th><th>Settles at</th>'+
+  panel.innerHTML='<div class="scroll-box scroll-field"><table><thead><tr><th class="num">#</th><th>Miner</th><th>Standing</th><th>Settles at</th>'+
     '<th class="num">Reveal block</th></tr></thead><tbody>'+body+'</tbody></table></div>';
-  return true;
 }
 function renderHeat(){
-  var panel=document.getElementById("heat-panel"), when=document.getElementById("heat-when");
-  var cn0=chainNow();
-  if(cn0&&cn0.rolling&&renderRoster(cn0)) return;
-  var src=heatSource(), heat=src&&src.doc;
-  var ents=(heat&&heat.entrants)||[];
-  if(!heat||!ents.length){
-    panel.className="";
-    when.textContent=src&&src.round?("round "+shortRoundId(src.round)):"";
-    var why=(heat&&heat.no_screen_reason)?esc(heat.no_screen_reason)
-      :"either a single eligible challenger, or a round that predates heat reporting";
-    panel.innerHTML='<div class="heat-empty">'+
-      '<div class="he-glyph">· · ·</div>'+
-      '<div class="he-head">No heat screening this round</div>'+
-      '<p>The field advanced without a screen — '+why+'. The verdict and final scores are unaffected.</p>'+
-      '</div>';
-    return;
-  }
-  var nf=heat.finalists, inFlight=src.live&&!heatRoundSettled(src.esb);
-  panel.className="panel";
-  var duel=!!heat.duel_only, title=document.getElementById("heat-title");
-  if(title) title.innerHTML=duel?"Duel field &mdash; seated":"Heat &mdash; screening";
-  if(duel){
-    // Duel-only round (DEC-CA-0037): nobody was screened, so there is no heat
-    // score to bar-chart — the standing IS the information: seat order (they
-    // duel the king in the seated cohort) or waiting for a later round.
-    var seated=0, waiting=0;
-    ents.forEach(function(e){ if(e.status==="seated") seated++; else if(e.status==="waiting") waiting++; });
-    when.textContent="round "+shortRoundId(src.round)+" · "+seated+" seated"+(waiting?" · "+waiting+" waiting":"")+
-      " · no screen"+(src.live&&src.asOf?" · published "+timeAgo(src.asOf):"");
-    var drows=ents.map(function(e,i){ return {e:e,i:i}; }).sort(function(a,b){
-      var ra=a.e.rank==null?1e9:a.e.rank, rb=b.e.rank==null?1e9:b.e.rank;
-      return (ra-rb)||(a.i-b.i);            // seats in seat order, then waiting in reveal order
-    });
-    var dbody=drows.map(function(x){
-      var e=x.e, m=heatStatusMeta(e.status);
-      return '<tr>'+
-        '<td class="num">'+(e.rank!=null?e.rank:"—")+'</td>'+
-        '<td class="num">'+(e.uid!=null?e.uid:"--")+'</td>'+
-        '<td title="'+esc(e.hotkey||"")+'">'+esc(shortHk(e.hotkey))+'</td>'+
-        '<td>'+refLink(e.gen_ref)+'</td>'+
-        '<td><span class="heat-pill '+m.cls+'">'+m.label+'</span></td></tr>';
-    }).join("");
-    panel.innerHTML='<div class="heat-note" title="Published by the trainer the moment the field is seated — hours before the round’s receipt. The verdict panel above lists every seated challenger’s score once the validators judge the cohort.">'+
-      (inFlight?'<b>Live</b> — duel in flight, no verdict yet. ':'')+
-      'Duel-only round — no screen. Every seated entrant trains the full budget and is judged against the king '+
-      '(α/k over the seated cohort); waiting entrants seat next round in reveal order.'+
-      (heat.no_screen_reason?' <span class="muted">'+esc(heat.no_screen_reason)+'</span>':'')+'</div>'+
-      '<div class="scroll-box scroll-field"><table><thead><tr>'+
-      '<th class="num">Seat</th><th class="num">UID</th><th>Miner</th><th>Generator</th><th>Standing</th>'+
-      '</tr></thead><tbody>'+dbody+'</tbody></table></div>';
-    return;
-  }
-  when.textContent="round "+shortRoundId(src.round)+" · "+ents.length+" entrants · "+
-    (nf!=null?nf:"--")+" finalist"+(nf===1?"":"s")+
-    (heat.screen_size?" · screened at "+esc(heat.screen_size):"")+
-    (src.live&&src.asOf?" · published "+timeAgo(src.asOf):"");
-  var rows=ents.slice().sort(function(a,b){
-    var ra=a.rank==null?1e9:a.rank, rb=b.rank==null?1e9:b.rank;
-    return (ra-rb)||((a.uid||0)-(b.uid||0));
-  });
-  var body=rows.map(function(e){
-    var m=heatStatusMeta(e.status), rel=e.rel_score;
-    var hasScore=rel!=null&&isFinite(rel)&&rel>0;
-    var width=hasScore?Math.max(6,100/rel):0;
-    var label=!hasScore?"—":(e.rank===1?"best":"+"+((rel-1)*100).toFixed(1)+"%");
-    var fill=e.status==="advanced"?"var(--good)":"var(--chal)";
-    return '<tr>'+
-      '<td class="num'+(e.rank===1?' good':'')+'">'+(e.rank!=null?e.rank:"—")+'</td>'+
-      '<td class="num">'+(e.uid!=null?e.uid:"--")+'</td>'+
-      '<td title="'+esc(e.hotkey||"")+'">'+esc(shortHk(e.hotkey))+'</td>'+
-      '<td>'+refLink(e.gen_ref)+'</td>'+
-      '<td class="heat-bar-cell"><span class="heat-bar"><i style="width:'+width.toFixed(0)+'%;background:'+fill+'"></i></span><span class="heat-rel">'+label+'</span></td>'+
-      '<td class="num">'+fmt(e.crps,4)+'</td>'+
-      '<td class="num">'+fmt(e.mase,3)+'</td>'+
-      '<td><span class="heat-pill '+m.cls+'">'+m.label+'</span></td></tr>';
-  }).join("");
-  panel.innerHTML='<div class="heat-note" title="Heat shows the geomean relative to the best entrant; CRPS (MWSQL) and MASE are each entrant’s raw aggregate error on this round’s held-out eval-pool slice. Published by the trainer the moment the heat settles — hours before the round’s receipt.">'+
-    (inFlight?'<b>Live</b> — heat settled, duel still training; no verdict yet. ':'')+
-    'Ranked by heat score = geomean(CRPS · MASE), lower is better; top '+
-    (nf!=null?nf:"N")+' advance to the duel vs the king.</div>'+
-    '<div class="scroll-box scroll-field"><table><thead><tr>'+
-    '<th class="num">#</th><th class="num">UID</th><th>Miner</th><th>Generator</th><th>Heat</th><th class="num">CRPS</th><th class="num">MASE</th><th>Standing</th>'+
-    '</tr></thead><tbody>'+body+'</tbody></table></div>';
+  renderRoster(chainNow());
 }
 function renderRounds(){
   var rs=(_index&&_index.rounds||[]).slice().reverse(), tb=document.getElementById("rounds");
@@ -1960,58 +2163,9 @@ function roundLabel(r){
   if(rolling){ var k=settlementNoOf(r,cn); if(k) lab+=" · S"+k; }
   return lab;
 }
-// ── live round panel: stage strip + revealed submissions ───────────────────
-// The trainer's internal progress is not public, so the pre-settle stages are
-// wall-clock ESTIMATES from the published stage windows (the same budgets the
-// trainer enforces; see cascade.shared.chain_status). "Settled" is confirmed:
-// a receipt for THIS epoch is in the index, and the strip shows its verdict.
-var STAGES=[["heat","Heat"],["duel","Duel"],["validation","Validation"],["settled","Settled"]];
-var STAGE_DEFAULT_WINDOWS={heat_seconds:2700, duel_seconds:11700};
-// Trainer-reported stage (status/round.json): preferred over the wall-clock
-// estimate when fresh (< 1h) and for THIS epoch — the estimate models the heat
-// as one competitor's budget and calls "duel" hours early on a large field.
-var ROUND_STATUS_FRESH_S=3600, ROUND_STATUS_SKEW_S=300;
-function liveStage(cn, el){
-  var d=_roundStatus;
-  if(!d||["heat","duel","validation"].indexOf(d.stage)<0) return null;
-  if(Number(d.epoch_start_block)!==cn.epochStart) return null;
-  var t=d.as_of?new Date(d.as_of).getTime():NaN; if(!isFinite(t)) return null;
-  var age=(Date.now()-t)/1000;
-  if(age>ROUND_STATUS_FRESH_S||age<-ROUND_STATUS_SKEW_S) return null;
-  return {key:d.stage, elapsed:el, live:true, asOf:d.as_of,
-          heatDone:d.heat_done, heatTotal:d.heat_total, finalists:d.finalists};
-}
-function currentStage(){
-  var cn=chainNow(); if(!cn) return null;
-  var settled=null;
-  (_index&&_index.rounds||[]).forEach(function(r){
-    if(Number(r.epoch_start_block)===cn.epochStart&&(!settled||r.status==="scored")) settled=r;
-  });
-  var el=(cn.est-cn.epochStart)*cn.bt;
-  if(settled) return {key:"settled", entry:settled, elapsed:el};
-  var live=liveStage(cn, el); if(live) return live;
-  var w=(_status&&_status.stage_windows)||STAGE_DEFAULT_WINDOWS;
-  if(el<w.heat_seconds) return {key:"heat", elapsed:el, estimated:true};
-  if(el<w.heat_seconds+w.duel_seconds) return {key:"duel", elapsed:el, estimated:true};
-  return {key:"validation", elapsed:el, estimated:true};
-}
-function stageDetail(stg){
-  if(!stg) return "--";
-  var into=" · <b>"+fmtDur(stg.elapsed)+"</b> into the round";
-  var src=stg.live?" · trainer-reported "+timeAgo(stg.asOf):" · estimated";
-  if(stg.key==="heat"){
-    var prog=(stg.live&&stg.heatDone!=null&&stg.heatTotal!=null)?
-      " ("+stg.heatDone+"/"+stg.heatTotal+" screened)":"";
-    return "<b>Heat</b> — trainer screening every challenger at the cheap budget"+prog+into+src;
-  }
-  if(stg.key==="duel"){
-    var who=(stg.live&&stg.finalists!=null)?stg.finalists+" finalist(s)":"finalists";
-    return "<b>Duel</b> — king vs "+who+" training at the full budget"+into+src;
-  }
-  if(stg.key==="validation") return "<b>Validation</b> — validators scoring the duel, receipt pending"+into+src;
-  var s=nextRoundSecs();
-  return "<b>Settled</b> — "+esc(verdictLabel(stg.entry))+(s!=null?" · next round ~"+fmtDur(s):"");
-}
+// ── live round panel: settlement strip + revealed submissions ──────────────
+// One pill per settlement boundary of the current era, confirmed by the
+// receipts in the index (see renderSettlementStrip).
 function renderStage(){
   var strip=document.getElementById("stage-strip"), detail=document.getElementById("stage-detail");
   if(!strip) return;
@@ -2020,14 +2174,8 @@ function renderStage(){
   // doesn't tell a reader where we are in the sequence.
   var lt=document.getElementById("live-title"), cn0=chainNow();
   if(lt){ var rn0=cn0?roundNoOfBlock(cn0.eraStart):null; lt.innerHTML=(cn0&&cn0.rolling?"This era — live":"This round — live")+(rn0?" · <b>r"+rn0+"</b>":""); }
-  if(cn0&&cn0.rolling){ renderSettlementStrip(cn0, strip, detail); return; }
-  var stg=currentStage();
-  var idx=stg?STAGES.map(function(s){return s[0];}).indexOf(stg.key):-1;
-  strip.innerHTML=STAGES.map(function(s,i){
-    var cls=!stg?"":(i===idx?" on":(i<idx?" done":""));
-    return '<span class="stage-pill'+cls+'">'+s[1]+'</span>';
-  }).join('<span class="stage-sep">&#9656;</span>');
-  detail.innerHTML=stageDetail(stg);
+  if(!cn0){ strip.innerHTML=""; detail.textContent="--"; return; }
+  renderSettlementStrip(cn0, strip, detail);
 }
 // One pill per settlement boundary of the current era: settled (a receipt for
 // that boundary is in the index), the boundary just passed (receipt pending),
@@ -2088,16 +2236,13 @@ var WS_ANCHOR_RID="3107676501688987439", WS_ANCHOR_NO=17;
 function roundBlockOf(rid){ var rs=_index&&_index.rounds; if(!rs) return null; for(var i=0;i<rs.length;i++) if(String(rs[i].round_id)===String(rid)) return rs[i].epoch_start_block; return null; }
 function roundNoOfBlock(b){ var ab=roundBlockOf(WS_ANCHOR_RID); if(b==null||ab==null) return null; var n=Math.round(WS_ANCHOR_NO+(b-ab)/3600); return n>0?n:null; }
 function roundNoOf(rid){
-  var b=roundBlockOf(rid);
-  // the LIVE round is not in the receipts index yet — status/round.json carries its block
-  if(b==null&&_roundStatus&&String(_roundStatus.round_id)===String(rid)) b=Number(_roundStatus.epoch_start_block)||null;
-  return roundNoOfBlock(b);
+  return roundNoOfBlock(roundBlockOf(rid));
 }
 function ckptRoundNo(ref){ var m=/ckpt-r(\d+)-/.exec(ref||""); return m?roundNoOf(m[1]):null; }
 function wsLabelOf(ref){ if(!ref) return "--"; var p=splitRef(ref); var repo=p.repo.replace(/^.*?cascade\//,""); var d=p.digest?p.digest.replace(/^sha256:/,"").slice(0,8):""; return d?repo+" @ "+d:repo; }
 // Rolling eras: the era's init is pinned in every settlement manifest
-// (warm_start_ckpt / warm_start_size, with the era index and generation); the
-// heat doc is the pre-rollover source. The next generation's effective era
+// (warm_start_ckpt / warm_start_size, with the era index and generation). The
+// next generation's effective era
 // comes from its promotion record.
 function renderWarmEra(cn,panel,when){
   var m=_latest&&_latest.manifest; if(!m||!m.era||!cn) return false;
@@ -2119,49 +2264,9 @@ function renderWarm(){
   var panel=document.getElementById("warm-panel"), when=document.getElementById("warm-when");
   if(!panel) return;
   var cn=chainNow();
-  if(cn&&cn.rolling&&renderWarmEra(cn,panel,when)) return;
-  var ws = _heat && _heat.warm_start;
-  if(!ws || !ws.init_checkpoint){
-    panel.innerHTML = '<div class="muted">Not active &mdash; rounds train from random initialisation.</div>';
-    if(when) when.textContent = "";
-    return;
-  }
-  function wsLabel(ref){ if(!ref) return "--"; var p=splitRef(ref); var repo=p.repo.replace(/^.*?cascade\//,""); var d=p.digest?p.digest.replace(/^sha256:/,"").slice(0,8):""; var base=d?repo+" @ "+d:repo; var rn=ckptRoundNo(ref); return rn?base+" (r"+rn+")":base; }
-  // heat.json is written at HEAT SETTLE, so it describes the last SETTLED round:
-  // init_checkpoint = that round's init, next_scheduled_init = the round after it.
-  // If a newer round is already live (status/round.json), that live round IS the
-  // "next" one and is training NOW from next_scheduled_init — so don't mislabel
-  // it as still-upcoming. The round after the live one needs the rotation roster
-  // (see loadPromotion) and only becomes knowable when this heat settles.
-  var cur=ws.init_checkpoint, nxt=ws.next_scheduled_init;
-  var settledRid=_heat.round_id, liveRid=_roundStatus && _roundStatus.round_id;
-  var running = liveRid && String(liveRid)!==String(settledRid);
-  function ridLabel(rid){ var rn=roundNoOf(rid); return esc(shortRoundId(rid))+(rn?" · r"+rn:""); }
-  var html='<div style="display:flex;flex-direction:column;gap:6px">';
-  if(running){
-    if(nxt){
-      html+='<div><span class="muted">Current round ('+ridLabel(liveRid)+', running) is training from:</span> '
-          + '<b title="'+esc(nxt)+'">'+esc(wsLabel(nxt))+'</b></div>';
-    }
-    html+='<div><span class="muted">Last completed round ('+ridLabel(settledRid)+') trained from:</span> '
-        + '<b title="'+esc(cur)+'">'+esc(wsLabel(cur))+'</b></div>';
-    html+='<div class="muted" style="font-size:.85em">The next round&rsquo;s init is drawn from the rotation '
-        + 'when this heat settles. Rotation cycles the promoted set (generation '+esc(ws.generation)+') by '
-        + 'design; each start is pinned in that round&rsquo;s signed manifest.</div>';
-  } else {
-    if(nxt){
-      html+='<div><span class="muted">Next round will warm-start from:</span> '
-          + '<b title="'+esc(nxt)+'">'+esc(wsLabel(nxt))+'</b></div>';
-    }
-    html+='<div><span class="muted">Current round ('+ridLabel(settledRid)+') warm-started from:</span> '
-        + '<b title="'+esc(cur)+'">'+esc(wsLabel(cur))+'</b></div>';
-    html+='<div class="muted" style="font-size:.85em">Next is a schedule &mdash; a promotion can change the '
-        + 'set. Rotation cycles the promoted set (generation '+esc(ws.generation)+') by design; each start is '
-        + 'pinned in that round&rsquo;s signed manifest.</div>';
-  }
-  html+='</div>';
-  panel.innerHTML=html;
-  if(when) when.textContent = ws.size ? esc(ws.size) : "";
+  if(renderWarmEra(cn,panel,when)) return;
+  panel.innerHTML = '<div class="muted">Not active &mdash; rounds train from random initialisation.</div>';
+  if(when) when.textContent = "";
 }
 // Warm-start history: the last 10 rounds and the checkpoint each trained from,
 // so miners can see the trend (random init → warm-start → rotation). The per-round
@@ -2237,7 +2342,506 @@ function renderWarmHistory(){
     '<div class="scroll-box"><table><thead><tr><th>Round</th><th>Warm-start init</th><th>When</th></tr></thead>'+
     '<tbody>'+rows+'</tbody></table></div>';
 }
-function renderAll(){ renderStatus(); renderHeader(); renderVerdict(); renderCohort(); renderChart(); renderReigns(); renderField(); renderHeat(); renderWarm(); renderRounds(); renderCountdown(); renderStage(); renderSubs(); }
+function renderAll(){ renderStatus(); renderHeader(); renderV2Strip(); renderVerdict(); renderCohort(); renderChart(); renderReigns(); renderField(); renderHeat(); renderWarm(); renderRounds(); renderCountdown(); renderStage(); renderSubs(); renderLaneALadder(); if(_page==="laneb") renderLaneB(); if(_page==="lanec") renderLaneC(); }
+// ── v2 (DEC-CA-0050): Cascade-MoE-28M + the domain-expert lane ──────────────
+// status/v2.json is the trainer's unsigned, presentational view (go-live
+// state, lane-B driver state, the king's routing health; built by
+// cascade.shared.v2_status). Everything consensus-relevant — the lane-B
+// verdicts, the paid wins, the weight vector — comes from the SIGNED receipts:
+// the anchored latest receipt (lane_b, lane_b_pay, weights) and, per
+// settlement, the index row's lane_b_verdicts.
+var _v2 = null, _satMetric = "overlap";
+// the lane-B commitment a miner posts (cascade.shared.expert_manifest)
+var EXPERT_COMMIT_PREFIX = "metro-v1:expert:";
+function v2Golive(){ return (_v2&&_v2.golive)||null; }
+function v2IsLive(){ var g=v2Golive(); return !!(g&&g.state==="live"); }
+function fmtParams(n){ if(n==null||!isFinite(n)) return "--"; return n>=1e9?(n/1e9).toFixed(1)+"B":(n>=1e6?Math.round(n/1e6)+"M":String(n)); }
+// The go-live block's distance from the chain clock (the status doc's own
+// block when the validator feed is not loaded).
+function v2EtaSecs(fb){
+  var cn=chainNow();
+  if(cn) return blockEta(cn,fb);
+  if(!_v2||_v2.block==null) return null;
+  var asOf=_v2.as_of?new Date(_v2.as_of).getTime():Date.now();
+  return Math.max(0,(fb-(Number(_v2.block)+Math.max(0,(Date.now()-asOf)/12000)))*12);
+}
+// {lane_a, lane_b, lane_c?, burn} of a signed weight vector — the page twin
+// of cascade.shared.v2_status.emission_split (exact; null when undecidable).
+// The receipt index row's own emission_split is preferred (latestSplit); this
+// is the fallback for a row that predates it.
+function emissionSplit(weights, rewardUids, pay, cpay){
+  var tot=0; (weights||[]).forEach(function(x){ tot+=Number(x)||0; }); if(!(tot>0)) return null;
+  var w=weights.map(function(x){ return (Number(x)||0)/tot; }), court={};
+  (rewardUids||[]).forEach(function(u){ court[Number(u)]=1; });
+  var wins=(pay&&pay.wins)||[], slot=null, laneB=0, paidOn={}, ok=true;
+  if(pay&&pay.share!=null&&pay.slots) slot=Number(pay.share)/Number(pay.slots);
+  else wins.forEach(function(x){ var u=Number(x.uid), m=Number(x.multiplier)||0; if(slot==null&&u>=0&&u<w.length&&!court[u]&&m>0) slot=w[u]/m; });
+  wins.forEach(function(x){
+    var u=Number(x.uid), m=Number(x.multiplier)||0; if(!(u>=0&&u<w.length)) return;
+    var amt; if(court[u]){ if(slot==null){ ok=false; return; } amt=slot*m; } else amt=w[u];
+    paidOn[u]=(paidOn[u]||0)+amt; laneB+=amt;
+  });
+  if(!ok) return null;
+  var laneC=0;
+  if(cpay){
+    // concurrent competitions: a slot is share x slot_frac[target] (competition weight, then per target)
+    var cshare=Number(cpay.share)||0, cfrac=cpay.slot_frac||null, cslot=cshare/Math.max(1,Number(cpay.slots)||1);
+    (cpay.wins||[]).forEach(function(x){ var u=Number(x.uid); if(!(u>=0&&u<w.length)) return; var sl=cfrac?cshare*(Number(cfrac[x.target])||0):cslot; var amt=sl*(Number(x.multiplier)||0); paidOn[u]=(paidOn[u]||0)+amt; laneC+=amt; });
+  }
+  var laneA=0; Object.keys(court).forEach(function(u){ u=Number(u); if(u>=0&&u<w.length) laneA+=w[u]-(paidOn[u]||0); });
+  var out={lane_a:laneA, lane_b:laneB, burn:Math.max(0,1-laneA-laneB-laneC)};
+  if(cpay) out.lane_c=laneC;
+  return out;
+}
+// The index row of the anchored latest receipt (same round), else the newest row.
+function latestRow(){
+  var rs=(_index&&_index.rounds)||[]; if(!rs.length) return null;
+  if(_latest) for(var i=rs.length-1;i>=0;i--) if(String(rs[i].round_id)===String(_latest.round_id)) return rs[i];
+  return rs[rs.length-1];
+}
+// The latest emission split: the index row's (written by the validator from
+// the signed receipt, lane C included), else computed from the receipt.
+function latestSplit(){
+  var row=latestRow();
+  if(row&&row.emission_split&&(!_latest||String(row.round_id)===String(_latest.round_id))) return row.emission_split;
+  var r=_latest;
+  if(r&&Array.isArray(r.weights)&&r.weights.length) return emissionSplit(r.weights, r.reward_uids, r.lane_b_pay||{wins:[]}, r.lane_c_pay||null);
+  return row&&row.emission_split||null;
+}
+function splitBar(s){
+  if(!s) return "";
+  function seg(c,v){ return v>0.0005?'<i class="'+c+'" style="width:'+(v*100).toFixed(2)+'%"></i>':''; }
+  var hasC=s.lane_c!=null;
+  return '<div class="split-bar" title="Emission split of the latest signed weight vector">'+seg("a",s.lane_a)+seg("b",s.lane_b)+(hasC?seg("c",s.lane_c):'')+seg("x",s.burn)+'</div>'+
+    '<div class="split-key"><span>lane A '+pct(s.lane_a)+'</span><span>lane B '+pct(s.lane_b)+'</span>'+(hasC?'<span>lane C '+pct(s.lane_c)+'</span>':'')+'<span>burn '+pct(s.burn)+'</span></div>';
+}
+function renderV2Strip(){
+  var st=document.getElementById("v2-state"), body=document.getElementById("v2-body"), sp=document.getElementById("v2-split");
+  if(!st) return;
+  var g=v2Golive(), mc=(_v2&&_v2.model)||{}, model=mc.total_params?
+    '<b>'+esc(mc.name||"Cascade-MoE-28M")+'</b> &middot; '+fmtParams(mc.active_params)+' active / '+fmtParams(mc.total_params)+' total &middot; '+
+    esc(mc.num_experts)+' experts, top-'+esc(mc.top_k):'<b>Cascade-MoE-28M</b> &middot; 28M active / 191M total';
+  if(!g){
+    st.className="v2-state"; st.textContent="v2 · status pending";
+    body.innerHTML="Today: the <b>toto2</b> competition. "+model+" lane A &mdash; the trainer&rsquo;s v2 status (status/v2.json) is not published yet. Lane B launches separately.";
+  } else if(g.state==="live"){
+    st.className="v2-state live"; st.textContent="v2 live";
+    var lb=(_v2&&_v2.lane_b)||{};
+    body.innerHTML=model+' &middot; lane A since block <b>'+esc(g.from_block)+'</b>'+
+      (lb.active?' &middot; lane B live':(lb.from_block?' &middot; lane B scheduled at block <b>'+esc(lb.from_block)+'</b>':' &middot; lane B not launched &mdash; lane A has the full allocation'));
+  } else if(g.state==="scheduled"){
+    var eta=v2EtaSecs(Number(g.from_block));
+    st.className="v2-state scheduled"; st.textContent="v2 · block "+g.from_block;
+    body.innerHTML="Today: the <b>toto2</b> competition. "+model+" lane A goes live at block <b>"+esc(g.from_block)+"</b>"+
+      (eta!=null?' (~'+esc(fmtDur(eta))+' · '+esc(blockClockOr(Number(g.from_block)))+')':'')+". Lane B launches separately.";
+  } else {
+    st.className="v2-state"; st.textContent="v2 · not announced";
+    body.innerHTML="Today: the <b>toto2</b> competition. "+model+" lane A &mdash; go-live block not yet announced. Lane B launches separately.";
+  }
+  sp.innerHTML=splitBar(latestSplit());
+  renderWarmStartLink();
+}
+// ── lane A: the DEC-CA-0055 king ladder ─────────────────────────────────────
+// Sources, newest first: the latest index row's ladder / king_check (the
+// validator's summary of the signed receipt), status/v2.json lane_a (the
+// trainer's read of the same receipt), the anchored receipt's own records.
+function laneALadder(){
+  var row=latestRow(), v=(_v2&&_v2.lane_a)||{}, lad=null, kc=null;
+  if(row){ lad=row.ladder||null; kc=row.king_check||null; }
+  if(!lad&&v.ladder) lad=v.ladder;
+  if(!kc&&v.king_check) kc=v.king_check;
+  if(!lad&&_latest&&_latest.emission){ var e=_latest.emission, l=e.ladder||{}, pol=e.policy||{};
+    lad={king_share:l.bp!=null?Number(l.bp)/10000:pol.king_share, event:l.event, court_hotkey:l.court_hotkey, court_until_block:l.court_until_block, slashed:!!l.slashed, former_share:pol.former_share, king_slash:pol.king_slash}; }
+  if(!kc&&_latest&&_latest.king_check) kc=_latest.king_check;
+  // the last JUDGED king check: walk the index back when the latest row has none
+  if(!kc){ var rs=(_index&&_index.rounds)||[]; for(var i=rs.length-1;i>=0;i--) if(rs[i].king_check){ kc=rs[i].king_check; break; } }
+  return {ladder:lad, check:kc};
+}
+function renderLaneALadder(){
+  var wrap=document.getElementById("la-ladder-wrap"), el=document.getElementById("la-ladder"), when=document.getElementById("la-ladder-when"); if(!el) return;
+  var x=laneALadder(), lad=x.ladder, kc=x.check;
+  if(!lad&&!kc){ wrap.hidden=true; return; }
+  wrap.hidden=false;
+  var cells='';
+  if(lad){
+    var sh=lad.king_share;
+    cells+='<div class="gate-cell"><div class="k">King ladder share</div><div class="v">'+(sh!=null?pct(sh):"--")+'</div>'+
+      '<div class="progress'+(sh>=0.95?' full':'')+'"><i style="width:'+((Number(sh)||0)*100).toFixed(1)+'%"></i></div>'+
+      '<div class="s">of lane A &middot; last step: '+esc(lad.event||"none")+(lad.funded_by?' &middot; funded by '+esc(lad.funded_by):'')+'</div></div>';
+    var courtLive=lad.court_hotkey&&lad.court_until_block;
+    cells+='<div class="gate-cell"><div class="k">Former-king court</div><div class="v">'+(courtLive?'<span title="'+esc(lad.court_hotkey)+'">'+esc(shortHk(lad.court_hotkey))+'</span>':'<span class="muted">none</span>')+'</div>'+
+      '<div class="s">'+(courtLive?(lad.former_share!=null?pct(lad.former_share)+' ':'')+'until block '+esc(lad.court_until_block):'no former king is paid')+'</div></div>';
+    cells+='<div class="gate-cell"><div class="k">Key slash</div><div class="v">'+(lad.slashed?'<span class="heat-pill nofit">slashed</span>':'<span class="heat-pill adv">none</span>')+'</div>'+
+      '<div class="s">'+(lad.slashed?'operator-funded king leg'+(lad.king_slash!=null?' &middot; capped at '+pct(lad.king_slash):''):'the king funded its own leg')+'</div></div>';
+  }
+  if(kc){
+    var res=String(kc.result||""), cls=res==="pass"?"adv":(res==="fail"?"nofit":"wait");
+    cells+='<div class="gate-cell"><div class="k">Last king check</div><div class="v"><span class="heat-pill '+cls+'">'+esc(res||"--")+'</span></div>'+
+      '<div class="s">round '+esc(shortRoundId(kc.round_id))+' &middot; LCB '+(kc.lcb!=null?fmt(kc.lcb,4):"--")+' vs margin '+(kc.margin!=null?fmt(kc.margin,4):"--")+
+      ((kc.reasons||[]).length?' &middot; <span title="'+esc((kc.reasons||[]).join("; "))+'">'+esc(String(kc.reasons[0]).slice(0,80))+'</span>':'')+'</div></div>';
+  }
+  el.innerHTML='<div class="gate-row">'+cells+'</div>';
+  when.textContent=kc&&kc.block?"check at block "+kc.block:"";
+}
+function blockClockOr(b){ var cn=chainNow(); if(!cn) return "--"; var d=new Date(Date.now()+(b-cn.est)*cn.bt*1000); return d.toISOString().slice(0,16).replace("T"," ")+"Z"; }
+function v2ModelName(){ return v2IsLive()?(((_v2.model||{}).name)||"Cascade-MoE-28M"):"toto2"; }
+
+// ── lane B: the gate ────────────────────────────────────────────────────────
+function lbDoc(){ return (_v2&&_v2.lane_b)||{}; }
+function lbPending(el, head, text){
+  el.innerHTML='<div class="heat-empty"><div class="he-glyph">· · ·</div><div class="he-head">'+esc(head)+'</div><p>'+text+'</p></div>';
+}
+function lbNotLiveText(){
+  var g=v2Golive(), lb=lbDoc();
+  if(!g) return "The trainer has not published status/v2.json yet.";
+  if(lb.from_block) return "Lane B is scheduled for the era starting at block "+esc(lb.from_block)+". Lane A keeps the full allocation until B's first settlement.";
+  if(g.state==="live") return "Lane B has not launched. Lane A has the full emission allocation; its king ladder and burn rules still apply.";
+  if(g.state==="scheduled") return "Lane A starts v2 at block "+esc(g.from_block)+". Lane B launches separately and has not been announced.";
+  return "The v2 go-live block has not been announced. Until then every settlement is a toto2 lane-A round.";
+}
+function layerCells(vals, bar){
+  if(!vals||!vals.length) return '<span class="muted">--</span>';
+  return '<span class="lyr-cells">'+vals.map(function(v,i){
+    var cls=v==null?"na":(v>=bar?"":"bad");
+    return '<i class="'+cls+'" title="MoE layer '+(i+1)+': '+(v==null?"--":Number(v).toFixed(3))+' (bar '+bar+')"></i>';
+  }).join("")+'</span>';
+}
+function renderLbGate(){
+  var el=document.getElementById("lb-gate"), when=document.getElementById("lb-gate-when"); if(!el) return;
+  var lb=lbDoc(), g=lb.gate||{};
+  when.textContent=_v2&&_v2.as_of?"status "+timeAgo(_v2.as_of):"";
+  if(!_v2){ lbPending(el,"Lane B status not published",lbNotLiveText()); return; }
+  var tok=Number(g.lineage_tokens)||0, need=Number(g.open_tokens)||0, frac=need>0?Math.min(1,tok/need):0;
+  var lat=g.latest&&g.latest.domains||{}, doms=lb.domains||[];
+  var rrows=doms.map(function(d){ var m=lat[d]||{};
+    return '<tr><td>'+esc(d)+'</td><td>'+layerCells(m.overlap,g.routing_overlap)+'</td><td>'+layerCells(m.jaccard,g.routing_jaccard)+'</td><td class="num">'+(m.tokens!=null?m.tokens:"--")+'</td></tr>'; }).join("");
+  var status=g.open?'<span class="heat-pill adv">● open</span>':'<span class="heat-pill wait">closed</span>';
+  el.innerHTML=(lb.active?'':'<div class="lb-note" style="margin-bottom:12px">'+lbNotLiveText()+'</div>')+
+    '<div class="gate-row">'+
+      '<div class="gate-cell"><div class="k">Lineage tokens</div><div class="v">'+esc(fmtTokens(tok).replace(" tokens",""))+
+        ' <span class="muted" style="font-size:13px">/ '+esc(fmtTokens(need).replace(" tokens",""))+'</span></div>'+
+        '<div class="progress'+(frac>=1?' full':'')+'"><i style="width:'+(frac*100).toFixed(1)+'%"></i></div>'+
+        '<div class="s">king-lineage training (channel-time points) &middot; '+(frac>=1?'floor reached':(frac*100).toFixed(1)+'% of the floor')+'</div></div>'+
+      '<div class="gate-cell"><div class="k">Gate</div><div class="v">'+status+'</div>'+
+        '<div class="s">'+(g.open?'latched open at block '+esc(g.opened_block)+' &mdash; one-way':esc(g.reason||"waiting for the first comparison"))+'</div></div>'+
+      '<div class="gate-cell"><div class="k">Routing bars</div><div class="v">'+(g.routing_overlap!=null?fmt(g.routing_overlap,2):"--")+' <span class="muted" style="font-size:13px">overlap</span> &middot; '+
+        (g.routing_jaccard!=null?fmt(g.routing_jaccard,2):"--")+' <span class="muted" style="font-size:13px">Jaccard</span></div>'+
+        '<div class="s">every MoE layer of every domain must clear both</div></div>'+
+    '</div>'+
+    (rrows?'<div class="cohort-head" style="margin-top:16px">Latest comparison'+(g.latest?' <span class="muted">— era '+esc(g.latest.era)+', block '+esc(g.latest.block)+'; one cell per MoE layer, red = below the bar</span>':'')+'</div>'+
+      '<div class="scroll-box"><table><thead><tr><th>Domain</th><th>Top-k overlap</th><th>ESFT Jaccard</th><th class="num">Tokens</th></tr></thead><tbody>'+rrows+'</tbody></table></div>':'');
+}
+// The saturation curve: per MoE layer, the worst domain's overlap (or
+// Jaccard) at each (previous king, king) comparison, against lineage tokens.
+function renderLbSat(){
+  var svg=document.getElementById("lb-sat-svg"), note=document.getElementById("lb-sat-note"), leg=document.getElementById("lb-sat-legend"); if(!svg) return;
+  var g=lbDoc().gate||{}, hist=g.history||[], key=_satMetric, bar=key==="overlap"?g.routing_overlap:g.routing_jaccard;
+  var W=1000,H=330,PL=52,PR=16,PT=14,PB=30; svg.setAttribute("viewBox","0 0 "+W+" "+H);
+  var nL=0; hist.forEach(function(r){ nL=Math.max(nL,(r[key]||[]).length); });
+  if(!hist.length||!nL){
+    svg.innerHTML='<text x="'+(W/2)+'" y="'+(H/2)+'" text-anchor="middle" fill="var(--muted)" font-size="14">'+(_v2?'no king-vs-king comparison yet — the lineage needs a second king':'awaiting status/v2.json')+'</text>';
+    note.textContent="--"; leg.innerHTML=""; return;
+  }
+  var xs=hist.map(function(r){ return Number(r.lineage_tokens)||0; }), xmin=Math.min.apply(null,xs), xmax=Math.max.apply(null,xs);
+  var useEra=xmax===xmin; if(useEra){ xs=hist.map(function(r,i){ return i; }); xmin=0; xmax=Math.max(1,hist.length-1); }
+  function X(v){ return PL+(xmax===xmin?0.5:(v-xmin)/(xmax-xmin))*(W-PL-PR); }
+  function Y(v){ return PT+(1-v)*(H-PT-PB); }
+  var out="";
+  [0,0.25,0.5,0.75,1].forEach(function(v){ var y=Y(v); out+='<line x1="'+PL+'" x2="'+(W-PR)+'" y1="'+y.toFixed(1)+'" y2="'+y.toFixed(1)+'" stroke="currentColor" stroke-width="0.6" opacity="0.14"/><text x="'+(PL-8)+'" y="'+(y+4).toFixed(1)+'" text-anchor="end" fill="var(--muted)" font-size="12">'+v.toFixed(2)+'</text>'; });
+  if(bar!=null){ var yb=Y(bar); out+='<line x1="'+PL+'" x2="'+(W-PR)+'" y1="'+yb.toFixed(1)+'" y2="'+yb.toFixed(1)+'" stroke="var(--ink)" stroke-width="1.2" stroke-dasharray="6 5" opacity="0.7"/><text x="'+(W-PR)+'" y="'+(yb-6).toFixed(1)+'" text-anchor="end" fill="var(--muted)" font-size="12">gate bar '+bar+'</text>'; }
+  var legend=[];
+  for(var li=0; li<nL; li++){
+    var col="var(--s"+(li%7+1)+")", pts=[];
+    hist.forEach(function(r,i){ var v=(r[key]||[])[li]; if(v!=null&&isFinite(v)) pts.push(X(xs[i]).toFixed(1)+","+Y(v).toFixed(1)); });
+    if(pts.length>1) out+='<polyline points="'+pts.join(" ")+'" fill="none" stroke="'+col+'" stroke-width="1.8" stroke-linejoin="round"/>';
+    pts.forEach(function(p){ var c=p.split(","); out+='<circle cx="'+c[0]+'" cy="'+c[1]+'" r="2.4" fill="'+col+'"/>'; });
+    var lay=(_v2&&_v2.model&&_v2.model.moe_blocks||[])[li];
+    legend.push('<span><i class="swatch" style="background:'+col+'"></i>'+(lay!=null?"block "+lay:"layer "+(li+1))+'</span>');
+  }
+  out+='<text x="'+PL+'" y="'+(H-8)+'" fill="var(--muted)" font-size="12">'+(useEra?"era "+hist[0].era:esc(fmtTokens(xmin)))+'</text>'+
+    '<text x="'+(W-PR)+'" y="'+(H-8)+'" text-anchor="end" fill="var(--muted)" font-size="12">'+(useEra?"era "+hist[hist.length-1].era:esc(fmtTokens(xmax)))+'</text>';
+  svg.innerHTML=out; leg.innerHTML=legend.join("");
+  var last=hist[hist.length-1], lv=(last[key]||[]).filter(function(v){ return v!=null; }), worst=lv.length?Math.min.apply(null,lv):null;
+  note.textContent=hist.length+" comparisons · latest worst layer "+(worst!=null?worst.toFixed(3):"--");
+}
+
+// ── lane B: the domain board ────────────────────────────────────────────────
+function lbPayout(){ return lbDoc().payout||{}; }
+// A win's multiplier at age `age` (in the schedule's unit): full pay for the
+// win's own `full` eras (gain-tiered, owner 2026-10-20: the full_eras of the
+// highest full_pay_tiers threshold its gain LCB met), then halving every
+// half-life down to the floor, nothing from the TTL on — the page twin of
+// cascade.eval.expert_lane.reward_multiplier + the win TTL.
+function payTiers(p){ return (p&&p.full_pay_tiers)||[]; }
+function payTiersText(p){
+  var t=payTiers(p); if(!t.length) return "--";
+  return t.map(function(x){ return esc(x[1])+" at LCB &ge; "+esc(x[0]); }).join(", ");
+}
+function payMultiplier(age, p, full){
+  full=Number(full)||0; var hl=Number(p.half_life)||1, fl=Number(p.floor)||0, ttl=Number(p.ttl)||0;
+  if(age<0) return 0;
+  if(ttl>0&&age>=ttl) return 0;
+  if(age<full) return 1;
+  return Math.max(fl, Math.pow(0.5,(age-full+1)/hl));
+}
+function lbWins(){ var p=_latest&&_latest.lane_b_pay; return (p&&p.wins)||[]; }
+function failedGuardOf(reason){
+  reason=String(reason||""); var m=/^regression on (?:domain )?([^:]+):/.exec(reason); return m?m[1].trim():"";
+}
+// Verdict rows for one domain, newest first: every index row's
+// lane_b_verdicts (the receipt summary's lane-B columns), else the anchored
+// latest receipt's own lane_b rows.
+function lbVerdicts(domain){
+  var out=[], seen={};
+  ((_index&&_index.rounds)||[]).slice().reverse().forEach(function(r){
+    (r.lane_b_verdicts||[]).forEach(function(v){
+      if(v.domain!==domain) return;
+      var k=r.round_id+"|"+v.hotkey; if(seen[k]) return; seen[k]=1;
+      out.push({round_id:r.round_id, at:r.published_at, hotkey:v.hotkey, passed:!!v.passed, stage:v.stage, reason:v.reason,
+                target_lcb:v.target_lcb, guard:v.failed_guard||failedGuardOf(v.reason), targets:v.targets||null});
+    });
+  });
+  if(_latest&&Array.isArray(_latest.lane_b)) _latest.lane_b.forEach(function(v){
+    if(v.domain!==domain) return;
+    var k=_latest.round_id+"|"+v.hotkey; if(seen[k]) return; seen[k]=1;
+    out.push({round_id:_latest.round_id, at:null, hotkey:v.hotkey, passed:!!v.passed, stage:v.stage, reason:v.reason,
+              target_lcb:v.target_lcb, guard:failedGuardOf(v.reason), targets:v.targets||null});
+  });
+  return out;
+}
+var HORIZON_PREFIX="horizon:";
+function isHorizonTarget(t){ return String(t||"").indexOf(HORIZON_PREFIX)===0; }
+function targetName(t){ return isHorizonTarget(t)?"horizon "+String(t).slice(HORIZON_PREFIX.length):String(t||""); }
+// The declared targets of the passing multi-target leg behind a win (DEC-CA-0059), else null.
+function multiTargetOf(domain, hotkey){
+  var vs=lbVerdicts(domain);
+  for(var i=0;i<vs.length;i++) if(vs[i].passed&&vs[i].hotkey===hotkey&&vs[i].targets&&vs[i].targets.length>1) return vs[i].targets;
+  return null;
+}
+function selCell(sel){
+  if(!sel||!sel.per_layer) return '<span class="muted">--</span>';
+  var ks=Object.keys(sel.per_layer).sort(function(a,b){ return Number(a)-Number(b); }), tot=0;
+  ks.forEach(function(k){ tot+=sel.per_layer[k]; });
+  var tip=ks.map(function(k){ return "layer "+k+": "+(sel.rows&&sel.rows[k]?sel.rows[k].join(","):sel.per_layer[k]); }).join(" · ");
+  return '<span title="'+esc(tip)+'">'+tot+' rows · '+ks.map(function(k){ return sel.per_layer[k]; }).join("/")+'</span>';
+}
+function renderLbDomains(){
+  var el=document.getElementById("lb-domains"), when=document.getElementById("lb-dom-when"); if(!el) return;
+  // DEC-CA-0059: one slot per target — the domains, then the horizon slots
+  var lb=lbDoc(), doms=(lb.targets||lb.domains||[]).slice(), p=lbPayout(), unit=p.unit||"eras";
+  if(!lb.active){ lbPending(el,"Lane B not launched",lbNotLiveText()); when.textContent=""; return; }
+  lbWins().forEach(function(w){ if(doms.indexOf(w.domain)<0) doms.push(w.domain); });
+  if(!doms.length){ lbPending(el,"No lane-B domains",lbNotLiveText()); when.textContent=""; return; }
+  var nH=doms.filter(isHorizonTarget).length;
+  when.textContent=(doms.length-nH)+" domains"+(nH?" + "+nH+" horizon slots":"")+" · "+(p.share!=null?pct(p.share)+" of emission split across them":"");
+  var wins={}; lbWins().forEach(function(w){ wins[w.domain]=w; });
+  el.className="dom-grid";
+  el.innerHTML=doms.map(function(d){
+    var pd=(lb.per_domain||{})[d]||{}, w=wins[d], vs=lbVerdicts(d).slice(0,5), html='<div class="dom-card">';
+    html+='<div class="dh"><span class="dn">'+esc(targetName(d))+'</span>'+(isHorizonTarget(d)?'<span class="heat-pill wait" title="DEC-CA-0059 horizon slot: judged on the scored horizon">horizon</span>':'')+(pd.pending_merge?'<span class="heat-pill adv" title="A passing leg waits for the next era init">merging next era</span>':'')+'</div>';
+    if(w){
+      var m=Number(w.multiplier)||0, age=Number(w.age)||0, ttl=Number(p.ttl)||0;
+      var mt=multiTargetOf(d, w.hotkey);
+      html+='<div class="row"><span>Winner</span><b title="'+esc(w.hotkey)+'">uid '+esc(w.uid)+' · '+esc(shortHk(w.hotkey))+'</b></div>'+
+        (mt?'<div class="row"><span>Multi-target leg</span><span>'+esc(mt.map(targetName).join(" + "))+'</span></div>':'')+
+        '<div class="row"><span>Paying</span><b>'+pct(m)+' of the slot</b></div><div class="mult-bar"><i style="width:'+(m*100).toFixed(1)+'%"></i></div>'+
+        '<div class="row"><span>Age</span><span>'+age+' '+esc(unit)+(ttl>0?' · expires in '+Math.max(0,ttl-age)+' '+esc(unit):'')+' · merged at block '+esc(w.merge_block)+'</span></div>';
+    } else html+='<div class="row"><span>Winner</span><span class="muted">none paid &mdash; the slot burns</span></div>';
+    var open=(pd.open||[]), fin=(pd.finished||[]), pend=(pd.pending||[]);
+    html+='<div class="sec-k">Legs</div><div class="row"><span>In flight <b>'+open.length+'</b></span><span>Awaiting settlement <b>'+fin.length+'</b></span><span>Queued <b>'+pend.length+'</b></span></div>';
+    open.concat(fin).forEach(function(l){ html+='<div class="row"><span title="'+esc(l.hotkey)+'">uid '+esc(l.uid)+' · '+esc(shortHk(l.hotkey))+'</span><span>base era '+esc(l.base_era)+'</span></div>'; });
+    html+='<div class="row"><span>Expert rows</span>'+selCell(pd.selection)+'</div>';
+    html+='<div class="sec-k">Recent verdicts</div>';
+    if(vs.length){
+      html+='<div class="scroll-box"><table><thead><tr><th>Miner</th><th>Verdict</th><th class="num">Target LCB</th><th>Why</th></tr></thead><tbody>'+vs.map(function(v){
+        var why=v.passed?'merge':(v.guard?'guard: '+esc(v.guard):esc(v.stage==="verdict"?String(v.reason||"").split(":")[0]:v.stage));
+        return '<tr><td title="'+esc(v.hotkey)+'">'+esc(shortHk(v.hotkey))+(v.targets&&v.targets.length>1?' <span class="muted" title="multi-target leg: '+esc(v.targets.join(", "))+'">×'+v.targets.length+'</span>':'')+'</td><td><span class="heat-pill '+(v.passed?'adv':'nofit')+'">'+(v.passed?'✓ pass':'✗ fail')+'</span></td>'+
+          '<td class="num">'+(v.target_lcb!=null?fmt(v.target_lcb,4):"--")+'</td><td class="muted" title="'+esc(v.reason||"")+'">'+why+'</td></tr>';
+      }).join("")+'</tbody></table></div>';
+    } else html+='<div class="row"><span class="muted">no judged legs yet</span></div>';
+    var dr=pd.dropped||[];
+    if(dr.length) html+='<div class="row"><span>Dropped before judging</span><span title="'+esc(dr.map(function(x){ return x.outcome+" · "+shortHk(x.hotkey); }).join(" · "))+'">'+dr.length+' ('+esc(dr[0].outcome)+')</span></div>';
+    return html+'</div>';
+  }).join("");
+}
+
+// ── lane B: payout schedule ─────────────────────────────────────────────────
+function renderLbPay(){
+  var svg=document.getElementById("lb-pay-svg"), note=document.getElementById("lb-pay-note"), when=document.getElementById("lb-pay-when"); if(!svg) return;
+  var p=lbPayout(), W=1000,H=330,PL=52,PR=16,PT=14,PB=30; svg.setAttribute("viewBox","0 0 "+W+" "+H);
+  if(!payTiers(p).length){ svg.innerHTML='<text x="'+(W/2)+'" y="'+(H/2)+'" text-anchor="middle" fill="var(--muted)" font-size="14">awaiting status/v2.json</text>'; note.textContent=""; when.textContent=""; return; }
+  var unit=p.unit||"eras", ttl=Number(p.ttl)||0, maxA=ttl>0?ttl+2:Math.max(12,Number((payTiers(p)[0]||[0,0])[1])+8);
+  function X(a){ return PL+a/maxA*(W-PL-PR); } function Y(v){ return PT+(1-v)*(H-PT-PB); }
+  var out="";
+  [0,0.25,0.5,0.75,1].forEach(function(v){ var y=Y(v); out+='<line x1="'+PL+'" x2="'+(W-PR)+'" y1="'+y.toFixed(1)+'" y2="'+y.toFixed(1)+'" stroke="currentColor" stroke-width="0.6" opacity="0.14"/><text x="'+(PL-8)+'" y="'+(y+4).toFixed(1)+'" text-anchor="end" fill="var(--muted)" font-size="12">'+Math.round(v*100)+'%</text>'; });
+  payTiers(p).forEach(function(tier, i){
+    var d="";
+    for(var a=0;a<=maxA;a++){ var m=payMultiplier(a,p,tier[1]); d+=(a?"L":"M")+X(a).toFixed(1)+" "+Y(m).toFixed(1)+" L"+X(a+1>maxA?maxA:a+1).toFixed(1)+" "+Y(m).toFixed(1)+" "; }
+    out+='<path d="'+d+'" fill="none" stroke="var(--good)" stroke-width="2.4" opacity="'+(1-0.25*i).toFixed(2)+'"><title>gain LCB &ge; '+esc(tier[0])+': '+esc(tier[1])+' full</title></path>';
+  });
+  if(Number(p.floor)>0){ var yf=Y(Number(p.floor)); out+='<line x1="'+PL+'" x2="'+(W-PR)+'" y1="'+yf.toFixed(1)+'" y2="'+yf.toFixed(1)+'" stroke="var(--muted)" stroke-dasharray="4 5" opacity="0.6"/>'; }
+  if(ttl>0){ var xt=X(ttl); out+='<line x1="'+xt.toFixed(1)+'" x2="'+xt.toFixed(1)+'" y1="'+PT+'" y2="'+(H-PB)+'" stroke="#BF5B3D" stroke-dasharray="3 4"/><text x="'+(xt-6).toFixed(1)+'" y="'+(PT+14)+'" text-anchor="end" fill="#BF5B3D" font-size="12">expires</text>'; }
+  lbWins().forEach(function(w){ var a=Number(w.age)||0; out+='<circle cx="'+X(a+0.5).toFixed(1)+'" cy="'+Y(Number(w.multiplier)||0).toFixed(1)+'" r="6" fill="var(--chal-line)" stroke="var(--surface)" stroke-width="2"><title>'+esc(w.domain)+' · uid '+esc(w.uid)+' · age '+a+' · '+pct(w.multiplier)+(w.full_eras!=null?' · full '+esc(w.full_eras)+' (tier '+esc(w.tier)+')':'')+'</title></circle>'; });
+  for(var t=0;t<=maxA;t+=Math.max(1,Math.round(maxA/8))) out+='<text x="'+X(t).toFixed(1)+'" y="'+(H-8)+'" text-anchor="middle" fill="var(--muted)" font-size="12">'+t+'</text>';
+  svg.innerHTML=out;
+  when.textContent="x = "+unit+" since the merge";
+  note.innerHTML="";
+  document.getElementById("lb-pay-title").innerHTML="Payout schedule"+infoTip("Payout schedule",
+    'Gain sets full-pay duration: '+payTiersText(p).replace(/&ge;/g,'≥')+'. Rewards then halve every '+p.half_life+' '+unit+' to a '+pct(p.floor)+' floor'+(ttl>0?' and expire after '+ttl+' '+unit:'')+'. Unpaid rewards '+(p.remainder==="lane_a"?'return to lane A.':'burn.'));
+}
+
+// ── lane B: how to enter ────────────────────────────────────────────────────
+// The miner CLI's lane-B entry: `cascade deploy --expert-domain` uploads the
+// generator and commits metro-v1:expert:<domain>:hippius:<ref> on chain.
+var EXPERT_CLI = "cascade deploy ./my-generator --wallet-name <coldkey> --wallet-hotkey <expert-hotkey> --hub-namespace <namespace> --expert-domain ";
+function renderLbEnter(){
+  var el=document.getElementById("lb-enter"); if(!el) return;
+  var doms=lbDoc().domains||[], d=doms.length?doms[0]:"<domain>";
+  document.getElementById("lb-enter-title").innerHTML="Enter lane B"+infoTip("Enter lane B","Train selected experts for a target. Earn rewards after the change passes the merge checks.");
+  el.innerHTML='<details><summary>Submission details</summary>'+
+    '<pre>'+esc(EXPERT_COMMIT_PREFIX)+'<b>'+esc(d)+'</b>:hippius:&lt;namespace/repo&gt;@sha256:&lt;digest&gt;</pre>'+
+    '<div class="lb-note">Domains: '+(doms.length?doms.map(function(x){ return '<code>'+esc(x)+'</code>'; }).join(" "):'<span class="muted">announced with v2</span>')+'. '+
+    'Legs queue per domain by commit block (never UID).</div>'+
+    '<pre>'+esc(EXPERT_CLI)+'<b>'+esc(d)+'</b></pre>'+
+    '<div class="lb-note">One commitment per hotkey. See <code>cascade deploy --help</code> for options.</div></details>';
+}
+
+// ── MoE health: the king's per-expert load ──────────────────────────────────
+function renderLbMoe(){
+  var el=document.getElementById("lb-moe"), when=document.getElementById("lb-moe-when"); if(!el) return;
+  var k=(_v2&&_v2.king)||{}, h=k.routing_health||{}, ls=h.layers||[];
+  if(!ls.length){ lbPending(el,"No routing health yet",_v2?(v2IsLive()?"Measured on the king&rsquo;s routing of the domains&rsquo; affinity slices once lane B probes it.":lbNotLiveText()):lbNotLiveText()); when.textContent=""; return; }
+  when.textContent=(k.era!=null?"era "+k.era+" king · ":"")+(k.health_source||"");
+  var cells=ls.map(function(L){
+    var heat=(L.heat||[]).map(function(v,i){ var a=Math.min(1,v/2), per=Math.round((h.experts||256)/(h.bins||32));
+      return '<i class="'+(v===0?"dead":"")+'" style="'+(v===0?"":"opacity:"+Math.max(0.06,a).toFixed(3))+'" title="experts '+(i*per)+'–'+((i+1)*per-1)+': '+v.toFixed(2)+'× fair load"></i>'; }).join("");
+    return '<div class="hm-row"><span class="hm-l">block '+esc(L.layer)+'</span><span class="hm-cells">'+heat+'</span></div>';
+  }).join("");
+  var rows=ls.map(function(L){
+    var hot=L.max_over_mean!=null&&L.max_over_mean>4;
+    return '<tr><td>block '+esc(L.layer)+'</td><td class="num'+(hot?' warn':'')+'">'+fmt(L.max_over_mean,2)+'×</td><td class="num">'+fmt(L.cv,2)+'</td>'+
+      '<td class="num'+(L.dead>0?' warn':'')+'">'+esc(L.dead)+'</td><td class="num">'+fmt(L.entropy,3)+'</td><td class="num">'+esc(L.tokens)+'</td></tr>';
+  }).join("");
+  el.innerHTML='<div class="heatmap">'+cells+'</div>'+
+    '<div class="hm-key"><span>'+esc(h.experts||"--")+' experts per layer in '+esc(h.bins||"--")+' cells</span><span class="ramp"></span><span>0 → 2× fair load</span><span>dotted = no token routed</span></div>'+
+    '<div class="scroll-box" style="margin-top:14px"><table><thead><tr><th>Layer</th><th class="num" title="Busiest expert ÷ mean load (1.0 = balanced)">Max / mean</th><th class="num" title="Std / mean of the per-expert load">CV</th>'+
+    '<th class="num" title="Experts that received no token">Dead</th><th class="num" title="Shannon entropy of the load share ÷ log E (1.0 = uniform)">Entropy</th><th class="num">Tokens</th></tr></thead><tbody>'+rows+'</tbody></table></div>';
+}
+// ── lane C (DEC-CA-0056): forward-only fine-tune competitions (MarketCast only) ────────────────────────
+// status/v2.json lane_c (config + slot holders read from the latest receipt +
+// the trainer's leg counts) and status/lane_c.json (the trainer's queue);
+// verdicts and paid slots from the signed receipts (index lane_c_verdicts,
+// the anchored receipt's lane_c_pay).
+var _lc=null;
+function lcDoc(){ return (_v2&&_v2.lane_c)||null; }
+function lcNotLiveText(){
+  var c=lcDoc();
+  if(!_v2) return "The trainer has not published status/v2.json yet.";
+  if(!c) return "Lane C is not live: no <code>[lane_c] from_block</code> is typed.";
+  if(c.state==="scheduled") return "Lane C starts at block "+esc(c.from_block)+".";
+  return "";
+}
+function lcWins(){ var p=_latest&&_latest.lane_c_pay; return (p&&p.wins)||[]; }
+function lcVerdicts(target){
+  var out=[], seen={};
+  ((_index&&_index.rounds)||[]).slice().reverse().forEach(function(r){
+    (r.lane_c_verdicts||[]).forEach(function(v){
+      if(v.target!==target) return;
+      var k=r.round_id+"|"+v.hotkey+"|"+(v.phase||""); if(seen[k]) return; seen[k]=1;
+      out.push({round_id:r.round_id, hotkey:v.hotkey, uid:v.uid, passed:!!v.passed, stage:v.stage, reason:v.reason,
+                gain_lcb:v.gain_lcb, gain:v.gain, phase:v.phase||"judge", outcome:v.outcome||""});
+    });
+  });
+  return out;
+}
+function renderLcStatus(){
+  var el=document.getElementById("lc-status"), when=document.getElementById("lc-status-when"); if(!el) return;
+  document.getElementById("lc-title").innerHTML="MarketCast"+infoTip("MarketCast","Fine-tune the pinned Timestral base with a marketcast.json recipe. Win on future market data; confirm next settlement to earn rewards.");
+  var c=lcDoc();
+  when.textContent=_v2&&_v2.as_of?"status "+timeAgo(_v2.as_of):"";
+  if(!c){ lbPending(el,"Lane C not live",lcNotLiveText()); return; }
+  var p=c.payout||{}, v=c.verdict||{}, legs=c.legs||{};
+  var state=c.state==="live"?'<span class="heat-pill adv">● live</span>':(c.state==="scheduled"?'<span class="heat-pill wait">block '+esc(c.from_block)+'</span>':'<span class="heat-pill wait">off</span>');
+  el.innerHTML=(c.state!=="live"?'<div class="lb-note" style="margin-bottom:12px">'+lcNotLiveText()+'</div>':'')+
+    '<div class="gate-row">'+
+      '<div class="gate-cell"><div class="k">State</div><div class="v">'+state+'</div><div class="s">from block '+esc(c.from_block||"--")+'</div></div>'+
+      '<div class="gate-cell"><div class="k">Share</div><div class="v">'+(c.share!=null?pct(c.share):"--")+'</div><div class="s">of emission, taken from '+esc(String(c.takes_from||"lane_b").replace("_"," "))+' &middot; '+esc(p.slots||0)+' target slots</div></div>'+
+      '<div class="gate-cell"><div class="k">Win bar</div><div class="v">'+(v.gain_margin!=null?fmt(v.gain_margin,3):"--")+'</div><div class="s">gain LCB vs pinned base &middot; &alpha; '+(v.alpha!=null?fmt(v.alpha,3):"--")+'</div></div>'+
+      '<div class="gate-cell"><div class="k">Training</div><div class="v">'+(legs.leg_hours!=null?fmt(legs.leg_hours,1)+'h':"--")+'</div><div class="s">'+esc(legs.legs_per_target||"--")+' jobs per target &middot; pinned Timestral base</div></div>'+
+    '</div>'+lcCompetitionsTable(c);
+}
+// Concurrent competitions (owner 2026-10-20): each competition's weight, its
+// normalised share of lane C, state (pending | active | winding_down | ended),
+// start / end blocks and wind-down rule. An idle competition's share burns.
+function lcCompetitionsTable(c){
+  var cs=(c&&c.competitions)||[]; if(!cs.length) return "";
+  var pill=function(st){ var cls=st==="active"?"adv":(st==="winding_down"?"wait":"nofit"); return '<span class="heat-pill '+cls+'">'+esc(String(st).replace("_"," "))+'</span>'; };
+  return '<div class="scroll-box" style="margin-top:12px"><table><thead><tr><th>Competition</th><th class="num">Weight</th><th class="num">Share of lane C</th><th>State</th><th>From</th><th>Until</th><th>Wind-down</th><th>Targets</th></tr></thead><tbody>'+
+    cs.map(function(x){
+      return '<tr><td><code>'+esc(x.kind)+':</code></td><td class="num">'+(x.weight!=null?fmt(x.weight,2):"--")+'</td><td class="num">'+(x.frac!=null?pct(x.frac):"--")+'</td><td>'+pill(x.state)+'</td>'+
+        '<td>'+(x.from_block?'block '+esc(x.from_block):'<span class="muted">not set</span>')+'</td><td>'+(x.until_block?'block '+esc(x.until_block):'<span class="muted">no end</span>')+'</td>'+
+        '<td>'+(x.wind_down==="stop"?'stops at the end':'full pay to '+esc(x.wind_down_max_eras)+' eras')+'</td><td>'+esc((x.targets||[]).join(", "))+'</td></tr>';
+    }).join("")+'</tbody></table></div>';
+}
+function renderLcTargets(){
+  var el=document.getElementById("lc-targets"), when=document.getElementById("lc-targets-when"); if(!el) return;
+  var c=lcDoc();
+  if(!c){ el.className=""; lbPending(el,"No lane-C targets",lcNotLiveText()); when.textContent=""; return; }
+  var ts=(c.targets||[]).slice(), per=c.per_target||{}, wins={}, lcs=(_lc&&_lc.targets)||{};
+  lcWins().forEach(function(w){ wins[w.target]=w; if(ts.indexOf(w.target)<0) ts.push(w.target); });
+  if(!ts.length){ el.className=""; lbPending(el,"No lane-C targets","No <code>[lane_c] targets</code> are configured."); when.textContent=""; return; }
+  when.textContent=ts.length+" targets"+(c.holders_source?" · holders from the "+c.holders_source:"");
+  el.className="dom-grid";
+  el.innerHTML=ts.map(function(t){
+    var pt=per[t]||{}, h=pt.holder||null, w=wins[t]||null, q=lcs[t]||{}, vs=lcVerdicts(t).slice(0,5), html='<div class="dom-card">';
+    html+='<div class="dh"><span class="dn">'+esc(t)+'</span>'+(pt.slot_frac!=null?'<span class="muted">'+pct(pt.slot_frac)+' of lane C</span>':'')+'</div>';
+    var hk=(h&&h.hotkey)||(w&&w.hotkey), uid=h&&h.uid!=null?h.uid:(w?w.uid:null), m=w?Number(w.multiplier):(h&&h.multiplier!=null?Number(h.multiplier):null);
+    if(hk){
+      html+='<div class="row"><span>Holder</span><b title="'+esc(hk)+'">uid '+esc(uid)+' · '+esc(shortHk(hk))+'</b></div>'+
+        (m!=null?'<div class="row"><span>Paying</span><b>'+pct(m)+' of the slot</b></div><div class="mult-bar"><i style="width:'+(m*100).toFixed(1)+'%"></i></div>':'')+
+        '<div class="row"><span>Won</span><span>block '+esc((h&&h.win_block)||(w&&w.win_block)||"--")+(h&&h.gain_lcb!=null?' · gain LCB '+fmt(h.gain_lcb,4):'')+'</span></div>';
+    } else html+='<div class="row"><span>Holder</span><span class="muted">none &mdash; the slot burns</span></div>';
+    var pend=pt.pending||[];
+    html+='<div class="sec-k">Pending confirmation</div>';
+    if(pend.length) pend.forEach(function(x){ html+='<div class="row"><span title="'+esc(x.hotkey)+'">'+esc(shortHk(x.hotkey))+'</span><span>'+esc(x.kind)+(x.gain_lcb!=null?' · LCB '+fmt(x.gain_lcb,4):'')+'</span></div>'; });
+    else html+='<div class="row"><span class="muted">none</span></div>';
+    html+='<div class="sec-k">Legs</div><div class="row"><span>Queued <b>'+esc(q.queued!=null?q.queued:(pt.queued||0))+'</b></span><span>In flight <b>'+esc(q.open!=null?q.open:(pt.open||0))+'</b> / '+esc(q.slots||pt.leg_slots||"--")+'</span><span>Awaiting settlement <b>'+esc(q.finished!=null?q.finished:(pt.finished||0))+'</b></span></div>';
+    html+='<div class="sec-k">Recent verdicts</div>';
+    if(vs.length){
+      html+='<div class="scroll-box"><table><thead><tr><th>Miner</th><th>Phase</th><th>Verdict</th><th class="num">Gain LCB</th></tr></thead><tbody>'+vs.map(function(v){
+        var oc=v.outcome==="confirmed"?'✓ confirmed':(v.outcome==="pending"?'pending':(v.passed?'✓ pass':'✗ '+esc(v.outcome||"fail")));
+        return '<tr><td title="'+esc(v.hotkey)+'">'+esc(shortHk(v.hotkey))+'</td><td>'+esc(v.phase)+'</td><td><span class="heat-pill '+(v.passed?'adv':'nofit')+'" title="'+esc(v.reason||"")+'">'+oc+'</span></td>'+
+          '<td class="num">'+(v.gain_lcb!=null?fmt(v.gain_lcb,4):"--")+'</td></tr>';
+      }).join("")+'</tbody></table></div>';
+    } else html+='<div class="row"><span class="muted">no judged legs yet</span></div>';
+    return html+'</div>';
+  }).join("");
+}
+function renderLcQueue(){
+  var el=document.getElementById("lc-queue"), when=document.getElementById("lc-queue-when"); if(!el) return;
+  var c=lcDoc(), tr=(c&&c.trainer)||{}, d=_lc||null;
+  if(!c){ lbPending(el,"Lane C not live",lcNotLiveText()); when.textContent=""; return; }
+  var q=(d&&d.queue)||tr.queue||{}, open=(d&&d.open)||tr.open||[], outs=(d&&d.outcomes)||tr.outcomes||[];
+  when.textContent=d&&d.block?"status/lane_c.json at block "+d.block:"";
+  var qk=Object.keys(q);
+  var html='<div class="row" style="font-family:var(--font-mono);font-size:12px">'+(qk.length?qk.map(function(k){ return esc(k)+' <b>'+esc(q[k])+'</b>'; }).join(" &middot; "):'<span class="muted">queue empty</span>')+'</div>';
+  if(open.length) html+='<div class="scroll-box" style="margin-top:10px"><table><thead><tr><th>Miner</th><th>Target</th><th class="num">Base era</th><th class="num">Started</th><th>GPU</th></tr></thead><tbody>'+open.map(function(l){
+    return '<tr><td title="'+esc(l.hotkey)+'">uid '+esc(l.uid)+' · '+esc(shortHk(l.hotkey))+'</td><td>'+esc(l.target)+'</td><td class="num">'+esc(l.base_era)+'</td><td class="num">'+esc(l.started_block)+'</td><td>'+esc(l.gpu||"--")+'</td></tr>'; }).join("")+'</tbody></table></div>';
+  if(outs.length) html+='<div class="lb-note" style="margin-top:10px">Recent outcomes: '+outs.slice(-6).map(function(o){ return esc((o.target||"")+" "+(o.outcome||o.kind||"")+(o.hotkey?" · "+shortHk(o.hotkey):"")); }).join(" &middot; ")+'</div>';
+  el.innerHTML=html;
+}
+function renderLaneC(){ renderLcStatus(); renderLcTargets(); renderLcQueue(); }
+function renderLaneB(){ renderLbGate(); renderLbSat(); renderLbDomains(); renderLbPay(); renderLbEnter(); renderLbMoe(); }
+function renderV2(){ renderV2Strip(); renderHeader(); renderLaneALadder(); if(_page==="laneb") renderLaneB(); if(_page==="lanec") renderLaneC(); }
+(function(){
+  var bs=document.querySelectorAll("[data-satm]");
+  for(var i=0;i<bs.length;i++) bs[i].addEventListener("click", function(){
+    _satMetric=this.dataset.satm; for(var j=0;j<bs.length;j++) bs[j].classList.toggle("active", bs[j]===this);
+    var g=lbDoc().gate||{}; renderLbSat();
+    document.getElementById("lb-sat-title").innerHTML="Routing stability"+infoTip("Routing stability","Previous and current era kings compared per layer; the weakest domain sets the value. "+(_satMetric==="overlap"?"Showing top-k overlap.":"Showing ESFT Jaccard.")+(g.open?" Gate open.":""));
+  });
+})();
+
 
 // ── wiring ──────────────────────────────────────────────────────────────────
 document.getElementById("theme-toggle").addEventListener("click",function(){
@@ -2304,7 +2908,11 @@ function setPage(p){
   for(var i=0;i<tabs.length;i++) tabs[i].classList.toggle("active", tabs[i].dataset.ptab===p);
   document.getElementById("page-main").hidden = p!=="main";
   document.getElementById("page-train").hidden = p!=="train";
+  document.getElementById("page-laneb").hidden = p!=="laneb";
+  document.getElementById("page-lanec").hidden = p!=="lanec";
   if(p==="train") loadBench();
+  if(p==="laneb") renderLaneB();
+  if(p==="lanec") renderLaneC();
 }
 (function(){
   var tabs=document.querySelectorAll(".page-tabs .btn");
@@ -2319,12 +2927,11 @@ function setPage(p){
 // actually TRAINED: under warm-start the king's checkpoint is re-trained from
 // the promoted init every round, so its curve is the lineage's training
 // trajectory, and every other entry is a checkpoint the network trained and
-// (mostly) discarded. The from-scratch shadow (DEC-CA-0014, benchmarks/scratch/
-// index.json) rides the same charts as a control. Reports are immutable once
+// (mostly) discarded. Reports are immutable once
 // published: fetched once per session, cache-friendly (no bust); a miss is
 // permanent except among the newest few rounds, where a late report is expected.
 var BENCH_SCAN_MAX=120, BENCH_RETRY_NEWEST=6;
-var _bench={}, _benchMissing={}, _benchInflight={}, _scratchIdx=null;
+var _bench={}, _benchMissing={}, _benchInflight={};
 // training/round-<id>.json: the trainer's unsigned per-leg telemetry (steps,
 // budget count, channel tokens, wall stop) published right after the manifest
 // (cascade.shared.training_summary). Same immutable-fetch discipline as the
@@ -2334,28 +2941,27 @@ var _train={}, _trainMissing={}, _trainInflight={};
 // the latest generation in force at its block, and a generation's members
 // (checkpoint id + source round) are the links the lineage walk follows.
 var _gens={}, _gensInflight={}, _gensLatest=0;
-// benchmarks/reference-toto2-<rung>.json: the OFFICIAL Toto2 checkpoint of a
-// ladder size, run through the identical battery (scripts/publish_reference_bench.py)
-// — drawn as the dashed reference line on every chart. Probed per size seen
-// on a king entry; a missing doc simply means that size has no reference yet.
+// A fixed Timestral-209M reference, scored by the same benchmark sidecar.
+// A missing report leaves the reference pending; never reuse a Toto2 score.
 var _refBench={}, _refMissing={}, _refInflight={};
-function rungKey(tag){ var m=String(tag||"").toLowerCase().match(/(\d+(?:\.\d+)?)\s*([mb])\b/); return m?(m[1]+m[2]):""; }
-function loadReference(rung){
-  if(!rung||_refBench[rung]||_refInflight[rung]||_refMissing[rung]) return;
-  _refInflight[rung]=true;
-  fetchJSON("benchmarks/reference-toto2-"+rung+".json",{bust:false})
-    .then(function(d){ delete _refInflight[rung]; _refBench[rung]=d; renderTrain(); })
-    .catch(function(){ delete _refInflight[rung]; _refMissing[rung]=true; });
+var REFERENCE_PRESET="timestral-209m", REFERENCE_LABEL="Timestral-209M";
+function loadReference(){
+  var key=REFERENCE_PRESET;
+  if(_refBench[key]||_refInflight[key]) return;
+  if(_refMissing[key]&&Date.now()-_refMissing[key]<POLL_MS) return;
+  _refInflight[key]=true;
+  fetchJSON("benchmarks/reference-timestral-209m.json")
+    .then(function(d){
+      if(d.preset!==REFERENCE_PRESET||!/^mistralai\/Timestral-209M@[0-9a-f]{40}$/.test(String(d.source||""))||!readSix(d)) throw new Error("invalid reference");
+      delete _refInflight[key]; delete _refMissing[key]; _refBench[key]=d; renderTrain();
+    })
+    .catch(function(){ delete _refInflight[key]; _refMissing[key]=Date.now(); });
 }
-// The reference for the latest king checkpoint's size: {six, geo, rung} or null.
 function trainReference(rows){
-  var rung=""; rows.forEach(function(row){ if(row.king&&row.king.size) rung=rungKey(row.king.size)||rung; });
-  if(!rung){ var rs=_index&&_index.rounds||[]; for(var i=rs.length-1;i>=0&&!rung;i--){ (rs[i].sizes||[]).forEach(function(z){ rung=rung||rungKey(z); }); } }
-  if(!rung) return null;
-  loadReference(rung);
-  var d=_refBench[rung]; if(!d) return null;
+  loadReference();
+  var d=_refBench[REFERENCE_PRESET]; if(!d) return null;
   var six=readSix(d); if(!six) return null;
-  return {six:six, geo:sixGeomean(six), rung:rung, label:"Toto2 "+rung};
+  return {six:six, geo:sixGeomean(six), label:REFERENCE_LABEL};
 }
 function loadGenerations(){
   fetchJSON("promotions/index.json").then(function(d){
@@ -2377,15 +2983,9 @@ function loadGenerations(){
 // rolling grid, else the block the reign clock fired at.
 function genStartBlock(G){ var cn=chainNow(); return (G.effective_era&&cn&&cn.eraBlocks)?G.effective_era*cn.eraBlocks:G.fired_block; }
 function genOfBlock(b){ var best=0; Object.keys(_gens).forEach(function(k){ var G=_gens[k]; if(genStartBlock(G)<=b&&G.gen>best) best=G.gen; }); return best; }
-var _trainScope="king", _trainView="values";
-// The seven series of the big plot, in fixed palette order (slot = colour):
-// the six public-benchmark numbers and the six-suite geomean.
-var SERIES=[{key:"gifteval_crps",label:"GIFT-Eval CRPS",slot:1},{key:"gifteval_mase",label:"GIFT-Eval MASE",slot:2},
-            {key:"boom_crps",label:"BOOM CRPS",slot:3},{key:"boom_mase",label:"BOOM MASE",slot:4},
-            {key:"time_crps",label:"TIME CRPS",slot:5},{key:"time_mase",label:"TIME MASE",slot:6},
-            {key:"geomean",label:"Geomean",slot:7}];
-var _trainSel={gifteval_crps:1, boom_crps:1, time_crps:1};
-function metricVal(six,key){ return key==="geomean"?sixGeomean(six):six[key]; }
+var _trainScope="king";
+var _paretoBenchmark="gifteval", _paretoAxes="size-mase", _paretoHistory=true;
+var _paretoCatalog=null, _paretoLoading=false, _paretoFetched=0, _paretoPoints=[];
 // The x axis is CUMULATIVE TRAINING, not the round ordinal: every round's king
 // leg is one more slice of optimiser steps on the same lineage, so a round is
 // plotted at round-number × steps-per-leg. The leg budget is not carried in the
@@ -2396,18 +2996,16 @@ function metricVal(six,key){ return key==="geomean"?sixGeomean(six):six[key]; }
 // holds for every channel mix). Contracted spend: a leg the wall stopped early
 // (deadline_hit) trained fewer steps than plotted.
 var TRAIN_BUDGET = { train_h: 3.0, ref_tps: 3700000, batch: 64, ctx: 4096 };
-// The official Toto2 pretraining run the lineage is measured against (Toto 2.0
-// release): 400k optimiser steps × 64 batch × 32 channels × 4096 context.
-var TOTO2_PRETRAIN = { steps: 400000, batch: 64, channels: 32, ctx: 4096 };
-function toto2Tokens(){ return TOTO2_PRETRAIN.steps*TOTO2_PRETRAIN.batch*TOTO2_PRETRAIN.channels*TOTO2_PRETRAIN.ctx; }
 function tokensPerLeg(){ return TRAIN_BUDGET.train_h*3600*TRAIN_BUDGET.ref_tps; }
 function stepsPerLeg(){ return Math.round(tokensPerLeg()/(TRAIN_BUDGET.batch*TRAIN_BUDGET.ctx)); }
 function fmtSteps(v){ if(v==null||!isFinite(v)) return "--"; if(v>=1e6) return (v/1e6).toFixed(v>=1e7?0:1)+"M steps"; if(v>=1e3) return Math.round(v/1e3)+"k steps"; return Math.round(v)+" steps"; }
 function fmtTokens(v){ if(v==null||!isFinite(v)) return "--"; if(v>=1e12) return (v/1e12).toFixed(2)+"T tokens"; if(v>=1e9) return Math.round(v/1e9)+"B tokens"; if(v>=1e6) return (v/1e6).toFixed(1)+"M tokens"; if(v>=1e3) return Math.round(v/1e3)+"k tokens"; return Math.round(v)+" tokens"; }
 var SIX_KEYS=["gifteval_crps","gifteval_mase","boom_crps","boom_mase","time_crps","time_mase"];
-var SUITES=[{key:"gifteval",label:"GIFT-Eval"},{key:"boom",label:"BOOM"},{key:"time",label:"TIME"}];
+var FEV_KEYS=["fev_crps","fev_mase"];
+var SCORE_KEYS=SIX_KEYS.concat(FEV_KEYS);
+var SUITES=[{key:"gifteval",label:"GIFT-Eval"},{key:"boom",label:"BOOM"},{key:"time",label:"TIME"},{key:"fev",label:"FEV"}];
 // The six numbers follow BenchScores' key convention; the nesting on a report
-// entry / scratch row is read tolerantly (flat, .scores, or .bench_scores).
+// entry is read tolerantly (flat, .scores, or .bench_scores).
 function readSix(o){
   if(!o) return null;
   var src=(typeof o.gifteval_mase==="number")?o
@@ -2416,6 +3014,7 @@ function readSix(o){
   if(!src) return null;
   var out={};
   for(var i=0;i<SIX_KEYS.length;i++){ var v=src[SIX_KEYS[i]]; if(typeof v!=="number"||!isFinite(v)) return null; out[SIX_KEYS[i]]=v; }
+  FEV_KEYS.forEach(function(k){ var v=src[k]; out[k]=(typeof v==="number"&&isFinite(v)&&v>=0)?v:null; });
   return out;
 }
 // cascade_score: the geometric mean of all six (lower is better) — the number
@@ -2424,22 +3023,25 @@ function sixGeomean(s){ var sum=0; for(var i=0;i<SIX_KEYS.length;i++){ if(!(s[SI
 function benchRounds(){
   // every round in the index (a validator-rejected round still benches — the
   // report follows the manifest, not the verdict), oldest first
-  var all=(_index&&_index.rounds||[]).slice().sort(function(a,b){ return (a.epoch_start_block||0)-(b.epoch_start_block||0); });
-  // pinned best-bench rounds (cascade.shared.hippius.note_best_bench) always load,
-  // so the "Best checkpoint so far" row matches the stakeholder page's card
-  return _pinnedOld.concat(all.slice(0,-BENCH_SCAN_MAX).filter(function(r){ return r.pinned==="best_bench"; })).concat(all.slice(-BENCH_SCAN_MAX));
+  return (_index&&_index.rounds||[]).slice().sort(function(a,b){ return (a.epoch_start_block||0)-(b.epoch_start_block||0); }).slice(-BENCH_SCAN_MAX);
 }
-// Pinned best-bench rows older than the rolling window: bench scan only, never
-// the window logic (reigns, timelines, counts). Same rule as stakeholders.html.
-var _pinnedOld=[];
-function splitPinned(d){
-  _pinnedOld=[];
-  if(!d||!Array.isArray(d.rounds)) return d;
-  var floor=null;
-  d.rounds.forEach(function(r){ if(r.pinned==="best_bench") return; var b=Number(r.epoch_start_block||0); if(floor===null||b<floor) floor=b; });
-  var keep=[];
-  d.rounds.forEach(function(r){ if(r.pinned==="best_bench"&&floor!==null&&Number(r.epoch_start_block||0)<floor) _pinnedOld.push(r); else keep.push(r); });
-  var out={}; for(var k in d) out[k]=d[k]; out.rounds=keep; return out;
+// DEC-CA-0063: from [v2] bench_source_from_block the lane-A bench numbers of
+// winners / the king live in the MAIN validator's report (bench_v/…); the
+// trainer's report then carries only the init. Merge both (by pointer).
+function fetchBenchRound(id){
+  var a=fetchJSON("benchmarks/round-"+id+".json",{bust:false}).catch(function(){ return null; });
+  var b=fetchJSON("bench_v/round-"+id+".json",{bust:false}).catch(function(){ return null; });
+  return Promise.all([a,b]).then(function(x){
+    if(!x[0]&&!x[1]) throw new Error("no bench report");
+    if(!x[1]) return x[0];
+    if(!x[0]) return x[1];
+    var seen={}, out=[];
+    (x[1].entries||[]).concat(x[0].entries||[]).forEach(function(e){
+      var k=String(e.trained_pointer||"")+"|"+String(e.role||"");
+      if(seen[k]) return; seen[k]=1; out.push(e);
+    });
+    var m={}; for(var k in x[0]) m[k]=x[0][k]; m.entries=out; return m;
+  });
 }
 function loadBench(){
   var rs=benchRounds(); if(!rs.length){ renderTrain(); return; }
@@ -2449,7 +3051,7 @@ function loadBench(){
     if(_bench[id]||_benchInflight[id]) return;
     if(_benchMissing[id]&&!newest[id]) return;
     _benchInflight[id]=true;
-    fetchJSON("benchmarks/round-"+id+".json",{bust:false})
+    fetchBenchRound(id)
       .then(function(d){ delete _benchInflight[id]; delete _benchMissing[id]; _bench[id]=d; renderTrain(); })
       .catch(function(){ delete _benchInflight[id]; _benchMissing[id]=true; renderTrain(); });
   });
@@ -2462,14 +3064,12 @@ function loadBench(){
       .then(function(d){ delete _trainInflight[id]; delete _trainMissing[id]; _train[id]=d; renderTrain(); })
       .catch(function(){ delete _trainInflight[id]; _trainMissing[id]=true; renderTrain(); });
   });
-  // the scratch-shadow roll-up grows a row every M rounds — small, refetch per visit
-  fetchJSON("benchmarks/scratch/index.json").then(function(d){ _scratchIdx=d; renderTrain(); }).catch(function(){});
   loadGenerations();
   renderTrain();
 }
 function trainRoundLabel(r){ var rn=roundNoOf(r.round_id); return rn?"r"+rn:shortRoundId(r.round_id); }
 // One row per round that has any bench data, oldest first: the report's
-// entries (king + challengers) and the scratch-control row when one exists.
+// entries (king + challengers).
 // The price of one leg: measured from its training-summary row when the doc
 // carries it, else the contracted budget. `tokens` are channel tokens (every
 // value entry: steps × batch × C × context); a row from a worker image that
@@ -2501,22 +3101,23 @@ function legIndex(){
 // init …, measured where the training summaries carry the numbers,
 // contracted for the rest.
 function trainRows(){
-  var scratchBy={};
-  ((_scratchIdx&&_scratchIdx.rounds)||[]).forEach(function(x){ var six=readSix(x.scratch_scores); if(six) scratchBy[String(x.round_id)]={six:six,geo:sixGeomean(six),ckpt:x.warm_start_ckpt||"",gen:x.generation}; });
   var byPtr=legIndex(), out=[], pending=0, missing=0;
   benchRounds().forEach(function(r){
     var id=String(r.round_id||""), rep=_bench[id], entries=[];
     if(_benchInflight[id]) pending++;
-    else if(!rep&&!scratchBy[id]) missing++;
+    else if(!rep) missing++;
     ((rep&&(rep.entries||rep.checkpoints))||[]).forEach(function(e){
       var six=readSix(e); if(!six) return;
       var role=String(e.role||"challenger"), hk=String(e.miner_hotkey||e.hotkey||"");
+      if(role==="init") return;
+      var measured=byPtr[String(e.trained_pointer||"")], ml=measured&&measured.leg||{};
       entries.push({role:role, hotkey:hk, uid:(e.miner_uid!=null?e.miner_uid:e.uid), size:String(e.size||""),
+                    params:e.param_count||ml.param_count||null, activeParams:e.active_param_count||ml.active_param_count||null,
+                    revisions:e.data_revisions||null,
                     pointer:String(e.trained_pointer||""), six:six, geo:sixGeomean(six),
                     crowned:!!(r.dethroned&&role==="challenger"&&hk&&hk===r.chal_hotkey)});
     });
     var king=null; entries.forEach(function(e){ if(e.role==="king"&&!king) king=e; });
-    var sc=scratchBy[id]||null;
     var doc=_train[id], kl=null;
     ((doc&&doc.legs)||[]).forEach(function(l){ if(l.role==="king"&&!kl) kl=l; });
     var gen=genOfBlock(Number(r.epoch_start_block)||0), depth=gen+1;
@@ -2531,8 +3132,8 @@ function trainRows(){
     var lin={steps:0,tokens:0,points:0,measured:0,exact:0,deadline:0,legs:depth,resolved:chain.length};
     chain.forEach(function(c){ lin.steps+=c.steps; lin.tokens+=c.tokens; lin.points+=c.points; if(c.measured) lin.measured++; if(c.exact) lin.exact++; if(c.deadline) lin.deadline++; });
     for(var k=chain.length; k<depth; k++){ lin.steps+=stepsPerLeg(); lin.tokens+=tokensPerLeg(); lin.points+=tokensPerLeg(); }
-    if(entries.length||sc) out.push({r:r, id:id, label:trainRoundLabel(r), gen:gen, depth:depth, leg:price, lineage:lin,
-                                     steps:lin.steps, tokens:lin.tokens, entries:entries, king:king, scratch:sc});
+    if(entries.length) out.push({r:r, id:id, label:trainRoundLabel(r), gen:gen, depth:depth, leg:price, lineage:lin,
+                                     steps:lin.steps, tokens:lin.tokens, entries:entries, king:king});
   });
   // One column per generation: every round of a generation trained the same
   // depth, so they share an x — the generation's mean lineage steps/tokens
@@ -2543,135 +3144,248 @@ function trainRows(){
   out.forEach(function(x){ var g=byGen[x.gen]; x.steps=g.steps/g.n; x.tokens=g.tokens/g.n; });
   return {rows:out, pending:pending, missing:missing};
 }
-// One series of the big plot: every king checkpoint, the BEST king per
-// generation (the line), challengers + scratch controls when shown, and the
-// official Toto2 reference; values as scored, or relative (%) to the first
-// generation's best king when the view is "relative".
-function trainSeries(rows, key){
-  var king=[], chal=[], scratch=[], bestByX={};
-  rows.forEach(function(row,i){
-    row.entries.forEach(function(e){
-      var v=metricVal(e.six,key); if(v==null||!isFinite(v)) return;
-      var pt={i:i,v:v,e:e,row:row};
-      if(e.role==="king"){ king.push(pt); var b=bestByX[row.steps]; if(!b||v<b.v) bestByX[row.steps]=pt; }
-      else chal.push(pt);
-    });
-    if(row.scratch){ var sv=metricVal(row.scratch.six,key); if(sv!=null&&isFinite(sv)) scratch.push({i:i,v:sv,row:row,e:{role:"scratch",hotkey:"",size:""}}); }
-  });
-  var best=Object.keys(bestByX).map(Number).sort(function(a,b){ return a-b; }).map(function(x){ return bestByX[x]; });
-  var ref=trainReference(rows), rv=ref?metricVal(ref.six,key):null;
-  var S={key:key, king:king, best:best, chal:_trainScope==="all"?chal:[], scratch:_trainScope==="all"?scratch:[],
-         ref:(rv!=null&&isFinite(rv))?{v:rv,label:ref.label}:null, base:null};
-  if(_trainView==="relative"&&best.length&&best[0].v>0){
-    var base=best[0].v; S.base=base;
-    function rel(p){ return {i:p.i, v:(p.v/base-1)*100, raw:p.v, e:p.e, row:p.row}; }
-    S.king=S.king.map(rel); S.best=S.best.map(rel); S.chal=S.chal.map(rel); S.scratch=S.scratch.map(rel);
-    if(S.ref) S.ref={v:(S.ref.v/base-1)*100, raw:S.ref.v, label:S.ref.label};
+// ── model Pareto frontier ────────────────────────────────────────────────
+function loadParetoCatalog(){
+  if(_paretoLoading||(_paretoFetched&&Date.now()-_paretoFetched<POLL_MS)) return;
+  _paretoLoading=true;
+  function validate(doc){
+    if(!doc||doc.schema!==1||!Array.isArray(doc.models)) throw Error("invalid model catalog");
+    return doc;
   }
-  return S;
+  fetchJSON("benchmarks/model-frontier.json").then(validate).catch(function(){
+    // This is a packaged asset, not a bucket object. A bucket 404 must not
+    // prevent a static host from serving its own checked-in fallback.
+    return fetch("data/benchmark-models.json",{cache:"no-cache"}).then(function(response){
+      if(!response.ok) throw Error("model catalog unavailable");
+      return response.json();
+    }).then(validate);
+  }).then(function(doc){
+    _paretoCatalog=doc;
+  }).catch(function(){}).then(function(){
+    _paretoLoading=false; _paretoFetched=Date.now(); renderTrain();
+  });
 }
-function seriesOf(key){ for(var i=0;i<SERIES.length;i++) if(SERIES[i].key===key) return SERIES[i]; return null; }
-function selectedSeries(){ return SERIES.filter(function(x){ return _trainSel[x.key]; }); }
-function fmtVal(v){ return _trainView==="relative"?((v>0?"+":"")+v.toFixed(2)+"%"):fmt(v); }
-// The big plot: every selected series on ONE axis, lineage steps along x
-// (one column per generation), the palette slot as the series colour,
-// direct labels at each line's end, the reference dashed in the same hue.
-function trainChartSVG(rows, SS, W, H){
-  var narrow=W<640, FS=narrow?12:15, PAD_L=narrow?46:64, PAD_R=narrow?14:210, PAD_T=narrow?12:16, PAD_B=narrow?26:30, n=rows.length;
-  var all=[]; SS.forEach(function(S){ ["king","chal","scratch"].forEach(function(k){ S[k].forEach(function(p){ all.push(p.v); }); }); if(S.ref&&S.king.length) all.push(S.ref.v); });
-  if(!all.length) return '<text x="'+(W/2)+'" y="'+(H/2)+'" text-anchor="middle" fill="var(--muted)" font-size="13">'+(SS.length?'no bench numbers yet':'pick a benchmark above')+'</text>';
-  var min=Math.min.apply(null,all), max=Math.max.apply(null,all);
-  if(min===max){ min-=Math.abs(min)*0.05||0.5; max+=Math.abs(max)*0.05||0.5; }
-  var pad=(max-min)*0.1; min-=pad; max+=pad;
-  var xs=rows.map(function(r){ return r.steps; }), xmin=Math.min.apply(null,xs), xmax=Math.max.apply(null,xs);
-  if(xmin===xmax){ xmin-=stepsPerLeg()/2; xmax+=stepsPerLeg()/2; }
-  function X(i){ return PAD_L+(rows[i].steps-xmin)/(xmax-xmin)*(W-PAD_L-PAD_R); }
-  function Y(v){ return PAD_T+(1-(v-min)/(max-min))*(H-PAD_T-PAD_B); }
-  var out="", tickStep=(max-min)/4, tickDp=_trainView==="relative"?1:Math.min(6,Math.max(2,Math.ceil(-Math.log10(tickStep||1))));
-  for(var g=0;g<=4;g++){
-    var val=min+(max-min)*g/4, y=Y(val);
-    out+='<line x1="'+PAD_L+'" y1="'+y.toFixed(1)+'" x2="'+(W-PAD_R)+'" y2="'+y.toFixed(1)+'" stroke="currentColor" stroke-width="0.6" opacity="0.14"/>';
-    out+='<text x="'+(PAD_L-8)+'" y="'+(y+3).toFixed(1)+'" text-anchor="end" fill="var(--muted)" font-size="'+FS+'">'+(_trainView==="relative"?val.toFixed(tickDp)+"%":val.toFixed(tickDp))+'</text>';
+function validLoss(v){ return typeof v==="number"&&isFinite(v)&&v>=0; }
+function validSize(v){ return typeof v==="number"&&isFinite(v)&&v>0; }
+function parameterLabel(v){
+  if(!validSize(v)) return "size unavailable";
+  return v>=1e9?(v/1e9).toFixed(2).replace(/0+$/,"").replace(/\.$/,"")+"B":
+    (v/1e6).toFixed(2).replace(/0+$/,"").replace(/\.$/,"")+"M";
+}
+function checkpointSize(entry){
+  if(validSize(entry.params)) return {total:entry.params,active:entry.activeParams,source:"reported checkpoint"};
+  var preset=_paretoCatalog&&_paretoCatalog.cascade_presets&&_paretoCatalog.cascade_presets[entry.size];
+  return preset&&validSize(preset.parameters)?{total:preset.parameters,active:preset.active_parameters,source:"configured preset"}:
+    {total:null,active:null,source:"size unavailable"};
+}
+// One endpoint per reign, in settlement order. Never cherry-pick a king's
+// best public score or treat an unseated challenger as part of the lineage.
+function kingTrajectory(rows){
+  var history=[];
+  function add(entry,row){
+    if(!entry) return;
+    var point={entry:entry,row:row}, last=history[history.length-1];
+    if(last&&last.entry.hotkey===entry.hotkey&&last.entry.size===entry.size) history[history.length-1]=point;
+    else history.push(point);
   }
-  if(_trainView==="relative"&&min<0&&max>0){ var y0=Y(0); out+='<line x1="'+PAD_L+'" y1="'+y0.toFixed(1)+'" x2="'+(W-PAD_R)+'" y2="'+y0.toFixed(1)+'" stroke="currentColor" stroke-width="0.8" opacity="0.35"/>'; }
-  rows.forEach(function(row,i){
-    if(row.r.dethroned){ var x=X(i); out+='<line x1="'+x.toFixed(1)+'" y1="'+PAD_T+'" x2="'+x.toFixed(1)+'" y2="'+(H-PAD_B)+'" stroke="var(--chal)" stroke-width="1" stroke-dasharray="3 4" opacity="0.5"/>'; }
+  rows.forEach(function(row){
+    add(row.king,row);
+    row.entries.forEach(function(entry){ if(entry.crowned) add(entry,row); });
   });
-  var raw=(xmax-xmin)/4, mag=Math.pow(10,Math.floor(Math.log10(raw||1))), nice=[1,2,2.5,5,10].map(function(m){ return m*mag; }).filter(function(v){ return v>=raw; })[0]||mag;
-  for(var t=Math.ceil(xmin/nice)*nice; t<=xmax+1e-6; t+=nice){
-    var xt=PAD_L+(t-xmin)/(xmax-xmin)*(W-PAD_L-PAD_R);
-    out+='<text x="'+xt.toFixed(1)+'" y="'+(H-7)+'" text-anchor="'+(xt>W-PAD_R-40?"end":(xt<PAD_L+30?"start":"middle"))+'" fill="var(--muted)" font-size="'+FS+'">'+esc(fmtSteps(t).replace(" steps",""))+'</text>';
+  var newest=benchRounds().slice(-1)[0]||{}, expected=newest.post_round_king_hotkey||null;
+  var pointer=_v2&&_v2.king&&_v2.king.pointer;
+  var current=null;
+  if(pointer){
+    for(var i=history.length-1;i>=0;i--){
+      if(history[i].entry.pointer===pointer&&(!expected||history[i].entry.hotkey===expected)){ current=history[i]; break; }
+    }
+  } else if(history.length&&(!expected||history[history.length-1].entry.hotkey===expected)) current=history[history.length-1];
+  return {history:history,current:current,pending:!!history.length&&!current};
+}
+function modelPoints(rows){
+  var suite=_paretoBenchmark, refs=[], kings=[], info=kingTrajectory(rows);
+  ((_paretoCatalog&&_paretoCatalog.models)||[]).forEach(function(model){
+    var score=model.scores&&model.scores[suite]; if(!score) return;
+    refs.push({id:"ref:"+model.id,label:model.label,kind:"reference",parameters:model.parameters,
+      active:model.active_parameters,mase:score.mase,crps:score.crps,source:score.basis||model.basis||"published reference",
+      url:score.source&&/^https:\/\//.test(score.source)?score.source:model.score_source||model.url||"",
+      revisions:score.data_revisions||model.data_revisions||null});
+  });
+  // A same-pipeline official reference takes precedence over its published
+  // leaderboard reading, and can supply suites not present in that board.
+  var reference=_refBench[REFERENCE_PRESET], rs=reference&&readSix(reference);
+  if(rs&&validLoss(rs[suite+"_mase"])&&validLoss(rs[suite+"_crps"])){
+    var existing=refs.filter(function(p){ return p.id==="ref:"+REFERENCE_PRESET; })[0];
+    var metadata=((_paretoCatalog&&_paretoCatalog.models)||[]).filter(function(m){ return m.id===REFERENCE_PRESET; })[0];
+    if(existing) refs=refs.filter(function(p){ return p!==existing; });
+    refs.push({id:"ref:"+REFERENCE_PRESET,label:REFERENCE_LABEL,kind:"reference",
+      parameters:metadata?metadata.parameters:null,mase:rs[suite+"_mase"],crps:rs[suite+"_crps"],
+      source:"same-pipeline reference",url:"https://huggingface.co/mistralai/Timestral-209M",
+      revisions:reference.data_revisions||null});
   }
-  // end labels: stacked so two series ending close together never overlap
-  var labels=[];
-  SS.forEach(function(S){
-    var col="var(--s"+seriesOf(S.key).slot+")";
-    if(S.ref){ var ry=Y(S.ref.v); out+='<line x1="'+PAD_L+'" y1="'+ry.toFixed(1)+'" x2="'+(W-PAD_R)+'" y2="'+ry.toFixed(1)+'" stroke="'+col+'" stroke-width="1.3" stroke-dasharray="6 5" opacity="0.7"/>'; labels.push({y:ry,text:S.ref.label+" "+fmtVal(S.ref.v),col:col,dim:true}); }
-    S.scratch.forEach(function(p){ var cx=X(p.i), cy=Y(p.v); out+='<rect x="'+(cx-3.5).toFixed(1)+'" y="'+(cy-3.5).toFixed(1)+'" width="7" height="7" transform="rotate(45 '+cx.toFixed(1)+' '+cy.toFixed(1)+')" fill="'+col+'" opacity="0.7"/>'; });
-    S.chal.forEach(function(p){ var cx=X(p.i).toFixed(1), cy=Y(p.v).toFixed(1); out+='<circle cx="'+cx+'" cy="'+cy+'" r="4.2" fill="var(--surface)"/><circle cx="'+cx+'" cy="'+cy+'" r="3" fill="'+(p.e.crowned?col:'var(--surface)')+'" stroke="'+col+'" stroke-width="1.6"/>'; });
-    var bestKey={}; S.best.forEach(function(p){ bestKey[p.i+":"+p.e.pointer]=1; });
-    S.king.forEach(function(p){ if(bestKey[p.i+":"+p.e.pointer]) return; var cx=X(p.i).toFixed(1), cy=Y(p.v).toFixed(1); out+='<circle cx="'+cx+'" cy="'+cy+'" r="3.4" fill="var(--surface)"/><circle cx="'+cx+'" cy="'+cy+'" r="2.3" fill="'+col+'" opacity="0.4"/>'; });
-    if(S.best.length>1) out+='<polyline points="'+S.best.map(function(p){ return X(p.i).toFixed(1)+","+Y(p.v).toFixed(1); }).join(" ")+'" fill="none" stroke="'+col+'" stroke-width="2.2" stroke-linejoin="round"/>';
-    S.best.forEach(function(p){ var cx=X(p.i).toFixed(1), cy=Y(p.v).toFixed(1); out+='<circle cx="'+cx+'" cy="'+cy+'" r="4.4" fill="var(--surface)"/><circle cx="'+cx+'" cy="'+cy+'" r="3.1" fill="'+col+'"/>'; });
-    if(S.best.length){ var last=S.best[S.best.length-1]; labels.push({y:Y(last.v),text:seriesOf(S.key).label+" "+fmtVal(last.v),col:col,dim:false}); }
+  info.history.forEach(function(item,i){
+    var entry=item.entry, size=checkpointSize(entry), current=item===info.current;
+    if(!_paretoHistory&&!current) return;
+    kings.push({id:"king:"+(entry.pointer||item.row.id+":"+i),label:current?"Current king":"Prior king "+(i+1),
+      kind:current?"current":"king",parameters:size.total,active:size.active,sizeSource:size.source,
+      mase:entry.six[suite+"_mase"],crps:entry.six[suite+"_crps"],row:item.row,entry:entry,
+      source:item.row.label+" · "+entry.size,revisions:entry.revisions});
   });
-  labels.sort(function(a,b){ return a.y-b.y; });
-  var gap=narrow?14:18, prev=-1e9; labels.forEach(function(L){ var y=Math.max(L.y,prev+gap); y=Math.min(y,H-PAD_B-2); L.y=y; prev=y; });
-  // wide: labels in the right margin; narrow: inside the plot, right-aligned, on a surface pad
-  labels.forEach(function(L){
-    if(narrow) out+='<text x="'+(W-PAD_R-4)+'" y="'+(L.y+4).toFixed(1)+'" text-anchor="end" fill="'+L.col+'" font-size="'+(FS-1)+'" font-weight="'+(L.dim?'400':'700')+'" opacity="'+(L.dim?'0.8':'1')+'" stroke="var(--surface)" stroke-width="3" paint-order="stroke">'+esc(L.text)+'</text>';
-    else out+='<text x="'+(W-PAD_R+8)+'" y="'+(L.y+4).toFixed(1)+'" fill="'+L.col+'" font-size="'+FS+'" font-weight="'+(L.dim?'400':'700')+'" opacity="'+(L.dim?'0.75':'1')+'">'+esc(L.text)+'</text>';
+  var current=kings.filter(function(p){ return p.kind==="current"; })[0];
+  var revisionKey=suite==="gifteval"?"gift-eval":suite;
+  var revision=current&&current.revisions&&current.revisions[revisionKey];
+  refs.concat(kings).forEach(function(p){
+    var other=p.revisions&&p.revisions[revisionKey];
+    p.incompatible=!!(revision&&other&&JSON.stringify(revision)!==JSON.stringify(other));
   });
-  out+='<line class="xh" x1="0" y1="'+PAD_T+'" x2="0" y2="'+(H-PAD_B)+'" stroke="currentColor" stroke-width="0.8" opacity="0" />';
-  var cols=[]; rows.forEach(function(row,i){ if(!cols.length||cols[cols.length-1].steps!==row.steps) cols.push({steps:row.steps,i:i}); });
-  cols.forEach(function(c,k){
-    var x=X(c.i), x0=k>0?(x+X(cols[k-1].i))/2:0, x1=k<cols.length-1?(x+X(cols[k+1].i))/2:W;
-    out+='<rect class="col" data-i="'+c.i+'" x="'+x0.toFixed(1)+'" y="0" width="'+Math.max(0,x1-x0).toFixed(1)+'" height="'+H+'" fill="transparent" data-x="'+x.toFixed(1)+'"/>';
+  return {references:refs,kings:kings,current:info.current,pending:info.pending};
+}
+function paretoCoordinates(point){
+  if(point.incompatible) return null;
+  var size=_paretoAxes!=="mase-crps", x=size?point.parameters:point.mase;
+  var y=_paretoAxes==="size-mase"?point.mase:point.crps;
+  return (size?validSize(x):validLoss(x))&&validLoss(y)?{x:x,y:y}:null;
+}
+// Minimise both selected axes. Equal points tie; neither dominates the other.
+function paretoFrontier(points){
+  return points.filter(function(p){ return !points.some(function(q){
+    return q.x<=p.x&&q.y<=p.y&&(q.x<p.x||q.y<p.y);
+  }); }).sort(function(a,b){ return a.x-b.x||a.y-b.y; });
+}
+function paretoChartSVG(points,W,H){
+  var narrow=W<640, left=narrow?54:68, right=narrow?18:36, top=36, bottom=58;
+  if(!points.length) return '<text x="'+W/2+'" y="'+H/2+'" text-anchor="middle" fill="var(--muted)" font-size="13">'+
+    (_paretoLoading?'Loading model scores…':'No comparable points for this view yet')+'</text>';
+  var logSize=_paretoAxes!=="mase-crps", xs=points.map(function(p){ return logSize?Math.log10(p.x):p.x; });
+  var ys=points.map(function(p){ return p.y; }), xmin=Math.min.apply(null,xs), xmax=Math.max.apply(null,xs);
+  var ymin=Math.min.apply(null,ys), ymax=Math.max.apply(null,ys), xd=xmax-xmin||0.5, yd=ymax-ymin||Math.max(ymax*.2,.1);
+  xmin-=xd*.1; xmax+=xd*.14; ymin=Math.max(0,ymin-yd*.16); ymax+=yd*.22;
+  if(!logSize) xmin=Math.max(0,xmin);
+  function X(v){ return left+((logSize?Math.log10(v):v)-xmin)/(xmax-xmin)*(W-left-right); }
+  function Y(v){ return H-bottom-(v-ymin)/(ymax-ymin)*(H-top-bottom); }
+  var out='<defs><marker id="pareto-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="var(--brand-coral)"/></marker></defs>';
+  for(var tick=0;tick<=4;tick++){
+    var y=ymin+(ymax-ymin)*tick/4, yy=Y(y);
+    out+='<line x1="'+left+'" y1="'+yy+'" x2="'+(W-right)+'" y2="'+yy+'" stroke="var(--rule)" opacity=".5"/>'+
+      '<text x="'+(left-10)+'" y="'+(yy+4)+'" text-anchor="end" fill="var(--muted)" font-size="11">'+y.toFixed(3)+'</text>';
+  }
+  var xticks=[];
+  if(logSize){
+    for(var power=Math.floor(xmin);power<=Math.ceil(xmax);power++) [1,2,5].forEach(function(mult){
+      var value=mult*Math.pow(10,power), t=Math.log10(value); if(t>=xmin&&t<=xmax) xticks.push(value);
+    });
+    var stride=Math.max(1,Math.ceil(xticks.length/(narrow?4:7))); xticks=xticks.filter(function(v,i){ return i%stride===0; });
+  } else for(var j=0;j<=4;j++) xticks.push(xmin+(xmax-xmin)*j/4);
+  xticks.forEach(function(x){ var xx=X(x);
+    out+='<line x1="'+xx+'" y1="'+top+'" x2="'+xx+'" y2="'+(H-bottom)+'" stroke="var(--rule)" opacity=".3"/>'+
+      '<text x="'+xx+'" y="'+(H-bottom+22)+'" text-anchor="middle" fill="var(--muted)" font-size="11">'+(logSize?parameterLabel(x):x.toFixed(3))+'</text>';
+  });
+  out+='<text x="'+((left+W-right)/2)+'" y="'+(H-10)+'" text-anchor="middle" fill="var(--muted)" font-size="11">'+
+    (logSize?'Total parameters · log scale':'MASE')+' · lower is better</text>'+
+    '<text x="'+left+'" y="17" fill="var(--muted)" font-size="11">'+(_paretoAxes==="size-mase"?'MASE':'CRPS')+' ↓</text>';
+  var frontier=paretoFrontier(points.filter(function(p){ return p.kind==="reference"; }));
+  var ids={}; frontier.forEach(function(p){ ids[p.id]=true; });
+  if(frontier.length>1){
+    var path="M"+X(frontier[0].x)+","+Y(frontier[0].y);
+    frontier.slice(1).forEach(function(p){ path+="H"+X(p.x)+"V"+Y(p.y); });
+    out+='<path class="pareto-frontier" d="'+path+'" fill="none" stroke="var(--ink)" stroke-dasharray="5 5" stroke-width="1.5" opacity=".55"/>';
+  }
+  var history=points.filter(function(p){ return p.kind!=="reference"; });
+  for(var h=1;h<history.length;h++){
+    var a=history[h-1], b=history[h];
+    // Do not bridge missing benchmark or size measurements in the trajectory.
+    if(b.order!==a.order+1) continue;
+    out+='<path class="king-trajectory" d="M'+X(a.x)+','+Y(a.y)+'L'+X(b.x)+','+Y(b.y)+'" stroke="var(--brand-coral)" fill="none" stroke-width="1.7" opacity=".65" marker-end="url(#pareto-arrow)"/>';
+  }
+  var labelBoxes=[];
+  points.forEach(function(p,i){
+    p.frontier=!!ids[p.id]; var x=X(p.x), y=Y(p.y), current=p.kind==="current";
+    var color=p.kind==="reference"?'var(--accent)':'var(--brand-coral)';
+    var radius=logSize?5:Math.max(4,Math.min(10,validSize(p.parameters)?4+Math.log10(p.parameters/1e6)*1.6:4));
+    var description=p.label+", "+parameterLabel(p.parameters)+", MASE "+fmt(p.mase,4)+", CRPS "+fmt(p.crps,4);
+    out+='<g class="pareto-point" data-point="'+i+'" tabindex="0" role="button" aria-label="'+esc(description)+'">'+
+      '<title>'+esc(description)+'</title><circle class="point-ring" cx="'+x+'" cy="'+y+'" r="14" fill="transparent"/>';
+    if(current) out+='<path d="M'+x+','+(y-9)+'L'+(x+9)+','+y+'L'+x+','+(y+9)+'L'+(x-9)+','+y+'Z" fill="var(--brand-coral)" stroke="var(--surface)" stroke-width="2"/>';
+    else out+='<circle cx="'+x+'" cy="'+y+'" r="'+radius+'" fill="'+(p.kind==="king"?'var(--surface)':color)+'" stroke="'+color+'" stroke-width="'+(p.frontier?2.5:1.5)+'" opacity="'+(p.kind==="reference"&&!p.frontier?0.65:1)+'"/>';
+    if(current||p.frontier&&!narrow){
+      var anchor=x>W-160?'end':'start', dx=anchor==='end'?-12:12, ly=Math.max(top+10,current?y-14:y-10);
+      var labelWidth=p.label.length*7, labelLeft=anchor==='end'?x+dx-labelWidth:x+dx;
+      for(var attempt=0;attempt<12;attempt++){
+        var collision=labelBoxes.some(function(b){ return Math.abs(b.y-ly)<17&&labelLeft<b.right+8&&labelLeft+labelWidth>b.left-8; });
+        if(!collision) break;
+        ly-=18; if(ly<top+10){ ly=y+24+attempt*18; }
+      }
+      labelBoxes.push({left:labelLeft,right:labelLeft+labelWidth,y:ly});
+      out+='<text x="'+(x+dx)+'" y="'+ly+'" text-anchor="'+anchor+'" fill="'+(current?'var(--brand-coral)':'var(--ink)')+'" font-size="12" font-weight="'+(current?'700':'400')+'" stroke="var(--surface)" stroke-width="4" paint-order="stroke">'+esc(p.label)+'</text>';
+    }
+    out+='</g>';
   });
   return out;
 }
-// The tooltip for one column (a generation): every selected series' best king
-// there, its round, and the reference, keyed by the series' line colour.
-function trainTipHTML(row, SS, i){
-  var x=row.steps, idxs={};
-  SS.forEach(function(S){ S.king.concat(S.chal,S.scratch).forEach(function(p){ if(p.row.steps===x) idxs[p.i]=1; }); });
-  var rowsHere=Object.keys(idxs).map(Number).sort(function(a,b){ return a-b; });
-  var lines=[];
-  SS.forEach(function(S){
-    var col="var(--s"+seriesOf(S.key).slot+")", best=null, nk=0, nc=0;
-    S.best.forEach(function(p){ if(p.row.steps===x) best=p; });
-    S.king.forEach(function(p){ if(p.row.steps===x) nk++; }); S.chal.forEach(function(p){ if(p.row.steps===x) nc++; });
-    var who=best?esc(best.row.label)+(best.e.uid!=null?' · uid '+esc(best.e.uid):''):'--';
-    lines.push('<div class="r"><span><i class="k" style="background:'+col+'"></i><b>'+(best?fmtVal(best.v):'--')+'</b></span><span class="who">'+esc(seriesOf(S.key).label)+' · '+who+(nc?' · '+nc+' chal':'')+'</span></div>');
-    if(S.ref) lines.push('<div class="r"><span><i class="k" style="height:0;border-top:2px dashed '+col+'"></i><b>'+fmtVal(S.ref.v)+'</b></span><span class="who">'+esc(S.ref.label)+' · official</span></div>');
-  });
-  var first=rows[rowsHere[0]]||row, last=rows[rowsHere[rowsHere.length-1]]||row;
-  var span=rowsHere.length>1?esc(first.label)+' – '+esc(last.label)+' · '+rowsHere.length+' rounds':esc(row.label);
-  return '<div class="h">Generation '+row.gen+' <span class="muted">· '+span+'</span></div>'+
-    '<div class="muted" style="margin-bottom:4px">'+esc(fmtSteps(row.steps))+' · '+esc(fmtTokens(row.tokens))+' · '+row.depth+' leg'+(row.depth===1?'':'s')+' deep'+(_trainView==="relative"?' · vs first generation':'')+'</div>'+lines.join("");
+function paretoTipHTML(point){
+  var size=parameterLabel(point.parameters)+(validSize(point.active)&&point.active!==point.parameters?' · '+parameterLabel(point.active)+' active':'');
+  return '<div class="h">'+esc(point.label)+'</div><div>'+esc(size)+'</div>'+
+    '<div class="r"><span>MASE</span><b>'+fmt(point.mase,4)+'</b></div><div class="r"><span>CRPS</span><b>'+fmt(point.crps,4)+'</b></div>'+
+    '<div class="muted">'+esc(point.source)+(point.sizeSource?' · '+esc(point.sizeSource):'')+'</div>'+
+    (point.row?'<div class="muted">'+esc(fmtTokens(point.row.tokens))+' · '+esc(fmtSteps(point.row.steps))+'</div>':'');
 }
-function wireTrainChart(wrap, rows, SS){
-  var svg=wrap.querySelector("svg"), tip=wrap.querySelector(".train-tip"), xh=svg.querySelector(".xh");
-  if(!svg||!tip) return;
-  function hide(){ tip.hidden=true; if(xh) xh.setAttribute("opacity","0"); }
-  svg.addEventListener("mouseleave", hide);
-  var cols=svg.querySelectorAll("rect.col");
-  for(var c=0;c<cols.length;c++){
-    cols[c].addEventListener("mousemove", function(ev){
-      var i=Number(this.dataset.i), x=this.dataset.x;
-      if(xh){ xh.setAttribute("x1",x); xh.setAttribute("x2",x); xh.setAttribute("opacity","0.35"); }
-      tip.innerHTML=trainTipHTML(rows[i],SS,i); tip.hidden=false;
-      var b=wrap.getBoundingClientRect(), px=ev.clientX-b.left, py=ev.clientY-b.top;
-      var tw=tip.offsetWidth||160, left=px+14; if(left+tw>b.width) left=Math.max(0,px-14-tw);
-      if(rows.length&&tip.querySelector(".r")===null) tip.hidden=true;
-      tip.style.left=left+"px"; tip.style.top=Math.max(0,py-10)+"px";
+function wireParetoChart(wrap,points){
+  var svg=wrap.querySelector("svg"), tip=wrap.querySelector(".train-tip"), detail=document.getElementById("pareto-detail");
+  tip.hidden=true;
+  function hide(){ tip.hidden=true; }
+  svg.onpointerleave=hide;
+  var nodes=svg.querySelectorAll(".pareto-point");
+  for(var i=0;i<nodes.length;i++) (function(node){
+    var point=points[Number(node.dataset.point)];
+    function show(){
+      tip.innerHTML=paretoTipHTML(point); tip.hidden=false;
+      var box=wrap.getBoundingClientRect(), bound=node.getBoundingClientRect(), width=tip.offsetWidth||220;
+      tip.style.left=Math.max(0,Math.min(box.width-width,bound.left-box.left+16))+"px";
+      tip.style.top=Math.max(0,Math.min(box.height-(tip.offsetHeight||100),bound.top-box.top-30))+"px";
+    }
+    function select(){ detail.innerHTML=paretoTipHTML(point); detail.hidden=false; }
+    node.addEventListener("pointerenter",show); node.addEventListener("focus",show); node.addEventListener("blur",hide);
+    node.addEventListener("click",select);
+    node.addEventListener("keydown",function(event){
+      if(event.key==="Enter"||event.key===" "){ event.preventDefault(); select(); }
+      if(event.key==="Escape"){ hide(); detail.hidden=true; }
     });
-  }
+  })(nodes[i]);
 }
+function renderPareto(rows){
+  loadParetoCatalog(); loadReference();
+  var data=modelPoints(rows), all=data.references.concat(data.kings), points=[];
+  all.forEach(function(point,i){ var xy=paretoCoordinates(point); if(!xy) return;
+    point.x=xy.x; point.y=xy.y; point.order=i; points.push(point);
+  });
+  _paretoPoints=points;
+  var wrap=document.getElementById("train-charts").querySelector(".train-chart"), box=wrap.querySelector(".chart-wrap");
+  var svg=document.getElementById("train-svg"), W=Math.max(300,Math.round(box.clientWidth||1000)), H=Math.max(250,Math.round(box.clientHeight||W*.45));
+  svg.setAttribute("viewBox","0 0 "+W+" "+H); svg.setAttribute("preserveAspectRatio","none");
+  svg.innerHTML=paretoChartSVG(points,W,H); wireParetoChart(wrap,points);
+  var refs=points.filter(function(p){ return p.kind==="reference"; }), front=paretoFrontier(refs);
+  var skipped=all.length-points.length, kings=points.length-refs.length;
+  document.getElementById("pareto-status").textContent=refs.length+" models · "+front.length+" on frontier · "+kings+" king"+(kings===1?'':'s')+
+    (skipped?' · '+skipped+' missing size/score or different data revision':'')+(data.pending?' · current checkpoint pending':'');
+  var note=_paretoCatalog&&_paretoCatalog.benchmarks&&_paretoCatalog.benchmarks[_paretoBenchmark];
+  var pipeline=refs.some(function(p){ return p.source==="same-pipeline reference"; });
+  document.getElementById("train-ref-status").textContent=note?(pipeline?'Published + same-pipeline references':'Published reference')+' · '+(note.n_configs||'')+' configurations':
+    pipeline?'Same-pipeline model reference':'Reference models pending for this benchmark';
+  document.getElementById("pareto-help").innerHTML=infoTip("Pareto frontier",
+    "A reference model is on the frontier when no other plotted reference is both smaller/better on one axis and at least as good on the other. Both axes favour lower values. Size means total checkpoint parameters, not active MoE parameters. In MASE × CRPS, dot size indicates total parameters. "+
+    (note&&note.note||"Only measured scores for this benchmark are shown; missing results are never substituted.")+" Known data-revision mismatches with the current king are excluded. Older records without revision metadata remain historical comparisons. King points use the last scored checkpoint per reign; arrows follow settlement order, not the best benchmark score. Dashed segments mark the reference frontier, not measured intermediate models.");
+  document.getElementById("pareto-rows").innerHTML=points.slice().sort(function(a,b){
+    return (a.kind==="current"?-1:b.kind==="current"?1:0)||a.x-b.x;
+  }).map(function(p){
+    var label=esc(p.label); if(/^https:\/\//.test(p.url||"")) label='<a href="'+esc(p.url)+'" target="_blank" rel="noopener noreferrer">'+label+'</a>';
+    return '<tr><td>'+label+'</td><td class="num">'+esc(parameterLabel(p.parameters))+'</td><td class="num">'+fmt(p.mase,4)+'</td><td class="num">'+fmt(p.crps,4)+'</td><td>'+esc(p.kind==="current"?'Current king':p.kind==="king"?'Prior king':p.frontier?'Frontier':'Reference')+'</td></tr>';
+  }).join("")||'<tr><td colspan="5" class="empty">No measured model comparisons for this view</td></tr>';
+}
+
 function tile(k,v,sub,o){
   // label + number only; `sub` is kept out of the tile (the hover title carries the detail)
   o=o||{};
-  return '<div class="tile'+(o.hl?' hl':'')+'"'+(o.title?' data-help="'+esc(o.title)+'"':'')+'>'+'<div class="k">'+esc(k)+'</div>'+
+  return '<div class="tile'+(o.hl?' hl':'')+'"><div class="k">'+esc(k)+infoTip(k,o.title)+'</div>'+
     '<div class="v">'+v+'</div>'+(o.sub?'<div class="s">'+o.sub+'</div>':'')+(o.tag?'<span class="tag">'+esc(o.tag)+'</span>':'')+'</div>';
 }
 function renderTrainStats(rows, info){
@@ -2681,18 +3395,18 @@ function renderTrainStats(rows, info){
     el.innerHTML='<div class="empty">'+(info.pending?'Loading bench reports&hellip; ('+info.pending+' pending)':'No bench reports published yet')+'</div>';
     when.textContent=""; return;
   }
-  var lastK=null, best=null, nK=0, nC=0, nS=0, firstK=null;
-  rows.forEach(function(row){
-    row.entries.forEach(function(e){
-      if(e.role==="king"){ nK++; lastK={e:e,row:row}; if(!firstK) firstK={e:e,row:row}; } else nC++;
-      if(e.geo!=null&&(!best||e.geo<best.geo)) best={geo:e.geo,e:e,row:row};
-    });
-    if(row.scratch) nS++;
-  });
-  var tiles=[], lastRow=null;
-  rows.forEach(function(row){ if(row.king) lastRow=row; });
-  if(!lastRow) rows.forEach(function(row){ if(row.leg) lastRow=row; });
+  var endpoint=kingTrajectory(rows).current, lastK=endpoint?{e:endpoint.entry,row:endpoint.row}:null;
+  var tiles=[], lastRow=lastK&&lastK.row;
   var lin=lastRow&&lastRow.lineage, leg=lastRow&&lastRow.leg;
+  // A newly crowned challenger has its own measured leg, even though both
+  // contestants share the same warm-start ancestry for this settlement.
+  if(lin&&lastK.e!==lastRow.king){
+    var hit=legIndex()[lastK.e.pointer], own=legPrice(hit&&hit.leg), adjusted={};
+    for(var field in lin) adjusted[field]=lin[field];
+    ["steps","tokens","points"].forEach(function(field){ adjusted[field]+=own[field]-leg[field]; });
+    ["measured","exact","deadline"].forEach(function(field){ adjusted[field]+=Number(!!own[field])-Number(!!leg[field]); });
+    lin=adjusted;
+  }
   var batch=TRAIN_BUDGET.batch, ctx=TRAIN_BUDGET.ctx, ld=lastRow&&_train[lastRow.id], contract=(ld&&ld.contract)||{};
   if(contract.batch_size) batch=contract.batch_size; if(contract.context_length) ctx=contract.context_length;
   // ── row one: the training behind the current king's checkpoint ──
@@ -2708,107 +3422,41 @@ function renderTrainStats(rows, info){
       {title:"The unit the training contract bills in. A multi-channel series costs its length once, however many channels it has, so this equals tokens trained on single-channel data and is smaller than it when the data is multivariate."}));
     tiles.push(tile("Lineage legs",lin.legs,"",
       {title:"Training legs behind the current king's checkpoint: one per generation plus its own. "+(unres?unres+" could not be traced to a published training summary and are counted at the contract's budget. ":"")+(lin.deadline?lin.deadline+" hit the wall-clock limit and trained less than the budget.":"")}));
-    var effPct=lin.tokens/toto2Tokens()*100, effTxt=(effPct<10?effPct.toFixed(2):effPct.toFixed(1))+"%";
-    tiles.push(tile("Tokens vs Toto2",esc(fmtTokens(lin.tokens).replace(" tokens",""))+'<span class="u">/ '+esc(fmtTokens(toto2Tokens()).replace(" tokens",""))+'</span>',"",
-      {title:"Tokens trained by the king's lineage compared with the official Toto2 pretraining run, which used "+fmtTokens(toto2Tokens())+" ("+fmtSteps(TOTO2_PRETRAIN.steps)+" × "+TOTO2_PRETRAIN.batch+" batch × "+TOTO2_PRETRAIN.channels+" channels × "+TOTO2_PRETRAIN.ctx+" context). The lineage has used "+effTxt+" of Toto2's pretraining tokens."}));
   }
-  // ── rows two and three: six public-benchmark numbers for the current king's
-  // latest checkpoint, then for the best checkpoint so far. The king retrains
-  // every era on a different init member, so its "beats Toto2" tags can flip
-  // era to era; the best row only moves when something genuinely beats it.
-  // "Best" = lowest combined score (geomean of the six) across the loaded
-  // reports, king or challenger: the same rule as the stakeholder page's
-  // "Which checkpoint is the best so far?" card.
-  var ref=(lastK||best)?trainReference(rows):null;
-  function benchRow(s, src, who, extra){
-    function beat(key){ if(!ref) return ""; var rv=ref.six[key]; return (rv!=null&&s[key]<rv)?"beats Toto2":""; }
-    function beatTxt(key){ if(!ref) return ""; var rv=ref.six[key]; return rv==null?"":(s[key]<rv?" This beats the official Toto2 "+ref.rung+" checkpoint's "+fmt(rv,4)+" by "+((rv-s[key])/rv*100).toFixed(1)+"%.":" The official Toto2 "+ref.rung+" checkpoint scores "+fmt(rv,4)+"."); }
-    SUITES.forEach(function(su){
-      var kc=su.key+"_crps", km=su.key+"_mase";
-      tiles.push(tile(su.label+" CRPS",fmt(s[kc],4),"",
-        {tag:beat(kc),title:"How accurate "+who+" probabilistic forecasts are on the public "+su.label+" benchmark (CRPS, continuous ranked probability score). Lower is better. From "+src+"'s signed bench report."+beatTxt(kc)+(extra?extra(kc):"")}));
-      tiles.push(tile(su.label+" MASE",fmt(s[km],4),"",
-        {tag:beat(km),title:"How accurate "+who+" point forecasts are on the public "+su.label+" benchmark, relative to a simple seasonal-naive forecast (MASE, mean absolute scaled error): 1.0 matches the naive baseline, below 1.0 beats it. Lower is better. From "+src+"'s signed bench report."+beatTxt(km)+(extra?extra(km):"")}));
-    });
-  }
-  function whoOf(e){ return (e.role==="king"?"king":"challenger")+(e.uid!=null?" uid "+e.uid:""); }
+  var matrix="";
+  // One benchmark per column; metric rows share the same order in every suite.
   if(lastK){
-    tiles.push('<div class="row-h">Current king &mdash; latest era &middot; <b>'+esc(whoOf(lastK.e))+'</b> &middot; '+esc(lastK.row.label)+
-      (lastK.e.geo!=null?' &middot; combined '+fmt(lastK.e.geo,5):'')+'</div>');
-    benchRow(lastK.e.six, lastK.row.label, "the king's latest checkpoint's", null);
+    var s=lastK.e.six, ref=trainReference(rows);
+    function referenceValue(key){
+      if(!ref) return null;
+      var suite=key.split("_")[0], revisionKey=suite==="gifteval"?"gift-eval":suite;
+      var kr=lastK.e.revisions&&lastK.e.revisions[revisionKey];
+      var rr=_refBench[REFERENCE_PRESET].data_revisions, revision=rr&&rr[revisionKey];
+      return kr&&revision&&JSON.stringify(kr)!==JSON.stringify(revision)?null:ref.six[key];
+    }
+    function beat(key){ if(!ref||s[key]==null) return ""; var rv=referenceValue(key); return (rv!=null&&s[key]<rv)?"beats "+ref.label:""; }
+    function beatTxt(key){ if(!ref||s[key]==null) return ""; var rv=referenceValue(key); return rv==null?"":" "+ref.label+": "+fmt(rv,4)+"."; }
+    matrix='<div class="score-matrix"><table class="benchmark-matrix" aria-label="King benchmark scores"><thead><tr><th scope="col">Metric</th>'+
+      SUITES.map(function(su){ return '<th scope="col">'+esc(su.label)+'</th>'; }).join("")+'</tr></thead><tbody>'+
+      ["mase","crps"].map(function(metric){
+        var label=metric.toUpperCase(), help=metric==="mase"?"Point-forecast loss, scaled against a seasonal-naive forecast. Lower is better.":"Probabilistic forecast loss. Lower is better.";
+        return '<tr><th scope="row">'+label+infoTip(label,help)+'</th>'+SUITES.map(function(su){
+          var key=su.key+"_"+metric, tag=beat(key);
+          return '<td data-metric="'+key+'">'+fmt(s[key],4)+infoTip(su.label+" "+label,lastK.row.label+'.'+beatTxt(key))+
+            (tag?'<span class="tag">'+esc(tag)+'</span>':'')+'</td>';
+        }).join("")+'</tr>';
+      }).join("")+'</tbody></table></div>';
   }
-  if(best){
-    var kingSix=lastK?lastK.e.six:null, isKing=lastK&&best.e===lastK.e;
-    tiles.push('<div class="row-h">Best checkpoint so far &middot; <b>'+esc(whoOf(best.e))+'</b> &middot; '+esc(best.row.label)+
-      ' &middot; combined '+fmt(best.geo,5)+(isKing?' &middot; the current king':'')+'</div>');
-    benchRow(best.e.six, best.row.label, "the best checkpoint so far ("+whoOf(best.e)+", lowest combined score across the loaded reports)'s",
-      function(key){ if(!kingSix||isKing||!(kingSix[key]>0)||!(best.e.six[key]>0)) return "";
-        var d=(kingSix[key]/best.e.six[key]-1)*100;
-        return " Current king: "+fmt(kingSix[key],4)+" (king "+(d>=0?"+":"")+d.toFixed(1)+"% vs best)."; });
-  }
-  el.innerHTML=tiles.join("");
-  wireTileHelp(el);
+  el.innerHTML=matrix+(tiles.length?'<div class="lineage-heading">King lineage'+infoTip("King lineage","Training accumulated along the current king checkpoint's warm-start ancestry. Measured counts are used where available; unresolved legs use the contracted budget.")+'</div><div class="train-tiles lineage-grid">'+tiles.join("")+'</div>':'')+
+    (!lastK?'<div class="empty">Current king benchmark pending</div>':'');
   when.textContent=lastK&&lastK.row.r.published_at?"benched round settled "+timeAgo(lastK.row.r.published_at):"";
 }
-// The explanation box for a cell: hover the title to peek, click it to pin
-// the box open until its × (or Escape, or a click elsewhere) closes it.
-var _helpPinned=null;
-function wireTileHelp(el){
-  var box=el.querySelector(".tile-help");
-  if(!box){ box=document.createElement("div"); box.className="tile-help"; box.hidden=true; el.appendChild(box);
-    box.addEventListener("click", function(ev){ if(ev.target.classList.contains("x")) closeHelp(el); ev.stopPropagation(); });
-    document.addEventListener("click", function(ev){ if(!el.contains(ev.target)) closeHelp(el); });
-    document.addEventListener("keydown", function(ev){ if(ev.key==="Escape") closeHelp(el); });
-  }
-  function closeHelp(){ _helpPinned=null; box.hidden=true; var o=el.querySelector(".tile.open"); if(o) o.classList.remove("open"); }
-  function show(tile,pin){
-    var text=tile.dataset.help; if(!text) return;
-    box.innerHTML='<button class="x" title="Close">×</button><div class="h">'+esc(tile.querySelector(".k").textContent)+'</div>'+esc(text)+
-      (pin?'':'<span class="pin">click the title to keep this open</span>');
-    box.hidden=false;
-    var top=tile.offsetTop+tile.offsetHeight+6, left=tile.offsetLeft, maxLeft=el.clientWidth-box.offsetWidth;
-    box.style.top=top+"px"; box.style.left=Math.max(0,Math.min(left,maxLeft))+"px";
-    var o=el.querySelector(".tile.open"); if(o&&o!==tile) o.classList.remove("open");
-    if(pin) tile.classList.add("open");
-  }
-  var ks=el.querySelectorAll(".tile[data-help] .k");
-  for(var i=0;i<ks.length;i++){
-    ks[i].addEventListener("mouseenter", function(){ if(_helpPinned) return; show(this.parentNode,false); });
-    ks[i].addEventListener("mouseleave", function(){ if(_helpPinned) return; box.hidden=true; });
-    ks[i].addEventListener("click", function(ev){
-      ev.stopPropagation(); var t=this.parentNode;
-      if(_helpPinned===t.dataset.help){ closeHelp(); return; }
-      _helpPinned=t.dataset.help; show(t,true);
-    });
-  }
-  // keep a pinned box (re-rendered on every poll) where it was
-  if(_helpPinned){ for(var j=0;j<ks.length;j++){ var t=ks[j].parentNode; if(t.dataset.help===_helpPinned){ show(t,true); return; } } _helpPinned=null; }
-}
 function renderTrain(){
-  var grid=document.getElementById("train-charts"); if(!grid) return;
+  if(!document.getElementById("train-charts")) return;
   var info=trainRows(), rows=info.rows;
   renderTrainStats(rows, info);
-  renderTrainChips();
-  var SS=selectedSeries().map(function(x){ return trainSeries(rows,x.key); });
-  var wrap=grid.querySelector(".train-chart"), svg=document.getElementById("train-svg"), box=wrap.querySelector(".chart-wrap");
-  var W=Math.max(300,Math.round(box.clientWidth||1000)), H=Math.max(220,Math.round(box.clientHeight||W*0.45));
-  svg.setAttribute("viewBox","0 0 "+W+" "+H); svg.setAttribute("preserveAspectRatio","none");
-  svg.innerHTML=trainChartSVG(rows,SS,W,H);
-  wireTrainChart(wrap,rows,SS);
-  var anyScratch=rows.some(function(r){ return !!r.scratch; }), ref=trainReference(rows);
-  document.getElementById("train-legend-ref").hidden=!ref;
-  if(ref) document.getElementById("train-legend-ref-label").textContent="Official "+ref.label;
-  document.getElementById("train-legend-chal").hidden=_trainScope!=="all";
-  document.getElementById("train-legend-scratch").hidden=!(anyScratch&&_trainScope==="all");
+  renderPareto(rows);
   renderTrainTable(rows);
-}
-function renderTrainChips(){
-  var el=document.getElementById("train-chips"); if(!el||el.children.length) return;
-  el.innerHTML=SERIES.map(function(x){ return '<button class="chip'+(_trainSel[x.key]?' on':'')+'" data-tser="'+x.key+'" style="--sc:var(--s'+x.slot+')" title="Toggle '+esc(x.label)+'"><i></i>'+esc(x.label)+'</button>'; }).join("");
-  for(var i=0;i<el.children.length;i++) el.children[i].addEventListener("click", function(){
-    var k=this.dataset.tser; if(_trainSel[k]) delete _trainSel[k]; else _trainSel[k]=1;
-    this.classList.toggle("on", !!_trainSel[k]); renderTrain();
-  });
 }
 function renderTrainTable(rows){
   var tb=document.getElementById("train-rows"); if(!tb) return;
@@ -2821,35 +3469,43 @@ function renderTrainTable(rows){
       var pill=e.role==="king"?'<span class="role-pill king">&#9819; king</span>':'<span class="role-pill chal">challenger</span>'+(e.crowned?' <span class="crown" title="Took the throne this round">&#9819;</span>':'');
       out.push('<tr'+(e.crowned?' class="throne"':'')+'><td title="'+esc(row.id)+'">'+esc(row.label)+'</td><td>'+pill+'</td>'+
         '<td title="'+esc(e.hotkey)+'">'+(e.uid!=null?'uid '+esc(e.uid)+' · ':'')+esc(shortHk(e.hotkey))+'</td><td>'+esc(e.size||"--")+'</td>'+
-        SIX_KEYS.map(function(k){ return '<td class="num">'+fmt(e.six[k],4)+'</td>'; }).join("")+
+        SCORE_KEYS.map(function(k){ return '<td class="num">'+fmt(e.six[k],4)+'</td>'; }).join("")+
         '<td class="num"><b>'+fmt(e.geo)+'</b></td><td class="num'+(rel!=null&&rel<0?' good':'')+'">'+(rel==null?'<span class="muted">--</span>':signedPct(rel))+'</td></tr>');
     });
-    if(row.scratch&&_trainScope==="all"){
-      var sc=row.scratch, srel=(kg&&sc.geo!=null)?(sc.geo-kg)/kg*100:null;
-      out.push('<tr><td title="'+esc(row.id)+'">'+esc(row.label)+'</td><td><span class="role-pill scratch">scratch control</span></td>'+
-        '<td class="muted" title="'+esc(sc.ckpt)+'">random init'+(sc.gen!=null?' · vs gen '+esc(sc.gen):'')+'</td><td class="muted">--</td>'+
-        SIX_KEYS.map(function(k){ return '<td class="num">'+fmt(sc.six[k],4)+'</td>'; }).join("")+
-        '<td class="num"><b>'+fmt(sc.geo)+'</b></td><td class="num'+(srel!=null&&srel<0?' good':'')+'">'+(srel==null?'<span class="muted">--</span>':signedPct(srel))+'</td></tr>');
-    }
   });
-  tb.innerHTML=out.length?out.join(""):'<tr><td colspan="12" class="empty">'+(_index?'No bench reports loaded yet':'Waiting for round data')+'</td></tr>';
+  tb.innerHTML=out.length?out.join(""):'<tr><td colspan="14" class="empty">'+(_index?'No bench reports loaded yet':'Waiting for round data')+'</td></tr>';
   document.getElementById("train-table-when").textContent=out.length?out.length+" checkpoints · newest first":"";
 }
 (function(){
-  var ms=document.querySelectorAll("[data-tview]"), ss=document.querySelectorAll("[data-tscope]");
-  function bind(list, attr, set){ for(var i=0;i<list.length;i++) list[i].addEventListener("click", function(){ set(this.dataset[attr]); for(var j=0;j<list.length;j++) list[j].classList.toggle("active", list[j]===this); renderTrain(); }); }
-  bind(ms,"tview",function(v){ _trainView=v; });
-  var rt=null; window.addEventListener("resize", function(){ clearTimeout(rt); rt=setTimeout(function(){ if(_page==="train") renderTrain(); }, 150); });
-  bind(ss,"tscope",function(v){ _trainScope=v; });
+  function changed(){
+    document.getElementById("pareto-detail").hidden=true;
+    renderTrain();
+  }
+  document.getElementById("pareto-benchmark").addEventListener("change",function(){
+    if(SUITES.some(function(s){ return s.key===this.value; },this)) _paretoBenchmark=this.value;
+    changed();
+  });
+  document.getElementById("pareto-axes").addEventListener("change",function(){
+    if(["size-mase","size-crps","mase-crps"].indexOf(this.value)>=0) _paretoAxes=this.value;
+    changed();
+  });
+  document.getElementById("pareto-history").addEventListener("change",function(){ _paretoHistory=this.checked; changed(); });
+  var ss=document.querySelectorAll("[data-tscope]");
+  for(var i=0;i<ss.length;i++) ss[i].addEventListener("click",function(){
+    _trainScope=this.dataset.tscope;
+    for(var j=0;j<ss.length;j++) ss[j].classList.toggle("active",ss[j]===this);
+    renderTrainTable(trainRows().rows);
+  });
+  var rt=null; window.addEventListener("resize",function(){ clearTimeout(rt); rt=setTimeout(function(){ if(_page==="train") renderTrain(); },150); });
 })();
 
 function poll(){
-  fetchJSON("receipts/index.json").then(function(d){ _index=splitPinned(collapseByRound(d)); _dataState="live"; renderAll(); loadWarmHistory(); if(_page==="train") loadBench(); })
+  fetchJSON("receipts/index.json").then(function(d){ _index=collapseByRound(d); _dataState="live"; renderAll(); loadWarmHistory(); if(_page==="train") loadBench(); })
     .catch(function(){ _dataState="offline"; renderStatus(); });
   loadPromotion();
   fetchJSON("receipts/"+RECEIPT_ANCHOR+"/latest.json")
     .catch(function(){ return fetchJSON("receipts/latest.json"); })
-    .then(function(d){ _latest=d; renderField(); renderHeat(); renderCohort(); }).catch(function(){});
+    .then(function(d){ _latest=d; renderField(); renderHeat(); renderCohort(); renderV2Strip(); renderLaneALadder(); if(_page==="laneb") renderLaneB(); if(_page==="lanec") renderLaneC(); }).catch(function(){});
   // Live chain status (validator poll cadence). The first live doc resets the
   // new-marker baseline, so ● new only ever flags a commit that appeared while
   // THIS page was watching real data. On failure keep the last good doc (or the
@@ -2861,19 +3517,15 @@ function poll(){
   }).catch(function(){});
   // Era roster (rolling mode): republished by the trainer at every settlement.
   fetchJSON("funded/latest.json").then(function(d){ _roster=d; renderHeat(); }).catch(function(){});
-  // Trainer-reported round stage (best-effort; staleness handled in liveStage).
-  fetchJSON("status/round.json").then(function(d){ _roundStatus=d; renderStage(); renderWarm(); })
-    .catch(function(){});
-  // Live heat standings, published when the heat settles rather than with the
-  // round's receipt (status/heat.json). Best-effort: on failure the panel falls
-  // back to the settled receipt's embedded heat block.
-  fetchJSON("status/heat.json").then(function(d){ _heat=d; renderHeat(); renderWarm(); })
-    .catch(function(){});
+  // v2 status (trainer, unsigned): go-live, lane-B driver state, MoE health
+  fetchJSON("status/v2.json").then(function(d){ _v2=d; renderV2(); }).catch(function(){});
+  // lane-C queue (trainer, unsigned; absent while lane C is off)
+  fetchJSON("status/lane_c.json").then(function(d){ _lc=d; if(_page==="lanec") renderLaneC(); }).catch(function(){});
 }
 poll();
 setInterval(function(){ if(!document.hidden) poll(); }, POLL_MS);
 document.addEventListener("visibilitychange", function(){ if(!document.hidden) poll(); });
-setInterval(function(){ renderCountdown(); renderStage(); }, 1000);  // tick ETA + stage clock
+setInterval(function(){ renderCountdown(); renderStage(); renderV2Strip(); }, 1000);  // tick ETA + settlement clock
 </script>
 
 

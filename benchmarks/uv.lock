@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = "==3.11.*"
 
 [manifest]
@@ -169,6 +169,7 @@ version = "0.0.1"
 source = { editable = "." }
 dependencies = [
     { name = "accelerate" },
+    { name = "certifi" },
     { name = "datasets" },
     { name = "gluonts" },
     { name = "huggingface-hub" },
@@ -179,11 +180,15 @@ dependencies = [
     { name = "safetensors" },
     { name = "salesforce-gift-eval" },
     { name = "scipy" },
+    { name = "threadpoolctl" },
     { name = "torch" },
     { name = "transformers" },
 ]
 
 [package.optional-dependencies]
+fev = [
+    { name = "fev" },
+]
 time = [
     { name = "timebench" },
 ]
@@ -191,7 +196,9 @@ time = [
 [package.metadata]
 requires-dist = [
     { name = "accelerate", specifier = ">=0.30" },
+    { name = "certifi", specifier = ">=2026.10.19" },
     { name = "datasets", specifier = "~=2.17.1" },
+    { name = "fev", marker = "extra == 'fev'", specifier = ">=0.6" },
     { name = "gluonts", specifier = "~=0.15.1" },
     { name = "huggingface-hub", specifier = ">=0.23" },
     { name = "numpy", specifier = "~=1.26.0" },
@@ -201,11 +208,12 @@ requires-dist = [
     { name = "safetensors", specifier = ">=0.4" },
     { name = "salesforce-gift-eval", git = "https://github.com/SalesforceAIResearch/gift-eval?rev=1527c41589189ad1bc3883ed4d3d97b3e5a3b47c" },
     { name = "scipy", specifier = "~=1.11.3" },
+    { name = "threadpoolctl", specifier = ">=3.6,<4" },
     { name = "timebench", marker = "extra == 'time'", git = "https://github.com/zqiao11/TIME" },
     { name = "torch", specifier = ">=2.2" },
     { name = "transformers", specifier = ">=4.40" },
 ]
-provides-extras = ["time"]
+provides-extras = ["time", "fev"]
 
 [[package]]
 name = "certifi"
@@ -319,34 +327,34 @@ wheels = [
 
 [package.optional-dependencies]
 cudart = [
-    { name = "nvidia-cuda-runtime", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-cuda-runtime" },
 ]
 cufft = [
-    { name = "nvidia-cufft", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-cufft" },
 ]
 cufile = [
-    { name = "nvidia-cufile", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-cufile" },
 ]
 cupti = [
-    { name = "nvidia-cuda-cupti", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-cuda-cupti" },
 ]
 curand = [
-    { name = "nvidia-curand", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-curand" },
 ]
 cusolver = [
-    { name = "nvidia-cusolver", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-cusolver" },
 ]
 cusparse = [
-    { name = "nvidia-cusparse", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-cusparse" },
 ]
 nvjitlink = [
-    { name = "nvidia-nvjitlink", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-nvjitlink" },
 ]
 nvrtc = [
-    { name = "nvidia-cuda-nvrtc", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-cuda-nvrtc" },
 ]
 nvtx = [
-    { name = "nvidia-nvtx", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-nvtx" },
 ]
 
 [[package]]
@@ -400,6 +408,21 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/74/6b/84ea8ea496b32a9c9331e7ca0529c670e1de0af239f597bf4f783e4a5396/einops-0.7.0.tar.gz", hash = "sha256:b2b04ad6081a3b227080c9bf5e3ace7160357ff03043cd66cc5b2319eb7031d1", size = 58522, upload-time = "2023-10-01T01:13:47.95Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/29/0b/2d1c0ebfd092e25935b86509a9a817159212d82aa43d7fb07eca4eeff2c2/einops-0.7.0-py3-none-any.whl", hash = "sha256:0f3096f26b914f465f6ff3c66f5478f9a5e380bb367ffc6493a68143fbbf1fd1", size = 44599, upload-time = "2023-10-01T01:13:46.178Z" },
+]
+
+[[package]]
+name = "fev"
+version = "0.10.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "datasets" },
+    { name = "numpy" },
+    { name = "pydantic" },
+    { name = "scipy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/eb/9e/af21153b05aff027f5d861f80f28740221c79c42e02c0c7c071c0c1a51e5/fev-0.10.0.tar.gz", hash = "sha256:509ab1f0ed82355c0b707825b96ff032aaaf817f9e26324b0b9ffe61d0fc36c9", size = 111181, upload-time = "2026-08-31T12:04:33.704Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d3/35/ea4bf38e4f5bcfce13513cc708400522637844f56afcbe4b363259bea8ed/fev-0.10.0-py3-none-any.whl", hash = "sha256:de83fcd73920fc8823e3b2c388ffb4e612e6bc2ab61b27ec991c91e70aea128f", size = 47649, upload-time = "2026-08-31T12:04:32.331Z" },
 ]
 
 [[package]]

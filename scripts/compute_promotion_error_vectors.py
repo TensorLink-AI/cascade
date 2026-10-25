@@ -3,8 +3,8 @@ candidate in the trainer's promotion log, written to
 ``<work_root>/promotion_error_vectors.json`` for select_members' trajectory-
 diversity policy (error decorrelation; see DEC-CA-0013 evolution).
 
-Each candidate checkpoint is fetched from the registry and evaluated with the
-round screener on the private pool slice for ``--block`` (default: the current
+Each candidate checkpoint is fetched from the registry and evaluated on the
+private pool slice (the validators' verdict draw) for ``--block`` (default: the current
 epoch start), producing one positive error scalar per window:
 ``sqrt(wql_w * mase_w)`` — the per-window analogue of the round geomean, so
 correlations are measured on exactly the error the throne is judged on.
@@ -28,8 +28,9 @@ from cascade.eval.scoring import stack_components  # noqa: E402
 from cascade.shared.config import load_chain_config  # noqa: E402
 from cascade.shared.hippius import HubConfig, fetch_from_hub  # noqa: E402
 from cascade.shared.manifest import parse_trained_pointer  # noqa: E402
-from cascade.trainer.loop import ResolvedGenerator  # noqa: E402
-from cascade.trainer.main import _build_screen_fn  # noqa: E402
+from cascade.trainer.main import load_window_source  # noqa: E402
+from cascade.validator.evaluator import evaluate_checkpoint  # noqa: E402
+from cascade.validator.windows import ladder_windows_for_round, scored_ladder  # noqa: E402
 
 
 def main() -> int:
@@ -58,7 +59,14 @@ def main() -> int:
         epoch = cfg.round.epoch_blocks if hasattr(cfg.round, "epoch_blocks") else 3600
         block = (blk // epoch) * epoch
 
-    screen, _, _, _ = _build_screen_fn(cfg, cache_dir=args.work_root)
+    source = load_window_source(cfg, cache_dir=args.work_root)
+    horizons = scored_ladder(cfg.eval, block)
+    if horizons:
+        windows = ladder_windows_for_round(
+            source, horizons=horizons, n_windows=cfg.eval.n_windows,
+            context_length=cfg.eval.context_length, round_seed=args.base_seed, block=block)
+    else:
+        windows = source.windows_for_round(args.base_seed, cfg.eval.n_windows, block=block)
     out_path = args.work_root / "promotion_error_vectors.json"
     vectors: dict[str, list[float]] = {}
     if out_path.is_file():
@@ -78,8 +86,8 @@ def main() -> int:
             continue
         dest = args.work_root / "promotion_vectors_cache" / cid.split("/")[-1].replace(":", "_")
         fetch_from_hub(ref, dest, hub)
-        gen = ResolvedGenerator(c.get("hotkey", ""), 0, cid)
-        raw = list(screen(dest, gen, args.base_seed, block))
+        raw = list(evaluate_checkpoint(dest, windows, num_samples=cfg.eval.num_samples,
+                                       device="cpu", contract=cfg.screen_contract()))
         qloss, abs_t, mase = stack_components(raw)
         # Per-window sqrt(WQL * MASE) via the round's own wql_per_window.
         # Zero-|y| windows are masked exactly as the round metric masks them;
@@ -87,7 +95,7 @@ def main() -> int:
         # vectors stay window-aligned after filtering.
         wql, valid = wql_per_window(qloss, abs_t)
         vec = [math.sqrt(max(float(w), 1e-12) * max(float(m), 1e-9))
-               for w, m, ok in zip(wql, mase, valid) if ok]
+               for w, m, ok in zip(wql, mase, valid, strict=False) if ok]
         vectors[cid] = vec
         out_path.write_text(json.dumps(vectors))
         print(f"scored: {cid[:80]} n_windows={len(vec)}")

@@ -3,43 +3,115 @@
 You submit a **data generator** — a *purely algorithmic* process behind the
 `generate()` endpoint: a sampler built from priors (GP/kernel families, causal
 DAGs, parametric trend/seasonality/noise, …). It is **code-only — no shipped
-weights** (see the contract below), so you compete on the data-generating prior,
+weights** (see the contract below), so you compete on the generator's synthetic data,
 not on a large pretrained forecaster distilled into a "generator". Whatever it is,
-it produces synthetic time-series that the subnet owner's trainer uses to train a
-**Toto2-4M forecaster from the round's shared init** — random at generation 0,
-the promoted cascade checkpoint once promotions fire (the live case today);
-never a fine-tune of released weights, so every learned parameter traces back
-to subnet data. You win when
-your data trains a better forecaster than the king's data, scored on a private,
-rotating held-out set you never see.
+it produces synthetic time series for the fixed forecaster in the effective
+era contract. Pre-v2 eras use the Toto2 lineage; v2 A/B use a fresh Cascade
+MoE lineage, with a configured random-init window and checked warm starts.
+Lane A challenges the king; Lane B trains selected experts and must satisfy
+its target/acceptance rules. Lane C's MarketCast recipe and pinned Timestral
+base have a [separate workflow](AGENT_MINING.md#lane-c-test-a-marketcast-recipe).
+This document defines the generator surface, not a single permanent model size.
 
-Series may be **multivariate**: `generate` may yield a 1-D `(L,)` array (one
-channel) or a `(C, L)` array with up to `max_channels = 32` variates
-(DEC-CA-0041, armed 2026-09-09). Nothing else about the carrier changes.
-Channel economics, so you can decide what to emit:
+**Read in order:** [layout](#repo-layout) → [Python interface](#the-contract)
+→ [required checks](#hard-requirements) → [local verification](MINER.md#3-verify-and-score-locally).
+The channel and record sections explain optional ways to structure your output.
 
-* **The budget is per time-step, not per channel** (`[training]
-  budget_denomination = "series_points"`, DEC-CA-0042): a `(C, L)` series
-  costs `L` points of the token budget, so a C-channel corpus trains `C×` the
-  channel tokens a univariate one does from the same budget (C=32 → 32×).
-* **Batches are 64 series wide whatever C** (`[training] batch_denomination =
-  "series"`): a C-channel batch is 64 × C sequences, so every width earns the
-  same optimizer step count and a wide batch trains `C×` the tokens per step.
-* **The wall is still the law.** The leg's `max_train_seconds` (5 h) is
-  unchanged by width; a C-channel step costs ~C× the GPU time of a univariate
-  one, so a width the round's GPU cannot push through in 5 h stops at the wall
-  under budget (`deadline_hit`) — the same rule every leg runs under. Size your
-  C to the SKU, not to the budget.
-* **Cross-channel structure only pays if it's real.** From `[scoring]
-  mv_score_from_block` the eval scores multivariate windows jointly (a
-  C-channel window counts once); channels of one series should carry related
-  signal. Near-duplicate channels are flagged by the channel-redundancy
-  telemetry (`channel_corr_mode = "shadow"` today; enforcement will follow it).
-  So are unrelated rows stacked into one array: a channel whose innovations
-  are uncorrelated with every other channel is logged as unpartnered
-  (`channel_telemetry.frac_unpartnered`, shadow only).
-* A univariate generator stays fully legal — `C = 1` batches, budgets, and
-  scores are byte-identical to the pre-raise behaviour.
+## Which limits apply
+
+Use the active era's signed training contract and the running trainer's
+generation policy. These checked-in mainnet values are a reference, not proof
+of deployment. Local `verify` uses `[generator]` limits; the CPU shard tier
+uses `[generation] max_length`, which can allow longer series. Longer output
+does not increase the model context: v2 crops training windows from it.
+
+<!-- cascade:training-reference:start -->
+| Setting | Mainnet before v2 | Mainnet v2 A |
+|---|---|---|
+| Model preset | `toto2-4m` | `cascade-moe-28m` |
+| Corpus feed | `stream_cpu` | `shards` |
+| Budget accounting | `series_points` | `series_points` |
+| Batch accounting | `series` | `series` |
+| Batch size | `64` | `64` |
+| Model context length | `4096` | `4096` |
+| Training wall limit (seconds) | `18000` | `18000` |
+| Generator channels per yield | 1–32 | 8–32 |
+| Generator length limit | 64–4096 | 64–32768 in the CPU shard tier |
+| CPU shard generation window | Not used by this contract | 90 minutes |
+<!-- cascade:training-reference:end -->
+
+Testnet has different activation and budgets. Before a live comparison,
+refresh `cascade status --json`; use the same network, contract, base and
+evaluation settings on both sides.
+
+`cascade verify DIR --live --json` resolves the deployed contract and CPU-tier
+policy together. Under v2 shards it uses `[generation] max_length` and
+`child_memory_mb`, including 8,064-point series within those bounds. With no
+bound contract (no `--live`, no `--at-block`), `verify`, `deploy`, an
+unfunded `submit`, `iterate`, `score` and `fetch --verify` check the
+intersection of the base and `[v2.training]` policies: 8–32 channels and the
+stricter length, memory and time limits, so a pass is admissible whichever
+side of the launch trains the entry. Use `--live` for the exact deployed
+policy, including longer v2 shard series. `--at-block` selects a configured
+era explicitly; while the mainnet launch is dated and `[v2] from_block` is
+still 0 it cannot resolve that launch offline and exits with usage error
+`launch_unresolved` rather than silently binding the pre-v2 policy. Pre-v2
+verification retains the one-channel floor and its earlier length limit. Do
+not use `--skip-verify` to bypass a policy mismatch.
+
+Quick and full runtime checks execute generator code in bounded sandbox
+children. Full verification compares two finite corpus prefixes; it cannot
+prove that every future seed or the complete production budget will succeed.
+A host unable to provide the configured isolation must use an approved
+container/runtime or report the check as unavailable.
+
+## Multivariate series
+
+V2 synthetic generators must yield `(C, L)` arrays with **8 ≤ C ≤ 32** on
+**every yield** (`[generator] min_channels = 8`, `max_channels = 32`).
+One-dimensional arrays and arrays with 1–7 or more than 32 channels are rejected.
+This also applies to a record's `values` array. The private evaluation pool's
+channel range is independent. Historical v1 replay retains its earlier limits.
+
+Channel economics:
+
+* **Billing.** `[training] budget_denomination` decides what one budget point
+  is. The rule in force for an era is the `budget_denomination` in the signed
+  `contract_body` of that era's manifests (`manifests/latest.json` on the
+  manifest bucket); a scheduled switch (`budget_denomination_after` /
+  `budget_denomination_after_block`) applies to eras starting at or after
+  its block, and a leg always trains, settles and is audited under its era's
+  rule.
+  * `"points+mv<N>"` (an optional policy, illustrated with `points+mv20`): every channel value is a
+    point, and a series with `C > 1` is billed `ceil(C × L × 100 / (100+N))`.
+    An all-multichannel corpus trains `N %` more tokens than a univariate one;
+    a corpus that stacks only a share of its series earns proportionally
+    less; a copied or junk channel spends real budget. The contract's wall
+    (`max_train_seconds`) still applies: a leg that cannot finish its budget
+    in time stops there (`deadline_hit`).
+  * `"series_points"`: a `(C, L)` series costs `L`, so a C-channel corpus
+    trains `C×` the channel tokens of a univariate one from the same budget —
+    but wider batches cost more GPU time, so a width the GPU cannot
+    push through in its wall (`max_train_seconds`) stops at the wall
+    under budget (`deadline_hit`). Size C to the GPU, not to the budget.
+* **Batch size and budget are separate.** With `batch_denomination = "series"`
+  and `batch_size = 64`, a C-channel batch contains 64 series, or 64 × C
+  channel sequences. Under `series_points` this preserves the budgeted update
+  count across widths; other denominations can change it. The wall can still
+  stop a slow run early.
+* **Cross-channel structure only pays if it is real.** Multivariate eval
+  windows are scored jointly (all channels forecast in one pass; the window
+  counts once), and eval windows carry at most 8 channels whatever your C.
+  Near-duplicate channels are flagged by the channel-redundancy telemetry
+  (`[generator] channel_corr_mode = "shadow"`), and so are unrelated rows
+  stacked into one array: a channel whose innovations are uncorrelated with
+  every other channel is logged as unpartnered
+  (`channel_telemetry.frac_unpartnered`). Both are labels only today.
+* Univariate and 2–7-channel yields are historical examples only; they are
+  not valid new v2 submissions. Each channel should add useful signal.
+
+A worked eight-channel example with billing numbers:
+[MINER.md §11](MINER.md#11-multichannel-generators).
 
 ## The record carrier (optional)
 
@@ -67,20 +139,21 @@ announcement, not a code release:
   the horizon; admitted only once `allow_future_known` arms, after the eval
   pool's covariate-curation rule exists). At least one target channel required.
 
-Your deployed bare-array (or values-only record) generator stays valid at
-every version, forever. You may declare `"interface_version": 1` in your
+Bare arrays and values-only records remain supported by the implemented
+interface, subject to the effective shape and resource limits. You may declare `"interface_version": 1` in your
 `config.json`; declaring a version newer than the trainer supports fails your
 run early with a clear error.
 
 ## Yield order is a training lever
 
-In the live `stream_cpu` feed the trainer consumes your series **in yield
-order** (bucketed by shape, no global shuffle) under a cosine LR schedule.
+In a `stream_cpu` feed (`[training] corpus_mode`) the trainer consumes
+your series **in yield order** (bucketed by shape, no global shuffle).
 Ordering easy→hard, stationary→shifted, or annealing your mixture over the
 stream is a curriculum you already control — it is the honest answer to "how
 do I express non-stationarity to this trainer": order, not timestamps
 (DEC-CA-0025). Both duel sides hold the same lever, and a pathological order
-only costs your own throughput (the wall is the law).
+can reduce throughput. The shard tier combines independently seeded children;
+do not assume its global order matches one streaming generator call.
 
 ## Repo layout
 
@@ -101,7 +174,7 @@ pretrained model into the generator. The same policy covers RAW DATA: bulk
 numeric payloads embedded in `config.json` or as python literals — real series
 included — are outside the design space, not a loophole (DEC-CA-0028; the repo
 byte cap is the wall). `torch`/`gpytorch` stay available as compute libraries
-for GP/kernel priors, and fitting parameters *inside the sandbox at round time*
+for GP/kernel priors, and fitting parameters *inside the sandbox at run time*
 from your own procedural data is legal — just don't ship parameters or data.
 The whole repo must be `<= max_repo_mb` (small, since it's source + config).
 
@@ -138,8 +211,8 @@ class Generator(DataGenerator):
         ...
 
     def generate(self, n_series: int) -> Iterator[np.ndarray]:
-        # Yield UP TO n_series float arrays: 1-D (L,) today, or (C, L) once the
-        # owner raises max_channels. Each length L must fall in the configured
+        # Yield UP TO n_series float arrays (C, L), with 8 <= C <= 32.
+        # Every yield must satisfy the active channel range. Each length L must fall in the configured
         # [min_length, max_length] band; total emitted points (C*L) are capped.
         # The trainer may stop consuming early — at the training token budget
         # (streaming) or at [generator] corpus_target_points (materialised
@@ -160,11 +233,13 @@ class Generator(DataGenerator):
   your generator twice and rejects it if the digests differ — non-negotiable,
   because the trainer and validators rely on it to audit runs.
 * **Bounds.** Each series is finite (no NaN/inf), floating dtype, shape
-  `(L,)` or `(C, L)` with `C <= generator.max_channels` (32) and `L` in
-  `[generator.min_length, generator.max_length]`. The whole corpus is capped
-  at `generator.max_total_points`. Keep magnitudes in a sane float32 range: a
+  `(C, L)` with `generator.min_channels <= C <= generator.max_channels`
+  (**8–32** for v2) and `L` in
+  the active length band described [above](#which-limits-apply). Local/full
+  materialisation is capped by `generator.max_total_points`; the shard tier
+  has its own point target and CPU window. Keep magnitudes in a sane float32 range: a
   corpus that drives the loss non-finite is rejected as the miner's fault.
-* **Count / budget.** The corpus budget is denominated in **points**: with
+* **Count / budget.** For ordinary materialised verification, with
   `[generator] corpus_target_points` armed (it ships armed), the materialised
   drain (`cascade verify`, `cache_reuse`) stops once your corpus reaches the
   target points, and the series count is yours to choose — many short series
@@ -174,27 +249,48 @@ class Generator(DataGenerator):
   disarms the target (`corpus_target_points = 0`) the legacy rule returns:
   exactly `n` series are required. Yielding *more* than `n` is always an
   error, and exhausting your iterator below the points target rejects the run.
-* **No network / no escape.** `generator.py` is AST-scanned for blocked imports
-  (sockets, subprocess, the cascade internals, etc.) and run in a
-  network-isolated sandbox. See `chain.toml [static_guard]`.
+* **No network / no escape.** Every `.py` in your tree — and any Python
+  source packed into a string constant — is AST-scanned for blocked imports
+  (sockets, subprocess, pickle, multiprocessing, the cascade internals, …),
+  compiled/native modules (`.so`, `.pyd`, `.pyc`, …) are rejected, and the
+  generator runs in a network-isolated sandbox. Ship every module as a `.py`
+  file: under `[static_guard] packed_sources = "reject"` the trainer refuses
+  Python code inside a string constant at admission, and the rejection
+  spends the hotkey ([MINER.md §11](MINER.md#code-in-strings-is-rejected)).
+  See `chain.toml [static_guard]`.
 * **Dependencies & size.** `requirements.txt` lines must be
   `pkg==ver --hash=sha256:…`, drawn from `chain.toml [dependencies] allowed`
   (which includes `torch`/`gpytorch` as compute libraries for GP/kernel priors —
   but no shipped weights), at most `max_packages`. The fetched repo (code only)
   must be `<= max_repo_mb`.
 
+## Runtime languages
+
+The submitted entry point is Python. Native/compiled modules are rejected, and
+spawning a Rust/C++ executable is not a supported generator path. NumPy and
+Numba are allowlisted compute libraries; their presence does not waive sandbox,
+determinism or budget checks. Supporting another source language would require
+a versioned build/runner contract and equivalent isolation and output checks.
+
 ## Compute-heavy priors (GP / kernel families)
 
 `gpytorch`, `scikit-learn` and `networkx` are allowlisted so GP, kernel and
 graph priors can compete, but a naive implementation prices itself out. Three
-facts to design around (DEC-CA-0031):
+facts to design around (DEC-CA-0031). The CPU-second limits below describe
+the single sandbox path. The v2 CPU tier additionally runs seed-sharded child
+processes under `[generation]` parallelism and its own `window_seconds` wall
+(default 5,400 seconds). A 90-minute tier window is not a promise that an
+arbitrary corpus finishes; generation, serialization/hashing and upload need
+measurement. Use the effective generation profile's length/point limits.
 
-* **The generation budget is CPU-seconds, and threads sum into it.** The
+For the single sandbox path:
+
+* **The sandbox CPU budget counts threads.** The
   sandbox enforces `max_generate_seconds` as `RLIMIT_CPU` across every thread,
   and `multiprocessing` is blocked. Multi-core BLAS burns the budget faster.
   Pin linear algebra to one thread (`OMP_NUM_THREADS=1` is set on lane-pinned
   pods) and spend the saving on a cheaper factorisation.
-* **The corpus budget is points, not series.** GP draws scale roughly
+* **The corpus budget is points, not series.** Dense GP draws using a fresh covariance Cholesky factor scale roughly
   cubically in length: at L=1024 instead of 4096 a kernel prior costs ~64×
   less per series. Emit many shorter series; the length band is the only
   shape constraint.
@@ -217,53 +313,56 @@ facts to design around (DEC-CA-0031):
   to 0. Deterministic, so your digest stays reproducible.
 
 Generator speed is a compute multiplier in the live stream (DEC-CA-0001): a
-slow prior feeds the trainer less data inside the round's wall. Measure
+slow generator feeds the trainer less data inside the leg's wall. Measure
 `seconds/series × (points needed / points per series)` against the budget
 before you submit; `cascade score` is the ground truth.
 
 ## Deploy
 
 ```bash
-cascade verify ./my-generator-repo            # runs every trainer-side check
+cascade verify ./my-generator-repo            # local source, output and determinism checks
 cascade deploy ./my-generator-repo --hub-repo <namespace/name> \
     --wallet-name <coldkey> --wallet-hotkey <hotkey>
 ```
 
 `deploy` verifies the repo locally, pushes it to your **Hippius Hub** repo (OCI),
-and writes `metro-v1:gen:hippius:<repo>@<digest>` on-chain via
-`set_reveal_commitment`. The OCI digest content-addresses (and so pins) the exact
+and writes `metro-v1:gen:hippius:<repo>@<digest>` on-chain as a timelock
+commitment (sealed in the SCALE-prefixed encoding validators decode — never
+hand-roll it with `bittensor.timelock.encrypt`). The OCI digest content-addresses (and so pins) the exact
 tree the trainer will fetch — needs the `[hippius]` extra and Hub credentials
 (`HIPPIUS_HUB_TOKEN`, or `HIPPIUS_HUB_USERNAME` + `HIPPIUS_HUB_PASSWORD`). Already
 pushed? Pass `--ref <repo@digest>` to skip the upload and just commit.
 
 The timelock reveal defaults to a **timed reveal**: the payload decrypts
 `[round] reveal_margin_blocks` before the next epoch boundary, so a submission
-stays hidden for its whole window and cannot be copied into its own round
+stays hidden until then and cannot be copied ahead of you
 (`--reveal-now` / `--blocks-until-reveal N` / `--next-epoch` override). Prefer
 `--hub-namespace <ns>` over a fixed `--hub-repo` name — each deploy then uses a
 fresh non-guessable repo, keeping the content as undiscoverable as the pointer.
-See MINER.md §5 ("Reveal timing"). Private submissions (`cascade submit`)
-skip the Hub entirely: the ZIP goes to the operator's vault and the chain
-commit is a `vault/direct@sha256:…` ref — see MINER.md §5.
+See [MINER.md §5 "Reveal timing"](MINER.md#reveal-timing). Private
+submissions (`cascade submit`) skip the Hub entirely: the ZIP goes to the
+operator's vault and the chain commit is a `vault/direct@sha256:…` ref — see
+[MINER.md §5](MINER.md#5-submit).
 
 ## What good data looks like
 
-You're optimising for **downstream forecast generalisation** of a Toto2-4M trained
-on your data from the round's shared init, evaluated on real held-out series
-(CRPS + MASE). Two consequences:
+You're optimising for **downstream forecast generalisation** of the effective
+contract's model trained on your data from its pinned init/base, evaluated on
+real held-out series. A/B use their lane-specific gain and guard rules; a
+public benchmark comparison is not a substitute for that verdict. Two consequences:
 
 * The model's learned signal comes only from subnet data — random init at
   generation 0, and after a cascade promotion the init is itself the product of
-  earlier rounds' winning data — so diversity of regimes (trend, multiple
+  earlier winning data — so diversity of regimes (trend, multiple
   seasonalities, regime shifts, varied noise structure, realistic scales)
   matters even more. A narrow or degenerate corpus teaches (or keeps) a narrow
   forecaster, and a tiny one can't win by being memorised (the budget is
-  `train_tokens`, not a few epochs). In a warm-started round the marginal game
+  `train_tokens`, not a few epochs). From a warm-started init the marginal game
   is sharper still: data that covers what the promoted lineage is *weak* on
   beats data that repeats what it already does well.
-* The eval set is **private and rotates every round**, so you cannot
-  distribution-match a public benchmark — you never see the windows, the slice
-  changes each round, and the trainer only ever feeds the model *your generator's
-  output*. Robust, general priors win; benchmark-shaped ones don't.
+* Private test windows rotate each settlement; public benchmarks provide
+  additional checks. Training data that covers varied, useful patterns is a
+  stronger research approach than fitting only one visible benchmark. Neither
+  a plausible-looking series nor a local benchmark win establishes a live win.
 
 See `scripts/example_generator/` for a runnable starting point.

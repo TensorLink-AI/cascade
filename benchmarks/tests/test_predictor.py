@@ -13,9 +13,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from gluonts.model.forecast import QuantileForecast, SampleForecast
-
 from cascade_benchmark.predictor import CheckpointPredictor
+from gluonts.model.forecast import QuantileForecast, SampleForecast
 
 QUANTILE_STUB = textwrap.dedent(
     """
@@ -145,7 +144,7 @@ def test_legacy_sample_wrapper_falls_back_to_sample_forecasts(tmp_path: Path):
     assert forecasts[1].start_date == dataset[1]["start"] + 20
 
 
-# ── missing values (2026-09-18: 23 of 97 GIFT-Eval configs carry NaN) ────────
+# ── missing values (23 of 97 GIFT-Eval configs carry NaN) ────────────────────
 
 from cascade_benchmark.predictor import impute_history  # noqa: E402
 

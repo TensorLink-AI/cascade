@@ -30,7 +30,7 @@ RUN printf 'PermitRootLogin prohibit-password\nPasswordAuthentication no\n' \
         > /etc/ssh/sshd_config.d/cascade.conf
 
 # uv for a reproducible pinned Python + deps (matches the repo's uv toolchain).
-COPY --from=ghcr.io/astral-sh/uv:0.13.4@sha256:f0a9c230906ab004ce4786b6e0c60995e30b2bdf585c51377026838573720993 /uv /bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.13.4@sha256:9f130421e930bfbdc563c00740466603f8723158e90297d07957c2294640262b /uv /bin/uv
 
 WORKDIR /root/cascade
 COPY . /root/cascade
@@ -39,9 +39,10 @@ COPY . /root/cascade
 # so the numeric stack is identical on every pod. Bump deliberately — a torch
 # change can shift numerics and break byte-exact re-derivation of older rounds.
 RUN uv venv --python 3.11 /root/cascade/.venv \
+    && .venv/bin/python scripts/check_tls_trust.py --system-only \
     && uv pip install --python /root/cascade/.venv/bin/python \
         torch==2.4.1 --index-url https://download.pytorch.org/whl/cu124 \
-    && uv pip install --python /root/cascade/.venv/bin/python -e '.[train,hippius,wandb]'
+    && uv pip install --python /root/cascade/.venv/bin/python -e '.[train,hippius,wandb,marketcast]'
     # [wandb] extra (2026-07-18): lets pod workers mirror per-step training
     # logs to wandb when [wandb] enabled=true AND WANDB_API_KEY is forwarded
     # (provision.toml forward_env). Absent either, the sink no-ops. NOTE: this
@@ -59,8 +60,10 @@ RUN uv pip install --python /root/cascade/.venv/bin/python \
         scipy==1.17.1 statsmodels==0.14.6 numba==0.66.0 \
         scikit-learn==1.9.0 gpytorch==1.15.2 networkx==3.6.1
 
+RUN .venv/bin/python scripts/check_tls_trust.py
+
 # The baked chain.toml is a BUILD-TIME SNAPSHOT, kept only so a pod can boot
-# and run heats before the orchestrator pushes config. It is NOT authoritative:
+# and run legs before the orchestrator pushes config. It is NOT authoritative:
 # its [training] train_image_digest is the pin as of the build — necessarily the
 # PREVIOUS image's digest, never this image's own (an image cannot know its
 # post-push digest; 2026-08-28 incident: freshly rotated images self-reported
@@ -87,7 +90,7 @@ RUN for f in chain.toml chain.testnet.toml; do \
 "# BUILD — for a freshly published image that is always the PREVIOUS image's" \
 "# digest, never this image's own (an image cannot know its post-push digest)." \
 "# Final-mode workers must run from the pushed config plus the launch-injected" \
-"# CASCADE_TRAIN_IMAGE_DIGEST; this file exists only so heats can boot before" \
+"# CASCADE_TRAIN_IMAGE_DIGEST; this file exists only so a pod can boot before" \
 "# config delivery." \
 "# =============================================================================" \
         | cat - "$f" > "$f.tmp" && mv "$f.tmp" "$f"; \
@@ -99,7 +102,3 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 
 EXPOSE 22
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
-
-# Refuse a worker image with compromised certificate roots.
-RUN uv pip install --python /root/cascade/.venv/bin/python certifi==2026.10.19 \
-    && /root/cascade/.venv/bin/python scripts/check_tls_trust.py

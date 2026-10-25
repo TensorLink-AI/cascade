@@ -1,4 +1,4 @@
-"""Per-payer rentals: one pod, one challenger, one miner's Lium key.
+"""Per-payer rentals: one pod, one challenger, one miner's provider account.
 
 The stage fleets (``loop.ProvisionerLoop``) rent homogeneous batches on the
 OPERATOR's account. Funded challenger legs (DEC-CA-0036) are the opposite
@@ -40,6 +40,7 @@ from .core import (
     PodAddress,
     Provider,
     ProvisionError,
+    UncertainCreateError,
     record_host_quarantine,
 )
 from .state import PodInstance
@@ -88,6 +89,34 @@ def lium_provider_for_key(api_key: str) -> Provider:
     return LiumProvider(api_key=api_key)
 
 
+# Marketplaces a miner may fund with. Each payer key scopes rentals to that
+# miner's own account; see cascade.provision.{vast,runpod} for the key scopes.
+COMPUTE_PROVIDERS = ("lium", "vast", "runpod")
+
+
+def provider_for_key(provider: str, api_key: str) -> Provider:
+    """An adapter for ``provider`` billing ``api_key``'s account."""
+    if not api_key:
+        raise ProvisionError("funded rental needs the payer's api key (empty)")
+    if provider == "lium":
+        from .core import LiumProvider as PayerLiumProvider
+
+        return PayerLiumProvider(api_key=api_key)
+    if provider == "shadeform":
+        from .core import ShadeformProvider
+
+        return ShadeformProvider(api_key=api_key)
+    if provider == "vast":
+        from .vast import VastProvider
+
+        return VastProvider(api_key=api_key)
+    if provider == "runpod":
+        from .runpod import RunPodProvider
+
+        return RunPodProvider(api_key=api_key)
+    raise ProvisionError(f"unknown compute provider {provider!r}")
+
+
 def apply_price_caps(provider: Provider, *, max_price_per_hour: float = 0.0,
                      max_leg_cost_usd: float = 0.0,
                      sku_wall_seconds: tuple[tuple[str, int], ...] = (),
@@ -120,9 +149,19 @@ def terminate_verified(provider: Provider, pod_id: str) -> bool:
     that turns a 401 into silence, so every funded-path teardown must believe
     the listing, not the call (review 2026-08-29). A provider without
     ``list_tagged`` cannot be re-checked; the call's own success is then the
-    best evidence available.
+    best evidence available. A provider that can say its view is incomplete
+    (``create_unresolved``: Lium's never-listed ``lium up``, Vast's label never
+    observed and no DELETE acknowledged) is never believed on an empty listing
+    alone.
     """
+    unresolved = getattr(provider, "create_unresolved", lambda _pid: False)
+    uncertain = unresolved(pod_id)
     provider.terminate(pod_id)
+    if uncertain and unresolved(pod_id):
+        return False
+    present = getattr(provider, "pod_exists", None)
+    if present is not None:
+        return not present(pod_id)
     lister = getattr(provider, "list_tagged", None)
     if lister is None:
         return True
@@ -209,15 +248,14 @@ def rent_funded_pod(
     provider_factory: Callable[[str], Provider] = lium_provider_for_key,
     now_iso: Callable[[], str] = lambda: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     host_key_scanner: Callable[[str, int], str] | None = None,
-    before_launch: Callable[[], tuple[str, str] | None] | None = None,
+    on_allocated: Callable[[str, str], None] | None = None,
+    vault: PayerKeyVault | None = None,
+    on_provider_selected: Callable[[str, str], None] | None = None,
+    existing_only: bool = False,
+    on_create_started: Callable[[], None] | None = None,
+    gpu_health=None,
 ) -> FundedRentResult:
     """Rent ONE pod for ``hotkey``'s challenger leg on ``hotkey``'s own key.
-
-    ``before_launch`` (the admission guards' rent-time re-check) runs only
-    when NO live pod of this leg exists — i.e. right before a NEW pod would
-    be launched; an adopted, possibly-training pod is never vetoed. It
-    returns ``(message, error_class)`` to stop the rent (nothing launched,
-    no attempt burned) or ``None`` to proceed; an exception proceeds.
 
     Success returns the ledgered :class:`PodInstance` (stage ``"funded"``,
     ``payer_hotkey`` set — the caller appends it to the round ledger and saves
@@ -226,21 +264,46 @@ def rent_funded_pod(
     key), classifies the error, and reports whether the attempt should burn.
     """
 
+    from ..funding.providers import PREFIX
+
+    if api_key.startswith(PREFIX) or (vault is not None and provider_factory is lium_provider_for_key):
+        from .payer_pool import rent_from_pool
+
+        return rent_from_pool(dict(
+            round_id=round_id, hotkey=hotkey, api_key=api_key, sku=sku, image=image,
+            ssh_pubkey=ssh_pubkey, netuid=netuid, gpus_per_pod=gpus_per_pod,
+            ready_timeout=ready_timeout, exclude_ids=exclude_ids,
+            cpu_blocklist=cpu_blocklist, skus=skus, price_caps=price_caps,
+            now_iso=now_iso, host_key_scanner=host_key_scanner, on_allocated=on_allocated,
+            vault=vault, on_provider_selected=on_provider_selected,
+            gpu_health=gpu_health), rent_funded_pod)
+
     def _fail(err: Exception | str, *, leaked_pod: str = "") -> FundedRentResult:
         msg = str(err)
         if api_key:
             msg = msg.replace(api_key, "<redacted>")
-        cls = classify_rent_failure(msg)
+        cls = "infra" if isinstance(err, UncertainCreateError) else classify_rent_failure(msg)
         log.warning("funded rent for %s failed [%s]: %s", hotkey, cls, msg[-300:])
         return FundedRentResult(
             hotkey=hotkey, ok=False, error=msg[-500:], error_class=cls,
             burn_attempt=(cls == "infra"), leaked_pod=leaked_pod,
         )
 
+    credential_id = ""
     name = funded_pod_name(round_id, hotkey, netuid)
     try:
         provider = apply_cpu_blocklist(provider_factory(api_key), cpu_blocklist)
         provider = apply_price_caps(provider, **(price_caps or {}))
+        if gpu_health is not None and gpu_health.threshold:
+            from ..trainer.gpu_health import GuardedProvider
+
+            provider = GuardedProvider(provider, gpu_health)
+        if vault is not None:
+            from ..funding.providers import PayerCredential, lease_credentials
+
+            credential_id = lease_credentials(vault, hotkey, PayerCredential(provider.name, api_key), scope=name)
+            if on_provider_selected is not None:
+                on_provider_selected(provider.name, credential_id)
     except Exception as e:  # noqa: BLE001 — a bad key must classify, not crash the round
         return _fail(e)
 
@@ -260,15 +323,19 @@ def rent_funded_pod(
     live_name, live_addr = "", None
     if callable(live_fn):
         try:
-            for cand in sorted(provider.list_tagged(name)):
+            candidates = sorted(provider.list_tagged(name))
+            if len(candidates) > 1:
+                return replace(_fail("multiple allocations need reconciliation; no new rental", leaked_pod=candidates[0]), burn_attempt=False)
+            for cand in candidates:
                 addr = live_fn(cand)
                 if addr is not None:
                     live_name, live_addr = cand, addr
                     break
+            if candidates and live_addr is None:
+                return replace(_fail("existing allocation is not ready; no new rental", leaked_pod=candidates[0]), burn_attempt=False)
         except Exception as e:  # noqa: BLE001 — a listing blip must not block the rent
-            log.warning("funded rent for %s: live-pod probe failed (%s) — renting",
-                        hotkey, str(e)[-200:])
-            live_name, live_addr = "", None
+            log.warning("funded rent for %s: existing allocation cannot be inspected; no new rental", hotkey)
+            return replace(_fail(e, leaked_pod=name + "-0"), burn_attempt=False)
     if live_addr is not None:
         try:
             ident_fn = getattr(provider, "pod_identity", None)
@@ -285,7 +352,7 @@ def rent_funded_pod(
             pod = PodInstance(
                 provider=provider.name, instance_id=live_name, stage=FUNDED_STAGE,
                 rented_at_iso=now_iso(), sku=landed, gpus=gpus_per_pod,
-                payer_hotkey=hotkey, pod_uid=pod_uid,
+                payer_hotkey=hotkey, pod_uid=pod_uid, payer_credential_id=credential_id,
             )
             log.warning("funded pod %s is still LIVE at %s:%d from a prior attempt — "
                         "adopting it for %s (no rent; the dispatcher attaches to its run)",
@@ -298,22 +365,18 @@ def rent_funded_pod(
                                     machine_id=machine, pod_uid=pod_uid,
                                     host_key=host_key, sku=landed, adopted=True)
         except Exception as e:  # noqa: BLE001 — never tear the live pod down; retry later
-            res = _fail(f"live pod {live_name} could not be adopted: {e}")
+            res = _fail(f"live pod {live_name} could not be adopted: {e}", leaked_pod=live_name)
             return replace(res, error_class="infra", burn_attempt=False)
 
-    if before_launch is not None:
-        try:
-            veto = before_launch()
-        except Exception as e:  # noqa: BLE001 — a guard fault never blocks a rent
-            log.warning("funded rent for %s: pre-launch check failed (%s) — renting",
-                        hotkey, str(e)[-200:])
-            veto = None
-        if veto is not None:
-            msg, cls = veto
-            log.warning("funded rent for %s stopped before launch [%s]: %s", hotkey, cls,
-                        msg[-300:])
-            return FundedRentResult(hotkey=hotkey, ok=False, error=msg[-500:],
-                                    error_class=cls, burn_attempt=False)
+    if existing_only:
+        # The pool's probe listed an allocation moments ago and this re-list
+        # did not: a listing flap, not a vanished pod. The allocation is still
+        # the leg's (``leaked_pod`` keeps its lease and create intent — the
+        # pool forgets both on a bare failure, and the next rent then created
+        # a twin under the same name).
+        return FundedRentResult(hotkey, False,
+                                error="existing allocation is booting or cannot yet be adopted; no new rental",
+                                error_class="infra", burn_attempt=False, leaked_pod=name + "-0")
 
     choices = tuple(skus) if len(tuple(skus)) > 1 else ()
     spec = LaunchSpec(
@@ -322,9 +385,21 @@ def rent_funded_pod(
         sku_choices=choices,
     )
     launched: list[str] = []
+    launch_attempted = False
     try:
+        if on_create_started is not None:
+            try:
+                on_create_started()
+            except Exception:
+                return FundedRentResult(hotkey, False, error="cannot persist rental intent; no create sent",
+                                        error_class="infra", burn_attempt=False)
+        launch_attempted = True
         launched = provider.launch(spec)
         pod_id = launched[0]
+        if on_allocated is not None:
+            getter = getattr(provider, "machine_of", None)
+            machine = str(getter(pod_id) or "") if callable(getter) else ""
+            on_allocated(machine, pod_id)
         if not provider.wait_ready(pod_id, timeout=ready_timeout):
             # Surface the captured `lium up` output INTO the error: launch is
             # fire-and-forget, so a key revoked (or balance exhausted) between
@@ -340,6 +415,8 @@ def rent_funded_pod(
             # The platform took the rent and delivered nothing usable: a lemon
             # host (2026-09-13: RUNNING with no ports for 900 s, four ids on
             # one machine). Remember the HOST before the pod record vanishes.
+            if classify_rent_failure(why) in {"auth", "rate_limited"}:
+                raise ProvisionError(why)
             quarantine_lemon_host(provider, pod_id, why)
             raise LemonPodError(why)
         addr = provider.get_ip(pod_id)
@@ -372,7 +449,7 @@ def rent_funded_pod(
         pod = PodInstance(
             provider=provider.name, instance_id=pod_id, stage=FUNDED_STAGE,
             rented_at_iso=now_iso(), sku=landed, gpus=gpus_per_pod,
-            payer_hotkey=hotkey, pod_uid=pod_uid,
+            payer_hotkey=hotkey, pod_uid=pod_uid, payer_credential_id=credential_id,
         )
         log.info("funded pod %s ready for %s at %s:%d (%s, billed to payer)",
                  pod_id, hotkey, addr.ip, addr.ssh_port, landed)
@@ -394,7 +471,31 @@ def rent_funded_pod(
                           "may be LEAKED on payer %s's account (revoked key?): %s",
                           pid, hotkey, te)
                 leaked = pid
+        if launch_attempted and not launched:
+            # ``launch`` raised: did a create reach the provider? An adapter
+            # that tracks its requests (``create_requested``) answers exactly —
+            # an offer search or template step failing BEFORE any create used
+            # to leave the write-ahead intent on disk for good (no listing can
+            # resolve a create that was never sent) and blocked the leg name
+            # until the epoch ended. Without the seam, any prose that is not a
+            # definite refusal reads as uncertain (fail closed).
+            requested = getattr(provider, "create_requested", None)
+            if callable(requested):
+                sent = isinstance(e, UncertainCreateError) or bool(requested(name + "-0"))
+            else:
+                sent = (isinstance(e, UncertainCreateError)
+                        or classify_rent_failure(str(e)) not in {"auth", "no_capacity", "rate_limited"})
+            if sent:
+                # A lost create response is not proof of rejection. Retain the
+                # intent and credential so recovery can find the allocation by name.
+                leaked = name + "-0"
+        if credential_id and vault is not None and not leaked:
+            from ..funding.providers import forget_lease
+
+            forget_lease(vault, credential_id)
         res = _fail(e, leaked_pod=leaked)
+        if leaked:
+            res = replace(res, burn_attempt=False)
         if isinstance(e, LemonPodError):
             # Not the taxonomy's "infra" (which spends one of the miner's
             # attempts): the caller rents again on another host.
@@ -425,7 +526,10 @@ def teardown_funded(
     for inst in instances:
         if inst.stage != FUNDED_STAGE:
             continue
-        key = vault.get(inst.payer_hotkey) if inst.payer_hotkey else None
+        from ..funding.providers import pod_credential
+
+        credential = pod_credential(vault, inst) if inst.payer_hotkey else None
+        key = credential.api_key if credential is not None else None
         if not key:
             log.error("no vaulted key for payer %s — cannot stop pod %s on their "
                       "account; the miner must `lium rm` it themselves",
@@ -433,12 +537,40 @@ def teardown_funded(
             orphaned.append(inst)
             continue
         try:
-            confirmed_gone = terminate_verified(provider_factory(key), inst.instance_id)
+            adapter = (provider_factory(key) if provider_factory is not lium_provider_for_key
+                       else provider_for_key(inst.provider, key))
+            ids = [inst.instance_id]
+            from ..funding.providers import create_intents
+
+            if (inst.payer_credential_id and not inst.pod_uid
+                    and create_intents(vault, inst.instance_id.removesuffix("-0"))
+                    and not adapter.list_tagged(inst.instance_id)):
+                orphaned.append(inst)
+                continue
+            if inst.provider != "lium" and inst.instance_id.startswith("cascade-"):
+                # Write-ahead intent: Shadeform assigns a UUID only after create.
+                ids = list(adapter.list_tagged(inst.instance_id))
+            if ids:
+                confirmed_gone = all(terminate_verified(adapter, pid) for pid in ids)
+            else:
+                # Nothing listed under the name. Gone when the pod was once
+                # OBSERVED (``pod_uid`` is read off a READY pod) or no create
+                # is pending for its scope: a replayed teardown, a rental the
+                # payer or the host already ended — not a row to keep as
+                # "still billing" forever. A write-ahead row whose create is
+                # still unresolved stays (the guard above): an eventually
+                # consistent empty listing cannot resolve a create.
+                confirmed_gone = bool(inst.pod_uid) or not create_intents(
+                    vault, inst.instance_id.removesuffix("-0"))
         except Exception as e:  # noqa: BLE001 — one pod's failure must not skip the rest
             log.error("funded teardown of %s (payer %s) failed: %s",
                       inst.instance_id, inst.payer_hotkey, e)
             orphaned.append(inst)
             continue
+        if confirmed_gone:
+            from ..funding.providers import forget_lease
+
+            forget_lease(vault, getattr(inst, "payer_credential_id", ""))
         if not confirmed_gone:
             log.error("funded pod %s still LIVE after terminate on payer %s's "
                       "account (revoked key?) — miner is billed until it stops",
@@ -496,40 +628,8 @@ def reconcile_funded(
     orphan as killed every sweep (review 2026-08-29). Only confirmed kills are
     returned; a pod that could not be confirmed dead is logged as a leak.
     """
-    owned_ids = {i.instance_id for i in owned if i.stage == FUNDED_STAGE}
-    killed: list[str] = []
-    only = None if hotkeys is None else {str(h) for h in hotkeys}
-    skip = {str(h) for h in exclude}
-    for hotkey in vault.hotkeys():
-        if (only is not None and hotkey not in only) or hotkey in skip:
-            continue
-        key = vault.get(hotkey)
-        if not key:
-            continue
-        provider = provider_factory(key)
-        lister = getattr(provider, "list_tagged", None)
-        if lister is None:
-            continue
-        mine = payer_pod_pattern(hotkey, netuid)
-        try:
-            tagged = lister("cascade-")
-        except Exception as e:  # noqa: BLE001 — one payer's API trouble must not stop the sweep
-            log.warning("funded reconcile: listing payer %s failed: %s", hotkey, e)
-            continue
-        for pod_name in tagged:
-            if mine.match(pod_name) and pod_name not in owned_ids:
-                log.warning("funded reconcile: killing orphan %s on payer %s's account",
-                            pod_name, hotkey)
-                try:
-                    confirmed = terminate_verified(provider, pod_name)
-                except Exception as e:  # noqa: BLE001 — keep sweeping the rest
-                    log.error("funded reconcile: terminate %s failed — may still "
-                              "bill payer %s: %s", pod_name, hotkey, e)
-                    continue
-                if confirmed:
-                    killed.append(pod_name)
-                else:
-                    log.error("funded reconcile: %s still LIVE after terminate on "
-                              "payer %s's account (revoked key?) — still billing",
-                              pod_name, hotkey)
-    return killed
+    from .payer_pool import reconcile_payer_accounts
+
+    return reconcile_payer_accounts(
+        owned, vault, netuid=netuid, provider_factory=provider_factory,
+        hotkeys=hotkeys, exclude=exclude)

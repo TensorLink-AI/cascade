@@ -1,0 +1,330 @@
+---
+id: NOTE-ca-submission-surface-roadmap
+type: note
+title: "Miner submission surface and scaling ladder: the staged expansion roadmap"
+status: active
+date: 2026-08-13
+tags: [interface, multivariate, scaling, roadmap]
+relations: {}
+---
+The design map behind [[DEC-CA-0020]] through [[DEC-CA-0028]]: how the miner
+submission surface and the model-size ladder expand, in what order, and what
+each step must measure before it arms. Every step is a `chain.toml` edit
+against code already in place and inert at today's values; which steps are
+armed is tracked in `CLAUDE.md`, not here. What remains is not code: the
+measurements (open questions below), pool content (MV windows, the
+masked-history slice, covariate curation + the EVAL_POOL exogeneity rule in
+writing), per-size `base_arch_digest` / throughput pins at each size arming,
+and the coordinated deploys.
+
+## The two workstreams
+
+The plan is two independent tracks that meet at the end:
+
+1. **The submission surface** (Stages 0–5): evolve *what miners can
+   express* — one extensible carrier settled up front (record-or-array
+   yield, canonical digest, reserved names, versioning), then payload
+   fields accepted one at a time, each strictly behind the eval work that
+   makes it measurable. Ranked by value-per-effort: multivariate (+ panels)
+   > missingness > time anchor > length.
+2. **The scaling ladder** (Stage 6 / the E0–E3 era map): evolve *what
+   miners' data trains* — from-scratch-per-round ends between 22M and
+   ~100M, so 313M+ rounds are warm-start increments on size-conditional
+   silicon (300M+ rents H100, owner-directed), screened at 22M, judged by a
+   margin re-unitised from %-of-level to %-of-increment.
+
+They interact only at E2+: the surface stages keep every deployed
+bare-array univariate generator valid throughout, and the ladder changes
+only what happens downstream of the corpus. The shared spine is the
+invariant list at the top and the measurement-before-arming discipline
+throughout.
+
+Binding constraints throughout (none are relaxed by any stage):
+
+- byte-identical corpus at a fixed seed; `cascade verify` is the law;
+- king and challenger share one `RoundSeeds` and a byte-identical contract;
+- miner code stays untrusted (static guard + network-isolated sandbox);
+- every deployed univariate bare-array generator stays valid, no
+  resubmission, at every stage;
+- the fixed model is Toto2-4M on a ~3h training budget; the one proposal that
+  assumes a larger model (long context) is explicitly parked on the 22M seam.
+
+## The ordering, and why the carrier goes first
+
+The carrier (DEC-CA-0020) lands first and almost independently — confirmed,
+not assumed: it touches the interface, the digests, the sandbox frame
+protocol, and the eval-side shapes, all in ways that are behaviour-preserving
+at today's payload (values-only corpora hash byte-identically; `C = 1`
+forecasting is unchanged). No gap work can land before it without either
+inventing a second migration or hashing a shape the canonical rule would
+later re-define. Its only coupling to the gaps is forward: each gap's payload
+becomes "accept one more named field".
+
+Value-per-effort ranking of the gaps themselves (the argument for each is in
+its decision node):
+
+| rank | gap | why |
+|---|---|---|
+| 1 | 6 — multivariate + roles (incl. 4, panels) | capacity already trained-but-dormant in every checkpoint; cost is eval hygiene needed anyway |
+| 2 | 3 — missingness | model's CPM machinery is imputation-shaped already; long pole is pool gap support |
+| 3 | 1+5 — time anchor / drift | carrier reservation is free; payload structurally blocked by the calendar-free arch pin |
+| 4 | 2 — length | long-range priors are miner-expressible today via internal crops; long context belongs to the 22M seam |
+
+## Stages
+
+### Stage 0 — carrier, payload-free (DEC-CA-0020)
+
+Record-or-array yield with `values` only; canonical digest with golden-vector
+tests frozen **before** the canonicaliser merges; reserved-name table with
+hard rejection; `[generator] interface_version = 1`; bytes-denominated
+carrier cap (`max_payload_bytes = 16e9`, numerically identical to today's
+point cap); sandbox record frame; eval-side `(C, L)` `ForecastFn` +
+per-window cluster fallback (`series_id`, not per-row singletons).
+
+- **Contract digest: no movement.** Everything here is `[generator]` config,
+  interface code, or eval internals. Verified: `TrainingContractConfig`
+  carries `[training]` only.
+- **Migration: none.** Bare arrays remain the documented common case.
+- **Lockstep note:** digest-blind code changes to shared scoring paths
+  (cluster fallback) follow the DEC-CA-0009 announced-restart discipline
+  even though nothing detects drift mechanically.
+
+### Stage 1 — channel correctness + eval groundwork (inert at C = 1)
+
+Fix the trainer channel-drop (`iter_training_batches` consumes all channels,
+buckets by `(P, C)`); new-checkpoint wrapper accepts `(C, L)` with a
+per-channel adapter kept forever for archived 1-D wrappers; pool builder
+stops dropping multi-channel harvested series and guarantees `source` on
+every window; `min_clusters` raised per the existing plan; shadow logging of
+per-series channel-correlation / effective-rank telemetry.
+
+- **Contract digest: none.** All code + pool content.
+- **Migration: none** (max_channels still 1; every path exercised at C = 1
+  is behaviour-identical).
+- Run the **MV-under-univariate-eval ablation** (DEC-CA-0026) on testnet
+  here — its result gates Stage 2's shape.
+
+### Stage 2 — arm multivariate targets (DEC-CA-0026, DEC-CA-0024)
+
+Raise `max_channels` (4–8, per the cost measurement), with multivariate eval
+windows live in the pool first. Panels ride as `(C, L)` groups
+(DEC-CA-0024); `max_channel_corr = 0.999` arms only after its shadow logs
+clear honest generators.
+
+- **Contract digest: nominally none** (`max_channels` is `[generator]`) —
+  but this stage should decide open question 4 of DEC-CA-0026: whether to
+  mirror the cap into `[training]` so the digest gate can detect a
+  cap-divergent trainer. If mirrored, one planned bump.
+- **Migration: none** for univariate generators; multivariate is opt-in.
+- **Testnet-first**, full cascade, per the DEC-CA-0005/0012 precedent.
+
+### Stage 3 — missingness (DEC-CA-0023)
+
+Pool masked-history slice first (real gaps preserved, `history_mask` in
+window metadata, mask-aware wrapper contract); then accept the `mask` field
+(pinned-0.0 filler, `max_missing_frac` gate) and consume it (input-mask OR +
+loss exclusion).
+
+- **Contract digest: one deliberate bump** — acceptance folds the accepted
+  field set / `interface_version = 2` into `[training]` (DEC-CA-0020 G2
+  layer 3), making corpus-semantics drift visible to the existing
+  `contract_digest_mismatch` gate. Coordinated epoch-boundary restart, the
+  routine re-pin protocol.
+- **Migration: none**; maskless generators are the unchanged default.
+
+### Stage 4 — roles and future-known covariates (DEC-CA-0026 back half)
+
+Accept `roles` (per-channel, record field — positional convention rejected);
+role-aware CPM mask construction; eval covariate windows **only after** the
+EVAL_POOL covariate-curation rule (exogeneity by provenance + informativeness
+screen) is written and its R² bar measured. `roles = 2` (future-known) stays
+refused until then even if 0/1 arm earlier.
+
+- **Contract digest: one bump** (field-set fold; co-schedule with Stage 3's
+  if timelines allow, so the fleet restarts once).
+- **Migration: none**; roles absent = all targets.
+
+### Stage 5 — long context (DEC-CA-0022; parked on the 22M seam)
+
+`context_length` (and `max_length` in lockstep) rise when the 22M size
+activates — that seam already forces throughput re-measurement, arch-digest
+recompute, and coordinated restart. Prior work: measured (not estimated)
+per-token cost at 8192 on the reference L40S; a pool-composition answer for
+sub-daily-only 8K-context windows.
+
+- **Contract digest: bumps regardless** (the 22M activation moves it anyway).
+- **Migration: none** — the length band widens, never narrows.
+
+### Stage 6 — scaling ladder: 313M+ on size-conditional silicon (DEC-CA-0027)
+
+Orthogonal to the submission-surface stages (it changes the model contract
+and the fleet, not the carrier). Owner-directed shape: **22M screen, duel at
+the large size on H100-class pods, small sizes keep their cheap ladders.**
+From-scratch-per-round dies between 22M and ~100M on any plausible SKU, so
+313M+ rounds are warm-start increments; the duel margin must be re-unitised
+from %-of-level to %-of-increment (baseline-referenced statistic — score the
+shared warm-start init as a third reference), or dethrones mechanically
+stop as the lineage compounds. Increment length (~6h candidate), margin
+form, and margin value are chosen jointly from the null-LCB noise-floor
+measurement, not by feel.
+
+- **Contract digest: bumps at arming** — new `[[training.sizes]]` block plus
+  `SizeSpec.expected_gpu` / `SizeSpec.target_train_hours` overrides; the
+  margin rework is a scoring-rule change (lockstep restart, receipt-recorded
+  mode, audit replays both rules).
+- **Migration: none for miners** — the submission surface is untouched; only
+  what happens to their data downstream scales.
+
+#### The era ladder (the warm-stage map, from DEC-CA-0027)
+
+Weights never cross sizes (strict-load design): each trained size carries
+its own lineage; what flows up the ladder is the crowned-corpus diet. Each
+era transition is a contract change, release-then-activate.
+
+| era | screen | throne (duel) | regime | margin | silicon |
+|---|---|---|---|---|---|
+| E0 (live) | none (every funded challenger duels) | 4M, 3h budget / 5h wall | warm-start lineage via cascade promotion | % of increment, decaying with tenure | per-leg SKU (4090 … L40S) |
+| E1 — 22M shakeout | 4M unchanged | {4M, 22M} combined | both from-scratch | 2% of level | + L40S-class |
+| E2 — 313M ladder | 22M mirror lineage (warm-start) | 313M increments ~6h | compounding lineage | % of increment | 4090 screen / H100 duel |
+| E3 — 1B | 22M mirror (or 313M mirror, open) | 1B increments | compounding lineage | % of increment | 8×H100 fleet |
+
+- **E1 is a machinery rehearsal, not a capability step**: the disabled 22M
+  size arms from-scratch (no warm-start or margin work needed at ~6B
+  tokens/round) purely to exercise per-size digests, throughput pins,
+  multi-size verdict pooling, and the new SizeSpec overrides on
+  mainnet-shaped rounds.
+- **E2 is the main act**: mirror screen (maturity-matched by
+  tokens-per-param, ~free to maintain; the screen needs no margin rework —
+  a shared baseline cancels in a ranking), increment duels, re-unitised
+  margin, 4M retires from scoring. Generation lifecycle: init round (random
+  init, WSD warmup) → compounding rounds (flat LR; each duel picks the next
+  increment's diet for throne and mirror) → release cuts (LR-decayed
+  *copies*; the lineage itself is never decayed) → reseed valve
+  (DEC-CA-0014 generalised; mirror reseeds the round the throne does).
+- **E3's hard gate**: deterministic multi-GPU or the bf16 recipe must land
+  first — single-GPU 1B is ~60 rounds to adequacy, a queue, not a ladder.
+- **Era boundaries — grow or reseed**: a new size starts from random init
+  (default) or is grown from the previous size's best checkpoint by a
+  deterministic function-preserving operator (μP-consistent width, depth
+  stacking; init provenance = grown-from ref + operator version). Option,
+  never default — settled at each era start by running both inits side by
+  side for the first k rounds and benching (DEC-CA-0014's instrument).
+
+### Never scheduled
+
+`start` / `freq` / `group_id` / `labels` / `quantiles` acceptance. Reserved
+names with published semantics, refused data — each waits for a consumer,
+and for `start`/`freq`/`group_id` the analysis says no consumer can exist
+under the pinned calendar-free, batch-independent architecture
+(DEC-CA-0021, DEC-CA-0024, DEC-CA-0025). They are carried in the reserved
+table so no miner can squat them and no future migration is needed to accept
+them.
+
+## Cross-cutting: budget denomination (Part D)
+
+The question assumed one flat point cap taxes long series and multivariate
+groups linearly and identically, penalising the SOTA target. Findings:
+
+1. **The binding budget is compute-denominated.** In `stream_cpu` mode the
+   stream stops at the training token budget (`target_train_hours` ×
+   `ref_throughput`, ~40B), and every point costs what the model spends
+   training on it. `max_total_points` binds only the materialised
+   `cache_reuse` drain and the sandbox output rlimit.
+2. **Width is priced by DEC-CA-0042**: the budget is denominated in
+   series-points (`[training] budget_denomination = "series_points"` — a
+   `(C, L)` series costs `L`), batches are 64 series at every width, and the
+   wall (`max_train_seconds`) — not the budget — bounds a wide leg
+   (DEC-CA-0001). DEC-CA-0047 (proposed) adds a scheduled proportional width
+   bonus.
+3. **Rejected:** per-series caps + series-count budgets (re-introduce shape
+   policy the token budget already prices better) and fully
+   compute-normalised budgets (≤10% fidelity for a schedule-coupled formula
+   every auditor would have to reproduce). The carrier cap is in
+   canonical-payload bytes (Stage 0).
+
+No `[generator]` cap is in `contract_digest` — renegotiating generator caps
+never breaks signatures or manifest gates; `budget_denomination` is a
+`[training]` term (digest-bound, drop-when-default).
+
+## Cross-cutting: the no-weights ceiling (Part D)
+
+**Stated as permanent roadmap policy:** generators are code-only. GAN,
+diffusion, flow, VQ-VAE generators and anything *fit to real data* are
+outside this competition's design space — not an unimplemented feature. The
+ban is what keeps the competed object a prior rather than a distillation,
+keeps submissions auditable (a 100KB program is reviewable; 100MB of
+parameters is not), and keeps the anti-distillation thesis of
+`docs/ARCHITECTURE.md` true.
+
+Two honest riders:
+
+- **The ceiling is enforced by extension globs, and its real wall is
+  `max_repo_mb`.** `FORBIDDEN_*_GLOBS` (`interface/validation.py:36,56`)
+  catch weight *files*; `config.json` is "any JSON object" up to the 128MB
+  repo cap, so numeric parameters can ship as JSON undetected. The hole is
+  size-bounded, not sealed — `validation.py`'s own comment says as much
+  ("extensions are enumerable-by-hand; the size cap is the wall").
+  Recommendation: lower `max_repo_mb` toward the
+  observed field size (~100KB repos, per the dedup cost notes — even 8MB
+  leaves 80× headroom) rather than pretend the glob list is the boundary.
+- **No narrow exception is defensible.** Every candidate ("small aux
+  sampler weights", "quantised seed tables") is a learned-parameter blob
+  whose provenance cannot be audited, which is the exact distillation hole.
+  The legitimate version already exists without exception: a generator may
+  *fit parameters inside the sandbox at round time*, deterministically from
+  the seed, from its own procedurally generated data — that is code
+  expressing a prior, and it is legal today.
+
+**Restated per DEC-CA-0028: the ceiling is no-shipped-DATA, not just
+no-shipped-weights.** Raw real series shipped as JSON/py literals are the
+same hole as weights (unauditable bulk numbers, distribution-matching against
+the eval pool's guessable upstreams, licensing the Hub then republishes) and
+are outside the design space by the same policy. The `max_repo_mb` reduction
+above is the wall for both.
+
+## Cross-cutting: shared real corpus (DEC-CA-0028; machinery wired, unarmed)
+
+If real data ever enters miner-side, it enters as ONE owner-published,
+frozen, licensed, digest-pinned corpus that every generator may READ
+(`[training] real_corpus_ref` → the opt-in `real_corpus_dir` constructor
+kwarg; repos stay code-only and miners compete on augmentation/synthesis
+CODE over the shared base — the TSMixup skill). Machinery is fully wired and
+inert: ref validation, drop-when-default digest binding (deployed digests
+untouched until set), parent-side digest-keyed materialisation cache,
+subprocess passthrough + container read-only mount, loud failure on an armed
+ref with no resolved corpus. Arming is config-only but FORBIDDEN until: (1)
+the pricing experiment runs (synthetic king vs base-verbatim via
+`genesis_generator_ref` vs base+naive-mixup); (2) `docs/EVAL_POOL.md` carries
+the corpus/eval-pool disjointness rule (provenance + time wall); (3) the
+licensed corpus artifact exists. See the decision node for the full analysis.
+
+## What each stage must NOT do (standing tripwires)
+
+- Accept any reserved field without a consumer in the same release
+  (DEC-CA-0020's refuse-unconsumed rule).
+- Move `corpus_digest` bytes for values-only corpora (golden vectors are the
+  guard).
+- Arm `roles = 2` before the EVAL_POOL exogeneity rule exists in writing.
+- Raise `max_channels` before the Stage 1 channel-drop fix ships.
+- Loosen the wall, the dup rules, or the determinism check to accommodate
+  any of this (DEC-CA-0001, DEC-CA-0008 stand).
+
+## Open questions (consolidated; each with its settling measurement)
+
+1. **MV-vs-univariate ablation** under the current eval — paired testnet
+   round, one `RoundSeeds` (gates Stage 2 sequencing). DEC-CA-0026.
+2. **Context-8192 throughput** on the reference L40S — replaces the ~10%
+   per-token estimate with a measurement (prices Stage 5). DEC-CA-0022.
+3. **Calendar-feature ablation at 4M** on GIFT frequency slices — decides
+   whether `freq` payload is ever worth an arch divergence. DEC-CA-0021.
+4. **Pool gap-rate measurement** (pre-interpolation missing-fraction per
+   source) — decides real-gaps vs injected-gaps for the masked eval slice.
+   DEC-CA-0023.
+5. **Exogenous-covariate informativeness distribution** — sets the R² bar
+   for the covariate curation screen. DEC-CA-0026.
+6. **Honest effective-rank distribution** from Stage 1 shadow telemetry —
+   validates (or kills) the 0.999 channel-correlation gate. DEC-CA-0026.
+7. **Digest-visible `[generator]` mirror**: whether `max_channels` (and the
+   accepted field set) should be mirrored into `[training]` so validators
+   mechanically detect a divergent trainer — decide at Stage 2 arming.
+   DEC-CA-0026 / DEC-CA-0020.

@@ -1,0 +1,7 @@
+{
+  "name": "reference-trend-seasonal-ar1",
+  "description": "Eight coupled channels with delayed trend, seasonality, AR noise and level shifts; seed-deterministic.",
+  "min_length": 128,
+  "max_length": 1024,
+  "channels": 8
+}

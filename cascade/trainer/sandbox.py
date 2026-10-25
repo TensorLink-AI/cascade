@@ -54,6 +54,7 @@ import numpy as np
 
 from ..shared.config import GeneratorConfig
 from ..shared.manifest import corpus_digest
+from ..shared.sandbox_policy import require_generator_sandbox
 from .corpus import CorpusError, CorpusResult, build_corpus, resolve_real_corpus
 
 log = logging.getLogger("cascade.trainer.sandbox")
@@ -294,6 +295,23 @@ def _netns_available() -> bool:
     return bool(_netns_prefix())
 
 
+def _isolation_lost() -> str:
+    """After a sandbox child failed: did the host's namespace wrapper itself
+    stop working (user.max_user_namespaces exhausted, an AppArmor/sysctl
+    change, EPERM at exec)? The probe is re-run rather than the child's stderr
+    read, because miner code controls that stderr and must not be able to
+    relabel its own crash as our fault. A lost wrapper clears the cached probe
+    so the next leg re-probes, and names the infra fault the worker, the CPU
+    tier and the funded-leg classifier already recognise ("" otherwise)."""
+    global _NETNS_PROBE
+    prefix = _NETNS_PROBE
+    if not prefix or _wrapper_works(prefix):
+        return ""
+    _NETNS_PROBE = None
+    return (f"sandbox_isolation_unavailable: the network namespace wrapper {' '.join(prefix)} "
+            "stopped working on this host while a generator child ran (infra, not the miner)")
+
+
 def _apply_rlimits(
     max_memory_mb: int, max_cpu_seconds: int, max_fsize_bytes: int, *, set_as: bool = True
 ) -> None:
@@ -471,6 +489,9 @@ def run_in_sandbox(
     sandbox (:mod:`cascade.trainer.sandbox_container`) with this rlimited child
     kept inside as defense in depth.
     """
+    # never in a process holding the trainer wallet / private pool unless
+    # hardened (raises SandboxPolicyError — not the miner's fault)
+    require_generator_sandbox(cfg, "run_in_sandbox")
     if cfg.sandbox_mode == "container":
         from .sandbox_container import run_in_container
 
@@ -529,12 +550,22 @@ def run_in_sandbox(
         meta_p = out_dir / "meta.json"
         if not meta_p.is_file():
             tail = (stderr or b"").decode("utf-8", "replace")[-2000:]
+            if use_netns and (lost := _isolation_lost()):
+                raise CorpusError(f"{lost}; child rc={proc.returncode}: {tail}")
             raise CorpusError(f"sandbox_crashed (rc={proc.returncode}): {tail}")
         meta = json.loads(meta_p.read_text(encoding="utf-8"))
         if not meta.get("ok"):
             raise CorpusError(f"generator_output_rejected: {meta.get('error')}")
 
         series = _load_series(out_dir / "corpus.npz", int(meta["n_series"]))
+        from ..interface.generator import SeriesValidator
+
+        validator = SeriesValidator.from_config(cfg)
+        for index, item in enumerate(series):
+            try:
+                series[index] = validator.process(item, index)
+            except ValueError as e:
+                raise CorpusError(f"generator_output_rejected: {e}") from e
         digest = corpus_digest(series)
         if digest != meta.get("digest"):
             raise CorpusError("sandbox_digest_mismatch: corpus altered in transit")
@@ -569,10 +600,12 @@ def _read_exact(rd: io.BufferedReader, n: int) -> bytes | None:
 _RECORD_MARKER = b"\xff" * 8
 
 
-def _read_frame_body(rd: io.BufferedReader) -> bytes | None:
+def _read_frame_body(rd: io.BufferedReader, max_bytes: int = 256 * 1024 * 1024) -> bytes | None:
     header = _read_exact(rd, 8)
     if not header or len(header) < 8:
         return None
+    if int.from_bytes(header, "big") > max_bytes:
+        raise CorpusError("sandbox_stream_failed: frame exceeds output limit")
     body = _read_exact(rd, int.from_bytes(header, "big"))
     if body is None or len(body) < int.from_bytes(header, "big"):
         return None
@@ -580,7 +613,7 @@ def _read_frame_body(rd: io.BufferedReader) -> bytes | None:
 
 
 def _frame_iter(
-    proc: subprocess.Popen, inactivity_timeout: int
+    proc: subprocess.Popen, inactivity_timeout: int, max_frame_bytes: int = 256 * 1024 * 1024
 ) -> Iterator[np.ndarray | dict]:
     """Yield series from the child's stdout: plain length-prefixed .npy frames,
     or marker-introduced record frames (see :data:`_RECORD_MARKER`)."""
@@ -591,12 +624,16 @@ def _frame_iter(
         if not ready:
             raise CorpusError(f"generator_stalled: no series for {timeout}s")
         header = _read_exact(rd, 8)
-        if not header or len(header) < 8:
-            break  # clean EOF: child finished its prefix (or died — checked below)
+        if not header:
+            break  # wait below distinguishes exhaustion from a dying child
+        if len(header) < 8:
+            raise CorpusError("sandbox_stream_failed: truncated frame header")
         if header == _RECORD_MARKER:
             count_b = _read_exact(rd, 8)
             if not count_b or len(count_b) < 8:
-                break
+                raise CorpusError("sandbox_stream_failed: truncated record header")
+            if not 1 <= int.from_bytes(count_b, "big") <= 32:
+                raise CorpusError("sandbox_stream_failed: invalid record field count")
             rec: dict[str, np.ndarray] = {}
             broken = False
             for _ in range(int.from_bytes(count_b, "big")):
@@ -604,8 +641,10 @@ def _frame_iter(
                 if not name_len_b or len(name_len_b) < 8:
                     broken = True
                     break
+                if int.from_bytes(name_len_b, "big") > 4096:
+                    raise CorpusError("sandbox_stream_failed: field name exceeds limit")
                 name_b = _read_exact(rd, int.from_bytes(name_len_b, "big"))
-                body = None if name_b is None else _read_frame_body(rd)
+                body = None if name_b is None else _read_frame_body(rd, max_frame_bytes)
                 if name_b is None or body is None:
                     broken = True
                     break
@@ -613,16 +652,23 @@ def _frame_iter(
                     np.lib.format.read_array(io.BytesIO(body), allow_pickle=False)
                 )
             if broken:
-                break  # child died mid-record
+                raise CorpusError("sandbox_stream_failed: truncated record")
             yield rec
             continue
+        if int.from_bytes(header, "big") > max_frame_bytes:
+            raise CorpusError("sandbox_stream_failed: frame exceeds output limit")
         body = _read_exact(rd, int.from_bytes(header, "big"))
         if body is None or len(body) < int.from_bytes(header, "big"):
-            break  # child died mid-frame
+            raise CorpusError("sandbox_stream_failed: truncated frame body")
         yield np.ascontiguousarray(np.lib.format.read_array(io.BytesIO(body), allow_pickle=False))
-    rc = proc.poll()
-    if rc not in (0, None):
+    try:
+        rc = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        raise CorpusError("sandbox_stream_failed: stdout closed but child did not exit") from e
+    if rc != 0:
         err = (proc.stderr.read() or b"").decode("utf-8", "replace")[-2000:]
+        if lost := _isolation_lost():
+            raise CorpusError(f"{lost}; child rc={rc}: {err}")
         raise CorpusError(f"sandbox_stream_failed (rc={rc}): {err}")
 
 
@@ -685,6 +731,7 @@ def stream_series(
     sandbox (:mod:`cascade.trainer.sandbox_container`), the rlimited child kept
     inside as defense in depth.
     """
+    require_generator_sandbox(cfg, "stream_series")
     if cfg.sandbox_mode == "container":
         from .sandbox_container import stream_series_container
 
@@ -742,7 +789,8 @@ def stream_series(
         # else max_generate_seconds (DEC-CA-0031 decoupled the two so raising
         # the batch drain budget cannot widen how long a stalled generator
         # holds a lane).
-        yield _frame_iter(proc, cfg.effective_stall_seconds)
+        yield _frame_iter(proc, cfg.effective_stall_seconds,
+                          cfg.max_channels * cfg.max_length * 8 + 1024 * 1024)
     except BaseException:
         _terminate(proc)
         raise

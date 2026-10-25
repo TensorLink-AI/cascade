@@ -162,6 +162,13 @@ class WindowScoreRecord:
     scores back into ``evaluate_round`` and reproduce the verdict bit-for-bit
     without a GPU. ``source`` drives the cluster bootstrap; without it the
     recomputed LCB would not match a verdict judged on a source-labeled pool.
+
+    ``domain`` (DEC-CA-0050 P2) is the window's pool domain label, so an
+    auditor can re-derive per-domain statistics (the lane-B domain verdict and
+    its guards, the ``per_domain_win_rate`` diagnostic) from the signed scores
+    alone. DROP-WHEN-DEFAULT: ``None`` (an unlabeled pool, and every receipt
+    archived before the field existed) is omitted from the canonical body, so
+    those receipts hash byte-for-byte as before.
     """
 
     series_id: str
@@ -171,9 +178,15 @@ class WindowScoreRecord:
     abs_target: float
     quantile_levels: tuple[float, ...]
     source: str | None = None
+    domain: str | None = None
 
     @classmethod
-    def from_score(cls, ws) -> WindowScoreRecord:
+    def from_score(cls, ws, *, keep_domain: bool = False) -> WindowScoreRecord:
+        """``keep_domain`` stamps the window's pool domain. The validator sets
+        it ONLY while lane B is active at the settlement's block
+        (``ValidatorRunner._window_records``): the deployed pool already
+        carries domain labels, so stamping unconditionally would change every
+        receipt's bytes the day v2 deploys. Default off = pre-v2 records."""
         """From a :class:`cascade.eval.scoring.WindowScore`."""
         return cls(
             series_id=str(ws.series_id),
@@ -183,6 +196,7 @@ class WindowScoreRecord:
             abs_target=float(ws.abs_target),
             quantile_levels=tuple(float(q) for q in ws.quantile_levels),
             source=(str(ws.source) if ws.source else None),
+            domain=(str(ws.domain) if keep_domain and getattr(ws, "domain", "") else None),
         )
 
     def to_score(self):
@@ -200,6 +214,7 @@ class WindowScoreRecord:
             quantile_levels=self.quantile_levels,
             source=self.source,
             channel=self.channel,
+            domain=self.domain or "",
         )
 
 
@@ -253,6 +268,14 @@ _PARAMS_DROP_WHEN_DEFAULT: dict[str, object] = {
     # Multivariate window aggregation (DEC-CA-0041): per-channel on every round
     # before mv_score_from_block, including all archived rounds.
     "mv_score": False,
+    # DEC-CA-0054 bench gate: off on every archived round.
+    "bench_gate_mode": "off",
+    "bench_gate_min_items": 10,
+    # DEC-CA-0061 bench-gate rule: the DEC-CA-0054 rule on every archived round,
+    # and rule v2's thresholds at their defaults ([scoring] bench_gate_*).
+    "bench_gate_rule": "dec-ca-0054",
+    "bench_gate_tolerance": 0.01,
+    "bench_gate_min_win_rate": 0.5,
 }
 
 
@@ -326,6 +349,12 @@ class VerdictRecord:
     # (see ``_verdict_body``), so archived receipt signatures survive.
     init_baseline_geomean: float | None = None
     init_floor_passed: bool | None = None
+    # DEC-CA-0054 bench gate outcome; None (not run) is dropped from the body.
+    bench_gate_passed: bool | None = None
+    # DEC-CA-0061: the rule, its three numbers (avg_ratio, worst_lcb,
+    # win_rate) and per-suite ratios that judged (``BenchGateResult.detail``);
+    # None (DEC-CA-0054 / not run) is dropped.
+    bench_gate_detail: dict | None = None
 
     # ── scored horizon ladder / duel-only display fields ────────────────────
     # ``per_horizon``: the decided pair's per-rung breakdown on a ladder round
@@ -424,6 +453,8 @@ class VerdictRecord:
             init_baseline_geomean=_none_for_nan(
                 getattr(result, "baseline_geomean", None)),
             init_floor_passed=getattr(result, "init_floor_passed", None),
+            bench_gate_passed=getattr(result, "bench_gate_passed", None),
+            bench_gate_detail=getattr(result, "bench_gate_detail", None),
             per_horizon=_clean_per_horizon(getattr(result, "per_horizon", None)),
             cohort_geomeans=(
                 {str(h): _none_for_nan(float(v)) for h, v in cohort_geomeans.items()}
@@ -468,6 +499,10 @@ def _verdict_body(v: VerdictRecord | None) -> dict | None:
         d.pop("init_baseline_geomean", None)
     if d.get("init_floor_passed") is None:
         d.pop("init_floor_passed", None)
+    if d.get("bench_gate_passed") is None:
+        d.pop("bench_gate_passed", None)
+    if d.get("bench_gate_detail") is None:
+        d.pop("bench_gate_detail", None)
     for key in ("per_horizon", "cohort_geomeans", "cohort_per_horizon",
                 "per_domain", "cohort_per_domain"):
         if not d.get(key):
@@ -527,10 +562,76 @@ class RoundReceipt:
     # (0 = none resolved, or typed into chain.toml). Stamped from lock-in on so
     # the audit replays each verdict under the bar the fleet decided.
     margin_v2_block: int = 0
-    # Staged-promotion carry (DEC-CA-0050, drop-when-default): the
-    # ``promotion_carry_from_block`` this validator resolved FROM VALIDATOR
-    # SIGNALS (0 = none resolved, or typed into chain.toml).
-    promotion_carry_block: int = 0
+    # cascade v2 (DEC-CA-0050, drop-when-default): ``[v2] from_block`` when
+    # this settlement judges a v2 era (its era starts at or after it), else 0
+    # — so every pre-v2 receipt serialises byte-for-byte as before and the
+    # audit replays each round under its own block's rules.
+    v2_block: int = 0
+    # Lane B (DEC-CA-0050, drop-when-default): this validator's verdict rows
+    # for the settlement's expert manifest (None = lane B not active, so
+    # every pre-lane-B receipt serialises and verifies byte-for-byte as before).
+    lane_b: tuple[dict, ...] | None = None
+    # Lane-B payout record (DEC-CA-0050, drop-when-default): present exactly
+    # when the recorded vector is the combined lane-A + lane-B vector —
+    # ``{"block", "era_blocks", "wins": [{domain, hotkey, uid, merge_block,
+    # age, multiplier}]}`` (age in eras), the decay clock and every PAID
+    # domain win (expired ones are unpaid, absent) — so the
+    # audit rebuilds the vector exactly (each slot ≤ share/n × multiplier, the
+    # unpaid share to burn). None on every pre-lane-B receipt.
+    lane_b_pay: dict | None = None
+    # DEC-CA-0055 (all drop-when-default, so every earlier receipt keeps its
+    # signed bytes): ``prelaunch_burn_block`` — the pre-launch burn block this
+    # validator resolved FROM VALIDATOR SIGNALS (0 = none, or typed);
+    # ``emission`` — the emission record the vector was built under
+    # (:func:`cascade.shared.emission.emission_record`: the policy, the
+    # lane-A ladder state and the transition that produced it), present
+    # whenever a DEC-CA-0055 rule shaped the vector; ``king_check`` — the
+    # v2 king check judged at this settlement (``{"result": "pass" | "fail" |
+    # "deferred", "round_id", "king_pointer", "reasons", ...}``).
+    prelaunch_burn_block: int = 0
+    emission: dict | None = None
+    king_check: dict | None = None
+    # DEC-CA-0058 (drop-when-default: only when a king check is stamped AND it
+    # scored rows the receipt does not already carry): the pool rows the king
+    # check fed ``evaluate_round`` that are not in ``entry_scores`` — role
+    # "king" (a settlement with no duel, so no king rows) and/or role "init"
+    # (the current init, when the verdict scored no ``baseline`` rows) — so
+    # the audit replays the check's LCB instead of trusting its result.
+    king_check_scores: tuple[EntryScores, ...] = ()
+    # Lane C (DEC-CA-0056, drop-when-default): this validator's verdict rows
+    # for the settlement's bound lane-C manifest (``[]`` when nothing was
+    # judged), and the payout record ``{"block", "era_blocks", "share",
+    # "slots", "wins": [{target, hotkey, uid, win_block, age, multiplier}]}``
+    # present exactly when the vector carries lane C — so the audit rebuilds
+    # the 3-lane vector. None on every pre-lane-C receipt (bytes unchanged).
+    lane_c: tuple[dict, ...] | None = None
+    lane_c_pay: dict | None = None
+    # DEC-CA-0057 (drop-when-default, so every receipt judged without an
+    # overlay keeps its exact bytes): the owner-signed network-config overlay
+    # this settlement was judged under — its ``seq`` and body digest; the
+    # audit fetches ``config/network/seq-<n>.json`` and checks the digest.
+    netconfig_seq: int = 0
+    netconfig_digest: str = ""
+    # DEC-CA-0058 (drop-when-default; stamped only once ``[netconfig]
+    # owner_hotkey`` is set, so every receipt before the main/satellite
+    # topology keeps its exact bytes): ``manifest_sha256`` — sha256 of the
+    # EXACT published ``manifests/round-<id>.json`` text this settlement
+    # judged (the validator's ``last_handled_manifest_sha``);
+    # ``state_prior_sha256`` — :func:`cascade.shared.settlement_state.
+    # state_digest` of the settlement state BEFORE it was applied;
+    # ``state_post`` — that state AFTER it (king, tenure, court, ladder,
+    # lane-B/C slots and pending). A satellite checks each receipt's prior
+    # digest against the previous receipt's posterior.
+    manifest_sha256: str = ""
+    state_prior_sha256: str = ""
+    state_post: dict | None = None
+    # DEC-CA-0063 (drop-when-default: only on a settlement whose lane-A bench
+    # rows come from the main validator): the validator bench report the
+    # bench gate / king check read — ``{"key", "sha256", "signer"}``, the
+    # store key, sha256 of its EXACT published text and the main validator
+    # hotkey it verifies against — so the audit (and a satellite) replays
+    # from exactly those bytes. None on every trainer-sourced receipt.
+    bench_report: dict | None = None
     receipt_version: int = RECEIPT_VERSION
     signature: str | None = None             # validator-hotkey signature over canonical_body
 
@@ -562,7 +663,7 @@ class RoundReceipt:
             "manifest": self.manifest,
             "participants": [asdict(p) for p in self.participants],
             "eval_context": asdict(self.eval_context) if self.eval_context else None,
-            "entry_scores": [asdict(e) for e in self.entry_scores],
+            "entry_scores": [_entry_scores_body(e) for e in self.entry_scores],
             "verdict": _verdict_body(self.verdict),
             "reward_uids": list(self.reward_uids),
             "weights": list(self.weights),
@@ -577,11 +678,50 @@ class RoundReceipt:
             body["activation_block"] = int(self.activation_block)
         if self.margin_v2_block:
             body["margin_v2_block"] = int(self.margin_v2_block)
-        if self.promotion_carry_block:
-            body["promotion_carry_block"] = int(self.promotion_carry_block)
+        if self.v2_block:
+            body["v2_block"] = int(self.v2_block)
+        if self.lane_b is not None:
+            body["lane_b"] = [dict(r) for r in self.lane_b]
+        if self.lane_b_pay is not None:
+            body["lane_b_pay"] = json.loads(json.dumps(self.lane_b_pay, sort_keys=True))
+        if self.prelaunch_burn_block:
+            body["prelaunch_burn_block"] = int(self.prelaunch_burn_block)
+        if self.emission is not None:
+            body["emission"] = json.loads(json.dumps(self.emission, sort_keys=True))
+        if self.king_check is not None:
+            body["king_check"] = json.loads(json.dumps(self.king_check, sort_keys=True))
+        if self.king_check_scores:
+            body["king_check_scores"] = [_entry_scores_body(e) for e in self.king_check_scores]
+        if self.lane_c is not None:
+            body["lane_c"] = [json.loads(json.dumps(r, sort_keys=True)) for r in self.lane_c]
+        if self.lane_c_pay is not None:
+            body["lane_c_pay"] = json.loads(json.dumps(self.lane_c_pay, sort_keys=True))
+        if self.netconfig_seq:
+            body["netconfig_seq"] = int(self.netconfig_seq)
+            body["netconfig_digest"] = str(self.netconfig_digest)
+        if self.manifest_sha256:
+            body["manifest_sha256"] = str(self.manifest_sha256)
+        if self.state_prior_sha256:
+            body["state_prior_sha256"] = str(self.state_prior_sha256)
+        if self.state_post is not None:
+            body["state_post"] = json.loads(json.dumps(self.state_post, sort_keys=True))
+        if self.bench_report is not None:
+            body["bench_report"] = json.loads(json.dumps(self.bench_report, sort_keys=True))
         return json.dumps(
             body, sort_keys=True, separators=(",", ":"), allow_nan=False
         ).encode("utf-8")
+
+
+def _entry_scores_body(e: EntryScores) -> dict:
+    """``asdict(e)`` with each window score's ``domain`` dropped at its
+    default (``None``) — the drop-when-default convention applied inside the
+    per-window records, so receipts of unlabeled pools (and every archived
+    receipt) keep their exact canonical bytes."""
+    d = asdict(e)
+    for rec in d["scores"]:
+        if rec.get("domain") is None:
+            rec.pop("domain", None)
+    return d
 
 
 def build_receipt(
@@ -605,7 +745,21 @@ def build_receipt(
     era_base_seed: int = 0,
     activation_block: int = 0,
     margin_v2_block: int = 0,
-    promotion_carry_block: int = 0,
+    lane_b: list[dict] | None = None,
+    lane_b_pay: dict | None = None,
+    v2_block: int = 0,
+    prelaunch_burn_block: int = 0,
+    emission: dict | None = None,
+    king_check: dict | None = None,
+    king_check_scores: tuple[EntryScores, ...] = (),
+    lane_c: list[dict] | None = None,
+    lane_c_pay: dict | None = None,
+    netconfig_seq: int = 0,
+    netconfig_digest: str = "",
+    manifest_sha256: str = "",
+    state_prior_sha256: str = "",
+    state_post: dict | None = None,
+    bench_report: dict | None = None,
 ) -> RoundReceipt:
     """Assemble a receipt from live-loop objects (``seeds`` is a ``RoundSeeds``).
 
@@ -634,7 +788,21 @@ def build_receipt(
         era_base_seed=int(era_base_seed or 0),
         activation_block=int(activation_block or 0),
         margin_v2_block=int(margin_v2_block or 0),
-        promotion_carry_block=int(promotion_carry_block or 0),
+        v2_block=int(v2_block or 0),
+        lane_b=None if lane_b is None else tuple(dict(r) for r in lane_b),
+        lane_b_pay=None if lane_b_pay is None else dict(lane_b_pay),
+        prelaunch_burn_block=int(prelaunch_burn_block or 0),
+        emission=None if emission is None else dict(emission),
+        king_check=None if king_check is None else dict(king_check),
+        king_check_scores=tuple(king_check_scores),
+        lane_c=None if lane_c is None else tuple(dict(r) for r in lane_c),
+        lane_c_pay=None if lane_c_pay is None else dict(lane_c_pay),
+        netconfig_seq=int(netconfig_seq or 0),
+        netconfig_digest=str(netconfig_digest or "") if netconfig_seq else "",
+        manifest_sha256=str(manifest_sha256 or ""),
+        state_prior_sha256=str(state_prior_sha256 or ""),
+        state_post=None if state_post is None else dict(state_post),
+        bench_report=None if bench_report is None else dict(bench_report),
     )
 
 
@@ -670,13 +838,34 @@ def load_receipt(text: str) -> RoundReceipt:
     The received body is kept on the returned receipt, so the signature is
     checked over the bytes the validator actually signed. Fields this code
     does not know (written by newer code) are ignored for parsing but stay
-    covered by the signature — an older reader can no longer fail
-    verification on a valid receipt (2026-10-02: the margin_v2_block stamp
-    made a pre-#345 trainer fall back to the deposed king for 20 min)."""
+    covered by the signature, so an older reader never fails verification
+    on a valid receipt that carries a newer stamp."""
     obj = json.loads(text)
     receipt = _receipt_from_obj(obj)
     object.__setattr__(receipt, "_received_body", _received_body(obj))
     return receipt
+
+
+def _entry_scores_from_obj(e: dict) -> EntryScores:
+    return EntryScores(
+        role=str(e["role"]),
+        size=str(e["size"]),
+        hotkey=str(e["hotkey"]),
+        uid=int(e["uid"]),
+        scores=tuple(
+            WindowScoreRecord(
+                series_id=str(s["series_id"]),
+                channel=int(s["channel"]),
+                mase=float(s["mase"]),
+                qloss_per_q=tuple(float(q) for q in s["qloss_per_q"]),
+                abs_target=float(s["abs_target"]),
+                quantile_levels=tuple(float(q) for q in s["quantile_levels"]),
+                source=(str(s["source"]) if s.get("source") else None),
+                domain=(str(s["domain"]) if s.get("domain") else None),
+            )
+            for s in e["scores"]
+        ),
+    )
 
 
 def _receipt_from_obj(obj: dict) -> RoundReceipt:
@@ -710,27 +899,7 @@ def _receipt_from_obj(obj: dict) -> RoundReceipt:
             n_windows=int(ec["n_windows"]),
             num_samples=int(ec["num_samples"]),
         ) if ec else None,
-        entry_scores=tuple(
-            EntryScores(
-                role=str(e["role"]),
-                size=str(e["size"]),
-                hotkey=str(e["hotkey"]),
-                uid=int(e["uid"]),
-                scores=tuple(
-                    WindowScoreRecord(
-                        series_id=str(s["series_id"]),
-                        channel=int(s["channel"]),
-                        mase=float(s["mase"]),
-                        qloss_per_q=tuple(float(q) for q in s["qloss_per_q"]),
-                        abs_target=float(s["abs_target"]),
-                        quantile_levels=tuple(float(q) for q in s["quantile_levels"]),
-                        source=(str(s["source"]) if s.get("source") else None),
-                    )
-                    for s in e["scores"]
-                ),
-            )
-            for e in obj.get("entry_scores", ())
-        ),
+        entry_scores=tuple(_entry_scores_from_obj(e) for e in obj.get("entry_scores", ())),
         verdict=VerdictRecord(
             params=dict(verdict["params"]),
             bootstrap_seed=str(verdict["bootstrap_seed"]),
@@ -771,6 +940,10 @@ def _receipt_from_obj(obj: dict) -> RoundReceipt:
                 else float(verdict["init_baseline_geomean"])
             ),
             init_floor_passed=verdict.get("init_floor_passed"),
+            # DEC-CA-0054 / DEC-CA-0061: absent ⇒ None ⇒ dropped again.
+            bench_gate_passed=verdict.get("bench_gate_passed"),
+            bench_gate_detail=(dict(verdict["bench_gate_detail"])
+                               if isinstance(verdict.get("bench_gate_detail"), dict) else None),
             per_horizon=_clean_per_horizon(verdict.get("per_horizon")),
             cohort_geomeans=(
                 {str(h): (None if v is None else float(v))
@@ -797,7 +970,29 @@ def _receipt_from_obj(obj: dict) -> RoundReceipt:
         era_base_seed=int(obj.get("era_base_seed", 0) or 0),
         activation_block=int(obj.get("activation_block", 0) or 0),
         margin_v2_block=int(obj.get("margin_v2_block", 0) or 0),
-        promotion_carry_block=int(obj.get("promotion_carry_block", 0) or 0),
+        v2_block=int(obj.get("v2_block", 0) or 0),
+        lane_b=(None if obj.get("lane_b") is None
+                else tuple(dict(r) for r in obj["lane_b"])),
+        lane_b_pay=(dict(obj["lane_b_pay"]) if isinstance(obj.get("lane_b_pay"), dict)
+                    else None),
+        prelaunch_burn_block=int(obj.get("prelaunch_burn_block", 0) or 0),
+        emission=(dict(obj["emission"]) if isinstance(obj.get("emission"), dict) else None),
+        king_check=(dict(obj["king_check"]) if isinstance(obj.get("king_check"), dict)
+                    else None),
+        king_check_scores=tuple(_entry_scores_from_obj(e)
+                                for e in obj.get("king_check_scores", ())),
+        lane_c=(None if obj.get("lane_c") is None
+                else tuple(dict(r) for r in obj["lane_c"])),
+        lane_c_pay=(dict(obj["lane_c_pay"]) if isinstance(obj.get("lane_c_pay"), dict)
+                    else None),
+        netconfig_seq=int(obj.get("netconfig_seq", 0) or 0),
+        netconfig_digest=str(obj.get("netconfig_digest", "") or ""),
+        manifest_sha256=str(obj.get("manifest_sha256", "") or ""),
+        state_prior_sha256=str(obj.get("state_prior_sha256", "") or ""),
+        state_post=(dict(obj["state_post"]) if isinstance(obj.get("state_post"), dict)
+                    else None),
+        bench_report=(dict(obj["bench_report"]) if isinstance(obj.get("bench_report"), dict)
+                      else None),
         receipt_version=version,
         signature=obj.get("signature"),
     )
@@ -816,6 +1011,8 @@ def summarize_receipt(receipt: RoundReceipt) -> dict:
     remains the source of truth, and the index carries a ``receipt_key`` pointer
     back to it (added by :func:`cascade.shared.hippius.update_receipt_index`).
     """
+    from .v2_status import v2_index_fields as _v2_index_fields
+
     entries = receipt.manifest.get("entries", []) if isinstance(receipt.manifest, dict) else []
 
     # The challenger the verdict belongs to: the LAST one scored. Under the cohort
@@ -953,8 +1150,7 @@ def summarize_receipt(receipt: RoundReceipt) -> dict:
         "activation_block": int(receipt.activation_block or 0),
         # DEC-CA-0049: the margin-v2 block resolved from validator signals.
         "margin_v2_block": int(receipt.margin_v2_block or 0),
-        # DEC-CA-0050: the promotion-carry block resolved from validator signals.
-        "promotion_carry_block": int(receipt.promotion_carry_block or 0),
+        **_v2_index_fields(receipt),
     }
 
 
@@ -986,19 +1182,10 @@ def verify_receipt_signature(receipt: RoundReceipt, validator_hotkey: str) -> bo
     """
     if not receipt.signature or not validator_hotkey:
         return False
-    try:
-        from bittensor import Keypair  # type: ignore
-    except ImportError as e:  # pragma: no cover — audit warns before calling this
-        raise RuntimeError(
-            "bittensor required to verify receipt signatures; install the [chain] extra"
-        ) from e
+    from .sr25519 import verify_hotkey  # raises SignatureVerifierUnavailable, never False
     # A receipt loaded from text verifies over the bytes it arrived with, so a
     # field added by newer code cannot break an older reader. A constructed
     # (or ``replace``-d) receipt carries no received body and verifies over
     # its own canonical body — any field tamper still kills the signature.
     body = getattr(receipt, "_received_body", None) or receipt.canonical_body()
-    try:
-        kp = Keypair(ss58_address=validator_hotkey)
-        return bool(kp.verify(body, bytes.fromhex(receipt.signature)))
-    except Exception:  # noqa: BLE001 — any malformed sig/address ⇒ untrusted
-        return False
+    return verify_hotkey(validator_hotkey, body, receipt.signature)

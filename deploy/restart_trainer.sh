@@ -1,5 +1,5 @@
 #!/bin/bash
-# One-shot trainer relaunch — exact prior arg line (2026-08-19 r29 heat re-run).
+# One-shot trainer relaunch.
 # Live copy on the box: /root/cascade/restart_trainer.sh (replace on deploy).
 #
 # Hardened after the r47 stray-trio incident (OPSLOG 2026-08-28 12:35): the
@@ -83,13 +83,27 @@ if [ -n "$OLD_PIDS" ]; then
   exit 1
 fi
 
+# Logs: the service writes trainer.log itself, size-rotated (--log-file:
+# trainer.log.1 … .10 at 200 MiB each), so the file no longer grows forever.
+# stdout/stderr (prints, an uncaught crash traceback) go to trainer.out, which
+# is rotated here at launch once it passes 50 MiB (one generation kept).
+if [ -f trainer.out ] && [ "$(stat -c %s trainer.out 2>/dev/null || echo 0)" -gt 52428800 ]; then
+  mv -f trainer.out trainer.out.1
+fi
+# A trainer.log left by the old `>> trainer.log` launch line is rotated once
+# the same way, so the handler starts from a bounded file.
+if [ -f trainer.log ] && [ "$(stat -c %s trainer.log 2>/dev/null || echo 0)" -gt 209715200 ]; then
+  mv -f trainer.log trainer.log.pre-rotation
+fi
+
 set -a && . ./.env && set +a
 nohup .venv/bin/python .venv/bin/cascade-trainer \
   --wallet-name main_one --wallet-hotkey sn_validator_hk \
   --network finney --chain-toml chain.toml \
   --trainer cascade.trainer.toto2_trainer:Toto2Trainer \
-  --remote-hosts hosts.toml --hosts-wait-seconds 5400 \
-  >> trainer.log 2>&1 &
+  --remote-hosts hosts.toml \
+  --log-file trainer.log \
+  >> trainer.out 2>&1 &
 NEW_PID=$!
 echo "trainer pid $NEW_PID"
 
@@ -112,7 +126,7 @@ if [ -n "$STRAYS" ]; then
   exit 1
 fi
 if ! kill -0 "$NEW_PID" 2>/dev/null; then
-  echo "FATAL: new $SERVICE (pid $NEW_PID) exited right after launch — check trainer.log"
+  echo "FATAL: new $SERVICE (pid $NEW_PID) exited right after launch — check trainer.out and trainer.log"
   exit 1
 fi
 echo "verified: the only running $SERVICE is the new pid $NEW_PID (no strays)"

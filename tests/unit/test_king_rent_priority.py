@@ -23,9 +23,7 @@ def test_king_pending_only_while_the_jit_king_is_armed_and_unrented(tmp_path):
     r._funded_king_host = None
     r._king_rent_done = True                        # any outcome of the king's rent
     assert r._king_pending() is False
-    assert _runner(tmp_path).__class__ and _runner(tmp_path)._king_pending() is False   # JIT king off
-    gated = _runner(tmp_path, funded_king_rent=True, funded_activation_block=10**9)
-    assert gated._king_pending() is False           # funded gate closed ⇒ the king never rents
+    assert _runner(tmp_path)._king_pending() is False   # JIT king off
 
 
 def test_challenger_capacity_wait_yields_to_the_king_then_proceeds(tmp_path):

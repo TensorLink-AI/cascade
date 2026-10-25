@@ -1,391 +1,451 @@
-# cascade architecture
+# Cascade architecture
+
+This document describes the implemented rolling A/B/C system. It is an
+implementation map, not live configuration. Discover deployment state through
+`cascade status --json`; use signed contracts, manifests and receipts for
+eligibility and outcomes. [Decisions](../decisions/) amend historical rules;
+[operator](OPERATOR.md), [miner](MINER.md) and [validator](VALIDATOR.md) guides
+cover role-specific procedures.
+
+**Read by task:** [roles and flow](#roles-and-data-flow) · [scoring](#scoring)
+· [status](#discovery-and-miner-status) · [communication map](#communication-map)
+· [configuration](#configuration-and-compatibility) · [trust](#trust-model).
+
+In this guide, a **leg** is one training run; an **era** fixes its shared
+starting checkpoint and rules; a **settlement** judges compatible completed
+work. The **king** is A's current winner. The **init** or **warm start** is the
+shared starting checkpoint, which can differ from the king's trained weights.
+The trainer signs **manifests**; validators sign **receipts** recording decisions.
 
 ## The thesis
 
-A time-series foundation model is only as good as the data it was trained on.
-cascade makes **synthetic training data** the competitive resource: miners
-write data generators, the subnet owner trains **a Toto2-4M backbone from random
-initialisation** on each, and the generator whose data yields the best forecaster
-wins. By holding the model architecture and the entire training process constant,
-the subnet turns a noisy question ("is this model good?") into a controlled one
-("is this *data* good?").
+Miners compete on synthetic training data under a fixed comparison contract.
+A/B contributions can accumulate in a shared forecasting model lineage. C is a
+separate application competition, currently MarketCast on a pinned Timestral
+base. Its checkpoints do not merge into A/B.
 
-Training **from scratch** (not fine-tuning a released checkpoint) is what makes
-that attribution clean: a fine-tune confounds data quality with what the
-pretrained weights already encode, whereas from random init the corpus is the
-*only* source of learned signal. This mirrors Toto 2.0 itself, whose pretraining
-mix is 57.5% synthetic and 0% public time series yet still tops GIFT-Eval — the
-synthetic prior is the lever, and cascade competes it.
+Pre-v2 eras use the Toto2 lineage; v2 starts a fresh Cascade MoE lineage under
+`[v2.training]`. The checked-in rolling preset is `cascade-moe-28m`, not the
+separate guarded approximately 220M-active direct runtime. Activation is an era
+boundary, and the contract is resolved at the era start. Old implementations
+remain necessary to replay prior settlements; they are not alternative defaults.
+
+The next model family has reserved **2M, 7M, 28M, 56M and ~120M active-parameter
+variants** in the [model preset directory](../deploy/presets/README.md).
+They are blocked placeholders awaiting model definitions and qualification;
+they do not change the checked-in training contract. The new 28M variant uses
+a separate identity from the existing implementation.
+Smaller variants are intended for cheaper miner experiments. Local results
+remain specific to that variant; the effective competition contract determines
+the architecture used for live training and rewards.
 
 ## Roles and data flow
 
 ### 1. Miner — submits a generator
 
-A miner writes `generator.py` exposing `Generator(DataGenerator)`, pushes the
-repo to the **Hippius Hub registry** (OCI) with `cascade deploy`, and commits a
-single on-chain pointer:
+A/B miners submit deterministic, code-only Python generators. B also declares
+eligible targets; the trainer selects routed expert rows. C submits an eligible
+MarketCast recipe, optionally including a generator. Inputs are immutable
+refs bound to on-chain commitments and signed intake requests. A hotkey holds
+one commitment, so replacing it can supersede another lane's queued entry.
 
-```
-metro-v1:gen:hippius:<repo>@<digest>
-```
+| Lane | Entry path | Scientific state after training |
+|---|---|---|
+| A | `miner/cli.py` → `funding/intake.py` → `FundedQueue` | Settlement, private-pool comparison and applicable public benchmark gate |
+| B | `miner/lane_b.py` → lane-B intake/queue → `trainer/lane_b_driver.py` | Target qualification, then warm-start merge acceptance when enabled |
+| C | `miner/lane_c.py` → lane-C intake/queue → `trainer/lane_c_driver.py` | Forward judging, deferral or pending confirmation, then confirmed slot decision |
 
-The Hub `repo@digest` content-addresses the generator code, `config.json`, and
-`requirements.txt` together — it both locates and pins the submission (the OCI
-digest *is* the content hash, so there is no separate git SHA). A generator is
-code-only (purely algorithmic): no shipped weights of any kind, so a miner cannot
-distill a pretrained forecaster into the "generator". The distinction from horizon
-is *what is scored*: cascade scores the **data** (via a fixed model trained on it),
-horizon scores the submitted model directly. See `docs/INTERFACE.md`.
+Paths in this map are relative to `cascade/`. Publication and funding are
+explicit actions. The lane-specific CLI workflow and output contract are in
+[AGENT_MINING.md](AGENT_MINING.md); source/data limits are in
+[INTERFACE.md](INTERFACE.md).
+
+`funding/providers.py` signs an ordered Lium/Shadeform/Vast/Runpod credential list; the
+local vault retains immutable rental credentials under `leases/`. The public
+ledger holds only provider and opaque credential references. `provision/payer_pool.py`
+selects capacity before create, adopts existing pods after restart, and routes
+cleanup to the original account. An uncertain create never falls through to a
+second account. The separate direct runtime keeps its own provider rules.
+
+Non-secret `create-intents/` records survive restarts and credential expiry.
+An empty provider listing does not resolve them. A confirmed existing allocation
+can be adopted, or a positively observed allocation can be terminated; only
+then can recovery clear its intent. Ledger corruption fails closed, with atomic
+writes and a backup; heartbeat refreshes cannot undo a credential rotation.
+
+`miner/funding.py` shares signing and the validation/consent/wallet order across
+A/B/C. Lane modules retain target checks, endpoint selection and result fields;
+the public CLI helper functions remain compatibility entry points.
 
 ### 2. Trainer — owner-operated, the GPU boundary
 
-A round is one ~12h epoch (`[round] epoch_blocks`, 24h before 2026-07-28); the
-trainer runs one round per epoch (so the king is retrained twice a day). Each
-round:
+`trainer/rolling.py` owns era context, A admission, completion and settlement.
+`TrainerRunner` in `trainer/loop.py` supplies infrastructure through the
+`runner_*` mixins. B/C drivers run alongside it, using shared admission and
+GPU capacity, while keeping their own scientific state.
 
-1. Resolves on-chain commitments to `(hotkey, uid, repo, revision)`, keeping only
-   those revealed **before the epoch boundary** (`resolve_commitments(...,
-   cutoff_block=epoch_start)`) — that boundary is the submission deadline.
-2. Identifies the reigning **king** (highest-incentive UID on the metagraph) and
-   the eligible **challenger field**.
-3. Derives one `RoundSeeds` from the round's base seed (the block hash **at the
-   epoch boundary**): a shared `generation_seed` and a shared `training_seed`,
-   used by every training in the round — heat and final, all sizes — so the whole
-   round shares one init (random, or the promoted cascade warm-start once a
-   generation is live — the current mainnet state).
-4. **Heat (screen).** Trains every eligible challenger cheaply
-   (`[round] heat_train_hours`, ~1h, on the primary/smallest size), scores each
-   on the held-out pool (geomean of CRPS/MASE), and keeps the top
-   `[round] finalists` (default 1; a top the screen cannot statistically
-   separate advances as a tied cohort, capped at `max_finalists`, 3). A
-   challenger that fails to train or score just
-   doesn't qualify. Every entrant is screened on the *same* window slice, so a
-   joint cluster bootstrap over the field is paired: the heat records `p_best`
-   per entrant and a `leader_lcb` against the runner-up on the manifest's heat
-   block, saying how decisive the screen was. Those are **diagnostics only** —
-   the finalists are the observed ranking, never a bounded one (DEC-CA-0006).
-   The standings are published the moment the heat settles — `status/heat.json`
-   plus a per-round `heats/round-<id>.json` and `heats/index.json`
-   (`cascade.shared.heat_status`) — so the dashboards and `cascade heat` show a
-   miner where it placed while the duel is still training, instead of waiting
-   for the round's receipt hours later. Presentational and unsigned, exactly
-   like the manifest's copy.
-5. **Final.** For the king and each surviving finalist, at **every configured
-   size** (the `[training]` primary plus each `[[training.sizes]]`, e.g. 4M + 22M),
-   **under that one shared seed pair**:
-   - opens the round's corpus stream (`cascade.trainer.stream.open_round_stream`,
-     selected by `[training] corpus_mode`): `stream_cpu` streams *fresh* `(C, L)`
-     series from a sandboxed generator with no reuse (rolling byte-exact digest);
-     `cache_reuse` draws a fixed corpus once (also sandboxed) and cycles it. Either
-     way the trainer gets one budget-capped iterator (univariate `C = 1` today;
-     the channel axis is carried so multivariate priors need no schema change),
-   - trains a **fresh Toto2 model from the round's shared init** (random, or
-     the promoted cascade warm-start) at that size via the owner's
-     `BaseTrainer` (`cascade.trainer.contract`; reference:
-     `cascade.trainer.toto2_trainer`) — it pulls series until the stream ends, for
-     the per-size budget (~3h on the reference GPU under a 5h wall, enforced as a fixed
-     `train_tokens` count so king and challenger get identical compute), streaming
-     per-step metrics (loss, lr, throughput) to **Hippius S3** (and, when
-     `[wandb] enabled`, mirroring the *same* records into a live wandb run — one
-     per round/competitor/size, tagged with the miner hotkey — so miners can watch
-     their generator train as it occurs; observability only, never fed to scoring),
-   - stamps one **host** record per run before the corpus stream opens
-     (`cascade.trainer.host_probe`, `[telemetry]`): lane geometry, CPU/GPU
-     capability, opaque pod + machine ids, and a *fixed* calibration bench
-     (`host_bench_tokens_per_s`) that is identical on every pod and independent of
-     the submission. It rides the same log channel and is what separates
-     pod-attributable slowness from generator-attributable slowness — the wall
-     prices generator speed deliberately (DEC-CA-0001), and `data_wait_frac` can
-     only rule the *corpus* out. Never signed, never scored,
-   - pushes the checkpoint to the **Hippius Hub registry** (OCI) and records its
-     size-tagged ref.
-6. Signs a `TrainingManifest` (trainer hotkey) listing every trained-model ref
-   (one king + finalist pair per size, each tagged with its `size`) and the
-   corpus/contract digests, and publishes it to the **Hippius S3** manifest
-   bucket (`round-<id>.json` + `latest.json`).
+A funded entry becomes eligible after reveal and lane checks. It can wait for
+CPU admission, corpus preparation, a fitting GPU, shared operator capacity,
+worker startup or settlement. Intake acceptance does not reserve a GPU. Reveal
+order is seniority subject to capacity, choice/caps and lane rules, not an ETA.
 
-   From `[round] rolling_from_block` (DEC-CA-0043, block-gated, unarmed on
-   mainnet) the round is replaced by *settlements*: funded challengers train
-   the moment they are funded, every epoch boundary publishes ONE manifest
-   carrying the era king plus every challenger finished since the last one,
-   manifests are hash-chained (`prev_round_id`), and the king's leg is
-   trained once per *era* (`era_settlements` boundaries sharing one seed
-   set, one init and one cached king checkpoint; a settlement at boundary B
-   belongs to the era containing B − 1). See `cascade/shared/era.py`,
-   `cascade/trainer/rolling.py`. The rollover block is not typed in: the
-   validators decide it on chain (DEC-CA-0045, `cascade/shared/activation.py`)
-   — each upgraded validator posts a readiness note, every node tallies
-   permit-holding stake behind it as of each boundary, the first boundary
-   at or over `[activation] threshold` locks in, and the rollover is the
-   next boundary. Trainer and provisioner read the same decision and arm
-   themselves; receipts record it (`activation_block`) for the audit.
+#### One training leg
 
-`BaseTrainer` is a `Protocol` — the single GPU-dependent seam. Everything else
-in the trainer is numpy/CPU and unit-tested. A reference implementation (a
-Toto2-4M backbone trained from random init under the `chain.toml [training]`
-recipe — `head_dim 64`, `patch_size 32`, a 9-quantile pinball head, u-μP, the
-NorMuon+AdamW split) is the operator's to provide; it must be **stateless across
-the king and challenger calls** so no information leaks between the two training
-runs (shared `training_seed` and shared warm-start pointer ⇒ identical init for
-both).
+1. Pin the leg's contract, seeds, base/init and immutable entry identity.
+2. Prepare its corpus. V2 A uses `generation/stage.py` and `generation/tier.py`
+   to create bounded sandboxed CPU shards before GPU rental. The generation
+   window is separate from the GPU training wall. The worker reads the pinned
+   shards; miner code does not need to execute on the GPU pod for that path.
+3. Dispatch the training worker under the pinned image/code fingerprint. A
+   trains the full model; B uses the selected-expert backend with other weights
+   frozen; C follows its competition's pinned-base recipe and data rules.
+4. Harvest, integrity-check and upload the checkpoint. Retained local harvest
+   evidence allows an interrupted upload to retry without repeating training.
+5. Persist completion before independent benchmark work. Compatible completed
+   entries can settle; old-era A work cannot silently become a new-era result.
 
-#### Two-device (remote) training
+Core seams are `runner_funded_legs.py`, `runner_funded_pods.py`,
+`runner_operator_pods.py`, `runner_generation.py`, `worker.py`, `contract.py`
+and the model-specific trainers. Worker receipts and checkpoint measurements
+bind artifacts to the effective contract. Tensor masks/compact rows and model
+state names are scientific compatibility surfaces, not generic cleanup targets.
 
-By default the king and challenger train sequentially on the trainer's own GPU.
-For faster rounds the trainer can dispatch them **in parallel to separate
-SSH-reachable GPU pods** (e.g. rented Lium/Targon boxes) via `--remote-hosts`
-(`cascade.trainer.remote`). The remote unit is a **round-worker**
-(`cascade.trainer.worker`), not a remote `BaseTrainer`: each pod pulls its
-generator from the registry by ref, builds the corpus in its own sandbox, trains,
-uploads the checkpoint, and returns a `TrainedEntry` receipt over SSH. The
-orchestrator collects the receipts and signs + publishes the manifest, so **the
-trainer hotkey never lands on a rented box**; pods need registry/S3 access, not
-the wallet. Dispatch is **detached** (`[round] detached_dispatch`, 2026-09-18): the
-launch session starts the worker under `setsid nohup` in its own session on the
-pod, with stdout/stderr/pid/exit code in a per-leg run dir
-(`_train_work/_dispatch/<leg>/`), and returns at once; the orchestrator polls
-with short SSH calls, tolerates an unreachable pod for
-`dispatch_reattach_grace_seconds`, then fetches the receipt. A dropped SSH
-session therefore no longer fails a healthy leg (the attached form lost seven
-Oslo lanes to one provider blip on 2026-09-18). Credentials still travel on the
-launch session's stdin only. The pod-side post-round bench uses the same path. The host list is a trainer-local file (`scripts/remote_hosts.example.toml`),
-never `chain.toml`.
+#### Capacity, queues and recovery
 
-This preserves the controlled experiment: the budget is a fixed `train_tokens`
-count, so king and challenger get **identical compute** regardless of which (or
-how fast a) device runs them. King failure aborts the round; a challenger failure
-just drops that challenger.
+`trainer/admission.py`, `lane_pool.py` and `runner_capacity.py` coordinate shared
+work. CPU generation has its own parallelism/capacity. King work has provisioning
+priority; B and C retain their lane limits and compete for remaining resources.
 
-**Byte-exact audit (pinned GPU).** The reference trainer runs deterministically
-(deterministic cuBLAS/cuDNN, the math attention kernel, all RNGs seeded from
-`training_seed`), so on a **fixed GPU SKU** a re-derived run reproduces the exact
-checkpoint. Each run records its `torch.cuda.get_device_name(...)` into the
-manifest entry's `gpu_name`, and the validator's gate enforces matched hardware:
-with `[training] expected_gpu` set, every entry must report that SKU; otherwise
-king and challenger must at least match each other. So pin one SKU on both pods
-(e.g. both an H100) and the round is byte-reproducible end-to-end; leave
-`expected_gpu` empty and you only lose the cross-round SKU pin, not the
-king-vs-challenger guarantee.
+`gpu_health.py` persists GPU-type cooldowns and `operator_health.py` runs an
+independent watchdog with a durable alert outbox. `provision/operator_pool.py`
+reserves capped operator spending before a create and binds cleanup to the
+original account and physical ID. `king_hedge.py` persists a delayed replica's
+first valid completion; it does not select on evaluation scores. These paid
+recovery features require explicit limits and ship disabled.
+
+`continuation.py` and `continuation_transport.py` implement the separately
+activated `cascade-continuation/1` protocol for MoE A/B and MarketCast C.
+Optimizer-boundary snapshots are pulled off-pod and checked against the job,
+input replay and qualified runtime before reuse. The original MarketCast
+training data travels with its continuation. The default empty protocol keeps
+historical training digests unchanged. See the
+[recovery controls and qualification procedure](OPERATOR.md#qualified-training-continuation)
+for activation requirements and integration limits.
+
+Queues are fresh file-backed instances with atomic writes and locking. A
+running attempt has a unique identity; stale callbacks cannot relabel a retry
+or consume a parked new commitment. Retry/backoff, deadlines and fault classes
+are explicit. Operator-caused losses preserve the submission. With configured
+operator lanes or capped operator rentals the retry runs on them; otherwise it
+rents a new pod on the payer's key, and after `OPERATOR_FAULT_RETRIES` (3) such
+losses the entry pauses for the operator.
+No spare capacity means waiting/requeue, not a manufactured successful result.
+See [the backlog runbook](OPERATOR.md#backlogs-and-recovery-across-lanes).
+
+`runner_common.funded_queue_of` resolves each lane's queue from one path/TTL
+rule, while runner-local specialist/king overrides remain in `TrainerRunner`.
+`trainer/lane_status.py` shares best-effort publication but keeps independent
+B/C rate limits. `shared/concurrency.call_with_deadline` bounds the caller's
+wait, not the underlying operation: a timeout is not evidence that a remote
+launch failed or was cancelled.
+
+#### Settlements
+
+Epoch boundaries define settlement opportunities; eras pin training context.
+Mainnet's effective rolling grid is derived through activation, not by changing
+a timing constant in isolation. A boundary belongs to the era containing the
+preceding block. Manifests are hash-chained by `prev_round_id` and name the
+training contract, era/init, entries and associated specialist/report digests.
+
+Durable write-ahead state preserves publication bytes and recovery ordering.
+The validator journals state transitions so partial writes, restarts and replay
+cannot silently produce a second merge or reward. Missing evidence can hold or
+defer work; it is not automatically a miner loss. The
+[operator runbook](OPERATOR.md#lineage-measurements-and-state-upgrades)
+describes recovery and state upgrades. Real provider behaviour and throughput
+require integration testing on the selected deployment.
 
 ### 3. Validator — reads the manifest, decides the throne
 
-The validator never trains. Each round it:
+Full evaluators check signatures, chain context, commitment/base identity,
+contracts, manifests and report bindings; score the required private windows;
+apply scientific rules; persist resulting state; and publish signed receipts
+and chain weights. They do not train challengers. When validator-sourced benches
+are active, the designated main validator also needs benchmark data and GPU
+capacity. Other full evaluators replay those signed public rows under their
+bindings while still scoring the private pool themselves.
 
-1. Reads the current manifest, verifies its signature and that king and
-   challenger share the **contract digest** and **base-arch digest** (the
-   controlled-experiment gate — `ValidatorRunner.check_manifest`). The contract
-   digest covers every size at once (`[[training.sizes]]` is folded into it).
-2. For each trained **size**, pulls the king's and finalist's checkpoints and
-   scores them on the **same** held-out real-world eval windows
-   (`cascade.validator.evaluator`), then **pools** the per-window scores across
-   sizes (king-vs-finalist), preserving pairing because each size shares the
-   window `abs_target`.
-3. Runs ONE paired-bootstrap KOTH verdict on the pooled scores
-   (`cascade.eval.koth.evaluate_round`) — a single throne decided on the combined
-   4M+22M skill — and folds it into the champion state.
-4. Sets weights: an equal share across the current king plus up to
-   `[scoring] reward_prior_kings` registered prior kings (`reward_prior_kings = 0`
-   ⇒ winner-take-all on the king; burns to `burn_uid` if none are registered).
+A satellite verifies the designated validator's signed receipt trail and derives
+weights without loading the training stack. Its role differs from an independent
+GPU evaluator. See [VALIDATOR.md](VALIDATOR.md) for setup and recovery.
+
+#### Lane B: qualification and merge acceptance
+
+`trainer/lane_b_driver.py` plans expert rows and holds trained legs. Settlement
+rebases a leg against the compatible current king, checks routing/base staleness
+and byte-level row constraints, and publishes an expert manifest. Target gains
+and non-inferiority guards determine qualification and slot selection.
+
+When acceptance is enabled, a qualification neither starts payment nor replaces
+the existing holder. At a scheduled warm start, `trainer/merge_acceptance.py`
+tests compatible deltas incrementally against the checkpoint accepted so far,
+with regression checks against the original init. `validator/merge_acceptance.py`
+verifies the bound intermediate weights and evidence. Only committed accepted
+contributions enter the init and begin rewards; rejection leaves them out.
+Overlapping rows or already-taken target slots can defer a proposal to another
+init. Existing pre-acceptance rules remain available only where configured.
+
+Acceptance staging has a trainer time budget (`round.ops_acceptance_timeout_seconds`,
+1,200 seconds by default). An overrun pins that era to the unmerged init; pending
+qualifications remain unpaid and unconsumed. A late background result cannot
+replace that pinned init. At most one acceptance worker runs at a time.
+
+#### Lane C: forward judging and confirmation
+
+`trainer/lane_c_driver.py`, `marketcast_runner.py` and `marketcast_leg.py` use
+the configured Timestral base and recipe. The signed lane-C manifest binds the
+trained artifact, recipe, training block and MarketCast evidence. The main
+validator evaluates forward-only windows and publishes report evidence whose
+exact digest is bound by a later manifest. Missing/infra evidence defers work
+under the configured bounds; scientific rejection is a different outcome.
+
+`validator/marketcast.py` and `validator/lane_c.py` maintain forward judging,
+confirmation and target holders. An initial pass is pending; a later
+confirmation must also satisfy the slot rule. A passing candidate below an
+existing holder's bound does not take the slot. No C fine-tune merges into A/B.
+
+Expired or deregistered holders are removed before confirmation. Only the final
+holder is labelled `confirmed` when several backlog rounds resolve together;
+judge-phase runners-up are `not_selected`. Losing every replica of a report
+already recorded by digest holds the whole settlement. Recovery requires the
+exact report bytes; a local timeout cannot safely substitute a different result.
 
 ### Cascade — king-reign promotion
 
-On top of the round-level KOTH sits **Cascade** (LIVE on mainnet —
-`[scoring] cascade_enabled`), a ratchet that periodically raises the floor the
-whole field trains up from. A **reign clock** counts rounds since the current
-king last took the throne — in blocks, anchored to the dethrone verdict's
-epoch-start block, so every node fires on the same round; every dethrone
-re-crowns and resets it (Cascade reuses the KOTH dethrone signal — it never
-re-implements dethroning). During a reign every **benched duel checkpoint** —
-the king's *and* the challengers'
-(promotion pays the checkpoint's owner nothing) — is scored on the three public
-suites — **GIFT-Eval, BOOM, and TIME** —
-`score = geomean(gifteval_crps, gifteval_mase, boom_crps, boom_mase, time_crps,
-time_mase)`, lower better — and kept in a per-reign candidate log. All three
-suites report
-CRPS/MASE the same way — the shifted geometric mean, across tasks, of each metric
-**normalized by the Seasonal-Naive baseline** (≈1.0 = baseline parity) — so the
-six numbers are the same kind of quantity before they enter the geomean.
+The reigning king and an era's shared init are distinct. V2 discards the old
+Toto2 warm-start members and observes its configured random-init window.
+From the v2 king-ladder policy, only a king backed by a passing validator king
+check can promote. `trainer/runner_promotion.py`, `trainer/promotion.py` and
+`validator/cascade.py` bind the decision and install it at an effective era.
+A merely announced future promotion is not today's init.
 
-When a king holds the throne `[scoring] cascade_reign_rounds` (5) consecutive
-rounds undethroned, the **trainer** proposes a promotion (DEC-CA-0013,
-propose-and-verify): it selects up to `cascade_top_k` (3) member checkpoints
-from the reign log — every member within `cascade_quality_epsilon` (5%) of the
-reign's best score; the best is the anchor, remaining slots picked greedily for
-**measured error decorrelation** (per-window residuals; DEC-CA-0015) with a
-structural fallback (distinct generator, round spacing) when error vectors are
-missing, never padded — and publishes a signed `PromotionRecord`
-(`promotions/gen-<n>.json`). The member set is a **rolling top-k**
-(DEC-CA-0044, supersedes the DEC-CA-0017 best-vs-best guard): on a ripe clock
-the live members compete with the reign's candidates for the same
-`cascade_top_k` slots — a candidate is admitted only when it benches strictly
-better than the worst live member (or a slot is free), the pool is
-re-selected under the envelope, and the promotion fires **only when
-membership changes**. Members that keep their slot carry over with their
-original `source_round` provenance, so the shared init never ratchets
-downhill and never shrinks below the best k seen so far (subject to the
-epsilon floor over the pool's best). Validators don't re-derive the
-selection: they verify an **envelope** — trainer signature, generation
-increment, `cascade_top_k` cap, reign-clock ripeness, and per-member
-provenance against the trainer-signed bench reports within the epsilon
-floor — failing closed on anything unverifiable. "Unverifiable" means the
-evidence was READ and does not support the record (report absent on every
-storage layer, entry missing, numbers outside the envelope); a promotion
-record or bench report that cannot be read at all is a transient — the
-round is retried next poll under the same grace as the pool-pin gate, never
-a receipt — and a cached report lacking the member is re-fetched (the
-trainer republishes the report as legs finish). Reign-scope on provenance
-applies to NEW entrants only: a member of the already-accepted generation is
-exempt (it was verified when it entered). Once a
-generation is live, each round's init is the rotation
-`members[epoch_index % len(members)]` (from DEC-CA-0043's rollover: one init
-per ERA, `members_gen(era)[era % k]` with the generation's `effective_era` a
-full era of notice), pinned in that round's signed manifest;
-**every run in the round — heat and final — trains from that one init**. The
-king **persists** on the throne with a fresh reign clock (DEC-CA-0004 — both
-roles train from the shared init, so promotion confers no advantage worth
-vacating over, and the throne only changes hands via a genuine dethrone). The
-reign clock and candidate log persist next to the trainer/validator state, so
-Cascade survives restarts.
+A promotion must still have the full required notice when it actually fires.
+Its canonical digest is announced in a trainer-signed settlement before the
+effective era, and later settlements bind that notice through predecessor
+hashes. Catch-up validators require this chain evidence too. Each v2 trained
+entry records its starting checkpoint and contract; restart recovery refuses an
+incompatible entry. Resolving the calendar launch discards future eras prepared
+under the legacy contract and requeues their work without burning an attempt.
+The trainer also requires a published notice before adding a promotion to its
+era ledger. An unannounced record leaves the previous init in use; unreadable
+evidence holds scheduling for recovery. A record whose earliest chain-bound
+notice is late is never effective for any node: validators record the
+generation as skipped (the init stays the live generation's) and their
+catch-up walk continues at the next record; the trainer's ledger keeps the
+previous init and the next passing king check fires the following generation
+under the same rule. A record that cannot be published at its fire boundary is
+retracted and the check re-read at the next boundary rather than announced
+late. Recovered promotions invalidate any prepared era whose generation/init
+differs, including after a restart.
 
-Those six numbers are **authoritative from the trainer, not recomputed per
-validator**. The trainer (owner-operated, already the manifest trust anchor)
-benchmarks **both final-duel checkpoints — the king's and the challenger's —
-strictly after the round's checkpoints are pushed and the manifest is
-published**: manifest publication never waits on a benchmark, so validators
-start scoring the duel the moment it lands, and a bench failure or timeout can
-never fail, delay, or modify the round. The numbers ship as a **separate
-trainer-signed artifact** — one JSON report per round at
-`benchmarks/round-<id>.json` in the manifest bucket (same hotkey signing scheme
-and same R2 dual-write as the manifest; `cascade.shared.bench_report`) — never
-inside the manifest entry, so every validator records the identical values and
-Cascade selection stays deterministic across validators rather than each
-re-running a non-bit-reproducible GPU sweep. Trainer and validators read
-**every duel checkpoint's set — king's and challengers' — into the reign
-candidate log** (the report lands ~30-60 min after the
-manifest, so nodes re-probe for a few rounds), fall back to the in-entry
-`bench_scores` older manifests carry, and tolerate a missing report — that
-round simply contributes no bench numbers, and promotion selects over the reign
-rounds that have them (when `[wandb]
-enabled`, the king/challenger pair is also logged per round). The eval is the
-**full** GIFT-Eval + BOOM + TIME battery each round (`[eval]
-cascade_bench_max_series = 0`; BOOM full ≈ 26 min on an RTX 5090, run with
-`--bench-device cuda`), and TIME's Seasonal-Naive baseline —
-checkpoint-independent — is cached so only the model forward is paid per round.
-Because the sweep runs on the JIT-rented final pods *after* their normal
-teardown signal (the manifest), the trainer brackets it with
-`bench_pending.json` / `bench_complete.json` markers in the shared work root
-and the provisioner holds the **final** pods — only that class — until the
-report is uploaded or `[eval] bench_hold_max_hours` (default 2 h) expires, then
-reaps regardless. The dethrone verdict itself stays entirely on the private
-eval pool; these public-benchmark numbers drive only Cascade's warm-start
-promotion. Cascade is gated by `[scoring] cascade_enabled` — **on for the live
-mainnet deployment** — and when off the trainer skips the eval, never writes
-the hold markers, and validators run pure KOTH.
+B acceptance can add permitted expert deltas to a scheduled init. Its base and
+intermediate evidence must match that exact adoption; background acceptance
+staging cannot silently install results for another era/base.
+
+The earlier rolling-top-k algorithm, including losing-challenger candidates,
+is retained for its historical block/config rules. It must not be described as
+the v2 king-only rule. Promotion does not itself crown a different Lane A king.
 
 ## The controlled-experiment invariant
 
-For a round to be a fair measurement of data quality, at **each size** the king's
-model and the challenger's model must differ in **exactly one** thing: the corpus.
-cascade enforces this on three sides:
+Within an A comparison, competitors use the same effective contract, training
+context and shared init; their generator/corpus is the competitive variable.
+The signed manifest records that context and validators gate the terms they
+consume. B additionally binds its selected rows and base; C binds a separate
+competition base/recipe and forward data. Those comparisons are not interchangeable.
 
-* **Trainer:** one `RoundSeeds` instance is reused for every run in the round —
-  heat and final, king and challenger, all sizes — so weight initialisation
-  (`training_seed` at generation 0; the one pinned warm-start checkpoint in a
-  warm-started round) and the generation seed are identical;
-  only the per-size width/depth changes between sizes, never between king and
-  challenger of the same size.
-* **Manifest:** `contract_digest` (sha256 of the `TrainingContractConfig`,
-  including every `[[training.sizes]]`) and `base_arch_digest` are recorded once;
-  each size's frozen-arch digest is folded into the contract digest.
-* **Validator:** rejects any manifest whose digests don't match its own
-  `chain.toml`, so a tampered or mismatched training run can't score.
-
-Auditability: because both seeds derive deterministically from the chain block
-hash and every corpus carries a `corpus_digest`, a second honest trainer (or a
-suspicious validator) can re-draw the corpus and re-train to confirm the run.
+Model-source bytes participate in architecture digests. State layouts, immutable
+refs and signed serialization also carry compatibility. Reusing a helper must
+not rewrite those bytes or change an archived receipt's canonical form.
 
 ## Scoring
 
-Per window, per channel, per model: MASE (Hyndman seasonal-naive denominator) and
-the gluonts `MeanWeightedSumQuantileLoss` components `(qloss_per_q, abs_target)`
-over the 9-level grid `0.1…0.9`. That grid is *exactly* Toto 2.0's training
-objective — its quantile head predicts those nine levels under pinball loss — so
-cascade's **score objective equals the model's train objective**, which
-collapses the metric-layer gap between what's trained and what's measured.
-Univariate windows produce one score each (`channel = 0`); a multivariate window
-contributes one row per channel.
+A uses paired private-window comparisons of quantile-loss/CRPS-related and MASE
+metrics under the effective horizon, domain and bootstrap rules. The applicable
+margin can depend on tenure and shared-init improvement; cohort correction
+handles multiple challengers. Rules are block-gated to keep historical replay.
 
-The KOTH decision is a **paired bootstrap LCB** on the relative improvement of
-`geomean(WQL, MASE)`, challenger vs king, resampling window clusters once per
-bag. Both halves are **geometric means over windows**, each window normalised by
-its own scale first: WQL by that window's `sum|y|`, MASE by its own seasonal-
-naive denominator. The challenger wins a round iff that LCB clears the win
-margin on at least `min_windows` common windows.
+A challenger that passes the private test must also pass any active public
+benchmark gate. The v2
+mainnet configuration selects the four-suite GIFT-Eval/BOOM/TIME/FEV rule through
+its activation settings. With validator-sourced benches, the main validator
+publishes signed rows and subsequent manifest bindings determine which bytes
+other validators use. Missing reports and budget deferrals are not invented
+scores or automatic scientific losses.
 
-The CRPS half was originally a *pooled* MWSQL — numerators and denominators
-summed across all windows, divided once — which is scale-dominated on a
-cross-domain pool: on a 2000-window round in July 2026 three high-magnitude
-series (BTC difficulty, two US-debt series) were measured at 100% of the
-denominator, giving half the decision statistic an effective sample size of 3.
-Normalising per window first is what makes the aggregate scale-invariant.
-Windows with `sum|y| == 0` have no scale to normalise by, so WQL is undefined
-there and they are excluded from that half (they still count for MASE).
-Receipts written before 2026-07-28 were judged under the pooled rule;
-`cascade-audit` replays each receipt under both and reports which one
-reproduces the recorded LCB. The windows
-are a **rotating private slice** (`cascade.validator.windows`): seeded by the
-round's block hash so every validator scores the identical set and the king/
-challenger comparison is paired, but rotated each round so no fixed eval set can
-be distribution-matched.
+B uses target gains and regression guards, followed by merge acceptance when
+active. C uses its competition's forward-only tests and confirmation. The
+allocation sequence A 100%, A/B 75/25, A/B/C 50/25/25 describes mainnet lane
+pools; actual rewards also depend on A's ladder and B/C slot/decay/expiry rules.
+Unused shares burn under the mainnet policy; allocating a lane pool does not
+pay its entire amount to its current winners. The
+[reward schedule](MINER.md#rewards-allocation-burn-and-progression) gives the
+launch caps, ladder and slot clocks. `shared/emission.py`, `shared/lane_b.py`,
+`shared/lane_c.py` and validator folds define the actual weight accounting.
 
-Dethroning is configurable. The shipped `chain.toml` sets `dethrone_cp = 1` with
-a flat margin (`win_margin_start == win_margin_end`, `margin_warmup_rounds = 0`),
-so a single round that clears the margin takes the throne and every king is
-equally challengeable regardless of tenure. The sticky, tenure-weighted variant
-is still available: set `dethrone_cp > 1` (a challenger must then win that many
-**consecutive** rounds; a single loss or inconclusive round resets the streak)
-and let `win_margin_end > win_margin_start` ramp over `margin_warmup_rounds` of
-tenure so an entrenched king must be beaten more decisively.
+## Discovery and miner status
 
-**Public-benchmark no-regression gate (optional, off by default).** With
-`[scoring] gift_gate_mode = "enforce"`, a dethrone additionally requires that the
-challenger has not *statistically meaningfully regressed* on broad public data
-(GIFT-Eval). On a private-pool win, both models are scored via the isolated
-`benchmarks/` sidecar and a **paired no-regression bootstrap**
-(`cascade.eval.gift_gate`) checks `lcb >= -gift_gate_tolerance` on the shared
-configs. The gate is **not winnable** — it can only block a dethrone the private
-LCB already granted — and an uncomputable gate (sidecar down, too few configs,
-or king/challenger on different pinned data revisions) makes the round
-inconclusive rather than silently passing or failing. `gift_gate_mode = "shadow"`
-computes and logs the verdict without enforcing it, to calibrate the tolerance
-against real noise first.
+`status/v2.json` publishes effective policy and the current init; chain and
+lane feeds publish timestamps. `miner/live_status.py` and `submission_status.py`
+separate queue execution from scientific progress, matching hotkey/ref/targets
+and the exact funded attempt. They distinguish missing, stale and empty feeds.
 
-## Trust model (v1) and the path to decentralisation
+B exposes qualification and acceptance observations. C retains bounded
+per-entry receipt observations across later omitted receipts and restarts, with
+the original receipt boundary. Historical confirmation is not evidence of
+current payment. Pending reveals remain redacted; stage changes are not worker
+heartbeats. Public telemetry is unsigned; signed reports remain authoritative.
 
-v1 centralises training in the owner's trainer and trust in `[manifest]
-trainer_hotkey`. This is the pragmatic bootstrap: it makes the controlled
-experiment trivially enforceable. The corpus/contract digests already make every
-run *reproducible*, which is the hook for decentralising training later (have
-validators or a trainer quorum re-derive and challenge a manifest).
+## Communication map
 
-## What's implemented vs. a boundary
+The main channels between the subnet's roles: who writes, who reads, what carries
+integrity, and what happens when several validators run at once. Setup steps
+for these credentials are in [VALIDATOR.md](VALIDATOR.md) and
+[OPERATOR.md](OPERATOR.md).
 
-Implemented and tested (numpy/CPU): the generator contract + output checks (with
-the MV-ready `(C, L)` channel axis), the static guard, commit/pointer parsing
-(Hippius Hub `repo@digest` scheme), config (the full from-scratch Toto2 contract, digest-pinned),
-the manifest schema + digests + **signing/verification**, the full scoring + KOTH
-math, the champion state machine, corpus building from a generator, the trainer's
-pairing logic, the **Hippius storage layer** (Hub ref grammar + S3
-manifest/log/pool-snapshot layout), the rotating private window selection *and* the **eval-pool
-loader** (`cascade.validator.pool`), and the trainer-round assembly + both
-**live service loops** (`trainer/main.py`, `validator/main.py`).
+Terminology worth pinning down first: the **trainer** publishes one
+**manifest** per settlement (signed training receipts); each **validator**
+publishes a **receipt** per settlement (signed scoring/weights record). Storage
+keys and the CLI call a settlement a "round" (`round-<id>.json`). Validators
+never post manifests — they gate, score, set weights, and publish receipts.
+Miners fund legs (and optionally submit code privately) over the trainer's
+HTTPS intake (channel 1b) — the only non-chain, non-storage channel.
 
-The **Toto2-4M from-scratch `BaseTrainer`** ships as a runnable reference
-(`cascade.trainer.toto2_trainer`) behind the `[train]` extra — a causal patch
-transformer with a 9-quantile pinball head, u-μP-style init, a Muon+AdamW
-optimiser split, and a token-budget LR schedule. It is the one piece that needs a
-**GPU to validate end-to-end** (no GPU in CI); run a real round on your reference
-box, then pin `base_arch_digest` / `ref_throughput_tokens_per_s`. Other operator
-inputs before launch: the Hippius `[storage]` credentials/endpoints and the
-held-out eval-pool ref (`[eval] window_pool`). The corpus sandbox subprocess
-caveats are unchanged.
+### The picture
+
+```
+                       Bittensor chain
+        commitments ▲            │ commitments,      ▲ weights
+        (gen refs)  │            │ incentive, blocks │ (per validator,
+                    │            ▼                   │  independent)
+   ┌────────┐   ┌─────────────────────┐        ┌──────────────┐
+   │ miners │   │       trainer       │        │  validators  │  × N
+   └────────┘   │ (owner GPU boundary)│        └──────────────┘
+        │       └─────────────────────┘          ▲  ▲  ▲    │
+        │ generator     │ checkpoints │ manifest │  │  │    │ receipts (signed,
+        │ repos         ▼             ▼          │  │  │    ▼ per-validator prefix)
+        ▼        ┌───────────┐  ┌─────────────────────────────────┐
+   ┌───────────┐ │ Hippius   │  │ manifest bucket (Hippius S3)    │
+   │ Hippius   │ │ Hub (OCI) │  │  manifests/…  logs/…            │
+   │ Hub (OCI) │ └───────────┘  │  receipts/<hotkey>/…  index.html│
+   └───────────┘                └─────────────────────────────────┘
+                                                 ▲
+                    ┌───────────┐   pool bucket  │ snapshots (tar+sha256,
+   TSBench-Forge ─► │ owner pool│ ───────────────┘  selected by
+   (private raw     │ builder   │                   effective_block)
+    data bucket)    └───────────┘
+```
+
+### Channels
+
+| # | Channel | Writer → Reader | Medium / key | Integrity | Multi-validator behaviour |
+|---|---------|-----------------|--------------|-----------|---------------------------|
+| 1 | Generator commitments | miner → trainer, validators | chain reveal commitments, `metro-v1:gen:hippius:<repo>@<digest>` | on-chain, digest-pinned | read-only; identical view per block |
+| 1b | Funding / private submission | miner → trainer | HTTPS to `cascade-intake`: `POST /v1/fund` (`X-Lium-Api-Key` or signed `X-Payer-Credentials`), `POST /v1/submit` (private generator ZIP → `vault/direct@sha256:…` ref), public `GET /v1/queue` | hotkey-signed request; the key lands in the sealed vault and nowhere else | n/a — validators never see it |
+| 2 | Seeds | chain → everyone | training seeds from the era/seed-epoch block hash under the effective rule; the settlement boundary's block hash keys the round id and eval draw | consensus | deterministic, shared; v2 king-ladder eras can reuse a seed epoch |
+| 3 | Training manifest | trainer → validators | `manifests/round-<id>.json` + `manifests/latest.json` (manifest bucket), one per settlement, hash-chained by `prev_round_id` | signed by `[manifest] trainer_hotkey`; gated by `check_manifest` + the era envelope | read-only; single writer; validators walk the chain forward, `latest.json` is only the head hint |
+| 3b | Bench reports | trainer → validators, dashboards | `benchmarks/round-<id>.json` (GIFT-Eval / BOOM / TIME, + FEV under DEC-CA-0061, per settlement checkpoint) | signed by the trainer hotkey | read-only; feeds promotion verification and, when the lane-A bench gate is on (DEC-CA-0054 / 0061, every v2 settlement), the gate's per-item rows |
+| 3d | Validator bench reports | main validator → validators, auditors | `bench_v/round-<id>.json` + rows under `bench_v/rows/<id>/` (DEC-CA-0063; pool clearers + king, `infra_failed` / `budget_deferred` / `checkpoint_fault` records) | signed by `[netconfig] owner_hotkey`; its sha256 bound by a later trainer-signed manifest and stamped `bench_report` on receipts | write-once; other validators hold until the binding lands, then replay exactly those bytes |
+| 3c | Promotion records | trainer → validators | `promotions/gen-<n>.json` | signed by the trainer hotkey; verified against the envelope | read-only; installed at the record's `effective_era` |
+| 3e | Lane-B expert manifest | trainer → validators | `lane_b/round-<id>.json`, digest bound by the A manifest | trainer signature, immutable checkpoint refs and row/base checks | validators reproduce qualification and accepted merge evidence |
+| 3f | Lane-C manifest and MarketCast report | trainer/main validator → validators | `lane_c/round-<id>.json`, `marketcast/round-<id>.json` and associated arrays | signed evidence; exact report digest bound by a later manifest | validators replay the bound forward/confirmation evidence |
+| 4 | Checkpoints / generators | trainer, miners → validators | Hippius Hub OCI, `repo@sha256:…` | content-addressed digest self-verifies | read-only |
+| 5 | Eval pool | owner pool builder → validators | `pool/snapshots/block-<N>.tar` + `pool/index.json` (pool bucket) | sha256 pinned in the **signed manifest** (`eval_pool_key`/`eval_pool_sha256`, gated by `check_pool_pin`) | read-only; all validators resolve the same snapshot for a settlement and verify it against the pin |
+| 5b | Activation notes | each validator → everyone | plain chain commitment `cascade-ready:1:<feature>:<lock>:<block>` (DEC-CA-0045) | on-chain, per hotkey; tallied by permit-holding stake | each node tallies the same notes as of the boundary block |
+| 5c | Network configuration | owner → trainer and validators | `config/network/seq-<n>.json` + `config/network/latest.json` | owner signature, supported keys, sequence and effective-block/stake adoption | durable config history keeps catch-up and replay on the applicable settings |
+| 6 | Weights | each validator → chain | `set_weights` | on-chain, per-hotkey | independent by construction — no shared state |
+| 7 | Round receipts | each validator → auditors, dashboard, satellites | `receipts/<hotkey>/round-<id>.json` + `receipts/<hotkey>/latest.json`, shared `receipts/latest.json` pointer | signed per validator hotkey; public-read | **single-writer prefixes** — validators cannot clobber each other; only the convenience pointer is last-writer-wins |
+| 8 | Receipts index | each validator → dashboard | `receipts/index.json`, entries keyed `(round_id, validator_hotkey)` | unsigned, presentational only | merge-keyed read-modify-write; a simultaneous write can drop one entry until that validator's next settlement — never audit- or weight-bearing |
+| 8b | Live chain status | validator (or `scripts/publish_chain_status.py`) → dashboard | `status/chain.json`: block anchor, epoch grid, activation, revealed submissions (`cascade.shared.chain_status`) | unsigned, presentational only | last-writer-wins whole-object overwrite; never audit- or weight-bearing |
+| 8c | Funded roster | trainer → miners, dashboards, audit | `funded/round-<id>.json` + `funded/latest.json`: the settlement's seated, in-flight, waiting and terminal entries plus per-rent seniority evidence (`rents`) | unsigned; the audit's `funded-roster` check WARNs on a pass-over, never FAILs | single writer (the trainer) |
+| 8d | Training summaries | trainer → dashboards | `training/round-<id>.json`: per-leg steps, tokens, width | unsigned, presentational only | single writer (the trainer) |
+| 8e | Current policy and lane progress | trainer/intake → miners and dashboard | `status/v2.json`, `status/lane_b.json`, `status/lane_c.json`, intake queue routes | unsigned timestamps and attempt-bound observations | discovery only; stale/missing is unknown, not permission to train or proof of payment |
+| 9 | Training logs | trainer → observers | `logs/round-<id>/<role>.jsonl` (+ optional wandb) — per-step metrics, the closing `summary`, and one `host` record per run (`[telemetry]`, `cascade.trainer.host_probe`) | none (observability) | read-only |
+| 10 | Trainer ↔ GPU pods | trainer orchestrator ↔ rented pods | SSH, receipt-sentinel stdout; checkpoint harvested by the orchestrator | wallet and storage credentials never leave the orchestrator | n/a |
+| 11 | Validator ↔ eval pod | validator ↔ its own GPU pod | SSH+scp (`--eval-hosts`; separate `--private-eval-hosts` opt-in) | public benchmarks transfer checkpoint/report; private offload transfers hash-bound checkpoint + selected histories and returns samples, with targets/scoring local | per-validator, operator-owned host |
+
+The channels a verdict depends on (1–6) are all either on-chain, signed, or
+content-addressed *and* deterministic per settlement — N validators reach the
+same verdict independently, which is why weights need no coordination.
+Signed receipts in channel 7 are also the authoritative input for satellite
+replay. Unsigned indices, queue views and training logs in channels 8–9 are
+observability and must not independently determine weights.
+
+Because storage keys aren't prefix-scoped, anyone holding a bucket's write
+credentials can overwrite *any* object in it. The design assumes that and
+anchors integrity above the storage layer: manifests fail the trainer-hotkey
+signature gate if touched, checkpoints are digest-pinned, and the eval pool is
+pinned inside the signed manifest. What write access *does* buy an attacker is
+vandalism — deleted receipts, a defaced dashboard, stalled rounds — which is
+detectable (signatures, the R2 mirror) but not preventable; the mitigation is
+key hygiene: one pair per bucket, pool keys separate from manifest keys, forge
+keys never shared beyond the owner.
+
+### What a validator needs access to — and only this
+
+| Resource | Access | Credential |
+|----------|--------|------------|
+| Bittensor chain | read + `set_weights` | hotkey wallet |
+| Manifest bucket | read `manifests/…`, write `receipts/<own hotkey>/…` + index | `HIPPIUS_S3_*` |
+| Pool bucket | read-only snapshots | `POOL_S3_*` — issue a pair separate from the manifest-bucket keys (S3 keys aren't prefix-scoped; a shared pair could write the pool) |
+| Hippius Hub | read (pull checkpoints/generators) | `HIPPIUS_HUB_TOKEN` (or username + password) |
+| HF benchmark datasets + bench sidecar (required on the designated main validator when active) | public read | `HF_TOKEN` if gated |
+
+The designated main validator needs the sidecar, staged data and GPU capacity
+once validator-sourced lane-A benches or MarketCast scoring are active. Other
+validators replay the signed, manifest-bound evidence for those paths.
+Historical optional `[eval] run_benchmarks` and `[scoring] gift_gate_mode` are
+separate call sites; they do not describe the v2 main validator's responsibilities.
+Satellites verify/replay signed receipts and do not need the training stack.
+
+Deliberately **not** on the list: the TSBench-Forge raw-data bucket. Validators
+consume forge data only through the built pool snapshots (channel 5). The raw
+catalog + parquet relay (`tsbench-forge-sources` on Hippius — see
+[EVAL_POOL.md](EVAL_POOL.md)) is an owner-orchestrator-side secret; keeping it private
+is the anti-gaming lever that stops miners from fitting generators to the
+held-out pool.
+
+### TSBench-Forge → validator data path
+
+```
+forge repo cron (scrape-data.yml)
+  └─ sync_storage.py ─► s3://tsbench-forge-sources        [private, owner-only]
+owner orchestrator
+  └─ aws s3 sync … ./tsforge
+     cascade-pool publish --sources tsbench_forge ─► pool bucket snapshots
+validators
+  └─ select snapshot by effective_block, verify sha256, rotate windows by round seed
+```
+
+One bucket contract end to end: `sources.yaml` + `data/<source_id>/<date>.parquet`
+at the relay, deterministic tar + `pool/index.json` at the pool. The forge cron
+and the pool-publish cron are decoupled; the staleness guard
+(`max_stale_days`, fail-loud when every feed is stale) lives in the pool
+builder so a dead scraper can't silently erode freshness.
+
+## Configuration and compatibility
+
+Owner-signed network overlays can change only the keys supported by the installed
+release. Signature, sequence, compatibility, stake lock-in, effective era and
+durable local history govern adoption. Manifests and receipts bind the applied
+configuration identity; historical replay uses the config in force at its block.
+An overlay cannot install code, change architecture bytes or silently replace
+release-only base/data pins. See [network configuration](VALIDATOR.md#owner-signed-network-config-dec-ca-0057).
+
+## Trust model
+
+Training is centralised in the owner's trainer and trust in `[manifest]
+trainer_hotkey`; that is what makes the controlled experiment enforceable.
+The seed derivations, corpus digests and signed contract make every run
+reproducible, which is the hook for decentralising training later (validators
+or a trainer quorum re-deriving and challenging a manifest).

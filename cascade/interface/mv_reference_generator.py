@@ -13,9 +13,9 @@ seasonality + noise) mirrors the deployed synthetic style, so at C=1 this is an
 ordinary king-style univariate corpus.
 
 Importable as ``generator.Generator`` (the trainer's contract). Emits ``(C, L)``
-arrays; deterministic from ``seed`` and ``n_series`` alone. Until
-``[generator] max_channels`` is raised the trainer rejects C>1 — this generator
-exists to be run in the ablation once it is.
+arrays; deterministic from ``seed`` and ``n_series`` alone. Defaults to the v2
+range of 8–32 channels. Explicit smaller ranges support historical ablations;
+they do not satisfy the current v2 submission policy.
 
 TWO DIFFERENT CHANNEL BUDGETS — do not conflate them:
 
@@ -50,8 +50,8 @@ class Generator(DataGenerator):
                 cfg = json.loads(cfg_path.read_text(encoding="utf-8")) or {}
             except Exception:  # noqa: BLE001 — a bad config falls back to defaults
                 cfg = {}
-        self._max_channels = int(cfg.get("max_channels", 4))
-        self._min_channels = int(cfg.get("min_channels", 2))
+        self._max_channels = int(cfg.get("max_channels", 32))
+        self._min_channels = int(cfg.get("min_channels", 8))
         self._length = int(cfg.get("length", 1024))
         self._max_delay = int(cfg.get("max_coupling_delay", 24))
         self._coupling_strength = float(cfg.get("coupling_strength", 0.6))

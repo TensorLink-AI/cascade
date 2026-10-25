@@ -1,10 +1,11 @@
 """hosts.toml publication — the provisioner's half of the trainer contract.
 
-The trainer re-reads its ``--remote-hosts`` file at every round start
-(``TrainerRunner._reload_remote_hosts``), so this file IS the interface: write
-it and the next round trains on the fleet; empty it and the next round falls
-back to local training (``load_hosts`` raises on zero ``[[host]]`` entries,
-which the trainer treats as "no fleet this round" — the round is never lost).
+The trainer re-reads its ``--remote-hosts`` file on every use (the funded pod
+profile, the operator FINAL lanes — ``TrainerRunner._rolling_final_hosts``),
+so this file IS the interface: write it and the next leg sees the lanes; empty
+it and no operator lane is offered (``load_hosts`` raises on zero ``[[host]]``
+entries, which the trainer treats as "no lanes on file" — a leg waits, it is
+never lost).
 
 Rendering itself stays in :func:`cascade.provision.core.render_hosts_toml`
 (stage-aware, per-GPU fan-out); this module owns only the two write

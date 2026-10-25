@@ -9,8 +9,9 @@ Scope: EVERY ``.py`` file under the repo (:func:`scan_tree`), not just
 code — and, inside each file, every long string/bytes constant that decodes to
 Python source (plain, base64, zlib, base64+zlib, hex; nested up to
 :data:`MAX_PACK_DEPTH`). Packing a module into a string constant and
-``exec``-ing it is a common, legitimate submission style, so the packed source
-is scanned exactly like a file rather than rejected.
+executing it is governed by ``packed_sources``: legacy ``scan`` inspects it
+like a file; ``reject`` refuses packed source itself. The current submission
+guide requires ordinary ``.py`` modules.
 
 One layer of defense-in-depth: static_guard is cheap and catches obvious cases
 at submit time; the trainer's corpus sandbox (network namespace, disk

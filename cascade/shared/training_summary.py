@@ -46,6 +46,7 @@ LEG_FIELDS = (
     "steps", "tokens_seen", "channel_tokens", "tokens_frac", "deadline_hit",
     "train_seconds", "gpu_name", "n_series", "total_points",
     "lr_schedule", "optim_state_resumed",
+    "param_count", "active_param_count",
 )
 CONTRACT_FIELDS = (
     "batch_size", "context_length", "budget_denomination", "batch_denomination",

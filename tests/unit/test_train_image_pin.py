@@ -87,12 +87,3 @@ def test_undigested_pin_is_a_loud_config_error(cfg, monkeypatch):
         assert_train_image(bad)
 
 
-def test_local_final_refuses_mismatched_runtime(cfg, monkeypatch, tmp_path):
-    """The local-training final path enforces the pin before any GPU work."""
-    from cascade.trainer.loop import TrainerRunner
-
-    monkeypatch.setenv(TRAIN_IMAGE_DIGEST_ENV, OTHER_SHA)
-    pinned = replace(cfg, training=replace(cfg.training, train_image_digest=SHA))
-    runner = TrainerRunner(cfg=pinned, base_trainer=object(), work_root=tmp_path)
-    with pytest.raises(TrainImageMismatch):
-        runner._train_final([], seeds=None, block=0)

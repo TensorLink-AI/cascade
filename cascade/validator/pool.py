@@ -170,10 +170,13 @@ class BucketWindowSource:
     """
 
     def __init__(self, cfg: ChainConfig, store: object, *, cache_dir: Path | str | None = None,
-                 max_cached: int = 3) -> None:
+                 max_cached: int = 3, prefix: str = "pool") -> None:
         self.cfg = cfg
         self.store = store
-        self.cache_dir = Path(cache_dir or "./_eval_pool")
+        # ``prefix``: the pool's key prefix in the bucket ("pool" = lane A)
+        self.prefix = str(prefix)
+        base = Path(cache_dir or "./_eval_pool")
+        self.cache_dir = base if self.prefix == "pool" else base / self.prefix
         self.max_cached = max_cached
         self._cache: dict[str, RotatingWindowSource] = {}
 
@@ -201,7 +204,7 @@ class BucketWindowSource:
         """The snapshot active for a round at epoch ``block`` (None → newest)."""
         from ..shared.hippius import read_pool_index, select_snapshot
 
-        index = read_pool_index(self.store)
+        index = read_pool_index(self.store, self.prefix)
         if not index:
             return None
         if block is None:
@@ -247,13 +250,15 @@ class BucketWindowSource:
 
 
 def load_bucket_pool(
-    cfg: ChainConfig, *, cache_dir: Path | str | None = None, store: object | None = None
+    cfg: ChainConfig, *, cache_dir: Path | str | None = None, store: object | None = None,
+    prefix: str = "pool",
 ) -> BucketWindowSource:
-    """Build a :class:`BucketWindowSource` for ``[storage] pool_bucket``."""
+    """Build a :class:`BucketWindowSource` for ``[storage] pool_bucket``
+    (``prefix`` selects the pool inside it: "pool" = lane A)."""
     if not cfg.storage.pool_bucket:
         raise PoolError("[storage] pool_bucket is empty; cannot load a bucket pool")
     if store is None:
         from ..shared.hippius import pool_s3_store
 
         store = pool_s3_store(cfg.storage)
-    return BucketWindowSource(cfg, store, cache_dir=cache_dir)
+    return BucketWindowSource(cfg, store, cache_dir=cache_dir, prefix=prefix)

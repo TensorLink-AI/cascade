@@ -1,7 +1,7 @@
 """The miner→operator funding endpoint: the one HTTP surface cascade exposes.
 
 Everything else miners do rides the chain (commit/reveal) or public storage
-(pull-only status files) — see ``docs/COMMUNICATION.md``. An API key cannot
+(pull-only status files) — see ``docs/ARCHITECTURE.md``. An API key cannot
 ride either: a chain commit is public forever once revealed, and storage is
 world-readable. So funding is a tiny authenticated POST straight to the
 operator, mirroring PRISM's intake (``base`` repo, ``prism-challenge``): the
@@ -23,13 +23,32 @@ transfers):
                          (v2: binds sha256 of the API key too, so an on-path
                          replay cannot attach or swap a key)
         X-Submission-Label: optional display name (≤32 chars, [A-Za-z0-9._-])
-                         shown beside the hotkey in the public queue, roster
-                         and heat standings — presentational, unsigned,
-                         never identity (DEC-CA-0043)
+                         shown beside the hotkey in the public queue and
+                         roster — presentational, unsigned, never identity
+                         (DEC-CA-0043)
+        X-Gpu-Type / X-Gpu-Allow-Fallback / X-Gpu-Max-Price: optional
+                         miner-chosen GPU type (DEC-CA-0060,
+                         :mod:`cascade.funding.gpu_choice`); when ANY is sent
+                         the signature is over the v3 message, which appends
+                         their values — none sent ⇒ the v2 bytes, unchanged
     → 202 {"status": "queued" | "replaced"}  |  200 "already-queued"
+          (+ "gpu", "allow_fallback", "max_price_per_hour" and an advisory
+          "warning" when a GPU type was chosen)
     → 400 missing_lium_api_key / missing_hotkey / missing_ref / bad_label /
-          stale_timestamp / bad_signature      |  403 not_revealed / not_registered
+          stale_timestamp / bad_signature / unknown_gpu / bad_gpu_fallback /
+          bad_gpu_max_price / gpu_options_without_gpu / gpu_choice_unavailable
+          | 403 not_revealed / not_registered
     → 409 replayed_timestamp | 503 registration_unavailable
+
+    POST /v1/credentials  (DEC-CA-0055: rotate the Lium key a hotkey's legs —
+        the v2 king's own leg included — rent on; same identity headers as
+        /v1/fund: X-Miner-Hotkey, X-Lium-Api-Key, X-Commit-Ref (a REVEALED
+        commitment of the hotkey), X-Timestamp, X-Signature over
+        canonical_fund_message("credentials", …) binding sha256 of the key)
+    → 200 {"status": "stored"} — the key replaces the hotkey's payer-vault key;
+          nothing is queued and the one lifetime submission is untouched
+    → 400 missing_lium_api_key / missing_hotkey / missing_ref / stale_timestamp /
+          bad_signature | 403 not_revealed / not_registered | 409 replayed_timestamp
 
     POST /v1/submit     (body = the generator ZIP; same identity headers,
         X-Content-Digest: sha256:<hex> of the body — the SIGNED binding —
@@ -43,6 +62,71 @@ transfers):
     → 403 not_registered (submissions require a hotkey registered on the
           subnet — self-minted keypairs cannot fill the private store)
     → 413 zip_too_large | 429 quota_exceeded | 503 submissions_disabled / busy
+
+    POST /v2/direct/credentials   (direct-MoE gangs; same identity headers)
+        X-Compute-Provider: lium | vast | runpod — the marketplace to rent on
+        X-Compute-Api-Key:  that marketplace's key, ideally scoped to instance
+                            create/delete only (see cascade.provision.vast/runpod)
+        X-Signature:        over canonical_fund_message("credentials", …) whose
+                            key field is sha256("<provider>:<key>")
+    → 200 {"status": "stored", "provider": …} | 400 unsupported_compute_provider /
+          missing_compute_api_key | 403 not_revealed / not_registered
+
+    POST /v1/lane-c/fund   (DEC-CA-0056 lane C — fund ONE fine-tune leg of the
+        hotkey's revealed lane-C commitment
+        ``metro-v1:ft:<target>:hippius:<ref>``; the ref is a recipe tree with
+        ``marketcast.json`` and an optional generator)
+        X-Miner-Hotkey, X-Lium-Api-Key, X-Commit-Ref (the recipe tree ref),
+        X-Lane-C-Target: the declared target, one of ``[lane_c] targets``
+                         (a forward-only competition's — today MarketCast
+                         ``mkt:<suite>``; anything else is ``bad_target``)
+        X-Timestamp, X-Signature over canonical_fund_message("lane-c-fund",
+                         hotkey, "<target>|<ref>", ts, sha256(key)) — binds
+                         the key digest, the target AND the ref
+        X-Submission-Label (optional, as above)
+        X-Gpu-Type / X-Gpu-Allow-Fallback / X-Gpu-Max-Price (optional, as
+                         /v1/fund — the v3 message then appends them)
+    → 202 {"status": "queued" | "replaced" | "queued-behind", "lane": "c",
+           "target": …} | 200 "already-queued"
+    → 400 missing_target / bad_target / unknown_target / missing_lium_api_key /
+          stale_timestamp / bad_signature | 403 not_revealed / not_registered |
+          409 replayed_timestamp | 409 competition_ended (its until_block
+          passed: nothing new is admitted) | 503 lane_c_disabled
+      The entry queues into the LANE-C queue (``lane_c_queue.json`` beside the
+      challenger queue — never the challenger queue) and the key lands in the
+      shared payer vault (one key per hotkey). It consumes NO lane-A lifetime
+      submission. Infra faults requeue without burning; an invalid
+      ``marketcast.json`` (or a generator fault) is the miner's and ends the
+      entry.
+    POST /v1/lane-c/withdraw  (same headers minus the key, signed as
+        "lane-c-withdraw") → 200 "withdrawn" | 409 not_queued
+    GET  /v1/lane-c/queue     (public lane-C queue: hotkey, target, ref, status)
+
+    POST /v1/lane-b/fund   (DEC-CA-0059 item 8 — fund ONE domain-expert leg of
+        the hotkey's revealed lane-B commitment
+        ``metro-v1:expert:<domain|codes>:hippius:<ref>``)
+        X-Miner-Hotkey, X-Lium-Api-Key, X-Commit-Ref (the generator ref),
+        X-Lane-B-Targets: the declared targets, comma-separated full names
+                         (``energy`` | ``energy,web_cloudops,horizon:720``),
+                         1..``[lane_b] max_domains_per_leg`` of ``[lane_b]
+                         targets`` — exactly the commitment's
+        X-Timestamp, X-Signature over canonical_fund_message("lane-b-fund",
+                         hotkey, "<targets as sent>|<ref>", ts, sha256(key))
+        X-Submission-Label, X-Gpu-Type / X-Gpu-Allow-Fallback /
+                         X-Gpu-Max-Price (optional, as /v1/fund)
+    → 202 {"status": "queued" | "replaced" | "queued-behind", "lane": "b",
+           "targets": […]} | 200 "already-queued"
+    → 400 missing_targets / bad_targets / unknown_target / too_many_targets /
+          missing_lium_api_key / stale_timestamp / bad_signature |
+          403 not_revealed / not_registered | 409 replayed_timestamp |
+          503 lane_b_disabled
+      Queues into the LANE-B queue (``lane_b_queue.json`` beside the
+      challenger queue); the key lands in the shared payer vault. No lane-A
+      lifetime submission is consumed; infra faults requeue without burning,
+      a capacity miss waits (``no_capacity``), the operator never pays.
+    POST /v1/lane-b/withdraw  (same headers minus the key, signed as
+        "lane-b-withdraw") → 200 "withdrawn" | 409 not_queued
+    GET  /v1/lane-b/queue     (public lane-B queue: hotkey, targets, ref, status)
 
     POST /v1/withdraw   (same auth headers, no key needed; with no live queue
         entry it still forgets the vaulted key → 200 "key-forgotten")
@@ -75,6 +159,7 @@ import time
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from .gpu_choice import GpuCatalog, GpuChoice, parse_gpu_headers, wall_warning
 from .queue import FundedQueue
 from .vault import PayerKeyVault
 
@@ -93,23 +178,64 @@ log = logging.getLogger("cascade.funding.intake")
 # window plus per-request freshness closes it without clock heroics.
 FRESHNESS_WINDOW_SECONDS = 300.0
 
-_ACTIONS = ("fund", "withdraw", "submit")
+_ACTIONS = ("fund", "withdraw", "submit", "credentials",
+            # DEC-CA-0056 lane C: the signed ref field is lane_c_signed_ref()
+            "lane-c-fund", "lane-c-withdraw",
+            # DEC-CA-0059 lane B: the signed ref field is lane_b_signed_ref()
+            "lane-b-fund", "lane-b-withdraw")
+
+LANE_C_TARGET_HEADER = "X-Lane-C-Target"
+LANE_B_TARGETS_HEADER = "X-Lane-B-Targets"
+
+
+def lane_b_targets(header_value: str) -> tuple[str, ...]:
+    """The declared targets of an ``X-Lane-B-Targets`` value, in the order
+    sent (each stripped; empty items dropped)."""
+    return tuple(t.strip() for t in str(header_value or "").split(",") if t.strip())
+
+
+def lane_b_signed_ref(targets, ref: str) -> str:
+    """The ``ref`` field a lane-B request signs: ``"<t1>,<t2>|<ref>"`` with
+    the targets EXACTLY as the request lists them — the signature binds the
+    declared targets and the ref (and, through the canonical message, the key
+    digest). The queue stores them in the ``[lane_b]`` slot order."""
+    from .queue import lane_b_entry_ref
+
+    return lane_b_entry_ref(targets, ref)
+
+
+def lane_c_signed_ref(target: str, ref: str) -> str:
+    """The ``ref`` field a lane-C request signs: ``"<target>|<ref>"`` — the
+    signature binds the declared target as well as the ref (and, through the
+    canonical message, the key digest)."""
+    from .queue import lane_c_entry_ref
+
+    return lane_c_entry_ref(target, ref)
 
 
 def canonical_fund_message(action: str, hotkey: str, ref: str, timestamp: str,
-                           key_digest: str = "-") -> bytes:
+                           key_digest: str = "-", gpu_segment: str = "") -> bytes:
     """The byte string the miner's hotkey signs. Versioned; fields ``:``-joined.
 
     ``ref`` is a Hub ``repo@digest`` and hotkeys are SS58, and the version tag
     pins the layout so a future field addition is a new version, not a silent
     re-parse. v2 (review 2026-09-02) appends ``key_digest`` — sha256 hex of
-    the ``X-Lium-Api-Key`` value, or ``-`` when the request carries no key —
+    the ``X-Lium-Api-Key`` value or the entire ``X-Payer-Credentials`` bundle,
+    or ``-`` when the request carries no key —
     so the signature binds WHICH key funds the entry: an on-path replay of a
     captured request can no longer attach its own key header (overwriting the
     victim's vaulted working key) or strip/swap the one that was sent.
+
+    v3 (DEC-CA-0060) appends ``gpu_segment`` — the miner's GPU choice
+    (:func:`cascade.funding.gpu_choice.gpu_signed_segment`) — and is used ONLY
+    when the request carries one: ``gpu_segment == ""`` is the v2 message,
+    byte for byte, so every existing tool keeps signing what it signs today.
     """
     if action not in _ACTIONS:
         raise ValueError(f"unknown action {action!r}")
+    if gpu_segment:
+        return (f"cascade-{action}:v3:{hotkey}:{ref}:{timestamp}:{key_digest}:"
+                f"{gpu_segment}").encode()
     return f"cascade-{action}:v2:{hotkey}:{ref}:{timestamp}:{key_digest}".encode()
 
 
@@ -138,27 +264,35 @@ def header_key_digest(headers) -> str:
     """The canonical-message key field for a request's headers."""
     import hashlib
 
-    api_key = (headers.get("X-Lium-Api-Key") or "").strip()
+    from .providers import header_credentials
+
+    api_key = header_credentials(headers)
     if not api_key:
         return "-"
     return hashlib.sha256(api_key.encode()).hexdigest()
 
 
+def compute_key_digest(provider: str, api_key: str) -> str:
+    """The canonical-message key field for a direct credential deposit: binds
+    WHICH marketplace as well as which key, so an on-path replay can neither
+    swap the key nor re-file it under another provider."""
+    import hashlib
+
+    return hashlib.sha256(f"{provider}:{api_key}".encode()).hexdigest()
+
+
 def verify_hotkey_signature(hotkey: str, message: bytes, signature_hex: str) -> bool:
     """sr25519 verification against the hotkey's SS58 address.
 
-    Same lazy-import shape as ``shared.manifest.verify_signature``: bittensor
-    is the ``chain`` extra, and a missing lib or malformed signature is a
-    False, never a crash — the caller decides whether unverifiable means
-    rejected (it does, whenever signatures are required).
+    A malformed or mismatched signature is False. A missing/broken bittensor
+    SDK is NOT a False: it raises ``SignatureVerifierUnavailable`` (the
+    request handler turns it into a logged 500), because answering False
+    would reject every valid miner signature with a misleading
+    ``bad_signature`` (DEC-CA-0051).
     """
-    try:
-        from bittensor import Keypair  # type: ignore
+    from ..shared.sr25519 import verify_hotkey
 
-        kp = Keypair(ss58_address=hotkey)
-        return bool(kp.verify(message, bytes.fromhex(signature_hex)))
-    except Exception:  # noqa: BLE001 — any failure to verify is a non-verify
-        return False
+    return verify_hotkey(hotkey, message, signature_hex)
 
 
 class PerIpLimiter:
@@ -245,12 +379,57 @@ class FundingIntake:
         vault: PayerKeyVault,
         *,
         resolve_reveal: Callable[[str, str], int | None],
+        direct_intake: object | None = None,
+        compute_vaults: dict | None = None,
         require_signature: bool = True,
         verify: Callable[[str, bytes, str], bool] = verify_hotkey_signature,
         clock: Callable[[], float] = time.time,
         store: object | None = None,   # SubmissionStore; None = submissions off
         resolve_registered: Callable[[str], bool | None] | None = None,
+        lane_c_queue: object | None = None,       # LaneCQueue; None = lane C off
+        resolve_lane_c_reveal: Callable[[str, str, str], int | None] | None = None,
+        lane_c_targets: tuple[str, ...] | None = None,
+        mkt_suites: tuple[str, ...] = (),
+        lane_c_closed: Callable[[str], str | None] | None = None,
+        gpu_catalog: GpuCatalog | None = None,
+        lane_b_queue: object | None = None,       # funding LaneBQueue; None = lane B off
+        resolve_lane_b_reveal: Callable[[str, tuple, str], int | None] | None = None,
+        lane_b_targets: tuple[str, ...] | None = None,
+        lane_b_max_targets: int | None = None,
     ) -> None:
+        self.direct_intake = direct_intake
+        # DEC-CA-0059 item 8 lane B: the domain-expert funding queue + its
+        # reveal oracle ``(hotkey, targets, ref) -> reveal block | None`` (the
+        # hotkey's revealed ``metro-v1:expert:`` commitment must declare
+        # exactly these targets and this ref), the configured slot list and
+        # the per-leg cap (None = accept any well-formed list; the trainer
+        # re-checks).
+        self.lane_b_queue = lane_b_queue
+        self.resolve_lane_b_reveal = resolve_lane_b_reveal
+        self.lane_b_targets = tuple(lane_b_targets) if lane_b_targets is not None else None
+        self.lane_b_max_targets = (int(lane_b_max_targets) if lane_b_max_targets is not None
+                                   else None)
+        # DEC-CA-0060: the SKUs a fund request may choose (``[round]
+        # funded_pod_skus``) and the walls behind the fund-time warning. None
+        # = no chain config (dev): any well-formed SKU, no warning.
+        self.gpu_catalog = gpu_catalog
+        # DEC-CA-0056 lane C: the fine-tune queue + its reveal oracle
+        # ``(hotkey, target, ref) -> reveal block | None`` (the hotkey's
+        # revealed ``metro-v1:ft:`` commitment must name exactly them), and
+        # the configured target list (None = accept any well-formed target;
+        # the trainer skips unknown ones).
+        self.lane_c_queue = lane_c_queue
+        self.resolve_lane_c_reveal = resolve_lane_c_reveal
+        self.lane_c_targets = tuple(lane_c_targets) if lane_c_targets is not None else None
+        # DEC-CA-0064: MarketCast suites admitted as mkt:<suite> lane-C
+        # targets (``[marketcast] target_suites``; none while it is off)
+        self.mkt_suites = tuple(mkt_suites)
+        # concurrent competitions (owner 2026-10-20): ``target -> refusal |
+        # None`` at the current chain block — a competition past its
+        # ``until_block`` admits nothing new (None = no end check: dev)
+        self.lane_c_closed = lane_c_closed
+        # marketplace → PayerKeyVault for direct-MoE gangs (Lium shares ``vault``).
+        self.compute_vaults = compute_vaults or {}
         self.queue = queue
         self.vault = vault
         self.resolve_reveal = resolve_reveal
@@ -351,8 +530,19 @@ class FundingIntake:
                                     "subnet — register first, then retry"}
         return None
 
-    def _auth(self, action: str, headers) -> tuple[int, dict] | tuple[None, dict]:
-        """Shared identity/signature gate; (None, ctx) when the request passes."""
+    def _auth(self, action: str, headers, key_digest: str | None = None,
+              signed_ref: str | None = None, gpu_segment: str = "",
+              ) -> tuple[int, dict] | tuple[None, dict]:
+        """Shared identity/signature gate; (None, ctx) when the request passes.
+        ``signed_ref`` (lane C) replaces ``X-Commit-Ref`` in the signed
+        message; ``ctx["ref"]`` stays the header's ref. ``gpu_segment``
+        (DEC-CA-0060) selects the v3 message when non-empty."""
+        from .providers import header_credentials
+
+        try:
+            header_credentials(headers)
+        except ValueError as exc:
+            return 400, {"code": "bad_provider_credentials", "message": str(exc)}
         hotkey = (headers.get("X-Miner-Hotkey") or "").strip()
         if not hotkey:
             return 400, {"code": "missing_hotkey",
@@ -369,8 +559,10 @@ class FundingIntake:
                 return 400, {"code": "stale_timestamp",
                              "message": "X-Timestamp must be current unix seconds "
                                         f"(±{FRESHNESS_WINDOW_SECONDS:.0f}s)"}
-            msg = canonical_fund_message(action, hotkey, ref, ts,
-                                         header_key_digest(headers))
+            msg = canonical_fund_message(action, hotkey,
+                                         ref if signed_ref is None else signed_ref, ts,
+                                         key_digest or header_key_digest(headers),
+                                         gpu_segment)
             if not sig or not self.verify(hotkey, msg, sig):
                 return 400, {"code": "bad_signature",
                              "message": "X-Signature must be the hotkey's sr25519 "
@@ -394,6 +586,12 @@ class FundingIntake:
             return 503, {"code": "submissions_disabled",
                          "message": "this intake accepts funding only; submit via "
                                     "the Hub path (cascade deploy)"}
+        from .providers import header_credentials
+
+        try:
+            header_credentials(headers)
+        except ValueError as exc:
+            return 400, {"code": "bad_provider_credentials", "message": str(exc)}
         hotkey = (headers.get("X-Miner-Hotkey") or "").strip()
         if not hotkey:
             return 400, {"code": "missing_hotkey",
@@ -481,7 +679,12 @@ class FundingIntake:
             return 400, {"code": "bad_zip", "message": str(e)}
         ref = vault_ref(digest)
         funding, note = "none", ""
-        api_key = (headers.get("X-Lium-Api-Key") or "").strip()
+        from .providers import header_credentials
+
+        try:
+            api_key = header_credentials(headers)
+        except ValueError as exc:
+            return 400, {"code": "bad_provider_credentials", "message": str(exc)}
         if api_key:
             # One-request flow: the key vaults now, the entry parks until the
             # miner's chain reveal resolves (the sweep promotes it). Vault
@@ -513,9 +716,29 @@ class FundingIntake:
             body_out["funding_note"] = note
         return 201, body_out
 
+    def _gpu_choice(self, headers) -> tuple[GpuChoice, str, dict | None]:
+        """The request's GPU choice (DEC-CA-0060), checked header-only BEFORE
+        the signature (an unknown SKU is refused without a chain read)."""
+        return parse_gpu_headers(headers, self.gpu_catalog)
+
+    def _gpu_reply(self, body: dict, choice: GpuChoice) -> dict:
+        """``body`` plus the chosen GPU and, when its measured wall cannot fit
+        the budget, the advisory ``warning`` — never a refusal. The default
+        choice adds nothing (today's reply bytes)."""
+        if not choice.chosen:
+            return body
+        out = {**body, **choice.as_dict()}
+        warn = wall_warning(choice, self.gpu_catalog)
+        if warn:
+            out["warning"] = warn
+        return out
+
     def fund(self, headers) -> tuple[int, dict]:
         self.sweep_pending()
-        status, ctx = self._auth("fund", headers)
+        choice, segment, gpu_err = self._gpu_choice(headers)
+        if gpu_err is not None:
+            return 400, gpu_err
+        status, ctx = self._auth("fund", headers, gpu_segment=segment)
         if status is not None:
             return status, ctx
         # Belt over the reveal check's braces: a reveal implies the hotkey was
@@ -524,7 +747,12 @@ class FundingIntake:
         gate = self._registration_gate(ctx["hotkey"])
         if gate is not None:
             return gate
-        api_key = (headers.get("X-Lium-Api-Key") or "").strip()
+        from .providers import header_credentials
+
+        try:
+            api_key = header_credentials(headers)
+        except ValueError as exc:
+            return 400, {"code": "bad_provider_credentials", "message": str(exc)}
         if not api_key:
             return 400, {"code": "missing_lium_api_key",
                          "message": "a funded entry needs your Lium API key "
@@ -538,15 +766,78 @@ class FundingIntake:
             return 403, {"code": "not_revealed",
                          "message": "no revealed commitment for this hotkey matches "
                                     "X-Commit-Ref — reveal first, then fund"}
-        outcome = self.queue.add(hotkey, ref, int(reveal_block), label=label)
+        outcome = self.queue.add(hotkey, ref, int(reveal_block), label=label,
+                                 gpu_choice=choice)
         # Vault AFTER the queue accepts (mirrors PRISM: creds stored only once
         # the row is real) — and on every accepted outcome, so a re-fund of a
         # queued entry refreshes a key that may be nearing its TTL.
         self.vault.insert(hotkey, api_key)
-        log.info("fund %s: %s (reveal_block=%d)", hotkey, outcome, reveal_block)
+        log.info("fund %s: %s (reveal_block=%d%s)", hotkey, outcome, reveal_block,
+                 f", gpu={choice.gpu}" if choice.chosen else "")
         if outcome == "already-queued":
-            return 200, {"status": "already-queued"}
-        return 202, {"status": outcome}
+            return 200, self._gpu_reply({"status": "already-queued"}, choice)
+        return 202, self._gpu_reply({"status": outcome}, choice)
+
+    def credentials(self, headers) -> tuple[int, dict]:
+        """DEC-CA-0055 key rotation: replace a hotkey's Lium key in the payer
+        vault at any time — the v2 king keeps its own leg funded (a failing
+        key slashes it to 1 % of lane A). The ``/v1/fund`` identity gate
+        (signature binding the key digest, fresh strictly-increasing
+        timestamp, subnet registration, a revealed commitment matching
+        ``X-Commit-Ref``); NOTHING is queued and the lifetime-submission rule
+        is never consulted — a rotation is custody, not a submission."""
+        from .providers import header_credentials
+
+        try:
+            api_key = header_credentials(headers)
+        except ValueError as exc:
+            return 400, {"code": "bad_provider_credentials", "message": str(exc)}
+        if not api_key:
+            return 400, {"code": "missing_lium_api_key",
+                         "message": "send the new Lium API key as X-Lium-Api-Key"}
+        status, ctx = self._auth("credentials", headers)
+        if status is not None:
+            return status, ctx
+        gate = self._registration_gate(ctx["hotkey"])
+        if gate is not None:
+            return gate
+        if self.resolve_reveal(ctx["hotkey"], ctx["ref"]) is None:
+            return 403, {"code": "not_revealed",
+                         "message": "no revealed commitment for this hotkey matches "
+                                    "X-Commit-Ref — reveal first, then rotate the key"}
+        self.vault.insert(ctx["hotkey"], api_key)
+        log.info("credentials %s: provider credentials rotated in the payer vault", ctx["hotkey"])
+        return 200, {"status": "stored"}
+
+    def direct_credentials(self, headers) -> tuple[int, dict]:
+        """Deposit (or rotate) the key a direct-MoE gang is rented with, on the
+        marketplace the miner chose. Same identity gate as ``/v1/fund``; the
+        key lands only in that marketplace's vault and nothing is queued —
+        admission is a separate signed ``/v2/direct/fund`` naming the provider.
+        """
+        provider = (headers.get("X-Compute-Provider") or "").strip().lower()
+        api_key = (headers.get("X-Compute-Api-Key") or "").strip()
+        if provider not in self.compute_vaults:
+            return 400, {"code": "unsupported_compute_provider",
+                         "message": "X-Compute-Provider must be one of "
+                                    + ", ".join(sorted(self.compute_vaults))}
+        if not api_key:
+            return 400, {"code": "missing_compute_api_key",
+                         "message": "send the marketplace key as X-Compute-Api-Key"}
+        status, ctx = self._auth("credentials", headers,
+                                 key_digest=compute_key_digest(provider, api_key))
+        if status is not None:
+            return status, ctx
+        gate = self._registration_gate(ctx["hotkey"])
+        if gate is not None:
+            return gate
+        if self.resolve_reveal(ctx["hotkey"], ctx["ref"]) is None:
+            return 403, {"code": "not_revealed",
+                         "message": "no revealed commitment for this hotkey matches "
+                                    "X-Commit-Ref — reveal first, then deposit a key"}
+        self.compute_vaults[provider].insert(ctx["hotkey"], api_key)
+        log.info("direct credentials %s: %s key stored", ctx["hotkey"], provider)
+        return 200, {"status": "stored", "provider": provider}
 
     def withdraw(self, headers) -> tuple[int, dict]:
         status, ctx = self._auth("withdraw", headers)
@@ -558,16 +849,11 @@ class FundingIntake:
             log.info("withdraw %s", hotkey)
             return 200, {"status": "withdrawn"}
         entry = self.queue.get(hotkey)
-        # A rolling leg in flight holds a pod rented with this key exactly like
-        # an in-round entry: forgetting the key now strands a live, billing pod
-        # the trainer can no longer stop or re-identify (2026-10-08 19:28,
-        # 5FHPFZ1x — the guard checked "in_round" only).
-        if entry is not None and entry.status in ("in_round", "in_flight"):
-            what = ("a training leg in flight" if entry.status == "in_flight"
-                    else "an entry already in a round")
+        if entry is not None and entry.status == "in_round":
             return 409, {"code": "not_queued",
-                         "message": f"{what} runs to its verdict — the key is "
-                                    "retained until then (teardown needs it)"}
+                         "message": "an entry already in a round runs to its "
+                                    "verdict — the key is retained until then "
+                                    "(teardown needs it)"}
         # No live entry: nothing to unqueue, but honor the custody half — a
         # terminal (done/failed) or absent entry has no teardown claim on the
         # key, so the miner can make us forget it NOW rather than waiting out
@@ -575,6 +861,239 @@ class FundingIntake:
         self.vault.remove(hotkey)
         log.info("withdraw %s: no live entry — key forgotten", hotkey)
         return 200, {"status": "key-forgotten"}
+
+    # ── lane C (DEC-CA-0056) ─────────────────────────────────────────────────
+
+    def _lane_c_request(self, action: str, headers, gpu_segment: str = "",
+                        ) -> tuple[int, dict] | tuple[None, dict]:
+        """The lane-C identity gate: lane C on, a well-formed configured
+        target, then the ``/v1/fund`` gate with the signature over
+        :func:`lane_c_signed_ref` (target AND ref) and the key digest."""
+        if self.lane_c_queue is None:
+            return 503, {"code": "lane_c_disabled",
+                         "message": "this intake does not run the lane-C (fine-tune) queue"}
+        target = (headers.get(LANE_C_TARGET_HEADER) or "").strip()
+        ref = (headers.get("X-Commit-Ref") or "").strip()
+        if not target:
+            return 400, {"code": "missing_target",
+                         "message": f"send the declared lane-C target as {LANE_C_TARGET_HEADER}"}
+        try:
+            from ..shared.config.lane_c import check_target, is_mkt_target
+
+            if is_mkt_target(target) and not self.mkt_suites:
+                return 400, {"code": "marketcast_inactive",
+                             "message": f"{target!r}: MarketCast (DEC-CA-0064) is not active "
+                                        "on this subnet — mkt:<suite> targets are refused"}
+            target = check_target(target, mkt_suites=self.mkt_suites)
+        except ValueError as e:
+            return 400, {"code": "bad_target", "message": str(e)}
+        except ImportError:   # pragma: no cover — shared lane-C config not shipped
+            pass
+        if self.lane_c_targets is not None and target not in self.lane_c_targets:
+            return 400, {"code": "unknown_target",
+                         "message": f"{target!r} is not a lane-C target; choose one of "
+                                    + ", ".join(self.lane_c_targets)}
+        if action == "lane-c-fund" and self.lane_c_closed is not None:
+            why = self.lane_c_closed(target)
+            if why:
+                return 409, {"code": "competition_ended", "message": why}
+        try:
+            signed = lane_c_signed_ref(target, ref) if ref else None
+        except ValueError as e:
+            return 400, {"code": "bad_ref", "message": str(e)}
+        status, ctx = self._auth(action, headers, signed_ref=signed, gpu_segment=gpu_segment)
+        if status is not None:
+            return status, ctx
+        ctx["target"] = target
+        return None, ctx
+
+    def lane_c_fund(self, headers) -> tuple[int, dict]:
+        """Fund one lane-C fine-tune leg (``POST /v1/lane-c/fund``): the
+        ``/v1/fund`` gate (signature binding key digest + target + ref, fresh
+        strictly-increasing timestamp, registered hotkey) plus a REVEALED
+        ``metro-v1:ft:<target>:hippius:<ref>`` commitment naming exactly this
+        target and ref. Queues into the lane-C queue (never the challenger
+        queue) and vaults the key in the shared payer vault — the same key a
+        hotkey's other legs rent on (one key per hotkey, rotated by
+        ``/v1/credentials``). Consumes NO lane-A lifetime submission."""
+        try:
+            self.lane_c_queue.expire_stale()      # type: ignore[union-attr]
+        except Exception:  # noqa: BLE001 — housekeeping never fails a request
+            log.exception("lane-C queue TTL sweep failed")
+        choice, segment, gpu_err = self._gpu_choice(headers)
+        if gpu_err is not None:
+            return 400, gpu_err
+        status, ctx = self._lane_c_request("lane-c-fund", headers, gpu_segment=segment)
+        if status is not None:
+            return status, ctx
+        gate = self._registration_gate(ctx["hotkey"])
+        if gate is not None:
+            return gate
+        from .providers import header_credentials
+
+        try:
+            api_key = header_credentials(headers)
+        except ValueError as exc:
+            return 400, {"code": "bad_provider_credentials", "message": str(exc)}
+        if not api_key:
+            return 400, {"code": "missing_lium_api_key",
+                         "message": "a funded fine-tune leg needs your Lium API key "
+                                    "as X-Lium-Api-Key"}
+        label, label_err = submission_label(headers)
+        if label_err is not None:
+            return 400, label_err
+        hotkey, ref, target = ctx["hotkey"], ctx["ref"], ctx["target"]
+        resolve = self.resolve_lane_c_reveal
+        reveal_block = resolve(hotkey, target, ref) if resolve is not None else None
+        if reveal_block is None:
+            return 403, {"code": "not_revealed",
+                         "message": "no revealed lane-C commitment "
+                                    "(metro-v1:ft:<target>:hippius:<ref>) for this hotkey "
+                                    "matches the target and X-Commit-Ref — commit with "
+                                    "`cascade lane-c commit`, wait for the reveal, then fund"}
+        outcome = self.lane_c_queue.add_lane_c(  # type: ignore[union-attr]
+            hotkey, target, ref, int(reveal_block), label=label, gpu_choice=choice)
+        self.vault.insert(hotkey, api_key)
+        log.info("lane-C fund %s: %s target=%s (reveal_block=%d%s)", hotkey, outcome, target,
+                 reveal_block, f", gpu={choice.gpu}" if choice.chosen else "")
+        if outcome == "already-queued":
+            return 200, self._gpu_reply(
+                {"status": "already-queued", "lane": "c", "target": target}, choice)
+        return 202, self._gpu_reply({"status": outcome, "lane": "c", "target": target}, choice)
+
+    def lane_c_withdraw(self, headers) -> tuple[int, dict]:
+        """Withdraw a still-queued lane-C entry (``POST /v1/lane-c/withdraw``).
+        The vaulted key is NOT forgotten here: it is shared with the hotkey's
+        other legs (use ``/v1/withdraw`` to forget it)."""
+        status, ctx = self._lane_c_request("lane-c-withdraw", headers)
+        if status is not None:
+            return status, ctx
+        if self.lane_c_queue.withdraw(ctx["hotkey"]):  # type: ignore[union-attr]
+            log.info("lane-C withdraw %s", ctx["hotkey"])
+            return 200, {"status": "withdrawn", "lane": "c"}
+        return 409, {"code": "not_queued",
+                     "message": "no queued lane-C entry for this hotkey (an in-flight leg "
+                                "runs to its end)"}
+
+    # ── lane B (DEC-CA-0059 item 8) ──────────────────────────────────────────
+
+    def _lane_b_request(self, action: str, headers, gpu_segment: str = "",
+                        ) -> tuple[int, dict] | tuple[None, dict]:
+        """The lane-B identity gate: lane B on, a well-formed declared target
+        list (configured slots, at most the per-leg cap, no repeats), then the
+        ``/v1/fund`` gate with the signature over :func:`lane_b_signed_ref`
+        (targets as sent AND ref) and the key digest. ``ctx["targets"]`` is
+        the list in the ``[lane_b]`` slot order (as sent when unconfigured)."""
+        if self.lane_b_queue is None:
+            return 503, {"code": "lane_b_disabled",
+                         "message": "this intake does not run the lane-B (domain-expert) queue"}
+        raw = (headers.get(LANE_B_TARGETS_HEADER) or "").strip()
+        sent = lane_b_targets(raw)
+        ref = (headers.get("X-Commit-Ref") or "").strip()
+        if not sent:
+            return 400, {"code": "missing_targets",
+                         "message": f"send the declared lane-B targets as {LANE_B_TARGETS_HEADER} "
+                                    "(comma-separated, e.g. energy or energy,horizon:720)"}
+        if len(set(sent)) != len(sent) or any("|" in t for t in sent):
+            return 400, {"code": "bad_targets",
+                         "message": f"{LANE_B_TARGETS_HEADER} must list distinct targets"}
+        if self.lane_b_targets is not None:
+            unknown = [t for t in sent if t not in self.lane_b_targets]
+            if unknown:
+                return 400, {"code": "unknown_target",
+                             "message": f"{unknown} not lane-B targets; choose from "
+                                        + ", ".join(self.lane_b_targets)}
+        if self.lane_b_max_targets is not None and len(sent) > self.lane_b_max_targets:
+            return 400, {"code": "too_many_targets",
+                         "message": f"{len(sent)} targets > [lane_b] max_domains_per_leg = "
+                                    f"{self.lane_b_max_targets}"}
+        try:
+            signed = lane_b_signed_ref(sent, ref) if ref else None
+        except ValueError as e:
+            return 400, {"code": "bad_ref", "message": str(e)}
+        status, ctx = self._auth(action, headers, signed_ref=signed, gpu_segment=gpu_segment)
+        if status is not None:
+            return status, ctx
+        order = self.lane_b_targets
+        ctx["targets"] = (tuple(t for t in order if t in sent) if order is not None else sent)
+        return None, ctx
+
+    def lane_b_fund(self, headers) -> tuple[int, dict]:
+        """Fund one lane-B domain-expert leg (``POST /v1/lane-b/fund``): the
+        ``/v1/fund`` gate (signature binding key digest + targets + ref, fresh
+        strictly-increasing timestamp, registered hotkey) plus a REVEALED
+        ``metro-v1:expert:`` commitment declaring exactly these targets and
+        this ref. Queues into the lane-B queue (never the challenger queue)
+        and vaults the key in the shared payer vault — the same key a
+        hotkey's other legs rent on. Consumes NO lane-A lifetime submission."""
+        try:
+            self.lane_b_queue.expire_stale()      # type: ignore[union-attr]
+        except Exception:  # noqa: BLE001 — housekeeping never fails a request
+            log.exception("lane-B queue TTL sweep failed")
+        choice, segment, gpu_err = self._gpu_choice(headers)
+        if gpu_err is not None:
+            return 400, gpu_err
+        status, ctx = self._lane_b_request("lane-b-fund", headers, gpu_segment=segment)
+        if status is not None:
+            return status, ctx
+        gate = self._registration_gate(ctx["hotkey"])
+        if gate is not None:
+            return gate
+        from .providers import header_credentials
+
+        try:
+            api_key = header_credentials(headers)
+        except ValueError as exc:
+            return 400, {"code": "bad_provider_credentials", "message": str(exc)}
+        if not api_key:
+            return 400, {"code": "missing_lium_api_key",
+                         "message": "a funded domain-expert leg needs your Lium API key "
+                                    "as X-Lium-Api-Key"}
+        label, label_err = submission_label(headers)
+        if label_err is not None:
+            return 400, label_err
+        hotkey, ref, targets = ctx["hotkey"], ctx["ref"], ctx["targets"]
+        resolve = self.resolve_lane_b_reveal
+        reveal_block = resolve(hotkey, targets, ref) if resolve is not None else None
+        if reveal_block is None:
+            return 403, {"code": "not_revealed",
+                         "message": "no revealed lane-B commitment (metro-v1:expert:…) for "
+                                    "this hotkey declares these targets and X-Commit-Ref — "
+                                    "commit with `cascade deploy --expert-domain`, wait for "
+                                    "the reveal, then fund"}
+        outcome = self.lane_b_queue.add_lane_b(  # type: ignore[union-attr]
+            hotkey, targets, ref, int(reveal_block), label=label, gpu_choice=choice)
+        self.vault.insert(hotkey, api_key)
+        log.info("lane-B fund %s: %s targets=%s (reveal_block=%d%s)", hotkey, outcome,
+                 ",".join(targets), reveal_block, f", gpu={choice.gpu}" if choice.chosen else "")
+        body = {"status": outcome, "lane": "b", "targets": list(targets)}
+        if outcome == "already-queued":
+            return 200, self._gpu_reply(body, choice)
+        return 202, self._gpu_reply(body, choice)
+
+    def lane_b_withdraw(self, headers) -> tuple[int, dict]:
+        """Withdraw a still-queued lane-B entry (``POST /v1/lane-b/withdraw``).
+        The vaulted key is NOT forgotten here: it is shared with the hotkey's
+        other legs (use ``/v1/withdraw`` to forget it)."""
+        status, ctx = self._lane_b_request("lane-b-withdraw", headers)
+        if status is not None:
+            return status, ctx
+        if self.lane_b_queue.withdraw(ctx["hotkey"]):  # type: ignore[union-attr]
+            log.info("lane-B withdraw %s", ctx["hotkey"])
+            return 200, {"status": "withdrawn", "lane": "b"}
+        return 409, {"code": "not_queued",
+                     "message": "no queued lane-B entry for this hotkey (an in-flight leg "
+                                "runs to its end)"}
+
+    def lane_b_queue_view(self) -> tuple[int, dict]:
+        if self.lane_b_queue is None:
+            return 503, {"code": "lane_b_disabled"}
+        return 200, self.lane_b_queue.public_view()  # type: ignore[union-attr]
+
+    def lane_c_queue_view(self) -> tuple[int, dict]:
+        if self.lane_c_queue is None:
+            return 503, {"code": "lane_c_disabled"}
+        return 200, self.lane_c_queue.public_view()  # type: ignore[union-attr]
 
     def queue_view(self) -> tuple[int, dict]:
         self.sweep_pending()
@@ -650,6 +1169,7 @@ class FundingIntake:
                 data = json.dumps(body).encode()
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
+                self.send_header("Cache-Control", "no-store")
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
@@ -693,6 +1213,10 @@ class FundingIntake:
                     self._reply(200, {"status": "ok"})
                 elif self.path == "/v1/queue":
                     self._dispatch(intake.queue_view)
+                elif self.path == "/v1/lane-c/queue":
+                    self._dispatch(intake.lane_c_queue_view)
+                elif self.path == "/v1/lane-b/queue":
+                    self._dispatch(intake.lane_b_queue_view)
                 else:
                     self._reply(404, {"code": "not_found"})
 
@@ -718,6 +1242,20 @@ class FundingIntake:
                                           "message": "Content-Length must be a "
                                                      "non-negative integer"})
                         return
+                if self.path == "/v2/direct/fund":
+                    if intake.direct_intake is None:
+                        self._reply(503, {"code": "direct_protocol_disabled"})
+                        return
+                    if not 0 < length <= 65536:
+                        self._reply(413, {"code": "invalid_direct_body_size"})
+                        return
+                    try:
+                        envelope = json.loads(self.rfile.read(length))
+                    except (ValueError, UnicodeError):
+                        self._reply(400, {"code": "invalid_json"})
+                        return
+                    self._dispatch(lambda: intake.direct_intake.fund(envelope, now=intake.clock()))
+                    return
                 if self.path == "/v1/submit":
                     cap = getattr(getattr(intake, "store", None), "max_bytes", 0) or (1 << 20)
                     if length > cap:
@@ -752,8 +1290,20 @@ class FundingIntake:
                     self.rfile.read(min(length, 1 << 16))
                 if self.path == "/v1/fund":
                     self._dispatch(lambda: intake.fund(self.headers))
+                elif self.path == "/v1/credentials":
+                    self._dispatch(lambda: intake.credentials(self.headers))
+                elif self.path == "/v2/direct/credentials":
+                    self._dispatch(lambda: intake.direct_credentials(self.headers))
                 elif self.path == "/v1/withdraw":
                     self._dispatch(lambda: intake.withdraw(self.headers))
+                elif self.path == "/v1/lane-c/fund":
+                    self._dispatch(lambda: intake.lane_c_fund(self.headers))
+                elif self.path == "/v1/lane-c/withdraw":
+                    self._dispatch(lambda: intake.lane_c_withdraw(self.headers))
+                elif self.path == "/v1/lane-b/fund":
+                    self._dispatch(lambda: intake.lane_b_fund(self.headers))
+                elif self.path == "/v1/lane-b/withdraw":
+                    self._dispatch(lambda: intake.lane_b_withdraw(self.headers))
                 else:
                     self._reply(404, {"code": "not_found"})
 

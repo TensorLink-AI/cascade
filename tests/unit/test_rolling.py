@@ -120,6 +120,16 @@ class FakeOps(LegOps):
         return self.chain_king
 
     # legs
+    def _with_identity(self, entry, era):
+        from cascade.shared.era import v2_era_active
+        from cascade.shared.manifest import contract_digest
+
+        cfg = getattr(self, "cfg", None)
+        if cfg is not None and v2_era_active(cfg, era.start_block):
+            return replace(entry, init_pointer=era.warm_start_ckpt,
+                           training_contract_digest=contract_digest(cfg.training.at_block(era.start_block)))
+        return entry
+
     def train_challenger(self, gen, era, block, *, end_wall):
         self.leg_calls.append((gen.hotkey, era.index, block, end_wall))
         gate = self.hold.get(gen.hotkey)
@@ -127,15 +137,15 @@ class FakeOps(LegOps):
             gate.wait(10)
         if gen.hotkey in self.failures:
             raise RuntimeError("leg failed")
-        return TrainedEntry(gen.hotkey, gen.uid, "challenger", gen.ref,
-                            _ptr(f"{gen.hotkey}-{era.index}"), "d", block, gpu_name="RTX 4090")
+        return self._with_identity(TrainedEntry(gen.hotkey, gen.uid, "challenger", gen.ref,
+                            _ptr(f"{gen.hotkey}-{era.index}"), "d", block, gpu_name="RTX 4090"), era)
 
     def train_king(self, gen, era, block, *, end_wall):
         self.king_calls.append((gen.hotkey, era.index, block, end_wall))
         if self.fail_king:
             raise self.king_exc or RuntimeError("king rent failed")
-        return TrainedEntry(gen.hotkey, gen.uid, "king", gen.ref,
-                            _ptr(f"K{gen.hotkey}-{era.index}"), "d", block, gpu_name="RTX 4090")
+        return self._with_identity(TrainedEntry(gen.hotkey, gen.uid, "king", gen.ref,
+                            _ptr(f"K{gen.hotkey}-{era.index}"), "d", block, gpu_name="RTX 4090"), era)
 
     def cached_leg(self, era, role, gen):
         return self.cached.get((era.index, role, gen.hotkey))
@@ -173,7 +183,7 @@ class FakeOps(LegOps):
     def publish_manifest(self, manifest):
         self.manifests.append(manifest)
 
-    def publish_bench(self, round_id, created_block, entries):
+    def publish_bench(self, round_id, created_block, entries, **kw):
         report = SimpleNamespace(round_id=round_id, created_block=created_block,
                                  entries=[(e.role, e.miner_hotkey) for e, _ in entries])
         self.benches.append(("report", round_id, report.entries))
@@ -233,16 +243,15 @@ def _sched(cfg, tmp_path, clock, ops=None, provenance=None):
                              pool_provenance_fn=provenance,
                              _rolling_note_king_host=lambda era: None)
     ops = ops or FakeOps(tmp_path, clock)
+    ops.cfg = cfg
     return RollingScheduler(runner, ops, clock=clock), ops
 
 
 def _join(sched, timeout=10.0):
     end = time.time() + timeout
-    while ((sched._threads or sched._king_threads or sched._king_bench_threads)
-           and time.time() < end):
+    while (sched._threads or sched._king_threads) and time.time() < end:
         time.sleep(0.01)
     assert not sched._threads and not sched._king_threads, "legs still running"
-    assert not sched._king_bench_threads, "king benches still running"
 
 
 def _advance(clock, ops, sched, client, *, from_block, to_block):
@@ -680,11 +689,8 @@ def test_queue_in_flight_lifecycle(tmp_path):
     e = q.get("ALFA")
     assert (e.status, e.target_boundary, e.era_index, e.started_block) == ("in_flight", 900, 1, 5)
     assert [x.hotkey for x in q.in_flight()] == ["ALFA"]
-    # a round-entry recovery never touches a flight; a withdraw is refused
-    assert q.recover_in_round() == 0 and q.get("ALFA").status == "in_flight"
+    # a withdraw is refused mid-flight
     assert not q.withdraw("ALFA")
-    assert q.retarget_flight("ALFA", target_boundary=1800)
-    assert q.get("ALFA").target_boundary == 1800
     # same-ref re-fund is proof of life; new ref queues behind
     assert q.add("ALFA", REF["ALFA"], reveal_block=10) == "already-queued"
     assert q.add("ALFA", REF_ALFA2, reveal_block=11) == "queued-behind"
@@ -1336,58 +1342,6 @@ def test_blocked_hotkey_is_refused_at_the_door_without_a_pod(cfg, tmp_path):
     assert q2.get("ALFA").status == "in_flight"
 
 
-def _ccommit(hk: str, ref: str, block: int, coldkey: str) -> Commitment:
-    return replace(_commit(hk, ref, block), coldkey=coldkey)
-
-
-def test_blocked_coldkey_refuses_every_hotkey_it_owns(cfg, tmp_path):
-    armed = _armed(cfg)
-    b0 = armed.round.rolling_from_block + 5
-    armed = replace(armed, round=replace(armed.round, blocked_coldkeys=("COLD-SPAM",)))
-    sched, ops = _sched(armed, tmp_path, Clock())
-    q = ops.queue()
-    # ALFA + CHAR share the blocked coldkey (CHAR stands in for a hotkey
-    # registered AFTER the list was written); BRAV is someone else's
-    ops.commits.append(_ccommit("ALFA", REF["ALFA"], b0 - 100, "COLD-SPAM"))
-    ops.commits.append(_ccommit("BRAV", REF["BRAV"], b0 - 90, "COLD-OK"))
-    ops.commits.append(_ccommit("CHAR", REF["CHAR"], b0 - 80, "COLD-SPAM"))
-    for hk, rb in (("ALFA", b0 - 100), ("BRAV", b0 - 90), ("CHAR", b0 - 80)):
-        q.add(hk, REF[hk], reveal_block=rb)
-    sched.tick(FakeClient(), b0)
-    _join(sched)
-    for hk in ("ALFA", "CHAR"):
-        assert q.get(hk).status == "failed" and q.get(hk).last_error_class == "blocked"
-        assert "blocked_coldkeys" in q.get(hk).last_error
-        assert hk not in ops.burnt
-    assert q.get("BRAV").status == "in_flight"
-
-
-def test_blocked_coldkey_respects_the_gate_and_exempts_the_king(cfg, tmp_path):
-    armed = _armed(cfg)
-    b0 = armed.round.rolling_from_block + 5
-    gated = replace(armed, round=replace(armed.round, blocked_coldkeys=("COLD-SPAM",),
-                                         blocked_from_block=b0 + 1))
-    sched, ops = _sched(gated, tmp_path, Clock())
-    ops.commits.append(_ccommit("ALFA", REF["ALFA"], b0 - 100, "COLD-SPAM"))
-    ops.queue().add("ALFA", REF["ALFA"], reveal_block=b0 - 100)
-    sched.tick(FakeClient(), b0)
-    _join(sched)
-    assert ops.queue().get("ALFA").status == "in_flight"      # before the gate: admitted
-    # the reigning king's hotkey is never refused by the coldkey rule
-    armed2 = replace(armed, round=replace(armed.round, blocked_coldkeys=("COLD-SPAM",)))
-    sched2, ops2 = _sched(armed2, tmp_path / "k", Clock())
-    sched2.tick(FakeClient(), b0)
-    _join(sched2)
-    king = sched2.state.current.king_hotkey
-    assert king
-    assert sched2._is_reigning_king(king)
-    commits = [_ccommit(king, "x", b0 - 1, "COLD-SPAM")]
-    gen = SimpleNamespace(hotkey=king, ref="x")
-    assert sched2._blocked_check(gen, b0, commits) is False
-    # an unknown coldkey (no metagraph data) is admitted, not guessed
-    assert sched2._coldkey_of([_commit("ALFA", REF["ALFA"], 1)], "ALFA") is None
-
-
 def test_forfeited_king_gets_no_king_leg(cfg, tmp_path):
     armed = _armed(cfg)
     b0 = armed.round.rolling_from_block + 5
@@ -1820,87 +1774,6 @@ def test_old_king_leg_landing_after_a_dethrone_is_discarded_and_new_king_trains(
     assert cur.index == idx and cur.king().miner_hotkey == "ALFA"
 
 
-class _HeldBenchOps(_HeldKingOps):
-    """bench_king blocks on ``bench_gate`` for the hotkeys in ``hold_benches``
-    and returns per-hotkey scores, so a misattributed bench is visible."""
-
-    def __init__(self, tmp_path, clock):
-        super().__init__(tmp_path, clock)
-        self.bench_gate = threading.Event()
-        self.hold_benches: set[str] = set()
-        self.bench_finished: list[str] = []
-
-    def bench_king(self, entry, era):
-        self.benches.append(("king", entry.miner_hotkey, era.index, self.clock()))
-        if entry.miner_hotkey in self.hold_benches:
-            self.bench_gate.wait(10)
-        tag = 0.1 if entry.miner_hotkey == "KING" else 0.9
-        self.bench_finished.append(entry.miner_hotkey)
-        return {k: tag for k in self.bench_scores}
-
-
-def _wait(pred, timeout=5.0):
-    end = time.time() + timeout
-    while not pred() and time.time() < end:
-        time.sleep(0.01)
-    return pred()
-
-
-def test_dethrone_during_the_old_kings_bench_launches_the_new_king_leg_at_once(cfg, tmp_path):
-    """2026-10-06 era 2562: the deposed king's bench held the king-leg slot,
-    so the new king's leg waited out the sweep and the next settlement
-    published nothing. The new leg must launch on the very next tick."""
-    armed = _armed(cfg)
-    clock = Clock()
-    ops = _HeldBenchOps(tmp_path, clock)
-    sched, _ = _sched(armed, tmp_path, clock, ops=ops)
-    client = FakeClient()
-    era_start = armed.round.rolling_from_block
-    b0 = era_start + 5
-    ops.hold_benches = {"KING"}
-    ops.commits.append(_commit("ALFA", REF["ALFA"], b0 - 100))
-    sched.tick(client, b0)                       # KING's leg lands, its bench blocks
-    assert _wait(lambda: any(b[1] == "KING" for b in ops.benches))
-    ops.king_hk = ops.chain_king = "ALFA"        # crowned from an earlier era
-    try:
-        sched.tick(client, b0 + 1)               # adopt + relaunch
-        assert _wait(lambda: [c[0] for c in ops.king_calls] == ["KING", "ALFA"]), \
-            "the new king's leg waited on the deposed king's bench"
-    finally:
-        ops.bench_gate.set()
-    _join(sched)
-    cur = sched.state.current
-    assert cur.king().miner_hotkey == "ALFA"
-
-
-def test_deposed_kings_bench_never_lands_on_the_new_kings_era(cfg, tmp_path):
-    armed = _armed(cfg)
-    clock = Clock()
-    ops = _HeldBenchOps(tmp_path, clock)
-    sched, _ = _sched(armed, tmp_path, clock, ops=ops)
-    client = FakeClient()
-    era_start = armed.round.rolling_from_block
-    b0 = era_start + 5
-    ops.hold_benches = {"KING"}
-    ops.hold_kings = {"ALFA"}                    # ALFA's leg still training when KING's bench ends
-    ops.commits.append(_commit("ALFA", REF["ALFA"], b0 - 100))
-    sched.tick(client, b0)
-    assert _wait(lambda: any(b[1] == "KING" for b in ops.benches))
-    ops.king_hk = ops.chain_king = "ALFA"
-    sched.tick(client, b0 + 1)
-    cur = sched.state.current
-    assert cur.king_hotkey == "ALFA"
-    ops.bench_gate.set()                         # KING's sweep finishes under ALFA's throne
-    assert _wait(lambda: "KING" in ops.bench_finished)
-    time.sleep(0.3)                              # let the sweep's write (if any) land
-    assert cur.king_bench is None, "the deposed king's numbers landed on the new king's era"
-    sched.tick(client, b0 + 2)                   # (main: the slot only frees now)
-    ops.king_gate.set()                          # ALFA's leg lands and benches its own
-    _join(sched)
-    assert cur.king().miner_hotkey == "ALFA"
-    assert cur.king_bench is not None and set(cur.king_bench.values()) == {0.9}
-
-
 def test_foreign_king_entry_restored_from_disk_is_dropped_and_retrained(cfg, tmp_path):
     """The live failure shape: the state on disk already carries the old
     king's entry under the new king. After a restart the entry is dropped
@@ -2226,51 +2099,6 @@ def test_king_pod_is_kept_while_a_verification_is_queued(cfg, tmp_path):
     assert ops.released.count(idx) == 1             # drained: released
 
 
-class _NotingVerifyOps(_VerifyOps):
-    def __init__(self, tmp_path, clock):
-        super().__init__(tmp_path, clock)
-        self.payer_reported: list[str] = []
-
-    def note_payer_reported(self, pointer):
-        self.payer_reported.append(pointer)
-
-
-def test_unverified_mode_publishes_queued_payer_numbers_and_frees_the_pod(cfg, tmp_path):
-    """Owner 2026-10-17 ([telemetry] funded_bench_unverified): a queued payer
-    bench is published AS REPORTED — no king-pod re-bench — and the drained
-    queue lets the era king pod go."""
-    armed = _armed(cfg)
-    clock = Clock()
-    ops = _NotingVerifyOps(tmp_path, clock)
-    sched, _ = _sched(armed, tmp_path, clock, ops=ops)
-    client = FakeClient()
-    q = ops.queue()
-    b0 = armed.round.rolling_from_block + 5
-    ops.hold_kings = {"KING"}
-    ops.commits.append(_commit("ALFA", REF["ALFA"], b0 - 100))
-    q.add("ALFA", REF["ALFA"], reveal_block=b0 - 100)
-    sched.tick(client, b0)
-    end = time.time() + 10
-    while "ALFA" in sched._threads and time.time() < end:
-        time.sleep(0.01)
-    assert [x["hotkey"] for x in sched.state.verify_queue] == ["ALFA"]
-    payer = dict(sched.state.verify_queue[0]["payer"])
-    idx = sched.state.current.index
-    sched.cfg = replace(sched.cfg, telemetry=replace(sched.cfg.telemetry,
-                                                     funded_bench_unverified=True))
-    ops.king_gate.set()
-    _join(sched)
-    sched.tick(client, b0 + 1)
-    _wait_verify(sched)
-    assert ops.verify_calls == []                       # never re-benched
-    assert sched.state.verify_queue == []
-    f = next(x for x in sched.state.finished if x.hotkey == "ALFA")
-    assert f.bench == payer                             # the payer's own numbers
-    assert ops.payer_reported == [f.entry["trained_pointer"]]
-    sched.tick(client, b0 + 2)
-    assert ops.released.count(idx) == 1                 # nothing left to verify: released
-
-
 def test_king_pod_that_cannot_bench_is_released_despite_queued_verifications(cfg, tmp_path):
     """2026-10-04: the era-2559 king pod (driver 570) could not bench; queued
     verifications must not pin an idle GPU — they wait for the next pod."""
@@ -2284,84 +2112,3 @@ def test_king_pod_that_cannot_bench_is_released_despite_queued_verifications(cfg
     _wait_verify(sched)
     assert sched.state.verify_queue                 # numbers kept for the next pod
     assert ops.released.count(idx) == 1
-
-
-# ── era-end overrun guard (2026-10-09 uid 205) ───────────────────────────────
-MAX_WALL = 18000.0            # [training] max_train_seconds: a leg may run this long
-
-
-def test_era_last_target_that_can_overrun_at_max_wall_starts_under_the_next_era(cfg):
-    # 16800 s before the era rolls: the typical wall (3.75 h + margin) clears
-    # the era's LAST settlement, the 5 h max wall does not. On 2026-10-09 a
-    # leg admitted like this ran ~4.5 h, finished after the era rolled and was
-    # discarded (payer re-billed). It must start under the next era instead.
-    armed = _armed(cfg)
-    now = 1_000_000.0
-    era_start = armed.round.rolling_from_block
-    era_len = EB * 4
-    cur = era_for_block(armed.round, era_start).index
-    late = era_start + era_len - 1400
-    old = admit(armed.round, block_now=late, now=now, wall_seconds=WALL,
-                margin_seconds=MARGIN, current_era=cur)
-    assert not old.cross_era and old.target_boundary == era_start + era_len  # the old rule
-    a = admit(armed.round, block_now=late, now=now, wall_seconds=WALL,
-              margin_seconds=MARGIN, current_era=cur, max_wall_seconds=MAX_WALL)
-    assert a.cross_era and a.era_index == cur + 1 and a.start_after == now
-    assert a.target_boundary >= era_start + era_len + EB      # never this era's last one
-
-
-def test_intra_era_target_is_unchanged_by_the_max_wall(cfg):
-    armed = _armed(cfg)
-    now = 1_000_000.0
-    era_start = armed.round.rolling_from_block
-    cur = era_for_block(armed.round, era_start).index
-    a_old = admit(armed.round, block_now=era_start + 10, now=now, wall_seconds=WALL,
-                  margin_seconds=MARGIN, current_era=cur)
-    a = admit(armed.round, block_now=era_start + 10, now=now, wall_seconds=WALL,
-              margin_seconds=MARGIN, current_era=cur, max_wall_seconds=MAX_WALL)
-    assert a == a_old and not a.cross_era and a.era_index == cur
-
-
-def test_era_last_target_that_fits_the_max_wall_is_admitted(cfg):
-    # 20400 s before the era rolls: even the 5 h max wall + margin clears it.
-    armed = _armed(cfg)
-    now = 1_000_000.0
-    era_start = armed.round.rolling_from_block
-    era_len = EB * 4
-    cur = era_for_block(armed.round, era_start).index
-    a = admit(armed.round, block_now=era_start + era_len - 1700, now=now, wall_seconds=WALL,
-              margin_seconds=MARGIN, current_era=cur, max_wall_seconds=MAX_WALL)
-    assert not a.cross_era and a.era_index == cur
-    assert a.target_boundary == era_start + era_len
-
-
-def test_rent_deadline_is_capped_at_the_era_end_minus_the_max_wall():
-    # rent time: a leg waiting for capacity must not START once its max wall
-    # could carry it past its era's last settlement
-    from cascade.trainer.loop import _era_capped
-
-    r = SimpleNamespace(_leg_local=SimpleNamespace(era_cap_deadline=5_000.0))
-    assert _era_capped(r, 9_000.0) == 5_000.0
-    assert _era_capped(r, 4_000.0) == 4_000.0          # only ever tightens
-    r._leg_local.era_cap_deadline = None
-    assert _era_capped(r, 9_000.0) == 9_000.0
-    # fail-open: no thread-local, or a non-numeric stand-in, never moves a deadline
-    assert _era_capped(SimpleNamespace(), 9_000.0) == 9_000.0
-    assert _era_capped(SimpleNamespace(_leg_local=SimpleNamespace(era_cap_deadline=object())),
-                       9_000.0) == 9_000.0
-
-
-def test_era_cap_deadline_is_era_end_minus_max_wall_minus_margin(cfg, monkeypatch):
-    from cascade.trainer.loop import TrainerRunner
-
-    armed = _armed(cfg)
-    era_start = armed.round.rolling_from_block
-    era_len = EB * 4
-    contract = SimpleNamespace(max_train_seconds=int(MAX_WALL))
-    r = SimpleNamespace(cfg=SimpleNamespace(round=armed.round, throne_contracts=lambda: [contract]),
-                        FUNDED_PUBLISH_MARGIN_SECONDS=900.0)
-    monkeypatch.setattr("cascade.trainer.loop.time.time", lambda: 1_000_000.0)
-    era = SimpleNamespace(start_block=era_start)
-    block = era_start + 100
-    got = TrainerRunner._rolling_era_cap_deadline(r, era, block)
-    assert got == 1_000_000.0 + (era_len - 100) * 12.0 - MAX_WALL - 900.0

@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -81,6 +82,14 @@ LIUM_APPEAR_TIMEOUT = 180.0
 
 class ProvisionError(RuntimeError):
     """A provisioning step failed (capacity, launch, teardown, or config)."""
+
+
+class UncertainCreateError(ProvisionError):
+    """A create may have allocated; retain its intent regardless of error prose."""
+
+
+class PriceCapUnavailable(ProvisionError):
+    """This provider cannot honor a requested price ceiling before creating."""
 
 
 # ── value types shared across providers ──────────────────────────────────────
@@ -133,7 +142,11 @@ def executor_price_per_hour(executor: dict) -> float | None:
         if v is None or isinstance(v, bool):
             continue
         try:
-            return float(v)
+            import math
+
+            price = float(v)
+            if math.isfinite(price) and price > 0:
+                return price
         except (TypeError, ValueError):
             continue
     return None
@@ -249,30 +262,44 @@ def _load_quarantine(path: Path) -> dict[str, dict]:
         out = {}
         for k, v in dict(raw).items():
             if isinstance(v, dict) and "until" in v:
-                out[str(k)] = {"until": float(v["until"]), "reason": str(v.get("reason", ""))}
+                out[str(k)] = {**v, "until": float(v["until"]), "reason": str(v.get("reason", ""))}
         return out
     except (FileNotFoundError, OSError, ValueError, TypeError):
         return {}
 
 
 def record_host_quarantine(host: str, reason: str, *,
-                           seconds: float = LIUM_HOST_QUARANTINE_SECONDS,
+                           seconds: float | None = None,
                            path: Path | None = None, now: float | None = None) -> None:
-    """Keep every executor on ``host`` (an IP) out of listings for ``seconds``."""
+    """Exclude a faulty host; use a short first quarantine unless explicitly pinned."""
+    from ..funding.faults import classify_rent_failure
+
+    if classify_rent_failure(reason) in {"auth", "rate_limited", "no_capacity"}:
+        log.warning("host quarantine skipped: account/API failure is not a hardware fault")
+        return
     host = str(host or "").strip()
     if not host:
         return
     path = path or lium_quarantine_path()
     now = time.time() if now is None else now
     try:
-        d = {k: v for k, v in _load_quarantine(path).items() if v["until"] > now}
-        prev = d.get(host)
-        until = max(now + seconds, prev["until"] if prev else 0.0)
-        d[host] = {"until": until, "reason": str(reason)[:300]}
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(d, sort_keys=True), encoding="utf-8")
-        tmp.replace(path)
+        from ..shared.atomic import path_lock, write_text_atomic
+
+        with path_lock(path):
+            d = {k: v for k, v in _load_quarantine(path).items() if v["until"] > now}
+            prev = d.get(host)
+            count = int(prev.get("count", 1)) + 1 if prev else 1
+            duration = seconds
+            if duration is None:
+                # One transient boot/transport failure gets thirty minutes;
+                # repeated failures get three hours. A stale runtime/driver
+                # needs intervention, so keep the existing 24-hour exclusion.
+                stale = any(t in reason.lower() for t in (
+                    "runtime rejected", "stale image", "driver too old", "wrong runtime"))
+                duration = LIUM_HOST_QUARANTINE_SECONDS if stale else (10800 if count > 1 else 1800)
+            until = max(now + duration, prev["until"] if prev else 0.0)
+            d[host] = {"until": until, "reason": str(reason)[:300], "count": count}
+            write_text_atomic(path, json.dumps(d, sort_keys=True))
         log.warning("lium: host %s quarantined for %.1f h — %s", host, (until - now) / 3600,
                     reason)
     except OSError as e:
@@ -341,25 +368,60 @@ def lium_template_payload(image: str, *, ssh_pubkey: str, ssh_port: int) -> dict
     return payload
 
 
+# The template fields that decide what a pod boots: the name is derived from
+# them, but the payer owns the account and can pre-create a template under
+# that name with other contents, so reuse compares every one of them.
+_TEMPLATE_PINNED = ("docker_image", "docker_image_tag", "docker_image_digest",
+                    "internal_ports", "environment", "entrypoint", "startup_commands")
+
+
 def lium_template_name(payload: dict) -> str:
     """Deterministic, content-addressed template name: the same image, pubkey,
     port and digest always resolve to the same template on the account."""
     import hashlib
     import json
 
-    keyed = {k: payload.get(k, "") for k in ("docker_image", "docker_image_tag",
-                                             "docker_image_digest", "internal_ports",
-                                             "environment", "entrypoint", "startup_commands")}
+    keyed = {k: payload.get(k, "") for k in _TEMPLATE_PINNED}
     h = hashlib.sha256(json.dumps(keyed, sort_keys=True).encode("utf-8")).hexdigest()[:12]
     return f"cascade-worker-{payload['docker_image_tag']}-{h}"
 
 
+def _template_diff(t: dict, payload: dict) -> list[str]:
+    """Pinned fields where template ``t`` differs from ``payload``; a field the
+    API did not return counts as different (unverifiable ⇒ not ours)."""
+    def norm(k, v):
+        if k == "internal_ports":
+            return sorted(int(x) for x in (v or []))
+        if k == "environment":
+            return {str(a): str(b) for a, b in (v or {}).items()}
+        return "" if v is None else str(v)
+
+    out = []
+    for k in _TEMPLATE_PINNED:
+        if k not in t:
+            out.append(k)
+            continue
+        try:
+            same = norm(k, t[k]) == norm(k, payload.get(k, ""))
+        except (TypeError, ValueError, AttributeError):
+            same = False
+        if not same:
+            out.append(k)
+    return out
+
+
 def lium_get_or_create_template(payload: dict, *, api_key: str,
                                 base_url: str = LIUM_API_BASE, timeout: float = 30.0) -> str:
-    """Resolve ``payload`` to a template id on the account — reuse by name, else
-    create once. A 429 on creation is surfaced as a :class:`ProvisionError`
-    naming the retry-after, so the caller's infra path can requeue instead of
-    burning a leg (and so the operator can SEE the limit)."""
+    """Resolve ``payload`` to a template id on the account — reuse one whose
+    pinned contents match exactly, else create once. The account belongs to
+    the payer, who can pre-create a template under our (derivable) name with
+    their own startup commands, env or SSH key: a name match alone is never
+    reused, and a squatted name makes us create under a nonce-suffixed name.
+    A 429 on creation is surfaced as a :class:`ProvisionError` naming the
+    retry-after, so the caller's infra path can requeue instead of burning a
+    leg (and so the operator can SEE the limit)."""
+    import secrets
+
     import requests
 
     if not api_key:
@@ -370,16 +432,27 @@ def lium_get_or_create_template(payload: dict, *, api_key: str,
         r = requests.get(f"{base_url}/templates", headers=headers, timeout=timeout)
     except requests.RequestException as e:
         raise ProvisionError(f"lium: template listing failed: {e}") from e
+    taken = False
     if r.ok:
         body = r.json()
         items = body if isinstance(body, list) else (body.get("items") or [])
         for t in items:
-            if (t.get("name") == name and t.get("docker_image") == payload["docker_image"]
-                    and t.get("docker_image_tag") == payload["docker_image_tag"]
-                    and t.get("id")):
+            tname = str(t.get("name") or "")
+            if not t.get("id") or not (tname == name or tname.startswith(name + "-")):
+                continue
+            taken = taken or tname == name
+            if any(k not in t for k in _TEMPLATE_PINNED):
+                t = _template_detail(t, base_url=base_url, headers=headers, timeout=timeout)
+            diff = _template_diff(t, payload)
+            if not diff:
                 return str(t["id"])
+            log.warning("lium: template %s (%s) is named like ours but differs in %s; "
+                        "not reusing it", t.get("id"), tname, ",".join(diff))
+    body = dict(payload)
+    if taken:
+        body["name"] = f"{name}-{secrets.token_hex(4)}"
     try:
-        r = requests.post(f"{base_url}/templates", headers=headers, json=payload,
+        r = requests.post(f"{base_url}/templates", headers=headers, json=body,
                           timeout=timeout)
     except requests.RequestException as e:
         raise ProvisionError(f"lium: template creation failed: {e}") from e
@@ -393,8 +466,23 @@ def lium_get_or_create_template(payload: dict, *, api_key: str,
     tid = str(r.json().get("id") or "")
     if not tid:
         raise ProvisionError(f"lium: template creation returned no id: {r.text[:200]}")
-    log.info("lium: created persistent template %s as %s", tid, name)
+    log.info("lium: created persistent template %s as %s", tid, body["name"])
     return tid
+
+
+def _template_detail(t: dict, *, base_url: str, headers: dict, timeout: float) -> dict:
+    """``GET /templates/{id}`` for a listing row that omits pinned fields; the
+    row itself on any failure (its missing fields then fail the compare)."""
+    import requests
+
+    try:
+        r = requests.get(f"{base_url}/templates/{t['id']}", headers=headers, timeout=timeout)
+    except requests.RequestException:
+        return t
+    if not r.ok:
+        return t
+    d = r.json()
+    return {**t, **d} if isinstance(d, dict) else t
 
 
 @dataclass(frozen=True)
@@ -493,11 +581,10 @@ def render_hosts_toml(
     NOT seeded onto the pod). The array literals are emitted as TOML/JSON-style
     ``["a", "b"]``.
 
-    ``stage`` ("any" | "heat" | "final") tags which round stage these pods serve
-    (see ``cascade.trainer.remote.RemoteHost``): a homogeneous batch is one stage,
-    so provision a cheap heat fleet (``--stage heat``) and a single-SKU final pair
-    (``--stage final``) as separate runs, then concatenate the ``[[host]]`` blocks.
-    ``"any"`` is omitted (it is the schema default).
+    ``stage`` ("any" | "final"; "heat" is still accepted, unused) tags the
+    lane class (see ``cascade.trainer.remote.RemoteHost``): the trainer's
+    rolling fallback legs take ``final``/``any`` lanes. ``"any"`` is omitted (it
+    is the schema default).
 
     ``pod_names`` (one per address) overrides the positional ``{prefix}-{i}``
     stem with a STABLE per-pod name: entries become ``{pod_names[i]}-g{g}``
@@ -663,7 +750,8 @@ def pick_shadeform_offer(types_json: dict, sku: str, *, gpus: int = 1,
             continue
         region = next(
             (a.get("region") for a in t.get("availability", [])
-             if a.get("available") and a.get("region") not in exclude_regions),
+             if a.get("available") and a.get("rental_type", "on_demand") == "on_demand"
+             and a.get("region") not in exclude_regions),
             None,
         )
         if not region:
@@ -680,6 +768,47 @@ def pick_shadeform_offer(types_json: dict, sku: str, *, gpus: int = 1,
         return None
     offers.sort(key=lambda x: x[0])
     return offers[0][1]
+
+
+def pick_shadeform_cpu_offer(types_json: dict, min_vcpus: int,
+                             max_price_usd_hr: float) -> list[dict]:
+    """CPU-generation offers (DEC-CA-0053) from ``GET /instances/types``,
+    cheapest first.
+
+    The endpoint is documented as GPU instance types, but every type reports
+    ``configuration.vcpus`` / ``memory_in_gb``, so a vCPU-rich cheap shape
+    serves as a CPU VM. Keeps on-demand available entries with ``vcpus >=
+    min_vcpus`` and ``hourly_price`` (CENTS) within ``max_price_usd_hr``. A
+    GPU-less type (``num_gpus == 0``), when listed at all, sorts ahead of any
+    GPU type at the same or higher price — we rent the cores, not the card.
+    Each offer: ``{cloud, region, shade_instance_type, vcpus, memory_gb,
+    price_usd_hr, num_gpus}``."""
+    out: list[tuple[int, float, dict]] = []
+    for t in types_json.get("instance_types", []):
+        conf = t.get("configuration", {}) or {}
+        vcpus = int(conf.get("vcpus", 0) or 0)
+        price = int(t.get("hourly_price", 1 << 30)) / 100.0
+        if vcpus < int(min_vcpus) or price > float(max_price_usd_hr):
+            continue
+        region = next(
+            (a.get("region") for a in t.get("availability", [])
+             if a.get("available") and a.get("rental_type", "on_demand") == "on_demand"),
+            None,
+        )
+        if not region:
+            continue
+        gpus = int(conf.get("num_gpus", 0) or 0)
+        out.append((0 if gpus == 0 else 1, price, {
+            "cloud": t.get("cloud"),
+            "region": region,
+            "shade_instance_type": t.get("shade_instance_type"),
+            "vcpus": vcpus,
+            "memory_gb": float(conf.get("memory_in_gb", 0) or 0),
+            "price_usd_hr": price,
+            "num_gpus": gpus,
+        }))
+    out.sort(key=lambda x: (x[0], x[1]))
+    return [o for _, _, o in out]
 
 
 def shadeform_offer_price_usd_hr(types_json: dict, sku: str) -> float | None:
@@ -903,6 +1032,9 @@ class LiumProvider:
     default_wall_seconds: float = 0.0
     # pod name → SKU it was launched on (sku_choices launches).
     _sku_by_name: dict = field(default_factory=dict, repr=False)
+    # pod name → monotonic time its `lium up` was issued (``create_requested``
+    # and the ghost settlement in ``terminate``).
+    _issued_creates: dict = field(default_factory=dict, repr=False)
 
     def _subprocess_env(self) -> dict[str, str] | None:
         """Child env for CLI calls: the payer's key layered over ours, or None.
@@ -1083,6 +1215,7 @@ class LiumProvider:
                 if pod_id in (p.get("name"), p.get("huid"), p.get("id"))]
         if not hits:
             return None
+        self.__dict__.setdefault("_unresolved_creates", {})[pod_id] = False
         return next((p for p in hits if lium_pod_ready(p)), hits[0])
 
     def available(self, sku: str, count: int, *, gpus: int = 1,
@@ -1151,11 +1284,18 @@ class LiumProvider:
             # injects the ACCOUNT's registered keys; a template NAME passed as
             # --image 400s ("image reference is not valid") — never do that.
             argv += ["--name", name, "--yes"]
-            if self._spawn is not None:
-                self._spawn(argv)
-            else:
-                _spawn_cli(argv, log_path=self._up_log_path(name),
-                           env=self._subprocess_env())
+            self.__dict__.setdefault("_unresolved_creates", {})[name] = True
+            # Issued is as certain as a fire-and-forget create gets: from here
+            # the intent must outlive any failure (``create_requested``).
+            self._issued_creates[name] = self._now()
+            try:
+                if self._spawn is not None:
+                    self._spawn(argv)
+                else:
+                    _spawn_cli(argv, log_path=self._up_log_path(name),
+                               env=self._subprocess_env())
+            except Exception as exc:  # noqa: BLE001 — a spawn that may have run is uncertain
+                raise UncertainCreateError(f"lium up {name}: {exc}") from None
             landed = sku_for.get(str(ex.get("id")), spec.sku)
             log.info("lium up → executor %s as %s (%s%s)", ex.get("id"), name, landed,
                      f", ${executor_price_per_hour(ex):.2f}/h"
@@ -1177,6 +1317,54 @@ class LiumProvider:
     def machine_of(self, pod_id: str) -> str | None:
         """Executor id a pod was launched on (this process's launches only)."""
         return self._executor_by_name.get(pod_id)
+
+    def create_unresolved(self, pod_id: str) -> bool:
+        return bool(self.__dict__.get("_unresolved_creates", {}).get(pod_id))
+
+    def create_requested(self, pod_id: str) -> bool:
+        """A ``lium up`` for ``pod_id`` was issued by this instance. False when
+        ``launch`` failed before it (the ``lium ls`` listing, the template):
+        nothing was created, so the write-ahead intent has nothing to guard."""
+        return pod_id in self._issued_creates
+
+    # `lium rm` prose for a target the account does not have. Anything else
+    # (a 401 on a revoked key, a transport error) keeps the create unresolved.
+    _RM_NOT_FOUND_MARKERS = ("not found", "no such", "does not exist", "doesn't exist", "no pod")
+
+    def _settle_ghost(self, pod_id: str, rm_error: str) -> None:
+        """Resolve a ``lium up`` that never listed as "deployed nothing".
+
+        The create is fire-and-forget, so a pod that never appeared kept its
+        leg name ``create_unresolved`` for the rest of the seed epoch (every
+        later rent refused, the sweep could not clear an intent no listing
+        can resolve). Evidence that nothing was allocated, ALL required: the
+        appear window has passed since the ``up`` was issued, ``lium rm`` by
+        name said the pod does not exist (not an auth or transport failure),
+        and two listings ``poll_interval`` apart both lack it. Anything less
+        keeps it unresolved — an uncertain create never authorizes a second
+        rental.
+        """
+        from ..funding.faults import classify_rent_failure
+
+        issued = self._issued_creates.get(pod_id)
+        if issued is None or self._now() - issued < LIUM_APPEAR_TIMEOUT:
+            return
+        low = rm_error.lower()
+        if (classify_rent_failure(low) in ("auth", "rate_limited")
+                or not any(m in low for m in self._RM_NOT_FOUND_MARKERS)):
+            return
+        try:
+            for attempt in range(2):
+                if attempt:
+                    self._sleep(self.poll_interval)
+                if self._pod(pod_id) is not None:
+                    return
+        except ProvisionError:
+            return                                  # cannot list: stays unresolved
+        self.__dict__.setdefault("_unresolved_creates", {})[pod_id] = False
+        log.warning("lium pod %s: `lium up` deployed nothing (never listed within %.0fs, "
+                    "`lium rm` finds no such pod, two empty listings) — the create is "
+                    "resolved as never made", pod_id, LIUM_APPEAR_TIMEOUT)
 
     def pod_identity(self, pod_id: str) -> dict | None:
         """The platform's identity of the pod currently answering to ``pod_id``.
@@ -1342,15 +1530,19 @@ class LiumProvider:
         # is no --yes flag (verified against the installed CLI). Passing one would
         # error and we'd mistake a live pod for a terminated one, i.e. leak it.
         executor = self._executor_of_pod(pod_id)      # before the pod vanishes
+        rm_error = ""
         try:
             self._cli(["rm", pod_id])
             log.info("lium rm %s", pod_id)
         except ProvisionError as e:
             # Idempotent: an already-gone pod is success, not a leak.
             log.warning("lium rm %s: %s (treating as already terminated)", pod_id, e)
+            rm_error = str(e)
         # The vacated executor deploys nothing for a while: keep every listing
         # (ours and each payer's) off it until the cooldown passes.
         record_executor_cooldown(executor)
+        if rm_error and self.create_unresolved(pod_id):
+            self._settle_ghost(pod_id, rm_error)
 
     def list_tagged(self, prefix: str) -> list[str]:
         """Live pod names starting with ``prefix`` (Lium addresses pods by name)."""
@@ -1386,6 +1578,12 @@ def scan_ssh_host_key(ip: str, port: int, *, timeout: float = 15.0,
 # ── Shadeform adapter (REST) ─────────────────────────────────────────────────
 
 
+def _shadeform_container_status(info: dict) -> str:
+    launch = info.get("launch_configuration") or {}
+    status = info.get("container_status") or launch.get("container_status")
+    return str(status or ("pending" if launch.get("type") == "docker" else "")).lower()
+
+
 @dataclass
 class ShadeformProvider:
     """Shadeform marketplace via its REST API (``X-API-KEY``).
@@ -1401,6 +1599,11 @@ class ShadeformProvider:
     # Registered account key id → VM-mode launches (bare VM + bootstrap_script,
     # user "shadeform"); empty → docker-mode (the worker-image contract).
     ssh_key_id: str = ""
+    api_key: str = field(default="", repr=False)
+    max_price_per_hour: float = 0.0
+    max_leg_cost_usd: float = 0.0
+    sku_wall_seconds: tuple[tuple[str, int], ...] = ()
+    default_wall_seconds: float = 0.0
     poll_interval: float = POD_POLL_INTERVAL
     _session: object | None = field(default=None, repr=False)
     _sleep: Callable[[float], None] = field(default=time.sleep, repr=False)
@@ -1408,6 +1611,9 @@ class ShadeformProvider:
     # region each pod was placed in (this process's launches only) — feeds the
     # replacement path's facility exclusion after an image_digest gate failure.
     _region_by_pod: dict = field(default_factory=dict, repr=False)
+    _sku_by_pod: dict = field(default_factory=dict, repr=False)
+    # names whose create request went out and was not definitely refused.
+    _issued_creates: set = field(default_factory=set, repr=False)
 
     def _http(self):
         if self._session is not None:
@@ -1418,7 +1624,7 @@ class ShadeformProvider:
             raise ProvisionError(
                 "the shadeform adapter needs `requests` (pip install -e '.[deploy]')"
             ) from e
-        key = os.environ.get(self.api_key_env)
+        key = self.api_key or os.environ.get(self.api_key_env)
         if not key:
             raise ProvisionError(f"shadeform: set ${self.api_key_env}")
         s = requests.Session()
@@ -1439,8 +1645,30 @@ class ShadeformProvider:
     def _offer(self, sku: str, *, gpus: int = 1,
                exclude_regions: tuple[str, ...] = ()) -> dict | None:
         types = self._get("/instances/types", {"gpu_type": sku, "available": "true"})
-        return pick_shadeform_offer(types, sku, gpus=gpus,
-                                    exclude_regions=exclude_regions)
+        limits = [self.max_price_per_hour] if self.max_price_per_hour > 0 else []
+        if self.max_leg_cost_usd > 0:
+            wall = dict(self.sku_wall_seconds).get(sku, self.default_wall_seconds)
+            if wall <= 0:
+                raise ProvisionError("shadeform: per-leg cap requires a positive training wall")
+            limits.append(self.max_leg_cost_usd * 3600.0 / wall)
+        cap = min(limits) if limits else math.inf
+        filtered = []
+        for row in types.get("instance_types", []):
+            try:
+                price = float(row["hourly_price"]) / 100.0
+            except (ValueError, TypeError, KeyError):
+                continue
+            if math.isfinite(price) and 0 <= price <= cap:
+                filtered.append(row)
+        offer = pick_shadeform_offer({"instance_types": filtered}, sku, gpus=gpus,
+                                     exclude_regions=exclude_regions)
+        if offer is not None:
+            quote = next(row for row in filtered
+                         if row.get("cloud") == offer["cloud"]
+                         and row.get("shade_instance_type") == offer["shade_instance_type"])
+            offer = {**offer, "price_usd_hr": float(quote["hourly_price"]) / 100.0,
+                     "sku": sku}
+        return offer
 
     def available(self, sku: str, count: int, *, gpus: int = 1) -> bool:
         # Shadeform reports availability, not exact counts; an available offer
@@ -1448,26 +1676,53 @@ class ShadeformProvider:
         return self._offer(sku, gpus=gpus) is not None
 
     def launch(self, spec: LaunchSpec) -> list[str]:
-        offer = self._offer(spec.sku, gpus=spec.gpus_per_pod,
-                            exclude_regions=spec.exclude_regions)
+        offers = [offer for sku in spec.sku_choices or (spec.sku,)
+                  if (offer := self._offer(sku, gpus=spec.gpus_per_pod,
+                                           exclude_regions=spec.exclude_regions)) is not None]
+        offer = min(offers, key=lambda row: row["price_usd_hr"]) if offers else None
         if offer is None:
-            raise ProvisionError(f"shadeform: no available {spec.sku} offer")
+            raise ProvisionError("shadeform: no_capacity under the requested GPU/price limits")
         ids: list[str] = []
         for i in range(spec.count):
-            body = shadeform_create_body(spec, offer, name=f"{spec.name_prefix}-{i}",
+            name = f"{spec.name_prefix}-{i}"
+            body = shadeform_create_body(spec, offer, name=name,
                                          ssh_key_id=self.ssh_key_id or None)
-            resp = self._post("/instances/create", body)
+            if self.max_leg_cost_usd > 0:
+                from decimal import ROUND_DOWN, Decimal
+
+                threshold = Decimal(str(self.max_leg_cost_usd)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+                if threshold <= 0:
+                    raise ProvisionError("shadeform: per-instance spend threshold must be at least $0.01")
+                body["auto_delete"] = {"spend_threshold": str(threshold)}
+            # From here the create may have reached the API (``create_requested``).
+            # A 4xx answer is a definite refusal — nothing allocated; a 5xx, a
+            # timeout or a 2xx without an id leaves the outcome uncertain.
+            self._issued_creates.add(name)
+            try:
+                resp = self._post("/instances/create", body)
+            except Exception as exc:  # noqa: BLE001 — sort refusal from uncertainty
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                if isinstance(status, int) and 400 <= status < 500 and status not in (408, 425):
+                    self._issued_creates.discard(name)
+                    raise ProvisionError(f"shadeform create refused ({status}): {exc}") from None
+                raise UncertainCreateError(f"shadeform create {name}: {exc}") from None
             iid = resp.get("id")
             if not iid:
-                raise ProvisionError(f"shadeform create returned no id: {resp}")
+                raise UncertainCreateError(f"shadeform create returned no id: {resp}")
             log.info("shadeform create → %s (%s/%s)", iid, offer["cloud"], offer["region"])
             ids.append(str(iid))
             self._region_by_pod[str(iid)] = str(offer["region"] or "")
+            self._sku_by_pod[str(iid)] = str(offer["sku"])
         return ids
 
     def region_of(self, pod_id: str) -> str | None:
         """Facility (region) a pod was placed in (this process's launches only)."""
         return self._region_by_pod.get(pod_id) or None
+
+    def create_requested(self, pod_id: str) -> bool:
+        """A create for ``pod_id`` (the requested NAME) went out and was not
+        definitely refused; False when ``launch`` failed before it."""
+        return pod_id in self._issued_creates
 
     def wait_ready(self, pod_id: str, *, timeout: float) -> bool:
         deadline = self._now() + timeout
@@ -1478,7 +1733,7 @@ class ShadeformProvider:
             if status in SHADEFORM_TERMINAL_BAD:
                 raise ProvisionError(f"shadeform instance {pod_id} entered {status!r}")
             if status == SHADEFORM_READY:
-                container = str(info.get("container_status") or "").lower()
+                container = _shadeform_container_status(info)
                 if container in SHADEFORM_CONTAINER_BAD:
                     raise ProvisionError(
                         f"shadeform instance {pod_id} container entered {container!r}"
@@ -1516,11 +1771,55 @@ class ShadeformProvider:
         except Exception as e:  # noqa: BLE001 — idempotent teardown, already-gone is fine
             log.warning("shadeform delete %s: %s (treating as already terminated)", pod_id, e)
 
+    def pod_exists(self, pod_id: str) -> bool:
+        # Shadeform IDs are UUIDs; list_tagged filters NAMES. Looking up a
+        # UUID as a name prefix falsely confirms a failed deletion as gone.
+        return any(str(row.get("id") or "") == pod_id and
+                   str(row.get("status") or "").lower() not in {"deleted", "terminated"}
+                   for row in self._get("/instances").get("instances", []))
+
     def list_tagged(self, prefix: str) -> list[str]:
         """Live instance IDs whose ``name`` starts with ``prefix`` (delete takes the id)."""
-        return filter_tagged_names(
-            self._get("/instances").get("instances", []), prefix, id_key="id"
-        )
+        return list(self.list_named(prefix))
+
+    def machine_of(self, pod_id: str) -> str:
+        # The marketplace allocates the instance atomically. Namespace its
+        # claim so it cannot collide with a Lium executor ID.
+        return f"shadeform:{pod_id}"
+
+    def sku_of(self, pod_id: str) -> str:
+        cached = self._sku_by_pod.get(pod_id)
+        if cached:
+            return cached
+        info = self._get(f"/instances/{pod_id}/info")
+        sku = str((info.get("configuration") or {}).get("gpu_type") or "")
+        if not sku:
+            raise ProvisionError("shadeform: cannot recover the allocated GPU type")
+        return sku
+
+    def list_named(self, prefix: str) -> dict[str, str]:
+        return {str(row["id"]): str(row.get("name") or "")
+                for row in self._get("/instances").get("instances", [])
+                if row.get("id") and str(row.get("name") or "").startswith(prefix)
+                and str(row.get("status") or "").lower() not in {"deleted", "terminated"}}
+
+    def pod_identity(self, pod_id: str) -> dict | None:
+        # A UUID identifies the allocation; the account's chosen name does not.
+        info = self._get(f"/instances/{pod_id}/info")
+        status = str(info.get("status") or "").lower()
+        container = _shadeform_container_status(info)
+        ready = status == SHADEFORM_READY and (not container or container == SHADEFORM_CONTAINER_READY)
+        return {"id": str(info.get("id") or ""),
+                "status": "RUNNING" if ready else status.upper()}
+
+    def live_pod_address(self, pod_id: str) -> PodAddress | None:
+        info = self._get(f"/instances/{pod_id}/info")
+        if str(info.get("status") or "").lower() != SHADEFORM_READY:
+            return None
+        container = _shadeform_container_status(info)
+        if container and container != SHADEFORM_CONTAINER_READY:
+            return None
+        return shadeform_pod_address(info)
 
     def offer_price(self, sku: str) -> float | None:
         """Cheapest available USD/hr for ``sku`` (the budget breaker's input)."""
@@ -1697,13 +1996,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("-n", "--count", type=int, default=DEFAULT_POD_COUNT,
                    help=f"Number of pods, all the same SKU (default {DEFAULT_POD_COUNT}).")
     p.add_argument("--image", help="Digest-pinned worker image (…@sha256:<64hex>).")
-    p.add_argument("--stage", default="any", choices=("any", "heat", "final"),
-                   help="Round stage these pods serve (default any). Heats can be a cheap "
-                        "SKU; finals must be a single SKU (validator gpu_name gate). Provision "
-                        "each stage as a separate run and concatenate the hosts.toml blocks.")
+    p.add_argument("--stage", default="any", choices=("any", "final"),
+                   help="Lane class these pods serve (default any); rolling fallback legs take "
+                        "final/any lanes. Finals must be a single SKU (validator gpu_name gate).")
     p.add_argument("--name-prefix", default="cascade-pod",
                    help="hosts.toml [[host]] name prefix (default cascade-pod); e.g. "
-                        "'cascade-heat' / 'cascade-final' to tell the fleets apart.")
+                        "'cascade-final' to tell lane classes apart.")
     p.add_argument("--ssh-pubkey",
                    help="Orchestrator SSH public key: inline 'ssh-…' or a path to a .pub file.")
     p.add_argument("--ssh-key-path", default=None,

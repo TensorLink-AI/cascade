@@ -21,13 +21,11 @@ behind the defaults.
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import json
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
-from datetime import UTC
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -38,62 +36,55 @@ from ..shared.activation import (
     ActivationRecord,
     ActivationStore,
     Tally,
-    apply_activation,
-    apply_forfeit_activation,
-    apply_margin_v2_activation,
-    apply_promotion_carry_activation,
-    ensure_signal,
-    forfeit_feature,
-    margin_v2_feature,
-    promotion_carry_feature,
-    record_for,
-    resolve_activation,
-    resolved_margin_v2_block,
-    resolved_promotion_carry_block,
-    resolved_rollover,
 )
-from ..shared.activation import summary as activation_summary
 from ..shared.config import (
     ChainConfig,
     cohort_maxt_active,
     cohort_maxt_increment_active,
     effective_epoch_blocks,
-    promotion_carry_active,
 )
+from ..shared.emission import crown_units
 from ..shared.era import (
-    EraSpec,
-    effective_resync_cap_rounds,
-    era_king_active,
-    era_length_blocks,
+    bench_gate_mode_at,
+    bench_gate_rule_at,
     legacy_king_anchor,
-    member_index_for_era,
-    min_effective_era,
-    settlement_era,
+    settlement_contract_block,
     tenure_blocks_active,
     tenure_rounds_at,
+    v2_settlement_active,
 )
 from ..shared.manifest import (
     TrainedEntry,
     TrainingManifest,
-    contract_digest,
     load_manifest,
-    locked_contract_terms,
-    parse_trained_pointer,
-    verify_signature,
 )
 from ..shared.receipt import (
     EntryScores,
-    EvalContext,
-    Participant,
-    RoundReceipt,
-    VerdictRecord,
-    WindowScoreRecord,
-    build_receipt,
     cohort_stats_of,
 )
 from . import state as state_mod
+from .activation_mixin import ActivationMixin
+from .bench import BENCH_REPORT_RETRY_ROUNDS, CascadeBenchMixin  # noqa: F401 — re-export
+from .era_gate import EraGateMixin, _merge_error_type, _NoMergeError  # noqa: F401 — re-export
+from .evaluation import EvaluationMixin
+from .gating import POOL_PIN_READ_GRACE_SECONDS, ManifestGateMixin  # noqa: F401 — re-export
+from .king_check import KingCheckMixin
+from .lane_b import LaneBMixin, LaneBTransient, _LaneBRound
+from .lane_c import LaneCMixin, LaneCTransient
+from .manifest_chain import (  # noqa: F401 — re-exported for callers of cascade.validator.loop
+    CHAIN_WALK_DEPTH,
+    CHAIN_WALK_MAX_DEPTH,
+    ManifestChain,
+    chain_manifests,
+    participants_from_commitments,
+    ref_as_of,
+)
+from .marketcast import MarketCastMixin
+from .promotion_gate import PromotionGateMixin
+from .receipts import ReceiptMixin
 from .state import ChampionState, StateTransition
-from .windows import ladder_windows_for_round, scored_ladder
+from .validator_bench import ValidatorBenchHold, ValidatorBenchMixin
+from .weights import WEIGHTS_RATE_LIMIT_BLOCKS, WeightsMixin  # noqa: F401 — re-export
 
 if TYPE_CHECKING:
     from ..trainer.remote import RemoteHost
@@ -101,145 +92,12 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("cascade.validator")
 
-# Subtensor ``weights_rate_limit`` on netuid 91: a set_weights inside this many
-# blocks of the previous one is silently dropped by the chain. A forced early
-# re-assert (a forfeiture crowning) waits at least this long.
-WEIGHTS_RATE_LIMIT_BLOCKS = 100
-
 # Resolve a trained entry to its per-window scores on the eval set.
 EvaluateFn = Callable[[TrainedEntry, list[EvalWindow]], list[WindowScore]]
 # Resolve a trained entry to its gift-eval ratio rows for the public-benchmark
 # gate: ``{"status", "rows", "revision"}`` (see ``eval.benchmarks.run_gift_rows``)
 # or ``None`` when the sidecar produced nothing.
 GiftRowsFn = Callable[[TrainedEntry], dict | None]
-
-
-def participants_from_commitments(commitments: list, cutoff_block: int,
-                                  floor_block: int = 0) -> tuple[Participant, ...]:
-    """The round's eligible participant set, for the public receipt.
-
-    Mirrors the trainer's eligibility rule (``trainer.loop.resolve_commitments``):
-    parseable generator pointers revealed STRICTLY BEFORE the epoch boundary and
-    at/after the go-live ``floor_block``, latest commit per hotkey among the
-    eligible ones — but keeps ``commit_block`` so an auditor can re-check every
-    entrant against the cutoff. Sorted by UID for a deterministic receipt body.
-
-    ``commitments`` should carry each hotkey's FULL reveal history
-    (``poll_commitments(include_history=True)``): with only the latest reveal, a
-    miner who re-committed after the boundary vanishes from the record even
-    though their eligible pre-cutoff entry fielded the round.
-    """
-    from ..interface.validation import parse_commit
-
-    best: dict[str, Participant] = {}
-    for c in commitments:
-        if floor_block and c.commit_block < floor_block:
-            continue
-        if c.commit_block >= cutoff_block:
-            continue
-        parsed = parse_commit(c.payload)
-        if parsed is None:
-            continue
-        prev = best.get(c.hotkey)
-        if prev is None or c.commit_block >= prev.commit_block:
-            best[c.hotkey] = Participant(
-                hotkey=c.hotkey, uid=c.uid, gen_ref=parsed.ref, commit_block=c.commit_block
-            )
-    return tuple(sorted(best.values(), key=lambda p: p.uid))
-
-
-def ref_as_of(commitments: list, hotkey: str, block: int) -> str | None:
-    """The generator ref ``hotkey`` had revealed AS OF ``block`` (DEC-CA-0043
-    ref binding at ``train_block``): the latest parseable commitment with
-    ``commit_block <= block``. ``commitments`` is the full reveal history
-    (``poll_commitments(include_history=True)``). None when nothing was
-    revealed by then."""
-    from ..interface.validation import parse_commit
-
-    best_block, best_ref = -1, None
-    for c in commitments:
-        if c.hotkey != hotkey or int(c.commit_block) > int(block):
-            continue
-        parsed = parse_commit(c.payload)
-        if parsed is None:
-            continue
-        if int(c.commit_block) >= best_block:
-            best_block, best_ref = int(c.commit_block), parsed.ref
-    return best_ref
-
-
-CHAIN_WALK_DEPTH = 16          # manifests per poll on the first attempt
-CHAIN_WALK_MAX_DEPTH = 1024    # doubled per unreached poll up to this
-
-
-@dataclass(frozen=True)
-class ManifestChain:
-    """:func:`chain_manifests` result: the manifests to handle OLDEST FIRST,
-    and whether the walk reached the last handled settlement (or the chain's
-    root). ``reached=False`` — a hole (unreadable round) or the depth cap —
-    means NOTHING may be handled: judging the oldest collected manifest would
-    fail its chain check and latch past every settlement in the gap, a
-    dethrone included, and the validator's throne would silently diverge
-    from the fleet's (the wedge the walk exists to prevent, one level
-    down)."""
-
-    manifests: tuple[tuple[str, str], ...]
-    reached: bool
-
-
-def chain_manifests(store: object, raw_latest: str, last_handled_round_id: str | None,
-                    *, max_depth: int = CHAIN_WALK_DEPTH,
-                    read_round: Callable[[object, str], str] | None = None,
-                    ) -> ManifestChain:
-    """The manifests to handle, OLDEST FIRST, walking ``prev_round_id`` back
-    from ``latest.json`` to ``last_handled_round_id`` (DEC-CA-0043: never jump
-    to latest — a validator that missed settlements catches up through every
-    one, dethrones included, before the era-king envelope is checked).
-
-    ``manifests`` is ``[(raw_text, sha256)]``. With no chain link on the
-    latest manifest (pre-rollover), no persisted position, or a latest that
-    already follows the last handled settlement, this is just ``[latest]``.
-    A readable manifest with no ``prev_round_id`` is the chain's ROOT (the
-    first settlement links to the last legacy round, which is unchained):
-    reaching it counts as reached — everything before it was never chained.
-    The walk is bounded by ``max_depth``; an unreadable round or the cap
-    yields ``reached=False`` and the caller retries next poll, deeper.
-    """
-    from ..shared.hippius import manifest_round_key
-
-    def _digest(raw: str) -> str:
-        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-    latest = load_manifest(raw_latest)
-    chain: list[tuple[str, str]] = [(raw_latest, _digest(raw_latest))]
-    prev = str(latest.prev_round_id or "")
-    if (not prev or last_handled_round_id is None or prev == last_handled_round_id
-            or str(latest.round_id) == last_handled_round_id):
-        return ManifestChain(tuple(chain), True)
-    reader = read_round or (lambda s, rid: s.get_text(manifest_round_key(rid)))
-    seen = {str(latest.round_id)}
-    reached = False
-    while prev and prev != last_handled_round_id:
-        if prev in seen:
-            log.error("manifest chain: round %s links back into itself; walking stops", prev)
-            break
-        if len(chain) >= max_depth:
-            log.warning("manifest chain: %d manifests walked without reaching %s (depth cap)",
-                        len(chain), last_handled_round_id)
-            break
-        seen.add(prev)
-        try:
-            raw = reader(store, prev)
-        except Exception as e:  # noqa: BLE001 — a hole in the chain: nothing is handled
-            log.warning("manifest chain: round %s unreadable (%s); walking stops", prev, e)
-            break
-        m = load_manifest(raw)
-        chain.append((raw, _digest(raw)))
-        prev = str(m.prev_round_id or "")
-    else:
-        reached = True            # prev == last handled, or the root ("" — unchained before it)
-    chain.reverse()
-    return ManifestChain(tuple(chain), reached)
 
 
 @dataclass(frozen=True)
@@ -283,31 +141,32 @@ class RoundOutcome:
     # only. Published on the receipt as ``cohort_stats`` (same drop-when-default
     # rule as ``cohort_lcbs``); display/audit material, never a gate.
     cohort_stats: dict[str, dict] = field(default_factory=dict)
-
-
-# How long the live loop keeps re-trying a round whose eval-pool index cannot
-# be READ at the pin gate (auth/network/5xx — not absence) before rejecting it
-# for real. Sized for observed Hippius blips (seconds-to-minutes) with a wide
-# margin — ~15 polls at the default 120s manifest cadence. A persistent failure
-# (bad credentials, dead endpoint) still ends in the loud reject receipt, just
-# this much later.
-POOL_PIN_READ_GRACE_SECONDS = 1800.0
-
-# How many subsequent rounds the Cascade step keeps re-probing for a round's
-# missing bench report before writing that round off. The trainer publishes the
-# report ~30-60 min after the manifest (the bench runs post-publish), so it is
-# usually there by the time the NEXT round's cascade step runs — one retry
-# catches nearly everything. The budget is deliberately generous anyway (each
-# retry is one GET against an R2-backed store): a validator that misses a
-# report its peers recorded ends the reign with a DIFFERENT log, can select a
-# different promotion winner, and then rejects rounds at the warm-start pin
-# gate — so convergence is worth days of cheap re-probing, and 5 retries at
-# 12h rounds spans most of a 7-round reign.
-BENCH_REPORT_RETRY_ROUNDS = 5
+    # Challengers that LOST by entry fault ([scoring] entry_fault_from_block):
+    # ``{hotkey: reason}``. Internal; the receipt carries it in the note.
+    entry_faults: dict[str, str] = field(default_factory=dict)
+    # The units of ``result.lcb`` (:func:`cascade.shared.emission.crown_units`):
+    # a crowning's DEC-CA-0055 start share is tiered on it in "increment"
+    # units only. Internal; the ladder record stamps it and the audit
+    # re-derives it from the receipt.
+    lcb_units: str = "level"
 
 
 @dataclass
-class ValidatorRunner:
+class ValidatorRunner(
+    ActivationMixin,
+    ManifestGateMixin,
+    EraGateMixin,
+    PromotionGateMixin,
+    EvaluationMixin,
+    CascadeBenchMixin,
+    ReceiptMixin,
+    WeightsMixin,
+    LaneBMixin,
+    LaneCMixin,
+    MarketCastMixin,
+    KingCheckMixin,
+    ValidatorBenchMixin,
+):
     cfg: ChainConfig
     state: ChampionState = field(default_factory=ChampionState)
     evaluate_fn: EvaluateFn | None = None     # injected in tests; defaults to registry+torch
@@ -322,11 +181,15 @@ class ValidatorRunner:
     # wallet and every consensus decision stay on this box either way; the pod
     # is never used for the private-pool duel.
     eval_host_fn: Callable[[], RemoteHost | None] | None = None
+    # Private contexts cross ONLY to this separately authorized trusted host.
+    private_eval_host_fn: Callable[[], RemoteHost | None] | None = None
+    private_eval_workers: int = 1
+    private_eval_timeout_s: int = 3600
     verify_signatures: bool = True            # gate manifests on the trainer-hotkey signature
     # Cascade — king-reign promotion (see cascade.validator.cascade). When wired,
     # the reign clock is reset on each dethrone and every benched duel
     # checkpoint's public-benchmark numbers (GIFT-Eval/BOOM/TIME, read from the
-    # trainer's signed post-publish bench report, falling back to older
+    # trainer's signed settlement bench report, falling back to older
     # manifests' in-entry bench_scores) are logged as promotion candidates. The
     # validator never selects: the trainer declares the promoted set in a
     # signed PromotionRecord and the warm-start gate verifies it against the
@@ -348,17 +211,33 @@ class ValidatorRunner:
     # CHAIN_WALK_MAX_DEPTH) each time the walk fails to reach the last handled
     # settlement, resets when it does.
     chain_walk_depth: int = CHAIN_WALK_DEPTH
-    # Block of the last successful (or attempted re-assert) weight-set; drives
-    # the between-rounds freshness push in _maybe_reassert_weights. None ⇒
+    # Block of the last SUCCESSFUL weight-set (a rejected push is not
+    # stamped); drives the between-rounds freshness push in
+    # _maybe_reassert_weights. None ⇒
     # never set this process, so the first live-loop tick re-asserts
     # immediately (a restart is also a manual "refresh last_update now").
     _last_weight_block: int | None = None
-    # First-failure clock (time.monotonic) per round for an UNREADABLE eval-pool
-    # index at the pin gate. Within POOL_PIN_READ_GRACE_SECONDS the round is
-    # re-tried on the next manifest poll (no latch, no reject receipt); once the
-    # grace expires the reject goes through, loudly. In-memory on purpose: a
-    # restart merely restarts the grace clock, which is harmless.
+    # First-failure clock (time.monotonic) per ``<round>|lane_b`` key for an
+    # UNREADABLE lane-B expert manifest. Within POOL_PIN_READ_GRACE_SECONDS the
+    # settlement is re-tried on the next poll; past it lane A proceeds with the
+    # lane-B part unfolded. In-memory on purpose: a restart merely restarts the
+    # grace clock, which is harmless.
     _pin_read_first_failure: dict[str, float] = field(default_factory=dict, repr=False)
+    # Lane-A gate read holds (pool pin / warm-start provenance / era refs),
+    # keyed ``<round>|<gate>``: ``(first failure monotonic, attempts)``. A read
+    # failure there NEVER latches a reject — it holds until the read succeeds;
+    # this is only the visibility clock (see ManifestGateMixin._hold_read_failure).
+    _read_holds: dict[str, tuple[float, int]] = field(default_factory=dict, repr=False)
+    # Digests of manifests skipped WITHOUT being recorded (bad signature, older
+    # than the handled position), so each is logged once, not every poll.
+    _skipped_digests: set = field(default_factory=set, repr=False)
+    # The in-process follow-up (receipt / benchmarks / Cascade step) of the
+    # round named by ``state.followup_round_id``: ``(round_id, digest, fn)``.
+    # Lost on a restart — the round is then re-judged from ``state.pre_round``.
+    _followup: tuple | None = field(default=None, repr=False)
+    # Why process_round returned None for a gated-in settlement, when it is not
+    # the stock "no king/challenger pair" (e.g. every challenger entry-faulted).
+    _round_none_reason: str | None = field(default=None, repr=False)
     # Rounds whose reigning-king checkpoint is still awaiting its bench report:
     # the report is published AFTER the manifest (the bench sweep runs
     # post-publish and takes ~an hour), so it routinely lands between this
@@ -392,1589 +271,69 @@ class ValidatorRunner:
     # persisted beside the others (``activation_margin_v2_state.json``).
     _margin_v2: ActivationRecord = field(default_factory=ActivationRecord, repr=False)
     _margin_v2_tally: Tally | None = field(default=None, repr=False)
-    # DEC-CA-0050 staged-promotion carry decided on chain: its own record +
-    # tally (``activation_promotion_carry_state.json``).
-    _promotion_carry: ActivationRecord = field(default_factory=ActivationRecord, repr=False)
-    _promotion_carry_tally: Tally | None = field(default=None, repr=False)
-
-    # ── stake-weighted activation (DEC-CA-0045) ─────────────────────────────
-
-    @property
-    def activation_block(self) -> int:
-        """The rollover block resolved FROM VALIDATOR SIGNALS and APPLIED to
-        the live config (0 = none, or typed into chain.toml — the receipt
-        then records nothing). Read off the config, not the record: a
-        receipt must never claim a rollover this validator did not run."""
-        return resolved_rollover(self.cfg)
-
-    def apply_activation_block(self, block: int) -> bool:
-        """Rewrite the live config for a rollover at ``block`` (see
-        :func:`cascade.shared.activation.apply_activation`) and refresh every
-        object that captured a config slice — the Cascade controller's grid
-        and reign threshold. Returns True when the config changed."""
-        from ..shared.era import effective_reign_threshold_rounds
-
-        new_cfg = apply_activation(self.cfg, block)
-        if new_cfg is self.cfg:
-            return False
-        self.cfg = new_cfg
-        if self.cascade is not None:
-            cfg = new_cfg
-            self.cascade.round_cfg = cfg.round
-            self.cascade.threshold_fn = (
-                lambda b: effective_reign_threshold_rounds(cfg.round, cfg.scoring, b))
-        log.warning("activation: DEC-CA-0043 rollover ARMED at block %d — rolling intake, "
-                    "era king, tenure in blocks and the grid switch (%d → %d) all flip "
-                    "there", block, new_cfg.round.epoch_blocks_prev, new_cfg.round.epoch_blocks)
-        return True
-
-    def _activation_step(self, client: object, *, now_block: int) -> None:
-        """One resolver pass: persist any advance, apply a lock-in, keep this
-        validator's on-chain note current. Never raises."""
-        if not self.cfg.activation.enabled:
-            return
-        try:
-            # Say "ready" BEFORE counting, so this validator's own stake is on
-            # chain for the first boundary it tallies.
-            self._ensure_own_signal(client)
-            res = resolve_activation(self.cfg, client, now_block=int(now_block),
-                                     record=self._activation)
-            if res.tally is not None:
-                self._activation_tally = res.tally
-            if res.changed:
-                self._activation = res.record
-                if self.activation_store is not None:
-                    self.activation_store.save(res.record)
-            if self._activation.locked and self._activation.source != "config":
-                self.apply_activation_block(self._activation.activation_block)
-                # The note now carries the agreed block for late joiners.
-                self._ensure_own_signal(client)
-            self._forfeit_step(client, now_block=now_block)
-            self._margin_v2_step(client, now_block=now_block)
-            self._promotion_carry_step(client, now_block=now_block)
-        except Exception as e:  # noqa: BLE001 — activation must never disturb a round
-            log.warning("activation step failed (%s); retrying next poll", e)
-
-    def _forfeit_store(self) -> ActivationStore | None:
-        store = self.activation_store
-        if store is None or store.path is None:
-            return None
-        return ActivationStore(store.path.with_name("activation_forfeit_state.json"))
-
-    def apply_forfeit_block(self, block: int) -> bool:
-        """Write the fleet-decided forfeiture block into the live config
-        (``[scoring] forfeit_from_block``). Returns True when it changed."""
-        new_cfg = apply_forfeit_activation(self.cfg, block)
-        if new_cfg is self.cfg:
-            return False
-        self.cfg = new_cfg
-        log.warning("activation: DEC-CA-0048 forfeiture ARMED at block %d — %d listed hotkey(s) "
-                    "leave the throne and the court at the first settlement whose boundary "
-                    "reaches it (successor %s)", new_cfg.scoring.forfeit_from_block,
-                    len(new_cfg.scoring.forfeit_hotkeys),
-                    (new_cfg.scoring.forfeit_successor_hotkey or "court")[:12])
-        return True
-
-    def _forfeit_step(self, client: object, *, now_block: int) -> None:
-        """The forfeiture's own resolver pass (same tally rule, its own
-        record). No-op without a forfeit list or under a typed block."""
-        spec = forfeit_feature(self.cfg)
-        if spec is None or not spec.decided_on_chain:
-            return
-        res = resolve_activation(self.cfg, client, now_block=int(now_block),
-                                 record=self._forfeit, feature=spec)
-        if res.tally is not None:
-            self._forfeit_tally = res.tally
-        if res.changed:
-            self._forfeit = res.record
-            store = self._forfeit_store()
-            if store is not None:
-                store.save(res.record)
-        if (self._forfeit.locked and self._forfeit.source != "config"
-                and self.apply_forfeit_block(self._forfeit.activation_block)):
-            self._ensure_own_signal(client)
-
-
-    @property
-    def margin_v2_block(self) -> int:
-        """The margin-v2 block resolved FROM VALIDATOR SIGNALS and applied to
-        the live config (0 = none, or typed into chain.toml) — stamped on
-        receipts so the audit replays the bar the fleet decided."""
-        return resolved_margin_v2_block(self.cfg)
-
-    def _margin_v2_store(self) -> ActivationStore | None:
-        store = self.activation_store
-        if store is None or store.path is None:
-            return None
-        return ActivationStore(store.path.with_name("activation_margin_v2_state.json"))
-
-    def apply_margin_v2_block(self, block: int) -> bool:
-        """Write the fleet-decided margin-v2 block into the live config
-        (``[scoring] margin_v2_from_block``). Returns True when it changed."""
-        new_cfg = apply_margin_v2_activation(self.cfg, block)
-        if new_cfg is self.cfg:
-            return False
-        self.cfg = new_cfg
-        sc = new_cfg.scoring
-        log.warning("activation: DEC-CA-0049 dethrone bar v2 ARMED at block %d — rounds from "
-                    "it on are judged at %.4f decaying to %.4f over %d blocks of tenure",
-                    sc.margin_v2_from_block, sc.win_margin_start_v2, sc.win_margin_end_v2,
-                    sc.margin_warmup_blocks_v2)
-        return True
-
-    def _margin_v2_step(self, client: object, *, now_block: int) -> None:
-        """The margin-v2 bar's own resolver pass (same tally rule, its own
-        record). No-op without a v2 bar or under a typed block."""
-        spec = margin_v2_feature(self.cfg)
-        if spec is None or not spec.decided_on_chain:
-            return
-        res = resolve_activation(self.cfg, client, now_block=int(now_block),
-                                 record=self._margin_v2, feature=spec)
-        if res.tally is not None:
-            self._margin_v2_tally = res.tally
-        if res.changed:
-            self._margin_v2 = res.record
-            store = self._margin_v2_store()
-            if store is not None:
-                store.save(res.record)
-        if (self._margin_v2.locked and self._margin_v2.source != "config"
-                and self.apply_margin_v2_block(self._margin_v2.activation_block)):
-            self._ensure_own_signal(client)
-
-    @property
-    def promotion_carry_block(self) -> int:
-        """The promotion-carry block resolved FROM VALIDATOR SIGNALS and
-        applied to the live config (0 = none, or typed into chain.toml) —
-        stamped on receipts (DEC-CA-0050)."""
-        return resolved_promotion_carry_block(self.cfg)
-
-    def _promotion_carry_active(self, block: int | None) -> bool:
-        """CONSENSUS gate (DEC-CA-0050) for the settlement / dethrone at
-        epoch boundary ``block``."""
-        return promotion_carry_active(self.cfg.scoring, block)
-
-    def _promotion_carry_store(self) -> ActivationStore | None:
-        store = self.activation_store
-        if store is None or store.path is None:
-            return None
-        return ActivationStore(store.path.with_name("activation_promotion_carry_state.json"))
-
-    def apply_promotion_carry_block(self, block: int) -> bool:
-        """Write the fleet-decided promotion-carry block into the live config
-        (``[scoring] promotion_carry_from_block``). Returns True when it changed."""
-        new_cfg = apply_promotion_carry_activation(self.cfg, block)
-        if new_cfg is self.cfg:
-            return False
-        self.cfg = new_cfg
-        log.warning("activation: DEC-CA-0050 staged-promotion carry ARMED at block %d — from "
-                    "it on a dethrone keeps a staged promotion and a prior-reign record is "
-                    "never timed on the new king's clock",
-                    new_cfg.scoring.promotion_carry_from_block)
-        return True
-
-    def _promotion_carry_step(self, client: object, *, now_block: int) -> None:
-        """The promotion carry's own resolver pass (same tally rule, its own
-        record). No-op without Cascade promotion or under a typed block."""
-        spec = promotion_carry_feature(self.cfg)
-        if spec is None or not spec.decided_on_chain:
-            return
-        res = resolve_activation(self.cfg, client, now_block=int(now_block),
-                                 record=self._promotion_carry, feature=spec)
-        if res.tally is not None:
-            self._promotion_carry_tally = res.tally
-        if res.changed:
-            self._promotion_carry = res.record
-            store = self._promotion_carry_store()
-            if store is not None:
-                store.save(res.record)
-        if (self._promotion_carry.locked and self._promotion_carry.source != "config"
-                and self.apply_promotion_carry_block(self._promotion_carry.activation_block)):
-            self._ensure_own_signal(client)
-
-    def _ensure_own_signal(self, client: object) -> None:
-        """Write this validator's note when it is not the one already on
-        chain. One chain read per CHANGE of note, not per poll: the payload
-        last confirmed on chain is remembered in-process."""
-        from ..shared.activation import own_signal_payload
-
-        if not self._signal_hotkey:
-            return
-        want = own_signal_payload(self.cfg, self._activation, self._forfeit, self._margin_v2,
-                                  self._promotion_carry)
-        if want is None or want == self._signal_sent:
-            return
-        try:
-            have = dict(client.read_plain_commitments())  # type: ignore[attr-defined]
-        except Exception as e:  # noqa: BLE001 — retry next poll
-            log.debug("activation: note read failed (%s)", e)
-            return
-        if have.get(self._signal_hotkey) == want:
-            self._signal_sent = want                 # confirmed on chain
-            return
-        # Written now, confirmed by the read on the next poll.
-        ensure_signal(client, self.cfg, self._activation, hotkey=self._signal_hotkey,
-                      forfeit_record=self._forfeit,
-                      margin_v2_record=self._margin_v2,
-                      promotion_carry_record=self._promotion_carry,
-                      current=have)
-
-    def _activation_startup(self, client: object) -> None:
-        """Restore the persisted decision, apply it, and run one pass."""
-        if not self.cfg.activation.enabled:
-            return
-        if self.activation_store is not None:
-            self._activation = record_for(self.cfg, self.activation_store.load())
-        # Apply a restored rollover FIRST: it switches the settlement grid
-        # (3600 -> 900), and the forfeiture / margin-v2 blocks below are
-        # validated against the grid in force — restored before it, a forfeit
-        # block on the 900 grid reads as "not a settlement boundary" and the
-        # validator dies at startup (2026-10-01, forfeit at 9166500).
-        if self._activation.locked and self._activation.source != "config":
-            self.apply_activation_block(self._activation.activation_block)
-        fstore, fspec = self._forfeit_store(), forfeit_feature(self.cfg)
-        if fstore is not None and fspec is not None:
-            self._forfeit = record_for(self.cfg, fstore.load(), fspec)
-            if self._forfeit.locked and self._forfeit.source != "config":
-                log.info("activation: restored forfeiture lock-in (block %d, forfeit at %d, via %s)",
-                         self._forfeit.lock_block, self._forfeit.activation_block,
-                         self._forfeit.source)
-                self.apply_forfeit_block(self._forfeit.activation_block)
-        mstore, mspec = self._margin_v2_store(), margin_v2_feature(self.cfg)
-        if mstore is not None and mspec is not None:
-            self._margin_v2 = record_for(self.cfg, mstore.load(), mspec)
-            if self._margin_v2.locked and self._margin_v2.source != "config":
-                log.info("activation: restored margin-v2 lock-in (block %d, bar from %d, via %s)",
-                         self._margin_v2.lock_block, self._margin_v2.activation_block,
-                         self._margin_v2.source)
-                self.apply_margin_v2_block(self._margin_v2.activation_block)
-        pstore, pspec = self._promotion_carry_store(), promotion_carry_feature(self.cfg)
-        if pstore is not None and pspec is not None:
-            self._promotion_carry = record_for(self.cfg, pstore.load(), pspec)
-            if self._promotion_carry.locked and self._promotion_carry.source != "config":
-                log.info("activation: restored promotion-carry lock-in (block %d, carry from "
-                         "%d, via %s)", self._promotion_carry.lock_block,
-                         self._promotion_carry.activation_block, self._promotion_carry.source)
-                self.apply_promotion_carry_block(self._promotion_carry.activation_block)
-        self._signal_hotkey = str(getattr(client, "hotkey_ss58", lambda: "")() or "")
-        if self._activation.locked and self._activation.source != "config":
-            log.info("activation: restored lock-in (block %d, rollover %d, via %s)",
-                     self._activation.lock_block, self._activation.activation_block,
-                     self._activation.source)
-        try:
-            now_block = int(client.current_block())  # type: ignore[attr-defined]
-        except Exception as e:  # noqa: BLE001
-            log.warning("activation: chain unavailable at startup (%s); first poll retries", e)
-            return
-        self._activation_step(client, now_block=now_block)
-
-    def _activation_tick(self, client: object) -> None:
-        if not self.cfg.activation.enabled:
-            return
-        try:
-            now_block = int(client.current_block())  # type: ignore[attr-defined]
-        except Exception as e:  # noqa: BLE001
-            log.debug("activation tick skipped (no block): %s", e)
-            return
-        self._activation_step(client, now_block=now_block)
-
-    def _forfeit_tick(self, client: object) -> None:
-        """Block-clock pass of DEC-CA-0048 (typed or resolved block alike;
-        independent of ``[activation] enabled``). Never raises."""
-        if not (getattr(self.cfg.scoring, "forfeit_hotkeys", ()) or ()):
-            return
-        try:
-            now_block = int(client.current_block())  # type: ignore[attr-defined]
-        except Exception as e:  # noqa: BLE001
-            log.debug("forfeiture tick skipped (no block): %s", e)
-            return
-        try:
-            self._forfeit_on_block(now_block=now_block)
-        except Exception as e:  # noqa: BLE001 — the settlement path applies it again
-            log.warning("forfeiture tick failed (%s); retrying next poll", e)
-
-    def _forfeit_on_block(self, *, now_block: int) -> bool:
-        """DEC-CA-0048 on the BLOCK clock: the poll ``now_block`` reaches
-        ``[scoring] forfeit_from_block`` the listed hotkeys leave the throne and
-        the court and the named successor is crowned — no manifest needed, so
-        the weights move at the block itself rather than at the trainer's next
-        manifest (the settlement path, ``_apply_forfeiture``, stays for a
-        validator that first meets the block through a manifest; both are
-        idempotent). The crowning is stamped with the GATE block, not the poll
-        block, so every validator records the same ``king_since_block``
-        whatever its poll timing. The standing weight vector is re-pushed as
-        soon as the chain's rate limit allows. Returns True when the state
-        changed."""
-        from ..shared.era import forfeit_successor, forfeited_hotkeys
-        from . import state as state_mod
-
-        forfeited = forfeited_hotkeys(self.cfg.scoring, int(now_block))
-        if not forfeited:
-            return False
-        gate = int(getattr(self.cfg.scoring, "forfeit_from_block", 0) or 0)
-        t = state_mod.apply_forfeit(self.state, forfeited=forfeited,
-                                    keep_former_kings=self.cfg.scoring.reward_prior_kings,
-                                    successor=forfeit_successor(self.cfg.scoring, int(now_block)) or None,
-                                    crowned_block=gate)
-        if t is None:
-            return False
-        log.warning("FORFEITURE at block %d (gate %d, block clock): %s — king now %s, court %s",
-                    int(now_block), gate, t.note, (t.state.king_hotkey or "vacant")[:12],
-                    [hk[:12] for hk in t.state.former_kings])
-        self.state = t.state
-        try:
-            self._persist_state()
-        except Exception as e:  # noqa: BLE001 — the round path persists again
-            log.warning("forfeiture: state persist deferred (%s)", e)
-        # Pull the next re-assert forward to the earliest block the chain's
-        # weights_rate_limit allows (an earlier push is a silent no-op).
-        interval = int(self.cfg.validator.weight_set_interval_blocks)
-        if self._last_weight_block is not None and interval > WEIGHTS_RATE_LIMIT_BLOCKS:
-            self._last_weight_block -= interval - WEIGHTS_RATE_LIMIT_BLOCKS
-        return True
-
-    # ── manifest gating ─────────────────────────────────────────────────────
-
-    def check_manifest(self, manifest: TrainingManifest) -> str | None:
-        """Return a rejection reason string, or None if the manifest is usable.
-
-        Enforces (1) the trainer-hotkey signature, (2) the training-contract
-        gate (see :meth:`_check_contract`), and (3) that the manifest targets
-        our configured base architecture and eval dataset.
-        """
-        if self.verify_signatures and not verify_signature(manifest, self.cfg.manifest.trainer_hotkey):
-            return "signature_invalid"
-        contract_reason = self._check_contract(manifest)
-        if contract_reason is not None:
-            return contract_reason
-        if manifest.base_arch_digest != self.cfg.training.base_arch_digest:
-            return "base_arch_digest_mismatch"
-        if manifest.eval_dataset != self.cfg.eval.eval_dataset:
-            return "eval_dataset_mismatch"
-        gpu_reason = self._check_gpu(manifest)
-        if gpu_reason is not None:
-            return gpu_reason
-        ws_reason = self._check_warm_start(manifest)
-        if ws_reason is not None:
-            return ws_reason
-        era_reason = self._check_era(manifest)
-        if era_reason is not None:
-            return era_reason
-        return None
-
-    # ── Era envelope (DEC-CA-0043) ───────────────────────────────────────────
-
-    def _era_active(self, manifest: TrainingManifest) -> bool:
-        return era_king_active(self.cfg.scoring, self._epoch_start_block(manifest))
-
-    def _check_era(self, manifest: TrainingManifest) -> str | None:
-        """Era-king envelope, fail closed, only from ``era_king_from_block``.
-
-        In order: the era stamp exists and parses; it is the era every node
-        derives from the settlement's epoch boundary (index / start on the
-        era grid / seeds from the previous era's start); the init it names is
-        ``members_gen(g)[era % k]`` for the latest verified promotion whose
-        ``effective_era <= era`` (a pending record is installed at its first
-        effective settlement, never earlier) and ``warm_start_ckpt`` is that
-        member; every entry's ``train_block`` lies inside the era's training
-        window ``[seed_block, era_end)``; the manifest chains to this
-        validator's last handled settlement; the king entry, when it is the
-        champion, carries the pointer this validator judged (or adopts the
-        era's first king leg); every entry's ref is the hotkey's revealed
-        commitment as of its ``train_block``.
-
-        Pre-gate manifests are untouched (bit-identical to the ungated
-        validator) — a stray ``era`` stamp before the block is ignored.
-        """
-        if not self._era_active(manifest):
-            return None
-        if manifest.era is None:
-            return "era_missing: settlement past era_king_from_block carries no era stamp"
-        try:
-            era = EraSpec.from_json(manifest.era)
-        except ValueError as e:
-            return f"era_malformed: {e}"
-        block = self._epoch_start_block(manifest)
-        expected = settlement_era(self.cfg.round, block)
-        if (era.index, era.start_block, era.seed_block) != (
-                expected.index, expected.start_block, expected.seed_block):
-            return (f"era_mismatch: manifest era {era.index}@{era.start_block} "
-                    f"(seed {era.seed_block}) but the boundary {block} is in era "
-                    f"{expected.index}@{expected.start_block} (seed {expected.seed_block})")
-        init_reason = self._check_era_init(manifest, era)
-        if init_reason is not None:
-            return init_reason
-        window_end = era.start_block + era_length_blocks(self.cfg.round, era.start_block)
-        for e in manifest.entries:
-            if not (era.seed_block <= int(e.train_block) < window_end):
-                return (f"era_entry_out_of_window: {e.role} uid{e.miner_uid} trained at "
-                        f"block {e.train_block}, outside era {era.index}'s window "
-                        f"[{era.seed_block}, {window_end})")
-        last = self.state.last_handled_round_id
-        if (last is not None and manifest.prev_round_id != last
-                and str(manifest.round_id) != last):
-            return (f"manifest_chain_broken: prev_round_id {manifest.prev_round_id!r} "
-                    f"but this validator last handled {last!r} — walk the chain")
-        king_reason = self._check_era_king(manifest, era)
-        if king_reason is not None:
-            return king_reason
-        return self._check_era_refs(manifest)
-
-    def _check_era_init(self, manifest: TrainingManifest, era: EraSpec) -> str | None:
-        """The init an era manifest declares must be the one the promotion
-        ledger names for that era (zero trainer discretion)."""
-        if self.cascade is None:
-            # Pure KOTH: no promotions, so an era is random-init by definition.
-            if era.generation or era.member_index or manifest.warm_start_ckpt:
-                return ("era_init_mismatch: cascade is off, era must train from "
-                        "random init")
-            return None
-        self._refresh_pending_promotion(era, block=self._epoch_start_block(manifest))
-        # Gating is PURE: the ledger in force for this era is derived here and
-        # installed only once the settlement is handled (_install_era_promotion)
-        # — a transient after the gate leaves the state untouched for the retry.
-        generation, members = self._era_ledger(era)
-        if generation == 0 or not members:
-            expected_member, expected_index = "", 0
-        else:
-            expected_index = member_index_for_era(era.index, len(members))
-            expected_member = members[expected_index]
-        if era.generation != generation or era.member_index != expected_index:
-            return (f"era_init_mismatch: era {era.index} declares generation "
-                    f"{era.generation} member {era.member_index}, the ledger names "
-                    f"generation {generation} member {expected_index}")
-        if manifest.warm_start_ckpt != expected_member:
-            return (f"era_init_mismatch: era {era.index} init is "
-                    f"{expected_member or '<random init>'!r}, manifest trained from "
-                    f"{manifest.warm_start_ckpt or '<random init>'!r}")
-        return None
-
-    def _era_ledger(self, era: EraSpec) -> tuple[int, tuple[str, ...]]:
-        """``(generation, members)`` in force for ``era``: the staged
-        promotion once its effective era is reached, else the live one."""
-        assert self.cascade is not None
-        state = self.cascade.state
-        if (state.pending_generation and state.pending_generation > state.generation
-                and int(era.index) >= int(state.pending_effective_era)):
-            return int(state.pending_generation), tuple(state.pending_members)
-        return int(state.generation), tuple(state.members)
-
-    def _install_era_promotion(self, manifest: TrainingManifest) -> None:
-        """Install the staged promotion at its first effective settlement —
-        called when a gated era manifest is HANDLED (scored, resync-held or
-        rejected), never from a gate. Idempotent."""
-        if self.cascade is None or not self._era_active(manifest) or manifest.era is None:
-            return
-        try:
-            era = EraSpec.from_json(manifest.era)
-        except ValueError:
-            return
-        state = self.cascade.state
-        if (state.pending_generation and state.pending_generation > state.generation
-                and int(era.index) >= int(state.pending_effective_era)):
-            self.cascade.note_promotion(
-                generation=state.pending_generation, members=state.pending_members,
-                block=era.start_block)
-            self.cascade.stage_promotion(generation=0, members=(), effective_era=0)
-            log.info("cascade: promotion generation=%d installed at era %d",
-                     self.cascade.state.generation, era.index)
-
-    def _adopt_era_king(self, manifest: TrainingManifest) -> None:
-        """Record the pointer the era's king is judged at — the era's first
-        king leg, or (already set by apply_round / demote_to_trained) the
-        crowned winner's — AFTER the settlement is handled. Adoption inside
-        the gate left a transient with an adopted pointer, and a legitimately
-        re-published manifest carrying a different first-king-leg pointer
-        was then rejected forever."""
-        if not self._era_active(manifest) or manifest.era is None:
-            return
-        try:
-            era = EraSpec.from_json(manifest.era)
-        except ValueError:
-            return
-        king = manifest.entry_for_role("king")
-        pointer = self.state.king_pointer
-        if (king is not None and king.miner_hotkey == self.state.king_hotkey
-                and (self.state.era_index != era.index or not pointer)):
-            pointer = str(king.trained_pointer)
-        if self.state.era_index != era.index or pointer != self.state.king_pointer:
-            self.state = replace(self.state, era_index=int(era.index), king_pointer=pointer)
-
-    def process_settlement(self, manifest: TrainingManifest, windows, base_seed: int):
-        """:meth:`process_round` for a settlement: the era ledger is installed
-        first (idempotent), the era king pointer adopted after success. A
-        transient raised by process_round leaves the pointer untouched."""
-        self._install_era_promotion(manifest)
-        outcome = self.process_round(manifest, windows, base_seed)
-        self._adopt_era_king(manifest)
-        return outcome
-
-    def _refresh_pending_promotion(self, era: EraSpec, *, block: int | None = None) -> None:
-        """Learn of a NEWER promotion record ahead of its effective era. The
-        record must survive the DEC-CA-0013 envelope (signature, set cap,
-        ripeness when attestable, member provenance) AND claim an
-        ``effective_era`` no earlier than one full era after it fired; a
-        record failing either is ignored (logged) — the ledger keeps naming
-        the live generation and a manifest trained from the new set fails
-        ``era_init_mismatch`` until a valid record exists. A record or bench
-        report that cannot be READ raises :class:`StorageError` instead (a
-        transient the poll loop retries): an unreadable ledger is not
-        evidence of a bad init.
-
-        DEC-CA-0050 (from ``promotion_carry_from_block``, judged at this
-        settlement's boundary ``block``): a record that fired BEFORE the
-        current reign's anchor fired under an earlier king's clock, so it is
-        never timed against the current one. It is timed against the previous
-        reign's anchor when this validator recorded that reign from an
-        observed transition, and reign-scoped to it; otherwise the timing
-        check is skipped (the non-attesting rule). Either way the current
-        reign's checkpoint log stays out of its quality floor (that reign's
-        checkpoints were never its candidates). Signature, set cap,
-        effective-era floor, provenance and quality still apply. A record
-        fired within the current reign is judged exactly as before. A
-        promotion re-staged after its effective era began is installed at the
-        next handled settlement whose era is >= ``effective_era``
-        (:meth:`_era_ledger` / :meth:`_install_era_promotion`)."""
-        from ..shared.promotion import verify_promotion_record_signature
-
-        assert self.cascade is not None
-        state = self.cascade.state
-        record = self._fetch_latest_promotion_record()
-        if record is None or record.generation <= max(state.generation, state.pending_generation):
-            return
-        if record.generation != state.generation + 1:
-            log.warning("cascade: promotion record gen=%d skips accepted gen=%d; ignored",
-                        record.generation, state.generation)
-            return
-        if self.verify_signatures and not verify_promotion_record_signature(
-                record, self.cfg.manifest.trainer_hotkey):
-            log.warning("cascade: promotion record gen=%d unsigned/invalid; ignored",
-                        record.generation)
-            return
-        member_ids = record.member_ids()
-        k_max = max(1, int(self.cfg.scoring.cascade_top_k))
-        if not member_ids or len(member_ids) > k_max:
-            log.warning("cascade: promotion record gen=%d declares %d member(s), cap %d; "
-                        "ignored", record.generation, len(member_ids), k_max)
-            return
-        floor = min_effective_era(self.cfg.round, int(record.fired_block))
-        if int(record.effective_era) < floor:
-            log.warning("cascade: promotion record gen=%d claims effective_era %d, "
-                        "earliest allowed %d (fired at block %d); ignored",
-                        record.generation, record.effective_era, floor, record.fired_block)
-            return
-        fired = int(record.fired_block)
-        prior_reign = (self._promotion_carry_active(block)
-                       and self.cascade.fired_in_prior_reign(fired))
-        reign_anchor: int | None = None
-        if prior_reign:
-            reign_anchor = self.cascade.prior_reign_anchor(fired)
-            attesting = reign_anchor is not None
-            if attesting and not self.cascade.is_ripe_since(reign_anchor, block=fired):
-                log.warning("cascade: promotion record gen=%d fired before the previous "
-                            "reign's clock (anchored at %d) ripened (block %d); ignored",
-                            record.generation, reign_anchor, fired)
-                return
-            if not attesting:
-                log.info("cascade: promotion record gen=%d fired at block %d under an earlier "
-                         "reign (current anchor %s) whose clock this validator cannot "
-                         "attest; timing check skipped", record.generation, fired,
-                         self.cascade.state.reign_start_block)
-        else:
-            attesting = self.cascade.can_verify_ripeness()
-            if attesting and not self.cascade.is_ripe(block=fired):
-                log.warning("cascade: promotion record gen=%d fired before the reign clock "
-                            "ripened (block %d); ignored", record.generation, record.fired_block)
-                return
-        # A StorageError out of the record fetch above or the member check
-        # here propagates: the era gate cannot judge this manifest without
-        # the provenance, and the poll loop retries the round (never a
-        # receipt) — see _gate_read_failed.
-        if prior_reign:
-            member_reason = self._verify_members(record, enforce_reign_scope=attesting,
-                                                 carried_exempt=True,
-                                                 reign_anchor=reign_anchor,
-                                                 use_reign_log=False)
-        else:
-            member_reason = self._verify_members(record, enforce_reign_scope=attesting,
-                                                 carried_exempt=True)
-        if member_reason is not None:
-            log.warning("cascade: promotion record gen=%d rejected: %s",
-                        record.generation, member_reason)
-            return
-        self.cascade.stage_promotion(generation=record.generation, members=member_ids,
-                                     effective_era=int(record.effective_era))
-        log.info("cascade: promotion generation=%d staged for era %d (%d member(s))",
-                 record.generation, record.effective_era, len(member_ids))
-
-    def _check_era_king(self, manifest: TrainingManifest, era: EraSpec) -> str | None:
-        """The king entry is judged at ONE pointer per era: the pointer this
-        validator crowned (a dethrone's winner) or the era's first king leg.
-        A new era adopts the manifest's king pointer; a stale-king manifest
-        (hotkey ≠ champion) is left to the resync valve, not rejected here."""
-        king = manifest.entry_for_role("king")
-        if king is None:
-            return None
-        champ = self.state.king_hotkey
-        if champ is not None and king.miner_hotkey != champ:
-            return None
-        if (self.state.era_index == era.index and self.state.king_pointer
-                and king.trained_pointer != self.state.king_pointer):
-            return (f"era_king_pointer_mismatch: era {era.index} king pointer is "
-                    f"{self.state.king_pointer!r}, manifest carries "
-                    f"{king.trained_pointer!r}")
-        # A new era's first king leg is adopted when the settlement is
-        # handled (_adopt_era_king), never here: gates leave state untouched.
-        return None
-
-    def _check_era_refs(self, manifest: TrainingManifest) -> str | None:
-        """Each entry's ref is the hotkey's revealed commitment AS OF its
-        ``train_block`` (not the latest reveal at the boundary), so a
-        re-commit between leg start and settlement cannot change what is
-        judged. FAIL CLOSED without a history provider (the live loop wires
-        ``client.poll_commitments(include_history=True)`` itself); a provider
-        failure is a transient (raised — the loop retries next poll)."""
-        if self.commitment_history_fn is None:
-            return ("era_ref_unverifiable: no commitment-history provider — refs are "
-                    "judged as of train_block from era_king_from_block")
-        history = self.commitment_history_fn()
-        for e in manifest.entries:
-            bound = ref_as_of(history, e.miner_hotkey, int(e.train_block))
-            if bound is None:
-                return (f"era_ref_unbound: {e.role} uid{e.miner_uid} had no revealed "
-                        f"commitment as of block {e.train_block}")
-            if bound != e.gen_ref:
-                return (f"era_ref_mismatch: {e.role} uid{e.miner_uid} ref {e.gen_ref!r} "
-                        f"is not the commitment revealed as of block {e.train_block} "
-                        f"({bound!r})")
-        return None
-
-    def _check_contract(self, manifest: TrainingManifest) -> str | None:
-        """Gate the round's training contract. Two regimes, block-selected.
-
-        **Declared** (DEC-CA-0036; from ``[scoring] declared_contract_from_block``,
-        and only for a manifest that actually publishes a ``contract_body``):
-        the trainer ships the round's full contract in the signed manifest and
-        this checks two things — that the body re-hashes to the
-        ``contract_digest`` it declares, and that the body's LOCKED projection
-        (:func:`locked_contract_terms`) matches ours. The locked terms are the
-        only ones this validator consumes with its own local value — including
-        ``train_seed_salt``, which the receipt assembler folds into the round's
-        published ``training_seed`` via ``RoundSeeds.derive``; every other
-        ``[training]`` term is recorded and audited but never gates, so the
-        trainer ships runtime and recipe fixes without a fleet restart.
-
-        **Strict** (legacy, and always for a body-less manifest): full digest
-        equality against the local ``[training]``, with the block-gated
-        ``prior_contract_digest`` transition for the round in flight across a
-        contract-changing release.
-
-        Note the asymmetry in where each side is read from: the digest
-        self-consistency check reads the DECLARED body (it proves the trainer's
-        own two statements agree), while the locked comparison comes from LOCAL
-        config on our side — a pin sourced from the declaration would be the
-        trainer gating itself.
-        """
-        declared_from = int(self.cfg.scoring.declared_contract_from_block)
-        if (declared_from and manifest.contract_body is not None
-                and self._epoch_start_block(manifest) >= declared_from):
-            declared = contract_digest(manifest.contract_body)
-            if declared != manifest.contract_digest:
-                return (f"contract_body_mismatch: body hashes to {declared} "
-                        f"but manifest declares {manifest.contract_digest}")
-            want = locked_contract_terms(self.cfg.training)
-            got = locked_contract_terms(manifest.contract_body)
-            if got != want:
-                return f"contract_locked_mismatch: {got} != {want}"
-            return None
-        want_contract = contract_digest(self.cfg.training)
-        if manifest.contract_digest != want_contract:
-            # Block-gated contract transition: a round whose epoch boundary
-            # precedes contract_from_block was trained under the pinned prior
-            # contract and is accepted against prior_contract_digest — so a
-            # validator restarted onto a contract-changing release still
-            # scores the round in flight (see ScoringConfig).
-            prior = self.cfg.scoring.prior_contract_digest
-            from_block = int(self.cfg.scoring.contract_from_block)
-            if not (prior and from_block
-                    and manifest.contract_digest == prior
-                    and self._epoch_start_block(manifest) < from_block):
-                return f"contract_digest_mismatch: {manifest.contract_digest} != {want_contract}"
-        return None
-
-    def _check_warm_start(self, manifest: TrainingManifest) -> str | None:
-        """Warm-start envelope gate (Cascade, DEC-CA-0013, propose-and-verify).
-
-        The trainer SELECTS the promoted warm-start set and declares each
-        round's init in the signed manifest (``warm_start_ckpt``); this gate
-        VERIFIES the declaration instead of re-deriving the selection:
-
-        * a declared init in the accepted generation's member set passes (any
-          member — rotation/allocation across members is trainer policy);
-        * an unseen init must be justified by a trainer-signed
-          :class:`~cascade.shared.promotion.PromotionRecord` for a NEWER
-          generation that survives the envelope (:meth:`_verify_promotion`):
-          provenance + quality floor against the reign log's signed bench
-          numbers, reign-clock ripeness, and the ``cascade_top_k`` set cap;
-        * random init ("") passes only in the random-init era (generation 0) —
-          once a promotion is live a round must never silently train unpinned.
-
-        Only enforced when Cascade is wired (off ⇒ pure KOTH, field ignored)."""
-        if self.cascade is None:
-            return None
-        legacy_reason = self._adopt_legacy_warm_start()
-        if legacy_reason is not None:
-            return legacy_reason
-        if self._era_active(manifest):
-            # DEC-CA-0043: the era gate names the init from the ledger
-            # (generation + era rotation) and rejects anything else.
-            return None
-        declared = manifest.warm_start_ckpt
-        state = self.cascade.state
-        if not declared:
-            if state.generation == 0:
-                return None
-            return ("warm_start_missing: manifest trained from <random init> but "
-                    f"promotion generation {state.generation} is live")
-        if declared in state.members:
-            return None
-        return self._verify_promotion(manifest, declared)
-
-    def _adopt_legacy_warm_start(self) -> str | None:
-        """Migration shim (pre-DEC-CA-0013 states): grandfather the single
-        pointer this validator's own Cascade installed under the old
-        select-and-install mechanism — or, on the owner box, the member set the
-        co-hosted trainer's engine wrote — as the accepted generation, once,
-        from the random-init era. Returns a rejection reason only for a
-        present-but-unreadable file (fail LOUD, never open).
-
-        Known bootstrap gap, accepted: the grandfathered generation has no
-        published PromotionRecord (the old winner has no ``source_round``
-        provenance to verify one against), so a validator with NO local state
-        at all — a fresh joiner during the grandfather window — rejects rounds
-        until the first post-upgrade promotion publishes a real record (≤ one
-        reign). Not a regression: under the old mechanism a fresh validator
-        without the pointer file rejected the same rounds for longer (until
-        its OWN promotion fired)."""
-        if self.cascade is None or self.cascade.state.generation != 0:
-            return None
-        p = Path(self.cfg.validator.warm_start_init_path)
-        if not p.is_file():
-            return None
-        try:
-            obj = json.loads(p.read_text(encoding="utf-8"))
-        except Exception as e:  # noqa: BLE001 — unreadable pin must fail LOUD, not open
-            return f"warm_start_state_unreadable: {p}: {e}"
-        members = [str(m.get("checkpoint_id") or "") for m in (obj.get("members") or ())]
-        members = [m for m in members if m]
-        if members:
-            self.cascade.adopt_member_set(
-                generation=int(obj.get("generation", 1) or 1), members=tuple(members))
-        else:
-            self.cascade.adopt_legacy_pointer(str(obj.get("checkpoint_id") or ""))
-        return None
-
-    def _verify_promotion(self, manifest: TrainingManifest, declared: str) -> str | None:
-        """Verify a declared-but-unseen init against the latest published
-        promotion record. Accepts (installs the new generation via
-        :meth:`CascadeController.note_promotion`) and returns ``None``, or
-        returns the rejection reason.
-
-        The envelope, in order: the record exists for a generation NEWER than
-        the accepted one and carries the declared init; it is trainer-signed;
-        its member set respects ``cascade_top_k``; the reign clock was ripe
-        (checked only when this validator's clock can attest timing at all —
-        an unanchored or catching-up clock only measures its own uptime, so it
-        skips the check rather than rejecting a whole reign's rounds); and
-        every member's provenance + quality holds against signed bench numbers
-        (:meth:`_verify_members`)."""
-        from ..shared.promotion import verify_promotion_record_signature
-
-        assert self.cascade is not None
-        state = self.cascade.state
-        record = self._fetch_latest_promotion_record()
-        if record is None:
-            return (f"warm_start_mismatch: manifest trained from {declared!r} but no "
-                    f"promotion record justifies it (accepted generation "
-                    f"{state.generation})")
-        if record.generation <= state.generation:
-            return (f"warm_start_mismatch: manifest trained from {declared!r} but the "
-                    f"latest promotion record is generation {record.generation} ≤ "
-                    f"accepted {state.generation} (stale or replayed)")
-        if self.verify_signatures and not verify_promotion_record_signature(
-            record, self.cfg.manifest.trainer_hotkey
-        ):
-            return (f"warm_start_promotion_unsigned: record generation "
-                    f"{record.generation} failed signature verification")
-        member_ids = record.member_ids()
-        if declared not in member_ids:
-            return (f"warm_start_mismatch: manifest trained from {declared!r}, not a "
-                    f"member of promotion generation {record.generation}")
-        k_max = max(1, int(self.cfg.scoring.cascade_top_k))
-        if not member_ids or len(member_ids) > k_max:
-            return (f"warm_start_promotion_invalid: generation {record.generation} "
-                    f"declares {len(member_ids)} member(s); cap is {k_max}")
-        block = self._epoch_start_block(manifest)
-        # The timing-and-scope checks apply when this validator's clock can
-        # attest at all (anchored, generation ≥ 1) and the record is the +1
-        # transition it watched — a bootstrap/catch-up validator's clock only
-        # measures its own uptime, so it verifies what its evidence supports.
-        attesting = (record.generation == state.generation + 1
-                     and self.cascade.can_verify_ripeness())
-        if attesting and not self.cascade.is_ripe(block=block):
-            return (f"warm_start_promotion_early: generation {record.generation} "
-                    f"declared before the reign clock ripened")
-        member_reason = self._verify_members(
-            record, enforce_reign_scope=attesting, carried_exempt=self._era_active(manifest))
-        if member_reason is not None:
-            return member_reason
-        self.cascade.note_promotion(
-            generation=record.generation, members=member_ids, block=block)
-        return None
-
-    def _verify_members(self, record: object, *, enforce_reign_scope: bool,
-                        carried_exempt: bool = False, reign_anchor: int | None = None,
-                        use_reign_log: bool = True) -> str | None:
-        """Provenance + quality floor for every member of a promotion record.
-
-        Each member must have trainer-signed bench numbers: from this
-        validator's reign log when it recorded that round, else fetched on
-        demand from the member's ``source_round`` bench report — so
-        verification does not depend on this validator's log being complete. A
-        member with no verifiable score fails CLOSED (an init nobody can score
-        must not become the field's floor) — but only when the report is
-        readable and lacks it, or is definitively absent. A report that cannot
-        be READ raises :class:`StorageError` (a transient: the round is
-        retried next poll, no receipt) — 2026-09-21 two validators published
-        permanent rejections of the first gen-11 rounds on a swallowed read
-        miss of a report that was on S3 the whole time.
-
-        ``enforce_reign_scope`` additionally pins the fetched fallback to the
-        CURRENT reign: the report's ``created_block`` must not predate this
-        validator's reign anchor, so a checkpoint from a dead reign (stale
-        trainer state, fabricated ``source_round``) can't pass provenance just
-        because some old signed report once scored it. Only enforced when this
-        validator's clock watched the whole reign (the same condition as
-        ripeness) — a bootstrap clock would mis-scope honest early-reign
-        members. The reign-log path is reign-scoped by construction (the log
-        clears on every re-crown). **Carried-over members are exempt**
-        (DEC-CA-0044 rolling top-k): a member of the generation this
-        validator already accepted (live or staged) was verified when it
-        entered and keeps its original ``source_round``, which by
-        construction predates the reign it now carries into — scope applies
-        only to NEW entrants. Quality is still re-checked for every member.
-        ``carried_exempt`` is CONSENSUS-GATED on ``era_king_from_block`` by
-        the caller: before the rollover every member is scoped (as the
-        previous release does), so an early-upgraded validator never accepts
-        a record its peers reject.
-
-        The floor is the best score across the reign log and the members
-        themselves; every member must sit within ``cascade_quality_epsilon``
-        of it. One-sided by construction: a validator's log is a subset of the
-        trainer's candidates (same signed reports), so a missing report can
-        only loosen this validator's floor — an honest trainer passes every
-        validator; only a cheating trainer splits the fleet, and splitting
-        loudly is the correct outcome there.
-
-        DEC-CA-0050 (prior-reign records only, caller-gated): ``reign_anchor``
-        scopes the fallback to THAT reign instead of the current one, and
-        ``use_reign_log=False`` keeps the current reign's log out of the
-        lookup and the floor. Defaults are the pre-DEC-CA-0050 behaviour."""
-        from .cascade import best_score, cascade_score, log_record_for
-
-        assert self.cascade is not None
-        state = self.cascade.state
-        reign_start = state.reign_start_block if reign_anchor is None else int(reign_anchor)
-        scope_label = "current" if reign_anchor is None else "record's"
-        carried = (set(state.members) | set(state.pending_members)) if carried_exempt else set()
-        scores: dict[str, float] = {}
-        for m in getattr(record, "members", ()):
-            rec = log_record_for(state, m.checkpoint_id) if use_reign_log else None
-            if rec is not None:
-                scores[m.checkpoint_id] = rec.score
-                continue
-            report = self._fetch_bench_report(
-                m.source_round, require=m.checkpoint_id, raise_unavailable=True)
-            be = None if report is None else report.entry_for_pointer(m.checkpoint_id)
-            if be is None:
-                return (f"warm_start_member_unverifiable: {m.checkpoint_id} has no "
-                        f"signed bench numbers (source_round={m.source_round!r})")
-            if (enforce_reign_scope and reign_start is not None
-                    and m.checkpoint_id not in carried
-                    and int(getattr(report, "created_block", 0)) < int(reign_start)):
-                return (f"warm_start_member_out_of_reign: {m.checkpoint_id} was "
-                        f"benched in round {m.source_round!r} (block "
-                        f"{getattr(report, 'created_block', '?')}), before the "
-                        f"{scope_label} reign anchored at block {reign_start}")
-            s = be.scores
-            scores[m.checkpoint_id] = cascade_score(
-                s.gifteval_crps, s.gifteval_mase, s.boom_crps,
-                s.boom_mase, s.time_crps, s.time_mase)
-        floor_candidates = list(scores.values())
-        log_best = best_score(self.cascade.state) if use_reign_log else None
-        if log_best is not None:
-            floor_candidates.append(log_best)
-        floor = min(floor_candidates)
-        epsilon = float(self.cfg.scoring.cascade_quality_epsilon)
-        for cid, score in scores.items():
-            if score > floor * (1.0 + epsilon):
-                return (f"warm_start_member_below_floor: {cid} score {score:.5f} "
-                        f"exceeds quality floor {floor:.5f} × (1 + {epsilon})")
-        return None
-
-    def _fetch_latest_promotion_record(self) -> object | None:
-        """The latest published promotion record, located via the unsigned
-        ``promotions/index.json`` (trust comes from the record's signature,
-        checked by the caller — the index is a locator only).
-
-        ``None`` when the index is absent (no promotion ever published) or
-        the located record is malformed — both verdicts. A store READ failure
-        (auth/network/5xx), or an index naming a record that cannot be read,
-        raises :class:`StorageError`: the caller's gate must retry next poll,
-        never reject. Before 2026-09-21 every failure here read as "no record
-        justifies this init" and latched a permanent ``warm_start_mismatch`` /
-        ``era_init_mismatch`` receipt."""
-        from ..shared.hippius import ObjectNotFound, StorageError
-        from ..shared.promotion import (
-            load_promotion_index,
-            load_promotion_record,
-            promotion_index_key,
-            promotion_record_key,
-        )
-
-        try:
-            index_text = self._bench_store().get_text(promotion_index_key())
-        except ObjectNotFound:
-            return None  # no promotions published yet
-        except Exception as e:  # noqa: BLE001 — store down / auth / network
-            log.warning("cascade: promotion index could not be READ (%s: %s)",
-                        type(e).__name__, str(e)[-300:])
-            raise StorageError(f"promotion_index_unavailable: {e}") from e
-        latest = load_promotion_index(index_text)
-        if latest <= 0:
-            return None
-        try:
-            text = self._bench_store().get_text(promotion_record_key(latest))
-        except Exception as e:  # noqa: BLE001 — incl. ObjectNotFound: the record is
-            # published BEFORE the index names it, so a miss here is a read
-            # failure or a store inconsistency, never "no promotion".
-            log.warning("cascade: promotion record gen=%d could not be READ (%s: %s)",
-                        latest, type(e).__name__, str(e)[-300:])
-            raise StorageError(f"promotion_record_unavailable: gen={latest}: {e}") from e
-        try:
-            return load_promotion_record(text)
-        except Exception as e:  # noqa: BLE001 — malformed content is a verdict
-            log.warning("cascade: promotion record gen=%d malformed (%s); ignored", latest, e)
-            return None
-
-    @staticmethod
-    def check_pool_pin(
-        manifest: TrainingManifest, window_source: object, *, block: int | None
-    ) -> str | None:
-        """Verify this round's eval pool against the trainer-signed pin.
-
-        A pinned manifest carries the ``(key, sha256)`` of the snapshot the
-        trainer screened on; the validator's own deterministic selection (same
-        epoch block, same rule) must resolve to the identical pair. The pin is
-        inside the signed body, so pool integrity descends from the trainer
-        signature rather than the unsigned ``pool/index.json`` — a poisoned
-        index or tampered tar surfaces here as a loud reject instead of scoring
-        on attacker-chosen data. Unpinned manifests (older trainers) keep the
-        legacy index-trust behaviour. Returns a reject reason or ``None``.
-
-        Raises :class:`~cascade.shared.hippius.StorageError` when the pool
-        index could not be READ (auth/network/5xx) — that is a transient, not a
-        verdict, and the caller decides retry-vs-reject (the live loop retries
-        within :data:`POOL_PIN_READ_GRACE_SECONDS`). Every other failure is a
-        reject reason.
-        """
-        if not (manifest.eval_pool_key and manifest.eval_pool_sha256):
-            return None
-        prov_fn = getattr(window_source, "provenance_for_round", None)
-        if prov_fn is None:
-            return ("pool_pin_unverifiable: manifest pins the eval pool but this "
-                    "validator's pool source reports no provenance")
-        try:
-            key, sha = prov_fn(int(manifest.round_id), block=block)
-        except Exception as e:  # noqa: BLE001 — an unverifiable pin must reject, not crash
-            from ..shared.hippius import StorageError
-
-            if isinstance(e, StorageError):
-                raise  # read failure, not a verdict — caller retries (see above)
-            return f"pool_pin_unverifiable: provenance lookup failed: {e}"
-        if not key or not sha:
-            return ("pool_pin_unverifiable: manifest pins the eval pool but this "
-                    "validator resolved no snapshot for the round")
-        if (key, sha) != (manifest.eval_pool_key, manifest.eval_pool_sha256):
-            return (f"pool_pin_mismatch: manifest signed {manifest.eval_pool_key}@"
-                    f"{manifest.eval_pool_sha256[:12]}…, this validator resolved "
-                    f"{key}@{sha[:12]}…")
-        return None
-
-    def _gate_read_failed(
-        self, round_id: str, err: Exception, *, gate: str = "pool_pin_unverifiable",
-        now: float | None = None,
-    ) -> str | None:
-        """Grace bookkeeping for a gate whose evidence could not be READ —
-        the pool index at the pin gate, or the promotion record / bench report
-        behind the warm-start gate (``gate`` names the reject reason).
-
-        Returns ``None`` while ``round_id``'s read failures span less than
-        :data:`POOL_PIN_READ_GRACE_SECONDS` — the caller then skips the cycle
-        with no latch and no receipt, so the next manifest poll re-attempts the
-        round from scratch. Once the grace expires, returns the terminal reject
-        reason (and forgets the round, so a later re-publish starts a fresh
-        grace window).
-        """
-        import time
-
-        now = time.monotonic() if now is None else now
-        first = self._pin_read_first_failure.setdefault(str(round_id), now)
-        waited = now - first
-        if waited < POOL_PIN_READ_GRACE_SECONDS:
-            log.warning(
-                "%s: evidence unreadable for round=%s (%s); retrying "
-                "next poll (%.0fs into %.0fs grace, no reject latched)",
-                gate, round_id, err, waited, POOL_PIN_READ_GRACE_SECONDS,
-            )
-            return None
-        self._pin_read_first_failure.pop(str(round_id), None)
-        return (
-            f"{gate}: provenance lookup failed persistently "
-            f"({waited:.0f}s > {POOL_PIN_READ_GRACE_SECONDS:.0f}s grace): {err}"
-        )
-
-    def _check_gpu(self, manifest: TrainingManifest) -> str | None:
-        """Matched-hardware gate for byte-exact re-derivation — PER SIZE.
-
-        Each entry is judged against ITS size's pin: the per-size contract's
-        ``expected_gpu`` (a ``SizeSpec.expected_gpu`` override, else the base
-        ``[training]`` pin — DEC-CA-0027's size-conditional silicon). A size
-        with no pin requires only that king and challenger ran the same GPU
-        within that size — equal compute is already guaranteed by the token
-        budget, but a byte-exact audit needs each comparison run on one SKU.
-        Different SIZES may legitimately run different silicon (a 313M duel on
-        H100 beside a 4M screen lineage on L40S); requiring one GPU across
-        sizes would deadlock exactly the configuration the per-size pin
-        exists for. Single-size manifests (every deployed round) are judged
-        identically to the old whole-manifest rule.
-        """
-        registry = self.cfg.training.size_registry
-        primary = self.cfg.training.arch_preset
-        by_size: dict[str, list[TrainedEntry]] = {}
-        for e in manifest.entries:
-            by_size.setdefault(e.size, []).append(e)
-        for size, entries in by_size.items():
-            preset = size or primary
-            # An unknown size tag falls back to the base pin. Defensive: both
-            # contract regimes pin the legal preset set before we get here —
-            # strict by full digest equality, declared by the locked projection
-            # (which carries every extra size's preset) — so a tag outside the
-            # registry means the trainer mislabelled its own entry, and the
-            # base pin is the conservative reading.
-            contract = registry.get(preset, self.cfg.training.primary_size)
-            pinned = contract.expected_gpu
-            gpus = {e.gpu_name for e in entries if e.gpu_name}
-            if pinned:
-                bad = sorted(g for g in gpus if g != pinned)
-                if bad or any(not e.gpu_name for e in entries):
-                    return (f"gpu_mismatch: size {preset!r} expected {pinned!r}, "
-                            f"manifest has {sorted(gpus)!r}")
-            elif len(gpus) > 1 and not self._era_active(manifest):
-                # DEC-CA-0043 lifts the same-GPU fallback: legs pick their SKU
-                # per entry, byte-exact audit across SKUs is given up (#294).
-                return (f"gpu_mismatch: size {preset!r} king/challenger on "
-                        f"different GPUs {sorted(gpus)!r}")
-        return None
-
-    # ── per-round decision ──────────────────────────────────────────────────
-
-    def _fetch_checkpoint_dir(self, entry: TrainedEntry) -> Path:
-        """Fetch a trained checkpoint from the Hippius Hub registry to a local
-        dir and return it. The OCI digest in the ref pins the bytes, so the
-        fetch is self-verifying; repeated fetches of the same ref land in the
-        same digest-named dir (cheap to reuse)."""
-        from ..shared.hippius import HubConfig, HubRef, fetch_from_hub
-
-        ref = parse_trained_pointer(entry.trained_pointer)
-        if ref is None:
-            raise ValueError(f"malformed trained_pointer: {entry.trained_pointer!r}")
-        hub = HubConfig.from_storage(self.cfg.storage)
-        dest = Path(self.cache_dir or "./_eval_ckpts") / HubRef.parse(ref).digest.replace(":", "-")
-        fetch_from_hub(ref, dest, hub)
-        return dest
-
-    def _verdict_windows(
-        self, window_source: object, round_seed: int | str, *, block: int | None
-    ) -> list[EvalWindow]:
-        """The round's verdict windows: the scored horizon ladder when active
-        at this round's epoch block (``[eval] scored_horizons`` /
-        ``scored_from_block``), else the single-horizon rotating draw. Both
-        are deterministic in ``(round_seed, block)``, so every validator
-        scores the identical set."""
-        horizons = scored_ladder(self.cfg.eval, block)
-        if not horizons:
-            return window_source.windows_for_round(
-                round_seed, self.cfg.eval.n_windows, block=block
-            )
-        return ladder_windows_for_round(
-            window_source, horizons=horizons,
-            n_windows=self.cfg.eval.n_windows,
-            context_length=self.cfg.eval.context_length,
-            round_seed=round_seed, block=block,
-        )
-
-    def _evaluate(self, entry: TrainedEntry, windows: list[EvalWindow]) -> list[WindowScore]:
-        if self.evaluate_fn is not None:
-            return self.evaluate_fn(entry, windows)
-        # Default path: fetch the checkpoint from the Hippius Hub registry and
-        # score it (registry + torch).
-        from .evaluator import evaluate_checkpoint
-
-        dest = self._fetch_checkpoint_dir(entry)
-        # The entry's contract arms the ingest guard: the checkpoint's code
-        # must be this release's, its config the contract's, its weights the
-        # pinned model's shape — a funded (miner-pod) checkpoint is untrusted.
-        size = getattr(entry, "size", "") or self.cfg.training.arch_preset
-        return evaluate_checkpoint(
-            dest, windows, num_samples=self.cfg.eval.num_samples, device=self.device,
-            contract=self.cfg.training.contract_for(size),
-        )
-
-    # Sentinel identity for the increment margin's third reference — the
-    # shared warm-start init checkpoint. Not a miner: uid −1 is out of range
-    # for every metagraph, and the audit locates its receipt rows by ROLE
-    # ("baseline"), not by this name.
-    BASELINE_HOTKEY = "__warm_start_init__"
-
-    def _score_increment_baseline(
-        self,
-        manifest: TrainingManifest,
-        paired_sizes: list[str],
-        windows: list[EvalWindow],
-        score_records: list[EntryScores],
-    ) -> list[WindowScore] | None:
-        """Score the shared warm-start init on the verdict windows.
-
-        Serves both consumers of the baseline: the increment margin
-        (DEC-CA-0027) and the init-baseline floor ([scoring] init_gate_mode).
-        Appends the init's rows to the receipt either way (role="baseline").
-
-        Returns ``None`` — judge at "level" / floor not applied — when the
-        round has no baseline:
-        a random-init round (no ``warm_start_ckpt``; the E2 init-round
-        semantics), or a multi-size duel / size mismatch, where a single init
-        cannot reference every paired size (weights never cross sizes).
-        """
-        if not manifest.warm_start_ckpt:
-            log.info("round=%s baseline eval on a random-init round: no init "
-                     "to score (increment judges at level; init floor skips)",
-                     manifest.round_id)
-            return None
-        if len(paired_sizes) != 1 or manifest.warm_start_size != paired_sizes[0]:
-            log.warning(
-                "round=%s margin_mode=increment needs a single-size duel at the "
-                "warm-start size (paired=%s, warm_start_size=%r); judging at level",
-                manifest.round_id, paired_sizes, manifest.warm_start_size)
-            return None
-        size = paired_sizes[0]
-        entry = TrainedEntry(
-            miner_hotkey=self.BASELINE_HOTKEY, miner_uid=-1, role="king",
-            gen_ref="", trained_pointer=manifest.warm_start_ckpt,
-            corpus_digest="", train_block=0, size=size,
-        )
-        scores = self._evaluate(entry, windows)
-        score_records.append(EntryScores(
-            role="baseline", size=size, hotkey=self.BASELINE_HOTKEY, uid=-1,
-            scores=tuple(WindowScoreRecord.from_score(s) for s in scores),
-        ))
-        log.info("round=%s increment baseline scored: %d rows from %s",
-                 manifest.round_id, len(scores), manifest.warm_start_ckpt)
-        return scores
-
-    # ── public-benchmark no-regression gate ─────────────────────────────────
-
-    def _eval_host(self) -> RemoteHost | None:
-        """The offload pod for THIS eval — resolved fresh every time so an
-        elastic pod (rented per round manifest, torn down on the receipt)
-        appears and disappears without a validator restart."""
-        return self.eval_host_fn() if self.eval_host_fn is not None else None
-
-    def _gift_rows(self, entry: TrainedEntry) -> dict | None:
-        """Gift-eval ratio rows for one entry — injected in tests, else the
-        sidecar bridge on the fetched checkpoint dir."""
-        if self.gift_rows_fn is not None:
-            return self.gift_rows_fn(entry)
-
-        ec = self.cfg.eval
-        dest = self._fetch_checkpoint_dir(entry)
-        num_samples = ec.gift_gate_num_samples or ec.num_samples
-        eval_host = self._eval_host()
-        if eval_host is not None:
-            # Offload the (heavy, paired) gift-eval to the GPU pod; the paired
-            # bootstrap and every consensus decision stay on this box.
-            from .eval_offload import gift_rows_via_host
-
-            return gift_rows_via_host(
-                eval_host, dest,
-                datasets=ec.gift_gate_datasets,
-                num_samples=num_samples,
-                data_dir=(ec.gift_gate_data_dir or None),
-                device="cuda",
-                timeout_s=ec.gift_gate_timeout_s,
-            )
-        from ..eval.benchmarks import run_gift_rows
-
-        return run_gift_rows(
-            dest,
-            project_dir=ec.benchmark_project_dir,
-            datasets=ec.gift_gate_datasets,
-            num_samples=num_samples,
-            device=self.device,
-            data_dir=(ec.gift_gate_data_dir or None),
-            timeout_s=ec.gift_gate_timeout_s,
-        )
-
-    def _run_gift_gate(
-        self,
-        result: RoundResult,
-        king_entry: TrainedEntry,
-        chal_entry: TrainedEntry,
-        *,
-        seed: int | str,
-        round_id: str,
-    ) -> RoundResult:
-        """Fold the public-benchmark gate into a *winning* round result.
-
-        Scores both sides on gift-eval (via the sidecar bridge) and runs the
-        paired no-regression bootstrap. The gate is uncomputable — and the
-        round therefore inconclusive under ``enforce`` — when either sidecar run
-        fails, gift-eval was skipped/errored, or the two runs scored against
-        different pinned data revisions (a consensus-safety check: king and
-        challenger must be judged on identical public data).
-        """
-        from ..eval.gift_gate import evaluate_gift_gate, uncomputable_gate
-        from ..eval.koth import apply_gift_gate
-
-        p = self.cfg.koth_params()
-        mode = p.gift_gate_mode
-        king_run = self._gift_rows(king_entry)
-        chal_run = self._gift_rows(chal_entry)
-        if (
-            king_run is None or chal_run is None
-            or king_run.get("status") != "ok" or chal_run.get("status") != "ok"
-        ):
-            gate = uncomputable_gate(p.gift_gate_tolerance, "gift-eval sidecar unavailable/errored")
-        elif king_run.get("revision") != chal_run.get("revision"):
-            gate = uncomputable_gate(
-                p.gift_gate_tolerance,
-                f"data-revision mismatch: king {king_run.get('revision')} != "
-                f"chal {chal_run.get('revision')}",
-            )
-        else:
-            gate = evaluate_gift_gate(
-                king_run["rows"], chal_run["rows"],
-                tolerance=p.gift_gate_tolerance,
-                alpha=p.bootstrap_alpha,
-                B=p.bootstrap_B,
-                seed=seed,
-                min_configs=p.gift_gate_min_configs,
-            )
-        log.info(
-            "gift-gate round=%s mode=%s computed=%s passed=%s lcb=%s tol=%.4f "
-            "n_configs=%d king_agg=%.5f chal_agg=%.5f%s",
-            round_id, mode, gate.computed, gate.passed,
-            f"{gate.lcb:.5f}" if gate.computed else "n/a", gate.tolerance,
-            gate.n_configs, gate.king_agg, gate.chal_agg,
-            "" if gate.computed else f" reason={gate.reason!r}",
-        )
-        return apply_gift_gate(result, gate, mode=mode)
-
-    def _maybe_run_benchmarks(
-        self, manifest: TrainingManifest, outcome: RoundOutcome | None
-    ) -> None:  # pragma: no cover — exercised only in the live loop
-        """Log public-benchmark numbers for a newly crowned king (log-only).
-
-        Best-effort and strictly off the consensus path: it runs only when a
-        challenger just dethroned the king, scores that new king's checkpoint via
-        the isolated sidecar, and logs whatever comes back. Any failure is
-        swallowed — a benchmark hiccup must never disturb weights or KOTH state.
-        """
-        ec = self.cfg.eval
-        if not ec.run_benchmarks:
-            return
-        if outcome is None or not outcome.transition.dethroned:
-            return
-        # The crowned challenger, NOT the manifest's first — a multi-finalist
-        # cohort (DEC-CA-0012) carries several, and taking the first would
-        # benchmark a checkpoint that did not take the throne.
-        crowned = outcome.transition.new_king_hotkey
-        new_king = next(
-            (e for e in manifest.entries_for_role("challenger")
-             if e.miner_hotkey == crowned),
-            None,
-        )
-        if new_king is None:
-            return
-        try:
-            from ..eval.benchmarks import format_report, run_benchmarks
-
-            ckpt = self._fetch_checkpoint_dir(new_king)
-            report = run_benchmarks(
-                ckpt,
-                project_dir=ec.benchmark_project_dir,
-                suites=ec.benchmark_suites or ("gift-eval", "boom", "time"),
-                num_samples=ec.benchmark_num_samples or ec.num_samples,
-                max_series=ec.benchmark_max_series,
-                device=self.device,
-            )
-            if report is not None:
-                log.info(
-                    "benchmarks round=%s king=%s %s",
-                    manifest.round_id, self.state.king_hotkey, format_report(report),
-                )
-        except Exception as e:  # noqa: BLE001 — log-only, never fatal
-            log.warning("benchmark hook failed for round=%s: %s", manifest.round_id, e)
-
-    # ── Cascade: king-reign promotion ────────────────────────────────────────
-
-    @staticmethod
-    def _bench_scores_dict(entry: TrainedEntry) -> dict | None:
-        """The six Cascade numbers off a manifest entry's trainer-signed
-        ``bench_scores`` (GIFT-Eval / BOOM / TIME CRPS+MASE), or ``None`` when the
-        entry carries none. The FALLBACK source, for rounds published before the
-        trainer moved the bench post-publish (those manifests carry the numbers
-        in-entry; new ones never do)."""
-        bs = entry.bench_scores
-        if bs is None:
-            return None
-        return {
-            "gifteval_crps": bs.gifteval_crps, "gifteval_mase": bs.gifteval_mase,
-            "boom_crps": bs.boom_crps, "boom_mase": bs.boom_mase,
-            "time_crps": bs.time_crps, "time_mase": bs.time_mase,
-        }
-
-    def _bench_store(self) -> object:
-        if self.bench_report_store is None:
-            from ..shared.hippius import open_manifest_store
-
-            self.bench_report_store = open_manifest_store(self.cfg.storage)
-        return self.bench_report_store
-
-    def _fetch_bench_report(self, round_id: str, *, require: str | None = None,
-                            raise_unavailable: bool = False) -> object | None:
-        """The round's trainer-signed bench report
-        (:mod:`cascade.shared.bench_report`), or ``None`` — absent (the bench
-        runs post-publish, so "not there yet" is a normal state), malformed,
-        or failing signature verification.
-
-        ``require`` names a trained pointer the caller needs: a CACHED report
-        lacking it is discarded and re-fetched once, so a copy cached before
-        the trainer (re)published the entry cannot pin a stale miss for the
-        life of the process. ``raise_unavailable`` turns a store READ failure
-        (network/auth/5xx — the object's existence is unknown) into a raised
-        :class:`StorageError` instead of ``None``: a member check must treat
-        "could not read" as a transient the loop retries next poll, never as
-        "has no bench numbers". Absence (``ObjectNotFound``) is still ``None``
-        — that IS a verdict. Read failures are logged either way; the old
-        silent ``None`` left every such miss undiagnosable."""
-        from ..shared.bench_report import (
-            bench_report_key,
-            load_bench_report,
-            verify_bench_report_signature,
-        )
-        from ..shared.hippius import ObjectNotFound, StorageError
-
-        rid = str(round_id)
-        cached = self._bench_report_cache.get(rid)
-        if cached is not None:
-            if require is None or cached.entry_for_pointer(require) is not None:
-                return cached
-            log.info("cascade: cached bench report for round=%s lacks %s; re-fetching",
-                     rid, require[:64])
-            self._bench_report_cache.pop(rid, None)
-        try:
-            text = self._bench_store().get_text(bench_report_key(rid))
-        except ObjectNotFound:
-            log.info("cascade: bench report for round=%s not published (yet)", rid)
-            return None
-        except Exception as e:  # noqa: BLE001 — store down / auth / network
-            log.warning("cascade: bench report for round=%s could not be READ (%s: %s)",
-                        rid, type(e).__name__, str(e)[-300:])
-            if raise_unavailable:
-                raise StorageError(f"bench_report_unavailable: round={rid}: {e}") from e
-            return None
-        try:
-            report = load_bench_report(text)
-        except (ValueError, KeyError, TypeError) as e:
-            log.warning("cascade: bench report for round=%s unparseable (%s); ignoring",
-                        round_id, e)
-            return None
-        if self.verify_signatures and not verify_bench_report_signature(
-            report, self.cfg.manifest.trainer_hotkey
-        ):
-            log.warning("cascade: bench report for round=%s failed signature "
-                        "verification; ignoring", round_id)
-            return None
-        self._bench_report_cache[rid] = report
-        while len(self._bench_report_cache) > 16:  # small FIFO, insertion-ordered
-            self._bench_report_cache.pop(next(iter(self._bench_report_cache)))
-        return report
-
-    def _report_bench_scores(self, round_id: str, trained_pointer: str) -> dict | None:
-        """The six Cascade numbers for one checkpoint out of the round's signed
-        bench report — the AUTHORITATIVE source (every validator reads the same
-        signed set). Joined on the exact ``trained_pointer``, never role/UID.
-        ``require`` makes a re-probe (:meth:`_drain_pending_bench`) a real GET
-        when the cached copy lacks the pointer — the report is republished as
-        legs finish, and a partial copy cached earlier must not answer every
-        retry from memory."""
-        report = self._fetch_bench_report(round_id, require=trained_pointer)
-        if report is None:
-            return None
-        be = report.entry_for_pointer(trained_pointer)
-        if be is None:
-            return None
-        s = be.scores
-        return {
-            "gifteval_crps": s.gifteval_crps, "gifteval_mase": s.gifteval_mase,
-            "boom_crps": s.boom_crps, "boom_mase": s.boom_mase,
-            "time_crps": s.time_crps, "time_mase": s.time_mase,
-        }
-
-    def _record_duel_checkpoints(self, manifest: TrainingManifest, now: float) -> None:
-        """Add the round's benched duel checkpoints — the king's AND every
-        challenger's at the primary throne size — to the reign log. Both roles
-        are promotion candidates (DEC-CA-0013): challenger checkpoints carry
-        genuinely different generator data, the deepest diversity the promoted
-        set can draw on, and the trainer benches both sides already. The log is
-        the envelope's provenance/quality evidence, so a later verification is
-        a lookup, not a re-eval.
-
-        Source order per checkpoint: the round's signed bench report
-        (authoritative; published after the manifest), then the manifest
-        entry's in-entry ``bench_scores`` (king-only, rounds from before the
-        bench moved post-publish). Neither yet ⇒ the checkpoint is queued and
-        re-probed at the next rounds' cascade steps (the report typically lands
-        ~an hour after the manifest); a checkpoint whose report never appears
-        simply contributes no bench numbers — the trainer selects (and this
-        validator verifies) over the reign checkpoints that have them."""
-        if self.cascade is None or self.state.king_hotkey is None:
-            return
-        primary = self.cfg.throne_contracts()[0].arch_preset
-        for entry in manifest.entries:
-            if (entry.size or primary) != primary:
-                continue
-            metrics = (self._report_bench_scores(manifest.round_id, entry.trained_pointer)
-                       or self._bench_scores_dict(entry))
-            if metrics is None:
-                self._queue_pending_bench(manifest.round_id, entry)
-                continue
-            self.cascade.record_checkpoint(
-                entry.trained_pointer, now=now, size=entry.size, role=entry.role, **metrics)
-
-    def _queue_pending_bench(self, round_id: str, entry: TrainedEntry) -> None:
-        if any(p["round_id"] == str(round_id)
-               and p["trained_pointer"] == entry.trained_pointer
-               for p in self._pending_bench):
-            return
-        self._pending_bench.append({
-            "round_id": str(round_id),
-            "trained_pointer": entry.trained_pointer,
-            "size": entry.size,
-            "role": entry.role,
-            "king_hotkey": self.state.king_hotkey,
-            # The reign identity at queue time: an accepted promotion re-crowns
-            # the SAME king with a new start block, so the king alone cannot
-            # tell "this reign" from "the reign the promotion just closed".
-            "reign_start": (None if self.cascade is None
-                            else self.cascade.state.reign_start_block),
-            "tries": BENCH_REPORT_RETRY_ROUNDS,
-        })
-        log.info("cascade: no bench numbers yet for round=%s %s checkpoint %s; "
-                 "will re-probe the bench report for up to %d round(s)",
-                 round_id, entry.role, entry.trained_pointer, BENCH_REPORT_RETRY_ROUNDS)
-
-    def _drain_pending_bench(self, now: float) -> None:
-        """Re-probe queued checkpoints' bench reports and log any that landed.
-
-        A queued checkpoint whose reign ended is dropped outright — whether by
-        a dethrone (new king) or by an accepted PROMOTION (same king, fresh
-        reign): the reign log was cleared at the re-crown, and a closed reign's
-        checkpoint leaking into the fresh log would corrupt the quality floor
-        the next promotion is verified against."""
-        if self.cascade is None or not self._pending_bench:
-            return
-        keep: list = []
-        for p in self._pending_bench:
-            if (p["king_hotkey"] != self.cascade.state.king_hotkey
-                    or p.get("reign_start") != self.cascade.state.reign_start_block):
-                log.info("cascade: dropping pending bench for round=%s (reign ended)",
-                         p["round_id"])
-                continue
-            metrics = self._report_bench_scores(p["round_id"], p["trained_pointer"])
-            if metrics is not None:
-                self.cascade.record_checkpoint(
-                    p["trained_pointer"], now=now, size=p["size"],
-                    role=p.get("role", ""), **metrics)
-                continue
-            p["tries"] -= 1
-            if p["tries"] > 0:
-                keep.append(p)
-            else:
-                log.info("cascade: giving up on bench report for round=%s; the "
-                         "checkpoint contributes no bench numbers", p["round_id"])
-        self._pending_bench = keep
-
-    def _cascade_round(
-        self, manifest: TrainingManifest, outcome: RoundOutcome | None
-    ) -> None:  # pragma: no cover — live-loop glue; the controller is unit-tested
-        """One Cascade step, run at the end of a round (after weights/receipts).
-        Resets the reign clock on a dethrone, re-anchors a legacy clock, and
-        records the round's benched duel checkpoints into the reign log. The
-        validator never fires a promotion (DEC-CA-0013): the trainer declares,
-        and the warm-start gate verifies+adopts at manifest time — this step
-        only maintains the clock and the evidence the gate verifies against.
-        Fully guarded: Cascade never disturbs KOTH."""
-        if self.cascade is None:
-            return
-        import time
-
-        now = time.time()
-        try:
-            # The reign clock runs on the round's epoch block — identical for every
-            # validator (from the signed manifest), so ripeness verdicts agree.
-            block = self._epoch_start_block(manifest)
-            # Reuse KOTH's dethrone signal to reset the clock (never reimplement it);
-            # on adoption (no cascade king but a live champion — a validator
-            # joining or restarting mid-reign), crown WITHOUT attestation: an
-            # adopted clock must not judge reign timing.
-            dethroned = (outcome is not None and outcome.transition.dethroned
-                         and outcome.transition.new_king_hotkey)
-            # DEC-CA-0050: from the carry gate a dethrone keeps the staged
-            # promotion (judged from this round's own boundary block).
-            carry = self._promotion_carry_active(block)
-            if dethroned:
-                self.cascade.note_dethrone(outcome.transition.new_king_hotkey, block=block,
-                                           carry_pending=carry)
-            elif self.cascade.state.king_hotkey is None and self.state.king_hotkey is not None:
-                self.cascade.note_dethrone(self.state.king_hotkey, block=block,
-                                           observed=False, carry_pending=carry)
-            self.cascade.observe_round(block=block)
-            # Earlier rounds first: reports published after those rounds'
-            # cascade steps (the bench runs post-publish) land in the reign log
-            # now, before this round's checkpoints are considered.
-            self._drain_pending_bench(now)
-            # A DETHRONE round's checkpoints belong to the reign that just
-            # ended and are recorded NOWHERE: the trainer's candidate pool
-            # wipes them at its own re-crown, and logging them here (into the
-            # freshly cleared log) would give this validator evidence the
-            # trainer never selects against — a stricter quality floor that
-            # rejects honest promotions (the one-sidedness invariant of
-            # _verify_members).
-            if not dethroned:
-                self._record_duel_checkpoints(manifest, now)
-        except Exception as e:  # noqa: BLE001 — Cascade must never disturb a round
-            log.warning("cascade step failed for round=%s: %s", manifest.round_id, e)
+    # DEC-CA-0055 pre-launch burn decided on chain: its own record + tally,
+    # persisted beside the others (``activation_prelaunch_burn_state.json``).
+    _prelaunch: ActivationRecord = field(default_factory=ActivationRecord, repr=False)
+    _prelaunch_tally: Tally | None = field(default=None, repr=False)
+    # Lane B (DEC-CA-0050): the domain-winner state (``<state_db>.lane_b.json``),
+    # the store its expert manifests are read from, the settlement block of the
+    # last judged manifest (the weight vector's decay clock), and the merged
+    # era inits already verified bit-exact.
+    _lane_b_state: object = field(default=None, repr=False)
+    _lane_b_store: object = field(default=None, repr=False)
+    _lane_b_block: int | None = field(default=None, repr=False)
+    _merged_init_ok: set = field(default_factory=set, repr=False)
+    # the pool lane-B catch-up / on-demand judging re-draws windows from
+    _lane_b_window_source: object = field(default=None, repr=False)
+    # the payout record of the last vector _apply_weights set (None = the
+    # legacy lane-A vector) — stamped on that round's receipt
+    _last_lane_b_pay: dict | None = field(default=None, repr=False)
+    # DEC-CA-0055: the emission record of the last vector _apply_weights set
+    # (None = no DEC-CA-0055 rule shaped it), and this settlement's ladder
+    # transition / king check — ``(round_id, record)`` — stamped on its receipt.
+    _last_emission: dict | None = field(default=None, repr=False)
+    _king_eval: tuple | None = field(default=None, repr=False)
+    _settlement_ladder: tuple | None = field(default=None, repr=False)
+    _settlement_king_check: tuple | None = field(default=None, repr=False)
+    # Lane C (DEC-CA-0056): the per-target slot state (``<state_db>.lane_c.json``),
+    # the store its manifests are read from (None = the lane-B / manifest
+    # store), the settlement block of the last judged manifest (the payout
+    # clock) and the payout record of the last vector set (stamped on that
+    # receipt). Lane C has no pool of its own (MarketCast-only lane C:
+    # MarketCast reads [marketcast] pool_prefix).
+    _lane_c_state: object = field(default=None, repr=False)
+    _lane_c_store: object = field(default=None, repr=False)
+    _lane_c_block: int | None = field(default=None, repr=False)
+    _last_lane_c_pay: dict | None = field(default=None, repr=False)
+    # DEC-CA-0057 owner-signed network config: the resolver (None, or one with
+    # an empty owner key = inert), the base config while a settlement runs
+    # under an overlay view (``_settlement_cfg``), that settlement's block,
+    # and the head block of the last activation pass (for the note).
+    netconfig: object | None = None
+    _cfg_base: ChainConfig | None = field(default=None, repr=False)
+    _settlement_block: int | None = field(default=None, repr=False)
+    # DEC-CA-0058: ``(round_id, settlement state)`` captured when the
+    # settlement started — its digest is the receipt's ``state_prior_sha256``.
+    _settlement_prior: tuple | None = field(default=None, repr=False)
+    _netconfig_now: int | None = field(default=None, repr=False)
+    # DEC-CA-0063 (lane-A benches on the main validator's GPU): the wallet
+    # this validator signs its bench report with (its hotkey == [netconfig]
+    # owner_hotkey makes it the MAIN validator — the only one that sweeps);
+    # an injectable sweep (tests: entry -> raw sidecar report); the
+    # settlement's bench state, the per-pointer sweep cache (the era king /
+    # init are swept once) and verified validator reports read later.
+    bench_signer: object | None = None
+    bench_sweep_fn: Callable[[TrainedEntry], dict | None] | None = None
+    # the paired pass ([eval] bench_paired; tests: entries -> one raw report
+    # each). With only ``bench_sweep_fn`` injected, sweeps stay one at a time.
+    bench_sweep_many_fn: Callable[[list], list] | None = None
+    _vbench: dict | None = field(default=None, repr=False)
+    _vbench_cache: dict = field(default_factory=dict, repr=False)
+    _vbench_reports: dict = field(default_factory=dict, repr=False)
+    # DEC-CA-0063: the raw manifests the settlement walk has pending AFTER the
+    # one being judged — where the trainer's record of its validator bench
+    # report (``validator_bench_reports``) is looked up.
+    _vbench_later_raw: list = field(default_factory=list, repr=False)
 
     def process_round(
         self,
@@ -1985,8 +344,9 @@ class ValidatorRunner:
         """Evaluate one manifest against the eval windows and update state.
 
         A round carries one king per trained size (the primary plus any
-        ``[[training.sizes]]``) and, when the heat advanced a statistically tied
-        cohort, up to ``[round] max_finalists`` challengers (DEC-CA-0012). For each
+        ``[[training.sizes]]``) and a cohort of challengers — every leg the
+        settlement judges (archived boundary rounds: the heat's advanced
+        cohort, DEC-CA-0012). For each
         challenger, every size's pair is scored on the SAME windows and the
         per-size scores are POOLED — king's across sizes vs challenger's across
         sizes, in identical order — so a single paired bootstrap decides ONE
@@ -2017,6 +377,7 @@ class ValidatorRunner:
         challenger paired with the king at every size, or fails the contract gate.
         Otherwise returns the round outcome with the (already-applied) transition.
         """
+        self._round_none_reason = None
         self._apply_forfeiture(manifest)
         reason = self.check_manifest(manifest)
         if reason is not None:
@@ -2050,12 +411,12 @@ class ValidatorRunner:
         king_scores: list[WindowScore] = []
         _t0 = _time.perf_counter()
         for size in paired_sizes:
-            ks = self._evaluate(king_by_size[size], windows)
+            ks = self._evaluate(king_by_size[size], windows, self._training_for(manifest))
             king_scores += ks
             score_records.append(EntryScores(
                 role="king", size=size,
                 hotkey=king_by_size[size].miner_hotkey, uid=king_by_size[size].miner_uid,
-                scores=tuple(WindowScoreRecord.from_score(s) for s in ks),
+                scores=self._window_records(ks, manifest),
             ))
         _t_king = _time.perf_counter() - _t0
 
@@ -2069,7 +430,7 @@ class ValidatorRunner:
         # JUDGED params — the receipt keeps recording the unmodified config
         # params (check_koth_params compares them against chain.toml) — and
         # the audit re-derives the judged margin rule as "params say
-        # increment AND baseline rows exist" (rows alone no longer imply
+        # increment AND baseline rows exist" (rows alone do not imply
         # increment: a level round with the floor on records them too).
         baseline_scores: list[WindowScore] | None = None
         if (base_params.margin_mode == "increment"
@@ -2119,20 +480,47 @@ class ValidatorRunner:
             self.cfg.round, self.cfg.scoring, block=self._epoch_start_block(manifest),
             tenure_rounds=self.state.tenure_rounds,
             king_since_block=self.state.king_since_block)
+        # DEC-CA-0055: the v2 king check (judged after this verdict) reuses the
+        # king's and the init's rows instead of re-scoring them.
+        self._king_eval = (str(manifest.round_id), king_scores, baseline_scores,
+                           tenure_at_decision)
         judged: list[tuple[str, TrainedEntry, RoundResult]] = []
         cohort_scores: list[tuple[str, list[WindowScore]]] = []
         inconclusive: RoundResult | None = None
+        inconclusive_at: tuple[str, TrainedEntry] | None = None
+        # Entry faults ([scoring] entry_fault_from_block): a challenger whose
+        # evaluation fails deterministically LOSES — no score rows, out of the
+        # judged cohort, reason in the verdict note — instead of raising the
+        # settlement into an endless retry. It still counts in ``k`` (the
+        # family the audit derives from the signed manifest). The king above
+        # is NOT covered: a king that cannot be scored must not crown anyone
+        # by default, so its failure stays an infra retry (as a missing king
+        # checkpoint always was).
+        fault_from = int(getattr(self.cfg.scoring, "entry_fault_from_block", 0) or 0)
+        faults_on = bool(fault_from) and epoch_block >= fault_from
+        faults: dict[str, str] = {}
         for hk, by_size in cohort:
             chal_scores: list[WindowScore] = []
+            chal_records: list[EntryScores] = []
             _t1 = _time.perf_counter()
-            for size in paired_sizes:
-                cs = self._evaluate(by_size[size], windows)
-                chal_scores += cs
-                score_records.append(EntryScores(
-                    role="challenger", size=size,
-                    hotkey=by_size[size].miner_hotkey, uid=by_size[size].miner_uid,
-                    scores=tuple(WindowScoreRecord.from_score(s) for s in cs),
-                ))
+            try:
+                for size in paired_sizes:
+                    cs = self._evaluate(by_size[size], windows, self._training_for(manifest))
+                    chal_scores += cs
+                    chal_records.append(EntryScores(
+                        role="challenger", size=size,
+                        hotkey=by_size[size].miner_hotkey, uid=by_size[size].miner_uid,
+                        scores=self._window_records(cs, manifest),
+                    ))
+            except Exception as e:  # noqa: BLE001 — classified; transients re-raise
+                fault = self._entry_fault_reason(e) if faults_on else None
+                if fault is None:
+                    raise
+                log.warning("round=%s challenger %s ENTRY FAULT (loses the duel): %s",
+                            manifest.round_id, hk, fault)
+                faults[hk] = fault
+                continue
+            score_records.extend(chal_records)
             _t_chal = _time.perf_counter() - _t1
             log.info(
                 "round=%s eval-timing challenger=%s device=%s n_windows=%d "
@@ -2154,6 +542,7 @@ class ValidatorRunner:
                          "king holds, remaining cohort not evaluated",
                          manifest.round_id, result.n_windows, result.n_clusters)
                 inconclusive = result
+                inconclusive_at = (hk, by_size[paired_sizes[0]])
                 break
             judged.append((hk, by_size[paired_sizes[0]], result))
             cohort_scores.append((hk, chal_scores))
@@ -2176,8 +565,30 @@ class ValidatorRunner:
         # Only when armed and the cohort completed (an inconclusive round holds
         # regardless); the per-challenger evaluate_round above ran at the
         # uncorrected alpha, so its geomeans/floors carry over unchanged.
+        if not judged and inconclusive is None:
+            # Every challenger faulted: nobody to judge, the king holds with
+            # no state change (as for a manifest with no pair).
+            self._round_none_reason = "entry_fault: every challenger faulted — " + "; ".join(
+                f"{hk}: {why}" for hk, why in faults.items())
+            log.warning("round=%s %s", manifest.round_id, self._round_none_reason)
+            return None
+        if use_maxt and faults and inconclusive is None and len(judged) == 1:
+            # Faults left ONE judged challenger of a k > 1 cohort: no joint
+            # bound to take, so it is judged at the cohort's Bonferroni
+            # alpha/k — what the audit's solo replay derives from the signed
+            # manifest (never the uncorrected alpha the max-T loop ran at).
+            hk, entry, _ = judged[0]
+            judged = [(hk, entry, evaluate_round(
+                king_scores, cohort_scores[0][1],
+                replace(base_params, bootstrap_alpha=base_params.bootstrap_alpha / k),
+                seed=base_seed, king_tenure_rounds=tenure_at_decision,
+                baseline_scores=baseline_scores,
+            ))]
+        lcb_maxt = False      # the decided lcb is the cohort's joint max-T bound
         if use_maxt and inconclusive is None and len(judged) > 1:
             from ..eval.koth import with_cohort_lcb
+
+            lcb_maxt = True
 
             # Increment units for the joint bound (DEC-CA-0039 stacked on
             # DEC-CA-0038, block-gated): base_params already fell back to
@@ -2202,12 +613,20 @@ class ValidatorRunner:
                      manifest.round_id, hk, res.lcb, res.margin,
                      res.challenger_wins_round)
 
+        # DEC-CA-0063: clearers the validator bench could not judge for an
+        # INFRA reason (trainer-recorded absent report, infra-failed sweep,
+        # exhausted bench budget) — skipped, never a loss: {hotkey: reason}.
+        bench_infra: dict[str, str] = {}
+        # DEC-CA-0063 items 9-10: clearers the settlement's sweep cap deferred
+        # (skipped, never a loss — the trainer carries the leg into a later
+        # settlement) and challengers whose sweep was a reproduced CHECKPOINT
+        # fault (the gate failed: a loss): {hotkey: reason}.
+        bench_deferred: dict[str, str] = {}
+        bench_fault: dict[str, str] = {}
         if inconclusive is not None:
+            assert inconclusive_at is not None
             decided_hotkey, chal_entry, result = (
-                cohort[len(judged)][0],
-                cohort[len(judged)][1][paired_sizes[0]],
-                inconclusive,
-            )
+                inconclusive_at[0], inconclusive_at[1], inconclusive)
             duelled: tuple[str, ...] = tuple(hk for hk, _, _ in judged) + (decided_hotkey,)
         else:
             # Gate on the bound, select on the point estimate: among the
@@ -2225,34 +644,74 @@ class ValidatorRunner:
                 log.info("round=%s %d challengers cleared the margin; crowning %s "
                          "(best observed geomean %.5f)", manifest.round_id,
                          len(clearers), decided_hotkey, result.chal_geomean)
-            # Public-benchmark no-regression gate: only on a private-pool win,
-            # and only when enabled. It can block a dethrone (or, uncomputable,
-            # hold the round) but never grant one. It is a sidecar sweep — the
-            # one genuinely expensive per-challenger step — so it runs on the
-            # best clearer and falls through to the next-best only if an
-            # ``enforce`` gate blocks. Gated on the primary size's pair (the
-            # pooled decision spans sizes; the gate screens on one).
-            if self.cfg.scoring.gift_gate_mode != "off" and clearers:
+            # Public-benchmark no-regression gates: only on a private-pool win,
+            # and only when enabled. Each can block a dethrone (or, uncomputable,
+            # hold the round) but never grant one. The GIFT gate is a sidecar
+            # sweep; the three-suite bench gate (DEC-CA-0054) reads the
+            # trainer-signed rows. They run on the best clearer and fall through
+            # to the next-best only if an ``enforce`` gate blocks. Gated on the
+            # primary size's pair (the pooled decision spans sizes; the gates
+            # screen on one).
+            gift_on = self.cfg.scoring.gift_gate_mode != "off"
+            bench_mode = bench_gate_mode_at(self.cfg, self._epoch_start_block(manifest))
+            bench_on = bench_mode != "off"
+            if (gift_on or bench_on) and clearers:
                 remaining = sorted(
                     clearers, key=lambda t: (t[2].chal_geomean,
                                              t[1].train_block, t[1].miner_uid))
+                gated_any = False
+                infra_hold = None
                 for hk, entry, res in remaining:
                     gate_size = (
-                        self.cfg.training.arch_preset
-                        if self.cfg.training.arch_preset in king_by_size
-                        and self.cfg.training.arch_preset in dict(cohort)[hk]
+                        self._training_for(manifest).arch_preset
+                        if self._training_for(manifest).arch_preset in king_by_size
+                        and self._training_for(manifest).arch_preset in dict(cohort)[hk]
                         else paired_sizes[0]
                     )
-                    gated = self._run_gift_gate(
-                        res, king_by_size[gate_size], dict(cohort)[hk][gate_size],
-                        seed=base_seed, round_id=manifest.round_id,
-                    )
+                    gated = res
+                    if gift_on:
+                        gated = self._run_gift_gate(
+                            gated, king_by_size[gate_size], dict(cohort)[hk][gate_size],
+                            seed=base_seed, round_id=manifest.round_id,
+                        )
+                    if bench_on and gated.challenger_wins_round:
+                        gated = self._run_bench_gate(
+                            gated, king_by_size[gate_size], dict(cohort)[hk][gate_size],
+                            seed=base_seed, round_id=manifest.round_id, mode=bench_mode,
+                            # DEC-CA-0061: the settlement's effective rule
+                            rule=bench_gate_rule_at(self.cfg, self._epoch_start_block(manifest)),
+                        )
+                        infra = getattr(self, "_bench_gate_infra", None)
+                        deferred = getattr(self, "_bench_gate_deferred", None)
+                        fault = getattr(self, "_bench_gate_fault", None)
+                        if fault is not None:
+                            bench_fault[hk] = fault
+                        if ((infra is not None or deferred is not None)
+                                and bench_mode == "enforce"):
+                            # DEC-CA-0063: infra / a budget deferral is never
+                            # the clearer's loss — skip it (streak untouched)
+                            # and fall through; with nobody left the king
+                            # holds (inconclusive).
+                            if deferred is not None:
+                                bench_deferred[hk] = deferred
+                            else:
+                                bench_infra[hk] = infra
+                            infra_hold = (hk, entry, gated)
+                            log.warning("round=%s %s cleared the private pool but the "
+                                        "validator bench is %s (%s); skipped, falling "
+                                        "through", manifest.round_id, hk,
+                                        "DEFERRED" if deferred is not None else "INFRA",
+                                        deferred if deferred is not None else infra)
+                            continue
                     decided_hotkey, chal_entry, result = hk, entry, gated
+                    gated_any = True
                     if gated.challenger_wins_round or gated.inconclusive:
                         break
                     log.info("round=%s %s cleared the private pool but was blocked by "
-                             "the public-benchmark gate; falling through to the next "
+                             "a public-benchmark gate; falling through to the next "
                              "clearer", manifest.round_id, hk)
+                if not gated_any and infra_hold is not None:
+                    decided_hotkey, chal_entry, result = infra_hold
 
         transition = state_mod.apply_round(
             self.state,
@@ -2261,10 +720,30 @@ class ValidatorRunner:
             result=result,
             dethrone_cp=self.cfg.scoring.dethrone_cp,
             keep_former_kings=self.cfg.scoring.reward_prior_kings,
-            defeated_hotkeys=duelled,
+            # A faulted challenger lost: its streak resets like a duelled one.
+            # A bench-infra clearer (DEC-CA-0063) did not lose: its streak stays.
+            defeated_hotkeys=tuple(h for h in duelled + tuple(faults)
+                                   if h not in bench_infra and h not in bench_deferred),
             crowned_block=self._epoch_start_block(manifest),
             crowned_pointer=chal_entry.trained_pointer,
         )
+        if faults:
+            # The signed record of WHY a manifest challenger has no score rows
+            # (VerdictRecord cannot grow; the note is free text).
+            transition = replace(transition, note=transition.note + "; entry_fault " + "; ".join(
+                f"{hk}: {why[:200]}" for hk, why in faults.items()))
+        if bench_infra:
+            # The signed record of which clearers the validator bench skipped
+            # as infra (free-text note, like entry_fault; the audit's
+            # bench-coverage row checks each against the report)
+            transition = replace(transition, note=transition.note + "; bench_infra " + "; ".join(
+                f"{hk}: {why[:200]}" for hk, why in sorted(bench_infra.items())))
+        for seg, named in (("bench_deferred", bench_deferred), ("bench_fault", bench_fault)):
+            if named:
+                # DEC-CA-0063 items 9-10, same free-text convention (the
+                # audit's bench-coverage row checks each against the report)
+                transition = replace(transition, note=transition.note + f"; {seg} " + "; ".join(
+                    f"{hk}: {why[:200]}" for hk, why in sorted(named.items())))
         self.state = transition.state
         log.info(
             "round=%s k=%d decided=%s lcb=%.4f margin=%.4f win=%s %s king=%s tenure=%d",
@@ -2315,6 +794,12 @@ class ValidatorRunner:
             cohort_per_domain={hk: r.per_domain for hk, _, r in judged
                                if r.per_domain},
             cohort_stats=({hk: cohort_stats_of(r) for hk, _, r in judged} if k > 1 else {}),
+            entry_faults=dict(faults),
+            lcb_units=crown_units(
+                margin_mode=base_params.margin_mode,
+                has_baseline=baseline_scores is not None, maxt=lcb_maxt,
+                maxt_increment=cohort_maxt_increment_active(
+                    self.cfg.scoring, self._epoch_start_block(manifest))),
         )
 
     def _pending_manifests(self, store: object, raw_latest: str,
@@ -2386,260 +871,28 @@ class ValidatorRunner:
         epoch_blocks = effective_epoch_blocks(self.cfg.round, manifest.created_block)
         return (manifest.created_block // epoch_blocks) * epoch_blocks
 
-    # ── public round receipts ────────────────────────────────────────────────
+    # ── cascade v2 (DEC-CA-0050): the contract a settlement is judged under ──
 
-    def build_round_receipt(
-        self,
-        manifest: TrainingManifest,
-        *,
-        base_seed: int,
-        epoch_start_block: int,
-        epoch_block_hash: str,
-        outcome: RoundOutcome | None = None,
-        windows: list[EvalWindow] | None = None,
-        reject_reason: str | None = None,
-        participants: tuple[Participant, ...] = (),
-        pool_provenance: tuple[str, str] = ("", ""),
-        reward_uids: tuple[int, ...] = (),
-        weights: tuple[float, ...] = (),
-        validator_hotkey: str = "",
-        era_base_seed: int = 0,
-    ) -> RoundReceipt:
-        """Assemble the round's public receipt (pure — no I/O, no signing).
+    def _training_for(self, manifest: TrainingManifest):
+        """The training contract ``manifest``'s settlement was trained under:
+        ``[training]`` resolved at the start of the era the settlement belongs
+        to (pure block arithmetic, never the era stamp) — the v2 contract for
+        a v2 era, the base contract byte-for-byte otherwise. Without a v2
+        schedule this IS ``self.cfg.training`` (same object)."""
+        t = self.cfg.training
+        if not int(getattr(t, "v2_from_block", 0) or 0):
+            return t
+        return t.at_block(settlement_contract_block(self.cfg.round,
+                                                    self._epoch_start_block(manifest)))
 
-        ``era_base_seed`` (DEC-CA-0043, era settlements only) is
-        ``block_seed(era.seed_block)``: the era's training seeds derive from
-        it, so the receipt's ``generation_seed`` / ``training_seed`` are the
-        era's while ``base_seed`` stays the settlement boundary's.
-
-        A gated-out manifest — or one with no (king, challenger) pair to score
-        (a no-contest round: nothing failed, the king simply holds) — yields a
-        ``rejected``-status receipt carrying the reason (the machine-readable
-        status string is kept for compatibility); a scored round yields
-        the full record: chain context, embedded manifest, participant set, the
-        eval slice, every per-window score, the verdict, and the weight vector.
-        """
-        from ..trainer.contract import RoundSeeds
-
-        era_start_block = 0
-        if era_king_active(self.cfg.scoring, epoch_start_block):
-            era_start_block = settlement_era(self.cfg.round, epoch_start_block).start_block
-            seeds = RoundSeeds.derive(int(era_base_seed), self.cfg.training)
-        else:
-            era_base_seed = 0
-            seeds = RoundSeeds.derive(base_seed, self.cfg.training)
-        if reject_reason is not None:
-            return build_receipt(
-                round_id=manifest.round_id, status="rejected",
-                epoch_start_block=epoch_start_block, epoch_block_hash=epoch_block_hash,
-                base_seed=base_seed, seeds=seeds, manifest=manifest,
-                participants=participants, reject_reason=reject_reason,
-                reward_uids=reward_uids, weights=weights,
-                validator_hotkey=validator_hotkey,
-                era_start_block=era_start_block, era_base_seed=era_base_seed,
-                activation_block=self.activation_block,
-                margin_v2_block=self.margin_v2_block,
-                promotion_carry_block=self.promotion_carry_block,
-            )
-        if outcome is None or windows is None:
-            raise ValueError("a scored receipt needs both outcome and windows")
-        eval_context = EvalContext(
-            pool_ref=pool_provenance[0],
-            pool_digest=pool_provenance[1],
-            window_ids=tuple(w.series_id for w in windows),
-            n_windows=len(windows),
-            num_samples=self.cfg.eval.num_samples,
-        )
-        verdict = VerdictRecord.from_round(
-            outcome.result, outcome.transition,
-            params=self.cfg.koth_params(block=epoch_start_block), bootstrap_seed=base_seed,
-            king_tenure_rounds=outcome.king_tenure_rounds,
-            cohort_k=outcome.cohort_k, cohort_lcbs=outcome.cohort_lcbs,
-            cohort_geomeans=outcome.cohort_geomeans,
-            cohort_per_horizon=outcome.cohort_per_horizon,
-            cohort_stats=outcome.cohort_stats,
-            cohort_per_domain=outcome.cohort_per_domain,
-        )
-        return build_receipt(
-            round_id=manifest.round_id, status="scored",
-            epoch_start_block=epoch_start_block, epoch_block_hash=epoch_block_hash,
-            base_seed=base_seed, seeds=seeds, manifest=manifest,
-            participants=participants, eval_context=eval_context,
-            entry_scores=outcome.entry_scores, verdict=verdict,
-            reward_uids=reward_uids, weights=weights,
-            validator_hotkey=validator_hotkey,
-            era_start_block=era_start_block, era_base_seed=era_base_seed,
-            activation_block=self.activation_block,
-            margin_v2_block=self.margin_v2_block,
-            promotion_carry_block=self.promotion_carry_block,
-        )
-
-    def _publish_round_receipt(
-        self,
-        client: object,
-        manifest: TrainingManifest,
-        base_seed: int,
-        *,
-        outcome: RoundOutcome | None = None,
-        windows: list[EvalWindow] | None = None,
-        reject_reason: str | None = None,
-        window_source: object = None,
-        reward_uids: tuple[int, ...] = (),
-        weights: tuple[float, ...] = (),
-    ) -> None:  # pragma: no cover — live-loop glue; assembly is unit-tested
-        """Gather chain context, sign, and publish the round receipt.
-
-        Best-effort by design: a receipt failure must never disturb weights or
-        KOTH state (they are already committed), so every chain lookup degrades
-        to an empty field and any publish error is logged and swallowed. The
-        audit CLI treats missing context as WARN, not PASS.
-        """
-        from datetime import datetime
-
-        from ..shared.hippius import (
-            open_manifest_store,
-            publish_receipt,
-            update_receipt_index,
-        )
-        from ..shared.receipt import dump_receipt, sign_receipt, summarize_receipt
-
-        try:
-            epoch_start = self._epoch_start_block(manifest)
-            epoch_hash = ""
-            era_base_seed = 0
-            current_block: int | None = None
-            participants: tuple[Participant, ...] = ()
-            try:
-                epoch_hash = client.block_hash(epoch_start)
-                if era_king_active(self.cfg.scoring, epoch_start):
-                    era_base_seed = int(client.block_seed(
-                        settlement_era(self.cfg.round, epoch_start).seed_block))
-                participants = participants_from_commitments(
-                    client.poll_commitments(include_history=True),
-                    cutoff_block=epoch_start,
-                    floor_block=self.cfg.round.commit_floor_block,
-                )
-                # Anchor for the dashboard's next-round countdown (best-effort;
-                # the client extrapolates block→wall-clock from this + as_of).
-                current_block = int(client.current_block())
-            except Exception as e:  # noqa: BLE001 — chain context is best-effort
-                log.warning("receipt chain context unavailable for round=%s: %s",
-                            manifest.round_id, e)
-            provenance = ("", "")
-            prov_fn = getattr(window_source, "provenance_for_round", None)
-            if prov_fn is not None:
-                try:
-                    # Same epoch block that selected the round's windows, so the
-                    # recorded provenance is the pool actually scored.
-                    provenance = tuple(prov_fn(base_seed, block=epoch_start))
-                except Exception as e:  # noqa: BLE001
-                    log.warning("pool provenance unavailable for round=%s: %s",
-                                manifest.round_id, e)
-            wallet = getattr(client, "wallet", lambda: None)()
-            hotkey_ss58 = str(getattr(getattr(wallet, "hotkey", None), "ss58_address", "") or "")
-
-            receipt = self.build_round_receipt(
-                manifest,
-                base_seed=base_seed,
-                epoch_start_block=epoch_start,
-                epoch_block_hash=str(epoch_hash),
-                outcome=outcome,
-                windows=windows,
-                reject_reason=reject_reason,
-                participants=participants,
-                pool_provenance=(provenance[0], provenance[1]),
-                reward_uids=reward_uids,
-                weights=weights,
-                validator_hotkey=hotkey_ss58,
-                era_base_seed=era_base_seed,
-            )
-            if wallet is not None:
-                receipt = sign_receipt(receipt, wallet)
-            else:
-                log.warning("publishing an UNSIGNED receipt (no wallet) for round=%s",
-                            manifest.round_id)
-            store = open_manifest_store(self.cfg.storage)
-            key = publish_receipt(store, dump_receipt(receipt), manifest.round_id,
-                                  validator_hotkey=hotkey_ss58)
-            # Operator-facing label only: a king-only round is a designed
-            # no-contest, not a rejection — but the receipt's machine-readable
-            # status stays "rejected" (audit checks, receipt bootstrap, and
-            # dashboards branch on it, and archived signatures cover it).
-            status_label = ("no-contest (king holds)"
-                            if reject_reason == "no_king_challenger_pair"
-                            else receipt.status)
-            log.info("published %s receipt round=%s signed=%s → s3://%s/%s",
-                     status_label, manifest.round_id, receipt.signature is not None,
-                     self.cfg.storage.manifest_bucket, key)
-            # Refresh the dashboard-facing rolling index (best-effort, and inside
-            # the outer guard: a listing convenience must never disturb a round).
-            try:
-                now_iso = datetime.now(UTC).isoformat(timespec="seconds")
-                # Schedule anchor for the "time until next round" countdown. The
-                # next round begins at the next epoch boundary; the client turns
-                # blocks into wall-clock via block_time_s, extrapolating current_block
-                # from `as_of`. Bittensor blocks are ~12s regardless of epoch_blocks
-                # (testnet shortens epochs, not block time), so it is a constant.
-                chain = {
-                    "as_of": now_iso,
-                    "current_block": current_block,
-                    "epoch_start_block": epoch_start,
-                    # Length of the round STARTING at epoch_start, not the raw
-                    # field: while a cadence change is pending the raw value is
-                    # the post-switch length, and the client's next-boundary
-                    # countdown (epoch_start + epoch_blocks) would point
-                    # mid-round. A round never spans the activation block, so
-                    # resolving at epoch_start is exact on both sides.
-                    "epoch_blocks": int(effective_epoch_blocks(self.cfg.round, epoch_start)),
-                    "block_time_s": 12.0,
-                }
-                update_receipt_index(
-                    store, summarize_receipt(receipt),
-                    updated_at=now_iso,
-                    subnet={"netuid": self.cfg.subnet.netuid, "name": self.cfg.subnet.name},
-                    chain=chain,
-                )
-            except Exception as e:  # noqa: BLE001
-                log.warning("receipt index update failed for round=%s: %s",
-                            manifest.round_id, e)
-        except Exception as e:  # noqa: BLE001 — receipts must never disturb the round
-            log.warning("receipt publication failed for round=%s: %s", manifest.round_id, e)
+    def _v2_receipt_block(self, boundary: int) -> int:
+        """The receipt's ``v2_block``: ``[v2] from_block`` when the settlement
+        at ``boundary`` judges a v2 era, else 0 (dropped from the body)."""
+        if v2_settlement_active(self.cfg, boundary):
+            return int(self.cfg.v2.from_block)
+        return 0
 
     # ── live loop ────────────────────────────────────────────────────────────
-
-    def _publish_chain_status(self, client: object, store: object) -> None:  # pragma: no cover
-        """Publish the dashboard's live ``status/chain.json`` (current block,
-        epoch grid, stage windows, revealed submissions) on the poll cadence.
-
-        Purely presentational and best-effort — it feeds the web dashboard's
-        round-stage strip and live submissions panel between receipts, and any
-        failure (chain flake, storage outage) is swallowed: status telemetry
-        must never disturb a round.
-        """
-        from datetime import datetime
-
-        from ..shared.chain_status import build_chain_status, publish_chain_status
-
-        try:
-            econ = getattr(client, "subnet_economics", lambda: None)()
-            activation = (activation_summary(self.cfg, self._activation, self._activation_tally,
-                                             self._forfeit, self._forfeit_tally,
-                                             self._margin_v2, self._margin_v2_tally,
-                                             self._promotion_carry,
-                                             self._promotion_carry_tally)
-                          if self.cfg.activation.enabled else None)
-            status = build_chain_status(
-                self.cfg,
-                current_block=int(client.current_block()),  # type: ignore[attr-defined]
-                commitments=client.poll_commitments(),  # type: ignore[attr-defined]
-                network=str(getattr(client, "network", "")),
-                as_of=datetime.now(UTC).isoformat(timespec="seconds"),
-                economics=econ,
-                activation=activation,
-            )
-            publish_chain_status(store, status)
-        except Exception as e:  # noqa: BLE001 — telemetry only
-            log.debug("chain status publish skipped: %s", e)
 
     def _maybe_calibrate_horizons(
         self, manifest: TrainingManifest, base_seed: int | str, window_source: object
@@ -2661,7 +914,7 @@ class ValidatorRunner:
             if pool_dir is None:
                 log.info("calib: window source exposes no series dir; skipping")
                 return
-            primary = self.cfg.training.primary_size.arch_preset
+            primary = self._training_for(manifest).primary_size.arch_preset
             checkpoints: dict[str, Path] = {}
             for entry in manifest.entries:
                 if (entry.size or primary) != primary:
@@ -2705,6 +958,8 @@ class ValidatorRunner:
         from ..shared.manifest import load_manifest
 
         store = open_manifest_store(self.cfg.storage)
+        self._lane_b_store = store         # DEC-CA-0050 expert manifests live beside
+        self._lane_b_window_source = window_source   # lane-B catch-up re-draws its windows
         if self.bench_report_store is None:
             # Bench reports live in the same bucket — reuse this store (and its
             # R2/HF fallbacks) instead of lazily building a second client.
@@ -2712,12 +967,11 @@ class ValidatorRunner:
         poll = self.cfg.manifest.poll_seconds
         # Dedup on CONTENT, not round_id: a re-published manifest for an
         # already-seen round id (same-round-id rerun, e.g. after a contract
-        # fix) must be re-judged, not silently skipped (2026-07-15: the
-        # round_id-only latch ignored the rerun manifest with no log line).
-        # The latch is PERSISTED (trainer PR #157's twin): a restart resumes
+        # fix) must be re-judged, not silently skipped.
+        # The latch is PERSISTED (mirrors the trainer's): a restart resumes
         # from the last handled (round, sha) instead of re-judging the already-
         # published round — under a changed scoring rule that re-judgement can
-        # flip a settled verdict (2026-07-28, DEC-CA-0009). State files from
+        # flip a settled verdict (e.g. DEC-CA-0009). State files from
         # before the marker existed are seeded from this validator's own
         # signature-verified receipt trail; a same-round re-publish with
         # different content still re-judges (the sha differs).
@@ -2727,19 +981,20 @@ class ValidatorRunner:
             # without it — _check_era_refs fails closed on None.
             self.commitment_history_fn = lambda: client.poll_commitments(include_history=True)
         last_round: str | None = self.state.last_handled_round_id
-        last_digest: str | None = self.state.last_handled_manifest_sha
         if last_round is None:
             seeded = self._probe_own_receipt_round(client, store)
             if seeded is not None:
                 try:
                     raw = read_latest_manifest(store)
-                    if load_manifest(raw).round_id == seeded:
+                    seeded_manifest = load_manifest(raw)
+                    if seeded_manifest.round_id == seeded:
                         last_round = seeded
-                        last_digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
                         self.state = replace(
                             self.state,
                             last_handled_round_id=str(seeded),
-                            last_handled_manifest_sha=last_digest,
+                            last_handled_manifest_sha=hashlib.sha256(
+                                raw.encode("utf-8")).hexdigest(),
+                            last_handled_block=int(seeded_manifest.created_block),
                         )
                         self._persist_state()
                 except (StorageError, ValueError) as e:
@@ -2753,489 +1008,616 @@ class ValidatorRunner:
         # manifest is judged, so a restart never judges a settlement under
         # the wrong rules.
         self._activation_startup(client)
+        from ..shared.calendar_launch import check_calendar_launch
+
+        check_calendar_launch(self._base_cfg(), client)
+        from .settlement_transaction import recover
+
+        self.registration_at_block_fn = getattr(client, "uid_for_hotkey_at_block", None)
+        recover(self)
+        if self.cfg.lane_b.from_block:
+            # DEC-CA-0050: a missing / torn lane-B state is rebuilt from the
+            # recent chain before the first weight push (best-effort; the next
+            # settlement's walk retries a deferred rebuild).
+            try:
+                self._lane_b_catch_up_startup()
+            except Exception as e:  # noqa: BLE001
+                log.warning("lane B: startup catch-up failed (%s); retried at the next "
+                            "settlement", e)
+        if self.cfg.lane_c.from_block:
+            try:
+                self._lane_c_catch_up_startup()
+            except Exception as e:  # noqa: BLE001
+                log.warning("lane C: startup catch-up failed (%s); retried at the next "
+                            "settlement", e)
         while True:
             try:
-                # The activation tally runs once per boundary (cheap otherwise)
-                # ahead of the manifests, so a lock-in seen this poll governs
-                # the settlement judged this poll.
-                self._activation_tick(client)
-                # DEC-CA-0048 on the block clock: the successor is crowned the
-                # poll the chain reaches forfeit_from_block, manifest or not.
-                self._forfeit_tick(client)
-                # Live dashboard telemetry first, every poll: between receipts
-                # this is the page's only fresh view of the chain (stage strip
-                # + live submissions). Best-effort; never affects the round.
-                self._publish_chain_status(client, store)
-                raw_latest = read_latest_manifest(store)
-                digest_latest = hashlib.sha256(raw_latest.encode("utf-8")).hexdigest()
-                if digest_latest == last_digest:
-                    log.debug("manifest unchanged (round=%s sha=%s…); skipping",
-                              last_round, digest_latest[:12])
-                else:
-                    # DEC-CA-0043: from era_king_from_block the manifests are
-                    # hash-chained and walked forward from the last handled
-                    # settlement (oldest first); before it, latest.json alone.
-                    for raw, digest in self._pending_manifests(store, raw_latest, last_round):
-                        manifest = load_manifest(raw)
-                        base_seed = int(manifest.round_id)
-                        if manifest.round_id == last_round:
-                            log.warning(
-                                "manifest for already-handled round=%s RE-PUBLISHED "
-                                "with different content (sha %s… -> %s…); re-judging",
-                                manifest.round_id,
-                                (last_digest or "")[:12], digest[:12],
-                            )
-                        log.info(
-                            "new manifest round=%s entries=%d (%s); gating + scoring …",
-                            manifest.round_id, len(manifest.entries),
-                            ",".join(f"{e.role}:uid{e.miner_uid}" for e in manifest.entries),
-                        )
-                        # Gate first so a rejected manifest never moves weights.
-                        retry_pin = False
-                        try:
-                            reason = self.check_manifest(manifest)
-                        except StorageError as e:
-                            # Warm-start provenance (promotion record / bench
-                            # report) could not be READ — a transient, not a
-                            # verdict: same grace as the pool pin below.
-                            reason = self._gate_read_failed(
-                                manifest.round_id, e, gate="warm_start_unverifiable")
-                            retry_pin = reason is None
-                        if reason is None:
-                            # Pool-pin gate: the signed snapshot pin must match this
-                            # validator's own deterministic selection for the round.
-                            try:
-                                reason = self.check_pool_pin(
-                                    manifest, window_source,
-                                    block=self._epoch_start_block(manifest),
-                                )
-                            except StorageError as e:
-                                # The index could not be READ (auth/network/5xx) —
-                                # a transient, not a verdict. Within the grace
-                                # window: no latch, no receipt, retry next poll.
-                                reason = self._gate_read_failed(manifest.round_id, e)
-                                retry_pin = reason is None
-                            else:
-                                self._pin_read_first_failure.pop(str(manifest.round_id), None)
-                        if retry_pin:
-                            # In-grace read failure: neither last_round nor
-                            # last_digest move, so the next manifest poll re-judges
-                            # this round from scratch. Falls through to the weight
-                            # re-assert + sleep below.
-                            break
-                        elif reason is not None:
-                            log.warning("rejecting manifest round=%s: %s", manifest.round_id, reason)
-                            last_round, last_digest = manifest.round_id, digest
-                            self.state = replace(
-                                self.state, last_handled_round_id=str(manifest.round_id),
-                                last_handled_manifest_sha=digest)
-                            self._persist_state()
-                            # A rejected round still gets a public receipt carrying
-                            # the gate's reason — visible, not silently absent.
-                            self._publish_round_receipt(
-                                client, manifest, base_seed,
-                                reject_reason=reason, window_source=window_source,
-                            )
-                        elif not self.king_synced(manifest):
-                            # The trainer trained the OLD king (incentive lags a
-                            # dethrone). Hold the KOTH state and keep voting the champion
-                            # so incentive migrates and the trainer re-syncs — bounded by
-                            # the safety valve (see _resync_step). A public receipt
-                            # records why, not a silent skip.
-                            last_round, last_digest = manifest.round_id, digest
-                            # Fold the marker in BEFORE _resync_step: it derives the
-                            # next state from this one, so the marker rides along
-                            # (demote_to_trained passes it through explicitly).
-                            self.state = replace(
-                                self.state, last_handled_round_id=str(manifest.round_id),
-                                last_handled_manifest_sha=digest)
-                            self._install_era_promotion(manifest)
-                            self.state, reject_reason = self._resync_step(manifest)
-                            self._adopt_era_king(manifest)
-                            self._persist_state()
-                            reward_uids = self._reward_uids(manifest, None, client)
-                            weights_vec = self._apply_weights(client, manifest.round_id, reward_uids)
-                            self._publish_round_receipt(
-                                client, manifest, base_seed,
-                                reject_reason=reject_reason,
-                                window_source=window_source,
-                                reward_uids=tuple(reward_uids), weights=weights_vec,
-                            )
-                        else:
-                            # The epoch block selects the daily snapshot; base_seed
-                            # rotates the window slice within it.
-                            windows = self._verdict_windows(
-                                window_source, base_seed,
-                                block=self._epoch_start_block(manifest),
-                            )
-                            # process_round mutates the sticky KOTH state atomically (it
-                            # raises before any mutation on a transient eval/fetch error,
-                            # leaving state untouched for a clean retry). Mark the round
-                            # consumed as soon as it returns, so a later weight-set failure
-                            # can NEVER re-run it and double-count the streak/tenure.
-                            outcome = self.process_settlement(manifest, windows, base_seed)
-                            # Back in sync — clear any accumulated resync holds so a
-                            # future desync starts the safety-valve count from zero.
-                            if self.state.resync_holds or self.state.last_resync_round_id:
-                                self.state = replace(
-                                    self.state, resync_holds=0, last_resync_round_id=None)
-                            last_round, last_digest = manifest.round_id, digest
-                            self.state = replace(
-                                self.state, last_handled_round_id=str(manifest.round_id),
-                                last_handled_manifest_sha=digest)
-                            self._persist_state()
-                            reward_uids = self._reward_uids(manifest, outcome, client)
-                            weights_vec = self._apply_weights(client, manifest.round_id, reward_uids)
-                            # The public receipt — strictly after weights, so it
-                            # records what was actually set (empty vector = the
-                            # weight extrinsic failed this round).
-                            if outcome is not None:
-                                self._publish_round_receipt(
-                                    client, manifest, base_seed,
-                                    outcome=outcome, windows=windows,
-                                    window_source=window_source,
-                                    reward_uids=tuple(reward_uids), weights=weights_vec,
-                                )
-                            else:
-                                # Gated in but nothing to score (no king/challenger
-                                # pair at any size): a public record still exists.
-                                self._publish_round_receipt(
-                                    client, manifest, base_seed,
-                                    reject_reason="no_king_challenger_pair",
-                                    window_source=window_source,
-                                    reward_uids=tuple(reward_uids), weights=weights_vec,
-                                )
-                            # Log-only public benchmarks for a freshly crowned king.
-                            # Strictly after weights are decided; never affects them.
-                            self._maybe_run_benchmarks(manifest, outcome)
-                            # Cascade step — strictly last, so this round's weights and
-                            # receipt already recorded the outgoing king. Resets the
-                            # reign clock on a dethrone, records the king's checkpoint,
-                            # and fires the promotion when the clock is ripe.
-                            self._cascade_round(manifest, outcome)
-                            # Multi-horizon calibration telemetry — after everything
-                            # consensus-relevant; log-only, inert unless configured.
-                        self._maybe_calibrate_horizons(manifest, base_seed, window_source)
+                self._poll_once(client, store, window_source)
             except Exception as e:  # noqa: BLE001 — a service loop must not die on one round
                 log.exception("round processing failed; retrying after poll: %s", e)
             try:
-                self._maybe_reassert_weights(client)
+                self._reassert_weights_at_head(client)
             except Exception as e:  # noqa: BLE001
                 log.warning("weight re-assert check failed: %s", e)
             time.sleep(poll)
 
-    def _maybe_reassert_weights(self, client: object) -> None:
-        """Re-push the standing weight vector every ``weight_set_interval_blocks``.
+    def _reassert_weights_at_head(self, client: object) -> None:
+        """The freshness re-assert, under the config in force at the head
+        (DEC-CA-0057; exactly ``_maybe_reassert_weights`` while inert)."""
+        from .settlement_transaction import recover
 
-        Subtensor treats a validator whose ``last_update`` is older than the
-        subnet's ``activity_cutoff`` (5000 blocks ≈ 16.7 h on netuid 91) as
-        inactive in Yuma consensus. A mainnet round is 3600 blocks (12 h since
-        2026-07-28; it was 7200, which alone blew the cutoff every round), so a
-        manifest now lands inside the cutoff — but voting only on manifests
-        still goes inactive the moment the trainer stalls, and the margin is
-        one missed round. This re-assert is what keeps that from silencing the
-        validator. The vector needs no
-        manifest: it is recomputed from the persisted champion state (king +
-        registered prior kings; no champion burns to ``burn_uid``), so this is
-        a pure freshness signal that can never move the throne. The interval
-        must stay ≥ the subnet's ``weights_rate_limit`` (100 blocks on netuid
-        91) or the chain silently no-ops the extrinsic; ≤ 0 disables.
-        """
-        interval = int(self.cfg.validator.weight_set_interval_blocks)
-        if interval <= 0:
+        recover(self)
+        if self.netconfig is None or not self.netconfig.enabled:
+            self._maybe_reassert_weights(client)
             return
-        cur = int(client.current_block())  # type: ignore[attr-defined]
-        if self._last_weight_block is not None and cur - self._last_weight_block < interval:
+        with self._settlement_cfg(int(client.current_block())):  # type: ignore[attr-defined]
+            self._maybe_reassert_weights(client)
+
+    def _poll_once(self, client: object, store: object, window_source: object) -> None:
+        """One manifest poll. The loop's position is ``state.last_handled_*``
+        (persisted): a round is HANDLED (scored, rejected or resync-held) once
+        its judgement is persisted together with a ``pre_round`` snapshot and a
+        ``followup_round_id`` marker; its follow-up (weights, receipt,
+        benchmarks, Cascade step) then runs and clears the marker. A follow-up
+        that raises is finished at the top of the next poll BEFORE anything
+        newer is judged (in-process: from the kept closure; after a restart:
+        by re-judging the round from its snapshot — a replacement, never a
+        second application)."""
+        from ..shared.hippius import read_latest_manifest
+        from .settlement_transaction import recover
+
+        recover(self)
+
+        # The activation tally runs once per boundary (cheap otherwise) ahead
+        # of the manifests, so a lock-in seen this poll governs the settlement
+        # judged this poll.
+        self._activation_tick(client)
+        from ..shared.calendar_launch import resolve_calendar_launch
+
+        base = self._base_cfg()
+        resolved = resolve_calendar_launch(base, client)
+        if resolved is not base:
+            if self._cfg_base is None:
+                self.cfg = resolved
+            else:
+                self._cfg_base = resolved
+        # Live dashboard telemetry first, every poll: between receipts this is
+        # the page's only fresh view of the chain (stage strip + live
+        # submissions). Best-effort; never affects the round.
+        self._publish_chain_status(client, store)
+        self._resume_followup()
+        force = self._reject_config_changed()
+        raw_latest = read_latest_manifest(store)
+        digest_latest = hashlib.sha256(raw_latest.encode("utf-8")).hexdigest()
+        if digest_latest == self.state.last_handled_manifest_sha and not force:
+            log.debug("manifest unchanged (round=%s sha=%s…); skipping",
+                      self.state.last_handled_round_id, digest_latest[:12])
+            caught_up = True
+        else:
+            caught_up = self._handle_pending(client, store, window_source, raw_latest)
+        if caught_up:
+            # DEC-CA-0048 on the block clock: the successor is crowned the poll
+            # the chain reaches forfeit_from_block, manifest or not — but only
+            # once every missed settlement has been walked: a settlement whose
+            # boundary precedes the gate must be judged under the pre-gate
+            # throne (each settlement applies forfeiture by ITS block in
+            # process_round), not one this tick forfeited at the head block.
+            self._forfeit_tick(client)
+
+    def _handle_pending(self, client: object, store: object, window_source: object,
+                        raw_latest: str) -> bool:
+        """Walk and handle the pending manifests (oldest first). Returns True
+        when the walk reached the latest manifest (caught up), False when it
+        stopped early (a hold, a skip, or an incomplete chain walk)."""
+        # DEC-CA-0043: from era_king_from_block the manifests are hash-chained
+        # and walked forward from the last handled settlement (oldest first);
+        # before it, latest.json alone.
+        pending = self._pending_manifests(store, raw_latest, self.state.last_handled_round_id)
+        if not pending:
+            return False
+        for i, (raw, digest) in enumerate(pending):
+            # DEC-CA-0063: the later manifests carry the trainer's record of
+            # this settlement's validator bench report
+            self._vbench_later_raw = [r for r, _ in pending[i + 1:]]
+            if not self._handle_manifest(client, window_source, load_manifest(raw), digest):
+                return False
+        return True
+
+    def _skip_unrecorded(self, digest: str, msg: str, *args: object) -> None:
+        """Log a skipped-without-recording manifest once per digest."""
+        if digest in self._skipped_digests:
+            log.debug("skipping manifest sha=%s… again (" + msg + ")", digest[:12], *args)
             return
-        uids: list[int] = []
-        if self.state.king_hotkey is not None:
-            uid = client.uid_for_hotkey(self.state.king_hotkey)  # type: ignore[attr-defined]
-            if uid is not None:
-                uids.append(uid)
-        for hk in self.state.former_kings:
-            uid = client.uid_for_hotkey(hk)  # type: ignore[attr-defined]
-            if uid is not None and uid not in uids:
-                uids.append(uid)
-        log.info("re-asserting weights (last set %s, block %d): reward_uids=%s",
-                 "never" if self._last_weight_block is None else
-                 f"{cur - self._last_weight_block} blocks ago", cur,
-                 uids or [self.cfg.scoring.burn_uid])
-        self._apply_weights(client, "weight-reassert", uids)
-        # Stamp even when the extrinsic failed: the next attempt comes after
-        # one interval (~27 more before the cutoff), not every poll tick.
-        self._last_weight_block = cur
+        self._skipped_digests.add(digest)
+        log.warning("skipping manifest sha=%s… WITHOUT recording it: " + msg,
+                    digest[:12], *args)
 
-    @staticmethod
-    def _manifest_king_hotkey(manifest: TrainingManifest) -> str | None:
-        e = manifest.entry_for_role("king")
-        return e.miner_hotkey if e is not None else None
+    def _handle_manifest(self, client: object, window_source: object,
+                         manifest: TrainingManifest, digest: str) -> bool:
+        """Gate, judge and follow up ONE manifest under the config in force at
+        its block (DEC-CA-0057 ``cfg_at``; the base config when no overlay is
+        adopted). Returns False when it was held or skipped without being
+        recorded (the walk stops; the next poll retries), True when it was
+        handled."""
+        # The overlay in force at created_block is the one in force at the
+        # settlement's boundary: an overlay applies at an era start, a
+        # boundary on both grids, so the two never straddle it.
+        with self._settlement_cfg(int(manifest.created_block)):
+            from .settlement_transaction import begin, recover
 
-    @staticmethod
-    def _manifest_king_uid(manifest: TrainingManifest) -> int | None:
-        e = manifest.entry_for_role("king")
-        return e.miner_uid if e is not None else None
+            recover(self)
+            begin(self)
+            try:
+                handled = self._handle_manifest_inner(client, window_source, manifest, digest)
+            except BaseException:
+                # A process kill leaves the same undo journal for startup.
+                # If already committed, recovery preserves the pending follow-up.
+                recover(self)
+                raise
+            recover(self)  # held/skipped: undo preparation; committed: no-op
+            return handled
 
-    def king_synced(self, manifest: TrainingManifest) -> bool:
-        """Whether the round's *trained* king matches the validator's champion.
+    def _handle_manifest_inner(self, client: object, window_source: object,
+                               manifest: TrainingManifest, digest: str) -> bool:
+        from ..shared.chain import ChainError
+        from ..shared.hippius import StorageError
 
-        The trainer picks the king it trains from on-chain incentive, which lags
-        the validator's dethrone verdicts. Until the champion
-        the validator crowned actually becomes the highest-incentive UID — and so
-        the king the trainer trains — the two disagree, and a round trained
-        against the *old* king must not have its verdict applied to the *new*
-        champion. Synced when the champion is unset (bootstrap) or the trained
-        king is the champion.
-        """
-        if self.state.king_hotkey is None:
-            return True
-        return self._manifest_king_hotkey(manifest) == self.state.king_hotkey
-
-    def _resync_step(self, manifest: TrainingManifest) -> tuple[ChampionState, str]:
-        """Next champion state + receipt reason for a king-resync round.
-
-        Called when the trained king != champion (``king_synced`` is False). By
-        default it holds the throne, bumping the consecutive-hold counter, and the
-        caller keeps voting the champion so incentive migrates and the trainer
-        re-syncs. SAFETY VALVE: once the champion has stayed un-synced for
-        ``scoring.king_resync_max_rounds`` consecutive rounds it can never be the
-        king the trainer trains (e.g. it has no usable commitment), so holding
-        forever would wedge the subnet — the valve abandons it and adopts the
-        trainer's trained king (:func:`state.demote_to_trained`), and normal
-        scoring resumes next round. ``king_resync_max_rounds <= 0`` disables the
-        valve (hold indefinitely). The counter advances once per DISTINCT
-        un-synced round: a restart re-gates the same stale manifest, and
-        counting those re-gates let five restarts during a pause trip the
-        valve and demote a healthy champion (2026-07-22). Pure: returns the
-        new state; the caller persists, votes, and publishes.
-        """
-        champ = self.state.king_hotkey
-        trained = self._manifest_king_hotkey(manifest)
-        round_id = str(manifest.round_id)
-        same_round = self.state.last_resync_round_id == round_id
-        holds = self.state.resync_holds if same_round else self.state.resync_holds + 1
-        cap = effective_resync_cap_rounds(self.cfg.round, self.cfg.scoring,
-                                          self._epoch_start_block(manifest))
-        from ..shared.era import forfeited_hotkeys
-        if trained is not None and trained in forfeited_hotkeys(
-                self.cfg.scoring, self._epoch_start_block(manifest)):
-            # DEC-CA-0048: the trainer still names a FORFEITED king. The valve
-            # must not crown it back — hold (and keep voting the successor)
-            # until the trainer follows the successor rule.
-            log.warning("round=%s trainer king %s is FORFEITED; the resync valve will not "
-                        "adopt it — holding for the successor (%d/%s)",
-                        manifest.round_id, (trained or "?")[:12], holds, cap)
-            trained = None
-        if 0 < cap <= holds and trained is not None:
-            log.warning(
-                "round=%s king_resync SAFETY VALVE: champion %s un-synced %d rounds "
-                "(cap=%d) — demoting to trained king %s, resuming normal scoring next round",
-                manifest.round_id, (champ or "?")[:12], holds, cap, (trained or "?")[:12],
-            )
-            return (
-                state_mod.demote_to_trained(
-                    self.state, trained_hotkey=trained,
-                    trained_uid=self._manifest_king_uid(manifest),
-                    trained_block=self._epoch_start_block(manifest),
-                    trained_pointer=str(getattr(
-                        manifest.entry_for_role("king"), "trained_pointer", "") or ""),
-                ),
-                f"king_resync_demoted: champion {champ} un-synced {holds} rounds "
-                f"(cap={cap}); adopted trained king {trained}",
-            )
-        log.warning(
-            "round=%s trainer king %s != champion %s; voting champion to re-sync "
-            "incentive, KOTH state held (%d/%s)",
-            manifest.round_id, (trained or "?")[:12], (champ or "?")[:12],
-            holds, cap if cap > 0 else "∞",
+        rid = str(manifest.round_id)
+        base_seed = int(manifest.round_id)
+        # Never move the handled position backwards: an older signed manifest
+        # re-published as latest is skipped, never recorded.
+        lhb = self.state.last_handled_block
+        if lhb is not None and int(manifest.created_block) < int(lhb):
+            self._skip_unrecorded(
+                digest, "round=%s created_block %d is older than the handled position "
+                "(round=%s, block %d)", rid, int(manifest.created_block),
+                self.state.last_handled_round_id, int(lhb))
+            return False
+        # Re-judging the last handled round (re-publish, changed config, or an
+        # unfinished follow-up): start from the state BEFORE it was applied, so
+        # the new judgement replaces the old one instead of stacking on it.
+        rollback = None
+        if rid == self.state.last_handled_round_id:
+            log.warning("manifest for already-handled round=%s re-judged (sha %s… -> %s…)",
+                        rid, (self.state.last_handled_manifest_sha or "")[:12], digest[:12])
+            rollback = self._rollback_point()
+            if not self._restore_pre_round(rid):
+                log.warning("round=%s has no pre-round snapshot (state from an older "
+                            "release); the re-judgement applies on top of it", rid)
+        log.info(
+            "new manifest round=%s entries=%d (%s); gating + scoring …",
+            manifest.round_id, len(manifest.entries),
+            ",".join(f"{e.role}:uid{e.miner_uid}" for e in manifest.entries),
         )
-        return (
-            replace(self.state, resync_holds=holds, last_resync_round_id=round_id),
-            f"king_resyncing: champion {champ} != trained king {trained}",
-        )
+        pre = self._snapshot(rid)
+        # DEC-CA-0058: the settlement state BEFORE this settlement (its digest
+        # is stamped on the receipt for satellite continuity)
+        self._capture_settlement_prior(rid)
+        self._settlement_ladder = None
+        self._settlement_king_check = None
 
-    def _king_uid_to_vote(self, manifest: TrainingManifest, *, client: object | None = None) -> int | None:
-        """The UID to put the king's weight on this round.
+        def _not_recorded() -> bool:
+            if rollback is not None:
+                self._apply_rollback(rollback)
+            return False
 
-        The **validator's champion state** is the authority on who holds the
-        throne, so vote *that* king every round — not the (lagging) king the
-        trainer happened to train. This is what makes a dethrone STICK: the new
-        champion keeps the weight, incentive migrates to it, and next round the
-        trainer trains it as king (they re-sync). Voting the trained/manifest
-        king instead — the old behaviour — reverted a dethrone the moment the
-        trainer lagged one round, orphaning the champion. The champion hotkey is
-        resolved to its current UID via the metagraph (robust to re-registration);
-        the manifest king is used only to bootstrap when there is no champion yet.
-        """
-        if self.state.king_hotkey is not None:
-            if client is not None:
-                resolved = client.uid_for_hotkey(self.state.king_hotkey)  # type: ignore[attr-defined]
-                if resolved is not None:
-                    return resolved
-            return self.state.king_uid
-        king_entry = manifest.entry_for_role("king")
-        return king_entry.miner_uid if king_entry is not None else None
-
-    def _apply_forfeiture(self, manifest: TrainingManifest) -> None:
-        """DEC-CA-0048: at a settlement whose boundary has reached
-        ``[scoring] forfeit_from_block``, strip the listed hotkeys from the
-        throne and the court BEFORE judging. The manifest's king entry (still the
-        forfeited hotkey until the trainer follows the receipts) then reads as a
-        stale-king manifest and takes the resync path — no duel is judged against
-        a forfeited king's checkpoint. Idempotent: nothing changes once applied."""
-        from ..shared.era import forfeit_successor, forfeited_hotkeys
-
-        block = self._epoch_start_block(manifest)
-        forfeited = forfeited_hotkeys(self.cfg.scoring, block)
-        if not forfeited:
-            return
-        t = state_mod.apply_forfeit(self.state, forfeited=forfeited,
-                                    keep_former_kings=self.cfg.scoring.reward_prior_kings,
-                                    successor=forfeit_successor(self.cfg.scoring, block) or None,
-                                    crowned_block=block)
-        if t is None:
-            return
-        log.warning("round=%s FORFEITURE at block %s: %s — king now %s, court %s",
-                    manifest.round_id, block, t.note,
-                    (t.state.king_hotkey or "vacant")[:12],
-                    [hk[:12] for hk in t.state.former_kings])
-        self.state = t.state
+        # Gate first so a rejected manifest never moves weights. A gate whose
+        # evidence cannot be READ holds the round (no latch, no receipt) —
+        # see ManifestGateMixin._hold_read_failure. Each gate has its own key.
         try:
+            reason = self.check_manifest(manifest)
+        except StorageError as e:
+            # Warm-start / era-init provenance (promotion record / bench report).
+            self._hold_read_failure(f"{rid}|warm_start", e, gate="warm_start_unverifiable")
+            return _not_recorded()
+        except (ChainError, OSError) as e:
+            # The era ref binding's commitment history (chain RPC) — a
+            # transient, not a verdict.
+            self._hold_read_failure(f"{rid}|era_refs", e, gate="era_ref_unverifiable")
+            return _not_recorded()
+        self._clear_read_hold(f"{rid}|warm_start")
+        self._clear_read_hold(f"{rid}|era_refs")
+        if reason == "signature_invalid":
+            # Not the trainer's manifest: nothing about it may move the
+            # handled position (it is not even evidence a round exists).
+            self._skip_unrecorded(digest, "round=%s signature does not verify against the "
+                                  "pinned trainer hotkey", rid)
+            return _not_recorded()
+        if reason is None:
+            # Pool-pin gate: the signed snapshot pin must match this
+            # validator's own deterministic selection for the round.
+            try:
+                reason = self.check_pool_pin(
+                    manifest, window_source, block=self._epoch_start_block(manifest))
+            except StorageError as e:
+                self._hold_read_failure(f"{rid}|pool_pin", e, gate="pool_pin_unverifiable")
+                return _not_recorded()
+            self._clear_read_hold(f"{rid}|pool_pin")
+        # Lane B (DEC-CA-0050): READ and JUDGE this settlement's bound expert
+        # manifest (plus any unfolded predecessors) BEFORE lane A mutates
+        # anything, so a transient read retries the whole settlement cleanly.
+        lane_b_rounds = None
+        if reason is None:
+            self._lane_b_block = self._epoch_start_block(manifest)
+            lb_key = f"{rid}|lane_b"
+            try:
+                lane_b_rounds = self._lane_b_prepare(manifest)
+                self._pin_read_first_failure.pop(lb_key, None)
+            except LaneBTransient as e:
+                if self._gate_read_failed(lb_key, e, gate="lane_b_unverifiable") is None:
+                    return _not_recorded()
+                # Past the grace: lane A proceeds; this round's lane-B part
+                # stays UNFOLDED, so the next settlement's catch-up walk
+                # re-judges it.
+                lane_b_rounds = [_LaneBRound(
+                    rid, self._lane_b_block, [{"error": f"lane_b_unverifiable: {e}"}], [],
+                    apply=False)]
+        # Lane C (DEC-CA-0056): same — READ and JUDGED before lane A mutates
+        # anything. A read failure HOLDS the settlement (no latch, no receipt)
+        # until it reads: a missing lane-C verdict would move the vector.
+        lane_c_rounds = None
+        if reason is None:
+            self._lane_c_block = self._epoch_start_block(manifest)
+            lc_key = f"{rid}|lane_c"
+            try:
+                lane_c_rounds = self._lane_c_prepare(manifest)
+            except LaneCTransient as e:
+                self._hold_read_failure(lc_key, e, gate="lane_c_unverifiable")
+                return _not_recorded()
+            self._clear_read_hold(lc_key)
+
+        if reason is not None:
+            log.warning("rejecting manifest round=%s: %s", rid, reason)
+            self._mark_handled(manifest, digest, pre, rejected=True)
             self._persist_state()
-        except Exception as e:  # noqa: BLE001 — the round path persists again
-            log.warning("forfeiture: state persist deferred (%s)", e)
+            from .settlement_transaction import commit
 
-    def _reward_uids(
-        self, manifest: TrainingManifest, outcome: RoundOutcome | None, client: object
-    ) -> list[int]:
-        """UIDs that share this round's weight: the current king plus any
-        ``former_kings`` still registered (teutonic-style equal-share payout).
+            commit(self)
 
-        Returns an empty list when there is no king to vote for at all (no
-        champion and no manifest king); the loop hands that to
-        ``set_equal_share_weights``, which burns to ``burn_uid`` rather than
-        reverting. The list is otherwise deduped/range-checked there too.
+            def _followup() -> None:
+                # A rejected round still gets a public receipt carrying the
+                # gate's reason — visible, not silently absent.
+                self._publish_round_receipt(
+                    client, manifest, base_seed,
+                    reject_reason=reason, window_source=window_source)
+        elif not self.king_synced(manifest):
+            # The trainer trained the OLD king (incentive lags a dethrone).
+            # Hold the KOTH state and keep voting the champion so incentive
+            # migrates and the trainer re-syncs — bounded by the safety valve
+            # (see _resync_step). A public receipt records why, not a silent
+            # skip. The marker is folded in BEFORE _resync_step: it derives
+            # the next state from this one, so the marker rides along
+            # (demote_to_trained passes the loop fields through explicitly).
+            self._mark_handled(manifest, digest, pre)
+            self._install_era_promotion(manifest)
+            self.state, reject_reason = self._resync_step(manifest)
+            self._adopt_era_king(manifest)
+            # Lane B folds on EVERY gated-in path, before the handled marker
+            # is persisted (idempotent per round).
+            lane_b_rows = self._lane_b_commit(lane_b_rounds)
+            lane_c_rows = self._lane_c_commit(lane_c_rounds)
+            self._persist_state()
+            from .settlement_transaction import commit
 
-        ``[validator] force_burn`` empties the list HERE — not just at the
-        weight push — so the published receipt's ``reward_uids`` agree with the
-        burn vector actually set (``cascade-audit`` recomputes one from the
-        other and fails on a mismatch).
-        """
-        if self.cfg.validator.force_burn:
-            return []
-        from ..shared.era import forfeited_hotkeys
+            commit(self)
+
+            def _followup() -> None:
+                reward_uids = self._reward_uids(manifest, None, client)
+                weights_vec = self._apply_weights(
+                    client, manifest.round_id, reward_uids,
+                    boundary=self._epoch_start_block(manifest))
+                self._publish_round_receipt(
+                    client, manifest, base_seed,
+                    reject_reason=reject_reason, window_source=window_source,
+                    reward_uids=tuple(reward_uids), weights=weights_vec,
+                    **self._lane_b_receipt_kw(lane_b_rows),
+                    **self._lane_c_receipt_kw(lane_c_rows),
+                )
+        else:
+            # The epoch block selects the daily snapshot; base_seed rotates
+            # the window slice within it.
+            windows = self._verdict_windows(
+                window_source, base_seed, block=self._epoch_start_block(manifest))
+            # process_round mutates the sticky KOTH state atomically (it raises
+            # before any mutation on a transient eval/fetch error, leaving
+            # state untouched for a clean retry). The round is marked handled
+            # as soon as it returns, so a later weight-set failure can NEVER
+            # re-run it and double-count the streak/tenure.
+            pre_king = self.state.king_hotkey
+            # DEC-CA-0063: a settlement whose lane-A bench rows come from the
+            # main validator — every other validator HOLDS until the main
+            # validator's signed report is published (never a verdict).
+            vb_key = f"{rid}|validator_bench"
+            try:
+                self._vbench_begin(manifest)
+            except StorageError as e:
+                self._hold_read_failure(vb_key, e, gate="validator_bench_unpublished")
+                return _not_recorded()
+            vb_point = self._rollback_point()
+            try:
+                outcome = self.process_settlement(manifest, windows, base_seed)
+                none_reason = self._round_none_reason
+                # DEC-CA-0055 (v2 + [v2] king_ladder): the king check when due,
+                # the ladder step, the court and the key slash — folded in
+                # BEFORE the handled marker persists, so a re-judgement
+                # replaces them.
+                self._v2_settlement_economics(manifest, windows, base_seed, outcome, pre_king)
+            except ValidatorBenchHold as e:
+                # DEC-CA-0063: a clearer reached the gate (or the king check
+                # ran) and the trainer has not recorded the report yet — every
+                # validator holds alike; nothing of the judgement stays.
+                self._apply_rollback(vb_point)
+                self._hold_read_failure(vb_key, e, gate="validator_bench_unrecorded")
+                return _not_recorded()
+            # DEC-CA-0063: the main validator publishes its report (every sweep
+            # this settlement ran, possibly none) BEFORE the settlement is
+            # handled; a failed publish undoes the judgement and holds.
+            try:
+                self._vbench_publish(manifest)
+            except StorageError as e:
+                self._apply_rollback(vb_point)
+                self._hold_read_failure(vb_key, e, gate="validator_bench_publish")
+                return _not_recorded()
+            if self._vbench_awaiting_record(manifest):
+                # The main validator's sweep pass that needed its report: it is
+                # published; now hold with every other validator until the
+                # trainer records it, and re-judge from those exact bytes.
+                self._apply_rollback(vb_point)
+                self._hold_read_failure(vb_key, ValidatorBenchHold(
+                    f"validator_bench_unrecorded: round={rid} (published; awaiting the "
+                    "trainer's record)"), gate="validator_bench_unrecorded")
+                return _not_recorded()
+            self._clear_read_hold(vb_key)
+            # Back in sync — clear any accumulated resync holds so a future
+            # desync starts the safety-valve count from zero.
+            if self.state.resync_holds or self.state.last_resync_round_id:
+                self.state = replace(self.state, resync_holds=0, last_resync_round_id=None)
+            self._mark_handled(manifest, digest, pre)
+            # Lane B (DEC-CA-0050): fold this settlement's judged expert
+            # manifest BEFORE the handled marker persists and before weights,
+            # so a new domain win is paid from the settlement that merged it.
+            lane_b_rows = self._lane_b_commit(lane_b_rounds)
+            lane_c_rows = self._lane_c_commit(lane_c_rounds)
+            self._persist_state()
+            from .settlement_transaction import commit
+
+            commit(self)
+
+            def _followup() -> None:
+                reward_uids = self._reward_uids(manifest, outcome, client)
+                weights_vec = self._apply_weights(
+                    client, manifest.round_id, reward_uids,
+                    boundary=self._epoch_start_block(manifest))
+                # The public receipt — strictly after weights, so it records
+                # what was actually set (empty vector = the weight extrinsic
+                # failed this round).
+                if outcome is not None:
+                    self._publish_round_receipt(
+                        client, manifest, base_seed,
+                        outcome=outcome, windows=windows, window_source=window_source,
+                        reward_uids=tuple(reward_uids), weights=weights_vec,
+                        **self._lane_b_receipt_kw(lane_b_rows),
+                        **self._lane_c_receipt_kw(lane_c_rows),
+                    )
+                else:
+                    # Gated in but nothing to score (no king/challenger pair at
+                    # any size, or every challenger entry-faulted): a public
+                    # record still exists.
+                    self._publish_round_receipt(
+                        client, manifest, base_seed,
+                        reject_reason=none_reason or "no_king_challenger_pair",
+                        window_source=window_source,
+                        reward_uids=tuple(reward_uids), weights=weights_vec,
+                        **self._lane_b_receipt_kw(lane_b_rows),
+                        **self._lane_c_receipt_kw(lane_c_rows),
+                    )
+                # Log-only public benchmarks for a freshly crowned king.
+                # Strictly after weights are decided; never affects them.
+                self._maybe_run_benchmarks(manifest, outcome)
+                # Cascade step — strictly last, so this round's weights and
+                # receipt already recorded the outgoing king. Resets the reign
+                # clock on a dethrone, records the king's checkpoint, and fires
+                # the promotion when the clock is ripe.
+                self._cascade_round(manifest, outcome)
+        self._run_followup(rid, digest, _followup)
+        # Multi-horizon calibration telemetry — after everything
+        # consensus-relevant; log-only, inert unless configured.
+        self._maybe_calibrate_horizons(manifest, base_seed, window_source)
+        return True
+
+    # ── handled position, pre-round snapshot and follow-up ───────────────────
+
+    def _config_identity(self) -> str:
+        """Identity of the config (and release) a verdict is reached under:
+        the parsed ``chain.toml``, the effective ``[scoring]`` (on-chain
+        activations rewrite it in memory) and the package version. A latched
+        reject is re-judged once this changes."""
+        from .. import __version__
+
+        cfg = self._base_cfg()
+        parts = [
+            json.dumps(getattr(cfg, "raw", {}) or {}, sort_keys=True, default=str),
+            repr(getattr(cfg, "scoring", None)),
+            str(__version__),
+        ]
+        # DEC-CA-0057: the adopted overlays are part of the rules (appended
+        # only when there are any, so the identity is unchanged without).
+        if self.netconfig is not None and self.netconfig.enabled:
+            hist = self.netconfig.history_identity()
+            if hist:
+                parts.append(hist)
+        body = "\n".join(parts)
+        return hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
+
+    def _reject_config_changed(self) -> bool:
+        """True when the last handled round is a reject latched under a
+        different config identity: it is re-judged this poll (rejects only —
+        an accepted judgement is never re-opened by a config change)."""
+        cid = self.state.reject_config_id
+        if not cid:
+            return False
+        now = self._config_identity()
+        if cid == now:
+            return False
+        log.warning("round=%s was REJECTED under config %s; config is now %s — "
+                    "re-judging it", self.state.last_handled_round_id, cid, now)
+        return True
+
+    def _snapshot(self, round_id: str) -> dict:
+        """The ``pre_round`` record for ``round_id``: this state (without its
+        own snapshot / follow-up marker) and the Cascade state, as they are
+        before the round is applied."""
+        st = replace(self.state, pre_round=None, followup_round_id=None)
+        casc = None
+        if self.cascade is not None:
+            from . import cascade as cascade_mod
+
+            casc = cascade_mod.dumps(self.cascade.state)
+        snap = {"round_id": str(round_id), "state": json.loads(state_mod.dumps(st)),
+                "cascade": casc}
+        lane_b = self._lane_b_snapshot()
+        if lane_b is not None:
+            snap["lane_b"] = lane_b
+        lane_c = self._lane_c_snapshot()
+        if lane_c is not None:
+            # DEC-CA-0056: the lane-C fold rides the snapshot (only once lane C
+            # is configured, so earlier snapshots keep their exact shape)
+            snap["lane_c"] = lane_c
+        return snap
+
+    def _rollback_point(self) -> tuple:
+        return (self.state, self.cascade.state if self.cascade is not None else None,
+                self._lane_c_snapshot(), self._lane_b_snapshot())
+
+    def _apply_rollback(self, point: tuple) -> None:
+        """Undo an in-memory pre-round restore (the re-judgement did not
+        happen: skipped or held)."""
+        self.state = point[0]
+        if self.cascade is not None and point[1] is not None:
+            self.cascade.state = point[1]
+        if len(point) > 2 and point[2] is not None:
+            self._lane_c_restore(point[2])
+        if len(point) > 3 and point[3] is not None:
+            self._lane_b_restore(point[3])
+
+    def _restore_pre_round(self, round_id: str) -> bool:
+        """Swap in the state (and Cascade state) from before ``round_id`` was
+        applied, in memory only (persisted when the round is handled again).
+        False when no snapshot for that round exists."""
+        pre = self.state.pre_round
+        if not pre or str(pre.get("round_id")) != str(round_id):
+            return False
+        self.state = state_mod.loads(json.dumps(pre["state"]))
+        if self.cascade is not None and pre.get("cascade") is not None:
+            from . import cascade as cascade_mod
+
+            self.cascade.state = cascade_mod.loads(pre["cascade"])
+        if pre.get("lane_c") is not None:
+            self._lane_c_restore(pre["lane_c"])
+        if pre.get("lane_b") is not None:
+            self._lane_b_restore(pre["lane_b"])
+        self._followup = None
+        return True
+
+    def _mark_handled(self, manifest: TrainingManifest, digest: str, pre: dict,
+                      *, rejected: bool = False) -> None:
+        """Record ``manifest`` as the handled position, with its pre-round
+        snapshot and a pending follow-up (persisted by the caller)."""
+        self.state = replace(
+            self.state,
+            last_handled_round_id=str(manifest.round_id),
+            last_handled_manifest_sha=digest,
+            last_handled_block=int(manifest.created_block),
+            reject_config_id=(self._config_identity() if rejected else ""),
+            pre_round=pre,
+            followup_round_id=str(manifest.round_id),
+        )
+        if self.cascade is not None and pre.get("cascade") is not None:
+            # The Cascade state may have been restored in memory to this
+            # round's snapshot: persist it with the handled marker.
+            self.cascade._persist()
+
+    def _run_followup(self, round_id: str, digest: str, fn: Callable[[], None]) -> None:
+        """Run a handled round's follow-up; clear the marker once it completes.
+        A raise propagates (the poll stops) and the closure is kept, so the
+        next poll finishes it before judging anything newer."""
+        blk = self._settlement_block
+        if blk is not None:
+            # DEC-CA-0057: a follow-up finished on a later poll runs under the
+            # same overlay view as the settlement that queued it.
+            inner = fn
+
+            def fn() -> None:
+                with self._settlement_cfg(blk):
+                    inner()
+        self._followup = (str(round_id), digest, fn)
+        fn()
+        self._followup = None
+        self.state = replace(self.state, followup_round_id=None)
+        self._persist_state()
+
+    def _resume_followup(self) -> None:
+        """Finish the handled round's follow-up left by a failed poll. With
+        the closure gone (restart), re-judge the round from its pre-round
+        snapshot — the judgement is deterministic, so the replacement equals
+        the original, and its follow-up then runs normally."""
+        rid = self.state.followup_round_id
+        if rid is None:
+            return
+        fu = self._followup
+        if fu is not None and fu[0] == rid and fu[1] == self.state.last_handled_manifest_sha:
+            log.warning("round=%s: finishing its follow-up (weights / receipt / Cascade "
+                        "step) before anything newer", rid)
+            self._run_followup(fu[0], fu[1], fu[2])
+            return
+        if self._restore_pre_round(rid):
+            log.warning("round=%s: follow-up did not complete before the restart; "
+                        "re-judging it from its pre-round snapshot", rid)
+            return
+        log.error("round=%s: follow-up pending but no snapshot to re-judge from; "
+                  "dropping the marker (its receipt / Cascade step may be missing)", rid)
+        self.state = replace(self.state, followup_round_id=None)
+        self._persist_state()
+
+    def _persist_state(self) -> None:
+        """Atomic write (tmp + fsync + rename) keeping the previous good file
+        as ``.bak`` — a crash never leaves a torn state file."""
+        from ..shared.atomic import write_text_atomic
 
         try:
-            forfeited = forfeited_hotkeys(self.cfg.scoring, self._epoch_start_block(manifest))
-        except Exception:  # noqa: BLE001 — no block context ⇒ the gate is simply not reached
-            forfeited = frozenset()
-        uids: list[int] = []
-        if not (self.state.king_hotkey and self.state.king_hotkey in forfeited):
-            king_uid = self._king_uid_to_vote(manifest, client=client)
-            if king_uid is not None:
-                uids.append(king_uid)
-        for hk in self.state.former_kings:
-            if hk in forfeited:
-                continue
-            uid = client.uid_for_hotkey(hk)  # type: ignore[attr-defined]
-            if uid is not None:
-                uids.append(uid)
-        return uids
-
-    def _apply_weights(self, client: object, round_id: str, reward_uids: list[int]) -> tuple[float, ...]:
-        """Set the equal-share weight vector on chain; return it (empty on failure).
-
-        Shared by the scored path and the king-resync path. Always sets weights —
-        an empty ``reward_uids`` burns to ``burn_uid`` so emission still leaves the
-        network. A failed extrinsic is logged and retried next round (the empty
-        vector is recorded truthfully in the receipt).
-
-        ``[validator] force_burn`` overrides the vector to a burn HERE — the
-        single choke point every push flows through (scored, resync, re-assert) —
-        so the receipt records the burn that was actually set. Champion state is
-        never touched by this override."""
-        from ..shared.chain import decayed_share_vector
-
-        if self.cfg.validator.force_burn:
-            log.warning(
-                "FORCE-BURN active (round=%s): %sburning to uid %d (champion state "
-                "untouched — unset [validator] force_burn and restart to resume voting)",
-                round_id,
-                f"dropping reward_uids={reward_uids}; " if reward_uids else "",
-                self.cfg.scoring.burn_uid,
-            )
-            reward_uids = []
-
-        decay = self.cfg.scoring.king_decay
-        try:
-            n_uids = client.n_uids()  # type: ignore[attr-defined]
-            client.set_equal_share_weights(  # type: ignore[attr-defined]
-                reward_uids, n_uids, decay=decay, burn_uid=self.cfg.scoring.burn_uid,
-            )
-            vec = tuple(decayed_share_vector(
-                reward_uids, n_uids, decay=decay, burn_uid=self.cfg.scoring.burn_uid))
-            log.info("round=%s weights set: reward_uids=%s (n_uids=%d, burn_uid=%d)",
-                     round_id, reward_uids or [self.cfg.scoring.burn_uid], n_uids,
-                     self.cfg.scoring.burn_uid)
-            # Reset the re-assert timer (fake test clients lack current_block).
-            with contextlib.suppress(Exception):
-                self._last_weight_block = int(client.current_block())  # type: ignore[attr-defined]
-            return vec
-        except Exception as e:  # noqa: BLE001 — retried next round
-            log.warning("weight set failed for round=%s (king holds, retried next round): %s",
-                        round_id, e)
-            return ()
-
-    def _persist_state(self) -> None:  # pragma: no cover
-        from . import state as state_mod
-
-        try:
-            Path(self.cfg.validator.state_db_path).write_text(
-                state_mod.dumps(self.state), encoding="utf-8"
-            )
+            write_text_atomic(self.cfg.validator.state_db_path,
+                              state_mod.dumps(self.state), backup=True)
         except Exception as e:  # noqa: BLE001
             log.warning("failed to persist validator state: %s", e)
+            raise
 
-    def _probe_own_receipt_round(self, client: object, store: object) -> str | None:
-        """Round id of this validator's own latest published receipt, or None.
 
-        Boot fallback for state files that predate ``last_handled_round_id``:
-        without it, the first restart after the upgrade would still re-judge
-        the already-published round once. Only a receipt whose signature
-        verifies against this validator's OWN hotkey seeds the marker — the
-        receipt prefix is public-read, so an unverified object must never be
-        able to make a validator skip a round. Any fault returns None (the
-        stock re-judge behaviour); storage must never block startup.
-        """
-        from ..shared.hippius import receipt_latest_key
-        from ..shared.receipt import load_receipt, verify_receipt_signature
-
-        try:
-            wallet = getattr(client, "wallet", lambda: None)()
-            hotkey = str(getattr(getattr(wallet, "hotkey", None), "ss58_address", "") or "")
-            if not hotkey:
-                return None
-            receipt = load_receipt(store.get_text(receipt_latest_key(hotkey)))
-            if not verify_receipt_signature(receipt, hotkey):
-                log.warning("re-entry probe: own latest receipt fails signature "
-                            "verification; ignoring it")
-                return None
-            return str(receipt.round_id)
-        except Exception as e:  # noqa: BLE001
-            log.debug("re-entry probe: no usable own receipt (%s)", e)
-            return None
+class ValidatorStateUnreadable(RuntimeError):
+    """``state_db_path`` exists but neither it nor its ``.bak`` parses.
+    Raised instead of starting fresh: a fresh state resets the king's tenure,
+    streaks, court and the handled position — the validator would re-judge
+    already-settled rounds and vote a different throne than its peers."""
 
 
 def _load_state(path: str) -> ChampionState:
-    """Load persisted champion state from ``state_db_path`` (JSON), or a fresh
-    state if the file is absent/unreadable."""
-    p = Path(path)
-    if not p.is_file():
+    """Load persisted champion state from ``state_db_path`` (JSON), falling
+    back to ``<path>.bak`` when the main file is torn. Absent (both) ⇒ a fresh
+    state; present but unparseable (both) ⇒ :class:`ValidatorStateUnreadable`
+    — never a silent fresh start."""
+    from ..shared.atomic import read_text_with_backup
+
+    state, src = read_text_with_backup(path, state_mod.loads)
+    if src == "absent":
         return ChampionState()
-    try:
-        return state_mod.loads(p.read_text(encoding="utf-8"))
-    except Exception as e:  # noqa: BLE001
-        log.warning("could not load validator state from %s (%s); starting fresh", path, e)
-        return ChampionState()
+    if state is None:
+        raise ValidatorStateUnreadable(
+            f"validator state at {path} (and {path}.bak) exists but does not parse; "
+            "refusing to start fresh. Restore the file (or remove both deliberately "
+            "to start from a blank state / the receipt bootstrap)")
+    if src == "backup":
+        log.warning("validator state at %s is torn/unreadable; resumed from %s.bak",
+                    path, path)
+    return state
 
 
 # First-boot receipt walk: each verified receipt costs one storage GET, so the
@@ -3255,7 +1637,7 @@ def _bootstrap_state_from_receipts(
     joining mid-reign would judge the next manifest blind (``king_synced``
     treats an unset champion as synced) and crown whichever king it happened
     to see win first — a different champion than every validator that
-    witnessed the real dethrone (OPSLOG 2026-07-17).
+    witnessed the real dethrone.
 
     ``anchor`` is the pinned receipt-signing ss58 (``[manifest]
     validator_hotkey``, falling back to ``trainer_hotkey``) — the same trust
@@ -3275,9 +1657,8 @@ def _bootstrap_state_from_receipts(
     validator witnessed the dethrones itself. Without it a joining validator
     votes the whole reward mass on the current king while established
     validators split it across the court, and its vtrust is capped at the
-    consensus share of the top slot (observed 2026-07-31: a converged
-    external validator pinned at vtrust 0.52 — the court head's exact
-    consensus weight). A trail too short to fill the court seeds what it has;
+    consensus share of the top slot (the court head's consensus weight). A
+    trail too short to fill the court seeds what it has;
     the rest accrues from live dethrones. The walk is bounded
     (``_BOOTSTRAP_MAX_RECEIPT_READS``) so first boot cannot stall on a long
     index.
@@ -3298,7 +1679,6 @@ def _bootstrap_state_from_receipts(
     from ..shared.hippius import (
         RECEIPT_INDEX_KEY,
         RECEIPT_LATEST_KEY,
-        receipt_index_window,
         receipt_latest_key,
         receipt_round_key,
     )
@@ -3329,8 +1709,7 @@ def _bootstrap_state_from_receipts(
     rows: list = []
     if throne is None or keep_former_kings > 0:
         try:
-            rows = receipt_index_window(
-                json.loads(store.get_text(RECEIPT_INDEX_KEY)).get("rounds", []))
+            rows = json.loads(store.get_text(RECEIPT_INDEX_KEY)).get("rounds", [])
         except Exception:  # noqa: BLE001 — no index ⇒ nothing beyond latest.json
             rows = []
     # Index rows are chronological (oldest first, capped at most-recent); walk
@@ -3392,6 +1771,9 @@ def build_runner(
     cache_dir: Path | None = None,
     device: str = "cpu",
     eval_host_fn: Callable[[], RemoteHost | None] | None = None,
+    private_eval_host_fn: Callable[[], RemoteHost | None] | None = None,
+    private_eval_workers: int = 1,
+    private_eval_timeout_s: int = 3600,
 ) -> ValidatorRunner:
     """Construct a runner from ``chain.toml``, restoring persisted champion
     state. Wallet/chain wiring for live weight-setting is attached by
@@ -3424,8 +1806,19 @@ def build_runner(
     # DEC-CA-0045: the resolved rollover persists beside the champion state.
     activation_store = ActivationStore(
         Path(cfg.validator.state_db_path).with_name("activation_state.json"))
+    # DEC-CA-0057: inert (no resolver) while [netconfig] owner_hotkey is empty.
+    netconfig = None
+    if cfg.netconfig.enabled:
+        from ..shared.hippius import open_manifest_store
+        from ..shared.netconfig import NetConfigResolver
+
+        netconfig = NetConfigResolver(
+            cfg, state_path=Path(cfg.validator.state_db_path).with_name("netconfig_state.json"),
+            store=lambda: open_manifest_store(cfg.storage), signal=True)
     return ValidatorRunner(
         cfg=cfg, state=state,
         cache_dir=cache_dir, device=device, cascade=cascade, eval_host_fn=eval_host_fn,
-        activation_store=activation_store,
+        private_eval_host_fn=private_eval_host_fn, private_eval_workers=private_eval_workers,
+        private_eval_timeout_s=private_eval_timeout_s,
+        activation_store=activation_store, netconfig=netconfig,
     )

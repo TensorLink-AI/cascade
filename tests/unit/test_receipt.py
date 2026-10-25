@@ -221,7 +221,7 @@ def test_every_field_mutation_changes_canonical_body():
 
 
 def test_real_signature_dies_on_any_tamper():
-    bt = pytest.importorskip("bittensor")
+    bt = pytest.importorskip("bittensor.sp_core")
     kp = bt.Keypair.create_from_uri("//Alice")
     receipt, _, _ = make_scored_receipt(validator_hotkey=kp.ss58_address)
     signed = sign_receipt(receipt, kp)
@@ -237,7 +237,7 @@ def test_real_signature_dies_on_any_tamper():
 
 
 def test_signature_survives_dump_load():
-    bt = pytest.importorskip("bittensor")
+    bt = pytest.importorskip("bittensor.sp_core")
     kp = bt.Keypair.create_from_uri("//Alice")
     receipt, _, _ = make_scored_receipt(validator_hotkey=kp.ss58_address)
     signed = sign_receipt(receipt, kp)
@@ -259,7 +259,7 @@ def test_receipt_from_newer_code_still_verifies():
     re-serialised without it, failed the signature and kept the deposed king.
     A field this code does not know — top-level or nested — must not break
     verification; it is reported via receipt_has_unknown_fields instead."""
-    bt = pytest.importorskip("bittensor")
+    bt = pytest.importorskip("bittensor.sp_core")
     from cascade.shared.receipt import receipt_has_unknown_fields
 
     kp = bt.Keypair.create_from_uri("//Alice")
@@ -280,7 +280,7 @@ def test_receipt_from_newer_code_still_verifies():
 def test_received_body_still_dies_on_tamper():
     """Verifying over the received bytes keeps every tamper fatal: editing a
     known field, an unknown field, or the signer after signing all fail."""
-    bt = pytest.importorskip("bittensor")
+    bt = pytest.importorskip("bittensor.sp_core")
     kp = bt.Keypair.create_from_uri("//Alice")
     receipt, _, _ = make_scored_receipt(validator_hotkey=kp.ss58_address)
     obj = json.loads(dump_receipt(sign_receipt(receipt, kp)))
@@ -301,7 +301,7 @@ def test_received_body_still_dies_on_tamper():
 
 def test_replaced_receipt_verifies_over_its_own_body():
     """replace() on a loaded receipt must not reuse the received bytes."""
-    bt = pytest.importorskip("bittensor")
+    bt = pytest.importorskip("bittensor.sp_core")
     kp = bt.Keypair.create_from_uri("//Alice")
     receipt, _, _ = make_scored_receipt(validator_hotkey=kp.ss58_address)
     loaded = load_receipt(dump_receipt(sign_receipt(receipt, kp)))

@@ -124,11 +124,67 @@ def evaluate_checkpoint(
     device: str = "cpu",
     contract=None,
     trust_checkpoint_code: bool = False,
+    workers: int = 1,
 ) -> list[WindowScore]:
     """Load the checkpoint and score it on ``windows``. Convenience wrapper over
     :func:`load_forecaster` + :func:`score_joint_forecaster_on_windows`.
     ``contract`` (the entry's TrainingContractConfig) arms the full ingest
     guard — every live scorer should pass it."""
+    if workers > 1:
+        scores = forecast_checkpoint_windows(
+            checkpoint_dir, [w.history for w in windows], [w.horizon for w in windows],
+            num_samples=num_samples, device=device, contract=contract, workers=workers,
+            trust_checkpoint_code=trust_checkpoint_code,
+            _transform=lambda i, sample: score_joint_forecaster_on_windows(
+                lambda *_: sample, [windows[i]], num_samples))
+        return [score for chunk in scores for score in chunk]
     forecast_fn = load_forecaster(checkpoint_dir, device=device, contract=contract,
                                   trust_checkpoint_code=trust_checkpoint_code)
     return score_joint_forecaster_on_windows(forecast_fn, windows, num_samples)
+
+
+def forecast_checkpoint_windows(checkpoint_dir, histories, horizons, *, num_samples: int,
+                                device: str = "cpu", contract=None, workers: int = 1,
+                                trust_checkpoint_code: bool = False,
+                                _transform=None) -> list:
+    """Parallel independent windows without changing a model's batch or RNG.
+
+    Each worker owns a wrapper; no mutable model cache is shared between
+    threads. Imports/guard checks are serialized before worker threads start.
+    Explicit concurrency is opt-in and must be qualified on the chosen GPU.
+    """
+    import queue
+    from concurrent.futures import ThreadPoolExecutor
+
+    if workers < 1 or len(histories) != len(horizons) or num_samples < 1:
+        raise ValueError("invalid private evaluation work shape or worker count")
+    if not histories:
+        return []
+    count = min(workers, len(histories))
+    devices = [device]
+    if device == "cuda":
+        import torch
+
+        devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())] or [device]
+    forecasters = [load_forecaster(
+        checkpoint_dir, device=devices[i % len(devices)], contract=contract,
+        trust_checkpoint_code=trust_checkpoint_code) for i in range(count)]
+    pending = queue.Queue()
+    for i in range(len(histories)):
+        pending.put(i)
+    results = [None] * len(histories)
+
+    def run(forecaster):
+        while True:
+            try:
+                i = pending.get_nowait()
+            except queue.Empty:
+                return
+            sample = forecaster(histories[i], int(horizons[i]), num_samples)
+            results[i] = _transform(i, sample) if _transform is not None else sample
+
+    with ThreadPoolExecutor(max_workers=count, thread_name_prefix="private-eval") as pool:
+        # Consume every future: a failed window cannot silently disappear.
+        for future in [pool.submit(run, f) for f in forecasters]:
+            future.result()
+    return results

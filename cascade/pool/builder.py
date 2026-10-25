@@ -14,9 +14,6 @@ tar). That reproducibility is the audit hook — anyone can re-build and compare
 
 Cleaning rules (a series is **dropped**, never silently corrupted, if it fails):
 
-* numeric no-data codes (``no_data_sentinels``, e.g. USGS NWIS ``-999999``)
-  are treated as missing, exactly like NaN — a provider's "no reading" code is
-  not data, and a finite sentinel used to slip past the missingness gate;
 * gaps (NaN/None) are linearly interpolated per channel, but a series with more
   than ``max_missing_frac`` missing is dropped (too unreliable to score on);
 * it is truncated to the freshest ``context_length + horizon`` points (older
@@ -52,7 +49,7 @@ import numpy as np
 from ..eval.seasonality import get_seasonality
 from .source import DataSource, FetchJson, HarvestContext, HarvestedSeries, HttpFetcher
 
-BUILDER_VERSION = "cascade-pool/2"   # /2: no_data_sentinels count as missing
+BUILDER_VERSION = "cascade-pool/1"
 SELECTION_MODES = ("first", "balanced")
 
 _SAFE_ID = re.compile(r"[^A-Za-z0-9._-]+")
@@ -61,6 +58,29 @@ _SAFE_ID = re.compile(r"[^A-Za-z0-9._-]+")
 def _sanitize_id(series_id: str) -> str:
     s = _SAFE_ID.sub("_", series_id.strip()).strip("._-")
     return s or "series"
+
+
+# Domain labels that mean "no domain" (the forge source falls back to
+# "unknown" when a catalog entry carries none).
+UNLABELED_DOMAINS = frozenset({"", "unknown", "none"})
+
+
+class DomainFloorError(ValueError):
+    """A pool build left some domain under ``min_series_per_domain``."""
+
+
+def check_domain_floor(per_domain: dict, floor: int | None) -> None:
+    """Raise :class:`DomainFloorError` naming every domain under ``floor``
+    (DEC-CA-0032 Part A). ``None``/0 disables the check."""
+    if not floor:
+        return
+    short = {d: n for d, n in sorted(per_domain.items())
+             if str(d).strip().lower() not in UNLABELED_DOMAINS and n < floor}
+    if short:
+        raise DomainFloorError(
+            f"domains under the {floor}-series floor: "
+            + ", ".join(f"{d}={n}" for d, n in short.items())
+            + " — add sources/feeds for them or lower --min-series-per-domain")
 
 
 @dataclass(frozen=True)
@@ -76,12 +96,6 @@ class PoolBuildConfig:
     # backbone (hourly) sources fill the full context.
     min_context: int = 256
     max_missing_frac: float = 0.2
-    # Exact numeric no-data codes mapped to NaN before interpolation, so they
-    # count toward ``max_missing_frac`` instead of entering the pool as values.
-    # -999999 is the USGS NWIS noDataValue (seen at up to 96% of a series in
-    # every snapshot since block 8640000). Exact match only: a real reading
-    # never lands on the code by chance at float32.
-    no_data_sentinels: tuple[float, ...] = (-999999.0,)
     max_channels: int = 1
     min_std: float = 1e-8
     keep_tail: bool = True
@@ -97,6 +111,15 @@ class PoolBuildConfig:
     # predate source stamping keep building — but flip it on before any pool
     # carries multichannel windows.
     require_source: bool = False
+    # v2 primary pool (DEC-CA-0050 P2): every kept series must carry a real
+    # domain label — lane B judges per domain, so an "unknown"/empty label is
+    # a window no domain verdict can use. Off by default (legacy pools keep
+    # building byte-identically).
+    require_domain: bool = False
+    # DEC-CA-0032 Part A capacity floor: refuse to write a pool in which any
+    # labeled domain holds fewer than this many series (each series is one
+    # window candidate per round). None = no floor (legacy behaviour).
+    min_series_per_domain: int | None = None
     # Which series win a capped slot: "first" (harvest order, the historical
     # behaviour) or "balanced" (seeded round-robin across sources — see the
     # module docstring). ``selection_seed`` is recorded in provenance.json so
@@ -190,13 +213,11 @@ def prepare_series(
         return None, "bad_shape"
     if cfg.require_source and not hs.source:
         return None, "missing_source"
+    if cfg.require_domain and str(hs.domain or "").strip().lower() in UNLABELED_DOMAINS:
+        return None, "missing_domain"
     n_channels, length = arr.shape
     if n_channels > cfg.max_channels:
         return None, "too_many_channels"
-
-    if cfg.no_data_sentinels:
-        arr = np.where(np.isin(arr, np.asarray(cfg.no_data_sentinels, dtype=arr.dtype)),
-                       np.nan, arr)
 
     cleaned = np.empty_like(arr)
     worst_missing = 0.0
@@ -500,6 +521,9 @@ def build_pool(
     """Harvest → clean/validate → dedup → write. The one-call entry point."""
     fetch = fetch or HttpFetcher()
     records, drops = collect_records(sources, ctx, cfg, fetch)
+    from collections import Counter as _Counter
+
+    check_domain_floor(_Counter(r.domain for r in records), cfg.min_series_per_domain)
     return write_pool(
         records, out_dir, as_of=ctx.as_of.isoformat(), cfg=cfg, drops=drops, overwrite=overwrite
     )

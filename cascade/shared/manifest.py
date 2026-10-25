@@ -38,6 +38,11 @@ TRAINED_RE = re.compile(r"^metro-v1:trained:hippius:(?P<ref>.+)$")
 
 MANIFEST_VERSION = 2
 VALID_ROLES = ("king", "challenger")
+# DEC-CA-0055 king-leg funding sources (TrainedEntry.funded_by): "king" = its
+# own key; "operator" = its key failed (validators slash the king to 1 %);
+# "operator_fault" = the operator trained it for a reason on OUR side (make-
+# good, capacity, a lost record) — never a slash.
+FUNDED_BY = ("", "king", "operator", "operator_fault")
 
 
 def parse_trained_pointer(payload: str) -> str | None:
@@ -108,6 +113,15 @@ def corpus_digest(series: Sequence[np.ndarray | dict]) -> str:
 # `TrainingContractConfig.at_block(block)`, and only ITS digest may differ.
 _NEVER_IN_DIGEST: frozenset[str] = frozenset({
     "budget_denomination_after", "budget_denomination_after_block",
+    # DEC-CA-0050 v2 activation: the post-v2 contract + its block are a
+    # schedule; the v2 era's contract is ``at_block(era start)``, whose own
+    # digest is what a v2 manifest declares.
+    "v2_from_block", "v2_contract",
+    # DEC-CA-0050 slow router: a per-leg runtime flag carried on the leg's
+    # resolved contract (the worker's --router-slow), never a contract term.
+    "router_slow",
+    # DEC-CA-0053 scheduled context growth: a schedule like DEC-CA-0047's.
+    "context_length_after", "context_length_after_block",
 })
 
 _DIGEST_DROP_WHEN_DEFAULT: dict[str, tuple] = {
@@ -156,6 +170,26 @@ _DIGEST_DROP_WHEN_DEFAULT: dict[str, tuple] = {
     "adamw_beta2": (0.999,),
     "adamw_lr_scale": (1.0, 1),
     "warm_lr_scale": (1.0, 1),
+    # DEC-CA-0050: the Cascade-MOE-28M recipe knobs — read only by the
+    # cascade_moe trainer, inert (absent from the digest) at their defaults.
+    "micro_batches": (1,),
+    "mup_lr_exponent": (0.0, 0),
+    "power_ema_sigma_rels": ((), []),
+    "power_ema_eval": (-1,),
+    "power_ema_scope": ("lineage",),
+    "continuation_protocol": ("",),
+    "anneal_shape": ("cosine",),
+    "copula_loss_cap": (0.0, 0),
+    "copula_samples": (8,),
+    "copula_patches": (2,),
+    # DEC-CA-0050 generation surface: 0 = the generator's own corpus target.
+    "corpus_epochs": (0,),
+    # DEC-CA-0050 v2 slow-adapting router (cascade_moe only): 1.0 = full rate.
+    "router_lr_scale": (1.0, 1),
+    "route_bias_rate_scale": (1.0, 1),
+    # DEC-CA-0053: long-series handling. "last" = keep the final window (every
+    # deployed config); "crop" is the deliberate digest bump.
+    "long_series": ("last",),
 }
 
 
@@ -272,6 +306,38 @@ class BenchScores:
     boom_mase: float
     time_crps: float
     time_mase: float
+    # DEC-CA-0061: FEV's suite-level numbers, the fourth suite of the strict
+    # lane-A bench gate. None on every report before it — dropped from every
+    # signed body then (``bench_scores_body``), so archived signatures verify.
+    fev_crps: float | None = None
+    fev_mase: float | None = None
+
+
+FEV_SCORE_KEYS = ("fev_crps", "fev_mase")
+
+
+def bench_scores_body(scores: BenchScores | dict) -> dict:
+    """A BenchScores' canonical dict: the six numbers, plus FEV's only when
+    present (DEC-CA-0061) — the drop-when-default convention."""
+    d = dict(asdict(scores) if isinstance(scores, BenchScores) else scores)
+    for k in FEV_SCORE_KEYS:
+        if d.get(k) is None:
+            d.pop(k, None)
+    return d
+
+
+def bench_scores_from_json(obj: dict) -> BenchScores:
+    """Parse a BenchScores dict; the FEV pair is optional (None when absent)."""
+    fev = {k: (None if obj.get(k) is None else float(obj[k])) for k in FEV_SCORE_KEYS}
+    return BenchScores(
+        gifteval_crps=float(obj["gifteval_crps"]),
+        gifteval_mase=float(obj["gifteval_mase"]),
+        boom_crps=float(obj["boom_crps"]),
+        boom_mase=float(obj["boom_mase"]),
+        time_crps=float(obj["time_crps"]),
+        time_mase=float(obj["time_mase"]),
+        **fev,
+    )
 
 
 @dataclass(frozen=True)
@@ -314,12 +380,23 @@ class TrainedEntry:
     # non-contiguous — ``_drop_final_content_clones`` can remove one — so
     # consumers sort, never index.
     duel_rank: int = 0
+    # DEC-CA-0055: who paid for this leg's pod — "king" (the king leg rented on
+    # the king's own deposited key) or "operator" (the operator's fallback after
+    # the king's key failed: validators slash the king to 1 % of lane A for the
+    # settlement). Set on the king entry of a v2 era; "" otherwise. Dropped from
+    # ``canonical_body`` when "" (see :func:`_entry_body`), so every earlier
+    # manifest hashes exactly as before.
+    funded_by: str = ""
+    init_pointer: str | None = None  # None = historical receipt with no per-leg init binding
+    training_contract_digest: str = ""
 
     def __post_init__(self) -> None:
         if self.role not in VALID_ROLES:
             raise ValueError(f"role must be one of {VALID_ROLES}; got {self.role!r}")
         if parse_trained_pointer(self.trained_pointer) is None:
             raise ValueError(f"malformed trained_pointer: {self.trained_pointer!r}")
+        if self.funded_by not in FUNDED_BY:
+            raise ValueError(f"funded_by must be one of {FUNDED_BY}; got {self.funded_by!r}")
 
 
 # ``seated`` / ``waiting`` are the duel-only round's standings (no screen ran:
@@ -343,14 +420,13 @@ class HeatEntrant:
     reproduces the ``heat_score`` behind ``rel_score``.
 
     Note: publishing the raw ``crps``/``mase`` exposes absolute error on the
-    private, per-round rotated eval pool — deliberately withheld in earlier
-    versions, since an absolute per-round signal can help a miner distribution-
-    match the pool. It is emitted now by owner decision for miner transparency
-    (owner confirmed 2026-07-26; see OPSLOG and DEC-CA-0007 if written).
+    private, per-round rotated eval pool. An absolute per-round signal can help
+    a miner distribution-match the pool; it is emitted anyway, by owner
+    decision, for miner transparency.
     ``rank``/``rel_score``/``crps``/``mase`` are None for an entrant that never
     produced a score (``failed_train`` / ``failed_screen``).
 
-    ``p_best`` is the shadow selection diagnostic (:mod:`cascade.eval.heat`): the
+    ``p_best`` was the heat's shadow selection diagnostic: the
     fraction of joint-bootstrap bags in which this entrant scored best. It says
     how much of the ranking is signal — a leader sitting near ``1 / n_entrants``
     was ranked by noise. Unlike ``crps``/``mase`` it is a comparison among
@@ -377,6 +453,10 @@ class HeatEntrant:
 class HeatResult:
     """The round's heat screen, as a presentational (unsigned) block.
 
+    Written only by the retired boundary-round trainer; rolling settlements
+    never carry one. Parsed so archived manifests (and the receipts that embed
+    them) round-trip unchanged.
+
     Rides in the manifest but is excluded from :meth:`TrainingManifest.canonical_body`
     — it is a *view* for the dashboard, not part of the signed/audited claim (an
     auditor cannot cheaply reproduce a discarded heat checkpoint). ``None`` on a
@@ -388,8 +468,7 @@ class HeatResult:
     runner-up (the duel's statistic, with the runner-up in the king's slot).
     ``> 0`` means the screen genuinely separated first from second; ``<= 0`` means
     it did not and the two were interchangeable on this evidence. It never
-    changed which entrants advanced — see :mod:`cascade.eval.heat`. None when the
-    screener returned only scalars, or with a single scored entrant.
+    changed which entrants advanced. None when the screener returned only scalars, or with a single scored entrant.
     """
 
     screen_size: str               # arch_preset the heat screened at
@@ -414,29 +493,28 @@ def _entry_body(e: TrainedEntry) -> dict:
     d = asdict(e)
     if d.get("bench_scores") is None:
         d.pop("bench_scores", None)
+    else:
+        d["bench_scores"] = bench_scores_body(d["bench_scores"])
     if not d.get("duel_rank"):
         d.pop("duel_rank", None)
+    if not d.get("funded_by"):
+        d.pop("funded_by", None)
+    if d.get("init_pointer") is None:
+        d.pop("init_pointer", None)
+    if not d.get("training_contract_digest"):
+        d.pop("training_contract_digest", None)
     return d
 
 
 def _bench_from_json(obj: object) -> BenchScores | None:
     if not isinstance(obj, dict):
         return None
-    return BenchScores(
-        gifteval_crps=float(obj["gifteval_crps"]),
-        gifteval_mase=float(obj["gifteval_mase"]),
-        boom_crps=float(obj["boom_crps"]),
-        boom_mase=float(obj["boom_mase"]),
-        time_crps=float(obj["time_crps"]),
-        time_mase=float(obj["time_mase"]),
-    )
+    return bench_scores_from_json(obj)
 
 
 def heat_to_json(heat: HeatResult | None) -> dict | None:
-    """The heat block's JSON shape. Public because the trainer publishes the
-    SAME shape mid-round as the standalone heat mirror
-    (:mod:`cascade.shared.heat_status`) — one shape means the dashboards render
-    a live heat and a settled round's heat with one code path."""
+    """The heat block's JSON shape — round-trips an archived manifest's block
+    byte-for-byte."""
     if heat is None:
         return None
     d = {
@@ -517,6 +595,22 @@ class TrainingManifest:
     # init (no promotion yet, or a pre-warm-start trainer).
     warm_start_ckpt: str = ""
     warm_start_size: str = ""
+    # Lane-B merged init (DEC-CA-0050, drop-when-default, SIGNED): when the
+    # era init carries merged domain legs, ``warm_start_ckpt`` is the MERGED
+    # checkpoint, ``warm_start_base`` the promotion member it was built from,
+    # and ``warm_start_merges`` the ordered merge records
+    # ({rebased_pointer, king_pointer, selection}) — validators rebuild the
+    # init bit-exactly from the member + their own recorded domain wins.
+    warm_start_base: str = ""
+    warm_start_merges: tuple = ()
+    # Lane-B binding (DEC-CA-0050, drop-when-default, SIGNED): the
+    # ``ExpertManifest.digest()`` of this settlement's ``lane_b/round-<id>.json``.
+    # The trainer settles lane B and publishes the expert manifest BEFORE this
+    # manifest, so a validator polling in between can never see a settlement
+    # whose expert legs appear later. Empty ⇒ no lane-B legs this round
+    # (deterministic for every validator); every pre-lane-B manifest hashes
+    # byte-for-byte as before.
+    expert_manifest_sha256: str = ""
     # Realised round composition (jittered mix, DEC-TB-0003 port): domain
     # counts, effective domains, cadences, class count of the round's served
     # eval windows. Informational and UNSIGNED like ``heat`` — never enters
@@ -548,6 +642,39 @@ class TrainingManifest:
     # their last handled settlement instead of jumping to ``latest.json``.
     # Signed, drop-when-empty.
     prev_round_id: str = ""
+    # Hash link (DEC-CA-0043): lowercase sha256 hex of the EXACT bytes of the
+    # previous settlement's published manifest — the UTF-8 encoding of the
+    # ``dump_manifest`` text written to ``manifests/round-<prev_round_id>.json``
+    # (the same text ``latest.json`` carried), i.e. the ``digest`` the
+    # validator loop and :func:`cascade.validator.manifest_chain.chain_manifests`
+    # compute (``sha256(raw.encode("utf-8"))``) and persist as
+    # ``last_handled_manifest_sha``. Validators that handled ``prev_round_id``
+    # reject a mismatch (``manifest_chain_broken``); empty ⇒ unchecked. Signed,
+    # drop-when-empty: every manifest without it keeps its exact bytes and
+    # signature. (Rollout: validators must run code that knows the field
+    # before the trainer emits it, or their recomputed body won't verify.)
+    prev_manifest_sha256: str = ""
+    # Signed announcement of a future v2 generation: generation -> record hash.
+    promotion_notices: dict[str, str] | None = None
+    # Lane-C binding (DEC-CA-0056, drop-when-empty, SIGNED): lowercase sha256
+    # hex of the EXACT published text of this settlement's
+    # ``lane_c/round-<id>.json`` (:func:`cascade.shared.lane_c_manifest.
+    # lane_c_text_digest`). Published BEFORE this manifest; empty ⇒ no lane-C
+    # legs this round (deterministic for every validator). Every manifest
+    # without it keeps its exact bytes and signature.
+    lane_c_digest: str = ""
+    # DEC-CA-0063 bench-report arbiter (drop-when-empty, SIGNED): for each
+    # EARLIER validator-sourced settlement whose fate the trainer resolved
+    # while building this one, ``{round_id: sha256 | "absent"}`` — the sha256
+    # of the exact text of the main validator's ``bench_v/round-<id>.json``
+    # the first time the trainer read it, or "absent" once ``[v2]
+    # bench_report_timeout_settlements`` later settlements were built without
+    # it. Each round is recorded ONCE (the earliest manifest that records it
+    # is the arbiter): every validator that needs a settlement's report
+    # judges from exactly those bytes, or treats it as absent — never from
+    # its own view of the store's timing. Every manifest without it keeps its
+    # exact bytes and signature.
+    validator_bench_reports: dict | None = None
     signature: str | None = None  # trainer_hotkey signature over canonical_body()
 
     def entry_for_role(self, role: str) -> TrainedEntry | None:
@@ -678,6 +805,11 @@ class TrainingManifest:
         if self.warm_start_ckpt:
             body["warm_start_ckpt"] = self.warm_start_ckpt
             body["warm_start_size"] = self.warm_start_size
+        if self.warm_start_merges:
+            body["warm_start_base"] = self.warm_start_base
+            body["warm_start_merges"] = [dict(m) for m in self.warm_start_merges]
+        if self.expert_manifest_sha256:
+            body["expert_manifest_sha256"] = self.expert_manifest_sha256
         # Same drop-when-unset convention (DEC-CA-0036): a manifest from a
         # trainer that publishes no contract body hashes exactly as it did
         # before the field existed, so every archived signature stays valid.
@@ -689,6 +821,15 @@ class TrainingManifest:
             body["era"] = self.era
         if self.prev_round_id:
             body["prev_round_id"] = self.prev_round_id
+        if self.prev_manifest_sha256:
+            body["prev_manifest_sha256"] = self.prev_manifest_sha256
+        if self.promotion_notices:
+            body["promotion_notices"] = dict(sorted(self.promotion_notices.items()))
+        if self.lane_c_digest:
+            body["lane_c_digest"] = self.lane_c_digest
+        if self.validator_bench_reports:
+            body["validator_bench_reports"] = {str(k): str(v) for k, v in sorted(
+                self.validator_bench_reports.items())}
         return json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
@@ -732,6 +873,9 @@ def load_manifest(text: str) -> TrainingManifest:
             size=str(e.get("size", "")),
             bench_scores=_bench_from_json(e.get("bench_scores")),
             duel_rank=int(e.get("duel_rank", 0)),
+            funded_by=str(e.get("funded_by", "") or ""),
+            init_pointer=e.get("init_pointer"),
+            training_contract_digest=str(e.get("training_contract_digest", "") or ""),
         )
         for e in obj["entries"]
     ]
@@ -749,10 +893,19 @@ def load_manifest(text: str) -> TrainingManifest:
         eval_pool_sha256=str(obj.get("eval_pool_sha256", "") or ""),
         warm_start_ckpt=str(obj.get("warm_start_ckpt", "") or ""),
         warm_start_size=str(obj.get("warm_start_size", "") or ""),
+        warm_start_base=str(obj.get("warm_start_base", "") or ""),
+        warm_start_merges=tuple(dict(m) for m in obj.get("warm_start_merges", ()) or ()),
+        expert_manifest_sha256=str(obj.get("expert_manifest_sha256", "") or ""),
         contract_body=(obj["contract_body"]
                        if isinstance(obj.get("contract_body"), dict) else None),
         era=(obj["era"] if isinstance(obj.get("era"), dict) else None),
         prev_round_id=str(obj.get("prev_round_id", "") or ""),
+        prev_manifest_sha256=str(obj.get("prev_manifest_sha256", "") or ""),
+        promotion_notices=obj.get("promotion_notices") or None,
+        lane_c_digest=str(obj.get("lane_c_digest", "") or ""),
+        validator_bench_reports=({str(k): str(v) for k, v in obj["validator_bench_reports"].items()}
+                                 if isinstance(obj.get("validator_bench_reports"), dict)
+                                 and obj["validator_bench_reports"] else None),
         signature=obj.get("signature"),
     )
 
@@ -787,14 +940,6 @@ def verify_signature(manifest: TrainingManifest, trainer_hotkey: str) -> bool:
     """
     if not manifest.signature or not trainer_hotkey:
         return False
-    try:
-        from bittensor import Keypair  # type: ignore
-    except ImportError as e:  # pragma: no cover - validator has bittensor
-        raise RuntimeError(
-            "bittensor required to verify manifest signatures; install the [chain] extra"
-        ) from e
-    try:
-        kp = Keypair(ss58_address=trainer_hotkey)
-        return bool(kp.verify(manifest.canonical_body(), bytes.fromhex(manifest.signature)))
-    except Exception:  # noqa: BLE001 — any malformed sig/address ⇒ untrusted
-        return False
+    from .sr25519 import verify_hotkey
+
+    return verify_hotkey(trainer_hotkey, manifest.canonical_body(), manifest.signature)

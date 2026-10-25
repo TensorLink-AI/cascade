@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 
-import bittensor as bt
+import bittensor.sp_core as bt  # 11.x: Keypair lives in sp_core
 
 from cascade.shared.hippius import (
     RECEIPT_INDEX_KEY,

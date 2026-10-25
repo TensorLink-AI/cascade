@@ -1,19 +1,17 @@
-
+"""ChainClient reveal decoding + connection hygiene (bittensor 11.x)."""
 
 # ── reveal decoding: both substrate renderings (the payload-length lottery) ──
 
 
-class _FakeQ:
-    def __init__(self, value): self.value = value
-
-
-class _FakeSubstrate:
-    def __init__(self, value): self._v = value
-    def query(self, module, storage_function, params): return _FakeQ(self._v)
-
-
 class _FakeSub:
-    def __init__(self, value): self.substrate = _FakeSubstrate(value)
+    """11.x-shaped subtensor: ``query(item, params, block=)`` returns the
+    decoded storage value directly (no ``.value`` wrapper)."""
+
+    def __init__(self, value): self._v = value
+
+    def query(self, item, params=None, *, block=None):
+        assert tuple(item)[:2] == ("Commitments", "RevealedCommitments")
+        return self._v
 
 
 def _client():
@@ -63,45 +61,49 @@ def test_raw_revealed_entries_skips_garbage_entry_only():
     assert out == [(2, good)]
 
 
-def test_defuse_substrate_destructor_is_safe_without_package(monkeypatch):
-    """The defusal is best-effort: importable package → __del__ neutered;
-    missing package → silent no-op (unit envs without the chain extra)."""
-    from cascade.shared import chain as chain_mod
+def test_raw_revealed_entries_accepts_bytes_rendering():
+    payload = "metro-v1:gen:hippius:a/b@hf:" + "9" * 40
+    scale = ((len(payload) << 2) | 1).to_bytes(2, "little")
+    out = _client()._raw_revealed_entries(_FakeSub([(scale + payload.encode(), 5)]), "hk")
+    assert out == [(5, payload)]
 
-    chain_mod._defuse_substrate_destructor()      # must never raise
-    try:
-        from async_substrate_interface import sync_substrate
-    except ImportError:
-        return
-    cls = getattr(sync_substrate, "SubstrateInterface", None)
-    if cls is not None:
-        obj = object.__new__(cls)
-        cls.__del__(obj)                          # neutered: returns instantly
+
+def test_reconnect_closes_the_dropped_client_off_thread():
+    """11.x's close/GC teardown can block ~10s on a hung loop: reconnect must
+    close the old client (detaching its GC finalizer) without blocking."""
+    import threading
+
+    closed = threading.Event()
+    c = _client()
+    c._subtensor = type("S", (), {"close": lambda self: closed.set()})()
+    c.reconnect()
+    assert c._subtensor is None
+    assert closed.wait(2.0)
 
 
 def test_bulk_decode_warning_fires_once_per_cause(monkeypatch, caplog):
-    """One malformed on-chain commit makes bittensor's batch decoder raise on
-    EVERY poll; the raw-map fallback is the fix, the warning must not repeat."""
+    """A failing map read would otherwise warn on EVERY poll; the per-hotkey
+    fallback is the fix, the warning must not repeat."""
     import logging
     from types import SimpleNamespace
 
     from cascade.shared import chain as chain_mod
 
     c = _client()
-    meta = SimpleNamespace(n=1, hotkeys=["hk"], coldkeys=["ck"])
+    meta = SimpleNamespace(block=10, neurons=[SimpleNamespace(hotkey="hk", coldkey="ck")])
 
-    def _boom(netuid):
+    def _boom(*a, **k):
         raise ValueError("non-hexadecimal number found in fromhex() arg at position 3")
 
-    sub = SimpleNamespace(metagraph=lambda netuid, lite: meta,
-                                get_all_revealed_commitments=_boom)
-    monkeypatch.setattr(c, "subtensor", lambda: sub)
-    monkeypatch.setattr(c, "_revealed_raw_map", lambda *a, **k: [])
+    monkeypatch.setattr(c, "subtensor", lambda: SimpleNamespace())
+    monkeypatch.setattr(c, "_metagraph", lambda block=None: meta)
+    monkeypatch.setattr(c, "_revealed_raw_map", _boom)
+    monkeypatch.setattr(c, "_revealed_per_uid", lambda *a, **k: [])
     monkeypatch.setattr(chain_mod, "_bulk_decode_warned", set())
     with caplog.at_level(logging.DEBUG, logger="cascade.chain"):
         for _ in range(3):
             assert c.poll_commitments() == []
     warned = [r for r in caplog.records if r.levelno == logging.WARNING
-              and "bulk revealed-commitment decode failed" in r.getMessage()]
+              and "bulk revealed-commitment read failed" in r.getMessage()]
     assert len(warned) == 1
     assert "repeats only when the cause changes" in warned[0].getMessage()

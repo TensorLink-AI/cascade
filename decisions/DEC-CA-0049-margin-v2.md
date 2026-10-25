@@ -2,7 +2,7 @@
 id: DEC-CA-0049
 type: decision
 title: "Dethrone bar v2: increment-unit margin 0.4 for a fresh king, decaying to 0.2 over 18000 blocks of tenure — decided on chain by validator readiness (DEC-CA-0045), typed block = owner override"
-status: proposed
+status: accepted
 date: 2026-10-01
 tags: [scoring, validator, consensus, margin, activation]
 revisit_when: "the first ~10 settlements after the bar applies — record dethrones, LCBs and raw win-rates, and whether 0.2 at the floor still admits raw-tied winners (the increment statistic is noisy; a raw-win-rate co-gate may be the better complement)"

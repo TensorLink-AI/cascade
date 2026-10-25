@@ -19,7 +19,6 @@ from dataclasses import dataclass
 from cascade.eval.benchmarks import gift_rows_from_report
 from cascade.trainer.remote import RemoteHost
 from cascade.validator.eval_offload import (
-    bench_scores_via_host,
     build_bench_remote_command,
     build_scp_argv,
     gift_rows_via_host,
@@ -42,18 +41,6 @@ _REPORT = {
     "suites": [
         {"suite": "gift-eval", "status": "ok",
          "rows": [{"full": "m4_hourly", "crps_ratio": 0.9, "mase_ratio": 0.95}]},
-    ],
-}
-
-
-# A full 3-suite report for the cascade bench (extract_bench_scores reads
-# each suite's `metrics` crps/mase).
-_BENCH_REPORT = {
-    "checkpoint": "/root/cascade/_eval_offload/ckpt/checkpoint",
-    "suites": [
-        {"suite": "gift-eval", "status": "ok", "metrics": {"crps": 0.42, "mase": 0.81}},
-        {"suite": "boom", "status": "ok", "metrics": {"crps": 0.55, "mase": 0.90}},
-        {"suite": "time", "status": "ok", "metrics": {"crps": 0.38, "mase": 0.77}},
     ],
 }
 
@@ -159,31 +146,6 @@ def test_gift_rows_via_host_returns_none_when_scp_fails(tmp_path):
     ckpt.mkdir()
     runner = _FakeRunner(scp_returncode=1)
     assert gift_rows_via_host(_host(), ckpt, runner=runner) is None
-
-
-# ── dispatch: cascade bench (GIFT-Eval + BOOM + TIME) ────────────────────────
-
-def test_bench_scores_via_host_dispatches_all_suites_and_parses(tmp_path):
-    ckpt = tmp_path / "ckpt"
-    ckpt.mkdir()
-    runner = _FakeRunner(report=_BENCH_REPORT)
-    scores = bench_scores_via_host(_host(), ckpt, num_samples=20, max_series=3,
-                                   data_dir="/root/cascade/bench_data", runner=runner)
-    assert scores == {
-        "gifteval_crps": 0.42, "gifteval_mase": 0.81,
-        "boom_crps": 0.55, "boom_mase": 0.90,
-        "time_crps": 0.38, "time_mase": 0.77,
-    }
-    assert "--suites gift-eval,boom,time" in runner.bench_cmd()  # all three suites
-    assert "--max-series 3" in runner.bench_cmd()
-
-
-def test_bench_scores_via_host_returns_none_on_incomplete_report(tmp_path):
-    ckpt = tmp_path / "ckpt"
-    ckpt.mkdir()
-    # Only gift-eval present ⇒ extract_bench_scores wants all three ⇒ None.
-    runner = _FakeRunner(report=_REPORT)
-    assert bench_scores_via_host(_host(), ckpt, runner=runner) is None
 
 
 # ── shared parse helper ──────────────────────────────────────────────────────

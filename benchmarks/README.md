@@ -1,21 +1,43 @@
 # cascade-benchmark (sidecar)
 
 Scores a trained cascade checkpoint on the public time-series benchmarks
-**GIFT-Eval**, **BOOM**, and **TIME**, and writes the numbers as JSON. These are
-**log-only** — they never feed miner scores, weights, or KOTH state. The
-validator runs this out-of-process and just logs whatever JSON comes back.
+**GIFT-Eval**, **BOOM**, **TIME** and **FEV** (the default `--suites`),
+and writes the numbers as JSON. TIME and FEV need their installation extras;
+FEV also requires a verified local task/data manifest. The private eval pool
+still decides every duel; the public numbers are telemetry, the input to
+warm-start promotion and, in v2, a gate that can only block a private-pool win
+(DEC-CA-0054 / DEC-CA-0061, `cascade/eval/bench_gate.py`):
+
+**For a protocol-required four-suite run, install both `time` and `fev` extras
+and stage all four suites.** An optional dependency at installation time
+can still be required by the selected competition rules.
+
+- **Trainer-source policy.** Each finished leg's checkpoint is benched at leg completion (on
+  the payer's pod for a funded challenger; the top entries are re-benched on the
+  era king's operator pod, and only operator numbers are signed). The numbers
+  (per suite × CRPS/MASE) ship in the trainer-signed
+  `benchmarks/round-<id>.json` report that promotion selection reads.
+- **Main validator (DEC-CA-0063).** From `[v2] bench_source_from_block` with
+  `bench_source = "validator"` (the mainnet `chain.toml` value; testnet keeps
+  `"trainer"`), the trainer skips lane-A sweeps. The main validator runs this
+  sidecar on its own GPU, only for a challenger that won the pool (plus the
+  king), within `[v2] bench_sweep_hours` / `bench_budget_hours`, with
+  `[eval] bench_workers` / `bench_paired` passed through as `--workers` /
+  `--extra-checkpoint`. It signs `bench_v/round-<id>.json`; other validators
+  read that report and do not sweep.
+- **Validator.** The optional GIFT-Eval no-regression gate
+  (`[scoring] gift_gate_mode`) runs a pinned GIFT-Eval subset through this
+  sidecar, locally or on an `--eval-hosts` pod.
 
 ## Why a separate project / environment
 
-`gift-eval` (the harness behind both GIFT-Eval and BOOM) hard-pins
-`numpy~=1.26`, `scipy~=1.11`, `datasets~=2.17`, `gluonts~=0.15`, `pandas==2.0.0`
-and needs Python 3.11. Those caps **cannot coexist** in the cascade env with
-`torch>=2.2` / `transformers>=4.40` / `bittensor` / the `hippius` extra — every
-resolver upgrade re-breaks the install. So this lives in its **own locked
-environment** and is invoked as a subprocess. The cascade core stays
-`numpy`/`scipy`-only.
+The benchmark harness has its own pinned scientific and dataset dependencies
+in `benchmarks/pyproject.toml` and `benchmarks/uv.lock`. It runs in an isolated
+Python 3.11 environment and is invoked as a subprocess, so changes to miner,
+chain or training dependencies do not silently change benchmark libraries.
+The core installation does not need the benchmark harness.
 
-The boundary is dead simple: **a checkpoint dir in, a results JSON out.** Every
+The interface is **a checkpoint directory in, a results JSON out.** Every
 cascade checkpoint already ships `forecast_wrapper.py` (the same trusted
 inference path the validator scores on), which we wrap as a gluonts predictor —
 so this is model-agnostic and consistent with in-protocol scores.
@@ -29,14 +51,20 @@ sampling contract still work via the original per-series `SampleForecast` path
 
 ## Docker (recommended): env + frozen data as one artifact
 
+Use uv >=0.13.4 and a patched OS CA store. The benchmark lock includes
+certifi >=2026.10.19. Run `benchmarks/.venv/bin/python scripts/check_tls_trust.py`
+from the repository root after installing locally. See the
+[TLS runbook](../docs/OPERATOR.md#tls-trust-and-the-october-2026-emudhra-incident)
+for image rebuilds and rollout.
+
 `benchmarks/Dockerfile` bakes the locked env **and** the three datasets at the
 revisions pinned in `cascade_benchmark/datasets.py`, so any host with docker
 (and optionally a GPU) scores checkpoints with zero setup and comparable
 numbers:
 
 ```bash
-# build (from benchmarks/); the data layer only rebuilds when revisions bump
-docker build -t cascade-bench:<tag> .
+# build from the repository root; the data layer only rebuilds when revisions bump
+docker build -f benchmarks/Dockerfile -t cascade-bench:<tag> .
 
 # score a checkpoint (data is baked at /data; env vars pre-wired)
 docker run --rm --gpus all \
@@ -51,16 +79,102 @@ the exact data they were computed against.
 
 ```bash
 # from the repo root — resolves in total isolation from the main env
-uv sync --project benchmarks
+uv sync --project benchmarks --frozen --extra time --extra fev
 ```
 
 ## Run
 
 ```bash
-uv run --project benchmarks cascade-benchmark \
+uv run --frozen --extra time --project benchmarks cascade-benchmark \
     /path/to/checkpoint_dir /path/to/out.json \
     --suites gift-eval,boom,time --num-samples 100
 ```
+
+For the current four-suite rule:
+
+```bash
+uv run --project benchmarks --frozen --extra time --extra fev cascade-benchmark \
+    /path/to/checkpoint_dir /path/to/out.json --data-dir ./bench_data \
+    --suites gift-eval,boom,time,fev --device cuda
+```
+
+Stage the [required datasets](#getting-the-data-auto-download) first. FEV uses
+the pinned local data described below. Inspect each suite's status, finite metrics,
+per-task rows and revisions; a written JSON file alone is not a passing sweep.
+
+### Concurrent sweep (`--workers`) and paired sweeps (`--extra-checkpoint`)
+
+```bash
+uv run --frozen --extra time --extra fev --project benchmarks cascade-benchmark CKPT out.json --device cuda \
+    --batch-size 512 --data-dir ./bench_data --workers auto \
+    [--extra-checkpoint KING_CKPT king.json] [--timings-json timings.json]
+```
+
+Every suite is split into work units: one GIFT-Eval config, BOOM dataset,
+TIME task or FEV task (`suites/_common.py`: `plan` / `run_unit` /
+`assemble`). `--workers N` runs them over N **spawned** worker processes,
+each loading every checkpoint once (`predictor.load_wrapper_cached`) and
+pulling one unit at a time. Rows, aggregates and skip lists are assembled in
+the fixed unit order. Qualification requires report JSON **byte-identical** to
+`--workers 1` on the chosen hardware. Both modes use one CPU thread per worker:
+same fp32 forward, same per-unit batches at `--batch-size`, same quantile
+grid. A failing unit is recorded exactly as before. A worker that dies is
+replaced and its unit re-run once; a unit that kills two workers ends the
+run (exit 3), as it would have crashed the sequential sweep.
+
+`--workers auto` sizes to the box (`cascade_benchmark/sizing.py`): min(by GPU
+memory, effective CPU cores − 1, host RAM, `--max-workers` [16], units).
+Affinity and cgroup quotas/limits are respected. By GPU memory means, per
+visible GPU, ⌊(free − 2 GiB) ÷ per-worker⌋. Per-worker VRAM is measured: a
+probe process loads the checkpoint(s), forwards one warm-up batch and reads
+`torch.cuda.max_memory_reserved`, then the tool adds ×1.25 and 0.5 GiB of
+CUDA context. `--worker-vram-gb` overrides the measurement. A CPU device
+uses the same CPU/RAM limits. The default RAM allowance is 2 GiB for data plus
+twice the checkpoint weight bytes per worker; `--worker-ram-gb` overrides it.
+This is an estimate, so measure dataset peaks on the actual VM.
+Workers are spread round-robin over the GPUs, one GPU each
+(`CUDA_VISIBLE_DEVICES`).
+
+`--extra-checkpoint DIR OUT` (repeatable) sweeps further checkpoints in the
+SAME pass: each unit's dataset is built once and forecast by every
+checkpoint, and each report is byte-identical to sweeping that checkpoint
+alone. `--timings-json` writes per-suite wall times and the worker plan, and
+never goes into the report. `scripts/bench_timing.py` (repo root) times
+`--workers 1` against other settings and checks all four suites, their data pins,
+coverage and identical reports. Missing/failed tasks cannot pass qualification.
+
+Requirement: the wrapper must be stateless across calls, which cascade's
+wrappers are: the quantile head is deterministic, and the sample path seeds
+each window from its history. A wrapper that kept RNG state would give
+schedule-dependent numbers with more than one worker.
+
+No dataset cache is added. GIFT-Eval/BOOM data is already memory-mapped HF
+arrow on local disk. A pickled cache of the built, univariate-ized entries
+would add a second serialisation path (dtype, `pandas.Period` starts) that
+could change numbers. A paired sweep already builds each dataset once per
+pass. TIME's checkpoint-independent Seasonal-Naive metrics stay cached
+(`cache.py`), scoped to the data revision, task settings and scorer. Unknown or
+partial data is never persistently cached.
+
+### Pinning FEV data
+
+Stage the release's chosen FEV tasks and datasets under the same absolute
+paths on every eval worker. Keep horizons, windows, seasonality and task names
+when replacing Hub paths with local Parquet paths; set `dataset_config: null`.
+No implicit Hub downloads are allowed in a normal FEV sweep.
+
+```bash
+uv run --frozen --extra fev --project benchmarks cascade-benchmark-pin-fev \
+    /data/bench/fev/tasks.yaml /data/bench/fev/manifest.json
+```
+
+`--data-dir /data/bench` discovers that manifest automatically. Alternatively,
+use `--fev-manifest PATH` or `CASCADE_BENCH_FEV_MANIFEST`. The runner verifies
+task/data hashes before spawning workers and records the manifest identity in
+`data_revisions.fev`. Changed tasks during execution abort the suite.
+`--allow-unpinned-fev` is only for archived/diagnostic runs; its revision is
+`unknown`, and it cannot pass qualification. The direct-runtime wrapper uses
+the same verifier.
 
 Fast smoke run on a subset (avoids downloading/scoring the full benchmarks):
 
@@ -80,7 +194,7 @@ The three benchmarks live in HuggingFace dataset repos (`Salesforce/GiftEval`,
 uv run --project benchmarks cascade-benchmark-download --data-dir ./bench_data
 
 # ...or fetch-and-score in one shot (each suite reads <data-dir>/<suite>)
-uv run --project benchmarks cascade-benchmark CKPT out.json \
+uv run --frozen --extra time --project benchmarks cascade-benchmark CKPT out.json \
     --suites gift-eval,boom,time --data-dir ./bench_data --download
 ```
 
@@ -103,6 +217,10 @@ run. The manual env vars below still work if you manage the data yourself.
   data. `CASCADE_BENCH_TIME_DATASETS` optionally restricts the `name/freq`
   configs (default: all of TIME's bundled config). Without it the `time` suite
   reports `skipped`.
+- `CASCADE_BENCH_FEV_MANIFEST` — verified local FEV task/data manifest.
+  `--data-dir` also discovers `<data-dir>/fev/manifest.json`. Normal runs use
+  this manifest to set `CASCADE_BENCH_FEV_TASKS`; direct task-list/URL overrides
+  are for explicitly unpinned diagnostic runs only.
 
 ## Output shape
 
@@ -120,6 +238,11 @@ run. The manual env vars below still work if you manage the data yourself.
 `status` is `ok` | `skipped` | `error` per suite — one broken suite never aborts
 the others, and a skipped/errored suite is logged as such rather than emitting a
 fabricated number.
+
+A zero process exit means the report was written, not that every required
+suite passed. Check suite status, finite metrics, required rows and data/task
+revisions. Compare checkpoints only with compatible metric definitions,
+aggregation, coverage and revisions; a truncated sweep is not a full-battery result.
 
 ## How each suite plugs in
 
@@ -145,16 +268,27 @@ fabricated number.
   also TIME's own leaderboard aggregation). The baseline is checkpoint-independent,
   so it is **cached** (`cache.py`, `~/.cache/cascade_benchmark/time_snaive` or
   `CASCADE_BENCH_TIME_BASELINE_CACHE`; `CASCADE_BENCH_NO_CACHE=1` disables) and
-  computed at most once per task — the model forward is the only per-round cost.
+  computed at most once per task — the model forward is the only per-checkpoint cost.
   `CASCADE_BENCH_TIME_RAW=1` forces the legacy raw arithmetic mean (not
   baseline-normalized, so **not** comparable).
 
 Both `GIFT_EVAL` and `BOOM` env vars must point at the respective downloaded
 benchmark data (gift-eval layout); each suite `skip`s cleanly when unset.
 
+**FEV** uses its task and rolling-window API, with the scoring implementation in
+`fev_metrics.py`. It records univariate task CRPS/MASE and an in-suite
+Seasonal-Naive baseline; multivariate-target tasks are explicitly skipped.
+Its headline uses a baseline-normalized geometric mean, while signed per-task
+rows retain the inputs needed by the public guards. It is separate from the
+three-suite shifted-geomean description below.
+Reports explicitly label this `cascade-fev/1` adaptation. It is **not the full
+official FEV leaderboard protocol**: covariates are unused and multivariate
+targets remain outside its declared scope. Changing that scoring contract is
+a coordinated rule change, not a performance optimization.
+
 ### Aggregation (the headline number)
 
-All three suites are **not** a plain mean of per-dataset metrics. The headline
+GIFT-Eval, BOOM and TIME do **not** use a plain mean of per-dataset metrics. Their headline
 is the official one (`aggregate.py`, a faithful port of DataDog's
 `boom/utils/leaderboard.py`, the same methodology GIFT-Eval and TIME use):
 
@@ -170,17 +304,15 @@ baseline keys. So `metrics.crps` / `metrics.mase` are leaderboard-comparable
 (values near 1.0 ≈ Seasonal-Naive; lower is better). `crps_zero` / `mae_zero`
 report the zero-inflated pool.
 
-## Status
+## Verification
 
-Data loading, per-config metrics, and aggregation are all written against — and
+Data loading, per-config metrics, and aggregation are written against — and
 verified from — upstream source at the pinned commits (gift-eval `naive.ipynb` +
 `data.py`; DataDog `boom/utils/leaderboard.py` + vendored Seasonal-Naive
 results; TIME `chronos2.py` + `saver.py`). The aggregation math and GIFT-Eval/
 BOOM key-alignment are unit-tested (`tests/test_aggregate.py`; 97/97 GIFT-Eval
-keys match the baseline, model==baseline normalizes to 1.0).
-
-What is **not** yet exercised: the actual model inference path
-(`CheckpointPredictor` → gluonts `evaluate_model`), because that needs the
-installed env + GB-scale data. **Smoke-test with `--max-series 1`** after
-`uv sync --project benchmarks`. Refresh the embedded GIFT-Eval list / vendored
-baselines if you bump the pinned commits.
+keys match the baseline, model==baseline normalizes to 1.0). The model
+inference path needs the installed env and GB-scale data, so it is not in CI:
+**smoke-test with `--max-series 1`** after `uv sync --project benchmarks`.
+Refresh the embedded GIFT-Eval list / vendored baselines if you bump the pinned
+commits.

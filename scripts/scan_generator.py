@@ -52,8 +52,7 @@ SECRET_HINTS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "WALLET")
 # Dangerous members of `os` — the module itself is ubiquitous in legitimate
 # code, so `import os` is never flagged, but `from os import system` (which
 # also hides the later bare `system(...)` call from the dotted-name check)
-# is exactly the cheap evasion the from-import check closes (review
-# 2026-09-02).
+# is exactly the cheap evasion the from-import check closes.
 OS_DANGER_MEMBERS = {"system", "popen", "execl", "execle", "execlp", "execv",
                      "execve", "execvp", "execvpe", "spawnl", "spawnle",
                      "spawnlp", "spawnv", "spawnve", "spawnvp", "fork",
@@ -162,8 +161,7 @@ class _PyScan(ast.NodeVisitor):
                          f"dynamic import from a computed string: {name}()")
             else:
                 # A LITERAL runtime import bypasses the import-statement
-                # checks entirely — `__import__("socket")` was invisible
-                # (review 2026-09-02). Same module lists as the statements.
+                # checks entirely (`__import__("socket")`). Same module lists as the statements.
                 root = self._root(str(node.args[0].value))
                 if root in NET_MODULES | PROC_MODULES | FFI_MODULES:
                     _finding(self.out, "high", self.rel,
@@ -206,7 +204,7 @@ def scan_python(root: Path, out: list) -> None:
         # cover — ValueError (null bytes survive errors="replace"),
         # RecursionError (pathological nesting; also reachable from visit()) —
         # and an unhandled crash here takes down the whole sync instead of
-        # producing a finding (review 2026-09-02). Fail-visible: an
+        # producing a finding. Fail-visible: an
         # unanalyzable file is a HIGH finding, not a pass.
         try:
             tree = ast.parse(p.read_text(errors="replace"))

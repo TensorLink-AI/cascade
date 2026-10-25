@@ -2,10 +2,11 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<link rel="alternate" type="text/plain" href="llms.txt" title="Agent mining guide">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>cascade · subnet scoreboard</title>
+<title>cascade · scoreboard</title>
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
-<meta name="description" content="Cascade (Bittensor SN91) scoreboard: is real competition happening, how much have the forecasts improved, what model scale has been demonstrated, and what that progress costs — all computed live from the subnet's public signed record.">
+<meta name="description" content="Cascade (Bittensor SN91) scoreboard: how close the king model is to the best public forecasters on GIFT-Eval, the training behind it, and the competition that produced it.">
 <style>
 /* ============================================================
    cascade — stakeholder scoreboard
@@ -15,21 +16,10 @@
    IBM Plex Mono metrics), inlined below exactly as index.html
    carries them.
 
-   Reading order is CONCLUSION → EVIDENCE → DETAIL → METHODOLOGY.
-   The top is a single compact scoreboard — eight measures, two
-   rows — not eight cards. Sections are editorial: a question in
-   the title face, a one-sentence answer, then the visual, with
-   identifiers and formulae behind expanders.
-
-   Type scale:
-     wordmark            Fraunces 900 46px
-     section question    Manrope 800 ~26px
-     scoreboard value    Plex Mono 600 ~38px
-     answer line         Hanken 15.5px, --ink
-     body / captions     Hanken 13.5px, --muted
-     metadata            Plex Mono 10–11px caps, --faint
-   --muted is EXPLANATORY text and must stay comfortably readable
-   on --paper in light mode; --faint is true metadata only.
+   Owner 2026-10-10: few numbers, little text. Three blocks only:
+   the GIFT-Eval gap to the best public models (hero + ranked bars),
+   five big-number tiles, one trend chart. Labels and tooltips carry
+   the definitions; the mining dashboard (index.html) carries detail.
    ============================================================ */
 /* Brand faces, inlined exactly as index.html carries them
    (Fraunces · Manrope · Hanken Grotesk · IBM Plex Mono). */
@@ -556,8 +546,8 @@
   unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
 }
 :root {
-  --clay:#BF5B3D; --clay-700:#8C3F29; --clay-100:#F0D6CC;
-  --sage:#7E9B7E; --sage-700:#526B51; --sage-300:#A9C1A9; --sage-100:#DCE7DC;
+  --clay:#BF5B3D; --clay-700:#8C3F29;
+  --sage:#7E9B7E; --sage-700:#526B51; --sage-300:#A9C1A9;
   --saffron:#DBA047; --saffron-600:#C4882F;
   --slate:#33404E; --slate-500:#55677A; --slate-400:#7E8EA0;
   --bone-light:#F4ECE3;
@@ -569,13 +559,13 @@
   --font-mono:'IBM Plex Mono',ui-monospace,'SF Mono',Menlo,monospace;
 
   --paper:var(--mist); --surface:var(--mist-card); --ink:#2E3A47;
-  --muted:#526376;          /* explanatory copy — AA on --paper */
-  --faint:var(--slate-400); /* metadata only, never body copy */
+  --muted:#526376; --faint:var(--slate-400);
   --line:1px dashed var(--mist-border);
   --line-faint:1px dotted rgba(51,64,78,0.16);
   --accent:var(--sage); --accent-deep:var(--sage-700);
-  --good:var(--sage-700); --warn:var(--saffron-600);
-  --pending-fg:#8a6414;
+  --good:var(--sage-700); --warn:var(--saffron-600); --bad:var(--clay);
+  --bar:rgba(51,64,78,0.18); --bar-us:var(--sage);
+  --track:rgba(126,155,126,.18);
 }
 [data-theme="dark"] {
   --paper:#232D38; --surface:#29343F; --ink:var(--bone-light);
@@ -583,14 +573,16 @@
   --line:1px dashed rgba(229,219,201,0.26);
   --line-faint:1px dotted rgba(229,219,201,0.14);
   --accent:var(--sage-300); --accent-deep:var(--sage-300);
-  --good:var(--sage-300); --warn:var(--saffron);
-  --pending-fg:var(--saffron);
+  --good:var(--sage-300); --warn:var(--saffron); --bad:#E07A5F;
+  --bar:rgba(229,219,201,0.22); --bar-us:var(--sage-300);
+  --track:rgba(169,193,169,.16);
 }
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--paper);color:var(--ink);font:14.5px/1.55 var(--font-sans);
+[hidden]{display:none!important}
+body{background:var(--paper);color:var(--ink);font:14.5px/1.5 var(--font-sans);
   display:flex;justify-content:center;min-height:100vh;-webkit-font-smoothing:antialiased;
   transition:background .2s,color .2s}
-.page{width:100%;max-width:1300px;padding:28px 48px 110px;display:flex;flex-direction:column}
+.page{width:100%;max-width:1080px;padding:24px 40px 90px;display:flex;flex-direction:column;gap:34px}
 a{color:var(--accent-deep);text-decoration:none}
 a:hover{text-decoration:underline}
 
@@ -599,10 +591,9 @@ a:hover{text-decoration:underline}
   border-bottom:var(--line);padding:8px 0;font-family:var(--font-mono);font-size:11px;
   text-transform:uppercase;letter-spacing:.05em;color:var(--faint)}
 #top-bar b{color:var(--ink);font-weight:600}
-.tb-group{display:flex;gap:22px;align-items:center;flex-wrap:wrap}
+.tb-group{display:flex;gap:18px;align-items:center;flex-wrap:wrap}
 #tb-live{color:var(--good);font-weight:700;letter-spacing:.08em}
-.ldot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--good);
-  margin-right:5px;vertical-align:1px}
+.ldot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--good);margin-right:5px;vertical-align:1px}
 .net-badge{font-weight:700;letter-spacing:.08em;padding:3px 9px;border:1px solid currentColor;border-radius:2px}
 .net-badge.net-mainnet{color:var(--sage-700)}
 [data-theme="dark"] .net-badge.net-mainnet{color:var(--sage-300)}
@@ -610,252 +601,200 @@ a:hover{text-decoration:underline}
 .btn{background:none;border:var(--line);color:var(--ink);font:600 10px/1 var(--font-mono);
   text-transform:uppercase;letter-spacing:.06em;padding:6px 11px;cursor:pointer;border-radius:2px}
 .btn:hover{background:var(--accent);color:var(--bone-light);border-color:var(--accent);text-decoration:none}
-.btn.cta{border-color:var(--accent);color:var(--accent-deep)}
-/* community glyph links — quiet, theme-aware, hidden until a URL exists */
+.btn.on{outline:2px solid var(--accent);outline-offset:-2px}
 .soc{display:inline-flex;gap:13px;align-items:center}
 .soc a{color:var(--faint);display:inline-flex;align-items:center}
 .soc a:hover{color:var(--ink)}
 .soc svg{width:15px;height:15px;display:block;fill:currentColor}
-.data-banner{padding:9px 14px;border-radius:3px;font-size:13px;margin-top:14px}
+.data-banner{padding:9px 14px;border-radius:3px;font-size:13px}
 .data-banner.loading{color:var(--muted);border:1px dashed rgba(127,127,127,.4)}
 .data-banner.offline{color:#BF5B3D;background:rgba(191,91,61,.10);border:1px solid rgba(191,91,61,.45);font-weight:600}
 
-/* masthead — establish identity, then get out of the way */
-.header{text-align:center;display:flex;flex-direction:column;align-items:center;gap:6px;padding:18px 0 22px}
-.header .wordmark{font-family:var(--font-display);font-weight:900;font-size:46px;letter-spacing:-.03em;
-  color:var(--accent);line-height:1}
-.header .tagline{font-family:var(--font-mono);font-size:11px;color:var(--faint);
-  text-transform:uppercase;letter-spacing:.09em;margin-top:5px}
-.header .sub{color:var(--muted);max-width:72ch;margin-top:8px;font-size:13.5px}
+.header{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap}
+.header .wordmark{font-family:var(--font-display);font-weight:900;font-size:40px;letter-spacing:-.03em;color:var(--accent);line-height:1}
+.header .tagline{font-family:var(--font-mono);font-size:11px;color:var(--faint);text-transform:uppercase;letter-spacing:.09em}
 
-/* ── the hero: the ONE headline number above the scoreboard — the score
-   against the official Toto2. Sage tick once beaten, saffron while
-   closing; a quiet em-dash until the official baseline is benched. ── */
-.hero{display:flex;flex-direction:column;align-items:flex-start;text-align:left;gap:10px;
-  padding:6px 0 30px}
-.hero .hk{font-family:var(--font-mono);font-size:10.5px;font-weight:600;text-transform:uppercase;
-  letter-spacing:.16em;color:var(--faint)}
-.hero .hbar{width:30px;height:3px;background:var(--saffron);border-radius:1px}
-.hero.beaten .hbar{background:var(--accent)}
-.hero .hrow{display:flex;align-items:center;gap:34px;flex-wrap:wrap}
-.hero .hv{font-family:var(--font-mono);font-weight:600;font-size:clamp(58px,7.2vw,92px);
-  line-height:.95;color:var(--ink);letter-spacing:-.02em}
-.hero .hv .u{font-size:.38em;color:var(--muted);font-weight:500}
-/* completion meter: first published result → the official score. The track is
-   a lighter step of the fill's own ramp; endpoints labeled so the scale is
-   honest — it shows ground gained, not a 0-anchored almost-full bar. */
-.hero .meter{display:flex;flex-direction:column;gap:6px;min-width:210px}
-.hero .mtrack{position:relative;width:min(320px,36vw);height:6px;border-radius:3px;
-  background:rgba(126,155,126,.22)}
-.hero .mfill{position:absolute;left:0;top:0;bottom:0;border-radius:3px;background:var(--saffron)}
-.hero.beaten .mfill{background:var(--accent)}
-.hero .mlabels{display:flex;justify-content:space-between;width:min(320px,36vw);
-  font-family:var(--font-mono);font-size:9.5px;text-transform:uppercase;
-  letter-spacing:.06em;color:var(--faint)}
-.hero.pending .hv{color:var(--faint);font-weight:500;font-size:clamp(34px,3.6vw,46px)}
-.hero .hq{font-family:var(--font-mono);font-size:12px;color:var(--muted);line-height:1.6}
-.hero .hq b{color:var(--ink)}
-.hero.pending .hq{color:var(--faint)}
+/* labels: one style for every section kicker */
+.kicker{font-family:var(--font-mono);font-size:10.5px;font-weight:600;text-transform:uppercase;
+  letter-spacing:.14em;color:var(--faint);display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:baseline}
+.kicker .r{letter-spacing:.06em;font-weight:500}
+[title]{cursor:help}
+button[title],a[title]{cursor:pointer}
 
-/* ── the scoreboard: eight measures, two rows, one composition.
-   No row captions — spacing and metric order carry the grouping;
-   the numbers are the hero, labels and qualifiers recede. ── */
-.board{border-top:var(--line);border-bottom:var(--line)}
-.brow{padding:20px 0 22px}
-.brow+.brow{border-top:var(--line-faint)}
-.bcells{display:grid;grid-template-columns:repeat(4,1fr);gap:14px 44px}
-.cell{display:flex;flex-direction:column;gap:7px;min-width:0}
-.cell .bk{font-family:var(--font-mono);font-size:10px;font-weight:500;text-transform:uppercase;
-  letter-spacing:.08em;color:var(--faint);line-height:1.45}
-.cell .bar{width:22px;height:3px;background:var(--accent);border-radius:1px}
-.cell.s-pend .bar{background:var(--saffron)}
-.cell.s-warn .bar{background:var(--clay)}
-.cell.s-off .bar{background:var(--faint);opacity:.55}
-.cell .bv{font-family:var(--font-mono);font-weight:600;letter-spacing:-.01em;
-  font-size:clamp(32px,3.3vw,44px);line-height:1.04;color:var(--ink);white-space:nowrap}
-.cell.s-pend .bv,.cell.s-off .bv{color:var(--faint);font-weight:500}
-.cell .bq{font-family:var(--font-mono);font-size:11px;color:var(--muted);line-height:1.5}
-.cell.s-pend .bq,.cell.s-off .bq{color:var(--faint)}
-@media (max-width:1020px){.bcells{grid-template-columns:repeat(2,1fr);gap:18px 30px}}
-@media (max-width:430px){.bcells{grid-template-columns:1fr;gap:16px}}
+/* ── hero: gap to the best ── */
+.hero{display:grid;grid-template-columns:minmax(0,5fr) minmax(0,7fr);gap:26px 44px;align-items:start;
+  border-top:var(--line);border-bottom:var(--line);padding:22px 0 26px}
+.hero .big{display:flex;flex-direction:column;gap:8px}
+.hero .hv{font-family:var(--font-mono);font-weight:600;font-size:clamp(52px,7vw,88px);line-height:.95;letter-spacing:-.02em;color:var(--ink)}
+.hero .hv .u{font-size:.36em;color:var(--muted);font-weight:500;letter-spacing:0}
+.hero .hv.pend{font-size:clamp(34px,4vw,46px);color:var(--faint);font-weight:500}
+.hero .hl{font-family:var(--font-title);font-weight:800;font-size:clamp(17px,1.8vw,21px);letter-spacing:-.01em}
+.hero .hl.ahead{color:var(--good)}
+.hero .hl.behind{color:var(--warn)}
+.hero .hq{font-family:var(--font-mono);font-size:11.5px;color:var(--muted)}
+.hero .place{display:inline-flex;gap:8px;align-items:baseline;font-family:var(--font-mono);font-size:12px;color:var(--muted);margin-top:4px}
+.hero .place b{font-size:20px;color:var(--ink)}
+.metric-tog{display:inline-flex;gap:6px}
+/* ranked bars: shorter = better (lower error) */
+.rank{display:flex;flex-direction:column;gap:7px;margin-top:10px}
+.rk{display:grid;grid-template-columns:minmax(92px,150px) minmax(0,1fr) 58px;gap:10px;align-items:center;font-family:var(--font-mono);font-size:12px}
+.rk .n{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink)}
+.rk .n small{color:var(--faint);font-size:10px;margin-left:5px}
+.rk .t{position:relative;height:14px;background:var(--track);border-radius:2px}
+.rk .f{position:absolute;left:0;top:0;bottom:0;border-radius:2px;background:var(--bar)}
+.rk .v{text-align:right;color:var(--muted)}
+.rk.us .n{font-weight:700}
+.rk.us .f{background:var(--bar-us)}
+.rk.us .v{color:var(--ink);font-weight:700}
+.rk.best .n::after{content:" ◆";color:var(--warn);font-size:9px}
+.rank-foot{font-family:var(--font-mono);font-size:10px;color:var(--faint);margin-top:8px;display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap}
 
-/* ── editorial sections ── */
-section.q{border-top:var(--line);margin-top:52px;padding-top:30px}
-.sec-head{display:flex;justify-content:space-between;align-items:baseline;gap:14px;margin-bottom:12px}
-.sec-head h2{font-family:var(--font-title);font-weight:800;font-size:clamp(21px,2.3vw,27px);
-  letter-spacing:-.015em;color:var(--ink);line-height:1.2}
-.sec-head h2.sm{font-size:clamp(16px,1.7vw,19px)}
-.sec-head .when{font-family:var(--font-mono);font-size:10.5px;text-transform:uppercase;
-  letter-spacing:.05em;color:var(--faint);white-space:nowrap}
-.answer{font-size:15.5px;line-height:1.6;color:var(--ink);max-width:88ch;margin-bottom:22px}
-.answer b{font-weight:700}
-.lede{color:var(--muted);font-size:13.5px;max-width:86ch;margin-bottom:18px;line-height:1.65}
-.lede b{color:var(--ink)}
+/* ── tiles ── */
+.tiles{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px}
+.tile{border:var(--line);background:var(--surface);padding:14px 14px 12px;min-width:0;display:flex;flex-direction:column;gap:6px}
+.tile .k{font-family:var(--font-mono);font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tile .bar{width:20px;height:3px;background:var(--accent);border-radius:1px}
+.tile.s-pend .bar{background:var(--saffron)}
+.tile.s-off .bar{background:var(--faint);opacity:.55}
+.tile .v{font-family:var(--font-mono);font-weight:600;font-size:clamp(24px,2.7vw,34px);line-height:1.05;color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tile.s-pend .v,.tile.s-off .v{color:var(--faint);font-weight:500}
+.tile .q{font-family:var(--font-mono);font-size:10.5px;color:var(--muted);line-height:1.4}
+@media (max-width:960px){.tiles{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media (max-width:560px){.tiles{grid-template-columns:repeat(2,minmax(0,1fr))}}
 
-/* the best checkpoint: who set it, and the exact artifact to pull */
-.ckpt-ref{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:18px;
-  padding:12px 0 2px;border-top:var(--line-faint)}
-.ckpt-ref .ck{font-family:var(--font-mono);font-size:10px;font-weight:500;text-transform:uppercase;
-  letter-spacing:.08em;color:var(--faint)}
-.ckpt-ref code{font-family:var(--font-mono);font-size:12px;color:var(--ink);
-  overflow-wrap:anywhere;word-break:break-all;min-width:0;flex:1 1 320px}
-.ckpt-ref .cn{flex-basis:100%;font-family:var(--font-mono);font-size:10.5px;color:var(--faint)}
-.bench-six{grid-template-columns:repeat(3,1fr)}
-@media (max-width:1020px){.bench-six{grid-template-columns:repeat(2,1fr)}}
-@media (max-width:430px){.bench-six{grid-template-columns:1fr}}
-
-/* borderless measured-vs-guaranteed key */
-.figure-key{display:flex;gap:52px;flex-wrap:wrap;margin:0 0 8px}
-.fk{display:flex;flex-direction:column;gap:3px}
-.fk .fkl{font-family:var(--font-mono);font-size:10px;font-weight:700;text-transform:uppercase;
-  letter-spacing:.07em;color:var(--muted);display:flex;align-items:center;gap:8px}
-.fk .fkv{font-family:var(--font-mono);font-size:25px;font-weight:600;color:var(--ink)}
-.fk .fks{font-family:var(--font-mono);font-size:10.5px;color:var(--faint)}
-
-/* expanders — detail on demand, never in the way */
-details{border-top:var(--line-faint);margin-top:16px}
-details summary{cursor:pointer;list-style:none;padding:10px 0 0;font-family:var(--font-mono);
-  font-size:10.5px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);
-  display:flex;align-items:center;gap:7px}
-details summary::-webkit-details-marker{display:none}
-details summary::before{content:"+";font-weight:700;color:var(--accent-deep);width:9px}
-details[open] summary::before{content:"−"}
-details summary:hover{color:var(--ink)}
-.detail-body{font-size:12.5px;color:var(--muted);line-height:1.7;padding:10px 0 4px;max-width:88ch}
-.detail-body p+p{margin-top:9px}
-.detail-body b{color:var(--ink)}
-.detail-body code{font-family:var(--font-mono);font-size:11.5px;color:var(--ink)}
-.detail-body ul{margin:6px 0 0 17px}
-.detail-body li{margin-bottom:5px}
-
-/* timeline — the section's primary evidence once the table is collapsed.
-   Filled dot = a first-time leader, hollow dot = a returning one; the
-   baseline marker is neutral. Dates alternate above/below the rail. */
-.timeline{position:relative;padding:10px 0 6px}
-.tl-rail{position:relative;height:116px}
-.tl-line{position:absolute;left:0;right:0;top:56px;border-top:var(--line)}
-.tl-ev{position:absolute;top:0;height:116px;transform:translateX(-50%);white-space:nowrap;
-  display:flex;flex-direction:column;align-items:center}
-.tl-dot{width:13px;height:13px;border-radius:50%;background:var(--accent);
-  border:2px solid var(--paper);position:absolute;top:49px;box-shadow:0 0 0 1.5px var(--accent)}
-.tl-ev.ret .tl-dot{background:var(--paper)}
-.tl-ev.launch .tl-dot{background:var(--paper);box-shadow:0 0 0 1px var(--muted)}
-.tl-lab{position:absolute;left:50%;transform:translateX(-50%);font-family:var(--font-mono);
-  font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
-.tl-lab.who{top:30px;color:var(--ink);font-weight:700}
-.tl-ev.launch .tl-lab.who{color:var(--muted);font-weight:400}
-.tl-lab.date{top:76px}
-.tl-ev.alt .tl-lab.who{top:92px}
-.tl-ev.alt .tl-lab.date{top:12px}
-.tl-note{font-family:var(--font-mono);font-size:10.5px;color:var(--muted);text-transform:uppercase;
-  letter-spacing:.05em;margin-top:6px}
-
-/* chart */
-.chart-wrap{width:100%;aspect-ratio:2.35/1;min-height:280px}
+/* ── trend ── */
+.chart-wrap{width:100%;aspect-ratio:2.6/1;min-height:200px}
 .chart-wrap svg{width:100%;height:100%;display:block}
-.chart-meta{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;
-  font-family:var(--font-mono);font-size:11px;text-transform:uppercase;margin-top:12px;color:var(--muted)}
-.legend{display:flex;gap:16px;align-items:center;flex-wrap:wrap}
+.chart-meta{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;font-family:var(--font-mono);font-size:10.5px;text-transform:uppercase;letter-spacing:.04em;margin-top:8px;color:var(--muted)}
+.legend{display:flex;gap:14px;align-items:center;flex-wrap:wrap}
 .legend span{display:inline-flex;align-items:center;gap:6px}
-.swatch{width:16px;height:4px;display:inline-block}
+.swatch{width:16px;height:3px;display:inline-block}
 .swatch.dashed{background:repeating-linear-gradient(90deg,currentColor 0 4px,transparent 4px 7px)}
-
-/* scaling ladder — discs sitting on a ground line, sized by scale */
-.ladder{display:flex;padding:14px 4px 0;--lscale:1}
-.lr{flex:1;display:flex;flex-direction:column;align-items:center;gap:10px;min-width:0}
-.lr .disc-box{width:100%;height:calc(74px*var(--lscale));display:flex;align-items:flex-end;
-  justify-content:center;border-bottom:var(--line)}
-.lr .disc{border-radius:50%;display:flex;align-items:center;justify-content:center;
-  font-family:var(--font-mono);font-weight:700;color:var(--bone-light);margin-bottom:-1px}
-.lr.done .disc{background:var(--accent);box-shadow:0 0 0 1px var(--accent-deep);font-size:11px}
-.lr.next .disc{border:2px dashed var(--saffron);background:transparent}
-.lr.plan .disc{border:1px solid var(--faint);opacity:.5;background:transparent}
-.lr .lp{font-family:var(--font-mono);font-size:15px;font-weight:600;color:var(--faint)}
-.lr.done .lp{color:var(--good)}
-.lr.next .lp{color:var(--ink)}
-.lr .ls{font-family:var(--font-mono);font-size:9px;text-transform:uppercase;
-  letter-spacing:.09em;color:var(--faint);margin-top:-5px}
-.lr.done .ls{color:var(--good)}
-.lr.next .ls{color:var(--pending-fg)}
-@media (max-width:640px){.ladder{--lscale:.7}}
-
-/* tables */
-.scroll-box{overflow:auto;scrollbar-width:thin;max-height:330px}
-.scroll-box::-webkit-scrollbar{width:5px;height:5px}
-.scroll-box::-webkit-scrollbar-thumb{background:var(--accent)}
-table{width:100%;border-collapse:collapse;font-family:var(--font-mono);font-size:12px}
-th{text-transform:uppercase;font-weight:700;font-size:9.5px;letter-spacing:.06em;text-align:left;
-  padding:9px 16px 9px 0;border-bottom:var(--line);background:var(--paper);position:sticky;top:0;
-  z-index:1;white-space:nowrap;color:var(--muted)}
-td{padding:8px 16px 8px 0;white-space:nowrap;color:var(--ink)}
-tr{border-bottom:var(--line-faint)}
-tbody tr:hover td{background:var(--accent);color:var(--bone-light)}
-tbody tr:hover td a{color:var(--bone-light)}
-.num{text-align:right}
-th.num{text-align:right}
-.muted{color:var(--muted)}
-.faint{color:var(--faint)}
-.badge{font-family:var(--font-mono);font-size:9px;font-weight:700;text-transform:uppercase;
-  letter-spacing:.05em;padding:1px 7px;border-radius:999px;border:1px solid currentColor;white-space:nowrap}
-.badge.new{color:var(--good)}
-.badge.ret{color:var(--faint)}
-.empty{color:var(--muted);text-transform:uppercase;padding:16px 0;text-align:center;
-  font-family:var(--font-mono);font-size:11px;letter-spacing:.05em}
-
-/* pending narrative — quiet, borderless, informative */
-.pending-panel{padding:2px 0;display:flex;flex-direction:column;gap:6px}
-.pending-panel .ph{font-family:var(--font-mono);font-weight:700;font-size:10.5px;
-  text-transform:uppercase;letter-spacing:.07em;color:var(--pending-fg)}
-.pending-panel p{font-size:13.5px;color:var(--muted);max-width:84ch;line-height:1.65}
-.pending-panel p b{color:var(--ink)}
-/* pretraining campaign — one progress row per ladder size, same visual
-   language as the hero meter (thin track, saffron in flight, sage done) */
-.pboard{margin-top:12px}
-.prow{display:grid;grid-template-columns:56px minmax(140px,1fr) minmax(220px,auto);gap:18px;
-  align-items:center;padding:11px 0;border-top:var(--line-faint)}
-.prow:last-child{border-bottom:var(--line-faint)}
-.prow .pz{font-family:var(--font-mono);font-size:14px;font-weight:600;color:var(--faint)}
-.prow.run .pz{color:var(--ink)}
-.prow.full .pz{color:var(--good)}
-.prow .ptrack{position:relative;height:6px;border-radius:3px;background:rgba(126,155,126,.22)}
-.prow .pfill{position:absolute;left:0;top:0;bottom:0;border-radius:3px;background:var(--saffron)}
-.prow.full .pfill{background:var(--accent)}
-.prow .pnote{font-family:var(--font-mono);font-size:11px;letter-spacing:.03em;
-  color:var(--muted);text-align:right;white-space:nowrap}
-.prow.off .pnote,.prow.off .ptrack{opacity:.55}
-.prow.off .pnote{color:var(--faint)}
-@media (max-width:640px){
-  .prow{grid-template-columns:44px 1fr;gap:8px 14px}
-  .prow .pnote{grid-column:1 / -1;text-align:left}
-}
-
-/* benchmark result cells reuse the scoreboard anatomy */
-.bench-cells{max-width:820px}
-
-/* method */
-.method{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:20px 32px}
-.method dt{font-family:var(--font-mono);font-size:11px;text-transform:uppercase;letter-spacing:.06em;
-  color:var(--ink);font-weight:700;margin-bottom:5px}
-.method dd{font-size:12.5px;color:var(--muted);line-height:1.65}
-.method code{font-family:var(--font-mono);font-size:11.5px;color:var(--ink)}
-.foot{font-size:12.5px;color:var(--muted);line-height:1.7;max-width:88ch}
+.foot{font-family:var(--font-mono);font-size:10.5px;color:var(--faint);border-top:var(--line-faint);padding-top:12px;display:flex;gap:14px;flex-wrap:wrap}
 
 @media (max-width:760px){
-  .page{padding:20px 18px 70px}
-  section.q{margin-top:40px;padding-top:24px}
-  .header{padding:18px 0 22px}
-  .header .wordmark{font-size:36px}
-  .chart-wrap{aspect-ratio:1.5/1}
-  table{min-width:620px}
-  /* a date label is wider than the gap between markers at this width — keep the
-     rail readable (dots + reign numbers) and let the table carry the dates */
-  .tl-lab.date{display:none}
-  .tl-rail{height:56px}
-  .tl-line{top:30px}
-  .tl-dot{top:25px}
-  .tl-lab.who{top:6px}
-  .tl-ev.alt .tl-lab.who{top:40px}
+  .page{padding:18px 16px 64px;gap:26px}
+  .hero{grid-template-columns:1fr;gap:18px}
+  .header .wordmark{font-size:32px}
+  .chart-wrap{aspect-ratio:1.6/1}
 }
+
+.info-icon { display:inline-flex; align-items:center; justify-content:center; padding:2px 4px; margin-left:4px; border:0; background:transparent; color:var(--muted); font:15px/1 var(--font-sans); vertical-align:middle; cursor:help; text-transform:none; }
+.info-icon:hover, .info-icon:focus-visible { color:var(--ink); }
+.info-icon:focus-visible { outline:2px solid var(--good); outline-offset:2px; }
+.info-tooltip { position:fixed; z-index:100; width:min(360px,calc(100vw - 24px)); max-height:calc(100vh - 24px); overflow:auto; padding:12px 14px; border:1px solid var(--muted); background:var(--paper); color:var(--ink); box-shadow:0 4px 18px rgba(0,0,0,.15); font:13px/1.55 var(--font-sans); white-space:normal; text-transform:none; letter-spacing:normal; pointer-events:none; }
+
+/* Dashboard adaptation of https://www.cascade.industries/styles/cascade-v2.css.
+   Keep the landing site's Manrope/Fraunces/IBM Plex Mono roles and forest palette. */
+:root {
+  --font-sans:'Manrope',system-ui,-apple-system,sans-serif;
+  --font-body:var(--font-sans);
+  --paper:#F3EFE6; --surface:#FCF9F2; --ink:#141B17;
+  --muted:#596258; --faint:#737B70;
+  --line:1px solid rgba(20,27,23,.22); --line-faint:1px solid rgba(20,27,23,.12);
+  --chal:#485F50; --chal-line:#485F50; --good:#3F6550;
+  --accent:#485F50; --accent-deep:#3F6550; --brand-coral:#EE6254;
+  --king:#141B17; --hatch:rgba(72,95,80,.07);
+}
+:root[data-theme="dark"] {
+  --paper:#141B17; --surface:#1B2520; --ink:#E8E1D3;
+  --muted:#AFAF9F; --faint:#929B8E;
+  --line:1px solid rgba(232,225,211,.25); --line-faint:1px solid rgba(232,225,211,.12);
+  --chal:#485F50; --chal-line:#A9C1A9; --good:#A9C1A9;
+  --accent:#A9C1A9; --accent-deep:#A9C1A9; --king:#E8E1D3;
+  --hatch:rgba(169,193,169,.08); --bar:rgba(232,225,211,.24);
+  --bar-us:#A9C1A9; --track:rgba(169,193,169,.16);
+}
+body { font-family:var(--font-sans); font-size:14px; }
+a:hover { color:var(--brand-coral); }
+::selection { background:var(--brand-coral); color:#141B17; }
+:focus-visible { outline:2px solid var(--brand-coral); outline-offset:3px; }
+.page { gap:28px; }
+.header { align-items:flex-start; text-align:left; }
+.header .wordmark, .wordmark { color:var(--ink); font-family:var(--font-display); font-weight:600; }
+.header .meta { align-items:flex-start; text-align:left; margin-top:4px; text-transform:none; }
+.header .tagline { color:var(--muted); font-family:var(--font-mono); letter-spacing:.12em; }
+.section-label { border-bottom:var(--line-faint); margin-bottom:16px; }
+.section-label > span:first-child, .kicker > span:first-child {
+  font-family:var(--font-title); font-size:20px; font-weight:800;
+  letter-spacing:-.04em; text-transform:none;
+}
+.kicker { align-items:center; }
+.btn, #theme-toggle { min-height:34px; padding:9px 12px; font-family:var(--font-mono); font-weight:400; letter-spacing:.09em; border:var(--line); }
+.page-tabs { gap:8px; }
+.page-tabs .btn { min-height:40px; padding:12px 16px; }
+.page-tabs .btn.active, .btn.on { background:#485F50; color:#E8E1D3; border-color:#485F50; }
+.btn:hover, #theme-toggle:hover { background:var(--brand-coral); color:#141B17; border-color:var(--brand-coral); }
+.panel, .verdict, .dom-card, .train-tiles .tile { border:var(--line); background:var(--surface); }
+.stat .k, .tile .k, .lineage-heading { font-family:var(--font-mono); font-weight:400; letter-spacing:.08em; }
+.train-tiles .tile .k { display:flex; align-items:center; justify-content:space-between; gap:4px; white-space:normal; overflow:visible; }
+.info-icon { flex:none; color:var(--muted); }
+.info-icon:hover, .info-icon[aria-expanded="true"] { color:var(--brand-coral); }
+.benchmark-matrix thead th { color:var(--ink); font-family:var(--font-title); font-size:15px; font-weight:800; letter-spacing:-.025em; text-transform:none; }
+.benchmark-matrix tbody th { text-align:left; }
+.benchmark-matrix td { color:var(--ink); padding-top:20px; padding-bottom:20px; }
+.benchmark-matrix tr:last-child td, .benchmark-matrix tr:last-child th { border-bottom:0; }
+.lineage-heading { margin-top:16px; }
+.tile .v, .stat .v { font-family:var(--font-mono); }
+.hero .hv { font-family:var(--font-title); font-weight:800; letter-spacing:-.045em; }
+.v2-state.live { color:var(--good); }
+@media (max-width:640px) {
+  .section-label > span:first-child, .kicker > span:first-child { font-size:17px; }
+  .page-tabs .btn { padding:10px; min-height:38px; letter-spacing:.04em; }
+  .benchmark-matrix thead th { font-size:11px; }
+  .benchmark-matrix td { font-size:15px; padding-top:16px; padding-bottom:16px; }
+}
+
+
+/* Numeric summaries share a frame and fine internal rules, like a table. */
+.tiles { grid-template-columns:repeat(5,minmax(0,1fr)); }
+.header .meta a { overflow-wrap:anywhere; }
+th + th, td + td { border-inline-start:var(--line-faint); }
+th, td, .stat .v, .tile .v, .gate-cell .v { font-variant-numeric:tabular-nums; }
+.benchmark-matrix th, .benchmark-matrix td { border-bottom:var(--line-faint); }
+.benchmark-matrix th, .benchmark-matrix td, .benchmark-matrix tbody tr:hover td { background:var(--surface); }
+.benchmark-matrix tbody tr:hover { background:var(--surface); }
+#train-stats { display:block; }
+.lineage-heading { padding:4px 0 12px; }
+.lineage-grid, .tiles { gap:0; border:var(--line); overflow:hidden; }
+.lineage-grid > .tile, .tiles > .tile { border:0; border-inline-end:var(--line-faint); min-height:88px; padding:14px 16px; }
+.lineage-grid > .tile:last-child, .tiles > .tile:last-child { border-inline-end:0; }
+.lineage-grid > .tile.hl { border-inline-end:var(--line-faint); background:var(--surface); }
+.verdict { padding:0; gap:0; overflow:hidden; }
+.verdict::before { display:none; }
+.verdict > .stat { padding:14px 16px; border-inline-end:var(--line-faint); border-bottom:var(--line-faint); min-height:80px; }
+.stat .k { display:flex; align-items:center; justify-content:space-between; gap:4px; white-space:normal; overflow:visible; }
+.gate-row { gap:0; border:var(--line-faint); }
+.gate-row:has(> .gate-cell:nth-child(4)) { grid-template-columns:repeat(4,minmax(0,1fr)); }
+.gate-cell { min-width:0; padding:14px; border-inline-end:var(--line-faint); }
+.gate-cell:last-child { border-inline-end:0; }
+.dom-card { gap:0; }
+.dom-card .dh { padding-bottom:12px; border-bottom:var(--line-faint); }
+.dom-card .row { padding:8px 0; border-bottom:var(--line-faint); }
+.dom-card .sec-k { margin-top:12px; padding:10px 0; border-top:0; }
+@media (max-width:1000px) and (min-width:641px) {
+  .tiles { grid-template-columns:repeat(3,minmax(0,1fr)); }
+  .lineage-grid > .tile, .tiles > .tile { border-bottom:var(--line-faint); }
+  .lineage-grid > .tile:nth-child(3), .tiles > .tile:nth-child(3) { border-inline-end:0; }
+  .lineage-grid > .tile:nth-child(n+4), .tiles > .tile:nth-child(n+4) { border-bottom:0; }
+  .lineage-grid > .tile:last-child, .tiles > .tile:last-child { grid-column:span 2; }
+}
+@media (max-width:860px) {
+  .gate-row, .gate-row:has(> .gate-cell:nth-child(4)) { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .gate-cell { border-bottom:var(--line-faint); }
+  .gate-cell:nth-child(2n) { border-inline-end:0; }
+  .gate-cell:last-child:nth-child(odd) { grid-column:span 2; }
+  .gate-cell:last-child { border-bottom:0; }
+  .gate-row:has(> .gate-cell:nth-child(4)) .gate-cell:nth-child(n+3) { border-bottom:0; }
+}
+@media (max-width:640px) {
+  .tiles { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .lineage-grid > .tile, .tiles > .tile { border-bottom:var(--line-faint); padding:12px; }
+  .lineage-grid > .tile:nth-child(2n), .tiles > .tile:nth-child(2n) { border-inline-end:0; }
+  .lineage-grid > .tile:last-child, .tiles > .tile:last-child { grid-column:span 2; border-bottom:0; }
+  .verdict > .stat, .gate-cell { padding:12px; }
+}
+
 </style>
 </head>
 <body>
@@ -867,14 +806,12 @@ th.num{text-align:right}
       <span id="net-badge" class="net-badge net-mainnet">MAINNET</span>
       <span id="tb-live" hidden><i class="ldot"></i>LIVE</span>
       <span>SUBNET <b id="tb-netuid">--</b></span>
-      <span>ROUNDS <b id="tb-rounds">--</b></span>
       <span>UPDATED <b id="tb-updated">--</b></span>
     </div>
     <div class="tb-group">
       <span class="soc" id="soc-links"></span>
-      <a class="btn cta" href="https://github.com/TensorLink-AI/cascade/blob/main/docs/MINER.md"
-         target="_blank" rel="noopener">Mine with your agent →</a>
-      <a class="btn" href="index.html">Technical dashboard →</a>
+      <a class="btn" href="index.html">Mining dashboard →</a>
+      <a class="btn" href="llms.txt">Agents</a>
       <button id="theme-toggle" class="btn">DARK</button>
     </div>
   </div>
@@ -883,248 +820,46 @@ th.num{text-align:right}
 
   <div class="header">
     <span class="wordmark">cascade</span>
-    <span class="tagline">Subnet scoreboard</span>
-    <p class="sub">Computed live from the subnet&rsquo;s public, signed record — nothing typed in by hand.</p>
+    <span class="tagline">Scoreboard · Bittensor SN91</span>
   </div>
 
-  <!-- the one headline number, then the scoreboard -->
+  <!-- 1. the one question: how close is the king to the best public models -->
   <section>
+    <div class="kicker"><span>GIFT-Eval · vs Timestral-209M</span>
+      <span class="r"><span class="metric-tog">
+        <button class="btn on" data-metric="mase" title="Point-forecast accuracy: MASE, Seasonal-Naive-normalised geometric mean over the 97 GIFT-Eval configs (the leaderboard's own aggregation). Lower is better.">MASE</button>
+        <button class="btn" data-metric="crps" title="Probabilistic accuracy: CRPS (mean weighted quantile loss), same aggregation. Lower is better.">CRPS</button>
+      </span></span></div>
     <div class="hero" id="hero"></div>
-    <div class="board" id="board"></div>
   </section>
 
-  <!-- competition -->
-  <section class="q">
-    <div class="sec-head"><h2>Is the competition working?</h2>
-      <span class="when" id="deth-when"></span></div>
-    <p class="answer" id="comp-answer">--</p>
-    <div class="timeline" id="timeline"></div>
-    <details>
-      <summary>View full lead history</summary>
-      <div class="detail-body">
-        <p>Rows are reigns, newest first, read straight from the signed round record: the miner
-        that took the lead, when, and by how much it beat the previous leader in a same-round
-        head-to-head. <b>First-time</b> marks a miner taking the lead for the first time.
-        <b>Miner</b> numbers are network UIDs;
-        <b>Entry</b> links to the exact submitted model; <b>Round</b> is the signed record that
-        awarded the win. Miner UIDs can be re-used by the network over time, so the
-        first-time/returning badges are matched on the miner&rsquo;s cryptographic key, not the UID.</p>
-      </div>
-      <div class="scroll-box" style="margin:4px 0 6px">
-        <table><thead><tr>
-          <th>#</th><th>Took the lead</th><th>Leader</th><th class="num">Won by</th>
-          <th class="num">Rounds held</th><th>Entry</th><th>Round</th>
-        </tr></thead><tbody id="reigns"></tbody></table>
-      </div>
-    </details>
+  <!-- 2. big numbers -->
+  <section>
+    <div class="tiles" id="tiles"></div>
   </section>
 
-  <!-- performance vs baseline -->
-  <section class="q">
-    <div class="sec-head"><h2>Are the forecasts getting better?</h2>
-      <span class="when" id="perf-when"></span></div>
-    <p class="answer" id="perf-answer">--</p>
-    <div class="figure-key" id="figure-key" hidden></div>
-    <div class="chart-wrap"><svg id="chart-perf" preserveAspectRatio="none" role="img"
-      aria-label="Cumulative forecast improvement over the day-one baseline, by round"></svg></div>
+  <!-- 3. one trend -->
+  <section>
+    <div class="kicker"><span id="trend-title">King vs Timestral-209M</span><span class="r" id="trend-when"></span></div>
+    <div class="chart-wrap"><svg id="chart-gap" preserveAspectRatio="none" role="img"
+      aria-label="The king's GIFT-Eval gap to the reference model, by settlement"></svg></div>
     <div class="chart-meta">
-      <div class="legend">
-        <span><i class="swatch" style="background:var(--accent)"></i> Measured improvement</span>
-        <span><i class="swatch dashed" style="color:var(--saffron)"></i> Guaranteed minimum</span>
-        <span class="faint">| marks a change of lead</span>
-      </div>
-      <span id="perf-note">--</span>
+      <span class="legend">
+        <span><i class="swatch" style="background:var(--accent)"></i>King</span>
+        <span><i class="swatch dashed" style="color:var(--warn)"></i><span id="trend-ref">Timestral-209M</span></span>
+      </span>
+      <span id="trend-note">--</span>
     </div>
-    <details>
-      <summary>How this is measured</summary>
-      <div class="detail-body">
-        <p id="baseline-def"></p>
-        <p>Every round, the subnet tests entries on a <b>fresh set of hidden data</b>. That stops
-        anyone tuning their entry to the test — but it also means a score from round&nbsp;1 and a
-        score from round&nbsp;80 were taken on different data and can&rsquo;t be compared head to
-        head.</p>
-        <p>What <i>can</i> be compared is each change of lead: the old leader and the challenger are
-        tested on the <b>exact same data, in the same round</b>. So we record how much better the
-        winner was at each handover, and multiply those steps together. Difficulty of the data
-        cancels out at every step.</p>
-        <p>The <b>guaranteed minimum</b> uses the cautious end of each measurement instead of
-        the best estimate — the same threshold the subnet itself required before awarding the win.
-        Reality sits between the two lines, and the gap is the honest margin of error.</p>
-        <p class="muted"><code>improvement = 1 − Π(challenger_error ÷ leader_error)</code> across
-        lead changes; the minimum line substitutes each round&rsquo;s 95% bootstrap lower bound.</p>
-      </div>
-    </details>
   </section>
 
-  <!-- scaling -->
-  <section class="q">
-    <div class="sec-head"><h2>How big are the models?</h2>
-      <span class="when" id="scale-when"></span></div>
-    <p class="answer" id="scale-answer">--</p>
-    <div class="ladder" id="ladder"></div>
-    <details>
-      <summary>What &ldquo;proven&rdquo; means here</summary>
-      <div class="detail-body">
-        <p>A step on this ladder counts as proven only after the whole competition — training,
-        screening, hidden-data evaluation and a signed verdict — has actually run at that size.
-        Planned sizes are the roadmap, never shown as achieved.</p>
-      </div>
-    </details>
-  </section>
-
-  <!-- vs the official Toto2 -->
-  <section class="q">
-    <div class="sec-head"><h2>Is it catching the official Toto2?</h2>
-      <span class="when" id="ref-when"></span></div>
-    <p class="answer" id="ref-answer">--</p>
-    <div id="ref-panel"></div>
-    <details>
-      <summary>How the head-to-head is measured</summary>
-      <div class="detail-body">
-        <p>Cascade trains the <b>same Toto2 architecture</b> the official Datadog release uses —
-        the layer shapes are pinned against the official checkpoint&rsquo;s own config — from
-        <b>random initialisation</b>, so no official weights are reused. At each ladder size the
-        comparison is therefore: same model, same size, <b>different training data</b>.</p>
-        <p>Both sides are scored by the <b>identical benchmark battery</b> (GIFT-Eval, BOOM, TIME;
-        CRPS + MASE; pinned data revisions): the official checkpoint is run through the same
-        sidecar as every round checkpoint and published as a reference doc
-        (<code>benchmarks/reference-&lt;size&gt;.json</code>), so no number here is transcribed
-        from a leaderboard. The percentage compares six-score geometric means (lower is better).</p>
-        <p>The fight is deliberately uneven: the official release was trained on its full corpus
-        at full budget, while every Cascade checkpoint is trained under the round&rsquo;s fixed,
-        published compute budget. And as everywhere on this page, these scores are
-        <b>report-only</b> — rounds are still settled on hidden data, never on public benchmarks.</p>
-      </div>
-    </details>
-  </section>
-
-  <!-- the best checkpoint itself -->
-  <section class="q">
-    <div class="sec-head"><h2>Which checkpoint is the best so far?</h2>
-      <span class="when" id="best-when"></span></div>
-    <p class="answer" id="best-answer">--</p>
-    <div id="best-panel"></div>
-    <details>
-      <summary>How the best checkpoint is picked, and how to get it</summary>
-      <div class="detail-body">
-        <p>Every round&rsquo;s trainer-signed benchmark report
-        (<code>benchmarks/round-&lt;id&gt;.json</code>) scores its duel checkpoints on the same
-        six-number battery. The best checkpoint is the one with the <b>lowest combined score</b>
-        (the geometric mean of all six; lower is better) across the recent reports this page
-        loads &mdash; king or challenger, whoever set it. It is report-only: the throne is still
-        decided on hidden data, so the best-benched checkpoint need not be the current king.</p>
-        <p>Each metric is set against the official Toto2 reference doc at the same size; a
-        <b>sage</b> tile beats the official number, a <b>saffron</b> one still trails it.</p>
-        <p>The checkpoint is a content-addressed artifact on the Hippius Hub
-        (<code>repo@sha256:&hellip;</code>, the same pointer the manifest and receipts carry).
-        It is an <b>anonymous pull</b> from <code>registry.hippius.com</code> &mdash; no account
-        or key needed &mdash; and the digest pins the exact bytes that were benched.</p>
-      </div>
-    </details>
-  </section>
-
-  <!-- pretraining completion -->
-  <section class="q">
-    <div class="sec-head"><h2>How far along is the pretraining?</h2>
-      <span class="when" id="pretrain-when"></span></div>
-    <p class="answer" id="pretrain-answer">--</p>
-    <div id="pretrain-panel"></div>
-    <details>
-      <summary>How the steps are counted</summary>
-      <div class="detail-body">
-        <p>Every round trains under a <b>fixed, published compute contract</b>: a set token budget
-        per checkpoint (hours &times; reference throughput), at a set global batch size and context
-        length. Steps per round is just that budget divided by tokens per step — nothing here is
-        measured off a training log; it is the contracted spend.</p>
-        <p>The champion&rsquo;s cumulative pretraining counts the latest round plus every
-        consecutive earlier round whose training was <b>warm-started</b> from the previous
-        round&rsquo;s promoted checkpoint (recorded on each round&rsquo;s signed manifest). A round
-        that trained from scratch resets the chain. Until carry-forward is switched on, every
-        chain is exactly one round long — that is stated, not hidden.</p>
-        <p>Each ladder size gets its own bar because Cascade&rsquo;s goal at every size is a
-        <b>full Toto2-scale pretraining</b>: the target behind each bar is the official
-        release&rsquo;s own step count at that size, transcribed from its published training
-        recipe. Until a size&rsquo;s figure is transcribed its bar shows the banked steps with the
-        target marked pending — never a guessed percentage. A size with no judged rounds yet
-        reads &ldquo;not started&rdquo;.</p>
-      </div>
-    </details>
-  </section>
-
-  <!-- efficiency -->
-  <section class="q">
-    <div class="sec-head"><h2>Is the progress worth the compute?</h2>
-      <span class="when" id="eff-when"></span></div>
-    <p class="answer" id="eff-answer">--</p>
-    <div class="chart-wrap"><svg id="chart-eff" preserveAspectRatio="none" role="img"
-      aria-label="Verified improvement per trillion training tokens, by round"></svg></div>
-    <div class="chart-meta">
-      <div class="legend">
-        <span><i class="swatch" style="background:var(--accent)"></i> Improvement per trillion training tokens</span>
-      </div>
-      <span id="eff-note">--</span>
-    </div>
-    <details>
-      <summary>How the training cost is counted</summary>
-      <div class="detail-body" id="eff-caveat"></div>
-    </details>
-  </section>
-
-  <!-- public benchmark -->
-  <section class="q">
-    <div class="sec-head"><h2>How does it score on public tests?</h2>
-      <span class="when" id="bench-when"></span></div>
-    <p class="answer" id="bench-answer">--</p>
-    <div id="bench-panel"></div>
-    <details>
-      <summary>Which benchmarks, and why they don&rsquo;t affect the competition</summary>
-      <div class="detail-body">
-        <p>GIFT-Eval, BOOM and TIME — three open forecasting benchmarks anyone can run, scored the
-        same way their public leaderboards do, so the numbers are directly comparable to published
-        results. <b>1.00 is the Seasonal-Naive baseline</b> — the standard yardstick these
-        leaderboards divide by: a forecast that simply repeats the most recent seasonal pattern.
-        <b>Below 1.00 beats it.</b></p>
-        <p>Each benchmark reports two scores. <b>MASE</b> measures how accurate the central
-        forecast is; <b>CRPS</b> measures how well the model&rsquo;s uncertainty range matched what
-        actually happened. Both are relative to the baseline at 1.00, and lower is better for
-        both. The large number in each tile is the MASE.</p>
-        <p>These scores are <b>reported only</b>. They never decide who wins a round. The benchmark
-        data is public, so scoring on it would just reward entries tuned to it; the competition is
-        settled on hidden data instead.</p>
-        <p>A trainer-signed report (<code>benchmarks/round-&lt;id&gt;.json</code>) is published after
-        a round&rsquo;s duel when the battery completes for at least one checkpoint. Some rounds have
-        none — the battery can fail, or a report can land late — which is normal; the page probes
-        the recent record for the reports that actually exist.</p>
-      </div>
-    </details>
-  </section>
-
-  <!-- compounding -->
-  <section class="q">
-    <div class="sec-head"><h2>Does progress carry forward?</h2>
-      <span class="when" id="warm-when"></span></div>
-    <p class="answer" id="warm-answer">--</p>
-    <div id="warm-panel"></div>
-  </section>
-
-  <!-- method -->
-  <section class="q">
-    <div class="sec-head"><h2 class="sm">Checking these numbers</h2>
-      <span class="when">Sources</span></div>
-    <p class="foot" id="foot"></p>
-    <details>
-      <summary>Where each number comes from</summary>
-      <dl class="method" id="method"></dl>
-    </details>
-  </section>
+  <div class="foot" id="foot"></div>
 
 </div>
 
 <script>
 // ── config ──────────────────────────────────────────────────────────────────
-// Mirrors index.html: the network is chosen by hostname, and receipts are read
-// same-origin first (CORS-free behind the Vercel rewrite or straight from the
-// bucket), with the absolute Hippius endpoints raced as a fallback.
+// Mirrors index.html: network by hostname; bucket endpoints tried in order,
+// the same-origin Vercel proxy last.
 var IS_TESTNET = /testnet/.test(location.hostname);
 var BUCKET = IS_TESTNET ? "cascade-testnet-manifests" : "cascade-manifests";
 var SAME_ORIGIN = location.pathname.replace(/\/[^/]*$/, "").replace(/\/$/, "");
@@ -1134,81 +869,34 @@ var ENDPOINTS = [
   "https://us-east-1.hippius.com/" + BUCKET,
   "https://eu-central-1.hippius.com/" + BUCKET
 ];
-// Trust anchor: the validator hotkey whose signed trail the verdict panels and
-// cascade-audit pin. Peers publish into the same shared index; entries are
-// collapsed in trust order, never by recency alone (see collapseByRound).
+// Trust anchor: the validator whose signed trail every panel pins (collapseByRound).
 var RECEIPT_ANCHOR = "5FcCsoB2R5M55RdrNrvPQv7xmLJRFzs7R7C73UUSxgUCyfsw";
-var HUB_BASE = "https://hub.hippius.com/models/", HUB_REF = "main";
 var POLL_MS = 120000;
-// The shared index is a ROLLING window (RECEIPT_INDEX_MAX_KEEP). At the cap the
-// "since launch" framing stops being literally true and the page says so.
+// receipts/index.json is a rolling window of this many rows (RECEIPT_INDEX_MAX_KEEP)
 var INDEX_MAX_KEEP = 400;
-
-// Training-token accounting. NOT carried in the receipts — the round summary
-// records the contract DIGEST, not its parameters — so the budget is read from
-// the public chain.toml, whose history gives the eras below. Each entry is
-// (effective date, reference throughput, final-run hours, heat-screen hours);
-// tokens = hours × 3600 × throughput. Verifiable against `git log -p chain.toml`.
-var TOKEN_ERAS = [
-  { from: "0000-00-00", ref_tps: 185000,  train_h: 3.0, heat_h: 0.5, batch: 64, ctx: 4096, why: "launch contract" },
-  { from: "2026-07-15", ref_tps: 3700000, train_h: 3.0, heat_h: 0.5, batch: 64, ctx: 4096, why: "L40S pods: 20× token budget, same 3h wall" },
-  { from: "2026-07-26", ref_tps: 3700000, train_h: 3.0, heat_h: 1.0, batch: 64, ctx: 4096, why: "heat screen 0.5h → 1.0h" },
-  // DEC-CA-0042 (amended 2026-09-16 21:30): the budget stays the 3h figure and is
-  // series-points (64 series per step at every width), so this step count holds
-  // for every channel mix — a C-channel round trains C× these tokens in the same
-  // steps; only the wall grew to 5h.
-  { from: "2026-09-16", ref_tps: 3700000, train_h: 3.0, heat_h: 1.0, batch: 64, ctx: 4096, why: "5h wall, 3h series-points budget (DEC-CA-0042)" }
-];
-
-// Official Toto2 pretraining budget per ladder size, in OPTIMISER STEPS — the
-// target Cascade's cumulative per-size training is measured against ("similar
-// number of training steps as the official release at each size"). TRANSCRIBE
-// each value from the Toto 2.0 tech report / model card, with its citation in
-// `source`; null = not yet transcribed and the completion section pends.
-// NEVER estimate these — an invented target would poison the one honest
-// completion number on the page.
-var TOTO2_PRETRAIN = {
-  "4m":   { steps: null, source: "" },
-  "22m":  { steps: null, source: "" },
-  "313m": { steps: null, source: "" },
-  "1b":   { steps: null, source: "" },
-  "2.5b": { steps: null, source: "" },
-  "10b":  { steps: null, source: "" }
-};
-
-// Scaling ladder. The rungs are the roadmap; which of them is VALIDATED is read
-// from the receipts (a rung with at least one judged round). disc = the marker
-// diameter on the ladder graphic, a restrained visual log of parameter count.
-var LADDER = [
-  { key: "4m",   label: "4M",   disc: 20 },
-  { key: "22m",  label: "22M",  disc: 28 },
-  { key: "313m", label: "313M", disc: 40 },
-  { key: "1b",   label: "1B",   disc: 48 },
-  { key: "2.5b", label: "2.5B", disc: 57 },
-  { key: "10b",  label: "10B",  disc: 66 }
-];
-
-// Community links. A glyph renders only when its URL is set — never ship a
-// guessed handle or invite. NOTE: the Discord link is a channel deep-link
-// (works for members); swap in a discord.gg invite to onboard outsiders.
-// The king's generator code on GitHub (champions/king, one commit per reign).
+// The headline reference: the leaderboard model the hero measures the gap to.
+var REF_HEADLINE = "Timestral-209M";
+// Contracted budget of ONE king leg (chain.toml [training]: hours × reference
+// throughput, series-points). Used for the lineage only before v2 is live;
+// from v2 the trainer's own lineage counter (status/v2.json) is read instead.
+var LEG_BUDGET = { train_h: 3.0, ref_tps: 3700000 };
+var BENCH_SCAN_MAX = 60, BENCH_RETRY_NEWEST = 6;
+var ERA_BLOCKS_FALLBACK = 3600;
 var KING_GITHUB = "https://github.com/TensorLink-AI/cascade/tree/main/champions/king";
+var HUB_BASE = "https://hub.hippius.com/models/", HUB_REF = "main";
 var COMMUNITY = {
   x:       "https://x.com/cascade_sn91",
   discord: "https://discord.com/channels/799672011265015819/1524889682520047776",
   github:  "https://github.com/TensorLink-AI/cascade"
 };
 
-var _index = null, _latest = null, _chain = null, _state = "loading";
-// Best-bench rows the index keeps past its rolling window (pinned:"best_bench",
-// cascade.shared.hippius.note_best_bench): fed to the best-so-far card ONLY —
-// never to counts, reigns, timelines or atCap(), which read the window.
-var _pinnedOld = [];
+var _index = null, _chain = null, _v2 = null, _lb = null, _gens = 0, _state = "loading", _metric = "mase";
+var _bench = {}, _benchMissing = {}, _benchInflight = {};
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 (function initTheme(){
-  var saved = localStorage.getItem("cascDashTheme");
-  document.documentElement.dataset.theme = saved === "dark" ? "dark" : "light";
+  var saved = null; try { saved = localStorage.getItem("cascDashTheme"); } catch(e) {}
+  document.documentElement.dataset.theme = saved === "light" ? "light" : "dark";
 })();
 function esc(s){ return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;")
   .replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
@@ -1216,47 +904,29 @@ function splitRef(r){ if(!r) return {repo:"",digest:""}; var i=r.indexOf("@");
   return i<0?{repo:r,digest:""}:{repo:r.slice(0,i),digest:r.slice(i+1)}; }
 function genUrl(ref){ var p=splitRef(ref); if(!p.repo) return "#";
   return p.digest.indexOf("hf:")===0 ? "https://huggingface.co/"+p.repo : HUB_BASE+p.repo+"/"+HUB_REF; }
-function shortRef(ref){ var p=splitRef(ref); if(!p.repo) return "--";
-  var d=p.digest?p.digest.replace(/^sha256:/,"").replace(/^hf:/,"").slice(0,8):"";
-  return d?p.repo+"@"+d:p.repo; }
-function refLink(ref){ var p=splitRef(ref);
-  if(!p.repo) return '<span class="muted">--</span>';
-  return '<a href="'+genUrl(ref)+'" target="_blank" rel="noopener" title="'+esc(ref)+'">'+esc(shortRef(ref))+'</a>'; }
-function shortRound(id){ id=String(id||""); return id.length>12?id.slice(0,6)+"…"+id.slice(-4):id; }
 function num(x,dp){ if(x==null||!isFinite(x)) return "--"; return Number(x).toFixed(dp==null?2:dp); }
-function signedPct(x,dp){ if(x==null||!isFinite(x)) return "--";
-  var v=Number(x)*100; return (v>=0?"+":"−")+Math.abs(v).toFixed(dp==null?1:dp)+"%"; }
-function dayOf(iso){ return iso ? String(iso).slice(0,10) : ""; }
-function prettyDay(iso){
-  var d = iso ? new Date(iso) : null;
+function prettyDay(iso){ var d = iso ? new Date(iso) : null;
   if(!d || isNaN(d.getTime())) return "--";
-  return d.toLocaleDateString(undefined,{year:"numeric",month:"short",day:"numeric"});
-}
-function shortDay(iso){
-  var d = iso ? new Date(iso) : null;
+  return d.toLocaleDateString(undefined,{year:"numeric",month:"short",day:"numeric"}); }
+function shortDay(iso){ var d = iso ? new Date(iso) : null;
   if(!d || isNaN(d.getTime())) return "";
-  return d.toLocaleDateString(undefined,{month:"short",day:"numeric"});
-}
-function fmtTao(x){
-  if(x==null||!isFinite(x)) return null;
-  var a=Math.abs(x), dp = a>=100?0 : a>=1?2 : a>=0.1?3 : 4;
-  return "τ"+Number(x).toFixed(dp);
-}
+  return d.toLocaleDateString(undefined,{month:"short",day:"numeric"}); }
 function timeAgo(i){ if(!i) return "--";
   var s=Math.floor((Date.now()-new Date(i).getTime())/1000); if(s<0)s=0;
   if(s<60)return s+"s ago"; var m=Math.floor(s/60); if(m<60)return m+"m ago";
   var h=Math.floor(m/60); if(h<24)return h+"h ago"; return Math.floor(h/24)+"d ago"; }
+function fmtBig(v){ if(v==null||!isFinite(v)) return "--";
+  if(v>=1e12) return (v/1e12).toFixed(v>=1e13?1:2)+"T"; if(v>=1e9) return Math.round(v/1e9)+"B";
+  if(v>=1e6) return (v/1e6).toFixed(1)+"M"; if(v>=1e3) return Math.round(v/1e3)+"k"; return String(Math.round(v)); }
+function fmtDur(s){ if(s==null||!isFinite(s)) return "--"; s=Math.max(0,Math.round(s));
+  var d=Math.floor(s/86400), h=Math.floor((s%86400)/3600), m=Math.floor((s%3600)/60);
+  return d?d+"d "+h+"h":(h?h+"h "+m+"m":m+"m"); }
 
 var _jsonMemo = {};
 var FETCH_TIMEOUT_MS = 15000;
 function fetchJSON(path, opts){
-  // Bandwidth (2026-10-05): the old version raced EVERY endpoint at once with a
-  // per-request ?t= cache-buster, so each poll pulled the 2 MB index and the
-  // 9 MB receipt through the Vercel proxy (billed transfer) and threw the
-  // losing copies away. Now: try endpoints IN ORDER (direct Hippius/R2 first,
-  // the same-origin Vercel proxy only as the last resort), revalidate with the
-  // object's ETag (cache:"no-cache" -> a 304 with no body when unchanged), and
-  // reuse the already-parsed object when the ETag has not moved.
+  // In-order endpoints (direct Hippius first, the same-origin Vercel proxy
+  // last), ETag revalidation, and a 403/404 is final (see index.html).
   var immutable = opts && opts.bust===false;
   var order = ENDPOINTS.filter(function(b){ return b!==SAME_ORIGIN; }).concat([SAME_ORIGIN]);
   var i = 0;
@@ -1268,13 +938,11 @@ function fetchJSON(path, opts){
     return fetch(base+"/"+path, {cache: immutable ? "default" : "no-cache", signal: ctl ? ctl.signal : undefined})
       .then(function(r){
         if(timer) clearTimeout(timer);
-        // 403/404 = the object is not there. Every endpoint serves the same bucket,
-        // so asking the next one (Vercel last) only repeats the miss: stop here.
         if(r.status===403||r.status===404){ var miss=new Error("HTTP "+r.status); miss.missing=true; throw miss; }
         if(!r.ok) throw new Error("HTTP "+r.status);
         var tag = r.headers.get("etag");
         var hit = _jsonMemo[path];
-        if(tag && hit && hit.etag===tag) return hit.data;      // unchanged: skip the re-parse
+        if(tag && hit && hit.etag===tag) return hit.data;
         return r.json().then(function(d){ _jsonMemo[path] = {etag: tag, data: d}; return d; });
       })
       .catch(function(e){ if(timer) clearTimeout(timer); if(e&&e.missing) throw e; return attempt(); });
@@ -1282,10 +950,8 @@ function fetchJSON(path, opts){
   return attempt();
 }
 
-// Peers publish into the same rolling index (keyed round_id + validator_hotkey).
-// One row per round, picked in trust order: scored beats rejected, the anchor
-// validator beats peers, then newest wins. Identical to index.html — the two
-// dashboards must never disagree about who is king.
+// One row per round in trust order: scored beats rejected, the anchor beats
+// peers, then newest. Identical to index.html.
 function collapseByRound(d){
   if(!d || !Array.isArray(d.rounds)) return d;
   var by={}, order=[];
@@ -1305,1262 +971,358 @@ function collapseByRound(d){
   return out;
 }
 
-// Split pinned best-bench rows that sit BEFORE the rolling window (older than
-// every unpinned row) out of the index, so the window logic never sees them.
-// A pinned row inside the window stays where it is.
-function splitPinned(d){
-  _pinnedOld = [];
-  if(!d || !Array.isArray(d.rounds)) return d;
-  var floor = null;
-  d.rounds.forEach(function(r){
-    if(r.pinned === "best_bench") return;
-    var b = Number(r.epoch_start_block || 0);
-    if(floor === null || b < floor) floor = b;
-  });
-  var keep = [];
-  d.rounds.forEach(function(r){
-    if(r.pinned === "best_bench" && floor !== null && Number(r.epoch_start_block || 0) < floor)
-      _pinnedOld.push(r);
-    else keep.push(r);
-  });
-  var out = {}; for(var k in d) out[k] = d[k];
-  out.rounds = keep;
-  return out;
-}
-function pinnedOldScored(){ return _pinnedOld.filter(function(r){ return r.status === "scored"; }); }
-
 // ── domain ──────────────────────────────────────────────────────────────────
 function allRounds(){ return (_index && _index.rounds) || []; }
 function scoredRounds(){ return allRounds().filter(function(r){ return r.status==="scored"; }); }
-function judgedRounds(){ return scoredRounds().filter(function(r){ return !r.inconclusive; }); }
-function atCap(){ return allRounds().length >= INDEX_MAX_KEEP; }
+function byBlock(rs){ return rs.slice().sort(function(a,b){ return (a.epoch_start_block||0)-(b.epoch_start_block||0); }); }
+function eraBlocks(){ var c=_chain||(_index&&_index.chain)||{};
+  if(Number(c.era_blocks)>0) return Number(c.era_blocks);
+  var eb=Number(c.epoch_blocks)||ERA_BLOCKS_FALLBACK; return eb<ERA_BLOCKS_FALLBACK?ERA_BLOCKS_FALLBACK:eb; }
 
-// Every throne change in the record, oldest first. reigns[0] is the BASELINE —
-// the king already seated at the first round the public index still carries.
-// `first` marks a hotkey's first time in the lead — matched on the hotkey, not
-// the UID, because Bittensor recycles deregistered UIDs to new registrants.
-function reigns(){
-  var out=[], cur=null, rs=scoredRounds(), seen={};
-  rs.forEach(function(r){
-    if(!cur){
-      cur={n:1,hotkey:r.king_hotkey,uid:r.king_uid,gen_ref:r.king_gen_ref,
-           round:r.round_id,block:r.epoch_start_block,at:r.published_at,
-           gain:null,rounds:0,baseline:true,
-           first:true};
-      seen[String(r.king_hotkey||"")]=1;
-      out.push(cur);
-    }
-    cur.rounds++;
-    if(r.dethroned){
-      var gain = (r.king_geomean>0 && r.chal_geomean>0) ? (1 - r.chal_geomean/r.king_geomean) : null;
-      var hk = String(r.chal_hotkey||"");
-      cur={n:out.length+1,hotkey:r.chal_hotkey,uid:r.chal_uid,gen_ref:r.chal_gen_ref,
-           round:r.round_id,block:r.epoch_start_block,at:r.published_at,
-           gain:gain,rounds:0,baseline:false,
-           first:!seen[hk]};
-      seen[hk]=1;
-      out.push(cur);
-    }
-  });
-  return out;
-}
-function distinctLeaders(rg){
-  var seen={}; (rg||reigns()).forEach(function(g){ seen[String(g.hotkey||("uid:"+g.uid))]=1; });
-  return Object.keys(seen).length;
-}
-
-// Field size = n_participants on the signed round summary: miners whose
-// committed entry was ELIGIBLE at that round's cutoff. That is the precise
-// thing the record counts — not "registered" and not "active", so the copy
-// says exactly that. Latest reading plus the range across the record.
-function fieldSize(){
-  var rs = scoredRounds(), latest = null, min = null, max = null, n = 0;
-  rs.forEach(function(r){
-    var p = r.n_participants;
-    if(p == null || !isFinite(p)) return;
-    latest = { n: p, at: r.published_at };
-    if(min === null || p < min) min = p;
-    if(max === null || p > max) max = p;
-    n++;
-  });
-  return latest ? { latest: latest, min: min, max: max, rounds: n } : null;
-}
-
-// The chained improvement over the baseline king. One factor per dethrone,
-// each a same-round / same-windows paired ratio, so per-round window difficulty
-// cancels instead of accumulating as noise.
-//   observed : Π (chal_geomean / king_geomean)
-//   floor    : Π (1 − lcb), the 95% bootstrap bound the dethrone was gated on
-function improvementChain(){
-  var obs=1, flo=1, pts=[], steps=[];
-  scoredRounds().forEach(function(r){
-    if(r.dethroned && r.king_geomean>0 && r.chal_geomean>0 &&
-       isFinite(r.king_geomean) && isFinite(r.chal_geomean)){
-      var f = r.chal_geomean / r.king_geomean;
-      // The LCB is the same bootstrap's 5th percentile of relative improvement;
-      // 1−lcb is therefore the pessimistic counterpart of f. Never let it credit
-      // MORE than observed (clamped at f) — the floor must stay a floor.
-      var lf = (r.lcb!=null && isFinite(r.lcb)) ? Math.max(f, 1 - r.lcb) : f;
-      obs *= f; flo *= Math.min(1, lf);
-      steps.push({ round_id:r.round_id, at:r.published_at, factor:f, lfactor:lf,
-                   lcb:r.lcb, margin:r.margin });
-    }
-    pts.push({ round_id:r.round_id, at:r.published_at, obs:1-obs, flo:1-flo,
-               tokens:roundTokens(r) });
-  });
-  return { obs:1-obs, floor:1-flo, steps:steps, pts:pts };
-}
-
-function eraFor(iso){
-  var d = dayOf(iso) || "9999-99-99", pick = TOKEN_ERAS[0];
-  TOKEN_ERAS.forEach(function(e){ if(d >= e.from) pick = e; });
-  return pick;
-}
-// Training tokens one round burned: the king and challenger final runs at every
-// trained size, plus one heat-screen run per entrant. The contract fixes the
-// budget, so this is the CONTRACTED spend — a run stopped by the wall-clock
-// guard (deadline_hit) burned less. Stated on the page, not hidden.
-function roundTokens(r){
-  if(r.status !== "scored") return 0;
-  var e = eraFor(r.published_at);
-  var sizes = (r.sizes && r.sizes.filter(Boolean).length) || 1;
-  var entrants = (r.heat && r.heat.n_entrants) || 0;
-  return 2 * sizes * e.train_h * 3600 * e.ref_tps + entrants * e.heat_h * 3600 * e.ref_tps;
-}
-
-// One round's optimiser-step budget PER SIZE: the contracted token budget
-// divided by tokens per step (global batch × context length) — every trained
-// size gets the full budget, so this is per-size, not summed across sizes.
-function stepsPerRound(e){
-  return e.train_h * 3600 * e.ref_tps / (e.batch * e.ctx);
-}
-
-// Cumulative pretraining of the CURRENT champion, per ladder size: the latest
-// round's step budget at each size it trained, plus the budgets of the
-// consecutive rounds behind it whose runs were warm-started from the previous
-// round's promoted checkpoint (index `warm_start`). A round without the flag
-// trained from scratch — the chain ends there, and steps from before it do
-// not count (that training was discarded, not carried). Until carry-forward
-// is switched on, every chain is honestly one round long.
-function pretrainBySize(){
-  var rs = scoredRounds();
-  if(!rs.length) return null;
-  var by = {}, rounds = 0;
-  for(var i = rs.length - 1; i >= 0; i--){
-    var r = rs[i], sp = stepsPerRound(eraFor(r.published_at));
-    var seen = {};
-    (r.sizes || []).forEach(function(s){
-      var k = rungKey(s);
-      if(k && !seen[k]){ seen[k] = 1; by[k] = (by[k] || 0) + sp; }
-    });
-    rounds++;
-    if(!r.warm_start) break;  // this round started from scratch
-  }
-  return { by:by, rounds:rounds };
-}
-function fmtSteps(x){
-  if(x==null || !isFinite(x)) return "--";
-  if(x >= 1e6) return num(x/1e6, x >= 1e7 ? 0 : 1) + "M";
-  if(x >= 1e3) return num(x/1e3, 0) + "k";
-  return num(x, 0);
-}
-
-// Size tag ("toto2-4m", "toto2-313m") → ladder rung key.
-function rungKey(tag){
-  var m = String(tag||"").toLowerCase().match(/(\d+(?:\.\d+)?)\s*([mb])\b/);
-  return m ? (m[1] + m[2]) : "";
-}
-function validatedRungs(){
-  var seen = {};
-  judgedRounds().forEach(function(r){
-    (r.sizes||[]).forEach(function(s){
-      var k = rungKey(s); if(!k) return;
-      seen[k] = (seen[k]||0) + 1;
-    });
-  });
-  return seen;
-}
-function topRung(){
-  var seen = validatedRungs(), idx = -1;
-  LADDER.forEach(function(r,i){ if(seen[r.key]) idx = i; });
-  return { idx:idx, top: idx>=0 ? LADDER[idx] : null, next: LADDER[idx+1] || null, seen:seen };
-}
-
-// Public-benchmark scores ride on the KING's manifest entry, stamped by the
-// trainer (BenchScores). They exist only when [scoring] cascade_enabled — kept
-// as the fallback source behind the per-round reports below.
-function benchScores(){
-  var m = _latest && _latest.manifest;
-  var entries = (m && m.entries) || [];
-  for(var i=0;i<entries.length;i++){
-    var e = entries[i];
-    if(e && e.role === "king" && e.bench_scores) return { scores:e.bench_scores, size:e.size||"" };
-  }
-  return null;
-}
-
-// ── per-round public-benchmark reports ──────────────────────────────────────
-// The trainer publishes a signed BenchReport at benchmarks/round-<id>.json
-// after a round's duel — GIFT-Eval / BOOM / TIME, CRPS + MASE, per checkpoint
-// (king and challenger). Not every round has one: the battery can fail or a
-// report can land late, so the page probes rather than assumes. Reports are
-// immutable once published (fetched uncached-busted exactly once); a miss is
-// permanent for the session except among the newest few rounds, where a
-// late-landing report is still expected.
-var BENCH_SCAN_MAX = 48, BENCH_RETRY_NEWEST = 6;
-var _benchReports = {}, _benchMissing = {}, _benchInflight = {};
-var SIX_KEYS = ["gifteval_crps","gifteval_mase","boom_crps","boom_mase","time_crps","time_mase"];
-
-// The six numbers follow extract_bench_scores' key convention; the exact
-// nesting on a BenchEntry is read tolerantly (flat, .scores, or .bench_scores).
-function readSix(o){
-  if(!o) return null;
-  var src = (typeof o.gifteval_mase === "number") ? o
-    : (o.scores && typeof o.scores.gifteval_mase === "number") ? o.scores
-    : (o.bench_scores && typeof o.bench_scores.gifteval_mase === "number") ? o.bench_scores
-    : null;
-  if(!src) return null;
-  var out = {};
-  for(var i=0;i<SIX_KEYS.length;i++){
-    var v = src[SIX_KEYS[i]];
-    if(typeof v !== "number" || !isFinite(v)) return null;
-    out[SIX_KEYS[i]] = v;
-  }
-  return out;
-}
-// The promotion-metric convention: geometric mean of all six (lower is better).
-function sixGeomean(s){
-  var sum = 0;
-  for(var i=0;i<SIX_KEYS.length;i++){
-    if(!(s[SIX_KEYS[i]] > 0)) return null;
-    sum += Math.log(s[SIX_KEYS[i]]);
-  }
-  return Math.exp(sum/6);
-}
-
-function scanBench(){
-  var rs = scoredRounds(), recent = rs.slice(-BENCH_SCAN_MAX);
-  // pinned best-bench rounds always load, wherever they sit in the index
-  var pinned = pinnedOldScored().concat(rs.slice(0, -BENCH_SCAN_MAX).filter(function(r){
-    return r.pinned === "best_bench"; }));
-  recent = pinned.concat(recent);
-  var newest = {};
-  rs.slice(-BENCH_RETRY_NEWEST).forEach(function(r){ newest[String(r.round_id)] = 1; });
-  recent.forEach(function(r){
-    var id = String(r.round_id);
-    if(_benchReports[id] || _benchInflight[id]) return;
-    if(_benchMissing[id] && !newest[id]) return;
-    _benchInflight[id] = true;
-    fetchJSON("benchmarks/round-" + id + ".json", { bust:false })
-      .then(function(d){
-        delete _benchInflight[id]; delete _benchMissing[id];
-        _benchReports[id] = d;
-        renderBoard(); renderBench(); renderRef();
-      })
-      .catch(function(){ delete _benchInflight[id]; _benchMissing[id] = true; });
-  });
-}
-
-// What the benchmark section shows:
-//   latest — the CURRENT LEADER's most recent published scores (the entry for
-//            the round's winner: challenger on a dethrone round, king else);
-//   best   — the lowest six-score geomean across every loaded report entry.
-// Falls back to the manifest-embedded king scores when no report has loaded.
-// Which ladder rung a bench entry belongs to: its own size tag when carried,
-// else the size embedded in the checkpoint pointer ("…/king-4m@sha256:…"),
-// else the round's single trained size.
-function entrySizeKey(e, r){
-  var k = rungKey(e && e.size || "");
-  if(!k) k = rungKey((e && (e.checkpoint || e.trained_pointer)) || "");
-  if(!k && r && r.sizes && r.sizes.filter(Boolean).length === 1) k = rungKey(r.sizes[0]);
-  return k;
-}
-
-// A report entry's miner uid: the signed report serialises it as miner_uid
-// (cascade.shared.bench_report); older/hand-built entries may carry uid.
-function entryUid(e){
+// GIFT-Eval readings off a bench report entry (BenchScores keys; read flat,
+// .scores or .bench_scores).
+function giftOf(e){
   if(!e) return null;
-  if(e.miner_uid != null && isFinite(e.miner_uid)) return Number(e.miner_uid);
-  if(e.uid != null && isFinite(e.uid)) return Number(e.uid);
-  return null;
+  var s=(typeof e.gifteval_mase==="number")?e:(e.scores&&typeof e.scores.gifteval_mase==="number")?e.scores
+    :(e.bench_scores&&typeof e.bench_scores.gifteval_mase==="number")?e.bench_scores:null;
+  if(!s||!(s.gifteval_mase>0)||!(s.gifteval_crps>0)) return null;
+  return {mase:s.gifteval_mase, crps:s.gifteval_crps};
 }
-
-function benchView(){
-  var rs = scoredRounds(), latest = null, best = null, bySize = {}, firstBySize = {};
-  var old = {};
-  pinnedOldScored().forEach(function(r){ old[String(r.round_id)] = 1; });
-  pinnedOldScored().concat(rs).forEach(function(r){
-    var rep = _benchReports[String(r.round_id)];
-    if(!rep) return;
-    // a pinned row from before the window feeds best / bySize only: it is
-    // neither the meter's starting anchor nor the current leader's latest
-    var isOld = !!old[String(r.round_id)];
-    var entries = rep.entries || rep.checkpoints || [];
-    var wantRole = r.dethroned ? "challenger" : "king";
-    entries.forEach(function(e){
-      var six = readSix(e);
-      if(!six) return;
-      var g = sixGeomean(six);
-      if(g != null && (!best || g < best.geomean))
-        best = { geomean:g, six:six, role:String(e.role||""), uid:entryUid(e),
-                 hotkey:String(e.miner_hotkey||e.hotkey||""),
-                 pointer:String(e.trained_pointer||e.checkpoint||""),
-                 size:entrySizeKey(e, r), round_id:r.round_id, at:r.published_at };
-      var sk = entrySizeKey(e, r);
-      if(g != null && sk && (!bySize[sk] || g < bySize[sk].geomean))
-        bySize[sk] = { geomean:g, six:six, role:String(e.role||""), uid:entryUid(e),
-                       hotkey:String(e.miner_hotkey||e.hotkey||""),
-                       pointer:String(e.trained_pointer||e.checkpoint||""),
-                       size:sk, round_id:r.round_id, at:r.published_at };
-      // rounds iterate oldest→newest: the first entry seen at a size is the
-      // earliest published result — the meter's honest starting anchor
-      if(isOld) return;
-      if(g != null && sk && !firstBySize[sk])
-        firstBySize[sk] = { geomean:g, at:r.published_at };
-      if(String(e && e.role || "") === wantRole)
-        latest = { six:six, geomean:g, round_id:r.round_id, at:r.published_at, src:"report" };
+// DEC-CA-0063: from [v2] bench_source_from_block the lane-A bench numbers of
+// winners / the king live in the MAIN validator's report (bench_v/…); the
+// trainer's report then carries only the init. Merge both (by pointer).
+function fetchBenchRound(id){
+  var a=fetchJSON("benchmarks/round-"+id+".json",{bust:false}).catch(function(){ return null; });
+  var b=fetchJSON("bench_v/round-"+id+".json",{bust:false}).catch(function(){ return null; });
+  return Promise.all([a,b]).then(function(x){
+    if(!x[0]&&!x[1]) throw new Error("no bench report");
+    if(!x[1]) return x[0];
+    if(!x[0]) return x[1];
+    var seen={}, out=[];
+    (x[1].entries||[]).concat(x[0].entries||[]).forEach(function(e){
+      var k=String(e.trained_pointer||"")+"|"+String(e.role||"");
+      if(seen[k]) return; seen[k]=1; out.push(e);
     });
+    var m={}; for(var k in x[0]) m[k]=x[0][k]; m.entries=out; return m;
   });
-  if(!latest){
-    var b = benchScores();
-    if(b){
-      var six = readSix(b.scores);
-      if(six) latest = { six:six, geomean:sixGeomean(six), round_id:null, at:null, src:"manifest" };
-    }
-  }
-  return { latest:latest, best:best, bySize:bySize, firstBySize:firstBySize };
 }
-
-// ── official-Toto2 reference docs ───────────────────────────────────────────
-// benchmarks/reference-<preset>.json: the OFFICIAL Datadog checkpoint of a
-// ladder size, run through the identical benchmark battery and published by
-// scripts/publish_reference_bench.py. Probed per rung; a missing doc simply
-// means that size's official checkpoint hasn't been benched yet.
-// reference-<preset>.json = the OFFICIAL checkpoint (the target side);
-// genesis-<preset>.json = the day-one king's own checkpoint, benched by the
-// same battery — the completion meter's fixed anchor. The genesis checkpoint
-// is a normal cascade artifact, so it needs no wrapping before benching.
-var _refBench = {}, _genBench = {}, _refMissing = {}, _refInflight = {};
-function scanRefs(retryMissing){
-  LADDER.forEach(function(r){
-    ["reference", "genesis"].forEach(function(prefix){
-      var pid = prefix + "-toto2-" + r.key;
-      var store = prefix === "reference" ? _refBench : _genBench;
-      var skey = "toto2-" + r.key;
-      if(store[skey] || _refInflight[pid]) return;
-      if(_refMissing[pid] && !retryMissing) return;
-      _refInflight[pid] = true;
-      fetchJSON("benchmarks/" + pid + ".json", { bust:false })
-        .then(function(d){
-          delete _refInflight[pid]; delete _refMissing[pid];
-          store[skey] = d; renderRef(); renderBoard();
-        })
-        .catch(function(){ delete _refInflight[pid]; _refMissing[pid] = true; });
+function scanBench(){
+  var rs=byBlock(allRounds()).slice(-BENCH_SCAN_MAX), newest={};
+  rs.slice(-BENCH_RETRY_NEWEST).forEach(function(r){ newest[String(r.round_id)]=1; });
+  rs.forEach(function(r){
+    var id=String(r.round_id||""); if(!id) return;
+    if(_bench[id]||_benchInflight[id]) return;
+    if(_benchMissing[id]&&!newest[id]) return;
+    _benchInflight[id]=true;
+    fetchBenchRound(id)
+      .then(function(d){ delete _benchInflight[id]; delete _benchMissing[id]; _bench[id]=d; renderHero(); renderTrend(); })
+      .catch(function(){ delete _benchInflight[id]; _benchMissing[id]=true; });
+  });
+}
+// Every settlement's KING checkpoint on GIFT-Eval, oldest first (signed reports).
+function kingSeries(){
+  var out=[];
+  byBlock(allRounds()).forEach(function(r){
+    var rep=_bench[String(r.round_id)]; if(!rep) return;
+    (rep.entries||rep.checkpoints||[]).forEach(function(e){
+      if(String(e.role||"")!=="king") return;
+      var g=giftOf(e); if(!g) return;
+      out.push({round_id:r.round_id, at:r.published_at, mase:g.mase, crps:g.crps,
+                pointer:String(e.trained_pointer||""), hotkey:String(e.miner_hotkey||"")});
     });
-  });
-}
-function genesisGeomean(sizeKey){
-  var doc = _genBench["toto2-" + sizeKey];
-  if(!doc) return null;
-  var six = readSix(doc);
-  return six ? sixGeomean(six) : (typeof doc.geomean === "number" ? doc.geomean : null);
-}
-
-function refDocs(){
-  var refs = [];
-  LADDER.forEach(function(r){
-    var doc = _refBench["toto2-" + r.key];
-    if(!doc) return;
-    var six = readSix(doc);
-    var g = six ? sixGeomean(six) : (typeof doc.geomean === "number" ? doc.geomean : null);
-    if(g != null) refs.push({ rung:r, doc:doc, geomean:g });
-  });
-  return refs;
-}
-// The headline bout: the largest rung where an official baseline AND a
-// comparable Cascade result both exist. This is what the scoreboard tile
-// leads with — the rallying number.
-function refPair(bv, refs){
-  var pair = null;
-  (refs || refDocs()).forEach(function(x){
-    var mine = bv.bySize[x.rung.key];
-    if(!mine) return;
-    var pct = x.geomean / mine.geomean * 100;
-    pair = { rung:x.rung, pct:pct, beaten:pct >= 100 };
-  });
-  return pair;
-}
-
-function renderRef(){
-  var bv = benchView(), el = document.getElementById("ref-panel");
-  var refs = refDocs();
-
-  if(!refs.length){
-    document.getElementById("ref-answer").innerHTML =
-      "Not yet measured — the official Toto2 checkpoints haven&rsquo;t been run through the battery yet.";
-    el.innerHTML = '<div class="pending-panel">' +
-      '<span class="ph">Awaiting the official baselines</span>' +
-      '<p>Cascade trains the same Toto2 architecture as the official Datadog release, from random ' +
-      'initialisation, at the same ladder of sizes — so each size is a direct head-to-head: same ' +
-      'model, different data. This section populates when the official checkpoints are scored by ' +
-      'the <b>identical benchmark battery</b> and published as reference docs, rather than quoting ' +
-      'anyone&rsquo;s leaderboard numbers.</p></div>';
-    document.getElementById("ref-when").textContent = "";
-    renderBest();
-    return;
-  }
-
-  var pair = refPair(bv, refs);
-  var cells = refs.map(function(x){
-    var mine = bv.bySize[x.rung.key];
-    if(!mine) return cell({ k:"vs official · " + x.rung.label, v:"&mdash;",
-      q:"awaiting a Cascade result at this size", state:"off" });
-    var pct = x.geomean / mine.geomean * 100, beaten = pct >= 100;
-    return cell({ k:"vs official · " + x.rung.label,
-      v: num(pct,1) + '<span class="u">%</span>',
-      q: beaten ? ("beats official by " + signedPct(pct/100 - 1, 1)) : "of the official score",
-      state: beaten ? "live" : "pend" });
-  });
-
-  document.getElementById("ref-answer").innerHTML = pair
-    ? (pair.beaten
-        ? "<b>Beaten at " + esc(pair.rung.label) + ".</b> Cascade&rsquo;s best " + esc(pair.rung.label) +
-          " checkpoint beats the official Toto2-" + esc(pair.rung.label) + " by <b>" +
-          signedPct(pair.pct/100 - 1, 1) + "</b> on the shared six-score battery."
-        : "Closing in: Cascade&rsquo;s best " + esc(pair.rung.label) + " checkpoint is at <b>" +
-          num(pair.pct,1) + "%</b> of the official Toto2-" + esc(pair.rung.label) +
-          "&rsquo;s score — same architecture, same size, scored by the identical battery.")
-    : "The official baselines are benched; awaiting a comparable Cascade result.";
-
-  var src = refs.map(function(x){
-    return esc(x.doc.source || ("Toto2-" + x.rung.label)) +
-      (x.doc.as_of ? " (" + esc(prettyDay(x.doc.as_of)) + ")" : "");
-  }).join(" · ");
-  el.innerHTML = '<div class="bcells bench-cells">' + cells.join("") + '</div>' +
-    '<p class="lede" style="margin:14px 0 0">Official side: ' + src +
-    ', scored by the same battery as every round checkpoint. Cascade trains from random ' +
-    'initialisation under the round&rsquo;s fixed compute budget.</p>';
-  document.getElementById("ref-when").textContent =
-    pair ? (pair.rung.label + " head-to-head") : "";
-  renderBest();
-}
-// ── the best checkpoint itself ─────────────────────────────────────────────
-// benchView().best named, not just scored: who set it, when, the six numbers
-// against the official reference at its size, and the exact Hub artifact.
-var HUB_POINTER_PREFIX = "metro-v1:trained:hippius:";
-function hubPointer(p){
-  p = String(p || "");
-  return p.indexOf(HUB_POINTER_PREFIX) === 0 ? p.slice(HUB_POINTER_PREFIX.length) : p;
-}
-function copyText(text, btn){
-  var done = function(){ if(btn){ btn.textContent = "Copied"; setTimeout(function(){ btn.textContent = "Copy"; }, 1600); } };
-  var fallback = function(){
-    try{
-      var ta = document.createElement("textarea");
-      ta.value = text; ta.setAttribute("readonly", ""); ta.style.position = "absolute"; ta.style.left = "-9999px";
-      document.body.appendChild(ta); ta.select(); document.execCommand("copy"); document.body.removeChild(ta); done();
-    }catch(e){ if(btn) btn.textContent = "Select"; }
-  };
-  if(navigator.clipboard && navigator.clipboard.writeText){
-    navigator.clipboard.writeText(text).then(done, fallback);
-  } else { fallback(); }
-}
-function renderBest(){
-  var el = document.getElementById("best-panel");
-  if(!el) return;
-  var bv = benchView(), b = bv.best;
-  if(!b || b.geomean == null){
-    document.getElementById("best-answer").innerHTML =
-      "Awaiting first benched checkpoint &mdash; the best one is named here once a signed " +
-      "benchmark report is published.";
-    el.innerHTML = "";
-    document.getElementById("best-when").textContent = "";
-    return;
-  }
-  var ref = null;
-  refDocs().forEach(function(x){ if(x.rung.key === b.size) ref = x; });
-  var refSix = ref ? readSix(ref.doc) : null;
-  var pct = ref ? ref.geomean / b.geomean * 100 : null;
-  var who = (b.uid != null ? "uid " + esc(b.uid) : "an unnamed miner") +
-    (b.hotkey ? ' <span title="' + esc(b.hotkey) + '">(' + esc(b.hotkey.slice(0,8)) + "&hellip;)</span>" : "");
-  document.getElementById("best-answer").innerHTML =
-    "The best checkpoint benched so far is " + who + "&rsquo;s " + esc(b.role || "duel") +
-    " checkpoint from round " + esc(shortRound(b.round_id)) + " (" + esc(prettyDay(b.at)) + "): " +
-    "combined score <b>" + num(b.geomean,5) + "</b>" +
-    (pct != null
-      ? (pct >= 100
-          ? " &mdash; <b>beats the official Toto2-" + esc(ref.rung.label) + "</b> by " + signedPct(pct/100 - 1, 1) + "."
-          : " &mdash; <b>" + num(pct,1) + "%</b> of the official Toto2-" + esc(ref.rung.label) + "&rsquo;s score.")
-      : ".");
-  var rows = [
-    { k:"GIFT-Eval · CRPS", key:"gifteval_crps" }, { k:"BOOM · CRPS", key:"boom_crps" }, { k:"TIME · CRPS", key:"time_crps" },
-    { k:"GIFT-Eval · MASE", key:"gifteval_mase" }, { k:"BOOM · MASE", key:"boom_mase" }, { k:"TIME · MASE", key:"time_mase" }
-  ];
-  var cells = rows.map(function(r){
-    var v = b.six[r.key], o = refSix ? refSix[r.key] : null;
-    if(o == null) return cell({ k:r.k, v:num(v,4), q:"no official reference at this size", state:"off" });
-    var beats = v < o;
-    return cell({ k:r.k, v:num(v,4),
-      q:"official " + num(o,4) + " · " + (beats ? "beats by " : "trails by ") + signedPct(Math.abs(v/o - 1), 1).replace(/^[+−]/, ""),
-      state: beats ? "live" : "pend" });
-  });
-  var ptr = hubPointer(b.pointer);
-  var refHtml = ptr
-    ? '<div class="ckpt-ref"><span class="ck">Checkpoint</span><code id="best-ptr">' + esc(ptr) + '</code>' +
-        '<button type="button" class="btn" id="best-copy">Copy</button>' +
-        '<span class="cn">Anonymous pull from registry.hippius.com &mdash; the digest pins the exact benched bytes.</span></div>'
-    : '<div class="ckpt-ref"><span class="ck">Checkpoint</span><span class="cn">pointer not carried by this report</span></div>';
-  el.innerHTML = '<div class="bcells bench-six">' + cells.join("") + '</div>' + refHtml;
-  var btn = document.getElementById("best-copy");
-  if(btn) btn.addEventListener("click", function(){ copyText(ptr, btn); });
-  document.getElementById("best-when").textContent = "Report " + prettyDay(b.at);
-}
-function warmStart(){
-  var m = _latest && _latest.manifest;
-  return (m && m.warm_start_ckpt) ? { ckpt:m.warm_start_ckpt, size:m.warm_start_size||"" } : null;
-}
-
-// ── render: the scoreboard ──────────────────────────────────────────────────
-// One compact composition, not eight cards. Cell anatomy is exactly three
-// levels — LABEL / VALUE / QUALIFIER — with a small state-coloured tick:
-// sage = demonstrated/live, saffron = defined but awaiting data, neutral =
-// mechanism not active. No pills: the whole page is live (top bar says so),
-// so only absence of a result is worth a state treatment.
-function cell(o){
-  return '<div class="cell s-'+(o.state||"live")+'">' +
-    '<span class="bk">'+esc(o.k)+'</span>' +
-    '<span class="bar"></span>' +
-    '<div class="bv">'+o.v+'</div>' +
-    '<div class="bq">'+(o.q||"")+'</div></div>';
-}
-
-function renderBoard(){
-  var rs = scoredRounds(), rg = reigns(), chain = improvementChain();
-  var deth = rs.filter(function(r){ return r.dethroned; }).length;
-  var nLead = distinctLeaders(rg);
-  var fs = fieldSize(), tr = topRung(), bv = benchView(), ws = warmStart();
-  var haveChain = chain.steps.length > 0;
-  var tot = chain.pts.reduce(function(a,p){ return a + p.tokens; }, 0);
-  var eff = (haveChain && tot>0) ? chain.obs / (tot/1e12) : null;
-
-  var row1 = [
-    cell({ k:"Miners entered",
-      v: fs ? String(fs.latest.n) : "&mdash;",
-      q: fs ? "one entry each · latest round" : "awaiting first round",
-      state: fs ? "live" : "pend" }),
-    cell({ k:"Lead changes",
-      v: rs.length ? String(deth) : "&mdash;",
-      q: rs.length ? (nLead + " leaders · " + rs.length + " rounds") : "awaiting first round",
-      state: rs.length ? "live" : "pend" }),
-    cell({ k:"Better than day one",
-      v: haveChain ? signedPct(chain.obs) : "&mdash;",
-      q: haveChain ? ("&ge; " + signedPct(chain.floor) + " guaranteed")
-                   : (rs.length ? "no verified gain yet" : "awaiting first round"),
-      state: haveChain ? "live" : "pend" }),
-    cell({ k:"Model scale",
-      v: tr.top ? tr.top.label : "&mdash;",
-      q: tr.top ? ("proven · next " + (tr.next ? tr.next.label : "&mdash;")) : "no judged size yet",
-      state: tr.top ? "live" : "pend" })
-  ];
-  var row2 = [
-    // The vs-official score lives in the HERO above the board; this cell
-    // stays the public-benchmark reading so no number appears twice.
-    cell({ k:"Public benchmark",
-      v: bv.latest ? num(bv.latest.six.gifteval_mase,3) : "&mdash;",
-      q: bv.latest ? ((bv.latest.six.gifteval_mase<1 ? "beats" : "trails") + " reference · GIFT-Eval")
-                   : "awaiting first result",
-      state: bv.latest ? (bv.latest.six.gifteval_mase<1 ? "live" : "warn") : "pend" }),
-    cell({ k:"Compute efficiency",
-      v: eff!=null ? signedPct(eff,2) : "&mdash;",
-      q: eff!=null ? "per trillion tokens" : "awaiting first verified gain",
-      state: eff!=null ? "live" : "pend" }),
-    cell({ k:"Carry-forward",
-      v: "&mdash;",
-      q: ws ? "switching on" : "not active yet",
-      state: ws ? "pend" : "off" }),
-    // Economics: alpha price + TAO emissions/day, read from the chain via the
-    // validator-published status feed (status/chain.json). Live and unsigned —
-    // when the feed doesn't carry it yet, the cell stays honestly pending.
-    econCell()
-  ];
-
-  document.getElementById("board").innerHTML =
-    '<div class="brow"><div class="bcells">' + row1.join("") + '</div></div>' +
-    '<div class="brow"><div class="bcells">' + row2.join("") + '</div></div>';
-
-  // the one headline number: where Cascade stands against the official Toto2
-  var pr = refPair(bv), hero = document.getElementById("hero");
-  if(pr){
-    // completion meter, anchored at the GENESIS KING's benched score when
-    // published (the fixed day-one origin — it can't drift with the rolling
-    // index), else at the first published result at this size. Skipped when
-    // degenerate (no anchor, or the anchor already met the target).
-    var meter = "";
-    var refs = refDocs(), refG = null;
-    refs.forEach(function(x){ if(x.rung.key === pr.rung.key) refG = x.geomean; });
-    var genG = genesisGeomean(pr.rung.key);
-    var anchorG = genG, anchorLabel = "genesis";
-    if(anchorG == null){
-      var first = bv.firstBySize[pr.rung.key];
-      if(first && first.geomean > 0){ anchorG = first.geomean; anchorLabel = "first result"; }
-    }
-    if(refG != null && anchorG != null && anchorG > 0){
-      var anchor = refG / anchorG * 100;
-      if(anchor < 100 && anchor < pr.pct - 0.05){
-        // the anchor is the bar's ZERO point: the fill is the share of the
-        // genesis→official gap closed. Words on the endpoints, numbers in
-        // the tooltip — the hero carries the only on-screen percentage.
-        var fill = Math.max(0, Math.min(1, (pr.pct - anchor) / (100 - anchor))) * 100;
-        meter =
-          '<div class="meter" title="' + esc(
-            anchorLabel + " " + num(anchor,1) + "% of the official score · today " +
-            num(pr.pct,1) + "% · gap closed " + num(fill,0) + "%") + '">' +
-            '<div class="mtrack"><i class="mfill" style="width:' + fill.toFixed(1) + '%"></i></div>' +
-            '<div class="mlabels"><span>' + esc(anchorLabel) + '</span>' +
-              '<span>official toto2</span></div></div>';
-      }
-    }
-    hero.className = "hero" + (pr.beaten ? " beaten" : "");
-    hero.innerHTML =
-      '<span class="hk">The target &middot; beat the official Toto2</span>' +
-      '<span class="hbar"></span>' +
-      '<div class="hrow"><div class="hv">' + num(pr.pct,1) + '<span class="u">%</span></div>' +
-        meter + '</div>' +
-      '<div class="hq">' +
-        (pr.beaten ? '<b>beats the official Toto2-' + esc(pr.rung.label) + '</b>'
-                   : 'of the official Toto2-' + esc(pr.rung.label) + '&rsquo;s score') +
-        ' &mdash; same architecture &middot; same size &middot; different data</div>';
-  } else {
-    hero.className = "hero pending";
-    hero.innerHTML =
-      '<span class="hk">The target &middot; beat the official Toto2</span>' +
-      '<span class="hbar"></span>' +
-      '<div class="hv">&mdash;</div>' +
-      '<div class="hq">awaiting the official baseline &mdash; same architecture &middot; ' +
-        'same size &middot; different data</div>';
-  }
-}
-
-function econCell(){
-  var ec = (_chain && _chain.economics) || null;
-  var price = ec ? fmtTao(ec.alpha_price_tao) : null;
-  var emit  = ec ? fmtTao(ec.tao_in_emission_per_day) : null;
-  if(price) return cell({ k:"Economics", v:price,
-    q:"alpha price" + (emit ? " · " + emit + "/day emissions" : ""), state:"live" });
-  if(emit) return cell({ k:"Economics", v:emit, q:"emissions per day", state:"live" });
-  return cell({ k:"Economics", v:"&mdash;", q:"not yet reported", state:"pend" });
-}
-
-// ── render: dethrone timeline + reigns ──────────────────────────────────────
-function renderCompetition(){
-  var rs = scoredRounds(), rg = reigns(), rail = document.getElementById("timeline");
-  var deth = rg.length ? rg.length - 1 : 0, nLead = distinctLeaders(rg);
-
-  // conclusion first — the sentence the timeline and table are evidence for
-  var fs = fieldSize();
-  var ans;
-  if(!rs.length) ans = "No round has been published yet — the competition has not started.";
-  else if(deth === 0) ans = "Not yet decided: over <b>" + rs.length + " round" + (rs.length===1?"":"s") +
-    "</b> the day-one leader has not been beaten. A healthy competition should produce lead changes over time.";
-  else ans = "<b>Yes.</b> " + (fs ? ("<b>" + fs.latest.n + " miners</b> entered the latest round " +
-    "(one entry per miner) and ") : "") +
-    "the lead has changed hands <b>" + deth + " time" + (deth===1?"":"s") +
-    "</b> across <b>" + rs.length + " rounds</b> — <b>" + nLead + " different miners</b> have held it" +
-    (nLead >= 3 ? ", so the title is genuinely contested." : ".");
-  document.getElementById("comp-answer").innerHTML = ans;
-
-  if(!rg.length){
-    rail.innerHTML = '<div class="empty">Waiting for the first published round</div>';
-  } else {
-    // True chronological placement, then a left-to-right pass that pushes any
-    // two events at least MIN_GAP apart so neighbouring labels cannot collide
-    // (a burst of dethrones in one day would otherwise print on top of itself).
-    var t0 = new Date(rg[0].at || Date.now()).getTime(), t1 = Date.now();
-    var span = Math.max(1, t1 - t0);
-    var MIN_GAP = rg.length > 1 ? Math.min(11, 86/(rg.length-1)) : 0;
-    var dense = rg.length > 14;   // too many to label; dots + endpoints only
-    var xs = rg.map(function(g){
-      var t = new Date(g.at || t0).getTime();
-      return 7 + 86 * Math.min(1, Math.max(0, (t - t0) / span));
-    });
-    for(var i=1; i<xs.length; i++) xs[i] = Math.max(xs[i], xs[i-1] + MIN_GAP);
-    var over = xs.length ? Math.max(0, xs[xs.length-1] - 93) : 0;
-    if(over > 0) xs = xs.map(function(x){ return x - over * (x - 7) / Math.max(1, xs[xs.length-1] - 7); });
-
-    var evs = rg.map(function(g,i){
-      var label = !dense || i===0 || i===rg.length-1;
-      return '<div class="tl-ev'+(g.baseline?" launch":(g.first?"":" ret"))+(i%2?" alt":"")+
-        '" style="left:'+xs[i].toFixed(2)+'%" title="'+
-        esc((g.baseline?"Starting point":("Lead change #"+(g.n-1)+(g.first?" · first-time leader":" · returning leader")))+
-            " · "+prettyDay(g.at)+" · miner "+(g.uid!=null?g.uid:"?"))+'">' +
-        (label ? '<span class="tl-lab who">'+esc(g.baseline?"start":("#"+(g.n-1)))+'</span>' +
-                 '<span class="tl-lab date">'+esc(prettyDay(g.at))+'</span>' : '') +
-        '<span class="tl-dot"></span></div>';
-    }).join("");
-    // the answer line above already states the count — the rail only adds a
-    // hover hint when it is too dense to label every marker
-    rail.innerHTML = '<div class="tl-rail"><div class="tl-line"></div>'+evs+'</div>' +
-      (dense ? '<div class="tl-note">hover a marker for its date</div>' : '');
-  }
-
-  var rows = rg.slice().reverse().map(function(g, i){
-    // the sitting king (first row): its code is archived on GitHub — link there,
-    // keep the exact registry digest beside it
-    var gen = i === 0
-      ? '<a href="'+KING_GITHUB+'" target="_blank" rel="noopener" title="'+esc(g.gen_ref)+' — code archived at champions/king on GitHub">'+esc(shortRef(g.gen_ref))+'</a> <span class="muted">·</span> '+
-        '<a class="muted" href="'+genUrl(g.gen_ref)+'" target="_blank" rel="noopener" title="The exact digest on the registry">hub</a>'
-      : refLink(g.gen_ref);
-    var who = g.baseline
-      ? '<span class="muted">miner '+(g.uid!=null?g.uid:"?")+'</span> <span class="badge ret">day one</span>'
-      : 'miner '+(g.uid!=null?g.uid:"?")+' '+
-        (g.first ? '<span class="badge new">first-time</span>' : '<span class="badge ret">returning</span>');
-    return '<tr>' +
-      '<td>'+(g.baseline?'<span class="muted">start</span>':("#"+(g.n-1)))+'</td>' +
-      '<td>'+esc(prettyDay(g.at))+'</td>' +
-      '<td>'+who+'</td>' +
-      '<td class="num">'+(g.gain!=null?'<span class="good" style="color:var(--good)">'+signedPct(g.gain)+'</span>':'<span class="muted">--</span>')+'</td>' +
-      '<td class="num">'+g.rounds+'</td>' +
-      '<td>'+gen+'</td>' +
-      '<td class="muted">'+esc(shortRound(g.round))+'</td></tr>';
-  }).join("");
-  document.getElementById("reigns").innerHTML = rows ||
-    '<tr><td colspan="7" class="empty">No reigns recorded yet</td></tr>';
-  document.getElementById("deth-when").textContent =
-    rg.length ? ("Since " + prettyDay(rg[0].at)) : "";
-}
-
-// ── charts ──────────────────────────────────────────────────────────────────
-// Restrained but legible: solid hairline grid, dated x-ticks, a y-axis caption,
-// ringed end-markers, and native tooltips on the moments that matter.
-function drawLines(svgId, series, opts){
-  var svg = document.getElementById(svgId);
-  var W = 1000, H = 400, pad = { l:78, r:20, t:18, b:44 };
-  svg.setAttribute("viewBox", "0 0 " + W + " " + H);
-  var all = [];
-  series.forEach(function(s){ s.data.forEach(function(v){ if(v!=null&&isFinite(v)) all.push(v); }); });
-  if(!all.length){
-    svg.innerHTML = '<text x="'+(W/2)+'" y="'+(H/2)+'" text-anchor="middle" ' +
-      'fill="currentColor" opacity=".55" font-size="17" font-family="'+
-      'IBM Plex Mono,ui-monospace,monospace">'+esc(opts.empty||"No data yet")+'</text>';
-    return;
-  }
-  var n = Math.max.apply(null, series.map(function(s){ return s.data.length; }));
-  // Clean axis: snap the domain to a round tick step, and never extend below
-  // zero when every value is non-negative (a phantom negative band misleads).
-  var dMin = Math.min.apply(null, all.concat([0])), dMax = Math.max.apply(null, all);
-  if(dMax === dMin) dMax = dMin + 1;
-  var raw = (dMax - dMin) / 4, mag = Math.pow(10, Math.floor(Math.log(raw)/Math.LN10));
-  var step = 10 * mag;
-  [1, 2, 2.5, 5].some(function(m){ if(m*mag >= raw){ step = m*mag; return true; } return false; });
-  var lo = Math.floor(dMin/step) * step, hi = Math.ceil(dMax/step) * step;
-  if(dMin >= 0 && lo < 0) lo = 0;
-  if(hi - dMax < step * 0.1) hi += step;   // headroom so the top line isn't glued to the frame
-  var X = function(i){ return pad.l + (n<=1 ? 0 : (W-pad.l-pad.r) * i/(n-1)); };
-  var Y = function(v){ return pad.t + (H-pad.t-pad.b) * (1 - (v-lo)/(hi-lo)); };
-  var out = [];
-  // gridlines + y labels (solid hairlines, recessive; labels legible)
-  var nT = Math.max(1, Math.round((hi-lo)/step));
-  for(var g=0; g<=nT; g++){
-    var v = lo + step*g, y = Y(v);
-    out.push('<line x1="'+pad.l+'" x2="'+(W-pad.r)+'" y1="'+y.toFixed(1)+'" y2="'+y.toFixed(1)+
-      '" stroke="currentColor" stroke-opacity=".12"/>');
-    out.push('<text x="'+(pad.l-10)+'" y="'+(y+5).toFixed(1)+'" text-anchor="end" fill="currentColor" '+
-      'opacity=".72" font-size="15" font-family="IBM Plex Mono,ui-monospace,monospace">'+
-      esc(opts.fmtY ? opts.fmtY(v) : num(v,2))+'</text>');
-  }
-  // y-axis caption, rotated along the left edge
-  if(opts.ylab){
-    out.push('<text transform="rotate(-90)" x="'+(-(pad.t+(H-pad.t-pad.b)/2))+'" y="16" '+
-      'text-anchor="middle" fill="currentColor" opacity=".72" font-size="13.5" '+
-      'font-family="IBM Plex Mono,ui-monospace,monospace" letter-spacing=".04em">'+esc(opts.ylab)+'</text>');
-  }
-  // x ticks (dates)
-  (opts.xticks||[]).forEach(function(t){
-    var x = X(t.i);
-    out.push('<line x1="'+x.toFixed(1)+'" x2="'+x.toFixed(1)+'" y1="'+(H-pad.b)+'" y2="'+(H-pad.b+5)+
-      '" stroke="currentColor" stroke-opacity=".35"/>');
-    out.push('<text x="'+x.toFixed(1)+'" y="'+(H-pad.b+22)+'" text-anchor="'+
-      (t.i===0 ? "start" : (t.i===n-1 ? "end" : "middle"))+'" fill="currentColor" opacity=".72" '+
-      'font-size="14" font-family="IBM Plex Mono,ui-monospace,monospace">'+esc(t.label)+'</text>');
-  });
-  // zero line
-  if(lo < 0 && hi > 0){
-    out.push('<line x1="'+pad.l+'" x2="'+(W-pad.r)+'" y1="'+Y(0).toFixed(1)+'" y2="'+Y(0).toFixed(1)+
-      '" stroke="currentColor" stroke-opacity=".3"/>');
-  }
-  // dethrone markers behind the lines
-  (opts.marks||[]).forEach(function(i){
-    out.push('<line x1="'+X(i).toFixed(1)+'" x2="'+X(i).toFixed(1)+'" y1="'+pad.t+'" y2="'+
-      (H-pad.b)+'" stroke="currentColor" stroke-opacity=".22" stroke-dasharray="2 5"/>');
-  });
-  series.forEach(function(s){
-    var d = "", started = false, lastI = -1, lastV = null;
-    s.data.forEach(function(v,i){
-      if(v==null||!isFinite(v)) return;
-      d += (started?" L":"M") + X(i).toFixed(1) + " " + Y(v).toFixed(1);
-      started = true; lastI = i; lastV = v;
-    });
-    if(!d) return;
-    out.push('<path d="'+d+'" fill="none" stroke="'+s.color+'" stroke-width="'+
-      (s.width||2.5)+'" stroke-linejoin="round" stroke-linecap="round"'+
-      (s.dash?' stroke-dasharray="'+s.dash+'"':'')+'/>');
-    // ringed end-marker so the current value is findable at a glance
-    out.push('<circle cx="'+X(lastI).toFixed(1)+'" cy="'+Y(lastV).toFixed(1)+'" r="5.5" fill="'+
-      s.color+'" stroke="var(--paper)" stroke-width="2">'+
-      (s.endTitle?'<title>'+esc(s.endTitle)+'</title>':'')+'</circle>');
-  });
-  // generous invisible hover targets with native tooltips on key points
-  (opts.pointTitles||[]).forEach(function(p){
-    var v = series[0].data[p.i];
-    if(v==null||!isFinite(v)) return;
-    out.push('<circle cx="'+X(p.i).toFixed(1)+'" cy="'+Y(v).toFixed(1)+
-      '" r="13" fill="transparent"><title>'+esc(p.title)+'</title></circle>');
-  });
-  svg.innerHTML = out.join("");
-}
-
-// Tick formatter: whole percents stay compact ("50%"), fractional steps keep
-// one decimal ("12.5%") — wide labels crowd the rotated axis caption.
-function pctTick(v){
-  var p = v*100;
-  return (Math.abs(p - Math.round(p)) < 0.01 ? p.toFixed(0) : p.toFixed(1)) + "%";
-}
-
-function dateTicks(pts){
-  var n = pts.length; if(!n) return [];
-  var idx = n <= 4 ? pts.map(function(_,i){ return i; })
-                   : [0, Math.round((n-1)/3), Math.round(2*(n-1)/3), n-1];
-  var seen = {}, out = [];
-  idx.forEach(function(i){
-    var lab = shortDay(pts[i].at);
-    if(!lab || seen[lab]) return;
-    seen[lab] = 1; out.push({ i:i, label:lab });
   });
   return out;
 }
-
-function renderPerf(){
-  var chain = improvementChain(), rg = reigns();
-
-  // conclusion first
-  var ans;
-  if(!chain.pts.length) ans = "No scored round has been published yet.";
-  else if(!chain.steps.length) ans = "Not yet: the day-one leader still holds, so no verified improvement exists to report.";
-  else ans = "<b>Yes.</b> The winning forecasts are measured at <b>" + signedPct(chain.obs) +
-    " improvement</b> over the day-one baseline, with at least <b>" + signedPct(chain.floor) +
-    "</b> supported by the conservative bound.";
-  document.getElementById("perf-answer").innerHTML = ans;
-
-  // the two figures, told apart at a glance — detail lives in the expander
-  var fk = document.getElementById("figure-key");
-  if(chain.steps.length){
-    fk.hidden = false;
-    fk.innerHTML =
-      '<div class="fk"><span class="fkl"><i class="swatch" style="background:var(--accent)"></i>' +
-        'Measured</span><div class="fkv">'+signedPct(chain.obs)+'</div>' +
-        '<div class="fks">best estimate</div></div>' +
-      '<div class="fk"><span class="fkl"><i class="swatch dashed" style="color:var(--saffron)"></i>' +
-        'Guaranteed minimum</span><div class="fkv">'+signedPct(chain.floor)+'</div>' +
-        '<div class="fks">95% lower-bound floor</div></div>';
-  } else { fk.hidden = true; }
-
-  drawLines("chart-perf", [
-    { data: chain.pts.map(function(p){ return p.obs; }), color:"var(--accent)",
-      endTitle: chain.steps.length ? ("Measured improvement today: "+signedPct(chain.obs)) : null },
-    { data: chain.pts.map(function(p){ return p.flo; }), color:"var(--saffron)", width:2, dash:"5 4",
-      endTitle: chain.steps.length ? ("Guaranteed minimum today: "+signedPct(chain.floor)) : null }
-  ], {
-    fmtY: pctTick,
-    ylab: "better than day one",
-    xticks: dateTicks(chain.pts),
-    marks: chain.pts.reduce(function(a,p,i){
-      if(chain.steps.some(function(s){ return s.round_id===p.round_id; })) a.push(i); return a; }, []),
-    pointTitles: chain.pts.reduce(function(a,p,i){
-      var st = null;
-      chain.steps.forEach(function(s){ if(s.round_id===p.round_id) st = s; });
-      if(st) a.push({ i:i, title:"Lead change · "+prettyDay(p.at)+" · winner was "+
-        signedPct(1-st.factor)+" better · running total "+signedPct(p.obs) });
-      return a; }, []),
-    empty: "No scored rounds published yet"
-  });
-  document.getElementById("baseline-def").innerHTML = rg.length
-    ? "<b>The baseline:</b> the entry that led on " + esc(prettyDay(rg[0].at)) +
-      ", the first round in the public record (<b>" + esc(shortRef(rg[0].gen_ref)) + "</b>). It is a " +
-      "fixed marker, not a competitor — it never re-runs, so the comparison point can&rsquo;t quietly move."
-    : "<b>The baseline:</b> whoever leads the very first round. None has been published yet.";
-  document.getElementById("perf-note").textContent = chain.steps.length
-    ? (signedPct(chain.obs) + " measured · " + signedPct(chain.floor) + " guaranteed")
-    : "The original leader still holds";
-  document.getElementById("perf-when").textContent =
-    chain.steps.length ? ("Last gain " + timeAgo(chain.steps[chain.steps.length-1].at)) : "";
+// The leaderboard reference (benchmarks/leaderboard-reference.json, refreshed
+// by scripts/refresh_leaderboard_reference.py from the GIFT-Eval space). The
+// "cascade" reading is the same aggregation as the king's signed numbers.
+function refModels(){ return (_lb && _lb.models) || []; }
+function refVal(m, metric){ var c=m&&m.cascade; var v=c?c[metric]:null; return (typeof v==="number"&&isFinite(v))?v:null; }
+function headlineRef(){ var ms=refModels(); for(var i=0;i<ms.length;i++) if(ms[i].model===REF_HEADLINE) return ms[i]; return null; }
+function placeInField(v, metric){
+  var f=_lb&&_lb.field&&_lb.field[metric]; if(!f||!f.length||v==null) return null;
+  var better=0; f.forEach(function(x){ if(x<v) better++; });
+  return {pos:better+1, of:f.length+1};
 }
 
-function renderEfficiency(){
-  var chain = improvementChain(), cum = 0, data = [];
-  chain.pts.forEach(function(p){
-    cum += p.tokens;
-    data.push(cum > 0 ? p.obs / (cum/1e12) : null);
-  });
-  var tot = chain.pts.reduce(function(a,p){ return a+p.tokens; }, 0);
-  var eff = (chain.steps.length && tot>0) ? chain.obs/(tot/1e12) : null;
-
-  // conclusion first — same per-trillion-token unit as the scoreboard
-  var ans;
-  if(!chain.pts.length) ans = "No scored round has been published yet.";
-  else if(eff==null) ans = "Not measurable yet: compute is being spent (" + num(tot/1e12,1) +
-    " trillion training tokens so far) but no verified improvement exists to divide by it.";
-  else ans = "Every trillion training tokens spent has bought <b>" + signedPct(eff,2) +
-    "</b> of verified forecast improvement — " + num(tot/1e12,1) + " trillion tokens since " +
-    esc(prettyDay(chain.pts[0].at)) + ".";
-  document.getElementById("eff-answer").innerHTML = ans;
-
-  drawLines("chart-eff", [{ data:data, color:"var(--accent)",
-    endTitle: eff!=null ? ("Today: "+signedPct(eff,2)+" per trillion tokens") : null }], {
-    fmtY: pctTick,
-    ylab: "gain per trillion tokens",
-    xticks: dateTicks(chain.pts),
-    empty: "No scored rounds published yet"
-  });
-  document.getElementById("eff-note").textContent = tot > 0
-    ? (num(tot/1e12,1) + " trillion tokens used" +
-       (chain.steps.length ? " · " + signedPct(chain.obs/(tot/1e12),2) + " per trillion" : ""))
-    : "--";
-  var eras = TOKEN_ERAS.map(function(e){
-    return (e.from === "0000-00-00" ? "at launch" : "from " + e.from) + ", " +
-      num(e.train_h*3600*e.ref_tps/1e9,1) + "B tokens per full training run and " +
-      num(e.heat_h*3600*e.ref_tps/1e9,1) + "B per screening run (" + e.why + ")";
-  }).join("; ");
-  document.getElementById("eff-caveat").innerHTML =
-    "<p>Reading the line: it falls through rounds that spend compute without a verified gain, " +
-    "and steps up at each change of lead.</p>" +
-    "<p>Every round trains the leader and the challenger from scratch, and briefly trains each " +
-    "entrant to screen the field. Those runs have <b>fixed, published budgets</b>, so the total is " +
-    "the number of runs multiplied by the budget in force at the time: " + esc(eras) + ".</p>" +
-    "<p>A run that hit its time limit early used less than its budget, so this figure <b>overstates " +
-    "the compute</b> — which means the efficiency shown is a cautious one, not a flattering one.</p>";
-  document.getElementById("eff-when").textContent =
-    tot>0 ? (num(tot/1e12,1)+" trillion tokens") : "";
-}
-
-// ── render: benchmark / ladder / warm start ─────────────────────────────────
-function renderBench(){
-  var bv = benchView(), el = document.getElementById("bench-panel");
-  var L = bv.latest;
-  var ans = !L
-    ? "No qualifying public result yet."
-    : "Every score is a ratio against a naive baseline forecast, which sits at 1.00 — " +
-      "<b>lower is better</b>. The current leader&rsquo;s latest published checkpoint scores <b>" +
-      num(L.six.gifteval_mase,3) + "</b> on GIFT-Eval accuracy (MASE)" +
-      (L.six.gifteval_mase<1
-        ? ": <b>" + num((1-L.six.gifteval_mase)*100,1) + "% better</b> than the baseline."
-        : " — not yet beating the baseline.");
-  document.getElementById("bench-answer").innerHTML = ans;
-  if(!L){
-    el.innerHTML = '<div class="pending-panel">' +
-      '<span class="ph">Awaiting first result</span>' +
-      '<p>GIFT-Eval, BOOM and TIME scores for the leading model appear here automatically when ' +
-      'the first externally reproducible result is published — blank until then.</p>' +
-      '</div>';
-    document.getElementById("bench-when").textContent = "";
-    return;
-  }
-  var s = L.six;
-  var suites = [
-    { n:"GIFT-Eval", c:s.gifteval_crps, m:s.gifteval_mase },
-    { n:"BOOM",      c:s.boom_crps,     m:s.boom_mase },
-    { n:"TIME",      c:s.time_crps,     m:s.time_mase }
-  ];
-  var bestLine = "";
-  if(bv.best && bv.best.geomean != null){
-    bestLine = '<p class="lede" style="margin:14px 0 0">Best combined score to date: <b>' +
-      num(bv.best.geomean,3) + '</b> — all six numbers above folded into one (a geometric ' +
-      'mean; lower is better), set by a ' + esc(bv.best.role || "leading") +
-      ' checkpoint on ' + esc(prettyDay(bv.best.at)) +
-      '. A combined score is its own scale — don&rsquo;t compare it to a single benchmark.</p>';
-  }
-  el.innerHTML = '<div class="bcells bench-cells">' + suites.map(function(x){
-    return cell({ k:x.n, v:num(x.m,3),
-      q:"MASE — " + (x.m<1 ? "beats" : "trails") + " 1.00 baseline · CRPS " + num(x.c,3),
-      state:(x.m<1 ? "live" : "warn") });
-  }).join("") + '</div>' + bestLine;
-  document.getElementById("bench-when").textContent = L.src === "report"
-    ? ("Report " + prettyDay(L.at)) : "Current leader";
-}
-
-function renderLadder(){
-  var tr = topRung(), el = document.getElementById("ladder");
-  document.getElementById("scale-answer").innerHTML = tr.top
-    ? "A <b>" + esc(tr.top.label) + "-parameter model</b> has been demonstrated end to end (" +
-      (tr.seen[tr.top.key]||0) + " round" + ((tr.seen[tr.top.key]||0)===1?"":"s") + ")" +
-      (tr.next ? "; the next milestone is <b>" + esc(tr.next.label) + "</b>, not yet run." :
-        " — the top of the planned ladder.")
-    : "No model size has produced a judged result yet.";
-  el.innerHTML = LADDER.map(function(r,i){
-    var done = !!tr.seen[r.key], next = (i === tr.idx+1);
-    var cls = done ? "done" : (next ? "next" : "plan");
-    var status = done ? ("proven · " + tr.seen[r.key] + " round" + (tr.seen[r.key]===1?"":"s"))
-                      : (next ? "next" : "planned");
-    return '<div class="lr '+cls+'">' +
-      '<div class="disc-box"><span class="disc" style="width:calc('+r.disc+'px*var(--lscale));' +
-        'height:calc('+r.disc+'px*var(--lscale))">'+(done?'✓':'')+'</span></div>' +
-      '<span class="lp">'+esc(r.label)+'</span>' +
-      '<span class="ls">'+esc(status)+'</span></div>';
-  }).join("");
-  document.getElementById("scale-when").textContent = tr.top ? (tr.top.label + " proven") : "";
-}
-
-function renderWarm(){
-  var ws = warmStart(), el = document.getElementById("warm-panel");
-  document.getElementById("warm-answer").innerHTML = ws
-    ? "Yes. Rounds no longer start from random initialisation &mdash; the strongest checkpoints earned in earlier rounds are <b>promoted</b> to become the starting point for new training, so each round builds on accumulated progress instead of starting from scratch."
-    : "Not active yet — every round starts from scratch, so nothing has been handed forward.";
-  if(!ws){
-    el.innerHTML = '<div class="pending-panel">' +
-      '<span class="ph">Not active yet</span>' +
-      '<p>This populates once the best model becomes everyone&rsquo;s starting line and the first ' +
-      'handover happens: it will show how much of the accumulated improvement survived, using a ' +
-      'formula fixed in advance — <b>the promoted model&rsquo;s benchmark score divided by the ' +
-      'next round&rsquo;s</b>.</p></div>';
-    document.getElementById("warm-when").textContent = "";
-    return;
-  }
-  el.innerHTML = '<div class="pending-panel">' +
-    '<span class="ph">Active &mdash; rotating starts</span>' +
-    '<p>This round started training from <b>' + esc(shortRef(ws.ckpt)) + '</b>, one of a set of ' +
-    'promoted checkpoints. Because more than one has been promoted, training <b>rotates through the ' +
-    'set</b>: each round starts from a different promoted checkpoint in turn, so the starting point ' +
-    '<b>changes from one round to the next by design</b>. A round starting from a different promoted ' +
-    'model than the round before it is the rotation working as intended, not a checkpoint being ' +
-    'skipped. Each round&rsquo;s start is recorded in its <b>signed manifest</b>, so which checkpoint ' +
-    'a round trained from is verifiable after the fact.</p></div>';
-  document.getElementById("warm-when").textContent = "Active";
-}
-
-function renderPretrain(){
-  var pt = pretrainBySize(), el = document.getElementById("pretrain-panel");
-  var ans = document.getElementById("pretrain-answer");
-  var when = document.getElementById("pretrain-when");
-  if(!pt){
-    ans.innerHTML = "No round has been published yet.";
-    el.innerHTML = ""; when.textContent = "";
-    return;
-  }
-  var tr = topRung(), chained = pt.rounds > 1;
-  var topKey = tr.top ? tr.top.key : null;
-  var topSteps = topKey ? (pt.by[topKey] || 0) : 0;
-
-  // the campaign board: every ladder size gets a row — steps banked toward a
-  // full Toto2-scale pretraining at that size, against the transcribed target
-  var anyTarget = false;
-  var rows = LADDER.map(function(r){
-    var steps = pt.by[r.key] || 0;
-    var tgt = TOTO2_PRETRAIN[r.key];
-    var t = (tgt && tgt.steps > 0) ? tgt.steps : null;
-    if(t) anyTarget = true;
-    var full = t != null && steps >= t;
-    var cls = full ? "full" : (steps > 0 ? "run" : "off");
-    var fill = t != null ? Math.max(0, Math.min(1, steps / t)) : 0;
-    var note;
-    if(steps <= 0) note = "not started";
-    else if(t != null) note = fmtSteps(steps) + " / " + fmtSteps(t) + " steps · " +
-      (full ? "target reached" : num(fill*100, fill < 0.1 ? 1 : 0) + "%");
-    else note = fmtSteps(steps) + " steps · target pending";
-    var title = t != null
-      ? Math.round(steps).toLocaleString() + " of " + Math.round(t).toLocaleString() +
-        " steps — target from: " + (tgt.source || "")
-      : Math.round(steps).toLocaleString() + " steps banked; official " + r.label +
-        " step count not yet transcribed";
-    return '<div class="prow ' + cls + '" title="' + esc(title) + '">' +
-      '<span class="pz">' + esc(r.label) + '</span>' +
-      '<div class="ptrack"><i class="pfill" style="width:' + (fill*100).toFixed(1) + '%"></i></div>' +
-      '<span class="pnote">' + note + '</span></div>';
-  });
-  el.innerHTML = '<div class="pboard">' + rows.join("") + '</div>' +
-    (anyTarget ? "" :
-      '<div class="pending-panel" style="margin-top:12px">' +
-      '<span class="ph">Targets pending</span>' +
-      '<p>Cascade trains to a <b>similar number of steps as the official Toto2 release</b> at ' +
-      'each size, so each bar&rsquo;s target is the official release&rsquo;s own step count — ' +
-      'transcribed from its published training recipe with a citation, never estimated. The ' +
-      'bars fill in as soon as those figures are on the page.</p></div>');
-
-  // headline: the overall campaign when every target is transcribed, else the
-  // current size's banked steps
-  var allT = LADDER.every(function(r){
-    var t = TOTO2_PRETRAIN[r.key]; return t && t.steps > 0; });
-  var chainNote = chained
-    ? "<b>" + pt.rounds + " consecutive rounds</b> carried forward"
-    : "one round&rsquo;s fixed budget — training does not carry forward between rounds yet";
-  if(allT){
-    var got = 0, want = 0;
-    LADDER.forEach(function(r){
-      var t = TOTO2_PRETRAIN[r.key].steps;
-      got += Math.min(pt.by[r.key] || 0, t); want += t; });
-    ans.innerHTML = "The full 4M&rarr;10B ladder is <b>" + num(got/want*100, got/want < 0.1 ? 1 : 0) +
-      "% pretrained</b> against the official Toto2 step budgets. At the current size" +
-      (tr.top ? " (" + esc(tr.top.label) + ")" : "") + " the champion has banked <b>&asymp;" +
-      fmtSteps(topSteps) + " steps</b>: " + chainNote + ".";
+// ── render: hero ────────────────────────────────────────────────────────────
+function renderHero(){
+  var el=document.getElementById("hero"), ks=kingSeries(), king=ks.length?ks[ks.length-1]:null;
+  var ref=headlineRef(), metric=_metric, label=metric==="mase"?"MASE":"CRPS";
+  var kv=king?king[metric]:null, rv=ref?refVal(ref,metric):null;
+  var big, rows=[];
+  if(kv!=null&&rv!=null){
+    var gap=(kv/rv-1)*100, ahead=gap<=0;
+    big='<div class="hv">'+num(Math.abs(gap),1)+'<span class="u">%</span></div>'+
+      '<div class="hl '+(ahead?"ahead":"behind")+'">'+(ahead?"ahead of ":"behind ")+esc(ref.model)+'</div>';
+  } else if(rv!=null){
+    big='<div class="hv pend">&mdash;</div><div class="hl">'+esc(ref.model)+' '+num(rv,3)+'</div>'+
+      '<div class="hq">awaiting the king&rsquo;s first signed GIFT-Eval report</div>';
   } else {
-    ans.innerHTML = "The champion has banked <b>&asymp;" + fmtSteps(topSteps) +
-      " optimiser steps</b>" + (tr.top ? " at " + esc(tr.top.label) : "") + " — " + chainNote +
-      ". Each size&rsquo;s goal is a full Toto2-scale pretraining: roughly the official " +
-      "release&rsquo;s own step count, banked round by round once training carries forward.";
+    big='<div class="hv pend">&mdash;</div><div class="hq">awaiting the leaderboard reference</div>';
   }
-  when.textContent = chained ? (pt.rounds + " rounds chained") : "1 round";
+  if(kv!=null){
+    var pl=placeInField(kv,metric);
+    big+='<div class="hq" title="King checkpoint of settlement '+esc(king.round_id)+' — signed bench report (the trainer&rsquo;s, or the main validator&rsquo;s once [v2] bench_source = validator)">'+
+      'king '+label+' <b>'+num(kv,3)+'</b> · '+esc(prettyDay(king.at))+'</div>';
+    if(pl) big+='<div class="place" title="Where the king&rsquo;s '+label+' geomean would sit among the leaderboard&rsquo;s '+(pl.of-1)+
+      ' entries without test-data leakage (by geomean; the board itself sorts by mean rank)">would place <b>#'+pl.pos+'</b> of '+pl.of+'</div>';
+    if(IS_TESTNET) big+='<div class="hq" title="Testnet benches a truncated battery (cascade_bench_max_series)">testnet battery is truncated &mdash; not comparable</div>';
+  }
+  refModels().forEach(function(m){ var v=refVal(m,metric); if(v!=null) rows.push({name:m.model, org:m.org, v:v, us:false, pos:m.leaderboard&&m.leaderboard.position}); });
+  if(kv!=null) rows.push({name:"Cascade king", org:"SN91", v:kv, us:true});
+  rows.sort(function(a,b){ return a.v-b.v; });
+  var max=0; rows.forEach(function(r){ if(r.v>max) max=r.v; });
+  var bestRef=null; rows.forEach(function(r){ if(!r.us&&(!bestRef||r.v<bestRef.v)) bestRef=r; });
+  var bars=rows.map(function(r){
+    var w=max>0?Math.max(2,r.v/max*100):0;
+    return '<div class="rk'+(r.us?' us':'')+(r===bestRef?' best':'')+'" title="'+esc(r.name+(r.org?" · "+r.org:"")+" · "+label+" "+num(r.v,4)+
+      (r.pos?" · leaderboard #"+r.pos+" (mean rank)":""))+'">'+
+      '<span class="n">'+esc(r.name)+(r.org?'<small>'+esc(r.org)+'</small>':'')+'</span>'+
+      '<span class="t"><i class="f" style="width:'+w.toFixed(1)+'%"></i></span>'+
+      '<span class="v">'+num(r.v,3)+'</span></div>';
+  }).join("");
+  var foot=_lb?('<span title="'+esc((_lb.readings&&_lb.readings.cascade)||"")+'">'+label+' · Seasonal-Naive = 1.00 · lower is better</span>'+
+      '<a href="'+esc(_lb.source||"#")+'" target="_blank" rel="noopener" title="Space revision '+esc(_lb.space_revision||"")+'">leaderboard · '+esc(prettyDay(_lb.retrieved_at))+'</a>'):'';
+  el.innerHTML='<div class="big">'+big+'</div><div><div class="rank">'+(bars||'<div class="hq">no reference models loaded</div>')+'</div>'+
+    '<div class="rank-foot">'+foot+'</div></div>';
 }
 
-// ── render: method + chrome ─────────────────────────────────────────────────
-function renderMethod(){
-  var rg = reigns();
-  var items = [
-    ["Miners entered",
-     "The signed round summary&rsquo;s participant count: miners whose committed entry was " +
-     "<b>eligible at the round&rsquo;s cutoff</b>. Each hotkey fields <b>one entry per round</b> " +
-     "— its latest on-chain commitment — so this is both the miner count and the entry count. " +
-     "Not &ldquo;registered&rdquo; and not &ldquo;active&rdquo; in any looser sense — exactly " +
-     "the entries the round judged."],
-    ["Lead changes",
-     "Counted from the signed record of each round — the field that says the title changed hands. " +
-     "&ldquo;Different miners&rdquo; are counted by cryptographic key, not UID (UIDs get re-used)."],
-    ["Measured vs guaranteed improvement",
-     "Each lead change is a like-for-like test of old leader against challenger on the same data. " +
-     "Those gains are multiplied together. The guaranteed figure uses the cautious end of each " +
-     "measurement (<code>lcb</code>, the threshold the win had to clear)."],
-    ["Why not one single score",
-     "The test data changes every round so nobody can tune to it. That makes scores from different " +
-     "rounds non-comparable, which is why gains are chained from same-round comparisons instead."],
-    ["Margin of error",
-     "A win is awarded on a good measurement, and good measurements are sometimes lucky. So the " +
-     "measured line runs slightly optimistic and the guaranteed line runs conservative. Read them " +
-     "as a range."],
-    ["Public benchmark",
-     "Trainer-signed per-round reports (<code>benchmarks/round-&lt;id&gt;.json</code>): GIFT-Eval, " +
-     "BOOM and TIME, CRPS + MASE, scored as their public leaderboards do. The headline is the " +
-     "current leader&rsquo;s most recent report; &ldquo;best combined score&rdquo; is the lowest " +
-     "six-score geometric mean in the scanned recent record. Not every round has a report. " +
-     "Reported only — they never decide who wins."],
-    ["Biggest model proven",
-     "The largest size that has actually produced a judged result. Planning a size doesn&rsquo;t " +
-     "count it."],
-    ["Vs official Toto2",
-     "Reference docs (<code>benchmarks/reference-&lt;size&gt;.json</code>): the official Datadog " +
-     "checkpoint of a ladder size, scored by the identical benchmark battery and published by " +
-     "the operator — never a transcribed leaderboard number. The percentage compares six-score " +
-     "geometric means against Cascade&rsquo;s best published checkpoint at that size. The " +
-     "completion meter&rsquo;s origin is the <b>genesis king</b> benched the same way " +
-     "(<code>benchmarks/genesis-&lt;size&gt;.json</code>) — the fixed day-one anchor — falling " +
-     "back to the earliest published round result until that lands."],
-    ["Pretraining progress",
-     "Steps per round are the <b>contracted</b> training budget (hours &times; reference " +
-     "throughput &divide; batch &times; context — all published in the training contract), not a " +
-     "measured log. Rounds chain only through the signed manifest&rsquo;s warm-start record; a " +
-     "from-scratch round resets the chain. The target is the official release&rsquo;s own step " +
-     "count at the same size, transcribed with citation — pending until it is."],
-    ["Compute",
-     "Number of training runs times their published budgets. See the note under the chart."],
-    ["Progress carried forward",
-     "Not measurable until the hand-forward mechanism is switched on."],
-    ["Economics",
-     "The subnet&rsquo;s alpha price (TAO per alpha, from the on-chain pool) and TAO emissions " +
-     "per day, read from the chain and published in the dashboard&rsquo;s live status feed " +
-     "(<code>status/chain.json</code>) on the validator&rsquo;s poll cadence. Unlike the round " +
-     "record this feed is presentational and unsigned; when it is absent the cell stays " +
-     "pending rather than guessing."]
-  ];
-  document.getElementById("method").innerHTML = items.map(function(p){
-    return "<div><dt>"+esc(p[0])+"</dt><dd>"+p[1]+"</dd></div>"; }).join("");
-
-  var parts = ["Read live from the subnet&rsquo;s public signed record. No database, no stored " +
-    "figures, nothing entered by hand — reload and it recalculates."];
-  if(atCap()){
-    parts.push("The public record keeps the most recent " + INDEX_MAX_KEEP + " rounds, so " +
-      "&ldquo;day one&rdquo; here means " + esc(prettyDay(rg.length?rg[0].at:"")) +
-      ", the oldest round still listed.");
+// ── render: tiles ───────────────────────────────────────────────────────────
+// Explanations live behind an info icon: hover, keyboard focus, or tap.
+function infoTip(label, text){
+  if(!text) return "";
+  return '<button type="button" class="info-icon" aria-label="About '+esc(label)+'" aria-expanded="false" data-info="'+esc(text)+'"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="8" cy="8" r="6.5" stroke="currentColor"/><path d="M8 7v4M8 4.5v.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg></button>';
+}
+(function infoHelp(){
+  var active=null, box=null, pinned=false;
+  function hide(){
+    if(active){ active.setAttribute("aria-expanded","false"); active.removeAttribute("aria-describedby"); }
+    if(box) box.hidden=true;
+    active=null; pinned=false;
   }
-  document.getElementById("foot").innerHTML = parts.join(" ");
+  function show(button, pin){
+    if(active!==button) hide();
+    if(!box){ box=document.createElement("div"); box.id="info-tooltip"; box.className="info-tooltip"; box.setAttribute("role","tooltip"); document.body.appendChild(box); }
+    active=button; pinned=!!pin; box.textContent=button.dataset.info; box.hidden=false;
+    button.setAttribute("aria-expanded","true"); button.setAttribute("aria-describedby",box.id);
+    position();
+  }
+  function position(){
+    if(!active||!box||box.hidden) return;
+    var r=active.getBoundingClientRect(), w=box.offsetWidth, h=box.offsetHeight;
+    if(!active.isConnected||r.bottom<0||r.top>window.innerHeight){ hide(); return; }
+    box.style.left=Math.max(12,Math.min(r.left,window.innerWidth-w-12))+"px";
+    box.style.top=Math.max(12,r.bottom+h+20>window.innerHeight?r.top-h-8:r.bottom+8)+"px";
+  }
+  function trigger(event){ return event.target.closest&&event.target.closest(".info-icon"); }
+  document.addEventListener("mouseover",function(event){ var b=trigger(event); if(b&&!pinned) show(b,false); });
+  document.addEventListener("mouseout",function(event){ if(trigger(event)===active&&!pinned) hide(); });
+  document.addEventListener("focusin",function(event){ var b=trigger(event); if(b) show(b,false); });
+  document.addEventListener("focusout",function(event){ if(trigger(event)===active) hide(); });
+  document.addEventListener("click",function(event){
+    var b=trigger(event);
+    if(!b){ hide(); return; }
+    if(active===b&&pinned) hide(); else show(b,true);
+  });
+  document.addEventListener("keydown",function(event){ if(event.key==="Escape") hide(); });
+  window.addEventListener("resize",position);
+  window.addEventListener("scroll",position,true);
+})();
+
+function tileHtml(o){
+  return '<div class="tile s-'+(o.state||"live")+'">'+
+    '<span class="k">'+esc(o.k)+infoTip(o.k,o.title)+'</span><span class="bar"></span>'+
+    '<div class="v">'+o.v+'</div><div class="q">'+(o.q||"")+'</div></div>';
+}
+function v2Live(){ return !!(_v2&&_v2.golive&&_v2.golive.state==="live"); }
+// Tokens on the king lineage: from v2 the trainer's own lineage counter (every
+// finished era's king leg); before it, one contracted leg per promotion
+// generation plus the king's own (the training tab's lineage depth).
+function lineageTokens(){
+  var lb=_v2&&_v2.lane_b&&_v2.lane_b.gate;
+  if(v2Live()&&lb&&Number(lb.lineage_tokens)>0) return {v:Number(lb.lineage_tokens), src:"v2"};
+  if(!allRounds().length) return null;
+  var legs=(_gens||0)+1;
+  return {v:legs*LEG_BUDGET.train_h*3600*LEG_BUDGET.ref_tps, src:"contract", legs:legs};
+}
+function competitions(){
+  var rs=allRounds(); if(!rs.length) return null;
+  var eras={}, legs=0, eb=eraBlocks();
+  rs.forEach(function(r){
+    var b=Number(r.era_start_block)>0?Number(r.era_start_block):Math.floor(Number(r.epoch_start_block||0)/eb)*eb;
+    eras[b]=1;
+    if(r.status!=="scored") return;
+    var k=Number(r.cohort_k)||0;
+    if(!k&&r.cohort_lcbs) k=Object.keys(r.cohort_lcbs).length;
+    if(!k&&r.chal_hotkey) k=1;
+    legs+=k;
+  });
+  return {settlements:rs.length, eras:Object.keys(eras).length, legs:legs};
+}
+function miners(){
+  var seen={}, latest=null;
+  byBlock(scoredRounds()).forEach(function(r){
+    [r.king_hotkey, r.chal_hotkey].forEach(function(h){ if(h) seen[h]=1; });
+    Object.keys(r.cohort_lcbs||{}).forEach(function(h){ seen[h]=1; });
+    if(r.n_participants!=null) latest=r.n_participants;
+  });
+  var n=Object.keys(seen).length; return n?{n:n, latest:latest}:null;
+}
+function renderTiles(){
+  var t=[], lt=lineageTokens(), c=competitions(), m=miners(), cap=allRounds().length>=INDEX_MAX_KEEP;
+  t.push(tileHtml({k:"Lineage tokens", v:lt?fmtBig(lt.v):"&mdash;", state:lt?"live":"pend",
+    q:lt?(lt.src==="v2"?"king lineage · trainer counter":lt.legs+" leg"+(lt.legs===1?"":"s")+" · contract"):"awaiting first round",
+    title:lt?(lt.src==="v2"?"Series-points trained on the king lineage, counted by the trainer (status/v2.json): one contract budget per finished era king leg."
+      :"Series-points behind the king's checkpoint: one contracted leg ("+fmtBig(LEG_BUDGET.train_h*3600*LEG_BUDGET.ref_tps)+") per promotion generation plus its own."):""}));
+  t.push(tileHtml({k:"Competitions", v:c?String(c.settlements):"&mdash;", state:c?"live":"pend",
+    q:c?(c.eras+" era"+(c.eras===1?"":"s")+" · "+c.legs+" challenger leg"+(c.legs===1?"":"s")):"awaiting first round",
+    title:"Settlements = signed round receipts"+(cap?" (the index keeps the latest "+INDEX_MAX_KEEP+")":"")+
+      "; eras = distinct 12 h eras they settle; challenger legs = challengers judged against the king (the cohort of each settlement)."}));
+  t.push(tileHtml({k:"Miners", v:m?String(m.n):"&mdash;", state:m?"live":"pend",
+    q:m?(m.latest!=null?m.latest+" eligible now":"judged"):"awaiting first round",
+    title:"Distinct miner hotkeys judged as king or challenger in the record; 'eligible now' = the latest settlement's participant set."}));
+  var lb=_v2&&_v2.lane_b, merged=lb&&lb.merged_total!=null?Number(lb.merged_total):null;
+  t.push(tileHtml({k:"Experts merged", v:v2Live()&&lb&&lb.active&&merged!=null?String(merged):"&mdash;", state:v2Live()&&lb&&lb.active?"live":"off",
+    q:v2Live()&&lb&&lb.active?((lb.domains||[]).length+" domains · lane B "+(lb.gate&&lb.gate.open?"open":"gated")):"lane B not launched",
+    title:"Domain-expert legs (lane B) whose change passed the gain test and every guard and was merged into the king's next era."}));
+  var g=_v2&&_v2.golive, gv="&mdash;", gq="go-live not announced", gs="off", gt="v2 = Cascade-MoE-28M + domain-expert lane";
+  if(g&&g.state==="live"){ gv="Live"; gs="live"; gq="since block "+g.from_block; }
+  else if(g&&g.state==="scheduled"){
+    gv="#"+g.from_block; gs="pend";
+    var secs=liveEta(g); gq=secs!=null?"in ~"+fmtDur(secs):"scheduled";
+  }
+  if(_v2&&_v2.model&&_v2.model.total_params) gt+=" ("+fmtBig(_v2.model.active_params)+" active / "+fmtBig(_v2.model.total_params)+" total params)";
+  t.push(tileHtml({k:"v2 · MoE", v:gv, q:gq, state:gs, title:gt}));
+  document.getElementById("tiles").innerHTML=t.join("");
+}
+// Blocks to the go-live, extrapolated from the status doc's own block.
+function liveEta(g){
+  if(!_v2||_v2.block==null||!g.from_block) return null;
+  var asOf=_v2.as_of?new Date(_v2.as_of).getTime():Date.now();
+  var est=Number(_v2.block)+Math.max(0,(Date.now()-asOf)/12000);
+  return Math.max(0,(g.from_block-est)*12);
 }
 
-// Inline marks (X, Discord, GitHub) so the page stays self-contained; each
-// renders only when COMMUNITY carries a real URL for it.
+// ── render: trend ───────────────────────────────────────────────────────────
+function renderTrend(){
+  var svg=document.getElementById("chart-gap"), W=1000, H=380, pad={l:70,r:18,t:16,b:40};
+  svg.setAttribute("viewBox","0 0 "+W+" "+H);
+  var ref=headlineRef(), metric=_metric, rv=ref?refVal(ref,metric):null, ks=kingSeries();
+  document.getElementById("trend-title").textContent="King vs "+(ref?ref.model:REF_HEADLINE)+" · GIFT-Eval "+(metric==="mase"?"MASE":"CRPS");
+  document.getElementById("trend-ref").textContent=ref?ref.model:REF_HEADLINE;
+  if(rv==null||!ks.length){
+    svg.innerHTML='<text x="'+(W/2)+'" y="'+(H/2)+'" text-anchor="middle" fill="currentColor" opacity=".55" font-size="16" font-family="IBM Plex Mono,monospace">'+
+      (rv==null?"awaiting the leaderboard reference":"awaiting signed king bench reports")+'</text>';
+    document.getElementById("trend-note").textContent="--"; document.getElementById("trend-when").textContent="";
+    return;
+  }
+  var pts=ks.map(function(p){ return {at:p.at, v:(p[metric]/rv-1)*100, raw:p[metric], id:p.round_id}; });
+  var vals=pts.map(function(p){ return p.v; }).concat([0]);
+  var lo=Math.min.apply(null,vals), hi=Math.max.apply(null,vals); if(hi===lo){ hi+=1; lo-=1; }
+  var span=hi-lo; lo-=span*0.1; hi+=span*0.1;
+  var n=pts.length;
+  function X(i){ return pad.l+(n<=1?0.5:i/(n-1))*(W-pad.l-pad.r); }
+  function Y(v){ return pad.t+(1-(v-lo)/(hi-lo))*(H-pad.t-pad.b); }
+  var out=[];
+  for(var g=0;g<=4;g++){
+    var v=lo+(hi-lo)*g/4, y=Y(v);
+    out.push('<line x1="'+pad.l+'" x2="'+(W-pad.r)+'" y1="'+y.toFixed(1)+'" y2="'+y.toFixed(1)+'" stroke="currentColor" stroke-opacity=".1"/>');
+    out.push('<text x="'+(pad.l-8)+'" y="'+(y+5).toFixed(1)+'" text-anchor="end" fill="currentColor" opacity=".7" font-size="14" font-family="IBM Plex Mono,monospace">'+(v>0?"+":"")+v.toFixed(1)+'%</text>');
+  }
+  var y0=Y(0);
+  out.push('<line x1="'+pad.l+'" x2="'+(W-pad.r)+'" y1="'+y0.toFixed(1)+'" y2="'+y0.toFixed(1)+'" stroke="var(--warn)" stroke-width="2" stroke-dasharray="7 5"/>');
+  out.push('<text x="'+(W-pad.r)+'" y="'+(y0-7).toFixed(1)+'" text-anchor="end" fill="var(--warn)" font-size="13" font-family="IBM Plex Mono,monospace">'+esc(ref.model)+' '+num(rv,3)+'</text>');
+  var d=pts.map(function(p,i){ return (i?"L":"M")+X(i).toFixed(1)+" "+Y(p.v).toFixed(1); }).join(" ");
+  if(n>1) out.push('<path d="'+d+'" fill="none" stroke="var(--accent)" stroke-width="2.5" stroke-linejoin="round"/>');
+  pts.forEach(function(p,i){
+    out.push('<circle cx="'+X(i).toFixed(1)+'" cy="'+Y(p.v).toFixed(1)+'" r="'+(i===n-1?5.5:3)+'" fill="var(--accent)" stroke="var(--paper)" stroke-width="1.5"><title>'+
+      esc(prettyDay(p.at)+" · king "+num(p.raw,4)+" · "+(p.v>0?"+":"")+p.v.toFixed(2)+"% vs "+ref.model)+'</title></circle>');
+  });
+  var ticks=n<=4?pts.map(function(_,i){ return i; }):[0,Math.round((n-1)/3),Math.round(2*(n-1)/3),n-1], seen={};
+  ticks.forEach(function(i){ var lab=shortDay(pts[i].at); if(!lab||seen[lab]) return; seen[lab]=1;
+    out.push('<text x="'+X(i).toFixed(1)+'" y="'+(H-12)+'" text-anchor="'+(i===0?"start":(i===n-1?"end":"middle"))+'" fill="currentColor" opacity=".7" font-size="13" font-family="IBM Plex Mono,monospace">'+esc(lab)+'</text>'); });
+  out.push('<text transform="rotate(-90)" x="'+(-(pad.t+(H-pad.t-pad.b)/2))+'" y="14" text-anchor="middle" fill="currentColor" opacity=".6" font-size="12" font-family="IBM Plex Mono,monospace">gap (below 0 = ahead)</text>');
+  svg.innerHTML=out.join("");
+  var last=pts[n-1];
+  document.getElementById("trend-note").textContent=n+" benched settlements · latest "+(last.v>0?"+":"")+last.v.toFixed(1)+"%";
+  document.getElementById("trend-when").textContent=prettyDay(last.at);
+}
+
+// ── chrome ──────────────────────────────────────────────────────────────────
 var SOC_ICONS = {
   x: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.901 1.153h3.68l-8.04 9.19L24 22.846h-7.406l-5.8-7.584-6.638 7.584H.474l8.6-9.83L0 1.154h7.594l5.243 6.932ZM17.61 20.644h2.039L6.486 3.24H4.298Z"/></svg>',
   discord: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.865-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.058a.082.082 0 0 0 .031.056 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028 14.09 14.09 0 0 0 1.226-1.994.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128c.126-.094.252-.192.372-.291a.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.009c.12.099.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03zM8.02 15.331c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418Z"/></svg>',
   github: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/></svg>'
 };
 function renderCommunity(){
-  var el = document.getElementById("soc-links"), names = { x:"X", discord:"Discord", github:"GitHub" };
-  el.innerHTML = ["x","discord","github"].map(function(k){
-    var url = COMMUNITY[k];
-    if(!url) return "";
-    return '<a href="'+esc(url)+'" target="_blank" rel="noopener" title="'+names[k]+
-      '" aria-label="'+names[k]+'">'+SOC_ICONS[k]+'</a>';
+  var el=document.getElementById("soc-links"), names={x:"X", discord:"Discord", github:"GitHub"};
+  el.innerHTML=["x","discord","github"].map(function(k){
+    var url=COMMUNITY[k]; if(!url) return "";
+    return '<a href="'+esc(url)+'" target="_blank" rel="noopener" title="'+names[k]+'" aria-label="'+names[k]+'">'+SOC_ICONS[k]+'</a>';
   }).join("");
 }
-renderCommunity();
-
+function renderFoot(){
+  var ks=kingSeries(), king=ks.length?ks[ks.length-1]:null, parts=[];
+  parts.push('<a href="'+KING_GITHUB+'" target="_blank" rel="noopener" title="The sitting king&rsquo;s generator code (champions/king)">king generator</a>');
+  var r=byBlock(scoredRounds()).pop();
+  if(r&&r.post_round_king_hotkey&&r.king_gen_ref) parts.push('<a href="'+genUrl(r.king_gen_ref)+'" target="_blank" rel="noopener" title="'+esc(r.king_gen_ref)+'">registry digest</a>');
+  if(king) parts.push('<span title="'+esc(king.pointer)+'">king checkpoint · settlement '+esc(String(king.round_id).slice(0,8))+'</span>');
+  parts.push('<span>signed receipts · bench reports · leaderboard reference</span>');
+  document.getElementById("foot").innerHTML=parts.join("");
+}
 function renderChrome(){
-  var sub = (_index && _index.subnet) || {};
-  document.getElementById("tb-netuid").textContent = sub.netuid!=null ? ("#"+sub.netuid) : "--";
-  document.getElementById("tb-rounds").textContent = allRounds().length || "--";
-  document.getElementById("tb-updated").textContent =
-    _index && _index.updated_at ? timeAgo(_index.updated_at) : "--";
-  document.getElementById("tb-live").hidden = _state !== "live";
-  var el = document.getElementById("net-badge");
-  el.textContent = IS_TESTNET ? "TESTNET" : "MAINNET";
-  el.className = "net-badge " + (IS_TESTNET ? "net-testnet" : "net-mainnet");
-  if(IS_TESTNET && document.title.indexOf("testnet") !== 0) document.title = "testnet · " + document.title;
-
-  var b = document.getElementById("data-banner");
-  if(_state === "live"){ b.hidden = true; }
-  else {
-    b.hidden = false;
-    b.className = "data-banner " + (_state === "offline" ? "offline" : "loading");
-    b.textContent = _state === "offline"
-      ? "Can’t reach the public record right now — showing nothing rather than stale numbers."
-      : "Loading the public record…";
-  }
+  var sub=(_index&&_index.subnet)||{};
+  document.getElementById("tb-netuid").textContent=sub.netuid!=null?("#"+sub.netuid):"--";
+  document.getElementById("tb-updated").textContent=_index&&_index.updated_at?timeAgo(_index.updated_at):"--";
+  document.getElementById("tb-live").hidden=_state!=="live";
+  var el=document.getElementById("net-badge");
+  el.textContent=IS_TESTNET?"TESTNET":"MAINNET";
+  el.className="net-badge "+(IS_TESTNET?"net-testnet":"net-mainnet");
+  if(IS_TESTNET&&document.title.indexOf("testnet")!==0) document.title="testnet · "+document.title;
+  var b=document.getElementById("data-banner");
+  if(_state==="live"){ b.hidden=true; return; }
+  b.hidden=false;
+  b.className="data-banner "+(_state==="offline"?"offline":"loading");
+  b.textContent=_state==="offline"?"Can’t reach the public record right now — showing nothing rather than stale numbers.":"Loading the public record…";
 }
-
-function renderAll(){
-  renderChrome(); renderBoard(); renderCompetition(); renderPerf();
-  renderLadder(); renderRef(); renderPretrain(); renderEfficiency(); renderBench(); renderWarm(); renderMethod();
-}
+function renderAll(){ renderChrome(); renderHero(); renderTiles(); renderTrend(); renderFoot(); }
 
 document.getElementById("theme-toggle").addEventListener("click", function(){
-  var dark = document.documentElement.dataset.theme !== "dark";
-  document.documentElement.dataset.theme = dark ? "dark" : "light";
-  localStorage.setItem("cascDashTheme", dark ? "dark" : "light");
-  this.textContent = dark ? "LIGHT" : "DARK";
-  renderPerf(); renderEfficiency();
+  var dark=document.documentElement.dataset.theme!=="dark";
+  document.documentElement.dataset.theme=dark?"dark":"light";
+  try { localStorage.setItem("cascDashTheme", dark?"dark":"light"); } catch(e) {}
+  this.textContent=dark?"LIGHT":"DARK";
 });
-document.getElementById("theme-toggle").textContent =
-  document.documentElement.dataset.theme === "dark" ? "LIGHT" : "DARK";
+document.getElementById("theme-toggle").textContent=document.documentElement.dataset.theme==="dark"?"LIGHT":"DARK";
+(function(){
+  var bs=document.querySelectorAll("[data-metric]");
+  for(var i=0;i<bs.length;i++) bs[i].addEventListener("click", function(){
+    _metric=this.dataset.metric;
+    for(var j=0;j<bs.length;j++) bs[j].classList.toggle("on", bs[j]===this);
+    renderHero(); renderTrend();
+  });
+})();
 
-var _pollN = 0;
+var _pollN=0;
 function poll(){
   _pollN++;
-  // reference docs are static-ish: probe on load, then re-probe misses every
-  // 10th poll (~10 min) so a freshly published baseline appears without a reload
-  scanRefs(_pollN === 1 || _pollN % 10 === 0);
   fetchJSON("receipts/index.json")
-    .then(function(d){ _index = splitPinned(collapseByRound(d)); _state = "live"; renderAll(); scanBench(); })
-    .catch(function(){ _state = "offline"; renderChrome(); });
-  // The anchored trail, not the shared last-writer-wins pointer: any validator
-  // can overwrite receipts/latest.json, and the bench/warm-start reads below
-  // must come from the same signer the rest of the page trusts.
-  fetchJSON("receipts/" + RECEIPT_ANCHOR + "/latest.json")
-    .catch(function(){ return fetchJSON("receipts/latest.json"); })
-    .then(function(d){ _latest = d; renderBoard(); renderBench(); renderWarm(); })
-    .catch(function(){});
-  // Live chain view (unsigned, presentational): feeds the Economics cell.
-  fetchJSON("status/chain.json")
-    .then(function(d){ _chain = d; renderBoard(); })
-    .catch(function(){});
+    .then(function(d){ _index=collapseByRound(d); _state="live"; renderAll(); scanBench(); })
+    .catch(function(){ _state="offline"; renderChrome(); });
+  fetchJSON("status/chain.json").then(function(d){ _chain=d; renderTiles(); }).catch(function(){});
+  // v2 status (trainer, unsigned): go-live, lineage counter, merged experts
+  fetchJSON("status/v2.json").then(function(d){ _v2=d; renderTiles(); }).catch(function(){});
+  if(_pollN===1||_pollN%10===0||!_lb)
+    fetchJSON("benchmarks/leaderboard-reference.json").then(function(d){ _lb=d; renderHero(); renderTrend(); }).catch(function(){});
+  fetchJSON("promotions/index.json").then(function(d){ _gens=Number(d&&d.latest_generation)||0; renderTiles(); }).catch(function(){});
 }
+renderCommunity();
 renderAll();
 poll();
 setInterval(function(){ if(!document.hidden) poll(); }, POLL_MS);
 document.addEventListener("visibilitychange", function(){ if(!document.hidden) poll(); });
+setInterval(renderTiles, 60000);   // tick the go-live countdown
 </script>
 </body>
 </html>

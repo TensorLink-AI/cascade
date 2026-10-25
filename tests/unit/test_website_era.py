@@ -1,13 +1,12 @@
 """The public website (cascade/website/index.html) under rolling eras: one
 round is one era of ``era_blocks`` with a settlement receipt at every
 ``epoch_blocks`` boundary inside it, and the live field is the trainer's
-funded roster (``funded/latest.json``), not the pre-rollover heat doc.
+funded roster (``funded/latest.json``).
 
 Contract checks on the static page (pure text, no network): the era grid is
 derived from the status feed, settlement rows group by era, every roster
-standing has a pill, the roster is fetched, and the stale pre-rollover docs are
-guarded against — a silent regression on any of these leaves the page counting
-3 h rounds or showing a field from before the current era."""
+standing has a pill and the roster is fetched — a silent regression on any of
+these leaves the page counting 3 h rounds or showing no field."""
 from __future__ import annotations
 
 import re
@@ -55,7 +54,7 @@ def test_settlement_rows_group_by_the_receipts_era(page: str):
     assert "Math.floor(b/era)*era" in body
 
 
-def test_roster_is_fetched_and_rendered_in_rolling_mode(page: str):
+def test_roster_is_fetched_and_rendered(page: str):
     assert re.search(r'fetchJSON\(\s*"funded/latest\.json"', page)
     assert "function renderRoster(" in page
     heat = _fn(page, "renderHeat")
@@ -69,11 +68,6 @@ def test_roster_is_fetched_and_rendered_in_rolling_mode(page: str):
 def test_every_roster_standing_has_a_pill(page: str, status: str):
     m = re.search(r"function heatStatusMeta\(s\)\{(.*?)\n\}", page, re.S)
     assert m and f's==="{status}"' in m.group(1)
-
-
-def test_stale_pre_rollover_heat_doc_is_never_shown_as_live(page: str):
-    body = _fn(page, "heatSource")
-    assert "live.esb<cn.eraStart" in body
 
 
 def test_live_strip_renders_one_pill_per_settlement(page: str):

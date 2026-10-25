@@ -1,25 +1,22 @@
-"""``cascade round`` — a terminal dashboard counting down to the next round.
+"""``cascade round`` — a terminal dashboard counting down to the next settlement.
 
 A round is one ``[round] epoch_blocks`` window on the chain block grid (the
-same math the trainer uses in :meth:`~cascade.trainer.loop.TrainerRunner.
-run_forever`): the current epoch is ``block // epoch_blocks`` and the next
-round starts at the next epoch boundary. Only commitments revealed STRICTLY
-BEFORE that boundary enter the next round, so the boundary is also the
-submission deadline — the number a miner actually watches.
+same grid the trainer settles on): the current epoch is
+``block // epoch_blocks`` and the next settlement is at the next epoch
+boundary. Intake is rolling — funded/revealed entries queue for admission and
+GPU capacity; completed work can settle at a later boundary — so the boundary is when verdicts land,
+not a submission deadline.
 
-Beyond the countdown, the dashboard shows where the round roughly is
-(``heat ▸ duel ▸ validation ▸ settled``) and a live feed of revealed on-chain
-submissions. The stage is *confirmed* when the round's receipt appears in the
-public ``receipts/index.json`` (settled), and otherwise *estimated* from the
-configured stage budgets — the trainer's internal progress is not public, so
-the pre-settle stages are wall-clock estimates, labelled as such. Submissions
-come straight from the chain's revealed commitments; in watch mode a commit
-that lands while you watch is flagged ``● new`` — the confirmation a miner
-looks for right after ``cascade deploy``.
+Beyond the countdown, the dashboard shows the round's verdict once its receipt
+appears in the public ``receipts/index.json`` (and the previous round's while
+this one is in flight), the dethrone bar the next verdict is judged at, and a
+live feed of revealed on-chain submissions straight from the chain's revealed
+commitments; in watch mode a commit that lands while you watch is flagged
+``● new`` — the confirmation a miner looks for right after ``cascade deploy``.
 
 Everything on-chain-exact here is in *blocks*; the wall-clock countdown is an
-estimate derived from the configured cadence (``round_hours`` over
-``epoch_blocks``, ~12s/block on Bittensor). In watch mode the display ticks
+estimate at Bittensor's fixed 12 s/block (never ``round_hours`` over
+``epoch_blocks`` — the grid length changes at the rollover, the clock does not). In watch mode the display ticks
 every second by interpolating between chain polls, re-syncs to the real block
 height every ``refresh`` seconds, and re-polls commitments + the receipt index
 on a slower cadence.
@@ -33,15 +30,9 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from ..shared.chain_status import STAGE_OVERHEAD_SECONDS, stage_windows
-from ..shared.config import RoundConfig, ScoringConfig, effective_epoch_blocks
+from ..shared.config import BLOCK_SECONDS, ChainConfig, RoundConfig, effective_epoch_blocks
 
-DEFAULT_SECONDS_PER_BLOCK = 12.0
 BAR_WIDTH = 28
-
-# Per-stage overhead of the timing estimate — shared with the web dashboard's
-# status feed so both estimate off the same numbers (see shared.chain_status).
-PHASE_OVERHEAD_SECONDS = STAGE_OVERHEAD_SECONDS
 
 # Max submission rows rendered before collapsing to a "… N more" line.
 SUBMISSIONS_SHOWN = 8
@@ -52,13 +43,14 @@ SUBMISSIONS_SHOWN = 8
 FEED_REFRESH_FLOOR_SECONDS = 60.0
 
 
-def seconds_per_block(round_cfg: RoundConfig) -> float:
-    """The configured wall-clock cadence: ``round_hours`` spread over
-    ``epoch_blocks``. Falls back to Bittensor's ~12s when the config carries a
-    placeholder (non-positive) value."""
-    if round_cfg.round_hours > 0 and round_cfg.epoch_blocks > 0:
-        return round_cfg.round_hours * 3600.0 / round_cfg.epoch_blocks
-    return DEFAULT_SECONDS_PER_BLOCK
+def seconds_per_block(round_cfg: RoundConfig | None = None) -> float:
+    """Bittensor's fixed 12 s block time (:data:`~cascade.shared.config.
+    BLOCK_SECONDS`). NOT ``round_hours / epoch_blocks``: the DEC-CA-0045
+    rollover shrinks ``epoch_blocks`` 3600 -> 900 while the chain clock stays
+    12 s, so that ratio would read 48 s/block and quadruple every ETA.
+    ``round_cfg`` is accepted (and ignored) for call-site compatibility."""
+    del round_cfg
+    return BLOCK_SECONDS
 
 
 @dataclass(frozen=True)
@@ -131,104 +123,6 @@ def _bar(progress: float, width: int = BAR_WIDTH) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
-# ── round stage (heat ▸ duel ▸ validation ▸ settled) ─────────────────────────
-
-PHASE_ORDER = ("heat", "duel", "validation", "settled")
-
-
-@dataclass(frozen=True)
-class PhaseEstimate:
-    """Where the current round roughly is. ``estimated`` is False only when the
-    stage is confirmed by public evidence (the round's receipt in the index)."""
-
-    key: str        # one of PHASE_ORDER
-    detail: str     # one-line human explanation shown under the strip
-    estimated: bool
-
-
-@dataclass(frozen=True)
-class RoundTimeline:
-    """Rough wall-clock stage windows for one round, derived from config.
-
-    The trainer's internal progress is not publicly readable, so the pre-settle
-    stages are estimated off the same budgets the trainer enforces: the heat's
-    wall-clock cap (``[round] heat_*``) and the final duel's per-size
-    ``max_train_seconds`` (summed — sizes train sequentially), each padded with
-    :data:`PHASE_OVERHEAD_SECONDS` for fetch/boot/upload. Anything past
-    ``heat + duel`` is presumed to be duel validation until the receipt lands.
-    """
-
-    heat_seconds: float
-    duel_seconds: float
-
-    @classmethod
-    def from_chain_config(cls, cfg: object) -> RoundTimeline:
-        heat_s, duel_s = stage_windows(cfg)
-        return cls(heat_seconds=heat_s, duel_seconds=duel_s)
-
-
-def phase_from_live(
-    doc: object,
-    st: RoundStatus,
-    *,
-    now_s: float | None = None,
-) -> PhaseEstimate | None:
-    """The trainer-reported stage (``status/round.json``), when trustworthy.
-
-    Returns a confirmed :class:`PhaseEstimate` when the doc is fresh and
-    matches the current epoch (see ``live_round_stage``), else None — the
-    caller falls back to the wall-clock estimate. Preferred over the estimate
-    because the estimate models the heat as ONE competitor's budget and calls
-    "duel" hours early on a large field.
-    """
-    from ..shared.chain_status import live_round_stage
-
-    live = live_round_stage(doc, epoch_start_block=st.epoch_start,
-                            now_s=time.time() if now_s is None else now_s)
-    if live is None:
-        return None
-    stage = str(live["stage"])
-    if stage == "heat":
-        done, total = live.get("heat_done"), live.get("heat_total")
-        progress = (f" — screening {int(done)}/{int(total)} challengers"
-                    if done is not None and total is not None else "")
-        what = f"trainer screening the field at the heat budget{progress}"
-    elif stage == "duel":
-        n = live.get("finalists")
-        who = f"{int(n)} finalist(s)" if n is not None else "finalists"
-        what = f"king vs {who} training at the full budget"
-    else:
-        what = "manifest published; validators scoring (receipt pending)"
-    return PhaseEstimate(stage, f"{what} (trainer-reported)", estimated=False)
-
-
-def phase_for(
-    st: RoundStatus,
-    timeline: RoundTimeline,
-    *,
-    drift_seconds: float = 0.0,
-    settled_outcome: str | None = None,
-) -> PhaseEstimate:
-    """The round's current stage: confirmed ``settled`` when an outcome line is
-    supplied (the round's receipt is public), else estimated from elapsed
-    wall-clock against the configured stage windows."""
-    if settled_outcome is not None:
-        return PhaseEstimate("settled", settled_outcome, estimated=False)
-    elapsed = st.blocks_elapsed * st.spb + max(0.0, drift_seconds)
-    if elapsed < timeline.heat_seconds:
-        key, what = "heat", "trainer screening challengers at the heat budget"
-    elif elapsed < timeline.heat_seconds + timeline.duel_seconds:
-        key, what = "duel", "king vs finalists training at the full budget"
-    else:
-        key, what = "validation", "validators scoring the duel (receipt pending)"
-    detail = f"{what} — {format_duration(elapsed)} into the round (est.)"
-    return PhaseEstimate(key, detail, estimated=True)
-
-
-def _phase_strip(current: str) -> str:
-    return " ▸ ".join(f"[{k.upper()}]" if k == current else k for k in PHASE_ORDER)
-
-
 # ── public receipt index (settled-round evidence; no credentials needed) ─────
 
 
@@ -249,7 +143,7 @@ def fetch_public_json(storage: object, key: str, *, timeout: float = 10.0) -> di
         return None
     url = f"{endpoint}/{bucket}/{key}"
     try:
-        req = urllib.request.Request(url, headers={"Accept": "application/json"})  # noqa: S310
+        req = urllib.request.Request(url, headers={"Accept": "application/json", "Cache-Control": "no-cache"})  # noqa: S310
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
             doc = json.loads(resp.read().decode("utf-8"))
     except Exception:  # noqa: BLE001 — every public doc is a best-effort enhancement
@@ -260,56 +154,10 @@ def fetch_public_json(storage: object, key: str, *, timeout: float = 10.0) -> di
 def fetch_public_receipt_index(storage: object, *, timeout: float = 10.0) -> dict | None:
     """Anonymously GET the dashboard-facing ``receipts/index.json``. None on any
     failure (the dashboard then simply shows estimates)."""
-    from ..shared.hippius import RECEIPT_INDEX_KEY, receipt_index_window
+    from ..shared.hippius import RECEIPT_INDEX_KEY
 
     doc = fetch_public_json(storage, RECEIPT_INDEX_KEY, timeout=timeout)
-    if doc is None or not isinstance(doc.get("rounds"), list):
-        return None
-    # the rolling window only — a pinned best-bench row is not a recent round
-    return {**doc, "rounds": receipt_index_window(doc["rounds"])}
-
-
-def fetch_public_round_status(storage: object, *, timeout: float = 10.0) -> dict | None:
-    """Anonymously GET the trainer-reported ``status/round.json``.
-
-    Best-effort: any failure returns None and the dashboard falls back to the
-    wall-clock stage estimate. Freshness/round-matching is the CONSUMER's job
-    (``phase_from_live``), so a stale doc here is returned as-is.
-    """
-    from ..shared.chain_status import ROUND_STATUS_KEY
-
-    return fetch_public_json(storage, ROUND_STATUS_KEY, timeout=timeout)
-
-
-def fetch_public_heat(storage: object, *, timeout: float = 10.0) -> dict | None:
-    """Anonymously GET the latest published heat standings (``status/heat.json``).
-
-    Written by the trainer the moment the heat settles — hours before the round's
-    receipt — so this is a miner's first read on where its submission placed.
-    Round-matching is the consumer's job (``cascade.shared.heat_status.
-    live_heat``), so another round's standings are returned as-is.
-    """
-    from ..shared.heat_status import HEAT_STATUS_KEY
-
-    return fetch_public_json(storage, HEAT_STATUS_KEY, timeout=timeout)
-
-
-def fetch_public_heat_round(
-    storage: object, round_id: str, *, timeout: float = 10.0
-) -> dict | None:
-    """Anonymously GET one round's archived heat standings."""
-    from ..shared.heat_status import heat_round_key
-
-    return fetch_public_json(storage, heat_round_key(str(round_id)), timeout=timeout)
-
-
-def fetch_public_heat_index(storage: object, *, timeout: float = 10.0) -> dict | None:
-    """Anonymously GET ``heats/index.json`` — the discoverable list of published
-    heats (a static reader cannot list the bucket)."""
-    from ..shared.heat_status import HEAT_INDEX_KEY
-
-    doc = fetch_public_json(storage, HEAT_INDEX_KEY, timeout=timeout)
-    return doc if doc is not None and isinstance(doc.get("heats"), list) else None
+    return doc if doc is not None and isinstance(doc.get("rounds"), list) else None
 
 
 def _as_int(value: object) -> int | None:
@@ -365,6 +213,109 @@ def outcome_line(entry: dict) -> str:
     return f"round settled — {held}"
 
 
+# ── lanes A / B / C (DEC-CA-0050 / 0055 / 0056) from the receipt index ──────
+
+
+def _pct(x: object) -> str:
+    v = _as_float(x)
+    return "--" if v is None else f"{v * 100:.0f}%"
+
+
+def _full_pay(w: dict) -> str:
+    """A paid win's gain-tiered full-pay period (owner 2026-10-20): ``, full
+    10 eras (tier 0.05)`` — empty when the record carries none."""
+    n = w.get("full_eras")
+    if n is None:
+        return ""
+    tier = _as_float(w.get("tier"))
+    return (f", full {n} eras" + (f" (tier {tier:g})" if tier is not None else "")
+            + (" BELOW the lowest tier" if w.get("below_floor") else ""))
+
+
+def _paid(wins: object, key: str) -> str:
+    rows = [w for w in (wins or []) if isinstance(w, dict)]
+    return ", ".join(f"{w.get(key)}→uid {w.get('uid')} ({_pct(w.get('multiplier'))}"
+                     f"{_full_pay(w)})" for w in rows) or "none (slots burn)"
+
+
+def _competition(c: dict) -> str:
+    """``mkt: 100% active (from block 7200, no end)`` — one lane-C competition
+    of a ``lane_c_pay`` record."""
+    fb, ub = _as_int(c.get("from_block")) or 0, _as_int(c.get("until_block")) or 0
+    when = (f"from block {fb:,}" if fb else "not started") + (
+        f", until block {ub:,}" if ub else ", no end")
+    return (f"{c.get('kind')}: {_pct(c.get('frac'))} {str(c.get('state') or '--')}"
+            f" ({when})")
+
+
+def lane_lines(entry: dict | None) -> list[str]:
+    """The lane rows of one settled index entry: the lane-A king ladder share
+    (DEC-CA-0055 ``ladder``: share, last step, former-king court, key slash)
+    and last king check, the lane-B and lane-C verdict counts and paid slots,
+    and the emission split. Rows without data are omitted, so a pre-v2 entry
+    renders nothing."""
+    if not isinstance(entry, dict):
+        return []
+    out: list[str] = []
+    lad = entry.get("ladder") if isinstance(entry.get("ladder"), dict) else None
+    kc = entry.get("king_check") if isinstance(entry.get("king_check"), dict) else None
+    if lad or kc:
+        parts = []
+        if lad:
+            parts.append(f"king ladder share {_pct(lad.get('king_share'))}"
+                         f" ({lad.get('event') or 'none'})")
+            if lad.get("crown_units"):
+                # DEC-CA-0055 margin-tiered start (owner 2026-10-20)
+                lcb, tier = _as_float(lad.get("crown_lcb")), _as_float(lad.get("crown_tier"))
+                parts.append("crowned "
+                             + (f"at LCB {lcb:.4f}" if lcb is not None else "with no LCB")
+                             + (f", tier >= {tier:g}" if tier is not None
+                                else f" ({lad['crown_units']} units, fixed start)")
+                             + f" -> starts at {_pct(lad.get('king_share'))}")
+            if lad.get("court_hotkey"):
+                parts.append(f"court {_short_hotkey(str(lad['court_hotkey']))}"
+                             f" until block {_as_int(lad.get('court_until_block')) or 0:,}")
+            if lad.get("slashed"):
+                # DEC-CA-0055 escalating slash: why, and the earliest lift
+                until = _as_int(lad.get("slash_until"))
+                parts.append(f"key slashed ({lad.get('slash_reason') or 'operator_paid'}"
+                             + (f" until block {until:,}" if until
+                                else ", rest of reign" if lad.get("slash_reason")
+                                == "repeat_lapse" else ", until the key is fixed") + ")")
+            else:
+                parts.append("no key slash")
+        if kc:
+            lcb, margin = _as_float(kc.get("lcb")), _as_float(kc.get("margin"))
+            nums = (f" (LCB {lcb:.4f} vs margin {margin:.4f})"
+                    if lcb is not None and margin is not None else "")
+            parts.append(f"king check {kc.get('result') or '--'}{nums}")
+        out.append("  lane A          " + " · ".join(parts))
+    for lane, rows_key, pay_key, target_key in (("B", "lane_b_verdicts", "lane_b_pay", "domain"),
+                                                ("C", "lane_c_verdicts", "lane_c_pay", "target")):
+        rows = entry.get(rows_key)
+        pay = entry.get(pay_key)
+        if rows is None and pay is None:
+            continue
+        rows = [r for r in (rows or []) if isinstance(r, dict)]
+        passed = sum(1 for r in rows if r.get("passed"))
+        wins = (pay or {}).get("wins") if isinstance(pay, dict) else None
+        out.append(f"  lane {lane}          {len(rows)} judged · {passed} passed · "
+                   f"paid: {_paid(wins, target_key)}")
+        comps = (pay or {}).get("competitions") if lane == "C" and isinstance(pay, dict) else None
+        if comps:
+            # concurrent competitions (owner 2026-10-20): weight share + state + dates
+            out.append("  lane C comps    " + " · ".join(_competition(c) for c in comps
+                                                        if isinstance(c, dict)))
+    split = entry.get("emission_split")
+    if isinstance(split, dict) and split:
+        parts = [f"lane A {_pct(split.get('lane_a'))}", f"lane B {_pct(split.get('lane_b'))}"]
+        if "lane_c" in split:
+            parts.append(f"lane C {_pct(split.get('lane_c'))}")
+        parts.append(f"burn {_pct(split.get('burn'))}")
+        out.append("  emission        " + " · ".join(parts))
+    return out
+
+
 # ── current dethrone bar (the tenure-decayed margin, DEC-CA-0016) ────────────
 #
 # The margin a challenger must clear DECAYS with the king's tenure, so the
@@ -377,10 +328,11 @@ def outcome_line(entry: dict) -> str:
 # replicated here so the dashboard stays free of the eval package).
 
 
-def current_king_tenure(index_doc: dict | None) -> int | None:
-    """The king's tenure ENTERING the round in flight, derived from the public
-    receipt index — the tenure the next verdict will be judged at. None when
-    no settled round is available."""
+def current_king_holds(index_doc: dict | None) -> tuple[int, ...] | None:
+    """The ``epoch_start_block`` of every settlement the reigning king has
+    HELD through (oldest first; the crowning settlement itself excluded), from
+    the public receipt index — ``len()`` is the validator's ``tenure_rounds``
+    counter. None when no settled round is available."""
     per_round: dict[int, dict] = {}
     for r in _index_rounds(index_doc):
         if str(r.get("status")) != "scored":
@@ -390,129 +342,82 @@ def current_king_tenure(index_doc: dict | None) -> int | None:
             per_round[esb] = r
     if not per_round:
         return None
-    ordered = [per_round[esb] for esb in sorted(per_round)]
-    king = ordered[-1].get("post_round_king_hotkey")
+    ordered = sorted(per_round)
+    king = per_round[ordered[-1]].get("post_round_king_hotkey")
     if not king:
         return None
-    tenure = 0
-    for row in reversed(ordered):
+    holds: list[int] = []
+    for esb in reversed(ordered):
+        row = per_round[esb]
         if row.get("post_round_king_hotkey") != king or row.get("dethroned"):
             break
-        tenure += 1
-    return tenure
+        holds.append(esb)
+    return tuple(reversed(holds))
 
 
-def margin_for_tenure_cfg(scoring: ScoringConfig, tenure: int,
-                          block: int | None = None) -> float:
-    """The validator's affine margin schedule (``eval.koth.margin_for_tenure``)
-    computed from ``[scoring]`` directly, for the round at epoch boundary
-    ``block`` (``None`` = the steady-state fresh-king margin)."""
-    from ..shared.config import effective_win_margin_start
+def tenure_at_block(cfg: ChainConfig, holds: tuple[int, ...], block: int | None) -> int:
+    """The tenure a validator judges at the settlement at ``block``, replayed
+    from the public hold history with the validator's own functions: before
+    ``tenure_blocks_from_block`` the hold counter; after it, blocks reigned ÷
+    the grid in force, counted from the anchor ``_anchor_legacy_king`` sets at
+    the king's first settlement past the gate (``legacy_king_anchor`` of the
+    counter at that settlement — a dethrone clears the anchor, so every king is
+    anchored this way)."""
+    from ..shared.era import legacy_king_anchor, tenure_blocks_active, tenure_rounds_at
 
-    start = effective_win_margin_start(scoring, block)
-    if scoring.margin_warmup_rounds <= 0:
-        return scoring.win_margin_end
-    frac = min(max(tenure, 0) / scoring.margin_warmup_rounds, 1.0)
-    return start + frac * (scoring.win_margin_end - start)
+    since: int | None = None
+    if block is not None and tenure_blocks_active(cfg.scoring, block):
+        gate = int(cfg.scoring.tenure_blocks_from_block)
+        post_gate = [b for b in holds if b >= gate]
+        first = post_gate[0] if post_gate else int(block)
+        pre = sum(1 for b in holds if b < first)
+        since = legacy_king_anchor(cfg.round, cfg.scoring, block=first, tenure_rounds=pre)
+    return tenure_rounds_at(cfg.round, cfg.scoring, block=block,
+                            tenure_rounds=len(holds), king_since_block=since)
 
 
-def dethrone_bar_line(index_doc: dict | None, scoring: ScoringConfig | None) -> str | None:
-    """The forward-looking margin line for the round in flight, or None when
-    the schedule is flat (no decay configured) or the index gives no tenure."""
-    if scoring is None or scoring.win_margin_start == scoring.win_margin_end:
+def _judged_params(cfg: ChainConfig, block: int | None):
+    """The validator's own resolution of the dethrone rule for the settlement
+    at epoch boundary ``block``: :meth:`ChainConfig.koth_params` (scheduled
+    fresh-king margin, DEC-CA-0045 blocks-denominated warm-up, DEC-CA-0039
+    margin mode, DEC-CA-0049 v2 bar)."""
+    return cfg.koth_params(block=block)
+
+
+def dethrone_bar_line(index_doc: dict | None, cfg: ChainConfig | None,
+                      block: int | None = None) -> str | None:
+    """The forward-looking margin line for the settlement at epoch boundary
+    ``block`` (the round in flight), or None when the schedule is flat (no
+    decay configured) or the index gives no tenure.
+
+    Tenure is counted the way the validator counts it at ``block``
+    (:func:`tenure_at_block`).
+    The bar is labelled in its units: under the increment margin (DEC-CA-0039,
+    and DEC-CA-0049's v2 bar) it is a share of the per-round increment over the
+    shared init, not of the king's absolute score. A round the validator has
+    to fall back to level units (no init baseline) is judged at the level bar
+    instead — that is decided in-round and cannot be forecast here."""
+    if cfg is None:
         return None
-    tenure = current_king_tenure(index_doc)
-    if tenure is None:
+    from ..eval.koth import margin_for_tenure
+
+    params = _judged_params(cfg, block)
+    if params.win_margin_start == params.win_margin_end:
         return None
-    margin = margin_for_tenure_cfg(scoring, tenure)
-    floor_at = scoring.margin_warmup_rounds
+    holds = current_king_holds(index_doc)
+    if holds is None:
+        return None
+    tenure = tenure_at_block(cfg, holds, block)
+    margin = margin_for_tenure(params, tenure)
+    floor_at = params.margin_warmup_rounds
+    end = params.win_margin_end
+    unit = " of the increment" if params.margin_mode == "increment" else ""
     if tenure >= floor_at:
-        tail = f"at the {scoring.win_margin_end * 100:.2f}% floor"
+        tail = f"at the {end * 100:.2f}% floor"
     else:
-        tail = f"floor {scoring.win_margin_end * 100:.2f}% at tenure {floor_at}"
-    return (f"  dethrone bar    LCB > {margin * 100:.3f}% this round"
+        tail = f"floor {end * 100:.2f}% at tenure {floor_at}"
+    return (f"  dethrone bar    LCB > {margin * 100:.3f}%{unit} this round"
             f"  (king tenure {tenure}; {tail})")
-
-
-# ── heat standings (public heat mirror; no credentials needed) ───────────────
-#
-# The heat is the cheap screen that ranks every eligible challenger and advances
-# the top `finalists`; the losing checkpoints are thrown away. The trainer
-# publishes the standings the moment the heat settles (status/heat.json +
-# heats/round-<id>.json — see cascade.shared.heat_status), which is hours before
-# the round's receipt and, for a round later rejected at a gate, the only place
-# they ever appear. This section renders them for the terminal.
-
-# Rows shown in the round dashboard's inline heat block before collapsing (the
-# miner's own row is always shown, however far down it placed).
-HEAT_ROWS_SHOWN = 6
-
-_HEAT_LABELS = {
-    "advanced": "▲ advanced",
-    "screened": "screened",
-    "failed_train": "did not train",
-    "failed_screen": "screen error",
-    "duplicate": "duplicate",
-    # duel-only rounds (no screen): seated entrants duel the king directly,
-    # waiting ones carry to a later round with their submission intact
-    "seated": "● seated — duels the king",
-    "waiting": "waiting — next round",
-}
-
-
-@dataclass(frozen=True)
-class HeatRow:
-    """One entrant's heat standing, dashboard-shaped."""
-
-    rank: int | None        # 1-based placement among scored entrants; None if unscored
-    uid: int
-    hotkey: str
-    ref: str
-    status: str             # one of manifest.HEAT_STATUSES
-    rel_score: float | None  # heat_score / best (1.0 = best); None if unscored
-    crps: float | None      # raw CRPS-family error on the round's eval-pool slice
-    mase: float | None      # raw geometric-mean MASE on that slice
-    mine: bool = False      # this is the hotkey/uid the caller asked about
-
-
-def _matches_me(uid: int, hotkey: str, me: str | None) -> bool:
-    if not me:
-        return False
-    me = me.strip()
-    return me == hotkey or (me.isdigit() and int(me) == uid)
-
-
-def heat_rows(doc: dict | None, *, me: str | None = None) -> list[HeatRow]:
-    """Shape a published heat document into rows, best rank first.
-
-    Unscored entrants (``failed_train`` / ``failed_screen`` / ``duplicate``)
-    carry no rank and sort last, by UID. ``me`` is a hotkey (ss58) or UID whose
-    row is flagged ``mine``.
-    """
-    if not isinstance(doc, dict):
-        return []
-    rows: list[HeatRow] = []
-    for e in doc.get("entrants", ()):
-        if not isinstance(e, dict):
-            continue
-        try:
-            uid, hotkey = int(e.get("uid", -1)), str(e.get("hotkey", ""))
-        except (TypeError, ValueError):
-            continue
-        rank = e.get("rank")
-        rows.append(HeatRow(
-            rank=None if rank is None else int(rank),
-            uid=uid,
-            hotkey=hotkey,
-            ref=str(e.get("gen_ref", "")),
-            status=str(e.get("status", "")),
-            rel_score=_as_float(e.get("rel_score")),
-            crps=_as_float(e.get("crps")),
-            mase=_as_float(e.get("mase")),
-            mine=_matches_me(uid, hotkey, me),
-        ))
-    rows.sort(key=lambda r: (r.rank is None, r.rank if r.rank is not None else 0, r.uid))
-    return rows
 
 
 def _as_float(value: object) -> float | None:
@@ -520,166 +425,6 @@ def _as_float(value: object) -> float | None:
         return None if value is None else float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
-
-
-def heat_headline(doc: dict | None) -> str:
-    """One line summarising a published heat: field size, how many advanced, the
-    size it screened at — or why no screen ran."""
-    if not isinstance(doc, dict):
-        return "no heat standings published"
-    rows = heat_rows(doc)
-    if doc.get("duel_only"):
-        seated = sum(1 for r in rows if r.status == "seated")
-        waiting = sum(1 for r in rows if r.status == "waiting")
-        return (f"duel-only round — {seated} seated (full 3h duel vs the king)"
-                + (f" · {waiting} waiting for a later round" if waiting else "")
-                + " · no screen")
-    if doc.get("no_screen") or not rows:
-        why = str(doc.get("no_screen_reason") or "no screen ran this round")
-        return f"no screen — {why}"
-    adv = sum(1 for r in rows if r.status == "advanced")
-    size = str(doc.get("screen_size") or "")
-    parts = [f"{len(rows)} entrants", f"{adv} advanced"]
-    if size:
-        parts.append(f"screened at {size}")
-    return " · ".join(parts)
-
-
-def _heat_row_line(r: HeatRow, *, show_error: bool = True) -> str:
-    """One standings row. ``show_error`` carries the raw CRPS/MASE columns —
-    decided per document (a scalar-only screener publishes neither, and empty
-    columns on every row would be noise) so the status column stays aligned
-    across rows where only SOME entrants were scored."""
-    if r.rel_score is not None and r.rel_score > 0:
-        gap = "best" if r.rank == 1 else f"+{(r.rel_score - 1.0) * 100:.1f}%"
-    else:
-        gap = "—"
-    err = ""
-    if show_error:
-        crps = "—" if r.crps is None else f"{r.crps:.4f}"
-        mase = "—" if r.mase is None else f"{r.mase:.3f}"
-        err = f"  crps {crps:>8}  mase {mase:>7}"
-    rank = f"#{r.rank}" if r.rank is not None else "—"
-    label = _HEAT_LABELS.get(r.status, r.status or "--")
-    return (f"    {rank:>4}  uid {r.uid:>4}  {_short_hotkey(r.hotkey):<11}  "
-            f"{_short_ref(r.ref):<32}  {gap:>7}{err}  {label}"
-            + ("   ← you" if r.mine else ""))
-
-
-def heat_block(
-    doc: dict | None,
-    *,
-    me: str | None = None,
-    limit: int | None = HEAT_ROWS_SHOWN,
-) -> list[str]:
-    """The heat section's lines: a headline plus one line per entrant.
-
-    ``limit`` caps the rows rendered (None = all); the caller's own row is
-    always included, however far down it placed, and the collapsed remainder is
-    reported. Empty list when nothing is published.
-    """
-    if not isinstance(doc, dict):
-        return []
-    rows = heat_rows(doc, me=me)
-    lines = [f"  heat            {heat_headline(doc)}"]
-    if not rows:
-        return lines
-    shown = rows if limit is None else rows[:limit]
-    hidden = rows[len(shown):]
-    mine_hidden = [r for r in hidden if r.mine]
-    show_error = any(r.crps is not None or r.mase is not None for r in rows)
-    lines += [_heat_row_line(r, show_error=show_error) for r in shown]
-    lines += [_heat_row_line(r, show_error=show_error) for r in mine_hidden]
-    rest = len(hidden) - len(mine_hidden)
-    if rest > 0:
-        lines.append(f"    … {rest} more (lower placings not shown)")
-    return lines
-
-
-def _short_pointer(pointer: str) -> str:
-    """A trained-checkpoint pointer, shortened for terminal display: drop the
-    scheme prefix and truncate the digest — ``cascade/ckpt-r…-king-toto2-4m
-    @sha256:ab12cdef…``. Unrecognized shapes pass through untouched."""
-    p = str(pointer)
-    tail = p.rsplit(":hippius:", 1)[-1]
-    if "@sha256:" in tail:
-        repo, digest = tail.rsplit("@sha256:", 1)
-        return f"{repo}@sha256:{digest[:12]}…" if len(digest) > 12 else tail
-    return tail
-
-
-def warm_start_line(ws: object) -> str | None:
-    """One ``warm start`` dashboard line from a round/heat doc's ``warm_start``
-    block (``cascade round``'s compact form of :func:`render_heat`'s pair of
-    lines), or None — a random-init round or an absent block shows nothing."""
-    if not isinstance(ws, dict) or not ws.get("init_checkpoint"):
-        return None
-    gen = ws.get("generation")
-    return (f"  warm start      this round trains from "
-            f"{_short_pointer(str(ws['init_checkpoint']))}"
-            + (f"  (generation {gen})" if gen else ""))
-
-
-def render_heat(doc: dict | None, *, me: str | None = None) -> str:
-    """The standalone ``cascade heat`` view of one published heat document."""
-    if not isinstance(doc, dict):
-        return ("no heat standings published yet — the trainer writes them when a "
-                "round's heat settles (status/heat.json)")
-    head = [
-        f"cascade heat — round {doc.get('round_id', '--')}"
-        f"  ·  epoch start block {doc.get('epoch_start_block', '--')}",
-        f"  published       {doc.get('as_of', '--')}",
-        f"  field           {heat_headline(doc)}",
-    ]
-    finalists = doc.get("finalists")
-    if doc.get("duel_only"):
-        head.append("  duel-only       every seated entrant trains the full budget and is "
-                    "judged against the king (α/k over the seated cohort); "
-                    "waiting entrants seat next round in reveal order")
-    elif finalists is not None:
-        head.append(f"  advancing       top {finalists} to the duel against the king")
-    lcb, nw, nc = doc.get("leader_lcb"), doc.get("n_windows"), doc.get("n_clusters")
-    if lcb is not None:
-        decisive = "separated 1st from 2nd" if float(lcb) > 0 else "did NOT separate 1st from 2nd"
-        head.append(f"  decisiveness    leader LCB {float(lcb):+.4f} — the screen {decisive}"
-                    + (f" (n_windows={nw}, feeds={nc})" if nw is not None else ""))
-    # Cascade warm-start: which promoted init THIS round's runs trained from,
-    # and the rotation's pick for the NEXT round — a schedule, not a promise
-    # (a promotion firing at the boundary replaces the member set; the round's
-    # signed manifest is always the ground truth for what actually trained).
-    ws = doc.get("warm_start")
-    if isinstance(ws, dict) and ws.get("init_checkpoint"):
-        gen = ws.get("generation")
-        head.append(f"  warm start      this round trained from "
-                    f"{_short_pointer(ws['init_checkpoint'])}"
-                    + (f"  (generation {gen})" if gen else ""))
-        nxt = ws.get("next_scheduled_init")
-        if nxt:
-            head.append(f"  next round      scheduled init {_short_pointer(nxt)} — "
-                        "a schedule, not a promise (a boundary promotion "
-                        "replaces the set; the manifest is ground truth)")
-    body = heat_block(doc, me=me, limit=None)
-    return "\n".join(head + ([""] + body[1:] if len(body) > 1 else []))
-
-
-def render_heat_index(doc: dict | None, *, limit: int = 20) -> str:
-    """The ``cascade heat --history`` view of ``heats/index.json``."""
-    heats = [h for h in (doc or {}).get("heats", []) if isinstance(h, dict)]
-    if not heats:
-        return "no published heats found (heats/index.json is absent or empty)"
-    lines = [f"cascade heat — {len(heats)} published heat(s), newest last"]
-    for h in heats[-limit:]:
-        lcb = h.get("leader_lcb")
-        lines.append(
-            f"  round {str(h.get('round_id', '--')):<14} block {h.get('epoch_start_block', '--'):>11}  "
-            f"{h.get('n_entrants', 0):>3} entrants  {h.get('n_advanced', 0):>2} advanced  "
-            f"leader uid {str(h.get('leader_uid', '--')):>4}"
-            + (f"  lcb {float(lcb):+.4f}" if lcb is not None else "")
-            + ("  (no screen)" if h.get("no_screen") else "")
-        )
-    if len(heats) > limit:
-        lines.append(f"  … {len(heats) - limit} older not shown (--limit to widen)")
-    return "\n".join(lines)
 
 
 # ── duel breakdown (`cascade duel` — the verdict behind DETHRONED/held) ──────
@@ -809,6 +554,7 @@ def render_duel(rows: list[dict], *, me: str | None = None) -> str:
     gift = row.get("gift_gate_passed")
     if gift is not None:
         lines.append("  gift gate      " + ("passed" if gift else "BLOCKED the dethrone"))
+    # Archived boundary-round receipts carry a heat summary; rolling ones don't.
     heat = row.get("heat")
     if isinstance(heat, dict) and heat.get("n_entrants") is not None:
         lines.append(f"  heat           {heat.get('n_entrants')} entrants · "
@@ -1190,12 +936,8 @@ class LiveFeed:
 
     client: object
     index_fetch: Callable[[], dict | None] | None = None
-    status_fetch: Callable[[], dict | None] | None = None
-    heat_fetch: Callable[[], dict | None] | None = None
     commitments: list | None = None
     index_doc: dict | None = None
-    round_status_doc: dict | None = None
-    heat_doc: dict | None = None
     _baseline: set[tuple[str, int]] | None = field(default=None, repr=False)
 
     def poll(self) -> None:
@@ -1209,17 +951,13 @@ class LiveFeed:
                 if self._baseline is None:
                     self._baseline = {(str(c.hotkey), int(c.commit_block)) for c in cms}
                 self.commitments = cms
-        for fetch, attr in ((self.index_fetch, "index_doc"),
-                            (self.status_fetch, "round_status_doc"),
-                            (self.heat_fetch, "heat_doc")):
-            if fetch is None:
-                continue
+        if self.index_fetch is not None:
             try:
-                doc = fetch()
+                doc = self.index_fetch()
             except Exception:  # noqa: BLE001 — best-effort; keep the last good doc
                 doc = None
             if doc is not None:
-                setattr(self, attr, doc)
+                self.index_doc = doc
 
     def rows(self, epoch_start: int, *, floor_block: int = 0) -> list[SubmissionRow] | None:
         """Current submission rows, or None when the chain feed is unavailable
@@ -1238,17 +976,16 @@ def render(
     network: str,
     *,
     drift_seconds: float = 0.0,
-    phase: PhaseEstimate | None = None,
+    settled: str | None = None,
     submissions: list[SubmissionRow] | None = None,
     last_outcome: str | None = None,
-    heat_lines: list[str] | None = None,
     bar_line: str | None = None,
-    warm_line: str | None = None,
+    lanes: list[str] | None = None,
 ) -> str:
     """The dashboard frame. ``drift_seconds`` is the wall-clock time elapsed
     since ``st.block`` was fetched, so watch mode can tick the countdown every
-    second between chain polls. ``phase`` / ``submissions`` / ``last_outcome`` /
-    ``heat_lines`` / ``warm_line`` are optional sections (None omits each), so
+    second between chain polls. ``settled`` / ``submissions`` / ``last_outcome`` /
+    ``bar_line`` are optional sections (None omits each), so
     the countdown-only frame is unchanged for callers without the live feed."""
     remaining = max(0.0, st.seconds_remaining - drift_seconds)
     eta = time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(time.time() + remaining))
@@ -1260,23 +997,20 @@ def render(
         f"  next round      epoch {st.epoch + 1:,} at block {st.next_epoch_start:,}",
         f"  progress        [{_bar(st.progress)}]  {pct:.1f}%"
         f"  ({st.blocks_elapsed:,} / {st.epoch_blocks:,} blocks)",
-        f"  countdown       {format_duration(remaining)} until next round"
+        f"  countdown       {format_duration(remaining)} until next settlement"
         f"  (~{st.spb:.1f}s/block)",
-        f"  deadline        commit strictly before block {st.next_epoch_start:,}"
-        f" to enter epoch {st.epoch + 1:,}",
+        f"  intake          next settlement at block {st.next_epoch_start:,};"
+        " funded/revealed entries queue for admission and GPU capacity; a particular settlement is not guaranteed",
         f"  eta             {eta} (estimated)",
     ]
-    if phase is not None:
-        lines.append(f"  stage           {_phase_strip(phase.key)}")
-        lines.append(f"                  {phase.detail}")
+    if settled:
+        lines.append(f"  this round      {settled}")
     if last_outcome:
         lines.append(f"  last round      {last_outcome}")
     if bar_line:
         lines.append(bar_line)
-    if warm_line:
-        lines.append(warm_line)
-    if heat_lines:
-        lines += heat_lines
+    if lanes:
+        lines.extend(lanes)
     if submissions is not None:
         n_next = sum(1 for r in submissions if r.next_round)
         n_this = len(submissions) - n_next
@@ -1300,63 +1034,36 @@ def compose_frame(
     network: str,
     round_cfg: RoundConfig,
     feed: LiveFeed,
-    timeline: RoundTimeline | None,
     *,
     drift_seconds: float = 0.0,
-    me: str | None = None,
-    scoring: ScoringConfig | None = None,
+    chain_cfg: ChainConfig | None = None,
 ) -> str:
     """Assemble one full frame from the chain snapshot + the live feed.
 
-    Stage precedence: a public receipt for THIS round confirms ``settled``;
-    then the trainer-reported stage (``status/round.json``) when fresh for
-    this round; otherwise the config-timing estimate (when a timeline is
-    available). The "last round" context line is shown only while the current
-    round is still in flight (it is redundant once this round settles).
-
-    The heat block appears as soon as THIS round's heat is published — the
-    trainer writes it when the heat settles, so it lands while the duel is
-    still training rather than with the round's receipt. ``me`` (a hotkey or
-    UID) flags the caller's own row.
+    A public receipt for THIS round shows its verdict; until then the
+    previous settled round's verdict is shown as context, with the dethrone
+    bar the next verdict will be judged at.
     """
-    from ..shared.heat_status import live_heat
-
-    phase: PhaseEstimate | None = None
+    settled: str | None = None
     last_outcome: str | None = None
     entry = settled_entry_for(feed.index_doc, st.epoch_start)
+    prior = None
     if entry is not None:
-        phase = phase_for(st, timeline or RoundTimeline(0.0, 0.0),
-                          settled_outcome=outcome_line(entry))
+        settled = outcome_line(entry).removeprefix("round ")
     else:
-        phase = phase_from_live(feed.round_status_doc, st)
-        if phase is None and timeline is not None:
-            phase = phase_for(st, timeline, drift_seconds=drift_seconds)
         prior = latest_settled_before(feed.index_doc, st.epoch_start)
         if prior is not None:
             last_outcome = outcome_line(prior).removeprefix("round settled — ")
-    heat_doc = live_heat(feed.heat_doc, epoch_start_block=st.epoch_start,
-                         now_s=time.time())
-    heat_lines = heat_block(heat_doc, me=me) if heat_doc is not None else None
     submissions = feed.rows(st.epoch_start, floor_block=round_cfg.commit_floor_block)
     # Forward-looking bar only while the round is in flight — once this round
     # settles its receipt states the margin it was actually judged at.
-    bar_line = (dethrone_bar_line(feed.index_doc, scoring)
+    bar_line = (dethrone_bar_line(feed.index_doc, chain_cfg, block=st.epoch_start)
                 if entry is None else None)
-    # Cascade warm-start: which promoted init this round's runs train from.
-    # The trainer-reported stage doc carries it from the first stage publish
-    # (older trainers don't — then the heat doc supplies it once the heat
-    # settles); both are gated to THIS round, so a stale doc shows nothing.
-    from ..shared.chain_status import live_round_stage
-
-    live_doc = live_round_stage(feed.round_status_doc,
-                                epoch_start_block=st.epoch_start,
-                                now_s=time.time())
-    ws = ((live_doc.get("warm_start") if isinstance(live_doc, dict) else None)
-          or (heat_doc.get("warm_start") if isinstance(heat_doc, dict) else None))
-    return render(st, network, drift_seconds=drift_seconds, phase=phase,
+    # lanes B / C and the lane-A ladder of the settlement on show
+    lanes = lane_lines(entry if entry is not None else prior)
+    return render(st, network, drift_seconds=drift_seconds, settled=settled,
                   submissions=submissions, last_outcome=last_outcome,
-                  heat_lines=heat_lines, bar_line=bar_line,
-                  warm_line=warm_start_line(ws))
+                  bar_line=bar_line, lanes=lanes or None)
 
 
 def run_dashboard(
@@ -1367,12 +1074,8 @@ def run_dashboard(
     once: bool = False,
     refresh: float = 30.0,
     out=None,
-    timeline: RoundTimeline | None = None,
     index_fetch: Callable[[], dict | None] | None = None,
-    status_fetch: Callable[[], dict | None] | None = None,
-    heat_fetch: Callable[[], dict | None] | None = None,
-    me: str | None = None,
-    scoring: ScoringConfig | None = None,
+    chain_cfg: ChainConfig | None = None,
 ) -> int:
     """Print the round dashboard; in watch mode, keep it live until Ctrl+C.
 
@@ -1381,22 +1084,16 @@ def run_dashboard(
     re-polling the live feed (commitments + receipt index) on a slower cadence
     (at least :data:`FEED_REFRESH_FLOOR_SECONDS`). A non-TTY ``out`` degrades
     to a single snapshot so piped/scripted runs never emit escape codes.
-    ``timeline`` enables the stage estimate; ``index_fetch`` (e.g.
-    :func:`fetch_public_receipt_index` bound to the storage config) enables
-    settled-round confirmation and last-round context; ``status_fetch`` (e.g.
-    :func:`fetch_public_round_status`) enables the trainer-reported live
-    stage; ``heat_fetch`` (e.g. :func:`fetch_public_heat`) enables the heat
-    standings block once this round's heat settles, with ``me`` (hotkey or UID)
-    flagging the caller's own row. A client without ``poll_commitments`` simply
-    gets no submissions section.
+    ``index_fetch`` (e.g. :func:`fetch_public_receipt_index` bound to the
+    storage config) enables the settled verdict, last-round context and the
+    dethrone bar. A client without ``poll_commitments`` simply gets no
+    submissions section.
     """
     out = out if out is not None else sys.stdout
-    feed = LiveFeed(client, index_fetch=index_fetch, status_fetch=status_fetch,
-                    heat_fetch=heat_fetch)
+    feed = LiveFeed(client, index_fetch=index_fetch)
     st = round_status(client.current_block(), round_cfg)
     feed.poll()
-    frame = compose_frame(st, network, round_cfg, feed, timeline, me=me,
-                          scoring=scoring)
+    frame = compose_frame(st, network, round_cfg, feed, chain_cfg=chain_cfg)
     print(frame, file=out)
     if once or not getattr(out, "isatty", lambda: False)():
         return 0
@@ -1414,8 +1111,8 @@ def run_dashboard(
             if time.monotonic() - feed_at >= feed_every:
                 feed.poll()
                 feed_at = time.monotonic()
-            frame = compose_frame(st, network, round_cfg, feed, timeline,
-                                  drift_seconds=drift, me=me, scoring=scoring)
+            frame = compose_frame(st, network, round_cfg, feed,
+                                  drift_seconds=drift, chain_cfg=chain_cfg)
             # move to the top of the previous frame, clear below, redraw
             print(f"\x1b[{lines}F\x1b[J" + frame, file=out)
             lines = frame.count("\n") + 1  # the feed can grow/shrink the frame

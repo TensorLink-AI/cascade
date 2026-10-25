@@ -1,6 +1,6 @@
 """Toto2-aligned optimizer constants + warm-start LR scale (DEC-CA-0035).
 
-Measured 2026-08-27 (docs/notes/2026-08-27-toto2-alignment.md): the full
+Measured 2026-08-27 (recorded in DEC-CA-0035): the full
 Toto 2.0 constants bundle (momentum 0.96, row-EMA β₂ 0.999, clip 7.0,
 wd 2e-8, AdamW β 0.91/0.972, 54:1 matrix:AdamW split) at warm LR
 base_lr×0.125 BEAT the converged warm-start init by 0.0038 — the campaign

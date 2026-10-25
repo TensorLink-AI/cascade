@@ -2,7 +2,8 @@
 id: DEC-CA-0011
 type: decision
 title: "Heat standings publish when the heat settles, mirrored publicly per round"
-status: active
+status: superseded
+note: "Superseded by DEC-CA-0043. No heat runs under rolling intake, so no heat standings are published."
 date: 2026-07-30
 tags: [heat, dashboard, miner-feedback, storage, presentational]
 revisit_when: "the heat mirror is ever proposed as an input to anything consensus-bearing (weights, the throne, an audit gate) — it is unsigned, single-writer, best-effort and must stay a view; or heats/index.json outgrows one object (>400 rounds is the current cap, ~a year of daily rounds), at which point it needs sharding rather than a bigger window"

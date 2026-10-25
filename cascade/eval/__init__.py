@@ -19,7 +19,6 @@ from .crps import (
     mwsql_from_components,
     wql_per_window,
 )
-from .heat import HeatDiagnostics, screen_diagnostics
 from .koth import KothParams, RoundResult, evaluate_round, margin_for_tenure
 from .mase import mase
 from .scoring import (
@@ -43,8 +42,6 @@ __all__ = [
     "mwsql_from_components",
     "geomean_wql_from_components",
     "wql_per_window",
-    "HeatDiagnostics",
-    "screen_diagnostics",
     "KothParams",
     "RoundResult",
     "evaluate_round",

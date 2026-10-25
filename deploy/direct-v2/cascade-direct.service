@@ -1,0 +1,25 @@
+[Unit]
+Description=Cascade V2 direct MoE scheduler (staging)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cascade
+WorkingDirectory=/opt/cascade
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=CUBLAS_WORKSPACE_CONFIG=:4096:8
+# Hippius S3 credentials and CASCADE_VAULT_KEY_FILE (the intake's vault seal key).
+EnvironmentFile=/etc/cascade/direct.env
+ExecStart=/opt/cascade/.venv/bin/python -m cascade.direct --config /etc/cascade/direct.json --serve
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/cascade /var/log/cascade
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

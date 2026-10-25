@@ -1,0 +1,173 @@
+{
+  "as_of": "2026-10-21T09:47:39+00:00",
+  "benchmarks": {
+    "gifteval": {
+      "aggregation": "cascade_official",
+      "n_configs": 97,
+      "note": "Published leaderboard rows use Cascade aggregation; these models were not rerun by Cascade.",
+      "source": "https://huggingface.co/spaces/Salesforce/GIFT-Eval",
+      "source_revision": "23078cb5bffd44b17301b84f77732425fceb88fb"
+    }
+  },
+  "cascade_presets": {
+    "cascade-moe-28m": {
+      "active_parameters": 27951168,
+      "base_arch_digest": "767b9525666d7f49eeec24de7642c4f8fe5e007de2b14657312e6c5795d3e877",
+      "parameters": 191496256,
+      "source": "configured architecture, counted on meta device"
+    },
+    "toto2-4m": {
+      "active_parameters": 3257120,
+      "base_arch_digest": "953e40d292e037ea07ffea25ae1fdf2e8b7dc8990276c081fa67fb4371396147",
+      "parameters": 3257120,
+      "source": "configured architecture, counted on meta device"
+    }
+  },
+  "models": [
+    {
+      "basis": "published GIFT-Eval, Cascade aggregation, 97 configurations",
+      "id": "timestral-209m",
+      "label": "Timestral-209M",
+      "model_revision": "9874d252ab0aae16f7f7c999f98f98d6ad7d8365",
+      "parameters": 209312256,
+      "score_source": "https://huggingface.co/spaces/Salesforce/GIFT-Eval/tree/23078cb5bffd44b17301b84f77732425fceb88fb/results/Timestral-209M",
+      "scores": {
+        "gifteval": {
+          "crps": 0.44601133574899665,
+          "mase": 0.6575477137129934
+        }
+      },
+      "size_source": "https://huggingface.co/api/models/mistralai/Timestral-209M/revision/9874d252ab0aae16f7f7c999f98f98d6ad7d8365",
+      "url": "https://huggingface.co/mistralai/Timestral-209M"
+    },
+    {
+      "basis": "published GIFT-Eval, Cascade aggregation, 97 configurations",
+      "id": "timesfm-3",
+      "label": "TimesFM-3",
+      "model_revision": "43046b85ec22d584a13f8098c2ed39c889e129c2",
+      "parameters": 330710976,
+      "score_source": "https://huggingface.co/spaces/Salesforce/GIFT-Eval/tree/23078cb5bffd44b17301b84f77732425fceb88fb/results/TimesFM-3",
+      "scores": {
+        "gifteval": {
+          "crps": 0.4556816368975652,
+          "mase": 0.6668268299338601
+        }
+      },
+      "size_source": "https://huggingface.co/api/models/google/timesfm-3.0-pytorch/revision/43046b85ec22d584a13f8098c2ed39c889e129c2",
+      "url": "https://huggingface.co/google/timesfm-3.0-pytorch"
+    },
+    {
+      "basis": "published GIFT-Eval, Cascade aggregation, 97 configurations",
+      "id": "chronos-2",
+      "label": "Chronos-2",
+      "model_revision": "29ec3766d36d6f73f0696f85560a422f50e8498c",
+      "parameters": 119477664,
+      "score_source": "https://huggingface.co/spaces/Salesforce/GIFT-Eval/tree/23078cb5bffd44b17301b84f77732425fceb88fb/results/Chronos-2",
+      "scores": {
+        "gifteval": {
+          "crps": 0.48541704399958285,
+          "mase": 0.6977939762067968
+        }
+      },
+      "size_source": "https://huggingface.co/api/models/amazon/chronos-2/revision/29ec3766d36d6f73f0696f85560a422f50e8498c",
+      "url": "https://huggingface.co/amazon/chronos-2"
+    },
+    {
+      "basis": "published GIFT-Eval, Cascade aggregation, 97 configurations",
+      "id": "tirex",
+      "label": "TiRex",
+      "model_revision": "01b1ebc83a87e82b119f907fe7e43d015db23e9d",
+      "parameters": null,
+      "score_source": "https://huggingface.co/spaces/Salesforce/GIFT-Eval/tree/23078cb5bffd44b17301b84f77732425fceb88fb/results/TiRex",
+      "scores": {
+        "gifteval": {
+          "crps": 0.4884647610142731,
+          "mase": 0.7157586730088926
+        }
+      },
+      "size_source": "https://huggingface.co/api/models/NX-AI/TiRex-1.1-gifteval/revision/01b1ebc83a87e82b119f907fe7e43d015db23e9d",
+      "url": "https://huggingface.co/NX-AI/TiRex-1.1-gifteval"
+    },
+    {
+      "basis": "published GIFT-Eval, Cascade aggregation, 97 configurations",
+      "id": "moirai2",
+      "label": "Moirai2",
+      "model_revision": "30f43ff08c8494f4943ae1521e9d4e94a0fbb389",
+      "parameters": 11387208,
+      "score_source": "https://huggingface.co/spaces/Salesforce/GIFT-Eval/tree/23078cb5bffd44b17301b84f77732425fceb88fb/results/Moirai2",
+      "scores": {
+        "gifteval": {
+          "crps": 0.5164392934229945,
+          "mase": 0.7281302647322111
+        }
+      },
+      "size_source": "https://huggingface.co/api/models/Salesforce/moirai-2.0-R-small/revision/30f43ff08c8494f4943ae1521e9d4e94a0fbb389",
+      "url": "https://huggingface.co/Salesforce/moirai-2.0-R-small"
+    },
+    {
+      "basis": "published GIFT-Eval, Cascade aggregation, 97 configurations",
+      "id": "toto-2.0-2.5b",
+      "label": "Toto-2.0-2.5B",
+      "model_revision": "51a2812bbe449437c01b79c0e425ed578f335f5b",
+      "parameters": 2454281792,
+      "score_source": "https://huggingface.co/spaces/Salesforce/GIFT-Eval/tree/23078cb5bffd44b17301b84f77732425fceb88fb/results/Toto-2.0-2.5B",
+      "scores": {
+        "gifteval": {
+          "crps": 0.47588642943367543,
+          "mase": 0.6955950636839872
+        }
+      },
+      "size_source": "https://huggingface.co/api/models/Datadog/Toto-2.0-2.5B/revision/51a2812bbe449437c01b79c0e425ed578f335f5b",
+      "url": "https://huggingface.co/Datadog/Toto-2.0-2.5B"
+    },
+    {
+      "basis": "published GIFT-Eval, Cascade aggregation, 97 configurations",
+      "id": "timestral-5m",
+      "label": "Timestral-5M",
+      "model_revision": "bdd20cfc15a3fea0e4cb5ccef37f8d3ca7aa335f",
+      "parameters": 5208960,
+      "score_source": "https://huggingface.co/spaces/Salesforce/GIFT-Eval/tree/23078cb5bffd44b17301b84f77732425fceb88fb/results/Timestral-5M",
+      "scores": {
+        "gifteval": {
+          "crps": 0.4788651908010459,
+          "mase": 0.7049059153919661
+        }
+      },
+      "size_source": "https://huggingface.co/api/models/mistralai/Timestral-5M/revision/bdd20cfc15a3fea0e4cb5ccef37f8d3ca7aa335f",
+      "url": "https://huggingface.co/mistralai/Timestral-5M"
+    },
+    {
+      "basis": "published GIFT-Eval, Cascade aggregation, 97 configurations",
+      "id": "timestral-28m",
+      "label": "Timestral-28M",
+      "model_revision": "49b26409ac87b5935539a5d8ffe7f397b720db47",
+      "parameters": 27821184,
+      "score_source": "https://huggingface.co/spaces/Salesforce/GIFT-Eval/tree/23078cb5bffd44b17301b84f77732425fceb88fb/results/Timestral-28M",
+      "scores": {
+        "gifteval": {
+          "crps": 0.4610069151036598,
+          "mase": 0.6779570999574924
+        }
+      },
+      "size_source": "https://huggingface.co/api/models/mistralai/Timestral-28M/revision/49b26409ac87b5935539a5d8ffe7f397b720db47",
+      "url": "https://huggingface.co/mistralai/Timestral-28M"
+    },
+    {
+      "basis": "published GIFT-Eval, Cascade aggregation, 97 configurations",
+      "id": "timestral-123m",
+      "label": "Timestral-123M",
+      "model_revision": "5a147287addda85f6acd8da3fb8858fe9af7e8f7",
+      "parameters": 122606720,
+      "score_source": "https://huggingface.co/spaces/Salesforce/GIFT-Eval/tree/23078cb5bffd44b17301b84f77732425fceb88fb/results/Timestral-123M",
+      "scores": {
+        "gifteval": {
+          "crps": 0.44760051676732737,
+          "mase": 0.6589251334918746
+        }
+      },
+      "size_source": "https://huggingface.co/api/models/mistralai/Timestral-123M/revision/5a147287addda85f6acd8da3fb8858fe9af7e8f7",
+      "url": "https://huggingface.co/mistralai/Timestral-123M"
+    }
+  ],
+  "schema": 1
+}

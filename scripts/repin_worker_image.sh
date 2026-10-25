@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Re-pin [training] train_image_digest to a published worker image tag.
+# Re-pin both training contracts, funded image and source fingerprint together.
 #
 #   scripts/repin_worker_image.sh worker-v0.2.0 [chain.toml]
 #
@@ -9,26 +9,19 @@
 # restart protocol printed at the end.
 set -euo pipefail
 TAG="${1:?usage: repin_worker_image.sh <tag> [chain.toml]}"
+[[ "$TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] || { echo "invalid image tag" >&2; exit 1; }
 TOML="${2:-chain.toml}"
 REPO="tensorlink-ai/cascade-worker"
+PYTHON_BIN="${CASCADE_PYTHON:-python3}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-TOKEN=$(curl -sf "https://ghcr.io/token?scope=repository:${REPO}:pull" | python3 -c "import json,sys; print(json.load(sys.stdin)['token'])")
+TOKEN=$(curl -sf "https://ghcr.io/token?scope=repository:${REPO}:pull" | "$PYTHON_BIN" -c "import json,sys; print(json.load(sys.stdin)['token'])")
 DIGEST=$(curl -sfI -H "Authorization: Bearer $TOKEN" \
   -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json" \
   "https://ghcr.io/v2/${REPO}/manifests/${TAG}" | grep -i docker-content-digest | awk '{print $2}' | tr -d '\r')
-[[ "$DIGEST" == sha256:* ]] || { echo "could not resolve digest for tag ${TAG}" >&2; exit 1; }
+[[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "could not resolve digest for tag ${TAG}" >&2; exit 1; }
 
-python3 - "$TOML" "$DIGEST" <<'PY'
-import re, sys
-toml, digest = sys.argv[1], sys.argv[2]
-s = open(toml).read()
-s2, n = re.subn(r'train_image_digest = "sha256:[0-9a-f]{64}"',
-                f'train_image_digest = "{digest}"', s, count=1)
-if n != 1:
-    sys.exit(f"expected exactly one pinned train_image_digest in {toml}; found {n}")
-open(toml, "w").write(s2)
-print(f"pinned {digest} in {toml}")
-PY
+"$PYTHON_BIN" "$SCRIPT_DIR/repin_worker_config.py" "$TOML" "ghcr.io/${REPO}:${TAG}@${DIGEST}"
 
 DECLARED=$(grep -E '^declared_contract_from_block' "$TOML" | tr -dc '0-9')
 

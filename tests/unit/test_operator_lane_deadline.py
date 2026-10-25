@@ -13,20 +13,15 @@ from __future__ import annotations
 import queue as _q
 import threading
 import time
-from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 
 from cascade.trainer.loop import (
-    ResolvedGenerator,
     TrainerRunner,
     _FinalLanePool,
-    _FundedLegSkip,
-    _FundedOperatorFallback,
     _LaneDeadlinePassed,
 )
-from cascade.trainer.remote import RemoteHost
 
 REF_A = "alice/gen-a@sha256:" + "a" * 64
 VAULT_REF = "vault/direct@sha256:" + "d" * 64
@@ -150,53 +145,6 @@ def test_free_lane_dispatch_with_no_deadline_uses_a_plain_queue():
     assert pool.get(timeout=0.1).name == "a"
 
 
-# ── the round: fallback legs vs the latest safe start ────────────────────────
-
-
-def _fallback_round(cfg, tmp_path, monkeypatch, *, epoch_end_wall: float,
-                    king_falls_back: bool):
-    from tests.unit.test_trainer_round import _FakeBaseTrainer
-
-    rnd = replace(cfg.round, funded_mode="required", funded_pods="rent", funded_king_rent=True,
-                  funded_activation_block=0, funded_operator_fallback=True)
-    runner = TrainerRunner(cfg=replace(cfg, round=rnd), base_trainer=_FakeBaseTrainer(),
-                           work_root=tmp_path, trainer_spec="m:C")
-    lane = RemoteHost(name="sf-l40s-0", host="10.9.9.9", port=2222, stage="final",
-                      workdir="/root/cascade")
-    runner.remote_hosts = [RemoteHost(name="funded-pod-profile", host="127.0.0.1", stage="final"),
-                           lane]
-    runner._funded_field = {"c": VAULT_REF}
-    runner._funded_leg_failures = {}
-    runner._funded_roster = {"seated": [], "waiting": [], "terminal": [], "outcomes": []}
-    runner._funded_king_lock = threading.Lock()
-    runner._funded_king_host = None
-    runner._final_role_hosts = {}
-    runner._funded_epoch_end_wall = epoch_end_wall      # fixed per attempt, as live
-    if king_falls_back:
-        runner._rent_king_host = lambda rid: (_ for _ in ()).throw(_FundedOperatorFallback("king"))
-    else:
-        runner._rent_king_host = lambda rid: lane
-        runner._stage_king_vault = lambda host, gen: host
-        runner._refuse_diverged_king = lambda entry, contract: None
-    runner._run_funded_leg = lambda *a, **k: (_ for _ in ()).throw(_FundedOperatorFallback("c"))
-    runner._stage_vault_zip_on = lambda host, digest: host
-    seen: list = []
-
-    class _D:
-        def __init__(self, **kw):
-            pass
-
-        def dispatch(self, host, **kw):
-            seen.append((host.name, kw["role"]))
-            return SimpleNamespace(hotkey=kw["hotkey"], role=kw["role"])
-
-    monkeypatch.setattr("cascade.trainer.remote.RemoteDispatcher", _D)
-    contract = cfg.throne_contracts()[0]
-    jobs = [(ResolvedGenerator(hotkey="k", uid=0, ref=REF_A), "king"),
-            (ResolvedGenerator(hotkey="c", uid=1, ref=VAULT_REF), "challenger")]
-    return runner, jobs, contract, seen
-
-
 def _hold_every_lane_busy(monkeypatch):
     """Make every deadline-form pool get() find no free lane (all busy)."""
     from cascade.trainer import loop as loop_mod
@@ -220,90 +168,10 @@ def _leg_wall(cfg) -> float:
     return max(int(c.max_train_seconds) for c in cfg.throne_contracts())
 
 
-def test_fallback_challenger_past_the_latest_safe_start_takes_a_free_lane(
-        cfg, tmp_path, monkeypatch):
-    # Epoch ends in 1 h (deadline behind us) but the operator lane is FREE:
-    # the leg runs there at once (owner 2026-09-20: rented lanes never idle
-    # while legs are queued; a late manifest is scored next epoch).
-    runner, jobs, contract, seen = _fallback_round(
-        cfg, tmp_path, monkeypatch, epoch_end_wall=time.time() + 3600.0, king_falls_back=False)
-    out = runner._train_remote(jobs, SimpleNamespace(base_seed=1), 10, contract,
-                               contract.train_tokens)
-    assert sorted(e.role for e in out) == ["challenger", "king"]
-    assert ("sf-l40s-0", "challenger") in seen
-    assert runner._funded_leg_failures == {}
-
-
-def test_fallback_challenger_past_the_latest_safe_start_requeues_when_no_lane_is_free(
-        cfg, tmp_path, monkeypatch):
-    # Same, with the only lane held busy: no waiting past the deadline — the
-    # leg settles as sold-out (no attempt burned), exactly the 2026-09-19 rule.
-    runner, jobs, contract, seen = _fallback_round(
-        cfg, tmp_path, monkeypatch, epoch_end_wall=time.time() + 3600.0, king_falls_back=False)
-    _hold_every_lane_busy(monkeypatch)
-    out = runner._train_remote(jobs, SimpleNamespace(base_seed=1), 10, contract,
-                               contract.train_tokens)
-    assert [e.role for e in out] == ["king"]
-    assert [r for _, r in seen] == ["king"]                 # challenger never dispatched
-    msg, miner_fault, error_class, burn = runner._funded_leg_failures["c"]
-    assert "latest safe start" in msg
-    assert (miner_fault, error_class, burn) == (False, "no_capacity", False)
-
-
-def test_fallback_challenger_inside_the_latest_safe_start_dispatches(
-        cfg, tmp_path, monkeypatch):
-    runner, jobs, contract, seen = _fallback_round(
-        cfg, tmp_path, monkeypatch,
-        epoch_end_wall=time.time() + _leg_wall(cfg) + TrainerRunner.FUNDED_PUBLISH_MARGIN_SECONDS
-        + 3600.0,
-        king_falls_back=False)
-    out = runner._train_remote(jobs, SimpleNamespace(base_seed=1), 10, contract,
-                               contract.train_tokens)
-    assert {e.role for e in out} == {"king", "challenger"}
-    assert ("sf-l40s-0", "challenger") in seen
-    assert runner._funded_leg_failures == {}
-
-
-def test_fallback_king_past_the_latest_safe_start_still_dispatches(
-        cfg, tmp_path, monkeypatch):
-    # The king is REQUIRED and never held back (owner 2026-09-20): past the
-    # latest safe start it still takes a free operator lane (late manifest,
-    # scored next epoch) while the challenger leg requeues unburned.
-    runner, jobs, contract, seen = _fallback_round(
-        cfg, tmp_path, monkeypatch, epoch_end_wall=time.time() + 3600.0, king_falls_back=True)
-    out = runner._train_remote(jobs, SimpleNamespace(base_seed=1), 10, contract,
-                               contract.train_tokens)
-    assert sorted(e.role for e in out) == ["challenger", "king"]
-    assert ("sf-l40s-0", "king") in seen               # the lane was free: both ran
-    assert runner._funded_leg_failures == {}
-
-
 def test_unknown_epoch_end_leaves_the_lane_wait_unbounded(tmp_path):
-    # No round context (unit fakes, --offline): the deadline helper answers
-    # None and the fallback path waits as it always did.
+    # No leg target (unit fakes, --offline): the deadline helper answers
+    # None and the fallback path waits unbounded.
     from tests.unit.test_funded_pod_wiring import _runner
 
     r = _runner(tmp_path)
-    for attr in ("_funded_epoch_end_wall", "_stage_ctx", "_funded_gate_block"):
-        if hasattr(r, attr):
-            delattr(r, attr)
     assert TrainerRunner._operator_lane_deadline(r) is None
-
-
-def test_fallback_skip_is_the_funded_leg_skip(cfg, tmp_path, monkeypatch):
-    # The dropped leg travels the same _FundedLegSkip route as a rent failure
-    # (never retried on the operator fleet, settled by _settle_funded).
-    runner, jobs, contract, _ = _fallback_round(
-        cfg, tmp_path, monkeypatch, epoch_end_wall=time.time() + 3600.0, king_falls_back=False)
-    _hold_every_lane_busy(monkeypatch)                  # past the deadline, nothing free
-    raised = {}
-    orig = runner._record_funded_failure
-
-    def _rec(hotkey, msg, **kw):
-        raised["hk"] = hotkey
-        orig(hotkey, msg, **kw)
-
-    runner._record_funded_failure = _rec
-    runner._train_remote(jobs, SimpleNamespace(base_seed=1), 10, contract, contract.train_tokens)
-    assert raised["hk"] == "c"
-    assert isinstance(_FundedLegSkip("c"), Exception)

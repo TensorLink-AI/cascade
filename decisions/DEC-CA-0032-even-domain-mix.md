@@ -27,7 +27,7 @@ r40-era capacities (2,000 trials):
    disabled entirely, econ_fin=5.4%, sales=6.7%, healthcare=8.8%.** Evenness
    is unreachable by any sampler change alone.
 
-Related pressure (docs/notes/2026-08-25-generator-lineage-r35-r40.md): miners
+Related pressure (a generator-lineage working note on rounds 35-40, never committed): miners
 statistically characterize pool marginals ("stable across all 8 snapshots on
 disk") and tune corpora toward them. A capacity-starved, stable pool
 composition is both an uneven eval AND an easy Goodhart target.

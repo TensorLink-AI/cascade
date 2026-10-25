@@ -78,6 +78,14 @@ def test_leg_fold_is_none_without_a_run_summary():
     assert leg_from_records([]) is None
 
 
+def test_checkpoint_size_telemetry_is_optional_and_preserved():
+    leg = leg_from_records([{**DONE, "param_count": 191_496_256,
+                             "active_param_count": 27_951_168}])
+    assert leg["param_count"] == 191_496_256
+    assert leg["active_param_count"] == 27_951_168
+    assert "param_count" not in leg_from_records([DONE])
+
+
 def test_collect_prefers_the_local_row_then_the_log_then_marks_unmeasured():
     reads = []
 

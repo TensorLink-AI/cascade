@@ -49,6 +49,18 @@ _ARCH_FIELDS = (
 )
 
 
+# base_arch → the model source folded into base_arch_digest and copied into
+# every checkpoint as model.py. toto2 keeps its file (its digest is byte-
+# identical to before the dispatch existed); cascade_moe is DEC-CA-0050.
+MODEL_SOURCES = {"cascade_moe": "moe_model.py"}
+DEFAULT_MODEL_SOURCE = "toto2_model.py"
+
+
+def model_source_file(contract: object) -> str:
+    """The model source file for ``contract.base_arch``."""
+    return MODEL_SOURCES.get(str(getattr(contract, "base_arch", "") or ""), DEFAULT_MODEL_SOURCE)
+
+
 def compute_base_arch_digest(contract: TrainingContractConfig) -> str:
     """Deterministic sha256 of the frozen base architecture + init code.
 
@@ -63,7 +75,7 @@ def compute_base_arch_digest(contract: TrainingContractConfig) -> str:
     environment.
     """
     arch = {k: getattr(contract, k) for k in _ARCH_FIELDS}
-    model_src = (Path(__file__).with_name("toto2_model.py")).read_bytes()
+    model_src = (Path(__file__).with_name(model_source_file(contract))).read_bytes()
     h = hashlib.sha256()
     h.update(json.dumps(arch, sort_keys=True, separators=(",", ":")).encode("utf-8"))
     h.update(b"\x00arch_src\x00")

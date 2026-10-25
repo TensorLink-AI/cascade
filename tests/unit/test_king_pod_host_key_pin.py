@@ -71,7 +71,6 @@ def test_fresh_rent_pins_the_scanned_key_and_the_transport_enforces_it(tmp_path,
     P = _fresh_prov()
     _install(monkeypatch, P)
     r = _runner(tmp_path, funded_king_rent=True)
-    r._funded_round_sku = "RTX4090"
     scanned = []
     r._host_key_scanner = lambda ip, port: scanned.append((ip, port)) or KEY
 
@@ -92,7 +91,6 @@ def test_unscannable_pod_is_a_lemon_and_the_king_rents_again(tmp_path, monkeypat
     P = _fresh_prov()
     torn, lemons = _install(monkeypatch, P)
     r = _runner(tmp_path, funded_king_rent=True)
-    r._funded_round_sku = "RTX4090"
     r._rent_wait_now = lambda: 0.0                  # far before the latest safe start
     r._rent_wait_sleep = lambda s: None
     slept = []
@@ -121,7 +119,6 @@ def test_adopted_king_pod_is_pinned_too(tmp_path, monkeypatch):
     _install(monkeypatch, P)
     P.live_pod_address = lambda self, name: SimpleNamespace(ip="7.7.7.7", ssh_port=2222)
     r = _runner(tmp_path, funded_king_rent=True)
-    r._funded_round_sku = "RTX4090"
     scanned = []
     r._host_key_scanner = lambda ip, port: scanned.append((ip, port)) or KEY
 

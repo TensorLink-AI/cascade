@@ -244,16 +244,6 @@ def test_engine_fires_after_a_ripe_reign_and_writes_pointer(tmp_path):
     assert obj["generation"] == 1
 
 
-def test_engine_rotates_members_by_epoch():
-    eng = TrainerPromotion(reign_threshold=5, k_max=2, quality_epsilon=0.05)
-    assert eng.init_for_epoch(0) is None            # random-init era
-    eng.members = (PromotedMember("a", "toto2-4m", "r1", 1.0),
-                   PromotedMember("b", "toto2-4m", "r2", 1.01))
-    assert eng.init_for_epoch(10) == ("a", "toto2-4m")
-    assert eng.init_for_epoch(11) == ("b", "toto2-4m")
-    assert eng.init_for_epoch(12) == ("a", "toto2-4m")
-
-
 def test_king_change_resets_reign_and_candidates(tmp_path):
     eng = _engine(tmp_path)
     eng.note_round("hkA", epoch_block=0)
@@ -319,7 +309,7 @@ def test_legacy_pointer_file_grandfathered_as_generation_one(tmp_path):
     )
     assert eng.generation == 1
     assert [m.checkpoint_id for m in eng.members] == ["old-winner"]
-    assert eng.init_for_epoch(7) == ("old-winner", "toto2-4m")
+    assert [(m.checkpoint_id, m.size) for m in eng.members] == [("old-winner", "toto2-4m")]
     # The pointer file was rewritten in the new schema (members + mirror).
     obj = json.loads((tmp_path / "warm_start_init.json").read_text(encoding="utf-8"))
     assert [m["checkpoint_id"] for m in obj["members"]] == ["old-winner"]
@@ -403,7 +393,7 @@ def test_no_downgrade_guard_holds_until_a_candidate_matches(tmp_path):
                      _report("r1", 1 * DAY, {"ptr-worse": (1.2, "hkKing", "king")}))
     assert eng.maybe_promote(epoch_block=5 * DAY, round_id="r5") is None
     assert eng.generation == 1 and len(eng.candidates) == 1   # held, not cleared
-    assert eng.init_for_epoch(0) == ("live-a", "toto2-4m")    # field keeps training
+    assert [m.checkpoint_id for m in eng.members] == ["live-a"]   # field keeps training
     # A later round produces a genuinely better checkpoint: fire on the still-
     # ripe clock, anchored on it.
     eng.record_bench(_manifest("r6", warm_start_ckpt="live-a"),
@@ -686,7 +676,7 @@ def test_rolling_topk_holds_when_no_candidate_enters(tmp_path):
                      _report("r1", 1 * DAY, {"c-worse": (1.03, "hkKing", "king")}))
     assert eng.maybe_promote(epoch_block=5 * DAY, round_id="r5") is None
     assert eng.generation == 1 and len(eng.candidates) == 1
-    assert eng.init_for_epoch(0) == ("m1", "toto2-4m")
+    assert [m.checkpoint_id for m in eng.members] == ["m1", "m2", "m3"]
 
 
 def test_rolling_topk_swaps_the_worst_member_and_carries_the_rest(tmp_path):

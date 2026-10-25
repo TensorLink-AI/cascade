@@ -1,7 +1,7 @@
 """Payer-key custody: memory-first, TTL-bounded, mode-0600 on disk, never logged.
 
 Ports the semantics of PRISM's ``PayerKeyVault`` (``base`` repo,
-``crates/prism-lium-payer``): a miner's Lium API key is held in master memory
+``crates/prism-lium-payer``): a miner's provider credentials is held in master memory
 for the life of its submission and *optionally* mirrored to an operator-local
 directory so a control-plane restart can still stop the miner's pod (teardown
 is the reason to persist, not convenience). Entries expire after a TTL sized
@@ -11,8 +11,10 @@ linger indefinitely on disk.
 What this deliberately is NOT: a database. Keys never enter any shared store
 (the S3 buckets, the submissions db, the queue file — the queue references
 hotkeys, never keys), never appear in logs or reprs, and never leave this
-process except as the ``LIUM_API_KEY`` env of a rent subprocess
-(``cascade.provision.core.LiumProvider``).
+process except through the selected provider adapter (Lium subprocess
+environment or Shadeform HTTP authentication). Ordered key lists use an opaque
+string payload. Immutable per-allocation snapshots live in ``leases/`` under
+the same sealing/TTL policy, so rotations cannot redirect teardown.
 
 File format: one ``<hotkey>.json`` per entry under ``dir`` (mode 0600, dir
 0700). With a seal key configured (``CASCADE_VAULT_KEY_FILE`` → 32 raw bytes
@@ -29,17 +31,21 @@ and are re-sealed on their next insert/refresh.
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import logging
 import os
 import re
 import secrets
+import tempfile
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-__all__ = ["DEFAULT_TTL_SECONDS", "PayerKeyVault", "VAULT_KEY_FILE_ENV", "load_seal_key"]
+__all__ = ["DEFAULT_TTL_SECONDS", "PayerKeyVault", "VAULT_KEY_FILE_ENV", "compute_vaults",
+           "load_seal_key"]
 
 log = logging.getLogger("cascade.funding.vault")
 
@@ -115,6 +121,7 @@ class PayerKeyVault:
     _entries: dict = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
+        self._write_lock = threading.RLock()
         if self.seal_key is None:
             self.seal_key = load_seal_key()
         if self.seal_key is not None and len(self.seal_key) != 32:
@@ -137,13 +144,32 @@ class PayerKeyVault:
     def insert(self, hotkey: str, api_key: str) -> None:
         """Store (or replace) ``hotkey``'s key with a fresh TTL."""
         hotkey = _safe_hotkey(hotkey)
+        with self._transaction(hotkey):
+            self._insert_locked(hotkey, api_key)
+
+    @contextlib.contextmanager
+    def _transaction(self, hotkey):
+        with self._write_lock:
+            if self.dir is None:
+                yield
+                return
+            import fcntl
+
+            fd = os.open(self.dir / f"{hotkey}.lock", os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                yield
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
+
+    def _insert_locked(self, hotkey, api_key):
         if not api_key:
             raise ValueError("refusing to store an empty api key")
         now = self.clock()
         self._entries[hotkey] = (api_key, now)
         if self.dir is not None:
             path = self.dir / f"{hotkey}.json"
-            tmp = path.with_suffix(".json.tmp")
             # Create 0600 from the first byte — write_text + chmod leaves a
             # umask-default window with the key already on disk.
             if self.seal_key is not None:
@@ -151,10 +177,15 @@ class PayerKeyVault:
                           "stored_at": now, "v": 1}
             else:
                 record = {"api_key": api_key, "stored_at": now}
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(json.dumps(record))
-            os.replace(tmp, path)
+            fd, temporary = tempfile.mkstemp(prefix=f"{hotkey}.", suffix=".tmp", dir=self.dir)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(json.dumps(record))
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(temporary, path)
+            finally:
+                Path(temporary).unlink(missing_ok=True)
 
     def refresh(self, hotkey: str) -> bool:
         """Re-stamp ``hotkey``'s TTL (measure-start / heartbeat re-seal).
@@ -163,18 +194,24 @@ class PayerKeyVault:
         stale its intake was — PRISM re-seals on measure start and heartbeats
         for the same reason. False when the entry is gone/expired.
         """
-        key = self.get(hotkey)
-        if key is None:
-            return False
-        self.insert(hotkey, key)
-        return True
+        hotkey = _safe_hotkey(hotkey)
+        with self._transaction(hotkey):
+            # Read inside the cross-process lock: a heartbeat must not undo
+            # credentials that intake rotated after this process hydrated.
+            entry = (self._read_file(self.dir / f"{hotkey}.json")
+                     if self.dir is not None else self._entries.get(hotkey))
+            if entry is None or self.clock() - entry[1] > self.ttl_seconds:
+                return False
+            self._insert_locked(hotkey, entry[0])
+            return True
 
     def remove(self, hotkey: str) -> None:
         """Forget ``hotkey``'s key (idempotent) — memory and disk."""
         hotkey = _safe_hotkey(hotkey)
-        self._entries.pop(hotkey, None)
-        if self.dir is not None:
-            (self.dir / f"{hotkey}.json").unlink(missing_ok=True)
+        with self._transaction(hotkey):
+            self._entries.pop(hotkey, None)
+            if self.dir is not None:
+                (self.dir / f"{hotkey}.json").unlink(missing_ok=True)
 
     # ── reads ────────────────────────────────────────────────────────────────
 
@@ -193,13 +230,28 @@ class PayerKeyVault:
             # delete a key the trainer had just re-stamped for a live leg.
             fresh = self._reload(hotkey)
             if fresh is None:
-                self.remove(hotkey)
-                return None
+                with self._transaction(hotkey):
+                    fresh = self._reload(hotkey)
+                    if fresh is None:
+                        self._entries.pop(hotkey, None)
+                        if self.dir is not None:
+                            (self.dir / f"{hotkey}.json").unlink(missing_ok=True)
+                        return None
             api_key, _ = fresh
         return api_key
 
     def has(self, hotkey: str) -> bool:
         return self.get(hotkey) is not None
+
+    def get_shared(self, hotkey: str) -> str | None:
+        """:meth:`get`, falling back to the directory for an entry another
+        process (the intake) wrote after this one hydrated."""
+        if self.dir is not None and self._reload(_safe_hotkey(hotkey)) is None:
+            return None
+        key = self.get(hotkey)
+        if key is None and self._reload(_safe_hotkey(hotkey)) is not None:
+            key = self.get(hotkey)
+        return key
 
     def hotkeys(self) -> list[str]:
         """Unexpired hotkeys, sorted (safe to log — carries no key material)."""
@@ -219,15 +271,16 @@ class PayerKeyVault:
             return 0
         loaded = 0
         for path in sorted(self.dir.glob("*.json")):
-            entry = self._read_file(path)
-            if entry is None:
-                continue
-            api_key, stored_at = entry
-            if not api_key or self.clock() - stored_at > self.ttl_seconds:
-                path.unlink(missing_ok=True)
-                continue
-            self._entries[path.stem] = (api_key, stored_at)
-            loaded += 1
+            with self._transaction(_safe_hotkey(path.stem)):
+                entry = self._read_file(path)
+                if entry is None:
+                    continue
+                api_key, stored_at = entry
+                if not api_key or self.clock() - stored_at > self.ttl_seconds:
+                    path.unlink(missing_ok=True)
+                    continue
+                self._entries[path.stem] = (api_key, stored_at)
+                loaded += 1
         return loaded
 
     def _read_file(self, path: Path) -> tuple[str, float] | None:
@@ -279,8 +332,17 @@ class PayerKeyVault:
         for hk, (_, stored_at) in list(self._entries.items()):
             if self.clock() - stored_at <= self.ttl_seconds:
                 continue
-            if self._reload(hk) is not None:
-                continue
-            self.remove(hk)
-            purged += 1
+            if self.get(hk) is None:
+                purged += 1
         return purged
+
+
+def compute_vaults(dir: str | os.PathLike | None, *, ttl_seconds: float = DEFAULT_TTL_SECONDS,
+                   providers: tuple[str, ...] = ("lium", "vast", "runpod"),
+                   ) -> dict[str, PayerKeyVault]:
+    """One vault per compute marketplace. Lium keeps the root directory (the
+    rolling lane's vault, unchanged); every other marketplace gets its own
+    subdirectory, so the rolling trainer never sees a non-Lium key."""
+    root = Path(dir) if dir is not None else None
+    return {p: PayerKeyVault(dir=None if root is None else (root if p == "lium" else root / p),
+                             ttl_seconds=ttl_seconds) for p in providers}

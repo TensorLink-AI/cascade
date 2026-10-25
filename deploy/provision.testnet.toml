@@ -1,34 +1,12 @@
-# cascade-provisioner — CLUSTER config (activate after PR #78 merges + pull).
-# Heat = one-or-two 4x RTX4090 clusters; lium first, shadeform VM-mode fallback.
-# Finals unmanaged (static cascade-final-b).
+# cascade-provisioner — TESTNET config: the elastic eval pod + hosts.toml.
+# The trainer rents its own pods; the retired heat/final fleet's tables and
+# keys are accepted and ignored.
 
 [provisioner]
-trigger_margin_blocks = 45          # ~9min: slow testnet RPC ate the 5-min window on 2026-07-14
 hosts_path            = "/root/cascade/hosts.toml"
 state_path            = "/root/cascade/provisioner_state.json"
 static_hosts          = "/root/cascade/static_hosts.toml"
 max_spend_per_round   = 25.0
-# Rules of escalation: a stage whose rung delivers NO healthy pod re-enters
-# the SKU ladder at the next (candidate × provider) rung, for at most
-# escalate_deadline_s of wall clock from its first rent attempt; a PARTIAL
-# fleet below min_viable_fleet of its slot demand gets one same-candidate
-# top-up batch. Renting runs in a worker thread (the loop keeps ticking);
-# the deadline bounds ONE attempt so the single worker never starves the
-# JIT final, the retries, or the next round's trigger. Degrading is NOT
-# fine — the orchestrator is CPU-only, so a round with no rented fleet is
-# effectively lost (and a locally-trained final can't pass the L40S pin) —
-# which is why failed stages keep retrying below.
-escalate_deadline_s   = 1800        # 0 = a failed rung is final (no escalation)
-min_viable_fleet      = 0.5         # 0 = never top up
-# A stage that rented NOTHING re-attempts the full pick→budget→rent pipeline
-# on this cadence while enough round remains for it to matter. 0 = one
-# attempt per round. (final_rent_on stays "margin" here: the testnet final
-# is UNMANAGED — static cascade-final-b — so there is nothing to defer.)
-rent_retry_cooldown_s = 900
-# Money backstop for zombie pools (pods that rent but never boot): dud
-# attempts double the stage's retry cooldown (capped 8x), and after this many
-# dud pods in one round the stage stops renting entirely. <= 0 = no cap.
-max_duds_per_stage    = 8
 eval_hosts_path       = "/root/cascade/eval_hosts.toml"   # elastic eval pod (PR #85)
 receipt_prefix        = "receipts/5F1VmMSaPPi2qm91HE8VyMiHoCz4YxGaexJ3qmbyAPBUcUtR/"
 
@@ -54,61 +32,7 @@ user          = "shadeform"
 workdir       = "/home/shadeform/cascade"
 remote_python = "/home/shadeform/cascade/.venv/bin/python"
 
-[provisioner.heat]
-# Primary: 4x RTX4090 clusters. Ordered fallbacks below — first
-# (candidate × provider) with capacity for the whole heat fleet wins;
-# a stage never mixes SKUs within a round.
-sku          = "NVIDIA GeForce RTX 4090"
-market_sku   = "RTX4090"                 # same marketplace name on lium AND shadeform
-gpus_per_pod = 4                         # CLUSTERS: one 4x box = 4 lanes, 1 bootstrap
-max_pods     = 8                         # slot-derived per shape: 4x rents 1-2, 1x singles can scale out
-providers    = ["lium", "shadeform"]     # lium first; no 4x on lium → shadeform VM-mode
-max_price_hr = 2.60                      # shadeform 4x RTX4090 = $2.40/hr/pod
-slot_overhead = 1.3
-
-[[provisioner.heat.candidate]]           # fallback 1: 4x A6000 cluster
-sku          = "NVIDIA RTX A6000"
-market_sku   = "A6000"
-gpus_per_pod = 4
-max_price_hr = 2.40
-
-[[provisioner.heat.candidate]]           # fallback 2: 8x RTX4090 cluster
-sku          = "NVIDIA GeForce RTX 4090"
-market_sku   = "RTX4090"
-gpus_per_pod = 8
-max_price_hr = 5.00
-
-[[provisioner.heat.candidate]]           # fallback 3: 8x A6000 cluster
-sku          = "NVIDIA RTX A6000"
-market_sku   = "A6000"
-gpus_per_pod = 8
-max_price_hr = 4.60
-
-[[provisioner.heat.candidate]]           # fallback 4: 2x 4090
-sku          = "NVIDIA GeForce RTX 4090"
-market_sku   = "RTX4090"
-gpus_per_pod = 2
-max_price_hr = 1.30
-
-[[provisioner.heat.candidate]]           # fallback 5 (floor): 2x A6000
-sku          = "NVIDIA RTX A6000"
-market_sku   = "A6000"
-gpus_per_pod = 2
-max_price_hr = 1.20
-
-# No 1x rungs: every pod pays the full bootstrap cost (rsync + uv sync) for a
-# single lane, and a singles fleet burns max_pods on 8 flaky boxes for 8 slots.
-# The 2x rungs are the floor.
-
-[provisioner.final]
-sku          = "NVIDIA L40S"
-market_sku   = "L40S"
-gpus_per_pod = 1
-max_pods     = 0                         # UNMANAGED: static cascade-final-b
-providers    = ["lium"]
-max_price_hr = 1.00
-
-# ── elastic eval pod (PR #85): rented at manifest, torn down at receipt ──────
+# ── elastic eval pod: rented at manifest, torn down at receipt ──────────────
 
 [provisioner.eval]
 sku          = "NVIDIA GeForce RTX 3090"

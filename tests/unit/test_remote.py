@@ -9,7 +9,6 @@ from pathlib import Path
 
 import pytest
 
-from cascade.shared.chain import Commitment
 from cascade.shared.manifest import format_trained_pointer
 from cascade.trainer import remote as remote_mod
 from cascade.trainer.loop import TrainerRunner
@@ -268,27 +267,6 @@ def test_dispatch_transport_failure_carries_returncode_255():
     assert ei.value.returncode == 255
 
 
-def test_probe_host_true_only_on_ssh_echo_roundtrip(monkeypatch):
-    # TCP reachability is not enough — only a full SSH echo round-trip proves a
-    # pod can run a worker (a booting pod accepts TCP but sshd dies rc=255).
-    monkeypatch.setattr(remote_mod, "run_ssh",
-                        lambda argv, t: _fake_proc(rc=0, stdout=remote_mod._HEAT_PROBE_TOKEN + "\n"))
-    assert remote_mod.probe_host(_host()) is True
-    # rc=255 transport failure ⇒ dead
-    monkeypatch.setattr(remote_mod, "run_ssh",
-                        lambda argv, t: _fake_proc(rc=255, stderr="connection refused"))
-    assert remote_mod.probe_host(_host()) is False
-    # rc=0 but no token (sshd banner / MOTD only) ⇒ not proven alive
-    monkeypatch.setattr(remote_mod, "run_ssh", lambda argv, t: _fake_proc(rc=0, stdout="motd"))
-    assert remote_mod.probe_host(_host()) is False
-    # a transport exception (no route) ⇒ dead
-    def _boom(argv, t):
-        raise OSError("no route to host")
-
-    monkeypatch.setattr(remote_mod, "run_ssh", _boom)
-    assert remote_mod.probe_host(_host()) is False
-    # an un-addressable host can't be probed ⇒ kept (never strand a fleet)
-    assert remote_mod.probe_host(types.SimpleNamespace(name="no-addr")) is True
 
 
 def test_dispatch_rc3_relays_one_line_miner_rejection():
@@ -349,41 +327,8 @@ class _RecordingDispatcher:
         return remote_mod.receipt_to_entry(_receipt_dict(role=role, uid=uid, hotkey=hotkey))
 
 
-def test_run_round_remote_assigns_king_and_challenger_to_separate_hosts(cfg, tmp_path, monkeypatch):
-    _RecordingDispatcher.calls = []
-    monkeypatch.setattr(remote_mod, "RemoteDispatcher", _RecordingDispatcher)
-    # contract_digest/base_arch_digest come from cfg; entries just need to assemble.
-
-    hosts = [_host(name="host0"), _host(name="host1")]
-    runner = TrainerRunner(cfg=cfg, base_trainer=object(), work_root=tmp_path,
-                           remote_hosts=hosts, trainer_spec="m:C")
-
-    commits = [
-        Commitment(uid=0, hotkey="a", coldkey=None, payload=f"metro-v1:gen:hippius:{REF_A}", commit_block=5),
-        Commitment(uid=1, hotkey="b", coldkey=None, payload=f"metro-v1:gen:hippius:{REF_B}", commit_block=6),
-    ]
-    manifest = runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
-
-    assert manifest.entry_for_role("king") is not None
-    assert manifest.entry_for_role("challenger") is not None
-    by_role = {role: name for (name, role, _ref) in _RecordingDispatcher.calls}
-    assert by_role["king"] == "host0" and by_role["challenger"] == "host1"
 
 
-def test_run_round_remote_aborts_when_king_fails(cfg, tmp_path, monkeypatch):
-    class _KingFails(_RecordingDispatcher):
-        def dispatch(self, host, *, role, **kw):
-            if role == "king":
-                raise RemoteDispatchError("king pod died")
-            return remote_mod.receipt_to_entry(_receipt_dict(role=role, **{k: kw[k] for k in ("uid", "hotkey")}))
-
-    monkeypatch.setattr(remote_mod, "RemoteDispatcher", _KingFails)
-    runner = TrainerRunner(cfg=cfg, base_trainer=object(), work_root=tmp_path,
-                           remote_hosts=[_host(name="h0")], trainer_spec="m:C")
-    commits = [Commitment(uid=0, hotkey="a", coldkey=None,
-                          payload=f"metro-v1:gen:hippius:{REF_A}", commit_block=5)]
-    with pytest.raises(RuntimeError):
-        runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
 
 
 def test_load_hosts_parses_and_validates_stage(tmp_path):

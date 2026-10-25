@@ -241,6 +241,10 @@ def test_record_frames_round_trip_through_the_pipe():
             def poll():
                 return 0
 
+            @staticmethod
+            def wait(timeout=None):
+                return 0
+
         items = list(_frame_iter(_P, 5))
     finally:
         rd.close()

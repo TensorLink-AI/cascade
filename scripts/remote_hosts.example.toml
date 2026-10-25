@@ -23,15 +23,12 @@
 # chain.toml [training] expected_gpu (the reference trainer runs deterministically;
 # the validator rejects any round whose two checkpoints weren't trained on it).
 #
-# STAGE TAGS (optional, default "any"): stage = "heat" | "final" | "any" restricts
-# which round stage a pod serves. Heats can run on a CHEAPER SKU class (e.g.
-# A6000) than the final — heat checkpoints are trainer-internal (screened and
-# discarded, never validated), and the fixed token budget keeps every heat
-# entrant on identical compute regardless of SKU. Two rules:
-#   * keep each stage's pods a single SKU (heat entrants stay numerically
-#     comparable; the final's king/challenger must match for the validator gate),
-#   * only the FINAL pods need the expected_gpu SKU from chain.toml.
-# Untagged ("any") hosts serve both stages — the pre-stage behaviour.
+# STAGE TAGS (optional, default "any"): stage = "final" | "any" marks an
+# operator lane the trainer's rolling fallback legs may take ("heat" is still
+# accepted by the parser but nothing schedules heats any more). Keep lanes a
+# single SKU — the king/challenger pair must match for the validator gate — and
+# give them the expected_gpu SKU from chain.toml. profile_only = true marks the
+# entry funded pods mirror without offering it as a lane.
 
 [[host]]
 name          = "king-box"

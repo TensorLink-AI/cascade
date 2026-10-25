@@ -69,3 +69,22 @@ NOT a substitute for basin escape (DEC-CA-0014): increment keeps INCREMENTAL
 competition alive as the lineage converges; if the lineage has genuinely
 plateaued (from-scratch benches ≈ the mature king), the answer is a reseed,
 which needs the scratch-shadow diagnostic armed first — a separate track.
+
+**Note 2026-10-20 (v2 cohort units — reviewed, no change).** A review flagged
+mainnet `chain.toml` typing `[scoring] cohort_maxt_increment_from_block = 0`
+as leaving v2 cohort settlements (k > 1) with a LEVEL-unit max-T bound
+compared against the increment-unit v2 bar (`[v2] win_margin_start` 0.10 →
+0.01). It does not happen on the config the fleet runs: mainnet's DEC-CA-0043
+rollover is decided on chain, and `apply_activation` writes the resolved
+rollover block into this key when it is 0 (the validator at runtime; the audit
+and satellites via `apply_receipt_activation` from the receipt's
+`activation_block`). Every v2 era follows the rollover, so every v2 cohort
+settlement — and every live pre-v2 era-king settlement — already judges the
+joint bound in increment units, and `crown_units` labels such crownings
+"increment". Typing `"v2"` (= `[v2] from_block`) instead was rejected: a gate
+after the rollover breaks the load-checked `era_king_from_block >=
+cohort_maxt_increment_from_block` ordering (`apply_activation` refuses it) and
+would move live pre-v2 era-king settlements back to level units. Pinned by
+`tests/unit/test_cohort_duel.py::test_mainnet_v2_cohort_settlement_is_judged_in_increment_units`
+and `::test_mainnet_cohort_increment_gate_cannot_trail_the_rollover`; the
+chain.toml comment now says so.

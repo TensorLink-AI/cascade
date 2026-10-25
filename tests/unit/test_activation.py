@@ -17,7 +17,6 @@ import pytest
 import cascade.shared.activation as A
 from cascade.shared.config import load_chain_config
 from cascade.shared.era import era_king_active, rolling_active, tenure_blocks_active
-from tests.unpinned import load_unpinned, strip_pins
 
 REPO = Path(__file__).resolve().parents[2]
 FEATURE = "rolling-era-king"
@@ -29,15 +28,15 @@ B0 = 9046800 + GRID
 
 @pytest.fixture
 def cfg():
-    """The shipped chain.toml with its DEC-CA-0048 forfeiture and DEC-CA-0049
-    margin-v2 bar DISARMED: these tests model the plain fleet (neither
-    configured) and arm one explicitly. The DEC-CA-0050 promotion-carry
-    segment is disarmed too (no Cascade promotion ⇒ no segment)."""
-    c = load_unpinned(REPO / "chain.toml")
+    """The shipped chain.toml with its DEC-CA-0048 forfeiture, DEC-CA-0049
+    margin-v2 bar and DEC-CA-0055 pre-launch burn DISARMED: these tests model
+    the plain fleet (none configured) and arm one explicitly."""
+    c = load_chain_config(REPO / "chain.toml")
     return replace(c, scoring=replace(c.scoring, forfeit_hotkeys=(), forfeit_from_block=0,
                                       forfeit_successor_hotkey="", win_margin_start_v2=0.0,
                                       win_margin_end_v2=0.0, margin_warmup_blocks_v2=0,
-                                      margin_v2_from_block=0, cascade_enabled=False))
+                                      margin_v2_from_block=0),
+                   v2=replace(c.v2, prelaunch_burn=0.0))
 
 
 def _v(hk, stake, *, permit=True, last_update=0):
@@ -344,8 +343,13 @@ def test_store_round_trips_and_tolerates_garbage(tmp_path):
     store.save(rec)
     assert store.load() == rec
     assert json.loads((tmp_path / "activation_state.json").read_text())["activation_block"] == B0 + GRID
+    # a torn main file falls back to the last good copy; with none, refuse
+    store.save(rec)                                  # the second save keeps a .bak
     (tmp_path / "activation_state.json").write_text("{not json")
-    assert store.load() == A.ActivationRecord()
+    assert store.load() == rec
+    (tmp_path / "activation_state.json.bak").write_text("{not json")
+    with pytest.raises(A.ActivationStateUnreadable):
+        store.load()
     assert A.ActivationStore(None).load() == A.ActivationRecord()
 
 
@@ -377,7 +381,7 @@ def test_startup_activation_arms_from_the_notes_and_persists(cfg, tmp_path):
 
 
 def test_shipped_configs_carry_the_activation_section():
-    main = load_unpinned(REPO / "chain.toml")
+    main = load_chain_config(REPO / "chain.toml")
     assert main.activation.enabled and main.activation.feature == FEATURE
     assert main.activation.threshold == 0.51 and main.activation.epoch_blocks_after == 900
     assert main.round.rolling_from_block == 0            # the fleet decides the block
@@ -386,7 +390,7 @@ def test_shipped_configs_carry_the_activation_section():
 
 
 def test_loader_rejects_a_bad_threshold_or_grid(tmp_path):
-    src = strip_pins((REPO / "chain.toml").read_text(encoding="utf-8"))
+    src = (REPO / "chain.toml").read_text(encoding="utf-8")
     p = tmp_path / "chain.toml"
     p.write_text(src.replace("threshold = 0.51", "threshold = 1.5"), encoding="utf-8")
     with pytest.raises(ValueError, match="threshold"):
@@ -434,7 +438,6 @@ def test_provisioner_loop_switches_its_grid_from_the_activation_hook():
     assert seen == [B0 + 5]
     assert (loop.epoch_blocks, loop.epoch_blocks_prev, loop.epoch_activation_block) == (
         900, 3600, B0 + GRID)
-    assert loop.epoch_at(B0 + GRID - 1) == 3600 and loop.epoch_at(B0 + GRID) == 900
     loop.activation_fn = lambda client, block: (_ for _ in ()).throw(RuntimeError("down"))
     loop._maybe_apply_activation(B0 + 6)                     # swallowed, grid kept
     assert loop.epoch_blocks == 900
@@ -443,17 +446,21 @@ def test_provisioner_loop_switches_its_grid_from_the_activation_hook():
 # ── chain client (fake subtensor) ────────────────────────────────────────────
 
 
-class _Meta:
-    def __init__(self):
-        self.n = 3
-        self.hotkeys = ["h0", "h1", "h2"]
-        self.S = [10.0, 0.0, 5.5]
-        self.validator_permit = [True, False, True]
-        self.last_update = [100, 0, 90]
-        self.coldkeys = ["c0", "c1", "c2"]
+def _meta():
+    """The 11.x typed metagraph (``subnets.metagraph``): uid-ordered neurons,
+    stake as an alpha Balance (10.5's ``S`` == ``total_stake``)."""
+    import bittensor as bt
+
+    rows = [("h0", 10.0, True, 100), ("h1", 0.0, False, 0), ("h2", 5.5, True, 90)]
+    return SimpleNamespace(block=123, neurons=[
+        SimpleNamespace(hotkey=hk, coldkey="c" + hk[1:], validator_permit=p, last_update=lu,
+                        total_stake=bt.Balance.from_rao(int(st * 1e9), 91))
+        for hk, st, p, lu in rows])
 
 
 class _Sub:
+    """Fake bittensor 11.x subtensor (DEC-CA-0051 shapes)."""
+
     def __init__(self):
         self.meta_calls = []
         self.commit_calls = []
@@ -461,16 +468,21 @@ class _Sub:
         self.commit_fail = False
         self.plain = {"h0": "cascade-ready:1:rolling-era-king:0:0",
                       "h2": "metro-v1:gen:hippius:a/b@sha256:" + "0" * 64}
+        self.subnets = SimpleNamespace(metagraph=self._metagraph)
 
-    def metagraph(self, **kw):
-        self.meta_calls.append(kw)
-        return _Meta()
+    def _metagraph(self, netuid, block=None, *, commitments=True):
+        self.meta_calls.append({"netuid": netuid, "block": block, "commitments": commitments})
+        return _meta()
 
-    def get_all_commitments(self, netuid, block=None):  # pragma: no cover — not used
-        raise AssertionError("the client must read CommitmentOf itself (no SDK decoder spam)")
-
-    def query_map(self, module, name, params, block=None):
-        assert (module, name, params) == ("Commitments", "CommitmentOf", [91])
+    def query_map(self, item, params=None, *, block=None):
+        item = tuple(item)[:2]
+        if item == ("Commitments", "RevealedCommitments"):
+            # a validator note sealed as a REVEAL (never happens in practice)
+            # next to a real submission — the note must still never surface
+            def _scale(t):
+                return "0x" + (((len(t) << 2) | 1).to_bytes(2, "little") + t.encode()).hex()
+            return [(hk, [(_scale(v), 50)]) for hk, v in self.plain.items()]
+        assert (item, params) == (("Commitments", "CommitmentOf"), [91])
         self.map_calls.append(block)
         rows = [(hk, {"block": 5, "info": {"fields": [{"Raw64": "0x" + v.encode().hex()}]}})
                 for hk, v in self.plain.items()]
@@ -479,16 +491,10 @@ class _Sub:
             {"TimelockEncrypted": {"encrypted": "0xdead", "reveal_round": 9}}]}}))
         return rows
 
-    def set_commitment(self, wallet, netuid, data, **kw):
-        self.commit_calls.append((netuid, data, kw))
+    def submit_call(self, call, wallet, **kw):
+        self.commit_calls.append((call.params["netuid"], call.params["info"], kw))
         return SimpleNamespace(success=not self.commit_fail,
                                message="rate limited" if self.commit_fail else "ok")
-
-    # No bulk/per-uid REVEALED store on this build: poll_commitments falls
-    # through to the plain store — the only path where a note could surface.
-
-    def get_commitment(self, netuid, uid, block=None):
-        return self.plain.get(f"h{uid}")
 
 
 def _client(sub):
@@ -504,15 +510,17 @@ def test_chain_client_reads_stake_permits_and_notes_as_of_a_block():
     sub = _Sub()
     c = _client(sub)
     rows = c.validator_stakes(block=123)
-    assert sub.meta_calls[-1] == {"netuid": 91, "lite": True, "block": 123}
+    assert sub.meta_calls[-1] == {"netuid": 91, "block": 123, "commitments": False}
     assert rows == [A.ValidatorStake("h0", 10.0, True, 100), A.ValidatorStake("h1", 0.0, False, 0),
                     A.ValidatorStake("h2", 5.5, True, 90)]
     assert c.read_plain_commitments() == sub.plain             # Raw only; sealed skipped
     assert c.read_plain_commitments(block=123) == sub.plain
     assert sub.map_calls == [None, 123]                         # as-of read forwarded
     c.set_plain_commitment("cascade-ready:1:rolling-era-king:0:0")
-    assert sub.commit_calls == [(91, "cascade-ready:1:rolling-era-king:0:0",
-                                 {"wait_for_inclusion": True, "wait_for_finalization": False})]
+    note = b"cascade-ready:1:rolling-era-king:0:0"
+    assert sub.commit_calls == [(91, {"fields": [{f"Raw{len(note)}": note}]},
+                                 {"signer": "hotkey", "wait_for_inclusion": True,
+                                  "wait_for_finalization": False})]
     assert c.hotkey_ss58() == "h0"
     # a rejected extrinsic is a failure, never "signalled"
     from cascade.shared.chain import ChainError
@@ -522,8 +530,9 @@ def test_chain_client_reads_stake_permits_and_notes_as_of_a_block():
 
 
 def test_poll_commitments_never_surfaces_an_activation_note():
-    """The plain-store fallback is where a validator's note lives; a field
-    builder must never see it as a submission."""
+    """A validator's note lives in the plain store, which poll_commitments
+    never reads; even a note that somehow arrived as a REVEAL is dropped — a
+    field builder must never see it as a submission."""
     sub = _Sub()
     c = _client(sub)
     got = c.poll_commitments()

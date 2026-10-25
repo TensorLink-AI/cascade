@@ -1,9 +1,15 @@
-"""ChainClient.poll_commitments robustness: one miner's malformed (non-hex)
-revealed commitment makes bittensor's BATCH decoder raise for the whole netuid.
-The poll must degrade to a per-UID decode that skips only the bad entry rather
-than going blind to the entire field (a single-commit field-wide DoS)."""
+"""ChainClient.poll_commitments robustness (bittensor 11.x, DEC-CA-0051).
+
+The whole netuid's ``RevealedCommitments`` is read in ONE ``query_map`` and
+decoded per entry by the repo's tolerant decoder (both substrate renderings),
+so one miner's malformed reveal costs exactly that entry — never the field
+(10.5's SDK batch decoder raised for the whole netuid: a single-commit
+field-wide DoS). If the map read itself fails, the poll degrades to one read
+per registered hotkey, skipping only the unreadable ones."""
 
 from __future__ import annotations
+
+from types import SimpleNamespace
 
 from cascade.shared.chain import ChainClient
 
@@ -13,46 +19,6 @@ CK = [f"5Cold{i}" for i in range(4)]
 
 def _payload(name: str) -> str:
     return f"metro-v1:gen:hippius:acct/{name}@sha256:" + "ab" * 32
-
-
-class _Meta:
-    def __init__(self):
-        self.hotkeys = list(HK)
-        self.coldkeys = list(CK)
-        self.n = len(HK)
-
-
-class _Sub:
-    """Fake subtensor. ``bulk_raises`` simulates the batch-decode DoS; ``bad_uids``
-    are the UIDs whose per-UID revealed decode also raises (the malformed ones)."""
-
-    def __init__(self, *, bulk_raises=False, bad_uids=()):
-        self.bulk_raises = bulk_raises
-        self.bad_uids = set(bad_uids)
-        # per-UID revealed data: (block, payload) tuples; uid 2 has none at all
-        self._reveals = {
-            0: ((100, _payload("gen0")),),
-            1: ((90, _payload("gen1old")), (110, _payload("gen1"))),
-            3: ((130, _payload("gen3")),),
-        }
-
-    def metagraph(self, netuid, lite=True):
-        return _Meta()
-
-    def get_all_revealed_commitments(self, netuid, block=None):
-        if self.bulk_raises:
-            raise ValueError("non-hexadecimal number found in fromhex() arg at position 1")
-        return {HK[u]: r for u, r in self._reveals.items()}
-
-    def get_revealed_commitment(self, netuid, uid, block=None):
-        if uid in self.bad_uids:
-            raise ValueError("non-hexadecimal number found in fromhex() arg at position 1")
-        return self._reveals.get(uid)
-
-
-class _SubNoBulk(_Sub):
-    """Older bittensor: no batch API at all — must use the per-UID path."""
-    get_all_revealed_commitments = None
 
 
 def _scale_wrap(payload: str, *, as_hex: bool) -> str:
@@ -67,74 +33,93 @@ RAW_PAYLOAD = "metro-v1:gen:hippius:acct/gen1@hf:" + "9" * 57
 assert len(RAW_PAYLOAD) == 91
 
 
-class _RawMapSubstrate:
-    """Fake ``sub.substrate`` whose query_map yields the whole netuid's raw
-    store — both renderings, plus one garbage entry and one foreign hotkey."""
-
-    def query_map(self, module, storage_function, params, page_size=200):
-        assert (module, storage_function) == ("Commitments", "RevealedCommitments")
-        return [
-            (HK[0], [( _scale_wrap(_payload("gen0"), as_hex=True), 100)]),
-            (HK[1], [("not-scale-garbage", 90),
-                     (_scale_wrap(RAW_PAYLOAD, as_hex=False), 110)]),
-            (HK[3], [( _scale_wrap(_payload("gen3"), as_hex=True), 130)]),
-            ("5ForeignHotkeyNotOnMetagraph", [( _scale_wrap(_payload("x"), as_hex=True), 1)]),
-        ]
+def _meta():
+    """The 11.x typed metagraph shape ChainClient reads: uid-ordered neurons."""
+    return SimpleNamespace(block=500, neurons=[
+        SimpleNamespace(hotkey=hk, coldkey=ck) for hk, ck in zip(HK, CK, strict=True)])
 
 
-class _SubRawMap(_Sub):
-    """Batch decoder poisoned, but the raw store map works — the fast path.
-    Per-UID access is a hard failure so the test proves it is never used."""
+# per-hotkey RevealedCommitments values: [(scale-bytes, reveal_block)]; uid 2
+# has none at all. HK1 carries an older reveal + a garbage entry + its latest
+# (raw-rendered) reveal; a foreign hotkey not on the metagraph is ignored.
+_STORE = {
+    HK[0]: [(_scale_wrap(_payload("gen0"), as_hex=True), 100)],
+    HK[1]: [(_scale_wrap(_payload("gen1old"), as_hex=True), 90),
+            ("not-scale-garbage", 95),
+            (_scale_wrap(RAW_PAYLOAD, as_hex=False), 110)],
+    HK[3]: [(_scale_wrap(_payload("gen3"), as_hex=True), 130)],
+    "5ForeignHotkeyNotOnMetagraph": [(_scale_wrap(_payload("x"), as_hex=True), 1)],
+}
 
-    def __init__(self):
-        super().__init__(bulk_raises=True)
-        self.substrate = _RawMapSubstrate()
 
-    def get_revealed_commitment(self, netuid, uid, block=None):
-        raise AssertionError("per-UID path must not run when the raw map works")
+class _Sub:
+    """Fake 11.x subtensor. ``map_raises`` makes the one-shot ``query_map``
+    fail (the fallback path); ``bad_hotkeys`` make that hotkey's per-key
+    ``query`` fail too."""
+
+    def __init__(self, *, map_raises=False, bad_hotkeys=()):
+        self.map_raises = map_raises
+        self.bad_hotkeys = set(bad_hotkeys)
+        self.map_calls = 0
+        self.query_calls = 0
+        self.blocks = []
+
+    def query_map(self, item, params=None, *, block=None):
+        assert tuple(item)[:2] == ("Commitments", "RevealedCommitments")
+        assert params == [259]
+        self.map_calls += 1
+        self.blocks.append(block)
+        if self.map_raises:
+            raise ConnectionError("websocket closed mid-map")
+        return list(_STORE.items())
+
+    def query(self, item, params=None, *, block=None):
+        assert tuple(item)[:2] == ("Commitments", "RevealedCommitments")
+        self.query_calls += 1
+        self.blocks.append(block)
+        netuid, hotkey = params
+        if hotkey in self.bad_hotkeys:
+            raise ValueError("unreadable entry")
+        return _STORE.get(hotkey)
 
 
 def _client(sub):
-    return ChainClient(netuid=259, _subtensor=sub)
+    c = ChainClient(netuid=259, _subtensor=sub)
+    c._metagraph = lambda block=None: _meta()  # type: ignore[method-assign]
+    return c
 
 
-def test_bulk_success_decodes_whole_field():
-    out = _client(_Sub()).poll_commitments()
-    assert sorted(c.uid for c in out) == [0, 1, 3]
-    assert {c.uid: c.commit_block for c in out} == {0: 100, 1: 110, 3: 130}
-
-
-def test_malformed_batch_falls_back_and_skips_only_bad_uid():
-    # batch decode raises (as on the live netuid); uid 1 is the malformed one.
-    out = _client(_Sub(bulk_raises=True, bad_uids=[1])).poll_commitments()
-    # every good UID survives; only the undecodable one is dropped — not the field.
-    assert sorted(c.uid for c in out) == [0, 3]
-    assert all(c.payload.startswith("metro-v1:gen:hippius:") for c in out)
-
-
-def test_malformed_batch_recovers_full_field_when_bad_uid_has_no_commit():
-    # batch raises but every UID with a commitment decodes per-UID → full recovery.
-    out = _client(_Sub(bulk_raises=True)).poll_commitments()
-    assert sorted(c.uid for c in out) == [0, 1, 3]
-
-
-def test_no_bulk_api_uses_per_uid():
-    out = _client(_SubNoBulk()).poll_commitments()
-    assert sorted(c.uid for c in out) == [0, 1, 3]
-
-
-def test_malformed_batch_prefers_one_shot_raw_map():
-    """Live 2026-07-14: the poisoned batch decoder pushed every resolve onto
-    the per-UID path (~13 min for the field), long enough to blow the
-    provisioner's rental window. The fallback must be ONE query_map with
-    tolerant per-entry decode: full field back, latest reveal per hotkey,
-    garbage entries and off-metagraph hotkeys skipped, per-UID never touched."""
-    out = _client(_SubRawMap()).poll_commitments()
+def test_one_shot_map_decodes_whole_field():
+    """Live 2026-07-14: per-UID reads took ~13 min for the field, long enough to
+    blow the provisioner's rental window. ONE query_map with tolerant per-entry
+    decode: full field back, latest reveal per hotkey, garbage entries and
+    off-metagraph hotkeys skipped, per-hotkey reads never touched — and the
+    map is pinned to the metagraph's block (one consistent snapshot)."""
+    sub = _Sub()
+    out = _client(sub).poll_commitments()
     assert sorted(c.uid for c in out) == [0, 1, 3]
     by_uid = {c.uid: c for c in out}
-    assert by_uid[1].commit_block == 110                  # latest, garbage skipped
+    assert {u: c.commit_block for u, c in by_uid.items()} == {0: 100, 1: 110, 3: 130}
     assert by_uid[1].payload == RAW_PAYLOAD               # raw rendering decoded
+    assert by_uid[0].payload == _payload("gen0")          # hex rendering decoded
     assert by_uid[0].coldkey == CK[0]
+    assert (sub.map_calls, sub.query_calls) == (1, 0)
+    assert sub.blocks == [500]
+
+
+def test_failed_map_falls_back_and_skips_only_bad_hotkey():
+    sub = _Sub(map_raises=True, bad_hotkeys=[HK[1]])
+    out = _client(sub).poll_commitments()
+    # every good UID survives; only the unreadable one is dropped — not the field.
+    assert sorted(c.uid for c in out) == [0, 3]
+    assert all(c.payload.startswith("metro-v1:gen:hippius:") for c in out)
+    assert sub.query_calls == len(HK)
+
+
+def test_failed_map_recovers_full_field_per_hotkey():
+    out = _client(_Sub(map_raises=True)).poll_commitments()
+    assert sorted(c.uid for c in out) == [0, 1, 3]
+    assert {c.uid: c.commit_block for c in out} == {0: 100, 1: 110, 3: 130}
 
 
 # ── include_history: the eligibility-cutoff read ──────────────────────────────
@@ -145,27 +130,20 @@ def test_malformed_batch_prefers_one_shot_raw_map():
 # from a round receipt after re-committing for the next round).
 
 
-def test_bulk_history_returns_every_reveal():
+def test_map_history_returns_every_decodable_reveal():
     out = _client(_Sub()).poll_commitments(include_history=True)
-    assert sorted(c.commit_block for c in out if c.uid == 1) == [90, 110]
-    # everyone else still contributes their single reveal
+    # all of HK1's entries come back (the tolerant decoder yields SOME payload
+    # for the garbage one — parse_commit rejects it downstream, same as any
+    # malformed commitment); the real reveals are intact
+    by_block = {c.commit_block: c for c in out if c.uid == 1}
+    assert sorted(by_block) == [90, 95, 110]
+    assert by_block[110].payload == RAW_PAYLOAD
     assert sorted({c.uid for c in out}) == [0, 1, 3]
     # the latest-only default is unchanged
     latest = _client(_Sub()).poll_commitments()
     assert [c.commit_block for c in latest if c.uid == 1] == [110]
 
 
-def test_per_uid_history_returns_every_reveal():
-    out = _client(_SubNoBulk()).poll_commitments(include_history=True)
-    assert sorted(c.commit_block for c in out if c.uid == 1) == [90, 110]
-
-
-def test_raw_map_history_returns_every_decodable_reveal():
-    out = _client(_SubRawMap()).poll_commitments(include_history=True)
-    # both of HK1's entries come back (the tolerant decoder yields SOME payload
-    # for the garbage one — parse_commit rejects it downstream, same as any
-    # malformed commitment); the real reveal is intact
-    by_block = {c.commit_block: c for c in out if c.uid == 1}
-    assert sorted(by_block) == [90, 110]
-    assert by_block[110].payload == RAW_PAYLOAD
-    assert sorted({c.uid for c in out}) == [0, 1, 3]
+def test_per_hotkey_history_returns_every_reveal():
+    out = _client(_Sub(map_raises=True)).poll_commitments(include_history=True)
+    assert sorted(c.commit_block for c in out if c.uid == 1) == [90, 95, 110]

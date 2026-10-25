@@ -3,7 +3,7 @@
 # stakeholder scoreboard can read them anonymously from the browser.
 #
 # Why this exists: until the ACL fix in shared/bench_report.publish_bench_report,
-# the trainer's post-publish bench wrote benchmarks/round-<id>.json PRIVATE
+# the trainer's bench publish wrote benchmarks/round-<id>.json PRIVATE
 # (every other browser-read object — receipts, status/*, the pages — carried the
 # canned ACL). A private round doc reads 403, which the page cannot tell apart
 # from "never benched": the Public benchmark cell just stays dashed. New reports

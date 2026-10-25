@@ -1,9 +1,7 @@
-"""Cascade warm-start consumption + envelope gate (DEC-CA-0005/0004/0012).
+"""Cascade warm-start envelope gate (DEC-CA-0005/0004/0012).
 
-The trainer's promotion engine writes the pointer file (the live generation's
-member set); the trainer reads it, trains every matching-size run this round
-from the epoch-rotation member, and stamps the pin onto the signed manifest;
-each validator then VERIFIES the declaration — any live member passes, an
+The trainer stamps each era's init (a member of the promoted set) onto the
+signed manifest; each validator then VERIFIES the declaration — any live member passes, an
 unseen init must be justified by a trainer-signed PromotionRecord that survives
 the envelope (provenance + quality floor + ripeness + set cap) — instead of
 re-deriving the selection.
@@ -38,7 +36,6 @@ from cascade.shared.promotion import (
     promotion_index_key,
     promotion_record_key,
 )
-from cascade.trainer.loop import TrainerRunner
 from cascade.trainer.remote import RemoteHost, worker_argv
 from cascade.validator.cascade import CascadeController, CascadeState
 from cascade.validator.loop import POOL_PIN_READ_GRACE_SECONDS, ValidatorRunner
@@ -50,112 +47,6 @@ PTR = format_trained_pointer(REF_T)
 PTR2 = format_trained_pointer(REF_T2)
 
 DAY = 7_200  # blocks; the controller runs with round_cfg=None in these tests
-
-
-# ── trainer: reading the promoted-init pointer ───────────────────────────────
-
-
-def _trainer(cfg, tmp_path, ws_path):
-    return TrainerRunner(cfg=cfg, base_trainer=object(), work_root=tmp_path,
-                         warm_start_path=ws_path)
-
-
-def test_no_pointer_path_means_random_init(cfg, tmp_path):
-    assert _trainer(cfg, tmp_path, None)._load_warm_start() is None
-
-
-def test_absent_pointer_file_means_random_init(cfg, tmp_path):
-    assert _trainer(cfg, tmp_path, tmp_path / "nope.json")._load_warm_start() is None
-
-
-def test_legacy_single_pointer_yields_ref_and_size(cfg, tmp_path):
-    p = tmp_path / "ws.json"
-    p.write_text(json.dumps({"checkpoint_id": PTR, "size": "toto2-22m"}), encoding="utf-8")
-    assert _trainer(cfg, tmp_path, p)._load_warm_start() == (PTR, "toto2-22m")
-
-
-def test_pointer_file_without_size_defaults_to_primary(cfg, tmp_path):
-    # Pointer files written before the size field existed default to the
-    # primary arch preset (what the benchmark sidecar scores).
-    p = tmp_path / "ws.json"
-    p.write_text(json.dumps({"checkpoint_id": PTR}), encoding="utf-8")
-    ref, size = _trainer(cfg, tmp_path, p)._load_warm_start()
-    assert ref == PTR and size == cfg.training.primary_size.arch_preset
-
-
-def test_member_set_rotates_by_epoch_index(cfg, tmp_path):
-    # DEC-CA-0013: a multi-member pointer file rotates deterministically —
-    # epoch N trains from members[N % len(members)].
-    p = tmp_path / "ws.json"
-    p.write_text(json.dumps({
-        "generation": 2,
-        "members": [
-            {"checkpoint_id": PTR, "size": "toto2-4m"},
-            {"checkpoint_id": PTR2, "size": "toto2-4m"},
-        ],
-        "checkpoint_id": PTR, "size": "toto2-4m",   # legacy mirror
-    }), encoding="utf-8")
-    t = _trainer(cfg, tmp_path, p)
-    assert t._load_warm_start(epoch_index=0) == (PTR, "toto2-4m")
-    assert t._load_warm_start(epoch_index=1) == (PTR2, "toto2-4m")
-    assert t._load_warm_start(epoch_index=2) == (PTR, "toto2-4m")
-    assert t._load_warm_start() == (PTR, "toto2-4m")  # no index ⇒ first member
-
-
-def test_engine_wins_over_pointer_file(cfg, tmp_path):
-    # With the promotion engine wired, it is the single source of the
-    # allocation policy — the pointer file (which the engine itself writes) is
-    # only the fallback for engine-less runs.
-    from cascade.shared.promotion import PromotedMember
-    from cascade.trainer.promotion import TrainerPromotion
-
-    eng = TrainerPromotion(reign_threshold=5, k_max=2, quality_epsilon=0.05)
-    eng.members = (PromotedMember(PTR, "toto2-4m", "r1", 1.0),
-                   PromotedMember(PTR2, "", "r2", 1.01))
-    t = TrainerRunner(cfg=cfg, base_trainer=object(), work_root=tmp_path,
-                      warm_start_path=None, promotion=eng)
-    assert t._load_warm_start(epoch_index=0) == (PTR, "toto2-4m")
-    # An empty member size falls back to the primary preset.
-    assert t._load_warm_start(epoch_index=1) == (
-        PTR2, cfg.training.primary_size.arch_preset)
-    # Random-init era: engine has no members and no file exists.
-    eng.members = ()
-    assert t._load_warm_start(epoch_index=0) is None
-
-
-def test_memberless_engine_falls_back_to_the_pointer_file(cfg, tmp_path):
-    # An engine whose state was lost while a live pointer file survives must
-    # NOT short-circuit to random init: a readable file still pins the round,
-    # and an unreadable one aborts it (the DEC-CA-0005 fail-loud contract).
-    from cascade.trainer.promotion import TrainerPromotion
-
-    eng = TrainerPromotion(reign_threshold=5, k_max=2, quality_epsilon=0.05)
-    p = tmp_path / "ws.json"
-    p.write_text(json.dumps({"checkpoint_id": PTR, "size": "toto2-4m"}), encoding="utf-8")
-    t = TrainerRunner(cfg=cfg, base_trainer=object(), work_root=tmp_path,
-                      warm_start_path=p, promotion=eng)
-    assert t._load_warm_start(epoch_index=0) == (PTR, "toto2-4m")
-    p.write_text("{not json", encoding="utf-8")
-    with pytest.raises(RuntimeError):
-        t._load_warm_start(epoch_index=0)
-
-
-def test_broken_pointer_file_raises_never_falls_back(cfg, tmp_path):
-    # DEC-CA-0005: once a promotion is live, a round must never silently train
-    # from random init — a live-but-unusable pointer aborts the round.
-    p = tmp_path / "ws.json"
-    p.write_text("{not json", encoding="utf-8")
-    with pytest.raises(RuntimeError):
-        _trainer(cfg, tmp_path, p)._load_warm_start()
-    p.write_text(json.dumps({"checkpoint_id": "not-a-pointer"}), encoding="utf-8")
-    with pytest.raises(RuntimeError):
-        _trainer(cfg, tmp_path, p)._load_warm_start()
-    p.write_text(json.dumps({"score": 0.5}), encoding="utf-8")  # no checkpoint_id
-    with pytest.raises(RuntimeError):
-        _trainer(cfg, tmp_path, p)._load_warm_start()
-    p.write_text(json.dumps({"members": [{"size": "toto2-4m"}]}), encoding="utf-8")
-    with pytest.raises(RuntimeError):
-        _trainer(cfg, tmp_path, p)._load_warm_start()
 
 
 # ── validator: the envelope gate ─────────────────────────────────────────────

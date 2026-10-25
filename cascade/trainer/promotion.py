@@ -53,7 +53,6 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ..shared.era import promotion_install_block, reign_anchor
 from ..shared.promotion import (
     PromotedMember,
     PromotionRecord,
@@ -232,10 +231,8 @@ def reign_tail(
     ``post_round_king_hotkey`` and are skipped. ``None`` when no usable row
     exists — the caller falls back to anchoring at the next boundary.
     """
-    from ..shared.hippius import receipt_index_window
-
     usable = [
-        r for r in receipt_index_window(rows)
+        r for r in rows
         if isinstance(r, dict) and r.get("status") == "scored"
         and r.get("post_round_king_hotkey")
         and int(r.get("epoch_start_block") or 0) > 0
@@ -254,6 +251,15 @@ def reign_tail(
     return king, start, [str(r.get("round_id") or "") for r in reversed(tail)]
 
 
+def _era_start_of(manifest: object) -> int:
+    """The era start a manifest's era stamp names (-1 = no stamp)."""
+    era = getattr(manifest, "era", None)
+    try:
+        return int(era["start_block"]) if isinstance(era, dict) else -1
+    except (KeyError, TypeError, ValueError):
+        return -1
+
+
 @dataclass
 class TrainerPromotion:
     """The engine: reign clock + candidate log + live member set, persisted.
@@ -266,10 +272,10 @@ class TrainerPromotion:
     :meth:`reign_threshold_at`). ``k_max``/``quality_epsilon`` mirror the fleet's
     envelope knobs (``cascade_top_k`` / ``cascade_quality_epsilon``) — the
     engine must select inside the envelope validators verify. ``pointer_path``
-    is the warm-start pointer file the training loop reads
-    (:meth:`TrainerRunner._load_warm_start`); ``state_path`` persists the
+    is the warm-start pointer file (the validators' ``[validator]
+    warm_start_init_path``); ``state_path`` persists the
     engine across restarts. ``round_cfg`` is the RoundConfig the clock divides
-    by. Thread-safe: ``record_bench`` runs on the post-publish bench thread.
+    by. Thread-safe: ``record_bench`` runs on the scheduler's bench threads.
     """
 
     reign_threshold: float
@@ -298,17 +304,18 @@ class TrainerPromotion:
     member_meta: dict[str, Candidate] = field(default_factory=dict)
     king_hotkey: str | None = None
     reign_start_block: int | None = None
-    # Block the live generation is (or will be) INSTALLED by validators — the
-    # start of its effective era (``promotion_install_block``). Validators
-    # reset the reign clock there, so the trainer's anchor never precedes it
-    # (``reign_anchor``). ``None`` = pre-era generation / unknown.
-    live_install_block: int | None = None
     candidates: tuple[Candidate, ...] = ()
     # The last fired promotion's record, held (and persisted) until the caller
     # confirms it published: state advances at fire time, so a publish failure
     # must be retried from here — losing the record would leave the fleet with
     # no way to verify the generation the pointer file already rotates over.
     pending_record: PromotionRecord | None = None
+    # DEC-CA-0050 v2: the ``[v2] from_block`` whose lineage this engine runs
+    # (0 = the original lineage). Set once by :meth:`start_lineage`.
+    lineage_block: int = 0
+    # DEC-CA-0055 v2 king-only promotion: the ``round_id`` of the last
+    # passing king check a promotion fired for — a check fires at most once.
+    last_king_check: str = ""
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     # ── lifecycle ────────────────────────────────────────────────────────────
@@ -354,8 +361,6 @@ class TrainerPromotion:
         self.king_hotkey = obj.get("king_hotkey") or None
         rsb = obj.get("reign_start_block")
         self.reign_start_block = None if rsb is None else int(rsb)
-        lib = obj.get("live_install_block")
-        self.live_install_block = None if lib is None else int(lib)
         self.candidates = tuple(
             _candidate_from_json(c) for c in (obj.get("candidates") or ())
         )
@@ -363,6 +368,8 @@ class TrainerPromotion:
             str(c["checkpoint_id"]): _candidate_from_json(c)
             for c in (obj.get("member_meta") or ())
         }
+        self.lineage_block = int(obj.get("lineage_block", 0) or 0)
+        self.last_king_check = str(obj.get("last_king_check", "") or "")
         pr = obj.get("pending_record")
         if pr:
             self.pending_record = PromotionRecord(
@@ -445,6 +452,27 @@ class TrainerPromotion:
                      "(deploy-time backfill)", king_hotkey[:12], int(reign_start_block))
             return True
 
+    def start_lineage(self, block: int) -> bool:
+        """DEC-CA-0050 v2 rollover: the Cascade-MOE-28M lineage starts from
+        random init, so nothing of the old (toto2) lineage may seed it — the
+        live members stop carrying (they are no init for the MoE), the
+        candidate log is cleared, and the next promotion selects from v2
+        rounds alone. The generation NUMBER is kept (validators require
+        ``accepted + 1``). Idempotent per ``block``; returns whether it reset."""
+        with self._lock:
+            if int(self.lineage_block) >= int(block):
+                return False
+            log.info("trainer promotion: v2 lineage from block %d — dropping %d toto2 "
+                     "member(s) and %d candidate(s); generation %d stays, the next "
+                     "promotion selects from v2 rounds only", int(block),
+                     len(self.members), len(self.candidates), self.generation)
+            self.lineage_block = int(block)
+            self.members = ()
+            self.member_meta = {}
+            self.candidates = ()
+            self._persist()
+            return True
+
     # ── per-round hooks ──────────────────────────────────────────────────────
 
     def note_round(self, king_hotkey: str | None, *, epoch_block: int) -> None:
@@ -456,21 +484,17 @@ class TrainerPromotion:
         with self._lock:
             if king_hotkey != self.king_hotkey:
                 self.king_hotkey = king_hotkey
-                # A crowning BEFORE the live generation's install is reset
-                # again by validators at the install (DEC-CA-0050 carries the
-                # staged generation across the dethrone).
-                self.reign_start_block = reign_anchor(
-                    crown_block=int(epoch_block), install_block=self.live_install_block)
+                self.reign_start_block = int(epoch_block)
                 self.candidates = ()
                 log.info("trainer promotion: reign clock reset for king %s at block %d",
-                         (king_hotkey or "?")[:12], int(self.reign_start_block))
+                         (king_hotkey or "?")[:12], int(epoch_block))
             elif self.reign_start_block is None and king_hotkey is not None:
                 self.reign_start_block = int(epoch_block)
             self._persist()
 
     def record_bench(self, manifest: object, report: object) -> int:
         """Log a round's benched duel checkpoints as promotion candidates.
-        Called from the post-publish bench thread with the round's manifest and
+        Called when a settlement's bench report publishes, with the manifest and
         its published bench report. Admissible only when the round trained from
         the CURRENT generation (its ``warm_start_ckpt`` is a live member, or
         random init in the random-init era) — a late report from a previous
@@ -478,8 +502,16 @@ class TrainerPromotion:
         candidates were added."""
         ws = str(getattr(manifest, "warm_start_ckpt", "") or "")
         with self._lock:
+            if self.lineage_block and _era_start_of(manifest) < int(self.lineage_block):
+                log.info("trainer promotion: round=%s trained before the v2 lineage "
+                         "(block %d); its bench contributes no candidates",
+                         getattr(manifest, "round_id", "?"), self.lineage_block)
+                return 0
             live = {m.checkpoint_id for m in self.members}
-            if ws not in live and not (ws == "" and self.generation == 0):
+            # random init is the live lineage's init in the random-init era
+            # AND after a v2 lineage reset (no members until its first fire)
+            if ws not in live and not (ws == "" and (self.generation == 0 or (
+                    self.lineage_block and not self.members))):
                 log.info("trainer promotion: round=%s trained from %r (not the live "
                          "generation); its bench contributes no candidates",
                          getattr(manifest, "round_id", "?"), ws or "<random init>")
@@ -488,6 +520,8 @@ class TrainerPromotion:
             known = {c.checkpoint_id for c in self.candidates}
             added = 0
             for e in getattr(report, "entries", ()):
+                if e.role == "init":
+                    continue          # DEC-CA-0055: the init's own bench, never a candidate
                 if e.trained_pointer in known:
                     continue
                 s = e.scores
@@ -510,7 +544,8 @@ class TrainerPromotion:
             return added
 
     def maybe_promote(self, *, epoch_block: int, round_id: str,
-                      effective_era: int = 0, rolling_topk: bool = True) -> PromotionRecord | None:
+                      effective_era: int = 0, rolling_topk: bool = True,
+                      clock_floor_block: int = 0) -> PromotionRecord | None:
         """Fire a promotion when the reign clock is ripe and the reign has
         candidates: select the member set, advance the generation, reset the
         clock (the king persists — DEC-CA-0004), clear the candidate log, and
@@ -525,6 +560,10 @@ class TrainerPromotion:
         signed record so validators install it at that era and no earlier.
         0 = pre-era record (effective at acceptance).
 
+        ``clock_floor_block`` (``cascade.shared.era.v2_reign_floor_block``):
+        the reign clock counts from no earlier than this block — the v2
+        random-init window does not count towards ripeness.
+
         ``rolling_topk`` (DEC-CA-0044) is CONSENSUS-GATED by the caller on
         ``era_king_from_block``: before the rollover the live members do not
         carry into the next generation and the old best-vs-best no-downgrade
@@ -535,7 +574,8 @@ class TrainerPromotion:
             if self.king_hotkey is None or self.reign_start_block is None:
                 return None
             clock = _ClockState(king_hotkey=self.king_hotkey,
-                                reign_start_block=self.reign_start_block)
+                                reign_start_block=max(int(self.reign_start_block),
+                                                      int(clock_floor_block)))
             elapsed = reign_rounds(clock, int(epoch_block), self.round_cfg)
             threshold = self.reign_threshold_at(int(epoch_block))
             if elapsed is None or elapsed < threshold:
@@ -589,6 +629,65 @@ class TrainerPromotion:
             return self._fire(selected, epoch_block=epoch_block, round_id=round_id,
                               effective_era=effective_era, elapsed=elapsed)
 
+    def note_king_check(self, check_round: str, block: int) -> bool:
+        """A judged (FAILED) v2 king check restarts the reign clock at its
+        settlement boundary, as the validators' does. Once per check; returns
+        whether it applied."""
+        with self._lock:
+            if not check_round or str(check_round) == self.last_king_check:
+                return False
+            self.last_king_check = str(check_round)
+            self.reign_start_block = int(block)
+            self._persist()
+            return True
+
+    def promote_king(self, *, check_round: str, king_pointer: str, size: str,
+                     score: float, epoch_block: int, round_id: str,
+                     effective_era: int) -> PromotionRecord | None:
+        """DEC-CA-0055 v2 king-only promotion: the validators' signed receipt
+        trail passed the king check of settlement ``check_round`` (king − init
+        increment LCB clears the margin, all six bench means improve, no
+        dethrone in the window) — install the king's checkpoint as the ONLY
+        member of the next generation. No challenger candidates, no rolling
+        top-k. Fires at most once per check (``last_king_check``); the reign
+        clock restarts (the king persists, DEC-CA-0004). ``epoch_block`` is the
+        check's settlement boundary (the block ripeness was judged at)."""
+        with self._lock:
+            if not check_round or not king_pointer:
+                return None
+            if str(check_round) == self.last_king_check:
+                return None
+            if any(m.checkpoint_id == king_pointer for m in self.members):
+                log.warning("trainer promotion: king check %s passed for %s, which is "
+                            "already the live generation's member — not re-fired",
+                            check_round, king_pointer)
+                self.last_king_check = str(check_round)
+                self._persist()
+                return None
+            # what retract_fire restores when the record cannot be published
+            # at this boundary (in memory only: a restart keeps the fired
+            # record pending and retries the publish — the DEC-CA-0055 notice
+            # rule then decides whether it is still timely)
+            self._fire_undo = {
+                "generation": self.generation, "members": self.members,
+                "member_meta": dict(self.member_meta), "candidates": self.candidates,
+                "reign_start_block": self.reign_start_block,
+                "last_king_check": self.last_king_check,
+                "pointer": self._pointer_text()}
+            self.last_king_check = str(check_round)
+            sel = Candidate(checkpoint_id=str(king_pointer), size=str(size),
+                            hotkey=self.king_hotkey or "", role="king",
+                            round_id=str(check_round),
+                            epoch_index=self._epoch_index(int(epoch_block)),
+                            score=float(score))
+            self.members = ()            # k = 1: nothing carries in the v2 lineage
+            record = self._fire([sel], epoch_block=epoch_block, round_id=round_id,
+                                effective_era=effective_era, elapsed=float("nan"))
+            log.info("trainer promotion: v2 king check %s passed — generation %d is the "
+                     "king's checkpoint alone, effective era %d", check_round,
+                     record.generation, int(effective_era))
+            return record
+
     def _select_legacy(self, elapsed: float) -> list[Candidate] | None:
         """Pre-rollover selection, byte-for-byte the previous release: the
         best candidate must at least match the live generation's best member
@@ -630,16 +729,7 @@ class TrainerPromotion:
         )
         self.member_meta = {c.checkpoint_id: c for c in selected}
         self.candidates = ()
-        # Validators reset the clock where they INSTALL this generation (its
-        # effective era's start), not at this fire — anchoring here would
-        # ripen the next generation a full notice era early and every
-        # attesting validator would ignore it (2026-10-17 gen-15 split).
-        install = (promotion_install_block(self.round_cfg, int(effective_era or 0),
-                                           fired_block=int(epoch_block))
-                   if self.round_cfg is not None else None)
-        self.live_install_block = install
-        self.reign_start_block = reign_anchor(crown_block=int(epoch_block),
-                                              install_block=install)
+        self.reign_start_block = int(epoch_block)
         record = PromotionRecord(
             generation=self.generation,
             king_hotkey=self.king_hotkey or "",
@@ -653,38 +743,12 @@ class TrainerPromotion:
         self._write_pointer()
         log.info(
             "PROMOTION fired: generation=%d reign=%.2f rounds members=[%s]; "
-            "king %s persists, reign clock reset to block %d (validator install)",
+            "king %s persists, reign clock reset",
             self.generation, elapsed,
             ", ".join(f"{m.checkpoint_id} ({m.score:.5f})" for m in self.members),
-            (self.king_hotkey or "?")[:12], int(self.reign_start_block),
+            (self.king_hotkey or "?")[:12],
         )
         return record
-
-    def withdraw_to(self, prev_record: PromotionRecord, *, reign_start_block: int,
-                    install_block: int | None = None) -> None:
-        """Owner-run recovery (trainer STOPPED): undo a fired-but-rejected
-        generation and return the engine to ``prev_record``'s generation, its
-        members, a cleared candidate log (the boundary replay re-ingests the
-        reign's bench reports), no pending record, and the reign clock at
-        ``reign_start_block`` — the anchor the VALIDATORS hold (their
-        ``cascade_state.json``), so the next fire is judged ripe on their
-        clock. Carried members' selection metadata is kept."""
-        with self._lock:
-            if int(prev_record.generation) != self.generation - 1:
-                raise ValueError(
-                    f"withdraw_to gen {prev_record.generation} from engine gen "
-                    f"{self.generation}: not the previous generation")
-            ids = {m.checkpoint_id for m in prev_record.members}
-            self.generation = int(prev_record.generation)
-            self.members = tuple(prev_record.members)
-            self.member_meta = {k: v for k, v in self.member_meta.items() if k in ids}
-            self.candidates = ()
-            self.pending_record = None
-            self.reign_start_block = int(reign_start_block)
-            self.live_install_block = (int(install_block) if install_block is not None
-                                       else int(reign_start_block))
-            self._persist()
-            self._write_pointer()
 
     def _member_candidate(self, m: PromotedMember) -> Candidate:
         """The live member as a selection candidate: its recorded selection
@@ -717,6 +781,64 @@ class TrainerPromotion:
                         "structural fallback", self.error_vectors_path, e)
             return None
 
+    def retract_fire(self, record: PromotionRecord) -> bool:
+        """Un-fire ``record`` (the v2 king-only promotion :meth:`promote_king`
+        fired at THIS boundary) because its record could not be published:
+        the engine returns to the state before the fire — generation,
+        members, candidate log, reign clock, ``last_king_check`` and the
+        pointer file — so the check is re-read at the next boundary and fires
+        again with that boundary's head as its fire block, or is refused there
+        as too late for its era (``_v2_king_check_step``). A record published
+        only at a later settlement would carry its notice late, and a late
+        notice is a dead generation for every node (the DEC-CA-0055 rule);
+        not firing is the cheaper outcome. Only the record of the fire this
+        process made can be retracted (``False`` otherwise: a restart retries
+        the publish instead)."""
+        with self._lock:
+            undo = self.__dict__.get("_fire_undo")
+            if (undo is None or self.pending_record is None
+                    or self.pending_record.canonical_body() != record.canonical_body()
+                    or int(undo["generation"]) + 1 != int(self.generation)):
+                return False
+            self.__dict__["_fire_undo"] = None
+            self.generation = int(undo["generation"])
+            self.members = tuple(undo["members"])
+            self.member_meta = dict(undo["member_meta"])
+            self.candidates = tuple(undo["candidates"])
+            self.reign_start_block = undo["reign_start_block"]
+            self.last_king_check = str(undo["last_king_check"])
+            self.pending_record = None
+            self._persist()
+            self._restore_pointer(undo["pointer"])
+            log.warning("trainer promotion: generation %d RETRACTED (record unpublished at "
+                        "its fire boundary); the check is re-read at the next boundary",
+                        int(record.generation))
+            return True
+
+    def _pointer_text(self) -> str | None:
+        """The pointer file's bytes (None when absent / no path)."""
+        if self.pointer_path is None or not self.pointer_path.is_file():
+            return None
+        try:
+            return self.pointer_path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+
+    def _restore_pointer(self, text: str | None) -> None:
+        """Put the pointer file back as it was before a retracted fire."""
+        if self.pointer_path is None:
+            return
+        try:
+            if text is None:
+                self.pointer_path.unlink(missing_ok=True)
+                return
+            tmp = self.pointer_path.with_suffix(self.pointer_path.suffix + ".tmp")
+            tmp.write_text(text, encoding="utf-8")
+            tmp.replace(self.pointer_path)
+        except Exception as e:  # noqa: BLE001
+            log.warning("trainer promotion: failed to restore pointer file %s: %s",
+                        self.pointer_path, e)
+
     def unpublished_record(self) -> PromotionRecord | None:
         """The fired-but-unpublished promotion record, or ``None``. The caller
         publishes it (signed) and confirms with :meth:`mark_record_published`;
@@ -728,17 +850,6 @@ class TrainerPromotion:
         with self._lock:
             self.pending_record = None
             self._persist()
-
-    def init_for_epoch(self, epoch_index: int) -> tuple[str, str] | None:
-        """The member this epoch's round trains from — deterministic rotation
-        (v1 allocation policy; validators accept any live member, so this can
-        become adaptive without touching consensus). ``None`` in the
-        random-init era."""
-        with self._lock:
-            if not self.members:
-                return None
-            m = self.members[int(epoch_index) % len(self.members)]
-            return m.checkpoint_id, m.size
 
     # ── persistence ──────────────────────────────────────────────────────────
 
@@ -757,9 +868,10 @@ class TrainerPromotion:
             "members": [member_to_json(m) for m in self.members],
             "king_hotkey": self.king_hotkey,
             "reign_start_block": self.reign_start_block,
-            "live_install_block": self.live_install_block,
             "candidates": [_candidate_to_json(c) for c in self.candidates],
             "member_meta": [_candidate_to_json(c) for c in self.member_meta.values()],
+            **({"lineage_block": int(self.lineage_block)} if self.lineage_block else {}),
+            **({"last_king_check": self.last_king_check} if self.last_king_check else {}),
             "pending_record": None if self.pending_record is None else {
                 "generation": self.pending_record.generation,
                 "king_hotkey": self.pending_record.king_hotkey,

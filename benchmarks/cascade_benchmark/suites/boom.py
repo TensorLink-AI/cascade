@@ -24,12 +24,21 @@ from __future__ import annotations
 
 import logging
 import os
-import traceback
+import sys
 
 from ..aggregate import official_aggregate
 from ..resources import load_json
 from ..results import SuiteResult
-from ._common import build_dataset_or_reason, describe_exception, score_dataset
+from ._common import (
+    SuitePlan,
+    abort,
+    abort_from_exc,
+    build_dataset_or_reason,
+    describe_exception,
+    run_sequential,
+    score_dataset,
+    until_abort,
+)
 
 log = logging.getLogger("cascade_benchmark.boom")
 
@@ -55,6 +64,85 @@ def _baseline_items(max_tasks: int | None):
             return
 
 
+def plan(*, max_series: int | None = None):
+    """The BOOM config list (one unit per official baseline key) — or the
+    suite's final ``SuiteResult`` when it cannot run at all."""
+    boom_path = os.environ.get("CASCADE_BENCH_BOOM_PATH") or os.environ.get("BOOM")
+    if not boom_path:
+        return SuiteResult(
+            suite="boom",
+            status="skipped",
+            detail="BOOM (or CASCADE_BENCH_BOOM_PATH) not set; point it at the BOOM data dir.",
+        )
+    # set before any worker starts: the scheduler snapshots os.environ after planning
+    os.environ.setdefault("BOOM", boom_path)
+    try:
+        baseline = load_json("boom_seasonal_naive.json")
+        low_variance = frozenset(load_json("boom_low_variance.json"))
+        units = list(_baseline_items(max_series))
+    except Exception as e:  # noqa: BLE001
+        return SuiteResult(suite="boom", **_abort_of(e)["abort"])
+    return SuitePlan(suite="boom", units=units,
+                     local={"baseline": baseline, "low_variance": low_variance})
+
+
+def _abort_of(e: BaseException) -> dict:
+    """The old suite-level ``except`` ladder (call inside the handler)."""
+    if isinstance(e, FileNotFoundError):
+        return abort("skipped", f"BOOM data file missing: {e}")
+    return abort_from_exc(e, import_detail="gift-eval not importable")
+
+
+def run_unit(ctx: dict, unit, checkpoints: list[str], *, num_samples: int = 100,
+             device: str = "cpu", batch_size: int = 64) -> list[dict]:
+    """Build one BOOM config's dataset ONCE and score it with every checkpoint."""
+    full, name, term = unit
+    try:
+        ds, reason = build_dataset_or_reason(name, term, storage_env_var="BOOM")
+    except Exception as e:  # noqa: BLE001 — gift-eval missing ends the suite
+        return [_abort_of(e)] * len(checkpoints)
+    if ds is None:
+        log.warning("boom: %s not loaded: %s", full, reason)
+        return [{"skip": {"full": full, "stage": "load", "reason": reason}}] * len(checkpoints)
+    out: list[dict] = []
+    for ckpt in checkpoints:
+        try:
+            m = score_dataset(
+                ds, ckpt, num_samples=num_samples, device=device, batch_size=batch_size,
+            )
+        except Exception as e:  # noqa: BLE001 — one config must not abort the sweep
+            reason = describe_exception(e)
+            log.warning("boom: %s not scored: %s", full, reason)
+            out.append({"skip": {"full": full, "stage": "score", "reason": reason}})
+            continue
+        out.append({"row": {"full": full, **m}})
+    return out
+
+
+def assemble(plan: SuitePlan, outcomes: list[dict]) -> SuiteResult:
+    done, aborted = until_abort(outcomes)
+    if aborted is not None:
+        return SuiteResult(suite="boom", **aborted)
+    try:
+        rows = [o["row"] for o in done if "row" in o]
+        skipped = [o["skip"] for o in done if "skip" in o]
+        n_expected = len(plan.units)
+        if not rows:
+            return SuiteResult(suite="boom", status="error", detail="no BOOM configs scored",
+                               skipped=skipped, n_expected=n_expected)
+        agg = official_aggregate(rows, plan.local["baseline"],
+                                 low_variance=plan.local["low_variance"])
+        metrics = {k: agg[k] for k in ("crps", "mase", "crps_zero", "mae_zero") if k in agg}
+        detail = ""
+        if skipped:
+            detail = f"partial: {len(skipped)} of {n_expected} configs skipped"
+            log.warning("boom: %s", detail)
+        return SuiteResult(suite="boom", status="ok", metrics=metrics, n_series=agg["n_scored"], rows=rows,
+                           detail=detail, skipped=skipped, n_expected=n_expected)
+    except Exception as e:  # noqa: BLE001
+        return SuiteResult(suite="boom", **_abort_of(e)["abort"])
+
+
 def run(
     checkpoint_dir: str,
     *,
@@ -63,56 +151,6 @@ def run(
     device: str = "cpu",
     batch_size: int = 64,
 ) -> SuiteResult:
-    boom_path = os.environ.get("CASCADE_BENCH_BOOM_PATH") or os.environ.get("BOOM")
-    if not boom_path:
-        return SuiteResult(
-            suite="boom",
-            status="skipped",
-            detail="BOOM (or CASCADE_BENCH_BOOM_PATH) not set; point it at the BOOM data dir.",
-        )
-    os.environ.setdefault("BOOM", boom_path)
-    try:
-        baseline = load_json("boom_seasonal_naive.json")
-        low_variance = frozenset(load_json("boom_low_variance.json"))
-        rows = []
-        skipped: list[dict] = []
-        items = list(_baseline_items(max_series))
-        for full, name, term in items:
-            ds, reason = build_dataset_or_reason(name, term, storage_env_var="BOOM")
-            if ds is None:
-                log.warning("boom: %s not loaded: %s", full, reason)
-                skipped.append({"full": full, "stage": "load", "reason": reason})
-                continue
-            try:
-                m = score_dataset(
-                    ds, checkpoint_dir,
-                    num_samples=num_samples, device=device, batch_size=batch_size,
-                )
-            except Exception as e:  # noqa: BLE001 — one config must not abort the sweep
-                reason = describe_exception(e)
-                log.warning("boom: %s not scored: %s", full, reason)
-                skipped.append({"full": full, "stage": "score", "reason": reason})
-                continue
-            rows.append({"full": full, **m})
-
-        if not rows:
-            return SuiteResult(suite="boom", status="error", detail="no BOOM configs scored",
-                               skipped=skipped, n_expected=len(items))
-        agg = official_aggregate(rows, baseline, low_variance=low_variance)
-        metrics = {k: agg[k] for k in ("crps", "mase", "crps_zero", "mae_zero") if k in agg}
-        detail = ""
-        if skipped:
-            detail = f"partial: {len(skipped)} of {len(items)} configs skipped"
-            log.warning("boom: %s", detail)
-        return SuiteResult(suite="boom", status="ok", metrics=metrics, n_series=agg["n_scored"], rows=rows,
-                           detail=detail, skipped=skipped, n_expected=len(items))
-    except FileNotFoundError as e:
-        return SuiteResult(suite="boom", status="skipped", detail=f"BOOM data file missing: {e}")
-    except ImportError as e:
-        return SuiteResult(suite="boom", status="skipped", detail=f"gift-eval not importable: {e}")
-    except Exception as e:  # noqa: BLE001
-        return SuiteResult(
-            suite="boom",
-            status="error",
-            detail=f"{type(e).__name__}: {e}\n{traceback.format_exc(limit=3)}",
-        )
+    """The whole suite for one checkpoint, in this process."""
+    return run_sequential(sys.modules[__name__], [checkpoint_dir], num_samples=num_samples,
+                          max_series=max_series, device=device, batch_size=batch_size)[0]

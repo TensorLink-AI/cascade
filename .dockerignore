@@ -27,6 +27,7 @@ _vpool_cache/
 _eval_pool/
 _train_work/
 _eval_ckpts/
+_audit_work/
 _bench_ckpts/
 _funded_harvest/
 _funded_ckpt_guard/

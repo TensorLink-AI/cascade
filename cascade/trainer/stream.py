@@ -12,8 +12,15 @@ the mode:
   generator under the sandbox's GPU profile (relaxed address-space rlimit + CUDA
   env passthrough). High throughput; audit is tolerance/same-hardware, so its
   rolling digest reproduces only on equivalent hardware.
+* ``shards`` — read a corpus the CPU generation tier (DEC-CA-0053) already
+  materialised into digest-pinned parquet shards
+  (:mod:`cascade.generation.shards`). No sandbox and no miner code run here;
+  each shard is sha256-verified before its first series is read, and the
+  rolling digest uses the same framing as the fresh streams, over the stored
+  (float32-widened) values. ``corpus_epochs`` > 0 cycles the corpus at most
+  that many times; 0 stops at the end of one pass.
 
-Both stop at ``token_budget`` points. :func:`open_round_stream` is a context
+All modes stop at ``token_budget`` points. :func:`open_round_stream` is a context
 manager; after the trainer drains ``series()``, read ``digest`` / ``n_series`` /
 ``total_points`` for the manifest. The two modes use different but
 internally-reproducible digest schemes — ``corpus_mode`` is in
@@ -22,8 +29,12 @@ internally-reproducible digest schemes — ``corpus_mode`` is in
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import itertools
+import math
+import queue
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -90,11 +101,6 @@ def element_points(arr: np.ndarray | dict, denomination: str = "points") -> int:
         # points (ceil, exact integers) — the width bonus under token billing.
         return -(-size * 100 // (100 + pct))
     return size
-
-
-def _element_points(arr: np.ndarray | dict) -> int:
-    """Legacy alias: the ``"points"`` rule."""
-    return element_points(arr, "points")
 
 
 def _inprocess_stream(
@@ -229,8 +235,15 @@ class _FreshSeriesStream(RoundStream):
         return _inprocess_stream(self._repo, self._seed, self._cfg, self._budget)
 
     def series(self) -> Iterator[np.ndarray]:
+        from ..interface.generator import SeriesValidator
+
+        validator = SeriesValidator.from_config(self._cfg)
         total = 0
-        for arr in self._raw_source():
+        for index, arr in enumerate(self._raw_source()):
+            try:
+                arr = validator.process(arr, index)
+            except ValueError as e:
+                raise CorpusError(f"generator_output_rejected: {e}") from e
             yield arr
             self._dig.update(arr)
             self._n += 1
@@ -265,6 +278,167 @@ class _FreshSeriesStream(RoundStream):
         return self._points
 
 
+# Where a ``shards`` leg's materialised corpus sits on the pod when the caller
+# passes no ``corpus_dir`` (the worker sets it from ``--corpus-dir``).
+CORPUS_DIR_ENV = "CASCADE_CORPUS_DIR"
+
+
+class _ShardStream(RoundStream):
+    """Read a materialised corpus (DEC-CA-0053) under the token budget.
+
+    Series come from :func:`cascade.generation.shards.iter_corpus` in its
+    training order; the stream stops at ``token_budget`` points under the
+    contract's denomination, exactly like the fresh streams, and digests the
+    consumed prefix with the same :class:`_StreamDigest` framing. With
+    ``epochs`` > 0 the corpus is re-read from the start at most ``epochs``
+    times in total; with 0 it is read once.
+    """
+
+    def __init__(self, corpus_dir: Path | str, token_budget: int, *,
+                 budget_denomination: str = "points", epochs: int = 0, eager_accounting=False,
+                 channel_bounds: tuple[int, int] | None = None) -> None:
+        from ..generation.shards import read_index, verify_shards
+
+        # A missing or corrupt shard is an infrastructure fault (the tier or
+        # the transfer), never the miner's: ShardError is deliberately NOT a
+        # CorpusError, so the worker exits as infra and the leg requeues.
+        self._dir = Path(corpus_dir)
+        verify_shards(self._dir, read_index(self._dir))
+        self._budget = int(token_budget)
+        self._denom = budget_denomination
+        self._passes = max(1, int(epochs or 0))
+        self._eager_accounting = eager_accounting
+        self._channel_bounds = channel_bounds
+        self._dig = _StreamDigest()
+        self._n = 0
+        self._points = 0
+
+    def series(self) -> Iterator[np.ndarray]:
+        from ..generation.shards import iter_corpus
+
+        total = 0
+        for _ in range(self._passes):
+            # shards were verified at open; a re-read pass skips the re-hash
+            for arr in iter_corpus(self._dir, verify=False):
+                if self._channel_bounds is not None:
+                    from ..generation.shards import ShardError
+
+                    lower, upper = self._channel_bounds
+                    if not lower <= arr.shape[0] <= upper:
+                        raise ShardError(f"shard series has {arr.shape[0]} channels outside [{lower}, {upper}]")
+                if self._eager_accounting:
+                    self._dig.update(arr)
+                    self._n += 1
+                    total += element_points(arr, self._denom)
+                    self._points = total
+                yield arr
+                if not self._eager_accounting:
+                    self._dig.update(arr)
+                    self._n += 1
+                    total += element_points(arr, self._denom)
+                    self._points = total
+                if total >= self._budget:
+                    return
+
+    @property
+    def digest(self) -> str:
+        return self._dig.hexdigest()
+
+    @property
+    def n_series(self) -> int:
+        return self._n
+
+    @property
+    def total_points(self) -> int:
+        return self._points
+
+
+# Read-ahead per seed-mix child (DEC-CA-0050 generation surface). Each child
+# is its own sandboxed generator process, but the round-robin reader only
+# drains one series per child per turn, so a child otherwise idles once its
+# OS pipe (~2 series) fills. A bounded queue filled by a thread keeps every
+# child generating concurrently. CONSUMPTION ORDER IS UNCHANGED — the
+# interleave still takes one series per child per turn — so the rolling
+# corpus digest is byte-identical with or without read-ahead.
+PREFETCH_SERIES = 64
+_END = object()
+
+
+class _Prefetch:
+    """Iterate ``it`` on a daemon thread into a bounded queue; re-raises the
+    producer's exception at the consumer, in order.
+
+    Every producer ``put`` (items, the end marker AND a raised exception) is
+    stop-aware: once the consumer is gone (the leg hit its wall and
+    ``close()`` ran) the thread gives up instead of blocking forever on a full
+    queue. :meth:`stop` also drains the queue so a blocked put frees at once,
+    and :meth:`join` lets the owner wait for the thread to leave the child
+    iterator before the child is closed (never two threads in one child)."""
+
+    _PUT_TIMEOUT = 0.1
+
+    def __init__(self, it: Iterator, maxsize: int = PREFETCH_SERIES) -> None:
+        self._q: queue.Queue = queue.Queue(maxsize=max(1, maxsize))
+        self._stop = threading.Event()
+        self._t = threading.Thread(target=self._run, args=(it,), daemon=True)
+        self._t.start()
+
+    def _put(self, item) -> bool:
+        """Put ``item`` unless stopped first; False ⇒ the consumer is gone."""
+        while not self._stop.is_set():
+            try:
+                self._q.put(item, timeout=self._PUT_TIMEOUT)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _run(self, it: Iterator) -> None:
+        try:
+            for item in it:
+                if not self._put(item) or self._stop.is_set():
+                    return
+            self._put(_END)
+        except BaseException as e:  # noqa: BLE001 - surfaced to the consumer
+            if not self._stop.is_set():
+                self._put(e)
+
+    def __iter__(self) -> _Prefetch:
+        return self
+
+    def __next__(self):
+        item = self._q.get()
+        if item is _END:
+            raise StopIteration
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    def stop(self) -> None:
+        """Signal the producer and drain the queue (unblocks a pending put)."""
+        self._stop.set()
+        while True:
+            try:
+                self._q.get_nowait()
+            except queue.Empty:
+                break
+
+    def join(self, timeout: float | None = None) -> bool:
+        """Wait for the producer thread; True once it has exited."""
+        self._t.join(timeout)
+        return not self._t.is_alive()
+
+    @property
+    def alive(self) -> bool:
+        return self._t.is_alive()
+
+
+# How long close() waits for a prefetch thread to leave its child iterator
+# before closing the child under it (a producer blocked INSIDE a slow
+# generator read only returns once the child process is killed).
+PREFETCH_JOIN_SECONDS = 2.0
+
+
 class _SeedMixStream(RoundStream):
     """Interleave N single-seed streams (``gen_seed_mix``, DEC-CA-0033).
 
@@ -285,7 +459,8 @@ class _SeedMixStream(RoundStream):
         self._points = 0
 
     def series(self) -> Iterator[np.ndarray]:
-        iters = [c.series() for c in self._children]
+        self._prefetch = [_Prefetch(c.series()) for c in self._children]
+        iters = list(self._prefetch)
         while iters:
             live = []
             for it in iters:
@@ -301,12 +476,25 @@ class _SeedMixStream(RoundStream):
             iters = live
 
     def close(self) -> None:
+        prefetch = list(getattr(self, "_prefetch", ()))
+        for pf in prefetch:
+            pf.stop()
+        # Let each producer leave its child iterator BEFORE the child is
+        # closed, so a child is never driven by two threads at once. A
+        # producer still blocked inside a slow generator read after the grace
+        # only returns once its child process is killed below.
+        for pf in prefetch:
+            pf.join(PREFETCH_JOIN_SECONDS)
         first_err: Exception | None = None
         for c in self._children:
             try:
                 c.close()
             except Exception as e:  # noqa: BLE001 - close every child first
                 first_err = first_err or e
+        for pf in prefetch:
+            if pf.alive:
+                pf.stop()                 # drain anything put after the first drain
+                pf.join(PREFETCH_JOIN_SECONDS)
         if first_err is not None:
             raise first_err
 
@@ -336,8 +524,16 @@ def open_round_stream(
     max_wall_seconds: int | None = None,
     seed_mix: int = 1,
     budget_denomination: str = "points",
+    corpus_epochs: int = 0,
+    corpus_dir: Path | str | None = None,
+    continuation_protocol: str = "",
 ) -> RoundStream:
     """Open the round's corpus stream for ``mode`` (see module docstring).
+
+    ``corpus_dir`` (``shards`` only) is the materialised corpus directory;
+    omitted ⇒ ``$CASCADE_CORPUS_DIR``. A ``shards`` stream never runs the
+    generator, so ``repo_dir``/``seed_mix`` are ignored there. ``cfg`` still
+    checks channel bounds; the tier already fanned generation over its children.
 
     ``budget_denomination`` ([training] budget_denomination, DEC-CA-0042) is
     what one point of ``token_budget`` is at C > 1 — see
@@ -361,20 +557,65 @@ def open_round_stream(
     n_mix = 1 if seed_mix is None else int(seed_mix)
     if n_mix < 1:
         raise CorpusError(f"seed_mix must be >= 1; got {seed_mix}")
+    epochs = int(corpus_epochs or 0)
+    if epochs < 0:
+        raise CorpusError(f"corpus_epochs must be >= 0; got {corpus_epochs}")
+    if mode == "shards":
+        import os
+
+        where = corpus_dir if corpus_dir is not None else os.environ.get(CORPUS_DIR_ENV, "")
+        if not where:
+            # operator misconfiguration, not a miner fault (not CorpusError)
+            raise ValueError(
+                f"corpus_mode='shards' needs a corpus_dir (or ${CORPUS_DIR_ENV})")
+        return _ShardStream(where, token_budget,
+                            budget_denomination=budget_denomination, epochs=epochs,
+                            eager_accounting=continuation_protocol == "cascade-continuation/1",
+                            channel_bounds=(cfg.min_channels, cfg.max_channels) if cfg is not None else None)
+    if epochs and mode != "cache_reuse":
+        raise CorpusError("corpus_epochs requires corpus_mode='cache_reuse' or 'shards'")
     if n_mix > 1:
+        from concurrent.futures import ThreadPoolExecutor
+
         from .contract import _mix
 
         share = int(token_budget) // n_mix
         budgets = [int(token_budget) - share * (n_mix - 1)] + [share] * (n_mix - 1)
-        return _SeedMixStream([
-            open_round_stream(
+
+        def _child(i: int, b: int) -> RoundStream:
+            return open_round_stream(
                 mode, repo_dir, _mix(generation_seed, "seed-mix", i), cfg,
                 token_budget=b, use_sandbox=use_sandbox, blocked=tuple(blocked),
                 allow_netns=allow_netns, max_wall_seconds=max_wall_seconds,
-                budget_denomination=budget_denomination,
+                budget_denomination=budget_denomination, corpus_epochs=epochs,
             )
-            for i, b in enumerate(budgets)
-        ], budget_denomination=budget_denomination)
+
+        # cache_reuse children materialise their corpus in the constructor:
+        # build them CONCURRENTLY (each is its own sandboxed process), in a
+        # fixed list order, so a prefill costs one child's wall, not N.
+        with ThreadPoolExecutor(max_workers=n_mix) as ex:
+            futs = [ex.submit(_child, i, b) for i, b in enumerate(budgets)]
+        children, first_err = [], None
+        for f in futs:
+            try:
+                children.append(f.result())
+            except Exception as e:  # noqa: BLE001 - re-raised after cleanup
+                first_err = first_err or e
+        if first_err is not None:
+            # one child failed to build: never leak its siblings' processes
+            for c in children:
+                with contextlib.suppress(Exception):   # the build error wins
+                    c.close()
+            raise first_err
+        return _SeedMixStream(children, budget_denomination=budget_denomination)
+    if epochs:
+        # DEC-CA-0050 generation surface: the unique corpus is exactly
+        # budget / epochs points — materialised before step 0 (the clock
+        # starts at the first batch), then cycled at most `epochs` times.
+        import dataclasses
+
+        cfg = dataclasses.replace(
+            cfg, corpus_target_points=int(math.ceil(int(token_budget) / epochs)))
     if mode == "cache_reuse":
         return _CacheReuseStream(
             repo_dir, generation_seed, cfg, token_budget,

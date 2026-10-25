@@ -28,7 +28,6 @@ from cascade.shared.config import (
     load_chain_config,
     margin_v2_active,
 )
-from tests.unpinned import load_unpinned, strip_pins
 
 REPO = Path(__file__).resolve().parents[2]
 PRIMARY = "rolling-era-king"
@@ -39,11 +38,12 @@ K, S = "KINGKINGKINGKING", "SUCCESSORSUCCESSOR"
 @pytest.fixture
 def cfg():
     """The shipped chain.toml (it carries the v2 bar, decided on chain) with
-    the DEC-CA-0048 forfeiture disarmed, so each test arms what it needs (the
-    DEC-CA-0050 promotion-carry segment too: no Cascade promotion ⇒ no segment)."""
-    c = load_unpinned(REPO / "chain.toml")
+    the DEC-CA-0048 forfeiture and the DEC-CA-0055 pre-launch burn disarmed,
+    so each test arms what it needs."""
+    c = load_chain_config(REPO / "chain.toml")
     return replace(c, scoring=replace(c.scoring, forfeit_hotkeys=(), forfeit_from_block=0,
-                                      forfeit_successor_hotkey="", cascade_enabled=False))
+                                      forfeit_successor_hotkey=""),
+                   v2=replace(c.v2, prelaunch_burn=0.0))
 
 
 def _typed(cfg):
@@ -96,12 +96,12 @@ class FakeChain:
 # ── config ─────────────────────────────────────────────────────────
 
 def test_shipped_values_parse_and_round_trip(tmp_path):
-    c = load_unpinned(DEFAULT_CHAIN_TOML)
+    c = load_chain_config(DEFAULT_CHAIN_TOML)
     assert (c.scoring.win_margin_start_v2, c.scoring.win_margin_end_v2,
             c.scoring.margin_warmup_blocks_v2, c.scoring.margin_v2_from_block) == (0.4, 0.2, 18000, 0)
     # absent keys ⇒ off, bit-identical
     bare = re.sub(r"^(win_margin_start_v2|win_margin_end_v2|margin_warmup_blocks_v2|"
-                  r"margin_v2_from_block)\s*=.*$", "", strip_pins(DEFAULT_CHAIN_TOML.read_text()), flags=re.M)
+                  r"margin_v2_from_block)\s*=.*$", "", DEFAULT_CHAIN_TOML.read_text(), flags=re.M)
     p = tmp_path / "chain.toml"
     p.write_text(bare)
     off = load_chain_config(p).scoring
@@ -138,7 +138,7 @@ def test_load_check_accepts_the_valid_shapes():
 def test_load_refuses_a_floorless_bar_in_chain_toml(tmp_path):
     p = tmp_path / "chain.toml"
     p.write_text(re.sub(r"^win_margin_end_v2\s*=.*$", "win_margin_end_v2 = 0.0",
-                        strip_pins(DEFAULT_CHAIN_TOML.read_text()), flags=re.M))
+                        DEFAULT_CHAIN_TOML.read_text(), flags=re.M))
     with pytest.raises(ValueError, match="all be set"):
         load_chain_config(p)
 

@@ -40,7 +40,6 @@ from .bootstrap import _seed_to_int
 # Each GIFT-Eval config's ratio row must carry these keys (produced by the
 # sidecar's ``gift-eval`` suite, keyed by the ``full`` = ``name/freq/term`` id).
 _KEY = "full"
-_RATIOS = ("crps_ratio", "mase_ratio")
 
 
 def _shifted_gmean(x: np.ndarray, epsilon: float = 1e-5) -> np.ndarray:

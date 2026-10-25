@@ -43,6 +43,7 @@ max_repo_mb          = 128       # cap on the fetched submission. Generators are
                                  # makes a distilled model impossible. max_memory_mb /
                                  # max_generate_seconds bound it at runtime.
 max_channels         = 32        # MV-TEST: C=32 raise (DEC-CA-0041), matches the mainnet cut.
+min_channels         = 8         # v2 synthetic submissions: 8–32 channels per yield
 channel_corr_mode    = "shadow"  # MV-TEST: channel-redundancy telemetry, labels only.
 # Cheap data-quality gates on generator output (see chain.toml for the rationale).
 max_abs_value        = 0.0       # 0.0 = cast-safe float32 ceiling; always applied.
@@ -165,14 +166,14 @@ train_image_digest = ""
 # ref_throughput_tokens_per_s = 90000
 
 [round]
-# Two-stage (heat → final) selection. TESTNET uses a SHORT epoch so rounds turn
-# over quickly for iteration; mainnet is 3600 (~12h) since 2026-07-28, was 7200.
-# The base seed is the block hash at the epoch boundary, so the whole epoch shares
-# one RoundSeeds; only commits before the boundary are eligible (the deadline).
-# NOTE: provision.toml is SHARED with mainnet and its trigger_margin_blocks
-# (3500, = mainnet epoch − 100) exceeds this 900-block epoch, which build_policy
-# rejects. Running the provisioner against testnet needs its own margin override
-# (~800). Pre-existing — the previous 7100 failed the same way.
+
+# Trainer-only resilience: owner fairness and correlated GPU outages.
+ops_max_active_per_coldkey = 1
+ops_gpu_failure_threshold = 2
+ops_gpu_failure_window_seconds = 3600
+ops_gpu_cooldown_seconds = 10800
+# The settlement grid. TESTNET uses a SHORT epoch so settlements turn over
+# quickly for iteration (see chain.toml for the mainnet semantics).
 epoch_blocks     = 150    # FUNDED-TEST fast round
 # DEC-CA-0043 loader rule: a rollover must also switch the grid. Testnet has
 # always run 150-block rounds, so the switch declared here is nominal (300 →
@@ -187,56 +188,39 @@ round_hours      = 3.0    # informational
 # other testnet gates at 1). Eras of 4 settlements = 600 blocks.
 rolling_from_block = 600
 era_settlements = 4
-heat_train_hours = 0.025  # FUNDED-TEST fast round
-heat_n_windows   = 64     # screening eval windows (testnet: small/fast)
-heat_num_samples = 10     # samples per window in the heat screen (0 = reuse [eval] num_samples);
-                          # ranking-only, so small keeps the CPU screen quick on a 3h epoch
-# Heat wall-clock cap (see chain.toml): budget hours = the cap, measured from the
-# FIRST TRAINING BATCH (fetch/sandbox boot excluded), token budget or deadline —
-# first reached stops, deadline stop flagged deadline_hit. Testnet floor is low
-# so the ~6-min heat budget really is the cap.
+heat_train_hours = 0.025  # `cascade score` budget + reduced-budget leg guard (see chain.toml)
+heat_n_windows   = 64
 heat_guard_factor        = 1.0
 heat_guard_floor_seconds = 300
-finalists        = 2      # FUNDED-TEST
-# Tie-aware finalist cohort (DEC-CA-0012, trainer half) — ARMED here FIRST
-# (2026-08-20, DEC-CA-0012 rollout order). With max_finalists > 1 a leader the
-# screen separated advances alone; a statistically tied top advances capped.
-# The tie RUN-OFF stays 0: its incremental draw relies on the seeded-prefix
-# property, which the jittered mix (DEC-CA-0019, active here from block 1)
-# does not provide — see the NOTE in chain.toml. Full semantics + the two
-# pre-arm couplings (deployed-fleet check at 1 + max_finalists slots; [eval]
-# bench_hold_max_hours sizing) are documented in chain.toml.
-# GATE FOR MAINNET: a full testnet round producing a genuine multi-finalist
-# cohort duel AND a cascade-audit replay of it, trainer and validator
-# restarted together.
-max_finalists      = 3    # cap on the advancing tied cohort (armed 2026-08-20)
-tie_runoff_windows = 0    # MUST stay 0 under the jittered mix — see chain.toml NOTE
-tie_runoff_phase_seconds = 900  # run-off wall clock; on expiry the tied set advances capped
-one_submission_per_hotkey = false   # TESTNET: relaxed — a hotkey re-competes every epoch (mainnet = true)
-# Duel-only rounds (no heat) — see chain.toml; 0 = off. Arm on testnet first.
+finalists        = 2      # default admission cap when funded_field_cap = 0 (see chain.toml)
+max_finalists      = 3
+one_submission_per_hotkey = false   # TESTNET: relaxed — a hotkey re-competes freely (mainnet = true)
+# Retired with the boundary-round trainer — ignored by the loader
+# (cascade.shared.config.RETIRED_KEYS); values kept for older releases.
 duel_from_block = 0
+heat_num_samples = 10
+tie_runoff_windows = 0
+tie_runoff_phase_seconds = 900
 duel_field_cap  = 0
-# Miner-funded compute (DEC-CA-0036): testnet is where "shadow" → "required"
-# gets exercised first (cascade-intake may run --trust-refs here). Inert now.
+skip_unfunded_rounds = true
+max_rounds_per_day = 1
+# Miner-funded compute (DEC-CA-0036): "required" = the funded queue IS the
+# intake (cascade-intake may run --trust-refs here).
 funded_mode = "required"  # FUNDED-TEST phase 2
 funded_queue_path = "funded_queue.json"
-skip_unfunded_rounds = true   # FUNDED-TEST phase 2
-max_rounds_per_day = 1
 funded_entry_ttl_hours = 36.0   # keep equal to cascade-intake --ttl-hours
-# Per-payer funded pods (DEC-CA-0036 second arming gate): "off" = funded legs
-# run on the operator fleet (pre-wiring behaviour); "rent" = each funded
-# challenger leg rents ONE pod on its payer's own Lium key, dispatches there,
-# and tears it down when the leg ends (king + eval pods stay operator-funded,
-# always). "rent" needs the three keys below; consensus-inert ([round]).
+# Per-payer funded pods (DEC-CA-0036): "rent" = each funded challenger leg
+# rents ONE pod on its payer's own Lium key, dispatches there, and tears it
+# down when the leg ends (the era king stays operator-funded). Consensus-inert.
 funded_pods = "rent"   # FUNDED-TEST phase 3 (live wiring validation)
 payer_vault_dir = "/root/cascade-main/.claude/worktrees/funded-release/_payer_vault"  # FUNDED-TEST (rehearsal intake vault)
 funded_pod_sku = "RTX4090"      # FUNDED-TEST
 funded_pod_image = "ghcr.io/tensorlink-ai/cascade-worker:worker-v0.8.1@sha256:d9001d0d0e3f1a40504b2bdd06782157ce96539b7bc6b99971e5a5646580e89b"  # FUNDED-TEST: v0.8.1 rehearsal build (armed testnet toml baked); mainnet stays on v0.8.0
 funded_ready_timeout_seconds = 900.0
 funded_pod_checkpoint = "harvest"  # credential-free pods (worker --local-only + orchestrator harvest)
-funded_field_cap = 8            # FUNDED-TEST: elastic field
-funded_capacity_probe = true    # FUNDED-TEST: clamp to the chosen type's live market
-funded_capacity_reserve = 1
+funded_field_cap = 8            # shared miner-funded A/B/C admission cap
+funded_capacity_probe = true    # retired (ignored)
+funded_capacity_reserve = 1     # retired (ignored)
 funded_pod_skus = ["RTX4090", "RTX3090", "L40S", "L40", "A6000"]  # FUNDED-TEST: per-round pick
 # No measured wall table on testnet: the repo default is MAINNET's measured
 # walls (3 h-class legs), which on this 150-block grid excluded every SKU at
@@ -245,14 +229,8 @@ funded_pod_skus = ["RTX4090", "RTX3090", "L40S", "L40", "A6000"]  # FUNDED-TEST:
 # max_train_seconds per SKU. Measure before setting (2026-09-21).
 funded_sku_wall_seconds = {}
 funded_king_rent = true   # FUNDED-TEST: JIT operator king at the round SKU (standing final pod expired 09-02)
-# Detached dispatch (2026-09-18): every remote leg and pod-side bench runs in
-# its own session on the pod (setsid+nohup; stdout/stderr/pid/exit_code in a
-# per-leg run dir under _train_work/_dispatch) and the trainer polls it with
-# short ssh calls, tolerating an unreachable pod for
-# dispatch_reattach_grace_seconds before the leg is declared lost. Replaces
-# the attached form, where one dropped ssh session failed a healthy leg
-# (09-13 5Co2Te; 09-17 5DoJQ; 09-18 02:52 all seven Oslo lanes → 8 legs
-# re-queued). Credentials still go over stdin only. false = attached.
+# Detached dispatch (see chain.toml): every remote leg and pod-side bench runs
+# in its own session on the pod and the trainer polls it. false = attached.
 detached_dispatch = true
 dispatch_poll_seconds = 30
 dispatch_reattach_grace_seconds = 900
@@ -261,23 +239,11 @@ champion_publish = "dethrone"  # FUNDED-TEST: rehearse the mainnet publish polic
 champion_publish_delay_rounds = 2
 dedup_mode = "shadow"               # TESTNET: log duplicate verdicts, drop nothing (mainnet = enforce)
 dedup_embedded_mode = "enforce"     # TESTNET: exact embedded tiers drop (mainnet ships the "shadow" default)
-dedup_probe_mode = "shadow"         # TESTNET: probe observes too (mainnet also ships shadow)
-# The probe executes generator code on the orchestrator and this config keeps
-# the permissive sandbox defaults (sandbox_strict = false, line 50), so the
-# probe would disable itself. TESTNET accepts that risk explicitly to collect
-# the calibration data; mainnet gets hard isolation instead of this flag.
-dedup_probe_allow_weak_sandbox = true
+dedup_probe_mode = "shadow"         # retired (ignored)
+dedup_probe_allow_weak_sandbox = true   # retired (ignored)
 reveal_margin_blocks      = 25      # timed-reveal target = boundary − margin (see chain.toml)
-# Genesis baseline king (burn-until-dethroned): a PUBLIC Hippius generator ref
-# (repo@digest) trained as the king whenever no on-chain champion resolves — a
-# fixed floor whose sentinel uid = -1 makes the validator BURN to burn_uid until
-# a real miner dethrones it. Empty = off. Handy on testnet to seed a stable king
-# (e.g. the base_generator) so rounds run before any miner submits.
-genesis_generator_ref = ""
-# Scaling seam (see chain.toml): screen at screen_size, train/judge the throne at
-# throne_sizes. Both default to the 4M primary; point them at a bigger size to
-# promote a rung. To test the sliding window on testnet, uncomment the 22M size
-# above and set e.g. screen_size = "toto2-4m", throne_sizes = ["toto2-22m"].
+genesis_generator_ref = ""          # retired (ignored)
+# The throne size(s) (see chain.toml); screen_size is informational.
 screen_size  = "toto2-4m"
 throne_sizes = ["toto2-4m"]
 
@@ -287,7 +253,7 @@ throne_sizes = ["toto2-4m"]
 # private and ROTATES per round (seeded by the block hash) so a generator cannot
 # distribution-match a fixed public benchmark — see cascade.validator.windows.
 eval_dataset   = "cascade-private-v1"  # identifier the validator matches on
-eval_source    = "private-rotating"      # rotating private pool (vs a fixed public set)
+eval_source    = "private-rotating"      # retired (RETIRED_KEYS): read by no release; kept for older loaders
 window_pool    = "tensorlink-dev/cascade-eval-pool@hf:36601d31df4be195890bc08a3249980128ad3eb7"  # TESTNET override — set out-of-band (not committed): the testnet eval-pool
                                           # Hub/hf ref (also lets the trainer heat-screener load).
                                           # Build with `cascade-pool build` (see docs/EVAL_POOL.md).
@@ -320,17 +286,19 @@ mix_block_slots      = 8
 mix_class_keep_frac  = 0.7
 mix_series_bag_frac  = 0.7
 mix_target_windows   = 0
-# TESTNET: cap datasets per suite for the Cascade duel bench. With
-# cascade_enabled = true the trainer runs GIFT-Eval/BOOM/TIME on BOTH duel
-# checkpoints every round, AFTER the manifest publishes (the signed
-# benchmarks/round-<id>.json report) — uncapped (0 = full battery) that sweep
-# can outlive the 3h epoch's pod hold, especially on a CPU orchestrator.
-# (Mainnet ships cascade_enabled = false, so its 0 stays the full battery.)
-cascade_bench_max_series = 3
-# How long the provisioner may hold the FINAL pod past the manifest for that
-# post-publish sweep (released early by the bench_complete marker). Inert
-# while cascade_enabled = false.
-bench_hold_max_hours  = 2.0
+# TESTNET: cap datasets per suite for the Cascade completion bench (each
+# checkpoint benched on GIFT-Eval/BOOM/TIME on its pod; the signed
+# benchmarks/round-<id>.json report) — uncapped (0 = full battery) the sweep
+# would outlive the short testnet epoch.
+cascade_bench_max_series = 0       # enforced gates require complete suites
+bench_hold_max_hours  = 2.0   # per-sweep timeout with the full battery (see chain.toml)
+# DEC-CA-0063 validator sweep concurrency — OPERATOR-LOCAL (only the main
+# validator sweeps; others replay its signed rows; the report is identical
+# for any value). "auto" sizes workers to free GPU memory / CPU cores (or an
+# int; 1 = sequential); bench_paired sweeps challenger + unswept king (king +
+# init at the king check) in one pass. docs/OPERATOR.md "Sizing the sweep".
+bench_workers = "auto"
+bench_paired  = true
 # Public-benchmark no-regression gate data (CONSENSUS; used when [scoring]
 # gift_gate_mode != "off"). Enforcing validators must have gift-eval data pinned.
 gift_gate_datasets    = ""       # gift-eval config subset for the gate ("" = full 97 configs)
@@ -357,6 +325,12 @@ gift_gate_timeout_s   = 3600     # per-checkpoint gift-eval timeout for the gate
 # round.
 declared_contract_from_block = 1
 mv_score_from_block = 1   # MV-TEST: joint multivariate window scoring live from round one
+# Entry-fault verdicts: from this block a challenger whose evaluation fails
+# deterministically (non-finite / wrong-shape forecasts, tampered checkpoint,
+# wrapper import/construct failure) loses its duel instead of wedging the
+# settlement in a retry loop. CONSENSUS (changes verdicts) — arm lockstep at an
+# announced block. 0 = off (inert).
+entry_fault_from_block = 0
 
 # King-of-the-hill — single-round dethroning with a TENURE-DECAYING margin
 # (DEC-CA-0016, TESTNET TRIAL). margin_for_tenure is affine from start (tenure
@@ -374,7 +348,7 @@ mv_score_from_block = 1   # MV-TEST: joint multivariate window scoring live from
 # and rejected — inside noise, it becomes a slow term-limit lottery). The
 # MAINNET schedule is CONFIRMED against the replay report over the real
 # receipt trail before it ships, release-then-activate
-# (docs/MARGIN_DECAY_ROLLOUT.md) — never a local flip: margin is judged
+# (decisions/DEC-CA-0016-tenure-decay-margin.md) — never a local flip: margin is judged
 # per-validator, so a mixed fleet forks verdicts.
 # HARD GUARDRAIL: win_margin_end must stay > 0 (the margin is the improvement
 # bar above the LCB noise gate; a 0 floor dethrones on any nonzero LCB).
@@ -402,19 +376,36 @@ min_clusters         = 10        # TESTNET override (template default 0). Below 
 bootstrap_B          = 10000     # paired-bootstrap resamples
 bootstrap_alpha      = 0.05      # one-sided LCB level
 dethrone_cp          = 1         # consecutive round wins to take the throne (1 = single-round)
-# Reward routing (teutonic-style): equal weight split across the current king
+# Reward routing (teutonic-style): weight split across the current king
 # plus up to `reward_prior_kings` previous DISTINCT kings that are still
-# registered. If none of them are registered, all weight burns to `burn_uid`.
+# registered, decaying geometrically by king_decay (below). If none of them are registered, all weight burns to `burn_uid`.
 # Set reward_prior_kings = 0 for pure winner-take-all on the current king.
 reward_prior_kings   = 4         # prior distinct kings that share weight with the current king
 burn_uid             = 0         # weight sink when no rewarded king is registered (owner burn slot)
-king_decay           = 0.5       # TESTNET override (template default 1.0): geometric decay so the king is clearly highest
+king_decay           = 0.5       # = mainnet (code default 1.0 = flat split): geometric decay so the king is clearly highest
 # Public-benchmark no-regression gate (see cascade.eval.gift_gate). AND-ed with
 # the private-pool decision on a win: can BLOCK a dethrone on a broad-public
 # regression, never grant one. Start on "shadow" to calibrate the tolerance.
 gift_gate_mode       = "shadow"  # TESTNET: log-only to calibrate tolerance, then "enforce" (template default "off")
 gift_gate_tolerance  = 0.03      # relative slack: challenger may be this much worse before failing
 gift_gate_min_configs = 15       # shared gift-eval configs below which the gate is uncomputable
+# Three-suite bench gate (DEC-CA-0054, cascade.eval.bench_gate). AND-ed like
+# the gift gate, can only BLOCK: on a private-pool win the challenger must not
+# be significantly worse than the king on GIFT-Eval, BOOM or TIME (paired
+# bootstrap on the trainer-signed per-item rows, alpha/3 per suite) and its
+# six-number geomean must be strictly better. Consensus: arm via DEC-CA-0045.
+bench_gate_mode      = "off"     # "off" | "shadow" (log-only) | "enforce"
+bench_gate_min_items = 10        # paired items per suite below which the gate is uncomputable
+# DEC-CA-0061 rule v2 ("avg_noninf_winrate", owner 2026-10-20; applies from
+# [v2] bench_gate_v2_from_block): unit = one benchmark task over GIFT-Eval,
+# BOOM, TIME and FEV; the suite-equal geomean of the challenger/king CRPS and
+# MASE ratios must be < 1, no suite's ratio LCB (paired task bootstrap,
+# alpha/4) may exceed 1 + bench_gate_tolerance, and the suite-equal task win
+# rate must be >= bench_gate_min_win_rate. bench_gate_min_items is then the
+# usable-task floor per suite. OWNER ITEM before arming: calibrate the
+# tolerance with scripts/bench_seed_noise.py on same-recipe seed replicas.
+bench_gate_tolerance    = 0.01   # ratio slack above 1 a suite's LCB may reach
+bench_gate_min_win_rate = 0.5    # suite-equal share of tasks the challenger wins (tie = half)
 # Cascade — king-reign promotion / warm-start (cascade.validator.cascade +
 # cascade.trainer.promotion, DEC-CA-0013 propose-and-verify). Enabled on
 # testnet with a shorter reign for iteration. After a ripe reign the TRAINER
@@ -424,7 +415,8 @@ gift_gate_min_configs = 15       # shared gift-eval configs below which the gate
 # epsilon + reign-clock ripeness) instead of re-deriving the selection. The
 # king PERSISTS on promotion (DEC-CA-0004); the throne is never vacated.
 cascade_enabled      = true      # TESTNET: armed 2026-08-05 for the PR-174 bench-pipeline drill (reports, hold, retry, promotion)
-cascade_reign_days   = 1         # consecutive undethroned days before a Cascade fires
+cascade_reign_days   = 1         # legacy name of cascade_reign_rounds (still accepted):
+                                 # consecutive undethroned ROUNDS before a Cascade fires
 # Promotion envelope (fleet-consensus, like the reign clock): 2 members keeps
 # each lineage half the rounds of a 1-day testnet reign; epsilon 0.05 mirrors
 # mainnet.
@@ -545,10 +537,15 @@ trainer_hotkey  = "5Cyver53HZaxdn6j9K2W9LyaoGxjz1W3cXHoKcaDyzfjfpHs"  # owner ho
 validator_hotkey = "5F1VmMSaPPi2qm91HE8VyMiHoCz4YxGaexJ3qmbyAPBUcUtR"  # TESTNET override
 poll_seconds    = 120
 
+# The trainer stamps prev_manifest_sha256 (the manifest hash link) on
+# settlements at/after this boundary. Signed-body field: set it only after
+# every validator runs a release that knows it. 0 = never stamped.
+hash_link_from_block = 0
+
 [validator]
 weight_set_interval_blocks = 180
 poll_seconds               = 120
-hf_cache_seconds           = 1800
+hf_cache_seconds           = 1800  # retired (RETIRED_KEYS): older releases require it
 state_db_path              = "validator_state.testnet.db"
 # Cascade persistence (see [scoring] cascade_reign_days). The co-hosted trainer
 # reads warm_start_init_path too — both processes must point at the same file.
@@ -569,7 +566,7 @@ mode    = "online"              # online | offline | disabled
 
 [telemetry]
 # Host-side run telemetry (cascade.trainer.host_probe). Observability only — never
-# feeds scoring, weights, or contract_digest. The heat prices generator speed
+# feeds scoring, weights, or contract_digest. The wall prices generator speed
 # (DEC-CA-0001) on a per-round rented fleet, so a slow run needs host-side
 # evidence to separate the pod from the submission; data_wait_frac only rules out
 # the corpus. host_bench times a fixed calibration workload before each run's
@@ -584,12 +581,8 @@ host_bench = true               # + the fixed calibration bench (host_bench_toke
 funded_bench = true
 funded_bench_verify_top = 1
 funded_bench_verify_tolerance = 0.02
-# Shadow scratch control (DEC-CA-0014 Stage 1): every M-th warm-started round,
-# train the king's generator from scratch post-publish and publish the labeled
-# telemetry report (benchmarks/scratch/) — never feeds scoring/promotion.
-# TESTNET: armed at 2 for the Stage-1 validation cycle (a shadow every ~6h at
-# the 3h cadence; the 0.75h budget keeps the extra leg cheap). Mainnet ships 0
-# until this cycle passes and the owner arms M=4.
+# Retired (ignored): the scratch-shadow leg rode the boundary-round bench
+# thread (DEC-CA-0014 Stage 1 needs a rolling port to come back).
 scratch_shadow_every_rounds = 2
 # bench_anneal_fraction = 0.15  # bench-anneal (DEC-CA-0030): bench the annealed copy of each duel
                                 # checkpoint (see mainnet chain.toml for the full note). Trainer
@@ -606,3 +599,366 @@ feature = "rolling-era-king"
 threshold = 0.51
 epoch_blocks_after = 150
 dormant_after_blocks = 0
+
+[v2]
+# cascade v2 (DEC-CA-0050) — ARMED on testnet at ONE typed block (no
+# readiness vote): 8190000 = era 13650 on the 150 × 4 = 600-block era grid
+# (head ≈ 8186845 on 2026-10-10, so ≈ 10.5 h of notice — every era before it
+# keeps toto2 byte-for-byte; the first v2 era trains the MoE from random init).
+# Trainer and validators must run the v2 release before this block; if the
+# deploy slips past it, move it to a later multiple of 600.
+from_block = 8190000
+# DEC-CA-0055 launch economics stay OFF here: testnet v2 is already live, and
+# random_init_eras / king_ladder (which also turns on warm-start seed epochs)
+# / carryover_king_share are all counted from [v2] from_block — arming them
+# now would re-judge eras the fleet has already settled. prelaunch_burn only
+# applies before the v2 block, which testnet has passed.
+random_init_eras = 0
+reign_warm_start_blocks = 0
+prelaunch_burn = 0.0
+carryover_king_share = 0.0
+king_ladder = false
+# The escalating key slash's minimum for a first lapse (eras; mainnet value).
+# Read only under king_ladder, so inert here.
+key_slash_min_eras = 6
+# The margin-tiered start share (mainnet values; read only under king_ladder,
+# so inert here): [lcb_threshold, start_bp] tiers on the crowning's
+# increment-unit LCB, and the fixed level-unit / no-LCB start.
+ladder_start_tiers = [[0.50, 8000], [0.25, 6500], [0.10, 5000], [0.01, 2500]]
+ladder_start_level_bp = 5000
+# DEC-CA-0061 rule v2 ("avg_noninf_winrate"): aligned with mainnet (owner
+# 2026-10-20 — nothing on this branch ran on testnet, no old verdict to keep).
+# "v2" = from_block; inert while [scoring] / [v2] bench_gate_mode stay "off"
+# (the receipt params then only stamp the rule name).
+bench_gate_v2_from_block = "v2"
+# DEC-CA-0063 (validator-GPU benches) stays OFF here: bench_source defaults to
+# "trainer", so bench_budget_hours (cap, default 4.0) / bench_sweep_hours
+# (per-checkpoint allowance, default 2.0) are read by nothing on testnet. The
+# mainnet chain.toml documents both.
+
+[v2.training]
+# Cascade-MOE-28M (deploy/presets/cascade-moe-28m.toml) with the testnet
+# fast-round budget, SKU and corpus mode kept from [training] above.
+base_arch          = "cascade_moe"
+arch_preset        = "cascade-moe-28m"
+base_arch_digest   = "767b9525666d7f49eeec24de7642c4f8fe5e007de2b14657312e6c5795d3e877"
+d_model            = 512
+num_layers         = 10
+num_heads          = 8
+head_dim           = 64
+patch_size         = 32
+mlp_expansion      = 2
+d_ff               = 1104
+num_quantiles      = 9
+masking            = "contiguous_patch"
+cpm_c_max          = 16
+cpm_p_max          = 0.4
+input_transform    = "arcsinh_causal"
+context_length     = 4096
+horizon            = 64
+target_train_hours          = 0.05     # TESTNET fast round (as [training])
+ref_throughput_tokens_per_s = 185000   # TESTNET (as [training]); mainnet value is the L40S placeholder
+warmup_fraction             = 0.0042
+batch_size                  = 64
+batch_denomination = "series"
+budget_denomination = "series_points"  # DEC-CA-0042 series-points billing
+optimizer          = "normuon_adamw"
+base_lr            = 0.0025
+adamw_lr_scale     = 0.2
+weight_decay       = 2e-8
+muon_momentum      = 0.96
+muon_row_beta2     = 0.999
+adamw_beta1        = 0.91
+adamw_beta2        = 0.972
+grad_clip          = 7.0
+lr_schedule        = "wsd"
+umup_base_d_model  = 512
+mup_lr_exponent    = 1.42
+warm_lr_scale      = 1.0
+train_seed_salt    = 1337
+max_train_seconds  = 300               # TESTNET fast round (as [training])
+corpus_mode        = "stream_gpu"      # TESTNET (as [training]): base_generator imports torch
+micro_batches      = 2
+power_ema_sigma_rels = [0.05, 0.10]
+power_ema_eval     = 0
+copula_loss_cap    = 0.1
+copula_samples     = 8
+copula_patches     = 2
+router_lr_scale       = 0.1
+route_bias_rate_scale = 0.25
+expected_gpu       = ""
+train_image_digest = ""
+
+[lane_b]
+# Preserve the existing testnet launch; mainnet launches B separately (see chain.toml).
+from_block = 8190000
+share     = 0.5
+remainder = "burn"
+domains = ["econ_fin", "energy", "healthcare", "nature", "sales", "transport", "web_cloudops"]
+# gain-tiered full-pay period (owner 2026-10-20; see chain.toml) —
+# uncalibrated placeholders
+full_pay_tiers   = [[0.05, 10], [0.02, 5], [0.01, 2]]
+half_life_rounds = 1.0
+floor            = 0.1
+win_ttl_eras     = 28
+alpha              = 0.05
+bootstrap_B        = 10000
+gain_margin        = 0.01          # > 0 (load-checked): an unchanged expert must not merge
+tau_domain         = 0.01
+tau_public         = 0.01
+min_target_windows = 30            # ~43 windows/domain at n_windows=300
+min_target_clusters = 5            # distinct sources among the target windows, else inconclusive
+min_guard_windows  = 50
+min_public_items   = 10
+require_public     = ["gift", "boom", "time"]   # FEV joins once the sidecar runs against the real `fev` package
+open_tokens       = 100000000      # testnet: ~3 eras of 0.05 h legs (~33M tokens/era); mainnet is 200B
+routing_jaccard   = 0.7
+routing_overlap   = 0.8
+rebase_jaccard    = 0.5
+rebase_overlap    = 0.7
+esft_p            = 0.2
+min_experts       = 8
+max_experts       = 38
+legs_per_domain   = 1
+max_base_age_eras = 2
+leg_hours         = 0.05           # TESTNET fast round
+affinity_windows  = 256
+# CONSENSUS merge guards (see chain.toml). TESTNET: lane B has been live since
+# 8190000, so the guards arm at a TYPED future era boundary instead of "v2"
+# (which would re-judge settled eras). 8280000 = era 13800 on the 600-block
+# era grid (head ≈ 8.25M on 2026-10-19 by the 8186845 @ 2026-10-10 anchor).
+# Validators must run the release before it; if the deploy slips past it,
+# move it to a later multiple of 600.
+merge_guard_from_block = 8280000
+# Preserve settled testnet economics; announce a future era to enable this.
+acceptance_from_block = 0
+leg_funding = "miner"              # lane-B legs on the miner's key (/v1/lane-b/fund)
+
+
+[lane_c]
+# Fine-tuning lane (DEC-CA-0056). TESTNET: SHIPPED INERT: from_block = 0 (off). The
+# owner types an ERA-BOUNDARY block at or after [v2] from_block; every
+# validator must run the lane-C release before it (no readiness vote). The
+# era starting at from_block is the first lane-C era; the settlement AT it is
+# still a pre-lane-C receipt. CONSENSUS: share, takes_from, remainder,
+# targets, payout schedule and verdict. Owner-tunable values marked.
+# MarketCast-only lane C (owner 2026-10-20): lane C is a container for
+# competitions, and a competition needs a FORWARD-ONLY eval. Today the only
+# one is MarketCast (DEC-CA-0064, mkt:<suite>); the generic domain: / freq: /
+# horizon: targets on the public-feed pool_c are refused at load (their
+# windows could be scraped and memorised). Lane C has no pool of its own.
+from_block = 0
+share      = 0.25                  # owner-tunable: taken from lane B ⇒ A 50 / B 25 / C 25
+takes_from = "lane_b"
+remainder  = "burn"                # unpaid decay + empty target slots burn
+# One emission slot each: "mkt:<suite>" for a [marketcast] suites member
+# (the list must match it). Listed but inactive while [marketcast]
+# from_block = 0: zero active slots, lane C's whole share burns.
+targets = ["mkt:returns", "mkt:vol"]
+# Payout schedule in ERAS (lane B's rule): 100 % for a GAIN-TIERED full
+# period after the judging settlement, then halving every half_life_rounds
+# eras to floor; payout STOPS at win_ttl_eras. full_pay_tiers (owner
+# 2026-10-20, CONSENSUS, overlay-settable; same shape and checks as [lane_b]):
+# the confirmed win's gain LCB picks the full_eras of the highest threshold it
+# meets, fixed at the win. mkt: targets use [marketcast] full_pay_tiers.
+# UNCALIBRATED PLACEHOLDERS — set from real lane-C win LCBs before arming.
+# A confirmed win takes the slot only with a STRICTLY higher gain LCB than a
+# holder on the same king (else the slot and its clock stay); a holder
+# trained on an older king is replaced.
+full_pay_tiers   = [[0.05, 10], [0.02, 5], [0.01, 2]]   # owner-tunable
+half_life_rounds = 1.0             # owner-tunable
+floor            = 0.1             # owner-tunable
+win_ttl_eras     = 28              # owner-tunable: 14 days of 12 h eras
+# Verdict: an mkt: entry is judged by MarketCast ([marketcast] alpha /
+# gain_margin / min_windows ...), paired vs the pinned base on forward-only
+# windows. The keys below are lane C's own verdict defaults, kept for the
+# next registered forward-only competition (MarketCast does not read them).
+alpha              = 0.05
+bootstrap_B        = 10000
+gain_margin        = 0.01          # owner-tunable
+min_target_windows = 100
+min_target_clusters = 5
+n_windows          = 1000          # windows drawn per target per settlement
+tau_public         = 0.01
+min_public_items   = 10
+# guard_public: none — public bench guards are refused on mkt: targets.
+# Trainer policy (no consensus impact)
+leg_hours          = 1.0
+legs_per_target    = 2
+max_base_age_eras  = 2
+max_lr_scale       = 1.0           # recipe lr_scale in (0, max_lr_scale]
+max_steps_fraction = 1.0           # recipe steps_fraction in (0, max_steps_fraction]
+
+# Concurrent competitions (owner 2026-10-20, DEC-CA-0056). One table per
+# configured competition; every [lane_c] target's kind needs one. CONSENSUS.
+# Lane C's share is split by weight (normalised over EVERY configured
+# competition, so one starting or ending never changes another's pay: an
+# idle competition's part burns), then equally among its targets.
+#   weight             >= 0                     (overlay-settable, DEC-CA-0057)
+#   from_block         era boundary >= [lane_c] from_block; 0 = not started.
+#                      MarketCast's start is [marketcast] from_block (one
+#                      source of truth) — from_block is refused here for mkt.
+#   until_block        era boundary after the start; 0 = no end (overlay-
+#                      settable, never to or from a block already passed).
+#                      The settlement AT it is the last judged; after it no
+#                      entry is admitted, dispatched or judged.
+#   wind_down          "finish_full_pay" (default): a win held at the end keeps
+#                      100 % while inside its own tiered full-pay period AND
+#                      within wind_down_max_eras eras of the end, then stops
+#                      (no decay tail); "stop": pay stops at the end.
+#   wind_down_max_eras default 6
+# Adding a competition kind is a release (its eval is code); see docs/OPERATOR.md.
+[lane_c.competitions.mkt]
+weight             = 1.0
+until_block        = 0             # no end
+wind_down          = "finish_full_pay"
+wind_down_max_eras = 6
+
+# CPU generation tier (DEC-CA-0053; operator-side, never in contract_digest).
+# enabled = false keeps generation on the GPU pod exactly as today. The tier
+# serves only legs whose effective contract has corpus_mode = "shards" (mainnet:
+# [v2.training], riding the v2 go-live); testnet's [v2.training] keeps
+# stream_gpu, so it would stay inert here even if enabled.
+[generation]
+enabled            = false
+providers          = ["targon", "shadeform"]   # preference order; Lium has no CPU VMs
+vcpus              = 32            # the pinned per-leg shape (owner pays; Targon CPU XLarge $1.00/h)
+child_memory_mb    = 2048
+children           = 0             # 0 = one sandbox child per vCPU
+max_parallel_jobs  = 2             # shared CPU VM cap; additional corpora wait
+max_price_per_hour = 1.25
+window_seconds     = 5400          # 90-minute generation window; CPU budget = vcpus x this
+target_points      = 50_000_000_000
+shard_points       = 16_777_216      # ~64 MB float32; a streaming pod holds ~2 per child
+max_length         = 32768
+storage_prefix     = "corpora/"
+bucket             = ""            # "" = [storage] manifest_bucket (private; kings get public-read)
+vm_image           = ""            # provider VM image (Targon: set before go-live)
+retention_days     = 14            # non-king corpora are deleted after this
+king_publish       = "recipe"      # "full" | "recipe" (ref + seed + digest + sample shards)
+sample_shards      = 4
+
+[netconfig]
+network_id = "bittensor:test"
+# Owner-signed network config (DEC-CA-0057). The ONE hotkey whose signed
+# overlay (config/network/seq-<n>.json + latest.json in the manifest bucket)
+# validators adopt: the owner's MAIN validator hotkey (the same key that signs
+# the results satellites replay, DEC-CA-0058). An overlay may change only
+# [scoring], [eval], the [round] schedule keys, [v2] runtime policy,
+# [lane_b], [lane_c] and listed numeric [marketcast] controls; adopted by the tally (a
+# `cfg-<8 hex>` note segment, 51 % of permit stake) and applies at its
+# era-start effective_block (or the first era start after a late lock-in).
+# "" = completely inert: nothing fetched, signalled or applied.
+owner_hotkey = ""
+poll_seconds = 300                 # how often latest.json is re-read
+
+[satellite]
+# Satellite validators (DEC-CA-0058, `cascade-satellite`): replay the main
+# validator's ([netconfig] owner_hotkey) signed receipts and set the vector
+# that replay derives — no model, no pool, no torch. Read only by satellites.
+# When the main validator is silent a satellite re-asserts its last verified
+# vector until stale_after_blocks past that settlement's boundary, then burns
+# until a new receipt verifies.
+stale_after_blocks = 3600          # one MAINNET era (= 6 eras on this 600-block testnet grid)
+poll_seconds       = 60            # how often the main validator's receipts are re-read
+max_walk           = 64            # receipts walked back per poll to reach the last replayed one
+
+# ── Lane D: distillation / real data (DEC-CA-0062) — WIRED, NOT IMPLEMENTED ──
+# Placeholder table so config, overlays and dashboards have a home for it.
+# from_block > 0 is REFUSED at load until the DEC is filled in and the trainer
+# + validator halves ship. Owner fills in targets, teacher and real corpus.
+[lane_d]
+from_block      = 0              # refused > 0 until implemented
+share           = 0.0            # of the total, carved from takes_from
+takes_from      = "lane_b"       # lane_a | lane_b | lane_c
+targets         = []             # TBD
+teacher_ref     = ""             # TBD: the teacher to distil from
+teacher_api     = "ephemeris"    # owner: Ephemeris TS foundation-model API (validators never call it)
+teacher_mode    = "route"        # route | ensemble | explicit (explicit needs teacher_models)
+real_corpus_ref = ""             # TBD: owner-pinned real corpus (DEC-CA-0028 pattern)
+data_sources    = ["real", "prior_corpus"]  # miners SELECT data (no generator): real and/or prior training corpora
+augmentations   = []             # TBD: the allowed augmentation list
+expert_choice   = "miner"        # miner | affinity | all
+max_context_length = 32768       # longer-context legs, up to 32k
+pool_prefix     = "pool_d"
+gain_margin     = 0.01
+
+# ── MarketCast: lane-C fine-tune eval on Timestral-28M (DEC-CA-0064) — BUILT, SHIPPED OFF ──
+# Fine-tunes of a PINNED third-party base (mistralai/Timestral-28M, Modified
+# MIT licence with a USD 20M/month revenue restriction that extends to
+# derivatives — owner/legal open item) are judged paired vs the untouched base
+# on forward-only market windows, one lane-C slot per suite (target
+# "mkt:<suite>", listed in [lane_c] targets). Arming (from_block > 0) is
+# load-checked: an era boundary >= [v2] from_block and >= [lane_c] from_block,
+# [v2] bench_source = "validator" in force (the main validator's GPU scores
+# MarketCast), [netconfig] owner_hotkey set, base pinned, and a built data
+# source for every class that lists assets. Base, activation and data contract
+# are release-only; listed numeric verdict/payout/liveness controls allow overlays.
+[marketcast]
+from_block         = 0                          # off; an era-boundary block arms it
+base_ref           = "mistralai/Timestral-28M@180698bbf5a50dda3516aa6419798437fb03a430"
+base_sha256        = "dfc83c6220937ce5fc6687b35a4df94cd25e28a2cfe6fb92a23dad6301b2015d"  # model.safetensors (HF LFS oid)
+base_arch          = "timestral"
+suites             = ["returns", "vol"]         # launch set; also range | funding | liquidity | alpha
+coverage_levels    = [0.5, 0.8, 0.98]           # calibration gate on mkt:returns AND mkt:vol
+coverage_tolerance = 0.05                       # owner-tunable: fail if empirical < nominal - tolerance
+alpha              = 0.05
+gain_margin        = 0.01                       # never 0
+# Gain-tiered full-pay period of an mkt: win (owner 2026-10-20), on lane C's
+# slot TTL and decay: [[lcb_threshold, full_eras], ...] like [lane_c]'s, but
+# its OWN table — the MarketCast LCB is a horizon-equal clustered geomean gain
+# on one suite's loss vs the pinned base, not lane C's sqrt(WQL*MASE) gain vs
+# the king, so one threshold is not the same evidence in both. Overlay-settable;
+# full_eras <= [lane_c] win_ttl_eras
+# (load-checked). UNCALIBRATED PLACEHOLDERS.
+full_pay_tiers     = [[0.05, 10], [0.02, 5], [0.01, 2]]
+min_windows        = 200                        # spread over >= min_time_blocks (review M10)
+min_clusters       = 8                          # distinct (asset class, time block) clusters
+pool_prefix        = "pool_mkt"
+max_context_length = 32768
+embargo_days       = 30                         # recipe training data ends this long before submission
+max_synthetic_fraction = 0.5                    # miner generator share of the training mix
+eval_context_length = 4096                      # context steps the base and the fine-tune both see
+windows_per_cell   = 48                         # per (asset, horizon), spread evenly: 2 per 6 h block over 6 days
+start_margin_seconds = 3600                     # windows start >= 1 h after the train block
+verdict_wait_blocks = 43200                     # an entry waits up to 6 days for its windows to close
+snapshot_days      = 21                         # realized 1m bars per eval snapshot
+coarse_history_days = 180                       # hourly bars for >= 1h series (HL serves ~208 d of 1h)
+report_timeout_settlements = 8                  # trainer records a missing report "absent" after this
+max_infra_deferrals = 8                         # main-validator compute failures before an uncharged drop
+cluster_block_hours = 6                         # bootstrap clusters = asset class x 6 h block
+min_time_blocks    = 8                          # >= 2 days of distinct 6 h blocks before a verdict
+min_bar_coverage   = 0.8                        # live-bar share in the 24 h before a window
+min_dollar_volume_24h = 1000000.0               # USD traded in the 24 h before a window (0 = off)
+coverage_tolerance_over = 0.10                  # gated levels also fail above nominal + this
+coverage_gate_levels = [0.5, 0.8]               # per horizon, class-weighted like the gain; 98 % report-only
+# Red-team fixes 2026-10-20 (DEC-CA-0064 §Red-team fixes). The gain is a
+# geomean over cells (asset class x 6 h block x horizon) of each cell's ratio
+# of MEAN CRPS — never the log of one window's CRPS (that rewarded too-narrow
+# quantiles against an oracle base). No filter reads the realised target.
+zero_scale_frac    = 0.001                      # cell masked (recorded) if base mean CRPS <= this x its horizon's median cell
+cell_ratio_cap     = 4.0                        # each cell's ft/base ratio clipped to [1/4, 4]
+tail_levels        = [0.05, 0.95]               # tail gate: hit rate beyond q_l within tail_tolerance of 5 %
+tail_tolerance     = 0.025                      # per horizon AND pooled over horizons
+calibration_z      = 3.0                        # every calibration tolerance >= 3 standard errors (thin classes)
+near_dup_tol       = 0.02                       # mean |dq| / base 5-95 % width vs a senior entry below this => duplicate
+max_open_legs_per_coldkey = 1                   # trainer policy: open MarketCast legs per coldkey
+
+[marketcast.assets]                             # the Hyperliquid-listed universe (2026-10-19)
+crypto      = ["BTC", "ETH", "SOL", "XRP", "HYPE", "BNB", "DOGE", "ADA", "AVAX", "LINK",
+               "SUI", "TRX", "LTC", "DOT", "BCH", "NEAR", "APT", "ARB", "OP", "TAO", "ENA",
+               "AAVE", "UNI", "INJ", "TIA", "SEI", "WIF", "JUP"]
+fx          = ["EUR", "JPY", "GBP"]             # all HL lists (xyz:, vs USD); other crosses: owner open item
+metals      = ["GOLD", "SILVER", "PLATINUM", "PALLADIUM"]
+commodities = ["CL", "BRENTOIL", "NATGAS", "COPPER"]
+equity_etf  = ["SP500", "XYZ100", "JP225", "KR200", "SMH", "XLE", "TLT", "XBI", "EWJ",
+               "EWY", "EWZ", "EWT", "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA"]
+alpha       = ["SN1", "SN8", "SN19", "SN50", "SN64", "SN88", "SN91", "SN123"]
+
+[marketcast.data_sources]                       # "<primary>[+<cross-check>]"; "" refuses arming the class
+crypto      = "hyperliquid+binance_spot"        # HL perps 1m + funding; Binance spot 1m cross-check
+fx          = "hyperliquid_xyz"                 # perp prices (basis, off-hours drift); Pyth / Chainlink = open candidates
+metals      = "hyperliquid_xyz"
+commodities = "hyperliquid_xyz"
+equity_etf  = "hyperliquid_xyz"
+alpha       = "bittensor_alpha"                 # subnet pool state via the pinned bittensor SDK

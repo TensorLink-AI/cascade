@@ -20,12 +20,21 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import traceback
 
 from ..aggregate import official_aggregate
 from ..resources import load_json
 from ..results import SuiteResult
-from ._common import build_dataset_or_reason, describe_exception, score_dataset
+from ._common import (
+    SuitePlan,
+    abort_from_exc,
+    build_dataset_or_reason,
+    describe_exception,
+    run_sequential,
+    score_dataset,
+    until_abort,
+)
 
 log = logging.getLogger("cascade_benchmark.gifteval")
 
@@ -124,14 +133,9 @@ def _name_term_pairs(max_tasks: int | None):
                 return
 
 
-def run(
-    checkpoint_dir: str,
-    *,
-    num_samples: int = 100,
-    max_series: int | None = None,
-    device: str = "cpu",
-    batch_size: int = 64,
-) -> SuiteResult:
+def plan(*, max_series: int | None = None):
+    """The config list (one unit per ``(name, term)``) — or the suite's final
+    ``SuiteResult`` when it cannot run at all."""
     if not (os.environ.get("GIFT_EVAL") or os.environ.get("CASCADE_BENCH_GIFTEVAL_DATASETS")):
         return SuiteResult(
             suite="gift-eval",
@@ -141,52 +145,88 @@ def run(
     try:
         properties = load_json("gifteval_dataset_properties.json")
         baseline = load_json("gifteval_seasonal_naive.json")
-        rows = []
-        skipped: list[dict] = []
-        pairs = list(_name_term_pairs(max_series))
-        for ds_name, term in pairs:
-            full = _baseline_key(ds_name, term, properties)
-            ds, reason = build_dataset_or_reason(ds_name, term)
-            if ds is None:
-                # One dataset must not abort the sweep — but it must not
-                # vanish either: record it so the report says what it covers.
-                log.warning("gift-eval: %s not loaded: %s", full, reason)
-                skipped.append({"full": full, "stage": "load", "reason": reason})
-                continue
-            try:
-                m = score_dataset(
-                    ds, checkpoint_dir,
-                    num_samples=num_samples, device=device, batch_size=batch_size,
-                )
-            except Exception as e:  # noqa: BLE001 — one dataset must not abort the sweep
-                reason = describe_exception(e)
-                log.warning("gift-eval: %s not scored: %s", full, reason)
-                skipped.append({"full": full, "stage": "score", "reason": reason})
-                continue
-            rows.append({"full": full, **m})
-
-        if not rows:
-            return SuiteResult(
-                suite="gift-eval", status="error", detail="no datasets scored",
-                skipped=skipped, n_expected=len(pairs),
-            )
-        agg = official_aggregate(rows, baseline)
-        metrics = {k: agg[k] for k in ("crps", "mase", "crps_zero", "mae_zero") if k in agg}
-        detail = ""
-        if skipped:
-            detail = (f"partial: {len(skipped)} of {len(pairs)} configs skipped: "
-                      + ", ".join(s["full"] for s in skipped))
-            log.warning("gift-eval: %s", detail)
-        return SuiteResult(
-            suite="gift-eval", status="ok", metrics=metrics, n_series=agg["n_scored"],
-            detail=detail, rows=_ratio_rows(rows, baseline),
-            skipped=skipped, n_expected=len(pairs),
-        )
-    except ImportError as e:
-        return SuiteResult(suite="gift-eval", status="skipped", detail=f"gift-eval not importable: {e}")
+        units = [(ds_name, term, _baseline_key(ds_name, term, properties))
+                 for ds_name, term in _name_term_pairs(max_series)]
     except Exception as e:  # noqa: BLE001
         return SuiteResult(
             suite="gift-eval",
             status="error",
             detail=f"{type(e).__name__}: {e}\n{traceback.format_exc(limit=3)}",
         )
+    return SuitePlan(suite="gift-eval", units=units, local={"baseline": baseline})
+
+
+def run_unit(ctx: dict, unit, checkpoints: list[str], *, num_samples: int = 100,
+             device: str = "cpu", batch_size: int = 64) -> list[dict]:
+    """Build one config's dataset ONCE and score it with every checkpoint."""
+    ds_name, term, full = unit
+    try:
+        ds, reason = build_dataset_or_reason(ds_name, term)
+    except Exception as e:  # noqa: BLE001 — gift-eval missing ends the suite
+        return [abort_from_exc(e, import_detail="gift-eval not importable")] * len(checkpoints)
+    if ds is None:
+        # One dataset must not abort the sweep — but it must not
+        # vanish either: record it so the report says what it covers.
+        log.warning("gift-eval: %s not loaded: %s", full, reason)
+        return [{"skip": {"full": full, "stage": "load", "reason": reason}}] * len(checkpoints)
+    out: list[dict] = []
+    for ckpt in checkpoints:
+        try:
+            m = score_dataset(
+                ds, ckpt, num_samples=num_samples, device=device, batch_size=batch_size,
+            )
+        except Exception as e:  # noqa: BLE001 — one dataset must not abort the sweep
+            reason = describe_exception(e)
+            log.warning("gift-eval: %s not scored: %s", full, reason)
+            out.append({"skip": {"full": full, "stage": "score", "reason": reason}})
+            continue
+        out.append({"row": {"full": full, **m}})
+    return out
+
+
+def assemble(plan: SuitePlan, outcomes: list[dict]) -> SuiteResult:
+    done, aborted = until_abort(outcomes)
+    if aborted is not None:
+        return SuiteResult(suite="gift-eval", **aborted)
+    try:
+        baseline = plan.local["baseline"]
+        rows = [o["row"] for o in done if "row" in o]
+        skipped = [o["skip"] for o in done if "skip" in o]
+        n_expected = len(plan.units)
+        if not rows:
+            return SuiteResult(
+                suite="gift-eval", status="error", detail="no datasets scored",
+                skipped=skipped, n_expected=n_expected,
+            )
+        agg = official_aggregate(rows, baseline)
+        metrics = {k: agg[k] for k in ("crps", "mase", "crps_zero", "mae_zero") if k in agg}
+        detail = ""
+        if skipped:
+            detail = (f"partial: {len(skipped)} of {n_expected} configs skipped: "
+                      + ", ".join(s["full"] for s in skipped))
+            log.warning("gift-eval: %s", detail)
+        return SuiteResult(
+            suite="gift-eval", status="ok", metrics=metrics, n_series=agg["n_scored"],
+            detail=detail, rows=_ratio_rows(rows, baseline),
+            skipped=skipped, n_expected=n_expected,
+        )
+    except Exception as e:  # noqa: BLE001
+        return SuiteResult(
+            suite="gift-eval",
+            status="error",
+            detail=f"{type(e).__name__}: {e}\n{traceback.format_exc(limit=3)}",
+        )
+
+
+def run(
+    checkpoint_dir: str,
+    *,
+    num_samples: int = 100,
+    max_series: int | None = None,
+    device: str = "cpu",
+    batch_size: int = 64,
+) -> SuiteResult:
+    """The whole suite for one checkpoint, in this process (``plan`` →
+    every ``run_unit`` in order → ``assemble``)."""
+    return run_sequential(sys.modules[__name__], [checkpoint_dir], num_samples=num_samples,
+                          max_series=max_series, device=device, batch_size=batch_size)[0]

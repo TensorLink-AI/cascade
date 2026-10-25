@@ -1,24 +1,16 @@
-"""Init-baseline: heat SHADOW row + validator duel-side floor.
+"""Init-baseline floor (DEC-CA-0034), the validator duel side.
 
-The 2026-08-26 blind spot: KOTH compares entrants to each other and to the
-king, never to "do nothing" — and the raw warm-start init measured BETTER
-than every trained entrant on the post-mix windows. Two mechanisms, split
-deliberately (owner 2026-08-26):
+KOTH compares entrants to each other and to the king, never to "do nothing".
+``[scoring] init_gate_mode`` is the authoritative floor — a challenger that
+beat the king but is worse than the init cannot be CROWNED. The gift-gate
+shape: off → shadow → enforce; can only block a dethrone, never grant one;
+king retention untouched. Consensus-relevant.
 
-- Heat ([round] init_gate_mode = "shadow"): the round's init scored on the
-  heat slice, published on the standings. NEVER filters the heat.
-- Duel ([scoring] init_gate_mode): the authoritative floor — a challenger
-  that beat the king but is worse than the init cannot be CROWNED. The
-  gift-gate shape: off → shadow → enforce; can only block a dethrone, never
-  grant one; king retention untouched. Consensus-relevant.
-
-Off (both defaults) must be byte-identical to the pre-gate code — the first
-tests of each half pin that, and the receipt tests pin signature stability.
+Off must be byte-identical to the pre-gate code, and the receipt tests pin
+signature stability. (The trainer's heat SHADOW row retired with the heat.)
 """
 
 from __future__ import annotations
-
-from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -26,9 +18,6 @@ import pytest
 from cascade.eval.koth import KothParams, evaluate_round
 from cascade.eval.scoring import WindowScore
 from cascade.shared.manifest import HeatResult, _heat_from_json, heat_to_json
-from cascade.trainer.contract import RoundSeeds
-from cascade.trainer.loop import ResolvedGenerator, TrainerRunner
-from tests.unit.test_trainer_round import _FakeBaseTrainer
 
 WS_REF = "metro-v1:trained:hippius:cascade/ckpt-init@sha256:" + "a" * 64
 
@@ -37,93 +26,12 @@ SCORES = {"b": 0.25, "c": 0.35, "d": 0.40}
 INIT_SCORE = 0.30
 
 
-# ── heat shadow row ───────────────────────────────────────────────────────────
-
-
-def _gens():
-    return [ResolvedGenerator(hotkey=h, uid=u, ref=f"{h}/gen@sha256:{'1' * 64}",
-                              reveal_block=10 + u)
-            for u, h in enumerate(["b", "c", "d"])]
-
-
-def _screen(ckpt_dir, gen, base_seed, block=None):
-    if gen is None:                      # the init-baseline probe
-        return INIT_SCORE
-    return SCORES[gen.hotkey]
-
-
-def _runner(cfg, tmp_path, monkeypatch, *, mode="off", screen=_screen):
-    cfg = replace(cfg, round=replace(
-        cfg.round, max_finalists=1, finalists=1, init_gate_mode=mode,
-    ))
-    runner = TrainerRunner(cfg=cfg, base_trainer=_FakeBaseTrainer(),
-                           work_root=tmp_path, use_sandbox=False,
-                           screen_fn=screen)
-    monkeypatch.setattr(
-        runner, "_heat_train",
-        lambda challengers, seeds, block, contract, tokens, warm_start_ref=None: [
-            (c, tmp_path / c.hotkey, f"digest-{c.hotkey}") for c in challengers
-        ],
-    )
-    monkeypatch.setattr(runner, "_fetch_checkpoint_dir",
-                        lambda ref: tmp_path / "init")
-    return runner, _gens()
-
-
-def _heat(runner, gens, *, warm_start=True):
-    seeds = RoundSeeds(base_seed=1, generation_seed=2, training_seed=3)
-    ws = ((WS_REF, runner.cfg.training.arch_preset) if warm_start else None)
-    return runner._run_heat(gens, seeds, block=100, screen_block=100,
-                            warm_start=ws)
-
-
-def test_heat_shadow_off_is_inert(cfg, tmp_path, monkeypatch):
-    runner, gens = _runner(cfg, tmp_path, monkeypatch, mode="off")
-    winners, heat = _heat(runner, gens)
-    assert [c.hotkey for c in winners] == ["b"]
-    assert heat.init_baseline is None
-    assert "init_baseline" not in heat_to_json(heat)   # frozen JSON shape
-
-
-def test_default_config_ships_shadow_off(cfg):
-    # ARMED 2026-08-27 (owner, the r47 all-live release): both gates ship in
-    # SHADOW — visibility rows only, verdicts untouched. Enforce remains a
-    # later, separate coordinated decision; this test pins that the shipped
-    # file never silently escalates past shadow.
-    assert cfg.round.init_gate_mode == "shadow"
+def test_default_config_ships_the_floor_in_shadow(cfg):
+    # Shadow = a visibility row only, verdicts untouched. Enforce remains a
+    # separate coordinated decision; this pins that the shipped file never
+    # silently escalates past shadow.
     assert cfg.scoring.init_gate_mode == "shadow"
     assert cfg.scoring.init_gate_tolerance == 0.0
-
-
-def test_heat_shadow_publishes_baseline_and_never_filters(cfg, tmp_path, monkeypatch):
-    runner, gens = _runner(cfg, tmp_path, monkeypatch, mode="shadow")
-    winners, heat = _heat(runner, gens)
-    assert [c.hotkey for c in winners] == ["b"]        # same advance as off
-    assert heat.init_baseline == pytest.approx(INIT_SCORE)
-    assert heat_to_json(heat)["init_baseline"] == pytest.approx(INIT_SCORE)
-    # c and d are worse than the init — and still merely "screened"
-    assert {e.status for e in heat.entrants} == {"advanced", "screened"}
-
-
-def test_heat_enforce_is_not_a_thing(cfg, tmp_path, monkeypatch):
-    # An operator setting "enforce" on [round] gets shadow-off + a warning,
-    # never a filtered heat — enforcement lives in [scoring].
-    runner, gens = _runner(cfg, tmp_path, monkeypatch, mode="enforce")
-    winners, heat = _heat(runner, gens)
-    assert [c.hotkey for c in winners] == ["b"]
-    assert heat.init_baseline is None
-
-
-def test_heat_shadow_fails_open(cfg, tmp_path, monkeypatch):
-    def screen(ckpt_dir, gen, base_seed, block=None):
-        if gen is None:
-            raise RuntimeError("pool hiccup")
-        return SCORES[gen.hotkey]
-
-    runner, gens = _runner(cfg, tmp_path, monkeypatch, mode="shadow", screen=screen)
-    winners, heat = _heat(runner, gens)
-    assert [c.hotkey for c in winners] == ["b"]
-    assert heat.init_baseline is None
 
 
 def test_heat_json_round_trips_init_baseline():
@@ -269,22 +177,18 @@ def test_loader_round_trips_init_gate_fields(tmp_path):
 
     repo_root = Path(__file__).resolve().parents[2]
     text = (repo_root / "chain.toml").read_text()
-    # The shipped file arms shadow/shadow (the 2026-08-27 release), so the
-    # round trip is proven by REPLACING the shipped lines with different
-    # values and reading them back. The [round] key uses distinct spacing.
+    # The shipped file arms shadow, so the round trip is proven by REPLACING
+    # the shipped line with different values and reading them back.
     assert 'init_gate_mode = "shadow"' in text          # [scoring]
-    assert 'init_gate_mode     = "shadow"' in text      # [round]
     patched = text.replace(
         'init_gate_mode = "shadow"',
         'init_gate_mode = "enforce"\ninit_gate_tolerance = 0.05', 1,
-    ).replace('init_gate_mode     = "shadow"',
-              'init_gate_mode     = "off"', 1)
+    )
     p = tmp_path / "chain.toml"
     p.write_text(patched)
     c = load_chain_config(p)
     assert c.scoring.init_gate_mode == "enforce"
     assert c.scoring.init_gate_tolerance == 0.05
-    assert c.round.init_gate_mode == "off"
     # and the koth params carry them through
     kp = c.koth_params()
     assert kp.init_gate_mode == "enforce"
@@ -293,7 +197,7 @@ def test_loader_round_trips_init_gate_fields(tmp_path):
 
 def test_loader_rejects_scoring_init_gate_typo(tmp_path):
     """[scoring] is strict (gift-gate rule: a typo must not silently
-    un-enforce the floor); [round] stays warn-and-off at the use site."""
+    un-enforce the floor)."""
     from pathlib import Path
 
     import pytest as _pytest

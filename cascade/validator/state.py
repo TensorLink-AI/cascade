@@ -51,19 +51,18 @@ class ChampionState:
     # not wedge the subnet forever. Persisted so the cap survives restarts.
     resync_holds: int = 0
     # The round_id of the last manifest that bumped ``resync_holds``. A restart
-    # re-gates the SAME stale manifest, and before this field each re-gate
-    # advanced the counter — five restarts during a pause tripped the valve and
-    # demoted a healthy champion (2026-07-22). The counter only advances when
+    # re-gates the SAME stale manifest; counting each re-gate would let a few
+    # restarts during a pause trip the valve and demote a healthy champion.
+    # The counter only advances when
     # the un-synced round is a NEW round_id; same-round re-gates hold without
     # counting. Cleared with ``resync_holds`` on any normally-scored round.
     last_resync_round_id: str | None = None
-    # Restart re-entry guard (the trainer's PR #157 twin — OPSLOG 2026-07-25):
-    # the (round_id, manifest sha256) the loop last handled (scored, rejected,
-    # or resync-held). Persisted so a restart does NOT re-judge the already-
-    # published round — under a changed scoring rule that re-judgement can
-    # flip a settled verdict (live 2026-07-28: DEC-CA-0009 would have retro-
-    # dethroned round 10447… at boot). The sha keeps the 2026-07-15 semantics
-    # across restarts: a re-published manifest with DIFFERENT content for the
+    # Restart re-entry guard (mirrors the trainer's): the (round_id, manifest
+    # sha256) the loop last handled (scored, rejected, or resync-held).
+    # Persisted so a restart does NOT re-judge the already-published round —
+    # under a changed scoring rule that re-judgement can flip a settled verdict
+    # (e.g. DEC-CA-0009). The sha keeps content-dedup semantics across
+    # restarts: a re-published manifest with DIFFERENT content for the
     # same round id is still re-judged, never silently skipped.
     last_handled_round_id: str | None = None
     last_handled_manifest_sha: str | None = None
@@ -72,8 +71,8 @@ class ChampionState:
     # before the field existed — the validator imputes one from the counter
     # at that king's FIRST settlement past tenure_blocks_from_block
     # (era.legacy_king_anchor) and persists it here; it is never re-imputed
-    # (the counter keeps advancing on the new grid, so re-imputing inflated
-    # the tenure 4× per settlement). ``king_pointer``: the checkpoint pointer this validator
+    # (the counter keeps advancing on the new grid, so re-imputing would
+    # inflate the tenure 4× per settlement). ``king_pointer``: the checkpoint pointer this validator
     # judged in the crowning settlement, or the era's first king leg — the
     # trainer cannot substitute another checkpoint of the same generator
     # within an era. ``era_index``: the era ``king_pointer`` was adopted in.
@@ -89,6 +88,66 @@ class ChampionState:
     # the fleet counts tenure from ONE anchor whether a validator upgraded
     # before or after that king's crowning. 0 = not yet; drop-when-default.
     tenure_anchor_gate: int = 0
+    # Loop bookkeeping beside the handled marker (all drop-when-default):
+    # ``last_handled_block``: the handled manifest's ``created_block`` — the
+    # handled position never moves backwards (an old signed manifest
+    # re-published as latest is skipped, never recorded). ``reject_config_id``:
+    # the validator config identity a REJECT of the last handled round was
+    # latched under ("" = that round was not a reject); a different identity at
+    # a later poll re-judges it. ``pre_round``: ``{"round_id", "state",
+    # "cascade"}`` — this state (and the Cascade state) as they were BEFORE the
+    # last handled round was applied, so a re-judgement of that round
+    # (re-publish, changed config, unfinished follow-up after a restart)
+    # REPLACES its effects instead of stacking them. ``followup_round_id``: the
+    # handled round whose weights / receipt / Cascade step have not completed
+    # yet; the next poll finishes it before anything newer is judged.
+    last_handled_block: int | None = None
+    reject_config_id: str = ""
+    pre_round: dict | None = None
+    followup_round_id: str | None = None
+    # DEC-CA-0055 lane-A economics (v2 eras, ``[v2] king_ladder``; all
+    # drop-when-default, so the ``pre_round`` snapshot carries them and a
+    # re-judged settlement replaces — never stacks — a ladder step):
+    # ``king_share_bp`` — the reigning king's ladder share of lane A in basis
+    # points (a duel crowning sets its margin-tiered start share,
+    # :func:`cascade.shared.emission.crown_start`; None = a DEC-CA-0048
+    # successor not moved yet, read as ``[v2] ladder_start_level_bp``). ``court_hotkey`` / ``court_until_block`` — the IMMEDIATE
+    # former king and the block its 5 % of lane A stops (dethroning boundary
+    # + COURT_BLOCKS). ``king_slashed`` — the last settlement paid the king
+    # ``key_slash_bp`` (the re-assert repeats that settlement's vector).
+    # ``king_key_lapses`` / ``king_lapse_open`` / ``king_slash_until_block`` —
+    # the reign's escalating key-slash state
+    # (:func:`cascade.shared.emission.key_slash_step`; reset by a crowning).
+    # ``king_check_pass`` — the last PASSING king check this validator judged
+    # (``{"round_id", "block", "king_pointer", "king_hotkey"}``): the only
+    # evidence a v2 promotion is accepted on. ``epoch_init`` — ``{"epoch",
+    # "init"}``: the init the current v2 seed epoch trains from (carried
+    # across crownings: an epoch outlives the reign that started it).
+    king_share_bp: int | None = None
+    court_hotkey: str | None = None
+    court_until_block: int = 0
+    king_slashed: bool = False
+    king_key_lapses: int = 0
+    king_lapse_open: bool = False
+    king_slash_until_block: int = 0
+    king_check_pass: dict | None = None
+    epoch_init: dict | None = None
+
+
+def _loop_fields(state: ChampionState) -> dict:
+    """The loop-position fields every fresh-state constructor carries over
+    (the throne is reset, not the loop's place in the manifest stream) —
+    plus the v2 seed epoch's init, which belongs to the era stream, not the
+    reign."""
+    return {
+        "last_handled_round_id": state.last_handled_round_id,
+        "last_handled_manifest_sha": state.last_handled_manifest_sha,
+        "last_handled_block": state.last_handled_block,
+        "reject_config_id": state.reject_config_id,
+        "pre_round": state.pre_round,
+        "followup_round_id": state.followup_round_id,
+        "epoch_init": state.epoch_init,
+    }
 
 
 @dataclass(frozen=True)
@@ -143,10 +202,21 @@ def apply_forfeit(
             resync_holds=0, last_resync_round_id=None,
             king_since_block=(int(crowned_block) if crowned_block is not None and new_king else None),
             king_pointer="", era_index=None,
+            # DEC-CA-0055: a fresh reign — the ladder restarts, no check
+            # carries over, and a forfeited hotkey is never the paid court
+            king_share_bp=None, king_check_pass=None, king_slashed=False,
+            king_key_lapses=0, king_lapse_open=False, king_slash_until_block=0,
+            court_hotkey=(None if state.court_hotkey in forfeited else state.court_hotkey),
+            court_until_block=(0 if state.court_hotkey in forfeited
+                               else state.court_until_block),
         )
         return StateTransition(
             state=new, dethroned=True, new_king_hotkey=new_king,
             note=f"forfeit:{state.king_hotkey[:12]}→{(new_king or 'vacant')[:12]}")
+    if state.court_hotkey and state.court_hotkey in forfeited:
+        state = replace(state, court_hotkey=None, court_until_block=0)
+        return StateTransition(state=replace(state, former_kings=court), dethroned=False,
+                               new_king_hotkey=state.king_hotkey, note="forfeit:court")
     if court != state.former_kings:
         return StateTransition(state=replace(state, former_kings=court), dethroned=False,
                                new_king_hotkey=state.king_hotkey, note="forfeit:court")
@@ -240,8 +310,7 @@ def apply_round(
                 former_kings=_roll_former_kings(
                     state, new_king=challenger_hotkey, keep=keep_former_kings
                 ),
-                last_handled_round_id=state.last_handled_round_id,
-                last_handled_manifest_sha=state.last_handled_manifest_sha,
+                **_loop_fields(state),
                 king_since_block=crowned_block,
                 king_pointer=str(crowned_pointer or ""),
                 era_index=state.era_index,
@@ -294,8 +363,7 @@ def demote_to_trained(
         # The throne is being reset, not the loop's position in the manifest
         # stream — dropping the marker here would re-judge the round that
         # triggered the demotion on the next restart.
-        last_handled_round_id=state.last_handled_round_id,
-        last_handled_manifest_sha=state.last_handled_manifest_sha,
+        **_loop_fields(state),
         king_since_block=trained_block,
         king_pointer=str(trained_pointer or ""),
         era_index=state.era_index,
@@ -312,6 +380,31 @@ def dumps(state: ChampionState) -> str:
         era_fields["era_index"] = int(state.era_index)
     if state.tenure_anchor_gate:
         era_fields["tenure_anchor_gate"] = int(state.tenure_anchor_gate)
+    if state.last_handled_block is not None:
+        era_fields["last_handled_block"] = int(state.last_handled_block)
+    if state.reject_config_id:
+        era_fields["reject_config_id"] = state.reject_config_id
+    if state.pre_round is not None:
+        era_fields["pre_round"] = state.pre_round
+    if state.followup_round_id is not None:
+        era_fields["followup_round_id"] = state.followup_round_id
+    if state.king_share_bp is not None:
+        era_fields["king_share_bp"] = int(state.king_share_bp)
+    if state.court_hotkey:
+        era_fields["court_hotkey"] = state.court_hotkey
+        era_fields["court_until_block"] = int(state.court_until_block)
+    if state.king_slashed:
+        era_fields["king_slashed"] = True
+    if state.king_key_lapses:
+        era_fields["king_key_lapses"] = int(state.king_key_lapses)
+    if state.king_lapse_open:
+        era_fields["king_lapse_open"] = True
+    if state.king_slash_until_block:
+        era_fields["king_slash_until_block"] = int(state.king_slash_until_block)
+    if state.king_check_pass is not None:
+        era_fields["king_check_pass"] = state.king_check_pass
+    if state.epoch_init is not None:
+        era_fields["epoch_init"] = state.epoch_init
     return json.dumps(
         {
             **era_fields,
@@ -358,4 +451,24 @@ def loads(text: str) -> ChampionState:
         king_pointer=str(obj.get("king_pointer", "") or ""),
         era_index=(int(obj["era_index"]) if obj.get("era_index") is not None else None),
         tenure_anchor_gate=int(obj.get("tenure_anchor_gate", 0) or 0),
+        last_handled_block=(
+            int(obj["last_handled_block"]) if obj.get("last_handled_block") is not None else None
+        ),
+        reject_config_id=str(obj.get("reject_config_id", "") or ""),
+        pre_round=(dict(obj["pre_round"]) if isinstance(obj.get("pre_round"), dict) else None),
+        followup_round_id=(
+            str(obj["followup_round_id"]) if obj.get("followup_round_id") is not None else None
+        ),
+        king_share_bp=(int(obj["king_share_bp"]) if obj.get("king_share_bp") is not None
+                       else None),
+        court_hotkey=(str(obj["court_hotkey"]) if obj.get("court_hotkey") else None),
+        court_until_block=int(obj.get("court_until_block", 0) or 0),
+        king_slashed=bool(obj.get("king_slashed", False)),
+        king_key_lapses=int(obj.get("king_key_lapses", 0) or 0),
+        king_lapse_open=bool(obj.get("king_lapse_open", False)),
+        king_slash_until_block=int(obj.get("king_slash_until_block", 0) or 0),
+        king_check_pass=(dict(obj["king_check_pass"])
+                         if isinstance(obj.get("king_check_pass"), dict) else None),
+        epoch_init=(dict(obj["epoch_init"]) if isinstance(obj.get("epoch_init"), dict)
+                    else None),
     )

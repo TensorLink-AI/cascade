@@ -27,27 +27,20 @@ can use to turn raw held-out series into :class:`EvalWindow` s.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import zlib
-from collections import Counter, defaultdict
+from collections import defaultdict
 from dataclasses import dataclass, replace
 from typing import Protocol, runtime_checkable
 
 import numpy as np
 
+# The same blake2b seed map as the eval bootstrap, so one ``round_seed``
+# string maps identically everywhere a validator uses it.
+from ..eval.bootstrap import _seed_to_int
 from ..eval.window import EvalWindow
 
 log = logging.getLogger("cascade.validator.windows")
-
-
-def _seed_to_int(seed: int | str) -> int:
-    """Stable seed → 64-bit int (blake2b), matching the eval bootstrap so the
-    same ``round_seed`` string maps identically everywhere a validator uses it."""
-    if isinstance(seed, int):
-        return seed
-    h = hashlib.blake2b(seed.encode("utf-8"), digest_size=8).digest()
-    return int.from_bytes(h, "big", signed=False)
 
 
 @dataclass(frozen=True)
@@ -196,8 +189,8 @@ def _tiered_split(
 
     Domains whose capacity cannot fill an even share of the (shrinking)
     remainder are SCARCE: they draw at full capacity, deterministically, every
-    round — the flat split's jitter could previously starve them below even
-    their caps (r40: web_cloudops drew 48 of ~300 available). The surviving
+    round — the flat split's jitter can starve them far below even their
+    caps. The surviving
     domains split the remaining budget with the jittered capped split under
     ``alpha`` (much tighter than the flat split's — fewer groups spread wider
     at equal alpha). When every domain can fill an even share the scarce set
@@ -328,46 +321,6 @@ def _jittered_pick(
                 sel = rng.choice(len(cell), size=n_cls, replace=False)
                 picks.extend(cell[int(i)] for i in sel)
     return [pool[idx_by_id[s]] for s in picks]
-
-
-def round_composition(windows: list[EvalWindow], mix: MixParams | None = None) -> dict:
-    """The realised composition of one round's served windows — the post-hoc
-    manifest block (DEC-TB-0003). Post-hoc by construction: each round's
-    Dirichlet draw is independent, so publishing it predicts nothing about the
-    next round."""
-    domains = dict(
-        sorted(Counter(str(w.metadata.get("domain") or "unknown") for w in windows).items())
-    )
-    total = sum(domains.values())
-    p = np.array([v / total for v in domains.values() if v], dtype=float)
-    eff = float(np.exp(-(p * np.log(p)).sum())) if p.size else 0.0
-    out = {
-        "n_windows": len(windows),
-        "domains": domains,
-        "effective_domains": round(eff, 2),
-        "cadences": dict(
-            sorted(Counter(str(w.metadata.get("freq") or "?") for w in windows).items())
-        ),
-        "n_dgp_classes": len(
-            {w.metadata.get("dgp_class") for w in windows if w.metadata.get("dgp_class")}
-        ),
-        "n_clusters": len(
-            {w.metadata.get("source") or w.series_id for w in windows}
-        ),
-    }
-    if mix is not None:
-        out["mix"] = {
-            "from_block": mix.from_block,
-            "jitter_alpha": mix.jitter_alpha,
-            "block_slots": mix.block_slots,
-            "class_keep_frac": mix.class_keep_frac,
-            "series_bag_frac": mix.series_bag_frac,
-            "target_windows": mix.target_windows,
-        }
-        if mix.tier_from_block:
-            out["mix"]["tier_from_block"] = mix.tier_from_block
-            out["mix"]["tier_jitter_alpha"] = mix.tier_jitter_alpha
-    return out
 
 
 @runtime_checkable

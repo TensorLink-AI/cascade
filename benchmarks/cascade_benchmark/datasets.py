@@ -1,9 +1,8 @@
 """Fetch the full benchmark datasets and wire them to the suites.
 
 Each suite reads its data from a directory named by an env var (``GIFT_EVAL`` /
-``BOOM`` / ``CASCADE_BENCH_TIME_DATASET``). Historically you had to download those
-by hand; this module pulls each benchmark's HuggingFace dataset repo into a local
-cache and returns the env-var → path mapping the suites expect.
+``BOOM`` / ``CASCADE_BENCH_TIME_DATASET``). This module pulls each benchmark's
+HuggingFace dataset repo into a local cache and returns the env-var → path mapping the suites expect.
 
 The three repos are the upstream sources the suites are written against:
 

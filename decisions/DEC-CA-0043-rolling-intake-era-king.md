@@ -2,11 +2,11 @@
 id: DEC-CA-0043
 type: decision
 title: "Rolling intake + era king: challengers train the moment they are funded, verdicts settle on a 3h grid, the king's leg is trained once per 12h era and cached — every behaviour change block-gated at ONE rollover"
-status: proposed
+status: accepted
 date: 2026-09-20
 tags: [funded, rounds, cadence, king, warm-start, consensus, block-gate]
 revisit_when: "the retrain-noise measurement (DEC-CA-0036's open gate) puts a fixed generator's seed-to-seed checkpoint spread above ~half the 0.5% margin floor (then the confirmation leg ships in this stack before ROLLOVER); or within-era slips (legs landing after their target settlement) turn out common (multi-member cohorts per manifest); or the slowest external validator's settlement time approaches 1h (reconsider the 3h grid); or an era-king manifest is rejected by a validator that could not fetch a 24h-old seed block hash (archive RPC)"
-relations: {builds_on: [DEC-CA-0036, DEC-CA-0038, DEC-CA-0039, DEC-CA-0013, DEC-CA-0004, DEC-CA-0016], revises: [DEC-CA-0013, DEC-CA-0016], related: [DEC-CA-0037, DEC-CA-0044, DEC-CA-0008, DEC-CA-0012]}
+relations: {supersedes: [DEC-CA-0003, DEC-CA-0006, DEC-CA-0011, DEC-CA-0037], builds_on: [DEC-CA-0036, DEC-CA-0038, DEC-CA-0039, DEC-CA-0013, DEC-CA-0004, DEC-CA-0016], revises: [DEC-CA-0013, DEC-CA-0016], related: [DEC-CA-0037, DEC-CA-0044, DEC-CA-0008, DEC-CA-0012]}
 ---
 
 ## Decision
@@ -232,3 +232,5 @@ The confirmation leg — unless the retrain-noise measurement says otherwise
 Stacked on #290 (increment-unit max-T) and #294 (per-leg SKU, per-SKU latest
 safe start). Do not merge until the six external validators run the
 release; ROLLOVER is an owner call, one boundary for every key.
+
+Supersedes [[DEC-CA-0003]] (provisioner fleet escalation), [[DEC-CA-0006]] and [[DEC-CA-0011]] (heat screen and heat standings) and [[DEC-CA-0037]] (duel-only boundary rounds).

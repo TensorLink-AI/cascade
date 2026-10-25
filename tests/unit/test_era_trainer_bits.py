@@ -70,7 +70,7 @@ def _commit(hk, ref, block):
 
 def _registry(tmp_path, mode, prints):
     runner = SimpleNamespace(cfg=SimpleNamespace(round=SimpleNamespace(
-        dedup_max_tokens=50_000, dedup_max_text_mb=4)), work_root=tmp_path)
+        dedup_max_text_mb=4)), work_root=tmp_path)
     reg = DedupRegistry(runner, tmp_path / "dedup_registry.json", mode=mode)
     reg.fingerprint = lambda ref: prints.get(ref)
     return reg
@@ -122,14 +122,12 @@ def test_rent_wait_deadline_honours_the_legs_own_target(tmp_path):
 
     fake = _Fake()
     fake.cfg = SimpleNamespace(round=SimpleNamespace(epoch_blocks=900))
-    fake._funded_epoch_end_wall = time.time() + 100.0
-    fake._stage_ctx, fake._funded_gate_block = {}, None
-    # no per-leg target: the round's epoch end
-    assert fake._funded_rent_wait_deadline() == fake._funded_epoch_end_wall - 13500.0 - 900.0
-    fake._leg_local.end_wall = fake._funded_epoch_end_wall + 50_000.0
-    assert fake._funded_rent_wait_deadline() == fake._funded_epoch_end_wall + 50_000.0 - 14400.0
+    now = time.time()
+    # no per-leg target: no latest safe start, no waiting
+    assert abs(fake._funded_rent_wait_deadline() - now) < 5.0
+    fake._leg_local.end_wall = now + 50_000.0
+    assert fake._funded_rent_wait_deadline() == now + 50_000.0 - 14400.0
     fake._leg_local.end_wall = None
-    assert fake._funded_rent_wait_deadline() == fake._funded_epoch_end_wall - 14400.0
 
 
 # ── rolling roster in the audit ──────────────────────────────────────────────
@@ -205,19 +203,3 @@ def test_rolling_fallback_pool_is_shared_gated_and_reloads_hosts_toml(tmp_path, 
     assert first.name == "lane-a" and pool.get(block=False).name == "lane-b" and pool.empty()
 
 
-def test_round_failure_never_tears_down_rolling_pods():
-    calls = []
-
-    def fake_teardown(why, **kw):
-        calls.append(why)
-    rolling = SimpleNamespace(_teardown_kept_funded_pods=fake_teardown,
-                              _funded_epoch_end_wall=None)
-    rolling.__dict__["_rolling_sched"] = object()
-    assert TrainerRunner._after_round_failure(rolling) == "rolling-keep" and calls == []
-    legacy_in_epoch = SimpleNamespace(_teardown_kept_funded_pods=fake_teardown,
-                                      _funded_epoch_end_wall=time.time() + 3600)
-    assert TrainerRunner._after_round_failure(legacy_in_epoch) == "keep" and calls == []
-    legacy_past = SimpleNamespace(_teardown_kept_funded_pods=fake_teardown,
-                                  _funded_epoch_end_wall=time.time() - 1)
-    assert TrainerRunner._after_round_failure(legacy_past) == "teardown"
-    assert calls == ["round failed before its bench"]

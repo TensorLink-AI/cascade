@@ -1,26 +1,25 @@
-"""Service loop — the full rent→publish→watch→teardown cycle on fakes.
+"""Service loop — the eval-pod rent→publish→teardown cycle, the ledger and
+the hosts files, on fakes.
 
-Every boundary (chain, plan, providers, manifest store, health, clock) is
-injected, so these tests drive whole rounds without a cloud account, a GPU,
-or a real trainer. The hosts.toml the loop publishes is always re-parsed with
-the trainer's own loader — the contract, not the string, is asserted."""
+Every boundary (chain, providers, manifest store, health, clock) is injected,
+so these tests drive whole rentals without a cloud account or a GPU. Every
+hosts file the loop publishes is re-parsed with the trainer's own loader —
+the contract, not the string, is asserted."""
 
 from __future__ import annotations
-
-import json
-import tomllib
 
 import pytest
 
 from cascade.provision.core import PodAddress, ProvisionError
 from cascade.provision.health import CheckResult, HealthReport
-from cascade.provision.loop import ProvisionerLoop, RenderSettings, parse_plan_output
-from cascade.provision.main import build_policy
+from cascade.provision.loop import ProvisionerLoop, RenderSettings
+from cascade.provision.main import build_policy, provider_names
 from cascade.provision.policy import ProvisionPolicy, SkuCandidate, StagePolicy
-from cascade.provision.state import load_state
+from cascade.provision.state import PodInstance, RoundState, load_state, save_state
 from cascade.trainer.remote import RemoteDispatchError, load_hosts
 
 IMG = "reg.example/cascade-worker@sha256:" + "a" * 64
+MANIFEST = {"manifests/latest.json": '{"round_id": "111"}'}
 
 
 # ── fakes ────────────────────────────────────────────────────────────────────
@@ -101,1394 +100,6 @@ def _report(ok=True, name="fake"):
     return HealthReport(checks=(CheckResult(name=name, ok=ok),))
 
 
-def cycle(loop):
-    """One poll tick, joined: renting runs in a worker thread in production;
-    tests join it so assertions see the settled world (same discipline as
-    ``_join_eval``)."""
-    loop.run_once()
-    t = loop._rent_thread
-    if t is not None:
-        t.join(timeout=30)
-
-
-def _policy(**kw):
-    kw.setdefault("heat", StagePolicy(sku="NVIDIA RTX A6000", gpus_per_pod=8, max_pods=2,
-                                      providers=("lium", "shadeform"), max_price_hr=4.0))
-    kw.setdefault("final", StagePolicy(sku="NVIDIA L40S", gpus_per_pod=2, max_pods=2,
-                                       providers=("lium", "shadeform"), max_price_hr=3.0))
-    kw.setdefault("trigger_margin_blocks", 25)
-    kw.setdefault("max_spend_per_round", 25.0)
-    return ProvisionPolicy(**kw)
-
-
-PLAN = {
-    "block": 880, "epoch_blocks": 900, "next_boundary_block": 900,
-    "blocks_to_boundary": 20, "king": "5King", "resolved": 14,
-    "challengers": 13, "eligible_challengers": 12,
-    "heat_train_hours": 0.5, "finalists": 1,
-}
-
-
-def make_loop(tmp_path, *, providers=None, block=880, policy=None, plan=None,
-              clock=None, store=None, health=None, dry_run=False, plan_calls=None,
-              eval_hosts=None, receipt_prefix="", escalate_deadline_s=1800.0,
-              min_viable_fleet=0.5, rent_retry_cooldown_s=900.0,
-              final_rent_on="margin", max_duds_per_stage=8):
-    providers = providers if providers is not None else {"lium": FakeProvider("lium")}
-    plan_calls = plan_calls if plan_calls is not None else []
-
-    def plan_fn():
-        plan_calls.append(1)
-        return dict(plan or PLAN)
-
-    return ProvisionerLoop(
-        policy=policy or _policy(),
-        providers=providers,
-        chain_client=FakeChain(block),
-        plan_fn=plan_fn,
-        render=RenderSettings(image=IMG, ssh_pubkey="ssh-ed25519 AAAA orch",
-                              key_path="~/.ssh/cascade_ed25519"),
-        hosts_path=tmp_path / "hosts.toml",
-        work_root=tmp_path / "work",
-        state_path=tmp_path / "state.json",
-        epoch_blocks=900,                    # 3h epochs → ttl 3h at ttl_epochs=1
-        final_hours=0.25,
-        manifest_store=store,
-        eval_hosts_path=eval_hosts,
-        receipt_prefix=receipt_prefix,
-        health_check=health,
-        dry_run=dry_run,
-        clock=clock or Clock(),
-        escalate_deadline_s=escalate_deadline_s,
-        min_viable_fleet=min_viable_fleet,
-        rent_retry_cooldown_s=rent_retry_cooldown_s,
-        final_rent_on=final_rent_on,
-        max_duds_per_stage=max_duds_per_stage,
-    ), plan_calls
-
-
-# ── happy path ───────────────────────────────────────────────────────────────
-
-
-def test_happy_path_rents_publishes_and_records(tmp_path):
-    prov = FakeProvider("lium")
-    loop, plan_calls = make_loop(tmp_path, providers={"lium": prov})
-    cycle(loop)
-
-    # 12 eligible → 3 heat slots → one 8-GPU pod; king+1 finalist → one 2-GPU pod.
-    assert prov.launched == ["cascade-900-heat-0", "cascade-900-final-0"]
-    assert prov.terminated == []
-
-    hosts = load_hosts(tmp_path / "hosts.toml")             # the trainer's own loader
-    heat = [h for h in hosts if h.stage == "heat"]
-    final = [h for h in hosts if h.stage == "final"]
-    assert len(heat) == 8 and len(final) == 2               # per-GPU fan-out
-    assert {h.cuda_device for h in heat} == {str(i) for i in range(8)}
-    assert all(h.name.startswith("cascade-lium-") and h.stage == "heat" for h in heat)   # stable per-pod names (H4)
-
-    st = load_state(tmp_path / "state.json")
-    assert st.round_id == "900" and st.published
-    assert {(i.stage, i.instance_id) for i in st.instances} == {
-        ("heat", "cascade-900-heat-0"), ("final", "cascade-900-final-0")}
-
-    # Rent-once latch: staying inside the margin must not rent again.
-    cycle(loop)
-    assert plan_calls == [1] and prov.launched == ["cascade-900-heat-0", "cascade-900-final-0"]
-
-
-def test_prewarm_hook_fires_per_healthy_pod_and_never_gates(tmp_path):
-    # The hook runs AFTER the health gate for every healthy pod (it filters
-    # stage itself); a raising hook must cost nothing — the pod stays healthy
-    # and publishes, because pre-warm is an optimization, never a gate.
-    prov = FakeProvider("lium")
-    loop, _ = make_loop(tmp_path, providers={"lium": prov})
-    calls = []
-
-    def prewarm(addr, stage, provider=""):
-        calls.append((stage, provider))
-        raise RuntimeError("boom")
-
-    loop.prewarm = prewarm
-    cycle(loop)
-    assert ("final", "lium") in calls and ("heat", "lium") in calls
-    assert prov.terminated == []                            # nothing gated out
-    hosts = load_hosts(tmp_path / "hosts.toml")
-    assert [h for h in hosts if h.stage == "final"]         # final still published
-
-
-def test_make_bench_prewarm_launches_only_on_final_pods(monkeypatch, tmp_path):
-    import cascade.provision.main as pmain
-
-    ran = []
-    monkeypatch.setattr(pmain.subprocess, "run",
-                        lambda argv, **kw: ran.append((argv, kw.get("input")))
-                        or type("P", (), {"returncode": 0, "stderr": ""})())
-    monkeypatch.setenv("HF_TOKEN", "hf_secret456")
-    render = RenderSettings(image=IMG, ssh_pubkey="ssh-ed25519 AAAA orch",
-                            key_path="~/.ssh/cascade_ed25519")
-    hook = pmain.make_bench_prewarm(render, pod_user="root")
-    hook(PodAddress("10.0.0.9", 2222), "heat", "lium")
-    assert ran == []                                        # heat pods: no-op
-    hook(PodAddress("10.0.0.9", 2222), "final", "lium")
-    assert len(ran) == 1
-    argv, payload = ran[0]
-    remote_cmd = argv[-1]
-    assert "root@10.0.0.9" in argv and "2222" in argv
-    assert "cascade-benchmark-download" in remote_cmd and "nohup" in remote_cmd
-    # the ROUND-CRITICAL token is never forwarded — the pre-warm runs
-    # concurrently with generator fetches and shares quota per token (r51,
-    # 2026-08-30: the download 429-starved both finalists' fetches). Without
-    # a dedicated bench token the download runs anonymous.
-    assert "hf_secret456" not in remote_cmd
-    assert payload is None
-    # a dedicated HF_BENCH_TOKEN rides stdin under the remote's HF_TOKEN name
-    # (what huggingface_hub reads on the pod), never the command string
-    monkeypatch.setenv("HF_BENCH_TOKEN", "hf_bench789")
-    hook(PodAddress("10.0.0.9", 2222), "final", "lium")
-    argv, payload = ran[-1]
-    assert "hf_bench789" not in argv[-1]
-    assert payload == "HF_TOKEN=hf_bench789\n"
-
-
-def test_no_trigger_outside_margin(tmp_path):
-    prov = FakeProvider("lium")
-    loop, plan_calls = make_loop(tmp_path, providers={"lium": prov}, block=800)
-    cycle(loop)
-    assert plan_calls == [] and prov.launched == []
-
-
-def test_dry_run_rents_nothing(tmp_path):
-    prov = FakeProvider("lium")
-    loop, plan_calls = make_loop(tmp_path, providers={"lium": prov}, dry_run=True)
-    cycle(loop)
-    assert plan_calls == [1]
-    assert prov.launched == []
-    assert not (tmp_path / "hosts.toml").exists()
-    assert load_state(tmp_path / "state.json") is None
-    cycle(loop)                                          # latch also applies to dry runs
-    assert plan_calls == [1]
-
-
-# ── provider failure modes ───────────────────────────────────────────────────
-
-
-def test_provider_down_falls_through_to_next(tmp_path):
-    lium = FakeProvider("lium", avail_raises=RuntimeError("api down"))
-    shade = FakeProvider("shadeform")
-    loop, _ = make_loop(tmp_path, providers={"lium": lium, "shadeform": shade})
-    cycle(loop)
-    assert lium.launched == []
-    assert shade.launched == ["cascade-900-heat-0", "cascade-900-final-0"]
-
-
-def test_one_stage_without_capacity_still_rents_the_other(tmp_path):
-    # lium has capacity but only heat's price is acceptable on it… simpler:
-    # heat's only provider is down, final's works → final-only fleet.
-    policy = _policy(heat=StagePolicy(sku="NVIDIA RTX A6000", gpus_per_pod=8, max_pods=2,
-                                      providers=("lium",), max_price_hr=4.0),
-                     final=StagePolicy(sku="NVIDIA L40S", gpus_per_pod=2, max_pods=2,
-                                       providers=("shadeform",), max_price_hr=3.0))
-    lium = FakeProvider("lium", available=False)
-    shade = FakeProvider("shadeform")
-    loop, _ = make_loop(tmp_path, providers={"lium": lium, "shadeform": shade}, policy=policy)
-    cycle(loop)
-    assert lium.launched == []
-    assert shade.launched == ["cascade-900-final-0"]
-    hosts = load_hosts(tmp_path / "hosts.toml")
-    assert all(h.stage == "final" for h in hosts)            # degraded, not dead
-
-
-def test_all_providers_down_clears_hosts_round_never_lost(tmp_path):
-    prov = FakeProvider("lium", available=False)
-    loop, plan_calls = make_loop(tmp_path, providers={"lium": prov})
-    cycle(loop)
-    assert prov.launched == []
-    # Empty hosts file = the trainer's explicit local-fallback signal.
-    assert (tmp_path / "hosts.toml").is_file()
-    with pytest.raises(RemoteDispatchError):
-        load_hosts(tmp_path / "hosts.toml")
-    cycle(loop)                                          # latched: no 30s hammering
-    assert plan_calls == [1]
-
-
-def test_overpriced_offer_skips_that_provider(tmp_path):
-    dear = FakeProvider("lium", price=99.0)                  # above both stage caps
-    fair = FakeProvider("shadeform", price=2.0)
-    loop, _ = make_loop(tmp_path, providers={"lium": dear, "shadeform": fair})
-    cycle(loop)
-    assert dear.launched == [] and len(fair.launched) == 2
-
-
-def test_budget_breaker_refuses_to_rent(tmp_path):
-    # Prices are under the per-stage caps, but worst-case (ttl = 3h epoch)
-    # projection 2 pods × $2.0 × 3h = $12 > the $10 round cap → refuse ALL.
-    prov = FakeProvider("lium", price=2.0)
-    loop, _ = make_loop(tmp_path, providers={"lium": prov},
-                        policy=_policy(max_spend_per_round=10.0))
-    cycle(loop)
-    assert prov.launched == []
-    with pytest.raises(RemoteDispatchError):
-        load_hosts(tmp_path / "hosts.toml")                  # cleared → local fallback
-
-
-# ── health gate: terminate + one replacement ─────────────────────────────────
-
-
-def test_unhealthy_pod_replaced_once(tmp_path):
-    prov = FakeProvider("lium")
-    bad_ips = {"10.0.0.1"}                                   # the first heat pod's IP
-
-    def health(addr, stage, provider="", **shape):
-        return _report(ok=addr.ip not in bad_ips)
-
-    loop, _ = make_loop(tmp_path, providers={"lium": prov}, health=health)
-    cycle(loop)
-    assert prov.terminated == ["cascade-900-heat-0"]
-    assert "cascade-900-heat-r0-0" in prov.launched          # the one replacement
-    st = load_state(tmp_path / "state.json")
-    assert {i.instance_id for i in st.instances} == {
-        "cascade-900-heat-r0-0", "cascade-900-final-0"}
-    heat = [h for h in load_hosts(tmp_path / "hosts.toml") if h.stage == "heat"]
-    assert all(h.host == "10.0.0.2" for h in heat)           # the replacement's IP
-
-
-def test_replacement_also_unhealthy_drops_the_slot(tmp_path):
-    prov = FakeProvider("lium")
-
-    def health(addr, stage, provider="", **shape):
-        return _report(ok=(stage != "heat"))                 # every heat pod is a lemon
-
-    loop, _ = make_loop(tmp_path, providers={"lium": prov}, health=health)
-    cycle(loop)
-    # Original + its single replacement both terminated; no third attempt.
-    assert prov.terminated == ["cascade-900-heat-0", "cascade-900-heat-r0-0"]
-    hosts = load_hosts(tmp_path / "hosts.toml")
-    assert all(h.stage == "final" for h in hosts)            # heat degraded away
-    st = load_state(tmp_path / "state.json")
-    assert {i.instance_id for i in st.instances} == {"cascade-900-final-0"}
-
-
-def test_replacement_excludes_the_failed_pods_machine(tmp_path):
-    """Incident 2026-07-14 round 5052267627071284702: the eval pod failed its
-    boot gate and the replacement re-rented the SAME lium executor (offer
-    lists are deterministic), so it failed identically. The replacement spec
-    must exclude the lemon's machine."""
-
-    class MachineAwareProvider(FakeProvider):
-        machines = ("m-lemon", "m-good", "m-spare")
-
-        def __init__(self, name, **kw):
-            super().__init__(name, **kw)
-            self.machine_by_pod: dict[str, str] = {}
-            self.specs = []
-
-        def launch(self, spec):
-            self.specs.append(spec)
-            offers = [m for m in self.machines if m not in spec.exclude_ids]
-            ids = super().launch(spec)
-            for i, pid in enumerate(ids):                    # head-of-list pick, like lium
-                self.machine_by_pod[pid] = offers[i]
-            return ids
-
-        def machine_of(self, pod_id):
-            return self.machine_by_pod.get(pod_id)
-
-    prov = MachineAwareProvider("lium")
-
-    def health(addr, stage, provider="", **shape):
-        pid = next(p for p, a in prov.live.items() if a.ip == addr.ip)
-        return _report(ok=not (stage == "heat" and prov.machine_by_pod[pid] == "m-lemon"))
-
-    loop, _ = make_loop(tmp_path, providers={"lium": prov}, health=health)
-    cycle(loop)
-
-    rspec = next(s for s in prov.specs if "-r0" in s.name_prefix)
-    assert rspec.exclude_ids == ("m-lemon",)                 # the fix
-    assert prov.machine_by_pod["cascade-900-heat-r0-0"] == "m-good"
-    heat = [h for h in load_hosts(tmp_path / "hosts.toml") if h.stage == "heat"]
-    assert heat and all(h.host == prov.live["cascade-900-heat-r0-0"].ip for h in heat)
-
-
-def test_image_digest_failure_excludes_the_facility(tmp_path):
-    """Incident 2026-08-30 r51: a final pod booted a STALE image (facility
-    host-image cache) and its same-region replacement predictably booted the
-    same wrong image. An image_digest gate failure must walk the replacement
-    to a different region; other failures keep machine-level exclusion only."""
-
-    class RegionAwareProvider(FakeProvider):
-        regions = ("kansascity-usa-1", "chicago-usa-2")
-
-        def __init__(self, name, **kw):
-            super().__init__(name, **kw)
-            self.region_by_pod: dict[str, str] = {}
-            self.specs = []
-
-        def launch(self, spec):
-            self.specs.append(spec)
-            region = next(r for r in self.regions if r not in spec.exclude_regions)
-            ids = super().launch(spec)
-            for pid in ids:
-                self.region_by_pod[pid] = region
-            return ids
-
-        def region_of(self, pod_id):
-            return self.region_by_pod.get(pod_id)
-
-    prov = RegionAwareProvider("lium")
-
-    def health(addr, stage, provider="", **shape):
-        pid = next(p for p, a in prov.live.items() if a.ip == addr.ip)
-        stale = (stage == "heat"
-                 and prov.region_by_pod[pid] == "kansascity-usa-1")
-        return _report(ok=not stale, name="image_digest")
-
-    loop, _ = make_loop(tmp_path, providers={"lium": prov}, health=health)
-    cycle(loop)
-
-    rspec = next(s for s in prov.specs if "-r0" in s.name_prefix)
-    assert rspec.exclude_regions == ("kansascity-usa-1",)    # the fix
-    assert prov.region_by_pod["cascade-900-heat-r0-0"] == "chicago-usa-2"
-    heat = [h for h in load_hosts(tmp_path / "hosts.toml") if h.stage == "heat"]
-    assert heat and all(h.host == prov.live["cascade-900-heat-r0-0"].ip for h in heat)
-    assert loop._gate_failures == {}                         # consumed, no leak
-
-
-def test_every_pod_unhealthy_clears_hosts(tmp_path):
-    prov = FakeProvider("lium")
-    loop, _ = make_loop(tmp_path, providers={"lium": prov},
-                        health=lambda addr, stage, provider="", **shape: _report(ok=False))
-    cycle(loop)
-    assert prov.live == {}                                    # nothing left billing
-    with pytest.raises(RemoteDispatchError):
-        load_hosts(tmp_path / "hosts.toml")
-
-
-# ── rules of escalation: empty rung → next rung; partial fleet → top-up ──────
-
-
-class LaunchFailProvider(FakeProvider):
-    """Capacity probe says yes, the actual rent call 500s — the gap that
-    escalation rule 2 closes (a launch failure used to lose the stage)."""
-
-    def launch(self, spec):
-        raise RuntimeError("api 500")
-
-
-def test_launch_failure_escalates_to_next_provider(tmp_path):
-    lium = LaunchFailProvider("lium")
-    shade = FakeProvider("shadeform")
-    loop, _ = make_loop(tmp_path, providers={"lium": lium, "shadeform": shade})
-    cycle(loop)
-    # Both stages: lium accepted the probe, failed the launch → the same rung
-    # on shadeform rents instead (escalation batch names carry -e1).
-    assert lium.launched == []
-    assert shade.launched == ["cascade-900-heat-e1-0", "cascade-900-final-e1-0"]
-    hosts = load_hosts(tmp_path / "hosts.toml")
-    assert {h.stage for h in hosts} == {"heat", "final"}
-
-
-def test_all_duds_on_one_provider_escalate_to_the_next(tmp_path):
-    lium = FakeProvider("lium")
-    shade = FakeProvider("shadeform")
-
-    def health(addr, stage, provider="", **shape):
-        return _report(ok=provider != "lium")                # a bad lium batch
-
-    loop, _ = make_loop(tmp_path, providers={"lium": lium, "shadeform": shade},
-                        health=health)
-    cycle(loop)
-    # Per stage on lium: the pod AND its one replacement were duds → the stage
-    # (not just the slot) escalates and rents healthy on shadeform.
-    assert lium.live == {} and len(lium.terminated) == 4     # heat+final, orig+repl
-    assert shade.launched == ["cascade-900-heat-e1-0", "cascade-900-final-e1-0"]
-    st = load_state(tmp_path / "state.json")
-    assert {i.instance_id for i in st.instances} == {
-        "cascade-900-heat-e1-0", "cascade-900-final-e1-0"}
-
-
-def test_zero_deadline_disables_escalation(tmp_path):
-    lium = LaunchFailProvider("lium")
-    shade = FakeProvider("shadeform")
-    loop, _ = make_loop(tmp_path, providers={"lium": lium, "shadeform": shade},
-                        escalate_deadline_s=0.0)
-    cycle(loop)
-    # Deadline already spent at the first failure → pre-escalation behaviour:
-    # the stage degrades, hosts clear, the trainer covers the round locally.
-    assert shade.launched == []
-    with pytest.raises(RemoteDispatchError):
-        load_hosts(tmp_path / "hosts.toml")
-
-
-def test_escalated_rung_rechecked_against_budget(tmp_path):
-    # Primary heat rung (one 8x pod) passes the round gate; its launch fails.
-    # The only fallback rung (1x singles → 3 pods) would blow the round cap
-    # with the final included → refused, ladder exhausted, heat degrades —
-    # but the final still rents.
-    class HeatLaunchFails(FakeProvider):
-        def launch(self, spec):
-            if "-heat" in spec.name_prefix:
-                raise RuntimeError("no heat capacity after all")
-            return super().launch(spec)
-
-    prov = HeatLaunchFails("lium", price=2.0)
-    policy = _policy(
-        heat=StagePolicy(sku="NVIDIA RTX A6000", gpus_per_pod=8, max_pods=4,
-                         providers=("lium",), max_price_hr=4.0,
-                         candidates=(SkuCandidate(sku="NVIDIA RTX A6000",
-                                                  gpus_per_pod=1, max_price_hr=4.0),)),
-        final=StagePolicy(sku="NVIDIA L40S", gpus_per_pod=2, max_pods=2,
-                          providers=("lium",), max_price_hr=3.0),
-        max_spend_per_round=20.0)
-    # Initial projection: (1 heat + 1 final) × $2 × 3h TTL = $12 <= $20. The
-    # escalated rung projects 3 × $2 × 3h = $18 heat + $6 final = $24 > $20.
-    loop, _ = make_loop(tmp_path, providers={"lium": prov}, policy=policy)
-    cycle(loop)
-    assert prov.launched == ["cascade-900-final-0"]
-    hosts = load_hosts(tmp_path / "hosts.toml")
-    assert all(h.stage == "final" for h in hosts)            # degraded, not dead
-
-
-def test_below_viability_partial_fleet_tops_up_same_candidate(tmp_path):
-    prov = FakeProvider("lium")
-    plan = dict(PLAN, eligible_challengers=80)               # 19 slots → 3 × 8-GPU pods
-    # Heat pods rent as .1/.2/.3; replacements draw .4/.5. Duds: pods 0 and 1
-    # AND their replacements → 1 of 3 pods healthy = 8 of 19 slots < 50%.
-    bad = {"10.0.0.1", "10.0.0.2", "10.0.0.4", "10.0.0.5"}
-
-    def health(addr, stage, provider="", **shape):
-        return _report(ok=addr.ip not in bad)
-
-    policy = _policy(
-        heat=StagePolicy(sku="NVIDIA RTX A6000", gpus_per_pod=8, max_pods=3,
-                         providers=("lium",), max_price_hr=4.0),
-        max_spend_per_round=100.0)
-    loop, _ = make_loop(tmp_path, providers={"lium": prov}, plan=plan,
-                        policy=policy, health=health)
-    cycle(loop)
-
-    # One same-candidate top-up batch re-rents exactly the two missing pods.
-    assert "cascade-900-heat-t0-0" in prov.launched
-    assert "cascade-900-heat-t0-1" in prov.launched
-    heat = [h for h in load_hosts(tmp_path / "hosts.toml") if h.stage == "heat"]
-    assert len(heat) == 3 * 8                                # back to full strength
-    st = load_state(tmp_path / "state.json")
-    heat_ids = {i.instance_id for i in st.instances if i.stage == "heat"}
-    assert heat_ids == {"cascade-900-heat-2",
-                        "cascade-900-heat-t0-0", "cascade-900-heat-t0-1"}
-
-
-def test_failed_round_retries_after_cooldown(tmp_path):
-    prov = FakeProvider("lium", available=False)
-    clock = Clock()
-    loop, plan_calls = make_loop(tmp_path, providers={"lium": prov}, clock=clock)
-    cycle(loop)
-    assert prov.launched == []                               # trigger found no capacity
-    cycle(loop)                                          # inside cooldown: latched
-    assert prov.launched == [] and plan_calls == [1]
-
-    prov._available = True                                   # the market recovered
-    clock.t += 901                                           # cooldown elapsed
-    cycle(loop)
-    # Both failed stages re-entered pick→budget→rent — no new plan_fn call
-    # (the trigger's payload is cached; reveals are closed mid-round anyway).
-    assert plan_calls == [1]
-    assert prov.launched == ["cascade-900-heat-0", "cascade-900-final-0"]
-    hosts = load_hosts(tmp_path / "hosts.toml")
-    assert {h.stage for h in hosts} == {"heat", "final"}
-
-
-def test_retry_gives_up_when_the_window_closes(tmp_path):
-    prov = FakeProvider("lium", available=False)
-    clock = Clock()
-    loop, _ = make_loop(tmp_path, providers={"lium": prov}, clock=clock)
-    cycle(loop)
-
-    prov._available = True
-    clock.t += 901
-    loop.chain_client.block = 1700                           # 0.33h left in the round:
-    cycle(loop)                                          # heat needs 0.5h + final
-    assert prov.launched == []                               # window closed → no rent
-    assert loop._stage_failed == set()                       # and no further retries
-
-
-def test_final_defers_until_heat_marker_and_sizes_off_it(tmp_path):
-    prov = FakeProvider("lium")
-    policy = _policy(max_spend_per_round=100.0)
-    loop, _ = make_loop(tmp_path, providers={"lium": prov}, policy=policy,
-                        final_rent_on="heat_complete")
-    cycle(loop)
-    # Margin trigger rents the HEAT only; the final waits on the trainer.
-    assert prov.launched == ["cascade-900-heat-0"]
-    assert load_state(tmp_path / "state.json").final_pending is True
-
-    # The trainer settles the heat: marker names TWO actual finalists (the
-    # plan predicted one) — the JIT fleet must match the marker, not the plan.
-    marker_dir = tmp_path / "work" / "777"
-    marker_dir.mkdir(parents=True)
-    (marker_dir / "heat_complete.json").write_text(json.dumps(
-        {"round_id": "777", "screened": 12, "finalists": ["f1", "f2"]}))
-    cycle(loop)
-    # Same tick: the marker tears the heat down AND rents the final — sized
-    # 1 + 2 actual finalists = 3 slots → two 2-GPU pods.
-    assert "cascade-900-heat-0" in prov.terminated
-    assert prov.launched[1:] == ["cascade-900-final-0", "cascade-900-final-1"]
-    hosts = load_hosts(tmp_path / "hosts.toml")
-    assert all(h.stage == "final" for h in hosts) and len(hosts) == 4
-    st = load_state(tmp_path / "state.json")
-    assert st.final_pending is False
-    assert {i.stage for i in st.instances} == {"final"}
-
-
-def test_scarce_final_market_rents_early_at_the_margin(tmp_path):
-    """The JIT exception: when the pinned SKU's primary rung probes scarce at
-    the margin, the final rents EARLY (locking whatever the ladder finds)
-    instead of gambling that capacity exists hours later."""
-
-    class NoTwoGpuPods(FakeProvider):
-        def available(self, sku, count, *, gpus=1):
-            return gpus != 2                                 # 2x L40S pool is dry
-
-    prov = NoTwoGpuPods("lium")
-    policy = _policy(
-        final=StagePolicy(sku="NVIDIA L40S", gpus_per_pod=2, max_pods=2,
-                          providers=("lium",), max_price_hr=3.0,
-                          candidates=(SkuCandidate(sku="NVIDIA L40S",
-                                                   gpus_per_pod=1, max_price_hr=1.5),)))
-    loop, _ = make_loop(tmp_path, providers={"lium": prov}, policy=policy,
-                        final_rent_on="heat_complete")
-    cycle(loop)
-    # Final rented at the margin via the 1x fallback rung — not deferred.
-    assert "cascade-900-final-0" in prov.launched
-    assert "cascade-900-final-1" in prov.launched
-    assert load_state(tmp_path / "state.json").final_pending is False
-
-
-def test_final_retry_ignores_a_previous_rounds_stale_marker(tmp_path):
-    """A pre-marker final retry must size off the PLAN, not whatever old
-    heat_complete.json the work-root still holds: a stale 5-finalist marker
-    inflated the retry fleet past the budget cap and sank the whole retry."""
-    marker_dir = tmp_path / "work" / "555"                   # a PREVIOUS round's
-    marker_dir.mkdir(parents=True)                           # marker, 5 finalists
-    (marker_dir / "heat_complete.json").write_text(json.dumps(
-        {"round_id": "555", "screened": 30,
-         "finalists": ["a", "b", "c", "d", "e"]}))
-
-    prov = FakeProvider("lium", available=False)
-    clock = Clock()
-    loop, _ = make_loop(tmp_path, providers={"lium": prov}, clock=clock)
-    cycle(loop)                                          # trigger: market dry
-    prov._available = True
-    clock.t += 901
-    cycle(loop)                                          # retry: market back
-    # Plan says 1 finalist → 2 slots → ONE 2-GPU final pod (and the budget
-    # gate passes: $12 heat + $6 final <= $25).
-    assert prov.launched == ["cascade-900-heat-0", "cascade-900-final-0"]
-
-
-def test_final_pending_survives_restart(tmp_path):
-    prov = FakeProvider("lium")
-    policy = _policy(max_spend_per_round=100.0)
-    loop, _ = make_loop(tmp_path, providers={"lium": prov}, policy=policy,
-                        final_rent_on="heat_complete")
-    cycle(loop)
-    assert load_state(tmp_path / "state.json").final_pending is True
-
-    # New process, same ledger: still waiting on the marker (heat instances
-    # exist → the marker scan re-anchors on their rent times).
-    loop2, _ = make_loop(tmp_path, providers={"lium": prov}, policy=policy,
-                         final_rent_on="heat_complete")
-    assert loop2._final_pending is True
-    assert loop2._heat_marker_latched is False
-
-
-def test_rent_runs_off_the_loop_thread(tmp_path):
-    """Renting must never block the poll loop (the 2026-07-14 lesson): the
-    worker can sit in a provider call for minutes while ticks keep landing —
-    and the orphan reaper must NOT run mid-rent, when the worker may own pods
-    it has not ledgered yet."""
-    import threading as _t
-    gate = _t.Event()
-
-    class BlockingProvider(FakeProvider):
-        def launch(self, spec):
-            gate.wait(timeout=30)
-            return super().launch(spec)
-
-    prov = BlockingProvider("lium")
-    loop, _ = make_loop(tmp_path, providers={"lium": prov})
-    loop.run_once()                              # returns while launch is stuck
-    assert loop._rent_inflight and prov.launched == []
-    prov.live["cascade-900-heat-x9"] = PodAddress("10.9.9.9", 22)   # a stray
-    loop.run_once()                              # loop still ticking mid-rent…
-    assert "cascade-900-heat-x9" in prov.live    # …but reaping is deferred
-    gate.set()
-    loop._rent_thread.join(timeout=30)
-    assert "cascade-900-heat-0" in prov.launched
-    loop.run_once()                              # worker done → stray reaped now
-    assert "cascade-900-heat-x9" not in prov.live
-
-
-def test_manifest_mid_rent_aborts_the_worker_and_pods_are_reaped(tmp_path):
-    """The round can END while a rent worker is mid-flight (manifest publish).
-    The worker must not publish pods for a dead round; whatever it ledgered
-    dies in the teardown sweep."""
-    import threading as _t
-    gate = _t.Event()
-    final_entered = _t.Event()
-
-    class FinalBlocks(FakeProvider):
-        def launch(self, spec):
-            if "-final" in spec.name_prefix:
-                final_entered.set()
-                gate.wait(timeout=30)
-            return super().launch(spec)
-
-    prov = FinalBlocks("lium")
-    store = FakeStore({"manifests/latest.json": '{"round_id": "1"}'})
-    loop, _ = make_loop(tmp_path, providers={"lium": prov}, store=store)
-    loop.run_once()                              # worker: heat rents, final blocks
-    assert final_entered.wait(timeout=30)        # heat is healthy + ledgered now
-    store.texts["manifests/latest.json"] = '{"round_id": "2"}'   # round over
-    loop.run_once()                              # teardown reaps heat, arms abort
-    assert "cascade-900-heat-0" in prov.terminated
-    gate.set()
-    loop._rent_thread.join(timeout=30)
-    loop.run_once()                              # the aborted rental's pods die too
-    assert "cascade-900-final-0" in prov.terminated
-    with pytest.raises(RemoteDispatchError):
-        load_hosts(tmp_path / "hosts.toml")      # never published for a dead round
-
-
-def test_dud_attempt_backs_off_the_retry_cooldown(tmp_path):
-    prov = FakeProvider("lium")
-    clock = Clock()
-    loop, _ = make_loop(tmp_path, providers={"lium": prov}, clock=clock,
-                        health=lambda a, s, provider="", **k: _report(ok=False))
-    cycle(loop)                                  # every pod a dud
-    n0 = len(prov.launched)
-    assert n0 > 0
-    assert loop._retry_backoff == {"heat": 2.0, "final": 2.0}
-    clock.t += 901                               # one FLAT cooldown: not yet —
-    cycle(loop)                                  # dud attempts pay double
-    assert len(prov.launched) == n0
-    clock.t += 1000                              # past 2× cooldown → retried
-    cycle(loop)
-    assert len(prov.launched) > n0
-    assert loop._retry_backoff == {"heat": 4.0, "final": 4.0}    # and doubled again
-
-
-def test_dud_cap_stops_renting_for_the_round(tmp_path):
-    prov = FakeProvider("lium")
-    clock = Clock()
-    loop, _ = make_loop(tmp_path, providers={"lium": prov}, clock=clock,
-                        health=lambda a, s, provider="", **k: _report(ok=False),
-                        max_duds_per_stage=2)
-    cycle(loop)                                  # pod + replacement dud per stage = at cap
-    n0 = len(prov.launched)
-    clock.t += 100_000                           # far past any backoff
-    cycle(loop)
-    assert len(prov.launched) == n0              # money backstop: no more renting
-    assert loop._stage_failed == set()           # and no further retry attempts
-
-
-def test_pending_final_gives_up_when_window_closes(tmp_path):
-    prov = FakeProvider("lium")
-    policy = _policy(max_spend_per_round=100.0)
-    loop, _ = make_loop(tmp_path, providers={"lium": prov}, policy=policy,
-                        final_rent_on="heat_complete")
-    cycle(loop)                                  # heat rented; final pending
-    assert load_state(tmp_path / "state.json").final_pending is True
-    loop.chain_client.block = 1760               # 8 min left; marker never came
-    cycle(loop)
-    assert load_state(tmp_path / "state.json").final_pending is False
-    assert not any("-final" in p for p in prov.launched)
-
-
-def test_viable_partial_fleet_does_not_top_up(tmp_path):
-    prov = FakeProvider("lium")
-    plan = dict(PLAN, eligible_challengers=80)               # 19 slots → 3 × 8-GPU pods
-    bad = {"10.0.0.1", "10.0.0.4"}                           # pod 0 + its replacement
-
-    def health(addr, stage, provider="", **shape):
-        return _report(ok=addr.ip not in bad)
-
-    policy = _policy(
-        heat=StagePolicy(sku="NVIDIA RTX A6000", gpus_per_pod=8, max_pods=3,
-                         providers=("lium",), max_price_hr=4.0),
-        max_spend_per_round=100.0)
-    loop, _ = make_loop(tmp_path, providers={"lium": prov}, plan=plan,
-                        policy=policy, health=health)
-    cycle(loop)
-    # 2 of 3 pods = 16 of 19 slots >= 50% → viable; the dropped slot stays
-    # dropped (serial waves), no top-up batch and no escalation.
-    assert not any("-t0" in p or "-e1" in p for p in prov.launched)
-    heat = [h for h in load_hosts(tmp_path / "hosts.toml") if h.stage == "heat"]
-    assert len(heat) == 2 * 8
-
-
-# ── watch + per-stage teardown ───────────────────────────────────────────────
-
-
-def _provisioned(tmp_path, **kw):
-    prov = FakeProvider("lium")
-    loop, _ = make_loop(tmp_path, providers={"lium": prov}, **kw)
-    cycle(loop)
-    assert len(prov.live) == 2
-    return loop, prov
-
-
-def test_heat_marker_tears_down_heat_while_final_runs(tmp_path):
-    clock = Clock()
-    loop, prov = _provisioned(tmp_path, clock=clock)
-    # The trainer settles the heat: work_root/<base_seed>/heat_complete.json.
-    # The provisioner keys rounds by boundary block and cannot know base_seed
-    # in advance — ANY marker newer than rent time is this round's signal.
-    marker_dir = tmp_path / "work" / "54321"
-    marker_dir.mkdir(parents=True)
-    (marker_dir / "heat_complete.json").write_text(
-        json.dumps({"round_id": "54321", "screened": 12, "finalists": ["hk"]}))
-    clock.t += 3600.0                                        # 1h in: TTL (3h) not due
-
-    cycle(loop)
-    assert prov.terminated == ["cascade-900-heat-0"]
-    assert "cascade-900-final-0" in prov.live                # final keeps training
-    hosts = load_hosts(tmp_path / "hosts.toml")              # re-rendered final-only
-    assert [h.stage for h in hosts] == ["final", "final"]
-    st = load_state(tmp_path / "state.json")
-    assert {i.stage for i in st.instances} == {"final"}
-
-
-class SeededChain(FakeChain):
-    """A chain that can answer block_seed(boundary) — the real ChainClient
-    surface the provisioner uses to match a marker to the round it belongs to."""
-
-    def __init__(self, block, seed):
-        super().__init__(block)
-        self._seed = seed
-
-    def block_seed(self, boundary):
-        return self._seed
-
-
-def test_zombie_marker_for_a_different_round_is_ignored(tmp_path):
-    # A zombie trainer re-touching an OLD round's heat_complete.json bumps its
-    # mtime past our rent time, so the mtime heuristic alone read it as THIS
-    # round's heat completing and tore down the fleet. Match the marker's
-    # work-dir base_seed to the round we are actually serving instead.
-    clock = Clock()
-    prov = FakeProvider("lium")
-    loop, _ = make_loop(tmp_path, providers={"lium": prov}, clock=clock)
-    loop.chain_client = SeededChain(880, 54321)     # this round's base_seed = 54321
-    cycle(loop)
-    assert len(prov.live) == 2
-
-    # A zombie from a PRIOR round re-touches ITS marker (a different base_seed).
-    zombie = tmp_path / "work" / "99999"
-    zombie.mkdir(parents=True)
-    (zombie / "heat_complete.json").write_text(
-        json.dumps({"round_id": "99999", "screened": 5, "finalists": ["z"]}))
-    clock.t += 1800.0
-    cycle(loop)
-    assert prov.terminated == []                     # zombie ignored: fleet intact
-    assert len(prov.live) == 2
-
-    # This round's OWN marker (matching base_seed) settles the heat for real.
-    real = tmp_path / "work" / "54321"
-    real.mkdir(parents=True)
-    (real / "heat_complete.json").write_text(
-        json.dumps({"round_id": "54321", "screened": 12, "finalists": ["hk"]}))
-    clock.t += 1800.0
-    cycle(loop)
-    assert prov.terminated == ["cascade-900-heat-0"]  # heat down, final keeps running
-    assert "cascade-900-final-0" in prov.live
-
-
-def test_manifest_tears_down_everything(tmp_path):
-    clock = Clock()
-    store = FakeStore()
-    loop, prov = _provisioned(tmp_path, clock=clock, store=store)
-    # Marker lands (teaches the provisioner base_seed 54321)…
-    d = tmp_path / "work" / "54321"
-    d.mkdir(parents=True)
-    (d / "heat_complete.json").write_text("{}")
-    clock.t += 1800.0
-    cycle(loop)
-    assert "cascade-900-final-0" in prov.live
-    # …then the round manifest publishes at the learned round id.
-    store.texts["manifests/round-54321.json"] = '{"round_id": "54321"}'
-    clock.t += 1800.0
-    cycle(loop)
-    assert prov.live == {}
-    with pytest.raises(RemoteDispatchError):
-        load_hosts(tmp_path / "hosts.toml")                  # cleared
-    assert load_state(tmp_path / "state.json").instances == ()
-
-
-def test_bench_pending_marker_holds_final_past_manifest(tmp_path):
-    # Cascade duel bench: the trainer drops bench_pending.json just before the
-    # manifest publishes, so the manifest — normally the final pod's death
-    # signal — must not reap it while the bench still runs on it. Heat pods are
-    # unaffected. bench_complete.json releases the hold.
-    clock = Clock()
-    store = FakeStore()
-    loop, prov = _provisioned(tmp_path, clock=clock, store=store)
-    loop.bench_hold_max_hours = 2.0                          # cascade_enabled wiring
-    d = tmp_path / "work" / "54321"
-    d.mkdir(parents=True)
-    (d / "heat_complete.json").write_text("{}")
-    clock.t += 900.0
-    cycle(loop)                                              # heat settles; learns the id
-    assert prov.terminated == ["cascade-900-heat-0"]         # heat dies as always
-    # The trainer arms the hold just before publishing, then the manifest lands.
-    (d / "bench_pending.json").write_text('{"round_id": "54321"}')
-    store.texts["manifests/round-54321.json"] = '{"round_id": "54321"}'
-    clock.t += 900.0
-    cycle(loop)
-    assert "cascade-900-final-0" in prov.live                # final held for the bench
-    # Report uploaded (or bench failed): the trainer writes bench_complete and
-    # removes the pending marker — the very next sweep reaps the final pod.
-    (d / "bench_complete.json").write_text('{"round_id": "54321", "uploaded": true}')
-    (d / "bench_pending.json").unlink()
-    clock.t += 60.0
-    cycle(loop)
-    assert prov.live == {}
-
-
-def test_bench_hold_expires_at_the_cap(tmp_path):
-    # A crashed/wedged bench never clears its marker: past bench_hold_max_hours
-    # the pod is reaped regardless (the extra pod-hours are the accepted cost,
-    # an eternally-billing pod is not).
-    clock = Clock()
-    store = FakeStore()
-    loop, prov = _provisioned(tmp_path, clock=clock, store=store)
-    loop.bench_hold_max_hours = 0.5
-    d = tmp_path / "work" / "54321"
-    d.mkdir(parents=True)
-    (d / "heat_complete.json").write_text("{}")
-    clock.t += 60.0
-    cycle(loop)                                              # heat settles; learns the id
-    (d / "bench_pending.json").write_text('{"round_id": "54321"}')
-    store.texts["manifests/round-54321.json"] = '{"round_id": "54321"}'
-    clock.t += 60.0
-    cycle(loop)
-    assert "cascade-900-final-0" in prov.live                # inside the cap: held
-    clock.t += 0.5 * 3600.0                                  # cap elapsed
-    cycle(loop)
-    assert prov.live == {}
-
-
-def test_bench_marker_ignored_when_hold_disabled(tmp_path):
-    # cascade_enabled off ⇒ the provisioner wires bench_hold_max_hours = 0 and
-    # a (stray) marker changes nothing: teardown is byte-identical to before.
-    clock = Clock()
-    store = FakeStore()
-    loop, prov = _provisioned(tmp_path, clock=clock, store=store)
-    assert loop.bench_hold_max_hours == 0.0                  # the default
-    d = tmp_path / "work" / "54321"
-    d.mkdir(parents=True)
-    (d / "heat_complete.json").write_text("{}")
-    (d / "bench_pending.json").write_text('{"round_id": "54321"}')
-    clock.t += 900.0
-    cycle(loop)
-    store.texts["manifests/round-54321.json"] = '{"round_id": "54321"}'
-    clock.t += 900.0
-    cycle(loop)
-    assert prov.live == {}
-
-
-def test_bench_hold_rearms_for_a_new_rounds_marker(tmp_path):
-    # Regression: one round's EXPIRED hold (crashed bench, cap ran out, pod
-    # reaped) must not deny the next round's bench its own hold. Once the
-    # ledger empties the sweep stops consulting _bench_hold, so the latch
-    # can't rely on being reset between rounds — a different marker identity
-    # must re-arm it.
-    from datetime import UTC, datetime
-
-    from cascade.provision.state import PodInstance, RoundState
-
-    clock = Clock()
-    loop, _ = make_loop(tmp_path, clock=clock)
-    loop.bench_hold_max_hours = 1.0
-    (tmp_path / "work").mkdir(parents=True, exist_ok=True)
-
-    def _fleet(round_key):
-        return RoundState(round_id=round_key, instances=(
-            PodInstance(provider="lium", instance_id=f"{round_key}-final", stage="final",
-                        rented_at_iso=datetime.fromtimestamp(clock.t, tz=UTC).isoformat()),))
-
-    # Round 111: hold arms, the trainer dies mid-bench, the cap expires.
-    loop._state = _fleet("900")
-    d1 = tmp_path / "work" / "111"
-    d1.mkdir(parents=True)
-    (d1 / "bench_pending.json").write_text('{"round_id": "111"}')
-    assert loop._bench_hold() is True
-    clock.t += 1.0 * 3600.0
-    assert loop._bench_hold() is False                       # expired: reap regardless
-    # Round 222: fresh fleet, fresh marker (the old round's marker is gone —
-    # settled or cleaned; in production its mtime also predates the new rent).
-    (d1 / "bench_pending.json").unlink()
-    loop._state = _fleet("1800")
-    d2 = tmp_path / "work" / "222"
-    d2.mkdir(parents=True)
-    (d2 / "bench_pending.json").write_text('{"round_id": "222"}')
-    assert loop._bench_hold() is True                        # latch re-armed
-
-
-def test_stale_bench_marker_from_prior_round_never_holds(tmp_path):
-    # A leftover bench_pending.json from ANOTHER round (trainer died mid-bench
-    # last round) must not hold the new fleet — same base_seed matching as the
-    # heat marker's zombie guard.
-    clock = Clock()
-    store = FakeStore()
-    prov = FakeProvider("lium")
-    loop, _ = make_loop(tmp_path, providers={"lium": prov}, store=store, clock=clock)
-    loop.chain_client = SeededChain(880, 54321)     # this round's base_seed = 54321
-    loop.bench_hold_max_hours = 2.0
-    stale = tmp_path / "work" / "99999"
-    stale.mkdir(parents=True)
-    (stale / "bench_pending.json").write_text('{"round_id": "99999"}')
-    clock.t += 600.0
-    cycle(loop)
-    assert len(prov.live) == 2
-    d = tmp_path / "work" / "54321"
-    d.mkdir(parents=True)
-    (d / "heat_complete.json").write_text("{}")
-    clock.t += 900.0
-    cycle(loop)                                              # heat settles; learns the id
-    store.texts["manifests/round-54321.json"] = '{"round_id": "54321"}'
-    clock.t += 900.0
-    cycle(loop)
-    assert prov.live == {}                                   # other round's marker: no hold
-
-
-def test_stale_manifest_from_prior_run_does_not_tear_down(tmp_path):
-    # Same-round-id rerun: the PREVIOUS run's manifest is still published at
-    # round-<id>.json when the heat marker lands. That leftover must not read
-    # as round-over (2026-07-15: it killed both pods 21s after duel dispatch);
-    # only a NEW publish — different bytes at the same key — ends the round.
-    clock = Clock()
-    store = FakeStore({"manifests/round-54321.json":
-                       '{"round_id": "54321", "contract_digest": "old"}'})
-    loop, prov = _provisioned(tmp_path, clock=clock, store=store)
-    d = tmp_path / "work" / "54321"
-    d.mkdir(parents=True)
-    (d / "heat_complete.json").write_text("{}")
-    clock.t += 1800.0
-    cycle(loop)
-    assert "cascade-900-final-0" in prov.live                # stale: final survives
-    # The rerun finishes and republishes the SAME round id with new content.
-    store.texts["manifests/round-54321.json"] = (
-        '{"round_id": "54321", "contract_digest": "new"}')
-    clock.t += 1800.0
-    cycle(loop)
-    assert prov.live == {}
-
-
-def test_relearn_of_same_round_resets_the_manifest_baseline(tmp_path):
-    # Same-round-id RELEARN (Round 8690400, 2026-07-23: fleet lost 31s after
-    # rent). _provision_round reset _learned_round_id but NOT the per-round
-    # manifest baseline (_round_baseline_for / _round_manifest_baseline). So a
-    # second provisioning of the same round kept the prior run's stale None
-    # baseline: when the marker re-taught the id, the previous run's manifest —
-    # still sitting at round-<id>.json — read as a FRESH publish and tore down
-    # the just-rented final pod.
-    clock = Clock()
-    store = FakeStore()
-    prov = FakeProvider("lium")
-    loop, _ = make_loop(tmp_path, providers={"lium": prov}, clock=clock, store=store)
-
-    # Round one: rent, then the marker teaches base_seed 54321 with NO manifest
-    # published yet → the per-round baseline is recorded as None.
-    cycle(loop)
-    marker_dir = tmp_path / "work" / "54321"
-    marker_dir.mkdir(parents=True)
-    (marker_dir / "heat_complete.json").write_text(
-        json.dumps({"round_id": "54321", "screened": 12, "finalists": ["hk"]}))
-    clock.t += 1800.0
-    cycle(loop)
-    assert loop._round_baseline_for == "54321"
-    assert loop._round_manifest_baseline is None                # stale None seed
-
-    # That round finishes and publishes its manifest (now sitting at the key)…
-    store.texts["manifests/round-54321.json"] = (
-        '{"round_id": "54321", "contract_digest": "old"}')
-    clock.t += 1800.0
-    cycle(loop)
-    assert prov.live == {}                                       # round one fully torn down
-
-    # …and the SAME round re-provisions (relearn): a fresh final pod is rented
-    # while the previous run's manifest still sits at round-54321.json.
-    clock.t += 1800.0
-    loop._provisioned_round = None
-    loop._provision_round(900)
-    if loop._rent_thread is not None:
-        loop._rent_thread.join(timeout=30)
-    assert "cascade-900-final-0" in prov.live                    # freshly rented
-
-    # The teardown sweep must NOT read the leftover manifest as a new publish.
-    loop._teardown_due_pods()
-    assert "cascade-900-final-0" in prov.live                    # fresh pod survives
-
-
-def test_latest_pointer_change_also_ends_the_round(tmp_path):
-    # No marker ever seen (e.g. trainer crashed mid-write) — the latest.json
-    # baseline still detects "a manifest published after we rented".
-    clock = Clock()
-    store = FakeStore({"manifests/latest.json": '{"round_id": "111"}'})
-    loop, prov = _provisioned(tmp_path, clock=clock, store=store)
-    clock.t += 1800.0
-    cycle(loop)
-    assert len(prov.live) == 2                               # unchanged pointer: no teardown
-    store.texts["manifests/latest.json"] = '{"round_id": "222"}'
-    cycle(loop)
-    assert prov.live == {}
-
-
-def test_ttl_backstop_fires_without_any_signal(tmp_path):
-    clock = Clock()
-    loop, prov = _provisioned(tmp_path, clock=clock)
-    clock.t += 3 * 3600.0 - 1                                # one second shy of 1 epoch
-    cycle(loop)
-    assert len(prov.live) == 2
-    clock.t += 1.0
-    cycle(loop)
-    assert prov.live == {} and len(prov.terminated) == 2
-
-
-# ── restart + reconcile ──────────────────────────────────────────────────────
-
-
-def test_restart_resumes_ledger_and_kills_orphans(tmp_path):
-    loop1, prov = _provisioned(tmp_path)
-    # A previous crash left a tagged pod the ledger never recorded.
-    prov.live["cascade-900-heat-zombie"] = PodAddress("10.0.0.99", 22)
-
-    loop2, plan_calls = make_loop(tmp_path, providers={"lium": prov}, block=885)
-    cycle(loop2)
-    assert "cascade-900-heat-zombie" in prov.terminated       # orphan reconciled away
-    assert "cascade-900-heat-0" in prov.live                  # owned pods untouched
-    # The resumed ledger's round_id restores the rent-once latch too.
-    assert plan_calls == []
-
-
-def test_reconcile_never_touches_untagged_pods(tmp_path):
-    prov = FakeProvider("lium")
-    prov.live["someone-elses-pod"] = PodAddress("10.9.9.9", 22)
-    loop, _ = make_loop(tmp_path, providers={"lium": prov}, block=100)
-    cycle(loop)
-    assert prov.terminated == []
-
-
-def test_reconcile_never_touches_hand_rented_cascade_pods(tmp_path):
-    """The 2026-07-13 incident: operators' pods legitimately share the
-    ``cascade-`` prefix (cascade-worker, cascade-final-b) but are NOT the
-    provisioner's — only the full cascade-<round>-<stage> scheme is reapable."""
-    prov = FakeProvider("lium")
-    prov.live["cascade-worker"] = PodAddress("10.9.9.1", 22)
-    prov.live["cascade-final-b"] = PodAddress("10.9.9.2", 22)
-    prov.live["cascade-heat-2"] = PodAddress("10.9.9.3", 22)   # no round id ⇒ not ours
-    prov.live["cascade-900-heat-zombie"] = PodAddress("10.9.9.4", 22)  # ours, orphaned
-    loop, _ = make_loop(tmp_path, providers={"lium": prov}, block=100)
-    cycle(loop)
-    assert prov.terminated == ["cascade-900-heat-zombie"]
-
-
-def test_dry_run_never_terminates_anything(tmp_path):
-    """--dry-run must gate EVERY provider mutation, not just rentals: the
-    reaper (and teardown) once terminated a live pod during a dry-run demo."""
-    prov = FakeProvider("lium")
-    prov.live["cascade-900-heat-zombie"] = PodAddress("10.9.9.4", 22)
-    loop, _ = make_loop(tmp_path, providers={"lium": prov}, block=100)
-    loop.dry_run = True
-    cycle(loop)
-    assert prov.terminated == []
-
-
-# ── adoption re-gate (a restart must not trust a previous run's gate pass) ───
-#
-# 2026-08-28: a zombie provisioner had gated pods against ITS OWN stale image
-# pin; on restart the adopted pods' old passes were honored, wrong-image pods
-# re-entered hosts.toml, and the final workers refused to run. Adoption now
-# re-runs the SAME health gate against the config loaded at startup.
-
-
-def _adopted(tmp_path, health, **kw):
-    """Rent a fleet with loop1 (gate skipped: health=None), then restart as
-    loop2 with ``health`` bound — its ledger adoption must re-gate the pods."""
-    prov = FakeProvider("lium")
-    loop1, _ = make_loop(tmp_path, providers={"lium": prov})
-    cycle(loop1)
-    assert len(prov.live) == 2                                # 1 heat + 1 final
-    loop2, _ = make_loop(tmp_path, providers={"lium": prov}, block=885,
-                         health=health, **kw)
-    loop2.sleep = lambda s: None          # retry spacing: no real waits in tests
-    return loop2, prov
-
-
-def cycle_adopted(loop):
-    """One tick, with the adopt-regate worker joined (same discipline as
-    ``cycle`` joins the rent worker)."""
-    loop.run_once()
-    t = loop._adopt_thread
-    if t is not None:
-        t.join(timeout=30)
-
-
-def test_adopted_pods_regate_against_current_config_and_survive_on_pass(tmp_path):
-    seen = []
-
-    def health(addr, stage, provider="", **shape):
-        seen.append((stage, shape.get("sku"), shape.get("gpus")))
-        return _report(ok=True)
-
-    loop2, prov = _adopted(tmp_path, health)
-    cycle_adopted(loop2)
-    # Every adopted pod went through the gate, asserting the LEDGERED shape
-    # (what was actually rented), not a guess.
-    assert sorted(seen) == [("final", "NVIDIA L40S", 2),
-                            ("heat", "NVIDIA RTX A6000", 8)]
-    assert prov.terminated == []                              # passes are adopted
-    hosts = load_hosts(tmp_path / "hosts.toml")               # lane fan-out per GPU
-    assert {h.stage for h in hosts} == {"final", "heat"}
-
-
-def test_adopted_pod_failing_regate_is_terminated_and_unpublished(tmp_path):
-    calls = []
-
-    def health(addr, stage, provider="", **shape):
-        calls.append(stage)
-        return _report(ok=(stage != "final"))      # e.g. image pin changed under it
-
-    loop2, prov = _adopted(tmp_path, health)
-    cycle_adopted(loop2)
-    # The bad pod is treated like a fresh gate failure: terminated + dropped.
-    assert [p for p in prov.terminated if "-final-" in p]
-    assert not [p for p in prov.terminated if "-heat-" in p]
-    st = load_state(tmp_path / "state.json")
-    assert [i.stage for i in st.instances] == ["heat"]        # ledger excludes it
-    hosts = load_hosts(tmp_path / "hosts.toml")               # fleet republished
-    assert {h.stage for h in hosts} == {"heat"}
-    # Deterministic failure burned every bounded attempt before the verdict.
-    assert calls.count("final") == 3 and calls.count("heat") == 1
-
-
-def test_adopted_pod_survives_a_transient_gate_blip(tmp_path):
-    """A pod mid-training must not die to one ssh hiccup: the first probe
-    fails, the bounded retry passes, the pod stays."""
-    calls = []
-
-    def health(addr, stage, provider="", **shape):
-        calls.append(stage)
-        return _report(ok=calls.count(stage) > 1)             # blip, then fine
-
-    loop2, prov = _adopted(tmp_path, health)
-    slept = []
-    loop2.sleep = slept.append
-    cycle_adopted(loop2)
-    assert prov.terminated == []
-    assert load_hosts(tmp_path / "hosts.toml")                # fleet intact
-    assert slept and all(s == 30.0 for s in slept)            # paced, bounded
-    assert len(calls) == 4                                    # 2 pods × (fail+pass)
-
-
-def test_adoption_regate_runs_once_and_skips_without_a_gate(tmp_path):
-    """health_check=None (gate disabled) adopts as before — and a gate that
-    exists probes each adopted pod exactly once across cycles."""
-    prov = FakeProvider("lium")
-    loop1, _ = make_loop(tmp_path, providers={"lium": prov})
-    cycle(loop1)
-    loop2, _ = make_loop(tmp_path, providers={"lium": prov}, block=885)
-    cycle_adopted(loop2)                                      # health=None: no-op
-    assert loop2._adopt_thread is None
-    assert prov.terminated == []
-
-    calls = []
-    loop3, _ = make_loop(tmp_path, providers={"lium": prov}, block=885,
-                         health=lambda a, s, provider="", **k: (calls.append(s),
-                                                                _report(ok=True))[1])
-    cycle_adopted(loop3)
-    cycle_adopted(loop3)                                      # second tick: latched
-    assert len(calls) == 2                                    # once per adopted pod
-
-
-def test_plan_failure_retries_next_tick(tmp_path):
-    prov = FakeProvider("lium")
-    calls = []
-
-    def flaky_plan():
-        calls.append(1)
-        if len(calls) == 1:
-            raise RuntimeError("subtensor hiccup")
-        return dict(PLAN)
-
-    loop, _ = make_loop(tmp_path, providers={"lium": prov})
-    loop.plan_fn = flaky_plan
-    cycle(loop)
-    assert prov.launched == []                                # no latch on plan failure…
-    cycle(loop)
-    assert len(calls) == 2 and len(prov.launched) == 2        # …so the next tick rents
-
-
-def test_heat_fleet_sizes_off_the_screened_field(tmp_path):
-    # With [round] dedup_mode = "enforce" the content screen drops a slice of
-    # the field pre-heat; a fleet sized off the raw eligible count just rents
-    # pods for copies that never train.
-    from cascade.provision.loop import _heat_field
-
-    prov = FakeProvider("lium")
-    plan = dict(PLAN, eligible_challengers=80, screened_challengers=40)
-    policy = _policy(
-        heat=StagePolicy(sku="NVIDIA RTX A6000", gpus_per_pod=8, max_pods=3,
-                         providers=("lium",), max_price_hr=4.0),
-        max_spend_per_round=100.0)
-    loop, _ = make_loop(tmp_path, providers={"lium": prov}, plan=plan, policy=policy)
-    cycle(loop)
-    heat_pods = [n for n in prov.launched if "heat" in n]
-    assert len(heat_pods) == 2                    # 10 slots → 2 pods, not 3
-
-    # older trainers (and dedup_mode = "off") omit the key entirely
-    assert _heat_field(plan) == 40
-    assert _heat_field(PLAN) == 12
-
-
-# ── plan-output parsing + config validation (main.py pure parts) ─────────────
-
-
-def test_parse_plan_output_takes_last_json_line():
-    text = ("btlogging noise\nWARNING something\n"
-            '{"old": true}\n' + json.dumps(PLAN) + "\ntrailing banner\n")
-    assert parse_plan_output(text)["eligible_challengers"] == 12
-
-
-def test_parse_plan_output_rejects_json_free_text():
-    with pytest.raises(ProvisionError):
-        parse_plan_output("no json here\n")
-
-
-def _raw_config(**over):
-    raw = {
-        "provisioner": {
-            "trigger_margin_blocks": 25,
-            "max_spend_per_round": 25.0,
-            "heat": {"sku": "NVIDIA RTX A6000", "gpus_per_pod": 8, "max_pods": 4,
-                     "providers": ["lium", "shadeform"], "max_price_hr": 4.0},
-            "final": {"sku": "NVIDIA L40S", "gpus_per_pod": 2, "max_pods": 2,
-                      "providers": ["lium", "shadeform"], "max_price_hr": 3.0},
-        }
-    }
-    raw["provisioner"].update(over)
-    return raw
-
-
-def test_build_policy_happy():
-    p = build_policy(_raw_config(), epoch_blocks=900)
-    assert p.heat.gpus_per_pod == 8 and p.final.sku == "NVIDIA L40S"
-    assert p.heat.slot_overhead == pytest.approx(1.3)         # default
-    assert p.ttl_epochs == 1
-
-
-@pytest.mark.parametrize("bad", [
-    {"trigger_margin_blocks": 900},                           # margin must be < epoch
-    {"trigger_margin_blocks": 0},
-    {"max_spend_per_round": 0},
-    {"heat": {"sku": "", "gpus_per_pod": 8, "max_pods": 4,
-              "providers": ["lium"], "max_price_hr": 4.0}},   # empty sku
-    {"heat": {"sku": "A6000", "gpus_per_pod": 0, "max_pods": 4,
-              "providers": ["lium"], "max_price_hr": 4.0}},   # gpus_per_pod >= 1
-    {"final": {"sku": "L40S", "gpus_per_pod": 2, "max_pods": 2,
-               "providers": ["lium"], "max_price_hr": 0}},    # price > 0
-])
-def test_build_policy_rejects_bad_config(bad):
-    with pytest.raises(ProvisionError):
-        build_policy(_raw_config(**bad), epoch_blocks=900)
-
-
-def test_build_policy_requires_both_stage_tables():
-    raw = _raw_config()
-    del raw["provisioner"]["heat"]
-    with pytest.raises(ProvisionError):
-        build_policy(raw, epoch_blocks=900)
-
-
-def test_hosts_file_round_trips_via_tomllib_too(tmp_path):
-    # Belt and braces: the published file is plain valid TOML, not just
-    # something load_hosts tolerates.
-    loop, _ = make_loop(tmp_path, providers={"lium": FakeProvider("lium")})
-    cycle(loop)
-    data = tomllib.loads((tmp_path / "hosts.toml").read_text(encoding="utf-8"))
-    assert len(data["host"]) == 10                            # 8 heat GPUs + 2 final GPUs
-
-
-# ── static hosts + bootstrap + unmanaged final ───────────────────────────────
-
-
-def test_static_hosts_survive_every_publish_and_clear(tmp_path):
-    """The operator's long-lived final pod must ride along on every render —
-    including failure paths that previously cleared the file outright."""
-    static = '[[host]]\nname = "cascade-final-b"\nhost = "216.81.245.151"\nstage = "final"\n'
-    prov = FakeProvider("lium")
-    loop, _ = make_loop(tmp_path, providers={"lium": prov}, block=880)
-    loop.static_hosts_text = static
-    cycle(loop)                               # provisions + publishes
-    text = (tmp_path / "hosts.toml").read_text()
-    assert "cascade-final-b" in text              # static entry present
-    assert 'stage         = "heat"' in text        # dynamic heat pods present
-    # all-providers-down path: static fleet remains, never an empty file
-    prov2 = FakeProvider("lium", available=False)
-    loop2, _ = make_loop(tmp_path, providers={"lium": prov2}, block=1780)
-    loop2.static_hosts_text = static
-    cycle(loop2)
-    text2 = (tmp_path / "hosts.toml").read_text()
-    assert "cascade-final-b" in text2
-    assert "heat" not in text2.replace('stage = "final"', "")
-
-
-def test_bootstrap_failure_replaces_pod_once(tmp_path):
-    calls = []
-
-    def flaky_bootstrap(addr, stage, provider=""):
-        calls.append(addr.ip)
-        return len(calls) > 1                     # first pod fails, replacement passes
-
-    prov = FakeProvider("lium")
-    loop, _ = make_loop(tmp_path, providers={"lium": prov}, block=880)
-    loop.bootstrap = flaky_bootstrap
-    cycle(loop)
-    assert len(calls) >= 2                        # failed pod → one replacement attempt
-    assert prov.terminated                        # the dud was terminated
-
-
-def test_unmanaged_final_rents_no_final_pods(tmp_path):
-    from cascade.provision.policy import size_fleet
-
-    pol = _policy(final=StagePolicy(sku="NVIDIA L40S", gpus_per_pod=1, max_pods=0,
-                                    providers=("lium",), max_price_hr=3.0))
-    plan = size_fleet(12, 1, 0.5, 3.0, 0.75, pol)
-    assert plan.final.pods == 0                   # stage unmanaged: static pods serve it
-    assert plan.heat.pods > 0
-
-
-def test_publish_uses_per_provider_profile(tmp_path):
-    """Shadeform VMs land as the 'shadeform' user under /home/shadeform — the
-    rendered hosts entries must carry that provider's paths, not lium's root."""
-    from dataclasses import replace as _replace
-
-    from cascade.provision.loop import PodProfile
-
-    prov = FakeProvider("shadeform")
-    loop, _ = make_loop(tmp_path, providers={"shadeform": prov})
-    loop.render = _replace(loop.render, profiles={"shadeform": PodProfile(
-        user="shadeform", workdir="/home/shadeform/cascade",
-        remote_python="/home/shadeform/cascade/.venv/bin/python")})
-    cycle(loop)
-    hosts = load_hosts(tmp_path / "hosts.toml")
-    assert hosts and all(h.user == "shadeform" for h in hosts)
-    assert all(h.workdir == "/home/shadeform/cascade" for h in hosts)
-
-
-# ── SKU fallback (homogeneous per round) ─────────────────────────────────────
-
-
 class ShapedProvider(FakeProvider):
     """A marketplace that only stocks specific (sku, gpus) shapes."""
 
@@ -1500,126 +111,74 @@ class ShapedProvider(FakeProvider):
         return (sku, gpus) in self.shapes
 
 
-def _fallback_policy():
-    from cascade.provision.policy import SkuCandidate
-    return _policy(heat=StagePolicy(
-        sku="NVIDIA GeForce RTX 4090", market_sku="RTX4090", gpus_per_pod=4,
-        max_pods=2, providers=("lium", "shadeform"), max_price_hr=2.60,
-        candidates=(SkuCandidate(sku="NVIDIA RTX A6000", market_sku="A6000",
-                                 gpus_per_pod=8, max_price_hr=4.50),)))
-
-
-def test_sku_fallback_takes_first_candidate_with_capacity(tmp_path):
-    """Primary 4x4090 out of stock everywhere; the 8xA6000 fallback (on the
-    second provider, at ITS shape: 1 pod for 7 slots) serves the whole heat."""
-    lium = ShapedProvider("lium", shapes=set())                      # nothing
-    shade = ShapedProvider("shadeform", shapes={("A6000", 8)})
-    loop, _ = make_loop(tmp_path, providers={"lium": lium, "shadeform": shade},
-                        policy=_fallback_policy())
-    cycle(loop)
-    assert shade.launched == ["cascade-900-heat-0"]                  # 1 × 8x pod
-    hosts = [h for h in load_hosts(tmp_path / "hosts.toml") if h.stage == "heat"]
-    assert len(hosts) == 8                                           # fallback fan-out
-    st = load_state(tmp_path / "state.json")
-    heat = [i for i in st.instances if i.stage == "heat"]
-    assert heat[0].sku == "NVIDIA RTX A6000" and heat[0].gpus == 8   # rented shape recorded
-
-
-def test_sku_fallback_health_gate_gets_rented_sku(tmp_path):
-    """The gate must assert the device that was ACTUALLY rented, not the primary."""
-    seen = []
-
-    def health(addr, stage, provider="", *, sku="", gpus=0, **kw):
-        seen.append((stage, sku, gpus))
-        return _report(ok=True)
-
-    shade = ShapedProvider("shadeform", shapes={("A6000", 8)})
-    loop, _ = make_loop(tmp_path, providers={"shadeform": shade},
-                        policy=_fallback_policy(), health=health)
-    cycle(loop)
-    assert ("heat", "NVIDIA RTX A6000", 8) in seen
-
-
-def test_sku_primary_wins_when_stocked(tmp_path):
-    lium = ShapedProvider("lium", shapes={("RTX4090", 4)})
-    shade = ShapedProvider("shadeform", shapes={("A6000", 8)})
-    loop, _ = make_loop(tmp_path, providers={"lium": lium, "shadeform": shade},
-                        policy=_fallback_policy())
-    cycle(loop)
-    assert lium.launched == ["cascade-900-heat-0"]   # 3 slots (12-field) @ 4x → 1 pod
-    assert shade.launched == []
-
-
-# ── stale chain client (the silent no-trigger of 2026-07-14) ─────────────────
-
-
-def test_frozen_block_rebuilds_chain_client_and_triggers(tmp_path):
-    """A quietly-dead websocket keeps answering with a stale block; after
-    stale_block_after_s the loop must rebuild the client and see the real
-    height — otherwise it cycles forever and never rents."""
-    prov = FakeProvider("lium")
-    clock = Clock()
-    stale = FakeChain(700)                      # frozen far from the boundary
-    fresh = FakeChain(880)                      # the real height (in-window)
-    loop, plan_calls = make_loop(tmp_path, providers={"lium": prov}, clock=clock)
-    loop.chain_client = stale
-    loop.chain_client_factory = lambda: fresh
-    loop.stale_block_after_s = 300.0
-
-    cycle(loop)                             # block seen, baseline set
-    clock.t += 200.0
-    cycle(loop)                             # frozen, but not stale yet
-    assert plan_calls == [] and prov.launched == []
-    clock.t += 200.0                            # now 400s frozen > 300s
-    cycle(loop)                             # rebuild → block 880 → trigger
-    assert plan_calls == [1]
-    assert prov.launched != []
-
-
-def test_raising_chain_client_rebuilds_once(tmp_path):
-    class DeadChain:
-        def current_block(self):
-            raise ConnectionError("ws closed")
-
-    prov = FakeProvider("lium")
-    loop, plan_calls = make_loop(tmp_path, providers={"lium": prov})
-    loop.chain_client = DeadChain()
-    loop.chain_client_factory = lambda: FakeChain(880)
-    cycle(loop)
-    assert plan_calls == [1]                    # rebuilt and proceeded same cycle
-
-# ── elastic eval pod (manifest-triggered; serves the validator) ──────────────
-
-
 def _eval_policy(**kw):
     kw.setdefault("eval", StagePolicy(sku="NVIDIA L40S", gpus_per_pod=1, max_pods=1,
-                                      providers=("lium",), max_price_hr=1.2))
-    return _policy(**kw)
+                                      providers=("lium", "shadeform"), max_price_hr=1.2))
+    kw.setdefault("max_spend_per_round", 25.0)
+    return ProvisionPolicy(**kw)
 
 
-def _eval_loop(tmp_path, *, store, prov=None, clock=None, dry_run=False,
-               receipt_prefix="receipts/5Val/", block=100):
-    """A loop far outside the boundary margin (block=100): only the
-    manifest-triggered eval machinery can act."""
+def make_loop(tmp_path, *, providers=None, block=100, policy=None, clock=None, store=None,
+              health=None, dry_run=False, eval_hosts=None, receipt_prefix=""):
+    providers = providers if providers is not None else {"lium": FakeProvider("lium")}
+    return ProvisionerLoop(
+        policy=policy or _eval_policy(),
+        providers=providers,
+        chain_client=FakeChain(block),
+        render=RenderSettings(image=IMG, ssh_pubkey="ssh-ed25519 AAAA orch",
+                              key_path="~/.ssh/cascade_ed25519"),
+        hosts_path=tmp_path / "hosts.toml",
+        work_root=tmp_path / "work",
+        state_path=tmp_path / "state.json",
+        epoch_blocks=900,                    # 3h epochs → ttl 3h at ttl_epochs=1
+        manifest_store=store,
+        eval_hosts_path=eval_hosts,
+        receipt_prefix=receipt_prefix,
+        health_check=health,
+        dry_run=dry_run,
+        clock=clock or Clock(),
+    )
+
+
+def _eval_loop(tmp_path, *, store=None, prov=None, providers=None, clock=None,
+               dry_run=False, receipt_prefix="receipts/5Val/", health=None, policy=None):
     prov = prov or FakeProvider("lium")
-    loop, _ = make_loop(tmp_path, providers={"lium": prov}, block=block, clock=clock,
-                        store=store, policy=_eval_policy(), dry_run=dry_run,
-                        eval_hosts=tmp_path / "eval_hosts.toml",
-                        receipt_prefix=receipt_prefix)
+    loop = make_loop(tmp_path, providers=providers or {"lium": prov}, clock=clock,
+                     store=store if store is not None else FakeStore(MANIFEST),
+                     policy=policy, dry_run=dry_run, health=health,
+                     eval_hosts=tmp_path / "eval_hosts.toml", receipt_prefix=receipt_prefix)
     return loop, prov
 
 
-def _join_eval(lp):
-    t = getattr(lp, "_eval_thread", None)
+def cycle(loop):
+    """One poll tick with the eval rent worker joined, so assertions see the
+    settled world."""
+    loop.run_once()
+    t = getattr(loop, "_eval_thread", None)
     if t is not None:
-        t.join(timeout=10)
+        t.join(timeout=30)
+
+
+def _seed_ledger(tmp_path, prov, pods, *, clock=None):
+    """A ledger left by an earlier run: ``pods`` = [(stage, instance_id, sku, gpus)],
+    live on ``prov``."""
+    clock = clock or Clock()
+    from datetime import UTC, datetime
+
+    iso = datetime.fromtimestamp(clock(), tz=UTC).isoformat()
+    insts = []
+    for i, (stage, pid, sku, gpus) in enumerate(pods):
+        prov.live[pid] = PodAddress(f"10.0.1.{i + 1}", 22)
+        insts.append(PodInstance(provider=prov.name, instance_id=pid, stage=stage,
+                                 rented_at_iso=iso, sku=sku, gpus=gpus))
+    save_state(tmp_path / "state.json", RoundState(round_id="900", instances=tuple(insts),
+                                                   published=True))
 
 
 def test_new_manifest_rents_exactly_one_eval_pod_once(tmp_path):
     store = FakeStore({"manifests/latest.json": '{"round_id": "111"}'})
     loop, prov = _eval_loop(tmp_path, store=store)
     cycle(loop)
-    _join_eval(loop)
     assert prov.launched == ["cascade-111-eval-0"]           # one pod, named for the round
 
     # Round-trip through the trainer's REAL loader (the validator's parser).
@@ -1637,10 +196,8 @@ def test_new_manifest_rents_exactly_one_eval_pod_once(tmp_path):
     assert st.last_evaled_round == "111"                     # persisted rent-once latch
     assert {(i.stage, i.instance_id) for i in st.instances} == {("eval", "cascade-111-eval-0")}
 
+    cycle(loop)                                               # same manifest: idempotent
     cycle(loop)
-    _join_eval(loop)                                          # same manifest: idempotent
-    cycle(loop)
-    _join_eval(loop)
     assert prov.launched == ["cascade-111-eval-0"]
 
 
@@ -1648,10 +205,8 @@ def test_eval_latch_persists_across_restart(tmp_path):
     store = FakeStore({"manifests/latest.json": '{"round_id": "111"}'})
     loop1, prov = _eval_loop(tmp_path, store=store)
     cycle(loop1)
-    _join_eval(loop1)
     loop2, prov2 = _eval_loop(tmp_path, store=store, prov=prov)  # fresh process, same ledger
     cycle(loop2)
-    _join_eval(loop2)
     assert prov.launched == ["cascade-111-eval-0"]           # no double rent
     assert "cascade-111-eval-0" in prov.live                 # and the owned pod survives
 
@@ -1661,23 +216,19 @@ def test_receipt_tears_down_eval_pod_and_clears_hosts_file(tmp_path):
     store = FakeStore({"manifests/latest.json": '{"round_id": "111"}'})
     loop, prov = _eval_loop(tmp_path, store=store, clock=clock)
     cycle(loop)
-    _join_eval(loop)
     clock.t += 600.0
     cycle(loop)
-    _join_eval(loop)
     assert "cascade-111-eval-0" in prov.live                 # no receipt yet: pod stays
     # The validator publishes the round's receipt under ITS OWN prefix.
     store.texts["receipts/5Val/round-111.json"] = '{"round_id": "111"}'
     clock.t += 600.0
     cycle(loop)
-    _join_eval(loop)
     assert prov.terminated == ["cascade-111-eval-0"] and prov.live == {}
     with pytest.raises(RemoteDispatchError):
         load_hosts(tmp_path / "eval_hosts.toml")             # cleared → validator falls local
     st = load_state(tmp_path / "state.json")
     assert st.instances == () and st.last_evaled_round == "111"
-    cycle(loop)
-    _join_eval(loop)                                          # receipted round never re-rents
+    cycle(loop)                                          # receipted round never re-rents
     assert prov.launched == ["cascade-111-eval-0"]
 
 
@@ -1685,10 +236,8 @@ def test_newer_manifest_replaces_the_eval_pod(tmp_path):
     store = FakeStore({"manifests/latest.json": '{"round_id": "111"}'})
     loop, prov = _eval_loop(tmp_path, store=store)
     cycle(loop)
-    _join_eval(loop)
     store.texts["manifests/latest.json"] = '{"round_id": "222"}'
     cycle(loop)
-    _join_eval(loop)
     # Round 111's evals are moot: its pod dies and round 222 gets its own —
     # teardown runs before the eval check, so the two never coexist.
     assert prov.terminated == ["cascade-111-eval-0"]
@@ -1702,14 +251,11 @@ def test_eval_ttl_backstop_fires_without_receipt_or_newer_manifest(tmp_path):
     store = FakeStore({"manifests/latest.json": '{"round_id": "111"}'})
     loop, prov = _eval_loop(tmp_path, store=store, clock=clock)
     cycle(loop)
-    _join_eval(loop)
     clock.t += 3 * 3600.0 - 1                                # one second shy of 1 epoch
     cycle(loop)
-    _join_eval(loop)
     assert "cascade-111-eval-0" in prov.live
     clock.t += 1.0
     cycle(loop)
-    _join_eval(loop)
     assert prov.live == {}                                   # TTL: silent validator ≠ bill
     with pytest.raises(RemoteDispatchError):
         load_hosts(tmp_path / "eval_hosts.toml")
@@ -1729,8 +275,9 @@ def test_fresh_start_skips_a_round_already_receipted(tmp_path):
 def test_absent_eval_policy_rents_nothing(tmp_path):
     store = FakeStore({"manifests/latest.json": '{"round_id": "111"}'})
     prov = FakeProvider("lium")
-    loop, _ = make_loop(tmp_path, providers={"lium": prov}, block=100, store=store,
-                        eval_hosts=tmp_path / "eval_hosts.toml")   # policy has no eval
+    loop = make_loop(tmp_path, providers={"lium": prov}, store=store,
+                     policy=ProvisionPolicy(max_spend_per_round=25.0),
+                     eval_hosts=tmp_path / "eval_hosts.toml")      # policy has no eval
     cycle(loop)
     assert prov.launched == [] and not (tmp_path / "eval_hosts.toml").exists()
 
@@ -1738,8 +285,7 @@ def test_absent_eval_policy_rents_nothing(tmp_path):
 def test_absent_eval_hosts_path_rents_nothing(tmp_path):
     store = FakeStore({"manifests/latest.json": '{"round_id": "111"}'})
     prov = FakeProvider("lium")
-    loop, _ = make_loop(tmp_path, providers={"lium": prov}, block=100, store=store,
-                        policy=_eval_policy())                     # nowhere to publish
+    loop = make_loop(tmp_path, providers={"lium": prov}, store=store)   # nowhere to publish
     cycle(loop)
     assert prov.launched == []
 
@@ -1754,18 +300,6 @@ def test_eval_dry_run_rents_nothing_and_touches_no_files(tmp_path):
     assert load_state(tmp_path / "state.json") is None       # dry-run writes no ledger
 
 
-def test_eval_skipped_when_round_budget_is_committed(tmp_path):
-    # The round breaker historically ignored eval; now eval respects what the
-    # boundary stages already committed — skipping is cheap (local CPU evals).
-    store = FakeStore({"manifests/latest.json": '{"round_id": "111"}'})
-    loop, prov = _eval_loop(tmp_path, store=store)
-    loop._committed = {"heat": 30.0}             # boundary stages hold the cap
-    cycle(loop)
-    _join_eval(loop)
-    assert prov.launched == []                   # skipped, not rented
-    assert load_state(tmp_path / "state.json").last_evaled_round == "111"  # latched
-
-
 def test_eval_no_capacity_degrades_and_latches(tmp_path):
     store = FakeStore({"manifests/latest.json": '{"round_id": "111"}'})
     loop, prov = _eval_loop(tmp_path, store=store, prov=FakeProvider("lium", available=False))
@@ -1773,18 +307,6 @@ def test_eval_no_capacity_degrades_and_latches(tmp_path):
     cycle(loop)                                          # latched: no 30s hammering
     assert prov.launched == []                               # validator evals run local
     assert load_state(tmp_path / "state.json").last_evaled_round == "111"
-
-
-def test_eval_and_trainer_stages_coexist_in_separate_files(tmp_path):
-    """A manifest lands while the boundary trigger fires: the eval pod goes to
-    eval_hosts.toml, the trainer fleet to hosts.toml — never cross-published."""
-    store = FakeStore({"manifests/latest.json": '{"round_id": "111"}'})
-    loop, prov = _eval_loop(tmp_path, store=store, block=880)
-    cycle(loop)
-    assert set(prov.launched) == {
-        "cascade-111-eval-0", "cascade-900-heat-0", "cascade-900-final-0"}
-    assert all(h.stage in ("heat", "final") for h in load_hosts(tmp_path / "hosts.toml"))
-    assert [h.name for h in load_hosts(tmp_path / "eval_hosts.toml")] == ["cascade-111-eval-0"]
 
 
 def test_reaper_accepts_eval_pods_as_self_named(tmp_path):
@@ -1795,63 +317,39 @@ def test_reaper_accepts_eval_pods_as_self_named(tmp_path):
     assert not is_provisioner_pod_name("cascade-eval-1")        # no round id ⇒ not ours
     prov = FakeProvider("lium")
     prov.live["cascade-900-eval-zombie"] = PodAddress("10.9.9.5", 22)
-    loop, _ = make_loop(tmp_path, providers={"lium": prov}, block=100)
+    loop = make_loop(tmp_path, providers={"lium": prov})
     cycle(loop)
     assert prov.terminated == ["cascade-900-eval-zombie"]       # orphan eval pod reaped
 
 
-def test_build_policy_eval_table_is_optional():
-    p = build_policy(_raw_config(), epoch_blocks=900)
-    assert p.eval is None                                       # pre-eval configs unchanged
-    raw = _raw_config(eval={"sku": "NVIDIA L40S", "gpus_per_pod": 1, "max_pods": 1,
-                            "providers": ["lium"], "max_price_hr": 1.2})
-    p = build_policy(raw, epoch_blocks=900)
-    assert p.eval.sku == "NVIDIA L40S" and p.eval.max_pods == 1
+def test_reconcile_never_touches_untagged_pods(tmp_path):
+    prov = FakeProvider("lium")
+    prov.live["someone-elses-pod"] = PodAddress("10.9.9.9", 22)
+    loop = make_loop(tmp_path, providers={"lium": prov})
+    cycle(loop)
+    assert prov.terminated == []
 
 
-def test_build_policy_rejects_bad_eval_table():
-    raw = _raw_config(eval={"sku": "", "gpus_per_pod": 1, "max_pods": 1,
-                            "providers": ["lium"], "max_price_hr": 1.2})
-    with pytest.raises(ProvisionError):
-        build_policy(raw, epoch_blocks=900)
+def test_dry_run_never_terminates_anything(tmp_path):
+    """--dry-run must gate EVERY provider mutation, not just rentals: the
+    reaper (and teardown) once terminated a live pod during a dry-run demo."""
+    prov = FakeProvider("lium")
+    prov.live["cascade-900-heat-zombie"] = PodAddress("10.9.9.4", 22)
+    loop = make_loop(tmp_path, providers={"lium": prov})
+    loop.dry_run = True
+    cycle(loop)
+    assert prov.terminated == []
 
 
 def test_heartbeat_logs_at_cycle_start(tmp_path, caplog):
     """Liveness must not depend on any network phase completing — the
-    heartbeat fires at cycle START (starved twice on 2026-07-14 when it
-    lived behind reconcile/eval polls)."""
+    heartbeat fires at cycle START."""
     import logging
 
-    loop, _ = make_loop(tmp_path, block=100)
+    loop = make_loop(tmp_path)
     with caplog.at_level(logging.INFO, logger="cascade.provision.loop"):
         cycle(loop)
     assert any("heartbeat: cycle start" in r.message for r in caplog.records)
-
-
-def test_hung_chain_client_hits_deadline_and_rebuilds(tmp_path):
-    """A websocket that HANGS (not raises) must not block the loop — the
-    deadline converts the hang into a rebuild. Four rental windows died to
-    silent chain stalls before this."""
-    import threading
-
-    class HangingChain:
-        def current_block(self):
-            threading.Event().wait(30)          # would block half the cycle
-
-    prov = FakeProvider("lium")
-    loop, plan_calls = make_loop(tmp_path, providers={"lium": prov})
-    loop.chain_client = HangingChain()
-    loop.chain_client_factory = lambda: FakeChain(880)
-    # shrink the deadline for test speed
-    orig = loop._with_deadline
-    loop_cls = type(loop)
-    try:
-        loop_cls._with_deadline = staticmethod(
-            lambda fn, seconds: orig(fn, 0.2 if seconds >= 60 else seconds))
-        cycle(loop)
-    finally:
-        loop_cls._with_deadline = staticmethod(orig)
-    assert plan_calls == [1]                    # rebuilt within the same cycle and triggered
 
 
 def test_on_cycle_hook_heals_stripped_logging(tmp_path):
@@ -1867,7 +365,7 @@ def test_on_cycle_hook_heals_stripped_logging(tmp_path):
         calls.append(1)
         lg.setLevel(logging.INFO)
 
-    loop, _ = make_loop(tmp_path, block=100)
+    loop = make_loop(tmp_path)
     loop.on_cycle = heal
     lg.setLevel(logging.CRITICAL)          # simulate the nuke
     cycle(loop)
@@ -1915,9 +413,9 @@ def test_heal_rebuilds_closed_handlers(tmp_path, monkeypatch):
     assert pmain  # import sanity
 
 
-def test_eval_rent_does_not_block_the_cycle(tmp_path, store_with_manifest=None):
+def test_eval_rent_does_not_block_the_cycle(tmp_path):
     """An eval pod's boot can take 15+ min — it must run OFF the loop thread
-    (a blocking boot swallowed a heat-trigger window on 2026-07-14)."""
+    so teardown/heartbeat/reconcile keep ticking."""
     import threading
     import time as _time
 
@@ -1932,7 +430,453 @@ def test_eval_rent_does_not_block_the_cycle(tmp_path, store_with_manifest=None):
     store = FakeStore({"manifests/latest.json": '{"round_id": "424242"}'})
     loop, _ = _eval_loop(tmp_path, store=store, prov=prov)
     t0 = _time.monotonic()
-    cycle(loop)                               # must return promptly
+    loop.run_once()                           # must return promptly
     took = _time.monotonic() - t0
     gate.set()
     assert took < 2.0, f"cycle blocked {took:.1f}s on the eval boot"
+
+
+# ── provider ladder, budget, health gate (the eval rental) ───────────────────
+
+
+def test_provider_down_falls_through_to_next(tmp_path):
+    lium = FakeProvider("lium", avail_raises=RuntimeError("api down"))
+    shade = FakeProvider("shadeform")
+    loop, _ = _eval_loop(tmp_path, providers={"lium": lium, "shadeform": shade})
+    cycle(loop)
+    assert lium.launched == [] and shade.launched == ["cascade-111-eval-0"]
+
+
+def test_overpriced_offer_skips_that_provider(tmp_path):
+    dear = FakeProvider("lium", price=99.0)
+    fair = FakeProvider("shadeform", price=1.0)
+    loop, _ = _eval_loop(tmp_path, providers={"lium": dear, "shadeform": fair})
+    cycle(loop)
+    assert dear.launched == [] and fair.launched == ["cascade-111-eval-0"]
+
+
+def test_budget_breaker_refuses_to_rent(tmp_path):
+    # Worst case (ttl = 3h epoch): 1 pod × $1.0 × 3h = $3 > the $2 cap.
+    prov = FakeProvider("lium", price=1.0)
+    loop, _ = _eval_loop(tmp_path, prov=prov, policy=_eval_policy(max_spend_per_round=2.0))
+    cycle(loop)
+    assert prov.launched == []
+    assert load_state(tmp_path / "state.json").last_evaled_round == "111"   # latched
+
+
+def test_unhealthy_pod_replaced_once(tmp_path):
+    prov = FakeProvider("lium")
+    loop, _ = _eval_loop(tmp_path, prov=prov,
+                         health=lambda addr, stage, provider="", **k: _report(
+                             ok=addr.ip != "10.0.0.1"))
+    cycle(loop)
+    assert prov.terminated == ["cascade-111-eval-0"]
+    assert prov.launched == ["cascade-111-eval-0", "cascade-111-eval-r0-0"]
+    hosts = load_hosts(tmp_path / "eval_hosts.toml")
+    assert [h.host for h in hosts] == ["10.0.0.2"]           # the replacement
+
+
+def test_replacement_also_unhealthy_drops_the_pod(tmp_path):
+    prov = FakeProvider("lium")
+    loop, _ = _eval_loop(tmp_path, prov=prov,
+                         health=lambda addr, stage, provider="", **k: _report(ok=False))
+    cycle(loop)
+    assert prov.terminated == ["cascade-111-eval-0", "cascade-111-eval-r0-0"]
+    assert load_state(tmp_path / "state.json").instances == ()
+    assert not (tmp_path / "eval_hosts.toml").exists()       # validator evals stay local
+
+
+def test_replacement_excludes_the_failed_pods_machine(tmp_path):
+    """Offer lists are deterministic: the replacement spec must exclude the
+    lemon's machine or it re-rents the same failed executor."""
+
+    class MachineAwareProvider(FakeProvider):
+        machines = ("m-lemon", "m-good", "m-spare")
+
+        def __init__(self, name, **kw):
+            super().__init__(name, **kw)
+            self.machine_by_pod: dict[str, str] = {}
+            self.specs = []
+
+        def launch(self, spec):
+            self.specs.append(spec)
+            offers = [m for m in self.machines if m not in spec.exclude_ids]
+            ids = super().launch(spec)
+            for i, pid in enumerate(ids):                    # head-of-list pick, like lium
+                self.machine_by_pod[pid] = offers[i]
+            return ids
+
+        def machine_of(self, pod_id):
+            return self.machine_by_pod.get(pod_id)
+
+    prov = MachineAwareProvider("lium")
+
+    def health(addr, stage, provider="", **shape):
+        pid = next(p for p, a in prov.live.items() if a.ip == addr.ip)
+        return _report(ok=prov.machine_by_pod[pid] != "m-lemon")
+
+    loop, _ = _eval_loop(tmp_path, prov=prov, health=health)
+    cycle(loop)
+    rspec = next(s for s in prov.specs if "-r0" in s.name_prefix)
+    assert rspec.exclude_ids == ("m-lemon",)
+    assert prov.machine_by_pod["cascade-111-eval-r0-0"] == "m-good"
+
+
+def test_image_digest_failure_excludes_the_facility(tmp_path):
+    """A stale facility image cache re-boots the same wrong image in the same
+    region: an image_digest gate failure walks the replacement to another."""
+
+    class RegionAwareProvider(FakeProvider):
+        regions = ("kansascity-usa-1", "chicago-usa-2")
+
+        def __init__(self, name, **kw):
+            super().__init__(name, **kw)
+            self.region_by_pod: dict[str, str] = {}
+            self.specs = []
+
+        def launch(self, spec):
+            self.specs.append(spec)
+            region = next(r for r in self.regions if r not in spec.exclude_regions)
+            ids = super().launch(spec)
+            for pid in ids:
+                self.region_by_pod[pid] = region
+            return ids
+
+        def region_of(self, pod_id):
+            return self.region_by_pod.get(pod_id)
+
+    prov = RegionAwareProvider("lium")
+
+    def health(addr, stage, provider="", **shape):
+        pid = next(p for p, a in prov.live.items() if a.ip == addr.ip)
+        return _report(ok=prov.region_by_pod[pid] != "kansascity-usa-1", name="image_digest")
+
+    loop, _ = _eval_loop(tmp_path, prov=prov, health=health)
+    cycle(loop)
+    rspec = next(s for s in prov.specs if "-r0" in s.name_prefix)
+    assert rspec.exclude_regions == ("kansascity-usa-1",)
+    assert prov.region_by_pod["cascade-111-eval-r0-0"] == "chicago-usa-2"
+    assert loop._gate_failures == {}                         # consumed, no leak
+
+
+def test_bootstrap_failure_replaces_pod_once(tmp_path):
+    calls = []
+
+    def flaky_bootstrap(addr, stage, provider=""):
+        calls.append(addr.ip)
+        return len(calls) > 1                     # first pod fails, replacement passes
+
+    loop, prov = _eval_loop(tmp_path)
+    loop.bootstrap = flaky_bootstrap
+    cycle(loop)
+    assert len(calls) == 2 and prov.terminated == ["cascade-111-eval-0"]
+
+
+def test_prewarm_hook_fires_per_healthy_pod_and_never_gates(tmp_path):
+    loop, prov = _eval_loop(tmp_path)
+    calls = []
+
+    def prewarm(addr, stage, provider=""):
+        calls.append((stage, provider))
+        raise RuntimeError("boom")
+
+    loop.prewarm = prewarm
+    cycle(loop)
+    assert calls == [("eval", "lium")]
+    assert prov.terminated == [] and load_hosts(tmp_path / "eval_hosts.toml")
+
+
+def test_sku_fallback_takes_first_candidate_with_capacity(tmp_path):
+    seen = []
+
+    def health(addr, stage, provider="", *, sku="", gpus=0, **kw):
+        seen.append((stage, sku, gpus))
+        return _report(ok=True)
+
+    policy = _eval_policy(eval=StagePolicy(
+        sku="NVIDIA L40S", gpus_per_pod=1, max_pods=1, providers=("lium", "shadeform"),
+        max_price_hr=1.2, candidates=(SkuCandidate(sku="NVIDIA RTX A6000",
+                                                   market_sku="A6000", max_price_hr=1.0),)))
+    lium = ShapedProvider("lium", shapes=set())
+    shade = ShapedProvider("shadeform", shapes={("A6000", 1)})
+    loop, _ = _eval_loop(tmp_path, providers={"lium": lium, "shadeform": shade},
+                         policy=policy, health=health)
+    cycle(loop)
+    assert shade.launched == ["cascade-111-eval-0"]
+    assert seen == [("eval", "NVIDIA RTX A6000", 1)]          # the gate asserts the RENTED sku
+    inst, = load_state(tmp_path / "state.json").instances
+    assert (inst.sku, inst.gpus) == ("NVIDIA RTX A6000", 1)
+
+
+# ── ledger: TTL, restart, re-gate, hosts.toml ────────────────────────────────
+
+
+def test_ttl_reaps_a_leftover_fleet_pod_and_republishes(tmp_path):
+    """A heat/final pod left in the ledger by the retired per-round fleet has
+    no teardown signal any more — the TTL alone reaps it."""
+    clock = Clock()
+    prov = FakeProvider("lium")
+    _seed_ledger(tmp_path, prov, [("final", "cascade-900-final-0", "NVIDIA L40S", 2)],
+                 clock=clock)
+    loop = make_loop(tmp_path, providers={"lium": prov}, clock=clock)
+    clock.t += 3 * 3600.0 - 1
+    cycle(loop)
+    assert prov.terminated == []
+    clock.t += 1.0
+    cycle(loop)
+    assert prov.terminated == ["cascade-900-final-0"]
+    assert load_state(tmp_path / "state.json").instances == ()
+
+
+def test_restart_resumes_ledger_and_kills_orphans(tmp_path):
+    prov = FakeProvider("lium")
+    _seed_ledger(tmp_path, prov, [("final", "cascade-900-final-0", "NVIDIA L40S", 2)])
+    prov.live["cascade-900-heat-zombie"] = PodAddress("10.0.0.99", 22)   # never ledgered
+    loop = make_loop(tmp_path, providers={"lium": prov})
+    cycle(loop)
+    assert prov.terminated == ["cascade-900-heat-zombie"]
+    assert "cascade-900-final-0" in prov.live                            # owned: untouched
+
+
+def test_reconcile_never_touches_hand_rented_cascade_pods(tmp_path):
+    """Operators' pods legitimately share the ``cascade-`` prefix — only the
+    full cascade-<round>-<stage> scheme is reapable."""
+    prov = FakeProvider("lium")
+    prov.live["cascade-worker"] = PodAddress("10.9.9.1", 22)
+    prov.live["cascade-final-b"] = PodAddress("10.9.9.2", 22)
+    prov.live["cascade-heat-2"] = PodAddress("10.9.9.3", 22)            # no round id
+    prov.live["cascade-n91-42-funded-king-0"] = PodAddress("10.9.9.5", 22)   # the trainer's
+    prov.live["cascade-900-heat-zombie"] = PodAddress("10.9.9.4", 22)   # ours, orphaned
+    loop = make_loop(tmp_path, providers={"lium": prov})
+    cycle(loop)
+    assert prov.terminated == ["cascade-900-heat-zombie"]
+
+
+def _adopted(tmp_path, health):
+    prov = FakeProvider("lium")
+    _seed_ledger(tmp_path, prov, [("eval", "cascade-111-eval-0", "NVIDIA L40S", 1),
+                                  ("final", "cascade-900-final-0", "NVIDIA L40S", 2)])
+    loop = make_loop(tmp_path, providers={"lium": prov}, health=health,
+                     store=FakeStore(MANIFEST), eval_hosts=tmp_path / "eval_hosts.toml")
+    loop._last_evaled_round = "111"
+    loop.sleep = lambda s: None          # retry spacing: no real waits in tests
+    return loop, prov
+
+
+def cycle_adopted(loop):
+    loop.run_once()
+    t = loop._adopt_thread
+    if t is not None:
+        t.join(timeout=30)
+
+
+def test_adopted_pods_regate_against_the_ledgered_shape(tmp_path):
+    seen = []
+
+    def health(addr, stage, provider="", **shape):
+        seen.append((stage, shape.get("sku"), shape.get("gpus"), shape.get("adopted")))
+        return _report(ok=True)
+
+    loop, prov = _adopted(tmp_path, health)
+    cycle_adopted(loop)
+    assert sorted(seen) == [("eval", "NVIDIA L40S", 1, True),
+                            ("final", "NVIDIA L40S", 2, True)]
+    assert prov.terminated == []
+
+
+def test_adopted_pod_failing_regate_is_terminated_and_unpublished(tmp_path):
+    calls = []
+
+    def health(addr, stage, provider="", **shape):
+        calls.append(stage)
+        return _report(ok=(stage != "final"))
+
+    loop, prov = _adopted(tmp_path, health)
+    cycle_adopted(loop)
+    assert prov.terminated == ["cascade-900-final-0"]
+    assert [i.stage for i in load_state(tmp_path / "state.json").instances] == ["eval"]
+    assert calls.count("final") == 3 and calls.count("eval") == 1   # bounded retry
+
+
+def test_adopted_pod_survives_a_transient_gate_blip(tmp_path):
+    calls = []
+
+    def health(addr, stage, provider="", **shape):
+        calls.append(stage)
+        return _report(ok=calls.count(stage) > 1)             # blip, then fine
+
+    loop, prov = _adopted(tmp_path, health)
+    slept = []
+    loop.sleep = slept.append
+    cycle_adopted(loop)
+    assert prov.terminated == []
+    assert slept and all(s == 30.0 for s in slept)
+    assert len(calls) == 4                                    # 2 pods × (fail+pass)
+
+
+def test_adoption_regate_runs_once_and_skips_without_a_gate(tmp_path):
+    prov = FakeProvider("lium")
+    _seed_ledger(tmp_path, prov, [("final", "cascade-900-final-0", "NVIDIA L40S", 2)])
+    loop = make_loop(tmp_path, providers={"lium": prov})
+    cycle_adopted(loop)                                       # health=None: no-op
+    assert loop._adopt_thread is None
+    calls = []
+    loop2 = make_loop(tmp_path, providers={"lium": prov},
+                      health=lambda a, s, provider="", **k: (calls.append(s), _report())[1])
+    cycle_adopted(loop2)
+    cycle_adopted(loop2)
+    assert calls == ["final"]                                 # once per adopted pod
+
+
+def test_static_hosts_and_operator_lanes_survive_a_teardown_republish(tmp_path):
+    clock = Clock()
+    prov = FakeProvider("lium")
+    _seed_ledger(tmp_path, prov, [("final", "cascade-900-final-0", "NVIDIA L40S", 2)],
+                 clock=clock)
+    (tmp_path / "hosts.toml").write_text(
+        '[[host]]\nname = "op-lane-1"\nhost = "77.7.7.7"\nstage = "final"\n')
+    static = '[[host]]\nname = "cascade-final-b"\nhost = "216.81.245.151"\nstage = "final"\n'
+    loop = make_loop(tmp_path, providers={"lium": prov}, clock=clock)
+    loop.static_hosts_text = static
+    clock.t += 3 * 3600.0                                     # TTL reaps the leftover
+    cycle(loop)
+    names = {h.name for h in load_hosts(tmp_path / "hosts.toml")}
+    assert names == {"cascade-final-b", "op-lane-1"}          # static + operator lane
+
+
+def test_publish_uses_per_provider_profile(tmp_path):
+    """Shadeform VMs land as the 'shadeform' user under /home/shadeform — the
+    rendered eval entry must carry that provider's paths, not lium's root."""
+    from dataclasses import replace as _replace
+
+    from cascade.provision.loop import PodProfile
+
+    prov = FakeProvider("shadeform")
+    loop, _ = _eval_loop(tmp_path, providers={"shadeform": prov},
+                         policy=_eval_policy(eval=StagePolicy(
+                             sku="NVIDIA L40S", gpus_per_pod=1, max_pods=1,
+                             providers=("shadeform",), max_price_hr=1.2)))
+    loop.render = _replace(loop.render, profiles={"shadeform": PodProfile(
+        user="shadeform", workdir="/home/shadeform/cascade",
+        remote_python="/home/shadeform/cascade/.venv/bin/python")})
+    cycle(loop)
+    hosts = load_hosts(tmp_path / "eval_hosts.toml")
+    assert hosts and all(h.user == "shadeform" for h in hosts)
+    assert all(h.workdir == "/home/shadeform/cascade" for h in hosts)
+
+
+# ── chain client guards ──────────────────────────────────────────────────────
+
+
+def test_frozen_block_rebuilds_chain_client(tmp_path):
+    """A quietly-dead websocket keeps answering with a stale block; after
+    stale_block_after_s the loop rebuilds the client and sees the real height."""
+    clock = Clock()
+    loop = make_loop(tmp_path, clock=clock)
+    loop.chain_client = FakeChain(700)
+    loop.chain_client_factory = lambda: FakeChain(880)
+    loop.stale_block_after_s = 300.0
+    cycle(loop)
+    clock.t += 200.0
+    cycle(loop)
+    assert loop._last_block == 700                            # frozen, not stale yet
+    clock.t += 200.0
+    cycle(loop)
+    assert loop._last_block == 880                            # rebuilt
+
+
+def test_raising_chain_client_rebuilds_once(tmp_path):
+    class DeadChain:
+        def current_block(self):
+            raise ConnectionError("ws closed")
+
+    loop = make_loop(tmp_path)
+    loop.chain_client = DeadChain()
+    loop.chain_client_factory = lambda: FakeChain(880)
+    cycle(loop)
+    assert loop._last_block == 880
+
+
+def test_hung_chain_client_hits_deadline_and_rebuilds(tmp_path):
+    """A websocket that HANGS (not raises) must not block the loop — the
+    deadline converts the hang into a rebuild."""
+    import threading
+
+    class HangingChain:
+        def current_block(self):
+            threading.Event().wait(30)
+
+    loop = make_loop(tmp_path)
+    loop.chain_client = HangingChain()
+    loop.chain_client_factory = lambda: FakeChain(880)
+    orig = loop._with_deadline
+    loop_cls = type(loop)
+    try:
+        loop_cls._with_deadline = staticmethod(
+            lambda fn, seconds: orig(fn, 0.2 if seconds >= 60 else seconds))
+        cycle(loop)
+    finally:
+        loop_cls._with_deadline = staticmethod(orig)
+    assert loop._last_block == 880
+
+
+# ── config ───────────────────────────────────────────────────────────────────
+
+
+def _raw_config(**over):
+    raw = {"provisioner": {"max_spend_per_round": 25.0}}
+    raw["provisioner"].update(over)
+    return raw
+
+
+def test_build_policy_eval_table_is_optional():
+    assert build_policy(_raw_config()).eval is None
+    raw = _raw_config(eval={"sku": "NVIDIA L40S", "gpus_per_pod": 1, "max_pods": 1,
+                            "providers": ["lium"], "max_price_hr": 1.2})
+    p = build_policy(raw)
+    assert p.eval.sku == "NVIDIA L40S" and p.eval.max_pods == 1 and p.ttl_epochs == 1
+
+
+@pytest.mark.parametrize("bad", [
+    {"max_spend_per_round": 0},
+    {"ttl_epochs": 0},
+    {"eval": {"sku": "", "gpus_per_pod": 1, "max_pods": 1,
+              "providers": ["lium"], "max_price_hr": 1.2}},
+    {"eval": {"sku": "L40S", "gpus_per_pod": 0, "max_pods": 1,
+              "providers": ["lium"], "max_price_hr": 1.2}},
+])
+def test_build_policy_rejects_bad_config(bad):
+    with pytest.raises(ProvisionError):
+        build_policy(_raw_config(**bad))
+
+
+def test_retired_fleet_tables_still_load_and_name_their_providers():
+    """A deployed provision.toml still carries the retired per-round fleet
+    (heat/final tables, trigger/escalation keys): it loads unchanged, and the
+    providers it names stay wired so a ledger leftover can still be reaped."""
+    raw = _raw_config(
+        trigger_margin_blocks=25, escalate_deadline_s=1800, final_rent_on="heat_complete",
+        heat={"sku": "NVIDIA RTX A6000", "gpus_per_pod": 8, "max_pods": 4,
+              "providers": ["lium", "shadeform"], "max_price_hr": 4.0},
+        final={"sku": "NVIDIA L40S", "gpus_per_pod": 2, "max_pods": 2,
+               "providers": ["shadeform"], "max_price_hr": 3.0},
+        eval={"sku": "NVIDIA L40S", "gpus_per_pod": 1, "max_pods": 1,
+              "providers": ["lium"], "max_price_hr": 1.2})
+    p = build_policy(raw)
+    assert p.eval.providers == ("lium",)
+    assert provider_names(raw, p) == ["lium", "shadeform"]
+
+
+def test_eval_hosts_fan_out_to_the_stage_shape_when_the_row_lacks_gpus(tmp_path):
+    """A ledger row with no recorded ``gpus`` publishes the stage policy's
+    ``gpus_per_pod`` lanes, never a silent single lane."""
+    policy = _eval_policy(eval=StagePolicy(sku="NVIDIA L40S", gpus_per_pod=2, max_pods=1,
+                                           providers=("lium",), max_price_hr=1.2))
+    loop, _prov = _eval_loop(tmp_path, policy=policy)
+    loop._last_evaled_round = "900"
+    inst = PodInstance(provider="lium", instance_id="cascade-900-eval-0", stage="eval",
+                       rented_at_iso="2026-01-01T00:00:00+00:00", sku="NVIDIA L40S", gpus=0)
+    loop._publish_eval_hosts([(inst, PodAddress("10.0.1.1", 22))])
+    text = (tmp_path / "eval_hosts.toml").read_text()
+    assert text.count("[[host]]") == 2
+    assert loop._stage_gpus("final") == 1          # no policy for the retired fleet

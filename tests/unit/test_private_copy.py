@@ -164,7 +164,7 @@ def _registry(tmp_path, prints, *, mode="enforce", pc_mode="enforce", thr=0.8,
               published=()):
     runner = SimpleNamespace(
         cfg=SimpleNamespace(round=SimpleNamespace(
-            dedup_max_tokens=50_000, dedup_max_text_mb=4, private_copy_mode=pc_mode,
+            dedup_max_text_mb=4, private_copy_mode=pc_mode,
             private_copy_min_containment=thr, private_copy_min_tokens=2000)),
         work_root=tmp_path,
         manifest_store=lambda: SimpleNamespace(get_text=lambda key: json.dumps(

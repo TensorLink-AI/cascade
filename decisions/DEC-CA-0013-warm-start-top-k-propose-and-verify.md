@@ -6,7 +6,7 @@ status: active
 date: 2026-08-10
 tags: [cascade, warm-start, promotion, trainer, consensus, diversity]
 revisit_when: "one full testnet promotion cycle (promote a multi-member set → rotate → next generation selects across lineages) shows whether structural diversity picks genuinely distinct checkpoints — or per-window error-decorrelation shadow data argues for a behavioral selection policy; also revisit if any evidence appears that the miner whose generator data shaped a promoted init gains a subsequent-round edge; and when PR-173-style multi-finalist cohorts ship trainer-side: the post-publish bench is SEQUENTIAL per pod (~1h per checkpoint) and bench_hold_max_hours is sized for k=1 — a cohort needs the hold scaled or the benched set capped (e.g. king + top-2 by duel_rank), or later cohort members silently drop out of the promotion candidate pool (kept as-is deliberately: degradation is graceful, and lane-scoped preemption / cohort-sized final fleets are the known fixes if it starts to bite)"
-relations: {}
+relations: {supersedes: [DEC-CA-0005]}
 ---
 Cascade warm-start promotion changes from "every validator re-derives one
 winner and installs it" to **propose-and-verify over a top-k member set**.

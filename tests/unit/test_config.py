@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from cascade.eval.crps import DEFAULT_QUANTILE_LEVELS
 from cascade.eval.koth import KothParams
-from tests.unpinned import load_unpinned, strip_pins
 
 
 def test_config_loads(cfg):
@@ -207,16 +206,6 @@ def test_validate_dedup_mode_rejects_unknown():
     assert validate_dedup_mode("enforce") == "enforce"
 
 
-def test_shipped_config_backs_the_probe_with_hard_isolation(cfg):
-    # The dedup probe executes untrusted generator code on the orchestrator,
-    # which holds the private eval pool and the trainer's wallet. Shipping the
-    # probe on with a degradable sandbox is the one combination that must not
-    # occur (cascade.trainer.loop.TrainerRunner._probe_sandbox_ok enforces it
-    # at runtime; this pins the shipped file).
-    probe_on = (cfg.round.dedup_probe_mode != "off"
-                and cfg.round.dedup_probe_series > 0)
-    if probe_on and not cfg.round.dedup_probe_allow_weak_sandbox:
-        assert cfg.generator.sandbox_mode == "container" or cfg.generator.sandbox_strict
 
 
 def test_for_hours_scales_budget_and_wall_clock_guard(cfg):
@@ -241,15 +230,6 @@ def test_for_hours_scales_budget_and_wall_clock_guard(cfg):
         c.for_hours(0.0)
 
 
-def test_heat_num_samples_knob(cfg):
-    # chain.toml ships the heat screen at the final's sample count (2026-07-27),
-    # so the screen ranks on the same estimator the duel decides on;
-    # 0 (the default) means "reuse [eval] num_samples".
-    from dataclasses import replace
-
-    assert cfg.round.heat_num_samples == cfg.eval.num_samples == 100
-    bare = replace(cfg.round, heat_num_samples=0)
-    assert (bare.heat_num_samples or cfg.eval.num_samples) == cfg.eval.num_samples
 
 
 def test_for_hours_guard_knobs_override_defaults(cfg):
@@ -312,7 +292,7 @@ def test_activation_block_must_be_on_both_grids(tmp_path):
 
     from cascade.shared.config import DEFAULT_CHAIN_TOML, load_chain_config
 
-    src = strip_pins(DEFAULT_CHAIN_TOML.read_text())
+    src = DEFAULT_CHAIN_TOML.read_text()
     p = tmp_path / "chain.toml"
     # The shipped template is in the steady state (0/0); build the scheduled
     # pair explicitly so the test does not depend on a live seam being armed.
@@ -336,7 +316,7 @@ def test_cadence_keys_must_be_set_together(tmp_path):
 
     from cascade.shared.config import DEFAULT_CHAIN_TOML, load_chain_config
 
-    src = strip_pins(DEFAULT_CHAIN_TOML.read_text())
+    src = DEFAULT_CHAIN_TOML.read_text()
     p = tmp_path / "chain.toml"
     steady = ("epoch_blocks_prev      = 0\nepoch_activation_block = 0")
     p.write_text(src.replace(steady, "epoch_blocks_prev      = 0\n"
@@ -352,9 +332,9 @@ def test_shipped_config_arms_points_denomination():
     """The shipped mainnet template arms corpus_target_points at today's
     corpus size in points (16384 × 4096) and splits the streaming stall
     window off the raised batch drain budget at its pre-split value."""
-    from cascade.shared.config import DEFAULT_CHAIN_TOML
+    from cascade.shared.config import DEFAULT_CHAIN_TOML, load_chain_config
 
-    c = load_unpinned(DEFAULT_CHAIN_TOML)
+    c = load_chain_config(DEFAULT_CHAIN_TOML)
     g = c.generator
     assert g.corpus_target_points == 16384 * 4096
     assert g.corpus_target_points <= g.max_total_points
@@ -378,7 +358,7 @@ def test_corpus_target_points_must_fit_the_point_cap(tmp_path):
 
     from cascade.shared.config import DEFAULT_CHAIN_TOML, load_chain_config
 
-    src = strip_pins(DEFAULT_CHAIN_TOML.read_text())
+    src = DEFAULT_CHAIN_TOML.read_text()
     p = tmp_path / "chain.toml"
     p.write_text(src.replace("corpus_target_points = 67_108_864",
                              "corpus_target_points = 3_000_000_000"))
@@ -392,10 +372,10 @@ def test_generator_budget_keys_stay_out_of_contract_digest():
     The digest hashes TrainingContractConfig only — assert the armed template's
     training digest is bit-equal to the same [training] with the drain armed
     or not (i.e. the generator block cannot reach it)."""
-    from cascade.shared.config import DEFAULT_CHAIN_TOML
+    from cascade.shared.config import DEFAULT_CHAIN_TOML, load_chain_config
     from cascade.shared.manifest import contract_digest
 
-    c = load_unpinned(DEFAULT_CHAIN_TOML)
+    c = load_chain_config(DEFAULT_CHAIN_TOML)
     assert "corpus_target_points" not in {
         f for f in c.training.__dataclass_fields__
     }
@@ -404,3 +384,47 @@ def test_generator_budget_keys_stay_out_of_contract_digest():
     }
     # And the digest input really is the training dataclass alone.
     assert len(contract_digest(c.training)) == 64
+
+
+# ── retired keys: deployed chain.tomls keep loading ──────────────────────────
+
+
+def test_retired_keys_load_and_are_ignored(tmp_path):
+    """External validators' deployed chain.tomls still carry the retired
+    boundary-round knobs: every one must load (ignored), none may be a live
+    field, and the shipped tomls — which still set several — load unchanged."""
+    import dataclasses
+    from pathlib import Path
+
+    from cascade.shared.config import (
+        DEFAULT_CHAIN_TOML,
+        RETIRED_KEYS,
+        EvalConfig,
+        RoundConfig,
+        TelemetryConfig,
+        ValidatorConfig,
+        load_chain_config,
+    )
+
+    live = {"round": {f.name for f in dataclasses.fields(RoundConfig)},
+            "telemetry": {f.name for f in dataclasses.fields(TelemetryConfig)},
+            "eval": {f.name for f in dataclasses.fields(EvalConfig)},
+            "validator": {f.name for f in dataclasses.fields(ValidatorConfig)}}
+    for section, keys in RETIRED_KEYS.items():
+        assert not keys & live[section], f"[{section}] retired key is a live field"
+
+    repo = Path(__file__).resolve().parents[2]
+    for name in ("chain.toml", "chain.testnet.toml"):
+        load_chain_config(repo / name)
+    text = DEFAULT_CHAIN_TOML.read_text()
+    extra = {"round": "\n".join(f"{k} = 1" for k in sorted(RETIRED_KEYS["round"])
+                                if f"\n{k} " not in text and f"\n{k}=" not in text),
+             "telemetry": "\n".join(f"{k} = 1" for k in sorted(RETIRED_KEYS["telemetry"])
+                                    if f"\n{k} " not in text)}
+    for section, lines in extra.items():
+        if lines:
+            text = text.replace(f"\n[{section}]\n", f"\n[{section}]\n{lines}\n", 1)
+    p = tmp_path / "chain.toml"
+    p.write_text(text)
+    assert load_chain_config(p).round.epoch_blocks == load_chain_config(
+        DEFAULT_CHAIN_TOML).round.epoch_blocks

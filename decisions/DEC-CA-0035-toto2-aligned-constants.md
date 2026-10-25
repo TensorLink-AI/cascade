@@ -2,7 +2,7 @@
 id: DEC-CA-0035
 type: decision
 title: "Toto2-aligned optimizer constants + warm-start LR scale — the measured recipe that beats the converged init, shipped inert behind drop-when-default"
-status: proposed
+status: accepted
 date: 2026-08-27
 tags: [cascade, training-recipe, optimizer, normuon, lr-schedule, umup, contract-digest, warm-start]
 revisit_when: "Wave 3 measures cross-generator separation at the aligned recipe (the arming gate: a better generator must still WIN under it, not just score near init); or a testnet cascade runs a full round cycle with the bundle armed (the mainnet-cut gate); or the 22M size seam arms (µP transfers the constants by design — verify warm_lr_scale at size); or Datadog publishes a revised recipe"
@@ -13,8 +13,8 @@ published Toto 2.0 hyperparameters (arXiv 2605.20119) — their HP sweep was
 paid once at 4M under u-µP and transfers across sizes; cascade should
 inherit it rather than re-derive. Measured 2026-08-26/27 on a rented
 4×L40S pod (u88 generator, production r41 seeds + warm-start init, 1h heat
-fence, EMA variants alongside; full grid in
-docs/notes/2026-08-27-toto2-alignment.md):
+fence, EMA variants alongside; full grid in a
+working note, never committed):
 
 - **The full constants bundle BEATS the converged warm-start init** — the
   first checkpoints all campaign to do so. Bundle @ base_lr×0.125 (5e-4):

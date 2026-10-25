@@ -1,8 +1,5 @@
-"""Round-boundary guards for the provisioner (2026-09-04 incidents).
+"""Hosts-file and health-gate guards for the provisioner.
 
-* H1 — a heat/final pod whose teardown signal is due is NOT terminated while
-  training legs are running on it (or while it cannot be reached); the TTL
-  stays the only unconditional kill.
 * H3 — hosts.toml entries this service does not own (operator-appended
   lanes) survive every republish; stale self-published lanes do not; the
   static fragment is re-read per publish.
@@ -24,8 +21,9 @@ from tests.unit.test_provision_health import _proc, _run_ssh
 from tests.unit.test_provision_loop import (
     Clock,
     FakeProvider,
-    FakeStore,
+    _eval_loop,
     _report,
+    _seed_ledger,
     cycle,
     make_loop,
 )
@@ -119,7 +117,7 @@ def test_adopted_regate_skips_fresh_boot():
 
 
 def test_fresh_boot_failure_walks_the_replacement_to_another_facility(tmp_path):
-    """Same treatment as image_digest (r51): a recycled container is a facility
+    """Same treatment as image_digest: a recycled container is a facility
     property (its container cache), so the replacement rents elsewhere."""
 
     class RegionAwareProvider(FakeProvider):
@@ -145,14 +143,13 @@ def test_fresh_boot_failure_walks_the_replacement_to_another_facility(tmp_path):
 
     def health(addr, stage, provider="", **shape):
         pid = next(p for p, a in prov.live.items() if a.ip == addr.ip)
-        recycled = stage == "heat" and prov.region_by_pod[pid] == "kansascity-usa-1"
-        return _report(ok=not recycled, name="fresh_boot")
+        return _report(ok=prov.region_by_pod[pid] != "kansascity-usa-1", name="fresh_boot")
 
-    loop, _ = make_loop(tmp_path, providers={"lium": prov}, health=health)
+    loop, _ = _eval_loop(tmp_path, prov=prov, health=health)
     cycle(loop)
     rspec = next(s for s in prov.specs if "-r0" in s.name_prefix)
     assert rspec.exclude_regions == ("kansascity-usa-1",)
-    assert prov.region_by_pod["cascade-900-heat-r0-0"] == "chicago-usa-2"
+    assert prov.region_by_pod["cascade-111-eval-r0-0"] == "chicago-usa-2"
     assert loop._gate_failures == {}
 
 
@@ -163,12 +160,11 @@ def test_regate_passes_adopted_flag_to_the_gate(tmp_path):
         seen.append(shape)
         return _report(ok=True)
 
-    prov = FakeProvider("lium")
-    loop, _ = make_loop(tmp_path, providers={"lium": prov}, health=health)
+    loop, prov = _eval_loop(tmp_path, health=health)
     cycle(loop)
-    assert seen and all(not s.get("adopted") for s in seen)     # fresh rentals
+    assert seen and all(not s.get("adopted") for s in seen)     # fresh rental
     seen.clear()
-    loop2, _ = make_loop(tmp_path, providers={"lium": prov}, health=health)
+    loop2 = make_loop(tmp_path, providers={"lium": prov}, health=health)
     loop2.run_once()
     t = loop2._adopt_thread
     if t is not None:
@@ -176,111 +172,7 @@ def test_regate_passes_adopted_flag_to_the_gate(tmp_path):
     assert seen and all(s.get("adopted") is True for s in seen)  # the re-gate
 
 
-# ── H1: liveness guard ───────────────────────────────────────────────────────
-
-
-def _manifest_round(tmp_path, clock, store, loop, prov):
-    """Marker lands, then the round manifest publishes: the final is due."""
-    d = tmp_path / "work" / "54321"
-    d.mkdir(parents=True)
-    (d / "heat_complete.json").write_text("{}")
-    clock.t += 1800.0
-    cycle(loop)
-    assert "cascade-900-final-0" in prov.live
-    store.texts["manifests/round-54321.json"] = '{"round_id": "54321"}'
-    clock.t += 1800.0
-
-
-def _fleet(tmp_path, clock, store, legs, heat_legs=0):
-    """A heat+final fleet whose FINAL pod reports ``legs()`` live legs (the
-    heat pod reports ``heat_legs``, idle by default so the marker reaps it)."""
-    prov = FakeProvider("lium")
-    loop, _ = make_loop(tmp_path, providers={"lium": prov}, clock=clock, store=store)
-    probed = []
-
-    def live_legs(addr, provider=""):
-        probed.append((addr.ip, provider))
-        pid = next((p for p, a in prov.live.items() if a.ip == addr.ip), "")
-        return heat_legs if "heat" in pid else legs()
-
-    loop.live_legs = live_legs
-    cycle(loop)
-    assert len(prov.live) == 2
-    return loop, prov, probed
-
-
-def test_final_with_live_legs_survives_its_manifest(tmp_path):
-    """The 2026-09-04 20:30 class: the OLD round's manifest+bench signals fired
-    7 s after the NEW round dispatched onto the same pods."""
-    clock, store = Clock(), FakeStore()
-    loop, prov, probed = _fleet(tmp_path, clock, store, legs=lambda: 2)
-    _manifest_round(tmp_path, clock, store, loop, prov)
-    cycle(loop)
-    assert "cascade-900-final-0" in prov.live                  # deferred, not killed
-    assert probed and probed[-1][1] == "lium"
-    hosts = load_hosts(tmp_path / "hosts.toml")
-    assert [h.stage for h in hosts] == ["final", "final"]     # still published
-    # Legs finish → the next sweep tears it down.
-    loop.live_legs = lambda addr, provider="": 0
-    clock.t += 60.0
-    cycle(loop)
-    assert prov.live == {}
-
-
-def test_unreachable_pod_is_not_proof_of_idleness(tmp_path):
-    clock, store = Clock(), FakeStore()
-    loop, prov, _ = _fleet(tmp_path, clock, store, legs=lambda: None)
-    _manifest_round(tmp_path, clock, store, loop, prov)
-    cycle(loop)
-    assert "cascade-900-final-0" in prov.live
-
-    def boom(addr, provider=""):
-        raise OSError("ssh: connect refused")
-
-    loop.live_legs = boom
-    clock.t += 60.0
-    cycle(loop)
-    assert "cascade-900-final-0" in prov.live                  # errors defer too
-
-
-def test_ttl_still_kills_a_pod_with_live_legs(tmp_path):
-    clock, store = Clock(), FakeStore()
-    loop, prov, _ = _fleet(tmp_path, clock, store, legs=lambda: 3)
-    _manifest_round(tmp_path, clock, store, loop, prov)
-    cycle(loop)
-    assert "cascade-900-final-0" in prov.live
-    clock.t += loop.ttl_hours * 3600.0 + 1.0                  # TTL: unconditional
-    cycle(loop)
-    assert prov.live == {}
-
-
-def test_heat_pod_with_live_legs_survives_the_marker(tmp_path):
-    clock, store = Clock(), FakeStore()
-    loop, prov, _ = _fleet(tmp_path, clock, store, legs=lambda: 0, heat_legs=1)
-    d = tmp_path / "work" / "54321"
-    d.mkdir(parents=True)
-    (d / "heat_complete.json").write_text("{}")
-    clock.t += 1800.0
-    cycle(loop)
-    assert "cascade-900-heat-0" in prov.live                   # legs still running
-    loop.live_legs = lambda addr, provider="": 0
-    clock.t += 60.0
-    cycle(loop)
-    assert "cascade-900-heat-0" not in prov.live
-    assert "cascade-900-final-0" in prov.live
-
-
-def test_no_probe_configured_keeps_the_old_behaviour(tmp_path):
-    clock, store = Clock(), FakeStore()
-    prov = FakeProvider("lium")
-    loop, _ = make_loop(tmp_path, providers={"lium": prov}, clock=clock, store=store)
-    cycle(loop)
-    _manifest_round(tmp_path, clock, store, loop, prov)
-    cycle(loop)
-    assert prov.live == {}
-
-
-# ── H3: operator lanes survive republishes ───────────────────────────────────
+# ── operator lanes survive republishes ───────────────────────────────────────
 
 OPERATOR_LANE = '''
 [[host]]
@@ -306,106 +198,80 @@ stage = "final"
 '''
 
 
-def _heat_marker(tmp_path, clock, loop):
-    d = tmp_path / "work" / "54321"
-    d.mkdir(parents=True, exist_ok=True)
-    (d / "heat_complete.json").write_text("{}")
-    clock.t += 1800.0
+
+LEFTOVER = [("final", "cascade-900-final-0", "NVIDIA L40S", 2)]
+
+
+def _leftover_fleet(tmp_path, clock):
+    """A ledger leftover of the retired per-round fleet, published to hosts.toml."""
+    prov = FakeProvider("lium")
+    _seed_ledger(tmp_path, prov, LEFTOVER, clock=clock)
+    loop = make_loop(tmp_path, providers={"lium": prov}, clock=clock)
+    loop._republish_from_ledger()
+    return loop, prov
+
+
+def _reap(loop, clock):
+    clock.t += loop.ttl_hours * 3600.0
     cycle(loop)
 
 
 def test_operator_lanes_survive_a_teardown_republish(tmp_path):
     clock = Clock()
-    prov = FakeProvider("lium")
-    loop, _ = make_loop(tmp_path, providers={"lium": prov}, clock=clock)
-    cycle(loop)
+    loop, prov = _leftover_fleet(tmp_path, clock)
     hosts_path = tmp_path / "hosts.toml"
-    # The operator appends a hand-rented lane (2026-09-04 flip-round fleet)
-    # and a stale lane a previous provisioner run published for a pod that is gone.
+    # The operator appends a hand-rented lane, and a stale lane a previous
+    # provisioner run published for a pod that is gone.
     hosts_path.write_text(hosts_path.read_text() + OPERATOR_LANE + STALE_SELF_LANE)
-
-    _heat_marker(tmp_path, clock, loop)                    # heat reaped → republish
+    _reap(loop, clock)
+    assert prov.live == {}
     hosts = load_hosts(hosts_path)
-    names = [h.name for h in hosts]
-    assert "cascade-900-final-m0-g0" in names               # preserved
-    assert "cascade-800-final-0-g0" not in names            # stale self-lane dropped
-    assert all("heat" not in n for n in names)              # our heat pods gone
-    assert len(names) == len(set(names))                    # no duplicates
-    lane = next(h for h in hosts if h.name == "cascade-900-final-m0-g0")
+    assert [h.name for h in hosts] == ["cascade-900-final-m0-g0"]   # preserved; stale dropped
+    lane = hosts[0]
     assert (lane.host, lane.port, lane.cuda_device, lane.stage) == ("10.99.0.1", 2222, "0", "final")
     assert lane.forward_env == ("HIPPIUS_S3_ACCESS_KEY", "HF_TOKEN")
     assert lane.ssh_options == ("StrictHostKeyChecking=accept-new",)
     assert lane.chain_toml == "/root/cascade/chain.deployed.toml"
 
 
-def test_operator_lane_survives_a_full_teardown_clear(tmp_path):
-    """'No dynamic pods' must degrade to 'operator fleet', never an empty file."""
-    clock, store = Clock(), FakeStore()
-    prov = FakeProvider("lium")
-    loop, _ = make_loop(tmp_path, providers={"lium": prov}, clock=clock, store=store)
-    cycle(loop)
-    hosts_path = tmp_path / "hosts.toml"
-    hosts_path.write_text(hosts_path.read_text() + OPERATOR_LANE)
-    _manifest_round(tmp_path, clock, store, loop, prov)
-    cycle(loop)
-    assert prov.live == {}
-    assert [h.name for h in load_hosts(hosts_path)] == ["cascade-900-final-m0-g0"]
-
-
 def test_our_own_terminated_pods_are_never_preserved_as_operator_lanes(tmp_path):
-    clock, store = Clock(), FakeStore()
-    prov = FakeProvider("lium")
-    loop, _ = make_loop(tmp_path, providers={"lium": prov}, clock=clock, store=store)
-    cycle(loop)
+    clock = Clock()
+    loop, prov = _leftover_fleet(tmp_path, clock)
     hosts_path = tmp_path / "hosts.toml"
-    # Rename our final lanes to an operator-looking shape: address ownership
-    # must still drop them once the pod is terminated.
-    text = hosts_path.read_text().replace("cascade-lium-", "cascade-operator-")
-    hosts_path.write_text(text)
-    _manifest_round(tmp_path, clock, store, loop, prov)
-    cycle(loop)
-    assert prov.live == {}
+    # Rename our lanes to an operator-looking shape: address ownership must
+    # still drop them once the pod is terminated.
+    hosts_path.write_text(hosts_path.read_text().replace("cascade-lium-", "cascade-operator-"))
+    _reap(loop, clock)
     with pytest.raises(RemoteDispatchError):
         load_hosts(hosts_path)                               # nothing left: cleared
 
 
 def test_torn_hosts_file_preserves_nothing(tmp_path):
     clock = Clock()
-    prov = FakeProvider("lium")
-    loop, _ = make_loop(tmp_path, providers={"lium": prov}, clock=clock)
-    cycle(loop)
+    loop, _ = _leftover_fleet(tmp_path, clock)
     hosts_path = tmp_path / "hosts.toml"
     hosts_path.write_text(hosts_path.read_text() + OPERATOR_LANE + "\n[[host]\nbroken = ")
-    _heat_marker(tmp_path, clock, loop)
+    loop._republish_from_ledger()
     names = [h.name for h in load_hosts(hosts_path)]
     assert "cascade-900-final-m0-g0" not in names            # garbage never re-emitted
-    assert names and all(n.startswith("cascade-lium-") and n.endswith(("-g0", "-g1")) for n in names)
+    assert names and all(n.startswith("cascade-lium-") for n in names)
 
 
-def test_lane_names_are_stable_across_a_second_rental(tmp_path):
-    """2026-09-06 09:05: the second pod's publish renamed the first pod's lanes
-    (old round id → new) and the trainer's name-keyed pool dispatched a second
-    leg onto the king's GPU. Names must derive from pod identity only."""
-    from cascade.provision.loop import lane_pod_name
-
-    clock, store = Clock(), FakeStore()
-    prov = FakeProvider("lium")
-    loop, _ = make_loop(tmp_path, providers={"lium": prov}, clock=clock, store=store)
-    cycle(loop)
-    first = {h.name: (h.host, h.cuda_device) for h in load_hosts(tmp_path / "hosts.toml")}
-    assert first and all(n.startswith("cascade-lium-") for n in first)
-    # Every name carries its pod's identity, not the round or position.
-    for inst in loop._state.instances:
-        stem = lane_pod_name(inst.provider, inst.instance_id)
-        assert any(n.startswith(stem + "-g") for n in first), (stem, sorted(first))
-    # A republish under a NEW round id (the second rental of the incident)
-    # keeps every existing lane byte-identical in name/host/device.
+def test_lane_names_derive_from_pod_identity_only(tmp_path):
+    """A republish under a new round id must never rename a lane the trainer
+    already holds (its name-keyed pool would dispatch onto a renamed twin)."""
     from dataclasses import replace as dc_replace
 
+    from cascade.provision.loop import lane_pod_name
+
+    loop, _ = _leftover_fleet(tmp_path, Clock())
+    first = {h.name: (h.host, h.cuda_device) for h in load_hosts(tmp_path / "hosts.toml")}
+    stem = lane_pod_name("lium", "cascade-900-final-0")
+    assert sorted(first) == [stem + "-g0", stem + "-g1"]
     loop._state = dc_replace(loop._state, round_id="9010800")
     loop._republish_from_ledger()
-    second = {h.name: (h.host, h.cuda_device) for h in load_hosts(tmp_path / "hosts.toml")}
-    assert second == first
+    assert {h.name: (h.host, h.cuda_device)
+            for h in load_hosts(tmp_path / "hosts.toml")} == first
 
 
 def test_lane_pod_name_shapes():
@@ -423,25 +289,22 @@ def test_lane_pod_name_shapes():
 
 
 def test_static_fragment_is_reread_on_every_publish(tmp_path):
-    clock = Clock()
-    prov = FakeProvider("lium")
     static_path = tmp_path / "static.toml"
     static_path.write_text('[[host]]\nname = "cascade-final-b"\nhost = "216.81.245.151"\nstage = "final"\n')
-    loop, _ = make_loop(tmp_path, providers={"lium": prov}, clock=clock)
+    loop = make_loop(tmp_path)
     loop.static_hosts_text = static_path.read_text()
     loop.static_hosts_path = static_path
-    cycle(loop)
+    loop._republish_from_ledger()
     assert "cascade-final-b" in (tmp_path / "hosts.toml").read_text()
     # Operator edits the fragment: the next publish carries the edit.
     static_path.write_text('[[host]]\nname = "cascade-final-c"\nhost = "216.81.245.152"\nstage = "final"\n')
-    _heat_marker(tmp_path, clock, loop)
+    loop._republish_from_ledger()
     text = (tmp_path / "hosts.toml").read_text()
     assert "cascade-final-c" in text and "cascade-final-b" not in text
     # A broken edit keeps the last-good fragment instead of publishing garbage.
     static_path.write_text("[[host]\nbroken")
     loop._republish_from_ledger()
-    text = (tmp_path / "hosts.toml").read_text()
-    assert "cascade-final-c" in text
+    assert "cascade-final-c" in (tmp_path / "hosts.toml").read_text()
     load_hosts(tmp_path / "hosts.toml")
 
 

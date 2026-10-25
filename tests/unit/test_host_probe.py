@@ -25,7 +25,6 @@ from cascade.trainer.host_probe import (
     lane_geometry,
     resolve_device,
 )
-from cascade.trainer.loop import host_spread_part, telemetry_rollup_line
 
 # ── identity: the two scopes ──────────────────────────────────────────────────
 
@@ -299,59 +298,6 @@ def test_host_summary_line_with_nothing_to_say():
     assert host_summary_line({}) == "no host facts available"
 
 
-# ── round roll-up: fleet uniformity ───────────────────────────────────────────
-
-
-def _run(bench=None, pod="p1", machine="m1", gpu="NVIDIA GeForce RTX 4090"):
-    m = {"deadline_hit": False, "data_wait_frac": 0.1}
-    if bench is not None:
-        m |= {"host_bench_tokens_per_s": bench, "host_id": pod,
-              "host_boot_id": machine, "host_gpu_name": gpu}
-    return m
-
-
-def test_host_spread_reports_the_bound_on_host_attributable_variance():
-    part = host_spread_part([
-        _run(1_000_000, pod="a", machine="m1"),
-        _run(1_500_000, pod="b", machine="m1"),
-        _run(2_000_000, pod="c", machine="m2"),
-    ])
-    assert "spread=2.00x" in part           # max/min: what the pods alone could explain
-    assert "3 pods" in part
-    assert "2 machines" in part             # a and b are co-tenants
-    assert "1 skus" in part
-
-
-def test_host_spread_is_silent_when_nothing_benched():
-    assert host_spread_part([_run(), _run()]) == ""
-
-
-def test_rollup_keeps_its_previous_text_without_host_facts():
-    line = telemetry_rollup_line(7, [_run(), _run()], [_run()])
-    assert "deadline_hit 0/2 heats + 0/1 finals" in line
-    assert "host_bench" not in line
-
-
-def test_rollup_appends_the_host_clause_when_present():
-    line = telemetry_rollup_line(7, [_run(1e6, pod="a"), _run(4e6, pod="b")], [])
-    assert "data_wait_frac p50=" in line
-    assert "host_bench min=1,000,000" in line
-    assert "spread=4.00x" in line
-
-
-def test_host_clause_counts_runs_that_lack_backend_metrics():
-    """Host facts come from the pod probe, backend metrics from the trainer. A
-    custom BaseTrainer emits no deadline_hit — its run still occupied a pod, so
-    excluding it would compute uniformity over the wrong denominator."""
-    bare = {"host_bench_tokens_per_s": 5e6, "host_id": "z", "host_boot_id": "m9"}
-    line = telemetry_rollup_line(9, [_run(1e6, pod="a"), bare], [])
-    assert "2 benched" in line
-    assert "spread=5.00x" in line
-
-
-# ── wiring: the round actually collects and publishes this ─────────────────────
-
-
 def test_shipped_chain_toml_enables_the_probe(cfg):
     # The section is optional and defaults on, so an operator who never adds it
     # still gets the telemetry — but the shipped template must not disagree.
@@ -360,13 +306,12 @@ def test_shipped_chain_toml_enables_the_probe(cfg):
 
 
 def _round_records(cfg, tmp_path, monkeypatch, caplog):
-    """Run one fixture round with a fake stream/trainer/registry and return
-    ``(emitted log records, log messages)``."""
-    from cascade.shared.chain import Commitment
+    """Train a king and a challenger leg with a fake stream/trainer/registry and
+    return ``(emitted log records, log messages)``."""
     from cascade.shared.hippius import HubRef, HubUpload
     from cascade.trainer import loop as loop_mod
-    from cascade.trainer.contract import TrainResult
-    from cascade.trainer.loop import TrainerRunner
+    from cascade.trainer.contract import RoundSeeds, TrainResult
+    from cascade.trainer.loop import ResolvedGenerator, TrainerRunner
 
     records: list[dict] = []
 
@@ -418,16 +363,12 @@ def _round_records(cfg, tmp_path, monkeypatch, caplog):
     )
     runner = TrainerRunner(cfg=cfg, base_trainer=_Trainer(), work_root=tmp_path,
                            use_sandbox=False)
-    commits = [
-        Commitment(uid=0, hotkey="a", coldkey=None,
-                   payload="metro-v1:gen:hippius:alice/gen-a@sha256:" + "a" * 64,
-                   commit_block=5),
-        Commitment(uid=1, hotkey="b", coldkey=None,
-                   payload="metro-v1:gen:hippius:bob/gen-b@sha256:" + "b" * 64,
-                   commit_block=6),
-    ]
+    seeds = RoundSeeds.derive(1, cfg.training)
     with caplog.at_level("INFO", logger="cascade.trainer"):
-        runner.run_round(commits, king_hotkey="a", base_seed=1, block=10)
+        runner.train_one(ResolvedGenerator("a", 0, "alice/gen-a@sha256:" + "a" * 64),
+                         "king", seeds, 10)
+        runner.train_one(ResolvedGenerator("b", 1, "bob/gen-b@sha256:" + "b" * 64),
+                         "challenger", seeds, 10, repo_suffix="-u1")
     return records, [r.message for r in caplog.records]
 
 
@@ -442,7 +383,7 @@ def probe_cfg(cfg):
     return replace(cfg, telemetry=TelemetryConfig(host_probe=True, host_bench=False))
 
 
-def test_round_emits_a_host_record_and_repeats_it_on_the_summary(
+def test_leg_emits_a_host_record_and_repeats_it_on_the_summary(
     probe_cfg, tmp_path, monkeypatch, caplog
 ):
     records, msgs = _round_records(probe_cfg, tmp_path, monkeypatch, caplog)
@@ -488,7 +429,7 @@ def test_disabling_the_probe_restores_the_previous_records(
     assert not any("host: host_id=" in m for m in msgs)
 
 
-def test_a_broken_probe_does_not_fail_the_round(
+def test_a_broken_probe_does_not_fail_the_leg(
     probe_cfg, tmp_path, monkeypatch, caplog
 ):
     from cascade.trainer import loop as loop_mod
@@ -498,5 +439,5 @@ def test_a_broken_probe_does_not_fail_the_round(
         lambda **k: (_ for _ in ()).throw(RuntimeError("probe exploded")),
     )
     records, _ = _round_records(probe_cfg, tmp_path, monkeypatch, caplog)
-    # The round still trained and still published its summaries.
+    # The legs still trained and still published their summaries.
     assert [r for r in records if r.get("event") == "summary"]

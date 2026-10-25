@@ -1,0 +1,9 @@
+# Reserved variant; nominal active-parameter target only.
+# Populate the model and qualify its complete contract before activation.
+# See ../README.md. No dimensions, digests or throughput are assumed here.
+
+[training]
+base_arch = "cascade_moe"
+arch_preset = "cascade-moe-v2-120m"
+implementation_status = "placeholder"
+target_active_parameters = 120000000

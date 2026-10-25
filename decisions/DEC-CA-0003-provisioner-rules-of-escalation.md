@@ -2,7 +2,8 @@
 id: DEC-CA-0003
 type: decision
 title: "Provisioner rules of escalation: deadline-bounded ladder walking, 2x floor"
-status: active
+status: superseded
+note: "Superseded by DEC-CA-0043. Governed the provisioner's per-round heat/final fleets, retired with the legacy round modes; the trainer now rents each leg and the era king just-in-time."
 date: 2026-07-23
 tags: [provisioner, operations, cost]
 revisit_when: "heats regularly degrade to local training, or the trigger margin / heat window math changes materially"

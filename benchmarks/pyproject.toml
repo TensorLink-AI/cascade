@@ -12,6 +12,7 @@ license = { text = "MIT" }
 # live in a resolver universe of their own, so they cannot collide with the main
 # repo's torch>=2.2 / transformers>=4.40 / bittensor / hippius stack.
 dependencies = [
+    "certifi>=2026.10.19",
     # gift-eval IS the harness for both GIFT-Eval and BOOM (BOOM's loader is
     # built on it). Pinned to the exact commit DataDog/toto's BOOM runner uses
     # so our BOOM numbers match the published leaderboard. Bump deliberately.
@@ -20,6 +21,7 @@ dependencies = [
     "datasets~=2.17.1",
     "pandas==2.0.0",
     "python-dotenv",
+    "threadpoolctl>=3.6,<4",
     "numpy~=1.26.0",
     "scipy~=1.11.3",
     "orjson",
@@ -43,6 +45,15 @@ dependencies = [
 time = [
     "timebench @ git+https://github.com/zqiao11/TIME",
 ]
+# FEV / fev-bench (autogluon/fev) is OPTIONAL too: it supplies the task list and
+# windows for the `fev` suite (scoring is cascade_benchmark.fev_metrics), and
+# a resolver clash with gift-eval's pins must not block the core env. The `fev`
+# suite reports `skipped` when it's absent. Lane-B public guards (DEC-CA-0050)
+# need it: `uv sync --project benchmarks --extra fev`. The locked FEV version
+# is shared by the native runner and the direct pinned-task wrapper.
+fev = [
+    "fev>=0.6",
+]
 
 [tool.uv]
 # timebench's upstream wheel force-includes config/datasets.yaml, which is also
@@ -56,6 +67,7 @@ build-constraint-dependencies = ["hatchling==1.18.0"]
 [project.scripts]
 cascade-benchmark = "cascade_benchmark.cli:main"
 cascade-benchmark-download = "cascade_benchmark.cli:download_main"
+cascade-benchmark-pin-fev = "cascade_benchmark.pin_fev:main"
 
 [build-system]
 requires = ["hatchling>=1.18"]

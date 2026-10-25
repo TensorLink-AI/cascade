@@ -12,8 +12,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from cascade.shared.config import ChainConfig  # noqa: E402
-from tests.unpinned import load_unpinned  # noqa: E402
+from cascade.shared.config import ChainConfig, load_chain_config  # noqa: E402
 
 # Credentials that turn "fake" code paths real: with these present, code under
 # test that falls through to ``open_manifest_store`` (e.g. the receipt-index
@@ -27,7 +26,8 @@ _LIVE_CREDENTIAL_ENV = (
     "HIPPIUS_HUB_USERNAME", "HIPPIUS_REGISTRY_USERNAME",
     "HIPPIUS_HUB_PASSWORD", "HIPPIUS_REGISTRY_PASSWORD",
     "BACKUP_S3_ACCESS_KEY", "BACKUP_S3_SECRET_KEY",
-    "HF_TOKEN", "WANDB_API_KEY",
+    "HF_TOKEN", "WANDB_API_KEY", "LIUM_API_KEY", "SHADEFORM_API_KEY",
+    "VAST_API_KEY", "RUNPOD_API_KEY",
 )
 
 
@@ -39,10 +39,34 @@ def _no_live_credentials(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _isolated_sku_outage_file(monkeypatch, tmp_path):
-    """The GPU-type outage cooldown persists under ~/.cache on the live box —
-    point every test at its own file so a suite run never steers real rents."""
-    monkeypatch.setenv("CASCADE_LIUM_SKU_OUTAGE_FILE", str(tmp_path / "sku_outage.json"))
+def _no_secrets_marker():
+    """A test that calls a trainer / validator ``main`` marks the pytest
+    process as holding secrets (cascade.shared.sandbox_policy); never let
+    that leak into later tests that run generator code."""
+    from cascade.shared.sandbox_policy import clear_holds_secrets
+
+    yield
+    clear_holds_secrets()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_default_settlement_journal(tmp_path, monkeypatch):
+    """Legacy loop fakes stub champion persistence but retain its default path.
+
+    Keep the new undo journal in their temporary directory too. Recovery tests
+    with an explicit state bundle path use the real production path unchanged.
+    """
+    from cascade.validator import settlement_transaction
+
+    original = settlement_transaction.journal_path
+
+    def isolated(runner):
+        path = original(runner)
+        if Path(runner.cfg.validator.state_db_path) == Path("validator_state.db"):
+            return tmp_path / path.name
+        return path
+
+    monkeypatch.setattr(settlement_transaction, "journal_path", isolated)
 
 
 @pytest.fixture(scope="session")
@@ -59,28 +83,37 @@ def cfg() -> ChainConfig:
     """
     from dataclasses import replace
 
-    # Without the DEC-CA-0050 [[activation.pinned]] lock-ins: they arm the
-    # mainnet rollover / forfeiture / v2 bar at mainnet heights, which no
-    # fixture models (tests of the pins load the real file).
-    c = load_unpinned(REPO_ROOT / "chain.toml")
+    c = load_chain_config(REPO_ROOT / "chain.toml")
+    # Tests using fake block clocks also reparse raw configuration (satellites,
+    # overlays). Neutralize the real calendar there as well as on cfg.v2.
+    import copy
+
+    raw = copy.deepcopy(c.raw)
+    raw["v2"]["launch_at_utc"] = ""
+    raw["netconfig"]["owner_hotkey"] = ""
     return replace(c, training=replace(c.training, expected_gpu="",
                                        train_image_digest=""),
+                   raw=raw,
+                   netconfig=replace(c.netconfig, owner_hotkey=""),
+                   v2=replace(c.v2, launch_at_utc="", prelaunch_burn_readiness=""),
                    # corpus_target_points ships ARMED (DEC-CA-0031): a points-
                    # denominated drain would override every fixture's small
                    # corpus_n_series with a 67M-point draw. Tests that exercise
                    # the points path arm it explicitly via replace().
-                   generator=replace(c.generator, corpus_target_points=0),
-                   # The scheduled cadence pair and the ARMED funded go-live
-                   # config are real-chain state: under pytest's tiny block
+                   # Generic fixtures replay v1/univariate paths. New-v2
+                   # admission tests load the unmodified release policy.
+                   generator=replace(c.generator, corpus_target_points=0, min_channels=1,
+                                     sandbox_strict=False),  # isolated trusted fixture generators
+                   # The scheduled cadence pair and the ARMED funded config
+                   # are real-chain state: under pytest's tiny block
                    # numbers the pair resolves every round to the OLD grid, and
-                   # funded_mode="required" would filter every fixture
-                   # challenger out of every round. Neutralize like the pins;
+                   # funded_mode="required" would route every fixture through
+                   # the funded queue. Neutralize like the pins;
                    # funded tests arm their own RoundConfig.
                    round=replace(c.round, commit_floor_block=0, dedup_mode="off",
                                  epoch_blocks_prev=0, epoch_activation_block=0,
-                                 funded_activation_block=0, funded_mode="off",
-                                 funded_pods="off", funded_king_rent=False,
-                                 skip_unfunded_rounds=False),
+                                 funded_mode="off",
+                                 funded_pods="off", funded_king_rent=False),
                    # a scheduled fresh-king margin change ships armed: pin the
                    # steady value so fixtures judge every block the same way
                    scoring=replace(c.scoring, win_margin_start_prev=0.0,

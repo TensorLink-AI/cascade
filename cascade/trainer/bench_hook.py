@@ -1,23 +1,17 @@
-"""Post-round public-benchmark telemetry — LOG-ONLY, never touches KOTH state.
+"""Public-benchmark sweeps (GIFT-Eval / BOOM / TIME) on the pod that holds a
+checkpoint — the numbers behind the trainer's signed bench reports.
 
-After the trainer publishes a round's manifest, the orchestrator can fire the
-benchmark sidecar (GIFT-Eval / BOOM / TIME) at the round's **king** checkpoint
-on the (now idle) GPU pod. Validators keep scoring rounds exclusively on the
-private eval pool — these numbers exist so the operator gets a round-over-round
-time series of what the champion generator produces at the standard budget.
-They must never feed miner scores, weights, or the throne decision: the
-benchmark data is public (a Goodhart target for generators) and GPU sweeps are
-not bit-reproducible across SKUs (unauditable as a consensus input).
+The rolling scheduler benches each checkpoint at completion on the pod that
+trained it (DEC-CA-0043); the six numbers feed promotion (DEC-CA-0013), never
+the duel verdict: the benchmark data is public (a Goodhart target for
+generators) and GPU sweeps are not bit-reproducible across SKUs.
 
-Failure semantics mirror ``cascade.eval.benchmarks``: the run happens on a
-daemon thread and every failure path logs and returns — a broken, slow, or
-missing benchmark must never delay or fail a round. Training always wins the
-GPU: each launch first kills any still-running benchmark on the pod, and the
-next round's training dispatch simply contends ahead of a straggler (size the
-suites to the round cadence: full battery ≈ 1h on a 4090 — fine at 24h rounds;
-use ``max_series``/a suite subset on fast testnet rounds).
+Failure semantics mirror ``cascade.eval.benchmarks``: every failure path logs
+and returns ``None`` — a broken, slow, or missing benchmark never fails a leg.
+Training always wins the GPU (a training dispatch kills any straggling sweep),
+and sweeps on one pod are serialized (:func:`host_bench_lock`).
 
-Command construction is pure and unit-tested; only the launcher shells out.
+Command construction is pure and unit-tested; only the runner shells out.
 """
 
 from __future__ import annotations
@@ -44,9 +38,9 @@ log = logging.getLogger("cascade.trainer.bench")
 
 @dataclass(frozen=True)
 class BenchPlan:
-    """What to run after each round. ``suites``/``max_series`` size the sweep
-    to the round cadence; ``data_dir`` must hold the pinned benchmark data on
-    the pod (``cascade-benchmark-download --data-dir …``)."""
+    """What a sweep runs. ``suites``/``max_series`` size it; ``data_dir`` must
+    hold the pinned benchmark data on the pod (``cascade-benchmark-download
+    --data-dir …``)."""
 
     suites: str = "gift-eval,boom,time"
     max_series: int = 0            # 0 = full benchmark
@@ -58,31 +52,22 @@ class BenchPlan:
     # installer path — override for a bootstrap-provisioned fleet.
     uv_bin: str = "/bin/uv"
     timeout_seconds: int = 2 * 3600
-    # Detached bench (2026-09-18, see remote.run_detached): the sweep runs in
-    # its own session on the pod and the orchestrator polls, so an ssh drop
-    # mid-bench (u201 ×3 pods, 5FYf, 5GKe — all `exit 255`) no longer loses
-    # the report. Off by default (test fixture shape); the live trainer arms
-    # it from [round] detached_dispatch.
+    # Detached bench (see remote.run_detached): the sweep runs in its own
+    # session on the pod and the orchestrator polls, so an ssh drop mid-bench
+    # no longer loses the report. Off by default (test fixture shape); the
+    # live trainer arms it from [round] detached_dispatch.
     detached: bool = False
     poll_seconds: int = 30
     reattach_grace_seconds: int = 900
-    # fence for the dataset download's wedge mode (2026-08-12: unauthenticated
-    # HF pulls deadlocked twice); authenticated pulls finish in ~3 min.
+    # fence for the dataset download's wedge mode (unauthenticated HF pulls
+    # can deadlock); authenticated pulls finish in ~3 min.
     download_timeout_seconds: int = 2700
-    # Decouple telemetry cadence from round cadence: skip launching when the
-    # last launch was under this many seconds ago (0 = benchmark every round).
-    # The right setting when rounds are tighter than the sweep: pick an
-    # interval > sweep duration and telemetry samples every Nth king instead
-    # of racing (and being preempted by) every round's training.
-    min_interval_seconds: int = 0
     # Benchmark data dir on the TRAINER box to sideload to the pod (tar over
     # ssh) before each sweep — None/absent-dir = old behavior (the pod's own
     # HF download, fenced by download_timeout_seconds, remains the fallback
-    # either way). r45–r48: four rounds straight lost their reports to the
-    # on-pod fetch (forecast_wrapper/exit-2, then r48's exit-124 stall at
-    # ~4975 files); the manual sideload of the same 4.4G battery streams in
-    # ~75s and succeeded every time. Marker-guarded, so sequential roles on
-    # one pod stage exactly once.
+    # either way). The on-pod fetch is the flaky leg; the 4.4G battery
+    # streams in ~75s. Marker-guarded, so sequential roles on one pod stage
+    # exactly once.
     local_data_dir: str | None = None
     # Fence on the tar|ssh stream — its own stall guard, separate from (and
     # much tighter than) the bench/download timeouts: the manual stream takes
@@ -95,68 +80,56 @@ def _suite_list(suites: str) -> list[str]:
     return [s.strip() for s in str(suites).split(",") if s.strip()]
 
 
+# All four suites can be sideloaded. FEV is operator-staged and hash-pinned;
+# the downloader handles the other three and never fetches FEV implicitly.
+STAGED_SUITES = ("gift-eval", "boom", "time", "fev")
+
+
+def _data_marker(suite: str) -> str:
+    return "manifest.json" if suite == "fev" else DATA_MARKER
+
+
+def _staged(suites: list[str]) -> list[str]:
+    return [s for s in suites if s in STAGED_SUITES]
+
+
+def _uv_extras(plan: BenchPlan) -> str:
+    """The sidecar extras every ``uv run`` passes: ``time`` always, ``fev``
+    when the sweep runs FEV (``uv run`` syncs exactly — a run without the
+    flag would uninstall fev and the suite would report ``skipped``)."""
+    return "--frozen --extra time" + (" --extra fev" if "fev" in _suite_list(plan.suites) else "")
+
+
+def bench_suites_for(cfg, suites: str) -> str:
+    """The trainer's sweep suites: ``suites`` (the ``--bench-suites`` flag),
+    plus ``fev`` once the DEC-CA-0061 four-suite rule can apply at any block
+    (``[v2] bench_gate_v2_from_block``). Unchanged otherwise."""
+    from ..shared.era import bench_gate_v2_configured
+
+    names = _suite_list(suites)
+    if bench_gate_v2_configured(cfg) and "fev" not in names:
+        names.append("fev")
+    return ",".join(names)
+
+
 def suite_markers(data_dir: str, suites: list[str]) -> str:
     """The ``test`` expression asserting every suite's COMPLETION marker under
     ``data_dir`` (`-f m1 -a -f m2 …`) — the one definition of "data is staged"
-    shared by the bench data guard, the prewarm, and the sideload."""
+    shared by the bench data guard and the sideload."""
     return " -a ".join(
-        f"-f {shlex.quote(f'{data_dir}/{s}/{DATA_MARKER}')}" for s in suites)
+        f"-f {shlex.quote(f'{data_dir}/{s}/{_data_marker(s)}')}" for s in suites)
 
-
-def build_prewarm_remote_command(workdir: str, *,
-                                 suites: str = "gift-eval,boom,time",
-                                 uv_bin: str = "/bin/uv",
-                                 download_timeout_seconds: int = 2700,
-                                 hf_token: bool = False) -> str:
-    """The remote shell string that pre-warms a fresh FINAL pod's benchmark
-    data in the background. Pure — safe to unit test.
-
-    JIT-rented final pods boot from the worker image, which deliberately bakes
-    no benchmark data — the bench's data guard downloads on first use, which
-    put a cold ~4.4G pull inside the bench window and cost the king leg its
-    report three rounds running (r18, r26, r27: exit 124 mid-download). Fired
-    right after the health gate, the download overlaps the multi-hour final
-    training instead, and the guard's marker test finds warm data at bench
-    time. Detached (``nohup``/``&`` with all stdio redirected) so the
-    launching SSH returns immediately; marker-guarded so a re-boot of a
-    half-warmed pod resumes rather than restarts; ``timeout``-fenced against
-    the download's wedge mode exactly like the guard. Targets
-    ``<workdir>/bench_data`` — the same path the trainer's bench plan derives
-    (main.py builds ``data_dir=f"{wd}/bench_data"`` from the fleet workdir).
-
-    ``hf_token`` arms the stdin-env sourcing prefix (the credential itself
-    never enters the command string — it travels on stdin like every other
-    forwarded cred); the exported var is inherited by the detached child.
-    """
-    data_dir = f"{workdir}/bench_data"
-    project = shlex.quote(f"{workdir}/benchmarks")
-    markers = suite_markers(data_dir, _suite_list(suites))
-    inner = (f"timeout {int(download_timeout_seconds)} "
-             f"{uv_bin} run --extra time --project {project} "
-             f"cascade-benchmark-download --data-dir {shlex.quote(data_dir)}")
-    env_source = "set -a && . /dev/stdin && set +a && " if hf_token else ""
-    return (
-        env_source
-        + f"test {markers} || {{ nohup sh -c {shlex.quote(inner)} "
-        + f">> {shlex.quote(f'{workdir}/bench_prewarm.log')} 2>&1 < /dev/null & }}"
-    )
 
 
 def role_paths(host: RemoteHost, round_id: str, arch_preset: str,
                role: str = "king") -> tuple[str, str]:
     """(checkpoint dir, report path) of a round's final ``role`` on the pod.
-    ``role`` is the work-DIR name: bare (``king``, ``challenger``) for
-    pre-cohort finals, uid-suffixed (``challenger-u<uid>``) when a
-    DEC-CA-0012 cohort trained several challengers — callers pass the
-    suffixed form (see ``loop._bench_role_dir``). Matches the layout
+    ``role`` is the work-DIR name the leg trained under — the role plus any
+    repo suffix (e.g. ``challenger-u<uid>``); callers pass the full form.
+    Matches the layout
     ``cascade.trainer.worker`` writes under ``<workdir>/_train_work``."""
     base = f"{host.workdir}/_train_work/{round_id}/{arch_preset}/{role}"
     return f"{base}/checkpoint", f"{base}/benchmark_report.json"
-
-
-def king_paths(host: RemoteHost, round_id: str, arch_preset: str) -> tuple[str, str]:
-    """(checkpoint dir, report path) of a round's king on the pod."""
-    return role_paths(host, round_id, arch_preset, "king")
 
 
 def build_bench_remote_command(host: RemoteHost, round_id: str, arch_preset: str,
@@ -168,8 +141,7 @@ def build_bench_remote_command(host: RemoteHost, round_id: str, arch_preset: str
     ``hf_token`` arms the stdin-env sourcing prefix (the credential itself
     NEVER enters the command string — it travels on stdin exactly like the
     worker dispatch's forwarded creds, see ``remote.build_remote_command``):
-    unauthenticated HF dataset pulls are rate-limited and wedged two fresh-pod
-    downloads on 2026-08-12."""
+    unauthenticated HF dataset pulls are rate-limited and can wedge."""
     ckpt, report = role_paths(host, round_id, arch_preset, role)
     argv = [
         "cascade-benchmark", ckpt, report,
@@ -186,37 +158,40 @@ def build_bench_remote_command(host: RemoteHost, round_id: str, arch_preset: str
         prefix = f"CUDA_VISIBLE_DEVICES={shlex.quote(host.cuda_device)} "
     project = shlex.quote(f"{host.workdir}/benchmarks")
     # Image-booted pods deliberately bake no benchmark data (4.4G would slow
-    # every heat boot for nothing) — self-provision on first bench instead.
+    # every boot) — self-provision on first bench instead.
     # && -chained so a failed download fails the sweep (best-effort upstream)
     # rather than benching against an empty data dir. Same-pod launches are
     # serialized by the caller (grouped by pod address), so the guard never
     # races itself.
     #
     # The guard tests each requested suite's COMPLETION marker, not the bare
-    # data dir: `test -d` turned one interrupted download into a permanent
-    # per-pod TIME skip (the dir existed, the download never re-ran — the
-    # r13–r15 bench drought). The download is marker-aware and resumable, so
-    # re-running over partial data is cheap; `timeout` fences the wedge mode
-    # (thread-pool deadlock with no sockets, seen twice on 2026-08-12) so a
-    # hung download fails this sweep instead of eating the bench window.
-    markers = suite_markers(plan.data_dir, _suite_list(plan.suites))
+    # data dir: `test -d` would turn one interrupted download into a
+    # permanent per-pod suite skip. The download is marker-aware and
+    # resumable, so re-running over partial data is cheap; `timeout` fences
+    # the wedge mode (thread-pool deadlock with no sockets) so a hung
+    # download fails this sweep instead of eating the bench window.
+    staged = [s for s in _staged(_suite_list(plan.suites)) if s != "fev"]
+    markers = suite_markers(plan.data_dir, staged)
+    extras = _uv_extras(plan)
     data_guard = (
         f"{{ test {markers} || "
         f"timeout {int(plan.download_timeout_seconds)} "
-        f"{plan.uv_bin} run --extra time --project {project} cascade-benchmark-download "
+        f"{plan.uv_bin} run {extras} --project {project} cascade-benchmark-download "
         f"--data-dir {shlex.quote(plan.data_dir)}; }} && "
-    )
+    ) if staged else ""
     # --extra time on EVERY uv run: timebench is an optional extra, and uv run
     # syncs the env exactly — a run without the flag would UNINSTALL it again
-    # (its absence on the pods was the root cause of the TIME-skip era,
-    # 2026-08-05 bootstrap rework).
+    # and silently skip the TIME suite.
     env_source = "set -a && . /dev/stdin && set +a && " if hf_token else ""
+    fev_guard = (f"test -f {shlex.quote(plan.data_dir + '/fev/manifest.json')} && "
+                 if "fev" in _suite_list(plan.suites) else "")
     cmd = (
         PREEMPT_BENCHMARKS
         + env_source
         + data_guard
+        + fev_guard
         + prefix
-        + f"{plan.uv_bin} run --extra time --project {project} "
+        + f"{plan.uv_bin} run {extras} --project {project} "
         + quoted
     )
     return cmd, report
@@ -299,11 +274,11 @@ def sideload_bench_data(host: RemoteHost, plan: BenchPlan, *,
     try:
         if not plan.local_data_dir:
             return False
-        suites = _suite_list(plan.suites)
+        suites = _staged(_suite_list(plan.suites))
         if not suites:
             return False
         local = Path(plan.local_data_dir)
-        missing = [s for s in suites if not (local / s / DATA_MARKER).is_file()]
+        missing = [s for s in suites if not (local / s / _data_marker(s)).is_file()]
         if missing:
             log.info("bench sideload skipped: %s missing suite marker(s) %s — "
                      "pod falls back to the on-pod download", local, missing)
@@ -337,10 +312,9 @@ def sideload_bench_data(host: RemoteHost, plan: BenchPlan, *,
 
 # One benchmark sweep per POD at a time. Every launch pre-empts any running
 # `cascade-benchmark` on its host (PREEMPT_BENCHMARKS — it clears strays a
-# restart left behind), so two concurrent sweeps on one pod killed each other:
-# 2026-09-29 the operator's verification re-benches of uid 133 and uid 86 died
-# rc 143 the moment the next verification started on the same king pod. With
-# the lock the pre-emption only ever hits a stray from another process.
+# restart left behind), so two concurrent sweeps on one pod would kill each
+# other. With the lock the pre-emption only ever hits a stray from another
+# process.
 _HOST_LOCKS: dict[str, threading.Lock] = {}
 _HOST_LOCKS_GUARD = threading.Lock()
 
@@ -370,8 +344,7 @@ def run_post_round_benchmark(host: RemoteHost, round_id: str, arch_preset: str,
     """Benchmark the round's final ``role`` checkpoint on ``host`` and return
     the parsed report.
 
-    Blocking (call it from :func:`launch_post_round_benchmark`'s thread).
-    Returns ``None`` on any failure — this path must never raise into a round.
+    Blocking. Returns ``None`` on any failure — this path must never raise into a round.
     Serialized per pod (:func:`host_bench_lock`): a second sweep on the same
     pod waits for the first instead of pre-empting it.
     """
@@ -441,35 +414,3 @@ def _run_post_round_benchmark(host: RemoteHost, round_id: str, arch_preset: str,
     except Exception as e:  # noqa: BLE001 — log-only telemetry must never raise
         log.warning("post-round benchmark errored (ignored): %s", e)
         return None
-
-
-_last_launch: dict[str, float] = {}  # host.name → monotonic() of last launch
-
-
-def launch_post_round_benchmark(host: RemoteHost, round_id: str, arch_preset: str,
-                                plan: BenchPlan, *, work_root: Path | None = None
-                                ) -> threading.Thread | None:
-    """Fire-and-forget wrapper: runs the benchmark on a daemon thread so the
-    round loop moves straight on to polling for the next epoch. Returns None
-    (skipped) when the last launch on this host was under
-    ``plan.min_interval_seconds`` ago."""
-    import time
-
-    now = time.monotonic()
-    last = _last_launch.get(host.name)
-    if plan.min_interval_seconds and last is not None and (now - last) < plan.min_interval_seconds:
-        log.info("post-round benchmark skipped for round=%s (last launch %.0fs ago < %ds interval)",
-                 round_id, now - last, plan.min_interval_seconds)
-        return None
-    _last_launch[host.name] = now
-    t = threading.Thread(
-        target=run_post_round_benchmark,
-        args=(host, round_id, arch_preset, plan),
-        kwargs={"work_root": work_root},
-        name=f"bench-{round_id}",
-        daemon=True,
-    )
-    t.start()
-    log.info("post-round benchmark launched for round=%s king (%s) on %s [suites=%s]",
-             round_id, arch_preset, host.name, plan.suites)
-    return t

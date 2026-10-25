@@ -136,20 +136,21 @@ def test_warm_start_hub_ref_and_pointer_fetch(cfg, tmp_path, monkeypatch):
     assert label == f"warm-start {ref}"
 
 
-def test_warm_start_live_reads_round_status(cfg, tmp_path, monkeypatch):
+def test_warm_start_live_requires_current_contract_and_init(cfg, tmp_path, monkeypatch):
+    from tests.unit.test_agent_onboarding import snapshot
+
     ref = "cascade/ckpt-r1-challenger-toto2-4m-u5@sha256:" + "cd" * 32
-    monkeypatch.setattr("cascade.miner.dashboard.fetch_public_round_status",
-                        lambda storage, **k: {"warm_start": {
-                            "init_checkpoint": f"metro-v1:trained:hippius:{ref}", "size": "toto2-4m"}})
+    data = snapshot(cfg)
+    data["warm_start"]["pointer"] = f"metro-v1:trained:hippius:{ref}"
+    monkeypatch.setattr("cascade.miner.live_status.fetch_snapshot", lambda cfg: data)
     seen = []
     monkeypatch.setattr("cascade.shared.hippius.fetch_from_hub",
                         lambda r, dest, hub=None: (seen.append(r), Path(dest).mkdir(parents=True), Path(dest))[-1])
     d, label = score_mod._resolve_warm_start(cfg, "live", cache_dir=tmp_path)
     assert seen == [ref] and d.is_dir() and ref in label
 
-    # a random-init round (no warm_start block) resolves to random init, no fetch
-    monkeypatch.setattr("cascade.miner.dashboard.fetch_public_round_status",
-                        lambda storage, **k: {"round_id": "1"})
+    # Explicit current-era random init is distinct from absent evidence.
+    data["warm_start"].update(pointer="", mode="random_init")
     d, label = score_mod._resolve_warm_start(cfg, "live", cache_dir=tmp_path)
     assert d is None and label.startswith("random init")
     assert seen == [ref]

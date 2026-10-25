@@ -1,6 +1,6 @@
 """Multi-horizon calibration telemetry — LOG-ONLY, never touches the verdict.
 
-Design: docs/notes/2026-08-31-multi-horizon-eval.md. The scored duel stays at
+Calibrates the scored horizon ladder (DEC-CA-0037). The scored duel stays at
 ``[eval] horizon``; this module measures how the round's duel checkpoints
 perform at the OTHER rungs of the planned 16/64/256/720 ladder so the scored
 flip (a separate, coordinated consensus release) can be calibrated on real

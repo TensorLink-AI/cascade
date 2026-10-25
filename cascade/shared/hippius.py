@@ -37,7 +37,6 @@ import contextlib
 import hashlib
 import io
 import json
-import math
 import os
 import re
 import shutil
@@ -264,9 +263,8 @@ def _resolve_hub_token_for_pull(action: str) -> str | bool:
     The Hub token service grants anonymous pull tokens for public projects,
     and the cascade checkpoint/generator repos are public by design — they
     are the artefacts validators and auditors verify. A validator therefore
-    needs no Hub account to eval a round (external validators hit exactly
-    this on 2026-07-18: checkpoint fetch raised HubAuthError although the
-    registry would have served the pull anonymously). Credentials, when
+    needs no Hub account to eval a round — a strict resolver would raise
+    HubAuthError on a pull the registry serves anonymously. Credentials, when
     present, are still used. Uploads keep the strict resolver — pushing
     always needs an identity. ``False`` is the library's explicit
     "anonymous; do not auto-discover" sentinel.
@@ -323,8 +321,8 @@ HUB_MAX_ATTEMPTS = 4
 HUB_BACKOFF_BASE_S = 2.0
 # Checkpoint UPLOADS retry much longer than fetches: an upload sits at the end
 # of a 3h training run, so waiting out a network flap is strictly cheaper than
-# failing the entry (r44 2026-08-27: a ~10-min pod-side route flap outlived the
-# 4×2s window and cost a full retrain). 8 × 5s doubling ≈ 10.6 min of patience
+# failing the entry (a ~10-min route flap outlives the fetch's 4×2s window
+# and costs a full retrain). 8 × 5s doubling ≈ 10.6 min of patience
 # before the HF mirror fallback (upload_dir_to_hub_or_hf) takes over.
 UPLOAD_MAX_ATTEMPTS = 8
 UPLOAD_BACKOFF_BASE_S = 5.0
@@ -346,16 +344,13 @@ _RETRYABLE_HUB_ERROR_SUBSTRINGS = (
     # must stay non-retryable.
     "http transport error", "error decoding response body",
     "error reading a body", "end of file before message length reached",
-    # Observed 2026-08-15..19 as the cause under "chunk 0 failed" on transient
-    # registry drops (retry always succeeded). A genuinely-local cause (disk
+    # Surfaces under "chunk 0 failed" on transient registry drops, where a
+    # retry succeeds. A genuinely-local cause (disk
     # full) just burns the 3 extra attempts (~14s) before the same failure.
     "local i/o error",
     # hippius_core's client-side read-stall watchdog ("download read stalled:
     # no data for 30s" under "chunk N failed"): no bytes for N s on a live
     # connection — transient by definition, a fresh connection lands it.
-    # 2026-09-21 (DEC-CA-0043 testnet validation): every era-king warm-start
-    # fetch on one pod died after 1 of 4 attempts on this, halting the era's
-    # settlements — the Aug chunk-drop fix above, a variant nobody had added.
     "read stalled", "no data for",
 )
 
@@ -375,7 +370,7 @@ def _is_retryable_hub_error(exc: BaseException) -> bool:
     # retryable detail ("http transport error", "error decoding response body",
     # ...) buried in __cause__/__context__. Matching only the top exception
     # classified those as permanent, so _retry_hub_op gave up after 1 of its 4
-    # attempts on every transient chunk drop (observed 6×, 2026-08-15..19).
+    # attempts on every transient chunk drop.
     # Auth stays non-retryable: a 401-wrapped chunk failure carries no
     # transport substring at any level of the chain.
     seen: set[int] = set()
@@ -420,20 +415,6 @@ _PRIVATE_ERROR_SUBSTRINGS = (
 )
 
 
-def _is_private_vault_miss(text: str) -> bool:
-    """A ``vault/direct`` (private, DEC-CA-0036) submission this caller cannot
-    read: not in a local vault and either no champion base configured or no
-    published champion object for it (an uncrowned private submission is
-    never published — 404, or 403 on a bucket that hides missing keys). That
-    is the same story as a private Hub repo — permanent for the archive — not
-    a flake. A network failure on the champion GET (timeout, DNS, reset)
-    carries no HTTP status and stays TRANSIENT."""
-    if "generator_artifact_unreachable: vault digest" not in text:
-        return False
-    return ("no $cascade_champion_base configured" in text
-            or "http error 404" in text or "http error 403" in text)
-
-
 def classify_fetch_failure(exc: BaseException) -> str:
     """Coarse verdict on a failed Hub/HF fetch: is this ref worth retrying?
 
@@ -453,8 +434,6 @@ def classify_fetch_failure(exc: BaseException) -> str:
     if _is_retryable_hub_error(exc):
         return FETCH_TRANSIENT
     text = f"{type(exc).__name__}: {exc}".lower()
-    if _is_private_vault_miss(text):
-        return FETCH_PRIVATE
     if any(sub in text for sub in _PRIVATE_ERROR_SUBSTRINGS):
         return FETCH_PRIVATE
     if any(sub in text for sub in _GONE_ERROR_SUBSTRINGS):
@@ -624,9 +603,8 @@ def fetch_from_hub(ref: HubRef | str, dest_dir: Path | str, hub: HubConfig | Non
     same ``dest_dir`` (heat lanes on one pod all warm-start from one checkpoint):
     the download lands in a private temp dir that is renamed into place only once
     complete, and a dir already carrying :data:`FETCH_COMPLETE_MARKER` is reused
-    as-is — the digest pins the bytes, so a completed snapshot never goes stale.
-    (The old unconditional rmtree+redownload deleted the dir out from under
-    sibling lanes mid-read: 2026-08-19 r29 heat drops.)
+    as-is — the digest pins the bytes, so a completed snapshot never goes stale,
+    and a sibling lane reading the same dir is never pulled out from under.
     """
     ref = ref if isinstance(ref, HubRef) else HubRef.parse(ref)
     dest = Path(dest_dir)
@@ -747,8 +725,7 @@ def _s3_client(s3cfg: S3Config):
         # here either has a fallback store (manifests) or retries on its own
         # poll cadence (pool index, provisioner watches). boto's defaults
         # (60s connect/read × legacy retries) let ONE bad GET burn minutes and
-        # starve poll loops — observed live 2026-07-14 (provisioner cycles
-        # taking minutes each, heartbeat/trigger starved). read_timeout is
+        # starve poll loops (heartbeat/trigger). read_timeout is
         # per-socket-read inactivity, not total transfer, so multi-MB objects
         # still stream fine as long as bytes flow.
         config=Config(signature_version="s3v4", s3={"addressing_style": "path"},
@@ -928,9 +905,8 @@ class HFFallbackStore:
                 # Absent on BOTH layers is a verdict ("not published"), not an
                 # outage — callers that treat ObjectNotFound as "absent" and
                 # every other StorageError as "unreadable, retry" must see it
-                # through the fallback layer too (2026-09-21: a warm-start
-                # member check could not tell the two apart and latched a
-                # permanent reject on a read miss).
+                # through the fallback layer too, or a read miss latches as
+                # a permanent reject.
                 raise ObjectNotFound(f"{key}: absent on S3 and HF fallback") from e
             raise StorageError(f"both S3 and HF get failed for {key}: {e}") from e
 
@@ -1084,9 +1060,8 @@ def open_manifest_store(storage: object) -> S3Store | HFFallbackStore | S3Mirror
 
 MANIFEST_LATEST_KEY = "manifests/latest.json"
 
-# Audit archive of miner generator code (OPSLOG 2026-08-25: miners routinely
-# delete their repos post-round — three deletions in one night broke an anneal
-# and the audit replay of two duel legs). The round's own resolve-time fetch is
+# Audit archive of miner generator code: miners routinely delete their repos
+# post-round, which breaks anneals and audit replays. The round's own resolve-time fetch is
 # the one guaranteed moment the code exists, so the trainer tars each fetched
 # tree here, keyed by its commit reference (which pins the content digest).
 # Immutable + tiny (code-only, max_repo_mb-bounded); R2 dual-write rides the
@@ -1113,6 +1088,19 @@ def private_archive_key(digest_hex: str) -> str:
     """King-archive key of a private submission's resolve-time tree tar,
     content-addressed by the vault digest."""
     return f"{PRIVATE_ARCHIVE_PREFIX}{digest_hex.strip().lower()}.tar"
+
+
+def publish_public_json(store: object, key: str, doc: dict) -> str:
+    """Write ``doc`` public-read at ``key``, retried private on a backend that
+    rejects canned object ACLs (mirrors the receipt-index publish). Returns the
+    key. For the unsigned, presentational docs (``status/chain.json``, the
+    funded roster) — never for anything a verdict depends on."""
+    text = json.dumps(doc, indent=2, sort_keys=True)
+    try:
+        store.put_text(key, text, content_type="application/json", acl="public-read")
+    except StorageError:
+        store.put_text(key, text, content_type="application/json")
+    return key
 
 
 def manifest_round_key(round_id: str) -> str:
@@ -1195,8 +1183,8 @@ def publish_receipt(
     # A SCORED verdict is only ever superseded by another scored verdict: on a
     # same-round-id re-judgement that ends in a gate rejection, the rejected
     # receipt must not clobber the signed scored record at the round key
-    # (2026-07-15: two contract-switch rejections erased the receipt that
-    # crowned the first king). The rejection stays visible via the latest
+    # (e.g. a restart re-gating an old manifest after a contract switch). The
+    # rejection stays visible via the latest
     # pointers; the round key keeps the authoritative scored copy.
     if _receipt_status(receipt_text) == "rejected" and _scored_receipt_at(store, round_key):
         import logging
@@ -1268,11 +1256,6 @@ def _scored_same_round_at(store: S3Store, key: str, round_id: str) -> bool:
 def read_receipt(store: S3Store, round_id: str, validator_hotkey: str = "") -> str:
     """Read one round's receipt JSON by round id (a validator's, or legacy)."""
     return store.get_text(receipt_round_key(round_id, validator_hotkey))
-
-
-def read_latest_receipt(store: S3Store, validator_hotkey: str = "") -> str:
-    """Read the newest receipt — a specific validator's, or the shared pointer."""
-    return store.get_text(receipt_latest_key(validator_hotkey))
 
 
 # ── receipts index (dashboard-facing) ───────────────────────────────────────
@@ -1347,8 +1330,8 @@ def update_receipt_index(
               if (str(r.get("round_id")), str(r.get("validator_hotkey") or ""))
               != (rid, hotkey)]
     # Scored precedence (mirrors publish_receipt): a rejected re-judgement of
-    # the same round must not erase this validator's scored entry — that is
-    # what blanked the dashboard's king on 2026-07-15. The rejected receipt
+    # the same round must not erase this validator's scored entry (it would
+    # blank the dashboard's king). The rejected receipt
     # remains reachable via receipts/<hotkey>/latest.json.
     if (str(entry.get("status")) == "rejected"
             and any(str(r.get("status")) == "scored" for r in prior)):
@@ -1357,13 +1340,9 @@ def update_receipt_index(
     rounds.sort(key=lambda r: (int(r.get("epoch_start_block", 0)),
                                str(r.get("round_id", "")),
                                str(r.get("validator_hotkey") or "")))
-    best = _best_bench_pins(doc)
-    _mark_best_bench(rounds, best)
-    rounds = _trim_keeping_pins(rounds, max_keep, best)
+    rounds = rounds[-max_keep:]
 
     out: dict = {"schema": RECEIPT_INDEX_SCHEMA, "rounds": rounds}
-    if best:
-        out[BEST_BENCH_PIN] = best
     if updated_at:
         out["updated_at"] = updated_at
     if subnet:
@@ -1371,185 +1350,13 @@ def update_receipt_index(
     if chain:
         out["chain"] = chain
 
-    _write_receipt_index(store, out)
-    return entry
-
-
-def _write_receipt_index(store: S3Store, doc: dict) -> None:
-    text = json.dumps(doc, indent=2, sort_keys=True)
+    text = json.dumps(out, indent=2, sort_keys=True)
     try:
         store.put_text(RECEIPT_INDEX_KEY, text, content_type="application/json", acl="public-read")
     except StorageError:
         # ACL unsupported on this backend: publish private rather than not at all.
         store.put_text(RECEIPT_INDEX_KEY, text, content_type="application/json")
-
-
-# ── best-bench pins (dashboard-facing) ─────────────────────────────────────
-#
-# The scoreboard's "best so far" card and its headline read the lowest
-# six-score geomean across the bench reports it can reach, and it can only
-# reach rounds the rolling index still lists. Left alone, the best checkpoint
-# ages out of the window and the headline drops although nothing regressed
-# (2026-10-16: 98.4 % → 98.2 % when u133's 0.59501 left the page's scan). So the
-# round holding the best geomean PER SIZE is pinned: its rows carry
-# ``pinned = "best_bench"`` + ``best_bench = {size: geomean}``, the header
-# keeps ``best_bench = {size: {round_id, geomean}}``, and the trim never evicts
-# a pinned round. Both copies exist because a peer validator on an older
-# release rebuilds the header from scratch (dropping the header copy) but
-# carries rows through verbatim; either copy restores the other on the next
-# write. Presentational only, like the rest of the index.
-
-BEST_BENCH_PIN = "best_bench"
-_SIX_KEYS = ("gifteval_crps", "gifteval_mase", "boom_crps",
-             "boom_mase", "time_crps", "time_mase")
-
-
-def bench_six_geomean(scores: object) -> float | None:
-    """Plain geometric mean of the six public-bench numbers — the same number
-    the scoreboard's ``sixGeomean`` ranks by (no clamp). None unless all six
-    are finite and positive."""
-    if not isinstance(scores, dict):
-        return None
-    total = 0.0
-    for k in _SIX_KEYS:
-        v = scores.get(k)
-        if (isinstance(v, bool) or not isinstance(v, (int, float))
-                or not math.isfinite(v) or v <= 0):
-            return None
-        total += math.log(v)
-    return math.exp(total / len(_SIX_KEYS))
-
-
-def best_bench_by_size(report: dict) -> dict[str, float]:
-    """``{size: lowest geomean}`` over one bench-report document's entries."""
-    out: dict[str, float] = {}
-    for e in (report or {}).get("entries") or []:
-        if not isinstance(e, dict):
-            continue
-        g = bench_six_geomean(e.get("scores"))
-        size = str(e.get("size") or "")
-        if g is not None and size and (size not in out or g < out[size]):
-            out[size] = g
-    return out
-
-
-def _best_bench_pins(doc: dict) -> dict[str, dict]:
-    """The current pins, from the header and the row marks (lowest wins)."""
-    best: dict[str, dict] = {}
-
-    def offer(size: str, rid: str, g: object) -> None:
-        if (not size or not rid or isinstance(g, bool)
-                or not isinstance(g, (int, float)) or not math.isfinite(g)):
-            return
-        if size not in best or float(g) < best[size]["geomean"]:
-            best[size] = {"round_id": rid, "geomean": float(g)}
-
-    header = doc.get(BEST_BENCH_PIN)
-    if isinstance(header, dict):
-        for size, pin in header.items():
-            if isinstance(pin, dict):
-                offer(str(size), str(pin.get("round_id") or ""), pin.get("geomean"))
-    for r in doc.get("rounds") or []:
-        marks = r.get(BEST_BENCH_PIN)
-        if r.get("pinned") == BEST_BENCH_PIN and isinstance(marks, dict):
-            for size, g in marks.items():
-                offer(str(size), str(r.get("round_id") or ""), g)
-    return best
-
-
-def _mark_best_bench(rounds: list[dict], best: dict[str, dict]) -> None:
-    """Make the row marks match ``best`` exactly (every validator's row of a
-    pinned round is marked; a row that lost its pin is unmarked)."""
-    by_round: dict[str, dict[str, float]] = {}
-    for size, pin in best.items():
-        by_round.setdefault(pin["round_id"], {})[size] = pin["geomean"]
-    for r in rounds:
-        marks = by_round.get(str(r.get("round_id")))
-        if marks:
-            r["pinned"] = BEST_BENCH_PIN
-            r[BEST_BENCH_PIN] = dict(marks)
-        elif r.get("pinned") == BEST_BENCH_PIN:
-            r.pop("pinned", None)
-            r.pop(BEST_BENCH_PIN, None)
-
-
-def _trim_keeping_pins(rounds: list[dict], max_keep: int,
-                       best: dict[str, dict]) -> list[dict]:
-    """The ``max_keep`` newest rows, plus every row of a pinned round that fell
-    off the front (still oldest-first, so the sort order holds)."""
-    if len(rounds) <= max_keep:
-        return rounds
-    pinned = {pin["round_id"] for pin in best.values()}
-    head, tail = rounds[:-max_keep], rounds[-max_keep:]
-    return [r for r in head if str(r.get("round_id")) in pinned] + tail
-
-
-def receipt_index_window(rows: list) -> list:
-    """``rows`` minus pinned best-bench rows that sit BEFORE the rolling window
-    (older than every unpinned row). Everything that reasons about the window
-    — reign tails, the former-king court, counts — reads this; only the
-    best-checkpoint views read the pinned rows. Same rule as the dashboards'
-    ``splitPinned``."""
-    floor = min((int(r.get("epoch_start_block") or 0) for r in rows
-                 if isinstance(r, dict) and r.get("pinned") != BEST_BENCH_PIN),
-                default=None)
-    if floor is None:
-        return list(rows)
-    return [r for r in rows
-            if not (isinstance(r, dict) and r.get("pinned") == BEST_BENCH_PIN
-                    and int(r.get("epoch_start_block") or 0) < floor)]
-
-
-def note_best_bench(store: S3Store, round_id: str, report: dict, *,
-                    reach_back: bool = True) -> dict[str, dict]:
-    """Offer one published bench report to the index's best-bench pins.
-
-    Called right after the report is published. A size's pin moves only when
-    this report beats it. A round the index lists with no SCORED row (a
-    validator-rejected round) never pins: the scoreboard reads scored rounds
-    only. A round not listed yet may pin; its rows get marked when they land.
-    ``reach_back``: when the index carries no pin at all (first run, or every
-    copy lost), seed the pins once from the reports of the rounds the index
-    still lists. Rewrites the index only when a pin changes. Best-effort and
-    presentational — returns the pins as stored."""
-    from .bench_report import bench_report_key
-
-    doc = read_receipt_index(store)
-    rounds = doc.get("rounds") or []
-    if not rounds:
-        # Absent OR unreadable (read_receipt_index maps a failed GET to empty):
-        # never write — a transient read error must not blank the index.
-        return {}
-    best = _best_bench_pins(doc)
-    before = {k: dict(v) for k, v in best.items()}
-    statuses: dict[str, set[str]] = {}
-    for r in rounds:
-        statuses.setdefault(str(r.get("round_id")), set()).add(str(r.get("status")))
-
-    def offer(rid: str, doc_: dict) -> None:
-        st = statuses.get(rid)
-        if st is not None and "scored" not in st:
-            return
-        for size, g in best_bench_by_size(doc_).items():
-            if size not in best or g < best[size]["geomean"]:
-                best[size] = {"round_id": rid, "geomean": g}
-
-    if reach_back and not best:
-        for rid in dict.fromkeys(str(r.get("round_id")) for r in rounds):
-            if rid == str(round_id) or "scored" not in statuses.get(rid, set()):
-                continue
-            try:
-                offer(rid, json.loads(store.get_text(bench_report_key(rid))))
-            except (StorageError, ValueError, TypeError):
-                continue
-    offer(str(round_id), report)
-    if best == before:
-        return best
-    _mark_best_bench(rounds, best)
-    doc["rounds"] = rounds
-    doc[BEST_BENCH_PIN] = best
-    _write_receipt_index(store, doc)
-    return best
+    return entry
 
 
 # ── static dashboard site ────────────────────────────────────────────────────
@@ -1609,36 +1416,27 @@ class LogSink:
         return key
 
 
-# ───────────────────────── eval-pool snapshots over S3 ──────────────────────
-#
-# The eval pool refreshes daily without a chain.toml edit: the owner orchestrator
-# publishes a new snapshot (a deterministic tar of the pool directory) to the
-# pool bucket and appends it to ``pool/index.json``. Every validator reads the
-# same owner-controlled index and selects, for a round, the snapshot whose
-# ``effective_block`` is the greatest ``<= the round's epoch-boundary block`` —
-# so all validators score the identical pool for a given round REGARDLESS of
-# when they polled (no latest-wins divergence at the daily rollover). Integrity
-# is the tar sha256.
-#
-# Why the EPOCH BLOCK, not the round id: a round id is the epoch-boundary block
-# HASH folded to a 64-bit seed (``ChainClient.block_seed``) — deliberately
-# unpredictable and therefore NON-monotonic. Selecting "greatest effective_round
-# <= round_id" over random seeds is meaningless. The epoch-boundary block NUMBER
-# (``created_block // epoch_blocks * epoch_blocks``) is monotonic and derivable
-# by every validator from the manifest's ``created_block``, so it is the correct
-# ordering key for "which daily snapshot is active for this round".
-#
-# Invariant the publisher MUST hold: a new snapshot's ``effective_block`` is in
-# the FUTURE (a later epoch than the current round). Never publish a snapshot
-# that becomes active for an already-processed round, or validators that already
-# scored it would disagree with those that re-select it.
+# Eval-pool snapshots: the owner publishes deterministic tar files and an
+# index; each tar is bound by SHA256. Validators choose the greatest
+# effective_block <= the settlement boundary, independent of polling time.
+# Round IDs are hash-derived seeds, so they cannot order snapshot activation.
+# Publish only future effective blocks: retroactive changes would make
+# replay disagree with validators that already scored the settlement.
 
 POOL_INDEX_KEY = "pool/index.json"
 POOL_INDEX_SCHEMA = 2   # v1 keyed snapshots by round_id (non-monotonic; broken)
+# The lane-A pool's key prefix. Another pool uses the same layout under its
+# own prefix in the same bucket: ``<prefix>/index.json`` +
+# ``<prefix>/snapshots/block-<N>.tar``.
+POOL_PREFIX = "pool"
 
 
-def pool_snapshot_key(effective_block: int) -> str:
-    return f"pool/snapshots/block-{int(effective_block)}.tar"
+def pool_index_key(prefix: str = POOL_PREFIX) -> str:
+    return POOL_INDEX_KEY if prefix == POOL_PREFIX else f"{prefix}/index.json"
+
+
+def pool_snapshot_key(effective_block: int, prefix: str = POOL_PREFIX) -> str:
+    return f"{prefix}/snapshots/block-{int(effective_block)}.tar"
 
 
 @dataclass(frozen=True)
@@ -1675,41 +1473,74 @@ class PoolSnapshotMeta:
         )
 
 
-def read_pool_index(store: S3Store) -> list[PoolSnapshotMeta]:
-    """Read the snapshot index, sorted by ``effective_block``.
+class SnapshotPruned(StorageError):
+    """The round's epoch block precedes every snapshot left in a PRUNED index:
+    the snapshot that served it was trimmed out (``pool/index.json`` keeps the
+    newest ``max_keep``). Distinct from a read failure and from "no pool":
+    the caller must HOLD the round, never pin it to the oldest survivor (which
+    is not the snapshot the trainer pinned — a latched ``pool_pin_mismatch``)."""
+
+
+class PoolIndex(list):
+    """:func:`read_pool_index`'s result — a plain sorted list of
+    :class:`PoolSnapshotMeta` plus ``pruned_through``: the greatest
+    ``effective_block`` ever trimmed out of the index (0 = never trimmed, or
+    an index written before the marker existed)."""
+
+    pruned_through: int = 0
+
+
+def read_pool_index(store: S3Store, prefix: str = POOL_PREFIX) -> list[PoolSnapshotMeta]:
+    """Read the snapshot index, sorted by ``effective_block`` (a
+    :class:`PoolIndex`, carrying the index's prune marker).
 
     Returns ``[]`` only when the index is genuinely ABSENT (no snapshot
     published yet). A read that FAILS — auth, network, wrong bucket/region, a
     transient 5xx — raises :class:`StorageError` rather than masquerading as an
-    empty index. The old bare ``except StorageError: return []`` conflated the
-    two, so a pool-bucket read blip read as "no snapshot" and the validator
-    rejected every trainer-pinned round as ``pool_pin_unverifiable`` — silently
-    self-excluding from consensus (observed live 2026-07-22).
+    empty index: a read blip treated as "no snapshot" would make the validator
+    reject every trainer-pinned round as ``pool_pin_unverifiable``, silently
+    self-excluding from consensus.
     """
     try:
-        text = store.get_text(POOL_INDEX_KEY)
+        text = store.get_text(pool_index_key(prefix))
     except ObjectNotFound:
         return []
     doc = json.loads(text)
     snaps = [PoolSnapshotMeta.from_dict(s) for s in doc.get("snapshots", [])]
-    return sorted(snaps, key=lambda s: s.effective_block)
+    index = PoolIndex(sorted(snaps, key=lambda s: s.effective_block))
+    index.pruned_through = int(doc.get("pruned_through", 0) or 0)
+    return index
 
 
-def select_snapshot(index: list[PoolSnapshotMeta], epoch_block: int) -> PoolSnapshotMeta | None:
+def select_snapshot(index: list[PoolSnapshotMeta], epoch_block: int, *,
+                    pruned_through: int | None = None) -> PoolSnapshotMeta | None:
     """The snapshot active for a round at ``epoch_block`` (its epoch-boundary block
     number): greatest ``effective_block <= epoch_block``.
 
-    Falls back to the earliest snapshot when ``epoch_block`` precedes them all (so
-    a validator always has a pool); returns ``None`` only for an empty index. The
-    rule is deterministic over a monotonic key, so every validator selects the
-    same snapshot for the same round regardless of when it polled.
+    When ``epoch_block`` precedes every entry: raises :class:`SnapshotPruned` if
+    the index has been trimmed (``pruned_through`` — by default the marker
+    :func:`read_pool_index` attaches — is set: the round's snapshot was pruned,
+    and the oldest survivor is NOT it); otherwise falls back to the earliest
+    snapshot (an index never trimmed, or one predating the marker — a round
+    before the first snapshot, so a validator always has a pool). Returns
+    ``None`` only for an empty index. The rule is deterministic over a
+    monotonic key, so every validator selects the same snapshot for the same
+    round regardless of when it polled.
     """
     if not index:
         return None
     eligible = [s for s in index if s.effective_block <= epoch_block]
     if eligible:
         return max(eligible, key=lambda s: s.effective_block)
-    return min(index, key=lambda s: s.effective_block)
+    if pruned_through is None:
+        pruned_through = int(getattr(index, "pruned_through", 0) or 0)
+    oldest = min(index, key=lambda s: s.effective_block)
+    if pruned_through:
+        raise SnapshotPruned(
+            f"pool_snapshot_pruned: block {epoch_block} precedes the oldest indexed "
+            f"snapshot (block {oldest.effective_block}); the index was trimmed through "
+            f"block {pruned_through}")
+    return oldest
 
 
 def publish_pool_snapshot(
@@ -1721,16 +1552,20 @@ def publish_pool_snapshot(
     n_series: int,
     context_length: int,
     horizon: int,
-    max_keep: int = 14,
+    max_keep: int = 60,
+    prefix: str = POOL_PREFIX,
 ) -> PoolSnapshotMeta:
     """Upload a pool snapshot tar and register it in ``pool/index.json``.
 
     Idempotent per ``effective_block`` (re-publishing replaces that entry). Keeps
     the most recent ``max_keep`` entries in the index (old tars are left in the
-    bucket for any validator still resolving an older round; prune out-of-band).
+    bucket for any validator still resolving an older round; prune out-of-band)
+    and records the greatest trimmed ``effective_block`` as ``pruned_through``,
+    so :func:`select_snapshot` refuses a round older than the index instead of
+    silently pinning the oldest survivor.
     """
     sha = tar_cid_digest(tar_bytes)
-    key = pool_snapshot_key(effective_block)
+    key = pool_snapshot_key(effective_block, prefix)
     store.put_bytes(key, tar_bytes, content_type="application/x-tar")
 
     meta = PoolSnapshotMeta(
@@ -1743,12 +1578,21 @@ def publish_pool_snapshot(
         context_length=context_length,
         horizon=horizon,
     )
-    index = [s for s in read_pool_index(store) if s.effective_block != meta.effective_block]
+    current = read_pool_index(store, prefix)
+    pruned_through = int(getattr(current, "pruned_through", 0) or 0)
+    index = [s for s in current if s.effective_block != meta.effective_block]
     index.append(meta)
     index.sort(key=lambda s: s.effective_block)
-    index = index[-max_keep:]
+    kept = index[-max_keep:]
+    dropped = [s for s in index if s not in kept]
+    index = kept
+    if dropped:
+        pruned_through = max(pruned_through, max(s.effective_block for s in dropped))
     doc = {"schema": POOL_INDEX_SCHEMA, "snapshots": [asdict(s) for s in index]}
-    store.put_text(POOL_INDEX_KEY, json.dumps(doc, indent=2, sort_keys=True),
+    if pruned_through:
+        # drop-when-zero: an index never trimmed serialises exactly as before
+        doc["pruned_through"] = pruned_through
+    store.put_text(pool_index_key(prefix), json.dumps(doc, indent=2, sort_keys=True),
                    content_type="application/json")
     return meta
 
@@ -1803,9 +1647,9 @@ def pool_s3_store(storage: object, *, bucket: str | None = None) -> S3Store | S3
     When ``[storage] pool_backup_bucket`` is set the result is wrapped in an
     :class:`S3MirrorStore` that dual-writes every snapshot tar and ``pool/index.json``
     to a Cloudflare R2 backup and, on a read, falls back to R2 when the primary
-    (Hippius) 5xx's — so a Hippius outage no longer strands the validator's
+    (Hippius) 5xx's — so a Hippius outage does not strand the validator's
     pool-pin gate as ``pool_pin_unverifiable``. With no ``pool_backup_bucket`` this
-    is exactly a plain :class:`S3Store` — no behaviour change. Every pool call site
+    is exactly a plain :class:`S3Store`. Every pool call site
     (publisher and validator) builds its store through here.
     """
     bkt = bucket or getattr(storage, "pool_bucket", "") or "cascade-eval-pool"

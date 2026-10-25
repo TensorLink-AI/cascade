@@ -451,8 +451,8 @@ def _merge_generator_attribution(old: dict, new: dict) -> dict:
 class SyncResult:
     """Outcome of a :func:`sync_kings` / :func:`sync_generators` run.
 
-    ``failed`` and ``unavailable`` split what used to be one bucket, because
-    they need opposite responses: ``failed`` is a RETRYABLE error (the Hub was
+    ``failed`` and ``unavailable`` are separate buckets because they need
+    opposite responses: ``failed`` is a RETRYABLE error (the Hub was
     down, the network flaked) and should page someone; ``unavailable`` is a
     generator whose upstream is gone or private, which no amount of re-running
     fixes and which the archive simply records.

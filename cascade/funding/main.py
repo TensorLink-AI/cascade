@@ -128,6 +128,9 @@ class ChainRevealResolver(_DeadlineCachedPoll):
                          deadline_seconds=deadline_seconds, clock=clock)
         self.client = client
         self._by_hotkey: dict[str, list] = {}
+        # DEC-CA-0064: the MarketCast suites whose mkt:<suite> lane-C
+        # commitments parse (none while [marketcast] is off)
+        self.mkt_suites: tuple[str, ...] = ()
 
     def _poll(self):
         return self.client.poll_commitments(include_history=True)
@@ -149,6 +152,40 @@ class ChainRevealResolver(_DeadlineCachedPoll):
         for c in self._by_hotkey.get(hotkey, []):
             parsed = parse_commit(c.payload)
             if parsed is not None and parsed.ref == ref:
+                best = c.commit_block if best is None else max(best, c.commit_block)
+        return best
+
+
+    def lane_b(self, hotkey: str, targets, ref: str, *, slots, max_targets: int | None = None,
+               ) -> int | None:
+        """DEC-CA-0059 item 8: the reveal block of ``hotkey``'s revealed lane-B
+        commitment (``metro-v1:expert:``, single or multi-target, resolved
+        against the ``[lane_b]`` slot list ``slots``) declaring exactly
+        ``targets`` and ``ref`` (latest matching reveal wins), else None."""
+        from ..shared.expert_manifest import parse_expert_targets
+
+        self._refresh()
+        want = set(targets)
+        best: int | None = None
+        for c in self._by_hotkey.get(hotkey, []):
+            parsed = parse_expert_targets(getattr(c, "payload", "") or "", tuple(slots),
+                                          max_targets=max_targets)
+            if parsed is not None and set(parsed[0]) == want and parsed[1] == ref:
+                best = c.commit_block if best is None else max(best, c.commit_block)
+        return best
+
+    def lane_c(self, hotkey: str, target: str, ref: str) -> int | None:
+        """DEC-CA-0056: the reveal block of ``hotkey``'s revealed lane-C
+        commitment ``metro-v1:ft:<target>:hippius:<ref>`` naming exactly this
+        target and ref (latest matching reveal wins), else None."""
+        from ..shared.lane_c_manifest import parse_finetune_commit
+
+        self._refresh()
+        best: int | None = None
+        for c in self._by_hotkey.get(hotkey, []):
+            parsed = parse_finetune_commit(getattr(c, "payload", "") or "",
+                                           mkt_suites=tuple(self.mkt_suites))
+            if parsed is not None and parsed == (target, ref):
                 best = c.commit_block if best is None else max(best, c.commit_block)
         return best
 
@@ -235,7 +272,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Concurrent-connection cap; over it the intake answers "
                         "an immediate 503 without spawning a handler thread. "
                         "An in-app backstop — real rate limiting belongs on "
-                        "the front proxy (docs/MINER_FUNDED_ROUNDS.md).")
+                        "the front proxy (docs/OPERATOR.md).")
     p.add_argument("--request-timeout", type=float, default=30.0,
                    help="Per-socket read/write timeout in seconds (slowloris "
                         "guard; the stdlib default is no timeout at all).")
@@ -252,6 +289,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="DEV ONLY: skip the chain reveal check (reveal_block=0).")
     p.add_argument("--log-level", default="INFO",
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    p.add_argument("--direct-config", type=Path, help="direct runtime JSON; enables signed /v2/direct/fund")
+    p.add_argument("--lane-b", choices=("auto", "on", "off"), default="auto",
+                   help="DEC-CA-0059 lane-B domain-expert intake (/v1/lane-b/fund): 'auto' = "
+                        "on once [lane_b] from_block is typed with [lane_b] "
+                        "leg_funding = 'miner'. Its queue is lane_b_queue.json beside "
+                        "--queue-path (the trainer derives the same path).")
+    p.add_argument("--lane-c", choices=("auto", "on", "off"), default="auto",
+                   help="DEC-CA-0056 lane-C fine-tune intake (/v1/lane-c/fund): 'auto' = "
+                        "on once chain.toml [lane_c] from_block is typed. Its queue is "
+                        "lane_c_queue.json beside --queue-path (the trainer derives the "
+                        "same path from [round] funded_queue_path).")
     return p
 
 
@@ -261,10 +309,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     load_env_files()
 
+    cfg = None
+    lane_c_resolver = None
+    lane_b_resolver = None
     if args.trust_refs:
         log.warning("--trust-refs: reveal + registration checks DISABLED — "
                     "dev only, never mainnet")
         resolver = lambda hotkey, ref: 0  # noqa: E731
+        lane_c_resolver = lambda hotkey, target, ref: 0  # noqa: E731
+        lane_b_resolver = lambda hotkey, targets, ref: 0  # noqa: E731
         registration = None
     else:
         from ..shared.config import load_chain_config
@@ -274,6 +327,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         client = ChainClient.from_config(cfg, network=args.network)
         resolver = ChainRevealResolver(client, deadline_seconds=args.chain_timeout)
+        resolver.mkt_suites = tuple(cfg.marketcast.target_suites)
+        lane_c_resolver = resolver.lane_c
+        _lb = cfg.lane_b
+
+        def lane_b_resolver(hotkey, targets, ref):
+            return resolver.lane_b(hotkey, targets, ref, slots=tuple(_lb.targets),
+                                   max_targets=int(_lb.max_domains_per_leg))
         registration = ChainRegistrationResolver(
             client, deadline_seconds=args.chain_timeout)
 
@@ -288,6 +348,82 @@ def main(argv: Sequence[str] | None = None) -> int:
         store = SubmissionStore(args.submission_dir,
                                 max_bytes=args.max_zip_mb * 1024 * 1024,
                                 max_hotkey_bytes=args.max_hotkey_mb * 1024 * 1024)
+    direct_intake = None
+    compute_vaults = None
+    if args.direct_config:
+        if args.trust_refs or args.no_require_signature:
+            raise ValueError("direct funding requires real chain registration and signatures")
+        import json
+
+        from ..direct.intake import DirectFundingIntake
+        from .vault import compute_vaults as make_compute_vaults
+        direct = json.loads(args.direct_config.read_text())
+        # Lium shares the rolling vault; Vast/RunPod keys live in subdirectories.
+        compute_vaults = {**make_compute_vaults(args.vault_dir, ttl_seconds=args.ttl_hours * 3600.0),
+                          "lium": vault}
+        for extra in compute_vaults.values():
+            extra.hydrate()
+
+        def funding_authorized(payer, providers):
+            return bool(providers) and all(
+                p in compute_vaults and compute_vaults[p].get_shared(payer) for p in providers)
+
+        direct_intake = DirectFundingIntake(
+            Path(direct["state_dir"]) / "ledger.sqlite", direct["ledger_policy"],
+            registered=registration, revealed=lambda payer, ref: resolver(payer, ref) is not None,
+            funding_authorized=funding_authorized, bootstrap_payer=direct["bootstrap_payer"])
+    lane_c_closed = None
+    if cfg is not None and not args.trust_refs:
+        from ..shared.lane_c import competition_closed
+
+        def lane_c_closed(target: str) -> str | None:
+            # concurrent competitions (owner 2026-10-20): refuse a fund once
+            # the target's competition reached its until_block (a chain read
+            # failure admits — the trainer's dispatch re-checks)
+            try:
+                block = int(client.current_block())
+            except Exception:  # noqa: BLE001
+                return None
+            return competition_closed(cfg.lane_c, target, block)
+    lane_c_queue, lane_c_targets = None, None
+    lane_c_cfg = getattr(cfg, "lane_c", None) if cfg is not None else None
+    lane_c_on = args.lane_c == "on" or (
+        args.lane_c == "auto" and int(getattr(lane_c_cfg, "from_block", 0) or 0) > 0)
+    if lane_c_on:
+        from .queue import LaneCQueue, lane_c_queue_path
+
+        lane_c_queue = LaneCQueue(lane_c_queue_path(args.queue_path),
+                                  entry_ttl_seconds=args.ttl_hours * 3600.0)
+        if lane_c_cfg is not None:
+            lane_c_targets = tuple(lane_c_cfg.targets)
+        log.info("lane-C intake ON: queue %s, targets %s", lane_c_queue.path,
+                 ",".join(lane_c_targets) if lane_c_targets else "<any well-formed>")
+    lane_b_queue, lane_b_slots, lane_b_cap = None, None, None
+    lane_b_cfg = getattr(cfg, "lane_b", None) if cfg is not None else None
+    lane_b_on = args.lane_b == "on" or (
+        args.lane_b == "auto" and lane_b_cfg is not None
+        and int(getattr(lane_b_cfg, "from_block", 0) or 0) > 0
+        and str(getattr(lane_b_cfg, "leg_funding", "miner")) == "miner")
+    if lane_b_on:
+        from .queue import LaneBQueue, lane_b_queue_path
+
+        lane_b_queue = LaneBQueue(lane_b_queue_path(args.queue_path),
+                                  entry_ttl_seconds=args.ttl_hours * 3600.0)
+        if lane_b_cfg is not None:
+            lane_b_slots = tuple(lane_b_cfg.targets)
+            lane_b_cap = int(lane_b_cfg.max_domains_per_leg)
+        log.info("lane-B intake ON: queue %s, targets %s", lane_b_queue.path,
+                 ",".join(lane_b_slots) if lane_b_slots else "<any well-formed>")
+    # DEC-CA-0060: the GPU types a fund request may choose, and the walls
+    # behind the fund-time warning. No chain config (--trust-refs) ⇒ any
+    # well-formed SKU is accepted (dev only; the trainer still checks).
+    gpu_catalog = None
+    if cfg is not None:
+        from .gpu_choice import GpuCatalog
+
+        gpu_catalog = GpuCatalog.from_config(cfg)
+        log.info("GPU choice: %s", ",".join(gpu_catalog.skus or ()) or
+                 "OFF (one locked type)")
     intake = FundingIntake(
         # Entry TTL tracks the key TTL by construction here; the trainer's
         # [round] funded_entry_ttl_hours must be set to the same value.
@@ -297,6 +433,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         require_signature=not args.no_require_signature,
         store=store,
         resolve_registered=registration,
+        direct_intake=direct_intake,
+        compute_vaults=compute_vaults,
+        lane_c_queue=lane_c_queue,
+        resolve_lane_c_reveal=lane_c_resolver,
+        lane_c_targets=lane_c_targets,
+        mkt_suites=(tuple(cfg.marketcast.target_suites) if cfg is not None else ()),
+        lane_c_closed=lane_c_closed,
+        gpu_catalog=gpu_catalog,
+        lane_b_queue=lane_b_queue,
+        resolve_lane_b_reveal=lane_b_resolver,
+        lane_b_targets=lane_b_slots,
+        lane_b_max_targets=lane_b_cap,
     )
     server = intake.make_server(args.host, args.port,
                                 max_connections=args.max_connections,

@@ -6,39 +6,23 @@ from __future__ import annotations
 import io
 import types
 from dataclasses import replace
-from datetime import UTC
 
 import pytest
 
 from cascade.miner import cli
 from cascade.miner.dashboard import (
-    DEFAULT_SECONDS_PER_BLOCK,
-    PHASE_OVERHEAD_SECONDS,
     SUBMISSIONS_SHOWN,
     LiveFeed,
-    PhaseEstimate,
-    RoundTimeline,
-    current_king_tenure,
+    current_king_holds,
     dethrone_bar_line,
     duel_round_rows,
-    fetch_public_heat,
-    fetch_public_heat_index,
-    fetch_public_heat_round,
     fetch_public_receipt_index,
-    fetch_public_round_status,
     format_duration,
-    heat_block,
-    heat_headline,
-    heat_rows,
     latest_settled_before,
     outcome_line,
-    phase_for,
-    phase_from_live,
     render,
     render_duel,
     render_duel_index,
-    render_heat,
-    render_heat_index,
     round_status,
     run_dashboard,
     seconds_per_block,
@@ -94,14 +78,19 @@ def test_round_status_at_boundary():
     assert st.blocks_remaining == 7200
 
 
-def test_seconds_per_block_derived_from_config():
-    # 24h over 7200 blocks = Bittensor's 12s cadence
-    assert seconds_per_block(RoundConfig(epoch_blocks=7200, round_hours=24.0)) == 12.0
-    # halve the round length, same grid → 6s blocks
-    assert seconds_per_block(RoundConfig(epoch_blocks=7200, round_hours=12.0)) == 6.0
-    # placeholder config falls back to the ~12s default
-    assert (seconds_per_block(RoundConfig(epoch_blocks=7200, round_hours=0.0))
-            == DEFAULT_SECONDS_PER_BLOCK)
+def test_seconds_per_block_is_the_chain_clock():
+    # Bittensor blocks are 12 s whatever the grid: the DEC-CA-0045 rollover
+    # moves epoch_blocks 3600 -> 900 with round_hours 12 — the old
+    # round_hours/epoch_blocks derivation read that as 48 s/block.
+    assert seconds_per_block(RoundConfig(epoch_blocks=3600, round_hours=12.0)) == 12.0
+    assert seconds_per_block(RoundConfig(epoch_blocks=900, round_hours=12.0)) == 12.0
+    assert seconds_per_block(RoundConfig(epoch_blocks=7200, round_hours=0.0)) == 12.0
+
+
+def test_countdown_after_rollover_uses_12s_blocks():
+    st = round_status(1_000, RoundConfig(epoch_blocks=900, round_hours=12.0))
+    assert st.spb == 12.0
+    assert st.seconds_remaining == 800 * 12.0
 
 
 def test_seconds_remaining_uses_cadence():
@@ -125,7 +114,9 @@ def test_render_frame_contents():
     assert "current block   4,321,004" in frame
     assert "round (epoch)   600" in frame
     assert "epoch 601 at block 4,327,200" in frame
-    assert "commit strictly before block 4,327,200" in frame
+    assert "next settlement at block 4,327,200" in frame
+    assert "queue for admission and GPU capacity" in frame and "strictly before" not in frame
+    assert "particular settlement is not guaranteed" in frame
     assert "13.9%" in frame  # 1004/7200
     assert "(~12.0s/block)" in frame
 
@@ -154,10 +145,10 @@ def test_cmd_round_wiring(monkeypatch, cfg, capsys):
     from cascade.shared.chain import ChainClient
     monkeypatch.setattr(ChainClient, "from_config", classmethod(lambda cls, *a, **k: client))
     args = types.SimpleNamespace(chain_toml=None, network="test", once=True,
-                                refresh=30.0, hotkey=None)
+                                refresh=30.0)
     rc = cli._cmd_round(args)
     assert rc == 0
-    assert "until next round" in capsys.readouterr().out
+    assert "until next settlement" in capsys.readouterr().out
 
 
 def test_cmd_round_chain_error_exits_3(monkeypatch, cfg, capsys):
@@ -170,7 +161,7 @@ def test_cmd_round_chain_error_exits_3(monkeypatch, cfg, capsys):
     monkeypatch.setattr(cli, "load_chain_config", lambda *_a, **_k: cfg)
     monkeypatch.setattr(ChainClient, "from_config", classmethod(lambda cls, *a, **k: _Dead()))
     args = types.SimpleNamespace(chain_toml=None, network="test", once=True,
-                                refresh=30.0, hotkey=None)
+                                refresh=30.0)
     rc = cli._cmd_round(args)
     assert rc == 3
     assert "chain error" in capsys.readouterr().err
@@ -182,117 +173,7 @@ def test_round_registered_in_parser():
     assert e.value.code == 0
 
 
-# ── round stage (heat ▸ duel ▸ validation ▸ settled) ─────────────────────────
-
-
-def test_round_timeline_from_config(cfg):
-    tl = RoundTimeline.from_chain_config(cfg)
-    rnd = cfg.round
-    heat_wall = min(
-        max(rnd.heat_guard_factor * rnd.heat_train_hours * 3600.0,
-            float(rnd.heat_guard_floor_seconds)),
-        float(cfg.screen_contract().max_train_seconds),
-    )
-    duel_wall = sum(c.max_train_seconds for c in cfg.throne_contracts())
-    assert tl.heat_seconds == heat_wall + PHASE_OVERHEAD_SECONDS
-    assert tl.duel_seconds == duel_wall + PHASE_OVERHEAD_SECONDS
-
-
-def test_phase_for_progression():
-    rc = RoundConfig(epoch_blocks=7200, round_hours=24.0)  # 12s blocks
-    tl = RoundTimeline(heat_seconds=1800.0, duel_seconds=10800.0)
-    # t=0: heat
-    p = phase_for(round_status(7200, rc), tl)
-    assert (p.key, p.estimated) == ("heat", True)
-    # 1h in (300 blocks): past the heat window → duel
-    assert phase_for(round_status(7500, rc), tl).key == "duel"
-    # 4h in (1200 blocks): past heat+duel → validation
-    assert phase_for(round_status(8400, rc), tl).key == "validation"
-    # drift can tip a stage boundary between chain polls
-    st = round_status(7200 + 149, rc)  # 1788s elapsed, 12s short of heat end
-    assert phase_for(st, tl).key == "heat"
-    assert phase_for(st, tl, drift_seconds=30.0).key == "duel"
-    # a public receipt confirms settled regardless of the clock
-    p = phase_for(round_status(7200, rc), tl, settled_outcome="round settled — king held")
-    assert (p.key, p.estimated) == ("settled", False)
-    assert "king held" in p.detail
-
-
-def _live_doc(**over):
-    from datetime import datetime
-
-    doc = {"schema": 1, "round_id": "99", "epoch_start_block": 7200,
-           "stage": "heat", "heat_done": 12, "heat_total": 65,
-           "as_of": datetime.now(UTC).isoformat()}
-    doc.update(over)
-    return doc
-
-
-def test_phase_from_live_prefers_trainer_report_over_the_clock():
-    rc = RoundConfig(epoch_blocks=7200, round_hours=24.0)
-    st = round_status(8400, rc)  # 4h in — the estimate would call "validation"
-    p = phase_from_live(_live_doc(), st)
-    assert p is not None
-    assert (p.key, p.estimated) == ("heat", False)
-    assert "12/65" in p.detail
-    assert "trainer-reported" in p.detail
-    # duel carries the finalist count; validation is plain
-    assert "1 finalist" in phase_from_live(
-        _live_doc(stage="duel", finalists=1), st).detail
-    assert phase_from_live(_live_doc(stage="validation"), st).key == "validation"
-
-
-def test_phase_from_live_rejects_stale_or_foreign_docs():
-    rc = RoundConfig(epoch_blocks=7200, round_hours=24.0)
-    st = round_status(8400, rc)
-    assert phase_from_live(None, st) is None
-    assert phase_from_live(_live_doc(epoch_start_block=14400), st) is None
-    assert phase_from_live(_live_doc(as_of="2026-01-01T00:00:00+00:00"), st) is None
-
-
-def test_run_dashboard_stage_precedence_live_beats_estimate_settled_beats_live():
-    rc = RoundConfig(epoch_blocks=7200, round_hours=24.0)
-    tl = RoundTimeline(1800.0, 10800.0)
-    # 4h into the epoch: the estimate alone would say validation…
-    out = io.StringIO()
-    run_dashboard(_FakeClient(8400), rc, "test", out=out, timeline=tl,
-                  status_fetch=lambda: _live_doc())
-    text = out.getvalue()
-    assert "stage           [HEAT]" in text          # …but the trainer says heat
-    assert "trainer-reported" in text
-    # a settled receipt for this round still outranks the live doc
-    settled = {"rounds": [{"epoch_start_block": 7200, "status": "scored",
-                           "dethroned": False, "post_round_king_uid": 3}]}
-    out = io.StringIO()
-    run_dashboard(_FakeClient(8400), rc, "test", out=out, timeline=tl,
-                  index_fetch=lambda: settled, status_fetch=lambda: _live_doc())
-    assert "[SETTLED]" in out.getvalue()
-
-
-def test_run_dashboard_shows_warm_start_from_live_stage_doc():
-    from cascade.miner.dashboard import warm_start_line
-
-    rc = RoundConfig(epoch_blocks=7200, round_hours=24.0)
-    ptr = ("metro-v1:trained:hippius:cascade/ckpt-r9-king-toto2-4m@sha256:"
-           + "a" * 64)
-    out = io.StringIO()
-    run_dashboard(_FakeClient(8400), rc, "test", out=out,
-                  status_fetch=lambda: _live_doc(warm_start={
-                      "init_checkpoint": ptr, "size": "toto2-4m",
-                      "generation": 4}))
-    text = out.getvalue()
-    assert ("warm start      this round trains from "
-            "cascade/ckpt-r9-king-toto2-4m@sha256:aaaaaaaaaaaa…") in text
-    assert "(generation 4)" in text
-    # Random-init round (no warm_start in the doc) ⇒ no line at all.
-    out = io.StringIO()
-    run_dashboard(_FakeClient(8400), rc, "test", out=out,
-                  status_fetch=lambda: _live_doc())
-    assert "warm start" not in out.getvalue()
-    # Helper edge cases: absent/malformed block, and no dangling generation.
-    assert warm_start_line(None) is None
-    assert warm_start_line({"size": "toto2-4m"}) is None
-    assert "generation" not in warm_start_line({"init_checkpoint": ptr})
+# ── settled verdicts (public receipt index) ──────────────────────────────────
 
 
 def test_settled_entry_prefers_scored_and_outcome_lines():
@@ -377,24 +258,22 @@ def test_live_feed_survives_poll_failures_and_missing_apis():
 # ── frame rendering with the live sections ───────────────────────────────────
 
 
-def test_render_includes_stage_and_submissions():
+def test_render_includes_settled_and_submissions():
     st = round_status(4_321_004, RoundConfig(epoch_blocks=7200, round_hours=24.0))
-    phase = PhaseEstimate("duel", "king vs finalists training — 2h 0m 0s in (est.)", True)
     rows = submission_rows(
         [_commit(7, "5F3s" + "x" * 40 + "8kQz", 4_320_500),
          _commit(3, "hk", 4_319_000)],
         st.epoch_start,
         baseline={("hk", 4_319_000)},
     )
-    frame = render(st, "finney", phase=phase, submissions=rows,
-                   last_outcome="king held (uid 3)")
-    assert "stage           heat ▸ [DUEL] ▸ validation ▸ settled" in frame
-    assert "king vs finalists" in frame
+    frame = render(st, "finney", submissions=rows, last_outcome="king held (uid 3)")
     assert "last round      king held (uid 3)" in frame
     assert "submissions     1 in this round · 1 committed for the next" in frame
     assert "→ next round" in frame and "in this round" in frame
     assert "● new" in frame
     assert "5F3sxx…8kQz" in frame  # long hotkeys are shortened
+    settled = render(st, "finney", settled="settled — king held (uid 3)")
+    assert "this round      settled — king held (uid 3)" in settled
 
 
 def test_render_submissions_empty_and_overflow():
@@ -409,7 +288,7 @@ def test_render_submissions_empty_and_overflow():
 def test_render_without_feed_matches_legacy_frame():
     st = round_status(4_321_004, RoundConfig(epoch_blocks=7200, round_hours=24.0))
     frame = render(st, "finney")
-    assert "stage" not in frame
+    assert "this round" not in frame
     assert "submissions" not in frame
     assert frame.splitlines()[-1].startswith("  eta")
 
@@ -421,12 +300,10 @@ def test_run_dashboard_once_with_live_feed():
                        "dethroned": False, "post_round_king_uid": 3}]}
     out = io.StringIO()
     rc = run_dashboard(client, RoundConfig(epoch_blocks=7200), "test", out=out,
-                       timeline=RoundTimeline(1800.0, 10800.0),
                        index_fetch=lambda: doc)
     assert rc == 0
     text = out.getvalue()
-    assert "[SETTLED]" in text                      # receipt evidence wins over the clock
-    assert "king held (uid 3)" in text
+    assert "this round      settled — king held (uid 3)" in text
     assert "submissions     1 in this round · 1 committed for the next" in text
     assert "last round" not in text                 # redundant once this round settled
 
@@ -434,10 +311,10 @@ def test_run_dashboard_once_with_live_feed():
 def test_run_dashboard_once_without_feed_apis_stays_clean():
     out = io.StringIO()
     rc = run_dashboard(_FakeClient(14_500), RoundConfig(epoch_blocks=7200),
-                       "test", out=out, timeline=RoundTimeline(1800.0, 10800.0))
+                       "test", out=out)
     assert rc == 0
     text = out.getvalue()
-    assert "stage           [HEAT]" in text         # estimate still renders
+    assert "countdown" in text                      # the countdown still renders
     assert "submissions" not in text                # no chain feed → no section
 
 
@@ -488,256 +365,23 @@ def test_fetch_public_receipt_index_failures_return_none(monkeypatch):
     assert fetch_public_receipt_index(_NoEndpoint()) is None
 
 
-def test_fetch_public_round_status(monkeypatch):
-    import io as _io
-    import urllib.request
-
-    captured = {}
-
-    class _Resp(_io.BytesIO):
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-    def _fake_urlopen(req, timeout=None):
-        captured["url"] = req.full_url
-        return _Resp(b'{"schema": 1, "stage": "heat"}')
-
-    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
-    doc = fetch_public_round_status(_Storage())
-    assert doc == {"schema": 1, "stage": "heat"}
-    assert captured["url"] == (
-        "https://s3.example.com/cascade-manifests/status/round.json")
-
-    monkeypatch.setattr(urllib.request, "urlopen",
-                        lambda *a, **k: (_ for _ in ()).throw(OSError("down")))
-    assert fetch_public_round_status(_Storage()) is None
-
-
-# ── heat standings (public heat mirror) ──────────────────────────────────────
-
-
-def _heat_doc(**over):
-    from datetime import datetime
-
-    doc = {
-        "schema": 1, "round_id": "1", "epoch_start_block": 14_400,
-        "as_of": datetime.now(UTC).isoformat(), "screened": 4,
-        "screen_size": "s", "finalists": 1,
-        "entrants": [
-            {"uid": 2, "hotkey": "hk-c", "gen_ref": "carol/gen@sha256:" + "c" * 64,
-             "status": "advanced", "rank": 1, "rel_score": 1.0, "p_best": 0.7,
-             "crps": 0.4123, "mase": 1.021},
-            {"uid": 3, "hotkey": "hk-d", "gen_ref": "dave/gen@sha256:" + "d" * 64,
-             "status": "screened", "rank": 2, "rel_score": 1.25, "p_best": 0.3,
-             "crps": 0.5, "mase": 1.2},
-            {"uid": 4, "hotkey": "hk-e", "gen_ref": "eve/gen@sha256:" + "e" * 64,
-             "status": "failed_train"},
-        ],
-        "leader_lcb": 0.031, "n_windows": 120, "n_clusters": 9,
-    }
-    doc.update(over)
-    return doc
-
-
-def test_heat_rows_rank_order_with_unscored_last_and_mine_flagged():
-    rows = heat_rows(_heat_doc(), me="hk-d")
-    assert [(r.rank, r.uid, r.status) for r in rows] == [
-        (1, 2, "advanced"), (2, 3, "screened"), (None, 4, "failed_train")]
-    assert [r.mine for r in rows] == [False, True, False]
-    # a UID identifies you just as well as the ss58
-    assert [r.mine for r in heat_rows(_heat_doc(), me="4")] == [False, False, True]
-    assert heat_rows(None) == [] and heat_rows({"entrants": "nope"}) == []
-
-
-def test_heat_headline_counts_and_no_screen_reason():
-    assert heat_headline(_heat_doc()) == "3 entrants · 1 advanced · screened at s"
-    doc = _heat_doc(entrants=[], no_screen=True,
-                    no_screen_reason="the field fit within the 1 finalist slot(s)")
-    assert heat_headline(doc).startswith("no screen — the field fit within")
-    assert heat_headline(None) == "no heat standings published"
-
-
-def test_heat_block_shows_gap_raw_error_and_always_your_own_row():
-    lines = heat_block(_heat_doc(), me="hk-e", limit=1)
-    assert "3 entrants · 1 advanced" in lines[0]
-    assert "#1" in lines[1] and "best" in lines[1]
-    assert "crps   0.4123" in lines[1] and "mase   1.021" in lines[1]
-    # limit=1 hides ranks 2+, but the caller's own (last-placed) row is kept…
-    assert "← you" in lines[2] and "did not train" in lines[2]
-    # …and the remainder is reported, not silently dropped
-    assert "… 1 more" in lines[-1]
-    # relative gap to the best entrant for a screened-out entrant
-    assert "+25.0%" in "\n".join(heat_block(_heat_doc(), limit=None))
-
-
-def test_render_heat_reports_decisiveness_and_missing_docs():
-    text = render_heat(_heat_doc(), me="hk-c")
-    assert "cascade heat — round 1" in text
-    assert "epoch start block 14400" in text
-    assert "top 1 to the duel" in text
-    assert "leader LCB +0.0310" in text and "separated 1st from 2nd" in text
-    assert "← you" in text
-    # a screen that did NOT separate the top two says so
-    assert "did NOT separate" in render_heat(_heat_doc(leader_lcb=-0.02))
-    assert "no heat standings published yet" in render_heat(None)
-
-
-def test_render_heat_shows_warm_start_and_next_scheduled_init():
-    from cascade.miner.dashboard import _short_pointer
-
-    this_ptr = "metro-v1:trained:hippius:cascade/ckpt-r9-king-toto2-4m@sha256:" + "a" * 64
-    next_ptr = "metro-v1:trained:hippius:cascade/ckpt-r9-chal-toto2-4m@sha256:" + "b" * 64
-    text = render_heat(_heat_doc(warm_start={
-        "init_checkpoint": this_ptr, "size": "toto2-4m", "generation": 3,
-        "next_scheduled_init": next_ptr,
-    }))
-    assert "this round trained from cascade/ckpt-r9-king-toto2-4m@sha256:aaaaaaaaaaaa…" in text
-    assert "(generation 3)" in text
-    assert "scheduled init cascade/ckpt-r9-chal-toto2-4m@sha256:bbbbbbbbbbbb…" in text
-    assert "a schedule, not a promise" in text
-    # No warm_start (random-init era) ⇒ no warm-start lines at all.
-    plain = render_heat(_heat_doc())
-    assert "warm start" not in plain and "scheduled init" not in plain
-    # No generation key (legacy pointer / engine-off) ⇒ no dangling "(generation )".
-    nogen = render_heat(_heat_doc(warm_start={"init_checkpoint": this_ptr,
-                                              "size": "toto2-4m"}))
-    assert "generation" not in nogen
-    # Shortener passes unrecognized shapes through untouched.
-    assert _short_pointer("weird-ref") == "weird-ref"
-
-
-def test_render_heat_index_lists_published_rounds():
-    doc = {"heats": [
-        {"round_id": "1", "epoch_start_block": 7_200, "n_entrants": 3,
-         "n_advanced": 1, "leader_uid": 2, "leader_lcb": 0.031},
-        {"round_id": "2", "epoch_start_block": 14_400, "n_entrants": 0,
-         "n_advanced": 0, "no_screen": True},
-    ]}
-    text = render_heat_index(doc)
-    assert "2 published heat(s)" in text
-    assert "round 1" in text and "leader uid    2" in text and "lcb +0.0310" in text
-    assert "(no screen)" in text
-    assert "no published heats found" in render_heat_index(None)
-
-
-def test_frame_shows_this_rounds_heat_as_soon_as_it_is_published():
-    # 4h into the round: the duel is still training, and until the heat mirror
-    # existed the standings only appeared with the receipt hours later.
-    rc = RoundConfig(epoch_blocks=7200, round_hours=24.0)
-    out = io.StringIO()
-    run_dashboard(_FeedClient(14_400 + 1200, [_commit(2, "hk-c", 14_000)]), rc, "test",
-                  out=out, timeline=RoundTimeline(1800.0, 10800.0),
-                  heat_fetch=lambda: _heat_doc(), me="hk-d")
-    text = out.getvalue()
-    assert "heat            3 entrants · 1 advanced · screened at s" in text
-    assert "← you" in text
-
-
-def test_frame_ignores_another_rounds_heat_standings():
-    rc = RoundConfig(epoch_blocks=7200, round_hours=24.0)
-    out = io.StringIO()
-    run_dashboard(_FakeClient(21_600 + 60), rc, "test", out=out,
-                  timeline=RoundTimeline(1800.0, 10800.0),
-                  heat_fetch=lambda: _heat_doc())   # epoch_start_block 14_400
-    assert "heat            " not in out.getvalue()
-
-
-def test_fetch_public_heat_docs(monkeypatch):
-    import io as _io
-    import urllib.request
-
-    urls = []
-
-    class _Resp(_io.BytesIO):
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-    def _fake_urlopen(req, timeout=None):
-        urls.append(req.full_url)
-        return _Resp(b'{"schema": 1, "entrants": [], "heats": []}')
-
-    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
-    base = "https://s3.example.com/cascade-manifests/"
-    assert fetch_public_heat(_Storage())["schema"] == 1
-    assert fetch_public_heat_round(_Storage(), "42")["schema"] == 1
-    assert fetch_public_heat_index(_Storage())["heats"] == []
-    assert urls == [base + "status/heat.json", base + "heats/round-42.json",
-                    base + "heats/index.json"]
-
-    monkeypatch.setattr(urllib.request, "urlopen",
-                        lambda *a, **k: (_ for _ in ()).throw(OSError("down")))
-    assert fetch_public_heat(_Storage()) is None
-    assert fetch_public_heat_index(_Storage()) is None
-
-
-# ── `cascade heat` command ───────────────────────────────────────────────────
-
-
-def test_cmd_heat_prints_the_latest_standings(monkeypatch, cfg, capsys):
-    monkeypatch.setattr(cli, "load_chain_config", lambda *_a, **_k: cfg)
-    monkeypatch.setattr("cascade.miner.dashboard.fetch_public_heat",
-                        lambda *_a, **_k: _heat_doc())
-    args = types.SimpleNamespace(chain_toml=None, hotkey="hk-d", round_id=None,
-                                history=False, limit=20)
-    assert cli._cmd_heat(args) == 0
-    out = capsys.readouterr().out
-    assert "cascade heat — round 1" in out and "← you" in out
-
-
-def test_cmd_heat_reads_an_archived_round_and_the_history(monkeypatch, cfg, capsys):
-    monkeypatch.setattr(cli, "load_chain_config", lambda *_a, **_k: cfg)
-    seen = {}
-
-    def _fetch_round(storage, rid, **_k):
-        seen["rid"] = rid
-        return _heat_doc(round_id=rid)
-
-    monkeypatch.setattr("cascade.miner.dashboard.fetch_public_heat_round", _fetch_round)
-    monkeypatch.setattr("cascade.miner.dashboard.fetch_public_heat_index",
-                        lambda *_a, **_k: {"heats": [
-                            {"round_id": "42", "epoch_start_block": 7_200,
-                             "n_entrants": 3, "n_advanced": 1, "leader_uid": 2}]})
-    args = types.SimpleNamespace(chain_toml=None, hotkey=None, round_id="42",
-                                history=False, limit=20)
-    assert cli._cmd_heat(args) == 0
-    assert seen["rid"] == "42"
-    assert "cascade heat — round 42" in capsys.readouterr().out
-
-    assert cli._cmd_heat(types.SimpleNamespace(
-        chain_toml=None, hotkey=None, round_id=None, history=True, limit=20)) == 0
-    assert "1 published heat(s)" in capsys.readouterr().out
-
-
-def test_cmd_heat_exits_1_when_nothing_is_published(monkeypatch, cfg, capsys):
-    monkeypatch.setattr(cli, "load_chain_config", lambda *_a, **_k: cfg)
-    monkeypatch.setattr("cascade.miner.dashboard.fetch_public_heat", lambda *_a, **_k: None)
-    args = types.SimpleNamespace(chain_toml=None, hotkey=None, round_id=None,
-                                history=False, limit=20)
-    assert cli._cmd_heat(args) == 1
-    assert "no published heat standings" in capsys.readouterr().err
-
-
-def test_heat_registered_in_parser():
-    with pytest.raises(SystemExit) as e:
-        cli.main(["heat", "--help"])
-    assert e.value.code == 0
-
-
 # ── dethrone bar (tenure-decayed margin, DEC-CA-0016) ────────────────────────
 
 
-def _scoring(start=0.02, end=0.005, warmup=8):
+def _scoring(start=0.02, end=0.005, warmup=8, **kw):
     from cascade.shared.config import ScoringConfig
     return ScoringConfig(
         win_margin_start=start, win_margin_end=end, margin_warmup_rounds=warmup,
-        min_windows=64, bootstrap_B=1000, bootstrap_alpha=0.05, dethrone_cp=1,
+        min_windows=64, bootstrap_B=1000, bootstrap_alpha=0.05, dethrone_cp=1, **kw,
     )
+
+
+def _cfg(round_cfg=None, **kw):
+    """A ChainConfig whose [scoring] is ``_scoring(**kw)`` — the dethrone bar
+    resolves through ``ChainConfig.koth_params`` exactly as the validator's."""
+    from cascade.shared.config import DEFAULT_CHAIN_TOML, load_chain_config
+    base = load_chain_config(DEFAULT_CHAIN_TOML)
+    return replace(base, scoring=_scoring(**kw), round=round_cfg or base.round)
 
 
 def _tenure_row(esb, king="5King" + "k" * 43, *, dethroned=False, status="scored"):
@@ -745,30 +389,78 @@ def _tenure_row(esb, king="5King" + "k" * 43, *, dethroned=False, status="scored
             "post_round_king_hotkey": king, "dethroned": dethroned}
 
 
-def test_current_king_tenure_counts_consecutive_holds():
+def test_current_king_holds_counts_consecutive_holds():
     # crowned at 100 (dethroned row), then five holds → tenure 5 entering next
     rows = [_tenure_row(100, dethroned=True)] + [
         _tenure_row(100 + 10 * i) for i in range(1, 6)]
-    assert current_king_tenure({"rounds": rows}) == 5
+    assert len(current_king_holds({"rounds": rows})) == 5
     # a fresh dethrone as the latest round → tenure 0
     rows.append(_tenure_row(200, king="5New" + "n" * 44, dethroned=True))
-    assert current_king_tenure({"rounds": rows}) == 0
+    assert len(current_king_holds({"rounds": rows})) == 0
     # rejected rows are ignored; empty/None index gives None
-    assert current_king_tenure({"rounds": [_tenure_row(1, status="rejected")]}) is None
-    assert current_king_tenure(None) is None
+    assert current_king_holds({"rounds": [_tenure_row(1, status="rejected")]}) is None
+    assert current_king_holds(None) is None
 
 
 def test_dethrone_bar_line_applies_the_affine_schedule():
     doc = {"rounds": [_tenure_row(100, dethroned=True)] + [
         _tenure_row(100 + 10 * i) for i in range(1, 7)]}   # tenure 6
-    line = dethrone_bar_line(doc, _scoring())
+    line = dethrone_bar_line(doc, _cfg())
     assert "LCB > 0.875%" in line and "tenure 6" in line and "floor 0.50%" in line
     # at/past warmup the line says it sits at the floor
     doc["rounds"] += [_tenure_row(200 + 10 * i) for i in range(3)]  # tenure 9
-    assert "at the 0.50% floor" in dethrone_bar_line(doc, _scoring())
+    assert "at the 0.50% floor" in dethrone_bar_line(doc, _cfg())
     # flat schedule (decay off) or no index → omitted
-    assert dethrone_bar_line(doc, _scoring(start=0.02, end=0.02)) is None
-    assert dethrone_bar_line(None, _scoring()) is None
+    assert dethrone_bar_line(doc, _cfg(start=0.02, end=0.02)) is None
+    assert dethrone_bar_line(None, _cfg()) is None
+
+
+# DEC-CA-0045 rollover at R: the grid drops 3600 -> 900 and tenure is counted
+# in blocks; margin_warmup_blocks = 28800 (8 old rounds) = 32 new settlements.
+_R = 9_000_000
+
+
+def _rolled_round():
+    return RoundConfig(epoch_blocks=900, epoch_blocks_prev=3600,
+                       epoch_activation_block=_R, round_hours=12.0)
+
+
+def _rolled_doc(holds=8):
+    """Crowned at the rollover settlement, then ``holds`` 900-block holds."""
+    return {"rounds": [_tenure_row(_R, dethroned=True)] + [
+        _tenure_row(_R + 900 * i) for i in range(1, holds + 1)]}
+
+
+def test_dethrone_bar_after_rollover_uses_blocks_denominated_warmup():
+    cfg = _cfg(_rolled_round(), start=0.01, end=0.005,
+               tenure_blocks_from_block=_R, margin_warmup_blocks=28_800)
+    block = _R + 900 * 9                       # the settlement after 8 holds
+    line = dethrone_bar_line(_rolled_doc(8), cfg, block=block)
+    # 8 of 32 settlements into the decay: 1% - 8/32 x 0.5% = 0.875% (the old
+    # rounds-denominated reading put it at the 0.5% floor)
+    assert "LCB > 0.875% this round" in line and "tenure 8" in line
+    assert "floor 0.50% at tenure 32" in line
+    assert "increment" not in line             # level units
+
+
+def test_dethrone_bar_under_margin_v2_reads_increment_units():
+    cfg = _cfg(_rolled_round(), start=0.01, end=0.005,
+               tenure_blocks_from_block=_R, margin_warmup_blocks=28_800,
+               margin_mode="increment", win_margin_start_v2=0.4,
+               win_margin_end_v2=0.2, margin_warmup_blocks_v2=18_000,
+               margin_v2_from_block=_R)
+    line = dethrone_bar_line(_rolled_doc(8), cfg, block=_R + 900 * 9)
+    # v2: 40% -> 20% of the increment over 18000/900 = 20 settlements
+    assert "LCB > 32.000% of the increment this round" in line
+    assert "floor 20.00% at tenure 20" in line
+
+
+def test_dethrone_bar_matches_the_validator_resolution():
+    from cascade.eval.koth import margin_for_tenure
+    cfg = _cfg(_rolled_round(), start=0.01, end=0.005,
+               tenure_blocks_from_block=_R, margin_warmup_blocks=28_800)
+    block = _R + 900 * 9
+    assert margin_for_tenure(cfg.koth_params(block=block), 8) == pytest.approx(0.00875)
 
 
 def test_render_includes_bar_line_only_when_given():

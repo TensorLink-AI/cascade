@@ -15,7 +15,6 @@ from cascade.funding import (
     classify_rent_failure,
     is_no_capacity,
     parse_retry_secs,
-    rounds_needed,
     select_field,
     should_recover,
 )
@@ -231,7 +230,7 @@ def test_stale_instance_never_resurrects_settled_entries(tmp_path):
     assert FundedQueue(path, clock=FakeClock()).get(HK_A).status == "done"
     # And its reads see the other writer's state without a rebuild.
     assert intake_q.get(HK_A).status == "done"
-    assert intake_q.queued_depth() == 1
+    assert sum(e.status == "queued" for e in intake_q.entries()) == 1
 
 
 def test_expire_stale_kills_only_old_queued(tmp_path):
@@ -313,7 +312,6 @@ def test_concurrent_reads_never_corrupt_a_write(tmp_path):
     def hammer_reads():
         while not stop.is_set():
             q.entries()
-            q.queued_depth()
 
     readers = [threading.Thread(target=hammer_reads) for _ in range(6)]
     for t in readers:
@@ -326,7 +324,7 @@ def test_concurrent_reads_never_corrupt_a_write(tmp_path):
         for t in readers:
             t.join()
     # Every one of the 200 funds survived — none dropped by a racing read.
-    assert q.queued_depth() == 200
+    assert sum(e.status == "queued" for e in q.entries()) == 200
     assert len(FundedQueue(path).entries()) == 200
 
 
@@ -350,7 +348,7 @@ def test_promote_pending_does_not_hold_lock_across_resolver(tmp_path):
 
     def try_read():
         resolver_entered.wait(timeout=5)
-        q.queued_depth()                     # must NOT block on the resolver's lock
+        q.entries()                          # must NOT block on the resolver's lock
         read_completed.set()
 
     reader = threading.Thread(target=try_read)
@@ -379,16 +377,6 @@ def test_fail_expect_ref_skips_a_replaced_entry(tmp_path):
     assert q.fail(HK_A, error="x", error_class="y",
                   expect_ref="new@sha256:" + "1" * 64)       # matching ref fails it
     assert q.get(HK_A).status == "failed"
-
-
-def test_rounds_needed_clamps():
-    assert rounds_needed(0, cap=3) == 1
-    assert rounds_needed(3, cap=3) == 1
-    assert rounds_needed(4, cap=3) == 2
-    assert rounds_needed(100, cap=3) == 4
-    assert rounds_needed(100, cap=3, max_rounds=2) == 2
-    with pytest.raises(ValueError):
-        rounds_needed(1, cap=0)
 
 
 from cascade.funding.queue import FundedQueue as Q  # noqa: E402

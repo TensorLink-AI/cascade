@@ -14,7 +14,6 @@ from dataclasses import replace
 import pytest
 
 from cascade.shared.config import ScoringConfig, effective_win_margin_start
-from tests.unpinned import load_unpinned, strip_pins
 
 
 def _scoring(**kw) -> ScoringConfig:
@@ -28,7 +27,7 @@ def test_margin_knobs_parse_and_default_off(tmp_path):
     from cascade.shared.config import DEFAULT_CHAIN_TOML, load_chain_config
 
     bare = re.sub(r"^(win_margin_start_prev|margin_activation_block)\s*=.*$", "",
-                  strip_pins(DEFAULT_CHAIN_TOML.read_text()), flags=re.M)
+                  DEFAULT_CHAIN_TOML.read_text(), flags=re.M)
     p = tmp_path / "chain.toml"
     p.write_text(bare)
     cfg = load_chain_config(p)
@@ -45,7 +44,7 @@ def test_margin_knobs_parse_and_default_off(tmp_path):
 
     # An armed shipped toml flips on an epoch boundary, in step with the
     # ladder and the duel-only rounds (one announced block).
-    shipped = load_unpinned(DEFAULT_CHAIN_TOML)
+    shipped = load_chain_config(DEFAULT_CHAIN_TOML)
     if shipped.scoring.margin_activation_block:
         assert shipped.scoring.win_margin_start_prev > 0.0
         assert shipped.scoring.margin_activation_block % shipped.round.epoch_blocks == 0
@@ -117,14 +116,20 @@ def test_audit_replays_each_receipt_under_its_own_margin(cfg):
     assert C.check_koth_params(pre_ok, armed).status == C.PASS
 
 
-def test_dashboard_margin_line_uses_the_round_value():
-    from cascade.miner.dashboard import margin_for_tenure_cfg
+def test_margin_resolves_to_the_round_value():
+    from cascade.eval.koth import margin_for_tenure
+    from cascade.shared.config import DEFAULT_CHAIN_TOML, load_chain_config
 
-    armed = _scoring(win_margin_start_prev=0.02, margin_activation_block=5000)
-    assert margin_for_tenure_cfg(armed, 0, block=4999) == 0.02
-    assert margin_for_tenure_cfg(armed, 0, block=5000) == 0.01
-    assert margin_for_tenure_cfg(armed, 0) == 0.01
-    assert margin_for_tenure_cfg(armed, 8, block=4999) == pytest.approx(0.005)
+    armed = replace(load_chain_config(DEFAULT_CHAIN_TOML),
+                    scoring=_scoring(win_margin_start_prev=0.02, margin_activation_block=5000))
+
+    def margin(tenure, block=None):
+        return margin_for_tenure(armed.koth_params(block=block), tenure)
+
+    assert margin(0, block=4999) == 0.02
+    assert margin(0, block=5000) == 0.01
+    assert margin(0) == 0.01
+    assert margin(8, block=4999) == pytest.approx(0.005)
 
 
 # ── DEC-CA-0039: block-gated increment-margin activation ─────────────────────
@@ -161,7 +166,7 @@ def test_cohort_maxt_increment_knob_parses_and_defaults_off(tmp_path):
     )
 
     bare = re.sub(r"^cohort_maxt_increment_from_block\s*=.*$", "",
-                  strip_pins(DEFAULT_CHAIN_TOML.read_text()), flags=re.M)
+                  DEFAULT_CHAIN_TOML.read_text(), flags=re.M)
     p = tmp_path / "chain.toml"
     p.write_text(bare)
     cfg = load_chain_config(p)
@@ -175,7 +180,7 @@ def test_cohort_maxt_increment_knob_parses_and_defaults_off(tmp_path):
     assert cohort_maxt_increment_active(cfg.scoring, 5000) is True
     assert cohort_maxt_increment_active(cfg.scoring, None) is False
     # An armed shipped toml flips on an epoch boundary, like the other gates.
-    shipped = load_unpinned(DEFAULT_CHAIN_TOML)
+    shipped = load_chain_config(DEFAULT_CHAIN_TOML)
     if shipped.scoring.cohort_maxt_increment_from_block:
         assert (shipped.scoring.cohort_maxt_increment_from_block
                 % shipped.round.epoch_blocks == 0)

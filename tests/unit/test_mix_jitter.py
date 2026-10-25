@@ -18,7 +18,6 @@ from cascade.validator.windows import (
     MixParams,
     RotatingWindowSource,
     _capped_jittered_split,
-    round_composition,
 )
 
 # A pool imbalanced the way the production pool is (big transport, tiny econ),
@@ -226,19 +225,3 @@ def test_capped_jittered_split_saturates_to_capacity():
     rng = np.random.default_rng(7)
     counts = _capped_jittered_split(500, [60, 50, 10], 4.0, 4, rng)
     assert counts == [60, 50, 10]
-
-
-# ─────────────────────────────────────────────────────── composition ────
-
-
-def test_round_composition_reports_the_served_mix():
-    w = _source().windows_for_round("round-1", 100, block=500)
-    comp = round_composition(w, _MIX)
-    assert comp["n_windows"] == 100
-    assert sum(comp["domains"].values()) == 100
-    assert set(comp["domains"]) == set(_DOMAINS)
-    assert 1.0 <= comp["effective_domains"] <= len(_DOMAINS)
-    assert comp["n_dgp_classes"] >= len(_DOMAINS)  # ≥1 active class per domain
-    assert comp["cadences"] == {"H": 100}
-    assert comp["mix"]["from_block"] == 100
-    assert comp["mix"]["jitter_alpha"] == 4.0

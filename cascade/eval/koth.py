@@ -21,6 +21,7 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 
+from .bench_gate import BenchGateResult
 from .bootstrap import (
     cohort_maxt_lcbs,
     increment_bootstrap_rel,
@@ -40,7 +41,6 @@ from .scoring import (
 #   "shadow"  — gate is computed and logged on a private-pool win, but the
 #               verdict is NOT changed (calibrate tolerance against real noise).
 #   "enforce" — gate is AND-ed into the dethrone decision.
-GIFT_GATE_MODES = ("off", "shadow", "enforce")
 
 # Margin denomination (``[scoring] margin_mode``; DEC-CA-0027):
 #   "level"     — LCB of (king − chal) / king vs the margin. The from-scratch
@@ -95,6 +95,20 @@ class KothParams:
     gift_gate_mode: str = "off"
     gift_gate_tolerance: float = 0.03
     gift_gate_min_configs: int = 15
+    # Three-suite bench gate (DEC-CA-0054, see :mod:`.bench_gate`): same
+    # rollout modes; ``bench_gate_min_items`` is the per-suite paired-item
+    # floor below which the gate is uncomputable. Reuses bootstrap_B/alpha.
+    bench_gate_mode: str = "off"
+    bench_gate_min_items: int = 10
+    # The settlement's effective bench-gate rule (``.bench_gate.RULES``):
+    # "dec-ca-0054" (three suites, six-number geomean better) or, from
+    # ``[v2] bench_gate_v2_from_block``, DEC-CA-0061's "avg_noninf_winrate"
+    # (four suites, per-task ratios: average < 1, no suite's ratio LCB above
+    # 1 + ``bench_gate_tolerance``, win rate >= ``bench_gate_min_win_rate``).
+    # Dropped from the receipt params at the defaults.
+    bench_gate_rule: str = "dec-ca-0054"
+    bench_gate_tolerance: float = 0.01
+    bench_gate_min_win_rate: float = 0.5
     # Init-baseline floor ([scoring] init_gate_mode): the shared warm-start
     # init, scored on the SAME duel windows, as an absolute floor under the
     # crown — "nobody takes the throne who's worse than doing nothing".
@@ -217,6 +231,11 @@ class RoundResult:
     # off or no baseline this round; under "enforce" a False has already been
     # folded into ``challenger_wins_round``; under "shadow" it is logged only.
     init_floor_passed: bool | None = None
+    # DEC-CA-0054 three-suite bench gate outcome, when it ran (None = not run).
+    bench_gate_passed: bool | None = None
+    # DEC-CA-0061: the rule, its three numbers and per-suite ratios that
+    # judged (:meth:`.bench_gate.BenchGateResult.detail`); None under DEC-CA-0054.
+    bench_gate_detail: dict | None = None
 
 
 def _window_clusters(scores: list[WindowScore]) -> tuple[list, int]:
@@ -579,8 +598,7 @@ def evaluate_round(
         )
     # An uncomputable bound (empty bootstrap sample ⇒ NaN) is an INCONCLUSIVE
     # round — king holds, streak untouched — never a compare that happens to
-    # be False today and True on some other path (2026-09-21 review: lcb=nan
-    # reached the verdict line with inconclusive=False).
+    # be False today and True on some other path.
     computable = bool(math.isfinite(lcb))
     wins = bool(computable and lcb >= margin)
     if params.init_gate_mode == "enforce" and init_floor_passed is False:
@@ -636,6 +654,24 @@ def apply_gift_gate(
     if not gate.computed:
         # Uncomputable gate on an otherwise-winning round: make no decision
         # rather than pass or fail silently — the king holds, streak untouched.
+        return replace(diagnostic, challenger_wins_round=False, inconclusive=True)
+    if not gate.passed:
+        return replace(diagnostic, challenger_wins_round=False)
+    return diagnostic
+
+
+def apply_bench_gate(
+    result: RoundResult, gate: BenchGateResult, *, mode: str
+) -> RoundResult:
+    """Fold the bench gate (DEC-CA-0054, or DEC-CA-0061) into a round result —
+    the same truth table as :func:`apply_gift_gate`: it only matters on a
+    private-pool win; ``enforce`` blocks a failing win and holds an
+    uncomputable one (inconclusive); ``shadow`` only records."""
+    diagnostic = replace(result, bench_gate_passed=(gate.passed if gate.computed else None),
+                         bench_gate_detail=gate.detail())
+    if mode != "enforce" or not result.challenger_wins_round:
+        return diagnostic
+    if not gate.computed:
         return replace(diagnostic, challenger_wins_round=False, inconclusive=True)
     if not gate.passed:
         return replace(diagnostic, challenger_wins_round=False)

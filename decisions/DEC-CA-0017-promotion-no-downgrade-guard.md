@@ -2,7 +2,8 @@
 id: DEC-CA-0017
 type: decision
 title: "Promotion never ratchets the shared init downhill: a ripe reign with only worse-benching candidates holds the live generation"
-status: active
+status: superseded
+note: "Superseded by DEC-CA-0044 (rolling top-k), which subsumes this guard."
 date: 2026-08-15
 tags: [cascade, warm-start, promotion, trainer, basin]
 revisit_when: "a hold persists for a full extra reign-length or more (the guard is starving rotation diversity — consider firing on equal-within-epsilon rather than equal-or-better, or feeding held reigns into the DEC-CA-0014 shadow read as evidence the lineage has plateaued); or Stage-2 reseed valve arms (a scratch candidate clearing the quality floor should also clear this guard by construction — verify the two compose); or bench noise is measured large enough that a strictly-worse hold is mostly noise (then compare with a noise-sized epsilon)"

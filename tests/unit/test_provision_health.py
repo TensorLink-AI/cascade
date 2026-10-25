@@ -444,8 +444,7 @@ def test_make_health_check_per_pod_attestation_does_not_mutate_frozen_gate(monke
 
     stage = StagePolicy(sku="NVIDIA L40S", gpus_per_pod=2, max_pods=2,
                         providers=("lium",), max_price_hr=3.0)
-    policy = ProvisionPolicy(heat=stage, final=stage, trigger_margin_blocks=25,
-                             max_spend_per_round=25.0)
+    policy = ProvisionPolicy(eval=stage, max_spend_per_round=25.0)
     render = RenderSettings(image=pin, ssh_pubkey="ssh-ed25519 AAAA orch",
                             key_path="~/.ssh/cascade_ed25519")
     check = make_health_check(policy, render, image_digest=pin, min_disk_gb=20.0,
@@ -453,14 +452,14 @@ def test_make_health_check_per_pod_attestation_does_not_mutate_frozen_gate(monke
     addr = PodAddress("10.0.0.5", 22)
 
     # Provider attestation matches the pin → passes, and (the bug) does NOT raise.
-    ok = check(addr, "final", "lium", sku="NVIDIA L40S", gpus=2, attested_digest=pin)
+    ok = check(addr, "eval", "lium", sku="NVIDIA L40S", gpus=2, attested_digest=pin)
     assert ok.ok, ok.summary()
 
     # Same cache key, a pod with NO usable attestation → image_digest fails. If the
     # first call had mutated the cached gate, this would still carry the old pin.
-    bad = check(addr, "final", "lium", sku="NVIDIA L40S", gpus=2, attested_digest="")
+    bad = check(addr, "eval", "lium", sku="NVIDIA L40S", gpus=2, attested_digest="")
     assert "image_digest" in {c.name for c in bad.failures}
 
     # And the matching attestation still passes afterwards: the cache survived intact.
-    again = check(addr, "final", "lium", sku="NVIDIA L40S", gpus=2, attested_digest=pin)
+    again = check(addr, "eval", "lium", sku="NVIDIA L40S", gpus=2, attested_digest=pin)
     assert again.ok, again.summary()

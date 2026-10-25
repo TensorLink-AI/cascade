@@ -36,17 +36,27 @@ from ..shared.config import ChainConfig
 
 @dataclass(frozen=True)
 class VerifyReport:
-    """Empty ``failures`` means the generator would be accepted by the trainer."""
+    """A local report; only scope=full covers the full materialised corpus."""
 
     ok: bool
     failures: list[tuple[str, ValidationResult]] = field(default_factory=list)
     runtime_skipped: bool = False
     corpus_digest: str | None = None
+    scope: str = "full"
+
+    def to_dict(self) -> dict:
+        return {"ok": self.ok, "runtime_skipped": self.runtime_skipped, "scope": self.scope,
+                "corpus_digest": self.corpus_digest,
+                "failures": [{"step": step, "reason": r.reason, "details": r.details}
+                             for step, r in self.failures]}
 
     def render(self) -> str:
         lines = []
         if self.ok:
-            lines.append("OK: generator would be accepted by the trainer.")
+            lines.append("OK: static checks passed; output bounds and determinism remain unchecked."
+                         if self.runtime_skipped else
+                         "OK: quick checks passed; run full verify before submission."
+                         if self.scope == "quick" else "OK: full local verification passed under the selected generator policy.")
         else:
             lines.append("FAIL: generator would be rejected by the trainer:")
             for step, r in self.failures:
@@ -58,20 +68,48 @@ class VerifyReport:
         return "\n".join(lines)
 
 
+def _policy(cfg: ChainConfig, across_launch: bool):
+    from dataclasses import replace
+
+    base = cfg.generator_for_contract(cfg.screen_contract())
+    v2 = cfg.training.v2_contract
+    if not across_launch or v2 is None:
+        return base
+    after = cfg.generator_for_contract(v2)
+    return replace(base,
+                   min_channels=max(base.min_channels, after.min_channels),
+                   max_channels=min(base.max_channels, after.max_channels),
+                   min_length=max(base.min_length, after.min_length),
+                   max_length=min(base.max_length, after.max_length),
+                   max_memory_mb=min(base.max_memory_mb, after.max_memory_mb),
+                   max_generate_seconds=min(base.max_generate_seconds, after.max_generate_seconds))
+
+
 def verify_repo(
     repo_dir: Path | str,
     cfg: ChainConfig,
     *,
     skip_runtime: bool = False,
+    quick: bool = False,
+    across_launch: bool = False,
 ) -> VerifyReport:
-    """Run every check the trainer runs before training on a generator."""
+    """Run every check the trainer runs before training on a generator.
+
+    ``across_launch`` (offline, no contract bound) checks the intersection of
+    the base and ``[v2.training]`` policies: a pass is admissible whichever
+    side of the v2 launch trains the entry.
+    """
+    from dataclasses import replace
+
+    cfg = replace(cfg, generator=_policy(cfg, across_launch))
     d = Path(repo_dir)
+    scope = "quick" if quick else "static" if skip_runtime else "full"
     failures: list[tuple[str, ValidationResult]] = []
 
     layout = check_repo_layout(d)
     if not layout.ok:
         failures.append(("repo_layout", layout))
-        return VerifyReport(ok=False, failures=failures, runtime_skipped=skip_runtime)
+        return VerifyReport(ok=False, failures=failures, runtime_skipped=skip_runtime, scope=scope)
 
     size = check_repo_size(d, cfg.generator.max_repo_mb)
     if not size.ok:
@@ -104,14 +142,39 @@ def verify_repo(
         failures.append(("requirements", reqs))
 
     if failures or skip_runtime:
-        return VerifyReport(ok=not failures, failures=failures, runtime_skipped=skip_runtime)
+        return VerifyReport(ok=not failures, failures=failures, runtime_skipped=skip_runtime, scope=scope)
 
-    digest, runtime_err = _determinism_check(d, cfg)
+    digest, runtime_err = (_quick_determinism_check(d, cfg) if quick else _determinism_check(d, cfg))
     if runtime_err is not None:
         failures.append(("determinism", runtime_err))
-        return VerifyReport(ok=False, failures=failures)
+        return VerifyReport(ok=False, failures=failures, scope=scope)
 
-    return VerifyReport(ok=True, failures=[], runtime_skipped=False, corpus_digest=digest)
+    return VerifyReport(ok=True, failures=[], runtime_skipped=False, corpus_digest=digest,
+                        scope=scope)
+
+
+def _quick_determinism_check(repo_dir: Path, cfg: ChainConfig):
+    """Bounded child process: two small corpora, with the full output validators."""
+    import json
+    import subprocess
+    import sys
+    from dataclasses import asdict, replace
+
+    generator = replace(cfg.generator, corpus_target_points=65_536, corpus_n_series=128)
+    try:
+        run = subprocess.run(
+            [sys.executable, "-m", "cascade.miner.verify_worker"],
+            input=json.dumps({"repo": str(repo_dir.resolve()), "generator": asdict(generator)}),
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        doc = json.loads(run.stdout)
+        if run.returncode or not doc.get("ok"):
+            return None, ValidationResult.fail("corpus_check_failed", error=doc.get("error", "worker failed"))
+        return str(doc["digest"]), None
+    except subprocess.TimeoutExpired:
+        return None, ValidationResult.fail("runtime_timeout", seconds=30)
+    except (OSError, ValueError, KeyError) as exc:
+        return None, ValidationResult.fail("corpus_check_failed", error=str(exc))
 
 
 def _determinism_check(
@@ -120,11 +183,18 @@ def _determinism_check(
 ) -> tuple[str | None, ValidationResult | None]:
     """Build the corpus twice at a fixed seed and assert identical digests."""
     try:
-        from ..trainer.corpus import CorpusError, assert_corpus_reproducible
+        from ..trainer.corpus import CorpusError
+        from ..trainer.sandbox import run_in_sandbox
     except ImportError as e:
         return None, ValidationResult.fail("missing_runtime_dep", error=str(e))
     try:
-        digest = assert_corpus_reproducible(repo_dir, 0, cfg.generator)
+        first = run_in_sandbox(repo_dir, 0, cfg.generator, blocked=cfg.static_guard.blocked)
+        second = run_in_sandbox(repo_dir, 0, cfg.generator, blocked=cfg.static_guard.blocked)
+        if not first.n_series or not second.n_series:
+            raise CorpusError("generator produced no usable series")
+        if first.digest != second.digest:
+            raise CorpusError("generator is not deterministic")
+        digest = first.digest
     except CorpusError as e:
         return None, ValidationResult.fail("corpus_check_failed", error=str(e))
     return digest, None

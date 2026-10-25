@@ -332,10 +332,10 @@ def test_publish_and_read_receipt_keys():
     assert store.acls[key] == "public-read"
     assert store.acls["receipts/latest.json"] == "public-read"
     assert hippius.read_receipt(store, "42") == '{"round_id":"42"}'
-    assert hippius.read_latest_receipt(store) == '{"round_id":"42"}'
+    assert store.get_text(hippius.receipt_latest_key()) == '{"round_id":"42"}'
     # a second round moves latest but keeps the old round readable
     hippius.publish_receipt(store, '{"round_id":"43"}', "43")
-    assert hippius.read_latest_receipt(store) == '{"round_id":"43"}'
+    assert store.get_text(hippius.receipt_latest_key()) == '{"round_id":"43"}'
     assert hippius.read_receipt(store, "42") == '{"round_id":"42"}'
 
 
@@ -355,8 +355,8 @@ def test_publish_receipt_rejected_never_downgrades_scored_round():
     rejected = '{"round_id":"42","status":"rejected","reject_reason":"king_resyncing: x != y"}'
     assert hippius.publish_receipt(store, rejected, "42", validator_hotkey="5Val") == key
     assert store.objects[key] == scored                            # round key preserved
-    assert hippius.read_latest_receipt(store, "5Val") == scored    # latest keeps the verdict
-    assert hippius.read_latest_receipt(store) == scored            # shared pointer too
+    assert store.get_text(hippius.receipt_latest_key("5Val")) == scored    # latest keeps the verdict
+    assert store.get_text(hippius.receipt_latest_key()) == scored            # shared pointer too
 
     scored2 = '{"round_id":"42","status":"scored","king_hotkey":"5NewKing"}'
     hippius.publish_receipt(store, scored2, "42", validator_hotkey="5Val")
@@ -365,7 +365,7 @@ def test_publish_receipt_rejected_never_downgrades_scored_round():
     # a NEW round's rejection still publishes and moves latest (real information)
     rejected43 = '{"round_id":"43","status":"rejected","reject_reason":"signature_invalid"}'
     hippius.publish_receipt(store, rejected43, "43", validator_hotkey="5Val")
-    assert hippius.read_latest_receipt(store, "5Val") == rejected43
+    assert store.get_text(hippius.receipt_latest_key("5Val")) == rejected43
 
 
 def test_other_validators_reject_cannot_steal_shared_pointer():
@@ -380,13 +380,13 @@ def test_other_validators_reject_cannot_steal_shared_pointer():
 
     rejected = '{"round_id":"42","status":"rejected","reject_reason":"pool_pin_unverifiable"}'
     hippius.publish_receipt(store, rejected, "42", validator_hotkey="5ValB")
-    assert hippius.read_latest_receipt(store) == scored            # shared pointer kept
-    assert hippius.read_latest_receipt(store, "5ValB") == rejected  # own trail intact
+    assert store.get_text(hippius.receipt_latest_key()) == scored            # shared pointer kept
+    assert store.get_text(hippius.receipt_latest_key("5ValB")) == rejected  # own trail intact
     assert hippius.read_receipt(store, "42", "5ValB") == rejected
 
     rejected43 = '{"round_id":"43","status":"rejected","reject_reason":"signature_invalid"}'
     hippius.publish_receipt(store, rejected43, "43", validator_hotkey="5ValB")
-    assert hippius.read_latest_receipt(store) == rejected43        # new round moves it
+    assert store.get_text(hippius.receipt_latest_key()) == rejected43        # new round moves it
 
 
 def test_publish_receipt_namespaced_per_validator():
@@ -400,10 +400,10 @@ def test_publish_receipt_namespaced_per_validator():
     # no clobber: both per-validator receipts and latest pointers coexist
     assert hippius.read_receipt(store, "42", "5ValA") == '{"v":"A"}'
     assert hippius.read_receipt(store, "42", "5ValB") == '{"v":"B"}'
-    assert hippius.read_latest_receipt(store, "5ValA") == '{"v":"A"}'
-    assert hippius.read_latest_receipt(store, "5ValB") == '{"v":"B"}'
+    assert store.get_text(hippius.receipt_latest_key("5ValA")) == '{"v":"A"}'
+    assert store.get_text(hippius.receipt_latest_key("5ValB")) == '{"v":"B"}'
     # the shared pointer is last-writer-wins by design
-    assert hippius.read_latest_receipt(store) == '{"v":"B"}'
+    assert store.get_text(hippius.receipt_latest_key()) == '{"v":"B"}'
     # the legacy un-namespaced round key is never written by namespaced publishes
     assert "receipts/round-42.json" not in store.objects
     # everything audit-facing is world-readable

@@ -1,4 +1,4 @@
-"""Open-market funded rounds (owner 2026-09-20): GPU type chosen PER LEG across
+"""Open-market funded legs: GPU type chosen PER LEG across
 ``[round] funded_pod_skus`` under price caps, and a per-SKU latest safe start
 from the measured leg wall — a fast lane or executor may still start late.
 
@@ -242,11 +242,9 @@ def _open_runner(tmp_path, **kw):
 
 
 def test_skus_for_rent_is_the_locked_type_or_the_open_list(tmp_path):
-    r = _runner(tmp_path, funded_sku_per_leg=False)
-    r._funded_round_sku = "L40S"
+    r = _runner(tmp_path, sku="L40S", funded_sku_per_leg=False)
     assert r._funded_skus_for_rent() == ("L40S",)
     r = _open_runner(tmp_path)
-    r._funded_round_sku = ""
     assert r._funded_skus_for_rent() == ("RTX4090", "H100")
 
 
@@ -271,7 +269,7 @@ def test_per_sku_deadline_shifts_the_round_wide_one_by_the_wall_difference(tmp_p
 
 def test_skus_fitting_now_drops_types_past_their_own_latest_start(tmp_path):
     r = _open_runner(tmp_path)
-    r._funded_epoch_end_wall = 99.0                                 # epoch end known
+    r._leg_local = SimpleNamespace(end_wall=99.0)                   # the leg's target is known
     r._funded_rent_wait_deadline = lambda: 1000.0
     r._rent_wait_now = lambda: 999.0
     assert r._skus_fitting_now(("RTX4090", "H100")) == ("H100",)   # 4090 deadline was 1000-8400
@@ -279,25 +277,21 @@ def test_skus_fitting_now_drops_types_past_their_own_latest_start(tmp_path):
     assert r._skus_fitting_now(("RTX4090", "H100")) == ()
     # A locked round never filters (its single type; the wait decides).
     locked = _runner(tmp_path, funded_sku_per_leg=False)
-    locked._funded_epoch_end_wall = 99.0
+    locked._leg_local = SimpleNamespace(end_wall=99.0)
     locked._funded_rent_wait_deadline = lambda: 1000.0
     locked._rent_wait_now = lambda: 5000.0
     assert locked._skus_fitting_now(("RTX4090",)) == ("RTX4090",)
 
 
 def test_rolling_leg_target_bounds_the_sku_filter_and_the_lane_deadline(tmp_path):
-    # Rolling intake: no round-wide epoch end (None by design) and the stage
-    # context carries epoch_start_block=0 — the leg's OWN target boundary
-    # (thread-local end_wall) is the known end. Before this the filter let
-    # every type through and operator-lane waits were unbounded.
+    # The leg's OWN target boundary (thread-local end_wall) is the known end:
+    # without it the filter lets every type through and lane waits are
+    # unbounded.
     r = _open_runner(tmp_path)
     for name in ("_funded_rent_wait_deadline", "_operator_lane_deadline"):
         setattr(r, name, types.MethodType(getattr(TrainerRunner, name), r))
     r.FUNDED_PUBLISH_MARGIN_SECONDS = TrainerRunner.FUNDED_PUBLISH_MARGIN_SECONDS
     r._leg_local = SimpleNamespace(end_wall=None)                  # the real class's thread-local
-    r._rolling_sched = SimpleNamespace()                           # rolling intake is running
-    r._funded_epoch_end_wall = None
-    r._stage_ctx = {"round_id": "", "epoch_start_block": 0, "warm_start": None}
     r._rent_wait_now = lambda: 1000.0
     assert not r._funded_epoch_end_known()
     assert r._skus_fitting_now(("RTX4090", "H100")) == ("RTX4090", "H100")
@@ -355,13 +349,6 @@ def test_probe_capacity_carries_the_price_caps_to_the_operator_provider(tmp_path
     assert seen["H100"] == (1.6, (("RTX4090", 12000), ("H100", 3600)), 18000.0)
 
 
-def test_admission_skips_the_round_lock_in_per_leg_mode(tmp_path):
-    r = _open_runner(tmp_path, funded_capacity_probe=True)
-    r._funded_admission_cap = TrainerRunner._funded_admission_cap.__get__(r)
-    r._funded_round_sku = "stale"
-    r._probe_funded_capacity = lambda *a, **k: (_ for _ in ()).throw(AssertionError("no probe"))
-    r._funded_admission_cap()
-    assert r._funded_round_sku == "" and r._funded_admission_info["sku"] == "per-leg:RTX4090/H100"
 
 
 # ── lanes: per-lane SKU and the per-lane latest safe start ───────────────────
@@ -422,7 +409,7 @@ def test_lane_pool_unbounded_when_any_lane_has_no_deadline():
 def test_operator_lane_deadline_fn_is_per_lane_only_with_a_wall_table(tmp_path):
     r = _open_runner(tmp_path)
     r._operator_lane_deadline = TrainerRunner._operator_lane_deadline.__get__(r)
-    r._funded_epoch_end_wall = 99.0
+    r._leg_local = SimpleNamespace(end_wall=99.0)
     r._funded_rent_wait_deadline = lambda: 1000.0
     fn = r._operator_lane_deadline_fn()
     assert callable(fn)
@@ -431,8 +418,8 @@ def test_operator_lane_deadline_fn_is_per_lane_only_with_a_wall_table(tmp_path):
     assert fn(_host("z")) == 1000.0 - (18000 - 3600)                 # unknown lane: contract cap
     flat = _runner(tmp_path, funded_sku_per_leg=False, funded_sku_wall_seconds=())
     flat._operator_lane_deadline = TrainerRunner._operator_lane_deadline.__get__(flat)
-    flat._funded_epoch_end_wall = 99.0
+    flat._leg_local = SimpleNamespace(end_wall=99.0)
     flat._funded_rent_wait_deadline = lambda: 1000.0
     assert flat._operator_lane_deadline_fn() == 1000.0
-    del flat._funded_epoch_end_wall
+    flat._leg_local.end_wall = None
     assert flat._operator_lane_deadline_fn() is None

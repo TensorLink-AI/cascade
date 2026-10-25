@@ -127,7 +127,10 @@ class _TimedStream:
 #                   earlier compounding-lineage sketch (scaling-ladder E2);
 #                   superseded by wsd (warmup-once + optimizer continuity)
 #                   but kept as a valid contract value.
-LR_SCHEDULES = ("warmup_cosine", "wsd", "warmup_flat")
+#   warmup_linear — linear warmup then LINEAR decay to 0 over the budget. Only
+#                   the lane-C fine-tune recipe (DEC-CA-0056, ``schedule =
+#                   "linear"``) selects it; no shipped contract does.
+LR_SCHEDULES = ("warmup_cosine", "wsd", "warmup_flat", "warmup_linear")
 
 
 def _lr_at(token_pos: int, total: int, warmup: int, base_lr: float, *,
@@ -152,6 +155,8 @@ def _lr_at(token_pos: int, total: int, warmup: int, base_lr: float, *,
         return base_lr
     progress = (token_pos - warmup) / max(1, total - warmup)
     progress = min(1.0, max(0.0, progress))
+    if schedule == "warmup_linear":
+        return base_lr * (1.0 - progress)
     return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
@@ -314,6 +319,54 @@ def batch_points(vals: np.ndarray, denomination: str = "points") -> int:
         row = int(vals.shape[1]) * int(vals.shape[-1])
         return int(vals.shape[0]) * (-(-row * 100 // (100 + pct)))
     return int(vals.size)
+
+
+def crop_long_series(stream, *, window: int, seed: int):
+    """``[training] long_series = "crop"`` (DEC-CA-0053): cut every series
+    longer than ``window`` into ``ceil(L / window)`` windows of exactly
+    ``window`` steps, so a long stored trajectory trains instead of losing
+    everything before its last window.
+
+    Offsets are stratified: ``[0, L - window]`` splits into ``n`` equal strata
+    and one offset is drawn uniformly from each, ascending, so the windows
+    cover the whole trajectory (they may overlap; at most ``n - 1`` adjacent
+    pairs do). The draw is a pure function of ``(seed, series index)`` —
+    byte-reproducible for a given stream. A series no longer than ``window``
+    passes through untouched; a mask is cropped with its values and roles
+    ride along. Billing is unchanged: the stream already billed every point.
+    """
+    for i, series in enumerate(stream):
+        rec = series if isinstance(series, dict) else None
+        vals = np.atleast_2d(np.asarray(rec["values"] if rec else series))
+        n_len = int(vals.shape[-1])
+        if n_len <= window:
+            yield series
+            continue
+        n = -(-n_len // window)
+        span = n_len - window
+        rng = np.random.default_rng([int(seed) % (2**63), i])
+        edges = np.linspace(0, span, n + 1)
+        offs = [min(span, int(lo + rng.random() * (hi - lo)))
+                for lo, hi in zip(edges[:-1], edges[1:], strict=True)]
+        for o in offs:
+            win = vals[:, o:o + window]
+            if rec is None:
+                yield win
+                continue
+            out = dict(rec, values=win)
+            if rec.get("mask") is not None:
+                out["mask"] = np.atleast_2d(np.asarray(rec["mask"]))[:, o:o + window]
+            yield out
+
+
+def batch_source(stream, contract, *, patch_size: int, max_ctx_patches: int,
+                 seed: int):
+    """The series stream the batcher sees: unchanged under ``long_series =
+    "last"`` (every deployed config — the batcher keeps each series' last
+    window), cropped by :func:`crop_long_series` under ``"crop"``."""
+    if str(getattr(contract, "long_series", "last") or "last") != "crop":
+        return stream
+    return crop_long_series(stream, window=max_ctx_patches * patch_size, seed=seed)
 
 
 def iter_training_batches(stream, *, patch_size: int, max_ctx_patches: int,
@@ -503,7 +556,25 @@ class Toto2Trainer:
         out_dir: Path,
         logger: TrainLogger | None = None,
         warm_start_dir: Path | None = None,
+        expert_selection: dict | None = None,
+        continuation=None,
     ) -> TrainResult:
+        # DEC-CA-0050: one --trainer spec drives both architectures; the MoE
+        # recipe lives in moe_trainer and the toto2 path below is untouched.
+        if str(getattr(contract, "base_arch", "") or "") == "cascade_moe":
+            from .moe_trainer import train_moe
+
+            return train_moe(self, stream, contract, training_seed=training_seed,
+                             token_budget=token_budget, out_dir=out_dir, logger=logger,
+                             warm_start_dir=warm_start_dir,
+                             expert_selection=expert_selection, continuation=continuation)
+        if continuation is not None:
+            raise ValueError("continuation requires the qualified cascade_moe backend")
+        if expert_selection is not None:
+            raise ValueError("expert_selection (lane-B legs) requires base_arch='cascade_moe'")
+        from .moe_trainer import refuse_moe_knobs
+
+        refuse_moe_knobs(contract)
         import torch
 
         from .toto2_model import (
@@ -624,7 +695,7 @@ class Toto2Trainer:
         # less LR than a random one — measured, full base_lr costs +0.11
         # geomean on step 1 and the run never recovers, while the aligned
         # constants at base_lr×0.125 BEAT the init
-        # (docs/notes/2026-08-27-toto2-alignment.md). Scales the whole
+        # (DEC-CA-0035). Scales the whole
         # warm-started run, every schedule branch (the fork-anneal decays
         # from the scaled level too — one stable phase, one finished form);
         # a from-scratch generation start keeps full base_lr.
@@ -680,7 +751,9 @@ class Toto2Trainer:
         # future patches from one forward pass — targets stay unmasked.
         budget_denomination = getattr(contract, "budget_denomination", "points")
         for arr in iter_training_batches(
-            timed_stream, patch_size=cfg.patch_size, max_ctx_patches=max_ctx_patches,
+            batch_source(timed_stream, contract, patch_size=cfg.patch_size,
+                         max_ctx_patches=max_ctx_patches, seed=training_seed),
+            patch_size=cfg.patch_size, max_ctx_patches=max_ctx_patches,
             batch_size=contract.batch_size,
             batch_denomination=getattr(contract, "batch_denomination", "series"),
         ):

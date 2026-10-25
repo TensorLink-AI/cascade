@@ -2,7 +2,7 @@
 id: DEC-CA-0041
 type: decision
 title: "Multivariate scoring for the private-pool duel is GIFT-Eval-weighted (per-variate metric, a window counts ONCE with its channels averaged in) and lands eval-first: the round point statistic is made to agree with the source-cluster bootstrap, block-gated and bit-identical on the univariate pool"
-status: proposed
+status: accepted
 date: 2026-09-08
 tags: [scoring, koth, eval, multivariate, gift, consensus, pool]
 revisit_when: "before arming mv_score_from_block: the coupled-source count must be measured against the LCB-width requirement below (a realistic single-digit MV gain from ~3 coupled sources does NOT clear a 0.5% margin; ~12+ sources / ~38% pool share does), the settling ablation (DEC-CA-0026) must show MV training now HELPS the MV-aware eval, and WindowScoreRecord.channel serialization must be confirmed for audit replay; revisit the arithmetic-vs-geometric within-window combiner if the owner prefers geometric variate averaging; revisit if the eval pool stops being source-tagged (the cluster key, hence the N_eff argument, breaks)"

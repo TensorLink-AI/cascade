@@ -2,11 +2,12 @@
 id: DEC-CA-0037
 type: decision
 title: "Duel-only rounds on the operator's final fleet: no heat, the whole field seats in reveal order, the fleet sizes to the epoch, one block-gated flip with the scored horizon ladder"
-status: accepted
+status: superseded
+note: "Superseded by DEC-CA-0043. Boundary rounds on the operator final fleet are gone; the scored horizon ladder ([eval] scored_from_block) it armed is still live."
 date: 2026-09-03
 tags: [round, heat, duel, provisioner, eval, cadence]
 revisit_when: "the waiting queue grows for several consecutive rounds (raise the final pod ceiling or shorten the grid); or a round's manifest lands inside the last 2h of its epoch twice (the overhead constant or the waves-per-lane rule is wrong); or the 3h grid arms (one wave per round — the pod ceiling becomes the seat count); or a seated cohort's α/k bar is shown to block a genuine improvement the single-finalist rule would have crowned"
-relations: {builds_on: [DEC-CA-0012, DEC-CA-0008, DEC-CA-0003], retires_operationally: [DEC-CA-0006, DEC-CA-0011], related: [DEC-CA-0036]}
+relations: {supersedes: [DEC-CA-0006], builds_on: [DEC-CA-0012, DEC-CA-0008, DEC-CA-0003], retires_operationally: [DEC-CA-0006, DEC-CA-0011], related: [DEC-CA-0036]}
 ---
 
 From `[round] duel_from_block` (8992800 ≈ Fri 2026-09-04 08:30 UTC, an epoch
@@ -68,3 +69,5 @@ gate would have kept 10), and with no heat the seats are what spam takes.
 - Rollback of the duel-only half is `duel_from_block = 0` + a trainer
   restart; the ladder half cannot be rolled back unilaterally once past its
   block.
+
+Supersedes [[DEC-CA-0006]] (the heat screen it removed from the round).

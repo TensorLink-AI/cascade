@@ -1,4 +1,4 @@
-# Test + lint gate on every PR and push to main — the repo's FIRST automated
+# Test + lint gate on every PR and push to main or cascade-v2 — the repo's FIRST automated
 # test CI. Added after a mainnet chain.toml change (commit_floor_block) silently
 # broke ~23 round tests with nothing to catch it. Ruff is scoped to cascade/ +
 # tests/; the vendored base_generator/, benchmarks/, and scripts/ carry separate
@@ -8,7 +8,7 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, cascade-v2]
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -27,13 +27,22 @@ jobs:
           version: "0.13.4"
           enable-cache: true
 
+      - name: Check system TLS trust before Git dependency fetches
+        run: uv run --no-project --python 3.11 python scripts/check_tls_trust.py --system-only
+
       # --frozen: install exactly the pinned lock (the reproducibility contract);
       # --all-extras pulls torch so the full suite runs (torch tests otherwise skip).
       - name: Sync (frozen, all extras)
         run: uv sync --frozen --all-extras
 
+      - name: Check TLS trust
+        run: uv run --frozen python scripts/check_tls_trust.py
+
       - name: Lint (ruff — cascade + tests)
         run: uv run ruff check cascade tests
+
+      - name: Documentation interfaces and links
+        run: uv run python scripts/check_docs.py
 
       - name: Unit tests
         run: uv run pytest tests/unit -q

@@ -8,6 +8,7 @@ license = { text = "MIT" }
 authors = [{ name = "tensorlink-ai" }]
 
 dependencies = [
+    "certifi>=2026.10.19",
     "numpy>=1.26",
     "scipy>=1.11",
     "python-dotenv>=1.0",   # auto-load a gitignored .env (credentials) at CLI startup
@@ -49,6 +50,11 @@ pool-forge = [
     "pyyaml>=6.0",
     "pandas>=2.0",
 ]
+# CPU generation tier (DEC-CA-0053): parquet corpus shards. The CPU VM, the
+# orchestrator and every GPU pod that reads a `shards` corpus need this.
+generation = [
+    "pyarrow>=15.0",
+]
 # Ephemeral GPU-pod provisioner (deploy/provision.py). Shells out to the `lium`
 # CLI (installed separately) and calls the Shadeform REST API via requests.
 deploy = [
@@ -60,14 +66,49 @@ deploy = [
 wandb = [
     "wandb>=0.17",
 ]
+# MarketCast (DEC-CA-0064): the Timestral inference library the MAIN
+# validator (GPU scoring) and MarketCast training pods load the pinned
+# Timestral-28M base with. Not on PyPI: pinned to an exact commit of
+# github.com/mistralai/timestral (version 1.0.0, Apache-2.0 code; the model
+# weights are Modified-MIT with a revenue restriction). Needs torch from the
+# [train] extra (timestral requires torch>=2.4; the pin is 2.4.1).
+#   pip install -e ".[train,hippius,marketcast]"
+marketcast = [
+    "timestral @ git+https://github.com/mistralai/timestral.git@a534bdbd244d64f3d9d743f46c7bf6fc330ed4ff",
+    "huggingface_hub>=0.23",
+    "safetensors>=0.4",
+]
 chain = [
     # Bittensor stack pulled in only where needed (validator, trainer, miner CLI).
     # PINNED exactly: the timelock-reveal encoding differs across SDK lines —
     # v8-era set_reveal_commitment writes reveals the netuid's decoder cannot
     # read (raw bytes where hex is expected), so a miner on the wrong SDK
     # commits successfully yet is skipped every round ("non-hexadecimal
-    # number found in fromhex()"). 10.5.0 is what the trainer/validators run.
-    "bittensor==10.5.0",
+    # number found in fromhex()").
+    # 11.3.0 (DEC-CA-0051) is a ground-up rewrite with two silent traps that
+    # cascade/shared/chain.py routes around — do not "simplify" them away:
+    #  * reveal encoding: v11's high-level ``bittensor.timelock.encrypt()``
+    #    seals RAW UTF-8 (no SCALE compact-length prefix), so the netuid's
+    #    decoder strips a real byte and the miner is skipped every round.
+    #    The commit path uses ``bittensor_core.get_encrypted_commitment``
+    #    (byte-identical to 10.5's bittensor_drand) — never timelock.encrypt.
+    #  * stake: ``neurons.all(...).total_stake`` is NOT 10.5's ``metagraph.S``;
+    #    the DEC-CA-0045 activation tally reads
+    #    ``bittensor.metagraph.fetch(...).neurons[i].total_stake`` (== S).
+    # Weights are cast to float32 before the v11 u16 quantiser so vectors stay
+    # bit-identical with 10.5 validators.
+    "bittensor==11.3.0",
+    # 10.5 pulled requests in transitively; 11.x does not. The chain-holding
+    # services (trainer → cascade.provision.core's Lium/Shadeform REST calls,
+    # provisioner) import it lazily, so it is declared here and in [deploy].
+    "requests>=2.31",
+]
+
+# Satellite validator (DEC-CA-0058): replays the main validator's signed
+# receipts — storage + chain only, never the [train] extra (no torch).
+#   pip install -e ".[satellite]"   (== ".[hippius,chain]")
+satellite = [
+    "cascade[hippius,chain]",
 ]
 
 [project.scripts]
@@ -76,9 +117,11 @@ cascade-trainer = "cascade.trainer.main:main"
 cascade-provisioner = "cascade.provision.main:main"
 cascade-train-worker = "cascade.trainer.worker:main"
 cascade-validator = "cascade.validator.main:main"
+cascade-satellite = "cascade.validator.satellite:main"
 cascade-pool = "cascade.pool.cli:main"
 cascade-audit = "cascade.audit.main:main"
 cascade-intake = "cascade.funding.main:main"
+cascade-generate = "cascade.generation.cli:main"
 
 # Pin torch to a single CUDA build (cu124) so every worker/validator resolves the
 # SAME wheel regardless of the host's CUDA version — uv would otherwise auto-select
@@ -96,8 +139,17 @@ torch = { index = "pytorch-cu124" }
 requires = ["hatchling>=1.18"]
 build-backend = "hatchling.build"
 
+[tool.hatch.metadata]
+# the [marketcast] extra pins timestral by git commit (a direct reference)
+allow-direct-references = true
+
 [tool.hatch.build.targets.wheel]
 packages = ["cascade"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"chain.toml" = "cascade/data/chain.toml"
+"chain.testnet.toml" = "cascade/data/chain.testnet.toml"
+"docs/AGENT_MINING.md" = "cascade/data/AGENT_MINING.md"
 
 [tool.pytest.ini_options]
 minversion = "8.0"

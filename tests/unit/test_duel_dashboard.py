@@ -2,14 +2,11 @@
 
 Validator side: ``per_horizon`` / ``cohort_geomeans`` / ``cohort_per_horizon``
 ride the receipt (dropped from the canonical body when absent, so archived
-signatures survive) and the public index. Trainer side: a duel-only round's
-standings list every entrant as ``seated`` or ``waiting``. CLI: ``cascade
-heat`` and ``cascade duel`` render both.
+signatures survive) and the public index. CLI: ``cascade duel`` renders them.
 """
 
 from __future__ import annotations
 
-import json
 from dataclasses import replace
 
 import numpy as np
@@ -318,50 +315,7 @@ def test_validator_records_cohort_and_per_horizon(cfg):
     assert outcome.result.per_horizon is not None
 
 
-# ── trainer standings + dashboard ────────────────────────────────────────────
-
-
-def test_heat_status_marks_duel_only_and_counts_seated(cfg):
-    from cascade.shared.heat_status import build_heat_status, heat_summary
-    from cascade.shared.manifest import HeatEntrant, HeatResult
-
-    heat = HeatResult(screen_size="", finalists=2, entrants=(
-        HeatEntrant(uid=5, hotkey="hk5", gen_ref="a/b@sha256:" + "a" * 64, status="seated",
-                    rank=1, rel_score=None, p_best=None, crps=None, mase=None),
-        HeatEntrant(uid=9, hotkey="hk9", gen_ref="c/d@sha256:" + "c" * 64, status="waiting",
-                    rank=None, rel_score=None, p_best=None, crps=None, mase=None)))
-    doc = build_heat_status(heat, round_id="1", epoch_start_block=3600, as_of="now",
-                            screened=1, no_screen_reason="duel-only round", duel_only=True)
-    assert doc["duel_only"] is True and doc["no_screen_reason"] == "duel-only round"
-    assert [e["status"] for e in doc["entrants"]] == ["seated", "waiting"]
-    s = heat_summary(doc)
-    assert s["duel_only"] is True and s["n_advanced"] == 1 and s["n_entrants"] == 2
-    # a legacy doc is unchanged
-    legacy = build_heat_status(None, round_id="2", epoch_start_block=7200, as_of="now",
-                               no_screen_reason="fit the slots")
-    assert "duel_only" not in legacy and legacy["no_screen"] is True
-
-
-def test_render_heat_lists_seated_and_waiting():
-    from cascade.miner.dashboard import heat_block, heat_headline, render_heat
-
-    doc = {"schema": 1, "round_id": "9", "epoch_start_block": 3600, "as_of": "now",
-           "screened": 2, "screen_size": "", "finalists": 2, "duel_only": True,
-           "no_screen_reason": "duel-only round: 2 seated", "entrants": [
-               {"uid": 7, "hotkey": "hk-g", "gen_ref": "g/g@sha256:" + "0" * 64,
-                "status": "seated", "rank": 1},
-               {"uid": 3, "hotkey": "hk-c", "gen_ref": "c/c@sha256:" + "1" * 64,
-                "status": "seated", "rank": 2},
-               {"uid": 8, "hotkey": "hk-h", "gen_ref": "h/h@sha256:" + "2" * 64,
-                "status": "waiting"}],
-           "leader_lcb": None, "n_windows": None, "n_clusters": None}
-    assert heat_headline(doc).startswith("duel-only round — 2 seated")
-    assert "1 waiting" in heat_headline(doc)
-    lines = heat_block(doc, me="hk-h")
-    assert any("seated — duels the king" in ln and "uid    7" in ln for ln in lines)
-    assert any("waiting — next round" in ln and "← you" in ln for ln in lines)
-    text = render_heat(doc)
-    assert "duel-only" in text and "advancing" not in text
+# ── dashboard ─────────────────────────────────────────────────────────────────
 
 
 def test_render_duel_shows_horizons_and_the_whole_cohort():
@@ -484,23 +438,3 @@ def test_render_duel_domain_history_is_the_per_miner_trend():
     assert "pass --hotkey" in render_duel_domain_history(doc, "")
 
 
-def test_trainer_publishes_seated_and_waiting_entrants(cfg, tmp_path, monkeypatch):
-    from tests.unit.test_duel_only_rounds import _field, _runner, _screen_must_not_run, _Store
-
-    duel_cfg = replace(cfg, round=replace(cfg.round, max_finalists=1, finalists=1,
-                                          duel_from_block=1000, duel_field_cap=2,
-                                          epoch_blocks_prev=0, epoch_activation_block=0))
-    store = _Store()
-    runner = _runner(duel_cfg, tmp_path, monkeypatch, publish_stage_status=True,
-                     screen_fn=_screen_must_not_run)
-    runner._manifest_store = store
-    runner.run_round(_field(), king_hotkey="a", base_seed=1, block=5000)
-    doc = json.loads(store.objects["status/heat.json"])
-    assert doc["duel_only"] is True
-    assert [(e["uid"], e["status"], e.get("rank")) for e in doc["entrants"]] == [
-        (2, "seated", 1), (1, "seated", 2), (3, "waiting", None)]
-    assert doc["finalists"] == 2
-    idx = json.loads(store.objects["heats/index.json"])
-    assert idx["heats"][0]["duel_only"] is True and idx["heats"][0]["n_advanced"] == 2
-    with pytest.raises(KeyError):
-        _ = doc["no_screen"]        # a duel-only doc is not a "no screen" doc

@@ -3,7 +3,11 @@
 A self-contained cascade data generator that adapts a curated subset of
 [TempoPFN](https://github.com/automl/TempoPFN)'s procedural synthetic time-series
 priors into a single deterministic `Generator(DataGenerator)`. Intended as the
-launch/genesis king for the cascade subnet.
+original v1 launch/genesis king for the cascade subnet.
+
+This historical source can emit fewer than 8 channels. New v2 submissions
+require **8–32 channels in every yield**; start with `cascade init` for a
+compliant template. The archived generator remains unchanged for replay.
 
 ## What's inside
 
@@ -24,8 +28,8 @@ drawn at `generate_length` (4096) and deterministically random-cropped into the
 `[min_length, max_length]` band for length diversity.
 
 The GP/kernel family — **GP-prior** (gpytorch), **KernelSynth** (scikit-learn)
-and **CauKer** (networkx + scikit-learn) — was added in v2: those deps are now
-on cascade's allowlist (`chain.toml [dependencies]`). The TempoPFN ablation
+and **CauKer** (networkx + scikit-learn) — draws only on deps from
+cascade's allowlist (`chain.toml [dependencies]`). The TempoPFN ablation
 shows this family carries a large share of the downstream signal. CauKer is
 multivariate (an SCM DAG of GP-prior nodes); each channel is flattened into its
 own univariate series so the emitted corpus stays 1-D. Its upstream GPU

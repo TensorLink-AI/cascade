@@ -12,6 +12,27 @@ eval pool.
   ``pool/index.json`` so every validator pulls the same snapshot for a round —
   no ``chain.toml`` edit. Run it from the owner orchestrator's daily cron.
 
+* Lane C has no pool of its own (MarketCast-only lane C, owner 2026-10-20):
+  the DEC-CA-0056 ``--lane c`` public-feed ``pool_c`` is retired — its
+  targets (the last horizon of public series) could be scraped and memorised.
+
+* ``cascade-pool publish --lane mkt`` (DEC-CA-0064) — the MarketCast
+  snapshot: the last ``[marketcast] snapshot_days`` of realized 1-minute
+  bars for every configured asset (Hyperliquid primary, Binance spot
+  cross-check for crypto, recorded dTAO alpha samples), signed with the main
+  validator's hotkey (``--wallet-name`` / ``--wallet-hotkey``) and published
+  under ``[marketcast] pool_prefix``. Validators never call a feed; they read
+  this snapshot. ``cascade-pool reveal --lane mkt`` mirrors retired ones;
+  ``cascade-pool mkt-record-alpha --out <file>`` appends one live sample per
+  configured subnet (cron it every minute on the box holding chain access)::
+
+      */1 * * * *  cascade-pool mkt-record-alpha --out /srv/cascade/alpha.jsonl
+      */5 * * * *  cascade-pool mkt-record --store /srv/cascade/bars
+      30 */6 * * * cascade-pool publish --lane mkt --alpha-rows /srv/cascade/alpha.jsonl \
+                       --bar-store /srv/cascade/bars \
+                       --wallet-name owner --wallet-hotkey main
+      50 5 * * *   cascade-pool reveal  --lane mkt --hf-repo <org>/cascade-eval-pool
+
 * ``cascade-pool sources`` — list the registered sources.
 
 Window geometry (``context_length`` / ``horizon``) defaults to ``[eval]`` in
@@ -56,9 +77,6 @@ def _add_build_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--horizon", type=int, default=None, help="Override [eval] horizon.")
     p.add_argument("--min-context", type=int, default=256, help="Minimum context a kept window affords.")
     p.add_argument("--max-missing-frac", type=float, default=0.2, help="Drop series gappier than this.")
-    p.add_argument("--no-data-sentinel", type=float, action="append", default=None,
-                   help="Numeric no-data code counted as missing (repeatable). "
-                        "Default: -999999 (USGS NWIS). Pass --no-data-sentinel nan to disable.")
     p.add_argument("--mv-pack", action="store_true",
                    help="DEC-CA-0041: pack each tagged source's mv_channels into one "
                         "(C, L) multivariate series (else project to the first channel). "
@@ -74,6 +92,24 @@ def _add_build_args(p: argparse.ArgumentParser) -> None:
         "can't crowd out that domain's daily series.",
     )
     p.add_argument("--max-series-total", type=int, default=None)
+    p.add_argument(
+        "--require-domain",
+        action="store_true",
+        help="v2 primary pool (DEC-CA-0050): drop series with no domain label "
+        "('unknown'/empty) — lane B judges per domain.",
+    )
+    p.add_argument(
+        "--require-source",
+        action="store_true",
+        help="Drop series with no upstream feed id (the cluster-bootstrap key).",
+    )
+    p.add_argument(
+        "--min-series-per-domain",
+        type=int,
+        default=None,
+        help="DEC-CA-0032 capacity floor: refuse to write a pool where any labeled "
+        "domain holds fewer series than this (v2 primary pool: 300).",
+    )
     p.add_argument(
         "--max-series-per-source",
         type=int,
@@ -92,16 +128,39 @@ def _add_build_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--selection",
         choices=("first", "balanced"),
-        default="first",
+        default=None,
         help="Who wins a capped slot: 'first' = harvest order (catalog order decides); "
         "'balanced' = seeded round-robin across sources, plus a seeded per-feed panel "
         "sample. Seed: --selection-seed, else the snapshot's effective block (publish) "
-        "or --as-of date (build).",
+        "or --as-of date (build). Default: 'first'.",
     )
     p.add_argument("--selection-seed", default=None,
                    help="Override the balanced-selection seed (recorded in provenance.json).")
     p.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
     p.add_argument("--timeout", type=float, default=30.0, help="Per-request HTTP timeout (s).")
+    _add_lane_args(p)
+
+
+def _add_lane_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--lane", choices=("a", "mkt"), default="a",
+                   help="Which eval pool: 'a' = the lane-A pool (pool/…); 'mkt' = the "
+                        "DEC-CA-0064 MarketCast snapshot ([marketcast] pool_prefix), lane "
+                        "C's only competition.")
+    p.add_argument("--prefix", default=None,
+                   help="Pool key prefix in the bucket (default: 'pool' for --lane a, "
+                        "[marketcast] pool_prefix for --lane mkt).")
+
+
+def pool_prefix(args: argparse.Namespace, cfg) -> str:
+    """The bucket key prefix this invocation publishes / reveals under."""
+    from ..shared.hippius import POOL_PREFIX
+
+    if getattr(args, "prefix", None):
+        return str(args.prefix).strip().strip("/")
+    if getattr(args, "lane", "a") == "mkt":
+        return str(getattr(getattr(cfg, "marketcast", None), "pool_prefix", "pool_mkt")
+                   or "pool_mkt")
+    return POOL_PREFIX
 
 
 def _add_build(sub: argparse._SubParsersAction) -> None:
@@ -142,12 +201,164 @@ def _add_publish(sub: argparse._SubParsersAction) -> None:
         default=1,
         help="With --effective-block auto, how many epochs ahead to activate (default 1).",
     )
-    p.add_argument("--max-keep", type=int, default=14, help="Snapshots to retain in the index.")
+    p.add_argument("--max-keep", type=int, default=60, help="Snapshots to retain in the index.")
     _add_build_args(p)
     p.add_argument("--no-mv-pack", action="store_true",
                    help="Force multichannel packing OFF even when effective_block is past "
                         "[scoring] mv_score_from_block (default: pack iff at/past the flip).")
+    _add_mkt_args(p)
     p.set_defaults(func=_cmd_publish)
+
+
+def _add_mkt_args(p: argparse.ArgumentParser) -> None:
+    """``--lane mkt`` (DEC-CA-0064) options."""
+    p.add_argument("--alpha-rows", type=Path, default=None,
+                   help="--lane mkt: the dTAO alpha recorder file (mkt-record-alpha).")
+    p.add_argument("--bar-store", type=Path, default=None,
+                   help="--lane mkt: the forward bar recording (mkt-record); REQUIRED — "
+                        "Hyperliquid serves only ~3.6 days of 1m candles.")
+    p.add_argument("--allow-cold", action="store_true",
+                   help="--lane mkt: build minute bars from the API alone (testing only: "
+                        "everything older than ~3.6 days is missing).")
+    p.add_argument("--anchor-block", type=int, default=None,
+                   help="--lane mkt: chain block at publish time (default: read the head).")
+    p.add_argument("--wallet-name", default=None, help="--lane mkt: signer wallet (main validator).")
+    p.add_argument("--wallet-hotkey", default=None, help="--lane mkt: signer hotkey.")
+    p.add_argument("--wallet-path", default=None, help="--lane mkt: wallet directory.")
+    p.add_argument("--snapshot-days", type=int, default=None,
+                   help="--lane mkt: override [marketcast] snapshot_days.")
+
+
+def _add_record_bars(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("mkt-record",
+                       help="DEC-CA-0064 (review M15): record closed Hyperliquid 1m bars + "
+                            "funding forward into the bar store publish --lane mkt reads.")
+    p.add_argument("--store", type=Path, required=True, help="Bar store directory.")
+    p.add_argument("--lookback-hours", type=float, default=48.0,
+                   help="Re-fetch window per pass (default 48; <= ~83 h, the API's 5000-candle "
+                        "1m depth).")
+    p.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
+    p.set_defaults(func=_cmd_record_bars)
+
+
+def _cmd_record_bars(args: argparse.Namespace) -> int:  # pragma: no cover — network glue
+    import time
+
+    from .marketcast_feeds import http_post_json
+    from .marketcast_store import MktBarStore, record_once
+
+    cfg = load_chain_config(args.chain_toml)
+    got = record_once(MktBarStore(args.store), cfg.marketcast, post=http_post_json,
+                      now=time.time(), lookback_minutes=int(args.lookback_hours * 60))
+    bad = {k: v for k, v in got.items() if isinstance(v, str)}
+    print(f"recorded {sum(v for v in got.values() if isinstance(v, int))} minute(s) over "
+          f"{len(got) - len(bad)} asset(s) → {args.store}; {len(bad)} failed")
+    for k, v in sorted(bad.items())[:10]:
+        print(f"  {k}: {v}", file=sys.stderr)
+    return 0 if got and not bad else (1 if not got or len(bad) == len(got) else 0)
+
+
+def _add_record_alpha(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("mkt-record-alpha",
+                       help="DEC-CA-0064: append one live dTAO pool sample per configured subnet.")
+    p.add_argument("--out", type=Path, required=True, help="JSON-lines recorder file.")
+    p.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
+    p.add_argument("--network", default="finney")
+    p.set_defaults(func=_cmd_record_alpha)
+
+
+def _cmd_record_alpha(args: argparse.Namespace) -> int:  # pragma: no cover — chain
+    from ..shared.chain import ChainClient
+    from .marketcast_feeds import alpha_netuid, append_alpha_row, read_alpha_state
+
+    cfg = load_chain_config(args.chain_toml)
+    client = ChainClient.from_config(cfg, network=args.network)
+    n = 0
+    for asset in cfg.marketcast.assets_map.get("alpha", ()):
+        row = read_alpha_state(client, alpha_netuid(asset))
+        if row is not None:
+            append_alpha_row(args.out, row)
+            n += 1
+    print(f"recorded {n} alpha sample(s) → {args.out}")
+    return 0
+
+
+def _cmd_publish_mkt(args: argparse.Namespace, cfg) -> int:
+    """``publish --lane mkt``: build, sign and publish the MarketCast snapshot."""
+    import shutil
+    import time
+
+    from ..shared.hippius import StorageError, pack_dir_to_tar, pool_s3_store, publish_pool_snapshot
+    from .marketcast import build_snapshot
+    from .marketcast_feeds import http_get_json, http_post_json, load_alpha_rows
+
+    mc = cfg.marketcast
+    store = None
+    if getattr(args, "bar_store", None) is not None:
+        from .marketcast_store import MktBarStore
+
+        store = MktBarStore(args.bar_store)
+    elif not getattr(args, "allow_cold", False):
+        print("error: --lane mkt needs --bar-store (the mkt-record recording): Hyperliquid "
+              "serves only ~3.6 days of 1m candles, so a cold build misses most of the "
+              f"{int(args.snapshot_days or mc.snapshot_days)}-day grid (--allow-cold to "
+              "force)", file=sys.stderr)
+        return 2
+    try:
+        effective_block = _resolve_effective_block(args, cfg)
+    except Exception as e:  # noqa: BLE001
+        print(f"error: could not resolve --effective-block: {e}", file=sys.stderr)
+        return 2
+    wallet, signer = None, ""
+    if args.wallet_name and args.wallet_hotkey:
+        from ..shared.chain import open_wallet
+
+        wallet = open_wallet(args.wallet_name, args.wallet_hotkey, args.wallet_path)
+        signer = str(wallet.hotkey.ss58_address)
+        if cfg.netconfig.owner_hotkey and signer != cfg.netconfig.owner_hotkey:
+            print(f"error: signer {signer} is not [netconfig] owner_hotkey "
+                  f"{cfg.netconfig.owner_hotkey}: validators would refuse the snapshot",
+                  file=sys.stderr)
+            return 2
+    else:
+        print("warning: no --wallet-name/--wallet-hotkey: the snapshot is UNSIGNED and every "
+              "validator will refuse it", file=sys.stderr)
+    anchor_block = args.anchor_block
+    if anchor_block is None:
+        from ..shared.chain import ChainClient
+
+        anchor_block = int(ChainClient.from_config(cfg).current_block())
+    now = time.time()
+    rows: dict = {}
+    if args.alpha_rows is not None:
+        for r in load_alpha_rows(args.alpha_rows):
+            rows.setdefault(int(r.netuid), []).append(r)
+    shutil.rmtree(args.out, ignore_errors=True)
+    args.out.mkdir(parents=True, exist_ok=True)
+    meta = build_snapshot(args.out, mc, end_time=now, anchor_block=int(anchor_block),
+                          anchor_time=now, post=http_post_json, get=http_get_json,
+                          alpha_rows=rows, wallet=wallet, signer=signer,
+                          days=args.snapshot_days, store=store)
+    n_assets = sum(len(v) for v in meta["assets"].values())
+    print(f"marketcast snapshot: {n_assets} asset(s), {meta['minutes']} minutes from "
+          f"t0={meta['t0']} signed={bool(meta.get('signature'))}")
+    if not n_assets:
+        print("build failed: no asset answered", file=sys.stderr)
+        return 1
+    try:
+        tar_bytes = pack_dir_to_tar(args.out)
+        store = pool_s3_store(cfg.storage)
+        pub = publish_pool_snapshot(
+            store, tar_bytes, effective_block=effective_block,
+            as_of=time.strftime("%Y-%m-%d", time.gmtime(now)), n_series=n_assets,
+            context_length=int(mc.eval_context_length), horizon=0, max_keep=args.max_keep,
+            prefix=pool_prefix(args, cfg))
+    except StorageError as e:
+        print(f"pool publish failed: {e}", file=sys.stderr)
+        return 4
+    print(f"published MarketCast snapshot {pub.key} effective_block={pub.effective_block} "
+          f"sha256={pub.sha256[:16]}…")
+    return 0
 
 
 def _add_reveal(sub: argparse._SubParsersAction) -> None:
@@ -166,6 +377,7 @@ def _add_reveal(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--max-reveal", type=int, default=6, help="Upload at most N per run.")
     p.add_argument("--out", type=Path, default=Path("./_reveal_stage"), help="Local staging dir.")
     p.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
+    _add_lane_args(p)
     p.set_defaults(func=_cmd_reveal)
 
 
@@ -186,6 +398,7 @@ def _cmd_reveal(args: argparse.Namespace) -> int:
 
     try:
         store = pool_s3_store(cfg.storage)
+        prefix = pool_prefix(args, cfg)
         n = reveal_snapshots(
             store,
             args.hf_repo,
@@ -193,6 +406,7 @@ def _cmd_reveal(args: argparse.Namespace) -> int:
             keep_newest=args.keep_newest,
             max_reveal=args.max_reveal,
             work_dir=args.out,
+            **({"prefix": prefix} if prefix != "pool" else {}),
         )
     except StorageError as e:
         print(f"reveal failed: {e}", file=sys.stderr)
@@ -225,7 +439,7 @@ def _build(args: argparse.Namespace, cfg, *, out_dir: Path, overwrite: bool):
         for src in sources:
             if hasattr(src, "mv_pack"):   # tsbench_forge packs mv_channels to (C, L)
                 src.mv_pack = True
-    selection = getattr(args, "selection", "first") or "first"
+    selection = getattr(args, "selection", None) or "first"
     seed = ""
     if selection == "balanced":
         seed = (getattr(args, "selection_seed", None)
@@ -246,10 +460,12 @@ def _build(args: argparse.Namespace, cfg, *, out_dir: Path, overwrite: bool):
         horizon=horizon,
         min_context=args.min_context,
         max_missing_frac=args.max_missing_frac,
-        no_data_sentinels=_no_data_sentinels(getattr(args, "no_data_sentinel", None)),
         max_series_per_domain=args.max_series_per_domain,
         max_series_per_domain_freq=args.max_series_per_domain_freq,
         max_series_total=args.max_series_total,
+        require_domain=bool(getattr(args, "require_domain", False)),
+        require_source=bool(getattr(args, "require_source", False)),
+        min_series_per_domain=getattr(args, "min_series_per_domain", None),
         max_channels=int(getattr(args, "max_channels", 1) or 1),
         selection=selection,
         selection_seed=seed,
@@ -257,14 +473,6 @@ def _build(args: argparse.Namespace, cfg, *, out_dir: Path, overwrite: bool):
     return build_pool(
         sources, out_dir, ctx, build_cfg, fetch=HttpFetcher(timeout=args.timeout), overwrite=overwrite
     )
-
-
-def _no_data_sentinels(values: list[float] | None) -> tuple[float, ...]:
-    """CLI ``--no-data-sentinel`` → ``PoolBuildConfig.no_data_sentinels``:
-    unset keeps the builder default; ``nan`` alone disables the mapping."""
-    if values is None:
-        return PoolBuildConfig().no_data_sentinels
-    return tuple(float(v) for v in values if v == v)   # drop NaN (the "disable" token)
 
 
 def _warn_if_small(summary, cfg) -> None:
@@ -329,6 +537,8 @@ def _cmd_publish(args: argparse.Namespace) -> int:
     if not cfg.storage.pool_bucket:
         print("error: [storage] pool_bucket is empty; set it before publishing.", file=sys.stderr)
         return 2
+    if getattr(args, "lane", "a") == "mkt":
+        return _cmd_publish_mkt(args, cfg)
 
     from ..shared.hippius import (
         StorageError,
@@ -352,7 +562,11 @@ def _cmd_publish(args: argparse.Namespace) -> int:
     print(f"mv-pack: {'ON' if pack else 'off'} ({why}); max_channels={getattr(args, 'max_channels', 1)}")
     # Balanced selection draws from the snapshot's own effective block, so every
     # snapshot rotates its sample and the seed is recoverable from the index.
-    args._selection_seed_default = f"block:{effective_block}"
+    # A pool under another --prefix seeds its own draw: its windows never
+    # mirror the main pool's.
+    prefix = pool_prefix(args, cfg)
+    args._selection_seed_default = (f"block:{effective_block}" if prefix == "pool"
+                                    else f"{prefix}:block:{effective_block}")
 
     try:
         summary = _build(args, cfg, out_dir=args.out, overwrite=True)
@@ -378,13 +592,15 @@ def _cmd_publish(args: argparse.Namespace) -> int:
             context_length=summary.context_length,
             horizon=summary.horizon,
             max_keep=args.max_keep,
+            **({"prefix": prefix} if prefix != "pool" else {}),
         )
     except StorageError as e:
         print(f"pool publish failed: {e}", file=sys.stderr)
         return 4
 
     print(
-        f"\npublished snapshot to {cfg.storage.pool_bucket}: {meta.key}\n"
+        f"\npublished {prefix}/ snapshot to "
+        f"{cfg.storage.pool_bucket}: {meta.key}\n"
         f"  effective_block={meta.effective_block} sha256={meta.sha256[:16]}… "
         f"size={meta.size_bytes:,} series={meta.n_series}"
     )
@@ -440,13 +656,19 @@ def main(argv: list[str] | None = None) -> int:
     from ..shared.env import load_env_files
     load_env_files()
     parser = argparse.ArgumentParser(
-        prog="cascade-pool", description="Build the held-out eval pool for cascade validators."
+        prog="cascade-pool", description="Build the held-out eval pool for cascade validators.",
+        epilog="Daily cron (owner orchestrator): `cascade-pool publish` (lane A) and, once "
+               "[marketcast] from_block is typed, `cascade-pool publish --lane mkt` (lane C's "
+               "MarketCast snapshot); `cascade-pool reveal [--lane mkt]` mirrors retired "
+               "snapshots.",
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
     _add_build(sub)
     _add_publish(sub)
     _add_reveal(sub)
     _add_sources(sub)
+    _add_record_alpha(sub)
+    _add_record_bars(sub)
     args = parser.parse_args(argv)
     return int(args.func(args))
 

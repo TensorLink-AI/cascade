@@ -89,8 +89,15 @@ jobs:
         with:
           python-version: "3.11"
 
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.13.4"
+
       - name: Install cascade (hippius extra)
-        run: pip install -e ".[hippius]"
+        run: |
+          python scripts/check_tls_trust.py --system-only
+          uv pip install --system --python "$(which python)" "pip==26.2.2" -e ".[hippius]"
+          python scripts/check_tls_trust.py
 
       - name: Scrape kings → private R2 archive
         env:

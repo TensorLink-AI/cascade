@@ -219,7 +219,6 @@ def test_king_fresh_rent_is_gated_by_the_floor(tmp_path, monkeypatch):
     from cascade.provision import funded as funded_mod
 
     r = _runner(tmp_path, funded_king_rent=True, funded_host_bench_floor=FLOOR)
-    r._funded_round_sku = "RTX4090"
     r._rent_wait_now = lambda: 0.0                  # far before the latest safe start ⇒ retry
     r._rent_wait_sleep = lambda s: None
     verdicts = ["slow host: calibration bench 393,688,673 tokens/s < floor 450,000,000 for RTX4090", ""]

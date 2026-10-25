@@ -3,6 +3,7 @@ id: DEC-CA-0014
 type: decision
 title: "From-scratch signal survives the warm-start era: shadow control first, reseed valve second, a second throne only on divergent-winners evidence"
 status: active
+note: "Stage 1 (scratch shadow) rode the legacy post-publish bench, never ran under rolling intake, and was removed. Stages 2-3 are unbuilt."
 date: 2026-08-10
 tags: [cascade, warm-start, koth, control, incentives, staging]
 revisit_when: "Stage-1 shadow data exists for ≥2 promotion generations: if the scratch-vs-lineage gap is closing (or closed), arm the Stage-2 reseed valve and re-examine the lineage; if scratch rounds and warm rounds would have crowned DIFFERENT generators repeatedly, open the Stage-3 two-throne design; if the gap compounds steadily and winners coincide, stay at Stage 1 and re-check a generation later"
@@ -40,7 +41,7 @@ manifest entry, never handed to `promotion.record_bench`. The remote leg
 drives the PINNED worker image's existing CLI, so it ships trainer-side
 unilaterally (no image re-pin). STATUS: testnet armed at M=2
 (`chain.testnet.toml`) for the one-cycle validation in
-`docs/SCRATCH_SHADOW.md`; mainnet stays 0 until that passes and the owner
+the scratch-shadow runbook (retired; in git history before cleanup/sweep); mainnet stays 0 until that passes and the owner
 arms M=4.
 
 **Stage 2 — cross-band reseed valve (arm when the gap closes).** Scratch

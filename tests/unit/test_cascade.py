@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import math
 
+import pytest
+
 from cascade.validator.cascade import (
     BLOCKS_PER_DAY,
     CascadeController,
@@ -323,10 +325,13 @@ def test_load_state_missing_file_is_fresh(tmp_path):
     assert load_state(tmp_path / "nope.json") == CascadeState()
 
 
-def test_load_state_corrupt_file_is_fresh(tmp_path):
+def test_load_state_corrupt_file_refuses(tmp_path):
+    from cascade.validator.cascade import CascadeStateUnreadable
+
     p = tmp_path / "bad.json"
     p.write_text("{not json", encoding="utf-8")
-    assert load_state(p) == CascadeState()
+    with pytest.raises(CascadeStateUnreadable):
+        load_state(p)
 
 
 # ── config toggle: warm-start on/off ─────────────────────────────────────────

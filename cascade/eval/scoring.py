@@ -10,14 +10,14 @@ denominator separately so a bag can aggregate before dividing, and so the
 aggregation rule stays a choice made at scoring time rather than baked into
 the per-window record.
 
-On GIFT-Eval alignment (this used to say the opposite — see DEC-CA-0009).
+On GIFT-Eval alignment (DEC-CA-0009).
 The gluonts ``MeanWeightedSumQuantileLoss`` is a pooled ratio
 ``sum QL_q / sum |y|``, and GIFT-Eval applies it WITHIN one dataset/freq/term
 config, where the scale is homogeneous. It then aggregates ACROSS its 97
-configs with a *geometric mean* of Seasonal-Naive-normalised values. We had
-collapsed those two layers into one: the pooled ratio applied to the whole
-heterogeneous pool. Over ~15 orders of magnitude that made three feeds 100%
-of the denominator. The current rule — a geometric mean of per-window WQL —
+configs with a *geometric mean* of Seasonal-Naive-normalised values. The
+legacy rule collapsed those two layers into one: the pooled ratio applied to
+the whole heterogeneous pool. Over ~15 orders of magnitude that made three
+feeds 100% of the denominator. The current rule — a geometric mean of per-window WQL —
 is the analogue of GIFT-Eval's *outer* layer, which is the one that carries
 the cross-scale aggregation.
 """
@@ -306,14 +306,12 @@ def global_geomean(scores: list[WindowScore], wql_mode: str = "geomean") -> floa
 
     Deliberately the SAME functional form as one bootstrap bag
     (:func:`cascade.eval.bootstrap._bag_geomeans`) evaluated on the identity
-    resample, so this is exactly the quantity the LCB is a bound on, and the
-    heat screen (which ranks on it) selects on the same metric the duel judges.
+    resample, so this is exactly the quantity the LCB is a bound on.
     Both halves are geometric means over windows.
 
     Both halves aggregate in log space for the same reason: per-window ratios
     are heavy-tailed, and an arithmetic mean lets a single exploding window
-    dominate the aggregate. That bites hardest in the heat, which screens on a
-    fraction of the windows and samples the final does.
+    dominate the aggregate.
 
     ``wql_mode`` selects the CRPS-family half and exists ONLY so that archived
     receipts stay verifiable:
@@ -340,10 +338,8 @@ def global_components(
     """The two components behind :func:`global_geomean`, ``(crps, mase)``, before
     they are combined into the geomean: ``crps`` is the round-level CRPS-family
     loss and ``mase`` is the *geometric* mean MASE — the same aggregation
-    :func:`global_geomean` uses, so ``sqrt(crps * mase)`` reproduces the geomean
-    the heat ranks on. NaN-safe — an empty list returns ``(nan, nan)``. Used by
-    the heat screener to report a challenger's raw error components, not just
-    the geomean. See :func:`global_geomean` for ``wql_mode``."""
+    :func:`global_geomean` uses, so ``sqrt(crps * mase)`` reproduces the geomean.
+    NaN-safe — an empty list returns ``(nan, nan)``. See :func:`global_geomean` for ``wql_mode``."""
     if not scores:
         return (float("nan"), float("nan"))
     if wql_mode not in WQL_MODES:

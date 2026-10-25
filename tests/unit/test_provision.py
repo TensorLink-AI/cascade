@@ -200,20 +200,6 @@ def test_lium_launch_injects_ssh_pubkey_env_and_port():
     assert spawned[1][spawned[1].index("--template_id") + 1] == "tmpl-1"
 
 
-def test_plan_argv_forwards_the_network():
-    """Incident 2026-07-14: the COUNT subprocess defaulted to finney, so a
-    testnet provisioner counted MAINNET's netuid and planned eligible=0 for
-    three consecutive rental windows. The network must ride along."""
-    from pathlib import Path
-
-    from cascade.provision.main import plan_argv
-
-    argv = plan_argv(Path("chain.testnet.toml"), Path("_train_work"), "test")
-    assert argv[argv.index("--network") + 1] == "test"
-    assert argv[argv.index("--chain-toml") + 1] == "chain.testnet.toml"
-    assert "--plan-only" in argv
-    # No network given (defaults intended) → flag genuinely absent.
-    assert "--network" not in plan_argv(None, Path("w"), None)
 
 
 def test_launch_injects_image_digest_env_when_pinned():
@@ -828,11 +814,9 @@ def test_make_health_check_attested_digest_on_frozen_gate(monkeypatch):
 
     monkeypatch.setattr(remote, "run_ssh", fake_run_ssh)
     policy = ProvisionPolicy(
-        heat=StagePolicy(sku="NVIDIA RTX A6000", gpus_per_pod=4, max_pods=1,
-                         providers=("shadeform",), max_price_hr=2.4),
-        final=StagePolicy(sku="NVIDIA L40S", gpus_per_pod=2, max_pods=1,
-                          providers=("shadeform",), max_price_hr=2.6),
-        trigger_margin_blocks=25, max_spend_per_round=25.0,
+        eval=StagePolicy(sku="NVIDIA L40S", gpus_per_pod=2, max_pods=1,
+                         providers=("shadeform",), max_price_hr=2.6),
+        max_spend_per_round=25.0,
     )
     render = RenderSettings(image=IMG, ssh_pubkey="ssh-ed25519 AAAA cascade",
                             key_path="/tmp/k")
@@ -841,8 +825,8 @@ def test_make_health_check_attested_digest_on_frozen_gate(monkeypatch):
     addr = PodAddress(ip="192.0.2.1", ssh_port=2222)
     # Two pods, different attestations, same cached stage gate: both calls
     # must return a report (probes fail — irrelevant), never raise.
-    r1 = check(addr, "heat", "shadeform", sku="NVIDIA RTX A6000", gpus=4,
+    r1 = check(addr, "eval", "shadeform", sku="NVIDIA RTX A6000", gpus=4,
                attested_digest="sha256:" + "aa" * 32)
-    r2 = check(addr, "heat", "shadeform", sku="NVIDIA RTX A6000", gpus=4,
+    r2 = check(addr, "eval", "shadeform", sku="NVIDIA RTX A6000", gpus=4,
                attested_digest="sha256:" + "bb" * 32)
     assert isinstance(r1, HealthReport) and isinstance(r2, HealthReport)

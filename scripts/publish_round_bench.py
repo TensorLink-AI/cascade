@@ -1,11 +1,11 @@
 #!/usr/bin/env python
 """Publish a round's public-benchmark report as a canonical ``BenchReport``.
 
-Backfill for rounds where the trainer's own post-publish bench sidecar failed
+Backfill for settlements where the trainer's own bench publish failed
 (``benchmarks/round-<round_id>.json`` absent): takes the external sidecar
 ``report.json`` for one or more of the round's duel checkpoints and publishes
 the trainer-signed round doc — byte-compatible with what
-``TrainerRunner._post_publish_bench`` publishes in production.
+``TrainerRunner._rolling_publish_bench`` publishes in production.
 
 The doc at that key has exactly ONE consumer-facing schema:
 :mod:`cascade.shared.bench_report`'s ``BenchReport`` — the validator's Cascade
@@ -154,11 +154,9 @@ def main() -> int:
                       created_block=manifest.created_block,
                       entries=tuple(entries))
     if args.wallet_name:
-        import bittensor as bt
+        from cascade.shared.chain import open_wallet
 
-        wallet = bt.Wallet(name=args.wallet_name, hotkey=args.wallet_hotkey,
-                           path=args.wallet_path) if args.wallet_path else \
-            bt.Wallet(name=args.wallet_name, hotkey=args.wallet_hotkey)
+        wallet = open_wallet(args.wallet_name, args.wallet_hotkey, args.wallet_path)
         doc = sign_bench_report(doc, wallet)
 
     text = dump_bench_report(doc)

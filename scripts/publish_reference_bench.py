@@ -1,29 +1,27 @@
 #!/usr/bin/env python
 """Publish an OFFICIAL-checkpoint benchmark as a dashboard reference doc.
 
-The stakeholder scoreboard frames Cascade's progress against the real
-Datadog Toto2 release: same architecture, same size, different data. Both
-sides of that comparison must come from the SAME pipeline — the benchmark
-sidecar (``benchmarks/``) with its pinned data — so nothing on the page is
-a transcribed leaderboard number.
+The dashboard compares Cascade with Timestral-209M using the same benchmark
+sidecar and pinned data. This is distinct from the stakeholder scoreboard's
+GIFT-Eval leaderboard comparison.
 
 This script takes the sidecar's ``report.json`` for an official checkpoint
 and publishes it as ``benchmarks/reference-<preset>.json`` (public-read) in
-the manifest bucket, where ``stakeholders.html`` probes for it per ladder
-rung. The six scores are extracted with the same convention as everything
-else (:func:`cascade.eval.benchmarks.extract_bench_scores`); an incomplete
-battery is refused, never published.
+the manifest bucket, where the Benchmarks tab reads it. All available scores
+are retained, including FEV. Timestral-209M requires all four suites and an
+exact Hub revision; legacy reference presets still accept the original six
+scores. The geomean remains the six-score promotion metric.
 
-Workflow (once per official size)::
+Workflow (once per official checkpoint)::
 
     # 1. wrap the official weights in the cascade checkpoint layout
     #    (weights.safetensors + config.json + model.py + forecast_wrapper.py)
     # 2. score it with the sidecar, exactly like a round checkpoint:
     docker run --rm --gpus all -v /path/ckpt:/ckpt:ro -v /out:/out \
-        cascade-bench:<tag> /ckpt /out/report.json --device cuda
+        cascade-bench:<tag> /ckpt /out/report.json --device cuda --suites gift-eval,boom,time,fev
     # 3. publish the reference doc (HIPPIUS_S3_ACCESS_KEY/_SECRET_KEY set):
     python scripts/publish_reference_bench.py /out/report.json \
-        --preset toto2-4m --source "Datadog/Toto-2.0-4m@hf:<revision>" \
+        --preset timestral-209m --source "mistralai/Timestral-209M@<40-character-revision>" \
         --wallet-name trainer --wallet-hotkey default
 
 Signing is optional but recommended: with ``--wallet-*`` the doc carries the
@@ -36,6 +34,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -47,6 +46,7 @@ from cascade.shared.hippius import S3Config, S3Store, StorageError
 REFERENCE_SCHEMA = 1
 SIX_KEYS = ("gifteval_crps", "gifteval_mase", "boom_crps", "boom_mase",
             "time_crps", "time_mase")
+FEV_KEYS = ("fev_crps", "fev_mase")
 
 
 def _canonical_body(doc: dict) -> bytes:
@@ -58,12 +58,31 @@ def _geomean(scores: dict) -> float:
     return math.exp(sum(math.log(scores[k]) for k in SIX_KEYS) / len(SIX_KEYS))
 
 
+def reference_scores(report: dict, *, preset: str, source: str) -> dict:
+    """Extract measured losses, retaining FEV and refusing incomplete references."""
+    timestral = preset == "timestral-209m"
+    if timestral and not re.fullmatch(r"mistralai/Timestral-209M@[0-9a-f]{40}", source):
+        raise ValueError("Timestral-209M source must pin its 40-character Hub revision")
+    for suite in report.get("suites", []):
+        for name, value in (suite.get("metrics") or {}).items():
+            if (str(name).lower() in ("crps", "wql", "mean_weighted_sum_quantile_loss", "mase")
+                    and (not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0)):
+                raise ValueError("reference losses must be finite and positive")
+    scores = extract_bench_scores(report, require_fev=timestral)
+    if scores is None:
+        suites = "GIFT-Eval/BOOM/TIME" + ("/FEV" if timestral else "")
+        raise ValueError(f"report is missing complete {suites} CRPS+MASE scores")
+    if any(not math.isfinite(v) or v <= 0 for v in scores.values()):
+        raise ValueError("reference losses must be finite and positive")
+    return {k: scores[k] for k in (*SIX_KEYS, *FEV_KEYS) if k in scores}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Publish an official-checkpoint bench report as a reference doc.")
     ap.add_argument("report", type=Path, help="Sidecar report.json for the official checkpoint.")
     ap.add_argument("--preset", required=True,
-                    help="Ladder preset this references, e.g. toto2-4m.")
+                    help="Reference preset, e.g. timestral-209m or toto2-4m.")
     ap.add_argument("--kind", choices=("official", "genesis"), default="official",
                     help="'official': the Datadog release (target side of the duel; "
                          "published as reference-<preset>.json). 'genesis': the "
@@ -81,13 +100,14 @@ def main() -> int:
     ap.add_argument("--wallet-hotkey", default=None)
     ap.add_argument("--wallet-path", default=None)
     ap.add_argument("--dry-run", action="store_true", help="Print the doc and exit.")
+    ap.add_argument("--out", type=Path, default=None, help="Also save the reference JSON locally for the model-frontier catalog.")
     args = ap.parse_args()
 
     report = json.loads(args.report.read_text(encoding="utf-8"))
-    scores = extract_bench_scores(report)
-    if scores is None:
-        print("refusing to publish: report is missing at least one of the six "
-              "GIFT-Eval/BOOM/TIME crps+mase scores", file=sys.stderr)
+    try:
+        scores = reference_scores(report, preset=args.preset, source=args.source)
+    except ValueError as exc:
+        print(f"refusing to publish: {exc}", file=sys.stderr)
         return 1
 
     doc: dict = {
@@ -95,7 +115,7 @@ def main() -> int:
         "kind": "reference_bench" if args.kind == "official" else "genesis_bench",
         "preset": args.preset,
         "source": args.source,
-        "scores": {k: scores[k] for k in SIX_KEYS},
+        "scores": scores,
         "geomean": _geomean(scores),
         "data_revisions": report.get("data_revisions"),
         "note": args.note,
@@ -118,6 +138,8 @@ def main() -> int:
     prefix = "reference" if args.kind == "official" else "genesis"
     key = f"benchmarks/{prefix}-{args.preset}.json"
     text = json.dumps(doc, indent=1)
+    if args.out is not None:
+        args.out.write_text(text + "\n", encoding="utf-8")
     if args.dry_run:
         print(f"[dry-run] would publish {len(text)} B to {key}:")
         print(text)

@@ -140,6 +140,22 @@ def _rent(provider, **kw):
     )
 
 
+def test_allocation_is_reported_before_waiting_for_boot(monkeypatch):
+    provider = FakeProvider()
+    events = []
+    monkeypatch.setattr(provider, "machine_of", lambda name: "executor-1", raising=False)
+
+    def ready(name, *, timeout):
+        assert events == [("allocated", "executor-1", name)]
+        events.append(("ready", name))
+        return True
+
+    monkeypatch.setattr(provider, "wait_ready", ready)
+    result = _rent(provider, on_allocated=lambda machine, name:
+                   events.append(("allocated", machine, name)))
+    assert result.ok and events[-1][0] == "ready"
+
+
 def test_rent_success_ledgers_payer_and_stage():
     provider = FakeProvider()
     res = _rent(provider)
@@ -155,7 +171,7 @@ def test_rent_success_ledgers_payer_and_stage():
     ("401 unauthorized for this api key", "auth", False),
     ("429 too many requests", "rate_limited", False),
     ("lium: only 0 × 1xL40S available, need 1", "no_capacity", False),
-    ("executor exploded mid-boot", "infra", True),
+    ("executor exploded mid-boot", "infra", False),
 ])
 def test_rent_failure_classes_and_burn(msg, cls, burns):
     res = _rent(FakeProvider(fail_launch=msg))

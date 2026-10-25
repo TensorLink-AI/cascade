@@ -24,8 +24,7 @@ max_total_points     = 2_000_000_000
 # GP/kernel draws scale ~cubically in length, so the fixed count pinned those
 # priors into their worst corner; freeing the count is what makes them
 # affordable inside max_generate_seconds. Inert for the live stream_cpu feed
-# (which already stops at the training token budget) and for the dedup probe
-# (count-denominated by construction). Not in contract_digest — no [generator]
+# (which already stops at the training token budget). Not in contract_digest — no [generator]
 # key is — so this is an operational (trainer-side) knob, no coordinated
 # restart. 0 = legacy exactly-corpus_n_series drain.
 corpus_target_points = 67_108_864
@@ -51,6 +50,7 @@ max_repo_mb          = 128       # cap on the fetched submission (code-only, no 
 # linear in C) and costs no per-token throughput. Eval-side mv_channels stays
 # ≤ 8 (EVAL_POOL.md); OOM is a challenger fault and never re-queues.
 max_channels         = 32
+min_channels         = 8         # v2 synthetic submissions: 8–32 channels per yield
 # The record carrier (DEC-CA-0020). interface_version 1 = record-or-array yield
 # with `values` only; every reserved field (mask, start, freq, group_id, roles,
 # labels, quantiles) is hard-rejected until the release that consumes it. Bumps
@@ -90,13 +90,20 @@ max_dup_fraction     = 0.05      # cache_reuse only: max fraction of exact byte-
 sandbox_mode   = "subprocess"
 sandbox_image  = ""              # e.g. "ghcr.io/tensorlink-ai/cascade-worker@sha256:<64hex>"
 sandbox_python = "python3"       # python inside sandbox_image
-sandbox_strict = false           # true on production: no netns => refuse, don't degrade.
-                                 # MUST be true (or container mode) before the dedup
-                                 # probe is armed (dedup_probe_series > 0): the probe runs
-                                 # generator code on the orchestrator, which holds the
-                                 # eval pool and wallet (DEC-CA-0008). Left false at merge
-                                 # because worker pods are UNVERIFIED under strict — flip
-                                 # is its own change, after verifying pods, testnet first.
+sandbox_strict = true            # no netns => refuse, don't degrade.
+                                 # The payer / worker pods read THIS table (the pushed
+                                 # chain.deployed.toml): a pod without unprivileged netns
+                                 # refuses every leg. That refusal is an infra fault (worker
+                                 # rc 1, tier "infra"), never a miner rejection; qualify the
+                                 # pod images' netns before relying on them (testnet runs
+                                 # strict since 2026-09-28). The orchestrator / validators run
+                                 # NO generator code today. Two guards keep it that way
+                                 # (cascade.shared.sandbox_policy). The LOAD
+                                 # check refuses dedup_probe_series > 0 (retired, read by
+                                 # nothing) unless strict / container. At RUNTIME, a process
+                                 # holding the trainer wallet / private pool (trainer main,
+                                 # validator main) refuses generator code in-process always,
+                                 # and in a sandbox child unless strict / container.
 
 [training]
 # The FIXED training contract — identical for king and challenger; folded into
@@ -255,13 +262,17 @@ train_image_digest = "sha256:43c07d4207d7693517d74203f6783fdd2c2f91e3d475f38db38
 #                             # null-LCB noise-floor measurement)
 
 [round]
-# Twice-daily round cadence + two-stage (heat → final). Base seed = the chain
-# block hash at the epoch boundary; only commitments revealed strictly before it
-# are eligible. CONSENSUS-RELEVANT: every validator derives the epoch from this
-# for pool-snapshot selection, so it must move in LOCKSTEP across operators (a
-# validator on a stale value silently picks a different snapshot). NOT part of
-# contract_digest ([training] only). The heat fleet auto-sizes from this
-# (plan_fleet) — don't hand-pin gpus_per_pod/max_pods.
+
+# Trainer-only resilience: owner fairness and correlated GPU outages.
+ops_max_active_per_coldkey = 1
+ops_gpu_failure_threshold = 2
+ops_gpu_failure_window_seconds = 3600
+ops_gpu_cooldown_seconds = 10800
+# The settlement grid. CONSENSUS-RELEVANT: every validator derives the epoch
+# from this for pool-snapshot selection, so it must move in LOCKSTEP across
+# operators (a validator on a stale value silently picks a different snapshot).
+# NOT part of contract_digest ([training] only). The DEC-CA-0045 rollover
+# switches it to [activation] epoch_blocks_after.
 epoch_blocks     = 3600   # ≈12h at a 12s block time
 round_hours      = 12.0   # informational: wall-clock span of an epoch
 # Scheduled switch (0/0 = steady state). Last used: 7200 → 3600 at 8726400,
@@ -273,8 +284,8 @@ epoch_activation_block = 0
 # this block challengers train the moment they are funded, legs cross
 # boundaries, every boundary publishes ONE settlement manifest (era king +
 # every challenger finished since the last settlement), the king's leg is
-# trained once per era and cached. 0 = off (the boundary-synchronous trainer,
-# bit-identical to before). ROLLOVER recipe (owner call, one boundary for
+# trained once per era and cached. The trainer idles until the rollover.
+# ROLLOVER recipe (owner call, one boundary for
 # everything): rolling_from_block = era_king_from_block =
 # tenure_blocks_from_block = cohort_maxt_increment_from_block = ROLLOVER
 # (a multiple of epoch_blocks × era_settlements — the era grid is absolute);
@@ -286,47 +297,24 @@ epoch_activation_block = 0
 rolling_from_block = 0
 # Settlements per era (consecutive boundaries sharing one set of training
 # seeds, one init and one cached king checkpoint): 4 on the 3h grid = 12h
-# eras — today's king-leg cadence with 3h verdicts inside it. Inert until a
-# rollover block is set.
+# eras — today's king-leg cadence with 3h verdicts inside it.
 era_settlements = 4
-heat_train_hours = 1.0    # screening budget per competitor (on screen_size)
-heat_n_windows   = 2000   # eval windows the heat screens on (= [eval] n_windows;
-                          # the full set — a smaller screen is noisy near the top)
-heat_num_samples = 100    # sample forecasts per window (0 = reuse [eval]); matches
-                          # the final's count so screen + duel rank on one estimator
-# Heat wall-clock cap: max(heat_guard_factor × heat_train_hours, floor), never
-# above max_train_seconds. RAISE the factor if heat pods are a slower SKU than
-# the reference box, else every heat time-truncates.
+# `cascade score` emulation budget/windows (miner-side) and the wall-clock
+# guard of a reduced-budget leg (bench-anneal): max(factor × hours, floor).
+heat_train_hours = 1.0
+heat_n_windows   = 2000
 heat_guard_factor        = 1.0
 heat_guard_floor_seconds = 900
-# In-round re-queues for challengers whose heat dispatch died on an
-# INFRASTRUCTURE failure (storage layer / ssh transport) — miner-fault
-# failures never re-queue. 0 restores terminal drops.
+# Default rolling admission cap when funded_field_cap = 0 (max of the two).
+finalists        = 1
+max_finalists      = 3
+# Retired with the boundary-round trainer — ignored by the loader
+# (cascade.shared.config.RETIRED_KEYS); values kept for older releases.
+heat_num_samples = 100
 heat_infra_requeues      = 2
-finalists        = 1      # challengers promoted from the heat to the final (top-N)
-# Tie-aware finalist cohort (DEC-CA-0012) — ARMED (owner 2026-08-20,
-# max_finalists=3): a leader the screen separated advances ALONE; a statistically
-# tied top is re-scored on a larger CPU-only slice (no retrain, no GPU) and
-# survivors advance too, capped at max_finalists. The validator judges the whole
-# cohort under a family-wise alpha/k. Bit-identical at max_finalists=1.
-# CRITICAL: tie_runoff_windows MUST STAY 0 while the jittered mix (DEC-CA-0019)
-# is active — the run-off assumes the draw is a permutation PREFIX, which the
-# jitter breaks (a "larger" draw returns the same mix_target_windows list, no
-# incremental evidence). With none, the run-off is skipped and the tied set
-# advances capped (the supported path). Re-arming needs a jitter-aware draw.
-max_finalists      = 3    # cap on the advancing tied cohort (armed 2026-08-20; 1 = tie logic OFF)
-# Init-baseline heat SHADOW row (DEC-CA-0034; armed 2026-08-27, owner): the
-# warm-start init is scored on the heat slice and published as
-# HeatResult.init_baseline. Visibility only — never filters the heat
-# (heat-side has no enforce). Trainer-only key, no consensus surface.
 init_gate_mode     = "shadow"
-tie_runoff_windows = 0    # MUST stay 0 under the jittered mix — see NOTE above
-# Wall clock for the WHOLE run-off, mirroring dedup_phase_seconds: on expiry
-# the pre-run-off tied set advances (capped) — a screen that cannot finish
-# must not sink the round it protects. Inert while max_finalists = 1.
+tie_runoff_windows = 0
 tie_runoff_phase_seconds = 900
-# Anti-spam: a challenger hotkey that has entered a heat is burned and must
-# re-register to resubmit. Set false only on a throwaway testnet.
 # Go-live gate: only commitments revealed at/after this block ever compete
 # (0 = off). MAINNET: set to the announced launch block AT LAUNCH so netuid
 # squatters / rehearsal commits from before the official start never enter a
@@ -334,58 +322,21 @@ tie_runoff_phase_seconds = 900
 commit_floor_block = 8622922  # OFFICIAL GO-LIVE BLOCK (deliberate): reveals before this never compete
                               # (unit fixtures neutralize it in tests/conftest.py)
 one_submission_per_hotkey = true
-# ── Duel-only rounds (no heat), block-gated ──────────────────────────────────
-# From the first epoch boundary >= duel_from_block the heat screen is skipped:
-# every screened entrant seats straight into the duel in reveal order and
-# trains the full [training] budget beside the king on the L40S final fleet.
-# The provisioner rents no heat fleet and sizes the final to fit the whole
-# field inside the epoch — each lane runs floor((round_hours − 1.5h) / 3h) = 3
-# legs back to back (pods carry a one-epoch TTL) — up to its pod ceiling
-# ([provisioner.final] max_pods). Seating is one-shot at the round start:
-# with duel_seat_all = true (default since 2026-09-08) the trainer seats the
-# WHOLE screened field and a fleet that came up short queues the extra legs
-# (the mid-final lane pool dispatches them as lanes join; the trainer logs
-# "FLEET SHORT" — top the lanes up, the round lands late otherwise). With
-# duel_seat_all = false (the pre-2026-09-08 rule) it seats only what the
-# lanes on file can finish before the boundary and the overflow waits for
-# the next round without spending its submission — round 565093567954236803
-# seated 2 of 5 that way after the rental lottery delivered 1 of 2 planned
-# lanes. With 2 pods × 2 lanes a round fits 11 legs; each extra 2-lane pod
-# adds 6. The validator judges the whole cohort under alpha/k (DEC-CA-0012,
-# k = seated). Trainer-side ([round] is outside contract_digest). 0 = off;
-# rollback = 0 + trainer restart.
-duel_from_block = 8992800   # 2026-09-04 ~08:30 UTC boundary (multiple of epoch_blocks)
-duel_field_cap  = 0         # 0 = no per-round cap; N = explicit cap (wins over duel_seat_all)
-duel_seat_all   = true      # seat every screened entrant; false = seats bounded by the lanes on file
-# ── Miner-funded compute (DEC-CA-0036) — armed, block-gated ──────────────────
-# Composes with duel-only above: legacy (operator-funded, duel-only) rounds run
-# until funded_activation_block; from it the funded queue IS the field and the
-# whole seated cohort still duels with no heat, exactly the duel-only shape.
-# "off" / "shadow" / "required" (funded queue IS the field; every seated
-# entrant duels, no heat). Everything below is inert before
-# funded_activation_block; legacy rounds keep running until it.
-# Details: docs/MINER_FUNDED_ROUNDS.md.
+duel_from_block = 8992800   # retired (ignored)
+duel_field_cap  = 0         # retired (ignored)
+duel_seat_all   = true      # retired (ignored)
+# ── Miner-funded compute (DEC-CA-0036) ───────────────────────────────────────
+# "required": the funded queue IS the intake — every funded, revealed entry
+# trains, up to funded_field_cap legs in flight. Details:
+# docs/OPERATOR.md.
 funded_mode = "required"
-funded_activation_block = 9046800   # first funded round ≈ Fri 2026-09-11 20:30 UTC (evening;
-                                    # owner 2026-09-10). The WHOLE release flips at THIS block, in
-                                    # one boundary: the funded queue becomes the field AND cohort
-                                    # max-T + increment (DEC-CA-0038/0039) + the [training] contract
-                                    # cut all go live together (their *_from_block below == this).
-                                    # The prior 08:30 boundary 9043200 runs the LAST old-world round
-                                    # — a legacy operator-funded duel under the OLD scoring/contract/
-                                    # trainer; nothing new fires there. cascade-intake opens for
-                                    # lium-key funding + private submissions right AFTER that morning
-                                    # round, so miners have the day to submit and fund before the
-                                    # evening funded round. MV scoring arms later, 9068400 (Mon 20:30).
+funded_activation_block = 9046800   # retired (ignored)
 funded_queue_path = "funded_queue.json"   # shared with cascade-intake (work_root-relative)
-# With funded_mode = "required": an unfunded boundary runs NOTHING (no king
-# leg, no pods, no manifest — validators just see no manifest and hold).
-# This is the elastic-cadence floor; the ceiling is the epoch grid itself.
-skip_unfunded_rounds = true
-max_rounds_per_day = 2                    # cadence sizing/telemetry only (grid = epoch_blocks)
+skip_unfunded_rounds = true               # retired (ignored)
+max_rounds_per_day = 2                    # retired (ignored)
 funded_entry_ttl_hours = 36.0             # MUST track cascade-intake --ttl-hours (key TTL)
-# "rent": each funded leg rents ONE pod on its payer's Lium key (king + eval
-# stay operator-funded). Consensus-inert.
+# "rent": each funded leg rents ONE pod on its payer's Lium key (the era king
+# stays operator-funded). Consensus-inert.
 funded_pods = "rent"
 payer_vault_dir = "payer_vault" # cascade-intake --vault-dir (work_root-relative)
 funded_pod_sku = ""             # unused with funded_pod_skus set (per-round pick)
@@ -407,15 +358,12 @@ funded_ready_timeout_seconds = 900.0
 # per-pod push-only Hub robot (revoked at teardown; Harbor expiry below).
 funded_pod_checkpoint = "harvest"
 funded_robot_duration_days = 1
-# Seats per round (0 = finalist_cap); clamped to live market capacity minus
-# the king's reserve when the probe is on. Held-back seats wait unburned.
-# 99 = no cap (owner 2026-09-16: "there shouldn't be any cap on GPUs"): every
-# paid entry seats the round it queues in — each seat rents its own payer pod,
-# so wall-clock stays one leg, and legs the market cannot serve poll for
-# capacity (then the operator lane) instead of waiting a whole round.
+# Shared miner-funded A/B/C admission cap (0 = finalist_cap); king work
+# has reserved admission. Waiting jobs queue before compute starts. Also
+# caps lane-A in-flight entries. Overlay-settable; CPU VMs have their own cap.
 funded_field_cap = 99
-funded_capacity_probe = true
-funded_capacity_reserve = 1
+funded_capacity_probe = true    # retired (ignored)
+funded_capacity_reserve = 1     # retired (ignored)
 # Allowed GPU types, preference-ordered; each round runs entirely on the
 # most-available one (king included). Needs [training] expected_gpu = "".
 # Blackwell (RTX5090, B200/B300) waits on a torch cu12.8 re-pin.
@@ -507,65 +455,25 @@ funded_operator_fallback = false
 submission_vault_dir = "submission_vault" # work_root-relative operator-private store
 champion_publish = "crown"   # a new king's code goes public as soon as it is crowned (owner 2026-09-14: "we want it immediately available")
 champion_publish_delay_rounds = 1
-# Content-level duplicate screen (pre-heat): re-uploads, comment shuffles,
-# and rename-only copies of the king or an earlier-committed challenger lose
-# their heat slot; the earliest submission keeps it. Pairwise only — never
-# transitive clusters. Dropped copies still burn their one submission.
-# NO similarity threshold: a ratio bar (originally sim >= 0.99, with a sketch
-# tier for oversize streams) is gameable by spacing edits just under it —
-# operators were already laddering variants at 0.90-0.986 — and it produced
-# the one confirmed false positive (a round's eventual finalist). Drops ride
-# on EXACT identity only: same tree, same normalized tokens, same tokens
-# modulo renames — and same probe OUTPUT once dedup_probe_mode enforces (a
-# zero-delta re-roll produces byte-identical probe bytes, so the spam a
-# threshold would target is caught ungameably).
-# ENABLED enforce 2026-07-26 by owner decision (DEC-CA-0008). The live-shadow
-# step was substituted by offline replay of the real screen on rounds
-# r1206/r1207/r1208 (drops: 2/0/0, all exact-identity or denied refs — zero
-# similarity-based verdicts possible since the threshold was removed).
+# Content-level dedup at admission (DEC-CA-0008, the rolling registry):
+# re-uploads, comment shuffles and rename-only copies of the king, a queued /
+# in-flight entry or a published champion are refused; the earliest reveal
+# keeps the slot and the copy burns its submission. EXACT identity only (same
+# tree, same normalized tokens, same tokens modulo renames) — NO similarity
+# threshold: a ratio bar is gameable by spacing edits just under it.
 dedup_mode         = "enforce"   # off | shadow | enforce (exact tiers)
-# config_only tier (identical .py, differing configs): SHADOW-logged until
-# this is true — config sweeps are ticket-spam AND the legitimate fork path.
-# Block-gated: with dedup_config_only_from_block set the tier drops only in
-# rounds whose epoch boundary is at/after it (shadow before). Trainer-side.
-dedup_config_only_enforce = true
-dedup_config_only_from_block = 8992800   # = [round] duel_from_block
-# Cost caps: tokenizer input is attacker-chosen up to max_repo_mb (~2s/MB);
-# the retained-token cap bounds the config_only delta measurement, the only
-# quadratic pass left. Field repos are ~100KB / 7-11k tokens (~40x headroom).
-dedup_max_tokens   = 50000       # 0 = uncapped; do NOT run 0 in production
+# Cost cap: tokenizer input is attacker-chosen up to max_repo_mb (~2s/MB).
 dedup_max_text_mb  = 4           # tokenizer input budget per repo
-# Wall clock for the WHOLE screen. On expiry the field proceeds unscreened: a
-# screen that cannot finish must not sink the round it protects.
+dedup_max_tokens   = 50000       # retired (ignored)
+# Retired with the field-wide screen + behavioural probe (ignored).
+dedup_config_only_enforce = true
+dedup_config_only_from_block = 8992800
 dedup_phase_seconds = 900
-# Behavioral probe: sandbox-draw N series per surviving entrant under the
-# shared round seed, twice. Twice-differs = non-deterministic generator
-# (contract violation, the entropy re-roll). Identical probe bytes across
-# entrants/vs-king = same process regardless of code. Probe drops gate on
-# dedup_probe_mode INDEPENDENTLY of dedup_mode — within-family heat spreads
-# suggest nondeterminism is widespread, and probe drops burn hotkeys, so the
-# probe ships SHADOW while the static tiers enforce.
-dedup_probe_mode   = "shadow"    # off | shadow | enforce
-# Probe OFF (owner, 2026-07-26): the probe EXECUTES miner code on the
-# orchestrator even in shadow (shadow gates the drops, not the execution).
-# To arm later: verify worker pods + this host under [generator]
-# sandbox_strict = true (or container mode), flip that first, then set
-# series = 8 with probe_mode = "shadow"; enforce only after reviewing
-# shadow verdicts. The static tiers above are independent and stay on.
-dedup_probe_series = 0           # 0 = probe off
-# Total probe wall clock; the per-draw budget is derived from it (budget / waves
-# / 2 draws), so N hostile entrants each burning their clock cannot stretch the
-# stage past this. The probe REFUSES to run unless [generator] has
-# sandbox_mode = "container" or sandbox_strict = true — shadow mode gates the
-# drops, not the execution, and this host holds the eval pool and the wallet.
+dedup_probe_mode   = "shadow"
+dedup_probe_series = 0
 dedup_probe_budget_seconds = 600
 
-# Genesis baseline king (burn-until-dethroned): a PUBLIC Hippius generator ref
-# (repo@digest). When set, the trainer trains THIS generator as the king
-# whenever no on-chain champion has a resolvable commitment — a fixed,
-# un-earnable floor — and the validator BURNS emission to burn_uid until a real
-# miner dethrones it (the king entry carries a sentinel uid = -1). Empty = off:
-# promote the lowest-UID miner to interim king (legacy behaviour).
+# Retired (ignored): the boundary-round trainer's genesis baseline king.
 genesis_generator_ref = "cascade/genesis-baseline@sha256:56c68bdac31718db7c59708c9678b19347fe7ef2f8a696bdd5f3ad4548e17a65"
 # submissions_db_path = "trainer_submissions.json"  # relative ⇒ under --work-root
 # Timed-reveal safety margin (blocks): `cascade deploy` targets its timelock
@@ -582,8 +490,8 @@ genesis_generator_ref = "cascade/genesis-baseline@sha256:56c68bdac31718db7c59708
 # fraction, 25/7200 = 0.35% → 25/3600 = 0.69% of a round: still negligible.
 # Sole hard constraint is reveal_margin_blocks < epoch_blocks (25 < 3600).
 reveal_margin_blocks = 25
-# Scaling seam: which size the heat screens at, and which size(s) decide the
-# throne. arch_preset names from the size registry; >1 throne size = combined score.
+# Which size(s) decide the throne (arch_preset names from the size registry;
+# >1 throne size = combined score); screen_size is informational.
 screen_size  = "toto2-4m"
 throne_sizes = ["toto2-4m"]
 
@@ -591,7 +499,7 @@ throne_sizes = ["toto2-4m"]
 # Held-out eval windows, identical for king and challenger. The slice is private
 # and rotates per round (seeded by block hash) — see cascade.validator.windows.
 eval_dataset   = "cascade-private-v1"  # identifier the validator matches on
-eval_source    = "private-rotating"    # rotating private pool (vs a fixed public set)
+eval_source    = "private-rotating"    # retired (RETIRED_KEYS): read by no release; kept for older loaders
 window_pool    = ""                    # Hippius Hub ref (repo@digest) of the held-out pool;
                                        # build/push with `cascade-pool build --out ./pool --upload`
                                        # (see docs/EVAL_POOL.md)
@@ -657,21 +565,22 @@ benchmark_project_dir = "benchmarks"  # path to the sidecar project
 benchmark_suites      = []       # subset of ["gift-eval","boom","time"]; [] = all three
 benchmark_num_samples = 0        # 0 reuses num_samples above
 benchmark_max_series  = 0        # cap datasets/tasks for a fast smoke run; 0 = full benchmark
-# Cascade post-publish duel bench (used only when [scoring] cascade_enabled).
-# After each manifest publishes, the trainer benches BOTH duel checkpoints on
-# GIFT-Eval/BOOM/TIME and publishes a separate signed report
-# (benchmarks/round-<id>.json). bench_hold_max_hours caps how long the
-# provisioner holds the round's FINAL pod for that sweep past its normal
-# teardown signal; the hold releases early when the bench_complete marker
-# lands. Inert while cascade_enabled = false.
-bench_hold_max_hours  = 9.0   # king+challenger bench SEQUENTIALLY on the one final pod
-                              # (same-pod parallel launches preempt each other) — sweep is
-                              # ~45-60min WITH data staged; raised 3.0→6.0 (2026-08-07) after
-                              # rate-limited HF downloads on token-less pods ate the 3h hold;
-                              # raised 6.0→9.0 (2026-08-20) for DEC-CA-0012 cohorts: a k=3
-                              # cohort benches 4 legs, and 9h stays inside the ttl_epochs=1
-                              # pod lifetime measured from the JIT final rent
-                              # twice. Data now pre-pushed from the box at final-rent time.
+# Cascade completion bench (used only when [scoring] cascade_enabled): under
+# a trainer [v2] bench_source (every pre-v2 era) each checkpoint is benched on
+# GIFT-Eval/BOOM/TIME on the pod that trained it and the numbers ride the
+# trainer-signed report (benchmarks/round-<id>.json). From [v2]
+# bench_source_from_block (DEC-CA-0063) lane-A rows come from the MAIN
+# validator's own sweep instead (bench_v/round-<id>.json; [v2] below).
+# With cascade_bench_max_series = 0 (the full battery) bench_hold_max_hours is
+# the per-sweep timeout.
+bench_hold_max_hours  = 9.0
+# DEC-CA-0063 validator sweep concurrency — OPERATOR-LOCAL (only the main
+# validator sweeps; others replay its signed rows; the report is identical
+# for any value). "auto" sizes workers to free GPU memory / CPU cores (or an
+# int; 1 = sequential); bench_paired sweeps challenger + unswept king (king +
+# init at the king check) in one pass. docs/OPERATOR.md "Sizing the sweep".
+bench_workers = "auto"
+bench_paired  = true
 # Public-benchmark no-regression gate data (CONSENSUS; used when [scoring]
 # gift_gate_mode != "off"). Enforcing validators need the data pinned locally.
 gift_gate_datasets    = ""       # gift-eval config subset ("" = full 97 configs)
@@ -689,7 +598,7 @@ gift_gate_timeout_s   = 3600     # per-checkpoint gift-eval timeout
 # CONSENSUS-SENSITIVE COORDINATED UPGRADE: margin is judged per-validator and
 # this config activates the decay AT release — every external validator (6)
 # and the trainer must upgrade in one coordinated window
-# (docs/MARGIN_DECAY_ROLLOUT.md). While the fleet is mixed, any round whose
+# (decisions/DEC-CA-0016-tenure-decay-margin.md). While the fleet is mixed, any round whose
 # challenger LCB lands between the decayed and flat margin FORKS verdicts.
 # HARD GUARDRAIL: win_margin_end must stay > 0 — the floor is the safety
 # property (0.5% sits above the bootstrap noise band, so a statistically
@@ -729,7 +638,15 @@ increment_from_block = 9046800  # = cohort_maxt_from_block (both flip at the eve
 # %-of-increment statistic (baseline on the shared resample), stacking the two
 # corrections as DEC-CA-0039 describes. CONSENSUS — release-then-activate with
 # the external validators; audit replays each round under its own block.
-# 0 = cohort rounds stay level-judged (no scheduled flip).
+# 0 = cohort rounds stay level-judged (no scheduled flip) — UNLESS the
+# DEC-CA-0043 rollover is decided on chain ([activation] below): the resolved
+# rollover writes ITS block here (apply_activation; load-checked era_king >=
+# this >= cohort_maxt_from_block), so on mainnet every era-king settlement —
+# and so every v2 settlement, which follows the rollover — judges the cohort
+# max-T in increment units, matching the increment-unit [v2] dethrone bar.
+# Do NOT type "v2" / a block after the rollover here: it breaks that ordering
+# (apply_activation refuses it) and would move live pre-v2 era-king
+# settlements back to level units (2026-10-20 review; DEC-CA-0039 note).
 cohort_maxt_increment_from_block = 0
 # Multivariate scoring activation (DEC-CA-0041): from this block a multivariate
 # window's channels are averaged into ONE per-window contribution (GIFT-Eval
@@ -741,6 +658,12 @@ cohort_maxt_increment_from_block = 0
 # a boundary; one release covers both. Bit-identical until an MV-packed pool
 # publishes (pool build --mv-pack).
 mv_score_from_block  = 9068400
+# Entry-fault verdicts: from this block a challenger whose evaluation fails
+# deterministically (non-finite / wrong-shape forecasts, tampered checkpoint,
+# wrapper import/construct failure) loses its duel instead of wedging the
+# settlement in a retry loop. CONSENSUS (changes verdicts) — arm lockstep at an
+# announced block. 0 = off (inert).
+entry_fault_from_block = 0
 win_margin_end       = 0.005     # decayed floor (> 0!) — reached at margin_warmup_rounds
 margin_warmup_rounds = 8         # rounds of tenure to reach the floor (~4d at 12h rounds)
 # Dethrone bar v2 (DEC-CA-0049, owner 2026-10-01) — CONSENSUS. Since the
@@ -818,6 +741,25 @@ king_decay           = 0.5       # geometric decay across [king, prior kings]: k
 gift_gate_mode       = "off"     # "off" | "shadow" (log-only) | "enforce"
 gift_gate_tolerance  = 0.03      # relative slack before the challenger fails
 gift_gate_min_configs = 15       # shared configs below which the gate is uncomputable
+# Three-suite bench gate (DEC-CA-0054, cascade.eval.bench_gate). AND-ed like
+# the gift gate, can only BLOCK: on a private-pool win the challenger must not
+# be significantly worse than the king on GIFT-Eval, BOOM or TIME (paired
+# bootstrap on the signed per-item rows — the trainer's, or the main
+# validator's under a validator [v2] bench_source — alpha/3 per suite) and
+# its six-number geomean must be strictly better. Consensus: arm via
+# DEC-CA-0045 (v2 settlements: [v2] bench_gate_mode; rule v2 below).
+bench_gate_mode      = "off"     # "off" | "shadow" (log-only) | "enforce"
+bench_gate_min_items = 10        # paired items per suite below which the gate is uncomputable
+# DEC-CA-0061 rule v2 ("avg_noninf_winrate", owner 2026-10-20; applies from
+# [v2] bench_gate_v2_from_block): unit = one benchmark task over GIFT-Eval,
+# BOOM, TIME and FEV; the suite-equal geomean of the challenger/king CRPS and
+# MASE ratios must be < 1, no suite's ratio LCB (paired task bootstrap,
+# alpha/4) may exceed 1 + bench_gate_tolerance, and the suite-equal task win
+# rate must be >= bench_gate_min_win_rate. bench_gate_min_items is then the
+# usable-task floor per suite. OWNER ITEM before arming: calibrate the
+# tolerance with scripts/bench_seed_noise.py on same-recipe seed replicas.
+bench_gate_tolerance    = 0.01   # ratio slack above 1 a suite's LCB may reach
+bench_gate_min_win_rate = 0.5    # suite-equal share of tasks the challenger wins (tie = half)
 # Margin denomination (DEC-CA-0027): "level" = LCB of (king-chal)/king (the
 # from-scratch rule, exact current behaviour). "increment" = the warm-start-era
 # rule: the shared init is scored as a third paired reference and the margin
@@ -835,7 +777,7 @@ margin_increment_floor = 0.01
 # rotates rounds across the members; validators verify the declaration against
 # the envelope below instead of re-deriving the selection. The king PERSISTS
 # on promotion (DEC-CA-0004); the throne is never vacated.
-cascade_enabled      = true      # ARMED 2026-08-05: warm-start promotion + post-publish duel bench live
+cascade_enabled      = true      # ARMED 2026-08-05: warm-start promotion + completion bench live
 # Consecutive undethroned ROUNDS before a Cascade fires — "survived N
 # challenges". Renamed from cascade_reign_days on 2026-07-28 (the old key is
 # still accepted): the clock used to divide reign blocks by a fixed 7200-block
@@ -857,16 +799,6 @@ cascade_reign_rounds = 5
 # with a materially worse init.
 cascade_top_k          = 3
 cascade_quality_epsilon = 0.05
-# Staged-promotion carry (DEC-CA-0050) — CONSENSUS. From this block a dethrone
-# between a promotion being STAGED and its effective_era keeps the staged
-# promotion, and a record that fired under an earlier reign is timed against
-# that reign's clock (or not at all when unattestable), never the new king's.
-# Fixes the 2026-10-14 wedge (gen 14 staged, dethrone, every era-2577 manifest
-# rejected era_init_mismatch). DECIDED ON CHAIN: 0 ⇒ validators signal the
-# DEC-CA-0045 note segment "promotion-carry"; at the first boundary where 51%
-# of eligible stake has signalled it locks in and applies from the NEXT
-# settlement boundary. A typed settlement boundary is the owner override.
-promotion_carry_from_block = 0
 # Block-gated contract transition (2026-08-20, WSD flip — DEC-CA-0018): rounds
 # whose epoch boundary precedes contract_from_block score against the pinned
 # PRIOR contract digest (the warmup_cosine contract every round through
@@ -906,7 +838,7 @@ contract_from_block    = 9046800
 # change, budget change) ships the same day instead of waiting on six external
 # validators to restart.
 #
-# 0 = OFF, the deployed value: every round takes the legacy strict path (full
+# 0 = OFF (the value before the 2026-08-27 arming): every round takes the legacy strict path (full
 # digest equality against the local [training]). Arming this is the LAST
 # [training]-driven change that needs a coordinated fleet deploy — after it,
 # [training] edits never again reject a round on an un-upgraded validator, and
@@ -1025,14 +957,19 @@ poll_seconds    = 120
 # Trust anchor for the public round receipts: the validator hotkey whose
 # signature `cascade-audit` requires. Empty = verify against the receipt's
 # self-declared signer (audit warns that the signer is unpinned).
-validator_hotkey = "5FcCsoB2R5M55RdrNrvPQv7xmLJRFzs7R7C73UUSxgUCyfsw"  # LOCAL OVERRIDE (audit trust anchor) — re-apply after every pull; see OPSLOG 2026-07-26
+validator_hotkey = "5FcCsoB2R5M55RdrNrvPQv7xmLJRFzs7R7C73UUSxgUCyfsw"  # main validator receipt signer
+
+# The trainer stamps prev_manifest_sha256 (the manifest hash link) on
+# settlements at/after this boundary. Signed-body field: set it only after
+# every validator runs a release that knows it. 0 = never stamped.
+hash_link_from_block = 0
 
 [validator]
 weight_set_interval_blocks = 180
 poll_seconds               = 120
-hf_cache_seconds           = 1800
+hf_cache_seconds           = 1800  # retired (RETIRED_KEYS): older releases require it
 state_db_path              = "validator_state.db"
-# Cascade persistence (see [scoring] cascade_reign_days): reign clock + reign
+# Cascade persistence (see [scoring] cascade_reign_rounds): reign clock + reign
 # checkpoint log, and the promoted warm-start pointer. The CO-HOSTED TRAINER
 # reads warm_start_init_path too (its rounds train from the pinned init once a
 # promotion fires) — point both processes at the same file.
@@ -1069,7 +1006,7 @@ funded_key_env = "WANDB_API_KEY_FUNDED"
 # Host-side run telemetry (cascade.trainer.host_probe). Observability only —
 # these fields ride the training-log channel next to the per-step metrics, never
 # the manifest, the receipt, or contract_digest, and nothing in the scoring path
-# reads them. They exist because the heat prices generator speed (DEC-CA-0001) on
+# reads them. They exist because the wall prices generator speed (DEC-CA-0001) on
 # a fleet rented per round: data_wait_frac can rule the CORPUS out as the cause of
 # a slow run, but only a host-side measurement can rule the POD in. host_bench
 # times a fixed calibration workload before each run's corpus stream opens (a few
@@ -1082,19 +1019,13 @@ host_bench = true               # + the fixed calibration bench (host_bench_toke
 # Payer numbers are a FILTER: the top-N re-bench on the operator's king pod and
 # only the operator's numbers are signed/published; a payer number better than
 # the re-bench by more than the tolerance is a forged sweep (entry dropped).
+# Lane A under a validator [v2] bench_source (DEC-CA-0063): the trainer runs
+# no challenger sweep and no payer verification — these keys then do nothing.
 funded_bench = true
 funded_bench_verify_top = 1
 funded_bench_verify_tolerance = 0.02
-# Shadow scratch control (DEC-CA-0014 Stage 1): every M-th warm-started round
-# the trainer ALSO trains the king's generator from scratch (random init,
-# identical contract + seeds) strictly post-publish on the idle final pod,
-# benches it, and publishes benchmarks/scratch/round-<id>.json — labeled
-# telemetry that never feeds scoring, selection, or promotion. [telemetry]
-# tier on purpose: must never touch contract_digest. 0 = off. MAINNET stays 0
-# until the owner arms it (DEC-CA-0014 says start M=4): arming costs a full
-# training leg every M rounds and needs [eval] bench_hold_max_hours sized for
-# duel bench + train leg + one more bench (~6-7h total at the 3h budget) — or
-# a dedicated pod. Testnet first, one full cycle.
+# Retired (ignored): the scratch-shadow leg rode the boundary-round bench
+# thread (DEC-CA-0014 Stage 1 needs a rolling port to come back).
 scratch_shadow_every_rounds = 0
 # bench_anneal_fraction = 0.15  # bench-anneal (DEC-CA-0030): NEVER together with [training]
                                 # ema_decay (the worker's anneal_recipe refuses an EMA-armed
@@ -1144,28 +1075,494 @@ epoch_blocks_after = 900
 # down. 0 = count every permit holder.
 dormant_after_blocks = 0
 
-# PINNED lock-ins (DEC-CA-0050). The readiness note lives in a 128-byte
-# commitment field; the three features below were decided on chain and their
-# locked-in segments filled 116 bytes, leaving no room for the promotion-carry
-# segment. Each pin is armed AT LOAD through the same apply function a
-# lock-in uses, so receipts (activation_block / margin_v2_block), verdicts and
-# the audit replay are byte-identical to the tallied lock-in; a pinned feature
-# is never tallied again and carries no note segment. Each pair must be the
-# exact (lock, activation) the fleet locked in — the loader refuses any other
-# pair, a pin plus a typed block for the same feature, and a pin whose feature
-# no longer exists (edited forfeit list / v2 bar). Do NOT remove a pin while
-# the feature's keys stay 0: the feature would be tallied afresh.
-[[activation.pinned]]   # DEC-CA-0043/0045 rollover: locked 9133200, rolling eras from 9136800
-feature          = "rolling-era-king"
-lock_block       = 9133200
-activation_block = 9136800
+[v2]
+launch_at_utc = "2026-10-30T12:00:00Z"
+prelaunch_burn_readiness = "r2"
+# cascade v2 (DEC-CA-0050): Cascade-MOE-28M king lineage (lane A) + the
+# domain-expert lane (lane B). Finalized chain timestamps resolve launch_at_utc
+# to the first era boundary at or after the target. A positive typed from_block
+# overrides the date and must be era-aligned. Validators must upgrade before
+# launch; from_block = 0 stays inert until the date is resolved. From that era
+# on: lane A trains [v2.training] from a NEW
+# random-init lineage (toto2 members never initialise the MoE), the slow
+# router bites once the routing gate opens, receipts stamp `v2_block`, and
+# lane A keeps 100 % of the allocation until [lane_b] from_block launches B.
+# Then A/B split 75/25; once C launches it takes its share from A (50/25/25).
+from_block = 0
+# Rides the same go-live (DEC-CA-0054): every v2 settlement enforces the
+# bench gate (the mode; the RULE is DEC-CA-0054's three suites + six-number
+# geomean only until bench_gate_v2_from_block below, which on mainnet is the
+# same block). "off" = keep [scoring]'s mode.
+bench_gate_mode = "enforce"
+# DEC-CA-0061 (rule v2, owner 2026-10-20): from this block the gate's rule is
+# "avg_noninf_winrate" — four suites (FEV joins), per-task ratios, average
+# < 1, no suite's ratio LCB above 1 + [scoring] bench_gate_tolerance at
+# alpha/4, win rate >= [scoring] bench_gate_min_win_rate (replaces the
+# six-number geomean). "v2" = the value of from_block, so the rule goes live
+# with v2 and never re-judges a settled era; 0 = DEC-CA-0054.
+bench_gate_v2_from_block = "v2"
+# DEC-CA-0063 (owner 2026-10-19: "on main branch it scores on main eval first
+# then only evals the benches if the competitor wins … our dedicated GPU for
+# validation"). Overlay-settable (DEC-CA-0057): from this block
+# the lane-A bench rows come from the MAIN validator ([netconfig]
+# owner_hotkey), which sweeps GIFT-Eval/BOOM/TIME (+FEV under DEC-CA-0061) on
+# its own GPU ONLY for a challenger that clears the private pool, plus the era
+# king (cached per pointer) and, when the king check is due, the king + init.
+# It signs bench_v/round-<id>.json (write-once). A validator needs it only
+# when a clearer reaches the gate or the king check is due; it then HOLDS
+# until a later trainer-signed manifest records the report's sha256 (or
+# "absent" after bench_report_timeout_settlements — its clearers are infra,
+# never a loss) and judges from exactly those bytes. The trainer runs no
+# lane-A challenger / king sweep and no payer-pod verification for these
+# eras (the once-per-seed-epoch init bench stays: it publishes the init
+# pointer). "v2" = from_block, so it switches with the v2 go-live. Load-
+# checked: needs king_ladder = true and [netconfig] owner_hotkey set once the
+# resolved block is > 0. The main validator needs a GPU (--device cuda or
+# --eval-hosts) and the benchmark data staged (cascade-benchmark-download).
+bench_source = "validator"
+bench_source_from_block = "v2"
+# DEC-CA-0063 liveness bounds (overlay-settable): the trainer records a
+# validator-sourced settlement's report "absent" in the Nth later settlement
+# built without it (>= 1). bench_sweep_hours = ONE checkpoint's sweep
+# allowance (its retry included): every clearer has its own, the king's sweep
+# has its own (never a clearer's). bench_budget_hours = the settlement CAP over
+# all of them: a clearer starts only while the cap still holds its whole
+# allowance (+ the king's when the king is not swept yet); one that does not
+# fit is published budget_deferred (never a loss) and the trainer carries its
+# leg into the settlement that records the report (<= 2 carries, inside the
+# era). 6.0 / 2.0 = a first clearer + the king, then one more clearer against
+# the cached king. Sweep failures reproduced on both attempts with checkpoint
+# evidence (non-finite forecasts, every config failing at scoring) are a
+# checkpoint_fault (the clearer fails the gate); everything else is infra.
+# Expected sweep time per checkpoint is an owner measurement item
+# (docs/OPERATOR.md "Sizing the sweep"); bench_sweep_hours <= the cap.
+bench_report_timeout_settlements = 8
+bench_budget_hours = 6.0
+bench_sweep_hours = 2.0
+# DEC-CA-0055 launch economics (CONSENSUS; inert until from_block is typed,
+# except the pre-launch burn, which is decided by an on-chain vote):
+# every v2 era before v2_first_era + 14 (7 days) trains from random init, and
+# the promotion reign clock counts from the window's end.
+random_init_eras = 14
+# King-check timing: the check is due at the first settlement whose warm start
+# (min_effective_era) would land >= this many blocks into the reign (counted
+# from no earlier than the window's end) — a pass takes effect 3 days into
+# the reign (first at ~day 10); the era of notice is absorbed, not added.
+reign_warm_start_blocks = 21600
+# Pre-launch burn: from the boundary after 51 % of permit stake signals the
+# DEC-CA-0045 note segment `prelaunch-95-r2`, every pre-v2 vector sends 95 %
+# to burn_uid (miners keep their split of the rest); it ends at the first v2
+# settlement. prelaunch_burn_from_block = <block> types it instead (override).
+prelaunch_burn = 0.95
+# The carried (toto2) king's court is paid at most 5 % of total emissions from
+# the v2 block until a king is crowned at a v2 settlement (lane B unchanged).
+carryover_king_share = 0.05
+# The king check at every ripe reign point (pool increment-LCB vs the init +
+# all six suite means vs the init), king-only (k = 1) promotions backed by a
+# pass, the lane-A share ladder (new king at a margin-tiered start below,
+# +10 % per pass to 95 %, a fail drops to 10 %; the last former king 5 % for
+# 36000 blocks), and the 1 % slash for a king leg the operator had to fund.
+king_ladder = true
+# Margin-tiered start share (owner 2026-10-20, CONSENSUS, overlay-settable):
+# a king crowned at an INCREMENT-unit settlement starts at the start_bp of the
+# highest [lcb_threshold, start_bp] tier its crowning LCB (the family-wise
+# corrected increment-unit LCB the dethrone bar below judged — never the point
+# estimate) meets. Thresholds strictly descending in (0, 1); start_bp in
+# [ladder_fail_bp, ladder_cap_bp], non-increasing down the list. The lowest
+# threshold should equal win_margin_end (the bar's floor): below it no win can
+# happen (a mismatch pays the lowest tier, logged). PLACEHOLDERS — calibrate on
+# seed replicas of one recipe on the private pool (the 0.50 tier must be rare
+# under noise). The dethrone bar itself is unchanged.
+ladder_start_tiers = [[0.50, 8000], [0.25, 6500], [0.10, 5000], [0.01, 2500]]
+# The fixed start for a crowning judged in LEVEL units (random-init eras, a
+# level fallback without an init baseline) or with no duel LCB (a DEC-CA-0048
+# successor): a level LCB is a different statistic, so the tiers never apply.
+ladder_start_level_bp = 5000
+# Escalating key slash (owner 2026-10-20, CONSENSUS, overlay-settable): the
+# FIRST operator-paid king leg of a reign holds the 1 % slash for at least
+# this many eras (6 = one 3-day round) from that settlement, even after a key
+# rotation (then until a king-funded leg); a SECOND lapse in the same reign
+# holds it for the rest of the reign. operator_fault never counts; a crowning
+# resets the count. 0 = the first lapse lifts with the first king-funded leg.
+key_slash_min_eras = 6
+# Lane-A dethrone bar on v2 settlements (owner 2026-10-19: "increment margin
+# to clear go from 10% to 1%") — CONSENSUS. A fresh king's increment-unit LCB
+# bar is win_margin_start, decaying linearly to win_margin_end over
+# margin_warmup_blocks of tenure (18000 ≈ 2.5 d, DEC-CA-0049's window).
+# Applies from [v2] from_block (every validator is on the release by then),
+# so no vote: DEC-CA-0049's 0.4 -> 0.2 keeps judging toto2 eras. A round that
+# falls back to LEVEL units keeps the level bar. Testnet leaves these unset
+# (its v2 is live; setting them would change its verdicts at once).
+win_margin_start     = 0.10
+win_margin_end       = 0.01
+margin_warmup_blocks = 18000
+# The king check's pool bar (DEC-CA-0055 item 4) — kept SEPARATE from the
+# dethrone bar above and FIXED (no tenure decay): the king vs the init in
+# increment units, so 0.2 ≈ an LCB of 0.2 % relative improvement over the
+# init (the statistic is capped at 2). 0.0 = follow the dethrone bar.
+king_check_margin = 0.2
 
-[[activation.pinned]]   # DEC-CA-0048 forfeiture: locked 9165600, forfeit at 9166500
-feature          = "forfeit-42b1a486"
-lock_block       = 9165600
-activation_block = 9166500
+[v2.training]
+# The post-v2 lane-A contract (deploy/presets/cascade-moe-28m.toml), resolved
+# at each era's START block (`--contract-block`): every pre-v2 era keeps the
+# [training] contract above byte-for-byte; the v2 contract's own digest is
+# what a v2 manifest declares (contract_digest moves at the block, not at the
+# release). train_seed_salt must equal [training]'s.
+base_arch          = "cascade_moe"
+arch_preset        = "cascade-moe-28m"
+base_arch_digest   = "767b9525666d7f49eeec24de7642c4f8fe5e007de2b14657312e6c5795d3e877"
+d_model            = 512
+num_layers         = 10
+num_heads          = 8
+head_dim           = 64
+patch_size         = 32
+mlp_expansion      = 2            # unused by cascade_moe (FFN widths live in moe_model.py)
+d_ff               = 1104         # dense FFN width = 8 × 92 + 368 (active MoE width)
+num_quantiles      = 9
+masking            = "contiguous_patch"
+cpm_c_max          = 16
+cpm_p_max          = 0.4
+input_transform    = "arcsinh_causal"
+context_length     = 4096
+horizon            = 64
+# DEC-CA-0053 rides the v2 go-live: lane A trains on corpora the CPU
+# generation tier materialised (corpus_mode = "shards" below — no miner code
+# on the GPU pod), and a series longer than the context is cut into seeded
+# random windows. Context growth
+# (8k → 32k) is a later typed step: context_length_after / _after_block.
+long_series        = "crop"
+target_train_hours          = 3.0
+ref_throughput_tokens_per_s = 3700000  # PLACEHOLDER — MEASURE MoE-28M on the pinned L40S before go-live
+warmup_fraction             = 0.0042   # ≈ 80 steps × 2.1M points at a 40B budget; recompute from the measured budget
+batch_size                  = 64       # 64 groups × 8 channels × 4096 points per update
+batch_denomination = "series"
+budget_denomination = "series_points"  # DEC-CA-0042 series-points billing
+optimizer          = "normuon_adamw"
+base_lr            = 0.0025       # NorMuon LR (spec §4)
+adamw_lr_scale     = 0.2          # AdamW LR 5e-4 = 0.0025 × 0.2
+weight_decay       = 2e-8
+muon_momentum      = 0.96
+muon_row_beta2     = 0.999
+adamw_beta1        = 0.91
+adamw_beta2        = 0.972
+grad_clip          = 7.0
+lr_schedule        = "wsd"
+umup_base_d_model  = 512
+mup_lr_exponent    = 1.42
+warm_lr_scale      = 1.0
+train_seed_salt    = 1337
+max_train_seconds  = 18000
+corpus_mode        = "shards"         # DEC-CA-0053 (see the comment above long_series)
+micro_batches      = 2            # ~56 GiB in one pass > 48 GB L40S; 2 × 32 groups fits
+power_ema_sigma_rels = [0.05, 0.10]
+power_ema_eval     = 0            # the 5 % EMA is the scored artifact
+power_ema_scope    = "leg"        # owner 2026-10-19: the scored EMA restarts every leg, so it
+                                  # reflects only that leg's training (a lineage-long window
+                                  # dilutes the competed block as the lineage grows)
+copula_loss_cap    = 0.1
+copula_samples     = 8
+copula_patches     = 2
+router_lr_scale       = 0.1       # slow router once the lane-B routing gate has opened
+route_bias_rate_scale = 0.25      # (owner-tunable; full rate before the gate opens)
+expected_gpu       = ""
+# RE-PIN before go-live: the worker image bakes the code (deploy/Dockerfile
+# COPY . + [round] worker_code_fingerprint); worker-v0.9.0 (below) predates
+# moe_model.py and --router-slow. Rebuild from the v2 release and pin it here.
+train_image_digest = "sha256:43c07d4207d7693517d74203f6783fdd2c2f91e3d475f38db38e4798ae97785e"
 
-[[activation.pinned]]   # DEC-CA-0049 dethrone bar v2: locked 9190800, bar from era start 9194400
-feature          = "margin-v2-d30eb443"
-lock_block       = 9190800
-activation_block = 9194400
+[lane_b]
+# Domain-expert lane (DEC-CA-0050), launched separately from lane A.
+# 0 = off: lane A keeps the full allocation. To launch B, announce an era
+# start at/after [v2] from_block; its first settlement allocates A/B 75/25.
+# CONSENSUS: from_block, share, decay,
+# TTL, remainder, domains, verdict params. Owner-tunable values marked.
+from_block = 0
+share     = 0.25                   # owner-tunable: B keeps 25% when C launches
+remainder = "burn"                 # unpaid decay + empty domain slots burn
+# The tsbench-forge domain labels (TSBench-Forge src/sources/sources.yaml,
+# copied verbatim onto every pool window) — one emission slot each.
+domains = ["econ_fin", "energy", "healthcare", "nature", "sales", "transport", "web_cloudops"]
+# Payout schedule, counted in ERAS (era_settlements settlements): 100 % for
+# a GAIN-TIERED full period, then halving every half_life_rounds eras to
+# `floor`; payout STOPS at win_ttl_eras (merged weights stay in the king
+# forever). Gain-tiered full-pay period (owner 2026-10-20, CONSENSUS,
+# overlay-settable): full_pay_tiers = [[lcb_threshold, full_eras], ...],
+# thresholds strictly descending in (0, 1), full_eras non-increasing and
+# <= win_ttl_eras; a win pays in full for the full_eras of the HIGHEST
+# threshold its target gain LCB meets (a multi-target leg: per target, each
+# by its own LCB), fixed at the win and recorded on it (never re-evaluated).
+# Below the lowest threshold (cannot happen while it is <= gain_margin) pays
+# the lowest tier, flagged below_floor. UNCALIBRATED PLACEHOLDERS: lane-B
+# domain LCBs are noisy (few windows / sources per domain) — set the
+# thresholds from real win LCBs before arming.
+full_pay_tiers   = [[0.05, 10], [0.02, 5], [0.01, 2]]   # owner-tunable
+half_life_rounds = 1.0             # owner-tunable
+floor            = 0.1             # owner-tunable
+win_ttl_eras     = 28              # owner-tunable: 14 days of 12 h eras
+# replay_settlements: unset ⇒ (win_ttl_eras + 1) × era_settlements, so a
+# rebuilt validator's lane-B state holds every still-paying win.
+# Verdict (gain = superiority, guards = non-inferiority, all at alpha)
+alpha              = 0.05
+bootstrap_B        = 10000
+gain_margin        = 0.01          # > 0 (load-checked): an unchanged expert must not merge
+tau_domain         = 0.01
+tau_public         = 0.01
+min_target_windows = 100
+min_target_clusters = 5            # distinct sources among the target windows, else inconclusive
+min_guard_windows  = 50
+min_public_items   = 10
+require_public     = ["gift", "boom", "time", "fev"]
+# Trainer policy
+open_tokens       = 200000000000   # 200B lineage tokens before lane B opens
+routing_jaccard   = 0.7
+routing_overlap   = 0.8
+rebase_jaccard    = 0.5
+rebase_overlap    = 0.7
+esft_p            = 0.2
+min_experts       = 8
+max_experts       = 38
+legs_per_domain   = 1
+max_base_age_eras = 2
+leg_hours         = 3.0
+affinity_windows  = 256
+# CONSENSUS merge guards (DEC-CA-0050 "state at merge"): from this era start
+# validators refuse an era init whose lane-B merges overlap on any (layer,
+# row) and any non-finite expert delta. "v2" = [v2] from_block (every lane-B
+# era on mainnet); an integer is a typed era boundary; 0 = never.
+merge_guard_from_block = "v2"
+# Individual wins only qualify; payment starts after a passing incremental
+# merge at a warm start. Activate with v2 on this not-yet-launched lane.
+acceptance_from_block = "v2"
+# Trainer policy (DEC-CA-0059 item 8): "miner" = lane-B legs rent on the
+# miner's key via /v1/lane-b/fund (no operator fallback); "operator" = the
+# retired operator lane pool (dev / emergency only).
+leg_funding = "miner"
+
+
+[lane_c]
+# Fine-tuning lane (DEC-CA-0056). SHIPPED INERT: from_block = 0 (off). The
+# owner types an ERA-BOUNDARY block at or after [v2] from_block; every
+# validator must run the lane-C release before it (no readiness vote). The
+# era starting at from_block is the first lane-C era; the settlement AT it is
+# still a pre-lane-C receipt. CONSENSUS: share, takes_from, remainder,
+# targets, payout schedule and verdict. Owner-tunable values marked.
+# MarketCast-only lane C (owner 2026-10-20): lane C is a container for
+# competitions, and a competition needs a FORWARD-ONLY eval. Today the only
+# one is MarketCast (DEC-CA-0064, mkt:<suite>); the generic domain: / freq: /
+# horizon: targets on the public-feed pool_c are refused at load (their
+# windows could be scraped and memorised). Lane C has no pool of its own.
+from_block = 0
+share      = 0.25                  # owner-tunable: taken from lane A ⇒ A 50 / B 25 / C 25
+takes_from = "lane_a"
+remainder  = "burn"                # unpaid decay + empty target slots burn
+# One emission slot each: "mkt:<suite>" for a [marketcast] suites member
+# (the list must match it). Listed but inactive while [marketcast]
+# from_block = 0: zero active slots, lane C's whole share burns.
+targets = ["mkt:returns", "mkt:vol"]
+# Payout schedule in ERAS (lane B's rule): 100 % for a GAIN-TIERED full
+# period after the judging settlement, then halving every half_life_rounds
+# eras to floor; payout STOPS at win_ttl_eras. full_pay_tiers (owner
+# 2026-10-20, CONSENSUS, overlay-settable; same shape and checks as [lane_b]):
+# the confirmed win's gain LCB picks the full_eras of the highest threshold it
+# meets, fixed at the win. mkt: targets use [marketcast] full_pay_tiers.
+# UNCALIBRATED PLACEHOLDERS — set from real lane-C win LCBs before arming.
+# A confirmed win takes the slot only with a STRICTLY higher gain LCB than a
+# holder on the same king (else the slot and its clock stay); a holder
+# trained on an older king is replaced.
+full_pay_tiers   = [[0.05, 10], [0.02, 5], [0.01, 2]]   # owner-tunable
+half_life_rounds = 1.0             # owner-tunable
+floor            = 0.1             # owner-tunable
+win_ttl_eras     = 28              # owner-tunable: 14 days of 12 h eras
+# Verdict: an mkt: entry is judged by MarketCast ([marketcast] alpha /
+# gain_margin / min_windows ...), paired vs the pinned base on forward-only
+# windows. The keys below are lane C's own verdict defaults, kept for the
+# next registered forward-only competition (MarketCast does not read them).
+alpha              = 0.05
+bootstrap_B        = 10000
+gain_margin        = 0.01          # owner-tunable
+min_target_windows = 100
+min_target_clusters = 5
+n_windows          = 1000          # windows drawn per target per settlement
+tau_public         = 0.01
+min_public_items   = 10
+# guard_public: none — public bench guards are refused on mkt: targets.
+# Trainer policy (no consensus impact)
+leg_hours          = 1.0
+legs_per_target    = 2
+max_base_age_eras  = 2
+max_lr_scale       = 1.0           # recipe lr_scale in (0, max_lr_scale]
+max_steps_fraction = 1.0           # recipe steps_fraction in (0, max_steps_fraction]
+
+# Concurrent competitions (owner 2026-10-20, DEC-CA-0056). One table per
+# configured competition; every [lane_c] target's kind needs one. CONSENSUS.
+# Lane C's share is split by weight (normalised over EVERY configured
+# competition, so one starting or ending never changes another's pay: an
+# idle competition's part burns), then equally among its targets.
+#   weight             >= 0                     (overlay-settable, DEC-CA-0057)
+#   from_block         era boundary >= [lane_c] from_block; 0 = not started.
+#                      MarketCast's start is [marketcast] from_block (one
+#                      source of truth) — from_block is refused here for mkt.
+#   until_block        era boundary after the start; 0 = no end (overlay-
+#                      settable, never to or from a block already passed).
+#                      The settlement AT it is the last judged; after it no
+#                      entry is admitted, dispatched or judged.
+#   wind_down          "finish_full_pay" (default): a win held at the end keeps
+#                      100 % while inside its own tiered full-pay period AND
+#                      within wind_down_max_eras eras of the end, then stops
+#                      (no decay tail); "stop": pay stops at the end.
+#   wind_down_max_eras default 6
+# Adding a competition kind is a release (its eval is code); see docs/OPERATOR.md.
+[lane_c.competitions.mkt]
+weight             = 1.0
+until_block        = 0             # no end
+wind_down          = "finish_full_pay"
+wind_down_max_eras = 6
+
+
+# CPU generation tier (DEC-CA-0053; operator-side, never in contract_digest).
+# It serves exactly the legs whose effective contract has corpus_mode =
+# "shards" — on mainnet that is [v2.training], so it goes live with v2.
+[generation]
+enabled            = true          # allowed; it runs only for legs whose contract is "shards"
+                                   # ([v2.training] from [v2] from_block), so inert until v2
+providers          = ["targon", "shadeform"]   # preference order; Lium has no CPU VMs
+vcpus              = 32            # the pinned per-leg shape (owner pays; Targon CPU XLarge $1.00/h)
+child_memory_mb    = 2048
+children           = 0             # 0 = one sandbox child per vCPU
+max_parallel_jobs  = 2             # shared CPU VM cap; additional corpora wait
+max_price_per_hour = 1.25
+window_seconds     = 5400          # 90-minute generation window; CPU budget = vcpus x this
+target_points      = 50_000_000_000
+shard_points       = 16_777_216      # ~64 MB float32; a streaming pod holds ~2 per child
+max_length         = 32768
+storage_prefix     = "corpora/"
+bucket             = ""            # "" = [storage] manifest_bucket (private; kings get public-read)
+vm_image           = ""            # provider VM image (Targon: set before go-live)
+retention_days     = 14            # non-king corpora are deleted after this
+king_publish       = "recipe"      # "full" | "recipe" (ref + seed + digest + sample shards)
+sample_shards      = 4
+
+[netconfig]
+network_id = "bittensor:finney"
+# Owner-signed network config (DEC-CA-0057). The ONE hotkey whose signed
+# overlay (config/network/seq-<n>.json + latest.json in the manifest bucket)
+# validators adopt: the owner's MAIN validator hotkey (the same key that signs
+# the results satellites replay, DEC-CA-0058). An overlay may change only
+# [scoring], [eval], the [round] schedule keys, [v2] runtime policy,
+# [lane_b], [lane_c] and listed numeric [marketcast] controls; adopted by the tally (a
+# `cfg-<8 hex>` note segment, 51 % of permit stake) and applies at its
+# era-start effective_block (or the first era start after a late lock-in).
+# "" = completely inert: nothing fetched, signalled or applied.
+owner_hotkey = "5FcCsoB2R5M55RdrNrvPQv7xmLJRFzs7R7C73UUSxgUCyfsw"  # main validator: benchmark and policy signer
+poll_seconds = 300                 # how often latest.json is re-read
+
+[satellite]
+# Satellite validators (DEC-CA-0058, `cascade-satellite`): replay the main
+# validator's ([netconfig] owner_hotkey) signed receipts and set the vector
+# that replay derives — no model, no pool, no torch. Read only by satellites.
+# When the main validator is silent a satellite re-asserts its last verified
+# vector until stale_after_blocks past that settlement's boundary, then burns
+# until a new receipt verifies.
+stale_after_blocks = 3600          # one era
+poll_seconds       = 60            # how often the main validator's receipts are re-read
+max_walk           = 64            # receipts walked back per poll to reach the last replayed one
+
+# ── Lane D: distillation / real data (DEC-CA-0062) — WIRED, NOT IMPLEMENTED ──
+# Placeholder table so config, overlays and dashboards have a home for it.
+# from_block > 0 is REFUSED at load until the DEC is filled in and the trainer
+# + validator halves ship. Owner fills in targets, teacher and real corpus.
+[lane_d]
+from_block      = 0              # refused > 0 until implemented
+share           = 0.0            # of the total, carved from takes_from
+takes_from      = "lane_b"       # lane_a | lane_b | lane_c
+targets         = []             # TBD
+teacher_ref     = ""             # TBD: the teacher to distil from
+teacher_api     = "ephemeris"    # owner: Ephemeris TS foundation-model API (validators never call it)
+teacher_mode    = "route"        # route | ensemble | explicit (explicit needs teacher_models)
+real_corpus_ref = ""             # TBD: owner-pinned real corpus (DEC-CA-0028 pattern)
+data_sources    = ["real", "prior_corpus"]  # miners SELECT data (no generator): real and/or prior training corpora
+augmentations   = []             # TBD: the allowed augmentation list
+expert_choice   = "miner"        # miner | affinity | all
+max_context_length = 32768       # longer-context legs, up to 32k
+pool_prefix     = "pool_d"
+gain_margin     = 0.01
+
+# ── MarketCast: lane-C fine-tune eval on Timestral-28M (DEC-CA-0064) — BUILT, SHIPPED OFF ──
+# Fine-tunes of a PINNED third-party base (mistralai/Timestral-28M, Modified
+# MIT licence with a USD 20M/month revenue restriction that extends to
+# derivatives — owner/legal open item) are judged paired vs the untouched base
+# on forward-only market windows, one lane-C slot per suite (target
+# "mkt:<suite>", listed in [lane_c] targets). Arming (from_block > 0) is
+# load-checked: an era boundary >= [v2] from_block and >= [lane_c] from_block,
+# [v2] bench_source = "validator" in force (the main validator's GPU scores
+# MarketCast), [netconfig] owner_hotkey set, base pinned, and a built data
+# source for every class that lists assets. Base, activation and data contract
+# are release-only; listed numeric verdict/payout/liveness controls allow overlays.
+[marketcast]
+from_block         = 0                          # off; an era-boundary block arms it
+base_ref           = "mistralai/Timestral-28M@180698bbf5a50dda3516aa6419798437fb03a430"
+base_sha256        = "dfc83c6220937ce5fc6687b35a4df94cd25e28a2cfe6fb92a23dad6301b2015d"  # model.safetensors (HF LFS oid)
+base_arch          = "timestral"
+suites             = ["returns", "vol"]         # launch set; also range | funding | liquidity | alpha
+coverage_levels    = [0.5, 0.8, 0.98]           # calibration gate on mkt:returns AND mkt:vol
+coverage_tolerance = 0.05                       # owner-tunable: fail if empirical < nominal - tolerance
+alpha              = 0.05
+gain_margin        = 0.01                       # never 0
+# Gain-tiered full-pay period of an mkt: win (owner 2026-10-20), on lane C's
+# slot TTL and decay: [[lcb_threshold, full_eras], ...] like [lane_c]'s, but
+# its OWN table — the MarketCast LCB is a horizon-equal clustered geomean gain
+# on one suite's loss vs the pinned base, not lane C's sqrt(WQL*MASE) gain vs
+# the king, so one threshold is not the same evidence in both. Overlay-settable;
+# full_eras <= [lane_c] win_ttl_eras
+# (load-checked). UNCALIBRATED PLACEHOLDERS.
+full_pay_tiers     = [[0.05, 10], [0.02, 5], [0.01, 2]]
+min_windows        = 200                        # spread over >= min_time_blocks (review M10)
+min_clusters       = 8                          # distinct (asset class, time block) clusters
+pool_prefix        = "pool_mkt"
+max_context_length = 32768
+embargo_days       = 30                         # recipe training data ends this long before submission
+max_synthetic_fraction = 0.5                    # miner generator share of the training mix
+eval_context_length = 4096                      # context steps the base and the fine-tune both see
+windows_per_cell   = 48                         # per (asset, horizon), spread evenly: 2 per 6 h block over 6 days
+start_margin_seconds = 3600                     # windows start >= 1 h after the train block
+verdict_wait_blocks = 43200                     # an entry waits up to 6 days for its windows to close
+snapshot_days      = 21                         # realized 1m bars per eval snapshot
+coarse_history_days = 180                       # hourly bars for >= 1h series (HL serves ~208 d of 1h)
+report_timeout_settlements = 8                  # trainer records a missing report "absent" after this
+max_infra_deferrals = 8                         # main-validator compute failures before an uncharged drop
+cluster_block_hours = 6                         # bootstrap clusters = asset class x 6 h block
+min_time_blocks    = 8                          # >= 2 days of distinct 6 h blocks before a verdict
+min_bar_coverage   = 0.8                        # live-bar share in the 24 h before a window
+min_dollar_volume_24h = 1000000.0               # USD traded in the 24 h before a window (0 = off)
+coverage_tolerance_over = 0.10                  # gated levels also fail above nominal + this
+coverage_gate_levels = [0.5, 0.8]               # per horizon, class-weighted like the gain; 98 % report-only
+# Red-team fixes 2026-10-20 (DEC-CA-0064 §Red-team fixes). The gain is a
+# geomean over cells (asset class x 6 h block x horizon) of each cell's ratio
+# of MEAN CRPS — never the log of one window's CRPS (that rewarded too-narrow
+# quantiles against an oracle base). No filter reads the realised target.
+zero_scale_frac    = 0.001                      # cell masked (recorded) if base mean CRPS <= this x its horizon's median cell
+cell_ratio_cap     = 4.0                        # each cell's ft/base ratio clipped to [1/4, 4]
+tail_levels        = [0.05, 0.95]               # tail gate: hit rate beyond q_l within tail_tolerance of 5 %
+tail_tolerance     = 0.025                      # per horizon AND pooled over horizons
+calibration_z      = 3.0                        # every calibration tolerance >= 3 standard errors (thin classes)
+near_dup_tol       = 0.02                       # mean |dq| / base 5-95 % width vs a senior entry below this => duplicate
+max_open_legs_per_coldkey = 1                   # trainer policy: open MarketCast legs per coldkey
+
+[marketcast.assets]                             # the Hyperliquid-listed universe (2026-10-19)
+crypto      = ["BTC", "ETH", "SOL", "XRP", "HYPE", "BNB", "DOGE", "ADA", "AVAX", "LINK",
+               "SUI", "TRX", "LTC", "DOT", "BCH", "NEAR", "APT", "ARB", "OP", "TAO", "ENA",
+               "AAVE", "UNI", "INJ", "TIA", "SEI", "WIF", "JUP"]
+fx          = ["EUR", "JPY", "GBP"]             # all HL lists (xyz:, vs USD); other crosses: owner open item
+metals      = ["GOLD", "SILVER", "PLATINUM", "PALLADIUM"]
+commodities = ["CL", "BRENTOIL", "NATGAS", "COPPER"]
+equity_etf  = ["SP500", "XYZ100", "JP225", "KR200", "SMH", "XLE", "TLT", "XBI", "EWJ",
+               "EWY", "EWZ", "EWT", "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA"]
+alpha       = ["SN1", "SN8", "SN19", "SN50", "SN64", "SN88", "SN91", "SN123"]
+
+[marketcast.data_sources]                       # "<primary>[+<cross-check>]"; "" refuses arming the class
+crypto      = "hyperliquid+binance_spot"        # HL perps 1m + funding; Binance spot 1m cross-check
+fx          = "hyperliquid_xyz"                 # perp prices (basis, off-hours drift); Pyth / Chainlink = open candidates
+metals      = "hyperliquid_xyz"
+commodities = "hyperliquid_xyz"
+equity_etf  = "hyperliquid_xyz"
+alpha       = "bittensor_alpha"                 # subnet pool state via the pinned bittensor SDK

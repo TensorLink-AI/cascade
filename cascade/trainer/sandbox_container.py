@@ -218,10 +218,18 @@ def run_in_container(
             raise CorpusError(f"generator_output_rejected: {meta.get('error')}")
 
         series = _load_series(out_dir / "corpus.npz", int(meta["n_series"]))
+        from ..interface.generator import SeriesValidator
+
+        validator = SeriesValidator.from_config(cfg)
+        for index, item in enumerate(series):
+            try:
+                series[index] = validator.process(item, index)
+            except ValueError as e:
+                raise CorpusError(f"generator_output_rejected: {e}") from e
         digest = corpus_digest(series)
         if digest != meta.get("digest"):
             raise CorpusError("sandbox_digest_mismatch: corpus altered in transit")
-        total = int(sum(int(s.size) for s in series))
+        total = int(sum(int((s["values"] if isinstance(s, dict) else s).size) for s in series))
         return CorpusResult(series=series, digest=digest, n_series=len(series),
                             total_points=total)
 

@@ -206,6 +206,12 @@ def _load_generator(
     interface_version: int = SUPPORTED_INTERFACE_VERSION,
     real_corpus_dir: str = "",
 ) -> DataGenerator:
+    # In-process execution of miner code: never in a process that holds the
+    # trainer wallet / private eval pool (a sandbox child is a fresh process
+    # and never carries the marker) — raises SandboxPolicyError.
+    from ..shared.sandbox_policy import require_generator_sandbox
+
+    require_generator_sandbox(None, "_load_generator", in_process=True)
     wrapper_py = repo_dir / "generator.py"
     if not wrapper_py.is_file():
         raise CorpusError("missing generator.py")
@@ -278,6 +284,7 @@ def build_corpus(
             max_length=cfg.max_length,
             max_total_points=cfg.max_total_points,
             max_channels=cfg.max_channels,
+            min_channels=cfg.min_channels,
             max_abs=cfg.max_abs_value or CAST_SAFE_MAX_FLOAT32,
             reject_constant=cfg.reject_constant,
             max_dup_fraction=cfg.max_dup_fraction,

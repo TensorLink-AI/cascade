@@ -6,7 +6,7 @@ status: active
 date: 2026-07-22
 tags: [cascade, warm-start, koth, incentives, consensus]
 revisit_when: "evidence that a reigning king's promoted init confers a relative advantage on the king (it shouldn't — both roles train from the shared init), or a redesign of the KOTH margin schedule that makes tenure unbounded"
-relations: {}
+relations: {supersedes: [DEC-CA-0005]}
 ---
 On a Cascade promotion the throne PERSISTS: the king stays crowned and only
 the reign clock + checkpoint log reset (re-crown the same king). The vacate

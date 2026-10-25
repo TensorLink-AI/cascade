@@ -27,6 +27,7 @@ from .crps import wql_per_window
 
 
 def _seed_to_int(seed: int | str) -> int:
+    """Stable seed → 64-bit int (blake2b); ints pass through unchanged."""
     if isinstance(seed, int):
         return seed
     h = hashlib.blake2b(seed.encode("utf-8"), digest_size=8).digest()
@@ -348,8 +349,8 @@ def joint_bag_geomeans(
     comparisons *within* a column are the informative direction.
 
     This generalises :func:`_rel_bootstrap_aggregated` (which is the two-row
-    case) to the heat's N-way field, where the question is a selection ("which
-    entrant is best?") rather than a two-sided test.
+    case) to an N-way cohort — the shared draw the max-T correction
+    (:func:`cohort_maxt_lcbs`) rides on.
 
     Raises ``ValueError`` if the competitors are not paired — differing window
     counts, or ``abs_target`` vectors that disagree (``abs_target`` depends only
@@ -358,7 +359,7 @@ def joint_bag_geomeans(
     if not components:
         return np.zeros((0, B), dtype=np.float64)
 
-    qloss0, abs0, mase0 = components[0]
+    qloss0, abs0, _ = components[0]
     if qloss0.ndim != 2:
         raise ValueError(f"qloss must be (N, num_q); got {qloss0.shape}")
     n = qloss0.shape[0]

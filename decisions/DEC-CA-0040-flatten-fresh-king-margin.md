@@ -116,5 +116,5 @@ hysteresis to break ties.
 `margin_activation_block` / `win_margin_start_prev` (set the prev to the current
 0.01), ARMED AT RELEASE under one coordinated validator-upgrade window — a
 config-mixed fleet forks verdicts exactly as the decay flip did
-(docs/MARGIN_DECAY_ROLLOUT.md). `chain.toml` is NOT modified by this node; the
+(the margin-decay rollout runbook, retired; in git history before cleanup/sweep). `chain.toml` is NOT modified by this node; the
 param flip is a separate owner-gated change after the replay + testnet gate pass.

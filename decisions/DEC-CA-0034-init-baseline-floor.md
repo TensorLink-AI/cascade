@@ -2,7 +2,8 @@
 id: DEC-CA-0034
 type: decision
 title: "Init-baseline: a null baseline for KOTH — heat shadow row + duel-side dethrone floor (gift-gate shaped), shipped off"
-status: proposed
+status: accepted
+note: "The duel-side gate runs in shadow ([scoring] init_gate_mode). The heat-side shadow standings row was removed with the heat screen."
 date: 2026-08-26
 tags: [cascade, koth, verdict, baseline, warm-start, consensus, receipts, observability]
 revisit_when: "Shadow logs from a few rounds exist (pick enforce tolerance from data, never from principle); or the DEC-CA-0033 recipe arms and entrants start beating the init (then strict enforce becomes meaningful); or a zero-train/min-tokens trainer guard lands (the floor does NOT catch a pristine-init upload — it scores EQUAL, not worse)"

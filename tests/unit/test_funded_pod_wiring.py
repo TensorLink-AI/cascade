@@ -11,7 +11,6 @@ import pytest
 
 import cascade.provision.funded as funded_mod
 import cascade.trainer.loop as loop_module
-from cascade.funding.queue import FundedQueue
 from cascade.funding.vault import PayerKeyVault
 from cascade.provision.core import PodAddress
 from cascade.provision.state import PodInstance
@@ -59,67 +58,55 @@ def _runner(tmp_path, *, sku="RTX4090", image="ghcr.io/x/worker@sha256:" + "c" *
     # (funded_sku_per_leg) is in force wherever a test turns it on
     fake = SimpleNamespace(cfg=SimpleNamespace(round=rnd,
                                                subnet=SimpleNamespace(netuid=91),
-                                               scoring=SimpleNamespace(era_king_from_block=1),
+                                               scoring=SimpleNamespace(era_king_from_block=1,
+                                                                        cascade_enabled=True),
                                                telemetry=TelemetryConfig()),
                            work_root=tmp_path,
-                           _stage_ctx={"round_id": "", "epoch_start_block": 1,
-                                       "warm_start": None},
-                           _funded_field={}, _funded_leg_failures={},
+                           _funded_leg_failures={},
                            _funded_claimed_execs=set(),
                            _funded_exec_lock=threading.Lock(),
                            _funded_ledger_lock=threading.Lock(),
                            _funded_rent_lock=threading.Lock(),
-                           _funded_admission_info={},
-                           _funded_round_sku="",
                            _funded_king_host=None,
                            _funded_king_lock=threading.Lock(),
                            _funded_bench_pods={},
-                           _funded_bench_pod_round={},
-                           _bench_in_flight={},
                            _funded_bench_lock=threading.Lock(),
                            _final_role_hosts={},
                            cascade_bench_plan=None,
-                           _funded_roster={"seated": [], "waiting": [],
-                                           "terminal": [], "outcomes": []})
+                           )
     fake.hub = lambda: SimpleNamespace(namespace="cascade")
     fake.HUB_ADMIN_ENV = TrainerRunner.HUB_ADMIN_ENV
     fake.FUNDED_HUB_ENV = TrainerRunner.FUNDED_HUB_ENV
     # Default: a working fake robot minter (tests override to simulate faults).
     fake._minter = _FakeMinter()
     fake._hub_robots = lambda: fake._minter
-    for name in ("_sku_per_leg_active",
-                 "_funded_gate_open", "_effective_funded_mode", "_revoke_robot",
+    for name in ("_sku_per_leg_active", "_revoke_robot",
                  "_funded_pod_credential", "_funded_pod_identity_mismatch",
-                 "_funded_checkpoint_mismatch", "_refuse_diverged_king",
-                 "_effective_funded_pods", "_funded_queue", "_payer_vault", "_funded_pod_profile",
-                 "_funded_admission_cap", "_probe_funded_capacity", "_claimed_executors",
-                 "_rent_slot", "_leg_rent_priority", "_capacity_sleep",
+                 "_funded_checkpoint_mismatch", "_refuse_diverged_king", "_funded_queue", "_payer_vault", "_funded_pod_profile", "_probe_funded_capacity", "_claimed_executors",
                  "_funded_skus_for_rent", "_funded_rent_wait_deadline_for",
                  "_funded_epoch_end_known", "_skus_fitting_now", "_leg_wall_seconds",
                  "_funded_price_caps", "_provider_capacity", "_operator_lane_deadline_fn",
                  "_rent_king_host", "_teardown_operator_pod", "_is_king_pod_of",
                  "_harvest_leg",
-                 "_startup_sweep", "_skip_unfunded_round",
                  "_funded_ledger_path", "_load_funded_ledger", "_save_funded_ledger",
                  "_ledger_add", "_ledger_remove", "_reconcile_funded_pods",
-                 "_record_funded_failure", "_rent_funded_host",
-                 "_teardown_funded_pod", "_run_funded_leg", "_settle_funded",
+                 "_record_funded_failure", "_count_funded_loss", "_rent_funded_host",
+                 "_teardown_funded_pod", "_run_funded_leg",
                  "_keep_funded_pod_for_bench", "_teardown_kept_funded_pod",
-                 "_sweep_payer_account",
-                 "_teardown_kept_funded_pods", "_bench_hold_rounds",
-                 "_pod_held_by_bench", "_funded_harvest",
-                 "_harvest_funded_checkpoint", "_pod_checkpoint_dir",
-                 "_filter_funded_challengers", "_submissions_path",
+                 "_sweep_payer_account", "_funded_harvest",
+                 "_harvest_funded_checkpoint", "_pod_checkpoint_dir", "_submissions_path",
                  "_submission_store", "_push_deployed_chain_toml",
                  "_wait_for_funded_capacity", "_funded_rent_wait_deadline",
                  "_operator_fallback_lanes", "_funded_pod_code_mismatch",
                  "_funded_pod_too_slow", "_host_bench_below_floor",
                  "_king_pending", "_yield_to_king", "_pin_king_host_key",
-                 "_operator_rent_allowed", "_operator_leg_pod_prefix",
+                 "_operator_rent_allowed", "_operator_recovery_available",
+                 "_operator_leg_pod_prefix",
                  "_is_operator_leg_pod_of", "_rent_operator_leg_host",
                  "_run_operator_rented_leg"):
         setattr(fake, name, getattr(TrainerRunner, name).__get__(fake))
     fake.FUNDED_MAX_STALE_PODS = TrainerRunner.FUNDED_MAX_STALE_PODS
+    fake.OPERATOR_FAULT_RETRIES = TrainerRunner.OPERATOR_FAULT_RETRIES
     fake.OPERATOR_LEG_POD_TAG = TrainerRunner.OPERATOR_LEG_POD_TAG
     # King pod host-key pin: a canned scanner (never ssh-keyscan in tests) and
     # no real retry sleeps; tests that exercise the scan override both.
@@ -135,8 +122,7 @@ def _runner(tmp_path, *, sku="RTX4090", image="ghcr.io/x/worker@sha256:" + "c" *
     fake.FUNDED_PUBLISH_MARGIN_SECONDS = TrainerRunner.FUNDED_PUBLISH_MARGIN_SECONDS
     fake._probe_funded_capacity = lambda sku, exclude_ids=(): 0
     prof = profile or _profile(tmp_path)
-    fake._hosts_for = lambda stage: [prof]
-    fake.will_run_post_publish_bench = lambda: fake.cascade_bench_plan is not None
+    fake.remote_hosts = [prof]
     return fake
 
 
@@ -222,6 +208,85 @@ def test_rent_success_builds_host_from_profile_and_ledgers_first(tmp_path, monke
     (name, project, days, actions), = runner._minter.created
     assert (project, days, actions) == ("cascade", 1, ("push",))
     assert ledger[0]["robot_id"] == 42 and pod.robot_id == 42
+
+
+def test_boot_wait_releases_selection_lock_after_claiming_executor(tmp_path, monkeypatch):
+    import threading
+    from dataclasses import replace
+
+    runner = _runner(tmp_path)
+    _vault(tmp_path, "hkA")
+    acquired = threading.Event()
+
+    def fake_rent(**kw):
+        assert runner._funded_rent_lock.locked()
+        kw["on_allocated"]("executor-1", _pod().instance_id)
+        assert "executor-1" in runner._claimed_executors()
+
+        def other_lane():
+            with runner._funded_rent_lock:
+                acquired.set()
+
+        t = threading.Thread(target=other_lane)
+        t.start()
+        assert acquired.wait(3), "another lane could not acquire while this pod boots"
+        t.join(timeout=3)
+        return replace(_rent_ok(), machine_id="executor-1")
+
+    monkeypatch.setattr(funded_mod, "rent_funded_pod", fake_rent)
+    _host, pod = runner._rent_funded_host("777", _challenger("hkA"))
+    assert pod.instance_id == _pod().instance_id
+    assert not runner._funded_rent_lock.locked()
+
+
+def test_unconfirmed_bad_pod_release_blocks_a_second_rent(tmp_path, monkeypatch):
+    runner = _runner(tmp_path)
+    _vault(tmp_path, "hkA")
+    queue = runner._funded_queue()
+    queue.add("hkA", REF, reveal_block=1)
+    calls = []
+
+    def rent(**kwargs):
+        calls.append(kwargs)
+        return _rent_ok()
+
+    monkeypatch.setattr(funded_mod, "rent_funded_pod", rent)
+    monkeypatch.setattr("cascade.provision.core.record_host_quarantine", lambda *a: None)
+    runner._funded_pod_code_mismatch = lambda *a: "stale worker image"
+    runner._teardown_funded_pod = lambda p: None
+    with pytest.raises(_FundedLegSkip):
+        runner._rent_funded_host("777", _challenger("hkA"))
+    # The release is unconfirmed (the pod is still in the ledger): no second
+    # rent now. Without operator capacity nothing is flagged as owed; the
+    # ledger and create-intent guards hold the retry until the pod is gone.
+    assert len(calls) == 1 and not queue.get("hkA").operator_billed
+    assert runner._funded_leg_failures["hkA"][2:] == ("infra", False)
+
+
+def test_confirmed_lemon_release_allows_a_bounded_payer_retry(tmp_path, monkeypatch):
+    from cascade.provision.funded import LEMON_CLASS
+
+    runner = _runner(tmp_path)
+    _vault(tmp_path, "hkA")
+    queue = runner._funded_queue()
+    queue.add("hkA", REF, reveal_block=1)
+    runner._funded_rent_wait_deadline = lambda: float("inf")
+    calls = []
+
+    def rent(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            kwargs["on_allocated"]("lemon-executor", _pod().instance_id)
+            # rent_funded_pod reports LEMON only after confirmed cleanup.
+            return funded_mod.FundedRentResult("hkA", False, error="never became ready",
+                                               error_class=LEMON_CLASS, burn_attempt=False)
+        assert not queue.get("hkA").operator_billed
+        return _rent_ok()
+
+    monkeypatch.setattr(funded_mod, "rent_funded_pod", rent)
+    _, pod = runner._rent_funded_host("777", _challenger("hkA"))
+    assert len(calls) == 2 and pod.instance_id == _pod().instance_id
+    assert not queue.get("hkA").operator_billed
 
 
 def test_rent_robot_mint_failure_fails_closed(tmp_path, monkeypatch):
@@ -381,7 +446,6 @@ def _leg_runner(tmp_path, monkeypatch, *, disp):
                         lambda host, ckpt_dir, **kw: PodHygiene())   # a clean pod
     torn = []
     runner._teardown_funded_pod = lambda pod: torn.append(pod.instance_id)
-    runner._funded_field = {"hkA": REF}
     runner._funded_pod_identity_mismatch = lambda pod: None   # pinned pod answers
     runner._funded_checkpoint_mismatch = lambda entry, contract: None   # guard passes
     seeds = SimpleNamespace(base_seed=777)
@@ -436,7 +500,6 @@ def test_vault_ref_leg_stages_the_zip_and_pins_the_pod_env(tmp_path, monkeypatch
                                           f"{host.workdir}/_vault_stage")))
 
     runner._stage_vault_zip_on = fake_stage
-    runner._funded_field = {"hkA": VAULT_REF}
     runner._run_funded_leg(disp, _challenger("hkA", ref=VAULT_REF), seeds, 100,
                            contract, "", warm_start_ref=None)
     assert staged == ["b" * 64]
@@ -546,41 +609,6 @@ def _cap_runner(tmp_path, **kw):
     return r
 
 
-def test_admission_cap_defaults_to_finalist_cap(tmp_path):
-    r = _runner(tmp_path)
-    r.cfg.round = RoundConfig(funded_mode="required", finalists=1, max_finalists=3)
-    assert r._funded_admission_cap() == 3
-
-
-def test_funded_field_cap_overrides_finalist_cap(tmp_path):
-    r = _runner(tmp_path, funded_field_cap=12)
-    assert r._funded_admission_cap() == 12
-
-
-def test_capacity_probe_clamps_to_market_minus_reserve(tmp_path):
-    r = _runner(tmp_path, funded_sku_per_leg=False, funded_field_cap=12, funded_capacity_probe=True,
-                funded_capacity_reserve=1)
-    r._probe_funded_capacity = lambda sku, exclude_ids=(): 5
-    assert r._funded_admission_cap() == 4
-
-
-def test_capacity_probe_failure_clamps_nothing(tmp_path):
-    r = _runner(tmp_path, funded_field_cap=12, funded_capacity_probe=True)
-    r._probe_funded_capacity = lambda sku, exclude_ids=(): None
-    assert r._funded_admission_cap() == 12
-
-
-def test_capacity_zero_seats_nobody_and_queue_holds(tmp_path):
-    r = _runner(tmp_path, funded_sku_per_leg=False, funded_field_cap=12, funded_capacity_probe=True,
-                funded_capacity_reserve=1)
-    r._probe_funded_capacity = lambda sku, exclude_ids=(): 1      # king's reserve eats it
-    FundedQueue(tmp_path / "funded_queue.json").add("hkA", REF, reveal_block=10)
-    kept = r._filter_funded_challengers([_challenger("hkA")])
-    assert kept == []
-    q = FundedQueue(tmp_path / "funded_queue.json")
-    assert q.get("hkA").status == "queued"        # holds, unburned
-
-
 def test_concurrent_rents_claim_distinct_executors(tmp_path, monkeypatch):
     r = _runner(tmp_path)
     _vault(tmp_path, "hkA")
@@ -668,84 +696,14 @@ def test_roster_check_skips_when_unpublished():
     assert check_funded_roster(_receipt(["hkA"]), None).status == SKIP
 
 
-def test_roster_publishes_seats_waiting_and_outcomes(tmp_path):
-    runner = _runner(tmp_path)
-    for name in ("_publish_funded_roster",):
-        setattr(runner, name, getattr(TrainerRunner, name).__get__(runner))
-    runner._funded_admission_info = {"cap": 2, "configured_cap": 2,
-                                     "market_capacity": 5, "reserve": 1}
-    runner._funded_roster = {
-        "seated": [{"hotkey": "hkA", "ref": REF, "reveal_block": 10}],
-        "waiting": [{"hotkey": "hkB", "reveal_block": 20}],
-        "terminal": [], "outcomes": [{"hotkey": "hkA", "outcome": "trained"}]}
-    published = {}
-
-    class _Store:
-        def put_text(self, key, text, **kw):
-            published[key] = json.loads(text)
-
-    runner.manifest_store = lambda: _Store()
-    runner._publish_funded_roster("777")
-    doc = published["funded/round-777.json"]
-    assert doc["admission"]["market_capacity"] == 5
-    assert doc["seated"][0]["hotkey"] == "hkA"
-    assert doc["outcomes"] == [{"hotkey": "hkA", "outcome": "trained"}]
-    assert "funded/latest.json" in published
-
-
 # ── per-round SKU choice + JIT king ──────────────────────────────────────────
-
-def test_multi_sku_picks_most_available(tmp_path):
-    r = _runner(tmp_path, funded_sku_per_leg=False, funded_pod_skus=("RTX4090", "A6000", "RTX3090"))
-    r._probe_funded_capacity = lambda sku, exclude_ids=(): {"RTX4090": 2, "A6000": 9,
-                                            "RTX3090": 4}[sku]
-    r._funded_admission_cap()
-    assert r._funded_round_sku == "A6000"
-    assert r._funded_admission_info["sku_capacities"] == {
-        "RTX4090": 2, "A6000": 9, "RTX3090": 4}
-
-
-def test_multi_sku_tie_breaks_toward_preference_order(tmp_path):
-    r = _runner(tmp_path, funded_sku_per_leg=False, funded_pod_skus=("RTX4090", "A6000"))
-    r._probe_funded_capacity = lambda sku, exclude_ids=(): 7
-    r._funded_admission_cap()
-    assert r._funded_round_sku == "RTX4090"
-
-
-def test_multi_sku_probe_blackout_falls_back_to_first(tmp_path):
-    r = _runner(tmp_path, funded_sku_per_leg=False, funded_pod_skus=("A6000", "RTX4090"),
-                funded_field_cap=6)
-    r._probe_funded_capacity = lambda sku, exclude_ids=(): None
-    assert r._funded_admission_cap() == 6            # no clamp
-    assert r._funded_round_sku == "A6000"
-
-
-def test_multi_sku_capacity_clamp_uses_chosen_sku(tmp_path):
-    r = _runner(tmp_path, funded_sku_per_leg=False, funded_pod_skus=("RTX4090", "A6000"),
-                funded_field_cap=10, funded_capacity_probe=True,
-                funded_capacity_reserve=1)
-    r._probe_funded_capacity = lambda sku, exclude_ids=(): {"RTX4090": 1, "A6000": 4}[sku]
-    assert r._funded_admission_cap() == 3            # A6000: 4 - 1 reserve
-    assert r._funded_round_sku == "A6000"
-
-
-def test_rent_uses_the_rounds_chosen_sku(tmp_path, monkeypatch):
-    r = _runner(tmp_path, funded_sku_per_leg=False, funded_pod_skus=("RTX4090", "A6000"))
-    _vault(tmp_path, "hkA")
-    r._funded_round_sku = "A6000"
-    seen = {}
-    monkeypatch.setattr(funded_mod, "rent_funded_pod",
-                        lambda **kw: (seen.update(kw), _rent_ok())[1])
-    r._rent_funded_host("1", _challenger("hkA"))
-    assert seen["sku"] == "A6000"
 
 
 def test_king_jit_rents_once_ledgers_and_claims_executor(tmp_path, monkeypatch):
     monkeypatch.setattr("cascade.trainer.remote.probe_worker_runtime",
                         lambda host, **kw: "")
     import cascade.provision.core as core_mod
-    r = _runner(tmp_path, funded_king_rent=True)
-    r._funded_round_sku = "A6000"
+    r = _runner(tmp_path, sku="A6000", funded_king_rent=True)
     launched = []
 
     class _Prov:
@@ -983,9 +941,8 @@ def test_funded_leg_keeps_the_pod_for_the_bench_when_armed(tmp_path, monkeypatch
     assert runner._final_role_hosts[("challenger", "toto2-4m", "hkA")] is host
     assert host.isolated and runner._funded_bench_pods["hkA"].instance_id == \
         "cascade-n91-777-funded-hka-0"
-    # the kept-pod sweeps end the bill exactly once
+    # the kept-pod teardown ends the bill
     runner._teardown_kept_funded_pod("hkA")
-    runner._teardown_kept_funded_pods("test")
     assert torn == ["cascade-n91-777-funded-hka-0"]
 
 
@@ -1028,7 +985,6 @@ def _harvest_runner(tmp_path, monkeypatch, *, disp, **round_kw):
                         lambda host, ckpt_dir, **kw: PodHygiene())   # a clean pod
     torn = []
     runner._teardown_funded_pod = lambda pod: torn.append(pod.instance_id)
-    runner._funded_field = {"hkA": REF}
     runner._funded_pod_identity_mismatch = lambda pod: None
     seeds = SimpleNamespace(base_seed=777)
     contract = SimpleNamespace(arch_preset="toto2-4m")
@@ -1123,7 +1079,7 @@ def test_stale_worker_image_probe_rejects_before_dispatch_as_infra(tmp_path, mon
     assert disp.calls == []                       # never dispatched
     assert torn == ["cascade-n91-777-funded-hka-0"]   # pod torn down anyway
     _msg, miner_fault, cls, burn = runner._funded_leg_failures["hkA"]
-    assert (miner_fault, cls, burn) == (False, "infra", True)
+    assert (miner_fault, cls, burn) == (False, "operator", False)   # our image: no burn
 
 
 def test_harvest_transport_failure_is_infra_not_tamper(tmp_path, monkeypatch):
@@ -1162,68 +1118,6 @@ def test_private_vault_king_gets_its_zip_staged_on_the_jit_pod(tmp_path):
     public_king = _challenger("kingHK", ref="tonybilling/gen-64a0412cd332@hf:abc")
     assert runner._stage_king_vault(host, public_king) is host      # untouched
     assert staged == ["d" * 64]
-
-
-def test_round_entry_sweep_keeps_this_rounds_king_pod_for_adoption(tmp_path, monkeypatch):
-    """2026-09-14: the retry's sweep destroyed the king pod that held a
-    complete (upload-failed) checkpoint. The round-entry sweep keeps THIS
-    round's king pod; every other round's operator pod still goes."""
-    r = _runner(tmp_path)
-    mine = PodInstance(provider="lium", instance_id="cascade-n91-4242-funded-king-0",
-                       stage="funded", rented_at_iso="2026-09-14T00:00:00Z",
-                       sku="RTX4090", gpus=1, payer_hotkey="")
-    stale = PodInstance(provider="lium", instance_id="cascade-n91-4141-funded-king-0",
-                        stage="funded", rented_at_iso="2026-09-13T00:00:00Z",
-                        sku="RTX4090", gpus=1, payer_hotkey="")
-    r._ledger_add(mine)
-    r._ledger_add(stale)
-    ops = []
-    r._teardown_operator_pod = lambda pod: (ops.append(pod.instance_id),
-                                            r._ledger_remove(pod.instance_id))
-    monkeypatch.setattr(funded_mod, "teardown_funded", lambda pods, vault, **kw: [])
-    monkeypatch.setattr(funded_mod, "reconcile_funded", lambda o, v, **kw: [])
-    r._reconcile_funded_pods(keep_round_id="4242")
-    assert ops == ["cascade-n91-4141-funded-king-0"]
-    assert [x.instance_id for x in r._load_funded_ledger()] == ["cascade-n91-4242-funded-king-0"]
-    # The boundary sweep (no round to keep) still clears it.
-    r._reconcile_funded_pods()
-    assert ops[-1] == "cascade-n91-4242-funded-king-0"
-    assert r._load_funded_ledger() == []
-
-
-def test_startup_sweep_keeps_the_round_it_is_about_to_run(tmp_path, monkeypatch):
-    """2026-09-14 03:47: the process-start sweep ran before the round id was
-    known and removed the king pod the retry was about to adopt. The startup
-    sweep now runs once the round is derived and keeps that round's pod."""
-    r = _runner(tmp_path)
-    r._ledger_add(PodInstance(provider="lium", instance_id="cascade-n91-4242-funded-king-0",
-                              stage="funded", rented_at_iso="2026-09-14T00:00:00Z",
-                              sku="RTX4090", gpus=1, payer_hotkey=""))
-    r._ledger_add(PodInstance(provider="lium", instance_id="cascade-n91-4141-funded-king-0",
-                              stage="funded", rented_at_iso="2026-09-13T00:00:00Z",
-                              sku="RTX4090", gpus=1, payer_hotkey=""))
-    ops = []
-    r._teardown_operator_pod = lambda pod: (ops.append(pod.instance_id),
-                                            r._ledger_remove(pod.instance_id))
-    monkeypatch.setattr(funded_mod, "teardown_funded", lambda pods, vault, **kw: [])
-    monkeypatch.setattr(funded_mod, "reconcile_funded", lambda o, v, **kw: [])
-    r._startup_sweep(4242)
-    assert ops == ["cascade-n91-4141-funded-king-0"]
-    assert [x.instance_id for x in r._load_funded_ledger()] == ["cascade-n91-4242-funded-king-0"]
-
-
-def test_run_forever_defers_the_startup_sweep_until_the_round_is_known():
-    """Source-level guard for the ``pragma: no cover`` loop: no bare
-    process-start sweep before the first chain read; the deferred one passes
-    the derived round."""
-    import inspect
-
-    from cascade.trainer.loop import TrainerRunner
-
-    src = inspect.getsource(TrainerRunner.run_forever)
-    head = src.split("while True:", 1)[0]
-    assert "_reconcile_funded_pods()" not in head
-    assert "self._startup_sweep(str(base_seed))" in src
 
 
 # ── training divergence (2026-09-14: a NaN checkpoint must never be published) ─
@@ -1296,50 +1190,8 @@ def test_refuse_diverged_king_aborts_on_nan_and_passes_finite(tmp_path, monkeypa
     assert runner._refuse_diverged_king(_king_entry(), SimpleNamespace(arch_preset="toto2-4m")) is None
 
 
-def test_king_dispatch_is_followed_by_the_divergence_refusal():
-    # Source-level pin: the JIT king dispatch must hand its entry to
-    # _refuse_diverged_king before anything else can see it.
-    import inspect
-    src = inspect.getsource(TrainerRunner._train_remote)
-    i = src.index('role="king", base_seed=seeds.base_seed')
-    j = src.index("self._refuse_diverged_king(entry, contract)")
-    assert i < j
-    assert "self._final_role_hosts[" not in src[i:j]
-
-
 # ── 2026-09-15 01:27: a THIRD sweep call site (the unfunded-round skip check) ran
 # without keep_round_id and tore down the round's own king pod on restart ────────
-
-def test_every_sweep_call_site_names_the_round_to_keep():
-    """#272 fixed the startup sweep, this fixes the skip check — pin the CLASS:
-    every call of _reconcile_funded_pods in the trainer passes keep_round_id
-    except the boundary sweep that runs with no round to keep."""
-    import inspect
-    import re
-    src = inspect.getsource(loop_module)
-    calls = [m for m in re.finditer(r"self\._reconcile_funded_pods\(([^)]*)\)", src)]
-    assert len(calls) >= 3
-    bare = [src[max(0, m.start() - 400):m.start()].splitlines()[-1].strip()
-            for m in calls if "keep_round_id" not in m.group(1)]
-    assert bare == [], f"sweep call(s) without keep_round_id: {bare}"
-
-
-def test_unfunded_skip_check_keeps_this_rounds_king_pod(tmp_path, monkeypatch):
-    r = _runner(tmp_path, skip_unfunded_rounds=True)
-    mine = PodInstance(provider="lium", instance_id="cascade-n91-4242-funded-king-0",
-                       stage="funded", rented_at_iso="2026-09-15T01:00:00Z",
-                       sku="RTX4090", gpus=1, payer_hotkey="")
-    r._ledger_add(mine)
-    ops = []
-    r._teardown_operator_pod = lambda pod: (ops.append(pod.instance_id),
-                                            r._ledger_remove(pod.instance_id))
-    monkeypatch.setattr(funded_mod, "teardown_funded", lambda pods, vault, **kw: [])
-    monkeypatch.setattr(funded_mod, "reconcile_funded", lambda o, v, **kw: [])
-    q = r._funded_queue()
-    q.add("hkA", REF, reveal_block=10)          # someone funded ⇒ the round runs
-    assert r._skip_unfunded_round("4242") is False
-    assert ops == []                             # the king pod survived the check
-    assert [x.instance_id for x in r._load_funded_ledger()] == ["cascade-n91-4242-funded-king-0"]
 
 
 # ── payer key TTL must outlive the leg (2026-09-15: 5H8c's key aged out mid-leg) ──
@@ -1394,118 +1246,6 @@ def test_key_lost_reason_comes_from_the_real_identity_check(tmp_path, monkeypatc
     runner = _runner(tmp_path)
     _vault(tmp_path, "hkB")                              # hkA absent
     assert runner._funded_pod_identity_mismatch(_pod("hkA")) == KEY_LOST_REASON
-
-
-# ── the boundary sweep vs an in-flight post-publish bench ────────────────────
-# 2026-09-18 21:43 and 2026-09-19 09:50: the next round's boundary sweep tore
-# down the previous round's king pod (the payer-bench verification host) and
-# a kept payer pod mid-bench; _verify_payer_benches then had no king host and
-# dropped every completed challenger bench — the signed report came out
-# king-only, twice. Pods of a bench still in flight are held.
-
-
-def _kept(instance_id: str, payer: str) -> PodInstance:
-    return PodInstance(provider="lium", instance_id=instance_id, stage="funded",
-                       rented_at_iso="2026-09-19T00:00:00Z", sku="RTX4090", gpus=1,
-                       payer_hotkey=payer)
-
-
-def _held_runner(tmp_path, monkeypatch, *, hold_hours: float = 9.0):
-    import time as _time
-
-    r = _runner(tmp_path)
-    r.cfg.eval = SimpleNamespace(bench_hold_max_hours=hold_hours)
-    _vault(tmp_path, "hkA")
-    _vault(tmp_path, "hkB")
-    prev_king = PodInstance(provider="lium", instance_id="cascade-n91-4141-funded-king-0",
-                            stage="funded", rented_at_iso="2026-09-19T00:00:00Z",
-                            sku="RTX4090", gpus=1, payer_hotkey="")
-    next_king = PodInstance(provider="lium", instance_id="cascade-n91-4242-funded-king-0",
-                            stage="funded", rented_at_iso="2026-09-19T00:00:00Z",
-                            sku="RTX4090", gpus=1, payer_hotkey="")
-    kept = _kept("cascade-n91-4141-funded-hka-0", "hkA")   # kept for 4141's bench
-    stale = _kept("cascade-n91-4040-funded-hkb-0", "hkB")  # an earlier round's leftover
-    for pod in (prev_king, next_king, kept, stale):
-        r._ledger_add(pod)
-    r._funded_bench_pods["hkA"] = kept
-    r._funded_bench_pod_round["hkA"] = "4141"
-    r._bench_in_flight["4141"] = _time.time()
-    ops: list[str] = []
-    payer_torn: list[str] = []
-    r._teardown_operator_pod = lambda pod: (ops.append(pod.instance_id),
-                                            r._ledger_remove(pod.instance_id))
-
-    def fake_teardown(pods, vault, **kw):
-        payer_torn.extend(p.instance_id for p in pods)
-        return []
-
-    monkeypatch.setattr(funded_mod, "teardown_funded", fake_teardown)
-    monkeypatch.setattr(funded_mod, "reconcile_funded", lambda o, v, **kw: [])
-    return r, ops, payer_torn
-
-
-def test_boundary_sweep_keeps_the_pods_of_an_in_flight_bench(tmp_path, monkeypatch):
-    r, ops, payer_torn = _held_runner(tmp_path, monkeypatch)
-    r._reconcile_funded_pods(keep_round_id="4242")
-    # The bench's king pod and its kept payer pod survive; the leftover goes.
-    assert ops == []
-    assert payer_torn == ["cascade-n91-4040-funded-hkb-0"]
-    assert sorted(x.instance_id for x in r._load_funded_ledger()) == [
-        "cascade-n91-4141-funded-hka-0", "cascade-n91-4141-funded-king-0",
-        "cascade-n91-4242-funded-king-0"]
-    # Bench thread exits (hold released) → the next sweep reaps the king pod.
-    r._bench_in_flight.clear()
-    r._teardown_kept_funded_pod("hkA")
-    r._reconcile_funded_pods(keep_round_id="4242")
-    assert ops == ["cascade-n91-4141-funded-king-0"]
-    assert [x.instance_id for x in r._load_funded_ledger()] == ["cascade-n91-4242-funded-king-0"]
-
-
-def test_bench_hold_expires_at_the_cap(tmp_path, monkeypatch):
-    """A hung bench must not turn the hold into an eternally-billing pod: past
-    [eval] bench_hold_max_hours the sweep reaps regardless."""
-    import time as _time
-
-    r, ops, payer_torn = _held_runner(tmp_path, monkeypatch, hold_hours=9.0)
-    r._bench_in_flight["4141"] = _time.time() - 10 * 3600
-    assert r._bench_hold_rounds() == []
-    r._reconcile_funded_pods(keep_round_id="4242")
-    assert ops == ["cascade-n91-4141-funded-king-0"]
-    assert sorted(payer_torn) == ["cascade-n91-4040-funded-hkb-0", "cascade-n91-4141-funded-hka-0"]
-
-
-def test_bench_hold_off_when_cap_is_zero(tmp_path, monkeypatch):
-    r, ops, _ = _held_runner(tmp_path, monkeypatch, hold_hours=0.0)
-    assert r._bench_hold_rounds() == []
-    r._reconcile_funded_pods(keep_round_id="4242")
-    assert ops == ["cascade-n91-4141-funded-king-0"]
-
-
-def test_round_entry_teardown_spares_the_in_flight_benchs_kept_pods(tmp_path, monkeypatch):
-    """run_round's 'previous round's bench left them' sweep takes only pods
-    kept for rounds whose bench is NOT in flight; the bench thread's exit
-    sweep takes only its own round's pods."""
-    import time as _time
-
-    r = _runner(tmp_path)
-    r.cfg.eval = SimpleNamespace(bench_hold_max_hours=9.0)
-    torn: list[str] = []
-    r._teardown_funded_pod = lambda pod: torn.append(pod.payer_hotkey)
-    r._funded_bench_pods.update({
-        "hkA": _kept("pod-a", "hkA"),   # kept for 4141, bench in flight
-        "hkB": _kept("pod-b", "hkB"),   # kept for 4040, that bench is long over
-        "hkC": _kept("pod-c", "hkC"),   # legacy: no round recorded
-    })
-    r._funded_bench_pod_round.update({"hkA": "4141", "hkB": "4040"})
-    r._bench_in_flight["4141"] = _time.time()
-    r._teardown_kept_funded_pods("round entry", exclude_rounds=r._bench_hold_rounds())
-    assert sorted(torn) == ["hkB", "hkC"]
-    assert list(r._funded_bench_pods) == ["hkA"]
-    # 4242's bench thread exiting must not take 4141's pod either.
-    r._teardown_kept_funded_pods("bench finished", round_id="4242")
-    assert list(r._funded_bench_pods) == ["hkA"]
-    r._teardown_kept_funded_pods("bench finished", round_id="4141")
-    assert torn[-1] == "hkA" and r._funded_bench_pods == {} and r._funded_bench_pod_round == {}
 
 
 # ── harvested tensor files must be the ones the worker hashed in memory ───────

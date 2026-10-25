@@ -80,9 +80,9 @@ class RemoteDispatchError(RuntimeError):
 
     ``returncode`` carries the ssh exit status when the failure was a non-zero
     remote/transport exit — 255 marks an SSH transport failure (host
-    unreachable, auth refused, sshd not ready), which the heat fan-out counts to
-    refuse caching a fleet-wide dead-pod wipeout as a completed heat. ``None``
-    for parse/timeout/logic failures that carry no ssh status."""
+    unreachable, auth refused, sshd not ready): a POD fault, which drains the
+    pod's lanes rather than blaming the leg. ``None`` for parse/timeout/logic
+    failures that carry no ssh status."""
 
     def __init__(self, *args, returncode: int | None = None) -> None:
         super().__init__(*args)
@@ -105,13 +105,9 @@ class RemoteHost:
     wandb logs, since the training — and its wandb run — happen on the pod.
     ``cuda_device`` pins ``CUDA_VISIBLE_DEVICES`` on the pod.
 
-    ``stage`` restricts which round stage the pod serves: ``"heat"`` (screen
-    trainings only), ``"final"`` (king/finalist trainings only), or ``"any"``
-    (both — the default, and the pre-stage behaviour). This is the cheap-GPU
-    seam: heats can run on a cheaper SKU class (e.g. A6000) because heat
-    checkpoints are trainer-internal — screened and discarded, never validated —
-    while the final MUST stay on one SKU (the validator's gpu_name gate pairs
-    king and challenger). Keep each stage's pods a single SKU.
+    ``stage`` tags which legs the host may serve: ``"final"`` and ``"any"``
+    entries are operator lanes / the rented-pod profile; ``"heat"`` is still
+    accepted in hosts files (the retired screen stage) and never dispatched to.
     """
 
     name: str
@@ -125,7 +121,7 @@ class RemoteHost:
     chain_toml: str | None = None          # path to chain.toml on the pod (if non-default)
     forward_env: tuple[str, ...] = ()
     ssh_options: tuple[str, ...] = ()       # extra raw `-o Key=Value` style flags
-    stage: str = "any"                      # "any" | "heat" | "final"
+    stage: str = "any"                      # "any" | "final" ("heat" accepted, unused)
     # Fixed (name, value) pairs merged into the dispatch's stdin env AFTER the
     # forward_env copies — per-HOST values the orchestrator's own environment
     # cannot supply (e.g. a funded pod's staged-vault dir, which is a pod-local
@@ -153,6 +149,9 @@ class RemoteHost:
     # fast lane may still take a leg late in the epoch. "" = unknown (the
     # contract's max_train_seconds bounds it).
     sku: str = ""
+    allocation_id: str = ""
+    allocation_provider: str = ""
+    allocation_incident: str = ""
 
 
 def load_hosts(path: Path | str) -> list[RemoteHost]:
@@ -170,7 +169,7 @@ def load_hosts(path: Path | str) -> list[RemoteHost]:
         workdir = "/root/cascade"
         cuda_device = "0"
         forward_env = ["HIPPIUS_S3_ACCESS_KEY", "HIPPIUS_S3_SECRET_KEY", "HIPPIUS_HUB_TOKEN"]
-        stage = "any"       # "heat" | "final" | "any" — which round stage this pod serves
+        stage = "any"       # "final" | "any" (operator lane); "heat" is accepted, unused
         sku = "L40S"        # optional: the lane's GPU type (per-SKU latest safe start)
         isolated = true     # optional: the pod receives NOTHING from the orchestrator's
                             # environment (forward_env ignored); its legs train
@@ -247,15 +246,22 @@ def worker_argv(
     anneal: bool = False,
     local_only: bool = False,
     contract_block: int | None = None,
+    domain: str | None = None,
+    expert_selection: dict | None = None,
+    router_slow: bool = False,
+    corpus_dir: str | None = None,
+    finetune_recipe: str | None = None,
+    continuation_root: str | None = None,
 ) -> list[str]:
     """The ``cascade.trainer.worker`` argv to run on the pod (no env/cd).
 
     ``arch_preset`` pins which configured size the pod trains (the primary size
     or one of ``[[training.sizes]]``); omitted ⇒ the worker trains the primary
     size, preserving single-size behaviour. ``train_hours`` overrides the compute
-    budget (a cheap heat screen); ``repo_suffix`` disambiguates the checkpoint
-    repo so parallel same-size runs (heat challengers) don't collide.
-    ``warm_start_ref`` is the round's pinned Cascade init (a trained_pointer);
+    budget (a reduced-budget leg, e.g. bench-anneal); ``repo_suffix``
+    disambiguates the checkpoint repo so parallel same-size runs (one per
+    challenger uid) don't collide. ``warm_start_ref`` is the era's pinned
+    Cascade init (a trained_pointer);
     the pod fetches it from the registry and trains from its weights instead of
     random init — omitted ⇒ random init."""
     argv = [
@@ -268,12 +274,14 @@ def worker_argv(
         "--block", str(int(block)),
         "--trainer", trainer_spec,
     ]
+    if continuation_root:
+        argv += ["--continuation-root", continuation_root]
     if arch_preset:
         argv += ["--arch-preset", arch_preset]
     if train_hours is not None:
         argv += ["--train-hours", repr(float(train_hours))]
     if repo_suffix:
-        # `=` form: the suffix starts with '-' (e.g. -heat-u3), which argparse
+        # `=` form: the suffix starts with '-' (e.g. -u3), which argparse
         # would otherwise mistake for a flag.
         argv.append(f"--repo-suffix={repo_suffix}")
     if warm_start_ref:
@@ -289,9 +297,46 @@ def worker_argv(
         # DEC-CA-0047: the era's contract block — the worker resolves the
         # scheduled contract switch from it, never from its launch block
         argv += ["--contract-block", str(int(contract_block))]
+    if router_slow:
+        # DEC-CA-0050 slow router (emitted only when true: every other leg's
+        # argv is byte-identical)
+        argv.append("--router-slow")
+    if corpus_dir:
+        # DEC-CA-0053 shards leg: corpus.json + per-shard download links
+        argv += ["--corpus-dir", corpus_dir]
+    if role == "expert":
+        # DEC-CA-0050 lane-B leg: the target domain + the expert rows it owns
+        if not domain or expert_selection is None:
+            raise ValueError("role 'expert' needs domain and expert_selection")
+        import json as _json
+
+        argv += ["--domain", domain, "--selection-json",
+                 _json.dumps({str(k): sorted(v) for k, v in sorted(expert_selection.items())},
+                             separators=(",", ":"))]
+    if role == "finetune":
+        # DEC-CA-0056 lane-C leg: the recipe (validated JSON; the worker
+        # re-validates it) — the base king rides --warm-start-ref
+        if not finetune_recipe or not warm_start_ref:
+            raise ValueError("role 'finetune' needs finetune_recipe and warm_start_ref")
+        argv += ["--recipe-json", finetune_recipe]
+    if role == "mkt_finetune":
+        # DEC-CA-0064 MarketCast leg: {"marketcast": recipe, "has_generator"};
+        # the pinned Timestral base rides --warm-start-ref; always local-only
+        if not finetune_recipe or not warm_start_ref or not local_only:
+            raise ValueError("role 'mkt_finetune' needs finetune_recipe, warm_start_ref and "
+                             "local_only")
+        argv += ["--recipe-json", finetune_recipe]
     if host.chain_toml:
         argv += ["--chain-toml", host.chain_toml]
     return argv
+
+
+def receipt_role(dispatched: str) -> str:
+    """The role a worker's receipt carries for a dispatched role: lane-B
+    expert and lane-C fine-tune legs upload as challengers (their own
+    suffixed repo)."""
+    return ("challenger" if dispatched in ("expert", "finetune", "mkt_finetune")
+            else dispatched)
 
 
 # Training always wins the GPU: every dispatch first kills any still-running
@@ -400,22 +445,11 @@ def _stdin_env(env: dict[str, str]) -> str | None:
     return "".join(f"{k}={shlex.quote(v)}\n" for k, v in sorted(env.items()))
 
 
-# ── detached dispatch (2026-09-18) ───────────────────────────────────────────
-#
-# The attached form above ties a leg's FATE to one ssh session: the worker's
-# stdout (receipt), stderr (reason) and exit code all ride the session, so a
-# transport drop — provider edge blip, keepalive starvation under load — turns
-# a healthy, still-training worker into ``rc=255`` on the orchestrator's side
-# (2026-09-13 5Co2Te after 1h39m; 2026-09-17 5DoJQ after 1h12m; 2026-09-18
-# 02:52 all seven Oslo lanes at once, 8 legs lost and re-queued). The pod-side
-# benches died the same way (u201, three pods). Detached dispatch decouples
-# them: the launch ssh starts the worker under ``setsid nohup`` in its own
-# session writing stdout/stderr/pid/exit_code into a per-leg run dir on the
-# pod and returns at once; the orchestrator then POLLS with short ssh calls —
-# an unreachable pod is retried for ``reattach_grace_seconds`` before the leg
-# is declared lost — and fetches the receipt when the exit code lands. The
-# credentials still travel on stdin only: the launcher sources them exported,
-# the detached session inherits them, nothing touches the pod's disk.
+# Detached dispatch keeps a worker alive across SSH transport failures.
+# setsid/nohup writes stdout, stderr, PID and exit code into a per-leg run
+# directory; short polls retry unreachable pods for reattach_grace_seconds.
+# Credentials arrive on stdin and are inherited through the environment,
+# never written to the pod's disk.
 
 DETACHED_RUN_ROOT = "_train_work/_dispatch"
 # Environment names that look like secrets — flagged when a non-isolated host
@@ -513,7 +547,8 @@ def run_detached(host: RemoteHost, body: str, stdin_env: str | None, run_dir: st
                  timeout: int, poll_seconds: int = DETACHED_POLL_SECONDS,
                  grace_seconds: int = DETACHED_REATTACH_GRACE_SECONDS,
                  runner=None, describe: str = "remote leg",
-                 preempt: str = PREEMPT_BENCHMARKS, launch: bool = True) -> subprocess.CompletedProcess:
+                 preempt: str = PREEMPT_BENCHMARKS, launch: bool = True,
+                 on_running=None, cancel=None) -> subprocess.CompletedProcess:
     """Run ``body`` detached on ``host`` and return a CompletedProcess-shaped
     result (returncode, stdout, stderr) exactly like the attached ssh would —
     the caller's receipt/rc handling is unchanged.
@@ -548,6 +583,10 @@ def run_detached(host: RemoteHost, body: str, stdin_env: str | None, run_dir: st
     vanished = False
     poll_argv = build_ssh_argv(host, _detached_poll_command(host, run_dir))
     while True:
+        if cancel is not None and cancel.is_set():
+            with contextlib.suppress(Exception):
+                run(build_ssh_argv(host, _detached_kill_command(host, run_dir)), 60, "")
+            raise RemoteDispatchError(f"{describe}: redundant leg cancelled", returncode=254)
         _SLEEP(poll_seconds)
         now = time.time()
         if now - t0 > timeout:
@@ -578,6 +617,8 @@ def run_detached(host: RemoteHost, body: str, stdin_env: str | None, run_dir: st
         misses = 0
         last_seen = now
         if token == "RUNNING":
+            if on_running is not None:
+                on_running()
             continue
         if token == "GONE":
             vanished = True
@@ -903,8 +944,13 @@ class LocalTrainReceipt:
     checkpoint_dir: str            # pod-local path of the trained checkpoint
     gpu_name: str = ""
     size: str = ""
+    init_pointer: str | None = None
+    training_contract_digest: str = ""
     # {tensor file: sha256} hashed in memory at save time (empty: not reported)
     tensor_digests: dict[str, str] = field(default_factory=dict, hash=False)
+    # DEC-CA-0064 MarketCast leg only: {base_ref, base_sha256,
+    # checkpoint_sha256, recipe_digest, data_digest}
+    marketcast: dict = field(default_factory=dict, hash=False)
 
 
 def receipt_to_local(receipt: dict) -> LocalTrainReceipt:
@@ -920,15 +966,46 @@ def receipt_to_local(receipt: dict) -> LocalTrainReceipt:
             checkpoint_dir=str(receipt["local_checkpoint_dir"]),
             gpu_name=str(receipt.get("gpu_name", "")),
             size=str(receipt.get("size", "")),
+            init_pointer=receipt.get("init_pointer"),
+            training_contract_digest=str(receipt.get("training_contract_digest", "") or ""),
             tensor_digests={str(k): str(v) for k, v in
                             dict(receipt.get("tensor_digests") or {}).items()},
+            marketcast={str(k): str(v) for k, v in
+                        dict(receipt.get("marketcast") or {}).items()},
         )
     except (KeyError, ValueError, TypeError) as e:
         raise RemoteDispatchError(f"receipt is not a valid local-train receipt: {e}") from e
 
 
+class _ProgressReader:
+    """The harvest's ssh stdout as seen by :mod:`tarfile`, counting bytes and
+    stamping the last moment any arrived (the stall watchdog's input)."""
+
+    def __init__(self, raw, clock=time.monotonic) -> None:
+        self._raw = raw
+        self._clock = clock
+        self.nbytes = 0
+        self.last_progress = clock()
+
+    def read(self, n: int = -1) -> bytes:
+        data = self._raw.read(n)
+        if data:
+            self.nbytes += len(data)
+            self.last_progress = self._clock()
+        return data
+
+
+# A checkpoint harvest's hard wall (the whole tar stream) and its no-progress
+# bound: a stalled or trickling stream off the pod must fail the harvest (the
+# caller's infra path), never hang the leg — for the era king, forever.
+HARVEST_TIMEOUT_SECONDS = 3600
+HARVEST_STALL_SECONDS = 300.0
+
+
 def harvest_remote_dir(host: RemoteHost, remote_dir: str, dest: Path | str,
-                       *, timeout: int = 600, runner=None) -> Path:
+                       *, timeout: int = HARVEST_TIMEOUT_SECONDS,
+                       stall_timeout: float = HARVEST_STALL_SECONDS,
+                       runner=None, max_bytes: int | None = None) -> Path:
     """Copy ``host:remote_dir`` into local ``dest`` (tar over ssh, ``dest``
     wiped first), under exactly the dispatch transport policy — a pinned host
     key stays pinned for the harvest. The credential-free pods' return
@@ -938,9 +1015,14 @@ def harvest_remote_dir(host: RemoteHost, remote_dir: str, dest: Path | str,
     :mod:`tarfile`'s ``"data"`` filter (PEP 706): absolute paths, ``..``
     traversal, symlinks/hardlinks escaping ``dest``, and device nodes are all
     refused — a hostile archive fails the harvest instead of writing outside
-    it (or smuggling ``/etc`` into the later upload via a symlink)."""
+    it (or smuggling ``/etc`` into the later upload via a symlink).
+
+    Bounded twice: ``timeout`` seconds for the whole stream and
+    ``stall_timeout`` seconds without a single byte. A watchdog thread kills
+    ssh on either breach, and the harvest raises :class:`RemoteDispatchError`."""
     import shutil
     import tarfile
+    import threading
 
     dest = Path(dest)
     if dest.exists():
@@ -962,22 +1044,84 @@ def harvest_remote_dir(host: RemoteHost, remote_dir: str, dest: Path | str,
                 f"(rc={proc.returncode})", returncode=proc.returncode)
         return dest
     ssh = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stream = _ProgressReader(ssh.stdout)
+    started = time.monotonic()
+    stop = threading.Event()
+    breach: list[str] = []
+
+    def _watchdog() -> None:
+        poll = max(0.05, min(5.0, float(stall_timeout) / 4))
+        while not stop.wait(poll):
+            now = time.monotonic()
+            if now - started > timeout:
+                breach.append(f"no complete archive within {timeout}s "
+                              f"({stream.nbytes} bytes received)")
+            elif now - stream.last_progress > stall_timeout:
+                breach.append(f"stream stalled: no bytes for {stall_timeout:.0f}s "
+                              f"({stream.nbytes} bytes received)")
+            if breach:
+                with contextlib.suppress(OSError):
+                    ssh.kill()
+                return
+
+    dog = threading.Thread(target=_watchdog, name="harvest-watchdog", daemon=True)
+    dog.start()
+
+    def _timed_out() -> RemoteDispatchError | None:
+        if not breach:
+            return None
+        return RemoteDispatchError(
+            f"checkpoint harvest from {host.name}:{remote_dir} timed out: {breach[0]}")
+
     try:
-        with tarfile.open(fileobj=ssh.stdout, mode="r|") as tf:
-            tf.extractall(dest, filter="data")
+        with tarfile.open(fileobj=stream, mode="r|") as tf:
+            extracted_bytes = 0
+            def checked_member(member, directory):
+                nonlocal extracted_bytes
+                checked = tarfile.data_filter(member, directory)
+                if max_bytes is not None and checked is not None:
+                    if not (checked.isdir() or checked.isfile()):
+                        raise tarfile.FilterError('continuation archive has non-regular members')
+                    extracted_bytes += checked.size
+                    if extracted_bytes > max_bytes:
+                        raise tarfile.FilterError('continuation archive exceeds its storage limit')
+                return checked
+            tf.extractall(dest, filter=checked_member)
     except tarfile.TarError as e:
+        stop.set()
         ssh.kill()
         ssh.wait()
-        raise RemoteDispatchError(
+        raise (_timed_out() or RemoteDispatchError(
             f"checkpoint harvest from {host.name}:{remote_dir}: refused or "
-            f"malformed archive: {e}") from e
-    except Exception:
+            f"malformed archive: {e}")) from e
+    except Exception as e:
+        stop.set()
         ssh.kill()
         ssh.wait()
+        late = _timed_out()
+        if late is not None:
+            raise late from e
         raise
     finally:
+        stop.set()
         ssh.stdout.close()
-    ssh_rc = ssh.wait(timeout=60)
+    dog.join(timeout=10)
+    late = _timed_out()
+    if late is not None:
+        # Killed at a member boundary: the truncated stream can parse as a
+        # complete (short) archive — never accept it as the checkpoint.
+        ssh.wait()
+        ssh.stderr.close()
+        raise late
+    try:
+        ssh_rc = ssh.wait(timeout=60)
+    except subprocess.TimeoutExpired as e:
+        ssh.kill()
+        ssh.wait()
+        ssh.stderr.close()
+        raise RemoteDispatchError(
+            f"checkpoint harvest from {host.name}:{remote_dir}: ssh did not exit "
+            f"after the archive") from e
     if ssh_rc != 0:
         err = ssh.stderr.read()[-400:]
         ssh.stderr.close()
@@ -1001,6 +1145,8 @@ def receipt_to_entry(receipt: dict) -> TrainedEntry:
             train_block=int(receipt["train_block"]),
             gpu_name=str(receipt.get("gpu_name", "")),
             size=str(receipt.get("size", "")),
+            init_pointer=receipt.get("init_pointer"),
+            training_contract_digest=str(receipt.get("training_contract_digest", "") or ""),
         )
     except (KeyError, ValueError) as e:
         raise RemoteDispatchError(f"receipt is not a valid TrainedEntry: {e}") from e
@@ -1041,6 +1187,12 @@ class RemoteDispatcher:
     detached: bool = False
     poll_seconds: int = DETACHED_POLL_SECONDS
     reattach_grace_seconds: int = DETACHED_REATTACH_GRACE_SECONDS
+    cancel_event: object = field(default=None, repr=False)
+    continuation_contract: object = field(default=None, repr=False)
+    continuation_marketcast_protocol: str | None = None
+    continuation_root: str | None = None
+    continuation_interval: int = 300
+    continuation_max_bytes: int = 17179869184
     _runner: object = field(default=None, repr=False)  # injectable for tests
 
     def dispatch(
@@ -1061,9 +1213,18 @@ class RemoteDispatcher:
         anneal: bool = False,
         local_checkpoint: bool = False,
         contract_block: int | None = None,
+        domain: str | None = None,
+        expert_selection: dict | None = None,
+        router_slow: bool = False,
+        corpus_files: dict[str, str] | None = None,
+        finetune_recipe: str | None = None,
+        cancel=None,
     ) -> TrainedEntry | LocalTrainReceipt:
         import os
 
+        cancel = cancel if cancel is not None else self.cancel_event
+        if cancel is not None and cancel.is_set():
+            raise RemoteDispatchError("redundant king replica cancelled", returncode=254)
         auto_harvest = False
         if host.isolated and not local_checkpoint:
             if self.harvest is None:
@@ -1073,12 +1234,39 @@ class RemoteDispatcher:
                     "worker that could not upload its checkpoint")
             local_checkpoint = True
             auto_harvest = True
+        mirror = None
+        use_continuation = bool(self.continuation_root)
+        if use_continuation:
+            from .continuation import PROTOCOL
+            if role == 'mkt_finetune' and self.continuation_marketcast_protocol is not None:
+                use_continuation = self.continuation_marketcast_protocol == PROTOCOL
+            elif self.continuation_contract is not None:
+                effective = self.continuation_contract.at_block(contract_block if contract_block is not None else block)
+                use_continuation = getattr(effective, 'continuation_protocol', '') == PROTOCOL
+        if use_continuation:
+            if not self.detached:
+                raise RemoteDispatchError('continuation requires detached dispatch')
+            from .continuation_transport import mirror_for
+            mirror = mirror_for(self, host, {"gen_ref": gen_ref, "hotkey": hotkey,
+                "role": role, "seed": base_seed, "arch": arch_preset,
+                "init": warm_start_ref, "contract_block": contract_block, "experts": expert_selection,
+                "domain": domain, "recipe": ({k: v for k, v in json.loads(finetune_recipe).items() if k != "train_time"}
+                    if role == "mkt_finetune" and finetune_recipe else finetune_recipe), "suffix": repo_suffix,
+                "train_hours": train_hours, "router_slow": router_slow, "anneal": anneal})
+        corpus_dir = None
+        if corpus_files:
+            corpus_dir = push_corpus_files(host, corpus_files,
+                                           f"{role}-{hotkey[:12]}-{int(base_seed)}",
+                                           runner=self._runner)
         argv = worker_argv(
             host, gen_ref=gen_ref, uid=uid, hotkey=hotkey, role=role,
             base_seed=base_seed, block=block, trainer_spec=self.trainer_spec,
             arch_preset=arch_preset, train_hours=train_hours, repo_suffix=repo_suffix,
             warm_start_ref=warm_start_ref, anneal=anneal, local_only=local_checkpoint,
-            contract_block=contract_block,
+            contract_block=contract_block, domain=domain, expert_selection=expert_selection,
+            router_slow=router_slow, corpus_dir=corpus_dir,
+            **({"finetune_recipe": finetune_recipe} if finetune_recipe else {}),
+            **({"continuation_root": mirror.remote_root} if mirror else {}),
         )
         # Per-host forwards plus the trainer's global extras (e.g. WANDB_API_KEY).
         # dict.fromkeys de-dups while preserving order if a host lists one too.
@@ -1098,16 +1286,29 @@ class RemoteDispatcher:
         if self.detached:
             body = _guarded_worker(_lane_prefix(host, lane_count), argv)
             tag = f"{role}-{hotkey[:12]}-{base_seed}"
+            if mirror is not None:
+                tag += '-' + mirror.root.name[:12]
+            elif cancel is not None:
+                import hashlib
+                tag += '-' + hashlib.sha256(json.dumps(argv).encode()).hexdigest()[:12]
             prior = find_detached_run(host, tag, runner=self._runner)
             if prior:
                 log.warning("dispatch role=%s → %s: a run of this leg is already on the "
                             "pod (%s) — attaching, not relaunching", role, host.name, prior)
             run_dir = prior or detached_run_dir(host, tag)
-            proc = run_detached(
-                host, body, _stdin_env(env), run_dir,
+            if mirror is not None and prior is None:
+                mirror.restore()
+            try:
+                proc = run_detached(
+                    host, body, _stdin_env(env), run_dir,
                 timeout=self.timeout_seconds, poll_seconds=self.poll_seconds,
                 grace_seconds=self.reattach_grace_seconds, runner=self._runner,
-                describe=f"remote {role} on {host.name}", launch=prior is None)
+                    describe=f"remote {role} on {host.name}", launch=prior is None,
+                    **({"on_running": mirror.poll} if mirror else {}),
+                    **({"cancel": cancel} if cancel is not None else {}))
+            finally:
+                if mirror is not None:
+                    mirror.close()
         else:
             remote_cmd, stdin_env = build_remote_command(host, argv, env, lane_count=lane_count)
             ssh_argv = build_ssh_argv(host, remote_cmd)
@@ -1143,16 +1344,35 @@ class RemoteDispatcher:
                         "--local-only and uploaded its own checkpoint — accepting "
                         "its pushed receipt (no harvest)", role, host.name, prior)
             entry = receipt_to_entry(receipt)
-            if entry.role != role:
+            if entry.role != receipt_role(role):
                 raise RemoteDispatchError(f"receipt role {entry.role!r} != dispatched {role!r}")
             return entry
         entry = (receipt_to_local(receipt) if local_checkpoint
                  else receipt_to_entry(receipt))
-        if entry.role != role:
+        if entry.role != receipt_role(role):
             raise RemoteDispatchError(f"receipt role {entry.role!r} != dispatched {role!r}")
         if auto_harvest:
             return self.harvest(host, entry, base_seed=base_seed, repo_suffix=repo_suffix)
         return entry
+
+
+def push_corpus_files(host: RemoteHost, files: dict[str, str], tag: str, *,
+                      runner=None) -> str:
+    """Write a shards leg's ``corpus.json`` + ``urls.json`` (DEC-CA-0053) into
+    ``<workdir>/_corpus/<tag>`` on the pod and return that dir. The links go
+    over stdin, never on a command line."""
+    pod_dir = f"{host.workdir}/_corpus/{tag}"
+    run = runner or run_ssh
+    for name, text in files.items():
+        if "/" in name or name.startswith("."):
+            raise RemoteDispatchError(f"bad corpus file name {name!r}")
+        cmd = (f"mkdir -p {shlex.quote(pod_dir)} && "
+               f"cat > {shlex.quote(pod_dir + '/' + name)}")
+        proc = run(build_ssh_argv(host, cmd), 120, text)
+        if proc.returncode != 0:
+            raise RemoteDispatchError(
+                f"pushing {name} to {host.name} failed: {(proc.stderr or '')[-300:]}")
+    return pod_dir
 
 
 def run_ssh(ssh_argv: list[str], timeout: int, stdin_text: str | None = None):
@@ -1163,29 +1383,3 @@ def run_ssh(ssh_argv: list[str], timeout: int, stdin_text: str | None = None):
     so ssh never inherits the orchestrator's own stdin."""
     return subprocess.run(ssh_argv, capture_output=True, text=True, timeout=timeout,
                           input=stdin_text if stdin_text is not None else "")
-
-
-_HEAT_PROBE_TOKEN = "cascade-heat-probe-ok"
-
-
-def probe_host(host: RemoteHost, *, timeout: int = 15) -> bool:
-    """A cheap liveness probe before heat fan-out: an SSH echo over
-    ``BatchMode`` + key auth.
-
-    TCP reachability is NOT sufficient — a booting pod completes the TCP
-    handshake while sshd (or the pod account) is not ready yet, and every
-    dispatch there dies ``rc=255`` (2026-07-23: a dead pod burned all 48
-    challengers in 11s, each a one-and-done ``rc=255``, and the 0/48 heat was
-    cached as legitimate). Only a full SSH round-trip proves the host can run a
-    worker. A host with no address to reach (``host`` unset — offline fakes)
-    cannot be probed and is KEPT, never stranding a fleet on a local config
-    slip; a real :class:`RemoteHost` always carries one. Returns True only when
-    the echo round-trips."""
-    if not getattr(host, "host", None):
-        return True
-    try:
-        proc = run_ssh(build_ssh_argv(host, shlex.join(["echo", _HEAT_PROBE_TOKEN])), timeout)
-    except Exception:  # noqa: BLE001 — any transport failure ⇒ treat as dead
-        return False
-    return (getattr(proc, "returncode", 1) == 0
-            and _HEAT_PROBE_TOKEN in (getattr(proc, "stdout", "") or ""))

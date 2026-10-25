@@ -1,6 +1,6 @@
 """Reference cascade generator — a template miners can fork.
 
-Emits deterministic synthetic univariate series: a mix of trend, multi-seasonal
+Emits deterministic synthetic multivariate series: a mix of trend, multi-seasonal
 sinusoids, AR(1) noise, and occasional level shifts. Everything is driven by the
 single ``seed`` passed in, so two runs at the same seed produce byte-identical
 corpora — the determinism the trainer audits.
@@ -29,6 +29,9 @@ class Generator(DataGenerator):
         self._seed = int(seed)
         self._min_len = int(self._cfg.get("min_length", 128))
         self._max_len = int(self._cfg.get("max_length", 1024))
+        self._channels = int(self._cfg.get("channels", 8))
+        if not 8 <= self._channels <= 32:
+            raise ValueError("v2 generators require 8–32 channels per series")
 
     @property
     def name(self) -> str:
@@ -66,4 +69,13 @@ class Generator(DataGenerator):
                 shift_at = int(rng.integers(length // 4, 3 * length // 4))
                 series[shift_at:] += rng.normal(0.0, 2.0)
 
-            yield series.astype(np.float64)
+            # Shared delayed drivers plus independent channel innovations.
+            delays = rng.integers(0, 8, size=(self._channels, 1))
+            times = np.maximum(np.arange(length)[None, :] - delays, 0)
+            loading = rng.uniform(0.5, 1.5, size=(self._channels, 1))
+            independent = rng.normal(0.0, 0.2, size=(self._channels, length))
+            rho = rng.uniform(0.1, 0.7, size=self._channels)
+            for i in range(1, length):
+                independent[:, i] += rho * independent[:, i - 1]
+            values = loading * series[times] + independent
+            yield values.astype(np.float64)

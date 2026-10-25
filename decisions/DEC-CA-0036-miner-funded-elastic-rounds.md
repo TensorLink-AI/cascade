@@ -2,7 +2,8 @@
 id: DEC-CA-0036
 type: decision
 title: "Miner-funded challenger legs under elastic-cadence rounds; king and confirmation legs stay operator-funded"
-status: proposed
+status: accepted
+note: "The elastic per-boundary round cadence is superseded by DEC-CA-0043 rolling intake; payer pods, the intake, the vault, direct submissions and champion publishing stand."
 date: 2026-08-28
 tags: [funding, provisioner, round, cadence, intake, security, cost]
 revisit_when: "the funded queue routinely overflows max cadence × finalist_cap for days (the k-cap or the grid is the wrong bottleneck); or shadow mode shows most of the field funding but the screen still deciding outcomes (retire the heat formally); or scratch-shadow retrain-noise measurements put same-generator retrain variance above the decayed margin floor (the confirmation gate needs the un-decayed margin, or the floor moves); or Lium reliably lacks the pinned final SKU so funded entries live in capacity-requeue purgatory (multi-provider BYOK or per-size pins, DEC-CA-0027)"
@@ -194,7 +195,7 @@ scored_from_block` (ladder [64, 256, 720]) BOTH at block 8992800 (≈ Fri
 is a later scheduled `epoch_activation_block` switch. `expected_gpu`
 unpinned ("" — contract change, coordinated deploy before Thu 20:30).
 Direct submissions stay off (image gate). Go-live checklist:
-docs/MINER_FUNDED_ROUNDS.md; miner-facing: docs/MINER.md §6b + llms.txt.
+docs/OPERATOR.md (Funded intake); miner-facing: docs/MINER.md §5-§8 + llms.txt.
 Accepted risk, owner-directed: the confirmation-leg wiring ships OPEN — a
 provisional dethrone crowns without an operator retrain. Revisit within
 the first week live.

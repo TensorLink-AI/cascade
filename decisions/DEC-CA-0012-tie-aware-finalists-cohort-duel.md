@@ -3,6 +3,7 @@ id: DEC-CA-0012
 type: decision
 title: "Finalist count responds to the screen's own statistic; the tied cohort all duel under a family-wise alpha"
 status: active
+note: "Heat finalists and the tie run-off were retired (DEC-CA-0037, DEC-CA-0043); the cohort duel stands, its per-challenger alpha/k correction revised by DEC-CA-0038."
 date: 2026-07-30
 tags: [koth, heat, scoring, bootstrap, eval, provision, audit]
 revisit_when: "tied sets routinely hit max_finalists after the run-off (the run-off is not separating, so the bar or the run-off size is wrong); or the shadow max-statistic diagnostic shows the Bonferroni alpha/k is materially over-tightening under the real cohort correlation (then move the correction onto the joint bootstrap); or the run-off's wall-clock cap starts expiring on real fields, which would mean it is delaying the heat_complete marker and the JIT final rental rather than paying for itself; or cohorts routinely produce more than one margin-clearer, which would mean the run-off is advancing genuinely-separable challengers"

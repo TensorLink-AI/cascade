@@ -69,45 +69,6 @@ def test_prepare_drops_too_much_missing():
     assert rec is None and reason == "too_much_missing"
 
 
-def test_prepare_counts_no_data_sentinel_as_missing():
-    # USGS NWIS -999999 is a finite no-data code: it must hit the missingness
-    # gate like NaN, not pass through as data (pool 9307800 carried a 96% one).
-    vals = 10 + np.sin(np.arange(600) / 5.0)
-    vals[: int(0.5 * 600)] = -999999.0
-    rec, reason = prepare_series(_series(base=vals), CFG)
-    assert rec is None and reason == "too_much_missing"
-
-
-def test_prepare_interpolates_sparse_no_data_sentinel():
-    vals = 10 + np.sin(np.arange(600) / 5.0)
-    vals[[550, 551, 580]] = -999999.0           # inside the kept tail, < 20%
-    rec, reason = prepare_series(_series(base=vals), CFG)
-    assert reason is None and rec is not None
-    assert (rec.values != -999999.0).all()
-    assert rec.values.min() > 8.0               # interpolated between real readings
-
-
-def test_prepare_no_data_sentinels_configurable():
-    vals = 10 + np.sin(np.arange(600) / 5.0)
-    vals[[550, 551]] = -999999.0
-    off = PoolBuildConfig(context_length=512, horizon=16, min_context=64, no_data_sentinels=())
-    rec, _ = prepare_series(_series(base=vals), off)
-    assert (rec.values == -999999.0).sum() == 2  # disabled ⇒ the old pass-through
-    vals2 = 10 + np.sin(np.arange(600) / 5.0)
-    vals2[[550, 551]] = -9999.0
-    on = PoolBuildConfig(context_length=512, horizon=16, min_context=64,
-                         no_data_sentinels=(-999999.0, -9999.0))
-    rec2, _ = prepare_series(_series(base=vals2), on)
-    assert (rec2.values != -9999.0).all()
-
-
-def test_cli_no_data_sentinel_parsing():
-    from cascade.pool.cli import _no_data_sentinels
-    assert _no_data_sentinels(None) == (-999999.0,)
-    assert _no_data_sentinels([-999999.0, -9999.0]) == (-999999.0, -9999.0)
-    assert _no_data_sentinels([float("nan")]) == ()
-
-
 def test_prepare_drops_constant():
     rec, reason = prepare_series(_series(base=np.full(600, 7.0)), CFG)
     assert rec is None and reason == "degenerate"
