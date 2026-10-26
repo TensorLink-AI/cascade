@@ -44,6 +44,7 @@ TRAINING_SUMMARY_PREFIX = "training/"
 # stays in the log — the document is the dashboard's read, not a log mirror.
 LEG_FIELDS = (
     "steps", "tokens_seen", "channel_tokens", "tokens_frac", "deadline_hit",
+    "training_complete", "corpus_exhausted",
     "train_seconds", "gpu_name", "n_series", "total_points",
     "lr_schedule", "optim_state_resumed",
     "param_count", "active_param_count",
@@ -118,6 +119,8 @@ def contract_block(contract: object) -> dict:
         v = getattr(contract, k, None)
         if v is not None:
             out[k] = v
+    if getattr(contract, "training_steps", 0):
+        out["training_steps"] = contract.training_steps
     tb = getattr(contract, "train_tokens", None)
     if tb is not None:
         with contextlib.suppress(TypeError, ValueError):

@@ -299,7 +299,7 @@ class _FundedLegMixin:
                 **({"domain": domain, "expert_selection": expert_selection}
                    if role == "expert" else {}),
             )
-            if getattr(contract, "base_arch", "") == "cascade_moe" and role != "mkt_finetune":
+            if getattr(contract, "base_arch", "") in ("cascade_moe", "cascade_pyramid") and role != "mkt_finetune":
                 from ..shared.manifest import contract_digest
 
                 if (getattr(entry, "init_pointer", None) != (warm_start_ref or "")

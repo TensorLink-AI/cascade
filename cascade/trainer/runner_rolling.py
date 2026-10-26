@@ -828,7 +828,7 @@ class _RollingMixin:
         if era.warm_start_ckpt:
             local = self._fetch_checkpoint_dir(era.warm_start_ckpt)
         else:
-            if str(getattr(contract, "base_arch", "") or "") != "cascade_moe":
+            if str(getattr(contract, "base_arch", "") or "") not in ("cascade_moe", "cascade_pyramid"):
                 log.warning("rolling: era %d init bench — random init of base_arch %r is "
                             "not rebuildable here; skipped", era.index,
                             getattr(contract, "base_arch", ""))

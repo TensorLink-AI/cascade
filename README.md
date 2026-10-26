@@ -60,17 +60,19 @@ completed work. A **leg** is one training run.
 ### The fixed model
 
 The contract is fixed for each comparison, not for the lifetime of the subnet.
-Pre-v2 eras use the Toto2 lineage. From the configured v2 activation era, Lane A
-uses a fresh Cascade mixture-of-experts lineage; the checked-in rolling preset
-is `cascade-moe-28m`. It does not import the old Toto2 warm-start members.
-Model shape, budgets, seeds and checkpoint pointers come from the effective
-era contract and signed evidence, not a model name copied from this README.
+Pre-v2 eras use the Toto2 lineage. The v2 candidate is the new
+`cascade-moe-v2-120m` pyramid MoE: **1,234,189,344 total parameters,
+111,651,872 active per token**, top-8 routing, and attention across channels.
+It starts a fresh lineage; old Toto2 checkpoints cannot initialize it.
+The worker image, hardware and initial generator still need launch qualification.
+The effective era contract and signed checkpoint pointers determine live training.
 
-The next model family has [reserved variants](deploy/presets/README.md) at
-2M, 7M, 28M, 56M and ~120M active parameters. These are placeholders awaiting
-model definitions; they cannot be selected for training yet. Smaller variants
-will let miners improve generators in cheaper local experiments, then check
-promising ideas on the model selected by the live competition contract.
+Implemented [smaller variants](deploy/presets/README.md) have approximately
+2M, 7M and 28M active parameters. Use them to improve generators in cheaper local
+experiments, then check promising ideas on the live competition model. The 56M
+variant remains unspecified. See the [model and recipe](docs/MODEL.md) for exact
+counts, masking, output head and training rules. GPU memory and throughput have
+not been measured for this port.
 
 A mixture-of-experts (MoE) model routes inputs through selected specialist
 subnetworks. B improves a limited selection of those experts while the rest

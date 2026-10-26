@@ -137,16 +137,14 @@ verify determinism, train and compare on real held-out data. Keep the base,
 settings and seeds fixed while comparing ideas. A local win is directional;
 live evaluation can produce a different result.
 
-Smaller models will give miners a cheaper way to improve generators: test an
-idea with `cascade score` or compare versions with `cascade iterate`, then
-check promising ideas on the competition model. Planned 2M, 7M, 28M, 56M and
-~120M variants are currently [placeholders](deploy/presets/README.md), not
-released models. Once populated, select a small variant through a complete
-local `--chain-toml` configuration, keeping both sides' model, budget, seeds,
-pool and compatible init identical. `--warm-start live` selects the actual
-competition contract and checkpoint; use it for the final local check, not
-to initialize a different small architecture. Local improvements do not
-establish paid wins.
+The new [pyramid MoE](docs/MODEL.md) has 1.234B total parameters and 111.65M
+active per token. Smaller implemented variants at roughly 2M, 7M and 28M active
+parameters give miners a cheaper way to improve generators. Use `cascade score`
+or `cascade iterate` with a [complete local config](deploy/presets/README.md),
+then recheck promising ideas on the live model. Keep both sides' settings and
+compatible starting checkpoint fixed. `--warm-start live` selects the actual
+competition contract and init. Small-model gains do not establish paid wins.
+GPU performance is unmeasured for this port; 56M remains unspecified.
 
 Start with the [agent operating instructions](AGENTS.md), read the
 [generator interface](docs/INTERFACE.md) before editing a generator, and use the

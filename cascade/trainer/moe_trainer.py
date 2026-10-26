@@ -865,6 +865,10 @@ def build_random_init(contract, *, training_seed: int, out_dir: Path) -> Path:
     in the leg checkpoint layout the bench sweep loads."""
     import torch
 
+    if contract.base_arch == "cascade_pyramid":
+        from .pyramid_trainer import build_random_init as build_pyramid_init
+
+        return build_pyramid_init(contract, training_seed=training_seed, out_dir=out_dir)
     from .moe_model import QUANTILE_LEVELS, CascadeMoEConfig, CascadeMoEModel
 
     torch.manual_seed(training_seed)

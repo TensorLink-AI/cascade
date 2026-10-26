@@ -46,7 +46,14 @@ def _contract(args):
     cfg = load_chain_config(args.chain_toml)
     c = cfg.training.v2_contract or cfg.training
     c = replace(c, continuation_protocol=PROTOCOL)
-    if args.tiny:
+    if args.tiny and c.base_arch == "cascade_pyramid":
+        c = replace(c, arch_preset="cascade-moe-v2-2m", d_model=128,
+                    num_heads=2, d_ff=276, training_steps=8, batch_size=8,
+                    micro_batches=1, max_train_seconds=600)
+        from .contract import compute_base_arch_digest
+
+        c = replace(c, base_arch_digest=compute_base_arch_digest(c))
+    elif args.tiny:
         c = replace(
             c,
             d_model=32,
@@ -65,17 +72,18 @@ def _contract(args):
             umup_base_d_model=32,
             micro_batches=2,
         )
-    if c.base_arch != "cascade_moe":
+    if c.base_arch not in ("cascade_moe", "cascade_pyramid"):
         raise ValueError("qualification requires a Cascade MoE contract")
     if args.case == "anneal":
-        c = replace(c, anneal_fraction=0.2, power_ema_eval=-1, lr_schedule="wsd")
+        c = (replace(c, training_steps=8) if c.base_arch == "cascade_pyramid" else
+             replace(c, anneal_fraction=0.2, power_ema_eval=-1, lr_schedule="wsd"))
     return c
 
 
-def _stream(contract):
+def _stream(contract, *, short=False):
     rng = np.random.default_rng(101)
     for _ in range(contract.batch_size * 64):
-        yield np.cumsum(rng.normal(size=(2, contract.context_length)), axis=-1)
+        yield np.cumsum(rng.normal(size=(2, min(contract.context_length, 64) if short else contract.context_length)), axis=-1)
 
 
 def _stage(args):
@@ -89,7 +97,7 @@ def _stage(args):
     trainer = Toto2Trainer(device=args.device, dtype=args.dtype)
     warm = root / "base" if args.case in {"b", "a-warm"} else None
     if warm is not None and args.phase == "baseline":
-        trainer.train(_stream(c), c, training_seed=7, token_budget=budget, out_dir=warm)
+        trainer.train(_stream(c, short=args.tiny), c, training_seed=7, token_budget=budget, out_dir=warm)
     selection = {0: [0, 1]} if args.case == "b" else None
     binding = {
         "contract": contract_digest(c),
@@ -113,7 +121,7 @@ def _stage(args):
 
             context.save = crash
     result = trainer.train(
-        _stream(c),
+        _stream(c, short=args.tiny),
         c,
         training_seed=7,
         token_budget=budget,

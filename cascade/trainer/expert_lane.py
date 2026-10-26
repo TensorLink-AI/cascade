@@ -222,7 +222,7 @@ def routing_stale(base: RoutingProbe, cur: RoutingProbe, selection: dict[int, li
 
 
 def affinity_batches(contexts: list[np.ndarray], *, patch_size: int, max_patches: int,
-                     batch: int = 16):
+                     batch: int = 16, scaler=None):
     """Standardised ``(patches, None)`` batches from 1-D context arrays, in the
     exact scaler the model trains under. Series are right-aligned to a common
     patch count per batch (shorter ones skipped below 2 patches)."""
@@ -241,7 +241,7 @@ def affinity_batches(contexts: list[np.ndarray], *, patch_size: int, max_patches
         chunk = rows[i:i + batch]
         w = min(len(r) for r in chunk)
         x = torch.as_tensor(np.stack([r[-w:] for r in chunk]), dtype=torch.float64)
-        z, _, _ = causal_standardize(x)
+        z, _, _ = (scaler or causal_standardize)(x)
         yield z.float().view(len(chunk), w // patch_size, patch_size), None
 
 
@@ -249,10 +249,11 @@ def load_king(king_dir: Path):
     import torch
     from safetensors.torch import load_file
 
-    from .moe_model import CascadeMoEConfig, CascadeMoEModel
+    from .model_backend import checkpoint_backend
 
-    cfg = CascadeMoEConfig.from_dict(json.loads((Path(king_dir) / "config.json").read_text())["moe"])
-    model = CascadeMoEModel(cfg)
+    backend = checkpoint_backend(king_dir)
+    cfg = backend.CascadeMoEConfig.from_dict(json.loads((Path(king_dir) / "config.json").read_text())["moe"])
+    model = backend.CascadeMoEModel(cfg)
     model.load_state_dict(load_file(str(Path(king_dir) / "weights.safetensors")))
     return model.to(torch.float32).eval()
 
@@ -267,7 +268,8 @@ def probe_routing(king_dir: Path, contexts: list[np.ndarray], cfg) -> RoutingPro
     model = load_king(king_dir)
     topk = routing_topk(model, affinity_batches(
         contexts[: cfg.affinity_windows], patch_size=model.cfg.patch_size,
-        max_patches=model.cfg.context_length // model.cfg.patch_size))
+        max_patches=model.cfg.context_length // model.cfg.patch_size,
+        scaler=__import__(type(model).__module__, fromlist=["causal_standardize"]).causal_standardize))
     E = model.cfg.num_experts
     dtype = np.uint8 if E <= 256 else np.int32
     aff = np.stack([np.bincount(t.reshape(-1).numpy(), minlength=E) for t in topk]
@@ -311,7 +313,7 @@ def horizon_decode_window(horizon: int, *, patch_size: int, context_patches: int
 
 
 def horizon_affinity_batches(contexts: list[np.ndarray], *, horizon: int, patch_size: int,
-                             context_patches: int, max_patches: int, batch: int = 16):
+                             context_patches: int, max_patches: int, batch: int = 16, scaler=None):
     """``(patches, mask, masked)`` batches for a horizon-``h`` decode: each
     context (right-aligned, standardised exactly as :func:`affinity_batches`)
     followed by ``masked`` all-zero, all-masked forecast patches. Inputs only —
@@ -334,7 +336,7 @@ def horizon_affinity_batches(contexts: list[np.ndarray], *, horizon: int, patch_
         chunk = rows[i:i + batch]
         w = min(len(r) for r in chunk)
         x = torch.as_tensor(np.stack([r[-w:] for r in chunk]), dtype=torch.float64)
-        z, _, _ = causal_standardize(x)
+        z, _, _ = (scaler or causal_standardize)(x)
         n, cp = len(chunk), w // patch_size
         patches = torch.cat([z.float().view(n, cp, patch_size),
                              torch.zeros(n, block, patch_size)], dim=1)
@@ -360,7 +362,8 @@ def probe_horizon_routing(king_dir: Path, contexts: list[np.ndarray], cfg,
                 contexts[: cfg.affinity_windows], horizon=horizon,
                 patch_size=model.cfg.patch_size,
                 context_patches=model.cfg.context_length // model.cfg.patch_size,
-                max_patches=model.cfg.max_patches):
+                max_patches=model.cfg.max_patches,
+                scaler=__import__(type(model).__module__, fromlist=["causal_standardize"]).causal_standardize):
             model(patches, mask)
             n, P = patches.shape[0], patches.shape[1]
             for li, layer in enumerate(layers):

@@ -290,17 +290,26 @@ run is logged to `.cascade-work/history.jsonl` with the best so far. Use
 `--baseline DIR` to compare against your previous version instead, or
 `cascade score` for a single number.
 
-**Start small when the variants are released.** Test generator ideas with
-`cascade score` or `cascade iterate` on a smaller model to reduce GPU memory
-and experiment time. The planned 2M, 7M, 28M, 56M and ~120M variants are currently
-[blocked placeholders](../deploy/presets/README.md), awaiting model definitions.
-Select a released variant through a complete `--chain-toml` configuration;
-a preset fragment alone is not a complete configuration. Compare candidate
-and baseline on the same model, budget, seeds, held-out pool and compatible
-starting checkpoint. Keep separate histories for different models. Then
-recheck promising generators with `--warm-start live`, which selects the live
-model and init. A small-model gain is not a live result; do not use a larger
-model's checkpoint to initialize a smaller architecture.
+**Start small.** The implemented 2M, 7M and 28M active-parameter variants let
+you test generators before using the 120M competition candidate. Generate a
+complete offline configuration from the checkout:
+
+```bash
+python scripts/pyramid_config.py --size 2m --out ./chain.local-2m.toml
+cascade iterate ./my-gen --chain-toml ./chain.local-2m.toml --pool-dir ./heldout --seeds 0,1 --train-hours 0.01 --work-dir ./.cascade-2m --json
+```
+
+Run the Python command with your installed environment (for example,
+`.venv/bin/python`). Other supported sizes are `7m`, `28m` and `120m`.
+The [presets](../deploy/presets/README.md) give exact counts and the
+[model specification](MODEL.md) explains the recipe. GPU memory and speed are
+unmeasured for this port. The 56M variant remains unspecified.
+
+Compare candidate and baseline on the same model, budget, seeds, pool and
+compatible init. Keep separate histories per model. Omit `--warm-start live`
+for small-model experiments; it selects the live contract and checkpoint.
+Recheck promising ideas on the live model before submitting. A small-model gain
+is not a paid win, and a larger model's checkpoint cannot initialize a smaller one.
 
 The number is directional. Validators score on a private pool you never see,
 so use the local score to hill-climb, not as the verdict, and rotate your pool

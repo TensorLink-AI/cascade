@@ -637,57 +637,62 @@ bench_gate_v2_from_block = "v2"
 # mainnet chain.toml documents both.
 
 [v2.training]
-# Cascade-MOE-28M (deploy/presets/cascade-moe-28m.toml) with the testnet
-# fast-round budget, SKU and corpus mode kept from [training] above.
-base_arch          = "cascade_moe"
-arch_preset        = "cascade-moe-28m"
-base_arch_digest   = "767b9525666d7f49eeec24de7642c4f8fe5e007de2b14657312e6c5795d3e877"
-d_model            = 512
-num_layers         = 10
-num_heads          = 8
-head_dim           = 64
-patch_size         = 32
-mlp_expansion      = 2
-d_ff               = 1104
-num_quantiles      = 9
-masking            = "contiguous_patch"
-cpm_c_max          = 16
-cpm_p_max          = 0.4
-input_transform    = "arcsinh_causal"
-context_length     = 4096
-horizon            = 64
-target_train_hours          = 0.05     # TESTNET fast round (as [training])
-ref_throughput_tokens_per_s = 185000   # TESTNET (as [training]); mainnet value is the L40S placeholder
-warmup_fraction             = 0.0042
-batch_size                  = 64
-batch_denomination = "series"
-budget_denomination = "series_points"  # DEC-CA-0042 series-points billing
-optimizer          = "normuon_adamw"
-base_lr            = 0.0025
-adamw_lr_scale     = 0.2
-weight_decay       = 2e-8
-muon_momentum      = 0.96
-muon_row_beta2     = 0.999
-adamw_beta1        = 0.91
-adamw_beta2        = 0.972
-grad_clip          = 7.0
-lr_schedule        = "wsd"
-umup_base_d_model  = 512
-mup_lr_exponent    = 1.42
-warm_lr_scale      = 1.0
-train_seed_salt    = 1337
-max_train_seconds  = 300               # TESTNET fast round (as [training])
-corpus_mode        = "stream_gpu"      # TESTNET (as [training]): base_generator imports torch
-micro_batches      = 2
-power_ema_sigma_rels = [0.05, 0.10]
-power_ema_eval     = 0
-copula_loss_cap    = 0.1
-copula_samples     = 8
-copula_patches     = 2
-router_lr_scale       = 0.1
+# The supplied pyramid ladder replaces the earlier v2 candidate.
+# Fresh lineage; historical [training] and moe_model.py are unchanged.
+# Explicit update budget, not an estimated GPU-throughput measurement.
+# Rebuild/repin the worker image and qualify hardware before deployment.
+base_arch = "cascade_pyramid"
+arch_preset = "cascade-moe-v2-2m"
+base_arch_digest = "8e10e5c4457126f2215004701ad0c9b90f02ef652b032d5fdc21f1ac96bea4dc"
+d_model = 128
+num_layers = 10
+num_heads = 2
+head_dim = 64
+patch_size = 32
+mlp_expansion = 2
+d_ff = 276
+num_quantiles = 9
+masking = "contiguous_patch"
+cpm_c_max = 16
+cpm_p_max = 0.4
+input_transform = "arcsinh_causal"
+context_length = 4096
+horizon = 64
+target_train_hours = 0.05
+ref_throughput_tokens_per_s = 0
+warmup_fraction = 0.002909090909090909
+batch_size = 512
+batch_denomination = "sequences"
+budget_denomination = "points"
+optimizer = "normuon_adamw"
+base_lr = 0.002125
+adamw_lr_scale = 0.2
+weight_decay = 2e-08
+muon_momentum = 0.96
+muon_row_beta2 = 0.999
+adamw_beta1 = 0.91
+adamw_beta2 = 0.972
+grad_clip = 7.0
+lr_schedule = "wsd"
+umup_base_d_model = 512
+mup_lr_exponent = 1.42
+warm_lr_scale = 1.0
+train_seed_salt = 1337
+max_train_seconds = 300
+corpus_mode = "stream_cpu"
+micro_batches = 1
+power_ema_sigma_rels = []
+power_ema_eval = -1
+copula_loss_cap = 0.1
+copula_samples = 4
+copula_patches = 127
+router_lr_scale = 0.1
 route_bias_rate_scale = 0.25
-expected_gpu       = ""
+training_steps = 16
 train_image_digest = ""
+expected_gpu = ""
+long_series = "crop"
+power_ema_scope = "leg"
 
 [lane_b]
 # Preserve the existing testnet launch; mainnet launches B separately (see chain.toml).

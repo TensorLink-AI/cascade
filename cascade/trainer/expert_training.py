@@ -13,6 +13,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from .moe_model import MoEFFN
+from .pyramid_model import MoEFFN as PyramidFFN
 
 
 class _ExpertMatmul(torch.autograd.Function):
@@ -82,6 +83,31 @@ class _SelectedMoEFFN(MoEFFN):
         return y
 
 
+class _SelectedPyramidFFN(PyramidFFN):
+    def __init__(self, base, rows):
+        _SelectedMoEFFN.__init__(self, base, rows)
+        self.num_experts = base.num_experts
+        self.selected_index = {int(row): i for i, row in enumerate(rows.tolist())}
+
+    def forward(self, x, seq_len):
+        result = super().forward(x, seq_len)
+        # No traffic can legitimately reach a chosen subset on this batch.
+        # Keep a differentiable zero so accumulation still has zero gradients.
+        return result + 0 * (self.slices[1].reshape(-1)[0] + self.slices[2].reshape(-1)[0])
+
+    def expert_single(self, x, expert, kind):
+        index = self.selected_index.get(expert)
+        if index is None:
+            return super().expert_single(x, expert, kind)
+        selected = self.slices[1] if kind == "w_in" else self.slices[2]
+        return x @ selected[index].to(x.dtype)
+
+    def expert_mm(self, x, weight, kind):
+        rows, wi, wo = self.slices
+        selected = wi if kind == "w_in" else wo
+        return _ExpertMatmul.apply(x, weight, selected.to(x.dtype), rows)
+
+
 class ExpertSlices:
     """Parameter source for the optimizer, clipping and power EMAs.
 
@@ -94,16 +120,16 @@ class ExpertSlices:
         self.weights, self.rows, self.leaves = {}, {}, {}
         for p in model.parameters():
             p.requires_grad_(False)
-        layers = [(n, m) for n, m in model.named_modules() if isinstance(m, MoEFFN)]
+        layers = [(n, m) for n, m in model.named_modules() if isinstance(m, (MoEFFN, PyramidFFN))]
         for li, (name, base) in enumerate(layers):
             chosen = selection.get(li, selection.get(str(li), []))
             if not chosen:
                 continue
             chosen = sorted(int(r) for r in chosen)
-            if len(set(chosen)) != len(chosen) or chosen[0] < 0 or chosen[-1] >= base.cfg.num_experts:
+            if len(set(chosen)) != len(chosen) or chosen[0] < 0 or chosen[-1] >= base.w_in.shape[0]:
                 raise ValueError(f"invalid expert rows for MoE layer {li}")
             rows = torch.tensor(chosen, device=base.w_in.device, dtype=torch.long)
-            layer = _SelectedMoEFFN(base, rows)
+            layer = (_SelectedPyramidFFN if isinstance(base, PyramidFFN) else _SelectedMoEFFN)(base, rows)
             parent, _, attr = name.rpartition(".")
             setattr(model.get_submodule(parent), attr, layer)
             for attr, leaf in zip(("w_in", "w_out"), layer.slices[1:], strict=True):

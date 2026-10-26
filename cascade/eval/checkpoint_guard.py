@@ -103,6 +103,9 @@ def expected_checkpoint_code(base_arch: str = "toto2") -> dict[str, bytes]:
     wrapper; every other value is the toto2 pair)."""
     from ..trainer import toto2_trainer
 
+    if base_arch == "cascade_pyramid":
+        return {"model.py": Path(__file__).parents[1].joinpath("trainer/pyramid_model.py").read_bytes(),
+                "forecast_wrapper.py": Path(__file__).parents[1].joinpath("trainer/pyramid_wrapper.py").read_bytes()}
     if base_arch == "cascade_moe":
         from ..trainer import moe_model, moe_trainer
 
@@ -118,7 +121,7 @@ def expected_checkpoint_code(base_arch: str = "toto2") -> dict[str, bytes]:
     }
 
 
-KNOWN_ARCHES = ("toto2", "cascade_moe")
+KNOWN_ARCHES = ("toto2", "cascade_moe", "cascade_pyramid")
 
 
 def checkpoint_arch(checkpoint_dir: Path | str) -> str:
@@ -221,6 +224,14 @@ def _model_for_contract(contract):
     """The pinned model + its config dict for ``contract`` (no weights). The
     MoE model is built on the meta device — its shapes are all the guard
     needs, and 191M params need not be allocated per ingest."""
+    if str(getattr(contract, "base_arch", "") or "") == "cascade_pyramid":
+        import torch
+
+        from ..trainer.pyramid_model import CascadeMoEConfig, CascadeMoEModel
+
+        cfg = CascadeMoEConfig.from_contract(contract)
+        with torch.device("meta"):
+            return CascadeMoEModel(cfg), "moe", cfg.to_dict()
     if str(getattr(contract, "base_arch", "") or "") == "cascade_moe":
         import torch
 
@@ -262,8 +273,9 @@ def verify_checkpoint(checkpoint_dir: Path | str, contract=None, *,
     d = Path(checkpoint_dir)
     arch = verify_checkpoint_code(d)
     if contract is not None:
-        want_arch = ("cascade_moe" if str(getattr(contract, "base_arch", "") or "")
-                     == "cascade_moe" else "toto2")
+        want_arch = str(getattr(contract, "base_arch", "") or "")
+        if want_arch not in KNOWN_ARCHES:
+            want_arch = "toto2"
         if arch != want_arch:
             raise CheckpointTampered(f"checkpoint carries the {arch} model; the "
                                      f"contract pins {want_arch}")

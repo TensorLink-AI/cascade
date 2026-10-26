@@ -1,0 +1,340 @@
+{
+ "name": "pyramid_varattn_ladder",
+ "created": "2026-10-26",
+ "status": "design only, no runs launched",
+ "width_rule": "heads=d/64; dense_ffn=round(2.15625 d); expert_hidden=round(0.18 d); shared=4*expert_hidden (identical to the 2M/7M/28M MoE ladder widths)",
+ "active_param_rule": "total minus inactive routed experts: sum over MoE layers of 2*d*h*(E-8); routers, shared experts, all else counted active",
+ "count_check": "Built on meta device with the 120M run's own code (count_params.py); 120m reproduces 1,234,189,344 / 111,651,872 exactly",
+ "sizes": {
+  "2m": {
+   "width": 128,
+   "heads": 2,
+   "depth": 10,
+   "dense_ffn": 276,
+   "expert_hidden": 23,
+   "shared_hidden": 92,
+   "expert_counts": [
+    128,
+    256,
+    256,
+    512,
+    512,
+    512,
+    512
+   ],
+   "top_k": 8,
+   "variate_layers_ffn_removed": [
+    4,
+    9
+   ],
+   "total_params": 17528416,
+   "active_params": 2031200,
+   "param_breakdown": {
+    "embed": 212608,
+    "attention": 661120,
+    "attention_gate": 132096,
+    "dense_ffn_block0": 70656,
+    "routers": 344064,
+    "routed_experts": 15826944,
+    "shared_experts": 164864,
+    "output": 116064
+   },
+   "normuon_matrix_lr": 0.0011871175842017338,
+   "adamw_lr": 0.000425,
+   "adamw_head_lr": 0.0017,
+   "router_lr": 0.000425
+  },
+  "7m": {
+   "width": 256,
+   "heads": 4,
+   "depth": 10,
+   "dense_ffn": 552,
+   "expert_hidden": 46,
+   "shared_hidden": 184,
+   "expert_counts": [
+    128,
+    256,
+    256,
+    512,
+    512,
+    512,
+    512
+   ],
+   "top_k": 8,
+   "variate_layers_ffn_removed": [
+    4,
+    9
+   ],
+   "total_params": 68919520,
+   "active_params": 6930656,
+   "param_breakdown": {
+    "embed": 449792,
+    "attention": 2632320,
+    "attention_gate": 526336,
+    "dense_ffn_block0": 282624,
+    "routers": 688128,
+    "routed_experts": 63307776,
+    "shared_experts": 659456,
+    "output": 373088
+   },
+   "normuon_matrix_lr": 0.0015882773266746224,
+   "adamw_lr": 0.000425,
+   "adamw_head_lr": 0.00085,
+   "router_lr": 0.000425
+  },
+  "28m": {
+   "width": 512,
+   "heads": 8,
+   "depth": 10,
+   "dense_ffn": 1104,
+   "expert_hidden": 92,
+   "shared_hidden": 368,
+   "expert_counts": [
+    128,
+    256,
+    256,
+    512,
+    512,
+    512,
+    512
+   ],
+   "top_k": 8,
+   "variate_layers_ffn_removed": [
+    4,
+    9
+   ],
+   "total_params": 273642976,
+   "active_params": 25687520,
+   "param_breakdown": {
+    "embed": 1348096,
+    "attention": 10506880,
+    "attention_gate": 2101248,
+    "dense_ffn_block0": 1130496,
+    "routers": 1376256,
+    "routed_experts": 253231104,
+    "shared_experts": 2637824,
+    "output": 1311072
+   },
+   "normuon_matrix_lr": 0.002125,
+   "adamw_lr": 0.000425,
+   "adamw_head_lr": 0.000425,
+   "router_lr": 0.000425
+  },
+  "120m": {
+   "width": 1088,
+   "heads": 17,
+   "depth": 10,
+   "dense_ffn": 2346,
+   "expert_hidden": 196,
+   "shared_hidden": 784,
+   "expert_counts": [
+    128,
+    256,
+    256,
+    512,
+    512,
+    512,
+    512
+   ],
+   "top_k": 8,
+   "variate_layers_ffn_removed": [
+    4,
+    9
+   ],
+   "total_params": 1234189344,
+   "active_params": 111651872,
+   "param_breakdown": {
+    "embed": 5435968,
+    "attention": 47393920,
+    "attention_gate": 9478656,
+    "dense_ffn_block0": 5104896,
+    "routers": 2924544,
+    "routed_experts": 1146421248,
+    "shared_experts": 11941888,
+    "output": 5488224
+   },
+   "normuon_matrix_lr": 0.002916417441361645,
+   "adamw_lr": 0.000425,
+   "adamw_head_lr": 0.0002,
+   "router_lr": 0.000425,
+   "reference_result": {
+    "run": "reviews/2026-10-26/pyramid_ramp64_varattn arm variate_attn_only",
+    "gift97_crps": 0.5033,
+    "gift97_mase": 0.7247
+   }
+  }
+ },
+ "architecture": {
+  "depth": 10,
+  "head_dim": 64,
+  "patch_size": 32,
+  "context_points": 4096,
+  "patches_per_series": 128,
+  "channels_per_group": 8,
+  "layer_roles": {
+   "0": "time, dense FFN",
+   "1": "time, MoE",
+   "2": "time, MoE",
+   "3": "time, MoE",
+   "4": "variate, attention only (FFN removed)",
+   "5": "time, MoE",
+   "6": "time, MoE",
+   "7": "time, MoE",
+   "8": "time, MoE",
+   "9": "variate, attention only (FFN removed)"
+  },
+  "moe_blocks": [
+   1,
+   2,
+   3,
+   5,
+   6,
+   7,
+   8
+  ],
+  "expert_counts_per_moe_block": [
+   128,
+   256,
+   256,
+   512,
+   512,
+   512,
+   512
+  ],
+  "top_k": 8,
+  "route_groups": 8,
+  "group_limit": 4,
+  "router_affinity": "sqrt(softplus(logits))",
+  "router_bias": "none (linear d->E, no bias), fp32",
+  "router_init_std": 0.02,
+  "selection_bias": "per-expert buffer, selection only, proportional controller",
+  "bias_gamma": 0.003,
+  "bias_balance_coef": 0.0001,
+  "z_coef": 0.001,
+  "capacity": "none (no token dropping)",
+  "expert_activation": "GELU (exact), bias-free",
+  "shared_expert": "always on, GELU, bias-free, hidden = 4 x expert_hidden",
+  "dense_ffn": "block 0 only: Linear(d,ffn,no bias)->GELU->Linear(ffn,d,no bias)",
+  "variate_block_ffn": "removed entirely: no norm2, no FFN, no FFN residual coefficients; block = x <- b_attn*x + a_attn*proj(attn(LN(x)))",
+  "attention": "pre-LN, qkv Linear with bias, proj Linear with bias, scale 1/head_dim, q *= softplus(per_dim_scale)/ln2 (per_dim_scale: 64 params per block, zero init)",
+  "time_attention": "causal over 128 patches, xPos (RoPE base 10000 + decay zeta=(i/32+0.4)/1.4, scale_base 512), gated output: attn*2*sigmoid(LN(x) Wg + bg), Wg,bg zero-init",
+  "variate_attention": "full bidirectional over the 8 channels at each patch, no positions, no output gate",
+  "norms": "LayerNorm eps 1e-4, elementwise_affine=False everywhere (norm1, norm2, final norm)",
+  "residual": "scaled residual x <- b*x + a*f(LN(x)), a=sqrt(t2/(t2+1)), b=sqrt(1/(t2+1)); S=128, r=S/ln S, af2=2*0.75^2/(r+1), aa2=r*af2, L=20; attn t2_i=aa2/(L/2+i*aa2+i*af2); ffn t2_i=af2/(L/2+(i+1)*aa2+i*af2); i=block index",
+  "residual_coefficients": {
+   "attn_a": [
+    0.31272,
+    0.29796,
+    0.28511,
+    0.2738,
+    0.26373,
+    0.2547,
+    0.24653,
+    0.23911,
+    0.23231,
+    0.22607
+   ],
+   "attn_b": [
+    0.94985,
+    0.95458,
+    0.95849,
+    0.96179,
+    0.9646,
+    0.96702,
+    0.96913,
+    0.97099,
+    0.97264,
+    0.97411
+   ],
+   "ffn_a": [
+    0.06077,
+    0.05791,
+    0.05543,
+    0.05323,
+    null,
+    0.04953,
+    0.04794,
+    0.0465,
+    0.04518,
+    null
+   ],
+   "ffn_b": [
+    0.99815,
+    0.99832,
+    0.99846,
+    0.99858,
+    null,
+    0.99877,
+    0.99885,
+    0.99892,
+    0.99898,
+    null
+   ]
+  },
+  "stem": "input per patch = [z*(1-m) (32), m (32)] -> Linear(64,d,bias) + conv branch -> residual SiLU MLP x+W2 SiLU(W1 x) (hidden=ffn, no bias) -> + role_embed[0] (zero init)",
+  "conv_branch": "over full 4096-point row: [z*obs, obs] (2 ch) -> causal Conv1d(2,128,k7,dil1)+GELU -> causal Conv1d(128,128,k7,dil4)+GELU -> avg-pool 32 per patch -> Linear(128,d,bias); added to patch Linear output",
+  "output": "final LN -> residual SiLU MLP (hidden=ffn) -> Linear(d, 32*11, bias)",
+  "head": "unified quantile + rank-1 Gaussian copula, 11 channels per future time step",
+  "init": "Linear: N(0,1/fan_in), bias 0; experts N(0,1/fan_in); router N(0,0.02); conv + conv proj PyTorch default; head weight N(0,0.001), bias: median 0, spacing logits softplus^-1(0.5*diff(Phi^-1(levels))-1e-4), diag logit softplus^-1(1-1e-4), factor 0; seed 1, scratch"
+ },
+ "training": {
+  "batch_groups": 64,
+  "channels": 8,
+  "rows_per_step": 512,
+  "context": 4096,
+  "points_per_update": 2097152,
+  "trunk_steps": 25000,
+  "cooldown_steps": 2500,
+  "total_updates": 27500,
+  "points_total": 57671680000,
+  "warmup_steps": 80,
+  "schedule": "lr(s)=base*s/80 for s<80; base for 80<=s<25000; base*max(0,1-(s-25000)/2499) for s>=25000; steps 0..27499",
+  "normuon": {
+   "base_lr": 0.002125,
+   "momentum": 0.96,
+   "nesterov": true,
+   "beta2": 0.999,
+   "ns_steps": 5,
+   "ns_coeffs": [
+    3.4445,
+    -4.775,
+    2.0315
+   ],
+   "weight_decay": 2e-08,
+   "shape_factor": "max(1,rows/cols)^0.5",
+   "applies_to": "every 2-D weight matrix incl. qkv, proj, gate, FFNs, each routed expert matrix separately, shared experts, embed_mlp, out_mlp, conv-branch projection (128->d), role_embed; NOT patch_embed, head, routers"
+  },
+  "adamw": {
+   "base_lr": 0.000425,
+   "betas": [
+    0.91,
+    0.972
+   ],
+   "eps": 1e-08,
+   "weight_decay": 0.05,
+   "router_weight_decay": 0.0,
+   "applies_to": "patch_embed (lr x1), head (lr x 512/d), routers (lr x1, wd 0), all 1-D/3-D tensors incl. biases, per_dim_scale, gate bias, conv kernels (lr x1)"
+  },
+  "lr_rule": "NorMuon matrix lr = 0.002125 * (512/d) * (d/512)^1.42 = 0.002125*(d/512)^0.42; AdamW head lr = 0.000425*512/d; other AdamW lr = 0.000425. 0.002125/0.000425 already include the 0.85 recipe multiplier.",
+  "grad_clip_global_norm": 7.0,
+  "cpm": {
+   "mask_unit": "patch",
+   "per_row": "p~U(0,0.4); drop spans of length c~U{1..16} patches at uniform start until >= p*128 patches masked (max 512 attempts)",
+   "rows": "each of the 512 (group,channel) rows independently",
+   "effect": "masked points zeroed before normalisation, excluded from loc/scale, input z set 0, mask flag 1"
+  },
+  "normalisation": "causal running mean/std per row over observed points (min 8 obs, eps 1e-5, float64), z=asinh((x-loc)/scale) clamp +-64; binary {0,1} rows: loc 0, scale 1; per-patch anchor = loc/scale at last point of the patch",
+  "targets": "output at patch p predicts all 32 points of patch p+1 (127 targets per row), standardised with patch p's anchor: truth=(x-loc_p)/scale_p",
+  "marginal_loss": "10 * mean over all 127x32 target points (masked and observed) of sum over levels 0.1..0.9 of pinball(asinh(q_level), asinh(truth) clamp +-64)",
+  "joint_loss": "10 * mean over target patches of energy score: 4 copula samples of the 32-vector; ES=(mean_i||x_i-y|| - 0.5 mean_{i<j}||x_i-x_j||)/sqrt(32)",
+  "gradient_combination": "g = grad(marginal + moe_aux) + w*grad(joint), w = min(0.1, 0.1*||grad marginal||/||grad joint||); then global clip 7",
+  "moe_aux": "mean over MoE layers of [1e-4 * E*sum_e f_e*P_e + 1e-3 * mean(logsumexp(logits)^2)], P from normalised affinities; added to marginal loss",
+  "bias_update": "after each step, per layer: load_e = share of global-batch assignments; b_e += 0.003*clamp((mean_load-load_e)/mean_load,-1,1); b -= mean(b)",
+  "precision": "bf16 autocast for model forward; fp32 router logits, standardisation, head maths and losses",
+  "data": "synthetic only: base26k/clockbase-20261016 generator mixture (immutable-base26k-c40-combo3-flat-cyclic-v1), ordered indices 0..27499, source seed 1351; substitute your own synthetic pipeline when porting",
+  "seed": 1,
+  "initialization": "scratch, complete architecture",
+  "ema_exports": "power-EMA sigma_rel 0.05 and 0.10 (optional)",
+  "precision_note": "no FP8"
+ }
+}

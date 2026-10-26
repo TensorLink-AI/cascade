@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from math import isfinite
 
 from .validators import (
     validate_accepted_fields,
@@ -18,7 +19,7 @@ from .validators import (
 
 # Reserved for model definitions that have not been supplied or qualified.
 # Release each ID only when its actual backend and full contract are wired.
-UNIMPLEMENTED_ARCH_PRESETS = frozenset(f"cascade-moe-v2-{size}m" for size in (2, 7, 28, 56, 120))
+UNIMPLEMENTED_ARCH_PRESETS = frozenset({"cascade-moe-v2-56m"})
 
 
 @dataclass(frozen=True)
@@ -103,6 +104,9 @@ class TrainingContractConfig:
     max_train_seconds: int
     # corpus feed mode (one of CORPUS_MODES); identical for king & challenger
     corpus_mode: str = "stream_cpu"
+    # Explicit update budget for the pyramid ladder. Zero preserves historical
+    # throughput-derived budgets and is omitted from their contract digest.
+    training_steps: int = 0
     # Exact FFN hidden width from the released config.json (0 ⇒ derive as
     # d_model × mlp_expansion). Toto-2.0-4m ships d_ff = 688, not 2×256.
     d_ff: int = 0
@@ -359,6 +363,9 @@ class TrainingContractConfig:
         throughput. Used for both the full final budget and the cheaper heat
         budget; going through a token count (not a raw timer) keeps king and
         challenger on identical compute and keeps a re-derived run reproducible."""
+        if self.training_steps:
+            steps = max(1, round(self.training_steps * hours / self.target_train_hours))
+            return steps * self.batch_size * self.context_length
         return int(round(hours * 3600.0 * self.ref_throughput_tokens_per_s))
 
     def for_hours(
@@ -390,6 +397,8 @@ class TrainingContractConfig:
         guard = max(int(round(guard_factor * hours * 3600.0)), int(guard_floor_seconds))
         return replace(
             self,
+            training_steps=(max(1, round(self.training_steps * hours / self.target_train_hours))
+                            if self.training_steps else 0),
             target_train_hours=float(hours),
             max_train_seconds=min(guard, self.max_train_seconds),
             extra_sizes=(),
@@ -514,6 +523,39 @@ def parse_training_contract(t: dict) -> TrainingContractConfig:
                 "recipe and measured budget, release its reserved architecture ID, "
                 "then remove implementation_status and "
                 "target_active_parameters before activation.")
+    steps = t.get("training_steps", 0)
+    if type(steps) is not int or steps < 0 or steps and t.get("base_arch") != "cascade_pyramid":
+        raise ValueError("training_steps is a non-negative integer for cascade_pyramid only")
+    released = {f"cascade-moe-v2-{size}m" for size in (2, 7, 28, 120)}
+    for variant in (t, *t.get("sizes", [])):
+        if variant.get("arch_preset") in released and t.get("base_arch") != "cascade_pyramid":
+            raise ValueError("pyramid presets require the cascade_pyramid backend")
+    if t.get("base_arch") == "cascade_pyramid":
+        sizes = {"2m": (128, 276), "7m": (256, 552),
+                 "28m": (512, 1104), "120m": (1088, 2346)}
+        for variant in (t, *t.get("sizes", [])):
+            key = str(variant.get("arch_preset", "")).removeprefix("cascade-moe-v2-")
+            if key not in sizes:
+                raise ValueError("unknown cascade_pyramid preset")
+            width, ffn = sizes[key]
+            expected = {"d_model": width, "d_ff": ffn, "num_heads": width // 64,
+                        "num_layers": 10}
+            for name, value in expected.items():
+                if variant.get(name) != value:
+                    raise ValueError(f"pyramid {key}: {name} must equal {value}")
+        if steps < 1:
+            raise ValueError("cascade_pyramid needs positive training_steps")
+        if t.get("ref_throughput_tokens_per_s") != 0:
+            raise ValueError("pyramid budgets use training_steps; reference throughput must be 0")
+        for name, default in (("batch_size", 0), ("micro_batches", 1), ("max_train_seconds", 0)):
+            value = t.get(name, default)
+            if type(value) is not int or value < 1:
+                raise ValueError(f"pyramid {name} must be a positive integer")
+        hours = t.get("target_train_hours", 0)
+        if isinstance(hours, bool) or not isinstance(hours, (int, float)) or not isfinite(hours) or hours <= 0:
+            raise ValueError("pyramid target_train_hours must be finite and positive")
+        if t.get("context_length_after", 0):
+            raise ValueError("this pyramid release has no context growth contract")
     extra_sizes = tuple(
         SizeSpec(
             arch_preset=str(z["arch_preset"]),
@@ -530,6 +572,7 @@ def parse_training_contract(t: dict) -> TrainingContractConfig:
         for z in t.get("sizes", [])
     )
     return TrainingContractConfig(
+        training_steps=steps,
         base_arch=str(t["base_arch"]),
         arch_preset=str(t["arch_preset"]),
         base_arch_digest=str(t["base_arch_digest"]),

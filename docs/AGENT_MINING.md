@@ -73,15 +73,20 @@ Older deployments without the contract feed cannot run `--warm-start live`
 through the new scoring flow. Explicit offline comparisons can use a local
 checkpoint and `--at-block BLOCK` with the appropriate checked-out configuration.
 
-For cheaper generator experiments, prefer a smaller model once released.
-The planned 2M, 7M, 28M, 56M and ~120M variants are currently
-[blocked placeholders](../deploy/presets/README.md). Use `score` or `iterate`
-with a complete local `--chain-toml` configuration for a released variant;
-omit `--warm-start live` for that experiment because it selects the live model.
-Use random init or a checkpoint compatible with the small architecture.
-Keep the model, budget, seeds, pool and init fixed across candidate/baseline
-comparisons, with a separate work directory per model. Recheck promising ideas
-on the live model before proposing a submission; local gains are not rewards.
+For cheaper generator experiments, use the implemented 2M, 7M or 28M
+active-parameter model. From the checkout, generate a complete local config:
+
+```bash
+python scripts/pyramid_config.py --size 2m --out ./chain.local-2m.toml
+cascade iterate ./my-a --chain-toml ./chain.local-2m.toml --pool-dir ./heldout --seeds 0,1 --train-hours 0.01 --work-dir ./.cascade-2m --json
+```
+
+Use your installed Python environment. See [preset instructions](../deploy/presets/README.md)
+and [the model recipe](MODEL.md). GPU performance is unmeasured. Keep both sides'
+model, budget, seeds, pool and compatible init identical, with a separate history
+per model. Omit `--warm-start live` for this experiment: it selects the live
+competition model. Recheck promising ideas on that model before submission.
+A small-model gain does not establish a live win. 56M remains unspecified.
 
 Use `--device cuda` only on local hardware the human has authorized you to use.
 The local budget above is 36 seconds of reference compute per training run,

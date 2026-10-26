@@ -56,7 +56,7 @@ def test_mainnet_ships_inert_with_the_v2_contract_scheduled():
     assert not cfg.v2.active(10**9)
     assert cfg.lane_b.from_block == 0 and not cfg.lane_b.active(10**9)
     v2c = cfg.training.v2_contract
-    assert v2c is not None and v2c.base_arch == "cascade_moe"
+    assert v2c is not None and v2c.base_arch == "cascade_pyramid"
     assert (v2c.router_lr_scale, v2c.route_bias_rate_scale) == (0.1, 0.25)
     # inert: every block resolves to the toto2 contract, same object
     assert cfg.training.at_block(10**9) is cfg.training
@@ -76,7 +76,7 @@ def test_testnet_is_armed_on_its_era_grid():
     assert cfg.lane_b.from_block == n + 1          # explicit testnet launch preserved
     t = cfg.training
     assert t.at_block(n - 1) is t                  # every pre-v2 era: toto2, same object
-    assert t.at_block(n).base_arch == "cascade_moe"
+    assert t.at_block(n).base_arch == "cascade_pyramid"
     assert contract_digest(t.at_block(n)) == contract_digest(t.v2_contract)
     assert contract_digest(t.at_block(n - 1)) == contract_digest(t) != contract_digest(
         t.at_block(n))
@@ -106,8 +106,11 @@ def test_v2_needs_its_contract_and_the_same_seed_salt(tmp_path):
     p.write_text(text[:i] + text[j:])
     with pytest.raises(ValueError, match=r"\[v2.training\]"):
         load_chain_config(p)
-    p.write_text(text[:i] + text[i:j].replace("train_seed_salt    = 1337",
-                                               "train_seed_salt    = 7") + text[j:])
+    import re
+
+    changed, count = re.subn(r"train_seed_salt\s*=\s*1337", "train_seed_salt = 7", text[i:j])
+    assert count == 1
+    p.write_text(text[:i] + changed + text[j:])
     with pytest.raises(ValueError, match="train_seed_salt"):
         load_chain_config(p)
     assert n > 0

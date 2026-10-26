@@ -14,10 +14,13 @@ rules the king normally funds its own leg too; failed-key recovery, configured
 make-good capacity and validator evaluation use operator resources. The scheduler is
 rolling intake + era king (DEC-CA-0043, `cascade/trainer/rolling.py`).
 
-The next MoE model family has [placeholder presets](../deploy/presets/README.md)
-for 2M, 7M, 28M, 56M and ~120M active parameters. They await model definitions
-and qualification, and configuration loading refuses them. The current
-`cascade-moe-28m` contract remains in place until a populated variant is released.
+The [implemented ladder](../deploy/presets/README.md) supplies 2M, 7M, 28M and
+120M active-parameter variants. `[v2.training]` selects 120M on mainnet and 2M
+for short testnet runs. The older 28M candidate remains available for replay.
+The new source uses an explicit update budget; it does not assume a measured
+GPU rate. Qualify the worker image, CPU generation image, baseline generator,
+GPU memory/throughput and full benchmark pipeline before activation. 56M
+remains unspecified and blocked.
 
 ## Contents
 
@@ -96,9 +99,12 @@ edited `chain.toml` before shipping it.
    (`uv sync --project benchmarks --extra fev --extra time`;
    `benchmarks/Dockerfile` includes both extras), plus data staged with
    `cascade-benchmark-download` and `[eval] gift_gate_data_dir`.
-4. **Measured throughput.** `[v2.training] ref_throughput_tokens_per_s`
-   (mainnet 3.7M) is a placeholder: measure MoE-28M on the pinned GPU
-   (DEC-CA-0001: calibrated to a well-fed trainer).
+4. **Hardware qualification.** The pyramid contract uses explicit
+   `training_steps`; `ref_throughput_tokens_per_s = 0` means unmeasured, not
+   zero work. Measure the 120M port on the intended GPU, including accumulation,
+   full-batch gradients, checkpoint I/O and the four public suites. The research
+   run's four-GPU expert parallelism is not a feature of this single-device port.
+   Keep the measured configuration and its image pinned before deployment.
 5. **CPU generation tier** (DEC-CA-0053, rides `[v2.training] corpus_mode =
    "shards"`): set `[generation] vm_image` (empty in both TOMLs), verify
    Hippius pre-signed URLs, run one testnet leg end to end. Each leg gets

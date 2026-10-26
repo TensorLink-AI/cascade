@@ -52,7 +52,7 @@ _ARCH_FIELDS = (
 # base_arch → the model source folded into base_arch_digest and copied into
 # every checkpoint as model.py. toto2 keeps its file (its digest is byte-
 # identical to before the dispatch existed); cascade_moe is DEC-CA-0050.
-MODEL_SOURCES = {"cascade_moe": "moe_model.py"}
+MODEL_SOURCES = {"cascade_moe": "moe_model.py", "cascade_pyramid": "pyramid_model.py"}
 DEFAULT_MODEL_SOURCE = "toto2_model.py"
 
 

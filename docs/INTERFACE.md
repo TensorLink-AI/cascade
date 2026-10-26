@@ -28,11 +28,11 @@ does not increase the model context: v2 crops training windows from it.
 <!-- cascade:training-reference:start -->
 | Setting | Mainnet before v2 | Mainnet v2 A |
 |---|---|---|
-| Model preset | `toto2-4m` | `cascade-moe-28m` |
+| Model preset | `toto2-4m` | `cascade-moe-v2-120m` |
 | Corpus feed | `stream_cpu` | `shards` |
-| Budget accounting | `series_points` | `series_points` |
-| Batch accounting | `series` | `series` |
-| Batch size | `64` | `64` |
+| Budget accounting | `series_points` | `points` |
+| Batch accounting | `series` | `sequences` |
+| Batch size | `64` | `512` |
 | Model context length | `4096` | `4096` |
 | Training wall limit (seconds) | `18000` | `18000` |
 | Generator channels per yield | 1–32 | 8–32 |

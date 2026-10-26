@@ -127,10 +127,27 @@ def golive(cfg, block: int | None) -> dict:
 _PARAMS_CACHE: dict | None = None
 
 
-def moe_model_card() -> dict:
+def moe_model_card(contract=None) -> dict:
     """Architecture headline of the pinned MoE preset: total / active params
     (``moe_model.param_counts`` on a meta-device model — no memory, no
     weights), experts, top-k, MoE blocks. ``{}`` when torch is unavailable."""
+    if getattr(contract, "base_arch", "") == "cascade_pyramid":
+        try:
+            import torch
+
+            from ..trainer.pyramid_model import CascadeMoEConfig, CascadeMoEModel, param_counts
+
+            config = CascadeMoEConfig.from_contract(contract)
+            with torch.device("meta"):
+                model = CascadeMoEModel(config)
+            counts = param_counts(model)
+            return {"name": contract.arch_preset, "total_params": counts["total"],
+                    "active_params": counts["active"], "num_experts": config.num_experts,
+                    "experts_per_layer": list(config.experts_per_layer),
+                    "top_k": config.top_k, "moe_blocks": list(config.moe_blocks),
+                    "num_layers": config.num_layers, "source": "configured_v2_contract"}
+        except (ImportError, ValueError):
+            return {}
     global _PARAMS_CACHE
     if _PARAMS_CACHE is not None:
         return dict(_PARAMS_CACHE)
@@ -156,7 +173,8 @@ def moe_model_card() -> dict:
 # ── routing health ───────────────────────────────────────────────────────────
 
 
-def king_routing_health(load, *, bins: int = HEAT_BINS, layers: list[int] | None = None) -> dict:
+def king_routing_health(load, *, bins: int = HEAT_BINS, layers: list[int] | None = None,
+                        expert_counts: list[int] | None = None) -> dict:
     """Load-balance stats of one king from per-expert assignment counts.
 
     ``load`` is ``(n_moe_layers, num_experts)`` counts (a ``RoutingProbe``'s
@@ -171,12 +189,16 @@ def king_routing_health(load, *, bins: int = HEAT_BINS, layers: list[int] | None
     a = np.asarray(load, dtype=np.float64)
     if a.ndim != 2 or a.size == 0:
         return {}
-    n_layers, E = a.shape
-    nb = max(1, min(int(bins), E))
-    edges = np.linspace(0, E, nb + 1).round().astype(int)
+    n_layers, max_experts = a.shape
+    if expert_counts is not None and (len(expert_counts) != n_layers or
+            any(not 1 <= count <= max_experts for count in expert_counts)):
+        return {}
     out_layers = []
     for li in range(n_layers):
-        row = a[li]
+        E = expert_counts[li] if expert_counts is not None else max_experts
+        nb = max(1, min(int(bins), E))
+        edges = np.linspace(0, E, nb + 1).round().astype(int)
+        row = a[li, :E]
         tot = float(row.sum())
         mean = tot / E if E else 0.0
         if tot <= 0:
@@ -591,7 +613,7 @@ def build_v2_status(cfg, *, block: int | None, state=None, health: dict | None =
         "block": None if block is None else int(block),
         "netuid": getattr(getattr(cfg, "subnet", None), "netuid", None),
         "golive": golive(cfg, block),
-        "model": moe_model_card(),
+        "model": moe_model_card(getattr(getattr(cfg, "training", None), "v2_contract", None)),
         "king": {"era": era_index, "pointer": str(king_pointer or ""),
                  "routing_health": health or {},
                  "health_source": (f"routing of {health_domains} domain affinity slice(s)"
@@ -933,8 +955,12 @@ def publish_trainer_v2_status(sched, block: int, *, min_interval_s: float = MIN_
         if drv is not None and ptr:
             load, n = driver_king_load(drv, ptr, block=block, allow_probe=allow_probe)
             if load is not None:
-                mc = moe_model_card()
-                health = king_routing_health(load, layers=mc.get("moe_blocks") or None)
+                training = getattr(cfg, "training", None)
+                if hasattr(training, "at_block"):
+                    training = training.at_block(int(getattr(cur, "start_block", block)))
+                mc = moe_model_card(training)
+                health = king_routing_health(load, layers=mc.get("moe_blocks") or None,
+                    expert_counts=mc.get("experts_per_layer"))
         # DEC-CA-0056: the trainer's lane-C driver (may be absent) feeds the
         # leg counts via ``status()``; its ``.st`` is the driver's leg state,
         # NOT the validators' slot state, so holders are not read from it
@@ -986,7 +1012,7 @@ def publish_trainer_v2_status(sched, block: int, *, min_interval_s: float = MIN_
             section: {name: getattr(obj, name) for name in names if hasattr(obj, name)}
             for section, obj, names in (
                 ("training", getattr(cfg, "training", None),
-                 ("target_train_hours", "ref_throughput_tokens_per_s", "batch_size", "context_length")),
+                 ("target_train_hours", "ref_throughput_tokens_per_s", "training_steps", "batch_size", "context_length")),
                 ("generation", getattr(cfg, "generation", None),
                  ("enabled", "window_seconds", "vcpus", "max_parallel_jobs", "target_points", "max_length")),
                 ("lane_b", getattr(cfg, "lane_b", None),
@@ -1009,7 +1035,9 @@ def publish_trainer_v2_status(sched, block: int, *, min_interval_s: float = MIN_
                                         "body": contract_payload(contract),
                                         "digest": contract_digest(contract)}
             doc["policy"]["training"] = {name: getattr(contract, name) for name in
-                ("target_train_hours", "ref_throughput_tokens_per_s", "batch_size", "context_length")}
+                ("target_train_hours", "ref_throughput_tokens_per_s", "training_steps", "batch_size", "context_length")}
+            doc["policy"]["training"]["point_budget"] = contract.train_tokens
+            doc["policy"]["training"]["budget_basis"] = "updates" if contract.training_steps else "reference_gpu_hours"
             for section in ("lane_b", "lane_c", "marketcast", "generator", "generation", "eval", "scoring"):
                 doc["policy"][section] = asdict(getattr(cfg, section))
             doc["policy"]["generator"] = asdict(cfg.generator_for_contract(contract))

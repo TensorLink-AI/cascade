@@ -139,7 +139,7 @@ def test_training_limits_cannot_drift_from_interface_guide(tmp_path, old, new):
 
 def test_training_reference_distinguishes_streaming_and_cpu_shard_limits():
     table = training_reference()
-    assert "| Budget accounting | `series_points` | `series_points` |" in table
+    assert "| Budget accounting | `series_points` | `points` |" in table
     assert "64–4096 | 64–32768 in the CPU shard tier" in table
     assert "| Corpus feed | `stream_cpu` | `shards` |" in table
     assert "90 minutes" in table

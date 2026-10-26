@@ -50,7 +50,7 @@ def contract_from_snapshot(snapshot):
         contract = parse_training_contract(body)
         if contract_digest(body) != doc["digest"] or contract_digest(contract) != doc["digest"]:
             raise ValueError("contract digest differs or this CLI cannot represent the contract")
-        if contract.base_arch not in ("toto2", "cascade_moe"):
+        if contract.base_arch not in ("toto2", "cascade_moe", "cascade_pyramid"):
             raise ValueError("unsupported architecture")
     except (KeyError, TypeError, ValueError) as exc:
         raise LiveStateUnavailable(f"Unusable live contract: {exc}") from exc

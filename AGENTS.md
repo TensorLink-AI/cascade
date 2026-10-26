@@ -130,15 +130,15 @@ anything. Read the result from the JSON:
 
 Rules for the loop:
 
-- Once smaller variants are released, optimize generators with `score` or
-  `iterate` on them before spending more local compute on the competition
-  model. The planned 2M, 7M, 28M, 56M and ~120M variants are currently
-  [blocked placeholders](deploy/presets/README.md). Select a released variant
-  with a complete local `--chain-toml` configuration and a compatible init;
-  omit `--warm-start live`, which selects the live contract and checkpoint.
-  Compare both generators under identical settings. For `iterate`, use a
-  separate `--work-dir` per model. Recheck promising ideas on the live model before
-  proposing submission; gains on a small model are not a live win.
+- Use the implemented 2M, 7M or 28M variants for cheaper generator experiments.
+  Generate a complete config with `python scripts/pyramid_config.py --size 2m
+  --out ./chain.local-2m.toml`, then pass it through `--chain-toml` to `score`
+  or `iterate`. See [presets](deploy/presets/README.md) and [model details](docs/MODEL.md).
+  GPU memory and throughput are unmeasured. 56M remains unspecified.
+  Keep both sides' model, budget, seeds, pool and compatible init identical;
+  use a separate `--work-dir` per model. Omit `--warm-start live` for small
+  experiments. Use it to recheck promising ideas on the actual competition
+  model before proposing submission. A small-model gain is not a live win.
 - Change one idea at a time, so each result says what helped.
 - Keep scoring settings fixed while comparing (`--pool-dir`, `--seeds`,
   `--train-hours`, `--warm-start`). History compares only identical settings.

@@ -10,16 +10,16 @@
     }
   },
   "cascade_presets": {
-    "cascade-moe-28m": {
-      "active_parameters": 27951168,
-      "base_arch_digest": "767b9525666d7f49eeec24de7642c4f8fe5e007de2b14657312e6c5795d3e877",
-      "parameters": 191496256,
-      "source": "configured architecture, counted on meta device"
-    },
     "toto2-4m": {
+      "parameters": 3257120,
       "active_parameters": 3257120,
       "base_arch_digest": "953e40d292e037ea07ffea25ae1fdf2e8b7dc8990276c081fa67fb4371396147",
-      "parameters": 3257120,
+      "source": "configured architecture, counted on meta device"
+    },
+    "cascade-moe-v2-120m": {
+      "parameters": 1234189344,
+      "active_parameters": 111651872,
+      "base_arch_digest": "dd6b40a6e3bc0ac12f4943fdf2299650dfeb96c2eb63ba2990bc9d7062d78ae9",
       "source": "configured architecture, counted on meta device"
     }
   },

@@ -79,7 +79,14 @@ def cascade_presets():
     result = {}
     for contract in (cfg.training.primary_size, cfg.training.v2_contract.primary_size):
         with torch.device("meta"):
-            if contract.base_arch == "cascade_moe":
+            if contract.base_arch == "cascade_pyramid":
+                from cascade.trainer.pyramid_model import CascadeMoEConfig as PyramidConfig
+                from cascade.trainer.pyramid_model import CascadeMoEModel as PyramidModel
+                from cascade.trainer.pyramid_model import param_counts as pyramid_counts
+
+                model = PyramidModel(PyramidConfig.from_contract(contract))
+                counts = pyramid_counts(model)
+            elif contract.base_arch == "cascade_moe":
                 model = CascadeMoEModel(CascadeMoEConfig.from_contract(contract))
                 counts = param_counts(model)
             else:

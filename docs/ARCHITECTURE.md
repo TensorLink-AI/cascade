@@ -24,20 +24,27 @@ A/B contributions can accumulate in a shared forecasting model lineage. C is a
 separate application competition, currently MarketCast on a pinned Timestral
 base. Its checkpoints do not merge into A/B.
 
-Pre-v2 eras use the Toto2 lineage; v2 starts a fresh Cascade MoE lineage under
-`[v2.training]`. The checked-in rolling preset is `cascade-moe-28m`, not the
-separate guarded approximately 220M-active direct runtime. Activation is an era
-boundary, and the contract is resolved at the era start. Old implementations
-remain necessary to replay prior settlements; they are not alternative defaults.
+Pre-v2 eras use the Toto2 lineage; the v2 candidate is `cascade-moe-v2-120m`
+under `[v2.training]`. It starts a fresh lineage at an era boundary. Historical
+`moe_model.py` and `toto2_model.py` bytes remain unchanged for replay. The separate
+direct runtime retains its own architecture contract.
 
-The next model family has reserved **2M, 7M, 28M, 56M and ~120M active-parameter
-variants** in the [model preset directory](../deploy/presets/README.md).
-They are blocked placeholders awaiting model definitions and qualification;
-they do not change the checked-in training contract. The new 28M variant uses
-a separate identity from the existing implementation.
-Smaller variants are intended for cheaper miner experiments. Local results
-remain specific to that variant; the effective competition contract determines
-the architecture used for live training and rewards.
+The new backend is `cascade_pyramid`: `trainer/pyramid_model.py` supplies the
+self-contained model, `pyramid_trainer.py` the objective and training loop,
+`pyramid_optimizer.py` the width-corrected optimizer, and `pyramid_wrapper.py`
+the standalone checkpoint loader. `trainer/contract.py` binds the model source
+into its architecture digest; `eval/checkpoint_guard.py` verifies both shipped
+Python files, configuration and tensor geometry before execution.
+`Toto2Trainer` dispatches the effective architecture for workers, audits and
+miner experiments. New update budgets are digest-bound; their default zero
+leaves historical contract digests unchanged.
+
+The [model specification](MODEL.md) describes the implemented 2M, 7M, 28M and
+120M ladder. [Preset instructions](../deploy/presets/README.md) cover complete
+local configs. A 56M identity stays blocked. Lane B resolves trusted checkpoint
+code before loading, counts each layer's actual experts, and uses compact
+trainable rows without changing the frozen weights. Routing matrices pad shorter
+layers to 512 columns; zero-affinity padding cannot enter a target selection.
 
 ## Roles and data flow
 

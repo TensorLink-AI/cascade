@@ -172,6 +172,7 @@ _DIGEST_DROP_WHEN_DEFAULT: dict[str, tuple] = {
     "warm_lr_scale": (1.0, 1),
     # DEC-CA-0050: the Cascade-MOE-28M recipe knobs — read only by the
     # cascade_moe trainer, inert (absent from the digest) at their defaults.
+    "training_steps": (0,),
     "micro_batches": (1,),
     "mup_lr_exponent": (0.0, 0),
     "power_ema_sigma_rels": ((), []),

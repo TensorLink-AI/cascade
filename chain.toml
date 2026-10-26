@@ -1204,72 +1204,63 @@ margin_warmup_blocks = 18000
 king_check_margin = 0.2
 
 [v2.training]
-# The post-v2 lane-A contract (deploy/presets/cascade-moe-28m.toml), resolved
-# at each era's START block (`--contract-block`): every pre-v2 era keeps the
-# [training] contract above byte-for-byte; the v2 contract's own digest is
-# what a v2 manifest declares (contract_digest moves at the block, not at the
-# release). train_seed_salt must equal [training]'s.
-base_arch          = "cascade_moe"
-arch_preset        = "cascade-moe-28m"
-base_arch_digest   = "767b9525666d7f49eeec24de7642c4f8fe5e007de2b14657312e6c5795d3e877"
-d_model            = 512
-num_layers         = 10
-num_heads          = 8
-head_dim           = 64
-patch_size         = 32
-mlp_expansion      = 2            # unused by cascade_moe (FFN widths live in moe_model.py)
-d_ff               = 1104         # dense FFN width = 8 × 92 + 368 (active MoE width)
-num_quantiles      = 9
-masking            = "contiguous_patch"
-cpm_c_max          = 16
-cpm_p_max          = 0.4
-input_transform    = "arcsinh_causal"
-context_length     = 4096
-horizon            = 64
-# DEC-CA-0053 rides the v2 go-live: lane A trains on corpora the CPU
-# generation tier materialised (corpus_mode = "shards" below — no miner code
-# on the GPU pod), and a series longer than the context is cut into seeded
-# random windows. Context growth
-# (8k → 32k) is a later typed step: context_length_after / _after_block.
-long_series        = "crop"
-target_train_hours          = 3.0
-ref_throughput_tokens_per_s = 3700000  # PLACEHOLDER — MEASURE MoE-28M on the pinned L40S before go-live
-warmup_fraction             = 0.0042   # ≈ 80 steps × 2.1M points at a 40B budget; recompute from the measured budget
-batch_size                  = 64       # 64 groups × 8 channels × 4096 points per update
-batch_denomination = "series"
-budget_denomination = "series_points"  # DEC-CA-0042 series-points billing
-optimizer          = "normuon_adamw"
-base_lr            = 0.0025       # NorMuon LR (spec §4)
-adamw_lr_scale     = 0.2          # AdamW LR 5e-4 = 0.0025 × 0.2
-weight_decay       = 2e-8
-muon_momentum      = 0.96
-muon_row_beta2     = 0.999
-adamw_beta1        = 0.91
-adamw_beta2        = 0.972
-grad_clip          = 7.0
-lr_schedule        = "wsd"
-umup_base_d_model  = 512
-mup_lr_exponent    = 1.42
-warm_lr_scale      = 1.0
-train_seed_salt    = 1337
-max_train_seconds  = 18000
-corpus_mode        = "shards"         # DEC-CA-0053 (see the comment above long_series)
-micro_batches      = 2            # ~56 GiB in one pass > 48 GB L40S; 2 × 32 groups fits
-power_ema_sigma_rels = [0.05, 0.10]
-power_ema_eval     = 0            # the 5 % EMA is the scored artifact
-power_ema_scope    = "leg"        # owner 2026-10-19: the scored EMA restarts every leg, so it
-                                  # reflects only that leg's training (a lineage-long window
-                                  # dilutes the competed block as the lineage grows)
-copula_loss_cap    = 0.1
-copula_samples     = 8
-copula_patches     = 2
-router_lr_scale       = 0.1       # slow router once the lane-B routing gate has opened
-route_bias_rate_scale = 0.25      # (owner-tunable; full rate before the gate opens)
-expected_gpu       = ""
-# RE-PIN before go-live: the worker image bakes the code (deploy/Dockerfile
-# COPY . + [round] worker_code_fingerprint); worker-v0.9.0 (below) predates
-# moe_model.py and --router-slow. Rebuild from the v2 release and pin it here.
+# The supplied pyramid ladder replaces the earlier v2 candidate.
+# Fresh lineage; historical [training] and moe_model.py are unchanged.
+# Explicit update budget, not an estimated GPU-throughput measurement.
+# Rebuild/repin the worker image and qualify hardware before deployment.
+base_arch = "cascade_pyramid"
+arch_preset = "cascade-moe-v2-120m"
+base_arch_digest = "dd6b40a6e3bc0ac12f4943fdf2299650dfeb96c2eb63ba2990bc9d7062d78ae9"
+d_model = 1088
+num_layers = 10
+num_heads = 17
+head_dim = 64
+patch_size = 32
+mlp_expansion = 2
+d_ff = 2346
+num_quantiles = 9
+masking = "contiguous_patch"
+cpm_c_max = 16
+cpm_p_max = 0.4
+input_transform = "arcsinh_causal"
+context_length = 4096
+horizon = 64
+target_train_hours = 3.0
+ref_throughput_tokens_per_s = 0
+warmup_fraction = 0.002909090909090909
+batch_size = 512
+batch_denomination = "sequences"
+budget_denomination = "points"
+optimizer = "normuon_adamw"
+base_lr = 0.002125
+adamw_lr_scale = 0.2
+weight_decay = 2e-08
+muon_momentum = 0.96
+muon_row_beta2 = 0.999
+adamw_beta1 = 0.91
+adamw_beta2 = 0.972
+grad_clip = 7.0
+lr_schedule = "wsd"
+umup_base_d_model = 512
+mup_lr_exponent = 1.42
+warm_lr_scale = 1.0
+train_seed_salt = 1337
+max_train_seconds = 18000
+corpus_mode = "shards"
+micro_batches = 8
+power_ema_sigma_rels = []
+power_ema_eval = -1
+copula_loss_cap = 0.1
+copula_samples = 4
+copula_patches = 127
+router_lr_scale = 0.1
+route_bias_rate_scale = 0.25
+# Fit the existing 50B unique-corpus cap; the full reference preset is 27,500.
+training_steps = 23841
 train_image_digest = "sha256:43c07d4207d7693517d74203f6783fdd2c2f91e3d475f38db38e4798ae97785e"
+expected_gpu = ""
+long_series = "crop"
+power_ema_scope = "leg"
 
 [lane_b]
 # Domain-expert lane (DEC-CA-0050), launched separately from lane A.

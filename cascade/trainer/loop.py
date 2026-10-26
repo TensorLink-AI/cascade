@@ -883,7 +883,7 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
                 raise ValueError("continuation requires an explicitly activated training contract")
             base_files = {p.name: digest_file(p) for p in sorted(Path(warm_start_dir).glob('*.safetensors'))} if warm_start_dir else {}
             continuation = worker_context(continuation_args, self.cfg, {
-                "backend": "cascade_moe", "contract": contract_digest(contract),
+                "backend": contract.base_arch, "contract": contract_digest(contract),
                 "base_files": base_files, "gen_ref": gen.ref, "hotkey": gen.hotkey,
                 "generation_seed": seeds.generation_seed, "training_seed": seeds.training_seed,
                 "token_budget": token_budget, "experts": expert_selection})

@@ -1,6 +1,7 @@
 # Cascade-MOE-28M [training] preset (DEC-CA-0050, P1).
 #
-# Live as the post-v2 contract: these keys are the [v2.training] table of
+# Historical candidate, retained for replay and prior local checkpoints.
+# Previously selected as the post-v2 contract: these keys are the [v2.training] table of
 # chain.toml / chain.testnet.toml, effective for every era starting at or
 # after [v2] from_block (DEC-CA-0050 go-live; contract_digest moves AT the
 # block, not at the release). Architecture change ⇒ a new lineage from random

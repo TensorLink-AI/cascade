@@ -1,43 +1,42 @@
 # Model presets
 
-The existing [Cascade MoE 28M preset](cascade-moe-28m.toml) belongs to the
-currently implemented model. Its source digest and historical checkpoints
-remain valid for replay.
+The implemented pyramid ladder has four variants. “2M”, “7M”, “28M” and “120M”
+are size labels; exact active counts are below. Each routes to 8 experts per
+MoE layer, with 128 / 256 / 256 / 512 / 512 / 512 / 512 experts across the layers.
 
-The next model family has five reserved variants. These files are placeholders
-for the model definitions you will provide. Sizes are **nominal active parameter
-targets**, not measured counts. Total parameter counts and expert layouts have
-not been assigned.
+| Size | Total parameters | Active per token | Training fragment |
+|---|---:|---:|---|
+| 2M | 17,528,416 | 2,031,200 | [2M](cascade-moe-v2-2m.toml) |
+| 7M | 68,919,520 | 6,930,656 | [7M](cascade-moe-v2-7m.toml) |
+| 28M | 273,642,976 | 25,687,520 | [28M](cascade-moe-v2-28m.toml) |
+| 120M | 1,234,189,344 | 111,651,872 | [120M](cascade-moe-v2-120m.toml) |
 
-The smaller variants are intended for miners to improve generators with less
-GPU memory and shorter local experiments. Once the models are populated, compare
-candidate and baseline on the same small variant, budget, seeds and held-out
-pool. Test promising generators again on the effective competition model before
-proposing a submission. Improvement on a small model does not establish a live
-win, and a checkpoint from a different architecture is not a compatible warm
-start. Adding these variants does not require every live entry to train all five.
+Parameter counts match the supplied architecture. GPU memory and speed are
+unmeasured for this port. Smaller variants offer local experiments with fewer
+parameters; no specific hardware capacity or speedup is promised.
+The 56M variant has no supplied definition and stays [blocked](pending/cascade-moe-56m.toml).
 
-| Target active parameters | Reserved architecture ID | Placeholder |
-|---|---|---|
-| 2M | `cascade-moe-v2-2m` | [2M](pending/cascade-moe-2m.toml) |
-| 7M | `cascade-moe-v2-7m` | [7M](pending/cascade-moe-7m.toml) |
-| 28M | `cascade-moe-v2-28m` | [28M](pending/cascade-moe-28m.toml) |
-| 56M | `cascade-moe-v2-56m` | [56M](pending/cascade-moe-56m.toml) |
-| ~120M | `cascade-moe-v2-120m` | [~120M](pending/cascade-moe-120m.toml) |
+From the checkout, create a **complete** local configuration:
 
-Each placeholder deliberately omits tensor dimensions, source and checkpoint
-digests, training recipes and throughput estimates. Configuration loading
-rejects its metadata in both primary and additional-size contracts, including
-a future `[v2.training]` table. These files do not change the active model,
-enable additional training jobs or make any performance claim.
+```bash
+python scripts/pyramid_config.py --size 2m --out ./chain.local-2m.toml
+cascade iterate ./my-gen --chain-toml ./chain.local-2m.toml --pool-dir ./heldout --seeds 0,1 --train-hours 0.01 --work-dir ./.cascade-2m --json
+```
 
-To populate a variant, supply its model implementation, exact configuration,
-checkpoint layout and source identity; qualify initialization, training,
-evaluation and Lane B's expert selection/merge behavior. Measure the reference
-throughput and memory requirements, then supply the complete training contract.
-Remove `implementation_status` and `target_active_parameters` from that contract
-only after qualification, and release that ID from `UNIMPLEMENTED_ARCH_PRESETS`
-in `cascade/shared/config/training.py`. Selecting a reserved name alone is also
-blocked, so it cannot label the old backend as a new model.
-Activate it through a reviewed contract release and
-new lineage. Keep the old implementations and pins available for replay.
+Use the installed Python environment; the command refuses to overwrite a file.
+The configuration has no dated activation, network overlay or runtime image pin
+for this offline experiment. It does not change your checked-in or live config.
+The fragments above contain `[training]` only; a fragment alone is not a complete
+`--chain-toml` file. The script validates and writes all required sections.
+
+Compare candidate and baseline with identical model, budget, seeds, held-out
+pool and compatible init. Use separate histories per model. Omit
+`--warm-start live` for the smaller-model experiment; it selects the actual live
+model and checkpoint. Recheck promising ideas there before submitting. A local
+gain on a smaller model does not establish a live win.
+
+The [model specification](../../docs/MODEL.md) covers the architecture and
+training recipe. The machine-readable [ladder](pyramid-ladder.json) preserves
+the supplied four-size design. Its research scores are source-run observations,
+not results measured from this port. The historical [old 28M preset](cascade-moe-28m.toml)
+and old model source remain available for checkpoint replay.

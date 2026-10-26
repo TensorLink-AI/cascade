@@ -115,15 +115,16 @@ chain evidence for payouts. For A use `cascade duel --hotkey HOTKEY --history --
 ## Competitions
 
 For cheaper generator optimization, use `cascade score` or `cascade iterate`
-on a smaller model once released. The planned 2M, 7M, 28M, 56M and ~120M
-variants are currently
-[blocked placeholders](https://github.com/TensorLink-AI/cascade/blob/cascade-v2/deploy/presets/README.md),
-awaiting model definitions. Select a released variant through a complete local
-`--chain-toml` configuration and compatible init. Keep both sides' model,
-budget, seeds and held-out pool fixed; use a separate work directory per model.
-Omit `--warm-start live` for the small-model experiment: it selects the live
-competition model and checkpoint. Recheck promising ideas with it before
-proposing submission. Small-model gains do not establish live wins or rewards.
+on the implemented 2M, 7M or 28M active-parameter variants. The 120M candidate
+has 1,234,189,344 total / 111,651,872 active parameters. 56M remains unspecified.
+See the [presets](https://github.com/TensorLink-AI/cascade/blob/cascade-v2/deploy/presets/README.md)
+and [model recipe](https://github.com/TensorLink-AI/cascade/blob/cascade-v2/docs/MODEL.md).
+From the checkout, `python scripts/pyramid_config.py --size 2m --out ./chain.local-2m.toml`
+writes a complete local config. Pass it with `--chain-toml`, keeping both sides'
+model, budget, seeds, pool and compatible init identical. Use separate histories
+per model. GPU performance is unmeasured for this port. Omit `--warm-start live`
+for small-model experiments; use it for the final check on the actual competition
+model. Small-model gains do not establish live wins or rewards.
 
 V1 centred on a Toto2-4M full-model data contest. V2 keeps the controlled
 competition on data, starts a fresh Cascade MoE lineage, adds selected-expert

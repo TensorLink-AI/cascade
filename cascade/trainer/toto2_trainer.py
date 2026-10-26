@@ -561,6 +561,13 @@ class Toto2Trainer:
     ) -> TrainResult:
         # DEC-CA-0050: one --trainer spec drives both architectures; the MoE
         # recipe lives in moe_trainer and the toto2 path below is untouched.
+        if str(getattr(contract, "base_arch", "") or "") == "cascade_pyramid":
+            from .pyramid_trainer import train_pyramid
+
+            return train_pyramid(self, stream, contract, training_seed=training_seed,
+                token_budget=token_budget, out_dir=out_dir, logger=logger,
+                warm_start_dir=warm_start_dir, expert_selection=expert_selection,
+                continuation=continuation)
         if str(getattr(contract, "base_arch", "") or "") == "cascade_moe":
             from .moe_trainer import train_moe
 

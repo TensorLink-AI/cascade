@@ -498,7 +498,7 @@ validator can judge the same settlement under different rules.
 
 - `from_block = 0` (checked-in mainnet template): v2 is off; nothing below changes.
 - From the first era starting at `from_block`:
-  - Lane A is judged under the `[v2.training]` contract (Cascade-MOE-28M):
+  - Lane A is judged under the `[v2.training]` contract (pyramid MoE, 120M nominal active size):
     the contract gate, `base_arch_digest`, the checkpoint guard and the
     eval all resolve the settlement's contract at its ERA START (pure block
     arithmetic). The settlement AT `from_block` still belongs to the last

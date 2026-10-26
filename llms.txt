@@ -60,15 +60,17 @@ Vast and Runpod; Runpod price-capped creates are refused. Key budgets are not
 verified by Cascade, and standard funding has no total cap across providers
 or retries. Do not mistake scoped permissions or preflight budgets for limits.
 
-For cheaper generator optimization, test with `cascade score` or compare
-versions with `cascade iterate` on a smaller model once released. The planned
-2M, 7M, 28M, 56M and ~120M variants are currently
-[blocked placeholders](deploy/presets/README.md). Select a released variant
-with a complete local `--chain-toml` configuration and compatible init;
-compare candidate and baseline using identical model, seeds, budget and pool,
-with separate histories per model. Recheck promising ideas with
-`--warm-start live`, which selects the live competition model and checkpoint.
-A small-model gain does not establish a live win or reward.
+For cheaper generator optimization, use `cascade score` or `cascade iterate`
+on the implemented 2M, 7M or 28M active-parameter variants. From the checkout,
+`python scripts/pyramid_config.py --size 2m --out ./chain.local-2m.toml` writes
+a complete `--chain-toml` config. See [preset instructions](deploy/presets/README.md)
+and [the architecture and recipe](docs/MODEL.md). The 120M candidate has
+1,234,189,344 total / 111,651,872 active parameters; 56M is unspecified.
+GPU memory and throughput are unmeasured for this port.
+Keep candidate and baseline on identical model, budget, seeds, pool and compatible
+init; use separate histories per model. Omit `--warm-start live` for small-model
+experiments. Use it for the final check against the live model and checkpoint.
+A small-model gain is not a live win or reward.
 
 | Lane | Contribution | What a successful contribution does |
 |---|---|---|

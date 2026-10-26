@@ -86,7 +86,7 @@ def test_lane_b(args, cfg):
             cfg = configured_context(cfg, block)
         elif cfg.training.v2_contract is not None:
             cfg = with_contract(cfg, cfg.training.v2_contract.primary_size)
-    if cfg.training.base_arch != "cascade_moe":
+    if cfg.training.base_arch not in ("cascade_moe", "cascade_pyramid"):
         raise ValueError("Lane-B tests require a configured MoE contract.")
     targets, error = expert_targets(cfg, args.targets)
     if error:

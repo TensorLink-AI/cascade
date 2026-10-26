@@ -95,7 +95,7 @@ def test_live_context_pins_moe_contract_and_checkpoint_together(cfg, monkeypatch
     data = snapshot(cfg)
     monkeypatch.setattr("cascade.miner.live_status.fetch_snapshot", lambda cfg: data)
     effective, pointer, _ = live_context(cfg)
-    assert effective.screen_contract().base_arch == "cascade_moe"
+    assert effective.screen_contract().base_arch == "cascade_pyramid"
     assert effective.eval.context_length == effective.training.context_length
     assert contract_digest(effective.training) == data["training_contract"]["digest"]
     assert pointer == data["warm_start"]["pointer"]

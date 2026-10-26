@@ -66,7 +66,7 @@ def test_calendar_replay_uses_finalized_time_not_the_receipts_claim():
     from cascade.audit.checks import check_v2, receipt_training
 
     replay = SimpleNamespace(epoch_start_block=54000, v2_block=43200, status="rejected")
-    assert receipt_training(replay, resolved).base_arch == "cascade_moe"
+    assert receipt_training(replay, resolved).base_arch == "cascade_pyramid"
     assert check_v2(replay, resolved).status == "PASS"
     with pytest.raises(ValueError, match="chain connection"):
         receipt_calendar_config(cfg, receipt)
