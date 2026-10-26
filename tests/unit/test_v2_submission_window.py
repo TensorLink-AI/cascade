@@ -195,3 +195,37 @@ def test_running_intake_remembers_opening_when_the_node_later_prunes_it():
     chain.finalized_block = lambda: 43201
     chain.block_timestamp = lambda _: pytest.fail("resolved pins must not be read again")
     assert admission(43201) is None
+
+
+@pytest.mark.parametrize("dated", [False, True])
+def test_pinned_opening_waits_for_its_finalized_block(cfg, dated):
+    from cascade.shared.v2_status import golive
+
+    view = replace(cfg, v2=replace(cfg.v2, from_block=1000, commit_from_block=500,
+        commit_open_at_utc="2026-10-30T09:00:00Z" if dated else ""))
+    refusal = lane_a_launch_gate(view, 499, 500)
+    assert refusal is not None and refusal[0] == 409
+    assert refusal[1]["code"] == "v2_submissions_not_open"
+    assert golive(view, 499)["admission_state"] == "closed"
+    assert lane_a_launch_gate(view, 500, 500) is None
+    assert golive(view, 500)["admission_state"] == "queued"
+    assert golive(view, 1000)["admission_state"] == "active"
+
+
+def test_intake_with_future_pins_stores_nothing_until_the_opening(cfg, tmp_path):
+    from cascade.funding.main import ChainLaunchAdmission
+    from tests.unit.test_funding_intake import HK, REF, make_intake
+
+    view = replace(cfg, v2=replace(cfg.v2, from_block=1000, launch_at_utc="",
+        commit_open_at_utc="", commit_from_block=500))
+    head = [499]
+    admission = ChainLaunchAdmission(view, SimpleNamespace(finalized_block=lambda: head[0]))
+    intake, _ = make_intake(tmp_path)
+    intake.lane_a_admission = admission
+    headers = {"X-Miner-Hotkey": HK, "X-Commit-Ref": REF, "X-Lium-Api-Key": "fixture-only"}
+    code, body = intake.fund(headers)
+    assert code == 409 and body["code"] == "v2_submissions_not_open"
+    assert intake.queue.get(HK) is None and intake.vault.get(HK) is None
+    head[0] = 500
+    code, _ = intake.fund(headers)
+    assert code == 202 and intake.queue.get(HK) is not None

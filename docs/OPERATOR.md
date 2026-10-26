@@ -49,7 +49,8 @@ archive endpoint or type the resolved `[v2] from_block`.
 
 The v2 paid-entry opening is separately pinned as `[v2] commit_open_at_utc =
 "2026-10-30T09:00:00Z"`. Its first finalized chain block becomes
-`commit_from_block`; an explicit block pin is also supported. Late nodes must
+`commit_from_block`; an explicit block pin is also supported. A configured pin
+does not open intake early: the finalized head must reach it first. Late nodes must
 be able to resolve both timestamps, or use both published block pins. This is
 also required after a restart. A running intake retains each resolved pin
 between requests so it does not repeatedly need state the node has pruned.

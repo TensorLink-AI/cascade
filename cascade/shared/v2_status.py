@@ -108,7 +108,7 @@ def golive(cfg, block: int | None) -> dict:
         floor = int(v2.commit_from_block)
         opening = {"commit_open_at_utc": v2.commit_open_at_utc,
                    "commit_from_block": floor,
-                   "admission_state": ("closed" if not floor else
+                   "admission_state": ("closed" if not floor or (block is not None and int(block) < floor) else
                        "active" if fb > 0 and block is not None and int(block) >= fb else "queued")}
     if fb <= 0:
         date = getattr(getattr(cfg, "v2", None), "launch_at_utc", "")

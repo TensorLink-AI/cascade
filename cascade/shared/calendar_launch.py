@@ -160,9 +160,10 @@ def lane_a_launch_gate(cfg, block, reveal_block=None):
     """A new-release paid admission gate; no queue, credentials or chain writes."""
     if not (cfg.v2.commit_open_at_utc or cfg.v2.commit_from_block):
         return None
-    if not cfg.v2.commit_from_block:
+    if not cfg.v2.commit_from_block or int(block) < int(cfg.v2.commit_from_block):
+        opening = cfg.v2.commit_open_at_utc or f"finalized block {cfg.v2.commit_from_block}"
         return 409, {"code": "v2_submissions_not_open",
-                     "message": f"Lane A v2 commitments open at {cfg.v2.commit_open_at_utc}; "
+                     "message": f"Lane A v2 commitments open at {opening}; "
                                 "nothing was queued or rented"}
     if reveal_block is not None and int(reveal_block) < int(cfg.v2.commit_from_block):
         return 403, {"code": "v2_commit_before_open",
