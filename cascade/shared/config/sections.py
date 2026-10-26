@@ -98,7 +98,7 @@ class GeneratorConfig:
     # config source). They ride here because this dataclass is what reaches
     # the sandbox children and every drain/stream call site.
     #   accepted_fields    — record fields to accept AND consume ("mask",
-    #                        "roles"); () = values-only (deployed default).
+    #                        "roles", "groups"); () = values-only (historical default).
     #   allow_future_known — admit roles value 2 (future-known covariates).
     #   real_corpus_ref    — the owner-published shared real corpus pin
     #                        (DEC-CA-0028); "" = none (deployed default).

@@ -117,3 +117,8 @@ Percentages are shares of the competition reward vector. A lane's pool is its bu
 - [Architecture](docs/ARCHITECTURE.md): components, data flow and trust boundaries.
 - [Evaluation-pool operations](docs/EVAL_POOL.md): private real-data snapshots and MarketCast observations.
 - [Protocol decisions](decisions/): historical rules and amendments, not a declaration that a feature is live.
+
+Optional generator `groups` labels pack independent channel groups into each
+8–32-channel yield. Use them only when the effective contract accepts
+`groups`; omission or `None` keeps the values-only path. See the group-packing
+section of [the interface](docs/INTERFACE.md#pack-independent-groups-in-one-yield).

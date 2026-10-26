@@ -77,6 +77,7 @@ def _policy(cfg: ChainConfig, across_launch: bool):
         return base
     after = cfg.generator_for_contract(v2)
     return replace(base,
+                   accepted_fields=tuple(sorted(set(base.accepted_fields) & set(after.accepted_fields))),
                    min_channels=max(base.min_channels, after.min_channels),
                    max_channels=min(base.max_channels, after.max_channels),
                    min_length=max(base.min_length, after.min_length),

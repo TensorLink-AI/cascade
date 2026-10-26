@@ -158,3 +158,8 @@ Discover what is actually active using `cascade status --json` and check the
 release with `cascade discovery-check --json`. Neither static prose nor an old
 checkpoint is a substitute for fresh rules. The [architecture](docs/ARCHITECTURE.md)
 and [decisions](decisions/) explain the implementation and its amendments.
+
+Optional generator `groups` labels pack independent channel groups into each
+8–32-channel yield. Use them only when the effective contract accepts
+`groups`; omission or `None` keeps the values-only path. See the group-packing
+section of [the interface](docs/INTERFACE.md#pack-independent-groups-in-one-yield).

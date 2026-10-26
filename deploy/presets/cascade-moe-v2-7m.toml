@@ -2,8 +2,9 @@
 
 [training]
 base_arch = "cascade_pyramid"
+accepted_fields = ["groups"]
 arch_preset = "cascade-moe-v2-7m"
-base_arch_digest = "9d1e6363c84ee3fa7c40293f10809aa92a5dc3044a84fc48796354729aa7eb7b"
+base_arch_digest = "7a8cc0e9a66b54fa68344e8aface33f107b9fcd4743a93fbb7a99dd7b3372b74"
 d_model = 256
 num_layers = 10
 num_heads = 4

@@ -210,7 +210,7 @@ class _GatedAttention(nn.Module):
             self.register_buffer("inv_freq", 1.0 / (10000.0**idx), persistent=False)
             self.register_buffer("zeta", (idx + 0.4) / 1.4, persistent=False)
 
-    def forward(self, h: torch.Tensor) -> torch.Tensor:
+    def forward(self, h: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
         B, T, _ = h.shape
         H, hd = self.cfg.num_heads, self.cfg.head_dim
         q, k, v = self.qkv(h).view(B, T, 3, H, hd).unbind(dim=2)
@@ -218,7 +218,10 @@ class _GatedAttention(nn.Module):
         if self.axis == "time":
             q, k = _xpos(q, k, self.inv_freq, self.zeta)
         q = q * (F.softplus(self.per_dim_scale) / math.log(2.0))
-        a = F.scaled_dot_product_attention(q, k, v, is_causal=(self.axis == "time"), scale=1.0 / hd)
+        if attn_mask is None:
+            a = F.scaled_dot_product_attention(q, k, v, is_causal=(self.axis == "time"), scale=1.0 / hd)
+        else:
+            a = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, scale=1.0 / hd)
         a = a.transpose(1, 2).reshape(B, T, H * hd)
         if self.gate is not None:
             a = a * (2 * torch.sigmoid(self.gate(h)))
@@ -376,11 +379,12 @@ class _Block(nn.Module):
         self.attn_a, self.attn_b = math.sqrt(t_a / (t_a + 1)), math.sqrt(1 / (t_a + 1))
         self.mlp_a, self.mlp_b = math.sqrt(t_m / (t_m + 1)), math.sqrt(1 / (t_m + 1))
 
-    def forward(self, x: torch.Tensor, roles: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, roles: torch.Tensor | None = None,
+                attn_mask: torch.Tensor | None = None) -> torch.Tensor:
         """``x``: ``(S, T, d)`` — S sequences of T tokens along this block's axis.
         ``roles``: ``(S, T)`` channel roles (variate blocks only)."""
         h = self.norm1(x)
-        x = self.attn_b * x + self.attn_a * self.attn(h)
+        x = self.attn_b * x + self.attn_a * self.attn(h, attn_mask=attn_mask)
         if self.ffn is None:
             return x
         h = self.norm2(x)
@@ -441,13 +445,23 @@ class CascadeMoEModel(nn.Module):
         return [b.ffn for b in self.blocks if b.moe]
 
     def forward(self, patches: torch.Tensor, mask: torch.Tensor | None = None,
-                roles: torch.Tensor | None = None, *, with_parameters: bool = False):
+                roles: torch.Tensor | None = None, *, with_parameters: bool = False,
+                groups: torch.Tensor | None = None):
         squeeze = patches.dim() == 3
         if squeeze:
             patches = patches[:, None]
             if mask is not None:
                 mask = mask[:, None]
         B, C, P, ps = patches.shape
+        variate_mask = None
+        if groups is not None:
+            if groups.shape != (B, C) or groups.dtype not in (torch.uint8, torch.int32, torch.int64):
+                raise ValueError("groups must be integer (B, C) labels")
+            groups = groups.to(device=patches.device)
+            same = groups[:, :, None] == groups[:, None, :]
+            # A single group is exactly the original unmasked SDPA path.
+            if not bool(same.all()):
+                variate_mask = same[:, None, None].expand(B, P, 1, C, C).reshape(B * P, 1, C, C)
         if mask is None:
             mask = torch.zeros_like(patches)
         else:
@@ -466,7 +480,7 @@ class CascadeMoEModel(nn.Module):
                 x = blk(x.reshape(B * C, P, -1)).view(B, C, P, -1)
             else:
                 r = roles[:, None, :].expand(B, P, C).reshape(B * P, C)
-                x = (blk(x.transpose(1, 2).reshape(B * P, C, -1), r)
+                x = (blk(x.transpose(1, 2).reshape(B * P, C, -1), r, attn_mask=variate_mask)
                      .view(B, P, C, -1).transpose(1, 2))
             if blk.moe and blk.ffn.last_aux is not None:
                 aux = aux + blk.ffn.last_aux
@@ -535,7 +549,7 @@ def _dct_project(x):
     return (x @ basis) @ basis.T
 
 
-def sample_copula_paths(params, n_samples, *, generator=None):
+def sample_copula_paths(params, n_samples, *, generator=None, groups=None):
     """B,C,[P,]32,23 -> B,C,[P,]S,32; rank-one noise shared over channels."""
     q = quantiles(params)
     diag = F.softplus(_dct_project(params[..., NUM_QUANTILES])) + 1e-4
@@ -553,7 +567,19 @@ def sample_copula_paths(params, n_samples, *, generator=None):
     noise = torch.randn(shape, device=params.device, dtype=params.dtype, generator=generator) @ chol.T
     latent_shape = list(shape[:-1]) + [1]
     latent_shape[1] = 1
-    latent = torch.randn(latent_shape, device=params.device, dtype=params.dtype, generator=generator)
+    if groups is None or bool((groups == 0).all()):
+        latent = torch.randn(latent_shape, device=params.device, dtype=params.dtype, generator=generator)
+    else:
+        if groups.shape != params.shape[:2] or groups.dtype not in (torch.uint8, torch.int32, torch.int64):
+            raise ValueError("groups must be integer (B, C) labels")
+        groups = groups.to(device=params.device, dtype=torch.long)
+        if bool((groups < 0).any()) or int(groups.max()) >= params.shape[1]:
+            raise ValueError("group labels outside channel range")
+        latent_shape[1] = int(groups.max()) + 1
+        independent = torch.randn(latent_shape, device=params.device, dtype=params.dtype, generator=generator)
+        index_shape = (*groups.shape, *((1,) * (independent.ndim - 2)))
+        channel_index = groups.reshape(index_shape).expand(params.shape[0], params.shape[1], *independent.shape[2:])
+        latent = independent.gather(1, channel_index)
     z = (diag[..., None, :] * noise + factor[..., None, :] * latent)
     z = z / (diag.square() + factor.square()).sqrt()[..., None, :]
     knots = torch.special.ndtri(q.new_tensor(QUANTILE_LEVELS))

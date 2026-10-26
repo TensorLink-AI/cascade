@@ -478,3 +478,81 @@ def test_audit_baseline_rows_with_empty_scores_fail_cleanly():
 
     with pytest.raises(ValueError, match="present but empty"):
         _baseline_pooled(_R, [""])
+
+
+def test_groups_are_gated_and_canonical_before_uint8_conversion():
+    from cascade.interface.generator import SeriesValidator
+
+    values = np.arange(8 * 64, dtype=float).reshape(8, 64)
+    valid = np.array([0, 1, 0, 2, 1, 2, 3, 3], dtype=np.uint8)
+    assert validate_accepted_fields(['groups']) == ('groups',)
+    with pytest.raises(ValueError, match="reserved"):
+        canonicalize_yield({'values': values, 'groups': valid})
+    validator = SeriesValidator(min_length=64, max_length=64, min_channels=8, max_channels=32,
+                                accepted_fields=('groups',))
+    out = validator.process({'values': values, 'groups': valid}, 0)
+    assert out['groups'].dtype == np.uint8 and out['groups'].shape == (8,)
+    assert np.array_equal(out['groups'], valid)
+    for invalid in ([1]*8, [0, 2, 1, 1, 1, 1, 1, 1], [-256]*8, [256]*8,
+                    [0.0]*8, [False]*8, np.zeros((8, 1), np.uint8), [0]*7):
+        with pytest.raises(ValueError, match='groups'):
+            validator.process({'values': values, 'groups': invalid}, 0)
+    with pytest.raises(ValueError, match='8–32'):
+        check_record({'values': values[:7], 'groups': np.zeros(7, dtype=np.uint8)})
+    # Direct check_record callers cannot waive integer validation.
+    with pytest.raises(ValueError, match='integer'):
+        check_record({'values': values, 'groups': np.zeros(8, dtype=float)})
+
+
+def test_groups_none_is_absence_even_when_unarmed():
+    values = _vals(13)
+    for accepted in ((), ('groups',)):
+        assert canonicalize_yield({'values': values, 'groups': None}, accepted=accepted) is values
+
+
+def test_legacy_backends_cannot_arm_an_unconsumed_groups_field(cfg):
+    from dataclasses import asdict
+
+    from cascade.shared.config.training import parse_training_contract
+
+    raw = asdict(cfg.training)
+    raw['accepted_fields'] = ['groups']
+    with pytest.raises(ValueError, match='groups require'):
+        parse_training_contract(raw)
+
+
+def test_pyramid_consumes_grouped_shards_end_to_end(tmp_path):
+    from dataclasses import replace
+
+    import torch
+
+    from cascade.generation.shards import finalize_index, write_shard
+    from cascade.miner.training_context import with_contract
+    from cascade.shared.config import parse_chain_config
+    from cascade.trainer.stream import open_round_stream
+    from cascade.trainer.toto2_trainer import Toto2Trainer
+    from scripts.pyramid_config import local_config
+
+    previous = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        cfg = parse_chain_config(local_config('2m'))
+        contract = replace(cfg.training, corpus_mode='shards', training_steps=2, batch_size=16,
+                           micro_batches=2, max_train_seconds=60)
+        cfg = with_contract(cfg, contract)
+        rng = np.random.default_rng(9)
+        groups = np.repeat(np.arange(4, dtype=np.uint8), 2)
+        series = [{'values': rng.normal(size=(8, 64)).astype(np.float32), 'groups': groups} for _ in range(4)]
+        shard = write_shard(tmp_path / 'group.parquet', series)
+        index = finalize_index(tmp_path, seed=9, children=[{'index': 0, 'seed': 9, 'shards': [shard]}])
+        assert index['schema'] == 2
+        with open_round_stream('shards', tmp_path, 9, cfg.generator, token_budget=2048, corpus_dir=tmp_path,
+                               continuation_protocol='cascade-continuation/1') as stream:
+            result = Toto2Trainer(device='cpu').train(stream.series(), contract, training_seed=3,
+                token_budget=2048, out_dir=tmp_path / 'checkpoint')
+        assert result.metrics['steps'] == 2 and result.metrics['channel_tokens'] == 2048
+        assert np.isfinite(result.metrics['final_loss'])
+        assert result.metrics['channel_telemetry']['n_multichannel_series'] == 4
+        assert stream.digest == index['corpus_digest']
+    finally:
+        torch.set_num_threads(previous)

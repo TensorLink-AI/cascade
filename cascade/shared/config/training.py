@@ -523,6 +523,8 @@ def parse_training_contract(t: dict) -> TrainingContractConfig:
                 "recipe and measured budget, release its reserved architecture ID, "
                 "then remove implementation_status and "
                 "target_active_parameters before activation.")
+    if "groups" in t.get("accepted_fields", ()) and t.get("base_arch") != "cascade_pyramid":
+        raise ValueError("groups require the cascade_pyramid consumer and a new architecture pin")
     steps = t.get("training_steps", 0)
     if type(steps) is not int or steps < 0 or steps and t.get("base_arch") != "cascade_pyramid":
         raise ValueError("training_steps is a non-negative integer for cascade_pyramid only")

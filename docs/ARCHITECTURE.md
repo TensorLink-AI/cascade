@@ -37,7 +37,11 @@ into its architecture digest; `eval/checkpoint_guard.py` verifies both shipped
 Python files, configuration and tensor geometry before execution.
 `Toto2Trainer` dispatches the effective architecture for workers, audits and
 miner experiments. New update budgets are digest-bound; their default zero
-leaves historical contract digests unchanged.
+leaves historical contract digests unchanged. Optional generator `groups`
+are carried through schema-2 shards, equal-width batches, masked variate
+attention and per-group copula sampling (DEC-CA-0065). Values-only paths retain
+their numerical and corpus bytes; new pyramid source/contract pins still
+require a matching release and checkpoint lineage.
 
 The [model specification](MODEL.md) describes Cascade MoE Base variants at 17.58M,
 69.02M, 273.84M and 1.23B total parameters. [Preset instructions](../deploy/presets/README.md) cover complete

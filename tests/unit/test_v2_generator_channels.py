@@ -185,3 +185,54 @@ def test_unbound_verification_holds_on_both_sides_of_the_launch(tmp_path, networ
         report = verify_repo(tmp_path, cfg, quick=True, across_launch=True)
         assert report.ok is ok, report.render()
     assert "channels outside [8, 32]" in report.render()
+
+
+@pytest.mark.parametrize('channels', [7, 8, 32, 33])
+def test_grouped_tier_enforces_width_and_reproduces_group_draw(tmp_path, channels):
+    base = load_chain_config()
+    cfg = base.generator_for_contract(base.training.v2_contract)
+    def child(_repo, seed, *_):
+        rng = np.random.default_rng(seed)
+        labels = rng.integers(0, 3, size=channels)
+        mapping = {}
+        groups = np.array([mapping.setdefault(int(label), len(mapping)) for label in labels], dtype=np.uint8)
+        return contextlib.nullcontext(iter([{'values': rng.normal(size=(channels, 64)), 'groups': groups}]))
+    g = GenerationConfig(vcpus=2, target_points=1024, shard_points=512)
+    a = generate_corpus(tmp_path, 4, cfg, g, tmp_path / 'a', runner=child)
+    b = generate_corpus(tmp_path, 4, cfg, g, tmp_path / 'b', runner=child)
+    if channels in (8, 32):
+        assert not a['faults'] and a['schema'] == 2
+        assert a['corpus_digest'] == b['corpus_digest']
+    else:
+        assert a['stop_reason'] == 'generator_fault' and a['n_series'] == 0
+
+
+def test_packing_template_is_optional_seeded_and_verifiable(tmp_path):
+    import shutil
+
+    from cascade.interface.generator import check_groups
+    from cascade.miner.training_context import with_contract
+
+    source = ROOT / 'cascade/miner/templates/generator'
+    for name in ('generator.py', 'config.json', 'requirements.txt'):
+        shutil.copy2(source / name, tmp_path / name)
+    config = json.loads((tmp_path / 'config.json').read_text())
+    config['channels'] = 32
+    config['packing']['enabled'] = True
+    config['packing']['shares'] = [30, 25, 25, 15, 5]
+    (tmp_path / 'config.json').write_text(json.dumps(config))
+    spec = importlib.util.spec_from_file_location('packed_template', tmp_path / 'generator.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    a = list(module.Generator(str(tmp_path), seed=7).generate(4))
+    b = list(module.Generator(str(tmp_path), seed=7).generate(4))
+    for left, right in zip(a, b, strict=True):
+        assert left['values'].dtype == np.float32
+        check_groups(left['groups'], 32)
+        assert np.array_equal(left['values'], right['values'])
+        assert np.array_equal(left['groups'], right['groups'])
+    cfg = load_chain_config()
+    cfg = with_contract(cfg, cfg.training.v2_contract)
+    cfg = replace(cfg, generator=replace(cfg.generator, sandbox_strict=False))
+    report = verify_repo(tmp_path, cfg, quick=True)
+    assert report.ok, report.render()

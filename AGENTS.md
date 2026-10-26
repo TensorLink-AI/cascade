@@ -185,6 +185,11 @@ Rules for the loop:
   wall; v2 A CPU shards have their own generation window before GPU rental.
 - `requirements.txt` is hash-locked and allowlisted.
 
+Optional generator `groups` labels pack independent channel groups into each
+8–32-channel yield. Use them only when the effective contract accepts
+`groups`; omission or `None` keeps the values-only path. See the group-packing
+section of [the interface](docs/INTERFACE.md#pack-independent-groups-in-one-yield).
+
 ## Rewards and burns
 
 <!-- cascade:rewards:summary:start -->

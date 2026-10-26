@@ -145,6 +145,8 @@ def test_architecture_and_recipe_mismatches_refuse_before_training(tmp_path, con
 
 
 def test_shipped_pyramid_pins_match_the_implemented_source():
+    # DEC-CA-0065 legitimately moves pyramid source pins for grouped attention
+    # and copula sampling. Legacy Toto2/MoE source and digest goldens stay fixed.
     import tomllib
 
     from cascade.shared.config.training import parse_training_contract

@@ -84,7 +84,9 @@ class ChainConfig:
         v2 policy raises it; the separately pinned pre-v2 model keeps its
         original admission range when replayed or trained during transition.
         """
-        gen = self.generator
+        gen = replace(self.generator, accepted_fields=contract.accepted_fields)
+        if "groups" in contract.accepted_fields:
+            gen = replace(gen, interface_version=2)
         if self.training.v2_contract is not None and contract.base_arch == self.training.base_arch:
             gen = replace(gen, min_channels=1)
         if contract.corpus_mode == "shards":

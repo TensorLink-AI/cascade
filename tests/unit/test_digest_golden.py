@@ -164,3 +164,30 @@ def test_drop_when_default_fields_never_move_a_deployed_digest():
         if hasattr(c, key):
             # present on the dataclass at its default → golden must still hold
             assert contract_digest(c) == GOLDEN_CONTRACT
+
+
+def test_grouped_corpus_stream_and_dedup_goldens():
+    from cascade.interface.generator import canonicalize_record, element_dedup_key
+
+    record = canonicalize_record({
+        'values': np.arange(8*64, dtype=float).reshape(8, 64) / 8,
+        'groups': np.array([0, 1, 0, 2, 1, 2, 3, 3], dtype=np.uint8),
+    })
+    assert corpus_digest([record]) == 'ba7c5e0a1a3fc08f6a4c70b65b355734ca0642f4e16b0719cf857e6335730050'
+    stream = _StreamDigest()
+    stream.update(record)
+    assert stream.hexdigest() == 'bb8c2af014889a9daf7c36b872e6c952ce5c5cc8ccd6c124ab50c4159797be46'
+    assert element_dedup_key(record).hex() == '032f33768280e6f960bd34f4a1d0b773'
+
+
+def test_none_groups_keep_frozen_values_only_digest_and_empty_field_contract():
+    from cascade.shared.manifest import contract_digest
+
+    assert corpus_digest([{'values': _a1(), 'groups': None}, _a2()]) == GOLDEN_CORPUS_VALUES_ONLY
+    stream = _StreamDigest()
+    stream.update({'values': _canon(_a1()), 'groups': None})
+    stream.update(_canon(_a2()))
+    assert stream.hexdigest() == GOLDEN_STREAM_2X1D
+    assert contract_digest(_fixture_contract(accepted_fields=())) == GOLDEN_CONTRACT
+    # The existing omission table is unchanged; arming groups is explicit.
+    assert contract_digest(_fixture_contract(accepted_fields=('groups',))) == 'b40b3d3b6d9fef826fd75a25db18d382fe3e62681d9c0d98a4e3ea59fd69ae75'

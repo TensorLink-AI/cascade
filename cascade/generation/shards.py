@@ -7,6 +7,10 @@ A materialised corpus is a directory::
 
 Each shard row is one series: ``channels`` (int32), ``length`` (int32) and
 ``values`` (the ``(C, L)`` array as little-endian float32 bytes, row-major).
+Schema 2 adds nullable ``groups`` (one uint8 label byte per channel). A
+values-only shard, including explicit ``groups=None``, keeps schema 1 and
+the exact original parquet bytes. An index is schema 2 if any shard uses it.
+
 float32 is what the model trains on; every reader widens it to float64
 exactly, so the stream digest is over the stored values, not the generator's
 pre-rounding float64.
@@ -42,6 +46,7 @@ from pathlib import Path
 import numpy as np
 
 SCHEMA = 1
+GROUPS_SCHEMA = 2
 INDEX_NAME = "corpus.json"
 URLS_NAME = "urls.json"      # remote corpus: {shard name: pre-signed GET link}
 
@@ -93,15 +98,29 @@ def file_sha256(path: Path | str) -> str:
     return h.hexdigest()
 
 
-def write_shard(path: Path | str, series: Iterable[np.ndarray]) -> dict:
+def write_shard(path: Path | str, series: Iterable[np.ndarray | dict]) -> dict:
     """Write ``series`` to one parquet shard; returns its index entry."""
     pa, pq = _pa()
     chans: list[int] = []
     lens: list[int] = []
     vals: list[bytes] = []
     points = 0
+    groups: list[bytes | None] = []
     for s in series:
+        group = None
+        if isinstance(s, dict):
+            extras = set(s) - {"values", "groups"}
+            if extras:
+                raise ShardError(f"unsupported shard fields: {sorted(extras)}")
+            group = s.get("groups")
+            s = s["values"]
         a = as_2d(s).astype("<f4")
+        if group is not None:
+            from ..interface.generator import check_groups
+
+            check_groups(group, a.shape[0])
+            group = np.asarray(group, dtype=np.uint8).tobytes()
+        groups.append(group)
         chans.append(int(a.shape[0]))
         lens.append(int(a.shape[1]))
         vals.append(np.ascontiguousarray(a).tobytes())
@@ -111,25 +130,46 @@ def write_shard(path: Path | str, series: Iterable[np.ndarray]) -> dict:
         "length": pa.array(lens, type=pa.int32()),
         "values": pa.array(vals, type=pa.large_binary()),
     })
+    grouped = any(g is not None for g in groups)
+    if grouped:
+        table = table.append_column("groups", pa.array(groups, type=pa.binary()))
+        table = table.replace_schema_metadata({b"cascade_schema": b"2"})
     path = Path(path)
     pq.write_table(table, path, compression="zstd")
-    return {"name": path.name, "sha256": file_sha256(path),
-            "n_series": len(chans), "points": points}
+    entry = {"name": path.name, "sha256": file_sha256(path),
+             "n_series": len(chans), "points": points}
+    if grouped:
+        entry["schema"] = GROUPS_SCHEMA
+    return entry
 
 
-def iter_shard(path: Path | str) -> Iterator[np.ndarray]:
-    """Yield a shard's series as float64 ``(C, L)`` arrays, in row order."""
+def iter_shard(path: Path | str) -> Iterator[np.ndarray | dict]:
+    """Yield widened float64 values, carrying schema-2 groups when present."""
     _, pq = _pa()
     pf = pq.ParquetFile(path)
-    for batch in pf.iter_batches(batch_size=1024, columns=["channels", "length", "values"]):
+    grouped = "groups" in pf.schema_arrow.names
+    columns = ["channels", "length", "values"] + (["groups"] if grouped else [])
+    for batch in pf.iter_batches(batch_size=1024, columns=columns):
         cs = batch.column(0).to_pylist()
         ls = batch.column(1).to_pylist()
         vs = batch.column(2).to_pylist()
-        for c, n, v in zip(cs, ls, vs, strict=True):
+        gs = batch.column(3).to_pylist() if grouped else [None] * len(cs)
+        for c, n, v, g in zip(cs, ls, vs, gs, strict=True):
             a = np.frombuffer(v, dtype="<f4")
             if a.size != c * n:
                 raise ShardError(f"{path}: row holds {a.size} values, expected {c}×{n}")
-            yield a.reshape(c, n).astype(np.float64)
+            values = a.reshape(c, n).astype(np.float64)
+            if g is None:
+                yield values
+            else:
+                from ..interface.generator import check_groups
+
+                labels = np.frombuffer(g, dtype=np.uint8).copy()
+                try:
+                    check_groups(labels, c)
+                except ValueError as exc:
+                    raise ShardError(f"{path}: {exc}") from exc
+                yield {"values": values, "groups": labels}
 
 
 def read_index(corpus_dir: Path | str) -> dict:
@@ -138,8 +178,8 @@ def read_index(corpus_dir: Path | str) -> dict:
         idx = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, ValueError) as e:
         raise ShardError(f"unreadable corpus index {p}: {e}") from e
-    if idx.get("schema") != SCHEMA:
-        raise ShardError(f"{p}: schema {idx.get('schema')!r}, expected {SCHEMA}")
+    if idx.get("schema") not in (SCHEMA, GROUPS_SCHEMA):
+        raise ShardError(f"{p}: schema {idx.get('schema')!r}, expected 1 or 2")
     return idx
 
 
@@ -265,8 +305,12 @@ def stream_digest(series: Iterable[np.ndarray]) -> tuple[str, int, int]:
     dg = _StreamDigest()
     n = points = 0
     for s in series:
-        a = as_2d(s)
-        dg.update(a)
+        if isinstance(s, dict):
+            a = as_2d(s["values"])
+            dg.update(s)
+        else:
+            a = as_2d(s)
+            dg.update(a)
         n += 1
         points += int(a.size)
     return dg.hexdigest(), n, points
@@ -282,7 +326,9 @@ def finalize_index(corpus_dir: Path | str, *, seed: int, children: list[dict],
         kids.append({**c,
                      "n_series": sum(s["n_series"] for s in c["shards"]),
                      "points": sum(s["points"] for s in c["shards"])})
-    index = {**(meta or {}), "schema": SCHEMA, "seed": int(seed), "children": kids}
+    schema = GROUPS_SCHEMA if any(sh.get("schema") == GROUPS_SCHEMA
+                                  for c in kids for sh in c["shards"]) else SCHEMA
+    index = {**(meta or {}), "schema": schema, "seed": int(seed), "children": kids}
     write_index(d, {**index, "corpus_digest": "", "n_series": 0, "points": 0})
     digest, n, points = stream_digest(iter_corpus(d, verify=True))
     index.update(corpus_digest=digest, n_series=n, points=points)

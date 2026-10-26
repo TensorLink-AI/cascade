@@ -83,7 +83,7 @@ def series_channel_stats(arr: np.ndarray) -> tuple[float, float] | None:
     return (max_abs_corr, effective_rank)
 
 
-def series_min_partner_z(arr: np.ndarray) -> float | None:
+def series_min_partner_z(arr: np.ndarray, groups=None) -> float | None:
     """Weakest channel's strongest shared-innovation coupling, as a z-score;
     ``None`` below 2 channels or 3 steps. A channel that never moves has no
     innovations and reads 0."""
@@ -93,6 +93,9 @@ def series_min_partner_z(arr: np.ndarray) -> float | None:
     d = np.diff(a, axis=1)
     corr = _corr_matrix(d)
     np.fill_diagonal(corr, 0.0)
+    if groups is not None:
+        labels = np.asarray(groups)
+        corr = np.where(labels[:, None] == labels[None, :], corr, 0.0)
     partner = np.abs(corr).max(axis=1)
     return float(partner.min() * np.sqrt(d.shape[1] - 1))
 
@@ -142,7 +145,9 @@ class ChannelStatsAccumulator:
         self._seen: set[bytes] = set()
 
     def observe(self, arr: np.ndarray | dict) -> None:
-        if isinstance(arr, dict):             # extended record: stats on values
+        groups = None
+        if isinstance(arr, dict):
+            groups = arr.get("groups")
             arr = arr["values"]
         a = np.asarray(arr)
         if a.ndim < 2 or a.shape[0] < 2:      # univariate: free, and silent
@@ -154,9 +159,10 @@ class ChannelStatsAccumulator:
         # per unique multichannel series; fresh streams never collide.
         import hashlib
 
-        key = hashlib.blake2b(
-            np.ascontiguousarray(a).tobytes(), digest_size=16
-        ).digest()
+        payload = np.ascontiguousarray(a).tobytes()
+        if groups is not None:
+            payload += b"\x00groups" + np.asarray(groups, dtype=np.uint8).tobytes()
+        key = hashlib.blake2b(payload, digest_size=16).digest()
         if key in self._seen:
             return
         self._seen.add(key)
@@ -166,7 +172,7 @@ class ChannelStatsAccumulator:
         self._corrs.append(stats[0])
         self._ranks.append(stats[1])
         self._n_channels.append(int(a.shape[0]))
-        partner_z = series_min_partner_z(a)
+        partner_z = series_min_partner_z(a, groups=groups)
         if partner_z is not None:
             self._partner_z.append(partner_z)
 

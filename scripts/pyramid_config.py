@@ -33,6 +33,7 @@ def training_table(size):
         d_model=row["width"], d_ff=row["dense_ffn"], num_heads=row["heads"], num_quantiles=21,
         target_train_hours=3.0, ref_throughput_tokens_per_s=0, training_steps=27500,
         batch_size=512, batch_denomination="sequences", budget_denomination="points",
+        accepted_fields=["groups"],
         base_lr=0.002125, warmup_fraction=80/27500, micro_batches=1,
         power_ema_sigma_rels=[], power_ema_eval=-1, copula_samples=4,
         copula_patches=127, router_lr_scale=1.0, route_bias_rate_scale=1.0,

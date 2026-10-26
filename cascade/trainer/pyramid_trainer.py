@@ -34,7 +34,7 @@ from .toto2_trainer import (
 )
 
 
-def prediction(model, values, mask):
+def prediction(model, values, mask, *, groups=None):
     """Normalize visible inputs and return next-patch parameters and anchors."""
     b, c, length = values.shape
     ps = model.cfg.patch_size
@@ -46,7 +46,7 @@ def prediction(model, values, mask):
     z = z.masked_fill(missing, 0).float().reshape(b, c, p, ps)
     with torch.autocast(device_type=values.device.type, dtype=torch.bfloat16,
                         enabled=values.device.type == "cuda"):
-        params = model(z, mask=mask, with_parameters=True)[:, :, :-1].float()
+        params = model(z, mask=mask, with_parameters=True, groups=groups)[:, :, :-1].float()
     loc = loc.reshape(b, c, p, ps)[:, :, :-1, -1, None].float()
     scale = scale.reshape(b, c, p, ps)[:, :, :-1, -1, None].float()
     return params, loc, scale
@@ -59,16 +59,16 @@ def marginal_pinball_loss(q, truth):
     return 90 * torch.maximum(levels * residual, (levels - 1) * residual).mean()
 
 
-def losses(model, values, mask, *, generator=None):
+def losses(model, values, mask, *, generator=None, groups=None):
     """Both losses see all next-patch targets; missing values are never invented."""
     b, c, length = values.shape
     ps = model.cfg.patch_size
     p = length // ps
-    params, loc, scale = prediction(model, values, mask)
+    params, loc, scale = prediction(model, values, mask, groups=groups)
     truth = (values.reshape(b, c, p, ps)[:, :, 1:].float() - loc) / scale
     q = quantiles(params)
     marginal = marginal_pinball_loss(q, truth)
-    paths = sample_copula_paths(params, 4, generator=generator)
+    paths = sample_copula_paths(params, 4, generator=generator, groups=groups)
     joint = 10 * energy_score(paths, truth).mean()
     return marginal, joint
 
@@ -124,10 +124,12 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
         copula_samples=4, copula_loss_cap=0.1, muon_momentum=0.96,
         muon_row_beta2=0.999, adamw_beta1=0.91, adamw_beta2=0.972,
         adamw_lr_scale=0.2, mup_lr_exponent=1.42, umup_base_d_model=512,
-        accepted_fields=(), warm_lr_scale=1.0)
+        warm_lr_scale=1.0)
     for name, value in expected.items():
         if getattr(contract, name) != value:
             raise ValueError(f"pyramid recipe requires {name}={value!r}")
+    if tuple(contract.accepted_fields) not in ((), ("groups",)):
+        raise ValueError("pyramid recipe accepts only optional groups")
     if str(trainer.dtype) != "torch.float32":
         raise ValueError("pyramid keeps fp32 master weights; CUDA forward uses bf16 autocast")
     torch.manual_seed(training_seed)
@@ -168,7 +170,18 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
         resumed_optimizer = trainer._load_optimizer_state(Path(warm_start_dir), optimizer, model)
     mask_rng = np.random.default_rng(np.random.SeedSequence([9152026, training_seed, 19]))
     cop_gen = torch.Generator(device=trainer.device).manual_seed(training_seed % (2**63))
-    timed = _TimedStream(stream)
+    from .channel_stats import ChannelStatsAccumulator
+
+    channel_stats = ChannelStatsAccumulator()
+    grouped_corpus = False
+
+    def observe(item):
+        nonlocal grouped_corpus
+        if isinstance(item, dict) and item.get("groups") is not None:
+            grouped_corpus = True
+        channel_stats.observe(item)
+
+    timed = _TimedStream(stream, observer=observe if "groups" in contract.accepted_fields else None)
     steps = contract.training_steps
     cooldown = max(1, round(steps / 11))
     trunk = steps - cooldown
@@ -201,13 +214,18 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
         max_ctx_patches=128, seed=training_seed), patch_size=cfg.patch_size,
         max_ctx_patches=128, batch_size=contract.batch_size,
         batch_denomination=contract.batch_denomination)
-    for index, values in enumerate(batches):
-        if isinstance(values, dict):
-            raise ValueError("pyramid recipe currently accepts target values without record fields")
+    for index, batch in enumerate(batches):
+        groups = None
+        if isinstance(batch, dict):
+            if set(batch) - {"values", "groups"} or "groups" not in contract.accepted_fields:
+                raise ValueError("pyramid recipe accepts only contracted groups")
+            values, groups = batch["values"], batch.get("groups")
+        else:
+            values = batch
         if continuation:
             from .continuation import batch_digest
 
-            replay_hash = hashlib.sha256((replay_hash + batch_digest(values)).encode()).hexdigest()
+            replay_hash = hashlib.sha256((replay_hash + batch_digest(batch)).encode()).hexdigest()
         if restored and index < step:
             if index + 1 == step:
                 if replay_hash != restored["input_hash"]:
@@ -246,7 +264,8 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
             with torch.no_grad():
                 for ids in splits:
                     prediction(model, torch.as_tensor(values[ids], device=trainer.device, dtype=torch.float64),
-                               torch.as_tensor(masks[ids], device=trainer.device))
+                               torch.as_tensor(masks[ids], device=trainer.device),
+                               groups=None if groups is None else torch.as_tensor(groups[ids], device=trainer.device))
                     for total, layer in zip(load, model.moe_layers(), strict=True):
                         total += layer.last_load
             for total, layer in zip(load, model.moe_layers(), strict=True):
@@ -258,7 +277,8 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
             weight = len(ids) / b
             x = torch.as_tensor(values[ids], device=trainer.device, dtype=torch.float64)
             mask = torch.as_tensor(masks[ids], device=trainer.device)
-            marginal, joint = losses(model, x, mask, generator=cop_gen)
+            marginal, joint = losses(model, x, mask, generator=cop_gen,
+                                     groups=None if groups is None else torch.as_tensor(groups[ids], device=trainer.device))
             marginal = marginal + model.aux_loss
             check_loss_finite(float(marginal.detach()), step=step, tokens=tokens)
             check_loss_finite(float(joint.detach()), step=step, tokens=tokens)
@@ -338,6 +358,10 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
         "corpus_exhausted": step < steps and tokens < token_budget and duration < contract.max_train_seconds}
     if slices:
         metrics.update(expert_training_backend="compact_rows", expert_trainable_param_count=sum(p.numel() for p in params))
+    if grouped_corpus:
+        summary = channel_stats.summary()
+        if summary is not None:
+            metrics["channel_telemetry"] = summary
     if logger:
         logger({"event": "done", **metrics})
     return TrainResult(out, counts["total"], duration, metrics)

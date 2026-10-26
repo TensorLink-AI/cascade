@@ -90,9 +90,9 @@ def inprocess_runner(repo: Path, seed: int, cfg: GeneratorConfig, budget: int,
 
 def _values(element) -> np.ndarray:
     if isinstance(element, dict):
-        extra = set(element) - {"values"}
+        extra = set(element) - {"values", "groups"}
         if extra:
-            raise ShardError(f"record fields {sorted(extra)} are not stored by shard schema 1")
+            raise ShardError(f"record fields {sorted(extra)} are not stored by the shard format")
         element = element["values"]
     return as_2d(element)
 
@@ -162,10 +162,11 @@ def _run_child(child: _Child, *, repo: Path, cfg: GeneratorConfig, n_children: i
 
             validator = SeriesValidator.from_config(cfg)
             for index, element in enumerate(frames):
-                a = _values(validator.process(element, index))
+                element = validator.process(element, index)
+                a = _values(element)
                 child.lengths[1 << max(0, int(a.shape[-1]) - 1).bit_length()] += 1
                 child.channels[int(a.shape[0]) if a.ndim == 2 else 1] += 1
-                buf.append(a)
+                buf.append(element if isinstance(element, dict) else a)
                 buf_points += int(a.size)
                 child.points += int(a.size)
                 if buf_points >= shard_points:

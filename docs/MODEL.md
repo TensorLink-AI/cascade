@@ -27,7 +27,9 @@ experiments. No 56M definition has been supplied.
 All sizes have ten blocks and 32-point patches. Training windows have at most
 4,096 points per channel. V2 generators emit 8–32 channels; the forecaster also
 accepts individual real series during evaluation. Channels stay together through
-attention so the model can learn their relationships.
+attention so the model can learn their relationships. Optional generator
+`groups` labels restrict cross-channel attention and shared copula factors to
+each group; omitted labels preserve joint attention across all channels.
 
 | Block | Attention axis | Feed-forward layer |
 |---|---|---|
@@ -70,8 +72,10 @@ one. Input values are transformed by `asinh` and clamped to ±64.
 
 The output at patch `p` predicts the 32 points of patch `p+1`, using patch `p`'s
 last location/scale as its anchor. Supervision includes both observed and masked
-targets. This recipe accepts values only; generator record masks and covariate
-roles are refused rather than silently ignored.
+targets. This recipe accepts values and optional per-channel `groups`;
+generator record masks and covariate roles are refused rather than silently
+ignored. Groups change which channels can attend to each other, not the
+per-channel loss or point budget.
 
 ## Unified output head
 
@@ -86,7 +90,7 @@ Copula drivers use the first eight DCT modes. Diagonal scales have constant RMS
 across each 32-point patch; factor magnitudes are equalized while preserving
 their patch energy. Independent temporal noise has covariance
 `0.99 * exp(-0.5 * ((t-t')/8)^2) + 0.01 * I`. A rank-one factor draw is shared
-across channels. Drivers are normalized to unit marginal variance and mapped
+across channels, or separately within each declared generator group. Drivers are normalized to unit marginal variance and mapped
 through a linear spline in normal-score coordinates, with linear tails.
 The validator wrapper uses these joint samples and a deterministic window seed.
 GIFT-Eval, BOOM, TIME and FEV retain their required nine-level metric grids.
@@ -148,6 +152,13 @@ the head tensors from 11 to 23 channels per point. Q9 pyramid checkpoints cannot
 initialize this release; checkpoint validation refuses incompatible tensors or
 configuration. Rebuild and qualify the Q21 worker image and its starting lineage.
 The original research run's Q9 scores do not establish Q21 performance.
+
+Group packing changes the pinned model source again, even for values-only
+users whose numerical path is unchanged. Its new architecture and accepting
+contract digests require a new release and matching baseline lineage. Existing
+checkpoint source must pass the unchanged byte-for-byte guard; an old Q21
+checkpoint cannot be relabelled as this release. Qualify images and baseline
+before activation; do not bypass the guard.
 
 ## Implementation and qualification
 

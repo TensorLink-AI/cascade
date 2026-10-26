@@ -642,8 +642,9 @@ bench_gate_v2_from_block = "v2"
 # Explicit update budget, not an estimated GPU-throughput measurement.
 # Rebuild/repin the worker image and qualify hardware before deployment.
 base_arch = "cascade_pyramid"
+accepted_fields = ["groups"]
 arch_preset = "cascade-moe-v2-2m"
-base_arch_digest = "6aed15d788d32b849f574443181a423058db742637a75df1fdae4bcc6b0f865d"
+base_arch_digest = "f836f54c7c5bf21ac2600f00f9b28b45461f67727e1a87ea268022ba326ff9e8"
 d_model = 128
 num_layers = 10
 num_heads = 2

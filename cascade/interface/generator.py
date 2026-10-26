@@ -47,9 +47,9 @@ import numpy as np
 # this is rejected before the generator runs (clear early error instead of a
 # mid-drain validation failure). Absent ⇒ 1. Bump only when a new payload
 # field is ACCEPTED (DEC-CA-0020's refuse-unconsumed rule).
-SUPPORTED_INTERFACE_VERSION = 1
+SUPPORTED_INTERFACE_VERSION = 2
 
-# The one field a record yield must carry at interface_version 1.
+# The required field in every interface version.
 VALUES_FIELD = "values"
 
 # Reserved payload names: published semantics, refused data. Each is claimed by
@@ -58,6 +58,7 @@ VALUES_FIELD = "values"
 # squat a name and no accepted-but-ignored field can ever exist. The table is
 # the migration path: accepting a field later is additive and breaks nobody.
 RESERVED_FIELDS: dict[str, str] = {
+    "groups": "per-channel attention groups (DEC-CA-0065; requires an accepting contract)",
     "mask": "per-entry observedness mask parallel to values (DEC-CA-0023)",
     "start": "absolute time anchor of the first step (DEC-CA-0021; no consumer under the calendar-free arch pin)",
     "freq": "sampling frequency / calendar step (DEC-CA-0021)",
@@ -104,6 +105,8 @@ def canonicalize_yield(
             )
         if key == VALUES_FIELD:
             continue
+        if key == "groups" and item[key] is None:
+            continue  # Explicit absence is exactly the legacy values-only path.
         if key in RESERVED_FIELDS:
             if key in accepted:
                 extras[key] = item[key]
@@ -167,11 +170,11 @@ class DataGenerator(ABC):
 
         Each yield is EITHER a bare array — the documented common case — or a
         named-field record (a ``dict``) whose ``"values"`` key carries that
-        same array (DEC-CA-0020). At ``interface_version`` 1 the record form
-        may carry the ``"values"`` field ONLY: reserved names
+        same array (DEC-CA-0020). Version 2 adds per-channel ``groups`` when
+        the effective contract accepts it (DEC-CA-0065). Other reserved names
         (:data:`RESERVED_FIELDS` — ``mask``, ``start``, ``freq``, ``group_id``,
         ``roles``, ``labels``, ``quantiles``) have published semantics but are
-        hard-rejected until the release that consumes them, and unknown names
+        hard-rejected unless their consumer is armed, and unknown names
         are always rejected. A values-only record corpus is byte-identical
         (same digest) to its bare-array twin, so the two forms are freely
         interchangeable.
@@ -315,19 +318,24 @@ def _series_key(canon: np.ndarray) -> bytes:
 
 RECORD_SENTINEL = b"\xff"
 
-_CANON_DTYPES = {"values": np.float64, "mask": np.uint8, "roles": np.uint8}
+_CANON_DTYPES = {"values": np.float64, "mask": np.uint8, "roles": np.uint8, "groups": np.uint8}
 
 
 def canonicalize_record(rec: dict) -> dict[str, np.ndarray]:
     """Canonical arrays for an extended record: ``values`` → contiguous
     ``(C, L)`` float64; ``mask`` → contiguous ``(C, L)`` uint8; ``roles`` →
-    contiguous ``(C,)`` uint8. Shape/content validity is :func:`check_record`'s
+    contiguous ``(C,)`` uint8; ``groups`` uses the same vector shape, with
+    integer/canonical-label validation before conversion. Shape/content validity is :func:`check_record`'s
     job — this only fixes dtype/layout so digests are byte-stable."""
     out: dict[str, np.ndarray] = {}
     for name, arr in rec.items():
+        if name == "groups":
+            if arr is None:
+                continue
+            check_groups(arr, np.atleast_2d(rec["values"]).shape[0])
         dtype = _CANON_DTYPES.get(name, np.float64)
         a = np.asarray(arr, dtype=dtype)
-        if name != "roles":
+        if name not in ("roles", "groups"):
             a = np.atleast_2d(a)
         out[name] = np.ascontiguousarray(a)
     return out
@@ -354,6 +362,25 @@ def _record_key(canon_rec: dict[str, np.ndarray]) -> bytes:
     return hashlib.blake2b(record_frame_bytes(canon_rec), digest_size=16).digest()
 
 
+def check_groups(groups, n_channels: int, *, index=None) -> None:
+    """Validate BEFORE uint8 conversion: no truncation, wrapping or relabelling."""
+    where = "" if index is None else f" (series {index})"
+    a = np.asarray(groups)
+    if not 8 <= n_channels <= 32:
+        raise ValueError(f"groups require 8–32 channels{where}")
+    if a.shape != (n_channels,):
+        raise ValueError(f"groups shape {a.shape} != ({n_channels},){where}")
+    if a.dtype.kind not in "iu":
+        raise ValueError(f"groups must contain integer labels{where}")
+    seen = set()
+    for value in a:
+        label = int(value)
+        if label not in seen:
+            if label != len(seen):
+                raise ValueError(f"groups labels must be canonical in order of first appearance{where}")
+            seen.add(label)
+
+
 def check_record(
     canon_rec: dict[str, np.ndarray],
     *,
@@ -372,6 +399,8 @@ def check_record(
       would randomise the dup gate); overall missing fraction ≤
       ``max_missing_frac``; no fully-masked channel (nothing observed to
       scale from).
+    * ``groups`` (DEC-CA-0065): integer ``(C,)`` labels, C in 8–32; new
+      labels must first appear as 0, 1, … with no gaps.
     * ``roles`` (DEC-CA-0026): shape ``(C,)``; entries in {0=target,
       1=past-covariate, 2=future-known}; value 2 admitted only when
       ``allow_future_known`` (armed only after the EVAL_POOL exogeneity rule
@@ -380,6 +409,9 @@ def check_record(
     """
     where = "" if index is None else f" (series {index})"
     values = canon_rec[VALUES_FIELD]
+    groups = canon_rec.get("groups")
+    if groups is not None:
+        check_groups(groups, values.shape[0], index=index)
     mask = canon_rec.get("mask")
     if mask is not None:
         if mask.shape != values.shape:

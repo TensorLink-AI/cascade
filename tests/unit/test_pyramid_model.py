@@ -298,3 +298,101 @@ def test_q21_pinball_keeps_the_original_overall_loss_scale():
     loss.backward()
     assert torch.isfinite(prediction.grad).all()
     assert all(torch.count_nonzero(prediction.grad[..., i]) > 0 for i in range(21))
+
+
+def test_packed_forward_matches_separate_groups_and_blocks_cross_group_gradients():
+    torch.manual_seed(17)
+    model = CascadeMoEModel(tiny_config()).eval()
+    x = torch.randn(2, 8, 4, 32, requires_grad=True)
+    groups = torch.tensor([[0, 1, 0, 2, 1, 2, 2, 3], [0, 0, 1, 1, 2, 2, 3, 3]])
+    packed = model(x, groups=groups)
+    for b in range(2):
+        for label in groups[b].unique():
+            indices = groups[b] == label
+            separate = model(x[b:b+1, indices])
+            torch.testing.assert_close(packed[b:b+1, indices], separate, atol=1e-5, rtol=0)
+    grad, = torch.autograd.grad(packed[0, groups[0] == 0].square().sum(), x)
+    assert grad[0, groups[0] == 0].abs().sum() > 0
+    assert torch.count_nonzero(grad[0, groups[0] != 0]) == 0
+    assert torch.count_nonzero(grad[1]) == 0
+
+
+def test_absent_and_all_zero_groups_use_the_original_unmasked_path(monkeypatch):
+    from cascade.trainer.pyramid_model import _GatedAttention, _xpos
+
+    torch.manual_seed(7)
+    model = CascadeMoEModel(tiny_config()).eval()
+    x = torch.randn(2, 8, 4, 32)
+    mask = torch.zeros(2, 8, 4, dtype=torch.bool)
+    mask[:, :, 1] = True
+    expected = model(x, mask)
+    assert torch.equal(expected, model(x, mask, groups=None))
+    assert torch.equal(expected, model(x, mask, groups=torch.zeros(2, 8, dtype=torch.long)))
+    # The pre-change attention implementation, using this runtime's kernels.
+    def old_forward(self, h, attn_mask=None):
+        import math
+
+        assert attn_mask is None
+        b, t, _ = h.shape
+        heads, hd = self.cfg.num_heads, self.cfg.head_dim
+        q, k, v = self.qkv(h).view(b, t, 3, heads, hd).unbind(dim=2)
+        q, k, v = (a.transpose(1, 2) for a in (q, k, v))
+        if self.axis == 'time':
+            q, k = _xpos(q, k, self.inv_freq, self.zeta)
+        q = q * (F.softplus(self.per_dim_scale) / math.log(2.0))
+        a = F.scaled_dot_product_attention(q, k, v, is_causal=self.axis == 'time', scale=1.0 / hd)
+        a = a.transpose(1, 2).reshape(b, t, heads * hd)
+        if self.gate is not None:
+            a = a * (2 * torch.sigmoid(self.gate(h)))
+        return self.proj(a)
+    monkeypatch.setattr(_GatedAttention, 'forward', old_forward)
+    assert torch.equal(expected, model(x, mask))
+    assert torch.equal(expected, model(x, mask, groups=torch.zeros(2, 8, dtype=torch.long)))
+
+
+def test_singleton_groups_are_finite_and_values_only_losses_are_exact():
+    torch.manual_seed(27)
+    model = CascadeMoEModel(tiny_config())
+    values = torch.randn(2, 8, 128)
+    mask = torch.zeros(2, 8, 4, dtype=torch.bool)
+    groups = torch.arange(8).expand(2, 8)
+    assert torch.isfinite(model(values.reshape(2, 8, 4, 32), groups=groups)).all()
+    reference = losses(model, values, mask, generator=torch.Generator().manual_seed(9))
+    for g in (None, torch.zeros_like(groups)):
+        actual = losses(model, values, mask, groups=g, generator=torch.Generator().manual_seed(9))
+        assert all(torch.equal(a, b) for a, b in zip(reference, actual, strict=True))
+
+
+def test_copula_shared_factor_is_independent_between_groups(monkeypatch):
+    model = CascadeMoEModel(tiny_config())
+    params = model.head.bias.detach().reshape(1, 1, 32, HEAD_CHANNELS).expand(1, 8, 32, HEAD_CHANNELS).clone()
+    params[..., -1] = 10  # Strong positive shared factor, identical marginal parameters.
+    real_randn = torch.randn
+    draws = []
+
+    def randn(shape, **kwargs):
+        if shape[-1] == 32:
+            return torch.zeros(shape, device=kwargs['device'], dtype=kwargs['dtype'])
+        draw = real_randn(shape, **kwargs)
+        draws.append(draw)
+        return draw
+    monkeypatch.setattr(torch, 'randn', randn)
+    groups = torch.tensor([[0, 0, 1, 1, 2, 2, 3, 3]])
+    paths = sample_copula_paths(params, 8000, groups=groups, generator=torch.Generator().manual_seed(43))
+    assert draws[0].shape == (1, 4, 8000, 1)
+    for group in range(4):
+        assert torch.equal(paths[0, 2*group], paths[0, 2*group+1])
+    corr = torch.corrcoef(paths[0, ::2, :, 0])
+    assert (corr - torch.eye(4)).abs().max() < 0.05
+
+
+def test_copula_none_and_zero_groups_preserve_random_stream_exactly():
+    model = CascadeMoEModel(tiny_config())
+    params = model.head.bias.detach().reshape(1, 1, 32, HEAD_CHANNELS).expand(2, 8, 32, HEAD_CHANNELS)
+    rng = torch.Generator().manual_seed(79)
+    expected = sample_copula_paths(params, 4, generator=rng)
+    state = rng.get_state()
+    for groups in (None, torch.zeros(2, 8, dtype=torch.long)):
+        generator = torch.Generator().manual_seed(79)
+        assert torch.equal(expected, sample_copula_paths(params, 4, generator=generator, groups=groups))
+        assert torch.equal(state, generator.get_state())

@@ -3,5 +3,37 @@
   "description": "Eight coupled channels with delayed trend, seasonality, AR noise and level shifts; seed-deterministic.",
   "min_length": 128,
   "max_length": 1024,
-  "channels": 8
+  "channels": 8,
+  "packing": {
+    "enabled": false,
+    "size_bins": [
+      [
+        1,
+        1
+      ],
+      [
+        2,
+        4
+      ],
+      [
+        5,
+        8
+      ],
+      [
+        9,
+        16
+      ],
+      [
+        17,
+        32
+      ]
+    ],
+    "shares": [
+      30,
+      25,
+      25,
+      15,
+      5
+    ]
+  }
 }

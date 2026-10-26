@@ -89,6 +89,10 @@ def corpus_digest(series: Sequence[np.ndarray | dict]) -> str:
     h = hashlib.sha256()
     h.update(len(series).to_bytes(8, "big"))
     for arr in series:
+        if isinstance(arr, dict) and "groups" in arr and arr["groups"] is None:
+            arr = {k: v for k, v in arr.items() if k != "groups"}
+            if set(arr) == {"values"}:
+                arr = arr["values"]
         if isinstance(arr, dict):
             h.update(record_frame_bytes(canonicalize_record(arr)))
             continue

@@ -211,3 +211,44 @@ def test_record_yields_flow_through_build_corpus(tmp_path):
     res = build_corpus(repo, 7, cfg)
     assert res.n_series == 3
     assert all(s.shape == (1, 100) for s in res.series)
+
+
+def test_none_groups_drain_is_identical_to_values_only_even_before_activation():
+    arrays = [_series(1), _series(2)]
+    plain = drain_generator(_Gen(items=arrays), 2, **KW)
+    optional = drain_generator(_Gen(items=[{'values': a, 'groups': None} for a in arrays]), 2, **KW)
+    assert all(isinstance(a, np.ndarray) for a in optional)
+    assert corpus_digest(optional) == corpus_digest(plain)
+    assert all(a.tobytes() == b.tobytes() for a, b in zip(optional, plain, strict=True))
+
+
+def test_groups_survive_real_streaming_sandbox(tmp_path, small_cfg, monkeypatch):
+    import os
+    from dataclasses import replace
+
+    from cascade.interface.generator import SeriesValidator
+    from cascade.trainer.sandbox import stream_series
+
+    repo = _repo(tmp_path, {'interface_version': 2})
+    (repo / 'requirements.txt').write_text('')
+    p = repo / 'generator.py'
+    source = p.read_text().replace(
+        "yield {'values': rng.standard_normal(100)}",
+        'yield {"groups": np.array([0,1,0,1,2,2,3,3], dtype=np.uint8), '
+        '"values": rng.standard_normal((8, 100))}')
+    p.write_text(source)
+    cfg = replace(small_cfg.generator, accepted_fields=('groups',), interface_version=2,
+                  min_channels=8, max_channels=32)
+    monkeypatch.setenv('CASCADE_LANE_INDEX', '0')
+    try:
+        count = max(2, len(os.sched_getaffinity(0)))
+    except AttributeError:
+        count = max(2, os.cpu_count() or 1)
+    monkeypatch.setenv('CASCADE_LANE_COUNT', str(count))
+    validator = SeriesValidator.from_config(cfg)
+    with stream_series(repo, 19, cfg, token_budget=1600, allow_netns=False) as frames:
+        rows = [validator.process(next(frames), i) for i in range(2)]
+    assert len(rows) == 2
+    assert rows[0]['values'].shape == (8, 100)
+    assert rows[0]['groups'].dtype == np.uint8
+    assert np.array_equal(rows[0]['groups'], [0, 1, 0, 1, 2, 2, 3, 3])

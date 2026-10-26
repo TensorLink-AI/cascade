@@ -124,28 +124,53 @@ Each `generate()` yield may be a **named-field record** instead of a bare array:
 yield {"values": arr}          # identical to `yield arr` — same corpus digest
 ```
 
-At `interface_version = 1` (see `chain.toml [generator]`) the record form
-accepts **`values` only** by default. These names are **reserved** — published
-semantics, rejected until the owner arms them via `[training]
-accepted_fields`: `mask` (observedness, DEC-CA-0023), `roles` (variate roles,
-DEC-CA-0026), `start` / `freq` (time anchor, DEC-CA-0021), `group_id` (panels,
-DEC-CA-0024), `labels`, `quantiles`. Unknown names are always rejected. The
-consumers for `mask` and `roles` are already wired, so arming is a config
-announcement, not a code release:
+Records accept only fields named by the effective contract's
+`accepted_fields`; unknown names are always rejected. Cascade MoE Base's new
+pyramid contracts accept **`groups`**. Generator masks and covariate roles are
+not accepted by this recipe. The legacy Toto2 backend has separate consumers
+for `mask` and `roles`; that does not make them valid for the pyramid recipe.
+`start`, `freq`, `group_id`, `labels` and `quantiles` stay reserved and refused.
 
-* `mask` — `(C, L)` uint8 parallel to `values`, 1 = missing. Masked entries of
-  `values` must be pinned **exactly 0.0**; per-series missing fraction capped
-  by `max_missing_frac`. Consumed as unobserved input (like CPM masking) and
-  excluded from the training loss.
-* `roles` — `(C,)` uint8 per-channel: 0 = target, 1 = past covariate
-  (conditioning context, excluded from loss), 2 = future-known (visible over
-  the horizon; admitted only once `allow_future_known` arms, after the eval
-  pool's covariate-curation rule exists). At least one target channel required.
+### Pack independent groups in one yield
 
-Bare arrays and values-only records remain supported by the implemented
-interface, subject to the effective shape and resource limits. You may declare `"interface_version": 1` in your
-`config.json`; declaring a version newer than the trainer supports fails your
-run early with a clear error.
+```python
+# Eight channels, four groups; interleaving is allowed.
+yield {"values": values.astype(np.float32),
+       "groups": np.array([0, 1, 0, 2, 1, 2, 3, 3], dtype=np.uint8)}
+```
+
+`groups` has shape `(C,)`, one integer label per channel. C remains **8–32**,
+while an individual group can have **1–C** channels. Labels introduce new
+numbers as **0, 1, … in order of first appearance**; gaps, reordered first
+appearances, negatives and fractional labels are rejected. Each group's
+channels attend only to each other; groups do not connect separate yields.
+They share the same length but can describe independent processes. Time crops
+leave labels unchanged. Batching uses equal-width buckets, with no channel
+padding. Every value still counts toward the normal point and batch budgets.
+
+Draw group sizes and labels deterministically from the generator seed. Your
+own `config.json` controls the size distribution. The starter's optional
+`packing.enabled` defaults to `false`; enable it only under a contract that
+accepts `groups`. Its example size-bin weights for **1 / 2–4 / 5–8 / 9–16 /
+17–32** channels are **30 / 25 / 25 / 15 / 5**. These are draw weights, not
+mandatory corpus proportions: the final group is clipped to the remaining
+channels. Each group gets an independently drawn driver. Full verification
+checks label determinism along with values.
+
+Omitting `groups` or setting it to `None` preserves values-only output, losses,
+digests and schema-1 shard bytes. An explicit all-zero vector has the same
+attention/sampling behavior but contributes to the record digest. Other group
+vectors use schema-2 shards and their labels are covered by shard and stream
+hashes. The copula shares one latent within each group, independently of the
+other groups. It does not change the loss definition.
+
+Interface version **2** announces group packing. Under an accepting contract
+you may declare `"interface_version": 2` in `config.json`. Older declarations
+and bare arrays still work; declaring a version newer than the effective
+trainer supports fails early. Check fresh live policy: this feature requires
+the matching new architecture, images and checkpoint lineage before live use.
+The per-series `group_id` remains distinct and unsupported
+([decision](../decisions/DEC-CA-0065-generator-group-packing.md)).
 
 ## Yield order is a training lever
 

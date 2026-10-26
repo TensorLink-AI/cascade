@@ -114,3 +114,21 @@ def test_chain_toml_pairs_series_fill_with_series_points_budget():
     assert cfg.training.batch_denomination == "series"
     assert cfg.training.budget_denomination == "series_points"
     assert cfg.generator.max_channels == 32
+
+
+def test_grouped_batches_bucket_by_channels_without_padding_and_crop_time_only():
+    from cascade.trainer.toto2_trainer import crop_long_series, iter_training_batches
+
+    groups = np.array([0, 1, 0, 2, 1, 2, 3, 3], dtype=np.uint8)
+    values = np.arange(8 * 256, dtype=float).reshape(8, 256)
+    records = list(crop_long_series([{'values': values, 'groups': groups}], window=128, seed=4))
+    assert len(records) == 2 and all(r['groups'] is groups for r in records)
+    source = [records[0], np.ones((9, 128)), records[1]['values']]
+    batches = list(iter_training_batches(source, patch_size=32, max_ctx_patches=4,
+                                        batch_size=2, batch_denomination='series'))
+    assert batches[0]['values'].shape == (2, 8, 128)
+    assert batches[0]['groups'].dtype == np.int64
+    assert np.array_equal(batches[0]['groups'][0], groups)
+    assert not batches[0]['groups'][1].any()  # bare row = one related group
+    assert set(batches[0]) == {'values', 'groups'}
+    assert batches[1].shape == (1, 9, 128)  # separate bucket, no padded channels

@@ -68,7 +68,7 @@ def validate_budget_denomination(mode: str) -> str:
     return mode
 
 
-CONSUMABLE_FIELDS = ("mask", "roles")
+CONSUMABLE_FIELDS = ("mask", "roles", "groups")
 
 
 def validate_accepted_fields(value: object) -> tuple[str, ...]:

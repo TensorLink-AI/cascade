@@ -138,3 +138,28 @@ def test_trainer_metrics_carry_summary_only_for_mv_corpora():
     tele = mv.metrics["channel_telemetry"]
     assert tele["n_multichannel_series"] == 4
     assert tele["max_channels_seen"] == 2
+
+
+def test_partner_telemetry_only_compares_channels_within_their_group():
+    from cascade.trainer.channel_stats import ChannelStatsAccumulator, series_min_partner_z
+
+    rng = np.random.default_rng(79)
+    left, right = rng.normal(size=(2, 1024)).cumsum(-1)
+    # Every row has a perfect duplicate, but those duplicates are in OTHER groups.
+    values = np.stack([left, right, left, right, left, right, left, right])
+    groups = np.arange(8, dtype=np.uint8)
+    assert series_min_partner_z(values) > 4
+    assert series_min_partner_z(values, groups=groups) == 0
+    stats = ChannelStatsAccumulator()
+    stats.observe(values)
+    stats.observe({'values': values, 'groups': groups})
+    stats.observe({'values': values, 'groups': groups})
+    summary = stats.summary()
+    assert summary['n_multichannel_series'] == 2
+    assert summary['frac_unpartnered'] == 0.5
+    # Explicit single group preserves legacy numbers.
+    one = ChannelStatsAccumulator()
+    one.observe({'values': values, 'groups': np.zeros(8, dtype=np.uint8)})
+    old = ChannelStatsAccumulator()
+    old.observe(values)
+    assert one.summary() == old.summary()

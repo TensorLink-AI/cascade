@@ -158,3 +158,58 @@ def test_historical_shard_accounting_still_replays_its_original_digest(tmp_path)
         assert stream.n_series == 0
         list(iterator)
         assert stream.digest == index['corpus_digest']
+
+
+def test_schema1_bytes_match_pre_group_writer_and_none(tmp_path):
+    pa, pq = S._pa()
+    values = np.arange(8 * 64, dtype=float).reshape(8, 64) / 7
+    arrays = [values, values * 2]
+    # Frozen pre-change schema-1 writer, same Arrow/runtime/compression.
+    table = pa.table({
+        'channels': pa.array([8, 8], type=pa.int32()),
+        'length': pa.array([64, 64], type=pa.int32()),
+        'values': pa.array([np.ascontiguousarray(a.astype('<f4')).tobytes() for a in arrays], type=pa.large_binary()),
+    })
+    old = tmp_path / 'old.parquet'
+    pq.write_table(table, old, compression='zstd')
+    bare = S.write_shard(tmp_path / 'bare.parquet', arrays)
+    none = S.write_shard(tmp_path / 'none.parquet', [{'values': a, 'groups': None} for a in arrays])
+    assert bare['sha256'] == none['sha256'] == S.file_sha256(old)
+    assert 'schema' not in bare and 'schema' not in none
+    assert old.read_bytes() == (tmp_path / 'bare.parquet').read_bytes() == (tmp_path / 'none.parquet').read_bytes()
+    for actual, expected in zip(S.iter_shard(old), arrays, strict=True):
+        assert np.array_equal(actual, expected.astype(np.float32).astype(np.float64))
+
+
+def test_schema2_mixed_rows_roundtrip_and_contract_gating(tmp_path):
+    groups = np.array([0, 1, 0, 1, 2, 2, 3, 3], dtype=np.uint8)
+    values = np.arange(8 * 64, dtype=np.float32).reshape(8, 64)
+    rows = [{'values': values, 'groups': groups}, values + 1, {'values': values + 2, 'groups': None}]
+    shard = S.write_shard(tmp_path / 'mixed.parquet', rows)
+    assert shard['schema'] == 2
+    idx = S.finalize_index(tmp_path, seed=4, children=[{'index': 0, 'seed': 4, 'shards': [shard]}])
+    assert S.read_index(tmp_path)['schema'] == idx['schema'] == 2
+    read = list(S.iter_corpus(tmp_path))
+    assert read[0]['groups'].dtype == np.uint8 and np.array_equal(read[0]['groups'], groups)
+    assert np.array_equal(read[0]['values'], values)
+    assert isinstance(read[1], np.ndarray) and isinstance(read[2], np.ndarray)
+    cfg = dataclasses.replace(_gen_cfg(), min_channels=8, accepted_fields=('groups',))
+    with open_round_stream('shards', tmp_path, 4, cfg, token_budget=10**8, corpus_dir=tmp_path) as stream:
+        assert len(list(stream.series())) == 3
+    assert stream.digest == idx['corpus_digest']
+    with open_round_stream('shards', tmp_path, 4, dataclasses.replace(cfg, accepted_fields=()),
+                           token_budget=10**8, corpus_dir=tmp_path) as stream, \
+            pytest.raises(S.ShardError, match='not accepted'):
+        list(stream.series())
+
+
+def test_shard_writer_and_reader_reject_noncanonical_groups(tmp_path):
+    pa, pq = S._pa()
+    values = np.zeros((8, 64), dtype=float)
+    with pytest.raises(ValueError, match='canonical'):
+        S.write_shard(tmp_path / 'bad.parquet', [{'values': values, 'groups': [1]*8}])
+    table = pa.table({'channels': [8], 'length': [64],
+        'values': [values.astype('<f4').tobytes()], 'groups': [bytes([1]*8)]})
+    pq.write_table(table, tmp_path / 'bad.parquet')
+    with pytest.raises(S.ShardError, match='canonical'):
+        list(S.iter_shard(tmp_path / 'bad.parquet'))

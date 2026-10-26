@@ -411,33 +411,46 @@ def iter_training_batches(stream, *, patch_size: int, max_ctx_patches: int,
     ``mask`` (B, C, L) uint8 — all-zeros rows for maskless series — and
     ``roles`` (B, C) uint8 — all-targets rows for roleless series). A bucket of
     purely bare series yields the bare ``(B, C, L)`` array, byte-identical to
-    the unarmed build.
+    the unarmed build. Optional ``groups`` vectors stack into int64 ``(B,C)``;
+    a bare row in a grouped batch gets all-zero labels. Group labels survive
+    time cropping unchanged. No channel padding is used.
     """
     buckets: dict[tuple[int, int], list[tuple]] = {}
 
     def _stack(items: list[tuple]):
-        vals = np.stack([v for v, _, _ in items], axis=0)
-        if all(m is None for _, m, _ in items) and all(r is None for _, _, r in items):
+        vals = np.stack([v for v, _, _, _ in items], axis=0)
+        has_mr = any(m is not None or r is not None for _, m, r, _ in items)
+        has_groups = any(g is not None for _, _, _, g in items)
+        if not has_mr and not has_groups:
             return vals
         _, n_ch, width = vals.shape
-        masks = np.stack([
-            m if m is not None else np.zeros((n_ch, width), dtype=np.uint8)
-            for _, m, _ in items
-        ], axis=0)
-        roles = np.stack([
-            r if r is not None else np.zeros(n_ch, dtype=np.uint8)
-            for _, _, r in items
-        ], axis=0)
-        return {"values": vals, "mask": masks, "roles": roles}
+        out = {"values": vals}
+        if has_mr:
+            out["mask"] = np.stack([
+                m if m is not None else np.zeros((n_ch, width), dtype=np.uint8)
+                for _, m, _, _ in items
+            ], axis=0)
+            out["roles"] = np.stack([
+                r if r is not None else np.zeros(n_ch, dtype=np.uint8)
+                for _, _, r, _ in items
+            ], axis=0)
+        if has_groups:
+            out["groups"] = np.stack([
+                g if g is not None else np.zeros(n_ch, dtype=np.int64)
+                for _, _, _, g in items
+            ], axis=0).astype(np.int64, copy=False)
+        return out
 
     for series in stream:
-        mask = roles = None
+        mask = roles = groups = None
         if isinstance(series, dict):
             s = np.atleast_2d(np.asarray(series["values"], dtype=np.float64))
             if series.get("mask") is not None:
                 mask = np.atleast_2d(np.asarray(series["mask"], dtype=np.uint8))
             if series.get("roles") is not None:
                 roles = np.asarray(series["roles"], dtype=np.uint8)
+            if series.get("groups") is not None:
+                groups = np.asarray(series["groups"], dtype=np.int64)
         else:
             s = np.atleast_2d(np.asarray(series, dtype=np.float64))   # (C, L)
         c = int(s.shape[0])
@@ -447,7 +460,7 @@ def iter_training_batches(stream, *, patch_size: int, max_ctx_patches: int,
         key = (p, c)
         w = p * patch_size
         buckets.setdefault(key, []).append(
-            (s[:, -w:], None if mask is None else mask[:, -w:], roles)
+            (s[:, -w:], None if mask is None else mask[:, -w:], roles, groups)
         )
         fill = (batch_size if batch_denomination == "series"
                 else max(1, batch_size // c))

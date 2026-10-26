@@ -59,6 +59,10 @@ class _StreamDigest:
         self._n = 0
 
     def update(self, arr: np.ndarray | dict) -> None:
+        if isinstance(arr, dict) and "groups" in arr and arr["groups"] is None:
+            arr = {k: v for k, v in arr.items() if k != "groups"}
+            if set(arr) == {"values"}:
+                arr = arr["values"]
         if isinstance(arr, dict):
             from ..interface.generator import canonicalize_record, record_frame_bytes
 
@@ -296,7 +300,7 @@ class _ShardStream(RoundStream):
 
     def __init__(self, corpus_dir: Path | str, token_budget: int, *,
                  budget_denomination: str = "points", epochs: int = 0, eager_accounting=False,
-                 channel_bounds: tuple[int, int] | None = None) -> None:
+                 channel_bounds: tuple[int, int] | None = None, accepted_fields: tuple[str, ...] = ()) -> None:
         from ..generation.shards import read_index, verify_shards
 
         # A missing or corrupt shard is an infrastructure fault (the tier or
@@ -309,6 +313,7 @@ class _ShardStream(RoundStream):
         self._passes = max(1, int(epochs or 0))
         self._eager_accounting = eager_accounting
         self._channel_bounds = channel_bounds
+        self._accepted_fields = accepted_fields
         self._dig = _StreamDigest()
         self._n = 0
         self._points = 0
@@ -320,12 +325,17 @@ class _ShardStream(RoundStream):
         for _ in range(self._passes):
             # shards were verified at open; a re-read pass skips the re-hash
             for arr in iter_corpus(self._dir, verify=False):
+                if isinstance(arr, dict) and set(arr) - {"values", *self._accepted_fields}:
+                    from ..generation.shards import ShardError
+
+                    raise ShardError("shard record contains fields not accepted by the contract")
+                vals = arr["values"] if isinstance(arr, dict) else arr
                 if self._channel_bounds is not None:
                     from ..generation.shards import ShardError
 
                     lower, upper = self._channel_bounds
-                    if not lower <= arr.shape[0] <= upper:
-                        raise ShardError(f"shard series has {arr.shape[0]} channels outside [{lower}, {upper}]")
+                    if not lower <= vals.shape[0] <= upper:
+                        raise ShardError(f"shard series has {vals.shape[0]} channels outside [{lower}, {upper}]")
                 if self._eager_accounting:
                     self._dig.update(arr)
                     self._n += 1
@@ -571,7 +581,8 @@ def open_round_stream(
         return _ShardStream(where, token_budget,
                             budget_denomination=budget_denomination, epochs=epochs,
                             eager_accounting=continuation_protocol == "cascade-continuation/1",
-                            channel_bounds=(cfg.min_channels, cfg.max_channels) if cfg is not None else None)
+                            channel_bounds=(cfg.min_channels, cfg.max_channels) if cfg is not None else None,
+                            accepted_fields=tuple(cfg.accepted_fields) if cfg is not None else ())
     if epochs and mode != "cache_reuse":
         raise CorpusError("corpus_epochs requires corpus_mode='cache_reuse' or 'shards'")
     if n_mix > 1:

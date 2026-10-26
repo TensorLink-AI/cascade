@@ -38,6 +38,10 @@ carries forward automatically; a particular settlement is not guaranteed.
 Use the live clock for settlement timing. Mainnet is netuid 91. The
 intake is `https://submissions.cascadesub.net`.
 
+Optional [group packing](INTERFACE.md#pack-independent-groups-in-one-yield)
+lets your generator place independent groups inside one 8–32-channel yield.
+It requires a contract accepting `groups`; bare arrays remain supported.
+
 ## Quickstart
 
 Install from a checkout first (`pip install -e '.[hippius,chain]'`); see
