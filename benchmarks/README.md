@@ -45,7 +45,10 @@ so this is model-agnostic and consistent with in-protocol scores.
 CPM-era checkpoints expose their quantile head
 (`forecast_quantiles_batch(histories, horizon)`), so the scorer emits gluonts
 `QuantileForecast`s straight from one batched forward pass per `--batch-size`
-series — no Monte-Carlo sampling. Older checkpoints that only implement the
+series — no Monte-Carlo sampling. Cascade MoE Base's 21-level head includes
+all nine levels requested by GIFT-Eval, BOOM, TIME and FEV. The adapters select
+those columns directly, retaining each suite's scoring grid and aggregation;
+missing levels are never interpolated into a pass. Older checkpoints that only implement the
 sampling contract still work via the original per-series `SampleForecast` path
 (slow; expect the historical hours-long runtimes for those).
 

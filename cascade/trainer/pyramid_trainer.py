@@ -52,6 +52,13 @@ def prediction(model, values, mask):
     return params, loc, scale
 
 
+def marginal_pinball_loss(q, truth):
+    """Mean across levels keeps the old 10*sum(Q9) objective's overall scale."""
+    residual = torch.asinh(truth).clamp(-64, 64)[..., None] - torch.asinh(q)
+    levels = q.new_tensor(QUANTILE_LEVELS)
+    return 90 * torch.maximum(levels * residual, (levels - 1) * residual).mean()
+
+
 def losses(model, values, mask, *, generator=None):
     """Both losses see all next-patch targets; missing values are never invented."""
     b, c, length = values.shape
@@ -60,9 +67,7 @@ def losses(model, values, mask, *, generator=None):
     params, loc, scale = prediction(model, values, mask)
     truth = (values.reshape(b, c, p, ps)[:, :, 1:].float() - loc) / scale
     q = quantiles(params)
-    residual = torch.asinh(truth).clamp(-64, 64)[..., None] - torch.asinh(q)
-    levels = q.new_tensor(QUANTILE_LEVELS)
-    marginal = 10 * torch.maximum(levels * residual, (levels - 1) * residual).sum(-1).mean()
+    marginal = marginal_pinball_loss(q, truth)
     paths = sample_copula_paths(params, 4, generator=generator)
     joint = 10 * energy_score(paths, truth).mean()
     return marginal, joint

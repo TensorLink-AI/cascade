@@ -65,7 +65,7 @@ class Wrapper:
         q = self.m.quantiles(params) * scale[..., None, None] + loc[..., None, None]
         if not torch.isfinite(q).all():
             raise FloatingPointError("non-finite pyramid quantiles")
-        return q[:, 0].reshape(len(histories), -1, 9)[:, :horizon].cpu().numpy().astype(np.float64)
+        return q[:, 0].reshape(len(histories), -1, self.cfg.num_quantiles)[:, :horizon].cpu().numpy().astype(np.float64)
 
     def forecast_quantiles(self, history, horizon):
         return self.forecast_quantiles_batch([history], horizon)

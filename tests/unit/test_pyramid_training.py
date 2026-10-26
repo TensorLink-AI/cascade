@@ -48,13 +48,13 @@ def test_new_backend_dispatch_checkpoint_guard_and_repeatable_forecasts(tmp_path
     a = train(tmp_path / "a", contract)
     b = train(tmp_path / "b", contract)
     assert a.metrics["steps"] == 3
-    assert verify_checkpoint(a.local_dir, contract).n_params == 17528416
+    assert verify_checkpoint(a.local_dir, contract).n_params == 17577952
     left, right = load_file(str(a.local_dir / 'weights.safetensors')), load_file(str(b.local_dir / 'weights.safetensors'))
     assert all(torch.equal(left[k], right[k]) for k in left)
     wrapper = Wrapper(a.local_dir)
     history = np.arange(4096.0)
     q = wrapper.forecast_quantiles_batch([history, history * 2], 64)
-    assert q.shape == (2, 64, 9) and np.isfinite(q).all()
+    assert q.shape == (2, 64, 21) and np.isfinite(q).all()
     assert (np.diff(q, axis=-1) > 0).all()
     paths = wrapper.forecast(history, 64, 4)
     assert paths.shape == (1, 4, 64) and np.isfinite(paths).all()
@@ -167,3 +167,17 @@ def test_bad_update_budget_inputs_refuse_at_config_load(field, value):
     raw['training'][field] = value
     with pytest.raises(ValueError, match=field):
         parse_chain_config(raw)
+
+
+def test_q9_head_tensor_shapes_cannot_be_used_as_a_q21_checkpoint(tmp_path, contract):
+    from safetensors.torch import save_file
+
+    checkpoint = train(tmp_path / 'q21', contract).local_dir
+    weights = checkpoint / 'weights.safetensors'
+    state = load_file(str(weights))
+    assert state['head.weight'].shape[0] == 32 * 23
+    state['head.weight'] = state['head.weight'][:32 * 11].contiguous()
+    state['head.bias'] = state['head.bias'][:32 * 11].contiguous()
+    save_file(state, str(weights))
+    with pytest.raises(CheckpointTampered, match='head'):
+        verify_checkpoint(checkpoint, contract)

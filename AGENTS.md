@@ -130,9 +130,9 @@ anything. Read the result from the JSON:
 
 Rules for the loop:
 
-- Use Cascade MoE Base - 17.53M, 68.92M or 273.64M for cheaper generator experiments.
+- Use Cascade MoE Base - 17.58M, 69.02M or 273.84M for cheaper generator experiments.
   Names use total parameters.
-  Generate a complete config with `python scripts/pyramid_config.py --size 17.53m
+  Generate a complete config with `python scripts/pyramid_config.py --size 17.58m
   --out ./chain.local-17m.toml`, then pass it through `--chain-toml` to `score`
   or `iterate`. See [presets](deploy/presets/README.md) and [model details](docs/MODEL.md).
   GPU memory and throughput are unmeasured. 56M remains unspecified.

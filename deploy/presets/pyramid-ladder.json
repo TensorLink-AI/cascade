@@ -1,10 +1,10 @@
 {
  "name": "pyramid_varattn_ladder",
  "created": "2026-10-26",
- "status": "design only, no runs launched",
+ "status": "Q21 port implemented; CPU checks pass; production GPU qualification pending",
  "width_rule": "heads=d/64; dense_ffn=round(2.15625 d); expert_hidden=round(0.18 d); shared=4*expert_hidden (identical to the 2M/7M/28M MoE ladder widths)",
  "active_param_rule": "total minus inactive routed experts: sum over MoE layers of 2*d*h*(E-8); routers, shared experts, all else counted active",
- "count_check": "Built on meta device with the 120M run's own code (count_params.py); 120m reproduces 1,234,189,344 / 111,651,872 exactly",
+ "count_check": "Current Q21 model counted on meta; head adds 384*(width+1) parameters to each original Q9 size",
  "sizes": {
   "2m": {
    "width": 128,
@@ -27,8 +27,8 @@
     4,
     9
    ],
-   "total_params": 17528416,
-   "active_params": 2031200,
+   "total_params": 17577952,
+   "active_params": 2080736,
    "param_breakdown": {
     "embed": 212608,
     "attention": 661120,
@@ -37,7 +37,7 @@
     "routers": 344064,
     "routed_experts": 15826944,
     "shared_experts": 164864,
-    "output": 116064
+    "output": 165600
    },
    "normuon_matrix_lr": 0.0011871175842017338,
    "adamw_lr": 0.000425,
@@ -65,8 +65,8 @@
     4,
     9
    ],
-   "total_params": 68919520,
-   "active_params": 6930656,
+   "total_params": 69018208,
+   "active_params": 7029344,
    "param_breakdown": {
     "embed": 449792,
     "attention": 2632320,
@@ -75,7 +75,7 @@
     "routers": 688128,
     "routed_experts": 63307776,
     "shared_experts": 659456,
-    "output": 373088
+    "output": 471776
    },
    "normuon_matrix_lr": 0.0015882773266746224,
    "adamw_lr": 0.000425,
@@ -103,8 +103,8 @@
     4,
     9
    ],
-   "total_params": 273642976,
-   "active_params": 25687520,
+   "total_params": 273839968,
+   "active_params": 25884512,
    "param_breakdown": {
     "embed": 1348096,
     "attention": 10506880,
@@ -113,7 +113,7 @@
     "routers": 1376256,
     "routed_experts": 253231104,
     "shared_experts": 2637824,
-    "output": 1311072
+    "output": 1508064
    },
    "normuon_matrix_lr": 0.002125,
    "adamw_lr": 0.000425,
@@ -141,8 +141,8 @@
     4,
     9
    ],
-   "total_params": 1234189344,
-   "active_params": 111651872,
+   "total_params": 1234607520,
+   "active_params": 112070048,
    "param_breakdown": {
     "embed": 5435968,
     "attention": 47393920,
@@ -151,7 +151,7 @@
     "routers": 2924544,
     "routed_experts": 1146421248,
     "shared_experts": 11941888,
-    "output": 5488224
+    "output": 5906400
    },
    "normuon_matrix_lr": 0.002916417441361645,
    "adamw_lr": 0.000425,
@@ -160,7 +160,9 @@
    "reference_result": {
     "run": "reviews/2026-10-26/pyramid_ramp64_varattn arm variate_attn_only",
     "gift97_crps": 0.5033,
-    "gift97_mase": 0.7247
+    "gift97_mase": 0.7247,
+    "quantiles": 9,
+    "current_head_measurement": false
    }
   }
  },
@@ -273,9 +275,32 @@
   },
   "stem": "input per patch = [z*(1-m) (32), m (32)] -> Linear(64,d,bias) + conv branch -> residual SiLU MLP x+W2 SiLU(W1 x) (hidden=ffn, no bias) -> + role_embed[0] (zero init)",
   "conv_branch": "over full 4096-point row: [z*obs, obs] (2 ch) -> causal Conv1d(2,128,k7,dil1)+GELU -> causal Conv1d(128,128,k7,dil4)+GELU -> avg-pool 32 per patch -> Linear(128,d,bias); added to patch Linear output",
-  "output": "final LN -> residual SiLU MLP (hidden=ffn) -> Linear(d, 32*11, bias)",
-  "head": "unified quantile + rank-1 Gaussian copula, 11 channels per future time step",
-  "init": "Linear: N(0,1/fan_in), bias 0; experts N(0,1/fan_in); router N(0,0.02); conv + conv proj PyTorch default; head weight N(0,0.001), bias: median 0, spacing logits softplus^-1(0.5*diff(Phi^-1(levels))-1e-4), diag logit softplus^-1(1-1e-4), factor 0; seed 1, scratch"
+  "output": "final LN -> residual SiLU MLP (hidden=ffn) -> Linear(d, 32*23, bias)",
+  "head": "21 monotone quantiles + rank-1 Gaussian copula, 23 channels per future time step",
+  "init": "Linear: N(0,1/fan_in), bias 0; experts N(0,1/fan_in); router N(0,0.02); conv + conv proj PyTorch default; head weight N(0,0.001), bias: median 0, spacing logits softplus^-1(0.5*diff(Phi^-1(Q21 levels))-1e-4), diag logit softplus^-1(1-1e-4), factor 0; seed 1, scratch",
+  "quantile_levels": [
+   0.01,
+   0.05,
+   0.1,
+   0.15,
+   0.2,
+   0.25,
+   0.3,
+   0.35,
+   0.4,
+   0.45,
+   0.5,
+   0.55,
+   0.6,
+   0.65,
+   0.7,
+   0.75,
+   0.8,
+   0.85,
+   0.9,
+   0.95,
+   0.99
+  ]
  },
  "training": {
   "batch_groups": 64,
@@ -325,7 +350,7 @@
   },
   "normalisation": "causal running mean/std per row over observed points (min 8 obs, eps 1e-5, float64), z=asinh((x-loc)/scale) clamp +-64; binary {0,1} rows: loc 0, scale 1; per-patch anchor = loc/scale at last point of the patch",
   "targets": "output at patch p predicts all 32 points of patch p+1 (127 targets per row), standardised with patch p's anchor: truth=(x-loc_p)/scale_p",
-  "marginal_loss": "10 * mean over all 127x32 target points (masked and observed) of sum over levels 0.1..0.9 of pinball(asinh(q_level), asinh(truth) clamp +-64)",
+  "marginal_loss": "90 * mean over all target points and all 21 levels of pinball(asinh(q_level), asinh(truth) clamp +-64); preserves Q9 10*sum scale",
   "joint_loss": "10 * mean over target patches of energy score: 4 copula samples of the 32-vector; ES=(mean_i||x_i-y|| - 0.5 mean_{i<j}||x_i-x_j||)/sqrt(32)",
   "gradient_combination": "g = grad(marginal + moe_aux) + w*grad(joint), w = min(0.1, 0.1*||grad marginal||/||grad joint||); then global clip 7",
   "moe_aux": "mean over MoE layers of [1e-4 * E*sum_e f_e*P_e + 1e-3 * mean(logsumexp(logits)^2)], P from normalised affinities; added to marginal loss",
@@ -336,5 +361,24 @@
   "initialization": "scratch, complete architecture",
   "ema_exports": "power-EMA sigma_rel 0.05 and 0.10 (optional)",
   "precision_note": "no FP8"
- }
+ },
+ "q9_reference_counts": {
+  "2m": {
+   "total_params": 17528416,
+   "active_params": 2031200
+  },
+  "7m": {
+   "total_params": 68919520,
+   "active_params": 6930656
+  },
+  "28m": {
+   "total_params": 273642976,
+   "active_params": 25687520
+  },
+  "120m": {
+   "total_params": 1234189344,
+   "active_params": 111651872
+  }
+ },
+ "head_revision": "Q21: owner-requested 21-quantile head; original research results used Q9"
 }

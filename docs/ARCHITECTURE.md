@@ -39,8 +39,8 @@ Python files, configuration and tensor geometry before execution.
 miner experiments. New update budgets are digest-bound; their default zero
 leaves historical contract digests unchanged.
 
-The [model specification](MODEL.md) describes Cascade MoE Base variants at 17.53M,
-68.92M, 273.64M and 1.23B total parameters. [Preset instructions](../deploy/presets/README.md) cover complete
+The [model specification](MODEL.md) describes Cascade MoE Base variants at 17.58M,
+69.02M, 273.84M and 1.23B total parameters. [Preset instructions](../deploy/presets/README.md) cover complete
 local configs. A 56M identity stays blocked. Lane B resolves trusted checkpoint
 code before loading, counts each layer's actual experts, and uses compact
 trainable rows without changing the frozen weights. Routing matrices pad shorter

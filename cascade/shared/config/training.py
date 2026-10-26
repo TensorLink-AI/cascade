@@ -539,7 +539,9 @@ def parse_training_contract(t: dict) -> TrainingContractConfig:
                 raise ValueError("unknown cascade_pyramid preset")
             width, ffn = sizes[key]
             expected = {"d_model": width, "d_ff": ffn, "num_heads": width // 64,
-                        "num_layers": 10}
+                        "num_layers": 10, "num_quantiles": 21}
+            if variant is not t:
+                expected.pop("num_quantiles")
             for name, value in expected.items():
                 if variant.get(name) != value:
                     raise ValueError(f"pyramid {key}: {name} must equal {value}")

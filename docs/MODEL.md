@@ -1,7 +1,7 @@
 # Cascade MoE Base: model and training recipe
 
 **Cascade MoE Base - 1.23B** is the v2 candidate, with 1.234B total
-parameters and 111.65M active per token. Smaller variants share its structure so
+parameters and 112.07M active per token. Smaller variants share its structure so
 miners can test generators with less local compute. Architecture availability
 and deployment readiness are separate: consult fresh `cascade status --json`.
 The worker image, CPU generation image, initial generator and GPU behavior need
@@ -11,10 +11,10 @@ qualification before this candidate can run live.
 
 | Model (total parameters) | Width / heads | Dense FFN | Expert / shared hidden | Total parameters | Active per token |
 |---|---|---:|---|---:|---:|
-| Cascade MoE Base - 17.53M | 128 / 2 | 276 | 23 / 92 | 17,528,416 | 2,031,200 |
-| Cascade MoE Base - 68.92M | 256 / 4 | 552 | 46 / 184 | 68,919,520 | 6,930,656 |
-| Cascade MoE Base - 273.64M | 512 / 8 | 1,104 | 92 / 368 | 273,642,976 | 25,687,520 |
-| Cascade MoE Base - 1.23B | 1,088 / 17 | 2,346 | 196 / 784 | 1,234,189,344 | 111,651,872 |
+| Cascade MoE Base - 17.58M | 128 / 2 | 276 | 23 / 92 | 17,577,952 | 2,080,736 |
+| Cascade MoE Base - 69.02M | 256 / 4 | 552 | 46 / 184 | 69,018,208 | 7,029,344 |
+| Cascade MoE Base - 273.84M | 512 / 8 | 1,104 | 92 / 368 | 273,839,968 | 25,884,512 |
+| Cascade MoE Base - 1.23B | 1,088 / 17 | 2,346 | 196 / 784 | 1,234,607,520 | 112,070,048 |
 
 Model names use total parameter counts, rounded in millions (M) or billions (B).
 These counts include routers, shared experts and output heads. Active counts
@@ -75,10 +75,10 @@ roles are refused rather than silently ignored.
 
 ## Unified output head
 
-Final LayerNorm and a residual SiLU MLP feed one linear head with 11 values per
-future point: median, eight spacing logits, a diagonal driver and one factor.
+Final LayerNorm and a residual SiLU MLP feed one linear head with 23 values per
+future point: median, twenty spacing logits, a diagonal driver and one factor.
 Positive `softplus(logit) + 1e-4` spacings produce monotone quantiles at levels
-0.1 through 0.9, centered at the median. Quantiles are in linear standardized
+**0.01, 0.05, 0.10, …, 0.95, 0.99** (21 levels), centered at the 0.5 median. Quantiles are in linear standardized
 units. Only the pinball loss transforms them with `asinh`; inference rescales
 them directly, without a second `sinh`.
 
@@ -89,7 +89,9 @@ their patch energy. Independent temporal noise has covariance
 across channels. Drivers are normalized to unit marginal variance and mapped
 through a linear spline in normal-score coordinates, with linear tails.
 The validator wrapper uses these joint samples and a deterministic window seed.
-Benchmark quantiles come directly from the monotone head. Neither path sorts
+GIFT-Eval, BOOM, TIME and FEV retain their required nine-level metric grids.
+The adapters select those levels directly from the 21-level head, without
+interpolation or changing the benchmarks' scoring definitions. Neither path sorts
 quantiles or clips sampled paths to conceal a failed forecast.
 
 ## Optimizer and schedule
@@ -120,11 +122,12 @@ end earlier; metrics distinguish incomplete training, exhaustion and a deadline.
 Mainnet keeps the existing 50B CPU corpus cap and therefore uses at most 23,841
 updates (49,998,200,832 points at the reference geometry), with an 80-update warmup
 and a final linear cooldown. Local presets retain the full 27,500-update research
-recipe. Testnet uses 16 updates on Cascade MoE Base - 17.53M. Shorter local `--train-hours` runs scale the
+recipe. Testnet uses 16 updates on Cascade MoE Base - 17.58M. Shorter local `--train-hours` runs scale the
 explicit update budget and schedule.
 
-The marginal objective is ten times the mean pinball loss, summed over all nine
-levels in asinh coordinates. The joint objective is ten times the fair energy
+The marginal objective is 90 times the mean pinball loss across all 21 levels
+and all target points in asinh coordinates. This keeps its overall scale
+comparable to the original `10 * sum(Q9)` objective. The joint objective is ten times the fair energy
 score from four copula samples per next-patch 32-vector, divided by `sqrt(32)`.
 Two gradients are accumulated separately. The joint gradient receives weight
 `min(0.1, 0.1 * norm(marginal_gradient) / norm(joint_gradient))`; global norm
@@ -137,6 +140,14 @@ named optimizer state form the warm-start lineage. Recovery replays the exact
 input prefix, checks its digest and runtime, restores RNG/optimizer state and
 continues without adding updates. An expert leg starts from scored king weights;
 only its selected rows can change or merge.
+
+## Checkpoint compatibility
+
+The Q21 head changes the architecture and training contract digests and expands
+the head tensors from 11 to 23 channels per point. Q9 pyramid checkpoints cannot
+initialize this release; checkpoint validation refuses incompatible tensors or
+configuration. Rebuild and qualify the Q21 worker image and its starting lineage.
+The original research run's Q9 scores do not establish Q21 performance.
 
 ## Implementation and qualification
 

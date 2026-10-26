@@ -17,9 +17,9 @@
       "source": "configured architecture, counted on meta device"
     },
     "cascade-moe-v2-120m": {
-      "parameters": 1234189344,
-      "active_parameters": 111651872,
-      "base_arch_digest": "dd6b40a6e3bc0ac12f4943fdf2299650dfeb96c2eb63ba2990bc9d7062d78ae9",
+      "parameters": 1234607520,
+      "active_parameters": 112070048,
+      "base_arch_digest": "66b8c5d8a426a24e52cd2c0642c6fd39cc3c8a09feeca1fc297fc92fba3ed51d",
       "source": "configured architecture, counted on meta device",
       "display_name": "Cascade MoE Base - 1.23B"
     }

@@ -12,8 +12,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-QUANTILE_LEVELS = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
+QUANTILE_LEVELS = (0.01, *(i / 20 for i in range(1, 20)), 0.99)
+NUM_QUANTILES = len(QUANTILE_LEVELS)
+MEDIAN_INDEX = QUANTILE_LEVELS.index(0.5)
 COPULA_RANK = 1
+HEAD_CHANNELS = NUM_QUANTILES + 1 + COPULA_RANK
 Z_CLAMP = 64.0
 # Channel roles for the variate blocks' role embedding.
 ROLE_TARGET = 0
@@ -27,7 +30,7 @@ class CascadeMoEConfig:
     num_heads: int = 8
     head_dim: int = 64
     patch_size: int = 32
-    num_quantiles: int = 9
+    num_quantiles: int = NUM_QUANTILES
     context_length: int = 4096
     horizon: int = 64
     max_patches: int = 136  # decode window in patches (context + masked horizon)
@@ -51,6 +54,10 @@ class CascadeMoEConfig:
     bias_update_rate: float = 0.003
     balance_loss_coef: float = 1e-4
     router_z_loss_coef: float = 0.001
+
+    def __post_init__(self):
+        if self.num_quantiles != NUM_QUANTILES:
+            raise ValueError(f"Cascade MoE Base requires {NUM_QUANTILES} quantiles")
 
     def layer_axis(self, i: int) -> str:
         return "variate" if i in self.variate_blocks else "time"
@@ -79,7 +86,7 @@ class CascadeMoEConfig:
             raise ValueError(f"unknown pyramid size {preset!r}")
         d, ffn, hidden = sizes[key]
         expected = dict(d_model=d, num_layers=10, num_heads=d // 64,
-                        head_dim=64, patch_size=32, num_quantiles=9,
+                        head_dim=64, patch_size=32, num_quantiles=NUM_QUANTILES,
                         context_length=4096, d_ff=ffn, cpm_c_max=16, cpm_p_max=0.4)
         for name, value in expected.items():
             if getattr(c, name) != value:
@@ -386,7 +393,7 @@ class _Block(nn.Module):
 
 
 class CascadeMoEModel(nn.Module):
-    """Q9 linear-standardized quantiles, or raw 11-channel head parameters."""
+    """Q21 linear-standardized quantiles, or raw 23-channel head parameters."""
 
     def __init__(self, cfg: CascadeMoEConfig):
         super().__init__()
@@ -399,7 +406,7 @@ class CascadeMoEModel(nn.Module):
         self.blocks = nn.ModuleList(_Block(cfg, i) for i in range(cfg.num_layers))
         self.norm = nn.LayerNorm(d, eps=1e-4, elementwise_affine=False)
         self.out_mlp = _ResidualMLP(d, cfg.dense_ffn)
-        self.head = nn.Linear(d, ps * 11)
+        self.head = nn.Linear(d, ps * HEAD_CHANNELS)
         # The conv branch and its projection retain PyTorch default initialization.
         for name, module in self.named_modules():
             if not name.startswith("conv_embed"):
@@ -413,11 +420,11 @@ class CascadeMoEModel(nn.Module):
                 if block.moe:
                     nn.init.normal_(block.ffn.router.weight, std=0.02)
             self.head.weight.normal_(0, 0.001)
-            bias = self.head.bias.reshape(ps, 11)
+            bias = self.head.bias.reshape(ps, HEAD_CHANNELS)
             bias.zero_()
             spacing = 0.5 * torch.special.ndtri(bias.new_tensor(QUANTILE_LEVELS)).diff()
-            bias[:, 1:9] = torch.log(torch.expm1(spacing - 1e-4))
-            bias[:, 9] = math.log(math.expm1(1 - 1e-4))
+            bias[:, 1:NUM_QUANTILES] = torch.log(torch.expm1(spacing - 1e-4))
+            bias[:, NUM_QUANTILES] = math.log(math.expm1(1 - 1e-4))
         self.aux_loss: torch.Tensor | None = None
         self.last_hidden: torch.Tensor | None = None
 
@@ -469,7 +476,7 @@ class CascadeMoEModel(nn.Module):
         # norm here to cap the copula term (training only; never at inference)
         self.last_hidden = x if self.training else None
         with torch.autocast(device_type=x.device.type, enabled=False):
-            params = self.head(x.float()).reshape(B, C, P, ps, 11)
+            params = self.head(x.float()).reshape(B, C, P, ps, HEAD_CHANNELS)
             out = params if with_parameters else quantiles(params)
         return out[:, 0] if squeeze else out
 
@@ -511,10 +518,12 @@ def param_counts(model: CascadeMoEModel) -> dict[str, int]:
 
 
 def quantiles(params):
-    """Monotone Q9 in linear standardized units (no sorting or clipping)."""
-    gaps = F.softplus(params[..., 1:9]) + 1e-4
+    """Monotone Q21 in linear standardized units (no sorting or clipping)."""
+    if params.shape[-1] != HEAD_CHANNELS:
+        raise ValueError(f"expected {HEAD_CHANNELS} unified-head channels")
+    gaps = F.softplus(params[..., 1:NUM_QUANTILES]) + 1e-4
     prefix = torch.cat([torch.zeros_like(gaps[..., :1]), gaps.cumsum(-1)], -1)
-    return params[..., :1] + prefix - prefix[..., 4:5]
+    return params[..., :1] + prefix - prefix[..., MEDIAN_INDEX:MEDIAN_INDEX + 1]
 
 
 def _dct_project(x):
@@ -527,11 +536,11 @@ def _dct_project(x):
 
 
 def sample_copula_paths(params, n_samples, *, generator=None):
-    """B,C,[P,]32,11 -> B,C,[P,]S,32; rank-one noise shared over channels."""
+    """B,C,[P,]32,23 -> B,C,[P,]S,32; rank-one noise shared over channels."""
     q = quantiles(params)
-    diag = F.softplus(_dct_project(params[..., 9])) + 1e-4
+    diag = F.softplus(_dct_project(params[..., NUM_QUANTILES])) + 1e-4
     diag = diag.square().mean(-1, keepdim=True).sqrt().expand_as(diag)
-    factor = 0.1 * _dct_project(params[..., 10])
+    factor = 0.1 * _dct_project(params[..., NUM_QUANTILES + 1])
     budget = factor.square().mean(-1, keepdim=True)
     direction = factor / factor.abs().clamp_min(1e-6)
     tiny = torch.finfo(params.dtype).tiny
@@ -548,8 +557,8 @@ def sample_copula_paths(params, n_samples, *, generator=None):
     z = (diag[..., None, :] * noise + factor[..., None, :] * latent)
     z = z / (diag.square() + factor.square()).sqrt()[..., None, :]
     knots = torch.special.ndtri(q.new_tensor(QUANTILE_LEVELS))
-    index = torch.bucketize(z.contiguous(), knots).sub(1).clamp(0, 7)
-    expanded = q.unsqueeze(-3).expand(*z.shape, 9)
+    index = torch.bucketize(z.contiguous(), knots).sub(1).clamp(0, NUM_QUANTILES - 2)
+    expanded = q.unsqueeze(-3).expand(*z.shape, NUM_QUANTILES)
     lo = expanded.gather(-1, index[..., None]).squeeze(-1)
     hi = expanded.gather(-1, (index + 1)[..., None]).squeeze(-1)
     return lo + (hi - lo) * ((z - knots[index]) / (knots[index + 1] - knots[index]))

@@ -61,11 +61,11 @@ verified by Cascade, and standard funding has no total cap across providers
 or retries. Do not mistake scoped permissions or preflight budgets for limits.
 
 For cheaper generator optimization, use `cascade score` or `cascade iterate`
-on Cascade MoE Base - 17.53M, 68.92M or 273.64M. Model names use total parameters. From the checkout,
-`python scripts/pyramid_config.py --size 17.53m --out ./chain.local-17m.toml` writes
+on Cascade MoE Base - 17.58M, 69.02M or 273.84M. Model names use total parameters. From the checkout,
+`python scripts/pyramid_config.py --size 17.58m --out ./chain.local-17m.toml` writes
 a complete `--chain-toml` config. See [preset instructions](deploy/presets/README.md)
 and [the architecture and recipe](docs/MODEL.md). Cascade MoE Base - 1.23B has
-1,234,189,344 total / 111,651,872 active parameters; 56M is unspecified.
+1,234,607,520 total / 112,070,048 active parameters; 56M is unspecified.
 GPU memory and throughput are unmeasured for this port.
 Keep candidate and baseline on identical model, budget, seeds, pool and compatible
 init; use separate histories per model. Omit `--warm-start live` for small-model

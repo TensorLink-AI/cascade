@@ -50,14 +50,11 @@ QUANTILE_LEVELS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 
 
 def _wrapper_quantile_grid_matches(wrapper) -> bool:
-    """True when the wrapper exposes the quantile head on TIME's exact grid."""
-    levels = getattr(wrapper, "quantile_levels", None)
-    return (
-        hasattr(wrapper, "forecast_quantiles_batch")
-        and levels is not None
-        and len(levels) == len(QUANTILE_LEVELS)
-        and np.allclose([float(v) for v in levels], QUANTILE_LEVELS)
-    )
+    """The direct head must contain every TIME level exactly."""
+    from ..quantiles import quantile_indices
+
+    return (hasattr(wrapper, "forecast_quantiles_batch") and
+            quantile_indices(getattr(wrapper, "quantile_levels", None), QUANTILE_LEVELS) is not None)
 
 
 def _contexts(wrapper, target) -> np.ndarray:
@@ -81,7 +78,9 @@ def _instance_quantiles(wrapper, target, horizon: int, num_samples: int) -> np.n
     """
     t = _contexts(wrapper, target)  # (V, L)
     if _wrapper_quantile_grid_matches(wrapper):
-        q = np.asarray(wrapper.forecast_quantiles_batch(list(t), horizon))  # (V, H, num_q)
+        from ..quantiles import forecast_on_grid
+
+        q = forecast_on_grid(wrapper, list(t), horizon, QUANTILE_LEVELS)
         return np.transpose(q, (2, 0, 1))  # (num_q, V, H)
     per_variate = []
     for v in range(t.shape[0]):
@@ -194,8 +193,10 @@ def _score_prepared(
             t = _contexts(wrapper, d["target"])
             jobs.extend(t)
             counts.append(t.shape[0])
+        from ..quantiles import forecast_on_grid
+
         chunks = [
-            np.asarray(wrapper.forecast_quantiles_batch(jobs[i : i + batch_size], pred_len))
+            forecast_on_grid(wrapper, jobs[i : i + batch_size], pred_len, QUANTILE_LEVELS)
             for i in range(0, len(jobs), batch_size)
         ]
         q = np.concatenate(chunks, axis=0)  # (sum_V, H, num_q)

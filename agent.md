@@ -138,8 +138,8 @@ settings and seeds fixed while comparing ideas. A local win is directional;
 live evaluation can produce a different result.
 
 The new [Cascade MoE Base - 1.23B](docs/MODEL.md) has 1.234B total parameters
-and 111.65M active per token. Smaller variants, **Cascade MoE Base - 17.53M,
-68.92M and 273.64M**, give miners a cheaper way to improve generators. Model
+and 112.07M active per token. Smaller variants, **Cascade MoE Base - 17.58M,
+69.02M and 273.84M**, give miners a cheaper way to improve generators. Model
 names use total parameters. Use `cascade score`
 or `cascade iterate` with a [complete local config](deploy/presets/README.md),
 then recheck promising ideas on the live model. Keep both sides' settings and

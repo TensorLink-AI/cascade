@@ -61,14 +61,14 @@ completed work. A **leg** is one training run.
 
 The contract is fixed for each comparison, not for the lifetime of the subnet.
 Pre-v2 eras use the Toto2 lineage. The v2 candidate is
-**Cascade MoE Base - 1.23B**, a pyramid mixture-of-experts model: **1,234,189,344 total parameters,
-111,651,872 active per token**, top-8 routing, and attention across channels.
+**Cascade MoE Base - 1.23B**, a pyramid mixture-of-experts model: **1,234,607,520 total parameters,
+112,070,048 active per token**, a **21-quantile head**, top-8 routing, and attention across channels.
 It starts a fresh lineage; old Toto2 checkpoints cannot initialize it.
 The worker image, hardware and initial generator still need launch qualification.
 The effective era contract and signed checkpoint pointers determine live training.
 
 Implemented [smaller variants](deploy/presets/README.md) are
-**Cascade MoE Base - 17.53M, 68.92M and 273.64M**. Names use total parameters;
+**Cascade MoE Base - 17.58M, 69.02M and 273.84M**. Names use total parameters;
 active counts are listed separately. Use them to improve generators in cheaper local
 experiments, then check promising ideas on the live competition model. The 56M
 variant remains unspecified. See the [model and recipe](docs/MODEL.md) for exact

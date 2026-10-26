@@ -44,6 +44,7 @@ from ..fev_metrics import (
     seasonal_naive_forecast,
 )
 from ..provenance import task_id, tree_snapshot, verified_snapshot
+from ..quantiles import forecast_on_grid, quantile_indices
 from ..results import SuiteResult
 from ._common import SuitePlan, abort, describe_exception, run_sequential, until_abort
 
@@ -125,7 +126,7 @@ def score_task_multi(task, wrappers: list, *, batch_size: int = 64) -> list:
                 qs: dict[int, object] = {}
                 for k in live():
                     try:
-                        qs[k] = wrappers[k].forecast_quantiles_batch(chunk, horizon)  # (B, h, nq)
+                        qs[k] = forecast_on_grid(wrappers[k], chunk, horizon, QUANTILE_LEVELS)
                     except Exception as e:  # noqa: BLE001 — this checkpoint only
                         failed[k] = e
                 for j, h in enumerate(chunk):
@@ -226,9 +227,9 @@ def run_unit(ctx: dict, unit, checkpoints: list[str], *, num_samples: int = 100,
             wrappers.append(None)
             continue
         levels = [round(float(v), 6) for v in getattr(w, "quantile_levels", [])]
-        if levels != [round(v, 6) for v in QUANTILE_LEVELS]:
+        if quantile_indices(getattr(w, "quantile_levels", None), QUANTILE_LEVELS) is None:
             out.append(abort("skipped",
-                             f"wrapper quantile grid {levels} != {list(QUANTILE_LEVELS)}"))
+                             f"wrapper quantile grid {levels} lacks required levels {list(QUANTILE_LEVELS)}"))
             wrappers.append(None)
             continue
         out.append(None)

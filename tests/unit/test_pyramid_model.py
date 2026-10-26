@@ -13,6 +13,8 @@ import torch
 import torch.nn.functional as F
 
 from cascade.trainer.pyramid_model import (
+    HEAD_CHANNELS,
+    QUANTILE_LEVELS,
     CascadeMoEConfig,
     CascadeMoEModel,
     MoEFFN,
@@ -43,11 +45,12 @@ def one_cpu_thread():
 
 
 @pytest.mark.parametrize("size", ["2m", "7m", "28m", "120m"])
-def test_counts_reproduce_the_supplied_reference(size):
+def test_counts_match_the_q21_ladder_and_its_delta_from_q9(size):
     from cascade.shared.config.training import parse_training_contract
     from scripts.pyramid_config import training_table
 
-    row = json.loads((ROOT / "deploy/presets/pyramid-ladder.json").read_text())["sizes"][size]
+    ladder = json.loads((ROOT / "deploy/presets/pyramid-ladder.json").read_text())
+    row = ladder["sizes"][size]
     contract = parse_training_contract(training_table(size))
     cfg = CascadeMoEConfig.from_contract(contract)
     with torch.device("meta"):
@@ -56,7 +59,11 @@ def test_counts_reproduce_the_supplied_reference(size):
     assert [layer.w_in.shape[0] for layer in model.moe_layers()] == row["expert_counts"]
     assert all(model.blocks[i].ffn is None and model.blocks[i].norm2 is None for i in (4, 9))
     assert all(model.blocks[i].attn.gate is None for i in (4, 9))
-    assert model.head.out_features == 32 * 11
+    assert model.head.out_features == 32 * 23
+    extra = 32 * 12 * (row["width"] + 1)
+    reference = ladder["q9_reference_counts"][size]
+    assert param_counts(model)["total"] == reference["total_params"] + extra
+    assert param_counts(model)["active"] == reference["active_params"] + extra
     assert float(model.blocks[0].attn_a) == pytest.approx(0.31272, abs=1e-5)
 
 
@@ -142,9 +149,9 @@ def test_scaler_excludes_hidden_values_and_preserves_binary_rows():
 
 def test_unified_head_and_energy_use_the_specified_coordinates_and_tails():
     model = CascadeMoEModel(tiny_config())
-    params = model.head.bias.detach().reshape(1, 1, 32, 11)
+    params = model.head.bias.detach().reshape(1, 1, 32, HEAD_CHANNELS)
     q = quantiles(params)
-    expected = 0.5 * torch.special.ndtri(torch.tensor([i / 10 for i in range(1, 10)]))
+    expected = 0.5 * torch.special.ndtri(torch.tensor(QUANTILE_LEVELS))
     torch.testing.assert_close(q[0, 0, 0], expected)
     paths = sample_copula_paths(params, 10000, generator=torch.Generator().manual_seed(5))
     assert paths.shape == (1, 1, 10000, 32)
@@ -154,7 +161,7 @@ def test_unified_head_and_energy_use_the_specified_coordinates_and_tails():
     assert float(energy_score(pair, torch.zeros(32))) == pytest.approx(0.0)
 
 
-def test_marginal_loss_is_dense_sum_of_nine_asinh_pinballs():
+def test_marginal_loss_trains_all_21_asinh_quantiles():
     model = CascadeMoEModel(tiny_config())
     x = torch.randn(1, 2, 128)
     mask = torch.zeros(1, 2, 4, dtype=torch.bool)
@@ -266,3 +273,28 @@ def test_dashboard_does_not_count_padding_as_dead_experts():
     health = king_routing_health(load.numpy(), expert_counts=[128, 256])
     assert all(row['dead'] == 0 for row in health['layers'])
     assert all(row['max_over_mean'] == 1.0 for row in health['layers'])
+
+
+def test_21_quantile_levels_include_the_median_tails_and_benchmark_grid():
+    assert len(QUANTILE_LEVELS) == 21
+    assert QUANTILE_LEVELS[0] == .01 and QUANTILE_LEVELS[-1] == .99
+    assert QUANTILE_LEVELS[10] == .5
+    assert all(a < b for a, b in zip(QUANTILE_LEVELS[:-1], QUANTILE_LEVELS[1:], strict=True))
+    assert all(i / 10 in QUANTILE_LEVELS for i in range(1, 10))
+    with pytest.raises(ValueError, match='21 quantiles'):
+        replace(tiny_config(), num_quantiles=9)
+    with pytest.raises(ValueError, match='23 unified-head channels'):
+        quantiles(torch.zeros(1, 32, 11))
+
+
+def test_q21_pinball_keeps_the_original_overall_loss_scale():
+    from cascade.trainer.pyramid_trainer import marginal_pinball_loss
+
+    prediction = torch.zeros(2, 32, 21, requires_grad=True)
+    truth = torch.ones(2, 32)
+    loss = marginal_pinball_loss(prediction, truth)
+    # Every residual is asinh(1); the symmetric level grid has mean 0.5.
+    torch.testing.assert_close(loss, 45 * torch.asinh(torch.tensor(1.0)))
+    loss.backward()
+    assert torch.isfinite(prediction.grad).all()
+    assert all(torch.count_nonzero(prediction.grad[..., i]) > 0 for i in range(21))

@@ -30,7 +30,7 @@ def training_table(size):
     row = json.loads((ROOT / "deploy/presets/pyramid-ladder.json").read_text())["sizes"][size]
     table = tomllib.loads((ROOT / "deploy/presets/cascade-moe-28m.toml").read_text())["training"]
     table.update(base_arch="cascade_pyramid", arch_preset=f"cascade-moe-v2-{size}",
-        d_model=row["width"], d_ff=row["dense_ffn"], num_heads=row["heads"],
+        d_model=row["width"], d_ff=row["dense_ffn"], num_heads=row["heads"], num_quantiles=21,
         target_train_hours=3.0, ref_throughput_tokens_per_s=0, training_steps=27500,
         batch_size=512, batch_denomination="sequences", budget_denomination="points",
         base_lr=0.002125, warmup_fraction=80/27500, micro_batches=1,

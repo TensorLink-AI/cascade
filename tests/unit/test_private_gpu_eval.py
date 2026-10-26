@@ -29,7 +29,7 @@ def checkpoint(cfg, tmp_path):
 
     old_threads = torch.get_num_threads()
     torch.set_num_threads(1)
-    contract = replace(cfg.training.v2_contract, base_arch="cascade_moe", training_steps=0, d_model=16, num_heads=2, head_dim=8, num_layers=4,
+    contract = replace(cfg.training.v2_contract, base_arch="cascade_moe", training_steps=0, num_quantiles=9, d_model=16, num_heads=2, head_dim=8, num_layers=4,
                        patch_size=2, context_length=16, horizon=4, d_ff=32)
     with torch.random.fork_rng():
         torch.manual_seed(42)

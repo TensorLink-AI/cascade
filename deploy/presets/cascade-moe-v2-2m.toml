@@ -1,9 +1,9 @@
-# Pyramid ladder training recipe; GPU throughput remains unmeasured.
+# Cascade MoE Base Q21 recipe; GPU throughput remains unmeasured.
 
 [training]
 base_arch = "cascade_pyramid"
 arch_preset = "cascade-moe-v2-2m"
-base_arch_digest = "8e10e5c4457126f2215004701ad0c9b90f02ef652b032d5fdc21f1ac96bea4dc"
+base_arch_digest = "6aed15d788d32b849f574443181a423058db742637a75df1fdae4bcc6b0f865d"
 d_model = 128
 num_layers = 10
 num_heads = 2
@@ -11,7 +11,7 @@ head_dim = 64
 patch_size = 32
 mlp_expansion = 2
 d_ff = 276
-num_quantiles = 9
+num_quantiles = 21
 masking = "contiguous_patch"
 cpm_c_max = 16
 cpm_p_max = 0.4

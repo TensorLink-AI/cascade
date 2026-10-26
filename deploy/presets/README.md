@@ -6,10 +6,10 @@ MoE layer, with 128 / 256 / 256 / 512 / 512 / 512 / 512 experts across the layer
 
 | Model | Total parameters | Active per token | CLI size / training fragment |
 |---|---:|---:|---|
-| Cascade MoE Base - 17.53M | 17,528,416 | 2,031,200 | [`17.53m`](cascade-moe-v2-2m.toml) |
-| Cascade MoE Base - 68.92M | 68,919,520 | 6,930,656 | [`68.92m`](cascade-moe-v2-7m.toml) |
-| Cascade MoE Base - 273.64M | 273,642,976 | 25,687,520 | [`273.64m`](cascade-moe-v2-28m.toml) |
-| Cascade MoE Base - 1.23B | 1,234,189,344 | 111,651,872 | [`1.23b`](cascade-moe-v2-120m.toml) |
+| Cascade MoE Base - 17.58M | 17,577,952 | 2,080,736 | [`17.58m`](cascade-moe-v2-2m.toml) |
+| Cascade MoE Base - 69.02M | 69,018,208 | 7,029,344 | [`69.02m`](cascade-moe-v2-7m.toml) |
+| Cascade MoE Base - 273.84M | 273,839,968 | 25,884,512 | [`273.84m`](cascade-moe-v2-28m.toml) |
+| Cascade MoE Base - 1.23B | 1,234,607,520 | 112,070,048 | [`1.23b`](cascade-moe-v2-120m.toml) |
 
 Parameter counts match the supplied architecture. GPU memory and speed are
 unmeasured for this port. Smaller variants offer local experiments with fewer
@@ -19,7 +19,7 @@ The 56M variant has no supplied definition and stays [blocked](pending/cascade-m
 From the checkout, create a **complete** local configuration:
 
 ```bash
-python scripts/pyramid_config.py --size 17.53m --out ./chain.local-17m.toml
+python scripts/pyramid_config.py --size 17.58m --out ./chain.local-17m.toml
 cascade iterate ./my-gen --chain-toml ./chain.local-17m.toml --pool-dir ./heldout --seeds 0,1 --train-hours 0.01 --work-dir ./.cascade-17m --json
 ```
 
@@ -40,6 +40,6 @@ gain on a smaller model does not establish a live win.
 
 The [model specification](../../docs/MODEL.md) covers the architecture and
 training recipe. The machine-readable [ladder](pyramid-ladder.json) preserves
-the supplied four-size design. Its research scores are source-run observations,
-not results measured from this port. The historical [flat-expert preset](cascade-moe-28m.toml)
+the supplied four-size design. Its original research scores used Q9; they are not results measured
+from this Q21 port. The historical [flat-expert preset](cascade-moe-28m.toml)
 and old model source remain available for checkpoint replay.

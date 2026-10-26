@@ -14,8 +14,8 @@ rules the king normally funds its own leg too; failed-key recovery, configured
 make-good capacity and validator evaluation use operator resources. The scheduler is
 rolling intake + era king (DEC-CA-0043, `cascade/trainer/rolling.py`).
 
-The [implemented ladder](../deploy/presets/README.md) supplies Cascade MoE Base variants at 17.53M,
-68.92M, 273.64M and 1.23B total parameters. `[v2.training]` selects 1.23B on mainnet and 17.53M
+The [implemented ladder](../deploy/presets/README.md) supplies Cascade MoE Base variants at 17.58M,
+69.02M, 273.84M and 1.23B total parameters. `[v2.training]` selects 1.23B on mainnet and 17.58M
 for short testnet runs. The older flat-expert candidate remains available for replay.
 The new source uses an explicit update budget; it does not assume a measured
 GPU rate. Qualify the worker image, CPU generation image, baseline generator,

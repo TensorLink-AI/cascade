@@ -51,6 +51,8 @@ from gluonts.dataset.field_names import FieldName
 from gluonts.model.forecast import Forecast, QuantileForecast, SampleForecast
 from gluonts.model.predictor import Predictor
 
+from .quantiles import forecast_on_grid, quantile_indices
+
 # The grid the gluonts metrics are configured with (suites/_common.py's
 # QUANTILE_LEVELS — kept local because the suites import this module).
 _METRIC_QUANTILE_LEVELS = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
@@ -152,19 +154,12 @@ class CheckpointPredictor(Predictor):
         # (the CPM mask channel); everything else gets ``impute_history``.
         self._handles_missing = bool(getattr(self._wrapper, "handles_missing", False))
         levels = getattr(self._wrapper, "quantile_levels", None)
-        # The quantile path requires the wrapper's grid to be exactly the one
-        # the gluonts metrics request (mirrors time_bench's check): on any
-        # other grid, QuantileForecast would silently interpolate/extrapolate
-        # the missing levels — numbers not comparable across checkpoints —
-        # whereas the sample path can serve any level correctly.
-        self._use_quantiles = (
-            hasattr(self._wrapper, "forecast_quantiles_batch")
-            and levels is not None
-            and len(levels) == len(_METRIC_QUANTILE_LEVELS)
-            and np.allclose([float(v) for v in levels], _METRIC_QUANTILE_LEVELS)
-        )
+        # A richer head is comparable when it contains every metric level.
+        # Missing levels still use the existing sample path; no interpolation.
+        self._use_quantiles = (hasattr(self._wrapper, "forecast_quantiles_batch")
+            and quantile_indices(levels, _METRIC_QUANTILE_LEVELS) is not None)
         if self._use_quantiles:
-            self._forecast_keys = [f"{float(v):g}" for v in levels]
+            self._forecast_keys = [f"{float(v):g}" for v in _METRIC_QUANTILE_LEVELS]
 
     def predict(self, dataset: Dataset, **kwargs) -> Iterator[Forecast]:
         if self._use_quantiles:
@@ -196,14 +191,7 @@ class CheckpointPredictor(Predictor):
     def _flush_quantiles(self, pending: list[tuple]) -> Iterator[QuantileForecast]:
         histories = [h for *_, hs in pending for h in hs]
         h = self.prediction_length
-        q = np.asarray(
-            self._wrapper.forecast_quantiles_batch(histories, h), dtype=np.float64
-        )
-        expected = (len(histories), h, len(self._forecast_keys))
-        if q.shape != expected:
-            raise ValueError(
-                f"wrapper.forecast_quantiles_batch returned {q.shape}; expected {expected}"
-            )
+        q = forecast_on_grid(self._wrapper, histories, h, _METRIC_QUANTILE_LEVELS)
         i = 0
         for start, item_id, ndim, n_time, hs in pending:
             rows = q[i : i + len(hs)]
