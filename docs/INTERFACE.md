@@ -60,7 +60,10 @@ verification retains the one-channel floor and its earlier length limit. Do
 not use `--skip-verify` to bypass a policy mismatch.
 
 Quick and full runtime checks execute generator code in bounded sandbox
-children. Full verification compares two finite corpus prefixes; it cannot
+children. Shard-aware verification also pins each child to the tier's
+configured cores per child and caps BLAS threads before importing generator
+dependencies, within the local host's allowed cpuset. Legacy verification
+retains its earlier CPU policy. Full verification compares two finite corpus prefixes; it cannot
 prove that every future seed or the complete production budget will succeed.
 A host unable to provide the configured isolation must use an approved
 container/runtime or report the check as unavailable.

@@ -85,6 +85,27 @@ def _policy(cfg: ChainConfig, across_launch: bool):
                    max_generate_seconds=min(base.max_generate_seconds, after.max_generate_seconds))
 
 
+def _verification_cores(cfg: ChainConfig, across_launch: bool = False):
+    """Explicit child cpuset for shard verification; never mutate the caller's env.
+
+    Match the tier's configured cores per child, within the local cpuset. Legacy
+    verification keeps dispatch geometry (or its historical uncapped default).
+    """
+    import os
+
+    contracts = [cfg.screen_contract()]
+    if across_launch and cfg.training.v2_contract is not None:
+        contracts.append(cfg.training.v2_contract)
+    if not any(c.corpus_mode == "shards" for c in contracts):
+        return None
+    try:
+        allowed = sorted(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        allowed = list(range(os.cpu_count() or 1))
+    count = max(1, cfg.generation.vcpus // cfg.generation.n_children)
+    return tuple(allowed[:count])
+
+
 def verify_repo(
     repo_dir: Path | str,
     cfg: ChainConfig,
@@ -101,6 +122,7 @@ def verify_repo(
     """
     from dataclasses import replace
 
+    cpu_cores = _verification_cores(cfg, across_launch)
     cfg = replace(cfg, generator=_policy(cfg, across_launch))
     d = Path(repo_dir)
     scope = "quick" if quick else "static" if skip_runtime else "full"
@@ -144,7 +166,8 @@ def verify_repo(
     if failures or skip_runtime:
         return VerifyReport(ok=not failures, failures=failures, runtime_skipped=skip_runtime, scope=scope)
 
-    digest, runtime_err = (_quick_determinism_check(d, cfg) if quick else _determinism_check(d, cfg))
+    digest, runtime_err = (_quick_determinism_check(d, cfg, cpu_cores=cpu_cores) if quick
+                           else _determinism_check(d, cfg, cpu_cores=cpu_cores))
     if runtime_err is not None:
         failures.append(("determinism", runtime_err))
         return VerifyReport(ok=False, failures=failures, scope=scope)
@@ -153,7 +176,7 @@ def verify_repo(
                         scope=scope)
 
 
-def _quick_determinism_check(repo_dir: Path, cfg: ChainConfig):
+def _quick_determinism_check(repo_dir: Path, cfg: ChainConfig, *, cpu_cores=None):
     """Bounded child process: two small corpora, with the full output validators."""
     import json
     import subprocess
@@ -164,7 +187,8 @@ def _quick_determinism_check(repo_dir: Path, cfg: ChainConfig):
     try:
         run = subprocess.run(
             [sys.executable, "-m", "cascade.miner.verify_worker"],
-            input=json.dumps({"repo": str(repo_dir.resolve()), "generator": asdict(generator)}),
+            input=json.dumps({"repo": str(repo_dir.resolve()), "generator": asdict(generator),
+                              "cpu_cores": cpu_cores}),
             capture_output=True, text=True, timeout=30, check=False,
         )
         doc = json.loads(run.stdout)
@@ -180,6 +204,7 @@ def _quick_determinism_check(repo_dir: Path, cfg: ChainConfig):
 def _determinism_check(
     repo_dir: Path,
     cfg: ChainConfig,
+    *, cpu_cores=None,
 ) -> tuple[str | None, ValidationResult | None]:
     """Build the corpus twice at a fixed seed and assert identical digests."""
     try:
@@ -188,8 +213,10 @@ def _determinism_check(
     except ImportError as e:
         return None, ValidationResult.fail("missing_runtime_dep", error=str(e))
     try:
-        first = run_in_sandbox(repo_dir, 0, cfg.generator, blocked=cfg.static_guard.blocked)
-        second = run_in_sandbox(repo_dir, 0, cfg.generator, blocked=cfg.static_guard.blocked)
+        first = run_in_sandbox(repo_dir, 0, cfg.generator, blocked=cfg.static_guard.blocked,
+                               cpu_cores=cpu_cores)
+        second = run_in_sandbox(repo_dir, 0, cfg.generator, blocked=cfg.static_guard.blocked,
+                               cpu_cores=cpu_cores)
         if not first.n_series or not second.n_series:
             raise CorpusError("generator produced no usable series")
         if first.digest != second.digest:

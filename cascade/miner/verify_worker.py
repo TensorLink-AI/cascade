@@ -14,8 +14,10 @@ def main():
         request = json.load(sys.stdin)
         with contextlib.redirect_stdout(sys.stderr):
             cfg = GeneratorConfig(**request["generator"])
-            first = run_in_sandbox(request["repo"], 0, cfg)
-            second = run_in_sandbox(request["repo"], 0, cfg)
+            cores = request.get("cpu_cores")
+            cores = tuple(cores) if cores is not None else None
+            first = run_in_sandbox(request["repo"], 0, cfg, cpu_cores=cores)
+            second = run_in_sandbox(request["repo"], 0, cfg, cpu_cores=cores)
             if not first.n_series or first.digest != second.digest:
                 raise ValueError("empty or non-deterministic generator corpus")
             digest = first.digest

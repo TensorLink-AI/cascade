@@ -170,6 +170,7 @@ def run_in_container(
     cfg: GeneratorConfig,
     *,
     blocked: tuple[str, ...] = (),
+    cpu_cores: tuple[int, ...] | None = None,
 ) -> CorpusResult:
     """Container-mode :func:`cascade.trainer.sandbox.run_in_sandbox`.
 
@@ -193,7 +194,7 @@ def run_in_container(
         out_dir = Path(td)
         out_dir.chmod(0o777)  # the image's user must be able to write the mount
         name = f"cascade-sbx-{os.urandom(6).hex()}"
-        lane = _lane_cpu_slice()
+        lane = (set(cpu_cores), len(cpu_cores)) if cpu_cores is not None else _lane_cpu_slice()
         argv = container_argv(
             cfg, runtime=runtime, name=name, repo=repo, out_dir=out_dir,
             child_args=[_REPO_MNT, str(int(generation_seed)),

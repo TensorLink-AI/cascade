@@ -369,7 +369,7 @@ def stream_cpu_rlimit(
     return int(max_generate_seconds) + max(1, int(nproc)) * int(max_wall_seconds)
 
 
-def _child_env(*, gpu: bool = False) -> dict[str, str]:
+def _child_env(*, gpu: bool = False, cpu_cores: tuple[int, ...] | None = None) -> dict[str, str]:
     """Minimal allowlisted env for the sandbox child, with lane thread caps.
 
     When a lane slice is active, BLAS/threadpool env caps the generator's
@@ -382,7 +382,7 @@ def _child_env(*, gpu: bool = False) -> dict[str, str]:
     """
     keys = _SAFE_ENV_KEYS + (_GPU_ENV_KEYS if gpu else ())
     env = {k: os.environ[k] for k in keys if k in os.environ}
-    lane = _lane_cpu_slice()
+    lane = (set(cpu_cores), len(cpu_cores)) if cpu_cores is not None else _lane_cpu_slice()
     if lane is not None:
         for key in _BLAS_ENV_KEYS:
             env[key] = str(lane[1])
@@ -473,6 +473,7 @@ def run_in_sandbox(
     blocked: tuple[str, ...] = (),
     allow_netns: bool = True,
     gpu_pid_query=None,
+    cpu_cores: tuple[int, ...] | None = None,
 ) -> CorpusResult:
     """Run :func:`build_corpus` in an isolated subprocess and return its result.
 
@@ -495,7 +496,7 @@ def run_in_sandbox(
     if cfg.sandbox_mode == "container":
         from .sandbox_container import run_in_container
 
-        return run_in_container(repo_dir, generation_seed, cfg, blocked=blocked)
+        return run_in_container(repo_dir, generation_seed, cfg, blocked=blocked, cpu_cores=cpu_cores)
     repo = Path(repo_dir)
     _preflight(repo, cfg, tuple(blocked))
     # DEC-CA-0028: materialise the pinned shared real corpus HERE, parent-side
@@ -518,7 +519,7 @@ def run_in_sandbox(
         timeout = int(cfg.max_generate_seconds) + 30
         preexec = None
         if os.name == "posix":
-            lane = _lane_cpu_slice()
+            lane = (set(cpu_cores), len(cpu_cores)) if cpu_cores is not None else _lane_cpu_slice()
 
             def preexec() -> None:  # runs post-fork, pre-exec in the child
                 if lane is not None:
@@ -533,7 +534,7 @@ def run_in_sandbox(
         # child's pid, which CompletedProcess does not carry.
         proc = subprocess.Popen(
             argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            env=_child_env(), preexec_fn=preexec,
+            env=_child_env(cpu_cores=cpu_cores), preexec_fn=preexec,
         )
         try:
             _, stderr = proc.communicate(timeout=timeout)
