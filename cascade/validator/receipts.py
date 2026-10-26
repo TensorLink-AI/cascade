@@ -220,6 +220,7 @@ class ReceiptMixin:
         """
         from datetime import datetime
 
+        from ..shared.calendar_launch import effective_commit_floor
         from ..shared.hippius import (
             open_manifest_store,
             publish_receipt,
@@ -243,7 +244,8 @@ class ReceiptMixin:
                 participants = participants_from_commitments(
                     client.poll_commitments(include_history=True),
                     cutoff_block=epoch_start,
-                    floor_block=self.cfg.round.commit_floor_block,
+                    floor_block=effective_commit_floor(
+                        self.cfg, settlement_era(self.cfg.round, epoch_start).start_block),
                 )
                 # Anchor for the dashboard's next-round countdown (best-effort;
                 # the client extrapolates block→wall-clock from this + as_of).

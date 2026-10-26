@@ -39,6 +39,12 @@ boundary at or after that target. The separate 95% pre-launch burn waits for
 51% of eligible validator stake to signal `prelaunch-95-r2`. Installation
 alone does not activate either rule. Fresh deployment status remains required.
 
+For this rollout, paid A entries open at **30 October 2026, 09:00 UTC**.
+Use a fresh reveal at or after that opening. Accepted entries stay queued
+until v2 activation; `waiting_launch` is an expected stage and consumes no
+training attempt. The window stays open afterward. The planned lane order
+is **A → C → B**; discover each lane's actual activation separately.
+
 1. Read `cascade status --json` and check network, freshness, lane activation
    and the current starting checkpoint. `ready_for_training` concerns A's init;
    it does not open B or C.
@@ -187,6 +193,7 @@ Percentages are shares of the competition reward vector. A lane's pool is its bu
 | Launched lanes | A pool | B pool | C pool |
 |---|---:|---:|---:|
 | A | 100% | 0% | 0% |
+| A + C | 75% | 0% | 25% |
 | A + B | 75% | 25% | 0% |
 | A + B + C | 50% | 25% | 25% |
 

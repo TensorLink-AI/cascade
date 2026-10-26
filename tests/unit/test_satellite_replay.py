@@ -66,7 +66,7 @@ def _keyed(cfg):
         "netconfig": {"owner_hotkey": MAIN_KP.ss58_address},
         "training": {"expected_gpu": "", "train_image_digest": ""},
         "generator": {"corpus_target_points": 0},
-        "v2": {"launch_at_utc": ""},
+        "v2": {"launch_at_utc": "", "commit_open_at_utc": "", "commit_from_block": 0},
         "round": {"commit_floor_block": 0, "dedup_mode": "off", "epoch_blocks_prev": 0,
                   "epoch_activation_block": 0},
         "scoring": {"win_margin_start_prev": 0.0, "margin_activation_block": 0},
@@ -91,6 +91,7 @@ def test_dated_launch_replays_historical_signed_receipts_with_chain_time(scfg, t
     receipt, _ = make_settlement(scfg, store, 0)
     raw = json.loads(json.dumps(scfg.raw))
     raw["v2"]["launch_at_utc"] = "2026-10-30T12:00:00Z"
+    raw["v2"]["commit_open_at_utc"] = "2026-10-30T09:00:00Z"
     dated = parse_chain_config(raw)
     runner = _runner(dated, store, tmp_path)
     chain = _chain(launch_timestamp(dated.v2.launch_at_utc), head)

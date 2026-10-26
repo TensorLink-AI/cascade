@@ -15,7 +15,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Heavy ML stack — only the trainer (and the validator's evaluator) need torch.
+# Heavy ML stack for training/evaluation; the generation extra also supplies
+# torch for CPU-only priors such as gpytorch generators.
 # torch is PINNED EXACTLY (not a range) + sourced from a fixed CUDA index below:
 # a KOTH duel compares king vs challenger, so every pod MUST run bit-identical
 # numerics. An unpinned `torch>=2.2` let fresh `uv sync`s resolve to whatever was
@@ -53,7 +54,16 @@ pool-forge = [
 # CPU generation tier (DEC-CA-0053): parquet corpus shards. The CPU VM, the
 # orchestrator and every GPU pod that reads a `shards` corpus need this.
 generation = [
-    "pyarrow>=15.0",
+    "numpy==2.4.6",
+    "scipy==1.17.1",
+    "pyarrow==25.0.0",
+    "torch==2.4.1",
+    "pandas==3.0.3",
+    "networkx==3.6.1",
+    "numba==0.66.0",
+    "scikit-learn==1.9.0",
+    "statsmodels==0.14.6",
+    "gpytorch==1.15.2",
 ]
 # Ephemeral GPU-pod provisioner (deploy/provision.py). Shells out to the `lium`
 # CLI (installed separately) and calls the Shadeform REST API via requests.

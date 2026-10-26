@@ -22,6 +22,13 @@ release's `prelaunch-95-r2` feature; it starts at the next settlement boundary.
 Installing the release does not activate B/C. Preserve activation and receipt
 state when upgrading, and check fresh status before assuming a lane is open.
 
+The paid A entry window opens **30 October 2026, 09:00 UTC**, three hours
+before the noon launch target. Its reveal floor is resolved independently
+from finalized timestamps (`[v2] commit_from_block`). Trainer dispatch waits
+for actual v2 activation. Receipts keep the historical floor for v1 and the
+v2 opening floor for v2. C can launch before B when it takes its share from A;
+the A+C allocation is 75%/25%, becoming 50%/25%/25% when B launches.
+
 The mainnet template pins `[netconfig] owner_hotkey` to the same public main
 validator address as `[manifest] validator_hotkey`. It signs benchmark reports
 and network policy. Satellites and full validators must use that release pin;
@@ -444,6 +451,7 @@ Percentages are shares of the competition reward vector. A lane's pool is its bu
 | Launched lanes | A pool | B pool | C pool |
 |---|---:|---:|---:|
 | A | 100% | 0% | 0% |
+| A + C | 75% | 0% | 25% |
 | A + B | 75% | 25% | 0% |
 | A + B + C | 50% | 25% | 25% |
 
@@ -499,10 +507,12 @@ validator can judge the same settlement under different rules.
     generation never initialises a v2 era. The random-init window comes from
     `[v2] random_init_eras` (checked-in mainnet: 14), in addition to the
     protocol's minimum warm-start offset; do not assume the third era is warm.
-  - Lane A keeps the full allocation until the independent `[lane_b]
-    `from_block` (0 = off). B's launch must be an era start at or after v2;
+  - Lane A keeps the full allocation until B or C launches independently
+    (`from_block = 0` means off). C taken from A may launch first; A/C then
+    split 75/25. B's launch must be an era start at or after v2;
     the settlement AT its launch still uses the preceding era's allocation.
-    Once B launches, mainnet A/B split 75/25, with B's share in one slot per
+    B reserves 25% when launched: A/B split 75/25 while C is off, and
+    A/B/C split 50/25/25 while C is on. B's share has one slot per
     `[lane_b]` domain plus one per `[eval]
     scored_horizons` rung (mainnet 7 + 3 = 10; testnet 7), each win paid
     100 % for the `full_eras` of the highest `[lane_b] full_pay_tiers`

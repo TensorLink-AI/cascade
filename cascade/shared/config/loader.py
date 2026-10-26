@@ -660,9 +660,14 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
                          "= \"enforce\": the v2 gate requires complete benchmark suites")
     # DEC-CA-0064: an armed MarketCast is an era-boundary block at/after the v2
     # go-live and lane C, scored on the main validator's GPU (DEC-CA-0063).
-    if cfg.lane_c.from_block and (not cfg.lane_b.from_block
-                                  or int(cfg.lane_c.from_block) + 1 < int(cfg.lane_b.from_block)):
-        # Independent allocation sources still follow the A -> B -> C launch order.
+    if (cfg.v2.commit_from_block and cfg.v2.from_block
+            and cfg.v2.commit_from_block > cfg.v2.from_block):
+        raise ValueError("[v2] commit_from_block must not follow from_block")
+    if (cfg.lane_c.from_block and cfg.lane_c.takes_from == "lane_b"
+            and (not cfg.lane_b.from_block
+                 or int(cfg.lane_c.from_block) + 1 < int(cfg.lane_b.from_block))):
+        # Legacy C allocations drawn from B still need that source to be live.
+        # C drawn from A can launch independently, including before B.
         raise ValueError(f"[lane_c] from_block={cfg.lane_c.from_block} needs lane B live by "
                          f"its first settlement ([lane_b] from_block={cfg.lane_b.from_block})")
     _mc = int(cfg.marketcast.from_block)

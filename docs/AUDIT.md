@@ -419,8 +419,10 @@ earlier commit holds) and skips the `lane_c_duplicate_evicted` error rows
 (a copy losing its slot). `_lane_c_paid_wins` checks the payout record's
 `slots` against the slot-bearing targets at the settlement — an `mkt:`
 target counts only once `[marketcast]` is live — and the vector is rebuilt
-from the per-target `slot_frac` (concurrent competitions, below). A lane-C payout record without a lane-B one is reported, never
-rebuilt: lane C without lane B is refused.
+from the per-target `slot_frac` (concurrent competitions, below). A lane-C payout
+record can stand alone when C takes its allocation from A. The audit rebuilds
+the A+C vector without reserving a B pool. Legacy C taken from B requires B's
+payout record; a B record before B launches is refused.
 
 ## Concurrent lane-C competitions (DEC-CA-0056, owner 2026-10-20)
 

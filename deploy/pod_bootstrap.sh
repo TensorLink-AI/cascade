@@ -63,6 +63,9 @@ sysctl -qw kernel.unprivileged_userns_clone=1 2>/dev/null || true
 .bootstrap/uv sync --frozen --all-extras --no-dev
 .venv/bin/python scripts/check_tls_trust.py
 .venv/bin/python -c 'import sys, torch, cascade.trainer.worker; print("bootstrap ok:", sys.version.split()[0], torch.__version__)'
+if [[ "$3" == "generation" ]]; then
+  .venv/bin/python scripts/check_generation_runtime.py
+fi
 # Benchmark dependencies are needed even when no local dataset cache exists.
 # Installation and trust-check failures must fail provisioning, not disappear.
 if [[ "$3" == "eval" ]]; then

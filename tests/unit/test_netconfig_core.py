@@ -47,6 +47,8 @@ def base_raw(owner: str | None = None) -> dict:
                           margin_warmup_blocks_v2=0, margin_v2_from_block=0)
     raw["v2"]["prelaunch_burn"] = 0.0
     raw["v2"]["launch_at_utc"] = ""
+    raw["v2"]["commit_open_at_utc"] = ""
+    raw["v2"]["commit_from_block"] = 0
     raw["netconfig"] = {"owner_hotkey": OWNER.ss58_address if owner is None else owner}
     # DEC-CA-0063: once the validator bench source arms, [manifest]
     # validator_hotkey (the shipped local override) must name the same main

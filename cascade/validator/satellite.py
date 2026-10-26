@@ -265,8 +265,9 @@ def replay_receipt(receipt, cfg: ChainConfig, *, reader: Any, prev: dict | None,
         return _fail("netconfig", nc_row.detail)
     if nc_row is not None and nc_row.status == WARN:
         raise Transient(f"netconfig: {nc_row.detail}")
-    if cfg_r.v2.launch_at_utc and not cfg_r.v2.from_block:
-        from ..shared.calendar_launch import receipt_calendar_config
+    from ..shared.calendar_launch import calendar_rules_pending, receipt_calendar_config
+
+    if calendar_rules_pending(cfg_r):
 
         if client is None:
             raise Transient("calendar-launch: chain connection or resolved from_block required")

@@ -574,10 +574,10 @@ def lane_pool_shares(lane_b_cfg, lane_c_cfg=None) -> tuple[float, float]:
     share_b = float(getattr(lane_b_cfg, "share", 0.0) or 0.0) if lane_b_cfg is not None else 0.0
     if lane_c_cfg is None:
         return share_b, 0.0
-    if lane_b_cfg is None:
-        raise ValueError("lane C without lane B is refused: launch B before C")
     if lane_c_cfg.takes_from == "lane_a":
         return share_b, min(float(lane_c_cfg.share), max(0.0, 1.0 - share_b))
+    if lane_b_cfg is None:
+        raise ValueError("lane C taken from lane B cannot run without lane B")
     share_c = min(float(lane_c_cfg.share), share_b)
     return share_b - share_c, share_c
 
@@ -585,7 +585,8 @@ def lane_pool_shares(lane_b_cfg, lane_c_cfg=None) -> tuple[float, float]:
 def lane_c_shares(lane_b_cfg, lane_c_cfg, block: int | None) -> tuple[float, float]:
     """``(B, C)`` allocations at settlement ``block``; A receives the rest."""
     active_c = lane_c_cfg if lane_c_cfg is not None and lane_c_cfg.active(block) else None
-    return lane_pool_shares(lane_b_cfg, active_c)
+    active_b = lane_b_cfg if lane_b_cfg is not None and lane_b_cfg.active(block) else None
+    return lane_pool_shares(active_b, active_c)
 
 
 def lane_c_vector(n_uids: int, *, cfg, wins: list[LaneCWin], burn_uid: int,

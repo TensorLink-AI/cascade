@@ -84,6 +84,13 @@ the public CLI helper functions remain compatibility entry points.
 `runner_*` mixins. B/C drivers run alongside it, using shared admission and
 GPU capacity, while keeping their own scientific state.
 
+Paid A entry opening is resolved separately from training activation, using
+finalized chain timestamps. The v2 intake rejects funding before the opening;
+queued challengers report `waiting_launch` and the trainer starts no CPU/GPU
+work until v2. Old reveals are refused without burning an attempt. Legacy
+receipt replay retains its earlier floor. C drawn from A may launch before B;
+the validator and audit reserve only the pools that have launched.
+
 A funded entry becomes eligible after reveal and lane checks. It can wait for
 CPU admission, corpus preparation, a fitting GPU, shared operator capacity,
 worker startup or settlement. Intake acceptance does not reserve a GPU. Reveal
@@ -285,7 +292,7 @@ scores or automatic scientific losses.
 
 B uses target gains and regression guards, followed by merge acceptance when
 active. C uses its competition's forward-only tests and confirmation. The
-allocation sequence A 100%, A/B 75/25, A/B/C 50/25/25 describes mainnet lane
+planned sequence A 100%, A/C 75/25, A/B/C 50/25/25 describes mainnet lane
 pools; actual rewards also depend on A's ladder and B/C slot/decay/expiry rules.
 Unused shares burn under the mainnet policy; allocating a lane pool does not
 pay its entire amount to its current winners. The

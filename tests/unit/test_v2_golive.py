@@ -42,6 +42,7 @@ def test_mainnet_ships_inert_with_the_v2_contract_scheduled():
     # DEC-CA-0055's launch economics ship configured but inert until the block
     # (the pre-launch burn waits for its on-chain vote: no start block yet)
     assert cfg.v2 == V2Config(from_block=0, launch_at_utc="2026-10-30T12:00:00Z",
+                              commit_open_at_utc="2026-10-30T09:00:00Z",
                               prelaunch_burn_readiness="r2",
                               bench_gate_mode="enforce", random_init_eras=14,
                               reign_warm_start_blocks=21600, prelaunch_burn=0.95,

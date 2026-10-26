@@ -26,7 +26,7 @@ class V2Config:
     ``from_block = 0``: v2 is not active (the mainnet placeholder until the
     owner types the go-live block). ``N > 0``: every era whose start block is
     ``>= N`` runs v2 — lane A trains Cascade-MOE-28M under ``[v2.training]``
-    (a new lineage from random init) and lane B (``[lane_b]``) is live. ``N``
+    (a new lineage from random init). B and C have independent launch blocks. ``N``
     must be an era boundary on the grid in force at ``N`` (checked at load).
     No on-chain readiness vote: the owner types the block, every validator
     must run the v2 release before it. CONSENSUS.
@@ -34,6 +34,8 @@ class V2Config:
 
     from_block: int = 0
     launch_at_utc: str = ""
+    commit_open_at_utc: str = ""
+    commit_from_block: int = 0
     prelaunch_burn_readiness: str = ""
     # DEC-CA-0054 rides the v2 go-live: the three-suite bench gate mode that
     # applies to every v2 settlement ("off" keeps [scoring] bench_gate_mode).
@@ -285,14 +287,21 @@ def parse_v2_economics(v2raw: dict) -> dict:
     from ..calendar_launch import launch_timestamp
 
     launch = v2raw.get("launch_at_utc", "")
+    opening = v2raw.get("commit_open_at_utc", "")
     readiness = v2raw.get("prelaunch_burn_readiness", "")
     if not isinstance(launch, str) or not isinstance(readiness, str):
         raise ValueError("v2 launch_at_utc and prelaunch_burn_readiness must be strings")
     launch_timestamp(launch)
+    if not isinstance(opening, str):
+        raise ValueError("v2 commit_open_at_utc must be a UTC timestamp string")
+    opened = launch_timestamp(opening)
+    launched = launch_timestamp(launch)
+    if opened is not None and launched is not None and opened > launched:
+        raise ValueError("v2 commit_open_at_utc must not follow launch_at_utc")
     if readiness and (not readiness.isascii() or not readiness.isalnum() or len(readiness) > 12):
         raise ValueError("v2 prelaunch_burn_readiness must be up to 12 ASCII letters/digits")
-    out.update(launch_at_utc=launch, prelaunch_burn_readiness=readiness)
-    for k in ("random_init_eras", "reign_warm_start_blocks", "prelaunch_burn_from_block"):
+    out.update(launch_at_utc=launch, commit_open_at_utc=opening, prelaunch_burn_readiness=readiness)
+    for k in ("random_init_eras", "reign_warm_start_blocks", "prelaunch_burn_from_block", "commit_from_block"):
         raw = v2raw.get(k, 0)
         if isinstance(raw, bool) or not isinstance(raw, int):
             raise ValueError(f"[v2] {k} must be an integer; got {raw!r}")

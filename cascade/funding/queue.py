@@ -76,6 +76,7 @@ INFRA_BACKOFF_MAX_SECONDS = 1800.0
 
 # Public, bounded lifecycle telemetry. Never store provider error text or keys.
 PHASES = frozenset({"admitted", "waiting_admission", "preparing_data", "waiting_gpu",
+                    "waiting_launch",
                     "booting", "training", "harvesting", "evaluating",
                     "awaiting_settlement", "waiting_operator", "queued", "done",
                     "failed", "withdrawn"})
@@ -544,6 +545,38 @@ class FundedQueue:
         """Admitted legs, including preparation, capacity waits and judging."""
         return [e for e in self.entries() if e.status == "in_flight"]
 
+    def hold_for_launch(self) -> None:
+        """Explain a queued launch hold without starting or consuming an attempt."""
+        with self._locked() as entries:
+            changed = False
+            for hotkey, entry in entries.items():
+                if entry.status == "queued":
+                    updated = replace(_phase(entry, "waiting_launch", self.clock()), last_active=self.clock())
+                    if updated != entry:
+                        entries[hotkey] = updated
+                        changed = True
+            if changed:
+                self._save(entries)
+
+    def rebase_preopening_reveals(self, floor: int, resolve) -> None:
+        """A fresh reveal of an old ref gets its first eligible queue position.
+
+        ``resolve`` reads the trainer's already-fetched chain snapshot, never
+        performs I/O. Live attempts and reveals already inside the window keep
+        their identity and seniority.
+        """
+        with self._locked() as entries:
+            changed = False
+            for hotkey, entry in entries.items():
+                if entry.status != "queued" or entry.reveal_block >= floor:
+                    continue
+                block = resolve(hotkey, entry.ref)
+                if block is not None and int(block) >= floor:
+                    entries[hotkey] = replace(entry, reveal_block=int(block))
+                    changed = True
+            if changed:
+                self._save(entries)
+
     def set_phase(self, hotkey: str, phase: str, *, expect_ref: str,
                   expect_started_block: int, expect_funded_at: float,
                   expect_attempt_id: str,
@@ -820,7 +853,8 @@ class FundedQueue:
                     "not_before": e.not_before,
                     "requeues": e.requeues,
                     "attempt_id": e.attempt_id,
-                    "phase": (e.phase if e.status == "in_flight" else e.status),
+                    "phase": (e.phase if e.status == "in_flight" or (
+                        e.status == "queued" and e.phase == "waiting_launch") else e.status),
                     "phase_at": e.phase_at,
                     "phase_reason": e.phase_reason,
                     "phase_history": list(e.phase_history),

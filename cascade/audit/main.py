@@ -566,9 +566,9 @@ def audit_receipt(
     cfg = apply_receipt_activation(cfg, receipt)
     # DEC-CA-0057: then the owner-signed overlay it was judged under, if any.
     cfg, nc_check = apply_receipt_overlay(receipt, cfg, store=netconfig_store)
-    from ..shared.calendar_launch import receipt_calendar_config
+    from ..shared.calendar_launch import calendar_rules_pending, receipt_calendar_config
 
-    if cfg.v2.launch_at_utc and not cfg.v2.from_block:
+    if calendar_rules_pending(cfg):
         if client is None:
             return [CheckResult("calendar-launch", WARN,
                 "dated launch needs a chain connection or an explicitly resolved [v2] from_block; "

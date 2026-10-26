@@ -2032,6 +2032,13 @@ class RollingScheduler:
         cur = self.state.current
         if queue is None or cur is None:
             return
+        # The v2 release's opening window reserves paid A entries for v2.
+        # Do not dispatch them under the still-live v1 contract, even if the
+        # operator installed this release days before the scheduled opening.
+        if ((self.cfg.v2.commit_open_at_utc or self.cfg.v2.commit_from_block)
+                and (not self.cfg.v2.active(block) or not self.cfg.v2.commit_from_block)):
+            queue.hold_for_launch()
+            return
         from ..funding.queue import select_field
 
         try:
@@ -2043,6 +2050,11 @@ class RollingScheduler:
 
         # Pending reveals promote from chain truth (the intake's backstop).
         queue.promote_pending(lambda hk, ref: self._reveal_block(history, hk, ref))
+        from ..shared.calendar_launch import effective_commit_floor
+
+        floor = effective_commit_floor(self.cfg, block)
+        if floor:
+            queue.rebase_preopening_reveals(floor, lambda hk, ref: self._reveal_block(history, hk, ref, block))
         queue.expire_stale()
         cap = int(self.cfg.round.funded_field_cap or 0) or max(1, int(self.cfg.round.finalist_cap))
         in_flight = len(queue.in_flight())
@@ -2091,6 +2103,12 @@ class RollingScheduler:
                 queue.fail(entry.hotkey, error=f"funded ref {entry.ref} no longer matches "
                            f"the revealed {revealed} — fund the new ref",
                            error_class="ref_mismatch", expect_ref=entry.ref)
+                continue
+            reveal_block = self._reveal_block(history, entry.hotkey, entry.ref, block)
+            if reveal_block is None or reveal_block < floor:
+                queue.fail(entry.hotkey, error="This reveal precedes the competition opening; "
+                           "make a fresh commitment and fund it. No training attempt was consumed.",
+                           error_class="commit_before_open", expect_ref=entry.ref)
                 continue
             # fit on what THIS ref measured last time (max with the SKU wall) and
             # leave room for the post-round bench before the boundary
@@ -2150,16 +2168,18 @@ class RollingScheduler:
         return parse_vault_ref(gen.ref) is None
 
     @staticmethod
-    def _reveal_block(history: list, hotkey: str, ref: str) -> int | None:
+    def _reveal_block(history: list, hotkey: str, ref: str, as_of: int | None = None) -> int | None:
         from ..interface.validation import parse_commit
 
+        best = None
         for c in history:
-            if c.hotkey != hotkey:
+            if c.hotkey != hotkey or (as_of is not None and int(c.commit_block) > as_of):
                 continue
             parsed = parse_commit(c.payload)
             if parsed is not None and parsed.ref == ref:
-                return int(c.commit_block)
-        return None
+                value = int(c.commit_block)
+                best = value if best is None else max(value, best)
+        return best
 
     def _record_rent(self, entry, adm: Admission, queue, not_jumps: set[str]) -> None:
         """Seniority evidence for the roster: at this rent, which more-senior

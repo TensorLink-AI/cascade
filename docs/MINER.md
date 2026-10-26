@@ -103,7 +103,7 @@ This is stage tracking, not a live percentage or per-step loss display.
 was observed. Use the public training logs for recorded step metrics.
 
 ```bash
-pip install -e '.[hippius,chain]'
+pip install -e '.[hippius,chain,generation]'
 cascade verify ./my-generator
 btcli subnets register --netuid 91 --network finney --wallet-name w --wallet-hotkey h
 
@@ -139,6 +139,31 @@ Before you fund:
   ([§11](#11-multichannel-generators)).
 
 ## 1. Install
+
+For this v2 rollout, use a fresh commitment revealed at or after **30 October
+2026, 09:00 UTC**. The updated paid Lane A intake refuses earlier entries.
+Accepted entries remain queued until the first v2 activation era at or after
+the **12:00 UTC** target; neither CPU generation nor GPU training starts under
+v1. Submissions remain open afterward. A queued entry is not a consumed
+training attempt. The one-submission-per-hotkey rule still applies when it is
+judged or rejected for a miner-caused fault.
+
+The earlier `[round] commit_floor_block` remains for v1 replay. V2 has its own
+`[v2] commit_from_block`, resolved from the opening's finalized timestamp.
+Inspect `golive.commit_from_block` and `golive.admission_state` in fresh
+`cascade status --json`. `v2_submissions_not_open` means wait for the opening;
+`v2_commit_before_open` needs a fresh reveal; `launch_rules_unavailable` is a
+retryable chain-read failure (CLI exit 3).
+
+### CPU generation libraries
+
+The `generation` extra includes NumPy, SciPy, pandas, PyArrow, torch, networkx,
+numba, scikit-learn, statsmodels and gpytorch. Bootstrap installs the frozen
+`uv.lock` and runs `scripts/check_generation_runtime.py`, which imports every
+library and prints its installed version before miner code runs. A missing
+library fails provisioning rather than rejecting the generator. Generator
+requirements still need allowlisted, hash-locked dependencies. Deployment of
+the qualified CPU image is an operator release step.
 
 Use a patched installer: uv >=0.13.4, or pip >=26.2.2 with a patched OS CA
 store. This checkout requires certifi >=2026.10.19. After installing, run
@@ -675,6 +700,7 @@ competition reward vector, not a fixed TAO/day or dollar payment.
 | Launched lanes | A pool | B pool | C pool |
 |---|---:|---:|---:|
 | A | 100% | 0% | 0% |
+| A + C | 75% | 0% | 25% |
 | A + B | 75% | 25% | 0% |
 | A + B + C | 50% | 25% | 25% |
 <!-- cascade:rewards:allocation:end -->
@@ -1120,7 +1146,7 @@ train the full model. B's generators train selected experts inside that model.
 B opens separately from A: an activation block alone does not bypass its
 measured-lineage and routing checks. Use fresh `cascade status --json`.
 
-Mainnet allocates A 100%, then A/B 75/25, then A/B/C 50/25/25 as lanes launch.
+The planned rollout allocates A 100%, then A/C 75/25, then A/B/C 50/25/25.
 The [reward schedule](#rewards-allocation-burn-and-progression) explains the
 launch cap, king ladder, acceptance clocks and burns.
 

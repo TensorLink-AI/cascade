@@ -1054,7 +1054,11 @@ def compose_frame(
         prior = latest_settled_before(feed.index_doc, st.epoch_start)
         if prior is not None:
             last_outcome = outcome_line(prior).removeprefix("round settled — ")
-    submissions = feed.rows(st.epoch_start, floor_block=round_cfg.commit_floor_block)
+    from ..shared.calendar_launch import effective_commit_floor
+
+    floor = (effective_commit_floor(chain_cfg, st.epoch_start) if chain_cfg is not None
+             else round_cfg.commit_floor_block)
+    submissions = feed.rows(st.epoch_start, floor_block=floor)
     # Forward-looking bar only while the round is in flight — once this round
     # settles its receipt states the margin it was actually judged at.
     bar_line = (dethrone_bar_line(feed.index_doc, chain_cfg, block=st.epoch_start)

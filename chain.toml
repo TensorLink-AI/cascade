@@ -315,11 +315,10 @@ heat_infra_requeues      = 2
 init_gate_mode     = "shadow"
 tie_runoff_windows = 0
 tie_runoff_phase_seconds = 900
-# Go-live gate: only commitments revealed at/after this block ever compete
-# (0 = off). MAINNET: set to the announced launch block AT LAUNCH so netuid
-# squatters / rehearsal commits from before the official start never enter a
-# round (and never burn their one submission).
-commit_floor_block = 8622922  # OFFICIAL GO-LIVE BLOCK (deliberate): reveals before this never compete
+# Original v1 reveal floor (0 = off), preserved for historical replay.
+# The v2 entry opening is separately resolved under [v2] below; do not replace
+# this historical block with an estimated future launch block.
+commit_floor_block = 8622922  # original v1 floor; v2 has its own opening below in [v2]
                               # (unit fixtures neutralize it in tests/conftest.py)
 one_submission_per_hotkey = true
 duel_from_block = 8992800   # retired (ignored)
@@ -1077,6 +1076,8 @@ dormant_after_blocks = 0
 
 [v2]
 launch_at_utc = "2026-10-30T12:00:00Z"
+commit_open_at_utc = "2026-10-30T09:00:00Z"  # V2 reveals queue here; training waits for v2
+commit_from_block = 0  # resolved from finalized timestamps, or explicitly pinned by operator
 prelaunch_burn_readiness = "r2"
 # cascade v2 (DEC-CA-0050): Cascade-MOE-28M king lineage (lane A) + the
 # domain-expert lane (lane B). Finalized chain timestamps resolve launch_at_utc
@@ -1086,8 +1087,8 @@ prelaunch_burn_readiness = "r2"
 # on: lane A trains [v2.training] from a NEW
 # random-init lineage (toto2 members never initialise the MoE), the slow
 # router bites once the routing gate opens, receipts stamp `v2_block`, and
-# lane A keeps 100 % of the allocation until [lane_b] from_block launches B.
-# Then A/B split 75/25; once C launches it takes its share from A (50/25/25).
+# lane A keeps 100 % until another lane launches. Planned order: C first
+# (A/C 75/25), then B (A/B/C 50/25/25); activation remains separate for each.
 from_block = 0
 # Rides the same go-live (DEC-CA-0054): every v2 settlement enforces the
 # bench gate (the mode; the RULE is DEC-CA-0054's three suites + six-number
@@ -1272,8 +1273,8 @@ train_image_digest = "sha256:43c07d4207d7693517d74203f6783fdd2c2f91e3d475f38db38
 
 [lane_b]
 # Domain-expert lane (DEC-CA-0050), launched separately from lane A.
-# 0 = off: lane A keeps the full allocation. To launch B, announce an era
-# start at/after [v2] from_block; its first settlement allocates A/B 75/25.
+# 0 = off: no B pool is reserved. To launch B, announce an era start at/after
+# [v2] from_block. A/B split 75/25 while C is off, A/B/C 50/25/25 while C is on.
 # CONSENSUS: from_block, share, decay,
 # TTL, remainder, domains, verdict params. Owner-tunable values marked.
 from_block = 0

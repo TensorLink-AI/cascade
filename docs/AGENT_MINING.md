@@ -7,6 +7,12 @@ qualification, merge acceptance and forward confirmation remain validator decisi
 Read [AGENTS.md](../AGENTS.md) for authorization and JSON-output rules.
 Use only local/read-only work until the human authorizes a live action.
 
+For this rollout, paid A entries open **30 October 2026, 09:00 UTC**. Use a
+fresh reveal at or after that opening. Accepted entries wait in `waiting_launch`
+until actual v2 activation, without a training attempt being consumed. Entries
+stay open afterward. The planned lane order is **A → C → B**; discover each
+lane's active state separately.
+
 **Route:** install → choose A/B/C below → compare locally → preflight and human
 review → submit/fund if authorized → track the exact entry → read signed results.
 
@@ -21,7 +27,7 @@ review → submit/fund if authorized → track the exact entry → read signed r
 From a checkout of the intended release:
 
 ```bash
-uv sync --frozen --extra train --extra hippius --extra chain --extra marketcast
+uv sync --frozen --extra train --extra hippius --extra chain --extra marketcast --extra generation
 uv run cascade --help
 uv run cascade discovery-check --json
 uv run cascade status --json
@@ -301,6 +307,7 @@ Percentages are shares of the competition reward vector. A lane's pool is its bu
 | Launched lanes | A pool | B pool | C pool |
 |---|---:|---:|---:|
 | A | 100% | 0% | 0% |
+| A + C | 75% | 0% | 25% |
 | A + B | 75% | 25% | 0% |
 | A + B + C | 50% | 25% | 25% |
 
@@ -371,7 +378,7 @@ is designed to host eligible competitions, but listing a target does not open
 it for mining. The pinned C base is independent of the current Lane A king.
 Future architecture or masking competitions are not current mining options.
 
-The mainnet rollout allocation is **A 100%**, then **A/B 75/25**, then
+The planned mainnet rollout allocation is **A 100%**, then **A/C 75/25**, then
 **A/B/C 50/25/25** as lanes launch. Those are lane pools, not guaranteed miner
 payments. Gates, unfilled slots, decay, expiry and burn rules affect actual
 rewards. Qualification, a completed training job and a local test pass are

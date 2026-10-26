@@ -2509,6 +2509,8 @@ def _lane_vector_want(receipt: RoundReceipt, cfg: ChainConfig, got_pol,
     burn = cfg.scoring.burn_uid
     wins, pay = [], receipt.lane_b_pay
     if pay is not None:
+        if not cfg.lane_b.active(boundary):
+            return None, 0, "lane-B payout record before lane B is active"
         wins, why = _lane_b_paid_wins(receipt, cfg, n_uids)
         if why is not None:
             return None, 0, why
@@ -2523,8 +2525,8 @@ def _lane_vector_want(receipt: RoundReceipt, cfg: ChainConfig, got_pol,
     elif cfg.lane_c.active(boundary):
         return None, 0, ("lane C is live at this settlement but the receipt carries no "
                          "lane-C payout record to rebuild it")
-    if c_pay is not None and pay is None:
-        return None, 0, "a lane-C payout record without lane B's: lane C without lane B is refused"
+    if c_pay is not None and pay is None and cfg.lane_c.takes_from == "lane_b":
+        return None, 0, "lane C taken from lane B requires lane B's payout record"
     a, b = lane_parts(list(receipt.reward_uids), n_uids, king_decay=cfg.scoring.king_decay,
                       burn_uid=burn, lane_b_cfg=(cfg.lane_b if pay is not None else None),
                       wins=wins, lane_c_cfg=(cfg.lane_c if c_pay is not None else None),
@@ -2547,7 +2549,7 @@ def _rebuild_lane_vector(name: str, receipt: RoundReceipt, cfg: ChainConfig, got
         return _fail(name, why)
     bad = [u for u, (g, x) in enumerate(zip(got, want, strict=True))
            if not math.isclose(g, x, rel_tol=1e-9, abs_tol=1e-12)]
-    lanes = "A+B+C" if c_pay is not None else ("A+B" if pay is not None else "A")
+    lanes = "A" + ("+B" if pay is not None else "") + ("+C" if c_pay is not None else "")
     if bad:
         u = bad[0]
         return _fail(name, f"uid {u} holds {got[u]}, the lane {lanes} rebuild gives {want[u]} "

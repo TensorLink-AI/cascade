@@ -367,11 +367,15 @@ from_block` is typed; every pre-lane-C path is byte-identical).
   copied recipe re-run on each new king can no longer take the slot. No
   further slot rule was added. A tree with different bytes (a one-byte edit)
   is a different submission: exact identity only, as DEC-CA-0008.
-- **Lane C never without lane B (L8).** One rule: `lane_parts` and
+- **Historical L8, amended 2026-10-26.** The original rule: `lane_parts` and
   `lane_c_shares` both raise `ValueError` for an active lane C without lane
   B, and the loader refuses a `[lane_c] from_block` before lane B is live
   (already implied by the v2 gate; now explicit). The audit reports a
   lane-C payout record without a lane-B one instead of rebuilding a vector.
+  The owner-approved rollout is now A → C → B. This restriction remains only
+  for legacy C taken from B. C with `takes_from = "lane_a"` may launch before
+  B or with B disabled: A/C reserve 75%/25%, then A/B/C reserve 50%/25%/25%.
+  Validator weights, receipt replay, audit and discovery use the same split.
 - **Slots = ACTIVE targets (L9).** `active_targets(lc, block, mc)`: an
   `mkt:` target counts only once `[marketcast]` is active at the settlement.
   The payout record's `slots`, the vector (`lane_c_vector(slots=)`,

@@ -22,6 +22,12 @@ does not open the lane. The separate **95% pre-launch burn** starts after
 **51% of eligible validator stake** signals this release's readiness, at the
 following settlement boundary. B and C remain separately activated.
 
+**V2 entry window:** fresh revealed commitments are eligible from **30 October
+2026, 09:00 UTC**. Paid Lane A intake is closed before then. Accepted entries
+queue until the actual v2 activation era; they cannot train under v1. Entries
+remain open after launch. Lane A's one-submission-per-hotkey rule is unchanged.
+The planned lane order is **A → C → B**: A/C use 75%/25%, then A/B/C use 50%/25%/25%.
+
 | You are | Start here |
 |---|---|
 | Exploring the research | [agent.md](agent.md), then [llms.txt](llms.txt) |
@@ -163,6 +169,7 @@ Percentages are shares of the competition reward vector. A lane's pool is its bu
 | Launched lanes | A pool | B pool | C pool |
 |---|---:|---:|---:|
 | A | 100% | 0% | 0% |
+| A + C | 75% | 0% | 25% |
 | A + B | 75% | 25% | 0% |
 | A + B + C | 50% | 25% | 25% |
 

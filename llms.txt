@@ -25,6 +25,11 @@ Burn is independent: 95% after 51% of eligible validator stake signals the
 release (`prelaunch-95-r2`), from the next settlement boundary. Installing
 the repo does not open a lane. B/C activation remains separate.
 
+Paid A entry opening: **2026-10-30 09:00 UTC**. Use a fresh revealed
+commitment at or after this opening. Accepted entries report `waiting_launch`
+until the actual v2 era; no training attempt starts during this hold.
+The opening is a floor, not a closing deadline. Planned order: **A → C → B**.
+
 From the intended release's installed environment:
 
 ```bash
@@ -85,6 +90,7 @@ Percentages are shares of the competition reward vector. A lane's pool is its bu
 | Launched lanes | A pool | B pool | C pool |
 |---|---:|---:|---:|
 | A | 100% | 0% | 0% |
+| A + C | 75% | 0% | 25% |
 | A + B | 75% | 25% | 0% |
 | A + B + C | 50% | 25% | 25% |
 

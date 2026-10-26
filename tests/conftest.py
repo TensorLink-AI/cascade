@@ -90,12 +90,15 @@ def cfg() -> ChainConfig:
 
     raw = copy.deepcopy(c.raw)
     raw["v2"]["launch_at_utc"] = ""
+    raw["v2"]["commit_open_at_utc"] = ""
+    raw["v2"]["commit_from_block"] = 0
     raw["netconfig"]["owner_hotkey"] = ""
     return replace(c, training=replace(c.training, expected_gpu="",
                                        train_image_digest=""),
                    raw=raw,
                    netconfig=replace(c.netconfig, owner_hotkey=""),
-                   v2=replace(c.v2, launch_at_utc="", prelaunch_burn_readiness=""),
+                   v2=replace(c.v2, launch_at_utc="", commit_open_at_utc="",
+                              commit_from_block=0, prelaunch_burn_readiness=""),
                    # corpus_target_points ships ARMED (DEC-CA-0031): a points-
                    # denominated drain would override every fixture's small
                    # corpus_n_series with a 67M-point draw. Tests that exercise

@@ -396,8 +396,10 @@ class FundingIntake:
         resolve_lane_b_reveal: Callable[[str, tuple, str], int | None] | None = None,
         lane_b_targets: tuple[str, ...] | None = None,
         lane_b_max_targets: int | None = None,
+        lane_a_admission: Callable[[int | None], tuple[int, dict] | None] | None = None,
     ) -> None:
         self.direct_intake = direct_intake
+        self.lane_a_admission = lane_a_admission
         # DEC-CA-0059 item 8 lane B: the domain-expert funding queue + its
         # reveal oracle ``(hotkey, targets, ref) -> reveal block | None`` (the
         # hotkey's revealed ``metro-v1:expert:`` commitment must declare
@@ -461,12 +463,25 @@ class FundingIntake:
         except Exception:  # noqa: BLE001 — purge is best-effort housekeeping
             log.exception("vault TTL purge failed (will retry next request)")
         try:
-            return self.queue.promote_pending(self.resolve_reveal)
+            def eligible(hotkey, ref):
+                block = self.resolve_reveal(hotkey, ref)
+                return block if block is not None and self._lane_a_gate(block) is None else None
+
+            return self.queue.promote_pending(eligible)
         except Exception:  # noqa: BLE001 — sweep is best-effort by design
             log.exception("pending-reveal sweep failed (will retry next request)")
             return 0
 
     # ── request handling (returns (http_status, body_dict)) ──────────────────
+
+    def _lane_a_gate(self, reveal_block=None):
+        if self.lane_a_admission is None:
+            return None
+        try:
+            return self.lane_a_admission(reveal_block)
+        except Exception:  # noqa: BLE001 — no credentials/queue write on unknown launch rules
+            return 503, {"code": "launch_rules_unavailable",
+                         "message": "Cannot verify the v2 opening against finalized chain timestamps; retry later."}
 
     def _parse_fresh_timestamp(self, ts: str) -> float | None:
         """The parsed timestamp when fresh, else ``None``.
@@ -649,6 +664,10 @@ class FundingIntake:
             ctx = gate_ctx
         self.sweep_pending()
         hotkey, declared = ctx["hotkey"], ctx["declared"]
+        if headers.get("X-Lium-Api-Key") or headers.get("X-Payer-Credentials"):
+            gate = self._lane_a_gate()
+            if gate is not None:
+                return gate
         actual = f"sha256:{hashlib.sha256(body).hexdigest()}"
         if actual != declared:
             return 400, {"code": "digest_mismatch",
@@ -766,6 +785,9 @@ class FundingIntake:
             return 403, {"code": "not_revealed",
                          "message": "no revealed commitment for this hotkey matches "
                                     "X-Commit-Ref — reveal first, then fund"}
+        gate = self._lane_a_gate(reveal_block)
+        if gate is not None:
+            return gate
         outcome = self.queue.add(hotkey, ref, int(reveal_block), label=label,
                                  gpu_choice=choice)
         # Vault AFTER the queue accepts (mirrors PRISM: creds stored only once

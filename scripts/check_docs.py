@@ -94,7 +94,8 @@ def reward_reference(root=ROOT):
         return f"{value * 100:.6g}%"
 
     allocations = ["| Launched lanes | A pool | B pool | C pool |", "|---|---:|---:|---:|"]
-    for label, bcfg, ccfg in (("A", None, None), ("A + B", cfg.lane_b, None),
+    for label, bcfg, ccfg in (("A", None, None), ("A + C", None, cfg.lane_c),
+                              ("A + B", cfg.lane_b, None),
                               ("A + B + C", cfg.lane_b, cfg.lane_c)):
         b, c = lane_pool_shares(bcfg, ccfg)
         allocations.append(f"| {label} | {percent(1-b-c)} | {percent(b)} | {percent(c)} |")

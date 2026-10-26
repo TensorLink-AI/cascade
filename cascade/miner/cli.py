@@ -1129,7 +1129,12 @@ def post_intake(req, out: Reporter, *, timeout: float) -> tuple[int, dict] | Non
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status, _decode_json_body(resp.read())
     except urllib.error.HTTPError as e:
-        return e.code, _decode_json_body(e.read())
+        body = _decode_json_body(e.read())
+        if e.code >= 500 and body.get("code") == "launch_rules_unavailable":
+            out.fail("launch_rules_unavailable", str(body.get("message") or "Launch rules unavailable"),
+                     NETWORK, http_status=e.code)
+            return None
+        return e.code, body
     except (urllib.error.URLError, OSError) as e:
         out.fail("intake_unreachable", f"intake unreachable: {e}", NETWORK)
         return None

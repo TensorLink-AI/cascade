@@ -31,6 +31,10 @@ The **95% pre-launch burn** activates separately after **51% of eligible
 validator stake** signals this release. Installation alone activates neither.
 Read fresh live status before proposing mining work; B/C have separate gates.
 
+Paid A entries open at **30 October 2026, 09:00 UTC**. Use a fresh revealed
+commitment from that opening; accepted entries wait for the actual v2 era,
+and submissions stay open after launch. The planned order is **A → C → B**.
+
 ## One contribution, from idea to the next experiment
 
 *Illustrative example, not a reported experiment or measured result:*
@@ -68,6 +72,7 @@ Percentages are shares of the competition reward vector. A lane's pool is its bu
 | Launched lanes | A pool | B pool | C pool |
 |---|---:|---:|---:|
 | A | 100% | 0% | 0% |
+| A + C | 75% | 0% | 25% |
 | A + B | 75% | 25% | 0% |
 | A + B + C | 50% | 25% | 25% |
 

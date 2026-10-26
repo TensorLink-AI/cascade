@@ -43,6 +43,21 @@ Nodes observing the crossing use recent timestamps; a much later fresh node
 may need an archive-capable RPC to derive that same historical boundary. A
 pruned node that cannot read it fails with an actionable error; point it at an
 archive endpoint or type the resolved `[v2] from_block`.
+
+The v2 paid-entry opening is separately pinned as `[v2] commit_open_at_utc =
+"2026-10-30T09:00:00Z"`. Its first finalized chain block becomes
+`commit_from_block`; an explicit block pin is also supported. Late nodes must
+be able to resolve both timestamps, or use both published block pins. This is
+an opening floor, not a closing deadline. The updated intake refuses paid A
+entries before it opens and refuses older reveals afterward. The updated
+trainer holds queued A challengers until v2 is active, without CPU/GPU rental
+or consuming attempts. Installing this release therefore pauses new challenger
+dispatch under v1; historical replay and king work remain available.
+
+The planned order is A → C → B. C with `takes_from = "lane_a"` can launch with
+B disabled or scheduled later. It reserves 25% while A keeps 75%; launching B
+later yields 50%/25%/25%. Legacy C taken from B still requires B to be live.
+Upgrade every validator and satellite to this release before arming C before B.
 While `launch_at_utc` is set and `from_block = 0`, the trainer and validator
 services refuse to start unless the v2 configuration the date would activate
 loads (for example `[netconfig] owner_hotkey` for `bench_source = "validator"`).
@@ -89,6 +104,10 @@ edited `chain.toml` before shipping it.
    at 50B points. Provisioning, digest finalization and upload add time
    outside that generation window. This is operator-side configuration;
    changing the window does not require other validators to update.
+   Bootstrap imports every supported generator library and prints its version
+   using `scripts/check_generation_runtime.py`; retain that manifest when
+   qualifying the production VM image. A dependency import failure must stop
+   provisioning before any miner generator runs.
 6. **Main validator identity.** Mainnet pins `[netconfig] owner_hotkey` to
    its configured main validator. Testnet keeps a separate unset identity;
    set it when enabling validator-sourced benches there. The
@@ -126,10 +145,11 @@ edited `chain.toml` before shipping it.
    refuses a non-boundary; a passed block judges the eras in between under
    the wrong contract). Trainer and every validator run the v2 release
    BEFORE it. Testnet is armed at 8190000: confirm it is still ahead of the
-   head before deploying. Leave `[lane_b] from_block = 0` for the A-only
+   head before deploying. Leave B and C `from_block = 0` for the A-only
    launch: lane A gets the full allocation, with its existing ladder and
    burn rules. Announce B separately at an era start ≥ `[v2] from_block`;
-   Mainnet A/B split 75/25 from B's first settlement, with empty B slots burning.
+   B reserves 25% from its first settlement; A keeps 75% if C is off and
+   50% if C is already live. Empty B slots burn.
    `[lane_b] acceptance_from_block = "v2"` makes individual wins unpaid
    qualifications: only compatible deltas accepted at a warm start start
    earning. Testnet leaves it at 0 to preserve settled history. To upgrade

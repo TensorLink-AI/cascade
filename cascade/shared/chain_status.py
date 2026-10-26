@@ -60,7 +60,9 @@ def build_chain_status(
     # (typed in or resolved by activation) the raw field is the post-switch
     # length and the strip would count boundaries that do not exist yet.
     epoch_blocks = max(1, int(effective_epoch_blocks(cfg.round, int(current_block))))
-    floor = int(cfg.round.commit_floor_block)
+    from .calendar_launch import effective_commit_floor
+
+    floor = effective_commit_floor(cfg, current_block)
     # The chain's fixed block time, NOT round_hours / epoch_blocks (that ratio
     # is 48 s/block once the rollover shrinks the grid to 900 blocks).
     block_time = BLOCK_SECONDS

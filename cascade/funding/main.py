@@ -424,6 +424,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         gpu_catalog = GpuCatalog.from_config(cfg)
         log.info("GPU choice: %s", ",".join(gpu_catalog.skus or ()) or
                  "OFF (one locked type)")
+    lane_a_admission = None
+    if cfg is not None and not args.trust_refs:
+        from ..shared.calendar_launch import lane_a_launch_gate, resolve_calendar_launch
+
+        def lane_a_admission(reveal_block):
+            effective = resolve_calendar_launch(cfg, client)
+            return lane_a_launch_gate(effective, int(client.finalized_block()), reveal_block)
+
     intake = FundingIntake(
         # Entry TTL tracks the key TTL by construction here; the trainer's
         # [round] funded_entry_ttl_hours must be set to the same value.
@@ -445,6 +453,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         resolve_lane_b_reveal=lane_b_resolver,
         lane_b_targets=lane_b_slots,
         lane_b_max_targets=lane_b_cap,
+        lane_a_admission=lane_a_admission,
     )
     server = intake.make_server(args.host, args.port,
                                 max_connections=args.max_connections,

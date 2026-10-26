@@ -30,7 +30,8 @@ def check_launch_loads(cfg, head_block: int) -> None:
     from .netconfig import effective_raw
 
     raw = effective_raw(cfg)
-    raw.setdefault("v2", {})["from_block"] = next_era_start(cfg.round, int(head_block))
+    raw.setdefault("v2", {})["from_block"] = next_era_start(
+        cfg.round, max(int(head_block), int(cfg.v2.commit_from_block) - 1))
     try:
         parse_chain_config(raw)
     except ValueError as exc:
@@ -52,22 +53,7 @@ def check_calendar_launch(cfg, client) -> None:
     check_launch_loads(cfg, int(client.finalized_block()))
 
 
-def resolve_calendar_launch(cfg, client):
-    """No wall-clock estimate, readiness vote or write to live state.
-
-    The first finalized block at/after the target selects the next era start.
-    Every late joiner derives that same block; the lane never opens early.
-    A typed from_block remains an explicit operator override.
-    """
-    target = launch_timestamp(cfg.v2.launch_at_utc)
-    if target is None or cfg.v2.from_block:
-        return cfg
-    from .config import parse_chain_config
-    from .era import next_era_start
-    from .netconfig import effective_raw
-
-    head = int(client.finalized_block())
-
+def _first_finalized_at(client, head, target):
     def stamp(block):
         try:
             value = float(client.block_timestamp(block))
@@ -76,13 +62,13 @@ def resolve_calendar_launch(cfg, client):
             # derive the same launch block, so guessing is not an option.
             raise RuntimeError(
                 f"calendar launch: cannot read the timestamp of block {block} ({exc}); use an "
-                "archive endpoint or type [v2] from_block to the resolved launch block") from exc
+                "archive endpoint or pin the resolved [v2] from_block and commit_from_block") from exc
         if not math.isfinite(value):
             raise ValueError("chain timestamp is non-finite; calendar launch is unresolved")
         return value
 
     if head < 1 or stamp(head) < target:
-        return cfg
+        return None
     # Most nodes observe the crossing immediately. Bracket it from the recent
     # head first rather than requiring an archive read halfway to genesis.
     hi, step = head, 1
@@ -97,9 +83,41 @@ def resolve_calendar_launch(cfg, client):
             lo = mid + 1
         else:
             hi = mid
-    block = next_era_start(cfg.round, lo - 1)
-    raw = effective_raw(cfg)
-    raw.setdefault("v2", {})["from_block"] = block
+    return lo
+
+
+def calendar_rules_pending(cfg):
+    return dated_launch_pending(cfg) or bool(
+        cfg.v2.commit_open_at_utc and not cfg.v2.commit_from_block)
+
+
+def resolve_calendar_launch(cfg, client):
+    """Resolve opening and activation independently from finalized timestamps.
+
+    Opening is the first block at/after its UTC time. Training starts at the
+    first era boundary at/after its own target. Neither uses an estimated
+    future block or the local wall clock. Explicit block pins take priority.
+    """
+    if not calendar_rules_pending(cfg):
+        return cfg
+    from .config import parse_chain_config
+    from .era import next_era_start
+    from .netconfig import effective_raw
+
+    head = int(client.finalized_block())
+    raw = None
+    for field, date in (("commit_from_block", cfg.v2.commit_open_at_utc),
+                        ("from_block", cfg.v2.launch_at_utc)):
+        if getattr(cfg.v2, field) or not date:
+            continue
+        crossing = _first_finalized_at(client, head, launch_timestamp(date))
+        if crossing is None:
+            continue
+        raw = raw if raw is not None else effective_raw(cfg)
+        raw.setdefault("v2", {})[field] = (
+            next_era_start(cfg.round, crossing - 1) if field == "from_block" else crossing)
+    if raw is None:
+        return cfg
     resolved = parse_chain_config(raw)
     from dataclasses import replace
 
@@ -108,7 +126,7 @@ def resolve_calendar_launch(cfg, client):
 
 def receipt_calendar_config(cfg, receipt, client=None):
     """Resolve a receipt's rules without trusting its claimed activation block."""
-    if not cfg.v2.launch_at_utc or cfg.v2.from_block:
+    if not calendar_rules_pending(cfg):
         return cfg
     if client is None:
         raise ValueError("dated launch requires a chain connection or resolved [v2] from_block")
@@ -126,4 +144,28 @@ def receipt_calendar_config(cfg, receipt, client=None):
 
     raw = effective_raw(cfg)
     raw["v2"]["launch_at_utc"] = ""
+    raw["v2"]["commit_open_at_utc"] = ""
     return replace(parse_chain_config(raw), activation=cfg.activation)
+
+
+def effective_commit_floor(cfg, block):
+    """Keep historical v1 admission unchanged; v2 uses its published opening."""
+    floor = int(cfg.round.commit_floor_block)
+    if getattr(cfg, "v2", None) is not None and cfg.v2.active(block):
+        floor = max(floor, int(cfg.v2.commit_from_block))
+    return floor
+
+
+def lane_a_launch_gate(cfg, block, reveal_block=None):
+    """A new-release paid admission gate; no queue, credentials or chain writes."""
+    if not (cfg.v2.commit_open_at_utc or cfg.v2.commit_from_block):
+        return None
+    if not cfg.v2.commit_from_block:
+        return 409, {"code": "v2_submissions_not_open",
+                     "message": f"Lane A v2 commitments open at {cfg.v2.commit_open_at_utc}; "
+                                "nothing was queued or rented"}
+    if reveal_block is not None and int(reveal_block) < int(cfg.v2.commit_from_block):
+        return 403, {"code": "v2_commit_before_open",
+                     "message": "This reveal precedes the v2 opening; make a fresh commitment. "
+                                "No training attempt was consumed."}
+    return None

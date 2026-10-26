@@ -18,6 +18,7 @@ PHASE_TEXT = {
     "queued": "Queued for admission",
     "admitted": "Admitted; preparation has not yet been reported",
     "waiting_admission": "Waiting for shared compute admission",
+    "waiting_launch": "Queued for v2 activation; training has not started",
     "preparing_data": "Preparing training data (includes CPU capacity waits)",
     "waiting_gpu": "Waiting for GPU provisioning",
     "booting": "GPU allocated; starting and checking the worker",
@@ -34,6 +35,7 @@ PHASE_TEXT = {
     "queued_behind": "New reference parked behind the current leg",
 }
 ERROR_TEXT = {
+    "commit_before_open": "The reveal predates the competition opening. Make a fresh commitment and fund it; no training attempt was consumed.",
     "price_cap_unavailable": "A listed provider cannot enforce the requested price ceiling; nothing was rented through it.",
     "no_capacity": "No fitting capacity or admission window was available at the last retry.",
     "rate_limited": "The provider rate-limited the request.",
@@ -213,6 +215,8 @@ def submission_view(snapshot, *, hotkey, lane, ref=None, queue=None, source=None
         return result
     status = row.get("status")
     phase = row.get("phase") if status == "in_flight" else status
+    if status == "queued" and row.get("phase") == "waiting_launch":
+        phase = "waiting_launch"
     phase = phase if isinstance(phase, str) and phase in PHASE_TEXT else (
         status if isinstance(status, str) and status in PHASE_TEXT else "unknown")
     ref = row.get("ref")
@@ -271,6 +275,8 @@ def submission_view(snapshot, *, hotkey, lane, ref=None, queue=None, source=None
             result["next_action"] = (f"Work was lost on the operator's side ({faults} of {OPERATOR_FAULT_RETRIES} "
                                      "losses). Unless operator recovery capacity is configured, the leg retries "
                                      "on your provider account with a new pod; keep the entry funded and do not resubmit.")
+        elif phase == "waiting_launch":
+            result["next_action"] = "Wait for v2 activation. Keep this entry; no training attempt has started and no resubmission is needed."
         elif phase == "waiting_gpu":
             result["next_action"] = "Keep the existing entry; no resubmission is needed for later rounds. For a prolonged wait, ask the operator to check your GPU type/price cap, market capacity and backlog."
         elif retry and retry > now.timestamp():

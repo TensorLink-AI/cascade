@@ -91,7 +91,9 @@ def status_snapshot(docs: dict, *, now: datetime, max_age: float) -> dict:
     return {
         "fetched_at": now.isoformat(timespec="seconds"),
         "fresh": fresh, "freshness": clocks,
-        "ready_for_training": warm["current"] and (comp.get("launch_preflight") or {}).get("state") != "blocked",
+        "ready_for_training": (warm["current"]
+            and (comp.get("launch_preflight") or {}).get("state") != "blocked"
+            and (comp.get("golive") or {}).get("admission_state") not in {"closed", "queued"}),
         "source_kind": "public_telemetry_not_consensus",
         "chain": chain, "warm_start": warm,
         "golive": comp.get("golive"), "model": comp.get("model"),

@@ -13,7 +13,7 @@ its checkpoints do not merge into A/B.
 You can follow the research without mining: open [Benchmarks](./index.html),
 choose GIFT-Eval and MASE × CRPS, and enable King trajectory. Lower error on
 both axes is better for that benchmark; compare matching tasks and revisions.
-The repository's [introduction](https://github.com/TensorLink-AI/cascade/blob/main/agent.md)
+The repository's [introduction](https://github.com/TensorLink-AI/cascade/blob/cascade-v2/agent.md)
 includes a labelled illustrative example and explains how to inspect the
 [published receipt index](./receipts/index.json). These v2 controls require the
 matching dashboard release; missing panels or reports are not measured results.
@@ -24,14 +24,14 @@ not live configuration.
 
 ## Start here
 
-- [Competition introduction](https://github.com/TensorLink-AI/cascade/blob/main/agent.md): purpose, what changed from v1, lanes and how contributions accumulate.
+- [Competition introduction](https://github.com/TensorLink-AI/cascade/blob/cascade-v2/agent.md): purpose, what changed from v1, lanes and how contributions accumulate.
 - [Mining dashboard](./index.html): current competitions, queues, rewards and warm start.
 - [Live competition policy](./status/v2.json): activation, targets, gates, budgets, pinned base and warm_start.
 - [Chain clock](./status/chain.json): current block, era grid and publication time.
-- [Miner guide](https://github.com/TensorLink-AI/cascade/blob/main/docs/MINER.md): full workflow and failure classes.
-- [Generator interface](https://github.com/TensorLink-AI/cascade/blob/main/docs/INTERFACE.md): read before editing a generator.
-- [Agent instructions](https://github.com/TensorLink-AI/cascade/blob/main/AGENTS.md): local checks and spending boundaries.
-- [Agent walkthrough](https://github.com/TensorLink-AI/cascade/blob/main/docs/AGENT_MINING.md): complete lane A/B/C setup, local tests and review flow.
+- [Miner guide](https://github.com/TensorLink-AI/cascade/blob/cascade-v2/docs/MINER.md): full workflow and failure classes.
+- [Generator interface](https://github.com/TensorLink-AI/cascade/blob/cascade-v2/docs/INTERFACE.md): read before editing a generator.
+- [Agent instructions](https://github.com/TensorLink-AI/cascade/blob/cascade-v2/AGENTS.md): local checks and spending boundaries.
+- [Agent walkthrough](https://github.com/TensorLink-AI/cascade/blob/cascade-v2/docs/AGENT_MINING.md): complete lane A/B/C setup, local tests and review flow.
 
 Use the matching network configuration throughout. A testnet host reads a
 different manifest bucket; do not combine its queues/checkpoints with mainnet.
@@ -45,6 +45,11 @@ boundary at or after that time using finalized chain timestamps. Installing
 the release does not open the lane. The separate 95% burn starts after 51%
 of eligible validator stake signals `prelaunch-95-r2`, from the following
 settlement boundary. B/C activation is separate; verify live policy.
+
+Paid A entries open **30 October 2026, 09:00 UTC**. Use a fresh revealed
+commitment from that opening. Accepted entries report `waiting_launch` until
+the actual v2 era, with no training attempt consumed during the hold. The
+window remains open afterward. The planned lane order is **A → C → B**.
 
 Default to local/read-only work. Publication, chain commitments, submissions
 and paid funding require the human's authorization. Never add `--yes` without it,
@@ -112,7 +117,7 @@ chain evidence for payouts. For A use `cascade duel --hotkey HOTKEY --history --
 For cheaper generator optimization, use `cascade score` or `cascade iterate`
 on a smaller model once released. The planned 2M, 7M, 28M, 56M and ~120M
 variants are currently
-[blocked placeholders](https://github.com/TensorLink-AI/cascade/blob/main/deploy/presets/README.md),
+[blocked placeholders](https://github.com/TensorLink-AI/cascade/blob/cascade-v2/deploy/presets/README.md),
 awaiting model definitions. Select a released variant through a complete local
 `--chain-toml` configuration and compatible init. Keep both sides' model,
 budget, seeds and held-out pool fixed; use a separate work directory per model.
@@ -270,6 +275,7 @@ Percentages are shares of the competition reward vector. A lane's pool is its bu
 | Launched lanes | A pool | B pool | C pool |
 |---|---:|---:|---:|
 | A | 100% | 0% | 0% |
+| A + C | 75% | 0% | 25% |
 | A + B | 75% | 25% | 0% |
 | A + B + C | 50% | 25% | 25% |
 

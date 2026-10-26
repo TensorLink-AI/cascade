@@ -102,16 +102,24 @@ def golive(cfg, block: int | None) -> dict:
     """``{from_block, state, blocks_to_go}`` with state ``unannounced`` (the
     0 placeholder), ``scheduled`` (block ahead) or ``live``."""
     fb = v2_from_block(cfg)
+    opening = {}
+    v2 = getattr(cfg, "v2", None)
+    if getattr(v2, "commit_open_at_utc", "") or getattr(v2, "commit_from_block", 0):
+        floor = int(v2.commit_from_block)
+        opening = {"commit_open_at_utc": v2.commit_open_at_utc,
+                   "commit_from_block": floor,
+                   "admission_state": ("closed" if not floor else
+                       "active" if fb > 0 and block is not None and int(block) >= fb else "queued")}
     if fb <= 0:
         date = getattr(getattr(cfg, "v2", None), "launch_at_utc", "")
         if date:
-            return {"from_block": 0, "state": "scheduled", "blocks_to_go": None,
+            return {**opening, "from_block": 0, "state": "scheduled", "blocks_to_go": None,
                     "launch_at_utc": date, "alignment": "first era at or after target"}
-        return {"from_block": 0, "state": "unannounced", "blocks_to_go": None}
+        return {**opening, "from_block": 0, "state": "unannounced", "blocks_to_go": None}
     if block is None or int(block) < fb:
-        return {"from_block": fb, "state": "scheduled",
+        return {**opening, "from_block": fb, "state": "scheduled",
                 "blocks_to_go": None if block is None else fb - int(block)}
-    return {"from_block": fb, "state": "live", "blocks_to_go": 0}
+    return {**opening, "from_block": fb, "state": "live", "blocks_to_go": 0}
 
 
 # ── model ────────────────────────────────────────────────────────────────────

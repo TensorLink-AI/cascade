@@ -51,7 +51,9 @@ def test_calendar_uses_the_same_finalized_era_for_live_and_late_nodes():
     raw["netconfig"]["owner_hotkey"] = cfg.manifest.validator_hotkey
     cfg = parse_chain_config(raw)
     target = launch_timestamp(cfg.v2.launch_at_utc)
-    assert resolve_calendar_launch(cfg, _chain(target, 30000)) is cfg
+    opening = resolve_calendar_launch(cfg, _chain(target, 30000))
+    assert opening.v2.from_block == 0
+    assert opening.v2.commit_from_block == 29101
     first = resolve_calendar_launch(cfg, _chain(target, 30001))
     late = resolve_calendar_launch(cfg, _chain(target, 100000))
     assert first.v2.from_block == late.v2.from_block == 43200
@@ -68,6 +70,8 @@ def test_a_node_observing_launch_immediately_needs_only_recent_timestamps():
     raw["netconfig"]["owner_hotkey"] = cfg.manifest.validator_hotkey
     cfg = parse_chain_config(raw)
     target = launch_timestamp(cfg.v2.launch_at_utc)
+    # A running node first resolves the opening while its timestamp is recent.
+    cfg = resolve_calendar_launch(cfg, _chain(target, 29101))
     chain = _chain(target, 30001)
     recent = chain.block_timestamp
     reads = []
@@ -96,7 +100,8 @@ def test_failed_or_nonfinite_chain_time_does_not_guess_a_launch():
     with pytest.raises(ValueError, match="unresolved"):
         resolve_calendar_launch(cfg, chain)
     # A testnet's separately typed historical activation remains authoritative.
-    typed = replace(cfg, v2=replace(cfg.v2, from_block=43200))
+    typed = replace(cfg, v2=replace(cfg.v2, from_block=43200,
+                                   commit_open_at_utc="", commit_from_block=0))
     assert resolve_calendar_launch(typed, object()) is typed
 
 

@@ -83,9 +83,71 @@ def test_a_only_cap_failed_check_and_key_slash_scale_to_full_pool(tmp_path, king
     assert vector[0] == pytest.approx(1 - king_bp / 10000)
 
 
-def test_lane_c_cannot_launch_before_or_without_b(tmp_path):
+def test_lane_c_drawn_from_a_can_launch_before_or_without_b(tmp_path):
     cfg, start, era = _config(tmp_path)
     for b_start in (0, start + 5 * era):
         raw = {**cfg.raw, "lane_b": {**cfg.raw["lane_b"], "from_block": b_start}}
+        assert load_chain_config(raw=raw).lane_c.takes_from == "lane_a"
+        legacy = {**raw, "lane_c": {**raw["lane_c"], "takes_from": "lane_b"}}
         with pytest.raises(ValueError, match="needs lane B live"):
-            load_chain_config(raw=raw)
+            load_chain_config(raw=legacy)
+
+
+@pytest.mark.parametrize("phase", ["a", "c_boundary", "a_c", "b_boundary", "a_b_c"])
+def test_c_first_weights_and_audit_reserve_only_launched_pools(tmp_path, phase):
+    cfg, start, era = _config(tmp_path)
+    c_start, b_start = start + 2 * era, start + 4 * era
+    cfg = replace(cfg, lane_b=replace(cfg.lane_b, from_block=b_start + 1),
+                  lane_c=replace(cfg.lane_c, from_block=c_start))
+    boundary = {"a": start + cfg.round.epoch_blocks, "c_boundary": c_start,
+                "a_c": c_start + cfg.round.epoch_blocks, "b_boundary": b_start,
+                "a_b_c": b_start + cfg.round.epoch_blocks}[phase]
+    b_live, c_live = boundary > b_start, boundary > c_start
+    state = ChampionState(king_hotkey=KING, king_uid=3, king_since_block=start + 1,
+                          king_share_bp=5000)
+    r = _runner(cfg, state)
+    r._lane_b_block = r._lane_c_block = boundary
+    m = _manifest(boundary)
+    r._v2_settlement_economics(m, [], 1, None, KING)
+    vector = r._apply_weights(_Client(boundary, {KING: 3}), m.round_id, [3], boundary=boundary)
+    pool_a = 1 - .25 * b_live - .25 * c_live
+    assert vector[3] == pytest.approx(.5 * pool_a)
+    assert vector[0] == pytest.approx(1 - vector[3])
+    assert sum(vector) == pytest.approx(1)
+    assert (r._last_lane_b_pay is not None) is b_live
+    assert (r._last_lane_c_pay is not None) is c_live
+    receipt = replace(_receipt(r, m, boundary, [3], vector),
+                      lane_c_pay=r._last_lane_c_pay, lane_c=[] if c_live else None)
+    result = check_weights(receipt, cfg)
+    assert result.status == "PASS", result.detail
+
+
+@pytest.mark.parametrize("ladder", [True, False])
+def test_c_holder_gets_paid_before_b_and_audit_rejects_a_premature_b_pool(tmp_path, ladder):
+    from cascade.shared.lane_c import TargetWin
+
+    cfg, start, era = _config(tmp_path)
+    c_start, b_start = start + 2 * era, start + 4 * era
+    cfg = replace(cfg, v2=replace(cfg.v2, king_ladder=ladder),
+                  lane_b=replace(cfg.lane_b, from_block=b_start + 1),
+                  lane_c=replace(cfg.lane_c, from_block=c_start),
+                  marketcast=replace(cfg.marketcast, from_block=c_start))
+    boundary = c_start + cfg.round.epoch_blocks
+    r = _runner(cfg, ChampionState(king_hotkey=KING, king_uid=3,
+                                   king_since_block=start + 1, king_share_bp=5000))
+    r._lane_b_block = r._lane_c_block = boundary
+    r._lane_c().record(TargetWin("mkt:returns", "specialist", 5, "confirmed", boundary,
+                                 gain_lcb=.05, tier=.05, full_eras=10))
+    m = _manifest(boundary)
+    r._v2_settlement_economics(m, [], 1, None, KING)
+    vector = r._apply_weights(_Client(boundary, {KING: 3, "specialist": 5}),
+                              m.round_id, [3], boundary=boundary)
+    assert vector[3] == pytest.approx(.375 if ladder else .75)
+    assert vector[5] == pytest.approx(.125)
+    assert sum(vector) == pytest.approx(1)
+    assert r._last_lane_b_pay is None
+    receipt = replace(_receipt(r, m, boundary, [3], vector), lane_c_pay=r._last_lane_c_pay, lane_c=[])
+    result = check_weights(receipt, cfg)
+    assert result.status == "PASS", result.detail
+    premature = replace(receipt, lane_b_pay={"block": boundary, "wins": []})
+    assert check_weights(premature, cfg).status == "FAIL"

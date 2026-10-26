@@ -351,15 +351,15 @@ def lane_parts(court_uids: Sequence[int], n_uids: int, *, king_decay: float, bur
     weight, then equal per target; review L9 — an ``mkt:`` target holds a
     slot only once MarketCast is live).
 
-    Lane C WITHOUT lane B is refused: the launch order is A, B, then C.
+    Lane C taken from A can launch before B. Legacy C taken from B requires B.
     The shared allocation helper also drives receipt/audit share records."""
     from .chain import decayed_share_vector
     from .lane_c import lane_pool_shares
 
     court = decayed_share_vector(list(court_uids), n_uids, decay=king_decay, burn_uid=burn_uid)
     b = [0.0] * n_uids
-    pool_a = 1.0
     share_b, share_c = lane_pool_shares(lane_b_cfg, lane_c_cfg)
+    pool_a = 1.0 - share_b - share_c
     if lane_b_cfg is not None:
         # DEC-CA-0059: one slot per lane-B target (domains + horizon targets)
         slot = share_b / max(1, len(getattr(lane_b_cfg, "targets", None)
@@ -370,7 +370,6 @@ def lane_parts(court_uids: Sequence[int], n_uids: int, *, king_decay: float, bur
             b[int(w.uid)] += amt
             paid_b += amt
         left_b = share_b - paid_b
-        pool_a = 1.0 - share_b - share_c
         if lane_b_cfg.remainder == "lane_a":
             pool_a += left_b
         elif left_b > 0:
