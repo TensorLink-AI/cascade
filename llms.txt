@@ -51,6 +51,12 @@ object; progress goes to stderr. Branch on `error.code`, not message wording.
 For an existing entry, poll the response's `data.tracking.argv` every 30–60
 seconds with backoff. A passed round is not a reason to submit again.
 
+For shard preparation, inspect `submissions[].generation`: CPU capacity,
+generation, hashing and upload have separate stages and their own freshness.
+Check its attempt binding; `generator_ref_only` is not an exact current queue
+attempt. Public W&B CPU logs, when enabled, use `phase:generation` and
+`hotkey:` tags. These reports are observability, not paid verdicts.
+
 ## Competition routes
 
 For provider keys and spending, read the

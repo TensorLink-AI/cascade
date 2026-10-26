@@ -134,6 +134,16 @@ state names are scientific compatibility surfaces, not generic cleanup targets.
 work. CPU generation has its own parallelism/capacity. King work has provisioning
 priority; B and C retain their lane limits and compete for remaining resources.
 
+`generation/progress.py` relays bounded CPU counters through a scoped upload
+link; `runner_generation.py` persists snapshots and mirrors them to W&B on
+the orchestrator. Status reports keep per-attempt binding and freshness.
+These counters never participate in admission digests, scoring or rewards.
+`generation/shards.py` supports legacy binary-float shards and an explicit
+schema-3 float32 byte-stream-split/Zstandard encoding with the same logical
+corpus digest. `generation/lifecycle.py` uses anchored validator receipts for
+observed king publication and conservative retention; private R2 corpus
+storage is separately configured from the primary public manifest store.
+
 `gpu_health.py` persists GPU-type cooldowns and `operator_health.py` runs an
 independent watchdog with a durable alert outbox. `provision/operator_pool.py`
 reserves capped operator spending before a create and binds cleanup to the

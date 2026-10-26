@@ -54,7 +54,9 @@ def shard_names(gcfg: GenerationConfig) -> list[str]:
 def upload_plan(store, base: str, gcfg: GenerationConfig,
                 expires_s: int = UPLOAD_EXPIRES_S) -> dict[str, str]:
     """``{name: PUT link}`` under ``base`` for every possible shard and the index."""
-    names = [*shard_names(gcfg), INDEX_NAME]
+    from .progress import PROGRESS_NAME
+
+    names = [*shard_names(gcfg), INDEX_NAME, PROGRESS_NAME]
     return {name: presign(store, "put_object", base + name, expires_s) for name in names}
 
 

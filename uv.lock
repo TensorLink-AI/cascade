@@ -330,7 +330,7 @@ requires-dist = [
     { name = "torch", marker = "extra == 'generation'", specifier = "==2.4.1", index = "https://download.pytorch.org/whl/cu124" },
     { name = "torch", marker = "extra == 'train'", specifier = "==2.4.1", index = "https://download.pytorch.org/whl/cu124" },
     { name = "transformers", marker = "extra == 'train'", specifier = ">=4.40" },
-    { name = "wandb", marker = "extra == 'wandb'", specifier = ">=0.17" },
+    { name = "wandb", marker = "extra == 'wandb'", specifier = ">=0.28" },
 ]
 provides-extras = ["train", "hippius", "dev", "pool-forge", "generation", "deploy", "wandb", "marketcast", "chain", "satellite"]
 

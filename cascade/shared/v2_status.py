@@ -998,6 +998,8 @@ def publish_trainer_v2_status(sched, block: int, *, min_interval_s: float = MIN_
         from .submission_progress import receipt_progress
 
         doc["submission_receipt"] = receipt_progress(receipt)
+        generation_view = getattr(sched.r, "_generation_progress_snapshot", None)
+        doc["generation_progress"] = generation_view() if callable(generation_view) else []
         # Publish the era's actual init, including accepted expert merges,
         # before its first settlement. The trained king is a different pointer.
         if cur is not None and hasattr(cur, "warm_start_ckpt"):

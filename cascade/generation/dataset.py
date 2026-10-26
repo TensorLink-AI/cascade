@@ -35,7 +35,7 @@ from .shards import INDEX_NAME, ShardError, read_index, verify_shards
 
 INDEX_KEY = "index.json"
 META_NAME = "meta.json"
-SCORE_FIELDS = ("crps_geomean", "mase_geomean", "verdict", "crowned", "bench")
+SCORE_FIELDS = ("crps_geomean", "mase_geomean", "verdict", "crowned", "bench", "settled_at", "settlement_round", "settlement_block")
 
 
 # The orchestrator writes the index from several threads (rolling legs, lane-B
@@ -179,6 +179,8 @@ def meta_from_index(idx: dict, *, round_id: str, hotkey: str, uid: int | None,
         "wall_seconds": idx.get("wall_seconds"), "cpu_model": idx.get("cpu_model", ""),
         "vcpus": idx.get("vcpus"), "stop_reason": idx.get("stop_reason", ""),
         "provider": provider, "shape": shape,
+        "stored_bytes": idx.get("stored_bytes"), "raw_bytes": idx.get("raw_bytes"),
+        "shard_encoding": idx.get("shard_encoding", "legacy"),
     }
 
 
@@ -231,10 +233,18 @@ def _add_row(store, meta: dict, *, round_id: str, hotkey: str, uid: int | None,
         "round_id": str(round_id), "hotkey": hotkey, "uid": uid, "era": era,
         "generator_ref": meta["generator_ref"], "corpus_digest": meta["corpus_digest"],
         "n_series": meta["n_series"], "points": meta["points"], "provider": provider,
+        "generation_seed": meta.get("seed"),
         "shape": shape, "uploaded_at": float(time.time() if now is None else now),
         "crps_geomean": None, "mase_geomean": None, "verdict": None,
         "crowned": False, "bench": None, "published": None, "expired": False,
     }
+    prior = _row(rows, round_id, hotkey)
+    if prior is not None and prior.get("crowned") and prior.get("corpus_digest") != row["corpus_digest"]:
+        raise ShardError("refusing to replace a crowned corpus identity")
+    if prior is not None and prior.get("corpus_digest") == row["corpus_digest"]:
+        for name in (*SCORE_FIELDS, "published", "uploaded_at"):
+            if name in prior:
+                row[name] = prior[name]
     rows = [r for r in rows if not (str(r["round_id"]) == str(round_id)
                                     and r["hotkey"] == hotkey)] + [row]
     _write_dataset_index(store, rows, prefix)
@@ -268,7 +278,6 @@ def _sample_shard_names(idx: dict, n: int) -> list[str]:
     return [name for _, _, name in ordered[:n]]
 
 
-@_index_locked
 def publish_king_corpus(src_store, public_store, round_id: str, hotkey: str,
                         gcfg: GenerationConfig) -> dict:
     """Publish a crowned king's corpus: ``full`` copies every shard;
@@ -287,11 +296,12 @@ def publish_king_corpus(src_store, public_store, round_id: str, hotkey: str,
     for name in (META_NAME, INDEX_NAME):
         _put_public(public_store, base + name, src_store.get_bytes(base + name),
                     "application/json")
-    rows = read_dataset_index(src_store, prefix)
-    row = _row(rows, round_id, hotkey)
-    if row is not None:
-        row.update(crowned=True, published=gcfg.king_publish)
-        _write_dataset_index(src_store, rows, prefix)
+    with _INDEX_LOCK:
+        rows = read_dataset_index(src_store, prefix)
+        row = _row(rows, round_id, hotkey)
+        if row is not None:
+            row.update(crowned=True, published=gcfg.king_publish)
+            _write_dataset_index(src_store, rows, prefix)
     return {"round_id": str(round_id), "hotkey": hotkey, "mode": gcfg.king_publish,
             "shards": names}
 

@@ -109,6 +109,12 @@ at era/generation transitions. The website's `llms.txt` explains all lanes
 and the read-only refresh loop. Public telemetry is discovery; signed
 contracts, manifests and receipts remain authoritative.
 
+For shard-mode preparation, inspect `submissions[].generation` and its own
+freshness and attempt binding. CPU waits, generation, hashing and upload are
+separate from training. `generator_ref_only` does not identify the current
+queue attempt; historical readiness is not proof of payment. Optional public
+W&B CPU runs use `phase:generation` and `hotkey:` tags.
+
 Work offline until the human says to spend:
 
 ```bash

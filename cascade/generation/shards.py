@@ -9,7 +9,10 @@ Each shard row is one series: ``channels`` (int32), ``length`` (int32) and
 ``values`` (the ``(C, L)`` array as little-endian float32 bytes, row-major).
 Schema 2 adds nullable ``groups`` (one uint8 label byte per channel). A
 values-only shard, including explicit ``groups=None``, keeps schema 1 and
-the exact original parquet bytes. An index is schema 2 if any shard uses it.
+the exact original parquet bytes under legacy encoding. Explicit
+``float32_bss`` encoding uses schema 3: typed float32 lists, byte-stream split
+and Zstandard, with the same rounded values and logical corpus digest. An
+index records the highest schema used by any shard.
 
 float32 is what the model trains on; every reader widens it to float64
 exactly, so the stream digest is over the stored values, not the generator's
@@ -47,6 +50,7 @@ import numpy as np
 
 SCHEMA = 1
 GROUPS_SCHEMA = 2
+FLOAT32_SCHEMA = 3
 INDEX_NAME = "corpus.json"
 URLS_NAME = "urls.json"      # remote corpus: {shard name: pre-signed GET link}
 
@@ -98,8 +102,13 @@ def file_sha256(path: Path | str) -> str:
     return h.hexdigest()
 
 
-def write_shard(path: Path | str, series: Iterable[np.ndarray | dict]) -> dict:
+def write_shard(path: Path | str, series: Iterable[np.ndarray | dict], *,
+                encoding: str = "legacy", compression_level: int = 3) -> dict:
     """Write ``series`` to one parquet shard; returns its index entry."""
+    if encoding not in ("legacy", "float32_bss"):
+        raise ShardError(f"unsupported shard encoding {encoding!r}")
+    if not 1 <= compression_level <= 9:
+        raise ShardError("compression_level must be 1–9")
     pa, pq = _pa()
     chans: list[int] = []
     lens: list[int] = []
@@ -135,10 +144,23 @@ def write_shard(path: Path | str, series: Iterable[np.ndarray | dict]) -> dict:
         table = table.append_column("groups", pa.array(groups, type=pa.binary()))
         table = table.replace_schema_metadata({b"cascade_schema": b"2"})
     path = Path(path)
-    pq.write_table(table, path, compression="zstd")
+    if encoding == "legacy":
+        pq.write_table(table, path, compression="zstd")
+    else:
+        # Lossless byte-stream split exposes corresponding float32 bytes to
+        # Zstd. No quantization, float16 conversion or rounding beyond legacy f32.
+        offsets = np.concatenate(([0], np.cumsum([len(v) // 4 for v in vals])))
+        flat = np.frombuffer(b"".join(vals), dtype="<f4")
+        column = pa.LargeListArray.from_arrays(pa.array(offsets, type=pa.int64()), pa.array(flat))
+        table = table.set_column(2, "values", column).replace_schema_metadata(
+            {b"cascade_schema": b"3", b"cascade_encoding": b"float32_bss"})
+        pq.write_table(table, path, compression="zstd", compression_level=compression_level,
+                       use_dictionary=False, use_byte_stream_split=["values.list.element"])
     entry = {"name": path.name, "sha256": file_sha256(path),
              "n_series": len(chans), "points": points}
-    if grouped:
+    if encoding == "float32_bss":
+        entry.update(schema=FLOAT32_SCHEMA, encoding=encoding)
+    elif grouped:
         entry["schema"] = GROUPS_SCHEMA
     return entry
 
@@ -147,15 +169,23 @@ def iter_shard(path: Path | str) -> Iterator[np.ndarray | dict]:
     """Yield widened float64 values, carrying schema-2 groups when present."""
     _, pq = _pa()
     pf = pq.ParquetFile(path)
+    pa, _ = _pa()
+    typed = pa.types.is_large_list(pf.schema_arrow.field("values").type) or pa.types.is_list(pf.schema_arrow.field("values").type)
     grouped = "groups" in pf.schema_arrow.names
     columns = ["channels", "length", "values"] + (["groups"] if grouped else [])
     for batch in pf.iter_batches(batch_size=1024, columns=columns):
         cs = batch.column(0).to_pylist()
         ls = batch.column(1).to_pylist()
-        vs = batch.column(2).to_pylist()
+        if typed:
+            values_column = batch.column(2)
+            offsets = values_column.offsets.to_numpy(zero_copy_only=False)
+            flat = values_column.values.to_numpy(zero_copy_only=False)
+            vs = (flat[start:end] for start, end in zip(offsets[:-1], offsets[1:], strict=True))
+        else:
+            vs = batch.column(2).to_pylist()
         gs = batch.column(3).to_pylist() if grouped else [None] * len(cs)
         for c, n, v, g in zip(cs, ls, vs, gs, strict=True):
-            a = np.frombuffer(v, dtype="<f4")
+            a = np.asarray(v, dtype="<f4") if typed else np.frombuffer(v, dtype="<f4")
             if a.size != c * n:
                 raise ShardError(f"{path}: row holds {a.size} values, expected {c}×{n}")
             values = a.reshape(c, n).astype(np.float64)
@@ -178,8 +208,8 @@ def read_index(corpus_dir: Path | str) -> dict:
         idx = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, ValueError) as e:
         raise ShardError(f"unreadable corpus index {p}: {e}") from e
-    if idx.get("schema") not in (SCHEMA, GROUPS_SCHEMA):
-        raise ShardError(f"{p}: schema {idx.get('schema')!r}, expected 1 or 2")
+    if idx.get("schema") not in (SCHEMA, GROUPS_SCHEMA, FLOAT32_SCHEMA):
+        raise ShardError(f"{p}: schema {idx.get('schema')!r}, expected 1, 2 or 3")
     return idx
 
 
@@ -326,8 +356,7 @@ def finalize_index(corpus_dir: Path | str, *, seed: int, children: list[dict],
         kids.append({**c,
                      "n_series": sum(s["n_series"] for s in c["shards"]),
                      "points": sum(s["points"] for s in c["shards"])})
-    schema = GROUPS_SCHEMA if any(sh.get("schema") == GROUPS_SCHEMA
-                                  for c in kids for sh in c["shards"]) else SCHEMA
+    schema = max((sh.get("schema", SCHEMA) for c in kids for sh in c["shards"]), default=SCHEMA)
     index = {**(meta or {}), "schema": schema, "seed": int(seed), "children": kids}
     write_index(d, {**index, "corpus_digest": "", "n_series": 0, "points": 0})
     digest, n, points = stream_digest(iter_corpus(d, verify=True))

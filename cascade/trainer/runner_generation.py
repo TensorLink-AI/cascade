@@ -74,8 +74,14 @@ class _GenerationMixin:
         if store is None:
             from ..shared.hippius import S3Config, S3Store
 
-            bucket = self.cfg.generation.bucket or self.cfg.storage.manifest_bucket
-            store = S3Store(S3Config.from_storage(self.cfg.storage, bucket=bucket))
+            gcfg = self.cfg.generation
+            if gcfg.storage_backend == "r2":
+                config = S3Config(endpoint=gcfg.s3_endpoint, region=gcfg.s3_region, bucket=gcfg.bucket,
+                                  access_key_env=gcfg.access_key_env, secret_key_env=gcfg.secret_key_env)
+            else:
+                bucket = gcfg.bucket or self.cfg.storage.manifest_bucket
+                config = S3Config.from_storage(self.cfg.storage, bucket=bucket)
+            store = S3Store(config)
             self.__dict__["_corpus_store_obj"] = store
         return store
 
@@ -102,9 +108,120 @@ class _GenerationMixin:
                 ssh_key_path=key, ssh_pubkey=pub.read_text(encoding="utf-8").strip(),
                 vm_image=self.cfg.generation.vm_image,
                 ledger_path=self._generation_vm_ledger(),
-                capacity_wait_s=self.GENERATION_CAPACITY_WAIT_SECONDS)
+                capacity_wait_s=self.GENERATION_CAPACITY_WAIT_SECONDS,
+                observer=self._observe_generation)
             self.__dict__["_generation_stage_obj"] = stage
         return stage
+
+    def _observe_generation(self, event):
+        """Local durable miner telemetry; network/W&B delivery is off this path."""
+        import json
+
+        from ..generation.progress import WandbProgress, atomic_json, public_progress
+
+        doc = public_progress(event)
+        if doc is None or not all(doc.get(k) for k in ("round_id", "hotkey", "generator_ref")):
+            return
+        guard = self.__dict__.setdefault("_generation_progress_guard", threading.RLock())
+        with guard:
+            records = self.__dict__.get("_generation_progress_records")
+            if records is None:
+                try:
+                    records = json.loads((Path(self.work_root) / "generation_progress.json").read_text())
+                    if not isinstance(records, dict):
+                        records = {}
+                except (OSError, ValueError):
+                    records = {}
+                self.__dict__["_generation_progress_records"] = records
+            key = f"{doc['round_id']}:{doc['hotkey']}"
+            prior = records.get(key, {})
+            if not isinstance(prior, dict):
+                prior = {}
+            if prior.get("attempt_id") != doc.get("attempt_id"):
+                if prior and doc["stage"] != "waiting_cpu":
+                    return  # A late reply cannot switch the active CPU attempt.
+                prior = {}
+            # The parent's terminal event wins over late CPU polling replies.
+            if prior.get("stage") in {"ready", "reused", "generator_fault", "infra_fault"}:
+                return
+            binding = getattr(self.__dict__.get("_leg_local_obj"), "funded_progress", None)
+            if binding:
+                doc["submission_attempt_id"] = binding[-1]
+            elif prior.get("attempt_id") == doc.get("attempt_id") and prior.get("submission_attempt_id"):
+                doc["submission_attempt_id"] = prior["submission_attempt_id"]
+            records[key] = {**prior, **doc}
+            while len(records) > 256:
+                records.pop(next(iter(records)))
+            try:
+                atomic_json(Path(self.work_root) / "generation_progress.json", records)
+            except OSError:
+                log.warning("generation progress persistence unavailable")
+            workers = self.__dict__.setdefault("_generation_wandb", {})
+            if key not in workers and getattr(self.cfg.wandb, "enabled", False):
+                workers[key] = WandbProgress(self.cfg.wandb, dict(round_id=doc["round_id"],
+                    hotkey=doc["hotkey"], uid=event.get("uid"), generator_ref=doc["generator_ref"]))
+            worker = workers.get(key)
+            if worker:
+                worker.emit(doc)
+            if doc["stage"] in {"ready", "reused", "generator_fault", "infra_fault"}:
+                workers.pop(key, None)
+
+    def _generation_progress_snapshot(self):
+        import json
+
+        from ..generation.progress import public_progress
+
+        records = self.__dict__.get("_generation_progress_records")
+        if records is None:
+            try:
+                records = json.loads((Path(self.work_root) / "generation_progress.json").read_text())
+            except (OSError, ValueError):
+                records = {}
+        if not isinstance(records, dict):
+            return []
+        return [doc for row in list(records.values())[-256:] if (doc := public_progress(row))]
+
+    def _maintain_generation_storage(self):
+        """Single flight: an upkeep deadline does not cancel a slow S3 copy."""
+        if not self.cfg.generation.enabled:
+            return []
+        guard = self.__dict__.setdefault("_generation_maintenance_guard", threading.Lock())
+        if not guard.acquire(blocking=False):
+            return []
+        try:
+            return self._maintain_generation_storage_locked()
+        finally:
+            guard.release()
+
+    def _maintain_generation_storage_locked(self):
+        """No deletion/publication without an anchored, verified validator receipt."""
+        from ..generation.dataset import read_dataset_index
+        from ..generation.lifecycle import maintain
+        from ..shared.hippius import S3Config, S3Store, receipt_latest_key
+        from ..shared.receipt import load_receipt, verify_receipt_signature
+
+        anchor = self.cfg.manifest.validator_hotkey
+        if not anchor:
+            return []
+        receipt = load_receipt(self.manifest_store().get_text(receipt_latest_key(anchor)))
+        if not verify_receipt_signature(receipt, anchor):
+            log.warning("corpus storage upkeep held: validator receipt signature invalid")
+            return []
+        store = self._corpus_store()
+        # Pending queue entries and unresolved settlements survive restarts.
+        # A metadata cache is not evidence that completed work is still active.
+        keep = set()
+        queue = self._funded_queue()
+        active = {e.hotkey for e in queue.entries() if e.status in {"queued", "in_flight", "in_round"}} if queue else set()
+        keep.update((str(r["round_id"]), r["hotkey"]) for r in read_dataset_index(store, self.cfg.generation.storage_prefix)
+                    if r.get("hotkey") in active)
+        public_store = S3Store(S3Config.from_storage(self.cfg.storage, bucket=self.cfg.storage.manifest_bucket))
+        gone = maintain(store, public_store, receipt, self.cfg.generation, keep=keep)
+        cache = self.__dict__.get("_leg_corpus_cache", {})
+        for key, result in list(cache.items()):
+            if (str(result.row["round_id"]), result.row["hotkey"]) in gone:
+                cache.pop(key, None)
+        return gone
 
     def _generation_vm_ledger(self) -> Path:
         return Path(self.work_root) / self.GENERATION_VM_LEDGER

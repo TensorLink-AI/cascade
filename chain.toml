@@ -1418,6 +1418,14 @@ wind_down_max_eras = 6
 # It serves exactly the legs whose effective contract has corpus_mode =
 # "shards" — on mainnet that is [v2.training], so it goes live with v2.
 [generation]
+shard_encoding = "float32_bss"       # schema 3, lossless float32 + byte-stream split/Zstd
+compression_level = 3
+progress_seconds = 15
+storage_backend = "primary"        # r2 requires explicit bucket/endpoint; see OPERATOR.md
+s3_endpoint = ""
+s3_region = "auto"
+access_key_env = "CORPUS_S3_ACCESS_KEY"
+secret_key_env = "CORPUS_S3_SECRET_KEY"
 enabled            = true          # allowed; it runs only for legs whose contract is "shards"
                                    # ([v2.training] from [v2] from_block), so inert until v2
 providers          = ["targon", "shadeform"]   # preference order; Lium has no CPU VMs
@@ -1431,9 +1439,9 @@ target_points      = 50_000_000_000
 shard_points       = 16_777_216      # ~64 MB float32; a streaming pod holds ~2 per child
 max_length         = 32768
 storage_prefix     = "corpora/"
-bucket             = ""            # "" = [storage] manifest_bucket (private; kings get public-read)
+bucket             = ""            # "" = primary manifest bucket; R2 needs an explicit private bucket
 vm_image           = ""            # provider VM image (Targon: set before go-live)
-retention_days     = 14            # non-king corpora are deleted after this
+retention_days     = 14            # eligible settled non-kings; unresolved/active work is kept
 king_publish       = "recipe"      # "full" | "recipe" (ref + seed + digest + sample shards)
 sample_shards      = 4
 

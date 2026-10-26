@@ -161,3 +161,97 @@ or GPU job was performed. The estimated ~4,900-series pool remains a projection;
 verify the actual eligible count, family coverage, cluster floors and future
 snapshot activation in an authorized rebuild. Production 32-channel GPU
 memory/throughput and signed image/baseline qualification remain outstanding.
+
+
+## CPU generation observability and compressed private storage
+
+- `generation/progress.py`, `tier.py`, `cli.py`, `transfer.py`, `stage.py`:
+  bounded generation/hash/upload counters, scoped progress PUT, nonce-checked
+  polling and parent-owned terminal state. Local snapshots are atomic;
+  W&B and progress uploads run outside the generation work path. Upload
+  observer failures do not change a successful transfer or corpus digest.
+- `trainer/runner_generation.py`, `wandb_sink.py`: durable recent progress,
+  exact queue-attempt bindings where available, restart discovery and a
+  separate CPU W&B run. Late CPU replies cannot overwrite a new attempt or a
+  terminal result. Independent W&B runs use `create_new`, including trainer
+  events, so parallel logging does not close other active runs.
+- `shared/v2_status.py`, `miner/live_status.py`, `submission_status.py`:
+  public counters and CLI generation reports, with independent freshness,
+  historical labels and explicit `generator_ref_only` fallback. A report is
+  observability, never a training verdict or reward record.
+- `generation/shards.py`, `shared/config/generation.py`, `chain.toml`:
+  explicit schema-3 typed float32 byte-stream split plus Zstandard level 3;
+  mainnet opts in. Legacy defaults preserve existing schema-1/2 bytes.
+  Private corpus storage can use an explicit R2 endpoint/bucket and separate
+  environment-named credentials. Mainnet still selects `primary`; no account
+  or bucket was configured or accessed.
+- `generation/dataset.py`, `lifecycle.py`, `trainer/loop.py`:
+  anchored-receipt-bound observed king publication and conservative expiry.
+  King marks precede public copying; failed publication retries safely.
+  Active, crowned and unresolved corpora are retained. Upkeep is single-flight
+  even if the outer deadline expires. This is not complete historical receipt
+  reconciliation or orphan-upload cleanup; unmatched B/C corpora are retained.
+- `pyproject.toml`, `uv.lock`: W&B floor raised to the already locked 0.28
+  release, which supports independent simultaneous runs. Dependency resolution
+  check passed offline; no package versions changed in the lock.
+- `test_generation_observability.py`, `test_generation_storage.py`:
+  lossless bytes/digests/groups, legacy writer equivalence, multiple Arrow
+  batches, exact/stale/historical attempt reporting, scoped polling, observer
+  failure isolation, W&B concurrency, private R2 routing, invalid config,
+  receipt bindings, failed public copies and protected expiry.
+- Operator, architecture, miner and agent entry-point guides explain the
+  storage format, counters, privacy, disk requirement and deployment checks.
+
+### Compression measurements
+
+Local CPU fixtures: 16 series of 32 channels × 8,064 points each (16.5 MB raw),
+three repetitions per method; readback checked exact stored float32 bytes.
+These are local Parquet measurements, not production-VM or end-to-end claims.
+No upload, fsync, training or GPU job was included.
+
+| Fixture | Existing Zstd bytes / raw | Float32 BSS + Zstd bytes / raw | Smaller than existing |
+|---|---:|---:|---:|
+| White noise | 0.924 | 0.856 | 7.4% |
+| Random walk | 0.916 | 0.759 | 17.1% |
+| Trend and seasonality | 0.898 | 0.756 | 15.8% |
+
+Median write times were 0.078–0.106 seconds for legacy and 0.119–0.157
+seconds for BSS; read times 0.029–0.030 versus 0.037–0.051 seconds. Savings
+cost some local CPU time and are generator-dependent. Raw evidence:
+`/tmp/cascade-corpus-compression-benchmark.json` and its adjacent script/log.
+50B float32 points are 200 GB raw. The current CPU path retains the full corpus
+until hashing completes; size local disk with working-space overhead.
+
+### Identity and deployment
+
+No model-source or contract pins moved. Logical corpus digests and float32
+values are identical between encodings; schema-3 Parquet file hashes differ.
+An absent encoding setting still selects the legacy byte-identical writer.
+Rebuild/qualify CPU and GPU reader images before enabling schema 3. A real
+private-bucket upload/readback/retry run and a public W&B access check remain
+unexecuted. Publication and cleanup were tested only with isolated stores and
+synthetic receipts; no live data, keys, provider rentals or paid jobs were used.
+No push or PR was performed.
+
+### Verification for this follow-up
+
+The first complete run reported **1 failed, 4,749 passed, 4 skipped**.
+Failure: `test_backlog_recovery.py::test_cpu_vm_admission_waits_before_provisioning`.
+The completion logger unconditionally read `.index` from a placeholder result
+when observability was disabled. It now reads completion metadata only with
+an observer and catches metric-extraction failures without failing successful
+work. The admission assertions were preserved; a new regression explicitly
+covers unreadable completion metrics. Full original failure output:
+`/tmp/cascade-generation-unit-initial-failure.log`.
+
+Latest focused coverage: **175 passed** in 9.12 seconds, including admission,
+shards, status, storage, W&B and the new failure-isolation case. Log:
+`/tmp/cascade-generation-final-focused.log`. Ruff, docs and offline lock checks
+pass. Final complete suite: **4,754 passed, 4 skipped** (7 existing NVML
+warnings), 454.62 seconds. Command:
+`OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 .venv/bin/python -m pytest tests/unit -q -o tmp_path_retention_policy=failed -o tmp_path_retention_count=1`.
+Full output: `/tmp/cascade-generation-final-unit-all.log`.
+Docs: 19 current guides, 353 CLI snippets, 30 miner commands and 13 console
+entrypoints, 0 issues (`/tmp/cascade-generation-final-docs.log`). Ruff:
+`/tmp/cascade-generation-final-ruff.log`. Offline frozen-lock check:
+`/tmp/cascade-generation-lock-check.log`.

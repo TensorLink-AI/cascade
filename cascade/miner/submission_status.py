@@ -308,6 +308,17 @@ def render_submission(out, view):
     out.info(f"  Status: {safe_text(view['message'])}")
     out.info(f"  Source as of: {safe_text(view['freshness'].get('as_of')) or 'unknown'}; "
              f"{'fresh' if view['freshness']['fresh'] else 'stale/unavailable'}")
+    gen = view.get("generation")
+    if gen:
+        tag = "historical" if gen.get("historical") else ("fresh" if gen["freshness"]["fresh"] else "stale")
+        out.info(f"  Generation report: {safe_text(gen['stage'])} ({tag}; {gen['binding']})")
+        if gen.get("stop_reason"):
+            out.info(f"    Generation stopped: {safe_text(gen['stop_reason'])}")
+        if "points" in gen:
+            out.info(f"    {int(gen['points']):,} / {int(gen.get('target_points', 0)):,} points; "
+                     f"{gen.get('points_per_second', 0):,.0f} points/s")
+        if "stored_bytes" in gen:
+            out.info(f"    Stored shards: {gen['stored_bytes'] / 1e9:.3f} GB")
     obs = view.get("observed") or {}
     if obs:
         funded_age = view.get("elapsed_since_funding_seconds")
@@ -402,3 +413,29 @@ def lane_queue_status(args, lane):
     if not clock["fresh"]:
         return out.fail("submission_status_unavailable", "Queue timestamp missing or stale; update the intake/publisher before relying on it.", NETWORK)
     return OK
+
+
+def generation_view(snapshot, view, *, now, max_age):
+    """A corpus report is not a training completion or a paid verdict."""
+    from ..generation.progress import public_progress
+
+    ref = str(view.get("ref") or "").rsplit("|", 1)[-1]
+    attempt = (view.get("observed") or {}).get("attempt_id")
+    records = snapshot.get("generation_progress")
+    if not isinstance(records, list):
+        return None
+    matches = []
+    for raw in records[-256:]:
+        doc = public_progress(raw)
+        if doc is None or doc.get("hotkey") != view.get("hotkey") or doc.get("generator_ref") != ref:
+            continue
+        bound = doc.get("submission_attempt_id")
+        if bound and bound != attempt:
+            continue
+        matches.append(doc)
+    if not matches:
+        return None
+    doc = max(matches, key=lambda d: datetime.fromisoformat(d["as_of"]))
+    return {**doc, "freshness": freshness(doc, now=now, max_age=max_age),
+            "binding": "submission_attempt" if doc.get("submission_attempt_id") else "generator_ref_only",
+            "historical": doc["stage"] in {"ready", "reused", "generator_fault", "infra_fault"}}

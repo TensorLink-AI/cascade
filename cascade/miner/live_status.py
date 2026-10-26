@@ -99,6 +99,7 @@ def status_snapshot(docs: dict, *, now: datetime, max_age: float) -> dict:
         "golive": comp.get("golive"), "model": comp.get("model"),
         "training_contract": comp.get("training_contract"),
         "compute": comp.get("compute"),
+        "generation_progress": comp.get("generation_progress", []),
         "operations": comp.get("operations"),
         "launch_preflight": comp.get("launch_preflight"),
         "agent_protocol": comp.get("agent_protocol"),
@@ -192,6 +193,9 @@ def cmd_status(args: argparse.Namespace) -> int:
                         view["freshness"]["fresh"] = False
                     queue_ok = queue_ok and view["freshness"]["fresh"] and view["status"] != "unknown"
                     views.append(view)
+                    from .submission_status import generation_view
+
+                    view["generation"] = generation_view(snapshot, view, now=datetime.now(UTC), max_age=args.max_age)
                     render_submission(out, view)
                 snapshot["submissions"] = views
                 snapshot["requested_submission_fresh"] = queue_ok

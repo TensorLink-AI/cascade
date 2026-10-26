@@ -1513,6 +1513,7 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
         from .runner_common import prune_harvest_dirs
 
         for what, fn in (("generation VM reap", self._reap_generation_vms),
+                         ("corpus storage upkeep", self._maintain_generation_storage),
                          ("harvest prune", lambda: prune_harvest_dirs(self.work_root))):
             try:
                 self._with_deadline(fn, self.UPKEEP_DEADLINE_SECONDS)

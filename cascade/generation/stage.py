@@ -279,9 +279,54 @@ class GenerationStage:
     sleep: Callable[[float], None] = field(default=time.sleep, repr=False)
     clock: Callable[[], float] = field(default=time.monotonic, repr=False)
 
+    observer: Callable[[dict], None] | None = field(default=None, repr=False)
+    _events: object = field(default_factory=threading.local, init=False, repr=False)
+
+    def _emit(self, stage, *, identity=None, **metrics):
+        if self.observer is None:
+            return
+        from datetime import UTC, datetime
+
+        identity = identity if identity is not None else getattr(self._events, "identity", {})
+        doc = {"stage": stage, "as_of": datetime.now(UTC).isoformat(), **metrics, **identity}
+        try:
+            self.observer(doc)
+        except Exception:  # noqa: BLE001 — never expose provider exceptions/credentials
+            log.warning("generation observer unavailable")
+
+    def generate(self, **kwargs) -> StageResult:
+        import uuid
+
+        prior = getattr(self._events, "identity", {})
+        self._events.identity = {"round_id": str(kwargs["round_id"]), "hotkey": kwargs["hotkey"],
+                                 "generator_ref": kwargs["gen_ref"], "uid": kwargs["uid"],
+                                 "attempt_id": uuid.uuid4().hex}
+        self._emit("waiting_cpu")
+        try:
+            result = self._generate(**kwargs)
+            if self.observer is not None:
+                try:
+                    idx = result.index
+                    self._emit("ready", points=idx.get("points", 0), n_series=idx.get("n_series", 0),
+                               target_points=self.cfg.generation.target_points,
+                               percent=min(100.0, 100 * idx.get("points", 0) / self.cfg.generation.target_points),
+                               stored_bytes=idx.get("stored_bytes", 0), raw_bytes=idx.get("raw_bytes", 0),
+                               elapsed_seconds=idx.get("wall_seconds", 0), cpu_seconds=idx.get("cpu_seconds", 0),
+                               stop_reason=idx.get("stop_reason", ""),
+                               compression_ratio=idx.get("raw_bytes", 0) / max(1, idx.get("stored_bytes", 0)),
+                               points_per_second=idx.get("points", 0) / max(1e-6, idx.get("wall_seconds", 0)))
+                except Exception:  # noqa: BLE001 — metadata logging cannot fail successful work
+                    log.warning("generation completion metrics unavailable")
+            return result
+        except Exception as exc:
+            self._emit("generator_fault" if isinstance(exc, GenerationFault) else "infra_fault")
+            raise
+        finally:
+            self._events.identity = prior
+
     # ── the stage ────────────────────────────────────────────────────────────
 
-    def generate(self, *, round_id: str, hotkey: str, uid: int | None, era: int | None,
+    def _generate(self, *, round_id: str, hotkey: str, uid: int | None, era: int | None,
                  gen_ref: str, repo_dir: Path | str, seed: int,
                  priority: bool = False) -> StageResult:
         from ..trainer.admission import FairSlots
@@ -365,6 +410,7 @@ class GenerationStage:
                 _LAUNCHING.discard(name)
             log.info("generation %s round=%s: %s %s (%d vCPU, $%.2f/h) → %s", hotkey[:12],
                      round_id, provider.name, shape.type_id, shape.vcpus, shape.price_per_hour, vm)
+            self._emit("booting_cpu")
             host = self._ready_host(provider, vm, name)
             self._bootstrap(host)
             base = leg_prefix(round_id, hotkey, gcfg.storage_prefix)
@@ -485,15 +531,49 @@ class GenerationStage:
             p = Path(tmp) / URLS_NAME
             p.write_text(json.dumps(urls), encoding="utf-8")
             self._copy(host, str(p), f"{gen}/{URLS_NAME}")
+        identity = dict(getattr(self._events, "identity", {}))
+        nonce = identity.get("attempt_id", "")
         cmd = (f"cd {shlex.quote(host.workdir)} && .venv/bin/cascade-generate "
                f"_gen/repo _gen/out --seed {int(seed)} "
                f"--generator-ref {shlex.quote(gen_ref)} "
-               f"--upload-urls _gen/{URLS_NAME} --json")
+               f"--upload-urls _gen/{URLS_NAME} --progress-id {shlex.quote(nonce)} "
+               f"--progress-file _gen/progress.json --json")
         timeout = int(self.cfg.generation.window_seconds + self.upload_slack_s)
+        stop = threading.Event()
+        watcher = None
+        if self.observer is not None and identity:
+            from .progress import PROGRESS_NAME, public_progress
+
+            base = leg_prefix(identity["round_id"], identity["hotkey"], self.cfg.generation.storage_prefix)
+
+            def poll():
+                previous = None
+                while not stop.wait(1):
+                    try:
+                        raw = json.loads(self.store.get_text(base + PROGRESS_NAME))
+                        doc = public_progress(raw)
+                        if (doc and doc.get("attempt_id") == nonce and doc["as_of"] != previous
+                                and not stop.is_set()):
+                            previous = doc["as_of"]
+                            stage = doc.pop("stage")
+                            if stage in {"ready", "reused", "generator_fault", "infra_fault"}:
+                                continue  # Parent verifies the result before any terminal event.
+                            doc.pop("attempt_id", None)
+                            self._emit(stage, identity=identity, **doc)
+                    except Exception:  # noqa: BLE001 — missing/delayed telemetry is not an empty corpus
+                        pass
+                    if stop.wait(max(1, self.cfg.generation.progress_seconds - 1)):
+                        break
+            watcher = threading.Thread(target=poll, daemon=True, name="generation-progress-poll")
+            watcher.start()
         try:
             proc = self.runner(build_ssh_argv(host, cmd), timeout)
         except subprocess.TimeoutExpired as e:
             raise GenerationInfraError(f"cascade-generate on {host.host} timed out") from e
+        finally:
+            stop.set()
+            if watcher:
+                watcher.join(timeout=0.5)
         summary = _last_json(proc.stdout)
         if proc.returncode == EXIT_GENERATOR:
             faults = summary.get("faults") or []

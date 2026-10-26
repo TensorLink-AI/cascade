@@ -26,6 +26,7 @@ watch; credentials come from the environment (``WANDB_API_KEY``), never
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import logging
 import os
@@ -219,7 +220,7 @@ def open_wandb_run(
             tags=[t[:64] for t in tags],
             config=run_config,
             mode=mode,
-            reinit=True,
+            reinit="create_new",
         )
     except Exception as e:  # noqa: BLE001 — never let wandb init abort a round
         log.warning("[wandb] init failed (continuing without wandb): %s", e)
@@ -281,7 +282,7 @@ def log_wandb_event(wcfg: object, *, kind: str, round_id: str, record: dict,
             name=f"{kind}-{rid}" + (f"-{key}" if key else ""), group=rid, job_type=kind,
             tags=[f"event:{kind}", f"round:{rid}", f"lane:{str(lane or 'A').upper()}"],
             config={"event": kind, "round_id": rid, **record},
-            mode=mode, reinit=True,
+            mode=mode, reinit="create_new",
         )
         sink = WandbSink(run)
         sink.emit({"event": kind, **_scalars(record)})
@@ -366,3 +367,31 @@ def log_validator_settlement(wcfg: object, row: dict, *, validator_hotkey: str =
         rec["validator_hotkey"] = validator_hotkey
     return log_wandb_event(wcfg, kind="settlement", round_id=str(row.get("round_id", "")),
                            record=rec, gate="validator_summary", key=validator_hotkey[:16])
+
+
+def open_generation_run(wcfg, *, round_id, hotkey, uid, generator_ref):
+    """One CPU-corpus run, shared by any lanes that reuse this source/seed.
+
+    Runs on the orchestrator only; credentials never go to a generator VM.
+    """
+    if not getattr(wcfg, "enabled", False):
+        return None
+    wandb = _wandb_module(wcfg)
+    if wandb is None:
+        return None
+    try:
+        run = wandb.init(
+            project=getattr(wcfg, "project", "cascade") or "cascade",
+            entity=getattr(wcfg, "entity", "") or None,
+            mode=getattr(wcfg, "mode", "online") or "online",
+            id=wandb_run_id(str(round_id), "cpu-generation", hotkey), resume="allow",
+            name=f"generation-{round_id}-{hotkey[:12]}", group=str(round_id), job_type="generation",
+            tags=["phase:generation", f"hotkey:{hotkey}"[:64]],
+            config=dict(round_id=round_id, miner_hotkey=hotkey, miner_uid=uid,
+                        generator_ref=generator_ref, stage="generation"), reinit="create_new")
+        with contextlib.suppress(Exception):
+            run.define_metric("generation/*", step_metric="generation/elapsed_seconds")
+        return WandbSink(run)
+    except Exception:  # noqa: BLE001 — no backend exception/credential is made public
+        log.warning("generation W&B logging unavailable")
+        return None

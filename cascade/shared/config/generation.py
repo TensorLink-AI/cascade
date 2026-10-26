@@ -20,6 +20,15 @@ KING_CORPUS_PUBLISH = ("full", "recipe")
 class GenerationConfig:
     # Master switch. False ⇒ the tier never rents, generates or stores.
     enabled: bool = False
+    # Explicit storage format: legacy preserves frozen parquet bytes.
+    shard_encoding: str = "legacy"
+    compression_level: int = 3
+    progress_seconds: int = 15
+    storage_backend: str = "primary"  # primary | r2 (private, explicit endpoint/bucket)
+    s3_endpoint: str = ""
+    s3_region: str = "auto"
+    access_key_env: str = "CORPUS_S3_ACCESS_KEY"
+    secret_key_env: str = "CORPUS_S3_SECRET_KEY"
     # CPU providers, preference-ordered. Lium is not one (no CPU executors).
     providers: tuple[str, ...] = GENERATION_PROVIDERS
     # The pinned machine shape every leg gets: vCPUs (the budget unit; the
@@ -38,11 +47,11 @@ class GenerationConfig:
     shard_points: int = 16_777_216
     # Longest series a generator may yield once the tier is live.
     max_length: int = 32768
-    # Hippius S3 prefix of the corpus dataset, and how long non-king corpora
+    # S3 prefix of the private corpus dataset, and how long non-king corpora
     # are kept before deletion.
     storage_prefix: str = "corpora/"
     # The S3 bucket corpora live in ("" = [storage] manifest_bucket); private
-    # by default, a king's published objects carry the public-read ACL.
+    # by default. Verified king copies go to the primary public store.
     bucket: str = ""
     # The provider VM image the tier boots (Targon needs one; Shadeform VM
     # mode uses its own). Bootstrapped over ssh like a bare GPU pod.
@@ -71,6 +80,13 @@ def parse_generation(raw: dict | None) -> GenerationConfig:
         raise ValueError(f"[generation] providers {bad} unknown; expected {GENERATION_PROVIDERS}")
     cfg = GenerationConfig(
         enabled=bool(g.get("enabled", False)),
+        shard_encoding=str(g.get("shard_encoding", "legacy")),
+        compression_level=int(g.get("compression_level", 3)),
+        progress_seconds=int(g.get("progress_seconds", 15)),
+        storage_backend=str(g.get("storage_backend", "primary")),
+        s3_endpoint=str(g.get("s3_endpoint", "")), s3_region=str(g.get("s3_region", "auto")),
+        access_key_env=str(g.get("access_key_env", "CORPUS_S3_ACCESS_KEY")),
+        secret_key_env=str(g.get("secret_key_env", "CORPUS_S3_SECRET_KEY")),
         providers=providers,
         vcpus=int(g.get("vcpus", 32)),
         child_memory_mb=int(g.get("child_memory_mb", 2048)),
@@ -88,6 +104,26 @@ def parse_generation(raw: dict | None) -> GenerationConfig:
         king_publish=str(g.get("king_publish", "recipe")),
         sample_shards=int(g.get("sample_shards", 4)),
     )
+    import re
+    from urllib.parse import urlsplit
+
+    if cfg.shard_encoding not in ("legacy", "float32_bss"):
+        raise ValueError("[generation] shard_encoding must be legacy or float32_bss")
+    if not 1 <= cfg.compression_level <= 9 or not 5 <= cfg.progress_seconds <= 300:
+        raise ValueError("generation compression_level must be 1–9 and progress_seconds 5–300")
+    if cfg.storage_backend not in ("primary", "r2"):
+        raise ValueError("[generation] storage_backend must be primary or r2")
+    if cfg.storage_backend == "r2":
+        endpoint = urlsplit(cfg.s3_endpoint)
+        if (not cfg.bucket or endpoint.scheme != "https" or not endpoint.hostname
+                or endpoint.username is not None or endpoint.password is not None
+                or endpoint.query or endpoint.fragment):
+            raise ValueError("R2 generation storage needs an explicit private bucket and HTTPS s3_endpoint")
+        for name in (cfg.access_key_env, cfg.secret_key_env):
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                raise ValueError("generation credential fields must name environment variables")
+    elif cfg.s3_endpoint:
+        raise ValueError("set generation storage_backend=r2 for an endpoint override")
     if cfg.king_publish not in KING_CORPUS_PUBLISH:
         raise ValueError(f"[generation] king_publish must be one of {KING_CORPUS_PUBLISH}")
     if min(cfg.vcpus, cfg.child_memory_mb, cfg.max_parallel_jobs, cfg.window_seconds,

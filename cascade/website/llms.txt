@@ -353,3 +353,13 @@ Optional generator `groups` labels pack independent channel groups into each
 32-channel yield. Use them only when the effective contract accepts
 `groups`; omission or `None` keeps the values-only path. See the group-packing
 section of the repository docs/INTERFACE.md.
+
+CPU corpus observability: exact-entry `cascade status` includes
+`submissions[].generation` when the deployment publishes it. It distinguishes
+CPU waits, generation, hashing, upload and parent-verified readiness; counters
+include points, series, rate and stored/uploaded bytes. Check its own freshness
+and attempt binding. `generator_ref_only` is source-level evidence, not an
+exact current queue attempt. Optional public W&B runs use `phase:generation`
+and `hotkey:` tags. The corpus store is private (optionally R2); observed kings
+publish the configured recipe/samples or full corpus to the public store.
+No progress or upload state establishes payment.

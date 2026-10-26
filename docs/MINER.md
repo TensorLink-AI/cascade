@@ -582,6 +582,20 @@ acceptance or forward-confirmation stages ([agent walkthrough](AGENT_MINING.md))
    before renting the GPU. The generation window and queue are distinct from
    GPU training; read their effective limits instead of adding a fixed wait to
    every lane. Earlier contracts can stream data during training.
+   To inspect preparation, use the returned tracking command, or
+   `cascade status --hotkey HOTKEY --lane a --ref REF --json`. Its
+   `submissions[].generation` report separates CPU waits, generation, hashing,
+   upload and verified readiness. It includes points, series, points/second,
+   worker counts and stored/uploaded bytes when available. Check the report's
+   own freshness and attempt binding; an old completed corpus is historical
+   evidence, and `generator_ref_only` does not identify the current queue
+   attempt. Shared A/B corpora use the same progress report. MarketCast C
+   currently has no separate CPU-corpus generation or W&B run.
+   If the operator enables a public W&B project, filter `phase:generation`
+   and your `hotkey:` for CPU preparation metrics, separately from training.
+   Generated corpora are private; only an observed king's configured recipe
+   and samples (or full corpus) are published. Storage uses lossless float32
+   compression. Preparation completion is not a forecast verdict or payment.
 3. **Training and harvest.** The worker uses the pinned era contract, init and
    seeds on the payer's pod, under the applicable point budget and wall. The
    orchestrator checks and uploads the checkpoint. A stage labelled

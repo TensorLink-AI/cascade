@@ -131,6 +131,8 @@ class _Child:
         self.budget = budget
         self.shards: list[dict] = []
         self.points = 0
+        self.n_series = 0
+        self.stored_bytes = 0
         self.stop_reason = ""
         self.fault: dict | None = None
         self.lengths: Counter = Counter()      # pow2 length bucket → series
@@ -140,7 +142,7 @@ class _Child:
 def _run_child(child: _Child, *, repo: Path, cfg: GeneratorConfig, n_children: int,
                out_dir: Path, shard_points: int, deadline: float, max_wall: int,
                runner: ChildRunner, stop: threading.Event, pin: bool,
-               now: Callable[[], float]) -> None:
+               now: Callable[[], float], encoding: str = "legacy", compression_level: int = 3) -> None:
     buf: list[np.ndarray] = []
     buf_points = 0
 
@@ -148,7 +150,8 @@ def _run_child(child: _Child, *, repo: Path, cfg: GeneratorConfig, n_children: i
         nonlocal buf, buf_points
         if buf:
             name = f"c{child.index}-{len(child.shards):05d}.parquet"
-            child.shards.append(write_shard(out_dir / name, buf))
+            child.shards.append(write_shard(out_dir / name, buf, encoding=encoding, compression_level=compression_level))
+            child.stored_bytes += (out_dir / name).stat().st_size
             buf, buf_points = [], 0
 
     try:
@@ -169,6 +172,7 @@ def _run_child(child: _Child, *, repo: Path, cfg: GeneratorConfig, n_children: i
                 buf.append(element if isinstance(element, dict) else a)
                 buf_points += int(a.size)
                 child.points += int(a.size)
+                child.n_series += 1
                 if buf_points >= shard_points:
                     flush()
                 if child.points >= child.budget:
@@ -217,6 +221,7 @@ def generate_corpus(
     out_dir: Path | str, *, deadline_s: float | None = None, use_sandbox: bool = True,
     runner: ChildRunner | None = None, generator_ref: str = "",
     now: Callable[[], float] = time.monotonic,
+    progress: Callable[[dict], None] | None = None,
 ) -> dict:
     """Generate one leg's corpus into ``out_dir`` and return its index
     (``corpus.json`` plus ``faults`` and ``stop_reason``).
@@ -244,12 +249,44 @@ def generate_corpus(
         kwargs=dict(repo=repo, cfg=child_cfg, n_children=n, out_dir=out,
                     shard_points=gcfg.shard_points, deadline=deadline,
                     max_wall=int(window), runner=run, stop=stop,
-                    pin=runner is None and use_sandbox, now=now),
+                    pin=runner is None and use_sandbox, now=now, encoding=gcfg.shard_encoding,
+                    compression_level=gcfg.compression_level),
     ) for c in children]
+    def report(stage):
+        if progress is None:
+            return
+        elapsed = max(0.0, time.monotonic() - wall0)
+        points = sum(c.points for c in children)
+        stored = sum(c.stored_bytes for c in children)
+        doc = dict(stage=stage, points=points, target_points=gcfg.target_points,
+                   n_series=sum(c.n_series for c in children), elapsed_seconds=round(elapsed, 3),
+                   points_per_second=points / max(elapsed, 1e-6),
+                   active_workers=sum(t.is_alive() for t in threads), workers=n,
+                   shards=sum(len(c.shards) for c in children), stored_bytes=stored,
+                   raw_bytes=points * 4,
+                   compression_ratio=(sum(sh["points"] for c in children for sh in c.shards) * 4 / stored
+                                      if stored else 0.0),
+                   percent=min(100.0, 100 * points / max(1, gcfg.target_points)))
+        try:
+            progress(doc)
+        except Exception:  # noqa: BLE001 — logging cannot change corpus admission
+            log.warning("generation progress observer unavailable")
+
+    report("generating")
     for t in threads:
         t.start()
-    for t in threads:
-        t.join()
+    if progress is None:
+        for t in threads:
+            t.join()
+    else:
+        last = time.monotonic()
+        while any(t.is_alive() for t in threads):
+            for t in threads:
+                t.join(timeout=0.1)
+            if time.monotonic() - last >= gcfg.progress_seconds:
+                report("generating")
+                last = time.monotonic()
+    report("hashing")
     faults = [{"child": c.index, **c.fault} for c in children if c.fault]
     reasons = {c.stop_reason for c in children}
     if not faults and not any(c.points for c in children):
@@ -282,6 +319,9 @@ def generate_corpus(
         "length_histogram": _merge(c.lengths for c in children),
         "channels_histogram": _merge(c.channels for c in children),
         "cascade_version": __version__,
+        "stored_bytes": sum(c.stored_bytes for c in children),
+        "raw_bytes": sum(c.points for c in children) * 4,
+        "shard_encoding": gcfg.shard_encoding,
     }
     kids = [{"index": c.index, "seed": c.seed, "stop_reason": c.stop_reason,
              "shards": c.shards} for c in children]

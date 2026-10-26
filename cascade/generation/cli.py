@@ -35,6 +35,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--upload-urls", type=Path, default=None,
                    help="JSON {name: pre-signed PUT link}: upload every shard, then "
                         "corpus.json, deleting each local file once it is up")
+    p.add_argument("--progress-id", default="", help="Operator attempt identity for progress.")
+    p.add_argument("--progress-file", type=Path, default=None, help="Atomic local progress JSON file.")
     p.add_argument("--json", action="store_true", help="print only the JSON summary")
     return p
 
@@ -72,30 +74,41 @@ def main(argv: list[str] | None = None) -> int:
     gen_cfg = cfg.generator_for_contract(contract)
     if not args.no_sandbox:
         gen_cfg = replace(gen_cfg, sandbox_strict=True)
-    idx = generate_corpus(
-        args.repo_dir, args.seed, gen_cfg, cfg.generation, args.out_dir,
-        deadline_s=args.window_seconds, use_sandbox=not args.no_sandbox,
-        generator_ref=args.generator_ref,
-    )
-    summary = {k: idx.get(k) for k in (
-        "corpus_digest", "n_series", "points", "stop_reason", "faults",
-        "cpu_seconds", "wall_seconds", "cpu_model", "n_children")}
-    summary["ok"] = not idx["faults"]
-    if idx["faults"]:
-        print(json.dumps(summary, sort_keys=True))
-        return EXIT_GENERATOR if idx["stop_reason"] == "generator_fault" else EXIT_INFRA
-    if args.upload_urls is not None:
-        try:
-            summary["uploaded"] = upload_corpus_dir(args.out_dir, idx, args.upload_urls)
-        except Exception as e:  # noqa: BLE001 — a failed upload is the machine's, never the miner's
-            summary.update(ok=False, error=f"upload: {type(e).__name__}: {e}"[:500])
+    from .progress import PROGRESS_NAME, CpuProgress
+
+    urls = json.loads(args.upload_urls.read_text()) if args.upload_urls else {}
+    progress = CpuProgress(args.progress_file or args.out_dir / PROGRESS_NAME,
+                           attempt_id=args.progress_id, url=urls.get(PROGRESS_NAME))
+    try:
+        idx = generate_corpus(
+            args.repo_dir, args.seed, gen_cfg, cfg.generation, args.out_dir,
+            deadline_s=args.window_seconds, use_sandbox=not args.no_sandbox,
+            generator_ref=args.generator_ref, progress=progress)
+        summary = {k: idx.get(k) for k in (
+            "corpus_digest", "n_series", "points", "stop_reason", "faults",
+            "cpu_seconds", "wall_seconds", "cpu_model", "n_children", "stored_bytes", "raw_bytes", "shard_encoding")}
+        summary["ok"] = not idx["faults"]
+        if idx["faults"]:
+            progress({"stage": "generator_fault" if idx["stop_reason"] == "generator_fault" else "infra_fault"})
             print(json.dumps(summary, sort_keys=True))
-            return EXIT_INFRA
-    print(json.dumps(summary, sort_keys=True))
-    return EXIT_OK
+            return EXIT_GENERATOR if idx["stop_reason"] == "generator_fault" else EXIT_INFRA
+        if args.upload_urls is not None:
+            try:
+                progress({"stage": "uploading"})
+                summary["uploaded"] = upload_corpus_dir(args.out_dir, idx, args.upload_urls, progress=progress)
+            except Exception as exc:  # noqa: BLE001 — upload is infrastructure, not a miner failure
+                progress({"stage": "infra_fault"})
+                summary.update(ok=False, error=f"upload: {type(exc).__name__}")
+                print(json.dumps(summary, sort_keys=True))
+                return EXIT_INFRA
+        progress({"stage": "uploaded"})  # The orchestrator still verifies/registers the corpus.
+        print(json.dumps(summary, sort_keys=True))
+        return EXIT_OK
+    finally:
+        progress.close()
 
 
-def upload_corpus_dir(out_dir: Path, index: dict, urls_path: Path, *, workers: int = 8) -> int:
+def upload_corpus_dir(out_dir: Path, index: dict, urls_path: Path, *, workers: int = 8, progress=None) -> int:
     """Upload every shard ``index`` lists through its pre-signed link (in
     parallel), then ``corpus.json`` last, so a reader never sees an index
     whose shards are not all in place. Each local shard is deleted once up.
@@ -111,13 +124,24 @@ def upload_corpus_dir(out_dir: Path, index: dict, urls_path: Path, *, workers: i
     if missing:
         raise RuntimeError(f"no upload link for {missing[:3]} (+{max(0, len(missing) - 3)})")
 
-    def one(name: str) -> None:
+    total_bytes = sum((out_dir / n).stat().st_size for n in names)
+    uploaded_bytes = 0
+
+    def one(name: str) -> int:
+        size = (out_dir / name).stat().st_size
         put_file(urls[name], out_dir / name)
         (out_dir / name).unlink(missing_ok=True)
+        return size
 
     with cf.ThreadPoolExecutor(max_workers=workers) as ex:
-        for f in [ex.submit(one, n) for n in names]:
-            f.result()
+        for count, future in enumerate(cf.as_completed([ex.submit(one, n) for n in names]), 1):
+            uploaded_bytes += future.result()
+            if progress:
+                try:
+                    progress(dict(stage="uploading", uploaded_shards=count, upload_total_shards=len(names),
+                                  uploaded_bytes=uploaded_bytes, upload_total_bytes=total_bytes))
+                except Exception:  # noqa: BLE001 — logging cannot fail an otherwise successful upload
+                    logging.getLogger(__name__).warning("upload progress observer unavailable")
     put_file(urls[INDEX_NAME], out_dir / INDEX_NAME)
     return len(names) + 1
 

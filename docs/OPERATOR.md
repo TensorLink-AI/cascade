@@ -108,7 +108,7 @@ edited `chain.toml` before shipping it.
    Keep the measured configuration and its image pinned before deployment.
 5. **CPU generation tier** (DEC-CA-0053, rides `[v2.training] corpus_mode =
    "shards"`): set `[generation] vm_image` (empty in both TOMLs), verify
-   Hippius pre-signed URLs, run one testnet leg end to end. Each leg gets
+   private corpus-store pre-signed URLs, run one testnet leg end to end. Each leg gets
    32 vCPUs for up to 90 minutes (`window_seconds = 5400`), stopping earlier
    at 50B points. Provisioning, digest finalization and upload add time
    outside that generation window. This is operator-side configuration;
@@ -1636,6 +1636,91 @@ fields these writers emit. Verify:
 same lane rows from the receipt index: the lane-A ladder share / court / key
 slash / king check, lane-B and lane-C verdict counts and paid slots, and the
 emission split.
+
+### CPU generation progress and corpus storage
+
+For shard-mode A/B legs, CPU preparation finishes before GPU rental. Miners
+can inspect `generation_progress` in `cascade status --json`, or the matched
+`submissions[].generation` report with `--hotkey` and `--ref`. It reports CPU
+capacity/boot waits, generation, hashing, upload and the parent-verified ready
+state, with generated points, series, rate, workers and stored/uploaded bytes.
+CPU counters refresh at `[generation] progress_seconds` (15 by default); public
+status publication adds its own interval. Each report has its own `as_of`.
+A fresh status feed does not make an old generation report fresh.
+
+`[wandb] enabled = true` also opens a separate `job_type=generation` run,
+tagged `phase:generation` and `hotkey:<address>`. The orchestrator logs
+`generation/*` counters, stage, final CPU seconds and stop reason. A retry
+resumes the source/seed job's run; its elapsed-time counter can restart. This
+run is shared when A/B reuse a corpus and does not claim a lane-specific
+training result. Independent W&B runs use `reinit="create_new"` so a second
+generation or trainer event cannot close the first. Use the locked W&B extra
+(version 0.28 or newer) and configure a public project for
+miner access. W&B outages do not fail generation. The CPU VM gets only a
+scoped progress-object PUT link; no W&B or corpus-store account key is sent
+to the generator. Final corpus metadata remains in `meta.json` even with
+W&B disabled. Reports without a queue-attempt binding are explicitly marked
+`generator_ref_only`; neither counters nor a completed upload prove a reward.
+
+Private storage defaults to `[storage] manifest_bucket` on the primary S3
+service. To use R2, pre-create a private bucket and set these fields within
+`[generation]` (the checked-in mainnet config still uses `primary`):
+
+```toml
+storage_backend = "r2"
+bucket = "cascade-private-corpora"
+s3_endpoint = "https://<account-id>.r2.cloudflarestorage.com"
+s3_region = "auto"
+access_key_env = "CORPUS_S3_ACCESS_KEY"
+secret_key_env = "CORPUS_S3_SECRET_KEY"
+shard_encoding = "float32_bss"
+compression_level = 3
+progress_seconds = 15
+```
+
+Supply those two environment variables to the orchestrator using the normal
+secret-management path. Values never belong in TOML or CLI arguments. R2
+requires an explicit HTTPS endpoint and bucket; a bad configuration fails
+instead of silently selecting another account. Other manifests, receipts and
+checkpoints keep their existing storage configuration. Select the corpus
+backend before starting work. Changing a live corpus bucket requires a drained
+queue or a verified migration of its index and objects; the setting does not
+migrate existing corpora or refresh already dispatched links.
+
+Objects live under `corpora/round-<seed-and-source-id>/<hotkey>/`: Parquet
+shards, `corpus.json`, `meta.json` and the latest `progress.json`.
+`corpora/index.json` holds per-corpus identities and observed settlement
+outcomes. The path's round identifier is a generation-seed/source identity,
+not necessarily the settlement round number. GPU workers receive scoped GET
+links, verify shard hashes and remove downloaded shards after use. CPU VMs
+currently retain the full local corpus through the final digest pass, then
+upload shards and the index last. Size CPU disk for the whole corpus:
+50B float32 points are 200 GB before compression, plus working space.
+Compression savings depend on the generator; allow for poorly compressible
+data. Provisioning, hashing and uploading are outside the 90-minute window.
+
+Mainnet explicitly selects `float32_bss`: schema 3 stores typed float32 lists
+with Parquet byte-stream split and Zstandard. It preserves the exact stored
+float32 values, optional group labels and logical corpus digest; file hashes
+and Parquet bytes change. Legacy encoding remains the default for absent
+settings and preserves schema-1/2 bytes, including `groups=None`. Neither
+format changes model-source pins or the training contract digest. CPU and GPU
+reader images must include schema-3 support before enabling it; old images
+must not receive these corpora. Qualify upload, readback, digest and recovery
+against the actual private R2 bucket before launch.
+
+Periodic upkeep verifies the configured main validator's anchored receipt
+before recording an A settlement or publishing a king corpus. The default
+publishes its recipe and four sample shards to the primary public store,
+never by making the R2 bucket public. An observed king is durably marked
+before copying, so a failed public upload cannot make it eligible for expiry.
+Completed non-kings become eligible after `retention_days = 14`; current
+queued/in-flight entries, crowned corpora and unresolved/unmatched outcomes
+are retained. Upkeep consumes the latest anchored receipt, so a missed older
+settlement can remain unresolved and retained. B/C-only corpora without a
+matched A receipt also remain retained. Unindexed partial uploads require
+operator reconciliation; this is not an orphan-object sweeper. Invalid or
+unavailable receipts hold maintenance rather than authorizing deletion.
 
 ### Live training on W&B (lanes, tags, events)
 

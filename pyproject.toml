@@ -74,7 +74,7 @@ deploy = [
 # the trainer mirrors its per-step S3 log into a wandb run so miners can watch
 # training as it occurs. Off unless [wandb] enabled = true in chain.toml.
 wandb = [
-    "wandb>=0.17",
+    "wandb>=0.28",
 ]
 # MarketCast (DEC-CA-0064): the Timestral inference library the MAIN
 # validator (GPU scoring) and MarketCast training pods load the pinned
