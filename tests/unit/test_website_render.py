@@ -264,7 +264,7 @@ def test_testnet_live_lane_b(tmp_path):
     fx = _bucket(v2_from=1000, block=50_000, lane_b=True)
     els = _render("index.html", fx, "testnet.casdesub.net", INDEX_CALLS, tmp_path)
     assert _html(els, "v2-state") == "v2 live"
-    assert _html(els, "base-arch") == "Cascade-MoE-28M"
+    assert _html(els, "base-arch") == "Cascade MoE Base - 191.5M"
     split = _html(els, "v2-split")
     assert "lane A 50%" in split and "lane B 35%" in split and "burn 15%" in split
     gate = _html(els, "lb-gate")

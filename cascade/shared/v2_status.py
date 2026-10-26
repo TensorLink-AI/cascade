@@ -1,5 +1,5 @@
 """``status/v2.json`` — the dashboards' live view of the v2 competition
-(DEC-CA-0050): the Cascade-MoE-28M lane-A lineage and the domain-expert
+(DEC-CA-0050): the Cascade MoE Base lane-A lineage and the domain-expert
 lane B.
 
 Unsigned and PRESENTATIONAL, like ``status/chain.json`` and the funded roster:
@@ -35,6 +35,8 @@ import time
 from dataclasses import asdict, is_dataclass
 from datetime import UTC, datetime
 
+from .model_names import MOE_FAMILY_NAME, moe_display_name
+
 log = logging.getLogger("cascade.shared.v2_status")
 
 V2_STATUS_KEY = "status/v2.json"
@@ -44,7 +46,7 @@ HISTORY_MAX = 96          # routing-saturation rows kept in the public doc
 OUTCOMES_MAX = 24         # dropped legs kept per domain
 MIN_INTERVAL_S = 60.0     # leave headroom below the CLI's 180-second freshness limit
 
-MODEL_NAME = "Cascade-MoE-28M"
+MODEL_NAME = MOE_FAMILY_NAME
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -141,7 +143,8 @@ def moe_model_card(contract=None) -> dict:
             with torch.device("meta"):
                 model = CascadeMoEModel(config)
             counts = param_counts(model)
-            return {"name": contract.arch_preset, "total_params": counts["total"],
+            return {"name": moe_display_name(counts["total"]), "preset": contract.arch_preset,
+                    "total_params": counts["total"],
                     "active_params": counts["active"], "num_experts": config.num_experts,
                     "experts_per_layer": list(config.experts_per_layer),
                     "top_k": config.top_k, "moe_blocks": list(config.moe_blocks),
@@ -160,7 +163,7 @@ def moe_model_card(contract=None) -> dict:
         with torch.device("meta"):
             model = CascadeMoEModel(mc)
         pc = param_counts(model)
-        _PARAMS_CACHE = {"name": MODEL_NAME, "total_params": int(pc["total"]),
+        _PARAMS_CACHE = {"name": moe_display_name(int(pc["total"])), "total_params": int(pc["total"]),
                          "active_params": int(pc["active"]), "num_experts": mc.num_experts,
                          "top_k": mc.top_k, "moe_blocks": list(mc.moe_blocks),
                          "num_layers": mc.num_layers}

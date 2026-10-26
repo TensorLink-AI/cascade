@@ -1,6 +1,6 @@
-# Pyramid MoE model and training recipe
+# Cascade MoE Base: model and training recipe
 
-Cascade v2's new candidate is a sparse forecasting model with 1.234B total
+**Cascade MoE Base - 1.23B** is the v2 candidate, with 1.234B total
 parameters and 111.65M active per token. Smaller variants share its structure so
 miners can test generators with less local compute. Architecture availability
 and deployment readiness are separate: consult fresh `cascade status --json`.
@@ -9,13 +9,14 @@ qualification before this candidate can run live.
 
 ## Sizes
 
-| Nominal size | Width / heads | Dense FFN | Expert / shared hidden | Total parameters | Active per token |
+| Model (total parameters) | Width / heads | Dense FFN | Expert / shared hidden | Total parameters | Active per token |
 |---|---|---:|---|---:|---:|
-| 2M | 128 / 2 | 276 | 23 / 92 | 17,528,416 | 2,031,200 |
-| 7M | 256 / 4 | 552 | 46 / 184 | 68,919,520 | 6,930,656 |
-| 28M | 512 / 8 | 1,104 | 92 / 368 | 273,642,976 | 25,687,520 |
-| 120M | 1,088 / 17 | 2,346 | 196 / 784 | 1,234,189,344 | 111,651,872 |
+| Cascade MoE Base - 17.53M | 128 / 2 | 276 | 23 / 92 | 17,528,416 | 2,031,200 |
+| Cascade MoE Base - 68.92M | 256 / 4 | 552 | 46 / 184 | 68,919,520 | 6,930,656 |
+| Cascade MoE Base - 273.64M | 512 / 8 | 1,104 | 92 / 368 | 273,642,976 | 25,687,520 |
+| Cascade MoE Base - 1.23B | 1,088 / 17 | 2,346 | 196 / 784 | 1,234,189,344 | 111,651,872 |
 
+Model names use total parameter counts, rounded in millions (M) or billions (B).
 These counts include routers, shared experts and output heads. Active counts
 subtract the unselected routed expert matrices; they are not GPU memory
 estimates. [Preset instructions](../deploy/presets/README.md) explain smaller-model
@@ -119,7 +120,7 @@ end earlier; metrics distinguish incomplete training, exhaustion and a deadline.
 Mainnet keeps the existing 50B CPU corpus cap and therefore uses at most 23,841
 updates (49,998,200,832 points at the reference geometry), with an 80-update warmup
 and a final linear cooldown. Local presets retain the full 27,500-update research
-recipe. Testnet uses 16 updates on 2M. Shorter local `--train-hours` runs scale the
+recipe. Testnet uses 16 updates on Cascade MoE Base - 17.53M. Shorter local `--train-hours` runs scale the
 explicit update budget and schedule.
 
 The marginal objective is ten times the mean pinball loss, summed over all nine

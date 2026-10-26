@@ -14,9 +14,9 @@ rules the king normally funds its own leg too; failed-key recovery, configured
 make-good capacity and validator evaluation use operator resources. The scheduler is
 rolling intake + era king (DEC-CA-0043, `cascade/trainer/rolling.py`).
 
-The [implemented ladder](../deploy/presets/README.md) supplies 2M, 7M, 28M and
-120M active-parameter variants. `[v2.training]` selects 120M on mainnet and 2M
-for short testnet runs. The older 28M candidate remains available for replay.
+The [implemented ladder](../deploy/presets/README.md) supplies Cascade MoE Base variants at 17.53M,
+68.92M, 273.64M and 1.23B total parameters. `[v2.training]` selects 1.23B on mainnet and 17.53M
+for short testnet runs. The older flat-expert candidate remains available for replay.
 The new source uses an explicit update budget; it does not assume a measured
 GPU rate. Qualify the worker image, CPU generation image, baseline generator,
 GPU memory/throughput and full benchmark pipeline before activation. 56M
@@ -102,7 +102,7 @@ edited `chain.toml` before shipping it.
    `cascade-benchmark-download` and `[eval] gift_gate_data_dir`.
 4. **Hardware qualification.** The pyramid contract uses explicit
    `training_steps`; `ref_throughput_tokens_per_s = 0` means unmeasured, not
-   zero work. Measure the 120M port on the intended GPU, including accumulation,
+   zero work. Measure the 1.23B port on the intended GPU, including accumulation,
    full-batch gradients, checkpoint I/O and the four public suites. The research
    run's four-GPU expert parallelism is not a feature of this single-device port.
    Keep the measured configuration and its image pinned before deployment.

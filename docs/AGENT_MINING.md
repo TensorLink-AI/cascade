@@ -73,12 +73,12 @@ Older deployments without the contract feed cannot run `--warm-start live`
 through the new scoring flow. Explicit offline comparisons can use a local
 checkpoint and `--at-block BLOCK` with the appropriate checked-out configuration.
 
-For cheaper generator experiments, use the implemented 2M, 7M or 28M
-active-parameter model. From the checkout, generate a complete local config:
+For cheaper generator experiments, use Cascade MoE Base - 17.53M, 68.92M or
+273.64M. Model names use total parameters. From the checkout, generate a complete local config:
 
 ```bash
-python scripts/pyramid_config.py --size 2m --out ./chain.local-2m.toml
-cascade iterate ./my-a --chain-toml ./chain.local-2m.toml --pool-dir ./heldout --seeds 0,1 --train-hours 0.01 --work-dir ./.cascade-2m --json
+python scripts/pyramid_config.py --size 17.53m --out ./chain.local-17m.toml
+cascade iterate ./my-a --chain-toml ./chain.local-17m.toml --pool-dir ./heldout --seeds 0,1 --train-hours 0.01 --work-dir ./.cascade-17m --json
 ```
 
 Use your installed Python environment. See [preset instructions](../deploy/presets/README.md)

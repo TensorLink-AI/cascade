@@ -24,8 +24,8 @@ A/B contributions can accumulate in a shared forecasting model lineage. C is a
 separate application competition, currently MarketCast on a pinned Timestral
 base. Its checkpoints do not merge into A/B.
 
-Pre-v2 eras use the Toto2 lineage; the v2 candidate is `cascade-moe-v2-120m`
-under `[v2.training]`. It starts a fresh lineage at an era boundary. Historical
+Pre-v2 eras use the Toto2 lineage; the v2 candidate is Cascade MoE Base - 1.23B
+(`cascade-moe-v2-120m`) under `[v2.training]`. It starts a fresh lineage at an era boundary. Historical
 `moe_model.py` and `toto2_model.py` bytes remain unchanged for replay. The separate
 direct runtime retains its own architecture contract.
 
@@ -39,8 +39,8 @@ Python files, configuration and tensor geometry before execution.
 miner experiments. New update budgets are digest-bound; their default zero
 leaves historical contract digests unchanged.
 
-The [model specification](MODEL.md) describes the implemented 2M, 7M, 28M and
-120M ladder. [Preset instructions](../deploy/presets/README.md) cover complete
+The [model specification](MODEL.md) describes Cascade MoE Base variants at 17.53M,
+68.92M, 273.64M and 1.23B total parameters. [Preset instructions](../deploy/presets/README.md) cover complete
 local configs. A 56M identity stays blocked. Lane B resolves trusted checkpoint
 code before loading, counts each layer's actual experts, and uses compact
 trainable rows without changing the frozen weights. Routing matrices pad shorter

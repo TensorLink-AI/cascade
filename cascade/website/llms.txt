@@ -115,11 +115,12 @@ chain evidence for payouts. For A use `cascade duel --hotkey HOTKEY --history --
 ## Competitions
 
 For cheaper generator optimization, use `cascade score` or `cascade iterate`
-on the implemented 2M, 7M or 28M active-parameter variants. The 120M candidate
+on Cascade MoE Base - 17.53M, 68.92M or 273.64M. Model names use total parameters.
+Cascade MoE Base - 1.23B
 has 1,234,189,344 total / 111,651,872 active parameters. 56M remains unspecified.
 See the [presets](https://github.com/TensorLink-AI/cascade/blob/cascade-v2/deploy/presets/README.md)
 and [model recipe](https://github.com/TensorLink-AI/cascade/blob/cascade-v2/docs/MODEL.md).
-From the checkout, `python scripts/pyramid_config.py --size 2m --out ./chain.local-2m.toml`
+From the checkout, `python scripts/pyramid_config.py --size 17.53m --out ./chain.local-17m.toml`
 writes a complete local config. Pass it with `--chain-toml`, keeping both sides'
 model, budget, seeds, pool and compatible init identical. Use separate histories
 per model. GPU performance is unmeasured for this port. Omit `--warm-start live`

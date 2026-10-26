@@ -1,15 +1,15 @@
 # Model presets
 
-The implemented pyramid ladder has four variants. “2M”, “7M”, “28M” and “120M”
-are size labels; exact active counts are below. Each routes to 8 experts per
+**Cascade MoE Base** has four variants, named by total parameters in M/B.
+Exact total and active counts are listed separately. Each routes to 8 experts per
 MoE layer, with 128 / 256 / 256 / 512 / 512 / 512 / 512 experts across the layers.
 
-| Size | Total parameters | Active per token | Training fragment |
+| Model | Total parameters | Active per token | CLI size / training fragment |
 |---|---:|---:|---|
-| 2M | 17,528,416 | 2,031,200 | [2M](cascade-moe-v2-2m.toml) |
-| 7M | 68,919,520 | 6,930,656 | [7M](cascade-moe-v2-7m.toml) |
-| 28M | 273,642,976 | 25,687,520 | [28M](cascade-moe-v2-28m.toml) |
-| 120M | 1,234,189,344 | 111,651,872 | [120M](cascade-moe-v2-120m.toml) |
+| Cascade MoE Base - 17.53M | 17,528,416 | 2,031,200 | [`17.53m`](cascade-moe-v2-2m.toml) |
+| Cascade MoE Base - 68.92M | 68,919,520 | 6,930,656 | [`68.92m`](cascade-moe-v2-7m.toml) |
+| Cascade MoE Base - 273.64M | 273,642,976 | 25,687,520 | [`273.64m`](cascade-moe-v2-28m.toml) |
+| Cascade MoE Base - 1.23B | 1,234,189,344 | 111,651,872 | [`1.23b`](cascade-moe-v2-120m.toml) |
 
 Parameter counts match the supplied architecture. GPU memory and speed are
 unmeasured for this port. Smaller variants offer local experiments with fewer
@@ -19,9 +19,12 @@ The 56M variant has no supplied definition and stays [blocked](pending/cascade-m
 From the checkout, create a **complete** local configuration:
 
 ```bash
-python scripts/pyramid_config.py --size 2m --out ./chain.local-2m.toml
-cascade iterate ./my-gen --chain-toml ./chain.local-2m.toml --pool-dir ./heldout --seeds 0,1 --train-hours 0.01 --work-dir ./.cascade-2m --json
+python scripts/pyramid_config.py --size 17.53m --out ./chain.local-17m.toml
+cascade iterate ./my-gen --chain-toml ./chain.local-17m.toml --pool-dir ./heldout --seeds 0,1 --train-hours 0.01 --work-dir ./.cascade-17m --json
 ```
+
+The earlier `2m`, `7m`, `28m` and `120m` CLI aliases still select the same
+presets. Stored contract IDs and filenames retain those aliases.
 
 Use the installed Python environment; the command refuses to overwrite a file.
 The configuration has no dated activation, network overlay or runtime image pin
@@ -38,5 +41,5 @@ gain on a smaller model does not establish a live win.
 The [model specification](../../docs/MODEL.md) covers the architecture and
 training recipe. The machine-readable [ladder](pyramid-ladder.json) preserves
 the supplied four-size design. Its research scores are source-run observations,
-not results measured from this port. The historical [old 28M preset](cascade-moe-28m.toml)
+not results measured from this port. The historical [flat-expert preset](cascade-moe-28m.toml)
 and old model source remain available for checkpoint replay.

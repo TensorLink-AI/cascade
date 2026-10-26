@@ -2343,7 +2343,7 @@ function renderWarmHistory(){
     '<tbody>'+rows+'</tbody></table></div>';
 }
 function renderAll(){ renderStatus(); renderHeader(); renderV2Strip(); renderVerdict(); renderCohort(); renderChart(); renderReigns(); renderField(); renderHeat(); renderWarm(); renderRounds(); renderCountdown(); renderStage(); renderSubs(); renderLaneALadder(); if(_page==="laneb") renderLaneB(); if(_page==="lanec") renderLaneC(); }
-// ── v2 (DEC-CA-0050): Cascade-MoE-28M + the domain-expert lane ──────────────
+// ── v2 (DEC-CA-0050): Cascade MoE Base + the domain-expert lane ──────────────
 // status/v2.json is the trainer's unsigned, presentational view (go-live
 // state, lane-B driver state, the king's routing health; built by
 // cascade.shared.v2_status). Everything consensus-relevant — the lane-B
@@ -2355,7 +2355,8 @@ var _v2 = null, _satMetric = "overlap";
 var EXPERT_COMMIT_PREFIX = "metro-v1:expert:";
 function v2Golive(){ return (_v2&&_v2.golive)||null; }
 function v2IsLive(){ var g=v2Golive(); return !!(g&&g.state==="live"); }
-function fmtParams(n){ if(n==null||!isFinite(n)) return "--"; return n>=1e9?(n/1e9).toFixed(1)+"B":(n>=1e6?Math.round(n/1e6)+"M":String(n)); }
+function fmtParams(n){ return validSize(n)?parameterLabel(n):"--"; }
+function cascadeMoEName(mc){ return "Cascade MoE Base"+(mc&&validSize(mc.total_params)?" - "+parameterLabel(mc.total_params):""); }
 // The go-live block's distance from the chain clock (the status doc's own
 // block when the validator feed is not loaded).
 function v2EtaSecs(fb){
@@ -2419,8 +2420,8 @@ function renderV2Strip(){
   var st=document.getElementById("v2-state"), body=document.getElementById("v2-body"), sp=document.getElementById("v2-split");
   if(!st) return;
   var g=v2Golive(), mc=(_v2&&_v2.model)||{}, model=mc.total_params?
-    '<b>'+esc(mc.name||"Cascade-MoE-28M")+'</b> &middot; '+fmtParams(mc.active_params)+' active / '+fmtParams(mc.total_params)+' total &middot; '+
-    esc(mc.num_experts)+' experts, top-'+esc(mc.top_k):'<b>Cascade-MoE-28M</b> &middot; 28M active / 191M total';
+    '<b>'+esc(cascadeMoEName(mc))+'</b> &middot; '+fmtParams(mc.active_params)+' active &middot; '+
+    esc(mc.num_experts)+' experts, top-'+esc(mc.top_k):'<b>Cascade MoE Base</b> &middot; parameter count pending';
   if(!g){
     st.className="v2-state"; st.textContent="v2 · status pending";
     body.innerHTML="Today: the <b>toto2</b> competition. "+model+" lane A &mdash; the trainer&rsquo;s v2 status (status/v2.json) is not published yet. Lane B launches separately.";
@@ -2484,7 +2485,7 @@ function renderLaneALadder(){
   when.textContent=kc&&kc.block?"check at block "+kc.block:"";
 }
 function blockClockOr(b){ var cn=chainNow(); if(!cn) return "--"; var d=new Date(Date.now()+(b-cn.est)*cn.bt*1000); return d.toISOString().slice(0,16).replace("T"," ")+"Z"; }
-function v2ModelName(){ return v2IsLive()?(((_v2.model||{}).name)||"Cascade-MoE-28M"):"toto2"; }
+function v2ModelName(){ return v2IsLive()?cascadeMoEName(_v2.model):"toto2"; }
 
 // ── lane B: the gate ────────────────────────────────────────────────────────
 function lbDoc(){ return (_v2&&_v2.lane_b)||{}; }

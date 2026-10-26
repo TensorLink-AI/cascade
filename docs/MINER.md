@@ -290,17 +290,18 @@ run is logged to `.cascade-work/history.jsonl` with the best so far. Use
 `--baseline DIR` to compare against your previous version instead, or
 `cascade score` for a single number.
 
-**Start small.** The implemented 2M, 7M and 28M active-parameter variants let
-you test generators before using the 120M competition candidate. Generate a
+**Start small.** Cascade MoE Base - 17.53M, 68.92M and 273.64M let you test
+generators before using the 1.23B competition candidate. Names use total parameters. Generate a
 complete offline configuration from the checkout:
 
 ```bash
-python scripts/pyramid_config.py --size 2m --out ./chain.local-2m.toml
-cascade iterate ./my-gen --chain-toml ./chain.local-2m.toml --pool-dir ./heldout --seeds 0,1 --train-hours 0.01 --work-dir ./.cascade-2m --json
+python scripts/pyramid_config.py --size 17.53m --out ./chain.local-17m.toml
+cascade iterate ./my-gen --chain-toml ./chain.local-17m.toml --pool-dir ./heldout --seeds 0,1 --train-hours 0.01 --work-dir ./.cascade-17m --json
 ```
 
 Run the Python command with your installed environment (for example,
-`.venv/bin/python`). Other supported sizes are `7m`, `28m` and `120m`.
+`.venv/bin/python`). Other total-size choices are `68.92m`, `273.64m` and `1.23b`.
+Earlier aliases `2m`, `7m`, `28m` and `120m` remain supported.
 The [presets](../deploy/presets/README.md) give exact counts and the
 [model specification](MODEL.md) explains the recipe. GPU memory and speed are
 unmeasured for this port. The 56M variant remains unspecified.

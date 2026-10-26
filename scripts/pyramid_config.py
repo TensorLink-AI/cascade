@@ -14,7 +14,19 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
+def size_aliases():
+    from cascade.shared.model_names import parameter_count_label
+
+    rows = json.loads((ROOT / "deploy/presets/pyramid-ladder.json").read_text())["sizes"]
+    return {parameter_count_label(row["total_params"]).lower(): alias for alias, row in rows.items()}
+
+
+def resolve_size(size):
+    return size_aliases().get(size.lower(), size.lower())
+
+
 def training_table(size):
+    size = resolve_size(size)
     row = json.loads((ROOT / "deploy/presets/pyramid-ladder.json").read_text())["sizes"][size]
     table = tomllib.loads((ROOT / "deploy/presets/cascade-moe-28m.toml").read_text())["training"]
     table.update(base_arch="cascade_pyramid", arch_preset=f"cascade-moe-v2-{size}",
@@ -72,6 +84,7 @@ def dump_toml(raw):
 def local_config(size, template=None):
     from cascade.shared.config import parse_chain_config
 
+    size = resolve_size(size)
     raw = tomllib.loads(Path(template or ROOT / "chain.toml").read_text())
     raw["training"] = training_table(size)
     raw["v2"].pop("training", None)
@@ -88,7 +101,9 @@ def local_config(size, template=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--size", required=True, choices=["2m", "7m", "28m", "120m"])
+    parser.add_argument("--size", required=True, type=str.lower,
+        choices=[*size_aliases(), "2m", "7m", "28m", "120m"],
+        help="Total parameter size; earlier active-size aliases are also accepted")
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--template", type=Path)
     args = parser.parse_args()

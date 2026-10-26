@@ -72,6 +72,7 @@ def cascade_presets():
     import torch
 
     from cascade.shared.config import load_chain_config
+    from cascade.shared.model_names import moe_display_name
     from cascade.trainer.moe_model import CascadeMoEConfig, CascadeMoEModel, param_counts
     from cascade.trainer.toto2_model import Toto2Config, Toto2Model
 
@@ -97,6 +98,8 @@ def cascade_presets():
                                        "active_parameters": int(counts["active"]),
                                        "base_arch_digest": contract.base_arch_digest,
                                        "source": "configured architecture, counted on meta device"}
+        if contract.base_arch in ("cascade_moe", "cascade_pyramid"):
+            result[contract.arch_preset]["display_name"] = moe_display_name(int(counts["total"]))
     return result
 
 

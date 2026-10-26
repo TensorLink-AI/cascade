@@ -20,7 +20,8 @@
       "parameters": 1234189344,
       "active_parameters": 111651872,
       "base_arch_digest": "dd6b40a6e3bc0ac12f4943fdf2299650dfeb96c2eb63ba2990bc9d7062d78ae9",
-      "source": "configured architecture, counted on meta device"
+      "source": "configured architecture, counted on meta device",
+      "display_name": "Cascade MoE Base - 1.23B"
     }
   },
   "models": [

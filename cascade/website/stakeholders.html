@@ -1186,13 +1186,13 @@ function renderTiles(){
   t.push(tileHtml({k:"Experts merged", v:v2Live()&&lb&&lb.active&&merged!=null?String(merged):"&mdash;", state:v2Live()&&lb&&lb.active?"live":"off",
     q:v2Live()&&lb&&lb.active?((lb.domains||[]).length+" domains · lane B "+(lb.gate&&lb.gate.open?"open":"gated")):"lane B not launched",
     title:"Domain-expert legs (lane B) whose change passed the gain test and every guard and was merged into the king's next era."}));
-  var g=_v2&&_v2.golive, gv="&mdash;", gq="go-live not announced", gs="off", gt="v2 = Cascade-MoE-28M + domain-expert lane";
+  var g=_v2&&_v2.golive, gv="&mdash;", gq="go-live not announced", gs="off", gt="v2 = Cascade MoE Base + domain-expert lane";
   if(g&&g.state==="live"){ gv="Live"; gs="live"; gq="since block "+g.from_block; }
   else if(g&&g.state==="scheduled"){
     gv="#"+g.from_block; gs="pend";
     var secs=liveEta(g); gq=secs!=null?"in ~"+fmtDur(secs):"scheduled";
   }
-  if(_v2&&_v2.model&&_v2.model.total_params) gt+=" ("+fmtBig(_v2.model.active_params)+" active / "+fmtBig(_v2.model.total_params)+" total params)";
+  if(_v2&&_v2.model&&_v2.model.total_params) gt="v2 = "+(_v2.model.name||"Cascade MoE Base")+" ("+fmtBig(_v2.model.total_params)+" total / "+fmtBig(_v2.model.active_params)+" active params)";
   t.push(tileHtml({k:"v2 · MoE", v:gv, q:gq, state:gs, title:gt}));
   document.getElementById("tiles").innerHTML=t.join("");
 }
