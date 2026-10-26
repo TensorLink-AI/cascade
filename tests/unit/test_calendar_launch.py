@@ -132,7 +132,7 @@ def test_a_pruned_late_joiner_gets_an_actionable_error_not_a_guess():
         return recent(block)
 
     chain.block_timestamp = pruned
-    with pytest.raises(RuntimeError, match="archive endpoint or type"):
+    with pytest.raises(RuntimeError, match="archive endpoint or pin the resolved.*from_block and commit_from_block"):
         resolve_calendar_launch(cfg, chain)
 
 

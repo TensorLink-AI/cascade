@@ -190,6 +190,22 @@ class ChainRevealResolver(_DeadlineCachedPoll):
         return best
 
 
+class ChainLaunchAdmission:
+    """Retain finalized opening/activation pins as the running intake observes them."""
+
+    def __init__(self, cfg, client):
+        self.cfg, self.client = cfg, client
+        self._lock = threading.Lock()
+
+    def __call__(self, reveal_block):
+        from ..shared.calendar_launch import lane_a_launch_gate, resolve_calendar_launch
+
+        with self._lock:
+            self.cfg = resolve_calendar_launch(self.cfg, self.client)
+            cfg = self.cfg
+        return lane_a_launch_gate(cfg, int(self.client.finalized_block()), reveal_block)
+
+
 class ChainRegistrationResolver(_DeadlineCachedPoll):
     """``hotkey -> registered on the subnet?`` off the lite metagraph.
 
@@ -426,11 +442,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                  "OFF (one locked type)")
     lane_a_admission = None
     if cfg is not None and not args.trust_refs:
-        from ..shared.calendar_launch import lane_a_launch_gate, resolve_calendar_launch
-
-        def lane_a_admission(reveal_block):
-            effective = resolve_calendar_launch(cfg, client)
-            return lane_a_launch_gate(effective, int(client.finalized_block()), reveal_block)
+        lane_a_admission = ChainLaunchAdmission(cfg, client)
 
     intake = FundingIntake(
         # Entry TTL tracks the key TTL by construction here; the trainer's

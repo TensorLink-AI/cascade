@@ -166,3 +166,32 @@ def test_cli_treats_unknown_launch_rules_as_retryable_without_hiding_the_code(mo
     out = SimpleNamespace(fail=lambda *args, **kw: calls.append((args, kw)))
     assert post_intake(urllib.request.Request("https://fixture.invalid/v1/fund"), out, timeout=30) is None
     assert calls[0][0][0] == "launch_rules_unavailable" and calls[0][0][2] == 3
+
+
+def test_running_intake_remembers_opening_when_the_node_later_prunes_it():
+    from cascade.funding.main import ChainLaunchAdmission
+    from tests.unit.test_calendar_launch import _chain
+
+    cfg = load_chain_config()
+    target = launch_timestamp(cfg.v2.launch_at_utc)
+    chain = _chain(target, 29101)
+    admission = ChainLaunchAdmission(cfg, chain)
+    assert admission(29101) is None
+    assert admission.cfg.v2.commit_from_block == 29101
+    chain.finalized_block = lambda: 30001
+    timestamp = chain.block_timestamp
+
+    def pruned(block):
+        if block < 29900:
+            raise RuntimeError("old state pruned")
+        return timestamp(block)
+
+    chain.block_timestamp = pruned
+    # Re-reading the startup cfg loses the observed opening and fails here.
+    with pytest.raises(RuntimeError, match="archive"):
+        resolve_calendar_launch(cfg, chain)
+    assert admission(30001) is None
+    assert admission.cfg.v2.from_block == 43200
+    chain.finalized_block = lambda: 43201
+    chain.block_timestamp = lambda _: pytest.fail("resolved pins must not be read again")
+    assert admission(43201) is None

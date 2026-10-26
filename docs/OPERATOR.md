@@ -48,7 +48,9 @@ The v2 paid-entry opening is separately pinned as `[v2] commit_open_at_utc =
 "2026-10-30T09:00:00Z"`. Its first finalized chain block becomes
 `commit_from_block`; an explicit block pin is also supported. Late nodes must
 be able to resolve both timestamps, or use both published block pins. This is
-an opening floor, not a closing deadline. The updated intake refuses paid A
+also required after a restart. A running intake retains each resolved pin
+between requests so it does not repeatedly need state the node has pruned.
+The submission rule is an opening floor, not a closing deadline. The updated intake refuses paid A
 entries before it opens and refuses older reveals afterward. The updated
 trainer holds queued A challengers until v2 is active, without CPU/GPU rental
 or consuming attempts. Installing this release therefore pauses new challenger
