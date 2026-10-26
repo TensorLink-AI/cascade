@@ -537,20 +537,20 @@ def test_pyramid_consumes_grouped_shards_end_to_end(tmp_path):
     torch.set_num_threads(1)
     try:
         cfg = parse_chain_config(local_config('2m'))
-        contract = replace(cfg.training, corpus_mode='shards', training_steps=2, batch_size=16,
+        contract = replace(cfg.training, corpus_mode='shards', training_steps=2, batch_size=64,
                            micro_batches=2, max_train_seconds=60)
         cfg = with_contract(cfg, contract)
         rng = np.random.default_rng(9)
-        groups = np.repeat(np.arange(4, dtype=np.uint8), 2)
-        series = [{'values': rng.normal(size=(8, 64)).astype(np.float32), 'groups': groups} for _ in range(4)]
+        groups = np.repeat(np.arange(4, dtype=np.uint8), 8)
+        series = [{'values': rng.normal(size=(32, 64)).astype(np.float32), 'groups': groups} for _ in range(4)]
         shard = write_shard(tmp_path / 'group.parquet', series)
         index = finalize_index(tmp_path, seed=9, children=[{'index': 0, 'seed': 9, 'shards': [shard]}])
         assert index['schema'] == 2
-        with open_round_stream('shards', tmp_path, 9, cfg.generator, token_budget=2048, corpus_dir=tmp_path,
+        with open_round_stream('shards', tmp_path, 9, cfg.generator, token_budget=8192, corpus_dir=tmp_path,
                                continuation_protocol='cascade-continuation/1') as stream:
             result = Toto2Trainer(device='cpu').train(stream.series(), contract, training_seed=3,
-                token_budget=2048, out_dir=tmp_path / 'checkpoint')
-        assert result.metrics['steps'] == 2 and result.metrics['channel_tokens'] == 2048
+                token_budget=8192, out_dir=tmp_path / 'checkpoint')
+        assert result.metrics['steps'] == 2 and result.metrics['channel_tokens'] == 8192
         assert np.isfinite(result.metrics['final_loss'])
         assert result.metrics['channel_telemetry']['n_multichannel_series'] == 4
         assert stream.digest == index['corpus_digest']

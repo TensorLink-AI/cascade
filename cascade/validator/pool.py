@@ -224,6 +224,12 @@ class BucketWindowSource:
         # jittered mix inside the snapshot's RotatingWindowSource.
         return self._ensure_snapshot(meta).windows_for_round(round_seed, n_windows, block=block)
 
+    def windows_for_verdict(self, round_seed, n_windows, *, block=None):
+        meta = self._select(block)
+        if meta is None:
+            raise PoolError("no eval-pool snapshot published for the v2 verdict")
+        return self._ensure_snapshot(meta).windows_for_verdict(round_seed, n_windows, block=block)
+
     def snapshot_dir_for_round(self, *, block=None):
         """Local directory of the snapshot serving a round at epoch ``block``,
         or ``None`` when no snapshot is published. Fetches (and caches) the

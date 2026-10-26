@@ -37,7 +37,7 @@ The planned lane order is **A → C → B**: A/C use 75%/25%, then A/B/C use 50%
 | The operator | [Operator runbook](docs/OPERATOR.md) |
 | Reviewing implementation | [Architecture](docs/ARCHITECTURE.md) and [decisions](decisions/) |
 
-V2 synthetic generators must emit finite float arrays `(C, L)` with **8–32 channels per yield**. One-dimensional and 1–7-channel yields are rejected. Read the effective policy for length and resource limits.
+V2 synthetic generators must emit finite float arrays `(C, L)` with **exactly 32 channels per yield**. One-dimensional and 1–31-channel yields are rejected. Read the effective policy for length and resource limits.
 
 V2 development is on the [`cascade-v2` branch](https://github.com/TensorLink-AI/cascade/tree/cascade-v2).
 Select that branch when installing; the live deployment still determines which rules are active.

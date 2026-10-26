@@ -43,7 +43,7 @@ max_repo_mb          = 128       # cap on the fetched submission. Generators are
                                  # makes a distilled model impossible. max_memory_mb /
                                  # max_generate_seconds bound it at runtime.
 max_channels         = 32        # MV-TEST: C=32 raise (DEC-CA-0041), matches the mainnet cut.
-min_channels         = 8         # v2 synthetic submissions: 8–32 channels per yield
+min_channels         = 32         # v2 synthetic submissions: exactly 32 channels per yield
 channel_corr_mode    = "shadow"  # MV-TEST: channel-redundancy telemetry, labels only.
 # Cheap data-quality gates on generator output (see chain.toml for the rationale).
 max_abs_value        = 0.0       # 0.0 = cast-safe float32 ceiling; always applied.

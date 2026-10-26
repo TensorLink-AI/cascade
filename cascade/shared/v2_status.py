@@ -1043,6 +1043,9 @@ def publish_trainer_v2_status(sched, block: int, *, min_interval_s: float = MIN_
             doc["policy"]["training"]["budget_basis"] = "updates" if contract.training_steps else "reference_gpu_hours"
             for section in ("lane_b", "lane_c", "marketcast", "generator", "generation", "eval", "scoring"):
                 doc["policy"][section] = asdict(getattr(cfg, section))
+            doc["policy"]["eval"]["n_windows"] = cfg.eval_windows_at(start, settlement=False)
+            if cfg.v2.eval_n_windows and cfg.v2.active(start):
+                doc["policy"]["eval"].update(mix_target_windows=0, mix_series_bag_frac=1.0)
             doc["policy"]["generator"] = asdict(cfg.generator_for_contract(contract))
             doc["policy"]["generator"].pop("real_corpus_dir", None)
             doc["policy"]["round"].update({name: getattr(cfg.round, name) for name in

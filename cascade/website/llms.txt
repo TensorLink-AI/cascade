@@ -157,7 +157,7 @@ does not mean a job was queued or a pod rented. Follow the repository's
 `docs/MINER.md#compute-provider-keys` for scoped-key setup and test-only deposit
 examples. The human supplies secrets through the environment; never print them.
 
-V2 synthetic generators must emit finite float arrays `(C, L)` with **8–32 channels per yield**. One-dimensional and 1–7-channel yields are rejected. Read the effective policy for length and resource limits.
+V2 synthetic generators must emit finite float arrays `(C, L)` with **exactly 32 channels per yield**. One-dimensional and 1–31-channel yields are rejected. Read the effective policy for length and resource limits.
 
 ### Lane A — full-model generator competition
 
@@ -350,6 +350,6 @@ Commands do not prompt. Never add `--yes` without this session's explicit
 human authorization. Never print, log, commit or pass secrets on argv.
 
 Optional generator `groups` labels pack independent channel groups into each
-8–32-channel yield. Use them only when the effective contract accepts
+32-channel yield. Use them only when the effective contract accepts
 `groups`; omission or `None` keeps the values-only path. See the group-packing
 section of the repository docs/INTERFACE.md.

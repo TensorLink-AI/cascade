@@ -25,7 +25,7 @@ experiments. No 56M definition has been supplied.
 ## Architecture
 
 All sizes have ten blocks and 32-point patches. Training windows have at most
-4,096 points per channel. V2 generators emit 8–32 channels; the forecaster also
+4,096 points per channel. V2 generators emit exactly 32 channels; the forecaster also
 accepts individual real series during evaluation. Channels stay together through
 attention so the model can learn their relationships. Optional generator
 `groups` labels restrict cross-channel attention and shared copula factors to
@@ -117,9 +117,10 @@ on the router group and selection-bias update; expert-subset legs freeze both.
 
 The supplied full recipe has 25,000 trunk updates and 2,500 cooldown updates,
 with an 80-update warmup and a linear cooldown ending at zero. Its global batch
-is 64 groups × 8 channels × 4,096 points: 512 channel rows. Competition contracts
-count channel rows (`batch_denomination = "sequences"`) so wider groups reduce
-the number of groups per update. `training_steps` sets an explicit maximum;
+used 64 examples × 8 channels × 4,096 points: 512 channel rows. The current
+32-channel generator policy fills the same 512-row batch with 16 examples.
+Competition contracts count channel rows (`batch_denomination = "sequences"`);
+optional group packing divides attention within those examples. `training_steps` sets an explicit maximum;
 `ref_throughput_tokens_per_s = 0` records that throughput is unmeasured. The
 point budget and wall limit remain enforced. A short or exhausted corpus may
 end earlier; metrics distinguish incomplete training, exhaustion and a deadline.

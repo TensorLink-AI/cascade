@@ -66,3 +66,13 @@ class Generator(DataGenerator):
     assert first
     assert os.environ['OPENBLAS_NUM_THREADS'] == '64'
     assert 'CASCADE_LANE_COUNT' not in os.environ
+
+
+def test_verification_profile_handles_hosts_without_an_affinity_api(small_cfg, example_generator_dir, monkeypatch):
+    # macOS still gets pre-import BLAS limits; there is no Linux cpuset API.
+    import os
+
+    monkeypatch.delattr(os, 'sched_setaffinity', raising=False)
+    result = run_in_sandbox(example_generator_dir, 0, small_cfg.generator,
+                            cpu_cores=(0,), allow_netns=False)
+    assert result.n_series > 0

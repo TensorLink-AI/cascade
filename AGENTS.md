@@ -155,7 +155,7 @@ Rules for the loop:
 - Use `cascade verify ./my-gen --live --json` to bind full verification to
   fresh deployed rules, including the CPU child's memory and length limits.
   Without `--live` or `--at-block`, verification checks the intersection of
-  the base and v2 policies (8–32 channels, the shorter length and smaller
+  the base and v2 policies (exactly 32 channels, the shorter length and smaller
   memory limit), so a pass holds on either side of the launch; `iterate` and
   `score` apply the same rule, so a scored generator is admissible. While the
   launch is dated and unresolved, `--at-block` is refused (`launch_unresolved`,
@@ -174,7 +174,7 @@ Rules for the loop:
 - Every module is a real `.py` file. Never keep code in a string and `exec`
   it: a string that decodes to code can be refused at admission, and that
   rejection spends the hotkey's only submission.
-- For v2, each yield is a finite float array `(C, L)` with **8 ≤ C ≤ 32**.
+- For v2, each yield is a finite float array `(C, L)` with **C = 32**.
   Historical v1 also accepted `(L,)`; this is not a valid new v2 yield. The earlier contract uses `64 ≤ L ≤ 4096`, `C ≤ 32`;
   v2 shard generation can publish different length limits. Read the interface
   and fresh live policy rather than hardcoding those earlier bounds.
@@ -186,7 +186,7 @@ Rules for the loop:
 - `requirements.txt` is hash-locked and allowlisted.
 
 Optional generator `groups` labels pack independent channel groups into each
-8–32-channel yield. Use them only when the effective contract accepts
+32-channel yield. Use them only when the effective contract accepts
 `groups`; omission or `None` keeps the values-only path. See the group-packing
 section of [the interface](docs/INTERFACE.md#pack-independent-groups-in-one-yield).
 

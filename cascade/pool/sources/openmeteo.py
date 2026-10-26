@@ -105,6 +105,7 @@ class OpenMeteoSource:
                     freq="H",
                     domain="weather",
                     seasonal_period=24,
-                    attrs={"lat": lat, "lon": lon, "variable": var},
+                    attrs={"lat": lat, "lon": lon, "variable": var,
+                           "source_family": "origin:archive-api.open-meteo.com"},
                 )
                 emitted += 1

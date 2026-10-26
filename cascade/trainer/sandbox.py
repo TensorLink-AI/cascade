@@ -526,7 +526,7 @@ def run_in_sandbox(
                     # Same degrade-silently posture as _apply_rlimits: affinity
                     # can fail in odd container setups, and fairness is
                     # best-effort — never the reason a generator fails.
-                    with contextlib.suppress(OSError):
+                    with contextlib.suppress(AttributeError, OSError):
                         os.sched_setaffinity(0, lane[0])
                 _apply_rlimits(cfg.max_memory_mb, cfg.max_generate_seconds, max_fsize)
 

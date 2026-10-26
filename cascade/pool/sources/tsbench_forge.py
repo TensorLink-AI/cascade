@@ -49,7 +49,7 @@ ENV_FORGE_DIR = "TSFORGE_DIR"
 DEFAULT_FORGE_DIR = "./tsforge"
 # DEC-CA-0041 mv_channels contract cap (docs/EVAL_POOL.md): ordered value-columns
 # within one (source, panel_row), at most this many, packed into one (C, L) window.
-MAX_MV_CHANNELS = 8
+MAX_MV_CHANNELS = 32
 
 # ISO-8601 duration (forge `frequency`) → (pandas-style freq, seasonal period).
 # Explicit periods because cascade's gluonts-style mapping gives D → 1 while
@@ -198,6 +198,9 @@ class TsbenchForgeSource:
         with open(catalog_path, encoding="utf-8") as f:
             catalog = yaml.safe_load(f) or []
 
+        from ..families import catalog_families
+
+        families = catalog_families(catalog)
         stale_cutoff = ctx.as_of - dt.timedelta(days=self.max_stale_days)
         emitted = 0
         usable_sources = 0
@@ -258,7 +261,7 @@ class TsbenchForgeSource:
                     domain=domain,
                     seasonal_period=seasonal_period,
                     source=sid,
-                    attrs={"dgp_class": dgp_class, **panel_key},
+                    attrs={"dgp_class": dgp_class, **panel_key, "source_family": families[str(sid)]},
                 )
                 emitted += 1
 

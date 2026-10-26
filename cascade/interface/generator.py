@@ -8,7 +8,7 @@ The contract is intentionally narrow:
 
 * construction takes the local repo directory and a deterministic ``seed``
 * ``generate(n_series)`` yields exactly ``n_series`` float series, each with
-  the channel count required by the effective generator policy (v2: 8–32)
+  the channel count required by the effective generator policy (checked-in v2: exactly 32)
 * output is bounded: per-series length in ``[min_length, max_length]`` and a
   global cap on total emitted points, both enforced by the trainer
 
@@ -181,7 +181,8 @@ class DataGenerator(ABC):
 
         The values array is a ``float`` ``np.ndarray`` (finite, no NaN or
         inf), 2-D ``(C, L)`` (``C`` variates of length ``L``) for v2, with
-        8–32 channels per yield. Historical policies can also admit 1-D
+        exactly 32 channels per yield in the checked-in v2 policy. Earlier
+        policies can admit other channel counts or 1-D
         ``(L,)`` arrays, which count as one channel ``(1, L)``.
         ``C`` must satisfy the effective configured channel range, and the
         length ``L`` must fall within ``[min_length, max_length]``; the trainer

@@ -113,6 +113,14 @@ class ChainConfig:
         base = self.training.at_block(block)
         return [base.contract_for(n) for n in names]
 
+    def eval_windows_at(self, block: int | None, *, settlement: bool = True) -> int:
+        """Private verdict budget under this round's own era, including replay."""
+        from ..era import v2_settlement_active
+
+        active = v2_settlement_active(self, block) if settlement else self.v2.active(block)
+        return (int(self.v2.eval_n_windows) if active and self.v2.eval_n_windows
+                else int(self.eval.n_windows))
+
     def koth_params(self, block: int | None = None) -> Any:
         """Build a :class:`cascade.eval.koth.KothParams` from ``[scoring]``
         for the round at epoch boundary ``block`` (``None`` = the steady-state

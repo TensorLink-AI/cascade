@@ -1915,15 +1915,15 @@ promotion engine to the overlay at the same block.
 
 ### V2 generator channel policy
 
-The release presets require **8–32 channels in every synthetic yield**, including
+The release presets require **exactly 32 channels in every synthetic yield**, including
 optional synthetic generators supplied with MarketCast recipes. The private eval
-pool keeps its separate channel rules. Verify the source with the new CLI before
+pool accepts native widths up to 32; narrower real data stays valid. Verify the source with the new CLI before
 uploading; `--skip-runtime` does not check output width. `cascade init` creates an
-8-channel starter. Stream parents, CPU corpus generation and GPU shard readers
+32-channel starter. Stream parents, CPU corpus generation and GPU shard readers
 check widths; incompatible cached corpora are regenerated before GPU rental.
 
 Before activating v2, verify the **chosen initial king/baseline generator** too.
-An inherited v1 source producing 1–7 channels does not satisfy the v2 policy;
+An inherited v1 source producing fewer than 32 channels does not satisfy the v2 policy;
 prepare a compliant baseline source/ref before launch. Archived source is kept
 unchanged for replay, and historical pre-v2 training resolves the original floor
 of one channel. Do not pad or duplicate archived data silently to pass the gate.
@@ -1960,3 +1960,16 @@ reconciliation. If the bound evidence is unreadable, scheduling holds until
 it can be read. Do not backdate a record or edit the era ledger to force it
 through. Verify the notice/report replica and restart paths during the
 integration qualification.
+
+### V2 private evidence budget and pool rebuild
+
+The mainnet candidate sets `[v2] eval_n_windows = 4000`, applied only to
+settlements judging v2 eras. Trainer, validators and audit must share that
+configuration. The legacy single-horizon draw's 1,200-window target is not
+applied to that v2 budget. New pool builds default to 800/domain,
+400/domain-frequency, 32 maximum native channels and source-family clustering.
+Update any explicit 600/300 publish-cron flags; repository edits do not change
+an installed cron or publish a new snapshot. Rebuild from the existing mirror,
+inspect family/drop/window counts, and publish only for a future settlement.
+See [pool build rules](EVAL_POOL.md#v2-pool-size-channel-width-and-evidence).
+A new 32-channel compliant baseline and GPU qualification remain required.

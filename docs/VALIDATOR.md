@@ -4,6 +4,14 @@ Validators check published evidence and set the reward weights on chain.
 Choose your role before installing: satellites replay signed results; full
 evaluators also run private forecasting tests. Neither trains challengers.
 
+Mainnet v2 private verdicts use `[v2] eval_n_windows = 4000`; the settlement
+at activation still judges the preceding era under its earlier budget. Run
+the same release/config as the other validators before that future era.
+New pool snapshots record conservative source-family cluster keys in `source`;
+correlated feeds resample together. Historical snapshots retain their recorded
+keys. Counts of windows and independent clusters are different evidence;
+see [pool rules](EVAL_POOL.md#v2-pool-size-channel-width-and-evidence).
+
 ## Choose your role
 
 | Role | What you run | What you need | Setup |

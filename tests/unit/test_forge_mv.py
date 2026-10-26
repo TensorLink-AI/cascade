@@ -53,3 +53,25 @@ def test_forge_untagged_still_picks_densest_1d():
     src = TsbenchForgeSource(forge_dir="/tmp")
     vals = src._extract_values(pd, _frame(), [], CTX, columns=None)
     assert vals is not None and vals.ndim == 1        # unchanged default behaviour
+
+
+def test_new_pool_packs_up_to_32_native_channels_without_padding(tmp_path):
+    import yaml
+
+    names = [f'v{i}' for i in range(33)]
+    root = tmp_path / 'forge'
+    data = root / 'data' / 'native-panel'
+    data.mkdir(parents=True)
+    (root / 'sources.yaml').write_text(yaml.safe_dump([{
+        'id': 'native-panel', 'domain': 'energy', 'frequency': 'PT1H',
+        'source_family': 'grid:fixture', 'mv_channels': names,
+    }]))
+    frame = pd.DataFrame({'timestamp': pd.date_range('2027-02-01', periods=100, freq='h'),
+                          **{n: np.arange(100.) + i for i, n in enumerate(names)}})
+    frame.to_parquet(data / '2027-03-01.parquet')
+    rows = list(TsbenchForgeSource(root, mv_pack=True).harvest(lambda *args: None, CTX))
+    assert len(rows) == 1 and rows[0].values.shape == (32, 100)
+    assert rows[0].attrs['source_family'] == 'curated:grid:fixture'
+    assert np.array_equal(rows[0].values[31], np.arange(100.) + 31)
+    single = list(TsbenchForgeSource(root, mv_pack=False).harvest(lambda *args: None, CTX))
+    assert single[0].values.ndim == 1  # Native narrow data remains valid, never repeated to 32.

@@ -384,6 +384,15 @@ class RotatingWindowSource:
         pool's provenance is round-independent (``block`` ignored)."""
         return self.provenance
 
+    def windows_for_verdict(self, round_seed, n_windows, *, block=None):
+        """V2 explicit evidence budget: don't silently shrink it to a legacy bag.
+
+        Domain/class selection still rotates. The final draw remains without
+        replacement and bounded by actual pool capacity; no windows are invented.
+        """
+        mix = replace(self.mix, target_windows=0, series_bag_frac=1.0) if self.mix else None
+        return replace(self, mix=mix).windows_for_round(round_seed, n_windows, block=block)
+
     def windows_for_round(
         self, round_seed: int | str, n_windows: int, *, block: int | None = None
     ) -> list[EvalWindow]:

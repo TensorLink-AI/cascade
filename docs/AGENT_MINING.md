@@ -50,7 +50,7 @@ does not grant B/C admission.
 queues, protocol capabilities and guide route. Exit 3 / `discovery_release_incomplete`
 means an operator must complete the release. It does not publish anything.
 
-V2 synthetic generators must emit finite float arrays `(C, L)` with **8–32 channels per yield**. One-dimensional and 1–7-channel yields are rejected. Read the effective policy for length and resource limits.
+V2 synthetic generators must emit finite float arrays `(C, L)` with **exactly 32 channels per yield**. One-dimensional and 1–31-channel yields are rejected. Read the effective policy for length and resource limits.
 
 ## Lane A: improve a generator
 

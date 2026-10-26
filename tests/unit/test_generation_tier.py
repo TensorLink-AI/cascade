@@ -152,7 +152,7 @@ def test_cli_refuses_when_disabled(tmp_path: Path, capsys, monkeypatch) -> None:
 
 
 def test_cli_runs_locally(tmp_path: Path, capsys, monkeypatch) -> None:
-    repo = Path(__file__).resolve().parents[2] / "scripts" / "example_generator"
+    repo = Path(__file__).resolve().parents[2] / "cascade/miner/templates/generator"
     cfg = load_chain_config()
     small = replace(cfg, generation=_gcfg(vcpus=1, target_points=5000, max_length=4096))
     monkeypatch.setattr("cascade.shared.config.load_chain_config", lambda *a: small)

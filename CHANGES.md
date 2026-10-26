@@ -103,3 +103,61 @@ thread counts. Full output covering all development failure cases is retained in
 - Real GPU SDPA behavior, peak memory/throughput, production container images,
   and baseline qualification need an integration run. CPU tests do not establish
   those results. No training/GPU jobs or live state changes were run here.
+
+
+## Follow-up: 32-channel generators and stronger private evidence
+
+This separate follow-up to DEC-CA-0065 implements DEC-CA-0066. Review it as a
+policy/eval change, separately from the group-packing architecture change.
+
+- `chain.toml`, `chain.testnet.toml`, the generator template and current miner/
+  agent/operator docs: require exactly **32 synthetic channels** per yield;
+  groups may be any sizes inside it. Historical v1 keeps its earlier floor.
+  Cached 8-channel corpora are rejected for new 32-channel legs. Champions are
+  untouched; the launch baseline must now qualify at 32 channels.
+- `cascade/pool/cli.py`, `builder.py`, `sources/*.py`: new pool builds default
+  to **800/domain**, **400/domain-frequency**, up to **32 native eval channels**
+  and source-family clustering. Narrow real data is retained; no padding or
+  duplicate channels. Existing explicit cron flags still need updating.
+- `cascade/pool/families.py`: curated catalog families, conservative crypto/FX/
+  sensor/origin fallback keys and transitive clean/noisy-pair grouping. New
+  metadata records the family in `source` and keeps feed provenance separately.
+  Unresolved families are dropped with a visible reason. Historical snapshots
+  and the legacy producer mode keep their recorded feed semantics.
+- `cascade/shared/config/{v2.py,chain_config.py}`, `shared/v2_status.py`,
+  `validator/{expert_lane.py,windows.py,pool.py}`: mainnet v2 verdicts request
+  **4,000 windows**. The resolver preserves the old-era boundary and replay;
+  testnet remains at its small budget. The single-horizon path no longer
+  silently shrinks v2 evidence to the old jitter target or bag. Ladder rungs
+  split the budget equally; actual eligible capacity can reduce it. Discovery
+  reports the effective budget. No change to public benchmark definitions.
+- `scripts/check_docs.py` renders the fixed channel count as 32. New and updated
+  tests cover cached-width rejection, native 32-channel extraction, both cap
+  bottlenecks, source-family transport through scoring/bootstrapping, historical
+  draws, snapshot delegation and invalid window-budget configuration. See
+  `test_eval_source_families.py`, `test_v2_verdict_budget.py` and the updated
+  generator, forge, pool, admission and record integration tests.
+
+No additional model-source/architecture or training-contract digest changes
+occur in this follow-up. Generator policy, future pool content and the v2
+private-eval configuration do change. The family rule is conservative rather
+than proof of independence: more correlated rows do not become independent
+samples, and the corrected confidence bound may widen.
+
+Final full unit suite: **4,723 passed, 4 skipped** (7 warnings), 468.03 seconds;
+[/tmp/cascade-c32-pool-final-unit-all.log](/tmp/cascade-c32-pool-final-unit-all.log).
+Focused checks: **215 passed**; final CPU-profile/CLI retest: **5 passed**.
+Docs: **19 guides, 350 snippets, zero issues**. Ruff **0.15.20: passed**.
+The first full follow-up run exposed one stale fixture using the old 8-channel
+example; the test now exercises the current 32-channel starter. Its acceptance
+assertions remain intact. A portability regression also covers hosts without
+Linux's affinity API: pre-import BLAS limits still apply without failing spawn.
+No changes were made to pinned model-source bytes after the group-packing
+commit. Failure-case outputs are retained at
+[/tmp/cascade-c32-pool-test-failures.txt](/tmp/cascade-c32-pool-test-failures.txt).
+
+No scrape, live pool rebuild/publication, cron edit, chain write, training job
+or GPU job was performed. The estimated ~4,900-series pool remains a projection;
+verify the actual eligible count, family coverage, cluster floors and future
+snapshot activation in an authorized rebuild. Production 32-channel GPU
+memory/throughput and signed image/baseline qualification remain outstanding.

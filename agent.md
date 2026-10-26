@@ -61,7 +61,7 @@ A and B are paths into the shared model lineage. C asks whether an application
 fine-tune helps on genuinely future observations, using its own base and reward
 slots. Not every lane or target is necessarily open on a deployment.
 
-V2 synthetic generators must emit finite float arrays `(C, L)` with **8–32 channels per yield**. One-dimensional and 1–7-channel yields are rejected. Read the effective policy for length and resource limits.
+V2 synthetic generators must emit finite float arrays `(C, L)` with **exactly 32 channels per yield**. One-dimensional and 1–31-channel yields are rejected. Read the effective policy for length and resource limits.
 
 ## Rewards and burns
 
@@ -160,6 +160,6 @@ checkpoint is a substitute for fresh rules. The [architecture](docs/ARCHITECTURE
 and [decisions](decisions/) explain the implementation and its amendments.
 
 Optional generator `groups` labels pack independent channel groups into each
-8–32-channel yield. Use them only when the effective contract accepts
+32-channel yield. Use them only when the effective contract accepts
 `groups`; omission or `None` keeps the values-only path. See the group-packing
 section of [the interface](docs/INTERFACE.md#pack-independent-groups-in-one-yield).

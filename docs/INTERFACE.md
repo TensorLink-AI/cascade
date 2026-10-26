@@ -35,7 +35,7 @@ does not increase the model context: v2 crops training windows from it.
 | Batch size | `64` | `512` |
 | Model context length | `4096` | `4096` |
 | Training wall limit (seconds) | `18000` | `18000` |
-| Generator channels per yield | 1–32 | 8–32 |
+| Generator channels per yield | 1–32 | 32 |
 | Generator length limit | 64–4096 | 64–32768 in the CPU shard tier |
 | CPU shard generation window | Not used by this contract | 90 minutes |
 <!-- cascade:training-reference:end -->
@@ -49,7 +49,7 @@ policy together. Under v2 shards it uses `[generation] max_length` and
 `child_memory_mb`, including 8,064-point series within those bounds. With no
 bound contract (no `--live`, no `--at-block`), `verify`, `deploy`, an
 unfunded `submit`, `iterate`, `score` and `fetch --verify` check the
-intersection of the base and `[v2.training]` policies: 8–32 channels and the
+intersection of the base and `[v2.training]` policies: exactly 32 channels and the
 stricter length, memory and time limits, so a pass is admissible whichever
 side of the launch trains the entry. Use `--live` for the exact deployed
 policy, including longer v2 shard series. `--at-block` selects a configured
@@ -70,9 +70,9 @@ container/runtime or report the check as unavailable.
 
 ## Multivariate series
 
-V2 synthetic generators must yield `(C, L)` arrays with **8 ≤ C ≤ 32** on
-**every yield** (`[generator] min_channels = 8`, `max_channels = 32`).
-One-dimensional arrays and arrays with 1–7 or more than 32 channels are rejected.
+V2 synthetic generators must yield `(C, L)` arrays with **C = 32** on
+**every yield** (`[generator] min_channels = 32`, `max_channels = 32`).
+One-dimensional arrays and arrays with 1–31 or more than 32 channels are rejected.
 This also applies to a record's `values` array. The private evaluation pool's
 channel range is independent. Historical v1 replay retains its earlier limits.
 
@@ -104,7 +104,7 @@ Channel economics:
   stop a slow run early.
 * **Cross-channel structure only pays if it is real.** Multivariate eval
   windows are scored jointly (all channels forecast in one pass; the window
-  counts once), and eval windows carry at most 8 channels whatever your C.
+  counts once), and eval windows carry at most 32 channels whatever your C.
   Near-duplicate channels are flagged by the channel-redundancy telemetry
   (`[generator] channel_corr_mode = "shadow"`), and so are unrelated rows
   stacked into one array: a channel whose innovations are uncorrelated with
@@ -134,12 +134,12 @@ for `mask` and `roles`; that does not make them valid for the pyramid recipe.
 ### Pack independent groups in one yield
 
 ```python
-# Eight channels, four groups; interleaving is allowed.
+# 32 channels, four groups of eight; interleaving is also allowed.
 yield {"values": values.astype(np.float32),
-       "groups": np.array([0, 1, 0, 2, 1, 2, 3, 3], dtype=np.uint8)}
+       "groups": np.repeat(np.arange(4, dtype=np.uint8), 8)}
 ```
 
-`groups` has shape `(C,)`, one integer label per channel. C remains **8–32**,
+`groups` has shape `(C,)`, one integer label per channel. C is **32** in the checked-in v2 policy,
 while an individual group can have **1–C** channels. Labels introduce new
 numbers as **0, 1, … in order of first appearance**; gaps, reordered first
 appearances, negatives and fractional labels are rejected. Each group's
@@ -239,7 +239,7 @@ class Generator(DataGenerator):
         ...
 
     def generate(self, n_series: int) -> Iterator[np.ndarray]:
-        # Yield UP TO n_series float arrays (C, L), with 8 <= C <= 32.
+        # Yield UP TO n_series float arrays (C, L), with C = 32.
         # Every yield must satisfy the active channel range. Each length L must fall in the configured
         # [min_length, max_length] band; total emitted points (C*L) are capped.
         # The trainer may stop consuming early — at the training token budget
@@ -262,7 +262,7 @@ class Generator(DataGenerator):
   because the trainer and validators rely on it to audit runs.
 * **Bounds.** Each series is finite (no NaN/inf), floating dtype, shape
   `(C, L)` with `generator.min_channels <= C <= generator.max_channels`
-  (**8–32** for v2) and `L` in
+  (**32** for v2) and `L` in
   the active length band described [above](#which-limits-apply). Local/full
   materialisation is capped by `generator.max_total_points`; the shard tier
   has its own point target and CPU window. Keep magnitudes in a sane float32 range: a

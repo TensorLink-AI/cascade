@@ -244,10 +244,12 @@ def _write_forge_mirror(tmp_path, as_of):
     catalog = [
         {  # hourly, panel-expanded into two series
             "id": "grid_load", "domain": "energy", "dgp_class": "load_curve",
+            "source_family": "fixture:grid",
             "frequency": "PT1H",
         },
         {  # daily, single series
             "id": "wiki_views", "domain": "web_traffic", "dgp_class": "attention",
+            "source_family": "fixture:wiki",
             "frequency": "P1D",
         },
         {"id": "switched_off", "domain": "energy", "frequency": "PT1H", "disabled": True},

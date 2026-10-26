@@ -64,7 +64,8 @@ def training_reference(root=ROOT):
         rows.append(f"| {label} | `{getattr(before, field)}` | `{getattr(after, field)}` |")
     rows.extend([
         f"| Generator channels per yield | {cfg.generator_for_contract(before).min_channels}–{cfg.generator.max_channels} | "
-        f"{cfg.generator_for_contract(after).min_channels}–{cfg.generator.max_channels} |",
+        + (f"{cfg.generator.max_channels} |" if cfg.generator_for_contract(after).min_channels == cfg.generator.max_channels
+         else f"{cfg.generator_for_contract(after).min_channels}–{cfg.generator.max_channels} |"),
         f"| Generator length limit | {cfg.generator.min_length}–{cfg.generator.max_length} | "
         f"{cfg.generator.min_length}–{cfg.generation.max_length} in the CPU shard tier |",
         f"| CPU shard generation window | Not used by this contract | {cfg.generation.window_seconds // 60} minutes |",

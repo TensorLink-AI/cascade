@@ -131,6 +131,56 @@ and provide `POOL_S3_ACCESS_KEY` / `POOL_S3_SECRET_KEY` (an R2 token). When the
 `POOL_S3_*` env is unset, the pool store falls back to the `HIPPIUS_S3_*`
 credentials, so a Hippius-only operator needs nothing extra.
 
+## V2 pool size, channel width and evidence
+
+New `build`/`publish` commands default to **800 series per domain**, **400 per
+(domain, frequency) cell**, a **32-channel upper limit**, and
+`--cluster-by source_family`. A real series keeps its native channel count;
+1–31 channels remain valid. These eval rules differ from synthetic generators,
+which now require exactly 32 channels. No channel is repeated to reach 32.
+Explicit flags in an existing publish cron still override these defaults;
+update old `600`/`300` flags before the next planned rebuild. The forge source
+reads existing mirrored parquet, so a cap-only rebuild needs no new scraping.
+Actual added series depend on what passes cleaning, deduplication and family
+checks; no specific pool-size increase is guaranteed by a config edit.
+
+The mainnet v2 private verdict budget is **4,000 windows**, resolved from
+`[v2] eval_n_windows`. Earlier settlements retain their old rule, including
+the single-horizon jitter target. The v2 single-horizon path honors its budget
+instead of shrinking it to the old 1,200-window target or series bag. The
+horizon ladder divides the budget across horizons and equalizes rung counts;
+short history or insufficient eligible series may reduce the actual count.
+Read the receipt's real window and cluster counts. Larger pools improve
+rotation; more judged windows and independent source families improve evidence.
+
+### Source families, not separate votes for correlated feeds
+
+The bootstrap groups by each snapshot's recorded `source`. New primary builds
+write source-family keys there, retain the feed id in `catalog_source`, and
+also record `source_family`. The same family resamples together across channels
+and horizons. Thirteen BTC trade-rate feeds across ten exchanges therefore do
+not supply thirteen independent clusters.
+
+A forge catalog entry can provide a reviewed label:
+
+```yaml
+id: exchange_btc_trade_rate
+source_family: crypto-market
+```
+
+Without a curated label, known crypto-market feeds share one conservative
+market family, FX feeds one FX family, known sensor networks one network,
+and other feeds one endpoint origin. Declared `paired_with` sources are joined
+transitively. This can combine independent signals conservatively; refine a
+family only with provenance evidence. A missing/unresolvable family is counted
+as `missing_source_family` and excluded. Check drops and `min_clusters` before
+publication. The rule cannot prove all remaining families independent.
+
+Use `--cluster-by source` only to reproduce older producer behavior. Existing
+snapshots are immutable and retain their previous keys; publish a corrected
+snapshot for a future settlement. No validator-side guessing or historical
+rewriting is needed. See [the decision](../decisions/DEC-CA-0066-fixed-generator-width-and-eval-families.md).
+
 ## Sources (shipped)
 
 | name            | domain          | freq       | seasonality | notes |
@@ -184,9 +234,9 @@ validator fetch — is unchanged.
 
 A source may tag genuinely coupled channels for multivariate scoring via
 `mv_channels` in its `sources.yaml` entry. This is a **cross-repo interface**,
-versioned here (v1):
+versioned here (DEC-CA-0066 raises the channel cap):
 
-> **`mv_channels`** — an ordered list (≤ 8) of value-column names within a
+> **`mv_channels`** — an ordered list (≤ 32) of value-column names within a
 > single `(source, panel_row)`, all on that row-group's shared timestamp index.
 > The group packs to one `(C, L)` eval window and counts as **one series**
 > against every cascade cap: the 200-series panel-expansion cap, the
@@ -200,7 +250,7 @@ versioned here (v1):
 windows iff the snapshot's `effective_block` is at or past `[scoring]
 mv_score_from_block` (`--no-mv-pack` forces off, `--mv-pack` forces on), so the
 pool and the multivariate scoring rule switch on the same boundary by
-construction. `--max-channels` is raised to the `mv_channels` cap (8)
+construction. `--max-channels` is raised to the `mv_channels` cap (32)
 automatically when packing.
 
 **Two consumers, deliberately different accounting.** Forge's own benchmark
@@ -225,7 +275,8 @@ Properties worth knowing:
   stale the build fails loudly instead of republishing old data. With the crons
   decoupled, a dead scraper must not silently erode the freshness lever.
 * **Cluster labels** — every series lands in `metadata.json` with
-  `source = <catalog id>`. The validator's KOTH bootstrap resamples these
+  the catalog feed id. New primary builds replace the bootstrap key with its
+  source family and retain the feed as `catalog_source` (see below). The validator's KOTH bootstrap resamples these
   *clusters* rather than windows (windows from one feed are correlated), and
   `[scoring] min_clusters` sets a breadth floor on the verdict. Raise it to
   ~30 once this source feeds the pool.
@@ -272,8 +323,8 @@ Operator steps:
    ```bash
    TSFORGE_DIR=./tsforge cascade-pool publish \
      --chain-toml "$TOML" --sources tsbench_forge \
-     --max-panel-series-per-feed 5 --max-series-per-domain-freq 300 \
-     --max-series-per-domain 600 --selection balanced \
+     --max-panel-series-per-feed 5 --max-series-per-domain-freq 400 \
+     --max-series-per-domain 800 --selection balanced \
      --require-domain --require-source --min-series-per-domain 300 \
      --effective-block "$EFFECTIVE_BLOCK"
    ```

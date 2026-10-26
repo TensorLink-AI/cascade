@@ -39,7 +39,7 @@ Use the live clock for settlement timing. Mainnet is netuid 91. The
 intake is `https://submissions.cascadesub.net`.
 
 Optional [group packing](INTERFACE.md#pack-independent-groups-in-one-yield)
-lets your generator place independent groups inside one 8–32-channel yield.
+lets your generator place independent groups inside one 32-channel yield.
 It requires a contract accepting `groups`; bare arrays remain supported.
 
 ## Quickstart
@@ -224,8 +224,8 @@ Rules that matter:
   your hotkey. Data that merely parses (a JSON blob, a literal) is fine; a
   flush-left docstring example that imports is not. Examples in
   [§11](#code-in-strings-is-rejected).
-- **Series shape.** V2 requires finite float arrays `(C, L)` with **8 ≤ C ≤ 32**
-  on every yield. One-dimensional and 1–7-channel yields are rejected.
+- **Series shape.** V2 requires finite float arrays `(C, L)` with **C = 32**
+  on every yield. One-dimensional and 1–31-channel yields are rejected.
   Historical v1 accepted `(L,)` or `(C, L)`. The earlier contract uses
   `64 ≤ L ≤ 4096` and `C ≤ 32`; v2 shard generation can publish different
   length limits. Read the live policy and [interface](INTERFACE.md).
@@ -239,7 +239,7 @@ Rules that matter:
   leg whose loss goes non-finite is rejected as your fault and your submission
   is spent. Keep values in a sane float32 range.
 
-A v2 `(C, L)` yield is one series with **8–32 coupled channels**. The rules are
+A v2 `(C, L)` yield is one series with **32 channels, optionally packed into independent groups**. The rules are
 in [INTERFACE.md](INTERFACE.md#multivariate-series); a worked example with
 billing numbers is [§11](#11-multichannel-generators).
 
@@ -256,7 +256,7 @@ cascade verify ./my-generator --live
 
 `--live` requires fresh discovery and selects the deployed CPU-tier memory
 and length bounds with the training contract. Offline checks without
-`--at-block` apply both the pre-v2 and v2 rules (8–32 channels, the stricter
+`--at-block` apply both the pre-v2 and v2 rules (exactly 32 channels, the stricter
 length and memory limits), so a pass holds either side of the launch; use
 `--at-block BLOCK` for a particular configured era. V2 shards permit
 8,064-point series within the published limit (verify those with `--live`);
@@ -974,14 +974,13 @@ billed. The contract's wall still applies. These are worked examples of
 
 | yield shape | values (tokens) | billed points | tokens per point |
 |---|---|---|---|
-| `(8, 1024)` | 8 192 | 6 827 | 1.20 |
-| `(16, 1024)` | 16 384 | 13 654 | 1.20 |
 | `(32, 1024)` | 32 768 | 27 307 | 1.20 |
 
-For this optional rule, the training budget is a fixed number of points (`[training]
-target_train_hours × 3600 × ref_throughput_tokens_per_s`). All legal v2
-widths are multichannel. The optional bonus concerns budget accounting;
-it does not relax the 8-channel minimum.
+For this optional rule, the budget is still measured in points. Earlier
+throughput-based contracts derive it from training hours and reference speed;
+the pyramid recipe uses its explicit update budget. The current v2 width is
+32 channels. The optional bonus concerns budget accounting;
+it does not relax the requirement for exactly 32 channels.
 
 Two things the rule does not do:
 
@@ -1046,7 +1045,7 @@ def responder(rng: np.random.Generator, a: np.ndarray, lag: int) -> np.ndarray:
     return b
 ```
 
-`generator.py`, the class the trainer loads. It yields `(2, L)` arrays:
+`generator.py`, the class the trainer loads. It yields `(32, L)` arrays:
 
 ```python
 from __future__ import annotations
@@ -1074,31 +1073,31 @@ class Generator(DataGenerator):
 
     @property
     def name(self) -> str:
-        return "example-eight-channel-lagged"
+        return "example-32-channel-lagged"
 
     def generate(self, n_series: int) -> Iterator[np.ndarray]:
         rng = np.random.default_rng(self._seed)          # the ONLY source of randomness
         for _ in range(n_series):
             length = int(rng.integers(self._min_len, self._max_len + 1))
             channels = []
-            for _ in range(4):
+            for _ in range(16):
                 a = driver(rng, length)
                 b = responder(rng, a, lag=int(rng.integers(1, self._max_lag + 1)))
                 channels.extend([a, b])
-            yield np.stack(channels).astype(np.float64)  # shape (8, L)
+            yield np.stack(channels).astype(np.float64)  # shape (32, L)
 ```
 
 Notes on the shape contract:
 
-- A v2 yield is one series `(C, L)` with **8 ≤ C ≤ 32**. Values must be finite float.
+- A v2 yield is one series `(C, L)` with **C = 32**. Values must be finite float.
   Historical `(L,)` and narrower multichannel arrays are not valid v2 submissions.
 - Every channel of a series has the same length `L`, within the effective
   length limits. Ordinary verification uses 64–4096 in the templates; the
   v2 CPU shard tier allows up to 32768.
-- Eval windows carry at most 8 channels whatever your `C`, and a multichannel
+- Eval windows carry at most 32 channels whatever your `C`, and a multichannel
   eval window scores once, its channels averaged.
 - Mixing legal widths is fine: a corpus can be 70% `(8, L)` and 30% `(16, L)`.
-  Every yield must independently have 8–32 channels. Billing is per yield.
+  Every yield must independently have exactly 32 channels. Billing is per yield.
 
 ### Code in strings is rejected
 
@@ -1139,7 +1138,7 @@ in your tree. Code that only exists after a decode step is invisible to both.
 
 - [ ] `cascade verify` says OK and `[deterministic]`.
 - [ ] Every sub-generator is a `.py` file; no `exec`, no code in strings.
-- [ ] Every v2 yield is finite float `(C, L)`, **8 ≤ C ≤ 32**, with `L` inside the effective limits.
+- [ ] Every v2 yield is finite float `(C, L)`, **C = 32**, with `L` inside the effective limits.
 - [ ] Channels of a series are genuinely coupled; a copied channel costs budget and hurts.
 - [ ] One hotkey, one lifetime submission: a rejection at admission spends it.
 

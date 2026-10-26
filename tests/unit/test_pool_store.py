@@ -545,9 +545,9 @@ def _publish_capturing_build(tmp_path, monkeypatch, cfg, argv_extra):
 def test_publish_packs_only_from_the_flip_block(tmp_path, monkeypatch):
     cfg = _cfg_mv(7200)
     before = _publish_capturing_build(tmp_path, monkeypatch, cfg, ["--effective-block", "3600"])
-    assert before == {"mv_pack": False, "max_channels": 1}
+    assert before == {"mv_pack": False, "max_channels": 32}
     at = _publish_capturing_build(tmp_path, monkeypatch, cfg, ["--effective-block", "7200"])
-    assert at == {"mv_pack": True, "max_channels": 8}         # MAX_MV_CHANNELS
+    assert at == {"mv_pack": True, "max_channels": 32}         # MAX_MV_CHANNELS
     off = _publish_capturing_build(tmp_path, monkeypatch, cfg,
                                    ["--effective-block", "7200", "--no-mv-pack"])
     assert off["mv_pack"] is False

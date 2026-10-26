@@ -50,7 +50,7 @@ max_repo_mb          = 128       # cap on the fetched submission (code-only, no 
 # linear in C) and costs no per-token throughput. Eval-side mv_channels stays
 # ≤ 8 (EVAL_POOL.md); OOM is a challenger fault and never re-queues.
 max_channels         = 32
-min_channels         = 8         # v2 synthetic submissions: 8–32 channels per yield
+min_channels         = 32         # v2 synthetic submissions: exactly 32 channels per yield
 # The record carrier (DEC-CA-0020). interface_version 1 = record-or-array yield
 # with `values` only; every reserved field (mask, start, freq, group_id, roles,
 # labels, quantiles) is hard-rejected until the release that consumes it. Bumps
@@ -319,6 +319,8 @@ tie_runoff_phase_seconds = 900
 # The v2 entry opening is separately resolved under [v2] below; do not replace
 # this historical block with an estimated future launch block.
 commit_floor_block = 8622922  # original v1 floor; v2 has its own opening below in [v2]
+# Private verdict budget, only for v2 settlements; earlier rounds keep [eval].
+eval_n_windows = 4000
                               # (unit fixtures neutralize it in tests/conftest.py)
 one_submission_per_hotkey = true
 duel_from_block = 8992800   # retired (ignored)

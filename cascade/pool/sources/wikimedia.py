@@ -93,6 +93,7 @@ class WikimediaSource:
                 freq="D",
                 domain="web_traffic",
                 seasonal_period=7,
-                attrs={"article": article, "project": self.project},
+                attrs={"article": article, "project": self.project,
+                       "source_family": "origin:wikimedia.org"},
             )
             emitted += 1

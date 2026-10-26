@@ -47,7 +47,7 @@ def _repo(path, shape):
 def test_cli_cross_thread_arrow_write_and_main_thread_read(tmp_path):
     # Run the real CLI in a fresh interpreter; an allocator segfault must be
     # observed as a failed process rather than taking down pytest.
-    repo = _repo(tmp_path / "repo", "(8, 2048)")
+    repo = _repo(tmp_path / "repo", "(32, 2048)")
     text = (ROOT / "chain.toml").read_text()
     start = text.index("[generation]")
     end = text.index("\n[", start + 1)
@@ -134,7 +134,7 @@ def test_verification_resolves_legacy_floor_and_v2_shard_length(tmp_path):
     assert verify_repo(legacy, cfg, quick=True).ok
     v2 = with_contract(cfg, cfg.training.v2_contract)
     assert not verify_repo(legacy, v2, quick=True).ok
-    long = _repo(tmp_path / "long", "(8, 8192)")
+    long = _repo(tmp_path / "long", "(32, 8192)")
     assert not verify_repo(long, cfg, quick=True).ok
     assert verify_repo(long, v2, quick=True).ok
     assert v2.generator.max_memory_mb == cfg.generation.child_memory_mb
@@ -144,7 +144,7 @@ def test_verification_enforces_the_cpu_child_memory_cap(tmp_path):
     cfg = load_chain_config()
     cfg = replace(cfg, generator=replace(cfg.generator, sandbox_strict=False))
     cfg = with_contract(cfg, cfg.training.v2_contract)
-    repo = _repo(tmp_path / "memory", "(8, 64)")
+    repo = _repo(tmp_path / "memory", "(32, 64)")
     source = (repo / "generator.py").read_text().replace(
         "        rng =", "        allocation = np.empty(3_000_000_000, dtype=np.uint8)\n        rng =")
     (repo / "generator.py").write_text(source)

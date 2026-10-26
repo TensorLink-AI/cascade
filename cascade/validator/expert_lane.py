@@ -55,13 +55,19 @@ def verdict_windows(cfg, window_source, round_seed, *, block):
     (``ValidatorRunner._verdict_windows``) and the trainer's lane-B self-judge,
     so both score the identical set: the scored horizon ladder when active at
     ``block``, else the single-horizon rotating draw."""
+    from ..shared.era import v2_settlement_active
     from .windows import ladder_windows_for_round, scored_ladder
 
+    budget_fn = getattr(cfg, "eval_windows_at", None)
+    budget = budget_fn(block) if budget_fn else cfg.eval.n_windows
     horizons = scored_ladder(cfg.eval, block)
     if not horizons:
-        return window_source.windows_for_round(round_seed, cfg.eval.n_windows, block=block)
+        draw = window_source.windows_for_round
+        if getattr(getattr(cfg, "v2", None), "eval_n_windows", 0) and v2_settlement_active(cfg, block):
+            draw = getattr(window_source, "windows_for_verdict", draw)
+        return draw(round_seed, budget, block=block)
     return ladder_windows_for_round(
-        window_source, horizons=horizons, n_windows=cfg.eval.n_windows,
+        window_source, horizons=horizons, n_windows=budget,
         context_length=cfg.eval.context_length, round_seed=round_seed, block=block,
     )
 

@@ -29,9 +29,9 @@ class Generator(DataGenerator):
         self._seed = int(seed)
         self._min_len = int(self._cfg.get("min_length", 128))
         self._max_len = int(self._cfg.get("max_length", 1024))
-        self._channels = int(self._cfg.get("channels", 8))
-        if not 8 <= self._channels <= 32:
-            raise ValueError("v2 generators require 8–32 channels per series")
+        self._channels = int(self._cfg.get("channels", 32))
+        if self._channels != 32:
+            raise ValueError("this v2 generator requires exactly 32 channels per yield")
 
     @property
     def name(self) -> str:

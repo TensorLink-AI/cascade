@@ -23,22 +23,22 @@ ROOT = Path(__file__).resolve().parents[2]
 @pytest.mark.parametrize("network", ["chain.toml", "chain.testnet.toml"])
 def test_release_width_policy_and_historical_replay(network):
     cfg = load_chain_config(ROOT / network)
-    assert (cfg.generator.min_channels, cfg.generator.max_channels) == (8, 32)
+    assert (cfg.generator.min_channels, cfg.generator.max_channels) == (32, 32)
     assert cfg.generator_for_contract(cfg.training).min_channels == 1
-    assert cfg.generator_for_contract(cfg.training.v2_contract).min_channels == 8
+    assert cfg.generator_for_contract(cfg.training.v2_contract).min_channels == 32
 
 
-@pytest.mark.parametrize("channels", [None, 1, 7, 8, 32, 33])
+@pytest.mark.parametrize("channels", [None, 1, 7, 8, 31, 32, 33])
 def test_every_array_and_record_yield_obeys_v2_bounds(channels):
     cfg = load_chain_config().generator
     shape = (64,) if channels is None else (channels, 64)
     values = np.random.default_rng(0).normal(size=shape)
     for item in (values, {"values": values}):
         validator = SeriesValidator.from_config(cfg)
-        if channels in (8, 32):
+        if channels == 32:
             validator.process(item, 0)
         else:
-            with pytest.raises(ValueError, match=r"outside \[8, 32\]"):
+            with pytest.raises(ValueError, match=r"outside \[32, 32\]"):
                 validator.process(item, 0)
     # Old direct callers/configs retain the original one-channel interface.
     check_series(np.ones(64), min_length=64, max_length=64)
@@ -50,7 +50,7 @@ def test_parent_refuses_underwidth_frames_even_if_child_skips_validation(tmp_pat
                         contextlib.nullcontext(iter([np.ones((7, 64))])))
     with open_round_stream("stream_cpu", tmp_path, 0, cfg, token_budget=1000,
                            use_sandbox=True) as stream:
-        with pytest.raises(CorpusError, match=r"outside \[8, 32\]"):
+        with pytest.raises(CorpusError, match=r"outside \[32, 32\]"):
             next(stream.series())
         assert stream.n_series == 0
 
@@ -64,7 +64,7 @@ def test_cpu_parent_rejects_nonfinite_output_from_a_bypassed_child(tmp_path):
     assert index["stop_reason"] == "generator_fault" and index["n_series"] == 0
 
 
-@pytest.mark.parametrize("channels", [7, 8, 32, 33])
+@pytest.mark.parametrize("channels", [7, 8, 31, 32, 33])
 def test_cpu_tier_rejects_invalid_width_before_gpu_rental(tmp_path, channels):
     cfg = load_chain_config().generator
     def child(*_):
@@ -72,9 +72,9 @@ def test_cpu_tier_rejects_invalid_width_before_gpu_rental(tmp_path, channels):
     index = generate_corpus(tmp_path, 1, cfg,
                             GenerationConfig(vcpus=1, target_points=64, shard_points=64),
                             tmp_path / "corpus", runner=child)
-    if channels in (8, 32):
+    if channels == 32:
         assert not index["faults"] and index["channels_histogram"] == {str(channels): 1}
-        assert index["min_channels"] == 8 and index["max_channels"] == 32
+        assert index["min_channels"] == 32 and index["max_channels"] == 32
     else:
         assert index["stop_reason"] == "generator_fault" and index["n_series"] == 0
 
@@ -84,7 +84,7 @@ def test_shard_reader_cannot_bypass_width_policy(tmp_path):
     finalize_index(tmp_path, seed=1, children=[{"index": 0, "seed": 1, "shards": [shard]}])
     with open_round_stream("shards", tmp_path, 1, load_chain_config().generator,
                            token_budget=1000, corpus_dir=tmp_path) as stream, \
-            pytest.raises(ShardError, match=r"outside \[8, 32\]"):
+            pytest.raises(ShardError, match=r"outside \[32, 32\]"):
         next(stream.series())
 
 
@@ -100,7 +100,7 @@ def test_real_starter_passes_current_verification_and_custom_widths(tmp_path):
     spec = importlib.util.spec_from_file_location("channel_starter", source / "generator.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    for channels in (8, 32):
+    for channels in (32,):
         (tmp_path / "config.json").write_text(json.dumps({"channels": channels}))
         a = list(module.Generator(str(tmp_path), seed=2).generate(2))
         b = list(module.Generator(str(tmp_path), seed=2).generate(2))
@@ -143,6 +143,8 @@ def test_old_width_cached_corpora_are_not_reused_for_new_gpu_legs(monkeypatch):
     args = {"round_id": "1", "hotkey": "H", "gen_ref": index["generator_ref"], "seed": 3}
     assert stage.existing(**args) is None
     index["channels_histogram"] = {"8": 1, "32": 1}
+    assert stage.existing(**args) is None
+    index["channels_histogram"] = {"32": 2}
     assert stage.existing(**args).index is index
 
 
@@ -179,15 +181,15 @@ def test_unbound_verification_holds_on_both_sides_of_the_launch(tmp_path, networ
     cfg = replace(cfg, generator=replace(cfg.generator, sandbox_strict=False))
     (tmp_path / "generator.py").write_text(_WIDTH_GENERATOR)
     (tmp_path / "requirements.txt").write_text("")
-    for channels, ok in ((8, True), (4, False)):
+    for channels, ok in ((32, True), (8, False)):
         (tmp_path / "config.json").write_text(json.dumps({"channels": channels}))
         assert verify_repo(tmp_path, cfg, quick=True).ok  # the base contract alone
         report = verify_repo(tmp_path, cfg, quick=True, across_launch=True)
         assert report.ok is ok, report.render()
-    assert "channels outside [8, 32]" in report.render()
+    assert "channels outside [32, 32]" in report.render()
 
 
-@pytest.mark.parametrize('channels', [7, 8, 32, 33])
+@pytest.mark.parametrize('channels', [7, 8, 31, 32, 33])
 def test_grouped_tier_enforces_width_and_reproduces_group_draw(tmp_path, channels):
     base = load_chain_config()
     cfg = base.generator_for_contract(base.training.v2_contract)
@@ -200,7 +202,7 @@ def test_grouped_tier_enforces_width_and_reproduces_group_draw(tmp_path, channel
     g = GenerationConfig(vcpus=2, target_points=1024, shard_points=512)
     a = generate_corpus(tmp_path, 4, cfg, g, tmp_path / 'a', runner=child)
     b = generate_corpus(tmp_path, 4, cfg, g, tmp_path / 'b', runner=child)
-    if channels in (8, 32):
+    if channels == 32:
         assert not a['faults'] and a['schema'] == 2
         assert a['corpus_digest'] == b['corpus_digest']
     else:

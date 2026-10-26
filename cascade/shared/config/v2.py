@@ -33,6 +33,8 @@ class V2Config:
     """
 
     from_block: int = 0
+    # Private verdict budget for v2 eras; 0 preserves the earlier eval policy.
+    eval_n_windows: int = 0
     launch_at_utc: str = ""
     commit_open_at_utc: str = ""
     commit_from_block: int = 0
@@ -301,7 +303,7 @@ def parse_v2_economics(v2raw: dict) -> dict:
     if readiness and (not readiness.isascii() or not readiness.isalnum() or len(readiness) > 12):
         raise ValueError("v2 prelaunch_burn_readiness must be up to 12 ASCII letters/digits")
     out.update(launch_at_utc=launch, commit_open_at_utc=opening, prelaunch_burn_readiness=readiness)
-    for k in ("random_init_eras", "reign_warm_start_blocks", "prelaunch_burn_from_block", "commit_from_block"):
+    for k in ("random_init_eras", "reign_warm_start_blocks", "prelaunch_burn_from_block", "commit_from_block", "eval_n_windows"):
         raw = v2raw.get(k, 0)
         if isinstance(raw, bool) or not isinstance(raw, int):
             raise ValueError(f"[v2] {k} must be an integer; got {raw!r}")

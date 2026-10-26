@@ -111,6 +111,8 @@ class PoolBuildConfig:
     # predate source stamping keep building — but flip it on before any pool
     # carries multichannel windows.
     require_source: bool = False
+    # Producer-only mode; recorded source keys keep archived verdicts unchanged.
+    cluster_by: str = "source"
     # v2 primary pool (DEC-CA-0050 P2): every kept series must carry a real
     # domain label — lane B judges per domain, so an "unknown"/empty label is
     # a window no domain verdict can use. Off by default (legacy pools keep
@@ -211,7 +213,14 @@ def prepare_series(
     arr = _to_2d_float(hs.values)
     if arr is None:
         return None, "bad_shape"
-    if cfg.require_source and not hs.source:
+    family = hs.attrs.get("source_family") if hs.attrs else None
+    if cfg.cluster_by not in ("source", "source_family"):
+        raise ValueError("cluster_by must be source or source_family")
+    if cfg.cluster_by == "source_family" and (not isinstance(family, str)
+                                               or not family or family.startswith("unresolved:")):
+        return None, "missing_source_family"
+    cluster = family if cfg.cluster_by == "source_family" else hs.source
+    if cfg.require_source and not cluster:
         return None, "missing_source"
     if cfg.require_domain and str(hs.domain or "").strip().lower() in UNLABELED_DOMAINS:
         return None, "missing_domain"
@@ -246,8 +255,12 @@ def prepare_series(
         else get_seasonality(hs.freq)
     )
     metadata = {"freq": hs.freq, "seasonal_period": seasonal, "domain": hs.domain}
-    if hs.source:
-        metadata["source"] = hs.source
+    if cluster:
+        metadata["source"] = cluster
+    if cfg.cluster_by == "source_family":
+        metadata["source_family"] = family
+        if hs.source:
+            metadata["catalog_source"] = hs.source
     # DGP class label (tsbench-forge catalog) — drives the jittered mix's
     # class-rotation tier (cascade.validator.windows). Absent for sources
     # without one; the sampler degrades to domain-level jitter only.

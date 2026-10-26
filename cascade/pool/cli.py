@@ -81,17 +81,20 @@ def _add_build_args(p: argparse.ArgumentParser) -> None:
                    help="DEC-CA-0041: pack each tagged source's mv_channels into one "
                         "(C, L) multivariate series (else project to the first channel). "
                         "Raise --max-channels alongside, and arm [scoring] mv_score_from_block.")
-    p.add_argument("--max-channels", type=int, default=1,
+    p.add_argument("--max-channels", type=int, default=32,
                    help="Max variates a kept series may carry (raise with --mv-pack).")
-    p.add_argument("--max-series-per-domain", type=int, default=None)
+    p.add_argument("--max-series-per-domain", type=int, default=800)
     p.add_argument(
         "--max-series-per-domain-freq",
         type=int,
-        default=None,
+        default=400,
         help="Cap per (domain, granularity) cell — an hourly flood inside a domain "
         "can't crowd out that domain's daily series.",
     )
     p.add_argument("--max-series-total", type=int, default=None)
+    p.add_argument("--cluster-by", choices=("source_family", "source"), default="source_family",
+                   help="Bootstrap grouping in newly built snapshots: conservative source families "
+                        "(default), or legacy feed ids for archived build reproduction.")
     p.add_argument(
         "--require-domain",
         action="store_true",
@@ -465,6 +468,7 @@ def _build(args: argparse.Namespace, cfg, *, out_dir: Path, overwrite: bool):
         max_series_total=args.max_series_total,
         require_domain=bool(getattr(args, "require_domain", False)),
         require_source=bool(getattr(args, "require_source", False)),
+        cluster_by=str(getattr(args, "cluster_by", "source")),
         min_series_per_domain=getattr(args, "min_series_per_domain", None),
         max_channels=int(getattr(args, "max_channels", 1) or 1),
         selection=selection,

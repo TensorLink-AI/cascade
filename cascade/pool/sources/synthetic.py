@@ -45,5 +45,5 @@ class SyntheticSource:
                 freq="H",
                 domain="synthetic",
                 seasonal_period=24,
-                attrs={"period": period},
+                attrs={"period": period, "source_family": "synthetic:testing-only"},
             )
