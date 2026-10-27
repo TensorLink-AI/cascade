@@ -17,6 +17,7 @@ One folder per reign, oldest first. `champions/king` is the sitting king; this a
 | 11 | [`11-5Dez81amG9d7`](11-5Dez81amG9d7/) | 23 | `5Dez81amG9d7…` | 2026-08-29 23:25 | 44 | `jan/p1-top-health@sha256:224b8b9d17029c19a0811ca` | 2 |
 | 12 | [`12-5Fv6FJ2JA5oP`](12-5Fv6FJ2JA5oP/) | 90 | `5Fv6FJ2JA5oP…` | 2026-09-06 12:16 | 12 | `rltrainer/vant-energy-lock85@sha256:0818031eb0ad` | 2 |
 | 13 | [`13-5GDygEQUGWfc`](13-5GDygEQUGWfc/) | 126 | `5GDygEQUGWfc…` | 2026-09-09 00:05 | 23 | `tonybilling/gen-64a0412cd332@hf:f4e2c286b471e2ef` | 2 |
+| 13 | [`13-5Gsa19SFpRY9`](13-5Gsa19SFpRY9/) | 31 | `5Gsa19SFpRY9…` | 2026-10-23 01:27 | 25 | `vault/direct@sha256:04e226724e3be088e01134a18959` | 0 |
 | 14 | [`14-5Eo6DSBhKyhi`](14-5Eo6DSBhKyhi/) | 165 | `5Eo6DSBhKyhi…` | 2026-09-13 15:16 | 57 | `vault/direct@sha256:95204b7eb8c2e0ca1c2433bd19bc` | 2 |
 | 15 | [`15-5GuWuTLLKunU`](15-5GuWuTLLKunU/) | 87 | `5GuWuTLLKunU…` | 2026-09-24 07:59 | 21 | `vault/direct@sha256:26f81e59d1aec8a11d067a9099cd` | 2 |
 | 16 | [`16-5ETnnvxu1nqt`](16-5ETnnvxu1nqt/) | 147 | `5ETnnvxu1nqt…` |  | 0 | `vault/direct@sha256:298591a20129a4b1326f4ffcd7b5` | 0 |
