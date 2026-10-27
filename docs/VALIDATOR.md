@@ -156,18 +156,57 @@ store. This checkout requires certifi >=2026.10.19. After installing, run
 See [TLS setup and worker rollout](OPERATOR.md#tls-trust-and-the-october-2026-emudhra-incident)
 if the check fails; never bypass certificate verification.
 
+Validators run **`main`**. The older `cascade-v2` branch is behind it, so
+don't install from it.
+
 ```bash
-git clone --branch cascade-v2 https://github.com/TensorLink-AI/cascade && cd cascade
-pip install -e '.[train,hippius,chain]'
+git clone https://github.com/TensorLink-AI/cascade && cd cascade
+uv sync --frozen --extra train --extra hippius --extra chain
+# pip alternative: pip install -e '.[train,hippius,chain]'
 ```
+
+`uv sync --frozen` installs exactly what `uv.lock` pins, which keeps every
+validator on identical numerics. Don't use `--all-extras`: validators don't
+need the generation, MarketCast or satellite extras.
 
 The install pins `bittensor==11.3.0` — **don't change it**: the port to the
 11.x SDK (DEC-CA-0051) keeps the subnet's reveal encoding, the activation
 tally's stake source and the u16 weight quantisation bit-identical to the
-10.5 fleet, and other SDK lines differ on at least one of those. Upgrade
-with `pip install -e '.[train,hippius,chain]'` (or `uv sync --all-extras`)
-and restart; 10.5-era signatures, keyfiles and on-chain reveals all keep
-working.
+10.5 fleet, and other SDK lines differ on at least one of those. 10.5-era
+signatures, keyfiles and on-chain reveals all keep working.
+
+### Upgrade an existing validator
+
+Upgrade when the owner announces a release, and before any activation block
+the announcement names:
+
+```bash
+cd cascade
+git fetch origin && git checkout main && git pull --ff-only origin main
+git log -1 --oneline          # matches the commit the owner announced
+uv sync --frozen --extra train --extra hippius --extra chain
+python scripts/check_tls_trust.py   # same interpreter as the CLI
+# restart cascade-validator the way you normally run it
+```
+
+- **Keep your state.** Restart from the same directory, so the validator
+  finds its state files (`validator_state.db`, `cascade_state.json`,
+  `warm_start_init.json`, `activation_*.json`). They carry your activation
+  lock-ins and the last settlement you handled. Never delete them to
+  "start clean". Copy them aside first if you want a rollback point.
+- **Local `chain.toml` edits.** `git pull` refuses to overwrite them. Copy
+  the file aside, pull, then re-apply only the edits you still need. The
+  published file is the authority for every consensus value.
+- **Check after restarting:**
+  - the startup lines show `validator up` and `activation: restored …` for
+    each lock-in;
+  - `weights set:` lines keep appearing, about every 180 blocks;
+  - there are no `rejecting manifest … contract_*` lines;
+  - your weight vector matches the subnet's (the king's uid first).
+
+Two log lines after an upgrade are expected (see
+[What can go wrong](#what-can-go-wrong)): a `set_weights rejected … rate
+limit` right after the restart, and the SDK's periodic `reconnecting` notice.
 
 Register and stake as you would on any subnet (netuid above; weight-setting
 needs a validator permit, i.e. stake above the subnet threshold).
@@ -429,6 +468,8 @@ FAILs and read WARNs for missing evidence. See
 | `manifest chain: … does not reach this validator's last handled settlement` | a `round-<id>.json` is missing from the bucket; the validator retries deeper each poll — report it if it persists |
 | `no eval-pool snapshot published` | owner hasn't published a snapshot, or wrong pool creds |
 | weights never set | no validator permit (insufficient stake), or the extrinsic fails — check `btcli` and `weight set failed` log lines |
+| `set_weights rejected … the rate limit is 100 blocks` just after a restart | expected: the previous process set weights moments before. It retries each poll, and the next set lands within ~100 blocks |
+| INFO `bittensor.transport: Connection to wss://… lost (…no response… in 60.0s); reconnecting` every few minutes | expected with SDK 11.3: it drops and reopens an idle chain connection. Harmless while `weights set:` lines keep appearing |
 | every pool read `SignatureDoesNotMatch` | you set `POOL_S3_*` with the default endpoint — unset them |
 | gift gate / bench slow | those want a GPU — `--eval-hosts`, or pin `gift_gate_data_dir` on a CUDA box |
 | audit WARNs on `block-hash-onchain` | lite node without history — use an archive node for zero WARNs |
@@ -612,7 +653,7 @@ the DEC-CA-0057 overlays). Satellites are inert while that key is empty.
 **Install (small CPU box, no `[train]` extra):**
 
 ```bash
-git clone --branch cascade-v2 https://github.com/TensorLink-AI/cascade && cd cascade
+git clone https://github.com/TensorLink-AI/cascade && cd cascade
 pip install -e '.[satellite]'          # == .[hippius,chain]: boto3, hippius-hub, bittensor 11.3.0
 export HIPPIUS_S3_ACCESS_KEY=...       # READ access on the manifest bucket
 export HIPPIUS_S3_SECRET_KEY=...       # (manifests/, receipts/, benchmarks/, bench_v/, marketcast/, config/network/)
