@@ -151,7 +151,7 @@ def verify_repo(
                 "packed_source" if (guard.reason or "").startswith("packed_source")
                 else "blocked_import",
                 blocked_module=guard.blocked_module,
-                reason=guard.reason,
+                guard_reason=guard.reason,
                 file=guard.file,
             ),
         ))

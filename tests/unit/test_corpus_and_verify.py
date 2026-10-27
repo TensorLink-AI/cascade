@@ -55,6 +55,33 @@ def test_verify_static_path_only(small_cfg, example_generator_dir):
     assert report.runtime_skipped
 
 
+@pytest.mark.parametrize("source, code", [
+    ("import socket\n", "blocked_import"),
+    ('_S = """\nimport numpy as np\n\n\ndef make(rng, n):\n'
+     '    \\"\\"\\"Eight channels from one random walk, each scaled and lightly noised.\\"\\"\\"\n'
+     '    x = np.cumsum(rng.standard_normal(n))\n'
+     '    return np.stack([x * (k + 1) for k in range(8)]) + 0.05 * rng.standard_normal((8, n))\n"""\n'
+     'exec(_S)\n', "packed_source"),
+])
+def test_verify_reports_static_guard_rejection(tmp_path, small_cfg, example_generator_dir,
+                                               source, code):
+    # Regression: the guard's own reason collided with ValidationResult.fail's
+    # positional reason, so every static-guard rejection crashed verify.
+    import shutil
+    from dataclasses import replace
+
+    small_cfg = replace(small_cfg, static_guard=replace(small_cfg.static_guard, packed_sources="reject"))
+    repo = tmp_path / "gen"
+    shutil.copytree(example_generator_dir, repo)
+    gen = repo / "generator.py"
+    gen.write_text(source + gen.read_text())
+    report = verify_repo(repo, small_cfg, skip_runtime=True)
+    assert not report.ok
+    (_, result), = [f for f in report.failures if f[0] == "static_guard"]
+    assert result.reason == code
+    assert result.details["guard_reason"]
+
+
 def test_build_round_corpus_cache_reuse(small_cfg, example_generator_dir):
     from cascade.trainer.corpus import build_round_corpus
 
