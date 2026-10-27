@@ -336,8 +336,9 @@ funded_queue_path = "funded_queue.json"   # shared with cascade-intake (work_roo
 skip_unfunded_rounds = true               # retired (ignored)
 max_rounds_per_day = 2                    # retired (ignored)
 funded_entry_ttl_hours = 36.0             # MUST track cascade-intake --ttl-hours (key TTL)
-# "rent": each funded leg rents ONE pod on its payer's Lium key (the era king
-# stays operator-funded). Consensus-inert.
+# "rent": each funded leg rents ONE pod on its payer's provider key.
+# Pre-v2 king training is operator-paid; v2 king_ladder tries the king's key
+# before operator recovery (DEC-CA-0055). Consensus-inert infrastructure.
 funded_pods = "rent"
 payer_vault_dir = "payer_vault" # cascade-intake --vault-dir (work_root-relative)
 funded_pod_sku = ""             # unused with funded_pod_skus set (per-round pick)

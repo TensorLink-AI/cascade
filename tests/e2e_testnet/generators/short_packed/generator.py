@@ -1,6 +1,7 @@
-"""Gap probe: a packed module SHORTER than static_guard.MIN_PACKED_CHARS hiding a
-blocked import. The static scan does not decode it; only the runtime sandbox
-stands between it and the network. Reported as WARN while it verifies."""
+"""Rejection fixture: a short literal exec hiding a blocked import.
+
+Literal code evaluators are scanned even below MIN_PACKED_CHARS.
+"""
 from __future__ import annotations
 
 from collections.abc import Iterator

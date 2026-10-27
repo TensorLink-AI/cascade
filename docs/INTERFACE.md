@@ -148,6 +148,14 @@ They share the same length but can describe independent processes. Time crops
 leave labels unchanged. Batching uses equal-width buckets, with no channel
 padding. Every value still counts toward the normal point and batch budgets.
 
+Miners choose the packing; no group-size distribution is required. For
+example, 12 related channels + 5 + 3 + 12 independent singletons fills all
+32 slots, with labels `[0]*12 + [1]*5 + [2]*3 + list(range(3, 15))`.
+The checked-in mainnet v2 batch uses `batch_size=512` with
+`batch_denomination="sequences"`: 16 examples × 32 channels per optimizer
+batch. Its eight micro-batches split that into two examples at a time.
+This matches channel-series count; it is not a measured GPU-cost guarantee.
+
 Draw group sizes and labels deterministically from the generator seed. Your
 own `config.json` controls the size distribution. The starter's optional
 `packing.enabled` defaults to `false`; enable it only under a contract that
@@ -158,7 +166,9 @@ channels. Each group gets an independently drawn driver. Full verification
 checks label determinism along with values.
 
 Omitting `groups` or setting it to `None` preserves values-only output, losses,
-digests and schema-1 shard bytes. An explicit all-zero vector has the same
+digests and legacy schema-1 shard bytes. Explicit schema-3 storage uses the
+same lossless float32 values and group labels with different Parquet bytes.
+An explicit all-zero vector has the same
 attention/sampling behavior but contributes to the record digest. Other group
 vectors use schema-2 shards and their labels are covered by shard and stream
 hashes. The copula shares one latent within each group, independently of the

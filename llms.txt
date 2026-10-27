@@ -125,6 +125,7 @@ Percentages are shares of the competition reward vector. A lane's pool is its bu
 - [Protocol decisions](decisions/): historical rules and amendments, not a declaration that a feature is live.
 
 Optional generator `groups` labels pack independent channel groups into each
-32-channel yield. Use them only when the effective contract accepts
+32-channel yield. Miners choose the packing and group-size mix; the
+starter distribution is an example, not an admission rule. Use them only when the effective contract accepts
 `groups`; omission or `None` keeps the values-only path. See the group-packing
 section of [the interface](docs/INTERFACE.md#pack-independent-groups-in-one-yield).

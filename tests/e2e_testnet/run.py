@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shutil
@@ -96,7 +97,8 @@ class Report:
         counts = {s: sum(c.status == s for c in self.checks) for s in ("PASS", "FAIL", "WARN", "SKIP")}
         doc = {"started_at": self.started, "updated_at": time.time(), "counts": counts,
                "checks": [asdict(c) for c in self.checks]}
-        self.path.write_text(json.dumps(doc, indent=1, default=str))
+        from cascade.shared.atomic import write_text_atomic
+        write_text_atomic(self.path, json.dumps(doc, indent=1, default=str, allow_nan=False))
 
     def failed(self) -> int:
         return sum(c.status == "FAIL" for c in self.checks)
@@ -110,12 +112,18 @@ class Ctx:
         self.r = report
         self.toml = str(Path(args.chain_toml).resolve())
         self.state_path = Path(args.state)
-        self.state = json.loads(self.state_path.read_text()) if (args.resume and self.state_path.is_file()) else {}
+        existing = json.loads(self.state_path.read_text()) if self.state_path.is_file() else {}
+        if not isinstance(existing, dict):
+            raise ValueError("e2e state must be an object; refusing to discard recovery evidence")
+        if existing.get("entries") and not args.resume:
+            raise ValueError("existing submissions require --resume or a different --state path")
+        self.state = existing if args.resume else {}
         self._cfg = None
         self._chain = None
 
     def save_state(self) -> None:
-        self.state_path.write_text(json.dumps(self.state, indent=1))
+        from cascade.shared.atomic import write_text_atomic
+        write_text_atomic(self.state_path, json.dumps(self.state, indent=1, allow_nan=False))
 
     @property
     def cfg(self):
@@ -198,14 +206,20 @@ def proc_running(pattern: str) -> list[str]:
     return [ln for ln in out.splitlines() if "pgrep" not in ln] if rc == 0 else []
 
 
-def testnet_pods() -> dict[str, list[str]]:
+def testnet_pods(netuid: int = 259) -> dict[str, list[str]]:
     """Live pods whose names carry the testnet netuid prefix, per provider we can list."""
-    netuid_tag = "cascade-n259-"
+    netuid_tag = f"cascade-n{int(netuid)}-"
     pods: dict[str, list[str]] = {}
     if os.environ.get("LIUM_API_KEY"):
         rc, out, _ = run(["lium", "ps", "--format", "json"], timeout=90)
-        names = re.findall(r'"name"\s*:\s*"([^"]+)"', out) if rc == 0 else []
-        pods["lium"] = sorted(n for n in names if n.startswith(netuid_tag))
+        try:
+            rows = json.loads(out) if rc == 0 else None
+            if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+                raise ValueError("invalid pod inventory")
+            pods["lium"] = sorted(str(row["name"]) for row in rows
+                                   if str(row.get("name", "")).startswith(netuid_tag))
+        except (ValueError, KeyError):
+            pods["lium"] = ["<list failed>"]
     key = os.environ.get("SHADEFORM_API_KEY")
     if key:
         req = urllib.request.Request("https://api.shadeform.ai/v1/instances", headers={"X-API-KEY": key})
@@ -217,6 +231,14 @@ def testnet_pods() -> dict[str, list[str]]:
                                        and i.get("status") not in ("deleted", "deleting"))
         except (urllib.error.URLError, ValueError, TimeoutError):
             pods["shadeform"] = ["<list failed>"]
+    for name in ("vast", "runpod"):
+        key = os.environ.get(PROVIDER_ENV[name])
+        if key:
+            from cascade.provision.funded import provider_for_key
+            try:
+                pods[name] = sorted(provider_for_key(name, key).list_tagged(netuid_tag))
+            except Exception:  # noqa: BLE001 — never publish account errors or mistake them for empty
+                pods[name] = ["<list failed>"]
     return pods
 
 
@@ -290,6 +312,7 @@ def stage_preflight(ctx: Ctx) -> None:
     r.check(S, "intake_http", q is not None, f"GET {ctx.args.intake}/v1/queue")
 
     head = ctx.chain.current_block()
+    effective = cfg.throne_contracts_at(head)[0]
     v2_from = int(cfg.v2.from_block) if getattr(cfg, "v2", None) else 0
     ctx.state["head_at_start"] = head
     r.check(S, "v2_active", v2_from and head >= v2_from, f"head={head} [v2] from_block={v2_from}",
@@ -313,7 +336,7 @@ def stage_preflight(ctx: Ctx) -> None:
     providers = (data.get("compute") or {}).get("rolling_providers") or []
     r.check(S, "rolling_providers_published", bool(providers), f"{providers}")
 
-    img = cfg.training.train_image_digest if hasattr(cfg.training, "train_image_digest") else ""
+    img = effective.train_image_digest
     funded = getattr(cfg.round, "funded_pod_image", "")
     # The contract pins a bare digest; the pod image ref carries it after "@".
     r.check(S, "image_pinned", bool(re.fullmatch(r"sha256:[0-9a-f]{64}", img or "")),
@@ -342,9 +365,26 @@ def stage_preflight(ctx: Ctx) -> None:
         present = bool(os.environ.get(env))
         r.add(S, f"provider_key_{p}", "PASS" if present else "SKIP", f"{env} {'set' if present else 'not set'}")
 
-    baseline = testnet_pods()
-    ctx.state.setdefault("pod_baseline", baseline)
-    r.add(S, "pod_baseline", "PASS", json.dumps(baseline))
+    baseline = testnet_pods(cfg.subnet.netuid)
+    baseline_ok = bool(baseline) and all("<list failed>" not in v for v in baseline.values())
+    if baseline_ok:
+        ctx.state.setdefault("pod_baseline", baseline)
+    r.check(S, "pod_baseline", baseline_ok, json.dumps(baseline))
+    unobserved = [p for sc in SCENARIOS if not ctx.args.scenarios or sc["name"] in ctx.args.scenarios
+                  for p in sc["providers"] if os.environ.get(PROVIDER_ENV[p]) and p not in baseline]
+    if unobserved:
+        r.add(S, "cleanup_coverage", "WARN", f"automatic pod inventory unavailable for {sorted(set(unobserved))}")
+    operator_providers = tuple(cfg.round.ops_operator_providers or ("lium",))
+    operator_ready = any(os.environ.get(PROVIDER_ENV[p]) for p in operator_providers if p in PROVIDER_ENV)
+    r.check(S, "operator_king_account", operator_ready,
+            "Operator account present for king fallback; this does not verify credit or capacity." if operator_ready else
+            "No configured operator provider credential: a carried king without a funded key cannot train.")
+    r.add(S, "cpu_generation_coverage", "PASS" if effective.corpus_mode == "shards" and cfg.generation.enabled else "WARN",
+          f"corpus_mode={effective.corpus_mode}; generation.enabled={cfg.generation.enabled}. "
+          "Streaming-only runs do not qualify the production CPU shard tier.")
+    r.add(S, "king_funding_coverage", "PASS" if cfg.v2.king_ladder else "WARN",
+          "King self-funding/key-failure rules are enabled." if cfg.v2.king_ladder else
+          "king_ladder=false: this run uses operator king funding and does not exercise mainnet self-funding.")
     ctx.save_state()
 
 
@@ -356,10 +396,8 @@ def stage_admission(ctx: Ctx) -> None:
         ("rejects_packed_source", "packed_source", r"pack|string|exec|static"),
         ("rejects_nondeterministic", "nondeterministic", r"not deterministic"),
         ("rejects_network_access", "net_access", r"blocked_import|socket"),
-        # Known gap probe: a sub-MIN_PACKED_CHARS exec'd module with a blocked import.
-        ("gap_short_packed_import", "short_packed", r"blocked_import|packed_source|socket"),
+        ("rejects_short_packed_import", "short_packed", r"blocked_import|packed_source|socket"),
     )
-    known_gaps = {"gap_short_packed_import"}
 
     def one(case):
         name, fixture, expect = case
@@ -375,22 +413,16 @@ def stage_admission(ctx: Ctx) -> None:
                 ctx.r.check(S, name, rc == 0 and "OK" in text, text.strip().splitlines()[-1:] and
                             text.strip().splitlines()[-1], t0=t0)
             else:
-                rejected = rc != 0 or "FAIL" in text
+                rejected = rc == 1 and "FAIL" in text
                 reason_ok = bool(re.search(expect, text, re.I))
                 crashed = "Traceback (most recent call last)" in text
                 if crashed:
                     ctx.r.add(S, name, "FAIL", f"verify crashed instead of reporting a rejection: "
                               f"{text.strip().splitlines()[-1][:300]}", t0=t0)
                     continue
-                if name in known_gaps:
-                    ctx.r.add(S, name, "PASS" if rejected else "WARN",
-                              "static guard rejected it" if rejected else
-                              "KNOWN GAP: verified OK; a short exec'd string hides a blocked import "
-                              "from the static scan (runtime sandbox is the only backstop)", t0=t0)
-                    continue
                 ctx.r.check(S, name, rejected and reason_ok,
                             f"rejected={rejected} reason_matches={reason_ok}: {text.strip()[-300:]}",
-                            warn=rejected and not reason_ok, t0=t0)
+                            t0=t0)
 
     # Upload path without touching chain or funding: --no-commit prints the payload.
     sc = SCENARIOS[0]
@@ -439,15 +471,19 @@ def _track(ctx: Ctx, entry: dict) -> None:
     rc, doc, _ = cli(ctx, "status", "--chain-toml", ctx.toml, "--hotkey", entry["hotkey"], "--lane", "a",
                      "--ref", entry["ref"], "--intake", ctx.args.intake, timeout=120)
     data = (doc or {}).get("data") or {}
-    obs = data.get("observed") or {}
-    status, phase = obs.get("status") or data.get("status"), obs.get("phase")
+    views = data.get("submissions") or []
+    view = next((v for v in views if isinstance(v, dict) and v.get("hotkey") == entry["hotkey"]
+                 and v.get("ref") == entry["ref"] and v.get("lane") == "a"), {})
+    fresh = bool((view.get("freshness") or {}).get("fresh"))
+    obs = view.get("observed") or {} if fresh else {}
+    status, phase = (obs.get("status") or view.get("status"), obs.get("phase")) if fresh else ("unknown", None)
     if not entry["phases"] or entry["phases"][-1][1:] != [status, phase]:
         entry["phases"].append([time.time(), status, phase])
         print(f"    {entry['scenario']}: status={status} phase={phase} "
               f"err={obs.get('last_error_class') or ''}", flush=True)
     entry.update(status=status, phase=phase, gpu=obs.get("gpu"), attempts=obs.get("attempts"),
                  requeues=obs.get("requeues"), last_error_class=obs.get("last_error_class"),
-                 operator_billed=obs.get("operator_billed"), verdict=data.get("verdict"),
+                 operator_billed=obs.get("operator_billed"), verdict=view.get("evaluation"),
                  started_block=obs.get("started_block"), era_index=obs.get("era_index"))
 
 
@@ -469,6 +505,9 @@ def stage_legs(ctx: Ctx) -> None:
     selected = [s for s in SCENARIOS if not ctx.args.scenarios or s["name"] in ctx.args.scenarios]
     for sc in selected:
         if sc["name"] in entries:
+            if entries[sc["name"]].get("submission_unresolved"):
+                ctx.r.add(S, f"submit_{sc['name']}", "FAIL",
+                          "Previous submit outcome is unresolved; reconcile the chain and intake before continuing.")
             continue
         missing = [p for p in sc["providers"] if not os.environ.get(PROVIDER_ENV[p])]
         if missing or not hotkey_of(sc["wallet"]):
@@ -476,6 +515,9 @@ def stage_legs(ctx: Ctx) -> None:
                       f"missing keys {missing}" if missing else f"no wallet {sc['wallet']}")
             continue
         t0 = time.time()
+        entries[sc["name"]] = {"scenario": sc["name"], "submission_unresolved": True,
+                                "submitted_at": time.time()}
+        ctx.save_state()
         e = _submit(ctx, sc)
         entries[sc["name"]] = e
         ctx.save_state()
@@ -492,7 +534,7 @@ def stage_legs(ctx: Ctx) -> None:
                              "--network", ctx.args.network, "--watch", "--timeout-s",
                              str(int(ctx.args.reveal_timeout)), timeout=ctx.args.reveal_timeout + 120)
             state = ((doc or {}).get("data") or {}).get("state")
-            e["revealed"] = state not in (None, "none", "pending")
+            e["revealed"] = rc == 0 and state == "revealed"
             ctx.r.check(S, f"reveal_{name}", e["revealed"], f"state={state}", t0=t0)
             ctx.save_state()
 
@@ -531,22 +573,54 @@ def stage_legs(ctx: Ctx) -> None:
 
 
 def _receipt(ctx: Ctx, validator_hk: str, round_id: str | None = None) -> dict | None:
-    key = f"receipts/{validator_hk}/{'round-' + round_id if round_id else 'latest'}.json"
+    from cascade.shared.hippius import receipt_latest_key, receipt_round_key
+    from cascade.shared.receipt import load_receipt, verify_receipt_signature
+
+    if not validator_hk:
+        return None
+    key = receipt_round_key(round_id, validator_hk) if round_id else receipt_latest_key(validator_hk)
     doc = http_json(ctx.bucket_url(key))
-    if isinstance(doc, dict) and "body" in doc and isinstance(doc["body"], dict):
-        return {**doc["body"], "_envelope": True}
-    return doc if isinstance(doc, dict) else None
+    if not isinstance(doc, dict):
+        return None
+    try:
+        receipt = load_receipt(json.dumps(doc, allow_nan=False))
+        if (receipt.validator_hotkey != validator_hk
+                or round_id is not None and receipt.round_id != round_id
+                or not verify_receipt_signature(receipt, validator_hk)):
+            return None
+    except Exception:  # noqa: BLE001 — missing verifier/invalid signature cannot establish a pass
+        return None
+    return doc
 
 
-def _participant_hotkeys(receipt: dict) -> set[str]:
-    out = set()
-    for p in receipt.get("participants") or []:
-        if isinstance(p, dict) and p.get("hotkey"):
-            out.add(p["hotkey"])
-    for k in ("chal_hotkey", "king_hotkey"):
-        if (receipt.get("verdict") or {}).get(k):
-            out.add(receipt["verdict"][k])
-    return out
+def _judged_entry(receipt: dict, entry: dict) -> bool:
+    if receipt.get("status") != "scored" or not receipt.get("verdict"):
+        return False
+    rows = (receipt.get("manifest") or {}).get("entries") or []
+    return any(isinstance(r, dict) and r.get("role") == "challenger"
+               and r.get("miner_hotkey") == entry.get("hotkey")
+               and r.get("gen_ref") == entry.get("ref") for r in rows)
+
+
+def _weights_agree(on_chain, receipt):
+    """Compare normalized values as well as support, allowing u16 rounding."""
+    try:
+        actual = [float(x) for x in on_chain]
+        expected = [float(x) for x in receipt["weights"]]
+        if not actual or not expected or any(not math.isfinite(x) or x < 0 for x in actual + expected):
+            return False
+        if sum(actual) <= 0 or sum(expected) <= 0:
+            return False
+        support = [i for i, x in enumerate(expected) if x > 0]
+        if support != sorted(receipt.get("reward_uids") or []):
+            return False
+        n = max(len(actual), len(expected))
+        a, b = sum(actual), sum(expected)
+        actual += [0.0] * (n - len(actual))
+        expected += [0.0] * (n - len(expected))
+        return all(abs(x / a - y / b) <= 2 * (len(support) + 1) / 65535 + 1e-6 for x, y in zip(actual, expected, strict=True))
+    except (TypeError, ValueError, KeyError, OverflowError):
+        return False
 
 
 def stage_settlement(ctx: Ctx) -> None:
@@ -559,13 +633,31 @@ def stage_settlement(ctx: Ctx) -> None:
     deadline = time.time() + ctx.args.settle_timeout
     while entries and time.time() < deadline and any(n not in rounds for n in entries):
         latest = _receipt(ctx, vals[0])
-        if latest:
-            hks = _participant_hotkeys(latest)
+        candidates = [latest] if latest else []
+        index = http_json(ctx.bucket_url("receipts/index.json"))
+        rows = (index or {}).get("rounds", []) if isinstance(index, dict) else []
+        seen = ctx.state.setdefault("settlement_receipts_checked", [])
+        for row in reversed(rows[-400:]):
+            if time.time() >= deadline:
+                break
+            if not isinstance(row, dict) or row.get("validator_hotkey") != vals[0] or row.get("status") != "scored":
+                continue
+            if int(row.get("epoch_start_block") or 0) < int(ctx.state.get("head_at_start") or 0):
+                continue
+            rid = str(row.get("round_id") or "")
+            if not rid or rid in seen or latest and rid == str(latest.get("round_id")):
+                continue
+            rec = _receipt(ctx, vals[0], rid)
+            if rec is not None:
+                candidates.append(rec)
+                seen.append(rid)
+        ctx.state["settlement_receipts_checked"] = seen[-400:]
+        for candidate in candidates:
             for n, e in entries.items():
-                if n not in rounds and e["hotkey"] in hks:
-                    rounds[n] = str(latest.get("round_id"))
+                if n not in rounds and _judged_entry(candidate, e):
+                    rounds[n] = str(candidate.get("round_id"))
                     print(f"    {n}: judged in round {rounds[n]}", flush=True)
-            ctx.save_state()
+        ctx.save_state()
         if any(n not in rounds for n in entries):
             time.sleep(ctx.args.poll)
 
@@ -576,7 +668,7 @@ def stage_settlement(ctx: Ctx) -> None:
             continue
         recs = {v: _receipt(ctx, v, rid) for v in vals}
         for v, rec in recs.items():
-            ctx.r.check(S, f"receipt_{n}_{v[:8]}", rec is not None and rec.get("status") in ("scored", "rejected"),
+            ctx.r.check(S, f"receipt_{n}_{v[:8]}", rec is not None and _judged_entry(rec, e),
                         f"status={rec and rec.get('status')} reject={rec and rec.get('reject_reason')}")
         a, b = recs.values()
         if a and b:
@@ -588,12 +680,17 @@ def stage_settlement(ctx: Ctx) -> None:
             ctx.r.check(S, f"validators_agree_{n}", all(same.values()),
                         json.dumps({k: v for k, v in same.items() if not v}) or "all fields equal")
         for v in vals:
+            current = _receipt(ctx, v)
+            if current and str(current.get("round_id")) != rid:
+                ctx.r.add(S, f"weights_match_{n}_{v[:8]}", "SKIP",
+                          "A newer receipt exists; current chain weights cannot prove a historical settlement's weights.")
+                continue
             on_chain = ctx.chain.weights_for_hotkey(v) or []
             uids = sorted(i for i, x in enumerate(on_chain) if x > 0)
             rec = recs.get(v) or {}
-            ctx.r.check(S, f"weights_match_{n}_{v[:8]}", uids == sorted(rec.get("reward_uids") or []),
+            ctx.r.check(S, f"weights_match_{n}_{v[:8]}", _weights_agree(on_chain, rec),
                         f"chain={uids} receipt={sorted(rec.get('reward_uids') or [])}",
-                        warn=bool(uids and rec))
+                        warn=False)
         rc, doc, _ = cli(ctx, "duel", "--chain-toml", ctx.toml, "--round", rid, "--hotkey", e["hotkey"])
         ctx.r.check(S, f"duel_view_{n}", rc == 0 and (doc or {}).get("ok"), f"rc={rc}")
     rc, doc, _ = cli(ctx, "round", "--chain-toml", ctx.toml, "--network", ctx.args.network, "--once")
@@ -613,7 +710,7 @@ def stage_validator(ctx: Ctx) -> None:
                     f"round={latest and latest.get('round_id')} validator_hotkey="
                     f"{latest and str(latest.get('validator_hotkey'))[:10]}")
         if latest:
-            ctx.r.check(S, f"receipt_signer_{w}", latest.get("validator_hotkey") in ("", hk), "signer is this validator")
+            ctx.r.check(S, f"receipt_signer_{w}", latest.get("validator_hotkey") == hk, "signer is this validator")
     chain_status = http_json(ctx.bucket_url("status/chain.json"))
     ctx.r.check(S, "chain_status_feed", chain_status is not None, f"as_of={(chain_status or {}).get('as_of')}")
 
@@ -654,8 +751,11 @@ def stage_cleanup(ctx: Ctx) -> None:
     baseline = ctx.state.get("pod_baseline") or {}
     deadline = time.time() + ctx.args.cleanup_timeout
     while True:
-        now = testnet_pods()
+        now = testnet_pods(ctx.cfg.subnet.netuid)
+        unavailable = not now or any("<list failed>" in v for v in now.values())
         extra = {p: sorted(set(v) - set(baseline.get(p, []))) for p, v in now.items()}
+        if unavailable:
+            extra["inventory"] = ["listing unavailable; cleanup unverified"]
         extra = {p: v for p, v in extra.items() if v}
         if not extra or time.time() > deadline:
             break
@@ -668,7 +768,7 @@ def stage_cleanup(ctx: Ctx) -> None:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--chain-toml", default=str(ROOT / "chain.testnet.toml"))
-    ap.add_argument("--network", default="test")
+    ap.add_argument("--network", choices=("test",), default="test")
     ap.add_argument("--intake", default="http://127.0.0.1:8790")
     ap.add_argument("--s3-base", default="https://s3.hippius.com")
     ap.add_argument("--stages", default=",".join(STAGES))
@@ -686,15 +786,32 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--cleanup-timeout", type=float, default=1800)
     args = ap.parse_args(argv)
     args.scenarios = [s for s in args.scenarios.split(",") if s]
+    selected_stages = [s for s in args.stages.split(",") if s]
+    if any(s not in STAGES for s in selected_stages):
+        ap.error("unknown stage")
+    if any(s not in {sc["name"] for sc in SCENARIOS} for s in args.scenarios):
+        ap.error("unknown scenario")
+    if any(not math.isfinite(v) or v <= 0 for v in (args.poll, args.reveal_timeout, args.leg_timeout,
+            args.settle_timeout, args.cleanup_timeout)) or args.verify_workers < 1:
+        ap.error("timeouts, poll interval and verification worker count must be positive")
+    if args.spend and any(s in PAID for s in selected_stages):
+        selected_stages = ["preflight", *[s for s in selected_stages if s != "preflight"]]
     for p in (args.state, args.report):
         Path(p).parent.mkdir(parents=True, exist_ok=True)
     Path(args.workdir).mkdir(parents=True, exist_ok=True)
 
     report = Report(Path(args.report))
-    ctx = Ctx(args, report)
-    for stage in [s for s in args.stages.split(",") if s]:
+    try:
+        ctx = Ctx(args, report)
+    except (ValueError, OSError) as exc:
+        report.add("preflight", "state", "FAIL", str(exc))
+        return 1
+    for stage in selected_stages:
         if stage not in STAGES:
             ap.error(f"unknown stage {stage}")
+        if stage in PAID and report.failed():
+            report.add(stage, "stage", "SKIP", "blocked by failed preflight/admission checks; no submission sent")
+            continue
         if stage in PAID and not args.spend:
             report.add(stage, "stage", "SKIP", "paid stage: rerun with --spend")
             continue

@@ -160,6 +160,7 @@ checkpoint is a substitute for fresh rules. The [architecture](docs/ARCHITECTURE
 and [decisions](decisions/) explain the implementation and its amendments.
 
 Optional generator `groups` labels pack independent channel groups into each
-32-channel yield. Use them only when the effective contract accepts
+32-channel yield. Miners choose the packing and group-size mix; the
+starter distribution is an example, not an admission rule. Use them only when the effective contract accepts
 `groups`; omission or `None` keeps the values-only path. See the group-packing
 section of [the interface](docs/INTERFACE.md#pack-independent-groups-in-one-yield).

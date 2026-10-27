@@ -255,3 +255,86 @@ Docs: 19 current guides, 353 CLI snippets, 30 miner commands and 13 console
 entrypoints, 0 issues (`/tmp/cascade-generation-final-docs.log`). Ruff:
 `/tmp/cascade-generation-final-ruff.log`. Offline frozen-lock check:
 `/tmp/cascade-generation-lock-check.log`.
+
+## Final pass over live-test changes (`fc4fa27`)
+
+Reviewed the four commits after `251a6a5`, including the new live-testnet
+harness, its 32-channel fixtures, structured verify rejection and v2 king
+harvest fix. Remote CI for `fc4fa27` passed. Additional local failure scenarios
+confirmed defects outside that coverage; no live stage or rental was run.
+
+### Findings and fixes
+
+| Severity | Trigger and impact | Location and fix | Evidence |
+|---|---|---|---|
+| High | Carried king has no key; its operator-funded CPU build entered ordinary admission and could lose priority behind miner work. | `runner_rolling.py`: preserve king priority while preparing its fallback corpus, restoring thread-local state on failure. Reward/funding rules are unchanged. | Real king dispatch control flow with missing/working keys, operator-side failure and CPU fault. |
+| High | Concurrent king/backup or lane harvests shared a seed/hotkey directory; one could overwrite or clean up another checkpoint. Pending upload records also shared one key. | `runner_common.py`, `loop.py`, `runner_funded_legs.py`: bind staging and pending records to source/role/size/init/contract/suffix; cleanup removes only that job. Matching legacy records stay readable; ambiguous records are held. Pyramid retries require contract binding. | Two actual concurrent harvest calls with a barrier retain distinct primary/backup bytes. Independent pending records survive another job's cleanup. |
+| High | Live harness proceeded to paid legs after failed preflight/admission and could lose submit intent across a crash or state reset. | `tests/e2e_testnet/run.py`: preflight before paid work, block on failures, test-network-only flag, strict args, atomic state/report, preserve unresolved submit intent and require resume. | Reproduced paid-stage execution after a failed preflight; regression now prevents the call. Unresolved attempts never auto-resubmit. |
+| High | Harness could accept rejected rounds or eligibility as settlement success, omitted signature verification and compared only reward UIDs. | Require anchored signed scored receipts containing the exact submitted challenger ref; compare normalized weight values within bounded u16 rounding. Search indexed receipt history; explicitly skip current-weight checks after a newer receipt. | Reproduced rejection accepted as success; tests cover wrong ref, eligibility-only, signer/round mismatch, different values on the same UIDs and non-finite weights. |
+| Medium | CLI response moved to `data.submissions[]`; harness kept polling obsolete top-level fields and could wait for six hours after completion. | Parse the exact lane/hotkey/ref view and require its own freshness. | Reproduced `done` reported as unknown; current, stale and wrong-attempt evidence tested. |
+| Medium | Failed Lium listing looked like an empty account; Vast/Runpod inventory was absent and network prefix hardcoded. | Failed/malformed listings remain unverified; inspect all four providers with the configured testnet netuid. | Reproduced empty inventory on nonzero CLI exit; provider adapters and prefix verified with isolated fakes. |
+| Medium | Short literal `exec` payload bypassed the packed-source size threshold; the harness treated it as a known warning. | `static_guard.py`: inspect literal code evaluators even below the arbitrary-string threshold, keeping data strings and expression literals compatible. The fixture is now a required rejection. | Literal blocked import rejected in scan/reject modes; ordinary short strings and `unpack=False` behavior retained. Runtime-assembled code still needs the sandbox. |
+| Medium | Nondeterminism fixture imported blocked `os`, so rejection did not test determinism. | Use an unseeded NumPy generator without that blocked import. | Fixture now reaches the intended deterministic-output check. |
+| Documentation | Operator guide still required B before C, and a TOML comment said king training always used operator funding. | Correct A → C → B, first-king funding/recovery, per-job harvest identity, optional miner packing and Targon deployment coverage. | Docs checker and source-backed control-flow review. |
+
+The initial four harness reproductions all failed on the reviewed remote code:
+`/tmp/cascade-live-review-reproductions.log`. A first new king test fixture used
+a read-only property incorrectly; the fixture was corrected without changing
+its funding or admission assertions. The confirmed-defect reproduction output remains preserved at the first log
+above; corrected king fixtures pass in the final focused and complete runs.
+
+### Funding and packing rules verified
+
+CPU generation is operator-paid. Mainnet v2 tries the current king's deposited
+provider key for its GPU leg; absent/unfunded/revoked credentials fall back to
+the operator. No new challenger fund request is required. A key-caused fallback
+retains `funded_by="operator"` and the existing 1%-of-A key-lapse policy,
+including for the carried king. Operator/provider recovery uses
+`operator_fault` without opening a lapse. No first-leg grace exception was
+introduced. If the operator also lacks funds/capacity, king retries and its
+dependent settlements wait. Testnet's default king_ladder=false exercises
+operator funding, not mainnet key penalties.
+
+Miners choose any canonical optional grouping of exactly 32 channels. The
+30/25/25/15/5 mix is an example of draw weights, not a required or calibrated
+realized distribution. Mainnet's 512 sequence budget gives 16 examples × 32
+channels, split into eight micro-batches; series-count equality is not a
+measured GPU-cost guarantee. Existing model masks and group copula behavior
+were rechecked; no model source/architecture pin changed.
+
+### Targon scope and remaining launch checks
+
+- `--private-eval-hosts` routes A private verdicts, king checks and B checks to
+  the prepared SSH GPU host; histories cross, targets/scoring stay local.
+- `--eval-hosts` routes all four public suites: GIFT-Eval, BOOM, TIME and FEV.
+  Configured private inference holds if its host is missing; public benchmarks
+  retain their documented local-device fallback.
+- MarketCast C uses the main validator's own `--device`, not either hosts flag.
+  Targon GPU provisioning is manual; CPU generation has its own automatic
+  provider. The running service flags/hosts were not inspected or changed.
+- A real Q21 pyramid checkpoint, made from initialized CPU fixture weights
+  without training, passed the private request/response protocol and exact
+  sequential/parallel qualification. GPU numerical/runtime qualification on
+  the actual Targon hardware remains required.
+- Checked-in launch image/source pins and the v2 baseline proof still require
+  the documented deployment qualification. These code edits change the worker
+  source fingerprint and verifier identity: rebuild/repin the deployed image
+  and requalify the baseline; do not substitute invented registry digests.
+- Default streaming testnet does not exercise the production CPU shard/R2
+  path, public W&B access or mainnet king_ladder behavior. Those require a
+  separately configured authorized integration run. GPU memory/throughput for
+  the production 1.23B model remains a hardware measurement.
+
+Focused checks: 129 harvest/recovery/king tests passed, and 92 final
+packing/private-Q21/harvest/harness checks passed. Ruff and docs passed.
+Final complete unit suite: **4,777 passed, 4 skipped**, 8 NVML warnings,
+527.61 seconds. Command:
+`PYTHONPATH=/tmp/cascade-v2-live-review-20261027 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 /root/tensorlink/cascade-v2/.venv/bin/python -m pytest tests/unit -q -o tmp_path_retention_policy=failed -o tmp_path_retention_count=1`.
+Logs: `/tmp/cascade-live-review-full-unit.log`,
+`/tmp/cascade-live-review-final-focused.log`,
+`/tmp/cascade-live-review-harvest-focused.log`,
+`/tmp/cascade-live-review-ruff.log`, `/tmp/cascade-live-review-docs.log`.
+The docs checker covered 19 guides, 353 CLI snippets, 30 miner commands and
+13 console entrypoints, with zero issues.
+No push, deployment, chain submission, provider rental or live-state change
+was performed in this pass.

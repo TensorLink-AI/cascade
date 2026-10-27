@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import logging
 import threading
@@ -202,44 +203,59 @@ HARVEST_DIRNAME = "_funded_harvest"
 HARVEST_RETENTION_SECONDS = 3 * 86400.0
 
 
-def harvest_dir(work_root: Path, base_seed, hotkey: str) -> Path:
-    return Path(work_root) / HARVEST_DIRNAME / f"{base_seed}" / hotkey
+def harvest_job_id(receipt, suffix: str) -> str:
+    """Separate replicas, lanes, sources and init/contract generations on disk."""
+    binding = {name: getattr(receipt, name, None) for name in
+               ("miner_hotkey", "role", "size", "gen_ref", "init_pointer", "training_contract_digest")}
+    binding["suffix"] = suffix
+    return hashlib.sha256(json.dumps(binding, sort_keys=True).encode()).hexdigest()[:24]
 
 
-def _pending_upload_path(work_root: Path, base_seed, hotkey: str) -> Path:
-    return Path(work_root) / HARVEST_DIRNAME / f"{base_seed}" / f"{hotkey}.pending.json"
+def harvest_dir(work_root: Path, base_seed, hotkey: str, *, job_id: str = "") -> Path:
+    tag = f"{hotkey}--{job_id}" if job_id else hotkey
+    return Path(work_root) / HARVEST_DIRNAME / f"{base_seed}" / tag
+
+
+def _pending_upload_path(work_root: Path, base_seed, hotkey: str, job_id: str = "") -> Path:
+    return harvest_dir(work_root, base_seed, hotkey, job_id=job_id).with_suffix(".pending.json")
 
 
 def write_pending_upload(work_root: Path, base_seed, hotkey: str, record: dict) -> None:
     """Remember a verified harvest whose upload failed (best-effort)."""
     try:
-        write_text_atomic(_pending_upload_path(work_root, base_seed, hotkey),
-                          json.dumps(record, sort_keys=True))
+        path = _pending_upload_path(work_root, base_seed, hotkey, record.get("harvest_job_id", ""))
+        write_text_atomic(path, json.dumps(record, sort_keys=True))
     except Exception as e:  # noqa: BLE001 — the requeue then simply retrains
         log.warning("could not record the pending upload of %s: %s", hotkey[:12], e)
 
 
-def read_pending_upload(work_root: Path, base_seed, hotkey: str) -> dict | None:
-    """The pending-upload record for this leg, when its local copy still exists."""
-    p = _pending_upload_path(work_root, base_seed, hotkey)
-    try:
-        rec = json.loads(p.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return None
-    except Exception as e:  # noqa: BLE001 — torn record ⇒ retrain
-        log.warning("pending upload record %s unreadable (%s); ignored", p, e)
-        return None
-    if not isinstance(rec, dict) or not Path(str(rec.get("dest", ""))).is_dir():
-        return None
-    return rec
+def read_pending_upload(work_root: Path, base_seed, hotkey: str, **binding) -> dict | None:
+    """Read the unique matching job; legacy unscoped records remain readable."""
+    old = _pending_upload_path(work_root, base_seed, hotkey)
+    paths = [old, *sorted(old.parent.glob(f"{hotkey}--*.pending.json"))]
+    matches = []
+    for p in paths:
+        try:
+            rec = json.loads(p.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError) as e:
+            log.warning("pending upload record %s unreadable (%s); ignored", p, type(e).__name__)
+            continue
+        if not isinstance(rec, dict) or not Path(str(rec.get("dest", ""))).is_dir():
+            continue
+        if any(rec.get(key) != value for key, value in binding.items()):
+            continue
+        matches.append(rec)
+    return matches[0] if len(matches) == 1 else None
 
 
-def clear_harvest(work_root: Path, base_seed, hotkey: str) -> None:
-    """Drop a leg's local harvest copy and its pending record (upload verified)."""
+def clear_harvest(work_root: Path, base_seed, hotkey: str, *, job_id: str = "") -> None:
+    """Remove this job only; another replica's upload/recovery is independent."""
     import shutil
 
-    shutil.rmtree(harvest_dir(work_root, base_seed, hotkey), ignore_errors=True)
-    _pending_upload_path(work_root, base_seed, hotkey).unlink(missing_ok=True)
+    shutil.rmtree(harvest_dir(work_root, base_seed, hotkey, job_id=job_id), ignore_errors=True)
+    _pending_upload_path(work_root, base_seed, hotkey, job_id).unlink(missing_ok=True)
 
 
 def prune_harvest_dirs(work_root: Path, *, now: float | None = None,

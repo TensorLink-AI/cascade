@@ -170,7 +170,7 @@ def upload_harvested_checkpoint(runner, record: dict, *, base_seed) -> TrainedEn
     )
     # The upload is verified (a pinned ref came back): nothing reads the
     # local copy after this — benches and validators fetch the ref.
-    clear_harvest(runner.work_root, base_seed, hotkey)
+    clear_harvest(runner.work_root, base_seed, hotkey, job_id=record.get("harvest_job_id", ""))
     return entry
 
 
@@ -655,7 +655,10 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
 
         report_progress(self, "harvesting")
 
-        dest = harvest_dir(self.work_root, seeds.base_seed, receipt.miner_hotkey)
+        from .runner_common import harvest_job_id
+
+        job_id = harvest_job_id(receipt, suffix)
+        dest = harvest_dir(self.work_root, seeds.base_seed, receipt.miner_hotkey, job_id=job_id)
         harvest_remote_dir(host, receipt.checkpoint_dir, dest)
         if getattr(receipt, "marketcast", None):
             # DEC-CA-0064: a Timestral fine-tune, not a Cascade-MoE checkpoint
@@ -668,7 +671,8 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
                          f"{receipt.role}-mkt{suffix}")
             self._mkt_harvested[receipt.miner_hotkey] = dict(receipt.marketcast)
             return upload_harvested_checkpoint(self, {
-                "dest": str(dest), "ckpt_repo": ckpt_repo, "suffix": suffix, "size": "mkt",
+                "dest": str(dest), "harvest_job_id": job_id,
+                "ckpt_repo": ckpt_repo, "suffix": suffix, "size": "mkt",
                 "miner_hotkey": receipt.miner_hotkey, "miner_uid": int(receipt.miner_uid),
                 "role": receipt.role, "gen_ref": receipt.gen_ref,
                 "corpus_digest": receipt.corpus_digest, "train_block": int(receipt.train_block),
@@ -702,7 +706,8 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
         ckpt_repo = (f"{self.hub().namespace}/ckpt-r{seeds.base_seed}-"
                      f"{receipt.role}-{size}{suffix}")
         record = {
-            "dest": str(dest), "ckpt_repo": ckpt_repo, "suffix": suffix, "size": size,
+            "dest": str(dest), "harvest_job_id": job_id,
+            "ckpt_repo": ckpt_repo, "suffix": suffix, "size": size,
             "miner_hotkey": receipt.miner_hotkey, "miner_uid": int(receipt.miner_uid),
             "role": receipt.role, "gen_ref": receipt.gen_ref,
             "corpus_digest": receipt.corpus_digest, "train_block": int(receipt.train_block),

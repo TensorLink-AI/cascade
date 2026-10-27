@@ -350,7 +350,8 @@ Commands do not prompt. Never add `--yes` without this session's explicit
 human authorization. Never print, log, commit or pass secrets on argv.
 
 Optional generator `groups` labels pack independent channel groups into each
-32-channel yield. Use them only when the effective contract accepts
+32-channel yield. Miners choose the packing and group-size mix; the
+starter distribution is an example, not an admission rule. Use them only when the effective contract accepts
 `groups`; omission or `None` keeps the values-only path. See the group-packing
 section of the repository docs/INTERFACE.md.
 

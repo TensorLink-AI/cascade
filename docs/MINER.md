@@ -40,6 +40,7 @@ intake is `https://submissions.cascadesub.net`.
 
 Optional [group packing](INTERFACE.md#pack-independent-groups-in-one-yield)
 lets your generator place independent groups inside one 32-channel yield.
+You choose the group sizes and mix; the template percentages are examples.
 It requires a contract accepting `groups`; bare arrays remain supported.
 
 ## Quickstart

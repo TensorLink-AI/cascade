@@ -557,7 +557,16 @@ class _RollingMixin:
                 return entry
         disp = self._dispatcher()
         # DEC-CA-0053: the king's corpus too is made before its GPU rent.
-        corpus = leg_corpus(self, gen, seeds, contract, era_index=era.index)
+        # The inherited king can arrive here before it has any payer key.
+        # CPU admission must still recognize it as king work, just as the
+        # own-key funded scope and replica threads do.
+        local = self._leg_local
+        previous = getattr(local, "funded_is_king", False)
+        local.funded_is_king = True
+        try:
+            corpus = leg_corpus(self, gen, seeds, contract, era_index=era.index)
+        finally:
+            local.funded_is_king = previous
         # Slot claim + rent as one unit against a bench-only king rent
         # (_rolling_king_bench_host): the single cached king host must never
         # hand one era's pod to the other era's leg.

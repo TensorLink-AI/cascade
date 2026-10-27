@@ -344,7 +344,8 @@ class _FundedLegMixin:
                 except _OperatorFault:
                     # Upload lost after its retries: bind the kept copy to
                     # this leg's init too, so only the same leg reuses it.
-                    rec = read_pending_upload(self.work_root, seeds.base_seed, gen.hotkey)
+                    rec = read_pending_upload(self.work_root, seeds.base_seed, gen.hotkey,
+                                              gen_ref=gen.ref, size=contract.arch_preset, suffix=suffix)
                     if rec is not None:
                         rec["warm_start_ref"] = warm_start_ref or ""
                         write_pending_upload(self.work_root, seeds.base_seed,
@@ -520,15 +521,22 @@ def _reupload_pending(runner, gen, seeds, contract, suffix: str, warm_start_ref)
     (see :func:`cascade.trainer.loop.upload_harvested_checkpoint`), re-uploaded
     now; ``None`` when there is none for exactly this leg. A failing re-upload
     records an operator fault (no burn) and raises."""
-    rec = read_pending_upload(runner.work_root, seeds.base_seed, gen.hotkey)
+    rec = read_pending_upload(runner.work_root, seeds.base_seed, gen.hotkey,
+                              gen_ref=gen.ref, size=contract.arch_preset, suffix=suffix,
+                              role="challenger", warm_start_ref=warm_start_ref or "")
     if rec is None:
         return None
     if (rec.get("gen_ref") != gen.ref or rec.get("size") != contract.arch_preset
             or rec.get("suffix") != suffix or rec.get("role") != "challenger"
             or rec.get("warm_start_ref") != (warm_start_ref or "")):
         return None
+    from ..shared.manifest import contract_digest
     from .loop import upload_harvested_checkpoint
 
+    recorded = rec.get("contract_digest")
+    if (recorded and recorded != contract_digest(contract)
+            or not recorded and getattr(contract, "base_arch", "") == "cascade_pyramid"):
+        return None
     log.warning("funded leg %s: re-uploading the checkpoint an earlier attempt of this "
                 "leg harvested and verified (its upload failed) — no retrain",
                 gen.hotkey[:12])

@@ -175,9 +175,10 @@ edited `chain.toml` before shipping it.
    intake and status ticks continue; no new-init leg starts early. Staged
    results consume pending deltas only when the scheduler adopts that exact
    era/base, so obsolete jobs and process restarts leave the queue intact.
-   `[lane_c] from_block`, if typed, must be an era boundary with B live by
-   then; mainnet C takes its share from A (`takes_from = "lane_a"`), giving
-   A/B/C = 50/25/25. Testnet keeps its existing B-funded C split. The settlement
+   `[lane_c] from_block`, if typed, must be an era boundary at or after v2 starts.
+   Mainnet C takes its share from A (`takes_from = "lane_a"`) and may launch
+   before B: A/C = 75/25, then A/B/C = 50/25/25 once B launches. A C policy
+   funded from B still requires B to be live; testnet retains that option. The settlement
    AT a lane's launch boundary still belongs to the preceding era.
 10. **MarketCast** (only when arming `[marketcast] from_block`): start
     `cascade-pool mkt-record` (and `mkt-record-alpha` if `alpha` assets are
@@ -292,6 +293,31 @@ The trainer rents miner-funded pods on Lium, Shadeform, Vast.ai or Runpod
   trainer rents on the operator's key. With the flag off, payer legs never
   run on operator hardware, and a leg whose key has expired is released as
   `auth`, unburned.
+
+**The carried king's first v2 training.** The identity carried from v1 is
+its hotkey/generator, not a Toto2 checkpoint relabelled as a v2 model. Its
+selected immutable generator must first pass v2 launch qualification with
+exactly 32 channels. CPU generation is operator-paid. On mainnet, the king's
+GPU leg first uses its deposited provider credentials; it does not need a new
+challenger funding request. If those credentials are absent, rejected or out
+of credit, the operator's account pays for the king GPU. This recovery is
+independent of `funded_operator_fallback`, which controls challenger fallback.
+The operator CPU request retains king priority in either funding path.
+
+Under the existing reward policy, a key-caused operator fallback records
+`funded_by="operator"` and can cap the carried king at 1% of A rather than its
+normal at-most-5% of total emissions. Provider/market/operator recovery records
+`operator_fault` and does not open a key lapse. There is no special free first
+GPU or launch grace exemption. If the operator also has no credit/capacity,
+the king retries and dependent settlements wait; challengers are not charged
+for its training. The default operator account is Lium. Additional operator
+providers require the capped operator pool and its explicit per-leg/daily
+limits. Verify that account is funded before admitting the launch cohort.
+
+Testnet's default `king_ladder=false` uses operator king funding and does not
+exercise the mainnet self-funding/penalty path. Its default streaming corpus
+also does not qualify the CPU shard tier. A successful streaming testnet run
+alone is insufficient evidence for either launch behavior.
 
 Every one of these pods is **isolated and credential-free** (details:
 [Credentials on payer pods](#credentials-on-payer-pods)). Public Hub
@@ -1095,6 +1121,17 @@ unset to expose all visible GPUs, or list one entry per GPU on that same VM;
 the resolver combines those masks. It selects one physical machine, not a
 distributed fleet. `--device cuda` runs on a GPU VM hosting the validator itself.
 MarketCast currently uses the validator's own `--device`.
+
+For an evaluation-only Targon VM, start the validator with both
+`--eval-hosts targon-eval.toml` and `--private-eval-hosts targon-eval.toml`.
+The private path covers A verdicts, king checks and B acceptance through the
+shared evaluator; the public path covers GIFT-Eval, BOOM, TIME and FEV.
+MarketCast C uses the validator's own `--device` and is not routed by either
+hosts flag. Run the main validator itself on its intended GPU for C, or qualify
+a separate C offload implementation before launch. A configured private host
+that disappears holds evaluation. Public benchmarks retain the documented
+local-device fallback when their host is unavailable. The repository does not
+prove these flags are present in a running service.
 
 Private-pool offload is separately opt-in through `--private-eval-hosts`;
 see [validator compute](VALIDATOR.md#compute-and-offloading). Only histories

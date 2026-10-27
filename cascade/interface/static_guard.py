@@ -159,6 +159,24 @@ def scan_source(
             if hit is not None:
                 return GuardResult(ok=False, blocked_module=hit, reason="from_import")
         elif isinstance(node, ast.Call):
+            # The size threshold applies to arbitrary data strings, not to
+            # a literal explicitly handed to a Python code evaluator.
+            if (unpack and _depth < MAX_PACK_DEPTH and isinstance(node.func, ast.Name)
+                    and node.func.id in {"exec", "eval"} and node.args
+                    and isinstance(node.args[0], ast.Constant)
+                    and isinstance(node.args[0].value, (str, bytes))):
+                payload = node.args[0].value
+                try:
+                    inner = ast.parse(payload)
+                except (SyntaxError, ValueError):
+                    inner = None
+                if inner is not None:
+                    if packed_sources == "reject" and _has_code_statements(inner):
+                        return GuardResult(ok=False, reason=f"packed_source[{_depth + 1}]")
+                    res = scan_source(payload, blocked, unpack=True, packed_sources=packed_sources,
+                                      _depth=_depth + 1)
+                    if not res.ok:
+                        return res
             if (
                 isinstance(node.func, ast.Name)
                 and node.func.id == "__import__"
