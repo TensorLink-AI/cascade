@@ -18,7 +18,7 @@ set -a; . ./.env; set +a
 | Stage | Cost | Checks |
 |---|---|---|
 | `preflight` | free | services up, intake answers, v2 active, status feed fresh, launch preflight not blocked, contract digest = feed, image pinned and resolvable on GHCR, worker code fingerprint = source, wallets registered, provider keys present, pod baseline |
-| `admission` | free | `cascade verify` accepts the 8-channel fixture and rejects univariate, packed-source, nondeterministic and network-access generators; `submit --no-commit` dry run |
+| `admission` | free | `cascade verify` accepts the 32-channel fixture and rejects univariate, packed-source, nondeterministic and network-access generators; `submit --no-commit` dry run |
 | `legs` | **paid** | one funded submission per provider scenario, reveal, stage tracking to a terminal status, trained, payer-billed, provider used |
 | `settlement` | free | each entry judged in a round; both validators' receipts exist and agree; on-chain weights = receipt reward uids; `duel` and `round` views |
 | `validator` | free | receipt index, latest receipt per validator and its signer, `status/chain.json`, `bench_v` reports when `bench_source = "validator"`, king ladder when armed |

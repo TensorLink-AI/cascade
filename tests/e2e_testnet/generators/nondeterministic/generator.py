@@ -21,4 +21,4 @@ class Generator(DataGenerator):
         rng = np.random.default_rng(self._seed)
         for _ in range(max(0, int(n_series))):
             x = np.cumsum(rng.standard_normal(512))
-            yield np.stack([x + 0.1 * k * rng.standard_normal(512) for k in range(8)])
+            yield np.stack([x + 0.1 * k * rng.standard_normal(512) for k in range(32)])

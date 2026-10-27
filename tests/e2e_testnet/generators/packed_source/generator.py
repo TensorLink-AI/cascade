@@ -13,10 +13,10 @@ import numpy as np
 
 
 def make(rng, length):
-    \"\"\"Eight channels driven by one random walk, each scaled and lightly noised.\"\"\"
+    \"\"\"Thirty-two channels driven by one random walk, each scaled and lightly noised.\"\"\"
     drivers = np.cumsum(rng.standard_normal(length))
-    noise = 0.05 * rng.standard_normal((8, length))
-    return np.stack([drivers * (k + 1) for k in range(8)]) + noise
+    noise = 0.05 * rng.standard_normal((32, length))
+    return np.stack([drivers * (k + 1) for k in range(32)]) + noise
 """
 
 _NS: dict = {}

@@ -259,11 +259,11 @@ def offline_digest(ctx: Ctx) -> str | None:
 
 
 def scenario_generator(ctx: Ctx, sc: dict) -> Path:
-    """A per-run copy of the mv8 fixture with a unique salt (unique corpus digest)."""
+    """A per-run copy of the mv32 fixture with a unique salt (unique corpus digest)."""
     run_id = ctx.state.setdefault("run_id", str(int(time.time())))
     d = Path(ctx.args.workdir) / f"gen-{sc['name']}-{run_id}"
     if not d.exists():
-        shutil.copytree(GENERATORS / "mv8", d)
+        shutil.copytree(GENERATORS / "mv32", d)
         salt = int(run_id) * 16 + SCENARIOS.index(sc)
         (d / "config.json").write_text(json.dumps({"salt": salt}))
     return d
@@ -344,10 +344,10 @@ def stage_preflight(ctx: Ctx) -> None:
 def stage_admission(ctx: Ctx) -> None:
     S = "admission"
     cases = (
-        ("accepts_mv8", "mv8", None),
+        ("accepts_mv32", "mv32", None),
         ("rejects_univariate", "univariate", r"channel"),
         ("rejects_packed_source", "packed_source", r"pack|string|exec|static"),
-        ("rejects_nondeterministic", "nondeterministic", r"determin|digest|mismatch"),
+        ("rejects_nondeterministic", "nondeterministic", r"not deterministic"),
         ("rejects_network_access", "net_access", r"blocked_import|socket"),
         # Known gap probe: a sub-MIN_PACKED_CHARS exec'd module with a blocked import.
         ("gap_short_packed_import", "short_packed", r"blocked_import|packed_source|socket"),

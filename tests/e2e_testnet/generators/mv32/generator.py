@@ -1,8 +1,8 @@
-"""Lane A e2e test generator: coupled 8-channel synthetic series, numpy only.
+"""Lane A e2e test generator: coupled 32-channel synthetic series, numpy only.
 
-Each series is a driver (sum of seasonal sines, a random walk trend and AR(1)
-noise) plus seven responders that depend on it: lagged copies, exponential
-smoothings, an integral and an inverse response.
+Each series is a driver (seasonal sines, a random-walk trend and AR(1) noise)
+plus 31 responders that depend on it: lagged copies, exponential smoothings at
+several rates, differences and an inverse response, each lightly noised.
 """
 from __future__ import annotations
 
@@ -14,7 +14,9 @@ import numpy as np
 
 from cascade.interface import DataGenerator
 
-_C = 8
+_C = 32
+_LAGS = (1, 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31)
+_ALPHAS = (0.03, 0.05, 0.08, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.7)
 
 
 class Generator(DataGenerator):
@@ -29,7 +31,7 @@ class Generator(DataGenerator):
 
     @property
     def name(self) -> str:
-        return "lane-a-e2e-mv8"
+        return "lane-a-e2e-mv32"
 
     def _driver(self, rng: np.random.Generator, L: int) -> np.ndarray:
         t = np.arange(L, dtype=np.float64)
@@ -49,20 +51,27 @@ class Generator(DataGenerator):
     def _couple(self, x: np.ndarray, rng: np.random.Generator) -> np.ndarray:
         L = x.shape[0]
         s = float(np.std(x)) or 1.0
-        out = np.empty((_C, L))
-        out[0] = x
-        for k, lag in enumerate((1, 3, 7), start=1):
-            out[k, :lag] = x[0]
-            out[k, lag:] = x[:-lag]
-            out[k] = 0.8 * out[k] + 0.05 * s * rng.standard_normal(L)
-        for k, a in ((4, 0.1), (5, 0.3)):
-            acc = x[0]
-            for i in range(L):
-                acc = a * x[i] + (1.0 - a) * acc
-                out[k, i] = acc
-        out[6] = np.cumsum(x - x.mean()) / L
-        out[7] = -0.5 * x + 0.1 * s * rng.standard_normal(L)
-        return out
+        rows = [x]
+        for lag in _LAGS:
+            r = np.empty(L)
+            r[:lag] = x[0]
+            r[lag:] = x[:-lag]
+            rows.append(0.8 * r + 0.05 * s * rng.standard_normal(L))
+        alphas = np.asarray(_ALPHAS)
+        ema = np.empty((alphas.size, L))
+        acc = np.full(alphas.size, x[0])
+        for i in range(L):
+            acc = alphas * x[i] + (1.0 - alphas) * acc
+            ema[:, i] = acc
+        rows.extend(ema)
+        d = np.diff(x, prepend=x[0])
+        rows.append(d)
+        rows.append(np.cumsum(x - x.mean()) / L)
+        rows.append(-0.5 * x + 0.1 * s * rng.standard_normal(L))
+        rows.append(np.abs(d) + 0.01 * s * rng.standard_normal(L))
+        while len(rows) < _C:
+            rows.append(rows[1 + len(rows) % 11] * 0.5 + 0.1 * s * rng.standard_normal(L))
+        return np.stack(rows[:_C])
 
     def generate(self, n_series: int) -> Iterator[np.ndarray]:
         rng = np.random.default_rng(self._seed)
