@@ -338,3 +338,20 @@ The docs checker covered 19 guides, 353 CLI snippets, 30 miner commands and
 13 console entrypoints, with zero issues.
 No push, deployment, chain submission, provider rental or live-state change
 was performed in this pass.
+
+### Main merge: scheduled pool configuration
+
+The merge check found explicit 600/domain and 300/domain-frequency overrides
+in `.github/workflows/publish-pool.yml`, which prevented the reviewed CLI's
+800/400 defaults from reaching scheduled snapshots. The primary publisher now
+uses 800/400. Its retired `publish --lane c` forge step was also removed:
+current Lane C is MarketCast, with its separate bar/alpha recorder and
+`--lane mkt` publishing pipeline. It must not call an unsupported CLI lane.
+
+A workflow/CLI integration check parses the actual scheduled command and
+compares its cap arguments with the real CLI defaults. It also rejects the
+obsolete C command. These two checks plus the four source-family/cap scenarios
+passed: **6 passed**, `/tmp/cascade-main-merge-pool-tests.log`. Ruff and docs
+also passed (`/tmp/cascade-main-merge-{ruff,docs}.log`). Core Python code did not
+change after the complete **4,777 passed / 4 skipped** run above. No pool job
+was manually dispatched and no existing snapshot was modified.

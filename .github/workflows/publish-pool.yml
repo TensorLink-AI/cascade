@@ -209,13 +209,13 @@ jobs:
           #   600 from ~50 sources. The KOTH bootstrap resamples whole feeds, so
           #   evidence scales with distinct sources: 5 per feed makes the same caps
           #   draw from ~2.4x more feeds and tightens the LCB.
-          # --max-series-per-domain-freq 300: balance by domain AND granularity —
+          # --max-series-per-domain-freq 400: balance by domain AND granularity —
           #   no (domain, freq) cell can dominate, so an hourly flood inside a
           #   domain can't crowd out that domain's daily series either.
-          # --max-series-per-domain 600: outer bound — every domain is already
+          # --max-series-per-domain 800: outer bound — every domain is already
           #   multi-granularity (4-9 freqs), so the cell cap alone would let one
-          #   domain span cells up to 300 x n_freqs; 600 absolute caps that.
-          #   Binds transport (at 600 since late Sep).
+          #   domain span cells up to 400 x n_freqs; 800 absolute caps that.
+          #   Keep these overrides aligned with the reviewed CLI defaults.
           # --selection balanced: when a cap binds, deal its slots round-robin
           #   across SOURCES in an order seeded by the snapshot's effective block,
           #   and take a seeded sample of each feed's panel rows. First-come
@@ -228,38 +228,14 @@ jobs:
             --chain-toml "$TOML" \
             --sources tsbench_forge \
             --max-panel-series-per-feed 5 \
-            --max-series-per-domain-freq 300 \
-            --max-series-per-domain 600 \
+            --max-series-per-domain-freq 400 \
+            --max-series-per-domain 800 \
             --selection balanced \
             --effective-block "$EFFECTIVE_BLOCK"
 
-      # DEC-CA-0056 lane C: the per-target fine-tune pool, built by the SAME
-      # builder from the same mirror but published under [lane_c] pool_prefix
-      # (pool_c/index.json + pool_c/snapshots/) with its OWN balanced-selection
-      # seed (lane-c:block:<N>), so its windows never mirror the main pool's.
-      # Inert until the toml types [lane_c] from_block (the step exits 0).
-      # Prints per-target coverage and warns for any target under
-      # [lane_c] min_target_windows.
-      - name: Build + publish LANE-C snapshot  (CASCADE key; inert until armed)
-        env:
-          NETWORK: ${{ github.event.inputs.network || 'mainnet' }}
-          EFFECTIVE_BLOCK: ${{ github.event.inputs.effective_block || 'auto' }}
-          BACKUP_S3_ACCESS_KEY: ${{ secrets.BACKUP_S3_ACCESS_KEY }}
-          BACKUP_S3_SECRET_KEY: ${{ secrets.BACKUP_S3_SECRET_KEY }}
-        run: |
-          TOML=chain.toml
-          [ "$NETWORK" = "testnet" ] && TOML=chain.testnet.toml
-          if ! python -c "import sys; from cascade.shared.config import load_chain_config as l; sys.exit(0 if l('$TOML').lane_c.from_block else 1)"; then
-            echo "[lane_c] from_block unset in $TOML — no lane-C pool"; exit 0
-          fi
-          TSFORGE_DIR=./tsforge cascade-pool publish --lane c \
-            --chain-toml "$TOML" \
-            --out ./_pool_stage_c \
-            --sources tsbench_forge \
-            --max-panel-series-per-feed 5 \
-            --max-series-per-domain-freq 300 \
-            --max-series-per-domain 600 \
-            --effective-block "$EFFECTIVE_BLOCK"
+      # MarketCast uses the separate bar/alpha recorder pipeline and
+      # `cascade-pool publish --lane mkt`; the retired forge --lane c path
+      # is intentionally absent (see docs/OPERATOR.md, MarketCast setup).
 
       # Public reveal: mirror RETIRED snapshot tars from the pool bucket to a
       # public HF dataset — the EXACT bytes validators scored, sha256-verified
