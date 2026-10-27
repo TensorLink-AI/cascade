@@ -303,14 +303,21 @@ def stage_preflight(ctx: Ctx) -> None:
     r.check(S, "launch_preflight", pre.get("state") not in ("blocked", None),
             f"{pre.get('state')}: {pre.get('reason', '')}"[:300])
     published = (data.get("training_contract") or {}).get("digest")
+    # Once v2 is active the feed publishes the v2 contract, not the base one
+    # that ``cascade-trainer --offline`` prints.
+    if v2_from and head >= v2_from and cfg.training.v2_contract is not None:
+        from cascade.shared.manifest import contract_digest
+        digest = contract_digest(cfg.training.v2_contract)
     r.check(S, "contract_digest_matches_feed", published == digest,
-            f"feed={published} offline={digest}", warn=not fresh)
+            f"feed={published} expected={digest}", warn=not fresh)
     providers = (data.get("compute") or {}).get("rolling_providers") or []
     r.check(S, "rolling_providers_published", bool(providers), f"{providers}")
 
     img = cfg.training.train_image_digest if hasattr(cfg.training, "train_image_digest") else ""
     funded = getattr(cfg.round, "funded_pod_image", "")
-    r.check(S, "image_pinned", bool(img) and "@sha256:" in img, f"train_image_digest={img}")
+    # The contract pins a bare digest; the pod image ref carries it after "@".
+    r.check(S, "image_pinned", bool(re.fullmatch(r"sha256:[0-9a-f]{64}", img or "")),
+            f"train_image_digest={img}")
     same = bool(img) and img.split("@")[-1] == funded.split("@")[-1]
     r.check(S, "funded_image_matches_train_image", same, f"funded_pod_image={funded}")
     resolved = ghcr_digest(funded) if funded else None
@@ -413,7 +420,9 @@ def _submit(ctx: Ctx, sc: dict) -> dict:
              "providers": sc["providers"], "ref": ref, "submit_rc": rc, "submit_err": err[-400:],
              "submitted_at": time.time(), "phases": [], "status": None}
     if rc == 0 and ref and sc["flow"] == "fund":
-        fund = ["fund", ctx.args.intake, "--ref", ref, *common, *keys, "--label", label, "--yes"]
+        # fund talks only to the intake: no --chain-toml / --network.
+        fund = ["fund", ctx.args.intake, "--ref", ref, "--wallet-name", sc["wallet"],
+                "--wallet-hotkey", "default", *keys, "--label", label, "--yes"]
         if sc.get("gpu"):
             fund += ["--gpu", sc["gpu"]]
         if "max_price" in sc:

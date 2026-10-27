@@ -623,7 +623,10 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
         a payer leg, resolving the contract from the receipt's size."""
         contract = self.cfg.training.primary_size
         size = str(getattr(receipt, "size", "") or "")
-        if size and size != contract.arch_preset:
+        v2 = getattr(self.cfg.training, "v2_contract", None)
+        if size and v2 is not None and size == v2.arch_preset:
+            contract = v2
+        elif size and size != contract.arch_preset:
             spec = next((sp for sp in self.cfg.training.extra_sizes
                          if sp.arch_preset == size), None)
             if spec is None:

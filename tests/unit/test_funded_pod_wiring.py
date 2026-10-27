@@ -1403,6 +1403,12 @@ def test_harvest_leg_resolves_contract_and_seeds_from_the_receipt(tmp_path, monk
     import pytest as _pytest
     with _pytest.raises(RuntimeError, match="unknown size"):
         r._harvest_leg("HOST", SimpleNamespace(size="toto2-999x", role="king"), base_seed=1)
+    # A v2 king leg's receipt names the v2 contract's size, which is not in the
+    # base size registry; every v2 harvest used to fail here.
+    v2 = SimpleNamespace(arch_preset="cascade-moe-v2-2m")
+    r.cfg.training.v2_contract = v2
+    r._harvest_leg("HOST", SimpleNamespace(size="cascade-moe-v2-2m", role="king"), base_seed=7)
+    assert seen["contract"] is v2
 
 
 # ── 2026-09-29: pods leaked when a re-attached leg settled from its persisted checkpoint ──
