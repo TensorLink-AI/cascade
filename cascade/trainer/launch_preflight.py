@@ -38,7 +38,7 @@ def identity(cfg, ref):
 
     HubRef.parse(ref)  # An immutable digest, never a mutable repository name.
     # The baseline is the king's ref: qualified under the king-leg policy.
-    policy = cfg.for_king().generator_for_contract(contract)
+    policy = cfg.for_king(ref).generator_for_contract(contract)
     source = Path(__file__).resolve().parents[1]
     verifier = hashlib.sha256()
     for file in ("interface/generator.py", "interface/static_guard.py", "miner/verify.py",
@@ -60,7 +60,7 @@ def qualify(cfg, ref, work_root):
 
     check_worker_release(cfg)
     expected = identity(cfg, ref)
-    effective = with_contract(cfg.for_king(), cfg.training.v2_contract)
+    effective = with_contract(cfg.for_king(ref), cfg.training.v2_contract)
     with tempfile.TemporaryDirectory(prefix="cascade-v2-baseline-") as directory:
         fetch_from_hub(ref, directory, HubConfig.from_storage(cfg.storage))
         report = verify_repo(directory, effective)

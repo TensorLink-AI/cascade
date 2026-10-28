@@ -280,7 +280,7 @@ class _GenerationMixin:
         # happen days later within the same seed epoch.
         cache = self.__dict__.setdefault("_leg_corpus_cache", {})
         king = bool(getattr(self.__dict__.get("_leg_local_obj"), "funded_is_king", False))
-        floor = (self.cfg.for_king() if king else self.cfg).generator.min_channels
+        floor = (self.cfg.for_king(gen.ref) if king else self.cfg).generator.min_channels
         key = (gen.hotkey, str(seeds.base_seed), gen.ref,
                floor, self.cfg.generator.max_channels)
         # One build per key even when two threads (lane A, lane-B domains) ask
@@ -323,7 +323,7 @@ class _GenerationMixin:
                 round_id=round_id, hotkey=gen.hotkey, uid=gen.uid, era=era_index,
                 gen_ref=gen.ref, repo_dir=repo, seed=int(seeds.generation_seed),
                 **({"priority": True,
-                    "min_channels": self.cfg.for_king().generator.min_channels}
+                    "min_channels": self.cfg.for_king(gen.ref).generator.min_channels}
                    if getattr(self.__dict__.get("_leg_local_obj"), "funded_is_king", False)
                    else {}))
         finally:

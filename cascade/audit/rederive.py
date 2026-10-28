@@ -219,7 +219,7 @@ def run_tier1(
             try:
                 digest = _rederive_digest(
                     cdir, receipt.generation_seed,
-                    cfg.for_king() if entry.role == "king" else cfg, mode=mode,
+                    cfg.for_king(entry.gen_ref) if entry.role == "king" else cfg, mode=mode,
                     token_budget=contract.train_tokens,
                     budget_denomination=getattr(contract, "budget_denomination", "points"),
                     corpus_epochs=epochs, corpus_dir=cdir)
@@ -244,7 +244,7 @@ def run_tier1(
                 _fetch_generator(entry.gen_ref, gen_dir, cfg)
                 digest = _rederive_digest(
                     gen_dir, receipt.generation_seed,
-                    cfg.for_king() if entry.role == "king" else cfg,
+                    cfg.for_king(entry.gen_ref) if entry.role == "king" else cfg,
                     mode=mode, token_budget=contract.train_tokens,
                     max_wall_seconds=contract.max_train_seconds,
                     seed_mix=int(getattr(contract, "gen_seed_mix", 1) or 1),
@@ -375,7 +375,7 @@ def run_tier2(
                           (manifest.warm_start_size or training.arch_preset) else None)
             with open_round_stream(
                 contract.corpus_mode, gen_dir, receipt.generation_seed,
-                (cfg.for_king() if entry.role == "king" else cfg).generator,
+                (cfg.for_king(entry.gen_ref) if entry.role == "king" else cfg).generator,
                 token_budget=contract.train_tokens, use_sandbox=True,
                 blocked=cfg.static_guard.blocked,
                 max_wall_seconds=contract.max_train_seconds,

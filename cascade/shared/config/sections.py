@@ -65,10 +65,12 @@ class GeneratorConfig:
     max_repo_mb: int = 128  # cap on fetched submission bytes (code-only; no shipped weights)
     max_channels: int = 1
     min_channels: int = 1
-    # Trainer-side floor for KING legs only (0 = min_channels). Lets a carried
-    # king whose committed generator predates the v2 width rule keep training
-    # its own ref; validators never check widths, only the ref.
+    # Trainer-side floor for KING legs only (0 = min_channels), and only for
+    # the generator refs in ``king_min_channels_refs`` (the genesis king's
+    # pre-v2 commitment). Any other king ref trains at ``min_channels``.
+    # Validators never check widths, only the ref.
     king_min_channels: int = 0
+    king_min_channels_refs: tuple[str, ...] = ()
     # Points-denominated materialised drain + decoupled streaming stall window
     # (DEC-CA-0031; see the class docstring). Both default inert.
     corpus_target_points: int = 0

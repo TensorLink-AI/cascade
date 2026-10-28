@@ -242,10 +242,16 @@ def test_packing_template_is_optional_seeded_and_verifiable(tmp_path):
 
 def test_king_min_channels_relaxes_only_king_legs(tmp_path, monkeypatch):
     base = load_chain_config()
-    assert base.for_king() is base  # unset: kings obey the release floor
+    genesis = "kingrepo@sha256:" + "a" * 64
+    base = replace(base, generator=replace(base.generator, king_min_channels=0,
+                                           king_min_channels_refs=(genesis,)))
+    assert base.for_king(genesis) is base  # unset: kings obey the release floor
     cfg = replace(base, generator=replace(base.generator, king_min_channels=1))
-    king = cfg.for_king().generator_for_contract(cfg.training.v2_contract)
+    king = cfg.for_king(genesis).generator_for_contract(cfg.training.v2_contract)
     assert (king.min_channels, king.max_channels) == (1, 32)
+    # Genesis-only: a king that re-commits any other ref trains at the floor.
+    recommit = "kingrepo@sha256:" + "b" * 64
+    assert cfg.for_king(recommit) is cfg
     assert cfg.generator_for_contract(cfg.training.v2_contract).min_channels == 32
     monkeypatch.setattr("cascade.trainer.sandbox.stream_series", lambda *a, **k:
                         contextlib.nullcontext(iter([np.ones((3, 64))])))

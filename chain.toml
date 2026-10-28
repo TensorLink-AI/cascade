@@ -51,10 +51,15 @@ max_repo_mb          = 128       # cap on the fetched submission (code-only, no 
 # ≤ 8 (EVAL_POOL.md); OOM is a challenger fault and never re-queues.
 max_channels         = 32
 min_channels         = 32         # v2 synthetic submissions: exactly 32 channels per yield
-# King legs only (trainer-side; 0 = min_channels): the carried king's committed
-# generator predates the 32-channel rule, so its leg trains at 1..32 channels.
-# Validators judge the king's ref, never its width.
+# Genesis king only (trainer-side; 0 = min_channels): the carried king's
+# committed generator predates the 32-channel rule, so a king leg of a ref
+# listed here trains at 1..32 channels. Any other king ref (a re-commit, a
+# v2 crowning) trains at min_channels. Validators judge the ref, never its
+# width. Set to the king's commitment at launch: uid 31 5Gsa19SF… as of
+# block 9339038 — re-check before launch_at_utc (a dethrone or re-commit
+# changes it; an unlisted non-32-channel king blocks the launch preflight).
 king_min_channels    = 1
+king_min_channels_refs = ["vault/direct@sha256:04e226724e3be088e01134a189598300b9c381779df59b159059c62f5afec73e"]
 # The record carrier (DEC-CA-0020). interface_version 1 = record-or-array yield
 # with `values` only; every reserved field (mask, start, freq, group_id, roles,
 # labels, quantiles) is hard-rejected until the release that consumes it. Bumps
