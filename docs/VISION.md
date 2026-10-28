@@ -1,102 +1,103 @@
-# Vision: a decentralised training stack for time-series foundation models
+# Cascade: an open training stack for time-series foundation models
 
-> **Living document.** This page describes where Cascade is heading and how the
-> current implementation lays the foundation. It is updated as stages ship.
-> It is not a statement of live activation: read `cascade status --json` and
-> the effective configuration before acting on any lane. Protocol rules live
-> in [decisions/](../decisions/); rewards live in the
-> [miner guide](MINER.md#rewards-allocation-burn-and-progression).
+Time-series foundation models such as Chronos, TimesFM and Toto are built the
+way large language models are: one lab runs a full training stack. It
+assembles data, pre-trains a general model, refines it with targeted
+mid-training and post-training, and fine-tunes it for the applications people
+actually use. Each stage has its own data, its own recipe and its own tests.
 
-## North star
+Cascade's vision is to run that entire stack in the open, as a competition on
+Bittensor. Every stage becomes a lane. Contributors propose what goes into
+the stage, the network trains under a fixed contract, and only measured,
+signed improvements are kept. Each accepted improvement becomes the starting
+point for the next stage and the next era. Improvements build on
+improvements: that is the cascade.
 
-Frontier time-series foundation models (TSFMs) such as Chronos, TimesFM, Toto
-and Moirai are built by a single lab running a full training stack: data,
-pre-training, mid-training, post-training and fine-tuning, each with its own
-evaluation. Cascade's aim is to run **that whole stack as an open
-competition**: every stage is a lane where independent contributors propose
-an input (data, a recipe or a teacher), the operator trains under a fixed
-contract on miner-funded compute, and validators accept only measured,
-signed improvements.
+## Why compete on the inputs
 
-Each accepted improvement becomes the starting point for the next stage and
-the next era. That compounding is the meaning of the name Cascade.
+Most decentralised training asks contributors for weights or gradients.
+Cascade asks for something smaller and more inspectable: the inputs to
+training. A synthetic data generator is a short Python program that encodes
+a hypothesis about how real series behave: shifting seasonality, regime
+changes, coupled channels, noise. A fine-tuning recipe is a declared schedule
+and dataset. Because the model, budget, seeds and starting checkpoint are
+fixed for each comparison, the only thing that differs between two entries is
+the idea itself, and held-out real data decides whether it worked.
 
-## The stack
+## The stack, lane by lane
 
-```mermaid
-flowchart TD
-    data["0 · Data<br/>synthetic generators (A/B)<br/>real corpus and selection (planned)"]
-    pre["1 · Pre-training — Lane A<br/>full model, king lineage, promoted warm starts"]
-    mid["2 · Mid-training<br/>per-leg cooldown · Lane B domain and horizon experts"]
-    post["3 · Post-training<br/>Lane B guarded merges · Lane D distillation (planned)<br/>calibration (planned)"]
-    ft["4 · Fine-tuning — Lane C<br/>application checkpoints, forward-only evaluation"]
-    eval["Evaluation at every stage<br/>private rotating pool · paired LCB duels<br/>GIFT-Eval / BOOM / TIME / FEV · forward-only windows"]
-    data --> pre --> mid --> post
-    post -->|"accepted updates enter the next warm start"| pre
-    post --> ft
-    eval -.-> pre
-    eval -.-> mid
-    eval -.-> post
-    eval -.-> ft
-```
+**Data.** Every stage starts with data. Miners write deterministic,
+sandboxed generators that emit 32-channel series, and the network generates
+their training shards on CPU before any GPU is rented. Over time, curated
+real data and selections from prior training corpora join the synthetic mix.
 
-## Stage by stage
+**Pre-training: Lane A.** Lane A trains the full model, Cascade MoE Base, a
+1.23B-parameter mixture-of-experts forecaster with 112M parameters active per
+token, a 21-quantile output head and attention across channels. Each
+challenger's generator trains the model, which is then compared with the
+reigning king on a private, rotating pool of real series and on the
+GIFT-Eval, BOOM, TIME and FEV public benchmarks. A winner takes the throne,
+and kings that keep passing scheduled checks are promoted to become the
+shared starting checkpoint for the next era. Pre-training is not one long
+run; it is a lineage that compounds across many independently funded runs.
 
-| Stage | What a frontier lab does | Cascade lane | Foundation in place today | Next step |
-|---|---|---|---|---|
-| **0. Data** | Synthetic priors (kernel/GP mixtures), large real corpora, augmentation such as TSMixup | Lane A/B generators; Lane D data selection | Deterministic, sandboxed 32-channel generators ([interface](INTERFACE.md)); CPU shard generation tier ([DEC-CA-0053](../decisions/DEC-CA-0053-cpu-generation-tier.md)); content dedup ([DEC-CA-0008](../decisions/DEC-CA-0008-content-dedup.md)); shared real-corpus machinery shipped inert ([DEC-CA-0028](../decisions/DEC-CA-0028-shared-real-corpus.md)) | Pin a real corpus disjoint from every evaluation pool and arm it, so pre-training uses a real + synthetic mix |
-| **1. Pre-training** | One long run from random init on a fixed architecture | **Lane A** | Cascade MoE Base - 1.23B ([model](MODEL.md)); a random-init window, then a king lineage whose promoted checkpoints become each era's warm start; warmup-stable-decay schedule ([DEC-CA-0018](../decisions/DEC-CA-0018-wsd-schedule-optimizer-continuity.md)); paired confidence-bound duels plus the four-suite public gate ([DEC-CA-0061](../decisions/DEC-CA-0061-lane-a-four-suite-strict-gate.md)); miner-funded compute ([DEC-CA-0036](../decisions/DEC-CA-0036-miner-funded-elastic-rounds.md)) | Launch v2 Lane A; measure lineage progress on public benchmarks era over era |
-| **2. Mid-training** | Cooldown on high-quality data, domain upweighting, long-context extension | Leg cooldown; **Lane B**; Lane D context | Every v2 leg ends with a linear cooldown, so scored checkpoints are in finished form ([model](MODEL.md#optimizer-and-schedule), lineage rationale in [DEC-CA-0029](../decisions/DEC-CA-0029-fork-anneal-finished-form-checkpoints.md)); Lane B continues training selected experts on declared domains and horizons ([DEC-CA-0050](../decisions/DEC-CA-0050-v2-moe-domain-expert-lane.md), [DEC-CA-0059](../decisions/DEC-CA-0059-lane-b-multi-domain-legs.md)) | Open Lane B once its lineage-token and routing-stability gates pass; calibrate its payout tiers from real wins; long-context recipe in Lane D |
-| **3. Post-training** | Distillation, model merging, expert specialisation, quantile calibration | **Lane B** merges; **Lane D** distillation; calibration target | Expert-specialised fine-tuning with frozen router, non-inferiority guards on every other domain and the public suites, and merge acceptance into the next warm start (`cascade/trainer/merge_acceptance.py`); Lane D wired as an inert placeholder with an Ephemeris teacher-panel design ([DEC-CA-0062](../decisions/DEC-CA-0062-lane-d-distillation-real-data.md)) | Build Lane D so distilled updates merge through the same acceptance path; add a calibration target judged on coverage and CRPS |
-| **4. Fine-tuning** | Task-, domain- or customer-specific adaptation | **Lane C** | Recipe fine-tunes with bounded schedules (`cascade/trainer/finetune.py`); competitions container with per-competition weights; MarketCast forward-only market evaluation with calibration gates and later confirmation ([DEC-CA-0056](../decisions/DEC-CA-0056-lane-c-fine-tuning.md), [DEC-CA-0064](../decisions/DEC-CA-0064-marketcast-finetune-eval.md)) | Add a competition whose pinned base is a promoted Cascade checkpoint, so Lane C fine-tunes our own model; add further forward-only applications |
-| **Model family** | Release several sizes from one recipe | Lane D (planned) | Cascade MoE Base 17.58M, 69.02M and 273.84M presets for local iteration ([presets](../deploy/presets/README.md)) | Distil the 1.23B king into the smaller sizes as published, evaluated checkpoints |
+**Mid-training: Lane B.** A mixture-of-experts model routes each input to
+specialist subnetworks. Once the shared model's routing has stabilised,
+Lane B lets miners target those specialists. A miner declares up to three
+targets (domains such as energy, healthcare or transport, or short, medium
+and long forecast horizons) and supplies a generator for them. The trainer
+selects the experts the model actually uses for those targets and trains
+only those, leaving the rest of the model frozen.
 
-## Principles shared by every stage
+**Post-training: merging and distillation.** A Lane B update must improve its
+targets without regressing any other domain, horizon or public benchmark. It
+must then pass merge acceptance before it enters the next shared checkpoint,
+so the general model gains specialist skill one verified update at a time.
+Distillation extends this stage: a fourth lane brings in real data and
+teacher forecasts from a panel of leading foundation models, compressing
+their knowledge into Cascade's own model and into smaller versions of it.
 
-These are already implemented for the live lanes and are the reason new
-stages can be added without redesigning the subnet:
+**Fine-tuning: Lane C.** Lane C turns foundation models into applications.
+Miners submit fine-tuning recipes for a pinned base model, and each
+fine-tune is judged only on observations that did not exist when it was
+trained, so it cannot have memorised the answers. The first competition,
+MarketCast, forecasts the quantities that market-facing subnets depend on,
+such as return distributions and realised volatility. A fine-tune must beat
+the untouched base, stay well calibrated, and confirm its gain on fresh data
+before it earns a slot.
 
-- **Contribute inputs, not weights.** Miners submit generators, recipes or
-  (planned) data selections; the operator trains under a pinned contract, so
-  results are comparable and reproducible.
-- **Measured, not claimed.** A stage advances only on a paired comparison
-  whose lower confidence bound clears a non-zero margin, with regression
-  guards on everything it was not trying to improve.
-- **Miner-funded compute.** Every lane rents on the contributor's own
-  provider key; infrastructure faults requeue rather than penalise.
-- **Signed, replayable evidence.** Manifests, receipts and promotions are
-  signed and hash-chained; satellites and the audit tool replay them
-  ([architecture](ARCHITECTURE.md), [audit](AUDIT.md)).
-- **Burn what is not earned.** Unpaid and unlaunched allocations burn instead
-  of diluting earned rewards.
-- **Separate activation.** Each lane and competition ships inert and is
-  activated at its own era boundary, so stages can roll out one at a time.
+## What every stage shares
 
-## Roadmap
+- **Measured, not claimed.** A contribution advances only when a paired
+  comparison's lower confidence bound clears a non-zero margin, with guards
+  on everything it was not trying to improve.
+- **Miner-funded compute.** Each contributor rents GPUs on their own provider
+  key, choosing their hardware and price limits. Infrastructure faults are
+  retried, not penalised.
+- **Verifiable by anyone.** Training manifests, evaluation receipts and
+  promotions are signed and hash-chained. Satellite validators replay them,
+  and an audit tool re-checks every decision.
+- **Rewards follow results.** Each lane has its own share of emissions, and
+  anything not earned is burned rather than redistributed.
+- **One stage at a time.** Each lane activates independently, so the stack
+  can grow without disrupting the stages already running.
 
-Phases describe order, not dates. Each phase is complete only when its lane
-is active on mainnet and producing signed results.
+## Rollout
 
-| Phase | Stages | Status |
-|---|---|---|
-| 1 | Pre-training (Lane A on Cascade MoE Base - 1.23B) | Launch targeted for 30 October 2026 |
-| 2 | Fine-tuning on an external base (Lane C / MarketCast) and mid/post-training experts (Lane B) | Built; off in the checked-in configuration; planned order C then B |
-| 3 | Real data in pre-training; distillation and long context (Lane D) | Real-corpus machinery inert; Lane D placeholder |
-| 4 | Fine-tuning our own model (Lane C on a Cascade base); calibration target; distilled size family | Design stage |
+Lane A, pre-training on Cascade MoE Base, launches first, targeting
+**30 October 2026, 12:00 UTC**. Lane C's application fine-tunes and Lane B's
+specialist experts follow, each activated at its own era boundary.
+Distillation, real data, fine-tunes built on Cascade's own model and a
+family of smaller models complete the stack.
 
-## Open questions
+The goal is a forecasting model that keeps improving because anyone can
+contribute the next good idea, and every idea has to prove itself on real
+data before the model keeps it.
 
-- Does distillation (Lane D) merge into the shared lineage, feed Lane A as a
-  data source, or stay a separate product like Lane C?
-- How is leakage controlled when a teacher panel has seen public benchmarks?
-- Which forward-only evaluations beyond markets can support Lane C
-  competitions without memorisable windows?
-- Should the size family be separate paid lineages or distilled releases of
-  the king?
+## Get involved
 
-## Updating this page
-
-Update the "Foundation in place today" and roadmap status columns when a
-stage ships or is activated, linking the decision record and guide that
-describe it. Keep live-state claims out of this page; point to discovery
-instead.
+- Explore the research: [the competition introduction](../agent.md)
+- Mine: [miner guide](MINER.md) and [agent walkthrough](AGENT_MINING.md)
+- Validate: [validator guide](VALIDATOR.md)
+- Audit the evidence: [audit guide](AUDIT.md) and the
+  [public dashboard](https://s3.hippius.com/cascade-manifests/index.html)
