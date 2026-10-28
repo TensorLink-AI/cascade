@@ -279,8 +279,10 @@ class _GenerationMixin:
         # the corpus metadata, not the expiring download links: retries can
         # happen days later within the same seed epoch.
         cache = self.__dict__.setdefault("_leg_corpus_cache", {})
+        king = bool(getattr(self.__dict__.get("_leg_local_obj"), "funded_is_king", False))
+        floor = (self.cfg.for_king() if king else self.cfg).generator.min_channels
         key = (gen.hotkey, str(seeds.base_seed), gen.ref,
-               self.cfg.generator.min_channels, self.cfg.generator.max_channels)
+               floor, self.cfg.generator.max_channels)
         # One build per key even when two threads (lane A, lane-B domains) ask
         # at once: the second waits and takes the first's corpus.
         locks = self.__dict__.setdefault("_leg_corpus_locks", {})
@@ -320,7 +322,9 @@ class _GenerationMixin:
             return stage.generate(
                 round_id=round_id, hotkey=gen.hotkey, uid=gen.uid, era=era_index,
                 gen_ref=gen.ref, repo_dir=repo, seed=int(seeds.generation_seed),
-                **({"priority": True} if getattr(self.__dict__.get("_leg_local_obj"),
-                                                 "funded_is_king", False) else {}))
+                **({"priority": True,
+                    "min_channels": self.cfg.for_king().generator.min_channels}
+                   if getattr(self.__dict__.get("_leg_local_obj"), "funded_is_king", False)
+                   else {}))
         finally:
             shutil.rmtree(repo, ignore_errors=True)

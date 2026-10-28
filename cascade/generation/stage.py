@@ -328,12 +328,13 @@ class GenerationStage:
 
     def _generate(self, *, round_id: str, hotkey: str, uid: int | None, era: int | None,
                  gen_ref: str, repo_dir: Path | str, seed: int,
-                 priority: bool = False) -> StageResult:
+                 priority: bool = False, min_channels: int | None = None) -> StageResult:
         from ..trainer.admission import FairSlots
 
         if not self.cfg.generation.enabled:
             raise GenerationInfraError("[generation] enabled = false")
-        reused = self.existing(round_id=round_id, hotkey=hotkey, gen_ref=gen_ref, seed=seed)
+        reused = self.existing(round_id=round_id, hotkey=hotkey, gen_ref=gen_ref, seed=seed,
+                               min_channels=min_channels)
         if reused is not None:
             return reused
         gate = self.__dict__.setdefault("_slots", FairSlots(clock=self.clock))
@@ -343,13 +344,16 @@ class GenerationStage:
             if not acquired:
                 raise GenerationInfraError("CPU generation admission is full — requeued")
             return self._generate_admitted(round_id=round_id, hotkey=hotkey, uid=uid, era=era,
-                                           gen_ref=gen_ref, repo_dir=repo_dir, seed=seed)
+                                           gen_ref=gen_ref, repo_dir=repo_dir, seed=seed,
+                                           min_channels=min_channels)
 
-    def _generate_admitted(self, *, round_id, hotkey, uid, era, gen_ref, repo_dir, seed):
+    def _generate_admitted(self, *, round_id, hotkey, uid, era, gen_ref, repo_dir, seed,
+                           min_channels=None):
         gcfg = self.cfg.generation
         if not gcfg.enabled:
             raise GenerationInfraError("[generation] enabled = false")
-        reused = self.existing(round_id=round_id, hotkey=hotkey, gen_ref=gen_ref, seed=seed)
+        reused = self.existing(round_id=round_id, hotkey=hotkey, gen_ref=gen_ref, seed=seed,
+                               min_channels=min_channels)
         if reused is not None:
             return reused
         pick = self._wait_for_offer(gcfg)
@@ -363,7 +367,7 @@ class GenerationStage:
         try:
             return self._generate_on(provider, shape, name, round_id=round_id, hotkey=hotkey,
                                      uid=uid, era=era, gen_ref=gen_ref, repo_dir=repo_dir,
-                                     seed=seed)
+                                     seed=seed, min_channels=min_channels)
         finally:
             with _LIVE_GUARD:
                 _LIVE.discard(name)
@@ -392,7 +396,7 @@ class GenerationStage:
 
     def _generate_on(self, provider, shape, name: str, *, round_id: str, hotkey: str,
                      uid: int | None, era: int | None, gen_ref: str, repo_dir: Path | str,
-                     seed: int) -> StageResult:
+                     seed: int, min_channels: int | None = None) -> StageResult:
         gcfg = self.cfg.generation
         row = {"provider": provider.name, "vm_id": "", "name": name,
                "created": time.time(), "round_id": str(round_id), "hotkey": hotkey}
@@ -415,7 +419,8 @@ class GenerationStage:
             self._bootstrap(host)
             base = leg_prefix(round_id, hotkey, gcfg.storage_prefix)
             summary = self._run(host, repo_dir, seed=seed, gen_ref=gen_ref,
-                                urls=upload_plan(self.store, base, gcfg))
+                                urls=upload_plan(self.store, base, gcfg),
+                                min_channels=min_channels)
             index = self._uploaded_index(base, summary)
             row = register_corpus(self.store, index, round_id=round_id, hotkey=hotkey,
                                   uid=uid, era=era, provider=provider.name,
@@ -434,8 +439,8 @@ class GenerationStage:
                           "VM ledger for the reaper%s", hotkey[:12], provider.name, vm, e,
                           "" if self.ledger_path else "; stop it by hand")
 
-    def existing(self, *, round_id: str, hotkey: str, gen_ref: str, seed: int
-                 ) -> StageResult | None:
+    def existing(self, *, round_id: str, hotkey: str, gen_ref: str, seed: int,
+                 min_channels: int | None = None) -> StageResult | None:
         """This leg's corpus when it is already in the dataset — its index row
         (written only after every shard and ``corpus.json`` landed) plus a
         ``corpus.json`` whose digest, generator ref and seed match — so a
@@ -458,10 +463,11 @@ class GenerationStage:
         # A corpus built before the width policy changed must not be reused
         # for a new leg and only discovered as incompatible on a paid GPU.
         channels = index.get("channels_histogram", {})
-        if self.cfg.generator.min_channels > 1:
+        floor = self.cfg.generator.min_channels if min_channels is None else int(min_channels)
+        if floor > 1:
             try:
                 if not channels or any(int(count) <= 0 or not (
-                        self.cfg.generator.min_channels <= int(c) <= self.cfg.generator.max_channels)
+                        floor <= int(c) <= self.cfg.generator.max_channels)
                         for c, count in channels.items()):
                     return None
             except (ValueError, TypeError, AttributeError):
@@ -521,7 +527,7 @@ class GenerationStage:
                                        f"{(proc.stderr or '')[-300:]}")
 
     def _run(self, host: RemoteHost, repo_dir: Path | str, *, seed: int, gen_ref: str,
-             urls: dict[str, str]) -> dict:
+             urls: dict[str, str], min_channels: int | None = None) -> dict:
         gen = f"{host.workdir}/_gen"
         self.runner(build_ssh_argv(host, f"rm -rf {shlex.quote(gen)} && "
                                          f"mkdir -p {shlex.quote(gen)}"), 120)
@@ -537,7 +543,8 @@ class GenerationStage:
                f"_gen/repo _gen/out --seed {int(seed)} "
                f"--generator-ref {shlex.quote(gen_ref)} "
                f"--upload-urls _gen/{URLS_NAME} --progress-id {shlex.quote(nonce)} "
-               f"--progress-file _gen/progress.json --json")
+               f"--progress-file _gen/progress.json --json"
+               + (f" --min-channels {int(min_channels)}" if min_channels is not None else ""))
         timeout = int(self.cfg.generation.window_seconds + self.upload_slack_s)
         stop = threading.Event()
         watcher = None

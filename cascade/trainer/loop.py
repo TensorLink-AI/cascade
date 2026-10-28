@@ -801,6 +801,7 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
         warm_start_dir: Path | None = None,
         expert_selection: dict | None = None,
         lane_info: dict | None = None,
+        king: bool = False,
     ) -> tuple[TrainResult, str, int, int]:
         """Fetch generator (registry) → build corpus → train into ``out_dir``,
         streaming per-step metrics to S3. No upload — the caller decides where
@@ -898,7 +899,8 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
 
         with open_round_stream(
             contract.corpus_mode,
-            gen_dir, seeds.generation_seed, self.cfg.generator_for_contract(contract),
+            gen_dir, seeds.generation_seed,
+            (self.cfg.for_king() if king else self.cfg).generator_for_contract(contract),
             token_budget=token_budget,
             use_sandbox=self.use_sandbox,
             blocked=self.cfg.static_guard.blocked,
@@ -1170,6 +1172,7 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
             result, corpus_digest, _, _ = self._train_checkpoint(
                 gen, seeds, contract, token_budget, out_dir, log_role=log_role,
                 warm_start_dir=ws_dir, **expert_kw(expert_selection),
+                **({"king": True} if role == "king" and not heat else {}),
                 # forwarded only off lane A, so a lane-A call (and test doubles
                 # without the kwarg) stays unchanged
                 **({"lane_info": lane_info}

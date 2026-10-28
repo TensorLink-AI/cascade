@@ -51,6 +51,10 @@ max_repo_mb          = 128       # cap on the fetched submission (code-only, no 
 # ≤ 8 (EVAL_POOL.md); OOM is a challenger fault and never re-queues.
 max_channels         = 32
 min_channels         = 32         # v2 synthetic submissions: exactly 32 channels per yield
+# King legs only (trainer-side; 0 = min_channels): the carried king's committed
+# generator predates the 32-channel rule, so its leg trains at 1..32 channels.
+# Validators judge the king's ref, never its width.
+king_min_channels    = 1
 # The record carrier (DEC-CA-0020). interface_version 1 = record-or-array yield
 # with `values` only; every reserved field (mask, start, freq, group_id, roles,
 # labels, quantiles) is hard-rejected until the release that consumes it. Bumps

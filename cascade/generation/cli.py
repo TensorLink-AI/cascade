@@ -38,6 +38,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--progress-id", default="", help="Operator attempt identity for progress.")
     p.add_argument("--progress-file", type=Path, default=None, help="Atomic local progress JSON file.")
     p.add_argument("--json", action="store_true", help="print only the JSON summary")
+    p.add_argument("--min-channels", type=int, default=None,
+                   help="width floor for this leg (a king leg under [generator] "
+                        "king_min_channels); default: the contract's policy")
     return p
 
 
@@ -72,6 +75,11 @@ def main(argv: list[str] | None = None) -> int:
         # This CLI prepares a shard leg, never a legacy streaming leg.
         contract = cfg.training.v2_contract
     gen_cfg = cfg.generator_for_contract(contract)
+    if args.min_channels is not None:
+        if not 1 <= args.min_channels <= gen_cfg.min_channels:
+            print(json.dumps({"ok": False, "error": "--min-channels may only lower the floor"}))
+            return EXIT_REFUSED
+        gen_cfg = replace(gen_cfg, min_channels=args.min_channels)
     if not args.no_sandbox:
         gen_cfg = replace(gen_cfg, sandbox_strict=True)
     from .progress import PROGRESS_NAME, CpuProgress

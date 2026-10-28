@@ -218,7 +218,8 @@ def run_tier1(
                 continue
             try:
                 digest = _rederive_digest(
-                    cdir, receipt.generation_seed, cfg, mode=mode,
+                    cdir, receipt.generation_seed,
+                    cfg.for_king() if entry.role == "king" else cfg, mode=mode,
                     token_budget=contract.train_tokens,
                     budget_denomination=getattr(contract, "budget_denomination", "points"),
                     corpus_epochs=epochs, corpus_dir=cdir)
@@ -232,7 +233,8 @@ def run_tier1(
                 (FAIL, f"shards digest {digest[:16]}… != recorded {entry.corpus_digest[:16]}…"))))
             continue
         cache_key = (entry.gen_ref, mode,
-                     contract.train_tokens if (mode != "cache_reuse" or epochs) else 0)
+                     contract.train_tokens if (mode != "cache_reuse" or epochs) else 0,
+                     entry.role == "king")
         try:
             if cache_key in digest_cache:
                 digest = digest_cache[cache_key]
@@ -241,7 +243,8 @@ def run_tier1(
                     entry.gen_ref.encode()).hexdigest()[:16]
                 _fetch_generator(entry.gen_ref, gen_dir, cfg)
                 digest = _rederive_digest(
-                    gen_dir, receipt.generation_seed, cfg,
+                    gen_dir, receipt.generation_seed,
+                    cfg.for_king() if entry.role == "king" else cfg,
                     mode=mode, token_budget=contract.train_tokens,
                     max_wall_seconds=contract.max_train_seconds,
                     seed_mix=int(getattr(contract, "gen_seed_mix", 1) or 1),
@@ -371,7 +374,8 @@ def run_tier2(
                           and (entry.size or training.arch_preset) ==
                           (manifest.warm_start_size or training.arch_preset) else None)
             with open_round_stream(
-                contract.corpus_mode, gen_dir, receipt.generation_seed, cfg.generator,
+                contract.corpus_mode, gen_dir, receipt.generation_seed,
+                (cfg.for_king() if entry.role == "king" else cfg).generator,
                 token_budget=contract.train_tokens, use_sandbox=True,
                 blocked=cfg.static_guard.blocked,
                 max_wall_seconds=contract.max_train_seconds,
