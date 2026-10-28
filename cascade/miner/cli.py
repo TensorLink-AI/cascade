@@ -306,7 +306,7 @@ def _resolve_fetch_ref(target: str, cfg, network: str) -> tuple[str, str]:
     by_hotkey = {c.hotkey: c for c in commitments}
 
     if target.lower() == "king":
-        king_hk = client.highest_incentive_hotkey()
+        king_hk = client.highest_incentive_hotkey(exclude_uids=(int(cfg.scoring.burn_uid),))
         if king_hk is None:
             raise ValueError("no king on the metagraph (vacant throne / empty subnet)")
         commit = by_hotkey.get(king_hk)

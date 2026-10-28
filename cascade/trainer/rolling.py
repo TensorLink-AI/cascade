@@ -515,7 +515,9 @@ class LegOps:
 
     def metagraph_king(self, client) -> str | None:
         try:
-            return self.chain_read(client.highest_incentive_hotkey)
+            cfg = getattr(self.r, "cfg", None)
+            burn = (int(cfg.scoring.burn_uid),) if cfg is not None else ()
+            return self.chain_read(lambda: client.highest_incentive_hotkey(exclude_uids=burn))
         except Exception:  # noqa: BLE001 — cross-check only (a timeout too)
             return None
 

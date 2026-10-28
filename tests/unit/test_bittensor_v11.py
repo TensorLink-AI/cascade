@@ -245,6 +245,7 @@ def test_metagraph_reads_use_the_typed_metagraph():
     sub.subnets = SimpleNamespace(metagraph=sub._metagraph)
     c = ChainClient(netuid=91, _subtensor=sub)
     assert c.highest_incentive_hotkey() == "5B"          # first max, as 10.5
+    assert c.highest_incentive_hotkey(exclude_uids=(1,)) == "5C"   # burn slot skipped
     assert c.n_uids() == 3
     assert c.registered_hotkeys() == ["5A", "5B", "5C"]
     assert c.uid_for_hotkey("5C") == 2 and c.uid_for_hotkey("5Z") is None

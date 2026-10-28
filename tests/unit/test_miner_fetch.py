@@ -20,7 +20,7 @@ class _FakeClient:
     def poll_commitments(self):
         return self._c
 
-    def highest_incentive_hotkey(self):
+    def highest_incentive_hotkey(self, exclude_uids=()):
         return self._king
 
 
