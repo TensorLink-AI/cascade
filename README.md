@@ -36,6 +36,7 @@ The planned lane order is **A → C → B**: A/C use 75%/25%, then A/B/C use 50%
 | A validator | [Validator guide](docs/VALIDATOR.md); choose satellite, full evaluator or designated main responsibilities |
 | The operator | [Operator runbook](docs/OPERATOR.md) |
 | Reviewing implementation | [Architecture](docs/ARCHITECTURE.md) and [decisions](decisions/) |
+| Following the roadmap | [Vision: the TSFM training stack](docs/VISION.md) |
 
 V2 synthetic generators must emit finite float arrays `(C, L)` with **exactly 32 channels per yield**. One-dimensional and 1–31-channel yields are rejected. Read the effective policy for length and resource limits.
 
