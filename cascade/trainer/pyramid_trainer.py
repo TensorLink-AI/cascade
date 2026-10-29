@@ -65,11 +65,15 @@ def losses(model, values, mask, *, generator=None, groups=None):
     ps = model.cfg.patch_size
     p = length // ps
     params, loc, scale = prediction(model, values, mask, groups=groups)
-    truth = (values.reshape(b, c, p, ps)[:, :, 1:].float() - loc) / scale
+    # float64 standardized target: after a flat context (scale floor 1e-5) a
+    # large jump puts it near 1e18 and beyond — past float32 for values near
+    # the float32 ceiling, and its squared norm overflows float32 long before.
+    truth64 = (values.reshape(b, c, p, ps)[:, :, 1:].double() - loc.double()) / scale.double()
     q = quantiles(params)
-    marginal = marginal_pinball_loss(q, truth)
+    marginal = marginal_pinball_loss(q, truth64.float())    # asinh + clamp: safe in float32
     paths = sample_copula_paths(params, 4, generator=generator, groups=groups)
-    joint = 10 * energy_score(paths, truth).mean()
+    # Same objective in float64 (combine_gradients caps its pull).
+    joint = 10 * energy_score(paths.double(), truth64).mean()
     return marginal, joint
 
 

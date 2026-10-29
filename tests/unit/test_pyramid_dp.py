@@ -110,3 +110,19 @@ def test_two_ranks_reproduce_the_one_gpu_step(tmp_path):
 def test_owned_splits_deal_round_robin():
     assert owned_splits(8, 0, 4) == {0, 4} and owned_splits(8, 3, 4) == {3, 7}
     assert set().union(*(owned_splits(8, r, 8) for r in range(8))) == set(range(8))
+
+
+@pytest.mark.parametrize("jump", [1e13, 1e15, 1e20, 3e38])
+def test_energy_score_survives_a_huge_jump_after_a_flat_context(jump):
+    """uid31's carried king (2026-10-29): a flat context then a ~1e13 jump made
+    the float32 energy score inf and aborted the leg at step 47."""
+    from cascade.trainer.pyramid_trainer import losses
+
+    model = _model()
+    v = np.full((1, 1, 64), 5.0)
+    v[..., 48:] = jump
+    marginal, joint = losses(model, torch.as_tensor(v), torch.zeros(1, 1, 16, dtype=torch.bool),
+                             generator=torch.Generator().manual_seed(1))
+    assert np.isfinite(float(marginal)) and np.isfinite(float(joint))
+    grads = torch.autograd.grad(joint, list(model.parameters()), allow_unused=True)
+    assert all(torch.isfinite(g).all() for g in grads if g is not None)
