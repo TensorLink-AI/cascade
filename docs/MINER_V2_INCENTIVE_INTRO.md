@@ -15,7 +15,7 @@ and `cascade status --json` are authoritative over this page.
 | Batch | 64 series | **16 series × 32 channels** per step |
 | Budget | per-series points | **≈ 50B points**: 23,841 steps × 16 × 32 × 4096 |
 | Submissions | one per hotkey, for life | **one per hotkey per round** |
-| Dethrone bar | 0.4 → 0.2 increment units | **0.10 → 0.01** increment units |
+| Dethrone bar | 0.4 → 0.2 increment units | **1% → 0.5%** level (first 7 days), then **0.10 → 0.01** increment |
 | Public benchmarks | GIFT-Eval, BOOM, TIME | adds **FEV**; run on the main validator's GPU |
 | Rewards | court split | **king ladder**, see below |
 | GPUs | one card per leg | **4×/8× multi-GPU layouts** (planned, see below) |
@@ -78,7 +78,9 @@ confidence bound (LCB) on your advantage over the king.
 
 - **Margin:** in increment units the bar is **0.10** against a fresh king,
   falling linearly to **0.01** over 18,000 blocks (≈ 2.5 days) of tenure.
-  Random-init eras use the level bar; `cascade round` prints the live bar.
+  Random-init eras have no init to compare against, so they use the level
+  bar: **1%** of the king's score, falling to **0.5%** over 28,800 blocks
+  (≈ 4 days). See the [FAQ](V2_FAQ.md) for worked examples.
 - **Public benchmark gate:** a private-pool win must also hold up on
   GIFT-Eval, BOOM, TIME and now **FEV**. You pass when you are better on
   average, no suite is significantly worse (within 1%), and you win at
