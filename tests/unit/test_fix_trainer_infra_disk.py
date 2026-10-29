@@ -31,7 +31,7 @@ def test_concurrent_burns_never_drop_each_other(tmp_path):
     for t in threads:
         t.join()
     assert _load_seen_hotkeys(path) == set(hotkeys)
-    assert json.loads(path.read_text()) == sorted(hotkeys)
+    assert sorted(json.loads(path.read_text())) == sorted(hotkeys)
     assert not list(tmp_path.glob("*.tmp.*"))          # atomic writes leave no temp
 
 
@@ -88,3 +88,23 @@ def test_log_file_is_size_rotated(tmp_path):
         for h in saved_handlers:
             root.addHandler(h)
         root.setLevel(saved_level)
+
+
+def test_burn_is_per_round_and_legacy_lifetime_burns_lift(tmp_path):
+    import json
+    from types import SimpleNamespace
+
+    from cascade.shared.config import effective_epoch_blocks, load_chain_config
+    from cascade.trainer.rolling import LegOps
+    from cascade.trainer.runner_common import _load_burns
+
+    path = tmp_path / "subs.json"
+    path.write_text(json.dumps(["OLD"]))                    # legacy lifetime list
+    assert _load_burns(path) == {"OLD": -1}
+    rnd = load_chain_config().round
+    step = int(effective_epoch_blocks(rnd, 0))
+    _add_seen_hotkeys(path, ["A"], step + 10)               # burned in round 1
+    ops = LegOps.__new__(LegOps)
+    ops.r = SimpleNamespace(cfg=SimpleNamespace(round=rnd), _submissions_path=lambda: path)
+    assert ops.burned(step + step // 2) == {"A"}            # same round: refused
+    assert ops.burned(2 * step + 1) == set()                # next round: free; OLD never matches

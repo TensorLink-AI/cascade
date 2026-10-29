@@ -54,7 +54,7 @@ def test_scheduler_replay_after_queue_write_keeps_next_fund(cfg, tmp_path):
     queue.add("ALFA", "next-ref", b0 + 1)
     original = ops.burn
 
-    def die_after_queue_write(gens):
+    def die_after_queue_write(gens, block=-1):
         raise RuntimeError("crash after queue completion")
 
     ops.burn = die_after_queue_write

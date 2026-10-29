@@ -26,10 +26,12 @@ def build(config, *, allow_paid=False):
         from ..funding.vault import compute_vaults
         from .compute import PayerPodProvider, PodProfile
         from .pods import PodDispatcher
+        from .profiles import check_operator_profiles
 
         cfg = config["provider"]
         vaults = compute_vaults(config["vault_dir"], ttl_seconds=config["vault_ttl_hours"] * 3600.0)
         profiles = {name: PodProfile(**value) for name, value in cfg["profiles"].items()}
+        check_operator_profiles(profiles)
         # Each marketplace is its own provider; a job's admitted terms name the
         # one its payer chose, and its key comes from that marketplace's vault.
         providers = {

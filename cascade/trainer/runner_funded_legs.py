@@ -481,15 +481,18 @@ class _FundedLegMixin:
                 why, hotkey[:12], len(killed), f" ({', '.join(killed)})" if killed else "")
         return killed
 
-    def _burn_hotkeys(self, challengers: list[ResolvedGenerator]) -> None:
-        """Burn the challengers that got their shot: 1 hotkey = 1 submission.
+    def _burn_hotkeys(self, challengers: list[ResolvedGenerator], block: int = -1) -> None:
+        """Burn the challengers that got their shot: 1 hotkey = 1 submission
+        per round. ``block`` places the burn in its round (the leg's start
+        block at settlement, the admission block on a refusal); the hotkey is
+        free again in the next round.
 
         Called when a leg SETTLES (its entry is in a published manifest) or
         its submission is refused for the miner's own fault — never for a leg
         lost to our infrastructure."""
         if not self.cfg.round.one_submission_per_hotkey or not challengers:
             return
-        _add_seen_hotkeys(self._submissions_path(), [c.hotkey for c in challengers])
+        _add_seen_hotkeys(self._submissions_path(), [c.hotkey for c in challengers], block)
 
 
 def _record_generation_failure(runner, gen, e: BaseException) -> None:

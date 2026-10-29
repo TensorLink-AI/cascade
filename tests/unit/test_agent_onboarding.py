@@ -281,7 +281,7 @@ def test_real_publishers_supply_matching_clock_contract_and_live_queue(cfg):
                               king=lambda: None)
     sched = SimpleNamespace(cfg=cfg, lane_b=None, state=SimpleNamespace(current=current),
                             r=SimpleNamespace(manifest_store=lambda: store),
-                            ops=SimpleNamespace(burned=lambda: {"spent"}, queue=lambda:
+                            ops=SimpleNamespace(burned=lambda block: {"spent"}, queue=lambda:
                                 SimpleNamespace(public_view=lambda: {"entries": []})))
     assert publish_trainer_v2_status(sched, block, clock=lambda: 0.)
     competition = store.writes[-1][1]

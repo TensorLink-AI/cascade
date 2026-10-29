@@ -208,10 +208,10 @@ class FakeOps(LegOps):
     def queue(self):
         return FundedQueue(self.tmp / "funded_queue.json", clock=self.clock)
 
-    def burned(self):
+    def burned(self, block):
         return set()
 
-    def burn(self, gens):
+    def burn(self, gens, block=-1):
         self.burnt.extend(g.hotkey for g in gens)
 
     def vault_owned(self, gens):

@@ -111,7 +111,7 @@ stable routing before B opens. C currently offers MarketCast recipes for returns
 and volatility when activated. It uses a separately pinned Timestral-28M base;
 the Timestral-209M dashboard reference is a different comparison model.
 
-Lane A allows one judged submission per hotkey. B/C allow one training run per
+Lane A allows one judged submission per hotkey per round. B/C allow one training run per
 revealed commitment; a new attempt needs a new commitment and funding. One
 hotkey has one chain commitment across lanes and at most one live training leg.
 Changing commitments can supersede queued work. Compute failures and rejected
