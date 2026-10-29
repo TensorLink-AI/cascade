@@ -56,6 +56,10 @@ _FUNDING_MARKERS = (
     # requeued the entry forever instead of releasing the key to the miner.
     "insufficient credit", "insufficient_credit", "insufficient_balance",
     "insufficient_funds",
+    # Lium's rent refusal (403, 2026-10-29): "renting needs a balance above 15
+    # minutes of the node's hourly price plus the same for each pod already
+    # running … Top up at https://lium.io/billing."
+    "needs a balance above", "lium.io/billing",
 )
 _RATE_MARKERS = ("too many requests", "rate limit")
 _CAPACITY_MARKERS = (

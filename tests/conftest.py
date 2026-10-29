@@ -157,3 +157,14 @@ def small_cfg(cfg):
 
     gen = replace(cfg.generator, corpus_n_series=6)
     return replace(cfg, generator=gen)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_operator_orphan_sweep(monkeypatch):
+    """The operator-account orphan sweep lists (and terminates on) the REAL
+    Lium account of whatever machine runs the suite; unit tests that build a
+    real trainer must never reach it. Tests of the sweep bind it directly."""
+    from cascade.trainer.runner_funded_pods import _FundedPodMixin
+
+    monkeypatch.setattr(_FundedPodMixin, "_sweep_operator_orphans",
+                        lambda self, keep_ids, keep_payers: None)
