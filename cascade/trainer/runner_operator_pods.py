@@ -84,7 +84,8 @@ class _OperatorPodMixin:
                     name="funded-king", host=addr.ip, port=addr.ssh_port,
                     user=profile.user, key_path=profile.key_path,
                     remote_python=profile.remote_python, workdir=profile.workdir,
-                    cuda_device="0", chain_toml=profile.chain_toml,
+                    # The whole rented pod: every GPU of a layout trains.
+                    cuda_device=None, chain_toml=profile.chain_toml,
                     # Credential-free like a payer pod: nothing from the
                     # orchestrator's environment reaches the king pod — the
                     # generator (public Hub refs pull anonymously; vault refs
@@ -421,7 +422,7 @@ class _OperatorPodMixin:
                 name=f"operator-leg-{gen.hotkey[:12]}", host=addr.ip, port=addr.ssh_port,
                 user=profile.user, key_path=profile.key_path,
                 remote_python=profile.remote_python, workdir=profile.workdir,
-                cuda_device="0", chain_toml=profile.chain_toml, forward_env=(),
+                cuda_device=None, chain_toml=profile.chain_toml, forward_env=(),  # whole pod
                 isolated=True, ssh_options=profile.ssh_options,
                 pinned_host_key=host_key, stage="final", sku=sku,
                     allocation_id=pod_id, allocation_provider=provider.name,

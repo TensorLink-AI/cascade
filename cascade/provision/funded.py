@@ -265,6 +265,7 @@ def rent_funded_pod(
     """
 
     from ..funding.providers import PREFIX
+    from .layout import layout_gpus
 
     if api_key.startswith(PREFIX) or (vault is not None and provider_factory is lium_provider_for_key):
         from .payer_pool import rent_from_pool
@@ -351,7 +352,7 @@ def rent_funded_pod(
                 skus[0] if skus else sku)
             pod = PodInstance(
                 provider=provider.name, instance_id=live_name, stage=FUNDED_STAGE,
-                rented_at_iso=now_iso(), sku=landed, gpus=gpus_per_pod,
+                rented_at_iso=now_iso(), sku=landed, gpus=max(gpus_per_pod, layout_gpus(landed)),
                 payer_hotkey=hotkey, pod_uid=pod_uid, payer_credential_id=credential_id,
             )
             log.warning("funded pod %s is still LIVE at %s:%d from a prior attempt — "
@@ -448,7 +449,7 @@ def rent_funded_pod(
         landed = (str(sku_fn(pod_id) or "") if callable(sku_fn) else "") or spec.sku
         pod = PodInstance(
             provider=provider.name, instance_id=pod_id, stage=FUNDED_STAGE,
-            rented_at_iso=now_iso(), sku=landed, gpus=gpus_per_pod,
+            rented_at_iso=now_iso(), sku=landed, gpus=max(gpus_per_pod, layout_gpus(landed)),
             payer_hotkey=hotkey, pod_uid=pod_uid, payer_credential_id=credential_id,
         )
         log.info("funded pod %s ready for %s at %s:%d (%s, billed to payer)",

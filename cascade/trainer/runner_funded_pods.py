@@ -501,6 +501,7 @@ class _FundedPodMixin:
         """
         from ..provision.core import record_host_quarantine
         from ..provision.funded import LEMON_CLASS, rent_funded_pod
+        from ..provision.layout import visible_devices
         from .remote import RemoteHost
 
         queue = self._funded_queue()
@@ -905,7 +906,9 @@ class _FundedPodMixin:
             host=result.address.ip, port=result.address.ssh_port,
             user=profile.user, key_path=profile.key_path,
             remote_python=profile.remote_python, workdir=profile.workdir,
-            cuda_device="0", chain_toml=profile.chain_toml,
+            # A layout pod ("8xH200") trains on all its GPUs.
+            cuda_device=visible_devices(getattr(result.pod, "sku", "") or ""),
+            chain_toml=profile.chain_toml,
             forward_env=(), static_env=env_pairs, isolated=True,
             pinned_host_key=result.host_key,
             ssh_options=profile.ssh_options,

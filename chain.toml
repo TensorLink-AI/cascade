@@ -377,8 +377,13 @@ funded_capacity_probe = true    # retired (ignored)
 funded_capacity_reserve = 1     # retired (ignored)
 # Allowed GPU types, preference-ordered; each round runs entirely on the
 # most-available one (king included). Needs [training] expected_gpu = "".
-# Blackwell (RTX5090, B200/B300) waits on a torch cu12.8 re-pin.
-funded_pod_skus = ["RTX4090", "RTX3090", "L40S", "L40", "A6000"]
+# v2 (owner 2026-10-29): multi-GPU layouts ("8xH200" = one pod, eight
+# H200s; the leg trains data-parallel on all of them). Defaults are the
+# layouts the $75 per-leg cap below admits; 4xH100 / 4xB300 / 8xB300 cost
+# more and rent only when a miner names them (--gpu, own --max-price).
+# Blackwell (4xB200, 8xB200, 4xB300, 8xB300) waits on a torch cu12.8 image:
+# the pinned image is torch 2.4.1 cu124, which cannot run on B200/B300.
+funded_pod_skus = ["8xH200", "8xH100", "4xH200", "4xH100"]
 # Never rent executors whose CPU model contains any of these (case-insensitive
 # substring of Lium's specs.cpu.model). 2026-09-13/14: four legs stalled —
 # zero series inside the 1800 s stall window — and all four sat on Xeon
@@ -416,10 +421,10 @@ funded_sku_per_leg = true
 # an hour bills less than a 4090 at $0.50/h for three — a plain $/h cap would
 # exclude the cheaper pool. funded_max_price_per_hour is only a sanity
 # ceiling. An unpriced listing is skipped while either cap is armed.
-# $1.60/leg ≈ a 4090 at $0.50/h for 3.2 h or an H100 at $1.30/h for 1.2 h;
-# $1.50/h keeps anything exotic out.
-funded_max_price_per_hour = 1.5
-funded_max_leg_cost_usd = 1.6
+# v2: prices are per POD-hour (all GPUs of a layout). $75/leg is the
+# default/opt-in line; $40/h is only a sanity ceiling over every default.
+funded_max_price_per_hour = 40.0
+funded_max_leg_cost_usd = 75.0
 # Measured wall (seconds) of one full-budget leg per SKU: drives the per-leg
 # cost cap and the per-SKU latest safe start (a fast type — or a hosts.toml
 # lane carrying `sku = "…"` — may still start late in the epoch). A type
@@ -428,7 +433,11 @@ funded_max_leg_cost_usd = 1.6
 # 3 h 40–4 h 34 observed), L40S 2 h 50 (2 h 47 measured), L40 ~3 h 10 (est.),
 # H100 ~1 h 40 (est., unmeasured — conservative). A6000 / RTX3090 are
 # wall-bound: no entry ⇒ the 5 h cap. Re-measure when the budget changes.
-funded_sku_wall_seconds = { RTX4090 = 13500, L40S = 10200, L40 = 11400, H100 = 6000 }
+# v2 layouts: the owner's Lium timings for 27,500 updates of 64 series × 8
+# variates (the same 512 rows per step as v2's 16 × 32) scaled to v2's 23,841
+# steps (× 0.867). 8xH200, 8xH100, 4xH100 measured; 4xH200 and Blackwell
+# estimated. Re-measure on the pinned image.
+funded_sku_wall_seconds = { RTX4090 = 13500, L40S = 10200, L40 = 11400, H100 = 6000, "8xH200" = 8333, "8xH100" = 8801, "4xH200" = 12483, "4xH100" = 13201, "4xB200" = 10174, "8xB200" = 6866, "4xB300" = 10299, "8xB300" = 6866 }
 # King pod rents JIT at the round's SKU (operator-billed); retire the
 # provisioner's final stage — the trainer ledgers and sweeps these pods.
 funded_king_rent = true

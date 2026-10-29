@@ -1091,9 +1091,14 @@ class LiumProvider:
         Shape matters: the fleet plan fans one hosts.toml lane out per GPU, so
         a 1× machine rented against an 8-lane plan strands seven lanes (and the
         health gate then kills the pod anyway — filter here, before renting)."""
+        from .layout import split_layout
+
+        base, count = split_layout(sku)
+        if count > 1:
+            gpus = count            # a layout SKU ("8xH200") fixes its own shape
         try:
             execs = parse_lium_executors(
-                self._cli(["ls", "--gpu", sku, "--format", "json"]).stdout)
+                self._cli(["ls", "--gpu", base, "--format", "json"]).stdout)
         except ProvisionError as e:
             raise self._scrub_key(e) from None
         shaped = [e for e in execs if int(e.get("gpu_count", 1) or 1) == int(gpus)]

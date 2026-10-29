@@ -190,6 +190,8 @@ class RoundConfig:
     # per-SKU latest safe start — a fast SKU may still start late — and the
     # per-leg cost cap. Unknown SKU ⇒ max_train_seconds.
     funded_sku_wall_seconds: tuple[tuple[str, int], ...] = (
+        ("4xB200", 10174), ("4xB300", 10299), ("4xH100", 13201), ("4xH200", 12483),
+        ("8xB200", 6866), ("8xB300", 6866), ("8xH100", 8801), ("8xH200", 8333),
         ("H100", 6000), ("L40", 11400), ("L40S", 10200), ("RTX4090", 13500))
     # Rent the era KING's pod just-in-time on the OPERATOR's account (the
     # trainer ledgers and sweeps it; the provisioner's reaper never matches

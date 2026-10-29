@@ -558,7 +558,7 @@ cascade lane-c fund https://submissions.cascadesub.net --target mkt:returns \
   default type (the cheapest that fits, under the operator caps) as soon as
   your chosen type has no capacity.
 - If the type has no measured full-budget wall (`funded_sku_wall_seconds`;
-  for example A6000 and RTX3090 today), or its wall reaches the contract
+  for example A6000 and RTX3090), or its wall reaches the contract
   wall, the fund reply carries a `warning` and the CLI prints it. The fund
   still goes through. A leg that stops at the wall is judged on what it
   trained.
@@ -567,7 +567,9 @@ cascade lane-c fund https://submissions.cascadesub.net --target mkt:returns \
   already running.
 - Your choice shows as `gpu` in `/v1/queue`, `/v1/lane-c/queue`,
   `cascade queue` and the published roster (empty means the default type).
-- Each leg uses one GPU. Multi-GPU legs are not supported.
+- A layout type such as `8xH200` rents one pod with that many GPUs, and the
+  leg trains data-parallel on all of them (same model as one GPU, sooner).
+  Layouts rent on Lium only.
 
 ## 6. What happens to a funded entry
 

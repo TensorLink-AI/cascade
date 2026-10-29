@@ -18,7 +18,7 @@ and `cascade status --json` are authoritative over this page.
 | Dethrone bar | 0.4 → 0.2 increment units | **1% → 0.5%** level (first 7 days), then **0.10 → 0.01** increment |
 | Public benchmarks | GIFT-Eval, BOOM, TIME | adds **FEV**; run on the main validator's GPU |
 | Rewards | court split | **king ladder**, see below |
-| GPUs | one card per leg | **4×/8× multi-GPU layouts** (planned, see below) |
+| GPUs | one card per leg | **4×/8× multi-GPU pods** (see below) |
 
 ## 32-channel generators
 
@@ -123,25 +123,35 @@ Today's king, **uid 31** (`5Gsa19SF…`), is the first v2 king.
 The pin is uid 31's commitment as of block 9,339,038. If uid 31 is
 dethroned or re-commits before launch, the operator updates it.
 
-## GPUs (planned)
+## GPUs
 
-v2 is meant to train on multi-GPU nodes. Layouts estimated at $75 or less
-per job are defaults; the rest are opt-in.
+v2 legs train on multi-GPU pods. Each leg rents one pod on your key and
+trains on all its GPUs: the 8 micro-batches of every step are split across
+the GPUs and their gradients summed, so a 4× and an 8× leg train the same
+model, step for step. More GPUs only finish sooner.
 
-| Layout | Wall time | $/h | Est. per job | |
+| Layout | v2 wall (est.) | $/h | Est. per leg | |
 |---|---:|---:|---:|---|
-| 8×H200 | 2.67 h measured | 18.00 | $48 | default |
-| 4×B200 | 3.26 h measured | 16.80 | $55 | default |
-| 8×H100 | 2.82 h measured | 24.00 | $68 | default |
-| 4×H200 | ~4.0 h est. | 18.00 | $72 | default |
-| 8×B200 | ~2.2 h est. | 33.60 | $74 | default |
-| 4×H100 | 4.23 h measured | 24.00 | $102 | opt-in |
-| 4×B300 | ~3.3 h est. | 32.00 | $106 | opt-in |
-| 8×B300 | ~2.2 h est. | 56.00 | $123 | opt-in |
+| `8xH200` | 2.3 h | 18.00 | $42 | default |
+| `8xH100` | 2.4 h | 24.00 | $59 | default |
+| `4xH200` | 3.5 h | 18.00 | $62 | default |
+| `4xH100` | 3.7 h | 24.00 | $88 | opt-in |
 
-Times are for the reference job at advertised Lium rates.
+Walls are the owner's Lium timings for 27,500 updates of the same 512-row
+step, scaled to v2's 23,841 steps; prices are advertised Lium rates per pod.
 
-**Not live at launch.** Lane A legs still rent one GPU from `[round]
-funded_pod_skus`; the multi-GPU path exists only in the direct lane, which
-is still switched off. `cascade status --json` shows which GPUs a leg can
-rent today.
+- **Default:** without `--gpu`, the leg rents the cheapest layout whose
+  estimated leg costs **$75 or less**.
+- **Opt-in:** name a dearer layout with `--gpu`; your own `--max-price`
+  (USD per pod-hour) applies instead of the operator's caps:
+
+  ```bash
+  cascade fund https://submissions.cascadesub.net --ref IMMUTABLE_REF \
+    --wallet-name W --wallet-hotkey H --gpu 4xH100 --max-price 30 --yes
+  ```
+
+- **Providers:** layouts rent on **Lium**. Other providers do not offer
+  them yet.
+- **Blackwell (B200, B300) is not available at launch.** The training image
+  is built for CUDA 12.4, which cannot run on Blackwell. `4xB200`,
+  `8xB200`, `4xB300` and `8xB300` join when the image moves to CUDA 12.8.

@@ -170,6 +170,12 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
         resumed_optimizer = trainer._load_optimizer_state(Path(warm_start_dir), optimizer, model)
     mask_rng = np.random.default_rng(np.random.SeedSequence([9152026, training_seed, 19]))
     cop_gen = torch.Generator(device=trainer.device).manual_seed(training_seed % (2**63))
+    from .pyramid_dp import Gang, gang_size, micro_batch_pass, owned_splits
+
+    world = gang_size(trainer.device) if slices is None else 1
+    gang = Gang(world, cfg, deterministic=trainer.deterministic, seed=training_seed) if world > 1 else None
+    if gang is not None:
+        cop_gen = torch.Generator(device=gang.device).manual_seed(training_seed % (2**63))
     from .channel_stats import ChannelStatsAccumulator
 
     channel_stats = ChannelStatsAccumulator()
@@ -210,124 +216,104 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
             raise ValueError("invalid pyramid active wall")
     replay_verified = not restored
     started = deadline = None
-    batches = iter_training_batches(batch_source(timed, contract, patch_size=cfg.patch_size,
-        max_ctx_patches=128, seed=training_seed), patch_size=cfg.patch_size,
-        max_ctx_patches=128, batch_size=contract.batch_size,
-        batch_denomination=contract.batch_denomination)
-    for index, batch in enumerate(batches):
-        groups = None
-        if isinstance(batch, dict):
-            if set(batch) - {"values", "groups"} or "groups" not in contract.accepted_fields:
-                raise ValueError("pyramid recipe accepts only contracted groups")
-            values, groups = batch["values"], batch.get("groups")
-        else:
-            values = batch
-        if continuation:
-            from .continuation import batch_digest
+    clean = False
+    try:
+        batches = iter_training_batches(batch_source(timed, contract, patch_size=cfg.patch_size,
+            max_ctx_patches=128, seed=training_seed), patch_size=cfg.patch_size,
+            max_ctx_patches=128, batch_size=contract.batch_size,
+            batch_denomination=contract.batch_denomination)
+        for index, batch in enumerate(batches):
+            groups = None
+            if isinstance(batch, dict):
+                if set(batch) - {"values", "groups"} or "groups" not in contract.accepted_fields:
+                    raise ValueError("pyramid recipe accepts only contracted groups")
+                values, groups = batch["values"], batch.get("groups")
+            else:
+                values = batch
+            if continuation:
+                from .continuation import batch_digest
 
-            replay_hash = hashlib.sha256((replay_hash + batch_digest(batch)).encode()).hexdigest()
-        if restored and index < step:
-            if index + 1 == step:
-                if replay_hash != restored["input_hash"]:
-                    raise ValueError("pyramid continuation input differs")
-                restore_rng(restored["rng"])
-                mask_rng.bit_generator.state = restored["mask_rng"]
-                cop_gen.set_state(restored["cop_rng"])
-                timed.wait_s = restored.get("data_wait", 0.0)
-                replay_verified = True
-                if step >= steps or tokens >= token_budget or active_elapsed >= contract.max_train_seconds:
-                    break
-            continue
-        if started is None:
-            started = time.time() - active_elapsed
-            deadline = started + contract.max_train_seconds
-        if step >= steps or tokens >= token_budget or time.time() >= deadline:
-            break
-        if step == trunk and stable is None and slices is None:
-            stable = trainer._stable_snapshot(model, optimizer)
-        factor = schedule_factor(step, steps)
-        for group in optimizer.param_groups:
-            group["lr"] = group["base_lr"] * factor
-        optimizer.zero_grad(set_to_none=True)
-        b, c, length = values.shape
-        masks = sample_cpm_masks(b * c, length // 32, c_max=16, p_max=0.4, rng=mask_rng).reshape(b, c, -1)
-        reference = [None] * len(params)
-        load = [torch.zeros(layer.num_experts, device=trainer.device, dtype=torch.int64) for layer in model.moe_layers()]
-        loss_m = loss_j = 0.0
-        splits = np.array_split(np.arange(b), min(contract.micro_batches, b))
-        for layer in model.moe_layers():
-            layer.balance_load_override = None
-        if len(splits) > 1:
-            # Counts are non-differentiable, but balance probabilities need the
-            # FULL batch's counts. A bounded no-grad pass avoids retaining all
-            # micro-batch activations or changing the auxiliary objective.
-            with torch.no_grad():
-                for ids in splits:
-                    prediction(model, torch.as_tensor(values[ids], device=trainer.device, dtype=torch.float64),
-                               torch.as_tensor(masks[ids], device=trainer.device),
-                               groups=None if groups is None else torch.as_tensor(groups[ids], device=trainer.device))
-                    for total, layer in zip(load, model.moe_layers(), strict=True):
-                        total += layer.last_load
-            for total, layer in zip(load, model.moe_layers(), strict=True):
-                layer.balance_load_override = total.clone()
-            for total in load:
-                total.zero_()
-        # Accumulate BOTH gradients over the complete batch before applying its cap.
-        for ids in splits:
-            weight = len(ids) / b
-            x = torch.as_tensor(values[ids], device=trainer.device, dtype=torch.float64)
-            mask = torch.as_tensor(masks[ids], device=trainer.device)
-            marginal, joint = losses(model, x, mask, generator=cop_gen,
-                                     groups=None if groups is None else torch.as_tensor(groups[ids], device=trainer.device))
-            marginal = marginal + model.aux_loss
-            check_loss_finite(float(marginal.detach()), step=step, tokens=tokens)
-            check_loss_finite(float(joint.detach()), step=step, tokens=tokens)
-            gm = torch.autograd.grad(marginal * weight, params, retain_graph=True, allow_unused=True)
-            gj = torch.autograd.grad(joint * weight, params, allow_unused=True)
-            for i, (p, m, j) in enumerate(zip(params, gm, gj, strict=True)):
-                if m is not None:
-                    reference[i] = m.detach() if reference[i] is None else reference[i] + m.detach()
-                if j is not None:
-                    p.grad = j.detach() if p.grad is None else p.grad + j.detach()
-            loss_m += float(marginal.detach()) * weight
-            loss_j += float(joint.detach()) * weight
-            for total, layer in zip(load, model.moe_layers(), strict=True):
-                total += layer.last_load
-        try:
-            energy_weight = combine_gradients(params, reference)
-        except FloatingPointError:
-            check_loss_finite(float("nan"), step=step, tokens=tokens)
-            raise
-        norm = torch.nn.utils.clip_grad_norm_(params, 7.0)
-        check_loss_finite(float(norm), step=step, tokens=tokens)
-        optimizer.step()
-        if slices:
-            slices.sync()
-        else:
-            for layer, total in zip(model.moe_layers(), load, strict=True):
-                layer.update_bias(total, rate_scale=bias_scale)
-        tokens += batch_points(values, contract.budget_denomination)
-        channel_tokens += values.size
-        step += 1
-        last_loss, last_joint = loss_m, loss_j
-        if logger and (step == 1 or step % 50 == 0):
-            logger({"event": "step", "step": step, "tokens": tokens, "loss": loss_m,
-                    "copula_es": loss_j, "energy_weight": energy_weight, "lr": optimizer.param_groups[0]["lr"]})
-        if continuation and continuation.due():
-            checkpoint_start = time.time()
-            continuation.save({"runtime": training_runtime(model), "step": step, "tokens": tokens,
-                "channel_tokens": channel_tokens, "model": model.state_dict(),
-                "leaves": dict(slices.named_parameters()) if slices else {},
-                "optimizer": optimizer.state_tensors(names), "stable": stable,
-                "last_loss": last_loss, "last_joint": last_joint, "elapsed": time.time() - started,
-                "data_wait": timed.wait_s,
-                "rng": rng_state(), "mask_rng": mask_rng.bit_generator.state,
-                "cop_rng": cop_gen.get_state(), "input_hash": replay_hash})
-            overhead = time.time() - checkpoint_start
-            started += overhead
-            deadline += overhead
-        if step >= steps or tokens >= token_budget or time.time() >= deadline:
-            break
+                replay_hash = hashlib.sha256((replay_hash + batch_digest(batch)).encode()).hexdigest()
+            if restored and index < step:
+                if index + 1 == step:
+                    if replay_hash != restored["input_hash"]:
+                        raise ValueError("pyramid continuation input differs")
+                    restore_rng(restored["rng"])
+                    mask_rng.bit_generator.state = restored["mask_rng"]
+                    cop_gen.set_state(restored["cop_rng"])
+                    timed.wait_s = restored.get("data_wait", 0.0)
+                    replay_verified = True
+                    if step >= steps or tokens >= token_budget or active_elapsed >= contract.max_train_seconds:
+                        break
+                continue
+            if started is None:
+                started = time.time() - active_elapsed
+                deadline = started + contract.max_train_seconds
+            if step >= steps or tokens >= token_budget or time.time() >= deadline:
+                break
+            if step == trunk and stable is None and slices is None:
+                stable = trainer._stable_snapshot(model, optimizer)
+            factor = schedule_factor(step, steps)
+            for group in optimizer.param_groups:
+                group["lr"] = group["base_lr"] * factor
+            optimizer.zero_grad(set_to_none=True)
+            b, c, length = values.shape
+            masks = sample_cpm_masks(b * c, length // 32, c_max=16, p_max=0.4, rng=mask_rng).reshape(b, c, -1)
+            splits = np.array_split(np.arange(b), min(contract.micro_batches, b))
+            if gang is not None:
+                if not gang.synced:
+                    gang.broadcast_state(model)
+                gang.send_step(values, masks, groups, len(splits), cop_gen)
+            reference, loss_m, loss_j, load = micro_batch_pass(
+                model, params, values, masks, groups, splits, owned_splits(len(splits), 0, world),
+                cop_gen, gang.device if gang is not None else trainer.device,
+                step=step, tokens=tokens, gang=gang)
+            try:
+                energy_weight = combine_gradients(params, reference)
+            except FloatingPointError:
+                check_loss_finite(float("nan"), step=step, tokens=tokens)
+                raise
+            norm = torch.nn.utils.clip_grad_norm_(params, 7.0)
+            check_loss_finite(float(norm), step=step, tokens=tokens)
+            optimizer.step()
+            if slices:
+                slices.sync()
+            else:
+                for layer, total in zip(model.moe_layers(), load, strict=True):
+                    layer.update_bias(total, rate_scale=bias_scale)
+            if gang is not None:
+                gang.broadcast_state(model)
+            tokens += batch_points(values, contract.budget_denomination)
+            channel_tokens += values.size
+            step += 1
+            last_loss, last_joint = loss_m, loss_j
+            if logger and (step == 1 or step % 50 == 0):
+                logger({"event": "step", "step": step, "tokens": tokens, "loss": loss_m,
+                        "copula_es": loss_j, "energy_weight": energy_weight, "lr": optimizer.param_groups[0]["lr"]})
+            if continuation and continuation.due():
+                checkpoint_start = time.time()
+                continuation.save({"runtime": training_runtime(model), "step": step, "tokens": tokens,
+                    "channel_tokens": channel_tokens, "model": model.state_dict(),
+                    "leaves": dict(slices.named_parameters()) if slices else {},
+                    "optimizer": optimizer.state_tensors(names), "stable": stable,
+                    "last_loss": last_loss, "last_joint": last_joint, "elapsed": time.time() - started,
+                    "data_wait": timed.wait_s,
+                    "rng": rng_state(), "mask_rng": mask_rng.bit_generator.state,
+                    "cop_rng": cop_gen.get_state(), "input_hash": replay_hash})
+                overhead = time.time() - checkpoint_start
+                started += overhead
+                deadline += overhead
+            if step >= steps or tokens >= token_budget or time.time() >= deadline:
+                break
+        clean = True
+    except BaseException as e:
+        if gang is not None and not isinstance(e, (ValueError, FloatingPointError)):
+            gang.stop(clean=False)
+            gang.raise_follower_error(e)
+        raise
+    finally:
+        if gang is not None:
+            gang.stop(clean=clean)
     if step == 0 or not replay_verified:
         raise ValueError("pyramid training consumed no verifiable optimizer step")
     duration = time.time() - started if started is not None else active_elapsed

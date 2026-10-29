@@ -177,12 +177,12 @@ a new digest.
 
 ### What GPU memory and throughput have been measured?
 
-None yet for the 1.23B v2 model. Published per-GPU wall times come from the
-previous, smaller contract. Multi-GPU layouts (4×/8× B200, B300, H200,
-H100) are planned but not live at launch. The table and the ≤ $75 default
-rule are in [MINER_V2_INCENTIVE_INTRO.md](MINER_V2_INCENTIVE_INTRO.md#gpus-planned).
-Until they ship, a Lane A leg rents one GPU from `[round] funded_pod_skus`.
-Prefer the 48 GB types (L40S, L40, A6000).
+Wall times come from the owner's Lium runs of the same 512-row step,
+scaled to v2's step count; GPU memory has not been published yet. v2 legs
+train on 4× and 8× H100/H200 pods, data-parallel across every GPU. Layouts
+estimated at $75 per leg or less are the default; 4×H100 is opt-in with
+`--gpu 4xH100`. Blackwell (B200, B300) waits for a CUDA 12.8 image. The
+table is in [MINER_V2_INCENTIVE_INTRO.md](MINER_V2_INCENTIVE_INTRO.md#gpus).
 
 ## Lanes
 
