@@ -370,6 +370,8 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
             max_repo_mb=int(g.get("max_repo_mb", 2048)),
             max_channels=int(g.get("max_channels", 1)),
             min_channels=int(g.get("min_channels", 1)),
+            king_min_channels=int(g.get("king_min_channels", 0)),
+            king_min_channels_refs=tuple(str(r) for r in g.get("king_min_channels_refs", ())),
             corpus_target_points=validate_corpus_target_points(
                 g.get("corpus_target_points", 0), int(g["max_total_points"])),
             stream_stall_seconds=int(g.get("stream_stall_seconds", 0)),

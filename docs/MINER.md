@@ -130,7 +130,7 @@ Before you fund:
   Earlier trainer-sourced benchmarks can extend pod time; validator-sourced
   v2 A benches use the main validator's GPU instead
   ([§6](#6-what-happens-to-a-funded-entry), [§5](#your-provider-keys)).
-- **A allows one judged submission per hotkey.** B/C use one training leg per
+- **A allows one judged submission per hotkey per round.** B/C use one training leg per
   revealed commitment. All lanes share the hotkey's one chain commitment;
   switching it can supersede queued work. Infrastructure failures follow the
   retry rules ([§8](#8-failure-classes)).
@@ -335,9 +335,9 @@ btcli subnets register --netuid 91 --network finney --wallet-name my-miner --wal
 ```
 
 Testnet: `--netuid 259 --network test`. For Lane A, a hotkey is spent once its
-submission is judged in a duel or fails through its own fault; another A
-submission needs a fresh hotkey. B/C have separate per-commitment rules and
-do not consume the lifetime A submission.
+submission is judged in a duel or fails through its own fault, for the rest
+of that round; it may submit again from the next round. B/C have separate
+per-commitment rules and do not consume the A submission.
 
 ## 5. Submit
 
@@ -898,7 +898,7 @@ What happens to your entry when a leg does not produce a judged checkpoint:
 | generator | your code raised, a series failed the checks, the loss went non-finite, code packed in a string refused at admission | **spent** |
 | duplicate | an exact, rename-only, embedded or private copy of an earlier commit (§9) | **spent** |
 | tamper | pod replaced under the same name, checkpoint altered | **spent** |
-| ref_mismatch / burned / funding_expired | you re-revealed a different ref / hotkey already used / entry outlived the 36 h key TTL | terminal; re-fund (a burned hotkey needs a fresh one) |
+| ref_mismatch / burned / funding_expired | you re-revealed a different ref / hotkey already used this round / entry outlived the 36 h key TTL | terminal; re-fund (a burned hotkey waits for the next round, or use a fresh one) |
 
 `cascade queue` shows the class beside a failed entry. A rate-limit streak
 longer than 6 h turns terminal; raise the key's limits and fund again.
@@ -1155,7 +1155,7 @@ in your tree. Code that only exists after a decode step is invisible to both.
 - [ ] Every sub-generator is a `.py` file; no `exec`, no code in strings.
 - [ ] Every v2 yield is finite float `(C, L)`, **C = 32**, with `L` inside the effective limits.
 - [ ] Channels of a series are genuinely coupled; a copied channel costs budget and hurts.
-- [ ] One hotkey, one lifetime submission: a rejection at admission spends it.
+- [ ] One hotkey, one submission per round: a rejection at admission spends that round's.
 
 ## 12. Scripting and coding agents
 
@@ -1227,7 +1227,7 @@ A hotkey holds one chain commitment. Committing B replaces its A/C commitment
 and can supersede queued work. Each revealed B commitment funds one leg;
 re-funding a spent commitment returns `spent`. To make a new attempt, commit
 again, wait for the new reveal and fund that commitment. This does not consume
-A's lifetime submission. Only one leg per hotkey can be live across A/B/C.
+A's per-round submission. Only one leg per hotkey can be live across A/B/C.
 
 ### Training and waiting
 

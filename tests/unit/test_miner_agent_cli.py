@@ -163,6 +163,45 @@ def test_direct_build_terms_refusals(environment, guard):  # noqa: F811
                                network_for(environment, g), state, "me")
 
 
+def test_direct_build_terms_profile_defaults(environment, guard):  # noqa: F811
+    from cascade.shared.direct_moe import digest
+
+    admit(environment, guard)
+    state = environment[0].ledger.state
+    net = network_for(environment, digest(guard.to_dict()))
+    base = dict(cohort=None, guard=None, role="challenger", reward=0, spend_cap=10, job=None,
+                ref="gen", provider=["vast"], reference=None)
+    _, t8 = direct_mod.build_terms(SimpleNamespace(**base, world_size=8, profile=None),
+                                   net, state, "me")
+    assert t8["profiles"] == ["8xH200", "8xH100", "8xB200"]     # <= $75, cheapest first
+    _, t4 = direct_mod.build_terms(SimpleNamespace(**base, world_size=4, profile=None),
+                                   net, state, "me")
+    assert t4["profiles"] == ["4xB200", "4xH200"]
+    _, opt = direct_mod.build_terms(SimpleNamespace(**base, world_size=8, profile=["8xB300"]),
+                                    net, state, "me")
+    assert opt["profiles"] == ["8xB300"]                         # opt-in only by name
+    with pytest.raises(ValueError, match="4-GPU gang"):
+        direct_mod.build_terms(SimpleNamespace(**base, world_size=8, profile=["4xB200"]),
+                               net, state, "me")
+    with pytest.raises(ValueError, match="no default profile"):
+        direct_mod.build_terms(SimpleNamespace(**base, world_size=2, profile=None),
+                               net, state, "me")
+
+
+def test_direct_profile_catalog_split():
+    from cascade.direct.compute import PodProfile
+    from cascade.direct.profiles import LAYOUTS, check_operator_profiles
+
+    assert {lay.name for lay in LAYOUTS if not lay.default} == {"8xB300", "4xB300", "4xH100"}
+    assert all(lay.estimated_usd <= 75 for lay in LAYOUTS if lay.default)
+    img = "repo@sha256:" + "a" * 64
+    check_operator_profiles({"8xH200": PodProfile("H200", 8, "H200", 141, "bfloat16", 1, 1, img,
+                                                  "a" * 64)})
+    with pytest.raises(ValueError, match="catalog layout is 8xH200"):
+        check_operator_profiles({"8xH200": PodProfile("H200", 4, "H200", 141, "bfloat16", 1, 1,
+                                                      img, "a" * 64)})
+
+
 def test_direct_status_reports_a_stale_king(environment, guard):  # noqa: F811
     state = {"king": "K", "king_history": [{"payer": "K", "round": 2}], "anchor": "a",
              "phase": "broad", "cohorts": {}, "advanced": [], "jobs": {}, "spent": 0,

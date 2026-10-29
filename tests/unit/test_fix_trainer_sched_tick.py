@@ -37,7 +37,7 @@ def test_chain_reads_run_under_the_runner_deadline():
 
     ops = LegOps(SimpleNamespace(_with_deadline=with_deadline, chain_read_timeout_s=5.0))
     client = SimpleNamespace(block_seed=lambda b: 1, poll_commitments=lambda **kw: [],
-                             highest_incentive_hotkey=lambda: "K")
+                             highest_incentive_hotkey=lambda **kw: "K")
     with pytest.raises(TimeoutError):
         ops.block_seed(client, 10)
     with pytest.raises(TimeoutError):
@@ -178,3 +178,17 @@ def test_the_king_is_pinned_only_while_its_lane_b_boundary_is_open(cfg, tmp_path
     sched.lane_b.release.set()
     sched._lane_b_slot["thread"].join(5)
     assert not sched._lane_b_pinned() and sched._lane_b_slot is not None
+
+
+def test_metagraph_king_never_names_the_burn_uid():
+    """While no king is paid the burn slot out-earns every miner; the
+    fallback king must skip it, or the era waits on a hotkey with no generator."""
+    seen = {}
+
+    def highest(exclude_uids=()):
+        seen["exclude"] = exclude_uids
+        return "K"
+
+    r = SimpleNamespace(cfg=SimpleNamespace(scoring=SimpleNamespace(burn_uid=0)))
+    assert LegOps(r).metagraph_king(SimpleNamespace(highest_incentive_hotkey=highest)) == "K"
+    assert seen["exclude"] == (0,)

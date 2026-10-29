@@ -515,7 +515,9 @@ class LegOps:
 
     def metagraph_king(self, client) -> str | None:
         try:
-            return self.chain_read(client.highest_incentive_hotkey)
+            cfg = getattr(self.r, "cfg", None)
+            burn = (int(cfg.scoring.burn_uid),) if cfg is not None else ()
+            return self.chain_read(lambda: client.highest_incentive_hotkey(exclude_uids=burn))
         except Exception:  # noqa: BLE001 — cross-check only (a timeout too)
             return None
 
@@ -777,15 +779,26 @@ class LegOps:
     def queue(self):
         return self.r._funded_queue()
 
-    def burned(self) -> set[str]:
-        from .loop import _load_seen_hotkeys
+    def burned(self, block: int) -> set[str]:
+        """Hotkeys that already used this round's one submission (a round is
+        one settlement step of the grid in force)."""
+        from ..shared.config import effective_epoch_blocks
+        from .runner_common import _load_burns
 
-        if not self.r.cfg.round.one_submission_per_hotkey:
+        rnd = self.r.cfg.round
+        if not rnd.one_submission_per_hotkey:
             return set()
-        return set(_load_seen_hotkeys(self.r._submissions_path()))
 
-    def burn(self, gens: list) -> None:
-        self.r._burn_hotkeys(gens)
+        def round_start(b: int) -> int:
+            eb = max(1, int(effective_epoch_blocks(rnd, int(b))))
+            return (int(b) // eb) * eb
+
+        cur = round_start(block)
+        return {h for h, b in _load_burns(self.r._submissions_path()).items()
+                if b >= 0 and round_start(b) == cur}
+
+    def burn(self, gens: list, block: int) -> None:
+        self.r._burn_hotkeys(gens, block)
 
     def vault_owned(self, gens: list) -> list:
         return self.r._verify_vault_ownership(gens)
@@ -2058,7 +2071,7 @@ class RollingScheduler:
         queue.expire_stale()
         cap = int(self.cfg.round.funded_field_cap or 0) or max(1, int(self.cfg.round.finalist_cap))
         in_flight = len(queue.in_flight())
-        burned = self.ops.burned()
+        burned = self.ops.burned(block)
         wall, margin = self.ops.wall_seconds(), self.ops.margin_seconds()
         held: list[str] = []
         not_jumps: set[str] = set()       # seniors that could not start this pass
@@ -2077,8 +2090,9 @@ class RollingScheduler:
                 not_jumps.add(entry.hotkey)
                 continue
             if entry.hotkey in burned:
-                queue.fail(entry.hotkey, error="hotkey already used its one lifetime "
-                           "submission", error_class="burned", expect_ref=entry.ref)
+                queue.fail(entry.hotkey, error="hotkey already used its one submission "
+                           "this round; fund again next round", error_class="burned",
+                           expect_ref=entry.ref)
                 continue
             from .admission import owner_busy
 
@@ -2244,7 +2258,8 @@ class RollingScheduler:
             q.fail(gen.hotkey, error=f"generator ships Python inside a string constant "
                    f"({res.file or 'generator.py'}, {res.reason}); every module must be a "
                    ".py file in the repo", error_class="generator", expect_ref=gen.ref)
-        self.ops.burn([gen])
+        self.ops.burn([gen], block if block is not None else
+                      (self.state.current.start_block if self.state.current else -1))
         log.warning("rolling: %s dropped — packed source in %s (%s)", gen.hotkey[:12],
                     res.file or "generator.py", res.reason)
         return True
@@ -2278,7 +2293,7 @@ class RollingScheduler:
             q.fail(gen.hotkey, error=f"generator {what} {matched} ({tier}); the "
                    "earliest commit keeps the entry", error_class="duplicate",
                    expect_ref=gen.ref)
-        self.ops.burn([gen])
+        self.ops.burn([gen], era.start_block)
         log.warning("rolling: %s dropped — duplicates %s (%s)", gen.hotkey[:12],
                     matched[:12], tier)
         return matched
@@ -2394,7 +2409,7 @@ class RollingScheduler:
                         queue.fail(gen.hotkey, error=msg or str(e), error_class=error_class,
                                    expect_ref=gen.ref)
                         if error_class in ("generator", "tamper"):
-                            self.ops.burn([gen])
+                            self.ops.burn([gen], block)
                     else:
                         queue.requeue(gen.hotkey, error=msg or str(e),
                                       error_class=error_class, burn_attempt=burn)
@@ -2784,14 +2799,14 @@ class RollingScheduler:
                                   init=init_bench)
         self.ops.record_bench_candidates(manifest, report)
         queue = self.ops.queue()
-        gens = []
         for f in ready:
             if queue is not None:
                 queue.mark_done(f.hotkey, expect_ref=f.ref,
                                 expect_started_block=f.started_block)
-            gens.append(ResolvedGen(f.hotkey, f.uid, f.ref, f.reveal_block))
-        if gens:
-            self.ops.burn(gens)
+            # The burn lands in the round the leg STARTED in: the hotkey may
+            # fund again from the next round on.
+            self.ops.burn([ResolvedGen(f.hotkey, f.uid, f.ref, f.reveal_block)],
+                          int(f.started_block))
         with self._lock:
             self.state.finished = [f for f in self.state.finished if f not in ready]
             self.state.published.extend(ready)

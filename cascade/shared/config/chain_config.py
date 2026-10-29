@@ -95,6 +95,19 @@ class ChainConfig:
                           max_generate_seconds=self.generation.window_seconds)
         return gen
 
+    def for_king(self, ref: str) -> ChainConfig:
+        """This config as the king leg of generator ``ref`` sees it:
+        ``[generator] king_min_channels`` (when set) replaces the width floor,
+        only for a ref listed in ``king_min_channels_refs`` (the genesis king's
+        commitment). A king that re-commits trains at ``min_channels``.
+        Trainer-side only — the floor is never part of a manifest or contract,
+        validators judge the ref."""
+        floor = int(self.generator.king_min_channels or 0)
+        if (not floor or floor >= self.generator.min_channels
+                or ref not in self.generator.king_min_channels_refs):
+            return self
+        return replace(self, generator=replace(self.generator, min_channels=floor))
+
     def throne_contracts(self) -> list[TrainingContractConfig]:
         """The single-size contracts the final trains + the throne is judged at —
         ``[round] throne_sizes`` resolved against the registry, defaulting to just

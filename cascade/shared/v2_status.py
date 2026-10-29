@@ -1068,7 +1068,7 @@ def publish_trainer_v2_status(sched, block: int, *, min_interval_s: float = MIN_
                                  "submission_status": {"schema": 1, "worker_liveness": "not_measured",
                                                        "pending_reveals": "redacted"}}
         burned = getattr(getattr(sched, "ops", None), "burned", None)
-        doc["admission"] = {"lane_a_spent_hotkeys": sorted(burned()) if callable(burned) else None,
+        doc["admission"] = {"lane_a_spent_hotkeys": sorted(burned(int(block))) if callable(burned) else None,
                             "one_live_leg_per_hotkey": True}
         queue = getattr(getattr(sched, "ops", None), "queue", None)
         if callable(queue):

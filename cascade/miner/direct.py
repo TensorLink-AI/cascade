@@ -71,8 +71,10 @@ def add_direct(sub: argparse._SubParsersAction) -> None:
     f.add_argument("--ref", required=True, help="Your revealed generator ref (repo@digest).")
     f.add_argument("--provider", action="append", required=True, choices=PROVIDERS,
                    help="Marketplace(s) the job may rent on (repeatable); a key must be on file.")
-    f.add_argument("--profile", action="append", required=True,
-                   help="Qualified hardware profile(s) for the gang (repeatable).")
+    f.add_argument("--profile", action="append", default=None,
+                   help="Hardware layout(s) for the gang (repeatable), e.g. 8xH200. Default: "
+                        "every layout of --world-size estimated at <= $75 per job; dearer "
+                        "layouts (8xB300, 4xB300, 4xH100) are opt-in by name.")
     f.add_argument("--world-size", type=int, required=True, help="GPUs in the gang.")
     f.add_argument("--spend-cap", type=int, required=True,
                    help="Most this job may spend, in the ledger's smallest money unit.")
@@ -283,6 +285,7 @@ def cmd_deposit_key(args) -> int:
 
 def build_terms(args, network, state, payer):
     """The admission terms for this job, from the published journal and config."""
+    from ..direct.profiles import resolve_profiles
     from ..shared.direct_moe import digest
 
     key, cohort = (args.cohort, state["cohorts"].get(args.cohort)) if args.cohort else open_cohort(state)
@@ -311,7 +314,7 @@ def build_terms(args, network, state, payer):
         "funding_ref": f"{'+'.join(providers)}:{payer}:{job}",
         "anchor": contract["anchor"], "budget": contract["budget"],
         "spend_cap": args.spend_cap, "reward": args.reward, "slot": key,
-        "profiles": sorted(set(args.profile)), "providers": providers,
+        "profiles": resolve_profiles(args.profile, args.world_size), "providers": providers,
         "world_size": args.world_size, "reference": args.reference or contract["anchor"],
         "guard_contract": guard,
     }

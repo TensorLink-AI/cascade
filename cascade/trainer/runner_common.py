@@ -50,33 +50,46 @@ def funded_queue_of(runner, *, lane="a"):
     return queue_type(path, entry_ttl_seconds=runner.cfg.round.funded_entry_ttl_hours * 3600.0)
 
 
-def _load_seen_hotkeys(path: Path) -> set[str]:
-    """Load the persisted 1-hotkey-1-submission burn set (best-effort)."""
+def _load_burns(path: Path) -> dict[str, int]:
+    """The persisted burn set: hotkey → block it was burned at (best-effort).
+    A legacy list (the old lifetime burn) loads at block -1, which no era
+    matches — so those hotkeys are free again."""
     try:
-        return {str(h) for h in json.loads(path.read_text(encoding="utf-8"))}
+        raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return set()
+        return {}
     except Exception as e:  # noqa: BLE001
         log.warning("submissions db %s unreadable (%s); starting from empty", path, e)
-        return set()
+        return {}
+    if isinstance(raw, dict):
+        return {str(h): int(b) for h, b in raw.items()}
+    return {str(h): -1 for h in raw}
 
 
-def _save_seen_hotkeys(path: Path, seen: set[str]) -> None:
+def _load_seen_hotkeys(path: Path) -> set[str]:
+    """Every hotkey in the burn set, whatever era it was burned in."""
+    return set(_load_burns(path))
+
+
+def _save_seen_hotkeys(path: Path, seen) -> None:
     """Persist the burn set (best-effort — anti-spam must never abort a round).
     Atomic (tmp + rename): a crash mid-write never leaves a torn set, which
-    :func:`_load_seen_hotkeys` would read as EMPTY — un-burning everyone."""
+    :func:`_load_burns` would read as EMPTY — un-burning everyone."""
+    burns = seen if isinstance(seen, dict) else {str(h): -1 for h in seen}
     try:
-        write_text_atomic(path, json.dumps(sorted(seen)))
+        write_text_atomic(path, json.dumps(dict(sorted(burns.items()))))
     except Exception as e:  # noqa: BLE001
         log.warning("could not persist submissions db to %s: %s", path, e)
 
 
-def _add_seen_hotkeys(path: Path, hotkeys) -> None:
-    """Union ``hotkeys`` into the persisted burn set: load + union + save under
-    the path's lock, so the tick thread and leg threads burning at once never
-    drop each other's additions."""
+def _add_seen_hotkeys(path: Path, hotkeys, block: int = -1) -> None:
+    """Record ``hotkeys`` as burned at ``block`` (the latest burn wins): load
+    + merge + save under the path's lock, so the tick thread and leg threads
+    burning at once never drop each other's additions."""
     with path_lock(path):
-        _save_seen_hotkeys(path, _load_seen_hotkeys(path) | {str(h) for h in hotkeys})
+        burns = _load_burns(path)
+        burns.update({str(h): int(block) for h in hotkeys})
+        _save_seen_hotkeys(path, burns)
 
 
 # ── executor claims (never re-picked by a sibling while in use) ─────────────

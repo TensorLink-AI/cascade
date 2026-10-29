@@ -93,9 +93,28 @@ export CASCADE_DIRECT_OWNER_HOTKEY=<owner ss58> CASCADE_DIRECT_CONFIG_BUCKET=<bu
 
    ```bash
    cascade direct fund https://<intake> --ref <repo@digest> --provider vast \
-       --profile <profile> --world-size 8 --spend-cap <units> --dry-run ...
+       --world-size 8 --spend-cap <units> --dry-run ...
    cascade direct fund ... --max-spend <units> --yes
    ```
+
+   Without `--profile` the gang may rent any default layout of its
+   `--world-size`: those estimated at $75 or less for the reference job
+   (27,500 updates, batch 64, eight variates, context 4096, advertised Lium
+   rates). Dearer layouts are opt-in: name them with `--profile`.
+
+   | Layout | Wall time | $/h | Est. per job | |
+   |---|---:|---:|---:|---|
+   | 8×H200 | 2.67 h measured | 18.00 | $48 | default |
+   | 4×B200 | 3.26 h measured | 16.80 | $55 | default |
+   | 8×H100 | 2.82 h measured | 24.00 | $68 | default |
+   | 4×H200 | ~4.0 h est. | 18.00 | $72 | default |
+   | 8×B200 | ~2.2 h est. | 33.60 | $74 | default |
+   | 4×H100 | 4.23 h measured | 24.00 | $102 | opt-in |
+   | 4×B300 | ~3.3 h est. | 32.00 | $106 | opt-in |
+   | 8×B300 | ~2.2 h est. | 56.00 | $123 | opt-in |
+
+   The catalog is `cascade/direct/profiles.py`. A job has one gang size, so
+   4× and 8× layouts never mix in one job.
 
    It refuses without `--max-spend` and `--yes` (exit 5) and sends nothing.
    The job id is derived from payer, generator and cohort, so a retry is

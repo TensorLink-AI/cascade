@@ -375,15 +375,17 @@ class ChainClient:
             raise ChainError(f"metagraph_failed: netuid {self.netuid} does not exist")
         return meta
 
-    def highest_incentive_hotkey(self) -> str | None:
+    def highest_incentive_hotkey(self, exclude_uids: tuple[int, ...] = ()) -> str | None:
         """The reigning king's hotkey: the UID with the highest incentive on the
-        metagraph (validators set this via weights). None on an empty metagraph."""
+        metagraph (validators set this via weights). None on an empty metagraph.
+        ``exclude_uids`` skips weight sinks (``burn_uid``): a burn slot out-earns
+        every miner while no king is paid, and is never the king."""
         neurons = list(self._metagraph().neurons)
-        n = len(neurons)
-        if n == 0:
+        uids = [u for u in range(len(neurons)) if u not in set(exclude_uids)]
+        if not uids:
             return None
         incentive = [float(nn.incentive) for nn in neurons]
-        best_uid = max(range(n), key=lambda u: incentive[u])
+        best_uid = max(uids, key=lambda u: incentive[u])
         if incentive[best_uid] <= 0.0:
             return None  # vacant throne — let the trainer pick an interim king
         return str(neurons[best_uid].hotkey)
