@@ -1188,6 +1188,9 @@ class _FundedPodMixin:
         from ..shared.config import funded_host_bench_floor_for
         from .remote import probe_host_bench
 
+        why = self._host_gpu_shortfall(host, sku, label)
+        if why:
+            return why
         floor = funded_host_bench_floor_for(
             getattr(self.cfg.round, "funded_host_bench_floor", ()) or (), sku)
         if floor <= 0:
@@ -1202,6 +1205,26 @@ class _FundedPodMixin:
         if tps < floor:
             return (f"slow host: calibration bench {tps:,.0f} tokens/s < floor "
                     f"{floor:,.0f} for {sku}")
+        return ""
+
+    def _host_gpu_shortfall(self, host, sku: str, label: str) -> str:
+        """Why ``host`` has fewer GPUs than the layout it was rented as, or
+        ``""``. Lium has sold an ``8xH200`` executor that exposed 6 (testnet
+        2026-10-30): the leg trains on fewer cards than its wall assumes, at
+        the full layout price. An unreadable count passes, like the bench."""
+        from ..provision.layout import layout_gpus
+        from .remote import probe_gpu_count
+
+        want = layout_gpus(sku)
+        if want <= 1:
+            return ""
+        got, err = probe_gpu_count(host)
+        if got is None:
+            log.warning("%s: gpu count unavailable (%s) — %d-GPU layout not verified",
+                        label, err, want)
+            return ""
+        if got < want:
+            return f"short pod: {got} GPU(s) visible, rented as {sku} ({want})"
         return ""
 
     def _funded_pod_too_slow(self, result, profile) -> str:

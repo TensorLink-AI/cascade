@@ -488,7 +488,13 @@ class LegOps:
         with_deadline = getattr(r, "_with_deadline", None)
         if not callable(with_deadline):
             return fn()
-        return with_deadline(fn, float(getattr(r, "chain_read_timeout_s", 60.0) or 60.0))
+        try:
+            return with_deadline(fn, float(getattr(r, "chain_read_timeout_s", 60.0) or 60.0))
+        except TimeoutError:
+            reconnect = getattr(r, "_reconnect_chain", None)
+            if callable(reconnect):
+                reconnect()
+            raise
 
     def block_seed(self, client, block: int) -> int:
         return int(self.chain_read(lambda: client.block_seed(int(block))))
@@ -1296,6 +1302,14 @@ class RollingScheduler:
 
         return contract_digest(self.cfg.training.at_block(int(era.start_block)))
 
+    def _stale_contract(self, era):
+        """``digest -> bool``: an entry trained under another contract than
+        the one _build_manifest pins for ``era`` (v2 eras; never before)."""
+        if not v2_era_active(self.cfg, era.start_block):
+            return lambda digest: False
+        want = self._contract_identity(era)
+        return lambda digest: digest != want
+
     def _seed_chain_root(self) -> bool:
         """The first settlement chains to the bucket's ``latest.json`` (the
         last legacy round — every validator's ``last_handled_round_id``);
@@ -1554,11 +1568,15 @@ class RollingScheduler:
                     from ..shared.manifest import contract_digest
 
                     entry = _entry_from_json(cur.king_entry)
+                    # The contract the leg TRAINED under (its measurement is
+                    # bound to it), not today's config: an image re-pin
+                    # mid-era changes the latter and wedged the roll
+                    # (testnet rc8→rc10, 2026-10-29).
                     self.lane_b.record_lineage_epoch(
                         f"{cur.epoch_start}:{cur.seed_block}:{cur.base_seed}", {
                         "pointer": entry.trained_pointer, "gen_ref": entry.gen_ref,
                         "corpus_digest": entry.corpus_digest,
-                        "contract_digest": contract_digest(
+                        "contract_digest": entry.training_contract_digest or contract_digest(
                             self.cfg.throne_contracts_at(int(cur.start_block))[0]),
                         "warm_start_ref": cur.warm_start_ckpt or "",
                         "token_budget": self.cfg.throne_contracts_at(
@@ -2636,14 +2654,19 @@ class RollingScheduler:
                 self._save()
                 return
         lo, hi = era_window(self.cfg.round, cur)
-        if not (lo <= int(king.train_block) < hi):
+        stale = self._stale_contract(cur)
+        if not (lo <= int(king.train_block) < hi) or stale(king.training_contract_digest):
             # Validators reject a settlement whole for ONE entry outside the
             # window; a king entry outside it can only come from a stamp bug
             # or a reused record of another era — retrain it, publish nothing.
-            log.error("rolling: boundary %d — era %d's king entry was trained at block %d, "
-                      "outside the era window [%d, %d); king entry dropped, the king leg "
-                      "retrains; %d finished leg(s) wait, nothing published",
-                      epoch_start, cur.index, int(king.train_block), lo, hi, len(ready))
+            # Same for one trained under a since re-pinned contract (worker
+            # image): _build_manifest would refuse it on every tick.
+            log.error("rolling: boundary %d — era %d's king entry (trained at block %d, "
+                      "contract %s) is outside the era window [%d, %d) or the era's "
+                      "contract; king entry dropped, the king leg retrains; %d finished "
+                      "leg(s) wait, nothing published", epoch_start, cur.index,
+                      int(king.train_block), king.training_contract_digest[:12] or "<none>",
+                      lo, hi, len(ready))
             with self._lock:
                 cur.king_entry, cur.king_bench, cur.king_bench_published = None, None, False
                 self.state.last_settled_boundary = epoch_start
@@ -2651,20 +2674,23 @@ class RollingScheduler:
             self.ops.discard_cached_leg(cur, "king", ResolvedGen(cur.king_hotkey, cur.king_uid,
                                                                  cur.king_ref))
             return
-        bad = [f for f in ready if not (lo <= int(f.entry.get("train_block", 0) or 0) < hi)]
+        bad = [f for f in ready if not (lo <= int(f.entry.get("train_block", 0) or 0) < hi)
+               or stale(str(f.entry.get("training_contract_digest", "") or ""))]
         if bad:
             queue = self.ops.queue()
             for f in bad:
                 tb = int(f.entry.get("train_block", 0) or 0)
-                log.error("rolling: boundary %d — %s's leg was trained at block %d, outside "
-                          "era %d's window [%d, %d): a trainer fault, never the miner's — "
-                          "dropped before publication, record discarded, requeued unburned "
-                          "(retrains)", epoch_start, f.hotkey[:12], tb, cur.index, lo, hi)
+                log.error("rolling: boundary %d — %s's leg (trained at block %d) is outside "
+                          "era %d's window [%d, %d) or contract: a trainer fault, never the "
+                          "miner's — dropped before publication, record discarded, requeued "
+                          "unburned (retrains)", epoch_start, f.hotkey[:12], tb, cur.index,
+                          lo, hi)
                 self.ops.discard_cached_leg(cur, "challenger",
                                             ResolvedGen(f.hotkey, f.uid, f.ref, f.reveal_block))
                 if queue is not None:
                     queue.requeue(f.hotkey, error=f"trained at block {tb}, outside era "
-                                  f"{cur.index}'s window [{lo}, {hi}) — trainer fault, retrained",
+                                  f"{cur.index}'s window [{lo}, {hi}) or contract — trainer "
+                                  "fault, retrained",
                                   error_class="infra", burn_attempt=False, operator_billed=True)
             with self._lock:
                 self.state.finished = [f for f in self.state.finished if f not in bad]

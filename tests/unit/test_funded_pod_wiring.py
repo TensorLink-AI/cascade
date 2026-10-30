@@ -98,7 +98,7 @@ def _runner(tmp_path, *, sku="RTX4090", image="ghcr.io/x/worker@sha256:" + "c" *
                  "_submission_store", "_push_deployed_chain_toml",
                  "_wait_for_funded_capacity", "_funded_rent_wait_deadline",
                  "_operator_fallback_lanes", "_funded_pod_code_mismatch",
-                 "_funded_pod_too_slow", "_host_bench_below_floor",
+                 "_funded_pod_too_slow", "_host_bench_below_floor", "_host_gpu_shortfall",
                  "_king_pending", "_yield_to_king", "_pin_king_host_key",
                  "_operator_rent_allowed", "_operator_recovery_available",
                  "_operator_leg_pod_prefix",
