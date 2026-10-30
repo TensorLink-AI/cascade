@@ -18,7 +18,10 @@ if (( 10#${BASH_REMATCH[1]} == 0 && (10#${BASH_REMATCH[2]} < 13 || (10#${BASH_RE
 fi
 UV_SHA="$(sha256sum "$UV_BIN")"
 UV_SHA="${UV_SHA%% *}"
-SSH_OPTS=(-p "$POD_PORT" -i "$POD_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new)
+# POD_KNOWN_HOSTS (optional): a per-pod known_hosts file — recycled provider
+# IPs must never be checked against another pod's key in the shared file.
+KH_OPTS=(); [[ -n "${POD_KNOWN_HOSTS:-}" ]] && KH_OPTS=(-o "UserKnownHostsFile=$POD_KNOWN_HOSTS")
+SSH_OPTS=(-p "$POD_PORT" -i "$POD_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new "${KH_OPTS[@]}")
 DEST="$POD_USER@$POD_IP"
 
 rsync -a --delete-after \
@@ -29,7 +32,7 @@ rsync -a --delete-after \
   "$SRC_ROOT/" "$DEST:$POD_WORKDIR/"
 
 if [[ -n "${CASCADE_CHAIN_TOML:-}" ]]; then
-  scp -P "$POD_PORT" -i "$POD_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+  scp -P "$POD_PORT" -i "$POD_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new "${KH_OPTS[@]}" \
     "$CASCADE_CHAIN_TOML" "$DEST:$POD_WORKDIR/$(basename "$CASCADE_CHAIN_TOML")"
 fi
 
@@ -39,7 +42,7 @@ fi
 
 printf -v REMOTE_MKDIR 'mkdir -p -- %q' "$POD_WORKDIR/.bootstrap"
 ssh "${SSH_OPTS[@]}" "$DEST" "$REMOTE_MKDIR"
-scp -P "$POD_PORT" -i "$POD_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+scp -P "$POD_PORT" -i "$POD_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new "${KH_OPTS[@]}" \
   "$UV_BIN" "$DEST:$POD_WORKDIR/.bootstrap/uv"
 # SSH joins command arguments through a remote shell; quote them explicitly.
 printf -v REMOTE_COMMAND 'bash -s -- %q %q %q' "$POD_WORKDIR" "$UV_SHA" "${POD_STAGE:-}"
@@ -55,9 +58,20 @@ export PATH="$PWD/.bootstrap:$PATH"
 if [[ -n "${UV_NATIVE_TLS:-}" || -n "${UV_SYSTEM_CERTS:-}" || -n "${SSL_CERT_FILE:-}" || -n "${SSL_CERT_DIR:-}" || -n "${UV_INSECURE_HOST:-}" ]]; then
   echo 'bootstrap requires uv bundled TLS trust without custom/insecure overrides' >&2; exit 1
 fi
+# Non-root bare VMs (Shadeform VM mode logs in as `shadeform`) need sudo.
+SUDO=""; [[ "$(id -u)" != 0 ]] && SUDO="sudo -n"
 # The generator sandbox needs unprivileged user/network namespaces.
-sysctl -qw kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null || true
-sysctl -qw kernel.unprivileged_userns_clone=1 2>/dev/null || true
+$SUDO sysctl -qw kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null || true
+$SUDO sysctl -qw kernel.unprivileged_userns_clone=1 2>/dev/null || true
+# Bare VMs (generation CPU tier) can boot an OS CA store that predates the
+# eMudhra removal; refresh the package through apt (signature-verified, not
+# TLS-trusted) so the check below can pass. A failed refresh is not fatal here:
+# the trust check is the gate.
+if command -v apt-get >/dev/null 2>&1; then
+  $SUDO env DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 \
+    && $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --only-upgrade ca-certificates >/dev/null 2>&1 \
+    || echo 'bootstrap: ca-certificates refresh failed (trust check decides)' >&2
+fi
 # Check OS trust before uv invokes git for direct-reference dependencies.
 .bootstrap/uv run --no-project --python 3.11 python scripts/check_tls_trust.py --system-only
 .bootstrap/uv sync --frozen --all-extras --no-dev

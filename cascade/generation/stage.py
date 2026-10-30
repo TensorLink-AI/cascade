@@ -252,6 +252,18 @@ def _last_json(text: str) -> dict:
     return {}
 
 
+
+def vm_known_hosts(vm_id: str) -> Path:
+    """A fresh per-VM known_hosts file. CPU providers recycle public IPs, so
+    the shared ~/.ssh/known_hosts would hold a previous VM's key for the same
+    address and refuse the new one; each VM instead trusts its own first key
+    (accept-new) in a file nothing else writes. Recreated empty per call."""
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", str(vm_id))[:96]
+    path = Path(tempfile.gettempdir()) / f"cascade-genvm-{safe}.known_hosts"
+    path.unlink(missing_ok=True)
+    path.touch(mode=0o600)
+    return path
+
 @dataclass
 class GenerationStage:
     cfg: object                                 # ChainConfig
@@ -499,13 +511,17 @@ class GenerationStage:
                                        f"{self.ready_timeout_s:.0f}s")
         return RemoteHost(name=name, host=addr.ip, port=addr.ssh_port, user=provider.ssh_user,
                           key_path=self.ssh_key_path, workdir=self.workdir,
-                          remote_python=f"{self.workdir}/.venv/bin/python")
+                          remote_python=f"{self.workdir}/.venv/bin/python",
+                          ssh_options=(f"UserKnownHostsFile={vm_known_hosts(vm)}",))
 
     def _bootstrap(self, host: RemoteHost) -> None:
         env = dict(os.environ)
         env.update({"POD_IP": host.host, "POD_PORT": str(host.port), "POD_USER": host.user,
                     "POD_KEY": str(Path(self.ssh_key_path).expanduser()),
                     "POD_STAGE": "generation", "POD_WORKDIR": host.workdir})
+        for opt in host.ssh_options:
+            if opt.startswith("UserKnownHostsFile="):
+                env["POD_KNOWN_HOSTS"] = opt.split("=", 1)[1]
         try:
             proc = self.shell(["bash", str(self.bootstrap_script)], env=env,
                               timeout=self.bootstrap_timeout_s, capture_output=True, text=True)
