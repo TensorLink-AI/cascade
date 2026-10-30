@@ -352,14 +352,14 @@ funded_pods = "rent"
 payer_vault_dir = "payer_vault" # cascade-intake --vault-dir (work_root-relative)
 funded_pod_sku = ""             # unused with funded_pod_skus set (per-round pick)
 # Worker image funded pods boot — keep = the fleet's pinned digest.
-funded_pod_image = "ghcr.io/tensorlink-ai/cascade-worker:worker-v0.9.0@sha256:43c07d4207d7693517d74203f6783fdd2c2f91e3d475f38db38e4798ae97785e"
+funded_pod_image = "ghcr.io/tensorlink-ai/cascade-worker:worker-v2.0.0-rc11@sha256:2fd193cad6be7bef87f110246a2074de84cde44511e153a21d1d0301d93cba64"
 # sha256 of that image's cascade/**/*.py (scripts/worker_code_fingerprint.py
 # <repo>@<digest>). Every rented final/funded pod must hash its files to this
 # BEFORE a leg is dispatched — the digest env a template injects is echoed
 # faithfully by a host that started a STALE image under the pinned tag
 # (2026-09-12: Lium 91.224.44.222/.223 ran worker-v0.7.0 as "v0.8.0"; three
 # miners' legs stalled and were burned). Re-derive on every image re-pin.
-worker_code_fingerprint = "dd5236181d9267f5bae26d49e545cf6bfb06afc2d0618e7e25cf101034db763b"   # 100 files, worker-v0.9.0 (43c07d42…); registry walk == branch tree 2026-09-16
+worker_code_fingerprint = "33b0d42fad8fa46b93c09ce1abb3d1d07a349905c171b795671cc68f06d7e907"   # 271 files, worker-v2.0.0-rc11 (2fd193ca…); registry walk, rc10 walk reproduced its pin 2026-10-30
 funded_ready_timeout_seconds = 900.0
 # How a funded leg's checkpoint leaves its payer pod. "harvest" (default):
 # CREDENTIAL-FREE pods — the worker trains --local-only (nothing at all in the
@@ -1279,7 +1279,7 @@ router_lr_scale = 0.1
 route_bias_rate_scale = 0.25
 # Fit the existing 50B unique-corpus cap; the full reference preset is 27,500.
 training_steps = 23841
-train_image_digest = "sha256:43c07d4207d7693517d74203f6783fdd2c2f91e3d475f38db38e4798ae97785e"
+train_image_digest = "sha256:2fd193cad6be7bef87f110246a2074de84cde44511e153a21d1d0301d93cba64"
 expected_gpu = ""
 long_series = "crop"
 power_ema_scope = "leg"
