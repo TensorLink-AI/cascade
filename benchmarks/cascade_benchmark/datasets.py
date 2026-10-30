@@ -81,16 +81,57 @@ def _read_marker(path: Path) -> dict | None:
         return None
 
 
+def listing_digest(path: str | Path) -> tuple[int, str]:
+    """``(n_files, sha256)`` of a data dir's file listing — sorted relative
+    paths and byte sizes, excluding the marker and the hub's ``.cache`` dir.
+    Cheap (stat only): it proves every file of a completed pull is still
+    present at its size, not that the bytes are unmodified. MUST stay
+    identical to ``cascade.validator.bench_identity.listing_digest``."""
+    import hashlib
+    import json
+
+    root = Path(path)
+    entries = []
+    for p in root.rglob("*"):
+        rel = p.relative_to(root)
+        if rel.parts[0] == ".cache" or rel.as_posix() == _MARKER or not p.is_file():
+            continue
+        entries.append([rel.as_posix(), p.stat().st_size])
+    entries.sort()
+    blob = json.dumps(entries, separators=(",", ":")).encode()
+    return len(entries), hashlib.sha256(blob).hexdigest()
+
+
 def recorded_revision(path: str | Path) -> str | None:
     """The revision a data dir was downloaded at, per its marker — ``None`` when
     the dir carries no marker (hand-managed, env-var-wired, or pre-marker data).
     Partial (``allow_patterns``) pulls are flagged so a subset can't masquerade
-    as the full benchmark."""
+    as the full benchmark, and so is a dir whose files no longer match the
+    listing the marker recorded at download time (files lost or truncated)."""
     marker = _read_marker(Path(path))
     if not marker or "revision" not in marker:
         return None
     rev = str(marker["revision"])
-    return f"{rev} (partial)" if marker.get("patterns") else rev
+    if marker.get("patterns"):
+        return f"{rev} (partial)"
+    if "listing_sha256" in marker:
+        n, digest = listing_digest(path)
+        if n != marker.get("n_files") or digest != marker["listing_sha256"]:
+            return f"{rev} (partial: files differ from the download listing)"
+    return rev
+
+
+def _expected_files(spec: DatasetSpec, allow_patterns: Sequence[str] | None) -> list[str]:
+    """Every file the pinned revision of the HF repo holds (pattern-filtered):
+    the authority a completed download is checked against."""
+    from fnmatch import fnmatch
+
+    from huggingface_hub import HfApi
+
+    files = HfApi().list_repo_files(spec.hf_repo, repo_type="dataset", revision=spec.revision)
+    if allow_patterns:
+        files = [f for f in files if any(fnmatch(f, pat) for pat in allow_patterns)]
+    return list(files)
 
 
 def download_suite(
@@ -114,6 +155,9 @@ def download_suite(
     spec = DATASETS[suite]
     dest = Path(dest)
     dest.mkdir(parents=True, exist_ok=True)
+    # A previous (possibly complete-looking) marker must not survive a pull
+    # that then fails half-way: the marker is rewritten only on verified success.
+    (dest / _MARKER).unlink(missing_ok=True)
     snapshot_download(
         repo_id=spec.hf_repo,
         repo_type="dataset",
@@ -121,15 +165,51 @@ def download_suite(
         local_dir=str(dest),
         allow_patterns=list(allow_patterns) if allow_patterns else None,
     )
+    # snapshot_download can return after rate limits with files missing; only
+    # a pull that holds every file of the pinned revision earns a marker.
+    expected = _expected_files(spec, allow_patterns)
+    missing = [f for f in expected if not (dest / f).is_file()]
+    if not expected or missing:
+        raise RuntimeError(
+            f"{suite}: download incomplete — {len(missing)} of {len(expected)} files of "
+            f"{spec.hf_repo}@{spec.revision[:12]} missing (e.g. {missing[:3]}); "
+            "re-run to resume (HF rate limits?)")
+    n_files, digest = listing_digest(dest)
     (dest / _MARKER).write_text(
         json.dumps({
             "repo": spec.hf_repo,
             "revision": spec.revision,
             "patterns": list(allow_patterns) if allow_patterns else None,
+            "n_files": n_files,
+            "listing_sha256": digest,
         }, indent=2),
         encoding="utf-8",
     )
     return dest
+
+
+def verify_suite(suite: str, dest: str | Path) -> dict:
+    """Check an existing full (pattern-free) data dir against the pinned
+    revision's HF file listing and, when every file is present, (re)write its
+    marker with the listing — no download. Upgrades dirs pulled before the
+    marker recorded a listing. Raises when files are missing."""
+    import json
+
+    spec = DATASETS[suite]
+    dest = Path(dest)
+    marker = _read_marker(dest)
+    if marker is not None and (marker.get("revision") != spec.revision or marker.get("patterns")):
+        raise RuntimeError(f"{suite}: {dest} marker is not the full pinned revision {spec.revision[:12]}")
+    expected = _expected_files(spec, None)
+    missing = [f for f in expected if not (dest / f).is_file()]
+    if not expected or missing:
+        raise RuntimeError(f"{suite}: {len(missing)} of {len(expected)} files missing "
+                           f"(e.g. {missing[:3]}) — re-download")
+    n_files, digest = listing_digest(dest)
+    new = {"repo": spec.hf_repo, "revision": spec.revision, "patterns": None,
+           "n_files": n_files, "listing_sha256": digest}
+    (dest / _MARKER).write_text(json.dumps(new, indent=2), encoding="utf-8")
+    return {"suite": suite, "expected": len(expected), **new}
 
 
 def ensure_datasets(
@@ -167,6 +247,8 @@ def ensure_datasets(
                 marker is not None
                 and marker.get("revision") == spec.revision
                 and marker.get("patterns") == (list(allow_patterns) if allow_patterns else None)
+                # a recorded listing that no longer matches ⇒ resume the pull
+                and "files differ" not in (recorded_revision(dest) or "")
             )
             if not in_sync:
                 try:

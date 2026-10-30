@@ -277,6 +277,12 @@ def download_main(argv: list[str] | None = None) -> int:
         default=",".join(DATASETS),
         help="comma-separated subset of: " + ", ".join(DATASETS),
     )
+    p.add_argument(
+        "--verify",
+        action="store_true",
+        help="no download: check existing data against the pinned revision's file "
+             "listing and stamp its marker (exit 1 if any file is missing)",
+    )
     args = p.parse_args(argv)
 
     suites = [s.strip() for s in args.suites.split(",") if s.strip()]
@@ -284,6 +290,20 @@ def download_main(argv: list[str] | None = None) -> int:
     if unknown:
         print(f"error: unknown suite(s): {unknown}; known: {list(DATASETS)}", file=sys.stderr)
         return 2
+
+    if args.verify:
+        from .datasets import verify_suite
+
+        rc = 0
+        for s in suites:
+            try:
+                r = verify_suite(s, Path(args.data_dir) / s)
+                print(f"{s}: complete — {r['expected']} repo files present; marker stamped "
+                      f"({r['n_files']} files, listing {r['listing_sha256'][:12]})", file=sys.stderr)
+            except Exception as e:  # noqa: BLE001 — report every suite
+                print(f"{s}: NOT verified — {e}", file=sys.stderr)
+                rc = 1
+        return rc
 
     for s in suites:
         dest = Path(args.data_dir) / s
