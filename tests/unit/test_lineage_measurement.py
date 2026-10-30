@@ -171,3 +171,37 @@ def test_scheduler_crash_after_epoch_registration_replays_without_double_count(
     sched.lane_b.reconcile_lineage()
     assert sched.lane_b.st.lineage_tokens == 317
     assert len(sched.lane_b.st.lineage_epochs) == 1
+
+
+def test_image_repin_mid_era_binds_the_contract_the_king_trained_under(
+        cfg, tmp_path, monkeypatch):
+    """Testnet rc8→rc10 (2026-10-29): the roll recomputed the contract digest
+    from the re-pinned config, so a replay refused ("changed its checkpoint
+    binding") and the measurement — bound to the old contract — never counted."""
+    from cascade.shared.era import era_for_block
+    from cascade.shared.manifest import TrainedEntry
+    from cascade.trainer.rolling import EraState, _entry_to_json
+    from tests.unit.test_dec55_trainer_epochs import _v2
+    from tests.unit.test_rolling import REF, Clock, FakeClient, _ptr, _sched
+
+    cfg, block, length = _v2(cfg)
+    sched, _ = _sched(cfg, tmp_path, Clock())
+    spec = era_for_block(cfg.round, block)
+    entry = TrainedEntry("KING", 0, "king", REF["KING"], _ptr("trained"), "corpus", block,
+                         training_contract_digest="rc8-contract")
+    sched.state.current = EraState(spec.index, block, spec.seed_block, 987,
+                                   epoch_start=spec.index, king_hotkey="KING",
+                                   king_entry=_entry_to_json(entry))
+    sched._save()
+    d = driver(tmp_path)
+    sched.lane_b = d
+    c = cfg.throne_contracts_at(block)[0]
+    write_measurement(tmp_path, metrics={"tokens_seen": 211}, gen_ref=entry.gen_ref,
+                      corpus_digest="corpus", contract_digest="rc8-contract",
+                      warm_start_ref="", token_budget=c.train_tokens)
+    nxt = era_for_block(cfg.round, block + 3 * length)
+    sched._roll_era(FakeClient(), nxt, nxt.start_block)
+    (binding,) = d.st.lineage_epochs.values()
+    assert binding["contract_digest"] == "rc8-contract"
+    d.reconcile_lineage()
+    assert d.st.lineage_tokens == 211

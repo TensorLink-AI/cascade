@@ -1455,6 +1455,19 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
 
         return call_with_deadline(fn, seconds)
 
+    def _reconnect_chain(self) -> None:
+        """Rebuild the loop's chain connection after a read timed out.
+
+        bittensor fails a request only when the whole socket goes quiet, so
+        one unanswered reply on a socket that still streams other frames
+        hangs every later read on it (testnet 2026-10-29: every tick timed
+        out until a restart). A fresh websocket is the only recovery."""
+        client = self.__dict__.get("_chain_client")
+        reconnect = getattr(client, "reconnect", None)
+        if callable(reconnect):
+            log.warning("chain read timed out — rebuilding the substrate connection")
+            reconnect()
+
     def _block_with_freeze_guard(self, client: object) -> int:
         """The chain height, rebuilding the connection when it hangs or freezes.
 
@@ -1552,6 +1565,7 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
             # Legacy work can continue; v2 rental still requires qualification.
             self.__dict__["_v2_launch_preflight_status"] = {"state": "blocked", "reason": str(exc)}
             log.error("v2 launch preflight blocked: %s", exc)
+        self.__dict__["_chain_client"] = client
         monitor = OperatorMonitor(self, client)
         monitor.start()
         self.__dict__["_operator_monitor"] = monitor
@@ -1591,4 +1605,6 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
                              self.cfg.round.rolling_from_block)
             except Exception as e:  # noqa: BLE001 — a service loop must not die on one tick
                 log.exception("trainer tick failed; retrying after the poll interval: %s", e)
+                if isinstance(e, TimeoutError):
+                    self._reconnect_chain()
             time.sleep(poll)

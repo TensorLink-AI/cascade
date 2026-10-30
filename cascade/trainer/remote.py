@@ -902,6 +902,22 @@ def probe_driver_major(host: RemoteHost, *, timeout: float = 45.0) -> tuple[int 
     return None, "driver probe printed no version"
 
 
+def probe_gpu_count(host: RemoteHost, *, timeout: float = 45.0) -> tuple[int | None, str]:
+    """``(n, "")`` — the GPUs ``host``'s driver lists (``nvidia-smi -L``) —
+    or ``(None, why)`` when it could not be read."""
+    try:
+        proc = subprocess.run(build_ssh_argv(host, "nvidia-smi -L"), capture_output=True,
+                              text=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        return None, f"gpu count probe timed out after {timeout:.0f}s"
+    except OSError as e:
+        return None, f"gpu count probe could not start: {e}"
+    if proc.returncode != 0:
+        return None, f"gpu count probe failed rc={proc.returncode}: {(proc.stderr or '')[-160:]}"
+    n = sum(1 for line in (proc.stdout or "").splitlines() if line.startswith("GPU "))
+    return (n, "") if n else (None, "gpu count probe listed no GPUs")
+
+
 def build_scp_argv(host: RemoteHost, local_path: str, remote_path: str) -> list[str]:
     """The local ``scp`` argv copying ``local_path`` to ``host:remote_path``
     under exactly :func:`build_ssh_argv`'s transport policy (a pinned host

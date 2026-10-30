@@ -1091,9 +1091,14 @@ class LiumProvider:
         Shape matters: the fleet plan fans one hosts.toml lane out per GPU, so
         a 1× machine rented against an 8-lane plan strands seven lanes (and the
         health gate then kills the pod anyway — filter here, before renting)."""
+        from .layout import split_layout
+
+        base, count = split_layout(sku)
+        if count > 1:
+            gpus = count            # a layout SKU ("8xH200") fixes its own shape
         try:
             execs = parse_lium_executors(
-                self._cli(["ls", "--gpu", sku, "--format", "json"]).stdout)
+                self._cli(["ls", "--gpu", base, "--format", "json"]).stdout)
         except ProvisionError as e:
             raise self._scrub_key(e) from None
         shaped = [e for e in execs if int(e.get("gpu_count", 1) or 1) == int(gpus)]
@@ -1406,10 +1411,20 @@ class LiumProvider:
             elif not seen and self._now() >= appear_by:
                 # Never listed ⇒ the `lium up` failed; don't burn the full
                 # ready timeout on a ghost. Surface the captured up output.
-                tail = self._up_log_tail(pod_id)
+                tail = self._up_log_tail(pod_id, n=2000)
                 log.warning("lium pod %s never appeared in `lium ps` within %.0fs — "
                             "`lium up` likely failed; its output: %s",
-                            pod_id, LIUM_APPEAR_TIMEOUT, tail or "(no up log captured)")
+                            pod_id, LIUM_APPEAR_TIMEOUT, tail[-400:] or "(no up log captured)")
+                from ..funding.faults import is_auth_or_permission, is_funding_failure
+
+                if is_funding_failure(tail) or is_auth_or_permission(tail):
+                    # The account refused the rent (2026-10-29: Lium 403 "renting
+                    # needs a balance above 15 minutes of the node's hourly
+                    # price…"). Not the host's fault: raise the account's own
+                    # words so the caller classifies it as auth/funding and the
+                    # payer is told to top up, instead of renting again as if
+                    # the host were a lemon.
+                    raise ProvisionError(f"lium up refused by the account: {tail[-600:]}")
                 return False
             self._sleep(self.poll_interval)
         return False

@@ -390,3 +390,53 @@ def test_settlement_hold_is_alerted_even_after_king_training_finishes():
         cfg=cfg,
     )
     assert any(c["code"] == "settlement_held" for c in report["conditions"])
+
+
+def test_a_timed_out_chain_read_rebuilds_the_connection(cfg, tmp_path):
+    """Testnet 2026-10-29: one unanswered reply left the trainer's websocket
+    hanging every later read until a restart. A timed-out read — in the
+    scheduler's chain_read or anywhere in the tick — now reconnects."""
+    from cascade.trainer.loop import TrainerRunner
+    from cascade.trainer.rolling import LegOps
+
+    reconnects = []
+    client = SimpleNamespace(reconnect=lambda: reconnects.append(True))
+    runner = TrainerRunner(cfg=cfg, base_trainer=object(), work_root=tmp_path)
+    runner.__dict__["_chain_client"] = client
+
+    def hung(fn, seconds):
+        raise TimeoutError()
+
+    runner._with_deadline = hung
+    with pytest.raises(TimeoutError):
+        LegOps(runner).chain_read(lambda: 1)
+    assert reconnects == [True]
+    runner._with_deadline = lambda fn, seconds: fn()
+    assert LegOps(runner).chain_read(lambda: 7) == 7
+    assert reconnects == [True]                     # a healthy read never reconnects
+
+
+def test_a_tick_that_times_out_reconnects_before_the_next_poll(cfg, tmp_path, monkeypatch):
+    from cascade.trainer import loop as loop_mod
+    from cascade.trainer.loop import TrainerRunner
+
+    reconnects = []
+    client = SimpleNamespace(reconnect=lambda: reconnects.append(True))
+    runner = TrainerRunner(cfg=cfg, base_trainer=object(), work_root=tmp_path)
+    from cascade.trainer import operator_health
+
+    monkeypatch.setattr(operator_health, "OperatorMonitor",
+                        lambda *a: SimpleNamespace(start=lambda: None))
+    runner._upkeep = lambda: None
+    ticks = []
+
+    def guard(c):
+        ticks.append(1)
+        if len(ticks) == 1:
+            raise TimeoutError()
+        raise SystemExit                           # stop the service loop
+    runner._block_with_freeze_guard = guard
+    monkeypatch.setattr(loop_mod.time, "sleep", lambda s: None)
+    with pytest.raises(SystemExit):
+        runner.run_forever(client)
+    assert reconnects == [True]

@@ -262,3 +262,39 @@ def test_lane_b_merges_apply_only_at_a_warm_start(cfg, tmp_path, monkeypatch):
     assert later.warm_start_ckpt == "M" and later.warm_start_merges == []
     assert later.base_seed == start.base_seed                 # one epoch
     assert sched.lane_b.calls == [(first + 3, False), (first + 3, True)]
+
+
+def test_legs_from_before_an_image_repin_are_retrained_not_wedging_settlement(cfg, tmp_path):
+    """Testnet rc7→rc8 (2026-10-29): entries trained under the previous worker
+    image's contract made _build_manifest refuse on every tick. The king entry
+    is dropped (the king retrains) and challenger legs requeue unburned."""
+    v2cfg, v2_block, L = _v2(cfg)
+    clock = Clock()
+    ops = EpochOps(tmp_path, clock)
+    sched, _ = _sched(v2cfg, tmp_path, clock, ops=ops)
+    client = FakeClient()
+    q = ops.queue()
+    ops.commits.append(_commit("ALFA", REF["ALFA"], v2_block - 100))
+    q.add("ALFA", REF["ALFA"], reveal_block=v2_block - 100)
+    sched.tick(client, v2_block + 5)
+    _join(sched)
+    _step(clock, ops, sched, client, from_block=v2_block + 5, to_block=v2_block + 6)
+    cur = sched.state.current
+    assert cur.king() is not None and [f.hotkey for f in sched.state.finished] == ["ALFA"]
+    import json
+    ke = json.loads(cur.king_entry) if isinstance(cur.king_entry, str) else dict(cur.king_entry)
+    ke["training_contract_digest"] = "old-image-contract"
+    cur.king_entry = json.dumps(ke) if isinstance(cur.king_entry, str) else ke
+    sched.state.finished[0].entry["training_contract_digest"] = "old-image-contract"
+    kings_before = len(ops.king_calls)
+    _advance(clock, ops, sched, client, from_block=v2_block + 6, to_block=v2_block + EB + 3)
+    _join(sched)
+    assert not any(e.training_contract_digest == "old-image-contract"
+                   for m in ops.manifests for e in m.entries)
+    _advance(clock, ops, sched, client, from_block=v2_block + EB + 3,
+             to_block=v2_block + 2 * EB + 3)
+    _join(sched)
+    assert len(ops.king_calls) > kings_before                    # the king retrained
+    a = q.get("ALFA")                                            # requeued, never burned
+    assert "ALFA" not in ops.burnt and a.last_error_class == "infra" and "contract" in a.last_error
+    assert sched.state.last_settled_boundary >= v2_block + EB    # settlement kept moving

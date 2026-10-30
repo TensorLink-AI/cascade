@@ -46,16 +46,16 @@ def test_open_market_knobs_parse_from_toml(tmp_path):
     # The repo ships every knob ON (owner 2026-09-20) and the dataclass
     # defaults agree, so a chain.toml without the keys arms the same policy.
     assert (rnd.funded_sku_per_leg, rnd.funded_max_price_per_hour,
-            rnd.funded_max_leg_cost_usd) == (True, 1.5, 1.6)
-    assert rnd.funded_sku_wall_seconds == (("H100", 6000), ("L40", 11400),
-                                           ("L40S", 10200), ("RTX4090", 13500))
+            rnd.funded_max_leg_cost_usd) == (True, 40.0, 75.0)
+    assert dict(rnd.funded_sku_wall_seconds)["8xH200"] == 8333
+    assert dict(rnd.funded_sku_wall_seconds)["H100"] == 6000
     assert rnd.funded_sku_wall_seconds == RoundConfig.funded_sku_wall_seconds
     src = repo_toml.read_text(encoding="utf-8")
     edited = src
     for before, after in (("funded_sku_per_leg = true", "funded_sku_per_leg = true"),
-                          ("funded_max_price_per_hour = 1.5", "funded_max_price_per_hour = 1.5"),
-                          ("funded_max_leg_cost_usd = 1.6", "funded_max_leg_cost_usd = 1.6"),
-                          ("funded_sku_wall_seconds = { RTX4090 = 13500, L40S = 10200, L40 = 11400, H100 = 6000 }",
+                          ("funded_max_price_per_hour = 40.0", "funded_max_price_per_hour = 1.5"),
+                          ("funded_max_leg_cost_usd = 75.0", "funded_max_leg_cost_usd = 1.6"),
+                          ('funded_sku_wall_seconds = { RTX4090 = 13500, L40S = 10200, L40 = 11400, H100 = 6000, "8xH200" = 8333, "8xH100" = 8801, "4xH200" = 12483, "4xH100" = 13201, "4xB200" = 10174, "8xB200" = 6866, "4xB300" = 10299, "8xB300" = 6866 }',
                            "funded_sku_wall_seconds = { RTX4090 = 12000, l40s = 7200 }")):
         assert edited.count(before) == 1, before
         edited = edited.replace(before, after, 1)

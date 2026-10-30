@@ -415,6 +415,10 @@ class _FundedPodMixin:
                              "in flight (re-attaches after a restart)", pod.instance_id)
                     continue
                 self._teardown_operator_pod(pod)
+            try:
+                self._sweep_operator_orphans(keep_ids, keep_payers)
+            except Exception as e:  # noqa: BLE001 — never blocks the payer sweep below
+                log.warning("funded sweep: operator-account orphan listing failed: %s", e)
             vault = self._payer_vault()
             if vault is None:
                 if any(x.payer_hotkey for x in pods):
@@ -441,6 +445,50 @@ class _FundedPodMixin:
                              netuid=self.cfg.subnet.netuid, exclude=keep_payers)
         except Exception as e:  # noqa: BLE001
             log.warning("funded pod reconcile failed (ignored): %s", e)
+
+    # A rent ledgers its pod right after the create; younger unledgered pods
+    # may be that window, never an orphan.
+    OPERATOR_ORPHAN_GRACE_SECONDS = 900.0
+
+    def _sweep_operator_orphans(self, keep_ids: tuple[str, ...],
+                                keep_payers: set[str] | frozenset[str]) -> None:
+        """Tear down THIS deployment's pods on the operator's Lium account that
+        no ledger row tracks — listing-based, like the per-payer
+        :func:`reconcile_funded`. The ledger sweep alone cannot see a pod that
+        left the ledger: 2026-10-29 a released 8xH200 king pod dropped out of
+        ``lium ps`` right after ``lium rm`` (so the verified teardown removed
+        it from the ledger), came back BROKEN and billed for 6 h. Scoped to
+        ``cascade-n<netuid>-…-funded-…`` names; current era king pods and
+        in-flight operator legs are kept, as in the ledger sweep."""
+        import datetime as _dt
+
+        from ..provision.core import LiumProvider
+        from ..provision.funded import terminate_verified
+
+        prefix = f"cascade-n{int(self.cfg.subnet.netuid)}-"
+        provider = LiumProvider()
+        ledgered = {p.instance_id for p in self._load_funded_ledger()}
+        now = _dt.datetime.now(_dt.UTC)
+        for row in provider._list_pods():
+            name = str(row.get("name") or "")
+            if not name.startswith(prefix) or "-funded-" not in name or name in ledgered:
+                continue
+            if any(self._is_king_pod_of(name, rid) for rid in keep_ids):
+                continue
+            if keep_payers and self._is_operator_leg_pod_of(name, keep_payers):
+                continue
+            try:
+                created = _dt.datetime.fromisoformat(str(row.get("created_at")))
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=_dt.UTC)
+                if (now - created).total_seconds() < self.OPERATOR_ORPHAN_GRACE_SECONDS:
+                    continue
+            except (TypeError, ValueError):
+                pass                       # no usable age: an off-ledger pod is still an orphan
+            gone = terminate_verified(provider, name)
+            log.error("funded sweep: operator pod %s (%s) was on no ledger — %s", name,
+                      row.get("status") or "?", "terminated" if gone
+                      else "terminate NOT confirmed; still billing, retried next sweep")
 
     def _is_king_pod_of(self, instance_id: str, round_id: str) -> bool:
         prefix = king_pod_name_prefix(self.cfg.subnet.netuid, str(round_id))
@@ -501,6 +549,7 @@ class _FundedPodMixin:
         """
         from ..provision.core import record_host_quarantine
         from ..provision.funded import LEMON_CLASS, rent_funded_pod
+        from ..provision.layout import visible_devices
         from .remote import RemoteHost
 
         queue = self._funded_queue()
@@ -905,7 +954,9 @@ class _FundedPodMixin:
             host=result.address.ip, port=result.address.ssh_port,
             user=profile.user, key_path=profile.key_path,
             remote_python=profile.remote_python, workdir=profile.workdir,
-            cuda_device="0", chain_toml=profile.chain_toml,
+            # A layout pod ("8xH200") trains on all its GPUs.
+            cuda_device=visible_devices(getattr(result.pod, "sku", "") or ""),
+            chain_toml=profile.chain_toml,
             forward_env=(), static_env=env_pairs, isolated=True,
             pinned_host_key=result.host_key,
             ssh_options=profile.ssh_options,
@@ -1137,6 +1188,9 @@ class _FundedPodMixin:
         from ..shared.config import funded_host_bench_floor_for
         from .remote import probe_host_bench
 
+        why = self._host_gpu_shortfall(host, sku, label)
+        if why:
+            return why
         floor = funded_host_bench_floor_for(
             getattr(self.cfg.round, "funded_host_bench_floor", ()) or (), sku)
         if floor <= 0:
@@ -1151,6 +1205,26 @@ class _FundedPodMixin:
         if tps < floor:
             return (f"slow host: calibration bench {tps:,.0f} tokens/s < floor "
                     f"{floor:,.0f} for {sku}")
+        return ""
+
+    def _host_gpu_shortfall(self, host, sku: str, label: str) -> str:
+        """Why ``host`` has fewer GPUs than the layout it was rented as, or
+        ``""``. Lium has sold an ``8xH200`` executor that exposed 6 (testnet
+        2026-10-30): the leg trains on fewer cards than its wall assumes, at
+        the full layout price. An unreadable count passes, like the bench."""
+        from ..provision.layout import layout_gpus
+        from .remote import probe_gpu_count
+
+        want = layout_gpus(sku)
+        if want <= 1:
+            return ""
+        got, err = probe_gpu_count(host)
+        if got is None:
+            log.warning("%s: gpu count unavailable (%s) — %d-GPU layout not verified",
+                        label, err, want)
+            return ""
+        if got < want:
+            return f"short pod: {got} GPU(s) visible, rented as {sku} ({want})"
         return ""
 
     def _funded_pod_too_slow(self, result, profile) -> str:
