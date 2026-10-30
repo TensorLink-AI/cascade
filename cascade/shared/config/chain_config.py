@@ -92,7 +92,7 @@ class ChainConfig:
         if contract.corpus_mode == "shards":
             gen = replace(gen, max_length=self.generation.max_length,
                           max_memory_mb=self.generation.child_memory_mb,
-                          max_generate_seconds=self.generation.window_seconds)
+                          max_generate_seconds=self.generation.max_window_seconds)
         return gen
 
     def for_king(self, ref: str) -> ChainConfig:

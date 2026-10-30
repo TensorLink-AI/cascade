@@ -339,3 +339,51 @@ def test_parse_generation_shadeform_key_id_env_round_trip():
         parse_generation({"shadeform_ssh_key_id_env": "not a name"})
     with pytest.raises(ValueError, match="not a chain.toml field"):
         parse_generation({"shadeform_ssh_key_id": "519203aa"})   # the value never lives here
+
+
+# ── fallback tiers (owner 2026-10-30: 32 vCPU always; 16 only when 32 is sold out) ──
+
+
+class _TierFake:
+    """Offers only for requests at or below ``max_vcpus``."""
+
+    def __init__(self, name, max_vcpus):
+        self.name, self.max_vcpus = name, max_vcpus
+
+    def offers(self, min_vcpus, max_price):
+        if min_vcpus > self.max_vcpus:
+            return []
+        return [CpuShape(self.max_vcpus, 64.0, 0.5, self.name, f"cpu_{self.max_vcpus}")]
+
+
+def test_tiered_offer_prefers_the_pinned_shape_on_any_provider():
+    from cascade.provision.cpu import select_tiered_offer
+
+    cfg = GenerationConfig(vcpus=32, window_seconds=5400, fallback_vcpus=(16,))
+    # targon (first) only has 16; shadeform has 32 → the 32 wins
+    p, shape, tier = select_tiered_offer([_TierFake("targon", 16), _TierFake("shadeform", 32)], cfg)
+    assert (p.name, tier, shape.vcpus) == ("shadeform", 32, 32)
+    # no 32 anywhere → the 16 tier
+    p, shape, tier = select_tiered_offer([_TierFake("targon", 16), _TierFake("shadeform", 8)], cfg)
+    assert (p.name, tier) == ("targon", 16)
+    assert select_tiered_offer([_TierFake("targon", 8)], cfg) is None
+    # no fallback configured → the single pinned shape, as before
+    assert select_tiered_offer([_TierFake("targon", 16)], GenerationConfig(vcpus=32)) is None
+
+
+def test_fallback_tier_gets_the_same_cpu_budget():
+    from cascade.shared.config.generation import parse_generation
+
+    g = parse_generation({"vcpus": 32, "window_seconds": 5400, "fallback_vcpus": [16]})
+    assert g.shapes == (32, 16) and g.window_for(16) == 10800 and g.max_window_seconds == 10800
+    leg = g.at_shape(16)
+    assert (leg.vcpus, leg.window_seconds, leg.n_children) == (16, 10800, 16)
+    assert leg.cpu_budget_seconds == g.cpu_budget_seconds == 172800
+    assert g.at_shape(32).window_seconds == 5400
+    with pytest.raises(ValueError):
+        g.at_shape(24)
+    for bad in ({"fallback_vcpus": [32]}, {"fallback_vcpus": [8, 16]}, {"fallback_vcpus": [7]},
+                {"fallback_vcpus": [16], "children": 4}):
+        with pytest.raises(ValueError):
+            parse_generation({"vcpus": 32, "window_seconds": 5400, **bad})
+    assert parse_generation({}).fallback_vcpus == () and parse_generation({}).shapes == (32,)

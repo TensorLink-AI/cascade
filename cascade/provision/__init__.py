@@ -47,7 +47,14 @@ from .core import (
     validate_digest_pinned,
     wait_ssh_reachable,
 )
-from .cpu import CpuProvider, CpuShape, ShadeformCpuProvider, cpu_providers, select_cpu_offer
+from .cpu import (
+    CpuProvider,
+    CpuShape,
+    ShadeformCpuProvider,
+    cpu_providers,
+    select_cpu_offer,
+    select_tiered_offer,
+)
 from .targon import TargonCpuProvider, parse_cpu_inventory
 
 __all__ = [
@@ -90,4 +97,5 @@ __all__ = [
     "cpu_providers",
     "parse_cpu_inventory",
     "select_cpu_offer",
+    "select_tiered_offer",
 ]

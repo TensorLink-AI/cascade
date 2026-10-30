@@ -43,7 +43,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ..provision.cpu import CpuProvider, select_cpu_offer
+from ..provision.cpu import CpuProvider, select_tiered_offer
 from ..shared.atomic import path_lock, write_text_atomic
 from ..trainer.remote import RemoteHost, build_scp_argv, build_ssh_argv, run_ssh
 from .dataset import _row, leg_prefix, read_dataset_index, register_corpus
@@ -368,8 +368,7 @@ class GenerationStage:
                                min_channels=min_channels)
         if reused is not None:
             return reused
-        pick = self._wait_for_offer(gcfg)
-        provider, shape = pick
+        provider, shape, tier = self._wait_for_offer(gcfg)
         name = _vm_name(hotkey, round_id)
         with _LIVE_GUARD:
             if name in _LIVE:
@@ -379,20 +378,22 @@ class GenerationStage:
         try:
             return self._generate_on(provider, shape, name, round_id=round_id, hotkey=hotkey,
                                      uid=uid, era=era, gen_ref=gen_ref, repo_dir=repo_dir,
-                                     seed=seed, min_channels=min_channels)
+                                     seed=seed, min_channels=min_channels, tier=tier)
         finally:
             with _LIVE_GUARD:
                 _LIVE.discard(name)
                 _LAUNCHING.discard(name)
 
     def _wait_for_offer(self, gcfg):
-        """The CPU offer to rent, re-probing a sold-out market with backoff for
-        up to ``capacity_wait_s`` — a drought is the operator tier's, never a
-        reason to fail the leg at once (it fails as infra only after that)."""
+        """``(provider, offer, tier_vcpus)`` to rent — the pinned shape first, a
+        ``fallback_vcpus`` tier only when no provider has it — re-probing a
+        sold-out market with backoff for up to ``capacity_wait_s``: a drought is
+        the operator tier's, never a reason to fail the leg at once (it fails as
+        infra only after that)."""
         deadline = self.clock() + float(self.capacity_wait_s)
         delay = max(1.0, float(self.capacity_poll_s))
         while True:
-            pick = select_cpu_offer(self.providers, gcfg)
+            pick = select_tiered_offer(self.providers, gcfg)
             if pick is not None:
                 return pick
             left = deadline - self.clock()
@@ -408,8 +409,11 @@ class GenerationStage:
 
     def _generate_on(self, provider, shape, name: str, *, round_id: str, hotkey: str,
                      uid: int | None, era: int | None, gen_ref: str, repo_dir: Path | str,
-                     seed: int, min_channels: int | None = None) -> StageResult:
+                     seed: int, min_channels: int | None = None,
+                     tier: int | None = None) -> StageResult:
         gcfg = self.cfg.generation
+        # The tier rented sets this leg's children and its equal-budget window.
+        leg = gcfg.at_shape(tier if tier is not None else gcfg.vcpus)
         row = {"provider": provider.name, "vm_id": "", "name": name,
                "created": time.time(), "round_id": str(round_id), "hotkey": hotkey}
         _ledger_put(self.ledger_path, row)             # write-ahead: the intent
@@ -424,15 +428,16 @@ class GenerationStage:
             _ledger_put(self.ledger_path, {**row, "vm_id": str(vm)})
             with _LIVE_GUARD:
                 _LAUNCHING.discard(name)
-            log.info("generation %s round=%s: %s %s (%d vCPU, $%.2f/h) → %s", hotkey[:12],
-                     round_id, provider.name, shape.type_id, shape.vcpus, shape.price_per_hour, vm)
+            log.info("generation %s round=%s: %s %s (%d vCPU, $%.2f/h; tier %d vCPU x %ds) → %s",
+                     hotkey[:12], round_id, provider.name, shape.type_id, shape.vcpus,
+                     shape.price_per_hour, leg.vcpus, leg.window_seconds, vm)
             self._emit("booting_cpu")
             host = self._ready_host(provider, vm, name)
             self._bootstrap(host)
             base = leg_prefix(round_id, hotkey, gcfg.storage_prefix)
             summary = self._run(host, repo_dir, seed=seed, gen_ref=gen_ref,
                                 urls=upload_plan(self.store, base, gcfg),
-                                min_channels=min_channels)
+                                min_channels=min_channels, leg=leg)
             index = self._uploaded_index(base, summary)
             row = register_corpus(self.store, index, round_id=round_id, hotkey=hotkey,
                                   uid=uid, era=era, provider=provider.name,
@@ -543,7 +548,9 @@ class GenerationStage:
                                        f"{(proc.stderr or '')[-300:]}")
 
     def _run(self, host: RemoteHost, repo_dir: Path | str, *, seed: int, gen_ref: str,
-             urls: dict[str, str], min_channels: int | None = None) -> dict:
+             urls: dict[str, str], min_channels: int | None = None,
+             leg=None) -> dict:
+        leg = leg if leg is not None else self.cfg.generation.at_shape(self.cfg.generation.vcpus)
         gen = f"{host.workdir}/_gen"
         self.runner(build_ssh_argv(host, f"rm -rf {shlex.quote(gen)} && "
                                          f"mkdir -p {shlex.quote(gen)}"), 120)
@@ -559,9 +566,12 @@ class GenerationStage:
                f"_gen/repo _gen/out --seed {int(seed)} "
                f"--generator-ref {shlex.quote(gen_ref)} "
                f"--upload-urls _gen/{URLS_NAME} --progress-id {shlex.quote(nonce)} "
-               f"--progress-file _gen/progress.json --json"
+               f"--progress-file _gen/progress.json --json "
+               # Explicit, never the VM's copy of chain.toml: the rented tier's
+               # children and window travel with the command.
+               f"--vcpus {int(leg.vcpus)} --window-seconds {int(leg.window_seconds)}"
                + (f" --min-channels {int(min_channels)}" if min_channels is not None else ""))
-        timeout = int(self.cfg.generation.window_seconds + self.upload_slack_s)
+        timeout = int(leg.window_seconds + self.upload_slack_s)
         stop = threading.Event()
         watcher = None
         if self.observer is not None and identity:

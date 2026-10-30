@@ -67,7 +67,9 @@ class _GenerationMixin:
                       and int(self.cfg.v2.from_block or 0) > 0))
         if not (shards and self.cfg.generation.enabled):
             return 0.0
-        return float(self.cfg.generation.window_seconds) + self.GENERATION_OVERHEAD_SECONDS
+        # The tier is picked at rental time, so admission plans for the longest
+        # one (a fallback shape's equal-budget window).
+        return float(self.cfg.generation.max_window_seconds) + self.GENERATION_OVERHEAD_SECONDS
 
     def _corpus_store(self):
         store = self.__dict__.get("_corpus_store_obj")
