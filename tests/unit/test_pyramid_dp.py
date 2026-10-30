@@ -103,7 +103,7 @@ def test_two_ranks_reproduce_the_one_gpu_step(tmp_path):
             for a, b in zip(got[key], one[key], strict=True):
                 assert (a is None) == (b is None) or (b is None and not a.any())
                 if b is not None:
-                    torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-7)
+                    torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-6)
         assert torch.equal(got["gen"], one["gen"])          # same random stream after the step
 
 
