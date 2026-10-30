@@ -154,3 +154,16 @@ def test_time_non_finite_metric_task_is_recorded(monkeypatch, tmp_path):
                             "reason": "non-finite CRPS/MASE (mean-replaced in the aggregate)"}]
     assert res.partial is False  # every task is in the headline — just not honestly
     assert res.detail == "1 of 2 tasks non-finite (mean-replaced): b/D/short"
+
+
+def test_fev_scope_exclusions_are_not_partial_but_other_skips_are():
+    """FEV's declared univariate-only scope (multivariate targets, stage
+    "scope") is not missing coverage — a 100-task list scoring its 65
+    univariate tasks must not read as partial (it held every v2 gate)."""
+    scope = [{"full": f"t{i}", "stage": "scope", "reason": "multivariate target"} for i in range(35)]
+    ok = SuiteResult(suite="fev", status="ok", n_series=65, n_expected=100, skipped=scope)
+    assert ok.n_scope_skipped == 35 and not ok.partial
+    failed = scope + [{"full": "t99", "stage": "score", "reason": "boom"}]
+    assert SuiteResult(suite="fev", status="ok", n_series=64, n_expected=100, skipped=failed).partial
+    # "scope" is FEV's declaration only: another suite can't use it to hide gaps
+    assert SuiteResult(suite="boom", status="ok", n_series=65, n_expected=100, skipped=scope).partial

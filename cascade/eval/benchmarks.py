@@ -276,8 +276,7 @@ def item_rows_from_report(report: dict | None) -> dict | None:
                              "crps": _finite_or_none(r.get("CRPS")),
                              "mase": _finite_or_none(r.get("MASE"))})
             out[key] = {"status": s.get("status"), "rows": rows}
-            if (s.get("partial") or s.get("max_series")
-                    or (s.get("n_expected") and s.get("n_series", 0) < s["n_expected"])):
+            if suite_incomplete(s):
                 out[key]["partial"] = True
             revision = (report.get("data_revisions") or {}).get(s.get("suite"))
             if revision:
@@ -394,6 +393,21 @@ def _pick_metric(metrics: dict, aliases: tuple[str, ...]) -> float | None:
     return None
 
 
+
+def suite_incomplete(s: dict) -> bool:
+    """Whether a signed report's suite entry falls short of its declared
+    coverage. Recomputed from the counts, never read from the report's own
+    ``partial`` flag. FEV's declared univariate-only scope (multivariate
+    targets reported with ``stage == "scope"``) is not a gap; any other skip,
+    a ``max_series`` cap or fewer scored than expected is. The same rule as
+    ``scripts/bench_timing.py`` and the sidecar's ``SuiteResult.partial``."""
+    skipped = s.get("skipped") or []
+    scope = sum(1 for k in skipped if s.get("suite") == "fev" and isinstance(k, dict)
+                and k.get("stage") == "scope")
+    expected = int(s.get("n_expected") or 0) - scope
+    return bool(s.get("max_series") or len(skipped) > scope
+                or (s.get("n_expected") and int(s.get("n_series") or 0) < expected))
+
 def extract_bench_scores(report: dict | None, *, require_fev: bool = False) -> dict | None:
     """Pull Cascade's six numbers — GIFT-Eval / BOOM / TIME CRPS+MASE — from a
     :func:`run_benchmarks` report, or ``None`` when any of the three suites is
@@ -424,8 +438,7 @@ def extract_bench_scores(report: dict | None, *, require_fev: bool = False) -> d
         if s.get("status") != "ok":
             problems.append(f"{suite}:{s.get('status')}")
             continue
-        if (s.get("partial") or s.get("max_series") or s.get("skipped")
-                or (s.get("n_expected") and s.get("n_series", 0) < s["n_expected"])):
+        if suite_incomplete(s):
             problems.append(f"{suite}:partial")
             continue
         m = s.get("metrics") or {}
@@ -435,9 +448,7 @@ def extract_bench_scores(report: dict | None, *, require_fev: bool = False) -> d
             continue
         got[f"{key}_crps"], got[f"{key}_mase"] = crps, mase
     fev = by_suite.get("fev")
-    if (fev is not None and fev.get("status") == "ok" and not fev.get("partial")
-            and not fev.get("max_series") and not fev.get("skipped")
-            and not (fev.get("n_expected") and fev.get("n_series", 0) < fev["n_expected"])):
+    if fev is not None and fev.get("status") == "ok" and not suite_incomplete(fev):
         m = fev.get("metrics") or {}
         crps, mase = _pick_metric(m, _CRPS_ALIASES), _pick_metric(m, _MASE_ALIASES)
         if crps is not None and mase is not None and all(math.isfinite(v) and v > 0 for v in (crps, mase)):
