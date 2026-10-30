@@ -301,3 +301,31 @@ def test_cpu_providers_factory_order(monkeypatch):
     ps = cpu_providers(GenerationConfig(providers=("shadeform", "targon")))
     assert [p.name for p in ps] == ["shadeform", "targon"]
     assert isinstance(ps[1], TargonCpuProvider)
+
+
+def test_cpu_providers_shadeform_vm_mode_from_config(monkeypatch):
+    monkeypatch.delenv("SHADEFORM_API_KEY", raising=False)
+    ps = cpu_providers(GenerationConfig(providers=("shadeform",), shadeform_ssh_key_id="k-1"))
+    assert ps[0].ssh_key_id == "k-1" and ps[0].ssh_user == "shadeform"
+    # explicit options still win over the config default
+    ps = cpu_providers(GenerationConfig(providers=("shadeform",), shadeform_ssh_key_id="k-1"),
+                       {"shadeform": {"ssh_key_id": "k-2"}})
+    assert ps[0].ssh_key_id == "k-2"
+    assert cpu_providers(GenerationConfig(providers=("shadeform",)))[0].ssh_key_id == ""
+
+
+def test_shadeform_cpu_docker_mode_refuses_bare_image_name():
+    from cascade.provision.cpu import ShadeformCpuProvider
+
+    p = ShadeformCpuProvider()
+    shape = CpuShape(32, 128.0, 1.02, "shadeform", "cpu_32", "dallas-usa-1", "latitude")
+    for image in ("", "ubuntu-24-04-lts"):     # the Targon vm_image is not a container
+        with pytest.raises(ProvisionError, match="shadeform_ssh_key_id"):
+            p.launch(shape, name="n", ssh_pubkey="ssh-ed25519 AAAA x", image=image)
+
+
+def test_parse_generation_shadeform_ssh_key_id_round_trip():
+    from cascade.shared.config.generation import parse_generation
+
+    assert parse_generation({"shadeform_ssh_key_id": "abc"}).shadeform_ssh_key_id == "abc"
+    assert parse_generation({}).shadeform_ssh_key_id == ""
