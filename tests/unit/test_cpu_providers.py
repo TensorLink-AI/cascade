@@ -301,3 +301,41 @@ def test_cpu_providers_factory_order(monkeypatch):
     ps = cpu_providers(GenerationConfig(providers=("shadeform", "targon")))
     assert [p.name for p in ps] == ["shadeform", "targon"]
     assert isinstance(ps[1], TargonCpuProvider)
+
+
+def test_cpu_providers_shadeform_vm_mode_from_env(monkeypatch):
+    monkeypatch.delenv("SHADEFORM_API_KEY", raising=False)
+    monkeypatch.setenv("SHADEFORM_SSH_KEY_ID", "k-1")
+    ps = cpu_providers(GenerationConfig(providers=("shadeform",)))
+    assert ps[0].ssh_key_id == "k-1" and ps[0].ssh_user == "shadeform"
+    # explicit options still win over the environment default
+    ps = cpu_providers(GenerationConfig(providers=("shadeform",)),
+                       {"shadeform": {"ssh_key_id": "k-2"}})
+    assert ps[0].ssh_key_id == "k-2"
+    monkeypatch.setenv("OTHER_KEY_ID", "k-3")
+    ps = cpu_providers(GenerationConfig(providers=("shadeform",),
+                                        shadeform_ssh_key_id_env="OTHER_KEY_ID"))
+    assert ps[0].ssh_key_id == "k-3"
+    monkeypatch.delenv("SHADEFORM_SSH_KEY_ID")
+    assert cpu_providers(GenerationConfig(providers=("shadeform",)))[0].ssh_key_id == ""
+
+
+def test_shadeform_cpu_docker_mode_refuses_bare_image_name():
+    from cascade.provision.cpu import ShadeformCpuProvider
+
+    p = ShadeformCpuProvider()
+    shape = CpuShape(32, 128.0, 1.02, "shadeform", "cpu_32", "dallas-usa-1", "latitude")
+    for image in ("", "ubuntu-24-04-lts"):     # the Targon vm_image is not a container
+        with pytest.raises(ProvisionError, match="SHADEFORM_SSH_KEY_ID"):
+            p.launch(shape, name="n", ssh_pubkey="ssh-ed25519 AAAA x", image=image)
+
+
+def test_parse_generation_shadeform_key_id_env_round_trip():
+    from cascade.shared.config.generation import parse_generation
+
+    assert parse_generation({}).shadeform_ssh_key_id_env == "SHADEFORM_SSH_KEY_ID"
+    assert parse_generation({"shadeform_ssh_key_id_env": "X_ID"}).shadeform_ssh_key_id_env == "X_ID"
+    with pytest.raises(ValueError, match="environment variable"):
+        parse_generation({"shadeform_ssh_key_id_env": "not a name"})
+    with pytest.raises(ValueError, match="not a chain.toml field"):
+        parse_generation({"shadeform_ssh_key_id": "519203aa"})   # the value never lives here

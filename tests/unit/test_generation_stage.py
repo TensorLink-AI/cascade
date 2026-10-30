@@ -348,3 +348,13 @@ def test_cached_corpus_gets_fresh_download_links_on_retry(tmp_path):
     assert first[S.INDEX_NAME] == retry[S.INDEX_NAME]
     assert first[S.URLS_NAME] != retry[S.URLS_NAME]
     assert signed == [(0, T.DOWNLOAD_EXPIRES_S), (25 * 3600, T.DOWNLOAD_EXPIRES_S)]
+
+
+def test_vm_known_hosts_is_fresh_per_vm():
+    from cascade.generation.stage import vm_known_hosts
+
+    p = vm_known_hosts("vm/../1")
+    assert p.name == "cascade-genvm-vm_.._1.known_hosts" and p.read_text() == ""
+    p.write_text("[1.2.3.4]:22 ssh-ed25519 OLD\n")       # a previous VM on a recycled IP
+    assert vm_known_hosts("vm/../1").read_text() == ""   # never trusted by the next VM
+    assert vm_known_hosts("vm-2") != p
