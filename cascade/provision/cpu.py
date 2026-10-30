@@ -116,7 +116,7 @@ class ShadeformCpuProvider(ShadeformProvider):
             # A bare provider image name (e.g. the Targon ``vm_image``) is not
             # a container: refuse before anything is rented.
             raise ProvisionError("shadeform cpu: docker mode needs a digest-pinned image "
-                                 "(or set [generation] shadeform_ssh_key_id for VM mode)")
+                                 "(or set $SHADEFORM_SSH_KEY_ID for VM mode)")
         spec = LaunchSpec(sku="CPU", count=1, image=image, ssh_pubkey=ssh_pubkey,
                           ssh_port=DEFAULT_SSH_PORT, name_prefix=name)
         offer = {"cloud": shape.cloud, "region": shape.region,
@@ -136,14 +136,17 @@ class ShadeformCpuProvider(ShadeformProvider):
 def cpu_providers(cfg: GenerationConfig, options: dict[str, dict] | None = None
                   ) -> list[CpuProvider]:
     """CPU adapters in ``cfg.providers`` order. ``options`` maps a provider
-    name to constructor kwargs; ``[generation] shadeform_ssh_key_id`` is the
-    Shadeform default (VM mode). Construction reads no credentials."""
+    name to constructor kwargs; the Shadeform VM-mode key id defaults to
+    ``$<[generation] shadeform_ssh_key_id_env>`` (an account key id, not a
+    secret). Construction reads no credentials."""
+    import os
+
     from .targon import TargonCpuProvider
 
     options = dict(options or {})
-    if cfg.shadeform_ssh_key_id:
-        options["shadeform"] = {"ssh_key_id": cfg.shadeform_ssh_key_id,
-                                **options.get("shadeform", {})}
+    key_id = os.environ.get(cfg.shadeform_ssh_key_id_env, "").strip()
+    if key_id:
+        options["shadeform"] = {"ssh_key_id": key_id, **options.get("shadeform", {})}
 
     factories = {"targon": TargonCpuProvider, "shadeform": ShadeformCpuProvider}
     out: list[CpuProvider] = []

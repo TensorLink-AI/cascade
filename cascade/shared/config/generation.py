@@ -56,11 +56,12 @@ class GenerationConfig:
     # The provider VM image the tier boots (Targon needs one; Shadeform VM
     # mode uses its own). Bootstrapped over ssh like a bare GPU pod.
     vm_image: str = ""
-    # Shadeform's registered SSH key id for the tier's bare CPU VMs (the key
-    # whose public half is the trainer's pod key). Without it Shadeform can
-    # only boot docker mode, which needs a digest-pinned image — so the
-    # Shadeform CPU fallback is unusable. Not a credential; never contract.
-    shadeform_ssh_key_id: str = ""
+    # The ENVIRONMENT VARIABLE holding Shadeform's registered SSH key id for
+    # the tier's bare CPU VMs (the key whose public half is the trainer's pod
+    # key). Operator-account specific, so the value never lives in chain.toml.
+    # Unset ⇒ Shadeform can only boot docker mode, which needs a digest-pinned
+    # image. Never contract.
+    shadeform_ssh_key_id_env: str = "SHADEFORM_SSH_KEY_ID"
     retention_days: int = 14
     # How a crowned king's corpus is published: every shard, or the recipe
     # (generator ref + seed + digest) plus ``sample_shards`` shards.
@@ -105,7 +106,7 @@ def parse_generation(raw: dict | None) -> GenerationConfig:
         storage_prefix=str(g.get("storage_prefix", "corpora/")),
         bucket=str(g.get("bucket", "")),
         vm_image=str(g.get("vm_image", "")),
-        shadeform_ssh_key_id=str(g.get("shadeform_ssh_key_id", "")),
+        shadeform_ssh_key_id_env=str(g.get("shadeform_ssh_key_id_env", "SHADEFORM_SSH_KEY_ID")),
         retention_days=int(g.get("retention_days", 14)),
         king_publish=str(g.get("king_publish", "recipe")),
         sample_shards=int(g.get("sample_shards", 4)),
@@ -130,6 +131,11 @@ def parse_generation(raw: dict | None) -> GenerationConfig:
                 raise ValueError("generation credential fields must name environment variables")
     elif cfg.s3_endpoint:
         raise ValueError("set generation storage_backend=r2 for an endpoint override")
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", cfg.shadeform_ssh_key_id_env):
+        raise ValueError("[generation] shadeform_ssh_key_id_env must name an environment variable")
+    if "shadeform_ssh_key_id" in g:
+        raise ValueError("[generation] shadeform_ssh_key_id is not a chain.toml field; "
+                         "set the id in the environment (shadeform_ssh_key_id_env)")
     if cfg.king_publish not in KING_CORPUS_PUBLISH:
         raise ValueError(f"[generation] king_publish must be one of {KING_CORPUS_PUBLISH}")
     if min(cfg.vcpus, cfg.child_memory_mb, cfg.max_parallel_jobs, cfg.window_seconds,
