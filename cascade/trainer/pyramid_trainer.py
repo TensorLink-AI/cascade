@@ -79,8 +79,15 @@ def losses(model, values, mask, *, generator=None, groups=None):
 
 def combine_gradients(parameters, reference, cap=0.1):
     """Combine the two *global* gradients, then let the caller apply clipping."""
-    norm_m = math.sqrt(sum(float(g.double().square().sum()) for g in reference if g is not None))
-    norm_j = math.sqrt(sum(float(p.grad.double().square().sum()) for p in parameters if p.grad is not None))
+    # Per-tensor float64 squared norms stay on the device and cross to the
+    # host in ONE transfer; the host then sums the same float64 values in the
+    # same order as the per-tensor float() loop it replaces (identical norms,
+    # one sync instead of one per tensor).
+    sq_m = [g.double().square().sum() for g in reference if g is not None]
+    sq_j = [p.grad.double().square().sum() for p in parameters if p.grad is not None]
+    host = torch.stack(sq_m + sq_j).tolist() if sq_m or sq_j else []
+    norm_m = math.sqrt(sum(host[:len(sq_m)]))
+    norm_j = math.sqrt(sum(host[len(sq_m):]))
     if not math.isfinite(norm_m + norm_j):
         raise FloatingPointError("non-finite pyramid gradient")
     weight = min(0.1, cap * norm_m / norm_j) if norm_j > 0 else 0.0

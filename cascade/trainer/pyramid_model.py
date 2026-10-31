@@ -382,11 +382,28 @@ class MoEFFN(nn.Module):
 
         self.last_load = counts.detach()
         self.last_topk = idx.detach()
-        if self.training:
+        if self.training and getattr(self, "defer_balance", False):
+            # The trainer finishes the balance term once the step's GLOBAL
+            # routing counts are known (one forward, no counting pre-pass):
+            # keep its differentiable inputs, same expressions as _aux_loss.
+            self.pending_balance = (
+                (s / s.sum(-1, keepdim=True).clamp_min(1e-20)).mean(0),
+                torch.logsumexp(logits, dim=-1).pow(2).mean())
+            self.last_aux = None
+        elif self.training:
             self.last_aux = self._aux_loss(idx, s, logits, seq_len)
         else:
             self.last_aux = None
         return y
+
+    def finish_balance(self, pending, global_load: torch.Tensor) -> torch.Tensor:
+        """``_aux_loss`` from a deferred forward's kept terms and the step's
+        global load — the value that forward computes with
+        ``balance_load_override = global_load``."""
+        p, z = pending
+        f = global_load.float() / global_load.sum().clamp_min(1)
+        bal = self.num_experts * (f * p).sum()
+        return self.cfg.balance_loss_coef * bal + self.cfg.router_z_loss_coef * z
 
     def _aux_loss(self, idx, s, logits, seq_len: int) -> torch.Tensor:
         E = self.num_experts
@@ -498,6 +515,16 @@ class CascadeMoEModel(nn.Module):
 
     def moe_layers(self) -> list[MoEFFN]:
         return [b.ffn for b in self.blocks if b.moe]
+
+    def finish_aux(self, pending, loads) -> torch.Tensor:
+        """The forward's ``aux_loss`` for a deferred-balance forward: its
+        layers' kept terms finished against the step's global ``loads``, summed
+        in block order from a float32 zero exactly as ``forward`` sums them."""
+        layers = self.moe_layers()
+        aux = loads[0].new_zeros((), dtype=torch.float32)
+        for layer, kept, load in zip(layers, pending, loads, strict=True):
+            aux = aux + layer.finish_balance(kept, load)
+        return aux / len(layers)
 
     def forward(self, patches: torch.Tensor, mask: torch.Tensor | None = None,
                 roles: torch.Tensor | None = None, *, with_parameters: bool = False,

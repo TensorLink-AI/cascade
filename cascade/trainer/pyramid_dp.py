@@ -163,7 +163,7 @@ def micro_batch_pass(model, params, values, masks, groups, splits, mine, cop_gen
     loss_m, loss_j, load)``: the summed marginal gradient, both batch-weighted
     losses and the summed routing loads. With ``gang=None`` and every split
     owned this is the one-GPU step, operation for operation."""
-    from .pyramid_trainer import losses, prediction
+    from .pyramid_trainer import losses
     from .toto2_trainer import check_loss_finite
 
     b, c, length = values.shape
@@ -179,39 +179,37 @@ def micro_batch_pass(model, params, values, masks, groups, splits, mine, cop_gen
         return x, mask, g
 
     load = [torch.zeros(layer.num_experts, device=device, dtype=torch.int64) for layer in layers]
+    # One forward per owned micro-batch, graphs kept: the balance term needs
+    # the FULL step's routing counts, which are exactly these forwards' counts
+    # summed over every split and rank (the forward is deterministic) — so it
+    # is finished here, before any backward, with no counting pre-pass.
     for layer in layers:
         layer.balance_load_override = None
-    if len(splits) > 1:
-        # Counts are non-differentiable, but balance probabilities need the
-        # FULL batch's counts. A bounded no-grad pass avoids retaining all
-        # micro-batch activations or changing the auxiliary objective.
-        with torch.no_grad():
-            for k, ids in enumerate(splits):
-                if k not in mine:
-                    continue
-                x, mask, g = batch(ids)
-                prediction(model, x, mask, groups=g)
-                for total, layer in zip(load, layers, strict=True):
-                    total += layer.last_load
-        if gang:
-            gang.sum_(load)
-        for total, layer in zip(load, layers, strict=True):
-            layer.balance_load_override = total.clone()
-        for total in load:
-            total.zero_()
+        layer.defer_balance = True
+    kept = []
+    try:
+        for k, ids in enumerate(splits):
+            if k not in mine:
+                skip_copula_draws(cop_gen, len(ids), c, length // ps, ps,
+                                  None if groups is None else torch.as_tensor(groups[ids]), device)
+                continue
+            x, mask, g = batch(ids)
+            marginal, joint = losses(model, x, mask, generator=cop_gen, groups=g)
+            kept.append((len(ids) / b, marginal, joint, [layer.pending_balance for layer in layers]))
+            for total, layer in zip(load, layers, strict=True):
+                total += layer.last_load
+                layer.pending_balance = None
+    finally:
+        for layer in layers:
+            layer.defer_balance = False
+    if gang:
+        gang.sum_(load)
     reference = [None] * len(params)
     loss_m = loss_j = 0.0
     bad = False
     # Accumulate BOTH gradients over the complete batch before applying its cap.
-    for k, ids in enumerate(splits):
-        if k not in mine:
-            skip_copula_draws(cop_gen, len(ids), c, length // ps, ps,
-                              None if groups is None else torch.as_tensor(groups[ids]), device)
-            continue
-        weight = len(ids) / b
-        x, mask, g = batch(ids)
-        marginal, joint = losses(model, x, mask, generator=cop_gen, groups=g)
-        marginal = marginal + model.aux_loss
+    for weight, marginal, joint, pending in kept:
+        marginal = marginal + model.finish_aux(pending, load)
         if gang is None:
             check_loss_finite(float(marginal.detach()), step=step, tokens=tokens)
             check_loss_finite(float(joint.detach()), step=step, tokens=tokens)
@@ -227,8 +225,7 @@ def micro_batch_pass(model, params, values, masks, groups, splits, mine, cop_gen
                 p.grad = j.detach() if p.grad is None else p.grad + j.detach()
         loss_m += float(marginal.detach()) * weight
         loss_j += float(joint.detach()) * weight
-        for total, layer in zip(load, layers, strict=True):
-            total += layer.last_load
+    del kept
     if gang is None:
         return reference, loss_m, loss_j, load
     if gang.any_(bad):
@@ -249,7 +246,7 @@ def micro_batch_pass(model, params, values, masks, groups, splits, mine, cop_gen
                 p.grad = torch.zeros_like(p)
             gang.dist.all_reduce(p.grad, op=gang.dist.ReduceOp.SUM)
     losses_t = torch.tensor([loss_m, loss_j], device=device, dtype=torch.float64)
-    gang.sum_([losses_t, *load])
+    gang.sum_([losses_t])           # the loads were summed before the backwards
     return reference, float(losses_t[0]), float(losses_t[1]), load
 
 
