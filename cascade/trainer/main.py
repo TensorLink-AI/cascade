@@ -352,6 +352,10 @@ def main(argv: list[str] | None = None) -> int:
     from ..shared.logging_util import restore_cascade_logging
 
     restore_cascade_logging(args.log_level)
+    # A stop must not leave cgen VMs billing until the next start's reaper.
+    from .runner_generation import install_generation_shutdown
+
+    install_generation_shutdown(runner)
     runner.run_forever(client)
     return 0
 
