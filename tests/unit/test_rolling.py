@@ -516,7 +516,8 @@ def test_restart_mid_era_restores_state_and_reattaches_in_flight_legs(cfg, tmp_p
     # intake), its pod kept through the startup sweep, the king leg reused
     assert ops2.king_calls == []
     assert [c[0] for c in ops2.leg_calls] == ["BRAV"]
-    assert ops2.sweeps[0][1] == {"ALFA", "BRAV"}       # every in-flight payer pod kept
+    # every in-flight payer pod kept, and the era king's own-key pod
+    assert ops2.sweeps[0][1] == {"ALFA", "BRAV", "KING"}
     assert str(sched2.state.current.base_seed) in ops2.sweeps[0][0]
     assert len(sched2.state.finished) == 2
     assert q.get("BRAV").status == "in_flight"
@@ -1194,7 +1195,7 @@ def test_restart_reattaches_an_in_flight_leg_stamped_with_no_era(cfg, tmp_path):
     sched2.tick(client, b0 + 3)
     _join(sched2)
     assert [c[0] for c in ops2.leg_calls] == ["BRAV"]      # re-attached under the current era
-    assert ops2.sweeps[0][1] == {"ALFA", "BRAV"}
+    assert ops2.sweeps[0][1] == {"ALFA", "BRAV", "KING"}   # + the era king's own-key pod
     assert q.get("BRAV").status == "in_flight"
     assert len(sched2.state.finished) == 2
 
@@ -1637,7 +1638,7 @@ def test_restart_after_the_legs_era_ended_requeues_them_unburned_instead_of_reat
     sched2, _ = _sched(armed, tmp_path, clock, ops=ops2)
     sched2.tick(client, era_end + EB + 3)
     _join(sched2)
-    assert ops2.sweeps[0][1] == set()                      # their pods were NOT kept
+    assert ops2.sweeps[0][1] == {"KING"}                   # their pods were NOT kept (the era king's is)
     assert sched2.state.current.index == era_idx + 1       # the era rolled on
     # nothing re-attached under the dead era: both were requeued unburned and
     # the new era's intake seated them afresh
