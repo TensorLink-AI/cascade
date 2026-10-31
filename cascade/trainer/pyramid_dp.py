@@ -51,6 +51,15 @@ def gang_size(device) -> int:
     return max(1, n)
 
 
+def bound_cpu_threads(world: int) -> int:
+    """Give each rank its share of the host's cores: 8 ranks at torch's
+    default (every core each) oversubscribed a 240-core pod (~34 busy
+    cores per rank = ~270 threads, 2026-10-31). The GPU step does not depend on it."""
+    n = max(1, (os.cpu_count() or 1) // max(1, int(world)))
+    torch.set_num_threads(n)
+    return n
+
+
 def owned_splits(n_splits: int, rank: int, world: int) -> set[int]:
     return set(range(rank, n_splits, world))
 
@@ -87,6 +96,7 @@ class Gang:
         for p in self.procs:
             p.start()
         torch.cuda.set_device(0)
+        bound_cpu_threads(self.world)
         dist.init_process_group("nccl", init_method=f"tcp://127.0.0.1:{port}", rank=0,
                                 world_size=self.world, timeout=_TIMEOUT)
         self.dist = dist
@@ -399,6 +409,7 @@ def _follower(rank, world, port, cfg_dict, deterministic, seed, errors) -> None:
 
     try:
         torch.cuda.set_device(rank)
+        bound_cpu_threads(world)
         device = torch.device("cuda", rank)
         dist.init_process_group("nccl", init_method=f"tcp://127.0.0.1:{port}", rank=rank,
                                 world_size=world, timeout=_TIMEOUT)
