@@ -530,7 +530,13 @@ class GenerationStage:
         if reused is not None:
             return reused
         gate = self.__dict__.setdefault("_slots", FairSlots(clock=self.clock))
-        deadline = self.clock() + self.capacity_wait_s if self.capacity_wait_s > 0 else None
+        # A full tier is OUR cap, not a fault: the leg keeps its FIFO place
+        # (reveal order, select_field) until a slot frees. The old 30-min
+        # deadline requeued it with the operator back-off, so a later reveal
+        # took the freed slot while an earlier one sat out its back-off
+        # (2026-10-31). capacity_wait_s still bounds a sold-out MARKET
+        # (_wait_for_offer); a corpus finished after its boundary is reused.
+        deadline = None
         # The king (``priority``) is never capped by max_parallel_jobs: queueing
         # first could not preempt running challenger generations, so a full tier
         # failed the era's king leg (2026-10-30 23:00). It mirrors the GPU side,
@@ -540,6 +546,9 @@ class GenerationStage:
         admission = (nullcontext(True) if priority
                      else gate.slot(lambda: self.cfg.generation.max_parallel_jobs,
                                     deadline=deadline))
+        if not priority and gate.active >= max(1, int(self.cfg.generation.max_parallel_jobs)):
+            log.info("generation %s: all %d CPU slots busy — waiting in line (%d ahead)",
+                     hotkey[:12], gate.active, len(gate.waiters))
         with admission as acquired:
             if not acquired:
                 raise GenerationInfraError("CPU generation admission is full — requeued")
