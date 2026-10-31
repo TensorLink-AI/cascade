@@ -138,8 +138,8 @@ class Gang:
     def sync_after_step(self, model) -> None:
         """Every rank's weights after a sharded step: each muon param from its
         owner, everything else (AdamW params, buffers) from rank 0."""
-        for t, src in zip(model.state_dict().values(), self._sources, strict=True):
-            self.dist.broadcast(t, src=src)
+        broadcast_from_sources(self.dist, list(model.state_dict().values()), self._sources,
+                               self.device)
 
     def gather_muon(self) -> None:
         """Bring every muon param's state to rank 0 (before any read of the
@@ -156,7 +156,9 @@ class Gang:
         exchange_muon_state(self.dist, self.optimizer, self.device, to_root=False)
         self.scatter_pending = False
 
-    def send_step(self, values, masks, groups, n_splits: int, gen, lr: float = 0.0) -> None:
+    def send_step(self, values, masks, groups, n_splits: int, gen, lr: float = 0.0):
+        """Send the step to the helpers; returns the float64 device copy of
+        ``values`` it broadcast, for :func:`micro_batch_pass` to reuse."""
         if not self.synced:
             raise RuntimeError("gang weights not synchronised before the first step")
         if self.scatter_pending:
@@ -165,10 +167,11 @@ class Gang:
         header = torch.tensor([_STEP, b, c, length, int(groups is not None), n_splits],
                               device=self.device, dtype=torch.int64)
         self.dist.broadcast(header, src=0)
-        _send_batch(self.dist, self.device, values, masks, groups)
+        values_t = _send_batch(self.dist, self.device, values, masks, groups)
         state = gen.get_state().to(self.device)
         self.dist.broadcast(state, src=0)
         self.dist.broadcast(torch.tensor([float(lr)], device=self.device, dtype=torch.float64), src=0)
+        return values_t
 
     def stop(self, *, clean: bool) -> None:
         """Release the helpers. ``clean`` = they are waiting for a step header;
@@ -238,28 +241,77 @@ def exchange_muon_state(dist, optimizer, device, *, to_root: bool) -> None:
             optimizer._row_v.pop(p, None)
 
 
-def _send_batch(dist, device, values, masks, groups) -> None:
-    dist.broadcast(torch.as_tensor(values, device=device, dtype=torch.float64), src=0)
+def broadcast_from_sources(dist, tensors, sources, device) -> None:
+    """Broadcast each tensor from its source rank, in order. Pure copies, so
+    the grouping cannot change a bit: on NCCL the broadcasts are issued as one
+    NCCL group (one launch instead of one per tensor, no staging copies) —
+    the device-mode coalescing ``batch_isend_irecv`` uses: async ops inside,
+    one stream-ordered wait on the group's work at exit. Any other backend
+    (gloo in the CPU tests) issues them one by one."""
+    if torch.device(device).type == "cuda" and dist.get_backend() == "nccl":
+        from torch.distributed.distributed_c10d import _coalescing_manager
+
+        with _coalescing_manager(device=torch.device(device)):
+            for t, src in zip(tensors, sources, strict=True):
+                dist.broadcast(t, src=src, async_op=True)
+        return
+    for t, src in zip(tensors, sources, strict=True):
+        dist.broadcast(t, src=src)
+
+
+def sum_int_bucket(gang, tensors) -> None:
+    """All-reduce (SUM) a list of int64 tensors as ONE flat int64 message and
+    write the sums back in place. Integer sums are exact in any order, so this
+    equals one all-reduce per tensor bit for bit."""
+    if not tensors:
+        return
+    if any(t.dtype != torch.int64 for t in tensors):
+        raise TypeError("sum_int_bucket takes int64 tensors only (float sums are order-dependent)")
+    flat = torch.cat([t.reshape(-1) for t in tensors])
+    gang.sum_([flat])
+    offset = 0
+    for t in tensors:
+        n = t.numel()
+        t.copy_(flat[offset:offset + n].view_as(t))
+        offset += n
+
+
+def _send_batch(dist, device, values, masks, groups):
+    values_t = torch.as_tensor(values, device=device, dtype=torch.float64)
+    dist.broadcast(values_t, src=0)
     dist.broadcast(torch.as_tensor(np.ascontiguousarray(masks), device=device), src=0)
     if groups is not None:
         dist.broadcast(torch.as_tensor(groups, device=device, dtype=torch.int64), src=0)
+    return values_t
 
 
 def micro_batch_pass(model, params, values, masks, groups, splits, mine, cop_gen, device, *,
-                     step: int, tokens: int, gang: Gang | None):
+                     step: int, tokens: int, gang: Gang | None, values_t=None):
     """The step's micro-batch work on this rank, summed across the gang.
 
     Leaves the summed copula gradient in ``p.grad`` and returns ``(reference,
     loss_m, loss_j, load)``: the summed marginal gradient, both batch-weighted
     losses and the summed routing loads. With ``gang=None`` and every split
-    owned this is the one-GPU step, operation for operation."""
+    owned this is the one-GPU step, operation for operation. ``values_t``: the
+    float64 device copy of ``values`` already made for the gang broadcast
+    (:meth:`Gang.send_step`), reused instead of a second host-to-device copy.
+
+    Host syncs: the losses of a micro-batch cross to the host in one read,
+    the gradient-presence flags in one read after their all-reduce; the float
+    all-reduces (calls, sizes, order) are exactly the per-tensor ones."""
     from .pyramid_trainer import losses, prediction
     from .toto2_trainer import check_loss_finite
 
     b, c, length = values.shape
     ps = model.cfg.patch_size
     layers = list(model.moe_layers())
-    values_t = torch.as_tensor(values, device=device, dtype=torch.float64) if gang else None
+    if not gang:
+        values_t = None
+    elif values_t is None:
+        values_t = torch.as_tensor(values, device=device, dtype=torch.float64)
+    elif values_t.dtype != torch.float64 or values_t.device != torch.device(device) \
+            or tuple(values_t.shape) != tuple(values.shape):
+        raise ValueError("values_t must be the float64 device copy of values")
 
     def batch(ids):
         x = (values_t[ids] if values_t is not None
@@ -296,17 +348,18 @@ def micro_batch_pass(model, params, values, masks, groups, splits, mine, cop_gen
             for layer in layers:
                 layer.defer_balance = False
         if gang:
-            gang.sum_(load)
+            sum_int_bucket(gang, load)
         reference = [None] * len(params)
         loss_m = loss_j = 0.0
         bad = False
         # Accumulate BOTH gradients over the complete batch before applying its cap.
         for weight, marginal, joint, pending in kept:
             marginal = marginal + finish_aux(model, pending, load)
+            lm, lj = _host_losses(marginal, joint)
             if gang is None:
-                check_loss_finite(float(marginal.detach()), step=step, tokens=tokens)
-                check_loss_finite(float(joint.detach()), step=step, tokens=tokens)
-            elif not (np.isfinite(float(marginal.detach())) and np.isfinite(float(joint.detach()))):
+                check_loss_finite(lm, step=step, tokens=tokens)
+                check_loss_finite(lj, step=step, tokens=tokens)
+            elif not (np.isfinite(lm) and np.isfinite(lj)):
                 bad = True
                 continue
             gm = torch.autograd.grad(marginal * weight, params, retain_graph=True, allow_unused=True)
@@ -316,8 +369,8 @@ def micro_batch_pass(model, params, values, masks, groups, splits, mine, cop_gen
                     reference[i] = m.detach() if reference[i] is None else reference[i] + m.detach()
                 if j is not None:
                     p.grad = j.detach() if p.grad is None else p.grad + j.detach()
-            loss_m += float(marginal.detach()) * weight
-            loss_j += float(joint.detach()) * weight
+            loss_m += lm * weight
+            loss_j += lj * weight
         del kept
     else:
         load = [torch.zeros(layer.num_experts, device=device, dtype=torch.int64) for layer in layers]
@@ -336,7 +389,7 @@ def micro_batch_pass(model, params, values, masks, groups, splits, mine, cop_gen
                     for total, layer in zip(load, layers, strict=True):
                         total += layer.last_load
             if gang:
-                gang.sum_(load)
+                sum_int_bucket(gang, load)
             for total, layer in zip(load, layers, strict=True):
                 layer.balance_load_override = total.clone()
             for total in load:
@@ -354,10 +407,11 @@ def micro_batch_pass(model, params, values, masks, groups, splits, mine, cop_gen
             x, mask, g = batch(ids)
             marginal, joint = losses(model, x, mask, generator=cop_gen, groups=g)
             marginal = marginal + model.aux_loss
+            lm, lj = _host_losses(marginal, joint)
             if gang is None:
-                check_loss_finite(float(marginal.detach()), step=step, tokens=tokens)
-                check_loss_finite(float(joint.detach()), step=step, tokens=tokens)
-            elif not (np.isfinite(float(marginal.detach())) and np.isfinite(float(joint.detach()))):
+                check_loss_finite(lm, step=step, tokens=tokens)
+                check_loss_finite(lj, step=step, tokens=tokens)
+            elif not (np.isfinite(lm) and np.isfinite(lj)):
                 bad = True
                 continue
             gm = torch.autograd.grad(marginal * weight, params, retain_graph=True, allow_unused=True)
@@ -367,8 +421,8 @@ def micro_batch_pass(model, params, values, masks, groups, splits, mine, cop_gen
                     reference[i] = m.detach() if reference[i] is None else reference[i] + m.detach()
                 if j is not None:
                     p.grad = j.detach() if p.grad is None else p.grad + j.detach()
-            loss_m += float(marginal.detach()) * weight
-            loss_j += float(joint.detach()) * weight
+            loss_m += lm * weight
+            loss_j += lj * weight
             for total, layer in zip(load, layers, strict=True):
                 total += layer.last_load
     if gang is None:
@@ -381,12 +435,15 @@ def micro_batch_pass(model, params, values, masks, groups, splits, mine, cop_gen
     present = torch.tensor([[reference[i] is not None, p.grad is not None]
                             for i, p in enumerate(params)], device=device, dtype=torch.int32)
     gang.dist.all_reduce(present, op=gang.dist.ReduceOp.MAX)
+    # ONE host read of the flags; the loop below then issues its gradient
+    # all-reduces back to back instead of syncing the host before each one.
+    flags = present.tolist()
     for i, p in enumerate(params):
-        if present[i, 0]:
+        if flags[i][0]:
             if reference[i] is None:
                 reference[i] = torch.zeros_like(p)
             gang.dist.all_reduce(reference[i], op=gang.dist.ReduceOp.SUM)
-        if present[i, 1]:
+        if flags[i][1]:
             if p.grad is None:
                 p.grad = torch.zeros_like(p)
             gang.dist.all_reduce(p.grad, op=gang.dist.ReduceOp.SUM)
@@ -394,8 +451,18 @@ def micro_batch_pass(model, params, values, masks, groups, splits, mine, cop_gen
     if getattr(model, "fast_training", False):
         gang.sum_([losses_t])       # the loads were summed before the backwards
     else:
-        gang.sum_([losses_t, *load])
-    return reference, float(losses_t[0]), float(losses_t[1]), load
+        gang.sum_([losses_t])
+        sum_int_bucket(gang, load)
+    loss_m, loss_j = losses_t.tolist()
+    return reference, loss_m, loss_j, load
+
+
+def _host_losses(marginal, joint) -> tuple[float, float]:
+    """``(float(marginal), float(joint))`` in ONE device-to-host read. Widening
+    to float64 is exact, so these are the very values two ``float()`` calls
+    return; nothing here enters the autograd graph."""
+    m, j = torch.stack([marginal.detach().double(), joint.detach().double()]).tolist()
+    return m, j
 
 
 def _follower(rank, world, port, cfg_dict, deterministic, seed, errors) -> None:
@@ -480,8 +547,7 @@ def _follower(rank, world, port, cfg_dict, deterministic, seed, errors) -> None:
             del reference
             for p in params:
                 p.grad = None
-            for t, src in zip(model.state_dict().values(), sources, strict=True):
-                dist.broadcast(t, src=src)
+            broadcast_from_sources(dist, list(model.state_dict().values()), sources, device)
     except BaseException as e:  # noqa: BLE001 — rank 0 re-raises it by type
         with contextlib.suppress(Exception):
             errors.put((type(e).__name__, str(e)[:500]))
