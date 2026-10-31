@@ -8,6 +8,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -286,6 +287,62 @@ class MoEFFN(nn.Module):
         weight = self.w_in if kind == "w_in" else self.w_out
         return x @ weight[expert].to(x.dtype)
 
+    def _binned_experts(self, x, tok, starts, counts):
+        """Every routed assignment through its expert, in expert-sorted order.
+
+        Experts are ranked by load and cut into bins whose members carry at
+        least half the bin's largest load; each bin is one padded ``bmm``. A
+        bin therefore pads under 2x its real rows (a collapsed router included),
+        and a step issues one matmul pair per bin, not per expert. Each row's
+        result depends only on its expert's weights — rows never mix."""
+        sizes = counts.tolist()                       # the layer's one host sync
+        total = sum(sizes)
+        if not total:
+            return x.new_zeros(0, x.shape[1])
+        ranked = sorted((e for e, n in enumerate(sizes) if n), key=lambda e: (-sizes[e], e))
+        bins, current = [], []
+        for e in ranked:
+            if current and 2 * sizes[e] < sizes[current[0]]:
+                bins.append(current)
+                current = []
+            current.append(e)
+        bins.append(current)
+        # Host-side layout, one upload per layer (no per-bin mask sync):
+        # slot = row of the bin's flattened (members x cap) buffer, src = its
+        # assignment's index in expert-sorted order.
+        n_of = np.asarray(sizes, dtype=np.int64)
+        first = np.cumsum(n_of) - n_of
+        slot, src, ids, shape = [], [], [], []
+        for members in bins:
+            m = np.asarray(members, dtype=np.int64)
+            n = n_of[m]
+            cap = int(n[0])
+            within = np.arange(int(n.sum())) - np.repeat(np.cumsum(n) - n, n)
+            slot.append(np.repeat(np.arange(len(m)) * cap, n) + within)
+            src.append(np.repeat(first[m], n) + within)
+            ids.append(m)
+            shape.append((len(m), cap, int(n.sum())))
+        index = torch.from_numpy(np.concatenate([*slot, *src, *ids])).to(x.device)
+        slot_t, src_t, ids_t = index[:total], index[total:2 * total], index[2 * total:]
+        # One gather of tokens and of expert weights per layer, then views per
+        # bin: a per-bin weight gather would back-propagate into a fresh
+        # full-size zero gradient for every bin (split backward is one cat).
+        x_bins = x[tok[src_t]].split([n for _, _, n in shape])
+        w_in = self.w_in.index_select(0, ids_t).split([k for k, _, _ in shape])
+        w_out = self.w_out.index_select(0, ids_t).split([k for k, _, _ in shape])
+        parts, at = [], 0
+        for (k, cap, n), xb, wi, wo in zip(shape, x_bins, w_in, w_out, strict=True):
+            rows = slot_t[at:at + n]
+            buf = xb.new_zeros(k * cap, xb.shape[1]).index_put((rows,), xb)
+            hid = F.gelu(self.expert_mm(buf.view(k, cap, -1), wi.to(buf.dtype), "w_in"))
+            out = self.expert_mm(hid, wo.to(buf.dtype), "w_out")
+            parts.append(out.reshape(k * cap, -1)[rows])
+            at += n
+        out = torch.cat(parts)
+        # bins visit assignments in rank order; src_t maps each back to its
+        # expert-sorted position
+        return out.new_zeros(total, out.shape[1]).index_put((src_t,), out)
+
     def forward(self, x: torch.Tensor, seq_len: int) -> torch.Tensor:
         """``x``: ``(N, d)`` tokens laid out as consecutive sequences of
         ``seq_len`` tokens (for the sequence-wise balance loss)."""
@@ -295,30 +352,10 @@ class MoEFFN(nn.Module):
         flat_e = idx.reshape(-1)                                  # (N·K,)
         order = torch.argsort(flat_e, stable=True)
         counts = torch.bincount(flat_e, minlength=E)              # (E,)
-        cap = int(counts.max().item()) if N else 0
         # position of each sorted assignment inside its expert's slot
         starts = torch.cumsum(counts, 0) - counts
-        sorted_e = flat_e[order]
-        pos = torch.arange(order.numel(), device=x.device) - starts[sorted_e]
         tok = order // K
-        if cap * E > 2 * flat_e.numel():
-            # A collapsed router must not allocate E copies of its busiest
-            # expert's tokens. Each sorted assignment is still processed once.
-            parts = []
-            start = 0
-            for expert, count in enumerate(counts.tolist()):
-                if count:
-                    inputs = x[tok[start:start + count]]
-                    hidden = F.gelu(self.expert_single(inputs, expert, "w_in"))
-                    parts.append(self.expert_single(hidden, expert, "w_out"))
-                    start += count
-            y_sorted = torch.cat(parts, 0)
-        else:
-            buf = x.new_zeros(E, max(cap, 1), d)
-            buf[sorted_e, pos] = x[tok]
-            hid = F.gelu(self.expert_mm(buf, self.w_in.to(buf.dtype), "w_in"))
-            out = self.expert_mm(hid, self.w_out.to(buf.dtype), "w_out")
-            y_sorted = out[sorted_e, pos]
+        y_sorted = self._binned_experts(x, tok, starts, counts)
         inv = torch.empty_like(order)
         inv[order] = torch.arange(order.numel(), device=x.device)
         y = y_sorted[inv].view(N, K, d)
