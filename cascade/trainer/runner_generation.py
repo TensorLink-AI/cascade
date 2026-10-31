@@ -25,6 +25,48 @@ def leg_corpus(runner, gen, seeds, contract, *, era_index: int | None = None) ->
     return {"corpus_files": runner._leg_corpus(gen, seeds, contract, era_index=era_index)}
 
 
+SHUTDOWN_TEARDOWN_SECONDS = 60.0
+
+
+def install_generation_shutdown(runner, *, signals=None, deadline_s: float =
+                                SHUTDOWN_TEARDOWN_SECONDS) -> list:
+    """On SIGTERM, terminate this process's generation VMs, then die exactly
+    as before (the previous disposition re-raised). A killed trainer used to
+    leave every in-flight cgen VM billing until the next start's reaper
+    (2026-10-31 04:46: five VMs). Teardown runs on a helper thread bounded by
+    ``deadline_s`` so a hung provider API cannot block the stop. An ignored
+    signal stays ignored. Returns the signals hooked (call from the main
+    thread only)."""
+    import os
+    import signal
+
+    hooked = []
+    for sig in (signals if signals is not None else (signal.SIGTERM,)):
+        previous = signal.getsignal(sig)
+        if previous == signal.SIG_IGN:
+            continue
+
+        def handler(signum, frame, _previous=previous):
+            log.warning("signal %d: terminating this process's generation VMs before exit",
+                        signum)
+            worker = threading.Thread(target=runner._shutdown_generation_vms, daemon=True,
+                                      name="generation-shutdown")
+            worker.start()
+            worker.join(deadline_s)
+            if worker.is_alive():
+                log.error("generation shutdown teardown still running after %.0fs — exiting; "
+                          "the reaper stops the rest at the next start", deadline_s)
+            if callable(_previous):
+                _previous(signum, frame)
+                return
+            signal.signal(signum, signal.SIG_DFL if _previous is None else _previous)
+            os.kill(os.getpid(), signum)
+
+        signal.signal(sig, handler)
+        hooked.append(sig)
+    return hooked
+
+
 class _GenerationMixin:
     """Runs :class:`cascade.generation.stage.GenerationStage` for a leg."""
 
@@ -248,6 +290,21 @@ class _GenerationMixin:
             return reap_generation_vms(ledger, providers)
         except Exception as e:  # noqa: BLE001 — a reaper must never sink the loop
             log.warning("generation VM reap failed (retried next pass): %s", e)
+            return []
+
+    def _shutdown_generation_vms(self) -> list[str]:
+        """Terminate the CPU VMs this process's stages own — the process is
+        stopping, so their in-thread teardown will never run. Never raises."""
+        stage = self.__dict__.get("_generation_stage_obj")
+        if stage is None:
+            return []
+        try:
+            from ..generation.stage import terminate_owned_vms
+
+            return terminate_owned_vms(stage.ledger_path, list(stage.providers))
+        except Exception as e:  # noqa: BLE001 — shutdown must not raise
+            log.error("generation shutdown teardown failed (the reaper retries at the next "
+                      "start): %s", e)
             return []
 
     def _generation_ssh_key(self) -> str:

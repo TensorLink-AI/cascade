@@ -275,11 +275,22 @@ class _RollingMixin:
             self.__dict__["_rolling_lane_pool_obj"] = pool
         return pool
 
-    def _king_self_funds(self, era) -> bool:
+    def _operator_funds_genesis_king(self, gen) -> bool:
+        """Owner rule 2026-10-31: the genesis king (its ref listed in
+        ``[generator] king_min_channels_refs``) is ALWAYS trained on the
+        operator's account, never billed to that miner's key. A king that
+        re-commits a new ref is no longer the genesis king: DEC-CA-0055 applies."""
+        refs = getattr(getattr(self.cfg, "generator", None), "king_min_channels_refs", ()) or ()
+        return gen is not None and str(getattr(gen, "ref", "") or "") in set(refs)
+
+    def _king_self_funds(self, era, gen=None) -> bool:
         """DEC-CA-0055 item 6: in a v2 era the king's leg rents on the king's
-        own payer-vault key (funded pods armed and a vault configured)."""
+        own payer-vault key (funded pods armed and a vault configured) —
+        except the genesis king, which the operator always pays for."""
         from ..shared.era import v2_era_active
 
+        if self._operator_funds_genesis_king(gen):
+            return False
         rnd = self.cfg.round
         return bool(v2_era_active(self.cfg, int(era.start_block))
                     and bool(getattr(self.cfg.v2, "king_ladder", False))
@@ -481,7 +492,7 @@ class _RollingMixin:
                     contract_block=self._era_contract_block(era), repo_suffix='-backup',
                     **corpus, **router_kw(self._era_router_slow(era)))
                 self._refuse_diverged_king(entry, contract)
-                if self._king_self_funds(era):
+                if self._king_self_funds(era, gen):
                     from .king_hedge import king_account_status
                     try:
                         status, key_digest = self._with_deadline(
@@ -532,8 +543,9 @@ class _RollingMixin:
         contract = self.cfg.throne_contracts_at(int(era.start_block))[0]
         seeds = self._rolling_seeds(era)
         ws_ref = self._rolling_warm_start_ref(era, contract)
-        funded_by = ""
-        if self._king_self_funds(era):
+        # the genesis king is operator-paid by owner rule: our side, never a slash
+        funded_by = "operator_fault" if self._operator_funds_genesis_king(gen) else ""
+        if self._king_self_funds(era, gen):
             try:
                 entry = self._rolling_train_king_own_key(
                     gen, era, block, end_wall=end_wall, contract=contract, seeds=seeds,

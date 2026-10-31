@@ -18,7 +18,10 @@ complete, matching ``corpus.json``) reuses it instead of renting a VM
 (:meth:`GenerationStage.existing`). Every VM is written to a crash ledger
 (``ledger_path``) before its launch and dropped only after a successful
 terminate; :func:`reap_generation_vms` terminates what a crash or a failed
-terminate left behind.
+terminate left behind; :func:`terminate_owned_vms` stops this process's VMs
+when it is told to exit. An offer whose VM never boots is quarantined
+(:class:`OfferQuarantine`) and a hotkey's rents are capped per window
+(:class:`RentLimiter`), so a requeue loop cannot re-rent a VM every tick.
 
 The VM never holds a storage credential (only per-object upload links) and
 the GPU pod later gets only ``corpus.json`` plus per-shard download links
@@ -259,6 +262,124 @@ def _ttl_kw(provider, chain_cfg, window_seconds: float) -> dict:
     return {"ttl_seconds": ttl} if "ttl_seconds" in params else {}
 
 
+def terminate_owned_vms(ledger_path: Path | str | None,
+                        providers: Sequence[CpuProvider]) -> list[str]:
+    """Terminate every VM a stage in THIS process owns (``_LIVE``) — the
+    shutdown path. The in-thread ``finally`` that normally stops a VM never
+    runs when the process is killed (2026-10-31 04:46: the trainer stopped
+    with five cgen VMs mid-generation and they billed until stopped by hand);
+    its generation cannot finish without this process anyway (the corpus is
+    registered here). A row without an id (launch mid-flight) stays for the
+    reaper. Best-effort, never raises; returns the VM ids stopped."""
+    if ledger_path is None:
+        return []
+    try:
+        rows = _ledger_load(Path(ledger_path))
+    except Exception as e:  # noqa: BLE001 — shutdown must not raise
+        log.error("generation shutdown: VM ledger unreadable (%s) — the reaper retries "
+                  "at the next start", e)
+        return []
+    with _LIVE_GUARD:
+        owned = set(_LIVE)
+    by_name = {p.name: p for p in providers}
+    stopped: list[str] = []
+    for row in rows:
+        name, vm = str(row.get("name", "")), str(row.get("vm_id", "") or "")
+        prov = by_name.get(str(row.get("provider", "")))
+        if name not in owned or not vm or prov is None:
+            continue
+        try:
+            prov.terminate(vm)
+        except Exception as e:  # noqa: BLE001 — the row stays for the reaper
+            log.error("generation shutdown: terminate of %s VM %s (%s) failed: %s — kept on "
+                      "the ledger for the reaper", prov.name, name, vm, e)
+            continue
+        stopped.append(vm)
+        _ledger_drop(Path(ledger_path), name)
+        log.warning("generation shutdown: terminated %s VM %s (%s) — the process is stopping",
+                    prov.name, name, vm)
+    return stopped
+
+
+# ── VM churn guards ─────────────────────────────────────────────────────────
+#
+# 2026-10-31 04:22–04:34: Shadeform's only cpu_32 offer (latitude/dallas-usa-1)
+# returned instances that entered 'error' ~10 s after create. Every requeued
+# leg re-picked that same offer on its next tick (~5 min), so each hotkey got
+# a fresh cgen VM per tick — 25 creates in 12 minutes. A boot failure now
+# quarantines the OFFER (provider/cloud/region/type) with escalating cooldown,
+# and a per-hotkey rent cap refuses (and alarms on) a hotkey renting more than
+# N VMs inside a window, whatever the cause.
+
+
+def offer_key(provider: CpuProvider | str, shape: object) -> tuple[str, str, str, str]:
+    name = provider if isinstance(provider, str) else str(getattr(provider, "name", ""))
+    return (name, str(getattr(shape, "cloud", "") or ""), str(getattr(shape, "region", "") or ""),
+            str(getattr(shape, "type_id", "") or ""))
+
+
+@dataclass
+class OfferQuarantine:
+    """Offers whose VMs never came up, skipped until their cooldown ends. The
+    cooldown doubles per consecutive strike (capped); a VM of that offer that
+    does come up clears it."""
+
+    cooldown_s: float = 1800.0
+    max_cooldown_s: float = 6 * 3600.0
+    clock: Callable[[], float] = field(default=time.monotonic, repr=False)
+    _until: dict = field(default_factory=dict, init=False, repr=False)
+    _strikes: dict = field(default_factory=dict, init=False, repr=False)
+    _lock: object = field(default_factory=threading.Lock, init=False, repr=False)
+
+    def blocked(self, provider, shape) -> bool:
+        key = offer_key(provider, shape)
+        with self._lock:
+            return self._until.get(key, 0.0) > self.clock()
+
+    def strike(self, provider, shape) -> tuple[int, float]:
+        """Record a boot failure; returns ``(strikes, cooldown_seconds)``."""
+        key = offer_key(provider, shape)
+        with self._lock:
+            n = self._strikes.get(key, 0) + 1
+            self._strikes[key] = n
+            cool = min(self.max_cooldown_s, self.cooldown_s * (2 ** (n - 1)))
+            self._until[key] = self.clock() + cool
+            return n, cool
+
+    def clear(self, provider, shape) -> None:
+        key = offer_key(provider, shape)
+        with self._lock:
+            self._strikes.pop(key, None)
+            self._until.pop(key, None)
+
+
+@dataclass
+class RentLimiter:
+    """At most ``limit`` cgen VM rents per hotkey per sliding ``window_s``."""
+
+    limit: int = 3
+    window_s: float = 3600.0
+    clock: Callable[[], float] = field(default=time.monotonic, repr=False)
+    _rents: dict = field(default_factory=dict, init=False, repr=False)
+    _lock: object = field(default_factory=threading.Lock, init=False, repr=False)
+
+    def recent(self, hotkey: str) -> int:
+        now = self.clock()
+        with self._lock:
+            kept = [t for t in self._rents.get(hotkey, []) if now - t < self.window_s]
+            self._rents[hotkey] = kept
+            return len(kept)
+
+    def record(self, hotkey: str) -> int:
+        """Count one rent; returns the hotkey's rents inside the window."""
+        now = self.clock()
+        with self._lock:
+            kept = [t for t in self._rents.get(hotkey, []) if now - t < self.window_s]
+            kept.append(now)
+            self._rents[hotkey] = kept
+            return len(kept)
+
+
 def _last_json(text: str) -> dict:
     for line in reversed((text or "").strip().splitlines()):
         line = line.strip()
@@ -306,11 +427,52 @@ class GenerationStage:
     # re-probe delay (doubling, capped at five minutes).
     capacity_wait_s: float = 0.0
     capacity_poll_s: float = 60.0
+    # VM churn guards (2026-10-31, see OfferQuarantine / RentLimiter): an
+    # offer whose VM never came up is skipped for this long (doubling per
+    # repeat); a hotkey renting more than ``max_vms_per_hotkey`` VMs inside
+    # ``vm_rent_window_s`` is refused with an alarm (0 ⇒ uncapped).
+    boot_fail_cooldown_s: float = 1800.0
+    max_vms_per_hotkey: int = 3
+    vm_rent_window_s: float = 3600.0
     sleep: Callable[[float], None] = field(default=time.sleep, repr=False)
     clock: Callable[[], float] = field(default=time.monotonic, repr=False)
 
     observer: Callable[[dict], None] | None = field(default=None, repr=False)
     _events: object = field(default_factory=threading.local, init=False, repr=False)
+
+    def offer_quarantine(self) -> OfferQuarantine:
+        q = self.__dict__.get("_offer_quarantine")
+        if q is None:
+            q = self.__dict__.setdefault("_offer_quarantine", OfferQuarantine(
+                cooldown_s=self.boot_fail_cooldown_s, clock=self.clock))
+        return q
+
+    def rent_limiter(self) -> RentLimiter:
+        lim = self.__dict__.get("_rent_limiter")
+        if lim is None:
+            lim = self.__dict__.setdefault("_rent_limiter", RentLimiter(
+                limit=int(self.max_vms_per_hotkey), window_s=self.vm_rent_window_s,
+                clock=self.clock))
+        return lim
+
+    def _check_rent_cap(self, hotkey: str, *, priority: bool) -> None:
+        """Refuse (and alarm) before a hotkey's next VM once it has rented
+        ``max_vms_per_hotkey`` inside the window. The king alarms but is
+        never refused: like max_parallel_jobs, a cap must not fail the era."""
+        lim = self.rent_limiter()
+        if lim.limit <= 0:
+            return
+        n = lim.recent(hotkey)
+        if n < lim.limit:
+            return
+        log.error("generation ALARM: %s already rented %d cgen VM(s) in the last %.0fs "
+                  "(cap %d)%s — check the CPU tier (boot failures, requeue churn)",
+                  hotkey[:12], n, lim.window_s, lim.limit,
+                  "; the king is never refused" if priority else "; refusing another rent")
+        if not priority:
+            raise GenerationInfraError(
+                f"CPU generation rent cap: {n} VM(s) for this hotkey in the last "
+                f"{lim.window_s:.0f}s (cap {lim.limit}) — requeued")
 
     def _emit(self, stage, *, identity=None, **metrics):
         if self.observer is None:
@@ -383,10 +545,10 @@ class GenerationStage:
                 raise GenerationInfraError("CPU generation admission is full — requeued")
             return self._generate_admitted(round_id=round_id, hotkey=hotkey, uid=uid, era=era,
                                            gen_ref=gen_ref, repo_dir=repo_dir, seed=seed,
-                                           min_channels=min_channels)
+                                           min_channels=min_channels, priority=priority)
 
     def _generate_admitted(self, *, round_id, hotkey, uid, era, gen_ref, repo_dir, seed,
-                           min_channels=None):
+                           min_channels=None, priority=False):
         gcfg = self.cfg.generation
         if not gcfg.enabled:
             raise GenerationInfraError("[generation] enabled = false")
@@ -394,6 +556,7 @@ class GenerationStage:
                                min_channels=min_channels)
         if reused is not None:
             return reused
+        self._check_rent_cap(hotkey, priority=priority)
         provider, shape, tier = self._wait_for_offer(gcfg)
         name = _vm_name(hotkey, round_id)
         with _LIVE_GUARD:
@@ -419,7 +582,8 @@ class GenerationStage:
         deadline = self.clock() + float(self.capacity_wait_s)
         delay = max(1.0, float(self.capacity_poll_s))
         while True:
-            pick = select_tiered_offer(self.providers, gcfg)
+            pick = select_tiered_offer(self.providers, gcfg,
+                                       exclude=self.offer_quarantine().blocked)
             if pick is not None:
                 return pick
             left = deadline - self.clock()
@@ -443,6 +607,11 @@ class GenerationStage:
         row = {"provider": provider.name, "vm_id": "", "name": name,
                "created": time.time(), "round_id": str(round_id), "hotkey": hotkey}
         _ledger_put(self.ledger_path, row)             # write-ahead: the intent
+        # Counted before the call: a launch that raises may still have billed.
+        rents = self.rent_limiter().record(hotkey)
+        if rents > 1:
+            log.warning("generation %s: cgen VM rent %d for this hotkey in the last %.0fs",
+                        hotkey[:12], rents, self.rent_limiter().window_s)
         try:
             vm = provider.launch(shape, name=name, ssh_pubkey=self.ssh_pubkey,
                                  image=self.vm_image,
@@ -459,7 +628,16 @@ class GenerationStage:
                      hotkey[:12], round_id, provider.name, shape.type_id, shape.vcpus,
                      shape.price_per_hour, leg.vcpus, leg.window_seconds, vm)
             self._emit("booting_cpu")
-            host = self._ready_host(provider, vm, name)
+            try:
+                host = self._ready_host(provider, vm, name)
+            except GenerationInfraError:
+                strikes, cool = self.offer_quarantine().strike(provider, shape)
+                log.error("generation %s: %s offer %s/%s/%s — VM %s never came up; offer "
+                          "quarantined for %.0fs (strike %d), the next rent skips it",
+                          hotkey[:12], provider.name, shape.cloud or "-", shape.region or "-",
+                          shape.type_id, vm, cool, strikes)
+                raise
+            self.offer_quarantine().clear(provider, shape)
             self._bootstrap(host)
             base = leg_prefix(round_id, hotkey, gcfg.storage_prefix)
             summary = self._run(host, repo_dir, seed=seed, gen_ref=gen_ref,

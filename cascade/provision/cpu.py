@@ -14,7 +14,7 @@ unless ``[generation] enabled`` — the provisioner is the only caller.
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -61,13 +61,19 @@ class CpuProvider(Protocol):
     def terminate(self, vm_id: str) -> None: ...
 
 
+OfferFilter = Callable[["CpuProvider", CpuShape], bool]
+
+
 def select_cpu_offer(
-    providers: Sequence[CpuProvider], cfg: GenerationConfig
+    providers: Sequence[CpuProvider], cfg: GenerationConfig,
+    exclude: OfferFilter | None = None,
 ) -> tuple[CpuProvider, CpuShape] | None:
     """The cheapest offer of the first provider (in the given order) that has
     one with ``cfg.vcpus`` vCPUs under ``cfg.max_price_per_hour``. A provider
     whose probe fails is logged and skipped — one adapter's fault never masks
-    the rest (as :func:`.core.select_provider`). ``None`` ⇒ no capacity."""
+    the rest (as :func:`.core.select_provider`). ``exclude(provider, offer)``
+    True drops an offer (a quarantined one whose VMs never boot). ``None`` ⇒
+    no capacity."""
     for p in providers:
         try:
             offers = p.offers(cfg.vcpus, cfg.max_price_per_hour)
@@ -78,13 +84,20 @@ def select_cpu_offer(
             continue
         log.info("cpu provider %s: %d offer(s) for %d vCPU ≤ $%.2f/h",
                  p.name, len(offers), cfg.vcpus, cfg.max_price_per_hour)
+        if exclude is not None and offers:
+            kept = [o for o in offers if not exclude(p, o)]
+            if len(kept) != len(offers):
+                log.warning("cpu provider %s: skipping %d quarantined offer(s)",
+                            p.name, len(offers) - len(kept))
+            offers = kept
         if offers:
             return p, offers[0]
     return None
 
 
 def select_tiered_offer(
-    providers: Sequence[CpuProvider], cfg: GenerationConfig
+    providers: Sequence[CpuProvider], cfg: GenerationConfig,
+    exclude: OfferFilter | None = None,
 ) -> tuple[CpuProvider, CpuShape, int] | None:
     """:func:`select_cpu_offer` over the tiers in ``cfg.shapes``: every provider
     at the pinned ``vcpus`` first, a fallback size only when NO provider has
@@ -93,7 +106,8 @@ def select_tiered_offer(
     from dataclasses import replace
 
     for v in cfg.shapes:
-        pick = select_cpu_offer(providers, replace(cfg, vcpus=v, fallback_vcpus=()))
+        pick = select_cpu_offer(providers, replace(cfg, vcpus=v, fallback_vcpus=()),
+                                exclude=exclude)
         if pick is not None:
             if v != cfg.vcpus:
                 log.info("cpu tier fallback: no %d-vCPU offer — renting a %d-vCPU tier "
