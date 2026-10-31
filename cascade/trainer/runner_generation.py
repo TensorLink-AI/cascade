@@ -345,14 +345,62 @@ class _GenerationMixin:
         # One build per key even when two threads (lane A, lane-B domains) ask
         # at once: the second waits and takes the first's corpus.
         locks = self.__dict__.setdefault("_leg_corpus_locks", {})
-        with locks.setdefault(key, threading.Lock()):
-            if key not in cache:
-                result = self._build_leg_corpus(gen, seeds, era_index)
-                if len(cache) >= 256:                 # old legs' entries
-                    cache.pop(next(iter(cache)))
-                cache[key] = result
-            result = cache[key]
+        # A pregen build of this key still waiting for a CPU slot sees the leg
+        # here and steps aside (GenerationYield), so the leg builds at its own
+        # priority instead of waiting behind it; a pregen already generating
+        # keeps the lock and the leg takes its corpus.
+        _GenerationMixin._want_leg_corpus(self, key, +1)
+        try:
+            with locks.setdefault(key, threading.Lock()):
+                if key not in cache:
+                    result = self._build_leg_corpus(gen, seeds, era_index)
+                    _GenerationMixin._cache_leg_corpus(cache, key, result)
+                result = cache[key]
+        finally:
+            _GenerationMixin._want_leg_corpus(self, key, -1)
         return self._generation_stage().pod_files(result)
+
+    @staticmethod
+    def _cache_leg_corpus(cache: dict, key, result) -> None:
+        if len(cache) >= 256:                         # old legs' entries
+            cache.pop(next(iter(cache)))
+        cache[key] = result
+
+    def _want_leg_corpus(self, key, delta: int) -> None:
+        guard = self.__dict__.setdefault("_leg_corpus_wanted_lock", threading.Lock())
+        with guard:
+            wanted = self.__dict__.setdefault("_leg_corpus_wanted", {})
+            n = wanted.get(key, 0) + delta
+            if n > 0:
+                wanted[key] = n
+            else:
+                wanted.pop(key, None)
+
+    def _pregen_leg_corpus(self, gen, seeds, *, cancel=lambda: False) -> str:
+        """Build a challenger's corpus ahead of its leg (``[generation]
+        pregen_enabled``) under the leg's own cache key, so the leg — and any
+        retry within the seed epoch — reuses it. Background priority on the
+        CPU gate. ``"busy"``: a leg (or another build) holds the key;
+        ``"cached"``: already built in this process; ``"built"``. Raises the
+        stage's errors; :class:`GenerationYield` when it stepped aside."""
+        key = (gen.hotkey, str(seeds.base_seed), gen.ref,
+               self.cfg.generator.min_channels, self.cfg.generator.max_channels)
+        cache = self.__dict__.setdefault("_leg_corpus_cache", {})
+        locks = self.__dict__.setdefault("_leg_corpus_locks", {})
+        lock = locks.setdefault(key, threading.Lock())
+        if not lock.acquire(blocking=False):
+            return "busy"
+        try:
+            if key in cache:
+                return "cached"
+            wanted = self.__dict__.setdefault("_leg_corpus_wanted", {})
+            result = self._build_leg_corpus(
+                gen, seeds, None, background=True,
+                cancel=lambda: bool(wanted.get(key)) or bool(cancel()))
+            _GenerationMixin._cache_leg_corpus(cache, key, result)
+            return "built"
+        finally:
+            lock.release()
 
     @staticmethod
     def _leg_round_id(gen, seeds) -> str:
@@ -375,7 +423,8 @@ class _GenerationMixin:
         except Exception:  # noqa: BLE001 — a probe failure only costs admission slack
             return False
 
-    def _build_leg_corpus(self, gen, seeds, era_index: int | None) -> StageResult:
+    def _build_leg_corpus(self, gen, seeds, era_index: int | None, *,
+                          background: bool = False, cancel=None) -> StageResult:
         from ..generation.stage import GenerationInfraError
         from ..shared.hippius import fetch_from_hub
 
@@ -404,6 +453,7 @@ class _GenerationMixin:
                 **({"priority": True,
                     "min_channels": self.cfg.for_king(gen.ref).generator.min_channels}
                    if getattr(self.__dict__.get("_leg_local_obj"), "funded_is_king", False)
-                   else {}))
+                   else {}),
+                **({"background": True, "cancel": cancel} if background else {}))
         finally:
             shutil.rmtree(repo, ignore_errors=True)
