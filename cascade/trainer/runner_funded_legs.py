@@ -331,8 +331,9 @@ class _FundedLegMixin:
                 host = self._stage_vault_zip_on(host, digest)
             harvest = self._funded_harvest()
             report_progress(self, "training")
-            entry = disp.dispatch(
-                host, lane_count=1,
+            disp = _with_leg_watchdog(self, disp, gen, pod, contract)
+            entry = _dispatch_watched(
+                disp, host, lane_count=1,
                 gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
                 role=role, base_seed=seeds.base_seed, block=block,
                 arch_preset=contract.arch_preset, warm_start_ref=warm_start_ref,
@@ -548,6 +549,38 @@ class _FundedLegMixin:
         if not self.cfg.round.one_submission_per_hotkey or not challengers:
             return
         _add_seen_hotkeys(self._submissions_path(), [c.hotkey for c in challengers], block)
+
+
+def _with_leg_watchdog(runner, disp, gen, pod, contract):
+    """``disp`` with the leg's progress watchdog (and periodic teardown-key
+    check) attached — a detached :class:`RemoteDispatcher` only; any other
+    dispatcher (attached form, test doubles) is returned unchanged."""
+    from dataclasses import replace
+
+    from .cost_guards import check_payer_key, leg_watchdog
+    from .remote import RemoteDispatcher
+
+    if not isinstance(disp, RemoteDispatcher) or not disp.detached:
+        return disp
+    payer = str(getattr(pod, "payer_hotkey", "") or "")
+
+    def key_check():
+        check_payer_key(runner, hotkey=gen.hotkey, pod_name=str(pod.instance_id), pod=pod)
+
+    watch = leg_watchdog(runner, gen=gen, pod=pod, contract=contract,
+                         key_check=key_check if payer else None)
+    return disp if watch is None else replace(disp, on_progress=watch)
+
+
+def _dispatch_watched(disp, host, **kw):
+    """``disp.dispatch`` with a watchdog abort turned into an operator fault:
+    the miner's pod and generator were fine, OUR wall estimate was not."""
+    from .remote import LegAborted
+
+    try:
+        return disp.dispatch(host, **kw)
+    except LegAborted as e:
+        raise _OperatorFault(str(e)) from e
 
 
 def _record_generation_failure(runner, gen, e: BaseException) -> None:

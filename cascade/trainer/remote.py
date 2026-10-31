@@ -489,11 +489,54 @@ def build_detached_command(host: RemoteHost, body: str, run_dir: str,
             f"echo {DETACHED_LAUNCH_TOKEN}")
 
 
+# The worker's own progress record (see cascade.trainer.loop: a small JSON
+# file rewritten on every logged step), named through this env var and read
+# back by the detached poll — the orchestrator's only live view of a remote
+# leg's throughput (the step log otherwise reaches S3 only at flush).
+PROGRESS_FILE_ENV = "CASCADE_PROGRESS_FILE"
+PROGRESS_FILE_NAME = "progress.json"
+DETACHED_PROGRESS_MARK = "PROGRESS:"
+_PROGRESS_MAX_BYTES = 2000
+
+
+def detached_progress_path(run_dir: str) -> str:
+    return f"{run_dir}/{PROGRESS_FILE_NAME}"
+
+
+def _progress_prefix(run_dir: str) -> str:
+    """The inline (non-secret) env naming the leg's progress file."""
+    return f"{PROGRESS_FILE_ENV}={shlex.quote(detached_progress_path(run_dir))} "
+
+
 def _detached_poll_command(host: RemoteHost, run_dir: str) -> str:
     rd = shlex.quote(run_dir)
+    pf = shlex.quote(detached_progress_path(run_dir))
+    # A RUNNING worker also prints its progress record (when it writes one)
+    # on the line BEFORE the token — the token stays the last line.
     return (f"cd {shlex.quote(host.workdir)} && if [ -f {rd}/exit_code ]; then "
             f"echo EXIT:$(cat {rd}/exit_code); elif [ -f {rd}/pid ] && "
-            f"kill -0 $(cat {rd}/pid) 2>/dev/null; then echo RUNNING; else echo GONE; fi")
+            f"kill -0 $(cat {rd}/pid) 2>/dev/null; then "
+            f"[ -f {pf} ] && printf '{DETACHED_PROGRESS_MARK}%s\\n' "
+            f"\"$(head -c {_PROGRESS_MAX_BYTES} {pf} | tr -d '\\n')\"; "
+            f"echo RUNNING; else echo GONE; fi")
+
+
+def parse_progress(lines) -> dict | None:
+    """The progress record a RUNNING poll printed, or ``None``."""
+    for ln in lines:
+        if ln.startswith(DETACHED_PROGRESS_MARK):
+            try:
+                rec = json.loads(ln[len(DETACHED_PROGRESS_MARK):])
+            except ValueError:
+                return None
+            return rec if isinstance(rec, dict) else None
+    return None
+
+
+class LegAborted(RemoteDispatchError):
+    """The orchestrator aborted a running detached leg on purpose (the
+    progress watchdog): the worker was killed, nothing about the run is the
+    miner's fault."""
 
 
 def _detached_find_command(host: RemoteHost, tag: str) -> str:
@@ -548,7 +591,8 @@ def run_detached(host: RemoteHost, body: str, stdin_env: str | None, run_dir: st
                  grace_seconds: int = DETACHED_REATTACH_GRACE_SECONDS,
                  runner=None, describe: str = "remote leg",
                  preempt: str = PREEMPT_BENCHMARKS, launch: bool = True,
-                 on_running=None, cancel=None) -> subprocess.CompletedProcess:
+                 on_running=None, cancel=None,
+                 on_progress=None) -> subprocess.CompletedProcess:
     """Run ``body`` detached on ``host`` and return a CompletedProcess-shaped
     result (returncode, stdout, stderr) exactly like the attached ssh would —
     the caller's receipt/rc handling is unchanged.
@@ -558,7 +602,12 @@ def run_detached(host: RemoteHost, body: str, stdin_env: str | None, run_dir: st
     poll are tolerated for ``grace_seconds`` of consecutive unreachability;
     the leg is only declared lost (rc=255) past that. ``timeout`` is the
     overall wall for the leg; on expiry the detached process group is killed
-    best-effort and the leg reported timed out."""
+    best-effort and the leg reported timed out.
+
+    ``on_progress(record | None)`` runs on every poll that finds the worker
+    RUNNING, with the worker's progress record (:func:`parse_progress`); a
+    non-empty string back is an abort: the process group is killed and
+    :class:`LegAborted` raised with that reason."""
     run = runner or run_ssh
     if launch:
         launch_cmd = preempt + build_detached_command(
@@ -619,6 +668,12 @@ def run_detached(host: RemoteHost, body: str, stdin_env: str | None, run_dir: st
         if token == "RUNNING":
             if on_running is not None:
                 on_running()
+            if on_progress is not None:
+                why = on_progress(parse_progress(lines))
+                if why:
+                    with contextlib.suppress(Exception):  # best-effort
+                        run(build_ssh_argv(host, _detached_kill_command(host, run_dir)), 60, "")
+                    raise LegAborted(f"{describe}: {why}", returncode=None)
             continue
         if token == "GONE":
             vanished = True
@@ -1209,6 +1264,10 @@ class RemoteDispatcher:
     continuation_root: str | None = None
     continuation_interval: int = 300
     continuation_max_bytes: int = 17179869184
+    # Detached legs only: ``on_progress(record | None) -> abort reason | None``
+    # on every RUNNING poll (the funded leg's progress watchdog — see
+    # cascade.trainer.cost_guards.ProgressWatchdog).
+    on_progress: object = field(default=None, repr=False)
     _runner: object = field(default=None, repr=False)  # injectable for tests
 
     def dispatch(
@@ -1300,7 +1359,6 @@ class RemoteDispatcher:
                  host.cuda_device, " [detached]" if self.detached else "")
         prior = None
         if self.detached:
-            body = _guarded_worker(_lane_prefix(host, lane_count), argv)
             tag = f"{role}-{hotkey[:12]}-{base_seed}"
             if mirror is not None:
                 tag += '-' + mirror.root.name[:12]
@@ -1312,6 +1370,8 @@ class RemoteDispatcher:
                 log.warning("dispatch role=%s → %s: a run of this leg is already on the "
                             "pod (%s) — attaching, not relaunching", role, host.name, prior)
             run_dir = prior or detached_run_dir(host, tag)
+            body = _guarded_worker(_lane_prefix(host, lane_count) + _progress_prefix(run_dir),
+                                   argv)
             if mirror is not None and prior is None:
                 mirror.restore()
             try:
@@ -1321,7 +1381,8 @@ class RemoteDispatcher:
                 grace_seconds=self.reattach_grace_seconds, runner=self._runner,
                     describe=f"remote {role} on {host.name}", launch=prior is None,
                     **({"on_running": mirror.poll} if mirror else {}),
-                    **({"cancel": cancel} if cancel is not None else {}))
+                    **({"cancel": cancel} if cancel is not None else {}),
+                    **({"on_progress": self.on_progress} if self.on_progress else {}))
             finally:
                 if mirror is not None:
                     mirror.close()
