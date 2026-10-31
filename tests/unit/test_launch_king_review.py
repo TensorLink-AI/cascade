@@ -20,7 +20,7 @@ def king_runner(*, key_failure=True):
                            throne_contracts_at=lambda _: [contract])
     r._rolling_seeds = lambda era: SimpleNamespace(base_seed=123)
     r._rolling_warm_start_ref = lambda *a: None
-    r._king_self_funds = lambda era: True
+    r._king_self_funds = lambda era, gen=None: True
     def own(*a, **kw):
         calls.append("own_key")
         if key_failure:
@@ -77,6 +77,36 @@ def test_operator_failure_does_not_invent_a_key_lapse(monkeypatch):
     r._rolling_train_king_single(SimpleNamespace(hotkey="king", uid=1, ref="ref"),
         SimpleNamespace(start_block=9000, index=1, base_seed=123), 9000, end_wall=10000)
     assert "key_lapse" not in calls and calls[-1] == ("persist", "operator_fault")
+
+
+GENESIS = "vault/direct@sha256:" + "a" * 64
+
+
+def _genesis_runner(monkeypatch):
+    from cascade.trainer import runner_rolling as M
+
+    r, calls = king_runner(key_failure=False)
+    r.cfg.generator = SimpleNamespace(king_min_channels_refs=(GENESIS,))
+    del r._king_self_funds                      # the real gate, not the stub
+    monkeypatch.setattr(M, "leg_corpus", lambda *a, **kw: {})
+    return r, calls
+
+
+def test_genesis_king_is_always_operator_paid_never_on_its_own_key(monkeypatch):
+    r, calls = _genesis_runner(monkeypatch)
+    r._rolling_train_king_single(SimpleNamespace(hotkey="genesis", uid=1, ref=GENESIS),
+        SimpleNamespace(start_block=9000, index=1, base_seed=123), 9000, end_wall=10000)
+    assert "own_key" not in calls and "key_lapse" not in calls
+    assert calls == ["operator_gpu", "operator_dispatch", ("persist", "operator_fault")]
+
+
+def test_a_recommitted_king_ref_is_not_the_genesis_exemption(monkeypatch):
+    r, _ = _genesis_runner(monkeypatch)
+    era = SimpleNamespace(start_block=9000, index=1, base_seed=123)
+    assert r._operator_funds_genesis_king(SimpleNamespace(ref=GENESIS)) is True
+    assert r._operator_funds_genesis_king(SimpleNamespace(ref="bob/gen@sha256:" + "b" * 64)) is False
+    assert r._operator_funds_genesis_king(None) is False
+    assert r._king_self_funds(era, SimpleNamespace(ref=GENESIS)) is False
 
 
 def test_failed_cpu_generation_restores_king_flag(monkeypatch):
