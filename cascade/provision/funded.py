@@ -230,6 +230,17 @@ class FundedRentResult:
     sku: str = ""
 
 
+def _log_key_cannot_stop(hotkey: str, pod_name: str, err: Exception, api_key: str) -> None:
+    """``PAYER KEY CANNOT STOP POD`` (2026-10-31 'Invalid API key'): the one
+    line ops grep to tell a miner their key no longer controls their pod."""
+    msg = str(err)
+    if api_key:
+        msg = msg.replace(api_key, "<redacted>")
+    log.error("PAYER KEY CANNOT STOP POD: hotkey=%s pod=%s — the vaulted key cannot list "
+              "pods on the payer's account (%s); no new rental on this key", hotkey,
+              pod_name, msg[-300:])
+
+
 def rent_funded_pod(
     *,
     round_id: str,
@@ -254,6 +265,7 @@ def rent_funded_pod(
     existing_only: bool = False,
     on_create_started: Callable[[], None] | None = None,
     gpu_health=None,
+    ttl_seconds: float = 0.0,
 ) -> FundedRentResult:
     """Rent ONE pod for ``hotkey``'s challenger leg on ``hotkey``'s own key.
 
@@ -277,7 +289,7 @@ def rent_funded_pod(
             cpu_blocklist=cpu_blocklist, skus=skus, price_caps=price_caps,
             now_iso=now_iso, host_key_scanner=host_key_scanner, on_allocated=on_allocated,
             vault=vault, on_provider_selected=on_provider_selected,
-            gpu_health=gpu_health), rent_funded_pod)
+            gpu_health=gpu_health, ttl_seconds=ttl_seconds), rent_funded_pod)
 
     def _fail(err: Exception | str, *, leaked_pod: str = "") -> FundedRentResult:
         msg = str(err)
@@ -335,7 +347,11 @@ def rent_funded_pod(
             if candidates and live_addr is None:
                 return replace(_fail("existing allocation is not ready; no new rental", leaked_pod=candidates[0]), burn_attempt=False)
         except Exception as e:  # noqa: BLE001 — a listing blip must not block the rent
+            # This listing is also the teardown-key check: it is the first
+            # call of every verified teardown, so a key that cannot list
+            # cannot stop the pod it would rent — nothing is rented.
             log.warning("funded rent for %s: existing allocation cannot be inspected; no new rental", hotkey)
+            _log_key_cannot_stop(hotkey, name + "-0", e, api_key)
             return replace(_fail(e, leaked_pod=name + "-0"), burn_attempt=False)
     if live_addr is not None:
         try:
@@ -383,7 +399,7 @@ def rent_funded_pod(
     spec = LaunchSpec(
         sku=(skus[0] if skus else sku), count=1, image=image, ssh_pubkey=ssh_pubkey,
         name_prefix=name, gpus_per_pod=gpus_per_pod, exclude_ids=exclude_ids,
-        sku_choices=choices,
+        sku_choices=choices, ttl_seconds=float(ttl_seconds or 0.0),
     )
     launched: list[str] = []
     launch_attempted = False

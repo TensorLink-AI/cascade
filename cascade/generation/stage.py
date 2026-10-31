@@ -241,6 +241,24 @@ def reap_generation_vms(ledger_path: Path | str, providers: Sequence[CpuProvider
     return reaped
 
 
+def _ttl_kw(provider, chain_cfg, window_seconds: float) -> dict:
+    """``{"ttl_seconds": …}`` for a provider whose ``launch`` takes one (the
+    provider-side auto-delete — a stopped trainer cannot leave a ``cgen-`` VM
+    billing until its next reap), else ``{}``."""
+    import inspect
+
+    from ..trainer.cost_guards import generation_ttl_seconds
+
+    ttl = generation_ttl_seconds(chain_cfg, float(window_seconds or 0))
+    if ttl <= 0:
+        return {}
+    try:
+        params = inspect.signature(provider.launch).parameters
+    except (TypeError, ValueError):
+        return {}
+    return {"ttl_seconds": ttl} if "ttl_seconds" in params else {}
+
+
 def _last_json(text: str) -> dict:
     for line in reversed((text or "").strip().splitlines()):
         line = line.strip()
@@ -427,7 +445,8 @@ class GenerationStage:
         _ledger_put(self.ledger_path, row)             # write-ahead: the intent
         try:
             vm = provider.launch(shape, name=name, ssh_pubkey=self.ssh_pubkey,
-                                 image=self.vm_image)
+                                 image=self.vm_image,
+                                 **_ttl_kw(provider, self.cfg, leg.window_seconds))
         except Exception as e:  # noqa: BLE001 — a market miss is infra
             # The row stays: a launch that raised may still have created a
             # VM; the reaper resolves it (or logs it for a manual stop).
