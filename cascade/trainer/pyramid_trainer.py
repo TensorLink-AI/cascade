@@ -79,8 +79,15 @@ def losses(model, values, mask, *, generator=None, groups=None):
 
 def combine_gradients(parameters, reference, cap=0.1):
     """Combine the two *global* gradients, then let the caller apply clipping."""
-    norm_m = math.sqrt(sum(float(g.double().square().sum()) for g in reference if g is not None))
-    norm_j = math.sqrt(sum(float(p.grad.double().square().sum()) for p in parameters if p.grad is not None))
+    # Per-tensor float64 squared norms stay on the device and cross to the
+    # host in ONE transfer; the host then sums the same float64 values in the
+    # same order as the per-tensor float() loop it replaces (identical norms,
+    # one sync instead of one per tensor).
+    sq_m = [g.double().square().sum() for g in reference if g is not None]
+    sq_j = [p.grad.double().square().sum() for p in parameters if p.grad is not None]
+    host = torch.stack(sq_m + sq_j).tolist() if sq_m or sq_j else []
+    norm_m = math.sqrt(sum(host[:len(sq_m)]))
+    norm_j = math.sqrt(sum(host[len(sq_m):]))
     if not math.isfinite(norm_m + norm_j):
         raise FloatingPointError("non-finite pyramid gradient")
     weight = min(0.1, cap * norm_m / norm_j) if norm_j > 0 else 0.0
@@ -161,6 +168,12 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
         slices = ExpertSlices(model, expert_selection)
     source = model if slices is None else slices
     params = list(source.parameters())
+    if slices is None:
+        # same operators, faster training kernels; pyramid_model.py (the
+        # LOCKED architecture source) is untouched
+        from .pyramid_fast import accelerate
+
+        accelerate(model)
     names = {id(p): n for n, p in source.named_parameters()}
     optimizer = build_optimizer(source, cfg.d_model)
     if optimizer.adamw:
@@ -178,6 +191,9 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
 
     world = gang_size(trainer.device) if slices is None else 1
     gang = Gang(world, cfg, deterministic=trainer.deterministic, seed=training_seed) if world > 1 else None
+    if gang is not None:
+        gang.shard_optimizer(model, optimizer)
+        gang.scatter_pending = bool(resumed_optimizer)
     if gang is not None:
         cop_gen = torch.Generator(device=gang.device).manual_seed(training_seed % (2**63))
     from .channel_stats import ChannelStatsAccumulator
@@ -212,6 +228,8 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
                     leaf.copy_(restored["leaves"][name])
             slices.sync()
         optimizer.load_state_tensors(restored["optimizer"], names)
+        if gang is not None:
+            gang.scatter_pending = True
         stable = restored["stable"]
         step, tokens, channel_tokens = restored["step"], restored["tokens"], restored["channel_tokens"]
         last_loss, last_joint = restored["last_loss"], restored["last_joint"]
@@ -256,6 +274,8 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
             if step >= steps or tokens >= token_budget or time.time() >= deadline:
                 break
             if step == trunk and stable is None and slices is None:
+                if gang is not None:
+                    gang.gather_muon()
                 stable = trainer._stable_snapshot(model, optimizer)
             factor = schedule_factor(step, steps)
             for group in optimizer.param_groups:
@@ -267,7 +287,8 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
             if gang is not None:
                 if not gang.synced:
                     gang.broadcast_state(model)
-                gang.send_step(values, masks, groups, len(splits), cop_gen)
+                gang.send_step(values, masks, groups, len(splits), cop_gen,
+                               lr=optimizer.param_groups[0]["lr"])
             reference, loss_m, loss_j, load = micro_batch_pass(
                 model, params, values, masks, groups, splits, owned_splits(len(splits), 0, world),
                 cop_gen, gang.device if gang is not None else trainer.device,
@@ -286,7 +307,7 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
                 for layer, total in zip(model.moe_layers(), load, strict=True):
                     layer.update_bias(total, rate_scale=bias_scale)
             if gang is not None:
-                gang.broadcast_state(model)
+                gang.sync_after_step(model)
             tokens += batch_points(values, contract.budget_denomination)
             channel_tokens += values.size
             step += 1
@@ -296,6 +317,8 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
                         "copula_es": loss_j, "energy_weight": energy_weight, "lr": optimizer.param_groups[0]["lr"]})
             if continuation and continuation.due():
                 checkpoint_start = time.time()
+                if gang is not None:
+                    gang.gather_muon()
                 continuation.save({"runtime": training_runtime(model), "step": step, "tokens": tokens,
                     "channel_tokens": channel_tokens, "model": model.state_dict(),
                     "leaves": dict(slices.named_parameters()) if slices else {},
@@ -310,6 +333,8 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
             if step >= steps or tokens >= token_budget or time.time() >= deadline:
                 break
         clean = True
+        if gang is not None and gang.synced:
+            gang.gather_muon()          # the final optimizer-state reads below
     except BaseException as e:
         if gang is not None and not isinstance(e, (ValueError, FloatingPointError)):
             gang.stop(clean=False)
