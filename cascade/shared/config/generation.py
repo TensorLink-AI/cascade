@@ -10,7 +10,7 @@ the testnet template leaves it off.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 GENERATION_PROVIDERS = ("targon", "shadeform")
 KING_CORPUS_PUBLISH = ("full", "recipe")
@@ -72,6 +72,18 @@ class GenerationConfig:
     # (generator ref + seed + digest) plus ``sample_shards`` shards.
     king_publish: str = "recipe"
     sample_shards: int = 4
+    # Pre-generation: build every funded, revealed entry's corpus as soon as
+    # it is queued, before (and regardless of) GPU admission, so the CPU tier
+    # never idles while entries wait for a GPU. Operator-billed and
+    # opportunistic: a pregen failure never touches the entry. Off by default.
+    pregen_enabled: bool = False
+    # At most this many pregen builds hold CPU slots at once; they only fill
+    # slots no real leg is waiting for (a real leg never queues behind them).
+    pregen_max_parallel: int = 4
+    # Estimated pregen spend cap per seed epoch (base seed), USD: no new
+    # pregen starts once exhausted. Each build is charged at
+    # max_price_per_hour x (max_window_seconds + boot/upload overhead).
+    pregen_max_usd_per_epoch: float = 50.0
 
     @property
     def n_children(self) -> int:
@@ -141,6 +153,9 @@ def parse_generation(raw: dict | None) -> GenerationConfig:
         retention_days=int(g.get("retention_days", 14)),
         king_publish=str(g.get("king_publish", "recipe")),
         sample_shards=int(g.get("sample_shards", 4)),
+        pregen_enabled=g.get("pregen_enabled", False),
+        pregen_max_parallel=g.get("pregen_max_parallel", 4),
+        pregen_max_usd_per_epoch=g.get("pregen_max_usd_per_epoch", 50.0),
     )
     import re
     from urllib.parse import urlsplit
@@ -185,6 +200,16 @@ def parse_generation(raw: dict | None) -> GenerationConfig:
         raise ValueError("[generation] children, retention_days and sample_shards must be >= 0")
     if not cfg.storage_prefix.endswith("/"):
         raise ValueError("[generation] storage_prefix must end with '/'")
+    if not isinstance(cfg.pregen_enabled, bool):
+        raise ValueError("[generation] pregen_enabled must be true or false")
+    if (isinstance(cfg.pregen_max_parallel, bool) or not isinstance(cfg.pregen_max_parallel, int)
+            or cfg.pregen_max_parallel <= 0):
+        raise ValueError("[generation] pregen_max_parallel must be a positive integer")
+    budget = cfg.pregen_max_usd_per_epoch
+    if (isinstance(budget, bool) or not isinstance(budget, int | float)
+            or not 0 <= float(budget) < float("inf")):
+        raise ValueError("[generation] pregen_max_usd_per_epoch must be a finite number >= 0")
+    cfg = replace(cfg, pregen_max_usd_per_epoch=float(budget))
     if cfg.enabled and not providers:
         raise ValueError("[generation] enabled needs at least one provider")
     return cfg
