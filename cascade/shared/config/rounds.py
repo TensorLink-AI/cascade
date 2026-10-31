@@ -193,6 +193,34 @@ class RoundConfig:
         ("4xB200", 10174), ("4xB300", 10299), ("4xH100", 13201), ("4xH200", 12483),
         ("8xB200", 6866), ("8xB300", 6866), ("8xH100", 8801), ("8xH200", 8333),
         ("H100", 6000), ("L40", 11400), ("L40S", 10200), ("RTX4090", 13500))
+    # ── Miner-cost protections (2026-10-31 incident) ─────────────────────────
+    # The worker image digest (``sha256:<64hex>`` or a full ``…@sha256:`` ref)
+    # the ``funded_sku_wall_seconds`` table was MEASURED on. When set and it
+    # differs from ``funded_pod_image``'s digest, no funded leg (and no JIT
+    # king pod) is rented: the walls are unmeasured for this image, so every
+    # latest-safe-start and cost cap built on them is a guess. The leg is
+    # requeued unburned as an operator fault. "" = gate off (the walls are
+    # trusted as-is — the pre-gate behaviour).
+    funded_sku_wall_measured_image: str = ""
+    # Progress watchdog per funded leg: once a detached leg has trained for
+    # this many seconds (from its first observed step), its steps/s is
+    # projected to completion; a leg projected past ``tolerance`` × the
+    # contract's max_train_seconds, or past ``tolerance`` × the time left to
+    # its target settlement, is aborted early — pod torn down, requeued as an
+    # operator fault (never the miner's attempt). 0 = off. Needs a worker
+    # image that writes CASCADE_PROGRESS_FILE (older images: inert).
+    progress_watchdog_grace_seconds: int = 1200
+    progress_watchdog_tolerance: float = 1.5
+    # Provider-side TTL on every funded / operator-leg / generation-VM rent:
+    # the pod's expected lifetime (leg wall cap + boot + bench) plus this
+    # margin, so a dead trainer cannot leave a pod billing. 0 = no TTL.
+    provider_ttl_margin_seconds: int = 3600
+    # Teardown-key check: before a payer pod is rented, and every this many
+    # seconds while its leg runs, the vaulted key must still list pods on the
+    # payer's account (the call every teardown makes). A key that cannot is
+    # logged "PAYER KEY CANNOT STOP POD"; before the rent it also refuses the
+    # rent. 0 = only the pre-rent check.
+    payer_key_check_seconds: int = 1800
     # Rent the era KING's pod just-in-time on the OPERATOR's account (the
     # trainer ledgers and sweeps it; the provisioner's reaper never matches
     # its name).
