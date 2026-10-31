@@ -321,8 +321,8 @@ class _OperatorPodMixin:
 
             provider = OperatorPool(self) if pod.provider == OperatorPool.name else LiumProvider()
             if terminate_verified(provider, pod.instance_id):
-                self._ledger_remove(pod.instance_id)
                 release_executor_of(self, pod.instance_id)
+                self._ledger_remove(pod.instance_id)       # may hit ENOSPC: pod already gone
             else:
                 log.error("operator pod %s still LIVE after terminate — kept "
                           "on ledger for the next sweep", pod.instance_id)
@@ -489,11 +489,18 @@ class _OperatorPodMixin:
                 _lemon("adopted operator leg pod unusable")
 
         from .cost_guards import measured_wall_refusal, provider_ttl_seconds
+        from .runner_common import disk_guard_refusal
 
         unmeasured = measured_wall_refusal(rnd)
         if unmeasured:
             log.error("operator leg %s: %s", gen.hotkey[:12], unmeasured)
             _skip(unmeasured, OPERATOR_FAULT_CLASS)
+        # Disk guard: a NEW leg pod only (the adopt path returned above); a
+        # king backup (``name_prefix``) is never held back by it.
+        low = disk_guard_refusal(self) if name_prefix is None else ""
+        if low:
+            log.error("operator leg %s: %s", gen.hotkey[:12], low)
+            _skip(low, "no_capacity")
         # A king backup (``name_prefix``) may become the era's king pod, which
         # lives for the era: no TTL there (see the king rent).
         ttl = provider_ttl_seconds(self, kind="leg") if name_prefix is None else 0.0
@@ -581,8 +588,24 @@ class _OperatorPodMixin:
             _record_generation_failure(self, gen, e)
             raise
         host, pod_id = self._rent_operator_leg_host(str(seeds.base_seed), gen)
+        released: list[bool] = []
+
+        def release_pod() -> None:
+            if released:
+                return
+            released.append(True)
+            pods = getattr(self, "_load_funded_ledger", lambda: [])()
+            pod = next((p for p in pods if p.instance_id == pod_id), None)
+            if pod is None:
+                from ..provision.operator_pool import OperatorPool, enabled
+                pooled = hasattr(self, "cfg") and enabled(self)
+                pod = PodInstance(provider=OperatorPool.name if pooled else "lium",
+                                  instance_id=pod_id, stage="funded", rented_at_iso="")
+            self._teardown_operator_pod(pod)
+
         try:
             from .progress import report_progress
+            from .runner_common import r2_transport_on
 
             digest = parse_vault_ref(gen.ref)
             if digest is not None:
@@ -601,7 +624,11 @@ class _OperatorPodMixin:
             )
             if specialist:
                 report_progress(self, "harvesting")
-                return self._harvest_funded_checkpoint(host, receipt, contract, seeds, suffix)
+                # r2 transport: the operator pod goes once the checkpoint is
+                # verified on R2, before the Hippius push.
+                return self._harvest_funded_checkpoint(
+                    host, receipt, contract, seeds, suffix,
+                    **({"release": release_pod} if r2_transport_on(self.cfg) else {}))
             return receipt
         except _FundedTamper as e:
             # The harvest hook's ingest guard: the same verdict as a payer leg.
@@ -629,11 +656,4 @@ class _OperatorPodMixin:
                                         error_class=error_class, burn=False)
             raise
         finally:
-            pods = getattr(self, "_load_funded_ledger", lambda: [])()
-            pod = next((p for p in pods if p.instance_id == pod_id), None)
-            if pod is None:
-                from ..provision.operator_pool import OperatorPool, enabled
-                pooled = hasattr(self, "cfg") and enabled(self)
-                pod = PodInstance(provider=OperatorPool.name if pooled else "lium",
-                                  instance_id=pod_id, stage="funded", rented_at_iso="")
-            self._teardown_operator_pod(pod)
+            release_pod()

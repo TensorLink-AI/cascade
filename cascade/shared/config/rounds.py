@@ -152,6 +152,32 @@ class RoundConfig:
     # are off). Requires a funded_pod_image built from a --local-only-aware
     # release when set to "harvest".
     funded_pod_checkpoint: str = "harvest"
+    # How a "harvest"-mode checkpoint travels pod → Hippius (2026-10-31: four
+    # concurrent ~14 GB tar-over-ssh harvests filled the trainer's disk and
+    # teardown crashed on ENOSPC). "ssh" (default): tar over the pinned ssh
+    # into work_root/_funded_harvest, verify, push, delete. "r2": the pod
+    # streams each file over the same ssh into a presigned multipart upload
+    # on the Cloudflare R2 backup ([storage] backup_s3_endpoint, operator
+    # keys never leave the box — the pod gets one link per part); the box
+    # verifies sizes + the receipt's tensor digests by streaming hash from
+    # R2, tears the pod down, then pushes to Hippius from R2 (relay host or
+    # bounded local temp). The checkpoint never lands under work_root.
+    funded_harvest_transport: str = "ssh"
+    # r2 transport: the operator VM (a ``[[host]]`` entry ``name`` in the
+    # hosts file) that downloads from R2 via presigned GETs, re-verifies and
+    # pushes to Hippius on its own disk. "" = push from a bounded local temp
+    # when free disk allows, else the push is requeued (pending record).
+    ckpt_relay_host: str = ""
+    # Free-disk floor (GB) on work_root: a NEW funded/operator leg pod is not
+    # rented below it (requeued no_capacity, never burned; a re-attached /
+    # adopted pod always keeps going), and the r2 local-temp push needs this
+    # much left after the download. 0 = off.
+    min_free_disk_gb: float = 30.0
+    # r2 transport: bucket ("" = the [storage] backup bucket) and key prefix
+    # (objects are <prefix><base_seed>/<hotkey>/<job_id>/<file>; expire them
+    # with a bucket lifecycle rule — docs/OPERATOR.md).
+    ckpt_r2_bucket: str = ""
+    ckpt_r2_prefix: str = "ckpt/"
     # Shared admission cap for miner-funded A/B/C preparation and training;
     # queued tasks wait FIFO. King work has reserved admission. Also bounds
     # lane-A in-flight entries; 0 ⇒ ``finalist_cap``. Overlay-settable.

@@ -961,6 +961,127 @@ in code:
   startup warning — never run mainnet that way. Plaintext entries still
   hydrate and re-seal on their next insert.
 
+### Checkpoints straight to R2 (`funded_harvest_transport = "r2"`)
+
+The ssh harvest above tars each finished leg's checkpoint (~14 GB with
+`optimizer.safetensors` and `weights_stable.safetensors`) onto the trainer's
+disk under `work_root/_funded_harvest`. On 2026-10-31 several harvests at once
+filled the 154 GB disk, teardown hit ENOSPC and pods kept billing miners for
+hours. The r2 transport keeps checkpoints off the box entirely. It **ships
+dark**: the default is `"ssh"`, which is the old behaviour unchanged.
+
+How it works (`cascade/trainer/r2_transfer.py`):
+
+1. The box plans a multipart upload on the Cloudflare R2 backup endpoint for
+   every top-level checkpoint file the Hippius push would carry. It mints one
+   presigned `upload_part` link per 512 MiB part (2 h expiry), or a single
+   presigned PUT for a one-part file.
+2. The pod uploads over the pinned ssh it already uses:
+   `tail -c +OFF FILE | head -c N | curl -X PUT -T - "$url"`. Four parts run at
+   once and each part is retried. Links go over stdin, never the command line.
+   **No operator credential reaches the pod**: a link lets the pod write one
+   part of one object until it expires, nothing else.
+3. The box checks `list_parts` against the plan: exact part numbers, sizes and
+   the ETags the PUTs returned. Any mismatch aborts the upload. Then it
+   completes the upload and re-checks the object size.
+4. The box streams every object back from R2 and hashes it with sha256,
+   writing nothing to disk. The hashes must match the worker receipt's
+   in-memory `tensor_digests`. A mismatch, or a tensor file the worker never
+   wrote, is `tamper`, the same verdict the ssh harvest gives. The contract
+   guard (`verify_checkpoint`) runs on a sparse skeleton in the system temp
+   dir: small files in full, plus each safetensors header followed by a hole
+   of the real length. That is a few KB on disk.
+5. **The pod is torn down now**, before any Hippius push. When the completion
+   bench keeps the pod, it stays for the bench as before.
+6. The Hippius push from R2:
+   - **Relay host** (`[round] ckpt_relay_host = "<name>"`): an operator-owned
+     VM listed as a `[[host]]` entry in the hosts file. The box sshes in and
+     runs `python -m cascade.trainer.r2_transfer relay`, sending presigned GET
+     links on stdin. The relay downloads into `<workdir>/_r2_relay`,
+     re-checks every sha256, runs `verify_checkpoint` and
+     `verify_weights_finite`, pushes with `upload_dir_to_hub_or_hf`, returns
+     the `repo@sha256:` ref and deletes its copy.
+   - **No relay**: the same steps run on the box in `work_root/_r2_push`, but
+     only when free disk stays at or above `min_free_disk_gb` after the
+     download. Otherwise the push is requeued.
+   - Requeue or failure: `<hotkey>--<job>.pending.json` records the R2 keys,
+     so the requeued leg pushes from R2 without a pod or a retrain. The
+     objects are deleted after a successful push.
+
+Validators see no change: the manifest still carries the Hippius
+`repo@sha256:` ref. A non-finite checkpoint is found at the push, after the
+pod is gone, and settles as the miner's `generator` fault, as before.
+MarketCast fine-tunes still use the ssh harvest.
+
+**Enable** (testnet first, Approve-tier):
+
+```toml
+[storage]
+backup_s3_endpoint = "https://<account>.r2.cloudflarestorage.com"   # required for r2
+
+[round]
+funded_harvest_transport = "r2"
+ckpt_relay_host = "ckpt-relay"   # "" = bounded local push, else requeue
+min_free_disk_gb = 30            # GiB; also the rent-time disk guard; 0 = off
+ckpt_r2_bucket = ""              # "" = [storage] backup_bucket (else manifest bucket)
+ckpt_r2_prefix = "ckpt/"         # objects: <prefix><base_seed>/<hotkey>/<job_id>/<file>
+```
+
+Before you flip it:
+
+- The worker image needs `curl`, `tail` and `head`. These are in
+  `deploy/Dockerfile`. Rebuild the image from this release, then re-pin
+  `funded_pod_image` and `worker_code_fingerprint`.
+- Credentials: `BACKUP_S3_ACCESS_KEY` / `BACKUP_S3_SECRET_KEY` on the box
+  only. The R2 token needs object read/write/delete and multipart on the
+  bucket.
+- Canary one leg per stage on testnet. Watch the log for `r2 harvest from
+  <pod>: N file(s)` and check the pod was gone before `hippius push`.
+
+**Relay host setup.** Use a small operator VM with disk at least the largest
+checkpoint (about 20 GB for the 1.23B preset) plus headroom, and good
+bandwidth to R2 and Hippius. Install the cascade checkout at the released
+commit (`uv sync --frozen`), so its `checkpoint_guard` matches the trainer's.
+Add it to the hosts file:
+
+```toml
+[[host]]
+name = "ckpt-relay"
+host = "203.0.113.7"
+user = "root"
+key_path = "~/.ssh/operator"
+remote_python = "/root/cascade/.venv/bin/python"
+workdir = "/root/cascade"
+stage = "heat"         # accepted, never dispatched to: the relay is not a GPU lane
+forward_env = ["HIPPIUS_HUB_TOKEN"]   # or keep Hub creds in the relay's own env
+```
+
+Keep `stage = "heat"`. With `"any"` or `"final"`, the relay would join the
+operator lane pool and could be seated with a leg. `forward_env` values travel
+to the relay on stdin, and only when the entry is not `isolated`. That is
+allowed because the relay is operator-owned. Never point `ckpt_relay_host` at
+a miner or payer pod. If the provisioner rewrites the hosts file, check that
+the relay entry survives.
+
+**Bucket lifecycle.** Add an R2 lifecycle rule on the `ckpt/` prefix that
+expires objects after 3 days and aborts incomplete multipart uploads after
+1 day. Successful pushes delete their objects. The rule cleans up what is
+left: tamper evidence, aborted uploads, and pending pushes whose era has
+passed (the box ages out pending records after 3 days too).
+
+**Disk guard and ENOSPC-safe teardown** (independent of the transport, so
+they are live at the default): a NEW funded or operator leg pod is not rented
+while `work_root` has less than `min_free_disk_gb` GiB free. The leg is
+requeued as `no_capacity` and never burned. A re-attached or adopted pod,
+and king backups, always keep going. Teardown no longer needs a disk write
+before terminate: a failed lease TTL re-stamp, lease removal or ledger write
+is logged and the pod is still terminated. The startup sweep settles any
+ledger row left behind.
+
+**Rollback**: set `funded_harvest_transport = "ssh"` and restart the trainer
+between legs. Pending R2 records still push from R2 on their retry. In-flight
+legs finish on the transport they started with.
+
 ### Bench at leg completion (miner-billed)
 
 This is the trainer-sourced benchmark path. Validator-sourced v2 A benchmarks
