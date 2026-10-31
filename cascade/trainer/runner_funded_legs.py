@@ -22,6 +22,7 @@ from .progress import progress_binding, report_progress
 from .runner_common import (
     ResolvedGenerator,
     _add_seen_hotkeys,
+    r2_transport_on,
     read_pending_upload,
     release_executor_of,
     router_kw,
@@ -308,6 +309,15 @@ class _FundedLegMixin:
             str(seeds.base_seed), gen,
             **({"gpu_choice": gpu_choice} if gpu_choice is not None else {}))
         keep = False
+        released: list[bool] = []
+
+        def release_pod() -> None:
+            # r2 transport: the checkpoint is verified on R2 — the payer's pod
+            # goes NOW, before the Hippius push (2026-10-31: pods billed for
+            # hours behind a stuck harvest).
+            if not released:
+                released.append(True)
+                self._teardown_funded_pod(pod)
         try:
             # Identity pin, before a single byte of dispatch: the pod that
             # answers to this name must be the one we rented (platform id)
@@ -384,9 +394,12 @@ class _FundedLegMixin:
                 # Pull it over the pinned ssh, ingest-verify the local copy,
                 # and upload it under the OPERATOR's identity — the entry's
                 # pointer is then a checkpoint whose bytes we inspected.
+                early = (r2_transport_on(self.cfg)
+                         and not (bench and self._keep_funded_pod_for_bench()))
                 try:
                     entry = self._harvest_funded_checkpoint(
-                        host, entry, contract, seeds, suffix)
+                        host, entry, contract, seeds, suffix,
+                        **({"release": release_pod} if early else {}))
                 except _OperatorFault:
                     # Upload lost after its retries: bind the kept copy to
                     # this leg's init too, so only the same leg reuses it.
@@ -475,7 +488,7 @@ class _FundedLegMixin:
                     queue.set_operator_billed(gen.hotkey, True)
             raise
         finally:
-            if not keep:
+            if not keep and not released:
                 self._teardown_funded_pod(pod)
 
     def _keep_funded_pod_for_bench(self) -> bool:
@@ -637,4 +650,14 @@ def _reupload_pending(runner, gen, seeds, contract, suffix: str, warm_start_ref)
         runner._record_funded_failure(gen.hotkey, f"operator-side fault: {e}",
                                       miner_fault=False, error_class=OPERATOR_FAULT_CLASS,
                                       burn=False)
+        raise
+    except _FundedTamper as e:
+        # r2 transport: the finite/code check runs at the push, so a retried
+        # push can still reach the verdict the ssh harvest reaches up front.
+        runner._record_funded_failure(gen.hotkey, f"checkpoint: {e}", miner_fault=True,
+                                      error_class="tamper", burn=False)
+        raise
+    except _FundedDiverged as e:
+        runner._record_funded_failure(gen.hotkey, f"{DIVERGED_MARKER}: {e}",
+                                      miner_fault=True, error_class="generator", burn=False)
         raise
