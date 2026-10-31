@@ -72,7 +72,10 @@ class _GenerationMixin:
 
     # Boot + bootstrap of the CPU VM, and the digest pass + upload after the
     # window: the tier's time beyond ``[generation] window_seconds``.
-    GENERATION_OVERHEAD_SECONDS = 2 * 3600.0
+    # Measured 2026-10-31 (17 rc15 legs, 32 vCPU, 5400 s window): rent →
+    # corpus ready median 55 min, max 93 min, so window + 30 min covers the
+    # slowest with margin (was 2 h: a 3.5 h lead for ~1 h of work).
+    GENERATION_OVERHEAD_SECONDS = 1800.0
     # A sold-out CPU market: re-probe this long (inside the overhead above)
     # before the leg requeues as an operator-side infra fault.
     GENERATION_CAPACITY_WAIT_SECONDS = 1800.0
