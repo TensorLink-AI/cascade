@@ -110,6 +110,7 @@ from .validators import (
     budget_denomination_parts,
     funded_host_bench_floor_for,
     funded_sku_wall_for,
+    image_digest,
     validate_accepted_fields,
     validate_anneal_shape,
     validate_batch_denomination,
@@ -126,8 +127,11 @@ from .validators import (
     validate_funded_pods,
     validate_funded_price_cap,
     validate_funded_sku_wall_seconds,
+    validate_measured_image,
+    validate_nonneg_seconds,
     validate_real_corpus_ref,
     validate_sandbox_mode,
+    validate_watchdog_tolerance,
 )
 from .validators import _validate_packed_sources_mode as _validate_packed_sources_mode
 
@@ -190,6 +194,7 @@ __all__ = [
     "funded_host_bench_floor_for",
     "funded_sku_wall_fit",
     "funded_sku_wall_for",
+    "image_digest",
     "lane_b_replay_cover",
     "load_chain_config",
     "parse_chain_config",
@@ -222,6 +227,9 @@ __all__ = [
     "validate_funded_pods",
     "validate_funded_price_cap",
     "validate_funded_sku_wall_seconds",
+    "validate_measured_image",
+    "validate_nonneg_seconds",
+    "validate_watchdog_tolerance",
     "validate_real_corpus_ref",
     "validate_sandbox_mode",
 ]

@@ -60,8 +60,11 @@ from .validators import (
     validate_funded_pods,
     validate_funded_price_cap,
     validate_funded_sku_wall_seconds,
+    validate_measured_image,
+    validate_nonneg_seconds,
     validate_real_corpus_ref,
     validate_sandbox_mode,
+    validate_watchdog_tolerance,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -445,6 +448,20 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
             funded_sku_wall_seconds=(validate_funded_sku_wall_seconds(
                 r["funded_sku_wall_seconds"]) if "funded_sku_wall_seconds" in r
                 else RoundConfig.funded_sku_wall_seconds),
+            funded_sku_wall_measured_image=validate_measured_image(
+                r.get("funded_sku_wall_measured_image", "")),
+            progress_watchdog_grace_seconds=validate_nonneg_seconds(
+                "progress_watchdog_grace_seconds",
+                r.get("progress_watchdog_grace_seconds",
+                      RoundConfig.progress_watchdog_grace_seconds)),
+            progress_watchdog_tolerance=validate_watchdog_tolerance(
+                r.get("progress_watchdog_tolerance", RoundConfig.progress_watchdog_tolerance)),
+            provider_ttl_margin_seconds=validate_nonneg_seconds(
+                "provider_ttl_margin_seconds",
+                r.get("provider_ttl_margin_seconds", RoundConfig.provider_ttl_margin_seconds)),
+            payer_key_check_seconds=validate_nonneg_seconds(
+                "payer_key_check_seconds",
+                r.get("payer_key_check_seconds", RoundConfig.payer_key_check_seconds)),
             funded_king_rent=bool(r.get("funded_king_rent", False)),
             detached_dispatch=bool(r.get("detached_dispatch", True)),
             dispatch_poll_seconds=max(5, int(r.get("dispatch_poll_seconds", 30))),

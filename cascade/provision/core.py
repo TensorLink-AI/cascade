@@ -132,6 +132,28 @@ class LaunchSpec:
     # it landed on through ``sku_of(pod_id)``. ``sku`` stays the nominal /
     # first choice for adapters without the seam.
     sku_choices: tuple[str, ...] = ()
+    # Provider-side auto-terminate, seconds from create (0 = none): Lium
+    # ``lium up --ttl``, Shadeform ``auto_delete.date_threshold``. The
+    # backstop that keeps a pod from billing after the trainer that rented it
+    # died; adapters without the feature ignore it.
+    ttl_seconds: float = 0.0
+
+
+def lium_ttl_arg(ttl_seconds: float) -> str:
+    """``lium up --ttl`` value for ``ttl_seconds`` (whole minutes, rounded
+    UP so the pod never dies before the wall it was sized for); "" = none."""
+    if not ttl_seconds or ttl_seconds <= 0:
+        return ""
+    return f"{max(1, math.ceil(float(ttl_seconds) / 60.0))}m"
+
+
+def shadeform_delete_at(ttl_seconds: float, *, now: float | None = None) -> str:
+    """Shadeform ``auto_delete.date_threshold`` (RFC 3339, UTC) for a pod that
+    must be gone ``ttl_seconds`` from now; "" = none."""
+    if not ttl_seconds or ttl_seconds <= 0:
+        return ""
+    t = (time.time() if now is None else float(now)) + math.ceil(float(ttl_seconds))
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
 
 
 def executor_price_per_hour(executor: dict) -> float | None:
@@ -1289,6 +1311,11 @@ class LiumProvider:
             # injects the ACCOUNT's registered keys; a template NAME passed as
             # --image 400s ("image reference is not valid") — never do that.
             argv += ["--name", name, "--yes"]
+            ttl = lium_ttl_arg(getattr(spec, "ttl_seconds", 0.0))
+            if ttl:
+                # Provider-side backstop: the pod terminates itself even if
+                # nothing here is alive to `lium rm` it.
+                argv += ["--ttl", ttl]
             self.__dict__.setdefault("_unresolved_creates", {})[name] = True
             # Issued is as certain as a fire-and-forget create gets: from here
             # the intent must outlive any failure (``create_requested``).
@@ -1709,6 +1736,9 @@ class ShadeformProvider:
                 if threshold <= 0:
                     raise ProvisionError("shadeform: per-instance spend threshold must be at least $0.01")
                 body["auto_delete"] = {"spend_threshold": str(threshold)}
+            delete_at = shadeform_delete_at(getattr(spec, "ttl_seconds", 0.0))
+            if delete_at:
+                body.setdefault("auto_delete", {})["date_threshold"] = delete_at
             # From here the create may have reached the API (``create_requested``).
             # A 4xx answer is a definite refusal — nothing allocated; a 5xx, a
             # timeout or a 2xx without an id leaves the outcome uncertain.

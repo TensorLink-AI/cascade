@@ -27,6 +27,7 @@ from .core import (
     ShadeformProvider,
     pick_shadeform_cpu_offer,
     shadeform_create_body,
+    shadeform_delete_at,
 )
 
 log = logging.getLogger("cascade.provision.cpu")
@@ -144,7 +145,7 @@ class ShadeformCpuProvider(ShadeformProvider):
         ]
 
     def launch(self, shape: CpuShape, *, name: str, ssh_pubkey: str,  # type: ignore[override]
-               image: str = "") -> str:
+               image: str = "", ttl_seconds: float = 0.0) -> str:
         if not self.ssh_key_id and "@sha256:" not in image:
             # A bare provider image name (e.g. the Targon ``vm_image``) is not
             # a container: refuse before anything is rented.
@@ -156,6 +157,11 @@ class ShadeformCpuProvider(ShadeformProvider):
                  "shade_instance_type": shape.type_id}
         body = shadeform_create_body(spec, offer, name=name,
                                      ssh_key_id=self.ssh_key_id or None)
+        delete_at = shadeform_delete_at(ttl_seconds)
+        if delete_at:
+            # Provider-side backstop: a cgen VM whose trainer died (or was
+            # stopped) deletes itself instead of billing until the next reap.
+            body["auto_delete"] = {"date_threshold": delete_at}
         resp = self._post("/instances/create", body)
         iid = resp.get("id")
         if not iid:
