@@ -8,7 +8,6 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -167,24 +166,6 @@ def _xpos(q, k, inv_freq, zeta, scale_base: float = 512.0):
     return (q * cos + rotate(q) * sin) * scale, (k * cos + rotate(k) * sin) / scale
 
 
-def _causal_conv(h: torch.Tensor, conv: nn.Conv1d, dilation: int) -> torch.Tensor:
-    """``conv`` over ``h (n, C, L)`` with causal left padding, as one matmul.
-
-    The same operator as ``conv(F.pad(h, ((k - 1) * dilation, 0)))`` with the
-    same parameters: the k dilated taps are stacked (im2col) against the
-    flattened ``(O, C*k)`` weight. cuDNN picks a ~10x slower kernel for these
-    dilated shapes whatever its algorithm settings (1xH200, 2026-10-31)."""
-    k, length = conv.kernel_size[0], h.shape[-1]
-    padded = F.pad(h, ((k - 1) * dilation, 0))
-    cols = torch.stack([padded[..., j * dilation:j * dilation + length] for j in range(k)], 2)
-    weight = conv.weight.reshape(conv.weight.shape[0], -1)
-    if torch.is_autocast_enabled():
-        dtype = torch.get_autocast_gpu_dtype() if h.is_cuda else torch.get_autocast_cpu_dtype()
-        weight, cols = weight.to(dtype), cols.to(dtype)
-    out = torch.matmul(weight, cols.flatten(1, 2).to(weight.dtype))
-    return out + conv.bias.to(out.dtype)[:, None] if conv.bias is not None else out
-
-
 class DilatedConvEmbed(nn.Module):
     """Parallel causal dilated convolutions over the point sequence
     ``[values × (1 − mask), mask]``, mean-pooled to one vector per patch.
@@ -209,7 +190,7 @@ class DilatedConvEmbed(nn.Module):
         # x2 carries [values, missing]; conv branch carries [values, observed].
         h = torch.stack([x2[..., :ps], 1 - x2[..., ps:]], dim=1).reshape(n, 2, p * ps)
         for conv, dilation in zip(self.convs, self.dilations, strict=True):
-            h = F.gelu(_causal_conv(h, conv, dilation))
+            h = F.gelu(conv(F.pad(h, ((self.k - 1) * dilation, 0))))
         return self.proj(h.reshape(n, h.shape[1], p, ps).mean(-1).transpose(1, 2))
 
 
@@ -305,62 +286,6 @@ class MoEFFN(nn.Module):
         weight = self.w_in if kind == "w_in" else self.w_out
         return x @ weight[expert].to(x.dtype)
 
-    def _binned_experts(self, x, tok, starts, counts):
-        """Every routed assignment through its expert, in expert-sorted order.
-
-        Experts are ranked by load and cut into bins whose members carry at
-        least half the bin's largest load; each bin is one padded ``bmm``. A
-        bin therefore pads under 2x its real rows (a collapsed router included),
-        and a step issues one matmul pair per bin, not per expert. Each row's
-        result depends only on its expert's weights — rows never mix."""
-        sizes = counts.tolist()                       # the layer's one host sync
-        total = sum(sizes)
-        if not total:
-            return x.new_zeros(0, x.shape[1])
-        ranked = sorted((e for e, n in enumerate(sizes) if n), key=lambda e: (-sizes[e], e))
-        bins, current = [], []
-        for e in ranked:
-            if current and 2 * sizes[e] < sizes[current[0]]:
-                bins.append(current)
-                current = []
-            current.append(e)
-        bins.append(current)
-        # Host-side layout, one upload per layer (no per-bin mask sync):
-        # slot = row of the bin's flattened (members x cap) buffer, src = its
-        # assignment's index in expert-sorted order.
-        n_of = np.asarray(sizes, dtype=np.int64)
-        first = np.cumsum(n_of) - n_of
-        slot, src, ids, shape = [], [], [], []
-        for members in bins:
-            m = np.asarray(members, dtype=np.int64)
-            n = n_of[m]
-            cap = int(n[0])
-            within = np.arange(int(n.sum())) - np.repeat(np.cumsum(n) - n, n)
-            slot.append(np.repeat(np.arange(len(m)) * cap, n) + within)
-            src.append(np.repeat(first[m], n) + within)
-            ids.append(m)
-            shape.append((len(m), cap, int(n.sum())))
-        index = torch.from_numpy(np.concatenate([*slot, *src, *ids])).to(x.device)
-        slot_t, src_t, ids_t = index[:total], index[total:2 * total], index[2 * total:]
-        # One gather of tokens and of expert weights per layer, then views per
-        # bin: a per-bin weight gather would back-propagate into a fresh
-        # full-size zero gradient for every bin (split backward is one cat).
-        x_bins = x[tok[src_t]].split([n for _, _, n in shape])
-        w_in = self.w_in.index_select(0, ids_t).split([k for k, _, _ in shape])
-        w_out = self.w_out.index_select(0, ids_t).split([k for k, _, _ in shape])
-        parts, at = [], 0
-        for (k, cap, n), xb, wi, wo in zip(shape, x_bins, w_in, w_out, strict=True):
-            rows = slot_t[at:at + n]
-            buf = xb.new_zeros(k * cap, xb.shape[1]).index_put((rows,), xb)
-            hid = F.gelu(self.expert_mm(buf.view(k, cap, -1), wi.to(buf.dtype), "w_in"))
-            out = self.expert_mm(hid, wo.to(buf.dtype), "w_out")
-            parts.append(out.reshape(k * cap, -1)[rows])
-            at += n
-        out = torch.cat(parts)
-        # bins visit assignments in rank order; src_t maps each back to its
-        # expert-sorted position
-        return out.new_zeros(total, out.shape[1]).index_put((src_t,), out)
-
     def forward(self, x: torch.Tensor, seq_len: int) -> torch.Tensor:
         """``x``: ``(N, d)`` tokens laid out as consecutive sequences of
         ``seq_len`` tokens (for the sequence-wise balance loss)."""
@@ -370,10 +295,30 @@ class MoEFFN(nn.Module):
         flat_e = idx.reshape(-1)                                  # (N·K,)
         order = torch.argsort(flat_e, stable=True)
         counts = torch.bincount(flat_e, minlength=E)              # (E,)
+        cap = int(counts.max().item()) if N else 0
         # position of each sorted assignment inside its expert's slot
         starts = torch.cumsum(counts, 0) - counts
+        sorted_e = flat_e[order]
+        pos = torch.arange(order.numel(), device=x.device) - starts[sorted_e]
         tok = order // K
-        y_sorted = self._binned_experts(x, tok, starts, counts)
+        if cap * E > 2 * flat_e.numel():
+            # A collapsed router must not allocate E copies of its busiest
+            # expert's tokens. Each sorted assignment is still processed once.
+            parts = []
+            start = 0
+            for expert, count in enumerate(counts.tolist()):
+                if count:
+                    inputs = x[tok[start:start + count]]
+                    hidden = F.gelu(self.expert_single(inputs, expert, "w_in"))
+                    parts.append(self.expert_single(hidden, expert, "w_out"))
+                    start += count
+            y_sorted = torch.cat(parts, 0)
+        else:
+            buf = x.new_zeros(E, max(cap, 1), d)
+            buf[sorted_e, pos] = x[tok]
+            hid = F.gelu(self.expert_mm(buf, self.w_in.to(buf.dtype), "w_in"))
+            out = self.expert_mm(hid, self.w_out.to(buf.dtype), "w_out")
+            y_sorted = out[sorted_e, pos]
         inv = torch.empty_like(order)
         inv[order] = torch.arange(order.numel(), device=x.device)
         y = y_sorted[inv].view(N, K, d)
@@ -382,28 +327,11 @@ class MoEFFN(nn.Module):
 
         self.last_load = counts.detach()
         self.last_topk = idx.detach()
-        if self.training and getattr(self, "defer_balance", False):
-            # The trainer finishes the balance term once the step's GLOBAL
-            # routing counts are known (one forward, no counting pre-pass):
-            # keep its differentiable inputs, same expressions as _aux_loss.
-            self.pending_balance = (
-                (s / s.sum(-1, keepdim=True).clamp_min(1e-20)).mean(0),
-                torch.logsumexp(logits, dim=-1).pow(2).mean())
-            self.last_aux = None
-        elif self.training:
+        if self.training:
             self.last_aux = self._aux_loss(idx, s, logits, seq_len)
         else:
             self.last_aux = None
         return y
-
-    def finish_balance(self, pending, global_load: torch.Tensor) -> torch.Tensor:
-        """``_aux_loss`` from a deferred forward's kept terms and the step's
-        global load — the value that forward computes with
-        ``balance_load_override = global_load``."""
-        p, z = pending
-        f = global_load.float() / global_load.sum().clamp_min(1)
-        bal = self.num_experts * (f * p).sum()
-        return self.cfg.balance_loss_coef * bal + self.cfg.router_z_loss_coef * z
 
     def _aux_loss(self, idx, s, logits, seq_len: int) -> torch.Tensor:
         E = self.num_experts
@@ -515,16 +443,6 @@ class CascadeMoEModel(nn.Module):
 
     def moe_layers(self) -> list[MoEFFN]:
         return [b.ffn for b in self.blocks if b.moe]
-
-    def finish_aux(self, pending, loads) -> torch.Tensor:
-        """The forward's ``aux_loss`` for a deferred-balance forward: its
-        layers' kept terms finished against the step's global ``loads``, summed
-        in block order from a float32 zero exactly as ``forward`` sums them."""
-        layers = self.moe_layers()
-        aux = loads[0].new_zeros((), dtype=torch.float32)
-        for layer, kept, load in zip(layers, pending, loads, strict=True):
-            aux = aux + layer.finish_balance(kept, load)
-        return aux / len(layers)
 
     def forward(self, patches: torch.Tensor, mask: torch.Tensor | None = None,
                 roles: torch.Tensor | None = None, *, with_parameters: bool = False,

@@ -21,11 +21,23 @@ def orthogonalise(gradient):
 class PyramidOptimizer(BatchedNorMuonAdamW):
     """Retain the named, pickle-free optimizer persistence interface."""
 
+    # Data-parallel sharding (pyramid_dp.Gang): ``muon_owner`` maps a muon
+    # param's index to the rank that steps it; every rank holds identical
+    # all-reduced gradients, so each owner's update is exactly the update rank
+    # 0 would compute. None = one process steps everything.
+    muon_owner: list[int] | None = None
+    rank: int = 0
+
     @torch.no_grad()
     def step(self):
-        lr = self.param_groups[0]["lr"]
-        for p in self.muon_params:
-            if p.grad is None:
+        self.step_muon(self.param_groups[0]["lr"])
+        if self.adamw is not None:
+            self.adamw.step()
+
+    @torch.no_grad()
+    def step_muon(self, lr):
+        for i, p in enumerate(self.muon_params):
+            if p.grad is None or (self.muon_owner is not None and self.muon_owner[i] != self.rank):
                 continue
             grad = p.grad.mT if p.ndim == 3 else p.grad
             view = p.mT if p.ndim == 3 else p
@@ -43,8 +55,18 @@ class PyramidOptimizer(BatchedNorMuonAdamW):
             update = update * (norm / (update.norm(dim=(-2, -1), keepdim=True) + 1e-10))
             update = update * max(1, grad.shape[-2] / grad.shape[-1]) ** 0.5
             view.mul_(1 - lr * 2e-8).add_(update, alpha=-lr)
-        if self.adamw is not None:
-            self.adamw.step()
+
+
+def assign_muon_owners(params, world: int) -> list[int]:
+    """Deterministic greedy split of the muon params over ``world`` ranks by
+    element count (largest first, ties by index); the same on every rank."""
+    load = [0] * world
+    owner = [0] * len(params)
+    for i in sorted(range(len(params)), key=lambda i: (-params[i].numel(), i)):
+        r = min(range(world), key=lambda r: (load[r], r))
+        owner[i] = r
+        load[r] += params[i].numel()
+    return owner
 
 
 def build_optimizer(model, width):
