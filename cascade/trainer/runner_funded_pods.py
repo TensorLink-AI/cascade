@@ -10,6 +10,7 @@ import time
 from dataclasses import replace
 from pathlib import Path
 
+from ..funding.queue import OPERATOR_FAULT_CLASS
 from ..shared.manifest import (
     TrainedEntry,
     contract_digest,
@@ -609,6 +610,27 @@ class _FundedPodMixin:
         if gpu_choice is None:
             gpu_choice = _entry_gpu_choice(flagged, gen.ref)
         rnd = self.cfg.round
+        from ..provision.funded import funded_pod_name
+        from .cost_guards import measured_wall_refusal
+
+        # A ledgered allocation of THIS leg (a restart, a retry after a
+        # transport drop) is adopted, not rented: its run is re-attached, so
+        # the rent-time guards below (measured walls, doomed start) must not
+        # strand it — the progress watchdog judges the re-attached run.
+        expected_id = funded_pod_name(str(round_id), gen.hotkey, self.cfg.subnet.netuid) + "-0"
+        try:
+            prior_alloc = any(p.instance_id == expected_id for p in self._load_funded_ledger())
+        except Exception:  # noqa: BLE001 — unreadable ledger: the guards apply
+            prior_alloc = False
+        why = "" if prior_alloc else measured_wall_refusal(rnd)
+        if why:
+            # No measured wall for the pinned image: every latest safe start
+            # and cost cap below is a guess (2026-10-31: 20x off). Nothing is
+            # rented; requeued unburned as OUR fault.
+            log.error("funded leg %s: %s", gen.hotkey[:12], why)
+            self._record_funded_failure(gen.hotkey, why, miner_fault=False,
+                                        error_class=OPERATOR_FAULT_CLASS, burn=False)
+            raise _FundedLegSkip(gen.hotkey)
         vault = self._payer_vault()
         if vault is None:
             self._record_funded_failure(
@@ -769,8 +791,19 @@ class _FundedPodMixin:
                     # Open market: only the types a leg started now still fits.
                     fit, caps = (self._skus_fitting_now(skus) or skus,
                                  self._funded_price_caps())
+                from .cost_guards import doomed_leg_reason, provider_ttl_seconds
                 from .gpu_health import health_for
 
+                doomed = "" if prior_alloc else doomed_leg_reason(self, tuple(fit))
+                if doomed:
+                    # Every type that could be rented now lands the leg after
+                    # the settlement it must make: never start it (the miner
+                    # would pay for a leg that can only be requeued at finish).
+                    log.error("funded leg %s: %s", gen.hotkey[:12], doomed)
+                    self._ledger_remove(expected_id)
+                    self._record_funded_failure(gen.hotkey, doomed, miner_fault=False,
+                                                error_class="no_capacity", burn=False)
+                    raise _FundedLegSkip(gen.hotkey)
                 result = rent_funded_pod(
                     round_id=str(round_id), hotkey=gen.hotkey, api_key=api_key,
                     sku=fit[0], image=rnd.funded_pod_image,
@@ -781,6 +814,7 @@ class _FundedPodMixin:
                     skus=fit, price_caps=caps,
                     on_allocated=on_allocated, vault=vault,
                     on_provider_selected=on_provider_selected, gpu_health=health_for(self),
+                    ttl_seconds=provider_ttl_seconds(self, kind="leg"),
                 )
                 if not result.ok and not result.leaked_pod:
                     for pod_id in allocated:

@@ -176,6 +176,16 @@ class _OperatorPodMixin:
                     with contextlib.suppress(ProvisionError):
                         _fail_king(pod_id, f"adopted king pod unreachable: {e}")
 
+            from .cost_guards import measured_wall_refusal
+
+            unmeasured = measured_wall_refusal(rnd)
+            if unmeasured:
+                # Same gate as every funded rent: no measured wall for the
+                # pinned image ⇒ no JIT king pod either (the write-ahead row
+                # goes — nothing was launched under it).
+                log.error("king rent: %s", unmeasured)
+                self._ledger_remove(f"{name_prefix}-0")
+                raise ProvisionError(unmeasured)
             attempt = 0
             while True:
                 _check_king_cancel(self)
@@ -478,6 +488,15 @@ class _OperatorPodMixin:
             with contextlib.suppress(ProvisionError):
                 _lemon("adopted operator leg pod unusable")
 
+        from .cost_guards import measured_wall_refusal, provider_ttl_seconds
+
+        unmeasured = measured_wall_refusal(rnd)
+        if unmeasured:
+            log.error("operator leg %s: %s", gen.hotkey[:12], unmeasured)
+            _skip(unmeasured, OPERATOR_FAULT_CLASS)
+        # A king backup (``name_prefix``) may become the era's king pod, which
+        # lives for the era: no TTL there (see the king rent).
+        ttl = provider_ttl_seconds(self, kind="leg") if name_prefix is None else 0.0
         bad = 0
         while True:
             _check_king_cancel(self)
@@ -499,7 +518,8 @@ class _OperatorPodMixin:
                     spec = LaunchSpec(sku=fit[0], count=1, image=rnd.funded_pod_image,
                                       ssh_pubkey=ssh_pubkey, name_prefix=prefix,
                                       gpus_per_pod=1, exclude_ids=claimed,
-                                      sku_choices=fit if len(fit) > 1 else ())
+                                      sku_choices=fit if len(fit) > 1 else (),
+                                      ttl_seconds=ttl)
                     pod_id = provider.launch(spec)[0]
                     _ledger(fit[0])
                     sku_fn = getattr(provider, "sku_of", None)
