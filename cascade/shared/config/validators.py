@@ -227,6 +227,48 @@ def funded_sku_wall_for(walls: tuple[tuple[str, int], ...], sku: str,
     return float(default)
 
 
+_IMAGE_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
+
+
+def validate_measured_image(value: object) -> str:
+    """``[round] funded_sku_wall_measured_image``: "" (gate off), a bare
+    ``sha256:<64hex>`` digest, or a full ``…@sha256:<64hex>`` image ref —
+    normalised to the bare digest. Anything else fails the load: a typo here
+    would silently either open the gate or refuse every rent."""
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    digest = text.rsplit("@", 1)[-1]
+    if not _IMAGE_DIGEST_RE.fullmatch(digest):
+        raise ValueError(
+            f"funded_sku_wall_measured_image={value!r} invalid; expected "
+            "sha256:<64hex> or an image ref pinned …@sha256:<64hex>")
+    return digest
+
+
+def image_digest(ref: str) -> str:
+    """The bare ``sha256:<64hex>`` of an image ref (or a bare digest), "" when
+    it carries none."""
+    m = _IMAGE_DIGEST_RE.search(str(ref or "").lower())
+    return m.group(0) if m else ""
+
+
+def validate_nonneg_seconds(name: str, value: object) -> int:
+    """A non-negative whole number of seconds (0 = off)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        raise ValueError(f"{name}={value!r} invalid; must be a non-negative number of "
+                         "seconds (0 = off)")
+    return int(value)
+
+
+def validate_watchdog_tolerance(value: object) -> float:
+    """``[round] progress_watchdog_tolerance``: a factor >= 1.0 (a factor below
+    1 would abort legs projected to finish INSIDE their budget)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 1.0:
+        raise ValueError(f"progress_watchdog_tolerance={value!r} invalid; must be >= 1.0")
+    return float(value)
+
+
 def validate_funded_price_cap(name: str, value: object) -> float:
     """A non-negative USD figure; 0 = off."""
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:

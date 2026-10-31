@@ -867,7 +867,13 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
             lane=str(li.get("lane") or "A"), target=str(li.get("target") or ""),
             recipe=li.get("recipe"),
         )
-        emitters = [s for s in (sink, wandb_sink) if s is not None]
+        # The orchestrator's live view of this run's throughput (its progress
+        # watchdog polls the file through the detached dispatch): set by the
+        # dispatcher on detached legs only, absent everywhere else.
+        from .progress_file import progress_file_sink
+
+        progress_sink = progress_file_sink()
+        emitters = [s for s in (sink, wandb_sink, progress_sink) if s is not None]
         logger = (lambda record: [s.emit(record) for s in emitters]) if emitters else None
 
         # Host telemetry, taken HERE — after the generator is fetched but before

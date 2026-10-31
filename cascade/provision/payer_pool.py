@@ -64,7 +64,17 @@ def rent_from_pool(options, rent_one):
                 adapter = GuardedProvider(adapter, gpu_health)
             # If an account cannot be queried, do not assume its prior create
             # failed and spend on a different account.
-            pods = adapter.list_tagged(name)
+            # This listing is also the teardown-key check (2026-10-31
+            # 'Invalid API key'): every verified teardown starts with it, so
+            # a key that cannot list cannot stop what it would rent.
+            try:
+                pods = adapter.list_tagged(name)
+            except Exception as exc:
+                from .funded import _log_key_cannot_stop
+
+                _log_key_cannot_stop(hotkey, f"{name}-0 ({credential.provider})", exc,
+                                     credential.api_key)
+                raise
             adapters.append((credential, adapter))
             if len(pods) > 1:
                 raise ProvisionError(
