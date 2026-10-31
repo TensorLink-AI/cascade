@@ -1125,6 +1125,25 @@ class RollingScheduler:
         except Exception:  # noqa: BLE001
             return set()
 
+    def _king_own_key_payers(self, *, live_only: bool) -> set[str]:
+        """Era kings whose leg rents on their OWN key (DEC-CA-0055 item 6):
+        that pod is a payer pod named like a challenger's, so neither the
+        king-pod name check nor the in-flight queue (a king has no queue
+        entry) protects it. 2026-10-31 the 30-min sweep terminated the era
+        2611 king's training pod. ``live_only`` — keep only while the era's
+        king leg thread runs (the live reconcile); at startup every current /
+        next era king is kept (the restart re-attaches to it)."""
+        out: set[str] = set()
+        for era in (self.state.current, self.state.next):
+            if era is None or not era.king_hotkey:
+                continue
+            if live_only:
+                t = self._king_threads.get(era.index)
+                if t is None or not t.is_alive():
+                    continue
+            out.add(era.king_hotkey)
+        return out
+
     def _lane_b_live(self) -> set[str]:
         """Hotkeys with a miner-funded lane-B leg running (DEC-CA-0059 item 8):
         their payer pods survive the sweep and they start no lane-A leg."""
@@ -1150,7 +1169,8 @@ class RollingScheduler:
         done = {(f.hotkey, f.ref) for f in self.state.finished}
         dead = self._dead_era_flights(client, flights, done, block)
         self.ops.sweep_pods(keep_round_ids=keep_ids,
-                            keep_payers={e.hotkey for e in flights} - set(dead))
+                            keep_payers=({e.hotkey for e in flights} - set(dead))
+                            | self._king_own_key_payers(live_only=False))
         self._reattach_flights(client, block, queue, flights, done, dead)
 
     def _maybe_reconcile(self, client, block: int, now: float) -> None:
@@ -1190,6 +1210,7 @@ class RollingScheduler:
             # DEC-CA-0056 / DEC-CA-0059: a running lane-C / lane-B leg's payer
             # pod is never swept
             keep |= self._lane_c_live() | self._lane_b_live()
+            keep |= self._king_own_key_payers(live_only=True)
             self.ops.sweep_pods(keep_round_ids=keep_ids, keep_payers=keep)
         except TimeoutError:
             raise

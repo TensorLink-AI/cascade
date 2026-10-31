@@ -105,3 +105,47 @@ def test_stale_abort_does_not_cancel_the_funded_king_leg(tmp_path):
     _arm_wait(r, deadline_offsets=3600, capacity_seq=[0, 0, 2])
     r._leg_local_obj = SimpleNamespace(funded_is_king=True)   # this thread's leg is the king
     assert r._wait_for_funded_capacity("H200", describe="funded leg king") is True
+
+
+# ── the 30-min pod sweep never takes the era king's own-key pod ───────────────
+
+
+def _king_sched(cfg, tmp_path):
+    from .test_rolling import REF, Clock, FakeClient, _armed, _commit, _join, _sched
+
+    armed = _armed(cfg)
+    clock = Clock()
+    sched, ops = _sched(armed, tmp_path, clock)
+    client = FakeClient()
+    b0 = armed.round.rolling_from_block + 5
+    ops.commits += [_commit("ALFA", REF["ALFA"], b0 - 100)]
+    ops.queue().add("ALFA", REF["ALFA"], reveal_block=b0 - 100)
+    sched.tick(client, b0)
+    _join(sched)
+    sched.state.current.king_hotkey = "KINGHK"
+    return sched, ops, client, clock, b0
+
+
+def test_live_king_leg_keeps_its_own_key_pod_through_the_sweep(cfg, tmp_path):
+    sched, ops, client, clock, b0 = _king_sched(cfg, tmp_path)
+    stop = threading.Event()
+    t = threading.Thread(target=stop.wait, daemon=True)
+    t.start()
+    sched._king_threads[sched.state.current.index] = t
+    try:
+        sched._reconciled_at = -1e12
+        sched._maybe_reconcile(client, b0 + 1, clock())
+        assert "KINGHK" in ops.sweeps[-1][1]
+    finally:
+        stop.set()
+        t.join()
+    # leg over: the king's leftover payer pod is swept like any other
+    sched._reconciled_at = -1e12
+    sched._maybe_reconcile(client, b0 + 2, clock())
+    assert "KINGHK" not in ops.sweeps[-1][1]
+
+
+def test_startup_sweep_keeps_the_era_king_payer(cfg, tmp_path):
+    sched, ops, client, clock, b0 = _king_sched(cfg, tmp_path)
+    sched._startup(client, b0 + 1)
+    assert "KINGHK" in ops.sweeps[-1][1]
