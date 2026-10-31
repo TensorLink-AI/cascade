@@ -52,8 +52,17 @@ class SuiteResult:
     max_series: int = 0
 
     @property
+    def n_scope_skipped(self) -> int:
+        """FEV's declared univariate-only scope: multivariate-target tasks are
+        planned, reported (``stage == "scope"``) and never scored. They are
+        outside the suite's scope, not missing coverage."""
+        return sum(1 for k in self.skipped
+                   if self.suite == "fev" and isinstance(k, dict) and k.get("stage") == "scope")
+
+    @property
     def partial(self) -> bool:
-        return bool(self.max_series) or bool(self.n_expected) and self.n_series < self.n_expected
+        expected = self.n_expected - self.n_scope_skipped
+        return bool(self.max_series) or bool(self.n_expected) and self.n_series < expected
 
 
 @dataclass

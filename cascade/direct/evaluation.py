@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import numpy as np
 from safetensors.torch import load
 
+from ..eval.benchmarks import suite_incomplete
 from ..eval.bootstrap import paired_bootstrap_lcb_aggregated
 from ..eval.direct_guard import make_receipt
 from ..shared.direct_moe import canonical, digest
@@ -190,8 +191,9 @@ class PublicSidecar:
             if (
                 suite is None
                 or suite["status"] != "ok"
-                or suite.get("skipped")
-                or suite.get("n_expected", 0) != len(suite.get("rows", []))
+                or not suite.get("n_expected")
+                # rows are the truth here: they stand in for an absent n_series
+                or suite_incomplete({**suite, "n_series": len(suite.get("rows", []))})
                 or report["data_revisions"].get(name) != self.revisions[logical]
             ):
                 raise ValueError(f"incomplete/unpinned public suite: {logical}")
