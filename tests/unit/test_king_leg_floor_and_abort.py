@@ -128,17 +128,12 @@ def _king_sched(cfg, tmp_path):
 
 def test_live_king_leg_keeps_its_own_key_pod_through_the_sweep(cfg, tmp_path):
     sched, ops, client, clock, b0 = _king_sched(cfg, tmp_path)
-    stop = threading.Event()
-    t = threading.Thread(target=stop.wait, daemon=True)
-    t.start()
-    sched._king_threads[sched.state.current.index] = t
-    try:
-        sched._reconciled_at = -1e12
-        sched._maybe_reconcile(client, b0 + 1, clock())
-        assert "KINGHK" in ops.sweeps[-1][1]
-    finally:
-        stop.set()
-        t.join()
+    # a king leg launched by an OLDER era (outlived it across a rollover)
+    sched._king_thread_hotkey[sched.state.current.index - 7] = "KINGHK"
+    sched._reconciled_at = -1e12
+    sched._maybe_reconcile(client, b0 + 1, clock())
+    assert "KINGHK" in ops.sweeps[-1][1]
+    del sched._king_thread_hotkey[sched.state.current.index - 7]
     # leg over: the king's leftover payer pod is swept like any other
     sched._reconciled_at = -1e12
     sched._maybe_reconcile(client, b0 + 2, clock())
@@ -149,3 +144,65 @@ def test_startup_sweep_keeps_the_era_king_payer(cfg, tmp_path):
     sched, ops, client, clock, b0 = _king_sched(cfg, tmp_path)
     sched._startup(client, b0 + 1)
     assert "KINGHK" in ops.sweeps[-1][1]
+
+
+def test_same_hotkey_challenger_is_held_while_the_king_leg_runs(cfg, tmp_path):
+    from .test_rolling import REF, _commit, _join
+
+    sched, ops, client, clock, b0 = _king_sched(cfg, tmp_path)
+    sched._king_thread_hotkey[sched.state.current.index - 7] = "BRAV"   # its king leg runs
+    ops.commits += [_commit("BRAV", REF["BRAV"], b0 - 50)]
+    ops.queue().add("BRAV", REF["BRAV"], reveal_block=b0 - 50)
+    sched.tick(client, b0 + 1)
+    _join(sched)
+    assert ops.queue().get("BRAV").status == "queued"
+    assert "BRAV" not in {c[0] for c in ops.leg_calls}
+
+
+# ── a sibling leg's account sweep never kills the live king pod ───────────────
+
+
+class _Vault:
+    def has(self, hotkey):
+        return True
+
+
+def test_account_sweep_is_skipped_while_a_king_leg_of_that_payer_runs(tmp_path, monkeypatch):
+    import cascade.provision.funded as pf
+    from cascade.trainer.loop import TrainerRunner
+    from cascade.trainer.runner_funded_legs import king_key_leg
+
+    called = []
+    monkeypatch.setattr(pf, "reconcile_funded", lambda *a, **k: called.append(k) or [])
+    r = _runner(tmp_path)
+    r._payer_vault = lambda: _Vault()
+    r._funded_ledger_lock = threading.Lock()
+    r._load_funded_ledger = lambda: []
+    r._save_funded_ledger = lambda rows: None
+    sweep = TrainerRunner._sweep_payer_account.__get__(r)
+    with king_key_leg(r, "KINGHK"):
+        assert sweep("KINGHK", why="sibling leg finished") == []
+        assert called == []                                   # nothing listed / killed
+        r._leg_local_obj = SimpleNamespace(funded_is_king=True)  # the king leg's own teardown
+        sweep("KINGHK", why="king leg finished")
+        assert len(called) == 1
+    r._leg_local_obj = SimpleNamespace(funded_is_king=False)
+    sweep("KINGHK", why="no king leg any more")
+    assert len(called) == 2
+
+
+def test_challengers_yield_while_the_own_key_king_rents(tmp_path):
+    from cascade.trainer.loop import TrainerRunner
+    from cascade.trainer.runner_funded_legs import king_key_renting
+
+    r = _runner(tmp_path)
+    r._funded_king_host = object()           # a stale operator king host: no effect
+    r._king_rent_done = True
+    pending = TrainerRunner._king_pending.__get__(r)
+    assert pending() is False
+    with king_key_renting(r):
+        assert pending() is True
+        r._leg_local_obj = SimpleNamespace(funded_is_king=True)
+        assert pending() is False             # the king never yields to itself
+        r._leg_local_obj = None
+    assert pending() is False

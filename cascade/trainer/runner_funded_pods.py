@@ -532,6 +532,18 @@ class _FundedPodMixin:
         return allowed
 
     def _rent_funded_host(self, round_id: str, gen: ResolvedGenerator, *, gpu_choice=None):
+        """:meth:`_rent_funded_host_unguarded`; an own-key KING rent is
+        registered while it lasts so challengers yield it the marketplace
+        (``_king_pending``), as they do the operator king's rent."""
+        if not getattr(self.__dict__.get("_leg_local_obj"), "funded_is_king", False):
+            return _FundedPodMixin._rent_funded_host_unguarded(self, round_id, gen, gpu_choice=gpu_choice)
+        from .runner_funded_legs import king_key_renting
+
+        with king_key_renting(self):
+            return _FundedPodMixin._rent_funded_host_unguarded(self, round_id, gen, gpu_choice=gpu_choice)
+
+    def _rent_funded_host_unguarded(self, round_id: str, gen: ResolvedGenerator, *,
+                                    gpu_choice=None):
         """Rent ``gen``'s leg pod on ITS payer's key → ``(RemoteHost, PodInstance)``.
 
         Every failure records a verdict (``_funded_leg_failures``) for the

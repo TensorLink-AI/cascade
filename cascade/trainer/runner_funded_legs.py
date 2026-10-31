@@ -59,6 +59,45 @@ def funded_leg_scope(runner, queue, contract, *, king_leg=False, gen=None):
                 setattr(local, key, value)
 
 
+
+_KING_KEY_LOCK = threading.Lock()
+
+
+def king_key_legs(runner) -> dict:
+    """hotkey -> number of own-key king legs (DEC-CA-0055 item 6) running now,
+    with ``"_renting"`` -> those still renting their pod."""
+    return runner.__dict__.setdefault("_king_key_legs", {})
+
+
+@contextmanager
+def king_key_leg(runner, hotkey: str):
+    """Register a running own-key king leg for the pod-kill guards."""
+    legs = king_key_legs(runner)
+    with _KING_KEY_LOCK:
+        legs[hotkey] = legs.get(hotkey, 0) + 1
+    try:
+        yield
+    finally:
+        with _KING_KEY_LOCK:
+            legs[hotkey] = legs.get(hotkey, 0) - 1
+            if legs[hotkey] <= 0:
+                legs.pop(hotkey, None)
+
+
+@contextmanager
+def king_key_renting(runner):
+    """An own-key king leg is renting: challengers yield the marketplace."""
+    legs = king_key_legs(runner)
+    with _KING_KEY_LOCK:
+        legs["_renting"] = legs.get("_renting", 0) + 1
+    try:
+        yield
+    finally:
+        with _KING_KEY_LOCK:
+            legs["_renting"] = legs.get("_renting", 0) - 1
+            if legs["_renting"] <= 0:
+                legs.pop("_renting", None)
+
 class _FundedLegMixin:
     """One funded leg end to end, its bench-pod retention and the burn set."""
 
@@ -465,7 +504,17 @@ class _FundedLegMixin:
     def _sweep_payer_account(self, hotkey: str, *, why: str) -> list[str]:
         """Terminate every funded pod of THIS payer on their account (their
         vaulted key; names scoped by ``payer_pod_pattern``) and drop their
-        ledger rows. Returns the pod names confirmed gone."""
+        ledger rows. Returns the pod names confirmed gone.
+
+        Never while ANOTHER leg of this hotkey runs an own-key king leg
+        (DEC-CA-0055 item 6): the sweep is name-scoped, not leg-scoped, and
+        would kill that live king pod (2026-10-31 review)."""
+        mine = 1 if getattr(self.__dict__.get("_leg_local_obj"), "funded_is_king", False) else 0
+        if king_key_legs(self).get(hotkey, 0) > mine:
+            log.warning("funded teardown: %s — payer %s has a king leg running on "
+                        "this account; account sweep skipped (its pod is live)",
+                        why, hotkey[:12])
+            return []
         vault = self._payer_vault()
         if vault is None or not vault.has(hotkey):
             log.warning("funded teardown: %s — no vaulted key for payer %s, cannot sweep "

@@ -310,35 +310,38 @@ class _RollingMixin:
         disp = self._dispatcher()
         self._leg_local.end_wall = float(end_wall)
         from ..funding.gpu_choice import GpuChoice
+        from .runner_funded_legs import king_key_leg
 
-        try:
-            # The king leg rides no fund request: the default GPU path, never
-            # a choice made for this hotkey's challenger leg (DEC-CA-0060).
-            entry = self._run_funded_leg(
-                disp, gen, seeds, int(block), contract, self.KING_KEY_SUFFIX,
-                king_leg=True,
-                warm_start_ref=ws_ref, contract_block=self._era_contract_block(era),
-                era_index=era.index, gpu_choice=GpuChoice(),
-                **router_kw(self._era_router_slow(era)))
-        except _FundedOperatorFallback as e:
-            # make-good / capacity hybrid / operator-billed: OUR side — no slash
-            raise _KingKeyFailed(f"funded path handed the leg to the operator ({e})",
-                                 slash=False) from e
-        except _FundedTamper as e:
-            raise _KingKeyFailed(f"tamper on the king's own pod: {e}",
-                                 key_digest=getattr(e, "payer_key_digest", observed_digest)) from e
-        except Exception as e:
-            verdict = self._funded_leg_failures.get(gen.hotkey)
-            if king_key_failed(verdict, e):
-                raise _KingKeyFailed(f"{(verdict or (str(e),))[0]}",
+        # registered for the pod-kill guards (sweep / account sweep / admission)
+        with king_key_leg(self, gen.hotkey):
+            try:
+                # The king leg rides no fund request: the default GPU path, never
+                # a choice made for this hotkey's challenger leg (DEC-CA-0060).
+                entry = self._run_funded_leg(
+                    disp, gen, seeds, int(block), contract, self.KING_KEY_SUFFIX,
+                    king_leg=True,
+                    warm_start_ref=ws_ref, contract_block=self._era_contract_block(era),
+                    era_index=era.index, gpu_choice=GpuChoice(),
+                    **router_kw(self._era_router_slow(era)))
+            except _FundedOperatorFallback as e:
+                # make-good / capacity hybrid / operator-billed: OUR side — no slash
+                raise _KingKeyFailed(f"funded path handed the leg to the operator ({e})",
+                                     slash=False) from e
+            except _FundedTamper as e:
+                raise _KingKeyFailed(f"tamper on the king's own pod: {e}",
                                      key_digest=getattr(e, "payer_key_digest", observed_digest)) from e
-            raise
-        finally:
-            self._leg_local.end_wall = None
-            # never bills the king past its leg: the bench runs on our pod
-            with contextlib.suppress(Exception):
-                self._teardown_kept_funded_pod(gen.hotkey)
-            self._final_role_hosts.pop(("challenger", contract.arch_preset, gen.hotkey), None)
+            except Exception as e:
+                verdict = self._funded_leg_failures.get(gen.hotkey)
+                if king_key_failed(verdict, e):
+                    raise _KingKeyFailed(f"{(verdict or (str(e),))[0]}",
+                                         key_digest=getattr(e, "payer_key_digest", observed_digest)) from e
+                raise
+            finally:
+                self._leg_local.end_wall = None
+                # never bills the king past its leg: the bench runs on our pod
+                with contextlib.suppress(Exception):
+                    self._teardown_kept_funded_pod(gen.hotkey)
+                self._final_role_hosts.pop(("challenger", contract.arch_preset, gen.hotkey), None)
         return entry
 
     def _rolling_king_funding(self, era, gen) -> str:

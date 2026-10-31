@@ -324,6 +324,8 @@ class _FundedCapacityMixin:
         outcome."""
         if getattr(self.__dict__.get("_leg_local_obj"), "funded_is_king", False):
             return False
+        if self.__dict__.get("_king_key_legs", {}).get("_renting", 0) > 0:
+            return True            # the king's own-key rent (DEC-CA-0055 item 6)
         rnd = self.cfg.round
         return bool(
             getattr(rnd, "funded_king_rent", False)

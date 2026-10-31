@@ -861,6 +861,7 @@ class RollingScheduler:
         self._king_threads: dict[int, threading.Thread] = {}  # era index -> king leg thread
         self._king_rebench_at: dict[int, float] = {}  # era index -> last king re-bench try
         self._king_thread_seed: dict[int, int] = {}   # era index -> base seed of its king LEG
+        self._king_thread_hotkey: dict[int, str] = {}  # era index -> hotkey of its running king LEG
         self._init_threads: dict[int, threading.Thread] = {}  # era index -> init bench
         self._init_bench_at: dict[int, float] = {}    # era index -> last init bench try
         self._verify_thread: threading.Thread | None = None   # one operator verification at a time
@@ -1133,15 +1134,12 @@ class RollingScheduler:
         2611 king's training pod. ``live_only`` — keep only while the era's
         king leg thread runs (the live reconcile); at startup every current /
         next era king is kept (the restart re-attaches to it)."""
-        out: set[str] = set()
-        for era in (self.state.current, self.state.next):
-            if era is None or not era.king_hotkey:
-                continue
-            if live_only:
-                t = self._king_threads.get(era.index)
-                if t is None or not t.is_alive():
-                    continue
-            out.add(era.king_hotkey)
+        # Every RUNNING king leg, whatever era launched it (a leg can outlive
+        # its launch era across a same-seed-epoch rollover).
+        out = {hk for hk in list(self._king_thread_hotkey.values()) if hk}
+        if not live_only:
+            out |= {era.king_hotkey for era in (self.state.current, self.state.next)
+                    if era is not None and era.king_hotkey}
         return out
 
     def _lane_b_live(self) -> set[str]:
@@ -1933,10 +1931,12 @@ class RollingScheduler:
             finally:
                 self._king_threads.pop(era.index, None)
                 self._king_thread_seed.pop(era.index, None)
+                self._king_thread_hotkey.pop(era.index, None)
 
         t = threading.Thread(target=_run, name=f"king-era{era.index}", daemon=True)
         self._king_threads[era.index] = t
         self._king_thread_seed[era.index] = int(era.base_seed)
+        self._king_thread_hotkey[era.index] = era.king_hotkey
         t.start()
 
     def _epoch_king_busy(self, era: EraState) -> bool:
@@ -2137,6 +2137,13 @@ class RollingScheduler:
 
             real_runner = getattr(self.ops, "r", None)
             if real_runner is not None and owner_busy(real_runner, entry.hotkey):
+                held.append(entry.hotkey)
+                not_jumps.add(entry.hotkey)
+                continue
+            if entry.hotkey in self._king_own_key_payers(live_only=True):
+                # The king's own-key leg runs on this hotkey's payer account
+                # under the same pod name a challenger leg would use: one leg
+                # per hotkey — the challenger waits for the king leg to end.
                 held.append(entry.hotkey)
                 not_jumps.add(entry.hotkey)
                 continue
