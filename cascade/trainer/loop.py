@@ -900,7 +900,9 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
         with open_round_stream(
             contract.corpus_mode,
             gen_dir, seeds.generation_seed,
-            (self.cfg.for_king(gen.ref) if king else self.cfg).generator_for_contract(contract),
+            # for_king is ref-gated (king_min_channels_refs): applied whatever the
+            # dispatch role, because the funded king leg dispatches as role=challenger.
+            self.cfg.for_king(gen.ref).generator_for_contract(contract),
             token_budget=token_budget,
             use_sandbox=self.use_sandbox,
             blocked=self.cfg.static_guard.blocked,

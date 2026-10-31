@@ -232,6 +232,11 @@ class _FundedCapacityMixin:
         sleep = getattr(self, "_rent_wait_sleep", None) or time.sleep
         now_fn = getattr(self, "_rent_wait_now", None) or time.time
         abort = getattr(self, "_funded_wait_abort", None)
+        if for_king or getattr(self.__dict__.get("_leg_local_obj"), "funded_is_king", False):
+            # The abort releases CHALLENGERS when the king cannot be rented; a
+            # king leg (operator or payer-funded) never cancels on it — a stale
+            # set from an earlier attempt would otherwise requeue the king.
+            abort = None
         if for_king and self._operator_fallback_lanes():
             # The king is REQUIRED and never held back: with operator lanes
             # on file it takes one at once, latest safe start or not — a late
