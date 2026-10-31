@@ -11,12 +11,11 @@
 from __future__ import annotations
 
 import threading
-from types import SimpleNamespace
 from dataclasses import replace
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
-
 
 from .test_funded_rent_wait import _arm_wait, _runner
 
