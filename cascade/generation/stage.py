@@ -351,8 +351,16 @@ class GenerationStage:
             return reused
         gate = self.__dict__.setdefault("_slots", FairSlots(clock=self.clock))
         deadline = self.clock() + self.capacity_wait_s if self.capacity_wait_s > 0 else None
-        with gate.slot(lambda: self.cfg.generation.max_parallel_jobs,
-                       deadline=deadline, priority=priority) as acquired:
+        # The king (``priority``) is never capped by max_parallel_jobs: queueing
+        # first could not preempt running challenger generations, so a full tier
+        # failed the era's king leg (2026-10-30 23:00). It mirrors the GPU side,
+        # where the king has its own reserved admission.
+        from contextlib import nullcontext
+
+        admission = (nullcontext(True) if priority
+                     else gate.slot(lambda: self.cfg.generation.max_parallel_jobs,
+                                    deadline=deadline))
+        with admission as acquired:
             if not acquired:
                 raise GenerationInfraError("CPU generation admission is full — requeued")
             return self._generate_admitted(round_id=round_id, hotkey=hotkey, uid=uid, era=era,

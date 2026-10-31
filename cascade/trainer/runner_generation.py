@@ -297,6 +297,27 @@ class _GenerationMixin:
             result = cache[key]
         return self._generation_stage().pod_files(result)
 
+    @staticmethod
+    def _leg_round_id(gen, seeds) -> str:
+        """The corpus identity's round: the seed epoch's base seed + the ref, so
+        every era of one v2 seed epoch (DEC-CA-0055) resolves the same corpus."""
+        ref_tag = hashlib.sha256(str(gen.ref).encode()).hexdigest()[:12]
+        return f"{seeds.base_seed}-{ref_tag}"
+
+    def _leg_corpus_ready(self, gen, seeds) -> bool:
+        """True when this leg's verified corpus is already stored (an earlier
+        attempt, or an earlier era of the same seed epoch): it needs no CPU
+        generation lead, only its GPU wall. Any read failure ⇒ False (plan
+        for the generation, the conservative case)."""
+        try:
+            king = bool(getattr(self.__dict__.get("_leg_local_obj"), "funded_is_king", False))
+            floor = self.cfg.for_king(gen.ref).generator.min_channels if king else None
+            return self._generation_stage().existing(
+                round_id=_GenerationMixin._leg_round_id(gen, seeds), hotkey=gen.hotkey, gen_ref=gen.ref,
+                seed=int(seeds.generation_seed), min_channels=floor) is not None
+        except Exception:  # noqa: BLE001 — a probe failure only costs admission slack
+            return False
+
     def _build_leg_corpus(self, gen, seeds, era_index: int | None) -> StageResult:
         from ..generation.stage import GenerationInfraError
         from ..shared.hippius import fetch_from_hub
@@ -304,8 +325,7 @@ class _GenerationMixin:
         # The ref is part of every name: a hotkey's second ref in one era gets
         # its own fetch (never the first ref's cached tree), its own dataset
         # prefix and its own VM.
-        ref_tag = hashlib.sha256(str(gen.ref).encode()).hexdigest()[:12]
-        round_id = f"{seeds.base_seed}-{ref_tag}"
+        round_id = _GenerationMixin._leg_round_id(gen, seeds)
         repo = Path(self.work_root) / "_generation" / f"{gen.hotkey[:16]}-{round_id}"
         try:
             fetch_from_hub(gen.ref, repo, self.hub())

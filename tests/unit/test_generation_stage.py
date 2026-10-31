@@ -396,3 +396,23 @@ def test_pinned_tier_leg_sends_the_pinned_shape(tmp_path):
     _go(st, tmp_path)
     gen_cmd = next(c for c in calls if "cascade-generate" in c)
     assert f"--vcpus {g.vcpus} --window-seconds {g.window_seconds}" in gen_cmd
+
+
+def test_king_generation_is_never_capped_by_max_parallel_jobs(tmp_path):
+    """2026-10-30 23:00: six challenger generations held every slot and the
+    era's king leg failed 'CPU generation admission is full'."""
+    prov, store = FakeProvider(), FakeStore()
+    st, idx, calls = _stage(tmp_path, prov, store)
+
+    class _Full:
+        def slot(self, *a, **k):
+            raise AssertionError("the king must not queue on the miner CPU cap")
+
+    st.__dict__["_slots"] = _Full()
+    (tmp_path / "repo").mkdir(exist_ok=True)
+    res = st.generate(round_id="77", hotkey=HK, uid=4, era=9, gen_ref="g@sha256:1",
+                      repo_dir=tmp_path / "repo", seed=123, priority=True)
+    assert res.index["corpus_digest"] == idx["corpus_digest"]
+    with pytest.raises(AssertionError):                 # challengers still queue
+        st.generate(round_id="78", hotkey=HK, uid=4, era=9, gen_ref="g@sha256:2",
+                    repo_dir=tmp_path / "repo", seed=124)

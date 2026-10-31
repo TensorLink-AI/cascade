@@ -88,7 +88,10 @@ class _FundedLegMixin:
                 if not king_leg and end is not None:
                     deadline = float(end) - float(contract.max_train_seconds)
                     deadline -= self.FUNDED_PUBLISH_MARGIN_SECONDS
-                    if getattr(contract, "corpus_mode", "") == "shards":
+                    # A corpus already generated (earlier attempt / era of the
+                    # same seed epoch) needs only its GPU wall, not the CPU lead.
+                    if (getattr(contract, "corpus_mode", "") == "shards"
+                            and not self._leg_corpus_ready(gen, seeds)):
                         deadline -= self._generation_lead_seconds()
 
                 def limit():
@@ -103,8 +106,11 @@ class _FundedLegMixin:
                 report_progress(self, "waiting_admission")
                 with admission as acquired:
                     if not acquired:
+                        late = deadline is not None and time.time() >= deadline
                         self._record_funded_failure(
-                            gen.hotkey, "shared compute admission is full; requeued before rent",
+                            gen.hotkey,
+                            ("past the latest safe start for this boundary; requeued before rent"
+                             if late else "shared compute admission is full; requeued before rent"),
                             miner_fault=False, error_class="no_capacity", burn=False)
                         raise _FundedLegSkip(gen.hotkey)
                     try:
