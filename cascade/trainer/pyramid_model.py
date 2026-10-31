@@ -167,6 +167,24 @@ def _xpos(q, k, inv_freq, zeta, scale_base: float = 512.0):
     return (q * cos + rotate(q) * sin) * scale, (k * cos + rotate(k) * sin) / scale
 
 
+def _causal_conv(h: torch.Tensor, conv: nn.Conv1d, dilation: int) -> torch.Tensor:
+    """``conv`` over ``h (n, C, L)`` with causal left padding, as one matmul.
+
+    The same operator as ``conv(F.pad(h, ((k - 1) * dilation, 0)))`` with the
+    same parameters: the k dilated taps are stacked (im2col) against the
+    flattened ``(O, C*k)`` weight. cuDNN picks a ~10x slower kernel for these
+    dilated shapes whatever its algorithm settings (1xH200, 2026-10-31)."""
+    k, length = conv.kernel_size[0], h.shape[-1]
+    padded = F.pad(h, ((k - 1) * dilation, 0))
+    cols = torch.stack([padded[..., j * dilation:j * dilation + length] for j in range(k)], 2)
+    weight = conv.weight.reshape(conv.weight.shape[0], -1)
+    if torch.is_autocast_enabled():
+        dtype = torch.get_autocast_gpu_dtype() if h.is_cuda else torch.get_autocast_cpu_dtype()
+        weight, cols = weight.to(dtype), cols.to(dtype)
+    out = torch.matmul(weight, cols.flatten(1, 2).to(weight.dtype))
+    return out + conv.bias.to(out.dtype)[:, None] if conv.bias is not None else out
+
+
 class DilatedConvEmbed(nn.Module):
     """Parallel causal dilated convolutions over the point sequence
     ``[values × (1 − mask), mask]``, mean-pooled to one vector per patch.
@@ -191,7 +209,7 @@ class DilatedConvEmbed(nn.Module):
         # x2 carries [values, missing]; conv branch carries [values, observed].
         h = torch.stack([x2[..., :ps], 1 - x2[..., ps:]], dim=1).reshape(n, 2, p * ps)
         for conv, dilation in zip(self.convs, self.dilations, strict=True):
-            h = F.gelu(conv(F.pad(h, ((self.k - 1) * dilation, 0))))
+            h = F.gelu(_causal_conv(h, conv, dilation))
         return self.proj(h.reshape(n, h.shape[1], p, ps).mean(-1).transpose(1, 2))
 
 
