@@ -82,6 +82,25 @@ def select_cpu_offer(
     return None
 
 
+def select_tiered_offer(
+    providers: Sequence[CpuProvider], cfg: GenerationConfig
+) -> tuple[CpuProvider, CpuShape, int] | None:
+    """:func:`select_cpu_offer` over the tiers in ``cfg.shapes``: every provider
+    at the pinned ``vcpus`` first, a fallback size only when NO provider has
+    the larger one. Returns ``(provider, offer, tier_vcpus)`` — the tier, not
+    the offer's own core count, sets the leg's children and window."""
+    from dataclasses import replace
+
+    for v in cfg.shapes:
+        pick = select_cpu_offer(providers, replace(cfg, vcpus=v, fallback_vcpus=()))
+        if pick is not None:
+            if v != cfg.vcpus:
+                log.info("cpu tier fallback: no %d-vCPU offer — renting a %d-vCPU tier "
+                         "(window %ds, same CPU budget)", cfg.vcpus, v, cfg.window_for(v))
+            return pick[0], pick[1], v
+    return None
+
+
 # ── Shadeform as a CPU provider ──────────────────────────────────────────────
 
 

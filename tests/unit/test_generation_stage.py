@@ -358,3 +358,61 @@ def test_vm_known_hosts_is_fresh_per_vm():
     p.write_text("[1.2.3.4]:22 ssh-ed25519 OLD\n")       # a previous VM on a recycled IP
     assert vm_known_hosts("vm/../1").read_text() == ""   # never trusted by the next VM
     assert vm_known_hosts("vm-2") != p
+
+
+class TierProvider(FakeProvider):
+    """Only 16-vCPU capacity on the market (32 is sold out)."""
+
+    def offers(self, vcpus, price):
+        return [CpuShape(vcpus=16, memory_gb=64, price_per_hour=0.47, provider="targon",
+                         type_id="cpu-large-amd")] if vcpus <= 16 else []
+
+
+def test_fallback_tier_leg_runs_its_children_and_equal_budget_window(tmp_path):
+    prov, store = TierProvider(), FakeStore()
+    st, idx, calls = _stage(tmp_path, prov, store)
+    st.cfg = replace(st.cfg, generation=replace(st.cfg.generation, vcpus=32, window_seconds=5400,
+                                                fallback_vcpus=(16,)))
+    timeouts = []
+    inner = st.runner
+
+    def runner(argv, timeout, stdin=None):
+        if "cascade-generate" in argv[-1]:
+            timeouts.append(timeout)
+        return inner(argv, timeout, stdin)
+
+    st.runner = runner
+    _go(st, tmp_path)
+    gen_cmd = next(c for c in calls if "cascade-generate" in c)
+    assert "--vcpus 16 --window-seconds 10800" in gen_cmd
+    assert timeouts == [10800 + int(st.upload_slack_s)]
+    assert prov.terminated == ["vm-1"]
+
+
+def test_pinned_tier_leg_sends_the_pinned_shape(tmp_path):
+    prov, store = FakeProvider(), FakeStore()
+    st, idx, calls = _stage(tmp_path, prov, store)
+    g = st.cfg.generation
+    _go(st, tmp_path)
+    gen_cmd = next(c for c in calls if "cascade-generate" in c)
+    assert f"--vcpus {g.vcpus} --window-seconds {g.window_seconds}" in gen_cmd
+
+
+def test_king_generation_is_never_capped_by_max_parallel_jobs(tmp_path):
+    """2026-10-30 23:00: six challenger generations held every slot and the
+    era's king leg failed 'CPU generation admission is full'."""
+    prov, store = FakeProvider(), FakeStore()
+    st, idx, calls = _stage(tmp_path, prov, store)
+
+    class _Full:
+        def slot(self, *a, **k):
+            raise AssertionError("the king must not queue on the miner CPU cap")
+
+    st.__dict__["_slots"] = _Full()
+    (tmp_path / "repo").mkdir(exist_ok=True)
+    res = st.generate(round_id="77", hotkey=HK, uid=4, era=9, gen_ref="g@sha256:1",
+                      repo_dir=tmp_path / "repo", seed=123, priority=True)
+    assert res.index["corpus_digest"] == idx["corpus_digest"]
+    with pytest.raises(AssertionError):                 # challengers still queue
+        st.generate(round_id="78", hotkey=HK, uid=4, era=9, gen_ref="g@sha256:2",
+                    repo_dir=tmp_path / "repo", seed=124)

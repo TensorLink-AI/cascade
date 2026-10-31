@@ -34,6 +34,11 @@ class GenerationConfig:
     # The pinned machine shape every leg gets: vCPUs (the budget unit; the
     # owner pays) and RAM per sandbox child. ``children`` = 0 ⇒ one per vCPU.
     vcpus: int = 32
+    # Smaller shapes rented ONLY when no ``vcpus`` offer exists (descending,
+    # each < vcpus). A leg on a fallback shape gets the same CPU budget —
+    # ``window_for(v) = vcpus * window_seconds / v`` — so it runs longer, not
+    # with less compute. ``()`` ⇒ the single pinned shape.
+    fallback_vcpus: tuple[int, ...] = ()
     child_memory_mb: int = 2048
     children: int = 0
     # Shared CPU VM limit; additional corpora wait before provisioning.
@@ -76,6 +81,31 @@ class GenerationConfig:
     def cpu_budget_seconds(self) -> int:
         return self.vcpus * self.window_seconds
 
+    @property
+    def shapes(self) -> tuple[int, ...]:
+        """vCPU tiers in rental preference order: the pinned shape, then fallbacks."""
+        return (self.vcpus, *self.fallback_vcpus)
+
+    def window_for(self, vcpus: int) -> int:
+        """The generation window of a leg on a ``vcpus`` shape: equal CPU budget."""
+        return self.cpu_budget_seconds // int(vcpus)
+
+    @property
+    def max_window_seconds(self) -> int:
+        """The longest window any tier can run (the smallest shape's) — what
+        scheduling and the per-child generate cap must allow for."""
+        return self.window_for(min(self.shapes))
+
+    def at_shape(self, vcpus: int) -> GenerationConfig:
+        """This config as a leg rented on a ``vcpus`` tier sees it: that many
+        vCPUs (children follow when ``children`` = 0) and its equal-budget window."""
+        from dataclasses import replace
+
+        if vcpus not in self.shapes:
+            raise ValueError(f"{vcpus} vCPU is not a configured generation tier {self.shapes}")
+        return replace(self, vcpus=int(vcpus), window_seconds=self.window_for(vcpus),
+                       fallback_vcpus=())
+
 
 def parse_generation(raw: dict | None) -> GenerationConfig:
     """Parse ``[generation]``; an absent table is the inert default."""
@@ -95,6 +125,7 @@ def parse_generation(raw: dict | None) -> GenerationConfig:
         secret_key_env=str(g.get("secret_key_env", "CORPUS_S3_SECRET_KEY")),
         providers=providers,
         vcpus=int(g.get("vcpus", 32)),
+        fallback_vcpus=tuple(int(v) for v in g.get("fallback_vcpus", ())),
         child_memory_mb=int(g.get("child_memory_mb", 2048)),
         children=int(g.get("children", 0)),
         max_parallel_jobs=int(g.get("max_parallel_jobs", 2)),
@@ -143,6 +174,13 @@ def parse_generation(raw: dict | None) -> GenerationConfig:
         raise ValueError("[generation] vcpus, child_memory_mb, max_parallel_jobs, "
                          "window_seconds, target_points, "
                          "shard_points and max_length must be positive")
+    fb = cfg.fallback_vcpus
+    if (any(v <= 0 or v >= cfg.vcpus for v in fb) or list(fb) != sorted(set(fb), reverse=True)
+            or any(cfg.cpu_budget_seconds % v for v in fb)):
+        raise ValueError("[generation] fallback_vcpus must be distinct, descending, each "
+                         "below vcpus and dividing the CPU budget (vcpus x window_seconds)")
+    if cfg.children > 0 and fb:
+        raise ValueError("[generation] fallback_vcpus needs children = 0 (one child per vCPU)")
     if cfg.children < 0 or cfg.retention_days < 0 or cfg.sample_shards < 0:
         raise ValueError("[generation] children, retention_days and sample_shards must be >= 0")
     if not cfg.storage_prefix.endswith("/"):

@@ -1019,7 +1019,7 @@ def publish_trainer_v2_status(sched, block: int, *, min_interval_s: float = MIN_
                 ("training", getattr(cfg, "training", None),
                  ("target_train_hours", "ref_throughput_tokens_per_s", "training_steps", "batch_size", "context_length")),
                 ("generation", getattr(cfg, "generation", None),
-                 ("enabled", "window_seconds", "vcpus", "max_parallel_jobs", "target_points", "max_length")),
+                 ("enabled", "window_seconds", "vcpus", "fallback_vcpus", "max_parallel_jobs", "target_points", "max_length")),
                 ("lane_b", getattr(cfg, "lane_b", None),
                  ("min_experts", "max_experts", "max_domains_per_leg", "acceptance_from_block", "merge_guard_from_block")),
                 ("round", getattr(cfg, "round", None), ("funded_field_cap", "finalist_cap")),

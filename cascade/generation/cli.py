@@ -28,6 +28,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--generator-ref", default="", help="repo@digest, recorded in the index")
     p.add_argument("--window-seconds", type=float, default=None,
                    help="override [generation] window_seconds")
+    p.add_argument("--vcpus", type=int, default=None,
+                   help="the rented tier's vCPUs (one sandbox child each); pair it with "
+                        "--window-seconds (the orchestrator sends both)")
     p.add_argument("--no-sandbox", action="store_true",
                    help="run in-process (local testing only)")
     p.add_argument("--allow-disabled", action="store_true",
@@ -58,6 +61,13 @@ def main(argv: list[str] | None = None) -> int:
     from .tier import generate_corpus
 
     cfg = load_chain_config(args.chain_toml) if args.chain_toml else load_chain_config()
+    if args.vcpus is not None:
+        # The orchestrator picked the tier and sends its window too; the VM's
+        # own chain.toml copy need not list the fallback tiers.
+        if args.vcpus <= 0 or cfg.generation.children > 0:
+            print(json.dumps({"ok": False, "error": "--vcpus needs a positive tier and children = 0"}))
+            return EXIT_REFUSED
+        cfg = replace(cfg, generation=replace(cfg.generation, vcpus=int(args.vcpus), fallback_vcpus=()))
     if not (cfg.generation.enabled or args.allow_disabled):
         print(json.dumps({"ok": False, "error": "[generation] enabled = false"}))
         return EXIT_REFUSED
