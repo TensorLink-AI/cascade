@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from math import isfinite
+from math import isfinite, sqrt
 
 from .validators import (
     validate_accepted_fields,
@@ -549,6 +549,21 @@ def parse_training_contract(t: dict) -> TrainingContractConfig:
                     raise ValueError(f"pyramid {key}: {name} must equal {value}")
         if steps < 1:
             raise ValueError("cascade_pyramid needs positive training_steps")
+        # Power EMA (digest-bound): the pyramid trainer averages per leg and
+        # ships the chosen EMA as weights.safetensors — refuse at load what
+        # pyramid_trainer.power_ema_settings would refuse at the first leg.
+        sigmas = list(t.get("power_ema_sigma_rels", ()) or ())
+        ema_eval = t.get("power_ema_eval", -1)
+        if sigmas:
+            if any(isinstance(s, bool) or not isinstance(s, (int, float))
+                   or not 0 < s < sqrt(1 / 12) for s in sigmas):
+                raise ValueError("pyramid power_ema_sigma_rels must lie in (0, 0.2887)")
+            if type(ema_eval) is not int or not 0 <= ema_eval < len(sigmas):
+                raise ValueError("pyramid power_ema_eval must index power_ema_sigma_rels")
+            if t.get("power_ema_scope", "lineage") != "leg":
+                raise ValueError("pyramid power_ema_scope must be 'leg' when power EMAs are armed")
+        elif ema_eval != -1:
+            raise ValueError("pyramid power_ema_eval needs power_ema_sigma_rels")
         if t.get("ref_throughput_tokens_per_s") != 0:
             raise ValueError("pyramid budgets use training_steps; reference throughput must be 0")
         for name, default in (("batch_size", 0), ("micro_batches", 1), ("max_train_seconds", 0)):
