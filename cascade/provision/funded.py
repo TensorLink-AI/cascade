@@ -629,8 +629,13 @@ def reconcile_funded(
     provider_factory: Callable[[str], Provider] = lium_provider_for_key,
     hotkeys: Iterable[str] | None = None,
     exclude: Iterable[str] = (),
+    keep: Callable[[Provider, str, str], bool] | None = None,
 ) -> list[str]:
     """The orphan reaper's per-payer sweep; returns the pod names CONFIRMED gone.
+
+    ``keep(adapter, pod_id, payer_hotkey)`` — the caller's per-pod guard: a
+    True verdict spares that pod this sweep (the trainer's sweep asks the pod
+    whether it holds a live worker or an unharvested checkpoint).
 
     ``hotkeys`` restricts the sweep to those payers (a finished leg's
     teardown fallback sweeps ITS payer only); ``exclude`` skips payers whose
@@ -655,4 +660,4 @@ def reconcile_funded(
 
     return reconcile_payer_accounts(
         owned, vault, netuid=netuid, provider_factory=provider_factory,
-        hotkeys=hotkeys, exclude=exclude)
+        hotkeys=hotkeys, exclude=exclude, keep=keep)

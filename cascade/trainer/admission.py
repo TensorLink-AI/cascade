@@ -2,10 +2,23 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import threading
 import time
 from collections import deque
 from contextlib import contextmanager
+from pathlib import Path
+
+log = logging.getLogger(__name__)
+
+# How long a chain-resolved hotkey -> coldkey identity stays usable for a NEW
+# admission. Wall-clock seconds (the cache is persisted across restarts).
+IDENTITY_TTL_SECONDS = 300.0
+# Persisted next to the rolling state in the trainer's work_root, so a restart
+# does not come up with a cold cache (2026-10-31: every re-attach after a
+# restart failed "coldkey identity is unavailable" and was requeued).
+IDENTITY_FILE = "coldkey_identities.json"
 
 
 class FairSlots:
@@ -36,10 +49,30 @@ class FairSlots:
 
     @contextmanager
     def slot(self, limit, *, deadline=None, priority=False, owner=None, owner_limit=0,
-             background=False, cancel=None):
+             background=False, cancel=None, force=False):
+        """``force`` — take the slot NOW, over the limits, still counted: an
+        already-admitted leg re-attached after a restart (it held its slot in
+        the previous process; refusing it would cut a running leg)."""
         token = object()
         item = (token, owner, owner_limit, bool(background))
         acquired = False
+        if force:
+            with self.condition:
+                self.active += 1
+                if owner_limit:
+                    self.owners[owner] = self.owners.get(owner, 0) + 1
+                acquired = True
+            try:
+                yield acquired
+            finally:
+                with self.condition:
+                    self.active -= 1
+                    if owner_limit:
+                        self.owners[owner] -= 1
+                        if not self.owners[owner]:
+                            del self.owners[owner]
+                    self.condition.notify_all()
+            return
         with self.condition:
             if priority and not background:
                 self.waiters.appendleft(item)
@@ -90,25 +123,107 @@ class FairSlots:
                     self.condition.notify_all()
 
 
+def _identity_path(runner) -> Path | None:
+    root = getattr(runner, "work_root", None)
+    return Path(root) / IDENTITY_FILE if root else None
+
+
+def _parse_identities(text: str) -> dict:
+    raw = json.loads(text)
+    if not isinstance(raw, dict):
+        raise ValueError("coldkey identity cache is not an object")
+    out = {}
+    for hotkey, row in raw.items():
+        owner, ts = row
+        out[str(hotkey)] = (str(owner or ""), float(ts))
+    return out
+
+
+def _identities(runner) -> dict:
+    """The live hotkey -> ``(coldkey, wall time resolved)`` cache; loaded from
+    the persisted file the first time a process asks (a restart starts warm).
+    Caller holds the identity lock."""
+    d = runner.__dict__
+    cache = d.get("_coldkey_identities")
+    if cache is not None:
+        return cache
+    cache = {}
+    path = _identity_path(runner)
+    if path is not None:
+        from ..shared.atomic import read_text_with_backup
+
+        try:
+            rows, source = read_text_with_backup(path, _parse_identities)
+        except Exception as e:  # noqa: BLE001 — a cold cache is the old behaviour
+            rows, source = None, f"error: {e}"
+        if rows:
+            cache.update(rows)
+        elif source not in ("absent", "main", "backup"):
+            log.warning("coldkey identity cache %s unreadable (%s) — starting cold", path, source)
+    d["_coldkey_identities"] = cache
+    return cache
+
+
+def _persist_identities(runner, cache: dict) -> None:
+    path = _identity_path(runner)
+    if path is None:
+        return
+    from ..shared.atomic import write_text_atomic
+
+    try:
+        write_text_atomic(path, json.dumps({hk: [o, ts] for hk, (o, ts) in sorted(cache.items())},
+                                           indent=0), backup=True)
+    except OSError as e:
+        log.warning("coldkey identity cache not persisted (%s): %s", path, e)
+
+
+def _identity_lock(runner):
+    return runner.__dict__.setdefault("_owner_identity_lock", threading.Lock())
+
+
 def remember_owners(runner, rows):
     """Only chain-resolved current owners count; never infer an owner from a hotkey."""
-    lock = runner.__dict__.setdefault("_owner_identity_lock", threading.Lock())
     latest = {}
     for row in rows:
         hotkey = str(getattr(row, "hotkey", "") or "")
         if hotkey and (hotkey not in latest or getattr(row, "commit_block", 0) >= getattr(latest[hotkey], "commit_block", 0)):
             latest[hotkey] = row
-    with lock:
-        identities = runner.__dict__.setdefault("_coldkey_identities", {})
+    now = time.time()
+    with _identity_lock(runner):
+        identities = _identities(runner)
         for hotkey, row in latest.items():
             owner = str(getattr(row, "coldkey", "") or "")
-            identities[hotkey] = (owner, time.monotonic())
+            identities[hotkey] = (owner, now)
+        if latest:
+            _persist_identities(runner, identities)
     return rows
 
 
 def owner_of(runner, hotkey):
-    owner, timestamp = runner.__dict__.get("_coldkey_identities", {}).get(hotkey, ("", 0))
-    return owner if owner and time.monotonic() - timestamp <= 300 else ""
+    with _identity_lock(runner):
+        owner, timestamp = _identities(runner).get(hotkey, ("", 0))
+    return owner if owner and time.time() - timestamp <= IDENTITY_TTL_SECONDS else ""
+
+
+# ── already-admitted legs (restart re-attach) ───────────────────────────────
+
+def mark_admitted(runner, hotkey) -> None:
+    """``hotkey``'s leg was admitted BEFORE this process started (an in-flight
+    queue entry being re-attached): its owner slot is honoured even when the
+    identity cache has not caught up yet. Cleared by :func:`clear_admitted`
+    when the leg thread ends."""
+    with _identity_lock(runner):
+        runner.__dict__.setdefault("_admitted_legs", set()).add(str(hotkey))
+
+
+def clear_admitted(runner, hotkey) -> None:
+    with _identity_lock(runner):
+        runner.__dict__.setdefault("_admitted_legs", set()).discard(str(hotkey))
+
+
+def is_admitted(runner, hotkey) -> bool:
+    with _identity_lock(runner):
+        return str(hotkey) in runner.__dict__.get("_admitted_legs", set())
 
 
 def owner_busy(runner, hotkey):
@@ -129,33 +244,49 @@ def owner_busy(runner, hotkey):
 
 @contextmanager
 def owner_admission(runner, hotkey, *, exempt=False, deadline=None):
-    """A shared, reentrant owner slot covers generation, training and fallback."""
+    """A shared, reentrant owner slot covers generation, training and fallback.
+
+    Only a NEW admission needs a fresh coldkey identity. A leg marked
+    :func:`mark_admitted` (re-attached after a restart) was admitted by the
+    previous process: an unknown identity lets it through (logged), a known
+    one takes its slot at once, over the limit, so the count stays right."""
     limit = int(getattr(runner.cfg.round, "ops_max_active_per_coldkey", 0))
     if exempt or not limit:
         yield
         return
     from .faults import _FundedLegSkip
 
+    local = runner.__dict__.setdefault("_owner_admission_local", threading.local())
+    held = getattr(local, "held", None)
+    if held is not None and held[1] == hotkey:
+        yield                               # reentrant: this thread already holds it
+        return
     owner = owner_of(runner, hotkey)
+    admitted = is_admitted(runner, hotkey)
+    if not owner and admitted:
+        log.warning("owner admission: %s re-attached with no coldkey identity cached — "
+                    "already admitted before the restart, proceeding", str(hotkey)[:12])
+        local.held = ("", hotkey)
+        try:
+            yield
+        finally:
+            local.held = held
+        return
     if not owner:
         runner._record_funded_failure(hotkey, "coldkey identity is unavailable; waiting for fresh chain metadata",
                                       miner_fault=False, error_class="no_capacity", burn=False)
         raise _FundedLegSkip(hotkey)
-    local = runner.__dict__.setdefault("_owner_admission_local", threading.local())
-    if getattr(local, "held", None) == (owner, hotkey):
-        yield
-        return
     gate = runner.__dict__.setdefault("_owner_slots", FairSlots())
     if deadline is None:
         deadline = time.time() + 1800
-    with gate.slot(2**31, owner=owner, owner_limit=limit, deadline=deadline) as acquired:
+    with gate.slot(2**31, owner=owner, owner_limit=limit, deadline=deadline,
+                   force=admitted) as acquired:
         if not acquired:
             runner._record_funded_failure(hotkey, "coldkey compute slot remained busy; requeued before rent",
                                           miner_fault=False, error_class="no_capacity", burn=False)
             raise _FundedLegSkip(hotkey)
-        previous = getattr(local, "held", None)
         local.held = (owner, hotkey)
         try:
             yield
         finally:
-            local.held = previous
+            local.held = held
