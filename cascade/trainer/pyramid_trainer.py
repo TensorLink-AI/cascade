@@ -102,6 +102,44 @@ def combine_gradients(parameters, reference, cap=0.1):
     return weight
 
 
+# Power EMA — IMAGE-ONLY (owner decision 2026-11-01). The settings are fixed
+# worker constants, NOT contract terms: they are not read from [training] /
+# [v2.training] and never enter ``contract_digest`` (the recipe check below
+# still pins the contract's own power_ema_sigma_rels to ()). They
+# ship with the worker image at an era boundary. Math is
+# ``moe_trainer.PowerEMA`` unchanged; every leg starts its own average (a
+# warm-started leg resumes the RAW weights_stable + optimizer lineage and never
+# inherits an average). The SCORED weights.safetensors is the
+# POWER_EMA_SIGMA_RELS[POWER_EMA_EVAL] average; a continuation snapshot carries
+# the raw model plus every EMA state, so a resumed leg restores them bitwise.
+POWER_EMA_SIGMA_RELS = (0.05, 0.10)
+POWER_EMA_EVAL = 1
+
+
+def power_ema_settings():
+    """``(sigma_rels, eval_index)`` of the image's fixed power EMAs, validated.
+    ``((), -1)`` (tests only) disables the average: the raw endpoint is scored."""
+    sigmas = tuple(float(s) for s in POWER_EMA_SIGMA_RELS)
+    index = int(POWER_EMA_EVAL)
+    if not sigmas:
+        if index != -1:
+            raise ValueError("pyramid power EMA: eval index needs sigma_rels")
+        return (), -1
+    if not 0 <= index < len(sigmas):
+        raise ValueError(f"pyramid power EMA: eval index {index} out of range for {sigmas!r}")
+    if any(not 0 < s < math.sqrt(1 / 12) for s in sigmas):
+        raise ValueError(f"pyramid power EMA: sigma_rels must lie in (0, 0.2887): {sigmas!r}")
+    return sigmas, index
+
+
+def power_ema_state(emas):
+    """Every EMA's shadows and step counter as one flat tensor dict."""
+    flat = {}
+    for ema in emas:
+        flat.update(ema.state_tensors())
+    return flat
+
+
 def save_checkpoint(out, state, cfg, contract):
     import json
 
@@ -122,7 +160,7 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
     from safetensors.torch import load_file
 
     from .continuation import assert_training_runtime, restore_rng, rng_state, training_runtime
-    from .moe_trainer import restore_frozen, route_bias_scale, router_lr_scale
+    from .moe_trainer import PowerEMA, restore_frozen, route_bias_scale, router_lr_scale
 
     cfg = CascadeMoEConfig.from_contract(contract)
     if contract.training_steps < 1:
@@ -139,6 +177,7 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
     for name, value in expected.items():
         if getattr(contract, name) != value:
             raise ValueError(f"pyramid recipe requires {name}={value!r}")
+    ema_sigmas, ema_eval = power_ema_settings()
     if tuple(contract.accepted_fields) not in ((), ("groups",)):
         raise ValueError("pyramid recipe accepts only optional groups")
     if str(trainer.dtype) != "torch.float32":
@@ -175,6 +214,12 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
 
         accelerate(model)
     names = {id(p): n for n, p in source.named_parameters()}
+    # Power EMAs live on rank 0 only (the process that owns the model after
+    # every gang sync): fp32 shadows of the PARAMETERS — buffers (the routing
+    # bias) stay live — over a lane-B leg's selected leaves only. Always
+    # fresh per leg (see POWER_EMA_SIGMA_RELS); a continuation restores them.
+    # Memory: +len(sigmas) fp32 parameter copies on rank 0 (~10 GB at 1.23B).
+    emas = [PowerEMA(model, s, expert_slices=slices) for s in ema_sigmas]
     optimizer = build_optimizer(source, cfg.d_model)
     if optimizer.adamw:
         router_ids = {id(layer.router.weight) for layer in model.moe_layers()}
@@ -238,6 +283,9 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
                     leaf.copy_(restored["leaves"][name])
             slices.sync()
         optimizer.load_state_tensors(restored["optimizer"], names)
+        for ema in emas:
+            if not ema.load_state_tensors(restored.get("emas") or {}):
+                raise ValueError("pyramid continuation lacks its power EMA state")
         if gang is not None:
             gang.scatter_pending = True
         stable = restored["stable"]
@@ -320,6 +368,10 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
                     layer.update_bias(total, rate_scale=bias_scale)
             if gang is not None:
                 gang.sync_after_step(model)
+            # once per optimizer step, after every rank's update has landed
+            # on rank 0 (sync_after_step) — never per micro-batch or per GPU
+            for ema in emas:
+                ema.update(model)
             tokens += batch_points(values, contract.budget_denomination)
             channel_tokens += values.size
             step += 1
@@ -335,6 +387,7 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
                     "channel_tokens": channel_tokens, "model": model.state_dict(),
                     "leaves": dict(slices.named_parameters()) if slices else {},
                     "optimizer": optimizer.state_tensors(names), "stable": stable,
+                    "emas": power_ema_state(emas),
                     "last_loss": last_loss, "last_joint": last_joint, "elapsed": time.time() - started,
                     "data_wait": timed.wait_s,
                     "rng": rng_state(), "mask_rng": mask_rng.bit_generator.state,
@@ -365,8 +418,15 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
     live = {k: v.detach().cpu().contiguous() for k, v in model.state_dict().items()}
     if slices:
         live = restore_frozen(live, base, expert_selection, moe_param_names(model))
+    scored = live
+    if ema_eval >= 0:
+        # the chosen power EMA is the evaluated artifact (weights.safetensors);
+        # the raw lineage (weights_stable + optimizer below) is untouched
+        scored = emas[ema_eval].export(model)
+        if slices:
+            scored = restore_frozen(scored, base, expert_selection, moe_param_names(model))
     out = Path(out_dir)
-    save_checkpoint(out, live, cfg, contract)
+    save_checkpoint(out, scored, cfg, contract)
     from .ckpt_digest import save_tensors_hashed
 
     if slices is None:
@@ -387,6 +447,8 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
         "optim_state_resumed": resumed_optimizer,
         "training_complete": step == steps,
         "corpus_exhausted": step < steps and tokens < token_budget and duration < contract.max_train_seconds}
+    if emas:
+        metrics.update(power_ema_eval_sigma_rel=ema_sigmas[ema_eval], power_ema_steps=emas[ema_eval].t)
     if slices:
         metrics.update(expert_training_backend="compact_rows", expert_trainable_param_count=sum(p.numel() for p in params))
     if grouped_corpus:

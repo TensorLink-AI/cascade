@@ -140,11 +140,35 @@ clipping at 7 follows their combination. Router auxiliaries average the
 `1e-4` balance and `1e-3` z-loss terms across MoE layers. Selection biases update
 proportionally to global-batch load error and are re-centered after each step.
 
-The scored checkpoint is the cooldown endpoint. The pre-cooldown weights and
-named optimizer state form the warm-start lineage. Recovery replays the exact
-input prefix, checks its digest and runtime, restores RNG/optimizer state and
-continues without adding updates. An expert leg starts from scored king weights;
-only its selected rows can change or merge.
+The pre-cooldown weights and named optimizer state form the warm-start lineage.
+Recovery replays the exact input prefix, checks its digest and runtime, restores
+RNG/optimizer state and continues without adding updates. An expert leg starts
+from scored king weights; only its selected rows can change or merge.
+
+### Power EMA (worker image, not a contract term)
+
+The worker image keeps two power-function EMAs of the parameters
+(`sigma_rel = 0.05` and `0.10`; `β_t = (1 − 1/t)^(γ+1)`, the
+`moe_trainer.PowerEMA` math), updated once per optimizer step after the gang
+sync. The scored `weights.safetensors` is the `sigma_rel = 0.10` average; the
+routing-selection biases are buffers and always come from the live model. The
+settings are fixed constants in `cascade/trainer/pyramid_trainer.py`
+(`POWER_EMA_SIGMA_RELS`, `POWER_EMA_EVAL`). They are not read from `[training]`
+or `[v2.training]` and are not part of `contract_digest`. The pyramid recipe
+check still requires the contract's own `power_ema_sigma_rels` to be empty. A
+change ships as a new worker image at an era boundary.
+
+Every leg starts its own average. A warm-started leg resumes the raw
+`weights_stable.safetensors` + `optimizer.safetensors` lineage, which the EMA
+never changes, and does not inherit an average. An expert leg averages only its
+selected rows; frozen bytes stay the king's. Continuation snapshots carry the
+raw model and every EMA state, a resumed leg restores them bitwise, and a
+snapshot without EMA state is refused.
+
+Memory: the EMAs are fp32 parameter copies held on rank 0 only (helper ranks
+are untouched), so rank 0 needs about 8 bytes × parameters extra. That is about
+10 GB at Cascade MoE Base - 1.23B, and small for the ≤ 120M presets. Budget it
+before you run the largest size on a GPU with tight memory.
 
 ## Checkpoint compatibility
 
