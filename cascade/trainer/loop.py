@@ -126,6 +126,22 @@ HARVEST_UPLOAD_ATTEMPTS = 4
 HARVEST_UPLOAD_BACKOFF_SECONDS = 60.0
 
 
+def _mark_harvested(runner, host, entry):
+    """After a verified harvest + upload: record WHEN this pod endpoint was
+    harvested (orchestrator-side, persisted), so the pod sweep knows a
+    finished exit-0 run there that ended before now is no longer the only copy
+    of its checkpoint. Nothing is written to the pod. Best-effort — an
+    unrecorded harvest only keeps the pod until its window ends."""
+    record = getattr(runner, "_record_pod_harvest", None)
+    if callable(record):
+        try:
+            record(getattr(host, "host", ""), getattr(host, "port", 22))
+        except Exception as e:  # noqa: BLE001 — never fails a harvested leg
+            log.warning("harvest: recording the harvest of %s failed: %s",
+                        getattr(host, "name", host), e)
+    return entry
+
+
 def upload_harvested_checkpoint(runner, record: dict, *, base_seed) -> TrainedEntry:
     """Upload the verified local copy ``record["dest"]`` under the operator's
     identity → the leg's :class:`TrainedEntry`; delete the copy once the
@@ -671,14 +687,14 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
             ckpt_repo = (f"{self.hub().namespace}/ckpt-r{seeds.base_seed}-"
                          f"{receipt.role}-mkt{suffix}")
             self._mkt_harvested[receipt.miner_hotkey] = dict(receipt.marketcast)
-            return upload_harvested_checkpoint(self, {
+            return _mark_harvested(self, host, upload_harvested_checkpoint(self, {
                 "dest": str(dest), "harvest_job_id": job_id,
                 "ckpt_repo": ckpt_repo, "suffix": suffix, "size": "mkt",
                 "miner_hotkey": receipt.miner_hotkey, "miner_uid": int(receipt.miner_uid),
                 "role": receipt.role, "gen_ref": receipt.gen_ref,
                 "corpus_digest": receipt.corpus_digest, "train_block": int(receipt.train_block),
                 "gpu_name": receipt.gpu_name, "receipt_size": "mkt"},
-                base_seed=seeds.base_seed)
+                base_seed=seeds.base_seed))
         # The harvested tensor files must be the ones the worker hashed in
         # memory at save time; anything else on disk is not the run's product.
         from .ckpt_digest import tensor_mismatches
@@ -716,7 +732,8 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
             "warm_start_ref": receipt.init_pointer,
             "contract_digest": receipt.training_contract_digest,
         }
-        return upload_harvested_checkpoint(self, record, base_seed=seeds.base_seed)
+        return _mark_harvested(
+            self, host, upload_harvested_checkpoint(self, record, base_seed=seeds.base_seed))
 
     def _archive_generator_tree(self, ref: str, d: Path) -> None:
         """Best-effort audit archive of a fetched generator tree.

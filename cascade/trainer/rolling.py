@@ -1157,19 +1157,38 @@ class RollingScheduler:
     # ── startup / restart ────────────────────────────────────────────────────
 
     def _startup(self, client, block: int) -> None:
-        """Restart re-entry: keep the pods of in-flight legs and both era king
-        pods, re-attach every in-flight leg (a persisted completed leg is
-        reused, never retrained), sweep everything else."""
+        """Restart re-entry: re-attach every in-flight leg (a persisted
+        completed leg is reused, never retrained), THEN sweep — keeping both
+        era king pods and the pod of every leg still in flight or running here.
+
+        The order is load-bearing (2026-10-31: three restarts cut live funded
+        pods): the sweep's keep-set is computed from what the re-attach pass
+        actually left in flight, never from a guess made before it. The pod
+        sweep itself also probes every candidate pod and keeps any with a live
+        worker or an unharvested finished run (``_sweep_keeps_pod``)."""
         keep_ids = tuple(str(e.base_seed) for e in (self.state.current, self.state.next) if e)
         self._seed_chain_root()
+        self._warm_identities(client)
         queue = self.ops.queue()
         flights = queue.in_flight() if queue is not None else []
         done = {(f.hotkey, f.ref) for f in self.state.finished}
         dead = self._dead_era_flights(client, flights, done, block)
-        self.ops.sweep_pods(keep_round_ids=keep_ids,
-                            keep_payers=({e.hotkey for e in flights} - set(dead))
-                            | self._king_own_key_payers(live_only=False))
         self._reattach_flights(client, block, queue, flights, done, dead)
+        still = {e.hotkey for e in queue.in_flight()} if queue is not None else set()
+        keep = ((still | set(self._threads)) - set(dead))
+        keep |= self._lane_c_live() | self._lane_b_live()
+        keep |= self._king_own_key_payers(live_only=False)
+        self.ops.sweep_pods(keep_round_ids=keep_ids, keep_payers=keep)
+
+    def _warm_identities(self, client) -> None:
+        """Best-effort chain read of the commitments before any re-attach, so
+        the coldkey identity cache (admission.remember_owners) is fresh; the
+        persisted cache and the re-attach bypass cover a failed read."""
+        try:
+            self.ops.commitments(client)
+        except Exception as e:  # noqa: BLE001 — never blocks the restart
+            log.warning("rolling: startup commitments read failed (%s) — re-attach "
+                        "proceeds on the persisted coldkey identities", e)
 
     def _maybe_reconcile(self, client, block: int, now: float) -> None:
         """Every ``RECONCILE_SECONDS``: the startup re-entry for a LIVE
@@ -1227,8 +1246,9 @@ class RollingScheduler:
                 # landed: the leg can never be judged (a leg that finishes
                 # after its era is requeued at finish anyway), so re-attaching
                 # only bills the payer for a second run — or a fresh pod when
-                # the first is gone. Pod released by the sweep above; requeue
-                # unburned now.
+                # the first is gone. Requeued unburned now; its pod is released
+                # by the sweep that follows (unless the pod still holds a live
+                # worker or an unharvested run — then it is kept, loudly).
                 log.warning("rolling: in-flight leg %s belongs to era %d, which ended at "
                             "block %d (now %d) — it can never be judged; pod released, "
                             "requeued unburned", e.hotkey[:12], era_idx, era_end, int(block))
@@ -2356,6 +2376,12 @@ class RollingScheduler:
                     *, resumed: bool = False) -> None:
         if gen.hotkey in self._threads:
             return
+        if resumed:
+            # Admitted by the previous process: owner admission must not refuse
+            # it for a cold identity cache (admission.owner_admission).
+            from .admission import mark_admitted
+
+            mark_admitted(self.r, gen.hotkey)
         queue = self.ops.queue()
         end_wall = wall_of_block(target, now=self.clock(), block_now=block)
         t_launch = self.clock()
@@ -2462,6 +2488,10 @@ class RollingScheduler:
                 log.warning("rolling: %s's leg failed [%s]: %s", gen.hotkey[:12],
                             error_class, error_tail(msg or str(e), 200))
             finally:
+                if resumed:
+                    from .admission import clear_admitted
+
+                    clear_admitted(self.r, gen.hotkey)
                 self._threads.pop(gen.hotkey, None)
 
         t = threading.Thread(target=_run, name=f"leg-{gen.hotkey[:12]}", daemon=True)

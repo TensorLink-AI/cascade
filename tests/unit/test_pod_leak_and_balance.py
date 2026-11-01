@@ -57,6 +57,9 @@ class _Runner:
     def _is_operator_leg_pod_of(self, name, hotkeys):
         return False
 
+    def _sweep_keeps_pod(self, adapter, pod_id, *, what):
+        return False                   # every listed pod idle (the guard has its own tests)
+
 
 def test_operator_orphans_are_swept_from_the_listing(monkeypatch, caplog):
     pods = [
