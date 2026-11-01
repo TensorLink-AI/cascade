@@ -52,7 +52,9 @@ def test_mainnet_ships_inert_with_the_v2_contract_scheduled():
                               # DEC-CA-0063: armed with the v2 go-live ("v2" = 0 now)
                               bench_source="validator", bench_source_from_block=0,
                               # DEC-CA-0063 item 9: settlement cap / per-sweep allowance
-                              bench_budget_hours=6.0, bench_sweep_hours=2.0)
+                              bench_budget_hours=6.0, bench_sweep_hours=2.0,
+                              # DEC-CA-0067: bundled budget, inert until the v2b vote
+                              eval_n_windows_after=4000)
     assert not cfg.v2.active(10**9)
     assert cfg.lane_b.from_block == 0 and not cfg.lane_b.active(10**9)
     v2c = cfg.training.v2_contract
