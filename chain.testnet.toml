@@ -637,7 +637,7 @@ image_decoupled_from_block = 0
 # keeps its small budget (DEC-CA-0066): 0 = no change.
 eval_n_windows_after = 0
 # TRAINER-ONLY provenance (not consensus, not in the vote): earlier
-# [v2.training] train_image_digest pins, exactly as once typed, so the trainer
+# v2.training train_image_digest pins, exactly as once typed, so the trainer
 # can PROVE a pre-repin leg differs only in its image. Append the old pin here
 # when re-pinning.
 prior_train_image_digests = []

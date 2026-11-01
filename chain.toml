@@ -1198,7 +1198,7 @@ image_decoupled_from_block = 0
 # verdict budget becomes this many windows. Inert until the switch.
 eval_n_windows_after = 4000
 # TRAINER-ONLY provenance (not consensus, not in the vote): earlier
-# [v2.training] train_image_digest pins, exactly as once typed, so the trainer
+# v2.training train_image_digest pins, exactly as once typed, so the trainer
 # can PROVE a pre-repin leg differs only in its image. Append the old pin here
 # when re-pinning.
 prior_train_image_digests = []
