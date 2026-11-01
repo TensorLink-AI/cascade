@@ -50,6 +50,10 @@ def _isolate_host_quarantine(tmp_path, monkeypatch):
 
     monkeypatch.setenv(provision_core.LIUM_QUARANTINE_FILE_ENV,
                        str(tmp_path / "_lium_host_quarantine.json"))
+    from cascade.provision import lium_identity
+
+    monkeypatch.setenv(lium_identity.LIUM_IDENTITY_FILE_ENV,
+                       str(tmp_path / "_lium_executor_identity.json"))
     provision_core.set_host_blocklist(())
     yield
     provision_core.set_host_blocklist(())
