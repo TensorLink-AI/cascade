@@ -810,7 +810,7 @@ class _FundedPodMixin:
         from ..provision.core import record_host_quarantine
         from ..provision.funded import LEMON_CLASS, rent_funded_pod
         from ..provision.layout import visible_devices
-        from .host_preflight import sync_host_blocklist
+        from .host_preflight import host_blocked_reason, sync_host_blocklist
         from .remote import RemoteHost
 
         # [round] funded_host_blocklist → every provider listing this rent makes.
@@ -1090,7 +1090,15 @@ class _FundedPodMixin:
                     # Hash its files before it ever sees a leg; a mismatch
                     # releases the pod, keeps its executor excluded and rents
                     # again — the miner is never blamed.
-                    why = self._funded_pod_code_mismatch(result, profile)
+                    adopted = bool(getattr(result, "adopted", False))
+                    # The pod's REAL host, now that its ssh address is known: a
+                    # listing that could not resolve hosts must never train on
+                    # a quarantined/blocklisted machine (2026-11-01 05:16,
+                    # 38.255.28.18). Torn down at once; its executor stays
+                    # excluded (claimed) like any rejected pod.
+                    blocked = ("" if adopted or result.address is None
+                               else host_blocked_reason(self, result.address.ip))
+                    why = blocked or self._funded_pod_code_mismatch(result, profile)
                     # Throughput gate (funded_host_bench_floor): a slow executor
                     # eats the leg's equal wall — released and rented again on
                     # the same bad-pod budget. Only its executor stays excluded
@@ -1099,7 +1107,6 @@ class _FundedPodMixin:
                     # we are about to attach to, so the calibration bench
                     # would read low and "release" the pod, killing the leg. It
                     # passed the gate when it was rented.
-                    adopted = bool(getattr(result, "adopted", False))
                     slow = ("" if (why or adopted)
                             else self._funded_pod_too_slow(result, profile))
                     # Multi-GPU preflight (an N-rank NCCL all_reduce under a
@@ -1116,7 +1123,7 @@ class _FundedPodMixin:
                                 kind="stale" if why else "slow", reason=why or slow)
                         queue = self._funded_queue()
                         stale_pods += 1
-                        if why and result.address is not None:
+                        if why and not blocked and result.address is not None:
                             # The stale cache lives on the HOST: every executor
                             # id it lists would boot the same image.
                             record_host_quarantine(result.address.ip, why)

@@ -234,6 +234,13 @@ class _OperatorPodMixin:
                         addr = provider.get_ip(pod_id)
                         if addr is None:
                             _fail_king(pod_id, f"king pod {pod_id} exposed no IP")
+                        # Its real host: never a quarantined/blocklisted one
+                        # (a blind listing can still land there).
+                        from .host_preflight import host_blocked_reason
+
+                        blocked = host_blocked_reason(self, addr.ip)
+                        if blocked:
+                            _fail_king(pod_id, f"king pod {pod_id} rejected: {blocked}")
                         try:
                             host_key = self._pin_king_host_key(pod_id, addr)
                         except ProvisionError as e:
@@ -397,7 +404,11 @@ class _OperatorPodMixin:
         from ..provision.core import LaunchSpec, ProvisionError
         from ..provision.funded import quarantine_lemon_host, terminate_verified
         from ..provision.state import PodInstance
-        from .host_preflight import multi_gpu_preflight_failure, sync_host_blocklist
+        from .host_preflight import (
+            host_blocked_reason,
+            multi_gpu_preflight_failure,
+            sync_host_blocklist,
+        )
         from .remote import RemoteHost, probe_worker_runtime
         from .runner_funded_pods import allocation_lock
 
@@ -545,6 +556,10 @@ class _OperatorPodMixin:
                     addr = provider.get_ip(pod_id)
                     if addr is None:
                         _lemon(f"operator leg pod {pod_id} exposed no IP")
+                    # Its real host: never a quarantined/blocklisted one.
+                    blocked = host_blocked_reason(self, addr.ip)
+                    if blocked:
+                        _lemon(f"operator leg pod {pod_id} rejected: {blocked}")
                     try:
                         host_key = self._pin_king_host_key(pod_id, addr)
                     except ProvisionError as e:

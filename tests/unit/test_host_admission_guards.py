@@ -689,3 +689,161 @@ def test_an_edited_tripped_lane_still_faces_the_gate():
     assert pool.known_hosts() == []                               # hold released, gate refused
     left = pool._rejected["lane-a"] - __import__("time").time()
     assert 0 < left <= pool.REJECT_RETRY_S + 1                    # the normal re-gate, not 6 h
+
+
+# ── B. quarantine/blocklist fail CLOSED (2026-11-01 05:16, 38.255.28.18) ──────
+
+LEMON = "38.255.28.18"
+
+
+def test_executor_host_ip_uses_the_map_then_the_listing_record():
+    from cascade.provision.core import executor_host_ip
+
+    assert executor_host_ip({"id": "ex-a"}, {"ex-a": LEMON}) == LEMON
+    assert executor_host_ip({"id": "ex-a", "executor_ip_address": LEMON}, {}) == LEMON
+    assert executor_host_ip({"id": "ex-a", "executor": {"ip": LEMON}}) == LEMON
+    assert executor_host_ip({"id": "ex-a"}, {}) == ""
+
+
+def _listing_provider(monkeypatch, tmp_path, records: str, hosts: dict):
+    monkeypatch.setenv(core_mod.LIUM_COOLDOWN_FILE_ENV, str(tmp_path / "cooldown.json"))
+
+    def _run(argv):
+        return types.SimpleNamespace(returncode=0, stdout=records if "ls" in argv else "[]",
+                                     stderr="")
+
+    prov = LiumProvider(bin="lium", _run=_run)
+    monkeypatch.setattr(prov, "_executor_hosts", lambda: hosts)
+    return prov
+
+
+def test_an_unmapped_executor_is_not_rented_while_a_host_is_quarantined(monkeypatch, tmp_path):
+    records = ('[{"id": "ex-lemon", "gpu_count": 8}, {"id": "ex-good", "gpu_count": 8}, '
+               '{"id": "ex-self", "gpu_count": 8, "executor_ip_address": "10.0.0.9"}]')
+    record_host_quarantine(LEMON, "NCCL PREFLIGHT failed", seconds=3600, host_fault=True)
+    # map unavailable: only the executor whose own record names its host survives
+    prov = _listing_provider(monkeypatch, tmp_path, records, {})
+    assert [e["id"] for e in prov._list_executors("8xH200")] == ["ex-self"]
+    # the blocklist (no quarantine file entry needed) fails closed the same way
+    set_host_blocklist(["10.0.0.9"])
+    assert prov._list_executors("8xH200") == []
+    assert prov.capacity("8xH200") == 0                           # → no_capacity, retried
+    # map back: the lemon is skipped by IP, the good one rents
+    set_host_blocklist(())
+    prov = _listing_provider(monkeypatch, tmp_path, records,
+                             {"ex-lemon": LEMON, "ex-good": "10.0.0.2"})
+    assert [e["id"] for e in prov._list_executors("8xH200")] == ["ex-good", "ex-self"]
+
+
+def test_an_empty_executor_map_is_not_cached(monkeypatch):
+    calls = []
+    prov = LiumProvider(bin="lium", _run=lambda argv: types.SimpleNamespace(
+        returncode=0, stdout="[]", stderr=""))
+    answers = [[], [{"id": "ex-a", "executor_ip_address": LEMON}]]
+    monkeypatch.setattr(prov, "_api_json", lambda what: calls.append(what) or answers.pop(0))
+    assert prov._executor_hosts() == {}
+    assert prov._executor_hosts() == {"ex-a": LEMON}              # asked again, not cached
+    assert prov._executor_hosts() == {"ex-a": LEMON}              # now cached
+    assert calls == ["executors", "executors"]
+
+
+def test_a_payer_pod_landing_on_a_quarantined_host_is_torn_down_and_rented_again(
+        tmp_path, monkeypatch):
+    from dataclasses import replace
+
+    from cascade.provision import funded as funded_mod
+    from cascade.provision.core import PodAddress
+    from tests.unit.test_funded_pod_wiring import _challenger, _rent_ok, _runner, _vault
+
+    record_host_quarantine(LEMON, "NCCL PREFLIGHT failed: Cuda failure 999", seconds=3600,
+                           host_fault=True)
+    runner = _runner(tmp_path)
+    _vault(tmp_path, "hkA")
+    lemon = replace(_rent_ok(), address=PodAddress(ip=LEMON, ssh_port=2222))
+    rents, torn, fingerprinted = [lemon, _rent_ok()], [], []
+    monkeypatch.setattr(funded_mod, "rent_funded_pod", lambda **kw: rents.pop(0))
+    monkeypatch.setattr(funded_mod, "teardown_funded",
+                        lambda pods, vault, **kw: (torn.extend(p.instance_id for p in pods), [])[1])
+    runner._funded_pod_code_mismatch = lambda result, profile: fingerprinted.append(
+        result.address.ip) or ""
+    runner._funded_pod_too_slow = lambda result, profile: ""
+    host, pod = runner._rent_funded_host("777", _challenger("hkA"))
+    assert rents == [] and len(torn) == 1                          # the lemon pod went at once
+    assert fingerprinted == ["10.9.9.9"]                           # never even probed the lemon
+    assert host.host == "10.9.9.9"
+    assert "hkA" not in runner._funded_leg_failures                # never the miner's
+
+
+def test_a_payer_pod_on_a_blocklisted_host_never_trains(tmp_path, monkeypatch):
+    from dataclasses import replace
+
+    from cascade.provision import funded as funded_mod
+    from cascade.provision.core import PodAddress
+    from tests.unit.test_funded_pod_wiring import _challenger, _rent_ok, _runner, _vault
+
+    runner = _runner(tmp_path, funded_host_blocklist=(LEMON,))
+    _vault(tmp_path, "hkA")
+    lemon = replace(_rent_ok(), address=PodAddress(ip=LEMON, ssh_port=2222))
+    rents, torn = [lemon, _rent_ok()], []
+    monkeypatch.setattr(funded_mod, "rent_funded_pod", lambda **kw: rents.pop(0))
+    monkeypatch.setattr(funded_mod, "teardown_funded",
+                        lambda pods, vault, **kw: (torn.extend(p.instance_id for p in pods), [])[1])
+    runner._funded_pod_code_mismatch = lambda result, profile: ""
+    runner._funded_pod_too_slow = lambda result, profile: ""
+    host, _pod = runner._rent_funded_host("777", _challenger("hkA"))
+    assert len(torn) == 1 and host.host == "10.9.9.9"
+    # a blocklisted host is not written into the expiring quarantine file
+    import json
+    import os
+    qf = Path(os.environ[core_mod.LIUM_QUARANTINE_FILE_ENV])
+    assert not qf.exists() or LEMON not in json.loads(qf.read_text())
+
+
+def test_a_king_pod_landing_on_a_quarantined_host_is_rejected(tmp_path, monkeypatch):
+    monkeypatch.setattr("cascade.trainer.remote.probe_worker_runtime", lambda host, **kw: "")
+    from cascade.provision import funded as funded_mod
+    from tests.unit.test_funded_pod_wiring import _runner
+
+    record_host_quarantine(LEMON, "NCCL PREFLIGHT failed", seconds=3600, host_fault=True)
+    r = _runner(tmp_path, funded_king_rent=True)
+    r._rent_wait_now = lambda: 0.0
+    r._rent_wait_sleep = lambda s: None
+    r._host_bench_below_floor = lambda host, sku, label: ""
+    ips = [LEMON, "9.9.9.9"]
+    launched, terminated, lemons = [], [], []
+    monkeypatch.setattr(funded_mod, "quarantine_lemon_host",
+                        lambda provider, pod_id, why: lemons.append(why))
+    monkeypatch.setattr(funded_mod, "terminate_verified",
+                        lambda provider, pod_id: terminated.append(pod_id) or True)
+
+    class _Prov:
+        name = "lium"
+
+        def capacity(self, sku, *, gpus=1, exclude_ids=()):
+            return 1
+
+        def launch(self, spec):
+            launched.append(spec.sku)
+            return [f"{spec.name_prefix}-0"]
+
+        def wait_ready(self, pod_id, *, timeout):
+            return True
+
+        def get_ip(self, pod_id):
+            return SimpleNamespace(ip=ips.pop(0), ssh_port=41000)
+
+        def machine_of(self, pod_id):
+            return f"exec-{len(launched)}"
+
+        def terminate(self, pod_id):
+            pass
+
+    orig = core_mod.LiumProvider
+    core_mod.LiumProvider = _Prov
+    try:
+        host = r._rent_king_host("42")
+    finally:
+        core_mod.LiumProvider = orig
+    assert len(launched) == 2 and len(terminated) == 1
+    assert lemons and "blocked" in lemons[0]
+    assert host.host == "9.9.9.9"

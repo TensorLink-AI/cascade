@@ -355,6 +355,30 @@ def host_blocklist() -> tuple[str, ...]:
     return _HOST_BLOCKLIST
 
 
+# Address fields an executor's own listing record may carry (the CLI's
+# ``ls`` JSON has historically had none; the API's ``/executors`` has
+# ``executor_ip_address``).
+_EXECUTOR_IP_FIELDS = ("executor_ip_address", "ip_address", "ip", "host", "public_ip")
+
+
+def executor_host_ip(executor: dict, hosts: dict[str, str] | None = None) -> str:
+    """Host IP of a marketplace executor: the id→IP map first, else an address
+    field on the listing record itself; "" when unknown."""
+    if not isinstance(executor, dict):
+        return ""
+    ip = (hosts or {}).get(str(executor.get("id", "")), "")
+    if ip:
+        return str(ip)
+    for k in _EXECUTOR_IP_FIELDS:
+        v = executor.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    ex = executor.get("executor")
+    if isinstance(ex, dict):
+        return executor_host_ip({k: ex.get(k) for k in _EXECUTOR_IP_FIELDS})
+    return ""
+
+
 def quarantined_hosts(*, path: Path | None = None,
                       now: float | None = None) -> dict[str, str]:
     """``{host ip: reason}`` for every host still under quarantine, plus every
@@ -1165,12 +1189,31 @@ class LiumProvider:
             shaped = kept
         quarantined = quarantined_hosts()
         if quarantined and shaped:
+            # FAIL CLOSED (2026-11-01 05:16: with the executor→IP map
+            # unavailable a payer rent landed on 38.255.28.18, quarantined
+            # until 2027, and hung NCCL again): an executor whose host IP
+            # cannot be resolved — neither from the map nor from its own
+            # listing record — is NOT rentable while any host is quarantined
+            # or blocklisted. An empty listing reads as no capacity, so the
+            # leg waits and retries instead of renting blind.
             hosts = self._executor_hosts()
-            kept = [e for e in shaped if hosts.get(str(e.get("id")), "") not in quarantined]
-            if len(kept) != len(shaped):
-                log.info("lium: %d %s executor(s) skipped — on a quarantined host (%s)",
-                         len(shaped) - len(kept), sku, ", ".join(sorted(
-                             {hosts[str(e["id"])] for e in shaped if e not in kept})))
+            kept, blocked, unknown = [], set(), 0
+            for e in shaped:
+                ip = executor_host_ip(e, hosts)
+                if not ip:
+                    unknown += 1
+                elif ip in quarantined:
+                    blocked.add(ip)
+                else:
+                    kept.append(e)
+            if blocked:
+                log.info("lium: %d %s executor(s) skipped — on a quarantined/blocklisted "
+                         "host (%s)", len(shaped) - len(kept) - unknown, sku,
+                         ", ".join(sorted(blocked)))
+            if unknown:
+                log.warning("lium: %d %s executor(s) skipped — host IP unknown (executor "
+                            "host map unavailable or incomplete); quarantine fails closed, "
+                            "retried on the next listing", unknown, sku)
             shaped = kept
         if self.cpu_blocklist and shaped:
             cpus = self._executor_cpus()
@@ -1580,8 +1623,11 @@ class LiumProvider:
             if isinstance(e, dict) and e.get("id") and e.get("executor_ip_address"):
                 hosts[str(e["id"])] = str(e["executor_ip_address"])
         if not hosts:
-            log.warning("lium: executor host map unavailable — host quarantine cannot "
-                        "steer this listing")
+            # Not cached: the next listing asks the API again (until then the
+            # quarantine fails closed on every unmapped executor).
+            log.warning("lium: executor host map unavailable — unmapped executors are "
+                        "not rentable while any host is quarantined")
+            return hosts
         object.__setattr__(self, "_executor_hosts_cache", (self._now(), hosts))
         return hosts
 
