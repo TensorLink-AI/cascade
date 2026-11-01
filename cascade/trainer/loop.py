@@ -721,6 +721,14 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
         job_id = harvest_job_id(receipt, suffix)
         dest = harvest_dir(self.work_root, seeds.base_seed, receipt.miner_hotkey, job_id=job_id)
         harvest_remote_dir(host, receipt.checkpoint_dir, dest)
+        # Owner 2026-11-01: a leg path that tears its pod down at leg end arms
+        # an early release; the box copy must first match the pod's own
+        # listing file for file (one re-harvest on a mismatch, else kept).
+        from .harvest_release import release_if_verified, verify_harvest_complete
+
+        verified = verify_harvest_complete(
+            self, host, receipt.checkpoint_dir, dest,
+            reharvest=lambda: harvest_remote_dir(host, receipt.checkpoint_dir, dest))
         if getattr(receipt, "marketcast", None):
             # DEC-CA-0064: a Timestral fine-tune, not a Cascade-MoE checkpoint
             from .marketcast_runner import verify_harvested_mkt_checkpoint
@@ -728,6 +736,7 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
             why = verify_harvested_mkt_checkpoint(self, dest, receipt)
             if why:
                 raise _FundedTamper(f"checkpoint: {why}")
+            release_if_verified(self, verified)
             ckpt_repo = (f"{self.hub().namespace}/ckpt-r{seeds.base_seed}-"
                          f"{receipt.role}-mkt{suffix}")
             self._mkt_harvested[receipt.miner_hotkey] = dict(receipt.marketcast)
@@ -763,6 +772,10 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
             raise _FundedTamper(f"checkpoint: {e}") from e
         except CheckpointDiverged as e:
             raise _FundedDiverged(str(e)) from e
+        # Every guard passed on a copy verified complete: nothing needs the
+        # pod any more — release it, then upload from the box copy (kept
+        # until a pinned ref returns; a failed upload re-uploads from it).
+        release_if_verified(self, verified)
         size = contract.arch_preset
         ckpt_repo = (f"{self.hub().namespace}/ckpt-r{seeds.base_seed}-"
                      f"{receipt.role}-{size}{suffix}")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import threading
 import time
@@ -18,11 +19,11 @@ from .faults import (
     _OperatorFault,
     classify_funded_worker_failure,
 )
+from .harvest_release import release_after_verified_harvest
 from .progress import progress_binding, report_progress
 from .runner_common import (
     ResolvedGenerator,
     _add_seen_hotkeys,
-    r2_transport_on,
     read_pending_upload,
     release_executor_of,
     router_kw,
@@ -321,12 +322,13 @@ class _FundedLegMixin:
         released: list[bool] = []
 
         def release_pod() -> None:
-            # r2 transport: the checkpoint is verified on R2 — the payer's pod
-            # goes NOW, before the Hippius push (2026-10-31: pods billed for
-            # hours behind a stuck harvest).
+            # Owner 2026-11-01: the harvested copy is verified (on the box, or
+            # on R2 with the r2 transport) and nothing benches on this pod —
+            # stop its bill before the upload / Hippius push.
             if not released:
-                released.append(True)
                 self._teardown_funded_pod(pod)
+                released.append(True)
+
         try:
             # Identity pin, before a single byte of dispatch: the pod that
             # answers to this name must be the one we rented (platform id)
@@ -402,13 +404,15 @@ class _FundedLegMixin:
                 # Credential-free pod: the checkpoint is still ON the pod.
                 # Pull it over the pinned ssh, ingest-verify the local copy,
                 # and upload it under the OPERATOR's identity — the entry's
-                # pointer is then a checkpoint whose bytes we inspected.
-                early = (r2_transport_on(self.cfg)
-                         and not (bench and self._keep_funded_pod_for_bench()))
+                # pointer is then a checkpoint whose bytes we inspected. A pod
+                # nothing benches on is released once the copy is verified,
+                # before the upload (cascade.trainer.harvest_release).
+                early = (contextlib.nullcontext() if _funded_pod_benched_here(self, bench)
+                         else release_after_verified_harvest(self, release_pod))
                 try:
-                    entry = self._harvest_funded_checkpoint(
-                        host, entry, contract, seeds, suffix,
-                        **({"release": release_pod} if early else {}))
+                    with early:
+                        entry = self._harvest_funded_checkpoint(
+                            host, entry, contract, seeds, suffix)
                 except _OperatorFault:
                     # Upload lost after its retries: bind the kept copy to
                     # this leg's init too, so only the same leg reuses it.
@@ -427,7 +431,7 @@ class _FundedLegMixin:
                 why = self._funded_checkpoint_mismatch(entry, contract)
                 if why:
                     raise _FundedTamper(f"checkpoint: {why}")
-            if bench and self._keep_funded_pod_for_bench():
+            if not released and bench and self._keep_funded_pod_for_bench():
                 # The checkpoint benches on THIS pod at completion (payer-
                 # billed, the miner's own sidecar eval); the scheduler tears
                 # it down when the bench ends (_teardown_kept_funded_pod).
@@ -678,3 +682,18 @@ def _reupload_pending(runner, gen, seeds, contract, suffix: str, warm_start_ref)
         runner._record_funded_failure(gen.hotkey, f"{DIVERGED_MARKER}: {e}",
                                       miner_fault=True, error_class="generator", burn=False)
         raise
+
+
+def _funded_pod_benched_here(runner, bench: bool) -> bool:
+    """Whether THIS leg's pod may still be needed after its harvest: the
+    trainer benches the checkpoint on it (payer-pod bench armed, the leg
+    benchable, the era not validator-benched — DEC-CA-0063). Otherwise the
+    pod is released once the harvested copy is verified. A king own-key
+    leg's pod is torn down the moment its leg returns either way. No bench
+    source on this thread (a caller that does not set it) keeps today's rule."""
+    if not (bench and runner._keep_funded_pod_for_bench()):
+        return False
+    local = runner.__dict__.get("_leg_local_obj")
+    if getattr(local, "funded_is_king", False):
+        return False
+    return not bool(getattr(local, "validator_bench", False))

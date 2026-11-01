@@ -349,6 +349,12 @@ class RoundConfig:
     # tensor digests is refused as tamper (true) or accepted with a warning
     # (false: a worker image that predates the digests still harvests).
     funded_require_tensor_digests: bool = False
+    # Owner 2026-11-01: release (tear down) a funded / operator-rented leg's
+    # pod as soon as its harvested checkpoint is verified complete on the box
+    # (every file, size + sha256 vs the pod's own listing) — before the box →
+    # Hippius upload, which then runs from the box copy. Never for a pod the
+    # trainer still benches on. false = torn down when the leg returns.
+    funded_release_after_harvest: bool = True
     # ── Direct submissions + champion-only publication (DEC-CA-0036) ─────────
     # Where the intake's private submission store lives (cascade.funding.store;
     # relative resolves under work_root). "" = direct submissions off: vault

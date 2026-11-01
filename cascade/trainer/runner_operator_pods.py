@@ -617,12 +617,8 @@ class _OperatorPodMixin:
             _record_generation_failure(self, gen, e)
             raise
         host, pod_id = self._rent_operator_leg_host(str(seeds.base_seed), gen)
-        released: list[bool] = []
 
-        def release_pod() -> None:
-            if released:
-                return
-            released.append(True)
+        def ledger_pod():
             pods = getattr(self, "_load_funded_ledger", lambda: [])()
             pod = next((p for p in pods if p.instance_id == pod_id), None)
             if pod is None:
@@ -630,11 +626,25 @@ class _OperatorPodMixin:
                 pooled = hasattr(self, "cfg") and enabled(self)
                 pod = PodInstance(provider=OperatorPool.name if pooled else "lium",
                                   instance_id=pod_id, stage="funded", rented_at_iso="")
-            self._teardown_operator_pod(pod)
+            return pod
 
+        released: list[bool] = []
+
+        def release_pod() -> None:
+            # Owner 2026-11-01: never benched here and torn down at leg end
+            # anyway — once the harvested copy is verified on the box, stop
+            # the operator's bill before the upload (harvest_release).
+            if not released:
+                self._teardown_operator_pod(ledger_pod())
+                released.append(True)
+
+        # A challenger receipt is harvested INSIDE dispatch (the isolated
+        # host's harvest hook, same thread): armed for the whole leg body.
+        from .harvest_release import arm_release, disarm_release
+
+        armed = arm_release(self, release_pod)
         try:
             from .progress import report_progress
-            from .runner_common import r2_transport_on
 
             digest = parse_vault_ref(gen.ref)
             if digest is not None:
@@ -662,11 +672,10 @@ class _OperatorPodMixin:
             )
             if specialist:
                 report_progress(self, "harvesting")
-                # r2 transport: the operator pod goes once the checkpoint is
-                # verified on R2, before the Hippius push.
-                return self._harvest_funded_checkpoint(
-                    host, receipt, contract, seeds, suffix,
-                    **({"release": release_pod} if r2_transport_on(self.cfg) else {}))
+                # The armed release (above) lets the pod go once the
+                # checkpoint is verified — on the box (ssh) or on R2 (r2
+                # transport) — before the Hippius push.
+                return self._harvest_funded_checkpoint(host, receipt, contract, seeds, suffix)
             return receipt
         except _FundedTamper as e:
             # The harvest hook's ingest guard: the same verdict as a payer leg.
@@ -694,4 +703,6 @@ class _OperatorPodMixin:
                                         error_class=error_class, burn=False)
             raise
         finally:
-            release_pod()
+            disarm_release(self, armed)
+            if not released:
+                self._teardown_operator_pod(ledger_pod())
