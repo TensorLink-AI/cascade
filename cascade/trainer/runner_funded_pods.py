@@ -1219,6 +1219,13 @@ class _FundedPodMixin:
             if p.returncode == 255:
                 _quarantine_lane_host(host, f"{label}: ssh refused at lane join")
             return f"ssh rc={p.returncode}: {(p.stderr or '')[-160:]}"
+        if getattr(self, "deployed_chain_toml", None):
+            # Same config a rented pod gets; the lane's workers run with
+            # --chain-toml <workdir>/chain.deployed.toml (_rolling_final_hosts).
+            try:
+                self._push_deployed_chain_toml(host)
+            except Exception as e:  # noqa: BLE001 — a lane without the config must not join
+                return f"deployed chain.toml push failed: {e}"
         why = probe_worker_runtime(host)
         if why:
             return why

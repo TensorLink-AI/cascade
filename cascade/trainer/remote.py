@@ -541,10 +541,14 @@ class LegAborted(RemoteDispatchError):
 
 def _detached_find_command(host: RemoteHost, tag: str) -> str:
     """List prior run dirs of ``tag`` on the pod that still matter: the worker
-    is alive (pid answers ``kill -0``) or finished (``exit_code`` written)."""
+    is alive (pid answers ``kill -0``) or finished CLEANLY (``exit_code`` 0 —
+    a result to harvest). A FAILED run (exit != 0) is never re-attached: that
+    only re-reports the old failure, so every retry on the lane "fails" in
+    seconds without relaunching (2026-11-01 Targon lanes, ~30 legs)."""
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", tag)[:80]
     return (f"cd {shlex.quote(host.workdir)} && for d in {DETACHED_RUN_ROOT}/{safe}-*; do "
-            f"[ -d \"$d\" ] || continue; if [ -f \"$d/exit_code\" ]; then echo ATTACH:$d; "
+            f"[ -d \"$d\" ] || continue; if [ -f \"$d/exit_code\" ]; then "
+            f"[ \"$(cat \"$d/exit_code\")\" = 0 ] && echo ATTACH:$d; "
             f"elif [ -f \"$d/pid\" ] && kill -0 $(cat \"$d/pid\") 2>/dev/null; then "
             f"echo ATTACH:$d; fi; done; true")
 

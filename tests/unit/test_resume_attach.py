@@ -242,3 +242,44 @@ def test_lium_name_lookup_prefers_the_running_pod_over_its_booting_twin():
     # a lone booting pod still resolves (wait_ready keeps polling it)
     assert _lium_with([booting]).pod_identity(name)["id"] == "uid-new"
     assert _lium_with([]).pod_identity(name) is None
+
+
+def test_find_command_never_reattaches_a_failed_run(tmp_path):
+    """2026-11-01: a failed run (exit != 0) left on a lane was re-attached on
+    every retry, so the leg "failed" in seconds forever without relaunching.
+    Only a live worker or a clean finish (exit 0, a result to harvest) attaches."""
+    import subprocess as sp
+
+    from cascade.trainer.remote import DETACHED_RUN_ROOT, _detached_find_command
+
+    root = tmp_path / DETACHED_RUN_ROOT
+    tag = "challenger-5FbwZ4y4VG9f-1"
+    for suffix, code in (("aaaa0000", "0"), ("bbbb2222", "2")):
+        d = root / f"{tag}-{suffix}"
+        d.mkdir(parents=True)
+        (d / "exit_code").write_text(code + "\n")
+    live = root / f"{tag}-cccc1111"
+    live.mkdir()
+    (live / "pid").write_text(str(__import__("os").getpid()))
+    dead = root / f"{tag}-dddd9999"
+    dead.mkdir()
+    (dead / "pid").write_text("999999999")
+    out = sp.run(["bash", "-c", _detached_find_command(_host(workdir=str(tmp_path)), tag)],
+                 capture_output=True, text=True, check=True).stdout
+    hits = sorted(ln.split("-")[-1] for ln in out.split() if ln.startswith("ATTACH:"))
+    assert hits == ["aaaa0000", "cccc1111"]
+
+
+def test_operator_lanes_get_the_deployed_chain_toml():
+    """A hand-rented operator lane trains on the deployed chain.toml (pushed
+    at the join gate), never the image's baked snapshot; an explicit
+    per-host chain_toml wins."""
+    from cascade.trainer.runner_rolling import _with_deployed_chain_toml
+
+    runner = types.SimpleNamespace(deployed_chain_toml="/root/cascade/chain.toml")
+    lane = _host(name="targon-lane-1", workdir="/root/cascade")
+    assert _with_deployed_chain_toml(runner, lane).chain_toml == "/root/cascade/chain.deployed.toml"
+    own = _host(name="x", chain_toml="/etc/c.toml")
+    assert _with_deployed_chain_toml(runner, own).chain_toml == "/etc/c.toml"
+    off = types.SimpleNamespace(deployed_chain_toml=None)
+    assert _with_deployed_chain_toml(off, lane).chain_toml is None

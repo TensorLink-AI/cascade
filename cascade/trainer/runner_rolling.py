@@ -257,8 +257,9 @@ class _RollingMixin:
             hosts = list(load_hosts(self.remote_hosts_path))
         else:
             hosts = list(self.remote_hosts or ())
-        return [h for h in hosts
-                if getattr(h, "stage", "any") in ("any", "final") and not is_profile_only(h)]
+        lanes = [h for h in hosts
+                 if getattr(h, "stage", "any") in ("any", "final") and not is_profile_only(h)]
+        return [_with_deployed_chain_toml(self, h) for h in lanes]
 
     def _rolling_lane_pool(self):
         """ONE lane pool for every rolling fallback leg (created lazily): lane
@@ -1111,3 +1112,17 @@ class _RollingMixin:
             reg = DedupRegistry(self, self.work_root / "dedup_registry.json", mode=mode)
             self.__dict__["_dedup_registry_obj"] = reg
         return reg
+
+
+def _with_deployed_chain_toml(runner, host):
+    """An operator lane trains on the orchestrator's DEPLOYED chain.toml, the
+    same file a rented pod gets (``_push_deployed_chain_toml``; the join gate
+    pushes it). Without this a hand-rented lane that boots the image's baked
+    snapshot resolves the wrong contract: 2026-11-01 two Targon 8xH200 lanes
+    failed every v2 leg ``unknown --arch-preset 'cascade-moe-v2-120m'`` for
+    ~1.5 h. A host that names its own ``chain_toml`` keeps it."""
+    from dataclasses import replace as dc_replace
+
+    if getattr(host, "chain_toml", None) or not getattr(runner, "deployed_chain_toml", None):
+        return host
+    return dc_replace(host, chain_toml=f"{host.workdir}/chain.deployed.toml")
