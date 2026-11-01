@@ -614,3 +614,14 @@ def test_breaker_victim_requeues_without_the_operator_backoff(tmp_path):
     assert record_lane_breaker_victim(runner, "hkA", victim) is True
     msg, miner_fault, cls, burn = runner._funded_leg_failures["hkA"]
     assert (miner_fault, cls, burn) == (False, "no_capacity", False) and "LANE BREAKER" in msg
+
+
+def test_lane_b_converts_a_breaker_victim_to_no_capacity():
+    from cascade.trainer.lane_b_driver import lane_breaker_failure
+
+    assert lane_breaker_failure(RuntimeError("x")) == {}
+    victim = RuntimeError("remote expert failed (rc=2)")
+    victim.lane_breaker = True
+    f = lane_breaker_failure(victim)["failure"]
+    assert (f.miner_fault, f.error_class, f.burn) == (False, "no_capacity", False)
+    assert "LANE BREAKER" in f.msg

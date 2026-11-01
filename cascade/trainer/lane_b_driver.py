@@ -1352,6 +1352,9 @@ class RunnerLaneBOps:
                                      burn=False) from e
                 except Exception as e:
                     verdict = self.r._funded_leg_failures.pop(gen.hotkey, None)
+                    breaker = lane_breaker_failure(e)
+                    if verdict is None and breaker:
+                        raise breaker["failure"] from e
                     if verdict is None:
                         raise LegFailure(f"lane-B leg failed (operator side): {e}",
                                          miner_fault=False, error_class="operator",
@@ -1430,7 +1433,7 @@ class RunnerLaneBOps:
                      getattr(entry, "gpu_name", ""))
             except Exception as e:  # noqa: BLE001 — a failed leg frees its domain
                 log.warning("lane B: leg %s/%s failed: %s", leg.sub.hotkey[:8], leg.sub.domain, e)
-                done(leg, None)
+                done(leg, None, **lane_breaker_failure(e))
 
         threading.Thread(target=_run, name=f"laneb-{label}", daemon=True).start()
 
@@ -1510,3 +1513,19 @@ def publish_lane_b_status(sched, block: int, *, min_interval_s: float = STATUS_M
     return publish_lane_status(sched, block, lane="b", status_key=LANE_B_STATUS_KEY,
                                last_published=_STATUS_LAST, min_interval_s=min_interval_s,
                                clock=clock, logger=log)
+
+
+def lane_breaker_failure(exc: BaseException) -> dict:
+    """``{"failure": LegFailure(no_capacity)}`` for a leg that failed on an
+    operator lane the circuit breaker just took out (``exc.lane_breaker``),
+    else ``{}`` — the same verdict the rolling path records
+    (:func:`cascade.trainer.runner_rolling.record_lane_breaker_victim`): the
+    LANE failed, so the leg requeues unburned without operator-fault backoff."""
+    if not getattr(exc, "lane_breaker", False):
+        return {}
+    from .lane_c_driver import LegFailure
+
+    return {"failure": LegFailure(
+        f"LANE BREAKER: the operator lane this leg ran on failed several different legs "
+        f"in a row and left the rotation — requeued without backoff ({str(exc)[-300:]})",
+        miner_fault=False, error_class="no_capacity", burn=False)}
