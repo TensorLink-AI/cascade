@@ -261,6 +261,22 @@ def cooling_executors(*, path: Path | None = None, now: float | None = None,
     return {k for k, v in _load_cooldowns(path).items() if now - v < ttl}
 
 
+# A cooldown stamped far in the FUTURE never expires: the operator's hand-made
+# permanent block of an executor id (2026-11-01: d4093d0c / 5aed9800 /
+# 36cf4f99 / d0a76aed, the executors of the blocklisted hosts). Those ids are
+# treated as known-bad identities, so their GPU / site twins are skipped too.
+_PINNED_COOLDOWN_MARGIN = 86400.0
+
+
+def pinned_executor_cooldowns(*, path: Path | None = None,
+                              now: float | None = None) -> dict[str, str]:
+    """``{executor id: why}`` for cooldowns stamped > 1 day in the future."""
+    path = path or lium_cooldown_path()
+    now = time.time() if now is None else now
+    return {k: "pinned in the executor cooldown file"
+            for k, v in _load_cooldowns(path).items() if v > now + _PINNED_COOLDOWN_MARGIN}
+
+
 # ── host quarantine ──────────────────────────────────────────────────────────
 # One PHYSICAL host serves several executor ids, and a lemon host stays a lemon
 # under every one of them (2026-09-13: 91.224.44.222 listed 37f19d50 / 8ae82436
@@ -1094,6 +1110,9 @@ class LiumProvider:
     # exclude a failed pod's machine when renting its replacement.
     _executor_by_name: dict = field(default_factory=dict, repr=False)
     _executor_hosts_cache: tuple = field(default=(), repr=False)
+    # executor id → full ``GET /executors`` record (host identity + health
+    # flags; see _steer_hosts). Cached like the host map.
+    _executor_records_cache: tuple = field(default=(), repr=False)
     # CPU-model substrings (case-insensitive) whose executors are never listed
     # ([round] funded_cpu_blocklist); () = no filter.
     cpu_blocklist: tuple[str, ...] = ()
@@ -1187,34 +1206,8 @@ class LiumProvider:
                          "(post-teardown cooldown deploys nothing)",
                          len(shaped) - len(kept), sku, LIUM_EXECUTOR_COOLDOWN_SECONDS / 60)
             shaped = kept
-        quarantined = quarantined_hosts()
-        if quarantined and shaped:
-            # FAIL CLOSED (2026-11-01 05:16: with the executor→IP map
-            # unavailable a payer rent landed on 38.255.28.18, quarantined
-            # until 2027, and hung NCCL again): an executor whose host IP
-            # cannot be resolved — neither from the map nor from its own
-            # listing record — is NOT rentable while any host is quarantined
-            # or blocklisted. An empty listing reads as no capacity, so the
-            # leg waits and retries instead of renting blind.
-            hosts = self._executor_hosts()
-            kept, blocked, unknown = [], set(), 0
-            for e in shaped:
-                ip = executor_host_ip(e, hosts)
-                if not ip:
-                    unknown += 1
-                elif ip in quarantined:
-                    blocked.add(ip)
-                else:
-                    kept.append(e)
-            if blocked:
-                log.info("lium: %d %s executor(s) skipped — on a quarantined/blocklisted "
-                         "host (%s)", len(shaped) - len(kept) - unknown, sku,
-                         ", ".join(sorted(blocked)))
-            if unknown:
-                log.warning("lium: %d %s executor(s) skipped — host IP unknown (executor "
-                            "host map unavailable or incomplete); quarantine fails closed, "
-                            "retried on the next listing", unknown, sku)
-            shaped = kept
+        if shaped:
+            shaped = self._steer_hosts(sku, shaped)
         if self.cpu_blocklist and shaped:
             cpus = self._executor_cpus()
             kept = [e for e in shaped
@@ -1225,6 +1218,90 @@ class LiumProvider:
                              {cpus[str(e["id"])] for e in shaped if e not in kept})))
             shaped = kept
         return self._price_filter(sku, shaped)
+
+    def _steer_hosts(self, sku: str, shaped: list[dict]) -> list[dict]:
+        """Keep prior-fault hosts and API-flagged executors out of a listing.
+
+        Lium no longer lists executor IPs (2026-11-01: 0/172 records carried
+        ``executor_ip_address``), so the IP quarantine alone matched nothing
+        and the rc16 fail-closed rule rented nothing at all. Each executor is
+        now judged on (see :mod:`cascade.provision.lium_identity`):
+
+        1. the API's own health flags (slow machine, frequent rent failures,
+           bad disk, explicitly unresponsive/inactive) — always skipped;
+        2. a known host IP (legacy API field / the id→IP map) that is
+           quarantined or blocklisted — skipped;
+        3. a known-bad identity — an executor id ever seen at a blocked IP or
+           marked bad, or sharing a GPU UUID / (miner hotkey, geo) site with
+           one — skipped;
+        4. otherwise RENTABLE (fail open on unknown) — EXCEPT when the API
+           record itself is unavailable while anything is blocked: identity
+           cannot be checked, so it fails closed (retried next listing).
+        """
+        from .lium_identity import (
+            blocked_identities,
+            health_flags,
+            identity_block_reason,
+            load_identities,
+        )
+
+        quarantined = quarantined_hosts()
+        records = self._executor_records()
+        blocked = blocked_identities(quarantined, records=records,
+                                     extra_bad_ids=pinned_executor_cooldowns())
+        hosts = self._executor_hosts() if quarantined else {}
+        learned = load_identities()["executors"]
+        kept: list[dict] = []
+        flagged: dict[str, int] = {}
+        by_ip: list[str] = []
+        by_identity: list[str] = []
+        unverifiable = unknown = n_flagged = 0
+        for e in shaped:
+            eid = str(e.get("id", ""))
+            rec = records.get(eid)
+            flags = health_flags(rec if rec is not None else e)
+            if flags:
+                n_flagged += 1
+                for f in flags:
+                    flagged[f] = flagged.get(f, 0) + 1
+                continue
+            ip = executor_host_ip(e, hosts) or executor_host_ip(rec or {})
+            if ip and ip in quarantined:
+                by_ip.append(ip)
+                continue
+            if not ip and (learned.get(eid) or {}).get("ips"):
+                ip = learned[eid]["ips"][-1]     # every learned IP is checked below
+            why = identity_block_reason(eid, rec, blocked)
+            if why:
+                by_identity.append(why)
+                continue
+            if not ip:
+                if rec is None and (quarantined or blocked):
+                    unverifiable += 1
+                    continue
+                unknown += 1
+            kept.append(e)
+        if flagged:
+            log.info("lium: %d %s executor(s) skipped — flagged by the Lium API (%s)",
+                     n_flagged, sku,
+                     ", ".join(f"{k}×{v}" for k, v in sorted(flagged.items())))
+        if by_ip:
+            log.info("lium: %d %s executor(s) skipped — on a quarantined/blocklisted "
+                     "host (%s)", len(by_ip), sku, ", ".join(sorted(set(by_ip))))
+        if by_identity:
+            log.info("lium: %d %s executor(s) skipped — known-bad host identity (%s)",
+                     len(by_identity), sku, "; ".join(sorted(set(by_identity))[:6]))
+        if unverifiable:
+            log.warning("lium: %d %s executor(s) skipped — no /executors record to check "
+                        "against %d blocked host(s) / %d bad executor(s); fails closed, "
+                        "retried on the next listing", unverifiable, sku,
+                        len(quarantined), len(blocked.ids))
+        if unknown:
+            log.info("lium: %d %s executor(s) with no learned host identity and no "
+                     "known-bad match — rentable (%d bad executor id(s), %d GPU(s), "
+                     "%d site(s) blocked)", unknown, sku, len(blocked.ids),
+                     len(blocked.gpus), len(blocked.sites))
+        return kept
 
     def wall_seconds_for(self, sku: str) -> float:
         """Measured full-budget leg wall for ``sku`` (``sku_wall_seconds``),
@@ -1408,6 +1485,12 @@ class LiumProvider:
                      if executor_price_per_hour(ex) is not None else "")
             self._executor_by_name[name] = str(ex.get("id"))
             self._sku_by_name[name] = landed
+            cached = self._executor_records_cache
+            if cached and cached[1].get(str(ex.get("id"))):
+                # Keep its GPU / site identity even after it leaves the listing.
+                from .lium_identity import learn_executor
+
+                learn_executor(str(ex.get("id")), record=cached[1][str(ex.get("id"))])
             names.append(name)
         return names
 
@@ -1532,7 +1615,10 @@ class LiumProvider:
 
     def get_ip(self, pod_id: str) -> PodAddress | None:
         pod = self._pod(pod_id)
-        return lium_pod_address(pod) if pod else None
+        addr = lium_pod_address(pod) if pod else None
+        if addr is not None and pod and lium_pod_ready(pod):
+            self._learn_pod_host(pod_id, addr.ip)
+        return addr
 
     def live_pod_address(self, pod_id: str) -> PodAddress | None:
         """``pod_id``'s SSH endpoint iff the pod EXISTS and is RUNNING with
@@ -1545,7 +1631,10 @@ class LiumProvider:
         pod = self._pod(pod_id)
         if not pod or not lium_pod_ready(pod):
             return None
-        return lium_pod_address(pod)
+        addr = lium_pod_address(pod)
+        if addr is not None:
+            self._learn_pod_host(pod_id, addr.ip)
+        return addr
 
     def _executor_of_pod(self, pod_id: str) -> str:
         """The executor a live pod sits on: this instance's own launch record,
@@ -1610,6 +1699,62 @@ class LiumProvider:
         object.__setattr__(self, "_executor_cpus_cache", (self._now(), cpus))
         return cpus
 
+    def _executor_records(self) -> dict[str, dict]:
+        """executor id → its ``GET /executors`` record. Cached briefly; empty
+        (and not cached) when the API is unreachable — then an executor with
+        no resolvable IP cannot be identity-checked (``_steer_hosts``)."""
+        cached = self._executor_records_cache
+        if cached and self._now() - cached[0] < self._EXECUTOR_HOSTS_TTL:
+            return cached[1]
+        recs = {str(e["id"]): e for e in (self._api_json("executors") or [])
+                if isinstance(e, dict) and e.get("id")}
+        if recs:
+            object.__setattr__(self, "_executor_records_cache", (self._now(), recs))
+        return recs
+
+    def _learn_pod_host(self, pod_id: str, ip: str) -> None:
+        """Persist executor → host IP for a pod we can see (once per pod/IP):
+        the identity the IP quarantine steers by now that the API lists no
+        executor IPs. Best-effort; never raises."""
+        if not ip:
+            return
+        seen = self.__dict__.setdefault("_learned_pod_hosts", {})
+        if seen.get(pod_id) == ip:
+            return
+        try:
+            from .lium_identity import learn_executor
+
+            executor = self._executor_by_name.get(pod_id) or self._executor_of_pod(pod_id)
+            seen[pod_id] = ip                       # one lookup per pod/IP, found or not
+            if not executor:
+                return
+            cached = self._executor_records_cache
+            record = cached[1].get(executor) if cached else None
+            learn_executor(executor, ip=ip, record=record)
+        except Exception as e:  # noqa: BLE001 — learning must never sink a rent
+            log.warning("lium: could not learn the host of pod %s: %s", pod_id, e)
+
+    def record_executor_fault(self, pod_id: str, reason: str) -> str:
+        """Mark the executor ``pod_id`` sits on as bad (its learned GPU / site
+        identity is then skipped too) — the lemon path, where the pod's host
+        IP may never have resolved. Returns the executor id ("" = unknown).
+
+        Only a pod the platform actually LISTED counts (RUNNING without ports,
+        a stale boot): a ``lium up`` that deployed nothing is a ghost/cooldown,
+        already handled by the per-id cooldown, never proof of a bad host."""
+        try:
+            from .lium_identity import mark_executor_bad
+
+            if self._pod(pod_id) is None:
+                return ""
+            executor = self._executor_by_name.get(pod_id) or self._executor_of_pod(pod_id)
+            if executor:
+                mark_executor_bad(executor, f"{pod_id}: {reason}")
+            return executor or ""
+        except Exception as e:  # noqa: BLE001
+            log.warning("lium: could not mark the executor of %s bad: %s", pod_id, e)
+            return ""
+
     def _executor_hosts(self) -> dict[str, str]:
         """executor id → host IP for the whole marketplace (the CLI's ``ls`` JSON
         carries no address; ``GET /executors`` does). Cached briefly per
@@ -1642,7 +1787,25 @@ class LiumProvider:
                 if ip:
                     return str(ip)
         executor = self._executor_by_name.get(pod_id, "")
-        return self._executor_hosts().get(executor, "") if executor else ""
+        ip = self._executor_hosts().get(executor, "") if executor else ""
+        if ip:
+            return ip
+        # The API lists no executor IPs any more (2026-11-01): the pod's own
+        # SSH endpoint, else the IP we learned for its executor.
+        try:
+            pod = self._pod(pod_id)
+            addr = lium_pod_address(pod) if pod else None
+            if addr is not None:
+                return addr.ip
+        except ProvisionError:
+            pass
+        if executor:
+            from .lium_identity import load_identities
+
+            ips = (load_identities()["executors"].get(executor) or {}).get("ips") or []
+            if ips:
+                return ips[-1]
+        return ""
 
     def terminate(self, pod_id: str) -> None:
         # `lium rm <target>` takes a positional target and does NOT prompt — there
