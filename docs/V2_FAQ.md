@@ -179,9 +179,12 @@ a new digest.
 
 Wall times come from the owner's Lium runs of the same 512-row step,
 scaled to v2's step count; GPU memory has not been published yet. v2 legs
-train on 4× and 8× H100/H200 pods, data-parallel across every GPU. Layouts
-estimated at $75 per leg or less are the default; 4×H100 is opt-in with
-`--gpu 4xH100`. Blackwell (B200, B300) waits for a CUDA 12.8 image. The
+train on 4× and 8× H100/H200 pods, data-parallel across every GPU. Without
+`--gpu` a leg rents the cheapest layout under the operator's caps (currently
+$40 per pod-hour and an estimated $110 per leg; see `cascade status --json`);
+4×H100 is opt-in with `--gpu 4xH100`. Lium prices move: recent legs cost
+about $70 (8×H100) to $125 (8×H200), and you should budget up to about
+$135 (8×H100) or $255 (8×H200) per leg. Blackwell (B200, B300) waits for a CUDA 12.8 image. The
 table is in [MINER_V2_INCENTIVE_INTRO.md](MINER_V2_INCENTIVE_INTRO.md#gpus).
 
 ## Lanes

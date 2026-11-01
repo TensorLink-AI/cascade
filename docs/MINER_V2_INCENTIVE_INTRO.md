@@ -130,18 +130,30 @@ trains on all its GPUs: the 8 micro-batches of every step are split across
 the GPUs and their gradients summed, so a 4× and an 8× leg train the same
 model, step for step. More GPUs only finish sooner.
 
-| Layout | v2 wall (est.) | $/h | Est. per leg | |
-|---|---:|---:|---:|---|
-| `8xH200` | 2.3 h | 18.00 | $42 | default |
-| `8xH100` | 2.4 h | 24.00 | $59 | default |
-| `4xH200` | 3.5 h | 18.00 | $62 | default |
-| `4xH100` | 3.7 h | 24.00 | $88 | opt-in |
+| Layout | Wall | Lium $/h seen (median) | Typical leg | **Plan for** |
+|---|---:|---:|---:|---:|
+| `8xH200` | 3.4–4.0 h | $24–46 ($31) | ~$125 | **up to $255** |
+| `8xH100` | 3.8 h | $14–24 ($16) | ~$70 | **up to $135** |
+| `4xH200` | 3.5 h | ~$16 (few rentals) | ~$65 | **up to $110** |
+| `4xH100` | 3.7 h | not rented recently | — | check the live price |
 
-Walls are the owner's Lium timings for 27,500 updates of the same 512-row
-step, scaled to v2's 23,841 steps; prices are advertised Lium rates per pod.
+Prices are what Lium actually charged for 8x/4x pods from 2026-10-29 to
+11-01, not advertised rates. They move by the hour and **8xH200 has nearly
+doubled** from the $18/h this table used to show. Walls are measured
+full-budget v2 legs (23,841 steps).
 
-- **Default:** without `--gpu`, the leg rents the cheapest layout whose
-  estimated leg costs **$75 or less**.
+- **Typical leg** = median price × (wall + ~30 min boot, data and upload).
+- **Plan for** = the highest price seen × 5.5 h: the 5 h hard training wall
+  plus boot and upload. A slow host can run to the wall. A leg that fails on
+  a bad host and reruns also bills the pod time it already used, so keep
+  room for one rerun on top if your key's budget is tight.
+- Set a Lium key budget (daily or lifetime) that covers the **Plan for**
+  column, not the typical one.
+
+- **Default:** without `--gpu`, the leg rents the cheapest layout under the
+  operator's caps: currently **$40 per pod-hour** and an estimated
+  **$110 per leg** (read the live values with `cascade status --json`). At
+  recent prices that is usually `8xH100`.
 - **Opt-in:** name a dearer layout with `--gpu`; your own `--max-price`
   (USD per pod-hour) applies instead of the operator's caps:
 
