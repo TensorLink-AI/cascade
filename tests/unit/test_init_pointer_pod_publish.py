@@ -28,6 +28,7 @@ from .test_rolling import EB, Clock, FakeOps, _armed, _sched
 
 INIT_PTR = "metro-v1:trained:hippius:cascade/ckpt-4242-moe-random-init@sha256:" + "e" * 64
 WARM_PTR = "metro-v1:trained:hippius:cascade/member@sha256:" + "f" * 64
+KING_PTR = "metro-v1:trained:hippius:cascade/king@sha256:" + "b" * 64
 MOE = SimpleNamespace(arch_preset="cascade-moe-v2-120m", base_arch="cascade_moe")
 SIX = {k: 0.5 for k in RR._SIX_SCORE_KEYS}
 
@@ -44,7 +45,7 @@ def _gated(cfg):
 
 def _era(**kw):
     king = {"miner_hotkey": "KING", "miner_uid": 1, "role": "king", "gen_ref": "g",
-            "trained_pointer": "kptr", "corpus_digest": "d", "train_block": 1}
+            "trained_pointer": KING_PTR, "corpus_digest": "d", "train_block": 1}
     return EraState(index=12, start_block=12 * 4 * EB, seed_block=11 * 4 * EB, base_seed=4242,
                     epoch_start=12, king_entry=king, king_hotkey="KING", **kw)
 
@@ -175,7 +176,7 @@ def test_legacy_era_still_benches_but_builds_the_init_on_the_pod(cfg, tmp_path, 
     assert r.rents == ["4242"]                       # the legacy bench-host rent, unchanged
     host = r._rolling_king_hosts[12]
     assert r.builds == [host] and swept == [(host, "init")]
-    assert out == {**SIX, "_pointer": INIT_PTR}
+    assert out["_pointer"] == INIT_PTR and {k: out[k] for k in SIX} == SIX
 
 
 def test_legacy_warm_start_pushes_the_member_and_builds_nothing(cfg, tmp_path, wired):
@@ -189,7 +190,8 @@ def test_legacy_warm_start_pushes_the_member_and_builds_nothing(cfg, tmp_path, w
     wired.setattr(benchmarks, "extract_bench_scores", lambda report, **kw: dict(SIX))
     r = _Runner(_gated(cfg), tmp_path)
     r._rolling_king_hosts = {12: SimpleNamespace(name="era-king-pod")}
-    assert r._rolling_bench_init(_era(warm_start_ckpt=WARM_PTR)) == SIX
+    out = r._rolling_bench_init(_era(warm_start_ckpt=WARM_PTR))
+    assert "_pointer" not in out and {k: out[k] for k in SIX} == SIX
     assert pushed == [(f"/local/{WARM_PTR}", "init")]
     assert r.builds == [] and r.published == [] and r.rents == []
 
