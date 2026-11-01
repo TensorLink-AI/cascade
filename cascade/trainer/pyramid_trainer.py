@@ -102,27 +102,33 @@ def combine_gradients(parameters, reference, cap=0.1):
     return weight
 
 
-def power_ema_settings(contract):
-    """``(sigma_rels, eval_index)`` of the contract's power EMAs, validated.
+# Power EMA — IMAGE-ONLY (owner decision 2026-11-01). The settings are fixed
+# worker constants, NOT contract terms: they are not read from [training] /
+# [v2.training] and never enter ``contract_digest`` (the recipe check below
+# still pins the contract's own power_ema_sigma_rels to ()). They
+# ship with the worker image at an era boundary. Math is
+# ``moe_trainer.PowerEMA`` unchanged; every leg starts its own average (a
+# warm-started leg resumes the RAW weights_stable + optimizer lineage and never
+# inherits an average). The SCORED weights.safetensors is the
+# POWER_EMA_SIGMA_RELS[POWER_EMA_EVAL] average; a continuation snapshot carries
+# the raw model plus every EMA state, so a resumed leg restores them bitwise.
+POWER_EMA_SIGMA_RELS = (0.05, 0.10)
+POWER_EMA_EVAL = 1
 
-    The pyramid ships a power EMA (``moe_trainer.PowerEMA``, the same math)
-    as the scored ``weights.safetensors`` only: its averages are per-leg
-    (``power_ema_scope = "leg"``) because a warm start resumes the RAW
-    pre-cooldown lineage (``weights_stable`` + ``optimizer``), never a
-    lineage average. Armed widths with ``power_ema_eval = -1`` would bump the
-    digest while changing no shipped byte, so they are refused too."""
-    sigmas = tuple(float(s) for s in (getattr(contract, "power_ema_sigma_rels", ()) or ()))
-    index = int(getattr(contract, "power_ema_eval", -1))
+
+def power_ema_settings():
+    """``(sigma_rels, eval_index)`` of the image's fixed power EMAs, validated.
+    ``((), -1)`` (tests only) disables the average: the raw endpoint is scored."""
+    sigmas = tuple(float(s) for s in POWER_EMA_SIGMA_RELS)
+    index = int(POWER_EMA_EVAL)
     if not sigmas:
         if index != -1:
-            raise ValueError("pyramid recipe: power_ema_eval needs power_ema_sigma_rels")
+            raise ValueError("pyramid power EMA: eval index needs sigma_rels")
         return (), -1
     if not 0 <= index < len(sigmas):
-        raise ValueError(f"pyramid recipe requires 0 <= power_ema_eval < {len(sigmas)} "
-                         f"with power_ema_sigma_rels={sigmas!r}")
-    if str(getattr(contract, "power_ema_scope", "lineage")) != "leg":
-        raise ValueError("pyramid recipe requires power_ema_scope='leg' (warm starts "
-                         "resume the raw weights_stable lineage, never an average)")
+        raise ValueError(f"pyramid power EMA: eval index {index} out of range for {sigmas!r}")
+    if any(not 0 < s < math.sqrt(1 / 12) for s in sigmas):
+        raise ValueError(f"pyramid power EMA: sigma_rels must lie in (0, 0.2887): {sigmas!r}")
     return sigmas, index
 
 
@@ -163,7 +169,7 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
     expected = dict(optimizer="normuon_adamw", base_lr=0.002125, weight_decay=2e-8,
         grad_clip=7.0, batch_denomination="sequences", budget_denomination="points",
         masking="contiguous_patch", input_transform="arcsinh_causal", lr_schedule="wsd",
-        anneal_fraction=0.0, ema_decay=0.0,
+        anneal_fraction=0.0, ema_decay=0.0, power_ema_sigma_rels=(),
         copula_samples=4, copula_loss_cap=0.1, muon_momentum=0.96,
         muon_row_beta2=0.999, adamw_beta1=0.91, adamw_beta2=0.972,
         adamw_lr_scale=0.2, mup_lr_exponent=1.42, umup_base_d_model=512,
@@ -171,7 +177,7 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
     for name, value in expected.items():
         if getattr(contract, name) != value:
             raise ValueError(f"pyramid recipe requires {name}={value!r}")
-    ema_sigmas, ema_eval = power_ema_settings(contract)
+    ema_sigmas, ema_eval = power_ema_settings()
     if tuple(contract.accepted_fields) not in ((), ("groups",)):
         raise ValueError("pyramid recipe accepts only optional groups")
     if str(trainer.dtype) != "torch.float32":
@@ -211,7 +217,8 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
     # Power EMAs live on rank 0 only (the process that owns the model after
     # every gang sync): fp32 shadows of the PARAMETERS — buffers (the routing
     # bias) stay live — over a lane-B leg's selected leaves only. Always
-    # fresh per leg (see power_ema_settings); a continuation restores them.
+    # fresh per leg (see POWER_EMA_SIGMA_RELS); a continuation restores them.
+    # Memory: +len(sigmas) fp32 parameter copies on rank 0 (~10 GB at 1.23B).
     emas = [PowerEMA(model, s, expert_slices=slices) for s in ema_sigmas]
     optimizer = build_optimizer(source, cfg.d_model)
     if optimizer.adamw:
