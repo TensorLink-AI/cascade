@@ -1803,6 +1803,14 @@ def _kc_deferred(receipt: RoundReceipt, cfg: ChainConfig, kc: dict, manifest,
             return _fail(name, f"deferred for {why[:60]!r} but the signed report's init entry "
                                "is " + ("absent" if ib is None else "a real bench"))
         return _ok(name, f"deferred: {why[:80]} (signed report agrees)")
+    if why.startswith("no init pointer for this seed epoch"):
+        # [v2] init_epoch_bind_from_block: the init pointer did not bind this
+        # seed epoch — a reason only a settlement under the binding may give
+        from ..shared.era import init_epoch_bind_at
+
+        if not init_epoch_bind_at(cfg, int(receipt.epoch_start_block)):
+            return _fail(name, f"deferred for {why[:60]!r} at a settlement before [v2] "
+                               "init_epoch_bind_from_block")
     if why.startswith("no init pointer"):
         # DEC-CA-0063: a random-init epoch whose init checkpoint pointer the
         # trainer's report did not carry

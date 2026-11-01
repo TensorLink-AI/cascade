@@ -989,19 +989,32 @@ class _RollingMixin:
         """DEC-CA-0063 era: publish the random-init checkpoint POINTER the main
         validator's king check benches (it sweeps the init on its own GPU).
 
-        No bench, no rent: the init is built on the era's operator king pod
-        only while that pod is still mapped (right after a new seed epoch's
-        king leg, which trains from this same random init), harvested to the
-        box as plain files and uploaded. With no such pod — a cached/carried
-        king leg, a king leg on the king's own (payer) key, a released pod —
-        nothing is rented: the publish is deferred (the scheduler retries up
-        to its cap; a later era of the epoch inherits a published pointer).
-        A warm-started epoch needs nothing (its init is ``warm_start_ckpt``).
-        Returns the pointer-only entry ``{six sentinels, "_pointer"}`` or None."""
+        No bench, never a rent, never a payer (miner-key) pod, never a pod
+        with a leg in flight. The init is built — CPU, contract-digest checked
+        on the pod — harvested to the box as plain files and uploaded, on the
+        first OPERATOR-billed pod the trainer already holds for the seed
+        epoch, in this order:
+
+        1. the era's operator king pod while still mapped (right after a new
+           seed epoch's king leg, which trains from this same random init);
+        2. an IDLE operator lane (checked out of the lane pool, so no leg can
+           take it meanwhile; never the last idle lane);
+        3. otherwise the request is parked: the next operator-billed
+           challenger pod of this seed epoch builds it right after its leg's
+           harvest, before its release (:meth:`_rolling_init_on_leg_pod`).
+
+        Returns the pointer-only entry ``{six sentinels, "_pointer"}``, or
+        ``{"_deferred": why}`` while parked (the scheduler re-polls without
+        spending a try), or None (nothing to publish). A failed build raises
+        (a try). A warm-started epoch needs nothing."""
         if era.warm_start_ckpt:
             return None
-        if str(getattr(era, "init_pointer", "") or ""):
-            return {**pointer_only_init_scores(), "_pointer": str(era.init_pointer)}
+        built = (str(getattr(era, "init_pointer", "") or "")
+                 or self.__dict__.get("_init_pointers_built", {}).get(str(era.base_seed), ""))
+        if built:
+            return {**pointer_only_init_scores(), "_pointer": built}
+        if str(era.base_seed) in self.__dict__.get("_init_building", set()):
+            return {"_deferred": "being built on an operator leg pod"}
         contract = era_contracts(self.cfg, era)[0]
         if not _init_rebuildable(contract):
             log.warning("rolling: era %d init pointer — random init of base_arch %r is not "
@@ -1012,19 +1025,106 @@ class _RollingMixin:
         host = (self._final_role_hosts.get(("king", contract.arch_preset, king.miner_hotkey))
                 if king is not None else None)
         host = host or self.__dict__.get("_rolling_king_hosts", {}).get(era.index)
-        if host is None or getattr(host, "isolated", False):
-            log.warning("rolling: era %d init pointer deferred — no operator king pod is "
-                        "mapped to the era (%s); NOT renting one for it (validator bench "
-                        "source: the main validator benches the init)", era.index,
-                        "a payer pod never builds the init" if host is not None
-                        else "cached/carried or own-key king leg, or the pod was released")
-            return None
-        remote_dir = self._rolling_build_init_on_pod(host, era, contract)
-        pointer = self._rolling_harvest_publish_init(host, remote_dir, era, contract)
-        log.info("rolling: era %d random-init checkpoint built on king pod %s and published "
-                 "→ %s (pointer only; the main validator benches it)", era.index,
+        if host is not None and self._rolling_operator_host(host):
+            return self._rolling_init_entry_on(host, era, contract, "operator king pod")
+        lane = self._rolling_take_idle_operator_lane()
+        if lane is not None:
+            pool, lane_host = lane
+            try:
+                return self._rolling_init_entry_on(lane_host, era, contract,
+                                                   "idle operator lane")
+            finally:
+                pool.put(lane_host)
+        self.__dict__.setdefault("_init_pointer_wanted", {})[str(era.base_seed)] = era
+        why = ("the era's king pod is a payer (miner-key) pod" if host is not None
+               else "no operator king pod (cached/carried or own-key king leg, or released)")
+        logged = self.__dict__.setdefault("_init_defer_logged", set())
+        if era.index not in logged:
+            logged.add(era.index)
+            log.warning("rolling: era %d init pointer deferred — %s and no idle operator lane; "
+                        "NOT renting one. The next operator-billed challenger pod of seed "
+                        "epoch %s builds it after its leg", era.index, why, era.base_seed)
+        return {"_deferred": why}
+
+    def _rolling_init_entry_on(self, host, era, contract, what: str) -> dict:
+        pointer = self._rolling_harvest_publish_init(
+            host, self._rolling_build_init_on_pod(host, era, contract), era, contract)
+        self.__dict__.setdefault("_init_pointers_built", {})[str(era.base_seed)] = pointer
+        self.__dict__.get("_init_pointer_wanted", {}).pop(str(era.base_seed), None)
+        log.info("rolling: era %d random-init checkpoint built on %s %s and published → %s "
+                 "(pointer only; the main validator benches it)", era.index, what,
                  getattr(host, "name", host), pointer)
         return {**pointer_only_init_scores(), "_pointer": pointer}
+
+    def _rolling_operator_host(self, host) -> bool:
+        """``host`` is OPERATOR-billed: an operator lane on file (not
+        isolated), or a credential-free (isolated) pod whose ledger row has no
+        payer — never a payer's (miner-key) pod. ``isolated`` alone means
+        credential-free, which operator king / leg pods are too. Unknown ⇒
+        False."""
+        if host is None:
+            return False
+        if not getattr(host, "isolated", False):
+            return True
+        aid = str(getattr(host, "allocation_id", "") or "")
+        if not aid:
+            return False
+        try:
+            pods = self._load_funded_ledger()
+        except Exception:  # noqa: BLE001 — unknown billing ⇒ not ours to use
+            return False
+        return any(str(p.instance_id) == aid and not str(p.payer_hotkey or "") for p in pods)
+
+    def _rolling_take_idle_operator_lane(self):
+        """``(pool, host)``: an operator lane checked OUT of the existing
+        rolling lane pool (idle by the pool's own occupancy — a lane in the
+        queue has no leg), or None. Never builds the pool (that probes every
+        lane) and never takes the LAST idle lane (a fallback leg may need it)."""
+        import queue as _queue
+
+        pool = self.__dict__.get("_rolling_lane_pool_obj")
+        if pool is None or pool.qsize() < 2:
+            return None
+        try:
+            host = pool.get(block=False)
+        except _queue.Empty:
+            return None
+        if not self._rolling_operator_host(host):
+            pool.put(host)
+            return None
+        return pool, host
+
+    def _rolling_init_on_leg_pod(self, host, base_seed, teardown) -> bool:
+        """Called by an operator-billed leg pod's release, right after its
+        leg's verified harvest (the worker has exited). When a parked init
+        request is for this pod's seed epoch, claim it and build there in a
+        background thread that tears the pod down when done (``teardown``);
+        returns True then (the caller must NOT tear down). Else False."""
+        wanted = self.__dict__.get("_init_pointer_wanted", {})
+        key = str(base_seed)
+        if key not in wanted or not self._rolling_operator_host(host):
+            return False
+        era = wanted.pop(key, None)
+        if era is None:
+            return False
+        building = self.__dict__.setdefault("_init_building", set())
+        building.add(key)
+
+        def _run() -> None:
+            try:
+                contract = era_contracts(self.cfg, era)[0]
+                self._rolling_init_entry_on(host, era, contract,
+                                            "operator challenger pod (after its leg)")
+            except Exception as e:  # noqa: BLE001 — re-parked for the next pod
+                wanted.setdefault(key, era)
+                log.warning("rolling: era %d init build on leg pod %s failed: %s", era.index,
+                            getattr(host, "name", host), e)
+            finally:
+                building.discard(key)
+                teardown()
+
+        threading.Thread(target=_run, name=f"init-on-leg-{key[:8]}", daemon=True).start()
+        return True
 
     def _rolling_build_init_on_pod(self, host, era, contract) -> str:
         """Build the epoch's random-init checkpoint ON ``host`` (CPU), at the
@@ -1075,10 +1175,13 @@ class _RollingMixin:
         identity → its ``metro-v1:trained:`` pointer."""
         from pathlib import Path
 
+        from ..shared.bench_report import random_init_repo_name
         from ..shared.hippius import upload_dir_to_hub_or_hf
         from ..shared.manifest import format_trained_pointer
 
-        repo = f"ckpt-{era.base_seed}-{contract.arch_preset}-random-init"
+        # the basename binds the seed epoch (its seed block): validators check
+        # it once [v2] init_epoch_bind_from_block is in force
+        repo = random_init_repo_name(era.base_seed, contract.arch_preset, int(era.seed_block))
         full = f"{self.hub().namespace}/{repo}"
         up = upload_dir_to_hub_or_hf(Path(local), full, self.hub(),
                                      hf_repo=self._hf_ckpt_repo(full))

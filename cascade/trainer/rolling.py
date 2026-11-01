@@ -2045,6 +2045,10 @@ class RollingScheduler:
         def _run():
             try:
                 bench = self.ops.bench_init(era)
+                if isinstance(bench, dict) and "_deferred" in bench:
+                    # DEC-CA-0063 pointer parked for an operator pod of the
+                    # epoch: no try spent (re-polled, nothing rented)
+                    return
                 with self._lock:
                     if bench is not None:
                         bench = dict(bench)

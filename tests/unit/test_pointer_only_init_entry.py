@@ -107,7 +107,8 @@ def test_trainer_publishes_a_pointer_only_init_alone_and_without_rows(cfg):
 
 def _trainer_path(report):
     fake = SimpleNamespace(_fetch_bench_report=lambda rid, require=None: report,
-                           _king_check_need_rows=False)
+                           _king_check_need_rows=False,
+                           _kc_init_unbound=lambda m, p, r: False)   # binding off
     manifest = SimpleNamespace(prev_round_id="100", warm_start_ckpt="")
     rec = {"reasons": []}
     return KingCheckMixin._v2_king_check_trainer_bench(fake, manifest, KING_PTR, rec), rec
@@ -143,7 +144,8 @@ def test_validator_bench_path_takes_only_the_pointer_and_benches_it_itself():
     fake = SimpleNamespace(
         _vbench={"mode": "sweep", "round_id": "101"}, _king_check_need_rows=False,
         _fetch_bench_report=lambda rid, raise_unavailable=False: _report(_init_entry()),
-        _vbench_side=side, _vbench_infra=lambda e: None)
+        _vbench_side=side, _vbench_infra=lambda e: None,
+        _kc_init_unbound=lambda m, p, r: False)                       # binding off
     manifest = SimpleNamespace(prev_round_id="100", warm_start_ckpt="", round_id="101")
     king = SimpleNamespace(miner_hotkey="KING", miner_uid=1, gen_ref=CID, size="p")
     rec = {"reasons": []}

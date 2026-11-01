@@ -463,6 +463,20 @@ def bench_source_from(cfg: Any) -> int:
     return int(getattr(v2, "bench_source_from_block", 0) or 0)
 
 
+def init_epoch_bind_from(cfg: Any) -> int:
+    """``[v2] init_epoch_bind_from_block`` (0 = never): the settlement
+    boundary from which the king check accepts a random-init epoch's init
+    pointer only when it binds that seed epoch (release-then-activate)."""
+    return max(0, int(getattr(getattr(cfg, "v2", None), "init_epoch_bind_from_block", 0) or 0))
+
+
+def init_epoch_bind_at(cfg: Any, boundary: int | None) -> bool:
+    """CONSENSUS: the init-pointer epoch binding is in force at the
+    settlement ``boundary``."""
+    n = init_epoch_bind_from(cfg)
+    return bool(n > 0 and boundary is not None and int(boundary) >= n)
+
+
 def validator_bench_era(cfg: Any, era_start: int | None) -> bool:
     """CONSENSUS: whether the era starting at ``era_start`` takes its lane-A
     bench rows from the main validator (DEC-CA-0063) instead of the trainer.

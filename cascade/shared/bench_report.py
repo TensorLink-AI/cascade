@@ -59,6 +59,34 @@ def pointer_only_init_scores() -> dict:
     return {k: POINTER_ONLY_INIT_SCORE for k in SIX_SCORE_KEYS}
 
 
+# The published random-init checkpoint's repository basename binds its seed
+# epoch: ``ckpt-<base_seed>-<arch>-random-init-sb<seed_block>``, where
+# ``seed_block`` is the epoch's seed block — the ``seed_block`` of every
+# manifest era stamp of that epoch, which validators already verify
+# (era_gate). The Hub and HF-fallback refs both keep the basename.
+RANDOM_INIT_EPOCH_TAG = "-random-init-sb"
+
+
+def random_init_repo_name(base_seed, arch_preset: str, seed_block: int) -> str:
+    """The random-init checkpoint repo basename for a seed epoch."""
+    return f"ckpt-{base_seed}-{arch_preset}{RANDOM_INIT_EPOCH_TAG}{int(seed_block)}"
+
+
+def init_pointer_bound_to_epoch(pointer: str, seed_block: int | None) -> bool:
+    """CONSENSUS (once ``[v2] init_epoch_bind_from_block`` is in force): the
+    random-init ``pointer`` names the seed epoch whose seed block is
+    ``seed_block`` (:func:`random_init_repo_name`). Pure."""
+    from .manifest import parse_trained_pointer
+
+    if seed_block is None:
+        return False
+    ref = parse_trained_pointer(str(pointer or ""))
+    if ref is None:
+        return False
+    base = ref.split("@", 1)[0].rsplit("/", 1)[-1]
+    return base.endswith(f"{RANDOM_INIT_EPOCH_TAG}{int(seed_block)}")
+
+
 def bench_report_key(round_id: str) -> str:
     return f"benchmarks/round-{round_id}.json"
 

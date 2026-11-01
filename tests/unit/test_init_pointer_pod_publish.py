@@ -64,6 +64,10 @@ class _Runner(RR._RollingMixin):
         self.rents: list[str] = []
         self.builds: list = []
         self.published: list = []
+        self.ledger: list = []
+
+    def _load_funded_ledger(self):
+        return list(self.ledger)
 
     def _rent_king_host(self, round_id):
         self.rents.append(round_id)
@@ -109,9 +113,12 @@ def test_validator_era_without_a_king_pod_rents_nothing_and_defers(cfg, tmp_path
                                                                    caplog):
     r = _Runner(_vsrc(_gated(cfg)), tmp_path)
     with caplog.at_level(logging.WARNING, logger="cascade.trainer"):
-        assert r._rolling_bench_init(_era()) is None
+        out = r._rolling_bench_init(_era())
+        again = r._rolling_bench_init(_era())
+    assert "_deferred" in out and "_deferred" in again
     assert r.rents == [] and r.builds == [] and r.published == []
-    assert "NOT renting" in caplog.text
+    assert caplog.text.count("NOT renting") == 1          # logged once per era
+    assert "4242" in r._init_pointer_wanted                # parked for an operator pod
 
 
 def test_validator_era_publishes_the_pointer_from_the_mapped_king_pod(cfg, tmp_path, wired):
@@ -130,8 +137,9 @@ def test_validator_era_publishes_the_pointer_from_the_mapped_king_pod(cfg, tmp_p
 def test_validator_era_never_builds_on_a_payer_pod(cfg, tmp_path, wired):
     r = _Runner(_vsrc(_gated(cfg)), tmp_path)
     r._final_role_hosts[("king", MOE.arch_preset, "KING")] = SimpleNamespace(
-        name="payer", isolated=True)
-    assert r._rolling_bench_init(_era()) is None
+        name="payer", isolated=True, allocation_id="payer-pod-0")
+    r.ledger = [SimpleNamespace(instance_id="payer-pod-0", payer_hotkey="KING")]
+    assert "_deferred" in r._rolling_bench_init(_era())
     assert r.rents == [] and r.builds == []
 
 
@@ -300,3 +308,94 @@ def test_the_tries_cap_carries_across_the_seed_epoch():
     dst2 = _era()
     RollingScheduler._carry_epoch_king(fake, src2, dst2)
     assert dst2.init_pointer == INIT_PTR and dst2.init_bench == SIX
+
+
+# ── operator-billed pods only (owner follow-up) ─────────────────────────────
+
+def _op_pod(name="op-king", aid="op-pod-0"):
+    """A credential-free (isolated) pod — operator king / leg pods are too."""
+    return SimpleNamespace(name=name, isolated=True, allocation_id=aid)
+
+
+def test_isolated_operator_king_pod_is_used(cfg, tmp_path, wired):
+    r = _Runner(_vsrc(_gated(cfg)), tmp_path)
+    pod = _op_pod()
+    r.ledger = [SimpleNamespace(instance_id="op-pod-0", payer_hotkey="")]
+    r._rolling_king_hosts = {12: pod}
+    assert r._rolling_bench_init(_era())["_pointer"] == INIT_PTR
+    assert r.builds == [pod] and r.rents == []
+
+
+def _lanes(*hosts):
+    import queue
+
+    q = queue.Queue()
+    for h in hosts:
+        q.put(h)
+    return q
+
+
+def test_an_idle_operator_lane_builds_it_and_is_handed_back(cfg, tmp_path, wired):
+    r = _Runner(_vsrc(_gated(cfg)), tmp_path)
+    a, b = SimpleNamespace(name="lane-a"), SimpleNamespace(name="lane-b")
+    r._rolling_lane_pool_obj = pool = _lanes(a, b)
+    assert r._rolling_bench_init(_era())["_pointer"] == INIT_PTR
+    assert r.builds == [a] and r.rents == []
+    assert pool.qsize() == 2                                # handed back
+
+
+def test_busy_last_or_payer_lanes_are_never_taken(cfg, tmp_path, wired):
+    for hosts in ((),                                       # every lane busy
+                  (SimpleNamespace(name="lane-a"),),        # the last idle lane
+                  (_op_pod("payer-1", "p1"), _op_pod("payer-2", "p2"))):   # payer pods
+        r = _Runner(_vsrc(_gated(cfg)), tmp_path)
+        r.ledger = [SimpleNamespace(instance_id="p1", payer_hotkey="M1"),
+                    SimpleNamespace(instance_id="p2", payer_hotkey="M2")]
+        r._rolling_lane_pool_obj = pool = _lanes(*hosts)
+        assert "_deferred" in r._rolling_bench_init(_era())
+        assert r.builds == [] and r.rents == [] and pool.qsize() == len(hosts)
+
+
+def test_a_parked_init_is_built_on_the_next_operator_leg_pod_after_its_leg(cfg, tmp_path,
+                                                                          wired):
+    r = _Runner(_vsrc(_gated(cfg)), tmp_path)
+    assert "_deferred" in r._rolling_bench_init(_era())
+    torn = []
+    payer = _op_pod("payer-leg", "pl")
+    r.ledger = [SimpleNamespace(instance_id="pl", payer_hotkey="MINER"),
+                SimpleNamespace(instance_id="ol", payer_hotkey="")]
+    # a payer pod or another seed epoch's pod never claims it
+    assert r._rolling_init_on_leg_pod(payer, 4242, lambda: torn.append("p")) is False
+    assert r._rolling_init_on_leg_pod(_op_pod("other", "ol"), 999,
+                                      lambda: torn.append("x")) is False
+    leg = _op_pod("op-leg", "ol")
+    assert r._rolling_init_on_leg_pod(leg, 4242, lambda: torn.append("leg")) is True
+    end = time.time() + 10
+    while torn != ["leg"] and time.time() < end:
+        time.sleep(0.01)
+    assert torn == ["leg"]                       # torn down by the build thread, once
+    assert r.builds == [leg] and r.rents == []
+    out = r._rolling_bench_init(_era())          # the next scheduler poll picks it up
+    assert out["_pointer"] == INIT_PTR and r.builds == [leg]
+
+
+def test_a_deferral_spends_no_try(cfg, tmp_path):
+    clock = Clock()
+
+    class _Parked(FakeOps):
+        calls = 0
+
+        def bench_init(self, era):
+            type(self).calls += 1
+            return {"_deferred": "no operator pod"}
+
+    sched, ops = _sched(_armed(cfg), tmp_path, clock, ops=_Parked(tmp_path, clock))
+    sched._ladder_era = lambda era: True
+    era = _era()
+    for _ in range(5):
+        clock.t += sched.INIT_BENCH_SECONDS + 1
+        sched._maybe_bench_init(era, clock.t)
+        end = time.time() + 10
+        while sched._init_threads and time.time() < end:
+            time.sleep(0.01)
+    assert type(ops).calls == 5 and era.init_bench_tries == 0 and era.init_bench is None
