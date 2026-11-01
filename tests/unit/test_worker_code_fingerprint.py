@@ -173,10 +173,18 @@ def test_stale_funded_pod_is_released_and_the_leg_rents_again(tmp_path, monkeypa
     from cascade.provision import funded as funded_mod
     from tests.unit.test_funded_pod_wiring import _challenger, _rent_ok, _runner, _vault
 
+    from dataclasses import replace
+
+    from cascade.provision.core import PodAddress
+
     runner = _runner(tmp_path)
     _vault(tmp_path, "hkA")
     rents, torn = [], []
-    monkeypatch.setattr(funded_mod, "rent_funded_pod", lambda **kw: rents.append(1) or _rent_ok())
+    # The stale pod's host is quarantined, so the replacement is on another
+    # host (one back on the quarantined host is torn down before any probe).
+    hosts = [_rent_ok(), replace(_rent_ok(), address=PodAddress(ip="10.9.9.10", ssh_port=2222))]
+    monkeypatch.setattr(funded_mod, "rent_funded_pod",
+                        lambda **kw: rents.append(1) or hosts.pop(0))
     monkeypatch.setattr(funded_mod, "teardown_funded",
                         lambda pods, vault, **kw: (torn.extend(p.instance_id for p in pods), [])[1])
     verdicts = ["stale worker image: pod code aaaa… (85 files) != pinned bbbb…", ""]
@@ -184,7 +192,7 @@ def test_stale_funded_pod_is_released_and_the_leg_rents_again(tmp_path, monkeypa
     host, pod = runner._rent_funded_host("777", _challenger("hkA"))
     assert len(rents) == 2                          # first pod rejected, second served
     assert torn == [pod.instance_id]                # the stale pod was released
-    assert host.host == "10.9.9.9"
+    assert host.host == "10.9.9.10"
     assert "hkA" not in runner._funded_leg_failures  # nothing recorded against the miner
 
 
