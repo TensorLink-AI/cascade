@@ -691,17 +691,20 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
         miner's training was fine, the operator's pull was not).
 
         r2 transport (:mod:`cascade.trainer.r2_transfer`): the same verdicts,
-        but the checkpoint moves pod → R2 and is verified there; ``release``
-        (when given) tears the pod down once it is verified on R2, BEFORE the
-        Hippius push."""
+        but the checkpoint moves pod → R2 and is verified there; the release
+        (``release`` when given, else the thread-armed one —
+        :mod:`cascade.trainer.harvest_release`) tears the pod down once the R2
+        copy matches the pod's listing, BEFORE the Hippius push. ssh
+        transport: the release runs once the box copy matches the pod's
+        listing and every ingest guard passed, before the upload."""
         from .runner_common import r2_transport_on
 
         if r2_transport_on(self.cfg):
             if not getattr(receipt, "marketcast", None):
                 from .r2_transfer import harvest_checkpoint_r2
 
-                return harvest_checkpoint_r2(self, host, receipt, contract, seeds, suffix,
-                                             release=release)
+                return _mark_harvested(self, host, harvest_checkpoint_r2(
+                    self, host, receipt, contract, seeds, suffix, release=release))
             log.warning("funded leg %s: MarketCast fine-tune harvested over ssh (its "
                         "verifier reads a local copy; r2 transport covers Cascade "
                         "checkpoints only)", receipt.miner_hotkey[:12])
@@ -728,7 +731,8 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
 
         verified = verify_harvest_complete(
             self, host, receipt.checkpoint_dir, dest,
-            reharvest=lambda: harvest_remote_dir(host, receipt.checkpoint_dir, dest))
+            reharvest=lambda: harvest_remote_dir(host, receipt.checkpoint_dir, dest),
+            release=release)
         if getattr(receipt, "marketcast", None):
             # DEC-CA-0064: a Timestral fine-tune, not a Cascade-MoE checkpoint
             from .marketcast_runner import verify_harvested_mkt_checkpoint
@@ -736,7 +740,7 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
             why = verify_harvested_mkt_checkpoint(self, dest, receipt)
             if why:
                 raise _FundedTamper(f"checkpoint: {why}")
-            release_if_verified(self, verified)
+            release_if_verified(self, verified, release)
             ckpt_repo = (f"{self.hub().namespace}/ckpt-r{seeds.base_seed}-"
                          f"{receipt.role}-mkt{suffix}")
             self._mkt_harvested[receipt.miner_hotkey] = dict(receipt.marketcast)
@@ -775,7 +779,7 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
         # Every guard passed on a copy verified complete: nothing needs the
         # pod any more — release it, then upload from the box copy (kept
         # until a pinned ref returns; a failed upload re-uploads from it).
-        release_if_verified(self, verified)
+        release_if_verified(self, verified, release)
         size = contract.arch_preset
         ckpt_repo = (f"{self.hub().namespace}/ckpt-r{seeds.base_seed}-"
                      f"{receipt.role}-{size}{suffix}")

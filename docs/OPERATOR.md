@@ -1040,8 +1040,16 @@ How it works (`cascade/trainer/r2_transfer.py`):
    guard (`verify_checkpoint`) runs on a sparse skeleton in the system temp
    dir: small files in full, plus each safetensors header followed by a hole
    of the real length. That is a few KB on disk.
-5. **The pod is torn down now**, before any Hippius push. When the completion
-   bench keeps the pod, it stays for the bench as before.
+5. **The pod is torn down now**, before any Hippius push — the early release
+   of `funded_release_after_harvest` (above), with the R2 objects as the
+   verified copy: the box asks the pod for its own listing of the checkpoint
+   dir (size + sha256 per file) and every pushed file on R2 must match it,
+   with nothing missing on either side (files the transport leaves on the pod
+   — off the push allow-list or in subdirectories — are not compared). Then
+   `pod released after verified r2 harvest (…) — Hippius push continues from
+   R2`. An unreachable listing or any difference keeps the pod to leg end (no
+   re-upload); the knob off keeps it too. When the completion bench keeps the
+   pod, it stays for the bench as before.
 6. The Hippius push from R2:
    - **Relay host** (`[round] ckpt_relay_host = "<name>"`): an operator-owned
      VM listed as a `[[host]]` entry in the hosts file. The box sshes in and

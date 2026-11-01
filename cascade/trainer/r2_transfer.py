@@ -709,7 +709,9 @@ def harvest_checkpoint_r2(runner, host, receipt, contract, seeds, suffix: str, *
                           release=None):
     """r2-mode :meth:`TrainerRunner._harvest_funded_checkpoint`: pod → R2,
     verify (sizes, tensor digests by streaming hash, contract guard on a
-    sparse skeleton), ``release()`` the pod, then the Hippius push via
+    sparse skeleton, R2 copy vs the pod's listing), ``release()`` the pod
+    (explicit or thread-armed, :mod:`cascade.trainer.harvest_release`), then
+    the Hippius push via
     :func:`cascade.trainer.loop.upload_harvested_checkpoint` (its retries and
     pending record — here naming the R2 keys). Same verdicts as the ssh
     harvest: deviations raise ``_FundedTamper`` / ``_FundedDiverged``, our
@@ -754,10 +756,16 @@ def harvest_checkpoint_r2(runner, host, receipt, contract, seeds, suffix: str, *
         raise _FundedTamper(f"checkpoint: {e}") from e
     finally:
         shutil.rmtree(skeleton, ignore_errors=True)
-    if release is not None:
-        # Every byte the leg produced is on R2 and verified: the pod (and its
-        # bill) goes NOW, before the Hippius push, whatever the push does.
-        release()
+    # Early pod release (#405 on the r2 path): the "verified copy" is the R2
+    # objects. Released only when a release is armed (or passed), the knob is
+    # on, and every pushed file on R2 matches the POD's own listing by size
+    # and sha256 — then the pod (and its bill) goes NOW, before the Hippius
+    # push, whatever the push does. Any doubt keeps it to leg end.
+    from .harvest_release import release_if_verified, verify_r2_harvest_complete
+
+    verified = verify_r2_harvest_complete(runner, host, receipt.checkpoint_dir,
+                                          ckpt.files, release)
+    release_if_verified(runner, verified, release, where="r2")
     size = contract.arch_preset
     record = {
         "r2": ckpt.to_record(), "harvest_job_id": job_id,

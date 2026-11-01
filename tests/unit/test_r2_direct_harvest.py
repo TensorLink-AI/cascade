@@ -123,11 +123,17 @@ class FakePod:
     """Plays the pod behind ``run_ssh``: lists files, streams byte ranges into
     the fake R2 links and answers with curl's ``-D -`` header dump."""
 
-    def __init__(self, files: dict[str, bytes], store: FakeStore, events=None, *, corrupt=None):
+    def __init__(self, files: dict[str, bytes], store: FakeStore, events=None, *, corrupt=None,
+                 listing=None, nested=None):
         self.files = files
         self.store = store
         self.events = events if events is not None else []
         self.corrupt = corrupt or {}          # name → bytes swapped in at upload
+        # The pod's own sha256 listing (#405 release check): ``listing`` maps
+        # name → bytes the pod reports (default: its files), or "fail" for an
+        # unreachable listing; ``nested`` adds files in subdirectories.
+        self.listing = listing
+        self.nested = nested or {}
         self.commands: list[str] = []
         self.stdins: list[str] = []
 
@@ -137,6 +143,14 @@ class FakePod:
         self.stdins.append(stdin_text or "")
         if "find . -maxdepth 1" in cmd:
             out = "".join(f"{n}\t{len(b)}\n" for n, b in self.files.items())
+            return CompletedProcess(argv, 0, out, "")
+        if "sha256sum" in cmd:
+            self.events.append("pod-listing")
+            if self.listing == "fail":
+                return CompletedProcess(argv, 255, "", "ssh: connect timed out")
+            listed = {**(self.files if self.listing is None else self.listing), **self.nested}
+            out = "".join(f"S {len(b)} ./{n}\n" for n, b in listed.items())
+            out += "".join(f"{hashlib.sha256(b).hexdigest()}  ./{n}\n" for n, b in listed.items())
             return CompletedProcess(argv, 0, out, "")
         m = _TAIL.search(cmd)
         if m:
@@ -268,7 +282,8 @@ class _Disp:
             gpu_name="RTX4090", size=kw["arch_preset"], tensor_digests=dict(self.digests))
 
 
-def _r2_runner(tmp_path, monkeypatch, *, files=None, corrupt=None, relay=None, **round_kw):
+def _r2_runner(tmp_path, monkeypatch, *, files=None, corrupt=None, relay=None,
+               listing=None, nested=None, **round_kw):
     work = tmp_path / "work"
     work.mkdir()
     round_kw.setdefault("ckpt_relay_host", "relay" if relay is not None else "")
@@ -293,7 +308,8 @@ def _r2_runner(tmp_path, monkeypatch, *, files=None, corrupt=None, relay=None, *
     store = FakeStore()
     runner._r2_store = store
     files = files or _ckpt_files()
-    runner._r2_ssh_runner = FakePod(files, store, events, corrupt=corrupt)
+    runner._r2_ssh_runner = FakePod(files, store, events, corrupt=corrupt, listing=listing,
+                                    nested=nested)
     if relay is not None:
         runner.remote_hosts = [*runner.remote_hosts, relay]
     verified = []
@@ -665,3 +681,134 @@ def test_runner_binds_the_new_seams():
     # the r2 glue only touches runner attributes TrainerRunner really has
     for name in ("_harvest_funded_checkpoint", "hub", "_hf_ckpt_repo"):
         assert hasattr(TrainerRunner, name)
+
+
+# ── #398 × #405: early pod release on the r2 path ────────────────────────────
+#
+# With the r2 transport the "verified copy" is the R2 objects: the pod goes
+# only after every pushed file on R2 matches the POD's own sha256 listing
+# (sizes + sha256), after the tensor digests and the contract guard, and
+# before the Hippius push. Any doubt keeps the pod to leg end.
+
+_TEARDOWN = "teardown cascade-n91-777-funded-hka-0"
+
+
+def test_r2_release_waits_for_the_pod_listing_match_then_precedes_the_push(
+        tmp_path, monkeypatch, caplog):
+    import logging
+
+    from cascade.trainer.harvest_release import RELEASE_LOG_R2
+
+    t = _r2_runner(tmp_path, monkeypatch)
+    with caplog.at_level(logging.INFO, logger="cascade.trainer"):
+        _leg(t)
+    ev = t.events
+    last_put = max(i for i, e in enumerate(ev) if e.startswith("put "))
+    assert last_put < ev.index("pod-listing") < ev.index(_TEARDOWN) < ev.index("hippius push")
+    assert ev.count(_TEARDOWN) == 1
+    assert ev.count("pod-listing") == 1
+    pushed = {n: b for n, b in t.files.items() if r2.checkpoint_file_allowed(n)}
+    assert RELEASE_LOG_R2 % (len(pushed), sum(map(len, pushed.values())) / 1e9) in caplog.text
+    # nothing was ever written under work_root on the way
+    assert _checkpoint_files_under(t.work) == []
+
+
+def test_r2_files_outside_the_push_scope_do_not_block_the_release(tmp_path, monkeypatch):
+    # notes.bin / .train_complete (off the allow-list) and a nested file are
+    # left on the pod by the transport and by the push: not compared
+    t = _r2_runner(tmp_path, monkeypatch, nested={"logs/train.log": b"step 1\n"})
+    _leg(t)
+    assert t.events.index(_TEARDOWN) < t.events.index("hippius push")
+
+
+@pytest.mark.parametrize("listing", [
+    "fail",                                                         # pod unreachable
+    {**_ckpt_files(), "config.json": b'{"toto2": {"x": 1}}'},       # size + sha256 differ
+    {**_ckpt_files(), "model.py": b"# modeL\n"},                    # same size, sha256 differs
+    {**_ckpt_files(), "weights_ema.safetensors": _safetensors(8)},  # pod has a file R2 lacks
+    {n: b for n, b in _ckpt_files().items() if n != "model.py"},    # R2 has a file the pod lacks
+], ids=["unreachable", "size", "sha256", "missing-on-r2", "extra-on-r2"])
+def test_r2_unverified_against_the_pod_keeps_it_until_after_the_push(
+        tmp_path, monkeypatch, listing):
+    t = _r2_runner(tmp_path, monkeypatch, listing=listing)
+    entry = _leg(t)
+    assert "cascade/ckpt-r777-challenger-toto2-4m@sha256:" in entry.trained_pointer
+    assert t.events.count(_TEARDOWN) == 1
+    assert t.events.index("hippius push") < t.events.index(_TEARDOWN)   # leg-end teardown
+
+
+def test_r2_release_knob_off_keeps_the_pod_and_never_lists_it(tmp_path, monkeypatch):
+    t = _r2_runner(tmp_path, monkeypatch, funded_release_after_harvest=False)
+    _leg(t)
+    assert "pod-listing" not in t.events
+    assert t.events.index("hippius push") < t.events.index(_TEARDOWN)
+    assert t.events.count(_TEARDOWN) == 1
+
+
+def test_r2_tamper_never_lists_or_releases_early(tmp_path, monkeypatch):
+    files = _ckpt_files()
+    t = _r2_runner(tmp_path, monkeypatch, files=files,
+                   corrupt={"weights.safetensors": _safetensors(64)[:-4] + b"\x00\x00\xc0\x7f"})
+    with pytest.raises(_FundedTamper):
+        _leg(t)
+    assert "pod-listing" not in t.events          # the ingest guards run first
+    assert t.events.count(_TEARDOWN) == 1
+
+
+def test_r2_push_failure_after_release_requeues_from_r2_without_the_pod(
+        tmp_path, monkeypatch):
+    t = _r2_runner(tmp_path, monkeypatch, min_free_disk_gb=0.0)
+    monkeypatch.setattr(runner_common, "DISK_USAGE",
+                        lambda p: SimpleNamespace(total=1 << 40, used=0, free=100))
+    from cascade.trainer.faults import _OperatorFault
+    with pytest.raises(_OperatorFault, match="kept on R2"):
+        _leg(t)
+    # released early (verified on R2), exactly once, and the push never ran
+    assert t.events.index("pod-listing") < t.events.index(_TEARDOWN)
+    assert t.events.count(_TEARDOWN) == 1 and "hippius push" not in t.events
+    assert runner_common.read_pending_upload(t.work, 777, "hkA")["r2"]["files"]
+
+
+def test_r2_explicit_release_respects_the_knob_and_the_listing():
+    from cascade.trainer.harvest_release import verify_r2_harvest_complete
+
+    files = _ckpt_files()
+    on_r2 = {n: {"key": f"k/{n}", "size": len(b), "sha256": hashlib.sha256(b).hexdigest()}
+             for n, b in files.items() if r2.checkpoint_file_allowed(n)}
+    host = RemoteHost(name="pod", host="10.0.0.9", workdir="/w")
+    pod = FakePod(files, FakeStore())
+    on = SimpleNamespace(cfg=SimpleNamespace(round=RoundConfig()), _r2_ssh_runner=pod)
+    got = verify_r2_harvest_complete(on, host, "ck", on_r2, release=lambda: None)
+    assert got is not None and got.files == len(on_r2)
+    assert got.nbytes == sum(m["size"] for m in on_r2.values())
+    # nothing armed and no explicit release: no ssh at all
+    n = len(pod.commands)
+    assert verify_r2_harvest_complete(on, host, "ck", on_r2) is None
+    off = SimpleNamespace(cfg=SimpleNamespace(round=RoundConfig(
+        funded_release_after_harvest=False)), _r2_ssh_runner=pod)
+    assert verify_r2_harvest_complete(off, host, "ck", on_r2, release=lambda: None) is None
+    assert len(pod.commands) == n
+    assert verify_r2_harvest_complete(on, host, "ck", {}, release=lambda: None) is None
+
+
+def test_r2_manifest_mismatches_scope_and_reasons():
+    from cascade.trainer.harvest_release import r2_manifest_mismatches
+
+    def entry(b):
+        return (len(b), hashlib.sha256(b).hexdigest())
+
+    def meta(b):
+        return {"size": len(b), "sha256": hashlib.sha256(b).hexdigest()}
+
+    pod = {"weights.safetensors": entry(b"w"), "config.json": entry(b"c"),
+           "notes.bin": entry(b"n"), "sub/weights.safetensors": entry(b"x")}
+    r2_files = {"weights.safetensors": meta(b"w"), "config.json": meta(b"c")}
+    assert r2_manifest_mismatches(pod, r2_files) == []
+    bad = r2_manifest_mismatches({**pod, "config.json": entry(b"cc")}, r2_files)
+    assert bad == ["config.json: 1 bytes on R2, 2 on the pod"]
+    bad = r2_manifest_mismatches({**pod, "config.json": entry(b"d")}, r2_files)
+    assert bad == ["config.json: sha256 differs from the pod's"]
+    bad = r2_manifest_mismatches({k: v for k, v in pod.items() if k != "config.json"}, r2_files)
+    assert bad == ["config.json: on R2 but not on the pod"]
+    bad = r2_manifest_mismatches({**pod, "model.py": entry(b"m")}, r2_files)
+    assert bad == ["model.py: missing from R2"]

@@ -25,6 +25,13 @@ trust anchor: the pod is miner-controlled, so the ingest guards stay the
 integrity gate either way. Any doubt — no callback armed, the knob off, an
 empty copy, an unreachable pod, a mismatch — keeps the pod, i.e. exactly the
 pre-change behaviour (torn down when the leg returns).
+
+With the r2 transport (``[round] funded_harvest_transport = "r2"``,
+:mod:`cascade.trainer.r2_transfer`) nothing lands on the box: the verified
+copy is the R2 objects, so the release runs once every pushed file on R2
+matches the pod's listing by size and sha256
+(:func:`verify_r2_harvest_complete`), after the tensor digests and the
+contract guard passed, and before the Hippius push.
 """
 
 from __future__ import annotations
@@ -41,6 +48,8 @@ log = logging.getLogger("cascade.trainer")
 
 RELEASE_LOG = ("pod released after verified harvest (%d files, %.2f GB) — "
                "upload continues from the box copy")
+RELEASE_LOG_R2 = ("pod released after verified r2 harvest (%d files, %.2f GB) — "
+                  "Hippius push continues from R2")
 
 
 @dataclass(frozen=True)
@@ -126,14 +135,16 @@ def manifest_mismatches(pod: dict, box: dict) -> list[str]:
 
 
 def verify_harvest_complete(runner, host, remote_dir: str, dest: Path,
-                            reharvest: Callable[[], None]) -> VerifiedHarvest | None:
+                            reharvest: Callable[[], None],
+                            release: Callable[[], None] | None = None
+                            ) -> VerifiedHarvest | None:
     """Check the box copy at ``dest`` against the pod's listing of
     ``remote_dir``. Returns the verified summary, or ``None`` (keep the pod)
     when no release is armed, the copy is empty, the pod cannot list its
     dir, or the copy still differs after one ``reharvest()``. Never raises
     for a listing problem; ``reharvest`` failures propagate (the harvest
     itself failed, as today)."""
-    if armed_release(runner) is None:
+    if release_callback(runner, release) is None:
         return None
     from concurrent.futures import ThreadPoolExecutor
 
@@ -170,11 +181,79 @@ def verify_harvest_complete(runner, host, remote_dir: str, dest: Path,
     return None
 
 
-def release_if_verified(runner, verified: VerifiedHarvest | None) -> bool:
-    """Run the armed release for a verified harvest; True once released. A
-    release that raises is logged and reported unreleased (the leg's own
-    teardown then runs as before)."""
-    fn = armed_release(runner)
+def r2_manifest_mismatches(pod: dict, r2_files: dict) -> list[str]:
+    """Why the R2 copy (``R2Checkpoint.files``: {name: {key, size, sha256}})
+    is not the pod's checkpoint. Only the files the r2 transport carries are
+    in scope — top-level regular files on the push allow-list
+    (:func:`cascade.trainer.r2_transfer.checkpoint_file_allowed`); the
+    transport deliberately leaves anything else on the pod, and so does
+    the Hippius push. Every in-scope pod file must be on R2 with the same
+    size and sha256, and R2 must hold nothing the pod does not list."""
+    from .r2_transfer import checkpoint_file_allowed
+
+    scoped = {p: v for p, v in pod.items()
+              if "/" not in p and checkpoint_file_allowed(p)}
+    on_r2 = {name: (int(m["size"]), str(m["sha256"])) for name, m in r2_files.items()}
+    bad = manifest_mismatches(scoped, on_r2)
+    return [b.replace("the box copy", "R2").replace("on the box", "on R2") for b in bad]
+
+
+def verify_r2_harvest_complete(runner, host, remote_dir: str, r2_files: dict,
+                               release: Callable[[], None] | None = None
+                               ) -> VerifiedHarvest | None:
+    """r2 transport (#398) twin of :func:`verify_harvest_complete`: the
+    "verified copy" is the set of R2 objects (sizes + sha256 already streamed
+    back by the box), checked against the POD's own listing of
+    ``remote_dir``. ``None`` (keep the pod until leg end) when no release is
+    armed (``release`` given or thread-armed, knob on), R2 holds nothing,
+    the pod cannot list its dir, or anything differs. No re-harvest here: a
+    second multipart upload costs as much as the first, and keeping the pod
+    is the safe pre-change path. Never raises for a listing problem."""
+    if release_callback(runner, release) is None:
+        return None
+    from . import remote
+
+    if not r2_files:
+        log.warning("r2 harvest of %s: nothing on R2 — pod kept", remote_dir)
+        return None
+    try:
+        # Same ssh seam as the r2 part uploads (tests script the pod there).
+        pod = remote.remote_file_manifest(
+            host, remote_dir, runner=getattr(runner, "_r2_ssh_runner", None))
+    except Exception as e:  # noqa: BLE001 — unverifiable ⇒ keep the pod
+        log.warning("r2 harvest of %s: pod listing unavailable (%s) — pod kept "
+                    "until the push ends", remote_dir, str(e)[-200:])
+        return None
+    bad = r2_manifest_mismatches(pod, r2_files)
+    if bad:
+        log.warning("r2 harvest of %s: R2 copy differs from the pod's checkpoint "
+                    "(%d file(s): %s) — pod kept, not released", remote_dir, len(bad),
+                    "; ".join(bad[:3]))
+        return None
+    return VerifiedHarvest(files=len(r2_files),
+                           nbytes=sum(int(m["size"]) for m in r2_files.values()))
+
+
+def release_callback(runner, release: Callable[[], None] | None = None
+                     ) -> Callable[[], None] | None:
+    """The release to run: an explicitly passed ``release`` (the r2 harvest's
+    keyword), else the thread-armed one — either way ``None`` while
+    ``[round] funded_release_after_harvest`` is off."""
+    if release is None:
+        return armed_release(runner)
+    rnd = getattr(getattr(runner, "cfg", None), "round", None)
+    if not bool(getattr(rnd, "funded_release_after_harvest", True)):
+        return None
+    return release
+
+
+def release_if_verified(runner, verified: VerifiedHarvest | None,
+                        release: Callable[[], None] | None = None, *,
+                        where: str = "box") -> bool:
+    """Run the armed (or given) release for a verified harvest; True once
+    released. A release that raises is logged and reported unreleased (the
+    leg's own teardown then runs as before)."""
+    fn = release_callback(runner, release)
     if verified is None or fn is None:
         return False
     try:
@@ -183,5 +262,6 @@ def release_if_verified(runner, verified: VerifiedHarvest | None) -> bool:
         log.error("pod release after verified harvest failed (%s) — torn down at "
                   "leg end instead", e)
         return False
-    log.info(RELEASE_LOG, verified.files, verified.nbytes / 1e9)
+    log.info(RELEASE_LOG if where == "box" else RELEASE_LOG_R2,
+             verified.files, verified.nbytes / 1e9)
     return True
