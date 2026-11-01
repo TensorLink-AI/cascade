@@ -189,10 +189,16 @@ as `weights.safetensors`:
 | Gate on (scored) | `sigma_rel = 0.10` average | `weights_raw.safetensors` (raw endpoint), `weights_ema005.safetensors` |
 
 The extras are written through `save_tensors_hashed`, so the worker's receipt
-`tensor_digests` lists them. The harvest, ingest and push checks then carry
-them like `weights_stable` and `optimizer`; those checks match `*.safetensors`.
-Each extra adds one weights-sized file to the checkpoint, about 4.9 GB at
-1.23B.
+`tensor_digests` lists them. The harvest checks then verify them like
+`weights_stable` and `optimizer`. Each extra adds one weights-sized file to the
+pod's checkpoint, about 4.9 GB at 1.23B.
+
+The extras are **operator analysis data and are never published**.
+`hippius.UNPUBLISHED_PATTERNS` (`weights_ema*.safetensors`,
+`weights_raw.safetensors`) is passed as `ignore_patterns` to every registry
+push, so the published checkpoint has exactly the pre-shadow file set. It is
+also passed to every registry pull, so a stray published copy never lands on a
+validator box. The audit re-derivation compares only the published tensor set.
 
 Every leg starts its own average. A warm-started leg resumes the raw
 `weights_stable.safetensors` + `optimizer.safetensors` lineage, which the EMA

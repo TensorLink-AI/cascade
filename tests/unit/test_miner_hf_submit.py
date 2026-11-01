@@ -39,7 +39,8 @@ class _FakeHfApi:
     def create_repo(self, repo, **k):
         self.created = (repo, k)
 
-    def upload_folder(self, *, repo_id, folder_path, repo_type, allow_patterns, commit_message):
+    def upload_folder(self, *, repo_id, folder_path, repo_type, allow_patterns, commit_message,
+                      ignore_patterns=None):
         self.uploaded = (repo_id, folder_path, repo_type, tuple(allow_patterns))
         return _FakeCommit("ab" * 20)  # a 40-hex commit sha
 
