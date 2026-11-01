@@ -113,13 +113,25 @@ def combine_gradients(parameters, reference, cap=0.1):
 # POWER_EMA_SIGMA_RELS[POWER_EMA_EVAL] average; a continuation snapshot carries
 # the raw model plus every EMA state, so a resumed leg restores them bitwise.
 #
-# ACTIVATION (owner 2026-11-01 ~06:35): the EMA is ON only from the first
+# ACTIVATION (owner 2026-11-01 ~06:35): the EMA is SCORED only from the first
 # warm-start seed epoch after the image ships — see power_ema_active. A seed
 # epoch shares ONE init (DEC-CA-0055), so the rule is identical for the king's
-# retrain and every challenger of an epoch; a random-init epoch stays raw and
-# byte-identical to the pre-EMA trainer.
+# retrain and every challenger of an epoch. SHADOW MODE (owner 2026-11-01):
+# both averages are always computed; where the gate is off (the random-init
+# epoch) weights.safetensors stays the raw endpoint, byte-identical to the
+# pre-EMA trainer, and the averages ride along as weights_ema005 / _ema010;
+# where it is on, weights.safetensors is the 0.10 average and the raw endpoint
+# rides along as weights_raw (+ the 0.05 file). Validators read only
+# weights.safetensors; the extras are comparison data, never scored.
 POWER_EMA_SIGMA_RELS = (0.05, 0.10)
 POWER_EMA_EVAL = 1
+RAW_WEIGHTS_FILE = "weights_raw.safetensors"
+
+
+def ema_weights_file(sigma_rel: float) -> str:
+    """``weights_ema005.safetensors`` / ``weights_ema010.safetensors``: the
+    unscored average of width ``sigma_rel`` (same format/keys as weights)."""
+    return f"weights_ema{round(float(sigma_rel) * 100):03d}.safetensors"
 # config.json key an EMA-scored checkpoint carries (validators read only
 # ``moe``); a lane-B expert leg inherits the decision from its base king.
 POWER_EMA_MARKER = "power_ema"
@@ -219,8 +231,8 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
         if getattr(contract, name) != value:
             raise ValueError(f"pyramid recipe requires {name}={value!r}")
     ema_sigmas, ema_eval = power_ema_settings()
-    if not power_ema_active(warm_start_dir, expert_selection):
-        ema_sigmas, ema_eval = (), -1
+    # computed on every leg (shadow); SCORED only where the init says so
+    ema_scored = bool(ema_sigmas) and power_ema_active(warm_start_dir, expert_selection)
     if tuple(contract.accepted_fields) not in ((), ("groups",)):
         raise ValueError("pyramid recipe accepts only optional groups")
     if str(trainer.dtype) != "torch.float32":
@@ -321,6 +333,8 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
                 raise ValueError("pyramid continuation lacks its power EMA state")
         if not emas and restored.get("emas"):
             raise ValueError("pyramid continuation carries power EMA state this raw leg never uses")
+        if emas and restored.get("power_ema_scored") is not ema_scored:
+            raise ValueError("pyramid continuation was made under the other power EMA decision")
         if gang is not None:
             gang.scatter_pending = True
         stable = restored["stable"]
@@ -420,7 +434,8 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
                     "channel_tokens": channel_tokens, "model": model.state_dict(),
                     "leaves": dict(slices.named_parameters()) if slices else {},
                     "optimizer": optimizer.state_tensors(names), "stable": stable,
-                    **({"emas": power_ema_state(emas)} if emas else {}),
+                    **({"emas": power_ema_state(emas), "power_ema_scored": ema_scored}
+                       if emas else {}),
                     "last_loss": last_loss, "last_joint": last_joint, "elapsed": time.time() - started,
                     "data_wait": timed.wait_s,
                     "rng": rng_state(), "mask_rng": mask_rng.bit_generator.state,
@@ -447,18 +462,28 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
     live = {k: v.detach().cpu().contiguous() for k, v in model.state_dict().items()}
     if slices:
         live = restore_frozen(live, base, expert_selection, moe_param_names(model))
-    scored = live
-    if ema_eval >= 0:
-        # the chosen power EMA is the evaluated artifact (weights.safetensors);
-        # the raw lineage (weights_stable + optimizer below) is untouched
-        scored = emas[ema_eval].export(model)
-        if slices:
-            scored = restore_frozen(scored, base, expert_selection, moe_param_names(model))
+
+    def average(ema):
+        avg = ema.export(model)
+        return restore_frozen(avg, base, expert_selection, moe_param_names(model)) if slices else avg
+
+    # the chosen power EMA is the evaluated artifact (weights.safetensors) on a
+    # scored leg; the raw lineage (weights_stable + optimizer below) is untouched
+    scored = average(emas[ema_eval]) if ema_scored else live
     out = Path(out_dir)
     save_checkpoint(out, scored, cfg, contract, power_ema=(
         {"sigma_rels": list(ema_sigmas), "scored_sigma_rel": ema_sigmas[ema_eval]}
-        if ema_eval >= 0 else None))
+        if ema_scored else None))
     from .ckpt_digest import save_tensors_hashed
+
+    # comparison extras, never scored (validators load only weights.safetensors);
+    # written through save_tensors_hashed so the receipt's tensor digests and
+    # every harvest / ingest check carry them like the lineage files
+    if ema_scored:
+        save_tensors_hashed(live, out / RAW_WEIGHTS_FILE)
+    for i, ema in enumerate(emas):
+        if not (ema_scored and i == ema_eval):
+            save_tensors_hashed(average(ema), out / ema_weights_file(ema.sigma_rel))
 
     if slices is None:
         stable = stable or trainer._stable_snapshot(model, optimizer)
@@ -479,7 +504,9 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
         "training_complete": step == steps,
         "corpus_exhausted": step < steps and tokens < token_budget and duration < contract.max_train_seconds}
     if emas:
-        metrics.update(power_ema_eval_sigma_rel=ema_sigmas[ema_eval], power_ema_steps=emas[ema_eval].t)
+        metrics.update(power_ema_scored=ema_scored, power_ema_steps=emas[0].t)
+    if ema_scored:
+        metrics.update(power_ema_eval_sigma_rel=ema_sigmas[ema_eval])
     if slices:
         metrics.update(expert_training_backend="compact_rows", expert_trainable_param_count=sum(p.numel() for p in params))
     if grouped_corpus:

@@ -164,8 +164,9 @@ wall-clock time, the image or the role (`power_ema_active`). Every era of a
 seed epoch shares one init (DEC-CA-0055), so the king's retrain and every
 challenger in an epoch get the same decision:
 
-- A random-init leg (the first v2 seed epoch) stays raw. Its output bytes are
-  exactly what the trainer produced before this feature.
+- A random-init leg (the first v2 seed epoch) scores the raw endpoint. Its
+  `weights.safetensors` and every other pre-existing file are byte-identical to
+  what the trainer produced before this feature.
 - A king or challenger leg (heat or full) that trains from a warm-start init, the
   seed epoch's promoted `warm_start_ckpt`, is EMA-scored.
 - A lane-B expert leg fine-tunes from a king checkpoint and follows that king.
@@ -177,12 +178,29 @@ challenger in an epoch get the same decision:
 A resumed leg reaches the same decision from the same init. A snapshot made
 under the other decision is refused.
 
+**Shadow files:** both averages are computed on every leg. They are comparison
+data and are never scored. Validators and the eval loader read only
+`weights.safetensors`. The extra files use the same safetensors format and keys
+as `weights.safetensors`:
+
+| Leg | `weights.safetensors` | Extra files |
+|---|---|---|
+| Gate off (shadow: random init, or an expert on a raw king) | raw endpoint | `weights_ema005.safetensors`, `weights_ema010.safetensors` |
+| Gate on (scored) | `sigma_rel = 0.10` average | `weights_raw.safetensors` (raw endpoint), `weights_ema005.safetensors` |
+
+The extras are written through `save_tensors_hashed`, so the worker's receipt
+`tensor_digests` lists them. The harvest, ingest and push checks then carry
+them like `weights_stable` and `optimizer`; those checks match `*.safetensors`.
+Each extra adds one weights-sized file to the checkpoint, about 4.9 GB at
+1.23B.
+
 Every leg starts its own average. A warm-started leg resumes the raw
 `weights_stable.safetensors` + `optimizer.safetensors` lineage, which the EMA
 never changes, and does not inherit an average. An expert leg averages only its
 selected rows; frozen bytes stay the king's. Continuation snapshots carry the
-raw model and every EMA state, a resumed leg restores them bitwise, and a
-snapshot without EMA state is refused.
+raw model, every EMA state and the scoring decision. A resumed leg restores
+them bitwise. A snapshot without EMA state is refused, and so is one made under
+the other decision.
 
 Memory: the EMAs are fp32 parameter copies held on rank 0 only (helper ranks
 are untouched), so rank 0 needs about 8 bytes × parameters extra. That is about
