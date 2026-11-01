@@ -1191,8 +1191,18 @@ canonical body; adding one would fork them).
 From `[v2] bench_source_from_block` (mainnet: `"v2"`, i.e. the v2 go-live)
 with `[v2] bench_source = "validator"`, lane A is no longer benched at leg
 completion. The trainer runs no challenger or king sweep, no payer-pod
-verification and no bench hold for those eras. Only the once-per-seed-epoch
-init bench stays: it publishes the init pointer the king check needs.
+verification and no bench hold for those eras, and no init bench either:
+the main validator benches the init itself. For a random-init seed epoch the
+trainer only publishes the init POINTER (a pointer-only `role = "init"`
+report entry whose six scores are the `-1.0` sentinel): the random-init
+checkpoint is built on the era's already-mapped operator king pod after the
+epoch's king leg (CPU, `moe_trainer.build_random_init` run pod-side, refused
+on a contract-digest mismatch), copied back as plain files, verified against
+the pod's listing and uploaded. Nothing is ever rented for it and the box
+never builds or loads it; with no operator king pod (cached/carried or
+own-key king leg, released pod) the publish defers, capped at
+`INIT_BENCH_MAX_TRIES` per seed epoch, and the king check defers with "no init
+pointer". A warm-started epoch needs nothing (the pointer is `warm_start_ckpt`).
 
 The **main validator** (the wallet whose hotkey is `[netconfig]
 owner_hotkey`) does the sweeps instead, and only when they are needed:

@@ -58,6 +58,73 @@ def _bench_fev_required(cfg, era) -> bool:
     return bench_gate_rule_for_era(cfg, int(era.start_block)) == BENCH_RULE_V2
 
 
+# DEC-CA-0063 eras: the main validator benches the init itself (king check,
+# ``_vbench_side(init_e, role="init")``); all it reads from the trainer's
+# report is the "init" entry's POINTER. A BenchEntry must carry six numbers,
+# so a pointer-only init entry carries this sentinel — negative, which no
+# CRPS / MASE can be — instead of a sweep. Nothing reads them: the trainer
+# report of a validator-sourced era has no king entry (the trainer benches no
+# king), so the trainer-report king check defers before comparing scores.
+INIT_POINTER_ONLY_SCORE = -1.0
+_SIX_SCORE_KEYS = ("gifteval_crps", "gifteval_mase", "boom_crps", "boom_mase",
+                   "time_crps", "time_mase")
+
+
+def pointer_only_init_scores() -> dict:
+    """The init entry's scores in a validator-sourced era (see
+    :data:`INIT_POINTER_ONLY_SCORE`): six sentinels, no FEV pair."""
+    return {k: INIT_POINTER_ONLY_SCORE for k in _SIX_SCORE_KEYS}
+
+
+# How long the pod-side random-init build may take (CPU construction + save of
+# the full-size init; minutes in practice).
+INIT_BUILD_TIMEOUT_S = 1800
+
+# Run ON THE POD with the pod's own interpreter and chain.toml: the
+# random-init checkpoint a v2 leg with ``training_seed`` starts from
+# (moe_trainer.build_random_init — the king leg's own construction), refused
+# unless the pod resolves exactly the trainer's contract (digest). argv:
+# <chain.toml or ""> <contract block> <training seed> <arch preset>
+# <contract digest> <out dir>.
+_INIT_BUILD_PY = (
+    "import sys\n"
+    "from pathlib import Path\n"
+    "from cascade.shared.config import load_chain_config\n"
+    "from cascade.shared.manifest import contract_digest\n"
+    "toml, block, seed, preset, digest, out = sys.argv[1:7]\n"
+    "c = load_chain_config(toml or None).throne_contracts_at(int(block))[0]\n"
+    "got = contract_digest(c)\n"
+    "if c.arch_preset != preset or got != digest:\n"
+    "    sys.exit('init build refused: pod contract %s/%s != trainer %s/%s'"
+    " % (c.arch_preset, got, preset, digest))\n"
+    "from cascade.trainer.moe_trainer import build_random_init\n"
+    "build_random_init(c, training_seed=int(seed), out_dir=Path(out))\n"
+)
+
+
+def _init_rebuildable(contract) -> bool:
+    """Whether ``contract``'s random init has a ``build_random_init``."""
+    return str(getattr(contract, "base_arch", "") or "") in ("cascade_moe", "cascade_pyramid")
+
+
+def build_init_remote_command(host, out_dir: str, *, contract_block: int, training_seed: int,
+                              arch_preset: str, digest: str) -> str:
+    """The pod-side shell string that builds the epoch's random-init
+    checkpoint into ``out_dir`` (wiped first). CPU only (``CUDA_VISIBLE_DEVICES``
+    blanked): the GPU is never touched. Pure — safe to unit test.
+
+    The trainer box never builds the init itself (7 GB box: a full-size model
+    construction is an OOM risk) — it only harvests the written files."""
+    import shlex
+
+    argv = [host.remote_python, "-c", _INIT_BUILD_PY, str(host.chain_toml or ""),
+            str(int(contract_block)), str(int(training_seed)), str(arch_preset),
+            str(digest), out_dir]
+    out = shlex.quote(out_dir)
+    return (f"cd {shlex.quote(host.workdir)} && rm -rf {out} && "
+            f"CUDA_VISIBLE_DEVICES= {shlex.join(argv)}")
+
+
 class _KingKeyFailed(Exception):
     """The king's own payer key cannot fund its leg (DEC-CA-0055 item 6) —
     the operator trains it instead and the manifest says so. ``slash`` is
@@ -862,15 +929,23 @@ class _RollingMixin:
         return dataclasses.asdict(scores) if scores is not None else None
 
     def _rolling_bench_init(self, era) -> dict | None:
-        """Bench the seed epoch's CURRENT init (DEC-CA-0055 "init" entry) on
-        the era's operator king pod: the member checkpoint when the epoch is
-        warm-started, else the random-init model rebuilt from the epoch's
-        training seed. Operator numbers only (never a payer pod)."""
+        """The seed epoch's CURRENT init entry (DEC-CA-0055 "init").
+
+        Validator-sourced era (DEC-CA-0063): the trainer benches nothing and
+        rents nothing — see :meth:`_rolling_publish_init_pointer`.
+
+        Trainer-sourced (legacy) era: bench the init on the era's operator
+        king pod — the member checkpoint when the epoch is warm-started, else
+        the random-init model, BUILT ON THAT POD from the epoch's training
+        seed (never on the trainer box) and, once benched, harvested and
+        published. Operator numbers only (never a payer pod)."""
         import dataclasses
 
         from ..eval.benchmarks import extract_bench_scores
         from .bench_hook import push_checkpoint, run_post_round_benchmark
 
+        if _validator_benches(self.cfg, era):
+            return self._rolling_publish_init_pointer(era)
         if self.cascade_bench_plan is None:
             return None
         king = era.king()
@@ -887,24 +962,19 @@ class _RollingMixin:
         if why:
             log.warning("rolling: era %d init bench skipped — %s", era.index, why)
             return None
+        round_id = str(era.base_seed)
         if era.warm_start_ckpt:
             local = self._fetch_checkpoint_dir(era.warm_start_ckpt)
+            push_checkpoint(host, local, round_id, contract.arch_preset, "init")
+            remote_dir = ""
         else:
-            if str(getattr(contract, "base_arch", "") or "") not in ("cascade_moe", "cascade_pyramid"):
+            if not _init_rebuildable(contract):
                 log.warning("rolling: era %d init bench — random init of base_arch %r is "
-                            "not rebuildable here; skipped", era.index,
+                            "not rebuildable; skipped", era.index,
                             getattr(contract, "base_arch", ""))
                 return None
-            from pathlib import Path
-
-            from .moe_trainer import build_random_init
-
-            seeds = self._rolling_seeds(era)
-            local = build_random_init(
-                contract, training_seed=int(seeds.training_seed),
-                out_dir=Path(self.work_root) / "init_bench" / str(era.base_seed))
-        round_id = str(era.base_seed)
-        push_checkpoint(host, local, round_id, contract.arch_preset, "init")
+            # built straight into the "init" role dir the sweep benches
+            remote_dir = self._rolling_build_init_on_pod(host, era, contract)
         report = run_post_round_benchmark(host, round_id, contract.arch_preset,
                                           self.cascade_bench_plan, work_root=self.work_root,
                                           role="init")
@@ -917,12 +987,98 @@ class _RollingMixin:
         if not era.warm_start_ckpt:
             # validators score the init on the pool: the random-init model must
             # be a PUBLISHED, fetchable checkpoint (the init entry's pointer)
-            pointer = out["_pointer"] = self._publish_init_checkpoint(local, era, contract)
+            pointer = out["_pointer"] = self._rolling_harvest_publish_init(
+                host, remote_dir, era, contract)
         if pointer:
             # DEC-CA-0061: the king check's bench half runs the gate's rule on
             # the init's TASK rows, so they are published like any entry's
             self._stash_bench_rows(pointer, report)
         return out
+
+    def _rolling_publish_init_pointer(self, era) -> dict | None:
+        """DEC-CA-0063 era: publish the random-init checkpoint POINTER the main
+        validator's king check benches (it sweeps the init on its own GPU).
+
+        No bench, no rent: the init is built on the era's operator king pod
+        only while that pod is still mapped (right after a new seed epoch's
+        king leg, which trains from this same random init), harvested to the
+        box as plain files and uploaded. With no such pod — a cached/carried
+        king leg, a king leg on the king's own (payer) key, a released pod —
+        nothing is rented: the publish is deferred (the scheduler retries up
+        to its cap; a later era of the epoch inherits a published pointer).
+        A warm-started epoch needs nothing (its init is ``warm_start_ckpt``).
+        Returns the pointer-only entry ``{six sentinels, "_pointer"}`` or None."""
+        if era.warm_start_ckpt:
+            return None
+        if str(getattr(era, "init_pointer", "") or ""):
+            return {**pointer_only_init_scores(), "_pointer": str(era.init_pointer)}
+        contract = era_contracts(self.cfg, era)[0]
+        if not _init_rebuildable(contract):
+            log.warning("rolling: era %d init pointer — random init of base_arch %r is not "
+                        "rebuildable; not published", era.index,
+                        getattr(contract, "base_arch", ""))
+            return None
+        king = era.king()
+        host = (self._final_role_hosts.get(("king", contract.arch_preset, king.miner_hotkey))
+                if king is not None else None)
+        host = host or self.__dict__.get("_rolling_king_hosts", {}).get(era.index)
+        if host is None or getattr(host, "isolated", False):
+            log.warning("rolling: era %d init pointer deferred — no operator king pod is "
+                        "mapped to the era (%s); NOT renting one for it (validator bench "
+                        "source: the main validator benches the init)", era.index,
+                        "a payer pod never builds the init" if host is not None
+                        else "cached/carried or own-key king leg, or the pod was released")
+            return None
+        remote_dir = self._rolling_build_init_on_pod(host, era, contract)
+        pointer = self._rolling_harvest_publish_init(host, remote_dir, era, contract)
+        log.info("rolling: era %d random-init checkpoint built on king pod %s and published "
+                 "→ %s (pointer only; the main validator benches it)", era.index,
+                 getattr(host, "name", host), pointer)
+        return {**pointer_only_init_scores(), "_pointer": pointer}
+
+    def _rolling_build_init_on_pod(self, host, era, contract) -> str:
+        """Build the epoch's random-init checkpoint ON ``host`` (CPU), at the
+        "init" role checkpoint dir; returns that pod-side dir."""
+        from ..shared.manifest import contract_digest
+        from .bench_hook import role_paths
+        from .remote import build_ssh_argv, error_tail, run_ssh
+
+        ckpt, _ = role_paths(host, str(era.base_seed), contract.arch_preset, "init")
+        cmd = build_init_remote_command(
+            host, ckpt, contract_block=int(era.start_block),
+            training_seed=int(self._rolling_seeds(era).training_seed),
+            arch_preset=str(contract.arch_preset), digest=contract_digest(contract))
+        proc = run_ssh(build_ssh_argv(host, cmd), INIT_BUILD_TIMEOUT_S)
+        if proc.returncode != 0:
+            raise RuntimeError(f"random-init build on {getattr(host, 'name', host)} failed "
+                               f"(rc={proc.returncode}): "
+                               f"{error_tail((proc.stderr or '') + (proc.stdout or ''))}")
+        return ckpt
+
+    def _rolling_harvest_publish_init(self, host, remote_dir: str, era, contract) -> str:
+        """Copy the pod-built init back as plain files (verified file-for-file
+        against the pod's own listing — nothing is loaded on the box), upload
+        it, drop the box copy. Returns the init's trained pointer."""
+        import shutil
+        from pathlib import Path
+
+        from .harvest_release import local_file_manifest, manifest_mismatches
+        from .remote import harvest_remote_dir, remote_file_manifest
+
+        dest = Path(self.work_root) / "init_publish" / str(era.base_seed)
+        try:
+            pod = remote_file_manifest(host, remote_dir)
+            if not pod:
+                raise RuntimeError(f"pod {getattr(host, 'name', host)} lists no init files "
+                                   f"under {remote_dir}")
+            harvest_remote_dir(host, remote_dir, dest)
+            bad = manifest_mismatches(pod, local_file_manifest(dest))
+            if bad:
+                raise RuntimeError("harvested init differs from the pod's copy: "
+                                   + "; ".join(bad[:3]))
+            return self._publish_init_checkpoint(dest, era, contract)
+        finally:
+            shutil.rmtree(dest, ignore_errors=True)
 
     def _publish_init_checkpoint(self, local, era, contract) -> str:
         """Upload the rebuilt random-init checkpoint under the operator's

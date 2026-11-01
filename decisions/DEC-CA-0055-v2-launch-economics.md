@@ -263,8 +263,10 @@ per-era king legs).
 - **Init bench** (`rolling._maybe_bench_init`, `runner_rolling._rolling_bench_init`):
   once per seed epoch on the era's operator king pod — the member checkpoint,
   or the random-init model rebuilt from the epoch's training seed
-  (`moe_trainer.build_random_init`) and PUBLISHED (operator identity) so
-  validators can score it. It rides every v2 bench report of the epoch as a
+  (`moe_trainer.build_random_init`, run ON that pod — never on the trainer
+  box) and PUBLISHED (operator identity) so validators can score it. Tries
+  are capped per seed epoch. Under DEC-CA-0063 no init bench runs and no pod
+  is rented for it: only the pointer is published (see DEC-CA-0063 item 8). It rides every v2 bench report of the epoch as a
   `role = "init"` entry (`trained_pointer` = `warm_start_ckpt`, or the published
   random-init checkpoint; `miner_hotkey = ""`, `miner_uid = -1`); never a
   promotion candidate.
