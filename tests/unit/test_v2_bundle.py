@@ -68,7 +68,7 @@ def test_generation_lead_applies_once_v2_is_typed(mainnet):
     era = mainnet.round.epoch_blocks * mainnet.round.era_settlements
     typed = replace(mainnet, v2=replace(mainnet.v2, from_block=10_000 * era))
     want = typed.generation.window_seconds + _GenerationMixin.GENERATION_OVERHEAD_SECONDS
-    assert lead(SimpleNamespace(cfg=typed, GENERATION_OVERHEAD_SECONDS=7200.0)) == want
+    assert lead(SimpleNamespace(cfg=typed, GENERATION_OVERHEAD_SECONDS=_GenerationMixin.GENERATION_OVERHEAD_SECONDS)) == want
 
 
 def _typed(mainnet):

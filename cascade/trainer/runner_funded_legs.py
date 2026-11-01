@@ -125,7 +125,13 @@ class _FundedLegMixin:
                 deadline = None if king_leg else time.time() + 1800.0
                 end = getattr(self.__dict__["_leg_local_obj"], "end_wall", None)
                 if not king_leg and end is not None:
-                    deadline = float(end) - float(contract.max_train_seconds)
+                    # The SAME wall admission budgeted (the measured SKU wall,
+                    # capped by max_train_seconds): the cap here opened a dead
+                    # zone where admission targeted a boundary this deadline had
+                    # already closed, so no-corpus legs idled ~1.2 h per cycle
+                    # (2026-10-31). The rent's own fit check still refuses a
+                    # type that cannot land; the progress watchdog a slow pod.
+                    deadline = float(end) - float(self._leg_wall_seconds(None))
                     deadline -= self.FUNDED_PUBLISH_MARGIN_SECONDS
                     # A corpus already generated (earlier attempt / era of the
                     # same seed epoch) needs only its GPU wall, not the CPU lead.
@@ -227,7 +233,7 @@ class _FundedLegMixin:
         deadline = time.time() + 1800.0
         end = getattr(self.__dict__["_leg_local_obj"], "end_wall", None)
         if end is not None:
-            deadline = min(deadline, float(end) - float(contract.max_train_seconds)
+            deadline = min(deadline, float(end) - float(self._leg_wall_seconds(None))
                            - self.FUNDED_PUBLISH_MARGIN_SECONDS)
         try:
             return self._dispatch_on_free_lane(
