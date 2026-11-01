@@ -210,9 +210,13 @@ def upload_harvested_checkpoint(runner, record: dict, *, base_seed) -> TrainedEn
         from .r2_transfer import R2Checkpoint, ckpt_store, delete_checkpoint
 
         ckpt = R2Checkpoint.from_record(r2)
+        kept = sorted(ckpt.shadow().files)
+        if kept:
+            log.info("r2: power-EMA comparison files of %s kept on R2 under %s for analysis "
+                     "(never published): %s", ckpt_repo, ckpt.prefix, ", ".join(kept))
         try:
             store = getattr(runner, "_r2_store", None) or ckpt_store(runner.cfg, bucket=ckpt.bucket)
-            delete_checkpoint(store, ckpt)
+            delete_checkpoint(store, ckpt.published())
         except Exception as e:  # noqa: BLE001 — lifecycle expiry is the backstop
             log.warning("r2 copy of %s not deleted (%s); lifecycle expiry cleans it",
                         ckpt_repo, e)
@@ -776,6 +780,14 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
             raise _FundedTamper(f"checkpoint: {e}") from e
         except CheckpointDiverged as e:
             raise _FundedDiverged(str(e)) from e
+        # The power-EMA comparison files were verified with the rest; they are
+        # never published: moved aside ([round] funded_keep_shadow_ema) or
+        # deleted now, so the upload carries the pre-shadow file set and the
+        # box keeps no extra weights by default.
+        from .runner_common import set_aside_shadow_ema
+
+        set_aside_shadow_ema(self.cfg, self.work_root, dest, seeds.base_seed,
+                             receipt.miner_hotkey, job_id=job_id)
         # Every guard passed on a copy verified complete: nothing needs the
         # pod any more — release it, then upload from the box copy (kept
         # until a pinned ref returns; a failed upload re-uploads from it).

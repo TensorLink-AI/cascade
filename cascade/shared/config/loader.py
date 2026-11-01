@@ -536,6 +536,7 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
                 "operator_billed_retry_seconds", r.get("operator_billed_retry_seconds", 60)),
             funded_require_tensor_digests=bool(r.get("funded_require_tensor_digests", False)),
             funded_release_after_harvest=bool(r.get("funded_release_after_harvest", True)),
+            funded_keep_shadow_ema=bool(r.get("funded_keep_shadow_ema", False)),
             submission_vault_dir=str(r.get("submission_vault_dir", "")),
             champion_publish=validate_champion_publish(
                 str(r.get("champion_publish", "off"))),

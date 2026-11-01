@@ -1065,6 +1065,24 @@ How it works (`cascade/trainer/r2_transfer.py`):
      so the requeued leg pushes from R2 without a pod or a retrain. The
      objects are deleted after a successful push.
 
+**Power-EMA shadow files** (#400): a pyramid leg also writes
+`weights_ema005.safetensors`, `weights_ema010.safetensors` and/or
+`weights_raw.safetensors`. These are comparison data for the operator and are
+never scored or published. They are verified with the rest of the checkpoint
+(receipt digests and pod listing).
+
+- **r2 transport:** the shadow files go to R2 under the leg's prefix. The Hippius
+  push skips them, and so does the local disk check. They are kept when the
+  published objects are deleted, and the bucket's lifecycle expiry removes
+  them.
+- **ssh transport:** once the box copy passes every guard, the shadow files are
+  deleted from it. With `[round] funded_keep_shadow_ema = true` (default
+  false) they are moved instead to `work_root/_shadow_ema/<base_seed>/<hotkey>--<job>/`.
+  That directory is outside the harvest dir, so neither the upload nor the
+  cleanup touches it. You must prune it yourself.
+
+The published checkpoint keeps the pre-shadow file set either way.
+
 Validators see no change: the manifest still carries the Hippius
 `repo@sha256:` ref. A non-finite checkpoint is found at the push, after the
 pod is gone, and settles as the miner's `generator` fault, as before.

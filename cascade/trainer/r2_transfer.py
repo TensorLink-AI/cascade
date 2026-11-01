@@ -126,6 +126,22 @@ def ckpt_prefix(cfg, base_seed, hotkey: str, job_id: str) -> str:
     return f"{root}{base_seed}/{hotkey}/{job_id}/"
 
 
+# The pyramid trainer's power-EMA comparison files (#400 shadow mode:
+# weights_ema005 / weights_ema010 / weights_raw) are OPERATOR analysis data.
+# They travel pod → R2 with the checkpoint and are verified against the
+# receipt like every tensor file, but the R2 → Hippius copy skips them (the
+# published checkpoint keeps exactly the pre-shadow file set; validators never
+# download them) and they stay on R2 when the published objects are deleted —
+# the bucket's lifecycle expiry cleans them. Same patterns as #400's
+# ``hippius.UNPUBLISHED_PATTERNS``.
+SHADOW_EMA_PATTERNS = ("weights_ema*.safetensors", "weights_raw.safetensors")
+
+
+def shadow_ema_file(name: str) -> bool:
+    """A power-EMA comparison file: kept for analysis, never published."""
+    return any(fnmatch.fnmatchcase(str(name), p) for p in SHADOW_EMA_PATTERNS)
+
+
 def checkpoint_file_allowed(name: str) -> bool:
     """A top-level checkpoint file the Hippius push would carry (its
     ``ALLOW_PATTERNS``) with a name safe to use in a shell and an object key."""
@@ -322,6 +338,16 @@ class R2Checkpoint:
 
     def digests(self) -> dict[str, str]:
         return {n: str(m["sha256"]) for n, m in self.files.items()}
+
+    def published(self) -> R2Checkpoint:
+        """The files the Hippius push carries (and later deletes from R2)."""
+        return R2Checkpoint(self.bucket, self.prefix,
+                            {n: dict(m) for n, m in self.files.items() if not shadow_ema_file(n)})
+
+    def shadow(self) -> R2Checkpoint:
+        """The power-EMA comparison files: stay on R2, never pushed."""
+        return R2Checkpoint(self.bucket, self.prefix,
+                            {n: dict(m) for n, m in self.files.items() if shadow_ema_file(n)})
 
 
 def materialize_skeleton(store, ckpt: R2Checkpoint, dest: Path | str) -> Path:
@@ -597,6 +623,8 @@ def relay_push(plan: dict, *, workdir: Path | str, fetch) -> dict:
         for name, meta in sorted(dict(plan["files"]).items()):
             if not checkpoint_file_allowed(name):
                 return {"ok": False, "kind": "storage", "why": f"bad file name {name!r}"}
+            if shadow_ema_file(name):
+                continue                   # analysis data: never published
             fetch(name, meta, tmp / name)
         try:
             # The bytes are the ones the box verified (sha256 above); the code
@@ -659,8 +687,11 @@ def push_from_r2(runner, record: dict) -> HubUpload:
     A tamper / diverged verdict at the push raises the leg's own exceptions."""
     from .faults import _FundedDiverged, _FundedTamper
 
-    ckpt = R2Checkpoint.from_record(record["r2"])
-    store = getattr(runner, "_r2_store", None) or ckpt_store(runner.cfg, bucket=ckpt.bucket)
+    full = R2Checkpoint.from_record(record["r2"])
+    store = getattr(runner, "_r2_store", None) or ckpt_store(runner.cfg, bucket=full.bucket)
+    # only the published set is copied to Hippius (and sized for the local
+    # disk check); the power-EMA comparison files stay on R2
+    ckpt = full.published()
     repo = record["ckpt_repo"]
     hub = runner.hub()
     plan = {"repo": repo, "hf_repo": runner._hf_ckpt_repo(repo),
