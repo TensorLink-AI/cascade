@@ -113,6 +113,13 @@ export CASCADE_DIRECT_OWNER_HOTKEY=<owner ss58> CASCADE_DIRECT_CONFIG_BUCKET=<bu
    | 4×B300 | ~3.3 h est. | 32.00 | $106 | opt-in |
    | 8×B300 | ~2.2 h est. | 56.00 | $123 | opt-in |
 
+   The $/h column is the catalog's advertised rate, used only to pick
+   defaults. **Real Lium prices run higher:** 8×H200 pods were charged
+   $24–46/h from 2026-10-29 to 11-01, about $31/h median. Budget
+   `--max-spend` for the highest rate you would accept × (wall + 1 h), not
+   the estimate here. The Lane A price table is in
+   [MINER_V2_INCENTIVE_INTRO.md](MINER_V2_INCENTIVE_INTRO.md#gpus).
+
    The catalog is `cascade/direct/profiles.py`. A job has one gang size, so
    4× and 8× layouts never mix in one job.
 
