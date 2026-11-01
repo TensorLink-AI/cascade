@@ -73,6 +73,12 @@ OPERATOR_FAULT_CLASS = "operator"
 COMPETITION_ENDED_CLASS = "competition_ended"
 INFRA_BACKOFF_BASE_SECONDS = 120.0
 INFRA_BACKOFF_MAX_SECONDS = 1800.0
+# An OPERATOR-billed entry (owner make-good / expired payer key) requeued for
+# an operator-side fault retries after this fixed delay instead: the fault is
+# ours and so is the bill, so doubling its wait only delays our own make-good
+# (2026-11-01: 34-93 requeues, up to 24 min between tries). ``[round]
+# operator_billed_retry_seconds``; 0 = the doubling backoff above.
+OPERATOR_BILLED_RETRY_SECONDS = 60.0
 
 # Public, bounded lifecycle telemetry. Never store provider error text or keys.
 PHASES = frozenset({"admitted", "waiting_admission", "preparing_data", "waiting_gpu",
@@ -241,9 +247,13 @@ class FundedQueue:
     """JSON-file queue shared across processes: flock-serialised, reload-first."""
 
     def __init__(self, path: Path | str, *, clock: Callable[[], float] = time.time,
-                 entry_ttl_seconds: float = DEFAULT_TTL_SECONDS) -> None:
+                 entry_ttl_seconds: float = DEFAULT_TTL_SECONDS,
+                 operator_billed_retry_seconds: float = OPERATOR_BILLED_RETRY_SECONDS) -> None:
         self.path = Path(path)
         self.clock = clock
+        # Fixed retry of an operator-billed entry after an operator-side fault
+        # (see OPERATOR_BILLED_RETRY_SECONDS); 0 = the doubling backoff.
+        self.operator_billed_retry_seconds = max(0.0, float(operator_billed_retry_seconds))
         # Must track the payer vault's TTL (cascade-intake --ttl-hours /
         # [round] funded_entry_ttl_hours): expiring earlier kills paid entries
         # whose key still works; later leaves keyless entries holding the
@@ -712,7 +722,10 @@ class FundedQueue:
         of ``max_attempts``; sold-out and rate-limited do not (they are the
         market's fault, not anyone's retry budget). An operator-side fault
         (:data:`OPERATOR_FAULT_CLASS`, never burned) backs off instead: the
-        entry cannot start again (:meth:`mark_in_flight`) before ``not_before``. Exhausted attempts turn
+        entry cannot start again (:meth:`mark_in_flight`) before ``not_before``
+        — doubling per consecutive such requeue, except for an OPERATOR-billed
+        entry, which waits ``operator_billed_retry_seconds`` flat with its
+        streak unchanged (0 = the doubling backoff for it too). Exhausted attempts turn
         the entry terminal ``failed`` — returns False, and the miner's next
         ``fund`` starts fresh. The entry itself is NEVER silently dropped:
         the miner paid for visibility into where their money went.
@@ -755,7 +768,13 @@ class FundedQueue:
                 self._save(entries)
                 return False
             streak, not_before = 0, 0.0
-            if error_class == OPERATOR_FAULT_CLASS and not burn_attempt:
+            billed = e.operator_billed or bool(operator_billed)
+            if (error_class == OPERATOR_FAULT_CLASS and not burn_attempt and billed
+                    and self.operator_billed_retry_seconds > 0):
+                # Our fault on our bill: a short fixed retry, streak not grown.
+                streak = e.infra_streak
+                not_before = now + self.operator_billed_retry_seconds
+            elif error_class == OPERATOR_FAULT_CLASS and not burn_attempt:
                 streak = e.infra_streak + 1
                 not_before = now + min(INFRA_BACKOFF_MAX_SECONDS,
                                        INFRA_BACKOFF_BASE_SECONDS * 2 ** (streak - 1))

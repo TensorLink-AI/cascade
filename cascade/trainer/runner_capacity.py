@@ -11,6 +11,36 @@ from .lane_pool import _lium_provider
 log = logging.getLogger("cascade.trainer")
 
 
+def operator_lane_allowed(runner, hotkey: str | None, *, for_king: bool = False) -> bool:
+    """May this waiting leg move onto an OPERATOR lane? Always, unless
+    ``[round] operator_lanes_operator_billed_only`` is armed — then only
+    operator-billed work does: king legs (the JIT king, ``hotkey`` None, a king
+    leg in flight), an ``operator_billed`` queue entry (owner make-good /
+    expired payer key) and the genesis king's ref (``[generator]
+    king_min_channels_refs``, always operator-funded). A miner-funded leg is
+    refused, so its wait ends ``no_capacity`` and it requeues unburned
+    (2026-11-01: miner legs fell back onto operator lanes and were killed)."""
+    rnd = runner.cfg.round
+    if not bool(getattr(rnd, "operator_lanes_operator_billed_only", False)):
+        return True
+    if for_king or hotkey is None:
+        return True
+    if getattr(runner.__dict__.get("_leg_local_obj"), "funded_is_king", False):
+        return True
+    try:
+        queue = runner._funded_queue()
+        entry = queue.get(hotkey) if queue is not None else None
+    except Exception as e:  # noqa: BLE001 — unreadable queue: not provably operator-billed
+        log.debug("operator-lane eligibility for %s: queue read failed (%s)", hotkey[:12], e)
+        entry = None
+    if entry is None:
+        return False
+    if bool(getattr(entry, "operator_billed", False)):
+        return True
+    refs = getattr(getattr(runner.cfg, "generator", None), "king_min_channels_refs", ()) or ()
+    return bool(refs) and str(getattr(entry, "ref", "") or "") in set(refs)
+
+
 class _FundedCapacityMixin:
     """Marketplace capacity waits, per-SKU walls and rent deadlines (DEC-CA-0036)."""
 
@@ -237,6 +267,12 @@ class _FundedCapacityMixin:
             # king leg (operator or payer-funded) never cancels on it — a stale
             # set from an earlier attempt would otherwise requeue the king.
             abort = None
+        # [round] operator_lanes_operator_billed_only: a miner-funded leg never
+        # leaves this wait for an operator lane (requeues no_capacity instead).
+        lanes_ok = operator_lane_allowed(self, hotkey, for_king=for_king)
+        if not lanes_ok:
+            log.debug("%s: miner-funded — operator lanes reserved for operator-billed "
+                      "work (operator_lanes_operator_billed_only)", describe)
         if for_king and self._operator_fallback_lanes():
             # The king is REQUIRED and never held back: with operator lanes
             # on file it takes one at once, latest safe start or not — a late
@@ -254,7 +290,7 @@ class _FundedCapacityMixin:
             # Hybrid fallback: operator lanes on file end the wait — the leg
             # runs there, operator-billed. Fresh legs keep polling the
             # marketplace until the fresh window (Lium first).
-            if (self._operator_fallback_lanes()
+            if (lanes_ok and self._operator_fallback_lanes()
                     and self._operator_fallback_eligible(hotkey, now_fn(), deadline)):
                 log.info("%s: operator final lane(s) on file — leaving the %s wait "
                          "for an operator lane (operator-billed)", describe, sku)
@@ -297,7 +333,7 @@ class _FundedCapacityMixin:
                          time.strftime("%H:%M:%SZ", time.gmtime(deadline)))
             polled += 1
             sleep(max(0.0, min(self.FUNDED_RENT_RETRY_SECONDS, deadline - now_fn())))
-        if self._operator_fallback_lanes():
+        if lanes_ok and self._operator_fallback_lanes():
             # Past the latest safe start with operator lanes on file: the leg
             # goes to the lane pool, which hands out a lane only if one is
             # FREE NOW (waiting would land it late); no free lane ⇒ the pool's
@@ -382,9 +418,11 @@ class _FundedCapacityMixin:
         includes them is capacity no rent can use. ``price_caps`` overrides
         the operator caps (a miner-chosen type, DEC-CA-0060)."""
         skus = (sku,) if isinstance(sku, str) else tuple(sku)
-        caps = price_caps if price_caps is not None else self._funded_price_caps()
         try:
-            from ..provision.operator_pool import operator_provider
+            from ..provision.operator_pool import operator_price_caps, operator_provider
+
+            # The probe runs on the OPERATOR's key: operator caps by default.
+            caps = price_caps if price_caps is not None else operator_price_caps(self)
 
             prov = operator_provider(self, lambda: _lium_provider(self.cfg.round, price_caps=caps))
             return self._provider_capacity(prov, skus, exclude_ids)

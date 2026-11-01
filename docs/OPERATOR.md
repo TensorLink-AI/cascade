@@ -293,6 +293,13 @@ The trainer rents miner-funded pods on Lium, Shadeform, Vast.ai or Runpod
   trainer rents on the operator's key. With the flag off, payer legs never
   run on operator hardware, and a leg whose key has expired is released as
   `auth`, unburned.
+  `[round] operator_lanes_operator_billed_only = true` (shipped `false`)
+  narrows the lanes to operator-billed work: make-goods / expired-key entries
+  (`operator_billed`) and king legs. A miner-funded leg with no marketplace
+  capacity then requeues `no_capacity`, unburned, instead of taking a lane.
+  An operator-billed entry requeued for an operator-side fault retries after
+  `operator_billed_retry_seconds` (default 60; 0 = the legacy doubling
+  backoff) without growing its backoff streak.
 
 **The carried king's first v2 training.** The identity carried from v1 is
 its hotkey/generator, not a Toto2 checkpoint relabelled as a v2 model. Its
@@ -828,7 +835,9 @@ and stale-feed behavior through an isolated lifecycle before publishing live.
    operator king pod itself; requires `[training] expected_gpu = ""`),
    `funded_sku_per_leg = true` with `funded_pod_skus` (the allowed GPU types;
    each leg rents the cheapest fitting executor), the price guards
-   `funded_max_leg_cost_usd` / `funded_max_price_per_hour` with
+   `funded_max_leg_cost_usd` / `funded_max_price_per_hour` (optionally
+   `operator_max_price_per_hour` for operator-account rents only; unset = the
+   shared `funded_max_price_per_hour`) with
    `funded_sku_wall_seconds` (measured wall per SKU; drives the per-leg cost
    cap and the latest safe start — re-measure when the budget changes),
    `funded_cpu_blocklist`, `funded_host_bench_floor`, `funded_field_cap`

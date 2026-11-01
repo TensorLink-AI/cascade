@@ -24,6 +24,28 @@ from .core import ProvisionError
 from .funded import apply_cpu_blocklist, apply_price_caps, provider_for_key, terminate_verified
 
 
+def operator_max_price_per_hour(rnd) -> float:
+    """The $/h ceiling of a rent on the OPERATOR's account: ``[round]
+    operator_max_price_per_hour`` when set, else the shared
+    ``funded_max_price_per_hour`` (one cap for both — the legacy behaviour)."""
+    own = getattr(rnd, "operator_max_price_per_hour", None)
+    if own is not None:
+        return float(own)
+    return float(getattr(rnd, "funded_max_price_per_hour", 0.0) or 0.0)
+
+
+def operator_price_caps(runner) -> dict:
+    """``apply_price_caps`` kwargs for an OPERATOR-account rent (operator-billed
+    legs, operator-rented pods, the JIT/genesis king): the funded caps with the
+    $/h ceiling swapped for :func:`operator_max_price_per_hour`. Miner-key
+    rents keep ``runner._funded_price_caps()`` unchanged."""
+    caps = dict(runner._funded_price_caps())
+    rnd = getattr(getattr(runner, "cfg", None), "round", None)
+    if rnd is not None and getattr(rnd, "operator_max_price_per_hour", None) is not None:
+        caps["max_price_per_hour"] = operator_max_price_per_hour(rnd)
+    return caps
+
+
 class SpendBook:
     def __init__(self, path, *, clock=time.time):
         self.path, self.clock = Path(path), clock
@@ -105,7 +127,7 @@ class OperatorPool:
             self.factory(credential.provider, credential.api_key),
             self.runner.cfg.round.funded_cpu_blocklist,
         )
-        provider = apply_price_caps(provider, **self.runner._funded_price_caps())
+        provider = apply_price_caps(provider, **operator_price_caps(self.runner))
         return guard_provider(self.runner, provider)
 
     def _credential(self, row):
@@ -202,7 +224,7 @@ class OperatorPool:
                 )
             accounts.append((credential, adapter))
         rnd = self.runner.cfg.round
-        hourly = float(rnd.funded_max_price_per_hour)
+        hourly = operator_max_price_per_hour(rnd)
         if not math.isfinite(hourly) or hourly <= 0:
             raise ProvisionError("operator pool requires a positive hourly price ceiling")
         end = getattr(getattr(self.runner, "_leg_local", None), "end_wall", None)

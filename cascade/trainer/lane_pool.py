@@ -18,9 +18,25 @@ class _FinalLanePool(queue.Queue):
 
     ``get()`` (the blocking, no-timeout form the dispatch path uses) refreshes
     membership from a ``refresh_fn`` on a timeout loop: hosts whose NAMES are
-    new enter the rotation through the join gate. Removal stays
+    new enter the rotation through the join gate. Liveness stays
     FAILURE-driven (a dead lane fails its dispatch and the retry policy moves
-    on): the hosts file is authoritative for membership, never for liveness.
+    on). With ``sync_from_file`` the hosts file is also authoritative for each
+    known lane's host object and membership:
+
+    * an edited entry (same name, ANY field: chain_toml, port, ssh options,
+      ...) re-joins THROUGH THE GATE with the fresh host object — an IDLE
+      lane at the next refresh, a BUSY one once its leg hands it back
+      (:meth:`put`). So the gate's work (ssh/runtime probe, the deployed
+      chain.toml push) runs on edits too; a rejected edit leaves the
+      rotation and is re-gated after ``REJECT_RETRY_S``.
+    * a lane no longer on file leaves the rotation once idle (a busy lane
+      finishes its leg first and is dropped on :meth:`put`). A file that
+      parses but lists ZERO lanes drains them all the same way.
+
+    A refresh that RAISES (hosts file missing, unreadable, unparsable, or
+    with no ``[[host]]`` entry at all — ``load_hosts``) keeps the current
+    set. 2026-11-01: edits never reached dispatch, and lanes removed from
+    the file (all of them) kept taking legs until ssh failed.
     """
 
     REFRESH_INTERVAL_S = 60.0
@@ -28,8 +44,15 @@ class _FinalLanePool(queue.Queue):
     # sooner than this (a pod still booting, or one that came back).
     REJECT_RETRY_S = 600.0
 
-    def __init__(self, initial_hosts: list, refresh_fn, gate_fn=None):
+    def __init__(self, initial_hosts: list, refresh_fn, gate_fn=None, *,
+                 sync_from_file: bool = False):
         super().__init__()
+        # True: the refresh also updates/removes KNOWN lanes (class doc);
+        # False keeps the join-only refresh.
+        self._sync = bool(sync_from_file)
+        # BUSY lanes' pending file changes, applied when the lane is handed
+        # back: name -> why it leaves the rotation (removed / edited).
+        self._pending: dict[str, str] = {}
         self._refresh_fn = refresh_fn          # () -> list[RemoteHost]; may raise
         self._gate_fn = gate_fn                # (RemoteHost) -> reason | None; may raise
         self._absorb_lock = threading.Lock()
@@ -80,6 +103,7 @@ class _FinalLanePool(queue.Queue):
             until = time.time() + self.REJECT_RETRY_S
             for n in dead:
                 self._known.pop(n, None)
+                self._pending.pop(n, None)
                 self._rejected[n] = until
             kept = []
             while True:
@@ -98,16 +122,80 @@ class _FinalLanePool(queue.Queue):
         return dead
 
     def known_hosts(self) -> list:
-        """Current membership (for lane-count geometry) — grows, never shrinks."""
+        """Current membership (for lane-count geometry): grows as lanes join,
+        shrinks as dead (or, with ``sync_from_file``, removed) lanes leave."""
         return list(self._known.values())
+
+    def put(self, item, block: bool = True, timeout: float | None = None) -> None:
+        """Hand a lane back (a leg finished with it). A file change recorded
+        while it was busy applies now: the lane leaves the rotation — removed
+        from the file, or edited, in which case the next refresh (every
+        ``get`` runs one first) re-joins it through the gate."""
+        name = getattr(item, "name", None)
+        if name is None or name not in self._pending:
+            # Fast path, no lock: a refresh can hold the lock through a join
+            # gate's ssh probe. A change recorded right after this check is
+            # applied to the then-idle lane by the next refresh.
+            super().put(item, block, timeout)
+            return
+        with self._absorb_lock:
+            why = self._pending.pop(name, None)
+            if why is not None:
+                self._known.pop(name, None)
+                log.info("lane pool: lane %s left the rotation after its leg (%s)",
+                         name, why)
+                return
+        super().put(item, block, timeout)
+
+    def _sync_known(self, fresh: list) -> None:
+        """Apply the file to KNOWN lanes (caller holds ``_absorb_lock``): a lane
+        removed or edited leaves the rotation — idle now, busy on :meth:`put`.
+        An edited lane is still on file, so the join loop re-gates it with the
+        fresh host object (in the same refresh for an idle lane). ``fresh``
+        may be empty: a file that PARSED with zero lanes drains them all."""
+        by_name = {getattr(h, "name", None): h for h in fresh}
+        by_name.pop(None, None)
+        changes: dict[str, str] = {}             # name -> why it leaves
+        for name, cur in self._known.items():
+            new = by_name.get(name)
+            if new is None:
+                changes[name] = "removed from the hosts file"
+            elif new is not cur and new != cur:
+                changes[name] = "hosts file entry changed; re-gating"
+        for name in list(self._pending):         # the file reverted the change
+            if name not in changes:
+                self._pending.pop(name, None)
+        if not changes:
+            return
+        idle = []
+        while True:
+            try:
+                idle.append(super().get(block=False))
+            except queue.Empty:
+                break
+        idle_names = set()
+        for h in idle:
+            name = getattr(h, "name", str(h))
+            idle_names.add(name)
+            if name not in changes:
+                super().put(h)
+                continue
+            self._known.pop(name, None)
+            self._pending.pop(name, None)
+            log.info("lane pool: idle lane %s left the rotation (%s)", name, changes[name])
+        for name, why in changes.items():
+            if name not in idle_names and name in self._known:
+                self._pending[name] = why        # busy: applied on put()
 
     def _absorb_new(self) -> None:
         try:
-            fresh = self._refresh_fn()
+            fresh = list(self._refresh_fn())
         except Exception as e:  # noqa: BLE001 — a torn/absent file keeps the last set
             log.debug("final lane pool refresh failed (keeping current set): %s", e)
             return
         with self._absorb_lock:
+            if self._sync:
+                self._sync_known(fresh)
             now = time.time()
             for h in fresh:
                 name = getattr(h, "name", None)
@@ -116,7 +204,7 @@ class _FinalLanePool(queue.Queue):
                 if self._rejected.get(name, 0.0) > now:
                     continue                      # rejected/drained: not yet due
                 if not self._admit(h):
-                    continue
+                    continue                      # _admit logs the rejection
                 self._known[name] = h
                 super().put(h)
                 log.info("lane pool: new lane %s joined", name)
