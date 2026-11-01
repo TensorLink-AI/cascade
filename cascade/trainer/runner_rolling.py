@@ -270,8 +270,10 @@ class _RollingMixin:
         live hosts.toml refresh."""
         pool = self.__dict__.get("_rolling_lane_pool_obj")
         if pool is None:
+            # sync_from_file: an edited hosts.toml entry reaches dispatch and a
+            # removed lane leaves once idle (never a stale host object).
             pool = _FinalLanePool(self._rolling_final_hosts(), self._rolling_final_hosts,
-                                  gate_fn=self._operator_lane_gate)
+                                  gate_fn=self._operator_lane_gate, sync_from_file=True)
             self.__dict__["_rolling_lane_pool_obj"] = pool
         return pool
 

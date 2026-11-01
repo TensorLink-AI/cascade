@@ -69,9 +69,9 @@ class _OperatorPodMixin:
                           ).read_text(encoding="utf-8").strip()
             skus = self._funded_skus_for_rent()
             sku = skus[0] if skus else rnd.funded_pod_sku
-            from ..provision.operator_pool import operator_provider
+            from ..provision.operator_pool import operator_price_caps, operator_provider
 
-            provider = operator_provider(self, lambda: _lium_provider(rnd, price_caps=self._funded_price_caps()))
+            provider = operator_provider(self, lambda: _lium_provider(rnd, price_caps=operator_price_caps(self)))
             name_prefix = getattr(self.__dict__.get("_leg_local_obj"), "king_primary_prefix", None) or king_pod_name_prefix(self.cfg.subnet.netuid, round_id)
 
             def _king_remote(addr, host_key: str) -> RemoteHost:
@@ -396,9 +396,9 @@ class _OperatorPodMixin:
         ssh_pubkey = (key_path.parent / (key_path.name + ".pub")
                       ).read_text(encoding="utf-8").strip()
         skus = self._funded_skus_for_rent()
-        from ..provision.operator_pool import operator_provider
+        from ..provision.operator_pool import operator_price_caps, operator_provider
 
-        provider = operator_provider(self, lambda: _lium_provider(rnd, price_caps=self._funded_price_caps()))
+        provider = operator_provider(self, lambda: _lium_provider(rnd, price_caps=operator_price_caps(self)))
         prefix = name_prefix or self._operator_leg_pod_prefix(round_id, gen.hotkey)
         if name_prefix is not None:
             from ..provision.funded import funded_pod_name

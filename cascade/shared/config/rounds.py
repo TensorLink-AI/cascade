@@ -186,6 +186,11 @@ class RoundConfig:
     # GPU can be the cheaper leg).
     funded_max_price_per_hour: float = 1.5
     funded_max_leg_cost_usd: float = 1.6
+    # $/h ceiling for rents on the OPERATOR's account only (operator-billed
+    # legs / make-goods, operator-rented pods, the JIT and genesis king). None
+    # (key absent) = funded_max_price_per_hour, i.e. one shared cap. Miner-key
+    # rents always keep funded_max_price_per_hour (or the miner's own cap).
+    operator_max_price_per_hour: float | None = None
     # Measured wall (seconds) of one full-budget leg per SKU. Drives the
     # per-SKU latest safe start — a fast SKU may still start late — and the
     # per-leg cost cap. Unknown SKU ⇒ max_train_seconds.
@@ -246,6 +251,17 @@ class RoundConfig:
     # many seconds before its latest safe start. 0 ⇒ every waiting leg falls
     # back at once. The JIT king is never held back.
     funded_operator_fallback_fresh_window_seconds: int = 3600
+    # Operator lanes carry only OPERATOR-billed work: owner make-goods /
+    # expired-payer-key entries (``operator_billed``) and king legs. A
+    # miner-funded leg that finds no marketplace capacity requeues
+    # ``no_capacity`` unburned instead of moving onto the operator's bill.
+    # False = today's hybrid (any waiting funded leg may take a lane).
+    operator_lanes_operator_billed_only: bool = False
+    # Retry delay (seconds) of an OPERATOR-billed entry requeued for an
+    # operator-side fault (error_class "operator"): fixed, and infra_streak
+    # does not grow — the operator's own fault never backs off its make-good.
+    # 0 = the legacy doubling backoff (INFRA_BACKOFF_*) for these entries too.
+    operator_billed_retry_seconds: int = 60
     # Trainer recovery controls; scientific contracts and reward rules are unchanged.
     ops_max_active_per_coldkey: int = 0
     ops_gpu_failure_threshold: int = 0
