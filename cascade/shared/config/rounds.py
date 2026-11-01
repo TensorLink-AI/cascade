@@ -355,6 +355,12 @@ class RoundConfig:
     # Hippius upload, which then runs from the box copy. Never for a pod the
     # trainer still benches on. false = torn down when the leg returns.
     funded_release_after_harvest: bool = True
+    # #400 power-EMA shadow mode: keep a ssh-harvested leg's comparison files
+    # (weights_ema005 / weights_ema010 / weights_raw — never published) on the
+    # box under work_root/_shadow_ema for analysis (true), or delete them once
+    # the harvest is verified (false: no extra weights on the box disk). The
+    # r2 transport keeps them on R2 either way.
+    funded_keep_shadow_ema: bool = False
     # ── Direct submissions + champion-only publication (DEC-CA-0036) ─────────
     # Where the intake's private submission store lives (cascade.funding.store;
     # relative resolves under work_root). "" = direct submissions off: vault
