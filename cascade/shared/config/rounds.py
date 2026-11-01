@@ -152,6 +152,32 @@ class RoundConfig:
     # are off). Requires a funded_pod_image built from a --local-only-aware
     # release when set to "harvest".
     funded_pod_checkpoint: str = "harvest"
+    # How a "harvest"-mode checkpoint travels pod → Hippius (2026-10-31: four
+    # concurrent ~14 GB tar-over-ssh harvests filled the trainer's disk and
+    # teardown crashed on ENOSPC). "ssh" (default): tar over the pinned ssh
+    # into work_root/_funded_harvest, verify, push, delete. "r2": the pod
+    # streams each file over the same ssh into a presigned multipart upload
+    # on the Cloudflare R2 backup ([storage] backup_s3_endpoint, operator
+    # keys never leave the box — the pod gets one link per part); the box
+    # verifies sizes + the receipt's tensor digests by streaming hash from
+    # R2, tears the pod down, then pushes to Hippius from R2 (relay host or
+    # bounded local temp). The checkpoint never lands under work_root.
+    funded_harvest_transport: str = "ssh"
+    # r2 transport: the operator VM (a ``[[host]]`` entry ``name`` in the
+    # hosts file) that downloads from R2 via presigned GETs, re-verifies and
+    # pushes to Hippius on its own disk. "" = push from a bounded local temp
+    # when free disk allows, else the push is requeued (pending record).
+    ckpt_relay_host: str = ""
+    # Free-disk floor (GB) on work_root: a NEW funded/operator leg pod is not
+    # rented below it (requeued no_capacity, never burned; a re-attached /
+    # adopted pod always keeps going), and the r2 local-temp push needs this
+    # much left after the download. 0 = off.
+    min_free_disk_gb: float = 30.0
+    # r2 transport: bucket ("" = the [storage] backup bucket) and key prefix
+    # (objects are <prefix><base_seed>/<hotkey>/<job_id>/<file>; expire them
+    # with a bucket lifecycle rule — docs/OPERATOR.md).
+    ckpt_r2_bucket: str = ""
+    ckpt_r2_prefix: str = "ckpt/"
     # Shared admission cap for miner-funded A/B/C preparation and training;
     # queued tasks wait FIFO. King work has reserved admission. Also bounds
     # lane-A in-flight entries; 0 ⇒ ``finalist_cap``. Overlay-settable.
@@ -186,6 +212,11 @@ class RoundConfig:
     # GPU can be the cheaper leg).
     funded_max_price_per_hour: float = 1.5
     funded_max_leg_cost_usd: float = 1.6
+    # $/h ceiling for rents on the OPERATOR's account only (operator-billed
+    # legs / make-goods, operator-rented pods, the JIT and genesis king). None
+    # (key absent) = funded_max_price_per_hour, i.e. one shared cap. Miner-key
+    # rents always keep funded_max_price_per_hour (or the miner's own cap).
+    operator_max_price_per_hour: float | None = None
     # Measured wall (seconds) of one full-budget leg per SKU. Drives the
     # per-SKU latest safe start — a fast SKU may still start late — and the
     # per-leg cost cap. Unknown SKU ⇒ max_train_seconds.
@@ -211,6 +242,42 @@ class RoundConfig:
     # image that writes CASCADE_PROGRESS_FILE (older images: inert).
     progress_watchdog_grace_seconds: int = 1200
     progress_watchdog_tolerance: float = 1.5
+    # EARLY judge (2026-11-01: the 93.120.231.186 8xH100 ran 0.2 steps/s on
+    # two legs, each aborted only at the 20-min grace and the host re-rented
+    # in between): from this many seconds of observed steps the watchdog
+    # already projects — with an OPTIMISTIC rate (one progress-record quantum
+    # of steps added, so record spacing can never cause a false abort) — and
+    # aborts a leg that breaks the same bound. The full judge still runs at
+    # the grace. 0 = off (judge at the grace only, the pre-#395 behaviour).
+    progress_watchdog_early_seconds: int = 600
+    # First-step deadline: a detached leg whose worker has reported NO
+    # training step within this many seconds of the leg's first poll (an NCCL
+    # hang before step 1 — "Cuda failure 999") is aborted as an operator fault
+    # and its host quarantined. Needs an image that writes
+    # CASCADE_PROGRESS_FILE: on one that does not, every leg would look
+    # stuck, hence 0 = off by default (arm e.g. 2700 on a progress image).
+    progress_first_step_seconds: int = 0
+    # Hosts (IP, or a provider host key such as ``vast:<machine_id>``) NEVER
+    # rented again and refused at the operator-lane join gate — merged with
+    # the expiring quarantine file (lium_host_quarantine.json). () = none.
+    funded_host_blocklist: tuple[str, ...] = ()
+    # Multi-GPU preflight: before a leg is admitted to a multi-GPU pod (payer
+    # rent, operator-leg rent, king rent, operator-lane join), an N-rank NCCL
+    # all_reduce of a fixed buffer runs on the pod under this hard timeout
+    # (seconds, torchrun start-up included). A hang or an NCCL/CUDA error
+    # rejects the pod (released and rented again / lane refused) and
+    # quarantines its host. 0 = preflight off. Single-GPU pods are skipped.
+    funded_host_nccl_timeout_seconds: int = 90
+    # Per-SKU floor (GB/s) on the preflight's measured all_reduce bus
+    # bandwidth — a comm-bound host (8xH200 VMs at ~155 W/GPU trained 5x
+    # slower) passes the hang check but not this. () / unknown SKU = off.
+    funded_host_nccl_busbw_floor: tuple[tuple[str, float], ...] = ()
+    # Lane circuit breaker: an operator lane that fails this many DIFFERENT
+    # legs in a row operator-side (no successful leg between; miner faults,
+    # storage blips and transport losses do not count) leaves the rotation
+    # for hours ("LANE BREAKER") instead of failing every leg in the queue in
+    # seconds. 0 = off.
+    operator_lane_breaker_failures: int = 3
     # Provider-side TTL on every funded / operator-leg / generation-VM rent:
     # the pod's expected lifetime (leg wall cap + boot + bench) plus this
     # margin, so a dead trainer cannot leave a pod billing. 0 = no TTL.
@@ -246,6 +313,17 @@ class RoundConfig:
     # many seconds before its latest safe start. 0 ⇒ every waiting leg falls
     # back at once. The JIT king is never held back.
     funded_operator_fallback_fresh_window_seconds: int = 3600
+    # Operator lanes carry only OPERATOR-billed work: owner make-goods /
+    # expired-payer-key entries (``operator_billed``) and king legs. A
+    # miner-funded leg that finds no marketplace capacity requeues
+    # ``no_capacity`` unburned instead of moving onto the operator's bill.
+    # False = today's hybrid (any waiting funded leg may take a lane).
+    operator_lanes_operator_billed_only: bool = False
+    # Retry delay (seconds) of an OPERATOR-billed entry requeued for an
+    # operator-side fault (error_class "operator"): fixed, and infra_streak
+    # does not grow — the operator's own fault never backs off its make-good.
+    # 0 = the legacy doubling backoff (INFRA_BACKOFF_*) for these entries too.
+    operator_billed_retry_seconds: int = 60
     # Trainer recovery controls; scientific contracts and reward rules are unchanged.
     ops_max_active_per_coldkey: int = 0
     ops_gpu_failure_threshold: int = 0
@@ -271,6 +349,18 @@ class RoundConfig:
     # tensor digests is refused as tamper (true) or accepted with a warning
     # (false: a worker image that predates the digests still harvests).
     funded_require_tensor_digests: bool = False
+    # Owner 2026-11-01: release (tear down) a funded / operator-rented leg's
+    # pod as soon as its harvested checkpoint is verified complete on the box
+    # (every file, size + sha256 vs the pod's own listing) — before the box →
+    # Hippius upload, which then runs from the box copy. Never for a pod the
+    # trainer still benches on. false = torn down when the leg returns.
+    funded_release_after_harvest: bool = True
+    # #400 power-EMA shadow mode: keep a ssh-harvested leg's comparison files
+    # (weights_ema005 / weights_ema010 / weights_raw — never published) on the
+    # box under work_root/_shadow_ema for analysis (true), or delete them once
+    # the harvest is verified (false: no extra weights on the box disk). The
+    # r2 transport keeps them on R2 either way.
+    funded_keep_shadow_ema: bool = False
     # ── Direct submissions + champion-only publication (DEC-CA-0036) ─────────
     # Where the intake's private submission store lives (cascade.funding.store;
     # relative resolves under work_root). "" = direct submissions off: vault

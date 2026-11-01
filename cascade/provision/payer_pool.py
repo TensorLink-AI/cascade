@@ -194,7 +194,8 @@ def rent_from_pool(options, rent_one):
         )
 
 
-def reconcile_payer_accounts(owned, vault, *, netuid, provider_factory, hotkeys, exclude):
+def reconcile_payer_accounts(owned, vault, *, netuid, provider_factory, hotkeys, exclude,
+                             keep=None):
     import logging
 
     from ..funding.providers import decode_credentials, lease_records
@@ -233,6 +234,8 @@ def reconcile_payer_accounts(owned, vault, *, netuid, provider_factory, hotkeys,
             pattern = payer_pod_pattern(hotkey, netuid)
             for pod_id, name in pods.items():
                 if pattern.match(name) and (credential.provider, pod_id) not in owned_ids:
+                    if keep is not None and keep(adapter, pod_id, hotkey):
+                        continue
                     if terminate_verified(adapter, pod_id):
                         killed.append(pod_id)
                     else:

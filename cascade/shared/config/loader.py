@@ -60,7 +60,9 @@ from .validators import (
     validate_funded_pods,
     validate_funded_price_cap,
     validate_funded_sku_wall_seconds,
+    validate_host_blocklist,
     validate_measured_image,
+    validate_nonneg_count,
     validate_nonneg_seconds,
     validate_real_corpus_ref,
     validate_sandbox_mode,
@@ -97,6 +99,41 @@ RETIRED_KEYS: dict[str, frozenset[str]] = {
     "eval": frozenset({"eval_source"}),
     "validator": frozenset({"hf_cache_seconds"}),
 }
+
+
+CKPT_TRANSPORTS = ("ssh", "r2")
+_BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
+
+
+def parse_ckpt_transport(r: dict) -> dict:
+    """The ``[round]`` checkpoint-transport knobs (r2 direct harvest), parsed
+    and validated: ``funded_harvest_transport``, ``ckpt_relay_host``,
+    ``min_free_disk_gb``, ``ckpt_r2_bucket``, ``ckpt_r2_prefix``. Unknown
+    transports and malformed buckets/prefixes fail loud — a typo silently
+    falling back to the ssh path would re-open the 2026-10-31 disk incident."""
+    transport = str(r.get("funded_harvest_transport", "ssh")).strip().lower()
+    if transport not in CKPT_TRANSPORTS:
+        raise ValueError(f"[round] funded_harvest_transport={transport!r} invalid; "
+                         f"expected one of {CKPT_TRANSPORTS}")
+    relay = r.get("ckpt_relay_host", "")
+    if not isinstance(relay, str):
+        raise ValueError("[round] ckpt_relay_host must be a hosts-file entry name (string)")
+    gb = r.get("min_free_disk_gb", 30.0)
+    if isinstance(gb, bool) or not isinstance(gb, (int, float)) or not (0 <= float(gb) < 1e6):
+        raise ValueError(f"[round] min_free_disk_gb must be a finite number >= 0; got {gb!r}")
+    bucket = str(r.get("ckpt_r2_bucket", "") or "").strip()
+    if bucket and not _BUCKET_RE.match(bucket):
+        raise ValueError(f"[round] ckpt_r2_bucket={bucket!r} is not a valid bucket name")
+    prefix = str(r.get("ckpt_r2_prefix", "ckpt/"))
+    if (prefix.startswith("/") or ".." in prefix.split("/")
+            or not re.fullmatch(r"[A-Za-z0-9._/-]*", prefix)):
+        raise ValueError(f"[round] ckpt_r2_prefix={prefix!r} invalid (relative key prefix, "
+                         "letters/digits/._-/ only, no '..')")
+    if prefix and not prefix.endswith("/"):
+        prefix += "/"
+    return {"funded_harvest_transport": transport, "ckpt_relay_host": relay.strip(),
+            "min_free_disk_gb": float(gb), "ckpt_r2_bucket": bucket,
+            "ckpt_r2_prefix": prefix}
 
 
 def parse_chain_config(raw: dict) -> ChainConfig:
@@ -431,6 +468,7 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
                 r.get("funded_ready_timeout_seconds", 900.0)),
             funded_robot_duration_days=max(1, int(r.get("funded_robot_duration_days", 1))),
             funded_pod_checkpoint=str(r.get("funded_pod_checkpoint", "harvest")),
+            **parse_ckpt_transport(r),
             funded_field_cap=validate_funded_field_cap(
                 r.get("funded_field_cap", 0)),
             funded_pod_skus=validate_funded_pod_skus(
@@ -445,6 +483,9 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
                 "funded_max_price_per_hour", r.get("funded_max_price_per_hour", 1.5)),
             funded_max_leg_cost_usd=validate_funded_price_cap(
                 "funded_max_leg_cost_usd", r.get("funded_max_leg_cost_usd", 1.6)),
+            operator_max_price_per_hour=(None if r.get("operator_max_price_per_hour") is None
+                                         else validate_funded_price_cap(
+                "operator_max_price_per_hour", r.get("operator_max_price_per_hour"))),
             funded_sku_wall_seconds=(validate_funded_sku_wall_seconds(
                 r["funded_sku_wall_seconds"]) if "funded_sku_wall_seconds" in r
                 else RoundConfig.funded_sku_wall_seconds),
@@ -456,6 +497,26 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
                       RoundConfig.progress_watchdog_grace_seconds)),
             progress_watchdog_tolerance=validate_watchdog_tolerance(
                 r.get("progress_watchdog_tolerance", RoundConfig.progress_watchdog_tolerance)),
+            progress_watchdog_early_seconds=validate_nonneg_seconds(
+                "progress_watchdog_early_seconds",
+                r.get("progress_watchdog_early_seconds",
+                      RoundConfig.progress_watchdog_early_seconds)),
+            progress_first_step_seconds=validate_nonneg_seconds(
+                "progress_first_step_seconds",
+                r.get("progress_first_step_seconds", RoundConfig.progress_first_step_seconds)),
+            funded_host_blocklist=validate_host_blocklist(
+                r.get("funded_host_blocklist", None)),
+            funded_host_nccl_timeout_seconds=validate_nonneg_seconds(
+                "funded_host_nccl_timeout_seconds",
+                r.get("funded_host_nccl_timeout_seconds",
+                      RoundConfig.funded_host_nccl_timeout_seconds)),
+            funded_host_nccl_busbw_floor=validate_funded_host_bench_floor(
+                r.get("funded_host_nccl_busbw_floor", None),
+                name="funded_host_nccl_busbw_floor", unit="GB/s", example='"8xH200" = 300'),
+            operator_lane_breaker_failures=validate_nonneg_count(
+                "operator_lane_breaker_failures",
+                r.get("operator_lane_breaker_failures",
+                      RoundConfig.operator_lane_breaker_failures)),
             provider_ttl_margin_seconds=validate_nonneg_seconds(
                 "provider_ttl_margin_seconds",
                 r.get("provider_ttl_margin_seconds", RoundConfig.provider_ttl_margin_seconds)),
@@ -469,7 +530,13 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
             funded_operator_fallback=bool(r.get("funded_operator_fallback", False)),
             funded_operator_fallback_fresh_window_seconds=max(
                 0, int(r.get("funded_operator_fallback_fresh_window_seconds", 3600))),
+            operator_lanes_operator_billed_only=bool(
+                r.get("operator_lanes_operator_billed_only", False)),
+            operator_billed_retry_seconds=validate_nonneg_seconds(
+                "operator_billed_retry_seconds", r.get("operator_billed_retry_seconds", 60)),
             funded_require_tensor_digests=bool(r.get("funded_require_tensor_digests", False)),
+            funded_release_after_harvest=bool(r.get("funded_release_after_harvest", True)),
+            funded_keep_shadow_ema=bool(r.get("funded_keep_shadow_ema", False)),
             submission_vault_dir=str(r.get("submission_vault_dir", "")),
             champion_publish=validate_champion_publish(
                 str(r.get("champion_publish", "off"))),
@@ -662,6 +729,10 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
         netconfig=parse_netconfig(raw.get("netconfig"), activation_feature=_act_feature),
         raw=raw,
     )
+    if (cfg.round.funded_harvest_transport == "r2"
+            and not (cfg.storage.backup_s3_endpoint or "").strip()):
+        raise ValueError("[round] funded_harvest_transport = \"r2\" needs [storage] "
+                         "backup_s3_endpoint (the Cloudflare R2 checkpoint bucket)")
     # DEC-CA-0063: a validator bench source with a block is an era-boundary
     # v2 rule that needs the king ladder (k = 1) and a named main validator.
     _bs = int(cfg.v2.bench_source_from_block)

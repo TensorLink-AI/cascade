@@ -39,6 +39,9 @@ Cost: O(C²L) per multichannel series, zero for univariate.
 
 from __future__ import annotations
 
+import queue
+import threading
+
 import numpy as np
 
 # Numerical floor for a channel's standard deviation. A constant channel has
@@ -206,3 +209,69 @@ class ChannelStatsAccumulator:
             out["frac_unpartnered"] = round(
                 float((pz < _UNPARTNERED_Z).mean()), 6)
         return out
+
+
+_STOP = object()
+
+
+class BackgroundObserver:
+    """Run ``fn(item)`` for every submitted item on ONE background thread, in
+    submission order (a FIFO queue, so a stateful accumulator sees exactly
+    the inline sequence and ends in exactly the inline state).
+
+    Telemetry only: it moves :meth:`ChannelStatsAccumulator.observe` (an
+    O(C²L) numpy pass + a content hash per multichannel series) off the
+    training thread. The queue is bounded (``maxsize`` items held by
+    reference — the stream yields a fresh array per series and the batcher
+    only reads them), so a slow observer back-pressures the stream instead
+    of growing memory. The first exception ``fn`` raises is kept, later items
+    are dropped, and it is re-raised on the next :meth:`__call__` or by
+    :meth:`close` — an observer failure still fails the run, as it did
+    inline. Call :meth:`close` before reading the accumulator.
+    """
+
+    def __init__(self, fn, *, maxsize: int = 64, name: str = "channel-stats") -> None:
+        self._fn = fn
+        self._q: queue.Queue = queue.Queue(maxsize=max(1, int(maxsize)))
+        self._error: BaseException | None = None
+        self._closed = False
+        self._thread = threading.Thread(target=self._run, name=name, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while True:
+            item = self._q.get()
+            try:
+                if item is _STOP:
+                    return
+                if self._error is None:
+                    self._fn(item)
+            except BaseException as e:  # noqa: BLE001 — re-raised on the caller's thread
+                self._error = e
+            finally:
+                self._q.task_done()
+
+    def _raise(self) -> None:
+        if self._error is not None:
+            raise self._error
+
+    def __call__(self, item) -> None:
+        if self._closed:
+            raise RuntimeError("BackgroundObserver is closed")
+        self._raise()
+        self._q.put(item)
+
+    def flush(self) -> None:
+        """Block until every submitted item has been observed."""
+        self._q.join()
+        self._raise()
+
+    def close(self, *, raise_errors: bool = True) -> None:
+        """Drain the queue, stop the thread and (by default) re-raise the
+        observer's failure. Idempotent."""
+        if not self._closed:
+            self._closed = True
+            self._q.put(_STOP)
+            self._thread.join()
+        if raise_errors:
+            self._raise()

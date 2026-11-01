@@ -197,11 +197,17 @@ def test_repeated_slow_pods_settle_infra_without_a_burn(tmp_path, monkeypatch):
 def test_stale_image_still_wins_over_the_floor(tmp_path, monkeypatch):
     """A stale pod is rejected for its image (host quarantined) and never
     benched — the fingerprint verdict stays the first word."""
+    from dataclasses import replace
+
     from cascade.provision import funded as funded_mod
+    from cascade.provision.core import PodAddress, quarantined_hosts
 
     runner = _runner(tmp_path, funded_host_bench_floor=FLOOR)
     _vault(tmp_path, "hkA")
-    monkeypatch.setattr(funded_mod, "rent_funded_pod", lambda **kw: _rent_ok())
+    # The stale host is quarantined, so the replacement lands on ANOTHER host
+    # (a pod back on the quarantined one would itself be torn down unprobed).
+    rented = [_rent_ok(), replace(_rent_ok(), address=PodAddress(ip="10.9.9.10", ssh_port=2222))]
+    monkeypatch.setattr(funded_mod, "rent_funded_pod", lambda **kw: rented.pop(0))
     monkeypatch.setattr(funded_mod, "teardown_funded", lambda pods, vault, **kw: [])
     verdicts = ["stale worker image: x != y", ""]
     runner._funded_pod_code_mismatch = lambda result, profile: verdicts.pop(0)
@@ -209,6 +215,7 @@ def test_stale_image_still_wins_over_the_floor(tmp_path, monkeypatch):
     runner._funded_pod_too_slow = lambda result, profile: probed.append(1) or ""
     runner._rent_funded_host("777", _challenger("hkA"))
     assert probed == [1]                            # only the pinned second pod was benched
+    assert "10.9.9.9" in quarantined_hosts()        # the stale host was quarantined
 
 
 # ── the JIT king ────────────────────────────────────────────────────────────

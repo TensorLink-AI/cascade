@@ -459,7 +459,9 @@ _CREDENTIAL_ENV_RE = re.compile(r"(KEY|SECRET|TOKEN|PASSWORD|PASSWD)", re.IGNORE
 DETACHED_POLL_SECONDS = 30
 DETACHED_REATTACH_GRACE_SECONDS = 900
 DETACHED_STDOUT_TAIL_BYTES = 262144
-DETACHED_STDERR_TAIL_BYTES = 20000
+# Large enough to reach past bash's job notice and the trailing log lines to
+# the worker's real Traceback (2026-11-01: a 20 KB tail held only the notice).
+DETACHED_STDERR_TAIL_BYTES = 131072
 DETACHED_LAUNCH_TOKEN = "__CASCADE_DETACHED__"
 DETACHED_STDERR_MARK = "__CASCADE_DETACHED_STDERR__"
 _SLEEP = time.sleep  # test seam
@@ -541,10 +543,14 @@ class LegAborted(RemoteDispatchError):
 
 def _detached_find_command(host: RemoteHost, tag: str) -> str:
     """List prior run dirs of ``tag`` on the pod that still matter: the worker
-    is alive (pid answers ``kill -0``) or finished (``exit_code`` written)."""
+    is alive (pid answers ``kill -0``) or finished CLEANLY (``exit_code`` 0 —
+    a result to harvest). A FAILED run (exit != 0) is never re-attached: that
+    only re-reports the old failure, so every retry on the lane "fails" in
+    seconds without relaunching (2026-11-01 Targon lanes, ~30 legs)."""
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", tag)[:80]
     return (f"cd {shlex.quote(host.workdir)} && for d in {DETACHED_RUN_ROOT}/{safe}-*; do "
-            f"[ -d \"$d\" ] || continue; if [ -f \"$d/exit_code\" ]; then echo ATTACH:$d; "
+            f"[ -d \"$d\" ] || continue; if [ -f \"$d/exit_code\" ]; then "
+            f"[ \"$(cat \"$d/exit_code\")\" = 0 ] && echo ATTACH:$d; "
             f"elif [ -f \"$d/pid\" ] && kill -0 $(cat \"$d/pid\") 2>/dev/null; then "
             f"echo ATTACH:$d; fi; done; true")
 
@@ -574,10 +580,209 @@ def find_detached_run(host: RemoteHost, tag: str, *, runner=None) -> str | None:
     return rel if rel.startswith("/") else f"{host.workdir}/{rel}"
 
 
+_POD_PROBE_TOKEN = "__CASCADE_POD_PROBE__"
+# exit code 0, whitespace-insensitive (the launcher writes "0\n")
+_RC_ZERO = '[ "$(tr -d \' \\n\' < "$d/exit_code")" = 0 ]'
+
+
+@dataclass(frozen=True)
+class PodRunsProbe:
+    """What the detached run dirs on a pod say about it (the sweep's guard).
+
+    ``reachable`` False = the probe could not run (transport failure,
+    host-key refusal, no answer): unknown, never "idle". ``live`` = run dirs
+    whose worker pid answers ``kill -0``; ``finished_ok`` = ``(run dir, age
+    seconds since exit)`` of runs that ended with exit code 0 — their
+    checkpoint is on the pod until the orchestrator harvests it (the caller
+    knows which it harvested; the pod is never written to)."""
+
+    reachable: bool
+    live: tuple[str, ...] = ()
+    finished_ok: tuple[tuple[str, float], ...] = ()
+    error: str = ""
+
+
+def _pod_runs_probe_command(host: RemoteHost) -> str:
+    return (
+        "if cd " + shlex.quote(host.workdir) + " 2>/dev/null; then now=$(date +%s); "
+        "for d in " + DETACHED_RUN_ROOT + "/*; do [ -d \"$d\" ] || continue; "
+        "if [ -f \"$d/exit_code\" ]; then "
+        "if " + _RC_ZERO + "; then "
+        "echo FINISHED:$(( now - $(stat -c %Y \"$d/exit_code\" 2>/dev/null || echo $now) )):$d; "
+        "fi; "
+        "elif [ -f \"$d/pid\" ] && kill -0 $(cat \"$d/pid\") 2>/dev/null; then echo LIVE:$d; fi; "
+        "done; fi; echo " + _POD_PROBE_TOKEN)
+
+
+def probe_pod_runs(host: RemoteHost, *, runner=None, timeout: int = 60) -> PodRunsProbe:
+    """Ask ``host`` which detached runs on it still matter. Read-only: nothing
+    on the pod changes. The pod sweep calls this before it may terminate a
+    pod — a live worker or an unharvested finished run keeps the pod."""
+    run = runner or run_ssh
+    try:
+        p = run(build_ssh_argv(host, _pod_runs_probe_command(host)), timeout, "")
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return PodRunsProbe(reachable=False, error=f"{type(e).__name__}: {e}")
+    lines = [ln.strip() for ln in (p.stdout or "").splitlines()]
+    if p.returncode != 0 or _POD_PROBE_TOKEN not in lines:
+        return PodRunsProbe(reachable=False,
+                            error=f"rc={p.returncode} {(p.stderr or '').strip()[-200:]}")
+    live: list[str] = []
+    finished: list[tuple[str, float]] = []
+    for ln in lines:
+        if ln.startswith("LIVE:"):
+            live.append(ln[len("LIVE:"):])
+        elif ln.startswith("FINISHED:"):
+            age, _, d = ln[len("FINISHED:"):].partition(":")
+            try:
+                finished.append((d, max(0.0, float(age))))
+            except ValueError:
+                finished.append((d, 0.0))   # unknown age: treated as fresh (kept)
+    return PodRunsProbe(reachable=True, live=tuple(live), finished_ok=tuple(finished))
+
+
 def _detached_fetch_command(host: RemoteHost, run_dir: str) -> str:
     rd = shlex.quote(run_dir)
+    pf = shlex.quote(detached_progress_path(run_dir))
     return (f"cd {shlex.quote(host.workdir)} && tail -c {DETACHED_STDOUT_TAIL_BYTES} {rd}/stdout; "
-            f"printf '\\n{DETACHED_STDERR_MARK}\\n'; tail -c {DETACHED_STDERR_TAIL_BYTES} {rd}/stderr")
+            f"printf '\\n{DETACHED_STDERR_MARK}\\n'; tail -c {DETACHED_STDERR_TAIL_BYTES} {rd}/stderr; "
+            f"printf '\\n{DETACHED_FETCH_PROGRESS_MARK}\\n'; "
+            f"head -c {_PROGRESS_MAX_BYTES} {pf} 2>/dev/null; true")
+
+
+# ── failed-leg evidence (2026-11-01: 03:18 and 00:03 incidents) ─────────────
+# A failed leg's logged reason was the stderr TAIL — only bash's job notice
+# ("[1]+ Exit N  CASCADE_PROGRESS_FILE=... < /dev/null") — and the pod was
+# removed seconds later, so the real cause was gone. The failure reason now
+# carries the last Traceback and the last error-signal lines, and the fetched
+# tails are saved on the orchestrator box before the exception reaches any
+# teardown.
+
+DETACHED_FETCH_PROGRESS_MARK = "__CASCADE_DETACHED_PROGRESS__"
+FAILED_LEG_LOG_MAX_BYTES = 262144
+FAILED_LEG_LOGS_KEEP = 200
+_TRACEBACK_HEAD = "Traceback (most recent call last):"
+_FAULT_RE = re.compile(r"NCCL|\bKilled\b|\bOOM\b|out of memory|OutOfMemoryError|"
+                       r"CUDA error|Segmentation fault|core dumped|oom-kill", re.IGNORECASE)
+_LEVEL_RE = re.compile(r"\b(ERROR|CRITICAL|FATAL)\b")
+
+
+def _is_signal_line(line: str) -> bool:
+    """An error-signal line: ERROR/CRITICAL/FATAL as a log level (upper case
+    only — ``error_class=`` is not a signal), or an NCCL / kill / OOM / CUDA
+    fault in any case."""
+    return bool(_LEVEL_RE.search(line) or _FAULT_RE.search(line))
+
+
+def split_job_notices(stderr: str) -> tuple[list[str], list[str]]:
+    """``(lines, job statuses)``: stderr without bash's job-control notice
+    lines, and each notice's status word(s) (``"Exit 1"``, ``"Killed"``)
+    without the long command line it echoes."""
+    lines, statuses = [], []
+    for ln in (stderr or "").splitlines():
+        m = _JOB_CONTROL_LINE.match(ln.strip())
+        if m:
+            rest = ln.strip()[m.start(1):].split()
+            word = rest[0]
+            if word == "Exit" and len(rest) > 1 and rest[1].isdigit():
+                word = f"Exit {rest[1]}"
+            statuses.append(word)
+            continue
+        lines.append(ln.rstrip())
+    return lines, statuses
+
+
+def last_traceback(lines: list[str], *, max_lines: int = 60) -> list[str]:
+    """The last ``Traceback (most recent call last):`` block of ``lines``,
+    through its exception line (the first unindented line after the frames);
+    the last ``max_lines`` of it when longer."""
+    idx = max((i for i, ln in enumerate(lines) if ln.lstrip().startswith(_TRACEBACK_HEAD)),
+              default=-1)
+    if idx < 0:
+        return []
+    block = [lines[idx]]
+    for ln in lines[idx + 1:]:
+        block.append(ln)
+        if ln and not ln[:1].isspace():
+            break
+    return block[-max_lines:]
+
+
+def summarize_failure(stderr: str, *, rc, progress: dict | None = None,
+                      tail_chars: int = 1500) -> tuple[str, str]:
+    """``(cause, detail)`` for a failed leg. ``cause`` is one line — exit
+    code, job status, last progress step and the most specific reason found
+    (the last traceback's exception line, else the last error-signal line,
+    else the last log line); ``detail`` is the traceback block, the last
+    error-signal lines and the cleaned tail (job notices stripped)."""
+    lines, statuses = split_job_notices(stderr)
+    tb = last_traceback(lines)
+    tb_set = set(tb)
+    signals = [ln for ln in lines if _is_signal_line(ln) and ln not in tb_set][-8:]
+    nonblank = [ln for ln in lines if ln.strip()]
+    if tb:
+        reason = tb[-1].strip()
+    elif signals:
+        reason = signals[-1].strip()
+    else:
+        reason = nonblank[-1].strip() if nonblank else "(no stderr)"
+    head = [f"exit_code={rc}"]
+    if statuses:
+        head.append(f"job={statuses[-1]}")
+    if progress and progress.get("step") is not None:
+        head.append(f"last_step={progress.get('step')}")
+    cause = " ".join(head) + ": " + reason[:400]
+    detail: list[str] = []
+    if tb:
+        detail += ["--- last traceback ---", *tb]
+    if signals:
+        detail += ["--- error signals ---", *signals]
+    tail = "\n".join(nonblank)[-tail_chars:]
+    if tail:
+        detail += ["--- stderr tail ---", tail]
+    return cause, "\n".join(detail)
+
+
+def save_failed_leg_evidence(root, hotkey: str, *, header: dict, stdout: str, stderr: str,
+                             clock=time.time) -> str | None:
+    """Write the fetched stdout + stderr tails of a failed leg to
+    ``root/<hotkey12>-<utc-ts>.log`` (at most ``FAILED_LEG_LOG_MAX_BYTES``;
+    the newest ``FAILED_LEG_LOGS_KEEP`` files are kept). Runs BEFORE the
+    failure propagates to any teardown. Best-effort: returns the path, or
+    None when it could not be written."""
+    if not root:
+        return None
+    try:
+        d = Path(root)
+        d.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(float(clock())))
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", str(hotkey or "unknown"))[:12]
+        path = d / f"{safe}-{ts}.log"
+        n = 1
+        while path.exists():
+            path = d / f"{safe}-{ts}-{n}.log"
+            n += 1
+        budget = FAILED_LEG_LOG_MAX_BYTES // 2
+        out_b = (stdout or "").encode("utf-8", "replace")[-budget:]
+        err_b = (stderr or "").encode("utf-8", "replace")[-budget:]
+        text = (json.dumps(header, sort_keys=True, default=str) + "\n"
+                + "=== stdout (tail) ===\n" + out_b.decode("utf-8", "replace")
+                + "\n=== stderr (tail) ===\n" + err_b.decode("utf-8", "replace") + "\n")
+        data = text.encode("utf-8", "replace")
+        if len(data) > FAILED_LEG_LOG_MAX_BYTES:
+            data = data[:1024] + data[-(FAILED_LEG_LOG_MAX_BYTES - 1024):]
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_bytes(data)
+        tmp.replace(path)
+        logs = sorted((p for p in d.glob("*.log") if p != path),
+                      key=lambda p: (p.stat().st_mtime, p.name))
+        for old in logs[:max(0, len(logs) + 1 - FAILED_LEG_LOGS_KEEP)]:
+            with contextlib.suppress(OSError):
+                old.unlink()
+        return str(path)
+    except Exception as e:  # noqa: BLE001 — evidence never masks the failure itself
+        log.warning("failed-leg evidence for %s not saved: %s", str(hotkey)[:12], e)
+        return None
 
 
 def _detached_kill_command(host: RemoteHost, run_dir: str) -> str:
@@ -630,6 +835,7 @@ def run_detached(host: RemoteHost, body: str, stdin_env: str | None, run_dir: st
     misses = 0
     rc: int | None = None
     vanished = False
+    last_progress: dict | None = None    # the worker's last step record seen by a poll
     poll_argv = build_ssh_argv(host, _detached_poll_command(host, run_dir))
     while True:
         if cancel is not None and cancel.is_set():
@@ -666,10 +872,13 @@ def run_detached(host: RemoteHost, body: str, stdin_env: str | None, run_dir: st
         misses = 0
         last_seen = now
         if token == "RUNNING":
+            seen = parse_progress(lines)
+            if seen is not None:
+                last_progress = seen
             if on_running is not None:
                 on_running()
             if on_progress is not None:
-                why = on_progress(parse_progress(lines))
+                why = on_progress(seen)
                 if why:
                     with contextlib.suppress(Exception):  # best-effort
                         run(build_ssh_argv(host, _detached_kill_command(host, run_dir)), 60, "")
@@ -696,14 +905,31 @@ def run_detached(host: RemoteHost, body: str, stdin_env: str | None, run_dir: st
             pass
         _SLEEP(20)
     if out is None:
+        step = (last_progress or {}).get("step")
+        at = f", last_step={step}" if step is not None else ""
         raise RemoteDispatchError(
-            f"{describe}: detached worker finished (rc={rc}) but its output could not "
+            f"{describe}: detached worker finished (rc={rc}{at}) but its output could not "
             f"be fetched after 6 attempts", returncode=rc)
     stdout, _, stderr = out.partition(DETACHED_STDERR_MARK)
+    stderr, _, fetched = stderr.partition(DETACHED_FETCH_PROGRESS_MARK)
+    progress = _parse_fetched_progress(fetched) or last_progress
     if vanished:
         stderr = stderr.rstrip() + "\n[detached worker process vanished without an exit code]"
-    return subprocess.CompletedProcess(args=fetch_argv, returncode=rc,
+    proc = subprocess.CompletedProcess(args=fetch_argv, returncode=rc,
                                        stdout=stdout, stderr=stderr)
+    proc.progress = progress          # the worker's last step record (or None)
+    return proc
+
+
+def _parse_fetched_progress(text: str) -> dict | None:
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:
+        rec = json.loads(text.splitlines()[0])
+    except ValueError:
+        return None
+    return rec if isinstance(rec, dict) else None
 
 
 def pinned_known_hosts_file(host: RemoteHost) -> Path:
@@ -929,6 +1155,138 @@ def probe_host_bench(host: RemoteHost, *,
             except (ValueError, KeyError, TypeError) as e:
                 return None, f"host bench probe returned malformed facts: {e}"
     return None, "host bench probe printed no result"
+
+
+# ── multi-GPU (NCCL) preflight ──────────────────────────────────────────────
+# Hosts that cannot do multi-GPU passed every other check (2026-10-31/11-01):
+# one hung before its first step on NCCL "Cuda failure 999", one hung on a
+# plain 8-GPU all_reduce, and 8xH200 VMs trained 5x slower comm-bound (~155 W
+# per GPU vs ~375 W). The preflight runs an N-rank all_reduce of a fixed
+# buffer on the pod's OWN torch (its pinned venv) under a hard timeout. The
+# script is self-contained and travels on stdin — nothing of this release has
+# to be in the pod's image for it to run.
+NCCL_PREFLIGHT_MARK = "NCCLCHECK "
+NCCL_PREFLIGHT_BUFFER_MB = 256
+NCCL_PREFLIGHT_ITERS = 20
+_NCCL_PREFLIGHT_PY = """\
+import datetime, json, os, time
+import torch
+import torch.distributed as dist
+local = int(os.environ["LOCAL_RANK"])
+torch.cuda.set_device(local)
+dist.init_process_group("nccl", timeout=datetime.timedelta(seconds=__INIT__))
+world = dist.get_world_size()
+probe = torch.ones(1024, device="cuda")
+dist.all_reduce(probe)
+torch.cuda.synchronize()
+ok = bool(torch.all(probe == world).item())
+buf = torch.zeros(__MB__ * 1024 * 1024 // 4, device="cuda")
+for _ in range(3):
+    dist.all_reduce(buf)
+torch.cuda.synchronize()
+dist.barrier()
+t0 = time.perf_counter()
+for _ in range(__ITERS__):
+    dist.all_reduce(buf)
+torch.cuda.synchronize()
+dt = torch.tensor([(time.perf_counter() - t0) / __ITERS__], device="cuda",
+                  dtype=torch.float64)
+dist.all_reduce(dt, op=dist.ReduceOp.MAX)
+if dist.get_rank() == 0:
+    nbytes = buf.numel() * buf.element_size()
+    sec = max(float(dt.item()), 1e-9)
+    algbw = nbytes / sec / 1e9
+    print("NCCLCHECK " + json.dumps({"world": world, "bytes": nbytes, "seconds": sec,
+          "algbw_gbps": algbw, "busbw_gbps": algbw * 2 * (world - 1) / world,
+          "ok": ok}), flush=True)
+dist.destroy_process_group()
+"""
+
+
+@dataclass(frozen=True)
+class NcclPreflight:
+    """One multi-GPU preflight. ``ok`` = the all_reduce completed with the
+    right sum; ``inconclusive`` = the probe could not reach the pod at all
+    (ssh transport), which says nothing about its GPUs."""
+
+    ok: bool
+    world: int = 0
+    busbw_gbps: float | None = None
+    error: str = ""
+    inconclusive: bool = False
+
+
+def nccl_preflight_script(*, init_timeout: int = 45, buffer_mb: int = NCCL_PREFLIGHT_BUFFER_MB,
+                          iters: int = NCCL_PREFLIGHT_ITERS) -> str:
+    return (_NCCL_PREFLIGHT_PY.replace("__INIT__", str(int(init_timeout)))
+            .replace("__MB__", str(int(buffer_mb))).replace("__ITERS__", str(int(iters))))
+
+
+def nccl_preflight_command(host: RemoteHost, nprocs: int, timeout: float) -> str:
+    """The pod-side shell: stdin → a temp script, ``torchrun --standalone``
+    with ``nprocs`` ranks under ``timeout -k`` (a hung collective is KILLed,
+    and so is any rank it orphaned), temp file removed, the rank-0 exit code
+    returned (124/137 = the hard timeout fired)."""
+    env = ""
+    if host.cuda_device is not None and str(host.cuda_device).strip():
+        env = f"CUDA_VISIBLE_DEVICES={shlex.quote(str(host.cuda_device).strip())} "
+    t = max(1, int(timeout))
+    return (f"cd {shlex.quote(host.workdir)} && f=$(mktemp /tmp/cascade-nccl-XXXXXX.py) && "
+            f"cat > \"$f\" && {env}OMP_NUM_THREADS=1 timeout -k 10 {t} "
+            f"{host.remote_python} -m torch.distributed.run --standalone --nnodes=1 "
+            f"--nproc_per_node={int(nprocs)} \"$f\"; rc=$?; "
+            f"pkill -KILL -f \"$f\" 2>/dev/null; rm -f \"$f\"; exit $rc")
+
+
+def probe_nccl_allreduce(host: RemoteHost, *, nprocs: int, timeout: float = 90.0,
+                         runner=None) -> NcclPreflight:
+    """Run the NCCL all_reduce preflight on ``host`` with ``nprocs`` ranks.
+
+    ``runner(argv, timeout, stdin_text)`` is the ssh call (``run_ssh``; a
+    scripted double in tests). A hang (the pod-side ``timeout`` or the local
+    one firing) and any non-zero exit (NCCL/CUDA error) are failures; only an
+    ssh transport failure (rc 255 / the ssh binary unavailable) is
+    inconclusive."""
+    run = runner or run_ssh
+    script = nccl_preflight_script(init_timeout=max(10, int(timeout) - 15))
+    argv = build_ssh_argv(host, nccl_preflight_command(host, nprocs, timeout))
+    try:
+        proc = run(argv, int(timeout) + 60, script)
+    except subprocess.TimeoutExpired:
+        return NcclPreflight(ok=False, world=nprocs,
+                             error=f"NCCL all_reduce hung: no answer within {timeout:.0f}s")
+    except OSError as e:
+        return NcclPreflight(ok=False, error=f"preflight could not start: {e}",
+                             inconclusive=True)
+    rc = proc.returncode
+    tail = error_tail((proc.stderr or "") + (proc.stdout or ""), 240)
+    if rc == 255:
+        return NcclPreflight(ok=False, error=f"ssh rc=255: {tail}", inconclusive=True)
+    if rc in (124, 137):
+        return NcclPreflight(ok=False, world=nprocs,
+                             error=f"NCCL all_reduce hung: {nprocs}-rank collective killed "
+                                   f"by the {timeout:.0f}s hard timeout ({tail})")
+    if rc != 0:
+        return NcclPreflight(ok=False, world=nprocs,
+                             error=f"NCCL all_reduce failed rc={rc}: {tail}")
+    for line in reversed((proc.stdout or "").splitlines()):
+        i = line.find(NCCL_PREFLIGHT_MARK)
+        if i < 0:
+            continue
+        try:
+            facts = json.loads(line[i + len(NCCL_PREFLIGHT_MARK):])
+            world, bw = int(facts["world"]), float(facts["busbw_gbps"])
+        except (ValueError, KeyError, TypeError) as e:
+            return NcclPreflight(ok=False, world=nprocs,
+                                 error=f"NCCL preflight returned malformed facts: {e}")
+        if not facts.get("ok"):
+            return NcclPreflight(ok=False, world=world, busbw_gbps=bw,
+                                 error="NCCL all_reduce returned a wrong sum")
+        if world != int(nprocs):
+            return NcclPreflight(ok=False, world=world, busbw_gbps=bw,
+                                 error=f"NCCL preflight ran {world} rank(s), expected {nprocs}")
+        return NcclPreflight(ok=True, world=world, busbw_gbps=bw)
+    return NcclPreflight(ok=False, world=nprocs, error="NCCL preflight printed no result")
 
 
 # The public-benchmark sidecar needs NVIDIA driver >= 580 (crusoe 535 and
@@ -1203,6 +1561,61 @@ def harvest_remote_dir(host: RemoteHost, remote_dir: str, dest: Path | str,
     return dest
 
 
+# The pod-side hash of a whole checkpoint dir (~14.5 GB: weights,
+# weights_stable, optimizer) — sha256 at disk speed, well inside this bound.
+POD_MANIFEST_TIMEOUT_SECONDS = 900
+
+
+def remote_file_manifest(host: RemoteHost, remote_dir: str, *,
+                         timeout: int = POD_MANIFEST_TIMEOUT_SECONDS,
+                         runner=None) -> dict[str, tuple[int, str]]:
+    """``{relative path: (size, sha256)}`` of every regular file under
+    ``host:remote_dir``, as the POD reports it — the reference a harvested
+    copy is checked against before the pod is released (see
+    :mod:`cascade.trainer.harvest_release`). Resolved in ``host.workdir``
+    exactly like :func:`harvest_remote_dir`. Raises
+    :class:`RemoteDispatchError` on any ssh failure or unparseable output
+    (a filename the listing cannot represent included): the caller then
+    simply keeps the pod."""
+    rd = shlex.quote(remote_dir)
+    cmd = (f"cd {shlex.quote(host.workdir)} && cd {rd} && "
+           "find . -type f -printf 'S %s %p\\n' && "
+           "find . -type f -exec sha256sum -- {} +")
+    argv = build_ssh_argv(host, cmd)
+    try:
+        proc = (runner(argv, timeout) if runner is not None else
+                subprocess.run(argv, capture_output=True, text=True,
+                               timeout=timeout, check=False))
+    except subprocess.TimeoutExpired as e:
+        raise RemoteDispatchError(
+            f"pod checkpoint manifest of {host.name}:{remote_dir} timed out "
+            f"after {timeout}s") from e
+    if proc.returncode != 0:
+        raise RemoteDispatchError(
+            f"pod checkpoint manifest of {host.name}:{remote_dir} failed "
+            f"(rc={proc.returncode}): {(proc.stderr or '')[-200:]!r}",
+            returncode=proc.returncode)
+    sizes: dict[str, int] = {}
+    hashes: dict[str, str] = {}
+    for line in (proc.stdout or "").splitlines():
+        if not line:
+            continue
+        if line.startswith("S "):
+            size, _, path = line[2:].partition(" ")
+            if not size.isdigit() or not path.startswith("./"):
+                raise RemoteDispatchError(f"pod checkpoint manifest: bad size line {line[:120]!r}")
+            sizes[path[2:]] = int(size)
+            continue
+        digest, sep, path = line.partition("  ")
+        if (not sep or len(digest) != 64 or not path.startswith("./")
+                or any(c not in "0123456789abcdef" for c in digest)):
+            raise RemoteDispatchError(f"pod checkpoint manifest: bad hash line {line[:120]!r}")
+        hashes[path[2:]] = digest
+    if set(sizes) != set(hashes):
+        raise RemoteDispatchError("pod checkpoint manifest: size and hash listings disagree")
+    return {p: (sizes[p], hashes[p]) for p in sizes}
+
+
 def receipt_to_entry(receipt: dict) -> TrainedEntry:
     """Validate a receipt dict into a :class:`TrainedEntry` (re-runs its checks)."""
     try:
@@ -1268,6 +1681,9 @@ class RemoteDispatcher:
     # on every RUNNING poll (the funded leg's progress watchdog — see
     # cascade.trainer.cost_guards.ProgressWatchdog).
     on_progress: object = field(default=None, repr=False)
+    # Where a failed leg's fetched stdout/stderr tails are saved on the
+    # orchestrator box (save_failed_leg_evidence); None = not saved.
+    evidence_dir: str | None = None
     _runner: object = field(default=None, repr=False)  # injectable for tests
 
     def dispatch(
@@ -1393,18 +1809,32 @@ class RemoteDispatcher:
                 proc = (self._runner or run_ssh)(ssh_argv, self.timeout_seconds, stdin_env)
             except subprocess.TimeoutExpired as e:
                 raise RemoteDispatchError(f"remote {role} on {host.name} timed out") from e
+        where = ""
+        progress = getattr(proc, "progress", None)
+        if proc.returncode != 0:
+            # Save the evidence BEFORE the failure reaches any teardown: the
+            # pod (and its run dir) is usually gone seconds later.
+            saved = save_failed_leg_evidence(
+                self.evidence_dir, hotkey,
+                header={"role": role, "host": host.name, "address": f"{host.host}:{host.port}",
+                        "base_seed": base_seed, "exit_code": proc.returncode,
+                        "progress": progress},
+                stdout=proc.stdout or "", stderr=proc.stderr or "")
+            where = f" [evidence: {saved}]" if saved else ""
         if proc.returncode == 3:
             # Worker rc=3 = miner submission rejected (CorpusError): the
             # worker's one-line reason — no traceback to relay.
             raise RemoteDispatchError(
                 f"remote {role} on {host.name}: miner submission rejected: "
-                f"{rejection_reason(proc.stderr)}",
+                f"{rejection_reason(proc.stderr)}{where}",
                 returncode=3,
             )
         if proc.returncode != 0:
-            tail = (proc.stderr or "")[-2000:]
+            cause, detail = summarize_failure(proc.stderr or "", rc=proc.returncode,
+                                              progress=progress)
             raise RemoteDispatchError(
-                f"remote {role} on {host.name} failed (rc={proc.returncode}): {tail}",
+                f"remote {role} on {host.name} failed (rc={proc.returncode}) {cause}{where}"
+                + (f"\n{detail}" if detail else ""),
                 returncode=proc.returncode,
             )
         receipt = parse_receipt(proc.stdout or "")

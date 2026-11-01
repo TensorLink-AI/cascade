@@ -32,6 +32,11 @@ import time
 log = logging.getLogger("cascade.trainer")
 
 THROUGHPUT_ABORT = "THROUGHPUT ABORT"
+FIRST_STEP_ABORT = "FIRST STEP DEADLINE"
+# The worker rewrites its progress record every PROGRESS_STEP_QUANTUM steps
+# (pyramid: step 1 and every 50 — cascade.trainer.progress_file): the early
+# judge credits a leg with one quantum it may have made but not yet reported.
+PROGRESS_STEP_QUANTUM = 50
 PAYER_KEY_CANNOT_STOP = "PAYER KEY CANNOT STOP POD"
 
 
@@ -65,19 +70,28 @@ class ProgressWatchdog:
     def __init__(self, *, label: str, hotkey: str, pod_name: str, training_steps: int,
                  max_train_seconds: float, end_wall: float | None, grace_seconds: float,
                  tolerance: float = 1.5, clock=time.time, key_check=None,
-                 key_check_seconds: float = 0.0) -> None:
+                 key_check_seconds: float = 0.0, early_seconds: float = 0.0,
+                 first_step_seconds: float = 0.0, host: str = "") -> None:
         self.label, self.hotkey, self.pod_name = label, hotkey, pod_name
+        self.host = str(host or "")
         self.training_steps = int(training_steps or 0)
         self.max_train_seconds = float(max_train_seconds or 0.0)
         self.end_wall = None if end_wall is None else float(end_wall)
         self.grace = float(grace_seconds or 0.0)
+        self.early = float(early_seconds or 0.0)
+        self.first_step = float(first_step_seconds or 0.0)
         self.tolerance = max(1.0, float(tolerance or 1.0))
         self.clock = clock
         self.key_check = key_check
         self.key_check_seconds = float(key_check_seconds or 0.0)
         self._first: tuple[float, int] | None = None
+        self._started: float | None = None
+        self._seen_step = False              # any step record at all (first-step deadline)
         self._last_key = clock()
         self.verdict: str | None = None
+        # The verdict's class, for the caller's host quarantine: "throughput"
+        # (projected past the bound) or "first_step" (never reached step 1).
+        self.kind: str = ""
 
     @staticmethod
     def _step(progress) -> int | None:
@@ -89,30 +103,8 @@ class ProgressWatchdog:
             return None
         return step if step >= 0 else None
 
-    def __call__(self, progress) -> str | None:
-        now = self.clock()
-        if (self.key_check is not None and self.key_check_seconds > 0
-                and now - self._last_key >= self.key_check_seconds):
-            self._last_key = now
-            try:
-                self.key_check()
-            except Exception as e:  # noqa: BLE001 — a check must never sink the leg
-                log.warning("%s: payer key check errored (%s)", self.label, e)
-        if self.verdict is not None:
-            return self.verdict
-        if self.grace <= 0 or self.training_steps <= 0:
-            return None
-        step = self._step(progress)
-        if step is None:
-            return None
-        if self._first is None:
-            self._first = (now, step)
-            return None
-        t0, s0 = self._first
-        elapsed = now - t0
-        if elapsed < self.grace:
-            return None
-        rate = max(0.0, (step - s0) / elapsed) if elapsed > 0 else 0.0
+    def _bound_breaks(self, rate: float, step: int, now: float) -> tuple[float, list[str]]:
+        """``(projected total, reasons)`` for ``rate`` — empty reasons = on budget."""
         remaining = max(0, self.training_steps - step)
         total = self.training_steps / rate if rate > 0 else math.inf
         left = remaining / rate if rate > 0 else math.inf
@@ -125,12 +117,66 @@ class ProgressWatchdog:
             if left > self.tolerance * budget:
                 why.append(f"projected {_hours(left)} to finish > {self.tolerance:g} x "
                            f"{_hours(budget)} left to the target settlement")
+        return total, why
+
+    def __call__(self, progress) -> str | None:
+        now = self.clock()
+        if self._started is None:
+            self._started = now
+        if (self.key_check is not None and self.key_check_seconds > 0
+                and now - self._last_key >= self.key_check_seconds):
+            self._last_key = now
+            try:
+                self.key_check()
+            except Exception as e:  # noqa: BLE001 — a check must never sink the leg
+                log.warning("%s: payer key check errored (%s)", self.label, e)
+        if self.verdict is not None:
+            return self.verdict
+        step = self._step(progress)
+        if step is not None:
+            self._seen_step = True
+        if step is None:
+            if (not self._seen_step and self.first_step > 0
+                    and now - self._started >= self.first_step):
+                self.kind = "first_step"
+                self.verdict = (f"{FIRST_STEP_ABORT}: hotkey={self.hotkey} pod={self.pod_name} "
+                                f"host={self.host or '?'} — no training step reported "
+                                f"{now - self._started:.0f}s after the leg started (deadline "
+                                f"{self.first_step:.0f}s; a worker hung before step 1, "
+                                f"e.g. an NCCL init/collective hang)")
+                log.error("%s — %s: aborting the leg, tearing the pod down; requeued as an "
+                          "operator fault (no attempt burned)", self.verdict, self.label)
+                return self.verdict
+            return None
+        if self.grace <= 0 or self.training_steps <= 0:
+            return None                      # the grace is the throughput judge's switch
+        if self._first is None:
+            self._first = (now, step)
+            return None
+        t0, s0 = self._first
+        elapsed = now - t0
+        early = ""
+        if elapsed < self.grace:
+            if self.early <= 0 or self.early >= self.grace or elapsed < self.early \
+                    or elapsed <= 0:
+                return None
+            # EARLY judge: the OPTIMISTIC rate — one progress-record quantum
+            # of steps the worker may have made but not yet written — so the
+            # record spacing can only ever make it lenient, never abort a
+            # leg that is on budget.
+            rate = (max(0, step - s0) + PROGRESS_STEP_QUANTUM) / elapsed
+            early = f"early judge, optimistic rate {rate:.3f} steps/s; "
+        else:
+            rate = max(0.0, (step - s0) / elapsed) if elapsed > 0 else 0.0
+        total, why = self._bound_breaks(rate, step, now)
         if not why:
             return None
+        observed = max(0.0, (step - s0) / elapsed) if elapsed > 0 else 0.0
+        self.kind = "throughput"
         self.verdict = (f"{THROUGHPUT_ABORT}: hotkey={self.hotkey} pod={self.pod_name} "
-                        f"rate={rate:.3f} steps/s (step {step}/{self.training_steps} after "
-                        f"{elapsed:.0f}s observed) projected={_hours(total)} total — "
-                        + "; ".join(why))
+                        f"host={self.host or '?'} rate={observed:.3f} steps/s (step "
+                        f"{step}/{self.training_steps} after {elapsed:.0f}s observed; {early}"
+                        f"projected={_hours(total)} total) — " + "; ".join(why))
         log.error("%s — %s: aborting the leg early, tearing the pod down; requeued as an "
                   "operator fault (no attempt burned)", self.verdict, self.label)
         return self.verdict
@@ -140,12 +186,16 @@ def _hours(seconds: float) -> str:
     return "inf h" if not math.isfinite(seconds) else f"{seconds / 3600.0:.2f} h"
 
 
-def leg_watchdog(runner, *, gen, pod, contract, key_check=None) -> ProgressWatchdog | None:
+def leg_watchdog(runner, *, gen, pod, contract, key_check=None,
+                 host: str = "") -> ProgressWatchdog | None:
     """The watchdog for one funded leg, or ``None`` with every guard off."""
     rnd = runner.cfg.round
     grace = float(getattr(rnd, "progress_watchdog_grace_seconds", 0) or 0)
+    early = float(getattr(rnd, "progress_watchdog_early_seconds", 0) or 0)
+    first = float(getattr(rnd, "progress_first_step_seconds", 0) or 0)
     key_every = float(getattr(rnd, "payer_key_check_seconds", 0) or 0)
-    if grace <= 0 and not (key_every > 0 and key_check is not None):
+    if (grace <= 0 and first <= 0
+            and not (key_every > 0 and key_check is not None)):
         return None
     local = runner.__dict__.get("_leg_local_obj")
     end = getattr(local, "end_wall", None)
@@ -156,7 +206,8 @@ def leg_watchdog(runner, *, gen, pod, contract, key_check=None) -> ProgressWatch
         max_train_seconds=float(getattr(contract, "max_train_seconds", 0) or 0),
         end_wall=None if end is None else float(end), grace_seconds=grace,
         tolerance=float(getattr(rnd, "progress_watchdog_tolerance", 1.5) or 1.5),
-        key_check=key_check, key_check_seconds=key_every)
+        key_check=key_check, key_check_seconds=key_every, early_seconds=early,
+        first_step_seconds=first, host=str(host or ""))
 
 
 # ── 2. measured-wall gate ────────────────────────────────────────────────────

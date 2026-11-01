@@ -172,26 +172,52 @@ def validate_funded_pod_skus(value: object) -> tuple[str, ...]:
     return tuple(str(x) for x in value)  # type: ignore[union-attr]
 
 
-def validate_funded_host_bench_floor(value: object) -> tuple[tuple[str, float], ...]:
-    """``[round] funded_host_bench_floor``: a TOML table ``{SKU = tokens/s}``
-    → sorted ``((sku, floor), …)``. Fail-loud on anything but a mapping of
-    non-negative numbers: a list or a bare number would silently arm nothing
-    (config knobs need loader parsing, 2026-09-08)."""
+def validate_funded_host_bench_floor(value: object, *,
+                                     name: str = "funded_host_bench_floor",
+                                     unit: str = "tokens/s",
+                                     example: str = "RTX4090 = 450e6"
+                                     ) -> tuple[tuple[str, float], ...]:
+    """``[round] funded_host_bench_floor`` (and every other per-SKU floor, by
+    ``name``): a TOML table ``{SKU = number}`` → sorted ``((sku, floor), …)``.
+    Fail-loud on anything but a mapping of non-negative numbers: a list or a
+    bare number would silently arm nothing (config knobs need loader
+    parsing, 2026-09-08)."""
     if value is None:
         return ()
     if not isinstance(value, dict):
         raise ValueError(
-            f"funded_host_bench_floor={value!r} invalid; must be a table of "
-            f'SKU = tokens/s, e.g. {{ RTX4090 = 450e6 }}')
+            f"{name}={value!r} invalid; must be a table of "
+            f'SKU = {unit}, e.g. {{ {example} }}')
     out = []
     for sku, floor in value.items():
         if isinstance(floor, bool) or not isinstance(floor, (int, float)) or floor < 0:
             raise ValueError(
-                f"funded_host_bench_floor[{sku!r}]={floor!r} invalid; must be a "
-                f"non-negative number of tokens/s")
+                f"{name}[{sku!r}]={floor!r} invalid; must be a "
+                f"non-negative number of {unit}")
         if str(sku).strip():
             out.append((str(sku).strip(), float(floor)))
     return tuple(sorted(out))
+
+
+def validate_host_blocklist(value: object, *, name: str = "funded_host_blocklist"
+                            ) -> tuple[str, ...]:
+    """``[round] funded_host_blocklist``: a list of host strings (IPs, or
+    provider host keys such as ``vast:<machine_id>``) → de-duplicated tuple in
+    file order. Fail-loud on a bare string (it would iterate per character)
+    or a non-string member."""
+    if value is None:
+        return ()
+    if isinstance(value, str) or not isinstance(value, (list, tuple)):
+        raise ValueError(f'{name}={value!r} invalid; must be a list of host strings, '
+                         f'e.g. ["93.120.231.186"]')
+    out: list[str] = []
+    for x in value:
+        if not isinstance(x, str):
+            raise ValueError(f"{name} member {x!r} invalid; must be a string")
+        h = x.strip()
+        if h and h not in out:
+            out.append(h)
+    return tuple(out)
 
 
 def validate_funded_sku_wall_seconds(value: object) -> tuple[tuple[str, int], ...]:
@@ -258,6 +284,13 @@ def validate_nonneg_seconds(name: str, value: object) -> int:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
         raise ValueError(f"{name}={value!r} invalid; must be a non-negative number of "
                          "seconds (0 = off)")
+    return int(value)
+
+
+def validate_nonneg_count(name: str, value: object) -> int:
+    """A non-negative whole count (0 = off)."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name}={value!r} invalid; must be a non-negative integer (0 = off)")
     return int(value)
 
 

@@ -416,3 +416,38 @@ def test_king_generation_is_never_capped_by_max_parallel_jobs(tmp_path):
     with pytest.raises(AssertionError):                 # challengers still queue
         st.generate(round_id="78", hotkey=HK, uid=4, era=9, gen_ref="g@sha256:2",
                     repo_dir=tmp_path / "repo", seed=124)
+
+
+def test_full_cpu_tier_waits_in_line_instead_of_requeueing(tmp_path):
+    """2026-10-31: the slot wait timed out after capacity_wait_s and requeued the
+    leg with the operator back-off, so a later reveal took the freed slot. A
+    full tier is our cap — the leg waits, however long, and runs when freed."""
+    import threading
+    import time
+
+    from cascade.trainer.admission import FairSlots
+
+    prov, store = FakeProvider(), FakeStore()
+    st, idx, _ = _stage(tmp_path, prov, store)
+    st.cfg = replace(st.cfg, generation=replace(st.cfg.generation, max_parallel_jobs=1))
+    st.capacity_wait_s = 0.01                       # would have expired at once
+    gate = st.__dict__.setdefault("_slots", FairSlots(clock=st.clock))
+    (tmp_path / "repo").mkdir(exist_ok=True)
+    out = {}
+
+    def run():
+        try:
+            out["res"] = st.generate(round_id="77", hotkey=HK, uid=4, era=9, gen_ref="g@sha256:1",
+                                     repo_dir=tmp_path / "repo", seed=123)
+        except Exception as e:  # noqa: BLE001
+            out["err"] = e
+
+    with gate.slot(1) as held:
+        assert held
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        time.sleep(1.5)
+        assert t.is_alive() and not out              # still waiting, not requeued
+    t.join(10)
+    assert "err" not in out, out.get("err")
+    assert out["res"].index["corpus_digest"] == idx["corpus_digest"]

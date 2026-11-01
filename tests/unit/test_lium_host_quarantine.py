@@ -82,15 +82,20 @@ def test_listing_skips_all_executors_of_a_quarantined_host(monkeypatch, tmp_path
     assert [e["id"] for e in _provider(monkeypatch, hosts)._list_executors("RTX4090")] == ["ex-c"]
 
 
-def test_listing_without_a_host_map_keeps_the_market(monkeypatch, tmp_path):
-    # The API is best-effort: an unmapped executor is NOT assumed bad (the
-    # fingerprint check still guards the leg); a mapped one is.
+def test_listing_without_a_host_map_fails_closed_while_anything_is_quarantined(
+        monkeypatch, tmp_path):
+    # 2026-11-01 05:16: with the map unavailable a payer rent landed on a host
+    # quarantined until 2027. An executor whose host cannot be resolved is not
+    # rentable while any host is quarantined (the empty listing reads as no
+    # capacity: the leg waits and retries); with nothing quarantined the
+    # market is untouched.
     _use_file(monkeypatch, tmp_path)
-    record_host_quarantine("91.224.44.222", "stale image")
-    prov = _provider(monkeypatch, {"ex-b": "91.224.44.222"})
-    assert [e["id"] for e in prov._list_executors("RTX4090")] == ["ex-a", "ex-c"]
     assert [e["id"] for e in _provider(monkeypatch, {})._list_executors("RTX4090")] == \
         ["ex-a", "ex-b", "ex-c"]
+    record_host_quarantine("91.224.44.222", "stale image")
+    prov = _provider(monkeypatch, {"ex-b": "91.224.44.222", "ex-c": "146.120.227.147"})
+    assert [e["id"] for e in prov._list_executors("RTX4090")] == ["ex-c"]   # ex-a unmapped
+    assert _provider(monkeypatch, {})._list_executors("RTX4090") == []
 
 
 def test_executor_hosts_and_host_of_pod_read_the_api(monkeypatch, tmp_path):

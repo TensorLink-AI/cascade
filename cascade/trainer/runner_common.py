@@ -47,7 +47,9 @@ def funded_queue_of(runner, *, lane="a"):
         queue_type, path = LaneCQueue, lane_c_queue_path(path)
     else:
         raise ValueError(f"unknown funding lane: {lane}")
-    return queue_type(path, entry_ttl_seconds=runner.cfg.round.funded_entry_ttl_hours * 3600.0)
+    return queue_type(path, entry_ttl_seconds=runner.cfg.round.funded_entry_ttl_hours * 3600.0,
+                      operator_billed_retry_seconds=float(getattr(
+                          runner.cfg.round, "operator_billed_retry_seconds", 60) or 0))
 
 
 def _load_burns(path: Path) -> dict[str, int]:
@@ -255,7 +257,9 @@ def read_pending_upload(work_root: Path, base_seed, hotkey: str, **binding) -> d
         except (OSError, ValueError) as e:
             log.warning("pending upload record %s unreadable (%s); ignored", p, type(e).__name__)
             continue
-        if not isinstance(rec, dict) or not Path(str(rec.get("dest", ""))).is_dir():
+        if not isinstance(rec, dict) or not (
+                isinstance(rec.get("r2"), dict)          # r2 transport: the copy is on R2
+                or Path(str(rec.get("dest", ""))).is_dir()):
             continue
         if any(rec.get(key) != value for key, value in binding.items()):
             continue
@@ -269,6 +273,84 @@ def clear_harvest(work_root: Path, base_seed, hotkey: str, *, job_id: str = "") 
 
     shutil.rmtree(harvest_dir(work_root, base_seed, hotkey, job_id=job_id), ignore_errors=True)
     _pending_upload_path(work_root, base_seed, hotkey, job_id).unlink(missing_ok=True)
+
+
+SHADOW_EMA_DIRNAME = "_shadow_ema"
+
+
+def shadow_ema_dir(work_root: Path, base_seed, hotkey: str, *, job_id: str = "") -> Path:
+    """Where ``[round] funded_keep_shadow_ema`` keeps one leg's power-EMA
+    comparison files on the box (outside the harvest dir, so neither the
+    upload nor :func:`clear_harvest` touches them)."""
+    tag = f"{hotkey}--{job_id}" if job_id else hotkey
+    return Path(work_root) / SHADOW_EMA_DIRNAME / f"{base_seed}" / tag
+
+
+def set_aside_shadow_ema(cfg, work_root: Path, dest: Path, base_seed, hotkey: str, *,
+                         job_id: str = "") -> list[str]:
+    """After the harvested copy at ``dest`` is verified: take the power-EMA
+    comparison files (``r2_transfer.shadow_ema_file``) out of it — moved to
+    :func:`shadow_ema_dir` when ``[round] funded_keep_shadow_ema`` is on, else
+    deleted (the default: no extra weights on the box disk). Returns the
+    names handled."""
+    import os
+
+    from .r2_transfer import shadow_ema_file
+
+    d = Path(dest)
+    if not d.is_dir():
+        return []
+    names = sorted(p.name for p in d.iterdir() if p.is_file() and shadow_ema_file(p.name))
+    if not names:
+        return []
+    if bool(getattr(getattr(cfg, "round", None), "funded_keep_shadow_ema", False)):
+        target = shadow_ema_dir(work_root, base_seed, hotkey, job_id=job_id)
+        target.mkdir(parents=True, exist_ok=True)
+        for name in names:
+            os.replace(d / name, target / name)
+        log.info("harvest: power-EMA comparison files kept in %s (never published): %s",
+                 target, ", ".join(names))
+    else:
+        for name in names:
+            (d / name).unlink(missing_ok=True)
+    return names
+
+
+def r2_transport_on(cfg) -> bool:
+    """``[round] funded_harvest_transport = "r2"``: harvested checkpoints go
+    pod → Cloudflare R2 → Hippius and never land on this box
+    (:mod:`cascade.trainer.r2_transfer`)."""
+    return str(getattr(getattr(cfg, "round", None), "funded_harvest_transport", "ssh")) == "r2"
+
+
+# ── trainer disk guard (2026-10-31: concurrent harvests filled the disk) ────
+#
+# Resolved through this module attribute so tests swap in a fake filesystem.
+DISK_USAGE = None   # None ⇒ shutil.disk_usage
+
+
+def disk_guard_refusal(runner) -> str:
+    """Why a NEW funded/operator leg pod must not be rented now ("" = rent):
+    free space under ``work_root`` below ``[round] min_free_disk_gb`` (GiB;
+    0 = off). Only for fresh rents — a re-attached or adopted pod is a live
+    leg and always keeps going. An unmeasurable disk never blocks a rent."""
+    import shutil
+
+    gb = float(getattr(getattr(runner.cfg, "round", None), "min_free_disk_gb", 0.0) or 0.0)
+    if gb <= 0:
+        return ""
+    usage = DISK_USAGE or shutil.disk_usage
+    try:
+        free = int(usage(Path(runner.work_root)).free)
+    except OSError as e:
+        log.warning("disk guard: free space under %s unreadable (%s); not blocking",
+                    runner.work_root, e)
+        return ""
+    if free >= gb * (1 << 30):
+        return ""
+    return (f"trainer disk low: {free / (1 << 30):.1f} GiB free under {runner.work_root} "
+            f"< [round] min_free_disk_gb={gb:g} — no new pod rented (requeued, "
+            "never burned)")
 
 
 def prune_harvest_dirs(work_root: Path, *, now: float | None = None,

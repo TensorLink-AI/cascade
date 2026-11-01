@@ -6,6 +6,7 @@ import contextlib
 import json
 import logging
 import shlex
+import threading
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -415,6 +416,9 @@ class _FundedPodMixin:
                     log.info("funded sweep: keeping %s — an operator-billed leg still "
                              "in flight (re-attaches after a restart)", pod.instance_id)
                     continue
+                if self._sweep_keeps_pod(self._operator_pod_provider(pod), pod.instance_id,
+                                         what="operator ledger pod"):
+                    continue
                 self._teardown_operator_pod(pod)
             try:
                 self._sweep_operator_orphans(keep_ids, keep_payers)
@@ -428,14 +432,25 @@ class _FundedPodMixin:
                               "miners until the vault comes back")
                 return
             pods = [x for x in pods if x.payer_hotkey and x.payer_hotkey not in keep_payers]
+            # A pod whose leg left the queue can still hold a live worker or a
+            # finished, unharvested checkpoint (2026-10-31: three restarts cut
+            # live legs) — probed per pod; kept pods stay on the ledger.
+            kept = [x for x in pods
+                    if self._sweep_keeps_pod(self._payer_pod_provider(vault, x), x.instance_id,
+                                             what=f"payer {x.payer_hotkey[:12]} ledger pod")]
+            kept_ids = {x.instance_id for x in kept}
+            pods = [x for x in pods if x.instance_id not in kept_ids]
             for pod in pods:
                 self._revoke_robot(pod)
             if pods:
                 leftovers = teardown_funded(pods, vault)
+                gone = {x.instance_id for x in pods} - {x.instance_id for x in leftovers}
                 with self._funded_ledger_lock:
+                    # Only CONFIRMED-gone rows leave the ledger: a kept pod's
+                    # row must survive, or the listing sweep below would read
+                    # it as an off-ledger orphan.
                     self._save_funded_ledger(
-                        leftovers + [x for x in self._load_funded_ledger()
-                                     if not x.payer_hotkey or x.payer_hotkey in keep_payers])
+                        [x for x in self._load_funded_ledger() if x.instance_id not in gone])
                 for inst in leftovers:
                     log.error("funded pod %s (payer %s) could not be confirmed "
                               "gone — still billing the miner; kept on the "
@@ -443,7 +458,9 @@ class _FundedPodMixin:
                               inst.instance_id, inst.payer_hotkey)
             # Orphans of every payer without an in-flight leg.
             reconcile_funded(self._load_funded_ledger(), vault,
-                             netuid=self.cfg.subnet.netuid, exclude=keep_payers)
+                             netuid=self.cfg.subnet.netuid, exclude=keep_payers,
+                             keep=lambda adapter, pod_id, hotkey: self._sweep_keeps_pod(
+                                 adapter, pod_id, what=f"payer {hotkey[:12]} off-ledger pod"))
         except Exception as e:  # noqa: BLE001
             log.warning("funded pod reconcile failed (ignored): %s", e)
 
@@ -486,10 +503,240 @@ class _FundedPodMixin:
                     continue
             except (TypeError, ValueError):
                 pass                       # no usable age: an off-ledger pod is still an orphan
+            if self._sweep_keeps_pod(provider, name, what="operator off-ledger pod"):
+                continue
             gone = terminate_verified(provider, name)
             log.error("funded sweep: operator pod %s (%s) was on no ledger — %s", name,
                       row.get("status") or "?", "terminated" if gone
                       else "terminate NOT confirmed; still billing, retried next sweep")
+
+    # ── the sweep's per-pod guard (2026-10-31 incidents) ─────────────────────
+    # Restarts at 20:52, 23:13 and 23:34 swept live funded pods mid-training —
+    # once a pod holding a FINISHED but unharvested checkpoint — because the
+    # sweep trusted the queue's keep-set alone. The pod itself is now asked.
+
+    # An unreachable pod is kept this long from the first sweep that could not
+    # reach it (unreachable ≠ dead: the leg's own poll rides out transport
+    # blips the same way). Persisted (sweep_unreachable.json beside the
+    # ledger): repeated restarts must not reset the grace forever.
+    SWEEP_UNREACHABLE_GRACE_SECONDS = 1800.0
+    # A finished exit-0 run with no harvested marker keeps its pod this long
+    # after it exited; past it nothing will harvest it (the re-attach pass
+    # already ran) and the pod is released, loudly.
+    SWEEP_UNHARVESTED_KEEP_SECONDS = 6 * 3600.0
+    SWEEP_PROBE_TIMEOUT_SECONDS = 60
+    POD_HARVEST_RECORDS_MAX = 512
+
+    def _pod_harvests_path(self) -> Path:
+        return Path(self.work_root) / "pod_harvests.json"
+
+    def _pod_harvests(self) -> dict:
+        """``"ip:port" -> wall time of the last verified harvest`` from that
+        endpoint (persisted beside the funded ledger, so it survives the very
+        restart the sweep guards)."""
+        cache = self.__dict__.get("_pod_harvest_records")
+        if cache is not None:
+            return cache
+        from ..shared.atomic import read_text_with_backup
+
+        def parse(text):
+            raw = json.loads(text)
+            return {str(k): float(v) for k, v in dict(raw).items()}
+
+        cache = {}
+        try:
+            rows, _ = read_text_with_backup(self._pod_harvests_path(), parse)
+            cache.update(rows or {})
+        except Exception as e:  # noqa: BLE001 — empty = every finished run is kept
+            log.warning("pod harvest records unreadable (%s) — finished runs are kept", e)
+        self.__dict__["_pod_harvest_records"] = cache
+        return cache
+
+    def _record_pod_harvest(self, ip: str, port: int) -> None:
+        if not ip or getattr(self, "work_root", None) is None:
+            return
+        from ..shared.atomic import write_text_atomic
+
+        clock = getattr(self, "_sweep_clock", None) or time.time
+        lock = self.__dict__.setdefault("_pod_harvest_lock", threading.Lock())
+        with lock:
+            recs = self._pod_harvests()
+            recs[f"{ip}:{int(port or 22)}"] = float(clock())
+            for k in sorted(recs, key=recs.get)[:max(0, len(recs) - self.POD_HARVEST_RECORDS_MAX)]:
+                recs.pop(k, None)
+            write_text_atomic(self._pod_harvests_path(), json.dumps(recs, indent=0), backup=True)
+
+    SWEEP_UNREACHABLE_FORGET_SECONDS = 7 * 86400.0
+
+    def _sweep_unreachable_path(self) -> Path:
+        return Path(self.work_root) / "sweep_unreachable.json"
+
+    def _sweep_unreachable(self) -> dict:
+        """``pod id -> wall time the sweep first found it unreachable``,
+        loaded once per process from the persisted file."""
+        cache = self.__dict__.get("_sweep_unreachable_since")
+        if cache is not None:
+            return cache
+        cache = {}
+        if getattr(self, "work_root", None) is not None:
+            from ..shared.atomic import read_text_with_backup
+
+            def parse(text):
+                return {str(k): float(v) for k, v in dict(json.loads(text)).items()}
+
+            try:
+                rows, _ = read_text_with_backup(self._sweep_unreachable_path(), parse)
+                cache.update(rows or {})
+            except Exception as e:  # noqa: BLE001 — empty = a fresh grace (keeps)
+                log.warning("sweep unreachable records unreadable (%s) — graces restart", e)
+        self.__dict__["_sweep_unreachable_since"] = cache
+        return cache
+
+    def _sweep_unreachable_update(self, pod_id: str, now: float, *, down: bool) -> float:
+        """Record (``down``) or clear ``pod_id``'s unreachable-since stamp and
+        persist the change; returns the stamp (``now`` when cleared)."""
+        lock = self.__dict__.setdefault("_sweep_unreachable_lock", threading.Lock())
+        with lock:
+            recs = self._sweep_unreachable()
+            before = dict(recs)
+            if down:
+                since = recs.setdefault(str(pod_id), float(now))
+            else:
+                since = float(now)
+                recs.pop(str(pod_id), None)
+            for k in [k for k, v in recs.items() if now - v > self.SWEEP_UNREACHABLE_FORGET_SECONDS]:
+                recs.pop(k, None)              # long-gone pods never pile up
+            if recs != before and getattr(self, "work_root", None) is not None:
+                from ..shared.atomic import write_text_atomic
+
+                try:
+                    write_text_atomic(self._sweep_unreachable_path(),
+                                      json.dumps(recs, indent=0, sort_keys=True), backup=True)
+                except OSError as e:
+                    log.warning("sweep unreachable records not persisted: %s", e)
+            return since
+
+    def _operator_pod_provider(self, pod):
+        """The provider ``_teardown_operator_pod`` would terminate ``pod`` on."""
+        from ..provision.core import LiumProvider
+        from ..provision.operator_pool import OperatorPool
+
+        return OperatorPool(self) if pod.provider == OperatorPool.name else LiumProvider()
+
+    def _payer_pod_provider(self, vault, pod):
+        """``pod``'s payer-account adapter (its vaulted key), or None."""
+        try:
+            from ..funding.providers import pod_credential
+            from ..provision.funded import lium_provider_for_key, provider_for_key
+
+            cred = pod_credential(vault, pod)
+            if cred is None or not cred.api_key:
+                return None
+            factory = self.__dict__.get("_funded_provider_factory")
+            if factory is not None and factory is not lium_provider_for_key:
+                return factory(cred.api_key)
+            return provider_for_key(pod.provider, cred.api_key)
+        except Exception as e:  # noqa: BLE001 — unknown, the guard decides
+            log.warning("funded sweep: no payer adapter for %s (%s)", pod.instance_id, e)
+            return None
+
+    def _sweep_probe_host(self, ip: str, port: int):
+        """A read-only probe identity for a pod the sweep has no pinned key
+        for: the rented-pod profile's user/key/workdir, a throwaway
+        known_hosts (a reused ip:port must never fail the probe on a stale
+        key — that would read as "unreachable")."""
+        from .remote import RemoteHost
+
+        profile = self._funded_pod_profile()
+        return RemoteHost(
+            name="sweep-probe", host=str(ip), port=int(port), user=profile.user,
+            key_path=profile.key_path, workdir=profile.workdir,
+            ssh_options=("UserKnownHostsFile=/dev/null", "ConnectTimeout=15",
+                         "LogLevel=ERROR", *profile.ssh_options))
+
+    def _sweep_keeps_pod(self, adapter, pod_id: str, *, what: str) -> bool:
+        """Whether the sweep must KEEP ``pod_id`` — asked of the pod itself:
+
+        - a detached worker still running (run dir pid answers ``kill -0``);
+        - a run that finished with exit code 0 and was never harvested, for
+          ``SWEEP_UNHARVESTED_KEEP_SECONDS`` after it exited;
+        - unreachable (no address, ssh failed) for less than
+          ``SWEEP_UNREACHABLE_GRACE_SECONDS`` since first seen so;
+        - anything the guard cannot decide (no adapter, no profile, a crash).
+
+        A kept pod costs $/h; a cut pod costs the whole leg — every keep is
+        logged at ERROR so an operator sees the bill."""
+        clock = getattr(self, "_sweep_clock", None) or time.time
+        now = float(clock())
+        try:
+            if adapter is None:
+                log.error("funded sweep: KEEPING %s %s — no provider adapter to locate it "
+                          "(cannot verify it is idle)", what, pod_id)
+                return True
+            try:
+                addr = adapter.get_ip(pod_id)
+                tagged = getattr(adapter, "list_tagged", None)
+                if addr is None and callable(tagged) and str(pod_id).startswith("cascade-"):
+                    # A write-ahead name (Shadeform assigns its id after create)
+                    for pid in tagged(pod_id):
+                        if pid != pod_id:
+                            addr = adapter.get_ip(pid)
+                            if addr is not None:
+                                break
+            except Exception as e:  # noqa: BLE001 — a listing failure is "unreachable"
+                log.warning("funded sweep: %s %s address lookup failed: %s", what, pod_id, e)
+                addr = None
+            probe = None
+            if addr is not None and getattr(addr, "ip", None):
+                from .remote import probe_pod_runs
+
+                host = self._sweep_probe_host(addr.ip, getattr(addr, "ssh_port", 22) or 22)
+                probe = probe_pod_runs(host, runner=getattr(self, "_sweep_ssh_runner", None),
+                                       timeout=self.SWEEP_PROBE_TIMEOUT_SECONDS)
+            if probe is None or not probe.reachable:
+                since = self._sweep_unreachable_update(pod_id, now, down=True)
+                down = now - since
+                why = "no ssh address" if probe is None else (probe.error or "ssh failed")
+                if down < self.SWEEP_UNREACHABLE_GRACE_SECONDS:
+                    log.error("funded sweep: KEEPING %s %s — unreachable (%s) for %.0fs, "
+                              "inside the %.0fs grace (unreachable is not dead)", what, pod_id,
+                              why, down, self.SWEEP_UNREACHABLE_GRACE_SECONDS)
+                    return True
+                log.error("funded sweep: %s %s unreachable (%s) for %.0fs, past the %.0fs "
+                          "grace — releasing", what, pod_id, why, down,
+                          self.SWEEP_UNREACHABLE_GRACE_SECONDS)
+                self._sweep_unreachable_update(pod_id, now, down=False)
+                return False
+            self._sweep_unreachable_update(pod_id, now, down=False)
+            if probe.live:
+                log.error("funded sweep: KEEPING %s %s — %d live detached worker(s) (%s); "
+                          "its leg is not in flight here — check it", what, pod_id,
+                          len(probe.live), ", ".join(probe.live))
+                return True
+            # A finished exit-0 run is harvested iff this endpoint was harvested
+            # AFTER the run exited (exit time from the pod's own age, so no
+            # clock skew; a reused ip:port's older record never counts).
+            harvested_at = self._pod_harvests().get(
+                f"{addr.ip}:{int(getattr(addr, 'ssh_port', 22) or 22)}", float("-inf"))
+            unharvested = [(d, age) for d, age in probe.finished_ok
+                           if harvested_at < now - age]
+            fresh = [(d, age) for d, age in unharvested
+                     if age < self.SWEEP_UNHARVESTED_KEEP_SECONDS]
+            if fresh:
+                log.error("funded sweep: KEEPING %s %s — finished run(s) with exit code 0 "
+                          "NOT harvested (%s); harvest it or it is released %.0fs after "
+                          "exit", what, pod_id,
+                          ", ".join(f"{d} {age:.0f}s ago" for d, age in fresh),
+                          self.SWEEP_UNHARVESTED_KEEP_SECONDS)
+                return True
+            if unharvested:
+                log.error("funded sweep: %s %s — unharvested run(s) older than %.0fs (%s); "
+                          "releasing", what, pod_id, self.SWEEP_UNHARVESTED_KEEP_SECONDS,
+                          ", ".join(d for d, _ in unharvested))
+            return False
+        except Exception as e:  # noqa: BLE001 — unsure ⇒ keep
+            log.error("funded sweep: KEEPING %s %s — guard failed (%s)", what, pod_id, e)
+            return True
 
     def _is_king_pod_of(self, instance_id: str, round_id: str) -> bool:
         prefix = king_pod_name_prefix(self.cfg.subnet.netuid, str(round_id))
@@ -563,8 +810,11 @@ class _FundedPodMixin:
         from ..provision.core import record_host_quarantine
         from ..provision.funded import LEMON_CLASS, rent_funded_pod
         from ..provision.layout import visible_devices
+        from .host_preflight import host_blocked_reason, sync_host_blocklist
         from .remote import RemoteHost
 
+        # [round] funded_host_blocklist → every provider listing this rent makes.
+        sync_host_blocklist(self)
         queue = self._funded_queue()
         flagged = queue.get(gen.hotkey) if queue is not None else None
         if (flagged is not None and bool(getattr(flagged, "operator_billed", False))
@@ -630,6 +880,17 @@ class _FundedPodMixin:
             log.error("funded leg %s: %s", gen.hotkey[:12], why)
             self._record_funded_failure(gen.hotkey, why, miner_fault=False,
                                         error_class=OPERATOR_FAULT_CLASS, burn=False)
+            raise _FundedLegSkip(gen.hotkey)
+        from .runner_common import disk_guard_refusal
+
+        # Disk guard (2026-10-31): never start a NEW leg the box may not have
+        # room to finish (harvest, ledgers, pending records). An adopted
+        # allocation is a live leg — it always keeps going.
+        low = "" if prior_alloc else disk_guard_refusal(self)
+        if low:
+            log.error("funded leg %s: %s", gen.hotkey[:12], low)
+            self._record_funded_failure(gen.hotkey, low, miner_fault=False,
+                                        error_class="no_capacity", burn=False)
             raise _FundedLegSkip(gen.hotkey)
         vault = self._payer_vault()
         if vault is None:
@@ -840,7 +1101,15 @@ class _FundedPodMixin:
                     # Hash its files before it ever sees a leg; a mismatch
                     # releases the pod, keeps its executor excluded and rents
                     # again — the miner is never blamed.
-                    why = self._funded_pod_code_mismatch(result, profile)
+                    adopted = bool(getattr(result, "adopted", False))
+                    # The pod's REAL host, now that its ssh address is known: a
+                    # listing that could not resolve hosts must never train on
+                    # a quarantined/blocklisted machine (2026-11-01 05:16,
+                    # 38.255.28.18). Torn down at once; its executor stays
+                    # excluded (claimed) like any rejected pod.
+                    blocked = ("" if adopted or result.address is None
+                               else host_blocked_reason(self, result.address.ip))
+                    why = blocked or self._funded_pod_code_mismatch(result, profile)
                     # Throughput gate (funded_host_bench_floor): a slow executor
                     # eats the leg's equal wall — released and rented again on
                     # the same bad-pod budget. Only its executor stays excluded
@@ -849,9 +1118,15 @@ class _FundedPodMixin:
                     # we are about to attach to, so the calibration bench
                     # would read low and "release" the pod, killing the leg. It
                     # passed the gate when it was rented.
-                    adopted = bool(getattr(result, "adopted", False))
                     slow = ("" if (why or adopted)
                             else self._funded_pod_too_slow(result, profile))
+                    # Multi-GPU preflight (an N-rank NCCL all_reduce under a
+                    # hard timeout): a host that hangs or crawls a collective
+                    # passed every other check. Its host is quarantined (the
+                    # fabric is per machine, not per executor id) by the
+                    # check itself. Adopted pods are mid-leg: skipped.
+                    if not (why or slow or adopted):
+                        slow = funded_pod_comm_failure(self, result, profile)
                     if why or slow:
                         if result.pod is not None:
                             health_for(self).record(
@@ -859,7 +1134,7 @@ class _FundedPodMixin:
                                 kind="stale" if why else "slow", reason=why or slow)
                         queue = self._funded_queue()
                         stale_pods += 1
-                        if why and result.address is not None:
+                        if why and not blocked and result.address is not None:
                             # The stale cache lives on the HOST: every executor
                             # id it lists would boot the same image.
                             record_host_quarantine(result.address.ip, why)
@@ -1197,9 +1472,15 @@ class _FundedPodMixin:
         (:meth:`_host_bench_below_floor`, off when no floor is set for the
         SKU) — the same guards a funded rent applies, so a hand-rented lane
         can be neither slow nor dead."""
+        from .host_preflight import host_blocked_reason, multi_gpu_preflight_failure
         from .remote import build_ssh_argv, probe_worker_runtime, run_ssh
 
         label = f"lane {getattr(host, 'name', host)}"
+        # [round] funded_host_blocklist + the host quarantine file: a host we
+        # refuse to rent is refused as a lane too (no ssh needed to say so).
+        why = host_blocked_reason(self, str(getattr(host, "host", "") or ""))
+        if why:
+            return why
         try:
             p = run_ssh(build_ssh_argv(host, "echo LANE_OK"), timeout=45)
         except Exception as e:  # noqa: BLE001
@@ -1208,6 +1489,13 @@ class _FundedPodMixin:
             if p.returncode == 255:
                 _quarantine_lane_host(host, f"{label}: ssh refused at lane join")
             return f"ssh rc={p.returncode}: {(p.stderr or '')[-160:]}"
+        if getattr(self, "deployed_chain_toml", None):
+            # Same config a rented pod gets; the lane's workers run with
+            # --chain-toml <workdir>/chain.deployed.toml (_rolling_final_hosts).
+            try:
+                self._push_deployed_chain_toml(host)
+            except Exception as e:  # noqa: BLE001 — a lane without the config must not join
+                return f"deployed chain.toml push failed: {e}"
         why = probe_worker_runtime(host)
         if why:
             return why
@@ -1217,6 +1505,12 @@ class _FundedPodMixin:
             why = self._host_bench_below_floor(host, sku, label)
             if why:
                 return why
+        # Multi-GPU preflight on the lane's own GPUs (its CUDA_VISIBLE_DEVICES,
+        # else its SKU's layout); a failing lane's host is quarantined.
+        why = multi_gpu_preflight_failure(
+            self, host, str(getattr(host, "sku", "") or sku or ""), label)
+        if why:
+            return why
         return None
 
     def _host_bench_below_floor(self, host, sku: str, label: str) -> str:
@@ -1321,6 +1615,38 @@ class _FundedPodMixin:
                       "billing payer %s; kept on ledger", pod.instance_id,
                       pod.payer_hotkey)
         else:
-            self._ledger_remove(pod.instance_id)
             # Confirmed gone: its executor is free for the next rent.
             release_executor_of(self, pod.instance_id)
+            try:
+                self._ledger_remove(pod.instance_id)
+            except OSError as e:
+                # A full disk (ENOSPC, 2026-10-31) after the pod is gone: the
+                # row stays and the startup sweep re-confirms it (an empty
+                # listing of an observed pod settles as gone, no re-bill).
+                log.error("funded pod %s is gone but its ledger row could not be "
+                          "removed (%s) — the startup sweep settles it",
+                          pod.instance_id, e)
+
+
+def funded_pod_comm_failure(runner, result, profile) -> str:
+    """Why a freshly rented funded pod fails the multi-GPU preflight, or ``""``
+    (single-GPU layout / preflight off / no address). Same ssh identity pin as
+    the code-fingerprint check; ALL of the layout's GPUs are visible."""
+    if getattr(result, "address", None) is None:
+        return ""
+    from ..provision.layout import visible_devices
+    from .host_preflight import multi_gpu_preflight_failure
+    from .remote import RemoteHost
+
+    rnd = runner.cfg.round
+    sku = (getattr(getattr(result, "pod", None), "sku", "") or getattr(result, "sku", "")
+           or getattr(runner, "_funded_round_sku", "") or getattr(rnd, "funded_pod_sku", ""))
+    host = RemoteHost(
+        name="funded-nccl", host=result.address.ip, port=result.address.ssh_port,
+        user=profile.user, key_path=profile.key_path,
+        remote_python=profile.remote_python, workdir=profile.workdir,
+        cuda_device=visible_devices(sku or ""), pinned_host_key=result.host_key,
+        ssh_options=profile.ssh_options, sku=sku or "",
+    )
+    pod_id = result.pod.instance_id if getattr(result, "pod", None) is not None else "?"
+    return multi_gpu_preflight_failure(runner, host, sku or "", f"funded pod {pod_id}")

@@ -211,6 +211,22 @@ ALLOW_PATTERNS = [
     "*.npy", "*.npz",
 ]
 
+# Never published, never fetched: the pyramid trainer's power-EMA comparison
+# files (``pyramid_trainer.RAW_WEIGHTS_FILE`` / ``ema_weights_file``) are
+# operator analysis data only. Excluded from every registry push so the
+# published checkpoint is exactly the pre-shadow file set, and from every
+# pull so a stray published copy never lands on a validator box (validators
+# score ``weights.safetensors`` alone).
+UNPUBLISHED_PATTERNS = ["weights_ema*.safetensors", "weights_raw.safetensors"]
+
+
+def unpublished_file(name: str) -> bool:
+    """True for a checkpoint file name that never goes to (or comes from) the
+    registry — see :data:`UNPUBLISHED_PATTERNS`."""
+    import fnmatch
+
+    return any(fnmatch.fnmatchcase(str(name), p) for p in UNPUBLISHED_PATTERNS)
+
 
 class HubAuthError(StorageError):
     """Hippius Hub auth is unavailable or clearly misconfigured."""
@@ -308,7 +324,8 @@ class HubUpload:
 
 
 def _dir_size_bytes(local_dir: Path | str) -> int:
-    return sum(p.stat().st_size for p in Path(local_dir).rglob("*") if p.is_file())
+    return sum(p.stat().st_size for p in Path(local_dir).rglob("*")
+               if p.is_file() and not unpublished_file(p.name))
 
 
 # A Hub push/pull is one HTTP round-trip to an IPFS-backed OCI registry, so a
@@ -483,7 +500,8 @@ def upload_dir_to_hub(local_dir: Path | str, repo: str, hub: HubConfig | None = 
     token = _resolve_hub_token(f"Uploading {d} to {repo}")
     result = _retry_hub_op(
         lambda: upload_folder(
-            repo_id=str(repo), folder_path=str(d), allow_patterns=ALLOW_PATTERNS, token=token,
+            repo_id=str(repo), folder_path=str(d), allow_patterns=ALLOW_PATTERNS,
+            ignore_patterns=UNPUBLISHED_PATTERNS, token=token,
         ),
         f"upload of {d} to {repo}",
         attempts=UPLOAD_MAX_ATTEMPTS, base_delay=UPLOAD_BACKOFF_BASE_S,
@@ -533,7 +551,7 @@ def upload_dir_to_hf(local_dir: Path | str, repo: str, *, token: str | None = No
         api.create_repo(str(repo), repo_type="model", private=False, exist_ok=True)
     info = api.upload_folder(
         repo_id=str(repo), folder_path=str(d), repo_type="model",
-        allow_patterns=ALLOW_PATTERNS,
+        allow_patterns=ALLOW_PATTERNS, ignore_patterns=UNPUBLISHED_PATTERNS,
         commit_message=f"cascade generator submission: {d.name}",
     )
     oid = str(getattr(info, "oid", "") or "")
@@ -628,7 +646,8 @@ def fetch_from_hub(ref: HubRef | str, dest_dir: Path | str, hub: HubConfig | Non
             _retry_hub_op(
                 lambda: hf_snapshot_download(
                     repo_id=ref.repo, revision=ref.digest[3:], local_dir=str(tmp),
-                    allow_patterns=ALLOW_PATTERNS, token=hf_token,
+                    allow_patterns=ALLOW_PATTERNS, ignore_patterns=UNPUBLISHED_PATTERNS,
+                    token=hf_token,
                 ),
                 f"fetch of {ref.immutable_ref}",
             )
@@ -644,7 +663,8 @@ def fetch_from_hub(ref: HubRef | str, dest_dir: Path | str, hub: HubConfig | Non
                 _retry_hub_op(
                     lambda: snapshot_download(
                         repo_id=ref.repo, revision=ref.digest, local_dir=str(tmp),
-                        allow_patterns=ALLOW_PATTERNS, token=hub_token,
+                        allow_patterns=ALLOW_PATTERNS, ignore_patterns=UNPUBLISHED_PATTERNS,
+                        token=hub_token,
                     ),
                     f"fetch of {ref.immutable_ref}",
                 )

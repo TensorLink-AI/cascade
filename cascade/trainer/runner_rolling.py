@@ -114,6 +114,8 @@ class _RollingMixin:
         return sched
 
     def _dispatcher(self):
+        from pathlib import Path
+
         from .remote import RemoteDispatcher
 
         if not self.trainer_spec:
@@ -132,6 +134,8 @@ class _RollingMixin:
             extra_forward_env=self._pod_extra_forward_env(),
             isolated_forward_env=self._pod_isolated_forward_env(),
             harvest=self._harvest_leg,
+            evidence_dir=(str(Path(self.work_root) / "_failed_legs")
+                          if getattr(self, "work_root", None) is not None else None),
             **({"cancel_event": self._leg_local.king_cancel} if getattr(self._leg_local, "king_cancel", None) is not None else {}),
             **({"continuation_root": str(self.work_root / "_continuations"),
                 "continuation_contract": self.cfg.training,
@@ -197,6 +201,9 @@ class _RollingMixin:
         # Opt-in for _FundedOperatorRent: an operator-billed leg with no lane
         # on file rents an operator pod instead of dying.
         self._leg_local.operator_rent_ok = True
+        # DEC-CA-0063 era: the trainer never benches on the payer pod, so the
+        # pod is released as soon as its harvest is verified (harvest_release).
+        self._leg_local.validator_bench = _validator_benches(self.cfg, era)
         try:
             try:
                 entry = self._run_funded_leg(disp, gen, seeds, int(block), contract, suffix,
@@ -226,22 +233,32 @@ class _RollingMixin:
                     staged = self._stage_vault_zip_on(host, digest) if digest else host
                     report_progress(self, "training")
                     return staged
-                entry = self._dispatch_on_free_lane(
-                    disp, pool, pool.known_hosts(),
-                    describe=f"rolling challenger {gen.hotkey}", used_host=used,
-                    prepare=prepare, deadline=self._operator_lane_deadline_fn(),
-                    gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
-                    role="challenger", base_seed=seeds.base_seed, block=int(block),
-                    arch_preset=contract.arch_preset, warm_start_ref=ws_ref,
-                    contract_block=self._era_contract_block(era), **slow,
-                    repo_suffix=suffix,
-                    **leg_corpus(self, gen, seeds, contract),   # cached
-                )
+                try:
+                    entry = self._dispatch_on_free_lane(
+                        disp, pool, pool.known_hosts(),
+                        describe=f"rolling challenger {gen.hotkey}", used_host=used,
+                        prepare=prepare, deadline=self._operator_lane_deadline_fn(),
+                        gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
+                        role="challenger", base_seed=seeds.base_seed, block=int(block),
+                        arch_preset=contract.arch_preset, warm_start_ref=ws_ref,
+                        contract_block=self._era_contract_block(era), **slow,
+                        repo_suffix=suffix,
+                        **leg_corpus(self, gen, seeds, contract),   # cached
+                    )
+                except Exception as e:
+                    from .faults import record_no_lanes_verdict
+
+                    # No live lane / a broken lane: the LANES failed, not the
+                    # leg — no_capacity, no backoff; the next try rents.
+                    if not record_lane_breaker_victim(self, gen.hotkey, e):
+                        record_no_lanes_verdict(self, gen.hotkey, e)
+                    raise
                 if used:
                     self._final_role_hosts[("challenger", contract.arch_preset, gen.hotkey)] = used[-1]
         finally:
             self._leg_local.end_wall = None
             self._leg_local.operator_rent_ok = False
+            self._leg_local.validator_bench = False
         self._persist_completed_leg(entry, round_id=era.base_seed, contract=contract,
                                     role="challenger", hotkey=gen.hotkey, suffix=suffix,
                                     warm_start_ckpt=ws_ref or "")
@@ -257,8 +274,9 @@ class _RollingMixin:
             hosts = list(load_hosts(self.remote_hosts_path))
         else:
             hosts = list(self.remote_hosts or ())
-        return [h for h in hosts
-                if getattr(h, "stage", "any") in ("any", "final") and not is_profile_only(h)]
+        lanes = [h for h in hosts
+                 if getattr(h, "stage", "any") in ("any", "final") and not is_profile_only(h)]
+        return [_with_deployed_chain_toml(self, h) for h in lanes]
 
     def _rolling_lane_pool(self):
         """ONE lane pool for every rolling fallback leg (created lazily): lane
@@ -269,10 +287,30 @@ class _RollingMixin:
         :meth:`_operator_lane_gate` (ssh, worker runtime, bench floor) from a
         live hosts.toml refresh."""
         pool = self.__dict__.get("_rolling_lane_pool_obj")
+        threshold = int(getattr(getattr(getattr(self, "cfg", None), "round", None),
+                                "operator_lane_breaker_failures", 0) or 0)
         if pool is None:
-            pool = _FinalLanePool(self._rolling_final_hosts(), self._rolling_final_hosts,
-                                  gate_fn=self._operator_lane_gate)
+            from .host_preflight import host_blocked_reason
+
+            # The initial lanes skip the join gate, but never the blocklist /
+            # quarantine: a blocked one is left to the refresh, whose gate
+            # refuses it (and re-gates it later, so an unblocked IP returns).
+            initial = []
+            for h in self._rolling_final_hosts():
+                why = host_blocked_reason(self, str(getattr(h, "host", "") or ""))
+                if why:
+                    log.warning("rolling lane pool: lane %s left out (%s)",
+                                getattr(h, "name", h), why)
+                    continue
+                initial.append(h)
+            # sync_from_file: an edited hosts.toml entry reaches dispatch and a
+            # removed lane leaves once idle (never a stale host object).
+            pool = _FinalLanePool(initial, self._rolling_final_hosts,
+                                  gate_fn=self._operator_lane_gate, sync_from_file=True,
+                                  breaker_threshold=threshold)
             self.__dict__["_rolling_lane_pool_obj"] = pool
+        else:
+            pool.breaker_threshold = threshold      # follows the live config
         return pool
 
     def _operator_funds_genesis_king(self, gen) -> bool:
@@ -1111,3 +1149,32 @@ class _RollingMixin:
             reg = DedupRegistry(self, self.work_root / "dedup_registry.json", mode=mode)
             self.__dict__["_dedup_registry_obj"] = reg
         return reg
+
+
+def record_lane_breaker_victim(runner, hotkey: str, exc: BaseException) -> bool:
+    """A leg that failed on a lane the circuit breaker just took out
+    (``exc.lane_breaker``) failed because of that LANE: its verdict is a
+    capacity miss — requeued unburned and WITHOUT the operator-fault backoff
+    (the queue backs off only ``operator`` class), so the healthy rest of the
+    fleet can take it at once. Returns True when it recorded one."""
+    if not getattr(exc, "lane_breaker", False):
+        return False
+    runner._record_funded_failure(
+        hotkey, f"LANE BREAKER: the operator lane this leg ran on failed several "
+        f"different legs in a row and left the rotation — requeued without backoff "
+        f"({str(exc)[-300:]})", miner_fault=False, error_class="no_capacity", burn=False)
+    return True
+
+
+def _with_deployed_chain_toml(runner, host):
+    """An operator lane trains on the orchestrator's DEPLOYED chain.toml, the
+    same file a rented pod gets (``_push_deployed_chain_toml``; the join gate
+    pushes it). Without this a hand-rented lane that boots the image's baked
+    snapshot resolves the wrong contract: 2026-11-01 two Targon 8xH200 lanes
+    failed every v2 leg ``unknown --arch-preset 'cascade-moe-v2-120m'`` for
+    ~1.5 h. A host that names its own ``chain_toml`` keeps it."""
+    from dataclasses import replace as dc_replace
+
+    if getattr(host, "chain_toml", None) or not getattr(runner, "deployed_chain_toml", None):
+        return host
+    return dc_replace(host, chain_toml=f"{host.workdir}/chain.deployed.toml")

@@ -102,7 +102,94 @@ def combine_gradients(parameters, reference, cap=0.1):
     return weight
 
 
-def save_checkpoint(out, state, cfg, contract):
+# Power EMA — IMAGE-ONLY (owner decision 2026-11-01). The settings are fixed
+# worker constants, NOT contract terms: they are not read from [training] /
+# [v2.training] and never enter ``contract_digest`` (the recipe check below
+# still pins the contract's own power_ema_sigma_rels to ()). They
+# ship with the worker image at an era boundary. Math is
+# ``moe_trainer.PowerEMA`` unchanged; every leg starts its own average (a
+# warm-started leg resumes the RAW weights_stable + optimizer lineage and never
+# inherits an average). The SCORED weights.safetensors is the
+# POWER_EMA_SIGMA_RELS[POWER_EMA_EVAL] average; a continuation snapshot carries
+# the raw model plus every EMA state, so a resumed leg restores them bitwise.
+#
+# ACTIVATION (owner 2026-11-01 ~06:35): the EMA is SCORED only from the first
+# warm-start seed epoch after the image ships — see power_ema_active. A seed
+# epoch shares ONE init (DEC-CA-0055), so the rule is identical for the king's
+# retrain and every challenger of an epoch. SHADOW MODE (owner 2026-11-01):
+# both averages are always computed; where the gate is off (the random-init
+# epoch) weights.safetensors stays the raw endpoint, byte-identical to the
+# pre-EMA trainer, and the averages ride along as weights_ema005 / _ema010;
+# where it is on, weights.safetensors is the 0.10 average and the raw endpoint
+# rides along as weights_raw (+ the 0.05 file). Validators read only
+# weights.safetensors; the extras are comparison data, never scored.
+POWER_EMA_SIGMA_RELS = (0.05, 0.10)
+POWER_EMA_EVAL = 1
+RAW_WEIGHTS_FILE = "weights_raw.safetensors"
+
+
+def ema_weights_file(sigma_rel: float) -> str:
+    """``weights_ema005.safetensors`` / ``weights_ema010.safetensors``: the
+    unscored average of width ``sigma_rel`` (same format/keys as weights)."""
+    return f"weights_ema{round(float(sigma_rel) * 100):03d}.safetensors"
+# config.json key an EMA-scored checkpoint carries (validators read only
+# ``moe``); a lane-B expert leg inherits the decision from its base king.
+POWER_EMA_MARKER = "power_ema"
+
+
+def power_ema_settings():
+    """``(sigma_rels, eval_index)`` of the image's fixed power EMAs, validated.
+    ``((), -1)`` (tests only) disables the average: the raw endpoint is scored."""
+    sigmas = tuple(float(s) for s in POWER_EMA_SIGMA_RELS)
+    index = int(POWER_EMA_EVAL)
+    if not sigmas:
+        if index != -1:
+            raise ValueError("pyramid power EMA: eval index needs sigma_rels")
+        return (), -1
+    if not 0 <= index < len(sigmas):
+        raise ValueError(f"pyramid power EMA: eval index {index} out of range for {sigmas!r}")
+    if any(not 0 < s < math.sqrt(1 / 12) for s in sigmas):
+        raise ValueError(f"pyramid power EMA: sigma_rels must lie in (0, 0.2887): {sigmas!r}")
+    return sigmas, index
+
+
+def power_ema_active(warm_start_dir, expert_selection):
+    """Is the power EMA on for this leg? Derived only from the leg's INIT
+    (never wall-clock, image or role), so a seed epoch is never mixed:
+
+    * random init (no ``warm_start_dir``) — the v2 epoch that begins at the
+      first v2 era — stays raw;
+    * a king / challenger (heat or full) leg from a warm-start init — only
+      a DEC-CA-0013 promoted init, the seed epoch's ``warm_start_ckpt``, is
+      ever passed to them — is EMA-scored;
+    * a lane-B expert leg (``expert_selection``) fine-tunes FROM a king
+      checkpoint, so it follows that king: EMA iff the king was itself
+      EMA-scored (its ``config.json`` carries :data:`POWER_EMA_MARKER`),
+      i.e. iff the king's seed epoch began at a promotion.
+
+    A continuation re-derives the same answer from the same init."""
+    import json
+
+    if warm_start_dir is None:
+        return False
+    if expert_selection is None:
+        return True
+    try:
+        obj = json.loads((Path(warm_start_dir) / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(obj, dict) and isinstance(obj.get(POWER_EMA_MARKER), dict)
+
+
+def power_ema_state(emas):
+    """Every EMA's shadows and step counter as one flat tensor dict."""
+    flat = {}
+    for ema in emas:
+        flat.update(ema.state_tensors())
+    return flat
+
+
+def save_checkpoint(out, state, cfg, contract, *, power_ema=None):
     import json
 
     from .ckpt_digest import save_tensors_hashed
@@ -110,9 +197,13 @@ def save_checkpoint(out, state, cfg, contract):
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     save_tensors_hashed(state, out / "weights.safetensors")
-    (out / "config.json").write_text(json.dumps({"moe": cfg.to_dict(),
+    meta = {"moe": cfg.to_dict(),
         "quantile_levels": list(QUANTILE_LEVELS), "base_arch": contract.base_arch,
-        "arch": contract.arch_preset, "input_transform": contract.input_transform}, sort_keys=True))
+        "arch": contract.arch_preset, "input_transform": contract.input_transform}
+    if power_ema is not None:
+        # only on EMA-scored legs; a raw leg's config.json is byte-identical
+        meta[POWER_EMA_MARKER] = power_ema
+    (out / "config.json").write_text(json.dumps(meta, sort_keys=True))
     (out / "model.py").write_bytes(Path(__file__).with_name("pyramid_model.py").read_bytes())
     (out / "forecast_wrapper.py").write_bytes(Path(__file__).with_name("pyramid_wrapper.py").read_bytes())
 
@@ -122,7 +213,7 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
     from safetensors.torch import load_file
 
     from .continuation import assert_training_runtime, restore_rng, rng_state, training_runtime
-    from .moe_trainer import restore_frozen, route_bias_scale, router_lr_scale
+    from .moe_trainer import PowerEMA, restore_frozen, route_bias_scale, router_lr_scale
 
     cfg = CascadeMoEConfig.from_contract(contract)
     if contract.training_steps < 1:
@@ -139,6 +230,9 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
     for name, value in expected.items():
         if getattr(contract, name) != value:
             raise ValueError(f"pyramid recipe requires {name}={value!r}")
+    ema_sigmas, ema_eval = power_ema_settings()
+    # computed on every leg (shadow); SCORED only where the init says so
+    ema_scored = bool(ema_sigmas) and power_ema_active(warm_start_dir, expert_selection)
     if tuple(contract.accepted_fields) not in ((), ("groups",)):
         raise ValueError("pyramid recipe accepts only optional groups")
     if str(trainer.dtype) != "torch.float32":
@@ -175,6 +269,12 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
 
         accelerate(model)
     names = {id(p): n for n, p in source.named_parameters()}
+    # Power EMAs live on rank 0 only (the process that owns the model after
+    # every gang sync): fp32 shadows of the PARAMETERS — buffers (the routing
+    # bias) stay live — over a lane-B leg's selected leaves only. Always
+    # fresh per leg (see POWER_EMA_SIGMA_RELS); a continuation restores them.
+    # Memory: +len(sigmas) fp32 parameter copies on rank 0 (~10 GB at 1.23B).
+    emas = [PowerEMA(model, s, expert_slices=slices) for s in ema_sigmas]
     optimizer = build_optimizer(source, cfg.d_model)
     if optimizer.adamw:
         router_ids = {id(layer.router.weight) for layer in model.moe_layers()}
@@ -201,13 +301,23 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
     channel_stats = ChannelStatsAccumulator()
     grouped_corpus = False
 
+    # The O(C²L) per-series stats run on one FIFO telemetry thread (same
+    # series, same order, so the same summary); it is drained before the
+    # summary is read. Nothing in training, the checkpoint or the
+    # continuation state reads the accumulator.
+    background = None
+    if "groups" in contract.accepted_fields:
+        from .channel_stats import BackgroundObserver
+
+        background = BackgroundObserver(channel_stats.observe)
+
     def observe(item):
         nonlocal grouped_corpus
         if isinstance(item, dict) and item.get("groups") is not None:
             grouped_corpus = True
-        channel_stats.observe(item)
+        background(item)
 
-    timed = _TimedStream(stream, observer=observe if "groups" in contract.accepted_fields else None)
+    timed = _TimedStream(stream, observer=observe if background is not None else None)
     steps = contract.training_steps
     cooldown = max(1, round(steps / 11))
     trunk = steps - cooldown
@@ -228,6 +338,13 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
                     leaf.copy_(restored["leaves"][name])
             slices.sync()
         optimizer.load_state_tensors(restored["optimizer"], names)
+        for ema in emas:
+            if not ema.load_state_tensors(restored.get("emas") or {}):
+                raise ValueError("pyramid continuation lacks its power EMA state")
+        if not emas and restored.get("emas"):
+            raise ValueError("pyramid continuation carries power EMA state this raw leg never uses")
+        if emas and restored.get("power_ema_scored") is not ema_scored:
+            raise ValueError("pyramid continuation was made under the other power EMA decision")
         if gang is not None:
             gang.scatter_pending = True
         stable = restored["stable"]
@@ -284,15 +401,17 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
             b, c, length = values.shape
             masks = sample_cpm_masks(b * c, length // 32, c_max=16, p_max=0.4, rng=mask_rng).reshape(b, c, -1)
             splits = np.array_split(np.arange(b), min(contract.micro_batches, b))
+            values_t = None
             if gang is not None:
                 if not gang.synced:
                     gang.broadcast_state(model)
-                gang.send_step(values, masks, groups, len(splits), cop_gen,
-                               lr=optimizer.param_groups[0]["lr"])
+                values_t = gang.send_step(values, masks, groups, len(splits), cop_gen,
+                                          lr=optimizer.param_groups[0]["lr"])
             reference, loss_m, loss_j, load = micro_batch_pass(
                 model, params, values, masks, groups, splits, owned_splits(len(splits), 0, world),
                 cop_gen, gang.device if gang is not None else trainer.device,
-                step=step, tokens=tokens, gang=gang)
+                step=step, tokens=tokens, gang=gang, values_t=values_t)
+            del values_t
             try:
                 energy_weight = combine_gradients(params, reference)
             except FloatingPointError:
@@ -308,6 +427,10 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
                     layer.update_bias(total, rate_scale=bias_scale)
             if gang is not None:
                 gang.sync_after_step(model)
+            # once per optimizer step, after every rank's update has landed
+            # on rank 0 (sync_after_step) — never per micro-batch or per GPU
+            for ema in emas:
+                ema.update(model)
             tokens += batch_points(values, contract.budget_denomination)
             channel_tokens += values.size
             step += 1
@@ -323,6 +446,8 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
                     "channel_tokens": channel_tokens, "model": model.state_dict(),
                     "leaves": dict(slices.named_parameters()) if slices else {},
                     "optimizer": optimizer.state_tensors(names), "stable": stable,
+                    **({"emas": power_ema_state(emas), "power_ema_scored": ema_scored}
+                       if emas else {}),
                     "last_loss": last_loss, "last_joint": last_joint, "elapsed": time.time() - started,
                     "data_wait": timed.wait_s,
                     "rng": rng_state(), "mask_rng": mask_rng.bit_generator.state,
@@ -332,6 +457,8 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
                 deadline += overhead
             if step >= steps or tokens >= token_budget or time.time() >= deadline:
                 break
+        if background is not None:
+            background.close()          # every observed series is in the stats
         clean = True
         if gang is not None and gang.synced:
             gang.gather_muon()          # the final optimizer-state reads below
@@ -341,6 +468,8 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
             gang.raise_follower_error(e)
         raise
     finally:
+        if background is not None:
+            background.close(raise_errors=False)
         if gang is not None:
             gang.stop(clean=clean)
     if step == 0 or not replay_verified:
@@ -349,9 +478,28 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
     live = {k: v.detach().cpu().contiguous() for k, v in model.state_dict().items()}
     if slices:
         live = restore_frozen(live, base, expert_selection, moe_param_names(model))
+
+    def average(ema):
+        avg = ema.export(model)
+        return restore_frozen(avg, base, expert_selection, moe_param_names(model)) if slices else avg
+
+    # the chosen power EMA is the evaluated artifact (weights.safetensors) on a
+    # scored leg; the raw lineage (weights_stable + optimizer below) is untouched
+    scored = average(emas[ema_eval]) if ema_scored else live
     out = Path(out_dir)
-    save_checkpoint(out, live, cfg, contract)
+    save_checkpoint(out, scored, cfg, contract, power_ema=(
+        {"sigma_rels": list(ema_sigmas), "scored_sigma_rel": ema_sigmas[ema_eval]}
+        if ema_scored else None))
     from .ckpt_digest import save_tensors_hashed
+
+    # comparison extras, never scored (validators load only weights.safetensors);
+    # written through save_tensors_hashed so the receipt's tensor digests and
+    # every harvest / ingest check carry them like the lineage files
+    if ema_scored:
+        save_tensors_hashed(live, out / RAW_WEIGHTS_FILE)
+    for i, ema in enumerate(emas):
+        if not (ema_scored and i == ema_eval):
+            save_tensors_hashed(average(ema), out / ema_weights_file(ema.sigma_rel))
 
     if slices is None:
         stable = stable or trainer._stable_snapshot(model, optimizer)
@@ -371,6 +519,10 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
         "optim_state_resumed": resumed_optimizer,
         "training_complete": step == steps,
         "corpus_exhausted": step < steps and tokens < token_budget and duration < contract.max_train_seconds}
+    if emas:
+        metrics.update(power_ema_scored=ema_scored, power_ema_steps=emas[0].t)
+    if ema_scored:
+        metrics.update(power_ema_eval_sigma_rel=ema_sigmas[ema_eval])
     if slices:
         metrics.update(expert_training_backend="compact_rows", expert_trainable_param_count=sum(p.numel() for p in params))
     if grouped_corpus:

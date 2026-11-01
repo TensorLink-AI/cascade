@@ -60,8 +60,10 @@ class _OperatorPodMixin:
             from ..provision.core import LaunchSpec, ProvisionError
             from ..provision.funded import quarantine_lemon_host, terminate_verified
             from ..provision.state import PodInstance
+            from .host_preflight import sync_host_blocklist
             from .remote import RemoteHost
 
+            sync_host_blocklist(self)
             rnd = self.cfg.round
             profile = self._funded_pod_profile()
             key_path = Path(profile.key_path or "").expanduser()
@@ -69,9 +71,9 @@ class _OperatorPodMixin:
                           ).read_text(encoding="utf-8").strip()
             skus = self._funded_skus_for_rent()
             sku = skus[0] if skus else rnd.funded_pod_sku
-            from ..provision.operator_pool import operator_provider
+            from ..provision.operator_pool import operator_price_caps, operator_provider
 
-            provider = operator_provider(self, lambda: _lium_provider(rnd, price_caps=self._funded_price_caps()))
+            provider = operator_provider(self, lambda: _lium_provider(rnd, price_caps=operator_price_caps(self)))
             name_prefix = getattr(self.__dict__.get("_leg_local_obj"), "king_primary_prefix", None) or king_pod_name_prefix(self.cfg.subnet.netuid, round_id)
 
             def _king_remote(addr, host_key: str) -> RemoteHost:
@@ -232,6 +234,13 @@ class _OperatorPodMixin:
                         addr = provider.get_ip(pod_id)
                         if addr is None:
                             _fail_king(pod_id, f"king pod {pod_id} exposed no IP")
+                        # Its real host: never a quarantined/blocklisted one
+                        # (a blind listing can still land there).
+                        from .host_preflight import host_blocked_reason
+
+                        blocked = host_blocked_reason(self, addr.ip)
+                        if blocked:
+                            _fail_king(pod_id, f"king pod {pod_id} rejected: {blocked}")
                         try:
                             host_key = self._pin_king_host_key(pod_id, addr)
                         except ProvisionError as e:
@@ -254,6 +263,14 @@ class _OperatorPodMixin:
                     # the defence of the throne. Fresh rents only — an
                     # adopted pod already holds its checkpoint.
                     why = self._host_bench_below_floor(king_host, sku, f"king pod {pod_id}")
+                    if why:
+                        _fail_king(pod_id, f"king pod rejected: {why}")
+                    # Multi-GPU preflight: a king host that hangs or crawls an
+                    # NCCL collective defends the throne at a fraction of its
+                    # rate (the check quarantines the host itself).
+                    from .host_preflight import multi_gpu_preflight_failure
+
+                    why = multi_gpu_preflight_failure(self, king_host, sku, f"king pod {pod_id}")
                     if why:
                         _fail_king(pod_id, f"king pod rejected: {why}")
                     # The king pod also runs the era's public benches and the
@@ -321,8 +338,8 @@ class _OperatorPodMixin:
 
             provider = OperatorPool(self) if pod.provider == OperatorPool.name else LiumProvider()
             if terminate_verified(provider, pod.instance_id):
-                self._ledger_remove(pod.instance_id)
                 release_executor_of(self, pod.instance_id)
+                self._ledger_remove(pod.instance_id)       # may hit ENOSPC: pod already gone
             else:
                 log.error("operator pod %s still LIVE after terminate — kept "
                           "on ledger for the next sweep", pod.instance_id)
@@ -387,18 +404,24 @@ class _OperatorPodMixin:
         from ..provision.core import LaunchSpec, ProvisionError
         from ..provision.funded import quarantine_lemon_host, terminate_verified
         from ..provision.state import PodInstance
+        from .host_preflight import (
+            host_blocked_reason,
+            multi_gpu_preflight_failure,
+            sync_host_blocklist,
+        )
         from .remote import RemoteHost, probe_worker_runtime
         from .runner_funded_pods import allocation_lock
 
+        sync_host_blocklist(self)
         rnd = self.cfg.round
         profile = self._funded_pod_profile()
         key_path = Path(profile.key_path or "").expanduser()
         ssh_pubkey = (key_path.parent / (key_path.name + ".pub")
                       ).read_text(encoding="utf-8").strip()
         skus = self._funded_skus_for_rent()
-        from ..provision.operator_pool import operator_provider
+        from ..provision.operator_pool import operator_price_caps, operator_provider
 
-        provider = operator_provider(self, lambda: _lium_provider(rnd, price_caps=self._funded_price_caps()))
+        provider = operator_provider(self, lambda: _lium_provider(rnd, price_caps=operator_price_caps(self)))
         prefix = name_prefix or self._operator_leg_pod_prefix(round_id, gen.hotkey)
         if name_prefix is not None:
             from ..provision.funded import funded_pod_name
@@ -489,11 +512,18 @@ class _OperatorPodMixin:
                 _lemon("adopted operator leg pod unusable")
 
         from .cost_guards import measured_wall_refusal, provider_ttl_seconds
+        from .runner_common import disk_guard_refusal
 
         unmeasured = measured_wall_refusal(rnd)
         if unmeasured:
             log.error("operator leg %s: %s", gen.hotkey[:12], unmeasured)
             _skip(unmeasured, OPERATOR_FAULT_CLASS)
+        # Disk guard: a NEW leg pod only (the adopt path returned above); a
+        # king backup (``name_prefix``) is never held back by it.
+        low = disk_guard_refusal(self) if name_prefix is None else ""
+        if low:
+            log.error("operator leg %s: %s", gen.hotkey[:12], low)
+            _skip(low, "no_capacity")
         # A king backup (``name_prefix``) may become the era's king pod, which
         # lives for the era: no TTL there (see the king rent).
         ttl = provider_ttl_seconds(self, kind="leg") if name_prefix is None else 0.0
@@ -533,6 +563,10 @@ class _OperatorPodMixin:
                     addr = provider.get_ip(pod_id)
                     if addr is None:
                         _lemon(f"operator leg pod {pod_id} exposed no IP")
+                    # Its real host: never a quarantined/blocklisted one.
+                    blocked = host_blocked_reason(self, addr.ip)
+                    if blocked:
+                        _lemon(f"operator leg pod {pod_id} rejected: {blocked}")
                     try:
                         host_key = self._pin_king_host_key(pod_id, addr)
                     except ProvisionError as e:
@@ -540,7 +574,9 @@ class _OperatorPodMixin:
                 _ledger(sku)
                 host = self._push_deployed_chain_toml(_remote(addr, host_key))
                 why = (probe_worker_runtime(host, **({"required_flags": ("--local-only", "--continuation-root")} if getattr(self.cfg.round, "ops_continuation_interval_seconds", 0) else {}))
-                       or self._host_bench_below_floor(host, sku, f"operator leg pod {pod_id}"))
+                       or self._host_bench_below_floor(host, sku, f"operator leg pod {pod_id}")
+                       or multi_gpu_preflight_failure(self, host, sku,
+                                                      f"operator leg pod {pod_id}"))
                 if why:
                     _lemon(f"operator leg pod rejected: {why}")
                 log.warning("operator leg pod %s ready at %s:%d for %s (sku=%s) — "
@@ -581,6 +617,32 @@ class _OperatorPodMixin:
             _record_generation_failure(self, gen, e)
             raise
         host, pod_id = self._rent_operator_leg_host(str(seeds.base_seed), gen)
+
+        def ledger_pod():
+            pods = getattr(self, "_load_funded_ledger", lambda: [])()
+            pod = next((p for p in pods if p.instance_id == pod_id), None)
+            if pod is None:
+                from ..provision.operator_pool import OperatorPool, enabled
+                pooled = hasattr(self, "cfg") and enabled(self)
+                pod = PodInstance(provider=OperatorPool.name if pooled else "lium",
+                                  instance_id=pod_id, stage="funded", rented_at_iso="")
+            return pod
+
+        released: list[bool] = []
+
+        def release_pod() -> None:
+            # Owner 2026-11-01: never benched here and torn down at leg end
+            # anyway — once the harvested copy is verified on the box, stop
+            # the operator's bill before the upload (harvest_release).
+            if not released:
+                self._teardown_operator_pod(ledger_pod())
+                released.append(True)
+
+        # A challenger receipt is harvested INSIDE dispatch (the isolated
+        # host's harvest hook, same thread): armed for the whole leg body.
+        from .harvest_release import arm_release, disarm_release
+
+        armed = arm_release(self, release_pod)
         try:
             from .progress import report_progress
 
@@ -589,8 +651,17 @@ class _OperatorPodMixin:
                 host = self._stage_vault_zip_on(host, digest)
             report_progress(self, "training")
             specialist = role in {"expert", "mkt_finetune"}
-            receipt = disp.dispatch(
-                host, lane_count=1, gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
+            # The same progress watchdog (throughput / first-step deadline)
+            # as a payer leg; an abort quarantines the host and is ours.
+            from types import SimpleNamespace
+
+            from .runner_funded_legs import _dispatch_watched, _with_leg_watchdog
+
+            disp = _with_leg_watchdog(
+                self, disp, gen, SimpleNamespace(instance_id=pod_id, payer_hotkey=""),
+                contract, host)
+            receipt = _dispatch_watched(
+                disp, host, lane_count=1, gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
                 role=role, base_seed=seeds.base_seed, block=int(block),
                 arch_preset=contract.arch_preset, warm_start_ref=warm_start_ref,
                 contract_block=contract_block, **corpus,
@@ -601,6 +672,9 @@ class _OperatorPodMixin:
             )
             if specialist:
                 report_progress(self, "harvesting")
+                # The armed release (above) lets the pod go once the
+                # checkpoint is verified — on the box (ssh) or on R2 (r2
+                # transport) — before the Hippius push.
                 return self._harvest_funded_checkpoint(host, receipt, contract, seeds, suffix)
             return receipt
         except _FundedTamper as e:
@@ -629,11 +703,6 @@ class _OperatorPodMixin:
                                         error_class=error_class, burn=False)
             raise
         finally:
-            pods = getattr(self, "_load_funded_ledger", lambda: [])()
-            pod = next((p for p in pods if p.instance_id == pod_id), None)
-            if pod is None:
-                from ..provision.operator_pool import OperatorPool, enabled
-                pooled = hasattr(self, "cfg") and enabled(self)
-                pod = PodInstance(provider=OperatorPool.name if pooled else "lium",
-                                  instance_id=pod_id, stage="funded", rented_at_iso="")
-            self._teardown_operator_pod(pod)
+            disarm_release(self, armed)
+            if not released:
+                self._teardown_operator_pod(ledger_pod())

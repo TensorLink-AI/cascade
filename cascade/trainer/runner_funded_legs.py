@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import threading
 import time
@@ -18,6 +19,7 @@ from .faults import (
     _OperatorFault,
     classify_funded_worker_failure,
 )
+from .harvest_release import release_after_verified_harvest
 from .progress import progress_binding, report_progress
 from .runner_common import (
     ResolvedGenerator,
@@ -125,7 +127,13 @@ class _FundedLegMixin:
                 deadline = None if king_leg else time.time() + 1800.0
                 end = getattr(self.__dict__["_leg_local_obj"], "end_wall", None)
                 if not king_leg and end is not None:
-                    deadline = float(end) - float(contract.max_train_seconds)
+                    # The SAME wall admission budgeted (the measured SKU wall,
+                    # capped by max_train_seconds): the cap here opened a dead
+                    # zone where admission targeted a boundary this deadline had
+                    # already closed, so no-corpus legs idled ~1.2 h per cycle
+                    # (2026-10-31). The rent's own fit check still refuses a
+                    # type that cannot land; the progress watchdog a slow pod.
+                    deadline = float(end) - float(self._leg_wall_seconds(None))
                     deadline -= self.FUNDED_PUBLISH_MARGIN_SECONDS
                     # A corpus already generated (earlier attempt / era of the
                     # same seed epoch) needs only its GPU wall, not the CPU lead.
@@ -227,7 +235,7 @@ class _FundedLegMixin:
         deadline = time.time() + 1800.0
         end = getattr(self.__dict__["_leg_local_obj"], "end_wall", None)
         if end is not None:
-            deadline = min(deadline, float(end) - float(contract.max_train_seconds)
+            deadline = min(deadline, float(end) - float(self._leg_wall_seconds(None))
                            - self.FUNDED_PUBLISH_MARGIN_SECONDS)
         try:
             return self._dispatch_on_free_lane(
@@ -254,8 +262,13 @@ class _FundedLegMixin:
                                         and prior.last_error_class == STALL_CLASS))
                 if error_class == "infra":
                     error_class = OPERATOR_FAULT_CLASS
-            self._record_funded_failure(gen.hotkey, str(e), miner_fault=miner_fault,
-                                        error_class=error_class, burn=False)
+            from .faults import record_no_lanes_verdict
+            from .runner_rolling import record_lane_breaker_victim
+
+            if not (record_lane_breaker_victim(self, gen.hotkey, e)
+                    or record_no_lanes_verdict(self, gen.hotkey, e)):
+                self._record_funded_failure(gen.hotkey, str(e), miner_fault=miner_fault,
+                                            error_class=error_class, burn=False)
             raise
 
     def _run_funded_leg_scoped(self, disp, gen, seeds, block, contract, suffix, *,
@@ -308,6 +321,16 @@ class _FundedLegMixin:
             str(seeds.base_seed), gen,
             **({"gpu_choice": gpu_choice} if gpu_choice is not None else {}))
         keep = False
+        released: list[bool] = []
+
+        def release_pod() -> None:
+            # Owner 2026-11-01: the harvested copy is verified (on the box, or
+            # on R2 with the r2 transport) and nothing benches on this pod —
+            # stop its bill before the upload / Hippius push.
+            if not released:
+                self._teardown_funded_pod(pod)
+                released.append(True)
+
         try:
             # Identity pin, before a single byte of dispatch: the pod that
             # answers to this name must be the one we rented (platform id)
@@ -331,7 +354,7 @@ class _FundedLegMixin:
                 host = self._stage_vault_zip_on(host, digest)
             harvest = self._funded_harvest()
             report_progress(self, "training")
-            disp = _with_leg_watchdog(self, disp, gen, pod, contract)
+            disp = _with_leg_watchdog(self, disp, gen, pod, contract, host)
             entry = _dispatch_watched(
                 disp, host, lane_count=1,
                 gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
@@ -383,10 +406,15 @@ class _FundedLegMixin:
                 # Credential-free pod: the checkpoint is still ON the pod.
                 # Pull it over the pinned ssh, ingest-verify the local copy,
                 # and upload it under the OPERATOR's identity — the entry's
-                # pointer is then a checkpoint whose bytes we inspected.
+                # pointer is then a checkpoint whose bytes we inspected. A pod
+                # nothing benches on is released once the copy is verified,
+                # before the upload (cascade.trainer.harvest_release).
+                early = (contextlib.nullcontext() if _funded_pod_benched_here(self, bench)
+                         else release_after_verified_harvest(self, release_pod))
                 try:
-                    entry = self._harvest_funded_checkpoint(
-                        host, entry, contract, seeds, suffix)
+                    with early:
+                        entry = self._harvest_funded_checkpoint(
+                            host, entry, contract, seeds, suffix)
                 except _OperatorFault:
                     # Upload lost after its retries: bind the kept copy to
                     # this leg's init too, so only the same leg reuses it.
@@ -405,7 +433,7 @@ class _FundedLegMixin:
                 why = self._funded_checkpoint_mismatch(entry, contract)
                 if why:
                     raise _FundedTamper(f"checkpoint: {why}")
-            if bench and self._keep_funded_pod_for_bench():
+            if not released and bench and self._keep_funded_pod_for_bench():
                 # The checkpoint benches on THIS pod at completion (payer-
                 # billed, the miner's own sidecar eval); the scheduler tears
                 # it down when the bench ends (_teardown_kept_funded_pod).
@@ -475,7 +503,7 @@ class _FundedLegMixin:
                     queue.set_operator_billed(gen.hotkey, True)
             raise
         finally:
-            if not keep:
+            if not keep and not released:
                 self._teardown_funded_pod(pod)
 
     def _keep_funded_pod_for_bench(self) -> bool:
@@ -551,10 +579,11 @@ class _FundedLegMixin:
         _add_seen_hotkeys(self._submissions_path(), [c.hotkey for c in challengers], block)
 
 
-def _with_leg_watchdog(runner, disp, gen, pod, contract):
+def _with_leg_watchdog(runner, disp, gen, pod, contract, host=None):
     """``disp`` with the leg's progress watchdog (and periodic teardown-key
     check) attached — a detached :class:`RemoteDispatcher` only; any other
-    dispatcher (attached form, test doubles) is returned unchanged."""
+    dispatcher (attached form, test doubles) is returned unchanged. ``host``
+    (the leg's RemoteHost) names the pod's IP in the verdict."""
     from dataclasses import replace
 
     from .cost_guards import check_payer_key, leg_watchdog
@@ -568,18 +597,25 @@ def _with_leg_watchdog(runner, disp, gen, pod, contract):
         check_payer_key(runner, hotkey=gen.hotkey, pod_name=str(pod.instance_id), pod=pod)
 
     watch = leg_watchdog(runner, gen=gen, pod=pod, contract=contract,
-                         key_check=key_check if payer else None)
+                         key_check=key_check if payer else None,
+                         host=str(getattr(host, "host", "") or ""))
     return disp if watch is None else replace(disp, on_progress=watch)
 
 
 def _dispatch_watched(disp, host, **kw):
     """``disp.dispatch`` with a watchdog abort turned into an operator fault:
-    the miner's pod and generator were fine, OUR wall estimate was not."""
+    the miner's pod and generator were fine, OUR wall estimate (or the
+    host) was not. The host is quarantined for a day: a host that cannot hold
+    the leg's rate — or never reached step 1 — is a hardware/fabric fault, and
+    re-renting it (2026-11-01: 93.120.231.186, 0.2 steps/s on two legs in a
+    row) only repeats the loss."""
+    from .host_preflight import quarantine_host_ip
     from .remote import LegAborted
 
     try:
         return disp.dispatch(host, **kw)
     except LegAborted as e:
+        quarantine_host_ip(str(getattr(host, "host", "") or ""), str(e)[-300:])
         raise _OperatorFault(str(e)) from e
 
 
@@ -638,3 +674,28 @@ def _reupload_pending(runner, gen, seeds, contract, suffix: str, warm_start_ref)
                                       miner_fault=False, error_class=OPERATOR_FAULT_CLASS,
                                       burn=False)
         raise
+    except _FundedTamper as e:
+        # r2 transport: the finite/code check runs at the push, so a retried
+        # push can still reach the verdict the ssh harvest reaches up front.
+        runner._record_funded_failure(gen.hotkey, f"checkpoint: {e}", miner_fault=True,
+                                      error_class="tamper", burn=False)
+        raise
+    except _FundedDiverged as e:
+        runner._record_funded_failure(gen.hotkey, f"{DIVERGED_MARKER}: {e}",
+                                      miner_fault=True, error_class="generator", burn=False)
+        raise
+
+
+def _funded_pod_benched_here(runner, bench: bool) -> bool:
+    """Whether THIS leg's pod may still be needed after its harvest: the
+    trainer benches the checkpoint on it (payer-pod bench armed, the leg
+    benchable, the era not validator-benched — DEC-CA-0063). Otherwise the
+    pod is released once the harvested copy is verified. A king own-key
+    leg's pod is torn down the moment its leg returns either way. No bench
+    source on this thread (a caller that does not set it) keeps today's rule."""
+    if not (bench and runner._keep_funded_pod_for_bench()):
+        return False
+    local = runner.__dict__.get("_leg_local_obj")
+    if getattr(local, "funded_is_king", False):
+        return False
+    return not bool(getattr(local, "validator_bench", False))

@@ -22,6 +22,7 @@ generator, build the corpus in the sandbox, train under the fixed contract.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import threading
@@ -125,6 +126,22 @@ HARVEST_UPLOAD_ATTEMPTS = 4
 HARVEST_UPLOAD_BACKOFF_SECONDS = 60.0
 
 
+def _mark_harvested(runner, host, entry):
+    """After a verified harvest + upload: record WHEN this pod endpoint was
+    harvested (orchestrator-side, persisted), so the pod sweep knows a
+    finished exit-0 run there that ended before now is no longer the only copy
+    of its checkpoint. Nothing is written to the pod. Best-effort — an
+    unrecorded harvest only keeps the pod until its window ends."""
+    record = getattr(runner, "_record_pod_harvest", None)
+    if callable(record):
+        try:
+            record(getattr(host, "host", ""), getattr(host, "port", 22))
+        except Exception as e:  # noqa: BLE001 — never fails a harvested leg
+            log.warning("harvest: recording the harvest of %s failed: %s",
+                        getattr(host, "name", host), e)
+    return entry
+
+
 def upload_harvested_checkpoint(runner, record: dict, *, base_seed) -> TrainedEntry:
     """Upload the verified local copy ``record["dest"]`` under the operator's
     identity → the leg's :class:`TrainedEntry`; delete the copy once the
@@ -134,27 +151,45 @@ def upload_harvested_checkpoint(runner, record: dict, *, base_seed) -> TrainedEn
     raised (infra, never an attempt burn)."""
     from .faults import _OperatorFault
 
-    dest = Path(record["dest"])
+    # r2 transport: the verified checkpoint is on R2 (``record["r2"]``), not
+    # on this box; the push runs from there (relay / bounded local temp).
+    r2 = record.get("r2")
     ckpt_repo = record["ckpt_repo"]
     hotkey = record["miner_hotkey"]
     sleep = getattr(runner, "_upload_retry_sleep", None) or time.sleep
     last: Exception | None = None
+    up = None
     for i in range(HARVEST_UPLOAD_ATTEMPTS):
         try:
-            up = upload_dir_to_hub_or_hf(
-                dest, ckpt_repo, runner.hub(), hf_repo=runner._hf_ckpt_repo(ckpt_repo))
+            if r2:
+                from .r2_transfer import push_from_r2
+
+                up = push_from_r2(runner, record)
+            else:
+                up = upload_dir_to_hub_or_hf(
+                    Path(record["dest"]), ckpt_repo, runner.hub(),
+                    hf_repo=runner._hf_ckpt_repo(ckpt_repo))
             break
+        except (_FundedTamper, _FundedDiverged):
+            raise                                  # a verdict, not a storage blip
         except Exception as e:  # noqa: BLE001 — storage blip: ours, retried
             last = e
+            from .r2_transfer import R2PushDeferred
+
+            if isinstance(e, R2PushDeferred):
+                log.warning("checkpoint push %s for %s deferred: %s", ckpt_repo,
+                            hotkey[:12], e)
+                break                              # no disk/relay now: requeue at once
             log.warning("checkpoint upload %s for %s: attempt %d/%d failed: %s", ckpt_repo,
                         hotkey[:12], i + 1, HARVEST_UPLOAD_ATTEMPTS, error_tail(str(e), 200))
             if i + 1 < HARVEST_UPLOAD_ATTEMPTS:
                 sleep(HARVEST_UPLOAD_BACKOFF_SECONDS * (2 ** i))
-    else:
+    if up is None:
         write_pending_upload(runner.work_root, base_seed, hotkey, record)
+        where = "kept on R2" if r2 else "kept"
         raise _OperatorFault(
             f"checkpoint upload failed after {HARVEST_UPLOAD_ATTEMPTS} attempts (operator "
-            f"storage; the harvested checkpoint is kept for the requeued leg): {last}")
+            f"storage; the harvested checkpoint is {where} for the requeued leg): {last}")
     entry = TrainedEntry(
         miner_hotkey=hotkey,
         miner_uid=int(record["miner_uid"]),
@@ -171,6 +206,20 @@ def upload_harvested_checkpoint(runner, record: dict, *, base_seed) -> TrainedEn
     # The upload is verified (a pinned ref came back): nothing reads the
     # local copy after this — benches and validators fetch the ref.
     clear_harvest(runner.work_root, base_seed, hotkey, job_id=record.get("harvest_job_id", ""))
+    if r2:
+        from .r2_transfer import R2Checkpoint, ckpt_store, delete_checkpoint
+
+        ckpt = R2Checkpoint.from_record(r2)
+        kept = sorted(ckpt.shadow().files)
+        if kept:
+            log.info("r2: power-EMA comparison files of %s kept on R2 under %s for analysis "
+                     "(never published): %s", ckpt_repo, ckpt.prefix, ", ".join(kept))
+        try:
+            store = getattr(runner, "_r2_store", None) or ckpt_store(runner.cfg, bucket=ckpt.bucket)
+            delete_checkpoint(store, ckpt.published())
+        except Exception as e:  # noqa: BLE001 — lifecycle expiry is the backstop
+            log.warning("r2 copy of %s not deleted (%s); lifecycle expiry cleans it",
+                        ckpt_repo, e)
     return entry
 
 
@@ -636,14 +685,33 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
         return self._harvest_funded_checkpoint(host, receipt, contract, seeds, repo_suffix)
 
     def _harvest_funded_checkpoint(self, host, receipt, contract, seeds,
-                                   suffix: str):
+                                   suffix: str, *, release=None):
         """Pull a ``--local-only`` funded leg's checkpoint off its payer pod,
         ingest-verify it, upload it under the operator's identity, and return
         the real :class:`TrainedEntry` (DEC-CA-0036 credential-free pods).
 
         Any guard deviation raises :class:`_FundedTamper` (miner fault,
         terminal); a transport/upload failure raises plain (infra — the
-        miner's training was fine, the operator's pull was not)."""
+        miner's training was fine, the operator's pull was not).
+
+        r2 transport (:mod:`cascade.trainer.r2_transfer`): the same verdicts,
+        but the checkpoint moves pod → R2 and is verified there; the release
+        (``release`` when given, else the thread-armed one —
+        :mod:`cascade.trainer.harvest_release`) tears the pod down once the R2
+        copy matches the pod's listing, BEFORE the Hippius push. ssh
+        transport: the release runs once the box copy matches the pod's
+        listing and every ingest guard passed, before the upload."""
+        from .runner_common import r2_transport_on
+
+        if r2_transport_on(self.cfg):
+            if not getattr(receipt, "marketcast", None):
+                from .r2_transfer import harvest_checkpoint_r2
+
+                return _mark_harvested(self, host, harvest_checkpoint_r2(
+                    self, host, receipt, contract, seeds, suffix, release=release))
+            log.warning("funded leg %s: MarketCast fine-tune harvested over ssh (its "
+                        "verifier reads a local copy; r2 transport covers Cascade "
+                        "checkpoints only)", receipt.miner_hotkey[:12])
         from ..eval.checkpoint_guard import (
             CheckpointDiverged,
             CheckpointTampered,
@@ -660,6 +728,15 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
         job_id = harvest_job_id(receipt, suffix)
         dest = harvest_dir(self.work_root, seeds.base_seed, receipt.miner_hotkey, job_id=job_id)
         harvest_remote_dir(host, receipt.checkpoint_dir, dest)
+        # Owner 2026-11-01: a leg path that tears its pod down at leg end arms
+        # an early release; the box copy must first match the pod's own
+        # listing file for file (one re-harvest on a mismatch, else kept).
+        from .harvest_release import release_if_verified, verify_harvest_complete
+
+        verified = verify_harvest_complete(
+            self, host, receipt.checkpoint_dir, dest,
+            reharvest=lambda: harvest_remote_dir(host, receipt.checkpoint_dir, dest),
+            release=release)
         if getattr(receipt, "marketcast", None):
             # DEC-CA-0064: a Timestral fine-tune, not a Cascade-MoE checkpoint
             from .marketcast_runner import verify_harvested_mkt_checkpoint
@@ -667,17 +744,18 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
             why = verify_harvested_mkt_checkpoint(self, dest, receipt)
             if why:
                 raise _FundedTamper(f"checkpoint: {why}")
+            release_if_verified(self, verified, release)
             ckpt_repo = (f"{self.hub().namespace}/ckpt-r{seeds.base_seed}-"
                          f"{receipt.role}-mkt{suffix}")
             self._mkt_harvested[receipt.miner_hotkey] = dict(receipt.marketcast)
-            return upload_harvested_checkpoint(self, {
+            return _mark_harvested(self, host, upload_harvested_checkpoint(self, {
                 "dest": str(dest), "harvest_job_id": job_id,
                 "ckpt_repo": ckpt_repo, "suffix": suffix, "size": "mkt",
                 "miner_hotkey": receipt.miner_hotkey, "miner_uid": int(receipt.miner_uid),
                 "role": receipt.role, "gen_ref": receipt.gen_ref,
                 "corpus_digest": receipt.corpus_digest, "train_block": int(receipt.train_block),
                 "gpu_name": receipt.gpu_name, "receipt_size": "mkt"},
-                base_seed=seeds.base_seed)
+                base_seed=seeds.base_seed))
         # The harvested tensor files must be the ones the worker hashed in
         # memory at save time; anything else on disk is not the run's product.
         from .ckpt_digest import tensor_mismatches
@@ -702,6 +780,18 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
             raise _FundedTamper(f"checkpoint: {e}") from e
         except CheckpointDiverged as e:
             raise _FundedDiverged(str(e)) from e
+        # The power-EMA comparison files were verified with the rest; they are
+        # never published: moved aside ([round] funded_keep_shadow_ema) or
+        # deleted now, so the upload carries the pre-shadow file set and the
+        # box keeps no extra weights by default.
+        from .runner_common import set_aside_shadow_ema
+
+        set_aside_shadow_ema(self.cfg, self.work_root, dest, seeds.base_seed,
+                             receipt.miner_hotkey, job_id=job_id)
+        # Every guard passed on a copy verified complete: nothing needs the
+        # pod any more — release it, then upload from the box copy (kept
+        # until a pinned ref returns; a failed upload re-uploads from it).
+        release_if_verified(self, verified, release)
         size = contract.arch_preset
         ckpt_repo = (f"{self.hub().namespace}/ckpt-r{seeds.base_seed}-"
                      f"{receipt.role}-{size}{suffix}")
@@ -715,7 +805,8 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
             "warm_start_ref": receipt.init_pointer,
             "contract_digest": receipt.training_contract_digest,
         }
-        return upload_harvested_checkpoint(self, record, base_seed=seeds.base_seed)
+        return _mark_harvested(
+            self, host, upload_harvested_checkpoint(self, record, base_seed=seeds.base_seed))
 
     def _archive_generator_tree(self, ref: str, d: Path) -> None:
         """Best-effort audit archive of a fetched generator tree.
@@ -1322,6 +1413,7 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
         or failure: a lane that failed for a challenger-specific reason
         (import error, OOM) is still good silicon — only a transport failure
         drains the pod's lanes."""
+        from .faults import _lane_fault
         from .remote import pod_lane_count
 
         # ``prepare(host) -> host`` runs on the CHOSEN lane right before each
@@ -1331,6 +1423,25 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
         _ready = prepare or (lambda h: h)
         _take = ((lambda: free_lanes.get(deadline=deadline)) if deadline is not None
                  else free_lanes.get)
+        # Lane circuit breaker (_FinalLanePool.record_leg_outcome): which leg
+        # this is, and whether a failure is the lane's (operator side).
+        _outcome = getattr(free_lanes, "record_leg_outcome", None)
+        leg_key = "|".join(str(kw.get(k) or "") for k in ("hotkey", "role", "domain"))
+        tripped = False
+
+        def _breaker(lane, exc=None) -> bool:
+            if _outcome is None:
+                return False
+            try:
+                if exc is None:
+                    return bool(_outcome(lane, leg_key, ok=True))
+                return bool(_outcome(lane, leg_key, ok=False,
+                                     operator_fault=_lane_fault(exc),
+                                     reason=error_tail(exc, 200)))
+            except Exception as be:  # noqa: BLE001 — the breaker never sinks a dispatch
+                log.warning("lane breaker bookkeeping failed (ignored): %s", be)
+                return False
+
         host = _take()
         try:
             entry = disp.dispatch(_ready(host), lane_count=pod_lane_count(host, hosts), **kw)
@@ -1344,7 +1455,9 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
                 free_lanes.mark_dead(host, error_tail(e, 160))
                 _quarantine_lane_host(host, f"lane {getattr(host, 'name', host)}: {error_tail(e, 200)}")
             else:
-                free_lanes.put(host)             # failed lane rejoins the rotation
+                tripped = _breaker(host, e)
+                if not tripped:
+                    free_lanes.put(host)         # failed lane rejoins the rotation
             if _storage_failure(e):
                 # Registry blips are global, so wait before re-dispatching.
                 # Sleep BEFORE taking the retry lane so no idle GPU is held
@@ -1353,6 +1466,13 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
                             "%.0fs before the retry", describe,
                             getattr(host, "name", host), STORAGE_RETRY_BACKOFF_SECONDS)
                 time.sleep(STORAGE_RETRY_BACKOFF_SECONDS)
+            known = getattr(free_lanes, "known_hosts", None)
+            if tripped and callable(known) and not known():
+                # The breaker took the pool's LAST lane: there is nothing to
+                # retry on — never block the leg on an empty pool.
+                with contextlib.suppress(Exception):
+                    e.lane_breaker = True
+                raise
             retry_host = _take()                 # next idle lane; different when one exists
             if transport:
                 # Never the dead pod again: a sibling lane handed back by a
@@ -1368,15 +1488,29 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
             log.warning("%s failed on %s (%s); retrying on %s", describe,
                         getattr(host, "name", host), e,
                         getattr(retry_host, "name", retry_host))
+            retry_tripped = False
             try:
                 entry = disp.dispatch(_ready(retry_host),
                                       lane_count=pod_lane_count(retry_host, hosts), **kw)
+            except Exception as e2:
+                if not _transport_failure(e2):
+                    retry_tripped = _breaker(retry_host, e2)
+                if (tripped or retry_tripped) and _lane_fault(e2):
+                    # The leg was a victim of a broken LANE: its caller
+                    # requeues it without the operator-fault backoff.
+                    with contextlib.suppress(Exception):
+                        e2.lane_breaker = True
+                raise
+            else:
+                _breaker(retry_host)
                 if used_host is not None:
                     used_host.append(retry_host)
                 return entry
             finally:
-                free_lanes.put(retry_host)
+                if not retry_tripped:
+                    free_lanes.put(retry_host)
         else:
+            _breaker(host)
             free_lanes.put(host)
             if used_host is not None:
                 used_host.append(host)
@@ -1542,8 +1676,10 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
         hard deadline (a hung provider API must not wedge the loop): reap
         generation VMs left billing (DEC-CA-0053), and age out harvested
         checkpoint copies nothing will read again."""
+        from .host_preflight import sync_host_blocklist
         from .runner_common import prune_harvest_dirs
 
+        sync_host_blocklist(self)            # [round] funded_host_blocklist → listings
         for what, fn in (("generation VM reap", self._reap_generation_vms),
                          ("corpus storage upkeep", self._maintain_generation_storage),
                          ("harvest prune", lambda: prune_harvest_dirs(self.work_root))):

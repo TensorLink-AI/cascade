@@ -39,6 +39,23 @@ def _no_live_credentials(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_host_quarantine(tmp_path, monkeypatch):
+    """Every test gets its own (empty) Lium host-quarantine file and an empty
+    permanent host blocklist: a quarantine one test records (a throughput
+    abort, a failed NCCL preflight, a lane join) must never leak into another
+    test's rent selection or lane gate — nor into the operator's real
+    ``~/.cache/cascade/lium_host_quarantine.json``. Tests that need a
+    specific file still ``monkeypatch.setenv`` it themselves."""
+    from cascade.provision import core as provision_core
+
+    monkeypatch.setenv(provision_core.LIUM_QUARANTINE_FILE_ENV,
+                       str(tmp_path / "_lium_host_quarantine.json"))
+    provision_core.set_host_blocklist(())
+    yield
+    provision_core.set_host_blocklist(())
+
+
+@pytest.fixture(autouse=True)
 def _no_secrets_marker():
     """A test that calls a trainer / validator ``main`` marks the pytest
     process as holding secrets (cascade.shared.sandbox_policy); never let
@@ -168,3 +185,16 @@ def _no_real_operator_orphan_sweep(monkeypatch):
 
     monkeypatch.setattr(_FundedPodMixin, "_sweep_operator_orphans",
                         lambda self, keep_ids, keep_payers: None)
+
+
+@pytest.fixture(autouse=True)
+def _ample_trainer_disk(monkeypatch):
+    """The trainer's free-disk guard ([round] min_free_disk_gb) reads the real
+    filesystem; keep every test hermetic against the box's actual free space.
+    Disk-guard tests install their own fake."""
+    from types import SimpleNamespace
+
+    from cascade.trainer import runner_common
+
+    monkeypatch.setattr(runner_common, "DISK_USAGE",
+                        lambda _p: SimpleNamespace(total=1 << 50, used=0, free=1 << 50))

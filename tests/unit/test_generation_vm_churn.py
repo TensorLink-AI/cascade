@@ -337,3 +337,49 @@ def test_a_leg_refused_by_shared_admission_never_reaches_generation(cfg, tmp_pat
                           contract, "", warm_start_ref=None)
     assert built == []
     assert failures and failures[0][2]["error_class"] == "no_capacity"
+
+
+def test_latest_safe_start_uses_the_wall_admission_budgeted(cfg, tmp_path, monkeypatch):
+    """2026-10-31: admission targeted a boundary with the measured SKU wall, but
+    this deadline subtracted the 5 h max_train_seconds cap, so no-corpus legs
+    hit 'past the latest safe start' for ~1.2 h of every 3 h cycle while the CPU
+    tier idled. Both now budget the same wall."""
+    from contextlib import contextmanager
+
+    from cascade.trainer import runner_funded_legs as rfl
+    from cascade.trainer.faults import _FundedLegSkip
+    from cascade.trainer.loop import ResolvedGenerator, TrainerRunner
+
+    r = TrainerRunner(cfg=cfg, base_trainer=object(), work_root=tmp_path, trainer_spec="m:C")
+    seen = []
+
+    class _Gate:
+        @contextmanager
+        def slot(self, limit, *, deadline=None, **kw):
+            seen.append(deadline)
+            yield False
+
+    r.__dict__["_funded_job_slots"] = _Gate()
+    from contextlib import nullcontext
+
+    from cascade.trainer import admission as adm
+    monkeypatch.setattr(adm, "owner_admission", lambda *a, **k: nullcontext())
+    end = time.time() + 40_000
+    r._leg_local.end_wall = end
+    monkeypatch.setattr(rfl, "leg_corpus", lambda *a, **k: {})
+    monkeypatch.setattr(r, "_leg_corpus_ready", lambda *a: False)
+    monkeypatch.setattr(r, "_leg_wall_seconds", lambda sku=None: 13_600.0)
+    monkeypatch.setattr(r, "_record_funded_failure", lambda *a, **k: None)
+    contract = replace(cfg.training, corpus_mode="shards", max_train_seconds=18_000)
+    with pytest.raises(_FundedLegSkip):
+        r._run_funded_leg(None, ResolvedGenerator("miner", 1, "ref"),
+                          SimpleNamespace(base_seed=1, generation_seed=2), 1,
+                          contract, "", warm_start_ref=None)
+    want = end - 13_600.0 - r.FUNDED_PUBLISH_MARGIN_SECONDS - r._generation_lead_seconds()
+    assert seen == [pytest.approx(want)]
+
+
+def test_generation_lead_is_the_window_plus_measured_overhead(cfg):
+    from cascade.trainer.runner_generation import _GenerationMixin
+
+    assert _GenerationMixin.GENERATION_OVERHEAD_SECONDS == 1800.0

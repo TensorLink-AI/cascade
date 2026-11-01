@@ -70,6 +70,16 @@ class GenerationInfraError(RuntimeError):
     miner's (capacity, boot, bootstrap, transfer). The leg requeues."""
 
 
+class GenerationYield(GenerationInfraError):
+    """A background (pre-generation) build gave up its place before renting:
+    a real leg wants the corpus, the seed epoch moved on, or pregen was
+    switched off. Nothing was rented; never a fault of anyone's."""
+
+# The FairSlots owner every background (pregen) build shares, so at most
+# ``[generation] pregen_max_parallel`` of them hold CPU slots at once.
+PREGEN_OWNER = "__pregen__"
+
+
 @dataclass
 class StageResult:
     index: dict
@@ -510,6 +520,8 @@ class GenerationStage:
                 except Exception:  # noqa: BLE001 — metadata logging cannot fail successful work
                     log.warning("generation completion metrics unavailable")
             return result
+        except GenerationYield:
+            raise                   # nothing ran: the leg's own attempt reports next
         except Exception as exc:
             self._emit("generator_fault" if isinstance(exc, GenerationFault) else "infra_fault")
             raise
@@ -520,7 +532,9 @@ class GenerationStage:
 
     def _generate(self, *, round_id: str, hotkey: str, uid: int | None, era: int | None,
                  gen_ref: str, repo_dir: Path | str, seed: int,
-                 priority: bool = False, min_channels: int | None = None) -> StageResult:
+                 priority: bool = False, min_channels: int | None = None,
+                 background: bool = False, cancel: Callable[[], bool] | None = None
+                 ) -> StageResult:
         from ..trainer.admission import FairSlots
 
         if not self.cfg.generation.enabled:
@@ -530,17 +544,37 @@ class GenerationStage:
         if reused is not None:
             return reused
         gate = self.__dict__.setdefault("_slots", FairSlots(clock=self.clock))
-        deadline = self.clock() + self.capacity_wait_s if self.capacity_wait_s > 0 else None
+        # A full tier is OUR cap, not a fault: the leg keeps its FIFO place
+        # (reveal order, select_field) until a slot frees. The old 30-min
+        # deadline requeued it with the operator back-off, so a later reveal
+        # took the freed slot while an earlier one sat out its back-off
+        # (2026-10-31). capacity_wait_s still bounds a sold-out MARKET
+        # (_wait_for_offer); a corpus finished after its boundary is reused.
+        deadline = None
         # The king (``priority``) is never capped by max_parallel_jobs: queueing
         # first could not preempt running challenger generations, so a full tier
         # failed the era's king leg (2026-10-30 23:00). It mirrors the GPU side,
         # where the king has its own reserved admission.
         from contextlib import nullcontext
 
-        admission = (nullcontext(True) if priority
-                     else gate.slot(lambda: self.cfg.generation.max_parallel_jobs,
-                                    deadline=deadline))
+        # A background (pregen) build only fills idle slots, never more than
+        # pregen_max_parallel of them, and steps aside for any waiting leg
+        # (FairSlots ``background``); it has no deadline — ``cancel`` ends it.
+        if background:
+            admission = gate.slot(lambda: self.cfg.generation.max_parallel_jobs,
+                                  background=True, owner=PREGEN_OWNER,
+                                  owner_limit=max(1, int(self.cfg.generation.pregen_max_parallel)),
+                                  cancel=cancel)
+        else:
+            admission = (nullcontext(True) if priority
+                         else gate.slot(lambda: self.cfg.generation.max_parallel_jobs,
+                                        deadline=deadline))
+            if not priority and gate.active >= max(1, int(self.cfg.generation.max_parallel_jobs)):
+                log.info("generation %s: all %d CPU slots busy — waiting in line (%d ahead)",
+                         hotkey[:12], gate.active, len(gate.waiters))
         with admission as acquired:
+            if not acquired and background:
+                raise GenerationYield("CPU pre-generation yielded before renting")
             if not acquired:
                 raise GenerationInfraError("CPU generation admission is full — requeued")
             return self._generate_admitted(round_id=round_id, hotkey=hotkey, uid=uid, era=era,

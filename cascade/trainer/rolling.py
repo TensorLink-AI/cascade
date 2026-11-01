@@ -785,6 +785,21 @@ class LegOps:
     def queue(self):
         return self.r._funded_queue()
 
+    # corpus pre-generation ([generation] pregen_enabled)
+    def pregen_ready(self, gen, era: EraState) -> bool:
+        """True when ``gen``'s leg in ``era`` needs no CPU build: the era's
+        contract streams (not ``shards``), the tier is off, or the corpus for
+        the era's seeds is already stored."""
+        contract = self._era_contract(era)
+        if (getattr(contract, "corpus_mode", "") != "shards"
+                or not self.r.cfg.generation.enabled):
+            return True
+        return bool(self.r._leg_corpus_ready(gen, self.r._rolling_seeds(era)))
+
+    def pregen_build(self, gen, era: EraState, *, cancel) -> str:
+        """Build that corpus now, at background priority on the CPU gate."""
+        return self.r._pregen_leg_corpus(gen, self.r._rolling_seeds(era), cancel=cancel)
+
     def burned(self, block: int) -> set[str]:
         """Hotkeys that already used this round's one submission (a round is
         one settlement step of the grid in force)."""
@@ -868,6 +883,14 @@ class RollingScheduler:
         self._idle_released: set[int] = set()   # eras whose idle king pod was released early
         self._started = False
         self._reconciled_at = 0.0               # last periodic in-flight/pod reconcile
+        # Corpus pre-generation (see _pregen_tick), keyed (hotkey, base_seed, ref).
+        self._intake_history: list | None = None    # the last intake's commitments
+        self._pregen_threads: dict[tuple, threading.Thread] = {}
+        self._pregen_done: set[tuple] = set()       # corpus stored/built: never again
+        self._pregen_retry: dict[tuple, tuple[int, float]] = {}  # failures, next try
+        self._pregen_probe_at: dict[tuple, float] = {}  # next not-ready re-probe
+        self._pregen_seeds: set[int] = set()        # base seeds pregen may build for
+        self._pregen_broke: set[int] = set()        # seeds whose budget-out was logged
         # The ONE background lane-B settlement (DEC-CA-0050): {"rid", "thread",
         # "started", "digest", "error"} — off the tick thread, still ordered
         # before its lane-A manifest (see _lane_b_settle).
@@ -925,6 +948,7 @@ class RollingScheduler:
         self._drain_verifies()
         self._release_idle_king_pods()
         self._chain_step("intake", self._intake, client, block, now)
+        self._pregen_tick(client, block, now)
         self._chain_step("reconcile", self._maybe_reconcile, client, block, now)
         self._lane_b_tick(block)
         self._lane_c_tick(block)
@@ -1157,19 +1181,38 @@ class RollingScheduler:
     # ── startup / restart ────────────────────────────────────────────────────
 
     def _startup(self, client, block: int) -> None:
-        """Restart re-entry: keep the pods of in-flight legs and both era king
-        pods, re-attach every in-flight leg (a persisted completed leg is
-        reused, never retrained), sweep everything else."""
+        """Restart re-entry: re-attach every in-flight leg (a persisted
+        completed leg is reused, never retrained), THEN sweep — keeping both
+        era king pods and the pod of every leg still in flight or running here.
+
+        The order is load-bearing (2026-10-31: three restarts cut live funded
+        pods): the sweep's keep-set is computed from what the re-attach pass
+        actually left in flight, never from a guess made before it. The pod
+        sweep itself also probes every candidate pod and keeps any with a live
+        worker or an unharvested finished run (``_sweep_keeps_pod``)."""
         keep_ids = tuple(str(e.base_seed) for e in (self.state.current, self.state.next) if e)
         self._seed_chain_root()
+        self._warm_identities(client)
         queue = self.ops.queue()
         flights = queue.in_flight() if queue is not None else []
         done = {(f.hotkey, f.ref) for f in self.state.finished}
         dead = self._dead_era_flights(client, flights, done, block)
-        self.ops.sweep_pods(keep_round_ids=keep_ids,
-                            keep_payers=({e.hotkey for e in flights} - set(dead))
-                            | self._king_own_key_payers(live_only=False))
         self._reattach_flights(client, block, queue, flights, done, dead)
+        still = {e.hotkey for e in queue.in_flight()} if queue is not None else set()
+        keep = ((still | set(self._threads)) - set(dead))
+        keep |= self._lane_c_live() | self._lane_b_live()
+        keep |= self._king_own_key_payers(live_only=False)
+        self.ops.sweep_pods(keep_round_ids=keep_ids, keep_payers=keep)
+
+    def _warm_identities(self, client) -> None:
+        """Best-effort chain read of the commitments before any re-attach, so
+        the coldkey identity cache (admission.remember_owners) is fresh; the
+        persisted cache and the re-attach bypass cover a failed read."""
+        try:
+            self.ops.commitments(client)
+        except Exception as e:  # noqa: BLE001 — never blocks the restart
+            log.warning("rolling: startup commitments read failed (%s) — re-attach "
+                        "proceeds on the persisted coldkey identities", e)
 
     def _maybe_reconcile(self, client, block: int, now: float) -> None:
         """Every ``RECONCILE_SECONDS``: the startup re-entry for a LIVE
@@ -1227,8 +1270,9 @@ class RollingScheduler:
                 # landed: the leg can never be judged (a leg that finishes
                 # after its era is requeued at finish anyway), so re-attaching
                 # only bills the payer for a second run — or a fresh pod when
-                # the first is gone. Pod released by the sweep above; requeue
-                # unburned now.
+                # the first is gone. Requeued unburned now; its pod is released
+                # by the sweep that follows (unless the pod still holds a live
+                # worker or an unharvested run — then it is kept, loudly).
                 log.warning("rolling: in-flight leg %s belongs to era %d, which ended at "
                             "block %d (now %d) — it can never be judged; pod released, "
                             "requeued unburned", e.hotkey[:12], era_idx, era_end, int(block))
@@ -2096,8 +2140,10 @@ class RollingScheduler:
         try:
             history = self.ops.commitments(client)
         except Exception as e:  # noqa: BLE001
+            self._intake_history = None
             log.warning("rolling: commitments unavailable (%s); intake waits", e)
             return
+        self._intake_history = history        # _pregen_tick reads the same reveals
         from ..validator.loop import ref_as_of
 
         # Pending reveals promote from chain truth (the intake's backstop).
@@ -2221,6 +2267,191 @@ class RollingScheduler:
             self._launch_leg(gen, era, block, adm.target_boundary, entry.label)
         if held:
             queue.touch(held)
+
+    # ── corpus pre-generation ────────────────────────────────────────────────
+
+    PREGEN_LEDGER = "pregen_spend.json"
+    PREGEN_RETRY_SECONDS = 1800.0          # first retry after a failed pregen; doubles
+    PREGEN_RETRY_MAX_SECONDS = 6 * 3600.0
+    PREGEN_PROBE_SECONDS = 600.0           # re-probe a missing corpus at most this often
+
+    def _pregen_tick(self, client, block: int, now: float) -> None:
+        """``[generation] pregen_enabled``: start the CPU build of every queued,
+        revealed entry's corpus now, in reveal order, instead of only inside
+        its admitted leg — entries waiting on GPU capacity, the coldkey rule
+        or the latest-safe-start deadline otherwise leave the CPU tier idle.
+        No GPU admission, deadline or coldkey gate applies (CPU only,
+        operator-billed); the stage caps it at ``pregen_max_parallel`` slots
+        that real legs always jump, and ``pregen_max_usd_per_epoch`` bounds
+        the spend per base seed. Opportunistic: a failure is logged and
+        retried with back-off, never charged to the entry. Never raises."""
+        try:
+            self._pregen_pass(client, int(block), float(now))
+        except Exception as e:  # noqa: BLE001 — pregen must never sink the tick
+            log.warning("rolling: corpus pregen pass failed (%s)", e)
+
+    def _pregen_active(self, key: tuple) -> bool:
+        """Whether a pregen of ``key`` may still start (checked while it waits
+        for a CPU slot): on, and its base seed still current or next."""
+        g = self.cfg.generation
+        return bool(g.enabled and g.pregen_enabled and int(key[1]) in self._pregen_seeds)
+
+    def _pregen_pass(self, client, block: int, now: float) -> None:
+        cur, nxt = self.state.current, self.state.next
+        seeds = {int(e.base_seed) for e in (cur, nxt) if e is not None}
+        gone = self._pregen_seeds - seeds
+        self._pregen_seeds = seeds
+        if gone:
+            # A new seed epoch: corpora of the old base seed will never train.
+            # Waiting builds step aside (_pregen_active); running ones finish.
+            log.info("rolling: seed epoch moved on — pregen stops for base seed(s) %s",
+                     sorted(gone))
+            with self._lock:
+                for keep in (self._pregen_done, self._pregen_retry, self._pregen_probe_at):
+                    for key in [k for k in keep if int(k[1]) in gone]:
+                        if isinstance(keep, set):
+                            keep.discard(key)
+                        else:
+                            keep.pop(key, None)
+        gcfg = self.cfg.generation
+        if not (gcfg.enabled and gcfg.pregen_enabled) or cur is None:
+            return
+        history = self._intake_history
+        queue = self.ops.queue()
+        if queue is None or history is None:
+            return
+        if ((self.cfg.v2.commit_open_at_utc or self.cfg.v2.commit_from_block)
+                and (not self.cfg.v2.active(block) or not self.cfg.v2.commit_from_block)):
+            return                    # entries held for the v2 launch (see _intake)
+        from ..funding.queue import select_field
+        from ..validator.loop import ref_as_of
+
+        rnd = self.cfg.round
+        burned = self.ops.burned(block)
+        blocked = rnd.blocked_at(block) if hasattr(rnd, "blocked_at") else frozenset()
+        wall, margin = self.ops.wall_seconds(), self.ops.margin_seconds()
+        for entry in select_field(queue.entries(), cap=0):   # (reveal_block, hotkey)
+            with self._lock:
+                if len(self._pregen_threads) >= int(gcfg.pregen_max_parallel):
+                    return
+            hk = entry.hotkey
+            # A live leg builds its own corpus; burned/blocked entries never
+            # train; the king's legs carry their own channel floor and priority.
+            if (hk in self._threads or hk in burned or hk in blocked
+                    or hk == cur.king_hotkey or ref_as_of(history, hk, block) != entry.ref):
+                continue
+            # The seeds the leg would actually train under: the era it would
+            # admit into (the next one's only once that era is prepared).
+            adm = admit(rnd, block_now=block, now=now,
+                        wall_seconds=self._leg_walls().fit_wall(entry.ref, wall),
+                        margin_seconds=margin + self._bench_margin(), current_era=cur.index)
+            era = self._era_state_for(adm.era_index)
+            if era is None:
+                continue
+            key = (hk, int(era.base_seed), entry.ref)
+            with self._lock:
+                if (key in self._pregen_threads or key in self._pregen_done
+                        or now < self._pregen_retry.get(key, (0, 0.0))[1]
+                        or now < self._pregen_probe_at.get(key, 0.0)):
+                    continue
+            gen = ResolvedGen(hk, -1, entry.ref, entry.reveal_block)
+            if self.ops.pregen_ready(gen, era):
+                with self._lock:
+                    self._pregen_done.add(key)
+                continue
+            self._pregen_probe_at[key] = now + self.PREGEN_PROBE_SECONDS
+            cost = self._pregen_cost_usd()
+            if not self._pregen_charge(key[1], cost):
+                if key[1] not in self._pregen_broke:
+                    self._pregen_broke.add(key[1])
+                    log.warning("rolling: pregen budget for base seed %d exhausted "
+                                "($%.2f per epoch) — no new pregen this seed epoch",
+                                key[1], float(gcfg.pregen_max_usd_per_epoch))
+                continue
+            gen = ResolvedGen(hk, self._uid_of(client, hk), entry.ref, entry.reveal_block)
+            self._start_pregen(key, gen, era, cost)
+
+    def _start_pregen(self, key: tuple, gen, era: EraState, cost: float) -> None:
+        from ..generation.stage import GenerationFault, GenerationYield
+
+        def _run() -> None:
+            outcome = "failed"
+            try:
+                outcome = self.ops.pregen_build(gen, era, cancel=lambda: not self._pregen_active(key))
+                if outcome in ("built", "cached"):
+                    with self._lock:
+                        self._pregen_done.add(key)
+                        self._pregen_retry.pop(key, None)
+                log.info("rolling: pregen %s (base seed %d): %s", gen.hotkey[:12], key[1],
+                         outcome)
+            except GenerationYield:
+                outcome = "yielded"
+                log.info("rolling: pregen %s stepped aside before renting (a leg wants the "
+                         "corpus, or the seed epoch moved on)", gen.hotkey[:12])
+            except GenerationFault as e:
+                # The miner's generator faulted: its own leg judges that, once.
+                with self._lock:
+                    self._pregen_retry[key] = (1, float("inf"))
+                log.warning("rolling: pregen %s hit a generator fault (%s) — not retried; "
+                            "the entry is untouched, its leg decides", gen.hotkey[:12],
+                            error_tail(str(e), 200))
+            except Exception as e:  # noqa: BLE001 — opportunistic: never the entry's
+                with self._lock:
+                    n = self._pregen_retry.get(key, (0, 0.0))[0] + 1
+                    wait = min(self.PREGEN_RETRY_SECONDS * 2 ** (n - 1),
+                               self.PREGEN_RETRY_MAX_SECONDS)
+                    self._pregen_retry[key] = (n, self.clock() + wait)
+                log.warning("rolling: pregen %s failed (%s) — retry in %.0fs; the entry is "
+                            "untouched", gen.hotkey[:12], error_tail(str(e), 200), wait)
+            finally:
+                if outcome in ("busy", "cached", "yielded"):
+                    self._pregen_charge(key[1], -cost)        # nothing was rented
+                with self._lock:
+                    self._pregen_threads.pop(key, None)
+
+        t = threading.Thread(target=_run, name=f"pregen-{gen.hotkey[:12]}", daemon=True)
+        with self._lock:
+            self._pregen_threads[key] = t
+        t.start()
+        log.info("rolling: pregen %s's corpus (era %d, base seed %d, est. $%.2f)",
+                 gen.hotkey[:12], era.index, key[1], cost)
+
+    def _pregen_cost_usd(self) -> float:
+        """One pregen build's estimated cost: the price ceiling over the
+        longest window plus the VM's boot/upload overhead (an upper bound;
+        the stage does not report the rented price)."""
+        from .runner_generation import _GenerationMixin
+
+        g = self.cfg.generation
+        hours = (float(g.max_window_seconds) + _GenerationMixin.GENERATION_OVERHEAD_SECONDS) / 3600.0
+        return float(g.max_price_per_hour) * hours
+
+    def _pregen_charge(self, base_seed: int, usd: float) -> bool:
+        """Book ``usd`` (negative refunds) against ``base_seed``'s pregen budget
+        in ``<work_root>/pregen_spend.json``; False — nothing booked — when a
+        charge would exceed ``pregen_max_usd_per_epoch``. Survives restarts.
+        An unreadable ledger reads as empty (the cap is an estimate)."""
+        path = Path(self.r.work_root) / self.PREGEN_LEDGER
+        budget = float(self.cfg.generation.pregen_max_usd_per_epoch)
+        with self._lock:
+            try:
+                spend = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(spend, dict):
+                    spend = {}
+            except (OSError, ValueError):
+                spend = {}
+            spent = float(spend.get(str(base_seed), 0.0) or 0.0)
+            if usd > 0 and spent + usd > budget + 1e-9:
+                return False
+            spend.pop(str(base_seed), None)
+            spend[str(base_seed)] = max(0.0, round(spent + usd, 6))
+            while len(spend) > 8:                     # old seed epochs
+                spend.pop(next(iter(spend)))
+            try:
+                write_text_atomic(path, json.dumps(spend, sort_keys=False))
+            except OSError as e:
+                log.warning("rolling: pregen spend ledger unwritable (%s)", e)
+            return True
 
     def _vault_owned_ok(self, gen) -> bool:
         from ..funding.store import parse_vault_ref
@@ -2356,6 +2587,12 @@ class RollingScheduler:
                     *, resumed: bool = False) -> None:
         if gen.hotkey in self._threads:
             return
+        if resumed:
+            # Admitted by the previous process: owner admission must not refuse
+            # it for a cold identity cache (admission.owner_admission).
+            from .admission import mark_admitted
+
+            mark_admitted(self.r, gen.hotkey)
         queue = self.ops.queue()
         end_wall = wall_of_block(target, now=self.clock(), block_now=block)
         t_launch = self.clock()
@@ -2462,6 +2699,10 @@ class RollingScheduler:
                 log.warning("rolling: %s's leg failed [%s]: %s", gen.hotkey[:12],
                             error_class, error_tail(msg or str(e), 200))
             finally:
+                if resumed:
+                    from .admission import clear_admitted
+
+                    clear_admitted(self.r, gen.hotkey)
                 self._threads.pop(gen.hotkey, None)
 
         t = threading.Thread(target=_run, name=f"leg-{gen.hotkey[:12]}", daemon=True)

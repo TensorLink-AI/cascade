@@ -74,6 +74,25 @@ class _LaneDeadlinePassed(Exception):
     and starting hours late."""
 
 
+class _NoOperatorLanes(_LaneDeadlinePassed):
+    """The lane pool has ZERO live lanes (all removed from hosts.toml, drained,
+    refused or breaker-held): waiting can never be served. The leg requeues
+    as ``no_capacity`` (unburned, no backoff) and its next try takes the
+    rent path — an operator pod for an operator-billed entry, the miner's
+    own key for a miner-funded one."""
+
+
+def record_no_lanes_verdict(runner, hotkey: str, exc: BaseException) -> bool:
+    """Record the ``no_capacity`` verdict for a leg that found no live
+    operator lane (``_NoOperatorLanes``); returns True when it did."""
+    if not isinstance(exc, _NoOperatorLanes):
+        return False
+    runner._record_funded_failure(
+        hotkey, f"no operator lanes left — requeued without backoff; the next try rents "
+        f"({exc})", miner_fault=False, error_class="no_capacity", burn=False)
+    return True
+
+
 def _http_status_in_chain(exc: BaseException | None) -> int | None:
     """First HTTP status code found walking an exception's cause chain."""
     seen: set[int] = set()
@@ -140,6 +159,19 @@ def _transport_failure(exc: BaseException) -> bool:
     if isinstance(exc, subprocess.CalledProcessError):
         return exc.returncode == 255
     return "Connection refused" in str(exc)
+
+
+def _lane_fault(exc: BaseException) -> bool:
+    """Whether a lane dispatch failure counts against the LANE (the circuit
+    breaker): an operator-side fault of that lane — a config error (rc 2),
+    a crashed worker, a throughput abort. Never the miner's own faults
+    (rc 3, tamper, a diverged checkpoint), never a storage-layer blip (global,
+    not the lane's) and never a transport loss (the dead-pod drain owns it)."""
+    if isinstance(exc, (_FundedTamper, _FundedDiverged, _LaneDeadlinePassed)):
+        return False
+    if getattr(exc, "returncode", None) == 3:
+        return False
+    return not (_storage_failure(exc) or _transport_failure(exc))
 
 
 def _quarantine_lane_host(host, reason: str) -> None:
