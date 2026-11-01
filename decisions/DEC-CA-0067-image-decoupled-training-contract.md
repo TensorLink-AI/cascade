@@ -197,6 +197,36 @@ DEC-CA-0049.
     overrides, so the same two typed lines must be applied to it by hand. That
     edit is Approve-tier and is not part of this PR.
 
+## Automatic image repin at the switch
+
+The trainer-only `[v2] *_after` pins schedule the image change onto the same
+block, so no hand repin is needed:
+- `train_image_digest_after`, `funded_pod_image_after`,
+  `worker_code_fingerprint_after`, and `funded_sku_wall_measured_image_after`
+  while the wall gate is on.
+- They are loaded as one release: all set or none, and the pod image and the
+  training image must name the same digest.
+
+How they apply:
+- `train_image_digest_after` is bound onto the v2 contract as a schedule. It is
+  never in any digest (`_NEVER_IN_DIGEST`). `TrainingContractConfig.at_block`
+  of an era starting at or after the resolved switch pins it; earlier eras pin
+  the current image.
+- Every leg's contract therefore carries its era's image. The `[round]` pins
+  for rents follow the leg's contract (`cascade.trainer.leg_pins.leg_round`).
+- While the after pins are configured, a dispatcher hook does two things:
+  - it checks each host's worker-code fingerprint against the leg's era pin, so
+    a host on the other image never takes the leg;
+  - for a post-switch leg, it pushes a deployed chain.toml with the after pins
+    substituted, so a worker of any release (rc16 predates this change)
+    resolves the same contract digest.
+- The pre-switch pin is proven automatically.
+- Nothing changes before the switch resolves. The validator side is untouched:
+  the image is outside consensus from the same block.
+
+The operator lines for rc16 are in docs/OPERATOR.md, "Automatic image repin at
+the switch".
+
 ## Procedure
 
 1. Release this change: validators, trainer and audit together. Nothing changes
@@ -208,8 +238,8 @@ DEC-CA-0049.
    `v2b-` segment and no longer show the forfeit or margin-v2 segments).
 4. The vote locks in when `threshold` is reached. `status/chain.json`
    `activation.image_decoupled` shows the lock and the switch era start.
-5. Once the switch era has started, append the current image pin to
-   `[v2] prior_train_image_digests`, then repin the worker image
-   (OPERATOR.md, "Re-pinning the image inside a v2 seed epoch").
+5. Either set the `[v2] *_after` pins before the switch (automatic, no restart
+   at the switch), or, once the switch era has started, append the current pin
+   to `[v2] prior_train_image_digests` and repin by hand (OPERATOR.md).
 6. If you need to stop the switch before lock-in: ship a release without the
    segment, or type an override.

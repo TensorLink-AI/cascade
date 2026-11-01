@@ -118,6 +118,18 @@ class V2Config:
     # these (cascade.shared.manifest.prove_numerics_digest). Append the OLD
     # pin here when re-pinning the image.
     prior_train_image_digests: tuple[str, ...] = ()
+    # DEC-CA-0067 AUTOMATIC image repin at the switch (TRAINER-ONLY, never
+    # consensus; all-or-none, load-checked as one release): legs of eras
+    # starting at or after ``image_decoupled_from_block`` run these pins —
+    # the [v2.training] image (bound onto the v2 contract as a schedule), the
+    # rented pod image, the worker code fingerprint and the image the SKU wall
+    # table was measured on (required when ``[round]
+    # funded_sku_wall_measured_image`` is set). Earlier eras keep the current
+    # pins. "" = no automatic repin (every pin byte-identical).
+    train_image_digest_after: str = ""
+    funded_pod_image_after: str = ""
+    worker_code_fingerprint_after: str = ""
+    funded_sku_wall_measured_image_after: str = ""
     # Emission burns (CONSENSUS on the weight vector, see
     # cascade.shared.emission). ``prelaunch_burn``: the fraction of every
     # pre-v2 vector sent to ``burn_uid`` by a validator on this release.
@@ -350,6 +362,7 @@ def parse_v2_economics(v2raw: dict) -> dict:
     out["bench_gate_v2_from_block"] = parse_bench_gate_v2_from_block(v2raw)
     out["prior_train_image_digests"] = _parse_prior_images(
         v2raw.get("prior_train_image_digests", []))
+    out.update(parse_image_after(v2raw))
     out["bench_source"], out["bench_source_from_block"] = parse_bench_source(v2raw)
     out.update(parse_bench_source_bounds(v2raw))
     ladder = v2raw.get("king_ladder", False)
@@ -389,6 +402,57 @@ def parse_v2_economics(v2raw: dict) -> dict:
     out["ladder_start_tiers"] = parse_ladder_start_tiers(
         v2raw.get("ladder_start_tiers", LADDER_START_TIERS),
         fail_bp=lad["ladder_fail_bp"], cap_bp=lad["ladder_cap_bp"])
+    return out
+
+
+IMAGE_AFTER_KEYS = ("train_image_digest_after", "funded_pod_image_after",
+                    "worker_code_fingerprint_after", "funded_sku_wall_measured_image_after")
+
+
+def parse_image_after(v2raw: dict) -> dict:
+    """The DEC-CA-0067 ``*_after`` pins, validated as ONE release: the image,
+    the pod image and the code fingerprint all set or all empty; both images
+    pinned by digest and naming the same digest; the fingerprint 64 hex; the
+    wall image a digest (or empty). Cross-section checks (the v2 contract, the
+    measured-wall gate) run in the loader."""
+    import re
+
+    out = {}
+    for k in IMAGE_AFTER_KEYS:
+        v = v2raw.get(k, "")
+        if not isinstance(v, str):
+            raise ValueError(f"[v2] {k} must be a string; got {v!r}")
+        out[k] = v.strip()
+    out["worker_code_fingerprint_after"] = out["worker_code_fingerprint_after"].lower()
+    core = [out[k] for k in IMAGE_AFTER_KEYS[:3]]
+    if any(core) and not all(core):
+        raise ValueError("[v2] train_image_digest_after, funded_pod_image_after and "
+                         "worker_code_fingerprint_after must be set together (one release) "
+                         "or all left empty")
+    if not any(core):
+        if out["funded_sku_wall_measured_image_after"]:
+            raise ValueError("[v2] funded_sku_wall_measured_image_after needs the other "
+                             "*_after pins")
+        return out
+    digest = re.compile(r"(?:^|@)(sha256:[0-9a-f]{64})$")
+    m_train = digest.search(out["train_image_digest_after"].lower())
+    m_pod = digest.search(out["funded_pod_image_after"].lower())
+    if m_train is None or m_pod is None or "@" not in out["funded_pod_image_after"]:
+        raise ValueError("[v2] train_image_digest_after must be sha256:<64 hex> (or a "
+                         "…@sha256: ref) and funded_pod_image_after a digest-pinned image "
+                         "ref (…@sha256:<64 hex>)")
+    if m_train.group(1) != m_pod.group(1):
+        raise ValueError("[v2] funded_pod_image_after and train_image_digest_after must name "
+                         "the same image digest")
+    if not re.fullmatch(r"[0-9a-f]{64}", out["worker_code_fingerprint_after"]):
+        raise ValueError("[v2] worker_code_fingerprint_after must be 64 hex")
+    wall = out["funded_sku_wall_measured_image_after"]
+    if wall:
+        mw = digest.search(wall.lower())
+        if mw is None:
+            raise ValueError("[v2] funded_sku_wall_measured_image_after must be "
+                             "sha256:<64 hex> or a …@sha256: ref")
+        out["funded_sku_wall_measured_image_after"] = mw.group(1)
     return out
 
 

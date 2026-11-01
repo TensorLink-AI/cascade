@@ -697,8 +697,11 @@ def apply_image_decoupled_activation(cfg: ChainConfig, block: int) -> ChainConfi
     if block % int(era_length_blocks(cfg.round, block - 1)):
         raise ValueError(f"image-decoupled block {block} is not an era start (DEC-CA-0067 "
                          "switches the rule only at a fresh era)")
-    return replace(cfg, v2=replace(cfg.v2, image_decoupled_from_block=block),
-                   activation=replace(cfg.activation, resolved_image_decoupled_block=block))
+    from .config.chain_config import bind_image_after
+
+    return bind_image_after(replace(
+        cfg, v2=replace(cfg.v2, image_decoupled_from_block=block),
+        activation=replace(cfg.activation, resolved_image_decoupled_block=block)))
 
 
 def apply_activation(cfg: ChainConfig, block: int) -> ChainConfig:

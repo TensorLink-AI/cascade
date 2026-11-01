@@ -366,3 +366,23 @@ def assert_launch_ready(cfg: ChainConfig, *, role: str) -> None:
         raise LaunchConfigError(
             "chain.toml is not launch-ready:\n  - " + "\n  - ".join(problems)
         )
+
+
+def bind_image_after(cfg):
+    """DEC-CA-0067: bind ``[v2] train_image_digest_after`` and the switch
+    block (``[v2] image_decoupled_from_block``, typed or resolved) onto the v2
+    contract as its image schedule, so :meth:`TrainingContractConfig.at_block`
+    of every era from the switch pins the after image (and every earlier era
+    the current one). Returns ``cfg`` itself when nothing changes."""
+    v2 = getattr(cfg, "v2", None)
+    t = cfg.training
+    c = getattr(t, "v2_contract", None)
+    if v2 is None or c is None:
+        return cfg
+    img = str(getattr(v2, "train_image_digest_after", "") or "")
+    gate = int(getattr(v2, "image_decoupled_from_block", 0) or 0) if img else 0
+    if (c.train_image_digest_after, c.train_image_after_block) == (img, gate):
+        return cfg
+    return replace(cfg, training=replace(t, v2_contract=replace(
+        c, train_image_digest_after=img, train_image_after_block=gate)))
+

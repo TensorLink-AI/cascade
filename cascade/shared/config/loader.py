@@ -768,4 +768,16 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
             v2_from_block=_v2_from, lane_c_from_block=int(cfg.lane_c.from_block),
             validator_bench_from=(_bs if str(cfg.v2.bench_source) == "validator" else 0),
             owner_hotkey=str(cfg.netconfig.owner_hotkey or ""))
-    return cfg
+    # DEC-CA-0067 automatic image repin: the *_after pins are one release for
+    # the v2 contract; a measured-wall gate in force needs the after image's
+    # measured walls too (else every post-switch rent would be refused).
+    if cfg.v2.train_image_digest_after:
+        if cfg.training.v2_contract is None:
+            raise ValueError("[v2] train_image_digest_after needs a [v2.training] contract")
+        if (cfg.round.funded_sku_wall_measured_image
+                and not cfg.v2.funded_sku_wall_measured_image_after):
+            raise ValueError("[v2] funded_sku_wall_measured_image_after is required while "
+                             "[round] funded_sku_wall_measured_image gates rents")
+    from .chain_config import bind_image_after
+
+    return bind_image_after(cfg)

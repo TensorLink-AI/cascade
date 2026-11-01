@@ -126,6 +126,9 @@ _NEVER_IN_DIGEST: frozenset[str] = frozenset({
     "router_slow",
     # DEC-CA-0053 scheduled context growth: a schedule like DEC-CA-0047's.
     "context_length_after", "context_length_after_block",
+    # DEC-CA-0067 automatic image repin: a schedule like DEC-CA-0047's — the
+    # effective contract at a block carries the pin itself.
+    "train_image_digest_after", "train_image_after_block",
 })
 
 _DIGEST_DROP_WHEN_DEFAULT: dict[str, tuple] = {

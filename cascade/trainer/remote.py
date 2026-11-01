@@ -1684,6 +1684,10 @@ class RemoteDispatcher:
     # Where a failed leg's fetched stdout/stderr tails are saved on the
     # orchestrator box (save_failed_leg_evidence); None = not saved.
     evidence_dir: str | None = None
+    # DEC-CA-0067: ``host_hook(host, contract_block) -> host`` run before every
+    # dispatch (cascade.trainer.leg_pins.dispatch_host_hook) — installed only
+    # while an automatic image repin is configured; None = unchanged dispatch.
+    host_hook: object = field(default=None, repr=False)
     _runner: object = field(default=None, repr=False)  # injectable for tests
 
     def dispatch(
@@ -1716,6 +1720,9 @@ class RemoteDispatcher:
         cancel = cancel if cancel is not None else self.cancel_event
         if cancel is not None and cancel.is_set():
             raise RemoteDispatchError("redundant king replica cancelled", returncode=254)
+        if self.host_hook is not None:
+            # the leg's era image: right worker code, right deployed config
+            host = self.host_hook(host, contract_block)
         auto_harvest = False
         if host.isolated and not local_checkpoint:
             if self.harvest is None:

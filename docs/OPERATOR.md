@@ -259,6 +259,46 @@ the lock-in:
 5. Verify that the next settlement keeps the king (`numerics proven` at INFO in
    trainer.log) and that the validators accept it.
 
+### Automatic image repin at the switch (DEC-CA-0067)
+
+Instead of the hand repin above, the trainer can switch images by itself at the
+switch era. Set these in the deployed chain.toml `[v2]`, all together:
+
+```toml
+train_image_digest_after = "sha256:34375845b2c4412ccd8462a6e9ca5ad78837567115bc7f9b56320458ba991409"
+funded_pod_image_after = "ghcr.io/tensorlink-ai/cascade-worker:worker-v2.0.0-rc16@sha256:34375845b2c4412ccd8462a6e9ca5ad78837567115bc7f9b56320458ba991409"
+worker_code_fingerprint_after = "5fe6ed7c0f0d5305b6101e589aab50b2ca5a76573cbc7afb3f44bc7354ce8fd0"
+# only while [round] funded_sku_wall_measured_image is set:
+# funded_sku_wall_measured_image_after = "sha256:<the image the walls were measured on>"
+```
+
+These values are rc16. The repo chain.toml ships them empty.
+
+What changes, and when:
+- Nothing changes until the vote resolves the switch (or a typed
+  `image_decoupled_from_block`). Every pin, file and dispatch stays
+  byte-identical.
+- Legs of eras starting at or after the switch get the after pins: rented pod
+  image, worker-code check, wall gate, the `[v2.training]` image in the leg's
+  contract, and a deployed chain.toml with those pins substituted
+  (`chain.deployed.after.toml`).
+- Legs of earlier eras keep the current pins, and in-flight legs keep their
+  image.
+- Before every dispatch, the worker-code fingerprint of each lane and pod is
+  checked against the leg's era pin. A host on the other image never takes the
+  leg.
+- The pre-switch pin joins the numerics proof automatically, so the carried
+  king is kept without editing `prior_train_image_digests`.
+- No trainer restart is needed at the switch.
+
+Gaps:
+- The provisioner's lane health gate still checks the current pins. Bring
+  post-switch lanes up on rc16 by hand, or update hosts.toml.
+- An era-kept king pod is reused within one seed epoch. If the king must
+  retrain after the switch, the hook refuses the old pod; retire it.
+- Continuation for post-switch legs only, in the same step, is a follow-up:
+  `[round] ops_continuation_*` is global.
+
 ### Enabling continuation after the switch (DEC-CA-0067)
 
 `continuation_protocol` is excluded from the numerics digest along with the

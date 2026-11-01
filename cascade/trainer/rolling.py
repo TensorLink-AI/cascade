@@ -1376,6 +1376,11 @@ class RollingScheduler:
         contract = self.cfg.training.at_block(int(era.start_block))
         priors = tuple(getattr(getattr(self.cfg, "v2", None), "prior_train_image_digests", ())
                        or ())
+        base = getattr(self.cfg.training, "v2_contract", None)
+        if base is not None and base.train_image_digest_after:
+            # DEC-CA-0067 automatic repin: the pre-switch pin is a known prior
+            # (a leg trained before the switch keeps its numerics, no edit)
+            priors = (*priors, str(base.train_image_digest))
         return prove_numerics_digest(contract, str(digest or ""), priors)
 
     def _stale_contract(self, era):

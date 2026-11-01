@@ -537,3 +537,25 @@ def v2_eval_windows_at(cfg: Any, boundary: int | None) -> int:
     if after and image_decoupled_at(cfg, boundary):
         return after
     return int(getattr(v2, "eval_n_windows", 0) or 0)
+
+
+def image_after_armed(cfg: Any) -> bool:
+    """DEC-CA-0067: an automatic image repin is configured (``[v2]
+    train_image_digest_after`` and its companion pins)."""
+    return bool(str(getattr(getattr(cfg, "v2", None), "train_image_digest_after", "") or ""))
+
+
+def round_pins_at(cfg: Any, era_start: int | None) -> Any:
+    """The ``[round]`` image pins a leg of the era starting at ``era_start``
+    runs under: the ``[v2] *_after`` pins from the DEC-CA-0067 switch on
+    (:func:`image_decoupled_era`), else ``cfg.round`` itself (same object —
+    byte-identical while no repin is configured or the switch is unresolved)."""
+    from dataclasses import replace as _replace
+
+    if not image_after_armed(cfg) or not image_decoupled_era(cfg, era_start):
+        return cfg.round
+    v2 = cfg.v2
+    return _replace(cfg.round, funded_pod_image=str(v2.funded_pod_image_after),
+                    worker_code_fingerprint=str(v2.worker_code_fingerprint_after),
+                    funded_sku_wall_measured_image=str(
+                        v2.funded_sku_wall_measured_image_after or ""))

@@ -1202,6 +1202,16 @@ eval_n_windows_after = 4000
 # can PROVE a pre-repin leg differs only in its image. Append the old pin here
 # when re-pinning.
 prior_train_image_digests = []
+# DEC-CA-0067 AUTOMATIC image repin at the switch (TRAINER-ONLY; one release,
+# all-or-none, load-checked): legs of eras from the resolved switch run these
+# pins (pod image, v2.training image, worker code fingerprint, and the image the
+# SKU walls were measured on — required while [round]
+# funded_sku_wall_measured_image is set); earlier eras keep the current pins.
+# The pre-switch pin joins the numerics proof automatically. Empty = off.
+train_image_digest_after = ""
+funded_pod_image_after = ""
+worker_code_fingerprint_after = ""
+funded_sku_wall_measured_image_after = ""
 # Margin-tiered start share (owner 2026-10-20, CONSENSUS, overlay-settable):
 # a king crowned at an INCREMENT-unit settlement starts at the start_bp of the
 # highest [lcb_threshold, start_bp] tier its crowning LCB (the family-wise
