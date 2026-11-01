@@ -332,6 +332,9 @@ def _run(gang, rank, world):
         optimizer.rank = rank
         sync = object.__new__(Gang)
         sync.dist, sync._sources = gang.dist, state_sources(model, optimizer)
+        # #399 (pyramid phase B): sync_after_step passes the gang's device to
+        # broadcast_from_sources (NCCL-grouped on cuda, plain on gloo/cpu)
+        sync.device = gang.device
     emas = [PowerEMA(model, s) for s in SIGMAS]
     gen = torch.Generator().manual_seed(11)
     traj = []                                   # raw parameters after every step
