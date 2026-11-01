@@ -635,7 +635,19 @@ class _OperatorPodMixin:
             # anyway — once the harvested copy is verified on the box, stop
             # the operator's bill before the upload (harvest_release).
             if not released:
-                self._teardown_operator_pod(ledger_pod())
+                # DEC-CA-0063: the leg is harvested (its worker exited) — a
+                # parked random-init build of this seed epoch runs here first;
+                # its thread then tears the pod down
+                hook = getattr(self, "_rolling_init_on_leg_pod", None)
+                try:
+                    claimed = bool(callable(hook) and hook(
+                        host, seeds.base_seed, lambda: self._teardown_operator_pod(ledger_pod())))
+                except Exception as e:  # noqa: BLE001 — never keep the pod over it
+                    log.warning("operator leg %s: init build hook failed: %s",
+                                gen.hotkey[:12], e)
+                    claimed = False
+                if not claimed:
+                    self._teardown_operator_pod(ledger_pod())
                 released.append(True)
 
         # A challenger receipt is harvested INSIDE dispatch (the isolated

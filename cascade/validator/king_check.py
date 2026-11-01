@@ -37,6 +37,7 @@ from __future__ import annotations
 import logging
 from dataclasses import replace
 
+from ..shared.bench_report import POINTER_ONLY_INIT_REASON
 from ..shared.emission import (
     KeySlash,
     LadderState,
@@ -399,6 +400,31 @@ class KingCheckMixin:
         return self._v2_king_check_pool(manifest, windows, base_seed, king, ib_pointer,
                                         bench_bad, rec)
 
+    def _kc_init_unbound(self, manifest: TrainingManifest, init_ptr: str, rec: dict) -> bool:
+        """CONSENSUS from ``[v2] init_epoch_bind_from_block`` (off before it —
+        no read, no change): a random-init settlement's init pointer must bind
+        THIS seed epoch (its repository basename names the manifest era
+        stamp's verified ``seed_block``, see
+        :func:`cascade.shared.bench_report.init_pointer_bound_to_epoch`). The
+        report read is the PREVIOUS settlement's, so a new epoch's first
+        settlement would otherwise judge the king against the previous
+        epoch's init. True (deferral reason appended) when it does not."""
+        from ..shared.bench_report import init_pointer_bound_to_epoch
+        from ..shared.era import init_epoch_bind_from
+
+        n = init_epoch_bind_from(getattr(self, "cfg", None))
+        if not n or manifest.warm_start_ckpt:
+            return False
+        if int(self._epoch_start_block(manifest)) < n:
+            return False
+        era = manifest.era if isinstance(getattr(manifest, "era", None), dict) else {}
+        sb = era.get("seed_block")
+        if init_pointer_bound_to_epoch(init_ptr, None if sb is None else int(sb)):
+            return False
+        rec["reasons"].append(f"no init pointer for this seed epoch (the published init "
+                              f"{init_ptr[:96]!r} does not bind seed block {sb})")
+        return True
+
     def _v2_king_check_trainer_bench(self, manifest: TrainingManifest, pointer: str,
                                      rec: dict) -> tuple | None:
         """The bench half's inputs from the PREVIOUS settlement's
@@ -421,9 +447,18 @@ class KingCheckMixin:
         if ib is None:
             rec["reasons"].append("bench report has no init entry")
             return None
+        if ib.pointer_only:
+            # DEC-CA-0063: a pointer-only init entry's sentinels are not a
+            # bench — never compared (the trainer also publishes it with no
+            # king entry and no rows, so an older build defers above / on the
+            # missing rows)
+            rec["reasons"].append(POINTER_ONLY_INIT_REASON)
+            return None
         if manifest.warm_start_ckpt and ib.trained_pointer != manifest.warm_start_ckpt:
             rec["reasons"].append(f"bench init entry {ib.trained_pointer!r} is not the era init "
                                   f"{manifest.warm_start_ckpt!r}")
+            return None
+        if self._kc_init_unbound(manifest, ib.trained_pointer, rec):
             return None
         if getattr(self, "_king_check_need_rows", False):
             try:
@@ -498,6 +533,8 @@ class KingCheckMixin:
         if not init_ptr:
             rec["reasons"].append("no init pointer (random-init epoch with no trainer-published "
                                   "init checkpoint)")
+            return None
+        if self._kc_init_unbound(manifest, init_ptr, rec):
             return None
         size = str(king.size or "")
         king_e = TrainedEntry(miner_hotkey=king.miner_hotkey, miner_uid=king.miner_uid,

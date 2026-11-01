@@ -38,6 +38,54 @@ BENCH_ROLES = (*VALID_ROLES, "init")
 
 BENCH_REPORT_VERSION = 1
 
+# DEC-CA-0063 eras: the trainer runs no init bench (the main validator sweeps
+# the init itself); its report's "init" entry carries only the random-init
+# checkpoint POINTER. The wire format needs six numbers, so a pointer-only
+# entry carries this sentinel in all six (no FEV, no rows) — negative, which
+# no CRPS / MASE can be, so the sentinel itself is the marker
+# (:attr:`BenchEntry.pointer_only`): no wire change, no new signed field (an
+# old parser would drop one and fail the signature). Readers never score it:
+# :meth:`BenchReport.entry_for_pointer` skips it and the king check / audit
+# defer on it (:data:`POINTER_ONLY_INIT_REASON`).
+POINTER_ONLY_INIT_SCORE = -1.0
+SIX_SCORE_KEYS = ("gifteval_crps", "gifteval_mase", "boom_crps", "boom_mase",
+                  "time_crps", "time_mase")
+POINTER_ONLY_INIT_REASON = ("bench init entry is pointer-only (validator bench source): "
+                            "its scores are not a bench")
+
+
+def pointer_only_init_scores() -> dict:
+    """A pointer-only init entry's scores: six sentinels, no FEV pair."""
+    return {k: POINTER_ONLY_INIT_SCORE for k in SIX_SCORE_KEYS}
+
+
+# The published random-init checkpoint's repository basename binds its seed
+# epoch: ``ckpt-<base_seed>-<arch>-random-init-sb<seed_block>``, where
+# ``seed_block`` is the epoch's seed block — the ``seed_block`` of every
+# manifest era stamp of that epoch, which validators already verify
+# (era_gate). The Hub and HF-fallback refs both keep the basename.
+RANDOM_INIT_EPOCH_TAG = "-random-init-sb"
+
+
+def random_init_repo_name(base_seed, arch_preset: str, seed_block: int) -> str:
+    """The random-init checkpoint repo basename for a seed epoch."""
+    return f"ckpt-{base_seed}-{arch_preset}{RANDOM_INIT_EPOCH_TAG}{int(seed_block)}"
+
+
+def init_pointer_bound_to_epoch(pointer: str, seed_block: int | None) -> bool:
+    """CONSENSUS (once ``[v2] init_epoch_bind_from_block`` is in force): the
+    random-init ``pointer`` names the seed epoch whose seed block is
+    ``seed_block`` (:func:`random_init_repo_name`). Pure."""
+    from .manifest import parse_trained_pointer
+
+    if seed_block is None:
+        return False
+    ref = parse_trained_pointer(str(pointer or ""))
+    if ref is None:
+        return False
+    base = ref.split("@", 1)[0].rsplit("/", 1)[-1]
+    return base.endswith(f"{RANDOM_INIT_EPOCH_TAG}{int(seed_block)}")
+
 
 def bench_report_key(round_id: str) -> str:
     return f"benchmarks/round-{round_id}.json"
@@ -76,6 +124,14 @@ class BenchEntry:
     def __post_init__(self) -> None:
         if self.role not in BENCH_ROLES:
             raise ValueError(f"role must be one of {BENCH_ROLES}; got {self.role!r}")
+
+    @property
+    def pointer_only(self) -> bool:
+        """A DEC-CA-0063 pointer-only init entry (see
+        :data:`POINTER_ONLY_INIT_SCORE`): its pointer is usable, its scores
+        are NOT a bench and must never be compared."""
+        return self.role == "init" and all(
+            getattr(self.scores, k, None) == POINTER_ONLY_INIT_SCORE for k in SIX_SCORE_KEYS)
 
 
 @dataclass(frozen=True)
@@ -129,15 +185,18 @@ class BenchReport:
         return _listed_reason(self.checkpoint_fault, trained_pointer, "checkpoint fault")
 
     def entry_for_pointer(self, trained_pointer: str) -> BenchEntry | None:
-        """The entry benching exactly this checkpoint pointer, else ``None``."""
+        """The entry benching exactly this checkpoint pointer, else ``None``.
+        A pointer-only init entry benches nothing, so it is never returned."""
         for e in self.entries:
-            if e.trained_pointer == trained_pointer:
+            if e.trained_pointer == trained_pointer and not e.pointer_only:
                 return e
         return None
 
     def init_entry(self) -> BenchEntry | None:
         """The DEC-CA-0055 ``role == "init"`` entry (the current init's
-        scores), else ``None``."""
+        scores), else ``None``. It may be pointer-only
+        (:attr:`BenchEntry.pointer_only`): a reader comparing its scores
+        checks that first."""
         for e in self.entries:
             if e.role == "init":
                 return e

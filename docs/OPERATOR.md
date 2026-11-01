@@ -1191,8 +1191,33 @@ canonical body; adding one would fork them).
 From `[v2] bench_source_from_block` (mainnet: `"v2"`, i.e. the v2 go-live)
 with `[v2] bench_source = "validator"`, lane A is no longer benched at leg
 completion. The trainer runs no challenger or king sweep, no payer-pod
-verification and no bench hold for those eras. Only the once-per-seed-epoch
-init bench stays: it publishes the init pointer the king check needs.
+verification and no bench hold for those eras, and no init bench either:
+the main validator benches the init itself. For a random-init seed epoch the
+trainer only publishes the init POINTER (a pointer-only `role = "init"`
+report entry whose six scores are the `-1.0` sentinel — published alone,
+with no rows, and never scored: `BenchEntry.pointer_only` marks it,
+`entry_for_pointer` skips it, the king check and the audit defer on it, and
+older validator builds defer too, on the missing king entry and init rows): the random-init
+checkpoint is built on the era's already-mapped operator king pod after the
+epoch's king leg (CPU, `moe_trainer.build_random_init` run pod-side, refused
+on a contract-digest mismatch), copied back as plain files, verified against
+the pod's listing and uploaded. Nothing is ever rented for it, the box never
+builds or loads it, and only an OPERATOR-billed pod is used (ledger row with
+no payer; never a miner-key pod, never one with a leg in flight): the era's
+operator king pod, else an idle operator lane (never the last idle one), else
+the request is parked and the next operator-billed challenger pod of the seed
+epoch builds it right after its leg's verified harvest, before its release.
+While parked the king check defers with "no init pointer"; a failed build
+counts against `INIT_BENCH_MAX_TRIES` per seed epoch. A warm-started epoch
+needs nothing (the pointer is `warm_start_ckpt`).
+
+The random-init repo is named `ckpt-<base_seed>-<arch>-random-init-sb<seed_block>`.
+From `[v2] init_epoch_bind_from_block` (default 0 = off; release first, then
+activate) the king check accepts a random-init pointer only when that suffix
+names the settlement's verified era-stamp `seed_block`, and otherwise defers
+with "no init pointer for this seed epoch". That closes the case where a new
+epoch's first settlement reads the previous epoch's init from the previous
+settlement's report.
 
 The **main validator** (the wallet whose hotkey is `[netconfig]
 owner_hotkey`) does the sweeps instead, and only when they are needed:

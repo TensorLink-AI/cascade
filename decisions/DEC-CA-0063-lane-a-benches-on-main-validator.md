@@ -95,10 +95,16 @@ bench_source_from_block` with `[v2] bench_source = "validator"`:
    without a record keeps its exact bytes.
 8. **Trainer.** For those eras the trainer runs no lane-A challenger sweep
    (no payer pod time), no king sweep, no payer-pod verification queue, no
-   bench hold and no `bench_first`. Only the once-per-seed-epoch init bench
-   on the operator pod stays. It is the only carrier of a random-init
-   epoch's init checkpoint pointer, and the validator re-sweeps that init
-   itself rather than using the trainer's numbers. Promotion under `[v2]
+   bench hold and no `bench_first`, and (2026-11-01) no init bench: for a
+   random-init epoch the trainer publishes only the init checkpoint POINTER
+   (a pointer-only `role = "init"` entry, sentinel scores `-1.0`), built on
+   an operator-billed pod the trainer already holds for the seed epoch (the
+   operator king pod, an idle operator lane, or an operator challenger pod
+   right after its leg's harvest). It is never a payer pod, never a pod rented
+   for it, and never the trainer box. From `[v2] init_epoch_bind_from_block`
+   (off by default) validators accept the pointer only when its repo name
+   binds the epoch's seed block. It is the only carrier of a random-init epoch's init
+   checkpoint pointer, and the validator sweeps that init itself. Promotion under `[v2]
    king_ladder` is k = 1, backed by a passing king check. Its member check
    (`_verify_members`) and the reign log (`_report_bench_scores`) fall back
    to the validator report. The trainer's member size/score metadata and the

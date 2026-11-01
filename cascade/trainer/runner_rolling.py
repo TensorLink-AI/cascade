@@ -7,6 +7,7 @@ import hashlib
 import logging
 import threading
 
+from ..shared.bench_report import pointer_only_init_scores
 from ..shared.manifest import BenchScores
 from .contract import RoundSeeds
 from .faults import (
@@ -56,6 +57,62 @@ def _bench_fev_required(cfg, era) -> bool:
     if not bench_gate_v2_configured(cfg):
         return False                # the gate runs at no block: the sweep has no FEV
     return bench_gate_rule_for_era(cfg, int(era.start_block)) == BENCH_RULE_V2
+
+
+# DEC-CA-0063 eras: the main validator benches the init itself (king check,
+# ``_vbench_side(init_e, role="init")``); all it reads from the trainer's
+# report is the "init" entry's POINTER — a pointer-only entry (sentinel
+# scores, see cascade.shared.bench_report.POINTER_ONLY_INIT_SCORE) that every
+# reader defers on. ``_rolling_publish_bench`` keeps it alone in its report.
+
+
+# How long the pod-side random-init build may take (CPU construction + save of
+# the full-size init; minutes in practice).
+INIT_BUILD_TIMEOUT_S = 1800
+
+# Run ON THE POD with the pod's own interpreter and chain.toml: the
+# random-init checkpoint a v2 leg with ``training_seed`` starts from
+# (moe_trainer.build_random_init — the king leg's own construction), refused
+# unless the pod resolves exactly the trainer's contract (digest). argv:
+# <chain.toml or ""> <contract block> <training seed> <arch preset>
+# <contract digest> <out dir>.
+_INIT_BUILD_PY = (
+    "import sys\n"
+    "from pathlib import Path\n"
+    "from cascade.shared.config import load_chain_config\n"
+    "from cascade.shared.manifest import contract_digest\n"
+    "toml, block, seed, preset, digest, out = sys.argv[1:7]\n"
+    "c = load_chain_config(toml or None).throne_contracts_at(int(block))[0]\n"
+    "got = contract_digest(c)\n"
+    "if c.arch_preset != preset or got != digest:\n"
+    "    sys.exit('init build refused: pod contract %s/%s != trainer %s/%s'"
+    " % (c.arch_preset, got, preset, digest))\n"
+    "from cascade.trainer.moe_trainer import build_random_init\n"
+    "build_random_init(c, training_seed=int(seed), out_dir=Path(out))\n"
+)
+
+
+def _init_rebuildable(contract) -> bool:
+    """Whether ``contract``'s random init has a ``build_random_init``."""
+    return str(getattr(contract, "base_arch", "") or "") in ("cascade_moe", "cascade_pyramid")
+
+
+def build_init_remote_command(host, out_dir: str, *, contract_block: int, training_seed: int,
+                              arch_preset: str, digest: str) -> str:
+    """The pod-side shell string that builds the epoch's random-init
+    checkpoint into ``out_dir`` (wiped first). CPU only (``CUDA_VISIBLE_DEVICES``
+    blanked): the GPU is never touched. Pure — safe to unit test.
+
+    The trainer box never builds the init itself (7 GB box: a full-size model
+    construction is an OOM risk) — it only harvests the written files."""
+    import shlex
+
+    argv = [host.remote_python, "-c", _INIT_BUILD_PY, str(host.chain_toml or ""),
+            str(int(contract_block)), str(int(training_seed)), str(arch_preset),
+            str(digest), out_dir]
+    out = shlex.quote(out_dir)
+    return (f"cd {shlex.quote(host.workdir)} && rm -rf {out} && "
+            f"CUDA_VISIBLE_DEVICES= {shlex.join(argv)}")
 
 
 class _KingKeyFailed(Exception):
@@ -862,15 +919,23 @@ class _RollingMixin:
         return dataclasses.asdict(scores) if scores is not None else None
 
     def _rolling_bench_init(self, era) -> dict | None:
-        """Bench the seed epoch's CURRENT init (DEC-CA-0055 "init" entry) on
-        the era's operator king pod: the member checkpoint when the epoch is
-        warm-started, else the random-init model rebuilt from the epoch's
-        training seed. Operator numbers only (never a payer pod)."""
+        """The seed epoch's CURRENT init entry (DEC-CA-0055 "init").
+
+        Validator-sourced era (DEC-CA-0063): the trainer benches nothing and
+        rents nothing — see :meth:`_rolling_publish_init_pointer`.
+
+        Trainer-sourced (legacy) era: bench the init on the era's operator
+        king pod — the member checkpoint when the epoch is warm-started, else
+        the random-init model, BUILT ON THAT POD from the epoch's training
+        seed (never on the trainer box) and, once benched, harvested and
+        published. Operator numbers only (never a payer pod)."""
         import dataclasses
 
         from ..eval.benchmarks import extract_bench_scores
         from .bench_hook import push_checkpoint, run_post_round_benchmark
 
+        if _validator_benches(self.cfg, era):
+            return self._rolling_publish_init_pointer(era)
         if self.cascade_bench_plan is None:
             return None
         king = era.king()
@@ -887,24 +952,19 @@ class _RollingMixin:
         if why:
             log.warning("rolling: era %d init bench skipped — %s", era.index, why)
             return None
+        round_id = str(era.base_seed)
         if era.warm_start_ckpt:
             local = self._fetch_checkpoint_dir(era.warm_start_ckpt)
+            push_checkpoint(host, local, round_id, contract.arch_preset, "init")
+            remote_dir = ""
         else:
-            if str(getattr(contract, "base_arch", "") or "") not in ("cascade_moe", "cascade_pyramid"):
+            if not _init_rebuildable(contract):
                 log.warning("rolling: era %d init bench — random init of base_arch %r is "
-                            "not rebuildable here; skipped", era.index,
+                            "not rebuildable; skipped", era.index,
                             getattr(contract, "base_arch", ""))
                 return None
-            from pathlib import Path
-
-            from .moe_trainer import build_random_init
-
-            seeds = self._rolling_seeds(era)
-            local = build_random_init(
-                contract, training_seed=int(seeds.training_seed),
-                out_dir=Path(self.work_root) / "init_bench" / str(era.base_seed))
-        round_id = str(era.base_seed)
-        push_checkpoint(host, local, round_id, contract.arch_preset, "init")
+            # built straight into the "init" role dir the sweep benches
+            remote_dir = self._rolling_build_init_on_pod(host, era, contract)
         report = run_post_round_benchmark(host, round_id, contract.arch_preset,
                                           self.cascade_bench_plan, work_root=self.work_root,
                                           role="init")
@@ -917,22 +977,211 @@ class _RollingMixin:
         if not era.warm_start_ckpt:
             # validators score the init on the pool: the random-init model must
             # be a PUBLISHED, fetchable checkpoint (the init entry's pointer)
-            pointer = out["_pointer"] = self._publish_init_checkpoint(local, era, contract)
+            pointer = out["_pointer"] = self._rolling_harvest_publish_init(
+                host, remote_dir, era, contract)
         if pointer:
             # DEC-CA-0061: the king check's bench half runs the gate's rule on
             # the init's TASK rows, so they are published like any entry's
             self._stash_bench_rows(pointer, report)
         return out
 
+    def _rolling_publish_init_pointer(self, era) -> dict | None:
+        """DEC-CA-0063 era: publish the random-init checkpoint POINTER the main
+        validator's king check benches (it sweeps the init on its own GPU).
+
+        No bench, never a rent, never a payer (miner-key) pod, never a pod
+        with a leg in flight. The init is built — CPU, contract-digest checked
+        on the pod — harvested to the box as plain files and uploaded, on the
+        first OPERATOR-billed pod the trainer already holds for the seed
+        epoch, in this order:
+
+        1. the era's operator king pod while still mapped (right after a new
+           seed epoch's king leg, which trains from this same random init);
+        2. an IDLE operator lane (checked out of the lane pool, so no leg can
+           take it meanwhile; never the last idle lane);
+        3. otherwise the request is parked: the next operator-billed
+           challenger pod of this seed epoch builds it right after its leg's
+           harvest, before its release (:meth:`_rolling_init_on_leg_pod`).
+
+        Returns the pointer-only entry ``{six sentinels, "_pointer"}``, or
+        ``{"_deferred": why}`` while parked (the scheduler re-polls without
+        spending a try), or None (nothing to publish). A failed build raises
+        (a try). A warm-started epoch needs nothing."""
+        if era.warm_start_ckpt:
+            return None
+        built = (str(getattr(era, "init_pointer", "") or "")
+                 or self.__dict__.get("_init_pointers_built", {}).get(str(era.base_seed), ""))
+        if built:
+            return {**pointer_only_init_scores(), "_pointer": built}
+        if str(era.base_seed) in self.__dict__.get("_init_building", set()):
+            return {"_deferred": "being built on an operator leg pod"}
+        contract = era_contracts(self.cfg, era)[0]
+        if not _init_rebuildable(contract):
+            log.warning("rolling: era %d init pointer — random init of base_arch %r is not "
+                        "rebuildable; not published", era.index,
+                        getattr(contract, "base_arch", ""))
+            return None
+        king = era.king()
+        host = (self._final_role_hosts.get(("king", contract.arch_preset, king.miner_hotkey))
+                if king is not None else None)
+        host = host or self.__dict__.get("_rolling_king_hosts", {}).get(era.index)
+        if host is not None and self._rolling_operator_host(host):
+            return self._rolling_init_entry_on(host, era, contract, "operator king pod")
+        lane = self._rolling_take_idle_operator_lane()
+        if lane is not None:
+            pool, lane_host = lane
+            try:
+                return self._rolling_init_entry_on(lane_host, era, contract,
+                                                   "idle operator lane")
+            finally:
+                pool.put(lane_host)
+        self.__dict__.setdefault("_init_pointer_wanted", {})[str(era.base_seed)] = era
+        why = ("the era's king pod is a payer (miner-key) pod" if host is not None
+               else "no operator king pod (cached/carried or own-key king leg, or released)")
+        logged = self.__dict__.setdefault("_init_defer_logged", set())
+        if era.index not in logged:
+            logged.add(era.index)
+            log.warning("rolling: era %d init pointer deferred — %s and no idle operator lane; "
+                        "NOT renting one. The next operator-billed challenger pod of seed "
+                        "epoch %s builds it after its leg", era.index, why, era.base_seed)
+        return {"_deferred": why}
+
+    def _rolling_init_entry_on(self, host, era, contract, what: str) -> dict:
+        pointer = self._rolling_harvest_publish_init(
+            host, self._rolling_build_init_on_pod(host, era, contract), era, contract)
+        self.__dict__.setdefault("_init_pointers_built", {})[str(era.base_seed)] = pointer
+        self.__dict__.get("_init_pointer_wanted", {}).pop(str(era.base_seed), None)
+        log.info("rolling: era %d random-init checkpoint built on %s %s and published → %s "
+                 "(pointer only; the main validator benches it)", era.index, what,
+                 getattr(host, "name", host), pointer)
+        return {**pointer_only_init_scores(), "_pointer": pointer}
+
+    def _rolling_operator_host(self, host) -> bool:
+        """``host`` is OPERATOR-billed: an operator lane on file (not
+        isolated), or a credential-free (isolated) pod whose ledger row has no
+        payer — never a payer's (miner-key) pod. ``isolated`` alone means
+        credential-free, which operator king / leg pods are too. Unknown ⇒
+        False."""
+        if host is None:
+            return False
+        if not getattr(host, "isolated", False):
+            return True
+        aid = str(getattr(host, "allocation_id", "") or "")
+        if not aid:
+            return False
+        try:
+            pods = self._load_funded_ledger()
+        except Exception:  # noqa: BLE001 — unknown billing ⇒ not ours to use
+            return False
+        return any(str(p.instance_id) == aid and not str(p.payer_hotkey or "") for p in pods)
+
+    def _rolling_take_idle_operator_lane(self):
+        """``(pool, host)``: an operator lane checked OUT of the existing
+        rolling lane pool (idle by the pool's own occupancy — a lane in the
+        queue has no leg), or None. Never builds the pool (that probes every
+        lane) and never takes the LAST idle lane (a fallback leg may need it)."""
+        import queue as _queue
+
+        pool = self.__dict__.get("_rolling_lane_pool_obj")
+        if pool is None or pool.qsize() < 2:
+            return None
+        try:
+            host = pool.get(block=False)
+        except _queue.Empty:
+            return None
+        if not self._rolling_operator_host(host):
+            pool.put(host)
+            return None
+        return pool, host
+
+    def _rolling_init_on_leg_pod(self, host, base_seed, teardown) -> bool:
+        """Called by an operator-billed leg pod's release, right after its
+        leg's verified harvest (the worker has exited). When a parked init
+        request is for this pod's seed epoch, claim it and build there in a
+        background thread that tears the pod down when done (``teardown``);
+        returns True then (the caller must NOT tear down). Else False."""
+        wanted = self.__dict__.get("_init_pointer_wanted", {})
+        key = str(base_seed)
+        if key not in wanted or not self._rolling_operator_host(host):
+            return False
+        era = wanted.pop(key, None)
+        if era is None:
+            return False
+        building = self.__dict__.setdefault("_init_building", set())
+        building.add(key)
+
+        def _run() -> None:
+            try:
+                contract = era_contracts(self.cfg, era)[0]
+                self._rolling_init_entry_on(host, era, contract,
+                                            "operator challenger pod (after its leg)")
+            except Exception as e:  # noqa: BLE001 — re-parked for the next pod
+                wanted.setdefault(key, era)
+                log.warning("rolling: era %d init build on leg pod %s failed: %s", era.index,
+                            getattr(host, "name", host), e)
+            finally:
+                building.discard(key)
+                teardown()
+
+        threading.Thread(target=_run, name=f"init-on-leg-{key[:8]}", daemon=True).start()
+        return True
+
+    def _rolling_build_init_on_pod(self, host, era, contract) -> str:
+        """Build the epoch's random-init checkpoint ON ``host`` (CPU), at the
+        "init" role checkpoint dir; returns that pod-side dir."""
+        from ..shared.manifest import contract_digest
+        from .bench_hook import role_paths
+        from .remote import build_ssh_argv, error_tail, run_ssh
+
+        ckpt, _ = role_paths(host, str(era.base_seed), contract.arch_preset, "init")
+        cmd = build_init_remote_command(
+            host, ckpt, contract_block=int(era.start_block),
+            training_seed=int(self._rolling_seeds(era).training_seed),
+            arch_preset=str(contract.arch_preset), digest=contract_digest(contract))
+        proc = run_ssh(build_ssh_argv(host, cmd), INIT_BUILD_TIMEOUT_S)
+        if proc.returncode != 0:
+            raise RuntimeError(f"random-init build on {getattr(host, 'name', host)} failed "
+                               f"(rc={proc.returncode}): "
+                               f"{error_tail((proc.stderr or '') + (proc.stdout or ''))}")
+        return ckpt
+
+    def _rolling_harvest_publish_init(self, host, remote_dir: str, era, contract) -> str:
+        """Copy the pod-built init back as plain files (verified file-for-file
+        against the pod's own listing — nothing is loaded on the box), upload
+        it, drop the box copy. Returns the init's trained pointer."""
+        import shutil
+        from pathlib import Path
+
+        from .harvest_release import local_file_manifest, manifest_mismatches
+        from .remote import harvest_remote_dir, remote_file_manifest
+
+        dest = Path(self.work_root) / "init_publish" / str(era.base_seed)
+        try:
+            pod = remote_file_manifest(host, remote_dir)
+            if not pod:
+                raise RuntimeError(f"pod {getattr(host, 'name', host)} lists no init files "
+                                   f"under {remote_dir}")
+            harvest_remote_dir(host, remote_dir, dest)
+            bad = manifest_mismatches(pod, local_file_manifest(dest))
+            if bad:
+                raise RuntimeError("harvested init differs from the pod's copy: "
+                                   + "; ".join(bad[:3]))
+            return self._publish_init_checkpoint(dest, era, contract)
+        finally:
+            shutil.rmtree(dest, ignore_errors=True)
+
     def _publish_init_checkpoint(self, local, era, contract) -> str:
         """Upload the rebuilt random-init checkpoint under the operator's
         identity → its ``metro-v1:trained:`` pointer."""
         from pathlib import Path
 
+        from ..shared.bench_report import random_init_repo_name
         from ..shared.hippius import upload_dir_to_hub_or_hf
         from ..shared.manifest import format_trained_pointer
 
-        repo = f"ckpt-{era.base_seed}-{contract.arch_preset}-random-init"
+        # the basename binds the seed epoch (its seed block): validators check
+        # it once [v2] init_epoch_bind_from_block is in force
+        repo = random_init_repo_name(era.base_seed, contract.arch_preset, int(era.seed_block))
         full = f"{self.hub().namespace}/{repo}"
         up = upload_dir_to_hub_or_hf(Path(local), full, self.hub(),
                                      hf_repo=self._hf_ckpt_repo(full))
@@ -1056,6 +1305,8 @@ class _RollingMixin:
 
     def _rolling_publish_bench(self, round_id: str, created_block: int, pairs: list, *,
                                rows_for: frozenset | None = None, init: dict | None = None):
+        import dataclasses
+
         from ..shared.bench_report import (
             BenchEntry,
             BenchReport,
@@ -1080,12 +1331,25 @@ class _RollingMixin:
             # king's six suite means against.
             try:
                 ip = str(init.get("pointer") or "")
-                entries = (*entries, BenchEntry(
+                ie = BenchEntry(
                     role="init", size=str(init.get("size") or primary), miner_hotkey="",
                     miner_uid=-1, trained_pointer=ip,
                     scores=BenchScores(**init["scores"]),
                     rows_key=rows.get(ip, {}).get("key", "") if ip else "",
-                    rows_sha256=rows.get(ip, {}).get("sha256", "") if ip else ""))
+                    rows_sha256=rows.get(ip, {}).get("sha256", "") if ip else "")
+                if ie.pointer_only:
+                    # DEC-CA-0063 pointer-only init: alone in its report, with no
+                    # rows, so even a reader that predates the marker defers
+                    # before comparing its sentinels — the king check finds no
+                    # king entry (and under rule v2 no init rows)
+                    ie = dataclasses.replace(ie, rows_key="", rows_sha256="")
+                    if entries:
+                        log.warning("bench report round=%s: %d scored entr%s dropped next to "
+                                    "a pointer-only init entry (validator bench source: "
+                                    "the main validator's report carries them)", round_id,
+                                    len(entries), "y" if len(entries) == 1 else "ies")
+                    entries = ()
+                entries = (*entries, ie)
             except (ValueError, KeyError, TypeError) as e:
                 log.warning("bench report round=%s: init entry not representable on this "
                             "build (%s) — published without it", round_id, e)

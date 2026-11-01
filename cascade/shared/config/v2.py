@@ -88,6 +88,15 @@ class V2Config:
     # whose warm start would take effect this many blocks into the reign
     # (:func:`cascade.shared.era.v2_check_due`). 21600 = 3 days. 0 = off.
     reign_warm_start_blocks: int = 0
+    # King check init binding (CONSENSUS, release-then-activate): from this
+    # settlement boundary on, a random-init epoch's init pointer is accepted
+    # only when its repository basename binds THIS seed epoch
+    # (cascade.shared.bench_report.init_pointer_bound_to_epoch against the
+    # manifest era stamp's seed_block); otherwise the check defers. Stops a
+    # new epoch's first settlement from judging the king against the
+    # PREVIOUS epoch's init (the report read is the previous settlement's).
+    # 0 = off (every build before it behaves identically).
+    init_epoch_bind_from_block: int = 0
     # Emission burns (CONSENSUS on the weight vector, see
     # cascade.shared.emission). ``prelaunch_burn``: the fraction of every
     # pre-v2 vector sent to ``burn_uid`` by a validator on this release.
@@ -303,7 +312,7 @@ def parse_v2_economics(v2raw: dict) -> dict:
     if readiness and (not readiness.isascii() or not readiness.isalnum() or len(readiness) > 12):
         raise ValueError("v2 prelaunch_burn_readiness must be up to 12 ASCII letters/digits")
     out.update(launch_at_utc=launch, commit_open_at_utc=opening, prelaunch_burn_readiness=readiness)
-    for k in ("random_init_eras", "reign_warm_start_blocks", "prelaunch_burn_from_block", "commit_from_block", "eval_n_windows"):
+    for k in ("random_init_eras", "reign_warm_start_blocks", "prelaunch_burn_from_block", "commit_from_block", "eval_n_windows", "init_epoch_bind_from_block"):
         raw = v2raw.get(k, 0)
         if isinstance(raw, bool) or not isinstance(raw, int):
             raise ValueError(f"[v2] {k} must be an integer; got {raw!r}")

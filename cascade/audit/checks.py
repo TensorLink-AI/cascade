@@ -1742,6 +1742,7 @@ def _kc_bench_scores(rec: dict | None):
 def _kc_deferred(receipt: RoundReceipt, cfg: ChainConfig, kc: dict, manifest,
                  bench: dict | None) -> CheckResult:
     """A recorded deferral: its stated reason against what is derivable."""
+    from ..shared.bench_report import POINTER_ONLY_INIT_REASON
     from ..validator.king_check import KC_GATE_UNCOMPUTABLE, POOL_INCONCLUSIVE
 
     name = "king-check"
@@ -1792,6 +1793,24 @@ def _kc_deferred(receipt: RoundReceipt, cfg: ChainConfig, kc: dict, manifest,
                                f"round {kc.get('bench_round')} is published now")
         return _ok(name, "deferred: no signed bench report"
                          + ("" if bench is not None else " (report not re-read)"))
+    if why == POINTER_ONLY_INIT_REASON:
+        # DEC-CA-0063: the trainer report's init entry carried only a pointer
+        # (sentinel scores) — the signed report must agree
+        if report is None:
+            return _ok(name, f"deferred: {why[:80]} (report not available to re-read)")
+        ib = report.init_entry()
+        if ib is None or not ib.pointer_only:
+            return _fail(name, f"deferred for {why[:60]!r} but the signed report's init entry "
+                               "is " + ("absent" if ib is None else "a real bench"))
+        return _ok(name, f"deferred: {why[:80]} (signed report agrees)")
+    if why.startswith("no init pointer for this seed epoch"):
+        # [v2] init_epoch_bind_from_block: the init pointer did not bind this
+        # seed epoch — a reason only a settlement under the binding may give
+        from ..shared.era import init_epoch_bind_at
+
+        if not init_epoch_bind_at(cfg, int(receipt.epoch_start_block)):
+            return _fail(name, f"deferred for {why[:60]!r} at a settlement before [v2] "
+                               "init_epoch_bind_from_block")
     if why.startswith("no init pointer"):
         # DEC-CA-0063: a random-init epoch whose init checkpoint pointer the
         # trainer's report did not carry
@@ -2057,6 +2076,10 @@ def check_king_check(receipt: RoundReceipt, cfg: ChainConfig,
     report = bench["report"]
     ptr = str(kc.get("king_pointer") or "")
     kb, ib = report.entry_for_pointer(ptr), report.init_entry()
+    if ib is not None and ib.pointer_only:
+        # DEC-CA-0063: its sentinels are not a bench — nothing may be judged on them
+        return _fail(name, f"{result} recorded against the pointer-only init entry of round "
+                           f"{kc.get('bench_round')} (its scores are not a bench)")
     if kb is None or ib is None:
         return _fail(name, f"{result} recorded but the signed report for round "
                            f"{kc.get('bench_round')} has no "

@@ -1554,6 +1554,9 @@ class RollingScheduler:
         if dst.init_bench is None and src.init_bench is not None:
             dst.init_bench, dst.init_bench_tries = dict(src.init_bench), src.init_bench_tries
             dst.init_pointer = src.init_pointer
+        elif dst.init_bench is None:
+            # the tries cap is per seed epoch: a later era never restarts it
+            dst.init_bench_tries = max(int(dst.init_bench_tries), int(src.init_bench_tries))
         if not src.king_entry or src.king_hotkey != dst.king_hotkey or dst.king_entry:
             return False
         if src.king_init != src.warm_start_ckpt:
@@ -2000,7 +2003,14 @@ class RollingScheduler:
 
     def _init_bench_owed(self, era: EraState) -> bool:
         """A v2 seed epoch's init still needs its bench (the "init" entry of
-        the signed bench report the king check compares against)."""
+        the signed bench report the king check compares against) — or, in a
+        validator-sourced era (DEC-CA-0063), only its published random-init
+        POINTER (the runner benches nothing and rents no pod for it). The
+        tries cap is per seed epoch (carried across its eras)."""
+        if era.warm_start_ckpt and validator_bench_era(self.cfg, int(era.start_block)):
+            # DEC-CA-0063: the main validator benches the init itself and a
+            # warm-started epoch's init pointer IS warm_start_ckpt — nothing owed
+            return False
         return (int(era.epoch_start) >= 0 and self._ladder_era(era)
                 and era.init_bench is None
                 and int(era.init_bench_tries) < self.INIT_BENCH_MAX_TRIES)
@@ -2023,9 +2033,22 @@ class RollingScheduler:
             return
         self._init_bench_at[era.index] = now
 
+        what = ("init pointer" if validator_bench_era(self.cfg, int(era.start_block))
+                else "init bench")
+
+        def _gave_up() -> None:
+            if int(era.init_bench_tries) >= self.INIT_BENCH_MAX_TRIES:
+                log.warning("rolling: era %d %s GAVE UP after %d tries — not retried this "
+                            "seed epoch (the king check defers without it)", era.index, what,
+                            int(era.init_bench_tries))
+
         def _run():
             try:
                 bench = self.ops.bench_init(era)
+                if isinstance(bench, dict) and "_deferred" in bench:
+                    # DEC-CA-0063 pointer parked for an operator pod of the
+                    # epoch: no try spent (re-polled, nothing rented)
+                    return
                 with self._lock:
                     if bench is not None:
                         bench = dict(bench)
@@ -2034,13 +2057,16 @@ class RollingScheduler:
                     else:
                         era.init_bench_tries += 1
                     self._save()
-                log.info("rolling: era %d init bench %s", era.index,
+                log.info("rolling: era %d %s %s", era.index, what,
                          "landed" if bench is not None else "came back empty")
+                if bench is None:
+                    _gave_up()
             except Exception as e:  # noqa: BLE001 — retried after INIT_BENCH_SECONDS
                 with self._lock:
                     era.init_bench_tries += 1
                     self._save()
-                log.warning("rolling: era %d init bench failed: %s", era.index, e)
+                log.warning("rolling: era %d %s failed: %s", era.index, what, e)
+                _gave_up()
             finally:
                 self._init_threads.pop(era.index, None)
 
