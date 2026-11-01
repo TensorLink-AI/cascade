@@ -149,7 +149,7 @@ def test_validator_bench_path_takes_only_the_pointer_and_benches_it_itself():
     rec = {"reasons": []}
     ks, is_, ptr = KingCheckMixin._v2_king_check_validator_bench(fake, manifest, king,
                                                                  KING_PTR, rec)
-    assert ptr == INIT_PTR and ("%s" % INIT_PTR, "init") in seen
+    assert ptr == INIT_PTR and (INIT_PTR, "init") in seen
     assert is_ == REAL_INIT                      # the validator's own sweep, never -1.0
 
 

@@ -21,6 +21,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from cascade.shared.bench_report import SIX_SCORE_KEYS
 from cascade.trainer import runner_rolling as RR
 from cascade.trainer.rolling import EraState, RollingScheduler
 
@@ -30,7 +31,7 @@ INIT_PTR = "metro-v1:trained:hippius:cascade/ckpt-4242-moe-random-init@sha256:" 
 WARM_PTR = "metro-v1:trained:hippius:cascade/member@sha256:" + "f" * 64
 KING_PTR = "metro-v1:trained:hippius:cascade/king@sha256:" + "b" * 64
 MOE = SimpleNamespace(arch_preset="cascade-moe-v2-120m", base_arch="cascade_moe")
-SIX = {k: 0.5 for k in RR._SIX_SCORE_KEYS}
+SIX = {k: 0.5 for k in SIX_SCORE_KEYS}
 
 
 def _vsrc(cfg):

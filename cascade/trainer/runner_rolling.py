@@ -7,7 +7,6 @@ import hashlib
 import logging
 import threading
 
-from ..shared.bench_report import SIX_SCORE_KEYS as _SIX_SCORE_KEYS
 from ..shared.bench_report import pointer_only_init_scores
 from ..shared.manifest import BenchScores
 from .contract import RoundSeeds
