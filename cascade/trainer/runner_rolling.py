@@ -114,6 +114,8 @@ class _RollingMixin:
         return sched
 
     def _dispatcher(self):
+        from pathlib import Path
+
         from .remote import RemoteDispatcher
 
         if not self.trainer_spec:
@@ -132,6 +134,8 @@ class _RollingMixin:
             extra_forward_env=self._pod_extra_forward_env(),
             isolated_forward_env=self._pod_isolated_forward_env(),
             harvest=self._harvest_leg,
+            evidence_dir=(str(Path(self.work_root) / "_failed_legs")
+                          if getattr(self, "work_root", None) is not None else None),
             **({"cancel_event": self._leg_local.king_cancel} if getattr(self._leg_local, "king_cancel", None) is not None else {}),
             **({"continuation_root": str(self.work_root / "_continuations"),
                 "continuation_contract": self.cfg.training,

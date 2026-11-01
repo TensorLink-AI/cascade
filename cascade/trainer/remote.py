@@ -459,7 +459,9 @@ _CREDENTIAL_ENV_RE = re.compile(r"(KEY|SECRET|TOKEN|PASSWORD|PASSWD)", re.IGNORE
 DETACHED_POLL_SECONDS = 30
 DETACHED_REATTACH_GRACE_SECONDS = 900
 DETACHED_STDOUT_TAIL_BYTES = 262144
-DETACHED_STDERR_TAIL_BYTES = 20000
+# Large enough to reach past bash's job notice and the trailing log lines to
+# the worker's real Traceback (2026-11-01: a 20 KB tail held only the notice).
+DETACHED_STDERR_TAIL_BYTES = 131072
 DETACHED_LAUNCH_TOKEN = "__CASCADE_DETACHED__"
 DETACHED_STDERR_MARK = "__CASCADE_DETACHED_STDERR__"
 _SLEEP = time.sleep  # test seam
@@ -637,8 +639,146 @@ def probe_pod_runs(host: RemoteHost, *, runner=None, timeout: int = 60) -> PodRu
 
 def _detached_fetch_command(host: RemoteHost, run_dir: str) -> str:
     rd = shlex.quote(run_dir)
+    pf = shlex.quote(detached_progress_path(run_dir))
     return (f"cd {shlex.quote(host.workdir)} && tail -c {DETACHED_STDOUT_TAIL_BYTES} {rd}/stdout; "
-            f"printf '\\n{DETACHED_STDERR_MARK}\\n'; tail -c {DETACHED_STDERR_TAIL_BYTES} {rd}/stderr")
+            f"printf '\\n{DETACHED_STDERR_MARK}\\n'; tail -c {DETACHED_STDERR_TAIL_BYTES} {rd}/stderr; "
+            f"printf '\\n{DETACHED_FETCH_PROGRESS_MARK}\\n'; "
+            f"head -c {_PROGRESS_MAX_BYTES} {pf} 2>/dev/null; true")
+
+
+# ── failed-leg evidence (2026-11-01: 03:18 and 00:03 incidents) ─────────────
+# A failed leg's logged reason was the stderr TAIL — only bash's job notice
+# ("[1]+ Exit N  CASCADE_PROGRESS_FILE=... < /dev/null") — and the pod was
+# removed seconds later, so the real cause was gone. The failure reason now
+# carries the last Traceback and the last error-signal lines, and the fetched
+# tails are saved on the orchestrator box before the exception reaches any
+# teardown.
+
+DETACHED_FETCH_PROGRESS_MARK = "__CASCADE_DETACHED_PROGRESS__"
+FAILED_LEG_LOG_MAX_BYTES = 262144
+FAILED_LEG_LOGS_KEEP = 200
+_TRACEBACK_HEAD = "Traceback (most recent call last):"
+_FAULT_RE = re.compile(r"NCCL|\bKilled\b|\bOOM\b|out of memory|OutOfMemoryError|"
+                       r"CUDA error|Segmentation fault|core dumped|oom-kill", re.IGNORECASE)
+_LEVEL_RE = re.compile(r"\b(ERROR|CRITICAL|FATAL)\b")
+
+
+def _is_signal_line(line: str) -> bool:
+    """An error-signal line: ERROR/CRITICAL/FATAL as a log level (upper case
+    only — ``error_class=`` is not a signal), or an NCCL / kill / OOM / CUDA
+    fault in any case."""
+    return bool(_LEVEL_RE.search(line) or _FAULT_RE.search(line))
+
+
+def split_job_notices(stderr: str) -> tuple[list[str], list[str]]:
+    """``(lines, job statuses)``: stderr without bash's job-control notice
+    lines, and each notice's status word(s) (``"Exit 1"``, ``"Killed"``)
+    without the long command line it echoes."""
+    lines, statuses = [], []
+    for ln in (stderr or "").splitlines():
+        m = _JOB_CONTROL_LINE.match(ln.strip())
+        if m:
+            rest = ln.strip()[m.start(1):].split()
+            word = rest[0]
+            if word == "Exit" and len(rest) > 1 and rest[1].isdigit():
+                word = f"Exit {rest[1]}"
+            statuses.append(word)
+            continue
+        lines.append(ln.rstrip())
+    return lines, statuses
+
+
+def last_traceback(lines: list[str], *, max_lines: int = 60) -> list[str]:
+    """The last ``Traceback (most recent call last):`` block of ``lines``,
+    through its exception line (the first unindented line after the frames);
+    the last ``max_lines`` of it when longer."""
+    idx = max((i for i, ln in enumerate(lines) if ln.lstrip().startswith(_TRACEBACK_HEAD)),
+              default=-1)
+    if idx < 0:
+        return []
+    block = [lines[idx]]
+    for ln in lines[idx + 1:]:
+        block.append(ln)
+        if ln and not ln[:1].isspace():
+            break
+    return block[-max_lines:]
+
+
+def summarize_failure(stderr: str, *, rc, progress: dict | None = None,
+                      tail_chars: int = 1500) -> tuple[str, str]:
+    """``(cause, detail)`` for a failed leg. ``cause`` is one line — exit
+    code, job status, last progress step and the most specific reason found
+    (the last traceback's exception line, else the last error-signal line,
+    else the last log line); ``detail`` is the traceback block, the last
+    error-signal lines and the cleaned tail (job notices stripped)."""
+    lines, statuses = split_job_notices(stderr)
+    tb = last_traceback(lines)
+    tb_set = set(tb)
+    signals = [ln for ln in lines if _is_signal_line(ln) and ln not in tb_set][-8:]
+    nonblank = [ln for ln in lines if ln.strip()]
+    if tb:
+        reason = tb[-1].strip()
+    elif signals:
+        reason = signals[-1].strip()
+    else:
+        reason = nonblank[-1].strip() if nonblank else "(no stderr)"
+    head = [f"exit_code={rc}"]
+    if statuses:
+        head.append(f"job={statuses[-1]}")
+    if progress and progress.get("step") is not None:
+        head.append(f"last_step={progress.get('step')}")
+    cause = " ".join(head) + ": " + reason[:400]
+    detail: list[str] = []
+    if tb:
+        detail += ["--- last traceback ---", *tb]
+    if signals:
+        detail += ["--- error signals ---", *signals]
+    tail = "\n".join(nonblank)[-tail_chars:]
+    if tail:
+        detail += ["--- stderr tail ---", tail]
+    return cause, "\n".join(detail)
+
+
+def save_failed_leg_evidence(root, hotkey: str, *, header: dict, stdout: str, stderr: str,
+                             clock=time.time) -> str | None:
+    """Write the fetched stdout + stderr tails of a failed leg to
+    ``root/<hotkey12>-<utc-ts>.log`` (at most ``FAILED_LEG_LOG_MAX_BYTES``;
+    the newest ``FAILED_LEG_LOGS_KEEP`` files are kept). Runs BEFORE the
+    failure propagates to any teardown. Best-effort: returns the path, or
+    None when it could not be written."""
+    if not root:
+        return None
+    try:
+        d = Path(root)
+        d.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(float(clock())))
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", str(hotkey or "unknown"))[:12]
+        path = d / f"{safe}-{ts}.log"
+        n = 1
+        while path.exists():
+            path = d / f"{safe}-{ts}-{n}.log"
+            n += 1
+        budget = FAILED_LEG_LOG_MAX_BYTES // 2
+        out_b = (stdout or "").encode("utf-8", "replace")[-budget:]
+        err_b = (stderr or "").encode("utf-8", "replace")[-budget:]
+        text = (json.dumps(header, sort_keys=True, default=str) + "\n"
+                + "=== stdout (tail) ===\n" + out_b.decode("utf-8", "replace")
+                + "\n=== stderr (tail) ===\n" + err_b.decode("utf-8", "replace") + "\n")
+        data = text.encode("utf-8", "replace")
+        if len(data) > FAILED_LEG_LOG_MAX_BYTES:
+            data = data[:1024] + data[-(FAILED_LEG_LOG_MAX_BYTES - 1024):]
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_bytes(data)
+        tmp.replace(path)
+        logs = sorted((p for p in d.glob("*.log") if p != path),
+                      key=lambda p: (p.stat().st_mtime, p.name))
+        for old in logs[:max(0, len(logs) + 1 - FAILED_LEG_LOGS_KEEP)]:
+            with contextlib.suppress(OSError):
+                old.unlink()
+        return str(path)
+    except Exception as e:  # noqa: BLE001 — evidence never masks the failure itself
+        log.warning("failed-leg evidence for %s not saved: %s", str(hotkey)[:12], e)
+        return None
 
 
 def _detached_kill_command(host: RemoteHost, run_dir: str) -> str:
@@ -691,6 +831,7 @@ def run_detached(host: RemoteHost, body: str, stdin_env: str | None, run_dir: st
     misses = 0
     rc: int | None = None
     vanished = False
+    last_progress: dict | None = None    # the worker's last step record seen by a poll
     poll_argv = build_ssh_argv(host, _detached_poll_command(host, run_dir))
     while True:
         if cancel is not None and cancel.is_set():
@@ -727,10 +868,13 @@ def run_detached(host: RemoteHost, body: str, stdin_env: str | None, run_dir: st
         misses = 0
         last_seen = now
         if token == "RUNNING":
+            seen = parse_progress(lines)
+            if seen is not None:
+                last_progress = seen
             if on_running is not None:
                 on_running()
             if on_progress is not None:
-                why = on_progress(parse_progress(lines))
+                why = on_progress(seen)
                 if why:
                     with contextlib.suppress(Exception):  # best-effort
                         run(build_ssh_argv(host, _detached_kill_command(host, run_dir)), 60, "")
@@ -757,14 +901,31 @@ def run_detached(host: RemoteHost, body: str, stdin_env: str | None, run_dir: st
             pass
         _SLEEP(20)
     if out is None:
+        step = (last_progress or {}).get("step")
+        at = f", last_step={step}" if step is not None else ""
         raise RemoteDispatchError(
-            f"{describe}: detached worker finished (rc={rc}) but its output could not "
+            f"{describe}: detached worker finished (rc={rc}{at}) but its output could not "
             f"be fetched after 6 attempts", returncode=rc)
     stdout, _, stderr = out.partition(DETACHED_STDERR_MARK)
+    stderr, _, fetched = stderr.partition(DETACHED_FETCH_PROGRESS_MARK)
+    progress = _parse_fetched_progress(fetched) or last_progress
     if vanished:
         stderr = stderr.rstrip() + "\n[detached worker process vanished without an exit code]"
-    return subprocess.CompletedProcess(args=fetch_argv, returncode=rc,
+    proc = subprocess.CompletedProcess(args=fetch_argv, returncode=rc,
                                        stdout=stdout, stderr=stderr)
+    proc.progress = progress          # the worker's last step record (or None)
+    return proc
+
+
+def _parse_fetched_progress(text: str) -> dict | None:
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:
+        rec = json.loads(text.splitlines()[0])
+    except ValueError:
+        return None
+    return rec if isinstance(rec, dict) else None
 
 
 def pinned_known_hosts_file(host: RemoteHost) -> Path:
@@ -1329,6 +1490,9 @@ class RemoteDispatcher:
     # on every RUNNING poll (the funded leg's progress watchdog — see
     # cascade.trainer.cost_guards.ProgressWatchdog).
     on_progress: object = field(default=None, repr=False)
+    # Where a failed leg's fetched stdout/stderr tails are saved on the
+    # orchestrator box (save_failed_leg_evidence); None = not saved.
+    evidence_dir: str | None = None
     _runner: object = field(default=None, repr=False)  # injectable for tests
 
     def dispatch(
@@ -1454,18 +1618,32 @@ class RemoteDispatcher:
                 proc = (self._runner or run_ssh)(ssh_argv, self.timeout_seconds, stdin_env)
             except subprocess.TimeoutExpired as e:
                 raise RemoteDispatchError(f"remote {role} on {host.name} timed out") from e
+        where = ""
+        progress = getattr(proc, "progress", None)
+        if proc.returncode != 0:
+            # Save the evidence BEFORE the failure reaches any teardown: the
+            # pod (and its run dir) is usually gone seconds later.
+            saved = save_failed_leg_evidence(
+                self.evidence_dir, hotkey,
+                header={"role": role, "host": host.name, "address": f"{host.host}:{host.port}",
+                        "base_seed": base_seed, "exit_code": proc.returncode,
+                        "progress": progress},
+                stdout=proc.stdout or "", stderr=proc.stderr or "")
+            where = f" [evidence: {saved}]" if saved else ""
         if proc.returncode == 3:
             # Worker rc=3 = miner submission rejected (CorpusError): the
             # worker's one-line reason — no traceback to relay.
             raise RemoteDispatchError(
                 f"remote {role} on {host.name}: miner submission rejected: "
-                f"{rejection_reason(proc.stderr)}",
+                f"{rejection_reason(proc.stderr)}{where}",
                 returncode=3,
             )
         if proc.returncode != 0:
-            tail = (proc.stderr or "")[-2000:]
+            cause, detail = summarize_failure(proc.stderr or "", rc=proc.returncode,
+                                              progress=progress)
             raise RemoteDispatchError(
-                f"remote {role} on {host.name} failed (rc={proc.returncode}): {tail}",
+                f"remote {role} on {host.name} failed (rc={proc.returncode}) {cause}{where}"
+                + (f"\n{detail}" if detail else ""),
                 returncode=proc.returncode,
             )
         receipt = parse_receipt(proc.stdout or "")

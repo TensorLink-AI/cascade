@@ -517,8 +517,8 @@ class _FundedPodMixin:
 
     # An unreachable pod is kept this long from the first sweep that could not
     # reach it (unreachable ≠ dead: the leg's own poll rides out transport
-    # blips the same way). Per process: a restart restarts the grace, which
-    # errs toward keeping.
+    # blips the same way). Persisted (sweep_unreachable.json beside the
+    # ledger): repeated restarts must not reset the grace forever.
     SWEEP_UNREACHABLE_GRACE_SECONDS = 1800.0
     # A finished exit-0 run with no harvested marker keeps its pod this long
     # after it exited; past it nothing will harvest it (the re-attach pass
@@ -565,6 +565,56 @@ class _FundedPodMixin:
             for k in sorted(recs, key=recs.get)[:max(0, len(recs) - self.POD_HARVEST_RECORDS_MAX)]:
                 recs.pop(k, None)
             write_text_atomic(self._pod_harvests_path(), json.dumps(recs, indent=0), backup=True)
+
+    SWEEP_UNREACHABLE_FORGET_SECONDS = 7 * 86400.0
+
+    def _sweep_unreachable_path(self) -> Path:
+        return Path(self.work_root) / "sweep_unreachable.json"
+
+    def _sweep_unreachable(self) -> dict:
+        """``pod id -> wall time the sweep first found it unreachable``,
+        loaded once per process from the persisted file."""
+        cache = self.__dict__.get("_sweep_unreachable_since")
+        if cache is not None:
+            return cache
+        cache = {}
+        if getattr(self, "work_root", None) is not None:
+            from ..shared.atomic import read_text_with_backup
+
+            def parse(text):
+                return {str(k): float(v) for k, v in dict(json.loads(text)).items()}
+
+            try:
+                rows, _ = read_text_with_backup(self._sweep_unreachable_path(), parse)
+                cache.update(rows or {})
+            except Exception as e:  # noqa: BLE001 — empty = a fresh grace (keeps)
+                log.warning("sweep unreachable records unreadable (%s) — graces restart", e)
+        self.__dict__["_sweep_unreachable_since"] = cache
+        return cache
+
+    def _sweep_unreachable_update(self, pod_id: str, now: float, *, down: bool) -> float:
+        """Record (``down``) or clear ``pod_id``'s unreachable-since stamp and
+        persist the change; returns the stamp (``now`` when cleared)."""
+        lock = self.__dict__.setdefault("_sweep_unreachable_lock", threading.Lock())
+        with lock:
+            recs = self._sweep_unreachable()
+            before = dict(recs)
+            if down:
+                since = recs.setdefault(str(pod_id), float(now))
+            else:
+                since = float(now)
+                recs.pop(str(pod_id), None)
+            for k in [k for k, v in recs.items() if now - v > self.SWEEP_UNREACHABLE_FORGET_SECONDS]:
+                recs.pop(k, None)              # long-gone pods never pile up
+            if recs != before and getattr(self, "work_root", None) is not None:
+                from ..shared.atomic import write_text_atomic
+
+                try:
+                    write_text_atomic(self._sweep_unreachable_path(),
+                                      json.dumps(recs, indent=0, sort_keys=True), backup=True)
+                except OSError as e:
+                    log.warning("sweep unreachable records not persisted: %s", e)
+            return since
 
     def _operator_pod_provider(self, pod):
         """The provider ``_teardown_operator_pod`` would terminate ``pod`` on."""
@@ -617,7 +667,6 @@ class _FundedPodMixin:
         A kept pod costs $/h; a cut pod costs the whole leg — every keep is
         logged at ERROR so an operator sees the bill."""
         clock = getattr(self, "_sweep_clock", None) or time.time
-        since_map = self.__dict__.setdefault("_sweep_unreachable_since", {})
         now = float(clock())
         try:
             if adapter is None:
@@ -645,7 +694,7 @@ class _FundedPodMixin:
                 probe = probe_pod_runs(host, runner=getattr(self, "_sweep_ssh_runner", None),
                                        timeout=self.SWEEP_PROBE_TIMEOUT_SECONDS)
             if probe is None or not probe.reachable:
-                since = since_map.setdefault(pod_id, now)
+                since = self._sweep_unreachable_update(pod_id, now, down=True)
                 down = now - since
                 why = "no ssh address" if probe is None else (probe.error or "ssh failed")
                 if down < self.SWEEP_UNREACHABLE_GRACE_SECONDS:
@@ -656,9 +705,9 @@ class _FundedPodMixin:
                 log.error("funded sweep: %s %s unreachable (%s) for %.0fs, past the %.0fs "
                           "grace — releasing", what, pod_id, why, down,
                           self.SWEEP_UNREACHABLE_GRACE_SECONDS)
-                since_map.pop(pod_id, None)
+                self._sweep_unreachable_update(pod_id, now, down=False)
                 return False
-            since_map.pop(pod_id, None)
+            self._sweep_unreachable_update(pod_id, now, down=False)
             if probe.live:
                 log.error("funded sweep: KEEPING %s %s — %d live detached worker(s) (%s); "
                           "its leg is not in flight here — check it", what, pod_id,

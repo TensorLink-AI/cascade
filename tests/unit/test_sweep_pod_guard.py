@@ -210,6 +210,31 @@ def test_guard_keeps_an_unreachable_pod_through_its_grace_then_releases(tmp_path
     assert not r._sweep_keeps_pod(adapter, "pod-a", what="t")       # unreachable that long
 
 
+def test_unreachable_grace_survives_restarts(tmp_path):
+    """Repeated restarts must not reset the grace forever: the first-seen
+    stamp is persisted beside the ledger."""
+    adapter = _Adapter({"pod-a": _addr("10.0.0.1")})
+    r = _Runner(tmp_path, _SSH({}))
+    assert r._sweep_keeps_pod(adapter, "pod-a", what="t")           # first seen down at NOW
+    assert json.loads((tmp_path / "sweep_unreachable.json").read_text()) == {"pod-a": NOW}
+    restarted = _Runner(tmp_path, _SSH({}))                         # a new process
+    restarted.clock[0] = NOW + _FundedPodMixin.SWEEP_UNREACHABLE_GRACE_SECONDS - 1
+    assert restarted._sweep_keeps_pod(adapter, "pod-a", what="t")
+    again = _Runner(tmp_path, _SSH({}))
+    again.clock[0] = NOW + _FundedPodMixin.SWEEP_UNREACHABLE_GRACE_SECONDS
+    assert not again._sweep_keeps_pod(adapter, "pod-a", what="t")   # grace NOT reset
+    assert json.loads((tmp_path / "sweep_unreachable.json").read_text()) == {}
+
+
+def test_unreachable_stamps_clear_on_contact_and_old_ones_are_forgotten(tmp_path):
+    (tmp_path / "sweep_unreachable.json").write_text(json.dumps(
+        {"long-gone": NOW - _FundedPodMixin.SWEEP_UNREACHABLE_FORGET_SECONDS - 1,
+         "pod-a": NOW - 60}))
+    r = _Runner(tmp_path, _SSH({"10.0.0.1": _live()}))
+    assert r._sweep_keeps_pod(_Adapter({"pod-a": _addr("10.0.0.1")}), "pod-a", what="t")
+    assert json.loads((tmp_path / "sweep_unreachable.json").read_text()) == {}
+
+
 def test_a_reachable_answer_resets_the_unreachable_grace(tmp_path):
     ssh = _SSH({})
     r = _Runner(tmp_path, ssh)
