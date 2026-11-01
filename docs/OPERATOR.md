@@ -1194,7 +1194,10 @@ completion. The trainer runs no challenger or king sweep, no payer-pod
 verification and no bench hold for those eras, and no init bench either:
 the main validator benches the init itself. For a random-init seed epoch the
 trainer only publishes the init POINTER (a pointer-only `role = "init"`
-report entry whose six scores are the `-1.0` sentinel): the random-init
+report entry whose six scores are the `-1.0` sentinel — published alone,
+with no rows, and never scored: `BenchEntry.pointer_only` marks it,
+`entry_for_pointer` skips it, the king check and the audit defer on it, and
+older validator builds defer too, on the missing king entry and init rows): the random-init
 checkpoint is built on the era's already-mapped operator king pod after the
 epoch's king leg (CPU, `moe_trainer.build_random_init` run pod-side, refused
 on a contract-digest mismatch), copied back as plain files, verified against

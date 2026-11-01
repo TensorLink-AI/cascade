@@ -37,6 +37,7 @@ from __future__ import annotations
 import logging
 from dataclasses import replace
 
+from ..shared.bench_report import POINTER_ONLY_INIT_REASON
 from ..shared.emission import (
     KeySlash,
     LadderState,
@@ -420,6 +421,13 @@ class KingCheckMixin:
             return None
         if ib is None:
             rec["reasons"].append("bench report has no init entry")
+            return None
+        if ib.pointer_only:
+            # DEC-CA-0063: a pointer-only init entry's sentinels are not a
+            # bench — never compared (the trainer also publishes it with no
+            # king entry and no rows, so an older build defers above / on the
+            # missing rows)
+            rec["reasons"].append(POINTER_ONLY_INIT_REASON)
             return None
         if manifest.warm_start_ckpt and ib.trained_pointer != manifest.warm_start_ckpt:
             rec["reasons"].append(f"bench init entry {ib.trained_pointer!r} is not the era init "

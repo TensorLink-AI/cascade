@@ -7,6 +7,8 @@ import hashlib
 import logging
 import threading
 
+from ..shared.bench_report import SIX_SCORE_KEYS as _SIX_SCORE_KEYS
+from ..shared.bench_report import pointer_only_init_scores
 from ..shared.manifest import BenchScores
 from .contract import RoundSeeds
 from .faults import (
@@ -60,20 +62,9 @@ def _bench_fev_required(cfg, era) -> bool:
 
 # DEC-CA-0063 eras: the main validator benches the init itself (king check,
 # ``_vbench_side(init_e, role="init")``); all it reads from the trainer's
-# report is the "init" entry's POINTER. A BenchEntry must carry six numbers,
-# so a pointer-only init entry carries this sentinel — negative, which no
-# CRPS / MASE can be — instead of a sweep. Nothing reads them: the trainer
-# report of a validator-sourced era has no king entry (the trainer benches no
-# king), so the trainer-report king check defers before comparing scores.
-INIT_POINTER_ONLY_SCORE = -1.0
-_SIX_SCORE_KEYS = ("gifteval_crps", "gifteval_mase", "boom_crps", "boom_mase",
-                   "time_crps", "time_mase")
-
-
-def pointer_only_init_scores() -> dict:
-    """The init entry's scores in a validator-sourced era (see
-    :data:`INIT_POINTER_ONLY_SCORE`): six sentinels, no FEV pair."""
-    return {k: INIT_POINTER_ONLY_SCORE for k in _SIX_SCORE_KEYS}
+# report is the "init" entry's POINTER — a pointer-only entry (sentinel
+# scores, see cascade.shared.bench_report.POINTER_ONLY_INIT_SCORE) that every
+# reader defers on. ``_rolling_publish_bench`` keeps it alone in its report.
 
 
 # How long the pod-side random-init build may take (CPU construction + save of
@@ -1212,6 +1203,8 @@ class _RollingMixin:
 
     def _rolling_publish_bench(self, round_id: str, created_block: int, pairs: list, *,
                                rows_for: frozenset | None = None, init: dict | None = None):
+        import dataclasses
+
         from ..shared.bench_report import (
             BenchEntry,
             BenchReport,
@@ -1236,12 +1229,25 @@ class _RollingMixin:
             # king's six suite means against.
             try:
                 ip = str(init.get("pointer") or "")
-                entries = (*entries, BenchEntry(
+                ie = BenchEntry(
                     role="init", size=str(init.get("size") or primary), miner_hotkey="",
                     miner_uid=-1, trained_pointer=ip,
                     scores=BenchScores(**init["scores"]),
                     rows_key=rows.get(ip, {}).get("key", "") if ip else "",
-                    rows_sha256=rows.get(ip, {}).get("sha256", "") if ip else ""))
+                    rows_sha256=rows.get(ip, {}).get("sha256", "") if ip else "")
+                if ie.pointer_only:
+                    # DEC-CA-0063 pointer-only init: alone in its report, with no
+                    # rows, so even a reader that predates the marker defers
+                    # before comparing its sentinels — the king check finds no
+                    # king entry (and under rule v2 no init rows)
+                    ie = dataclasses.replace(ie, rows_key="", rows_sha256="")
+                    if entries:
+                        log.warning("bench report round=%s: %d scored entr%s dropped next to "
+                                    "a pointer-only init entry (validator bench source: "
+                                    "the main validator's report carries them)", round_id,
+                                    len(entries), "y" if len(entries) == 1 else "ies")
+                    entries = ()
+                entries = (*entries, ie)
             except (ValueError, KeyError, TypeError) as e:
                 log.warning("bench report round=%s: init entry not representable on this "
                             "build (%s) — published without it", round_id, e)
