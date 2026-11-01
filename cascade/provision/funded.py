@@ -196,6 +196,14 @@ def quarantine_lemon_host(provider: Provider, pod_id: str, reason: str) -> str:
     else:
         log.warning("lium: lemon pod %s has no resolvable host — nothing quarantined",
                     pod_id)
+    # The executor itself (and its learned GPU / site identity) is skipped too:
+    # Lium lists no executor IPs, so the host quarantine alone may not steer.
+    marker = getattr(provider, "record_executor_fault", None)
+    if callable(marker):
+        try:
+            marker(pod_id, reason)
+        except Exception as e:  # noqa: BLE001 — never mask the lemon
+            log.warning("lium: could not mark lemon pod %s's executor bad: %s", pod_id, e)
     return host
 
 
