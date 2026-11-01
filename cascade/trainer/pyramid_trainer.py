@@ -112,8 +112,17 @@ def combine_gradients(parameters, reference, cap=0.1):
 # inherits an average). The SCORED weights.safetensors is the
 # POWER_EMA_SIGMA_RELS[POWER_EMA_EVAL] average; a continuation snapshot carries
 # the raw model plus every EMA state, so a resumed leg restores them bitwise.
+#
+# ACTIVATION (owner 2026-11-01 ~06:35): the EMA is ON only from the first
+# warm-start seed epoch after the image ships — see power_ema_active. A seed
+# epoch shares ONE init (DEC-CA-0055), so the rule is identical for the king's
+# retrain and every challenger of an epoch; a random-init epoch stays raw and
+# byte-identical to the pre-EMA trainer.
 POWER_EMA_SIGMA_RELS = (0.05, 0.10)
 POWER_EMA_EVAL = 1
+# config.json key an EMA-scored checkpoint carries (validators read only
+# ``moe``); a lane-B expert leg inherits the decision from its base king.
+POWER_EMA_MARKER = "power_ema"
 
 
 def power_ema_settings():
@@ -132,6 +141,34 @@ def power_ema_settings():
     return sigmas, index
 
 
+def power_ema_active(warm_start_dir, expert_selection):
+    """Is the power EMA on for this leg? Derived only from the leg's INIT
+    (never wall-clock, image or role), so a seed epoch is never mixed:
+
+    * random init (no ``warm_start_dir``) — the v2 epoch that begins at the
+      first v2 era — stays raw;
+    * a king / challenger (heat or full) leg from a warm-start init — only
+      a DEC-CA-0013 promoted init, the seed epoch's ``warm_start_ckpt``, is
+      ever passed to them — is EMA-scored;
+    * a lane-B expert leg (``expert_selection``) fine-tunes FROM a king
+      checkpoint, so it follows that king: EMA iff the king was itself
+      EMA-scored (its ``config.json`` carries :data:`POWER_EMA_MARKER`),
+      i.e. iff the king's seed epoch began at a promotion.
+
+    A continuation re-derives the same answer from the same init."""
+    import json
+
+    if warm_start_dir is None:
+        return False
+    if expert_selection is None:
+        return True
+    try:
+        obj = json.loads((Path(warm_start_dir) / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(obj, dict) and isinstance(obj.get(POWER_EMA_MARKER), dict)
+
+
 def power_ema_state(emas):
     """Every EMA's shadows and step counter as one flat tensor dict."""
     flat = {}
@@ -140,7 +177,7 @@ def power_ema_state(emas):
     return flat
 
 
-def save_checkpoint(out, state, cfg, contract):
+def save_checkpoint(out, state, cfg, contract, *, power_ema=None):
     import json
 
     from .ckpt_digest import save_tensors_hashed
@@ -148,9 +185,13 @@ def save_checkpoint(out, state, cfg, contract):
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     save_tensors_hashed(state, out / "weights.safetensors")
-    (out / "config.json").write_text(json.dumps({"moe": cfg.to_dict(),
+    meta = {"moe": cfg.to_dict(),
         "quantile_levels": list(QUANTILE_LEVELS), "base_arch": contract.base_arch,
-        "arch": contract.arch_preset, "input_transform": contract.input_transform}, sort_keys=True))
+        "arch": contract.arch_preset, "input_transform": contract.input_transform}
+    if power_ema is not None:
+        # only on EMA-scored legs; a raw leg's config.json is byte-identical
+        meta[POWER_EMA_MARKER] = power_ema
+    (out / "config.json").write_text(json.dumps(meta, sort_keys=True))
     (out / "model.py").write_bytes(Path(__file__).with_name("pyramid_model.py").read_bytes())
     (out / "forecast_wrapper.py").write_bytes(Path(__file__).with_name("pyramid_wrapper.py").read_bytes())
 
@@ -178,6 +219,8 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
         if getattr(contract, name) != value:
             raise ValueError(f"pyramid recipe requires {name}={value!r}")
     ema_sigmas, ema_eval = power_ema_settings()
+    if not power_ema_active(warm_start_dir, expert_selection):
+        ema_sigmas, ema_eval = (), -1
     if tuple(contract.accepted_fields) not in ((), ("groups",)):
         raise ValueError("pyramid recipe accepts only optional groups")
     if str(trainer.dtype) != "torch.float32":
@@ -276,6 +319,8 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
         for ema in emas:
             if not ema.load_state_tensors(restored.get("emas") or {}):
                 raise ValueError("pyramid continuation lacks its power EMA state")
+        if not emas and restored.get("emas"):
+            raise ValueError("pyramid continuation carries power EMA state this raw leg never uses")
         if gang is not None:
             gang.scatter_pending = True
         stable = restored["stable"]
@@ -375,7 +420,7 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
                     "channel_tokens": channel_tokens, "model": model.state_dict(),
                     "leaves": dict(slices.named_parameters()) if slices else {},
                     "optimizer": optimizer.state_tensors(names), "stable": stable,
-                    "emas": power_ema_state(emas),
+                    **({"emas": power_ema_state(emas)} if emas else {}),
                     "last_loss": last_loss, "last_joint": last_joint, "elapsed": time.time() - started,
                     "data_wait": timed.wait_s,
                     "rng": rng_state(), "mask_rng": mask_rng.bit_generator.state,
@@ -410,7 +455,9 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
         if slices:
             scored = restore_frozen(scored, base, expert_selection, moe_param_names(model))
     out = Path(out_dir)
-    save_checkpoint(out, scored, cfg, contract)
+    save_checkpoint(out, scored, cfg, contract, power_ema=(
+        {"sigma_rels": list(ema_sigmas), "scored_sigma_rel": ema_sigmas[ema_eval]}
+        if ema_eval >= 0 else None))
     from .ckpt_digest import save_tensors_hashed
 
     if slices is None:

@@ -158,6 +158,25 @@ or `[v2.training]` and are not part of `contract_digest`. The pyramid recipe
 check still requires the contract's own `power_ema_sigma_rels` to be empty. A
 change ships as a new worker image at an era boundary.
 
+**Activation:** the EMA activates at the first warm-start seed epoch after the
+image ships. The trainer decides it from the leg's init only, never from
+wall-clock time, the image or the role (`power_ema_active`). Every era of a
+seed epoch shares one init (DEC-CA-0055), so the king's retrain and every
+challenger in an epoch get the same decision:
+
+- A random-init leg (the first v2 seed epoch) stays raw. Its output bytes are
+  exactly what the trainer produced before this feature.
+- A king or challenger leg (heat or full) that trains from a warm-start init, the
+  seed epoch's promoted `warm_start_ckpt`, is EMA-scored.
+- A lane-B expert leg fine-tunes from a king checkpoint and follows that king.
+  It is EMA-scored only when the king was, which means the king's seed epoch
+  began at a promotion. An EMA-scored checkpoint records this as a
+  `power_ema` key in `config.json`; validators read only `moe`. A raw leg's
+  `config.json` has no such key.
+
+A resumed leg reaches the same decision from the same init. A snapshot made
+under the other decision is refused.
+
 Every leg starts its own average. A warm-started leg resumes the raw
 `weights_stable.safetensors` + `optimizer.safetensors` lineage, which the EMA
 never changes, and does not inherit an average. An expert leg averages only its
