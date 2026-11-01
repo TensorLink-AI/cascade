@@ -48,8 +48,10 @@ def test_knob_ships_off_on_mainnet_and_testnet():
 def _with(tmp_path, value):
     text = (ROOT / "chain.toml").read_text()
     text = re.sub(r"(?m)^init_epoch_bind_from_block\s*=.*$", "", text)
-    text = text.replace("king_ladder = true",
-                        f"king_ladder = true\ninit_epoch_bind_from_block = {value}", 1)
+    # the [v2] key line itself (the phrase also appears in comments above it)
+    text, n = re.subn(r"(?m)^king_ladder = true$",
+                      f"king_ladder = true\ninit_epoch_bind_from_block = {value}", text, count=1)
+    assert n == 1
     p = tmp_path / "chain.toml"
     p.write_text(text)
     return p
