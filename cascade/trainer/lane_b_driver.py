@@ -1521,9 +1521,15 @@ def lane_breaker_failure(exc: BaseException) -> dict:
     else ``{}`` — the same verdict the rolling path records
     (:func:`cascade.trainer.runner_rolling.record_lane_breaker_victim`): the
     LANE failed, so the leg requeues unburned without operator-fault backoff."""
+    from .faults import _NoOperatorLanes
+    from .lane_c_driver import LegFailure
+
+    if isinstance(exc, _NoOperatorLanes):
+        return {"failure": LegFailure(
+            f"no operator lanes left — requeued without backoff ({exc})",
+            miner_fault=False, error_class="no_capacity", burn=False)}
     if not getattr(exc, "lane_breaker", False):
         return {}
-    from .lane_c_driver import LegFailure
 
     return {"failure": LegFailure(
         f"LANE BREAKER: the operator lane this leg ran on failed several different legs "

@@ -246,7 +246,12 @@ class _RollingMixin:
                         **leg_corpus(self, gen, seeds, contract),   # cached
                     )
                 except Exception as e:
-                    record_lane_breaker_victim(self, gen.hotkey, e)
+                    from .faults import record_no_lanes_verdict
+
+                    # No live lane / a broken lane: the LANES failed, not the
+                    # leg — no_capacity, no backoff; the next try rents.
+                    if not record_lane_breaker_victim(self, gen.hotkey, e):
+                        record_no_lanes_verdict(self, gen.hotkey, e)
                     raise
                 if used:
                     self._final_role_hosts[("challenger", contract.arch_preset, gen.hotkey)] = used[-1]

@@ -74,6 +74,25 @@ class _LaneDeadlinePassed(Exception):
     and starting hours late."""
 
 
+class _NoOperatorLanes(_LaneDeadlinePassed):
+    """The lane pool has ZERO live lanes (all removed from hosts.toml, drained,
+    refused or breaker-held): waiting can never be served. The leg requeues
+    as ``no_capacity`` (unburned, no backoff) and its next try takes the
+    rent path — an operator pod for an operator-billed entry, the miner's
+    own key for a miner-funded one."""
+
+
+def record_no_lanes_verdict(runner, hotkey: str, exc: BaseException) -> bool:
+    """Record the ``no_capacity`` verdict for a leg that found no live
+    operator lane (``_NoOperatorLanes``); returns True when it did."""
+    if not isinstance(exc, _NoOperatorLanes):
+        return False
+    runner._record_funded_failure(
+        hotkey, f"no operator lanes left — requeued without backoff; the next try rents "
+        f"({exc})", miner_fault=False, error_class="no_capacity", burn=False)
+    return True
+
+
 def _http_status_in_chain(exc: BaseException | None) -> int | None:
     """First HTTP status code found walking an exception's cause chain."""
     seen: set[int] = set()

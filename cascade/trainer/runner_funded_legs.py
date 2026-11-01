@@ -262,9 +262,11 @@ class _FundedLegMixin:
                                         and prior.last_error_class == STALL_CLASS))
                 if error_class == "infra":
                     error_class = OPERATOR_FAULT_CLASS
+            from .faults import record_no_lanes_verdict
             from .runner_rolling import record_lane_breaker_victim
 
-            if not record_lane_breaker_victim(self, gen.hotkey, e):
+            if not (record_lane_breaker_victim(self, gen.hotkey, e)
+                    or record_no_lanes_verdict(self, gen.hotkey, e)):
                 self._record_funded_failure(gen.hotkey, str(e), miner_fault=miner_fault,
                                             error_class=error_class, burn=False)
             raise
