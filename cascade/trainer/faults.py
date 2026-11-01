@@ -142,6 +142,19 @@ def _transport_failure(exc: BaseException) -> bool:
     return "Connection refused" in str(exc)
 
 
+def _lane_fault(exc: BaseException) -> bool:
+    """Whether a lane dispatch failure counts against the LANE (the circuit
+    breaker): an operator-side fault of that lane — a config error (rc 2),
+    a crashed worker, a throughput abort. Never the miner's own faults
+    (rc 3, tamper, a diverged checkpoint), never a storage-layer blip (global,
+    not the lane's) and never a transport loss (the dead-pod drain owns it)."""
+    if isinstance(exc, (_FundedTamper, _FundedDiverged, _LaneDeadlinePassed)):
+        return False
+    if getattr(exc, "returncode", None) == 3:
+        return False
+    return not (_storage_failure(exc) or _transport_failure(exc))
+
+
 def _quarantine_lane_host(host, reason: str) -> None:
     """Quarantine the pod's host IP (Lium relists the same machine under new
     executor ids) after a transport failure; loopback/profile hosts skipped.

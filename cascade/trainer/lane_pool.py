@@ -43,9 +43,13 @@ class _FinalLanePool(queue.Queue):
     # A lane that failed the join gate or was drained as dead is re-gated no
     # sooner than this (a pod still booting, or one that came back).
     REJECT_RETRY_S = 600.0
+    # A lane the circuit breaker took out stays out this long (it failed
+    # several different legs in a row — an operator config/host fault that a
+    # 10-minute re-gate would only feed the next legs).
+    BREAKER_HOLD_S = 6 * 3600.0
 
     def __init__(self, initial_hosts: list, refresh_fn, gate_fn=None, *,
-                 sync_from_file: bool = False):
+                 sync_from_file: bool = False, breaker_threshold: int = 0):
         super().__init__()
         # True: the refresh also updates/removes KNOWN lanes (class doc);
         # False keeps the join-only refresh.
@@ -58,6 +62,16 @@ class _FinalLanePool(queue.Queue):
         self._absorb_lock = threading.Lock()
         self._known: dict[str, object] = {}
         self._rejected: dict[str, float] = {}  # lane name -> earliest re-gate time
+        # Lane circuit breaker ([round] operator_lane_breaker_failures; 0 =
+        # off): lane name -> the DISTINCT legs it failed operator-side since
+        # its last successful leg.
+        self.breaker_threshold = int(breaker_threshold or 0)
+        self._lane_failures: dict[str, list[str]] = {}
+        # Lanes the breaker took out: name -> the host object it tripped on.
+        # With ``sync_from_file`` an EDITED entry (the operator fixed the lane)
+        # ends the hold at once and re-joins through the gate; an unchanged
+        # entry waits out BREAKER_HOLD_S.
+        self._breaker_held: dict[str, object] = {}
         # The initial lanes are taken as given; the gate guards lanes that
         # JOIN later.
         for h in initial_hosts:
@@ -89,18 +103,22 @@ class _FinalLanePool(queue.Queue):
         return (getattr(a, "host", None), getattr(a, "port", None)) == (
             getattr(b, "host", None), getattr(b, "port", None))
 
-    def mark_dead(self, host, reason: str) -> list[str]:
+    def mark_dead(self, host, reason: str, *, lane_only: bool = False,
+                  hold_s: float | None = None) -> list[str]:
         """Drain every lane on ``host``'s pod: a transport failure (ssh refused,
         detached worker unreachable) is a POD fault, and its sibling lanes
         would only feed the next leg's single retry the same dead endpoint.
         The lanes leave membership; the hosts file re-offers them after
-        ``REJECT_RETRY_S`` through the gate. Returns the drained names."""
+        ``REJECT_RETRY_S`` (or ``hold_s``) through the gate. ``lane_only``
+        drains just ``host``'s own lane (the circuit breaker: siblings on the
+        same pod get their own count). Returns the drained names."""
         with self._absorb_lock:
-            dead = [n for n, h in self._known.items() if self.same_pod(h, host)]
             name = getattr(host, "name", str(host))
+            dead = [] if lane_only else [n for n, h in self._known.items()
+                                         if self.same_pod(h, host)]
             if name not in dead:
                 dead.append(name)
-            until = time.time() + self.REJECT_RETRY_S
+            until = time.time() + (self.REJECT_RETRY_S if hold_s is None else float(hold_s))
             for n in dead:
                 self._known.pop(n, None)
                 self._pending.pop(n, None)
@@ -120,6 +138,39 @@ class _FinalLanePool(queue.Queue):
                         len(dead), getattr(host, "host", "?"), getattr(host, "port", "?"),
                         reason, ", ".join(dead))
         return dead
+
+    def record_leg_outcome(self, host, leg: str, *, ok: bool,
+                           operator_fault: bool = True, reason: str = "") -> bool:
+        """The lane circuit breaker. A successful leg resets ``host``'s lane;
+        an operator-side failure of a leg it has not failed yet counts one;
+        miner faults count nothing either way. At ``breaker_threshold``
+        DIFFERENT legs failed in a row the lane leaves the rotation for
+        ``BREAKER_HOLD_S`` with one ERROR "LANE BREAKER" line — 2026-11-01:
+        one lane failed ~30 legs in seconds each (rc=2, its config), every one
+        of them accruing requeues and backoff. Returns True when it tripped."""
+        name = getattr(host, "name", str(host))
+        with self._absorb_lock:
+            if ok:
+                self._lane_failures.pop(name, None)
+                return False
+            if not operator_fault or self.breaker_threshold <= 0:
+                return False
+            legs = self._lane_failures.setdefault(name, [])
+            if leg not in legs:
+                legs.append(leg)
+            n = len(legs)
+            if n < self.breaker_threshold:
+                return False
+            self._lane_failures.pop(name, None)
+            self._breaker_held[name] = host
+        log.error("LANE BREAKER: lane %s (%s:%s) failed %d different legs in a row "
+                  "operator-side with no successful leg between (last: %s) — taken out of "
+                  "rotation for %.1f h; fix the lane, then it re-joins through the gate",
+                  name, getattr(host, "host", "?"), getattr(host, "port", "?"), n,
+                  reason or "?", self.BREAKER_HOLD_S / 3600)
+        self.mark_dead(host, f"LANE BREAKER: {n} different legs failed in a row",
+                       lane_only=True, hold_s=self.BREAKER_HOLD_S)
+        return True
 
     def known_hosts(self) -> list:
         """Current membership (for lane-count geometry): grows as lanes join,
@@ -165,6 +216,8 @@ class _FinalLanePool(queue.Queue):
         for name in list(self._pending):         # the file reverted the change
             if name not in changes:
                 self._pending.pop(name, None)
+        for name in changes:                     # an edited/removed entry: fresh count
+            self._lane_failures.pop(name, None)
         if not changes:
             return
         idle = []
@@ -196,6 +249,7 @@ class _FinalLanePool(queue.Queue):
         with self._absorb_lock:
             if self._sync:
                 self._sync_known(fresh)
+                self._release_edited_breaker_holds(fresh)
             now = time.time()
             for h in fresh:
                 name = getattr(h, "name", None)
@@ -206,8 +260,25 @@ class _FinalLanePool(queue.Queue):
                 if not self._admit(h):
                     continue                      # _admit logs the rejection
                 self._known[name] = h
+                self._breaker_held.pop(name, None)
+                self._lane_failures.pop(name, None)
                 super().put(h)
                 log.info("lane pool: new lane %s joined", name)
+
+    def _release_edited_breaker_holds(self, fresh: list) -> None:
+        """A breaker-held lane whose hosts-file entry CHANGED since it tripped
+        is re-gated now instead of after ``BREAKER_HOLD_S`` (the operator
+        fixed it); an unchanged or absent entry stays held. Caller holds
+        ``_absorb_lock``."""
+        by_name = {getattr(h, "name", None): h for h in fresh}
+        for name, tripped in list(self._breaker_held.items()):
+            new = by_name.get(name)
+            if new is None or new is tripped or new == tripped:
+                continue
+            self._breaker_held.pop(name, None)
+            self._rejected.pop(name, None)
+            log.warning("lane pool: lane %s was edited after its LANE BREAKER trip — "
+                        "re-gating it now", name)
 
     def _deadline_of(self, deadline, host) -> float | None:
         """Per-lane form: ``deadline`` may be a callable ``host -> float|None``

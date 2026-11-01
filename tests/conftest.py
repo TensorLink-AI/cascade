@@ -39,6 +39,23 @@ def _no_live_credentials(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_host_quarantine(tmp_path, monkeypatch):
+    """Every test gets its own (empty) Lium host-quarantine file and an empty
+    permanent host blocklist: a quarantine one test records (a throughput
+    abort, a failed NCCL preflight, a lane join) must never leak into another
+    test's rent selection or lane gate — nor into the operator's real
+    ``~/.cache/cascade/lium_host_quarantine.json``. Tests that need a
+    specific file still ``monkeypatch.setenv`` it themselves."""
+    from cascade.provision import core as provision_core
+
+    monkeypatch.setenv(provision_core.LIUM_QUARANTINE_FILE_ENV,
+                       str(tmp_path / "_lium_host_quarantine.json"))
+    provision_core.set_host_blocklist(())
+    yield
+    provision_core.set_host_blocklist(())
+
+
+@pytest.fixture(autouse=True)
 def _no_secrets_marker():
     """A test that calls a trainer / validator ``main`` marks the pytest
     process as holding secrets (cascade.shared.sandbox_policy); never let

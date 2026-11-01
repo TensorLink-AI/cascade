@@ -22,6 +22,7 @@ generator, build the corpus in the sandbox, train under the fixed contract.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import threading
@@ -1383,6 +1384,7 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
         or failure: a lane that failed for a challenger-specific reason
         (import error, OOM) is still good silicon — only a transport failure
         drains the pod's lanes."""
+        from .faults import _lane_fault
         from .remote import pod_lane_count
 
         # ``prepare(host) -> host`` runs on the CHOSEN lane right before each
@@ -1392,6 +1394,25 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
         _ready = prepare or (lambda h: h)
         _take = ((lambda: free_lanes.get(deadline=deadline)) if deadline is not None
                  else free_lanes.get)
+        # Lane circuit breaker (_FinalLanePool.record_leg_outcome): which leg
+        # this is, and whether a failure is the lane's (operator side).
+        _outcome = getattr(free_lanes, "record_leg_outcome", None)
+        leg_key = "|".join(str(kw.get(k) or "") for k in ("hotkey", "role", "domain"))
+        tripped = False
+
+        def _breaker(lane, exc=None) -> bool:
+            if _outcome is None:
+                return False
+            try:
+                if exc is None:
+                    return bool(_outcome(lane, leg_key, ok=True))
+                return bool(_outcome(lane, leg_key, ok=False,
+                                     operator_fault=_lane_fault(exc),
+                                     reason=error_tail(exc, 200)))
+            except Exception as be:  # noqa: BLE001 — the breaker never sinks a dispatch
+                log.warning("lane breaker bookkeeping failed (ignored): %s", be)
+                return False
+
         host = _take()
         try:
             entry = disp.dispatch(_ready(host), lane_count=pod_lane_count(host, hosts), **kw)
@@ -1405,7 +1426,9 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
                 free_lanes.mark_dead(host, error_tail(e, 160))
                 _quarantine_lane_host(host, f"lane {getattr(host, 'name', host)}: {error_tail(e, 200)}")
             else:
-                free_lanes.put(host)             # failed lane rejoins the rotation
+                tripped = _breaker(host, e)
+                if not tripped:
+                    free_lanes.put(host)         # failed lane rejoins the rotation
             if _storage_failure(e):
                 # Registry blips are global, so wait before re-dispatching.
                 # Sleep BEFORE taking the retry lane so no idle GPU is held
@@ -1414,6 +1437,13 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
                             "%.0fs before the retry", describe,
                             getattr(host, "name", host), STORAGE_RETRY_BACKOFF_SECONDS)
                 time.sleep(STORAGE_RETRY_BACKOFF_SECONDS)
+            known = getattr(free_lanes, "known_hosts", None)
+            if tripped and callable(known) and not known():
+                # The breaker took the pool's LAST lane: there is nothing to
+                # retry on — never block the leg on an empty pool.
+                with contextlib.suppress(Exception):
+                    e.lane_breaker = True
+                raise
             retry_host = _take()                 # next idle lane; different when one exists
             if transport:
                 # Never the dead pod again: a sibling lane handed back by a
@@ -1429,15 +1459,29 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
             log.warning("%s failed on %s (%s); retrying on %s", describe,
                         getattr(host, "name", host), e,
                         getattr(retry_host, "name", retry_host))
+            retry_tripped = False
             try:
                 entry = disp.dispatch(_ready(retry_host),
                                       lane_count=pod_lane_count(retry_host, hosts), **kw)
+            except Exception as e2:
+                if not _transport_failure(e2):
+                    retry_tripped = _breaker(retry_host, e2)
+                if (tripped or retry_tripped) and _lane_fault(e2):
+                    # The leg was a victim of a broken LANE: its caller
+                    # requeues it without the operator-fault backoff.
+                    with contextlib.suppress(Exception):
+                        e2.lane_breaker = True
+                raise
+            else:
+                _breaker(retry_host)
                 if used_host is not None:
                     used_host.append(retry_host)
                 return entry
             finally:
-                free_lanes.put(retry_host)
+                if not retry_tripped:
+                    free_lanes.put(retry_host)
         else:
+            _breaker(host)
             free_lanes.put(host)
             if used_host is not None:
                 used_host.append(host)
@@ -1603,8 +1647,10 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
         hard deadline (a hung provider API must not wedge the loop): reap
         generation VMs left billing (DEC-CA-0053), and age out harvested
         checkpoint copies nothing will read again."""
+        from .host_preflight import sync_host_blocklist
         from .runner_common import prune_harvest_dirs
 
+        sync_host_blocklist(self)            # [round] funded_host_blocklist → listings
         for what, fn in (("generation VM reap", self._reap_generation_vms),
                          ("corpus storage upkeep", self._maintain_generation_storage),
                          ("harvest prune", lambda: prune_harvest_dirs(self.work_root))):

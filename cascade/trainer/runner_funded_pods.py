@@ -810,8 +810,11 @@ class _FundedPodMixin:
         from ..provision.core import record_host_quarantine
         from ..provision.funded import LEMON_CLASS, rent_funded_pod
         from ..provision.layout import visible_devices
+        from .host_preflight import host_blocked_reason, sync_host_blocklist
         from .remote import RemoteHost
 
+        # [round] funded_host_blocklist → every provider listing this rent makes.
+        sync_host_blocklist(self)
         queue = self._funded_queue()
         flagged = queue.get(gen.hotkey) if queue is not None else None
         if (flagged is not None and bool(getattr(flagged, "operator_billed", False))
@@ -1098,7 +1101,15 @@ class _FundedPodMixin:
                     # Hash its files before it ever sees a leg; a mismatch
                     # releases the pod, keeps its executor excluded and rents
                     # again — the miner is never blamed.
-                    why = self._funded_pod_code_mismatch(result, profile)
+                    adopted = bool(getattr(result, "adopted", False))
+                    # The pod's REAL host, now that its ssh address is known: a
+                    # listing that could not resolve hosts must never train on
+                    # a quarantined/blocklisted machine (2026-11-01 05:16,
+                    # 38.255.28.18). Torn down at once; its executor stays
+                    # excluded (claimed) like any rejected pod.
+                    blocked = ("" if adopted or result.address is None
+                               else host_blocked_reason(self, result.address.ip))
+                    why = blocked or self._funded_pod_code_mismatch(result, profile)
                     # Throughput gate (funded_host_bench_floor): a slow executor
                     # eats the leg's equal wall — released and rented again on
                     # the same bad-pod budget. Only its executor stays excluded
@@ -1107,9 +1118,15 @@ class _FundedPodMixin:
                     # we are about to attach to, so the calibration bench
                     # would read low and "release" the pod, killing the leg. It
                     # passed the gate when it was rented.
-                    adopted = bool(getattr(result, "adopted", False))
                     slow = ("" if (why or adopted)
                             else self._funded_pod_too_slow(result, profile))
+                    # Multi-GPU preflight (an N-rank NCCL all_reduce under a
+                    # hard timeout): a host that hangs or crawls a collective
+                    # passed every other check. Its host is quarantined (the
+                    # fabric is per machine, not per executor id) by the
+                    # check itself. Adopted pods are mid-leg: skipped.
+                    if not (why or slow or adopted):
+                        slow = funded_pod_comm_failure(self, result, profile)
                     if why or slow:
                         if result.pod is not None:
                             health_for(self).record(
@@ -1117,7 +1134,7 @@ class _FundedPodMixin:
                                 kind="stale" if why else "slow", reason=why or slow)
                         queue = self._funded_queue()
                         stale_pods += 1
-                        if why and result.address is not None:
+                        if why and not blocked and result.address is not None:
                             # The stale cache lives on the HOST: every executor
                             # id it lists would boot the same image.
                             record_host_quarantine(result.address.ip, why)
@@ -1455,9 +1472,15 @@ class _FundedPodMixin:
         (:meth:`_host_bench_below_floor`, off when no floor is set for the
         SKU) — the same guards a funded rent applies, so a hand-rented lane
         can be neither slow nor dead."""
+        from .host_preflight import host_blocked_reason, multi_gpu_preflight_failure
         from .remote import build_ssh_argv, probe_worker_runtime, run_ssh
 
         label = f"lane {getattr(host, 'name', host)}"
+        # [round] funded_host_blocklist + the host quarantine file: a host we
+        # refuse to rent is refused as a lane too (no ssh needed to say so).
+        why = host_blocked_reason(self, str(getattr(host, "host", "") or ""))
+        if why:
+            return why
         try:
             p = run_ssh(build_ssh_argv(host, "echo LANE_OK"), timeout=45)
         except Exception as e:  # noqa: BLE001
@@ -1482,6 +1505,12 @@ class _FundedPodMixin:
             why = self._host_bench_below_floor(host, sku, label)
             if why:
                 return why
+        # Multi-GPU preflight on the lane's own GPUs (its CUDA_VISIBLE_DEVICES,
+        # else its SKU's layout); a failing lane's host is quarantined.
+        why = multi_gpu_preflight_failure(
+            self, host, str(getattr(host, "sku", "") or sku or ""), label)
+        if why:
+            return why
         return None
 
     def _host_bench_below_floor(self, host, sku: str, label: str) -> str:
@@ -1597,3 +1626,27 @@ class _FundedPodMixin:
                 log.error("funded pod %s is gone but its ledger row could not be "
                           "removed (%s) — the startup sweep settles it",
                           pod.instance_id, e)
+
+
+def funded_pod_comm_failure(runner, result, profile) -> str:
+    """Why a freshly rented funded pod fails the multi-GPU preflight, or ``""``
+    (single-GPU layout / preflight off / no address). Same ssh identity pin as
+    the code-fingerprint check; ALL of the layout's GPUs are visible."""
+    if getattr(result, "address", None) is None:
+        return ""
+    from ..provision.layout import visible_devices
+    from .host_preflight import multi_gpu_preflight_failure
+    from .remote import RemoteHost
+
+    rnd = runner.cfg.round
+    sku = (getattr(getattr(result, "pod", None), "sku", "") or getattr(result, "sku", "")
+           or getattr(runner, "_funded_round_sku", "") or getattr(rnd, "funded_pod_sku", ""))
+    host = RemoteHost(
+        name="funded-nccl", host=result.address.ip, port=result.address.ssh_port,
+        user=profile.user, key_path=profile.key_path,
+        remote_python=profile.remote_python, workdir=profile.workdir,
+        cuda_device=visible_devices(sku or ""), pinned_host_key=result.host_key,
+        ssh_options=profile.ssh_options, sku=sku or "",
+    )
+    pod_id = result.pod.instance_id if getattr(result, "pod", None) is not None else "?"
+    return multi_gpu_preflight_failure(runner, host, sku or "", f"funded pod {pod_id}")
