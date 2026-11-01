@@ -110,6 +110,8 @@ def cfg() -> ChainConfig:
     raw["v2"]["commit_open_at_utc"] = ""
     raw["v2"]["commit_from_block"] = 0
     raw["netconfig"]["owner_hotkey"] = ""
+    raw["scoring"]["forfeit_from_block"] = 0        # DEC-CA-0067 typed blocks: see scoring=
+    raw["scoring"]["margin_v2_from_block"] = 0
     return replace(c, training=replace(c.training, expected_gpu="",
                                        train_image_digest=""),
                    raw=raw,
