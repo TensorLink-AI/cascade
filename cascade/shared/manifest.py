@@ -263,8 +263,22 @@ def contract_digest(contract: object) -> str:
 # ``_NEVER_IN_DIGEST``: the schedules and ``router_slow``). ``expected_gpu``
 # stays (a LOCKED term — the matched-hardware pin), and so does
 # ``max_train_seconds`` (the wall can cut the token budget a leg consumes,
-# i.e. it can change the numerics). NEVER remove an entry once shipped.
-IMAGE_RUNTIME_FIELDS: tuple[str, ...] = ("train_image_digest",)
+# i.e. it can change the numerics).
+# ``continuation_protocol`` is runtime-only too: it turns on optimizer-boundary
+# snapshots and resume (cascade.trainer.continuation — "input iterators are
+# reconstructed by deterministic replay before RNG restoration; a continuation
+# is never a new warm start and never increases the remaining budget"), and a
+# qualified crash/resume is bitwise including the EMA. Its one other effect is
+# the shard stream's EAGER accounting (cascade.trainer.stream._ShardStream):
+# the same series are yielded in the same order, only the receipt's
+# ``corpus_digest`` / ``n_series`` also count the final consumed series. The
+# weights a leg trains are unchanged; the accounting difference is carried by
+# the leg's own receipt and replayed by the audit under the leg's contract.
+# NEVER remove an entry once shipped.
+IMAGE_RUNTIME_FIELDS: tuple[str, ...] = ("train_image_digest", "continuation_protocol")
+# The values ``prove_numerics_digest`` tries for the runtime-only terms other
+# than the image: every continuation protocol a release has shipped ("" = off).
+CONTINUATION_PROTOCOLS: tuple[str, ...] = ("", "cascade-continuation/1")
 
 # Domain tag: a numerics digest can never equal a full contract digest of any
 # payload (the full digest hashes the bare JSON).
@@ -305,28 +319,33 @@ def prove_numerics_digest(contract: object, full_digest: str,
     PROVEN against ``contract`` — or ``None`` when it cannot be.
 
     A leg records only its FULL ``training_contract_digest``. That leg trained
-    under ``contract`` with nothing but the image pin different iff, for some
-    image ``img``, ``contract_digest(contract with train_image_digest=img) ==
-    full_digest`` (sha256 preimage resistance: no other term set hashes there).
-    Tried: ``contract``'s own pin, then each of ``candidate_images`` (exactly as
-    once typed, plus the bare ``sha256:…`` of a ``repo@sha256:…`` ref). On a
-    match the leg's numerics are ``contract``'s, so the result is
+    under ``contract`` with nothing but the runtime-only terms
+    (:data:`IMAGE_RUNTIME_FIELDS`) different iff, for some image ``img`` and
+    continuation protocol ``p``, ``contract_digest(contract with
+    train_image_digest=img, continuation_protocol=p) == full_digest`` (sha256
+    preimage resistance: no other term set hashes there). Tried: ``contract``'s
+    own pin, then each of ``candidate_images`` (exactly as once typed, plus the
+    bare ``sha256:…`` of a ``repo@sha256:…`` ref), each with ``contract``'s own
+    protocol and every :data:`CONTINUATION_PROTOCOLS` value. On a match the
+    leg's numerics are ``contract``'s, so the result is
     ``numerics_contract_digest(contract)``. No match (a numerics change, or an
     image the candidates do not name) ⇒ ``None`` — the caller keeps the old
     stale → retrain behaviour for that leg."""
     if not full_digest:
         return None
     payload = contract_payload(contract)
-    seen: set[str] = set()
-    for cand in [str(payload.get("train_image_digest", "")),
-                 *(v for c in candidate_images for v in _image_variants(c))]:
-        if cand in seen:
-            continue
-        seen.add(cand)
-        trial = dict(payload)
-        trial["train_image_digest"] = cand
-        if contract_digest(trial) == str(full_digest):
-            return numerics_contract_digest(contract)
+    images = list(dict.fromkeys([
+        str(payload.get("train_image_digest", "")),
+        *(v for c in candidate_images for v in _image_variants(c))]))
+    protocols = list(dict.fromkeys([str(payload.get("continuation_protocol", "") or ""),
+                                    *CONTINUATION_PROTOCOLS]))
+    for img in images:
+        for proto in protocols:
+            trial = dict(payload)
+            trial["train_image_digest"] = img
+            trial["continuation_protocol"] = proto     # "" drops (drop-when-default)
+            if contract_digest(trial) == str(full_digest):
+                return numerics_contract_digest(contract)
     return None
 
 

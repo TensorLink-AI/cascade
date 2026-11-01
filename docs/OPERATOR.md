@@ -259,6 +259,38 @@ the lock-in:
 5. Verify that the next settlement keeps the king (`numerics proven` at INFO in
    trainer.log) and that the validators accept it.
 
+### Enabling continuation after the switch (DEC-CA-0067)
+
+`continuation_protocol` is excluded from the numerics digest along with the
+image pin. Once the DEC-CA-0067 switch is in force, turning on mid-run backup
+checkpoints keeps the carried king and the finished legs. The trainer tries both
+protocol values ("" and `cascade-continuation/1`) automatically, so there is no
+list to maintain for this term. Before the switch it is a full contract change:
+legs are retrained and validators reject them. Do not arm it earlier.
+
+1. Wait until the switch era has started.
+2. In the deployed chain.toml:
+   - `[v2.training] continuation_protocol = "cascade-continuation/1"`;
+   - `[round] ops_continuation_image_digest` = the qualified worker image's
+     immutable digest (it must equal the running `CASCADE_TRAIN_IMAGE_DIGEST`,
+     or the worker refuses);
+   - `[round] ops_continuation_interval_seconds = 1800`;
+   - `[round] ops_continuation_max_bytes = 34359738368` (32 GiB; an rc16 leg
+     with its EMA snapshot is about 24 GB, and the default is 16 GiB).
+3. If the image changes in the same step, append the old pin to
+   `[v2] prior_train_image_digests` as in the re-pin runbook.
+4. Point the box-side snapshot mirror at the large volume. The orchestrator
+   mirrors to `<--work-root>/_continuations` (`cascade/trainer/runner_rolling.py`
+   `_dispatcher`). There is no separate flag, so either run the trainer with
+   `--work-root` on the large volume, or replace `_train_work/_continuations`
+   with a symlink to it while no leg is in flight. A dedicated
+   `--continuation-root` is a follow-up. The pod side writes to
+   `<host workdir>/_continuations/<job>` (`continuation_transport.py`); that is
+   set per host in hosts.toml.
+5. Restart with no legs in flight. Detached dispatch is required, and the
+   dispatcher refuses continuation unless a training contract declares the
+   protocol.
+
 ### GPU type
 
 The GPU type is chosen **per leg**: the trainer rents the cheapest fitting

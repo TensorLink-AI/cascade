@@ -30,12 +30,34 @@ boundary. The numerics they train under must stay enforced.
 `numerics_contract_digest(contract)` is
 `sha256("cascade-numerics-contract/1\n" + canonical JSON)`. The JSON is the
 `contract_payload` that `contract_digest` hashes, with `IMAGE_RUNTIME_FIELDS =
-("train_image_digest",)` removed. The domain tag means it can never equal a full
+("train_image_digest", "continuation_protocol")` removed. The domain tag means it can never equal a full
 digest. `contract_digest` itself is unchanged, so every existing digest is
 byte-identical (golden vector).
 
-An audit of `TrainingContractConfig` found only one pure image or runtime pin.
-The schedules and `router_slow` are already outside the digest. `expected_gpu`
+An audit of `TrainingContractConfig` found two runtime-only terms: the image pin
+and `continuation_protocol`.
+
+`continuation_protocol` turns on optimizer-boundary snapshots and resume. It
+cannot change the trained weights:
+- `cascade/trainer/continuation.py` (module docstring): "Input iterators are
+  reconstructed by deterministic replay before RNG restoration. A continuation
+  is never a new warm start and never increases the remaining budget."
+- docs/OPERATOR.md "Qualified training continuation": recovery replays completed
+  batches without optimizer updates and checks their digest before restoring
+  the saved RNG state; snapshot I/O adds no optimizer steps or budget.
+- The qualification run was bitwise: OPSLOG 2026-11-01 08:50, rc15 vs rc16
+  bit-identical, and resume bitwise including the EMA.
+
+Its one other effect is the shard stream's eager accounting
+(`cascade/trainer/stream.py` `_ShardStream`). The same series are yielded in the
+same order, and the final consumed series is also counted in the receipt's
+`corpus_digest` / `n_series`. That is accounting, not numerics. It is carried by
+each leg's own receipt; validators do not recompute it.
+
+The proof tries both protocol values automatically. Enabling continuation after
+the switch therefore keeps the king and the legs, exactly like an image repin.
+
+For the other terms: the schedules and `router_slow` are already outside the digest. `expected_gpu`
 stays because it is a LOCKED term. `max_train_seconds` stays because the wall
 can cut the tokens a leg trains.
 
@@ -75,8 +97,9 @@ era's last settlement, so no era is judged under two rules.
 This is the DEC-CA-0045 secondary-feature path, aligned to eras like
 DEC-CA-0049.
 
-- **Feature.** The name is `v2b-<sha256("image-decoupled/1|train_image_digest|
-  eval_n_windows_after=<n>")[:8]>`. It is short because of the note budget below.
+- **Feature.** The name is
+  `v2b-<sha256("image-decoupled/1|train_image_digest,continuation_protocol|eval_n_windows_after=<n>")[:8]>`
+  (mainnet: `v2b-150ec0d0`). It is short because of the note budget below.
   A changed bundle is a fresh vote.
 - **Signal.** Validators on this release add the segment to their note at startup
   whenever `[activation]` is on and v2 is scheduled.

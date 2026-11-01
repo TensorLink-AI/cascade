@@ -42,6 +42,7 @@ REPO = Path(__file__).resolve().parents[2]
 PRIMARY = "rolling-era-king"
 B0 = 9046800 + 3600                     # an era start on the 900 grid (era = 3600)
 OLD = "sha256:" + "a" * 64
+PROTO = "cascade-continuation/1"
 NEW = "sha256:" + "b" * 64
 # FROZEN: numerics_contract_digest of test_digest_golden's fixture contract.
 GOLDEN_NUMERICS = "46d1933659a676ddbe45ed7e6f407e52b9a2ced81630fbd36f5d0540fdd42598"
@@ -59,7 +60,7 @@ def test_contract_digest_is_unchanged_and_numerics_excludes_only_the_image():
 
     c = _fixture_contract()
     assert contract_digest(c) == GOLDEN_CONTRACT            # no existing digest moves
-    assert IMAGE_RUNTIME_FIELDS == ("train_image_digest",)
+    assert IMAGE_RUNTIME_FIELDS == ("train_image_digest", "continuation_protocol")
     assert numerics_contract_digest(c) == GOLDEN_NUMERICS
     assert numerics_contract_digest(c) != contract_digest(c)   # domain-tagged
     imaged = replace(c, train_image_digest=NEW)
@@ -85,6 +86,24 @@ def test_shipped_contract_digests_are_byte_identical():
 
             assert "train_image_digest" in contract_payload(t)
             assert contract_digest(t) != contract_digest(replace(t, train_image_digest=NEW))
+
+
+def test_continuation_protocol_is_runtime_only():
+    from .test_digest_golden import _fixture_contract
+
+    c = _fixture_contract()
+    cont = replace(c, continuation_protocol=PROTO)
+    assert contract_digest(cont) != contract_digest(c)                  # still a full-digest term
+    assert numerics_contract_digest(cont) == numerics_contract_digest(c) == GOLDEN_NUMERICS
+    # a leg trained before continuation was declared is proven against the
+    # continuation-armed contract (and vice versa), with or without an image repin
+    assert prove_numerics_digest(cont, contract_digest(c)) == numerics_contract_digest(cont)
+    assert prove_numerics_digest(c, contract_digest(cont)) == numerics_contract_digest(c)
+    both = replace(cont, train_image_digest=NEW)
+    leg = contract_digest(replace(c, train_image_digest=OLD))
+    assert prove_numerics_digest(both, leg) is None
+    assert prove_numerics_digest(both, leg, [OLD]) == numerics_contract_digest(both)
+    assert prove_numerics_digest(cont, contract_digest(replace(c, base_lr=1.0))) is None
 
 
 def test_prove_numerics_digest_needs_the_leg_image():
@@ -378,11 +397,13 @@ def test_new_fields_are_drop_when_empty_and_signed_when_set():
 # ── the trainer ──────────────────────────────────────────────────────────────
 
 
-def _trainer(cfg, tmp_path, *, on: bool, priors=(OLD,)):
+def _trainer(cfg, tmp_path, *, on: bool, priors=(OLD,), protocol=""):
     from cascade.trainer.rolling import EraState
     from tests.unit.test_dec55_trainer_epochs import _v2
     from tests.unit.test_rolling import Clock, _sched
 
+    if protocol:
+        cfg = replace(cfg, training=replace(cfg.training, continuation_protocol=protocol))
     cfg, start, _ = _v2(cfg)
     cfg = replace(cfg, v2=replace(cfg.v2, image_decoupled_from_block=start if on else 0,
                                   prior_train_image_digests=tuple(priors)))
@@ -428,6 +449,24 @@ def test_trainer_active_keeps_an_image_only_stale_king_and_stamps(cfg, tmp_path)
     with pytest.raises(StorageError, match="refusing v2 manifest"):
         sched._build_manifest(era, _leg(contract, start, image=OLD, base_lr=1.0), [], "50000",
                               start, pin_block=start)
+
+
+def test_trainer_keeps_legs_across_enabling_continuation(cfg, tmp_path):
+    for on, kept in ((True, True), (False, False)):
+        sched, era, contract, start = _trainer(cfg, tmp_path, on=on, protocol=PROTO)
+        assert contract.continuation_protocol == PROTO
+        pre = _leg(contract, start, continuation_protocol="")       # trained before it
+        assert pre.training_contract_digest != contract_digest(contract)
+        assert sched._stale_contract(era)(pre.training_contract_digest) is (not kept)
+        if on:
+            m = sched._build_manifest(era, pre, [], "50000", start, pin_block=start)
+            assert m.entries[0].numerics_contract_digest == numerics_contract_digest(contract)
+    # continuation + image repin together: kept with the prior pin, not without
+    sched, era, contract, start = _trainer(cfg, tmp_path, on=True, protocol=PROTO)
+    both = _leg(contract, start, image=OLD, continuation_protocol="")
+    assert not sched._stale_contract(era)(both.training_contract_digest)
+    sched, era, contract, start = _trainer(cfg, tmp_path, on=True, protocol=PROTO, priors=())
+    assert sched._stale_contract(era)(both.training_contract_digest)
 
 
 def test_trainer_active_without_the_prior_image_cannot_prove_and_retrains(cfg, tmp_path):
