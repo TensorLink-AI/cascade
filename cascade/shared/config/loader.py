@@ -470,6 +470,7 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
             funded_operator_fallback_fresh_window_seconds=max(
                 0, int(r.get("funded_operator_fallback_fresh_window_seconds", 3600))),
             funded_require_tensor_digests=bool(r.get("funded_require_tensor_digests", False)),
+            funded_release_after_harvest=bool(r.get("funded_release_after_harvest", True)),
             submission_vault_dir=str(r.get("submission_vault_dir", "")),
             champion_publish=validate_champion_publish(
                 str(r.get("champion_publish", "off"))),

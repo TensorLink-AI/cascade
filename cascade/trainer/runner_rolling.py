@@ -197,6 +197,9 @@ class _RollingMixin:
         # Opt-in for _FundedOperatorRent: an operator-billed leg with no lane
         # on file rents an operator pod instead of dying.
         self._leg_local.operator_rent_ok = True
+        # DEC-CA-0063 era: the trainer never benches on the payer pod, so the
+        # pod is released as soon as its harvest is verified (harvest_release).
+        self._leg_local.validator_bench = _validator_benches(self.cfg, era)
         try:
             try:
                 entry = self._run_funded_leg(disp, gen, seeds, int(block), contract, suffix,
@@ -242,6 +245,7 @@ class _RollingMixin:
         finally:
             self._leg_local.end_wall = None
             self._leg_local.operator_rent_ok = False
+            self._leg_local.validator_bench = False
         self._persist_completed_leg(entry, round_id=era.base_seed, contract=contract,
                                     role="challenger", hotkey=gen.hotkey, suffix=suffix,
                                     warm_start_ckpt=ws_ref or "")

@@ -983,6 +983,12 @@ def _harvest_runner(tmp_path, monkeypatch, *, disp, **round_kw):
     from cascade.trainer.remote import PodHygiene
     monkeypatch.setattr("cascade.trainer.remote.probe_pod_hygiene",
                         lambda host, ckpt_dir, **kw: PodHygiene())   # a clean pod
+    # No pod answers here: the pre-upload release (harvest_release) cannot
+    # list the checkpoint dir, so the pod is kept to leg end — the behaviour
+    # these tests pin. tests/unit/test_release_pod_after_harvest.py scripts it.
+    def _no_listing(host, remote_dir, **kw):
+        raise RemoteDispatchError("no pod listing in this test")
+    monkeypatch.setattr("cascade.trainer.remote.remote_file_manifest", _no_listing)
     torn = []
     runner._teardown_funded_pod = lambda pod: torn.append(pod.instance_id)
     runner._funded_pod_identity_mismatch = lambda pod: None

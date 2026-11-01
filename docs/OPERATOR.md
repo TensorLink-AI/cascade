@@ -910,6 +910,18 @@ in code:
   orchestrator inspected before anything else could fetch them. A harvest
   transport failure settles as infra (requeue), never tamper. Requires a
   `funded_pod_image` built from a `--local-only`-aware release.
+  - **Pod released before the upload** (`[round]
+    funded_release_after_harvest = true`, the default): once the box copy
+    matches the pod's own listing of the checkpoint dir (every regular file,
+    size + sha256; one re-harvest on a mismatch) and the ingest guards pass,
+    a payer or operator-rented leg's pod is torn down and the Hippius upload
+    runs from the box copy (`pod released after verified harvest (…) —
+    upload continues from the box copy`). The copy stays on the box until
+    the upload returns a pinned ref; a failed upload leaves the
+    pending-upload record the requeued leg re-uploads from. A pod the
+    trainer still benches on (payer-pod bench armed outside a DEC-CA-0063
+    validator-bench era), a shared operator lane or the era king pod is
+    never released early; any listing failure keeps the pod to leg end.
   - **Pin `funded_pod_image` as `repo:tag@sha256:…`, not digest-only.** Lium's
     launch API rejects the canonical digest ref and the client degrades a
     digest-only pin to the repo's floating tag (`:latest`), so a host with an

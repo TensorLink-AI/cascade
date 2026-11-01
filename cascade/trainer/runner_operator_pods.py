@@ -581,6 +581,32 @@ class _OperatorPodMixin:
             _record_generation_failure(self, gen, e)
             raise
         host, pod_id = self._rent_operator_leg_host(str(seeds.base_seed), gen)
+
+        def ledger_pod():
+            pods = getattr(self, "_load_funded_ledger", lambda: [])()
+            pod = next((p for p in pods if p.instance_id == pod_id), None)
+            if pod is None:
+                from ..provision.operator_pool import OperatorPool, enabled
+                pooled = hasattr(self, "cfg") and enabled(self)
+                pod = PodInstance(provider=OperatorPool.name if pooled else "lium",
+                                  instance_id=pod_id, stage="funded", rented_at_iso="")
+            return pod
+
+        released: list[bool] = []
+
+        def release_pod() -> None:
+            # Owner 2026-11-01: never benched here and torn down at leg end
+            # anyway — once the harvested copy is verified on the box, stop
+            # the operator's bill before the upload (harvest_release).
+            if not released:
+                self._teardown_operator_pod(ledger_pod())
+                released.append(True)
+
+        # A challenger receipt is harvested INSIDE dispatch (the isolated
+        # host's harvest hook, same thread): armed for the whole leg body.
+        from .harvest_release import arm_release, disarm_release
+
+        armed = arm_release(self, release_pod)
         try:
             from .progress import report_progress
 
@@ -629,11 +655,6 @@ class _OperatorPodMixin:
                                         error_class=error_class, burn=False)
             raise
         finally:
-            pods = getattr(self, "_load_funded_ledger", lambda: [])()
-            pod = next((p for p in pods if p.instance_id == pod_id), None)
-            if pod is None:
-                from ..provision.operator_pool import OperatorPool, enabled
-                pooled = hasattr(self, "cfg") and enabled(self)
-                pod = PodInstance(provider=OperatorPool.name if pooled else "lium",
-                                  instance_id=pod_id, stage="funded", rented_at_iso="")
-            self._teardown_operator_pod(pod)
+            disarm_release(self, armed)
+            if not released:
+                self._teardown_operator_pod(ledger_pod())

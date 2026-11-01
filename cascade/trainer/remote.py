@@ -1203,6 +1203,61 @@ def harvest_remote_dir(host: RemoteHost, remote_dir: str, dest: Path | str,
     return dest
 
 
+# The pod-side hash of a whole checkpoint dir (~14.5 GB: weights,
+# weights_stable, optimizer) — sha256 at disk speed, well inside this bound.
+POD_MANIFEST_TIMEOUT_SECONDS = 900
+
+
+def remote_file_manifest(host: RemoteHost, remote_dir: str, *,
+                         timeout: int = POD_MANIFEST_TIMEOUT_SECONDS,
+                         runner=None) -> dict[str, tuple[int, str]]:
+    """``{relative path: (size, sha256)}`` of every regular file under
+    ``host:remote_dir``, as the POD reports it — the reference a harvested
+    copy is checked against before the pod is released (see
+    :mod:`cascade.trainer.harvest_release`). Resolved in ``host.workdir``
+    exactly like :func:`harvest_remote_dir`. Raises
+    :class:`RemoteDispatchError` on any ssh failure or unparseable output
+    (a filename the listing cannot represent included): the caller then
+    simply keeps the pod."""
+    rd = shlex.quote(remote_dir)
+    cmd = (f"cd {shlex.quote(host.workdir)} && cd {rd} && "
+           "find . -type f -printf 'S %s %p\\n' && "
+           "find . -type f -exec sha256sum -- {} +")
+    argv = build_ssh_argv(host, cmd)
+    try:
+        proc = (runner(argv, timeout) if runner is not None else
+                subprocess.run(argv, capture_output=True, text=True,
+                               timeout=timeout, check=False))
+    except subprocess.TimeoutExpired as e:
+        raise RemoteDispatchError(
+            f"pod checkpoint manifest of {host.name}:{remote_dir} timed out "
+            f"after {timeout}s") from e
+    if proc.returncode != 0:
+        raise RemoteDispatchError(
+            f"pod checkpoint manifest of {host.name}:{remote_dir} failed "
+            f"(rc={proc.returncode}): {(proc.stderr or '')[-200:]!r}",
+            returncode=proc.returncode)
+    sizes: dict[str, int] = {}
+    hashes: dict[str, str] = {}
+    for line in (proc.stdout or "").splitlines():
+        if not line:
+            continue
+        if line.startswith("S "):
+            size, _, path = line[2:].partition(" ")
+            if not size.isdigit() or not path.startswith("./"):
+                raise RemoteDispatchError(f"pod checkpoint manifest: bad size line {line[:120]!r}")
+            sizes[path[2:]] = int(size)
+            continue
+        digest, sep, path = line.partition("  ")
+        if (not sep or len(digest) != 64 or not path.startswith("./")
+                or any(c not in "0123456789abcdef" for c in digest)):
+            raise RemoteDispatchError(f"pod checkpoint manifest: bad hash line {line[:120]!r}")
+        hashes[path[2:]] = digest
+    if set(sizes) != set(hashes):
+        raise RemoteDispatchError("pod checkpoint manifest: size and hash listings disagree")
+    return {p: (sizes[p], hashes[p]) for p in sizes}
+
+
 def receipt_to_entry(receipt: dict) -> TrainedEntry:
     """Validate a receipt dict into a :class:`TrainedEntry` (re-runs its checks)."""
     try:
