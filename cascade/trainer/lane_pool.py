@@ -27,14 +27,24 @@ class _FinalLanePool(queue.Queue):
     # A lane that failed the join gate or was drained as dead is re-gated no
     # sooner than this (a pod still booting, or one that came back).
     REJECT_RETRY_S = 600.0
+    # A lane the circuit breaker took out stays out this long (it failed
+    # several different legs in a row — an operator config/host fault that a
+    # 10-minute re-gate would only feed the next legs).
+    BREAKER_HOLD_S = 6 * 3600.0
 
-    def __init__(self, initial_hosts: list, refresh_fn, gate_fn=None):
+    def __init__(self, initial_hosts: list, refresh_fn, gate_fn=None, *,
+                 breaker_threshold: int = 0):
         super().__init__()
         self._refresh_fn = refresh_fn          # () -> list[RemoteHost]; may raise
         self._gate_fn = gate_fn                # (RemoteHost) -> reason | None; may raise
         self._absorb_lock = threading.Lock()
         self._known: dict[str, object] = {}
         self._rejected: dict[str, float] = {}  # lane name -> earliest re-gate time
+        # Lane circuit breaker ([round] operator_lane_breaker_failures; 0 =
+        # off): lane name -> the DISTINCT legs it failed operator-side since
+        # its last successful leg.
+        self.breaker_threshold = int(breaker_threshold or 0)
+        self._lane_failures: dict[str, list[str]] = {}
         # The initial lanes are taken as given; the gate guards lanes that
         # JOIN later.
         for h in initial_hosts:
@@ -66,18 +76,22 @@ class _FinalLanePool(queue.Queue):
         return (getattr(a, "host", None), getattr(a, "port", None)) == (
             getattr(b, "host", None), getattr(b, "port", None))
 
-    def mark_dead(self, host, reason: str) -> list[str]:
+    def mark_dead(self, host, reason: str, *, lane_only: bool = False,
+                  hold_s: float | None = None) -> list[str]:
         """Drain every lane on ``host``'s pod: a transport failure (ssh refused,
         detached worker unreachable) is a POD fault, and its sibling lanes
         would only feed the next leg's single retry the same dead endpoint.
         The lanes leave membership; the hosts file re-offers them after
-        ``REJECT_RETRY_S`` through the gate. Returns the drained names."""
+        ``REJECT_RETRY_S`` (or ``hold_s``) through the gate. ``lane_only``
+        drains just ``host``'s own lane (the circuit breaker: siblings on the
+        same pod get their own count). Returns the drained names."""
         with self._absorb_lock:
-            dead = [n for n, h in self._known.items() if self.same_pod(h, host)]
             name = getattr(host, "name", str(host))
+            dead = [] if lane_only else [n for n, h in self._known.items()
+                                         if self.same_pod(h, host)]
             if name not in dead:
                 dead.append(name)
-            until = time.time() + self.REJECT_RETRY_S
+            until = time.time() + (self.REJECT_RETRY_S if hold_s is None else float(hold_s))
             for n in dead:
                 self._known.pop(n, None)
                 self._rejected[n] = until
@@ -96,6 +110,38 @@ class _FinalLanePool(queue.Queue):
                         len(dead), getattr(host, "host", "?"), getattr(host, "port", "?"),
                         reason, ", ".join(dead))
         return dead
+
+    def record_leg_outcome(self, host, leg: str, *, ok: bool,
+                           operator_fault: bool = True, reason: str = "") -> bool:
+        """The lane circuit breaker. A successful leg resets ``host``'s lane;
+        an operator-side failure of a leg it has not failed yet counts one;
+        miner faults count nothing either way. At ``breaker_threshold``
+        DIFFERENT legs failed in a row the lane leaves the rotation for
+        ``BREAKER_HOLD_S`` with one ERROR "LANE BREAKER" line — 2026-11-01:
+        one lane failed ~30 legs in seconds each (rc=2, its config), every one
+        of them accruing requeues and backoff. Returns True when it tripped."""
+        name = getattr(host, "name", str(host))
+        with self._absorb_lock:
+            if ok:
+                self._lane_failures.pop(name, None)
+                return False
+            if not operator_fault or self.breaker_threshold <= 0:
+                return False
+            legs = self._lane_failures.setdefault(name, [])
+            if leg not in legs:
+                legs.append(leg)
+            n = len(legs)
+            if n < self.breaker_threshold:
+                return False
+            self._lane_failures.pop(name, None)
+        log.error("LANE BREAKER: lane %s (%s:%s) failed %d different legs in a row "
+                  "operator-side with no successful leg between (last: %s) — taken out of "
+                  "rotation for %.1f h; fix the lane, then it re-joins through the gate",
+                  name, getattr(host, "host", "?"), getattr(host, "port", "?"), n,
+                  reason or "?", self.BREAKER_HOLD_S / 3600)
+        self.mark_dead(host, f"LANE BREAKER: {n} different legs failed in a row",
+                       lane_only=True, hold_s=self.BREAKER_HOLD_S)
+        return True
 
     def known_hosts(self) -> list:
         """Current membership (for lane-count geometry) — grows, never shrinks."""

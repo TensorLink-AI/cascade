@@ -254,8 +254,11 @@ class _FundedLegMixin:
                                         and prior.last_error_class == STALL_CLASS))
                 if error_class == "infra":
                     error_class = OPERATOR_FAULT_CLASS
-            self._record_funded_failure(gen.hotkey, str(e), miner_fault=miner_fault,
-                                        error_class=error_class, burn=False)
+            from .runner_rolling import record_lane_breaker_victim
+
+            if not record_lane_breaker_victim(self, gen.hotkey, e):
+                self._record_funded_failure(gen.hotkey, str(e), miner_fault=miner_fault,
+                                            error_class=error_class, burn=False)
             raise
 
     def _run_funded_leg_scoped(self, disp, gen, seeds, block, contract, suffix, *,
@@ -331,7 +334,7 @@ class _FundedLegMixin:
                 host = self._stage_vault_zip_on(host, digest)
             harvest = self._funded_harvest()
             report_progress(self, "training")
-            disp = _with_leg_watchdog(self, disp, gen, pod, contract)
+            disp = _with_leg_watchdog(self, disp, gen, pod, contract, host)
             entry = _dispatch_watched(
                 disp, host, lane_count=1,
                 gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
@@ -551,10 +554,11 @@ class _FundedLegMixin:
         _add_seen_hotkeys(self._submissions_path(), [c.hotkey for c in challengers], block)
 
 
-def _with_leg_watchdog(runner, disp, gen, pod, contract):
+def _with_leg_watchdog(runner, disp, gen, pod, contract, host=None):
     """``disp`` with the leg's progress watchdog (and periodic teardown-key
     check) attached — a detached :class:`RemoteDispatcher` only; any other
-    dispatcher (attached form, test doubles) is returned unchanged."""
+    dispatcher (attached form, test doubles) is returned unchanged. ``host``
+    (the leg's RemoteHost) names the pod's IP in the verdict."""
     from dataclasses import replace
 
     from .cost_guards import check_payer_key, leg_watchdog
@@ -568,18 +572,25 @@ def _with_leg_watchdog(runner, disp, gen, pod, contract):
         check_payer_key(runner, hotkey=gen.hotkey, pod_name=str(pod.instance_id), pod=pod)
 
     watch = leg_watchdog(runner, gen=gen, pod=pod, contract=contract,
-                         key_check=key_check if payer else None)
+                         key_check=key_check if payer else None,
+                         host=str(getattr(host, "host", "") or ""))
     return disp if watch is None else replace(disp, on_progress=watch)
 
 
 def _dispatch_watched(disp, host, **kw):
     """``disp.dispatch`` with a watchdog abort turned into an operator fault:
-    the miner's pod and generator were fine, OUR wall estimate was not."""
+    the miner's pod and generator were fine, OUR wall estimate (or the
+    host) was not. The host is quarantined for a day: a host that cannot hold
+    the leg's rate — or never reached step 1 — is a hardware/fabric fault, and
+    re-renting it (2026-11-01: 93.120.231.186, 0.2 steps/s on two legs in a
+    row) only repeats the loss."""
+    from .host_preflight import quarantine_host_ip
     from .remote import LegAborted
 
     try:
         return disp.dispatch(host, **kw)
     except LegAborted as e:
+        quarantine_host_ip(str(getattr(host, "host", "") or ""), str(e)[-300:])
         raise _OperatorFault(str(e)) from e
 
 

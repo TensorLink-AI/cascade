@@ -292,11 +292,17 @@ def _load_quarantine(path: Path) -> dict[str, dict]:
 
 def record_host_quarantine(host: str, reason: str, *,
                            seconds: float | None = None,
-                           path: Path | None = None, now: float | None = None) -> None:
-    """Exclude a faulty host; use a short first quarantine unless explicitly pinned."""
+                           path: Path | None = None, now: float | None = None,
+                           host_fault: bool = False) -> None:
+    """Exclude a faulty host; use a short first quarantine unless explicitly pinned.
+
+    ``host_fault=True``: the caller MEASURED the host's fault (a hung NCCL
+    collective, a throughput abort) — the account/API text screen is skipped,
+    since free text such as "step 401/23841" must not read as an HTTP 401."""
     from ..funding.faults import classify_rent_failure
 
-    if classify_rent_failure(reason) in {"auth", "rate_limited", "no_capacity"}:
+    if not host_fault and classify_rent_failure(reason) in {"auth", "rate_limited",
+                                                            "no_capacity"}:
         log.warning("host quarantine skipped: account/API failure is not a hardware fault")
         return
     host = str(host or "").strip()
@@ -328,12 +334,37 @@ def record_host_quarantine(host: str, reason: str, *,
         log.warning("lium: could not record host quarantine for %s: %s", host, e)
 
 
+# ``[round] funded_host_blocklist``: hosts NEVER rented again, whatever the
+# quarantine file says. Process-wide (every provider listing in this process
+# consults :func:`quarantined_hosts`), replaced — never merged — by the
+# trainer from its live config (:func:`cascade.trainer.host_preflight.
+# sync_host_blocklist`), so removing an IP from the knob un-blocks it.
+HOST_BLOCKLIST_REASON = "funded_host_blocklist (permanent)"
+_HOST_BLOCKLIST: tuple[str, ...] = ()
+
+
+def set_host_blocklist(hosts) -> tuple[str, ...]:
+    """Replace the permanent host blocklist; returns the new tuple."""
+    global _HOST_BLOCKLIST
+    _HOST_BLOCKLIST = tuple(dict.fromkeys(
+        str(h).strip() for h in (hosts or ()) if str(h).strip()))
+    return _HOST_BLOCKLIST
+
+
+def host_blocklist() -> tuple[str, ...]:
+    return _HOST_BLOCKLIST
+
+
 def quarantined_hosts(*, path: Path | None = None,
                       now: float | None = None) -> dict[str, str]:
-    """``{host ip: reason}`` for every host still under quarantine."""
+    """``{host ip: reason}`` for every host still under quarantine, plus every
+    host on the permanent blocklist (:func:`set_host_blocklist`)."""
     path = path or lium_quarantine_path()
     now = time.time() if now is None else now
-    return {k: v["reason"] for k, v in _load_quarantine(path).items() if v["until"] > now}
+    out = {k: v["reason"] for k, v in _load_quarantine(path).items() if v["until"] > now}
+    for h in _HOST_BLOCKLIST:
+        out[h] = HOST_BLOCKLIST_REASON
+    return out
 # Lium caps ``POST /templates`` at 20 requests per hour PER CLIENT IP, and
 # ``lium up --image`` creates a throw-away template on EVERY call — so a round's
 # worth of launches (king + funded legs + retries) silently exhausted the hour

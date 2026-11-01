@@ -931,6 +931,138 @@ def probe_host_bench(host: RemoteHost, *,
     return None, "host bench probe printed no result"
 
 
+# ── multi-GPU (NCCL) preflight ──────────────────────────────────────────────
+# Hosts that cannot do multi-GPU passed every other check (2026-10-31/11-01):
+# one hung before its first step on NCCL "Cuda failure 999", one hung on a
+# plain 8-GPU all_reduce, and 8xH200 VMs trained 5x slower comm-bound (~155 W
+# per GPU vs ~375 W). The preflight runs an N-rank all_reduce of a fixed
+# buffer on the pod's OWN torch (its pinned venv) under a hard timeout. The
+# script is self-contained and travels on stdin — nothing of this release has
+# to be in the pod's image for it to run.
+NCCL_PREFLIGHT_MARK = "NCCLCHECK "
+NCCL_PREFLIGHT_BUFFER_MB = 256
+NCCL_PREFLIGHT_ITERS = 20
+_NCCL_PREFLIGHT_PY = """\
+import datetime, json, os, time
+import torch
+import torch.distributed as dist
+local = int(os.environ["LOCAL_RANK"])
+torch.cuda.set_device(local)
+dist.init_process_group("nccl", timeout=datetime.timedelta(seconds=__INIT__))
+world = dist.get_world_size()
+probe = torch.ones(1024, device="cuda")
+dist.all_reduce(probe)
+torch.cuda.synchronize()
+ok = bool(torch.all(probe == world).item())
+buf = torch.zeros(__MB__ * 1024 * 1024 // 4, device="cuda")
+for _ in range(3):
+    dist.all_reduce(buf)
+torch.cuda.synchronize()
+dist.barrier()
+t0 = time.perf_counter()
+for _ in range(__ITERS__):
+    dist.all_reduce(buf)
+torch.cuda.synchronize()
+dt = torch.tensor([(time.perf_counter() - t0) / __ITERS__], device="cuda",
+                  dtype=torch.float64)
+dist.all_reduce(dt, op=dist.ReduceOp.MAX)
+if dist.get_rank() == 0:
+    nbytes = buf.numel() * buf.element_size()
+    sec = max(float(dt.item()), 1e-9)
+    algbw = nbytes / sec / 1e9
+    print("NCCLCHECK " + json.dumps({"world": world, "bytes": nbytes, "seconds": sec,
+          "algbw_gbps": algbw, "busbw_gbps": algbw * 2 * (world - 1) / world,
+          "ok": ok}), flush=True)
+dist.destroy_process_group()
+"""
+
+
+@dataclass(frozen=True)
+class NcclPreflight:
+    """One multi-GPU preflight. ``ok`` = the all_reduce completed with the
+    right sum; ``inconclusive`` = the probe could not reach the pod at all
+    (ssh transport), which says nothing about its GPUs."""
+
+    ok: bool
+    world: int = 0
+    busbw_gbps: float | None = None
+    error: str = ""
+    inconclusive: bool = False
+
+
+def nccl_preflight_script(*, init_timeout: int = 45, buffer_mb: int = NCCL_PREFLIGHT_BUFFER_MB,
+                          iters: int = NCCL_PREFLIGHT_ITERS) -> str:
+    return (_NCCL_PREFLIGHT_PY.replace("__INIT__", str(int(init_timeout)))
+            .replace("__MB__", str(int(buffer_mb))).replace("__ITERS__", str(int(iters))))
+
+
+def nccl_preflight_command(host: RemoteHost, nprocs: int, timeout: float) -> str:
+    """The pod-side shell: stdin → a temp script, ``torchrun --standalone``
+    with ``nprocs`` ranks under ``timeout -k`` (a hung collective is KILLed,
+    and so is any rank it orphaned), temp file removed, the rank-0 exit code
+    returned (124/137 = the hard timeout fired)."""
+    env = ""
+    if host.cuda_device is not None and str(host.cuda_device).strip():
+        env = f"CUDA_VISIBLE_DEVICES={shlex.quote(str(host.cuda_device).strip())} "
+    t = max(1, int(timeout))
+    return (f"cd {shlex.quote(host.workdir)} && f=$(mktemp /tmp/cascade-nccl-XXXXXX.py) && "
+            f"cat > \"$f\" && {env}OMP_NUM_THREADS=1 timeout -k 10 {t} "
+            f"{host.remote_python} -m torch.distributed.run --standalone --nnodes=1 "
+            f"--nproc_per_node={int(nprocs)} \"$f\"; rc=$?; "
+            f"pkill -KILL -f \"$f\" 2>/dev/null; rm -f \"$f\"; exit $rc")
+
+
+def probe_nccl_allreduce(host: RemoteHost, *, nprocs: int, timeout: float = 90.0,
+                         runner=None) -> NcclPreflight:
+    """Run the NCCL all_reduce preflight on ``host`` with ``nprocs`` ranks.
+
+    ``runner(argv, timeout, stdin_text)`` is the ssh call (``run_ssh``; a
+    scripted double in tests). A hang (the pod-side ``timeout`` or the local
+    one firing) and any non-zero exit (NCCL/CUDA error) are failures; only an
+    ssh transport failure (rc 255 / the ssh binary unavailable) is
+    inconclusive."""
+    run = runner or run_ssh
+    script = nccl_preflight_script(init_timeout=max(10, int(timeout) - 15))
+    argv = build_ssh_argv(host, nccl_preflight_command(host, nprocs, timeout))
+    try:
+        proc = run(argv, int(timeout) + 60, script)
+    except subprocess.TimeoutExpired:
+        return NcclPreflight(ok=False, world=nprocs,
+                             error=f"NCCL all_reduce hung: no answer within {timeout:.0f}s")
+    except OSError as e:
+        return NcclPreflight(ok=False, error=f"preflight could not start: {e}",
+                             inconclusive=True)
+    rc = proc.returncode
+    tail = error_tail((proc.stderr or "") + (proc.stdout or ""), 240)
+    if rc == 255:
+        return NcclPreflight(ok=False, error=f"ssh rc=255: {tail}", inconclusive=True)
+    if rc in (124, 137):
+        return NcclPreflight(ok=False, world=nprocs,
+                             error=f"NCCL all_reduce hung: {nprocs}-rank collective killed "
+                                   f"by the {timeout:.0f}s hard timeout ({tail})")
+    if rc != 0:
+        return NcclPreflight(ok=False, world=nprocs,
+                             error=f"NCCL all_reduce failed rc={rc}: {tail}")
+    for line in reversed((proc.stdout or "").splitlines()):
+        i = line.find(NCCL_PREFLIGHT_MARK)
+        if i < 0:
+            continue
+        try:
+            facts = json.loads(line[i + len(NCCL_PREFLIGHT_MARK):])
+            world, bw = int(facts["world"]), float(facts["busbw_gbps"])
+        except (ValueError, KeyError, TypeError) as e:
+            return NcclPreflight(ok=False, world=nprocs,
+                                 error=f"NCCL preflight returned malformed facts: {e}")
+        if not facts.get("ok"):
+            return NcclPreflight(ok=False, world=world, busbw_gbps=bw,
+                                 error="NCCL all_reduce returned a wrong sum")
+        if world != int(nprocs):
+            return NcclPreflight(ok=False, world=world, busbw_gbps=bw,
+                                 error=f"NCCL preflight ran {world} rank(s), expected {nprocs}")
+        return NcclPreflight(ok=True, world=world, busbw_gbps=bw)
+    return NcclPreflight(ok=False, world=nprocs, error="NCCL preflight printed no result")
+
+
 # The public-benchmark sidecar needs NVIDIA driver >= 580 (crusoe 535 and
 # Warsaw 570 hosts fail every bench in about a minute; 2026-10-04 the era-2559
 # king pod, driver 570, burned three payer verifications to "dropped").

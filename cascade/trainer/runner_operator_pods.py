@@ -60,8 +60,10 @@ class _OperatorPodMixin:
             from ..provision.core import LaunchSpec, ProvisionError
             from ..provision.funded import quarantine_lemon_host, terminate_verified
             from ..provision.state import PodInstance
+            from .host_preflight import sync_host_blocklist
             from .remote import RemoteHost
 
+            sync_host_blocklist(self)
             rnd = self.cfg.round
             profile = self._funded_pod_profile()
             key_path = Path(profile.key_path or "").expanduser()
@@ -256,6 +258,14 @@ class _OperatorPodMixin:
                     why = self._host_bench_below_floor(king_host, sku, f"king pod {pod_id}")
                     if why:
                         _fail_king(pod_id, f"king pod rejected: {why}")
+                    # Multi-GPU preflight: a king host that hangs or crawls an
+                    # NCCL collective defends the throne at a fraction of its
+                    # rate (the check quarantines the host itself).
+                    from .host_preflight import multi_gpu_preflight_failure
+
+                    why = multi_gpu_preflight_failure(self, king_host, sku, f"king pod {pod_id}")
+                    if why:
+                        _fail_king(pod_id, f"king pod rejected: {why}")
                     # The king pod also runs the era's public benches and the
                     # payer verifications: a driver too old for the bench
                     # sidecar burns every one of them.
@@ -387,9 +397,11 @@ class _OperatorPodMixin:
         from ..provision.core import LaunchSpec, ProvisionError
         from ..provision.funded import quarantine_lemon_host, terminate_verified
         from ..provision.state import PodInstance
+        from .host_preflight import multi_gpu_preflight_failure, sync_host_blocklist
         from .remote import RemoteHost, probe_worker_runtime
         from .runner_funded_pods import allocation_lock
 
+        sync_host_blocklist(self)
         rnd = self.cfg.round
         profile = self._funded_pod_profile()
         key_path = Path(profile.key_path or "").expanduser()
@@ -540,7 +552,9 @@ class _OperatorPodMixin:
                 _ledger(sku)
                 host = self._push_deployed_chain_toml(_remote(addr, host_key))
                 why = (probe_worker_runtime(host, **({"required_flags": ("--local-only", "--continuation-root")} if getattr(self.cfg.round, "ops_continuation_interval_seconds", 0) else {}))
-                       or self._host_bench_below_floor(host, sku, f"operator leg pod {pod_id}"))
+                       or self._host_bench_below_floor(host, sku, f"operator leg pod {pod_id}")
+                       or multi_gpu_preflight_failure(self, host, sku,
+                                                      f"operator leg pod {pod_id}"))
                 if why:
                     _lemon(f"operator leg pod rejected: {why}")
                 log.warning("operator leg pod %s ready at %s:%d for %s (sku=%s) — "
@@ -589,8 +603,17 @@ class _OperatorPodMixin:
                 host = self._stage_vault_zip_on(host, digest)
             report_progress(self, "training")
             specialist = role in {"expert", "mkt_finetune"}
-            receipt = disp.dispatch(
-                host, lane_count=1, gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
+            # The same progress watchdog (throughput / first-step deadline)
+            # as a payer leg; an abort quarantines the host and is ours.
+            from types import SimpleNamespace
+
+            from .runner_funded_legs import _dispatch_watched, _with_leg_watchdog
+
+            disp = _with_leg_watchdog(
+                self, disp, gen, SimpleNamespace(instance_id=pod_id, payer_hotkey=""),
+                contract, host)
+            receipt = _dispatch_watched(
+                disp, host, lane_count=1, gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
                 role=role, base_seed=seeds.base_seed, block=int(block),
                 arch_preset=contract.arch_preset, warm_start_ref=warm_start_ref,
                 contract_block=contract_block, **corpus,

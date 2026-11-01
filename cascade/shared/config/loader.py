@@ -60,7 +60,9 @@ from .validators import (
     validate_funded_pods,
     validate_funded_price_cap,
     validate_funded_sku_wall_seconds,
+    validate_host_blocklist,
     validate_measured_image,
+    validate_nonneg_count,
     validate_nonneg_seconds,
     validate_real_corpus_ref,
     validate_sandbox_mode,
@@ -456,6 +458,26 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
                       RoundConfig.progress_watchdog_grace_seconds)),
             progress_watchdog_tolerance=validate_watchdog_tolerance(
                 r.get("progress_watchdog_tolerance", RoundConfig.progress_watchdog_tolerance)),
+            progress_watchdog_early_seconds=validate_nonneg_seconds(
+                "progress_watchdog_early_seconds",
+                r.get("progress_watchdog_early_seconds",
+                      RoundConfig.progress_watchdog_early_seconds)),
+            progress_first_step_seconds=validate_nonneg_seconds(
+                "progress_first_step_seconds",
+                r.get("progress_first_step_seconds", RoundConfig.progress_first_step_seconds)),
+            funded_host_blocklist=validate_host_blocklist(
+                r.get("funded_host_blocklist", None)),
+            funded_host_nccl_timeout_seconds=validate_nonneg_seconds(
+                "funded_host_nccl_timeout_seconds",
+                r.get("funded_host_nccl_timeout_seconds",
+                      RoundConfig.funded_host_nccl_timeout_seconds)),
+            funded_host_nccl_busbw_floor=validate_funded_host_bench_floor(
+                r.get("funded_host_nccl_busbw_floor", None),
+                name="funded_host_nccl_busbw_floor", unit="GB/s", example='"8xH200" = 300'),
+            operator_lane_breaker_failures=validate_nonneg_count(
+                "operator_lane_breaker_failures",
+                r.get("operator_lane_breaker_failures",
+                      RoundConfig.operator_lane_breaker_failures)),
             provider_ttl_margin_seconds=validate_nonneg_seconds(
                 "provider_ttl_margin_seconds",
                 r.get("provider_ttl_margin_seconds", RoundConfig.provider_ttl_margin_seconds)),

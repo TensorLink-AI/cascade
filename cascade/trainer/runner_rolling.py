@@ -226,17 +226,21 @@ class _RollingMixin:
                     staged = self._stage_vault_zip_on(host, digest) if digest else host
                     report_progress(self, "training")
                     return staged
-                entry = self._dispatch_on_free_lane(
-                    disp, pool, pool.known_hosts(),
-                    describe=f"rolling challenger {gen.hotkey}", used_host=used,
-                    prepare=prepare, deadline=self._operator_lane_deadline_fn(),
-                    gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
-                    role="challenger", base_seed=seeds.base_seed, block=int(block),
-                    arch_preset=contract.arch_preset, warm_start_ref=ws_ref,
-                    contract_block=self._era_contract_block(era), **slow,
-                    repo_suffix=suffix,
-                    **leg_corpus(self, gen, seeds, contract),   # cached
-                )
+                try:
+                    entry = self._dispatch_on_free_lane(
+                        disp, pool, pool.known_hosts(),
+                        describe=f"rolling challenger {gen.hotkey}", used_host=used,
+                        prepare=prepare, deadline=self._operator_lane_deadline_fn(),
+                        gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
+                        role="challenger", base_seed=seeds.base_seed, block=int(block),
+                        arch_preset=contract.arch_preset, warm_start_ref=ws_ref,
+                        contract_block=self._era_contract_block(era), **slow,
+                        repo_suffix=suffix,
+                        **leg_corpus(self, gen, seeds, contract),   # cached
+                    )
+                except Exception as e:
+                    record_lane_breaker_victim(self, gen.hotkey, e)
+                    raise
                 if used:
                     self._final_role_hosts[("challenger", contract.arch_preset, gen.hotkey)] = used[-1]
         finally:
@@ -269,10 +273,28 @@ class _RollingMixin:
         :meth:`_operator_lane_gate` (ssh, worker runtime, bench floor) from a
         live hosts.toml refresh."""
         pool = self.__dict__.get("_rolling_lane_pool_obj")
+        threshold = int(getattr(getattr(getattr(self, "cfg", None), "round", None),
+                                "operator_lane_breaker_failures", 0) or 0)
         if pool is None:
-            pool = _FinalLanePool(self._rolling_final_hosts(), self._rolling_final_hosts,
-                                  gate_fn=self._operator_lane_gate)
+            from .host_preflight import host_blocked_reason
+
+            # The initial lanes skip the join gate, but never the blocklist /
+            # quarantine: a blocked one is left to the refresh, whose gate
+            # refuses it (and re-gates it later, so an unblocked IP returns).
+            initial = []
+            for h in self._rolling_final_hosts():
+                why = host_blocked_reason(self, str(getattr(h, "host", "") or ""))
+                if why:
+                    log.warning("rolling lane pool: lane %s left out (%s)",
+                                getattr(h, "name", h), why)
+                    continue
+                initial.append(h)
+            pool = _FinalLanePool(initial, self._rolling_final_hosts,
+                                  gate_fn=self._operator_lane_gate,
+                                  breaker_threshold=threshold)
             self.__dict__["_rolling_lane_pool_obj"] = pool
+        else:
+            pool.breaker_threshold = threshold      # follows the live config
         return pool
 
     def _operator_funds_genesis_king(self, gen) -> bool:
@@ -1111,3 +1133,18 @@ class _RollingMixin:
             reg = DedupRegistry(self, self.work_root / "dedup_registry.json", mode=mode)
             self.__dict__["_dedup_registry_obj"] = reg
         return reg
+
+
+def record_lane_breaker_victim(runner, hotkey: str, exc: BaseException) -> bool:
+    """A leg that failed on a lane the circuit breaker just took out
+    (``exc.lane_breaker``) failed because of that LANE: its verdict is a
+    capacity miss — requeued unburned and WITHOUT the operator-fault backoff
+    (the queue backs off only ``operator`` class), so the healthy rest of the
+    fleet can take it at once. Returns True when it recorded one."""
+    if not getattr(exc, "lane_breaker", False):
+        return False
+    runner._record_funded_failure(
+        hotkey, f"LANE BREAKER: the operator lane this leg ran on failed several "
+        f"different legs in a row and left the rotation — requeued without backoff "
+        f"({str(exc)[-300:]})", miner_fault=False, error_class="no_capacity", burn=False)
+    return True
