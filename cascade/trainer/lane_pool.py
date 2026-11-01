@@ -7,9 +7,12 @@ import queue
 import threading
 import time
 
-from .faults import _LaneDeadlinePassed
+from .faults import _LaneDeadlinePassed, _NoOperatorLanes
 
 log = logging.getLogger("cascade.trainer")
+
+
+REMOVED_FROM_FILE = "removed from the hosts file"
 
 
 class _FinalLanePool(queue.Queue):
@@ -172,6 +175,29 @@ class _FinalLanePool(queue.Queue):
                        lane_only=True, hold_s=self.BREAKER_HOLD_S)
         return True
 
+    def _live_lanes(self) -> list[str]:
+        """Known lanes that can still serve: a BUSY lane already removed from
+        the hosts file leaves on :meth:`put` and will never serve a waiter."""
+        return [n for n in list(self._known) if self._pending.get(n) != REMOVED_FROM_FILE]
+
+    def _raise_if_no_lanes(self) -> None:
+        if not self._live_lanes():
+            held = sorted(n for n, t in self._rejected.items() if t > time.time())
+            raise _NoOperatorLanes(
+                "no operator lanes left — none live on file"
+                + (f" (out of rotation: {', '.join(held)})" if held else ""))
+
+    def unavailable_names(self) -> set[str]:
+        """Lane names out of the rotation RIGHT NOW (drained as dead, refused
+        at the gate, taken out by the breaker) and not live again — callers
+        deciding "is there an operator lane?" must not count them."""
+        # Lock-free snapshot: a refresh holds the lock through a join gate's
+        # ssh probe, and this is asked on every capacity poll.
+        now = time.time()
+        known = set(self._known)
+        return ({n for n, t in list(self._rejected.items()) if t > now and n not in known}
+                | {n for n, why in list(self._pending.items()) if why == REMOVED_FROM_FILE})
+
     def known_hosts(self) -> list:
         """Current membership (for lane-count geometry): grows as lanes join,
         shrinks as dead (or, with ``sync_from_file``, removed) lanes leave."""
@@ -210,7 +236,7 @@ class _FinalLanePool(queue.Queue):
         for name, cur in self._known.items():
             new = by_name.get(name)
             if new is None:
-                changes[name] = "removed from the hosts file"
+                changes[name] = REMOVED_FROM_FILE
             elif new is not cur and new != cur:
                 changes[name] = "hosts file entry changed; re-gating"
         for name in list(self._pending):         # the file reverted the change
@@ -324,11 +350,21 @@ class _FinalLanePool(queue.Queue):
                     try:
                         return super().get(block=False)
                     except queue.Empty:
+                        self._raise_if_no_lanes()
                         raise _LaneDeadlinePassed(
                             f"no operator lane free at the leg's latest safe start "
                             f"({time.strftime('%H:%M:%SZ', time.gmtime(latest))})"
                         ) from None
             self._absorb_new()
+            # ZERO live lanes (none on file, all removed by the hosts-file
+            # sync, drained as dead, refused at the gate or taken out by the
+            # breaker): nothing can ever free — never wait for one.
+            # 2026-11-01: 8 legs sat here ~02:20→06:41 after every lane went.
+            if not self._live_lanes():
+                try:
+                    return super().get(block=False)   # a lane handed back untracked
+                except queue.Empty:
+                    self._raise_if_no_lanes()
             wait = self.REFRESH_INTERVAL_S
             if latest is not None:
                 wait = max(0.0, min(wait, latest - time.time()))

@@ -406,8 +406,25 @@ class _FundedCapacityMixin:
                 hosts = []
         else:
             hosts = list(getattr(self, "remote_hosts", None) or [])
-        return [h for h in hosts
-                if getattr(h, "stage", "any") in ("any", "final") and not is_profile_only(h)]
+        lanes = [h for h in hosts
+                 if getattr(h, "stage", "any") in ("any", "final") and not is_profile_only(h)]
+        # Only lanes that can still serve: not out of the rolling pool's
+        # rotation (drained as dead, refused at the gate, breaker-held) and not
+        # on a blocked host. "Lanes on file" that are all gone must read as NO
+        # lanes, so an operator-billed entry rents an operator pod and a
+        # miner-funded one keeps polling its own key (2026-11-01: 8 legs sat
+        # on a lane pool with no live lane until their latest safe start).
+        pool = self.__dict__.get("_rolling_lane_pool_obj")
+        out = getattr(pool, "unavailable_names", None)
+        gone = out() if callable(out) else set()
+        if gone:
+            lanes = [h for h in lanes if getattr(h, "name", None) not in gone]
+        if lanes:
+            from .host_preflight import host_blocked_reason
+
+            lanes = [h for h in lanes
+                     if not host_blocked_reason(self, str(getattr(h, "host", "") or ""))]
+        return lanes
 
     def _probe_funded_capacity(self, sku,
                                exclude_ids: tuple[str, ...] = (),
