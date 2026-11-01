@@ -103,29 +103,57 @@ def _pool(hosts, *, gate=None, sync=True):
     return _FinalLanePool(list(hosts), f, gate_fn=gate, sync_from_file=sync), f
 
 
-def test_edit_replaces_an_idle_lanes_host_object():
+def _recording_gate(verdicts=None):
+    seen = []
+
+    def gate(h):
+        seen.append(h)
+        return (verdicts or {}).get(h.name)
+    return gate, seen
+
+
+def test_edit_regates_an_idle_lane_with_the_fresh_host_object():
+    """Any field edit re-runs the join gate (#401's deployed chain.toml push
+    happens there), then the fresh object rejoins."""
     a = _lane()
-    pool, f = _pool([a])
+    gate, seen = _recording_gate()
+    pool, f = _pool([a], gate=gate)
     edited = replace(a, chain_toml="/root/cascade/chain.deployed.toml",
                      ssh_options=("-o", "ServerAliveInterval=15"))
     f.hosts = [edited]
     got = pool.get(deadline=None)
     assert got == edited and got is not a
+    assert seen == [edited]                              # gated before rejoining
     assert pool.known_hosts() == [edited]
 
 
-def test_edit_reaches_a_busy_lane_when_its_leg_hands_it_back():
+def test_edit_reaches_a_busy_lane_through_the_gate_after_its_leg():
     a = _lane()
-    pool, f = _pool([a])
+    gate, seen = _recording_gate()
+    pool, f = _pool([a], gate=gate)
     held = pool.get()                                   # a leg holds the lane
     edited = replace(a, chain_toml="/x/chain.toml")
     f.hosts = [edited]
     pool._absorb_new()                                  # refresh while busy
-    assert pool.qsize() == 0                            # never yanked from the leg
-    pool.put(held)                                      # the leg finishes
-    again = pool.get()
-    assert again == edited
+    assert pool.qsize() == 0 and seen == []             # never yanked, not gated mid-leg
+    pool.put(held)                                      # the leg finishes: lane leaves
+    assert pool.known_hosts() == []
+    again = pool.get()                                  # next refresh re-gates it
+    assert again == edited and seen == [edited]
     assert pool.known_hosts() == [edited]
+
+
+def test_edited_lane_rejected_at_the_gate_leaves_the_rotation(caplog):
+    a = _lane()
+    gate, seen = _recording_gate({"lane-a": "deployed chain.toml push failed: scp rc=1"})
+    pool, f = _pool([a], gate=gate)
+    f.hosts = [replace(a, chain_toml="/x")]
+    with caplog.at_level("INFO", logger="cascade.trainer"):
+        pool._absorb_new()
+    assert pool.known_hosts() == [] and pool.qsize() == 0
+    assert "left the rotation" in caplog.text and "NOT admitted" in caplog.text
+    pool._absorb_new()                                  # not re-gated before REJECT_RETRY_S
+    assert len(seen) == 1
 
 
 def test_removed_idle_lane_leaves_the_rotation():
@@ -152,28 +180,69 @@ def test_removed_busy_lane_finishes_its_leg_then_leaves():
 
 def test_changed_endpoint_rejoins_through_the_gate():
     a = _lane()
-    gated = []
-    pool, f = _pool([a], gate=lambda h: gated.append(h) or None)
+    gate, seen = _recording_gate()
+    pool, f = _pool([a], gate=gate)
     moved = replace(a, port=40022)
     f.hosts = [moved]
     assert pool.get() == moved
-    assert gated == [moved]                              # a new pod: gated first
+    assert seen == [moved]                               # a new pod: gated first
 
 
-def test_rejected_moved_endpoint_does_not_reenter():
-    a = _lane()
-    pool, f = _pool([a], gate=lambda h: "ssh refused")
-    f.hosts = [replace(a, port=40022)]
+def test_a_cleanly_parsed_empty_lane_list_drains_every_lane():
+    """2026-11-01: every lane removed from hosts.toml, yet the trainer kept
+    dispatching to the deleted VMs for 15 min."""
+    a, b = _lane("a"), _lane("b", host="10.0.0.2")
+    pool, f = _pool([a, b])
+    held = pool.get()                                    # one leg in flight
+    f.hosts = []                                         # parsed: zero final lanes
     pool._absorb_new()
+    assert pool.qsize() == 0                             # the idle lane left now
+    assert [h.name for h in pool.known_hosts()] == [held.name]
+    pool.put(held)                                       # the busy one after its leg
     assert pool.known_hosts() == [] and pool.qsize() == 0
 
 
-def test_empty_refresh_never_prunes():
+def test_a_refresh_that_fails_keeps_every_lane():
     a = _lane()
-    pool, f = _pool([a])
-    f.hosts = []                                         # torn / mid-rewrite file
-    assert pool.get() is a
-    assert pool.known_hosts() == [a]
+
+    def broken():
+        raise ValueError("Invalid TOML: torn write")
+    pool = _FinalLanePool([a], broken, sync_from_file=True)
+    pool._absorb_new()
+    assert pool.known_hosts() == [a] and pool.get() is a
+
+
+def _hosts_entry(name, host, *, profile=False):
+    return (f'[[host]]\nname = "{name}"\nhost = "{host}"\nport = 22\n'
+            f'workdir = "/root/cascade"\nstage = "final"\n'
+            + ("profile_only = true\n" if profile else ""))
+
+
+def test_rolling_pool_drains_on_an_empty_file_but_not_a_missing_or_corrupt_one(tmp_path):
+    hosts_toml = tmp_path / "hosts.toml"
+    profile = _hosts_entry("funded-pod-profile", "127.0.0.1", profile=True)
+    hosts_toml.write_text(profile + _hosts_entry("lane-a", "10.0.0.1"), encoding="utf-8")
+    fake = SimpleNamespace(remote_hosts_path=hosts_toml, remote_hosts=(),
+                           _operator_lane_gate=lambda h: None)
+    fake._rolling_final_hosts = TrainerRunner._rolling_final_hosts.__get__(fake)
+    pool = TrainerRunner._rolling_lane_pool(fake)
+    assert [h.name for h in pool.known_hosts()] == ["lane-a"]
+    # missing file: ignored, lanes kept
+    hosts_toml.unlink()
+    pool._absorb_new()
+    assert [h.name for h in pool.known_hosts()] == ["lane-a"]
+    # unparsable file (a torn write): ignored
+    hosts_toml.write_text('[[host]]\nname = "lane-a', encoding="utf-8")
+    pool._absorb_new()
+    assert [h.name for h in pool.known_hosts()] == ["lane-a"]
+    # no [[host]] at all (an empty/truncated file): load_hosts raises, ignored
+    hosts_toml.write_text("", encoding="utf-8")
+    pool._absorb_new()
+    assert [h.name for h in pool.known_hosts()] == ["lane-a"]
+    # parses cleanly, zero final lanes (only the pod profile left): drained
+    hosts_toml.write_text(profile, encoding="utf-8")
+    pool._absorb_new()
+    assert pool.known_hosts() == [] and pool.qsize() == 0
 
 
 def test_reverted_edit_drops_the_pending_change():
@@ -195,6 +264,7 @@ def test_without_sync_the_join_only_refresh_is_unchanged():
     assert pool.get() is a                               # legacy: host object kept
     f.hosts = []
     pool.put(a)
+    pool._absorb_new()
     assert pool.known_hosts() == [a]
 
 
