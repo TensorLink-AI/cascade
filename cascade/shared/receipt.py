@@ -562,6 +562,10 @@ class RoundReceipt:
     # (0 = none resolved, or typed into chain.toml). Stamped from lock-in on so
     # the audit replays each verdict under the bar the fleet decided.
     margin_v2_block: int = 0
+    # DEC-CA-0067 (drop-when-default): the ``[v2] image_decoupled_from_block``
+    # this validator resolved FROM VALIDATOR SIGNALS (0 = none, or typed into
+    # chain.toml), so the audit replays each settlement under its rule.
+    image_decoupled_block: int = 0
     # cascade v2 (DEC-CA-0050, drop-when-default): ``[v2] from_block`` when
     # this settlement judges a v2 era (its era starts at or after it), else 0
     # — so every pre-v2 receipt serialises byte-for-byte as before and the
@@ -678,6 +682,8 @@ class RoundReceipt:
             body["activation_block"] = int(self.activation_block)
         if self.margin_v2_block:
             body["margin_v2_block"] = int(self.margin_v2_block)
+        if self.image_decoupled_block:
+            body["image_decoupled_block"] = int(self.image_decoupled_block)
         if self.v2_block:
             body["v2_block"] = int(self.v2_block)
         if self.lane_b is not None:
@@ -745,6 +751,7 @@ def build_receipt(
     era_base_seed: int = 0,
     activation_block: int = 0,
     margin_v2_block: int = 0,
+    image_decoupled_block: int = 0,
     lane_b: list[dict] | None = None,
     lane_b_pay: dict | None = None,
     v2_block: int = 0,
@@ -788,6 +795,7 @@ def build_receipt(
         era_base_seed=int(era_base_seed or 0),
         activation_block=int(activation_block or 0),
         margin_v2_block=int(margin_v2_block or 0),
+        image_decoupled_block=int(image_decoupled_block or 0),
         v2_block=int(v2_block or 0),
         lane_b=None if lane_b is None else tuple(dict(r) for r in lane_b),
         lane_b_pay=None if lane_b_pay is None else dict(lane_b_pay),
@@ -970,6 +978,7 @@ def _receipt_from_obj(obj: dict) -> RoundReceipt:
         era_base_seed=int(obj.get("era_base_seed", 0) or 0),
         activation_block=int(obj.get("activation_block", 0) or 0),
         margin_v2_block=int(obj.get("margin_v2_block", 0) or 0),
+        image_decoupled_block=int(obj.get("image_decoupled_block", 0) or 0),
         v2_block=int(obj.get("v2_block", 0) or 0),
         lane_b=(None if obj.get("lane_b") is None
                 else tuple(dict(r) for r in obj["lane_b"])),

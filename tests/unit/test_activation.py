@@ -36,7 +36,8 @@ def cfg():
                                       forfeit_successor_hotkey="", win_margin_start_v2=0.0,
                                       win_margin_end_v2=0.0, margin_warmup_blocks_v2=0,
                                       margin_v2_from_block=0),
-                   v2=replace(c.v2, prelaunch_burn=0.0))
+                   # no v2 schedule ⇒ no DEC-CA-0067 "v2b-" vote either
+                   v2=replace(c.v2, prelaunch_burn=0.0, launch_at_utc="", from_block=0))
 
 
 def _v(hk, stake, *, permit=True, last_update=0):

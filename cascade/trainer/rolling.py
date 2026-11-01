@@ -56,6 +56,7 @@ from ..shared.era import (
     bench_gate_mode_at,
     era_for_block,
     era_length_blocks,
+    image_decoupled_era,
     member_index_for_era,
     min_effective_era,
     next_era_start,
@@ -1365,13 +1366,47 @@ class RollingScheduler:
 
         return contract_digest(self.cfg.training.at_block(int(era.start_block)))
 
+    def _numerics_of(self, era, digest: str) -> str | None:
+        """DEC-CA-0067: the PROVEN numerics digest of a leg that recorded the
+        full ``digest`` against ``era``'s contract, else None (see
+        :func:`cascade.shared.manifest.prove_numerics_digest`): the current
+        pin and every ``[v2] prior_train_image_digests`` entry are tried."""
+        from ..shared.manifest import prove_numerics_digest
+
+        contract = self.cfg.training.at_block(int(era.start_block))
+        priors = tuple(getattr(getattr(self.cfg, "v2", None), "prior_train_image_digests", ())
+                       or ())
+        return prove_numerics_digest(contract, str(digest or ""), priors)
+
     def _stale_contract(self, era):
         """``digest -> bool``: an entry trained under another contract than
-        the one _build_manifest pins for ``era`` (v2 eras; never before)."""
+        the one _build_manifest pins for ``era`` (v2 eras; never before).
+
+        From ``[v2] image_decoupled_from_block`` (DEC-CA-0067, the era's own
+        rule) a leg is stale only when its numerics cannot be PROVEN equal to
+        the era's — an image-only repin keeps the king entry and the finished
+        legs; a numerics change (or an unprovable digest) still retrains."""
         if not v2_era_active(self.cfg, era.start_block):
             return lambda digest: False
         want = self._contract_identity(era)
-        return lambda digest: digest != want
+        if not image_decoupled_era(self.cfg, int(era.start_block)):
+            return lambda digest: digest != want
+
+        def stale(digest: str) -> bool:
+            if digest == want:
+                return False
+            if self._numerics_of(era, digest) is not None:
+                log.info("rolling: era %d leg contract %s differs from the era's %s only in "
+                         "the worker image (numerics proven) — kept, no retrain",
+                         era.index, str(digest)[:12], want[:12])
+                return False
+            log.error("rolling: era %d leg contract %s is NOT provably the era's numerics "
+                      "(%s; not the current pin or any [v2] prior_train_image_digests "
+                      "entry) — treated as stale, retrains", era.index,
+                      str(digest)[:12] or "<none>", want[:12])
+            return True
+
+        return stale
 
     def _seed_chain_root(self) -> bool:
         """The first settlement chains to the bucket's ``latest.json`` (the
@@ -3173,7 +3208,12 @@ class RollingScheduler:
                         expert_manifest_sha256: str = "", lane_c_digest: str = "",
                         validator_bench_reports: dict | None = None,
                         carried: list[FinishedLeg] | tuple = ()):
-        from ..shared.manifest import TrainingManifest, contract_digest, contract_payload
+        from ..shared.manifest import (
+            TrainingManifest,
+            contract_digest,
+            contract_payload,
+            numerics_contract_digest,
+        )
 
         ordered = sorted([*ready, *carried], key=lambda f: (f.reveal_block, f.hotkey))
         # DEC-CA-0055 item 6: the king entry names who paid for its leg (v2
@@ -3188,7 +3228,25 @@ class RollingScheduler:
                 replace(_entry_from_json(f.entry), role="challenger",
                         duel_rank=(i if len(ordered) > 1 else 0)), ""))
         contract = self.cfg.training.at_block(int(era.start_block))
-        if v2_era_active(self.cfg, era.start_block):
+        # DEC-CA-0067: stamped ONLY from the era's switch — before it every
+        # manifest is byte-identical to the earlier release's
+        decoupled = (v2_era_active(self.cfg, era.start_block)
+                     and image_decoupled_era(self.cfg, int(era.start_block)))
+        numerics = numerics_contract_digest(contract) if decoupled else ""
+        if decoupled:
+            from ..shared.hippius import StorageError
+
+            stamped = []
+            for entry in entries:
+                proven = self._numerics_of(era, entry.training_contract_digest)
+                if entry.init_pointer != era.warm_start_ckpt or proven != numerics:
+                    raise StorageError(
+                        "refusing v2 manifest: entry lacks the scheduled init or a provable "
+                        "numerics contract identity; check worker release and requeue "
+                        "incompatible work")
+                stamped.append(replace(entry, numerics_contract_digest=proven))
+            entries = stamped
+        elif v2_era_active(self.cfg, era.start_block):
             from ..shared.hippius import StorageError
 
             for entry in entries:
@@ -3238,6 +3296,8 @@ class RollingScheduler:
             # regardless).
             prev_manifest_sha256=(self.state.last_published_manifest_sha256
                                   if self._hash_link_active(pin_block) else ""),
+            # DEC-CA-0067: passed only when stamped (byte-identical before)
+            **({"numerics_contract_digest": numerics} if numerics else {}),
         )
 
     def _vbench_carry(self, cur: EraState, ready: list[FinishedLeg],

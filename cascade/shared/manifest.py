@@ -249,6 +249,87 @@ def contract_digest(contract: object) -> str:
     return hashlib.sha256(blob).hexdigest()
 
 
+# ── the numerics projection of a training contract (DEC-CA-0067) ────────────
+# The declared contract fields that pin the RUNTIME (the container image the
+# leg executed in), not the numerics the leg computed. They stay in
+# ``contract_digest`` (so every existing digest is byte-identical, the receipt
+# keeps the full provenance, and the pod still refuses a FINAL whose runtime
+# image != the pin — cascade.trainer.contract.verify_train_image), but from
+# ``[v2] image_decoupled_from_block`` the per-entry consensus check compares
+# :func:`numerics_contract_digest` instead, so re-pinning the worker image
+# (speed, an EMA shadow …) no longer retrains the carried king or rejects a
+# settlement. Audited against TrainingContractConfig: every other field is an
+# architecture / objective / budget / optimizer / corpus term (or already in
+# ``_NEVER_IN_DIGEST``: the schedules and ``router_slow``). ``expected_gpu``
+# stays (a LOCKED term — the matched-hardware pin), and so does
+# ``max_train_seconds`` (the wall can cut the token budget a leg consumes,
+# i.e. it can change the numerics). NEVER remove an entry once shipped.
+IMAGE_RUNTIME_FIELDS: tuple[str, ...] = ("train_image_digest",)
+
+# Domain tag: a numerics digest can never equal a full contract digest of any
+# payload (the full digest hashes the bare JSON).
+_NUMERICS_DOMAIN = b"cascade-numerics-contract/1\n"
+
+
+def numerics_contract_payload(contract: object) -> dict:
+    """:func:`contract_payload` minus :data:`IMAGE_RUNTIME_FIELDS` — the dict
+    :func:`numerics_contract_digest` hashes. Accepts a contract dataclass or a
+    payload dict (a manifest's published ``contract_body``)."""
+    payload = contract_payload(contract)
+    for key in IMAGE_RUNTIME_FIELDS:
+        payload.pop(key, None)
+    return payload
+
+
+def numerics_contract_digest(contract: object) -> str:
+    """sha256 over the contract's numerics: ``contract_digest``'s exact
+    canonical JSON with the image/runtime pins removed, domain-tagged.
+    Deterministic; equal for two contracts that differ ONLY in
+    :data:`IMAGE_RUNTIME_FIELDS`, different for any other term change."""
+    blob = json.dumps(numerics_contract_payload(contract), sort_keys=True,
+                      separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(_NUMERICS_DOMAIN + blob).hexdigest()
+
+
+def _image_variants(ref: str) -> list[str]:
+    ref = str(ref or "").strip()
+    out = [ref]
+    if "@" in ref:
+        out.append(ref.rsplit("@", 1)[1])
+    return out
+
+
+def prove_numerics_digest(contract: object, full_digest: str,
+                          candidate_images=()) -> str | None:
+    """The numerics digest of the contract a leg recorded as ``full_digest``,
+    PROVEN against ``contract`` — or ``None`` when it cannot be.
+
+    A leg records only its FULL ``training_contract_digest``. That leg trained
+    under ``contract`` with nothing but the image pin different iff, for some
+    image ``img``, ``contract_digest(contract with train_image_digest=img) ==
+    full_digest`` (sha256 preimage resistance: no other term set hashes there).
+    Tried: ``contract``'s own pin, then each of ``candidate_images`` (exactly as
+    once typed, plus the bare ``sha256:…`` of a ``repo@sha256:…`` ref). On a
+    match the leg's numerics are ``contract``'s, so the result is
+    ``numerics_contract_digest(contract)``. No match (a numerics change, or an
+    image the candidates do not name) ⇒ ``None`` — the caller keeps the old
+    stale → retrain behaviour for that leg."""
+    if not full_digest:
+        return None
+    payload = contract_payload(contract)
+    seen: set[str] = set()
+    for cand in [str(payload.get("train_image_digest", "")),
+                 *(v for c in candidate_images for v in _image_variants(c))]:
+        if cand in seen:
+            continue
+        seen.add(cand)
+        trial = dict(payload)
+        trial["train_image_digest"] = cand
+        if contract_digest(trial) == str(full_digest):
+            return numerics_contract_digest(contract)
+    return None
+
+
 # ── the locked (consensus) projection of a training contract — DEC-CA-0036 ───
 # The ONLY contract terms a validator gates a manifest on. Everything else in
 # [training] is trainer-DECLARED: published in the signed manifest, recorded in
@@ -394,6 +475,11 @@ class TrainedEntry:
     funded_by: str = ""
     init_pointer: str | None = None  # None = historical receipt with no per-leg init binding
     training_contract_digest: str = ""
+    # DEC-CA-0067 (drop-when-empty, SIGNED): the leg's
+    # :func:`numerics_contract_digest` — stamped only on settlements where
+    # ``[v2] image_decoupled_from_block`` is in force, so every earlier
+    # manifest hashes byte-for-byte as before.
+    numerics_contract_digest: str = ""
 
     def __post_init__(self) -> None:
         if self.role not in VALID_ROLES:
@@ -508,6 +594,8 @@ def _entry_body(e: TrainedEntry) -> dict:
         d.pop("init_pointer", None)
     if not d.get("training_contract_digest"):
         d.pop("training_contract_digest", None)
+    if not d.get("numerics_contract_digest"):
+        d.pop("numerics_contract_digest", None)
     return d
 
 
@@ -680,6 +768,12 @@ class TrainingManifest:
     # its own view of the store's timing. Every manifest without it keeps its
     # exact bytes and signature.
     validator_bench_reports: dict | None = None
+    # DEC-CA-0067 (drop-when-empty, SIGNED): ``numerics_contract_digest`` of
+    # this settlement's contract (``contract_body``) — what every entry's own
+    # ``numerics_contract_digest`` must equal once ``[v2]
+    # image_decoupled_from_block`` is in force. Empty on every earlier
+    # manifest, which keeps its exact bytes and signature.
+    numerics_contract_digest: str = ""
     signature: str | None = None  # trainer_hotkey signature over canonical_body()
 
     def entry_for_role(self, role: str) -> TrainedEntry | None:
@@ -835,6 +929,8 @@ class TrainingManifest:
         if self.validator_bench_reports:
             body["validator_bench_reports"] = {str(k): str(v) for k, v in sorted(
                 self.validator_bench_reports.items())}
+        if self.numerics_contract_digest:
+            body["numerics_contract_digest"] = self.numerics_contract_digest
         return json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
@@ -881,6 +977,7 @@ def load_manifest(text: str) -> TrainingManifest:
             funded_by=str(e.get("funded_by", "") or ""),
             init_pointer=e.get("init_pointer"),
             training_contract_digest=str(e.get("training_contract_digest", "") or ""),
+            numerics_contract_digest=str(e.get("numerics_contract_digest", "") or ""),
         )
         for e in obj["entries"]
     ]
@@ -911,6 +1008,7 @@ def load_manifest(text: str) -> TrainingManifest:
         validator_bench_reports=({str(k): str(v) for k, v in obj["validator_bench_reports"].items()}
                                  if isinstance(obj.get("validator_bench_reports"), dict)
                                  and obj["validator_bench_reports"] else None),
+        numerics_contract_digest=str(obj.get("numerics_contract_digest", "") or ""),
         signature=obj.get("signature"),
     )
 

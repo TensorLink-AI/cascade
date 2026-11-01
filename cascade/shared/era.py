@@ -497,3 +497,43 @@ def validator_bench_at(cfg: Any, boundary: int | None) -> bool:
 def validator_bench_configured(cfg: Any) -> bool:
     """Whether a validator bench source applies at any block."""
     return bench_source_from(cfg) > 0
+
+
+# ── DEC-CA-0067: the image-decoupled contract + its bundled window budget ───
+
+
+def image_decoupled_from(cfg: Any) -> int:
+    """``[v2] image_decoupled_from_block`` (0 = never): typed by the owner, or
+    written by the ``v2b-`` lock-in (the first era start after it)."""
+    return max(0, int(getattr(getattr(cfg, "v2", None), "image_decoupled_from_block", 0) or 0))
+
+
+def image_decoupled_era(cfg: Any, era_start: int | None) -> bool:
+    """CONSENSUS: whether the era starting at ``era_start`` is judged under the
+    numerics-only per-leg contract rule (trainer-side: stamp
+    ``numerics_contract_digest`` and keep image-only-stale legs)."""
+    n = image_decoupled_from(cfg)
+    return bool(n > 0 and era_start is not None and int(era_start) >= n)
+
+
+def image_decoupled_at(cfg: Any, boundary: int | None) -> bool:
+    """CONSENSUS: :func:`image_decoupled_era` of the era a SETTLEMENT at
+    ``boundary`` belongs to (:func:`settlement_contract_block`) — the
+    settlement AT the switch block is the previous era's last and keeps the
+    old rule, so no era is ever judged under two rules (the
+    :func:`validator_bench_at` / :func:`v2_settlement_active` convention)."""
+    if boundary is None or not image_decoupled_from(cfg):
+        return False
+    return image_decoupled_era(cfg, settlement_contract_block(cfg.round, int(boundary)))
+
+
+def v2_eval_windows_at(cfg: Any, boundary: int | None) -> int:
+    """CONSENSUS: the ``[v2]`` private verdict budget in force for a settlement
+    at ``boundary`` — ``eval_n_windows_after`` from the DEC-CA-0067 switch on
+    (when set), else ``eval_n_windows`` (0 = no v2 budget: ``[eval]``
+    applies). Only meaningful on a v2 settlement; the caller checks that."""
+    v2 = getattr(cfg, "v2", None)
+    after = int(getattr(v2, "eval_n_windows_after", 0) or 0)
+    if after and image_decoupled_at(cfg, boundary):
+        return after
+    return int(getattr(v2, "eval_n_windows", 0) or 0)

@@ -60,6 +60,11 @@ ERA START after the lock-in boundary into ``[scoring] margin_v2_from_block``
 The DEC-CA-0055 pre-launch burn is the third (``prelaunch-<pct>``):
 lock-in writes the NEXT settlement boundary into ``[v2]
 prelaunch_burn_from_block`` (:func:`apply_prelaunch_burn_activation`).
+The DEC-CA-0067 consensus bundle is the fourth (``v2b-<sha256(params)[:8]>``):
+lock-in writes the first ERA START after the lock-in boundary into ``[v2]
+image_decoupled_from_block`` (:func:`apply_image_decoupled_activation`) — the
+image-decoupled per-leg contract rule and ``[v2] eval_n_windows_after`` both
+switch there.
 """
 
 from __future__ import annotations
@@ -625,6 +630,77 @@ def apply_prelaunch_burn_activation(cfg: ChainConfig, block: int) -> ChainConfig
                    activation=replace(cfg.activation, resolved_prelaunch_burn_block=block))
 
 
+# DEC-CA-0067 consensus bundle "v2b": the image-decoupled contract rule (its
+# rule version + the image/runtime field list) and the bundled v2 verdict
+# window budget. The params ARE the feature: a changed bundle is a fresh vote.
+V2B_RULE = "image-decoupled/1"
+
+
+def v2b_feature_name(eval_n_windows_after: int) -> str:
+    """``v2b-<sha256("image-decoupled/1|<fields>|eval_n_windows_after=<n>")[:8]>``.
+    Kept short on purpose: the note is ONE 128-byte commitment field shared
+    with every other segment (:data:`NOTE_MAX_BYTES`)."""
+    from .manifest import IMAGE_RUNTIME_FIELDS
+
+    body = (f"{V2B_RULE}|{','.join(IMAGE_RUNTIME_FIELDS)}|"
+            f"eval_n_windows_after={int(eval_n_windows_after or 0)}")
+    return "v2b-" + hashlib.sha256(body.encode("utf-8")).hexdigest()[:8]
+
+
+def configured_image_decoupled_block(cfg: ChainConfig) -> int:
+    """The DEC-CA-0067 block TYPED into chain.toml (0 = none / decided on
+    chain). A block written by :func:`apply_image_decoupled_activation` is not
+    typed (``activation.resolved_image_decoupled_block`` marks it)."""
+    if int(getattr(cfg.activation, "resolved_image_decoupled_block", 0) or 0):
+        return 0
+    return int(getattr(getattr(cfg, "v2", None), "image_decoupled_from_block", 0) or 0)
+
+
+def resolved_image_decoupled_block(cfg: ChainConfig) -> int:
+    return int(getattr(cfg.activation, "resolved_image_decoupled_block", 0) or 0)
+
+
+def image_decoupled_feature(cfg: ChainConfig) -> FeatureSpec | None:
+    """The DEC-CA-0067 bundle as a feature the fleet decides (the DEC-CA-0049
+    pattern): present whenever ``[activation]`` is on and v2 is scheduled
+    (``[v2] from_block`` or ``launch_at_utc``) — a validator on this release
+    signals it at startup; ``typed_block`` = the typed ``[v2]
+    image_decoupled_from_block`` (the override — nothing is signalled). Takes
+    effect at the first ERA START after the lock-in boundary. ``None`` =
+    activation off or no v2 schedule (a typed block is then the only way)."""
+    v2 = getattr(cfg, "v2", None)
+    if not cfg.activation.enabled or v2 is None or not (
+            int(getattr(v2, "from_block", 0) or 0) or getattr(v2, "launch_at_utc", "")):
+        return None
+    name = v2b_feature_name(int(getattr(v2, "eval_n_windows_after", 0) or 0))
+    return FeatureSpec(name=name, typed_block=configured_image_decoupled_block(cfg),
+                       align="era")
+
+
+def apply_image_decoupled_activation(cfg: ChainConfig, block: int) -> ChainConfig:
+    """The config the owner would have typed for the DEC-CA-0067 bundle decided
+    at rollover ``block`` (the first era start after the lock-in boundary):
+    ``[v2] image_decoupled_from_block`` = that block — which also switches
+    ``eval_n_windows_after`` in (:func:`cascade.shared.era.v2_eval_windows_at`).
+    A typed block is returned unchanged (the owner override); a block already
+    applied is idempotent; a different block after lock-in raises (one-way);
+    a block that is not an era start raises."""
+    block = int(block or 0)
+    if block <= 0 or configured_image_decoupled_block(cfg):
+        return cfg
+    have = resolved_image_decoupled_block(cfg)
+    if have == block:
+        return cfg
+    if have:
+        raise ValueError(f"image-decoupled contract {have} already applied; a lock-in is "
+                         f"one-way and cannot move it to {block}")
+    if block % int(era_length_blocks(cfg.round, block - 1)):
+        raise ValueError(f"image-decoupled block {block} is not an era start (DEC-CA-0067 "
+                         "switches the rule only at a fresh era)")
+    return replace(cfg, v2=replace(cfg.v2, image_decoupled_from_block=block),
+                   activation=replace(cfg.activation, resolved_image_decoupled_block=block))
+
+
 def apply_activation(cfg: ChainConfig, block: int) -> ChainConfig:
     """The config the owner would have typed for a rollover at ``block``.
 
@@ -1035,6 +1111,14 @@ def apply_receipt_activation(cfg: ChainConfig, receipt: Any) -> ChainConfig:
         except ValueError as e:
             log.warning("activation: receipt pre-launch burn block %d not applied to the "
                         "audit config (%s)", plb, e)
+    # DEC-CA-0067: the fleet-decided image-decoupled block, likewise.
+    idb = int(getattr(receipt, "image_decoupled_block", 0) or 0)
+    if idb and not configured_image_decoupled_block(cfg):
+        try:
+            cfg = apply_image_decoupled_activation(cfg, idb)
+        except ValueError as e:
+            log.warning("activation: receipt image-decoupled block %d not applied to the "
+                        "audit config (%s)", idb, e)
     return cfg
 
 
@@ -1050,7 +1134,8 @@ def own_signal_payload(cfg: ChainConfig, record: ActivationRecord,
                        margin_v2_record: ActivationRecord | None = None,
                        prelaunch_record: ActivationRecord | None = None,
                        netconfig_segment: ReadySignal | None = None,
-                       in_force: ChainConfig | None = None) -> str | None:
+                       in_force: ChainConfig | None = None,
+                       image_decoupled_record: ActivationRecord | None = None) -> str | None:
     """The note this node should have on chain right now (``None`` when
     signalling is off): plain readiness until lock-in, then the agreed block
     — per segment. With no forfeiture decided on chain the note is exactly
@@ -1082,6 +1167,12 @@ def own_signal_payload(cfg: ChainConfig, record: ActivationRecord,
     if (plb is not None and plb.decided_on_chain
             and not (typed is not None and configured_prelaunch_burn_block(typed))):
         extras.append(_segment_for(plb, prelaunch_record))
+    # DEC-CA-0067 rides last among the feature segments (the newest; the
+    # first trimmed under NOTE_MAX_BYTES — see the DEC for the byte budget)
+    v2b = image_decoupled_feature(cfg)
+    if (v2b is not None and v2b.decided_on_chain
+            and not (typed is not None and configured_image_decoupled_block(typed))):
+        extras.append(_segment_for(v2b, image_decoupled_record))
     tail = [netconfig_segment] if netconfig_segment is not None else []
     if not primary.decided_on_chain and not extras and not tail:
         return None                                  # typed-in rollover: the note is inert
@@ -1108,12 +1199,14 @@ def ensure_signal(client: Any, cfg: ChainConfig, record: ActivationRecord, *,
                   margin_v2_record: ActivationRecord | None = None,
                   prelaunch_record: ActivationRecord | None = None,
                   netconfig_segment: ReadySignal | None = None,
-                  in_force: ChainConfig | None = None) -> bool:
+                  in_force: ChainConfig | None = None,
+                  image_decoupled_record: ActivationRecord | None = None) -> bool:
     """Write this validator's note unless the chain already carries it.
     Returns True when a write happened. Never raises (a failed write is
     retried on the next call)."""
     want = own_signal_payload(cfg, record, forfeit_record, margin_v2_record,
-                              prelaunch_record, netconfig_segment, in_force)
+                              prelaunch_record, netconfig_segment, in_force,
+                              image_decoupled_record)
     if want is None:
         return False
     try:
@@ -1134,7 +1227,9 @@ def summary(cfg: ChainConfig, record: ActivationRecord, t: Tally | None,
             margin_v2_record: ActivationRecord | None = None,
             margin_v2_tally: Tally | None = None,
             prelaunch_record: ActivationRecord | None = None,
-            prelaunch_tally: Tally | None = None) -> dict:
+            prelaunch_tally: Tally | None = None,
+            image_decoupled_record: ActivationRecord | None = None,
+            image_decoupled_tally: Tally | None = None) -> dict:
     """Presentational block for ``status/chain.json`` / dashboards."""
     out: dict = {
         "feature": cfg.activation.feature,
@@ -1189,4 +1284,18 @@ def summary(cfg: ChainConfig, record: ActivationRecord, t: Tally | None,
         if prelaunch_tally is not None:
             po["tally"] = prelaunch_tally.to_json()
         out["prelaunch_burn"] = po
+    v2b = image_decoupled_feature(cfg)
+    if v2b is not None:
+        rec = image_decoupled_record or ActivationRecord()
+        io: dict = {
+            "feature": v2b.name,
+            "eval_n_windows_after": int(getattr(cfg.v2, "eval_n_windows_after", 0) or 0),
+            "typed_block": int(v2b.typed_block),
+            "lock_block": int(rec.lock_block),
+            "activation_block": int(rec.activation_block),
+            "source": rec.source,
+        }
+        if image_decoupled_tally is not None:
+            io["tally"] = image_decoupled_tally.to_json()
+        out["image_decoupled"] = io
     return out

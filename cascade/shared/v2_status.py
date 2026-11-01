@@ -1032,6 +1032,7 @@ def publish_trainer_v2_status(sched, block: int, *, min_interval_s: float = MIN_
         if hasattr(cfg, "throne_contracts_at"):
             from dataclasses import asdict
 
+            from .era import image_decoupled_era
             from .manifest import contract_digest, contract_payload
 
             start = int(getattr(cur, "start_block", block))
@@ -1046,7 +1047,9 @@ def publish_trainer_v2_status(sched, block: int, *, min_interval_s: float = MIN_
             for section in ("lane_b", "lane_c", "marketcast", "generator", "generation", "eval", "scoring"):
                 doc["policy"][section] = asdict(getattr(cfg, section))
             doc["policy"]["eval"]["n_windows"] = cfg.eval_windows_at(start, settlement=False)
-            if cfg.v2.eval_n_windows and cfg.v2.active(start):
+            if (cfg.v2.eval_n_windows or (
+                    cfg.v2.eval_n_windows_after and image_decoupled_era(cfg, start))) \
+                    and cfg.v2.active(start):
                 doc["policy"]["eval"].update(mix_target_windows=0, mix_series_bag_frac=1.0)
             doc["policy"]["generator"] = asdict(cfg.generator_for_contract(contract))
             doc["policy"]["generator"].pop("real_corpus_dir", None)

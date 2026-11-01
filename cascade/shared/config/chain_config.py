@@ -128,11 +128,17 @@ class ChainConfig:
 
     def eval_windows_at(self, block: int | None, *, settlement: bool = True) -> int:
         """Private verdict budget under this round's own era, including replay."""
-        from ..era import v2_settlement_active
+        from ..era import image_decoupled_era, v2_eval_windows_at, v2_settlement_active
 
         active = v2_settlement_active(self, block) if settlement else self.v2.active(block)
-        return (int(self.v2.eval_n_windows) if active and self.v2.eval_n_windows
-                else int(self.eval.n_windows))
+        if settlement:
+            n = v2_eval_windows_at(self, block)
+        else:
+            # ``block`` is an era start here (v2_status): the era's own rule
+            after = int(getattr(self.v2, "eval_n_windows_after", 0) or 0)
+            n = (after if after and image_decoupled_era(self, block)
+                 else int(self.v2.eval_n_windows))
+        return int(n) if active and n else int(self.eval.n_windows)
 
     def koth_params(self, block: int | None = None) -> Any:
         """Build a :class:`cascade.eval.koth.KothParams` from ``[scoring]``

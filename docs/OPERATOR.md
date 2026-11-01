@@ -219,6 +219,46 @@ Tier 2 uses the match to decide when a byte-exact checkpoint comparison
 applies. Rented pods boot `[round] funded_pod_image`; pin it as described in
 [Credentials on payer pods](#credentials-on-payer-pods).
 
+### Re-pinning the image inside a v2 seed epoch (DEC-CA-0067)
+
+`train_image_digest` is part of `contract_digest`. Before DEC-CA-0067 is in
+force, re-pinning it mid-epoch makes the trainer drop the carried king entry
+and every finished leg (`_stale_contract`) and retrain them (operator-billed),
+and validators reject any entry with a different full digest
+(`era_entry_init_mismatch`). Do not re-pin inside a v2 seed epoch until the
+switch below is in force.
+
+Once `[v2] image_decoupled_from_block` is in force for an era, every v2
+settlement of that era stamps `numerics_contract_digest` (the contract minus
+`train_image_digest`) on the manifest and on every entry. Validators gate legs
+on that value. An image-only re-pin then keeps the king entry and pointer and
+the finished legs. A numerics change still retrains. The pod still refuses a
+FINAL whose runtime image differs from the pin.
+
+How it activates: validators on the release signal `v2b-<hash>` at startup. At
+the first settlement boundary where `[activation] threshold` of eligible stake
+has signalled, the vote locks in. The switch is the first era start after that
+boundary. Trainer and validators resolve the same block. A typed
+`[v2] image_decoupled_from_block` is the owner override. The same block also
+switches the v2 verdict budget to `[v2] eval_n_windows_after`.
+
+Re-pin runbook, once `status/chain.json` (`activation.image_decoupled`) shows
+the lock-in:
+
+1. Wait until the switch era has started (head block >= the activation block).
+2. Append the CURRENT `[v2.training] train_image_digest`, exactly as typed, to
+   `[v2] prior_train_image_digests` in the deployed chain.toml. The trainer
+   uses it to prove that a pre-repin leg differs only in its image. A leg it
+   cannot prove is retrained and logged at ERROR.
+3. Re-pin `[v2.training] train_image_digest` and `[round] funded_pod_image` to
+   the new release (`scripts/repin_worker_image.sh`). Push `chain.deployed.toml`
+   and spot-check one pod per stage.
+4. Restart the trainer only with no legs in flight. A leg dispatched before the
+   re-pin and re-attached after a restart is still requeued, because its
+   receipt names the old full digest.
+5. Verify that the next settlement keeps the king (`numerics proven` at INFO in
+   trainer.log) and that the validators accept it.
+
 ### GPU type
 
 The GPU type is chosen **per leg**: the trainer rents the cheapest fitting

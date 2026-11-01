@@ -438,6 +438,8 @@ class SatelliteRunner(ActivationMixin):
     _margin_v2_tally: Any = field(default=None, repr=False)
     _prelaunch: ActivationRecord = field(default_factory=ActivationRecord, repr=False)
     _prelaunch_tally: Any = field(default=None, repr=False)
+    _image_decoupled: ActivationRecord = field(default_factory=ActivationRecord, repr=False)
+    _image_decoupled_tally: Any = field(default=None, repr=False)
     _cfg_base: Any = field(default=None, repr=False)
     _settlement_block: int | None = field(default=None, repr=False)
     _netconfig_now: int | None = field(default=None, repr=False)

@@ -278,6 +278,9 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
     activation_store: object | None = None
     _activation: object | None = field(default=None, repr=False)
     _forfeit: object | None = field(default=None, repr=False)
+    # DEC-CA-0067 image-decoupled contract, resolved READ-ONLY like the
+    # forfeiture (``activation_image_decoupled_state.json``).
+    _image_decoupled: object | None = field(default=None, repr=False)
     # DEC-CA-0057 owner-signed network config, resolved READ-ONLY (the trainer
     # never signals): the resolver (None = inert) and, while an overlay is in
     # force, the base config ``self.cfg`` is a view of (activation lock-ins
@@ -613,6 +616,7 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
             if rec.locked and rec.source != "config":
                 self.apply_activation_block(rec.activation_block)
             self._forfeit_tick(client, block)
+            self._image_decoupled_tick(client, block)
         except Exception as e:  # noqa: BLE001 — activation must never sink a tick
             log.warning("activation step failed (%s); retrying next poll", e)
 
@@ -663,6 +667,59 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
                 log.warning("activation: DEC-CA-0048 forfeiture ARMED at block %d — the era whose "
                             "first settlement reaches it trains the successor's king leg",
                             new_cfg.scoring.forfeit_from_block)
+
+    def _image_decoupled_tick(self, client, block: int) -> None:
+        """DEC-CA-0067 decided on chain: the trainer resolves the SAME tally the
+        validators do (same resolver, same as-of-boundary reads, same notes
+        for a late start — it never signals) and applies the resolved era
+        start to ``[v2] image_decoupled_from_block``. Deterministic: the
+        manifest fields and the numerics stale rule key off exactly the block
+        every validator applies, so the trainer never stamps them early (the
+        block is 0 until this resolves) and a lock-in always lands at least
+        one settlement before its era starts (``align="era"``)."""
+        from ..shared.activation import (
+            ActivationRecord,
+            ActivationStore,
+            apply_image_decoupled_activation,
+            image_decoupled_feature,
+            record_for,
+            resolve_activation,
+        )
+
+        spec = image_decoupled_feature(self._base_cfg())
+        if spec is None or not spec.decided_on_chain:
+            return
+        store = None
+        base = getattr(self.activation_store, "path", None)
+        if base is not None:
+            store = ActivationStore(Path(base).with_name("activation_image_decoupled_state.json"))
+        rec = self._image_decoupled
+        if rec is None:
+            rec = record_for(self._base_cfg(),
+                             store.load() if store is not None else ActivationRecord(), spec)
+            self._image_decoupled = rec
+            if rec.locked and rec.source != "config":
+                log.info("activation: restored image-decoupled lock-in (block %d, rule from "
+                         "%d, via %s)", rec.lock_block, rec.activation_block, rec.source)
+        res = resolve_activation(self._base_cfg(), client, now_block=int(block), record=rec,
+                                 feature=spec)
+        if res.changed:
+            self._image_decoupled = res.record
+            if store is not None:
+                store.save(res.record)
+        rec = self._image_decoupled
+        if rec.locked and rec.source != "config":
+            base = self._base_cfg()
+            new_cfg = apply_image_decoupled_activation(base, rec.activation_block)
+            if new_cfg is not base:
+                self._set_base_cfg(new_cfg)
+                if self._cfg_base is None:
+                    # no overlay view: the scheduler holds its own reference
+                    self._point_cfg_consumers(new_cfg)
+                log.warning("activation: DEC-CA-0067 image-decoupled contract ARMED at block "
+                            "%d — settlements of eras from it stamp numerics_contract_digest "
+                            "and keep image-only-stale legs",
+                            new_cfg.v2.image_decoupled_from_block)
 
     def _harvest_leg(self, host, receipt, *, base_seed: int, repo_suffix: str = ""):
         """Dispatcher hook for ISOLATED hosts that were not dispatched

@@ -446,17 +446,34 @@ def _tier2_score_compare(
             # The ladder draw is keyed on the CONFIG budget (per-rung size =
             # n_windows // len(horizons)); the receipt's total reflects rung
             # equalisation and would re-key the per-rung draws.
+            # DEC-CA-0067: from the switch the validator keys the ladder on
+            # the settlement's v2 budget (``eval_windows_at``); before it on
+            # ``[eval] n_windows`` exactly as this replay always did.
+            from ..shared.era import image_decoupled_at
+
+            budget = (cfg.eval_windows_at(receipt.epoch_start_block)
+                      if image_decoupled_at(cfg, receipt.epoch_start_block)
+                      else cfg.eval.n_windows)
             windows = ladder_windows_for_round(
-                source, horizons=horizons, n_windows=cfg.eval.n_windows,
+                source, horizons=horizons, n_windows=budget,
                 context_length=cfg.eval.context_length,
                 round_seed=receipt.base_seed, block=receipt.epoch_start_block,
             )
         else:
+            from ..shared.era import image_decoupled_at, v2_eval_windows_at, v2_settlement_active
+
             n = (receipt.eval_context.n_windows if receipt.eval_context
                  else cfg.eval.n_windows)
-            windows = source.windows_for_round(
-                receipt.base_seed, n, block=receipt.epoch_start_block
-            )
+            draw = source.windows_for_round
+            b = receipt.epoch_start_block
+            if (image_decoupled_at(cfg, b) and v2_eval_windows_at(cfg, b)
+                    and v2_settlement_active(cfg, b)):
+                # DEC-CA-0067: the validator's explicit-evidence verdict draw
+                # (cascade.validator.expert_lane.verdict_windows), keyed on the
+                # SAME budget — the recorded count may be pool-capped
+                n = cfg.eval_windows_at(b)
+                draw = getattr(source, "windows_for_verdict", draw)
+            windows = draw(receipt.base_seed, n, block=b)
         # Both checkpoints go through the ingest guard under the round's own
         # contract: the PUBLISHED one may have come off a miner-funded pod.
         contract = contract_for_replay(receipt, cfg)

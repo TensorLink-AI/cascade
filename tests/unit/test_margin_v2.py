@@ -43,7 +43,8 @@ def cfg():
     c = load_chain_config(REPO / "chain.toml")
     return replace(c, scoring=replace(c.scoring, forfeit_hotkeys=(), forfeit_from_block=0,
                                       forfeit_successor_hotkey=""),
-                   v2=replace(c.v2, prelaunch_burn=0.0))
+                   # no v2 schedule ⇒ no DEC-CA-0067 "v2b-" vote either
+                   v2=replace(c.v2, prelaunch_burn=0.0, launch_at_utc="", from_block=0))
 
 
 def _typed(cfg):

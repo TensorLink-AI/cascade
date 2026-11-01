@@ -97,6 +97,27 @@ class V2Config:
     # PREVIOUS epoch's init (the report read is the previous settlement's).
     # 0 = off (every build before it behaves identically).
     init_epoch_bind_from_block: int = 0
+    # DEC-CA-0067 image-decoupled contract (CONSENSUS, release-then-activate):
+    # from the ERA starting at or after this block, a v2 settlement's per-leg
+    # contract check compares ``numerics_contract_digest`` (the contract minus
+    # the worker-image pin) instead of the full ``training_contract_digest``,
+    # so an image repin keeps the carried king and the finished legs. Decided
+    # ON CHAIN as a DEC-CA-0045 secondary feature (``v2b-<hash>``): lock-in
+    # writes the first ERA START after the lock-in boundary here
+    # (``activation.resolved_image_decoupled_block`` marks it). A typed block
+    # is the owner override; 0 = vote (or off with [activation] off).
+    image_decoupled_from_block: int = 0
+    # DEC-CA-0067 bundle (CONSENSUS): from the SAME block, a v2 settlement's
+    # private verdict budget is this many windows (the explicit-evidence
+    # verdict draw, exactly as ``eval_n_windows``). 0 = no change.
+    eval_n_windows_after: int = 0
+    # DEC-CA-0067 TRAINER-ONLY provenance (never consensus, not in the vote):
+    # earlier ``train_image_digest`` pins, exactly as once typed, that a leg
+    # trained before a repin may have recorded. The trainer proves such a
+    # leg's numerics digest by re-hashing the current contract with each of
+    # these (cascade.shared.manifest.prove_numerics_digest). Append the OLD
+    # pin here when re-pinning the image.
+    prior_train_image_digests: tuple[str, ...] = ()
     # Emission burns (CONSENSUS on the weight vector, see
     # cascade.shared.emission). ``prelaunch_burn``: the fraction of every
     # pre-v2 vector sent to ``burn_uid`` by a validator on this release.
@@ -312,7 +333,7 @@ def parse_v2_economics(v2raw: dict) -> dict:
     if readiness and (not readiness.isascii() or not readiness.isalnum() or len(readiness) > 12):
         raise ValueError("v2 prelaunch_burn_readiness must be up to 12 ASCII letters/digits")
     out.update(launch_at_utc=launch, commit_open_at_utc=opening, prelaunch_burn_readiness=readiness)
-    for k in ("random_init_eras", "reign_warm_start_blocks", "prelaunch_burn_from_block", "commit_from_block", "eval_n_windows", "init_epoch_bind_from_block"):
+    for k in ("random_init_eras", "reign_warm_start_blocks", "prelaunch_burn_from_block", "commit_from_block", "eval_n_windows", "init_epoch_bind_from_block", "image_decoupled_from_block", "eval_n_windows_after"):
         raw = v2raw.get(k, 0)
         if isinstance(raw, bool) or not isinstance(raw, int):
             raise ValueError(f"[v2] {k} must be an integer; got {raw!r}")
@@ -327,6 +348,8 @@ def parse_v2_economics(v2raw: dict) -> dict:
             raise ValueError(f"[v2] {k} must be in [0, 1); got {raw}")
         out[k] = float(raw)
     out["bench_gate_v2_from_block"] = parse_bench_gate_v2_from_block(v2raw)
+    out["prior_train_image_digests"] = _parse_prior_images(
+        v2raw.get("prior_train_image_digests", []))
     out["bench_source"], out["bench_source_from_block"] = parse_bench_source(v2raw)
     out.update(parse_bench_source_bounds(v2raw))
     ladder = v2raw.get("king_ladder", False)
@@ -367,6 +390,23 @@ def parse_v2_economics(v2raw: dict) -> dict:
         v2raw.get("ladder_start_tiers", LADDER_START_TIERS),
         fail_bp=lad["ladder_fail_bp"], cap_bp=lad["ladder_cap_bp"])
     return out
+
+
+def _parse_prior_images(raw: object) -> tuple[str, ...]:
+    """``[v2] prior_train_image_digests``: a list of ``sha256:<64 hex>`` (or
+    ``repo@sha256:<64 hex>``) strings, order and duplicates dropped-preserving."""
+    import re
+
+    if not isinstance(raw, (list, tuple)):
+        raise ValueError(f"[v2] prior_train_image_digests must be a list of strings; got {raw!r}")
+    out: list[str] = []
+    for v in raw:
+        if not isinstance(v, str) or not re.search(r"(?:^|@)sha256:[0-9a-f]{64}$", v.strip()):
+            raise ValueError("[v2] prior_train_image_digests entries must be sha256:<64 hex> "
+                             f"(or repo@sha256:<64 hex>); got {v!r}")
+        if v.strip() not in out:
+            out.append(v.strip())
+    return tuple(out)
 
 
 LANE_B_REMAINDERS = ("burn", "lane_a")
