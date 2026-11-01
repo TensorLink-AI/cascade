@@ -1737,10 +1737,16 @@ class LiumProvider:
     def record_executor_fault(self, pod_id: str, reason: str) -> str:
         """Mark the executor ``pod_id`` sits on as bad (its learned GPU / site
         identity is then skipped too) — the lemon path, where the pod's host
-        IP may never have resolved. Returns the executor id ("" = unknown)."""
+        IP may never have resolved. Returns the executor id ("" = unknown).
+
+        Only a pod the platform actually LISTED counts (RUNNING without ports,
+        a stale boot): a ``lium up`` that deployed nothing is a ghost/cooldown,
+        already handled by the per-id cooldown, never proof of a bad host."""
         try:
             from .lium_identity import mark_executor_bad
 
+            if self._pod(pod_id) is None:
+                return ""
             executor = self._executor_by_name.get(pod_id) or self._executor_of_pod(pod_id)
             if executor:
                 mark_executor_bad(executor, f"{pod_id}: {reason}")

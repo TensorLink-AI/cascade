@@ -194,12 +194,22 @@ def test_ready_pod_on_a_blocked_ip_teaches_its_executor(monkeypatch, tmp_path):
 def test_lemon_without_host_ip_marks_its_executor_bad(monkeypatch, tmp_path):
     records = [_rec("ex-lemon"), _rec("ex-ok", hotkey="5Ok", city="X")]
     prov = _provider(monkeypatch, tmp_path, records)
-    monkeypatch.setattr(prov, "_pod", lambda pid: None)
+    # listed RUNNING with no ports (no SSH endpoint → no host IP)
+    monkeypatch.setattr(prov, "_pod", lambda pid: {"status": "RUNNING", "ssh_cmd": ""})
     prov._executor_by_name["leg-0"] = "ex-lemon"
     ident.learn_executor("ex-lemon", record=records[0])
     assert quarantine_lemon_host(prov, "leg-0", "never ready") == ""
     assert "ex-lemon" in ident.load_identities()["bad"]
     assert _ids(prov) == ["ex-ok"]
+
+
+def test_ghost_up_never_marks_its_executor_bad(monkeypatch, tmp_path):
+    prov = _provider(monkeypatch, tmp_path, [_rec("ex-ghost")])
+    monkeypatch.setattr(prov, "_pod", lambda pid: None)            # never listed
+    prov._executor_by_name["leg-0"] = "ex-ghost"
+    assert prov.record_executor_fault("leg-0", "never appeared") == ""
+    assert ident.load_identities()["bad"] == {}
+    assert _ids(prov) == ["ex-ghost"]
 
 
 # ── persistence ─────────────────────────────────────────────────────────────
