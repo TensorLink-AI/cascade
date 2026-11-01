@@ -17,6 +17,7 @@ No GPUs, no ssh: scripted runners and fakes throughout.
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
 import subprocess
@@ -574,11 +575,9 @@ def test_a_success_resets_the_count_and_miner_faults_never_count(monkeypatch):
               "hkE": _rc2("lane-a")}
     disp = _FailingDisp(lambda h, kw: script[kw["hotkey"]])
     for hk in ("hkA", "hkB", "hkC", "hkD", "hkE"):
-        try:
+        with contextlib.suppress(RemoteDispatchError):
             TrainerRunner._dispatch_on_free_lane(disp, pool, [lane], describe="x",
                                                  hotkey=hk, role="challenger")
-        except RemoteDispatchError:
-            pass
     assert [h.name for h in pool.known_hosts()] == ["lane-a"]      # never tripped
     assert pool._lane_failures == {"lane-a": ["hkE|challenger|"]}
 

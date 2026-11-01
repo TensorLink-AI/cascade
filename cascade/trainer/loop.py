@@ -78,7 +78,6 @@ from .faults import (  # noqa: F401
     _LaneDeadlinePassed,
     _quarantine_lane_host,
     _storage_failure,
-    _lane_fault,
     _transport_failure,
     classify_funded_worker_failure,
 )
@@ -1324,6 +1323,7 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
         or failure: a lane that failed for a challenger-specific reason
         (import error, OOM) is still good silicon — only a transport failure
         drains the pod's lanes."""
+        from .faults import _lane_fault
         from .remote import pod_lane_count
 
         # ``prepare(host) -> host`` runs on the CHOSEN lane right before each
