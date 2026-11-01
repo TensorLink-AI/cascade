@@ -201,13 +201,23 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
     channel_stats = ChannelStatsAccumulator()
     grouped_corpus = False
 
+    # The O(C²L) per-series stats run on one FIFO telemetry thread (same
+    # series, same order, so the same summary); it is drained before the
+    # summary is read. Nothing in training, the checkpoint or the
+    # continuation state reads the accumulator.
+    background = None
+    if "groups" in contract.accepted_fields:
+        from .channel_stats import BackgroundObserver
+
+        background = BackgroundObserver(channel_stats.observe)
+
     def observe(item):
         nonlocal grouped_corpus
         if isinstance(item, dict) and item.get("groups") is not None:
             grouped_corpus = True
-        channel_stats.observe(item)
+        background(item)
 
-    timed = _TimedStream(stream, observer=observe if "groups" in contract.accepted_fields else None)
+    timed = _TimedStream(stream, observer=observe if background is not None else None)
     steps = contract.training_steps
     cooldown = max(1, round(steps / 11))
     trunk = steps - cooldown
@@ -284,15 +294,17 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
             b, c, length = values.shape
             masks = sample_cpm_masks(b * c, length // 32, c_max=16, p_max=0.4, rng=mask_rng).reshape(b, c, -1)
             splits = np.array_split(np.arange(b), min(contract.micro_batches, b))
+            values_t = None
             if gang is not None:
                 if not gang.synced:
                     gang.broadcast_state(model)
-                gang.send_step(values, masks, groups, len(splits), cop_gen,
-                               lr=optimizer.param_groups[0]["lr"])
+                values_t = gang.send_step(values, masks, groups, len(splits), cop_gen,
+                                          lr=optimizer.param_groups[0]["lr"])
             reference, loss_m, loss_j, load = micro_batch_pass(
                 model, params, values, masks, groups, splits, owned_splits(len(splits), 0, world),
                 cop_gen, gang.device if gang is not None else trainer.device,
-                step=step, tokens=tokens, gang=gang)
+                step=step, tokens=tokens, gang=gang, values_t=values_t)
+            del values_t
             try:
                 energy_weight = combine_gradients(params, reference)
             except FloatingPointError:
@@ -332,6 +344,8 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
                 deadline += overhead
             if step >= steps or tokens >= token_budget or time.time() >= deadline:
                 break
+        if background is not None:
+            background.close()          # every observed series is in the stats
         clean = True
         if gang is not None and gang.synced:
             gang.gather_muon()          # the final optimizer-state reads below
@@ -341,6 +355,8 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
             gang.raise_follower_error(e)
         raise
     finally:
+        if background is not None:
+            background.close(raise_errors=False)
         if gang is not None:
             gang.stop(clean=clean)
     if step == 0 or not replay_verified:
