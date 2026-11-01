@@ -168,3 +168,16 @@ def _no_real_operator_orphan_sweep(monkeypatch):
 
     monkeypatch.setattr(_FundedPodMixin, "_sweep_operator_orphans",
                         lambda self, keep_ids, keep_payers: None)
+
+
+@pytest.fixture(autouse=True)
+def _ample_trainer_disk(monkeypatch):
+    """The trainer's free-disk guard ([round] min_free_disk_gb) reads the real
+    filesystem; keep every test hermetic against the box's actual free space.
+    Disk-guard tests install their own fake."""
+    from types import SimpleNamespace
+
+    from cascade.trainer import runner_common
+
+    monkeypatch.setattr(runner_common, "DISK_USAGE",
+                        lambda _p: SimpleNamespace(total=1 << 50, used=0, free=1 << 50))

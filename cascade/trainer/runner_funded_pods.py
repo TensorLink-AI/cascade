@@ -631,6 +631,17 @@ class _FundedPodMixin:
             self._record_funded_failure(gen.hotkey, why, miner_fault=False,
                                         error_class=OPERATOR_FAULT_CLASS, burn=False)
             raise _FundedLegSkip(gen.hotkey)
+        from .runner_common import disk_guard_refusal
+
+        # Disk guard (2026-10-31): never start a NEW leg the box may not have
+        # room to finish (harvest, ledgers, pending records). An adopted
+        # allocation is a live leg — it always keeps going.
+        low = "" if prior_alloc else disk_guard_refusal(self)
+        if low:
+            log.error("funded leg %s: %s", gen.hotkey[:12], low)
+            self._record_funded_failure(gen.hotkey, low, miner_fault=False,
+                                        error_class="no_capacity", burn=False)
+            raise _FundedLegSkip(gen.hotkey)
         vault = self._payer_vault()
         if vault is None:
             self._record_funded_failure(
@@ -1321,6 +1332,14 @@ class _FundedPodMixin:
                       "billing payer %s; kept on ledger", pod.instance_id,
                       pod.payer_hotkey)
         else:
-            self._ledger_remove(pod.instance_id)
             # Confirmed gone: its executor is free for the next rent.
             release_executor_of(self, pod.instance_id)
+            try:
+                self._ledger_remove(pod.instance_id)
+            except OSError as e:
+                # A full disk (ENOSPC, 2026-10-31) after the pod is gone: the
+                # row stays and the startup sweep re-confirms it (an empty
+                # listing of an observed pod settles as gone, no re-bill).
+                log.error("funded pod %s is gone but its ledger row could not be "
+                          "removed (%s) — the startup sweep settles it",
+                          pod.instance_id, e)

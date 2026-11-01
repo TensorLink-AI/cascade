@@ -99,6 +99,41 @@ RETIRED_KEYS: dict[str, frozenset[str]] = {
 }
 
 
+CKPT_TRANSPORTS = ("ssh", "r2")
+_BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
+
+
+def parse_ckpt_transport(r: dict) -> dict:
+    """The ``[round]`` checkpoint-transport knobs (r2 direct harvest), parsed
+    and validated: ``funded_harvest_transport``, ``ckpt_relay_host``,
+    ``min_free_disk_gb``, ``ckpt_r2_bucket``, ``ckpt_r2_prefix``. Unknown
+    transports and malformed buckets/prefixes fail loud — a typo silently
+    falling back to the ssh path would re-open the 2026-10-31 disk incident."""
+    transport = str(r.get("funded_harvest_transport", "ssh")).strip().lower()
+    if transport not in CKPT_TRANSPORTS:
+        raise ValueError(f"[round] funded_harvest_transport={transport!r} invalid; "
+                         f"expected one of {CKPT_TRANSPORTS}")
+    relay = r.get("ckpt_relay_host", "")
+    if not isinstance(relay, str):
+        raise ValueError("[round] ckpt_relay_host must be a hosts-file entry name (string)")
+    gb = r.get("min_free_disk_gb", 30.0)
+    if isinstance(gb, bool) or not isinstance(gb, (int, float)) or not (0 <= float(gb) < 1e6):
+        raise ValueError(f"[round] min_free_disk_gb must be a finite number >= 0; got {gb!r}")
+    bucket = str(r.get("ckpt_r2_bucket", "") or "").strip()
+    if bucket and not _BUCKET_RE.match(bucket):
+        raise ValueError(f"[round] ckpt_r2_bucket={bucket!r} is not a valid bucket name")
+    prefix = str(r.get("ckpt_r2_prefix", "ckpt/"))
+    if (prefix.startswith("/") or ".." in prefix.split("/")
+            or not re.fullmatch(r"[A-Za-z0-9._/-]*", prefix)):
+        raise ValueError(f"[round] ckpt_r2_prefix={prefix!r} invalid (relative key prefix, "
+                         "letters/digits/._-/ only, no '..')")
+    if prefix and not prefix.endswith("/"):
+        prefix += "/"
+    return {"funded_harvest_transport": transport, "ckpt_relay_host": relay.strip(),
+            "min_free_disk_gb": float(gb), "ckpt_r2_bucket": bucket,
+            "ckpt_r2_prefix": prefix}
+
+
 def parse_chain_config(raw: dict) -> ChainConfig:
     """Parse an already-loaded ``chain.toml`` table (``tomllib`` shape).
 
@@ -431,6 +466,7 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
                 r.get("funded_ready_timeout_seconds", 900.0)),
             funded_robot_duration_days=max(1, int(r.get("funded_robot_duration_days", 1))),
             funded_pod_checkpoint=str(r.get("funded_pod_checkpoint", "harvest")),
+            **parse_ckpt_transport(r),
             funded_field_cap=validate_funded_field_cap(
                 r.get("funded_field_cap", 0)),
             funded_pod_skus=validate_funded_pod_skus(
@@ -662,6 +698,10 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
         netconfig=parse_netconfig(raw.get("netconfig"), activation_feature=_act_feature),
         raw=raw,
     )
+    if (cfg.round.funded_harvest_transport == "r2"
+            and not (cfg.storage.backup_s3_endpoint or "").strip()):
+        raise ValueError("[round] funded_harvest_transport = \"r2\" needs [storage] "
+                         "backup_s3_endpoint (the Cloudflare R2 checkpoint bucket)")
     # DEC-CA-0063: a validator bench source with a block is an era-boundary
     # v2 rule that needs the king ladder (k = 1) and a named main validator.
     _bs = int(cfg.v2.bench_source_from_block)

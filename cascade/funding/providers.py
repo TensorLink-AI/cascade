@@ -10,10 +10,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from dataclasses import dataclass, field
 
 from ..shared.atomic import path_lock, write_text_atomic
+
+log = logging.getLogger("cascade.funding.providers")
 
 ROLLING_PROVIDERS = ("lium", "shadeform", "vast", "runpod")
 CREDENTIALS_HEADER = "X-Payer-Credentials"
@@ -180,7 +183,14 @@ def pod_credential(vault, pod) -> PayerCredential | None:
         row = json.loads(raw)
         if row["hotkey"] != pod.payer_hotkey or row["provider"] != pod.provider:
             return None
-        leases.refresh(token)
+        try:
+            leases.refresh(token)
+        except OSError as e:
+            # The TTL re-stamp is a convenience; the credential is already in
+            # hand. A full disk (ENOSPC, 2026-10-31) must never stop the
+            # teardown that needs this key from terminating the pod.
+            log.warning("lease TTL refresh for payer %s failed (%s); using the key "
+                        "as read", str(pod.payer_hotkey)[:12], e)
         return PayerCredential(row["provider"], row["api_key"])
     raw = vault.get_shared(pod.payer_hotkey) or ""
     return next((c for c in decode_credentials(raw) if c.provider == pod.provider), None)

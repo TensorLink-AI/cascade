@@ -134,27 +134,45 @@ def upload_harvested_checkpoint(runner, record: dict, *, base_seed) -> TrainedEn
     raised (infra, never an attempt burn)."""
     from .faults import _OperatorFault
 
-    dest = Path(record["dest"])
+    # r2 transport: the verified checkpoint is on R2 (``record["r2"]``), not
+    # on this box; the push runs from there (relay / bounded local temp).
+    r2 = record.get("r2")
     ckpt_repo = record["ckpt_repo"]
     hotkey = record["miner_hotkey"]
     sleep = getattr(runner, "_upload_retry_sleep", None) or time.sleep
     last: Exception | None = None
+    up = None
     for i in range(HARVEST_UPLOAD_ATTEMPTS):
         try:
-            up = upload_dir_to_hub_or_hf(
-                dest, ckpt_repo, runner.hub(), hf_repo=runner._hf_ckpt_repo(ckpt_repo))
+            if r2:
+                from .r2_transfer import push_from_r2
+
+                up = push_from_r2(runner, record)
+            else:
+                up = upload_dir_to_hub_or_hf(
+                    Path(record["dest"]), ckpt_repo, runner.hub(),
+                    hf_repo=runner._hf_ckpt_repo(ckpt_repo))
             break
+        except (_FundedTamper, _FundedDiverged):
+            raise                                  # a verdict, not a storage blip
         except Exception as e:  # noqa: BLE001 — storage blip: ours, retried
             last = e
+            from .r2_transfer import R2PushDeferred
+
+            if isinstance(e, R2PushDeferred):
+                log.warning("checkpoint push %s for %s deferred: %s", ckpt_repo,
+                            hotkey[:12], e)
+                break                              # no disk/relay now: requeue at once
             log.warning("checkpoint upload %s for %s: attempt %d/%d failed: %s", ckpt_repo,
                         hotkey[:12], i + 1, HARVEST_UPLOAD_ATTEMPTS, error_tail(str(e), 200))
             if i + 1 < HARVEST_UPLOAD_ATTEMPTS:
                 sleep(HARVEST_UPLOAD_BACKOFF_SECONDS * (2 ** i))
-    else:
+    if up is None:
         write_pending_upload(runner.work_root, base_seed, hotkey, record)
+        where = "kept on R2" if r2 else "kept"
         raise _OperatorFault(
             f"checkpoint upload failed after {HARVEST_UPLOAD_ATTEMPTS} attempts (operator "
-            f"storage; the harvested checkpoint is kept for the requeued leg): {last}")
+            f"storage; the harvested checkpoint is {where} for the requeued leg): {last}")
     entry = TrainedEntry(
         miner_hotkey=hotkey,
         miner_uid=int(record["miner_uid"]),
@@ -171,6 +189,16 @@ def upload_harvested_checkpoint(runner, record: dict, *, base_seed) -> TrainedEn
     # The upload is verified (a pinned ref came back): nothing reads the
     # local copy after this — benches and validators fetch the ref.
     clear_harvest(runner.work_root, base_seed, hotkey, job_id=record.get("harvest_job_id", ""))
+    if r2:
+        from .r2_transfer import R2Checkpoint, ckpt_store, delete_checkpoint
+
+        ckpt = R2Checkpoint.from_record(r2)
+        try:
+            store = getattr(runner, "_r2_store", None) or ckpt_store(runner.cfg, bucket=ckpt.bucket)
+            delete_checkpoint(store, ckpt)
+        except Exception as e:  # noqa: BLE001 — lifecycle expiry is the backstop
+            log.warning("r2 copy of %s not deleted (%s); lifecycle expiry cleans it",
+                        ckpt_repo, e)
     return entry
 
 
@@ -636,14 +664,30 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
         return self._harvest_funded_checkpoint(host, receipt, contract, seeds, repo_suffix)
 
     def _harvest_funded_checkpoint(self, host, receipt, contract, seeds,
-                                   suffix: str):
+                                   suffix: str, *, release=None):
         """Pull a ``--local-only`` funded leg's checkpoint off its payer pod,
         ingest-verify it, upload it under the operator's identity, and return
         the real :class:`TrainedEntry` (DEC-CA-0036 credential-free pods).
 
         Any guard deviation raises :class:`_FundedTamper` (miner fault,
         terminal); a transport/upload failure raises plain (infra — the
-        miner's training was fine, the operator's pull was not)."""
+        miner's training was fine, the operator's pull was not).
+
+        r2 transport (:mod:`cascade.trainer.r2_transfer`): the same verdicts,
+        but the checkpoint moves pod → R2 and is verified there; ``release``
+        (when given) tears the pod down once it is verified on R2, BEFORE the
+        Hippius push."""
+        from .runner_common import r2_transport_on
+
+        if r2_transport_on(self.cfg):
+            if not getattr(receipt, "marketcast", None):
+                from .r2_transfer import harvest_checkpoint_r2
+
+                return harvest_checkpoint_r2(self, host, receipt, contract, seeds, suffix,
+                                             release=release)
+            log.warning("funded leg %s: MarketCast fine-tune harvested over ssh (its "
+                        "verifier reads a local copy; r2 transport covers Cascade "
+                        "checkpoints only)", receipt.miner_hotkey[:12])
         from ..eval.checkpoint_guard import (
             CheckpointDiverged,
             CheckpointTampered,

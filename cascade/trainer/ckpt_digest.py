@@ -87,3 +87,23 @@ def tensor_mismatches(directory: Path | str, expected: dict[str, str]) -> list[s
         if p.is_file() and p.name.endswith(TENSOR_SUFFIX) and p.name not in expected:
             reasons.append(f"{p.name}: tensor file the worker never wrote")
     return reasons
+
+
+def listing_mismatches(present: dict[str, str], expected: dict[str, str]) -> list[str]:
+    """:func:`tensor_mismatches` over an already-hashed listing ``{file name:
+    sha256}`` (the r2 transport hashes by streaming the objects back, so no
+    local directory exists) — the same verdict, the same reasons."""
+    reasons: list[str] = []
+    for name in sorted(expected):
+        want = str(expected[name]).lower()
+        got = present.get(name)
+        if got is None:
+            reasons.append(f"{name}: missing from the harvested checkpoint")
+            continue
+        if str(got).lower() != want:
+            reasons.append(f"{name}: sha256 {str(got)[:12]}… on the pod, the worker wrote "
+                           f"{want[:12]}… (replaced after the save)")
+    for name in sorted(present):
+        if name.endswith(TENSOR_SUFFIX) and name not in expected:
+            reasons.append(f"{name}: tensor file the worker never wrote")
+    return reasons

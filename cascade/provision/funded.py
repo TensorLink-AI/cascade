@@ -587,7 +587,13 @@ def teardown_funded(
         if confirmed_gone:
             from ..funding.providers import forget_lease
 
-            forget_lease(vault, getattr(inst, "payer_credential_id", ""))
+            try:
+                forget_lease(vault, getattr(inst, "payer_credential_id", ""))
+            except OSError as e:
+                # The pod IS gone; a lease row left behind by a full disk
+                # (ENOSPC) only ages out by TTL — never report it as live.
+                log.warning("funded pod %s terminated; forgetting its lease failed "
+                            "(%s) — the row expires by TTL", inst.instance_id, e)
         if not confirmed_gone:
             log.error("funded pod %s still LIVE after terminate on payer %s's "
                       "account (revoked key?) — miner is billed until it stops",
