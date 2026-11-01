@@ -574,6 +574,67 @@ def find_detached_run(host: RemoteHost, tag: str, *, runner=None) -> str | None:
     return rel if rel.startswith("/") else f"{host.workdir}/{rel}"
 
 
+_POD_PROBE_TOKEN = "__CASCADE_POD_PROBE__"
+# exit code 0, whitespace-insensitive (the launcher writes "0\n")
+_RC_ZERO = '[ "$(tr -d \' \\n\' < "$d/exit_code")" = 0 ]'
+
+
+@dataclass(frozen=True)
+class PodRunsProbe:
+    """What the detached run dirs on a pod say about it (the sweep's guard).
+
+    ``reachable`` False = the probe could not run (transport failure,
+    host-key refusal, no answer): unknown, never "idle". ``live`` = run dirs
+    whose worker pid answers ``kill -0``; ``finished_ok`` = ``(run dir, age
+    seconds since exit)`` of runs that ended with exit code 0 — their
+    checkpoint is on the pod until the orchestrator harvests it (the caller
+    knows which it harvested; the pod is never written to)."""
+
+    reachable: bool
+    live: tuple[str, ...] = ()
+    finished_ok: tuple[tuple[str, float], ...] = ()
+    error: str = ""
+
+
+def _pod_runs_probe_command(host: RemoteHost) -> str:
+    return (
+        "if cd " + shlex.quote(host.workdir) + " 2>/dev/null; then now=$(date +%s); "
+        "for d in " + DETACHED_RUN_ROOT + "/*; do [ -d \"$d\" ] || continue; "
+        "if [ -f \"$d/exit_code\" ]; then "
+        "if " + _RC_ZERO + "; then "
+        "echo FINISHED:$(( now - $(stat -c %Y \"$d/exit_code\" 2>/dev/null || echo $now) )):$d; "
+        "fi; "
+        "elif [ -f \"$d/pid\" ] && kill -0 $(cat \"$d/pid\") 2>/dev/null; then echo LIVE:$d; fi; "
+        "done; fi; echo " + _POD_PROBE_TOKEN)
+
+
+def probe_pod_runs(host: RemoteHost, *, runner=None, timeout: int = 60) -> PodRunsProbe:
+    """Ask ``host`` which detached runs on it still matter. Read-only: nothing
+    on the pod changes. The pod sweep calls this before it may terminate a
+    pod — a live worker or an unharvested finished run keeps the pod."""
+    run = runner or run_ssh
+    try:
+        p = run(build_ssh_argv(host, _pod_runs_probe_command(host)), timeout, "")
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return PodRunsProbe(reachable=False, error=f"{type(e).__name__}: {e}")
+    lines = [ln.strip() for ln in (p.stdout or "").splitlines()]
+    if p.returncode != 0 or _POD_PROBE_TOKEN not in lines:
+        return PodRunsProbe(reachable=False,
+                            error=f"rc={p.returncode} {(p.stderr or '').strip()[-200:]}")
+    live: list[str] = []
+    finished: list[tuple[str, float]] = []
+    for ln in lines:
+        if ln.startswith("LIVE:"):
+            live.append(ln[len("LIVE:"):])
+        elif ln.startswith("FINISHED:"):
+            age, _, d = ln[len("FINISHED:"):].partition(":")
+            try:
+                finished.append((d, max(0.0, float(age))))
+            except ValueError:
+                finished.append((d, 0.0))   # unknown age: treated as fresh (kept)
+    return PodRunsProbe(reachable=True, live=tuple(live), finished_ok=tuple(finished))
+
+
 def _detached_fetch_command(host: RemoteHost, run_dir: str) -> str:
     rd = shlex.quote(run_dir)
     return (f"cd {shlex.quote(host.workdir)} && tail -c {DETACHED_STDOUT_TAIL_BYTES} {rd}/stdout; "
