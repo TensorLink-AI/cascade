@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import types
+from pathlib import Path
 
 import pytest
 
@@ -131,7 +132,7 @@ def test_evidence_is_written_capped_and_pruned(tmp_path):
     p = save_failed_leg_evidence(root, HK, header={"exit_code": 1}, stdout="out\n",
                                  stderr=STDERR, clock=lambda: 1_761_966_000.0)
     assert p is not None and os.path.basename(p).startswith(HK[:12] + "-2025")
-    text = open(p).read()
+    text = Path(p).read_text()
     assert json.loads(text.splitlines()[0]) == {"exit_code": 1}
     assert "=== stderr (tail) ===" in text and "NCCL watchdog timeout" in text and JOB in text
     big = save_failed_leg_evidence(root, HK, header={}, stdout="o" * 10**6,
