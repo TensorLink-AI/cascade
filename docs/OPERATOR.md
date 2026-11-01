@@ -536,6 +536,34 @@ apply. The king has reserved admission and gets first GPU acquisition.
 cannot launch unbounded generation VMs. Admission waits do not rent a GPU.
 These are per-trainer-process controls; run one authoritative scheduler.
 
+#### Corpus pre-generation (`[generation] pregen_*`, off by default)
+
+Without it, a shard-mode corpus is built only inside an admitted leg, so
+entries waiting for a GPU, the coldkey rule or the latest-safe-start deadline
+leave the CPU tier idle. With `pregen_enabled = true` (default `false`) the
+scheduler starts, each tick and in reveal order, the CPU build of every
+queued entry whose funded ref is revealed and whose corpus is missing for the
+seeds its leg would train under (the next era's once that era is prepared).
+No GPU admission, deadline or coldkey gate applies; the build is
+operator-billed. Corpora are keyed by base seed and ref, so they are reused by
+the leg and every retry within the seed epoch; a new seed epoch stops pregen
+for the old seed (running builds finish).
+
+- `pregen_max_parallel` (default 4): at most this many pregen builds hold CPU
+  slots. They share the `max_parallel_jobs` gate but only fill idle slots, and
+  their slots never count against a real leg, so a leg never waits behind
+  pregen (up to `2 x max_parallel_jobs` VMs can run while pregen drains). A
+  pregen still waiting for a slot steps aside when its own leg starts.
+- `pregen_max_usd_per_epoch` (default 50.0): estimated spend cap per base
+  seed. Each start is booked at `max_price_per_hour x (max_window_seconds +
+  2 h overhead)` in `<work_root>/pregen_spend.json` (refunded if nothing was
+  rented); no new pregen starts once exhausted (logged once).
+
+A pregen failure is logged and retried with back-off (30 min, doubling, max
+6 h); it never fails, burns or bills the queue entry or touches
+`operator_faults`. A generator fault is not retried; the entry's own leg
+decides it. The per-hotkey CPU rent cap counts pregen rents too.
+
 GPU selection and launch stay serialized until the executor is claimed.
 Once its identity is known, boot, SSH and runtime checks release that
 selection lock, allowing other jobs to acquire different GPUs. Unknown

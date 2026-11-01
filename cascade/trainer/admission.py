@@ -13,6 +13,14 @@ class FairSlots:
 
     Priority is reserved for king work; it jumps queued miners, never
     interrupts an active job. ``clock`` and deadlines use wall seconds.
+
+    ``background`` work (opportunistic corpus pre-generation) only fills idle
+    capacity and yields to real legs: it takes a slot only while no
+    foreground job is waiting and the total is under the limit, and the slots
+    it holds never count against a foreground job's limit — so a real leg
+    never waits behind background work (at most ``2 x limit`` jobs run while
+    background work drains). ``cancel()`` true abandons a still-waiting
+    request (``acquired`` False); it never interrupts an active job.
     """
 
     def __init__(self, *, clock=time.time):
@@ -20,17 +28,23 @@ class FairSlots:
         self.condition = threading.Condition()
         self.waiters = deque()
         self.active = 0
+        self.background_active = 0
         self.owners = {}
 
+    def _owner_ok(self, item):
+        return not item[2] or self.owners.get(item[1], 0) < item[2]
+
     @contextmanager
-    def slot(self, limit, *, deadline=None, priority=False, owner=None, owner_limit=0):
+    def slot(self, limit, *, deadline=None, priority=False, owner=None, owner_limit=0,
+             background=False, cancel=None):
         token = object()
+        item = (token, owner, owner_limit, bool(background))
         acquired = False
         with self.condition:
-            if priority:
-                self.waiters.appendleft((token, owner, owner_limit))
+            if priority and not background:
+                self.waiters.appendleft(item)
             else:
-                self.waiters.append((token, owner, owner_limit))
+                self.waiters.append(item)
             self.condition.notify_all()
             try:
                 while True:
@@ -38,11 +52,20 @@ class FairSlots:
                     remaining = None if deadline is None else deadline - self.clock()
                     if remaining is not None and remaining <= 0:
                         break
-                    eligible = next((item for item in self.waiters
-                                     if not item[2] or self.owners.get(item[1], 0) < item[2]), None)
-                    if eligible is not None and eligible[0] is token and self.active < cap:
+                    if cancel is not None and cancel():
+                        break
+                    if background:
+                        free = (self.active < cap
+                                and not any(not w[3] for w in self.waiters))
+                    else:
+                        free = self.active - self.background_active < cap
+                    eligible = next((w for w in self.waiters
+                                     if w[3] == item[3] and self._owner_ok(w)), None)
+                    if eligible is not None and eligible[0] is token and free:
                         self.waiters.remove(eligible)
                         self.active += 1
+                        if background:
+                            self.background_active += 1
                         if owner_limit:
                             self.owners[owner] = self.owners.get(owner, 0) + 1
                         acquired = True
@@ -50,7 +73,7 @@ class FairSlots:
                     self.condition.wait(1.0 if remaining is None else min(1.0, remaining))
             finally:
                 if not acquired:
-                    self.waiters.remove((token, owner, owner_limit))
+                    self.waiters.remove(item)
                 self.condition.notify_all()
         try:
             yield acquired
@@ -58,6 +81,8 @@ class FairSlots:
             if acquired:
                 with self.condition:
                     self.active -= 1
+                    if background:
+                        self.background_active -= 1
                     if owner_limit:
                         self.owners[owner] -= 1
                         if not self.owners[owner]:
