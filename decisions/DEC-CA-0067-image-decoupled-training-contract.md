@@ -114,26 +114,75 @@ DEC-CA-0049.
   With six external validators on netuid 91, confirm every one has upgraded
   (their notes carry the `v2b-` segment) before relying on the lock-in. Test on
   testnet first.
-- **Note byte budget (activation prerequisite).** The plain commitment is one
-  128-byte field.
-  - The deployed main validator's note today is
+- **Note byte budget, and the typed blocks that free it.** The plain commitment
+  is one 128-byte field. Before this release:
+  - The main validator, whose rollover is typed in its deployed chain.toml,
+    publishes
     `cascade-ready:1:rolling-era-king:0:0:forfeit-42b1a486:9165600:9166500:margin-v2-d30eb443:9190800:9194400:prelaunch-95-r2:0:0`,
-    which is 124 bytes.
-  - Adding `:v2b-xxxxxxxx:0:0` (17 bytes) gives 141 bytes. The trimmer drops the
-    newest segment, so this vote is NOT signalled.
-  - Room has to be freed first. Either type the already-decided forfeit and
-    margin-v2 blocks into chain.toml (behaviour-identical, and their segments
-    leave the note), or retire the unlocked prelaunch vote. That is an owner
-    decision, not part of this change.
-  - After lock-in the segment grows to 29 bytes.
+    which is 124 bytes. Adding `:v2b-<8hex>:0:0` (+17 bytes) makes 141.
+  - A validator on the repo chain.toml (rollover resolved from signals) already
+    sits at 136 bytes. Its trimmer drops `prelaunch-95-r2` today, and would drop
+    `v2b-` too.
+  - Either way the vote could not be signalled.
+
+  This release therefore types the two already-decided blocks into
+  `chain.toml [scoring]`:
+  - `forfeit_from_block = 9166500`: the `forfeit-42b1a486` lock-in (9165600)
+    resolved through `forfeit_block_for`, which returns the activation block
+    unchanged. The deployed validator log confirms it: "forfeiture ARMED at
+    block 9166500".
+  - `margin_v2_from_block = 9194400`: the `margin-v2-d30eb443` lock-in (9190800)
+    resolved through `apply_margin_v2_activation`, which writes the era-start
+    activation block. The log confirms "bar v2 ARMED at block 9194400".
+
+  The typed values equal the resolved ones exactly, so judged behaviour is
+  identical:
+  - A persisted lock-in restored on the typed config is a no-op, never a raise,
+    because `apply_*` returns a typed config unchanged.
+  - `resolve_activation` re-labels the record `source = "config"`.
+  - A typed feature is not `decided_on_chain`, so `own_signal_payload` omits its
+    segment.
+  - Receipts stop stamping `margin_v2_block`, which is now typed. Archived
+    receipts that carry 9194400 still pass `check_margin_v2` against the typed
+    value.
+  - `prelaunch-95-r2` is left alone. It becomes signalled again by
+    repo-config validators, but v2 has launched and every future settlement is
+    a v2 settlement, so a pre-launch burn lock-in is inert
+    (`cascade.shared.emission`).
+
+  Note lengths after this release:
+
+  | Validator | `v2b-` unlocked | after lock-in (`v2b-<8hex>:<lock>:<act>`) |
+  |---|---|---|
+  | repo-config validator | 85 bytes | 97 bytes |
+  | main validator (typed rollover) | 73 bytes | 85 bytes |
+
+  `test_mainnet_note_carries_v2b_within_the_field` asserts at least 24 bytes of
+  headroom.
+- **What every validator operator must do.**
+  - External validators run `cascade-validator --chain-toml chain.toml` from
+    their repo checkout (docs/VALIDATOR.md: "the published file is the
+    authority for every consensus value"). They must deploy THIS release's
+    `chain.toml`, which carries the typed blocks, keeping their own local edits.
+    A node still on the old file keeps signalling the forfeit and margin-v2
+    segments, its trimmer drops `v2b-`, and its stake never counts toward the
+    vote.
+  - The owner overlay (DEC-CA-0057) cannot do this for them. An overlay that
+    changes a `*_from_block` to a block before its own apply block is refused
+    as retroactive.
+  - The main validator's deployed chain.toml carries uncommitted live
+    overrides, so the same two typed lines must be applied to it by hand. That
+    edit is Approve-tier and is not part of this PR.
 
 ## Procedure
 
 1. Release this change: validators, trainer and audit together. Nothing changes
    yet.
-2. Free note room (see above).
+2. Every validator, external and main, deploys the release `chain.toml` with the
+   typed forfeit and margin-v2 blocks. The main validator's live file is edited
+   by hand.
 3. Wait until all six external validators run the release (their notes show the
-   `v2b-` segment).
+   `v2b-` segment and no longer show the forfeit or margin-v2 segments).
 4. The vote locks in when `threshold` is reached. `status/chain.json`
    `activation.image_decoupled` shows the lock and the switch era start.
 5. Once the switch era has started, append the current image pin to

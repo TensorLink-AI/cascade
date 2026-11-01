@@ -42,7 +42,7 @@ def cfg():
     so each test arms what it needs."""
     c = load_chain_config(REPO / "chain.toml")
     return replace(c, scoring=replace(c.scoring, forfeit_hotkeys=(), forfeit_from_block=0,
-                                      forfeit_successor_hotkey=""),
+                                      forfeit_successor_hotkey="", margin_v2_from_block=0),
                    # no v2 schedule ⇒ no DEC-CA-0067 "v2b-" vote either
                    v2=replace(c.v2, prelaunch_burn=0.0, launch_at_utc="", from_block=0))
 
@@ -99,7 +99,8 @@ class FakeChain:
 def test_shipped_values_parse_and_round_trip(tmp_path):
     c = load_chain_config(DEFAULT_CHAIN_TOML)
     assert (c.scoring.win_margin_start_v2, c.scoring.win_margin_end_v2,
-            c.scoring.margin_warmup_blocks_v2, c.scoring.margin_v2_from_block) == (0.4, 0.2, 18000, 0)
+            c.scoring.margin_warmup_blocks_v2, c.scoring.margin_v2_from_block) == (
+        0.4, 0.2, 18000, 9194400)        # the decided block, typed since DEC-CA-0067
     # absent keys ⇒ off, bit-identical
     bare = re.sub(r"^(win_margin_start_v2|win_margin_end_v2|margin_warmup_blocks_v2|"
                   r"margin_v2_from_block)\s*=.*$", "", DEFAULT_CHAIN_TOML.read_text(), flags=re.M)

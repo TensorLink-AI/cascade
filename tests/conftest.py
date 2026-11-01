@@ -137,7 +137,11 @@ def cfg() -> ChainConfig:
                    # a scheduled fresh-king margin change ships armed: pin the
                    # steady value so fixtures judge every block the same way
                    scoring=replace(c.scoring, win_margin_start_prev=0.0,
-                                   margin_activation_block=0),
+                                   margin_activation_block=0,
+                                   # DEC-CA-0067 typed the already-decided
+                                   # forfeit / margin-v2 blocks (real-chain
+                                   # state): fixtures keep them undecided
+                                   forfeit_from_block=0, margin_v2_from_block=0),
                    manifest=replace(c.manifest, validator_hotkey=""))
 
 

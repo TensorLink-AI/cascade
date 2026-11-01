@@ -513,3 +513,61 @@ def test_audit_numerics_check(cfg):
     # a recorded block the audit config does not carry fails
     assert check_numerics_contract(
         _receipt(m, block, image_decoupled_block=n + 3600), off).status == "FAIL"
+
+
+# ── the mainnet note fits (the typed forfeit / margin-v2 blocks) ─────────────
+
+# The live lock-ins (activation_*_state.json on the main validator, 2026-11-01).
+LIVE_ROLLOVER = (9133200, 9136800)
+LIVE_FORFEIT = ("forfeit-42b1a486", 9165600, 9166500)
+LIVE_MARGIN_V2 = ("margin-v2-d30eb443", 9190800, 9194400)
+
+
+def test_typed_blocks_equal_the_resolved_ones_and_leave_the_note():
+    cfg = load_chain_config(REPO / "chain.toml")
+    assert cfg.scoring.forfeit_from_block == LIVE_FORFEIT[2]
+    assert cfg.scoring.margin_v2_from_block == LIVE_MARGIN_V2[2]
+    forfeit, margin = A.forfeit_feature(cfg), A.margin_v2_feature(cfg)
+    assert (forfeit.name, margin.name) == (LIVE_FORFEIT[0], LIVE_MARGIN_V2[0])
+    assert not forfeit.decided_on_chain and not margin.decided_on_chain
+    # the typed values are EXACTLY what the votes resolve to on the untyped config
+    untyped = replace(cfg, scoring=replace(cfg.scoring, forfeit_from_block=0,
+                                           margin_v2_from_block=0))
+    rolled = A.apply_activation(untyped, LIVE_ROLLOVER[1])
+    resolved = A.apply_margin_v2_activation(
+        A.apply_forfeit_activation(rolled, LIVE_FORFEIT[2]), LIVE_MARGIN_V2[2])
+    assert resolved.scoring.forfeit_from_block == cfg.scoring.forfeit_from_block
+    assert resolved.scoring.margin_v2_from_block == cfg.scoring.margin_v2_from_block
+    # a restored (persisted) lock-in on the typed config is a no-op, never a raise
+    typed = A.apply_activation(cfg, LIVE_ROLLOVER[1])
+    assert A.apply_forfeit_activation(typed, LIVE_FORFEIT[2]) is typed
+    assert A.apply_margin_v2_activation(typed, LIVE_MARGIN_V2[2]) is typed
+
+
+@pytest.mark.parametrize("rollover_typed", [False, True])
+def test_mainnet_note_carries_v2b_within_the_field(rollover_typed):
+    """``rollover_typed=False`` is a validator on the release chain.toml (its
+    rollover resolved from signals); True is the main validator's deployed
+    shape (rolling_from_block typed)."""
+    cfg = load_chain_config(REPO / "chain.toml")
+    feature = A.primary_feature(cfg).name
+    if rollover_typed:
+        cfg = A.apply_activation(cfg, LIVE_ROLLOVER[1])
+        cfg = replace(cfg, activation=replace(cfg.activation, resolved_block=0))
+        primary = A.ActivationRecord(feature=feature, activation_block=LIVE_ROLLOVER[1],
+                                     source="config")
+    else:
+        primary = A.ActivationRecord(feature=feature, lock_block=LIVE_ROLLOVER[0],
+                                     activation_block=LIVE_ROLLOVER[1], source="signals")
+    rec = lambda f: A.ActivationRecord(feature=f[0], lock_block=f[1],  # noqa: E731
+                                       activation_block=f[2], source="signals")
+    v2b = A.image_decoupled_feature(cfg).name
+    locked = A.ActivationRecord(feature=v2b, lock_block=9401400, activation_block=9403200,
+                                source="tally")
+    for v2b_rec, tail in ((None, f"{v2b}:0:0"), (locked, f"{v2b}:9401400:9403200")):
+        note = A.own_signal_payload(cfg, primary, rec(LIVE_FORFEIT), rec(LIVE_MARGIN_V2),
+                                    A.ActivationRecord(), None, None, v2b_rec)
+        assert LIVE_FORFEIT[0] not in note and LIVE_MARGIN_V2[0] not in note
+        assert ":prelaunch-95-r2:0:0:" in note                 # left alone
+        assert note.endswith(":" + tail)
+        assert len(note.encode("utf-8")) <= A.NOTE_MAX_BYTES - 24   # room to spare

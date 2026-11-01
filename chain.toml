@@ -705,7 +705,7 @@ margin_warmup_rounds = 8         # rounds of tenure to reach the floor (~4d at 1
 win_margin_start_v2     = 0.4
 win_margin_end_v2       = 0.2
 margin_warmup_blocks_v2 = 18000
-margin_v2_from_block    = 0
+margin_v2_from_block    = 9194400   # TYPED 2026-11-01 (DEC-CA-0067): = the block the margin-v2-d30eb443 vote resolved (locked in at 9190800, applied at 9194400) — behaviour-identical; frees its note segment
 # Era king (DEC-CA-0043) — CONSENSUS, release-then-activate with the external
 # validators; audit replays each settlement under its own block. From a
 # settlement whose epoch boundary is >= this block the validator verifies the
@@ -737,7 +737,7 @@ king_resync_max_blocks = 18000   # = king_resync_max_rounds (5) × 3600 blocks �
 # legitimate holder of that code.
 forfeit_hotkeys          = ["5HDvXrTbUgK72UEkc7HrSpEtd6HpUDXuwh5pvePmWraqLHwu"]
 forfeit_successor_hotkey = "5DZv2yrGtcc9GHqhojwTQ7XWTvVL9xdab9LJhVNn4tF5S5H9"
-forfeit_from_block       = 0     # decided on chain (see above); a typed settlement boundary overrides
+forfeit_from_block       = 9166500   # TYPED 2026-11-01 (DEC-CA-0067): = the block the forfeit-42b1a486 vote resolved (locked in at 9165600, applied at 9166500) — behaviour-identical; frees its note segment
 min_windows          = 200       # below this many common windows, no decision
 min_clusters         = 0         # min distinct window clusters (pool `source` labels)
                                  # for a decision; raise to ~30 once the pool
