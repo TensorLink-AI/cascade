@@ -298,6 +298,8 @@ def set_aside_shadow_ema(cfg, work_root: Path, dest: Path, base_seed, hotkey: st
     from .r2_transfer import shadow_ema_file
 
     d = Path(dest)
+    if not d.is_dir():
+        return []
     names = sorted(p.name for p in d.iterdir() if p.is_file() and shadow_ema_file(p.name))
     if not names:
         return []
