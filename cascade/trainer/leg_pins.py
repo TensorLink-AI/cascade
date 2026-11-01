@@ -37,8 +37,14 @@ from ..shared.era import image_after_armed, image_decoupled_era, round_pins_at
 log = logging.getLogger(__name__)
 
 AFTER_TOML_NAME = "chain.deployed.after.toml"
-_FINGERPRINTS: dict[tuple, str] = {}
+# host identity -> (fingerprint, measured at). Keyed on the endpoint AND the
+# pinned host key / allocation id, so a reused ip:port (a new container) never
+# returns another pod's value; short TTL, and a mismatch is always re-measured
+# before refusing, so a lane re-bootstrapped onto the other image is accepted
+# without a trainer restart.
+_FINGERPRINTS: dict[tuple, tuple[str, float]] = {}
 _FP_LOCK = threading.Lock()
+FINGERPRINT_TTL_SECONDS = 300.0
 
 
 def _local(runner):
@@ -84,6 +90,11 @@ def leg_contract_scope(runner, contract):
                 delattr(loc, "leg_contract")
         else:
             loc.leg_contract = saved
+
+
+class LegImageMismatch(RuntimeError):
+    """The host runs (or cannot prove it runs) another worker image than the
+    leg's era pins. Never a lane fault: the lane breaker does not count it."""
 
 
 # ── the deployed chain.toml a post-switch leg's worker loads ────────────────
@@ -142,37 +153,58 @@ def render_after_toml(text: str, cfg) -> str:
     out = _set_keys(out, "round", round_vals)
     out = _set_keys(out, "v2", {"image_decoupled_from_block": int(v2.image_decoupled_from_block)})
     raw = tomllib.loads(out)
-    if (raw["v2"]["training"]["train_image_digest"] != v2.train_image_digest_after
-            or raw["round"]["funded_pod_image"] != rnd.funded_pod_image
-            or raw["round"]["worker_code_fingerprint"] != rnd.worker_code_fingerprint):
-        raise ValueError("rendered post-switch chain.toml does not carry the after pins")
+    want = {("v2", "training", "train_image_digest"): str(v2.train_image_digest_after),
+            ("v2", "image_decoupled_from_block"): int(v2.image_decoupled_from_block),
+            **{("round", k): v for k, v in round_vals.items()}}
+    for path, value in want.items():
+        node = raw
+        for part in path:
+            node = node.get(part, {}) if isinstance(node, dict) else {}
+        if node != value:
+            raise ValueError(f"rendered post-switch chain.toml: {'.'.join(path)} = {node!r}, "
+                             f"expected {value!r}")
     return out
 
 
 def _push_after_toml(runner, host):
     from dataclasses import replace as dc_replace
 
+    from ..shared.atomic import write_text_atomic
+
     src = getattr(runner, "deployed_chain_toml", None)
     if not src:
-        return host
+        # the pod would resolve its baked / hosts.toml config: never the
+        # post-switch pins the orchestrator expects — refuse, never guess
+        raise LegImageMismatch("post-switch leg needs the trainer's deployed_chain_toml "
+                               "(--chain-toml) to render its after-image config")
     text = render_after_toml(Path(src).read_text(encoding="utf-8"), runner.cfg)
     local = Path(getattr(runner, "work_root", ".")) / "_deployed" / AFTER_TOML_NAME
     local.parent.mkdir(parents=True, exist_ok=True)
-    local.write_text(text, encoding="utf-8")
+    write_text_atomic(local, text)
     pushed = runner._push_deployed_chain_toml(host, src=local, dest_name=AFTER_TOML_NAME)
     return dc_replace(pushed, chain_toml=f"{host.workdir}/{AFTER_TOML_NAME}")
 
 
-def host_code_fingerprint(host) -> str:
-    """The host's worker ``cascade/**/*.py`` fingerprint (cached per endpoint)."""
+def _fp_key(host) -> tuple:
+    return (str(getattr(host, "host", "")), int(getattr(host, "port", 0) or 0),
+            str(getattr(host, "workdir", "")), str(getattr(host, "pinned_host_key", "") or ""),
+            str(getattr(host, "allocation_id", "") or ""))
+
+
+def host_code_fingerprint(host, *, fresh: bool = False, clock=None) -> str:
+    """The host's worker ``cascade/**/*.py`` fingerprint (cached per host
+    identity for :data:`FINGERPRINT_TTL_SECONDS`; ``fresh`` re-measures)."""
+    import time
+
     from ..provision.codeprint import CHECK_TIMEOUT_SECONDS, remote_code_fingerprint
     from .remote import build_ssh_argv, run_ssh
 
-    key = (str(getattr(host, "host", "")), int(getattr(host, "port", 0) or 0),
-           str(getattr(host, "workdir", "")), str(getattr(host, "pinned_host_key", "") or ""))
+    now = (clock or time.monotonic)()
+    key = _fp_key(host)
     with _FP_LOCK:
-        if key in _FINGERPRINTS:
-            return _FINGERPRINTS[key]
+        hit = _FINGERPRINTS.get(key)
+        if hit is not None and not fresh and now - hit[1] < FINGERPRINT_TTL_SECONDS:
+            return hit[0]
 
     def _run(argv):
         return run_ssh(build_ssh_argv(host, shlex.join(list(argv))),
@@ -180,36 +212,63 @@ def host_code_fingerprint(host) -> str:
 
     got, _n, err = remote_code_fingerprint(_run, workdir=host.workdir)
     if err:
-        raise RuntimeError(f"code fingerprint unavailable on {getattr(host, 'name', host)}: {err}")
+        raise LegImageMismatch(
+            f"code fingerprint unavailable on {getattr(host, 'name', host)}: {err}")
     with _FP_LOCK:
-        _FINGERPRINTS[key] = got
+        _FINGERPRINTS[key] = (got, now)
     return got
 
 
-class LegImageMismatch(RuntimeError):
-    """The host runs another worker image than the leg's era pins."""
 
 
-def dispatch_host_hook(runner, *, fingerprint_fn=host_code_fingerprint):
+class _HostHook:
     """``hook(host, block) -> host`` for the dispatcher (``block`` = the leg's
-    ``--contract-block``, its era start). Pre-switch leg: the host must run the
-    CURRENT worker code; post-switch leg: the AFTER code, and the host gets the
-    rendered post-switch chain.toml."""
+    ``--contract-block``, its era start). Pre-switch leg: the host must run
+    the CURRENT worker code; post-switch leg: the AFTER code, and the host
+    gets the rendered post-switch chain.toml. :meth:`matches` lets a lane
+    pool pick a lane on the leg's image instead of taking one and refusing."""
 
-    def hook(host, block):
-        cfg = runner.cfg
+    def __init__(self, runner, fingerprint_fn):
+        self.runner, self.fingerprint_fn = runner, fingerprint_fn
+
+    def _want(self, block) -> str:
+        return str(round_pins_at(self.runner.cfg, int(block)).worker_code_fingerprint
+                   or "").lower()
+
+    def _fingerprint(self, host, *, fresh=False) -> str:
+        return self.fingerprint_fn(host, fresh=fresh)
+
+    def matches(self, host, block) -> bool:
+        """Whether ``host`` runs the leg's era image (re-measured on a miss)."""
+        if not image_after_armed(self.runner.cfg) or block is None:
+            return True
+        want = self._want(block)
+        if not want:
+            return True
+        try:
+            return (self._fingerprint(host) == want
+                    or self._fingerprint(host, fresh=True) == want)
+        except LegImageMismatch:
+            return False
+
+    def __call__(self, host, block):
+        cfg = self.runner.cfg
         if not image_after_armed(cfg) or block is None:
             return host
         post = image_decoupled_era(cfg, int(block))
-        pins = round_pins_at(cfg, int(block))
-        want = str(pins.worker_code_fingerprint or "").lower()
+        want = self._want(block)
         if want:
-            got = fingerprint_fn(host)
+            got = self._fingerprint(host)
+            if got != want:
+                got = self._fingerprint(host, fresh=True)   # a re-bootstrapped lane
             if got != want:
                 raise LegImageMismatch(
                     f"{getattr(host, 'name', host)} runs worker code {got[:12]}… but this "
                     f"leg's era (start {block}) pins {want[:12]}… "
                     f"({'after' if post else 'current'} image) — not dispatched here")
-        return _push_after_toml(runner, host) if post else host
+        return _push_after_toml(self.runner, host) if post else host
 
-    return hook
+
+def dispatch_host_hook(runner, *, fingerprint_fn=host_code_fingerprint):
+    """The dispatcher's per-leg image hook (:class:`_HostHook`)."""
+    return _HostHook(runner, fingerprint_fn)

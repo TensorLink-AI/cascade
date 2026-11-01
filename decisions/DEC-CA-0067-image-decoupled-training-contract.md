@@ -197,6 +197,25 @@ DEC-CA-0049.
     overrides, so the same two typed lines must be applied to it by hand. That
     edit is Approve-tier and is not part of this PR.
 
+## Per-leg contract re-derivation (no trusted stamps)
+
+From the switch every entry also publishes its own runtime terms,
+`train_image_digest` and `continuation_protocol`. Both are SIGNED and dropped
+when empty, so pre-switch bytes are identical.
+
+Validators (`era_gate`, `era_entry_contract_unproven`) and the audit
+(`numerics-contract`) re-derive
+`contract_digest(era contract body with the entry's image/protocol) == entry.training_contract_digest`,
+and require the entry's numerics to equal the manifest's. A garbage or
+mismatched digest is rejected, so the numerics stamp is never taken on trust.
+
+Audit replay (`cascade/audit/rederive.py` `entry_replay_contract`) runs each
+leg under its OWN recorded image and protocol:
+- Tier 2 byte-exactness compares against the image the leg actually ran.
+- Tier 1 re-derives the corpus digest with the leg's continuation protocol, so
+  the eager-accounting `corpus_digest` / `n_series` difference never
+  false-FAILs.
+
 ## Automatic image repin at the switch
 
 The trainer-only `[v2] *_after` pins schedule the image change onto the same
@@ -226,6 +245,49 @@ How they apply:
 
 The operator lines for rc16 are in docs/OPERATOR.md, "Automatic image repin at
 the switch".
+
+Lane handling:
+- A lane pool picks a lane on the leg's era image (`_dispatch_on_free_lane`
+  with the hook's `matches`); it does not take one and then fail.
+- No matching lane means a clean `LegImageMismatch`, which the lane breaker
+  never counts.
+- The fingerprint cache is keyed on endpoint plus host key plus allocation, has
+  a 300 s TTL, and is always re-measured before a refusal. A lane
+  re-bootstrapped onto the after image is accepted without a trainer restart.
+- The provisioner health gate also accepts the after release.
+- `check_worker_release` accepts a box whose code is either release.
+- The bench-anneal telemetry leg (`runner_promotion`) runs on the pod that
+  trained the entry, so it is on that entry's image by construction. It
+  carries no `--contract-block`, and the hook is a no-op there.
+
+**Owner rule: qualification before arming.**
+- An image may be set as `*_after` ONLY after a bit-identical qualification
+  against the current image: weights and optimizer state, world size 1 and 8,
+  and crash/resume.
+- The qualification must be recorded in OPSLOG before the `*_after` lines are
+  armed.
+- Excluding the image from the numerics digest is sound only because of this
+  rule.
+
+## Release notes / blast radius (operators)
+
+- **Typed forfeit / margin-v2 blocks.**
+  - Late-joining or old-release validators can no longer re-derive the forfeit
+    and margin-v2 blocks from notes. This release no longer signals them
+    (typed), so such a node must run this release's chain.toml.
+  - Receipts stop carrying `margin_v2_block` (the block is typed). This is
+    audit-only: archived receipts with 9194400 still pass.
+- **Note budget.** The `v2b-` segment fits beside a locked `cfg-` overlay
+  segment while blocks have 7 digits. Past block 10,000,000 a locked `v2b-` is
+  trimmed. Rule: once v2b is decided, type `[v2] image_decoupled_from_block` in
+  chain.toml (behaviour-identical) so its segment leaves the note.
+- **CPU cost.** The bundled 4000-window budget is about twice the current 2000
+  windows of CPU scoring per v2 settlement on every validator, so external
+  validators should expect longer settlement scoring. The verdict draw is still
+  capped by the pool's capacity. `eval_n_windows_after` is load-bounded at
+  20000.
+- **Testnet** carries `eval_n_windows_after = 300`, its current budget, so the
+  vote hash and the explicit verdict draw are rehearsed.
 
 ## Procedure
 

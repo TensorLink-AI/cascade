@@ -221,6 +221,9 @@ class _FundedLegMixin:
         runner = self
 
         class RecoveryDispatcher:
+            # DEC-CA-0067: the lane pool picks a lane on the leg's era image
+            host_hook = getattr(disp, "host_hook", None)
+
             def dispatch(self, host, **kw):
                 # MarketCast requires local-only even on an operator lane.
                 # Harvest under THIS specialist's scheduled contract, not the

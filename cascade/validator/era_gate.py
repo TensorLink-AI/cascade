@@ -17,7 +17,11 @@ from ..shared.era import (
     v2_generation_usable,
 )
 from ..shared.lane_b import merge_identities
-from ..shared.manifest import TrainingManifest, numerics_contract_digest
+from ..shared.manifest import (
+    TrainingManifest,
+    entry_contract_proven,
+    numerics_contract_digest,
+)
 from .king_check import NOTICE_LATE
 from .lane_b import LaneBTransient
 from .manifest_chain import ref_as_of
@@ -112,6 +116,14 @@ class EraGateMixin:
                     return (f"era_entry_numerics_mismatch: {e.role} uid{e.miner_uid} trained "
                             f"under numerics {e.numerics_contract_digest[:16]}…, the era's "
                             f"are {manifest.numerics_contract_digest[:16]}…")
+                if not entry_contract_proven(self._era_contract_source(manifest), e):
+                    # re-derived, never trusted: the era's contract with THIS
+                    # leg's published image/protocol must hash to its digest
+                    return (f"era_entry_contract_unproven: {e.role} uid{e.miner_uid} "
+                            f"training_contract_digest {e.training_contract_digest[:16] or '<none>'}"
+                            f"… is not the era contract with its image "
+                            f"{e.train_image_digest[:19] or '<none>'} / protocol "
+                            f"{e.continuation_protocol or '<off>'}")
             elif v2_era and (
                     e.init_pointer != manifest.warm_start_ckpt
                     or e.training_contract_digest != manifest.contract_digest):
@@ -140,6 +152,13 @@ class EraGateMixin:
             return king_reason
         return self._check_era_refs(manifest)
 
+    def _era_contract_source(self, manifest: TrainingManifest):
+        """The settlement's contract: its published ``contract_body`` (whose
+        full digest ``_check_contract`` tied to ``contract_digest``), else the
+        local contract the strict gate compared against."""
+        return (manifest.contract_body if manifest.contract_body is not None
+                else self._training_for(manifest))
+
     def _check_numerics_digest(self, manifest: TrainingManifest) -> str | None:
         """DEC-CA-0067: the manifest-level ``numerics_contract_digest`` exists
         and is the numerics projection of the settlement's own contract — its
@@ -150,9 +169,7 @@ class EraGateMixin:
         if not manifest.numerics_contract_digest:
             return ("era_numerics_missing: settlement past [v2] image_decoupled_from_block "
                     "carries no numerics_contract_digest")
-        source = (manifest.contract_body if manifest.contract_body is not None
-                  else self._training_for(manifest))
-        want = numerics_contract_digest(source)
+        want = numerics_contract_digest(self._era_contract_source(manifest))
         if manifest.numerics_contract_digest != want:
             return (f"era_numerics_mismatch: manifest declares numerics "
                     f"{manifest.numerics_contract_digest[:16]}…, its contract hashes to "

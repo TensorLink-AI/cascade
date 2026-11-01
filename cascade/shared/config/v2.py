@@ -360,6 +360,11 @@ def parse_v2_economics(v2raw: dict) -> dict:
             raise ValueError(f"[v2] {k} must be in [0, 1); got {raw}")
         out[k] = float(raw)
     out["bench_gate_v2_from_block"] = parse_bench_gate_v2_from_block(v2raw)
+    if out["eval_n_windows_after"] > EVAL_WINDOWS_MAX:
+        # the verdict draw is capped by the pool anyway; a value past this is a
+        # typo that would multiply every validator's CPU scoring time
+        raise ValueError(f"[v2] eval_n_windows_after must be <= {EVAL_WINDOWS_MAX}; got "
+                         f"{out['eval_n_windows_after']}")
     out["prior_train_image_digests"] = _parse_prior_images(
         v2raw.get("prior_train_image_digests", []))
     out.update(parse_image_after(v2raw))
@@ -404,6 +409,8 @@ def parse_v2_economics(v2raw: dict) -> dict:
         fail_bp=lad["ladder_fail_bp"], cap_bp=lad["ladder_cap_bp"])
     return out
 
+
+EVAL_WINDOWS_MAX = 20000
 
 IMAGE_AFTER_KEYS = ("train_image_digest_after", "funded_pod_image_after",
                     "worker_code_fingerprint_after", "funded_sku_wall_measured_image_after")

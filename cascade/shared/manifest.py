@@ -316,10 +316,10 @@ def _image_variants(ref: str) -> list[str]:
     return out
 
 
-def prove_numerics_digest(contract: object, full_digest: str,
-                          candidate_images=()) -> str | None:
-    """The numerics digest of the contract a leg recorded as ``full_digest``,
-    PROVEN against ``contract`` — or ``None`` when it cannot be.
+def prove_runtime_terms(contract: object, full_digest: str,
+                        candidate_images=()) -> tuple[str, str] | None:
+    """The ``(train_image_digest, continuation_protocol)`` a leg that recorded
+    ``full_digest`` trained under, PROVEN against ``contract`` — or ``None``.
 
     A leg records only its FULL ``training_contract_digest``. That leg trained
     under ``contract`` with nothing but the runtime-only terms
@@ -329,13 +329,51 @@ def prove_numerics_digest(contract: object, full_digest: str,
     preimage resistance: no other term set hashes there). Tried: ``contract``'s
     own pin, then each of ``candidate_images`` (exactly as once typed, plus the
     bare ``sha256:…`` of a ``repo@sha256:…`` ref), each with ``contract``'s own
-    protocol and every :data:`CONTINUATION_PROTOCOLS` value. On a match the
-    leg's numerics are ``contract``'s, so the result is
-    ``numerics_contract_digest(contract)``. No match (a numerics change, or an
-    image the candidates do not name) ⇒ ``None`` — the caller keeps the old
-    stale → retrain behaviour for that leg."""
+    protocol and every :data:`CONTINUATION_PROTOCOLS` value."""
     if not full_digest:
         return None
+    payload = contract_payload(contract)
+    images = list(dict.fromkeys([
+        str(payload.get("train_image_digest", "")),
+        *(v for c in candidate_images for v in _image_variants(c))]))
+    protocols = list(dict.fromkeys([str(payload.get("continuation_protocol", "") or ""),
+                                    *CONTINUATION_PROTOCOLS]))
+    for img in images:
+        for proto in protocols:
+            if contract_digest(entry_contract_payload(payload, img, proto)) == str(full_digest):
+                return img, proto
+    return None
+
+
+def entry_contract_payload(contract: object, image: str, protocol: str) -> dict:
+    """``contract``'s payload with the runtime-only terms set to a leg's own
+    (``protocol`` "" drops, drop-when-default) — the contract that leg
+    trained under when its runtime terms are the only difference."""
+    trial = dict(contract_payload(contract))
+    trial["train_image_digest"] = str(image or "")
+    trial["continuation_protocol"] = str(protocol or "")
+    return contract_payload(trial)
+
+
+def entry_contract_proven(contract: object, entry: TrainedEntry) -> bool:
+    """DEC-CA-0067 validator / audit re-derivation: the era contract
+    (``contract``, typically the manifest's ``contract_body``) with THIS
+    entry's published runtime terms hashes to the entry's recorded
+    ``training_contract_digest``."""
+    return bool(entry.training_contract_digest) and contract_digest(entry_contract_payload(
+        contract, entry.train_image_digest, entry.continuation_protocol)
+    ) == entry.training_contract_digest
+
+
+def prove_numerics_digest(contract: object, full_digest: str,
+                          candidate_images=()) -> str | None:
+    """The numerics digest of the contract a leg recorded as ``full_digest``
+    when :func:`prove_runtime_terms` proves it (then it is ``contract``'s own
+    ``numerics_contract_digest``), else ``None`` — the caller keeps the old
+    stale → retrain behaviour for that leg."""
+    if prove_runtime_terms(contract, full_digest, candidate_images) is None:
+        return None
+    return numerics_contract_digest(contract)
     payload = contract_payload(contract)
     images = list(dict.fromkeys([
         str(payload.get("train_image_digest", "")),
@@ -502,6 +540,13 @@ class TrainedEntry:
     # ``[v2] image_decoupled_from_block`` is in force, so every earlier
     # manifest hashes byte-for-byte as before.
     numerics_contract_digest: str = ""
+    # DEC-CA-0067 (drop-when-empty, SIGNED): the leg's own runtime-only terms
+    # (:data:`IMAGE_RUNTIME_FIELDS`), stamped with ``numerics_contract_digest``
+    # so validators re-derive ``contract_digest(contract_body with these) ==
+    # training_contract_digest`` instead of trusting the stamp. "" protocol =
+    # continuation off (dropped).
+    train_image_digest: str = ""
+    continuation_protocol: str = ""
 
     def __post_init__(self) -> None:
         if self.role not in VALID_ROLES:
@@ -618,6 +663,9 @@ def _entry_body(e: TrainedEntry) -> dict:
         d.pop("training_contract_digest", None)
     if not d.get("numerics_contract_digest"):
         d.pop("numerics_contract_digest", None)
+    for k in ("train_image_digest", "continuation_protocol"):
+        if not d.get(k):
+            d.pop(k, None)
     return d
 
 
@@ -1000,6 +1048,8 @@ def load_manifest(text: str) -> TrainingManifest:
             init_pointer=e.get("init_pointer"),
             training_contract_digest=str(e.get("training_contract_digest", "") or ""),
             numerics_contract_digest=str(e.get("numerics_contract_digest", "") or ""),
+            train_image_digest=str(e.get("train_image_digest", "") or ""),
+            continuation_protocol=str(e.get("continuation_protocol", "") or ""),
         )
         for e in obj["entries"]
     ]

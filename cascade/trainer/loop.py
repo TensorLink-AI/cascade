@@ -1499,9 +1499,45 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
                 log.warning("lane breaker bookkeeping failed (ignored): %s", be)
                 return False
 
+        # DEC-CA-0067 automatic repin: with the dispatcher's per-leg image hook
+        # armed, take a lane that runs THIS leg's era image (the hook would
+        # refuse any other) — never take one and fail on it.
+        from .leg_pins import LegImageMismatch
+
+        _matches = getattr(getattr(disp, "host_hook", None), "matches", None)
+        _block = kw.get("contract_block")
+        _plain_take = _take
+
+        def _take_matching():
+            if _matches is None or _block is None:
+                return _plain_take()
+            known = getattr(free_lanes, "known_hosts", None)
+            pool = list(known()) if callable(known) else list(hosts)
+            if pool and not any(_matches(h, _block) for h in pool):
+                raise LegImageMismatch(
+                    f"{describe}: no lane runs this leg's era image (contract block "
+                    f"{_block}); bring a lane up on that image")
+            aside: list = []
+            try:
+                for _ in range(2 * max(1, len(pool))):
+                    lane = _plain_take()
+                    if _matches(lane, _block):
+                        return lane
+                    aside.append(lane)
+                raise LegImageMismatch(f"{describe}: no free lane on this leg's era image")
+            finally:
+                for lane in aside:
+                    free_lanes.put(lane)
+
+        _take = _take_matching
         host = _take()
         try:
             entry = disp.dispatch(_ready(host), lane_count=pod_lane_count(host, hosts), **kw)
+        except LegImageMismatch:
+            # the leg's image, not the lane's health: back in the rotation,
+            # never counted by the lane breaker
+            free_lanes.put(host)
+            raise
         except Exception as e:  # noqa: BLE001 — any dispatch failure is retryable once
             transport = _transport_failure(e)
             if transport and hasattr(free_lanes, "mark_dead"):

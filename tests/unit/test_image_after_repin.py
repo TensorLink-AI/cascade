@@ -193,7 +193,7 @@ def test_dispatch_hook_refuses_the_other_image_and_pushes_the_after_config(acfg,
     host = RemoteHost(name="lane", host="10.0.0.1", workdir="/w",
                       chain_toml="/w/chain.deployed.toml")
     on = {"fp": FP16}
-    hook = dispatch_host_hook(runner, fingerprint_fn=lambda h: on["fp"])
+    hook = dispatch_host_hook(runner, fingerprint_fn=lambda h, fresh=False: on["fp"])
     out = hook(host, SW)                                        # post-switch leg, rc16 host
     assert out.chain_toml == f"/w/{AFTER_TOML_NAME}"
     assert pushed and pushed[0][1] == AFTER_TOML_NAME and RC16 in pushed[0][0]
@@ -235,3 +235,179 @@ def test_pre_switch_king_is_proven_without_a_manual_prior(cfg, tmp_path):
     assert not sched._stale_contract(era)(king.training_contract_digest)
     assert sched._numerics_of(era, king.training_contract_digest) == numerics_contract_digest(
         v2cfg.training.at_block(n))
+
+
+# ── review fixes: lane selection, cache, provisioner, audit replay ───────────
+
+
+class _LaneHost:
+    def __init__(self, name, host):
+        self.name, self.host, self.port, self.stage = name, host, 22, "final"
+        self.workdir, self.pinned_host_key, self.allocation_id = "/w", "", ""
+
+
+class _Hook:
+    def __init__(self, image_of):
+        self.image_of = image_of
+
+    def matches(self, host, block):
+        return self.image_of[host.name] == ("after" if block >= SW else "current")
+
+    def __call__(self, host, block):
+        from cascade.trainer.leg_pins import LegImageMismatch
+
+        if not self.matches(host, block):
+            raise LegImageMismatch("wrong image")
+        return host
+
+
+class _LaneDisp:
+    def __init__(self, hook):
+        self.host_hook, self.calls = hook, []
+
+    def dispatch(self, host, **kw):
+        host = self.host_hook(host, kw.get("contract_block"))
+        self.calls.append(host.name)
+        return SimpleNamespace(host=host.name)
+
+
+def test_lane_pool_picks_the_lane_on_the_legs_era_image():
+    from cascade.trainer.loop import TrainerRunner, _FinalLanePool
+
+    old, new = _LaneHost("old", "10.0.0.1"), _LaneHost("new", "10.0.0.2")
+    hosts = [old, new]
+    pool = _FinalLanePool(hosts, lambda: hosts)
+    d = _LaneDisp(_Hook({"old": "current", "new": "after"}))
+    out = TrainerRunner._dispatch_on_free_lane(d, pool, hosts, describe="x",
+                                               role="challenger", contract_block=SW)
+    assert out.host == "new" and d.calls == ["new"]
+    out = TrainerRunner._dispatch_on_free_lane(d, pool, hosts, describe="x",
+                                               role="challenger", contract_block=SW - 3600)
+    assert out.host == "old"
+    assert sorted(h.name for h in pool.known_hosts()) == ["new", "old"]   # nobody tripped
+
+
+def test_no_lane_on_the_era_image_refuses_cleanly_without_the_breaker():
+    from cascade.trainer.leg_pins import LegImageMismatch
+    from cascade.trainer.loop import TrainerRunner, _FinalLanePool
+
+    hosts = [_LaneHost("old", "10.0.0.1")]
+    pool = _FinalLanePool(hosts, lambda: hosts)
+    d = _LaneDisp(_Hook({"old": "current"}))
+    with pytest.raises(LegImageMismatch, match="no lane runs this leg's era image"):
+        TrainerRunner._dispatch_on_free_lane(d, pool, hosts, describe="x",
+                                             role="challenger", contract_block=SW)
+    assert [h.name for h in pool.known_hosts()] == ["old"] and d.calls == []
+
+
+def test_fingerprint_cache_is_keyed_per_container_and_expires(monkeypatch):
+    from cascade.trainer import leg_pins
+
+    calls = []
+    monkeypatch.setattr("cascade.provision.codeprint.remote_code_fingerprint",
+                        lambda run, workdir: (calls.append(1) or (state["fp"], 3, "")))
+    state = {"fp": "a" * 64}
+    leg_pins._FINGERPRINTS.clear()
+    h1 = _LaneHost("lane", "10.0.0.9")
+    h1.pinned_host_key = "key-1"
+    t = [0.0]
+    assert leg_pins.host_code_fingerprint(h1, clock=lambda: t[0]) == "a" * 64
+    assert leg_pins.host_code_fingerprint(h1, clock=lambda: t[0]) == "a" * 64
+    assert len(calls) == 1                                       # cached
+    state["fp"] = "b" * 64
+    h2 = _LaneHost("lane", "10.0.0.9")
+    h2.pinned_host_key = "key-2"                                 # same ip:port, new container
+    assert leg_pins.host_code_fingerprint(h2, clock=lambda: t[0]) == "b" * 64
+    t[0] = leg_pins.FINGERPRINT_TTL_SECONDS + 1
+    assert leg_pins.host_code_fingerprint(h1, clock=lambda: t[0]) == "b" * 64   # expired
+    leg_pins._FINGERPRINTS.clear()
+
+
+def test_hook_remeasures_a_rebootstrapped_lane_before_refusing(acfg, tmp_path):
+    from cascade.trainer.leg_pins import dispatch_host_hook
+
+    armed = A.apply_image_decoupled_activation(acfg, SW)
+    seen = []
+
+    def fp(host, fresh=False):
+        seen.append(fresh)
+        return FP16 if fresh else armed.round.worker_code_fingerprint   # stale cache
+
+    src = tmp_path / "chain.toml"
+    src.write_text((REPO / "chain.toml").read_text())
+    runner = SimpleNamespace(cfg=armed, deployed_chain_toml=src, work_root=tmp_path,
+                             _push_deployed_chain_toml=lambda h, **kw: h)
+    from cascade.trainer.remote import RemoteHost
+
+    host = RemoteHost(name="lane", host="10.0.0.1", workdir="/w")
+    hook = dispatch_host_hook(runner, fingerprint_fn=fp)
+    assert hook(host, SW).chain_toml.endswith("chain.deployed.after.toml")
+    assert seen == [False, True]
+    runner.deployed_chain_toml = None                           # no config to render
+    from cascade.trainer.leg_pins import LegImageMismatch
+
+    with pytest.raises(LegImageMismatch, match="deployed_chain_toml"):
+        hook(host, SW)
+
+
+def test_provisioner_gate_accepts_the_after_release():
+    from cascade.provision.health import HealthGate
+
+    gate = HealthGate(sku="H100", image_digest="sha256:" + "1" * 64, code_fingerprint="1" * 64,
+                      alt_image_digest=RC16, alt_code_fingerprint=FP16)
+
+    def run_for(digest, fp):
+        def run(argv):
+            if argv[0] == "printenv":
+                return SimpleNamespace(returncode=0, stdout=digest, stderr="")
+            return SimpleNamespace(returncode=1, stdout="", stderr="")
+        return run
+
+    assert gate._check_image_digest(run_for(RC16, FP16))[0]
+    assert not gate._check_image_digest(run_for("sha256:" + "9" * 64, FP16))[0]
+    plain = HealthGate(sku="H100", image_digest="sha256:" + "1" * 64)
+    assert not plain._check_image_digest(run_for(RC16, FP16))[0]          # byte-identical
+
+
+def test_audit_replays_each_leg_under_its_own_runtime_terms():
+    from cascade.audit.rederive import entry_replay_contract
+
+    c = load_chain_config(REPO / "chain.toml").training.v2_contract
+    e = SimpleNamespace(train_image_digest=RC16, continuation_protocol="cascade-continuation/1")
+    assert entry_replay_contract(c, e, SimpleNamespace(numerics_contract_digest="")) is c
+    out = entry_replay_contract(c, e, SimpleNamespace(numerics_contract_digest="n" * 64))
+    assert (out.train_image_digest, out.continuation_protocol) == (
+        RC16, "cascade-continuation/1")
+    assert numerics_contract_digest(out) == numerics_contract_digest(c)
+
+
+def test_tier1_rederives_with_the_legs_own_protocol(tmp_path, monkeypatch):
+    from cascade.audit import rederive as R
+    from cascade.shared.manifest import TrainingManifest, format_trained_pointer
+
+    cfg = load_chain_config(REPO / "chain.toml")
+    cfg = replace(cfg, training=replace(cfg.training, v2_from_block=1))
+    v2c = cfg.training.v2_contract
+    entry = TrainedEntry("hk", 1, "king", "ns/g@sha256:" + "1" * 64,
+                         format_trained_pointer("ns/c@sha256:" + "2" * 64), "digest-x", 5,
+                         size=v2c.arch_preset, numerics_contract_digest="n" * 64,
+                         train_image_digest=RC16, continuation_protocol="cascade-continuation/1")
+    manifest = TrainingManifest(round_id="1", created_block=5, contract_digest="c" * 64,
+                                base_arch_digest="a" * 64, eval_dataset="e", entries=[entry],
+                                numerics_contract_digest="n" * 64)
+    receipt = SimpleNamespace(status="scored", manifest={}, epoch_start_block=SW + 900,
+                              generation_seed=7, load_embedded_manifest=lambda: manifest)
+    seen = {}
+
+    def fake(*a, **kw):
+        seen.update(kw)
+        return "digest-x"
+
+    monkeypatch.setattr(R, "_rederive_digest", fake)
+    monkeypatch.setattr(R, "_fetch_generator", lambda *a, **k: None)
+    root = tmp_path / "corpora"
+    (root / "hk").mkdir(parents=True)
+    (root / "hk" / "corpus.json").write_text("{}")
+    out = R.run_tier1(receipt, cfg, workdir=tmp_path, full_stream=True, corpus_root=root)
+    assert out[0].status == "PASS", out
+    assert seen.get("continuation_protocol") == "cascade-continuation/1"

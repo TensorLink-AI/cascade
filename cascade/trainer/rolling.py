@@ -1366,12 +1366,13 @@ class RollingScheduler:
 
         return contract_digest(self.cfg.training.at_block(int(era.start_block)))
 
-    def _numerics_of(self, era, digest: str) -> str | None:
-        """DEC-CA-0067: the PROVEN numerics digest of a leg that recorded the
-        full ``digest`` against ``era``'s contract, else None (see
-        :func:`cascade.shared.manifest.prove_numerics_digest`): the current
-        pin and every ``[v2] prior_train_image_digests`` entry are tried."""
-        from ..shared.manifest import prove_numerics_digest
+    def _runtime_terms_of(self, era, digest: str) -> tuple[str, str] | None:
+        """DEC-CA-0067: the PROVEN ``(train_image_digest, continuation_protocol)``
+        of a leg that recorded the full ``digest`` against ``era``'s contract,
+        else None (see :func:`cascade.shared.manifest.prove_runtime_terms`):
+        the current pin, every ``[v2] prior_train_image_digests`` entry and —
+        with an automatic repin — the pre-switch pin are tried."""
+        from ..shared.manifest import prove_runtime_terms
 
         contract = self.cfg.training.at_block(int(era.start_block))
         priors = tuple(getattr(getattr(self.cfg, "v2", None), "prior_train_image_digests", ())
@@ -1381,7 +1382,16 @@ class RollingScheduler:
             # DEC-CA-0067 automatic repin: the pre-switch pin is a known prior
             # (a leg trained before the switch keeps its numerics, no edit)
             priors = (*priors, str(base.train_image_digest))
-        return prove_numerics_digest(contract, str(digest or ""), priors)
+        return prove_runtime_terms(contract, str(digest or ""), priors)
+
+    def _numerics_of(self, era, digest: str) -> str | None:
+        """The numerics digest of a leg whose runtime terms are proven
+        (:meth:`_runtime_terms_of`), else None."""
+        from ..shared.manifest import numerics_contract_digest
+
+        if self._runtime_terms_of(era, digest) is None:
+            return None
+        return numerics_contract_digest(self.cfg.training.at_block(int(era.start_block)))
 
     def _stale_contract(self, era):
         """``digest -> bool``: an entry trained under another contract than
@@ -3243,13 +3253,17 @@ class RollingScheduler:
 
             stamped = []
             for entry in entries:
-                proven = self._numerics_of(era, entry.training_contract_digest)
-                if entry.init_pointer != era.warm_start_ckpt or proven != numerics:
+                terms = self._runtime_terms_of(era, entry.training_contract_digest)
+                if entry.init_pointer != era.warm_start_ckpt or terms is None:
                     raise StorageError(
                         "refusing v2 manifest: entry lacks the scheduled init or a provable "
                         "numerics contract identity; check worker release and requeue "
                         "incompatible work")
-                stamped.append(replace(entry, numerics_contract_digest=proven))
+                # the leg's own runtime terms ride signed, so every validator
+                # re-derives its full digest from the era's contract body
+                stamped.append(replace(entry, numerics_contract_digest=numerics,
+                                       train_image_digest=terms[0],
+                                       continuation_protocol=terms[1]))
             entries = stamped
         elif v2_era_active(self.cfg, era.start_block):
             from ..shared.hippius import StorageError

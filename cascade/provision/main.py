@@ -119,7 +119,8 @@ def provider_names(raw: dict, policy: ProvisionPolicy) -> list[str]:
 
 def make_health_check(policy: ProvisionPolicy, render: RenderSettings, *,
                       image_digest: str, min_disk_gb: float,
-                      hippius_probe, code_fingerprint: str = "") -> callable:
+                      hippius_probe, code_fingerprint: str = "",
+                      alt_image_digest: str = "", alt_code_fingerprint: str = "") -> callable:
     """Bind the pure :class:`HealthGate` to a real ``ssh`` transport per pod.
 
     Gates are built lazily per ``(stage, provider)``: the pod's user/workdir/
@@ -146,6 +147,9 @@ def make_health_check(policy: ProvisionPolicy, render: RenderSettings, *,
                 remote_python=prof.remote_python, workdir=prof.workdir,
                 image_digest=image_digest, min_disk_gb=min_disk_gb,
                 code_fingerprint=code_fingerprint,
+                **({"alt_image_digest": alt_image_digest,
+                    "alt_code_fingerprint": alt_code_fingerprint}
+                   if alt_code_fingerprint else {}),
                 hippius_probe=hippius_probe,
                 home_dir=("/root" if prof.user == "root" else f"/home/{prof.user}"),
             )
@@ -636,6 +640,9 @@ def _run(args) -> int:
             min_disk_gb=float(top.get("min_disk_gb", 20.0)),
             hippius_probe=hippius_probe,
             code_fingerprint=cfg.round.worker_code_fingerprint,
+            # DEC-CA-0067: a lane on the after release also passes
+            alt_image_digest=cfg.v2.train_image_digest_after,
+            alt_code_fingerprint=cfg.v2.worker_code_fingerprint_after,
         ),
         bootstrap=bootstrap,
         prewarm=make_config_push(render, box_chain_toml=str(args.chain_toml),

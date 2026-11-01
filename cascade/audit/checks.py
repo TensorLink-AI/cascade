@@ -401,13 +401,24 @@ def check_numerics_contract(receipt: RoundReceipt, cfg: ChainConfig,
                                     else receipt_training(receipt, cfg))
     if got != want:
         return _fail(name, f"manifest numerics {got[:16]}… != its contract's {want[:16]}…")
+    from ..shared.manifest import entry_contract_payload
+
+    source = body if isinstance(body, dict) else receipt_training(receipt, cfg)
     for e in entries:
         if str(e.get("numerics_contract_digest", "") or "") != got:
             return _fail(name, f"{e.get('role')} uid{e.get('miner_uid')} numerics "
                                f"{str(e.get('numerics_contract_digest', ''))[:16] or '<none>'} "
                                f"!= the settlement's {got[:16]}…")
+        derived = contract_digest(entry_contract_payload(
+            source, str(e.get("train_image_digest", "") or ""),
+            str(e.get("continuation_protocol", "") or "")))
+        if derived != str(e.get("training_contract_digest", "") or ""):
+            return _fail(name, f"{e.get('role')} uid{e.get('miner_uid')} "
+                               "training_contract_digest is not the era contract with its "
+                               f"published image/protocol (re-derives to {derived[:16]}…)")
     return _ok(name, f"every entry trained under the settlement's numerics {got[:16]}… "
-                     "(image pin excluded)" + notes)
+                     "and re-derives its full contract digest from its own image/protocol"
+                     + notes)
 
 
 def check_era(receipt: RoundReceipt, cfg: ChainConfig, client: object | None = None) -> CheckResult:
@@ -3474,6 +3485,7 @@ _REJECTION_CHECK_FOR_REASON = (
     ("contract_digest_mismatch", "contract-digest"),
     ("era_numerics_", "numerics-contract"),
     ("era_entry_numerics_", "numerics-contract"),
+    ("era_entry_contract_unproven", "numerics-contract"),
     ("base_arch_digest_mismatch", "base-arch-digest"),
 )
 

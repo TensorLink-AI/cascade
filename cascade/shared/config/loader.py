@@ -771,6 +771,16 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
     # DEC-CA-0067 automatic image repin: the *_after pins are one release for
     # the v2 contract; a measured-wall gate in force needs the after image's
     # measured walls too (else every post-switch rent would be refused).
+    _idb = int(cfg.v2.image_decoupled_from_block)
+    if _idb:
+        # a typed switch is an ERA START at or after the v2 go-live (a
+        # resolved one is checked the same way by the activation apply)
+        _idb_grid = _ebp if (_eab and _ebp and _idb < _eab) else _eb
+        if _idb % (max(1, _idb_grid) * max(1, _era_settlements)):
+            raise ValueError(f"[v2] image_decoupled_from_block={_idb} is not an era start")
+        if cfg.v2.from_block and _idb < int(cfg.v2.from_block):
+            raise ValueError(f"[v2] image_decoupled_from_block={_idb} precedes [v2] "
+                             f"from_block={cfg.v2.from_block}")
     if cfg.v2.train_image_digest_after:
         if cfg.training.v2_contract is None:
             raise ValueError("[v2] train_image_digest_after needs a [v2.training] contract")

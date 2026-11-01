@@ -274,6 +274,10 @@ worker_code_fingerprint_after = "5fe6ed7c0f0d5305b6101e589aab50b2ca5a76573cbc7af
 
 These values are rc16. The repo chain.toml ships them empty.
 
+**Owner rule.** Set an image as `*_after` only after a bit-identical
+qualification against the current image: weights and optimizer state, world
+size 1 and 8, and crash/resume. Record the qualification in OPSLOG first.
+
 What changes, and when:
 - Nothing changes until the vote resolves the switch (or a typed
   `image_decoupled_from_block`). Every pin, file and dispatch stays
@@ -291,9 +295,17 @@ What changes, and when:
   king is kept without editing `prior_train_image_digests`.
 - No trainer restart is needed at the switch.
 
+Lanes:
+- The lane pool hands each leg a lane on its era's image.
+- The provisioner health gate accepts either release.
+- A lane re-bootstrapped onto rc16 is picked up within 300 s (the fingerprint
+  cache TTL), and is re-measured before any refusal.
+- A refusal never trips the lane breaker.
+
 Gaps:
-- The provisioner's lane health gate still checks the current pins. Bring
-  post-switch lanes up on rc16 by hand, or update hosts.toml.
+- The provisioner still pins `CASCADE_TRAIN_IMAGE_DIGEST` on its pods from the
+  base `[training]` pin (pre-existing). Lanes for v2 legs should be rented pods
+  or hand-managed hosts.toml lanes.
 - An era-kept king pod is reused within one seed epoch. If the king must
   retrain after the switch, the hook refuses the old pod; retire it.
 - Continuation for post-switch legs only, in the same step, is a follow-up:

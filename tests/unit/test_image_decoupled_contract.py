@@ -124,7 +124,7 @@ def test_prove_numerics_digest_needs_the_leg_image():
 
 
 def test_knobs_ship_off_and_inert():
-    for path, after in (("chain.toml", 4000), ("chain.testnet.toml", 0)):
+    for path, after in (("chain.toml", 4000), ("chain.testnet.toml", 300)):
         cfg = load_chain_config(REPO / path)
         assert cfg.v2.image_decoupled_from_block == 0
         assert cfg.v2.eval_n_windows_after == after
@@ -160,6 +160,8 @@ def test_knobs_round_trip_through_the_loader(tmp_path):
 
 @pytest.mark.parametrize("key,value", [
     ("image_decoupled_from_block", "-1"), ("image_decoupled_from_block", "1.5"),
+    ("image_decoupled_from_block", "9403201"),           # not an era start
+    ("eval_n_windows_after", "50000"),                   # past the sane bound
     ("image_decoupled_from_block", "true"), ("eval_n_windows_after", '"4000"'),
     ("eval_n_windows_after", "-5"),
     ("prior_train_image_digests", '"sha256:x"'),
@@ -446,6 +448,10 @@ def test_trainer_active_keeps_an_image_only_stale_king_and_stamps(cfg, tmp_path)
     assert m.numerics_contract_digest == want
     assert [e.numerics_contract_digest for e in m.entries] == [want]
     assert m.entries[0].training_contract_digest == king.training_contract_digest  # provenance
+    assert (m.entries[0].train_image_digest, m.entries[0].continuation_protocol) == (OLD, "")
+    from cascade.shared.manifest import entry_contract_proven
+
+    assert entry_contract_proven(m.contract_body, m.entries[0])
     with pytest.raises(StorageError, match="refusing v2 manifest"):
         sched._build_manifest(era, _leg(contract, start, image=OLD, base_lr=1.0), [], "50000",
                               start, pin_block=start)
@@ -491,9 +497,17 @@ def _validator_setup(cfg, *, on: bool):
     return _runner(v2cfg), m, v2c, old_digest
 
 
-def _stamp(m, numerics, *, entry_numerics=None, digest=None):
+V2_IMAGE = load_chain_config(REPO / "chain.toml").training.v2_contract.train_image_digest
+
+
+def _stamp(m, numerics, *, entry_numerics=None, digest=None, image=None, protocol=""):
+    """Stamp the DEC-CA-0067 fields like the trainer: numerics + the leg's OWN
+    runtime terms (``image`` defaults to the era's pin, or OLD with an
+    old-image ``digest``)."""
+    img = image if image is not None else (OLD if digest else V2_IMAGE)
     entries = [replace(e, numerics_contract_digest=(numerics if entry_numerics is None
                                                     else entry_numerics),
+                       train_image_digest=img, continuation_protocol=protocol,
                        **({"training_contract_digest": digest} if digest else {}))
                for e in m.entries]
     return replace(m, entries=entries, numerics_contract_digest=numerics)
@@ -518,6 +532,14 @@ def test_validator_active_accepts_image_only_and_rejects_numerics_or_missing(cfg
         "era_entry_numerics_missing")
     assert r.check_manifest(m).startswith("era_numerics_missing")      # unstamped manifest
     assert r.check_manifest(_stamp(m, other)).startswith("era_numerics_mismatch")
+    # MAJOR: the per-leg digest is RE-DERIVED, never trusted
+    garbage = _stamp(m, n, digest="f" * 64, image=V2_IMAGE)
+    assert r.check_manifest(garbage).startswith("era_entry_contract_unproven")
+    lying = _stamp(m, n, digest=old, image=V2_IMAGE)          # wrong image for its digest
+    assert r.check_manifest(lying).startswith("era_entry_contract_unproven")
+    numerics_change = contract_digest(replace(v2c, train_image_digest=OLD, base_lr=1.0))
+    assert r.check_manifest(_stamp(m, n, digest=numerics_change)).startswith(
+        "era_entry_contract_unproven")
     bad_init = _stamp(m, n)
     bad_init = replace(bad_init, entries=[replace(e, init_pointer="x") for e in bad_init.entries])
     assert r.check_manifest(bad_init).startswith("era_entry_init_mismatch")
@@ -547,6 +569,8 @@ def test_audit_numerics_check(cfg):
     assert check_numerics_contract(_receipt(_stamp(m, num), block), on).status == "PASS"
     assert check_numerics_contract(_receipt(m, block), on).status == "FAIL"
     other = numerics_contract_digest(replace(v2c, base_lr=1.0))
+    assert check_numerics_contract(_receipt(_stamp(m, num, digest="f" * 64, image=V2_IMAGE),
+                                            block), on).status == "FAIL"
     assert check_numerics_contract(_receipt(_stamp(m, num, entry_numerics=other), block),
                                    on).status == "FAIL"
     # a recorded block the audit config does not carry fails
@@ -556,10 +580,14 @@ def test_audit_numerics_check(cfg):
 
 # ── the mainnet note fits (the typed forfeit / margin-v2 blocks) ─────────────
 
-# The live lock-ins (activation_*_state.json on the main validator, 2026-11-01).
-LIVE_ROLLOVER = (9133200, 9136800)
-LIVE_FORFEIT = ("forfeit-42b1a486", 9165600, 9166500)
-LIVE_MARGIN_V2 = ("margin-v2-d30eb443", 9190800, 9194400)
+# The live lock-ins: the main validator's activation_*_state.json records,
+# copied verbatim into a fixture (never re-typed constants).
+_LIVE = json.loads((REPO / "tests" / "fixtures" /
+                    "mainnet_activation_state_20261101.json").read_text())
+LIVE_ROLLOVER = (_LIVE["rollover"]["lock_block"], _LIVE["rollover"]["activation_block"])
+LIVE_FORFEIT = tuple(_LIVE["forfeit"][k] for k in ("feature", "lock_block", "activation_block"))
+LIVE_MARGIN_V2 = tuple(_LIVE["margin_v2"][k]
+                       for k in ("feature", "lock_block", "activation_block"))
 
 
 def test_typed_blocks_equal_the_resolved_ones_and_leave_the_note():
@@ -610,3 +638,29 @@ def test_mainnet_note_carries_v2b_within_the_field(rollover_typed):
         assert ":prelaunch-95-r2:0:0:" in note                 # left alone
         assert note.endswith(":" + tail)
         assert len(note.encode("utf-8")) <= A.NOTE_MAX_BYTES - 24   # room to spare
+
+
+def test_note_with_a_locked_cfg_segment_and_the_v2b_type_rule():
+    """The DEC-CA-0057 ``cfg-`` overlay segment rides last. With 7-digit
+    blocks a locked cfg- and a locked v2b both fit; past block 10,000,000
+    (8 digits) the locked v2b is trimmed — the rule: once v2b is DECIDED,
+    type its block into chain.toml (behaviour-identical) and its segment
+    leaves the note."""
+    cfg = load_chain_config(REPO / "chain.toml")
+    v2b = A.image_decoupled_feature(cfg).name
+    for digits, fits in ((7, True), (8, False)):
+        low = 10 ** (digits - 1)
+        primary = A.ActivationRecord(feature=A.primary_feature(cfg).name, lock_block=low + 1,
+                                     activation_block=low + 2, source="signals")
+        locked = A.ActivationRecord(feature=v2b, lock_block=low + 3, activation_block=low + 4,
+                                    source="tally")
+        seg = A.ReadySignal("cfg-1234abcd", low + 5, low + 6)
+        note = A.own_signal_payload(cfg, primary, None, None, A.ActivationRecord(), seg, None,
+                                    locked)
+        assert len(note.encode()) <= A.NOTE_MAX_BYTES
+        assert note.endswith(f":cfg-1234abcd:{low + 5}:{low + 6}")       # cfg- outranks
+        assert (f"{v2b}:{low + 3}:{low + 4}" in note) is fits
+        typed = replace(cfg, v2=replace(cfg.v2, image_decoupled_from_block=9403200))
+        note = A.own_signal_payload(typed, primary, None, None, A.ActivationRecord(), seg, None,
+                                    locked)
+        assert v2b not in note and len(note.encode()) <= A.NOTE_MAX_BYTES

@@ -634,8 +634,10 @@ king_ladder = false
 image_decoupled_from_block = 0
 # Bundled with the same block (part of the vote's hash): the v2 private
 # verdict budget becomes this many windows. Inert until the switch. Testnet
-# keeps its small budget (DEC-CA-0066): 0 = no change.
-eval_n_windows_after = 0
+# keeps its small budget (DEC-CA-0066: = [eval] n_windows) but carries a
+# non-zero value so the vote's feature hash and the explicit verdict draw are
+# rehearsed exactly as on mainnet.
+eval_n_windows_after = 300
 # TRAINER-ONLY provenance (not consensus, not in the vote): earlier
 # v2.training train_image_digest pins, exactly as once typed, so the trainer
 # can PROVE a pre-repin leg differs only in its image. Append the old pin here
