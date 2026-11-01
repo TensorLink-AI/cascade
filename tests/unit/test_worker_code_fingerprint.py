@@ -170,12 +170,11 @@ def test_other_rejections_and_infra_exits_are_unchanged():
 # ── funded rent path: a stale pod never receives a leg ──────────────────────
 
 def test_stale_funded_pod_is_released_and_the_leg_rents_again(tmp_path, monkeypatch):
-    from cascade.provision import funded as funded_mod
-    from tests.unit.test_funded_pod_wiring import _challenger, _rent_ok, _runner, _vault
-
     from dataclasses import replace
 
+    from cascade.provision import funded as funded_mod
     from cascade.provision.core import PodAddress
+    from tests.unit.test_funded_pod_wiring import _challenger, _rent_ok, _runner, _vault
 
     runner = _runner(tmp_path)
     _vault(tmp_path, "hkA")

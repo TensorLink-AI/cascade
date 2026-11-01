@@ -197,10 +197,9 @@ def test_repeated_slow_pods_settle_infra_without_a_burn(tmp_path, monkeypatch):
 def test_stale_image_still_wins_over_the_floor(tmp_path, monkeypatch):
     """A stale pod is rejected for its image (host quarantined) and never
     benched — the fingerprint verdict stays the first word."""
-    from cascade.provision import funded as funded_mod
-
     from dataclasses import replace
 
+    from cascade.provision import funded as funded_mod
     from cascade.provision.core import PodAddress, quarantined_hosts
 
     runner = _runner(tmp_path, funded_host_bench_floor=FLOOR)
