@@ -158,12 +158,55 @@ or `[v2.training]` and are not part of `contract_digest`. The pyramid recipe
 check still requires the contract's own `power_ema_sigma_rels` to be empty. A
 change ships as a new worker image at an era boundary.
 
+**Activation:** the EMA activates at the first warm-start seed epoch after the
+image ships. The trainer decides it from the leg's init only, never from
+wall-clock time, the image or the role (`power_ema_active`). Every era of a
+seed epoch shares one init (DEC-CA-0055), so the king's retrain and every
+challenger in an epoch get the same decision:
+
+- A random-init leg (the first v2 seed epoch) scores the raw endpoint. Its
+  `weights.safetensors` and every other pre-existing file are byte-identical to
+  what the trainer produced before this feature.
+- A king or challenger leg (heat or full) that trains from a warm-start init, the
+  seed epoch's promoted `warm_start_ckpt`, is EMA-scored.
+- A lane-B expert leg fine-tunes from a king checkpoint and follows that king.
+  It is EMA-scored only when the king was, which means the king's seed epoch
+  began at a promotion. An EMA-scored checkpoint records this as a
+  `power_ema` key in `config.json`; validators read only `moe`. A raw leg's
+  `config.json` has no such key.
+
+A resumed leg reaches the same decision from the same init. A snapshot made
+under the other decision is refused.
+
+**Shadow files:** both averages are computed on every leg. They are comparison
+data and are never scored. Validators and the eval loader read only
+`weights.safetensors`. The extra files use the same safetensors format and keys
+as `weights.safetensors`:
+
+| Leg | `weights.safetensors` | Extra files |
+|---|---|---|
+| Gate off (shadow: random init, or an expert on a raw king) | raw endpoint | `weights_ema005.safetensors`, `weights_ema010.safetensors` |
+| Gate on (scored) | `sigma_rel = 0.10` average | `weights_raw.safetensors` (raw endpoint), `weights_ema005.safetensors` |
+
+The extras are written through `save_tensors_hashed`, so the worker's receipt
+`tensor_digests` lists them. The harvest checks then verify them like
+`weights_stable` and `optimizer`. Each extra adds one weights-sized file to the
+pod's checkpoint, about 4.9 GB at 1.23B.
+
+The extras are **operator analysis data and are never published**.
+`hippius.UNPUBLISHED_PATTERNS` (`weights_ema*.safetensors`,
+`weights_raw.safetensors`) is passed as `ignore_patterns` to every registry
+push, so the published checkpoint has exactly the pre-shadow file set. It is
+also passed to every registry pull, so a stray published copy never lands on a
+validator box. The audit re-derivation compares only the published tensor set.
+
 Every leg starts its own average. A warm-started leg resumes the raw
 `weights_stable.safetensors` + `optimizer.safetensors` lineage, which the EMA
 never changes, and does not inherit an average. An expert leg averages only its
 selected rows; frozen bytes stay the king's. Continuation snapshots carry the
-raw model and every EMA state, a resumed leg restores them bitwise, and a
-snapshot without EMA state is refused.
+raw model, every EMA state and the scoring decision. A resumed leg restores
+them bitwise. A snapshot without EMA state is refused, and so is one made under
+the other decision.
 
 Memory: the EMAs are fp32 parameter copies held on rank 0 only (helper ranks
 are untouched), so rank 0 needs about 8 bytes × parameters extra. That is about

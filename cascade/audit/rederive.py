@@ -92,12 +92,12 @@ def _fetch_generator(gen_ref: str, dest: Path, cfg: ChainConfig) -> Path:
         # No credentials in the environment — try an anonymous snapshot pull.
         from hippius_hub import snapshot_download  # type: ignore
 
-        from ..shared.hippius import ALLOW_PATTERNS, HubRef
+        from ..shared.hippius import ALLOW_PATTERNS, UNPUBLISHED_PATTERNS, HubRef
 
         ref = HubRef.parse(gen_ref)
         return Path(snapshot_download(
             repo_id=ref.repo, revision=ref.digest, local_dir=str(dest),
-            allow_patterns=ALLOW_PATTERNS, token=None,
+            allow_patterns=ALLOW_PATTERNS, ignore_patterns=UNPUBLISHED_PATTERNS, token=None,
         ))
 
 
@@ -399,8 +399,14 @@ def run_tier2(
         exact_ok = image_matched and entry.gpu_name and entry.gpu_name == local_gpu
         if exact_ok:
             ours, theirs = _dir_file_digests(out_dir), _dir_file_digests(published_dir)
-            weights_ours = {k: v for k, v in ours.items() if k.endswith(".safetensors")}
-            weights_theirs = {k: v for k, v in theirs.items() if k.endswith(".safetensors")}
+            # the power-EMA comparison files are never published — compare
+            # the published tensor set only
+            from ..shared.hippius import unpublished_file
+
+            weights_ours = {k: v for k, v in ours.items()
+                            if k.endswith(".safetensors") and not unpublished_file(k)}
+            weights_theirs = {k: v for k, v in theirs.items()
+                              if k.endswith(".safetensors") and not unpublished_file(k)}
             if weights_ours == weights_theirs and weights_ours:
                 results.append(CheckResult(name, PASS,
                                            "checkpoint re-trains byte-identically "

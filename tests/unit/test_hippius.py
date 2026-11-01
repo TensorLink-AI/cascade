@@ -80,7 +80,7 @@ def _fake_hub(monkeypatch, downloader):
 def test_fetch_from_hub_is_atomic_reused_and_marked_complete(tmp_path, monkeypatch):
     calls = {"n": 0}
 
-    def dl(*, repo_id, revision, local_dir, allow_patterns, token):
+    def dl(*, repo_id, revision, local_dir, allow_patterns, token, ignore_patterns=None):
         calls["n"] += 1
         p = Path(local_dir)
         p.mkdir(parents=True, exist_ok=True)
@@ -101,7 +101,7 @@ def test_fetch_from_hub_is_atomic_reused_and_marked_complete(tmp_path, monkeypat
 
 
 def test_fetch_from_hub_replaces_unmarked_partial_dir(tmp_path, monkeypatch):
-    def dl(*, repo_id, revision, local_dir, allow_patterns, token):
+    def dl(*, repo_id, revision, local_dir, allow_patterns, token, ignore_patterns=None):
         p = Path(local_dir)
         p.mkdir(parents=True, exist_ok=True)
         (p / "config.json").write_text("{}")
@@ -118,7 +118,7 @@ def test_fetch_from_hub_replaces_unmarked_partial_dir(tmp_path, monkeypatch):
 def test_fetch_from_hub_yields_to_sibling_completed_snapshot(tmp_path, monkeypatch):
     dest = tmp_path / "sha256-b"
 
-    def dl(*, repo_id, revision, local_dir, allow_patterns, token):
+    def dl(*, repo_id, revision, local_dir, allow_patterns, token, ignore_patterns=None):
         p = Path(local_dir)
         p.mkdir(parents=True, exist_ok=True)
         (p / "ours.bin").write_bytes(b"x")
@@ -302,3 +302,69 @@ def test_pull_token_prefers_real_credentials(monkeypatch, tmp_path):
     monkeypatch.setenv(hippius.HUB_TOKEN_ENV_NAMES[0], "tok-123")
     monkeypatch.setattr(hippius, "HUB_TOKEN_PATH", tmp_path / "absent-token")
     assert hippius._resolve_hub_token_for_pull("Downloading x/y@sha256:z") == "tok-123"
+
+
+# ── power-EMA comparison files are never published nor fetched ───────────────
+
+_SHADOW = ("weights_ema005.safetensors", "weights_ema010.safetensors", "weights_raw.safetensors")
+_PUBLISHED = ("config.json", "model.py", "forecast_wrapper.py", "weights.safetensors",
+              "weights_stable.safetensors", "optimizer.safetensors")
+
+
+def _filtered(names, allow_patterns, ignore_patterns):
+    """The HF ``filter_repo_objects`` semantics both hubs apply."""
+    import fnmatch
+
+    return sorted(n for n in names
+                  if any(fnmatch.fnmatch(n, p) for p in allow_patterns)
+                  and not any(fnmatch.fnmatch(n, p) for p in (ignore_patterns or [])))
+
+
+def test_unpublished_file_names():
+    for name in _SHADOW:
+        assert hippius.unpublished_file(name)
+    for name in _PUBLISHED + ("power_ema.safetensors", "ema_0.05.safetensors"):
+        assert not hippius.unpublished_file(name)
+
+
+def test_checkpoint_push_publishes_exactly_the_pre_shadow_file_set(tmp_path, monkeypatch):
+    """The published checkpoint is byte-for-byte main's file set: the shadow
+    files never reach the registry, and the reported size excludes them."""
+    import sys
+    import types
+
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    for name in _PUBLISHED + _SHADOW + (".train_complete",):
+        (ckpt / name).write_bytes(name.encode())
+    seen = {}
+
+    def upload_folder(*, repo_id, folder_path, allow_patterns, ignore_patterns, token):
+        names = [p.name for p in Path(folder_path).iterdir()]
+        seen["files"] = _filtered(names, allow_patterns, ignore_patterns)
+        return types.SimpleNamespace(oid="sha256:" + "c" * 64)
+
+    mod = types.ModuleType("hippius_hub")
+    mod.upload_folder = upload_folder
+    monkeypatch.setitem(sys.modules, "hippius_hub", mod)
+    monkeypatch.setattr(hippius, "_resolve_hub_token", lambda _msg: "tok")
+    up = hippius.upload_dir_to_hub(ckpt, "cascade/ckpt-test")
+    assert seen["files"] == sorted(_PUBLISHED)
+    assert up.size_bytes == sum(len(n.encode()) for n in _PUBLISHED + (".train_complete",))
+
+
+def test_checkpoint_fetch_skips_shadow_files(tmp_path, monkeypatch):
+    """Defensive: even a stray published shadow file never lands on a
+    validator box (the fetch passes the deny patterns)."""
+    served = _PUBLISHED + _SHADOW
+
+    def dl(*, repo_id, revision, local_dir, allow_patterns, token, ignore_patterns=None):
+        p = Path(local_dir)
+        p.mkdir(parents=True, exist_ok=True)
+        for name in _filtered(served, allow_patterns, ignore_patterns):
+            (p / name).write_bytes(b"x")
+
+    _fake_hub(monkeypatch, dl)
+    dest = hippius.fetch_from_hub(_FETCH_REF, tmp_path / "snap")
+    got = sorted(p.name for p in dest.iterdir() if p.name != hippius.FETCH_COMPLETE_MARKER)
+    assert got == sorted(_PUBLISHED)
