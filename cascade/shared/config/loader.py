@@ -447,6 +447,9 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
                 "funded_max_price_per_hour", r.get("funded_max_price_per_hour", 1.5)),
             funded_max_leg_cost_usd=validate_funded_price_cap(
                 "funded_max_leg_cost_usd", r.get("funded_max_leg_cost_usd", 1.6)),
+            operator_max_price_per_hour=(None if r.get("operator_max_price_per_hour") is None
+                                         else validate_funded_price_cap(
+                "operator_max_price_per_hour", r.get("operator_max_price_per_hour"))),
             funded_sku_wall_seconds=(validate_funded_sku_wall_seconds(
                 r["funded_sku_wall_seconds"]) if "funded_sku_wall_seconds" in r
                 else RoundConfig.funded_sku_wall_seconds),
@@ -491,6 +494,10 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
             funded_operator_fallback=bool(r.get("funded_operator_fallback", False)),
             funded_operator_fallback_fresh_window_seconds=max(
                 0, int(r.get("funded_operator_fallback_fresh_window_seconds", 3600))),
+            operator_lanes_operator_billed_only=bool(
+                r.get("operator_lanes_operator_billed_only", False)),
+            operator_billed_retry_seconds=validate_nonneg_seconds(
+                "operator_billed_retry_seconds", r.get("operator_billed_retry_seconds", 60)),
             funded_require_tensor_digests=bool(r.get("funded_require_tensor_digests", False)),
             submission_vault_dir=str(r.get("submission_vault_dir", "")),
             champion_publish=validate_champion_publish(

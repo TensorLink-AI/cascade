@@ -625,3 +625,67 @@ def test_lane_b_converts_a_breaker_victim_to_no_capacity():
     f = lane_breaker_failure(victim)["failure"]
     assert (f.miner_fault, f.error_class, f.burn) == (False, "no_capacity", False)
     assert "LANE BREAKER" in f.msg
+
+
+# ── D x hosts-file sync (#402): breaker state per lane name across re-gates ──
+
+def _rh(name, port=22, host="104.218.237.44"):
+    return RemoteHost(name=name, host=host, port=port, user="root", workdir="/root/cascade")
+
+
+def _synced_pool(file_hosts: list, threshold: int = 2, gate_fn=None):
+    return _FinalLanePool(list(file_hosts), lambda: list(file_hosts), gate_fn=gate_fn,
+                          sync_from_file=True, breaker_threshold=threshold)
+
+
+def test_breaker_counts_are_per_lane_name():
+    a, b = _rh("lane-a"), _rh("lane-b", port=23)
+    pool = _synced_pool([a, b])
+    assert pool.record_leg_outcome(a, "L1", ok=False) is False
+    assert pool.record_leg_outcome(b, "L2", ok=False) is False    # b's own count
+    assert pool._lane_failures == {"lane-a": ["L1"], "lane-b": ["L2"]}
+    assert pool.record_leg_outcome(b, "L3", ok=False) is True     # b trips, a untouched
+    assert [h.name for h in pool.known_hosts()] == ["lane-a"]
+    assert pool._lane_failures == {"lane-a": ["L1"]}
+
+
+def test_unchanged_file_keeps_the_count_an_edit_regates_with_a_fresh_one():
+    a = _rh("lane-a")
+    file_hosts = [a]
+    pool = _synced_pool(file_hosts)
+    pool.record_leg_outcome(a, "L1", ok=False)
+    pool._absorb_new()                                            # same entry: count kept
+    assert pool._lane_failures == {"lane-a": ["L1"]}
+    file_hosts[:] = [_rh("lane-a", port=2222)]                    # the operator edits the lane
+    pool._absorb_new()                                            # re-gated, fresh host object
+    assert [h.port for h in pool.known_hosts()] == [2222]
+    assert pool._lane_failures == {}                              # fresh count
+    edited = pool.known_hosts()[0]
+    assert pool.record_leg_outcome(edited, "L2", ok=False) is False   # 1 of 2: no trip
+
+
+def test_a_tripped_lane_stays_held_until_its_entry_is_edited():
+    file_hosts = [_rh("lane-a")]
+    pool = _synced_pool(file_hosts, threshold=1)
+    assert pool.record_leg_outcome(file_hosts[0], "L1", ok=False) is True
+    assert pool.known_hosts() == []
+    file_hosts[:] = [_rh("lane-a")]                               # equal entry, new object
+    pool._absorb_new()
+    assert pool.known_hosts() == []                               # still held (6 h)
+    file_hosts[:] = [_rh("lane-a", port=2222)]                    # the operator fixed it
+    pool._absorb_new()
+    assert [h.port for h in pool.known_hosts()] == [2222]         # re-joined through the gate
+    assert pool._breaker_held == {} and pool._lane_failures == {}
+    assert pool.get(block=False).port == 2222
+
+
+def test_an_edited_tripped_lane_still_faces_the_gate():
+    file_hosts = [_rh("lane-a")]
+    verdict = {"lane-a": "ssh rc=255: refused"}
+    pool = _synced_pool(file_hosts, threshold=1, gate_fn=lambda h: verdict.get(h.name))
+    pool.record_leg_outcome(file_hosts[0], "L1", ok=False)
+    file_hosts[:] = [_rh("lane-a", port=2222)]
+    pool._absorb_new()
+    assert pool.known_hosts() == []                               # hold released, gate refused
+    left = pool._rejected["lane-a"] - __import__("time").time()
+    assert 0 < left <= pool.REJECT_RETRY_S + 1                    # the normal re-gate, not 6 h

@@ -47,7 +47,9 @@ def funded_queue_of(runner, *, lane="a"):
         queue_type, path = LaneCQueue, lane_c_queue_path(path)
     else:
         raise ValueError(f"unknown funding lane: {lane}")
-    return queue_type(path, entry_ttl_seconds=runner.cfg.round.funded_entry_ttl_hours * 3600.0)
+    return queue_type(path, entry_ttl_seconds=runner.cfg.round.funded_entry_ttl_hours * 3600.0,
+                      operator_billed_retry_seconds=float(getattr(
+                          runner.cfg.round, "operator_billed_retry_seconds", 60) or 0))
 
 
 def _load_burns(path: Path) -> dict[str, int]:
