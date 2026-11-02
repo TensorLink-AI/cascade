@@ -469,3 +469,74 @@ def test_tier1_rederives_with_the_legs_own_protocol(tmp_path, monkeypatch):
     out = R.run_tier1(receipt, cfg, workdir=tmp_path, full_stream=True, corpus_root=root)
     assert out[0].status == "PASS", out
     assert seen.get("continuation_protocol") == "cascade-continuation/1"
+
+
+# ── review 2: transport vs image, billing ────────────────────────────────────
+
+
+@pytest.mark.parametrize("mode", ["rc255", "timeout"])
+def test_unreachable_pod_during_the_probe_is_a_transport_failure(monkeypatch, mode):
+    import subprocess
+
+    from cascade.trainer import leg_pins
+    from cascade.trainer.faults import _transport_failure
+    from cascade.trainer.remote import RemoteDispatchError
+
+    def fake_ssh(argv, timeout, stdin_text=None):
+        if mode == "timeout":
+            raise subprocess.TimeoutExpired(argv, timeout)
+        return subprocess.CompletedProcess(argv, 255, "", "ssh: connect: Connection timed out")
+
+    monkeypatch.setattr("cascade.trainer.remote.run_ssh", fake_ssh)
+    monkeypatch.setattr("cascade.trainer.remote.build_ssh_argv", lambda h, cmd: ["ssh", cmd])
+    leg_pins._FINGERPRINTS.clear()
+    with pytest.raises(RemoteDispatchError) as ei:
+        leg_pins.host_code_fingerprint(_LaneHost("lane", "10.0.0.7"))
+    assert ei.value.returncode == 255 and _transport_failure(ei.value)
+    assert not isinstance(ei.value, leg_pins.LegImageMismatch)
+
+
+def test_a_reachable_pod_without_the_package_is_an_image_mismatch(monkeypatch):
+    import subprocess
+
+    from cascade.trainer import leg_pins
+
+    monkeypatch.setattr("cascade.trainer.remote.run_ssh",
+                        lambda argv, timeout, stdin_text=None:
+                        subprocess.CompletedProcess(argv, 1, "", "find: no such dir"))
+    monkeypatch.setattr("cascade.trainer.remote.build_ssh_argv", lambda h, cmd: ["ssh", cmd])
+    leg_pins._FINGERPRINTS.clear()
+    with pytest.raises(leg_pins.LegImageMismatch):
+        leg_pins.host_code_fingerprint(_LaneHost("lane", "10.0.0.8"))
+
+
+def test_unreachable_lane_does_not_match_and_the_dispatch_drains_it(acfg, tmp_path):
+    from cascade.trainer.leg_pins import dispatch_host_hook
+    from cascade.trainer.remote import RemoteDispatchError
+
+    armed = A.apply_image_decoupled_activation(acfg, SW)
+
+    def fp(host, fresh=False):
+        raise RemoteDispatchError("pod unreachable", returncode=255)
+
+    runner = SimpleNamespace(cfg=armed, deployed_chain_toml=None, work_root=tmp_path)
+    hook = dispatch_host_hook(runner, fingerprint_fn=fp)
+    host = _LaneHost("lane", "10.0.0.9")
+    assert hook.matches(host, SW) is False
+    with pytest.raises(RemoteDispatchError):
+        hook(host, SW)
+
+
+def test_image_refusal_never_moves_a_payer_legs_billing():
+    from cascade.trainer.faults import _OperatorFault
+    from cascade.trainer.leg_pins import ImageAfterUnqualified, LegImageMismatch
+    from cascade.trainer.runner_funded_legs import bill_operator_after_fault
+
+    flips = []
+    q = SimpleNamespace(set_operator_billed=lambda hk, flag: flips.append((hk, flag)))
+    runner = SimpleNamespace(_funded_queue=lambda: q)
+    assert not bill_operator_after_fault(runner, "hk", LegImageMismatch("other image"))
+    assert not bill_operator_after_fault(runner, "hk", ImageAfterUnqualified("no record"))
+    assert flips == []
+    assert bill_operator_after_fault(runner, "hk", _OperatorFault("upload lost"))
+    assert flips == [("hk", True)]

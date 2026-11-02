@@ -187,10 +187,15 @@ class _FundedLegMixin:
                                 domain=domain, expert_selection=expert_selection)
                         report_progress(self, "awaiting_settlement")
                         return entry
-                    except Exception:
+                    except Exception as exc:
+                        from .leg_pins import LegImageMismatch
+
                         verdict = self._funded_leg_failures.get(gen.hotkey)
                         local = self.__dict__["_leg_local_obj"]
-                        if local.funded_allocated and (verdict is None or not verdict[1]):
+                        # DEC-CA-0067: an image refusal never moves the bill
+                        # (only make-goods train on the operator account)
+                        if (local.funded_allocated and not isinstance(exc, LegImageMismatch)
+                                and (verdict is None or not verdict[1])):
                             queue = self._funded_queue()
                             if queue is not None:
                                 queue.set_operator_billed(gen.hotkey, True)
@@ -478,9 +483,7 @@ class _FundedLegMixin:
             self._record_funded_failure(gen.hotkey, f"operator-side fault: {e}",
                                         miner_fault=False, error_class=OPERATOR_FAULT_CLASS,
                                         burn=False)
-            queue = self._funded_queue()
-            if queue is not None:
-                queue.set_operator_billed(gen.hotkey, True)
+            bill_operator_after_fault(self, gen.hotkey, e)
             raise
         except _FundedDiverged as e:
             # The same verdict the worker's own rc=3 gives a non-finite loss
@@ -716,3 +719,21 @@ def _funded_pod_benched_here(runner, bench: bool) -> bool:
     if getattr(local, "funded_is_king", False):
         return False
     return not bool(getattr(local, "validator_bench", False))
+
+
+def bill_operator_after_fault(runner, hotkey: str, exc: BaseException) -> bool:
+    """After an operator-side fault the leg's retry is operator-billed —
+    EXCEPT a DEC-CA-0067 image refusal (``LegImageMismatch``: the pod runs
+    another image than the leg's era pins, or the after release is not
+    qualified): the billing is left as it was (owner rule: only make-goods
+    train on the operator account; a payer-billed leg stays payer-billed, a
+    make-good stays one). Returns whether it flipped the billing."""
+    from .leg_pins import LegImageMismatch
+
+    if isinstance(exc, LegImageMismatch):
+        return False
+    queue = runner._funded_queue()
+    if queue is None:
+        return False
+    queue.set_operator_billed(hotkey, True)
+    return True

@@ -246,11 +246,30 @@ def host_code_fingerprint(host, *, fresh: bool = False, clock=None) -> str:
         if hit is not None and not fresh and now - hit[1] < FINGERPRINT_TTL_SECONDS:
             return hit[0]
 
+    import subprocess
+
+    from .remote import RemoteDispatchError
+
+    transport: list[str] = []
+
     def _run(argv):
-        return run_ssh(build_ssh_argv(host, shlex.join(list(argv))),
-                       timeout=CHECK_TIMEOUT_SECONDS)
+        try:
+            proc = run_ssh(build_ssh_argv(host, shlex.join(list(argv))),
+                           timeout=CHECK_TIMEOUT_SECONDS)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            transport.append(f"{type(e).__name__}: {e}")
+            return subprocess.CompletedProcess(argv, 255, "", str(e))
+        if getattr(proc, "returncode", 0) == 255:
+            transport.append((getattr(proc, "stderr", "") or "ssh exit 255")[-200:])
+        return proc
 
     got, _n, err = remote_code_fingerprint(_run, workdir=host.workdir)
+    if err and transport:
+        # the POD is unreachable, not on another image: the dispatcher's
+        # transport path drains it (mark_dead), never an image refusal
+        raise RemoteDispatchError(
+            f"pod unreachable during the code fingerprint probe of "
+            f"{getattr(host, 'name', host)}: {transport[-1]}", returncode=255)
     if err:
         raise LegImageMismatch(
             f"code fingerprint unavailable on {getattr(host, 'name', host)}: {err}")
@@ -292,11 +311,13 @@ class _HostHook:
         want = self._want(block)
         if not want:
             return True
+        from .remote import RemoteDispatchError
+
         try:
             return (self._fingerprint(host) == want
                     or self._fingerprint(host, fresh=True) == want)
-        except LegImageMismatch:
-            return False
+        except (LegImageMismatch, RemoteDispatchError):
+            return False          # unprovable / unreachable: not this leg's lane
 
     def __call__(self, host, block):
         cfg = self.runner.cfg
