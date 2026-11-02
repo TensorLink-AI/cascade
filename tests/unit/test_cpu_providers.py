@@ -241,6 +241,44 @@ def test_shadeform_cpu_offer_prefers_gpuless():
     assert (first["shade_instance_type"], first["price_usd_hr"]) == ("cpu-box", 1.0)
 
 
+def test_shadeform_cpu_offer_one_per_region():
+    t = _st("cpu_32", 32, 102, gpus=0, cloud="latitude")
+    t["availability"] = [
+        {"region": "dallas-usa-1", "available": True, "rental_type": "on_demand"},
+        {"region": "ashburn-usa-7", "available": True, "rental_type": "on_demand"},
+        {"region": "gone-1", "available": False, "rental_type": "on_demand"},
+        {"region": "spot-1", "available": True, "rental_type": "spot"},
+        {"region": "dallas-usa-1", "available": True, "rental_type": "on_demand"},
+        {"region": "LON", "available": True},
+    ]
+    offers = pick_shadeform_cpu_offer({"instance_types": [t]}, 32, 1.25)
+    assert [o["region"] for o in offers] == ["dallas-usa-1", "ashburn-usa-7", "LON"]
+    assert {o["shade_instance_type"] for o in offers} == {"cpu_32"}
+
+
+def test_shadeform_quarantined_region_falls_through_to_next():
+    """The 2026-11-02 failure: one dead region must not block the type."""
+    t = _st("cpu_32", 32, 102, gpus=0, cloud="latitude")
+    t["availability"] = [{"region": "dallas-usa-1", "available": True, "rental_type": "on_demand"},
+                         {"region": "ashburn-usa-7", "available": True,
+                          "rental_type": "on_demand"}]
+    sess = _Session({("get", "/instances/types"): _Resp({"instance_types": [t]})})
+    p = ShadeformCpuProvider(_session=sess, ssh_key_id="k")
+    pick = select_cpu_offer([p], GenerationConfig(providers=("shadeform",), vcpus=32,
+                                                  max_price_per_hour=1.25),
+                            exclude=lambda _p, o: o.region == "dallas-usa-1")
+    assert pick is not None and (pick[1].cloud, pick[1].region) == ("latitude", "ashburn-usa-7")
+
+
+def test_shadeform_cpu_offer_primary_regions_before_spares():
+    a = _st("a", 32, 100, gpus=0)
+    a["availability"] = [{"region": "a1", "available": True}, {"region": "a2", "available": True}]
+    b = _st("b", 32, 100, gpus=0)
+    b["availability"] = [{"region": "b1", "available": True}]
+    offers = pick_shadeform_cpu_offer({"instance_types": [a, b]}, 32, 2.0)
+    assert [o["region"] for o in offers] == ["a1", "b1", "a2"]
+
+
 def test_shadeform_cpu_provider_launch_docker_needs_image():
     sess = _Session({("get", "/instances/types"): _Resp({"instance_types": [_st("x", 32, 90)]}),
                      ("post", "/instances/create"): _Resp({"id": "sf-1"})})
