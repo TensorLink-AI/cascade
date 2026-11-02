@@ -235,14 +235,43 @@ on that value. An image-only re-pin then keeps the king entry and pointer and
 the finished legs. A numerics change still retrains. The pod still refuses a
 FINAL whose runtime image differs from the pin.
 
-**Every deployed chain.toml must carry the release values** before this
-release starts: `[v2] eval_n_windows_after = 4000`,
+**Deploying this release: the chain.toml values first.** Every deployed
+chain.toml must carry `[v2] eval_n_windows_after = 4000`,
 `[v2] image_decoupled_feature = "v2b-150ec0d0"`, and the typed
 `[scoring] forfeit_from_block = 9166500` / `margin_v2_from_block = 9194400`.
 The feature name hashes `eval_n_windows_after`, so a file without it would
-vote on `v2b-6bbd262b` and fork from the fleet; the loader refuses to start
-(trainer, validator, audit) when the pinned name is missing or differs from
-the computed one.
+vote on `v2b-6bbd262b` and fork from the fleet.
+
+What refuses and what keeps running on a file without them:
+- **Refuse to start:** `cascade-validator`, `cascade-trainer`, `cascade-audit`
+  (the processes that vote on or act on the vote; their `main` sets the
+  loader's vote-pin guard). The validator also refuses to start when its own
+  note would trim the `v2b-` segment, which is what happens with the pins but
+  without the typed `[scoring]` blocks.
+- **Keep running, ERROR logged:** train workers on pods
+  (`cascade-train-worker`, the pod-side snippets), the miner CLI (`cascade`),
+  `cascade-intake` (funding), `cascade-provisioner`, `cascade-satellite`,
+  `cascade-pool`, `cascade-generate`.
+
+Steps (Approve-tier; snapshot each file first):
+1. Hand-edit every deployed chain.toml (trainer box `/root/cascade/chain.toml`,
+   the main validator's, any satellite / intake copy): add the two `[v2]` keys
+   and type the two `[scoring]` blocks.
+2. Validate THAT exact file with the release loader before restarting
+   anything, as the voting processes will:
+
+   ```bash
+   PYTHONPATH=<release checkout> <venv>/bin/python -c "
+   from cascade.shared.config.loader import load_chain_config, require_vote_pin
+   from cascade.shared.activation import image_decoupled_feature
+   require_vote_pin(); c = load_chain_config('<deployed chain.toml>')
+   print(image_decoupled_feature(c))"
+   ```
+
+   It must print `v2b-150ec0d0` and raise nothing.
+3. Only then restart, one service at a time (validator, trainer, audit,
+   intake, provisioner, satellite), and check each log for the startup line
+   and no `image_decoupled_feature` ERROR.
 
 How it activates: validators on the release signal `v2b-<hash>` at startup. At
 the first settlement boundary where `[activation] threshold` of eligible stake
@@ -341,18 +370,33 @@ Lanes:
 - A refusal never trips the lane breaker.
 
 Lane and pod behaviour once armed:
-- A leg waiting for a lane on its era's image never holds a lane of the other
-  image: the lane pool hands out only a matching lane and leaves the rest idle
-  for the other era's legs.
-- An ssh failure during the worker-code probe is a transport failure (the pod
-  is drained like any unreachable pod), not an image mismatch.
-- A funded leg refused for its image keeps its billing: a payer-billed leg is
-  never moved to the operator account (only make-goods train there).
+- Lane matching acts only on legs of eras under the RESOLVED switch. A
+  pre-switch leg, and every leg while the vote is unresolved, is handed lanes
+  and dispatched exactly as without the repin (no probe; the worker's own
+  FINAL image check still guards it).
+- A post-switch leg takes only a lane whose worker code AND runtime image
+  identity (`CASCADE_TRAIN_IMAGE_DIGEST`, what the worker checks) are the
+  after release; other lanes stay idle for the other era's legs. A lane seen
+  on another release is re-probed at most once a minute.
+- An ssh failure while probing a lane makes it "unknown": the leg waits and
+  retries; it is never told "no lane on this image". An ssh failure at
+  dispatch is a transport failure (the pod is drained like any unreachable
+  pod), not an image mismatch.
+- Never the wrong image (owner rule 2026-11-02): a pod or lane whose runtime
+  image is not the leg's pin — seen by the dispatch hook, by the worker's FINAL
+  refusal (rc 2, before any corpus streaming or training), or by the rent-time
+  code check — is released at once, its host and executor are marked bad for
+  24 h (a lane leaves the rotation), and the leg retries unburned on the same
+  billing. At most 2 such pods per leg per hour; then the leg waits
+  (`no_capacity`), so a miner is never billed repeatedly for our image skew.
 - MarketCast legs of a post-switch era carry the era's `--contract-block`, so
   they get the image check and the after-image config. Direct-MoE gangs
   (`cascade/direct`) rent their own signed, qualified pod profiles and are not
   touched by the `*_after` pins.
 - The bench-only king pod is rented under its era's contract.
+- A typed `[v2] image_decoupled_from_block` must be an era start. While the
+  DEC-CA-0045 rollover is still decided on chain it is checked on the
+  post-rollover grid (`[activation] epoch_blocks_after × era_settlements`).
 
 Gaps:
 - The provisioner still pins `CASCADE_TRAIN_IMAGE_DIGEST` on its pods from the
