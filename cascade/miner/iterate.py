@@ -12,8 +12,13 @@ candidate is instant. Every run appends one line to
 
 The result is directional, not the verdict: validators score on a private,
 rotating pool and duel on an LCB with a dethrone margin (DEC-CA-0012/0039).
-Use ``--pool-dir`` with real held-out data for a meaningful signal; the
+Use ``--pool-dir`` with real held-out data (or ``--pool-hf`` for a retired,
+sha256-verified public eval-pool snapshot) for a meaningful signal; the
 default synthetic sample only catches gross regressions.
+
+``--keep-ckpt DIR`` keeps every trained checkpoint; ``--bench`` then runs the
+public-benchmark sidecar on the best candidate seed and the baseline at the
+same seed and previews the v2 bench gate (:mod:`cascade.miner.bench`).
 """
 
 from __future__ import annotations
@@ -32,6 +37,7 @@ DEFAULT_WORK_DIR = Path(".cascade-work")
 
 
 def add_iterate(sub: argparse._SubParsersAction) -> None:
+    from .bench import add_bench_options
     from .cli import add_score_options
 
     p = sub.add_parser(
@@ -55,6 +61,12 @@ def add_iterate(sub: argparse._SubParsersAction) -> None:
                    help="Complete local configuration; can select a released smaller model for cheaper experiments.")
     p.add_argument("--network", default="finney", help="Network for fetching the king.")
     add_score_options(p)
+    p.add_argument("--bench", action="store_true",
+                   help="After scoring, bench the best candidate seed's checkpoint and the "
+                        "baseline's at that seed with the benchmarks/ sidecar and preview "
+                        "whether the v2 public bench gate would block it (needs a baseline; "
+                        "keeps checkpoints under --keep-ckpt or <work-dir>/checkpoints).")
+    add_bench_options(p)
     p.set_defaults(func=cmd_iterate)
 
 
@@ -75,11 +87,16 @@ def content_digest(repo_dir: Path) -> str:
 def settings_key(args, seed: int) -> dict:
     pool_dir = args.pool_dir
     pool_stamp = args._pool_stamp if hasattr(args, "_pool_stamp") else pool_content_stamp(pool_dir)
-    return json.loads(json.dumps({"pool_dir": str(pool_dir) if pool_dir else None, "pool_stamp": pool_stamp,
-            "pool_ref": args.pool_ref or None, "train_hours": args.train_hours,
-            "n_windows": args.n_windows, "device": args.device,
-            "warm_start": args.warm_start, "seed": seed,
-            "context": getattr(args, "_cache_context", None), "cache_schema": 2}))
+    key = {"pool_dir": str(pool_dir) if pool_dir else None, "pool_stamp": pool_stamp,
+           "pool_ref": args.pool_ref or None, "train_hours": args.train_hours,
+           "n_windows": args.n_windows, "device": args.device,
+           "warm_start": args.warm_start, "seed": seed,
+           "context": getattr(args, "_cache_context", None), "cache_schema": 2}
+    hf = getattr(args, "_pool_hf", None)
+    if hf is not None:
+        # Only present for --pool-hf, so caches of every other pool keep their keys.
+        key["pool_hf"] = {"snapshot": hf.snapshot, "sha256": hf.sha256}
+    return json.loads(json.dumps(key))
 
 
 def file_digest(path):
@@ -180,23 +197,45 @@ def resolve_baseline(args, cfg, out):
     return OK, Path(dest), f"{label} {ref}"
 
 
+def keep_root(args) -> Path | None:
+    """Where trained checkpoints are kept: ``--keep-ckpt``, else
+    ``<work-dir>/checkpoints`` under ``--bench``, else nowhere."""
+    if getattr(args, "keep_ckpt", None) is not None:
+        return Path(args.keep_ckpt)
+    return args.work_dir / "checkpoints" if getattr(args, "bench", False) else None
+
+
 def score_all(repo: Path, digest: str, args, cfg, seeds, cache: ScoreCache, out, role: str):
+    import shutil
+
     from .cli import score_result_dict
     from .score import score_generator
 
+    keep = keep_root(args)
     rows = []
     for seed in seeds:
         key = cache.key(digest, settings_key(args, seed))
         hit = cache.get(key)
-        if hit is not None:
+        kept = (hit or {}).get("checkpoint_dir") or ""
+        if hit is not None and (keep is None or (kept and Path(kept).is_dir())):
             out.info(f"  {role} seed {seed}: geomean={hit['geomean']:.5f} (cached)")
             rows.append({**hit, "seed": seed, "cached": True})
             continue
+        extra = {}
+        if getattr(args, "_pool_hf", None) is not None:
+            extra["pool_hf"] = args._pool_hf
+        if keep is not None:
+            # Named by the cache key: one dir per generator x settings x seed.
+            ckpt_dir = keep / f"{role}-{key[:16]}"
+            shutil.rmtree(ckpt_dir, ignore_errors=True)
+            extra["keep_ckpt"] = ckpt_dir
+            if hit is not None:
+                out.info(f"  {role} seed {seed}: cached score has no kept checkpoint; retraining")
         out.info(f"  {role} seed {seed}: training…")
         r = score_generator(repo, cfg, pool_dir=args.pool_dir, pool_ref=args.pool_ref,
                             train_hours=args.train_hours, n_windows=args.n_windows,
                             device=args.device, seed=seed, warm_start=args.warm_start,
-                            cache_dir=args.work_dir / "score")
+                            cache_dir=args.work_dir / "score", **extra)
         row = score_result_dict(r)
         cache.put(key, row)
         out.info(f"  {role} seed {seed}: geomean={r.geomean:.5f} ({r.train_seconds:.0f}s)")
@@ -265,6 +304,26 @@ def cmd_iterate(args: argparse.Namespace) -> int:
     digest = content_digest(args.repo_dir)
     out.info(f"candidate {args.repo_dir} ({digest[:12]}) verified")
 
+    bench_settings = None
+    if getattr(args, "bench", False):
+        if str(args.baseline).strip().lower() == "none":
+            return out.fail("bench_needs_baseline",
+                            "--bench compares against a baseline checkpoint; drop --baseline none",
+                            USAGE)
+        from .bench import default_project, gate_settings, sidecar_problems
+
+        bench_settings = gate_settings(cfg, args.at_block)
+        fatal, _ = sidecar_problems(args.bench_project or default_project(),
+                                    bench_settings["suites"])
+        if fatal:  # fail before hours of training, not after
+            return out.fail("bench_unavailable", fatal, USAGE)
+
+    from .cli import resolve_pool_hf
+
+    rc, args._pool_hf = resolve_pool_hf(args, args.work_dir, out)
+    if rc != OK:
+        return rc
+
     rc, baseline_dir, baseline_label = resolve_baseline(args, cfg, out)
     if rc != OK:
         return rc
@@ -283,10 +342,16 @@ def cmd_iterate(args: argparse.Namespace) -> int:
     result = {"candidate": {"path": str(args.repo_dir), "content_digest": digest, **candidate},
               "seeds": seeds, "pool": cand_rows[0]["pool"], "init": cand_rows[0]["init"],
               "lower_is_better": True, "directional_only": True}
+    if args._pool_hf is not None:
+        result["pool_hf"] = args._pool_hf.as_dict()
     if base_rows is not None:
         baseline = summarise(base_rows)
         result["baseline"] = {"label": baseline_label, **baseline}
         result["comparison"] = compare(candidate, baseline, args.min_improvement)
+    if bench_settings is not None:
+        rc, result["bench"] = run_bench(args, cfg, cand_rows, base_rows, bench_settings, out)
+        if rc != OK:
+            return rc
 
     history_path = args.work_dir / "history.jsonl"
     entry = {"time": int(time.time()), "content_digest": digest, "path": str(args.repo_dir),
@@ -294,6 +359,10 @@ def cmd_iterate(args: argparse.Namespace) -> int:
              "settings": settings_key(args, None),
              "baseline_mean": result.get("baseline", {}).get("mean"),
              "relative_improvement": result.get("comparison", {}).get("relative_improvement")}
+    if args._pool_hf is not None:
+        entry["pool_hf"] = args._pool_hf.as_dict()
+    if "bench" in result:
+        entry["bench_verdict"] = result["bench"]["verdict"]
     history_path.parent.mkdir(parents=True, exist_ok=True)
     with history_path.open("a") as f:
         f.write(json.dumps(entry, sort_keys=True) + "\n")
@@ -315,4 +384,38 @@ def cmd_iterate(args: argparse.Namespace) -> int:
              f"({best['content_digest'][:12]}, {best['path']})")
     out.info(f"pool: {result['pool']} — directional only; the live duel uses a private pool "
              "and a dethrone margin.")
+    if "bench" in result:
+        from .bench import render
+
+        for line in render(result["bench"]):
+            out.info(line)
     return OK
+
+
+def run_bench(args, cfg, cand_rows, base_rows, settings, out):
+    """``(exit_code, bench result)``: the sidecar on the best candidate seed's
+    kept checkpoint and the baseline's at the SAME seed (like for like), judged
+    by the validator's gate function."""
+    from .bench import BenchUnavailable, judge, run_sidecar
+
+    best = min(cand_rows, key=lambda r: r["geomean"])
+    base = next(r for r in base_rows if r["seed"] == best["seed"])
+    cand_ckpt, base_ckpt = best.get("checkpoint_dir"), base.get("checkpoint_dir")
+    if not cand_ckpt or not base_ckpt:
+        return out.fail("bench_no_checkpoint", "a scored side kept no checkpoint to bench",
+                        REJECTED), None
+    out.info(f"bench: candidate seed {best['seed']} ({cand_ckpt}) vs baseline ({base_ckpt}); "
+             "the full suites can take hours…")
+    try:
+        chal_report, king_report = run_sidecar(
+            [cand_ckpt, base_ckpt], cfg, project=args.bench_project,
+            data_dir=args.bench_data_dir, device=args.device, workers=args.bench_workers,
+            batch_size=args.bench_batch_size, settings=settings, warn=out.warn)
+    except BenchUnavailable as e:
+        return out.fail("bench_unavailable", str(e), USAGE), None
+    except Exception as e:  # noqa: BLE001
+        return out.fail("bench_failed", f"bench failed: {type(e).__name__}: {e}", REJECTED), None
+    verdict = judge(king_report, chal_report, settings)
+    verdict.update(seed_benched=best["seed"], candidate_checkpoint=cand_ckpt,
+                   baseline_checkpoint=base_ckpt)
+    return OK, verdict

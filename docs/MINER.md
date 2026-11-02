@@ -398,6 +398,38 @@ without that current contract cannot support live comparisons with this CLI.
 or contract gets a separate score cache/history.
 Without it you train from random init, which ranks generators differently.
 
+### Retired pools, kept checkpoints and the bench preview
+
+Three flags for local iteration (worked example:
+[local iteration demo](DEMO_LOCAL_ITERATE.md)):
+
+- `--pool-hf [latest|SNAPSHOT]` on `cascade score` / `cascade iterate` scores
+  on a **retired** eval-pool snapshot from the public HF dataset
+  `Tensor-Link/cascade-eval-pool`. `latest` picks the newest
+  `<date>-block-<N>` folder; legacy date-only folders are rebuilds and are
+  never used. The `block-<N>.tar` is checked against the folder's
+  `POOL_SHA256` (download integrity, not authenticity) and scored from the
+  extracted tar. It is cached by sha256 under the work directory, so a
+  re-run works offline. The snapshot and sha256 are recorded in the result and
+  in `history.jsonl`, and they key the iterate cache. It cannot be combined
+  with `--pool-dir` or `--pool`. A retired pool is directional only. It is
+  evaluation data: never train on it.
+- `--keep-ckpt DIR` keeps the trained checkpoint instead of a temp directory
+  (`cascade score`: DIR must be empty; `cascade iterate`: one subdirectory per
+  generator, settings and seed).
+- `cascade iterate --bench` (or `cascade bench CKPT_DIR --king KING_CKPT_DIR`)
+  runs the [benchmark sidecar](../benchmarks/README.md) on the best candidate
+  seed and the baseline at the same seed. It applies the validator's own
+  bench-gate function with `[scoring] bench_gate_tolerance` and
+  `bench_gate_min_win_rate` from your `--chain-toml`, and prints whether the
+  public bench gate would block. Install the sidecar first with
+  `uv sync --project benchmarks --frozen --extra time --extra fev` and stage
+  data with `--bench-data-dir`. A suite without staged data is skipped, and the
+  verdict is then reported as partial. It is a preview: the validator seeds
+  the bootstrap with the round's block hash and runs the gate only after a
+  private-pool win. The preview ignores `bench_gate_mode` and prints the
+  configured mode; a gate set to `off` or `shadow` never blocks.
+
 ## 4. Register a hotkey
 
 ```bash

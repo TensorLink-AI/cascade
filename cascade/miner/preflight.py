@@ -18,7 +18,7 @@ def add_preflight(sub):
     p.add_argument("--network", default="finney")
     p.add_argument("--chain-toml", type=Path, default=None)
     p.add_argument("--timeout", type=positive_seconds, default=10.0)
-    p.add_argument("--max-price", type=positive_seconds, default=None, help="Proposed USD per GPU-hour ceiling; no quote is fetched.")
+    p.add_argument("--max-price", type=positive_seconds, default=None, help="Proposed USD per pod-hour ceiling (the listing's whole-pod price; falls back to the per-GPU price if a listing lacks it); no quote is fetched.")
     p.add_argument("--max-spend", type=positive_seconds, default=None, help="Proposed total USD budget for the human to review.")
     p.set_defaults(func=cmd_preflight)
 
@@ -115,7 +115,7 @@ def assess(snapshot, *, lane, targets, hotkey, max_price, max_spend):
         all_fresh = all((snapshot.get("freshness") or {}).get(f"lane_{other}_queue", {}).get("fresh") for other in required)
         check("hotkey_idle", False if busy else True if all_fresh else None,
               "One live leg per hotkey across all lanes; an existing queued/in-flight entry must be tracked first.")
-    check("price_ceiling", max_price is not None, "Set an explicit per-GPU-hour ceiling for the proposed funding command.")
+    check("price_ceiling", max_price is not None, "Set an explicit per-pod-hour ceiling for the proposed funding command.")
     check("total_budget", max_spend is not None, "Record a total budget for review; standard lane funding currently enforces an hourly cap only.")
     return checks
 
