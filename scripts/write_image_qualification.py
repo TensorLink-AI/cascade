@@ -22,14 +22,22 @@ byte-identical — for A vs B (``equal``) and for crash+resume vs straight
 resume run); the LAST dir holding a pair wins. The harness's own summary must
 not report FAIL/ERROR for a check the record relies on.
 
-The record is written only if it VALIDATES (world sizes include 1 and 8,
-resume tested, all equal) — otherwise the script prints every gap and exits 1.
-Nothing is ever written for incomplete evidence.
+The REQUIRED world sizes are the GPU counts of the SKUs the trainer can rent
+for v2 legs, read from ``[round] funded_pod_skus`` / ``funded_pod_sku`` of
+``--chain-toml`` (default: the deployed-style repo ``chain.toml``; e.g.
+``["8xH200", "4xH100"]`` -> {4, 8}) or given explicitly with
+``--require-worlds 4,8``. Use the DEPLOYED chain.toml: the trainer checks
+against its own effective SKUs.
+
+The record is written only if it VALIDATES (every required world equal AND
+crash+resume equal, every listed world equal) — otherwise the script prints
+every gap and exits 1. Nothing is ever written for incomplete evidence.
 
     python3 scripts/write_image_qualification.py \\
         --from-image sha256:<64> --to-image sha256:<64> \\
         --from-fingerprint <64 hex> --to-fingerprint <64 hex> \\
         --run-id <harness run id> --qual-out /root/qual-out [--qual-out ...] \\
+        --chain-toml /root/cascade/chain.toml [--require-worlds 4,8] \\
         [--manifests-dir DIR] [--out-dir qualifications]
 """
 from __future__ import annotations
@@ -173,6 +181,17 @@ def collect(qual_outs: list[Path]) -> tuple[dict, list[str], dict]:
     return {k: v for k, v in comps.items() if v}, notes, manifests
 
 
+def required_from_chain_toml(path: Path, q) -> tuple[int, ...]:
+    """The rentable SKUs' GPU counts from a chain.toml's ``[round]``."""
+    import tomllib
+
+    rnd = tomllib.loads(Path(path).read_text(encoding="utf-8")).get("round", {})
+    skus = list(rnd.get("funded_pod_skus", []) or [])
+    if rnd.get("funded_pod_sku"):
+        skus.append(rnd["funded_pod_sku"])
+    return q.required_worlds_for_skus(skus)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     ap.add_argument("--from-image", required=True, help="current image, sha256:<64 hex>")
@@ -181,6 +200,10 @@ def main(argv=None) -> int:
     ap.add_argument("--to-fingerprint", required=True)
     ap.add_argument("--run-id", action="append", default=[], required=True)
     ap.add_argument("--qual-out", action="append", type=Path, required=True)
+    ap.add_argument("--chain-toml", type=Path, default=REPO / "chain.toml",
+                    help="derive the required world sizes from its [round] SKUs")
+    ap.add_argument("--require-worlds", default=None,
+                    help="explicit required world sizes, e.g. 4,8 (overrides --chain-toml)")
     ap.add_argument("--date-utc", default=None, help="default: now")
     ap.add_argument("--out-dir", type=Path, default=REPO / "qualifications")
     ap.add_argument("--manifests-dir", type=Path, default=None,
@@ -190,6 +213,9 @@ def main(argv=None) -> int:
     q = _qual_module()
     from_img = "sha256:" + q.image_hex(args.from_image)
     to_img = "sha256:" + q.image_hex(args.to_image)
+    required = (tuple(sorted({int(w) for w in args.require_worlds.split(",") if w.strip()}))
+                if args.require_worlds else required_from_chain_toml(args.chain_toml, q))
+    print(f"required world sizes: {list(required)}")
     comps, notes, manifests = collect(list(args.qual_out))
     worlds = sorted(int(w) for w, c in comps.items() if "equal" in c)
     record = {
@@ -200,13 +226,13 @@ def main(argv=None) -> int:
         "date_utc": args.date_utc or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "run_ids": list(args.run_id),
         "world_sizes": worlds,
-        "resume_tested": bool(worlds) and all(
-            comps[str(w)].get("resume_equal") is True for w in worlds),
+        "resume_tested": bool(required) and all(
+            comps.get(str(w), {}).get("resume_equal") is True for w in required),
         "comparisons": {str(w): comps[str(w)] for w in worlds},
     }
     bad = q.validate_record(record, from_image=args.from_image, to_image=args.to_image,
                             from_fingerprint=args.from_fingerprint,
-                            to_fingerprint=args.to_fingerprint)
+                            to_fingerprint=args.to_fingerprint, required=required)
     for n in notes:
         print(f"note: {n}")
     if bad:

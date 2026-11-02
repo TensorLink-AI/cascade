@@ -2,8 +2,10 @@
 only with a valid ``qualifications/<from12>-to-<to12>.json`` record for exactly
 that (current image -> after image) pair.
 
-* missing record / other pair / any equal=false / world 8 missing / resume not
-  tested / fingerprint mismatch => refused (rent, dispatch, lane pool, the
+* missing record / other pair / any equal=false / a required world missing
+  (required = the GPU counts of the rentable SKUs; world 1 only with a 1-GPU
+  SKU) / resume not tested and equal at every required world / fingerprint
+  mismatch => refused (rent, dispatch, lane pool, the
   funded leg before its corpus) as an operator fault, never the breaker;
 * a valid record => allowed; the emergency override => allowed + ERROR +
   operator alert; pre-switch legs and unarmed configs are unaffected;
@@ -58,8 +60,8 @@ def _good(cfg) -> dict:
     return {"schema": Q.SCHEMA, "from_image": "sha256:" + Q.image_hex(frm),
             "to_image": "sha256:" + Q.image_hex(to),
             "from_worker_code_fingerprint": ffp, "to_worker_code_fingerprint": tfp,
-            "date_utc": "2026-11-01T08:22:00Z", "run_ids": ["qual-1"], "world_sizes": [1, 8],
-            "resume_tested": True, "comparisons": {"1": dict(comp), "8": dict(comp)}}
+            "date_utc": "2026-11-01T08:22:00Z", "run_ids": ["qual-1"], "world_sizes": [4, 8],
+            "resume_tested": True, "comparisons": {"4": dict(comp), "8": dict(comp)}}
 
 
 def _write(cfg, obj, name=None):
@@ -144,12 +146,13 @@ def _mut(path, value):
     (_mut(("to_image",), RC15), "to_image"),
     (_mut(("from_image",), RC16), "from_image"),
     (_mut(("comparisons", "8", "equal"), False), "world 8: equal"),
-    (_mut(("comparisons", "1", "resume_equal"), False), "world 1: resume_equal"),
-    (_mut(("world_sizes",), [1]), "lacks [8]"),
+    (_mut(("comparisons", "4", "resume_equal"), False), "world 4: resume_equal"),
+    (_mut(("comparisons", "8", "resume_manifest_sha256"), KeyError), "world 8: resume_manifest"),
+    (_mut(("world_sizes",), [8]), "lacks [4]"),                 # a configured 4-GPU SKU
     (_mut(("world_sizes",), [1, 4]), "lacks [8]"),
     (_mut(("resume_tested",), False), "resume_tested"),
     (_mut(("comparisons", "8"), KeyError), "world 8: no comparison"),
-    (_mut(("comparisons", "1", "manifest_sha256"), "short"), "manifest_sha256"),
+    (_mut(("comparisons", "4", "manifest_sha256"), "short"), "manifest_sha256"),
     (_mut(("to_worker_code_fingerprint",), "e" * 64), "to_worker_code_fingerprint"),
     (_mut(("run_ids",), []), "run_ids"),
     (_mut(("schema",), "v0"), "schema"),
@@ -158,6 +161,48 @@ def test_any_gap_in_the_record_refuses(armed, mutate, why):
     _write(armed, mutate(_good(armed)))
     st = Q.qualification_status(armed)
     assert not st.usable and why in st.reason, st.reason
+
+
+def test_required_worlds_are_the_rentable_skus_gpu_counts(armed):
+    assert Q.required_worlds(armed) == (4, 8)               # mainnet: 8x/4x H100/H200
+    assert Q.required_worlds(load_chain_config(REPO / "chain.testnet.toml")) == (1,)
+    assert Q.required_worlds_for_skus(["8xH200", "8xH100"]) == (8,)
+    assert Q.required_worlds_for_skus(["8xH200", "H100"]) == (1, 8)
+    assert Q.required_worlds_for_skus([]) == Q.DEFAULT_REQUIRED_WORLDS
+    rnd = replace(armed.round, funded_pod_skus=("8xH200",), funded_pod_sku="4xH100")
+    assert Q.required_worlds(replace(armed, round=rnd)) == (4, 8)
+
+
+def test_world_1_not_required_without_a_one_gpu_sku(armed):
+    rec = _good(armed)
+    assert "1" not in rec["comparisons"]
+    _write(armed, rec)
+    assert Q.qualification_status(armed).qualified
+    # an extra listed size needs equality, not a resume check
+    rec["world_sizes"] = [1, 4, 8]
+    rec["comparisons"]["1"] = {"manifest_sha256": "c" * 64, "tensors": 3, "equal": True}
+    _write(armed, rec)
+    assert Q.qualification_status(armed).qualified
+    rec["comparisons"]["1"]["equal"] = False
+    _write(armed, rec)
+    assert "world 1: equal" in Q.qualification_status(armed).reason
+
+
+def test_a_one_gpu_sku_makes_world_1_required(armed):
+    cfg = replace(armed, round=replace(armed.round,
+                                       funded_pod_skus=(*armed.round.funded_pod_skus, "H100")))
+    _write(cfg, _good(cfg))
+    st = Q.qualification_status(cfg)
+    assert not st.usable and "lacks [1]" in st.reason
+
+
+def test_only_8_gpu_skus_need_only_world_8(armed):
+    cfg = replace(armed, round=replace(armed.round, funded_pod_skus=("8xH200", "8xH100")))
+    rec = _good(cfg)
+    rec["world_sizes"] = [8]
+    rec["comparisons"].pop("4")
+    _write(cfg, rec)
+    assert Q.qualification_status(cfg).qualified
 
 
 def test_a_record_for_another_pair_does_not_count(armed):
@@ -277,7 +322,7 @@ def _safetensors(path: Path, tensors: dict[str, bytes]) -> None:
     path.write_bytes(struct.pack("<Q", len(h)) + h + blob)
 
 
-def _harness_out(root: Path, *, worlds=(1, 8), drift_world=None, resume=True) -> Path:
+def _harness_out(root: Path, *, worlds=(4, 8), drift_world=None, resume=True) -> Path:
     rows = []
     for w in worlds:
         for run in ("A-fresh", "B-fresh") + (("B-full6", "B-resume6") if resume else ()):
@@ -317,7 +362,7 @@ def test_helper_writes_a_record_the_trainer_accepts(armed, tmp_path):
     rc = _helper().main(_argv(armed, Q.QUALIFICATIONS_DIR, out))
     assert rc == 0
     rec = json.loads(next(Q.QUALIFICATIONS_DIR.glob("*.json")).read_text())
-    assert rec["world_sizes"] == [1, 8] and rec["resume_tested"] is True
+    assert rec["world_sizes"] == [4, 8] and rec["resume_tested"] is True
     rows = _helper().comparison_manifest(out / "w8" / "A-fresh", out / "w8" / "B-fresh")[0]
     assert rec["comparisons"]["8"]["manifest_sha256"] == hashlib.sha256(
         json.dumps(rows, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -327,7 +372,8 @@ def test_helper_writes_a_record_the_trainer_accepts(armed, tmp_path):
     assert Q.qualification_status(armed).qualified
 
 
-@pytest.mark.parametrize("kw", [{"drift_world": 8}, {"worlds": (1,)}, {"resume": False}])
+@pytest.mark.parametrize("kw", [{"drift_world": 8}, {"worlds": (8,)}, {"worlds": (1, 8)},
+                                {"resume": False}])
 def test_helper_refuses_incomplete_evidence(armed, tmp_path, kw):
     out = _harness_out(tmp_path / "qual", **kw)
     assert _helper().main(_argv(armed, Q.QUALIFICATIONS_DIR, out)) == 1
@@ -338,8 +384,9 @@ def test_helper_refuses_incomplete_evidence(armed, tmp_path, kw):
 def test_shipped_records_validate():
     """Every committed record names its own pair and validates (fingerprints
     are checked by the trainer against the deployed pins)."""
+    cfg = load_chain_config(REPO / "chain.toml")
     for p in sorted(Q.QUALIFICATIONS_DIR.glob("*.json")):
         obj = json.loads(p.read_text())
         assert p.name == Q.record_filename(obj["from_image"], obj["to_image"])
-        assert Q.validate_record(obj, from_image=obj["from_image"],
-                                 to_image=obj["to_image"]) == []
+        assert Q.validate_record(obj, from_image=obj["from_image"], to_image=obj["to_image"],
+                                 required=Q.required_worlds(cfg)) == []

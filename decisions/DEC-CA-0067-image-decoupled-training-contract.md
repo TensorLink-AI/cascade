@@ -262,8 +262,8 @@ Lane handling:
 
 **Owner rule: qualification before arming.**
 - An image may be set as `*_after` ONLY after a bit-identical qualification
-  against the current image: weights and optimizer state, world size 1 and 8,
-  and crash/resume.
+  against the current image: weights and optimizer state at every world size
+  the trainer can rent for a v2 leg, and crash/resume at each of them.
 - The qualification must be recorded in OPSLOG before the `*_after` lines are
   armed.
 - Excluding the image from the numerics digest is sound only because of this
@@ -277,9 +277,18 @@ Lane handling:
   `cascade-image-qualification/1`; full from/to image digests; from/to worker
   code fingerprints equal to the pinned `[round] worker_code_fingerprint` /
   `[v2] worker_code_fingerprint_after`; `date_utc`; ≥ 1 run id;
-  `world_sizes` ⊇ {1, 8}; `resume_tested = true`; and per world size the
-  sha256 of the sorted per-tensor comparison manifest (weights, stable weights,
-  optimizer tensors) with `equal = true` and `resume_equal = true`.
+  `world_sizes` ⊇ the REQUIRED sizes; `resume_tested = true`; and per world
+  size the sha256 of the sorted per-tensor comparison manifest (weights,
+  stable weights, optimizer tensors) with `equal = true`, plus
+  `resume_equal = true` at every required size.
+- Required world sizes (owner 2026-11-02: "we don't use 1x GPU on training"):
+  the GPU counts of the SKUs the trainer can rent for v2 legs, from the
+  effective `[round] funded_pod_skus` plus a set `funded_pod_sku`
+  (`image_qualification.required_worlds`; `"8xH200"` → 8, a plain type → 1).
+  Mainnet's `["8xH200", "8xH100", "4xH200", "4xH100"]` requires {4, 8}; world
+  1 is required only while a one-GPU SKU is listed. With no SKU configured
+  the conservative {1, 8} applies. Adding a SKU with a new GPU count
+  invalidates existing records until that size is qualified.
 - `scripts/write_image_qualification.py` emits the record from the
   qualification harness outputs (`scripts/qualify_pyramid_bitwise.py`, A run
   in the FROM image, B in the TO image). It hashes tensors without torch and

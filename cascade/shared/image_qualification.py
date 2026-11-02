@@ -20,14 +20,22 @@ Schema (``cascade-image-qualification/1``)::
       "to_worker_code_fingerprint": "<64 hex>",
       "date_utc": "2026-11-01T08:22:00Z",
       "run_ids": ["<harness run id>", ...],          # >= 1
-      "world_sizes": [1, 8],                         # must include 1 and 8
+      "world_sizes": [4, 8],                         # must include every REQUIRED world
       "resume_tested": true,                         # must be true
       "comparisons": {                               # one per world size
-        "1": {"manifest_sha256": "<64 hex>", "tensors": 412, "equal": true,
+        "8": {"manifest_sha256": "<64 hex>", "tensors": 412, "equal": true,
               "resume_manifest_sha256": "<64 hex>", "resume_equal": true},
-        "8": {...}
+        "4": {...}
       }
     }
+
+The REQUIRED world sizes are the GPU counts of the SKUs the trainer can rent
+for v2 legs (:func:`required_worlds`: ``[round] funded_pod_skus`` and
+``funded_pod_sku``, ``"8xH200"`` -> 8, a plain type -> 1), so mainnet's
+``["8xH200", "8xH100", "4xH200", "4xH100"]`` requires {4, 8} and world 1 is
+not required (owner 2026-11-02: training never runs on one GPU). Every
+listed world must be ``equal``; every REQUIRED world must also be
+``resume_equal`` (crash+resume tested at that size).
 
 ``manifest_sha256`` is the sha256 of the sorted per-tensor comparison manifest
 (every tensor of ``weights.safetensors``, ``weights_stable.safetensors`` and
@@ -47,7 +55,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 SCHEMA = "cascade-image-qualification/1"
-REQUIRED_WORLDS = (1, 8)
+# Fallback when no rentable SKU is configured (nothing to derive from): the
+# conservative pair. Normally :func:`required_worlds` decides.
+DEFAULT_REQUIRED_WORLDS = (1, 8)
+_LAYOUT = re.compile(r"^\s*(\d+)\s*[xX\u00d7]\s*(\S+)\s*$")
 QUALIFICATIONS_DIR = Path(__file__).resolve().parents[2] / "qualifications"
 
 _HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -61,6 +72,32 @@ def image_hex(ref: str) -> str:
     return m.group(1) if m else ""
 
 
+def sku_gpus(sku: str) -> int:
+    """GPUs in one pod of ``sku`` (``"8xH200"`` -> 8, ``"RTX4090"`` -> 1);
+    the same rule as :func:`cascade.provision.layout.layout_gpus`."""
+    m = _LAYOUT.match(str(sku or ""))
+    return int(m.group(1)) if m and int(m.group(1)) >= 1 else 1
+
+
+def required_worlds_for_skus(skus) -> tuple[int, ...]:
+    skus = [str(s).strip() for s in (skus or ()) if str(s or "").strip()]
+    if not skus:
+        return DEFAULT_REQUIRED_WORLDS
+    return tuple(sorted({sku_gpus(s) for s in skus}))
+
+
+def required_worlds(cfg) -> tuple[int, ...]:
+    """The world sizes a qualification must cover: the GPU count of every SKU
+    the trainer can rent for a v2 leg (``[round] funded_pod_skus`` plus a
+    set ``funded_pod_sku``). None configured -> :data:`DEFAULT_REQUIRED_WORLDS`."""
+    rnd = getattr(cfg, "round", None)
+    skus = list(getattr(rnd, "funded_pod_skus", ()) or ())
+    locked = str(getattr(rnd, "funded_pod_sku", "") or "")
+    if locked:
+        skus.append(locked)
+    return required_worlds_for_skus(skus)
+
+
 def record_filename(from_image: str, to_image: str) -> str:
     a, b = image_hex(from_image), image_hex(to_image)
     if not a or not b:
@@ -69,10 +106,13 @@ def record_filename(from_image: str, to_image: str) -> str:
 
 
 def validate_record(obj: object, *, from_image: str, to_image: str,
-                    from_fingerprint: str = "", to_fingerprint: str = "") -> list[str]:
-    """Every reason ``obj`` does NOT qualify the pair (empty list = qualified).
-    The fingerprints are checked when given (the trainer always gives the
-    pinned ones)."""
+                    from_fingerprint: str = "", to_fingerprint: str = "",
+                    required: tuple[int, ...] = DEFAULT_REQUIRED_WORLDS) -> list[str]:
+    """Every reason ``obj`` does NOT qualify the pair (empty list = qualified)
+    for the ``required`` world sizes (the trainer passes
+    :func:`required_worlds`). The fingerprints are checked when given (the
+    trainer always gives the pinned ones)."""
+    required = tuple(sorted({int(w) for w in required}))
     if not isinstance(obj, dict):
         return ["record is not a JSON object"]
     bad: list[str] = []
@@ -101,10 +141,10 @@ def validate_record(obj: object, *, from_image: str, to_image: str,
             or not all(isinstance(w, int) and not isinstance(w, bool) for w in worlds)):
         bad.append("world_sizes must be a list of ints")
         worlds = []
-    missing = [w for w in REQUIRED_WORLDS if w not in worlds]
+    missing = [w for w in required if w not in worlds]
     if missing:
         bad.append(f"world_sizes {worlds} lacks {missing} (must include "
-                   f"{list(REQUIRED_WORLDS)})")
+                   f"{list(required)}, the rentable SKUs' GPU counts)")
     if obj.get("resume_tested") is not True:
         bad.append("resume_tested is not true")
     comps = obj.get("comparisons")
@@ -120,6 +160,8 @@ def validate_record(obj: object, *, from_image: str, to_image: str,
             bad.append(f"world {w}: manifest_sha256 is not 64 hex")
         if c.get("equal") is not True:
             bad.append(f"world {w}: equal is not true")
+        if w not in required:
+            continue                   # listed extra size: equality only
         if not _HEX64.fullmatch(str(c.get("resume_manifest_sha256", "") or "")):
             bad.append(f"world {w}: resume_manifest_sha256 is not 64 hex")
         if c.get("resume_equal") is not True:
@@ -170,7 +212,8 @@ def qualification_status(cfg, *, root: Path | str | None = None) -> Qualificatio
                 reason = f"qualification record {name} unreadable: {e}"
             else:
                 bad = validate_record(obj, from_image=from_image, to_image=to_image,
-                                      from_fingerprint=from_fp, to_fingerprint=to_fp)
+                                      from_fingerprint=from_fp, to_fingerprint=to_fp,
+                                      required=required_worlds(cfg))
                 if bad:
                     reason = f"qualification record {name} rejected: " + "; ".join(bad)
     if not reason:
