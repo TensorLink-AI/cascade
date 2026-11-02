@@ -1565,18 +1565,28 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
             free_lanes.put(host)
             raise
         except Exception as e:  # noqa: BLE001 — any dispatch failure is retryable once
-            from .leg_pins import WRONG_IMAGE_BAD_SECONDS, is_image_refusal_text
+            from .leg_pins import WRONG_IMAGE_BAD_SECONDS, worker_refused_image
 
-            if is_image_refusal_text(str(e)) and hasattr(free_lanes, "mark_dead"):
-                # owner rule 2026-11-02 (never the wrong image): the worker
-                # refused FINAL (rc 2) before any corpus/training — this lane's
-                # runtime image is not the leg's pin. It leaves the rotation
-                # (never the breaker, never the leg's fault) until re-gated.
-                free_lanes.mark_dead(host, f"wrong runtime image: {error_tail(e, 160)}",
-                                     lane_only=True, hold_s=WRONG_IMAGE_BAD_SECONDS)
+            if (worker_refused_image(e) and _block is not None and callable(_filters)
+                    and _filters(_block)):
+                # A POST-SWITCH leg's worker refused FINAL (exit 2 + its stdout
+                # sentinel; nothing of the miner's ran). Pre-switch legs keep
+                # the release's exact handling below. The lane is held out
+                # only on OUR measured evidence (its code is another release);
+                # otherwise it is our config skew — back in the rotation.
+                evidence = False
+                try:
+                    evidence = _hook._observe(host, fresh=True)[0] != _hook._want(_block)[0]
+                except Exception:  # noqa: BLE001 — unverified: no blame
+                    evidence = False
+                if evidence and hasattr(free_lanes, "mark_dead"):
+                    free_lanes.mark_dead(host, f"wrong worker release: {error_tail(e, 160)}",
+                                         lane_only=True, hold_s=WRONG_IMAGE_BAD_SECONDS)
+                else:
+                    free_lanes.put(host)
                 raise LegImageMismatch(
-                    f"{describe}: lane {getattr(host, 'name', host)} runs the wrong runtime "
-                    f"image ({error_tail(e, 200)})") from e
+                    f"{describe}: lane {getattr(host, 'name', host)} refused FINAL for this "
+                    f"leg's image ({error_tail(e, 200)})", code_evidence=evidence) from e
             transport = _transport_failure(e)
             if transport and hasattr(free_lanes, "mark_dead"):
                 # ssh refused / worker unreachable: the POD is gone, not the

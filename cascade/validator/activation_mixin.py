@@ -30,6 +30,12 @@ from .weights import WEIGHTS_RATE_LIMIT_BLOCKS
 log = logging.getLogger("cascade.validator")
 
 
+class ActivationStartupRefused(RuntimeError):
+    """This node must not run: its activation note would trim the DEC-CA-0067
+    ``v2b-`` segment (it would never vote on it). Never swallowed by a caller's
+    best-effort activation guard."""
+
+
 class ActivationMixin:
     """Rollover, forfeiture, margin-v2, pre-launch burn and DEC-CA-0067 lock-ins
     decided on chain."""
@@ -362,12 +368,16 @@ class ActivationMixin:
                 self.apply_image_decoupled_block(self._image_decoupled.activation_block)
         from ..shared.activation import v2b_note_problem
 
+        try:
+            head = int(client.current_block())  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001 — judged on the last tallied boundary
+            head = int(getattr(self._activation, "last_checked_boundary", 0) or 0) or None
         trim = v2b_note_problem(self._base_cfg(), self._activation, self._forfeit,
-                                self._margin_v2, self._prelaunch)
+                                self._margin_v2, self._prelaunch, head_block=head)
         if trim:
             # DEC-CA-0067: a validator whose note drops the v2b- segment never
             # votes on it (only a WARNING per write) — refuse to start instead
-            raise RuntimeError(f"activation: refusing to start — {trim}")
+            raise ActivationStartupRefused(f"activation: refusing to start — {trim}")
         self._signal_hotkey = str(getattr(client, "hotkey_ss58", lambda: "")() or "")
         if self._activation.locked and self._activation.source != "config":
             log.info("activation: restored lock-in (block %d, rollover %d, via %s)",

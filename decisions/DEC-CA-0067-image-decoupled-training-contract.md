@@ -356,6 +356,20 @@ Lane handling:
   gangs rent their own signed pod profiles (`cascade/direct/compute.py`
   `PodProfile.image`) and are not affected by the `*_after` pins.
 
+## Delta-review fixes (2026-11-02)
+
+- Worker image refusals are structured: exit 2 plus
+  `IMAGE_REFUSAL_SENTINEL` as the worker's last stdout line, never free text
+  (a generator's exception text cannot trigger lane holds or quarantines).
+- Every never-the-wrong-image path is post-switch only; a host or executor
+  is blamed only on the trainer's own measured code fingerprint; unverifiable
+  probes are "unknown" (wait / retry); the per-leg cap persists and the
+  capped leg waits.
+- The satellite is a voting process (vote-pin guard, note-budget refusal).
+- The note-budget check uses the digit count blocks reach within ~30 days
+  (8 digits from ~9,784,000): type v2b's block once decided (or the locked
+  rollover) before then.
+
 ## Procedure
 
 1. Release this change: validators, trainer and audit together. Nothing changes

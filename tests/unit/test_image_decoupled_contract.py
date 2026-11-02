@@ -242,12 +242,13 @@ def test_only_the_voting_entry_points_set_the_guard():
     import cascade.audit.main as audit_main
     import cascade.trainer.main as trainer_main
     import cascade.validator.main as validator_main
+    import cascade.validator.satellite as satellite
 
-    for mod in (validator_main, trainer_main, audit_main):
+    for mod in (validator_main, trainer_main, audit_main, satellite):   # satellite votes
         assert "require_vote_pin()" in inspect.getsource(mod.main), mod.__name__
     root = REPO / "cascade"
     for rel in ("trainer/worker.py", "miner/cli.py", "funding/main.py", "provision/main.py",
-                "validator/satellite.py", "pool/cli.py", "generation/cli.py"):
+                "pool/cli.py", "generation/cli.py"):
         path = root / rel
         if path.is_file():
             assert "require_vote_pin" not in path.read_text(), rel
@@ -802,7 +803,8 @@ def test_untyped_blocks_would_trim_the_v2b_segment(tmp_path):
     rec, fr, mr = _live_records()
     why = A.v2b_note_problem(cfg, rec, fr, mr)
     assert "TRIM" in why and "v2b-150ec0d0" in why
-    assert A.v2b_note_problem(load_chain_config(REPO / "chain.toml"), rec) == ""   # typed: fits
+    assert A.v2b_note_problem(load_chain_config(REPO / "chain.toml"), rec,
+                              head_block=9_420_000) == ""                  # typed: fits
     s = A.summary(cfg, rec, None, fr, None, mr)
     assert s["image_decoupled"]["note_fits"] is False and "TRIM" in s["image_decoupled"][
         "note_problem"]
@@ -830,3 +832,35 @@ def test_the_trainer_never_refuses_for_the_note_budget(tmp_path):
     import cascade.trainer.loop as trainer_loop
 
     assert "v2b_note_problem" not in inspect.getsource(trainer_loop)
+
+
+def test_note_budget_worst_case_scales_to_8_digit_blocks():
+    """Review 4: the worst case uses the digit count blocks reach within the
+    horizon; 8 digits (head unknown, or within ~30 days of 10,000,000) trims
+    the release config's v2b segment beside a locked cfg- overlay — the
+    documented rule: type v2b's block once it is decided."""
+    cfg = load_chain_config(REPO / "chain.toml")
+    rec = _live_records()[0]
+    assert A.v2b_note_problem(cfg, rec, head_block=9_420_000) == ""
+    assert "TRIM" in A.v2b_note_problem(cfg, rec, head_block=9_800_000)
+    assert "TRIM" in A.v2b_note_problem(cfg, rec)                      # unknown head: 8 digits
+
+
+def test_satellite_refuses_on_the_note_budget_but_tolerates_other_failures():
+    from cascade.validator.activation_mixin import ActivationStartupRefused
+    from cascade.validator.satellite import SatelliteRunner
+
+    sat = SatelliteRunner.__new__(SatelliteRunner)
+
+    def refuse(client):
+        raise ActivationStartupRefused("trim")
+
+    sat._activation_startup = refuse
+    with pytest.raises(ActivationStartupRefused):
+        sat.activation_startup(None)
+
+    def flaky(client):
+        raise OSError("rpc down")
+
+    sat._activation_startup = flaky
+    sat.activation_startup(None)                                    # logged, not fatal

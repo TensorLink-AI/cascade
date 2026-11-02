@@ -243,15 +243,23 @@ The feature name hashes `eval_n_windows_after`, so a file without it would
 vote on `v2b-6bbd262b` and fork from the fleet.
 
 What refuses and what keeps running on a file without them:
-- **Refuse to start:** `cascade-validator`, `cascade-trainer`, `cascade-audit`
-  (the processes that vote on or act on the vote; their `main` sets the
-  loader's vote-pin guard). The validator also refuses to start when its own
-  note would trim the `v2b-` segment, which is what happens with the pins but
-  without the typed `[scoring]` blocks.
+- **Refuse to start:** `cascade-validator`, `cascade-satellite` (both signal
+  and tally the vote), `cascade-trainer`, `cascade-audit` (they act on it);
+  their `main` sets the loader's vote-pin guard. The validator and the
+  satellite also refuse to start when their own note would trim the `v2b-`
+  segment, which is what happens with the pins but without the typed
+  `[scoring]` blocks.
 - **Keep running, ERROR logged:** train workers on pods
   (`cascade-train-worker`, the pod-side snippets), the miner CLI (`cascade`),
-  `cascade-intake` (funding), `cascade-provisioner`, `cascade-satellite`,
-  `cascade-pool`, `cascade-generate`.
+  `cascade-intake` (funding), `cascade-provisioner`, `cascade-pool`,
+  `cascade-generate`.
+- **Note headroom (time-limited):** the note-budget check judges blocks at
+  the digit count they reach within ~30 days. With the release chain.toml
+  (rollover resolved from signals, a locked `cfg-` overlay segment) the
+  `v2b-` segment no longer fits once blocks reach 8 digits, so from head
+  ~9,784,000 a validator on that config refuses to start until v2b's block
+  is typed once decided (or the already-locked rollover is typed). Plan that
+  edit before then.
 
 Steps (Approve-tier; snapshot each file first):
 1. Hand-edit every deployed chain.toml (trainer box `/root/cascade/chain.toml`,
@@ -382,13 +390,25 @@ Lane and pod behaviour once armed:
   retries; it is never told "no lane on this image". An ssh failure at
   dispatch is a transport failure (the pod is drained like any unreachable
   pod), not an image mismatch.
-- Never the wrong image (owner rule 2026-11-02): a pod or lane whose runtime
-  image is not the leg's pin — seen by the dispatch hook, by the worker's FINAL
-  refusal (rc 2, before any corpus streaming or training), or by the rent-time
-  code check — is released at once, its host and executor are marked bad for
-  24 h (a lane leaves the rotation), and the leg retries unburned on the same
-  billing. At most 2 such pods per leg per hour; then the leg waits
-  (`no_capacity`), so a miner is never billed repeatedly for our image skew.
+- Never the wrong image (owner rule 2026-11-02), post-switch legs only (a
+  pre-switch leg is handled exactly as in the release before): a pod or lane
+  that cannot run the leg's image is released at once and the leg retries
+  unburned on the same billing. Its host and executor are marked bad for
+  24 h (a lane leaves the rotation) ONLY when the trainer itself measured the
+  pod's worker code as another release; a mismatch of the image env we
+  injected, our deployed config, or a probe that could not run is never
+  blamed on the host. A worker's own FINAL refusal counts only as exit 2
+  with the worker's stdout sentinel as its last line
+  (`contract.IMAGE_REFUSAL_SENTINEL`, printed before any miner code runs;
+  workers that predate it never trigger this path) — never from free text.
+  At most 2 such pods per leg (hotkey, role, era) per hour, counted in
+  `<work-root>/image_refusals.json` across restarts; then the leg waits
+  (`no_capacity`, requeued), so a miner is never billed repeatedly for our
+  image skew.
+- The runtime image probe reads what the worker will see: the host's
+  `static_env` (sourced into the worker's session), else `printenv` in a
+  plain ssh session (the worker runs in one, `remote.build_remote_command`).
+  A probe whose remote command fails (python, OOM, disk) is "unknown".
 - MarketCast legs of a post-switch era carry the era's `--contract-block`, so
   they get the image check and the after-image config. Direct-MoE gangs
   (`cascade/direct`) rent their own signed, qualified pod profiles and are not

@@ -75,6 +75,19 @@ def error_tail(text: object, limit: int = 300) -> str:
     return head + " … " + "\n".join(reversed(tail))
 
 
+def worker_image_refusal(returncode, stdout: str) -> bool:
+    """DEC-CA-0067: the worker's own structured FINAL image refusal — exit 2
+    AND :data:`cascade.trainer.contract.IMAGE_REFUSAL_SENTINEL` as the LAST
+    non-empty stdout line. Never inferred from free text (miner output,
+    stderr tails). Workers that predate the sentinel never match."""
+    from .contract import IMAGE_REFUSAL_SENTINEL
+
+    if returncode != 2:
+        return False
+    lines = [ln.strip() for ln in str(stdout or "").splitlines() if ln.strip()]
+    return bool(lines) and lines[-1] == IMAGE_REFUSAL_SENTINEL
+
+
 class RemoteDispatchError(RuntimeError):
     """An SSH dispatch or receipt parse failed.
 
@@ -87,6 +100,9 @@ class RemoteDispatchError(RuntimeError):
     def __init__(self, *args, returncode: int | None = None) -> None:
         super().__init__(*args)
         self.returncode = returncode
+        # set by the dispatcher from the worker's exit + stdout only
+        # (:func:`worker_image_refusal`) — never from message text
+        self.image_refusal = False
 
 
 HOST_STAGES = ("any", "heat", "final")
@@ -1839,11 +1855,13 @@ class RemoteDispatcher:
         if proc.returncode != 0:
             cause, detail = summarize_failure(proc.stderr or "", rc=proc.returncode,
                                               progress=progress)
-            raise RemoteDispatchError(
+            err = RemoteDispatchError(
                 f"remote {role} on {host.name} failed (rc={proc.returncode}) {cause}{where}"
                 + (f"\n{detail}" if detail else ""),
                 returncode=proc.returncode,
             )
+            err.image_refusal = worker_image_refusal(proc.returncode, proc.stdout or "")
+            raise err
         receipt = parse_receipt(proc.stdout or "")
         if (local_checkpoint and self.detached and prior
                 and "local_checkpoint_dir" not in receipt and "trained_pointer" in receipt):

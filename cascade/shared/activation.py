@@ -1196,22 +1196,33 @@ def own_signal_payload(cfg: ChainConfig, record: ActivationRecord,
     return note
 
 
+# Horizon for the note-budget worst case: blocks are judged at the digit count
+# they can reach this far past the head (about 30 days at 12 s).
+NOTE_BLOCK_HORIZON = 216_000
+
+
 def v2b_note_problem(cfg: ChainConfig, record: ActivationRecord | None = None,
                      forfeit_record: ActivationRecord | None = None,
                      margin_v2_record: ActivationRecord | None = None,
-                     prelaunch_record: ActivationRecord | None = None) -> str:
+                     prelaunch_record: ActivationRecord | None = None, *,
+                     head_block: int | None = None) -> str:
     """Why this node's note would TRIM the DEC-CA-0067 ``v2b-`` segment, or ""
     (it fits / nothing to signal). Taken with this node's CURRENT records for
-    the other features and the v2b segment at its longest (locked, 7-digit
-    blocks), plus a locked ``cfg-`` overlay segment when ``[netconfig]`` is on
-    (it outranks feature segments). A node whose note drops ``v2b-`` never
-    votes on it — silently but for a WARNING — so the validator refuses to
-    start instead (type the already-decided forfeit / margin-v2 blocks to free
-    room)."""
+    the other features, the v2b segment at its longest (locked) and a locked
+    ``cfg-`` overlay segment when ``[netconfig]`` is on (it outranks feature
+    segments), every worst-case block at the digit count reachable within
+    :data:`NOTE_BLOCK_HORIZON` of ``head_block`` (None = 8 digits, the
+    conservative bound). A node whose note drops ``v2b-`` never votes on it —
+    silently but for a WARNING — so the validator refuses to start instead.
+    Rule: type the already-decided forfeit / margin-v2 blocks, and type v2b's
+    own block once it is decided, to keep headroom (past block ~9,784,000 the
+    8-digit worst case needs it)."""
     spec = image_decoupled_feature(cfg)
     if spec is None or not spec.decided_on_chain or not cfg.activation.enabled:
         return ""
-    big = 9_999_999
+    digits = (8 if head_block is None
+              else max(7, len(str(max(0, int(head_block)) + NOTE_BLOCK_HORIZON))))
+    big = 10 ** digits - 1
     worst = ActivationRecord(feature=spec.name, lock_block=big, activation_block=big,
                              source="tally")
     seg = (ReadySignal("cfg-ffffffff", lock_block=big, activation_block=big)
@@ -1331,7 +1342,9 @@ def summary(cfg: ChainConfig, record: ActivationRecord, t: Tally | None,
         if image_decoupled_tally is not None:
             io["tally"] = image_decoupled_tally.to_json()
         trim = v2b_note_problem(cfg, record, forfeit_record, margin_v2_record,
-                                prelaunch_record)
+                                prelaunch_record,
+                                head_block=int(getattr(record, "last_checked_boundary", 0)
+                                               or 0) or None)
         io["note_fits"] = not trim
         if trim:
             io["note_problem"] = trim

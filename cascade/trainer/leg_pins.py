@@ -158,7 +158,21 @@ def leg_contract_scope(runner, contract):
 class LegImageMismatch(_OperatorFault):
     """The host runs (or cannot prove it runs) another worker image than the
     leg's era pins. Never a lane fault (the lane breaker does not count it)
-    and never the miner's: an operator fault, requeued unburned."""
+    and never the miner's: an operator fault, requeued unburned.
+
+    ``code_evidence``: the trainer MEASURED the pod's worker code fingerprint
+    and it is another release's — the only evidence a host / executor is ever
+    blamed on (never our injected image env or our deployed config)."""
+
+    def __init__(self, *args, code_evidence: bool = False) -> None:
+        super().__init__(*args)
+        self.code_evidence = bool(code_evidence)
+
+
+class LegImageUnverified(LegImageMismatch):
+    """The pod's release could not be measured right now (the probe's remote
+    command failed: python, OOM, disk, a missing package dir). Unknown, never
+    "wrong image": no blame, no retry-cap count; the lane / leg retries."""
 
 
 class ImageAfterUnqualified(LegImageMismatch):
@@ -300,7 +314,7 @@ def host_code_fingerprint(host, *, fresh: bool = False, clock=None) -> str:
             f"pod unreachable during the code fingerprint probe of "
             f"{getattr(host, 'name', host)}: {transport[-1]}", returncode=255)
     if err:
-        raise LegImageMismatch(
+        raise LegImageUnverified(
             f"code fingerprint unavailable on {getattr(host, 'name', host)}: {err}")
     with _FP_LOCK:
         _FINGERPRINTS[key] = (got, now)
@@ -313,56 +327,48 @@ _RUNTIME_IMAGES: dict[tuple, tuple[str, float]] = {}
 _IMAGE_RE = re.compile(r"sha256:[0-9a-f]{64}")
 
 
-def parse_runtime_image(printenv_out: str, bashrc_out: str, environ_out: str) -> str:
-    """The ``sha256:<64hex>`` the pod's worker will see as
-    ``CASCADE_TRAIN_IMAGE_DIGEST`` (login env, then the provisioner's
-    ``~/.bashrc`` export, then the container's launch env), or ""."""
-    for text in (printenv_out, bashrc_out):
-        m = _IMAGE_RE.search(str(text or "").lower())
-        if m:
-            return m.group(0)
-    for entry in str(environ_out or "").split("\0"):
-        if entry.startswith("CASCADE_TRAIN_IMAGE_DIGEST="):
-            m = _IMAGE_RE.search(entry.lower())
-            if m:
-                return m.group(0)
-    return ""
-
-
 def host_runtime_image(host, *, fresh: bool = False, clock=None) -> str:
-    """The runtime image identity a worker on ``host`` reports
-    (``CASCADE_TRAIN_IMAGE_DIGEST``, exactly what ``assert_train_image``
-    reads), cached like :func:`host_code_fingerprint`. "" = unset (a worker
-    there refuses every FINAL). Unreachable ⇒ ``RemoteDispatchError(255)``."""
+    """The ``CASCADE_TRAIN_IMAGE_DIGEST`` a worker dispatched to ``host`` will
+    see — exactly its launch env: the host's own ``static_env`` (which the
+    dispatcher sources into the worker's session), else what a plain ssh
+    session on the host exports (the worker runs in one:
+    ``cascade.trainer.remote.build_remote_command`` = ``cd <workdir> && [set -a
+    && . /dev/stdin && set +a &&] <worker>``; sshd's env + the login rc files,
+    the same session ``printenv`` runs in). Cached like
+    :func:`host_code_fingerprint`. "" = unset (the worker refuses every FINAL).
+    Unreachable ⇒ ``RemoteDispatchError(255)``; a failed probe command ⇒
+    :class:`LegImageUnverified`."""
     import subprocess
     import time
 
     from ..provision.codeprint import CHECK_TIMEOUT_SECONDS
     from .remote import RemoteDispatchError, build_ssh_argv, run_ssh
 
+    for k, v in tuple(getattr(host, "static_env", ()) or ()):
+        if k == "CASCADE_TRAIN_IMAGE_DIGEST":
+            m = _IMAGE_RE.search(str(v).lower())
+            return m.group(0) if m else ""
     now = (clock or time.monotonic)()
     key = _fp_key(host)
     with _FP_LOCK:
         hit = _RUNTIME_IMAGES.get(key)
         if hit is not None and not fresh and now - hit[1] < FINGERPRINT_TTL_SECONDS:
             return hit[0]
-    outs = []
-    home = "/root" if str(getattr(host, "user", "root") or "root") == "root" else \
-        f"/home/{getattr(host, 'user', '')}"
-    for argv in (["printenv", "CASCADE_TRAIN_IMAGE_DIGEST"],
-                 ["grep", "-s", "^export CASCADE_TRAIN_IMAGE_DIGEST=", f"{home}/.bashrc"],
-                 ["cat", "/proc/1/environ"]):
-        try:
-            proc = run_ssh(build_ssh_argv(host, shlex.join(argv)), timeout=CHECK_TIMEOUT_SECONDS)
-        except (subprocess.TimeoutExpired, OSError) as e:
-            raise RemoteDispatchError(f"pod unreachable during the runtime image probe of "
-                                      f"{getattr(host, 'name', host)}: {e}",
-                                      returncode=255) from e
-        if getattr(proc, "returncode", 0) == 255:
-            raise RemoteDispatchError(f"pod unreachable during the runtime image probe of "
-                                      f"{getattr(host, 'name', host)}", returncode=255)
-        outs.append(proc.stdout if getattr(proc, "returncode", 1) == 0 else "")
-    got = parse_runtime_image(*outs)
+    try:
+        proc = run_ssh(build_ssh_argv(host, shlex.join(["printenv", "CASCADE_TRAIN_IMAGE_DIGEST"])),
+                       timeout=CHECK_TIMEOUT_SECONDS)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        raise RemoteDispatchError(f"pod unreachable during the runtime image probe of "
+                                  f"{getattr(host, 'name', host)}: {e}", returncode=255) from e
+    rc = getattr(proc, "returncode", 0)
+    if rc == 255:
+        raise RemoteDispatchError(f"pod unreachable during the runtime image probe of "
+                                  f"{getattr(host, 'name', host)}", returncode=255)
+    if rc not in (0, 1):          # printenv: 1 = unset (a real answer)
+        raise LegImageUnverified(f"runtime image probe failed on "
+                                 f"{getattr(host, 'name', host)} (rc={rc})")
+    m = _IMAGE_RE.search(str(getattr(proc, "stdout", "") or "").lower()) if rc == 0 else None
+    got = m.group(0) if m else ""
     with _FP_LOCK:
         _RUNTIME_IMAGES[key] = (got, now)
     return got
@@ -436,8 +442,8 @@ class _HostHook:
                 return False
             self._reprobed[key] = now
             return self._observe(host, fresh=True) == want
-        except RemoteDispatchError:
-            return None
+        except (RemoteDispatchError, LegImageUnverified):
+            return None           # unknown right now: wait / retry, never "wrong"
         except LegImageMismatch:
             return False
 
@@ -457,7 +463,7 @@ class _HostHook:
             raise LegImageMismatch(
                 f"{getattr(host, 'name', host)} runs worker code {got[0][:12]}… but this "
                 f"leg's era (start {block}) pins {want_fp[:12]}… (after image) — not "
-                "dispatched here")
+                "dispatched here", code_evidence=True)
         if got[1] != want_img:
             raise LegImageMismatch(
                 f"{getattr(host, 'name', host)} reports runtime image "
@@ -512,50 +518,95 @@ def log_image_qualification(cfg) -> dict | None:
 
 # ── owner rule 2026-11-02: never the wrong image ────────────────────────────
 #
-# Any pod / executor whose RUNTIME image is not the leg's pinned image —
-# caught by the dispatch hook or by the worker's own FINAL refusal (rc 2,
-# ``contract.assert_train_image``, before any corpus streaming or training) —
-# is released at once and its host + executor are marked bad, so a bad host
-# costs at most one short pod. The retry is unburned, keeps the leg's billing
-# and is capped (IMAGE_RETRY_CAP per leg per IMAGE_RETRY_WINDOW_S).
+# Post-switch legs only (pre-switch behaviour is exactly the release before
+# it). A pod / lane the leg cannot use because of its image is released at
+# once; its host + executor are marked bad ONLY on evidence the trainer
+# measured on the pod itself (the worker code fingerprint) — never on our
+# injected image env or our deployed config. The retry is unburned, keeps the
+# leg's billing and is capped (IMAGE_RETRY_CAP per leg per IMAGE_RETRY_WINDOW_S,
+# persisted across restarts); a capped leg WAITS (no_capacity), it is not
+# dropped.
 
-IMAGE_REFUSAL_MARKER = "refusing FINAL run: "
 IMAGE_RETRY_CAP = 2
 IMAGE_RETRY_WINDOW_S = 3600.0
 WRONG_IMAGE_BAD_SECONDS = 24 * 3600.0
+IMAGE_REFUSALS_FILE = "image_refusals.json"
 
 
-def is_image_refusal_text(text: str) -> bool:
-    """A worker exit that is ``assert_train_image``'s FINAL refusal."""
-    return IMAGE_REFUSAL_MARKER in str(text or "")
+class ImageRetryCapped(LegImageMismatch):
+    """The leg already lost :data:`IMAGE_RETRY_CAP` pods to the wrong image in
+    the window: it waits (unburned, no_capacity) instead of renting again."""
 
 
-def _refusals(runner) -> dict:
-    return runner.__dict__.setdefault("_image_refusals", {})
+def worker_refused_image(exc: BaseException) -> bool:
+    """The worker's own structured FINAL image refusal (exit 2 + the stdout
+    sentinel, :func:`cascade.trainer.remote.worker_image_refusal`) — set by
+    the dispatcher from the exit code and the worker's stdout, never from
+    message text."""
+    return bool(getattr(exc, "image_refusal", False)) and getattr(exc, "returncode", None) == 2
 
 
-def note_image_refusal(runner, hotkey: str, *, now: float | None = None) -> int:
-    """Count one wrong-image refusal for ``hotkey``'s leg; returns how many
-    fell inside the window."""
+def leg_key(hotkey: str, role: str = "", era_seed: object = "") -> str:
+    return f"{hotkey}|{role}|{era_seed}"
+
+
+def _refusals_path(runner):
+    root = getattr(runner, "work_root", None)
+    return Path(root) / IMAGE_REFUSALS_FILE if root else None
+
+
+def _load_refusals(runner) -> dict:
+    mem = runner.__dict__.setdefault("_image_refusals", None)
+    if mem is not None:
+        return mem
+    data: dict = {}
+    path = _refusals_path(runner)
+    if path is not None and path.is_file():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            data = {str(k): [float(t) for t in v] for k, v in dict(raw).items()}
+        except (OSError, ValueError, TypeError) as e:
+            log.warning("image refusal counts unreadable (%s); starting empty", e)
+    runner.__dict__["_image_refusals"] = data
+    return data
+
+
+def _window(seen, now):
+    return [t for t in seen if now - t < IMAGE_RETRY_WINDOW_S]
+
+
+def note_image_refusal(runner, key: str, *, now: float | None = None) -> int:
+    """Count one wrong-image pod for leg ``key``; persisted next to the
+    trainer state. Returns the count inside the window."""
+    import time
+
+    from ..shared.atomic import write_text_atomic
+
+    now = time.time() if now is None else float(now)
+    with _FP_LOCK:
+        data = _load_refusals(runner)
+        for k in list(data):
+            data[k] = _window(data[k], now)
+            if not data[k]:
+                data.pop(k)
+        data.setdefault(key, []).append(now)
+        n = len(data[key])
+        path = _refusals_path(runner)
+        if path is not None:
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                write_text_atomic(path, json.dumps(data, sort_keys=True))
+            except OSError as e:
+                log.warning("image refusal counts not persisted: %s", e)
+        return n
+
+
+def image_retry_exhausted(runner, key: str, *, now: float | None = None) -> bool:
     import time
 
     now = time.time() if now is None else float(now)
     with _FP_LOCK:
-        seen = [t for t in _refusals(runner).get(hotkey, []) if now - t < IMAGE_RETRY_WINDOW_S]
-        seen.append(now)
-        _refusals(runner)[hotkey] = seen
-        return len(seen)
-
-
-def image_retry_exhausted(runner, hotkey: str, *, now: float | None = None) -> bool:
-    """Whether ``hotkey``'s leg already hit :data:`IMAGE_RETRY_CAP` wrong-image
-    refusals in the window (the next rent waits)."""
-    import time
-
-    now = time.time() if now is None else float(now)
-    with _FP_LOCK:
-        seen = [t for t in _refusals(runner).get(hotkey, []) if now - t < IMAGE_RETRY_WINDOW_S]
-    return len(seen) >= IMAGE_RETRY_CAP
+        return len(_window(_load_refusals(runner).get(key, []), now)) >= IMAGE_RETRY_CAP
 
 
 def mark_wrong_image_host(runner, host, pod, reason: str) -> list[str]:

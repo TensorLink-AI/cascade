@@ -509,7 +509,7 @@ def test_unreachable_pod_during_the_probe_is_a_transport_failure(monkeypatch, mo
     assert not isinstance(ei.value, leg_pins.LegImageMismatch)
 
 
-def test_a_reachable_pod_without_the_package_is_an_image_mismatch(monkeypatch):
+def test_a_failed_fingerprint_probe_is_unverified_never_wrong(monkeypatch):
     import subprocess
 
     from cascade.trainer import leg_pins
@@ -519,7 +519,8 @@ def test_a_reachable_pod_without_the_package_is_an_image_mismatch(monkeypatch):
                         subprocess.CompletedProcess(argv, 1, "", "find: no such dir"))
     monkeypatch.setattr("cascade.trainer.remote.build_ssh_argv", lambda h, cmd: ["ssh", cmd])
     leg_pins._FINGERPRINTS.clear()
-    with pytest.raises(leg_pins.LegImageMismatch):
+    # review 4: remote python / OOM / disk / missing dir = UNKNOWN (no blame)
+    with pytest.raises(leg_pins.LegImageUnverified):
         leg_pins.host_code_fingerprint(_LaneHost("lane", "10.0.0.8"))
 
 
@@ -704,84 +705,246 @@ def test_unreachable_lane_means_wait_never_no_lane():
 # ── owner rule 2026-11-02: never the wrong image ─────────────────────────────
 
 
-def test_image_refusal_retry_cap():
+def _armed_post(acfg):
+    return A.apply_image_decoupled_activation(acfg, SW)
+
+
+def test_worker_image_refusal_needs_rc2_and_the_workers_own_last_line():
+    """Review 4 CRITICAL: never free text. A generator raising the old marker
+    (worker exit 3 / an rc-1 stderr tail) is never an image refusal."""
+    from cascade.trainer.contract import IMAGE_REFUSAL_SENTINEL as S
+    from cascade.trainer.leg_pins import worker_refused_image
+    from cascade.trainer.remote import RemoteDispatchError, worker_image_refusal
+
+    assert worker_image_refusal(2, f"log line\n{S}\n")
+    assert not worker_image_refusal(3, S)                         # miner rejection exit
+    assert not worker_image_refusal(1, S)
+    assert not worker_image_refusal(2, f"{S}\nmore output")       # not the last line
+    assert not worker_image_refusal(2, "refusing FINAL run: runtime image sha256:a")
+    e = RemoteDispatchError("miner submission rejected: ValueError('refusing FINAL run: x "
+                            f"{S}')", returncode=3)
+    assert not worker_refused_image(e)
+    e2 = RemoteDispatchError("rc=2", returncode=2)
+    assert not worker_refused_image(e2)                           # flag only from stdout
+    e2.image_refusal = True
+    assert worker_refused_image(e2)
+
+
+def test_image_refusal_retry_cap_is_per_leg_and_persists(tmp_path):
     from cascade.trainer.leg_pins import (
         IMAGE_RETRY_CAP,
         IMAGE_RETRY_WINDOW_S,
         image_retry_exhausted,
-        is_image_refusal_text,
+        leg_key,
         note_image_refusal,
     )
 
-    r = SimpleNamespace()
-    assert is_image_refusal_text("worker exit 2: refusing FINAL run: runtime image sha256:a")
-    assert not is_image_refusal_text("worker exit 2: config error")
+    r = SimpleNamespace(work_root=tmp_path)
+    k = leg_key("hk", "challenger", 4242)
     for i in range(IMAGE_RETRY_CAP):
-        assert not image_retry_exhausted(r, "hk", now=100.0)
-        note_image_refusal(r, "hk", now=100.0 + i)
-    assert image_retry_exhausted(r, "hk", now=200.0)
-    assert not image_retry_exhausted(r, "other", now=200.0)
-    assert not image_retry_exhausted(r, "hk", now=100.0 + IMAGE_RETRY_WINDOW_S + 5)
+        assert not image_retry_exhausted(r, k, now=100.0)
+        note_image_refusal(r, k, now=100.0 + i)
+    assert image_retry_exhausted(r, k, now=200.0)
+    assert not image_retry_exhausted(r, leg_key("hk", "challenger", 4243), now=200.0)
+    assert not image_retry_exhausted(r, leg_key("hk", "king", 4242), now=200.0)
+    restarted = SimpleNamespace(work_root=tmp_path)                 # a trainer restart
+    assert image_retry_exhausted(restarted, k, now=200.0)
+    assert not image_retry_exhausted(restarted, k, now=100.0 + IMAGE_RETRY_WINDOW_S + 5)
 
 
-def test_wrong_image_pod_marks_host_and_executor_bad():
+def test_wrong_image_pod_blames_only_on_measured_code_evidence(tmp_path):
     from cascade.provision.core import quarantined_hosts
     from cascade.provision.lium_identity import load_identities
     from cascade.trainer.leg_pins import (
         ImageAfterUnqualified,
         LegImageMismatch,
+        LegImageUnverified,
         image_retry_exhausted,
     )
     from cascade.trainer.runner_funded_legs import _wrong_image_pod
 
-    r = SimpleNamespace(_funded_claim_meta={"exec-1": (0.0, "pod-1"), "exec-2": (0.0, "pod-9")})
+    r = SimpleNamespace(work_root=tmp_path,
+                        _funded_claim_meta={"exec-1": (0.0, "pod-1"), "exec-2": (0.0, "pod-9")})
     host = SimpleNamespace(host="203.0.113.7", name="funded")
     pod = SimpleNamespace(instance_id="pod-1")
-    _wrong_image_pod(r, "hk", host, pod, ImageAfterUnqualified("our config"))
-    assert "exec-1" not in load_identities()["bad"]             # our config, not the host
-    _wrong_image_pod(r, "hk", host, pod, LegImageMismatch("runtime image sha256:b"))
+    _wrong_image_pod(r, "k", host, pod, ImageAfterUnqualified("our config"))
+    _wrong_image_pod(r, "k", host, pod, LegImageUnverified("probe failed"))
+    _wrong_image_pod(r, "k", host, pod, LegImageMismatch("our injected env differs"))
+    assert load_identities()["bad"] == {} and "203.0.113.7" not in quarantined_hosts()
+    _wrong_image_pod(r, "k", host, pod, LegImageMismatch("pod code differs",
+                                                         code_evidence=True))
     bad = load_identities()["bad"]
     assert "exec-1" in bad and "exec-2" not in bad
     assert "203.0.113.7" in quarantined_hosts()
-    _wrong_image_pod(r, "hk", host, pod, LegImageMismatch("again"))
-    assert image_retry_exhausted(r, "hk")                       # a bad host costs one pod
+    assert image_retry_exhausted(r, "k")          # env mismatch + code mismatch = 2 pods
 
 
-def test_capped_funded_leg_waits_without_renting():
-    from cascade.trainer.faults import _FundedLegSkip
-    from cascade.trainer.leg_pins import IMAGE_RETRY_CAP, note_image_refusal
+def test_capped_post_switch_leg_waits_without_renting(acfg, tmp_path):
+    from cascade.trainer.leg_pins import (
+        IMAGE_RETRY_CAP,
+        ImageRetryCapped,
+        leg_key,
+        note_image_refusal,
+    )
     from cascade.trainer.runner_funded_legs import _FundedLegMixin
 
+    armed = _armed_post(acfg)
     seen = []
     runner = SimpleNamespace(
-        cfg=load_chain_config(REPO / "chain.toml"), _funded_leg_failures={},
+        cfg=armed, work_root=tmp_path, _funded_leg_failures={},
         _record_funded_failure=lambda hk, msg, **kw: seen.append(kw),
         _rent_funded_host=lambda *a, **k: pytest.fail("rented past the wrong-image cap"))
     for _ in range(IMAGE_RETRY_CAP):
-        note_image_refusal(runner, "hk")
+        note_image_refusal(runner, leg_key("hk", "challenger", 1))
     gen = SimpleNamespace(hotkey="hk", uid=1, ref="ns/g@sha256:" + "1" * 64)
-    with pytest.raises(_FundedLegSkip):
+    with pytest.raises(ImageRetryCapped):                         # waits, not dropped
         _FundedLegMixin._run_funded_leg_scoped(
-            runner, None, gen, SimpleNamespace(base_seed=1), 1, SimpleNamespace(), "",
-            warm_start_ref="")
+            runner, None, gen, SimpleNamespace(base_seed=1), SW, armed.training.at_block(SW),
+            "", warm_start_ref="")
     assert seen == [{"miner_fault": False, "error_class": "no_capacity", "burn": False}]
 
 
-def test_lane_whose_worker_refuses_final_leaves_the_rotation():
+def test_pre_switch_leg_ignores_the_cap(acfg, tmp_path):
+    """Review 4 HIGH 2: pre-switch behaviour is exactly the release's."""
+    from cascade.trainer.leg_pins import IMAGE_RETRY_CAP, leg_key, note_image_refusal
+    from cascade.trainer.runner_funded_legs import _FundedLegMixin
+
+    armed = _armed_post(acfg)
+    runner = SimpleNamespace(cfg=armed, work_root=tmp_path, _funded_leg_failures={},
+                             _record_funded_failure=lambda *a, **k: None)
+    for _ in range(IMAGE_RETRY_CAP):
+        note_image_refusal(runner, leg_key("hk", "challenger", 1))
+    sentinel = RuntimeError("reached the reupload step")
+
+    def _reupload(*a, **k):
+        raise sentinel
+
+    import cascade.trainer.runner_funded_legs as RFL
+
+    orig = RFL._reupload_pending
+    RFL._reupload_pending = _reupload
+    try:
+        with pytest.raises(RuntimeError, match="reached the reupload step"):
+            _FundedLegMixin._run_funded_leg_scoped(
+                runner, None, SimpleNamespace(hotkey="hk", uid=1, ref="r"),
+                SimpleNamespace(base_seed=1), SW - 3600,
+                armed.training.at_block(SW - 3600), "", warm_start_ref="")
+    finally:
+        RFL._reupload_pending = orig
+
+
+class _RefusingDisp:
+    def __init__(self, hook, *, rc=2, sentinel=True, text="worker exit 2"):
+        self.host_hook, self.rc, self.sentinel, self.text = hook, rc, sentinel, text
+
+    def dispatch(self, host, **kw):
+        from cascade.trainer.remote import RemoteDispatchError
+
+        e = RemoteDispatchError(self.text, returncode=self.rc)
+        e.image_refusal = self.sentinel and self.rc == 2
+        raise e
+
+
+def _real_hook(cfg, fp):
+    from cascade.trainer.leg_pins import dispatch_host_hook
+
+    return dispatch_host_hook(SimpleNamespace(cfg=cfg, deployed_chain_toml=None),
+                              fingerprint_fn=lambda h, fresh=False: fp["v"],
+                              image_fn=lambda h, fresh=False: RC16)
+
+
+def test_post_switch_lane_refusal_holds_the_lane_only_on_measured_code(acfg):
     from cascade.trainer.leg_pins import LegImageMismatch
     from cascade.trainer.loop import TrainerRunner, _FinalLanePool
 
-    hosts = [_LaneHost("bad", "10.0.0.1"), _LaneHost("good", "10.0.0.2")]
+    armed = _armed_post(acfg)
+    fp = {"v": FP16}
+    hook = _real_hook(armed, fp)
+    hosts = [_LaneHost("lane", "10.0.0.1")]
     pool = _FinalLanePool(hosts, lambda: hosts, breaker_threshold=1)
+    # matching passed (after code), the worker refused: our probe now sees the
+    # same release => our config skew => lane stays in rotation, no breaker
+    with pytest.raises(LegImageMismatch) as ei:
+        TrainerRunner._dispatch_on_free_lane(_RefusingDisp(hook), pool, hosts, describe="x",
+                                             role="challenger", contract_block=SW)
+    assert not ei.value.code_evidence and [h.name for h in pool.known_hosts()] == ["lane"]
+    # the lane flips to another release between the match and the refusal
+    calls = {"n": 0}
 
-    class Disp:
-        host_hook = None
+    def flip(h, fresh=False):
+        calls["n"] += 1
+        return FP16 if not fresh or calls["n"] < 3 else armed.round.worker_code_fingerprint
+    hook.fingerprint_fn = flip
+    with pytest.raises(LegImageMismatch) as ei:
+        TrainerRunner._dispatch_on_free_lane(_RefusingDisp(hook), pool, hosts, describe="x",
+                                             role="challenger", contract_block=SW)
+    assert ei.value.code_evidence and pool.known_hosts() == []
 
-        def dispatch(self, host, **kw):
-            raise RuntimeError("worker exit 2: refusing FINAL run: runtime image sha256:"
-                               + "1" * 64 + " != pinned train_image_digest sha256:" + "2" * 64)
 
-    with pytest.raises(LegImageMismatch, match="wrong runtime image"):
-        TrainerRunner._dispatch_on_free_lane(Disp(), pool, hosts, describe="x",
-                                             role="challenger")
-    assert [h.name for h in pool.known_hosts()] == ["good"]       # released, not retried
+def test_marker_text_from_a_generator_is_a_plain_failure(acfg):
+    """A miner's exception carrying the old marker never holds a lane."""
+    from cascade.trainer.leg_pins import LegImageMismatch
+    from cascade.trainer.loop import TrainerRunner, _FinalLanePool
+
+    armed = _armed_post(acfg)
+    hook = _real_hook(armed, {"v": FP16})
+    hosts = [_LaneHost("lane", "10.0.0.1")]
+    pool = _FinalLanePool(hosts, lambda: hosts)
+    d = _RefusingDisp(hook, rc=3, sentinel=False,
+                      text="miner submission rejected: ValueError('refusing FINAL run: x')")
+    with pytest.raises(Exception) as ei:
+        TrainerRunner._dispatch_on_free_lane(d, pool, hosts, describe="x", role="challenger",
+                                             contract_block=SW)
+    assert not isinstance(ei.value, LegImageMismatch)
+    assert [h.name for h in pool.known_hosts()] == ["lane"]
+
+
+def test_pre_switch_lane_refusal_keeps_the_release_behaviour(acfg):
+    from cascade.trainer.leg_pins import LegImageMismatch
+    from cascade.trainer.loop import TrainerRunner, _FinalLanePool
+
+    armed = _armed_post(acfg)
+    hook = _real_hook(armed, {"v": FP16})
+    hosts = [_LaneHost("lane", "10.0.0.1")]
+    pool = _FinalLanePool(hosts, lambda: hosts)
+    with pytest.raises(Exception) as ei:
+        TrainerRunner._dispatch_on_free_lane(_RefusingDisp(hook), pool, hosts, describe="x",
+                                             role="challenger", contract_block=SW - 3600)
+    assert not isinstance(ei.value, LegImageMismatch)
+    assert [h.name for h in pool.known_hosts()] == ["lane"]
+
+
+def test_runtime_image_probe_reads_what_the_worker_sees(monkeypatch):
+    import subprocess
+
+    from cascade.trainer import leg_pins
+
+    host = _LaneHost("lane", "10.0.0.5")
+    host.static_env = (("CASCADE_TRAIN_IMAGE_DIGEST", RC16),)
+    assert leg_pins.host_runtime_image(host) == RC16           # sourced into the worker
+    host.static_env = ()
+    out = {"rc": 0, "stdout": RC16 + "\n"}
+    monkeypatch.setattr("cascade.trainer.remote.run_ssh", lambda argv, timeout, stdin_text=None:
+                        subprocess.CompletedProcess(argv, out["rc"], out["stdout"], ""))
+    monkeypatch.setattr("cascade.trainer.remote.build_ssh_argv", lambda h, cmd: ["ssh", cmd])
+    leg_pins._RUNTIME_IMAGES.clear()
+    assert leg_pins.host_runtime_image(host, fresh=True) == RC16
+    out.update(rc=1, stdout="")
+    assert leg_pins.host_runtime_image(host, fresh=True) == ""     # unset: a real answer
+    out.update(rc=127)
+    with pytest.raises(leg_pins.LegImageUnverified):
+        leg_pins.host_runtime_image(host, fresh=True)
+    leg_pins._RUNTIME_IMAGES.clear()
+
+
+def test_unverified_probe_is_unknown_in_matching(acfg):
+    from cascade.trainer.leg_pins import LegImageUnverified, dispatch_host_hook
+
+    armed = _armed_post(acfg)
+
+    def fp(h, fresh=False):
+        raise LegImageUnverified("remote python failed")
+
+    hook = dispatch_host_hook(SimpleNamespace(cfg=armed), fingerprint_fn=fp,
+                              image_fn=lambda h, fresh=False: RC16)
+    assert hook.match_state(_LaneHost("a", "10.0.0.1"), SW) is None
