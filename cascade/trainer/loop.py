@@ -1533,17 +1533,23 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
                 raise LegImageMismatch(
                     f"{describe}: no lane runs this leg's era image (contract block "
                     f"{_block}); bring a lane up on that image")
-            aside: list = []
-            try:
-                for _ in range(2 * max(1, len(pool))):
-                    lane = _plain_take()
-                    if _matches(lane, _block):
-                        return lane
-                    aside.append(lane)
-                raise LegImageMismatch(f"{describe}: no free lane on this leg's era image")
-            finally:
-                for lane in aside:
-                    free_lanes.put(lane)
+
+            def _is_era_lane(h):
+                return _matches(h, _block)
+
+            if isinstance(free_lanes, _FinalLanePool):
+                # filtered take: lanes of the other era stay idle for their
+                # legs while this one waits (deadline semantics unchanged)
+                return free_lanes.get(deadline=deadline, match=_is_era_lane)
+            # a plain queue: never hold a lane while waiting — hand each
+            # non-matching one straight back and retry briefly
+            for _ in range(4 * max(1, len(pool))):
+                lane = _plain_take()
+                if _is_era_lane(lane):
+                    return lane
+                free_lanes.put(lane)
+                time.sleep(0.05)
+            raise LegImageMismatch(f"{describe}: no free lane on this leg's era image")
 
         _take = _take_matching
         host = _take()

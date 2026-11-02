@@ -308,6 +308,56 @@ def test_no_lane_on_the_era_image_refuses_cleanly_without_the_breaker():
     assert [h.name for h in pool.known_hosts()] == ["old"] and d.calls == []
 
 
+def test_split_fleet_two_eras_never_starve_each_other():
+    """Review 2: a post-switch leg waiting for the busy after-image lane must
+    NOT hold the idle current-image lane — a concurrent pre-switch leg takes
+    it at once; the waiter gets its lane when it is handed back."""
+    import time as _t
+
+    from cascade.trainer.loop import TrainerRunner, _FinalLanePool
+
+    old, new = _LaneHost("old", "10.0.0.1"), _LaneHost("new", "10.0.0.2")
+    hosts = [old, new]
+    pool = _FinalLanePool(hosts, lambda: hosts)
+    first, second = pool.get(), pool.get()
+    assert {first.name, second.name} == {"old", "new"}
+    pool.put(old)                                    # "new" is busy with another leg
+    d = _LaneDisp(_Hook({"old": "current", "new": "after"}))
+    got: dict = {}
+
+    def post_leg():
+        got["post"] = TrainerRunner._dispatch_on_free_lane(
+            d, pool, hosts, describe="post", role="challenger", contract_block=SW)
+
+    t = threading.Thread(target=post_leg, daemon=True)
+    t.start()
+    _t.sleep(0.3)
+    assert "post" not in got                         # waiting for "new"
+    pre = TrainerRunner._dispatch_on_free_lane(d, pool, hosts, describe="pre",
+                                               role="challenger", contract_block=SW - 3600)
+    assert pre.host == "old"                         # not held by the waiting leg
+    pool.put(new)                                    # the busy leg hands it back
+    t.join(10)
+    assert got["post"].host == "new"
+    assert sorted(h.name for h in pool.known_hosts()) == ["new", "old"]
+
+
+def test_filtered_take_respects_the_deadline():
+    import time as _t
+
+    from cascade.trainer.faults import _LaneDeadlinePassed
+    from cascade.trainer.lane_pool import _FinalLanePool
+
+    old = _LaneHost("old", "10.0.0.1")
+    new = _LaneHost("new", "10.0.0.2")
+    pool = _FinalLanePool([old, new], lambda: [old, new])
+    pool.get(), pool.get()
+    pool.put(old)                                    # only the other era's lane is idle
+    with pytest.raises(_LaneDeadlinePassed):
+        pool.get(deadline=_t.time() - 1, match=lambda h: h.name == "new")
+    assert pool.get(block=False).name == "old"       # never taken by the refused leg
+
+
 def test_fingerprint_cache_is_keyed_per_container_and_expires(monkeypatch):
     from cascade.trainer import leg_pins
 
