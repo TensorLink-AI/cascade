@@ -309,68 +309,167 @@ def host_code_fingerprint(host, *, fresh: bool = False, clock=None) -> str:
 
 
 
+_RUNTIME_IMAGES: dict[tuple, tuple[str, float]] = {}
+_IMAGE_RE = re.compile(r"sha256:[0-9a-f]{64}")
+
+
+def parse_runtime_image(printenv_out: str, bashrc_out: str, environ_out: str) -> str:
+    """The ``sha256:<64hex>`` the pod's worker will see as
+    ``CASCADE_TRAIN_IMAGE_DIGEST`` (login env, then the provisioner's
+    ``~/.bashrc`` export, then the container's launch env), or ""."""
+    for text in (printenv_out, bashrc_out):
+        m = _IMAGE_RE.search(str(text or "").lower())
+        if m:
+            return m.group(0)
+    for entry in str(environ_out or "").split("\0"):
+        if entry.startswith("CASCADE_TRAIN_IMAGE_DIGEST="):
+            m = _IMAGE_RE.search(entry.lower())
+            if m:
+                return m.group(0)
+    return ""
+
+
+def host_runtime_image(host, *, fresh: bool = False, clock=None) -> str:
+    """The runtime image identity a worker on ``host`` reports
+    (``CASCADE_TRAIN_IMAGE_DIGEST``, exactly what ``assert_train_image``
+    reads), cached like :func:`host_code_fingerprint`. "" = unset (a worker
+    there refuses every FINAL). Unreachable ⇒ ``RemoteDispatchError(255)``."""
+    import subprocess
+    import time
+
+    from ..provision.codeprint import CHECK_TIMEOUT_SECONDS
+    from .remote import RemoteDispatchError, build_ssh_argv, run_ssh
+
+    now = (clock or time.monotonic)()
+    key = _fp_key(host)
+    with _FP_LOCK:
+        hit = _RUNTIME_IMAGES.get(key)
+        if hit is not None and not fresh and now - hit[1] < FINGERPRINT_TTL_SECONDS:
+            return hit[0]
+    outs = []
+    home = "/root" if str(getattr(host, "user", "root") or "root") == "root" else \
+        f"/home/{getattr(host, 'user', '')}"
+    for argv in (["printenv", "CASCADE_TRAIN_IMAGE_DIGEST"],
+                 ["grep", "-s", "^export CASCADE_TRAIN_IMAGE_DIGEST=", f"{home}/.bashrc"],
+                 ["cat", "/proc/1/environ"]):
+        try:
+            proc = run_ssh(build_ssh_argv(host, shlex.join(argv)), timeout=CHECK_TIMEOUT_SECONDS)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            raise RemoteDispatchError(f"pod unreachable during the runtime image probe of "
+                                      f"{getattr(host, 'name', host)}: {e}",
+                                      returncode=255) from e
+        if getattr(proc, "returncode", 0) == 255:
+            raise RemoteDispatchError(f"pod unreachable during the runtime image probe of "
+                                      f"{getattr(host, 'name', host)}", returncode=255)
+        outs.append(proc.stdout if getattr(proc, "returncode", 1) == 0 else "")
+    got = parse_runtime_image(*outs)
+    with _FP_LOCK:
+        _RUNTIME_IMAGES[key] = (got, now)
+    return got
+
+
 class _HostHook:
     """``hook(host, block) -> host`` for the dispatcher (``block`` = the leg's
-    ``--contract-block``, its era start). Pre-switch leg: the host must run
-    the CURRENT worker code; post-switch leg: the AFTER code, and the host
-    gets the rendered post-switch chain.toml. :meth:`matches` lets a lane
-    pool pick a lane on the leg's image instead of taking one and refusing."""
+    ``--contract-block``, its era start). It acts ONLY on legs of eras under
+    the resolved switch (:meth:`filters`): such a leg needs a host whose
+    worker code AND runtime image identity are the after release, and gets
+    the rendered post-switch chain.toml. Every other leg — a pre-switch era,
+    or any era while the vote is unresolved — is handed through untouched
+    (lane handout and dispatch exactly as without the repin; the worker's own
+    FINAL image check still guards it). :meth:`match_state` lets a lane pool
+    pick a matching lane instead of taking one and refusing."""
 
-    def __init__(self, runner, fingerprint_fn):
+    # a lane known to run another image is re-measured at most this often
+    REPROBE_SECONDS = 60.0
+
+    def __init__(self, runner, fingerprint_fn, image_fn=None, clock=None):
+        import time
+
         self.runner, self.fingerprint_fn = runner, fingerprint_fn
+        self.image_fn = image_fn if image_fn is not None else host_runtime_image
+        self.clock = clock or time.monotonic
+        self._reprobed: dict[tuple, float] = {}
 
-    def _want(self, block) -> str:
-        return str(round_pins_at(self.runner.cfg, int(block)).worker_code_fingerprint
-                   or "").lower()
+    def filters(self, block) -> bool:
+        cfg = self.runner.cfg
+        return bool(image_after_armed(cfg) and block is not None
+                    and image_decoupled_era(cfg, int(block)))
+
+    def _want(self, block) -> tuple[str, str]:
+        cfg = self.runner.cfg
+        fp = str(round_pins_at(cfg, int(block)).worker_code_fingerprint or "").lower()
+        img = image_digest(str(cfg.training.at_block(int(block)).train_image_digest or ""))
+        return fp, img
 
     def _fingerprint(self, host, *, fresh=False) -> str:
         return self.fingerprint_fn(host, fresh=fresh)
 
+    def _image(self, host, *, fresh=False) -> str:
+        return self.image_fn(host, fresh=fresh)
+
+    def _observe(self, host, *, fresh: bool) -> tuple[str, str]:
+        return self._fingerprint(host, fresh=fresh), self._image(host, fresh=fresh)
+
     def require_qualified(self, block) -> None:
         """Raise :class:`ImageAfterUnqualified` for a post-switch leg whose
         after release is not qualified (before any lane is taken)."""
-        cfg = self.runner.cfg
-        if image_after_armed(cfg) and block is not None and image_decoupled_era(cfg, int(block)):
-            require_after_qualified(cfg, f"dispatch (contract block {int(block)})")
+        if self.filters(block):
+            require_after_qualified(self.runner.cfg, f"dispatch (contract block {int(block)})")
 
-    def matches(self, host, block) -> bool:
-        """Whether ``host`` runs the leg's era image (re-measured on a miss)."""
-        if not image_after_armed(self.runner.cfg) or block is None:
-            return True
-        want = self._want(block)
-        if not want:
-            return True
+    def match_state(self, host, block):
+        """True: ``host`` runs the leg's era release (code and runtime image);
+        False: it runs another one; None: unknown right now (unreachable) —
+        wait / retry, never "no lane". A host seen on another release is
+        re-measured at most every :attr:`REPROBE_SECONDS`."""
         from .remote import RemoteDispatchError
 
+        if not self.filters(block):
+            return True
+        want = self._want(block)
         try:
-            return (self._fingerprint(host) == want
-                    or self._fingerprint(host, fresh=True) == want)
-        except (LegImageMismatch, RemoteDispatchError):
-            return False          # unprovable / unreachable: not this leg's lane
+            got = self._observe(host, fresh=False)
+            if got == want:
+                return True
+            key = _fp_key(host)
+            now = self.clock()
+            if now - self._reprobed.get(key, float("-inf")) < self.REPROBE_SECONDS:
+                return False
+            self._reprobed[key] = now
+            return self._observe(host, fresh=True) == want
+        except RemoteDispatchError:
+            return None
+        except LegImageMismatch:
+            return False
+
+    def matches(self, host, block) -> bool:
+        """Whether ``host`` may take the leg (:meth:`match_state` is True)."""
+        return self.match_state(host, block) is True
 
     def __call__(self, host, block):
-        cfg = self.runner.cfg
-        if not image_after_armed(cfg) or block is None:
+        if not self.filters(block):
             return host
-        post = image_decoupled_era(cfg, int(block))
-        if post:
-            self.require_qualified(block)
-        want = self._want(block)
-        if want:
-            got = self._fingerprint(host)
-            if got != want:
-                got = self._fingerprint(host, fresh=True)   # a re-bootstrapped lane
-            if got != want:
-                raise LegImageMismatch(
-                    f"{getattr(host, 'name', host)} runs worker code {got[:12]}… but this "
-                    f"leg's era (start {block}) pins {want[:12]}… "
-                    f"({'after' if post else 'current'} image) — not dispatched here")
-        return _push_after_toml(self.runner, host) if post else host
+        self.require_qualified(block)
+        want_fp, want_img = self._want(block)
+        got = self._observe(host, fresh=False)
+        if got != (want_fp, want_img):
+            got = self._observe(host, fresh=True)        # a re-bootstrapped lane
+        if got[0] != want_fp:
+            raise LegImageMismatch(
+                f"{getattr(host, 'name', host)} runs worker code {got[0][:12]}… but this "
+                f"leg's era (start {block}) pins {want_fp[:12]}… (after image) — not "
+                "dispatched here")
+        if got[1] != want_img:
+            raise LegImageMismatch(
+                f"{getattr(host, 'name', host)} reports runtime image "
+                f"{got[1][:19] or '<unset>'} but this leg's era (start {block}) pins "
+                f"{want_img[:19]} — its worker would refuse FINAL; not dispatched here")
+        return _push_after_toml(self.runner, host)
 
 
-def dispatch_host_hook(runner, *, fingerprint_fn=host_code_fingerprint):
+def dispatch_host_hook(runner, *, fingerprint_fn=host_code_fingerprint, image_fn=None,
+                       clock=None):
     """The dispatcher's per-leg image hook (:class:`_HostHook`)."""
-    return _HostHook(runner, fingerprint_fn)
+    return _HostHook(runner, fingerprint_fn, image_fn, clock)
 
 
 # ── the per-tick signal: ERROR log + operator alert ─────────────────────────
@@ -409,3 +508,80 @@ def log_image_qualification(cfg) -> dict | None:
                   "qualify it and turn the override off",
                   str(cfg.v2.train_image_digest_after)[:19], cond["reason"])
     return cond
+
+
+# ── owner rule 2026-11-02: never the wrong image ────────────────────────────
+#
+# Any pod / executor whose RUNTIME image is not the leg's pinned image —
+# caught by the dispatch hook or by the worker's own FINAL refusal (rc 2,
+# ``contract.assert_train_image``, before any corpus streaming or training) —
+# is released at once and its host + executor are marked bad, so a bad host
+# costs at most one short pod. The retry is unburned, keeps the leg's billing
+# and is capped (IMAGE_RETRY_CAP per leg per IMAGE_RETRY_WINDOW_S).
+
+IMAGE_REFUSAL_MARKER = "refusing FINAL run: "
+IMAGE_RETRY_CAP = 2
+IMAGE_RETRY_WINDOW_S = 3600.0
+WRONG_IMAGE_BAD_SECONDS = 24 * 3600.0
+
+
+def is_image_refusal_text(text: str) -> bool:
+    """A worker exit that is ``assert_train_image``'s FINAL refusal."""
+    return IMAGE_REFUSAL_MARKER in str(text or "")
+
+
+def _refusals(runner) -> dict:
+    return runner.__dict__.setdefault("_image_refusals", {})
+
+
+def note_image_refusal(runner, hotkey: str, *, now: float | None = None) -> int:
+    """Count one wrong-image refusal for ``hotkey``'s leg; returns how many
+    fell inside the window."""
+    import time
+
+    now = time.time() if now is None else float(now)
+    with _FP_LOCK:
+        seen = [t for t in _refusals(runner).get(hotkey, []) if now - t < IMAGE_RETRY_WINDOW_S]
+        seen.append(now)
+        _refusals(runner)[hotkey] = seen
+        return len(seen)
+
+
+def image_retry_exhausted(runner, hotkey: str, *, now: float | None = None) -> bool:
+    """Whether ``hotkey``'s leg already hit :data:`IMAGE_RETRY_CAP` wrong-image
+    refusals in the window (the next rent waits)."""
+    import time
+
+    now = time.time() if now is None else float(now)
+    with _FP_LOCK:
+        seen = [t for t in _refusals(runner).get(hotkey, []) if now - t < IMAGE_RETRY_WINDOW_S]
+    return len(seen) >= IMAGE_RETRY_CAP
+
+
+def mark_wrong_image_host(runner, host, pod, reason: str) -> list[str]:
+    """Never rent this host / executor again for the image: quarantine the
+    host IP and mark every executor the trainer claimed for ``pod`` bad
+    (with its learned GPU / site identity, :mod:`cascade.provision.lium_identity`).
+    Best-effort; returns the executors marked."""
+    from ..provision.core import record_host_quarantine
+    from ..provision.lium_identity import mark_executor_bad
+
+    why = f"wrong runtime image: {reason}"[:300]
+    ip = str(getattr(host, "host", "") or "")
+    if ip and ip not in ("127.0.0.1", "localhost"):
+        try:
+            record_host_quarantine(ip, why, seconds=WRONG_IMAGE_BAD_SECONDS, host_fault=True)
+        except Exception as e:  # noqa: BLE001 — never mask the refusal
+            log.warning("wrong-image host %s not quarantined: %s", ip, e)
+    marked: list[str] = []
+    iid = str(getattr(pod, "instance_id", "") or "")
+    if iid:
+        meta = getattr(runner, "_funded_claim_meta", None) or {}
+        for machine, (_t, owner) in list(meta.items()):
+            if owner == iid:
+                mark_executor_bad(machine, why, seconds=WRONG_IMAGE_BAD_SECONDS)
+                marked.append(machine)
+    log.error("DEC-CA-0067: %s booted the wrong runtime image — released; host %s and "
+              "executor(s) %s marked bad (%s)", iid or getattr(host, "name", "?"),
+              ip or "?", ", ".join(m[:8] for m in marked) or "none known", reason)
+    return marked

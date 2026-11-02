@@ -78,7 +78,8 @@ def _hook(cfg, tmp_path, fp=FP16):
     src.write_text((REPO / "chain.toml").read_text())
     runner = SimpleNamespace(cfg=cfg, deployed_chain_toml=src, work_root=tmp_path,
                              _push_deployed_chain_toml=lambda h, **kw: h)
-    return dispatch_host_hook(runner, fingerprint_fn=lambda h, fresh=False: fp)
+    return dispatch_host_hook(runner, fingerprint_fn=lambda h, fresh=False: fp,
+                              image_fn=lambda h, fresh=False: RC16)
 
 
 # ── the verdict ──────────────────────────────────────────────────────────────

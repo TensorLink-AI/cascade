@@ -200,15 +200,19 @@ def test_dispatch_hook_refuses_the_other_image_and_pushes_the_after_config(acfg,
 
     host = RemoteHost(name="lane", host="10.0.0.1", workdir="/w",
                       chain_toml="/w/chain.deployed.toml")
-    on = {"fp": FP16}
-    hook = dispatch_host_hook(runner, fingerprint_fn=lambda h, fresh=False: on["fp"])
+    on = {"fp": FP16, "img": RC16}
+    hook = dispatch_host_hook(runner, fingerprint_fn=lambda h, fresh=False: on["fp"],
+                              image_fn=lambda h, fresh=False: on["img"])
     out = hook(host, SW)                                        # post-switch leg, rc16 host
     assert out.chain_toml == f"/w/{AFTER_TOML_NAME}"
     assert pushed and pushed[0][1] == AFTER_TOML_NAME and RC16 in pushed[0][0]
-    with pytest.raises(LegImageMismatch):
-        hook(host, SW - 3600)                                   # pre-switch leg on rc16
+    # review 3: a pre-switch leg is handed through untouched (the worker's own
+    # FINAL image check still guards it)
+    assert hook(host, SW - 3600) is host
+    on["img"] = armed.training.at_block(SW - 3600).train_image_digest   # base pin injected
+    with pytest.raises(LegImageMismatch, match="runtime image"):
+        hook(host, SW)                       # after code, but the worker would refuse FINAL
     on["fp"] = armed.round.worker_code_fingerprint
-    assert hook(host, SW - 3600) is host                         # current image: unchanged
     with pytest.raises(LegImageMismatch):
         hook(host, SW)                                          # post-switch leg on old image
     assert hook(host, None) is host
@@ -258,8 +262,17 @@ class _Hook:
     def __init__(self, image_of):
         self.image_of = image_of
 
+    def filters(self, block):
+        return block is not None and block >= SW
+
+    def match_state(self, host, block):
+        state = self.image_of[host.name]
+        if state is None:
+            return None                                   # unreachable right now
+        return state == ("after" if block >= SW else "current")
+
     def matches(self, host, block):
-        return self.image_of[host.name] == ("after" if block >= SW else "current")
+        return self.match_state(host, block) is True
 
     def __call__(self, host, block):
         from cascade.trainer.leg_pins import LegImageMismatch
@@ -398,7 +411,7 @@ def test_hook_remeasures_a_rebootstrapped_lane_before_refusing(acfg, tmp_path):
     from cascade.trainer.remote import RemoteHost
 
     host = RemoteHost(name="lane", host="10.0.0.1", workdir="/w")
-    hook = dispatch_host_hook(runner, fingerprint_fn=fp)
+    hook = dispatch_host_hook(runner, fingerprint_fn=fp, image_fn=lambda h, fresh=False: RC16)
     assert hook(host, SW).chain_toml.endswith("chain.deployed.after.toml")
     assert seen == [False, True]
     runner.deployed_chain_toml = None                           # no config to render
@@ -596,3 +609,179 @@ def test_marketcast_post_switch_leg_carries_its_contract_block(acfg):
     assert mkt_contract_block_kw(armed, SimpleNamespace(start_block=SW)) == {"contract_block": SW}
     assert mkt_contract_block_kw(armed, SimpleNamespace(start_block=SW - 3600)) == {}
     assert mkt_contract_block_kw(acfg, SimpleNamespace(start_block=SW)) == {}   # unresolved
+
+
+# ── review 3: matching is a no-op unless the leg is post-switch; F5 image ────
+
+
+def _boom(*a, **k):
+    raise AssertionError("probed a lane for a leg that needs no matching")
+
+
+def test_armed_but_unresolved_hands_lanes_out_as_today(acfg):
+    from cascade.trainer.leg_pins import dispatch_host_hook
+    from cascade.trainer.loop import TrainerRunner, _FinalLanePool
+
+    runner = SimpleNamespace(cfg=acfg, deployed_chain_toml=None)
+    hook = dispatch_host_hook(runner, fingerprint_fn=_boom, image_fn=_boom)
+    assert not hook.filters(SW)
+    hosts = [_LaneHost("a", "10.0.0.1")]
+    pool = _FinalLanePool(hosts, lambda: hosts)
+    d = _LaneDisp(hook)
+    out = TrainerRunner._dispatch_on_free_lane(d, pool, hosts, describe="x",
+                                               role="challenger", contract_block=SW)
+    assert out.host == "a"                                       # no probe, no refusal
+
+
+def test_pre_switch_leg_is_never_probed(acfg):
+    from cascade.trainer.leg_pins import dispatch_host_hook
+
+    armed = A.apply_image_decoupled_activation(acfg, SW)
+    hook = dispatch_host_hook(SimpleNamespace(cfg=armed), fingerprint_fn=_boom, image_fn=_boom)
+    host = _LaneHost("a", "10.0.0.1")
+    assert hook.match_state(host, SW - 3600) is True and hook(host, SW - 3600) is host
+
+
+def test_post_switch_match_needs_the_runtime_image_too(acfg):
+    from cascade.trainer.leg_pins import dispatch_host_hook
+
+    armed = A.apply_image_decoupled_activation(acfg, SW)
+    base_img = armed.training.at_block(SW - 3600).train_image_digest
+    img = {"v": base_img}
+    hook = dispatch_host_hook(SimpleNamespace(cfg=armed), fingerprint_fn=lambda h, fresh=False: FP16,
+                              image_fn=lambda h, fresh=False: img["v"])
+    host = _LaneHost("a", "10.0.0.1")
+    assert hook.match_state(host, SW) is False       # after code, base pin injected
+    img["v"] = RC16
+    hook._reprobed.clear()
+    assert hook.match_state(host, SW) is True
+
+
+def test_other_image_lane_is_reprobed_at_most_once_a_minute(acfg):
+    from cascade.trainer.leg_pins import dispatch_host_hook
+
+    armed = A.apply_image_decoupled_activation(acfg, SW)
+    calls = []
+    t = [0.0]
+
+    def fp(h, fresh=False):
+        calls.append(fresh)
+        return armed.round.worker_code_fingerprint             # the current image
+
+    hook = dispatch_host_hook(SimpleNamespace(cfg=armed), fingerprint_fn=fp,
+                              image_fn=lambda h, fresh=False: RC16, clock=lambda: t[0])
+    host = _LaneHost("a", "10.0.0.1")
+    for _ in range(5):
+        assert hook.match_state(host, SW) is False
+    assert calls.count(True) == 1                               # one fresh re-probe
+    t[0] = hook.REPROBE_SECONDS + 1
+    assert hook.match_state(host, SW) is False
+    assert calls.count(True) == 2
+
+
+def test_unreachable_lane_means_wait_never_no_lane():
+    import time as _t
+
+    from cascade.trainer.faults import _LaneDeadlinePassed
+    from cascade.trainer.leg_pins import LegImageMismatch
+    from cascade.trainer.loop import TrainerRunner, _FinalLanePool
+
+    hosts = [_LaneHost("down", "10.0.0.1")]
+    pool = _FinalLanePool(hosts, lambda: hosts)
+    d = _LaneDisp(_Hook({"down": None}))
+    with pytest.raises(_LaneDeadlinePassed):                    # waited, then the deadline
+        TrainerRunner._dispatch_on_free_lane(d, pool, hosts, describe="x", role="challenger",
+                                             contract_block=SW, deadline=_t.time() - 1)
+    try:
+        pool.get(deadline=_t.time() - 1, match=lambda h: None)
+    except _LaneDeadlinePassed:
+        pass
+    except LegImageMismatch:                                    # pragma: no cover
+        pytest.fail("an unreachable lane must not read as 'no lane on this image'")
+    assert [h.name for h in pool.known_hosts()] == ["down"]
+
+
+# ── owner rule 2026-11-02: never the wrong image ─────────────────────────────
+
+
+def test_image_refusal_retry_cap():
+    from cascade.trainer.leg_pins import (
+        IMAGE_RETRY_CAP,
+        IMAGE_RETRY_WINDOW_S,
+        image_retry_exhausted,
+        is_image_refusal_text,
+        note_image_refusal,
+    )
+
+    r = SimpleNamespace()
+    assert is_image_refusal_text("worker exit 2: refusing FINAL run: runtime image sha256:a")
+    assert not is_image_refusal_text("worker exit 2: config error")
+    for i in range(IMAGE_RETRY_CAP):
+        assert not image_retry_exhausted(r, "hk", now=100.0)
+        note_image_refusal(r, "hk", now=100.0 + i)
+    assert image_retry_exhausted(r, "hk", now=200.0)
+    assert not image_retry_exhausted(r, "other", now=200.0)
+    assert not image_retry_exhausted(r, "hk", now=100.0 + IMAGE_RETRY_WINDOW_S + 5)
+
+
+def test_wrong_image_pod_marks_host_and_executor_bad():
+    from cascade.provision.core import quarantined_hosts
+    from cascade.provision.lium_identity import load_identities
+    from cascade.trainer.leg_pins import (
+        ImageAfterUnqualified,
+        LegImageMismatch,
+        image_retry_exhausted,
+    )
+    from cascade.trainer.runner_funded_legs import _wrong_image_pod
+
+    r = SimpleNamespace(_funded_claim_meta={"exec-1": (0.0, "pod-1"), "exec-2": (0.0, "pod-9")})
+    host = SimpleNamespace(host="203.0.113.7", name="funded")
+    pod = SimpleNamespace(instance_id="pod-1")
+    _wrong_image_pod(r, "hk", host, pod, ImageAfterUnqualified("our config"))
+    assert "exec-1" not in load_identities()["bad"]             # our config, not the host
+    _wrong_image_pod(r, "hk", host, pod, LegImageMismatch("runtime image sha256:b"))
+    bad = load_identities()["bad"]
+    assert "exec-1" in bad and "exec-2" not in bad
+    assert "203.0.113.7" in quarantined_hosts()
+    _wrong_image_pod(r, "hk", host, pod, LegImageMismatch("again"))
+    assert image_retry_exhausted(r, "hk")                       # a bad host costs one pod
+
+
+def test_capped_funded_leg_waits_without_renting():
+    from cascade.trainer.faults import _FundedLegSkip
+    from cascade.trainer.leg_pins import IMAGE_RETRY_CAP, note_image_refusal
+    from cascade.trainer.runner_funded_legs import _FundedLegMixin
+
+    seen = []
+    runner = SimpleNamespace(
+        cfg=load_chain_config(REPO / "chain.toml"), _funded_leg_failures={},
+        _record_funded_failure=lambda hk, msg, **kw: seen.append(kw),
+        _rent_funded_host=lambda *a, **k: pytest.fail("rented past the wrong-image cap"))
+    for _ in range(IMAGE_RETRY_CAP):
+        note_image_refusal(runner, "hk")
+    gen = SimpleNamespace(hotkey="hk", uid=1, ref="ns/g@sha256:" + "1" * 64)
+    with pytest.raises(_FundedLegSkip):
+        _FundedLegMixin._run_funded_leg_scoped(
+            runner, None, gen, SimpleNamespace(base_seed=1), 1, SimpleNamespace(), "",
+            warm_start_ref="")
+    assert seen == [{"miner_fault": False, "error_class": "no_capacity", "burn": False}]
+
+
+def test_lane_whose_worker_refuses_final_leaves_the_rotation():
+    from cascade.trainer.leg_pins import LegImageMismatch
+    from cascade.trainer.loop import TrainerRunner, _FinalLanePool
+
+    hosts = [_LaneHost("bad", "10.0.0.1"), _LaneHost("good", "10.0.0.2")]
+    pool = _FinalLanePool(hosts, lambda: hosts, breaker_threshold=1)
+
+    class Disp:
+        host_hook = None
+
+        def dispatch(self, host, **kw):
+            raise RuntimeError("worker exit 2: refusing FINAL run: runtime image sha256:"
+                               + "1" * 64 + " != pinned train_image_digest sha256:" + "2" * 64)
+
+    with pytest.raises(LegImageMismatch, match="wrong runtime image"):
+        TrainerRunner._dispatch_on_free_lane(Disp(), pool, hosts, describe="x",
+                                             role="challenger")
+    assert [h.name for h in pool.known_hosts()] == ["good"]       # released, not retried

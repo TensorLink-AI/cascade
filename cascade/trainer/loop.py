@@ -1516,26 +1516,30 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
         # refuse any other) — never take one and fail on it.
         from .leg_pins import LegImageMismatch
 
-        _matches = getattr(getattr(disp, "host_hook", None), "matches", None)
+        _hook = getattr(disp, "host_hook", None)
+        _state = getattr(_hook, "match_state", None)
+        _filters = getattr(_hook, "filters", None)
         _block = kw.get("contract_block")
         _plain_take = _take
 
-        _require = getattr(getattr(disp, "host_hook", None), "require_qualified", None)
+        _require = getattr(_hook, "require_qualified", None)
 
         def _take_matching():
-            if _matches is None or _block is None:
+            # matching is a no-op (today's lane handout) unless this leg's era
+            # is under the resolved switch with the after pins armed
+            if _state is None or _block is None or (callable(_filters) and not _filters(_block)):
                 return _plain_take()
             if _require is not None:
                 _require(_block)        # an unqualified after release: no lane is taken
             known = getattr(free_lanes, "known_hosts", None)
             pool = list(known()) if callable(known) else list(hosts)
-            if pool and not any(_matches(h, _block) for h in pool):
+            if pool and all(_state(h, _block) is False for h in pool):
                 raise LegImageMismatch(
                     f"{describe}: no lane runs this leg's era image (contract block "
                     f"{_block}); bring a lane up on that image")
 
             def _is_era_lane(h):
-                return _matches(h, _block)
+                return _state(h, _block)
 
             if isinstance(free_lanes, _FinalLanePool):
                 # filtered take: lanes of the other era stay idle for their
@@ -1545,7 +1549,7 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
             # non-matching one straight back and retry briefly
             for _ in range(4 * max(1, len(pool))):
                 lane = _plain_take()
-                if _is_era_lane(lane):
+                if _is_era_lane(lane) is True:
                     return lane
                 free_lanes.put(lane)
                 time.sleep(0.05)
@@ -1561,6 +1565,18 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
             free_lanes.put(host)
             raise
         except Exception as e:  # noqa: BLE001 — any dispatch failure is retryable once
+            from .leg_pins import WRONG_IMAGE_BAD_SECONDS, is_image_refusal_text
+
+            if is_image_refusal_text(str(e)) and hasattr(free_lanes, "mark_dead"):
+                # owner rule 2026-11-02 (never the wrong image): the worker
+                # refused FINAL (rc 2) before any corpus/training — this lane's
+                # runtime image is not the leg's pin. It leaves the rotation
+                # (never the breaker, never the leg's fault) until re-gated.
+                free_lanes.mark_dead(host, f"wrong runtime image: {error_tail(e, 160)}",
+                                     lane_only=True, hold_s=WRONG_IMAGE_BAD_SECONDS)
+                raise LegImageMismatch(
+                    f"{describe}: lane {getattr(host, 'name', host)} runs the wrong runtime "
+                    f"image ({error_tail(e, 200)})") from e
             transport = _transport_failure(e)
             if transport and hasattr(free_lanes, "mark_dead"):
                 # ssh refused / worker unreachable: the POD is gone, not the

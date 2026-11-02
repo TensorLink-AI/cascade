@@ -1143,6 +1143,15 @@ class _FundedPodMixin:
                             # The stale cache lives on the HOST: every executor
                             # id it lists would boot the same image.
                             record_host_quarantine(result.address.ip, why)
+                        if why and not blocked and result.machine_id:
+                            # owner rule 2026-11-02 (never the wrong image): the
+                            # executor and its learned identity too, so a relisted
+                            # id on the same machine is not rented again for it
+                            from ..provision.lium_identity import mark_executor_bad
+                            from .leg_pins import WRONG_IMAGE_BAD_SECONDS
+
+                            mark_executor_bad(result.machine_id, f"wrong worker image: {why}",
+                                              seconds=WRONG_IMAGE_BAD_SECONDS)
                         why = why or slow
                         log.warning("funded leg %s: pod %s rejected — %s; releasing "
                                     "and renting again (%d stale pod(s) so far)",

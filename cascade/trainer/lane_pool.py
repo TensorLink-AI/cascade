@@ -216,7 +216,7 @@ class _FinalLanePool(queue.Queue):
                 snapshot = [h for h in self.queue if id(h) not in rejected]
             for h in snapshot:
                 try:
-                    ok = bool(match(h))
+                    ok = match(h) is True
                 except Exception:  # noqa: BLE001 — an unprovable lane never matches
                     ok = False
                 if not ok:
@@ -439,12 +439,14 @@ class _FinalLanePool(queue.Queue):
         self._raise_if_no_lanes()
         known = self.known_hosts()
 
-        def ok(h):
+        def state(h):
+            # True / False / None (unknown — e.g. unreachable right now: the
+            # leg waits and retries, it is never told "no lane")
             try:
-                return bool(match(h))
+                return match(h)
             except Exception:  # noqa: BLE001
-                return False
-        if known and not any(ok(h) for h in known):
+                return None
+        if known and all(state(h) is False for h in known):
             raise _NoOperatorLanes("no operator lane on this leg's era image (DEC-CA-0067) "
                                    "— none of " + ", ".join(
                                        sorted(getattr(h, "name", "?") for h in known)))
@@ -473,7 +475,7 @@ class _FinalLanePool(queue.Queue):
 
             def fits(h):
                 own = self._deadline_of(deadline, h)
-                return (own is None or time.time() < own) and match(h)
+                return (own is None or time.time() < own) and match(h) is True
             try:
                 return self._get_where(fits, wait)
             except queue.Empty:
