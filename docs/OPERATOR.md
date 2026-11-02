@@ -703,7 +703,7 @@ noticed. Now:
   * free space holds every queued and in-flight leg's checkpoint plus the
     reserve.
 
-  The owner can also clear it with `cascade-trainer resume-rents --reason …`.
+  The owner can also clear it with `resume-rents`, which takes a reason.
   `rent-status` / `list-operator-legs` show the halt.
 * **No blind retrain.** A leg that an our-side fault hit after it trained
   re-harvests its **kept** pod once the halt is clear; it is never retrained.
