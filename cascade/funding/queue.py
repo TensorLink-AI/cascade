@@ -885,7 +885,8 @@ class FundedQueue:
                 # Capped: PAUSE (not failed, not burned) until the operator
                 # fixes the cause and resumes it — never a hot loop.
                 status = phase = PAUSED_STATUS
-                log.error("operator alert: entry_paused %s — %d operator-side faults (cap %d); "
+                # (the watchdog raises the one entry_paused alert from this state)
+                log.warning("queue: %s PAUSED — %d operator-side faults (cap %d); "
                           "not failed, nothing burned; resume with `cascade-trainer "
                           "resume-operator-leg %s` once the cause is fixed. Last: %s",
                           hotkey[:12], op_requeues, self.operator_fault_cap, hotkey,

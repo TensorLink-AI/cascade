@@ -158,7 +158,8 @@ class OperatorBreaker:
                 return prev
             write_text_atomic(self.path, json.dumps(rec, sort_keys=True))
         if prev is None:
-            log.error("operator alert: operator_breaker_open — %s; ALL operator rents paused "
+            # the watchdog raises the one operator_breaker_open alert from the file
+            log.error("money guard: operator breaker OPEN — %s; ALL operator rents paused "
                       "for %.0f s", reason[:200], self.cooldown_seconds)
         return rec
 
