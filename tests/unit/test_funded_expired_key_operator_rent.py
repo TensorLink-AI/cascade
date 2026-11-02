@@ -122,7 +122,8 @@ def test_an_operator_billed_entry_with_no_lane_rents_on_the_operator(tmp_path, m
     assert q.get("hkA").operator_faults == r.OPERATOR_FAULT_RETRIES
     with pytest.raises(_FundedLegSkip):
         r._rent_funded_host("777", _challenger("hkA"))
-    assert r._funded_leg_failures["hkA"][2:] == ("operator", False)
+    # a hold, not a new fault: backed off, never counted (review F4)
+    assert r._funded_leg_failures["hkA"][2:] == ("operator_blocked", False)
     assert "paused after" in r._funded_leg_failures["hkA"][0]
 
 

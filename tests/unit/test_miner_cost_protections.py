@@ -364,7 +364,8 @@ def test_unmeasured_image_refuses_the_rent_unburned(tmp_path, monkeypatch, caplo
         runner._rent_funded_host("777", _challenger("hkA"))
     assert rents == []                                             # nothing rented
     msg, miner_fault, cls, burn = runner._funded_leg_failures["hkA"]
-    assert (miner_fault, cls, burn) == (False, "operator", False)
+    # a config gate, not a fault: backed off, never counted (review F4)
+    assert (miner_fault, cls, burn) == (False, "operator_blocked", False)
     assert any("no measured wall" in r.getMessage() for r in caplog.records)
     assert not (tmp_path / "funded_pods.json").exists() or json.loads(
         (tmp_path / "funded_pods.json").read_text()) == []         # no write-ahead row left
