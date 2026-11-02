@@ -382,11 +382,17 @@ def test_helper_refuses_incomplete_evidence(armed, tmp_path, kw):
 
 
 def test_shipped_records_validate():
-    """Every committed record names its own pair and validates (fingerprints
-    are checked by the trainer against the deployed pins)."""
+    """Every committed record names its own pair, carries the schema and
+    validates for the shipped SKUs (fingerprints are checked by the trainer
+    against the deployed pins). No record committed yet ⇒ skipped, loudly."""
     cfg = load_chain_config(REPO / "chain.toml")
-    for p in sorted(Q.QUALIFICATIONS_DIR.glob("*.json")):
+    records = sorted(Q.QUALIFICATIONS_DIR.glob("*.json"))
+    if not records:
+        pytest.skip("no qualification record committed yet (qualifications/ is empty): "
+                    "every *_after arming is refused until one is")
+    for p in records:
         obj = json.loads(p.read_text())
+        assert obj.get("schema") == Q.SCHEMA, p.name
         assert p.name == Q.record_filename(obj["from_image"], obj["to_image"])
         assert Q.validate_record(obj, from_image=obj["from_image"], to_image=obj["to_image"],
-                                 required=Q.required_worlds(cfg)) == []
+                                 required=Q.required_worlds(cfg)) == [], p.name

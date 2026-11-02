@@ -329,13 +329,48 @@ Lane handling:
 - **Testnet** carries `eval_n_windows_after = 300`, its current budget, so the
   vote hash and the explicit verdict draw are rehearsed.
 
+## Second review fixes (2026-11-02)
+
+- Fork guard: `[v2] image_decoupled_feature` pins the vote's feature name
+  (Procedure step 2).
+- A typed `image_decoupled_from_block` on a config whose rollover is decided on
+  chain is checked on the post-rollover era grid
+  (`epoch_blocks_after × era_settlements`).
+- The lane pool's era-image take is non-destructive: a waiting leg never holds
+  a lane of the other image.
+- A transport failure during the code-fingerprint probe drains the pod (it is
+  not an image mismatch); a funded leg's image refusal never flips it to
+  operator billing.
+- In-flight restore and the funded receipt check apply the decoupled rule, so
+  an old-image leg re-attaches after a post-lock-in restart.
+- The bench-only king re-rent runs under its era's contract; MarketCast
+  post-switch legs carry `--contract-block`.
+- Verified, unchanged: the worker refuses every full-budget leg whose runtime
+  image differs from the pin of the contract it resolved (`--contract-block`)
+  — `cascade/trainer/worker.py:213` (`is_heat` = `--train-hours` given and the
+  role is neither expert nor finetune) and `:301-310`
+  (`contract.assert_train_image`). Rolling king and challenger legs pass no
+  `--train-hours`, so they are covered; only reduced-budget legs (heats, the
+  bench-anneal telemetry leg) skip it; the live trainer always sets `deployed_chain_toml`
+  (`cascade/trainer/main.py:321`, `--chain-toml` or `chain.toml`); direct-MoE
+  gangs rent their own signed pod profiles (`cascade/direct/compute.py`
+  `PodProfile.image`) and are not affected by the `*_after` pins.
+
 ## Procedure
 
 1. Release this change: validators, trainer and audit together. Nothing changes
    yet.
-2. Every validator, external and main, deploys the release `chain.toml` with the
-   typed forfeit and margin-v2 blocks. The main validator's live file is edited
-   by hand.
+2. Every node, external validators, the main validator and the trainer,
+   deploys the release `chain.toml` values: the typed `[scoring]
+   forfeit_from_block = 9166500` / `margin_v2_from_block = 9194400`, `[v2]
+   eval_n_windows_after = 4000` and `[v2] image_decoupled_feature =
+   "v2b-150ec0d0"`. The main validator's and the trainer's live files are
+   edited by hand (the live trainer file lacks `eval_n_windows_after`).
+   **Fork guard:** the feature name hashes `eval_n_windows_after`; a file
+   without it computes `v2b-6bbd262b` and would signal and tally another
+   feature, silently. The loader therefore refuses to start any node whose
+   computed name differs from the pinned `image_decoupled_feature`, or whose
+   pin is absent while `[activation]` is on and v2 is scheduled.
 3. Wait until all six external validators run the release (their notes show the
    `v2b-` segment and no longer show the forfeit or margin-v2 segments).
 4. The vote locks in when `threshold` is reached. `status/chain.json`

@@ -587,3 +587,12 @@ def test_receipt_of_a_reattached_old_image_leg_is_accepted(acfg):
     assert not receipt_contract_ok(armed, post, "f" * 64, SW)
     pre = armed.training.at_block(SW - 3600)
     assert not receipt_contract_ok(armed, pre, contract_digest(post), SW - 3600)  # old rule
+
+
+def test_marketcast_post_switch_leg_carries_its_contract_block(acfg):
+    from cascade.trainer.marketcast_runner import mkt_contract_block_kw
+
+    armed = A.apply_image_decoupled_activation(acfg, SW)
+    assert mkt_contract_block_kw(armed, SimpleNamespace(start_block=SW)) == {"contract_block": SW}
+    assert mkt_contract_block_kw(armed, SimpleNamespace(start_block=SW - 3600)) == {}
+    assert mkt_contract_block_kw(acfg, SimpleNamespace(start_block=SW)) == {}   # unresolved

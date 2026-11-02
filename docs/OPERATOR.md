@@ -235,6 +235,15 @@ on that value. An image-only re-pin then keeps the king entry and pointer and
 the finished legs. A numerics change still retrains. The pod still refuses a
 FINAL whose runtime image differs from the pin.
 
+**Every deployed chain.toml must carry the release values** before this
+release starts: `[v2] eval_n_windows_after = 4000`,
+`[v2] image_decoupled_feature = "v2b-150ec0d0"`, and the typed
+`[scoring] forfeit_from_block = 9166500` / `margin_v2_from_block = 9194400`.
+The feature name hashes `eval_n_windows_after`, so a file without it would
+vote on `v2b-6bbd262b` and fork from the fleet; the loader refuses to start
+(trainer, validator, audit) when the pinned name is missing or differs from
+the computed one.
+
 How it activates: validators on the release signal `v2b-<hash>` at startup. At
 the first settlement boundary where `[activation] threshold` of eligible stake
 has signalled, the vote locks in. The switch is the first era start after that
@@ -253,9 +262,12 @@ the lock-in:
 3. Re-pin `[v2.training] train_image_digest` and `[round] funded_pod_image` to
    the new release (`scripts/repin_worker_image.sh`). Push `chain.deployed.toml`
    and spot-check one pod per stage.
-4. Restart the trainer only with no legs in flight. A leg dispatched before the
-   re-pin and re-attached after a restart is still requeued, because its
-   receipt names the old full digest.
+4. Restart the trainer, preferably with no legs in flight. A leg dispatched
+   before the re-pin is re-attached after the restart: under the decoupled
+   rule the restore check and the receipt check accept a digest that is
+   provably the era contract with the old image (`_stale_contract`,
+   `leg_pins.receipt_contract_ok`). A leg with other numerics is still
+   requeued.
 5. Verify that the next settlement keeps the king (`numerics proven` at INFO in
    trainer.log) and that the validators accept it.
 
@@ -327,6 +339,20 @@ Lanes:
 - A lane re-bootstrapped onto rc16 is picked up within 300 s (the fingerprint
   cache TTL), and is re-measured before any refusal.
 - A refusal never trips the lane breaker.
+
+Lane and pod behaviour once armed:
+- A leg waiting for a lane on its era's image never holds a lane of the other
+  image: the lane pool hands out only a matching lane and leaves the rest idle
+  for the other era's legs.
+- An ssh failure during the worker-code probe is a transport failure (the pod
+  is drained like any unreachable pod), not an image mismatch.
+- A funded leg refused for its image keeps its billing: a payer-billed leg is
+  never moved to the operator account (only make-goods train there).
+- MarketCast legs of a post-switch era carry the era's `--contract-block`, so
+  they get the image check and the after-image config. Direct-MoE gangs
+  (`cascade/direct`) rent their own signed, qualified pod profiles and are not
+  touched by the `*_after` pins.
+- The bench-only king pod is rented under its era's contract.
 
 Gaps:
 - The provisioner still pins `CASCADE_TRAIN_IMAGE_DIGEST` on its pods from the
