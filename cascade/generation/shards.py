@@ -48,6 +48,7 @@ place) is read in place instead of downloaded.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import logging
 import random
@@ -313,9 +314,11 @@ def _fetch_shard(corpus_dir: Path, sh: dict, url: str, *,
             raise ShardLinkExpired(
                 f"shard {sh['name']}: download link expired ({e}) — re-sign the corpus "
                 "links; retrying the same link cannot succeed") from e
-        except OSError as e:
+        except (OSError, http.client.HTTPException) as e:
+            # HTTPException (e.g. IncompleteRead on a dropped body) is not an
+            # OSError but is the same transient transport failure.
             p.unlink(missing_ok=True)
-            why = f"could not be downloaded: {e}"
+            why = f"could not be downloaded: {str(e) or repr(e)}"
         else:
             if file_sha256(p) == sh["sha256"]:
                 if attempt > 1:

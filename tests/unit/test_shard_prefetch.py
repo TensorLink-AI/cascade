@@ -25,6 +25,7 @@ from cascade.generation import shards as S
 from cascade.generation import transfer as T
 from cascade.trainer.remote import (
     DETACHED_LAUNCH_TOKEN,
+    PREFETCH_PID_NAME,
     DETACHED_STDERR_MARK,
     PREFETCH_LIST_NAME,
     PREFETCH_SCRIPT_NAME,
@@ -129,11 +130,78 @@ def test_wrapper_keeps_the_worker_rc_and_kills_the_prefetch(tmp_path):
     assert not alive, "the prefetch dies with the worker"
 
 
+@needs_tools
+def test_a_stale_prefetch_is_swept_but_never_the_leg_itself(tmp_path):
+    """A leftover prefetch of the same corpus (a killed or timed-out leg) is
+    killed before the fresh launch; the sweep's pattern never matches the
+    launching shell, so the worker still runs and its rc comes back."""
+    script = tmp_path / PREFETCH_SCRIPT_NAME
+    script.write_text(f"echo $$ >> {tmp_path}/pids; sleep 300\n")
+    stale = subprocess.Popen(["setsid", "bash", str(script), "1"])
+    try:
+        for _ in range(50):
+            if (tmp_path / "pids").exists():
+                break
+            subprocess.run(["sleep", "0.1"])
+        cmd = with_prefetch("bash -c 'sleep 1; exit 5'", str(tmp_path), str(tmp_path))
+        rc = subprocess.run(["bash", "-c", cmd], timeout=30).returncode
+        assert rc == 5, "the sweep must not kill the leg's own shell"
+        assert stale.wait(timeout=10) != 0, "the stale prefetch was killed"
+        fresh = int((tmp_path / PREFETCH_PID_NAME).read_text())
+        pids = [int(x) for x in (tmp_path / "pids").read_text().split()]
+        assert fresh in pids and len(pids) == 2
+    finally:
+        if stale.poll() is None:
+            stale.kill()
+
+
+@needs_tools
+def test_the_detached_kill_reaps_the_prefetch_by_its_recorded_pid(tmp_path):
+    from cascade.trainer.remote import _detached_kill_command
+
+    script = tmp_path / PREFETCH_SCRIPT_NAME
+    script.write_text("sleep 300\n")
+    pf = subprocess.Popen(["setsid", "bash", str(script)])
+    (tmp_path / PREFETCH_PID_NAME).write_text(f"{pf.pid}\n")
+    try:
+        host = RemoteHost(name="p", host="1.2.3.4", workdir=str(tmp_path))
+        subprocess.run(["bash", "-c", _detached_kill_command(host, str(tmp_path))],
+                       timeout=30, check=True)
+        assert pf.wait(timeout=10) != 0
+    finally:
+        if pf.poll() is None:
+            pf.kill()
+
+
+def test_ere_escape_is_literal():
+    import re
+
+    from cascade.trainer.remote import _ere_escape
+
+    for text in ("/w/_corpus/a.b/prefetch.sh", "/w/x(1)+y]^$|{z}?*/p.sh"):
+        assert re.fullmatch(_ere_escape(text), text)
+        assert not re.search(_ere_escape("/w/_corpus/a.b/prefetch.sh"),
+                             "/w/_corpus/aXb/prefetch.sh")
+
+
+@needs_tools
+def test_prefetch_stops_at_the_disk_floor_before_any_fetch(tmp_path):
+    idx = _corpus(tmp_path / "src")
+    pod = _pod(tmp_path, idx, "http://127.0.0.1:9/b/")
+    (pod / PREFETCH_SCRIPT_NAME).write_text(
+        prefetch_script(str(pod), need_bytes=1, n_shards=9, floor_bytes=10**18))
+    p = subprocess.run(["bash", str(pod / PREFETCH_SCRIPT_NAME)],
+                       capture_output=True, text=True, timeout=60)
+    assert p.returncode == 0
+    assert "under the" in p.stderr and "prefetch stopped" in p.stderr
+    assert not list(pod.glob("*.parquet"))
+
+
 def test_attached_command_carries_the_wrapper():
     host = RemoteHost(name="p", host="1.2.3.4", workdir="/w")
     cmd, _ = build_remote_command(host, ["python", "-m", "w"], {},
                                   wrap=lambda c: with_prefetch(c, "/w/_corpus/t"))
-    assert "setsid bash /w/_corpus/t/prefetch.sh $$" in cmd
+    assert "pfd=/w/_corpus/t;" in cmd and 'setsid bash "$pfd/prefetch.sh" $$' in cmd
     plain, _ = build_remote_command(host, ["python", "-m", "w"], {})
     assert "prefetch" not in plain
 
@@ -186,7 +254,8 @@ def test_prefetch_lands_every_shard_verified_and_the_reader_never_downloads(tmp_
     try:
         pod = _pod(tmp_path, idx, f"http://127.0.0.1:{srv.server_address[1]}/b/")
         (pod / PREFETCH_SCRIPT_NAME).write_text(
-            prefetch_script(str(pod), need_bytes=1, n_shards=len(_names(idx)), parallel=3))
+            prefetch_script(str(pod), need_bytes=1, n_shards=len(_names(idx)), parallel=3,
+                            floor_bytes=1))
         p = subprocess.run(["bash", str(pod / PREFETCH_SCRIPT_NAME)],
                            capture_output=True, text=True, timeout=120)
     finally:
@@ -303,7 +372,10 @@ def test_detached_dispatch_pushes_and_starts_the_prefetch(tmp_path, _no_sleep):
     assert cmds[3].endswith("/w/_corpus/challenger-hk-1/prefetch.tsv")
     assert "https://" in runner.calls[3][1] and all("https://" not in c for c in cmds)
     assert cmds[4].endswith("/w/_corpus/challenger-hk-1/prefetch.sh")
-    assert "setsid bash /w/_corpus/challenger-hk-1/prefetch.sh $$" in cmds[5]
+    launch = cmds[5]
+    assert "pfd=/w/_corpus/challenger-hk-1;" in launch
+    assert 'setsid bash "$pfd/prefetch.sh" $$' in launch
+    assert "/w/_train_work/_dispatch/challenger-hk-1-" in launch and "/prefetch.pid" in launch
 
 
 def test_prefetch_off_or_reattach_launches_exactly_as_before(tmp_path, _no_sleep):

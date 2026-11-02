@@ -1986,11 +1986,21 @@ itself once the leg's shell is gone. A reattach never starts it again.
 Its log lines go to the leg's stderr with the prefix `cascade-prefetch:`.
 
 The prefetch never fails a leg. It skips with a WARNING when free disk is
-below `stored_bytes` + 10% + 20 GiB. When a shard never verifies, it gives
-up on that shard with a WARNING and the worker fetches that shard itself, as
-before. On an expired link it stops. A worker that still dies fetching
-shards is classed as an operator fault: it is requeued and does not burn
-the miner's attempt. For scale, a 50B-point `float32_bss` corpus is about
+below `stored_bytes` + 10% + 20 GiB at start. Before every download it
+checks free disk again and stops once less than 20 GiB is free, because
+other lanes on a multi-lane pod share the volume. When a shard never
+verifies, it gives up on that shard with a WARNING and the worker fetches
+that shard itself, as before. On an expired link it stops. The prefetch
+records its pid in the leg's run dir, so a detached timeout or cancel kills
+it along with the worker. A fresh launch first kills any leftover prefetch
+of the same corpus.
+
+A worker that still dies fetching shards is classed as an operator fault:
+it is requeued and does not burn the miner's attempt. This applies only to
+shards legs, where no miner code runs on the pod. It also applies only when
+the failure's final traceback exception is the shard error itself. On a
+streaming leg the generator could print the same text, so there the exit
+stays `infra`. For scale, a 50B-point `float32_bss` corpus is about
 46.5 GB in about 3,000 shards of roughly 15.5 MB each, so the check needs
 about 72 GB free. Set the knob to `false` to go back to streaming only.
 

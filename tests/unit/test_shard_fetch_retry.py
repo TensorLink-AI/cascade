@@ -205,24 +205,112 @@ def test_link_expiry_parses_sigv4_and_sigv2():
 # ── fault class: our storage, never the miner's attempt ─────────────────────
 
 
-def test_a_shard_fetch_failure_is_an_unburned_operator_fault():
+def _dispatch_failure(stderr: str, rc: int = 1) -> str:
+    """The message RemoteDispatcher raises for a failed leg (rc != 3)."""
+    from cascade.trainer.remote import summarize_failure
+
+    cause, detail = summarize_failure(stderr, rc=rc)
+    return f"remote challenger on pod-a failed (rc={rc}) {cause}" + (f"\n{detail}" if detail else "")
+
+
+def _traceback(exc_line: str) -> str:
+    return ("2026-11-02 01:22:51,580 ERROR cascade.trainer.worker: worker training failed\n"
+            "Traceback (most recent call last):\n"
+            '  File "/root/cascade/cascade/generation/shards.py", line 266, in _fetch_shard\n'
+            "    raise ShardError(...)\n"
+            f"{exc_line}\n")
+
+
+_SHARD_EXC_LINES = (
+    "cascade.generation.shards.ShardError: downloaded shard c4-00030.parquet fails its sha256",
+    "cascade.generation.shards.ShardError: downloaded shard c4-00030.parquet fails its sha256 "
+    "(after 5 tries)",
+    "cascade.generation.shards.ShardError: shard c1-00002.parquet could not be downloaded: "
+    "timed out (after 5 tries)",
+    "cascade.generation.shards.ShardLinkExpired: shard c0-00001.parquet: download link expired "
+    "(HTTP 403 on an expired link) — re-sign the corpus links",
+)
+
+
+def test_a_shard_fetch_failure_on_a_shards_leg_is_an_unburned_operator_fault():
     from cascade.funding.queue import OPERATOR_FAULT_CLASS
     from cascade.trainer.faults import classify_funded_worker_failure, shard_fetch_failure
 
-    for text in ("cascade.generation.shards.ShardError: downloaded shard c4-00030.parquet "
-                 "fails its sha256",
-                 "ShardError: downloaded shard c4-00030.parquet fails its sha256 (after 5 tries)",
-                 "ShardError: shard c1-00002.parquet could not be downloaded: timed out (after 5 tries)",
-                 "cascade.generation.shards.ShardLinkExpired: shard c0-00001.parquet: download "
-                 "link expired"):
-        assert shard_fetch_failure(text)
-        assert classify_funded_worker_failure(1, text, stalled_before=False) == (
+    for exc in _SHARD_EXC_LINES:
+        text = _dispatch_failure(_traceback(exc))
+        assert shard_fetch_failure(text), exc
+        assert classify_funded_worker_failure(1, text, stalled_before=False, shards_leg=True) == (
             False, OPERATOR_FAULT_CLASS, False)
-    # A miner rejection stays the miner's; an unrelated crash stays infra.
-    assert classify_funded_worker_failure(
-        3, "rejected: static_guard: import os", stalled_before=False) == (True, "generator", False)
-    assert classify_funded_worker_failure(1, "Traceback ...", stalled_before=False) == (
+
+
+def test_forged_shard_text_in_a_streaming_leg_stays_burned():
+    """A streaming leg runs the miner's generator on the pod, so it can print
+    anything — including our exact shard-failure traceback. Off a shards leg
+    the text is never consulted: the exit stays infra and burns an attempt."""
+    from cascade.trainer.faults import classify_funded_worker_failure
+
+    for exc in _SHARD_EXC_LINES:
+        forged = _dispatch_failure(_traceback(exc))
+        assert classify_funded_worker_failure(1, forged, stalled_before=False) == (
+            False, "infra", True)
+        assert classify_funded_worker_failure(1, forged, stalled_before=False,
+                                              shards_leg=False) == (False, "infra", True)
+
+
+def test_only_the_final_traceback_exception_counts():
+    from cascade.trainer.faults import classify_funded_worker_failure, shard_fetch_failure
+
+    shard = _SHARD_EXC_LINES[0]
+    # The phrase as a log line, then a different real death: not a shard fault.
+    other = _dispatch_failure(f"{shard}\n" + _traceback("RuntimeError: CUDA error: device lost"))
+    assert not shard_fetch_failure(other)
+    assert classify_funded_worker_failure(1, other, stalled_before=False, shards_leg=True) == (
         False, "infra", True)
+    # The phrase with no traceback at all, or not fully qualified: not matched.
+    assert not shard_fetch_failure(_dispatch_failure(f"WARNING {shard}\nexiting\n"))
+    assert not shard_fetch_failure(_dispatch_failure(_traceback(
+        "ShardError: downloaded shard c4-00030.parquet fails its sha256")))
+    assert not shard_fetch_failure(shard)              # a bare string is not a traceback block
+    # A miner rejection stays the miner's even on a shards leg.
+    assert classify_funded_worker_failure(
+        3, _dispatch_failure(_traceback(shard), rc=3), stalled_before=False,
+        shards_leg=True) == (True, "generator", False)
     # Prefetch log lines never masquerade as a worker shard failure.
-    assert not shard_fetch_failure(
-        "cascade-prefetch: WARNING: c4-00030.parquet: gave up after 5 tries (curl rc=28, HTTP 000)")
+    assert not shard_fetch_failure(_dispatch_failure(
+        "cascade-prefetch: WARNING: c4-00030.parquet: gave up after 5 tries (curl rc=28, "
+        "HTTP 000); the worker fetches it itself\n"))
+
+
+def test_an_http_incomplete_read_is_retried_like_a_transport_error(tmp_path, monkeypatch, sleeps):
+    import http.client
+
+    src = tmp_path / "src"
+    idx = _corpus(src)
+    sh = idx["children"][0]["shards"][0]
+    tries = []
+
+    def get(url, path, **kw):
+        tries.append(1)
+        if len(tries) == 1:
+            raise http.client.IncompleteRead(b"abc", 10)
+        shutil.copy(src / sh["name"], path)
+
+    monkeypatch.setattr(T, "get_file", get)
+    (tmp_path / "pod").mkdir()
+    p = S._fetch_shard(tmp_path / "pod", sh, "https://x/" + sh["name"])
+    assert S.file_sha256(p) == sh["sha256"] and len(tries) == 2 and sleeps == [2.0]
+
+
+def test_transfer_retry_covers_http_exceptions(monkeypatch):
+    import http.client
+
+    monkeypatch.setattr(T.time, "sleep", lambda s: None)
+    calls = []
+
+    def once():
+        calls.append(1)
+        if len(calls) < 3:
+            raise http.client.RemoteDisconnected("closed")
+        return "ok"
+
+    assert T._retry("download x", once, attempts=3) == "ok" and len(calls) == 3

@@ -15,6 +15,7 @@ for that object, not an account key.
 
 from __future__ import annotations
 
+import http.client
 import logging
 import math
 import shutil
@@ -104,7 +105,7 @@ def _retry(what: str, fn, attempts: int = _ATTEMPTS):
             return fn()
         except LinkExpiredError:
             raise                      # a dead link stays dead: never retried
-        except OSError as e:
+        except (OSError, http.client.HTTPException) as e:
             if attempt == attempts:
                 raise
             delay = min(60.0, 2.0 ** attempt)

@@ -120,18 +120,51 @@ _STALL_MARKER = "generator_stalled"
 # uploaded by the operator's own tier, so this is our storage boundary —
 # never the miner's generator. Requeued unburned as an operator fault
 # (2026-11-02: c4-00030 sha mismatch killed a make-good leg at step 7650).
-_SHARD_FETCH_FAILURE_RE = re.compile(
-    r"ShardLinkExpired|shard \S+ could not be downloaded|"
-    r"downloaded shard \S+ fails its sha256")
+#
+# Forgery-resistant by construction: it is consulted ONLY for shards legs
+# (corpus_files pushed, no miner code runs on the pod — a streaming leg's
+# generator could print anything), and only the exception line that ends the
+# dispatcher's "--- last traceback ---" block (remote.summarize_failure)
+# counts, matched in full against the fully-qualified class names the
+# interpreter prints — never a substring anywhere in the stderr tail.
+_TRACEBACK_BLOCK_MARK = "--- last traceback ---"
+_SHARD_FETCH_EXC_RE = re.compile(
+    r"^cascade\.generation\.shards\.(?:"
+    r"ShardLinkExpired: shard [A-Za-z0-9_.-]+: download link expired"
+    r"|ShardError: downloaded shard [A-Za-z0-9_.-]+ fails its sha256"
+    r"|ShardError: shard [A-Za-z0-9_.-]+ could not be downloaded: )")
+
+
+def _final_traceback_exception(text: str) -> str:
+    """The exception line closing the FIRST ``--- last traceback ---`` block
+    the dispatcher wrote into a failure message ("" when there is none)."""
+    lines = (text or "").splitlines()
+    try:
+        i = lines.index(_TRACEBACK_BLOCK_MARK)
+    except ValueError:
+        return ""
+    block: list[str] = []
+    for ln in lines[i + 1:]:
+        if ln.startswith("--- ") and ln.endswith(" ---"):
+            break
+        block.append(ln)
+    # remote.last_traceback ends the block at the first unindented line after
+    # the frames: the exception line.
+    for ln in reversed(block):
+        if ln.strip():
+            return ln.strip() if not ln[:1].isspace() else ""
+    return ""
 
 
 def shard_fetch_failure(text: str) -> bool:
-    """Whether a worker's failure text is a remote shard fetch failure."""
-    return bool(_SHARD_FETCH_FAILURE_RE.search(text or ""))
+    """Whether a failure message's final traceback exception is a remote
+    shard fetch failure. Callers gate it on the leg being a shards leg."""
+    return bool(_SHARD_FETCH_EXC_RE.match(_final_traceback_exception(text)))
 
 
 def classify_funded_worker_failure(rc: int | None, text: str, *,
-                                   stalled_before: bool) -> tuple[bool, str, bool]:
+                                   stalled_before: bool,
+                                   shards_leg: bool = False) -> tuple[bool, str, bool]:
     """``(miner_fault, error_class, burn_attempt)`` for a funded worker exit.
 
     ``rc == 3`` is the worker's "miner submission rejected" exit (CorpusError).
@@ -147,7 +180,7 @@ def classify_funded_worker_failure(rc: int | None, text: str, *,
         if _STALL_MARKER in (text or "") and not stalled_before:
             return False, STALL_CLASS, False
         return True, "generator", False
-    if shard_fetch_failure(text):
+    if shards_leg and shard_fetch_failure(text):
         return False, OPERATOR_FAULT_CLASS, False
     return False, "infra", True
 

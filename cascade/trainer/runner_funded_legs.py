@@ -259,7 +259,8 @@ class _FundedLegMixin:
                 miner_fault, error_class, _ = classify_funded_worker_failure(
                     getattr(e, "returncode", None), str(e),
                     stalled_before=bool(prior is not None
-                                        and prior.last_error_class == STALL_CLASS))
+                                        and prior.last_error_class == STALL_CLASS),
+                    shards_leg=bool(corpus.get("corpus_files")))
                 if error_class == "infra":
                     error_class = OPERATOR_FAULT_CLASS
             from .faults import record_no_lanes_verdict
@@ -494,7 +495,8 @@ class _FundedLegMixin:
             miner_fault, error_class, burn = classify_funded_worker_failure(
                 rc, text,
                 stalled_before=bool(prior is not None
-                                    and prior.last_error_class == STALL_CLASS))
+                                    and prior.last_error_class == STALL_CLASS),
+                shards_leg=bool(corpus.get("corpus_files")))
             self._record_funded_failure(gen.hotkey, text, miner_fault=miner_fault,
                                         error_class=error_class, burn=burn)
             if not miner_fault:

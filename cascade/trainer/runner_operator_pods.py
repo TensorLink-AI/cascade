@@ -708,7 +708,8 @@ class _OperatorPodMixin:
             miner_fault, error_class, _burn = classify_funded_worker_failure(
                 getattr(e, "returncode", None), str(e),
                 stalled_before=bool(prior is not None
-                                    and prior.last_error_class == STALL_CLASS))
+                                    and prior.last_error_class == STALL_CLASS),
+                shards_leg=bool(corpus.get("corpus_files")))
             if error_class == "infra":
                 error_class = OPERATOR_FAULT_CLASS
             self._record_funded_failure(gen.hotkey, str(e), miner_fault=miner_fault,
