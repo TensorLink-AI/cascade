@@ -274,9 +274,31 @@ worker_code_fingerprint_after = "5fe6ed7c0f0d5305b6101e589aab50b2ca5a76573cbc7af
 
 These values are rc16. The repo chain.toml ships them empty.
 
-**Owner rule.** Set an image as `*_after` only after a bit-identical
-qualification against the current image: weights and optimizer state, world
-size 1 and 8, and crash/resume. Record the qualification in OPSLOG first.
+**Owner rule (enforced).** Set an image as `*_after` only after a
+bit-identical qualification against the current image: weights and optimizer
+state, world size 1 and 8, and crash/resume. Record the qualification in
+OPSLOG first. The trainer enforces it: without a valid
+`qualifications/<from12>-to-<to12>.json` for exactly this pair it refuses
+every post-switch rent and dispatch on the after image (ERROR every tick plus
+an `image_after_unqualified` operator alert; legs wait as unburned operator
+faults, never on the old image). Make the record from the harness outputs:
+
+```bash
+# on the qualification pod: A = checkout from the FROM image, B = from the TO image
+python scripts/qualify_pyramid_bitwise.py --ref /root/qual-a --cand /root/qual-b \
+    --worlds 1,8 --chain-toml /root/cascade/chain.deployed.toml --out /root/qual-out
+# copy /root/qual-out back (ckpt/ dirs + summary.json), then on the box:
+python3 scripts/write_image_qualification.py \
+    --from-image sha256:<current> --to-image sha256:<after> \
+    --from-fingerprint <current worker_code_fingerprint> \
+    --to-fingerprint <worker_code_fingerprint_after> \
+    --run-id <run id> --qual-out /root/qual-out --manifests-dir /root/qual-manifests
+```
+
+Commit the record it writes and deploy it with the trainer code. It writes
+nothing when any world, the resume check or any tensor is missing or differs.
+Emergency only: `[v2] image_after_unqualified_override = true` uses the after
+pins unqualified (ERROR every tick, `image_after_override` alert).
 
 What changes, and when:
 - Nothing changes until the vote resolves the switch (or a typed

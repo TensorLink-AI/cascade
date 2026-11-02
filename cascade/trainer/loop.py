@@ -620,6 +620,18 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
         except Exception as e:  # noqa: BLE001 — activation must never sink a tick
             log.warning("activation step failed (%s); retrying next poll", e)
 
+    def _image_qualification_tick(self) -> None:
+        """DEC-CA-0067 owner rule: a loud ERROR every tick while the ``[v2]
+        *_after`` release is unqualified (refused) or used under the emergency
+        override. The operator watchdog raises the matching alert. Never
+        raises."""
+        try:
+            from .leg_pins import log_image_qualification
+
+            log_image_qualification(self.cfg)
+        except Exception as e:  # noqa: BLE001 — a signal, never a tick failure
+            log.warning("image qualification check failed (%s)", e)
+
     def _forfeit_tick(self, client, block: int) -> None:
         """DEC-CA-0048 forfeiture decided on chain: the trainer resolves the
         same tally the validators do (it never signals) so the rolling
@@ -1508,9 +1520,13 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
         _block = kw.get("contract_block")
         _plain_take = _take
 
+        _require = getattr(getattr(disp, "host_hook", None), "require_qualified", None)
+
         def _take_matching():
             if _matches is None or _block is None:
                 return _plain_take()
+            if _require is not None:
+                _require(_block)        # an unqualified after release: no lane is taken
             known = getattr(free_lanes, "known_hosts", None)
             pool = list(known()) if callable(known) else list(hosts)
             if pool and not any(_matches(h, _block) for h in pool):
@@ -1820,6 +1836,7 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
                 # BEFORE the grid is derived: a lock-in arms rolling intake at
                 # the very boundary it names.
                 self._activation_tick(client, block)
+                self._image_qualification_tick()
                 from ..shared.calendar_launch import resolve_calendar_launch
 
                 base = self._base_cfg()

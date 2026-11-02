@@ -257,8 +257,8 @@ Lane handling:
 - The provisioner health gate also accepts the after release.
 - `check_worker_release` accepts a box whose code is either release.
 - The bench-anneal telemetry leg (`runner_promotion`) runs on the pod that
-  trained the entry, so it is on that entry's image by construction. It
-  carries no `--contract-block`, and the hook is a no-op there.
+  trained the entry and now carries its duel's `--contract-block` (the era
+  start), so the hook checks that pod's image like any other leg.
 
 **Owner rule: qualification before arming.**
 - An image may be set as `*_after` ONLY after a bit-identical qualification
@@ -268,6 +268,37 @@ Lane handling:
   armed.
 - Excluding the image from the numerics digest is sound only because of this
   rule.
+
+**The rule is ENFORCED by the trainer** (owner decision 2026-11-01):
+- The trainer uses the `*_after` pins only when the repo-tracked record
+  `qualifications/<from12>-to-<to12>.json` exists for EXACTLY the pair
+  (current `[v2.training] train_image_digest` → `[v2] train_image_digest_after`)
+  and validates (`cascade/shared/image_qualification.py`): schema
+  `cascade-image-qualification/1`; full from/to image digests; from/to worker
+  code fingerprints equal to the pinned `[round] worker_code_fingerprint` /
+  `[v2] worker_code_fingerprint_after`; `date_utc`; ≥ 1 run id;
+  `world_sizes` ⊇ {1, 8}; `resume_tested = true`; and per world size the
+  sha256 of the sorted per-tensor comparison manifest (weights, stable weights,
+  optimizer tensors) with `equal = true` and `resume_equal = true`.
+- `scripts/write_image_qualification.py` emits the record from the
+  qualification harness outputs (`scripts/qualify_pyramid_bitwise.py`, A run
+  in the FROM image, B in the TO image). It hashes tensors without torch and
+  writes nothing unless the record validates.
+- Refusal: no post-switch rent (`leg_pins.leg_round`), dispatch (the host
+  hook), lane take (the lane pool refuses before taking a lane) or funded leg
+  (before its corpus or rent) on the after image. The leg fails as an
+  operator fault (`LegImageMismatch` ⊂ `_OperatorFault`), unburned, never
+  counted by the lane breaker, and NEVER falls back to the old image: its
+  contract pins the after image, so it waits for a record. The provisioner
+  health gate admits after-image lanes and `check_worker_release` accepts the
+  after release only when qualified.
+- Signal: an ERROR every trainer tick and an operator-watchdog alert
+  (`image_after_unqualified`, scope `image`) while the after pins are armed
+  without a valid record — from arming, before the switch resolves.
+- Emergency override: `[v2] image_after_unqualified_override = true`
+  (trainer-only, default false). The pins are used unqualified, with an ERROR
+  every tick and an `image_after_override` alert while it is on.
+- Pre-switch eras and configs without after pins are unaffected.
 
 ## Release notes / blast radius (operators)
 

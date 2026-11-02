@@ -33,6 +33,11 @@ def check_worker_release(cfg):
         if contract is None or not image or image_digest(v2.train_image_digest_after) != image:
             raise ValueError("v2 funded_pod_image_after and train_image_digest_after must name "
                              "the same release")
+        from ..shared.image_qualification import qualification_status
+
+        st = qualification_status(cfg)
+        if not st.usable:
+            raise ValueError(f"v2 after release is not qualified (owner rule): {st.reason}")
         return
     if cfg.round.worker_code_fingerprint != current:
         raise ValueError("v2 worker image is not qualified for this release: rebuild from this source "

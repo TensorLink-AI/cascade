@@ -130,6 +130,13 @@ class V2Config:
     funded_pod_image_after: str = ""
     worker_code_fingerprint_after: str = ""
     funded_sku_wall_measured_image_after: str = ""
+    # DEC-CA-0067 owner EMERGENCY override (TRAINER-ONLY): use the ``*_after``
+    # pins although no valid ``qualifications/<from12>-to-<to12>.json`` record
+    # qualifies them bit-identical against the current pin
+    # (cascade.shared.image_qualification). The trainer logs an ERROR every
+    # tick and raises an operator alert while it is true. Default false: an
+    # unqualified after release is refused (no post-switch rent/dispatch).
+    image_after_unqualified_override: bool = False
     # Emission burns (CONSENSUS on the weight vector, see
     # cascade.shared.emission). ``prelaunch_burn``: the fraction of every
     # pre-v2 vector sent to ``burn_uid`` by a validator on this release.
@@ -368,6 +375,10 @@ def parse_v2_economics(v2raw: dict) -> dict:
     out["prior_train_image_digests"] = _parse_prior_images(
         v2raw.get("prior_train_image_digests", []))
     out.update(parse_image_after(v2raw))
+    ov = v2raw.get("image_after_unqualified_override", False)
+    if not isinstance(ov, bool):
+        raise ValueError(f"[v2] image_after_unqualified_override must be true/false; got {ov!r}")
+    out["image_after_unqualified_override"] = ov
     out["bench_source"], out["bench_source_from_block"] = parse_bench_source(v2raw)
     out.update(parse_bench_source_bounds(v2raw))
     ladder = v2raw.get("king_ladder", False)

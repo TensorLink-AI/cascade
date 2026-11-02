@@ -653,6 +653,8 @@ train_image_digest_after = ""
 funded_pod_image_after = ""
 worker_code_fingerprint_after = ""
 funded_sku_wall_measured_image_after = ""
+# Enforced qualification rule for the *_after pins (see chain.toml).
+image_after_unqualified_override = false
 # The escalating key slash's minimum for a first lapse (eras; mainnet value).
 # Read only under king_ladder, so inert here.
 key_slash_min_eras = 6

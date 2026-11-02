@@ -33,6 +33,7 @@ from pathlib import Path
 
 from ..shared.config import image_digest
 from ..shared.era import image_after_armed, image_decoupled_era, round_pins_at
+from .faults import _OperatorFault
 
 log = logging.getLogger(__name__)
 
@@ -67,11 +68,44 @@ def contract_runs_after(cfg, contract) -> bool:
 
 def leg_round(runner):
     """The ``[round]`` pins for the leg on this thread: the after view for a
-    post-switch leg, else ``runner.cfg.round`` itself (same object)."""
+    post-switch leg, else ``runner.cfg.round`` itself (same object). A
+    post-switch leg whose after release is NOT qualified raises
+    :class:`ImageAfterUnqualified` — every rent reads its pins here, so no pod
+    is ever rented on an unqualified image (and never on the old one for a
+    post-switch leg)."""
     cfg = runner.cfg
     if not contract_runs_after(cfg, leg_contract(runner)):
         return cfg.round
+    require_after_qualified(cfg, "rent")
     return round_pins_at(cfg, int(cfg.v2.image_decoupled_from_block))
+
+
+# ── the owner's qualification rule (enforced) ───────────────────────────────
+
+
+def after_image_refusal(cfg) -> str:
+    """Why the ``[v2] *_after`` pins must NOT be used, or "" (qualified, or
+    the owner's emergency override is on, or no after pins). See
+    :mod:`cascade.shared.image_qualification`."""
+    from ..shared.image_qualification import qualification_status
+
+    if not image_after_armed(cfg):
+        return ""
+    st = qualification_status(cfg)
+    return "" if st.usable else st.reason
+
+
+def require_after_qualified(cfg, what: str) -> None:
+    """Raise :class:`ImageAfterUnqualified` (loud ERROR) when the after
+    release is not qualified. Never a fallback to the current image: the leg
+    fails as an operator fault (unburned) and waits for a record."""
+    why = after_image_refusal(cfg)
+    if why:
+        log.error("DEC-CA-0067: REFUSING %s on the after image %s — %s. Commit the "
+                  "qualification record (scripts/write_image_qualification.py) or, in an "
+                  "emergency only, set [v2] image_after_unqualified_override = true",
+                  what, str(cfg.v2.train_image_digest_after)[:19], why)
+        raise ImageAfterUnqualified(f"after image not qualified ({what}): {why}")
 
 
 @contextlib.contextmanager
@@ -92,9 +126,15 @@ def leg_contract_scope(runner, contract):
             loc.leg_contract = saved
 
 
-class LegImageMismatch(RuntimeError):
+class LegImageMismatch(_OperatorFault):
     """The host runs (or cannot prove it runs) another worker image than the
-    leg's era pins. Never a lane fault: the lane breaker does not count it."""
+    leg's era pins. Never a lane fault (the lane breaker does not count it)
+    and never the miner's: an operator fault, requeued unburned."""
+
+
+class ImageAfterUnqualified(LegImageMismatch):
+    """A post-switch leg whose ``[v2] *_after`` release has no valid
+    qualification record (the owner's bit-identical rule)."""
 
 
 # ── the deployed chain.toml a post-switch leg's worker loads ────────────────
@@ -238,6 +278,13 @@ class _HostHook:
     def _fingerprint(self, host, *, fresh=False) -> str:
         return self.fingerprint_fn(host, fresh=fresh)
 
+    def require_qualified(self, block) -> None:
+        """Raise :class:`ImageAfterUnqualified` for a post-switch leg whose
+        after release is not qualified (before any lane is taken)."""
+        cfg = self.runner.cfg
+        if image_after_armed(cfg) and block is not None and image_decoupled_era(cfg, int(block)):
+            require_after_qualified(cfg, f"dispatch (contract block {int(block)})")
+
     def matches(self, host, block) -> bool:
         """Whether ``host`` runs the leg's era image (re-measured on a miss)."""
         if not image_after_armed(self.runner.cfg) or block is None:
@@ -256,6 +303,8 @@ class _HostHook:
         if not image_after_armed(cfg) or block is None:
             return host
         post = image_decoupled_era(cfg, int(block))
+        if post:
+            self.require_qualified(block)
         want = self._want(block)
         if want:
             got = self._fingerprint(host)
@@ -272,3 +321,41 @@ class _HostHook:
 def dispatch_host_hook(runner, *, fingerprint_fn=host_code_fingerprint):
     """The dispatcher's per-leg image hook (:class:`_HostHook`)."""
     return _HostHook(runner, fingerprint_fn)
+
+
+# ── the per-tick signal: ERROR log + operator alert ─────────────────────────
+
+
+def image_qualification_condition(cfg) -> dict | None:
+    """The operator-watchdog condition for the after release, or ``None``:
+    ``image_after_unqualified`` (armed without a valid record — every
+    post-switch leg is refused) or ``image_after_override`` (used unqualified
+    under the owner's emergency override)."""
+    from ..shared.image_qualification import qualification_status
+
+    if not image_after_armed(cfg):
+        return None
+    st = qualification_status(cfg)
+    if not st.usable:
+        return {"code": "image_after_unqualified", "scope": "image", "reason": st.reason[:300]}
+    if st.override and not st.qualified:
+        return {"code": "image_after_override", "scope": "image", "reason": st.reason[:300]}
+    return None
+
+
+def log_image_qualification(cfg) -> dict | None:
+    """One trainer tick: a loud ERROR while the after release is unqualified
+    (refused) or used under the override. Returns the condition."""
+    cond = image_qualification_condition(cfg)
+    if cond is None:
+        return None
+    if cond["code"] == "image_after_unqualified":
+        log.error("DEC-CA-0067: [v2] *_after release %s is NOT QUALIFIED — every post-switch "
+                  "rent/dispatch on it is refused (legs wait as operator faults): %s",
+                  str(cfg.v2.train_image_digest_after)[:19], cond["reason"])
+    else:
+        log.error("DEC-CA-0067: [v2] image_after_unqualified_override = true — the after "
+                  "release %s is used WITHOUT a qualification record (%s). Emergency only: "
+                  "qualify it and turn the override off",
+                  str(cfg.v2.train_image_digest_after)[:19], cond["reason"])
+    return cond

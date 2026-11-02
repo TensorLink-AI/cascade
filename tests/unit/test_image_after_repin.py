@@ -39,6 +39,14 @@ AFTER = {"train_image_digest_after": RC16, "funded_pod_image_after": RC16_REF,
          "worker_code_fingerprint_after": FP16}
 
 
+@pytest.fixture(autouse=True)
+def _qualified(monkeypatch):
+    """These tests exercise the repin mechanics with a QUALIFIED after release
+    (the owner's qualification rule itself is tested in
+    test_image_qualification.py)."""
+    monkeypatch.setattr("cascade.trainer.leg_pins.after_image_refusal", lambda cfg: "")
+
+
 # ── the knobs ────────────────────────────────────────────────────────────────
 
 

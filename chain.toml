@@ -1212,6 +1212,11 @@ train_image_digest_after = ""
 funded_pod_image_after = ""
 worker_code_fingerprint_after = ""
 funded_sku_wall_measured_image_after = ""
+# Owner rule (enforced): the trainer uses the *_after pins only with a valid
+# qualifications/<from12>-to-<to12>.json record (bit-identical at world 1 and 8
+# plus bitwise resume; scripts/write_image_qualification.py). EMERGENCY ONLY:
+# true uses them unqualified, with an ERROR + operator alert every tick.
+image_after_unqualified_override = false
 # Margin-tiered start share (owner 2026-10-20, CONSENSUS, overlay-settable):
 # a king crowned at an INCREMENT-unit settlement starts at the start_bp of the
 # highest [lcb_threshold, start_bp] tier its crowning LCB (the family-wise

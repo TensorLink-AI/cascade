@@ -303,6 +303,20 @@ class _FundedLegMixin:
         # A new leg: a verdict left by this hotkey's previous leg must never
         # be read back as this one's (leg_failure falls back to its default).
         self._funded_leg_failures.pop(gen.hotkey, None)
+        # DEC-CA-0067 owner rule: a post-switch leg never rents (nor builds its
+        # corpus) on an UNQUALIFIED after release — an operator fault, unburned,
+        # and the billing stays the payer's (the miner's pod did nothing wrong).
+        from .leg_pins import ImageAfterUnqualified, after_image_refusal, contract_runs_after
+
+        if contract_runs_after(self.cfg, contract):
+            why = after_image_refusal(self.cfg)
+            if why:
+                self._record_funded_failure(
+                    gen.hotkey, f"operator-side fault: after image not qualified — {why}",
+                    miner_fault=False, error_class=OPERATOR_FAULT_CLASS, burn=False)
+                log.error("funded leg %s: REFUSED — the post-switch after image is not "
+                          "qualified (%s)", gen.hotkey[:12], why)
+                raise ImageAfterUnqualified(f"after image not qualified (rent): {why}")
         # A previous attempt of THIS leg (same era seeds, ref, size, init)
         # trained and verified fine but lost its upload: re-upload the local
         # copy instead of renting and retraining.
