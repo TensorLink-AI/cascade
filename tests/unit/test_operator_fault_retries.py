@@ -84,3 +84,8 @@ def test_loss_limit_still_allows_configured_operator_recovery(tmp_path):
     with pytest.raises(_FundedOperatorRent):
         runner._rent_funded_host("777", _challenger("hkA"))
     assert queue.get("hkA").operator_billed and queue.get("hkA").attempts == 0
+
+
+# The owner-approval gate (2026-11-02) is tested in test_money_safety.py;
+# these tests drive the operator-lane / operator-rent machinery behind it.
+pytestmark = pytest.mark.usefixtures("operator_legs_preapproved")

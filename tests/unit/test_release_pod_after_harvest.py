@@ -346,3 +346,8 @@ def test_release_knob_defaults_on_and_round_trips_through_the_loader(tmp_path):
     assert edited != src
     (tmp_path / "chain.toml").write_text(edited, encoding="utf-8")
     assert load_chain_config(tmp_path / "chain.toml").round.funded_release_after_harvest is False
+
+
+# The owner-approval gate (2026-11-02) is tested in test_money_safety.py;
+# these tests drive the operator-lane / operator-rent machinery behind it.
+pytestmark = pytest.mark.usefixtures("operator_legs_preapproved")

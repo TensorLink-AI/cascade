@@ -409,3 +409,8 @@ def test_c_identical_weights_do_not_mix_two_miners_submission_identities():
     rows = lane_c_progress(state)
     assert [(r["hotkey"], r["ref"], r["attempt_id"]) for r in rows] == [
         (HK, REF, HK), ("another-miner", OTHER, "another-miner")]
+
+
+# The owner-approval gate (2026-11-02) is tested in test_money_safety.py;
+# these tests drive the operator-lane / operator-rent machinery behind it.
+pytestmark = pytest.mark.usefixtures("operator_legs_preapproved")
