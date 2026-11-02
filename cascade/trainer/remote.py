@@ -84,9 +84,15 @@ class RemoteDispatchError(RuntimeError):
     pod's lanes rather than blaming the leg. ``None`` for parse/timeout/logic
     failures that carry no ssh status."""
 
-    def __init__(self, *args, returncode: int | None = None) -> None:
+    def __init__(self, *args, returncode: int | None = None,
+                 final_exception: str = "") -> None:
         super().__init__(*args)
         self.returncode = returncode
+        # The worker's final traceback exception line, parsed from its stderr
+        # by the dispatcher (final_exception_line) — the ONLY input the shard
+        # fault classifier trusts, never the message text, which carries a
+        # stderr tail anything on the pod could have printed.
+        self.final_exception = final_exception
 
 
 HOST_STAGES = ("any", "heat", "final")
@@ -710,6 +716,20 @@ def last_traceback(lines: list[str], *, max_lines: int = 60) -> list[str]:
     return block[-max_lines:]
 
 
+def final_exception_line(stderr: str) -> str:
+    """The exception line that closes the worker's LAST real traceback in
+    ``stderr`` — ``""`` when there is none, or when the block is cut off
+    before its exception line (the tail ended inside the frames)."""
+    lines, _ = split_job_notices(stderr or "")
+    tb = last_traceback(lines)
+    if len(tb) < 2:
+        return ""
+    last = tb[-1]
+    if not last.strip() or last[:1].isspace() or last.lstrip().startswith(_TRACEBACK_HEAD):
+        return ""
+    return last.strip()
+
+
 def summarize_failure(stderr: str, *, rc, progress: dict | None = None,
                       tail_chars: int = 1500) -> tuple[str, str]:
     """``(cause, detail)`` for a failed leg. ``cause`` is one line — exit
@@ -788,13 +808,29 @@ def save_failed_leg_evidence(root, hotkey: str, *, header: dict, stdout: str, st
 
 
 def _detached_kill_command(host: RemoteHost, run_dir: str) -> str:
+    """Kill a detached leg: its whole SESSION (the launcher's ``setsid``
+    makes the recorded pid the session id; the guarded worker runs under
+    ``set -m`` in its own process GROUP inside it, so a group kill of the
+    pid misses it), then the shard prefetch's own session (with_prefetch).
+    Each pid is first checked against ``/proc/<pid>/cmdline`` — the leg's
+    shell names its run dir, the prefetch its script — so a pid the kernel
+    reused for an unrelated process is never signalled."""
     rd = shlex.quote(run_dir)
-    # The shard prefetch runs in its OWN session (with_prefetch), outside the
-    # leg's group: kill it by the pid it recorded in the run dir too.
     return (f"cd {shlex.quote(host.workdir)} && p=$(cat {rd}/pid 2>/dev/null); "
-            f"[ -n \"$p\" ] && {{ kill -KILL -- -$p 2>/dev/null; kill -KILL $p 2>/dev/null; }}; "
+            f"[ -n \"$p\" ] && tr '\\0' ' ' </proc/$p/cmdline 2>/dev/null "
+            f"| grep -qF -- {rd} && "
+            f"{{ pkill -KILL -s $p 2>/dev/null; kill -KILL -- -$p 2>/dev/null; "
+            f"kill -KILL $p 2>/dev/null; }}; "
             f"q=$(cat {rd}/{PREFETCH_PID_NAME} 2>/dev/null); "
-            f"[ -n \"$q\" ] && {{ kill -KILL -- -$q 2>/dev/null; kill -KILL $q 2>/dev/null; }}; true")
+            f"[ -n \"$q\" ] && {_prefetch_alive('$q')} && "
+            f"{{ pkill -KILL -s $q 2>/dev/null; kill -KILL -- -$q 2>/dev/null; "
+            f"kill -KILL $q 2>/dev/null; }}; true")
+
+
+def _prefetch_alive(pid_expr: str) -> str:
+    """A shell test: ``pid_expr`` is a live process running prefetch.sh."""
+    return (f"tr '\\0' ' ' </proc/{pid_expr}/cmdline 2>/dev/null "
+            f"| grep -q 'prefetch[.]sh'")
 
 
 def run_detached(host: RemoteHost, body: str, stdin_env: str | None, run_dir: str, *,
@@ -1868,6 +1904,7 @@ class RemoteDispatcher:
             raise RemoteDispatchError(
                 f"remote {role} on {host.name} failed (rc={proc.returncode}) {cause}{where}"
                 + (f"\n{detail}" if detail else ""),
+                final_exception=final_exception_line(proc.stderr or ""),
                 returncode=proc.returncode,
             )
         receipt = parse_receipt(proc.stdout or "")
@@ -2113,7 +2150,12 @@ def prefetch_files(corpus_files: dict[str, str], corpus_dir: str) -> dict[str, s
         log.warning("shard prefetch skipped for %s: corpus.json carries no stored_bytes "
                     "to size the disk check — the worker streams shards itself", corpus_dir)
         return None
-    script = prefetch_script(corpus_dir, need_bytes=prefetch_need_bytes(stored), n_shards=n)
+    # The per-try floor also reserves room for every in-flight download (P
+    # parallel, sized at twice the mean shard) so P concurrent tries that all
+    # passed the check cannot overshoot it.
+    floor = PREFETCH_MARGIN_BYTES + PREFETCH_PARALLEL * 2 * -(-stored // n)
+    script = prefetch_script(corpus_dir, need_bytes=prefetch_need_bytes(stored), n_shards=n,
+                             floor_bytes=floor)
     return {PREFETCH_LIST_NAME: listing, PREFETCH_SCRIPT_NAME: script}
 
 
@@ -2154,7 +2196,8 @@ def with_prefetch(command: str, corpus_dir: str, run_dir: str | None = None) -> 
             f"setsid bash \"$pfd/{PREFETCH_SCRIPT_NAME}\" $$ </dev/null >/dev/null & "
             f"pf=$!; {record}"
             f"{command}; rc=$?; "
-            f"kill -TERM -- -$pf 2>/dev/null; kill -TERM $pf 2>/dev/null; (exit $rc); }}")
+            f"{_prefetch_alive('$pf')} && {{ pkill -TERM -s $pf 2>/dev/null; "
+            f"kill -TERM -- -$pf 2>/dev/null; kill -TERM $pf 2>/dev/null; }}; (exit $rc); }}")
 
 
 def run_ssh(ssh_argv: list[str], timeout: int, stdin_text: str | None = None):

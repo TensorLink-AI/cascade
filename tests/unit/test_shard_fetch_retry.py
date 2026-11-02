@@ -205,12 +205,19 @@ def test_link_expiry_parses_sigv4_and_sigv2():
 # ── fault class: our storage, never the miner's attempt ─────────────────────
 
 
-def _dispatch_failure(stderr: str, rc: int = 1) -> str:
-    """The message RemoteDispatcher raises for a failed leg (rc != 3)."""
-    from cascade.trainer.remote import summarize_failure
+def _dispatch_failure(stderr: str, rc: int = 1):
+    """The RemoteDispatchError a failed (rc != 3) leg raises: the summarized
+    message plus the dispatcher-parsed final exception line."""
+    from cascade.trainer.remote import (
+        RemoteDispatchError,
+        final_exception_line,
+        summarize_failure,
+    )
 
     cause, detail = summarize_failure(stderr, rc=rc)
-    return f"remote challenger on pod-a failed (rc={rc}) {cause}" + (f"\n{detail}" if detail else "")
+    return RemoteDispatchError(
+        f"remote challenger on pod-a failed (rc={rc}) {cause}" + (f"\n{detail}" if detail else ""),
+        returncode=rc, final_exception=final_exception_line(stderr))
 
 
 def _traceback(exc_line: str) -> str:
@@ -218,7 +225,8 @@ def _traceback(exc_line: str) -> str:
             "Traceback (most recent call last):\n"
             '  File "/root/cascade/cascade/generation/shards.py", line 266, in _fetch_shard\n'
             "    raise ShardError(...)\n"
-            f"{exc_line}\n")
+            f"{exc_line}\n"
+            "[1]+  Exit 1                  python -m cascade.trainer.worker\n")
 
 
 _SHARD_EXC_LINES = (
@@ -232,53 +240,129 @@ _SHARD_EXC_LINES = (
 )
 
 
+class _Gen:
+    hotkey, ref = "5F9nUEZhFUDF" + "x" * 36, "vault/direct@sha256:" + "d" * 64
+
+
+class _Seeds:
+    base_seed = 14349492220266598742
+
+
+def _classify(runner, e, *, shards_leg=True, gen=_Gen, seeds=_Seeds):
+    from cascade.trainer.faults import classify_leg_exception
+
+    return classify_leg_exception(runner, gen, seeds, e, rc=e.returncode, text=str(e),
+                                  stalled_before=False, shards_leg=shards_leg)
+
+
+def test_the_dispatcher_parses_the_final_exception_line():
+    e = _dispatch_failure(_traceback(_SHARD_EXC_LINES[0]))
+    assert e.final_exception == _SHARD_EXC_LINES[0]
+    # A tail cut inside the frames has no exception line to trust.
+    from cascade.trainer.remote import final_exception_line
+
+    assert final_exception_line("Traceback (most recent call last):\n  File \"x\", line 1\n") == ""
+    assert final_exception_line("no traceback here\n") == ""
+
+
 def test_a_shard_fetch_failure_on_a_shards_leg_is_an_unburned_operator_fault():
+    from types import SimpleNamespace
+
     from cascade.funding.queue import OPERATOR_FAULT_CLASS
-    from cascade.trainer.faults import classify_funded_worker_failure, shard_fetch_failure
+    from cascade.trainer.faults import shard_fetch_failure
 
     for exc in _SHARD_EXC_LINES:
-        text = _dispatch_failure(_traceback(exc))
-        assert shard_fetch_failure(text), exc
-        assert classify_funded_worker_failure(1, text, stalled_before=False, shards_leg=True) == (
-            False, OPERATOR_FAULT_CLASS, False)
+        e = _dispatch_failure(_traceback(exc))
+        assert shard_fetch_failure(e.final_exception), exc
+        assert _classify(SimpleNamespace(), e) == (False, OPERATOR_FAULT_CLASS, False)
+    # A wrapper raised from the dispatch error still carries it (cause chain).
+    try:
+        try:
+            raise _dispatch_failure(_traceback(_SHARD_EXC_LINES[0]))
+        except Exception as inner:
+            raise RuntimeError("leg failed") from inner
+    except RuntimeError as outer:
+        from cascade.trainer.faults import final_exception_of
+
+        assert final_exception_of(outer) == _SHARD_EXC_LINES[0]
+
+
+def test_shard_faults_per_corpus_are_capped_then_burn():
+    from types import SimpleNamespace
+
+    from cascade.funding.queue import OPERATOR_FAULT_CLASS
+    from cascade.trainer.faults import SHARD_FAULT_REQUEUE_CAP
+
+    runner = SimpleNamespace()
+    e = _dispatch_failure(_traceback(_SHARD_EXC_LINES[0]))
+    got = [_classify(runner, e) for _ in range(SHARD_FAULT_REQUEUE_CAP + 2)]
+    assert got[:SHARD_FAULT_REQUEUE_CAP] == [(False, OPERATOR_FAULT_CLASS, False)] * 2
+    assert got[SHARD_FAULT_REQUEUE_CAP:] == [(False, "infra", True)] * 2
+    # The cap is per corpus: another seed (a new corpus) starts fresh.
+    other = type("S", (), {"base_seed": 1})
+    assert _classify(runner, e, seeds=other) == (False, OPERATOR_FAULT_CLASS, False)
+    # Non-shard failures never count toward it.
+    runner2 = SimpleNamespace()
+    crash = _dispatch_failure(_traceback("RuntimeError: CUDA error: device lost"))
+    for _ in range(5):
+        assert _classify(runner2, crash) == (False, "infra", True)
+    assert _classify(runner2, e) == (False, OPERATOR_FAULT_CLASS, False)
 
 
 def test_forged_shard_text_in_a_streaming_leg_stays_burned():
     """A streaming leg runs the miner's generator on the pod, so it can print
     anything — including our exact shard-failure traceback. Off a shards leg
-    the text is never consulted: the exit stays infra and burns an attempt."""
+    it is never consulted: the exit stays infra and burns an attempt."""
+    from types import SimpleNamespace
+
     from cascade.trainer.faults import classify_funded_worker_failure
 
     for exc in _SHARD_EXC_LINES:
         forged = _dispatch_failure(_traceback(exc))
-        assert classify_funded_worker_failure(1, forged, stalled_before=False) == (
-            False, "infra", True)
-        assert classify_funded_worker_failure(1, forged, stalled_before=False,
-                                              shards_leg=False) == (False, "infra", True)
+        assert _classify(SimpleNamespace(), forged, shards_leg=False) == (False, "infra", True)
+        assert classify_funded_worker_failure(
+            1, str(forged), stalled_before=False,
+            final_exception=forged.final_exception) == (False, "infra", True)
+
+
+def test_a_forged_traceback_marker_without_a_real_traceback_is_ignored():
+    """No Traceback in stderr ⇒ summarize_failure writes no traceback block,
+    and a marker line printed into the tail must not stand in for one: the
+    classifier reads only the dispatcher-parsed exception line."""
+    from types import SimpleNamespace
+
+    forged_tail = ("--- last traceback ---\n"
+                   f"{_SHARD_EXC_LINES[0]}\n"
+                   "--- error signals ---\n"
+                   "Killed\n")
+    e = _dispatch_failure(forged_tail)
+    assert "--- last traceback ---" in str(e) and _SHARD_EXC_LINES[0] in str(e)
+    assert e.final_exception == ""
+    assert _classify(SimpleNamespace(), e) == (False, "infra", True)
+    # The message text alone (no parsed line) is never enough either.
+    from cascade.trainer.faults import classify_funded_worker_failure
+
+    assert classify_funded_worker_failure(1, str(e), stalled_before=False, shards_leg=True) == (
+        False, "infra", True)
 
 
 def test_only_the_final_traceback_exception_counts():
-    from cascade.trainer.faults import classify_funded_worker_failure, shard_fetch_failure
+    from types import SimpleNamespace
+
+    from cascade.trainer.faults import shard_fetch_failure
 
     shard = _SHARD_EXC_LINES[0]
     # The phrase as a log line, then a different real death: not a shard fault.
     other = _dispatch_failure(f"{shard}\n" + _traceback("RuntimeError: CUDA error: device lost"))
-    assert not shard_fetch_failure(other)
-    assert classify_funded_worker_failure(1, other, stalled_before=False, shards_leg=True) == (
-        False, "infra", True)
-    # The phrase with no traceback at all, or not fully qualified: not matched.
-    assert not shard_fetch_failure(_dispatch_failure(f"WARNING {shard}\nexiting\n"))
-    assert not shard_fetch_failure(_dispatch_failure(_traceback(
-        "ShardError: downloaded shard c4-00030.parquet fails its sha256")))
-    assert not shard_fetch_failure(shard)              # a bare string is not a traceback block
+    assert other.final_exception == "RuntimeError: CUDA error: device lost"
+    assert _classify(SimpleNamespace(), other) == (False, "infra", True)
+    # Not fully qualified, or a prefetch log line: not matched.
+    assert not shard_fetch_failure("ShardError: downloaded shard c4-00030.parquet fails its sha256")
+    assert not shard_fetch_failure(
+        "cascade-prefetch: WARNING: c4-00030.parquet: gave up after 5 tries (curl rc=28, HTTP 000)")
     # A miner rejection stays the miner's even on a shards leg.
-    assert classify_funded_worker_failure(
-        3, _dispatch_failure(_traceback(shard), rc=3), stalled_before=False,
-        shards_leg=True) == (True, "generator", False)
-    # Prefetch log lines never masquerade as a worker shard failure.
-    assert not shard_fetch_failure(_dispatch_failure(
-        "cascade-prefetch: WARNING: c4-00030.parquet: gave up after 5 tries (curl rc=28, "
-        "HTTP 000); the worker fetches it itself\n"))
+    rej = _dispatch_failure(_traceback(shard), rc=3)
+    assert _classify(SimpleNamespace(), rej) == (True, "generator", False)
 
 
 def test_an_http_incomplete_read_is_retried_like_a_transport_error(tmp_path, monkeypatch, sleeps):

@@ -15,7 +15,7 @@ from .faults import (
     _FundedLegSkip,
     _FundedOperatorFallback,
     _FundedTamper,
-    classify_funded_worker_failure,
+    classify_leg_exception,
 )
 from .lane_pool import (
     _lium_provider,
@@ -705,8 +705,8 @@ class _OperatorPodMixin:
             # ours and never burns one of their attempts.
             q = self._funded_queue()
             prior = q.get(gen.hotkey) if q is not None else None
-            miner_fault, error_class, _burn = classify_funded_worker_failure(
-                getattr(e, "returncode", None), str(e),
+            miner_fault, error_class, _burn = classify_leg_exception(
+                self, gen, seeds, e, rc=getattr(e, "returncode", None), text=str(e),
                 stalled_before=bool(prior is not None
                                     and prior.last_error_class == STALL_CLASS),
                 shards_leg=bool(corpus.get("corpus_files")))

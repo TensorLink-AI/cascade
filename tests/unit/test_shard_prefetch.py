@@ -173,6 +173,95 @@ def test_the_detached_kill_reaps_the_prefetch_by_its_recorded_pid(tmp_path):
             pf.kill()
 
 
+def _poll(pred, timeout=10.0):
+    import time
+
+    end = time.time() + timeout
+    while time.time() < end:
+        if pred():
+            return True
+        time.sleep(0.1)
+    return pred()
+
+
+needs_procps = pytest.mark.skipif(
+    not (HAVE_TOOLS and shutil.which("pkill") and shutil.which("pgrep")
+         and shutil.which("nohup") and Path("/proc/self/cmdline").exists()),
+    reason="needs setsid, nohup, pkill, pgrep and /proc")
+
+
+@needs_procps
+def test_the_detached_kill_kills_a_guarded_worker(tmp_path):
+    """The guarded worker runs under ``set -m`` in its own process GROUP; a
+    group kill of the recorded pid missed it. The kill is by session now."""
+    from cascade.trainer.remote import (
+        _detached_kill_command,
+        _guarded_worker,
+        build_detached_command,
+    )
+
+    host = RemoteHost(name="p", host="1.2.3.4", workdir=str(tmp_path))
+    rd = str(tmp_path / "run-1")
+    launch = build_detached_command(host, _guarded_worker("", ["sleep", "300"]), rd,
+                                    stdin_env_present=False)
+    subprocess.run(["bash", "-c", launch], check=True, timeout=30, capture_output=True)
+    assert _poll(lambda: (tmp_path / "run-1" / "pid").is_file())
+    sid = (tmp_path / "run-1" / "pid").read_text().strip()
+
+    def worker_alive():
+        return subprocess.run(["pgrep", "-s", sid, "-x", "sleep"],
+                              capture_output=True).returncode == 0
+
+    try:
+        assert _poll(worker_alive), "the guarded worker started"
+        subprocess.run(["bash", "-c", _detached_kill_command(host, rd)], timeout=30, check=True)
+        assert _poll(lambda: not worker_alive()), "the worker died with its session"
+    finally:
+        subprocess.run(["pkill", "-KILL", "-s", sid], capture_output=True)
+
+
+@needs_procps
+def test_the_detached_kill_never_signals_a_reused_pid(tmp_path):
+    """A pid file left by a finished leg may name a pid the kernel has since
+    given to something else: it is checked against /proc/<pid>/cmdline first."""
+    from cascade.trainer.remote import _detached_kill_command
+
+    bystander = subprocess.Popen(["setsid", "sleep", "300"])
+    try:
+        rd = tmp_path / "run-2"
+        rd.mkdir()
+        (rd / "pid").write_text(f"{bystander.pid}\n")
+        (rd / PREFETCH_PID_NAME).write_text(f"{bystander.pid}\n")
+        host = RemoteHost(name="p", host="1.2.3.4", workdir=str(tmp_path))
+        subprocess.run(["bash", "-c", _detached_kill_command(host, str(rd))],
+                       timeout=30, check=True)
+        assert bystander.poll() is None, "an unrelated process was signalled"
+    finally:
+        bystander.kill()
+        bystander.wait(timeout=10)
+
+
+@needs_procps
+def test_the_wrapper_never_signals_a_reused_prefetch_pid(tmp_path):
+    """A prefetch that already finished (its pid reaped, possibly reused) is
+    not signalled when the worker exits: the cmdline check gates the kill."""
+    (tmp_path / PREFETCH_SCRIPT_NAME).write_text("exit 0\n")
+    cmd = with_prefetch("bash -c 'sleep 0.5; exit 4'", str(tmp_path), str(tmp_path))
+    # The gate the wrapper (and the detached kill) applies before signalling:
+    # false for a live process that is not a prefetch.
+    bystander = subprocess.Popen(["setsid", "sleep", "300"])
+    try:
+        from cascade.trainer.remote import _prefetch_alive
+
+        check = _prefetch_alive(str(bystander.pid))
+        assert subprocess.run(["bash", "-c", check]).returncode != 0
+        assert subprocess.run(["bash", "-c", cmd], timeout=30).returncode == 4
+        assert bystander.poll() is None
+    finally:
+        bystander.kill()
+        bystander.wait(timeout=10)
+
+
 def test_ere_escape_is_literal():
     import re
 

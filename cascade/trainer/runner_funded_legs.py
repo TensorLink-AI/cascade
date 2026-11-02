@@ -18,6 +18,7 @@ from .faults import (
     _FundedTamper,
     _OperatorFault,
     classify_funded_worker_failure,
+    classify_leg_exception,
 )
 from .harvest_release import release_after_verified_harvest
 from .progress import progress_binding, report_progress
@@ -256,8 +257,8 @@ class _FundedLegMixin:
             else:
                 q = self._funded_queue()
                 prior = q.get(gen.hotkey) if q is not None else None
-                miner_fault, error_class, _ = classify_funded_worker_failure(
-                    getattr(e, "returncode", None), str(e),
+                miner_fault, error_class, _ = classify_leg_exception(
+                    self, gen, seeds, e, rc=getattr(e, "returncode", None), text=str(e),
                     stalled_before=bool(prior is not None
                                         and prior.last_error_class == STALL_CLASS),
                     shards_leg=bool(corpus.get("corpus_files")))
@@ -492,8 +493,8 @@ class _FundedLegMixin:
                 raise
             queue = self._funded_queue()
             prior = queue.get(gen.hotkey) if queue is not None else None
-            miner_fault, error_class, burn = classify_funded_worker_failure(
-                rc, text,
+            miner_fault, error_class, burn = classify_leg_exception(
+                self, gen, seeds, e, rc=rc, text=text,
                 stalled_before=bool(prior is not None
                                     and prior.last_error_class == STALL_CLASS),
                 shards_leg=bool(corpus.get("corpus_files")))

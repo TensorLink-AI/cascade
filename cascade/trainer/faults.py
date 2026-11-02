@@ -123,11 +123,17 @@ _STALL_MARKER = "generator_stalled"
 #
 # Forgery-resistant by construction: it is consulted ONLY for shards legs
 # (corpus_files pushed, no miner code runs on the pod — a streaming leg's
-# generator could print anything), and only the exception line that ends the
-# dispatcher's "--- last traceback ---" block (remote.summarize_failure)
-# counts, matched in full against the fully-qualified class names the
-# interpreter prints — never a substring anywhere in the stderr tail.
-_TRACEBACK_BLOCK_MARK = "--- last traceback ---"
+# generator could print anything), and only on the worker's final traceback
+# exception line as the DISPATCHER parsed it from stderr
+# (RemoteDispatchError.final_exception, remote.final_exception_line) — never
+# on the message text, whose stderr tail could carry a forged block. The line
+# must match in full the fully-qualified class names the interpreter prints.
+#
+# Bounded: the corpus is reused across retries, so a persistently bad stored
+# object would fail every retry the same way. After SHARD_FAULT_REQUEUE_CAP
+# unburned shard faults for one corpus (hotkey, seed, ref) the next one is
+# plain "infra" again (burns, as before this class existed).
+SHARD_FAULT_REQUEUE_CAP = 2
 _SHARD_FETCH_EXC_RE = re.compile(
     r"^cascade\.generation\.shards\.(?:"
     r"ShardLinkExpired: shard [A-Za-z0-9_.-]+: download link expired"
@@ -135,54 +141,80 @@ _SHARD_FETCH_EXC_RE = re.compile(
     r"|ShardError: shard [A-Za-z0-9_.-]+ could not be downloaded: )")
 
 
-def _final_traceback_exception(text: str) -> str:
-    """The exception line closing the FIRST ``--- last traceback ---`` block
-    the dispatcher wrote into a failure message ("" when there is none)."""
-    lines = (text or "").splitlines()
-    try:
-        i = lines.index(_TRACEBACK_BLOCK_MARK)
-    except ValueError:
-        return ""
-    block: list[str] = []
-    for ln in lines[i + 1:]:
-        if ln.startswith("--- ") and ln.endswith(" ---"):
-            break
-        block.append(ln)
-    # remote.last_traceback ends the block at the first unindented line after
-    # the frames: the exception line.
-    for ln in reversed(block):
-        if ln.strip():
-            return ln.strip() if not ln[:1].isspace() else ""
+def final_exception_of(exc: BaseException | None) -> str:
+    """The dispatcher-parsed final traceback exception line carried by
+    ``exc`` or an exception in its cause chain (``""`` when none does)."""
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        line = getattr(exc, "final_exception", "")
+        if isinstance(line, str) and line:
+            return line
+        exc = exc.__cause__ or exc.__context__
     return ""
 
 
-def shard_fetch_failure(text: str) -> bool:
-    """Whether a failure message's final traceback exception is a remote
-    shard fetch failure. Callers gate it on the leg being a shards leg."""
-    return bool(_SHARD_FETCH_EXC_RE.match(_final_traceback_exception(text)))
+def shard_fetch_failure(final_exception: str) -> bool:
+    """Whether a worker's final traceback exception line (as the dispatcher
+    parsed it) is a remote shard fetch failure. Callers gate it on the leg
+    being a shards leg."""
+    return bool(_SHARD_FETCH_EXC_RE.match((final_exception or "").strip()))
 
 
 def classify_funded_worker_failure(rc: int | None, text: str, *,
                                    stalled_before: bool,
-                                   shards_leg: bool = False) -> tuple[bool, str, bool]:
+                                   shards_leg: bool = False,
+                                   final_exception: str = "",
+                                   shard_faults_before: int = 0) -> tuple[bool, str, bool]:
     """``(miner_fault, error_class, burn_attempt)`` for a funded worker exit.
 
     ``rc == 3`` is the worker's "miner submission rejected" exit (CorpusError).
     A rejection whose text is a stream STALL is classed :data:`STALL_CLASS`
     (infra-side, unburned) the first time and ``"generator"`` (the miner's
     shot) only when this hotkey already stalled once before. Every other
-    rejection stays ``"generator"``. A non-rejection exit whose text is a
-    remote shard fetch failure (:func:`shard_fetch_failure` — our storage) is
-    :data:`OPERATOR_FAULT_CLASS`, unburned; any other exit is ``"infra"`` and
+    rejection stays ``"generator"``. On a ``shards_leg`` (the corpus was
+    pushed; no miner code ran on the pod) a non-rejection exit whose
+    dispatcher-parsed ``final_exception`` is a remote shard fetch failure
+    (:func:`shard_fetch_failure` — our storage) is :data:`OPERATOR_FAULT_CLASS`,
+    unburned, while ``shard_faults_before`` (this corpus's earlier ones) is
+    under :data:`SHARD_FAULT_REQUEUE_CAP`; any other exit is ``"infra"`` and
     burns one of the entry's retry attempts, as before.
     """
     if rc == 3:
         if _STALL_MARKER in (text or "") and not stalled_before:
             return False, STALL_CLASS, False
         return True, "generator", False
-    if shards_leg and shard_fetch_failure(text):
+    if (shards_leg and shard_fetch_failure(final_exception)
+            and shard_faults_before < SHARD_FAULT_REQUEUE_CAP):
         return False, OPERATOR_FAULT_CLASS, False
     return False, "infra", True
+
+
+def classify_leg_exception(runner, gen, seeds, exc: BaseException, *, rc: int | None,
+                           text: str, stalled_before: bool,
+                           shards_leg: bool) -> tuple[bool, str, bool]:
+    """:func:`classify_funded_worker_failure` for a failed funded leg, with
+    the per-corpus shard-fault count kept on ``runner`` (in memory; a trainer
+    restart resets it — still bounded per process)."""
+    import threading
+
+    final = final_exception_of(exc)
+    key = (str(getattr(gen, "hotkey", "")), str(getattr(seeds, "base_seed", "")),
+           str(getattr(gen, "ref", "")))
+    lock = runner.__dict__.setdefault("_shard_fault_lock", threading.Lock())
+    with lock:
+        counts = runner.__dict__.setdefault("_shard_fault_counts", {})
+        before = int(counts.get(key, 0))
+        verdict = classify_funded_worker_failure(
+            rc, text, stalled_before=stalled_before, shards_leg=shards_leg,
+            final_exception=final, shard_faults_before=before)
+        if shards_leg and rc != 3 and shard_fetch_failure(final):
+            counts[key] = before + 1
+            if verdict[1] != OPERATOR_FAULT_CLASS:
+                log.warning("leg %s: shard fetch failure #%d for one corpus (cap %d) — "
+                            "classed infra; check the stored object (%s)",
+                            key[0][:12], before + 1, SHARD_FAULT_REQUEUE_CAP, final[:200])
+    return verdict
 
 
 # Storage-layer failure fingerprints: a run that died inside the artifact /
