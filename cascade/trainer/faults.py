@@ -147,9 +147,12 @@ def final_exception_of(exc: BaseException | None) -> str:
     seen: set[int] = set()
     while exc is not None and id(exc) not in seen:
         seen.add(id(exc))
-        line = getattr(exc, "final_exception", "")
-        if isinstance(line, str) and line:
-            return line
+        if hasattr(exc, "final_exception"):
+            # The first dispatch error in the chain decides, even when it parsed
+            # no line: a retry that failed without a traceback must not inherit
+            # an EARLIER attempt's shard verdict through ``__context__``.
+            line = getattr(exc, "final_exception", "")
+            return line if isinstance(line, str) else ""
         exc = exc.__cause__ or exc.__context__
     return ""
 

@@ -828,9 +828,13 @@ def _detached_kill_command(host: RemoteHost, run_dir: str) -> str:
 
 
 def _prefetch_alive(pid_expr: str) -> str:
-    """A shell test: ``pid_expr`` is a live process running prefetch.sh."""
-    return (f"tr '\\0' ' ' </proc/{pid_expr}/cmdline 2>/dev/null "
-            f"| grep -q 'prefetch[.]sh'")
+    """A shell test: ``pid_expr`` is a live process whose argv[1] IS a
+    prefetch.sh path (``bash <corpus>/prefetch.sh <ppid>``). Matching argv[1]
+    alone, not the whole command line: every prefetch-wrapped leg shell
+    (``bash -c "... $pfd/prefetch.sh ..."``) also holds that text, and a stale
+    pid the kernel reused for another lane's leg shell must never pass."""
+    return (f"tr '\\0' '\\n' </proc/{pid_expr}/cmdline 2>/dev/null "
+            f"| sed -n 2p | grep -q '/prefetch[.]sh$'")
 
 
 def run_detached(host: RemoteHost, body: str, stdin_env: str | None, run_dir: str, *,

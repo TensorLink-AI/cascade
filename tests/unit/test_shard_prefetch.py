@@ -262,6 +262,36 @@ def test_the_wrapper_never_signals_a_reused_prefetch_pid(tmp_path):
         bystander.wait(timeout=10)
 
 
+@needs_procps
+def test_a_reused_prefetch_pid_on_another_legs_shell_is_never_signalled(tmp_path):
+    """Every prefetch-wrapped leg shell carries the text ``$pfd/prefetch.sh``
+    in its own command line. A stale prefetch.pid the kernel reused for
+    ANOTHER lane's leg shell must fail the gate (argv[1] is ``-c``), while the
+    real prefetch (``bash <dir>/prefetch.sh <ppid>``) passes it."""
+    from cascade.trainer.remote import _detached_kill_command, _prefetch_alive
+
+    (tmp_path / PREFETCH_SCRIPT_NAME).write_text("sleep 300\n")
+    other_leg = subprocess.Popen(
+        ["setsid", "bash", "-c",
+         f'pfd={tmp_path}; : "$pfd/prefetch.sh"; sleep 300; true'])
+    real = subprocess.Popen(["setsid", "bash", str(tmp_path / PREFETCH_SCRIPT_NAME), "1"])
+    try:
+        assert subprocess.run(["bash", "-c", _prefetch_alive(str(other_leg.pid))]).returncode != 0
+        assert subprocess.run(["bash", "-c", _prefetch_alive(str(real.pid))]).returncode == 0
+        rd = tmp_path / "run-3"
+        rd.mkdir()
+        (rd / PREFETCH_PID_NAME).write_text(f"{other_leg.pid}\n")
+        host = RemoteHost(name="p", host="1.2.3.4", workdir=str(tmp_path))
+        subprocess.run(["bash", "-c", _detached_kill_command(host, str(rd))],
+                       timeout=30, check=True)
+        assert other_leg.poll() is None, "another lane's leg shell was signalled"
+    finally:
+        for proc in (other_leg, real):
+            subprocess.run(["pkill", "-KILL", "-s", str(proc.pid)], capture_output=True)
+            proc.kill()
+            proc.wait(timeout=10)
+
+
 def test_ere_escape_is_literal():
     import re
 

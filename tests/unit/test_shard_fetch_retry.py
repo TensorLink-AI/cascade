@@ -398,3 +398,26 @@ def test_transfer_retry_covers_http_exceptions(monkeypatch):
         return "ok"
 
     assert T._retry("download x", once, attempts=3) == "ok" and len(calls) == 3
+
+
+def test_a_retry_without_a_traceback_does_not_inherit_the_first_shard_verdict():
+    """The lane retry dispatches inside ``except`` of the first failure, so
+    its error carries that failure as ``__context__``. The first dispatch error
+    in the chain decides: a retry with no parsed line is not a shard fault."""
+    from cascade.trainer.faults import final_exception_of
+    from cascade.trainer.remote import RemoteDispatchError
+
+    first = RemoteDispatchError("attempt 1")
+    first.final_exception = _SHARD_EXC_LINES[0]
+    try:
+        try:
+            raise first
+        except RemoteDispatchError:
+            raise RemoteDispatchError("retry timed out")  # noqa: B904 — implicit context IS the case under test
+    except RemoteDispatchError as retry:
+        assert retry.__context__ is first
+        assert final_exception_of(retry) == ""
+    # An explicit wrapper without the attribute still reaches the inner line.
+    wrapped = RuntimeError("leg failed")
+    wrapped.__cause__ = first
+    assert final_exception_of(wrapped) == _SHARD_EXC_LINES[0]
