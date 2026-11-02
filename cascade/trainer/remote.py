@@ -373,7 +373,7 @@ def pod_lane_count(host: RemoteHost, hosts: list[RemoteHost] | None) -> int:
 
 def build_remote_command(
     host: RemoteHost, argv: list[str], env: dict[str, str],
-    *, lane_count: int | None = None,
+    *, lane_count: int | None = None, wrap=None,
 ) -> tuple[str, str | None]:
     """The shell string ssh runs on the pod plus the stdin payload that carries
     the forwarded env: ``(command, stdin_env)``.
@@ -411,6 +411,8 @@ def build_remote_command(
     # `set -m` gives the backgrounded job its own pgid ($w); `wait` collects
     # the worker's rc; `kill -- -$w` reaps the group; the rc is preserved.
     guarded = _guarded_worker(prefix, argv)
+    if wrap is not None:                 # e.g. the shard prefetch (with_prefetch)
+        guarded = wrap(guarded)
     command = f"{PREEMPT_BENCHMARKS}cd {shlex.quote(host.workdir)} && {source}{guarded}"
     return command, stdin_env
 
@@ -1684,6 +1686,11 @@ class RemoteDispatcher:
     # Where a failed leg's fetched stdout/stderr tails are saved on the
     # orchestrator box (save_failed_leg_evidence); None = not saved.
     evidence_dir: str | None = None
+    # Shards legs: start the pod-side corpus prefetch beside the worker
+    # (prefetch_files / with_prefetch; [round] funded_prefetch_shards). Off by
+    # default here so test doubles keep their exact ssh call sequence; the
+    # live trainer arms it from config.
+    prefetch_shards: bool = False
     _runner: object = field(default=None, repr=False)  # injectable for tests
 
     def dispatch(
@@ -1745,10 +1752,29 @@ class RemoteDispatcher:
                     if role == "mkt_finetune" and finetune_recipe else finetune_recipe), "suffix": repo_suffix,
                 "train_hours": train_hours, "router_slow": router_slow, "anneal": anneal})
         corpus_dir = None
+        prefetch = None
         if corpus_files:
-            corpus_dir = push_corpus_files(host, corpus_files,
-                                           f"{role}-{hotkey[:12]}-{int(base_seed)}",
+            corpus_tag = f"{role}-{hotkey[:12]}-{int(base_seed)}"
+            corpus_dir = push_corpus_files(host, corpus_files, corpus_tag,
                                            runner=self._runner)
+            if self.prefetch_shards:
+                prefetch = prefetch_files(corpus_files, corpus_dir)
+
+        def _arm_prefetch(command: str) -> str:
+            # Push + start the corpus prefetch beside a FRESH launch only (a
+            # reattach must not rewrite a script a live prefetch is running).
+            # Any failure here launches the worker exactly as before.
+            if not prefetch:
+                return command
+            try:
+                push_corpus_files(host, prefetch, corpus_tag, runner=self._runner)
+            except (RemoteDispatchError, subprocess.TimeoutExpired, OSError) as e:
+                log.warning("dispatch role=%s → %s: shard prefetch not started (%s) — "
+                            "the worker streams shards itself", role, host.name, e)
+                return command
+            log.info("dispatch role=%s → %s: shard prefetch armed (%d shards) in %s",
+                     role, host.name, prefetch[PREFETCH_LIST_NAME].count("\n"), corpus_dir)
+            return with_prefetch(command, corpus_dir)
         argv = worker_argv(
             host, gen_ref=gen_ref, uid=uid, hotkey=hotkey, role=role,
             base_seed=base_seed, block=block, trainer_spec=self.trainer_spec,
@@ -1788,6 +1814,8 @@ class RemoteDispatcher:
             run_dir = prior or detached_run_dir(host, tag)
             body = _guarded_worker(_lane_prefix(host, lane_count) + _progress_prefix(run_dir),
                                    argv)
+            if prior is None:
+                body = _arm_prefetch(body)
             if mirror is not None and prior is None:
                 mirror.restore()
             try:
@@ -1803,7 +1831,8 @@ class RemoteDispatcher:
                 if mirror is not None:
                     mirror.close()
         else:
-            remote_cmd, stdin_env = build_remote_command(host, argv, env, lane_count=lane_count)
+            remote_cmd, stdin_env = build_remote_command(
+                host, argv, env, lane_count=lane_count, wrap=_arm_prefetch)
             ssh_argv = build_ssh_argv(host, remote_cmd)
             try:
                 proc = (self._runner or run_ssh)(ssh_argv, self.timeout_seconds, stdin_env)
@@ -1880,6 +1909,207 @@ def push_corpus_files(host: RemoteHost, files: dict[str, str], tag: str, *,
             raise RemoteDispatchError(
                 f"pushing {name} to {host.name} failed: {(proc.stderr or '')[-300:]}")
     return pod_dir
+
+
+# ── shard prefetch (trainer-side; works with any worker image) ──────────────
+#
+# A shards leg's worker streams its corpus from pre-signed links while it
+# trains; a reader on an older image has no retry, so one bad download kills
+# the leg mid-run (2026-11-02 c4-00030: step 7650/23841 on an 8xH200). The
+# dispatcher therefore pushes a small pod-side script next to corpus.json /
+# urls.json and starts it in the BACKGROUND alongside the worker. It fetches
+# every shard in the reader's own consumption order (shard k of every child
+# before shard k+1), each with bounded retries + timeouts, checks the bytes
+# against corpus.json's sha256, writes to a hidden temp name and only then
+# renames it into place. Why that is safe against a reader that is already
+# running (cascade.generation.shards._child_iter, unchanged since the rc15
+# image's 5e3fade):
+#
+# * the reader only ever opens ``<dir>/<name>``; a rename(2) within one
+#   directory is atomic, so it sees either no file or the complete, verified
+#   one — never a partial write (temps are ``.<name>.prefetch-<pid>``, which
+#   no reader looks at and which cannot collide with get_file's ``.part``);
+# * a shard already on disk is read in place, NOT downloaded (``start(i)``
+#   returns None when the file exists; the plain path when all exist) — and
+#   the plain path reads with verify=False, which is why the prefetch must
+#   verify BEFORE the rename;
+# * same bytes ⇒ same series in the same order: the prefetch never changes
+#   what trains, only where the reader gets the bytes from;
+# * a rename over a file the reader holds open leaves its fd on the old inode
+#   (identical bytes), and the reader's unlink-after-read of a remote shard
+#   at worst makes a lagging prefetch re-land a file no one reads again.
+#
+# The script never fails the leg: it skips with a WARNING when the pod lacks
+# the disk, gives up a shard after its retries (the worker then fetches that
+# one itself, as before), always exits 0, and is killed when the worker
+# exits (or stops itself when the leg's shell is gone). A prefetch problem is
+# therefore at worst the status quo — never a charge to the miner.
+
+PREFETCH_SCRIPT_NAME = "prefetch.sh"
+PREFETCH_LIST_NAME = "prefetch.tsv"
+PREFETCH_PARALLEL = 8
+PREFETCH_ATTEMPTS = 5
+# Free disk the prefetch requires beyond the corpus's stored bytes: +10% and
+# a flat 20 GiB for checkpoints/logs the leg writes on the same volume.
+PREFETCH_MARGIN_FRACTION = 0.10
+PREFETCH_MARGIN_BYTES = 20 * 1024 ** 3
+_PREFETCH_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
+_PREFETCH_SHA_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def prefetch_need_bytes(stored_bytes: int) -> int:
+    """Free bytes the pod needs before a prefetch is started."""
+    return int(stored_bytes * (1.0 + PREFETCH_MARGIN_FRACTION)) + PREFETCH_MARGIN_BYTES
+
+
+def prefetch_list(index: dict, urls: dict[str, str]) -> str:
+    """``name<TAB>sha256<TAB>expiry<TAB>url`` per shard, in the reader's
+    consumption order (round-robin over children by shard position — the
+    order iter_corpus reaches them), so the prefetch lands ahead of it.
+    Raises ``ValueError`` on anything the shell side could misparse."""
+    from ..generation.transfer import link_expiry_epoch
+
+    children = sorted(index.get("children") or [], key=lambda c: int(c["index"]))
+    depth = max((len(c.get("shards") or []) for c in children), default=0)
+    rows = []
+    for k in range(depth):
+        for c in children:
+            shards = c.get("shards") or []
+            if k >= len(shards):
+                continue
+            sh = shards[k]
+            name, sha = str(sh.get("name", "")), str(sh.get("sha256", ""))
+            url = urls.get(name)
+            if url is None:
+                continue                    # a local shard: nothing to fetch
+            if not _PREFETCH_NAME_RE.match(name) or not _PREFETCH_SHA_RE.match(sha):
+                raise ValueError(f"unexpected shard entry {name[:40]!r}")
+            if not url.startswith(("https://", "http://")) or any(
+                    ch in url for ch in '"\\\t\r\n '):
+                raise ValueError(f"unexpected download link for {name}")
+            rows.append(f"{name}\t{sha}\t{link_expiry_epoch(url)}\t{url}\n")
+    return "".join(rows)
+
+
+def prefetch_script(corpus_dir: str, *, need_bytes: int, n_shards: int,
+                    parallel: int = PREFETCH_PARALLEL,
+                    attempts: int = PREFETCH_ATTEMPTS) -> str:
+    """The pod-side bash prefetch (see the block comment above). Argument 1
+    is the pid of the leg's shell; the script stops itself once that is gone.
+    Links are fed to curl on stdin (``-K -``), never on a command line, and
+    are never printed — log lines carry shard names, codes and counts only."""
+    d = shlex.quote(corpus_dir)
+    need_kb = (int(need_bytes) + 1023) // 1024
+    return f"""#!/usr/bin/env bash
+# cascade shard prefetch — generated by cascade.trainer.remote; do not edit.
+set -u
+dir={d}
+list="$dir/{PREFETCH_LIST_NAME}"
+owner="${{1:-}}"
+P={int(parallel)}; A={int(attempts)}; need_kb={need_kb}; total={int(n_shards)}
+say() {{ echo "cascade-prefetch: $*" >&2; }}
+alive() {{ [ -z "$owner" ] || kill -0 "$owner" 2>/dev/null; }}
+if ! command -v curl >/dev/null 2>&1 || ! command -v sha256sum >/dev/null 2>&1; then
+  say "WARNING: curl/sha256sum missing; prefetch skipped, the worker streams shards itself"; exit 0
+fi
+avail_kb=$(df -Pk "$dir" 2>/dev/null | awk 'NR==2{{print $4}}')
+case "$avail_kb" in ''|*[!0-9]*)
+  say "WARNING: free disk unreadable for $dir; prefetch skipped, the worker streams shards itself"; exit 0;;
+esac
+if [ "$avail_kb" -lt "$need_kb" ]; then
+  say "WARNING: free disk ${{avail_kb}}KiB < needed ${{need_kb}}KiB; prefetch skipped, the worker streams shards itself"; exit 0
+fi
+rm -f "$dir"/.*.prefetch-* "$dir/.prefetch-failed" "$dir/.prefetch-expired" 2>/dev/null
+: > "$dir/.prefetch-failed"
+t0=$(date +%s)
+say "start: $total shards, $P parallel, ${{avail_kb}}KiB free"
+fetch() {{
+  local name=$1 sha=$2 exp=$3 url=$4 f="$dir/$1" a=1 delay=2 code rc tmp
+  if [ -f "$f" ] && [ "$(sha256sum < "$f" | cut -c1-64)" = "$sha" ]; then return 0; fi
+  tmp="$dir/.$name.prefetch-$BASHPID"
+  while :; do
+    [ -e "$dir/.prefetch-expired" ] && return 1
+    alive || return 1
+    rm -f "$tmp"
+    code=$(printf 'url = "%s"\\n' "$url" | curl -sS -K - -o "$tmp" -w '%{{http_code}}' \\
+      --connect-timeout 30 --max-time 900 --speed-limit 102400 --speed-time 60 2>/dev/null)
+    rc=$?
+    if [ "$rc" -eq 0 ] && [ "$code" = 200 ] \\
+       && [ "$(sha256sum < "$tmp" | cut -c1-64)" = "$sha" ]; then
+      mv -f "$tmp" "$f" && return 0
+    fi
+    rm -f "$tmp"
+    if [ "$code" = 401 ] || [ "$code" = 403 ]; then
+      if [ "$exp" -gt 0 ] && [ "$(date +%s)" -ge "$exp" ]; then
+        : > "$dir/.prefetch-expired"
+        say "WARNING: $name: download link EXPIRED (HTTP $code); prefetch stopped — links need re-signing"
+        echo "$name" >> "$dir/.prefetch-failed"; return 1
+      fi
+    fi
+    if [ "$a" -ge "$A" ]; then
+      say "WARNING: $name: gave up after $A tries (curl rc=$rc, HTTP ${{code:-none}}); the worker fetches it itself"
+      echo "$name" >> "$dir/.prefetch-failed"; return 1
+    fi
+    say "$name: try $a/$A failed (curl rc=$rc, HTTP ${{code:-none}}); retrying"
+    sleep $(( delay / 2 + RANDOM % (delay / 2 + 1) ))
+    a=$((a + 1)); delay=$((delay * 2)); [ "$delay" -gt 60 ] && delay=60
+  done
+}}
+running=0
+while IFS=$'\\t' read -r name sha exp url; do
+  [ -n "$name" ] || continue
+  alive || {{ say "leg shell gone; prefetch stopped"; kill 0; exit 0; }}
+  [ -e "$dir/.prefetch-expired" ] && break
+  fetch "$name" "$sha" "$exp" "$url" &
+  running=$((running + 1))
+  if [ "$running" -ge "$P" ]; then wait -n; running=$((running - 1)); fi
+done < "$list"
+wait
+nf=$(wc -l < "$dir/.prefetch-failed" | tr -d ' ')
+say "done: $total shards in $(( $(date +%s) - t0 ))s, $nf not prefetched"
+exit 0
+"""
+
+
+def prefetch_files(corpus_files: dict[str, str], corpus_dir: str) -> dict[str, str] | None:
+    """The prefetch script + its shard list for a remote corpus, or ``None``
+    (with a WARNING) when there is nothing to prefetch or the index cannot
+    size it. ``None`` means: launch as before, the worker streams."""
+    from ..generation.shards import INDEX_NAME, URLS_NAME
+
+    if URLS_NAME not in corpus_files or INDEX_NAME not in corpus_files:
+        return None
+    try:
+        index = json.loads(corpus_files[INDEX_NAME])
+        urls = json.loads(corpus_files[URLS_NAME])
+        if not isinstance(urls, dict):
+            raise ValueError("urls.json is not a mapping")
+        listing = prefetch_list(index, urls)
+        stored = int(index.get("stored_bytes") or 0)
+    except (ValueError, TypeError, KeyError) as e:
+        log.warning("shard prefetch skipped for %s: %s — the worker streams shards itself",
+                    corpus_dir, e)
+        return None
+    n = listing.count("\n")
+    if not n:
+        return None
+    if stored <= 0:
+        log.warning("shard prefetch skipped for %s: corpus.json carries no stored_bytes "
+                    "to size the disk check — the worker streams shards itself", corpus_dir)
+        return None
+    script = prefetch_script(corpus_dir, need_bytes=prefetch_need_bytes(stored), n_shards=n)
+    return {PREFETCH_LIST_NAME: listing, PREFETCH_SCRIPT_NAME: script}
+
+
+def with_prefetch(command: str, corpus_dir: str) -> str:
+    """``command`` (the guarded worker) with the corpus prefetch started
+    beside it in its OWN session (``setsid``: its own process group, so the
+    worker's group reap never touches it and it is killed as a group the
+    moment the worker exits). The worker's exit code is preserved; the
+    prefetch's never matters."""
+    sc = shlex.quote(f"{corpus_dir}/{PREFETCH_SCRIPT_NAME}")
+    return (f"{{ setsid bash {sc} $$ </dev/null >/dev/null & pf=$!; {command}; rc=$?; "
+            f"kill -TERM -- -$pf 2>/dev/null; kill -TERM $pf 2>/dev/null; (exit $rc); }}")
 
 
 def run_ssh(ssh_argv: list[str], timeout: int, stdin_text: str | None = None):

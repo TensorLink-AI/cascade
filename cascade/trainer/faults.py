@@ -6,6 +6,7 @@ import logging
 import re
 import subprocess
 
+from ..funding.queue import OPERATOR_FAULT_CLASS
 from ..shared.hippius import StorageError
 
 log = logging.getLogger("cascade.trainer")
@@ -113,6 +114,21 @@ def _http_status_in_chain(exc: BaseException | None) -> int | None:
 STALL_CLASS = "stall"
 _STALL_MARKER = "generator_stalled"
 
+# A worker that died fetching ITS CORPUS from our storage (a shards leg's
+# pre-signed download: transport error after every retry, a sha256 mismatch on
+# the downloaded bytes, an expired link). The corpus was written, hashed and
+# uploaded by the operator's own tier, so this is our storage boundary —
+# never the miner's generator. Requeued unburned as an operator fault
+# (2026-11-02: c4-00030 sha mismatch killed a make-good leg at step 7650).
+_SHARD_FETCH_FAILURE_RE = re.compile(
+    r"ShardLinkExpired|shard \S+ could not be downloaded|"
+    r"downloaded shard \S+ fails its sha256")
+
+
+def shard_fetch_failure(text: str) -> bool:
+    """Whether a worker's failure text is a remote shard fetch failure."""
+    return bool(_SHARD_FETCH_FAILURE_RE.search(text or ""))
+
 
 def classify_funded_worker_failure(rc: int | None, text: str, *,
                                    stalled_before: bool) -> tuple[bool, str, bool]:
@@ -122,13 +138,17 @@ def classify_funded_worker_failure(rc: int | None, text: str, *,
     A rejection whose text is a stream STALL is classed :data:`STALL_CLASS`
     (infra-side, unburned) the first time and ``"generator"`` (the miner's
     shot) only when this hotkey already stalled once before. Every other
-    rejection stays ``"generator"``; any other exit is ``"infra"`` and burns
-    one of the entry's retry attempts, as before.
+    rejection stays ``"generator"``. A non-rejection exit whose text is a
+    remote shard fetch failure (:func:`shard_fetch_failure` — our storage) is
+    :data:`OPERATOR_FAULT_CLASS`, unburned; any other exit is ``"infra"`` and
+    burns one of the entry's retry attempts, as before.
     """
     if rc == 3:
         if _STALL_MARKER in (text or "") and not stalled_before:
             return False, STALL_CLASS, False
         return True, "generator", False
+    if shard_fetch_failure(text):
+        return False, OPERATOR_FAULT_CLASS, False
     return False, "infra", True
 
 

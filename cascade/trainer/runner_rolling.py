@@ -200,6 +200,7 @@ class _RollingMixin:
                 "continuation_interval": self.cfg.round.ops_continuation_interval_seconds,
                 "continuation_max_bytes": self.cfg.round.ops_continuation_max_bytes}
                if self.cfg.round.ops_continuation_interval_seconds else {}),
+            prefetch_shards=bool(getattr(self.cfg.round, "funded_prefetch_shards", True)),
             **self._dispatch_mode(),
         )
 

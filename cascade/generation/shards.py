@@ -37,12 +37,21 @@ reports when consumed to the end.
 A REMOTE corpus (the GPU pod) is ``corpus.json`` plus ``urls.json`` — one
 pre-signed download link per shard (:mod:`.transfer`). Readers fetch each
 shard when its child reaches it, check its sha256, and delete it once read.
+A fetch that fails (transport error, short read or sha256 mismatch) is
+retried with bounded exponential backoff + jitter before the leg gives up;
+a retry re-downloads the SAME object and only verified bytes are ever read,
+so which series train, and their order, never depend on a retry. A shard a
+trainer-side prefetch already landed (verified, atomically renamed into
+place) is read in place instead of downloaded.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import random
+import time
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 
@@ -54,12 +63,35 @@ FLOAT32_SCHEMA = 3
 INDEX_NAME = "corpus.json"
 URLS_NAME = "urls.json"      # remote corpus: {shard name: pre-signed GET link}
 
+log = logging.getLogger("cascade.generation.shards")
+
+# Remote shard fetch retry policy (2026-11-02: one bad c4-00030 download —
+# sha256 mismatch, no retry — killed an 8xH200 leg at step 7650). Attempts
+# are TOTAL tries; the backoff before try n+1 is min(cap, base * 2**(n-1))
+# times a jitter factor in [0.5, 1.0]. This loop is the ONLY retry layer on
+# the shard path: it calls transfer.get_file with attempts=1, so the two
+# never compound into a 25-try double exponential.
+SHARD_FETCH_ATTEMPTS = 5
+SHARD_FETCH_BACKOFF_BASE_S = 2.0
+SHARD_FETCH_BACKOFF_CAP_S = 60.0
+_SLEEP = time.sleep          # test seam
+_JITTER = random.random      # test seam; never feeds the data path
+
 
 _POOL_SET = False
 
 
 class ShardError(ValueError):
     """A corpus directory or shard is malformed or fails its digest."""
+
+
+class ShardLinkExpired(ShardError):
+    """A shard's pre-signed download link was refused (HTTP 401/403) after its
+    signed expiry: retrying the same link can never succeed, the orchestrator
+    must re-sign. Distinct from a transient download failure so an operator
+    sees "links outlived" rather than "storage flaked"; either way it is OUR
+    storage-side fault, never the miner's."""
+
 
 
 def _pa():
@@ -252,19 +284,55 @@ def verify_shards(corpus_dir: Path | str, index: dict | None = None) -> None:
                 raise ShardError(f"shard {p} fails its sha256")
 
 
-def _fetch_shard(corpus_dir: Path, sh: dict, url: str) -> Path:
-    """Download one remote shard and check it against the index's sha256."""
-    from .transfer import get_file
+def _backoff_s(attempt: int) -> float:
+    """Sleep before try ``attempt + 1``: exponential, capped, jittered."""
+    raw = min(SHARD_FETCH_BACKOFF_CAP_S, SHARD_FETCH_BACKOFF_BASE_S * 2.0 ** (attempt - 1))
+    return raw * (0.5 + 0.5 * _JITTER())
 
+
+def _fetch_shard(corpus_dir: Path, sh: dict, url: str, *,
+                 attempts: int | None = None) -> Path:
+    """Download one remote shard and check it against the index's sha256,
+    retrying a failed download OR a hash mismatch up to ``attempts`` times
+    (default :data:`SHARD_FETCH_ATTEMPTS`). The partial/bad file is deleted
+    between tries. An expired link raises :class:`ShardLinkExpired` at once.
+
+    Pure retry: every try fetches the same object and the file is only
+    returned once its bytes hash to the index's sha256, so the series read
+    are exactly the ones a first-try success would have read."""
+    from .transfer import LinkExpiredError, get_file
+
+    n = max(1, int(attempts if attempts is not None else SHARD_FETCH_ATTEMPTS))
     p = corpus_dir / sh["name"]
-    try:
-        get_file(url, p)
-    except OSError as e:
-        raise ShardError(f"shard {sh['name']} could not be downloaded: {e}") from e
-    if file_sha256(p) != sh["sha256"]:
-        p.unlink(missing_ok=True)
-        raise ShardError(f"downloaded shard {sh['name']} fails its sha256")
-    return p
+    why = ""
+    for attempt in range(1, n + 1):
+        try:
+            get_file(url, p, attempts=1)
+        except LinkExpiredError as e:
+            p.unlink(missing_ok=True)
+            raise ShardLinkExpired(
+                f"shard {sh['name']}: download link expired ({e}) — re-sign the corpus "
+                "links; retrying the same link cannot succeed") from e
+        except OSError as e:
+            p.unlink(missing_ok=True)
+            why = f"could not be downloaded: {e}"
+        else:
+            if file_sha256(p) == sh["sha256"]:
+                if attempt > 1:
+                    log.warning("shard %s: fetched and verified on try %d/%d",
+                                sh["name"], attempt, n)
+                return p
+            p.unlink(missing_ok=True)
+            why = "fails its sha256"
+        if attempt < n:
+            delay = _backoff_s(attempt)
+            log.warning("shard %s %s; retry %d/%d in %.1fs", sh["name"], why,
+                        attempt, n - 1, delay)
+            _SLEEP(delay)
+    if why == "fails its sha256":
+        raise ShardError(f"downloaded shard {sh['name']} fails its sha256 "
+                         f"(after {n} tries)")
+    raise ShardError(f"shard {sh['name']} {why} (after {n} tries)")
 
 
 def _child_iter(corpus_dir: Path, child: dict, urls: dict[str, str]) -> Iterator[np.ndarray]:

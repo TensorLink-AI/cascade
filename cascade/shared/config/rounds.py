@@ -302,6 +302,16 @@ class RoundConfig:
     detached_dispatch: bool = True
     dispatch_poll_seconds: int = 30
     dispatch_reattach_grace_seconds: int = 900
+    # Shards legs (a remote corpus: urls.json on the pod): start a pod-side
+    # prefetch of EVERY shard alongside the worker — curl with per-shard
+    # retries + timeouts, sha256-checked against corpus.json, written to a
+    # temp name and atomically renamed into place — so the worker reads
+    # verified local files instead of downloading mid-run (2026-11-02: one
+    # bad shard download killed an 8xH200 leg at step 7650). Skipped with a
+    # WARNING when the pod lacks the disk (stored_bytes + margin); a prefetch
+    # failure never fails the leg (the worker streams as before). Works with
+    # worker images that predate the reader-side retry. False = stream only.
+    funded_prefetch_shards: bool = True
     # Hybrid fallback: a funded leg (or the JIT king) still WAITING for
     # marketplace capacity takes an OPERATOR final lane from hosts.toml as
     # soon as one is on file — operator-billed for that leg only. Off ⇒
