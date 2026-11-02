@@ -86,14 +86,23 @@ def tree_bytes(path: Path) -> int:
     return total
 
 
+_MTIME_WALK_LIMIT = 4096
+
+
 def _last_used(path: Path) -> float:
-    """mtime of ``path`` or of its newest top-level entry (LRU key)."""
+    """The newest mtime anywhere in ``path``'s tree (bounded walk; LRU key and
+    grace) — a file being written deep inside counts (review F11)."""
     t = path.stat().st_mtime
-    if path.is_dir():
-        with contextlib.suppress(OSError):
-            for child in path.iterdir():
-                with contextlib.suppress(OSError):
-                    t = max(t, child.lstat().st_mtime)
+    if not path.is_dir():
+        return t
+    seen = 0
+    for dirpath, dirs, files in os.walk(path):
+        for name in dirs + files:
+            seen += 1
+            with contextlib.suppress(OSError):
+                t = max(t, (Path(dirpath) / name).lstat().st_mtime)
+            if seen >= _MTIME_WALK_LIMIT:
+                return t
     return t
 
 
@@ -368,12 +377,15 @@ def harvest_source(root: Path | str, active: Callable[[], set[str]]) -> Source:
     return Source(name="harvest", root=Path(root), list_items=items, reclaimable=ok)
 
 
-def leftover_source(work_root: Path | str) -> list[Source]:
-    """Hand-made ``_funded_harvest.box-*`` leftovers beside the harvest dir."""
+def leftover_source(work_root: Path | str, active: Callable[[], set[str]] = set) -> list[Source]:
+    """Hand-made ``_funded_harvest.box-*`` copies beside the harvest dir —
+    judged exactly like the harvest dir (a pending upload record keeps an
+    item; review F11)."""
     out = []
     for p in sorted(Path(work_root).glob("_funded_harvest.box-*")):
-        out.append(Source(name=f"leftover:{p.name}", root=p.resolve(), list_items=_children,
-                          reclaimable=lambda _p: True))
+        src = harvest_source(p.resolve(), active)
+        src.name = f"leftover:{p.name}"
+        out.append(src)
     return out
 
 
@@ -385,9 +397,37 @@ def eval_cache_root(cfg) -> Path:
 def eval_cache_protected(cfg, cache_root: Path | str, extra: Iterable[str] = ()) -> set[str]:
     """Never-evict set for the eval cache: refs in validator / cascade / warm-
     start state, the validator's unsettled-manifest pins, plus ``extra``.
-    Raises :class:`ProtectionUnknown` when any of it cannot be read."""
+    Raises :class:`ProtectionUnknown` when any of it cannot be read — and
+    when the champion state file is MISSING while the cache holds
+    checkpoints (a wrong working directory or a moved state file must never
+    read as "no king": review F11)."""
+    state = Path(getattr(getattr(cfg, "validator", None), "state_db_path", "") or "")
+    if str(state) and not state.is_file():
+        root = Path(cache_root)
+        if root.is_dir() and any(DIGEST_DIR_RE.match(p.name) for p in root.iterdir()):
+            raise ProtectionUnknown(f"validator state {state} not found (cwd {Path.cwd()}) "
+                                    "— protecting everything")
     return (read_state_refs(validator_state_paths(cfg)) | read_pins(cache_root)
             | {n for n in extra if n})
+
+
+@contextlib.contextmanager
+def space_lock(root: Path | str):
+    """Cross-process lock shared by the trainer's reclaim and the
+    validator's pin-then-trim (``<eval cache>/.space.lock``). A missing root
+    takes no lock (nothing there to evict)."""
+    import fcntl
+
+    root = Path(root)
+    if not root.is_dir():
+        yield
+        return
+    with open(root / ".space.lock", "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
 
 
 def box_sources(cfg, work_root: Path | str | None = None, *,
@@ -406,7 +446,7 @@ def box_sources(cfg, work_root: Path | str | None = None, *,
         srcs += [digest_cache_source("bench_ckpts", wr / "_bench_ckpts", protected),
                  digest_cache_source("ckpt_guard", wr / "_funded_ckpt_guard", protected),
                  harvest_source(wr / "_funded_harvest", active_harvests)]
-        srcs += leftover_source(wr)
+        srcs += leftover_source(wr, active_harvests)
     return srcs
 
 
@@ -419,13 +459,14 @@ def reclaim(cfg, target: Path | str, *, need_bytes: int = 0, floor_bytes: int | 
     if floor_bytes is None:
         floor_bytes = int(float(getattr(v, "eval_ckpt_cache_min_free_gb", 0.0) or 0.0) * GIB)
     grace = float(getattr(v, "eval_ckpt_cache_grace_seconds", 3600) or 0)
-    try:
-        sources = box_sources(cfg, work_root, active_harvests=active_harvests,
-                              extra_protected=extra_protected)
-    except ProtectionUnknown as e:
-        log.error("disk: protection state unreadable (%s) — evicting NOTHING", e)
-        free = free_bytes(target)
-        short = 0 if free is None else max(0, int(floor_bytes) + int(need_bytes) - free)
-        return Report(free_after=free, short_bytes=short, blocked=str(e))
-    return ensure_space(target, sources, floor_bytes=int(floor_bytes),
-                        need_bytes=int(need_bytes), grace_seconds=grace, why=why)
+    with space_lock(eval_cache_root(cfg)):
+        try:
+            sources = box_sources(cfg, work_root, active_harvests=active_harvests,
+                                  extra_protected=extra_protected)
+        except ProtectionUnknown as e:
+            log.error("disk: protection state unreadable (%s) — evicting NOTHING", e)
+            free = free_bytes(target)
+            short = 0 if free is None else max(0, int(floor_bytes) + int(need_bytes) - free)
+            return Report(free_after=free, short_bytes=short, blocked=str(e))
+        return ensure_space(target, sources, floor_bytes=int(floor_bytes),
+                            need_bytes=int(need_bytes), grace_seconds=grace, why=why)

@@ -186,34 +186,46 @@ def test_parked_entries_can_be_withdrawn(tmp_path):
 # ── the approval store ──────────────────────────────────────────────────────
 
 
-def test_approvals_are_single_use_and_bound_to_the_request(tmp_path):
-    s = OperatorApprovals(tmp_path / "a.json")
-    assert s.request("funded_queue.json", HK, ref=REF, attempt_id="A1", uid=146,
-                     projected_cost_usd=65.0, kind="expired_key")
-    assert not s.request("funded_queue.json", HK, ref=REF, attempt_id="A2")   # refresh only
-    assert s.pending()[0]["request_attempt_id"] == "A1"
+def test_approvals_last_for_one_leg_and_bind_to_ref_funding_and_kind(tmp_path):
+    s_ = OperatorApprovals(tmp_path / "a.json")
+    q = "funded_queue.json"
+    assert s_.request(q, HK, ref=REF, attempt_id="A1", uid=146, projected_cost_usd=65.0,
+                      kind="expired_key", funded_at=5.0)
+    assert not s_.request(q, HK, ref=REF, attempt_id="A2", kind="expired_key",
+                          funded_at=5.0)                               # refresh only
+    assert s_.pending()[0]["request_attempt_id"] == "A1"
     with pytest.raises(ValueError):
-        s.decide(HK, approve=True, attempt_id="A2")
+        s_.decide(HK, approve=True, attempt_id="A2")
     with pytest.raises(LookupError):
-        s.decide("5Other", approve=True)
-    s.decide(HK, approve=True, attempt_id="A1")
-    assert s.consume("funded_queue.json", HK, ref="other@x", attempt_id="B",
-                     projected_cost_usd=1.0) == "none"                       # other ref
-    assert s.consume("funded_queue.json", HK, ref=REF, attempt_id="B",
-                     projected_cost_usd=65.0) == "approved"
-    assert s.consume("funded_queue.json", HK, ref=REF, attempt_id="C",
-                     projected_cost_usd=65.0) == "none"                      # used up
+        s_.decide("5Other", approve=True)
+    s_.decide(HK, approve=True, attempt_id="A1")
+    chk = dict(ref=REF, funded_at=5.0, projected_cost_usd=65.0)
+    assert s_.check(q, HK, attempt_id="B", kind="make_good", **chk) == "none"     # kind
+    assert s_.check(q, HK, attempt_id="B", kind="expired_key", ref=REF, funded_at=6.0) == "none"
+    # not used up by a check: a no-capacity requeue (new attempt) still passes
+    assert s_.check(q, HK, attempt_id="B", kind="expired_key", **chk) == "approved"
+    assert s_.check(q, HK, attempt_id="C", kind="expired_key", **chk) == "approved"
+    assert s_.mark_launched(q, HK, ref=REF, attempt_id="C")
+    assert s_.check(q, HK, attempt_id="C", kind="expired_key", **chk) == "approved"  # reattach
+    assert s_.check(q, HK, attempt_id="D", kind="expired_key", **chk) == "none"      # retry
 
 
 def test_approval_ceiling_refuses_a_costlier_dispatch(tmp_path):
-    s = OperatorApprovals(tmp_path / "a.json")
-    s.request("q", HK, ref=REF, attempt_id="A1", projected_cost_usd=65.0)
-    s.decide(HK, approve=True, max_cost_usd=50.0)
-    assert s.consume("q", HK, ref=REF, attempt_id="A1", projected_cost_usd=65.0) == "over_ceiling"
-    assert s.pending()[0]["state"] == "pending"
+    s_ = OperatorApprovals(tmp_path / "a.json")
+    s_.request("q", HK, ref=REF, attempt_id="A1", projected_cost_usd=65.0)
+    s_.decide(HK, approve=True, max_cost_usd=50.0)
+    assert s_.check("q", HK, ref=REF, attempt_id="A1", kind="",
+                    projected_cost_usd=65.0) == "over_ceiling"
 
 
-# ── the gate on a fake runner ───────────────────────────────────────────────
+def test_owner_can_preapprove_without_a_pending_request(tmp_path, capsys):
+    q = _flight(tmp_path)
+    assert cli(["approve-operator-leg", HK, "--work-root", str(tmp_path),
+                "--kind", "operator_lane"]) == 0
+    s_ = OperatorApprovals.for_work_root(tmp_path)
+    assert s_.peek_approved("funded_queue.json", HK, REF, funded_at=q.get(HK).funded_at,
+                            kind="operator_lane")
+    assert not s_.peek_approved("funded_queue.json", HK, REF, kind="paid_fallback")
 
 
 def _gate_runner(tmp_path, balance=1000.0, **round_kw):
@@ -262,7 +274,7 @@ def test_unapproved_operator_leg_parks_with_cost_and_alert(tmp_path):
     assert "operator_leg_awaiting_approval" in codes
 
 
-def test_approved_leg_dispatches_exactly_once_and_books_the_spend(tmp_path, capsys):
+def test_approved_leg_books_spend_only_at_launch_and_lasts_for_the_leg(tmp_path, capsys):
     r, q = _gate_runner(tmp_path)
     _park(r, q)
     assert cli(["approve-operator-leg", HK, "--work-root", str(tmp_path)]) == 0
@@ -270,10 +282,44 @@ def test_approved_leg_dispatches_exactly_once_and_books_the_spend(tmp_path, caps
     assert q.get(HK).status == "queued"
     _redispatch(q)
     assert money_guard.operator_leg_gate(r, GEN, kind="expired_key", rent=True) is None
+    assert money_guard.OperatorSpend.for_runner(r).total() == 0.0      # nothing rented yet
+    # the rent found no capacity: requeued, and the approval SURVIVES (F3)
+    q.requeue(HK, error="sold out", error_class="no_capacity", burn_attempt=False)
+    _redispatch(q)
+    assert money_guard.operator_leg_gate(r, GEN, kind="expired_key", rent=True) is None
+    money_guard.note_operator_launch(r, HK)                              # the pod is up
     assert money_guard.OperatorSpend.for_runner(r).total() == pytest.approx(65.0)
-    # a later failure's retry needs a NEW approval
+    # the same attempt (a restart re-attach) passes; a retry after a failure parks
+    assert money_guard.operator_leg_gate(r, GEN, kind="expired_key", rent=True) is None
+    q.requeue(HK, error="leg lost", error_class="no_capacity", burn_attempt=False)
+    _redispatch(q)
     _park(r, q)
     assert q.get(HK).status == AWAITING_APPROVAL_STATUS
+
+
+def test_restart_adopts_an_in_flight_operator_leg_without_approval(tmp_path):
+    """Review F1: uid146's in-flight operator-billed leg, its operator pod on
+    the ledger, re-attached by a restarted trainer: adopted — no approval
+    request, no spend booking, no park; it stays in flight (the keep-set)."""
+    from cascade.trainer.admission import mark_admitted
+
+    r, q = _gate_runner(tmp_path)
+    q.set_operator_billed(HK, True)
+    r._operator_leg_pod_prefix = lambda rid, hk: f"cascade-n91-{rid}-funded-{hk[:12].lower()}-op"
+    r._load_funded_ledger = lambda: [SimpleNamespace(
+        instance_id=f"cascade-n91-777-funded-{HK[:12].lower()}-op-0")]
+    assert money_guard.gate_or_adopt(r, "777", GEN, kind="make_good", rent=True) is None
+    assert money_guard.take_deferred_gate(r) == "make_good"     # gated only if the pod is gone
+    assert OperatorApprovals.for_work_root(tmp_path).pending() == []
+    assert money_guard.OperatorSpend.for_runner(r).total() == 0.0
+    assert q.get(HK).status == "in_flight" and HK not in r._funded_leg_failures
+    # a re-attached in-flight operator-billed lane leg is grandfathered too
+    mark_admitted(r, HK)
+    assert money_guard.gate_or_adopt(r, "777", GEN, kind="make_good", rent=False) is None
+    # ... but a FRESH rent of a resumed leg without its pod is still gated
+    r._load_funded_ledger = lambda: []
+    with pytest.raises(_FundedLegSkip):
+        money_guard.gate_or_adopt(r, "777", GEN, kind="make_good", rent=True)
 
 
 def test_denied_expired_key_fails_unburned_and_make_good_returns_to_the_miner(tmp_path):
@@ -350,16 +396,30 @@ def test_daily_cap_blocks_with_one_alert(tmp_path):
                                                  ops_operator_daily_cap_usd=80.0)) == 80.0
 
 
-def test_unknown_balance_refuses_and_low_balance_trips_the_breaker(tmp_path):
+def test_balance_shortfall_refuses_the_leg_only_and_the_king_still_rents(tmp_path):
+    """Review F2: a projected shortfall (or an unknown balance) refuses THAT
+    leg with one alert; the account-wide breaker stays closed and a king rent
+    proceeds. Only a real 402 trips the breaker — and never refuses the king."""
     r, q = _gate_runner(tmp_path, balance=None)
     _approve(r, q)
     with pytest.raises(_FundedLegSkip):
         money_guard.operator_leg_gate(r, GEN, kind="expired_key", rent=True)
-    assert money_guard.OperatorBreaker.for_runner(r).open_record() is None
     r._operator_balance_reader = lambda: 100.0              # < 65 * 1.25 + 50
     with pytest.raises(_FundedLegSkip):
         money_guard.operator_leg_gate(r, GEN, kind="expired_key", rent=True)
-    assert money_guard.OperatorBreaker.for_runner(r).open_record() is not None
+    assert r._funded_leg_failures[HK][2] == OPERATOR_BLOCKED_CLASS
+    assert money_guard.OperatorBreaker.for_runner(r).open_record() is None
+    assert any(c["code"] == "operator_balance_low" for c in money_guard.health_conditions(r, {}))
+
+    class _King:
+        name = "lium"
+
+        def launch(self, spec):
+            return ["king-0"]
+
+    assert money_guard.guard_operator_provider(r, _King(), enforce=False).launch("s") == ["king-0"]
+    money_guard.OperatorBreaker.for_runner(r).trip("402 BALANCE_REQUIRED on a challenger rent")
+    assert money_guard.guard_operator_provider(r, _King(), enforce=False).launch("s") == ["king-0"]
 
 
 def test_balance_refusal_on_any_operator_launch_trips_the_breaker(tmp_path):
@@ -409,3 +469,63 @@ def test_paused_entries_raise_one_condition(tmp_path):
     conds = [c for c in money_guard.health_conditions(r, {"a": q.entries()})
              if c["code"] == "entry_paused"]
     assert len(conds) == 1 and re.search("resume-operator-leg", conds[0]["message"])
+
+
+# ── review F4 / F5 / F12 ────────────────────────────────────────────────────
+
+
+def test_transient_events_never_count_and_a_new_cause_restarts_the_count(tmp_path):
+    from cascade.funding.queue import OPERATOR_TRANSIENT_CLASS
+
+    q = _flight(tmp_path)
+    for _ in range(5):     # VM never booted / no verdict / rent refusals / capacity waits
+        q.requeue(HK, error="generation (operator tier): VM never booted",
+                  error_class=OPERATOR_TRANSIENT_CLASS, burn_attempt=False)
+        q.requeue(HK, error="sold out", error_class="no_capacity", burn_attempt=False)
+    assert (q.get(HK).status, q.get(HK).operator_requeues) == ("queued", 0)
+    q.requeue(HK, error="upload failed after 3 attempts: hippius 503", error_class="operator",
+              burn_attempt=False)
+    q.requeue(HK, error="upload failed after 3 attempts: hippius 504", error_class="operator",
+              burn_attempt=False)
+    assert q.get(HK).operator_requeues == 2                     # same cause (numbers blanked)
+    q.requeue(HK, error="worker receipt lacks the init", error_class="operator",
+              burn_attempt=False)
+    assert q.get(HK).operator_requeues == 1                     # a different real cause
+
+
+def test_a_paused_entry_auto_resumes_after_the_cooldown(tmp_path):
+    t = [1000.0]
+    q = _flight(tmp_path, t, operator_pause_resume_seconds=3600)
+    for _ in range(3):
+        q.requeue(HK, error="x", error_class=OPERATOR_FAULT_CLASS, burn_attempt=False)
+    assert q.get(HK).status == PAUSED_STATUS
+    t[0] += 3599
+    assert q.resume_expired_pauses() == [] and q.get(HK).status == PAUSED_STATUS
+    t[0] += 2
+    q.expire_stale()                                            # every trainer tick
+    e = q.get(HK)
+    assert (e.status, e.operator_requeues, e.attempts) == ("queued", 0, 0)
+
+
+def test_an_old_code_rewrite_never_unpauses_or_loses_the_count(tmp_path):
+    """Review F5: an older writer (the intake / opbill_guard on old code) drops
+    unknown entry fields but keeps status and phase history verbatim."""
+    q = _flight(tmp_path)
+    for _ in range(3):
+        q.requeue(HK, error="x", error_class=OPERATOR_FAULT_CLASS, burn_attempt=False)
+    doc = json.loads(q.path.read_text())
+    for row in doc["entries"]:
+        row.pop("operator_requeues", None)
+        row.pop("operator_fault_cause", None)
+    q.path.write_text(json.dumps(doc))
+    e = FundedQueue(q.path).get(HK)
+    assert e.status == PAUSED_STATUS and e.operator_requeues == 3 and e.operator_fault_cause
+
+
+def test_float_seconds_and_counts_load(tmp_path):
+    cfg = load_chain_config(_edited(
+        tmp_path, "operator_breaker_cooldown_seconds = 3600.0\nharvest_disk_retries = 2.0\n",
+        "eval_ckpt_cache_grace_seconds = 600.0\n"))
+    assert cfg.round.operator_breaker_cooldown_seconds == 3600
+    assert cfg.round.harvest_disk_retries == 2
+    assert cfg.validator.eval_ckpt_cache_grace_seconds == 600

@@ -56,7 +56,8 @@ _LOCK = threading.Lock()
 # ── one-shot alerts (surfaced through the operator_health watchdog) ──────────
 
 
-def alert(runner, code: str, scope: str, message: str, **data) -> None:
+def alert(runner, code: str, scope: str, message: str, *, severity: str = "warning",
+          **data) -> None:
     """Raise (or refresh) an active operator alert. The watchdog emits ONE
     line per activation and resolves it when :func:`clear_alert` runs (or it
     goes stale); repeated raises only refresh it."""
@@ -66,6 +67,7 @@ def alert(runner, code: str, scope: str, message: str, **data) -> None:
         key = (code, scope)
         prev = alerts.get(key)
         alerts[key] = {"code": code, "scope": scope, "message": message[:300],
+                       "severity": severity,
                        "since": prev["since"] if prev else now, "last": now, **data}
     if prev is None:
         log.info("money guard: %s %s raised (%s)", code, scope, message[:200])
@@ -94,6 +96,16 @@ def health_conditions(runner, queues: dict, *, now: float | None = None) -> list
     t = time.time() if now is None else float(now)
     out = _alert_conditions(runner, t)
     with contextlib.suppress(Exception):
+        from .box_health import BoxHealth
+
+        halt = BoxHealth.for_runner(runner).halt()
+        if halt:
+            out.append({"code": "rents_halted", "scope": "box", "severity": "critical",
+                        "class": halt.get("cls"), "since": halt.get("since"),
+                        "message": (f"ALL new GPU rents halted: {halt.get('reason', '')[:200]} — "
+                                    "clears on a passing health check or `cascade-trainer "
+                                    "resume-rents`")})
+    with contextlib.suppress(Exception):
         rec = OperatorBreaker.for_runner(runner).open_record(t)
         if rec:
             out.append({"code": "operator_breaker_open", "scope": "operator",
@@ -103,13 +115,18 @@ def health_conditions(runner, queues: dict, *, now: float | None = None) -> list
         from ..funding.operator_approvals import OperatorApprovals
 
         for r in OperatorApprovals.for_work_root(runner.work_root).pending():
+            lost = float(r.get("miner_lost_usd") or 0.0)
             out.append({
                 "code": "operator_leg_awaiting_approval", "scope": str(r.get("hotkey", ""))[:16],
                 "uid": r.get("uid"), "sku": r.get("sku"),
                 "projected_cost_usd": r.get("projected_cost_usd"),
+                "severity": "critical" if lost else "warning",
                 "message": (f"{r.get('kind', '')}: ~${r.get('projected_cost_usd', 0):.2f} on the "
-                            f"operator account — `cascade-trainer approve-operator-leg "
-                            f"{r.get('hotkey')}` or `deny-operator-leg`")})
+                            f"operator account"
+                            + (f"; the miner already lost ≤ ${lost:.2f} on a finished run"
+                               if lost else "")
+                            + f" — `cascade-trainer approve-operator-leg {r.get('hotkey')}` "
+                            "or `deny-operator-leg`")})
     for lane, entries in (queues or {}).items():
         for e in entries:
             if e.status == PAUSED_STATUS:
@@ -177,9 +194,12 @@ class _BreakerGuardedProvider:
     """An operator provider whose ``launch`` refuses while the breaker is open
     and trips it on a balance refusal. Everything else is delegated."""
 
-    def __init__(self, provider, breaker: OperatorBreaker) -> None:
+    def __init__(self, provider, breaker: OperatorBreaker, *, enforce: bool = True) -> None:
         self._provider = provider
         self._breaker = breaker
+        # False for the king's JIT pod and king backups: they are never held
+        # by a breaker someone else tripped — only their own 402 trips it.
+        self._enforce = enforce
 
     def __getattr__(self, name):
         return getattr(self._provider, name)
@@ -187,7 +207,7 @@ class _BreakerGuardedProvider:
     def launch(self, spec, *args, **kwargs):
         from ..provision.core import ProvisionError
 
-        rec = self._breaker.open_record()
+        rec = self._breaker.open_record() if self._enforce else None
         if rec:
             raise ProvisionError(f"operator rents paused: circuit breaker open until "
                                  f"{time.strftime('%H:%M:%SZ', time.gmtime(rec['open_until']))} "
@@ -200,11 +220,13 @@ class _BreakerGuardedProvider:
             raise
 
 
-def guard_operator_provider(runner, provider):
-    """Wrap an OPERATOR-account provider with the circuit breaker."""
+def guard_operator_provider(runner, provider, *, enforce: bool = True):
+    """Wrap an OPERATOR-account provider with the circuit breaker. A real
+    balance refusal (402 / BALANCE_REQUIRED) from ANY launch trips it;
+    ``enforce=False`` (king pod / king backups) is never refused by it."""
     if isinstance(provider, _BreakerGuardedProvider):
-        return provider
-    return _BreakerGuardedProvider(provider, OperatorBreaker.for_runner(runner))
+        provider = provider._provider
+    return _BreakerGuardedProvider(provider, OperatorBreaker.for_runner(runner), enforce=enforce)
 
 
 # ── projected cost, daily spend ledger, balance ─────────────────────────────
@@ -327,11 +349,14 @@ def operator_rent_preflight(runner, gen, cost_usd: float) -> None:
               "balance; requeued, nothing burned", cls=OPERATOR_BLOCKED_CLASS)
     clear_alert(runner, "operator_balance_unknown", "operator")
     if bal < need:
-        breaker.trip(f"operator balance ${bal:.2f} < ${need:.2f} needed for a "
-                     f"${cost_usd:.2f} leg plus the eval-pod reserve")
+        # Refuses THIS leg only: a projection never trips the account-wide
+        # breaker (that would hold the king's pod) — only a real 402 does.
+        alert(runner, "operator_balance_low", hk[:16],
+              f"operator balance ${bal:.2f} < ${need:.2f} needed for a ${cost_usd:.2f} leg "
+              "plus the eval-pod reserve — leg not rented")
         _skip(runner, hk, f"operator balance below projected cost + reserve (needs "
-              f"${need:.2f}); operator rents paused, nothing rented, nothing burned",
-              cls=OPERATOR_BLOCKED_CLASS)
+              f"${need:.2f}); nothing rented, nothing burned", cls=OPERATOR_BLOCKED_CLASS)
+    clear_alert(runner, "operator_balance_low", hk[:16])
 
 
 def payer_balance_refusal(runner, api_key: str, *, hours: float, rate: float | None = None) -> str:
@@ -367,11 +392,17 @@ def payer_balance_refusal(runner, api_key: str, *, hours: float, rate: float | N
 # ── the per-leg owner approval gate ─────────────────────────────────────────
 
 
-def preapproved(runner, hotkey: str) -> bool:
-    """Whether ``hotkey``'s current leg holds an unconsumed owner approval
-    (peek only). A miner-funded leg with a working key leaves its market
-    wait for operator capacity ONLY then; otherwise it keeps waiting on its
-    own key and requeues as usual — it is never parked for that."""
+def _leg_local(runner):
+    import threading
+
+    return runner.__dict__.setdefault("_leg_local_obj", threading.local())
+
+
+def preapproved(runner, hotkey: str, *, kind: str = "") -> bool:
+    """Whether ``hotkey``'s current leg holds an unlaunched owner approval
+    (peek only; an owner pre-approval counts). A miner-funded leg with a
+    working key leaves its market wait for operator capacity ONLY then;
+    otherwise it keeps waiting on its own key and is never parked for it."""
     try:
         queue = runner._funded_queue()
         if queue is None or not hotkey:
@@ -380,22 +411,49 @@ def preapproved(runner, hotkey: str) -> bool:
 
         entry = queue.get(hotkey)
         return bool(entry is not None and OperatorApprovals.for_work_root(
-            runner.work_root).peek_approved(Path(queue.path).name, hotkey, entry.ref))
+            runner.work_root).peek_approved(Path(queue.path).name, hotkey, entry.ref,
+                                            funded_at=entry.funded_at, kind=kind))
     except Exception:  # noqa: BLE001 — unknown ⇒ not approved
         return False
 
 
+def grandfathered(runner, hotkey: str, *, allocated: bool) -> bool:
+    """A leg already running on the operator's bill when this gate shipped
+    (or before a restart): operator-billed, in flight and either holding a
+    ledgered operator pod (``allocated``) or re-attached by this process. It
+    is ADOPTED, never parked — parking it would drop its pod from the sweep's
+    keep-set and lose the run (review F1)."""
+    try:
+        queue = runner._funded_queue()
+        e = queue.get(hotkey) if queue is not None else None
+    except Exception:  # noqa: BLE001
+        return False
+    if e is None or e.status != "in_flight" or not e.operator_billed:
+        return False
+    if allocated:
+        return True
+    from .admission import is_admitted
+
+    return is_admitted(runner, hotkey)
+
+
 def operator_leg_gate(runner, gen, *, kind: str, rent: bool) -> None:
     """Gate EVERY miner leg about to be billed to the operator (``kind``:
-    ``expired_key`` / ``make_good`` / ``operator_lane`` / ``paid_fallback``;
-    ``rent`` = a new operator-account pod, else an existing operator lane).
+    ``expired_key`` / ``make_good`` / ``operator_lane`` / ``paid_fallback``)
+    and every retrain after a finished run was lost on our side
+    (``retrain_after_loss``, on the miner's key). ``rent`` = a new
+    operator-account pod (money preflight + spend booking at launch), else
+    no new operator spend.
 
-    Returns only when the owner's single-use approval for this leg was
-    consumed (and, for a rent, every money preflight passed). Otherwise the
-    verdict is recorded and :class:`_FundedLegSkip` raised: no approval →
-    ``awaiting_operator_approval`` (parked, unburned, one alert); denied →
-    the miner's own key (or, for an expired key, a terminal unburned
-    "re-fund needed"). King legs (no funded queue in scope) are not gated."""
+    Returns when the owner's approval of this leg applies (and, for a rent,
+    every money preflight passed). Nothing is used up here: the approval is
+    marked launched only once the pod is actually rented
+    (:func:`note_operator_launch`), so a no-capacity / lemon / rent error
+    keeps it for the next attempt. Otherwise the verdict is recorded and
+    :class:`_FundedLegSkip` raised: no approval → ``awaiting_operator_approval``
+    (parked, unburned, one alert); denied → the miner's own key (or, for an
+    expired key, a terminal unburned "re-fund needed"). King legs (no funded
+    queue in scope) are not gated."""
     queue = runner._funded_queue()
     if queue is None:
         return
@@ -404,45 +462,117 @@ def operator_leg_gate(runner, gen, *, kind: str, rent: bool) -> None:
     hk = gen.hotkey
     entry = queue.get(hk)
     attempt_id = str(getattr(entry, "attempt_id", "") or "")
+    funded_at = getattr(entry, "funded_at", None)
     sku, rate, hours, cost = projected_operator_leg_cost(runner)
-    if not rent:
+    lost = 0.0
+    if kind == "retrain_after_loss":
+        from .box_health import miner_lost_usd
+
+        lost, cost = miner_lost_usd(runner), 0.0    # the miner's key pays the retrain
+    elif not rent:
         cost = 0.0          # an operator lane is already paid for; no new spend
     store = OperatorApprovals.for_work_root(runner.work_root)
     qname = Path(queue.path).name
-    if store.peek_approved(qname, hk, gen.ref) and rent:
-        # Money checks BEFORE the approval is used: a blocked rent keeps it.
-        operator_rent_preflight(runner, gen, cost)
-    verdict = store.consume(qname, hk, ref=gen.ref, attempt_id=attempt_id,
-                            projected_cost_usd=cost)
+    verdict = store.check(qname, hk, ref=gen.ref, attempt_id=attempt_id, kind=kind,
+                          funded_at=funded_at, projected_cost_usd=cost)
     if verdict == "approved":
-        log.warning("operator-billed leg %s (%s, uid %s): owner approval consumed — %s on the "
-                    "OPERATOR's account, projected ≤ $%.2f (%s, $%.2f/h x %.1f h)",
-                    hk[:12], kind, getattr(gen, "uid", "?"),
-                    "renting a pod" if rent else "running on an operator lane", cost, sku,
-                    rate, hours)
-        if rent:
-            OperatorSpend.for_runner(runner).charge(hk, cost, kind=kind)
+        if rent and kind != "retrain_after_loss":
+            operator_rent_preflight(runner, gen, cost)   # a block keeps the approval
+        _leg_local(runner).operator_approval = {
+            "queue": qname, "hotkey": hk, "ref": gen.ref, "attempt_id": attempt_id,
+            "cost": cost, "kind": kind, "book": bool(rent and kind != "retrain_after_loss")}
+        if not rent:
+            note_operator_launch(runner, hk)           # a lane dispatch IS the launch
+        log.warning("operator-billed leg %s (%s, uid %s): owner approval applies — %s, "
+                    "projected ≤ $%.2f (%s, $%.2f/h x %.1f h)", hk[:12], kind,
+                    getattr(gen, "uid", "?"),
+                    "renting a pod" if rent else "no new operator rent", cost, sku, rate, hours)
         return
     if verdict == "denied":
-        if kind == "expired_key":
-            _skip(runner, hk, "payer key expired and the operator declined to pay for this "
-                  "leg — fund again with a fresh key (no attempt charged)", cls="auth",
-                  miner_fault=True)
+        store.take_denial(qname, hk)
+        if kind in ("expired_key", "retrain_after_loss"):
+            _skip(runner, hk, ("payer key expired and the operator declined to pay for this "
+                               "leg — fund again with a fresh key (no attempt charged)"
+                               if kind == "expired_key" else
+                               "the operator declined the retrain after a lost run — fund "
+                               "again to retrain (no attempt charged)"),
+                  cls="auth", miner_fault=True)
         _skip(runner, hk, "the operator declined to pay for this leg; it retries on the "
               "miner's own key (no attempt charged)", cls=DENIED_CLASS)
     reason = {"expired_key": "payer key expired",
               "make_good": "operator make-good after an operator-side loss",
               "operator_lane": "no marketplace capacity: an operator lane",
-              "paid_fallback": "ops_paid_fallback: marketplace sold out"}.get(kind, kind)
+              "paid_fallback": "ops_paid_fallback: marketplace sold out",
+              "retrain_after_loss": "retrain after a finished run was lost on our side"
+              }.get(kind, kind)
     store.request(qname, hk, ref=gen.ref, attempt_id=attempt_id, queue_path=str(queue.path),
                   uid=getattr(gen, "uid", None), sku=sku, rate_per_hour=rate,
-                  expected_hours=hours, projected_cost_usd=cost, kind=kind, reason=reason)
+                  expected_hours=hours, projected_cost_usd=cost, kind=kind, reason=reason,
+                  funded_at=funded_at, miner_lost_usd=lost)
     _skip(runner, hk, f"awaiting operator approval ({reason}; ~${cost:.2f} projected on "
-          f"{sku or 'the round SKU'}) — parked, nothing rented, no attempt charged",
-          cls=APPROVAL_CLASS)
+          f"{sku or 'the round SKU'}"
+          + (f"; the miner already lost ≤ ${lost:.2f}" if lost else "")
+          + ") — parked, nothing rented, no attempt charged", cls=APPROVAL_CLASS)
+
+
+def operator_leg_allocated(runner, round_id: str, hotkey: str) -> bool:
+    """This leg's own operator pod is on the ledger (a restart, a retry after
+    a transport drop, a kept pod): it must be ADOPTED by name, never re-gated."""
+    try:
+        want = runner._operator_leg_pod_prefix(str(round_id), hotkey) + "-0"
+        return any(p.instance_id == want for p in runner._load_funded_ledger())
+    except Exception:  # noqa: BLE001 — unreadable ledger: not allocated
+        return False
+
+
+def gate_or_adopt(runner, round_id: str, gen, *, kind: str, rent: bool) -> None:
+    """:func:`operator_leg_gate`, except for a leg that already runs on the
+    operator's bill (review F1): its ledgered operator pod is adopted with no
+    approval, preflight or spend booking — if that pod turns out to be gone,
+    the fresh rent is gated then (``operator_gate_deferred``). An in-flight
+    operator-billed leg re-attached after a restart takes its lane the same
+    way (grandfathered)."""
+    if rent and operator_leg_allocated(runner, round_id, gen.hotkey):
+        _leg_local(runner).operator_gate_deferred = kind
+        log.warning("operator-billed leg %s: its operator pod is on the ledger — adopting it "
+                    "(no new approval, no new spend)", gen.hotkey[:12])
+        return
+    if not rent and grandfathered(runner, gen.hotkey, allocated=False):
+        log.warning("operator-billed leg %s: already in flight on the operator's bill "
+                    "(re-attached) — continuing without a new approval", gen.hotkey[:12])
+        return
+    operator_leg_gate(runner, gen, kind=kind, rent=rent)
+
+
+def take_deferred_gate(runner) -> str | None:
+    loc = _leg_local(runner)
+    kind = getattr(loc, "operator_gate_deferred", None)
+    loc.operator_gate_deferred = None
+    return kind
+
+
+def note_operator_launch(runner, hotkey: str | None = None) -> None:
+    """The approved leg's pod was rented (or its lane dispatched): mark the
+    approval launched for THIS attempt and book the operator spend — only
+    now, never for a rent that did not happen (review F3)."""
+    loc = _leg_local(runner)
+    a = getattr(loc, "operator_approval", None)
+    if not a:
+        return
+    loc.operator_approval = None
+    if hotkey is not None and a["hotkey"] != hotkey:
+        return                        # a stale approval of another leg on this thread
+    from ..funding.operator_approvals import OperatorApprovals
+
+    OperatorApprovals.for_work_root(runner.work_root).mark_launched(
+        a["queue"], a["hotkey"], ref=a["ref"], attempt_id=a["attempt_id"], cost_usd=a["cost"])
+    if a.get("book"):
+        OperatorSpend.for_runner(runner).charge(a["hotkey"], a["cost"], kind=a["kind"])
 
 
 __all__ = ["AWAITING_APPROVAL_STATUS", "OperatorBreaker", "OperatorSpend", "alert",
            "clear_alert", "daily_cap_usd", "guard_operator_provider", "health_conditions",
            "is_balance_refusal", "operator_leg_gate", "operator_rent_preflight",
-           "payer_balance_refusal", "preapproved", "projected_operator_leg_cost"]
+           "gate_or_adopt", "grandfathered", "note_operator_launch", "operator_leg_allocated",
+           "take_deferred_gate", "payer_balance_refusal", "preapproved",
+           "projected_operator_leg_cost"]

@@ -7,7 +7,6 @@ import logging
 import time
 from pathlib import Path
 
-from ..funding.queue import OPERATOR_FAULT_CLASS
 from .corpus import DIVERGED_MARKER
 from .faults import (
     STALL_CLASS,
@@ -73,7 +72,10 @@ class _OperatorPodMixin:
             sku = skus[0] if skus else rnd.funded_pod_sku
             from ..provision.operator_pool import operator_price_caps, operator_provider
 
-            provider = operator_provider(self, lambda: _lium_provider(rnd, price_caps=operator_price_caps(self)))
+            # The king is never held by a breaker another rent tripped (F2);
+            # only its own 402 trips it.
+            provider = operator_provider(self, lambda: _lium_provider(rnd, price_caps=operator_price_caps(self)),
+                                         king=True)
             name_prefix = getattr(self.__dict__.get("_leg_local_obj"), "king_primary_prefix", None) or king_pod_name_prefix(self.cfg.subnet.netuid, round_id)
 
             def _king_remote(addr, host_key: str) -> RemoteHost:
@@ -188,6 +190,14 @@ class _OperatorPodMixin:
                 log.error("king rent: %s", unmeasured)
                 self._ledger_remove(f"{name_prefix}-0")
                 raise ProvisionError(unmeasured)
+            from .box_health import rent_halt_refusal
+
+            halted = rent_halt_refusal(self, king=True)
+            if halted:
+                # A disk halt holds the king too: its checkpoint could not be
+                # saved either (logged loudly by rent_halt_refusal).
+                self._ledger_remove(f"{name_prefix}-0")
+                raise ProvisionError(halted)
             attempt = 0
             while True:
                 _check_king_cancel(self)
@@ -421,7 +431,8 @@ class _OperatorPodMixin:
         skus = self._funded_skus_for_rent()
         from ..provision.operator_pool import operator_price_caps, operator_provider
 
-        provider = operator_provider(self, lambda: _lium_provider(rnd, price_caps=operator_price_caps(self)))
+        provider = operator_provider(self, lambda: _lium_provider(rnd, price_caps=operator_price_caps(self)),
+                                     king=name_prefix is not None)
         prefix = name_prefix or self._operator_leg_pod_prefix(round_id, gen.hotkey)
         if name_prefix is not None:
             from ..provision.funded import funded_pod_name
@@ -517,20 +528,31 @@ class _OperatorPodMixin:
         unmeasured = measured_wall_refusal(rnd)
         if unmeasured:
             log.error("operator leg %s: %s", gen.hotkey[:12], unmeasured)
-            _skip(unmeasured, OPERATOR_FAULT_CLASS)
-        # Disk guard: a NEW leg pod only (the adopt path returned above); a
-        # king backup (``name_prefix``) is never held back by it.
-        low = disk_guard_refusal(self) if name_prefix is None else ""
+            _skip(unmeasured, "operator_blocked")
+        # Disk guard (+ box-health halt + canary): a NEW leg pod only (the
+        # adopt path returned above); a king backup (``name_prefix``) is held
+        # only by a disk halt.
+        if name_prefix is None:
+            low = disk_guard_refusal(self)
+        else:
+            from .box_health import rent_halt_refusal
+
+            low = rent_halt_refusal(self, king=True)
         if low:
             from ..funding.queue import OPERATOR_DISK_CLASS
 
             log.error("operator leg %s: %s", gen.hotkey[:12], low)
             _skip(low, OPERATOR_DISK_CLASS)
         from ..funding.queue import OPERATOR_BLOCKED_CLASS
-        from .money_guard import OperatorBreaker
+        from .money_guard import OperatorBreaker, operator_leg_gate, take_deferred_gate
 
+        deferred = take_deferred_gate(self) if name_prefix is None else None
+        if deferred:
+            # This leg skipped the approval because its operator pod was on
+            # the ledger (F1) — but that pod is gone: a FRESH rent is gated.
+            operator_leg_gate(self, gen, kind=deferred, rent=True)
         breaker = OperatorBreaker.for_runner(self)
-        tripped = breaker.open_record()
+        tripped = breaker.open_record() if name_prefix is None else None
         if tripped:
             # 2026-11-02: one 402 must pause every operator rent, not re-try
             # per leg every poll.
@@ -595,10 +617,17 @@ class _OperatorPodMixin:
                             "operator-billed (payer key expired)", pod_id, addr.ip,
                             addr.ssh_port, gen.hotkey[:12], sku)
                 _check_king_cancel(self)
+                if name_prefix is None:
+                    # A usable pod is up: only now is the owner's approval used
+                    # for this attempt and the operator spend booked (review F3)
+                    # — a sold-out market, a lemon or a rent error keeps both.
+                    from .money_guard import note_operator_launch
+
+                    note_operator_launch(self, gen.hotkey)
                 return host, pod_id
             except ProvisionError as e:
                 bad += 1
-                tripped = breaker.open_record()
+                tripped = breaker.open_record() if name_prefix is None else None
                 if tripped:
                     # A balance refusal (this rent or another) opened the
                     # breaker: stop now — no retry against an empty account.
@@ -609,11 +638,11 @@ class _OperatorPodMixin:
                         or now_fn() >= self._funded_rent_wait_deadline()):
                     from ..funding.faults import classify_rent_failure
 
-                    # Our account, our pods: anything but a sold-out market is
-                    # an OPERATOR fault — counted and capped, never "infra"
-                    # (which neither backed off nor counted: 2026-11-02 loop).
+                    # Our account, our pods: a rent refusal is transient on our
+                    # side — backed off (never the flat "infra" loop of
+                    # 2026-11-02) and never counted toward the fault cap.
                     cls = "no_capacity" if classify_rent_failure(str(e)) == "no_capacity" \
-                        else OPERATOR_FAULT_CLASS
+                        else "operator_transient"
                     _skip(f"operator-billed leg: {bad} bad pod(s), last: {e}", cls)
                 log.warning("operator leg %s: rent attempt %d failed (%s); renting again",
                             gen.hotkey[:12], bad, e)
@@ -638,6 +667,9 @@ class _OperatorPodMixin:
             _record_generation_failure(self, gen, e)
             raise
         host, pod_id = self._rent_operator_leg_host(str(seeds.base_seed), gen)
+        _loc = self.__dict__.get("_leg_local_obj")
+        if _loc is not None:
+            _loc.leg_trained = False           # set by the harvest (harvest_guard)
 
         def ledger_pod():
             pods = getattr(self, "_load_funded_ledger", lambda: [])()
@@ -721,13 +753,16 @@ class _OperatorPodMixin:
                                         burn=False)
             raise
         except Exception as e:  # noqa: BLE001 — classify, record, re-raise
-            from .harvest_guard import keep_cost_line, keeps_pod, local_disk_error
+            from .harvest_guard import handle_our_side_fault
 
-            if (keeps_pod(e) or local_disk_error(e) is not None) and not released:
+            loc = self.__dict__.get("_leg_local_obj")
+            if handle_our_side_fault(self, gen, e, pod_id=pod_id, payer=False,
+                                     trained=bool(getattr(loc, "leg_trained", False)),
+                                     released=bool(released)):
                 # OUR disk failed with the run complete on this pod: keep it
                 # (ledgered; the requeued leg adopts it by name and harvests).
                 released.append(False)
-                log.error("operator leg %s: %s", gen.hotkey[:12], keep_cost_line(self, pod_id))
+                raise
             # An OPERATOR pod: the miner controls nothing on it, so only the
             # worker's own rc 3 (their generator) is theirs; anything else is
             # ours and never burns one of their attempts.
@@ -739,7 +774,8 @@ class _OperatorPodMixin:
                                     and prior.last_error_class == STALL_CLASS),
                 shards_leg=bool(corpus.get("corpus_files")))
             if error_class == "infra":
-                error_class = OPERATOR_FAULT_CLASS
+                # infra on OUR pod (it died, transport): transient (review F4)
+                error_class = "operator_transient"
             self._record_funded_failure(gen.hotkey, str(e), miner_fault=miner_fault,
                                         error_class=error_class, burn=False)
             raise

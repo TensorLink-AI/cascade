@@ -51,7 +51,9 @@ def funded_queue_of(runner, *, lane="a"):
                       operator_billed_retry_seconds=float(getattr(
                           runner.cfg.round, "operator_billed_retry_seconds", 60) or 0),
                       operator_fault_cap=int(getattr(runner.cfg.round, "operator_fault_cap", 3)
-                                             or 0))
+                                             or 0),
+                      operator_pause_resume_seconds=float(getattr(
+                          runner.cfg.round, "operator_pause_resume_seconds", 21600) or 0))
 
 
 def _load_burns(path: Path) -> dict[str, int]:
@@ -364,28 +366,72 @@ def reclaim_box_space(runner, target: Path | str, *, need_bytes: int = 0,
         return None
 
 
-def _legs_holding_pods(runner) -> int:
-    """Pods on the funded ledger — each may still land a checkpoint here."""
-    load = getattr(runner, "_load_funded_ledger", None)
+def _leg_hotkey(runner) -> str | None:
+    """The hotkey of the leg this thread is running (its progress binding)."""
+    binding = getattr(runner.__dict__.get("_leg_local_obj"), "funded_progress", None)
     try:
-        return len(list(load())) if callable(load) else 0
-    except Exception:  # noqa: BLE001 — unreadable ledger: count none
-        return 0
+        return str(binding[1]) if binding else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# Phases of an in-flight leg that holds a pod whose checkpoint is still to
+# land here (preparation / GPU waits hold none; judged legs are harvested).
+_POD_PHASES = frozenset({"booting", "training", "harvesting"})
+
+
+def _legs_holding_pods(runner) -> int:
+    """Live legs that will still harvest a checkpoint to this box: in-flight
+    entries (lanes A/B/C) in a pod-holding phase, the calling leg excluded
+    (review F10 — the ledger alone also counts stale other-seed rows, the
+    king's and this leg's own write-ahead row)."""
+    me = _leg_hotkey(runner)
+    n = 0
+    for lane in ("a", "b", "c"):
+        try:
+            q = funded_queue_of(runner, lane=lane)
+        except Exception:  # noqa: BLE001 — a lane without a queue
+            continue
+        if q is None:
+            continue
+        try:
+            n += sum(1 for e in q.entries() if e.status == "in_flight"
+                     and e.phase in _POD_PHASES and e.hotkey != me)
+        except Exception:  # noqa: BLE001 — unreadable queue: count none
+            continue
+    return n
 
 
 def disk_guard_refusal(runner) -> str:
     """Why a NEW funded/operator leg pod must not be rented now ("" = rent).
 
-    Disk reservation (2026-11-02): free space on the harvest filesystem must
-    hold the expected checkpoint of every leg that holds a pod plus this one
-    (``[round] expected_checkpoint_gb`` each; 0 with the r2 transport, which
-    never lands checkpoints here) on top of ``[round] min_free_disk_gb``
-    (GiB; 0 = the whole guard off) — measured AFTER the space manager evicted
-    whatever is reclaimable. Only for fresh rents: a re-attached or adopted
-    pod is a live leg and always keeps going. An unmeasurable disk never
-    blocks a rent."""
-    from ..shared.disk_space import GIB
+    In order (2026-11-02):
 
+    1. the box-health halt (:mod:`cascade.trainer.box_health`) — an our-side
+       fault halts EVERY new rent until the health check passes;
+    2. the pre-rent canary — write + fsync + rename + delete in the harvest
+       dir; a failure trips the halt;
+    3. the disk reservation — free space on the harvest filesystem must hold
+       the expected checkpoint of every live leg holding a pod plus this one
+       (``[round] expected_checkpoint_gb`` each; 0 with the r2 transport) on
+       top of ``[round] min_free_disk_gb`` (GiB; 0 = the reservation off),
+       measured AFTER the space manager evicted whatever is reclaimable; a
+       shortfall trips the halt too.
+
+    Only for fresh rents: a re-attached or adopted pod is a live leg and
+    always keeps going. An unmeasurable disk never blocks a rent."""
+    from ..shared.disk_space import GIB
+    from .box_health import LOCAL_DISK, BoxHealth, harvest_canary, rent_halt_refusal
+    from .money_guard import alert, clear_alert
+
+    halted = rent_halt_refusal(runner)
+    if halted:
+        return f"operator disk: {halted} — no new pod rented (requeued, never burned)"
+    who = _leg_hotkey(runner) or "box"
+    canary = harvest_canary(runner)
+    if canary:
+        BoxHealth.for_runner(runner).record(LOCAL_DISK, who, canary)
+        return f"operator disk: {canary} — no new pod rented (requeued, never burned)"
     rnd = getattr(runner.cfg, "round", None)
     gb = float(getattr(rnd, "min_free_disk_gb", 0.0) or 0.0)
     if gb <= 0:
@@ -407,8 +453,6 @@ def disk_guard_refusal(runner) -> str:
                           why="pre-rent disk reservation")
         with contextlib.suppress(OSError):
             free = _free_under(target)
-    from .money_guard import alert, clear_alert
-
     if free >= floor + need:
         clear_alert(runner, "operator_disk", "box")
         return ""
@@ -416,7 +460,8 @@ def disk_guard_refusal(runner) -> str:
            f"< {need / GIB:.0f} GiB for {holding + 1} checkpoint(s) of {per:g} GB + [round] "
            f"min_free_disk_gb={gb:g} (after evicting reclaimable data) — no new pod rented "
            "(requeued, never burned)")
-    alert(runner, "operator_disk", "box", msg)
+    alert(runner, "operator_disk", "box", msg, severity="critical")
+    BoxHealth.for_runner(runner).record(LOCAL_DISK, who, msg)
     return msg
 
 

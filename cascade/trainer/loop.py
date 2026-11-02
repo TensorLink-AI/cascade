@@ -743,7 +743,7 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
         return guarded_harvest(
             self, dest, lambda: TrainerRunner._harvest_funded_checkpoint_ssh(
                 self, host, receipt, contract, seeds, suffix, release=release),
-            label=f"{receipt.miner_hotkey[:12]}/{job_id[:8]}",
+            label=f"{receipt.miner_hotkey[:12]}/{job_id[:8]}", hotkey=receipt.miner_hotkey,
             pod_id=str(getattr(host, "allocation_id", "") or getattr(host, "name", "")),
             r2_fallback=r2_fallback)
 

@@ -112,14 +112,17 @@ def test_harvest_with_a_pending_upload_or_in_progress_is_never_reclaimed(tmp_pat
     pending = _mk(seed, "hkB--j2", 1000, age=10_000)
     (seed / "hkB--j2.pending.json").write_text("{}")
     writing = _mk(seed, "hkC--j3.partial-1-2", 1000, age=10_000)
-    leftover = _mk(wr / "_funded_harvest.box-20261031", "old", 1000, age=10_000)
-    fs["cap"] = 4_100
+    leftover = _mk(wr / "_funded_harvest.box-20261031" / "776", "hkD--j4", 1000, age=10_000)
+    boxed_pending = _mk(wr / "_funded_harvest.box-20261031" / "776", "hkE--j5", 1000,
+                        age=10_000)
+    (boxed_pending.parent / "hkE--j5.pending.json").write_text("{}")
+    fs["cap"] = 5_100
     cfg = _cfg(tmp_path, eval_ckpt_cache_grace_seconds=60)
     rep = disk_space.reclaim(cfg, wr, floor_bytes=10_000, work_root=wr,
                              active_harvests=lambda: {str((seed / "hkC--j3").resolve())})
     gone = {c.path for c in rep.evicted}
     assert settled in gone and leftover in gone
-    assert pending.is_dir() and writing.is_dir()
+    assert pending.is_dir() and writing.is_dir() and boxed_pending.is_dir()
 
 
 def test_validator_trims_its_cache_and_pins_the_manifest_in_progress(tmp_path, fs):
@@ -128,6 +131,7 @@ def test_validator_trims_its_cache_and_pins_the_manifest_in_progress(tmp_path, f
     cache = tmp_path / "_eval_ckpts"
     for i, name in enumerate(D[:3]):
         _mk(cache, name, 1000, age=10_000 - i * 1000)
+    (tmp_path / "validator_state.db").write_text("{}")         # a validator lives here
     v = SimpleNamespace(cfg=_cfg(tmp_path, eval_ckpt_cache_max_gb=0.0,
                                  eval_ckpt_cache_min_free_gb=2_500 / disk_space.GIB,
                                  eval_ckpt_cache_grace_seconds=60),
@@ -262,20 +266,111 @@ def test_failed_harvest_stream_leaves_no_copy_and_no_partial(tmp_path, monkeypat
 # ── pre-rent disk reservation ───────────────────────────────────────────────
 
 
-def test_reservation_counts_every_leg_holding_a_pod(tmp_path, monkeypatch):
+def test_reservation_counts_only_live_legs_holding_a_pod(tmp_path, monkeypatch):
+    from cascade.funding.queue import FundedQueue
     from cascade.trainer import money_guard, runner_common
 
     gib = 1 << 30
     monkeypatch.setattr(runner_common, "DISK_USAGE",
                         lambda p: SimpleNamespace(total=1, used=0, free=70 * gib))
-    rnd = RoundConfig(min_free_disk_gb=30.0, expected_checkpoint_gb=15.0)
+    rnd = RoundConfig(min_free_disk_gb=30.0, expected_checkpoint_gb=15.0,
+                      funded_mode="required")
     r = SimpleNamespace(cfg=SimpleNamespace(round=rnd), work_root=tmp_path)
-    r._load_funded_ledger = lambda: []
-    assert runner_common.disk_guard_refusal(r) == ""          # 70 >= 30 + 15
-    r._load_funded_ledger = lambda: [1, 2]                     # 30 + 15 * 3 = 75 > 70
-    msg = runner_common.disk_guard_refusal(r)
+    q = FundedQueue(tmp_path / "funded_queue.json")
+    for i, hk in enumerate(("hkA", "hkB", "hkC")):
+        q.add(hk, f"r@{i}", 10 + i)
+        q.mark_in_flight(hk, f"r@{i}", target_boundary=1, era_index=1, started_block=1)
+    assert runner_common.disk_guard_refusal(r) == ""          # none holds a pod yet
+    for hk, i in (("hkA", 0), ("hkB", 1)):
+        e = q.get(hk)
+        assert q.set_phase(hk, "training", expect_ref=f"r@{i}", expect_started_block=1,
+                           expect_funded_at=e.funded_at, expect_attempt_id=e.attempt_id)
+    msg = runner_common.disk_guard_refusal(r)                  # 30 + 15 * 3 = 75 > 70
     assert msg.startswith("operator disk") and "3 checkpoint(s)" in msg
     assert any(c["code"] == "operator_disk" for c in money_guard.health_conditions(r, {}))
-    r._load_funded_ledger = lambda: []
-    assert runner_common.disk_guard_refusal(r) == ""
-    assert not any(c["code"] == "operator_disk" for c in money_guard.health_conditions(r, {}))
+
+
+def test_the_disk_manager_evicts_nothing_when_cwd_differs_or_state_is_missing(
+        tmp_path, fs, monkeypatch):
+    cache = tmp_path / "deploy" / "_eval_ckpts"
+    _mk(cache, D[0], 1000, age=10_000)
+    (tmp_path / "elsewhere").mkdir()
+    monkeypatch.chdir(tmp_path / "elsewhere")                 # relative state paths miss
+    vc = ValidatorConfig(weight_set_interval_blocks=1, poll_seconds=1,
+                         state_db_path="validator_state.db", eval_ckpt_cache_dir=str(cache),
+                         eval_ckpt_cache_grace_seconds=0)
+    cfg = SimpleNamespace(validator=vc, round=RoundConfig())
+    fs["cap"] = 1_000
+    rep = disk_space.reclaim(cfg, cache, floor_bytes=10_000)
+    assert rep.blocked and rep.evicted == [] and (cache / D[0]).is_dir()
+
+
+# ── box health: today's sequence (owner, 2026-11-02) ────────────────────────
+
+
+def test_a_full_volume_halts_every_rent_keeps_the_pod_and_reharvests_it(tmp_path, monkeypatch):
+    """The volume is full, a leg finishes, its harvest hits ENOSPC: no lium rm
+    before the harvest, no new rent for ANY leg, the halt set and alerted.
+    Space comes back: the canary passes, the halt clears, and the SAME pod is
+    re-harvested — adopted, never retrained."""
+    from dataclasses import replace as dc_replace
+
+    from cascade.provision import funded as funded_mod
+    from cascade.trainer import money_guard, runner_common
+    from cascade.trainer.box_health import BoxHealth
+    from cascade.trainer.faults import _FundedLegSkip
+    from tests.unit.test_funded_pod_wiring import _challenger, _rent_ok, _vault
+    from tests.unit.test_release_pod_after_harvest import POD, _leg, _scripted
+
+    runner, disp, seeds, contract, events, _ = _scripted(tmp_path, monkeypatch)
+    rents = []
+
+    def rent(**kw):
+        rents.append(kw["hotkey"])
+        # the second rent of hkA finds its kept pod (the ledgered name) live
+        return dc_replace(_rent_ok(kw["hotkey"]), adopted=rents.count(kw["hotkey"]) > 1)
+
+    monkeypatch.setattr(funded_mod, "rent_funded_pod", rent)
+    from cascade.trainer import remote as remote_mod
+
+    good_harvest = remote_mod.harvest_remote_dir            # the scripted (working) harvest
+
+    def full_harvest(host, rdir, dest, **kw):
+        events.append("harvest-enospc")
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr("cascade.trainer.remote.harvest_remote_dir", full_harvest)
+    gib = 1 << 30
+    free = {"b": 0}
+    monkeypatch.setattr(runner_common, "DISK_USAGE",
+                        lambda p: SimpleNamespace(total=1, used=0, free=free["b"]))
+    free["b"] = 500 * gib                                   # room when the leg starts
+    with pytest.raises(harvest_guard.HarvestKeepPod):
+        _leg(runner, disp, seeds, contract)
+    assert f"teardown:{POD}" not in events                  # no lium rm, pod KEPT
+    assert "harvest-enospc" in events and rents == ["hkA"]
+    halt = BoxHealth.for_runner(runner).halt()
+    assert halt is not None and halt["cls"] == "local_disk"
+    conds = {c["code"]: c for c in money_guard.health_conditions(runner, {})}
+    assert conds["rents_halted"]["severity"] == "critical"
+    assert conds["our_side_fault"]["severity"] == "critical"
+    assert runner._funded_leg_failures["hkA"][1:] == (False, "operator_kept_pod", False)
+
+    free["b"] = 0                                            # the volume is full
+    _vault(tmp_path, "hkB")
+    for hk in ("hkB", "hkA"):                                # a new leg, and the retry
+        runner.__dict__.pop("_box_health_checked", None)
+        with pytest.raises(_FundedLegSkip):
+            runner._rent_funded_host("777", _challenger(hk))
+        assert runner._funded_leg_failures[hk][2] == "operator_disk"
+    assert rents == ["hkA"]                                  # nothing rented, nothing retrained
+
+    free["b"] = 500 * gib                                    # space is back
+    runner.__dict__.pop("_box_health_checked", None)
+    monkeypatch.setattr("cascade.trainer.remote.harvest_remote_dir", good_harvest)
+    entry = _leg(runner, disp, seeds, contract)
+    assert entry.miner_hotkey == "hkA"
+    assert BoxHealth.for_runner(runner).halt() is None
+    assert rents == ["hkA", "hkA"]                           # the second was an ADOPTION
+    assert BoxHealth.for_runner(runner).leg("hkA") is None
+    assert "upload" in events

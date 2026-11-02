@@ -573,7 +573,7 @@ class LaneBDriver:
 
                 self._leg_done(leg, None, failure=LegFailure(
                     f"expert dispatch failed: {e}", miner_fault=False,
-                    error_class="operator", burn=False))
+                    error_class="operator_transient", burn=False))
         return started
 
     def _prev_king(self, era_index: int, king_pointer: str) -> str | None:
@@ -1345,7 +1345,7 @@ class RunnerLaneBOps:
                     if recovery is not None and recovery.operator_billed:
                         raise LegFailure("operator-funded lane-B recovery is waiting for "
                                          "operator capacity; the miner is not charged again",
-                                         miner_fault=False, error_class="operator",
+                                         miner_fault=False, error_class="operator_transient",
                                          burn=False) from e
                     raise LegFailure(f"no marketplace capacity on the payer key ({e})",
                                      miner_fault=False, error_class="no_capacity",
@@ -1357,7 +1357,7 @@ class RunnerLaneBOps:
                         raise breaker["failure"] from e
                     if verdict is None:
                         raise LegFailure(f"lane-B leg failed (operator side): {e}",
-                                         miner_fault=False, error_class="operator",
+                                         miner_fault=False, error_class="operator_transient",
                                          burn=False) from e
                     msg, miner_fault, error_class, burn = verdict
                     raise LegFailure(msg or str(e), miner_fault=miner_fault,
@@ -1369,7 +1369,7 @@ class RunnerLaneBOps:
             except Exception as e:  # noqa: BLE001 — an unclassified failure is ours
                 done(leg, None, failure=LegFailure(
                     f"lane-B leg failed without a verdict (operator side): {e}",
-                    miner_fault=False, error_class="operator", burn=False))
+                    miner_fault=False, error_class="operator_transient", burn=False))
 
         threading.Thread(target=_run, name=f"laneb-{leg.sub.hotkey[:8]}", daemon=True).start()
 

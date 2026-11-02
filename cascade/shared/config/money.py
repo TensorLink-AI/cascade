@@ -20,9 +20,24 @@ MONEY_KNOBS: dict[str, tuple[object, str]] = {
     "operator_daily_spend_cap_usd": (200.0, "usd"),
     "payer_projected_rate_per_hour": (0.0, "usd"),
     "expected_checkpoint_gb": (15.0, "gb"),
-    "harvest_disk_retries": (3, "count"),
+    "harvest_disk_retries": (2, "count"),
     "harvest_disk_retry_seconds": (60, "seconds"),
+    "harvest_keep_max_seconds": (1800, "seconds"),
+    "operator_pause_resume_seconds": (21600, "seconds"),
+    "box_fault_window_seconds": (7200, "seconds"),
 }
+
+
+def _whole(value: object) -> int | None:
+    """An integral number as int (``3600`` and ``3600.0`` alike — a float
+    spelling must never fail the whole config load; review F12), else None."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        return int(value)
+    return None
 
 
 def _number(name: str, value: object) -> float:
@@ -37,10 +52,11 @@ def parse_money_safety(r: dict) -> dict:
     for name, (default, kind) in MONEY_KNOBS.items():
         value = r.get(name, default)
         if kind in ("count", "seconds"):
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            whole = _whole(value)
+            if whole is None or whole < 0:
                 raise ValueError(f"[round] {name}={value!r} invalid; must be a non-negative "
                                  "integer (0 = off)")
-            out[name] = int(value)
+            out[name] = whole
             continue
         v = _number(name, value)
         if kind == "factor" and v < 1.0:
@@ -72,10 +88,11 @@ def parse_validator_cache(v: dict) -> dict:
                 raise ValueError(f"[validator] {name} must be a non-empty path string")
             out[name] = value.strip()
         elif kind == "seconds":
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            whole = _whole(value)
+            if whole is None or whole < 0:
                 raise ValueError(f"[validator] {name}={value!r} invalid; must be a "
                                  "non-negative integer")
-            out[name] = int(value)
+            out[name] = whole
         else:
             if (isinstance(value, bool) or not isinstance(value, (int, float))
                     or not math.isfinite(value) or value < 0):

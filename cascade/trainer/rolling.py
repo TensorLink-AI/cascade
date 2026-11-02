@@ -586,11 +586,13 @@ class LegOps:
         # start, so a path that fails without recording one (the operator-
         # lane fallback, a dispatcher/config error) is OURS, never the
         # miner's — operator class: no burned attempt, the queue backs off.
-        from ..funding.queue import OPERATOR_FAULT_CLASS
+        # Transient (review F4): backed off, never counted toward the
+        # operator-fault cap — a real fault always records its own verdict.
+        from ..funding.queue import OPERATOR_TRANSIENT_CLASS
 
         return self.r._funded_leg_failures.get(
             hotkey, ("challenger leg failed without a recorded verdict (operator side)",
-                     False, OPERATOR_FAULT_CLASS, False))
+                     False, OPERATOR_TRANSIENT_CLASS, False))
 
     def king_funding(self, era: EraState, gen) -> str:
         """DEC-CA-0055: who paid for ``era``'s persisted king leg ("king" /

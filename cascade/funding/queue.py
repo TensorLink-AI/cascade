@@ -50,7 +50,10 @@ __all__ = [
     "AWAITING_APPROVAL_STATUS",
     "COMPETITION_ENDED_CLASS",
     "DENIED_CLASS",
+    "COUNTED_OPERATOR_CLASSES",
+    "KEPT_POD_CLASS",
     "OPERATOR_BACKOFF_CLASSES",
+    "OPERATOR_TRANSIENT_CLASS",
     "OPERATOR_BLOCKED_CLASS",
     "OPERATOR_DISK_CLASS",
     "OPERATOR_FAULT_CAP",
@@ -108,7 +111,26 @@ DENIED_CLASS = "operator_denied"
 # the entry's operator-fault cap (they clear on their own).
 OPERATOR_DISK_CLASS = "operator_disk"
 OPERATOR_BLOCKED_CLASS = "operator_blocked"
-OPERATOR_BACKOFF_CLASSES = frozenset({"operator", OPERATOR_DISK_CLASS, OPERATOR_BLOCKED_CLASS})
+# Transient operator-side events (a CPU-tier VM that never booted, a failure
+# without a recorded verdict, an operator-rent refusal, infra on an operator
+# pod): backed off, never counted against the cap (review F4).
+OPERATOR_TRANSIENT_CLASS = "operator_transient"
+# A harvest our side could not finish with the run complete on a KEPT pod:
+# a real operator fault (counted), retried after a short FIXED delay — the
+# re-attach must come quickly (the kept pod may bill the miner; review F6).
+KEPT_POD_CLASS = "operator_kept_pod"
+KEPT_POD_RETRY_SECONDS = 60.0
+# Disk waits re-check cheaply (no rent happens): a short, bounded backoff.
+DISK_BACKOFF_BASE_SECONDS = 60.0
+DISK_BACKOFF_MAX_SECONDS = 600.0
+OPERATOR_BACKOFF_CLASSES = frozenset({"operator", OPERATOR_DISK_CLASS, OPERATOR_BLOCKED_CLASS,
+                                      OPERATOR_TRANSIENT_CLASS})
+# Only these count toward the cap — and only CONSECUTIVE faults of the SAME
+# cause (a different real cause restarts the count at 1).
+COUNTED_OPERATOR_CLASSES = frozenset({"operator", KEPT_POD_CLASS})
+# A paused entry resumes by itself after this long (``[round]
+# operator_pause_resume_seconds``; 0 = manual resume only).
+OPERATOR_PAUSE_RESUME_SECONDS = 6 * 3600.0
 # Operator-side faults (OPERATOR_FAULT_CLASS) an entry may take before it
 # PAUSES — counted on EVERY occurrence, never reset by an interleaved
 # no_capacity/rate-limit requeue (2026-11-02: a 402 re-dispatched one leg
@@ -208,6 +230,8 @@ class FundedEntry:
     # Operator-side faults on this entry, EVERY occurrence (see
     # OPERATOR_FAULT_CAP); reset by a re-fund, ``resume`` or completion.
     operator_requeues: int = 0
+    # The cause the count above is counting (a normalised error prefix).
+    operator_fault_cause: str = ""
 
     @property
     def active_at(self) -> float:
@@ -222,10 +246,30 @@ class FundedEntry:
                          max_price_per_hour=self.gpu_max_price_per_hour)
 
 
+def _from_history(item: dict, key: str, default):
+    """``key`` from the newest phase event that carries it — the fallback when
+    a writer on older code dropped the entry field (review F5)."""
+    for ev in reversed(list(item.get("phase_history") or ())):
+        if isinstance(ev, dict) and key in ev:
+            return ev[key]
+    return default
+
+
+def _cause_key(error: str) -> str:
+    """A cause signature for "the same fault again": the error's leading text
+    with numbers, hex ids and paths blanked out."""
+    text = re.sub(r"[0-9a-f]{8,}|\d+(\.\d+)?|/[^\s:'\"]+", "#", (error or "").lower())
+    return re.sub(r"\s+", " ", text).strip()[:80]
+
+
 def _phase(entry: FundedEntry, phase: str, now: float, reason: str = "", *, force=False) -> FundedEntry:
     if not force and (entry.phase, entry.phase_reason) == (phase, reason):
         return entry
+    # The fault count rides every event too: a writer on older code drops
+    # unknown entry fields but keeps the history verbatim (review F5).
     event = {"phase": phase, "at": now, "reason": reason, "error_class": entry.last_error_class,
+             "operator_requeues": entry.operator_requeues,
+             "operator_fault_cause": entry.operator_fault_cause,
              "attempt_id": entry.attempt_id,
              "target_boundary": entry.target_boundary, "era_index": entry.era_index}
     return replace(entry, phase=phase, phase_at=now, phase_reason=reason,
@@ -290,9 +334,11 @@ class FundedQueue:
     def __init__(self, path: Path | str, *, clock: Callable[[], float] = time.time,
                  entry_ttl_seconds: float = DEFAULT_TTL_SECONDS,
                  operator_billed_retry_seconds: float = OPERATOR_BILLED_RETRY_SECONDS,
-                 operator_fault_cap: int = OPERATOR_FAULT_CAP) -> None:
+                 operator_fault_cap: int = OPERATOR_FAULT_CAP,
+                 operator_pause_resume_seconds: float = OPERATOR_PAUSE_RESUME_SECONDS) -> None:
         self.path = Path(path)
         self.clock = clock
+        self.operator_pause_resume_seconds = max(0.0, float(operator_pause_resume_seconds))
         # Operator-side faults before the entry pauses (0 = no cap).
         self.operator_fault_cap = max(0, int(operator_fault_cap))
         # Fixed retry of an operator-billed entry after an operator-side fault
@@ -377,7 +423,10 @@ class FundedQueue:
                 phase_history=tuple(item.get("phase_history") or ())[-16:],
                 requeues=int(item.get("requeues", 0) or 0),
                 attempt_id=str(item.get("attempt_id", "") or ""),
-                operator_requeues=int(item.get("operator_requeues", 0) or 0),
+                operator_requeues=int(item.get("operator_requeues", _from_history(
+                    item, "operator_requeues", 0)) or 0),
+                operator_fault_cause=str(item.get("operator_fault_cause", _from_history(
+                    item, "operator_fault_cause", "")) or ""),
             )
             entries[entry.hotkey] = entry
         return entries
@@ -460,10 +509,13 @@ class FundedQueue:
                 # back to the queue on THEIR key, operator billing and the
                 # operator-fault count cleared.
                 same = prev.ref == ref
+                # A re-fund is a NEW funding: any owner approval bound to the
+                # old one no longer applies (approvals bind to funded_at).
                 entries[hotkey] = _phase(replace(
                     prev, ref=ref, reveal_block=prev.reveal_block if same else int(reveal_block),
-                    funded_at=prev.funded_at if same else now, last_active=now, status="queued",
-                    operator_billed=False, operator_requeues=0, infra_streak=0, not_before=0.0,
+                    funded_at=now, last_active=now, status="queued",
+                    operator_billed=False, operator_requeues=0, operator_fault_cause="",
+                    infra_streak=0, not_before=0.0,
                     label=label or prev.label, **_gpu_fields(gpu_choice)), "queued", now, force=True)
                 self._save(entries)
                 return "queued" if same else "replaced"
@@ -697,6 +749,7 @@ class FundedQueue:
             entries[hotkey] = _phase(replace(
                 e, status="queued", not_before=0.0, infra_streak=0, last_active=now,
                 operator_requeues=0 if expect_status == PAUSED_STATUS else e.operator_requeues,
+                operator_fault_cause="" if expect_status == PAUSED_STATUS else e.operator_fault_cause,
                 operator_billed=False if deny else e.operator_billed,
                 last_error=(reason or e.last_error)[:500],
                 last_error_class=DENIED_CLASS if deny else e.last_error_class),
@@ -750,6 +803,7 @@ class FundedQueue:
         """
         if max_age_seconds is None:
             max_age_seconds = self.entry_ttl_seconds
+        self.resume_expired_pauses()
         with self._locked() as entries:
             now = self.clock()
             expired = [hk for hk, e in entries.items()
@@ -764,6 +818,28 @@ class FundedQueue:
             if expired:
                 self._save(entries)
             return len(expired)
+
+    def resume_expired_pauses(self) -> list[str]:
+        """Paused entries older than ``operator_pause_resume_seconds`` return
+        to the queue (fault count reset), one log line each; called every
+        trainer tick through :meth:`expire_stale`. The manual resume stays."""
+        if not self.operator_pause_resume_seconds:
+            return []
+        with self._locked() as entries:
+            now = self.clock()
+            due = [hk for hk, e in entries.items() if e.status == PAUSED_STATUS
+                   and now - (e.phase_at or e.last_active) >= self.operator_pause_resume_seconds]
+            for hk in due:
+                e = entries[hk]
+                entries[hk] = _phase(replace(
+                    e, status="queued", operator_requeues=0, operator_fault_cause="",
+                    infra_streak=0, not_before=0.0, last_active=now), "queued", now, force=True)
+                log.warning("queue: %s auto-RESUMED after a %.0f h operator-fault pause "
+                            "(nothing burned); it pauses again on the same fault", hk[:12],
+                            self.operator_pause_resume_seconds / 3600)
+            if due:
+                self._save(entries)
+            return due
 
     def mark_done(self, hotkey: str, *, expect_ref: str | None = None,
                   expect_started_block: int | None = None) -> None:
@@ -866,8 +942,16 @@ class FundedQueue:
                 return True
             streak, not_before = 0, 0.0
             billed = e.operator_billed or bool(operator_billed)
-            op_requeues = e.operator_requeues
-            if error_class in OPERATOR_BACKOFF_CLASSES and not burn_attempt:
+            op_requeues, cause = e.operator_requeues, e.operator_fault_cause
+            if error_class == KEPT_POD_CLASS and not burn_attempt:
+                # re-attach the kept pod soon, never after a long backoff
+                streak = e.infra_streak
+                not_before = now + KEPT_POD_RETRY_SECONDS
+            elif error_class == OPERATOR_DISK_CLASS and not burn_attempt:
+                streak = e.infra_streak + 1
+                not_before = now + min(DISK_BACKOFF_MAX_SECONDS,
+                                       DISK_BACKOFF_BASE_SECONDS * 2 ** (streak - 1))
+            elif error_class in OPERATOR_BACKOFF_CLASSES and not burn_attempt:
                 # Our side (or a global operator block): back off, doubling per
                 # consecutive such requeue. An OPERATOR-billed entry starts
                 # from ``operator_billed_retry_seconds`` instead of the infra
@@ -877,20 +961,23 @@ class FundedQueue:
                         if billed and self.operator_billed_retry_seconds > 0
                         else INFRA_BACKOFF_BASE_SECONDS)
                 not_before = now + min(INFRA_BACKOFF_MAX_SECONDS, base * 2 ** (streak - 1))
-            if error_class == OPERATOR_FAULT_CLASS and not burn_attempt:
-                op_requeues += 1
+            if error_class in COUNTED_OPERATOR_CLASSES and not burn_attempt:
+                # consecutive REAL faults of the SAME cause; capacity waits,
+                # rent refusals and transient events never count (review F4)
+                key = _cause_key(error)
+                op_requeues, cause = (op_requeues + 1, key) if key == cause else (1, key)
             status, phase = "queued", "queued"
-            if (error_class == OPERATOR_FAULT_CLASS and self.operator_fault_cap
+            if (error_class in COUNTED_OPERATOR_CLASSES and self.operator_fault_cap
                     and op_requeues >= self.operator_fault_cap):
                 # Capped: PAUSE (not failed, not burned) until the operator
-                # fixes the cause and resumes it — never a hot loop.
+                # fixes the cause and resumes it, or the auto-resume cooldown.
                 status = phase = PAUSED_STATUS
                 # (the watchdog raises the one entry_paused alert from this state)
-                log.warning("queue: %s PAUSED — %d operator-side faults (cap %d); "
-                          "not failed, nothing burned; resume with `cascade-trainer "
-                          "resume-operator-leg %s` once the cause is fixed. Last: %s",
-                          hotkey[:12], op_requeues, self.operator_fault_cap, hotkey,
-                          error[:200])
+                log.warning("queue: %s PAUSED — %d consecutive operator-side faults of one "
+                            "cause (cap %d); not failed, nothing burned; resumes by itself "
+                            "after %.0f h or via `cascade-trainer resume-operator-leg %s`. "
+                            "Last: %s", hotkey[:12], op_requeues, self.operator_fault_cap,
+                            self.operator_pause_resume_seconds / 3600, hotkey, error[:200])
             entries[hotkey] = _phase(replace(
                 e, status=status, attempts=attempts,
                 last_error=error[:500], last_error_class=error_class,
@@ -901,7 +988,7 @@ class FundedQueue:
                                  else e.operator_billed or bool(operator_billed)),
                 operator_faults=e.operator_faults + (
                     1 if operator_billed and not e.operator_billed else 0),
-                operator_requeues=op_requeues,
+                operator_requeues=op_requeues, operator_fault_cause=cause,
                 not_before=not_before, infra_streak=streak, requeues=e.requeues + 1),
                 phase, now, force=True)
             if was_flight and e.queued_ref:

@@ -450,7 +450,7 @@ def test_operator_capacity_probe_uses_the_operator_cap(monkeypatch):
     seen = []
     monkeypatch.setattr(cap_mod, "_lium_provider",
                         lambda rnd, price_caps=None: seen.append(price_caps) or object())
-    monkeypatch.setattr(op_mod, "operator_provider", lambda runner, factory: factory())
+    monkeypatch.setattr(op_mod, "operator_provider", lambda runner, factory, **kw: factory())
     r = _caps_runner(funded_max_price_per_hour=7.0, operator_max_price_per_hour=40.0)
     r._provider_capacity = lambda prov, skus, exclude: 3
     assert TrainerRunner._probe_funded_capacity(r, ("RTX4090",)) == 3

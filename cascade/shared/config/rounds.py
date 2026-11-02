@@ -365,8 +365,18 @@ class RoundConfig:
     # A local-disk fault while harvesting (ENOSPC/EIO/...) keeps the pod and
     # retries the harvest this many times (space reclaimed in between) before
     # the leg is requeued unburned with the pod kept for the re-attach.
-    harvest_disk_retries: int = 3
+    harvest_disk_retries: int = 2
     harvest_disk_retry_seconds: int = 60
+    # A pod KEPT after OUR disk failed its harvest may bill the MINER: kept at
+    # most this long (then released with a critical "miner-billed loss"
+    # alert so the owner can make it good). Review F6.
+    harvest_keep_max_seconds: int = 1800
+    # A paused entry (operator-fault cap) resumes by itself after this long;
+    # 0 = manual `cascade-trainer resume-operator-leg` only.
+    operator_pause_resume_seconds: int = 21600
+    # Box health breaker: the same our-side fault class on >= 2 legs within
+    # this window (or ANY local-disk fault) halts every new GPU rent.
+    box_fault_window_seconds: int = 7200
     # Trainer recovery controls; scientific contracts and reward rules are unchanged.
     ops_max_active_per_coldkey: int = 0
     ops_gpu_failure_threshold: int = 0

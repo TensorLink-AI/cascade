@@ -4,12 +4,17 @@
     cascade-trainer approve-operator-leg <hotkey> [--attempt-id ID] [--max-cost USD] [--queue NAME]
     cascade-trainer deny-operator-leg    <hotkey> [--attempt-id ID] [--queue NAME]
     cascade-trainer resume-operator-leg  <hotkey> [--queue NAME]
+    cascade-trainer rent-status          [--json]
+    cascade-trainer resume-rents         --reason TEXT
 
 ``list`` shows legs awaiting approval (hotkey, uid, SKU, projected cost, why)
 and entries paused after operator-side faults. ``approve`` records a
-SINGLE-USE approval bound to that hotkey's pending request (and, with
-``--max-cost``, a cost ceiling) and returns the entry to the queue; exactly
-one operator-billed dispatch consumes it. ``deny`` records a single-use
+approval of that hotkey's pending request (and, with ``--max-cost``, a cost
+ceiling) and returns the entry to the queue. With NO pending request it
+PRE-approves the hotkey's next operator-billed leg (``--kind`` narrows it).
+The approval lasts for one leg: it is used when that leg's pod is actually
+rented (or its lane dispatched); a no-capacity / rent error keeps it, and a
+retry after the leg failed needs a new approval. ``deny`` records a single-use
 denial: the leg returns to the queue on the miner's own key, or fails
 unburned when it has none ("re-fund needed"). ``resume`` returns a paused
 entry to the queue with its operator-fault count reset — run it only once the
@@ -28,7 +33,8 @@ import sys
 from pathlib import Path
 
 COMMANDS = ("list-operator-legs", "approve-operator-leg", "deny-operator-leg",
-            "resume-operator-leg")
+            "resume-operator-leg", "rent-status", "resume-rents")
+KINDS = ("", "expired_key", "make_good", "operator_lane", "paid_fallback", "retrain_after_loss")
 
 
 def _queues(work_root: Path) -> list:
@@ -68,7 +74,7 @@ def _parser() -> argparse.ArgumentParser:
     for cmd in COMMANDS:
         s = sub.add_parser(cmd)
         s.add_argument("--work-root", type=Path, default=Path("./_train_work"))
-        if cmd != "list-operator-legs":
+        if cmd not in ("list-operator-legs", "rent-status", "resume-rents"):
             s.add_argument("hotkey")
             s.add_argument("--queue", default=None,
                            help="queue file name when the hotkey has entries in several lanes")
@@ -78,8 +84,13 @@ def _parser() -> argparse.ArgumentParser:
         if cmd == "approve-operator-leg":
             s.add_argument("--max-cost", type=float, default=None,
                            help="refuse the dispatch if its projected cost exceeds this (USD)")
-        if cmd == "list-operator-legs":
+            s.add_argument("--kind", default="", choices=KINDS,
+                           help="a pre-approval (no pending request) for this kind only")
+        if cmd in ("list-operator-legs", "rent-status"):
             s.add_argument("--json", action="store_true")
+        if cmd == "resume-rents":
+            s.add_argument("--reason", required=True,
+                           help="why it is safe to rent again (logged)")
     return p
 
 
@@ -90,14 +101,21 @@ def main(argv: list[str]) -> int:
     args = _parser().parse_args(argv)
     wr = Path(args.work_root)
     store = OperatorApprovals.for_work_root(wr)
+    if args.cmd in ("rent-status", "resume-rents"):
+        return _rents(args, wr)
     if args.cmd == "list-operator-legs":
         pending = store.pending()
         paused = [{"queue": q.path.name, "hotkey": e.hotkey, "ref": e.ref,
                    "operator_requeues": e.operator_requeues, "last_error": e.last_error}
                   for q in _queues(wr) for e in q.entries() if e.status == PAUSED_STATUS]
+        halt = _halt(wr)
         if args.json:
-            print(json.dumps({"awaiting_approval": pending, "paused": paused}, indent=2))
+            print(json.dumps({"awaiting_approval": pending, "paused": paused,
+                              "rents_halted": halt}, indent=2))
             return 0
+        if halt:
+            print(f"RENTS HALTED since {halt.get('since')}: {halt.get('reason')} "
+                  "(`cascade-trainer rent-status`)")
         if not pending and not paused:
             print("no operator-billed legs awaiting approval; no paused entries")
         for r in pending:
@@ -124,7 +142,9 @@ def main(argv: list[str]) -> int:
     approve = args.cmd == "approve-operator-leg"
     try:
         rec = store.decide(hk, approve=approve, attempt_id=args.attempt_id,
-                           max_cost_usd=getattr(args, "max_cost", None), queue_name=args.queue)
+                           max_cost_usd=getattr(args, "max_cost", None), queue_name=args.queue,
+                           preapprove=_live_entry(wr, hk, args.queue,
+                                                  kind=getattr(args, "kind", "")))
     except (LookupError, ValueError) as e:
         print(f"refused: {e}", file=sys.stderr)
         return 1
@@ -139,6 +159,55 @@ def main(argv: list[str]) -> int:
           + (f" ceiling ${rec['max_cost_usd']:.2f}" if rec.get("max_cost_usd") else "")
           + ("; entry returned to the queue" if moved else
              "; entry was not parked (it is picked up at its next dispatch)"))
+    return 0
+
+
+def _live_entry(work_root: Path, hotkey: str, queue_name: str | None, *, kind: str) -> dict | None:
+    """The hotkey's live queue entry as a pre-approval binding, or None."""
+    for q in _queues(work_root):
+        if queue_name and q.path.name != queue_name:
+            continue
+        e = q.get(hotkey)
+        if e is not None and e.status in ("queued", "in_flight", "awaiting_operator_approval",
+                                          "paused"):
+            return {"queue": q.path.name, "queue_path": str(q.path), "ref": e.ref,
+                    "funded_at": e.funded_at, "kind": kind}
+    return None
+
+
+def _halt(work_root: Path) -> dict | None:
+    from .box_health import BoxHealth
+
+    try:
+        return BoxHealth(work_root / "box_health.json").halt()
+    except Exception as e:  # noqa: BLE001
+        return {"reason": f"box health unreadable: {e}"}
+
+
+def _rents(args, work_root: Path) -> int:
+    from .box_health import BoxHealth
+
+    bh = BoxHealth(work_root / "box_health.json")
+    if args.cmd == "resume-rents":
+        if bh.clear(f"owner: {args.reason}"):
+            print(f"rents RESUMED ({args.reason})")
+            return 0
+        print("rents were not halted")
+        return 0
+    st = bh.state()
+    if getattr(args, "json", False):
+        print(json.dumps({"rents_halted": st.get("halt"), "recent_faults": st.get("events"),
+                          "legs": st.get("legs"), "last_clear": st.get("last_clear")},
+                         indent=2, default=str))
+        return 0
+    h = st.get("halt")
+    print(f"RENTS HALTED since {h.get('since')}: {h.get('reason')}" if h else "rents: OK")
+    for e in st.get("events") or []:
+        print(f"  fault {e.get('cls')} on {str(e.get('hotkey'))[:12]} at {e.get('at')}: "
+              f"{str(e.get('detail'))[:120]}")
+    for hk, rec in (st.get("legs") or {}).items():
+        print(f"  leg {hk[:12]}: {rec.get('cls')} trained={rec.get('trained')} "
+              f"kept={rec.get('kept')} pod={rec.get('pod_id')}")
     return 0
 
 

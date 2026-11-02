@@ -102,7 +102,8 @@ def test_generation_tier_infra_is_the_operators_unburned(exc):
     r, rec = _rec_runner()
     _record_generation_failure(r, _challenger("hkA"), exc)
     _msg, kw = rec["hkA"]
-    assert kw == {"miner_fault": False, "error_class": OPERATOR_FAULT_CLASS, "burn": False}
+    # transient on the operator tier (review F4): backed off, never counted
+    assert kw == {"miner_fault": False, "error_class": "operator_transient", "burn": False}
 
 
 def test_generator_fault_on_the_cpu_tier_stays_the_miners():
@@ -245,7 +246,8 @@ def test_operator_rented_leg_failure_never_burns(tmp_path, monkeypatch):
             r, _Boom(), _challenger("hkA"), SimpleNamespace(base_seed=7), 1,
             SimpleNamespace(arch_preset="toto2-4m", corpus_mode="stream_cpu"), "",
             warm_start_ref=None)
-    assert rec["hkA"] == {"miner_fault": False, "error_class": OPERATOR_FAULT_CLASS,
+    # infra on OUR pod is transient (review F4): never burned, never counted
+    assert rec["hkA"] == {"miner_fault": False, "error_class": "operator_transient",
                           "burn": False}
     assert torn == ["op-pod-0"]
 

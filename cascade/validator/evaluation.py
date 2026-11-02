@@ -48,8 +48,10 @@ class EvaluationMixin:
         # it is handled (_mark_handled clears the pins); the cache is trimmed
         # to its budget / free-space floor BEFORE this fetch (2026-11-02:
         # 401 GB of never-evicted checkpoints filled the volume).
-        self._pin_eval_checkpoint(root, name)
-        self._trim_eval_cache(root, need_bytes=0 if dest.is_dir() else self._expected_ckpt_bytes())
+        with disk_space.space_lock(root):                 # pin-then-trim vs trainer reclaim
+            self._pin_eval_checkpoint(root, name)
+            self._trim_eval_cache(root, need_bytes=0 if dest.is_dir()
+                                  else self._expected_ckpt_bytes())
         fetch_from_hub(ref, dest, hub)
         disk_space.touch(dest)
         return dest

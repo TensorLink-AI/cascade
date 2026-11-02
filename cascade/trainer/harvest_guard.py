@@ -127,10 +127,17 @@ def _room(runner, dest: Path, why: str) -> int:
 
 
 def guarded_harvest(runner, dest: Path | str, attempt: Callable[[], object], *,
-                    label: str, pod_id: str = "",
+                    label: str, pod_id: str = "", hotkey: str = "",
                     r2_fallback: Callable[[], object] | None = None):
     """Run ``attempt`` (one full ssh harvest + verify + upload) under the
-    disk policy above; returns its result."""
+    disk policy above; returns its result.
+
+    The first local-disk error is recorded in the box health at once (it
+    halts every new rent while this leg still retries). A copy that differs
+    from a MINER-controlled pod's own listing twice is tamper — the payer can
+    reach their pod — never a free operator-side retry (review F7)."""
+    from .box_health import LOCAL_DISK, BoxHealth
+    from .faults import _FundedTamper
     from .money_guard import alert, clear_alert
 
     dest = Path(dest)
@@ -143,6 +150,10 @@ def guarded_harvest(runner, dest: Path | str, attempt: Callable[[], object], *,
     active.add(key)
     loc = runner.__dict__.setdefault("_leg_local_obj", threading.local())
     loc.harvest_released = False
+    loc.leg_trained = True                  # a harvest only follows a finished run
+    payer = bool(getattr(loc, "harvest_pod_payer", False))
+    halted = False
+    mismatches = 0
     last: BaseException | None = None
     try:
         for i in range(retries + 1):
@@ -151,14 +162,25 @@ def guarded_harvest(runner, dest: Path | str, attempt: Callable[[], object], *,
                 last = HarvestDiskFault(f"{short / 1e9:.1f} GB short of room for the checkpoint "
                                         "after evicting everything reclaimable")
                 alert(runner, "harvest_disk", label[:16],
-                      f"harvest of {label} blocked: {short / 1e9:.1f} GB short on {dest.parent}")
+                      f"harvest of {label} blocked: {short / 1e9:.1f} GB short on {dest.parent}",
+                      severity="critical")
+                if not halted:
+                    BoxHealth.for_runner(runner).record(LOCAL_DISK, hotkey or label,
+                                                        str(last))
+                    halted = True
             else:
                 try:
                     result = attempt()
                     clear_alert(runner, "harvest_disk", label[:16])
+                    if hotkey:
+                        BoxHealth.for_runner(runner).forget_leg(hotkey)
                     return result
                 except HarvestIncomplete as e:
                     last = e
+                    mismatches += 1
+                    if payer and mismatches >= 2:
+                        raise _FundedTamper(f"checkpoint: the payer pod's checkpoint differs from "
+                                            f"its own listing after re-harvests ({e})") from e
                 except Exception as e:
                     err = local_disk_error(e)
                     if err is None:
@@ -172,7 +194,12 @@ def guarded_harvest(runner, dest: Path | str, attempt: Callable[[], object], *,
                     last = e
                     _drop_partial(dest)
                     alert(runner, "harvest_disk", label[:16],
-                          f"harvest of {label} hit a local disk error: {err}")
+                          f"harvest of {label} hit a local disk error: {err}",
+                          severity="critical")
+                    if not halted:
+                        # halt every new rent NOW, while this leg retries
+                        BoxHealth.for_runner(runner).record(LOCAL_DISK, hotkey or label, str(err))
+                        halted = True
             if i < retries:
                 delay = wait * (2 ** i)
                 log.error("harvest of %s failed on the operator's side (try %d/%d: %s) — %s; "
@@ -198,3 +225,56 @@ def guarded_harvest(runner, dest: Path | str, attempt: Callable[[], object], *,
             f"({last}); the pod is KEPT for the re-attach — nothing burned") from last
     finally:
         active.discard(key)
+
+
+def handle_our_side_fault(runner, gen, exc: BaseException, *, pod_id: str, payer: bool,
+                          trained: bool, released: bool) -> bool:
+    """One leg failure seen by the leg paths: record any our-side fault in
+    the box health (may halt every rent; one critical alert), and decide
+    whether to KEEP the pod. Returns True = keep it (never torn down now).
+
+    A pod is kept only while the finished run is still on it (trained, not
+    yet released, a keep-pod or local-disk fault) and for at most
+    ``[round] harvest_keep_max_seconds`` from the first keep — a payer pod
+    bills the MINER while kept (review F6). Every keep and every lost run is
+    priced in one critical alert so the owner can make it good."""
+    from ..funding.queue import KEPT_POD_CLASS
+    from .box_health import BoxHealth, miner_lost_usd, record_leg_fault
+    from .money_guard import alert
+
+    hk = gen.hotkey
+    ours = keeps_pod(exc) or local_disk_error(exc) is not None
+    keep = bool(ours and trained and not released)
+    if keep:
+        bh = BoxHealth.for_runner(runner)
+        prev = bh.leg(hk) or {}
+        since = prev.get("kept_since") if prev.get("pod_id") == pod_id else None
+        now = time.time()
+        limit = float(getattr(runner.cfg.round, "harvest_keep_max_seconds", 1800) or 0)
+        if since is None:
+            since = now
+        if limit and now - since >= limit:
+            keep = False
+        record_leg_fault(runner, hk, exc, trained=True, pod_id=pod_id, payer=payer, kept=keep,
+                         ref=gen.ref, extra={"kept_since": since} if keep else {})
+    else:
+        record_leg_fault(runner, hk, exc, trained=trained and ours, pod_id=pod_id, payer=payer,
+                         kept=False, ref=gen.ref)
+    who = "MINER" if payer else "operator"
+    if keep:
+        runner._record_funded_failure(hk, f"operator-side harvest fault, pod kept for the "
+                                      f"re-attach: {exc}", miner_fault=False,
+                                      error_class=KEPT_POD_CLASS, burn=False)
+        line = keep_cost_line(runner, pod_id)
+        log.error("leg %s: %s", hk[:12], line)
+        if payer:
+            alert(runner, "miner_billed_keep", hk[:16], f"{line} — billed to the {who}; make "
+                  "it good if the run is lost", severity="critical")
+        return True
+    if ours and trained and not released:
+        lost = miner_lost_usd(runner)
+        alert(runner, "miner_billed_loss" if payer else "operator_billed_loss", hk[:16],
+              f"finished run of {hk[:12]} LOST to an operator-side fault (pod {pod_id} "
+              f"released after the keep budget): ≤ ${lost:.2f} billed to the {who}; a retrain "
+              "needs the owner's approval", severity="critical")
+    return False
