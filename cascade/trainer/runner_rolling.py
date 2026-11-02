@@ -949,7 +949,8 @@ class _RollingMixin:
             return None
         scores = self._remote_bench_scores(host, entry, str(era.base_seed),
                                            contract.arch_preset, role_dir="king",
-                                           require_fev=_bench_fev_required(self.cfg, era))
+                                           require_fev=_bench_fev_required(self.cfg, era),
+                                           contract_block=self._era_contract_block(era))
         return dataclasses.asdict(scores) if scores is not None else None
 
     def _rolling_bench_init(self, era) -> dict | None:
@@ -1241,7 +1242,8 @@ class _RollingMixin:
         role_dir = f"challenger-u{entry.miner_uid}"
         scores = self._remote_bench_scores(host, entry, str(era.base_seed),
                                            contract.arch_preset, role_dir=role_dir,
-                                           require_fev=_bench_fev_required(self.cfg, era))
+                                           require_fev=_bench_fev_required(self.cfg, era),
+                                           contract_block=self._era_contract_block(era))
         if scores is None:
             return None
         if not getattr(host, "isolated", False):

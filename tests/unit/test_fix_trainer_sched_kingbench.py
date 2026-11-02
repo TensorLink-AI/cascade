@@ -79,7 +79,8 @@ class _Runner(RR._RollingMixin):
     def _fetch_checkpoint_dir(self, pointer):
         return f"/local/{pointer}"
 
-    def _remote_bench_scores(self, host, entry, round_id, preset, *, role_dir, require_fev=False):
+    def _remote_bench_scores(self, host, entry, round_id, preset, *, role_dir, require_fev=False,
+                             contract_block=None):
         self.benched.append((host, round_id, role_dir))
         return BenchScores(**SIX)
 

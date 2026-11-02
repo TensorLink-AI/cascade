@@ -374,20 +374,6 @@ def prove_numerics_digest(contract: object, full_digest: str,
     if prove_runtime_terms(contract, full_digest, candidate_images) is None:
         return None
     return numerics_contract_digest(contract)
-    payload = contract_payload(contract)
-    images = list(dict.fromkeys([
-        str(payload.get("train_image_digest", "")),
-        *(v for c in candidate_images for v in _image_variants(c))]))
-    protocols = list(dict.fromkeys([str(payload.get("continuation_protocol", "") or ""),
-                                    *CONTINUATION_PROTOCOLS]))
-    for img in images:
-        for proto in protocols:
-            trial = dict(payload)
-            trial["train_image_digest"] = img
-            trial["continuation_protocol"] = proto     # "" drops (drop-when-default)
-            if contract_digest(trial) == str(full_digest):
-                return numerics_contract_digest(contract)
-    return None
 
 
 # ── the locked (consensus) projection of a training contract — DEC-CA-0036 ───

@@ -658,6 +658,7 @@ class _PromotionMixin:
     def _remote_bench_scores(
         self, host: object, entry: TrainedEntry, round_id: str, primary: str,
         *, role_dir: str | None = None, require_fev: bool = False,
+        contract_block: int | None = None,
     ) -> BenchScores | None:
         """One remote sweep → six numbers, or ``None`` on any miss.
 
@@ -677,7 +678,8 @@ class _PromotionMixin:
         bench_round, bench_role = round_id, (role_dir or entry.role)
         frac = float(getattr(self.cfg.telemetry, "bench_anneal_fraction", 0.0) or 0.0)
         if frac > 0.0:
-            annealed = self._dispatch_bench_anneal(host, entry, round_id, primary, frac)
+            annealed = self._dispatch_bench_anneal(host, entry, round_id, primary, frac,
+                                                   contract_block=contract_block)
             if annealed is not None:
                 bench_round, bench_role = annealed
         report = run_post_round_benchmark(
@@ -736,7 +738,7 @@ class _PromotionMixin:
 
     def _dispatch_bench_anneal(
         self, host: object, entry: TrainedEntry, round_id: str, primary: str,
-        frac: float,
+        frac: float, *, contract_block: int | None = None,
     ) -> tuple[str, str] | None:
         """Run the bench-anneal leg (DEC-CA-0030) for one duel checkpoint on
         the pod that trained it, returning the ``(round_dir, role_dir)`` pair
@@ -749,7 +751,12 @@ class _PromotionMixin:
         ``frac × target_train_hours`` under the pure-decay recipe
         (``--anneal``). The salt keys the work dir + checkpoint repo away
         from every canonical name, so nothing this leg writes can collide
-        with a consensus artifact."""
+        with a consensus artifact.
+
+        ``contract_block`` (the duel's era start, as its rolling legs carry):
+        the worker resolves that era's contract and — DEC-CA-0067 — the
+        dispatcher's image hook checks the pod runs that era's image (and
+        sends a post-switch leg its after-image config)."""
         from .remote import pod_lane_count
 
         if not self.trainer_spec:
@@ -784,6 +791,8 @@ class _PromotionMixin:
                 arch_preset=size, train_hours=contract.target_train_hours * frac,
                 repo_suffix=suffix, warm_start_ref=entry.trained_pointer,
                 lane_count=pod_lane_count(host, [host]), anneal=True,
+                **({"contract_block": int(contract_block)}
+                   if contract_block is not None else {}),
             )
         except Exception as e:  # noqa: BLE001 — telemetry: fall back, never raise
             log.warning("round=%s: bench-anneal leg failed for %s %s (benching "
