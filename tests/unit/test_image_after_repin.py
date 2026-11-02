@@ -540,3 +540,50 @@ def test_image_refusal_never_moves_a_payer_legs_billing():
     assert flips == []
     assert bill_operator_after_fault(runner, "hk", _OperatorFault("upload lost"))
     assert flips == [("hk", True)]
+
+
+def test_restart_reattaches_an_old_image_leg_under_the_decoupled_rule(cfg, tmp_path):
+    """Review 2: after a post-lock-in restart an in-flight leg whose digest
+    differs from the era's only in its image (dispatched before the repin) is
+    RE-ATTACHED; a leg with other numerics is still requeued."""
+    from cascade.trainer.rolling import EraState
+    from tests.unit.test_rolling import Clock, _sched
+    from tests.unit.test_v2_golive_validator import _v2
+
+    v2cfg, n = _v2(cfg)
+    v2cfg = bind_image_after(replace(v2cfg, v2=replace(v2cfg.v2, **AFTER,
+                                                        image_decoupled_from_block=n)))
+    sched, _ = _sched(v2cfg, tmp_path, Clock())
+    era = EraState(10, n, n, 1)
+    base = v2cfg.training.v2_contract
+    old_image = contract_digest(replace(base, train_image_digest_after="", train_image_after_block=0))
+    assert old_image != sched._contract_identity(era)
+    launched, requeued = [], []
+    sched._era_state_for = lambda idx: era
+    sched._uid_of = lambda client, hk: 1
+    sched._flight_stamp = lambda e, era, block, q: (0, 0)
+    sched._launch_leg = lambda gen, *a, **k: launched.append(gen.hotkey)
+    q = SimpleNamespace(requeue=lambda hk, **kw: requeued.append(hk))
+
+    def flight(hk, digest):
+        return SimpleNamespace(hotkey=hk, ref="r", reveal_block=1, era_index=10,
+                               training_init=era.warm_start_ckpt,
+                               training_contract_digest=digest, label="")
+
+    sched._reattach_flights(None, n + 5, q, [flight("old-image", old_image),
+                                            flight("numerics", "f" * 64)], set(), {})
+    assert launched == ["old-image"] and requeued == ["numerics"]
+
+
+def test_receipt_of_a_reattached_old_image_leg_is_accepted(acfg):
+    from cascade.trainer.leg_pins import receipt_contract_ok
+
+    armed = A.apply_image_decoupled_activation(acfg, SW)
+    post = armed.training.at_block(SW)
+    old = contract_digest(replace(acfg.training.v2_contract, train_image_digest_after=""))
+    assert receipt_contract_ok(armed, post, contract_digest(post), SW)
+    assert receipt_contract_ok(armed, post, old, SW)                 # image-only: proven
+    assert not receipt_contract_ok(armed, post, old, None)           # no era named: strict
+    assert not receipt_contract_ok(armed, post, "f" * 64, SW)
+    pre = armed.training.at_block(SW - 3600)
+    assert not receipt_contract_ok(armed, pre, contract_digest(post), SW - 3600)  # old rule

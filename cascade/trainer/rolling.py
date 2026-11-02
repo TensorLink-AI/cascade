@@ -1296,9 +1296,12 @@ class RollingScheduler:
                               error_class="infra", burn_attempt=False)
                 continue
             gen = ResolvedGen(e.hotkey, self._uid_of(client, e.hotkey), e.ref, e.reveal_block)
+            # DEC-CA-0067: under the decoupled rule a leg whose digest differs
+            # only in its runtime terms (an old-image leg across a repin) is
+            # NOT stale — re-attached, never requeued operator-billed
             if v2_era_active(self.cfg, era.start_block) and (
                     e.training_init != era.warm_start_ckpt
-                    or e.training_contract_digest != self._contract_identity(era)):
+                    or self._stale_contract(era)(e.training_contract_digest)):
                 queue.requeue(e.hotkey, error="in-flight init/contract is missing or incompatible after restart",
                               error_class="infra", burn_attempt=False, operator_billed=True)
                 continue
@@ -1372,17 +1375,10 @@ class RollingScheduler:
         else None (see :func:`cascade.shared.manifest.prove_runtime_terms`):
         the current pin, every ``[v2] prior_train_image_digests`` entry and —
         with an automatic repin — the pre-switch pin are tried."""
-        from ..shared.manifest import prove_runtime_terms
+        from .leg_pins import proven_runtime_terms
 
-        contract = self.cfg.training.at_block(int(era.start_block))
-        priors = tuple(getattr(getattr(self.cfg, "v2", None), "prior_train_image_digests", ())
-                       or ())
-        base = getattr(self.cfg.training, "v2_contract", None)
-        if base is not None and base.train_image_digest_after:
-            # DEC-CA-0067 automatic repin: the pre-switch pin is a known prior
-            # (a leg trained before the switch keeps its numerics, no edit)
-            priors = (*priors, str(base.train_image_digest))
-        return prove_runtime_terms(contract, str(digest or ""), priors)
+        return proven_runtime_terms(self.cfg, self.cfg.training.at_block(int(era.start_block)),
+                                    digest)
 
     def _numerics_of(self, era, digest: str) -> str | None:
         """The numerics digest of a leg whose runtime terms are proven

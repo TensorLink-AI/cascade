@@ -391,10 +391,12 @@ class _FundedLegMixin:
                    if role == "expert" else {}),
             )
             if getattr(contract, "base_arch", "") in ("cascade_moe", "cascade_pyramid") and role != "mkt_finetune":
-                from ..shared.manifest import contract_digest
+                from .leg_pins import receipt_contract_ok
 
                 if (getattr(entry, "init_pointer", None) != (warm_start_ref or "")
-                        or getattr(entry, "training_contract_digest", "") != contract_digest(contract)):
+                        or not receipt_contract_ok(
+                            self.cfg, contract, getattr(entry, "training_contract_digest", ""),
+                            contract_block)):
                     raise _OperatorFault(
                         "worker receipt lacks or disagrees with the dispatched init/contract; "
                         "rebuild and repin the v2 worker image")

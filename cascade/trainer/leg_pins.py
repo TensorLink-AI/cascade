@@ -80,6 +80,35 @@ def leg_round(runner):
     return round_pins_at(cfg, int(cfg.v2.image_decoupled_from_block))
 
 
+def proven_runtime_terms(cfg, contract, digest: str) -> tuple[str, str] | None:
+    """DEC-CA-0067: the PROVEN ``(train_image_digest, continuation_protocol)``
+    of a leg that recorded the full ``digest`` against ``contract``, else
+    None (:func:`cascade.shared.manifest.prove_runtime_terms`). Tried: the
+    contract's own pin, every ``[v2] prior_train_image_digests`` entry and —
+    with an automatic repin — the pre-switch pin."""
+    from ..shared.manifest import prove_runtime_terms
+
+    priors = tuple(getattr(getattr(cfg, "v2", None), "prior_train_image_digests", ()) or ())
+    base = getattr(cfg.training, "v2_contract", None)
+    if base is not None and getattr(base, "train_image_digest_after", ""):
+        priors = (*priors, str(base.train_image_digest))
+    return prove_runtime_terms(contract, str(digest or ""), priors)
+
+
+def receipt_contract_ok(cfg, contract, digest: str, contract_block) -> bool:
+    """A worker receipt's ``training_contract_digest`` is the dispatched
+    contract's — or, in an era under the DEC-CA-0067 decoupled rule, provably
+    that contract with other runtime terms (an old-image leg re-attached
+    across a repin + restart)."""
+    from ..shared.manifest import contract_digest
+
+    if str(digest or "") == contract_digest(contract):
+        return True
+    return bool(contract_block is not None
+                and image_decoupled_era(cfg, int(contract_block))
+                and proven_runtime_terms(cfg, contract, digest) is not None)
+
+
 # ── the owner's qualification rule (enforced) ───────────────────────────────
 
 
