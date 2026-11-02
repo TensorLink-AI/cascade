@@ -187,11 +187,15 @@ class BoxHealth:
 def harvest_canary(runner) -> str:
     """Write + fsync + rename + delete a small file in the harvest dir; ""
     when the box can save a checkpoint there, else why not."""
+    import uuid
+
     from .runner_common import HARVEST_DIRNAME
 
     root = Path(runner.work_root) / HARVEST_DIRNAME
-    tmp = root / f".canary-{os.getpid()}.tmp"
-    done = root / f".canary-{os.getpid()}"
+    # unique per call: concurrent leg threads run their canaries at once
+    tag = f"{os.getpid()}-{uuid.uuid4().hex[:12]}"
+    tmp = root / f".canary-{tag}.tmp"
+    done = root / f".canary-{tag}"
     try:
         root.mkdir(parents=True, exist_ok=True)
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
