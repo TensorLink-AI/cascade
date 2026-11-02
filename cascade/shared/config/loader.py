@@ -13,6 +13,7 @@ from .generation import parse_generation
 from .lane_c import parse_lane_c
 from .lane_d import parse_lane_d
 from .marketcast import check_marketcast_arming, parse_marketcast
+from .money import parse_money_safety, parse_validator_cache
 from .reliability import parse_reliability
 from .rounds import RoundConfig, check_rollover_alignment
 from .scoring import (
@@ -436,6 +437,7 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
         training=training,
         round=RoundConfig(
             **parse_reliability(r),
+            **parse_money_safety(r),
             epoch_blocks=int(r.get("epoch_blocks", 7200)),
             round_hours=float(r.get("round_hours", 24.0)),
             epoch_blocks_prev=int(r.get("epoch_blocks_prev", 0)),
@@ -695,6 +697,7 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
             warm_start_init_path=str(v.get("warm_start_init_path", "warm_start_init.json")),
             bootstrap_from_receipts=bool(v.get("bootstrap_from_receipts", True)),
             force_burn=bool(v.get("force_burn", False)),
+            **parse_validator_cache(v),
         ),
         wandb=WandbConfig(
             enabled=bool(wb.get("enabled", False)),

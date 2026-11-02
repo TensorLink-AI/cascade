@@ -33,6 +33,8 @@ PHASE_TEXT = {
     "failed": "Entry stopped; action may be required",
     "withdrawn": "Entry withdrawn",
     "queued_behind": "New reference parked behind the current leg",
+    "awaiting_operator_approval": "Parked: the operator must approve paying for this leg; nothing was charged",
+    "paused": "Paused by repeated operator-side faults; nothing was burned",
 }
 ERROR_TEXT = {
     "commit_before_open": "The reveal predates the competition opening. Make a fresh commitment and fund it; no training attempt was consumed.",
@@ -40,6 +42,10 @@ ERROR_TEXT = {
     "no_capacity": "No fitting capacity or admission window was available at the last retry.",
     "rate_limited": "The provider rate-limited the request.",
     "operator": "An operator/provider fault deferred the work.",
+    "operator_disk": "The operator's disk had no room for the checkpoint; nothing was rented or burned.",
+    "operator_blocked": "Operator-side spending safeguards deferred the work; nothing was rented or burned.",
+    "awaiting_operator_approval": "The leg would be paid by the operator and waits for the operator's approval; no attempt was consumed.",
+    "operator_denied": "The operator declined to pay for this leg; it retries on your own provider key (no attempt consumed).",
     "infra": "An infrastructure failure caused a retry.",
     "auth": "The payer credential is missing, expired or refused; review funding with the operator.",
     "funding_expired": "Funding expired while idle; review a new funding request.",
@@ -281,6 +287,10 @@ def submission_view(snapshot, *, hotkey, lane, ref=None, queue=None, source=None
             result["next_action"] = "Keep the existing entry; no resubmission is needed for later rounds. For a prolonged wait, ask the operator to check your GPU type/price cap, market capacity and backlog."
         elif retry and retry > now.timestamp():
             result["message"] = "Queued in retry backoff"
+    elif status in ("awaiting_operator_approval", "paused"):
+        result.update(auto_retry=False, action_required=False,
+                      next_action=("Nothing was burned and no attempt was consumed. The operator "
+                                   "must act on this entry; keep it funded and do not resubmit."))
     elif status in ("failed", "withdrawn"):
         result.update(auto_retry=False, action_required=status == "failed",
                       next_action=ERROR_TEXT.get(error, "Review the terminal outcome with the operator before proposing a new submission."))

@@ -44,6 +44,7 @@ def _scripted(tmp_path, monkeypatch, *, pod_files=None, harvests=None, upload_fa
     runner, _torn, seeds, contract = _harvest_runner(tmp_path, monkeypatch, disp=disp, **round_kw)
     runner._hf_ckpt_repo = lambda repo: None
     runner._upload_retry_sleep = lambda s: None
+    runner._harvest_retry_sleep = lambda s: None
     events: list[str] = []
     runner._teardown_funded_pod = lambda pod: events.append(f"teardown:{pod.instance_id}")
     pod_files = dict(FILES if pod_files is None else pod_files)
@@ -115,18 +116,24 @@ def test_hash_mismatch_reharvests_once_then_releases(tmp_path, monkeypatch):
     {k: v for k, v in FILES.items() if k != "optimizer.pt"},         # file missing
     dict(FILES, **{"optimizer.pt": b"O" * 3}),                       # truncated
 ])
-def test_no_release_on_mismatch_pod_kept_until_the_leg_ends(tmp_path, monkeypatch, copy):
+def test_persistent_mismatch_is_never_a_success_and_keeps_the_pod(tmp_path, monkeypatch, copy):
+    """2026-11-02 (saving robustness): a copy that still differs from the
+    pod's own listing after its re-harvest is NEVER uploaded; the harvest is
+    retried (bounded) and then the pod is KEPT for the re-attach — an
+    operator fault, nothing burned."""
+    from cascade.trainer.harvest_guard import HarvestKeepPod
+
     runner, disp, seeds, contract, events, _ = _scripted(
-        tmp_path, monkeypatch, harvests=[copy])
-    # the upload helper asserts the full file set; a missing file is the
-    # guards' business, not this test's
+        tmp_path, monkeypatch, harvests=[copy], harvest_disk_retries=1)
     monkeypatch.setattr(loop_module, "upload_dir_to_hub_or_hf",
                         lambda d, repo, hub, hf_repo=None: events.append("upload") or SimpleNamespace(
                             ref=SimpleNamespace(immutable_ref="cascade/c@sha256:" + "d" * 64)))
-    _leg(runner, disp, seeds, contract)
-    # two harvests (one retry), never released early: torn down AFTER the upload
-    assert events == ["harvest", "pod-listing", "harvest", "pod-listing", "verify", "upload",
-                      f"teardown:{POD}"]
+    with pytest.raises(HarvestKeepPod):
+        _leg(runner, disp, seeds, contract)
+    # two tries x (harvest + one re-harvest), never verified, uploaded or torn down
+    assert events == ["harvest", "pod-listing", "harvest", "pod-listing"] * 2
+    msg, miner_fault, cls, burn = runner._funded_leg_failures["hkA"]
+    assert (miner_fault, cls, burn) == (False, "operator", False)
 
 
 def test_unlistable_pod_is_kept_until_the_leg_ends(tmp_path, monkeypatch):

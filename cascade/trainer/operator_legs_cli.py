@@ -1,0 +1,145 @@
+"""Owner commands for operator-billed legs (2026-11-02).
+
+    cascade-trainer list-operator-legs   [--work-root _train_work] [--json]
+    cascade-trainer approve-operator-leg <hotkey> [--attempt-id ID] [--max-cost USD] [--queue NAME]
+    cascade-trainer deny-operator-leg    <hotkey> [--attempt-id ID] [--queue NAME]
+    cascade-trainer resume-operator-leg  <hotkey> [--queue NAME]
+
+``list`` shows legs awaiting approval (hotkey, uid, SKU, projected cost, why)
+and entries paused after operator-side faults. ``approve`` records a
+SINGLE-USE approval bound to that hotkey's pending request (and, with
+``--max-cost``, a cost ceiling) and returns the entry to the queue; exactly
+one operator-billed dispatch consumes it. ``deny`` records a single-use
+denial: the leg returns to the queue on the miner's own key, or fails
+unburned when it has none ("re-fund needed"). ``resume`` returns a paused
+entry to the queue with its operator-fault count reset — run it only once the
+cause is fixed.
+
+Pure file operations under the trainer's work root (flock'd, like the
+queue); no chain, no provider, no key material. Run them on the trainer box
+from the deployment directory (the work root and queue paths are relative).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+COMMANDS = ("list-operator-legs", "approve-operator-leg", "deny-operator-leg",
+            "resume-operator-leg")
+
+
+def _queues(work_root: Path) -> list:
+    """Every funding-lane queue file under ``work_root`` (A, B, C)."""
+    from ..funding.queue import (
+        LANE_B_QUEUE_FILE,
+        LANE_C_QUEUE_FILE,
+        FundedQueue,
+        LaneBQueue,
+        LaneCQueue,
+    )
+
+    out = []
+    for name, cls in (("funded_queue.json", FundedQueue), (LANE_B_QUEUE_FILE, LaneBQueue),
+                      (LANE_C_QUEUE_FILE, LaneCQueue)):
+        p = work_root / name
+        if p.is_file():
+            out.append(cls(p))
+    return out
+
+
+def _queue_for(work_root: Path, rec: dict | None, queue_name: str | None):
+    from ..funding.queue import FundedQueue
+
+    path = (rec or {}).get("queue_path") or ""
+    if path and Path(path).is_file():
+        return FundedQueue(path)
+    for q in _queues(work_root):
+        if queue_name is None or q.path.name == queue_name:
+            return q
+    return None
+
+
+def _parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="cascade-trainer", description=__doc__.split("\n\n")[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+    for cmd in COMMANDS:
+        s = sub.add_parser(cmd)
+        s.add_argument("--work-root", type=Path, default=Path("./_train_work"))
+        if cmd != "list-operator-legs":
+            s.add_argument("hotkey")
+            s.add_argument("--queue", default=None,
+                           help="queue file name when the hotkey has entries in several lanes")
+        if cmd in ("approve-operator-leg", "deny-operator-leg"):
+            s.add_argument("--attempt-id", default=None,
+                           help="bind to this pending request (as listed)")
+        if cmd == "approve-operator-leg":
+            s.add_argument("--max-cost", type=float, default=None,
+                           help="refuse the dispatch if its projected cost exceeds this (USD)")
+        if cmd == "list-operator-legs":
+            s.add_argument("--json", action="store_true")
+    return p
+
+
+def main(argv: list[str]) -> int:
+    from ..funding.operator_approvals import OperatorApprovals
+    from ..funding.queue import AWAITING_APPROVAL_STATUS, PAUSED_STATUS
+
+    args = _parser().parse_args(argv)
+    wr = Path(args.work_root)
+    store = OperatorApprovals.for_work_root(wr)
+    if args.cmd == "list-operator-legs":
+        pending = store.pending()
+        paused = [{"queue": q.path.name, "hotkey": e.hotkey, "ref": e.ref,
+                   "operator_requeues": e.operator_requeues, "last_error": e.last_error}
+                  for q in _queues(wr) for e in q.entries() if e.status == PAUSED_STATUS]
+        if args.json:
+            print(json.dumps({"awaiting_approval": pending, "paused": paused}, indent=2))
+            return 0
+        if not pending and not paused:
+            print("no operator-billed legs awaiting approval; no paused entries")
+        for r in pending:
+            print(f"AWAITING  {r['hotkey']}  uid={r.get('uid')}  queue={r['queue']}  "
+                  f"attempt={r.get('request_attempt_id')}  sku={r.get('sku') or '?'}  "
+                  f"~${float(r.get('projected_cost_usd') or 0):.2f} "
+                  f"(${float(r.get('rate_per_hour') or 0):.2f}/h x "
+                  f"{float(r.get('expected_hours') or 0):.1f} h)  why: {r.get('reason')}")
+        for r in paused:
+            print(f"PAUSED    {r['hotkey']}  queue={r['queue']}  operator faults="
+                  f"{r['operator_requeues']}  last: {r['last_error'][:160]}")
+        return 0
+    hk = args.hotkey
+    if args.cmd == "resume-operator-leg":
+        for q in _queues(wr):
+            if args.queue and q.path.name != args.queue:
+                continue
+            if q.unpark(hk, expect_status=PAUSED_STATUS,
+                        reason="resumed by the operator after a fault pause"):
+                print(f"resumed {hk} in {q.path.name} (operator-fault count reset)")
+                return 0
+        print(f"no paused entry for {hk}", file=sys.stderr)
+        return 1
+    approve = args.cmd == "approve-operator-leg"
+    try:
+        rec = store.decide(hk, approve=approve, attempt_id=args.attempt_id,
+                           max_cost_usd=getattr(args, "max_cost", None), queue_name=args.queue)
+    except (LookupError, ValueError) as e:
+        print(f"refused: {e}", file=sys.stderr)
+        return 1
+    q = _queue_for(wr, rec, args.queue)
+    moved = bool(q is not None and q.unpark(
+        hk, expect_status=AWAITING_APPROVAL_STATUS, deny=not approve,
+        reason=("approved by the operator (single use)" if approve
+                else "the operator declined to pay for this leg")))
+    verb = "APPROVED (single use)" if approve else "DENIED"
+    cost = rec.get("projected_cost_usd")
+    print(f"{verb}: {hk} uid={rec.get('uid')} {rec.get('kind')} ~${float(cost or 0):.2f}"
+          + (f" ceiling ${rec['max_cost_usd']:.2f}" if rec.get("max_cost_usd") else "")
+          + ("; entry returned to the queue" if moved else
+             "; entry was not parked (it is picked up at its next dispatch)"))
+    return 0
+
+
+__all__ = ["COMMANDS", "main"]

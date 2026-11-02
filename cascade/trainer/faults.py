@@ -201,6 +201,13 @@ def classify_leg_exception(runner, gen, seeds, exc: BaseException, *, rc: int | 
     restart resets it — still bounded per process)."""
     import threading
 
+    from .harvest_guard import local_disk_error
+
+    if local_disk_error(exc) is not None or getattr(exc, "keep_pod", False):
+        # 2026-11-02: OUR disk (ENOSPC/EIO/... anywhere in the leg) or a
+        # harvest our side could not finish — an operator fault, never a
+        # miner burn, whatever the message says.
+        return False, OPERATOR_FAULT_CLASS, False
     final = final_exception_of(exc)
     key = (str(getattr(gen, "hotkey", "")), str(getattr(seeds, "base_seed", "")),
            str(getattr(gen, "ref", "")))

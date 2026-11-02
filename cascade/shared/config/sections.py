@@ -387,6 +387,18 @@ class ValidatorConfig:
     # back off resumes voting the persisted king immediately. For "something
     # looks wrong, stop endorsing while I investigate" — NOT a shutdown.
     force_burn: bool = False
+    # Eval checkpoint cache retention (2026-11-02: 29 x 14 GB never evicted
+    # filled the checkpoint volume). LOCAL ONLY: a re-fetch is digest-pinned,
+    # so eviction never changes a verdict. Never evicted: the current king,
+    # anything referenced by the validator / cascade state or the warm-start
+    # init, checkpoints of the manifest being settled, and dirs touched within
+    # the grace. Others go oldest-first (LRU by mtime) to stay under
+    # ``eval_ckpt_cache_max_gb`` (0 = no budget) and above
+    # ``eval_ckpt_cache_min_free_gb`` free on that filesystem (0 = no floor).
+    eval_ckpt_cache_dir: str = "_eval_ckpts"
+    eval_ckpt_cache_max_gb: float = 120.0
+    eval_ckpt_cache_min_free_gb: float = 60.0
+    eval_ckpt_cache_grace_seconds: int = 3600
 
 
 @dataclass(frozen=True)

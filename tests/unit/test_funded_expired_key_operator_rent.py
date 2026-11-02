@@ -231,3 +231,8 @@ def test_the_sweep_recognises_in_flight_operator_leg_pods(tmp_path):
     assert not r._is_operator_leg_pod_of("cascade-n91-777-funded-hka-0", {"hkA"})   # payer pod
     assert not r._is_operator_leg_pod_of("cascade-n91-777-funded-king-0", {"hkA"})
     assert not r._is_operator_leg_pod_of("cascade-n259-777-funded-hka-op-0", {"hkA"})  # testnet
+
+
+# The owner-approval gate (2026-11-02) is tested in test_money_safety.py;
+# these tests drive the operator-lane / operator-rent machinery behind it.
+pytestmark = pytest.mark.usefixtures("operator_legs_preapproved")

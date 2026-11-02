@@ -561,3 +561,8 @@ def test_in_leg_replacements_stop_at_the_remaining_loss_budget(tmp_path, monkeyp
     assert q.get("hkA").operator_faults == OPERATOR_FAULT_RETRIES
     msg, miner_fault, cls, burn = r._funded_leg_failures["hkA"]
     assert (miner_fault, cls, burn) == (False, "infra", False) and "bad pod(s)" in msg
+
+
+# The owner-approval gate (2026-11-02) is tested in test_money_safety.py;
+# these tests drive the operator-lane / operator-rent machinery behind it.
+pytestmark = pytest.mark.usefixtures("operator_legs_preapproved")

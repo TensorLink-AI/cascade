@@ -334,6 +334,39 @@ class RoundConfig:
     # does not grow — the operator's own fault never backs off its make-good.
     # 0 = the legacy doubling backoff (INFRA_BACKOFF_*) for these entries too.
     operator_billed_retry_seconds: int = 60
+    # ── money safety (2026-11-02 incident: a full disk burned miner attempts,
+    # an expired-key make-good drained the operator Lium account, a 402 then
+    # hot-looped). Trainer-only: never changes what validators compute.
+    #
+    # Operator-side faults (error_class "operator") an entry may take before
+    # it PAUSES (status "paused": not failed, not burned, never re-dispatched
+    # until the operator resumes it). Counted on EVERY occurrence. 0 = no cap.
+    operator_fault_cap: int = 3
+    # A balance refusal (402 / BALANCE_REQUIRED) on an OPERATOR rent opens the
+    # operator-account circuit breaker: no operator rent of any kind for this
+    # many seconds (one alert, no per-leg retries).
+    operator_breaker_cooldown_seconds: int = 3600
+    # Before an operator-billed miner leg rents: the operator's Lium balance
+    # must cover the projected leg cost × this factor plus the reserve below
+    # (the reserve keeps the validator's eval pods alive). Unknown = refused.
+    operator_cost_safety_factor: float = 1.25
+    operator_balance_reserve_usd: float = 50.0
+    # Hard daily ceiling (UTC day) on projected operator spend for miner legs
+    # rented on the operator account. 0 = off. ops_operator_daily_cap_usd,
+    # when set, also applies (the lower positive value wins).
+    operator_daily_spend_cap_usd: float = 200.0
+    # Payer-key balance check before a miner's own-key rent: the payer's Lium
+    # balance must cover this hourly rate × the leg's expected wall. 0 = off.
+    payer_projected_rate_per_hour: float = 0.0
+    # Disk reservation before ANY pod rent (ssh harvest transport): free space
+    # under work_root ≥ expected checkpoint × (legs holding a pod + 1) +
+    # min_free_disk_gb, after reclaimable data was evicted.
+    expected_checkpoint_gb: float = 15.0
+    # A local-disk fault while harvesting (ENOSPC/EIO/...) keeps the pod and
+    # retries the harvest this many times (space reclaimed in between) before
+    # the leg is requeued unburned with the pod kept for the re-attach.
+    harvest_disk_retries: int = 3
+    harvest_disk_retry_seconds: int = 60
     # Trainer recovery controls; scientific contracts and reward rules are unchanged.
     ops_max_active_per_coldkey: int = 0
     ops_gpu_failure_threshold: int = 0

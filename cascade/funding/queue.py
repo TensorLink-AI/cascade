@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import re
 import time
 import uuid
@@ -42,8 +43,18 @@ from pathlib import Path
 
 from .vault import DEFAULT_TTL_SECONDS
 
+log = logging.getLogger("cascade.funding.queue")
+
 __all__ = [
+    "APPROVAL_CLASS",
+    "AWAITING_APPROVAL_STATUS",
     "COMPETITION_ENDED_CLASS",
+    "DENIED_CLASS",
+    "OPERATOR_BACKOFF_CLASSES",
+    "OPERATOR_BLOCKED_CLASS",
+    "OPERATOR_DISK_CLASS",
+    "OPERATOR_FAULT_CAP",
+    "PAUSED_STATUS",
     "DEFAULT_MAX_ATTEMPTS",
     "OPERATOR_FAULT_CLASS",
     "FundedEntry",
@@ -80,12 +91,39 @@ INFRA_BACKOFF_MAX_SECONDS = 1800.0
 # operator_billed_retry_seconds``; 0 = the doubling backoff above.
 OPERATOR_BILLED_RETRY_SECONDS = 60.0
 
+# ── money safety (2026-11-02) ────────────────────────────────────────────────
+# A leg that would be billed to the OPERATOR is never rented or dispatched
+# without a one-shot owner approval (cascade.funding.operator_approvals): it
+# parks here, unburned, never re-dispatched, until the owner approves or
+# denies it. Not terminal, no attempt consumed, never TTL-expired.
+APPROVAL_CLASS = "awaiting_operator_approval"
+AWAITING_APPROVAL_STATUS = "awaiting_operator_approval"
+# The owner declined to pay for the leg: requeued on the miner's own key
+# (operator_billed cleared); an entry without a usable key then fails
+# terminally, unburned ("re-fund needed").
+DENIED_CLASS = "operator_denied"
+# Global operator-side blocks that are nobody's per-entry fault: the box disk
+# reservation, the operator-account circuit breaker, the balance gate and the
+# daily spend cap. Backed off like an operator fault, never counted against
+# the entry's operator-fault cap (they clear on their own).
+OPERATOR_DISK_CLASS = "operator_disk"
+OPERATOR_BLOCKED_CLASS = "operator_blocked"
+OPERATOR_BACKOFF_CLASSES = frozenset({"operator", OPERATOR_DISK_CLASS, OPERATOR_BLOCKED_CLASS})
+# Operator-side faults (OPERATOR_FAULT_CLASS) an entry may take before it
+# PAUSES — counted on EVERY occurrence, never reset by an interleaved
+# no_capacity/rate-limit requeue (2026-11-02: a 402 re-dispatched one leg
+# every ~2.5 min for hours). ``[round] operator_fault_cap``; 0 = no cap.
+OPERATOR_FAULT_CAP = 3
+# Paused: not failed, not burned, never re-dispatched until ``resume``.
+PAUSED_STATUS = "paused"
+_PARKED = (PAUSED_STATUS, AWAITING_APPROVAL_STATUS)
+
 # Public, bounded lifecycle telemetry. Never store provider error text or keys.
 PHASES = frozenset({"admitted", "waiting_admission", "preparing_data", "waiting_gpu",
                     "waiting_launch",
                     "booting", "training", "harvesting", "evaluating",
                     "awaiting_settlement", "waiting_operator", "queued", "done",
-                    "failed", "withdrawn"})
+                    "failed", "withdrawn", PAUSED_STATUS, AWAITING_APPROVAL_STATUS})
 PHASE_REASONS = frozenset({"", "availability_check", "market_capacity", "king_priority",
                           "operator_recovery"})
 
@@ -167,6 +205,9 @@ class FundedEntry:
     phase_history: tuple[dict, ...] = ()
     requeues: int = 0
     attempt_id: str = ""
+    # Operator-side faults on this entry, EVERY occurrence (see
+    # OPERATOR_FAULT_CAP); reset by a re-fund, ``resume`` or completion.
+    operator_requeues: int = 0
 
     @property
     def active_at(self) -> float:
@@ -248,9 +289,12 @@ class FundedQueue:
 
     def __init__(self, path: Path | str, *, clock: Callable[[], float] = time.time,
                  entry_ttl_seconds: float = DEFAULT_TTL_SECONDS,
-                 operator_billed_retry_seconds: float = OPERATOR_BILLED_RETRY_SECONDS) -> None:
+                 operator_billed_retry_seconds: float = OPERATOR_BILLED_RETRY_SECONDS,
+                 operator_fault_cap: int = OPERATOR_FAULT_CAP) -> None:
         self.path = Path(path)
         self.clock = clock
+        # Operator-side faults before the entry pauses (0 = no cap).
+        self.operator_fault_cap = max(0, int(operator_fault_cap))
         # Fixed retry of an operator-billed entry after an operator-side fault
         # (see OPERATOR_BILLED_RETRY_SECONDS); 0 = the doubling backoff.
         self.operator_billed_retry_seconds = max(0.0, float(operator_billed_retry_seconds))
@@ -333,6 +377,7 @@ class FundedQueue:
                 phase_history=tuple(item.get("phase_history") or ())[-16:],
                 requeues=int(item.get("requeues", 0) or 0),
                 attempt_id=str(item.get("attempt_id", "") or ""),
+                operator_requeues=int(item.get("operator_requeues", 0) or 0),
             )
             entries[entry.hotkey] = entry
         return entries
@@ -409,6 +454,19 @@ class FundedQueue:
                                           **_gpu_fields(gpu_choice))
                 self._save(entries)
                 return "queued-behind"
+            if prev is not None and prev.status in _PARKED:
+                # A re-fund of a parked entry (awaiting operator approval /
+                # paused after operator faults) is the miner paying again:
+                # back to the queue on THEIR key, operator billing and the
+                # operator-fault count cleared.
+                same = prev.ref == ref
+                entries[hotkey] = _phase(replace(
+                    prev, ref=ref, reveal_block=prev.reveal_block if same else int(reveal_block),
+                    funded_at=prev.funded_at if same else now, last_active=now, status="queued",
+                    operator_billed=False, operator_requeues=0, infra_streak=0, not_before=0.0,
+                    label=label or prev.label, **_gpu_fields(gpu_choice)), "queued", now, force=True)
+                self._save(entries)
+                return "queued" if same else "replaced"
             if prev is not None and prev.status in ("pending_reveal", "queued", "in_round"):
                 if prev.ref == ref and prev.status != "pending_reveal":
                     # Idempotent, but a re-fund is proof of life — refresh so
@@ -620,6 +678,32 @@ class FundedQueue:
             self._save(entries)
             return True
 
+    # ── owner actions on parked entries (cascade-trainer *-operator-leg) ────
+
+    def unpark(self, hotkey: str, *, expect_status: str, deny: bool = False,
+               reason: str = "") -> bool:
+        """Return a parked entry (``expect_status``: awaiting approval / paused)
+        to the queue. ``deny`` additionally clears ``operator_billed`` and
+        stamps :data:`DENIED_CLASS` — the leg then runs on the miner's own key
+        or, without one, fails unburned. A resumed (paused) entry restarts its
+        operator-fault count. False when the entry is not in that state."""
+        if expect_status not in _PARKED:
+            raise ValueError(f"not a parked status: {expect_status!r}")
+        with self._locked() as entries:
+            e = entries.get(hotkey)
+            if e is None or e.status != expect_status:
+                return False
+            now = self.clock()
+            entries[hotkey] = _phase(replace(
+                e, status="queued", not_before=0.0, infra_streak=0, last_active=now,
+                operator_requeues=0 if expect_status == PAUSED_STATUS else e.operator_requeues,
+                operator_billed=False if deny else e.operator_billed,
+                last_error=(reason or e.last_error)[:500],
+                last_error_class=DENIED_CLASS if deny else e.last_error_class),
+                "queued", now, force=True)
+            self._save(entries)
+            return True
+
     def restamp_flight(self, hotkey: str, *, target_boundary: int, era_index: int,
                        started_block: int) -> bool:
         """Replace an ``in_flight`` entry's era / target / start stamp — the
@@ -707,7 +791,7 @@ class FundedQueue:
         """Miner-initiated exit while queued/pending; False once a round has it."""
         with self._locked() as entries:
             e = entries.get(hotkey)
-            if e is None or e.status not in ("queued", "pending_reveal"):
+            if e is None or e.status not in ("queued", "pending_reveal", *_PARKED):
                 return False
             entries[hotkey] = _phase(replace(e, status="withdrawn"), "withdrawn", self.clock())
             self._save(entries)
@@ -767,28 +851,58 @@ class FundedQueue:
                     self._after_flight(entries, hotkey)
                 self._save(entries)
                 return False
+            if error_class == APPROVAL_CLASS and not burn_attempt:
+                # Parked for a one-shot owner approval: never re-dispatched,
+                # nothing consumed, the flight's stamps cleared.
+                entries[hotkey] = _phase(replace(
+                    e, status=AWAITING_APPROVAL_STATUS, last_error=error[:500],
+                    last_error_class=error_class, last_active=now, target_boundary=0,
+                    era_index=0, started_block=0, training_init=None,
+                    training_contract_digest="", not_before=0.0, requeues=e.requeues + 1),
+                    AWAITING_APPROVAL_STATUS, now, force=True)
+                if was_flight and e.queued_ref:
+                    self._after_flight(entries, hotkey)
+                self._save(entries)
+                return True
             streak, not_before = 0, 0.0
             billed = e.operator_billed or bool(operator_billed)
-            if (error_class == OPERATOR_FAULT_CLASS and not burn_attempt and billed
-                    and self.operator_billed_retry_seconds > 0):
-                # Our fault on our bill: a short fixed retry, streak not grown.
-                streak = e.infra_streak
-                not_before = now + self.operator_billed_retry_seconds
-            elif error_class == OPERATOR_FAULT_CLASS and not burn_attempt:
+            op_requeues = e.operator_requeues
+            if error_class in OPERATOR_BACKOFF_CLASSES and not burn_attempt:
+                # Our side (or a global operator block): back off, doubling per
+                # consecutive such requeue. An OPERATOR-billed entry starts
+                # from ``operator_billed_retry_seconds`` instead of the infra
+                # base — still doubling, never a flat hot loop (2026-11-02).
                 streak = e.infra_streak + 1
-                not_before = now + min(INFRA_BACKOFF_MAX_SECONDS,
-                                       INFRA_BACKOFF_BASE_SECONDS * 2 ** (streak - 1))
+                base = (self.operator_billed_retry_seconds
+                        if billed and self.operator_billed_retry_seconds > 0
+                        else INFRA_BACKOFF_BASE_SECONDS)
+                not_before = now + min(INFRA_BACKOFF_MAX_SECONDS, base * 2 ** (streak - 1))
+            if error_class == OPERATOR_FAULT_CLASS and not burn_attempt:
+                op_requeues += 1
+            status, phase = "queued", "queued"
+            if (error_class == OPERATOR_FAULT_CLASS and self.operator_fault_cap
+                    and op_requeues >= self.operator_fault_cap):
+                # Capped: PAUSE (not failed, not burned) until the operator
+                # fixes the cause and resumes it — never a hot loop.
+                status = phase = PAUSED_STATUS
+                log.error("operator alert: entry_paused %s — %d operator-side faults (cap %d); "
+                          "not failed, nothing burned; resume with `cascade-trainer "
+                          "resume-operator-leg %s` once the cause is fixed. Last: %s",
+                          hotkey[:12], op_requeues, self.operator_fault_cap, hotkey,
+                          error[:200])
             entries[hotkey] = _phase(replace(
-                e, status="queued", attempts=attempts,
+                e, status=status, attempts=attempts,
                 last_error=error[:500], last_error_class=error_class,
                 last_active=now, rate_limited_since=rl_since,
                 target_boundary=0, era_index=0, started_block=0,
                 training_init=None, training_contract_digest="",
-                operator_billed=e.operator_billed or bool(operator_billed),
+                operator_billed=(False if error_class == DENIED_CLASS
+                                 else e.operator_billed or bool(operator_billed)),
                 operator_faults=e.operator_faults + (
                     1 if operator_billed and not e.operator_billed else 0),
+                operator_requeues=op_requeues,
                 not_before=not_before, infra_streak=streak, requeues=e.requeues + 1),
-                "queued", now, force=True)
+                phase, now, force=True)
             if was_flight and e.queued_ref:
                 # The re-commit supersedes the requeue: the miner moved on.
                 self._after_flight(entries, hotkey)
@@ -882,6 +996,8 @@ class FundedQueue:
                        if e.queued_ref and e.queued_reveal_block > 0 else {}),
                     **({"operator_billed": True} if e.operator_billed else {}),
                     **({"operator_faults": e.operator_faults} if e.operator_faults else {}),
+                    **({"operator_requeues": e.operator_requeues}
+                       if e.operator_requeues else {}),
                     "label": e.label,
                     # DEC-CA-0060: "" = the default (cheapest fitting type)
                     "gpu": e.gpu,

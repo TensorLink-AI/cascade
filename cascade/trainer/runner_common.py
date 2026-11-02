@@ -49,7 +49,9 @@ def funded_queue_of(runner, *, lane="a"):
         raise ValueError(f"unknown funding lane: {lane}")
     return queue_type(path, entry_ttl_seconds=runner.cfg.round.funded_entry_ttl_hours * 3600.0,
                       operator_billed_retry_seconds=float(getattr(
-                          runner.cfg.round, "operator_billed_retry_seconds", 60) or 0))
+                          runner.cfg.round, "operator_billed_retry_seconds", 60) or 0),
+                      operator_fault_cap=int(getattr(runner.cfg.round, "operator_fault_cap", 3)
+                                             or 0))
 
 
 def _load_burns(path: Path) -> dict[str, int]:
@@ -329,28 +331,93 @@ def r2_transport_on(cfg) -> bool:
 DISK_USAGE = None   # None ⇒ shutil.disk_usage
 
 
-def disk_guard_refusal(runner) -> str:
-    """Why a NEW funded/operator leg pod must not be rented now ("" = rent):
-    free space under ``work_root`` below ``[round] min_free_disk_gb`` (GiB;
-    0 = off). Only for fresh rents — a re-attached or adopted pod is a live
-    leg and always keeps going. An unmeasurable disk never blocks a rent."""
+def _free_under(path: Path) -> int:
     import shutil
 
-    gb = float(getattr(getattr(runner.cfg, "round", None), "min_free_disk_gb", 0.0) or 0.0)
+    p = Path(path)
+    while not p.exists() and p != p.parent:
+        p = p.parent
+    return int((DISK_USAGE or shutil.disk_usage)(p).free)
+
+
+def active_harvests(runner) -> set[str]:
+    """Resolved harvest dirs a harvest in THIS process is writing now (the
+    space manager never reclaims them)."""
+    return set(runner.__dict__.get("_active_harvest_dirs") or ())
+
+
+def reclaim_box_space(runner, target: Path | str, *, need_bytes: int = 0,
+                      floor_bytes: int | None = None, why: str = ""):
+    """The ONE space manager (cascade.shared.disk_space) on behalf of the
+    trainer: evict reclaimable data (eval cache beyond the validator's
+    protection set, fetch caches, settled harvest leftovers) so ``target``'s
+    filesystem has ``floor_bytes + need_bytes`` free. Never raises."""
+    from ..shared import disk_space
+
+    try:
+        return disk_space.reclaim(
+            runner.cfg, target, need_bytes=need_bytes, floor_bytes=floor_bytes,
+            work_root=runner.work_root, active_harvests=lambda: active_harvests(runner),
+            why=why)
+    except Exception as e:  # noqa: BLE001 — space management never sinks a leg
+        log.warning("disk: reclaim on %s failed (%s)", target, e)
+        return None
+
+
+def _legs_holding_pods(runner) -> int:
+    """Pods on the funded ledger — each may still land a checkpoint here."""
+    load = getattr(runner, "_load_funded_ledger", None)
+    try:
+        return len(list(load())) if callable(load) else 0
+    except Exception:  # noqa: BLE001 — unreadable ledger: count none
+        return 0
+
+
+def disk_guard_refusal(runner) -> str:
+    """Why a NEW funded/operator leg pod must not be rented now ("" = rent).
+
+    Disk reservation (2026-11-02): free space on the harvest filesystem must
+    hold the expected checkpoint of every leg that holds a pod plus this one
+    (``[round] expected_checkpoint_gb`` each; 0 with the r2 transport, which
+    never lands checkpoints here) on top of ``[round] min_free_disk_gb``
+    (GiB; 0 = the whole guard off) — measured AFTER the space manager evicted
+    whatever is reclaimable. Only for fresh rents: a re-attached or adopted
+    pod is a live leg and always keeps going. An unmeasurable disk never
+    blocks a rent."""
+    from ..shared.disk_space import GIB
+
+    rnd = getattr(runner.cfg, "round", None)
+    gb = float(getattr(rnd, "min_free_disk_gb", 0.0) or 0.0)
     if gb <= 0:
         return ""
-    usage = DISK_USAGE or shutil.disk_usage
+    per = 0.0 if r2_transport_on(runner.cfg) else float(
+        getattr(rnd, "expected_checkpoint_gb", 0.0) or 0.0)
+    holding = _legs_holding_pods(runner)
+    need = int(per * GIB) * (holding + 1)
+    floor = int(gb * GIB)
+    target = Path(runner.work_root) / HARVEST_DIRNAME
     try:
-        free = int(usage(Path(runner.work_root)).free)
+        free = _free_under(target)
     except OSError as e:
         log.warning("disk guard: free space under %s unreadable (%s); not blocking",
                     runner.work_root, e)
         return ""
-    if free >= gb * (1 << 30):
+    if free < floor + need:
+        reclaim_box_space(runner, target, need_bytes=need, floor_bytes=floor,
+                          why="pre-rent disk reservation")
+        with contextlib.suppress(OSError):
+            free = _free_under(target)
+    from .money_guard import alert, clear_alert
+
+    if free >= floor + need:
+        clear_alert(runner, "operator_disk", "box")
         return ""
-    return (f"trainer disk low: {free / (1 << 30):.1f} GiB free under {runner.work_root} "
-            f"< [round] min_free_disk_gb={gb:g} — no new pod rented (requeued, "
-            "never burned)")
+    msg = (f"operator disk: trainer disk low: {free / GIB:.1f} GiB free under {runner.work_root} "
+           f"< {need / GIB:.0f} GiB for {holding + 1} checkpoint(s) of {per:g} GB + [round] "
+           f"min_free_disk_gb={gb:g} (after evicting reclaimable data) — no new pod rented "
+           "(requeued, never burned)")
+    alert(runner, "operator_disk", "box", msg)
+    return msg
 
 
 def prune_harvest_dirs(work_root: Path, *, now: float | None = None,

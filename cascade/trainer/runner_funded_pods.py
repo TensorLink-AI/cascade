@@ -841,8 +841,13 @@ class _FundedPodMixin:
             # Owner make-good: this entry's leg is on the operator's bill — an
             # operator lane (or an operator-rented pod), never the payer's key;
             # a miss requeues the leg unburned like any lane fault.
+            from .money_guard import operator_leg_gate
+
             lanes = self._operator_fallback_lanes()
             if not lanes and self._operator_rent_allowed():
+                # Owner 2026-11-02: never on our account without a one-shot
+                # approval of THIS leg (parks awaiting_operator_approval).
+                operator_leg_gate(self, gen, kind="make_good", rent=True)
                 log.warning("final challenger %s: entry is OPERATOR-BILLED — no operator "
                             "lane on file, renting a pod on the OPERATOR's account",
                             gen.hotkey)
@@ -853,6 +858,7 @@ class _FundedPodMixin:
                     "is configured, so the miner's key will not be charged again",
                     miner_fault=False, error_class="operator", burn=False)
                 raise _FundedLegSkip(gen.hotkey)
+            operator_leg_gate(self, gen, kind="make_good", rent=False)
             log.warning("final challenger %s: entry is OPERATOR-BILLED (owner make-good) — "
                         "running on an operator lane (%d on file), never on the payer's key",
                         gen.hotkey, len(lanes))
@@ -888,9 +894,11 @@ class _FundedPodMixin:
         # allocation is a live leg — it always keeps going.
         low = "" if prior_alloc else disk_guard_refusal(self)
         if low:
+            from ..funding.queue import OPERATOR_DISK_CLASS
+
             log.error("funded leg %s: %s", gen.hotkey[:12], low)
             self._record_funded_failure(gen.hotkey, low, miner_fault=False,
-                                        error_class="no_capacity", burn=False)
+                                        error_class=OPERATOR_DISK_CLASS, burn=False)
             raise _FundedLegSkip(gen.hotkey)
         vault = self._payer_vault()
         if vault is None:
@@ -913,8 +921,22 @@ class _FundedPodMixin:
         if api_key and vault.refresh(gen.hotkey):
             log.info("final challenger %s: payer key TTL re-stamped for the leg",
                      gen.hotkey)
+        if api_key and not prior_alloc:
+            # A key that cannot pay for the whole leg never starts it: the
+            # miner would pay for a pod that dies mid-run (no attempt charged).
+            from .money_guard import payer_balance_refusal
+
+            poor = payer_balance_refusal(self, api_key, hours=self._leg_wall_seconds() / 3600.0)
+            if poor:
+                log.warning("funded leg %s: %s", gen.hotkey[:12], poor)
+                self._record_funded_failure(gen.hotkey, poor, miner_fault=True,
+                                            error_class="auth", burn=False)
+                raise _FundedLegSkip(gen.hotkey)
         if not api_key:
+            from .money_guard import operator_leg_gate
+
             if self._operator_fallback_lanes():
+                operator_leg_gate(self, gen, kind="expired_key", rent=False)
                 # The payer's key aged out while their leg kept failing on our
                 # side. With the owner-armed hybrid on and operator lanes on
                 # file, the leg runs operator-billed rather than dropping the
@@ -926,8 +948,11 @@ class _FundedPodMixin:
             if self._operator_rent_allowed():
                 # A queued entrant whose key aged out while the marketplace was
                 # sold out is not dropped: with no operator lane on file the leg
-                # rents a pod on the OPERATOR's account. The entry is flagged
-                # so every retry stays on our bill; the miner is never burned.
+                # rents a pod on the OPERATOR's account — ONLY once the owner
+                # approved this leg (2026-11-02: an unapproved expired-key rent
+                # drained the operator account). The entry is flagged so the
+                # approved leg stays on our bill; the miner is never burned.
+                operator_leg_gate(self, gen, kind="expired_key", rent=True)
                 log.warning("final challenger %s: no vaulted key (TTL expired) — "
                             "operator-billed (payer key expired): renting a pod on the "
                             "OPERATOR's account", gen.hotkey)
@@ -1210,6 +1235,13 @@ class _FundedPodMixin:
                     live_claimed_executors(self), health_for(self)),
                 allow_paid_fallback=chosen is None,
                 **({"price_caps": chosen[1]} if chosen is not None else {}))
+            if waited in ("operator_rent", "operator"):
+                from .money_guard import operator_leg_gate
+
+                self._ledger_remove(expected_id)
+                operator_leg_gate(self, gen, kind=("paid_fallback" if waited == "operator_rent"
+                                                   else "operator_lane"),
+                                  rent=waited == "operator_rent")
             if waited == "operator_rent":
                 self._ledger_remove(expected_id)
                 queue = self._funded_queue()

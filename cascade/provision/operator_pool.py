@@ -352,8 +352,13 @@ def enabled(runner):
 
 
 def operator_provider(runner, legacy_factory):
+    """The provider every OPERATOR-account rent goes through, wrapped with
+    the operator-account circuit breaker (a balance refusal pauses ALL
+    operator rents for a cooldown — 2026-11-02, cascade.trainer.money_guard)."""
+    from ..trainer.money_guard import guard_operator_provider
+
     if enabled(runner):
-        return OperatorPool(runner)
+        return guard_operator_provider(runner, OperatorPool(runner))
     from ..trainer.gpu_health import guard_provider
 
-    return guard_provider(runner, legacy_factory())
+    return guard_operator_provider(runner, guard_provider(runner, legacy_factory()))

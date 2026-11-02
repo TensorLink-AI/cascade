@@ -537,8 +537,9 @@ def test_disk_guard_requeues_a_new_rent_unburned(tmp_path, monkeypatch):
         runner._rent_funded_host("777", _challenger("hkA"))
     assert rented == []
     msg, miner_fault, cls, burn = runner._funded_leg_failures["hkA"]
-    assert (miner_fault, cls, burn) == (False, "no_capacity", False)
-    assert "min_free_disk_gb" in msg
+    # 2026-11-02: an operator-disk block (backed off, never counted, never burned)
+    assert (miner_fault, cls, burn) == (False, "operator_disk", False)
+    assert "min_free_disk_gb" in msg and msg.startswith("operator disk")
 
 
 def test_disk_guard_never_stops_an_adopted_live_leg(tmp_path, monkeypatch):

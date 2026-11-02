@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import logging
+import sys
 from pathlib import Path
 
 from ..shared.config import load_chain_config
@@ -139,6 +140,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from .operator_legs_cli import COMMANDS as _OPERATOR_LEG_COMMANDS
+
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if raw and raw[0] in _OPERATOR_LEG_COMMANDS:
+        # Owner commands for operator-billed legs: pure work-root file ops,
+        # no env, chain or provider (cascade.trainer.operator_legs_cli).
+        from .operator_legs_cli import main as operator_legs_main
+
+        return operator_legs_main(raw)
     from ..shared.env import load_env_files
     load_env_files()
     args = _build_parser().parse_args(argv)

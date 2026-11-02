@@ -712,6 +712,43 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
             log.warning("funded leg %s: MarketCast fine-tune harvested over ssh (its "
                         "verifier reads a local copy; r2 transport covers Cascade "
                         "checkpoints only)", receipt.miner_hotkey[:12])
+        # 2026-11-02: a full disk must never cost a finished run. The ssh
+        # harvest runs under the disk policy (room check + eviction before
+        # each try, partial copy dropped and retried on a local-disk error,
+        # pod → R2 as the last resort, else the pod is KEPT for the re-attach).
+        from .harvest_guard import guarded_harvest
+        from .runner_common import harvest_job_id
+
+        job_id = harvest_job_id(receipt, suffix)
+        dest = harvest_dir(self.work_root, seeds.base_seed, receipt.miner_hotkey, job_id=job_id)
+        r2_fallback = None
+        if not getattr(receipt, "marketcast", None) and self._r2_fallback_available():
+            from .r2_transfer import harvest_checkpoint_r2
+
+            def r2_fallback():
+                return _mark_harvested(self, host, harvest_checkpoint_r2(
+                    self, host, receipt, contract, seeds, suffix, release=release))
+        return guarded_harvest(
+            self, dest, lambda: self._harvest_funded_checkpoint_ssh(
+                host, receipt, contract, seeds, suffix, release=release),
+            label=f"{receipt.miner_hotkey[:12]}/{job_id[:8]}",
+            pod_id=str(getattr(host, "allocation_id", "") or getattr(host, "name", "")),
+            r2_fallback=r2_fallback)
+
+    def _r2_fallback_available(self) -> bool:
+        """Whether a checkpoint can go pod → R2 directly (the backup store is
+        configured) — the ssh harvest's last resort when our disk fails."""
+        try:
+            from .r2_transfer import ckpt_store
+
+            getattr(self, "_r2_store", None) or ckpt_store(self.cfg)
+            return True
+        except Exception:  # noqa: BLE001 — not configured
+            return False
+
+    def _harvest_funded_checkpoint_ssh(self, host, receipt, contract, seeds,
+                                       suffix: str, *, release=None):
+        """One ssh harvest attempt (see :meth:`_harvest_funded_checkpoint`)."""
         from ..eval.checkpoint_guard import (
             CheckpointDiverged,
             CheckpointTampered,
@@ -737,6 +774,15 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
             self, host, receipt.checkpoint_dir, dest,
             reharvest=lambda: harvest_remote_dir(host, receipt.checkpoint_dir, dest),
             release=release)
+        if verified is None and getattr(self.__dict__.get("_leg_local_obj"),
+                                        "harvest_mismatch", False):
+            # The pod listed its checkpoint and the box copy still differs
+            # after its re-harvest: never declared a success — the pod is
+            # kept and the harvest retried (harvest_guard), never uploaded.
+            from .harvest_guard import HarvestIncomplete
+
+            raise HarvestIncomplete(f"harvested copy of {receipt.checkpoint_dir} differs from "
+                                    "the pod's listing after a re-harvest")
         if getattr(receipt, "marketcast", None):
             # DEC-CA-0064: a Timestral fine-tune, not a Cascade-MoE checkpoint
             from .marketcast_runner import verify_harvested_mkt_checkpoint

@@ -522,8 +522,20 @@ class _OperatorPodMixin:
         # king backup (``name_prefix``) is never held back by it.
         low = disk_guard_refusal(self) if name_prefix is None else ""
         if low:
+            from ..funding.queue import OPERATOR_DISK_CLASS
+
             log.error("operator leg %s: %s", gen.hotkey[:12], low)
-            _skip(low, "no_capacity")
+            _skip(low, OPERATOR_DISK_CLASS)
+        from ..funding.queue import OPERATOR_BLOCKED_CLASS
+        from .money_guard import OperatorBreaker
+
+        breaker = OperatorBreaker.for_runner(self)
+        tripped = breaker.open_record()
+        if tripped:
+            # 2026-11-02: one 402 must pause every operator rent, not re-try
+            # per leg every poll.
+            _skip(f"operator rents paused (circuit breaker: {tripped.get('reason', '')}); "
+                  "requeued, nothing rented, nothing burned", OPERATOR_BLOCKED_CLASS)
         # A king backup (``name_prefix``) may become the era's king pod, which
         # lives for the era: no TTL there (see the king rent).
         ttl = provider_ttl_seconds(self, kind="leg") if name_prefix is None else 0.0
@@ -586,13 +598,22 @@ class _OperatorPodMixin:
                 return host, pod_id
             except ProvisionError as e:
                 bad += 1
+                tripped = breaker.open_record()
+                if tripped:
+                    # A balance refusal (this rent or another) opened the
+                    # breaker: stop now — no retry against an empty account.
+                    _skip(f"operator rents paused (circuit breaker: "
+                          f"{tripped.get('reason', '')}); last: {e}", OPERATOR_BLOCKED_CLASS)
                 now_fn = getattr(self, "_rent_wait_now", None) or time.time
                 if (bad >= self.FUNDED_MAX_STALE_PODS
                         or now_fn() >= self._funded_rent_wait_deadline()):
                     from ..funding.faults import classify_rent_failure
 
+                    # Our account, our pods: anything but a sold-out market is
+                    # an OPERATOR fault — counted and capped, never "infra"
+                    # (which neither backed off nor counted: 2026-11-02 loop).
                     cls = "no_capacity" if classify_rent_failure(str(e)) == "no_capacity" \
-                        else "infra"
+                        else OPERATOR_FAULT_CLASS
                     _skip(f"operator-billed leg: {bad} bad pod(s), last: {e}", cls)
                 log.warning("operator leg %s: rent attempt %d failed (%s); renting again",
                             gen.hotkey[:12], bad, e)
@@ -700,6 +721,13 @@ class _OperatorPodMixin:
                                         burn=False)
             raise
         except Exception as e:  # noqa: BLE001 — classify, record, re-raise
+            from .harvest_guard import keep_cost_line, keeps_pod, local_disk_error
+
+            if (keeps_pod(e) or local_disk_error(e) is not None) and not released:
+                # OUR disk failed with the run complete on this pod: keep it
+                # (ledgered; the requeued leg adopts it by name and harvests).
+                released.append(False)
+                log.error("operator leg %s: %s", gen.hotkey[:12], keep_cost_line(self, pod_id))
             # An OPERATOR pod: the miner controls nothing on it, so only the
             # worker's own rc 3 (their generator) is theirs; anything else is
             # ours and never burns one of their attempts.

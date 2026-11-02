@@ -297,9 +297,60 @@ The trainer rents miner-funded pods on Lium, Shadeform, Vast.ai or Runpod
   narrows the lanes to operator-billed work: make-goods / expired-key entries
   (`operator_billed`) and king legs. A miner-funded leg with no marketplace
   capacity then requeues `no_capacity`, unburned, instead of taking a lane.
-  An operator-billed entry requeued for an operator-side fault retries after
-  `operator_billed_retry_seconds` (default 60; 0 = the legacy doubling
-  backoff) without growing its backoff streak.
+  An operator-billed entry requeued for an operator-side fault backs off from
+  `operator_billed_retry_seconds` (default 60), doubling per consecutive
+  fault up to 30 min (0 = the infra base of 120 s).
+* **Every operator-billed miner leg needs the owner's approval (2026-11-02).**
+  No path bills a miner leg to the operator on its own. This covers an
+  expired payer key, `funded_operator_fallback`, operator lanes,
+  `ops_paid_fallback_after_seconds` and a make-good after our fault. Such a
+  leg parks as `awaiting_operator_approval`. It is unburned, never
+  re-dispatched and never TTL-expired, and it raises one
+  `operator_leg_awaiting_approval` alert. The owner acts per leg:
+
+  ```bash
+  cascade-trainer list-operator-legs                 # pending + paused
+  cascade-trainer approve-operator-leg <hotkey> [--max-cost 120] [--attempt-id ID]
+  cascade-trainer deny-operator-leg <hotkey>
+  cascade-trainer resume-operator-leg <hotkey>       # a paused entry, cause fixed
+  ```
+
+  Run these from the deployment directory (`--work-root` defaults to
+  `./_train_work`). An approval is single-use: exactly one dispatch consumes
+  it, and a retry after a later failure needs a new one. A denial sends the
+  leg back to the miner's own key. A leg with no key fails unburned, with the
+  reason "re-fund needed". A miner-funded leg with a working key leaves its
+  market wait for operator capacity only when an approval is already on
+  file. Otherwise it is never parked and keeps waiting on its own key. The
+  king is not gated.
+* **Operator-fault cap.** Every operator-side fault (`error_class
+  "operator"`) counts, and the count does not reset in between. After
+  `[round] operator_fault_cap` (default 3) the entry is `paused`. It is not
+  failed and not burned, and it raises one `entry_paused` alert. Resume it
+  with `resume-operator-leg`.
+* **Money gates before any rent.** These run before every rent:
+  * A disk reservation. Free space on the harvest filesystem must be at least
+    `expected_checkpoint_gb` (15) × (legs holding a pod + 1) +
+    `min_free_disk_gb`, measured after eviction.
+  * For an approved operator rent:
+    * the breaker is closed;
+    * the projected cost is within `ops_operator_leg_cap_usd` and the daily
+      cap (`operator_daily_spend_cap_usd`, default 200, UTC day);
+    * the operator Lium balance is at least projected cost ×
+      `operator_cost_safety_factor` (1.25) + `operator_balance_reserve_usd`
+      (50, which keeps the validator's eval pods alive). An unknown balance
+      refuses the rent.
+  * An optional payer-balance check (`payer_projected_rate_per_hour`,
+    0 = off).
+
+  A blocked leg requeues unburned as `operator_disk` / `operator_blocked`.
+  It backs off and is not counted against the entry. One alert is raised
+  per block.
+* **Operator-account circuit breaker.** A 402 / BALANCE_REQUIRED on any
+  operator rent, or a balance-gate shortfall, opens
+  `_train_work/operator_breaker.json`. While it is open, no operator rent of
+  any kind runs (king backups included) for `operator_breaker_cooldown_seconds`
+  (3600). It raises one `operator_breaker_open` alert.
 
 **The carried king's first v2 training.** The identity carried from v1 is
 its hotkey/generator, not a Toto2 checkpoint relabelled as a v2 model. Its
@@ -593,11 +644,50 @@ policy below is configured, the retrain runs there (B/C keep their role, base
 and recipe/selection). Otherwise the flag is cleared and the leg rents a new pod
 on the payer's key; a pod whose release is unconfirmed still blocks that rent.
 After `OPERATOR_FAULT_RETRIES` (3) losses the entry pauses with an `operator`
-failure instead of billing the miner again; fix the cause, then (with the
+failure instead of billing the miner again. Fix the cause, then (with the
 trainer stopped) remove `operator_faults` from that queue entry to resume it.
+That is separate from the `operator_fault_cap` pause above, which
+`resume-operator-leg` clears.
 The flag is a recovery billing restriction,
 not a refund of already consumed GPU time. No-capacity failures before an
 allocation remain ordinary retries without an attempt burn.
+
+### Disk space and harvest safety (2026-11-02)
+
+The checkpoint volume once filled to 100%. The validator eval cache held
+401 GB of never-evicted checkpoints, and every finished leg then failed its
+harvest with ENOSPC. Those failures burned miner attempts, and the pods were
+torn down before anything was saved. Now:
+
+* **One space manager** (`cascade/shared/disk_space.py`) covers the validator
+  eval cache, `_bench_ckpts`, `_funded_ckpt_guard`, settled `_funded_harvest`
+  copies and `_funded_harvest.box-*` leftovers. Each source has a byte budget
+  and each filesystem a free-space floor. Reclaimable items go oldest-first.
+  These are never evicted:
+  * a checkpoint referenced by the validator state, `cascade_state.json` or
+    `warm_start_init.json` (the king included);
+  * the manifest being settled (`<cache>/.pinned.json`);
+  * a harvest whose push is not confirmed (`*.pending.json`) or that is being
+    written;
+  * anything touched within the grace.
+
+  When the protection state is unreadable, nothing is evicted. Knobs:
+  `[validator] eval_ckpt_cache_dir` (`_eval_ckpts`),
+  `eval_ckpt_cache_max_gb` (120), `eval_ckpt_cache_min_free_gb` (60) and
+  `eval_ckpt_cache_grace_seconds` (3600).
+* **Harvest saves are atomic.** A harvest is extracted into a `.partial-*`
+  sibling, fsynced, then renamed into place. A partial copy never looks
+  complete. The pod's sha256 listing must match before the pod is released.
+  A copy that still differs after its re-harvest is retried, never uploaded.
+* **A local-disk error is our fault.** ENOSPC, EDQUOT, EROFS, EIO or EFBIG
+  anywhere in a leg is classed `operator` and never burns a miner attempt.
+  The partial copy is dropped, space is reclaimed, and the harvest is retried
+  `harvest_disk_retries` (3) times with doubling waits from
+  `harvest_disk_retry_seconds` (60). If R2 is configured, the last resort is
+  pod → R2 directly. Otherwise the pod is **kept**: its ledger row stays, the
+  requeued leg re-attaches and harvests it, and the cost of every keep is
+  logged. A pod that has run training is torn down only after a verified
+  harvest or when the run is proven failed.
 
 ### Outage protection, alerts and capped recovery
 

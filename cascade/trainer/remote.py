@@ -27,6 +27,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import os
 import re
 import secrets
 import shlex
@@ -1496,13 +1497,15 @@ def harvest_remote_dir(host: RemoteHost, remote_dir: str, dest: Path | str,
     ``stall_timeout`` seconds without a single byte. A watchdog thread kills
     ssh on either breach, and the harvest raises :class:`RemoteDispatchError`."""
     import shutil
-    import tarfile
     import threading
 
     dest = Path(dest)
     if dest.exists():
         shutil.rmtree(dest)
-    dest.mkdir(parents=True)
+    if runner is not None:
+        dest.mkdir(parents=True)
+    else:
+        dest.parent.mkdir(parents=True, exist_ok=True)
     # The worker runs under ``cd host.workdir`` (see build_remote_command), so a
     # ``--local-only`` receipt's checkpoint dir is relative to THAT — but this is
     # a fresh ssh session whose cwd is the login home. Resolve the harvest in the
@@ -1518,6 +1521,57 @@ def harvest_remote_dir(host: RemoteHost, remote_dir: str, dest: Path | str,
                 f"checkpoint harvest from {host.name}:{remote_dir} failed "
                 f"(rc={proc.returncode})", returncode=proc.returncode)
         return dest
+    # Saved robustly (2026-11-02): extracted into a sibling ``.partial-*``
+    # dir, fsynced, then renamed onto ``dest`` — a half-written checkpoint
+    # never looks complete, and any failure (ENOSPC mid-write included)
+    # removes the partial copy instead of leaving it to fill the disk.
+    work = dest.with_name(f"{dest.name}.partial-{os.getpid()}-{threading.get_ident()}")
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True)
+    try:
+        _harvest_stream_into(host, remote_dir, argv, work, timeout=timeout,
+                             stall_timeout=stall_timeout, max_bytes=max_bytes)
+        _fsync_tree(work)
+        os.replace(work, dest)
+        _fsync_dir(dest.parent)
+    except BaseException:
+        shutil.rmtree(work, ignore_errors=True)
+        raise
+    return dest
+
+
+def _fsync_dir(path: Path) -> None:
+    with contextlib.suppress(OSError):
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
+def _fsync_tree(root: Path) -> None:
+    """fsync every regular file and directory under ``root`` (durable before
+    the rename publishes it)."""
+    for dirpath, _dirs, files in os.walk(root):
+        for name in files:
+            p = Path(dirpath) / name
+            if p.is_symlink() or not p.is_file():
+                continue
+            fd = os.open(p, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        _fsync_dir(Path(dirpath))
+
+
+def _harvest_stream_into(host, remote_dir: str, argv: list[str], dest: Path, *,
+                         timeout: int, stall_timeout: float, max_bytes: int | None) -> None:
+    """The tar-over-ssh stream of :func:`harvest_remote_dir`, extracted into
+    ``dest`` under the ``"data"`` filter and both deadlines."""
+    import tarfile
+    import threading
+
     ssh = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     stream = _ProgressReader(ssh.stdout)
     started = time.monotonic()
@@ -1604,7 +1658,6 @@ def harvest_remote_dir(host: RemoteHost, remote_dir: str, dest: Path | str,
             f"checkpoint harvest from {host.name}:{remote_dir} failed "
             f"(ssh rc={ssh_rc}): {err!r}", returncode=ssh_rc)
     ssh.stderr.close()
-    return dest
 
 
 # The pod-side hash of a whole checkpoint dir (~14.5 GB: weights,
