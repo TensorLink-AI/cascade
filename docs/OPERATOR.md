@@ -1957,6 +1957,67 @@ upload shards and the index last. Size CPU disk for the whole corpus:
 Compression savings depend on the generator; allow for poorly compressible
 data. Provisioning, hashing and uploading are outside the 90-minute window.
 
+#### Shard download retries and the pod-side prefetch
+
+A GPU worker that streams its corpus retries each shard fetch: a transport
+error, a short body (fewer bytes than `Content-Length`) or a sha256 mismatch
+is retried up to 5 tries with exponential backoff and jitter (2 s doubling,
+capped at 60 s). The partial file is deleted between tries. This shard loop
+is the only retry layer; `transfer.get_file` runs once per try. A 401/403 on
+a link past its signed expiry raises `ShardLinkExpired` straight away,
+because retrying a dead link cannot work. The orchestrator has to re-sign it.
+A retry fetches the same object and only verified bytes are read, so the
+series that train and their order do not change. These retries ship with
+the next worker image. Images up to rc15 still fail on the first bad
+download (2026-11-02: `c4-00030.parquet fails its sha256` at step
+7650/23841 on an 8xH200).
+
+`[round] funded_prefetch_shards = true` (the default) covers older images.
+When a shards leg has `urls.json`, the dispatcher pushes `prefetch.sh` and
+`prefetch.tsv` next to the corpus and starts the prefetch in its own session
+beside the worker. The prefetch does not delay the launch. It downloads every
+shard in the order the reader consumes them, 8 at a time, using `curl` with
+timeouts and 5 tries each. Links reach curl on stdin and are never logged.
+Each shard is checked against `corpus.json` and written to a hidden temp
+file, then renamed into place. The reader opens only `<name>` and reads a
+shard that is already on disk instead of downloading it, so it never sees a
+partial file. The prefetch is killed when the worker exits, and it stops by
+itself once the leg's shell is gone. A reattach never starts it again.
+Its log lines go to the leg's stderr with the prefix `cascade-prefetch:`.
+
+The prefetch never fails a leg. It skips with a WARNING when free disk is
+below `stored_bytes` + 10% + 20 GiB at start. Before every download it
+checks free disk again and stops once less than 20 GiB is free, because
+other lanes on a multi-lane pod share the volume. When a shard never
+verifies, it gives up on that shard with a WARNING and the worker fetches
+that shard itself, as before. On an expired link it stops. The prefetch
+records its pid in the leg's run dir, so a detached timeout or cancel kills
+it along with the worker. A fresh launch first kills any leftover prefetch
+of the same corpus.
+
+A worker that still dies fetching shards is classed as an operator fault:
+it is requeued and does not burn the miner's attempt. This applies only to
+shards legs, where no miner code runs on the pod. It also applies only when
+the failure's final traceback exception is the shard error itself. On a
+streaming leg the generator could print the same text, so there the exit
+stays `infra`. The dispatcher parses that exception line from the worker's
+stderr itself. A traceback marker printed into the log tail is never trusted.
+The corpus is reused across retries, so a stored object that is persistently
+bad would fail every retry. To bound that, a corpus (hotkey, seed, ref) gets
+at most 2 unburned shard faults per trainer process. After that the leg is
+classed `infra` and burns an attempt, as before. Check the stored object
+when the log shows `shard fetch failure #3`.
+
+A detached kill (timeout or cancel) kills the leg's whole session. The
+guarded worker runs in its own process group inside that session, so a
+group kill would miss it. The kill also checks `/proc/<pid>/cmdline` for
+each recorded pid first, so a pid the kernel has reused for another process
+is never signalled.
+
+For scale, a 50B-point `float32_bss` corpus is about
+46.5 GB in about 3,000 shards of roughly 15.5 MB each, so the check needs
+about 72 GB free. Set the knob to `false` to go back to streaming only.
+
 Mainnet explicitly selects `float32_bss`: schema 3 stores typed float32 lists
 with Parquet byte-stream split and Zstandard. It preserves the exact stored
 float32 values, optional group labels and logical corpus digest; file hashes

@@ -527,6 +527,7 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
             detached_dispatch=bool(r.get("detached_dispatch", True)),
             dispatch_poll_seconds=max(5, int(r.get("dispatch_poll_seconds", 30))),
             dispatch_reattach_grace_seconds=max(0, int(r.get("dispatch_reattach_grace_seconds", 900))),
+            funded_prefetch_shards=bool(r.get("funded_prefetch_shards", True)),
             funded_operator_fallback=bool(r.get("funded_operator_fallback", False)),
             funded_operator_fallback_fresh_window_seconds=max(
                 0, int(r.get("funded_operator_fallback_fresh_window_seconds", 3600))),
