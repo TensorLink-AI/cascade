@@ -2000,7 +2000,21 @@ it is requeued and does not burn the miner's attempt. This applies only to
 shards legs, where no miner code runs on the pod. It also applies only when
 the failure's final traceback exception is the shard error itself. On a
 streaming leg the generator could print the same text, so there the exit
-stays `infra`. For scale, a 50B-point `float32_bss` corpus is about
+stays `infra`. The dispatcher parses that exception line from the worker's
+stderr itself. A traceback marker printed into the log tail is never trusted.
+The corpus is reused across retries, so a stored object that is persistently
+bad would fail every retry. To bound that, a corpus (hotkey, seed, ref) gets
+at most 2 unburned shard faults per trainer process. After that the leg is
+classed `infra` and burns an attempt, as before. Check the stored object
+when the log shows `shard fetch failure #3`.
+
+A detached kill (timeout or cancel) kills the leg's whole session. The
+guarded worker runs in its own process group inside that session, so a
+group kill would miss it. The kill also checks `/proc/<pid>/cmdline` for
+each recorded pid first, so a pid the kernel has reused for another process
+is never signalled.
+
+For scale, a 50B-point `float32_bss` corpus is about
 46.5 GB in about 3,000 shards of roughly 15.5 MB each, so the check needs
 about 72 GB free. Set the knob to `false` to go back to streaming only.
 
