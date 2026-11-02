@@ -126,6 +126,18 @@ HARVEST_UPLOAD_ATTEMPTS = 4
 HARVEST_UPLOAD_BACKOFF_SECONDS = 60.0
 
 
+def _r2_fallback_available(runner) -> bool:
+    """Whether a checkpoint can go pod → R2 directly (the backup store is
+    configured) — the ssh harvest's last resort when our disk fails."""
+    try:
+        from .r2_transfer import ckpt_store
+
+        getattr(runner, "_r2_store", None) or ckpt_store(runner.cfg)
+        return True
+    except Exception:  # noqa: BLE001 — not configured
+        return False
+
+
 def _mark_harvested(runner, host, entry):
     """After a verified harvest + upload: record WHEN this pod endpoint was
     harvested (orchestrator-side, persisted), so the pod sweep knows a
@@ -722,29 +734,18 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
         job_id = harvest_job_id(receipt, suffix)
         dest = harvest_dir(self.work_root, seeds.base_seed, receipt.miner_hotkey, job_id=job_id)
         r2_fallback = None
-        if not getattr(receipt, "marketcast", None) and self._r2_fallback_available():
+        if not getattr(receipt, "marketcast", None) and _r2_fallback_available(self):
             from .r2_transfer import harvest_checkpoint_r2
 
             def r2_fallback():
                 return _mark_harvested(self, host, harvest_checkpoint_r2(
                     self, host, receipt, contract, seeds, suffix, release=release))
         return guarded_harvest(
-            self, dest, lambda: self._harvest_funded_checkpoint_ssh(
-                host, receipt, contract, seeds, suffix, release=release),
+            self, dest, lambda: TrainerRunner._harvest_funded_checkpoint_ssh(
+                self, host, receipt, contract, seeds, suffix, release=release),
             label=f"{receipt.miner_hotkey[:12]}/{job_id[:8]}",
             pod_id=str(getattr(host, "allocation_id", "") or getattr(host, "name", "")),
             r2_fallback=r2_fallback)
-
-    def _r2_fallback_available(self) -> bool:
-        """Whether a checkpoint can go pod → R2 directly (the backup store is
-        configured) — the ssh harvest's last resort when our disk fails."""
-        try:
-            from .r2_transfer import ckpt_store
-
-            getattr(self, "_r2_store", None) or ckpt_store(self.cfg)
-            return True
-        except Exception:  # noqa: BLE001 — not configured
-            return False
 
     def _harvest_funded_checkpoint_ssh(self, host, receipt, contract, seeds,
                                        suffix: str, *, release=None):

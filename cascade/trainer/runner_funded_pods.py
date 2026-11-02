@@ -921,7 +921,8 @@ class _FundedPodMixin:
         if api_key and vault.refresh(gen.hotkey):
             log.info("final challenger %s: payer key TTL re-stamped for the leg",
                      gen.hotkey)
-        if api_key and not prior_alloc:
+        if (api_key and not prior_alloc
+                and float(getattr(rnd, "payer_projected_rate_per_hour", 0.0) or 0.0) > 0):
             # A key that cannot pay for the whole leg never starts it: the
             # miner would pay for a pod that dies mid-run (no attempt charged).
             from .money_guard import payer_balance_refusal

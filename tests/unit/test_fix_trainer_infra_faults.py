@@ -39,8 +39,8 @@ class _FakeDisp:
 
 # ── the queue: operator faults back off, never burn ─────────────────────────
 
-def _queue(tmp_path, t):
-    q = FundedQueue(tmp_path / "q.json", clock=lambda: t[0])
+def _queue(tmp_path, t, **kw):
+    q = FundedQueue(tmp_path / "q.json", clock=lambda: t[0], **kw)
     q.add("hk", "r@1", 10)
     assert q.mark_in_flight("hk", "r@1", target_boundary=1, era_index=1, started_block=1)
     return q
@@ -48,7 +48,9 @@ def _queue(tmp_path, t):
 
 def test_operator_requeue_backs_off_and_never_burns(tmp_path):
     t = [1000.0]
-    q = _queue(tmp_path, t)
+    # the backoff alone (the operator-fault cap pauses at 3 by default —
+    # tests/unit/test_money_safety.py)
+    q = _queue(tmp_path, t, operator_fault_cap=0)
     assert q.requeue("hk", error="upload failed", error_class=OPERATOR_FAULT_CLASS,
                      burn_attempt=False)
     e = q.get("hk")
