@@ -61,7 +61,7 @@ def _names(idx):
 
 
 def _urls(idx, base="https://s3.example/b/k/"):
-    return {n: f"{base}{n}?X-Amz-Date=20261102T000000Z&X-Amz-Expires=86400&X-Amz-Signature=sig"
+    return {n: f"{base}{n}?X-Amz-Date=20261102T000000Z&X-Amz-Expires=86400&X-Amz-Signature=SIGTOKEN0"
             for n in _names(idx)}
 
 
@@ -102,7 +102,7 @@ def test_prefetch_files_need_a_remote_corpus_and_its_stored_bytes(tmp_path):
                            "/w/_corpus/t")
     assert set(files) == {PREFETCH_LIST_NAME, PREFETCH_SCRIPT_NAME}
     script = files[PREFETCH_SCRIPT_NAME]
-    assert "https://" not in script and "sig" not in script, "links live only in the list"
+    assert "https://" not in script and "SIGTOKEN0" not in script, "links live only in the list"
     assert f"need_kb={(prefetch_need_bytes(12345) + 1023) // 1024}" in script
     assert prefetch_need_bytes(10**10) == 11 * 10**9 + 20 * 1024 ** 3
 
@@ -194,7 +194,7 @@ def test_prefetch_lands_every_shard_verified_and_the_reader_never_downloads(tmp_
     assert p.returncode == 0, p.stderr
     assert f"{victim}: try 1/5 failed" in p.stderr and hits[victim] == 2
     assert "0 not prefetched" in p.stderr
-    assert "127.0.0.1" not in p.stderr and "sig" not in p.stderr, "links are never logged"
+    assert "127.0.0.1" not in p.stderr and "SIGTOKEN0" not in p.stderr, "links are never logged"
     for c in idx["children"]:
         for sh in c["shards"]:
             assert S.file_sha256(pod / sh["name"]) == sh["sha256"]
