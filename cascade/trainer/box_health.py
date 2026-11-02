@@ -44,6 +44,9 @@ log = logging.getLogger("cascade.trainer.box_health")
 BOX_HEALTH_FILE = "box_health.json"
 LOCAL_DISK, HARVEST, STORAGE = "local_disk", "harvest", "storage"
 CHECK_EVERY_SECONDS = 30.0
+# In-process latch (review N3): a halt this process set holds even when its
+# own state write failed (a full disk can refuse box_health.json itself).
+_LATCH: dict[str, dict] = {}
 
 
 def our_side_fault_class(exc: BaseException | None) -> str | None:
@@ -60,9 +63,10 @@ def our_side_fault_class(exc: BaseException | None) -> str | None:
     e: BaseException | None = exc
     while e is not None and id(e) not in seen:
         seen.add(id(e))
-        if isinstance(e, HarvestDiskFault):
-            return LOCAL_DISK
-        if isinstance(e, HarvestKeepPod):
+        # A HarvestDiskFault without a real disk error in its chain is a room
+        # shortfall (legs legitimately holding space): a harvest-class fault,
+        # never a LOCAL_DISK halt that would hold the king (review N2).
+        if isinstance(e, (HarvestDiskFault, HarvestKeepPod)):
             return HARVEST
         if isinstance(e, (StorageFault, StorageError)):
             return STORAGE
@@ -124,7 +128,7 @@ class BoxHealth:
             return doc
 
     def halt(self) -> dict | None:
-        return self.state().get("halt")
+        return self.state().get("halt") or _LATCH.get(str(self.path))
 
     def record(self, cls: str, hotkey: str, detail: str) -> dict | None:
         """Record one our-side fault; returns the halt when it is (now) set."""
@@ -141,6 +145,8 @@ class BoxHealth:
                     "reason": (f"{cls} fault on {hotkey[:12]}: {detail[:200]}" if cls == LOCAL_DISK
                                else f"{cls} faults on {len(legs)} legs within "
                                     f"{self.window_seconds / 3600:.1f} h")}
+            if new is not None:
+                _LATCH[str(self.path)] = new
             self._save(doc)
             halt = doc.get("halt")
         if new is not None:
@@ -153,7 +159,8 @@ class BoxHealth:
 
     def clear(self, by: str) -> bool:
         with self._locked() as doc:
-            was = doc.get("halt")
+            was = doc.get("halt") or _LATCH.pop(str(self.path), None)
+            _LATCH.pop(str(self.path), None)
             if was is None:
                 return False
             doc["halt"] = None
@@ -219,34 +226,56 @@ def harvest_canary(runner) -> str:
         return f"harvest-dir canary failed: {e}"
 
 
-def _legs_waiting_or_running(runner) -> int:
-    from .runner_common import funded_queue_of
+def storage_probe(runner) -> str:
+    """"" when OUR storage takes a write: put + get + delete of a small canary
+    key on the manifest store (the clear condition of a harvest/storage halt —
+    a disk check says nothing about them; review N3)."""
+    import uuid
 
-    n = 0
-    for lane in ("a", "b", "c"):
-        try:
-            q = funded_queue_of(runner, lane=lane)
-            if q is not None:
-                n += sum(1 for e in q.entries() if e.status in ("queued", "in_flight"))
-        except Exception:  # noqa: BLE001 — a lane without a queue
-            continue
-    return n
+    probe = getattr(runner, "_storage_probe", None)
+    if callable(probe):
+        return str(probe() or "")
+    store_fn = getattr(runner, "manifest_store", None)
+    if not callable(store_fn):
+        return "no storage probe available — clear with `cascade-trainer resume-rents`"
+    key = f"health/box-canary-{uuid.uuid4().hex[:12]}"
+    try:
+        store = store_fn()
+        store.put_bytes(key, b"cascade box-health storage canary\n")
+        if store.get_bytes(key) != b"cascade box-health storage canary\n":
+            return "storage canary read back different bytes"
+        delete = getattr(store, "delete", None)
+        if callable(delete):
+            with contextlib.suppress(Exception):
+                delete(key)
+        return ""
+    except Exception as e:  # noqa: BLE001 — any failure keeps the halt
+        return f"storage canary failed: {str(e)[:200]}"
 
 
-def health_check(runner) -> str:
-    """"" when the box is healthy enough to resume rents: the canary passes
-    and free space holds every queued + in-flight leg's checkpoint plus the
-    ``min_free_disk_gb`` reserve (after reclaimable data was evicted)."""
+def health_check(runner, cls: str = LOCAL_DISK) -> str:
+    """"" when the box is healthy enough to resume rents. A disk halt needs the
+    canary AND free space for every live leg holding a pod plus one more, on
+    top of the ``min_free_disk_gb`` reserve (the same sizing as the pre-rent
+    reservation; review N2). A harvest/storage halt needs the storage probe."""
     from ..shared.disk_space import GIB
-    from .runner_common import HARVEST_DIRNAME, _free_under, r2_transport_on, reclaim_box_space
+    from .runner_common import (
+        HARVEST_DIRNAME,
+        _free_under,
+        _legs_holding_pods,
+        r2_transport_on,
+        reclaim_box_space,
+    )
 
+    if cls in (HARVEST, STORAGE):
+        return storage_probe(runner)
     why = harvest_canary(runner)
     if why:
         return why
     rnd = runner.cfg.round
     per = 0.0 if r2_transport_on(runner.cfg) else float(
         getattr(rnd, "expected_checkpoint_gb", 0.0) or 0.0)
-    need = int(per * GIB) * max(1, _legs_waiting_or_running(runner))
+    need = int(per * GIB) * (_legs_holding_pods(runner) + 1)
     floor = int(float(getattr(rnd, "min_free_disk_gb", 0.0) or 0.0) * GIB)
     target = Path(runner.work_root) / HARVEST_DIRNAME
     try:
@@ -258,8 +287,8 @@ def health_check(runner) -> str:
     except OSError as e:
         return f"free space unreadable: {e}"
     if free < need + floor:
-        return (f"{free / GIB:.1f} GiB free < {(need + floor) / GIB:.1f} GiB for every queued "
-                "and in-flight leg's checkpoint plus the reserve")
+        return (f"{free / GIB:.1f} GiB free < {(need + floor) / GIB:.1f} GiB for every live "
+                "leg's checkpoint plus one more and the reserve")
     return ""
 
 
@@ -276,7 +305,7 @@ def rent_halt_refusal(runner, *, king: bool = False) -> str:
     last = runner.__dict__.get("_box_health_checked")
     now = time.monotonic()
     if last is None or now - last[0] >= CHECK_EVERY_SECONDS:
-        why = health_check(runner)
+        why = health_check(runner, h.get("cls", LOCAL_DISK))
         runner.__dict__["_box_health_checked"] = (now, why)
     else:
         why = last[1]

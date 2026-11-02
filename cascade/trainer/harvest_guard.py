@@ -137,7 +137,6 @@ def guarded_harvest(runner, dest: Path | str, attempt: Callable[[], object], *,
     from a MINER-controlled pod's own listing twice is tamper — the payer can
     reach their pod — never a free operator-side retry (review F7)."""
     from .box_health import LOCAL_DISK, BoxHealth
-    from .faults import _FundedTamper
     from .money_guard import alert, clear_alert
 
     dest = Path(dest)
@@ -161,13 +160,10 @@ def guarded_harvest(runner, dest: Path | str, attempt: Callable[[], object], *,
             if short:
                 last = HarvestDiskFault(f"{short / 1e9:.1f} GB short of room for the checkpoint "
                                         "after evicting everything reclaimable")
+                # a room shortfall is not a disk error: alert, no halt (N2)
                 alert(runner, "harvest_disk", label[:16],
                       f"harvest of {label} blocked: {short / 1e9:.1f} GB short on {dest.parent}",
                       severity="critical")
-                if not halted:
-                    BoxHealth.for_runner(runner).record(LOCAL_DISK, hotkey or label,
-                                                        str(last))
-                    halted = True
             else:
                 try:
                     result = attempt()
@@ -179,8 +175,7 @@ def guarded_harvest(runner, dest: Path | str, attempt: Callable[[], object], *,
                     last = e
                     mismatches += 1
                     if payer and mismatches >= 2:
-                        raise _FundedTamper(f"checkpoint: the payer pod's checkpoint differs from "
-                                            f"its own listing after re-harvests ({e})") from e
+                        raise _unverifiable(runner, dest, label, e, hotkey) from e
                 except Exception as e:
                     err = local_disk_error(e)
                     if err is None:
@@ -212,6 +207,8 @@ def guarded_harvest(runner, dest: Path | str, attempt: Callable[[], object], *,
                             "pod → R2 directly (the pod-side safety net)", label)
                 result = r2_fallback()
                 clear_alert(runner, "harvest_disk", label[:16])
+                if hotkey:                      # harvested: no stale lost-run record (N5)
+                    BoxHealth.for_runner(runner).forget_leg(hotkey)
                 return result
             except Exception as e:  # noqa: BLE001 — fall through: keep the pod
                 from .faults import _FundedDiverged, _FundedTamper
@@ -225,6 +222,33 @@ def guarded_harvest(runner, dest: Path | str, attempt: Callable[[], object], *,
             f"({last}); the pod is KEPT for the re-attach — nothing burned") from last
     finally:
         active.discard(key)
+
+
+def _unverifiable(runner, dest: Path, label: str, exc: BaseException, hotkey: str):
+    """Keep the evidence of a persistent payer-pod mismatch (the box copy and
+    both manifests) and return the terminal, UNBURNED verdict (review F7)."""
+    import json
+
+    from .faults import CheckpointUnverifiable
+    from .money_guard import alert
+
+    loc = runner.__dict__.get("_leg_local_obj")
+    ev = getattr(loc, "harvest_mismatch_evidence", None) or {}
+    proof = dest.with_name(dest.name + ".unverifiable.json")
+    try:
+        proof.write_text(json.dumps({
+            "hotkey": hotkey, "label": label, "box_copy": str(dest), "at": time.time(),
+            "pod_manifest": ev.get("pod"), "box_manifest": ev.get("box"),
+            "mismatches": ev.get("mismatches")}, default=list, indent=1), encoding="utf-8")
+    except OSError as e:
+        log.error("harvest of %s: could not write the mismatch evidence (%s)", label, e)
+    alert(runner, "checkpoint_unverifiable", (hotkey or label)[:16],
+          f"payer pod checkpoint of {label} differs from the pod's own listing after a retry — "
+          f"failed UNBURNED; evidence kept: {dest} and {proof} (any burn is the owner's call)",
+          severity="critical")
+    log.critical("harvest of %s: checkpoint UNVERIFIABLE (%s) — evidence kept at %s and %s; "
+                 "terminal, nothing burned", label, str(exc)[:200], dest, proof)
+    return CheckpointUnverifiable(f"checkpoint unverifiable after a retry: {exc}")
 
 
 def handle_our_side_fault(runner, gen, exc: BaseException, *, pod_id: str, payer: bool,

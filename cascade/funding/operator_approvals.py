@@ -123,9 +123,13 @@ class OperatorApprovals:
         state = r.get("state")
         if state == LAUNCHED:
             return "approved" if r.get("launched_attempt_id") == attempt_id else "none"
+        if not _kind_ok(r, kind):
+            # a decision about ANOTHER kind of leg (a leftover make-good
+            # denial) never decides this one (review F9)
+            return "none"
         if state == DENIED:
             return "denied"
-        if state != APPROVED or not _kind_ok(r, kind):
+        if state != APPROVED:
             return "none"
         ceiling = r.get("max_cost_usd")
         if ceiling is not None and float(projected_cost_usd) > float(ceiling):
@@ -153,8 +157,9 @@ class OperatorApprovals:
             k = _key(queue_name, hotkey)
             prev = recs.get(k) or {}
             now = self.clock()
-            if prev.get("state") in (APPROVED, DENIED) and _bound(prev, ref=ref,
-                                                                  funded_at=funded_at):
+            if (prev.get("state") in (APPROVED, DENIED) and _bound(prev, ref=ref,
+                                                                   funded_at=funded_at)
+                    and _kind_ok(prev, kind)):
                 return False
             fresh = not (prev.get("state") == PENDING and _bound(prev, ref=ref,
                                                                  funded_at=funded_at)

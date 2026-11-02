@@ -13,6 +13,7 @@ from .corpus import DIVERGED_MARKER
 from .faults import (
     KEY_LOST_REASON,
     STALL_CLASS,
+    CheckpointUnverifiable,
     _FundedDiverged,
     _FundedKeyLost,
     _FundedTamper,
@@ -472,6 +473,12 @@ class _FundedLegMixin:
                 "the pod cannot be re-identified or stopped from here; "
                 "re-fund to supply a fresh key",
                 miner_fault=True, error_class="auth", burn=False)
+            raise
+        except CheckpointUnverifiable as e:
+            # Terminal but UNBURNED (review F7): evidence kept, owner decides.
+            self._record_funded_failure(gen.hotkey, f"checkpoint: {e}", miner_fault=True,
+                                        error_class=CheckpointUnverifiable.error_class,
+                                        burn=False)
             raise
         except _OperatorFault as e:
             # Our side (or the provider's) failed; the miner's pod and run

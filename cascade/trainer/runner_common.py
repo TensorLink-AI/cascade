@@ -366,6 +366,25 @@ def reclaim_box_space(runner, target: Path | str, *, need_bytes: int = 0,
         return None
 
 
+def probe_pod_live(live, pod_id: str, *, tries: int = 3, sleep=None,
+                   delay: float = 5.0):
+    """``(address | None, definitive)``: ask ``live(pod_id)``; a probe that
+    ERRORS (a provider blip) is retried up to ``tries`` times and never reads
+    as "gone" (review F1 residual). A clean "not live" answer is definitive."""
+    sleep = sleep or time.sleep
+    for i in range(max(1, tries)):
+        try:
+            addr = live(pod_id)
+        except Exception as e:  # noqa: BLE001 — a blip: retried, never "gone"
+            log.warning("pod liveness probe of %s failed (%s) — try %d/%d", pod_id,
+                        str(e)[:120], i + 1, tries)
+            if i + 1 < tries:
+                sleep(delay)
+            continue
+        return addr, True
+    return None, False
+
+
 def _leg_hotkey(runner) -> str | None:
     """The hotkey of the leg this thread is running (its progress binding)."""
     binding = getattr(runner.__dict__.get("_leg_local_obj"), "funded_progress", None)
@@ -408,7 +427,8 @@ def disk_guard_refusal(runner) -> str:
     In order (2026-11-02):
 
     1. the box-health halt (:mod:`cascade.trainer.box_health`) — an our-side
-       fault halts EVERY new rent until the health check passes;
+       fault halts EVERY new rent until its clear condition passes (an
+       own-key king leg: only a disk halt);
     2. the pre-rent canary — write + fsync + rename + delete in the harvest
        dir; a failure trips the halt;
     3. the disk reservation — free space on the harvest filesystem must hold
@@ -416,7 +436,7 @@ def disk_guard_refusal(runner) -> str:
        (``[round] expected_checkpoint_gb`` each; 0 with the r2 transport) on
        top of ``[round] min_free_disk_gb`` (GiB; 0 = the reservation off),
        measured AFTER the space manager evicted whatever is reclaimable; a
-       shortfall trips the halt too.
+       shortfall refuses this rent only (no halt).
 
     Only for fresh rents: a re-attached or adopted pod is a live leg and
     always keeps going. An unmeasurable disk never blocks a rent."""
@@ -426,7 +446,9 @@ def disk_guard_refusal(runner) -> str:
 
     if getattr(runner, "work_root", None) is None:
         return ""                                   # no box state to judge (a bare test double)
-    halted = rent_halt_refusal(runner)
+    # an own-key KING leg is held only by a real disk halt (review N4)
+    king = bool(getattr(runner.__dict__.get("_leg_local_obj"), "funded_is_king", False))
+    halted = rent_halt_refusal(runner, king=king)
     if halted:
         return f"operator disk: {halted} — no new pod rented (requeued, never burned)"
     who = _leg_hotkey(runner) or "box"
@@ -462,8 +484,10 @@ def disk_guard_refusal(runner) -> str:
            f"< {need / GIB:.0f} GiB for {holding + 1} checkpoint(s) of {per:g} GB + [round] "
            f"min_free_disk_gb={gb:g} (after evicting reclaimable data) — no new pod rented "
            "(requeued, never burned)")
-    alert(runner, "operator_disk", "box", msg, severity="critical")
-    BoxHealth.for_runner(runner).record(LOCAL_DISK, who, msg)
+    # A shortfall refuses THIS rent only (legs may legitimately hold the
+    # space) — never a halt: only a real disk error or a failed canary
+    # trips the box-health breaker (review N2).
+    alert(runner, "operator_disk", "box", msg)
     return msg
 
 

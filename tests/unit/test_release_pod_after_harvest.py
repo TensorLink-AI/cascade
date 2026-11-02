@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -116,25 +117,30 @@ def test_hash_mismatch_reharvests_once_then_releases(tmp_path, monkeypatch):
     {k: v for k, v in FILES.items() if k != "optimizer.pt"},         # file missing
     dict(FILES, **{"optimizer.pt": b"O" * 3}),                       # truncated
 ])
-def test_persistent_mismatch_on_a_payer_pod_is_tamper_after_one_retry(tmp_path, monkeypatch,
-                                                                     copy):
+def test_persistent_mismatch_on_a_payer_pod_is_unverifiable_never_burned(tmp_path, monkeypatch,
+                                                                         copy):
     """A copy that still differs from the pod's own listing is NEVER uploaded.
-    The payer can reach their own pod, so a mismatch that persists after one
-    retry is a tamper verdict — never free operator-side retries (review F7)."""
-    from cascade.trainer.faults import _FundedTamper
+    After one retry it is a terminal but UNBURNED ``checkpoint_unverifiable``
+    (flaky hardware, a write race or our own bug look like tampering): the
+    box copy and both manifests stay as evidence (review F7)."""
+    import json
+
+    from cascade.trainer.faults import CheckpointUnverifiable
 
     runner, disp, seeds, contract, events, _ = _scripted(
         tmp_path, monkeypatch, harvests=[copy], harvest_disk_retries=3)
     monkeypatch.setattr(loop_module, "upload_dir_to_hub_or_hf",
                         lambda d, repo, hub, hf_repo=None: events.append("upload") or SimpleNamespace(
                             ref=SimpleNamespace(immutable_ref="cascade/c@sha256:" + "d" * 64)))
-    with pytest.raises(_FundedTamper):
+    with pytest.raises(CheckpointUnverifiable):
         _leg(runner, disp, seeds, contract)
-    # two tries x (harvest + one re-harvest), never verified or uploaded
     assert events[:8] == ["harvest", "pod-listing", "harvest", "pod-listing"] * 2
     assert "upload" not in events
     msg, miner_fault, cls, burn = runner._funded_leg_failures["hkA"]
-    assert (miner_fault, cls) == (True, "tamper")
+    assert (miner_fault, cls, burn) == (True, "checkpoint_unverifiable", False)
+    (proof,) = list(tmp_path.rglob("*.unverifiable.json"))
+    doc = json.loads(proof.read_text())
+    assert doc["pod_manifest"] and doc["box_manifest"] and Path(doc["box_copy"]).is_dir()
 
 
 def test_unlistable_pod_is_kept_until_the_leg_ends(tmp_path, monkeypatch):

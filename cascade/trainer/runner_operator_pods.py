@@ -227,6 +227,11 @@ class _OperatorPodMixin:
                                           name_prefix=name_prefix,
                                           gpus_per_pod=1, exclude_ids=claimed,
                                           sku_choices=fit if len(fit) > 1 else ())
+                        from .box_health import rent_halt_refusal
+
+                        halted = rent_halt_refusal(self, king=True)
+                        if halted:                        # before EVERY king launch (N3)
+                            raise ProvisionError(halted)
                         pod_id = provider.launch(spec)[0]
                         _ledger_king(pod_id)
                         sku_fn = getattr(provider, "sku_of", None)
@@ -503,7 +508,20 @@ class _OperatorPodMixin:
             raise ProvisionError(why)
 
         live = getattr(provider, "live_pod_address", None)
-        addr = live(pod_id) if live is not None else None
+        addr = None
+        if live is not None:
+            from .money_guard import operator_leg_allocated
+            from .runner_common import probe_pod_live
+
+            addr, definitive = probe_pod_live(live, pod_id,
+                                              sleep=getattr(self, "_rent_wait_sleep", None))
+            if (addr is None and not definitive and name_prefix is None
+                    and operator_leg_allocated(self, round_id, gen.hotkey)):
+                # A provider blip on a ledgered operator pod (review F1
+                # residual): never park, never rent a second pod — requeue
+                # transient with the row kept; the next try re-attaches.
+                _skip("operator leg pod liveness unknown (provider blip) — re-attach retried, "
+                      "nothing rented, not parked", "operator_transient")
         if addr is not None:
             log.warning("operator leg pod %s for %s is still LIVE at %s:%d — adopting it",
                         pod_id, gen.hotkey[:12], addr.ip, addr.ssh_port)
@@ -578,6 +596,11 @@ class _OperatorPodMixin:
                 with allocation_lock(self._funded_rent_lock) as release_allocation:
                     claimed = live_claimed_executors(self)
                     fit = self._skus_fitting_now(skus) or skus
+                    from .box_health import rent_halt_refusal
+
+                    halted = rent_halt_refusal(self, king=name_prefix is not None)
+                    if halted:                            # re-checked before EVERY launch (N3)
+                        _skip(f"operator disk: {halted} — nothing rented", "operator_disk")
                     _ledger(fit[0])                       # write-ahead (deterministic name)
                     spec = LaunchSpec(sku=fit[0], count=1, image=rnd.funded_pod_image,
                                       ssh_pubkey=ssh_pubkey, name_prefix=prefix,

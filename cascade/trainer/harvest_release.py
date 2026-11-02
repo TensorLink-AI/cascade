@@ -183,6 +183,8 @@ def verify_harvest_complete(runner, host, remote_dir: str, dest: Path,
             reharvest()
         else:
             _local(runner).harvest_mismatch = True
+            _local(runner).harvest_mismatch_evidence = {"pod": pod, "box": box,
+                                                        "mismatches": bad}
     return None
 
 

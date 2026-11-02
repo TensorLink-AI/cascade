@@ -55,6 +55,17 @@ class StorageFault(_OperatorFault):
     halts every rent)."""
 
 
+class CheckpointUnverifiable(Exception):
+    """A payer pod's checkpoint still differs from the pod's OWN listing after
+    a re-harvest and a retry. Flaky host hardware, a write race or our own bug
+    look exactly like tampering here, so this is a terminal but UNBURNED
+    verdict (``checkpoint_unverifiable``): no hotkey burn, at most the one
+    attempt; the box copy and both manifests are kept as evidence, and any
+    burn is the owner's manual call (review F7)."""
+
+    error_class = "checkpoint_unverifiable"
+
+
 class _FundedLegSkip(Exception):
     """A funded challenger leg that settled its own queue verdict (rent/setup
     failure) and must simply be dropped from the round — never retried on the

@@ -243,7 +243,11 @@ def projected_operator_leg_cost(runner) -> tuple[str, float, float, float]:
                                                           if rnd.funded_pod_sku else ())
     sku = skus[0] if skus else ""
     rate = float(operator_max_price_per_hour(rnd) or 0.0)
-    hours = (float(runner._leg_wall_seconds()) + float(rnd.funded_ready_timeout_seconds)) / 3600.0
+    try:
+        wall = float(runner._leg_wall_seconds())
+    except Exception:  # noqa: BLE001 — unknown wall: project a full day (caps stay strict)
+        wall = 24 * 3600.0
+    hours = (wall + float(getattr(rnd, "funded_ready_timeout_seconds", 0.0) or 0.0)) / 3600.0
     return sku, rate, hours, rate * hours
 
 

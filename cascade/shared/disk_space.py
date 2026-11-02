@@ -372,6 +372,8 @@ def harvest_source(root: Path | str, active: Callable[[], set[str]]) -> Source:
         base = p.with_name(p.name.split(".partial-", 1)[0])
         if base.with_name(base.name + PENDING_SUFFIX).exists():
             return False                    # push not confirmed: never reclaimable
+        if base.with_name(base.name + ".unverifiable.json").exists():
+            return False                    # mismatch evidence: the owner's to judge
         return str(base.resolve()) not in active()
 
     return Source(name="harvest", root=Path(root), list_items=items, reclaimable=ok)

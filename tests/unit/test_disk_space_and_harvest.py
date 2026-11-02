@@ -344,6 +344,8 @@ def test_a_full_volume_halts_every_rent_keeps_the_pod_and_reharvests_it(tmp_path
     free = {"b": 0}
     monkeypatch.setattr(runner_common, "DISK_USAGE",
                         lambda p: SimpleNamespace(total=1, used=0, free=free["b"]))
+    monkeypatch.setattr(disk_space, "DISK_USAGE",
+                        lambda p: SimpleNamespace(total=1, used=0, free=free["b"]))
     free["b"] = 500 * gib                                   # room when the leg starts
     with pytest.raises(harvest_guard.HarvestKeepPod):
         _leg(runner, disp, seeds, contract)
@@ -357,6 +359,7 @@ def test_a_full_volume_halts_every_rent_keeps_the_pod_and_reharvests_it(tmp_path
     assert runner._funded_leg_failures["hkA"][1:] == (False, "operator_kept_pod", False)
 
     free["b"] = 0                                            # the volume is full
+    runner._payer_pod_liveness = lambda pod_id: (object(), True)   # the kept pod is up
     _vault(tmp_path, "hkB")
     for hk in ("hkB", "hkA"):                                # a new leg, and the retry
         runner.__dict__.pop("_box_health_checked", None)
@@ -367,10 +370,13 @@ def test_a_full_volume_halts_every_rent_keeps_the_pod_and_reharvests_it(tmp_path
 
     free["b"] = 500 * gib                                    # space is back
     runner.__dict__.pop("_box_health_checked", None)
+    from cascade.trainer.box_health import rent_halt_refusal
+
+    assert rent_halt_refusal(runner) == ""                   # canary + space pass: cleared
+    assert BoxHealth.for_runner(runner).halt() is None
     monkeypatch.setattr("cascade.trainer.remote.harvest_remote_dir", good_harvest)
     entry = _leg(runner, disp, seeds, contract)
     assert entry.miner_hotkey == "hkA"
-    assert BoxHealth.for_runner(runner).halt() is None
     assert rents == ["hkA", "hkA"]                           # the second was an ADOPTION
     assert BoxHealth.for_runner(runner).leg("hkA") is None
     assert "upload" in events

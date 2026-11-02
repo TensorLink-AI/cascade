@@ -2712,6 +2712,7 @@ class RollingScheduler:
                     _finish(cached)
                     return
                 entry = self.ops.train_challenger(gen, era, block, end_wall=end_wall)
+                _forget_lost_leg(self.r, gen.hotkey)            # trained + harvested (N5)
                 _finish(entry)
             except Exception as e:  # noqa: BLE001 — settle the leg from its outcome
                 msg, miner_fault, error_class, burn = self.ops.leg_failure(gen.hotkey)
@@ -2719,6 +2720,7 @@ class RollingScheduler:
                     if miner_fault:
                         queue.fail(gen.hotkey, error=msg or str(e), error_class=error_class,
                                    expect_ref=gen.ref)
+                        _forget_lost_leg(self.r, gen.hotkey)    # terminal: no stale record (N5)
                         if error_class in ("generator", "tamper"):
                             self.ops.burn([gen], block)
                     else:
@@ -3652,3 +3654,14 @@ class RollingScheduler:
                          for e in entries if e.status == "failed"],
             "rents": list(self.state.rents),
         }
+
+
+def _forget_lost_leg(runner, hotkey: str) -> None:
+    """End a hotkey's box-health lost-run record (review N5). Never raises."""
+    try:
+        from .box_health import BoxHealth
+
+        if getattr(runner, "work_root", None) is not None:
+            BoxHealth.for_runner(runner).forget_leg(hotkey)
+    except Exception as e:  # noqa: BLE001
+        log.warning("box health: could not clear the leg record of %s (%s)", hotkey[:12], e)

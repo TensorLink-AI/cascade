@@ -358,8 +358,8 @@ The trainer rents miner-funded pods on Lium, Shadeform, Vast.ai or Runpod
     dir.
   * **A disk reservation.** Free space on the harvest filesystem must be at
     least `expected_checkpoint_gb` (15) × (live legs holding a pod + 1) +
-    `min_free_disk_gb`, measured after eviction. A canary or reservation
-    failure trips the halt.
+    `min_free_disk_gb`, measured after eviction. A canary failure trips the
+    halt. A reservation shortfall refuses only that rent and never halts.
   * **For an approved operator rent:**
     * the breaker is closed;
     * the projected cost is within `ops_operator_leg_cap_usd` and the daily
@@ -698,19 +698,31 @@ noticed. Now:
   JIT pod is halted too, loudly. Legs already training keep running. Waiting
   legs requeue unburned (`operator_disk`) and never count toward any cap.
 
-  The halt clears itself when the health check passes:
-  * a write + fsync + rename + delete canary in the harvest dir passes;
-  * free space holds every queued and in-flight leg's checkpoint plus the
-    reserve.
+  Only a real disk error or a failed canary is a disk halt; a plain
+  reservation shortfall refuses that one rent and never halts. The halt is
+  re-checked right before every launch, and in-process it holds even if its
+  own state write failed. It clears itself when its health check passes:
+  * **A disk halt.** A write + fsync + rename + delete canary in the
+    harvest dir passes, and free space holds every live pod-holding leg's
+    checkpoint plus one more and the reserve.
+  * **A harvest or storage halt.** A storage probe passes: a put, get and
+    delete of a `health/box-canary-*` key on the manifest store.
+
+  A disk halt also holds the king and king backups; a harvest or storage
+  halt never does. A kept pod's re-harvest is never held by the halt; it
+  only needs room for its own checkpoint.
 
   The owner can also clear it with `resume-rents`, which takes a reason.
   `rent-status` / `list-operator-legs` show the halt.
 * **No blind retrain.** A leg that an our-side fault hit after it trained
-  re-harvests its **kept** pod once the halt is clear; it is never retrained.
+  re-harvests its **kept** pod; it is never retrained. Before any rent, the
+  kept pod's liveness is asked through the payer's provider. A blip is
+  retried and never reads as "gone".
   The pod is kept at most `harvest_keep_max_seconds` (1800) and is
   re-attached every 60 s. If the finished run is gone, the retrain needs the
-  owner's approval even on the miner's key (`retrain_after_loss`), with one
-  critical alert pricing what the miner already lost. A pod that has run
+  owner's approval even on the miner's key (`retrain_after_loss`), decided
+  before any pod is rented. One critical alert prices what the miner
+  already lost. A pod that has run
   training is torn down only after a verified harvest or when the run is
   proven failed. Every miner-billed keep and loss raises a critical alert so
   the owner can make it good.
@@ -740,8 +752,12 @@ noticed. Now:
   sibling, fsynced, then renamed into place. A partial copy never looks
   complete. The pod's sha256 listing must match before the pod is released.
   On an operator pod, a copy that still differs after its re-harvest is
-  retried, never uploaded. On a **payer** (miner-controlled) pod, a mismatch
-  that persists after one retry is tamper.
+  retried, never uploaded. On a **payer** pod, a mismatch that persists after
+  one retry is a terminal but **unburned** `checkpoint_unverifiable`. Flaky
+  hardware, a write race or our own bug look the same as tampering. The box
+  copy and both manifests (`<harvest dir>.unverifiable.json`) are kept as
+  evidence and never evicted, with one critical alert. Any burn is the
+  owner's manual call.
 * **A local-disk error is our fault.** ENOSPC, EDQUOT, EROFS, EIO or EFBIG
   anywhere in a leg is classed `operator` and never burns a miner attempt.
   It halts rents at once. The partial copy is dropped, space is reclaimed,

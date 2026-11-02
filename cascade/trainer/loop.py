@@ -126,6 +126,16 @@ HARVEST_UPLOAD_ATTEMPTS = 4
 HARVEST_UPLOAD_BACKOFF_SECONDS = 60.0
 
 
+def _forget_lost_leg(runner, hotkey: str) -> None:
+    """A successful harvest/upload ends any lost-run record of the hotkey."""
+    try:
+        from .box_health import BoxHealth
+
+        BoxHealth.for_runner(runner).forget_leg(hotkey)
+    except Exception as e:  # noqa: BLE001 — bookkeeping never fails a harvest
+        log.warning("box health: could not clear the leg record of %s (%s)", hotkey[:12], e)
+
+
 def _r2_fallback_available(runner) -> bool:
     """Whether a checkpoint can go pod → R2 directly (the backup store is
     configured) — the ssh harvest's last resort when our disk fails."""
@@ -719,8 +729,10 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
             if not getattr(receipt, "marketcast", None):
                 from .r2_transfer import harvest_checkpoint_r2
 
-                return _mark_harvested(self, host, harvest_checkpoint_r2(
+                entry = _mark_harvested(self, host, harvest_checkpoint_r2(
                     self, host, receipt, contract, seeds, suffix, release=release))
+                _forget_lost_leg(self, receipt.miner_hotkey)   # harvested (review N5)
+                return entry
             log.warning("funded leg %s: MarketCast fine-tune harvested over ssh (its "
                         "verifier reads a local copy; r2 transport covers Cascade "
                         "checkpoints only)", receipt.miner_hotkey[:12])
