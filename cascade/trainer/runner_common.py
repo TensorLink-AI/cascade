@@ -424,6 +424,8 @@ def disk_guard_refusal(runner) -> str:
     from .box_health import LOCAL_DISK, BoxHealth, harvest_canary, rent_halt_refusal
     from .money_guard import alert, clear_alert
 
+    if getattr(runner, "work_root", None) is None:
+        return ""                                   # no box state to judge (a bare test double)
     halted = rent_halt_refusal(runner)
     if halted:
         return f"operator disk: {halted} — no new pod rented (requeued, never burned)"

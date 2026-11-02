@@ -482,7 +482,7 @@ class _FundedLegMixin:
                                         miner_fault=False, error_class=OPERATOR_FAULT_CLASS,
                                         burn=False)
             # box health (may halt every rent) + the bounded keep (F6)
-            if handle_our_side_fault(self, gen, e, pod_id=pod.instance_id, payer=True,
+            if handle_our_side_fault(self, gen, e, pod_id=str(getattr(pod, "instance_id", "") or ""), payer=True,
                                      trained=trained or _harvested_in_dispatch(self),
                                      released=bool(released)):
                 # The run is complete on the MINER's pod: the retry re-attaches
@@ -530,7 +530,7 @@ class _FundedLegMixin:
                                         error_class=error_class, burn=burn)
             from .harvest_guard import handle_our_side_fault, keeps_pod, local_disk_error
 
-            if handle_our_side_fault(self, gen, e, pod_id=pod.instance_id, payer=True,
+            if handle_our_side_fault(self, gen, e, pod_id=str(getattr(pod, "instance_id", "") or ""), payer=True,
                                      trained=trained or _harvested_in_dispatch(self),
                                      released=bool(released)):
                 # OUR disk failed with the run on the miner's pod: keep it for
