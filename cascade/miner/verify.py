@@ -113,7 +113,9 @@ def geometry(cfg: ChainConfig, policy, across_launch: bool) -> dict:
 
 def render_geometry(g: dict) -> list[str]:
     lo, hi = g["min_channels"], g["max_channels"]
-    width = f"exactly {hi} channels per yield" if lo == hi else f"{lo}-{hi} channels per yield"
+    width = (f"exactly {hi} channels per yield (pack narrower processes into the {hi} rows "
+             "yourself; nothing pads or merges yields)" if lo == hi
+             else f"{lo}-{hi} channels per yield")
     lines = [f"  checked geometry: {width}, length {g['min_length']}-{g['max_length']}; "
              + ("optional `groups` packing accepted" if g["groups_accepted"]
                 else "values-only (`groups` not accepted by every checked contract)")

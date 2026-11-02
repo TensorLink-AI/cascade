@@ -77,9 +77,11 @@ def cmd_init(args):
             f"# Lane {args.lane.upper()} starter\n\n"
             f"Declared target: {args.target or 'none'}.\n\n"
             "Read the deployed llms.txt and run cascade status --json before choosing live rules.\n"
-            + ("The starter yields exactly 32 channels per series (the v2 rule); optional `groups` "
-               "packing is off (`packing.enabled` in config.json) and needs a contract that accepts "
-               "`groups`. `cascade verify DIR --quick` prints the channel and batch geometry it checks.\n"
+            + ("Every yield must be exactly 32 channels (the v2 rule; a narrower yield is rejected). "
+               "Your generator must pack narrower processes into the 32 rows itself; the starter's "
+               "optional `groups` packing (`packing.enabled` in config.json) is off and needs a "
+               "contract that accepts `groups`. `cascade verify DIR --quick` prints the channel and "
+               "batch geometry it checks.\n"
                if recipe is None else "")
             +
             "See docs/AGENT_MINING.md for install, held-out pools, local tests, upload, reveal, funding and outcome tracking.\n"

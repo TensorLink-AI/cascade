@@ -174,9 +174,10 @@ def _add_score(sub: argparse._SubParsersAction) -> None:
 def add_score_options(p: argparse.ArgumentParser) -> None:
     """The local-scoring knobs shared by ``score`` and ``iterate``."""
     p.epilog = (
-        "Improve generators cheaply with score or iterate on a smaller model once released, "
-        "using a complete --chain-toml configuration. The planned 2M, 7M, 28M, 56M and ~120M "
-        "variants are currently blocked placeholders. Compare candidate and baseline with "
+        "Improve generators cheaply with score or iterate on a smaller Cascade MoE Base "
+        "preset (17.58M, 69.02M, 273.84M; 1.23B is the competition candidate) using a complete "
+        "--chain-toml from `python scripts/pyramid_config.py --size 17.58m --out FILE` "
+        "(aliases 2m/7m/28m/120m); the 56M variant remains blocked. Compare candidate and baseline with "
         "the same model, budget, seeds, pool and compatible starting checkpoint. Recheck "
         "promising ideas with --warm-start live: it selects the live competition model and "
         "init. A small-model improvement does not establish a live win.")
@@ -1404,8 +1405,8 @@ def add_gpu_args(p: argparse.ArgumentParser) -> None:
     """DEC-CA-0060 ``--gpu`` / ``--allow-fallback`` / ``--max-price`` on a fund
     command (lane A ``fund``, ``lane-b fund`` and ``lane-c fund``)."""
     p.add_argument("--gpu", default="",
-                   help="GPU type your key rents (one of chain.toml [round] funded_pod_skus, "
-                        "e.g. H100). Same token budget and wall as every leg — a faster "
+                   help="GPU type your key rents (one of chain.toml [round] funded_pod_skus; "
+                        "mainnet: 8xH100 or 8xH200). Same token budget and wall as every leg — a faster "
                         "type costs more per hour, never buys more compute. Default: the "
                         "cheapest fitting type under the operator's price caps. The "
                         "operator caps do not apply to a chosen type; --max-price does. "
@@ -1415,7 +1416,8 @@ def add_gpu_args(p: argparse.ArgumentParser) -> None:
                         "has no capacity (default: wait for it; the entry requeues "
                         "unburned like any capacity miss).")
     p.add_argument("--max-price", type=float, default=None,
-                   help="With --gpu: your own cap in USD per GPU-hour on the chosen type "
+                   help="With --gpu: your own cap in USD per pod-hour (the listing's whole-pod "
+                        "price, e.g. all 8 GPUs of an 8xH100) on the chosen type "
                         "(default: none — you accept the listed price).")
 
 
