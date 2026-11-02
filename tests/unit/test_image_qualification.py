@@ -27,7 +27,15 @@ import pytest
 import cascade.shared.activation as A
 from cascade.shared import image_qualification as Q
 from cascade.shared.config import load_chain_config
-from tests.unit.test_image_after_repin import AFTER, FP16, RC16, REPO, SW, _LaneHost, acfg  # noqa: F401
+from tests.unit.test_image_after_repin import (  # noqa: F401
+    AFTER,
+    FP16,
+    RC16,
+    REPO,
+    SW,
+    _LaneHost,
+    acfg,
+)
 
 RC15 = "sha256:5d41d94bc0c0d3ae3dfd042b0cc7e4d900c7d1f48173808436c12bf764a67641"
 
@@ -75,6 +83,7 @@ def _hook(cfg, tmp_path, fp=FP16):
 
 
 def test_missing_record_refuses_every_post_switch_path(armed, tmp_path):
+    from cascade.trainer.faults import _lane_fault, _OperatorFault
     from cascade.trainer.leg_pins import (
         ImageAfterUnqualified,
         LegImageMismatch,
@@ -82,7 +91,6 @@ def test_missing_record_refuses_every_post_switch_path(armed, tmp_path):
         leg_contract_scope,
         leg_round,
     )
-    from cascade.trainer.faults import _OperatorFault, _lane_fault
     from cascade.trainer.remote import RemoteHost
 
     st = Q.qualification_status(armed)
