@@ -875,33 +875,42 @@ def pick_shadeform_cpu_offer(types_json: dict, min_vcpus: int,
     GPU-less type (``num_gpus == 0``), when listed at all, sorts ahead of any
     GPU type at the same or higher price — we rent the cores, not the card.
     Each offer: ``{cloud, region, shade_instance_type, vcpus, memory_gb,
-    price_usd_hr, num_gpus}``."""
-    out: list[tuple[int, float, dict]] = []
+    price_usd_hr, num_gpus}``.
+
+    One offer PER available on-demand region, in the API's region order:
+    the generation stage quarantines (provider, cloud, region, type), so a
+    region whose VMs never come up must not hide the same type's other
+    regions (2026-11-02: latitude/cpu_32 listed dallas, ashburn, TYO3, LON;
+    only dallas was ever offered, and it errored on create 3/3)."""
+    out: list[tuple[int, float, int, dict]] = []
     for t in types_json.get("instance_types", []):
         conf = t.get("configuration", {}) or {}
         vcpus = int(conf.get("vcpus", 0) or 0)
         price = int(t.get("hourly_price", 1 << 30)) / 100.0
         if vcpus < int(min_vcpus) or price > float(max_price_usd_hr):
             continue
-        region = next(
-            (a.get("region") for a in t.get("availability", [])
-             if a.get("available") and a.get("rental_type", "on_demand") == "on_demand"),
-            None,
-        )
-        if not region:
-            continue
+        regions: list[str] = []
+        for a in t.get("availability", []) or []:
+            r = a.get("region")
+            if (r and r not in regions and a.get("available")
+                    and a.get("rental_type", "on_demand") == "on_demand"):
+                regions.append(r)
         gpus = int(conf.get("num_gpus", 0) or 0)
-        out.append((0 if gpus == 0 else 1, price, {
-            "cloud": t.get("cloud"),
-            "region": region,
-            "shade_instance_type": t.get("shade_instance_type"),
-            "vcpus": vcpus,
-            "memory_gb": float(conf.get("memory_in_gb", 0) or 0),
-            "price_usd_hr": price,
-            "num_gpus": gpus,
-        }))
-    out.sort(key=lambda x: (x[0], x[1]))
-    return [o for _, _, o in out]
+        for i, region in enumerate(regions):
+            out.append((0 if gpus == 0 else 1, price, i, {
+                "cloud": t.get("cloud"),
+                "region": region,
+                "shade_instance_type": t.get("shade_instance_type"),
+                "vcpus": vcpus,
+                "memory_gb": float(conf.get("memory_in_gb", 0) or 0),
+                "price_usd_hr": price,
+                "num_gpus": gpus,
+            }))
+    # Stable sort: the first region of every type at a price still comes
+    # before the second region of any of them (index i), so a cheaper type's
+    # spare regions never outrank a different type's primary one.
+    out.sort(key=lambda x: (x[0], x[1], x[2]))
+    return [o for *_, o in out]
 
 
 def shadeform_offer_price_usd_hr(types_json: dict, sku: str) -> float | None:
