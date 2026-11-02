@@ -25,9 +25,9 @@ from cascade.generation import shards as S
 from cascade.generation import transfer as T
 from cascade.trainer.remote import (
     DETACHED_LAUNCH_TOKEN,
-    PREFETCH_PID_NAME,
     DETACHED_STDERR_MARK,
     PREFETCH_LIST_NAME,
+    PREFETCH_PID_NAME,
     PREFETCH_SCRIPT_NAME,
     RECEIPT_SENTINEL,
     RemoteDispatcher,
