@@ -15,18 +15,13 @@ independent contributions produce sustained forecasting progress. The
 example, and links actual historical evidence. Implemented features and live
 activation are different: inspect the deployment before choosing a lane.
 
-**V2 Lane A launch target: 30 October 2026, 12:00 UTC.** The release resolves
-the first era boundary at or after that target from finalized chain timestamps;
-it does not estimate a launch block from wall-clock time. Installing the release
-does not open the lane. The separate **95% pre-launch burn** starts after
-**51% of eligible validator stake** signals this release's readiness, at the
-following settlement boundary. B and C remain separately activated.
-
-**V2 entry window:** fresh revealed commitments are eligible from **30 October
-2026, 09:00 UTC**. Paid Lane A intake is closed before then. Accepted entries
-queue until the actual v2 activation era; they cannot train under v1. Entries
-remain open after launch. Lane A's one-submission-per-hotkey rule is unchanged.
-The planned lane order is **A → C → B**: A/C use 75%/25%, then A/B/C use 50%/25%/25%.
+**V2 Lane A is live on mainnet since 30 October 2026.** Paid entries opened
+at 09:00 UTC and the first v2 era started at the first era boundary after
+12:00 UTC (block 9,399,600). Commitments revealed before the opening are
+refused; make a fresh one. Lane A allows one judged submission per hotkey per
+round (one 900-block settlement, about 3 h). B and C remain separately
+activated. The planned lane order is **A → C → B**: A/C use 75%/25%, then
+A/B/C use 50%/25%/25%.
 
 | You are | Start here |
 |---|---|
@@ -39,8 +34,8 @@ The planned lane order is **A → C → B**: A/C use 75%/25%, then A/B/C use 50%
 
 V2 synthetic generators must emit finite float arrays `(C, L)` with **exactly 32 channels per yield**. One-dimensional and 1–31-channel yields are rejected. Read the effective policy for length and resource limits.
 
-V2 development is on the [`cascade-v2` branch](https://github.com/TensorLink-AI/cascade/tree/cascade-v2).
-Select that branch when installing; the live deployment still determines which rules are active.
+V2 is developed and deployed from `main`; the older `cascade-v2` branch is
+not the live code. The live deployment still determines which rules are active.
 
 ## Why compete on data
 
@@ -64,16 +59,25 @@ Pre-v2 eras use the Toto2 lineage. The v2 candidate is
 **Cascade MoE Base - 1.23B**, a pyramid mixture-of-experts model: **1,234,607,520 total parameters,
 112,070,048 active per token**, a **21-quantile head**, top-8 routing, and attention across channels.
 It starts a fresh lineage; old Toto2 checkpoints cannot initialize it.
-The worker image, hardware and initial generator still need launch qualification.
 The effective era contract and signed checkpoint pointers determine live training.
+On mainnet it trains on `8xH100` or `8xH200` pods only; a full 23,841-step leg
+measured ≈ 3.5 h on both (2026-11-01/02). See the
+[GPU and price table](docs/MINER_V2_INCENTIVE_INTRO.md#gpus).
 
 Implemented [smaller variants](deploy/presets/README.md) are
 **Cascade MoE Base - 17.58M, 69.02M and 273.84M**. Names use total parameters;
 active counts are listed separately. Use them to improve generators in cheaper local
 experiments, then check promising ideas on the live competition model. The 56M
 variant remains unspecified. See the [model and recipe](docs/MODEL.md) for exact
-counts, masking, output head and training rules. GPU memory and throughput have
-not been measured for this port.
+counts, masking, output head and training rules. GPU memory has not been
+measured for any size, and throughput only for the 1.23B model (above).
+
+For local scoring, use held-out data from the public eval pool
+[Tensor-Link/cascade-eval-pool](https://huggingface.co/datasets/Tensor-Link/cascade-eval-pool)
+(retired validator snapshots, byte-identical to what was scored; use the
+`snapshots/<as_of>-block-<N>/` folders). It is an evaluation set, never
+training data; the live private pool is newer and never revealed. See
+[MINER.md](docs/MINER.md#held-out-data-the-public-eval-pool).
 
 A mixture-of-experts (MoE) model routes inputs through selected specialist
 subnetworks. B improves a limited selection of those experts while the rest

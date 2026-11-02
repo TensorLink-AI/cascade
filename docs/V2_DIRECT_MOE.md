@@ -97,27 +97,40 @@ export CASCADE_DIRECT_OWNER_HOTKEY=<owner ss58> CASCADE_DIRECT_CONFIG_BUCKET=<bu
    cascade direct fund ... --max-spend <units> --yes
    ```
 
+   **Not rentable on mainnet today.** The direct lane is not activated
+   (`DirectConfig.validate()` refuses live activation), so none of the
+   layouts below can be rented through it on mainnet. Rolling Lane A legs
+   rent only `8xH100` and `8xH200` (deployed `[round] funded_pod_skus`);
+   4× layouts and Blackwell are not offered there either.
+
    Without `--profile` the gang may rent any default layout of its
    `--world-size`: those estimated at $75 or less for the reference job
-   (27,500 updates, batch 64, eight variates, context 4096, advertised Lium
-   rates). Dearer layouts are opt-in: name them with `--profile`.
+   (27,500 updates, batch 64, eight variates, context 4096) **at the
+   catalog's advertised rates**. Dearer layouts are opt-in: name them with
+   `--profile`. The catalog columns below are only that selection
+   heuristic (`cascade/direct/profiles.py`, rates as advertised by Lium on
+   2026-10-29), not prices you will pay:
 
-   | Layout | Wall time | $/h | Est. per job | |
+   | Layout | Catalog wall (reference job) | Catalog $/h (heuristic) | Catalog est. per job | Catalog class |
    |---|---:|---:|---:|---|
    | 8×H200 | 2.67 h measured | 18.00 | $48 | default |
-   | 4×B200 | 3.26 h measured | 16.80 | $55 | default |
+   | 4×B200 | 3.26 h measured | 16.80 | $55 | default (Blackwell: needs a CUDA 12.8 image, not shipped) |
    | 8×H100 | 2.82 h measured | 24.00 | $68 | default |
    | 4×H200 | ~4.0 h est. | 18.00 | $72 | default |
-   | 8×B200 | ~2.2 h est. | 33.60 | $74 | default |
+   | 8×B200 | ~2.2 h est. | 33.60 | $74 | default (Blackwell: not runnable) |
    | 4×H100 | 4.23 h measured | 24.00 | $102 | opt-in |
-   | 4×B300 | ~3.3 h est. | 32.00 | $106 | opt-in |
-   | 8×B300 | ~2.2 h est. | 56.00 | $123 | opt-in |
+   | 4×B300 | ~3.3 h est. | 32.00 | $106 | opt-in (Blackwell: not runnable) |
+   | 8×B300 | ~2.2 h est. | 56.00 | $123 | opt-in (Blackwell: not runnable) |
 
-   The $/h column is the catalog's advertised rate, used only to pick
-   defaults. **Real Lium prices run higher:** 8×H200 pods were charged
-   $24–46/h from 2026-10-29 to 11-01, about $31/h median. Budget
-   `--max-spend` for the highest rate you would accept × (wall + 1 h), not
-   the estimate here. The Lane A price table is in
+   **What mainnet actually measured (2026-11-01/02, rolling Lane A, the
+   23,841-step v2 job):** about 112–115 steps per minute, ≈ 3.5 h, on
+   **both** 8×H100 and 8×H200. Lium charged **$14.40–23.20/h for 8×H100**
+   and **$24–46/h for 8×H200** (median ~$31/h). The catalog walls above are
+   for a different reference job and are not a substitute for these.
+
+   Budget `--max-spend` (and `--spend-cap`, both in the ledger's smallest
+   money unit) from the highest hourly rate you would accept × (wall + 1 h),
+   never from the catalog estimate. The Lane A price table is in
    [MINER_V2_INCENTIVE_INTRO.md](MINER_V2_INCENTIVE_INTRO.md#gpus).
 
    The catalog is `cascade/direct/profiles.py`. A job has one gang size, so
