@@ -27,6 +27,7 @@ from cascade.shared.hippius import pack_dir_to_tar
 EXAMPLE = Path(__file__).resolve().parents[2] / "scripts" / "example_generator"
 SNAP_OLD = "2026-10-27-block-9361800"
 SNAP_NEW = "2026-10-31-block-9388800"
+REVISION = "c0ffee" + "0" * 34
 
 
 def run_json(capsys, argv):
@@ -73,12 +74,16 @@ class FakeHF:
 
     def __call__(self, url: str):
         self.calls.append(url)
+        if url.endswith("/revision/main"):
+            return _Resp(json.dumps({"sha": REVISION}).encode())
         if "/api/datasets/" in url:
+            assert f"/tree/{REVISION}/" in url  # the listing is pinned to one commit
             rows = [{"type": "directory", "path": f"snapshots/{f}"} for f in self.folders]
             if "page=2" in url:
                 return _Resp(json.dumps(rows[2:]).encode())
             nxt = url + "?cursor=x&page=2"
             return _Resp(json.dumps(rows[:2]).encode(), {"Link": f'<{nxt}>; rel="next"'})
+        assert f"/resolve/{REVISION}/" in url  # downloads pinned to the same commit
         if url.endswith(hf.SHA_MARKER):
             return _Resp((self.sha + "\n").encode())
         if url.endswith(".tar"):
@@ -99,7 +104,9 @@ def test_latest_never_picks_a_legacy_folder():
 def test_spec_validation_refuses_legacy_and_swallowed_paths():
     assert hf.validate_spec("latest") == hf.LATEST
     assert hf.validate_spec(f"snapshots/{SNAP_NEW}/") == SNAP_NEW
-    for bad in ("2026-07-23", "./my-gen", "block-9388800"):
+    # full-width / Arabic-Indic digits are Unicode \\d but never a snapshot
+    for bad in ("2026-07-23", "./my-gen", "block-9388800",
+                "\uff12\uff10\uff12\uff16-10-31-block-1", "2026-10-31-block-\u0661"):
         with pytest.raises(hf.HfPoolError):
             hf.validate_spec(bad)
 
@@ -111,6 +118,9 @@ def test_latest_follows_pagination_verifies_and_extracts_from_tar(tmp_path, monk
     assert pool.snapshot == SNAP_NEW and pool.block == 9388800 and pool.sha256 == fake.sha
     assert sorted(p.name for p in pool.path.glob("*.npy")) == [f"s{i}.npy" for i in range(4)]
     assert pool.path == tmp_path / "work" / "hf-pool" / fake.sha / "pool"
+    assert pool.revision == REVISION and pool.as_dict()["revision"] == REVISION
+    # the verified tar is deleted after extraction: one copy on disk
+    assert not list((tmp_path / "work" / "hf-pool").rglob("*.tar"))
     assert any(u.endswith(f"{SNAP_NEW}/block-9388800.tar") for u in fake.calls)
     # only the verified tar is downloaded, never the unpacked convenience copies
     assert not any(u.endswith(".npy") for u in fake.calls)
@@ -247,6 +257,10 @@ def test_gate_settings_read_the_config(cfg):
     s = bench_mod.gate_settings(replace(cfg, scoring=replace(
         cfg.scoring, bench_gate_tolerance=0.03, bench_gate_min_win_rate=0.6)))
     assert s["tolerance"] == 0.03 and s["min_win_rate"] == 0.6
+    assert s["configured_mode"]["scoring"] == cfg.scoring.bench_gate_mode
+    assert "v2" in s["configured_mode"]
+    v = bench_mod.judge(_report(seed=5), _report(seed=5), {**SETTINGS_V2, "configured_mode": s["configured_mode"]})
+    assert any("IGNORED" in line and cfg.scoring.bench_gate_mode in line for line in bench_mod.render(v))
     assert s["rule"] in (RULE_V1, RULE_V2)
     assert s["suites"] == (list(SUITES_V2) if s["rule"] == RULE_V2 else ["gift", "boom", "time"])
 
@@ -413,13 +427,54 @@ def test_bench_command_numbers_only_and_verdict(capsys, monkeypatch, tmp_path):
 # ── verify reports the geometry it checks ────────────────────────────────────
 
 
-def test_verify_reports_effective_geometry():
-    from cascade.miner.verify import verify_repo
+
+
+def _hostile_tar(tmp_path: Path, kind: str) -> bytes:
+    import tarfile
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        ok = io.BytesIO(b"x")
+        info = tarfile.TarInfo("ok.npy")
+        info.size = 1
+        tar.addfile(info, ok)
+        if kind == "symlink":
+            link = tarfile.TarInfo("evil.npy")
+            link.type, link.linkname = tarfile.SYMTYPE, "/etc/passwd"
+            tar.addfile(link)
+        else:
+            esc = tarfile.TarInfo("../escape.npy")
+            esc.size = 1
+            tar.addfile(esc, io.BytesIO(b"y"))
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize("kind", ["symlink", "traversal"])
+def test_hostile_tar_is_refused_and_nothing_is_cached(tmp_path, monkeypatch, kind):
+    monkeypatch.setattr(hf, "_open", FakeHF(_hostile_tar(tmp_path, kind)))
+    with pytest.raises(hf.HfPoolError, match="unsafe tar member"):
+        hf.resolve_hf_pool(SNAP_NEW, tmp_path / "work")
+    cache = tmp_path / "work" / "hf-pool"
+    assert not list(cache.glob(f"*/{hf.COMPLETE_MARKER}")) and not list(cache.glob(".incoming-*"))
+    assert not (tmp_path / "work" / "escape.npy").exists()
+
+
+def test_corrupt_tar_with_matching_sha_is_a_clean_pool_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(hf, "_open", FakeHF(b"not a tar at all" * 64))
+    with pytest.raises(hf.HfPoolError) as e:
+        hf.resolve_hf_pool(SNAP_NEW, tmp_path / "work")
+    assert not isinstance(e.value, hf.HfPoolIntegrityError)
+
+
+# ── verify reports the geometry it checks (CLI layer, not verify_repo) ───────
+
+
+def test_verify_cli_reports_effective_geometry(capsys):
+    from cascade.miner.geometry import geometry
     from cascade.shared.config import load_chain_config
 
     cfg = load_chain_config(Path(__file__).resolve().parents[2] / "chain.toml")
-    report = verify_repo(EXAMPLE, cfg, skip_runtime=True, across_launch=True)
-    g = report.to_dict()["geometry"]
+    g = geometry(cfg, True)
     assert g["max_channels"] == cfg.generator.max_channels
     v2 = cfg.training.v2_contract
     if v2 is not None and cfg.generator.min_channels == cfg.generator.max_channels:
@@ -428,4 +483,13 @@ def test_verify_reports_effective_geometry():
         row = next(t for t in g["training"] if t["contract"] == "v2")
         assert row["series_per_step"] == max(1, v2.batch_size // cfg.generator.max_channels)
         assert row["long_series"] == v2.long_series
-    assert "checked geometry" in report.render()
+    rc, doc = run_json(capsys, ["verify", str(EXAMPLE), "--skip-runtime"])
+    assert doc["data"]["geometry"] == g
+
+
+def test_verify_repo_report_is_unchanged_by_geometry():
+    """The trainer's baseline qualification consumes verify_repo; the display
+    geometry must not ride on its report (launch_preflight hashes verify.py)."""
+    from cascade.miner.verify import VerifyReport
+
+    assert "geometry" not in VerifyReport.__dataclass_fields__

@@ -50,9 +50,11 @@ cascade score ./demo-gen-v2 --chain-toml ./chain.local-17m.toml --pool-hf latest
 
 `--pool-hf latest` lists `Tensor-Link/cascade-eval-pool`, picks the newest
 `snapshots/<date>-block-<N>/` folder (never a legacy date-only rebuild),
-downloads `block-<N>.tar`, refuses it unless its sha256 equals `POOL_SHA256`,
-and extracts it to `.cascade-work/hf-pool/<sha256>/`. The tar is the scoring
-source. The command prints a reminder that the pool is retired and is evaluation
+downloads `block-<N>.tar` from one pinned dataset commit, refuses it unless
+its sha256 equals that folder's `POOL_SHA256` (download integrity against the
+dataset's own file, not authenticity), and extracts it to
+`.cascade-work/hf-pool/<sha256>/pool/`. The extracted tar is the scoring
+source; the tar itself is deleted after a verified extract. The command prints a reminder that the pool is retired and is evaluation
 data, never training data. A second run reuses the cache without the network.
 
 The JSON document has this shape. Values vary by hardware, seed and snapshot;
@@ -140,5 +142,7 @@ A suite without staged data or without its extra (TIME needs `--extra time`,
 FEV needs `--extra fev` and a pinned FEV manifest) comes back skipped. The gate
 then reports `uncomputable` with `partial: true`, and `staged_preview` shows the
 per-suite task ratio and win rate for the suites that did run. Those are
-display numbers, not a verdict. If the sidecar environment is missing,
+display numbers, not a verdict. The preview also ignores `bench_gate_mode`: it judges as
+if the gate were enforced and prints the configured `[scoring]` and `[v2]` modes.
+Under `off` the gate never blocks a win, and under `shadow` it only logs. If the sidecar environment is missing,
 `--bench` stops before any training and prints the `uv sync` command.

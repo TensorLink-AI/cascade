@@ -80,7 +80,14 @@ def gate_settings(cfg, at_block: int | None = None) -> dict:
         n = bench_gate_v2_from(cfg)
         rule = bench_gate_rule_for_era(cfg, n) if n else RULE_V1
     s = cfg.scoring
-    return {"rule": rule, "suites": list(SUITES_V2 if rule == RULE_V2 else SUITES),
+    # Reported, never applied: the preview judges as if the gate were enforced.
+    from ..shared.era import bench_gate_mode_at
+
+    v2_mode = str(getattr(getattr(cfg, "v2", None), "bench_gate_mode", "off") or "off")
+    mode = {"scoring": str(getattr(s, "bench_gate_mode", "off") or "off"), "v2": v2_mode}
+    if at_block is not None:
+        mode["effective_at_block"] = bench_gate_mode_at(cfg, int(at_block))
+    return {"rule": rule, "configured_mode": mode, "suites": list(SUITES_V2 if rule == RULE_V2 else SUITES),
             "tolerance": float(s.bench_gate_tolerance),
             "min_win_rate": float(s.bench_gate_min_win_rate),
             "min_items": int(s.bench_gate_min_items),
@@ -264,6 +271,13 @@ def render(v: dict) -> list[str]:
         for suite, row in (v.get("staged_preview") or {}).items():
             lines.append(f"    staged {suite}: ratio {row['ratio']:.5f}, win rate "
                          f"{row['win_rate']:.3f} over {row['n']} tasks (display only)")
+    mode = s.get("configured_mode")
+    if mode:
+        shown = ", ".join(f"[{k}] {v}" if k != "effective_at_block" else f"effective at --at-block: {v}"
+                          for k, v in mode.items())
+        lines.append(f"  bench_gate_mode is IGNORED by this preview (judged as if enforced); "
+                     f"configured: {shown}. 'off' never blocks a win and 'shadow' only logs, "
+                     "so a BLOCK here only bites where the mode is 'enforce'.")
     lines.append("  local preview only: the validator runs the gate after a private-pool win, "
                  "seeded by the round's block hash.")
     return lines

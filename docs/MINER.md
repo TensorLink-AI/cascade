@@ -335,8 +335,9 @@ Three flags for local iteration (worked example:
   on a **retired** eval-pool snapshot from the public HF dataset
   `Tensor-Link/cascade-eval-pool`. `latest` picks the newest
   `<date>-block-<N>` folder; legacy date-only folders are rebuilds and are
-  never used. The `block-<N>.tar` is checked against `POOL_SHA256` and scored
-  from the extracted tar. It is cached by sha256 under the work directory, so a
+  never used. The `block-<N>.tar` is checked against the folder's
+  `POOL_SHA256` (download integrity, not authenticity) and scored from the
+  extracted tar. It is cached by sha256 under the work directory, so a
   re-run works offline. The snapshot and sha256 are recorded in the result and
   in `history.jsonl`, and they key the iterate cache. It cannot be combined
   with `--pool-dir` or `--pool`. A retired pool is directional only. It is
@@ -354,7 +355,8 @@ Three flags for local iteration (worked example:
   data with `--bench-data-dir`. A suite without staged data is skipped, and the
   verdict is then reported as partial. It is a preview: the validator seeds
   the bootstrap with the round's block hash and runs the gate only after a
-  private-pool win.
+  private-pool win. The preview ignores `bench_gate_mode` and prints the
+  configured mode; a gate set to `off` or `shadow` never blocks.
 
 ## 4. Register a hotkey
 

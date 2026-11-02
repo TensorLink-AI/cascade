@@ -18,7 +18,7 @@ def add_preflight(sub):
     p.add_argument("--network", default="finney")
     p.add_argument("--chain-toml", type=Path, default=None)
     p.add_argument("--timeout", type=positive_seconds, default=10.0)
-    p.add_argument("--max-price", type=positive_seconds, default=None, help="Proposed USD per pod-hour ceiling (the whole pod's listed price); no quote is fetched.")
+    p.add_argument("--max-price", type=positive_seconds, default=None, help="Proposed USD per pod-hour ceiling (the listing's whole-pod price; falls back to the per-GPU price if a listing lacks it); no quote is fetched.")
     p.add_argument("--max-spend", type=positive_seconds, default=None, help="Proposed total USD budget for the human to review.")
     p.set_defaults(func=cmd_preflight)
 

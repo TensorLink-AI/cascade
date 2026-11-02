@@ -191,9 +191,11 @@ def add_score_options(p: argparse.ArgumentParser) -> None:
                       metavar="latest|SNAPSHOT",
                       help="Score on a RETIRED eval-pool snapshot from the public HF dataset "
                            "Tensor-Link/cascade-eval-pool: 'latest' (the default value; the newest "
-                           "'<date>-block-<N>' folder) or an exact folder name. The tar is "
-                           "sha256-verified against POOL_SHA256 and cached by sha256 under the "
-                           "work dir; a cached snapshot is reused offline. Directional only; "
+                           "'<date>-block-<N>' folder) or an exact folder name, downloaded from one "
+                           "pinned dataset commit. The tar's sha256 is checked against the "
+                           "dataset's own POOL_SHA256 (download integrity, not authenticity) and "
+                           "the extraction is cached by sha256 under iterate's --work-dir "
+                           "(score: ./.cascade-work); a cached snapshot is reused offline. Directional only; "
                            "evaluation data, never train on it. Place it after the repo path.")
     p.add_argument("--keep-ckpt", type=Path, default=None, metavar="DIR",
                    help="Keep the trained checkpoint(s) in DIR instead of a discarded temp dir "
@@ -239,7 +241,8 @@ def resolve_pool_hf(args, cache_root: Path, out):
         return out.fail("pool_hf_unavailable", str(e), NETWORK), None
     except OSError as e:
         return out.fail("pool_hf_unavailable", f"could not fetch the HF pool: {e}", NETWORK), None
-    out.info(f"pool: {pool.snapshot} (sha256 {pool.sha256}) verified, cached at {pool.path}")
+    out.info(f"pool: {pool.snapshot} (sha256 {pool.sha256}, HF revision "
+             f"{pool.revision or 'unknown'}) matches its POOL_SHA256; cached at {pool.path}")
     return OK, pool
 
 
@@ -685,8 +688,13 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     unbound = not getattr(args, "live", False) and getattr(args, "at_block", None) is None
     report = verify_repo(args.repo_dir, cfg, skip_runtime=args.skip_runtime, quick=args.quick,
                          across_launch=unbound)
-    out.result(**report.to_dict())
+    from .geometry import render_geometry, safe_geometry
+
+    geo = safe_geometry(cfg, unbound)
+    out.result(**report.to_dict(), **({"geometry": geo} if geo is not None else {}))
     out.info(report.render())
+    if geo is not None:
+        out.info("\n".join(render_geometry(geo)))
     if not report.ok:
         out.error = {"code": "verify_failed",
                      "message": "; ".join(f"[{s}] {r.reason}" for s, r in report.failures)}
@@ -1416,8 +1424,9 @@ def add_gpu_args(p: argparse.ArgumentParser) -> None:
                         "has no capacity (default: wait for it; the entry requeues "
                         "unburned like any capacity miss).")
     p.add_argument("--max-price", type=float, default=None,
-                   help="With --gpu: your own cap in USD per pod-hour (the listing's whole-pod "
-                        "price, e.g. all 8 GPUs of an 8xH100) on the chosen type "
+                   help="With --gpu: your own cap in USD per pod-hour on the chosen type (the "
+                        "listing's whole-pod price, e.g. all 8 GPUs of an 8xH100; falls back to "
+                        "the per-GPU price if a listing lacks it) "
                         "(default: none — you accept the listed price).")
 
 
