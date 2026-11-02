@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import importlib.util
 import math
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -26,6 +27,8 @@ _RESULTS = Path(__file__).resolve().parents[2] / "benchmarks" / "cascade_benchma
 _spec = importlib.util.spec_from_file_location("_sidecar_results", _RESULTS)
 R = importlib.util.module_from_spec(_spec)
 assert _spec.loader is not None
+# dataclasses resolve string annotations through sys.modules[cls.__module__]
+sys.modules[_spec.name] = R
 _spec.loader.exec_module(R)
 
 SUITE_NAMES = {"gift": "gift-eval", "boom": "boom", "time": "time", "fev": "fev"}
