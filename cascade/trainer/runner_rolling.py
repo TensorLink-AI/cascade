@@ -917,7 +917,12 @@ class _RollingMixin:
                 abort = getattr(self, "_funded_wait_abort", None)
                 was_set = abort.is_set() if abort is not None else True
                 try:
-                    host = self._rent_king_host(str(era.base_seed))
+                    from .leg_pins import leg_contract_scope
+
+                    # DEC-CA-0067: the bench pod is rented on THIS era's image
+                    # pins (leg_round reads the era contract on this thread)
+                    with leg_contract_scope(self, contract):
+                        host = self._rent_king_host(str(era.base_seed))
                 except Exception as e:  # noqa: BLE001 — retried by the scheduler
                     if abort is not None and not was_set:
                         abort.clear()   # a bench rent's give-up never releases challengers

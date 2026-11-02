@@ -120,6 +120,27 @@ def test_restart_king_without_a_host_is_benched_on_the_rerented_era_pod(cfg, pus
     assert r._rolling_bench_king(entry, _era()) == SIX and r.rents == ["4242"]
 
 
+def test_the_bench_king_pod_rents_under_the_eras_contract(cfg, pushes):
+    """DEC-CA-0067 review 2: the bench-only king rent names the era's contract
+    on its thread, so leg_round picks THAT era's image pins."""
+    from cascade.trainer.leg_pins import leg_contract
+    from cascade.trainer.runner_common import era_contracts
+
+    host = SimpleNamespace(name="funded-king")
+    seen = []
+
+    def rent(r, rid):
+        seen.append(leg_contract(r))
+        r._funded_king_host = host
+        return host
+
+    r = _Runner(_gated(cfg), rent)
+    entry = SimpleNamespace(miner_hotkey="KING", trained_pointer="ptr", size="", role="king")
+    r._rolling_bench_king(entry, _era())
+    assert seen == [era_contracts(r.cfg, _era())[0]]
+    assert leg_contract(r) is None                              # scope closed
+
+
 def test_a_failed_bench_rent_never_releases_challenger_waits(cfg, pushes):
     def rent(r, rid):
         r._funded_wait_abort.set()           # what the king rent's give-up does
