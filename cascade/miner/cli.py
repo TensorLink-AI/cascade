@@ -180,11 +180,24 @@ def add_score_options(p: argparse.ArgumentParser) -> None:
         "the same model, budget, seeds, pool and compatible starting checkpoint. Recheck "
         "promising ideas with --warm-start live: it selects the live competition model and "
         "init. A small-model improvement does not establish a live win.")
-    p.add_argument("--pool-dir", type=Path, default=None,
-                   help="Local dir of .npy/.npz held-out series to score on (recommended: your "
-                        "own real data). Falls back to --pool, then an offline synthetic sample.")
-    p.add_argument("--pool", default="", dest="pool_ref",
-                   help="A Hippius Hub pool ref (repo@digest) to score on instead of --pool-dir.")
+    pool = p.add_mutually_exclusive_group()
+    pool.add_argument("--pool-dir", type=Path, default=None,
+                      help="Local dir of .npy/.npz held-out series to score on (recommended: your "
+                           "own real data). Falls back to --pool, then an offline synthetic sample.")
+    pool.add_argument("--pool", default="", dest="pool_ref",
+                      help="A Hippius Hub pool ref (repo@digest) to score on instead of --pool-dir.")
+    pool.add_argument("--pool-hf", nargs="?", const="latest", default=None,
+                      metavar="latest|SNAPSHOT",
+                      help="Score on a RETIRED eval-pool snapshot from the public HF dataset "
+                           "Tensor-Link/cascade-eval-pool: 'latest' (the default value; the newest "
+                           "'<date>-block-<N>' folder) or an exact folder name. The tar is "
+                           "sha256-verified against POOL_SHA256 and cached by sha256 under the "
+                           "work dir; a cached snapshot is reused offline. Directional only; "
+                           "evaluation data, never train on it. Place it after the repo path.")
+    p.add_argument("--keep-ckpt", type=Path, default=None, metavar="DIR",
+                   help="Keep the trained checkpoint(s) in DIR instead of a discarded temp dir "
+                        "(score: DIR must be absent or empty; iterate: one subdirectory per "
+                        "generator/settings/seed), e.g. to run `cascade bench` on them.")
     p.add_argument("--train-hours", type=float, default=None,
                    help="Training budget (default: [round] heat_train_hours — the cheap local budget).")
     p.add_argument("--n-windows", type=int, default=None,
@@ -204,7 +217,29 @@ def score_result_dict(r) -> dict:
             "n_series": r.n_series, "train_seconds": r.train_seconds,
             "pool": r.pool_label, "init": r.init_label,
             "contract_digest": getattr(r, "contract_digest", ""),
-            "train_tokens": getattr(r, "train_tokens", 0)}
+            "train_tokens": getattr(r, "train_tokens", 0),
+            "pool_snapshot": getattr(r, "pool_snapshot", "") or "",
+            "pool_sha256": getattr(r, "pool_sha256", "") or "",
+            "checkpoint_dir": getattr(r, "checkpoint_dir", "") or ""}
+
+
+def resolve_pool_hf(args, cache_root: Path, out):
+    """``(exit_code, HfPool | None)`` for ``--pool-hf``; prints the retired-pool note."""
+    if getattr(args, "pool_hf", None) is None:
+        return OK, None
+    from .hf_pool import RETIRED_POOL_NOTE, HfPoolError, HfPoolIntegrityError, resolve_hf_pool
+
+    out.warn(RETIRED_POOL_NOTE)
+    try:
+        pool = resolve_hf_pool(args.pool_hf, cache_root, warn=out.warn)
+    except HfPoolIntegrityError as e:
+        return out.fail("pool_hf_integrity", str(e), REJECTED), None
+    except HfPoolError as e:
+        return out.fail("pool_hf_unavailable", str(e), NETWORK), None
+    except OSError as e:
+        return out.fail("pool_hf_unavailable", f"could not fetch the HF pool: {e}", NETWORK), None
+    out.info(f"pool: {pool.snapshot} (sha256 {pool.sha256}) verified, cached at {pool.path}")
+    return OK, pool
 
 
 def _cmd_score(args: argparse.Namespace) -> int:
@@ -230,10 +265,14 @@ def _cmd_score(args: argparse.Namespace) -> int:
         if not report.ok:
             out.result(verify=report.to_dict())
             return out.fail("verify_failed", "verify failed — fix before scoring:\n" + report.render())
+    from .iterate import DEFAULT_WORK_DIR
     from .training_context import UnresolvedLaunch
 
+    rc, pool_hf = resolve_pool_hf(args, DEFAULT_WORK_DIR, out)
+    if rc != OK:
+        return rc
     try:
-        r = _run_score(args, cfg)
+        r = _run_score(args, cfg, pool_hf=pool_hf)
     except LiveStateUnavailable as e:
         return out.fail("live_warm_start_unavailable", str(e), NETWORK)
     except UnresolvedLaunch as e:
@@ -244,25 +283,33 @@ def _cmd_score(args: argparse.Namespace) -> int:
     except Exception as e:  # noqa: BLE001 — surface any train/eval failure cleanly
         return out.fail("scoring_failed", f"scoring failed: {type(e).__name__}: {e}")
     out.result(**score_result_dict(r), lower_is_better=True)
-    same = "--pool-dir <same pool>" + (f" --warm-start {args.warm_start}" if args.warm_start else "")
+    same = ((f"--pool-hf {pool_hf.snapshot}" if pool_hf is not None else "--pool-dir <same pool>")
+            + (f" --warm-start {args.warm_start}" if args.warm_start else ""))
     out.info(
         f"\nscore: geomean={r.geomean:.5f}  (lower is better)\n"
         f"  pool:    {r.pool_label}  ({r.n_windows} windows)\n"
         f"  corpus:  {r.n_series} series, digest {r.corpus_digest[:12]}…\n"
         f"  init:    {r.init_label}\n"
         f"  trained: {r.train_seconds:.0f}s\n"
-        f"\ncompare against the king:  cascade iterate {args.repo_dir} {same}"
+        + (f"  kept:    {r.checkpoint_dir}  (bench it: cascade bench {r.checkpoint_dir} "
+           f"--king KING_CKPT)\n" if getattr(r, "checkpoint_dir", "") else "")
+        + f"\ncompare against the king:  cascade iterate {args.repo_dir} {same}"
     )
     return OK
 
 
-def _run_score(args: argparse.Namespace, cfg):
+def _run_score(args: argparse.Namespace, cfg, pool_hf=None):
     from .score import score_generator
 
+    extra = {}
+    if pool_hf is not None:
+        extra["pool_hf"] = pool_hf
+    if getattr(args, "keep_ckpt", None) is not None:
+        extra["keep_ckpt"] = args.keep_ckpt
     return score_generator(
         args.repo_dir, cfg, pool_dir=args.pool_dir, pool_ref=args.pool_ref,
         train_hours=args.train_hours, n_windows=args.n_windows, device=args.device,
-        seed=args.seed, warm_start=args.warm_start, at_block=args.at_block,
+        seed=args.seed, warm_start=args.warm_start, at_block=args.at_block, **extra,
     )
 
 
@@ -1549,6 +1596,7 @@ def _add_json_flag(parser: argparse.ArgumentParser, *, root: bool = True) -> Non
 
 
 def build_parser() -> argparse.ArgumentParser:
+    from .bench import add_bench
     from .direct import add_direct
     from .discovery_check import add_discovery_check
     from .iterate import add_iterate
@@ -1566,6 +1614,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_verify(sub)
     add_iterate(sub)
     _add_score(sub)
+    add_bench(sub)
     _add_submit(sub)
     _add_deploy(sub)
     _add_fund(sub)

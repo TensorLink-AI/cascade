@@ -23,6 +23,7 @@ it to minutes.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import tempfile
 from dataclasses import dataclass
@@ -42,18 +43,29 @@ class ScoreResult:
     init_label: str = "random init"
     contract_digest: str = ""
     train_tokens: int = 0
+    # --pool-hf: the retired HF snapshot scored on (folder + tar sha256), so
+    # runs are comparable; empty for every other pool.
+    pool_snapshot: str = ""
+    pool_sha256: str = ""
+    # --keep-ckpt: where the trained checkpoint was kept (empty = discarded).
+    checkpoint_dir: str = ""
 
 
-def _load_pool_windows(cfg, *, pool_dir, pool_ref, n_windows, seed, cache_dir):
+def _load_pool_windows(cfg, *, pool_dir, pool_ref, n_windows, seed, cache_dir, pool_hf=None):
     """Resolve the scoring pool to a list of EvalWindow.
 
-    Precedence: an explicit local ``pool_dir`` (your own held-out .npy/.npz), then
-    a Hub ``pool_ref`` (a pinned public pool), else an offline **synthetic sample**
-    (deterministic, clearly directional — swap in real data for a meaningful
-    signal). Returns ``(windows, label)``.
+    Precedence: a verified retired HF snapshot ``pool_hf`` (:class:`.hf_pool.HfPool`,
+    scored from its extracted tar), an explicit local ``pool_dir`` (your own
+    held-out .npy/.npz), then a Hub ``pool_ref`` (a pinned public pool), else an
+    offline **synthetic sample** (deterministic, clearly directional — swap in
+    real data for a meaningful signal). Returns ``(windows, label)``.
     """
     from ..validator.pool import window_source_from_dir
     from ..validator.windows import build_windows_from_series
+
+    if pool_hf is not None:
+        src = window_source_from_dir(Path(pool_hf.path), cfg, label=pool_hf.label)
+        return src.windows_for_round(seed, n_windows), pool_hf.label
 
     if pool_dir is not None:
         src = window_source_from_dir(Path(pool_dir), cfg, label=f"dir={pool_dir}")
@@ -151,6 +163,8 @@ def score_generator(
     trainer_spec: str = "cascade.trainer.toto2_trainer:Toto2Trainer",
     warm_start: str | Path | None = None,
     at_block: int | None = None,
+    pool_hf=None,
+    keep_ckpt: Path | str | None = None,
 ) -> ScoreResult:
     """Train the fixed model on ``repo_dir``'s corpus at a cheap local budget and
     score it on the resolved pool. Returns a :class:`ScoreResult` (lower geomean better).
@@ -162,6 +176,11 @@ def score_generator(
     ``warm_start`` (see :func:`_resolve_warm_start`) replaces the seeded random
     init with a promoted cascade checkpoint — ``"live"`` for the current era init — and switches the trainer to the warm-started recipe, so
     the run mirrors a live warm-started round instead of a from-scratch one.
+
+    ``pool_hf`` (a resolved :class:`.hf_pool.HfPool`) scores on a retired HF
+    eval-pool snapshot. ``keep_ckpt`` trains into that directory (which must be
+    absent or empty) and keeps it, instead of a discarded temp dir, so the
+    checkpoint can be benched; its path is returned as ``checkpoint_dir``.
     """
     from ..eval.scoring import global_geomean
     from ..shared.manifest import contract_digest
@@ -194,7 +213,8 @@ def score_generator(
     cache.mkdir(parents=True, exist_ok=True)
 
     windows, pool_label = _load_pool_windows(
-        cfg, pool_dir=pool_dir, pool_ref=pool_ref, n_windows=n_win, seed=seed, cache_dir=cache
+        cfg, pool_dir=pool_dir, pool_ref=pool_ref, n_windows=n_win, seed=seed, cache_dir=cache,
+        pool_hf=pool_hf,
     )
     if not windows:
         raise ValueError("scoring pool produced no windows (check --pool-dir / --pool contents)")
@@ -205,7 +225,15 @@ def score_generator(
     base_trainer = _load_trainer(trainer_spec)
     if hasattr(base_trainer, "device"):
         base_trainer.device = device
-    with tempfile.TemporaryDirectory(dir=cache, prefix="ckpt-") as td:
+    if keep_ckpt is not None:
+        keep = Path(keep_ckpt)
+        if keep.exists() and (not keep.is_dir() or any(keep.iterdir())):
+            raise ValueError(f"--keep-ckpt {keep} exists and is not an empty directory")
+        keep.mkdir(parents=True, exist_ok=True)
+        ckpt_ctx = contextlib.nullcontext(str(keep))
+    else:
+        ckpt_ctx = tempfile.TemporaryDirectory(dir=cache, prefix="ckpt-")
+    with ckpt_ctx as td:
         out_dir = Path(td)
         log.info("training on %s at %.3gh (%s point-passes) from %s …",
                  repo.name, hours, f"{token_budget:,}", init_label)
@@ -239,4 +267,7 @@ def score_generator(
         init_label=init_label,
         contract_digest=contract_digest(contract),
         train_tokens=token_budget,
+        pool_snapshot=pool_hf.snapshot if pool_hf is not None else "",
+        pool_sha256=pool_hf.sha256 if pool_hf is not None else "",
+        checkpoint_dir=str(result.local_dir) if keep_ckpt is not None else "",
     )

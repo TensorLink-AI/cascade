@@ -77,6 +77,11 @@ def cmd_init(args):
             f"# Lane {args.lane.upper()} starter\n\n"
             f"Declared target: {args.target or 'none'}.\n\n"
             "Read the deployed llms.txt and run cascade status --json before choosing live rules.\n"
+            + ("The starter yields exactly 32 channels per series (the v2 rule); optional `groups` "
+               "packing is off (`packing.enabled` in config.json) and needs a contract that accepts "
+               "`groups`. `cascade verify DIR --quick` prints the channel and batch geometry it checks.\n"
+               if recipe is None else "")
+            +
             "See docs/AGENT_MINING.md for install, held-out pools, local tests, upload, reveal, funding and outcome tracking.\n"
             "This starter does not establish that a lane is open or that an entry will earn.\n"
             "Do not submit, commit or fund without the human's authorization.\n")
