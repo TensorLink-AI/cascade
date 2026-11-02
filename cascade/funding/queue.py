@@ -256,10 +256,15 @@ def _from_history(item: dict, key: str, default):
 
 
 def _cause_key(error: str) -> str:
-    """A cause signature for "the same fault again": the error's leading text
-    with numbers, hex ids and paths blanked out."""
+    """A cause signature for "the same fault again": a short hash of the
+    error's leading text with numbers, hex ids and paths blanked out. Only the
+    hash is stored — the phase history is a PUBLIC feed and never carries
+    provider error text."""
+    import hashlib
+
     text = re.sub(r"[0-9a-f]{8,}|\d+(\.\d+)?|/[^\s:'\"]+", "#", (error or "").lower())
-    return re.sub(r"\s+", " ", text).strip()[:80]
+    text = re.sub(r"\s+", " ", text).strip()[:80]
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
 
 
 def _phase(entry: FundedEntry, phase: str, now: float, reason: str = "", *, force=False) -> FundedEntry:
