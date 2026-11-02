@@ -1196,6 +1196,36 @@ def own_signal_payload(cfg: ChainConfig, record: ActivationRecord,
     return note
 
 
+def v2b_note_problem(cfg: ChainConfig, record: ActivationRecord | None = None,
+                     forfeit_record: ActivationRecord | None = None,
+                     margin_v2_record: ActivationRecord | None = None,
+                     prelaunch_record: ActivationRecord | None = None) -> str:
+    """Why this node's note would TRIM the DEC-CA-0067 ``v2b-`` segment, or ""
+    (it fits / nothing to signal). Taken with this node's CURRENT records for
+    the other features and the v2b segment at its longest (locked, 7-digit
+    blocks), plus a locked ``cfg-`` overlay segment when ``[netconfig]`` is on
+    (it outranks feature segments). A node whose note drops ``v2b-`` never
+    votes on it — silently but for a WARNING — so the validator refuses to
+    start instead (type the already-decided forfeit / margin-v2 blocks to free
+    room)."""
+    spec = image_decoupled_feature(cfg)
+    if spec is None or not spec.decided_on_chain or not cfg.activation.enabled:
+        return ""
+    big = 9_999_999
+    worst = ActivationRecord(feature=spec.name, lock_block=big, activation_block=big,
+                             source="tally")
+    seg = (ReadySignal("cfg-ffffffff", lock_block=big, activation_block=big)
+           if getattr(getattr(cfg, "netconfig", None), "enabled", False) else None)
+    note = own_signal_payload(cfg, record or ActivationRecord(), forfeit_record,
+                              margin_v2_record, prelaunch_record, seg, None, worst) or ""
+    if spec.name in note.split(":"):
+        return ""
+    return (f"the activation note would exceed {NOTE_MAX_BYTES} bytes and TRIM the "
+            f"{spec.name} segment (note without it: {note!r}) — type the decided "
+            "[scoring] forfeit_from_block / margin_v2_from_block (release chain.toml) to "
+            "free room")
+
+
 def ensure_signal(client: Any, cfg: ChainConfig, record: ActivationRecord, *,
                   hotkey: str, current: dict[str, str] | None = None,
                   forfeit_record: ActivationRecord | None = None,
@@ -1300,5 +1330,10 @@ def summary(cfg: ChainConfig, record: ActivationRecord, t: Tally | None,
         }
         if image_decoupled_tally is not None:
             io["tally"] = image_decoupled_tally.to_json()
+        trim = v2b_note_problem(cfg, record, forfeit_record, margin_v2_record,
+                                prelaunch_record)
+        io["note_fits"] = not trim
+        if trim:
+            io["note_problem"] = trim
         out["image_decoupled"] = io
     return out

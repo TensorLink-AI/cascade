@@ -32,6 +32,17 @@ _LIVE_CREDENTIAL_ENV = (
 
 
 @pytest.fixture(autouse=True)
+def _vote_pin_mode_is_per_test():
+    """DEC-CA-0067: a test that runs a validator/trainer/audit ``main`` turns
+    the process-wide vote-pin guard on; never leak it into the next test."""
+    from cascade.shared.config.loader import require_vote_pin, vote_pin_required
+
+    before = vote_pin_required()
+    yield
+    require_vote_pin(before)
+
+
+@pytest.fixture(autouse=True)
 def _no_live_credentials(monkeypatch):
     """Scrub storage/API credentials so no test can touch live services."""
     for name in _LIVE_CREDENTIAL_ENV:

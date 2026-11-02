@@ -199,23 +199,61 @@ def _deployed_style(tmp_path, drop=("eval_n_windows_after", "image_decoupled_fea
     return p
 
 
-def test_deployed_config_missing_the_keys_refuses_to_load(tmp_path):
+@pytest.fixture
+def voting():
+    """A validator / trainer / audit process (their ``main`` sets this)."""
+    from cascade.shared.config.loader import require_vote_pin
+
+    require_vote_pin()          # reset after the test by tests/conftest.py
+
+
+def test_deployed_config_missing_the_keys_refuses_to_load(tmp_path, voting):
     with pytest.raises(ValueError, match="image_decoupled_feature is not pinned.*v2b-6bbd262b"):
         load_chain_config(_deployed_style(tmp_path))
 
 
-def test_missing_budget_with_the_release_pin_refuses(tmp_path):
+def test_missing_budget_with_the_release_pin_refuses(tmp_path, voting):
     p = _deployed_style(tmp_path, drop=("eval_n_windows_after",))
     with pytest.raises(ValueError, match="computes v2b-6bbd262b"):
         load_chain_config(p)
 
 
-def test_another_budget_than_the_pin_refuses(tmp_path):
+def test_another_budget_than_the_pin_refuses(tmp_path, voting):
     with pytest.raises(ValueError, match="image_decoupled_feature"):
         load_chain_config(_with(tmp_path, eval_n_windows_after=3000))
 
 
-def test_unpinned_is_fine_without_a_vote():
+def test_non_voting_processes_load_a_pinless_config_with_an_error(tmp_path, caplog):
+    """Review 3: train workers on pods, the miner CLI, intake/funding, the
+    provisioner and the satellite never set the vote-pin guard — they load
+    the deployed-style file (ERROR logged) and keep working."""
+    import logging
+
+    with caplog.at_level(logging.ERROR, logger="cascade.config"):
+        cfg = load_chain_config(_deployed_style(tmp_path))
+    assert cfg.v2.image_decoupled_feature == ""
+    assert any("image_decoupled_feature is not pinned" in r.getMessage()
+               for r in caplog.records if r.levelno == logging.ERROR)
+
+
+def test_only_the_voting_entry_points_set_the_guard():
+    import inspect
+
+    import cascade.audit.main as audit_main
+    import cascade.trainer.main as trainer_main
+    import cascade.validator.main as validator_main
+
+    for mod in (validator_main, trainer_main, audit_main):
+        assert "require_vote_pin()" in inspect.getsource(mod.main), mod.__name__
+    root = REPO / "cascade"
+    for rel in ("trainer/worker.py", "miner/cli.py", "funding/main.py", "provision/main.py",
+                "validator/satellite.py", "pool/cli.py", "generation/cli.py"):
+        path = root / rel
+        if path.is_file():
+            assert "require_vote_pin" not in path.read_text(), rel
+
+
+def test_unpinned_is_fine_without_a_vote(voting):
     """No [activation] feature: nothing is voted, so no pin is required (a
     pinned one is still checked)."""
     from dataclasses import replace as _r
@@ -732,3 +770,63 @@ def test_note_with_a_locked_cfg_segment_and_the_v2b_type_rule():
         note = A.own_signal_payload(typed, primary, None, None, A.ActivationRecord(), seg, None,
                                     locked)
         assert v2b not in note and len(note.encode()) <= A.NOTE_MAX_BYTES
+
+
+# ── review 3: the v2b segment must never be silently trimmed ─────────────────
+
+
+def _untyped_blocks(tmp_path):
+    """The release chain.toml (pins set) WITHOUT the typed forfeit / margin-v2
+    blocks — a deployment that applied the pins but not the typed blocks."""
+    text = (REPO / "chain.toml").read_text()
+    for k in ("forfeit_from_block", "margin_v2_from_block"):
+        text, n = re.subn(rf"(?m)^{k}\s*=.*$", f"{k} = 0", text)
+        assert n == 1, k
+    p = tmp_path / "untyped.toml"
+    p.write_text(text)
+    return load_chain_config(p)
+
+
+def _live_records():
+    R = A.ActivationRecord
+    return (R(feature="rolling-era-king", lock_block=9133200, activation_block=9136800,
+              source="tally"),
+            R(feature="forfeit-42b1a486", lock_block=9165600, activation_block=9166500,
+              source="tally"),
+            R(feature="margin-v2-d30eb443", lock_block=9190800, activation_block=9194400,
+              source="tally"))
+
+
+def test_untyped_blocks_would_trim_the_v2b_segment(tmp_path):
+    cfg = _untyped_blocks(tmp_path)
+    rec, fr, mr = _live_records()
+    why = A.v2b_note_problem(cfg, rec, fr, mr)
+    assert "TRIM" in why and "v2b-150ec0d0" in why
+    assert A.v2b_note_problem(load_chain_config(REPO / "chain.toml"), rec) == ""   # typed: fits
+    s = A.summary(cfg, rec, None, fr, None, mr)
+    assert s["image_decoupled"]["note_fits"] is False and "TRIM" in s["image_decoupled"][
+        "note_problem"]
+
+
+def test_validator_refuses_to_start_when_its_note_would_trim_v2b(tmp_path):
+    from cascade.validator.loop import ValidatorRunner
+
+    cfg = _untyped_blocks(tmp_path)
+    rec, fr, mr = _live_records()
+    A.ActivationStore(tmp_path / "act.json").save(rec)
+    A.ActivationStore(tmp_path / "activation_forfeit_state.json").save(fr)
+    A.ActivationStore(tmp_path / "activation_margin_v2_state.json").save(mr)
+    runner = ValidatorRunner(cfg=cfg, activation_store=A.ActivationStore(tmp_path / "act.json"))
+    chain = SimpleNamespace(current_block=lambda: 9_400_000, hotkey_ss58=lambda: "v1")
+    with pytest.raises(RuntimeError, match="refusing to start.*v2b-150ec0d0"):
+        runner._activation_startup(chain)
+
+
+def test_the_trainer_never_refuses_for_the_note_budget(tmp_path):
+    """The trainer never signals: v2b_note_problem is a validator gate only
+    (the trainer's activation tick does not consult it)."""
+    import inspect
+
+    import cascade.trainer.loop as trainer_loop
+
+    assert "v2b_note_problem" not in inspect.getsource(trainer_loop)

@@ -800,6 +800,27 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
     return bind_image_after(cfg)
 
 
+# DEC-CA-0067 fork guard mode. Set ONLY by the entry points of processes
+# that vote on or act on the v2b vote (cascade-validator, cascade-trainer,
+# cascade-audit) via :func:`require_vote_pin`: they REFUSE a config whose
+# pinned feature is missing or wrong. Every other process (train workers on
+# pods, the miner CLI, intake/funding, the provisioner, the satellite) logs
+# an ERROR and keeps working — it neither signals nor tallies the vote.
+_REQUIRE_VOTE_PIN = False
+
+
+def require_vote_pin(enabled: bool = True) -> None:
+    """Make :func:`check_image_decoupled_feature` refuse (raise) instead of
+    logging, for the rest of this process. Called first thing by the
+    validator, trainer and audit ``main``."""
+    global _REQUIRE_VOTE_PIN
+    _REQUIRE_VOTE_PIN = bool(enabled)
+
+
+def vote_pin_required() -> bool:
+    return _REQUIRE_VOTE_PIN
+
+
 def check_image_decoupled_feature(cfg) -> None:
     """DEC-CA-0067 fork guard: the ``v2b-`` feature this config would vote on
     must equal the PINNED ``[v2] image_decoupled_feature``. Its name hashes
@@ -814,15 +835,24 @@ def check_image_decoupled_feature(cfg) -> None:
     spec = image_decoupled_feature(cfg)
     want = (spec.name if spec is not None
             else v2b_feature_name(int(cfg.v2.eval_n_windows_after or 0)))
+    why = ""
     if spec is not None and not pinned:
-        raise ValueError(
-            f"[v2] image_decoupled_feature is not pinned: this config votes on {want} "
-            f"([v2] eval_n_windows_after={int(cfg.v2.eval_n_windows_after or 0)}). Deploy the "
-            "release chain.toml values ([v2] eval_n_windows_after and "
-            "image_decoupled_feature) — refusing to start rather than vote on another feature")
-    if pinned and pinned != want:
-        raise ValueError(
-            f"[v2] image_decoupled_feature = {pinned!r} but this config computes {want} "
-            f"([v2] eval_n_windows_after={int(cfg.v2.eval_n_windows_after or 0)}): it would "
-            "vote on a different DEC-CA-0067 feature than the fleet — fix eval_n_windows_after "
-            "to the release value")
+        why = (f"[v2] image_decoupled_feature is not pinned: this config votes on {want} "
+               f"([v2] eval_n_windows_after={int(cfg.v2.eval_n_windows_after or 0)}). Deploy the "
+               "release chain.toml values ([v2] eval_n_windows_after and "
+               "image_decoupled_feature)")
+    elif pinned and pinned != want:
+        why = (f"[v2] image_decoupled_feature = {pinned!r} but this config computes {want} "
+               f"([v2] eval_n_windows_after={int(cfg.v2.eval_n_windows_after or 0)}): it would "
+               "vote on a different DEC-CA-0067 feature than the fleet — fix "
+               "eval_n_windows_after to the release value")
+    if not why:
+        return
+    if _REQUIRE_VOTE_PIN:
+        raise ValueError(why + " — refusing to start (this process votes on or acts on the "
+                         "v2b vote)")
+    import logging
+
+    logging.getLogger("cascade.config").error(
+        "%s — continuing: this process neither signals nor tallies the vote, but the "
+        "validator / trainer / audit on this config will refuse to start", why)

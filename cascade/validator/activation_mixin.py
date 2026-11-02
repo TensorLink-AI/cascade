@@ -291,6 +291,12 @@ class ActivationMixin:
                                   self._image_decoupled)
         if want is None or want == self._signal_sent:
             return
+        v2b = image_decoupled_feature(self._base_cfg())
+        if (v2b is not None and v2b.decided_on_chain
+                and v2b.name not in want.split(":")):
+            log.error("activation: DEC-CA-0067 segment %s is TRIMMED from this validator's "
+                      "note (over the byte budget) — it is NOT voting on it; type the "
+                      "decided forfeit / margin-v2 blocks", v2b.name)
         try:
             have = dict(client.read_plain_commitments())  # type: ignore[attr-defined]
         except Exception as e:  # noqa: BLE001 — retry next poll
@@ -312,6 +318,7 @@ class ActivationMixin:
         """Restore the persisted decision, apply it, and run one pass."""
         if not self.cfg.activation.enabled:
             return
+
         if self.activation_store is not None:
             self._activation = record_for(self.cfg, self.activation_store.load())
         # Apply a restored rollover FIRST: it switches the settlement grid
@@ -353,6 +360,14 @@ class ActivationMixin:
                          "%d, via %s)", self._image_decoupled.lock_block,
                          self._image_decoupled.activation_block, self._image_decoupled.source)
                 self.apply_image_decoupled_block(self._image_decoupled.activation_block)
+        from ..shared.activation import v2b_note_problem
+
+        trim = v2b_note_problem(self._base_cfg(), self._activation, self._forfeit,
+                                self._margin_v2, self._prelaunch)
+        if trim:
+            # DEC-CA-0067: a validator whose note drops the v2b- segment never
+            # votes on it (only a WARNING per write) — refuse to start instead
+            raise RuntimeError(f"activation: refusing to start — {trim}")
         self._signal_hotkey = str(getattr(client, "hotkey_ss58", lambda: "")() or "")
         if self._activation.locked and self._activation.source != "config":
             log.info("activation: restored lock-in (block %d, rollover %d, via %s)",
