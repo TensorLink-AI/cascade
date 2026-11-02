@@ -111,6 +111,13 @@ class V2Config:
     # private verdict budget is this many windows (the explicit-evidence
     # verdict draw, exactly as ``eval_n_windows``). 0 = no change.
     eval_n_windows_after: int = 0
+    # DEC-CA-0067 CONSENSUS guard: the ``v2b-<hash>`` feature name this node
+    # must compute (it hashes ``eval_n_windows_after``). Required while
+    # ``[activation]`` is on and v2 is scheduled; the loader REFUSES the
+    # config when it is absent or differs from the computed name, so two nodes
+    # can never silently vote on different features (a deployed chain.toml
+    # missing ``eval_n_windows_after`` computes another name).
+    image_decoupled_feature: str = ""
     # DEC-CA-0067 TRAINER-ONLY provenance (never consensus, not in the vote):
     # earlier ``train_image_digest`` pins, exactly as once typed, that a leg
     # trained before a repin may have recorded. The trainer proves such a
@@ -372,6 +379,10 @@ def parse_v2_economics(v2raw: dict) -> dict:
         # typo that would multiply every validator's CPU scoring time
         raise ValueError(f"[v2] eval_n_windows_after must be <= {EVAL_WINDOWS_MAX}; got "
                          f"{out['eval_n_windows_after']}")
+    feat = v2raw.get("image_decoupled_feature", "")
+    if not isinstance(feat, str):
+        raise ValueError(f"[v2] image_decoupled_feature must be a string; got {feat!r}")
+    out["image_decoupled_feature"] = feat.strip()
     out["prior_train_image_digests"] = _parse_prior_images(
         v2raw.get("prior_train_image_digests", []))
     out.update(parse_image_after(v2raw))

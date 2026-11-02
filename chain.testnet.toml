@@ -638,6 +638,8 @@ image_decoupled_from_block = 0
 # non-zero value so the vote's feature hash and the explicit verdict draw are
 # rehearsed exactly as on mainnet.
 eval_n_windows_after = 300
+# Fork guard: the v2b feature name eval_n_windows_after = 300 hashes to.
+image_decoupled_feature = "v2b-c74823cc"
 # TRAINER-ONLY provenance (not consensus, not in the vote): earlier
 # v2.training train_image_digest pins, exactly as once typed, so the trainer
 # can PROVE a pre-repin leg differs only in its image. Append the old pin here

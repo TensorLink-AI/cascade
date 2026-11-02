@@ -150,8 +150,11 @@ def _with(tmp_path, **kv):
 
 
 def test_knobs_round_trip_through_the_loader(tmp_path):
+    from cascade.shared.activation import v2b_feature_name
+
     cfg = load_chain_config(_with(tmp_path, image_decoupled_from_block=9403200,
                                   eval_n_windows_after=3000,
+                                  image_decoupled_feature=f'"{v2b_feature_name(3000)}"',
                                   prior_train_image_digests=f'["{OLD}", "repo@{NEW}"]'))
     assert cfg.v2.image_decoupled_from_block == 9403200
     assert cfg.v2.eval_n_windows_after == 3000
@@ -170,6 +173,71 @@ def test_knobs_round_trip_through_the_loader(tmp_path):
 def test_knobs_refuse_bad_values(tmp_path, key, value):
     with pytest.raises(ValueError, match=key):
         load_chain_config(_with(tmp_path, **{key: value}))
+
+
+# ── the fork guard: the pinned feature name ──────────────────────────────────
+
+
+def test_shipped_configs_pin_the_feature_they_compute():
+    from cascade.shared.activation import v2b_feature_name
+
+    for path, name in (("chain.toml", "v2b-150ec0d0"), ("chain.testnet.toml", "v2b-c74823cc")):
+        cfg = load_chain_config(REPO / path)
+        assert cfg.v2.image_decoupled_feature == name
+        assert v2b_feature_name(cfg.v2.eval_n_windows_after) == name
+
+
+def _deployed_style(tmp_path, drop=("eval_n_windows_after", "image_decoupled_feature")):
+    """The release chain.toml as a deployment that predates the keys would
+    carry it (the live mainnet file lacked eval_n_windows_after)."""
+    text = (REPO / "chain.toml").read_text()
+    for k in drop:
+        text, n = re.subn(rf"(?m)^{k}\s*=.*$\n", "", text)
+        assert n == 1, k
+    p = tmp_path / "deployed.toml"
+    p.write_text(text)
+    return p
+
+
+def test_deployed_config_missing_the_keys_refuses_to_load(tmp_path):
+    with pytest.raises(ValueError, match="image_decoupled_feature is not pinned.*v2b-6bbd262b"):
+        load_chain_config(_deployed_style(tmp_path))
+
+
+def test_missing_budget_with_the_release_pin_refuses(tmp_path):
+    p = _deployed_style(tmp_path, drop=("eval_n_windows_after",))
+    with pytest.raises(ValueError, match="computes v2b-6bbd262b"):
+        load_chain_config(p)
+
+
+def test_another_budget_than_the_pin_refuses(tmp_path):
+    with pytest.raises(ValueError, match="image_decoupled_feature"):
+        load_chain_config(_with(tmp_path, eval_n_windows_after=3000))
+
+
+def test_unpinned_is_fine_without_a_vote():
+    """No [activation] feature: nothing is voted, so no pin is required (a
+    pinned one is still checked)."""
+    from dataclasses import replace as _r
+
+    from cascade.shared.config.loader import check_image_decoupled_feature
+
+    cfg = load_chain_config(REPO / "chain.toml")
+    off = _r(cfg, activation=_r(cfg.activation, feature=""))
+    check_image_decoupled_feature(_r(off, v2=_r(off.v2, image_decoupled_feature="")))
+    with pytest.raises(ValueError, match="image_decoupled_feature"):
+        check_image_decoupled_feature(_r(off, v2=_r(off.v2, eval_n_windows_after=1)))
+
+
+def test_typed_switch_on_the_post_rollover_era_grid(tmp_path):
+    """Review 2: an undecided DEC-CA-0045 rollover (repo config) still accepts
+    every real post-rollover era start ((epoch_blocks_after) x era_settlements
+    = 3600), not only multiples of the pre-rollover 14400."""
+    for b in (9504000, 9507600, 9511200):
+        cfg = load_chain_config(_with(tmp_path, image_decoupled_from_block=b))
+        assert cfg.v2.image_decoupled_from_block == b
+    with pytest.raises(ValueError, match="not an era start"):
+        load_chain_config(_with(tmp_path, image_decoupled_from_block=9505800))
 
 
 # ── the vote ─────────────────────────────────────────────────────────────────

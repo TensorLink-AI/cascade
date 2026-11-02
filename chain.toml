@@ -1197,6 +1197,10 @@ image_decoupled_from_block = 0
 # Bundled with the same block (part of the vote's hash): the v2 private
 # verdict budget becomes this many windows. Inert until the switch.
 eval_n_windows_after = 4000
+# Fork guard (CONSENSUS): the v2b feature name the two values above hash to.
+# Every node loads only if it computes exactly this name (missing or another
+# eval_n_windows_after => refuses to start, never votes on another feature).
+image_decoupled_feature = "v2b-150ec0d0"
 # TRAINER-ONLY provenance (not consensus, not in the vote): earlier
 # v2.training train_image_digest pins, exactly as once typed, so the trainer
 # can PROVE a pre-repin leg differs only in its image. Append the old pin here
