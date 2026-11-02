@@ -161,7 +161,7 @@ def upload_harvested_checkpoint(runner, record: dict, *, base_seed) -> TrainedEn
     attempt fails the copy stays, a pending-upload record lets the requeued
     leg re-upload it instead of retraining, and :class:`_OperatorFault` is
     raised (infra, never an attempt burn)."""
-    from .faults import _OperatorFault
+    from .faults import StorageFault
 
     # r2 transport: the verified checkpoint is on R2 (``record["r2"]``), not
     # on this box; the push runs from there (relay / bounded local temp).
@@ -199,7 +199,7 @@ def upload_harvested_checkpoint(runner, record: dict, *, base_seed) -> TrainedEn
     if up is None:
         write_pending_upload(runner.work_root, base_seed, hotkey, record)
         where = "kept on R2" if r2 else "kept"
-        raise _OperatorFault(
+        raise StorageFault(
             f"checkpoint upload failed after {HARVEST_UPLOAD_ATTEMPTS} attempts (operator "
             f"storage; the harvested checkpoint is {where} for the requeued leg): {last}")
     entry = TrainedEntry(

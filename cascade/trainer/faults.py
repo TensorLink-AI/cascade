@@ -48,6 +48,13 @@ class _OperatorFault(RuntimeError):
     budget is for failures on the miner's own pod (DEC-CA-0036)."""
 
 
+class StorageFault(_OperatorFault):
+    """OUR storage lost a verified checkpoint's upload after every retry (the
+    harvested copy is kept for the re-upload): an operator fault the box
+    health tracks (cascade.trainer.box_health — the same class on two legs
+    halts every rent)."""
+
+
 class _FundedLegSkip(Exception):
     """A funded challenger leg that settled its own queue verdict (rent/setup
     failure) and must simply be dropped from the round — never retried on the
