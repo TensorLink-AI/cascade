@@ -183,12 +183,18 @@ rewriting is needed. See [the decision](../decisions/DEC-CA-0066-fixed-generator
 
 ## Sources (shipped)
 
+**Mainnet uses only `tsbench_forge`**: the daily publish
+(`.github/workflows/publish-pool.yml`) builds with `--sources tsbench_forge`,
+labelled with the 7 GIFT-Eval domains `econ_fin`, `energy`, `healthcare`,
+`nature`, `sales`, `transport`, `web_cloudops`. The other sources are
+supported by the builder but not used on mainnet.
+
 | name            | domain          | freq       | seasonality | notes |
 |-----------------|-----------------|------------|-------------|-------|
-| `openmeteo`     | weather         | H          | 24 (daily)  | keyless archive API; global grid (~252 pts × 12 vars), fills full context |
-| `wikimedia`     | web_traffic     | D          | 7 (weekly)  | keyless REST API; ~85 articles, shorter-context breadth |
-| `tsbench_forge` | 7 GIFT domains  | 30S–D      | per cadence | reads a synced [tsbench-forge](https://github.com/tensorlink-dev/TSBench-Forge) scraper mirror (~90 feeds, 36 DGP classes); needs the `pool-forge` extra |
-| `synthetic`     | synthetic       | H          | 24          | offline/testing only — **not** for a real pool |
+| `openmeteo`     | weather         | H          | 24 (daily)  | supported by the builder, not used on mainnet; keyless archive API; global grid (~252 pts × 12 vars), fills full context |
+| `wikimedia`     | web_traffic     | D          | 7 (weekly)  | supported by the builder, not used on mainnet; keyless REST API; ~85 articles, shorter-context breadth |
+| `tsbench_forge` | 7 GIFT domains  | 30S–D      | per cadence | **the mainnet source**; reads a synced [tsbench-forge](https://github.com/tensorlink-dev/TSBench-Forge) scraper mirror (~90 feeds, 36 DGP classes); needs the `pool-forge` extra |
+| `synthetic`     | synthetic       | H          | 24          | supported by the builder, not used on mainnet; offline/testing only — **not** for a real pool |
 
 ### tsbench-forge (bucket relay)
 

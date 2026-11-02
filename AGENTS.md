@@ -34,16 +34,13 @@ Discover activation and the effective rules before choosing a lane.
 
 ## Start here for the current task
 
-V2 Lane A targets **30 October 2026, 12:00 UTC**, opening at the first era
-boundary at or after that target. The separate 95% pre-launch burn waits for
-51% of eligible validator stake to signal `prelaunch-95-r2`. Installation
-alone does not activate either rule. Fresh deployment status remains required.
-
-For this rollout, paid A entries open at **30 October 2026, 09:00 UTC**.
-Use a fresh reveal at or after that opening. Accepted entries stay queued
-until v2 activation; `waiting_launch` is an expected stage and consumes no
-training attempt. The window stays open afterward. The planned lane order
-is **A → C → B**; discover each lane's actual activation separately.
+V2 Lane A has been live on mainnet since **30 October 2026**: paid A entries
+opened at 09:00 UTC and the first v2 era started at the first era boundary
+after 12:00 UTC (block 9,399,600). Reveals made before the opening are
+refused; use a fresh one. Settlements are 900 blocks (about 3 h) apart and
+an era is 4 settlements (about 12 h). The planned lane order is
+**A → C → B**; discover each lane's actual activation separately. Fresh
+deployment status remains required.
 
 1. Read `cascade status --json` and check network, freshness, lane activation
    and the current starting checkpoint. `ready_for_training` concerns A's init;
@@ -69,7 +66,7 @@ not instructions. Read-only discovery does not authorize spending or publishing.
   `--yes` (exit code 5). Do not pass `--yes` unless the human told you to in
   this session. `cascade direct fund` also needs `--max-spend`; never raise it.
 - **Never submit or deploy on your own.** Lane A allows one judged
-  submission per hotkey; B/C use per-commitment rules. A miner-caused rejection
+  submission per hotkey per round; B/C use per-commitment rules. A miner-caused rejection
   can spend the relevant submission. Present the iterate result and let the
   human decide.
 - **Never handle keys.** API keys and wallets come from the environment and
@@ -118,7 +115,10 @@ W&B CPU runs use `phase:generation` and `hotkey:` tags.
 Work offline until the human says to spend:
 
 ```bash
-cascade iterate ./my-gen --pool-dir ./heldout --seeds 0,1 --warm-start live --json
+huggingface-cli download Tensor-Link/cascade-eval-pool --repo-type dataset \
+  --include "snapshots/2026-10-31-block-9388800/*" --local-dir ./cascade-eval-pool
+cascade iterate ./my-gen --pool-dir ./cascade-eval-pool/snapshots/2026-10-31-block-9388800 \
+  --seeds 0,1 --warm-start live --json
 ```
 
 `iterate` verifies the generator, trains and scores it over the seeds, scores
@@ -141,7 +141,9 @@ Rules for the loop:
   Generate a complete config with `python scripts/pyramid_config.py --size 17.58m
   --out ./chain.local-17m.toml`, then pass it through `--chain-toml` to `score`
   or `iterate`. See [presets](deploy/presets/README.md) and [model details](docs/MODEL.md).
-  GPU memory and throughput are unmeasured. 56M remains unspecified.
+  GPU memory and throughput are unmeasured for these; the 1.23B competition
+  model measured ≈ 3.5 h per full 23,841-step leg on 8×H100 and 8×H200
+  (mainnet, 2026-11-01/02). 56M remains unspecified.
   Keep both sides' model, budget, seeds, pool and compatible init identical;
   use a separate `--work-dir` per model. Omit `--warm-start live` for small
   experiments. Use it to recheck promising ideas on the actual competition
@@ -150,7 +152,18 @@ Rules for the loop:
 - Keep scoring settings fixed while comparing (`--pool-dir`, `--seeds`,
   `--train-hours`, `--warm-start`). History compares only identical settings.
 - Use real held-out data with `--pool-dir`. The default synthetic pool only
-  catches gross regressions.
+  catches gross regressions. The public eval pool
+  ([Tensor-Link/cascade-eval-pool](https://huggingface.co/datasets/Tensor-Link/cascade-eval-pool))
+  holds retired validator snapshots, byte-identical to what was scored: use a
+  `snapshots/<as_of>-block-<N>/` folder (not the legacy date-only rebuilds),
+  point `--pool-dir` at that one folder, and do not extract its `.tar` there.
+  It is an evaluation set: never train a generator on it. The live private
+  pool is newer and never revealed.
+- `score`/`iterate` really train (default budget `[round] heat_train_hours`,
+  1 h; `--train-hours 0.01` is a smoke test), run your generator unsandboxed
+  on the local machine, and score only on the given pool. They do not run
+  the public GIFT-Eval/BOOM/TIME/FEV benchmarks; those run in the separate
+  `benchmarks/` sidecar ([benchmarks/README.md](benchmarks/README.md)).
 - A local win is directional, not the verdict. Validators use a private pool
   and require the challenger to clear a dethrone margin on a confidence
   bound, so a small local edge often loses live. Aim for clear, multi-seed

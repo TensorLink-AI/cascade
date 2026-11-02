@@ -101,7 +101,9 @@ Channel economics:
   and `batch_size = 64`, a C-channel batch contains 64 series, or 64 × C
   channel sequences. Under `series_points` this preserves the budgeted update
   count across widths; other denominations can change it. The wall can still
-  stop a slow run early.
+  stop a slow run early. Mainnet v2 uses `batch_denomination = "sequences"`
+  with `batch_size = 512`: each step holds 512 ÷ 32 = 16 series of 32
+  channels (`max(1, batch_size // C)` in `iter_training_batches`).
 * **Cross-channel structure only pays if it is real.** Multivariate eval
   windows are scored jointly (all channels forecast in one pass; the window
   counts once), and eval windows carry at most 32 channels whatever your C.

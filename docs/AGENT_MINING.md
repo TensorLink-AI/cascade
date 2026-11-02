@@ -7,11 +7,12 @@ qualification, merge acceptance and forward confirmation remain validator decisi
 Read [AGENTS.md](../AGENTS.md) for authorization and JSON-output rules.
 Use only local/read-only work until the human authorizes a live action.
 
-For this rollout, paid A entries open **30 October 2026, 09:00 UTC**. Use a
-fresh reveal at or after that opening. Accepted entries wait in `waiting_launch`
-until actual v2 activation, without a training attempt being consumed. Entries
-stay open afterward. The planned lane order is **A → C → B**; discover each
-lane's active state separately.
+V2 Lane A has been live on mainnet since **30 October 2026** (paid A entries
+opened 09:00 UTC; the first v2 era started at block 9,399,600). Use a reveal
+made at or after that opening; earlier reveals are refused. Settlements are
+900 blocks (about 3 h) apart and an era is 4 settlements (about 12 h). The
+planned lane order is **A → C → B**; discover each lane's active state
+separately.
 
 **Route:** install → choose A/B/C below → compare locally → preflight and human
 review → submit/fund if authorized → track the exact entry → read signed results.
@@ -57,9 +58,33 @@ V2 synthetic generators must emit finite float arrays `(C, L)` with **exactly 32
 ```bash
 cascade init ./my-a --lane a --json
 cascade verify ./my-a --quick --json
-cascade iterate ./my-a --pool-dir ./heldout --seeds 0,1 \
-  --warm-start live --train-hours 0.01 --device cpu --json
+huggingface-cli download Tensor-Link/cascade-eval-pool --repo-type dataset \
+  --include "snapshots/2026-10-31-block-9388800/*" --local-dir ./cascade-eval-pool
+cascade iterate ./my-a --pool-dir ./cascade-eval-pool/snapshots/2026-10-31-block-9388800 \
+  --seeds 0,1 --warm-start live --train-hours 0.01 --device cpu --json
 ```
+
+The held-out data above is the public eval pool
+([Tensor-Link/cascade-eval-pool](https://huggingface.co/datasets/Tensor-Link/cascade-eval-pool)):
+a lagged reveal of **retired** held-out snapshots, byte-identical to what
+validators scored. Use `snapshots/<as_of>-block-<N>/` folders only (the
+legacy `snapshots/<YYYY-MM-DD>/` folders through 2026-08-03 are rebuilds);
+the latest is `2026-10-31-block-9388800` (3,841 series, sha256
+`cb9b64d24f30fc41321058bb56583a60986a0a8e480bd5967962d21fe6896649`). Point
+`--pool-dir` at one snapshot folder: it loads every `.npy` under it
+recursively plus that folder's `metadata.json`, and ignores the `.tar`,
+`POOL_SHA256` and `provenance.json`. Do not extract the `.tar` there. It is
+an **evaluation** set: score on it, never train a generator on it. The live
+private pool (TSBench-Forge only, 7 GIFT-Eval domains) is newer and never
+revealed, so local scores are directional. Details:
+[MINER.md](MINER.md#held-out-data-the-public-eval-pool).
+
+`score`/`iterate` really train (the live trainer, pyramid MoE), run your
+generator locally **without** the sandbox, score only on the pool you pass,
+and do **not** run the public GIFT-Eval/BOOM/TIME/FEV benchmarks; those run
+in the separate [benchmarks sidecar](../benchmarks/README.md) and on mainnet
+can only block a private-pool win. `--train-hours 0.01` is a smoke test
+(79 steps); the default is `[round] heat_train_hours` (1 h).
 
 `--quick` runs static checks and generates two small corpora in a child with a
 30-second timeout. Its digest covers only that small sample; it is **not** the
@@ -82,7 +107,10 @@ cascade iterate ./my-a --chain-toml ./chain.local-17m.toml --pool-dir ./heldout 
 ```
 
 Use your installed Python environment. See [preset instructions](../deploy/presets/README.md)
-and [the model recipe](MODEL.md). GPU performance is unmeasured. Keep both sides'
+and [the model recipe](MODEL.md). GPU performance is unmeasured for the small
+variants; the 1.23B competition model measured ≈ 3.5 h per full leg
+(23,841 steps at ~112–115 steps/min) on both 8×H100 and 8×H200 on mainnet,
+2026-11-01/02. Keep both sides'
 model, budget, seeds, pool and compatible init identical, with a separate history
 per model. Omit `--warm-start live` for this experiment: it selects the live
 competition model. Recheck promising ideas on that model before submission.
@@ -93,8 +121,8 @@ The local budget above is 36 seconds of reference compute per training run,
 subject to the configured wall guard; two seeds and two generators are four
 runs. It is not the paid live budget. The default scoring budget is larger.
 
-Put real held-out `.npy`/`.npz` series in `heldout/`, kept outside the generator
-tree. Each must be long enough for the effective context plus forecast horizon.
+Put real held-out `.npy`/`.npz` series in `heldout/` (or use a public eval
+pool snapshot as above), kept outside the generator tree. Each must be long enough for the effective context plus forecast horizon.
 `metadata.json` can map a filename stem (or `archive:key` for `.npz`) to:
 
 ```json

@@ -13,7 +13,7 @@ its checkpoints do not merge into A/B.
 You can follow the research without mining: open [Benchmarks](./index.html),
 choose GIFT-Eval and MASE × CRPS, and enable King trajectory. Lower error on
 both axes is better for that benchmark; compare matching tasks and revisions.
-The repository's [introduction](https://github.com/TensorLink-AI/cascade/blob/cascade-v2/agent.md)
+The repository's [introduction](https://github.com/TensorLink-AI/cascade/blob/main/agent.md)
 includes a labelled illustrative example and explains how to inspect the
 [published receipt index](./receipts/index.json). These v2 controls require the
 matching dashboard release; missing panels or reports are not measured results.
@@ -24,14 +24,14 @@ not live configuration.
 
 ## Start here
 
-- [Competition introduction](https://github.com/TensorLink-AI/cascade/blob/cascade-v2/agent.md): purpose, what changed from v1, lanes and how contributions accumulate.
+- [Competition introduction](https://github.com/TensorLink-AI/cascade/blob/main/agent.md): purpose, what changed from v1, lanes and how contributions accumulate.
 - [Mining dashboard](./index.html): current competitions, queues, rewards and warm start.
 - [Live competition policy](./status/v2.json): activation, targets, gates, budgets, pinned base and warm_start.
 - [Chain clock](./status/chain.json): current block, era grid and publication time.
-- [Miner guide](https://github.com/TensorLink-AI/cascade/blob/cascade-v2/docs/MINER.md): full workflow and failure classes.
-- [Generator interface](https://github.com/TensorLink-AI/cascade/blob/cascade-v2/docs/INTERFACE.md): read before editing a generator.
-- [Agent instructions](https://github.com/TensorLink-AI/cascade/blob/cascade-v2/AGENTS.md): local checks and spending boundaries.
-- [Agent walkthrough](https://github.com/TensorLink-AI/cascade/blob/cascade-v2/docs/AGENT_MINING.md): complete lane A/B/C setup, local tests and review flow.
+- [Miner guide](https://github.com/TensorLink-AI/cascade/blob/main/docs/MINER.md): full workflow and failure classes.
+- [Generator interface](https://github.com/TensorLink-AI/cascade/blob/main/docs/INTERFACE.md): read before editing a generator.
+- [Agent instructions](https://github.com/TensorLink-AI/cascade/blob/main/AGENTS.md): local checks and spending boundaries.
+- [Agent walkthrough](https://github.com/TensorLink-AI/cascade/blob/main/docs/AGENT_MINING.md): complete lane A/B/C setup, local tests and review flow.
 
 Use the matching network configuration throughout. A testnet host reads a
 different manifest bucket; do not combine its queues/checkpoints with mainnet.
@@ -40,16 +40,12 @@ features are available on a deployment. Check `cascade --help` on an older CLI.
 
 ## Pull a fresh snapshot
 
-V2 Lane A targets **30 October 2026, 12:00 UTC**, aligned to the first era
-boundary at or after that time using finalized chain timestamps. Installing
-the release does not open the lane. The separate 95% burn starts after 51%
-of eligible validator stake signals `prelaunch-95-r2`, from the following
-settlement boundary. B/C activation is separate; verify live policy.
-
-Paid A entries open **30 October 2026, 09:00 UTC**. Use a fresh revealed
-commitment from that opening. Accepted entries report `waiting_launch` until
-the actual v2 era, with no training attempt consumed during the hold. The
-window remains open afterward. The planned lane order is **A → C → B**.
+V2 Lane A is live on mainnet: paid A entries opened **2026-10-30 09:00 UTC**
+and the first v2 era started at the first era boundary after 12:00 UTC
+(block 9,399,600). Use a revealed commitment made at or after the opening;
+earlier reveals are refused. Settlements are 900 blocks (about 3 h) apart;
+an era is 4 settlements (about 12 h). B/C activation is separate; verify live policy.
+Planned order: **A → C → B**.
 
 Default to local/read-only work. Publication, chain commitments, submissions
 and paid funding require the human's authorization. Never add `--yes` without it,
@@ -118,12 +114,14 @@ For cheaper generator optimization, use `cascade score` or `cascade iterate`
 on Cascade MoE Base - 17.58M, 69.02M or 273.84M. Model names use total parameters.
 Cascade MoE Base - 1.23B
 has 1,234,607,520 total / 112,070,048 active parameters. 56M remains unspecified.
-See the [presets](https://github.com/TensorLink-AI/cascade/blob/cascade-v2/deploy/presets/README.md)
-and [model recipe](https://github.com/TensorLink-AI/cascade/blob/cascade-v2/docs/MODEL.md).
+See the [presets](https://github.com/TensorLink-AI/cascade/blob/main/deploy/presets/README.md)
+and [model recipe](https://github.com/TensorLink-AI/cascade/blob/main/docs/MODEL.md).
 From the checkout, `python scripts/pyramid_config.py --size 17.58m --out ./chain.local-17m.toml`
 writes a complete local config. Pass it with `--chain-toml`, keeping both sides'
 model, budget, seeds, pool and compatible init identical. Use separate histories
-per model. GPU performance is unmeasured for this port. Omit `--warm-start live`
+per model. GPU performance is unmeasured for this port, except the 1.23B
+model's wall: ≈ 3.5 h per full 23,841-step leg on both 8xH100 and 8xH200
+(mainnet, 2026-11-01/02); mainnet rents only those two layouts. Omit `--warm-start live`
 for small-model experiments; use it for the final check on the actual competition
 model. Small-model gains do not establish live wins or rewards.
 
@@ -180,10 +178,44 @@ directional; they do not guarantee a live win.
 ```bash
 cascade verify ./my-gen --json
 cascade verify ./my-gen --quick --json
-cascade iterate ./my-gen --pool-dir ./heldout --seeds 0,1 --warm-start live --json
+cascade iterate ./my-gen --pool-dir ./cascade-eval-pool/snapshots/2026-10-31-block-9388800 --seeds 0,1 --warm-start live --json
 cascade round --once --json
 cascade duel --history --json
 ```
+
+Score on real held-out data: the public eval pool
+[Tensor-Link/cascade-eval-pool](https://huggingface.co/datasets/Tensor-Link/cascade-eval-pool)
+is a lagged reveal of **retired** validator snapshots, byte-identical to what
+was scored. Use `snapshots/<as_of>-block-<N>/` folders (legacy date-only
+folders through 2026-08-03 are rebuilds); the latest is
+`snapshots/2026-10-31-block-9388800` (3,841 series). Each holds the scored
+`block-<N>.tar`, `POOL_SHA256`, unpacked `<series_id>.npy`, `metadata.json`
+(`freq`, `seasonal_period`, `domain`, `source`; older snapshots can include
+sources no longer used) and `provenance.json`. Point `--pool-dir` at one
+snapshot folder; it reads the `.npy` files and `metadata.json` and ignores
+the rest. It is an evaluation set: never train a generator on it. The live
+private pool is newer, never revealed, and built only from
+[TSBench-Forge](https://github.com/tensorlink-dev/TSBench-Forge) across the 7
+GIFT-Eval domains (econ_fin, energy, healthcare, nature, sales, transport,
+web_cloudops), so local scores are directional.
+
+```bash
+huggingface-cli download Tensor-Link/cascade-eval-pool --repo-type dataset \
+  --include "snapshots/2026-10-31-block-9388800/*" --local-dir ./cascade-eval-pool
+cascade iterate ./my-gen --pool-dir ./cascade-eval-pool/snapshots/2026-10-31-block-9388800 \
+  --seeds 0,1 --warm-start live --json
+```
+
+`score`/`iterate` really train (default `[round] heat_train_hours`, 1 h;
+`--train-hours 0.01` is a smoke test), run your generator locally without
+the sandbox, and score only on the given pool. They do not run the public
+GIFT-Eval/BOOM/TIME/FEV benchmarks: those run in the separate `benchmarks/`
+sidecar and, on mainnet, can only block a private-pool win.
+
+Geometry on mainnet v2: every yield is `(32, L)` (no padding, so pack
+narrower processes into the 32 rows; `groups` labels are optional); each
+step trains 16 series × 32 channels at context 4096 for 23,841 steps;
+series longer than 4096 are cropped into random 4096-point windows.
 
 Create a new source-only starter with `cascade init ./my-gen --lane a --json`.
 Use `verify --quick` after each edit: it checks two small corpora with a 30-second
