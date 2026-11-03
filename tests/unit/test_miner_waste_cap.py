@@ -326,6 +326,7 @@ def test_the_cli_flag_round_trips_through_the_intake(tmp_path):
     from tests.unit.test_miner_chosen_gpu import _clock, _intake, _sign
 
     args = build_parser().parse_args(["fund", "https://intake.example", "--ref", GREF,
+                                      "--wallet-name", "w", "--wallet-hotkey", "h",
                                       "--max-total-spend", "75"])
     assert args.max_total_spend == 75.0
     h = build_fund_headers("fund", GHK, GREF, "sk", _sign, now=_clock, max_total_spend=75.0)
