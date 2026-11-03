@@ -53,7 +53,7 @@ def forecasts_via_host(host, checkpoint, windows, *, contract, num_samples,
     """
     from ..eval.checkpoint_guard import CheckpointTampered, verify_checkpoint
     from .evaluator import EvaluatorError
-    from .private_worker import CHECKPOINT_FILES, read_forecasts, write_request
+    from .private_worker import CHECKPOINT_FILES, check_forecasts, write_request
 
     try:
         verify_checkpoint(checkpoint, contract)
@@ -73,36 +73,43 @@ def forecasts_via_host(host, checkpoint, windows, *, contract, num_samples,
             raise PrivateEvalUnavailable("private evaluation transport/worker failed")
         return proc
 
+    tmpdir = tempfile.TemporaryDirectory(prefix="cascade-private-eval-")
     try:
-        with tempfile.TemporaryDirectory(prefix="cascade-private-eval-") as tmp:
-            local = Path(tmp)
-            request = local / "request.npz"
-            identity = write_request(request, checkpoint, windows,
-                                     contract=contract, num_samples=num_samples)
-            step(build_ssh_argv(host, f"umask 077 && mkdir -p {shlex.quote(base + '/checkpoint')}"))
-            for name in CHECKPOINT_FILES:
-                step(build_scp_argv(host, str(Path(checkpoint) / name), f"{base}/checkpoint/{name}"))
-            step(build_scp_argv(host, str(request), f"{base}/request.npz"))
-            argv = [host.remote_python, "-m", "cascade.validator.private_worker",
-                    f"{work}/checkpoint", f"{work}/request.npz", f"{work}/samples.npz",
-                    "--device", "cuda", "--workers", str(workers)]
-            env = "OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 "
-            if host.cuda_device is not None:
-                env += f"CUDA_VISIBLE_DEVICES={shlex.quote(host.cuda_device)} "
-            command = (f"cd {shlex.quote(host.workdir)} && " + env
-                       + f"timeout --signal=TERM --kill-after=15s {max(1, int(deadline - time.monotonic()) - 15)}s "
-                       + " ".join(shlex.quote(a) for a in argv))
-            step(build_ssh_argv(host, command))
-            size = step(build_ssh_argv(host, f"stat -c %s {shlex.quote(base + '/samples.npz')}"))
-            budget = (sum(w.n_channels * num_samples * w.horizon * 8 for w in windows)
-                      + (len(windows) + 1) * 8192)
-            if not 0 < int(size.stdout.strip()) <= budget:
-                raise PrivateEvalUnavailable("private evaluation response exceeds its shape budget")
-            output = local / "samples.npz"
-            download = build_scp_argv(host, "unused", "unused")
-            download[-2:] = [f"{host.user}@{host.host}:{base}/samples.npz", str(output)]
-            step(download)
-            return read_forecasts(output, identity, windows, num_samples)
+        local = Path(tmpdir.name)
+        request = local / "request.npz"
+        identity = write_request(request, checkpoint, windows,
+                                 contract=contract, num_samples=num_samples)
+        step(build_ssh_argv(host, f"umask 077 && mkdir -p {shlex.quote(base + '/checkpoint')}"))
+        for name in CHECKPOINT_FILES:
+            step(build_scp_argv(host, str(Path(checkpoint) / name), f"{base}/checkpoint/{name}"))
+        step(build_scp_argv(host, str(request), f"{base}/request.npz"))
+        argv = [host.remote_python, "-m", "cascade.validator.private_worker",
+                f"{work}/checkpoint", f"{work}/request.npz", f"{work}/samples.npz",
+                "--device", "cuda", "--workers", str(workers)]
+        env = "OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 "
+        if host.cuda_device is not None:
+            env += f"CUDA_VISIBLE_DEVICES={shlex.quote(host.cuda_device)} "
+        command = (f"cd {shlex.quote(host.workdir)} && " + env
+                   + f"timeout --signal=TERM --kill-after=15s {max(1, int(deadline - time.monotonic()) - 15)}s "
+                   + " ".join(shlex.quote(a) for a in argv))
+        step(build_ssh_argv(host, command))
+        size = step(build_ssh_argv(host, f"stat -c %s {shlex.quote(base + '/samples.npz')}"))
+        budget = (sum(w.n_channels * num_samples * w.horizon * 8 for w in windows)
+                  + (len(windows) + 1) * 8192)
+        if not 0 < int(size.stdout.strip()) <= budget:
+            raise PrivateEvalUnavailable("private evaluation response exceeds its shape budget")
+        output = local / "samples.npz"
+        download = build_scp_argv(host, "unused", "unused")
+        download[-2:] = [f"{host.user}@{host.host}:{base}/samples.npz", str(output)]
+        step(download)
+        # Validate EVERY window first (a corrupt/partial reply still holds
+        # the round as infrastructure, never a miner fault), then stream
+        # the samples one window at a time into the scorer: the full
+        # duel's samples never sit in the validator's RAM at once.
+        check_forecasts(output, identity, windows, num_samples)
+        streamed = StreamedForecasts(output, windows, num_samples, tmpdir)
+        tmpdir = None              # owned by ``streamed`` now
+        return streamed
     except PrivateEvalUnavailable:
         raise
     except Exception as e:
@@ -114,6 +121,55 @@ def forecasts_via_host(host, checkpoint, windows, *, contract, num_samples,
                 log.warning("private eval cleanup failed on %s; remove %s", host.name, base)
         except Exception:
             log.warning("private eval cleanup unavailable on %s; remove %s", host.name, base)
+        if tmpdir is not None:
+            tmpdir.cleanup()
+
+
+class StreamedForecasts:
+    """The validated forecast samples of one private eval, yielded in window
+    order straight from the downloaded NPZ (identical arrays and order to the
+    old in-memory list). Owns the local temp dir; :meth:`close` (or exhausting
+    the iterator) removes it. A read failure here is infrastructure
+    (:class:`PrivateEvalUnavailable`) — the reply was already validated."""
+
+    def __init__(self, path, windows, num_samples, tmpdir):
+        self.path, self.windows, self.num_samples = Path(path), list(windows), int(num_samples)
+        self._tmpdir = tmpdir
+        self._gen = None
+
+    def __len__(self) -> int:
+        return len(self.windows)
+
+    def __iter__(self):
+        from .private_worker import iter_forecasts
+
+        if self._tmpdir is None:
+            raise PrivateEvalUnavailable("private evaluation samples already released")
+
+        def gen():
+            try:
+                yield from iter_forecasts(self.path, self.windows, self.num_samples)
+            except Exception as e:  # noqa: BLE001 — validated already: never a miner fault
+                raise PrivateEvalUnavailable(
+                    f"private evaluation samples unreadable: {type(e).__name__}") from e
+            finally:
+                self.close()
+
+        self._gen = gen()
+        return self._gen
+
+    def close(self) -> None:
+        gen, self._gen = self._gen, None
+        if gen is not None:
+            with contextlib.suppress(Exception):
+                gen.close()
+        tmp, self._tmpdir = self._tmpdir, None
+        if tmp is not None:
+            with contextlib.suppress(Exception):
+                tmp.cleanup()
+
+    def __del__(self):
+        self.close()
 
 
 def make_eval_host_fn(path: Path | str, *, local_fallback: bool = True) -> Callable[[], RemoteHost | None]:

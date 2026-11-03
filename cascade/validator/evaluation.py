@@ -165,11 +165,19 @@ class EvaluationMixin:
             host = private_host_fn()
             if host is None:
                 raise PrivateEvalUnavailable("configured private evaluation GPU host is unavailable")
-            samples = iter(forecasts_via_host(
+            forecasts = forecasts_via_host(
                 host, dest, windows, contract=contract, num_samples=self.cfg.eval.num_samples,
-                workers=workers, timeout_s=self.private_eval_timeout_s))
-            return score_joint_forecaster_on_windows(
-                lambda *_: next(samples), windows, self.cfg.eval.num_samples)
+                workers=workers, timeout_s=self.private_eval_timeout_s)
+            # Streamed one window at a time (validated in full first); the
+            # downloaded samples file is released as soon as scoring ends.
+            try:
+                samples = iter(forecasts)
+                return score_joint_forecaster_on_windows(
+                    lambda *_: next(samples), windows, self.cfg.eval.num_samples)
+            finally:
+                close = getattr(forecasts, "close", None)
+                if callable(close):
+                    close()
         return evaluate_checkpoint(
             dest, windows, num_samples=self.cfg.eval.num_samples, device=self.device,
             contract=contract, workers=workers,
