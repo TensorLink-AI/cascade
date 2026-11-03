@@ -68,3 +68,15 @@ def test_a_healthy_stream_still_extracts_under_the_watchdog(tmp_path, monkeypatc
     dest = remote_mod.harvest_remote_dir(RemoteHost(name="p", host="h"), "/w/ck",
                                          tmp_path / "out", timeout=30, stall_timeout=5)
     assert (dest / "weights.safetensors").read_bytes() == b"W" * 4096
+
+
+def test_a_slow_but_moving_harvest_outlives_the_soft_deadline():
+    """2026-11-03: 14.68 GB of a 14.8 GB make-good checkpoint arrived at ~2.6 MB/s
+    when the fixed 3600 s deadline killed it; a stream above the rate floor goes on."""
+    breach = remote_mod.harvest_total_breach
+    gb = 1_000_000_000
+    assert breach(3601, int(14.68 * gb), 3600) is None            # ~4 MB/s: keep going
+    assert breach(5400, int(14.0 * gb), 3600) is None             # ~2.6 MB/s: keep going
+    assert "floor" in breach(3601, 100 * 1_000_000, 3600)          # ~28 kB/s: fail as before
+    assert breach(100, 0, 3600) is None                             # inside the soft deadline
+    assert "hard cap" in breach(remote_mod.HARVEST_HARD_CAP_SECONDS + 1, 10**15, 3600)
