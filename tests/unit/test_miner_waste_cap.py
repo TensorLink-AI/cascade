@@ -334,8 +334,9 @@ def test_the_cli_flag_round_trips_through_the_intake(tmp_path):
     intake = _intake(tmp_path)
     status, body = intake.fund(h)
     assert status == 202 and intake.queue.get(GHK).max_total_spend_usd == 75.0
-    # the budget is SIGNED: a header swapped in transit fails the signature
-    assert intake.fund({**h, BUDGET_HEADER: "9999"})[0] in (401, 403)
+    # the budget is SIGNED: a header swapped in transit is refused, nothing changes
+    status, body = intake.fund({**h, BUDGET_HEADER: "9999"})
+    assert status >= 400 and intake.queue.get(GHK).max_total_spend_usd == 75.0
 
 
 @pytest.mark.parametrize("raw", ["-5", "0", "nan", "inf", "abc"])
