@@ -27,8 +27,10 @@ def leg_corpus(runner, gen, seeds, contract, *, era_index: int | None = None) ->
     # under an operator-billed leg's own slot.
     from .admission import owner_admission
 
-    king = bool(getattr(runner.__dict__.get("_leg_local_obj"), "funded_is_king", False))
-    with owner_admission(runner, gen.hotkey, exempt=king, cpu_tier=True):
+    king = bool(getattr(getattr(runner, "__dict__", {}).get("_leg_local_obj"),
+                        "funded_is_king", False))
+    hotkey = str(getattr(gen, "hotkey", "") or "")
+    with owner_admission(runner, hotkey, exempt=king or not hotkey, cpu_tier=True):
         return {"corpus_files": runner._leg_corpus(gen, seeds, contract, era_index=era_index)}
 
 

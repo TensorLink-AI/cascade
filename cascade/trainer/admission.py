@@ -277,7 +277,8 @@ def owner_admission(runner, hotkey, *, exempt=False, deadline=None, cpu_tier=Fal
     :func:`mark_admitted` (re-attached after a restart) was admitted by the
     previous process: an unknown identity lets it through (logged), a known
     one takes its slot at once, over the limit, so the count stays right."""
-    limit = int(getattr(runner.cfg.round, "ops_max_active_per_coldkey", 0))
+    limit = int(getattr(getattr(getattr(runner, "cfg", None), "round", None),
+                        "ops_max_active_per_coldkey", 0) or 0)
     if exempt or not limit:
         yield
         return
