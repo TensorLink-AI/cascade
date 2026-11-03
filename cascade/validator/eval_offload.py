@@ -233,8 +233,10 @@ def make_eval_host_fn(path: Path | str, *, local_fallback: bool = True) -> Calla
     return resolve
 
 
-def build_scp_argv(host: RemoteHost, local_path: str, remote_path: str) -> list[str]:
-    """The local ``scp -r`` argv that copies ``local_path`` → ``host:remote_path``,
+def build_scp_argv(host: RemoteHost, local_path: str | list[str],
+                   remote_path: str) -> list[str]:
+    """The local ``scp -r`` argv that copies ``local_path`` (one path, or a list
+    of files into the ``remote_path`` directory) → ``host:remote_path``,
     mirroring :func:`cascade.trainer.remote.build_ssh_argv`'s connection options.
     Note ``scp`` uses ``-P`` (capital) for the port, unlike ``ssh``'s ``-p``."""
     argv = ["scp", "-r", "-P", str(host.port), "-o", "BatchMode=yes",
@@ -243,8 +245,42 @@ def build_scp_argv(host: RemoteHost, local_path: str, remote_path: str) -> list[
         argv += ["-i", str(Path(host.key_path).expanduser())]
     for opt in host.ssh_options:
         argv += ["-o", opt]
-    argv += [local_path, f"{host.user}@{host.host}:{remote_path}"]
+    argv += ([str(x) for x in local_path] if isinstance(local_path, list) else [local_path])
+    argv += [f"{host.user}@{host.host}:{remote_path}"]
     return argv
+
+
+# What the benchmark sidecar reads from a checkpoint (the wrapper loads
+# config.json + weights.safetensors; model.py is its import). A trained
+# checkpoint also carries optimizer.safetensors + weights_stable.safetensors
+# (the warm-start lineage branch) — 2/3 of its bytes, never read by a bench,
+# and with them a 2-checkpoint sweep spent ~3.5 h of its 4 h budget on scp
+# (2026-11-03). Same set the private eval pod receives.
+BENCH_UPLOAD_FILES = ("config.json", "forecast_wrapper.py", "model.py", "weights.safetensors")
+# Upload budget per checkpoint, separate from the benchmark's own timeout.
+BENCH_UPLOAD_SECONDS_PER_CKPT = 7200
+# Content-addressed checkpoints kept on the pod between sweeps (a retried or
+# re-held settlement re-uses them instead of uploading again).
+BENCH_CACHE_KEEP = 6
+_UPLOAD_MANIFEST = ".cascade_upload_manifest"
+
+
+def bench_upload_files(ckpt_dir: str | Path) -> list[Path]:
+    """The files of ``ckpt_dir`` a bench needs, in :data:`BENCH_UPLOAD_FILES`
+    order (absent ones skipped)."""
+    root = Path(str(ckpt_dir))
+    return [root / f for f in BENCH_UPLOAD_FILES if (root / f).is_file()]
+
+
+def bench_upload_manifest(files: list[Path]) -> str:
+    """``name size`` per file — what a cached copy on the pod must match."""
+    return "".join(f"{f.name} {f.stat().st_size}\n" for f in files)
+
+
+def _cacheable(ckpt_dir: str | Path) -> bool:
+    # only content-addressed fetch dirs (sha256-<digest>) are safe to key by name
+    name = Path(str(ckpt_dir)).name
+    return name.startswith("sha256-") and len(name) > len("sha256-") + 16
 
 
 def build_bench_remote_command(
@@ -316,43 +352,106 @@ def run_bench_via_host_many(
     num_samples: int = 100, batch_size: int = 512, max_series: int = 0,
     datasets: str = "", data_dir: str | None = None, device: str = "cuda",
     timeout_s: int = 3600, runner=None, workers: str | int | None = None,
+    upload_timeout_s: int | None = None,
 ) -> list[dict | None]:
     """:func:`run_bench_via_host` for several checkpoints in ONE paired
     sidecar pass on the pod (``--extra-checkpoint``) — one report (or
-    ``None``) per checkpoint, each identical to its solo sweep. Never raises."""
+    ``None``) per checkpoint, each identical to its solo sweep. Never raises.
+
+    Only :data:`BENCH_UPLOAD_FILES` are uploaded. Content-addressed
+    checkpoints (``sha256-…`` dirs) go to a per-digest cache on the pod and
+    are re-used when a previous upload of the same files completed, so a
+    retried settlement does not upload again. The upload has its own budget
+    (``upload_timeout_s``, default :data:`BENCH_UPLOAD_SECONDS_PER_CKPT` per
+    checkpoint); ``timeout_s`` is the benchmark's, counted from when the
+    uploads finish."""
     run = runner or run_ssh
-    deadline = time.monotonic() + timeout_s
+    n = len(ckpt_dirs)
+    out: list[dict | None] = [None] * n
+    if n == 0:
+        return out
+    up_budget = (int(upload_timeout_s) if upload_timeout_s
+                 else BENCH_UPLOAD_SECONDS_PER_CKPT * n)
+    deadline = time.monotonic() + up_budget
 
     def step(argv, cap=None):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError("public benchmark offload deadline expired")
         return run(argv, min(remaining, cap) if cap else remaining)
-    n = len(ckpt_dirs)
-    out: list[dict | None] = [None] * n
-    if n == 0:
-        return out
     name = Path(str(ckpt_dirs[0])).name or "ckpt"
     base = f"{host.workdir}/_eval_offload/{name}-{uuid.uuid4().hex}" + (f"-paired{n}" if n > 1 else "")
+    cache = f"{host.workdir}/_eval_offload/cache"
+    tag = uuid.uuid4().hex[:12]
+    keys = [Path(str(d)).name if _cacheable(d) else "" for d in ckpt_dirs]
     if n == 1:
-        ckpts, reports = [f"{base}/checkpoint"], [f"{base}/report.json"]
+        scratch, reports = [f"{base}/checkpoint"], [f"{base}/report.json"]
     else:
-        ckpts = [f"{base}/checkpoint-{i}" for i in range(n)]
+        scratch = [f"{base}/checkpoint-{i}" for i in range(n)]
         reports = [f"{base}/report-{i}.json" for i in range(n)]
+    ckpts = [f"{cache}/{k}" if k else s for k, s in zip(keys, scratch, strict=True)]
     try:
+        # prep: the run dir, the cache, and a prune of old cache entries /
+        # abandoned partial uploads (never the ones this sweep uses)
+        keep = " ".join(f"-e {shlex.quote(k)}" for k in keys if k) or "-e ''"
+        prune = (f"cd {shlex.quote(cache)} && rm -rf -- *.part-* && "
+                 f"ls -1t | grep -vxF {keep} | tail -n +{BENCH_CACHE_KEEP} "
+                 "| xargs -r rm -rf --")
         prep = step(build_ssh_argv(
-            host, f"rm -rf {shlex.quote(base)} && mkdir -p "
-            + " ".join(shlex.quote(c) for c in ckpts)), 120)
+            host, f"rm -rf {shlex.quote(base)} && mkdir -p {shlex.quote(base)} "
+            + " ".join(shlex.quote(c) for k, c in zip(keys, ckpts, strict=True) if not k)
+            + f" {shlex.quote(cache)} && ({prune} || true)"), 120)
         if prep.returncode != 0:
             log.warning("eval-offload prep failed on %s: %s", host.name, (prep.stderr or "")[-200:])
             return out
-        for local, remote in zip(ckpt_dirs, ckpts, strict=True):
-            # Copy the checkpoint's CONTENTS into the remote checkpoint dir.
-            scp = step(build_scp_argv(host, f"{str(local).rstrip('/')}/.", remote))
+        for local, remote, key in zip(ckpt_dirs, ckpts, keys, strict=True):
+            files = bench_upload_files(local)
+            if not files:
+                # not a checkpoint layout we know — copy the whole dir (legacy)
+                scp = step(build_scp_argv(host, f"{str(local).rstrip('/')}/.", remote))
+                if scp.returncode != 0:
+                    log.warning("eval-offload scp to %s failed: %s", host.name,
+                                (scp.stderr or "")[-300:])
+                    return out
+                continue
+            manifest = bench_upload_manifest(files)
+            if key:
+                probe = step(build_ssh_argv(
+                    host, f"head -c 65536 {shlex.quote(remote + '/' + _UPLOAD_MANIFEST)} "
+                    f"2>/dev/null && touch {shlex.quote(remote)}"), 60)
+                if probe.returncode == 0 and (probe.stdout or "") == manifest:
+                    log.info("eval-offload: %s already on %s — upload skipped",
+                             key[-24:], host.name)
+                    continue
+            dest = f"{remote}.part-{tag}" if key else remote
+            if key:
+                mk = step(build_ssh_argv(host, f"mkdir -p {shlex.quote(dest)}"), 60)
+                if mk.returncode != 0:
+                    log.warning("eval-offload prep failed on %s: %s", host.name,
+                                (mk.stderr or "")[-200:])
+                    return out
+            t0 = time.monotonic()
+            scp = step(build_scp_argv(host, [str(f) for f in files], dest + "/"))
             if scp.returncode != 0:
                 log.warning("eval-offload scp to %s failed: %s", host.name,
                             (scp.stderr or "")[-300:])
                 return out
+            log.info("eval-offload: uploaded %d file(s), %.1f GB of %s to %s in %.0fs",
+                     len(files), sum(f.stat().st_size for f in files) / 1e9,
+                     Path(str(local)).name[-24:], host.name, time.monotonic() - t0)
+            if key:
+                # publish atomically: the manifest is written last, inside the
+                # partial dir, then the dir replaces any stale cached copy
+                fin = step(build_ssh_argv(
+                    host, f"printf %s {shlex.quote(manifest)} > "
+                    f"{shlex.quote(dest + '/' + _UPLOAD_MANIFEST)} && rm -rf {shlex.quote(remote)} "
+                    f"&& mv {shlex.quote(dest)} {shlex.quote(remote)}"), 120)
+                if fin.returncode != 0:
+                    log.warning("eval-offload cache publish failed on %s: %s", host.name,
+                                (fin.stderr or "")[-200:])
+                    return out
+        # the benchmark's own budget starts now, not at the first scp
+        deadline = time.monotonic() + timeout_s
         cmd = build_bench_remote_command(
             host, ckpts[0], reports[0], suites=suites,
             num_samples=num_samples, batch_size=batch_size, max_series=max_series,
@@ -366,6 +465,7 @@ def run_bench_via_host_many(
                         suites, host.name, proc.returncode, (proc.stderr or "")[-400:])
             return out
         for i, rep in enumerate(reports):
+            deadline = max(deadline, time.monotonic() + 120)
             cat = step(build_ssh_argv(host, f"cat {shlex.quote(rep)}"), 120)
             if cat.returncode != 0:
                 log.warning("eval-offload report missing on %s: %s", host.name,
@@ -378,7 +478,10 @@ def run_bench_via_host_many(
         return [None] * n
     finally:
         with contextlib.suppress(Exception):
-            run(build_ssh_argv(host, f"rm -rf {shlex.quote(base)}"), 15)
+            # the run dir (reports + uncached copies) and this sweep's partial
+            # uploads; the cache itself stays for the next sweep
+            run(build_ssh_argv(host, f"rm -rf {shlex.quote(base)} "
+                               f"{shlex.quote(cache)}/*.part-{tag}"), 15)
 
 
 def gift_rows_via_host(
