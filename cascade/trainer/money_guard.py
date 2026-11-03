@@ -232,17 +232,46 @@ def guard_operator_provider(runner, provider, *, enforce: bool = True):
 # ── projected cost, daily spend ledger, balance ─────────────────────────────
 
 
-def projected_operator_leg_cost(runner) -> tuple[str, float, float, float]:
+def best_offer_rate(runner, skus) -> float | None:
+    """The cheapest operator-account offer's $/h for ``skus`` right now (the
+    same listing and price caps a rent uses), or None when unknown."""
+    seam = getattr(runner, "_operator_offer_rate", None)
+    if callable(seam):
+        return seam(tuple(skus))
+    try:
+        from ..provision.core import executor_price_per_hour
+        from ..provision.operator_pool import operator_price_caps
+        from .lane_pool import _lium_provider
+
+        prov = _lium_provider(runner.cfg.round, price_caps=operator_price_caps(runner))
+        for _sku, ex in prov.list_offers(tuple(skus)):
+            price = executor_price_per_hour(ex)
+            if price:
+                return float(price)
+    except Exception as e:  # noqa: BLE001 — unknown: the ceiling applies
+        log.debug("operator offer price unknown (%s)", e)
+    return None
+
+
+def projected_operator_leg_cost(runner, *, live_price: bool = False
+                                ) -> tuple[str, float, float, float]:
     """``(sku, $/h, hours, $)`` an operator-account leg is projected to cost:
-    the operator $/h ceiling × the leg's expected wall (+ the ready timeout).
-    An upper bound — the rent itself never pays more than the ceiling."""
+    the cheapest current offer's $/h when ``live_price`` and known, else the
+    operator $/h ceiling, × the leg's expected wall (+ the ready timeout).
+    The spend actually BOOKED is the landed price (:func:`note_operator_launch`;
+    review R4)."""
     from ..provision.operator_pool import operator_max_price_per_hour
 
     rnd = runner.cfg.round
     skus = tuple(runner._funded_skus_for_rent() or ()) or ((rnd.funded_pod_sku,)
                                                           if rnd.funded_pod_sku else ())
     sku = skus[0] if skus else ""
-    rate = float(operator_max_price_per_hour(rnd) or 0.0)
+    ceiling = float(operator_max_price_per_hour(rnd) or 0.0)
+    rate = ceiling
+    if live_price and skus:
+        best = best_offer_rate(runner, skus)
+        if best:
+            rate = min(best, ceiling) if ceiling else best
     try:
         wall = float(runner._leg_wall_seconds())
     except Exception:  # noqa: BLE001 — unknown wall: project a full day (caps stay strict)
@@ -277,14 +306,20 @@ class OperatorSpend:
         rows = self._load().get(self.day(t), [])
         return float(sum(float(r.get("usd", 0.0)) for r in rows))
 
-    def charge(self, hotkey: str, usd: float, *, kind: str, now: float | None = None) -> None:
+    def rows(self, now: float | None = None) -> list[dict]:
+        t = time.time() if now is None else float(now)
+        return list(self._load().get(self.day(t), []))
+
+    def charge(self, hotkey: str, usd: float, *, kind: str, projected: float | None = None,
+               now: float | None = None) -> None:
         t = time.time() if now is None else float(now)
         with _LOCK:
             doc = self._load()
             day = self.day(t)
             doc = {k: v for k, v in doc.items() if k >= self.day(t - 14 * 86400)}
-            doc.setdefault(day, []).append({"hotkey": hotkey, "usd": round(float(usd), 2),
-                                            "kind": kind, "at": t})
+            doc.setdefault(day, []).append({
+                "hotkey": hotkey, "usd": round(float(usd), 2), "kind": kind, "at": t,
+                "projected_usd": round(float(usd if projected is None else projected), 2)})
             write_text_atomic(self.path, json.dumps(doc, sort_keys=True))
 
 
@@ -467,7 +502,8 @@ def operator_leg_gate(runner, gen, *, kind: str, rent: bool) -> None:
     entry = queue.get(hk)
     attempt_id = str(getattr(entry, "attempt_id", "") or "")
     funded_at = getattr(entry, "funded_at", None)
-    sku, rate, hours, cost = projected_operator_leg_cost(runner)
+    sku, rate, hours, cost = projected_operator_leg_cost(
+        runner, live_price=bool(rent and kind != "retrain_after_loss"))
     lost = 0.0
     if kind == "retrain_after_loss":
         from .box_health import miner_lost_usd
@@ -484,7 +520,8 @@ def operator_leg_gate(runner, gen, *, kind: str, rent: bool) -> None:
             operator_rent_preflight(runner, gen, cost)   # a block keeps the approval
         _leg_local(runner).operator_approval = {
             "queue": qname, "hotkey": hk, "ref": gen.ref, "attempt_id": attempt_id,
-            "cost": cost, "kind": kind, "book": bool(rent and kind != "retrain_after_loss")}
+            "cost": cost, "hours": hours, "kind": kind,
+            "book": bool(rent and kind != "retrain_after_loss")}
         if not rent:
             note_operator_launch(runner, hk)           # a lane dispatch IS the launch
         log.warning("operator-billed leg %s (%s, uid %s): owner approval applies — %s, "
@@ -555,7 +592,8 @@ def take_deferred_gate(runner) -> str | None:
     return kind
 
 
-def note_operator_launch(runner, hotkey: str | None = None) -> None:
+def note_operator_launch(runner, hotkey: str | None = None, *,
+                         landed_rate: float | None = None) -> None:
     """The approved leg's pod was rented (or its lane dispatched): mark the
     approval launched for THIS attempt and book the operator spend — only
     now, never for a rent that did not happen (review F3)."""
@@ -568,10 +606,15 @@ def note_operator_launch(runner, hotkey: str | None = None) -> None:
         return                        # a stale approval of another leg on this thread
     from ..funding.operator_approvals import OperatorApprovals
 
+    # Book the LANDED $/h × the expected wall when the rent price is known
+    # (the projection was an upper bound; review R4).
+    booked = (float(landed_rate) * float(a.get("hours") or 0.0) if landed_rate
+              else float(a["cost"]))
     OperatorApprovals.for_work_root(runner.work_root).mark_launched(
-        a["queue"], a["hotkey"], ref=a["ref"], attempt_id=a["attempt_id"], cost_usd=a["cost"])
+        a["queue"], a["hotkey"], ref=a["ref"], attempt_id=a["attempt_id"], cost_usd=booked)
     if a.get("book"):
-        OperatorSpend.for_runner(runner).charge(a["hotkey"], a["cost"], kind=a["kind"])
+        OperatorSpend.for_runner(runner).charge(a["hotkey"], booked, kind=a["kind"],
+                                                projected=float(a["cost"]))
 
 
 __all__ = ["AWAITING_APPROVAL_STATUS", "OperatorBreaker", "OperatorSpend", "alert",

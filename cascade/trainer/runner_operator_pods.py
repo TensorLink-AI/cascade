@@ -32,6 +32,26 @@ from .runner_generation import leg_corpus
 log = logging.getLogger("cascade.trainer")
 
 
+def _wait_out_rent_halt(runner, name_prefix: str) -> None:
+    """Hold the king's rent while the box-health halt (a disk halt) stands:
+    one cheap check per ``FUNDED_RENT_RETRY_SECONDS``, no provider call. At
+    the latest safe start it gives up with :class:`RentsHalted` — which the
+    era loop never counts as a king-leg failure (review R2)."""
+    from .box_health import RentsHalted, rent_halt_refusal
+
+    sleep = getattr(runner, "_rent_wait_sleep", None) or time.sleep
+    now_fn = getattr(runner, "_rent_wait_now", None) or time.time
+    while True:
+        halted = rent_halt_refusal(runner, king=True)
+        if not halted:
+            return
+        _check_king_cancel(runner)
+        if now_fn() >= runner._funded_rent_wait_deadline():
+            runner._ledger_remove(f"{name_prefix}-0")
+            raise RentsHalted(halted)
+        sleep(runner.FUNDED_RENT_RETRY_SECONDS)
+
+
 def _check_king_cancel(runner):
     event = getattr(runner.__dict__.get('_leg_local_obj'), 'king_cancel', None)
     if event is not None and event.is_set():
@@ -190,17 +210,13 @@ class _OperatorPodMixin:
                 log.error("king rent: %s", unmeasured)
                 self._ledger_remove(f"{name_prefix}-0")
                 raise ProvisionError(unmeasured)
-            from .box_health import rent_halt_refusal
-
-            halted = rent_halt_refusal(self, king=True)
-            if halted:
-                # A disk halt holds the king too: its checkpoint could not be
-                # saved either (logged loudly by rent_halt_refusal).
-                self._ledger_remove(f"{name_prefix}-0")
-                raise ProvisionError(halted)
             attempt = 0
             while True:
                 _check_king_cancel(self)
+                # A disk halt holds the king too (its checkpoint could not be
+                # saved either): WAIT at the poll cadence — no capacity probe,
+                # never a king-leg failure, never a pod rotation (review R2).
+                _wait_out_rent_halt(self, name_prefix)
                 attempt += 1
                 # A sold-out marketplace is not a round failure: wait for a GPU
                 # (outside the rent lock) up to the round's latest safe start —
@@ -227,11 +243,11 @@ class _OperatorPodMixin:
                                           name_prefix=name_prefix,
                                           gpus_per_pod=1, exclude_ids=claimed,
                                           sku_choices=fit if len(fit) > 1 else ())
-                        from .box_health import rent_halt_refusal
+                        from .box_health import RentsHalted, rent_halt_refusal
 
                         halted = rent_halt_refusal(self, king=True)
                         if halted:                        # before EVERY king launch (N3)
-                            raise ProvisionError(halted)
+                            raise RentsHalted(halted)
                         pod_id = provider.launch(spec)[0]
                         _ledger_king(pod_id)
                         sku_fn = getattr(provider, "sku_of", None)
@@ -295,6 +311,10 @@ class _OperatorPodMixin:
                     if why:
                         _fail_king(pod_id, f"king pod rejected: {why}")
                 except ProvisionError as e:
+                    from .box_health import RentsHalted
+
+                    if isinstance(e, RentsHalted):
+                        continue                 # the loop top waits it out (R2)
                     # A pod that never came up / had no IP / ran the wrong
                     # runtime is a LEMON, not a verdict: it is torn down
                     # (_fail_king) and its executor stays excluded — rent again
@@ -646,7 +666,12 @@ class _OperatorPodMixin:
                     # — a sold-out market, a lemon or a rent error keeps both.
                     from .money_guard import note_operator_launch
 
-                    note_operator_launch(self, gen.hotkey)
+                    price_fn = getattr(provider, "price_of", None)
+                    try:
+                        landed = price_fn(pod_id) if callable(price_fn) else None
+                    except Exception:  # noqa: BLE001 — unknown: the projection is booked
+                        landed = None
+                    note_operator_launch(self, gen.hotkey, landed_rate=landed)
                 return host, pod_id
             except ProvisionError as e:
                 bad += 1

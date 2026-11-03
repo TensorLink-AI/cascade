@@ -1385,6 +1385,11 @@ class LiumProvider:
         process's launches only); "" when unknown."""
         return self._sku_by_name.get(pod_id, "")
 
+    def price_of(self, pod_id: str) -> float | None:
+        """The landed executor's $/h for a pod this process launched; None
+        when unknown (an unpriced listing, another process's launch)."""
+        return self.__dict__.get("_price_by_name", {}).get(pod_id)
+
     def _list_pods(self) -> list[dict]:
         try:
             return parse_lium_pods(self._cli(["ps", "--format", "json"]).stdout)
@@ -1494,6 +1499,8 @@ class LiumProvider:
                      if executor_price_per_hour(ex) is not None else "")
             self._executor_by_name[name] = str(ex.get("id"))
             self._sku_by_name[name] = landed
+            # the LANDED $/h: operator spend is booked at the real rent price
+            self.__dict__.setdefault("_price_by_name", {})[name] = executor_price_per_hour(ex)
             cached = self._executor_records_cache
             if cached and cached[1].get(str(ex.get("id"))):
                 # Keep its GPU / site identity even after it leaves the listing.

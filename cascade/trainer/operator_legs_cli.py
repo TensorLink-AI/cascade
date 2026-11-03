@@ -109,10 +109,17 @@ def main(argv: list[str]) -> int:
                    "operator_requeues": e.operator_requeues, "last_error": e.last_error}
                   for q in _queues(wr) for e in q.entries() if e.status == PAUSED_STATUS]
         halt = _halt(wr)
+        spend = _spend(wr)
         if args.json:
             print(json.dumps({"awaiting_approval": pending, "paused": paused,
-                              "rents_halted": halt}, indent=2))
+                              "rents_halted": halt, "operator_spend_today": spend}, indent=2))
             return 0
+        print(f"operator spend today (UTC): booked ${spend['booked_usd']:.2f} "
+              f"(projected ${spend['projected_usd']:.2f}) over {len(spend['legs'])} leg(s)")
+        for row in spend["legs"]:
+            print(f"  {str(row.get('hotkey'))[:16]} {row.get('kind')}: booked "
+                  f"${float(row.get('usd') or 0):.2f}, projected "
+                  f"${float(row.get('projected_usd') or row.get('usd') or 0):.2f}")
         if halt:
             print(f"RENTS HALTED since {halt.get('since')}: {halt.get('reason')} "
                   "(`cascade-trainer rent-status`)")
@@ -173,6 +180,20 @@ def _live_entry(work_root: Path, hotkey: str, queue_name: str | None, *, kind: s
             return {"queue": q.path.name, "queue_path": str(q.path), "ref": e.ref,
                     "funded_at": e.funded_at, "kind": kind}
     return None
+
+
+def _spend(work_root: Path) -> dict:
+    """Today's operator spend: booked (landed $/h) vs projected, per leg."""
+    from .money_guard import OperatorSpend
+
+    try:
+        rows = OperatorSpend(work_root / "operator_spend.json").rows()
+    except Exception:  # noqa: BLE001 — unreadable: show none
+        rows = []
+    return {"booked_usd": round(sum(float(r.get("usd") or 0) for r in rows), 2),
+            "projected_usd": round(sum(float(r.get("projected_usd") or r.get("usd") or 0)
+                                       for r in rows), 2),
+            "legs": rows}
 
 
 def _halt(work_root: Path) -> dict | None:

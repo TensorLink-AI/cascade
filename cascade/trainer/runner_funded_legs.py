@@ -685,8 +685,12 @@ def _record_generation_failure(runner, gen, e: BaseException) -> None:
     if rc is None and type(e).__name__ == "CorpusError":
         rc = 3
     if rc != 3:
-        # no CPU capacity / a VM that never booted: transient (review F4)
+        # no CPU capacity / a VM that never booted: transient (review F4);
+        # OUR disk failing the corpus write still halts every rent (R5)
         from ..funding.queue import OPERATOR_TRANSIENT_CLASS
+        from .box_health import note_disk_error
+
+        note_disk_error(getattr(runner, "work_root", None), e, f"corpus of {gen.hotkey[:12]}")
 
         runner._record_funded_failure(gen.hotkey, f"generation (operator tier): {e}",
                                       miner_fault=False, error_class=OPERATOR_TRANSIENT_CLASS,

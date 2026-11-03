@@ -404,8 +404,15 @@ class _FundedPodMixin:
         _, source = read_text_with_backup(self._funded_ledger_path(), _parse_funded_ledger)
         if source == "unreadable":
             raise RuntimeError("funded pod ledger unreadable; refusing to overwrite billing evidence")
-        write_text_atomic(self._funded_ledger_path(), json.dumps([asdict(x) for x in pods], indent=2),
-                          backup=source == "main")
+        try:
+            write_text_atomic(self._funded_ledger_path(),
+                              json.dumps([asdict(x) for x in pods], indent=2),
+                              backup=source == "main")
+        except OSError as e:
+            from .box_health import note_disk_error
+
+            note_disk_error(self.work_root, e, "funded pod ledger")   # halts rents (R5)
+            raise
 
     def _ledger_add(self, pod) -> None:
         with self._funded_ledger_lock:
@@ -1009,7 +1016,10 @@ class _FundedPodMixin:
         # room to finish (harvest, ledgers, pending records); also the box
         # health halt and the pre-rent canary. An adopted allocation is a live
         # leg — it always keeps going.
-        low = "" if prior_alloc else disk_guard_refusal(self)
+        # Only a pod confirmed LIVE skips the guards: an unknown liveness (no
+        # key / provider / probe) gets every guard too (review R6).
+        adopt_live = bool(prior_alloc and pod_live is True)
+        low = "" if adopt_live else disk_guard_refusal(self)
         if low:
             from ..funding.queue import OPERATOR_DISK_CLASS
 
@@ -1208,7 +1218,7 @@ class _FundedPodMixin:
                     self._record_funded_failure(gen.hotkey, doomed, miner_fault=False,
                                                 error_class="no_capacity", burn=False)
                     raise _FundedLegSkip(gen.hotkey)
-                if not prior_alloc:
+                if not adopt_live:
                     # The halt is re-checked right before EVERY launch — a wait
                     # or a lemon re-rent can outlive the leg-start check (N3).
                     is_king = bool(getattr(self.__dict__.get("_leg_local_obj"),

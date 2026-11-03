@@ -546,6 +546,7 @@ def test_disk_guard_never_stops_an_adopted_live_leg(tmp_path, monkeypatch):
     runner = _runner(tmp_path, min_free_disk_gb=30.0)
     _vault(tmp_path, "hkA")
     runner._ledger_add(_pod("hkA"))                  # this leg's allocation is live
+    runner._payer_pod_liveness = lambda pod_id: (object(), True)   # ... and confirmed so
     monkeypatch.setattr(funded_mod, "rent_funded_pod", lambda **kw: _rent_ok())
     monkeypatch.setattr(runner_common, "DISK_USAGE",
                         lambda p: SimpleNamespace(total=1 << 40, used=0, free=1 << 20))

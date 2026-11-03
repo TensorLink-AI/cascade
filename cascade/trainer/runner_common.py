@@ -246,6 +246,9 @@ def write_pending_upload(work_root: Path, base_seed, hotkey: str, record: dict) 
         write_text_atomic(path, json.dumps(record, sort_keys=True))
     except Exception as e:  # noqa: BLE001 — the requeue then simply retrains
         log.warning("could not record the pending upload of %s: %s", hotkey[:12], e)
+        from .box_health import note_disk_error
+
+        note_disk_error(work_root, e, f"pending upload of {hotkey[:12]}")   # R5
 
 
 def read_pending_upload(work_root: Path, base_seed, hotkey: str, **binding) -> dict | None:
@@ -505,6 +508,11 @@ def prune_harvest_dirs(work_root: Path, *, now: float | None = None,
         if not seed_dir.is_dir():
             continue
         for item in seed_dir.iterdir():
+            # mismatch evidence (and the box copy it names) is the owner's to
+            # judge: never aged out (review R6)
+            if (item.name.endswith(".unverifiable.json")
+                    or item.with_name(item.name + ".unverifiable.json").exists()):
+                continue
             try:
                 if t - item.stat().st_mtime <= max_age_seconds:
                     continue

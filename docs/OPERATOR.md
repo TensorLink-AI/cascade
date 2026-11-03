@@ -363,7 +363,12 @@ The trainer rents miner-funded pods on Lium, Shadeform, Vast.ai or Runpod
   * **For an approved operator rent:**
     * the breaker is closed;
     * the projected cost is within `ops_operator_leg_cap_usd` and the daily
-      cap (`operator_daily_spend_cap_usd`, default 200, UTC day);
+      cap (`operator_daily_spend_cap_usd`, default 200, UTC day). The
+      projection uses the cheapest current offer's $/h for the round SKU
+      (else the `operator_max_price_per_hour` ceiling) × the expected wall.
+      The spend **booked** at launch is the landed $/h × the wall, so the
+      $200 default admits about two 8xH100 legs a day at ~$12–15/h.
+      `list-operator-legs` shows booked vs projected for today;
     * the operator Lium balance is at least projected cost ×
       `operator_cost_safety_factor` (1.25) + `operator_balance_reserve_usd`
       (50, which keeps the validator's eval pods alive). An unknown balance
@@ -702,14 +707,24 @@ noticed. Now:
   reservation shortfall refuses that one rent and never halts. The halt is
   re-checked right before every launch, and in-process it holds even if its
   own state write failed. It clears itself when its health check passes:
-  * **A disk halt.** A write + fsync + rename + delete canary in the
-    harvest dir passes, and free space holds every live pod-holding leg's
+  * **A disk or harvest halt.** A write + fsync + rename + delete canary in
+    the harvest dir passes, and free space holds every live pod-holding leg's
     checkpoint plus one more and the reserve.
-  * **A harvest or storage halt.** A storage probe passes: a put, get and
-    delete of a `health/box-canary-*` key on the manifest store.
+  * **A storage halt** (our registry push lost a checkpoint). The Hippius Hub
+    registry takes a push of one fixed tiny file to one fixed repo
+    (`<namespace>/box-health-canary`, the same digest every time). The probe
+    is Hub-only and never goes through the HF / R2 fallback. With no hub
+    configured, only `resume-rents` clears it.
+
+  `resume-rents` from another process clears a persisted halt everywhere.
+  Only a halt whose own state write failed is latched in-process.
 
   A disk halt also holds the king and king backups; a harvest or storage
-  halt never does. A kept pod's re-harvest is never held by the halt; it
+  halt never does. A halted king rent waits at the poll cadence with no
+  provider call; it is never counted as a king-leg failure and never
+  rotates or quarantines a host. Disk errors outside the leg paths also
+  halt: the pod ledger, pending-upload records and the corpus write. A
+  miner's unreachable generator artifact is never our storage fault. A kept pod's re-harvest is never held by the halt; it
   only needs room for its own checkpoint.
 
   The owner can also clear it with `resume-rents`, which takes a reason.

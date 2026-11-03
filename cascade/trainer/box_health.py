@@ -39,19 +39,27 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+from ..provision.core import ProvisionError
+
 log = logging.getLogger("cascade.trainer.box_health")
+
+
+class RentsHalted(ProvisionError):
+    """A rent refused by the box-health halt: never a king-leg failure, never
+    a reason to rotate or quarantine a host (review R2)."""
 
 BOX_HEALTH_FILE = "box_health.json"
 LOCAL_DISK, HARVEST, STORAGE = "local_disk", "harvest", "storage"
 CHECK_EVERY_SECONDS = 30.0
-# In-process latch (review N3): a halt this process set holds even when its
-# own state write failed (a full disk can refuse box_health.json itself).
+# In-process latch (review N3): a halt this process set holds when — and only
+# when — its own state write FAILED (a full disk can refuse box_health.json
+# itself). A persisted halt is never latched, so the owner's `resume-rents`
+# from another process clears it here too (review R1).
 _LATCH: dict[str, dict] = {}
 
 
 def our_side_fault_class(exc: BaseException | None) -> str | None:
     """The box-health class of a leg failure on OUR side, or ``None``."""
-    from ..shared.hippius import StorageError
     from .faults import StorageFault
     from .harvest_guard import HarvestDiskFault, HarvestKeepPod, local_disk_error
 
@@ -68,7 +76,10 @@ def our_side_fault_class(exc: BaseException | None) -> str | None:
         # never a LOCAL_DISK halt that would hold the king (review N2).
         if isinstance(e, (HarvestDiskFault, HarvestKeepPod)):
             return HARVEST
-        if isinstance(e, (StorageFault, StorageError)):
+        # Only OUR registry push losing a verified checkpoint: a miner's
+        # unreachable generator artifact (StorageError on their ref) is the
+        # miner's side, never a box-health storage fault (review R5).
+        if isinstance(e, StorageFault):
             return STORAGE
         e = e.__cause__ or e.__context__
     return None
@@ -115,20 +126,32 @@ class BoxHealth:
         doc.setdefault("legs", {})
         return doc
 
-    def _save(self, doc: dict) -> None:
+    def _save(self, doc: dict) -> bool:
         from ..shared.atomic import write_text_atomic
 
         try:
             write_text_atomic(self.path, json.dumps(doc, sort_keys=True))
+            return True
         except OSError as e:     # a full disk can refuse this very write
             log.critical("box health: could not persist (%s) — the halt holds in memory", e)
+            return False
 
     def state(self) -> dict:
         with self._locked() as doc:
             return doc
 
     def halt(self) -> dict | None:
-        return self.state().get("halt") or _LATCH.get(str(self.path))
+        doc = self.state()
+        if doc.get("halt"):
+            return doc["halt"]
+        latched = _LATCH.get(str(self.path))
+        if latched is None:
+            return None
+        cleared = float((doc.get("last_clear") or {}).get("at", 0) or 0)
+        if cleared >= float(latched.get("since", 0) or 0):
+            _LATCH.pop(str(self.path), None)      # cleared since (another process)
+            return None
+        return latched
 
     def record(self, cls: str, hotkey: str, detail: str) -> dict | None:
         """Record one our-side fault; returns the halt when it is (now) set."""
@@ -145,10 +168,10 @@ class BoxHealth:
                     "reason": (f"{cls} fault on {hotkey[:12]}: {detail[:200]}" if cls == LOCAL_DISK
                                else f"{cls} faults on {len(legs)} legs within "
                                     f"{self.window_seconds / 3600:.1f} h")}
-            if new is not None:
-                _LATCH[str(self.path)] = new
-            self._save(doc)
-            halt = doc.get("halt")
+            saved = self._save(doc)
+            if new is not None and not saved:
+                _LATCH[str(self.path)] = new      # only an UNPERSISTED halt (R1)
+            halt = doc.get("halt") or _LATCH.get(str(self.path))
         if new is not None:
             log.critical("operator alert: rents_halted — ALL new GPU rents halted (miner keys "
                          "and operator%s): %s. Legs already training keep running; the halt "
@@ -191,6 +214,21 @@ class BoxHealth:
 # ── the health check (auto-clear) and the pre-rent canary ───────────────────
 
 
+def note_disk_error(work_root, exc: BaseException, where: str) -> None:
+    """Route a local-disk OSError from outside the leg paths (ledger / state
+    writes, pending-upload records, corpus generation) into the box health:
+    ANY local-disk fault halts every new rent (review R5). Never raises."""
+    try:
+        from .harvest_guard import local_disk_error
+
+        err = local_disk_error(exc)
+        if err is None or work_root is None:
+            return
+        BoxHealth(Path(work_root) / BOX_HEALTH_FILE).record(LOCAL_DISK, where, str(err))
+    except Exception as e:  # noqa: BLE001 — bookkeeping of a fault never adds one
+        log.critical("box health: could not record a disk fault from %s (%s)", where, e)
+
+
 def harvest_canary(runner) -> str:
     """Write + fsync + rename + delete a small file in the harvest dir; ""
     when the box can save a checkpoint there, else why not."""
@@ -226,38 +264,46 @@ def harvest_canary(runner) -> str:
         return f"harvest-dir canary failed: {e}"
 
 
+HUB_CANARY_REPO = "box-health-canary"
+_HUB_CANARY_TEXT = "cascade box-health registry canary\n"
+
+
 def storage_probe(runner) -> str:
-    """"" when OUR storage takes a write: put + get + delete of a small canary
-    key on the manifest store (the clear condition of a harvest/storage halt —
-    a disk check says nothing about them; review N3)."""
-    import uuid
+    """"" when the Hippius Hub REGISTRY takes a push — the very path a
+    :class:`StorageFault` comes from (``upload_harvested_checkpoint``). One
+    fixed-content file pushed to ONE fixed repo (``<namespace>/
+    box-health-canary``): content-addressed, so every probe overwrites the
+    same digest — no litter. Hub only: never the HF / R2 fallback (a fallback
+    passing would fail the halt OPEN; review R3). No hub configured ⇒ the
+    halt clears only on `cascade-trainer resume-rents`."""
+    import tempfile
 
     probe = getattr(runner, "_storage_probe", None)
     if callable(probe):
         return str(probe() or "")
-    store_fn = getattr(runner, "manifest_store", None)
-    if not callable(store_fn):
-        return "no storage probe available — clear with `cascade-trainer resume-rents`"
-    key = f"health/box-canary-{uuid.uuid4().hex[:12]}"
+    hub_fn = getattr(runner, "hub", None)
+    if not callable(hub_fn):
+        return "no registry probe available — clear with `cascade-trainer resume-rents`"
     try:
-        store = store_fn()
-        store.put_bytes(key, b"cascade box-health storage canary\n")
-        if store.get_bytes(key) != b"cascade box-health storage canary\n":
-            return "storage canary read back different bytes"
-        delete = getattr(store, "delete", None)
-        if callable(delete):
-            with contextlib.suppress(Exception):
-                delete(key)
+        from ..shared.hippius import upload_dir_to_hub
+
+        ns = str(getattr(hub_fn(), "namespace", "") or "")
+        if not ns:
+            return "no registry namespace — clear with `cascade-trainer resume-rents`"
+        with tempfile.TemporaryDirectory(prefix="box-canary-") as d:
+            (Path(d) / "canary.txt").write_text(_HUB_CANARY_TEXT, encoding="utf-8")
+            upload_dir_to_hub(d, f"{ns}/{HUB_CANARY_REPO}")
         return ""
     except Exception as e:  # noqa: BLE001 — any failure keeps the halt
-        return f"storage canary failed: {str(e)[:200]}"
+        return f"registry canary push failed: {str(e)[:200]}"
 
 
 def health_check(runner, cls: str = LOCAL_DISK) -> str:
-    """"" when the box is healthy enough to resume rents. A disk halt needs the
-    canary AND free space for every live leg holding a pod plus one more, on
-    top of the ``min_free_disk_gb`` reserve (the same sizing as the pre-rent
-    reservation; review N2). A harvest/storage halt needs the storage probe."""
+    """"" when the box is healthy enough to resume rents. A disk or harvest
+    halt needs the harvest-dir canary AND free space for every live leg
+    holding a pod plus one more, on top of the ``min_free_disk_gb`` reserve
+    (the same sizing as the pre-rent reservation; review N2/R3). A storage
+    halt needs the registry probe."""
     from ..shared.disk_space import GIB
     from .runner_common import (
         HARVEST_DIRNAME,
@@ -267,8 +313,9 @@ def health_check(runner, cls: str = LOCAL_DISK) -> str:
         reclaim_box_space,
     )
 
-    if cls in (HARVEST, STORAGE):
+    if cls == STORAGE:
         return storage_probe(runner)
+    # LOCAL_DISK and HARVEST: the harvest-dir canary + the reservation
     why = harvest_canary(runner)
     if why:
         return why

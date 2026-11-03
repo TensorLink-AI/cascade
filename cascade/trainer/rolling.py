@@ -1953,6 +1953,15 @@ class RollingScheduler:
                     era.king_bench = bench
                     self._save()
             except Exception as e:  # noqa: BLE001 — retried next tick; never kills the loop
+                if _rents_halted(e):
+                    # The box-health halt held the king's rent: not the pod's
+                    # fault — never counted, never a rotation (review R2).
+                    log.error("rolling: era %d king leg waits for the box-health halt: %s",
+                              era.index, error_tail(e, 200))
+                    with self._lock:
+                        era.king_leg_failed = error_tail(e, 300)
+                        self._save()
+                    return
                 log.error("rolling: era %d king leg FAILED: %s", era.index, e)
                 with self._lock:
                     era.king_leg_failed = error_tail(e, 300)
@@ -3665,3 +3674,16 @@ def _forget_lost_leg(runner, hotkey: str) -> None:
             BoxHealth.for_runner(runner).forget_leg(hotkey)
     except Exception as e:  # noqa: BLE001
         log.warning("box health: could not clear the leg record of %s (%s)", hotkey[:12], e)
+
+
+def _rents_halted(exc: BaseException | None) -> bool:
+    """A failure that is the box-health halt holding the rent (review R2)."""
+    from .box_health import RentsHalted
+
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, RentsHalted):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
