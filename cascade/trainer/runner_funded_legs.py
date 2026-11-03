@@ -676,14 +676,24 @@ def _pre_corpus_money_gates(runner, gen, gpu_choice=None, *, round_id: str = "")
         return                       # a re-attach: the rent path adopts, never re-gates
     q = runner._funded_queue()
     e = q.get(gen.hotkey) if q is not None else None
-    operator = bool(e is not None and getattr(e, "operator_billed", False))
+    billed = bool(e is not None and getattr(e, "operator_billed", False))
+    # The operator gates apply only where the rent path would RENT on the
+    # operator's account: an operator-billed entry with no lane on file and
+    # an allowed operator rent (without operator capacity the rent path
+    # retries it on the payer's key, as before).
+    operator = False
+    if billed:
+        try:
+            operator = (not runner._operator_fallback_lanes()) and runner._operator_rent_allowed()
+        except Exception:  # noqa: BLE001 — unknown: the rent path decides
+            operator = False
     why, cls = would_rent_refusal(runner, gen, operator=operator)
     if why:
         log.warning("funded leg %s: %s — no corpus generated", gen.hotkey[:12], why)
         runner._record_funded_failure(gen.hotkey, why, miner_fault=False, error_class=cls,
                                       burn=False)
         raise _FundedLegSkip(gen.hotkey)
-    if not operator and e is not None:
+    if not billed and e is not None:
         from .miner_spend_guard import budget_check, waste_cap_check
 
         waste_cap_check(runner, gen)                     # pauses at the cap (no rent)

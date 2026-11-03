@@ -708,7 +708,13 @@ def _operator_launch_check(runner, *, kind: str, projected_usd: float) -> None:
     rnd = runner.cfg.round
     scope = str(getattr(rnd, "operator_daily_cap_scope", "all") or "all")
     cap = daily_cap_usd(rnd)
-    if cap and (scope == "all" or kind not in NON_MINER_KINDS):
+    # The king pod and its backups COUNT toward the cap (scope "all") but are
+    # never refused by it: one king era at the ceiling exceeds any sane daily
+    # cap and a refused king stalls every settlement. The runway guard below
+    # is what protects the account from the king (backups also keep their
+    # own ops_king_backup_cap_usd).
+    if cap and kind not in (KING_KIND, KING_BACKUP_KIND) and (
+            scope == "all" or kind not in NON_MINER_KINDS):
         spent = OperatorSpend.for_runner(runner).total(scope=scope)
         if spent + projected_usd > cap:
             msg = (f"operator daily cap: today ${spent:.2f} + this {kind} launch "
@@ -805,11 +811,9 @@ def would_rent_refusal(runner, gen, *, operator: bool) -> tuple[str, str]:
                 return (f"operator daily spend cap reached (${spent:.2f} + ${projected:.2f} > "
                         f"${cap:.2f}); nothing rented", OPERATOR_BLOCKED_CLASS)
         bal = _read_balance(runner)
-        if bal is None:
-            return ("operator balance unknown — no operator rent without a known balance",
-                    OPERATOR_BLOCKED_CLASS)
+        # unknown: not refused HERE — the gate's preflight fails closed on it
         rw = operator_runway(runner, balance=bal, extra_usd=projected)
-        if rw["held"]:
+        if bal is not None and rw["held"]:
             return (f"no new operator rents: balance ${bal:.2f} - committed "
                     f"${rw['committed_usd']:.2f} - ${projected:.2f} < reserve "
                     f"${rw['reserve_usd']:.2f}", OPERATOR_BLOCKED_CLASS)

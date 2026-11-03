@@ -219,15 +219,21 @@ def test_every_operator_launch_is_booked_and_a_lemon_settles_to_its_real_cost(tm
     assert len(rows) == 2 and rows[-1]["kind"] == "make_good" and rows[-1]["hotkey"] == HK
 
 
-def test_daily_cap_covers_the_king_unless_scoped_to_miner_legs(tmp_path):
-    r = _runner(tmp_path, balance=10_000.0, operator_daily_spend_cap_usd=100.0)
-    prov = money_guard.guard_operator_provider(r, _Prov([KING + "-0"]), enforce=False)
-    with pytest.raises(OperatorRentsHeld, match="daily cap"):
-        prov.launch(SimpleNamespace(name_prefix=KING))        # 20 x 12 h > 100
-    r.cfg.round = dataclasses.replace(r.cfg.round, operator_daily_cap_scope="miner_legs")
-    assert prov.launch(SimpleNamespace(name_prefix=KING)) == [KING + "-0"]
-    assert money_guard.OperatorSpend.for_runner(r).total(scope="miner_legs") == 0.0
+def test_daily_cap_counts_the_king_and_cpu_vms_unless_scoped_to_miner_legs(tmp_path):
+    r = _runner(tmp_path, balance=10_000.0, operator_daily_spend_cap_usd=250.0)
+    king = money_guard.guard_operator_provider(r, _Prov([KING + "-0"]), enforce=False)
+    # the king is COUNTED but never refused by the cap (the runway guards it)
+    assert king.launch(SimpleNamespace(name_prefix=KING)) == [KING + "-0"]     # $240
     assert money_guard.OperatorSpend.for_runner(r).total() == pytest.approx(240.0)
+    leg = "cascade-n91-777-funded-abc-op"
+    legs = money_guard.guard_operator_provider(r, _Prov([leg + "-0"]))
+    with pytest.raises(OperatorRentsHeld, match="daily cap"):
+        legs.launch(SimpleNamespace(name_prefix=leg))           # 240 + 60 > 250
+    gen = SimpleNamespace(hotkey=HK, ref=REF)
+    assert "daily spend cap" in money_guard.would_rent_refusal(r, gen, operator=True)[0]
+    r.cfg.round = dataclasses.replace(r.cfg.round, operator_daily_cap_scope="miner_legs")
+    assert money_guard.OperatorSpend.for_runner(r).total(scope="miner_legs") == 0.0
+    assert legs.launch(SimpleNamespace(name_prefix=leg)) == [leg + "-0"]
 
 
 def test_cpu_vms_are_booked_and_held_with_every_operator_rent(tmp_path):

@@ -1277,9 +1277,14 @@ Trainer-only; nothing here reaches a manifest or a validator verdict.
   landed $/h × expected hours (lemons too, settled to their real cost at
   teardown), and the daily cap counts it per `operator_daily_cap_scope`
   (`"all"` default: king pods, backups, CPU VMs, lemons, miner legs;
-  `"miner_legs"` = the #417 behaviour). **Size `operator_daily_spend_cap_usd`
-  for the king before deploying with scope "all"** (two king eras a day at
-  the king's $/h × 12 h each).
+  `"miner_legs"` = the #417 behaviour). Every operator launch is checked
+  against the cap right before the create — except the king pod and its
+  backups, which are COUNTED but never refused by it (one king era at the
+  ceiling exceeds any sane daily cap, and a refused king stalls every
+  settlement; the runway guard protects the account from the king). With
+  scope "all", king spend uses up the cap for miner-leg operator rents and
+  CPU VMs: **size `operator_daily_spend_cap_usd` for the king's spend before
+  deploying** (two king eras a day at the king's $/h × 12 h each).
 * **Priced keep** (above), the **lost-run retrain is operator-billed**, an
   unreachable pod last seen with a finished unharvested run is kept for the
   priced keep, not the 30 min unreachable grace.

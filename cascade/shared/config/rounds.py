@@ -398,6 +398,8 @@ class RoundConfig:
     operator_standing_pods_usd_per_hour: tuple[tuple[str, float], ...] = ()
     # Which booked operator spend the daily cap counts: "all" (king pods,
     # backups, CPU VMs, lemons, miner legs) or "miner_legs" (#417 behaviour).
+    # The king pod and its backups are counted but never refused by the cap
+    # (the runway guard holds them); every other operator launch is.
     operator_daily_cap_scope: str = "all"
     # The FIRST infra loss on a miner's key taking the submission's infra
     # waste to this files the spend_cap_make_good request (one alert) —
