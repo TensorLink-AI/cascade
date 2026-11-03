@@ -783,8 +783,8 @@ def would_rent_refusal(runner, gen, *, operator: bool) -> tuple[str, str]:
     from .box_health import rent_halt_refusal
     from .cost_guards import doomed_leg_reason, measured_wall_refusal
 
-    rnd = runner.cfg.round
     try:
+        rnd = runner.cfg.round
         why = measured_wall_refusal(rnd)
         if why:
             return why, OPERATOR_BLOCKED_CLASS
