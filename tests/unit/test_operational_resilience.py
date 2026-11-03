@@ -440,3 +440,8 @@ def test_a_tick_that_times_out_reconnects_before_the_next_poll(cfg, tmp_path, mo
     with pytest.raises(SystemExit):
         runner.run_forever(client)
     assert reconnects == [True]
+
+
+# The owner-approval gate (2026-11-02) is tested in test_money_safety.py;
+# these tests drive the operator-lane / operator-rent machinery behind it.
+pytestmark = pytest.mark.usefixtures("operator_legs_preapproved")

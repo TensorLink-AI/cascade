@@ -13,6 +13,7 @@ from .corpus import DIVERGED_MARKER
 from .faults import (
     KEY_LOST_REASON,
     STALL_CLASS,
+    CheckpointUnverifiable,
     _FundedDiverged,
     _FundedKeyLost,
     _FundedTamper,
@@ -188,10 +189,16 @@ class _FundedLegMixin:
                                 domain=domain, expert_selection=expert_selection)
                         report_progress(self, "awaiting_settlement")
                         return entry
-                    except Exception:
+                    except Exception as exc:
+                        from .harvest_guard import keeps_pod, local_disk_error
+
                         verdict = self._funded_leg_failures.get(gen.hotkey)
                         local = self.__dict__["_leg_local_obj"]
-                        if local.funded_allocated and (verdict is None or not verdict[1]):
+                        # A pod KEPT after our disk failed is re-attached on
+                        # the miner's own key: never flagged operator-billed.
+                        ours_kept = keeps_pod(exc) or local_disk_error(exc) is not None
+                        if (local.funded_allocated and not ours_kept
+                                and (verdict is None or not verdict[1])):
                             queue = self._funded_queue()
                             if queue is not None:
                                 queue.set_operator_billed(gen.hotkey, True)
@@ -323,13 +330,23 @@ class _FundedLegMixin:
             str(seeds.base_seed), gen,
             **({"gpu_choice": gpu_choice} if gpu_choice is not None else {}))
         keep = False
+        # A harvest that failed on OUR side (disk/IO) with the run complete:
+        # the pod is NEVER torn down for it (harvest_guard) — the requeued leg
+        # re-attaches to its ledgered allocation and harvests again.
+        hold_pod = False
+        trained = False
         released: list[bool] = []
+        # the harvest of a payer pod: the miner controls it (review F7)
+        _loc = self.__dict__.setdefault("_leg_local_obj", threading.local())
+        _loc.harvest_pod_payer, _loc.leg_trained = True, False
 
         def release_pod() -> None:
             # Owner 2026-11-01: the harvested copy is verified (on the box, or
             # on R2 with the r2 transport) and nothing benches on this pod —
             # stop its bill before the upload / Hippius push.
             if not released:
+                # verified harvest: this pod PRODUCED the result (never waste)
+                _spend_result(self, gen.hotkey, pod)
                 self._teardown_funded_pod(pod)
                 released.append(True)
 
@@ -357,6 +374,7 @@ class _FundedLegMixin:
             harvest = self._funded_harvest()
             report_progress(self, "training")
             disp = _with_leg_watchdog(self, disp, gen, pod, contract, host)
+            # (a harvest inside dispatch marks the leg trained — harvest_guard)
             entry = _dispatch_watched(
                 disp, host, lane_count=1,
                 gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
@@ -370,6 +388,7 @@ class _FundedLegMixin:
                 **({"domain": domain, "expert_selection": expert_selection}
                    if role == "expert" else {}),
             )
+            trained = True
             if getattr(contract, "base_arch", "") in ("cascade_moe", "cascade_pyramid") and role != "mkt_finetune":
                 from ..shared.manifest import contract_digest
 
@@ -444,6 +463,7 @@ class _FundedLegMixin:
                 self._final_role_hosts[
                     ("challenger", contract.arch_preset, gen.hotkey)] = host
                 keep = True
+            _spend_result(self, gen.hotkey, pod)
             return entry
         except _FundedTamper as e:
             self._record_funded_failure(gen.hotkey, f"pod identity: {e}",
@@ -457,12 +477,30 @@ class _FundedLegMixin:
                 "re-fund to supply a fresh key",
                 miner_fault=True, error_class="auth", burn=False)
             raise
+        except CheckpointUnverifiable as e:
+            # Terminal but UNBURNED (review F7): evidence kept, owner decides.
+            self._record_funded_failure(gen.hotkey, f"checkpoint: {e}", miner_fault=True,
+                                        error_class=CheckpointUnverifiable.error_class,
+                                        burn=False)
+            raise
         except _OperatorFault as e:
             # Our side (or the provider's) failed; the miner's pod and run
             # were fine — requeued, never one of their attempts.
+            from .harvest_guard import handle_our_side_fault, keeps_pod
+
             self._record_funded_failure(gen.hotkey, f"operator-side fault: {e}",
                                         miner_fault=False, error_class=OPERATOR_FAULT_CLASS,
                                         burn=False)
+            # box health (may halt every rent) + the bounded keep (F6)
+            if handle_our_side_fault(self, gen, e, pod_id=str(getattr(pod, "instance_id", "") or ""), payer=True,
+                                     trained=trained or _harvested_in_dispatch(self),
+                                     released=bool(released)):
+                # The run is complete on the MINER's pod: the retry re-attaches
+                # there (their key, no new rent) — not an operator make-good.
+                hold_pod = True
+                raise
+            if keeps_pod(e):
+                raise                  # our harvest failed: never an operator make-good
             queue = self._funded_queue()
             if queue is not None:
                 queue.set_operator_billed(gen.hotkey, True)
@@ -500,13 +538,32 @@ class _FundedLegMixin:
                 shards_leg=bool(corpus.get("corpus_files")))
             self._record_funded_failure(gen.hotkey, text, miner_fault=miner_fault,
                                         error_class=error_class, burn=burn)
+            from .harvest_guard import handle_our_side_fault, keeps_pod, local_disk_error
+
+            if handle_our_side_fault(self, gen, e, pod_id=str(getattr(pod, "instance_id", "") or ""), payer=True,
+                                     trained=trained or _harvested_in_dispatch(self),
+                                     released=bool(released)):
+                # OUR disk failed with the run on the miner's pod: keep it for
+                # the re-attach on their key (never an operator make-good).
+                hold_pod = True
+                raise
+            if keeps_pod(e) or local_disk_error(e) is not None:
+                raise                  # our side: never an operator make-good
             if not miner_fault:
                 queue = self._funded_queue()
                 if queue is not None:
                     queue.set_operator_billed(gen.hotkey, True)
             raise
         finally:
-            if not keep and not released:
+            self.__dict__["_leg_local_obj"].harvest_pod_payer = False
+            if not keep and not released and not hold_pod:
+                verdict = self._funded_leg_failures.get(gen.hotkey)
+                if verdict is not None and verdict[1]:
+                    # a genuine miner fault: waste of THEIR making (no make-good)
+                    from .miner_spend_guard import MINER, spend_end
+
+                    spend_end(self, gen.hotkey, str(getattr(pod, "instance_id", "") or ""),
+                              outcome="waste", reason=str(verdict[0])[:120], kind=MINER)
                 self._teardown_funded_pod(pod)
 
     def _keep_funded_pod_for_bench(self) -> bool:
@@ -558,8 +615,12 @@ class _FundedLegMixin:
         factory = self.__dict__.get("_funded_provider_factory") or lium_provider_for_key
         killed = reconcile_funded([], vault, netuid=self.cfg.subnet.netuid,
                                   provider_factory=factory, hotkeys=[hotkey])
+        from .miner_spend_guard import spend_end
+
         for name in killed:
             release_executor_of(self, name)
+            spend_end(self, hotkey, name, outcome="waste",       # the account sweep (S1)
+                      reason="account sweep without a harvested result")
         with self._funded_ledger_lock:
             self._save_funded_ledger([x for x in self._load_funded_ledger()
                                       if x.payer_hotkey != hotkey])
@@ -598,11 +659,27 @@ def _with_leg_watchdog(runner, disp, gen, pod, contract, host=None):
 
     def key_check():
         check_payer_key(runner, hotkey=gen.hotkey, pod_name=str(pod.instance_id), pod=pod)
+        from .miner_spend_guard import spend_touch
+
+        spend_touch(runner, gen.hotkey, str(pod.instance_id))    # seen alive (review S1)
 
     watch = leg_watchdog(runner, gen=gen, pod=pod, contract=contract,
                          key_check=key_check if payer else None,
                          host=str(getattr(host, "host", "") or ""))
     return disp if watch is None else replace(disp, on_progress=watch)
+
+
+def _spend_result(runner, hotkey: str, pod) -> None:
+    from .miner_spend_guard import RESULT, spend_end
+
+    spend_end(runner, hotkey, str(getattr(pod, "instance_id", "") or ""), outcome=RESULT,
+              reason="harvested and verified")
+
+
+def _harvested_in_dispatch(runner) -> bool:
+    """A harvest ran inside this thread's dispatch (the isolated-host hook):
+    the run had finished training (harvest_guard marks it)."""
+    return bool(getattr(runner.__dict__.get("_leg_local_obj"), "leg_trained", False))
 
 
 def _dispatch_watched(disp, host, **kw):
@@ -632,8 +709,15 @@ def _record_generation_failure(runner, gen, e: BaseException) -> None:
     if rc is None and type(e).__name__ == "CorpusError":
         rc = 3
     if rc != 3:
+        # no CPU capacity / a VM that never booted: transient (review F4);
+        # OUR disk failing the corpus write still halts every rent (R5)
+        from ..funding.queue import OPERATOR_TRANSIENT_CLASS
+        from .box_health import note_disk_error
+
+        note_disk_error(getattr(runner, "work_root", None), e, f"corpus of {gen.hotkey[:12]}")
+
         runner._record_funded_failure(gen.hotkey, f"generation (operator tier): {e}",
-                                      miner_fault=False, error_class=OPERATOR_FAULT_CLASS,
+                                      miner_fault=False, error_class=OPERATOR_TRANSIENT_CLASS,
                                       burn=False)
         return
     q = runner._funded_queue()

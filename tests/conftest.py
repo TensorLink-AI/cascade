@@ -202,3 +202,21 @@ def _ample_trainer_disk(monkeypatch):
 
     monkeypatch.setattr(runner_common, "DISK_USAGE",
                         lambda _p: SimpleNamespace(total=1 << 50, used=0, free=1 << 50))
+    # The ONE space manager (harvest room checks, eval-cache floor) likewise.
+    from cascade.shared import disk_space
+
+    monkeypatch.setattr(disk_space, "DISK_USAGE",
+                        lambda _p: SimpleNamespace(total=1 << 50, used=0, free=1 << 50))
+
+
+@pytest.fixture
+def operator_legs_preapproved(monkeypatch):
+    """Tests of the operator-lane / operator-rent MACHINERY (timing, lanes,
+    rents, recovery) predate the 2026-11-02 owner-approval gate: every leg
+    they drive counts as approved by the owner. The gate itself — parking,
+    single-use approvals, denials, the money preflights — is covered in
+    tests/unit/test_money_safety.py, which never uses this fixture."""
+    from cascade.trainer import money_guard
+
+    monkeypatch.setattr(money_guard, "operator_leg_gate", lambda runner, gen, **kw: None)
+    monkeypatch.setattr(money_guard, "preapproved", lambda runner, hotkey: True)

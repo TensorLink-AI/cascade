@@ -423,3 +423,8 @@ def test_operator_lane_deadline_fn_is_per_lane_only_with_a_wall_table(tmp_path):
     assert flat._operator_lane_deadline_fn() == 1000.0
     flat._leg_local.end_wall = None
     assert flat._operator_lane_deadline_fn() is None
+
+
+# The owner-approval gate (2026-11-02) is tested in test_money_safety.py;
+# these tests drive the operator-lane / operator-rent machinery behind it.
+pytestmark = pytest.mark.usefixtures("operator_legs_preapproved")

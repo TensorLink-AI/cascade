@@ -880,3 +880,8 @@ def test_eval_hosts_fan_out_to_the_stage_shape_when_the_row_lacks_gpus(tmp_path)
     text = (tmp_path / "eval_hosts.toml").read_text()
     assert text.count("[[host]]") == 2
     assert loop._stage_gpus("final") == 1          # no policy for the retired fleet
+
+
+# The owner-approval gate (2026-11-02) is tested in test_money_safety.py;
+# these tests drive the operator-lane / operator-rent machinery behind it.
+pytestmark = pytest.mark.usefixtures("operator_legs_preapproved")

@@ -847,3 +847,8 @@ def test_a_king_pod_landing_on_a_quarantined_host_is_rejected(tmp_path, monkeypa
     assert len(launched) == 2 and len(terminated) == 1
     assert lemons and "blocked" in lemons[0]
     assert host.host == "9.9.9.9"
+
+
+# The owner-approval gate (2026-11-02) is tested in test_money_safety.py;
+# these tests drive the operator-lane / operator-rent machinery behind it.
+pytestmark = pytest.mark.usefixtures("operator_legs_preapproved")

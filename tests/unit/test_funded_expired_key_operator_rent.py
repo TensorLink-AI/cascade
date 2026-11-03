@@ -122,7 +122,8 @@ def test_an_operator_billed_entry_with_no_lane_rents_on_the_operator(tmp_path, m
     assert q.get("hkA").operator_faults == r.OPERATOR_FAULT_RETRIES
     with pytest.raises(_FundedLegSkip):
         r._rent_funded_host("777", _challenger("hkA"))
-    assert r._funded_leg_failures["hkA"][2:] == ("operator", False)
+    # a hold, not a new fault: backed off, never counted (review F4)
+    assert r._funded_leg_failures["hkA"][2:] == ("operator_blocked", False)
     assert "paused after" in r._funded_leg_failures["hkA"][0]
 
 
@@ -231,3 +232,8 @@ def test_the_sweep_recognises_in_flight_operator_leg_pods(tmp_path):
     assert not r._is_operator_leg_pod_of("cascade-n91-777-funded-hka-0", {"hkA"})   # payer pod
     assert not r._is_operator_leg_pod_of("cascade-n91-777-funded-king-0", {"hkA"})
     assert not r._is_operator_leg_pod_of("cascade-n259-777-funded-hka-op-0", {"hkA"})  # testnet
+
+
+# The owner-approval gate (2026-11-02) is tested in test_money_safety.py;
+# these tests drive the operator-lane / operator-rent machinery behind it.
+pytestmark = pytest.mark.usefixtures("operator_legs_preapproved")

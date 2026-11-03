@@ -39,8 +39,8 @@ class _FakeDisp:
 
 # ── the queue: operator faults back off, never burn ─────────────────────────
 
-def _queue(tmp_path, t):
-    q = FundedQueue(tmp_path / "q.json", clock=lambda: t[0])
+def _queue(tmp_path, t, **kw):
+    q = FundedQueue(tmp_path / "q.json", clock=lambda: t[0], **kw)
     q.add("hk", "r@1", 10)
     assert q.mark_in_flight("hk", "r@1", target_boundary=1, era_index=1, started_block=1)
     return q
@@ -48,7 +48,9 @@ def _queue(tmp_path, t):
 
 def test_operator_requeue_backs_off_and_never_burns(tmp_path):
     t = [1000.0]
-    q = _queue(tmp_path, t)
+    # the backoff alone (the operator-fault cap pauses at 3 by default —
+    # tests/unit/test_money_safety.py)
+    q = _queue(tmp_path, t, operator_fault_cap=0)
     assert q.requeue("hk", error="upload failed", error_class=OPERATOR_FAULT_CLASS,
                      burn_attempt=False)
     e = q.get("hk")
@@ -100,7 +102,8 @@ def test_generation_tier_infra_is_the_operators_unburned(exc):
     r, rec = _rec_runner()
     _record_generation_failure(r, _challenger("hkA"), exc)
     _msg, kw = rec["hkA"]
-    assert kw == {"miner_fault": False, "error_class": OPERATOR_FAULT_CLASS, "burn": False}
+    # transient on the operator tier (review F4): backed off, never counted
+    assert kw == {"miner_fault": False, "error_class": "operator_transient", "burn": False}
 
 
 def test_generator_fault_on_the_cpu_tier_stays_the_miners():
@@ -243,6 +246,12 @@ def test_operator_rented_leg_failure_never_burns(tmp_path, monkeypatch):
             r, _Boom(), _challenger("hkA"), SimpleNamespace(base_seed=7), 1,
             SimpleNamespace(arch_preset="toto2-4m", corpus_mode="stream_cpu"), "",
             warm_start_ref=None)
-    assert rec["hkA"] == {"miner_fault": False, "error_class": OPERATOR_FAULT_CLASS,
+    # infra on OUR pod is transient (review F4): never burned, never counted
+    assert rec["hkA"] == {"miner_fault": False, "error_class": "operator_transient",
                           "burn": False}
     assert torn == ["op-pod-0"]
+
+
+# The owner-approval gate (2026-11-02) is tested in test_money_safety.py;
+# these tests drive the operator-lane / operator-rent machinery behind it.
+pytestmark = pytest.mark.usefixtures("operator_legs_preapproved")

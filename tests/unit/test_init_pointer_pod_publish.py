@@ -399,3 +399,8 @@ def test_a_deferral_spends_no_try(cfg, tmp_path):
         while sched._init_threads and time.time() < end:
             time.sleep(0.01)
     assert type(ops).calls == 5 and era.init_bench_tries == 0 and era.init_bench is None
+
+
+# The owner-approval gate (2026-11-02) is tested in test_money_safety.py;
+# these tests drive the operator-lane / operator-rent machinery behind it.
+pytestmark = pytest.mark.usefixtures("operator_legs_preapproved")

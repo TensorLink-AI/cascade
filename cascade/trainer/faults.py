@@ -48,6 +48,24 @@ class _OperatorFault(RuntimeError):
     budget is for failures on the miner's own pod (DEC-CA-0036)."""
 
 
+class StorageFault(_OperatorFault):
+    """OUR storage lost a verified checkpoint's upload after every retry (the
+    harvested copy is kept for the re-upload): an operator fault the box
+    health tracks (cascade.trainer.box_health — the same class on two legs
+    halts every rent)."""
+
+
+class CheckpointUnverifiable(Exception):
+    """A payer pod's checkpoint still differs from the pod's OWN listing after
+    a re-harvest and a retry. Flaky host hardware, a write race or our own bug
+    look exactly like tampering here, so this is a terminal but UNBURNED
+    verdict (``checkpoint_unverifiable``): no hotkey burn, at most the one
+    attempt; the box copy and both manifests are kept as evidence, and any
+    burn is the owner's manual call (review F7)."""
+
+    error_class = "checkpoint_unverifiable"
+
+
 class _FundedLegSkip(Exception):
     """A funded challenger leg that settled its own queue verdict (rent/setup
     failure) and must simply be dropped from the round — never retried on the
@@ -201,6 +219,13 @@ def classify_leg_exception(runner, gen, seeds, exc: BaseException, *, rc: int | 
     restart resets it — still bounded per process)."""
     import threading
 
+    from .harvest_guard import local_disk_error
+
+    if local_disk_error(exc) is not None or getattr(exc, "keep_pod", False):
+        # 2026-11-02: OUR disk (ENOSPC/EIO/... anywhere in the leg) or a
+        # harvest our side could not finish — an operator fault, never a
+        # miner burn, whatever the message says.
+        return False, OPERATOR_FAULT_CLASS, False
     final = final_exception_of(exc)
     key = (str(getattr(gen, "hotkey", "")), str(getattr(seeds, "base_seed", "")),
            str(getattr(gen, "ref", "")))

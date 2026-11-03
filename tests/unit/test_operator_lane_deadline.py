@@ -175,3 +175,8 @@ def test_unknown_epoch_end_leaves_the_lane_wait_unbounded(tmp_path):
 
     r = _runner(tmp_path)
     assert TrainerRunner._operator_lane_deadline(r) is None
+
+
+# The owner-approval gate (2026-11-02) is tested in test_money_safety.py;
+# these tests drive the operator-lane / operator-rent machinery behind it.
+pytestmark = pytest.mark.usefixtures("operator_legs_preapproved")

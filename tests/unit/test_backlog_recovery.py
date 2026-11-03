@@ -328,3 +328,8 @@ def test_fair_slots_priority_fifo_and_release_after_failure():
     with gate.slot(1, deadline=time.time() - 1) as acquired:
         assert acquired is False
     assert gate.active == 0 and not gate.waiters
+
+
+# The owner-approval gate (2026-11-02) is tested in test_money_safety.py;
+# these tests drive the operator-lane / operator-rent machinery behind it.
+pytestmark = pytest.mark.usefixtures("operator_legs_preapproved")

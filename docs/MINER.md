@@ -564,8 +564,23 @@ This does not establish a total-dollar cap.
 
 An API key does not itself prove that a budget is configured. Cascade does
 not create keys, raise budgets or verify their remaining allowance. Its
-`--max-price` is an hourly price ceiling for a selected GPU; standard A/B/C
-funding has no cumulative total-dollar budget across providers or retries.
+`--max-price` is an hourly price ceiling for a selected GPU.
+
+On lane A, `cascade fund` takes `--max-total-spend USD`: a **total budget
+for the submission**. It counts every pod on your key across all retries, the
+successful one included. Before each rent, the operator projects your spend
+so far plus the next leg (its price × the expected wall + the boot
+timeout). If that would exceed the budget, no pod is rented and the entry
+pauses as `paused_budget`. It is never rejected; fund again with a higher
+budget to resume. The budget is part of the signed request. A re-fund
+without the flag keeps your stored budget; `--max-total-spend 0` clears it.
+
+A leg already running is **never** killed for an overrun, so set a
+[Lium key budget](https://docs.lium.io/pod-users/api-keys#budgets) as the
+hard backstop. The queue status shows `spend_usd` / `budget_usd`, and
+`miner_waste_usd` (pods that produced nothing). If waste reaches the
+operator's cap the entry pauses as `paused_spend_cap`. Your submission is
+kept: the operator reviews infra losses, or a re-fund resumes it.
 
 | Provider | Documented spending control | Cascade behavior |
 |---|---|---|

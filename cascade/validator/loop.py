@@ -1536,6 +1536,11 @@ class ValidatorRunner(
             # The Cascade state may have been restored in memory to this
             # round's snapshot: persist it with the handled marker.
             self.cascade._persist()
+        # Settled: the eval checkpoints it pinned become ordinary LRU entries
+        # (the king's stays protected through the champion state).
+        release = getattr(self, "_release_eval_pins", None)
+        if callable(release):
+            release()
 
     def _run_followup(self, round_id: str, digest: str, fn: Callable[[], None]) -> None:
         """Run a handled round's follow-up; clear the marker once it completes.

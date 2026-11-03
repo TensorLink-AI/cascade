@@ -351,9 +351,17 @@ def enabled(runner):
     )
 
 
-def operator_provider(runner, legacy_factory):
+def operator_provider(runner, legacy_factory, *, king: bool = False):
+    """The provider every OPERATOR-account rent goes through, wrapped with
+    the operator-account circuit breaker: a real balance refusal (402 /
+    BALANCE_REQUIRED) pauses operator rents for a cooldown (2026-11-02,
+    cascade.trainer.money_guard). ``king`` (the JIT king pod, king backups)
+    is never refused by it — only its own 402 trips it."""
+    from ..trainer.money_guard import guard_operator_provider
+
     if enabled(runner):
-        return OperatorPool(runner)
+        return guard_operator_provider(runner, OperatorPool(runner), enforce=not king)
     from ..trainer.gpu_health import guard_provider
 
-    return guard_provider(runner, legacy_factory())
+    return guard_operator_provider(runner, guard_provider(runner, legacy_factory()),
+                                   enforce=not king)

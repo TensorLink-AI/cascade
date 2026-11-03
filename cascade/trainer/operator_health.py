@@ -22,15 +22,17 @@ from .gpu_health import health_for
 log = logging.getLogger(__name__)
 
 
-def lium_balance():
-    """Documented GET /users/me; missing data is unknown, never zero."""
+def lium_balance(api_key: str | None = None):
+    """Documented GET /users/me; missing data is unknown, never zero.
+    ``api_key`` None = the operator's ``LIUM_API_KEY``; a payer's vaulted key
+    reads that payer's balance (money_guard.payer_balance_refusal)."""
     import math
 
     import requests
 
     from ..provision.core import LIUM_API_BASE
 
-    key = os.environ.get("LIUM_API_KEY")
+    key = api_key if api_key is not None else os.environ.get("LIUM_API_KEY")
     if not key:
         return None
     response = requests.get(
@@ -209,7 +211,9 @@ class OperatorMonitor:
         if len(pending) >= 2:
             state["outbox"].remove(pending[-1])
         state["outbox"].append({"event": event, "delivered": False})
-        log.warning("operator alert: %s %s (%s)", condition["code"], condition["scope"], status)
+        detail = condition.get("message")
+        log.warning("operator alert: %s %s (%s)%s", condition["code"], condition["scope"], status,
+                    f" — {detail}" if detail and status == "active" else "")
 
     def _deliver(self, state):
         name = getattr(self.runner.cfg.round, "ops_alert_webhook_env", "")
@@ -291,6 +295,14 @@ class OperatorMonitor:
             cfg=runner.cfg.round,
             gpu_blocked=health_for(runner).blocked(),
         )
+        # Money safety (2026-11-02): approvals pending, paused entries, the
+        # operator breaker and every rent block — one alert per activation.
+        try:
+            from .money_guard import health_conditions
+
+            snap["conditions"] += health_conditions(runner, queues, now=now)
+        except Exception as e:  # noqa: BLE001 — never sinks the watchdog
+            log.warning("money-safety conditions unavailable (%s)", type(e).__name__)
         snap["sample_duration_seconds"] = round(max(0, self.clock() - now), 1)
         if snap["sample_duration_seconds"] > max(
             30, runner.cfg.round.ops_alert_interval_seconds * 2

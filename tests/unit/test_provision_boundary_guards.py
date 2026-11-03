@@ -320,3 +320,8 @@ def test_render_host_entries_round_trips_through_tomllib_and_load_hosts(tmp_path
     weird = [{"name": 'a"b\\c', "host": "10.0.0.1", "note": "ünïcode", "port": 22,
               "flag": True, "ratio": 0.5, "forward_env": []}]
     assert tomllib.loads(render_host_entries(weird))["host"] == weird
+
+
+# The owner-approval gate (2026-11-02) is tested in test_money_safety.py;
+# these tests drive the operator-lane / operator-rent machinery behind it.
+pytestmark = pytest.mark.usefixtures("operator_legs_preapproved")

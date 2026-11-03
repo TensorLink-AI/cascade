@@ -144,6 +144,9 @@ def verify_harvest_complete(runner, host, remote_dir: str, dest: Path,
     dir, or the copy still differs after one ``reharvest()``. Never raises
     for a listing problem; ``reharvest`` failures propagate (the harvest
     itself failed, as today)."""
+    # Set only when the pod LISTED its checkpoint and the copy still differs
+    # after the re-harvest: the harvest is then not a success (harvest_guard).
+    _local(runner).harvest_mismatch = False
     if release_callback(runner, release) is None:
         return None
     from concurrent.futures import ThreadPoolExecutor
@@ -178,6 +181,10 @@ def verify_harvest_complete(runner, host, remote_dir: str, dest: Path,
                     " — re-harvesting" if attempt == 1 else " — pod kept, not released")
         if attempt == 1:
             reharvest()
+        else:
+            _local(runner).harvest_mismatch = True
+            _local(runner).harvest_mismatch_evidence = {"pod": pod, "box": box,
+                                                        "mismatches": bad}
     return None
 
 
@@ -262,6 +269,9 @@ def release_if_verified(runner, verified: VerifiedHarvest | None,
         log.error("pod release after verified harvest failed (%s) — torn down at "
                   "leg end instead", e)
         return False
+    # From here the box copy (or R2) is the only copy: harvest_guard never
+    # deletes it on a later local-disk error.
+    _local(runner).harvest_released = True
     log.info(RELEASE_LOG if where == "box" else RELEASE_LOG_R2,
              verified.files, verified.nbytes / 1e9)
     return True

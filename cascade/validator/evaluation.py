@@ -38,10 +38,94 @@ class EvaluationMixin:
         ref = parse_trained_pointer(entry.trained_pointer)
         if ref is None:
             raise ValueError(f"malformed trained_pointer: {entry.trained_pointer!r}")
+        from ..shared import disk_space
+
         hub = HubConfig.from_storage(self.cfg.storage)
-        dest = Path(self.cache_dir or "./_eval_ckpts") / HubRef.parse(ref).digest.replace(":", "-")
+        root = Path(self.cache_dir or disk_space.eval_cache_root(self.cfg))
+        name = HubRef.parse(ref).digest.replace(":", "-")
+        dest = root / name
+        # The manifest being settled keeps every checkpoint it fetched until
+        # it is handled (_mark_handled clears the pins); the cache is trimmed
+        # to its budget / free-space floor BEFORE this fetch (2026-11-02:
+        # 401 GB of never-evicted checkpoints filled the volume).
+        with disk_space.space_lock(root):                 # pin-then-trim vs trainer reclaim
+            self._pin_eval_checkpoint(root, name)
+            self._trim_eval_cache(root, need_bytes=0 if dest.is_dir()
+                                  else self._expected_ckpt_bytes())
         fetch_from_hub(ref, dest, hub)
+        disk_space.touch(dest)
         return dest
+
+    def _expected_ckpt_bytes(self) -> int:
+        from ..shared.disk_space import GIB
+
+        return int(float(getattr(self.cfg.round, "expected_checkpoint_gb", 0.0) or 0.0) * GIB)
+
+    def _pin_eval_checkpoint(self, root: Path, name: str) -> None:
+        """Pin ``name`` for the manifest in progress (persisted beside the
+        cache so the trainer's space manager honours it too). Best-effort."""
+        from ..shared import disk_space
+
+        disk_space.touch_pins_active(root)        # this validator pins: trainer may trim
+        pins = self.__dict__.setdefault("_eval_ckpt_pins", set())
+        if name in pins:
+            return
+        pins.add(name)
+        try:
+            disk_space.write_pins(root, pins)
+        except OSError as e:
+            log.warning("eval cache: could not persist pins (%s); in-memory pins still hold", e)
+
+    def _release_eval_pins(self) -> None:
+        """The manifest settled: its checkpoints become ordinary LRU entries."""
+        from ..shared import disk_space
+
+        pins = self.__dict__.get("_eval_ckpt_pins")
+        if not pins:
+            return
+        pins.clear()
+        root = Path(self.cache_dir or disk_space.eval_cache_root(self.cfg))
+        try:
+            disk_space.write_pins(root, ())
+        except OSError as e:
+            log.warning("eval cache: could not clear pins (%s)", e)
+
+    def _trim_eval_cache(self, root: Path, *, need_bytes: int = 0) -> None:
+        """Evict reclaimable eval checkpoints (never the king / state refs /
+        pinned) to stay under the budget and above the free-space floor.
+        Never raises: a trim failure must not cost a settlement."""
+        from ..shared import disk_space
+
+        try:
+            extra = set(self.__dict__.get("_eval_ckpt_pins") or ())
+            # The in-memory champion state is fresher than its file (the king
+            # crowned this settlement may not be persisted yet).
+            state = getattr(self, "state", None)
+            if state is not None:
+                from . import state as state_mod
+
+                extra |= disk_space.referenced_digest_dirs([state_mod.dumps(state)])
+            v = self.cfg.validator
+            disk_space.touch_pins_active(root)
+            try:
+                protected = disk_space.eval_cache_protected(self.cfg, root, extra)
+            except disk_space.ProtectionUnknown as e:
+                log.error("eval cache: protection state unreadable (%s) — nothing evicted", e)
+                return
+            src = disk_space.digest_cache_source(
+                "eval_cache", root, protected,
+                max_bytes=int(float(v.eval_ckpt_cache_max_gb) * disk_space.GIB))
+            rep = disk_space.ensure_space(
+                root, [src], floor_bytes=int(float(v.eval_ckpt_cache_min_free_gb) * disk_space.GIB),
+                need_bytes=need_bytes, grace_seconds=float(v.eval_ckpt_cache_grace_seconds),
+                why="eval cache retention")
+            if rep.short_bytes:
+                log.error("eval cache: still %.1f GB short of the free-space floor after "
+                          "evicting everything reclaimable (%d evicted) — protected "
+                          "checkpoints or other data fill %s", rep.short_bytes / 1e9,
+                          len(rep.evicted), root)
+        except Exception as e:  # noqa: BLE001 — never fails a fetch
+            log.warning("eval cache trim failed (%s); fetching anyway", e)
 
     def _verdict_windows(
         self, window_source: object, round_seed: int | str, *, block: int | None

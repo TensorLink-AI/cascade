@@ -586,11 +586,13 @@ class LegOps:
         # start, so a path that fails without recording one (the operator-
         # lane fallback, a dispatcher/config error) is OURS, never the
         # miner's — operator class: no burned attempt, the queue backs off.
-        from ..funding.queue import OPERATOR_FAULT_CLASS
+        # Transient (review F4): backed off, never counted toward the
+        # operator-fault cap — a real fault always records its own verdict.
+        from ..funding.queue import OPERATOR_TRANSIENT_CLASS
 
         return self.r._funded_leg_failures.get(
             hotkey, ("challenger leg failed without a recorded verdict (operator side)",
-                     False, OPERATOR_FAULT_CLASS, False))
+                     False, OPERATOR_TRANSIENT_CLASS, False))
 
     def king_funding(self, era: EraState, gen) -> str:
         """DEC-CA-0055: who paid for ``era``'s persisted king leg ("king" /
@@ -1951,6 +1953,15 @@ class RollingScheduler:
                     era.king_bench = bench
                     self._save()
             except Exception as e:  # noqa: BLE001 — retried next tick; never kills the loop
+                if _rents_halted(e):
+                    # The box-health halt held the king's rent: not the pod's
+                    # fault — never counted, never a rotation (review R2).
+                    log.error("rolling: era %d king leg waits for the box-health halt: %s",
+                              era.index, error_tail(e, 200))
+                    with self._lock:
+                        era.king_leg_failed = error_tail(e, 300)
+                        self._save()
+                    return
                 log.error("rolling: era %d king leg FAILED: %s", era.index, e)
                 with self._lock:
                     era.king_leg_failed = error_tail(e, 300)
@@ -2710,6 +2721,7 @@ class RollingScheduler:
                     _finish(cached)
                     return
                 entry = self.ops.train_challenger(gen, era, block, end_wall=end_wall)
+                _forget_lost_leg(self.r, gen.hotkey)            # trained + harvested (N5)
                 _finish(entry)
             except Exception as e:  # noqa: BLE001 — settle the leg from its outcome
                 msg, miner_fault, error_class, burn = self.ops.leg_failure(gen.hotkey)
@@ -2717,6 +2729,7 @@ class RollingScheduler:
                     if miner_fault:
                         queue.fail(gen.hotkey, error=msg or str(e), error_class=error_class,
                                    expect_ref=gen.ref)
+                        _forget_lost_leg(self.r, gen.hotkey)    # terminal: no stale record (N5)
                         if error_class in ("generator", "tamper"):
                             self.ops.burn([gen], block)
                     else:
@@ -3650,3 +3663,27 @@ class RollingScheduler:
                          for e in entries if e.status == "failed"],
             "rents": list(self.state.rents),
         }
+
+
+def _forget_lost_leg(runner, hotkey: str) -> None:
+    """End a hotkey's box-health lost-run record (review N5). Never raises."""
+    try:
+        from .box_health import BoxHealth
+
+        if getattr(runner, "work_root", None) is not None:
+            BoxHealth.for_runner(runner).forget_leg(hotkey)
+    except Exception as e:  # noqa: BLE001
+        log.warning("box health: could not clear the leg record of %s (%s)", hotkey[:12], e)
+
+
+def _rents_halted(exc: BaseException | None) -> bool:
+    """A failure that is the box-health halt holding the rent (review R2)."""
+    from .box_health import RentsHalted
+
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, RentsHalted):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -44,6 +45,7 @@ def _scripted(tmp_path, monkeypatch, *, pod_files=None, harvests=None, upload_fa
     runner, _torn, seeds, contract = _harvest_runner(tmp_path, monkeypatch, disp=disp, **round_kw)
     runner._hf_ckpt_repo = lambda repo: None
     runner._upload_retry_sleep = lambda s: None
+    runner._harvest_retry_sleep = lambda s: None
     events: list[str] = []
     runner._teardown_funded_pod = lambda pod: events.append(f"teardown:{pod.instance_id}")
     pod_files = dict(FILES if pod_files is None else pod_files)
@@ -115,18 +117,30 @@ def test_hash_mismatch_reharvests_once_then_releases(tmp_path, monkeypatch):
     {k: v for k, v in FILES.items() if k != "optimizer.pt"},         # file missing
     dict(FILES, **{"optimizer.pt": b"O" * 3}),                       # truncated
 ])
-def test_no_release_on_mismatch_pod_kept_until_the_leg_ends(tmp_path, monkeypatch, copy):
+def test_persistent_mismatch_on_a_payer_pod_is_unverifiable_never_burned(tmp_path, monkeypatch,
+                                                                         copy):
+    """A copy that still differs from the pod's own listing is NEVER uploaded.
+    After one retry it is a terminal but UNBURNED ``checkpoint_unverifiable``
+    (flaky hardware, a write race or our own bug look like tampering): the
+    box copy and both manifests stay as evidence (review F7)."""
+    import json
+
+    from cascade.trainer.faults import CheckpointUnverifiable
+
     runner, disp, seeds, contract, events, _ = _scripted(
-        tmp_path, monkeypatch, harvests=[copy])
-    # the upload helper asserts the full file set; a missing file is the
-    # guards' business, not this test's
+        tmp_path, monkeypatch, harvests=[copy], harvest_disk_retries=3)
     monkeypatch.setattr(loop_module, "upload_dir_to_hub_or_hf",
                         lambda d, repo, hub, hf_repo=None: events.append("upload") or SimpleNamespace(
                             ref=SimpleNamespace(immutable_ref="cascade/c@sha256:" + "d" * 64)))
-    _leg(runner, disp, seeds, contract)
-    # two harvests (one retry), never released early: torn down AFTER the upload
-    assert events == ["harvest", "pod-listing", "harvest", "pod-listing", "verify", "upload",
-                      f"teardown:{POD}"]
+    with pytest.raises(CheckpointUnverifiable):
+        _leg(runner, disp, seeds, contract)
+    assert events[:8] == ["harvest", "pod-listing", "harvest", "pod-listing"] * 2
+    assert "upload" not in events
+    msg, miner_fault, cls, burn = runner._funded_leg_failures["hkA"]
+    assert (miner_fault, cls, burn) == (True, "checkpoint_unverifiable", False)
+    (proof,) = list(tmp_path.rglob("*.unverifiable.json"))
+    doc = json.loads(proof.read_text())
+    assert doc["pod_manifest"] and doc["box_manifest"] and Path(doc["box_copy"]).is_dir()
 
 
 def test_unlistable_pod_is_kept_until_the_leg_ends(tmp_path, monkeypatch):
@@ -339,3 +353,8 @@ def test_release_knob_defaults_on_and_round_trips_through_the_loader(tmp_path):
     assert edited != src
     (tmp_path / "chain.toml").write_text(edited, encoding="utf-8")
     assert load_chain_config(tmp_path / "chain.toml").round.funded_release_after_harvest is False
+
+
+# The owner-approval gate (2026-11-02) is tested in test_money_safety.py;
+# these tests drive the operator-lane / operator-rent machinery behind it.
+pytestmark = pytest.mark.usefixtures("operator_legs_preapproved")

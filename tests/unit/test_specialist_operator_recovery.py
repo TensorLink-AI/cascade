@@ -95,3 +95,8 @@ def test_make_good_preserves_specialist_job_and_releases_resources(
     assert pool.get_nowait() is host  # shared GPU lane returned even after both attempts fail
     assert q.get("alice").operator_billed
     assert not hasattr(r.__dict__["_leg_local_obj"], "funded_queue")
+
+
+# The owner-approval gate (2026-11-02) is tested in test_money_safety.py;
+# these tests drive the operator-lane / operator-rent machinery behind it.
+pytestmark = pytest.mark.usefixtures("operator_legs_preapproved")

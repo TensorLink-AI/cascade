@@ -11,7 +11,6 @@ import time
 from dataclasses import replace
 from pathlib import Path
 
-from ..funding.queue import OPERATOR_FAULT_CLASS
 from ..shared.manifest import (
     TrainedEntry,
     contract_digest,
@@ -80,6 +79,40 @@ def allocation_lock(lock):
         yield release
     finally:
         release()
+
+
+def _kept_pod_record(runner, pod_id: str):
+    from .box_health import BoxHealth
+
+    for hk, rec in (BoxHealth.for_runner(runner).state().get("legs") or {}).items():
+        if rec.get("pod_id") == pod_id and rec.get("kept"):
+            return hk, rec
+    return None, None
+
+
+def _kept_past_budget(runner, pod_id: str, now: float) -> bool:
+    """``pod_id`` was kept after OUR harvest fault longer than
+    ``[round] harvest_keep_max_seconds``: release it (priced alert, run lost)."""
+    try:
+        hk, rec = _kept_pod_record(runner, pod_id)
+        limit = float(getattr(runner.cfg.round, "harvest_keep_max_seconds", 600) or 0)
+        if rec is None or not limit or time.time() - float(rec.get("kept_since") or now) < limit:
+            return False
+        from .box_health import BoxHealth, miner_lost_usd
+        from .money_guard import alert
+
+        BoxHealth.for_runner(runner).note_leg(hk, {"kept": False})
+        who = "MINER" if rec.get("payer") else "operator"
+        alert(runner, "miner_billed_loss" if rec.get("payer") else "operator_billed_loss",
+              hk[:16], f"kept pod {pod_id} released after the {limit:.0f} s keep budget — the "
+              f"finished run is lost: ≤ ${miner_lost_usd(runner):.2f} billed to the {who}; a "
+              "retrain needs the owner's approval", severity="critical")
+        log.error("funded sweep: releasing KEPT pod %s of %s — past the %.0f s keep budget",
+                  pod_id, hk[:12], limit)
+        return True
+    except Exception as e:  # noqa: BLE001 — unsure ⇒ the normal sweep rule
+        log.warning("funded sweep: kept-pod budget check failed for %s (%s)", pod_id, e)
+        return False
 
 
 class _FundedPodMixin:
@@ -371,8 +404,15 @@ class _FundedPodMixin:
         _, source = read_text_with_backup(self._funded_ledger_path(), _parse_funded_ledger)
         if source == "unreadable":
             raise RuntimeError("funded pod ledger unreadable; refusing to overwrite billing evidence")
-        write_text_atomic(self._funded_ledger_path(), json.dumps([asdict(x) for x in pods], indent=2),
-                          backup=source == "main")
+        try:
+            write_text_atomic(self._funded_ledger_path(),
+                              json.dumps([asdict(x) for x in pods], indent=2),
+                              backup=source == "main")
+        except OSError as e:
+            from .box_health import note_disk_error
+
+            note_disk_error(self.work_root, e, "funded pod ledger")   # halts rents (R5)
+            raise
 
     def _ledger_add(self, pod) -> None:
         with self._funded_ledger_lock:
@@ -445,6 +485,12 @@ class _FundedPodMixin:
             if pods:
                 leftovers = teardown_funded(pods, vault)
                 gone = {x.instance_id for x in pods} - {x.instance_id for x in leftovers}
+                from .miner_spend_guard import spend_end
+
+                for x in pods:
+                    if x.instance_id in gone:      # the sweep's teardown (review S1)
+                        spend_end(self, x.payer_hotkey, x.instance_id, outcome="waste",
+                                  reason="swept without a harvested result")
                 with self._funded_ledger_lock:
                     # Only CONFIRMED-gone rows leave the ledger: a kept pod's
                     # row must survive, or the listing sweep below would read
@@ -457,10 +503,16 @@ class _FundedPodMixin:
                               "ledger for the next sweep",
                               inst.instance_id, inst.payer_hotkey)
             # Orphans of every payer without an in-flight leg.
-            reconcile_funded(self._load_funded_ledger(), vault,
-                             netuid=self.cfg.subnet.netuid, exclude=keep_payers,
-                             keep=lambda adapter, pod_id, hotkey: self._sweep_keeps_pod(
-                                 adapter, pod_id, what=f"payer {hotkey[:12]} off-ledger pod"))
+            killed = reconcile_funded(self._load_funded_ledger(), vault,
+                                      netuid=self.cfg.subnet.netuid, exclude=keep_payers,
+                                      keep=lambda adapter, pod_id, hotkey: self._sweep_keeps_pod(
+                                          adapter, pod_id,
+                                          what=f"payer {hotkey[:12]} off-ledger pod"))
+            from .miner_spend_guard import close_vanished, spend_end
+
+            for name in killed or ():
+                spend_end(self, "", str(name), outcome="waste", reason="off-ledger pod swept")
+            close_vanished(self)                     # open records of pods long gone
         except Exception as e:  # noqa: BLE001
             log.warning("funded pod reconcile failed (ignored): %s", e)
 
@@ -623,6 +675,30 @@ class _FundedPodMixin:
 
         return OperatorPool(self) if pod.provider == OperatorPool.name else LiumProvider()
 
+    def _payer_pod_liveness(self, pod_id: str):
+        """``(address | None, definitive)`` for this leg's ledgered payer pod,
+        asked through ITS payer provider (bounded retries: a blip is never
+        "gone"). Unknown when the pod, its key or the probe is unavailable."""
+        from .runner_common import probe_pod_live
+
+        try:
+            pod = next((p for p in self._load_funded_ledger() if p.instance_id == pod_id), None)
+            vault = self._payer_vault() if pod is not None else None
+            provider = self._payer_pod_provider(vault, pod) if vault is not None else None
+            live = getattr(provider, "live_pod_address", None)
+        except Exception as e:  # noqa: BLE001 — unknown, never "gone"
+            log.warning("funded leg: liveness of %s unknown (%s)", pod_id, e)
+            return None, False
+        if not callable(live):
+            return None, False
+        addr, definitive = probe_pod_live(live, pod_id,
+                                          sleep=getattr(self, "_rent_wait_sleep", None))
+        if addr is not None and pod is not None:
+            from .miner_spend_guard import spend_touch
+
+            spend_touch(self, pod.payer_hotkey, pod_id)        # seen alive
+        return addr, definitive
+
     def _payer_pod_provider(self, vault, pod):
         """``pod``'s payer-account adapter (its vaulted key), or None."""
         try:
@@ -722,6 +798,11 @@ class _FundedPodMixin:
                            if harvested_at < now - age]
             fresh = [(d, age) for d, age in unharvested
                      if age < self.SWEEP_UNHARVESTED_KEEP_SECONDS]
+            if fresh and _kept_past_budget(self, pod_id, now):
+                # A pod WE kept after our own harvest fault: bounded at
+                # [round] harvest_keep_max_seconds, not the 6 h restart grace —
+                # it bills its payer (review F6). Released with a priced alert.
+                return False
             if fresh:
                 log.error("funded sweep: KEEPING %s %s — finished run(s) with exit code 0 "
                           "NOT harvested (%s); harvest it or it is released %.0fs after "
@@ -826,11 +907,22 @@ class _FundedPodMixin:
             # that keeps recurring (a broken image, our credential setup) must
             # not keep billing the miner: after the cap the entry pauses.
             faults = int(getattr(flagged, "operator_faults", 0) or 0)
+            from .miner_spend_guard import capped
+
+            if capped(self, gen):
+                # A make-good approved after the miner waste cap: NEVER again
+                # on the miner's key — it waits for operator capacity.
+                self._record_funded_failure(
+                    gen.hotkey, "the operator make-good after the waste cap needs operator "
+                    "capacity; your key is not charged again", miner_fault=False,
+                    error_class="operator_blocked", burn=False)
+                raise _FundedLegSkip(gen.hotkey)
             if faults >= self.OPERATOR_FAULT_RETRIES:
                 self._record_funded_failure(
                     gen.hotkey, f"paused after {faults} operator-side failures; the operator "
                     "must fix the cause before this leg rents again (not the miner's fault, "
-                    "nothing burned)", miner_fault=False, error_class="operator", burn=False)
+                    "nothing burned)", miner_fault=False, error_class="operator_blocked",
+                    burn=False)
                 raise _FundedLegSkip(gen.hotkey)
             log.warning("final challenger %s: operator-side failure %d/%d and no operator "
                         "make-good configured; retrying on the miner's key with a new pod",
@@ -841,8 +933,14 @@ class _FundedPodMixin:
             # Owner make-good: this entry's leg is on the operator's bill — an
             # operator lane (or an operator-rented pod), never the payer's key;
             # a miss requeues the leg unburned like any lane fault.
+            from .money_guard import gate_or_adopt
+
             lanes = self._operator_fallback_lanes()
             if not lanes and self._operator_rent_allowed():
+                # Owner 2026-11-02: never on our account without the owner's
+                # approval of THIS leg (parks awaiting_operator_approval); a
+                # leg already holding its operator pod is adopted (F1).
+                gate_or_adopt(self, round_id, gen, kind="make_good", rent=True)
                 log.warning("final challenger %s: entry is OPERATOR-BILLED — no operator "
                             "lane on file, renting a pod on the OPERATOR's account",
                             gen.hotkey)
@@ -851,8 +949,9 @@ class _FundedPodMixin:
                 self._record_funded_failure(
                     gen.hotkey, "operator-funded recovery is required; no operator capacity "
                     "is configured, so the miner's key will not be charged again",
-                    miner_fault=False, error_class="operator", burn=False)
+                    miner_fault=False, error_class="operator_blocked", burn=False)
                 raise _FundedLegSkip(gen.hotkey)
+            gate_or_adopt(self, round_id, gen, kind="make_good", rent=False)
             log.warning("final challenger %s: entry is OPERATOR-BILLED (owner make-good) — "
                         "running on an operator lane (%d on file), never on the payer's key",
                         gen.hotkey, len(lanes))
@@ -878,19 +977,92 @@ class _FundedPodMixin:
             # and cost cap below is a guess (2026-10-31: 20x off). Nothing is
             # rented; requeued unburned as OUR fault.
             log.error("funded leg %s: %s", gen.hotkey[:12], why)
+            from ..funding.queue import OPERATOR_BLOCKED_CLASS
+
             self._record_funded_failure(gen.hotkey, why, miner_fault=False,
-                                        error_class=OPERATOR_FAULT_CLASS, burn=False)
+                                        error_class=OPERATOR_BLOCKED_CLASS, burn=False)
             raise _FundedLegSkip(gen.hotkey)
+        # No blind retrain (2026-11-02: every ENOSPC harvest re-rented on the
+        # MINER's key and retrained, ~$640 lost). A leg an our-side fault hit
+        # AFTER it trained either re-harvests its KEPT pod (adopted below,
+        # once the box-health halt is clear) or — the finished run is gone —
+        # retrains only with the owner's approval, even on the miner's key.
+        from .box_health import BoxHealth, rent_halt_refusal
         from .runner_common import disk_guard_refusal
 
+        lost_leg = BoxHealth.for_runner(self).leg(gen.hotkey) if queue is not None else None
+        if lost_leg and (not lost_leg.get("trained") or lost_leg.get("ref", gen.ref) != gen.ref):
+            lost_leg = None
+        retrain_gated = False
+        pod_live: bool | None = None
+        if prior_alloc:
+            # Is this leg's ledgered pod actually live and adoptable? A stale
+            # write-ahead row must not bypass the halt / canary / reservation
+            # (review N3), and a lost kept pod must be known BEFORE any rent.
+            probe = getattr(self, "_payer_pod_liveness", None)
+            addr, definitive = probe(expected_id) if callable(probe) else (None, False)
+            pod_live = True if addr is not None else (False if definitive else None)
+            if pod_live is False:
+                log.warning("funded leg %s: ledgered pod %s is not live — a fresh rent, every "
+                            "rent guard applies", gen.hotkey[:12], expected_id)
+                prior_alloc = False
+        if lost_leg is not None:
+            from ..funding.queue import OPERATOR_DISK_CLASS, OPERATOR_TRANSIENT_CLASS
+
+            if pod_live is True and lost_leg.get("kept"):
+                # Re-harvest the kept pod: never held by the halt; it needs room
+                # for its OWN checkpoint only (review N2).
+                from .harvest_guard import _room
+                from .runner_common import HARVEST_DIRNAME
+
+                short = _room(self, Path(self.work_root) / HARVEST_DIRNAME,
+                              f"re-harvest of {gen.hotkey[:12]}'s kept pod")
+                if short:
+                    self._record_funded_failure(
+                        gen.hotkey, f"operator disk: no room yet ({short / 1e9:.1f} GB short) "
+                        "to re-harvest the kept pod — retried, nothing rented",
+                        miner_fault=False, error_class=OPERATOR_DISK_CLASS, burn=False)
+                    raise _FundedLegSkip(gen.hotkey)
+            elif pod_live is None and prior_alloc:
+                # Liveness unknown (a provider blip): neither rent nor park.
+                self._record_funded_failure(
+                    gen.hotkey, "kept pod liveness unknown (provider blip) — re-attach "
+                    "retried, nothing rented", miner_fault=False,
+                    error_class=OPERATOR_TRANSIENT_CLASS, burn=False)
+                raise _FundedLegSkip(gen.hotkey)
+            else:
+                # The finished run is gone (or its pod was never kept): no
+                # blind retrain on the miner's key — the owner's approval comes
+                # BEFORE any rent (review N1/N6). Approved ⇒ an ordinary leg.
+                from .money_guard import operator_leg_gate
+
+                operator_leg_gate(self, gen, kind="retrain_after_loss", rent=True)
+                retrain_gated = True
+                lost_leg = None
+                prior_alloc = False
         # Disk guard (2026-10-31): never start a NEW leg the box may not have
-        # room to finish (harvest, ledgers, pending records). An adopted
-        # allocation is a live leg — it always keeps going.
-        low = "" if prior_alloc else disk_guard_refusal(self)
+        # room to finish (harvest, ledgers, pending records); also the box
+        # health halt and the pre-rent canary. An adopted allocation is a live
+        # leg — it always keeps going.
+        # Only a pod confirmed LIVE skips the guards: an unknown liveness (no
+        # key / provider / probe) gets every guard too (review R6).
+        adopt_live = bool(prior_alloc and pod_live is True)
+        is_king = bool(getattr(self.__dict__.get("_leg_local_obj"), "funded_is_king", False))
+        if is_king and not adopt_live:
+            # An own-key KING leg held by a disk halt: RentsHalted, never a
+            # _FundedLegSkip the era loop counts and rotates on (review D2).
+            from .box_health import RentsHalted
+
+            held = rent_halt_refusal(self, king=True)
+            if held:
+                raise RentsHalted(held)
+        low = "" if adopt_live else disk_guard_refusal(self)
         if low:
+            from ..funding.queue import OPERATOR_DISK_CLASS
+
             log.error("funded leg %s: %s", gen.hotkey[:12], low)
             self._record_funded_failure(gen.hotkey, low, miner_fault=False,
-                                        error_class="no_capacity", burn=False)
+                                        error_class=OPERATOR_DISK_CLASS, burn=False)
             raise _FundedLegSkip(gen.hotkey)
         vault = self._payer_vault()
         if vault is None:
@@ -913,8 +1085,34 @@ class _FundedPodMixin:
         if api_key and vault.refresh(gen.hotkey):
             log.info("final challenger %s: payer key TTL re-stamped for the leg",
                      gen.hotkey)
+        if (api_key and not prior_alloc
+                and float(getattr(rnd, "payer_projected_rate_per_hour", 0.0) or 0.0) > 0):
+            # A key that cannot pay for the whole leg never starts it: the
+            # miner would pay for a pod that dies mid-run (no attempt charged).
+            from ..funding.queue import PAYER_BALANCE_CLASS
+            from .money_guard import payer_balance_refusal
+
+            # A miner-chosen type is projected at the miner's own cap (an
+            # 8xH200 at $30+/h must not be under-projected at the knob) or,
+            # uncapped, at the operator's funded ceiling.
+            knob = float(getattr(rnd, "payer_projected_rate_per_hour", 0.0) or 0.0)
+            chosen_rate = (float(getattr(gpu_choice, "max_price_per_hour", 0.0) or 0.0)
+                           or float(getattr(rnd, "funded_max_price_per_hour", 0.0) or 0.0)
+                           ) if getattr(gpu_choice, "gpu", "") else 0.0
+            poor = payer_balance_refusal(self, api_key, hours=self._leg_wall_seconds() / 3600.0,
+                                         rate=max(knob, chosen_rate))
+            if poor:
+                # nothing rented, requeued with a backoff — never terminal,
+                # never a burn, never counted against any cap
+                log.warning("funded leg %s: %s", gen.hotkey[:12], poor)
+                self._record_funded_failure(gen.hotkey, poor, miner_fault=False,
+                                            error_class=PAYER_BALANCE_CLASS, burn=False)
+                raise _FundedLegSkip(gen.hotkey)
         if not api_key:
+            from .money_guard import gate_or_adopt
+
             if self._operator_fallback_lanes():
+                gate_or_adopt(self, round_id, gen, kind="expired_key", rent=False)
                 # The payer's key aged out while their leg kept failing on our
                 # side. With the owner-armed hybrid on and operator lanes on
                 # file, the leg runs operator-billed rather than dropping the
@@ -926,8 +1124,11 @@ class _FundedPodMixin:
             if self._operator_rent_allowed():
                 # A queued entrant whose key aged out while the marketplace was
                 # sold out is not dropped: with no operator lane on file the leg
-                # rents a pod on the OPERATOR's account. The entry is flagged
-                # so every retry stays on our bill; the miner is never burned.
+                # rents a pod on the OPERATOR's account — ONLY once the owner
+                # approved this leg (2026-11-02: an unapproved expired-key rent
+                # drained the operator account). The entry is flagged so the
+                # approved leg stays on our bill; the miner is never burned.
+                gate_or_adopt(self, round_id, gen, kind="expired_key", rent=True)
                 log.warning("final challenger %s: no vaulted key (TTL expired) — "
                             "operator-billed (payer key expired): renting a pod on the "
                             "OPERATOR's account", gen.hotkey)
@@ -1004,7 +1205,7 @@ class _FundedPodMixin:
                 self._record_funded_failure(
                     gen.hotkey, "a previous allocation failed on the operator side; "
                     "recovery must not rent another GPU on the miner's key",
-                    miner_fault=False, error_class="operator", burn=False)
+                    miner_fault=False, error_class="operator_blocked", burn=False)
                 raise _FundedLegSkip(gen.hotkey)
             # King first: a challenger never takes the rent lock (or the last
             # GPU) while the round's JIT king still needs a pod.
@@ -1014,6 +1215,33 @@ class _FundedPodMixin:
                     gen.hotkey, "king still needs GPU capacity — challenger requeued",
                     miner_fault=False, error_class="no_capacity", burn=False)
                 raise _FundedLegSkip(gen.hotkey)
+            if not adopt_live and not is_king:
+                # The miner waste cap, before EVERY rent on the miner's key
+                # (a lemon re-rent and a retrain included).
+                from .miner_spend_guard import budget_check, waste_cap_check
+
+                try:
+                    waste_cap_check(self, gen)
+                    budget_check(self, gen, gpu_choice)      # the miner's own total budget
+                except _FundedLegSkip:
+                    self._ledger_remove(expected_id)
+                    raise
+            if not adopt_live:
+                # The full halt check (it may probe) runs BEFORE the rent lock;
+                # under the lock only the standing verdict is read (D1).
+                halted = rent_halt_refusal(self, king=is_king)
+                if halted:
+                    self._ledger_remove(expected_id)
+                    if is_king:
+                        from .box_health import RentsHalted
+
+                        raise RentsHalted(halted)
+                    from ..funding.queue import OPERATOR_DISK_CLASS
+
+                    self._record_funded_failure(
+                        gen.hotkey, f"operator disk: {halted} — nothing rented",
+                        miner_fault=False, error_class=OPERATOR_DISK_CLASS, burn=False)
+                    raise _FundedLegSkip(gen.hotkey)
             with allocation_lock(self._funded_rent_lock) as release_allocation:
                 if self._king_pending():
                     # The king can become pending while this thread waits
@@ -1030,6 +1258,10 @@ class _FundedPodMixin:
 
                     report_progress(self, "booting")
                     allocated.append(pod_id)
+                    if not is_king:
+                        from .miner_spend_guard import fallback_rate, spend_start
+
+                        spend_start(self, gen.hotkey, pod_id, rate=fallback_rate(self, gpu_choice))
                     if selected_provider["credential_id"]:
                         self._ledger_add(PodInstance(
                             provider=selected_provider["name"], instance_id=pod_id, stage="funded",
@@ -1065,6 +1297,23 @@ class _FundedPodMixin:
                     self._record_funded_failure(gen.hotkey, doomed, miner_fault=False,
                                                 error_class="no_capacity", burn=False)
                     raise _FundedLegSkip(gen.hotkey)
+                if not adopt_live:
+                    # The halt is re-checked right before EVERY launch — a wait
+                    # or a lemon re-rent can outlive the leg-start check (N3).
+                    # Under the rent lock: the cached verdict only (D1).
+                    halted = rent_halt_refusal(self, king=is_king, cached_only=True)
+                    if halted:
+                        from ..funding.queue import OPERATOR_DISK_CLASS
+
+                        self._ledger_remove(expected_id)
+                        if is_king:
+                            from .box_health import RentsHalted
+
+                            raise RentsHalted(halted)
+                        self._record_funded_failure(
+                            gen.hotkey, f"operator disk: {halted} — nothing rented",
+                            miner_fault=False, error_class=OPERATOR_DISK_CLASS, burn=False)
+                        raise _FundedLegSkip(gen.hotkey)
                 result = rent_funded_pod(
                     round_id=str(round_id), hotkey=gen.hotkey, api_key=api_key,
                     sku=fit[0], image=rnd.funded_pod_image,
@@ -1078,10 +1327,21 @@ class _FundedPodMixin:
                     ttl_seconds=provider_ttl_seconds(self, kind="leg"),
                 )
                 if not result.ok and not result.leaked_pod:
+                    from .miner_spend_guard import spend_end
+
                     for pod_id in allocated:
                         release_executor_of(self, pod_id)
                         if pod_id != expected_id:
                             self._ledger_remove(pod_id)
+                        # a lemon / failed rent: the miner paid for nothing
+                        spend_end(self, gen.hotkey, pod_id, outcome="waste",
+                                  reason=f"rent failed: {str(result.error)[:120]}")
+                if result.ok and result.pod is not None and not is_king:
+                    from .miner_spend_guard import fallback_rate, spend_start
+
+                    landed = getattr(result, "price_per_hour", None)
+                    spend_start(self, gen.hotkey, result.pod.instance_id,
+                                rate=landed or fallback_rate(self, gpu_choice))
                 if (not result.ok and allocated and result.error_class != "auth"
                         and (result.leaked_pod or result.error_class != LEMON_CLASS)
                         and self._operator_recovery_available()):
@@ -1102,6 +1362,11 @@ class _FundedPodMixin:
                     # releases the pod, keeps its executor excluded and rents
                     # again — the miner is never blamed.
                     adopted = bool(getattr(result, "adopted", False))
+                    if retrain_gated:
+                        from .money_guard import note_operator_launch
+
+                        note_operator_launch(self, gen.hotkey)
+                        BoxHealth.for_runner(self).forget_leg(gen.hotkey)
                     # The pod's REAL host, now that its ssh address is known: a
                     # listing that could not resolve hosts must never train on
                     # a quarantined/blocklisted machine (2026-11-01 05:16,
@@ -1210,8 +1475,14 @@ class _FundedPodMixin:
                     live_claimed_executors(self), health_for(self)),
                 allow_paid_fallback=chosen is None,
                 **({"price_caps": chosen[1]} if chosen is not None else {}))
-            if waited == "operator_rent":
+            if waited in ("operator_rent", "operator"):
+                from .money_guard import gate_or_adopt
+
                 self._ledger_remove(expected_id)
+                gate_or_adopt(self, round_id, gen, kind=("paid_fallback" if waited == "operator_rent"
+                                                         else "operator_lane"),
+                              rent=waited == "operator_rent")
+            if waited == "operator_rent":
                 queue = self._funded_queue()
                 if queue is not None:
                     queue.set_operator_billed(gen.hotkey, True)
@@ -1230,6 +1501,13 @@ class _FundedPodMixin:
             # (a leaked pod keeps its ledger row for the sweep).
             if not result.leaked_pod:
                 self._ledger_remove(expected_id)
+            else:
+                # a leaked pod: its record closes now (it produced nothing); the
+                # sweep keeps trying to stop it (review S1)
+                from .miner_spend_guard import spend_end
+
+                spend_end(self, gen.hotkey, result.leaked_pod, outcome="waste",
+                          reason="leaked: teardown not confirmed")
             msg = result.error
             if chosen is not None and result.error_class == "no_capacity":
                 msg = (f"no {chosen[0][0]} capacity (miner-chosen GPU, no fallback) before "
@@ -1591,6 +1869,13 @@ class _FundedPodMixin:
 
     def _teardown_funded_pod(self, pod) -> None:
         """Tear one funded pod down NOW (leg finished); ledger reflects reality."""
+        # A pod torn down without a recorded result produced nothing for the
+        # miner: close its spend record as waste (a no-op after a result).
+        from .miner_spend_guard import spend_end
+
+        spend_end(self, str(getattr(pod, "payer_hotkey", "") or ""),
+                  str(getattr(pod, "instance_id", "") or ""), outcome="waste",
+                  reason="torn down without a harvested result")
         # The leg is over: its Hub robot dies first, whatever the pod does.
         self._revoke_robot(pod)
         vault = self._payer_vault()

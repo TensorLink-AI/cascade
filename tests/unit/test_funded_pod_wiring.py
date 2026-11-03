@@ -1478,3 +1478,8 @@ def test_restart_sweep_reaps_other_payers_orphans_while_legs_are_in_flight(tmp_p
                         lambda o, v, **kw: (seen.update(kw), [])[1])
     runner._reconcile_funded_pods(keep_payers={"hkA"})
     assert seen and set(seen["exclude"]) == {"hkA"}
+
+
+# The owner-approval gate (2026-11-02) is tested in test_money_safety.py;
+# these tests drive the operator-lane / operator-rent machinery behind it.
+pytestmark = pytest.mark.usefixtures("operator_legs_preapproved")

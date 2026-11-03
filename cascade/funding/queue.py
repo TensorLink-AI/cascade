@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import re
 import time
 import uuid
@@ -42,8 +43,26 @@ from pathlib import Path
 
 from .vault import DEFAULT_TTL_SECONDS
 
+log = logging.getLogger("cascade.funding.queue")
+
 __all__ = [
+    "APPROVAL_CLASS",
+    "AWAITING_APPROVAL_STATUS",
     "COMPETITION_ENDED_CLASS",
+    "DENIED_CLASS",
+    "COUNTED_OPERATOR_CLASSES",
+    "KEPT_POD_CLASS",
+    "OPERATOR_BACKOFF_CLASSES",
+    "BUDGET_CLASS",
+    "PAUSED_BUDGET_STATUS",
+    "PAUSED_SPEND_STATUS",
+    "PAYER_BALANCE_CLASS",
+    "SPEND_CAP_CLASS",
+    "OPERATOR_TRANSIENT_CLASS",
+    "OPERATOR_BLOCKED_CLASS",
+    "OPERATOR_DISK_CLASS",
+    "OPERATOR_FAULT_CAP",
+    "PAUSED_STATUS",
     "DEFAULT_MAX_ATTEMPTS",
     "OPERATOR_FAULT_CLASS",
     "FundedEntry",
@@ -80,12 +99,76 @@ INFRA_BACKOFF_MAX_SECONDS = 1800.0
 # operator_billed_retry_seconds``; 0 = the doubling backoff above.
 OPERATOR_BILLED_RETRY_SECONDS = 60.0
 
+# ── money safety (2026-11-02) ────────────────────────────────────────────────
+# A leg that would be billed to the OPERATOR is never rented or dispatched
+# without a one-shot owner approval (cascade.funding.operator_approvals): it
+# parks here, unburned, never re-dispatched, until the owner approves or
+# denies it. Not terminal, no attempt consumed, never TTL-expired.
+APPROVAL_CLASS = "awaiting_operator_approval"
+AWAITING_APPROVAL_STATUS = "awaiting_operator_approval"
+# The owner declined to pay for the leg: requeued on the miner's own key
+# (operator_billed cleared); an entry without a usable key then fails
+# terminally, unburned ("re-fund needed").
+DENIED_CLASS = "operator_denied"
+# Global operator-side blocks that are nobody's per-entry fault: the box disk
+# reservation, the operator-account circuit breaker, the balance gate and the
+# daily spend cap. Backed off like an operator fault, never counted against
+# the entry's operator-fault cap (they clear on their own).
+OPERATOR_DISK_CLASS = "operator_disk"
+OPERATOR_BLOCKED_CLASS = "operator_blocked"
+# Transient operator-side events (a CPU-tier VM that never booted, a failure
+# without a recorded verdict, an operator-rent refusal, infra on an operator
+# pod): backed off, never counted against the cap (review F4).
+OPERATOR_TRANSIENT_CLASS = "operator_transient"
+# A harvest our side could not finish with the run complete on a KEPT pod:
+# a real operator fault (counted), retried after a short FIXED delay — the
+# re-attach must come quickly (the kept pod may bill the miner; review F6).
+KEPT_POD_CLASS = "operator_kept_pod"
+KEPT_POD_RETRY_SECONDS = 60.0
+# Disk waits re-check cheaply (no rent happens): a short, bounded backoff.
+DISK_BACKOFF_BASE_SECONDS = 60.0
+DISK_BACKOFF_MAX_SECONDS = 600.0
+OPERATOR_BACKOFF_CLASSES = frozenset({"operator", OPERATOR_DISK_CLASS, OPERATOR_BLOCKED_CLASS,
+                                      OPERATOR_TRANSIENT_CLASS, "payer_balance"})
+# Only these count toward the cap — and only CONSECUTIVE faults of the SAME
+# cause (a different real cause restarts the count at 1).
+COUNTED_OPERATOR_CLASSES = frozenset({"operator", KEPT_POD_CLASS})
+# A paused entry resumes by itself after this long (``[round]
+# operator_pause_resume_seconds``; 0 = manual resume only).
+OPERATOR_PAUSE_RESUME_SECONDS = 6 * 3600.0
+# Operator-side faults (OPERATOR_FAULT_CLASS) an entry may take before it
+# PAUSES — counted on EVERY occurrence, never reset by an interleaved
+# no_capacity/rate-limit requeue (2026-11-02: a 402 re-dispatched one leg
+# every ~2.5 min for hours). ``[round] operator_fault_cap``; 0 = no cap.
+OPERATOR_FAULT_CAP = 3
+# Paused: not failed, not burned, never re-dispatched until ``resume``.
+PAUSED_STATUS = "paused"
+# The miner waste cap (cascade.funding.miner_spend): pods on the miner's key
+# that produced nothing reached ``[round] miner_waste_cap_usd``. Never failed,
+# burned, TTL-expired or rejected; resumed by a re-fund, the owner's
+# resume (it resets the count) or an approved operator make-good.
+SPEND_CAP_CLASS = "spend_cap"
+PAUSED_SPEND_STATUS = "paused_spend_cap"
+# The payer's balance cannot finish the leg: nothing rented, requeued with a
+# backoff, never counted against any cap (the miner tops up).
+PAYER_BALANCE_CLASS = "payer_balance"
+# The miner's own TOTAL budget for the submission (``max_total_spend_usd``)
+# cannot cover the next leg: the same never-reject guarantees as the waste
+# cap; a re-fund with a higher budget (or the owner) resumes it.
+BUDGET_CLASS = "budget"
+PAUSED_BUDGET_STATUS = "paused_budget"
+_PARKED = (PAUSED_STATUS, AWAITING_APPROVAL_STATUS, PAUSED_SPEND_STATUS, PAUSED_BUDGET_STATUS)
+_PARK_BY_CLASS = {APPROVAL_CLASS: AWAITING_APPROVAL_STATUS, SPEND_CAP_CLASS: PAUSED_SPEND_STATUS,
+                  BUDGET_CLASS: PAUSED_BUDGET_STATUS}
+_KEEP = object()
+
 # Public, bounded lifecycle telemetry. Never store provider error text or keys.
 PHASES = frozenset({"admitted", "waiting_admission", "preparing_data", "waiting_gpu",
                     "waiting_launch",
                     "booting", "training", "harvesting", "evaluating",
                     "awaiting_settlement", "waiting_operator", "queued", "done",
-                    "failed", "withdrawn"})
+                    "failed", "withdrawn", PAUSED_STATUS, AWAITING_APPROVAL_STATUS,
+                    "paused_spend_cap", "paused_budget"})
 PHASE_REASONS = frozenset({"", "availability_check", "market_capacity", "king_priority",
                           "operator_recovery"})
 
@@ -161,12 +244,21 @@ class FundedEntry:
     gpu: str = ""
     gpu_allow_fallback: bool = False
     gpu_max_price_per_hour: float = 0.0
+    # The miner's TOTAL budget for this submission (USD; None = none): every
+    # pod on their key, success included, plus the next leg's projection
+    # must fit. Set by every fund (the latest request wins).
+    max_total_spend_usd: float | None = None
     phase: str = ""
     phase_at: float = 0.0
     phase_reason: str = ""
     phase_history: tuple[dict, ...] = ()
     requeues: int = 0
     attempt_id: str = ""
+    # Operator-side faults on this entry, EVERY occurrence (see
+    # OPERATOR_FAULT_CAP); reset by a re-fund, ``resume`` or completion.
+    operator_requeues: int = 0
+    # The cause the count above is counting (a normalised error prefix).
+    operator_fault_cause: str = ""
 
     @property
     def active_at(self) -> float:
@@ -181,10 +273,35 @@ class FundedEntry:
                          max_price_per_hour=self.gpu_max_price_per_hour)
 
 
+def _from_history(item: dict, key: str, default):
+    """``key`` from the newest phase event that carries it — the fallback when
+    a writer on older code dropped the entry field (review F5)."""
+    for ev in reversed(list(item.get("phase_history") or ())):
+        if isinstance(ev, dict) and key in ev:
+            return ev[key]
+    return default
+
+
+def _cause_key(error: str) -> str:
+    """A cause signature for "the same fault again": a short hash of the
+    error's leading text with numbers, hex ids and paths blanked out. Only the
+    hash is stored — the phase history is a PUBLIC feed and never carries
+    provider error text."""
+    import hashlib
+
+    text = re.sub(r"[0-9a-f]{8,}|\d+(\.\d+)?|/[^\s:'\"]+", "#", (error or "").lower())
+    text = re.sub(r"\s+", " ", text).strip()[:80]
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
+
+
 def _phase(entry: FundedEntry, phase: str, now: float, reason: str = "", *, force=False) -> FundedEntry:
     if not force and (entry.phase, entry.phase_reason) == (phase, reason):
         return entry
+    # The fault count rides every event too: a writer on older code drops
+    # unknown entry fields but keeps the history verbatim (review F5).
     event = {"phase": phase, "at": now, "reason": reason, "error_class": entry.last_error_class,
+             "operator_requeues": entry.operator_requeues,
+             "operator_fault_cause": entry.operator_fault_cause,
              "attempt_id": entry.attempt_id,
              "target_boundary": entry.target_boundary, "era_index": entry.era_index}
     return replace(entry, phase=phase, phase_at=now, phase_reason=reason,
@@ -193,7 +310,8 @@ def _phase(entry: FundedEntry, phase: str, now: float, reason: str = "", *, forc
 
 # DEC-CA-0060 fields, written to the queue file only when set: an entry
 # without a GPU choice serialises exactly as before the fields existed.
-_GPU_FIELD_DEFAULTS = {"gpu": "", "gpu_allow_fallback": False, "gpu_max_price_per_hour": 0.0}
+_GPU_FIELD_DEFAULTS = {"gpu": "", "gpu_allow_fallback": False, "gpu_max_price_per_hour": 0.0,
+                       "max_total_spend_usd": None}
 
 
 def _gpu_fields(choice) -> dict:
@@ -248,9 +366,14 @@ class FundedQueue:
 
     def __init__(self, path: Path | str, *, clock: Callable[[], float] = time.time,
                  entry_ttl_seconds: float = DEFAULT_TTL_SECONDS,
-                 operator_billed_retry_seconds: float = OPERATOR_BILLED_RETRY_SECONDS) -> None:
+                 operator_billed_retry_seconds: float = OPERATOR_BILLED_RETRY_SECONDS,
+                 operator_fault_cap: int = OPERATOR_FAULT_CAP,
+                 operator_pause_resume_seconds: float = OPERATOR_PAUSE_RESUME_SECONDS) -> None:
         self.path = Path(path)
         self.clock = clock
+        self.operator_pause_resume_seconds = max(0.0, float(operator_pause_resume_seconds))
+        # Operator-side faults before the entry pauses (0 = no cap).
+        self.operator_fault_cap = max(0, int(operator_fault_cap))
         # Fixed retry of an operator-billed entry after an operator-side fault
         # (see OPERATOR_BILLED_RETRY_SECONDS); 0 = the doubling backoff.
         self.operator_billed_retry_seconds = max(0.0, float(operator_billed_retry_seconds))
@@ -327,12 +450,18 @@ class FundedQueue:
                 gpu=str(item.get("gpu", "") or ""),
                 gpu_allow_fallback=bool(item.get("gpu_allow_fallback", False)),
                 gpu_max_price_per_hour=float(item.get("gpu_max_price_per_hour", 0.0) or 0.0),
+                max_total_spend_usd=(float(item["max_total_spend_usd"])
+                                     if item.get("max_total_spend_usd") is not None else None),
                 phase=str(item.get("phase", "") or ""),
                 phase_at=float(item.get("phase_at", 0.0) or 0.0),
                 phase_reason=str(item.get("phase_reason", "") or ""),
                 phase_history=tuple(item.get("phase_history") or ())[-16:],
                 requeues=int(item.get("requeues", 0) or 0),
                 attempt_id=str(item.get("attempt_id", "") or ""),
+                operator_requeues=int(item.get("operator_requeues", _from_history(
+                    item, "operator_requeues", 0)) or 0),
+                operator_fault_cause=str(item.get("operator_fault_cause", _from_history(
+                    item, "operator_fault_cause", "")) or ""),
             )
             entries[entry.hotkey] = entry
         return entries
@@ -369,7 +498,7 @@ class FundedQueue:
     # ── lifecycle ────────────────────────────────────────────────────────────
 
     def add(self, hotkey: str, ref: str, reveal_block: int, *,
-            label: str = "", gpu_choice=None) -> str:
+            label: str = "", gpu_choice=None, max_total_spend_usd=_KEEP) -> str:
         """Fund (or re-fund) a submission; returns the outcome for the caller.
 
         ``label`` (already normalised) names the entry for dashboards; an
@@ -389,6 +518,9 @@ class FundedQueue:
         including over a terminal one (a resubmit after done/failed frees the
         slot: entry cost is the compute funding, not a lifetime bar).
         """
+        budget = ({} if max_total_spend_usd is _KEEP else {
+            "max_total_spend_usd": (float(max_total_spend_usd)
+                                    if max_total_spend_usd is not None else None)})
         with self._locked() as entries:
             now = self.clock()
             prev = entries.get(hotkey)
@@ -400,22 +532,38 @@ class FundedQueue:
                     entries[hotkey] = replace(prev, last_active=now, queued_ref="",
                                               queued_reveal_block=0,
                                               label=label or prev.label,
-                                              **_gpu_fields(gpu_choice))
+                                              **_gpu_fields(gpu_choice), **budget)
                     self._save(entries)
                     return "already-queued"
                 entries[hotkey] = replace(prev, queued_ref=ref,
                                           queued_reveal_block=int(reveal_block),
                                           last_active=now, label=label or prev.label,
-                                          **_gpu_fields(gpu_choice))
+                                          **_gpu_fields(gpu_choice), **budget)
                 self._save(entries)
                 return "queued-behind"
+            if prev is not None and prev.status in _PARKED:
+                # A re-fund of a parked entry (awaiting operator approval /
+                # paused after operator faults) is the miner paying again:
+                # back to the queue on THEIR key, operator billing and the
+                # operator-fault count cleared.
+                same = prev.ref == ref
+                # A re-fund is a NEW funding: any owner approval bound to the
+                # old one no longer applies (approvals bind to funded_at).
+                entries[hotkey] = _phase(replace(
+                    prev, ref=ref, reveal_block=prev.reveal_block if same else int(reveal_block),
+                    funded_at=now, last_active=now, status="queued",
+                    operator_billed=False, operator_requeues=0, operator_fault_cause="",
+                    infra_streak=0, not_before=0.0,
+                    label=label or prev.label, **_gpu_fields(gpu_choice), **budget), "queued", now, force=True)
+                self._save(entries)
+                return "queued" if same else "replaced"
             if prev is not None and prev.status in ("pending_reveal", "queued", "in_round"):
                 if prev.ref == ref and prev.status != "pending_reveal":
                     # Idempotent, but a re-fund is proof of life — refresh so
                     # an actively-tended entry never TTL-expires under you.
                     entries[hotkey] = replace(prev, last_active=now,
                                               label=label or prev.label,
-                                              **_gpu_fields(gpu_choice))
+                                              **_gpu_fields(gpu_choice), **budget)
                     self._save(entries)
                     return "already-queued"
                 if prev.status == "in_round":
@@ -425,12 +573,12 @@ class FundedQueue:
                 entries[hotkey] = replace(
                     prev, ref=ref, reveal_block=int(reveal_block),
                     funded_at=now, last_active=now, status="queued",
-                    label=label or prev.label, **_gpu_fields(gpu_choice))
+                    label=label or prev.label, **_gpu_fields(gpu_choice), **budget)
                 self._save(entries)
                 return "replaced" if prev.ref != ref else "queued"
             entries[hotkey] = FundedEntry(
                 hotkey=hotkey, ref=ref, reveal_block=int(reveal_block),
-                funded_at=now, last_active=now, label=label, **_gpu_fields(gpu_choice))
+                funded_at=now, last_active=now, label=label, **_gpu_fields(gpu_choice), **budget)
             self._save(entries)
             return "queued"
 
@@ -620,6 +768,36 @@ class FundedQueue:
             self._save(entries)
             return True
 
+    # ── owner actions on parked entries (cascade-trainer *-operator-leg) ────
+
+    def unpark(self, hotkey: str, *, expect_status: str, deny: bool = False,
+               reason: str = "", operator_billed: bool | None = None) -> bool:
+        """Return a parked entry (``expect_status``: awaiting approval / paused)
+        to the queue. ``deny`` additionally clears ``operator_billed`` and
+        stamps :data:`DENIED_CLASS` — the leg then runs on the miner's own key
+        or, without one, fails unburned. A resumed (paused) entry restarts its
+        operator-fault count. False when the entry is not in that state."""
+        if expect_status not in _PARKED:
+            raise ValueError(f"not a parked status: {expect_status!r}")
+        with self._locked() as entries:
+            e = entries.get(hotkey)
+            if e is None or e.status != expect_status:
+                return False
+            now = self.clock()
+            entries[hotkey] = _phase(replace(
+                e, status="queued", not_before=0.0, infra_streak=0, last_active=now,
+                operator_requeues=(0 if expect_status in (PAUSED_STATUS, PAUSED_SPEND_STATUS,
+                                                          PAUSED_BUDGET_STATUS)
+                                   else e.operator_requeues),
+                operator_fault_cause="" if expect_status == PAUSED_STATUS else e.operator_fault_cause,
+                operator_billed=(False if deny else e.operator_billed
+                                 if operator_billed is None else bool(operator_billed)),
+                last_error=(reason or e.last_error)[:500],
+                last_error_class=DENIED_CLASS if deny else e.last_error_class),
+                "queued", now, force=True)
+            self._save(entries)
+            return True
+
     def restamp_flight(self, hotkey: str, *, target_boundary: int, era_index: int,
                        started_block: int) -> bool:
         """Replace an ``in_flight`` entry's era / target / start stamp — the
@@ -650,7 +828,8 @@ class FundedQueue:
             hotkey=hotkey, ref=e.queued_ref, reveal_block=int(e.queued_reveal_block),
             funded_at=now, last_active=now, label=e.label, gpu=e.gpu,
             gpu_allow_fallback=e.gpu_allow_fallback,
-            gpu_max_price_per_hour=e.gpu_max_price_per_hour)
+            gpu_max_price_per_hour=e.gpu_max_price_per_hour,
+            max_total_spend_usd=e.max_total_spend_usd)
 
     def expire_stale(self, max_age_seconds: float | None = None) -> int:
         """Terminally expire idle queued entries past the payer-key TTL.
@@ -666,6 +845,7 @@ class FundedQueue:
         """
         if max_age_seconds is None:
             max_age_seconds = self.entry_ttl_seconds
+        self.resume_expired_pauses()
         with self._locked() as entries:
             now = self.clock()
             expired = [hk for hk, e in entries.items()
@@ -680,6 +860,28 @@ class FundedQueue:
             if expired:
                 self._save(entries)
             return len(expired)
+
+    def resume_expired_pauses(self) -> list[str]:
+        """Paused entries older than ``operator_pause_resume_seconds`` return
+        to the queue (fault count reset), one log line each; called every
+        trainer tick through :meth:`expire_stale`. The manual resume stays."""
+        if not self.operator_pause_resume_seconds:
+            return []
+        with self._locked() as entries:
+            now = self.clock()
+            due = [hk for hk, e in entries.items() if e.status == PAUSED_STATUS
+                   and now - (e.phase_at or e.last_active) >= self.operator_pause_resume_seconds]
+            for hk in due:
+                e = entries[hk]
+                entries[hk] = _phase(replace(
+                    e, status="queued", operator_requeues=0, operator_fault_cause="",
+                    infra_streak=0, not_before=0.0, last_active=now), "queued", now, force=True)
+                log.warning("queue: %s auto-RESUMED after a %.0f h operator-fault pause "
+                            "(nothing burned); it pauses again on the same fault", hk[:12],
+                            self.operator_pause_resume_seconds / 3600)
+            if due:
+                self._save(entries)
+            return due
 
     def mark_done(self, hotkey: str, *, expect_ref: str | None = None,
                   expect_started_block: int | None = None) -> None:
@@ -707,7 +909,7 @@ class FundedQueue:
         """Miner-initiated exit while queued/pending; False once a round has it."""
         with self._locked() as entries:
             e = entries.get(hotkey)
-            if e is None or e.status not in ("queued", "pending_reveal"):
+            if e is None or e.status not in ("queued", "pending_reveal", *_PARKED):
                 return False
             entries[hotkey] = _phase(replace(e, status="withdrawn"), "withdrawn", self.clock())
             self._save(entries)
@@ -767,28 +969,72 @@ class FundedQueue:
                     self._after_flight(entries, hotkey)
                 self._save(entries)
                 return False
+            if error_class in _PARK_BY_CLASS and not burn_attempt:
+                # Parked for an owner approval / at the miner waste cap / at
+                # the miner's own budget: never re-dispatched, nothing
+                # consumed, the flight's stamps cleared; attempts untouched.
+                status = _PARK_BY_CLASS[error_class]
+                entries[hotkey] = _phase(replace(
+                    e, status=status, last_error=error[:500],
+                    last_error_class=error_class, last_active=now, target_boundary=0,
+                    era_index=0, started_block=0, training_init=None,
+                    training_contract_digest="", not_before=0.0, requeues=e.requeues + 1),
+                    status, now, force=True)
+                if was_flight and e.queued_ref:
+                    self._after_flight(entries, hotkey)
+                self._save(entries)
+                return True
             streak, not_before = 0, 0.0
             billed = e.operator_billed or bool(operator_billed)
-            if (error_class == OPERATOR_FAULT_CLASS and not burn_attempt and billed
-                    and self.operator_billed_retry_seconds > 0):
-                # Our fault on our bill: a short fixed retry, streak not grown.
+            op_requeues, cause = e.operator_requeues, e.operator_fault_cause
+            if error_class == KEPT_POD_CLASS and not burn_attempt:
+                # re-attach the kept pod soon, never after a long backoff
                 streak = e.infra_streak
-                not_before = now + self.operator_billed_retry_seconds
-            elif error_class == OPERATOR_FAULT_CLASS and not burn_attempt:
+                not_before = now + KEPT_POD_RETRY_SECONDS
+            elif error_class == OPERATOR_DISK_CLASS and not burn_attempt:
                 streak = e.infra_streak + 1
-                not_before = now + min(INFRA_BACKOFF_MAX_SECONDS,
-                                       INFRA_BACKOFF_BASE_SECONDS * 2 ** (streak - 1))
+                not_before = now + min(DISK_BACKOFF_MAX_SECONDS,
+                                       DISK_BACKOFF_BASE_SECONDS * 2 ** (streak - 1))
+            elif error_class in OPERATOR_BACKOFF_CLASSES and not burn_attempt:
+                # Our side (or a global operator block): back off, doubling per
+                # consecutive such requeue. An OPERATOR-billed entry starts
+                # from ``operator_billed_retry_seconds`` instead of the infra
+                # base — still doubling, never a flat hot loop (2026-11-02).
+                streak = e.infra_streak + 1
+                base = (self.operator_billed_retry_seconds
+                        if billed and self.operator_billed_retry_seconds > 0
+                        else INFRA_BACKOFF_BASE_SECONDS)
+                not_before = now + min(INFRA_BACKOFF_MAX_SECONDS, base * 2 ** (streak - 1))
+            if error_class in COUNTED_OPERATOR_CLASSES and not burn_attempt:
+                # consecutive REAL faults of the SAME cause; capacity waits,
+                # rent refusals and transient events never count (review F4)
+                key = _cause_key(error)
+                op_requeues, cause = (op_requeues + 1, key) if key == cause else (1, key)
+            status, phase = "queued", "queued"
+            if (error_class in COUNTED_OPERATOR_CLASSES and self.operator_fault_cap
+                    and op_requeues >= self.operator_fault_cap):
+                # Capped: PAUSE (not failed, not burned) until the operator
+                # fixes the cause and resumes it, or the auto-resume cooldown.
+                status = phase = PAUSED_STATUS
+                # (the watchdog raises the one entry_paused alert from this state)
+                log.warning("queue: %s PAUSED — %d consecutive operator-side faults of one "
+                            "cause (cap %d); not failed, nothing burned; resumes by itself "
+                            "after %.0f h or via `cascade-trainer resume-operator-leg %s`. "
+                            "Last: %s", hotkey[:12], op_requeues, self.operator_fault_cap,
+                            self.operator_pause_resume_seconds / 3600, hotkey, error[:200])
             entries[hotkey] = _phase(replace(
-                e, status="queued", attempts=attempts,
+                e, status=status, attempts=attempts,
                 last_error=error[:500], last_error_class=error_class,
                 last_active=now, rate_limited_since=rl_since,
                 target_boundary=0, era_index=0, started_block=0,
                 training_init=None, training_contract_digest="",
-                operator_billed=e.operator_billed or bool(operator_billed),
+                operator_billed=(False if error_class == DENIED_CLASS
+                                 else e.operator_billed or bool(operator_billed)),
                 operator_faults=e.operator_faults + (
                     1 if operator_billed and not e.operator_billed else 0),
+                operator_requeues=op_requeues, operator_fault_cause=cause,
                 not_before=not_before, infra_streak=streak, requeues=e.requeues + 1),
-                "queued", now, force=True)
+                phase, now, force=True)
             if was_flight and e.queued_ref:
                 # The re-commit supersedes the requeue: the miner moved on.
                 self._after_flight(entries, hotkey)
@@ -843,6 +1089,14 @@ class FundedQueue:
 
     # ── transparency feed ────────────────────────────────────────────────────
 
+    def _spend_view(self) -> dict:
+        try:
+            from .miner_spend import MinerSpend
+
+            return MinerSpend.beside(self.path).public()
+        except Exception:  # noqa: BLE001 — telemetry only
+            return {}
+
     def public_view(self) -> dict:
         """The queue as miners may see it — no key material, no sealed field.
 
@@ -854,6 +1108,15 @@ class FundedQueue:
         anyway.
         """
         current = self.entries()
+        spend = self._spend_view()
+
+        def _spent(e: FundedEntry) -> dict:
+            s = spend.get((e.hotkey, e.ref))
+            if not s or (s.get("funded_at") is not None and float(s["funded_at"]) != e.funded_at):
+                return {}
+            return {"miner_spend_usd": s["miner_spend_usd"], "miner_waste_usd": s["miner_waste_usd"],
+                    "spend_usd": s["miner_spend_usd"]}
+
         return {
             "as_of": datetime.fromtimestamp(self.clock(), UTC).isoformat(),
             "queued_depth": sum(1 for e in current if e.status == "queued"),
@@ -882,6 +1145,11 @@ class FundedQueue:
                        if e.queued_ref and e.queued_reveal_block > 0 else {}),
                     **({"operator_billed": True} if e.operator_billed else {}),
                     **({"operator_faults": e.operator_faults} if e.operator_faults else {}),
+                    **({"operator_requeues": e.operator_requeues}
+                       if e.operator_requeues else {}),
+                    **_spent(e),
+                    **({"budget_usd": round(e.max_total_spend_usd, 2)}
+                       if e.max_total_spend_usd is not None else {}),
                     "label": e.label,
                     # DEC-CA-0060: "" = the default (cheapest fitting type)
                     "gpu": e.gpu,
