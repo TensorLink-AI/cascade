@@ -49,6 +49,11 @@ DIGEST_DIR_RE = re.compile(r"^(?:sha256|hf)-[0-9a-f]{40,64}$")
 # A digest token anywhere in a state file ("repo@sha256:<hex>", "hf:<sha1>").
 _REF_TOKEN_RE = re.compile(r"(?<![0-9a-z])(sha256|hf)[:-]([0-9a-f]{40,64})(?![0-9a-f])")
 PINS_FILE = ".pinned.json"
+# Heartbeat the pin-aware validator writes into its eval cache (startup and
+# every pin / trim). Without a recent one the TRAINER never evicts from the
+# eval cache: an older validator does not pin the manifest it is judging.
+PINS_ACTIVE_FILE = ".pins-active"
+PINS_ACTIVE_MAX_AGE_SECONDS = 24 * 3600.0
 PENDING_SUFFIX = ".pending.json"
 
 # Resolved through this attribute so tests swap in a fake filesystem.
@@ -174,6 +179,23 @@ def read_pins(root: Path | str) -> set[str]:
     except (OSError, ValueError) as e:
         raise ProtectionUnknown(f"{p}: {e}") from e
     return {str(x) for x in (doc.get("pinned") or []) if isinstance(x, str)}
+
+
+def touch_pins_active(root: Path | str) -> None:
+    """The validator's pin-awareness heartbeat (best-effort)."""
+    p = Path(root)
+    with contextlib.suppress(OSError):
+        p.mkdir(parents=True, exist_ok=True)
+        (p / PINS_ACTIVE_FILE).touch()
+
+
+def validator_pin_aware(root: Path | str, *, now: float | None = None) -> bool:
+    """A pin-aware validator heartbeat exists in ``root`` and is recent."""
+    try:
+        age = (time.time() if now is None else now) - (Path(root) / PINS_ACTIVE_FILE).stat().st_mtime
+    except OSError:
+        return False
+    return age <= PINS_ACTIVE_MAX_AGE_SECONDS
 
 
 def write_pins(root: Path | str, names: Iterable[str]) -> None:
@@ -440,9 +462,16 @@ def box_sources(cfg, work_root: Path | str | None = None, *,
     v = getattr(cfg, "validator", None)
     cache = eval_cache_root(cfg)
     protected = eval_cache_protected(cfg, cache, extra_protected)
-    srcs = [digest_cache_source(
-        "eval_cache", cache, protected,
-        max_bytes=int(float(getattr(v, "eval_ckpt_cache_max_gb", 0.0) or 0.0) * GIB))]
+    srcs = []
+    if validator_pin_aware(cache):
+        srcs.append(digest_cache_source(
+            "eval_cache", cache, protected,
+            max_bytes=int(float(getattr(v, "eval_ckpt_cache_max_gb", 0.0) or 0.0) * GIB)))
+    elif Path(cache).is_dir():
+        # An older validator (no pins of the manifest it is judging): the
+        # trainer leaves its cache alone entirely.
+        log.info("disk: no pin-aware validator heartbeat in %s — the eval cache is skipped",
+                 cache)
     if work_root is not None:
         wr = Path(work_root)
         srcs += [digest_cache_source("bench_ckpts", wr / "_bench_ckpts", protected),

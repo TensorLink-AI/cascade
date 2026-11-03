@@ -68,6 +68,7 @@ def test_lru_eviction_never_touches_the_king_state_refs_or_pins(tmp_path, fs):
         '{"king": "cascade/ckpt@' + D[0].replace("-", ":", 1) + '"}')
     (tmp_path / "warm_start_init.json").write_text('{"ref": "x@' + D[1].replace("-", ":", 1) + '"}')
     disk_space.write_pins(cache, [D[2]])
+    disk_space.touch_pins_active(cache)                        # a pin-aware validator
     fs["cap"] = 5_000 + 3_000                                  # 3000 free; floor 4500
     cfg = _cfg(tmp_path, eval_ckpt_cache_max_gb=0.0, eval_ckpt_cache_grace_seconds=60)
     rep = disk_space.reclaim(cfg, cache, floor_bytes=4_500)
@@ -380,3 +381,20 @@ def test_a_full_volume_halts_every_rent_keeps_the_pod_and_reharvests_it(tmp_path
     assert rents == ["hkA", "hkA"]                           # the second was an ADOPTION
     assert BoxHealth.for_runner(runner).leg("hkA") is None
     assert "upload" in events
+
+
+def test_the_trainer_never_evicts_an_old_validators_cache(tmp_path, fs):
+    """Deploy safety: the trainer moves first; an older validator writes no
+    pins for the manifest it is judging, so without its heartbeat the trainer
+    never touches the eval cache. With it: the normal policy."""
+    cache = tmp_path / "_eval_ckpts"
+    for i, name in enumerate(D[:3]):
+        _mk(cache, name, 1000, age=10_000 - i * 1000)
+    (tmp_path / "validator_state.db").write_text("{}")
+    fs["cap"] = 3_500
+    cfg = _cfg(tmp_path, eval_ckpt_cache_max_gb=0.0, eval_ckpt_cache_grace_seconds=60)
+    rep = disk_space.reclaim(cfg, cache, floor_bytes=10_000, work_root=tmp_path / "wr")
+    assert rep.evicted == [] and all((cache / n).is_dir() for n in D[:3])
+    disk_space.touch_pins_active(cache)
+    rep = disk_space.reclaim(cfg, cache, floor_bytes=10_000, work_root=tmp_path / "wr")
+    assert {c.path.name for c in rep.evicted} == set(D[:3])

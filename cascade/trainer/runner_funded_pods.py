@@ -1019,6 +1019,15 @@ class _FundedPodMixin:
         # Only a pod confirmed LIVE skips the guards: an unknown liveness (no
         # key / provider / probe) gets every guard too (review R6).
         adopt_live = bool(prior_alloc and pod_live is True)
+        is_king = bool(getattr(self.__dict__.get("_leg_local_obj"), "funded_is_king", False))
+        if is_king and not adopt_live:
+            # An own-key KING leg held by a disk halt: RentsHalted, never a
+            # _FundedLegSkip the era loop counts and rotates on (review D2).
+            from .box_health import RentsHalted
+
+            held = rent_halt_refusal(self, king=True)
+            if held:
+                raise RentsHalted(held)
         low = "" if adopt_live else disk_guard_refusal(self)
         if low:
             from ..funding.queue import OPERATOR_DISK_CLASS
@@ -1167,6 +1176,22 @@ class _FundedPodMixin:
                     gen.hotkey, "king still needs GPU capacity — challenger requeued",
                     miner_fault=False, error_class="no_capacity", burn=False)
                 raise _FundedLegSkip(gen.hotkey)
+            if not adopt_live:
+                # The full halt check (it may probe) runs BEFORE the rent lock;
+                # under the lock only the standing verdict is read (D1).
+                halted = rent_halt_refusal(self, king=is_king)
+                if halted:
+                    self._ledger_remove(expected_id)
+                    if is_king:
+                        from .box_health import RentsHalted
+
+                        raise RentsHalted(halted)
+                    from ..funding.queue import OPERATOR_DISK_CLASS
+
+                    self._record_funded_failure(
+                        gen.hotkey, f"operator disk: {halted} — nothing rented",
+                        miner_fault=False, error_class=OPERATOR_DISK_CLASS, burn=False)
+                    raise _FundedLegSkip(gen.hotkey)
             with allocation_lock(self._funded_rent_lock) as release_allocation:
                 if self._king_pending():
                     # The king can become pending while this thread waits
@@ -1221,13 +1246,16 @@ class _FundedPodMixin:
                 if not adopt_live:
                     # The halt is re-checked right before EVERY launch — a wait
                     # or a lemon re-rent can outlive the leg-start check (N3).
-                    is_king = bool(getattr(self.__dict__.get("_leg_local_obj"),
-                                           "funded_is_king", False))
-                    halted = rent_halt_refusal(self, king=is_king)
+                    # Under the rent lock: the cached verdict only (D1).
+                    halted = rent_halt_refusal(self, king=is_king, cached_only=True)
                     if halted:
                         from ..funding.queue import OPERATOR_DISK_CLASS
 
                         self._ledger_remove(expected_id)
+                        if is_king:
+                            from .box_health import RentsHalted
+
+                            raise RentsHalted(halted)
                         self._record_funded_failure(
                             gen.hotkey, f"operator disk: {halted} — nothing rented",
                             miner_fault=False, error_class=OPERATOR_DISK_CLASS, burn=False)

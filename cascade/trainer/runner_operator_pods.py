@@ -245,8 +245,8 @@ class _OperatorPodMixin:
                                           sku_choices=fit if len(fit) > 1 else ())
                         from .box_health import RentsHalted, rent_halt_refusal
 
-                        halted = rent_halt_refusal(self, king=True)
-                        if halted:                        # before EVERY king launch (N3)
+                        halted = rent_halt_refusal(self, king=True, cached_only=True)
+                        if halted:                        # before EVERY king launch (N3, D1)
                             raise RentsHalted(halted)
                         pod_id = provider.launch(spec)[0]
                         _ledger_king(pod_id)
@@ -612,13 +612,18 @@ class _OperatorPodMixin:
                 if waited is not True:
                     _skip("operator-billed leg: no GPU on the operator's account before "
                           "the latest safe start (requeued, operator-billed)", "no_capacity")
+            from .box_health import rent_halt_refusal
+
+            # the full check (it may probe) BEFORE the rent lock (D1)
+            halted = rent_halt_refusal(self, king=name_prefix is not None)
+            if halted:
+                _skip(f"operator disk: {halted} — nothing rented", "operator_disk")
             try:
                 with allocation_lock(self._funded_rent_lock) as release_allocation:
                     claimed = live_claimed_executors(self)
                     fit = self._skus_fitting_now(skus) or skus
-                    from .box_health import rent_halt_refusal
-
-                    halted = rent_halt_refusal(self, king=name_prefix is not None)
+                    halted = rent_halt_refusal(self, king=name_prefix is not None,
+                                               cached_only=True)
                     if halted:                            # re-checked before EVERY launch (N3)
                         _skip(f"operator disk: {halted} — nothing rented", "operator_disk")
                     _ledger(fit[0])                       # write-ahead (deterministic name)

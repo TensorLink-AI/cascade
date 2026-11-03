@@ -324,32 +324,65 @@ def test_the_king_waits_out_a_halt_without_probing_or_failing(tmp_path, monkeypa
     assert rolling._rents_halted(wrapped) and not rolling._rents_halted(RuntimeError("x"))
 
 
-def test_the_registry_probe_pushes_one_fixed_canary_and_never_falls_back(tmp_path, monkeypatch):
-    """R3: the STORAGE probe pushes the SAME tiny file to ONE fixed Hub repo
-    (content-addressed: no litter) and never goes through HF / R2."""
+def test_the_registry_probe_pushes_one_fixed_canary_once_with_a_deadline(tmp_path, monkeypatch):
+    """R3/D1: the STORAGE probe pushes the SAME tiny file to ONE fixed Hub repo
+    (content-addressed: no litter), one attempt, a short deadline — never the
+    retrying checkpoint upload, never HF / R2."""
+    import time as _time
+    from pathlib import Path
+
     import cascade.shared.hippius as hip
 
-    pushes = []
-
-    def push(d, repo, hub=None):
-        from pathlib import Path
-
-        pushes.append((repo, sorted((p.name, p.read_text()) for p in Path(d).iterdir())))
-
-    monkeypatch.setattr(hip, "upload_dir_to_hub", push)
+    monkeypatch.setattr(hip, "upload_dir_to_hub",
+                        lambda *a, **k: pytest.fail("never the retrying upload"))
     monkeypatch.setattr(hip, "upload_dir_to_hf",
                         lambda *a, **k: pytest.fail("the probe must never touch HF"))
+    pushes = []
     r = _bare(tmp_path)
     r.hub = lambda: SimpleNamespace(namespace="cascade")
+    r._hub_canary_push = lambda d, repo: pushes.append(
+        (repo, sorted((p.name, p.read_text()) for p in Path(d).iterdir())))
     assert box_health.storage_probe(r) == "" and box_health.storage_probe(r) == ""
     assert pushes[0] == pushes[1] and pushes[0][0] == "cascade/box-health-canary"
 
-    def down(d, repo, hub=None):
+    def down(d, repo):
         raise hip.StorageError("hub 503")
 
-    monkeypatch.setattr(hip, "upload_dir_to_hub", down)
+    r._hub_canary_push = down
     assert "failed" in box_health.storage_probe(r)
+    monkeypatch.setattr(box_health, "STORAGE_PROBE_TIMEOUT_SECONDS", 0.2)
+    r._hub_canary_push = lambda d, repo: _time.sleep(2)
+    t0 = _time.monotonic()
+    assert "timed out" in box_health.storage_probe(r) and _time.monotonic() - t0 < 1.5
     assert "resume-rents" in box_health.storage_probe(_bare(tmp_path / "nohub"))
+
+
+def test_the_in_lock_halt_check_never_runs_the_probe(tmp_path, monkeypatch):
+    """D1: under the rent lock only the standing verdict is read."""
+    r = _bare(tmp_path)
+    BoxHealth.for_runner(r).record(STORAGE, "hkA", "x")
+    BoxHealth.for_runner(r).record(STORAGE, "hkB", "x")
+    monkeypatch.setattr(box_health, "health_check",
+                        lambda *a, **k: pytest.fail("no probe under the rent lock"))
+    assert rent_halt_refusal(r, cached_only=True)
+    assert rent_halt_refusal(r, king=True, cached_only=True) == ""
+
+
+def test_an_own_key_king_leg_held_by_a_disk_halt_raises_rents_halted(tmp_path, monkeypatch):
+    """D2: never a _FundedLegSkip the era loop would count and rotate on."""
+    import threading
+
+    r = _runner(tmp_path)
+    _vault(tmp_path, "hkA")
+    loc = r.__dict__.setdefault("_leg_local_obj", threading.local())
+    loc.funded_is_king = True
+    BoxHealth.for_runner(r).record(LOCAL_DISK, "hkZ", "ENOSPC")
+    monkeypatch.setattr(box_health, "harvest_canary", lambda runner: "canary failed: EIO")
+    rents = []
+    monkeypatch.setattr(funded_mod, "rent_funded_pod", lambda **kw: rents.append(kw))
+    with pytest.raises(RentsHalted):
+        r._rent_funded_host("777", _challenger("hkA"))
+    assert rents == [] and "hkA" not in r._funded_leg_failures
 
 
 def test_a_harvest_halt_clears_on_the_disk_check(tmp_path, monkeypatch):

@@ -284,18 +284,47 @@ def storage_probe(runner) -> str:
     hub_fn = getattr(runner, "hub", None)
     if not callable(hub_fn):
         return "no registry probe available — clear with `cascade-trainer resume-rents`"
-    try:
-        from ..shared.hippius import upload_dir_to_hub
+    import threading
 
+    try:
         ns = str(getattr(hub_fn(), "namespace", "") or "")
-        if not ns:
-            return "no registry namespace — clear with `cascade-trainer resume-rents`"
-        with tempfile.TemporaryDirectory(prefix="box-canary-") as d:
-            (Path(d) / "canary.txt").write_text(_HUB_CANARY_TEXT, encoding="utf-8")
-            upload_dir_to_hub(d, f"{ns}/{HUB_CANARY_REPO}")
-        return ""
-    except Exception as e:  # noqa: BLE001 — any failure keeps the halt
-        return f"registry canary push failed: {str(e)[:200]}"
+    except Exception as e:  # noqa: BLE001
+        return f"registry probe unavailable: {str(e)[:200]}"
+    if not ns:
+        return "no registry namespace — clear with `cascade-trainer resume-rents`"
+    # ONE attempt with a short deadline (review D1): never the ~21 min
+    # retrying upload of a real checkpoint.
+    outcome: list[str] = []
+
+    def _push() -> None:
+        try:
+            push = getattr(runner, "_hub_canary_push", None) or _hub_push_once
+            with tempfile.TemporaryDirectory(prefix="box-canary-") as d:
+                (Path(d) / "canary.txt").write_text(_HUB_CANARY_TEXT, encoding="utf-8")
+                push(d, f"{ns}/{HUB_CANARY_REPO}")
+            outcome.append("")
+        except Exception as e:  # noqa: BLE001 — any failure keeps the halt
+            outcome.append(f"registry canary push failed: {str(e)[:200]}")
+
+    t = threading.Thread(target=_push, name="box-health-registry-probe", daemon=True)
+    t.start()
+    t.join(STORAGE_PROBE_TIMEOUT_SECONDS)
+    if t.is_alive() or not outcome:
+        return f"registry canary push timed out after {STORAGE_PROBE_TIMEOUT_SECONDS:.0f} s"
+    return outcome[0]
+
+
+STORAGE_PROBE_TIMEOUT_SECONDS = 30.0
+
+
+def _hub_push_once(folder: str, repo: str) -> None:
+    """A single Hub push (no retry loop) of ``folder`` to ``repo``."""
+    from hippius_hub import upload_folder
+
+    from ..shared.hippius import ALLOW_PATTERNS, _resolve_hub_token
+
+    upload_folder(repo_id=repo, folder_path=folder, allow_patterns=ALLOW_PATTERNS,
+                  token=_resolve_hub_token(f"box-health canary push to {repo}"))
 
 
 def health_check(runner, cls: str = LOCAL_DISK) -> str:
@@ -339,16 +368,23 @@ def health_check(runner, cls: str = LOCAL_DISK) -> str:
     return ""
 
 
-def rent_halt_refusal(runner, *, king: bool = False) -> str:
+def rent_halt_refusal(runner, *, king: bool = False, cached_only: bool = False) -> str:
     """Why NO new GPU pod may be rented now ("" = go). While halted the
     health check runs (at most every 30 s) and clears the halt itself. A
-    king rent is held only by a disk halt (the other classes leave it)."""
+    king rent is held only by a disk halt (the other classes leave it).
+
+    ``cached_only`` (every call made UNDER the rent lock): never runs the
+    health check or the registry probe — a probe must never hold the global
+    rent lock (review D1). The callers run the full check just before taking
+    the lock; under it a standing halt simply refuses."""
     bh = BoxHealth.for_runner(runner)
     h = bh.halt()
     if not h:
         return ""
     if king and h.get("cls") != LOCAL_DISK:
         return ""
+    if cached_only:
+        return f"GPU rents halted by the box health breaker ({h.get('reason', '')})"
     last = runner.__dict__.get("_box_health_checked")
     now = time.monotonic()
     if last is None or now - last[0] >= CHECK_EVERY_SECONDS:

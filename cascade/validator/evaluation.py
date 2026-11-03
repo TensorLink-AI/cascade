@@ -66,6 +66,7 @@ class EvaluationMixin:
         cache so the trainer's space manager honours it too). Best-effort."""
         from ..shared import disk_space
 
+        disk_space.touch_pins_active(root)        # this validator pins: trainer may trim
         pins = self.__dict__.setdefault("_eval_ckpt_pins", set())
         if name in pins:
             return
@@ -105,6 +106,7 @@ class EvaluationMixin:
 
                 extra |= disk_space.referenced_digest_dirs([state_mod.dumps(state)])
             v = self.cfg.validator
+            disk_space.touch_pins_active(root)
             try:
                 protected = disk_space.eval_cache_protected(self.cfg, root, extra)
             except disk_space.ProtectionUnknown as e:
