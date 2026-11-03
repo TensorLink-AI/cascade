@@ -1476,6 +1476,28 @@ class _ProgressReader:
 # caller's infra path), never hang the leg — for the era king, forever.
 HARVEST_TIMEOUT_SECONDS = 3600
 HARVEST_STALL_SECONDS = 300.0
+# Past ``timeout`` a stream that is still MOVING at a usable average rate keeps
+# going (2026-11-03: a 14.8 GB make-good checkpoint off a ~2.6 MB/s host was
+# killed at 3600 s with 14.68 GB received and the pod torn down — the finished
+# run lost). The stall guard above still kills a dead stream within 300 s; a
+# trickle below HARVEST_MIN_RATE_BYTES_PER_S fails at ``timeout`` as before, and
+# HARVEST_HARD_CAP_SECONDS bounds every harvest absolutely.
+HARVEST_MIN_RATE_BYTES_PER_S = 1_000_000
+HARVEST_HARD_CAP_SECONDS = 6 * 3600
+
+
+def harvest_total_breach(elapsed: float, nbytes: int, timeout: float) -> str | None:
+    """Why a still-flowing harvest stream must stop now, or ``None``: past
+    ``timeout`` only when its average rate is below the floor, and always
+    past the hard cap."""
+    if elapsed > HARVEST_HARD_CAP_SECONDS:
+        return (f"no complete archive within the {HARVEST_HARD_CAP_SECONDS}s hard cap "
+                f"({nbytes} bytes received)")
+    if elapsed > timeout and nbytes / max(elapsed, 1e-9) < HARVEST_MIN_RATE_BYTES_PER_S:
+        return (f"no complete archive within {timeout}s ({nbytes} bytes received, "
+                f"{nbytes / max(elapsed, 1e-9) / 1e6:.2f} MB/s average < "
+                f"{HARVEST_MIN_RATE_BYTES_PER_S / 1e6:.2f} MB/s floor)")
+    return None
 
 
 def harvest_remote_dir(host: RemoteHost, remote_dir: str, dest: Path | str,
@@ -1493,8 +1515,10 @@ def harvest_remote_dir(host: RemoteHost, remote_dir: str, dest: Path | str,
     refused — a hostile archive fails the harvest instead of writing outside
     it (or smuggling ``/etc`` into the later upload via a symlink).
 
-    Bounded twice: ``timeout`` seconds for the whole stream and
-    ``stall_timeout`` seconds without a single byte. A watchdog thread kills
+    Bounded three ways: ``stall_timeout`` seconds without a single byte;
+    ``timeout`` seconds for the whole stream unless it is still averaging at
+    least :data:`HARVEST_MIN_RATE_BYTES_PER_S`; and
+    :data:`HARVEST_HARD_CAP_SECONDS` absolutely. A watchdog thread kills
     ssh on either breach, and the harvest raises :class:`RemoteDispatchError`."""
     import shutil
     import threading
@@ -1582,9 +1606,9 @@ def _harvest_stream_into(host, remote_dir: str, argv: list[str], dest: Path, *,
         poll = max(0.05, min(5.0, float(stall_timeout) / 4))
         while not stop.wait(poll):
             now = time.monotonic()
-            if now - started > timeout:
-                breach.append(f"no complete archive within {timeout}s "
-                              f"({stream.nbytes} bytes received)")
+            why = harvest_total_breach(now - started, stream.nbytes, timeout)
+            if why:
+                breach.append(why)
             elif now - stream.last_progress > stall_timeout:
                 breach.append(f"stream stalled: no bytes for {stall_timeout:.0f}s "
                               f"({stream.nbytes} bytes received)")
