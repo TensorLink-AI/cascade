@@ -529,13 +529,15 @@ class _RollingMixin:
         # balance never blocks (the rent's own 402 still classifies).
         from .money_guard import alert, payer_balance_refusal
 
-        rate = max(float(getattr(self.cfg.round, "payer_projected_rate_per_hour", 0.0) or 0.0),
-                   float(getattr(self.cfg.round, "funded_max_price_per_hour", 0.0) or 0.0))
         try:
+            rnd = self.cfg.round
+            rate = max(float(getattr(rnd, "payer_projected_rate_per_hour", 0.0) or 0.0),
+                       float(getattr(rnd, "funded_max_price_per_hour", 0.0) or 0.0))
             hours = float(self._leg_wall_seconds()) / 3600.0
-        except Exception:  # noqa: BLE001
-            hours = 0.0
-        poor = payer_balance_refusal(self, key, hours=hours, rate=rate) if hours else ""
+            poor = payer_balance_refusal(self, key, hours=hours, rate=rate) if hours else ""
+        except Exception as e:  # noqa: BLE001 — unknown: never blocks (the rent's 402 does)
+            log.debug("king key balance check unavailable (%s)", e)
+            poor = ""
         if poor:
             alert(self, "king_key_unfunded", hotkey[:16],
                   f"king {hotkey[:12]}: rotated key authenticates but is unfunded — {poor}",
