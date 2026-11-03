@@ -978,8 +978,13 @@ class FundedQueue:
 
     def requeue(self, hotkey: str, *, error: str, error_class: str,
                 burn_attempt: bool, max_attempts: int = DEFAULT_MAX_ATTEMPTS,
-                operator_billed: bool = False) -> bool:
+                operator_billed: bool = False, backoff: bool = True) -> bool:
         """Return a failed leg to the queue (the no-burn path).
+
+        ``backoff=False``: a requeue the trainer makes for its OWN bookkeeping
+        (a leg trained outside its era window, an era state lost to a
+        restart) retrains at once — it rents nothing by itself, so the
+        unburned-infra backoff (money safety II) does not apply to it.
 
         ``burn_attempt`` follows the fault taxonomy: infra faults consume one
         of ``max_attempts``; sold-out and rate-limited do not (they are the
@@ -1058,9 +1063,9 @@ class FundedQueue:
                 streak = e.infra_streak + 1
                 not_before = now + min(DISK_BACKOFF_MAX_SECONDS,
                                        DISK_BACKOFF_BASE_SECONDS * 2 ** (streak - 1))
-            elif not burn_attempt and (error_class in OPERATOR_BACKOFF_CLASSES
-                                       or error_class not in NO_BACKOFF_CLASSES
-                                       and error_class not in _PARK_BY_CLASS):
+            elif backoff and not burn_attempt and (error_class in OPERATOR_BACKOFF_CLASSES
+                                                   or error_class not in NO_BACKOFF_CLASSES
+                                                   and error_class not in _PARK_BY_CLASS):
                 # Our side (or a global operator block): back off, doubling per
                 # consecutive such requeue. An OPERATOR-billed entry starts
                 # from ``operator_billed_retry_seconds`` instead of the infra
