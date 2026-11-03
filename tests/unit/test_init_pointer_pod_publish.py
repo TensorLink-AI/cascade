@@ -249,7 +249,7 @@ def test_harvest_publish_verifies_the_copy_and_drops_it(tmp_path, monkeypatch):
     body = b"weights"
     pod_listing = {"weights.safetensors": (len(body), hashlib.sha256(body).hexdigest())}
 
-    def harvest(host, remote_dir, dest):
+    def harvest(host, remote_dir, dest, **kw):
         Path(dest).mkdir(parents=True, exist_ok=True)
         (Path(dest) / "weights.safetensors").write_bytes(body)
 
