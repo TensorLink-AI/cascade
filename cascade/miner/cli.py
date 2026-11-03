@@ -1417,7 +1417,8 @@ def add_gpu_args(p: argparse.ArgumentParser, *, budget: bool = False) -> None:
                         "mainnet: 8xH100 or 8xH200). Same token budget and wall as every leg — a faster "
                         "type costs more per hour, never buys more compute. Default: the "
                         "cheapest fitting type under the operator's price caps. The "
-                        "operator caps do not apply to a chosen type; --max-price does. "
+                        "operator caps do not apply to a chosen type; --max-price does "
+                        "(without it the operator's funded_max_price_per_hour applies). "
                         "A re-fund without --gpu resets to the default.")
     p.add_argument("--allow-fallback", action="store_true",
                    help="With --gpu: rent the cheapest fitting type when the chosen one "
@@ -1426,8 +1427,9 @@ def add_gpu_args(p: argparse.ArgumentParser, *, budget: bool = False) -> None:
     p.add_argument("--max-price", type=float, default=None,
                    help="With --gpu: your own cap in USD per pod-hour on the chosen type (the "
                         "listing's whole-pod price, e.g. all 8 GPUs of an 8xH100; falls back to "
-                        "the per-GPU price if a listing lacks it) "
-                        "(default: none — you accept the listed price).")
+                        "the per-GPU price x the pod's GPU count if a listing lacks it). "
+                        "Default (flag omitted): the operator's funded_max_price_per_hour. "
+                        "--max-price 0 = explicitly uncapped (you accept any listed price).")
     if not budget:
         return
     p.add_argument("--max-total-spend", type=float, default=None,

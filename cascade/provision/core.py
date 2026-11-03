@@ -84,6 +84,12 @@ class ProvisionError(RuntimeError):
     """A provisioning step failed (capacity, launch, teardown, or config)."""
 
 
+class OperatorRentsHeld(ProvisionError):
+    """No new OPERATOR-account rent of any kind (the king's included): the
+    runway guard or the daily cap holds them (cascade.trainer.money_guard).
+    Not a lemon and not a capacity miss — callers wait it out, never spin."""
+
+
 class UncertainCreateError(ProvisionError):
     """A create may have allocated; retain its intent regardless of error prose."""
 
@@ -156,22 +162,61 @@ def shadeform_delete_at(ttl_seconds: float, *, now: float | None = None) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
 
 
-def executor_price_per_hour(executor: dict) -> float | None:
-    """An executor's USD/h from ``lium ls`` JSON (``price_per_hour``, else
-    ``price_per_gpu_hour``); None when the listing carries neither."""
-    for key in ("price_per_hour", "price_per_gpu_hour"):
-        v = executor.get(key)
-        if v is None or isinstance(v, bool):
-            continue
-        try:
-            import math
+def _positive(v) -> float | None:
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    return x if math.isfinite(x) and x > 0 else None
 
-            price = float(v)
-            if math.isfinite(price) and price > 0:
-                return price
-        except (TypeError, ValueError):
-            continue
+
+def executor_gpu_count(executor: dict) -> int | None:
+    """The executor's GPU count from a ``lium ls`` / ``lium ps`` record
+    (``gpu_count``, ``num_gpus``, ``gpus``, or the same under ``machine``);
+    None when the listing does not say."""
+    for rec in (executor, executor.get("machine") if isinstance(executor.get("machine"), dict)
+                else {}):
+        for key in ("gpu_count", "num_gpus", "gpus"):
+            n = _positive(rec.get(key))
+            if n is not None and float(n).is_integer():
+                return int(n)
     return None
+
+
+def executor_free_gpus(executor: dict) -> int | None:
+    """GPUs the listing says are FREE to rent on the executor (a partially
+    rented / GPU-split machine lists fewer than it has), or None when the
+    listing carries no such field."""
+    for key in ("available_gpu_count", "available_gpus", "free_gpu_count", "free_gpus"):
+        v = executor.get(key)
+        if isinstance(v, (list, tuple)):
+            return len(v)
+        if v is not None and not isinstance(v, bool):
+            try:
+                return max(0, int(v))
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def executor_price_per_hour(executor: dict, *, gpu_count: int | None = None) -> float | None:
+    """An executor's WHOLE-POD USD/h from ``lium ls`` JSON: ``price_per_hour``,
+    else ``price_per_gpu_hour`` × its GPU count (``gpu_count``, else the
+    listing's own count); None when neither is known. A per-GPU figure is
+    never compared with a pod cap on its own (money safety II: an 8-GPU pod
+    read at its per-GPU price slipped under every cap 8x loose)."""
+    whole = _positive(executor.get("price_per_hour"))
+    if whole is not None:
+        return whole
+    per = _positive(executor.get("price_per_gpu_hour"))
+    if per is None:
+        return None
+    n = gpu_count or executor_gpu_count(executor)
+    if not n:
+        return None                  # unknown count ⇒ unpriced (a cap drops it)
+    return per * int(n)
 
 
 def image_digest_of(image: str) -> str:
@@ -1206,7 +1251,12 @@ class LiumProvider:
                 self._cli(["ls", "--gpu", base, "--format", "json"]).stdout)
         except ProvisionError as e:
             raise self._scrub_key(e) from None
-        shaped = [e for e in execs if int(e.get("gpu_count", 1) or 1) == int(gpus)]
+        # EXACT shape before any rent (money safety II): the listed count must
+        # be the layout's (a multi-GPU rent never assumes a missing count),
+        # and a listing that says fewer GPUs are free is skipped too.
+        shaped = [e for e in execs
+                  if (executor_gpu_count(e) or (1 if int(gpus) == 1 else 0)) == int(gpus)
+                  and (executor_free_gpus(e) is None or executor_free_gpus(e) >= int(gpus))]
         cooling = cooling_executors()
         if cooling:
             kept = [e for e in shaped if str(e.get("id")) not in cooling]

@@ -733,11 +733,15 @@ noticed. Now:
   re-harvests its **kept** pod; it is never retrained. Before any rent, the
   kept pod's liveness is asked through the payer's provider. A blip is
   retried and never reads as "gone".
-  The pod is kept at most `harvest_keep_max_seconds` (600) and is
-  re-attached every 60 s. If the finished run is gone, the retrain needs the
-  owner's approval even on the miner's key (`retrain_after_loss`), decided
-  before any pod is rented. One critical alert prices what the miner
-  already lost. A pod that has run
+  The pod is kept while the keep costs less than `harvest_keep_cost_fraction`
+  (0.5) of the run it protects (keep hours < 0.5 × trained hours) and never
+  past `harvest_keep_max_seconds` (10800), and is re-attached every 60 s.
+  The pod → R2 push is always tried before a release when R2 is configured
+  (a critical alert says so when it is not). If the finished run is gone,
+  the retrain is an OPERATOR make-good (`make_good`, owner approval, the
+  miner's loss priced in the request) — never on the miner's key again;
+  without operator capacity it waits `operator_blocked`. One critical alert
+  prices what the miner already lost. A pod that has run
   training is torn down only after a verified harvest or when the run is
   proven failed. Every miner-billed keep and loss raises a critical alert so
   the owner can make it good.
@@ -1254,6 +1258,81 @@ in code:
   vault directory is useless without the key. Unset = plaintext 0600 with a
   startup warning — never run mainnet that way. Plaintext entries still
   hydrate and re-seal on their next insert.
+
+### Money safety II (2026-11-03 money-leak audit)
+
+Trainer-only; nothing here reaches a manifest or a validator verdict.
+
+* **Operator runway guard.** committed = Σ rate × remaining expected wall of
+  every live operator pod on the funded ledger (king pods, backups,
+  operator legs; the rate booked at launch, else the ceiling) + each
+  `operator_standing_pods_usd_per_hour` entry × `operator_runway_alert_hours`.
+  runway = (balance − committed − `operator_balance_reserve_usd`) / burn.
+  Under `operator_runway_alert_hours` (6): one critical
+  `operator_runway_low` alert. balance − committed − the launch's projection
+  < the reserve: **no new operator rents** (`operator_rents_held`, distinct
+  from the 402 breaker) — every operator launch, the king's and the CPU
+  VMs' included, is refused right before the create; it clears by itself.
+* **Every operator allocation is booked** in `operator_spend.json` at its
+  landed $/h × expected hours (lemons too, settled to their real cost at
+  teardown), and the daily cap counts it per `operator_daily_cap_scope`
+  (`"all"` default: king pods, backups, CPU VMs, lemons, miner legs;
+  `"miner_legs"` = the #417 behaviour). **Size `operator_daily_spend_cap_usd`
+  for the king before deploying with scope "all"** (two king eras a day at
+  the king's $/h × 12 h each).
+* **Priced keep** (above), the **lost-run retrain is operator-billed**, an
+  unreachable pod last seen with a finished unharvested run is kept for the
+  priced keep, not the 30 min unreachable grace.
+* **Post-rent rejects** (short pod, stale image, slow host, NCCL) and lemons
+  on a miner's key are booked `make_good` in the miner spend ledger (spend,
+  never their waste) with one `miner_make_good_owed` alert carrying the
+  amount. A short pod's host IP is quarantined. Listings are filtered on the
+  exact GPU count (and a listed free-GPU count) before renting. A listing
+  without a whole-pod price is priced at per-GPU × GPU count, never per-GPU.
+* **Waste alert.** The first infra loss taking a submission's infra waste to
+  `miner_waste_alert_usd` (15) files the `spend_cap_make_good` request at
+  once. A leaked pod's spend record stays open until the sweep confirms it
+  gone.
+* **Backoff.** An unburned `infra` requeue (and any other unburned requeue
+  that is not a market wait) backs off; a lemon verified gone resolves its
+  leg's create intents; a payer's key and leases are re-stamped while it has
+  ledger rows or open intents.
+* **Pre-corpus gates.** The money gates run as a side-effect-free would-rent
+  verdict before the corpus, so no CPU VM is paid for a leg that cannot rent;
+  the operator rent path has the doomed-leg check.
+* **King pods.** `king_pod_ttl_margin_seconds` (0 = off) sets a Lium `--ttl`
+  of one era + the margin at create (Lium cannot extend a TTL). The idle
+  reaper (`king_idle_reap_checks` = 2, every `king_idle_check_seconds` = 900)
+  terminates king BACKUPS and stale-era king pods that are not the king host
+  in use and hold no live worker / unharvested run on consecutive checks,
+  after a final on-pod check, with one alert. The in-use king pod is never
+  reaped (the era's benches run on it).
+* **Inventory.** Every `operator_inventory_interval_seconds` (3600) the
+  OPERATOR account's `lium ps` is diffed against the funded ledger, this
+  deployment's funded names, `operator_inventory_allow`, the standing-pod
+  names and every host IP / name in `operator_inventory_host_files`; one
+  `operator_unknown_pod` alert per unknown pod with its name and $/h. Nothing
+  is ever deleted.
+
+#### Queue schema and the deploy order
+
+`funded_queue.json` now carries `schema_version` (2). Unknown entry keys
+ride `FundedEntry.extra` through every load/save, and a writer whose schema
+is older than the file's **refuses to save** (critical log,
+`QueueSchemaTooNew`) instead of dropping fields. Writers deployed before
+this field existed (the intake and `opbill_guard` on 5e3fade) cannot be
+fixed retroactively and still drop unknown keys, so deploy in this order:
+
+1. stop `opbill_guard` (redundant since #417);
+2. restart `cascade-intake` on this release;
+3. restart the trainer on this release (the validator does not write the
+   queue).
+
+Never run a pre-release intake or trainer against the queue again: it
+cannot see `schema_version` and would still drop fields. From this release
+on, a writer meeting a NEWER schema refuses to save rather than lose them —
+bump `QUEUE_SCHEMA_VERSION` whenever a release adds an entry field that an
+older writer must not drop.
 
 ### Checkpoints straight to R2 (`funded_harvest_transport = "r2"`)
 

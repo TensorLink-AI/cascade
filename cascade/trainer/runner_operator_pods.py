@@ -52,6 +52,20 @@ def _wait_out_rent_halt(runner, name_prefix: str) -> None:
         sleep(runner.FUNDED_RENT_RETRY_SECONDS)
 
 
+def king_pod_ttl_seconds(runner) -> float:
+    """Provider TTL of a king pod / king backup: one era's wall + ``[round]
+    king_pod_ttl_margin_seconds`` (0 = no TTL). Lium cannot extend a TTL
+    (``lium rm --in`` only adds schedules), so this is a create-time
+    backstop; the idle-king reaper (money_guard.king_reaper_tick) is the
+    enforcing half."""
+    from .money_guard import era_wall_seconds
+
+    margin = float(getattr(runner.cfg.round, "king_pod_ttl_margin_seconds", 0) or 0)
+    if margin <= 0:
+        return 0.0
+    return era_wall_seconds(runner.cfg.round) + margin
+
+
 def _check_king_cancel(runner):
     event = getattr(runner.__dict__.get('_leg_local_obj'), 'king_cancel', None)
     if event is not None and event.is_set():
@@ -142,6 +156,9 @@ class _OperatorPodMixin:
                     record_pod_failure(self, provider, pod_id, sku, why,
                         kind='stale' if 'runtime' in why else 'slow' if 'rejected' in why else 'boot')
                 quarantine_lemon_host(provider, pod_id, why)
+                from .money_guard import settle_operator_pod
+
+                settle_operator_pod(self, pod_id)        # booked at launch: its real cost
                 # Verified teardown, ledger row dropped only when CONFIRMED
                 # gone (bare terminate swallows a failed rm as success).
                 try:
@@ -242,7 +259,8 @@ class _OperatorPodMixin:
                                           ssh_pubkey=ssh_pubkey,
                                           name_prefix=name_prefix,
                                           gpus_per_pod=1, exclude_ids=claimed,
-                                          sku_choices=fit if len(fit) > 1 else ())
+                                          sku_choices=fit if len(fit) > 1 else (),
+                                          ttl_seconds=king_pod_ttl_seconds(self))
                         from .box_health import RentsHalted, rent_halt_refusal
 
                         halted = rent_halt_refusal(self, king=True, cached_only=True)
@@ -315,6 +333,20 @@ class _OperatorPodMixin:
 
                     if isinstance(e, RentsHalted):
                         continue                 # the loop top waits it out (R2)
+                    from ..provision.core import OperatorRentsHeld
+
+                    if isinstance(e, OperatorRentsHeld):
+                        # The runway guard / daily cap holds EVERY operator
+                        # rent, the king's too: wait at the poll cadence (no
+                        # pod was created), give up at the latest safe start.
+                        now_fn = getattr(self, "_rent_wait_now", None) or time.time
+                        if now_fn() >= self._funded_rent_wait_deadline():
+                            self._ledger_remove(f"{name_prefix}-0")
+                            _give_up(f"king rent held at the latest safe start: {e}")
+                        log.error("king rent held: %s", e)
+                        sleep = getattr(self, "_rent_wait_sleep", None) or time.sleep
+                        sleep(self.FUNDED_RENT_RETRY_SECONDS)
+                        continue
                     # A pod that never came up / had no IP / ran the wrong
                     # runtime is a LEMON, not a verdict: it is torn down
                     # (_fail_king) and its executor stays excluded — rent again
@@ -516,6 +548,9 @@ class _OperatorPodMixin:
                 record_pod_failure(self, provider, pod_id, sku, why,
                     kind='stale' if 'runtime' in why else 'slow' if 'rejected' in why else 'boot')
             quarantine_lemon_host(provider, pod_id, why)
+            from .money_guard import settle_operator_pod
+
+            settle_operator_pod(self, pod_id)            # booked at launch: its real cost
             try:
                 if terminate_verified(provider, pod_id):
                     self._ledger_remove(pod_id)
@@ -596,9 +631,20 @@ class _OperatorPodMixin:
             # per leg every poll.
             _skip(f"operator rents paused (circuit breaker: {tripped.get('reason', '')}); "
                   "requeued, nothing rented, nothing burned", OPERATOR_BLOCKED_CLASS)
+        if name_prefix is None:
+            # Money safety II: the same doomed-leg gate as a payer rent — an
+            # operator pod is never rented for a leg that can only land after
+            # the settlement it must make (nothing rented, requeued unburned).
+            from .cost_guards import doomed_leg_reason
+
+            doomed = doomed_leg_reason(self, tuple(skus))
+            if doomed:
+                log.error("operator leg %s: %s", gen.hotkey[:12], doomed)
+                _skip(doomed, "no_capacity")
         # A king backup (``name_prefix``) may become the era's king pod, which
-        # lives for the era: no TTL there (see the king rent).
-        ttl = provider_ttl_seconds(self, kind="leg") if name_prefix is None else 0.0
+        # lives for the era: the king's era TTL (0 = none; see the king rent).
+        ttl = (provider_ttl_seconds(self, kind="leg") if name_prefix is None
+               else king_pod_ttl_seconds(self))
         bad = 0
         while True:
             _check_king_cancel(self)
@@ -676,9 +722,16 @@ class _OperatorPodMixin:
                         landed = price_fn(pod_id) if callable(price_fn) else None
                     except Exception:  # noqa: BLE001 — unknown: the projection is booked
                         landed = None
-                    note_operator_launch(self, gen.hotkey, landed_rate=landed)
+                    note_operator_launch(self, gen.hotkey, landed_rate=landed, pod_id=pod_id)
                 return host, pod_id
             except ProvisionError as e:
+                from ..provision.core import OperatorRentsHeld
+
+                if isinstance(e, OperatorRentsHeld):
+                    # runway guard / daily cap: nothing was created — never a
+                    # bad pod, never a retry loop against an empty account
+                    self._ledger_remove(pod_id)
+                    _skip(f"operator rents held: {e}", OPERATOR_BLOCKED_CLASS)
                 bad += 1
                 tripped = breaker.open_record() if name_prefix is None else None
                 if tripped:
@@ -712,8 +765,19 @@ class _OperatorPodMixin:
         is harvested by the rolling dispatcher (credential-free pod)."""
         from ..funding.store import parse_vault_ref
         from ..provision.state import PodInstance
+        from .money_guard import operator_leg_allocated, would_rent_refusal
         from .runner_funded_legs import _record_generation_failure
 
+        # Money safety II: the money gates as a side-effect-free "would it
+        # rent?" verdict BEFORE the corpus — no CPU VM is paid for a leg
+        # that cannot rent (nothing rented, requeued unburned).
+        why, cls = (("", "") if operator_leg_allocated(self, str(seeds.base_seed), gen.hotkey)
+                    else would_rent_refusal(self, gen, operator=True))
+        if why:
+            log.warning("operator leg %s: %s — no corpus generated", gen.hotkey[:12], why)
+            self._record_funded_failure(gen.hotkey, why, miner_fault=False, error_class=cls,
+                                        burn=False)
+            raise _FundedLegSkip(gen.hotkey)
         try:
             corpus = leg_corpus(self, gen, seeds, contract)  # DEC-CA-0053, before the rent
         except Exception as e:  # noqa: BLE001 — classify, record, re-raise

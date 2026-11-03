@@ -11,8 +11,11 @@ headers:
                           (absent = false: the leg WAITS for the chosen type
                           and requeues like any capacity miss; true = rent the
                           cheapest fitting type when the chosen one has none)
-    X-Gpu-Max-Price:      the miner's own $/h cap on the chosen type (absent
-                          or 0 = no cap — the miner accepts the listed price)
+    X-Gpu-Max-Price:      the miner's own $/h cap on the chosen type. ABSENT
+                          = the operator's ``funded_max_price_per_hour``
+                          (money safety II: a chosen type is never uncapped
+                          by omission); an explicit ``0`` = no cap (the
+                          miner accepts the listed price).
 
 A chosen type is rented under the MINER's cap only: the operator's
 ``funded_max_price_per_hour`` / ``funded_max_leg_cost_usd`` exist to protect
@@ -85,6 +88,9 @@ class GpuCatalog:
     skus: tuple[str, ...] | None = None
     walls: tuple[tuple[str, int], ...] = ()
     wall_cap_seconds: float = 0.0
+    # The $/h cap a chosen type gets when the request names none (the
+    # operator's funded_max_price_per_hour; 0 = none configured).
+    default_max_price_per_hour: float = 0.0
 
     @classmethod
     def from_config(cls, cfg) -> GpuCatalog:
@@ -96,7 +102,8 @@ class GpuCatalog:
         except Exception:  # noqa: BLE001 — no contract ⇒ no warning, never a refusal
             cap = 0.0
         return cls(skus=skus, walls=tuple(getattr(rnd, "funded_sku_wall_seconds", ()) or ()),
-                   wall_cap_seconds=cap)
+                   wall_cap_seconds=cap, default_max_price_per_hour=float(
+                       getattr(rnd, "funded_max_price_per_hour", 0.0) or 0.0))
 
     def canonical(self, sku: str) -> str | None:
         """The catalog's spelling of ``sku`` (case-insensitive), else None."""
@@ -155,7 +162,8 @@ def parse_gpu_headers(headers, catalog: GpuCatalog | None
         return GpuChoice(), "", {
             "code": "bad_gpu_fallback",
             "message": f"{GPU_FALLBACK_HEADER} must be 1/true/yes or 0/false/no"}
-    price = 0.0
+    # No header ⇒ the operator's default cap; only an explicit 0 is uncapped.
+    price = float(cat.default_max_price_per_hour or 0.0)
     if p:
         try:
             price = float(p)

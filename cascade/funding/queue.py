@@ -37,7 +37,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -46,6 +46,8 @@ from .vault import DEFAULT_TTL_SECONDS
 log = logging.getLogger("cascade.funding.queue")
 
 __all__ = [
+    "QUEUE_SCHEMA_VERSION",
+    "QueueSchemaTooNew",
     "APPROVAL_CLASS",
     "AWAITING_APPROVAL_STATUS",
     "COMPETITION_ENDED_CLASS",
@@ -129,7 +131,12 @@ KEPT_POD_RETRY_SECONDS = 60.0
 DISK_BACKOFF_BASE_SECONDS = 60.0
 DISK_BACKOFF_MAX_SECONDS = 600.0
 OPERATOR_BACKOFF_CLASSES = frozenset({"operator", OPERATOR_DISK_CLASS, OPERATOR_BLOCKED_CLASS,
-                                      OPERATOR_TRANSIENT_CLASS, "payer_balance"})
+                                      OPERATOR_TRANSIENT_CLASS, "payer_balance", "infra"})
+# Money safety II (2026-11-03 audit): ANY requeue that burns nothing and is
+# not a market wait backs off too — an unburned "infra" (e.g. a lemon or
+# ``create_unresolved`` reported with burn_attempt=False) used to retry at
+# once, every poll, re-renting. Market waits keep their own cadence.
+NO_BACKOFF_CLASSES = frozenset({"no_capacity", "rate_limited", "price_cap_unavailable", ""})
 # Only these count toward the cap — and only CONSECUTIVE faults of the SAME
 # cause (a different real cause restarts the count at 1).
 COUNTED_OPERATOR_CLASSES = frozenset({"operator", KEPT_POD_CLASS})
@@ -161,6 +168,24 @@ _PARKED = (PAUSED_STATUS, AWAITING_APPROVAL_STATUS, PAUSED_SPEND_STATUS, PAUSED_
 _PARK_BY_CLASS = {APPROVAL_CLASS: AWAITING_APPROVAL_STATUS, SPEND_CAP_CLASS: PAUSED_SPEND_STATUS,
                   BUDGET_CLASS: PAUSED_BUDGET_STATUS}
 _KEEP = object()
+
+# ── queue file schema (money safety II, 2026-11-03) ─────────────────────────
+# Two processes write this file (intake + trainer) and they may run different
+# releases. A writer on older code used to DROP every entry field it did not
+# know (2026-11-02: an old intake erased #417's operator_requeues on each
+# save). Now: unknown entry keys ride :attr:`FundedEntry.extra` through every
+# load/save, unknown top-level keys are carried too, and the file names its
+# ``schema_version`` — a writer whose version is OLDER than the file's REFUSES
+# to save (raises :class:`QueueSchemaTooNew`, logs critical) instead of
+# rewriting fields it cannot understand. Writers deployed before this field
+# existed cannot be fixed retroactively: the deploy order (docs/OPERATOR.md,
+# "Queue schema") restarts every writer on the new code before the first
+# write that needs a new field.
+QUEUE_SCHEMA_VERSION = 2
+
+
+class QueueSchemaTooNew(RuntimeError):
+    """The queue file was written by a NEWER schema than this writer knows."""
 
 # Public, bounded lifecycle telemetry. Never store provider error text or keys.
 PHASES = frozenset({"admitted", "waiting_admission", "preparing_data", "waiting_gpu",
@@ -259,6 +284,10 @@ class FundedEntry:
     operator_requeues: int = 0
     # The cause the count above is counting (a normalised error prefix).
     operator_fault_cause: str = ""
+    # Keys a NEWER writer stored on this entry that this code does not know:
+    # carried verbatim through every load/save, never interpreted, never
+    # compared (money safety II: an old writer must not drop new fields).
+    extra: dict = field(default_factory=dict, compare=False, hash=False, repr=False)
 
     @property
     def active_at(self) -> float:
@@ -271,6 +300,9 @@ class FundedEntry:
 
         return GpuChoice(gpu=self.gpu, allow_fallback=self.gpu_allow_fallback,
                          max_price_per_hour=self.gpu_max_price_per_hour)
+
+
+_ENTRY_FIELDS = frozenset(f.name for f in fields(FundedEntry)) - {"extra"}
 
 
 def _from_history(item: dict, key: str, default):
@@ -424,6 +456,7 @@ class FundedQueue:
             return entries
         raw = json.loads(self.path.read_text(encoding="utf-8"))
         for item in raw.get("entries", []):
+            extra = {k: v for k, v in item.items() if k not in _ENTRY_FIELDS}
             entry = FundedEntry(
                 hotkey=str(item["hotkey"]),
                 ref=str(item["ref"]),
@@ -462,22 +495,50 @@ class FundedQueue:
                     item, "operator_requeues", 0)) or 0),
                 operator_fault_cause=str(item.get("operator_fault_cause", _from_history(
                     item, "operator_fault_cause", "")) or ""),
+                extra=extra,
             )
             entries[entry.hotkey] = entry
         return entries
+
+    def _on_disk_header(self) -> dict:
+        """The current file's top-level keys other than ``entries`` ({} when
+        absent); an unreadable file reads as {} (the load already failed)."""
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, ValueError, OSError):
+            return {}
+        return {k: v for k, v in raw.items() if k != "entries"} if isinstance(raw, dict) else {}
 
     def _save(self, entries: dict[str, FundedEntry]) -> None:
         import os
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        header = self._on_disk_header()
+        try:
+            on_disk = int(header.get("schema_version", 1) or 1)
+        except (TypeError, ValueError):
+            on_disk = QUEUE_SCHEMA_VERSION + 1        # unparseable ⇒ treat as newer
+        if on_disk > QUEUE_SCHEMA_VERSION:
+            msg = (f"funded queue {self.path} has schema_version {header.get('schema_version')!r}"
+                   f" > this writer's {QUEUE_SCHEMA_VERSION}: REFUSING to save (an older "
+                   "writer would drop fields it does not know) — restart this process on "
+                   "the release that wrote the file")
+            log.critical(msg)
+            raise QueueSchemaTooNew(msg)
+
         def _row(e: FundedEntry) -> dict:
             row = asdict(e)
+            extra = row.pop("extra", None) or {}
             for k, default in _GPU_FIELD_DEFAULTS.items():
                 if row.get(k) == default:
                     row.pop(k, None)
+            for k, v in extra.items():
+                row.setdefault(k, v)            # never overrides a known field
             return row
 
         payload = {
+            **header,
+            "schema_version": QUEUE_SCHEMA_VERSION,
             "entries": [_row(e) for e in sorted(
                 entries.values(), key=lambda e: (e.reveal_block, e.hotkey))],
         }
@@ -995,7 +1056,9 @@ class FundedQueue:
                 streak = e.infra_streak + 1
                 not_before = now + min(DISK_BACKOFF_MAX_SECONDS,
                                        DISK_BACKOFF_BASE_SECONDS * 2 ** (streak - 1))
-            elif error_class in OPERATOR_BACKOFF_CLASSES and not burn_attempt:
+            elif not burn_attempt and (error_class in OPERATOR_BACKOFF_CLASSES
+                                       or error_class not in NO_BACKOFF_CLASSES
+                                       and error_class not in _PARK_BY_CLASS):
                 # Our side (or a global operator block): back off, doubling per
                 # consecutive such requeue. An OPERATOR-billed entry starts
                 # from ``operator_billed_retry_seconds`` instead of the infra

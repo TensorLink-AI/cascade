@@ -144,6 +144,7 @@ class _GenerationMixin:
         if stage is None:
             from ..generation.stage import GenerationStage
             from ..provision.cpu import cpu_providers
+            from .money_guard import BookedCpuProvider
 
             key = self._generation_ssh_key()
             pub = Path(key + ".pub").expanduser()
@@ -151,7 +152,9 @@ class _GenerationMixin:
                 raise RuntimeError(f"generation tier: no public key at {pub} for the CPU VMs")
             stage = GenerationStage(
                 cfg=self.cfg, store=self._corpus_store(),
-                providers=cpu_providers(self.cfg.generation),
+                # Money safety II: every cgen VM launch is re-checked against
+                # the operator runway / daily cap and booked at its price.
+                providers=[BookedCpuProvider(self, p) for p in cpu_providers(self.cfg.generation)],
                 ssh_key_path=key, ssh_pubkey=pub.read_text(encoding="utf-8").strip(),
                 vm_image=self.cfg.generation.vm_image,
                 ledger_path=self._generation_vm_ledger(),

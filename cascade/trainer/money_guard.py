@@ -190,16 +190,34 @@ def is_balance_refusal(text: str) -> bool:
     return is_funding_failure(low) or "balance_required" in low
 
 
+def launch_kind(name_prefix: str) -> str:
+    """The spend kind of an operator launch, from its deterministic pod name."""
+    name = str(name_prefix or "")
+    if "-funded-king" in name:
+        return KING_BACKUP_KIND if "-replica-" in name else KING_KIND
+    if "-funded-" in name and (name.endswith("-op") or "-op-" in name):
+        return OPERATOR_LEG_KIND
+    if "-funded-" in name and "-replica-" in name:
+        return KING_BACKUP_KIND
+    return OPERATOR_OTHER_KIND
+
+
 class _BreakerGuardedProvider:
     """An operator provider whose ``launch`` refuses while the breaker is open
-    and trips it on a balance refusal. Everything else is delegated."""
+    and trips it on a balance refusal; with a runner (money safety II) every
+    launch — the king's included — is also re-checked against the runway
+    guard and the daily cap RIGHT BEFORE the create, and every allocation
+    (lemons too) is booked into :class:`OperatorSpend` at its landed price.
+    Everything else is delegated."""
 
-    def __init__(self, provider, breaker: OperatorBreaker, *, enforce: bool = True) -> None:
+    def __init__(self, provider, breaker: OperatorBreaker, *, enforce: bool = True,
+                 runner=None) -> None:
         self._provider = provider
         self._breaker = breaker
         # False for the king's JIT pod and king backups: they are never held
         # by a breaker someone else tripped — only their own 402 trips it.
         self._enforce = enforce
+        self._runner = runner
 
     def __getattr__(self, name):
         return getattr(self._provider, name)
@@ -212,21 +230,73 @@ class _BreakerGuardedProvider:
             raise ProvisionError(f"operator rents paused: circuit breaker open until "
                                  f"{time.strftime('%H:%M:%SZ', time.gmtime(rec['open_until']))} "
                                  f"({rec.get('reason', '')})")
+        runner = self._runner
+        kind = launch_kind(getattr(spec, "name_prefix", ""))
+        hours = 0.0
+        if runner is not None:
+            hours = expected_pod_hours(runner, kind)
+            operator_launch_check(runner, kind=kind, projected_usd=ceiling_rate(runner) * hours)
         try:
-            return self._provider.launch(spec, *args, **kwargs)
+            ids = self._provider.launch(spec, *args, **kwargs)
         except Exception as e:
             if is_balance_refusal(str(e)):
                 self._breaker.trip(f"operator rent refused for balance: {str(e)[:200]}")
             raise
+        if runner is not None:
+            for pid in ids or ():
+                book_operator_allocation(runner, self._provider, str(pid), kind=kind,
+                                         hours=hours)
+        return ids
+
+
+class BookedCpuProvider:
+    """A CPU-generation provider (``cgen-*`` VMs, operator money) whose every
+    launch is re-checked against the runway guard / daily cap and booked
+    into :class:`OperatorSpend` (kind ``cpu_vm``), and whose terminate
+    settles the booking to the VM's real cost (money safety II). Everything
+    else is delegated."""
+
+    def __init__(self, runner, provider) -> None:
+        self._runner = runner
+        self._provider = provider
+
+    def __getattr__(self, name):
+        return getattr(self._provider, name)
+
+    def launch(self, shape, *, name: str, ssh_pubkey: str, image=None, ttl_seconds=None):
+        import inspect
+
+        rate = float(getattr(shape, "price_per_hour", 0.0) or 0.0)
+        hours = (float(ttl_seconds) if ttl_seconds else 2 * 3600.0) / 3600.0
+        operator_launch_check(self._runner, kind=CPU_VM_KIND, projected_usd=rate * hours)
+        kw = {"name": name, "ssh_pubkey": ssh_pubkey}
+        if image is not None:
+            kw["image"] = image
+        if ttl_seconds:
+            with contextlib.suppress(TypeError, ValueError):
+                if "ttl_seconds" in inspect.signature(self._provider.launch).parameters:
+                    kw["ttl_seconds"] = ttl_seconds
+        vm = self._provider.launch(shape, **kw)
+        with contextlib.suppress(Exception):
+            OperatorSpend.for_runner(self._runner).charge(
+                "", rate * hours, kind=CPU_VM_KIND, pod_id=str(vm), rate=rate, hours=hours)
+        return vm
+
+    def terminate(self, vm_id: str):
+        settle_operator_pod(self._runner, str(vm_id))
+        return self._provider.terminate(vm_id)
 
 
 def guard_operator_provider(runner, provider, *, enforce: bool = True):
-    """Wrap an OPERATOR-account provider with the circuit breaker. A real
+    """Wrap an OPERATOR-account provider with the circuit breaker (and the
+    runway / daily-cap re-check + spend booking at every launch). A real
     balance refusal (402 / BALANCE_REQUIRED) from ANY launch trips it;
-    ``enforce=False`` (king pod / king backups) is never refused by it."""
+    ``enforce=False`` (king pod / king backups) is never refused by the
+    breaker — the runway guard holds them too (money safety II)."""
     if isinstance(provider, _BreakerGuardedProvider):
         provider = provider._provider
-    return _BreakerGuardedProvider(provider, OperatorBreaker.for_runner(runner), enforce=enforce)
+    return _BreakerGuardedProvider(provider, OperatorBreaker.for_runner(runner), enforce=enforce,
+                                   runner=runner)
 
 
 # ── projected cost, daily spend ledger, balance ─────────────────────────────
@@ -280,8 +350,20 @@ def projected_operator_leg_cost(runner, *, live_price: bool = False
     return sku, rate, hours, rate * hours
 
 
+KING_KIND, KING_BACKUP_KIND = "king", "king_backup"
+OPERATOR_LEG_KIND, OPERATOR_OTHER_KIND, CPU_VM_KIND = "operator_leg", "operator", "cpu_vm"
+# Kinds that are NOT a miner leg rented on the operator's account (the
+# daily cap's ``miner_legs`` scope leaves them out).
+NON_MINER_KINDS = frozenset({KING_KIND, KING_BACKUP_KIND, CPU_VM_KIND, OPERATOR_OTHER_KIND})
+
+
 class OperatorSpend:
-    """``<work_root>/operator_spend.json``: projected operator spend per UTC day."""
+    """``<work_root>/operator_spend.json``: operator spend per UTC day.
+
+    A row per allocation (``pod_id``, landed ``rate``, ``hours`` projected):
+    booked at the launch itself (every allocation, lemons too), relabelled
+    when an approved miner leg's pod turns out usable, and SETTLED to its
+    real cost (rate x the time it lived) when it is torn down early."""
 
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
@@ -301,26 +383,145 @@ class OperatorSpend:
     def day(now: float) -> str:
         return time.strftime("%Y-%m-%d", time.gmtime(now))
 
-    def total(self, now: float | None = None) -> float:
+    def total(self, now: float | None = None, *, scope: str = "all") -> float:
+        """Today's (UTC) booked operator spend; ``scope="miner_legs"`` leaves
+        out the king, backups, CPU VMs and other operator pods."""
         t = time.time() if now is None else float(now)
         rows = self._load().get(self.day(t), [])
+        if scope == "miner_legs":
+            rows = [r for r in rows if r.get("kind") not in NON_MINER_KINDS]
         return float(sum(float(r.get("usd", 0.0)) for r in rows))
+
+    def row_for(self, pod_id: str) -> dict | None:
+        """The newest booking of ``pod_id`` (any day kept), or None."""
+        if not pod_id:
+            return None
+        hit = self._newest(self._load(), pod_id)
+        return dict(hit) if hit else None
+
+    def settle(self, pod_id: str, *, now: float | None = None) -> float | None:
+        """``pod_id`` ended early (a lemon, a rejected pod): book what it
+        really cost — rate x the time it lived, never more than projected.
+        Returns the settled USD (None when it was never booked)."""
+        t = time.time() if now is None else float(now)
+        with _LOCK:
+            doc = self._load()
+            hit = self._newest(doc, pod_id, unsettled=True)
+            if hit is None:
+                return None
+            real = max(0.0, t - float(hit.get("at") or t)) / 3600.0 * float(hit.get("rate") or 0)
+            hit["usd"] = round(min(float(hit.get("usd") or 0.0), real), 2)
+            hit["settled_at"] = t
+            write_text_atomic(self.path, json.dumps(doc, sort_keys=True))
+            return float(hit["usd"])
 
     def rows(self, now: float | None = None) -> list[dict]:
         t = time.time() if now is None else float(now)
         return list(self._load().get(self.day(t), []))
 
+    @staticmethod
+    def _newest(doc: dict, pod_id: str, *, unsettled: bool = False) -> dict | None:
+        hit = None
+        for _day, rows in sorted(doc.items()):
+            for r in rows:
+                if r.get("pod_id") == pod_id and not (unsettled and r.get("settled_at")):
+                    hit = r
+        return hit
+
     def charge(self, hotkey: str, usd: float, *, kind: str, projected: float | None = None,
-               now: float | None = None) -> None:
+               now: float | None = None, pod_id: str = "", rate: float | None = None,
+               hours: float | None = None, relabel: bool = False) -> None:
+        """Book ``usd`` (one row per allocation: a re-rent under the same
+        deterministic name is a NEW row). ``relabel``: the newest unsettled
+        booking of ``pod_id`` (the launch booked it) is RELABELLED (hotkey,
+        kind, the landed cost) instead — one allocation never counts twice."""
         t = time.time() if now is None else float(now)
         with _LOCK:
             doc = self._load()
             day = self.day(t)
             doc = {k: v for k, v in doc.items() if k >= self.day(t - 14 * 86400)}
-            doc.setdefault(day, []).append({
-                "hotkey": hotkey, "usd": round(float(usd), 2), "kind": kind, "at": t,
-                "projected_usd": round(float(usd if projected is None else projected), 2)})
+            hit = self._newest(doc, pod_id, unsettled=True) if relabel and pod_id else None
+            if hit is not None:
+                hit.update(hotkey=hotkey or hit.get("hotkey", ""), kind=kind,
+                           usd=round(float(usd), 2))
+                if rate:
+                    hit["rate"] = round(float(rate), 4)
+                write_text_atomic(self.path, json.dumps(doc, sort_keys=True))
+                return
+            row = {"hotkey": hotkey, "usd": round(float(usd), 2), "kind": kind, "at": t,
+                   "projected_usd": round(float(usd if projected is None else projected), 2)}
+            if pod_id:
+                row["pod_id"] = pod_id
+            if rate is not None:
+                row["rate"] = round(float(rate), 4)
+            if hours is not None:
+                row["hours"] = round(float(hours), 3)
+            doc.setdefault(day, []).append(row)
             write_text_atomic(self.path, json.dumps(doc, sort_keys=True))
+
+
+def ceiling_rate(runner) -> float:
+    """The operator's $/h ceiling (the projection rate when no price is known)."""
+    from ..provision.operator_pool import operator_max_price_per_hour
+
+    try:
+        return float(operator_max_price_per_hour(runner.cfg.round) or 0.0)
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def era_wall_seconds(rnd) -> float:
+    """One era's wall: epoch_blocks x era_settlements x the block time."""
+    from ..shared.config import BLOCK_SECONDS
+
+    try:
+        return (max(1, int(getattr(rnd, "epoch_blocks", 0) or 0))
+                * max(1, int(getattr(rnd, "era_settlements", 0) or 0)) * float(BLOCK_SECONDS))
+    except Exception:  # noqa: BLE001
+        return 12 * 3600.0
+
+
+def _leg_life_seconds(runner) -> float:
+    rnd = runner.cfg.round
+    try:
+        wall = float(runner._leg_wall_seconds())
+    except Exception:  # noqa: BLE001 — unknown wall: a full day (strict)
+        wall = 24 * 3600.0
+    return wall + float(getattr(rnd, "funded_ready_timeout_seconds", 0.0) or 0.0)
+
+
+def expected_pod_hours(runner, kind: str) -> float:
+    """How long an operator allocation of ``kind`` is expected to bill: a
+    king pod / backup lives for the era, everything else for one leg."""
+    if kind in (KING_KIND, KING_BACKUP_KIND):
+        return max(era_wall_seconds(runner.cfg.round), _leg_life_seconds(runner)) / 3600.0
+    return _leg_life_seconds(runner) / 3600.0
+
+
+def book_operator_allocation(runner, provider, pod_id: str, *, kind: str, hours: float,
+                             hotkey: str = "") -> None:
+    """Book one operator allocation at its REAL price (the provider's landed
+    $/h, else the ceiling) x its expected hours. Never raises."""
+    try:
+        rate = None
+        price_fn = getattr(provider, "price_of", None)
+        if callable(price_fn):
+            with contextlib.suppress(Exception):
+                rate = price_fn(pod_id)
+        rate = float(rate or ceiling_rate(runner) or 0.0)
+        OperatorSpend.for_runner(runner).charge(hotkey, rate * hours, kind=kind, pod_id=pod_id,
+                                                rate=rate, hours=hours)
+    except Exception as e:  # noqa: BLE001 — bookkeeping never blocks a rent
+        log.warning("operator spend: allocation %s not booked (%s)", pod_id, e)
+
+
+def settle_operator_pod(runner, pod_id: str) -> None:
+    """``pod_id`` (an operator lemon / rejected pod) is being torn down: its
+    booking becomes its real cost so far. Never raises."""
+    try:
+        OperatorSpend.for_runner(runner).settle(pod_id)
+    except Exception as e:  # noqa: BLE001
+        log.debug("operator spend: settle of %s skipped (%s)", pod_id, e)
 
 
 def daily_cap_usd(rnd) -> float:
@@ -367,7 +568,8 @@ def operator_rent_preflight(runner, gen, cost_usd: float) -> None:
               f"${leg_cap:.2f}; nothing rented", cls=OPERATOR_BLOCKED_CLASS)
     clear_alert(runner, "operator_leg_cap", hk[:16])
     cap = daily_cap_usd(rnd)
-    spent = OperatorSpend.for_runner(runner).total()
+    spent = OperatorSpend.for_runner(runner).total(
+        scope=str(getattr(rnd, "operator_daily_cap_scope", "all") or "all"))
     if cap and spent + cost_usd > cap:
         alert(runner, "operator_daily_cap", "operator",
               f"today ${spent:.2f} + projected ${cost_usd:.2f} > daily cap ${cap:.2f}")
@@ -396,6 +598,225 @@ def operator_rent_preflight(runner, gen, cost_usd: float) -> None:
         _skip(runner, hk, f"operator balance below projected cost + reserve (needs "
               f"${need:.2f}); nothing rented, nothing burned", cls=OPERATOR_BLOCKED_CLASS)
     clear_alert(runner, "operator_balance_low", hk[:16])
+
+
+# ── the operator RUNWAY guard (money safety II) ─────────────────────────────
+# 2026-11-02 the balance gate was point-in-time: it ignored what the pods
+# already running would still bill (king, backups, legs, eval pods), so the
+# account drained to 402 and Lium killed every pod on it. The runway guard
+# counts that committed spend before ANY new operator rent.
+
+RUNWAY_FILE = "operator_runway.json"
+
+
+def _parse_iso(text: str) -> float | None:
+    import calendar
+
+    try:
+        return float(calendar.timegm(time.strptime(str(text), "%Y-%m-%dT%H:%M:%SZ")))
+    except (TypeError, ValueError):
+        return None
+
+
+def committed_spend(runner, *, now: float | None = None) -> dict:
+    """``{committed_usd, burn_usd_per_hour, pods: [...]}`` — every live
+    operator pod (funded-ledger rows with no payer: king pods, backups,
+    operator legs) at its booked rate (else the ceiling) x its remaining
+    expected wall, plus each standing pod (``[round]
+    operator_standing_pods_usd_per_hour``: eval pods, hand-rented lanes) at
+    its rate x the alert horizon (they run at least that long)."""
+    t = time.time() if now is None else float(now)
+    rnd = runner.cfg.round
+    spend = OperatorSpend.for_runner(runner)
+    ceiling = ceiling_rate(runner)
+    pods, committed, burn = [], 0.0, 0.0
+    try:
+        ledger = list(runner._load_funded_ledger())
+    except Exception:  # noqa: BLE001 — unreadable: nothing extra counted (logged)
+        log.warning("runway: funded ledger unreadable — committed spend undercounted")
+        ledger = []
+    for pod in ledger:
+        if getattr(pod, "payer_hotkey", ""):
+            continue                                    # a miner's own key pays it
+        pid = str(getattr(pod, "instance_id", "") or "")
+        row = spend.row_for(pid) or {}
+        kind = row.get("kind") or launch_kind(pid)
+        rate = float(row.get("rate") or ceiling)
+        start = float(row.get("at") or _parse_iso(getattr(pod, "rented_at_iso", "")) or t)
+        hours = float(row.get("hours") or expected_pod_hours(runner, kind))
+        left = max(0.0, start + hours * 3600.0 - t) / 3600.0
+        committed += rate * left
+        burn += rate
+        pods.append({"pod": pid, "rate": rate, "hours_left": round(left, 2), "kind": kind})
+    horizon = float(getattr(rnd, "operator_runway_alert_hours", 0.0) or 0.0)
+    for name, rate in tuple(getattr(rnd, "operator_standing_pods_usd_per_hour", ()) or ()):
+        committed += float(rate) * horizon
+        burn += float(rate)
+        pods.append({"pod": name, "rate": float(rate), "hours_left": horizon, "kind": "standing"})
+    return {"committed_usd": round(committed, 2), "burn_usd_per_hour": round(burn, 4),
+            "pods": pods}
+
+
+def _read_balance(runner) -> float | None:
+    reader = getattr(runner, "_operator_balance_reader", None)
+    if reader is None:
+        from .operator_health import lium_balance as reader
+    return _balance(reader)
+
+
+def operator_runway(runner, *, balance: float | None, now: float | None = None,
+                    extra_usd: float = 0.0) -> dict:
+    """The runway verdict. ``held`` = balance - committed (- ``extra_usd``,
+    a launch about to happen) < the reserve: no new operator rent of any
+    kind. ``runway_hours`` = (balance - committed - reserve) / burn rate
+    (inf with nothing burning). An unknown balance is never ``held`` here
+    (the miner-leg preflight already fails closed on it)."""
+    c = committed_spend(runner, now=now)
+    reserve = float(getattr(runner.cfg.round, "operator_balance_reserve_usd", 0.0) or 0.0)
+    out = {**c, "balance_usd": balance, "reserve_usd": reserve, "held": False,
+           "runway_hours": None}
+    if balance is None:
+        return out
+    free = float(balance) - c["committed_usd"] - reserve
+    out["held"] = float(balance) - c["committed_usd"] - float(extra_usd) < reserve
+    burn = c["burn_usd_per_hour"]
+    out["runway_hours"] = (round(free / burn, 2) if burn > 0
+                           else (float("inf") if free >= 0 else 0.0))
+    return out
+
+
+def operator_launch_check(runner, *, kind: str, projected_usd: float) -> None:
+    """Right before EVERY operator launch (the king's included): the runway
+    guard (balance - committed - this launch < reserve ⇒ refused) and the
+    daily cap (over its scope). A refusal raises
+    :class:`~cascade.provision.core.OperatorRentsHeld` with one critical alert;
+    the state clears by itself once the balance / the day recovers."""
+    from ..provision.core import OperatorRentsHeld
+
+    try:
+        _operator_launch_check(runner, kind=kind, projected_usd=projected_usd)
+    except OperatorRentsHeld:
+        raise
+    except Exception as e:  # noqa: BLE001 — a bookkeeping fault never blocks a launch
+        log.warning("operator launch check unavailable for a %s launch (%s) — the rent's "
+                    "other gates decide", kind, e)
+
+
+def _operator_launch_check(runner, *, kind: str, projected_usd: float) -> None:
+    from ..provision.core import OperatorRentsHeld
+
+    rnd = runner.cfg.round
+    scope = str(getattr(rnd, "operator_daily_cap_scope", "all") or "all")
+    cap = daily_cap_usd(rnd)
+    if cap and (scope == "all" or kind not in NON_MINER_KINDS):
+        spent = OperatorSpend.for_runner(runner).total(scope=scope)
+        if spent + projected_usd > cap:
+            msg = (f"operator daily cap: today ${spent:.2f} + this {kind} launch "
+                   f"≈${projected_usd:.2f} > ${cap:.2f} ({scope}) — no new operator rent")
+            alert(runner, "operator_daily_cap", "operator", msg, severity="critical")
+            raise OperatorRentsHeld(msg)
+    bal = _read_balance(runner)
+    if bal is None:
+        log.warning("runway: operator balance unknown at a %s launch — not held here (the "
+                    "miner-leg preflight fails closed on it)", kind)
+        return
+    rw = operator_runway(runner, balance=bal, extra_usd=projected_usd)
+    if rw["held"]:
+        msg = (f"NO NEW OPERATOR RENTS: balance ${bal:.2f} - committed "
+               f"${rw['committed_usd']:.2f} - this {kind} launch ≈${projected_usd:.2f} < the "
+               f"${rw['reserve_usd']:.2f} reserve (king included) — top up the operator account;"
+               " clears by itself")
+        alert(runner, "operator_rents_held", "operator", msg, severity="critical")
+        _save_runway(runner, rw)
+        raise OperatorRentsHeld(msg)
+
+
+def _save_runway(runner, rw: dict) -> None:
+    with contextlib.suppress(Exception):
+        doc = {**{k: v for k, v in rw.items() if k != "pods"}, "at": time.time(),
+               "runway_hours": (None if rw.get("runway_hours") in (None, float("inf"))
+                                else rw["runway_hours"])}
+        write_text_atomic(Path(runner.work_root) / RUNWAY_FILE, json.dumps(doc, sort_keys=True))
+
+
+def runway_tick(runner, balance: float | None) -> dict:
+    """The periodic half (the operator-health sampler): one critical alert
+    while the runway is under ``operator_runway_alert_hours``; the held
+    state alert while balance - committed < reserve; both clear by
+    themselves. Returns the verdict."""
+    rw = operator_runway(runner, balance=balance)
+    alert_h = float(getattr(runner.cfg.round, "operator_runway_alert_hours", 0.0) or 0.0)
+    hrs = rw.get("runway_hours")
+    if balance is not None and alert_h and hrs is not None and hrs < alert_h:
+        alert(runner, "operator_runway_low", "operator",
+              f"operator runway {hrs:.1f} h < {alert_h:.0f} h: balance ${balance:.2f}, committed "
+              f"${rw['committed_usd']:.2f} by {len(rw['pods'])} pod(s), burn "
+              f"${rw['burn_usd_per_hour']:.2f}/h, reserve ${rw['reserve_usd']:.2f}",
+              severity="critical")
+    else:
+        clear_alert(runner, "operator_runway_low", "operator")
+    if rw["held"]:
+        alert(runner, "operator_rents_held", "operator",
+              f"NO NEW OPERATOR RENTS (king included): balance ${balance:.2f} - committed "
+              f"${rw['committed_usd']:.2f} < reserve ${rw['reserve_usd']:.2f} — top up; "
+              "clears by itself", severity="critical")
+    elif balance is not None:
+        clear_alert(runner, "operator_rents_held", "operator")
+    _save_runway(runner, rw)
+    return rw
+
+
+def would_rent_refusal(runner, gen, *, operator: bool) -> tuple[str, str]:
+    """``(why, error_class)`` — "" when a rent for ``gen``'s leg could go
+    ahead now. A side-effect-free verdict over the money / box gates the
+    rent itself applies (no rent, no approval consumed, no probe, no alert),
+    run BEFORE the leg's corpus is generated so no CPU VM is paid for a leg
+    that cannot rent (money safety II). ``operator``: the leg is billed to
+    the operator's account (breaker, runway, daily cap, balance apply)."""
+    from ..funding.queue import OPERATOR_DISK_CLASS
+    from .box_health import rent_halt_refusal
+    from .cost_guards import doomed_leg_reason, measured_wall_refusal
+
+    rnd = runner.cfg.round
+    try:
+        why = measured_wall_refusal(rnd)
+        if why:
+            return why, OPERATOR_BLOCKED_CLASS
+        why = rent_halt_refusal(runner, king=False, cached_only=True)
+        if why:
+            return f"operator disk: {why} — nothing rented", OPERATOR_DISK_CLASS
+        skus = tuple(runner._funded_skus_for_rent() or ())
+        why = doomed_leg_reason(runner, skus) if skus else ""
+        if why:
+            return why, "no_capacity"
+        if not operator:
+            return "", ""
+        rec = OperatorBreaker.for_runner(runner).open_record()
+        if rec:
+            return (f"operator rents paused (circuit breaker: {rec.get('reason', '')}); nothing "
+                    "rented, nothing burned", OPERATOR_BLOCKED_CLASS)
+        hours = expected_pod_hours(runner, OPERATOR_LEG_KIND)
+        projected = ceiling_rate(runner) * hours
+        cap = daily_cap_usd(rnd)
+        if cap:
+            spent = OperatorSpend.for_runner(runner).total(
+                scope=str(getattr(rnd, "operator_daily_cap_scope", "all") or "all"))
+            if spent + projected > cap:
+                return (f"operator daily spend cap reached (${spent:.2f} + ${projected:.2f} > "
+                        f"${cap:.2f}); nothing rented", OPERATOR_BLOCKED_CLASS)
+        bal = _read_balance(runner)
+        if bal is None:
+            return ("operator balance unknown — no operator rent without a known balance",
+                    OPERATOR_BLOCKED_CLASS)
+        rw = operator_runway(runner, balance=bal, extra_usd=projected)
+        if rw["held"]:
+            return (f"no new operator rents: balance ${bal:.2f} - committed "
+                    f"${rw['committed_usd']:.2f} - ${projected:.2f} < reserve "
+                    f"${rw['reserve_usd']:.2f}", OPERATOR_BLOCKED_CLASS)
+    except Exception as e:  # noqa: BLE001 — unsure ⇒ let the rent's own gates decide
+        log.warning("would-rent verdict for %s unavailable (%s) — the rent's gates decide",
+                    str(getattr(gen, "hotkey", ""))[:12], e)
+    return "", ""
 
 
 def payer_balance_refusal(runner, api_key: str, *, hours: float, rate: float | None = None) -> str:
@@ -481,13 +902,13 @@ def grandfathered(runner, hotkey: str, *, allocated: bool) -> bool:
     return is_admitted(runner, hotkey)
 
 
-def operator_leg_gate(runner, gen, *, kind: str, rent: bool) -> None:
+def operator_leg_gate(runner, gen, *, kind: str, rent: bool, lost_usd: float = 0.0) -> None:
     """Gate EVERY miner leg about to be billed to the operator (``kind``:
-    ``expired_key`` / ``make_good`` / ``operator_lane`` / ``paid_fallback``)
-    and every retrain after a finished run was lost on our side
-    (``retrain_after_loss``, on the miner's key). ``rent`` = a new
-    operator-account pod (money preflight + spend booking at launch), else
-    no new operator spend.
+    ``expired_key`` / ``make_good`` / ``operator_lane`` / ``paid_fallback``).
+    A retrain after a finished run was lost on our side is a ``make_good``
+    with ``lost_usd`` (money safety II: OPERATOR-billed, never on the
+    miner's key). ``rent`` = a new operator-account pod (money preflight +
+    spend booking at launch), else no new operator spend.
 
     Returns when the owner's approval of this leg applies (and, for a rent,
     every money preflight passed). Nothing is used up here: the approval is
@@ -507,26 +928,20 @@ def operator_leg_gate(runner, gen, *, kind: str, rent: bool) -> None:
     entry = queue.get(hk)
     attempt_id = str(getattr(entry, "attempt_id", "") or "")
     funded_at = getattr(entry, "funded_at", None)
-    sku, rate, hours, cost = projected_operator_leg_cost(
-        runner, live_price=bool(rent and kind != "retrain_after_loss"))
-    lost = 0.0
-    if kind == "retrain_after_loss":
-        from .box_health import miner_lost_usd
-
-        lost, cost = miner_lost_usd(runner), 0.0    # the miner's key pays the retrain
-    elif not rent:
+    sku, rate, hours, cost = projected_operator_leg_cost(runner, live_price=bool(rent))
+    lost = float(lost_usd or 0.0)
+    if not rent:
         cost = 0.0          # an operator lane is already paid for; no new spend
     store = OperatorApprovals.for_work_root(runner.work_root)
     qname = Path(queue.path).name
     verdict = store.check(qname, hk, ref=gen.ref, attempt_id=attempt_id, kind=kind,
                           funded_at=funded_at, projected_cost_usd=cost)
     if verdict == "approved":
-        if rent and kind != "retrain_after_loss":
+        if rent:
             operator_rent_preflight(runner, gen, cost)   # a block keeps the approval
         _leg_local(runner).operator_approval = {
             "queue": qname, "hotkey": hk, "ref": gen.ref, "attempt_id": attempt_id,
-            "cost": cost, "hours": hours, "kind": kind,
-            "book": bool(rent and kind != "retrain_after_loss")}
+            "cost": cost, "hours": hours, "kind": kind, "book": bool(rent)}
         if not rent:
             note_operator_launch(runner, hk)           # a lane dispatch IS the launch
         log.warning("operator-billed leg %s (%s, uid %s): owner approval applies — %s, "
@@ -536,7 +951,9 @@ def operator_leg_gate(runner, gen, *, kind: str, rent: bool) -> None:
         return
     if verdict == "denied":
         store.take_denial(qname, hk)
-        if kind in ("expired_key", "retrain_after_loss"):
+        if kind == "expired_key" or lost:
+            # A declined retrain after OUR loss never falls back to the
+            # miner's key (money safety II): the miner decides by re-funding.
             _skip(runner, hk, ("payer key expired and the operator declined to pay for this "
                                "leg — fund again with a fresh key (no attempt charged)"
                                if kind == "expired_key" else
@@ -546,7 +963,9 @@ def operator_leg_gate(runner, gen, *, kind: str, rent: bool) -> None:
         _skip(runner, hk, "the operator declined to pay for this leg; it retries on the "
               "miner's own key (no attempt charged)", cls=DENIED_CLASS)
     reason = {"expired_key": "payer key expired",
-              "make_good": "operator make-good after an operator-side loss",
+              "make_good": ("operator make-good: retrain after a finished run was lost on "
+                            "our side" if lost else
+                            "operator make-good after an operator-side loss"),
               "operator_lane": "no marketplace capacity: an operator lane",
               "paid_fallback": "ops_paid_fallback: marketplace sold out",
               "retrain_after_loss": "retrain after a finished run was lost on our side"
@@ -571,7 +990,8 @@ def operator_leg_allocated(runner, round_id: str, hotkey: str) -> bool:
         return False
 
 
-def gate_or_adopt(runner, round_id: str, gen, *, kind: str, rent: bool) -> None:
+def gate_or_adopt(runner, round_id: str, gen, *, kind: str, rent: bool,
+                  lost_usd: float = 0.0) -> None:
     """:func:`operator_leg_gate`, except for a leg that already runs on the
     operator's bill (review F1): its ledgered operator pod is adopted with no
     approval, preflight or spend booking — if that pod turns out to be gone,
@@ -587,7 +1007,7 @@ def gate_or_adopt(runner, round_id: str, gen, *, kind: str, rent: bool) -> None:
         log.warning("operator-billed leg %s: already in flight on the operator's bill "
                     "(re-attached) — continuing without a new approval", gen.hotkey[:12])
         return
-    operator_leg_gate(runner, gen, kind=kind, rent=rent)
+    operator_leg_gate(runner, gen, kind=kind, rent=rent, lost_usd=lost_usd)
 
 
 def take_deferred_gate(runner) -> str | None:
@@ -598,7 +1018,7 @@ def take_deferred_gate(runner) -> str | None:
 
 
 def note_operator_launch(runner, hotkey: str | None = None, *,
-                         landed_rate: float | None = None) -> None:
+                         landed_rate: float | None = None, pod_id: str = "") -> None:
     """The approved leg's pod was rented (or its lane dispatched): mark the
     approval launched for THIS attempt and book the operator spend — only
     now, never for a rent that did not happen (review F3)."""
@@ -618,11 +1038,18 @@ def note_operator_launch(runner, hotkey: str | None = None, *,
     OperatorApprovals.for_work_root(runner.work_root).mark_launched(
         a["queue"], a["hotkey"], ref=a["ref"], attempt_id=a["attempt_id"], cost_usd=booked)
     if a.get("book"):
+        # ``pod_id``: the launch already booked this allocation (every
+        # operator launch is booked by the guarded provider) — relabel it to
+        # this leg at its landed cost instead of booking it twice.
         OperatorSpend.for_runner(runner).charge(a["hotkey"], booked, kind=a["kind"],
-                                                projected=float(a["cost"]))
+                                                projected=float(a["cost"]), pod_id=pod_id,
+                                                rate=landed_rate, relabel=bool(pod_id))
 
 
 __all__ = ["AWAITING_APPROVAL_STATUS", "OperatorBreaker", "OperatorSpend", "alert",
+           "BookedCpuProvider", "book_operator_allocation", "committed_spend",
+           "operator_launch_check",
+           "operator_runway", "runway_tick", "settle_operator_pod", "would_rent_refusal",
            "clear_alert", "daily_cap_usd", "guard_operator_provider", "health_conditions",
            "is_balance_refusal", "operator_leg_gate", "operator_rent_preflight",
            "gate_or_adopt", "grandfathered", "note_operator_launch", "operator_leg_allocated",

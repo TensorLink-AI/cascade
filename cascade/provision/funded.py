@@ -610,6 +610,11 @@ def teardown_funded(
             from ..funding.providers import forget_lease
 
             try:
+                # Money safety II: a pod CONFIRMED gone resolves every create
+                # intent of its leg name — a lemon rm'd and verified gone
+                # must never leave ``create_unresolved`` blocking (and
+                # re-polling) the leg forever.
+                resolve_scope_intents(vault, inst.instance_id.removesuffix("-0"))
                 forget_lease(vault, getattr(inst, "payer_credential_id", ""))
             except OSError as e:
                 # The pod IS gone; a lease row left behind by a full disk
@@ -622,6 +627,21 @@ def teardown_funded(
                       inst.instance_id, inst.payer_hotkey)
             orphaned.append(inst)
     return orphaned
+
+
+def resolve_scope_intents(vault, scope: str) -> int:
+    """Resolve every create intent of leg name ``scope`` (its pod is
+    confirmed gone); returns how many were resolved."""
+    from ..funding.providers import create_intents, resolve_create
+
+    n = 0
+    for row in list(create_intents(vault, scope)):
+        resolve_create(vault, str(row.get("token") or ""))
+        n += 1
+    if n:
+        log.info("funded: %d create intent(s) of %s resolved — the pod is confirmed gone",
+                 n, scope)
+    return n
 
 
 def payer_pod_pattern(hotkey: str, netuid: int) -> re.Pattern:

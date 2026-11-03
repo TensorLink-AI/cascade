@@ -315,6 +315,12 @@ class _FundedLegMixin:
         reused = _reupload_pending(self, gen, seeds, contract, suffix, warm_start_ref)
         if reused is not None:
             return reused
+        # Money safety II: the money gates as a side-effect-free "would it
+        # rent?" verdict BEFORE the corpus (a CPU VM is operator money): a
+        # leg that cannot rent never generates. King legs are exempt (a held
+        # king is the era loop's RentsHalted, never a skip it counts).
+        if not getattr(self.__dict__.get("_leg_local_obj"), "funded_is_king", False):
+            _pre_corpus_money_gates(self, gen, gpu_choice, round_id=str(seeds.base_seed))
         # DEC-CA-0053: a shards leg's corpus is made on the CPU tier FIRST —
         # the payer's GPU is rented only once there is something to train on.
         try:
@@ -643,6 +649,48 @@ class _FundedLegMixin:
         _add_seen_hotkeys(self._submissions_path(), [c.hotkey for c in challengers], block)
 
 
+def _leg_allocated(runner, round_id: str, hotkey: str) -> bool:
+    """A ledgered pod of THIS leg exists (payer or operator-rented): a
+    restart / retry re-attaches to it — no pre-rent gate may strand it."""
+    from ..provision.funded import funded_pod_name
+
+    try:
+        base = funded_pod_name(str(round_id), hotkey, runner.cfg.subnet.netuid)
+        names = {base + "-0", runner._operator_leg_pod_prefix(str(round_id), hotkey) + "-0"}
+        return any(p.instance_id in names for p in runner._load_funded_ledger())
+    except Exception:  # noqa: BLE001 — unknown: assume allocated (never strand a live leg)
+        return True
+
+
+def _pre_corpus_money_gates(runner, gen, gpu_choice=None, *, round_id: str = "") -> None:
+    """Before a payer leg's corpus is generated: the would-rent verdict
+    (:func:`~cascade.trainer.money_guard.would_rent_refusal`; the operator
+    gates too when the entry is operator-billed) and the miner-key money
+    gates (waste cap, the miner's own budget) — so a leg that cannot rent
+    pays for no CPU VM. Raises :class:`_FundedLegSkip` (nothing rented,
+    unburned) with the verdict recorded."""
+    from .faults import _FundedLegSkip
+    from .money_guard import would_rent_refusal
+
+    if _leg_allocated(runner, round_id, gen.hotkey):
+        return                       # a re-attach: the rent path adopts, never re-gates
+    q = runner._funded_queue()
+    e = q.get(gen.hotkey) if q is not None else None
+    operator = bool(e is not None and getattr(e, "operator_billed", False))
+    why, cls = would_rent_refusal(runner, gen, operator=operator)
+    if why:
+        log.warning("funded leg %s: %s — no corpus generated", gen.hotkey[:12], why)
+        runner._record_funded_failure(gen.hotkey, why, miner_fault=False, error_class=cls,
+                                      burn=False)
+        raise _FundedLegSkip(gen.hotkey)
+    if not operator and e is not None:
+        from .miner_spend_guard import budget_check, waste_cap_check
+
+        waste_cap_check(runner, gen)                     # pauses at the cap (no rent)
+        budget_check(runner, gen, gpu_choice if gpu_choice is not None
+                     else getattr(e, "gpu_choice", None))
+
+
 def _with_leg_watchdog(runner, disp, gen, pod, contract, host=None):
     """``disp`` with the leg's progress watchdog (and periodic teardown-key
     check) attached — a detached :class:`RemoteDispatcher` only; any other
@@ -689,14 +737,34 @@ def _dispatch_watched(disp, host, **kw):
     the leg's rate — or never reached step 1 — is a hardware/fabric fault, and
     re-renting it (2026-11-01: 93.120.231.186, 0.2 steps/s on two legs in a
     row) only repeats the loss."""
+    from .cost_guards import FIRST_STEP_ABORT
     from .host_preflight import quarantine_host_ip
     from .remote import LegAborted
 
     try:
         return disp.dispatch(host, **kw)
     except LegAborted as e:
-        quarantine_host_ip(str(getattr(host, "host", "") or ""), str(e)[-300:])
-        raise _OperatorFault(str(e)) from e
+        # Never a burn: OUR watchdog aborted it (an operator-side fault). A
+        # hang before step 1 on a leg whose corpus was made OFF the pod (the
+        # CPU tier) can only be the host — NCCL init, the driver — and its
+        # IP is quarantined. With on-pod generation the time before step 1
+        # includes the miner's generator, so it is not proof of a bad host:
+        # still unburned, the host is not blamed (money safety II).
+        first_step = FIRST_STEP_ABORT in str(e)
+        if not first_step or kw.get("corpus_files"):
+            quarantine_host_ip(str(getattr(host, "host", "") or ""), str(e)[-300:])
+        else:
+            log.warning("leg %s: first-step deadline with on-pod generation — not proof of a "
+                        "bad host; requeued unburned, host not quarantined",
+                        str(kw.get("hotkey", ""))[:12])
+        cls = HostHangFault if first_step and kw.get("corpus_files") else _OperatorFault
+        raise cls(str(e)) from e
+
+
+class HostHangFault(_OperatorFault):
+    """The worker never reached step 1 on a pre-generated corpus: the HOST
+    hung (NCCL init / a collective / the driver) — an operator-side,
+    unburned fault; the host is quarantined."""
 
 
 def _record_generation_failure(runner, gen, e: BaseException) -> None:

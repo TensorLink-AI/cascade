@@ -80,16 +80,44 @@ def keeps_pod(exc: BaseException | None) -> bool:
     return False
 
 
+def trained_seconds_of(runner, rec: dict | None = None) -> float:
+    """How long the finished run a kept pod protects trained: the recorded
+    figure, else the leg's expected wall (a finished leg trained ~its wall)."""
+    v = (rec or {}).get("trained_seconds")
+    if v:
+        return float(v)
+    try:
+        return float(runner._leg_wall_seconds())
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def keep_budget_seconds(runner, rec: dict | None = None) -> float:
+    """The PRICED keep (money safety II): a pod kept after our harvest fault
+    is worth keeping while keep cost < ``harvest_keep_cost_fraction`` x
+    rate x trained hours — the rate cancels, so keep seconds < fraction x
+    trained seconds — and never past ``harvest_keep_max_seconds`` (0 = no
+    hard cap). 0 = do not keep."""
+    rnd = runner.cfg.round
+    frac = float(getattr(rnd, "harvest_keep_cost_fraction", 0.5) or 0.0)
+    cap = float(getattr(rnd, "harvest_keep_max_seconds", 10800) or 0.0)
+    priced = frac * trained_seconds_of(runner, rec)
+    if priced <= 0:
+        return 0.0
+    return min(priced, cap) if cap > 0 else priced
+
+
 def keep_cost_line(runner, pod_id: str) -> str:
     """One log line pricing a kept pod: worst case at the price ceiling until
     the sweep releases a finished-unharvested run."""
     rnd = runner.cfg.round
     rate = max(float(getattr(rnd, "funded_max_price_per_hour", 0.0) or 0.0),
                float(getattr(rnd, "operator_max_price_per_hour", 0.0) or 0.0))
-    hours = float(getattr(type(runner), "SWEEP_UNHARVESTED_KEEP_SECONDS", 6 * 3600.0)) / 3600.0
+    hours = keep_budget_seconds(runner) / 3600.0
     return (f"pod {pod_id} KEPT after an operator-side harvest failure: it keeps billing at "
-            f"≤ ${rate:.2f}/h until the requeued leg re-attaches and harvests it, or the "
-            f"sweep releases it after {hours:.0f} h (worst case ≈ ${rate * hours:.2f})")
+            f"≤ ${rate:.2f}/h until the requeued leg re-attaches and harvests it, or it is "
+            f"released after the priced keep of {hours:.1f} h (worst case ≈ "
+            f"${rate * hours:.2f})")
 
 
 def _released(runner) -> bool:
@@ -201,6 +229,16 @@ def guarded_harvest(runner, dest: Path | str, attempt: Callable[[], object], *,
                           "retrying in %.0f s after freeing space", label, i + 1, retries + 1,
                           str(last)[:200], keep_cost_line(runner, pod_id or "?"), delay)
                 sleep(delay)
+        loc.harvest_r2_tried = r2_fallback is not None
+        if r2_fallback is None:
+            # Money safety II: the pod-side safety net is unavailable — the
+            # kept pod is the ONLY copy of a finished, paid run. Say so loudly.
+            log.critical("harvest of %s: R2 is NOT configured — no pod → R2 push possible; "
+                         "the kept pod is the only copy of this finished run (configure the "
+                         "R2 backup store to close this)", label)
+            alert(runner, "harvest_no_r2", label[:16],
+                  f"harvest of {label} failed on our side and R2 is not configured — the kept "
+                  "pod is the only copy of the finished run", severity="critical")
         if r2_fallback is not None:
             try:
                 log.warning("harvest of %s: box-side harvest exhausted its budget — pushing "
@@ -274,13 +312,18 @@ def handle_our_side_fault(runner, gen, exc: BaseException, *, pod_id: str, payer
         prev = bh.leg(hk) or {}
         since = prev.get("kept_since") if prev.get("pod_id") == pod_id else None
         now = time.time()
-        limit = float(getattr(runner.cfg.round, "harvest_keep_max_seconds", 600) or 0)
+        trained_s = trained_seconds_of(runner, prev if prev.get("pod_id") == pod_id else None)
+        limit = keep_budget_seconds(runner, {"trained_seconds": trained_s})
         if since is None:
             since = now
-        if limit and now - since >= limit:
-            keep = False
+        if now - since >= limit:
+            keep = False                  # the priced keep is spent (0 = never keep)
+        loc = runner.__dict__.get("_leg_local_obj")
         record_leg_fault(runner, hk, exc, trained=True, pod_id=pod_id, payer=payer, kept=keep,
-                         ref=gen.ref, extra={"kept_since": since} if keep else {})
+                         ref=gen.ref, extra={"kept_since": since, "trained_seconds": trained_s,
+                                             "r2_tried": bool(getattr(loc, "harvest_r2_tried",
+                                                                      False))}
+                         if keep else {})
     else:
         record_leg_fault(runner, hk, exc, trained=trained and ours, pod_id=pod_id, payer=payer,
                          kept=False, ref=gen.ref)
@@ -297,8 +340,11 @@ def handle_our_side_fault(runner, gen, exc: BaseException, *, pod_id: str, payer
         return True
     if ours and trained and not released:
         lost = miner_lost_usd(runner)
+        loc = runner.__dict__.get("_leg_local_obj")
+        r2 = ("the pod → R2 push was tried and failed" if getattr(loc, "harvest_r2_tried", False)
+              else "R2 is NOT configured (no pod → R2 push was possible)")
         alert(runner, "miner_billed_loss" if payer else "operator_billed_loss", hk[:16],
               f"finished run of {hk[:12]} LOST to an operator-side fault (pod {pod_id} "
-              f"released after the keep budget): ≤ ${lost:.2f} billed to the {who}; a retrain "
-              "needs the owner's approval", severity="critical")
+              f"released after the priced keep; {r2}): ≤ ${lost:.2f} billed to the {who}; its "
+              "retrain is an operator make-good (owner approval)", severity="critical")
     return False

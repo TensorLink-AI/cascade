@@ -138,7 +138,7 @@ class RoundConfig:
     # still echoes the injected digest env; this it cannot fake. Empty ⇒ off.
     worker_code_fingerprint: str = ""
     # Ceiling on one funded pod's boot (launch → SSH-ready), seconds.
-    funded_ready_timeout_seconds: float = 900.0
+    funded_ready_timeout_seconds: float = 420.0
     # Harbor expiry (days) on the per-pod Hub robot a funded leg gets
     # (cascade.funding.robots). Revocation at teardown is the real bound;
     # this is the backstop if a revoke ever fails.
@@ -367,10 +367,13 @@ class RoundConfig:
     # the leg is requeued unburned with the pod kept for the re-attach.
     harvest_disk_retries: int = 2
     harvest_disk_retry_seconds: int = 30
-    # A pod KEPT after OUR disk failed its harvest may bill the MINER: kept at
-    # most this long (then released with a critical "miner-billed loss"
-    # alert so the owner can make it good). Review F6.
-    harvest_keep_max_seconds: int = 600
+    # A pod KEPT after OUR side failed its harvest (it may bill the MINER) is
+    # kept while the keep costs less than ``harvest_keep_cost_fraction`` of
+    # the run it protects (rate x the leg's trained hours; the rate cancels:
+    # keep hours < fraction x trained hours), and never past this hard cap.
+    # Then released with a critical priced alert (money safety II).
+    harvest_keep_max_seconds: int = 10800
+    harvest_keep_cost_fraction: float = 0.5
     # Miner waste cap (cascade.funding.miner_spend): pods on a miner's key
     # that produced nothing, summed per submission (ref + funding), at or
     # above this pause the entry ("paused_spend_cap": never failed, burned,
@@ -382,6 +385,42 @@ class RoundConfig:
     # Box health breaker: the same our-side fault class on >= 2 legs within
     # this window (or ANY local-disk fault) halts every new GPU rent.
     box_fault_window_seconds: int = 7200
+    # ── money safety II (2026-11-03 money-leak audit) ──
+    # Operator RUNWAY: committed = sum(rate x remaining wall) of every live
+    # operator pod (ledger rows: king, backups, operator legs) + the standing
+    # pods below x the alert horizon; runway = (balance - committed -
+    # operator_balance_reserve_usd) / burn rate. Below this many hours: ONE
+    # critical alert. balance - committed < the reserve: NO new operator
+    # rent of any kind (king included) until it recovers. 0 = alert off.
+    operator_runway_alert_hours: float = 6.0
+    # Standing operator pods the ledger cannot see (validator eval pods,
+    # hand-rented lanes): ``{name = usd_per_hour}`` (TOML table).
+    operator_standing_pods_usd_per_hour: tuple[tuple[str, float], ...] = ()
+    # Which booked operator spend the daily cap counts: "all" (king pods,
+    # backups, CPU VMs, lemons, miner legs) or "miner_legs" (#417 behaviour).
+    operator_daily_cap_scope: str = "all"
+    # The FIRST infra loss on a miner's key taking the submission's infra
+    # waste to this files the spend_cap_make_good request (one alert) —
+    # before the next rent, never one leg late. 0 = off (the cap still trips).
+    miner_waste_alert_usd: float = 15.0
+    # King pod / backup provider TTL = time to the era's end + this margin
+    # (Lium ``--ttl``; cannot be extended, so it is a backstop). 0 = no TTL.
+    king_pod_ttl_margin_seconds: int = 0
+    # The idle-king reaper: a king/backup pod of a PAST era (or a current-era
+    # backup that is not the king's host) with no live worker and no
+    # unharvested finished run on this many consecutive checks
+    # ``king_idle_check_seconds`` apart is terminated (verified) with one
+    # alert. 0 = off.
+    king_idle_reap_checks: int = 2
+    king_idle_check_seconds: int = 900
+    # Operator-account inventory: every this-many seconds ``lium ps`` on the
+    # OPERATOR account is diffed against the allowlist (funded ledger, king
+    # pods, the names below, and every host IP in the listed host files —
+    # eval_hosts.toml, hosts.toml); each unknown pod raises ONE alert with
+    # its name and $/h. Never deletes anything. 0 = off.
+    operator_inventory_interval_seconds: int = 3600
+    operator_inventory_allow: tuple[str, ...] = ()
+    operator_inventory_host_files: tuple[str, ...] = ()
     # Trainer recovery controls; scientific contracts and reward rules are unchanged.
     ops_max_active_per_coldkey: int = 0
     ops_gpu_failure_threshold: int = 0

@@ -303,6 +303,14 @@ class OperatorMonitor:
             snap["conditions"] += health_conditions(runner, queues, now=now)
         except Exception as e:  # noqa: BLE001 — never sinks the watchdog
             log.warning("money-safety conditions unavailable (%s)", type(e).__name__)
+        # Money safety II: the operator runway guard, the idle-king reaper,
+        # the operator-account inventory and the payer-key TTL refresh.
+        try:
+            from .money_watch import money_periodic
+
+            money_periodic(runner, balances.get("lium"), now=now)
+        except Exception as e:  # noqa: BLE001 — never sinks the watchdog
+            log.warning("money watch unavailable (%s)", type(e).__name__)
         snap["sample_duration_seconds"] = round(max(0, self.clock() - now), 1)
         if snap["sample_duration_seconds"] > max(
             30, runner.cfg.round.ops_alert_interval_seconds * 2

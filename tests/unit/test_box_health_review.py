@@ -150,20 +150,32 @@ def _lost_runner(tmp_path, monkeypatch, *, live, kept=True):
     return r, q, rents
 
 
+def _with_operator_rent(r, monkeypatch):
+    monkeypatch.setattr(r, "_operator_recovery_available", lambda: True, raising=False)
+    monkeypatch.setattr(r, "_operator_rent_allowed", lambda: True, raising=False)
+    monkeypatch.setattr(r, "_operator_fallback_lanes", lambda: [], raising=False)
+    monkeypatch.setattr(r, "_operator_balance_reader", lambda: 10_000.0, raising=False)
+
+
 @pytest.mark.parametrize("kept,live", [(True, (None, True)), (False, (None, True)),
                                        (False, (object(), True))])
 def test_a_lost_run_parks_for_approval_before_any_rent(tmp_path, monkeypatch, kept, live):
     r, q, rents = _lost_runner(tmp_path, monkeypatch, live=live, kept=kept)
+    _with_operator_rent(r, monkeypatch)
     with pytest.raises(_FundedLegSkip):
         r._rent_funded_host("777", _challenger("hkA"))
     assert rents == []                                        # the miner paid NOTHING more
     assert r._funded_leg_failures["hkA"][2] == "awaiting_operator_approval"
     (req,) = OperatorApprovals.for_work_root(tmp_path).pending()
-    assert req["kind"] == "retrain_after_loss"
+    # money safety II: the retrain is an OPERATOR make-good with the loss priced in
+    assert req["kind"] == "make_good" and req["miner_lost_usd"] >= 0
 
 
-def test_an_approved_retrain_rents_once_as_an_ordinary_leg(tmp_path, monkeypatch):
+def test_an_approved_retrain_is_operator_billed_never_on_the_miners_key(tmp_path, monkeypatch):
+    from cascade.trainer.faults import _FundedOperatorRent
+
     r, q, rents = _lost_runner(tmp_path, monkeypatch, live=(None, True))
+    _with_operator_rent(r, monkeypatch)
     with pytest.raises(_FundedLegSkip):
         r._rent_funded_host("777", _challenger("hkA"))
     q.requeue("hkA", error="awaiting", error_class="awaiting_operator_approval",
@@ -172,9 +184,23 @@ def test_an_approved_retrain_rents_once_as_an_ordinary_leg(tmp_path, monkeypatch
 
     assert cli(["approve-operator-leg", "hkA", "--work-root", str(tmp_path)]) == 0
     q.mark_in_flight("hkA", "r@1", target_boundary=1, era_index=1, started_block=2)
-    host, pod = r._rent_funded_host("777", _challenger("hkA"))
-    assert len(rents) == 1 and host.host == "10.9.9.9"        # one rent, used normally
+    with pytest.raises(_FundedOperatorRent):
+        r._rent_funded_host("777", _challenger("hkA"))
+    assert rents == []                                        # never the miner's key
+    assert q.get("hkA").operator_billed
     assert BoxHealth.for_runner(r).leg("hkA") is None
+
+
+def test_a_lost_run_without_operator_capacity_waits_and_never_charges_the_miner(
+        tmp_path, monkeypatch):
+    r, q, rents = _lost_runner(tmp_path, monkeypatch, live=(None, True))
+    monkeypatch.setattr(r, "_operator_recovery_available", lambda: False, raising=False)
+    with pytest.raises(_FundedLegSkip):
+        r._rent_funded_host("777", _challenger("hkA"))
+    assert rents == []
+    assert r._funded_leg_failures["hkA"][2] == "operator_blocked"
+    assert any(c["code"] == "lost_run_needs_operator"
+               for c in money_guard.health_conditions(r, {}))
 
 
 def test_unknown_kept_pod_liveness_neither_rents_nor_parks(tmp_path, monkeypatch):

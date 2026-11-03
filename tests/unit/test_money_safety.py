@@ -417,6 +417,9 @@ def test_balance_shortfall_refuses_the_leg_only_and_the_king_still_rents(tmp_pat
         def launch(self, spec):
             return ["king-0"]
 
+    # (money safety II: the RUNWAY guard holds the king too when the balance
+    # cannot cover it — here the account can, so only the leg was refused)
+    r._operator_balance_reader = lambda: 1000.0
     assert money_guard.guard_operator_provider(r, _King(), enforce=False).launch("s") == ["king-0"]
     money_guard.OperatorBreaker.for_runner(r).trip("402 BALANCE_REQUIRED on a challenger rent")
     assert money_guard.guard_operator_provider(r, _King(), enforce=False).launch("s") == ["king-0"]
