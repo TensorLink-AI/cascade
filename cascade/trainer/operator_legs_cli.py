@@ -99,7 +99,12 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str]) -> int:
     from ..funding.operator_approvals import OperatorApprovals
-    from ..funding.queue import AWAITING_APPROVAL_STATUS, PAUSED_SPEND_STATUS, PAUSED_STATUS
+    from ..funding.queue import (
+        AWAITING_APPROVAL_STATUS,
+        PAUSED_BUDGET_STATUS,
+        PAUSED_SPEND_STATUS,
+        PAUSED_STATUS,
+    )
 
     args = _parser().parse_args(argv)
     wr = Path(args.work_root)
@@ -111,7 +116,7 @@ def main(argv: list[str]) -> int:
         paused = [{"queue": q.path.name, "hotkey": e.hotkey, "ref": e.ref, "status": e.status,
                    "operator_requeues": e.operator_requeues, "last_error": e.last_error}
                   for q in _queues(wr) for e in q.entries()
-                  if e.status in (PAUSED_STATUS, PAUSED_SPEND_STATUS)]
+                  if e.status in (PAUSED_STATUS, PAUSED_SPEND_STATUS, PAUSED_BUDGET_STATUS)]
         halt = _halt(wr)
         spend = _spend(wr)
         if args.json:
@@ -149,6 +154,12 @@ def main(argv: list[str]) -> int:
                 if getattr(args, "reset_spend", False):
                     _reset_spend(q, hk)
                 print(f"resumed {hk} in {q.path.name} (operator-fault count reset)")
+                return 0
+            if q.unpark(hk, expect_status=PAUSED_BUDGET_STATUS,
+                        reason="resumed by the operator after the miner budget pause"):
+                if getattr(args, "reset_spend", False):
+                    _reset_spend(q, hk)
+                print(f"resumed {hk} in {q.path.name} (budget pause)")
                 return 0
             if q.unpark(hk, expect_status=PAUSED_SPEND_STATUS,
                         reason="resumed by the operator after the waste cap"):
@@ -202,7 +213,7 @@ def _live_entry(work_root: Path, hotkey: str, queue_name: str | None, *, kind: s
             continue
         e = q.get(hotkey)
         if e is not None and e.status in ("queued", "in_flight", "awaiting_operator_approval",
-                                          "paused", "paused_spend_cap"):
+                                          "paused", "paused_spend_cap", "paused_budget"):
             return {"queue": q.path.name, "queue_path": str(q.path), "ref": e.ref,
                     "funded_at": e.funded_at, "kind": kind}
     return None

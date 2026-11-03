@@ -239,8 +239,10 @@ It never opens a wallet or sends a write request. Unknown evidence blocks
 `ready_to_propose`; a pass is permission to present the proposal, not spend.
 
 Its price and total budget are **review inputs**, not a GPU quote or reservation.
-Standard A/B/C funding supports an hourly `--max-price` with an explicit GPU;
-it does not currently enforce the preflight's total `--max-spend`. Direct-MoE
+Standard A/B/C funding supports an hourly `--max-price` with an explicit GPU.
+Lane A `fund` also takes a total `--max-total-spend` budget, enforced before
+every rent (never by killing a running leg; a Lium key budget is the hard
+backstop). The preflight's `--max-spend` is a review input only. Direct-MoE
 funding has a separate total-cap mechanism. Review the live wall, GPU count,
 CPU preparation and any extra time before authorizing a paid action.
 

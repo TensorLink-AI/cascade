@@ -63,6 +63,7 @@ def test_knob_round_trips_with_an_integral_float(tmp_path):
     assert RoundConfig().miner_waste_cap_usd == 30.0
     assert load_chain_config(_edited(tmp_path, "miner_waste_cap_usd = 45\n")
                              ).round.miner_waste_cap_usd == 45.0
+    (tmp_path / "b").mkdir()
     with pytest.raises(ValueError, match="miner_waste_cap_usd"):
         load_chain_config(_edited(tmp_path / "b", "miner_waste_cap_usd = -1\n"))
 
@@ -264,3 +265,86 @@ def test_a_chosen_h200_is_projected_at_its_own_cap(tmp_path, monkeypatch):
     why = money_guard.payer_balance_refusal(r, "sk", hours=4.0, rate=max(15.0, 32.0))
     assert "≈$128.00" in why
     assert money_guard.payer_balance_refusal(r, "sk", hours=4.0, rate=15.0) == ""
+
+
+# ── the miner's own TOTAL budget (--max-total-spend) ────────────────────────
+
+
+def _budget_runner(tmp_path, monkeypatch, budget, **kw):
+    r, q, rents = _setup(tmp_path, monkeypatch, miner_waste_cap_usd=0.0, **kw)
+    q.add(HK, REF, 10, max_total_spend_usd=budget)               # (a re-fund may change it)
+    return r, q, rents
+
+
+def _leg_need(r):
+    from cascade.trainer.miner_spend_guard import fallback_rate
+
+    return fallback_rate(r) * (4 * 3600.0 + r.cfg.round.funded_ready_timeout_seconds) / 3600.0
+
+
+def test_a_budget_too_small_for_one_leg_pauses_before_any_rent(tmp_path, monkeypatch):
+    r, q, rents = _budget_runner(tmp_path, monkeypatch, 1.0)
+    with pytest.raises(_FundedLegSkip):
+        r._rent_funded_host("777", _challenger(HK))
+    assert rents == [] and _settle(r, q) == "budget"
+    e = q.get(HK)
+    assert e.status == "paused_budget" and e.attempts == 0
+    assert "budget $1 insufficient" in e.last_error and "your submission is kept" in e.last_error
+    assert q.expire_stale(max_age_seconds=0) == 0 and q.get(HK).status == "paused_budget"
+    assert q.public_view()["entries"][0]["budget_usd"] == 1.0
+
+
+def test_a_budget_for_one_leg_blocks_the_retry_after_a_lost_run(tmp_path, monkeypatch):
+    r, q, rents = _budget_runner(tmp_path, monkeypatch, None)
+    budget = _leg_need(r) + 1.0                                   # exactly one leg
+    q.add(HK, REF, 10, max_total_spend_usd=budget)
+    _seed(tmp_path, q, [("p1", 1.5, 4.25, "waste", "infra")])     # the lost run
+    with pytest.raises(_FundedLegSkip):
+        r._rent_funded_host("777", _challenger(HK))
+    assert rents == [] and _settle(r, q) == "budget"
+    # raising the budget (a re-fund) resumes it on a fresh count
+    assert q.add(HK, REF, 10, max_total_spend_usd=budget * 3) == "queued"
+    q.mark_in_flight(HK, REF, target_boundary=1, era_index=1, started_block=2)
+    r._rent_funded_host("777", _challenger(HK))
+    assert len(rents) == 1
+
+
+def test_no_budget_is_unchanged_and_old_rows_load(tmp_path, monkeypatch):
+    r, q, rents = _setup(tmp_path, monkeypatch, miner_waste_cap_usd=0.0)
+    r._rent_funded_host("777", _challenger(HK))
+    assert len(rents) == 1
+    doc = json.loads(q.path.read_text())
+    assert "max_total_spend_usd" not in doc["entries"][0]          # unset ⇒ not written
+    assert FundedQueue(q.path).get(HK).max_total_spend_usd is None
+
+
+def test_the_cli_flag_round_trips_through_the_intake(tmp_path):
+    from cascade.funding.gpu_choice import BUDGET_HEADER
+    from cascade.miner.cli import build_fund_headers, build_parser
+    from tests.unit.test_miner_chosen_gpu import HK as GHK
+    from tests.unit.test_miner_chosen_gpu import REF as GREF
+    from tests.unit.test_miner_chosen_gpu import _clock, _intake, _sign
+
+    args = build_parser().parse_args(["fund", "https://intake.example", "--ref", GREF,
+                                      "--max-total-spend", "75"])
+    assert args.max_total_spend == 75.0
+    h = build_fund_headers("fund", GHK, GREF, "sk", _sign, now=_clock, max_total_spend=75.0)
+    assert h[BUDGET_HEADER] == "75.0"
+    intake = _intake(tmp_path)
+    status, body = intake.fund(h)
+    assert status == 202 and intake.queue.get(GHK).max_total_spend_usd == 75.0
+    # the budget is SIGNED: a header swapped in transit fails the signature
+    assert intake.fund({**h, BUDGET_HEADER: "9999"})[0] in (401, 403)
+
+
+@pytest.mark.parametrize("raw", ["-5", "0", "nan", "inf", "abc"])
+def test_the_intake_rejects_a_bad_budget(tmp_path, raw):
+    from cascade.funding.gpu_choice import BUDGET_HEADER
+    from cascade.miner.cli import build_fund_headers
+    from tests.unit.test_miner_chosen_gpu import HK as GHK
+    from tests.unit.test_miner_chosen_gpu import REF as GREF
+    from tests.unit.test_miner_chosen_gpu import _clock, _intake, _sign
+
+    h = build_fund_headers("fund", GHK, GREF, "sk", _sign, now=_clock)
+    status, body = _intake(tmp_path).fund({**h, BUDGET_HEADER: raw})
+    assert status == 400 and body["code"] == "bad_max_total_spend"

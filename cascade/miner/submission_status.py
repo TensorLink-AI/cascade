@@ -36,6 +36,7 @@ PHASE_TEXT = {
     "awaiting_operator_approval": "Parked: the operator must approve paying for this leg; nothing was charged",
     "paused": "Paused by repeated operator-side faults; nothing was burned",
     "paused_spend_cap": "Paused: too much of your funding was lost to failed attempts; your submission is kept",
+    "paused_budget": "Paused: your total budget (--max-total-spend) cannot cover the next leg; raise it or re-fund — your submission is kept",
 }
 ERROR_TEXT = {
     "commit_before_open": "The reveal predates the competition opening. Make a fresh commitment and fund it; no training attempt was consumed.",
@@ -48,6 +49,7 @@ ERROR_TEXT = {
     "awaiting_operator_approval": "The leg would be paid by the operator and waits for the operator's approval; no attempt was consumed.",
     "operator_denied": "The operator declined to pay for this leg; it retries on your own provider key (no attempt consumed).",
     "spend_cap": "Paused after failed attempts cost too much of your funding. Your submission is kept (never rejected); the operator reviews infra losses, or fund again to resume.",
+    "budget": "Your total budget cannot cover the next leg; fund again with a higher --max-total-spend. Nothing was rented.",
     "payer_balance": "Your provider balance cannot finish this leg: top up; nothing was rented and no attempt was consumed.",
     "infra": "An infrastructure failure caused a retry.",
     "auth": "The payer credential is missing, expired or refused; review funding with the operator.",
@@ -290,7 +292,7 @@ def submission_view(snapshot, *, hotkey, lane, ref=None, queue=None, source=None
             result["next_action"] = "Keep the existing entry; no resubmission is needed for later rounds. For a prolonged wait, ask the operator to check your GPU type/price cap, market capacity and backlog."
         elif retry and retry > now.timestamp():
             result["message"] = "Queued in retry backoff"
-    elif status in ("awaiting_operator_approval", "paused", "paused_spend_cap"):
+    elif status in ("awaiting_operator_approval", "paused", "paused_spend_cap", "paused_budget"):
         result.update(auto_retry=False, action_required=False,
                       next_action=("Nothing was burned and no attempt was consumed. The operator "
                                    "must act on this entry; keep it funded and do not resubmit."))

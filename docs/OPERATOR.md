@@ -809,6 +809,15 @@ miner_waste_cap_usd` (30; 0 = off) pauses the entry as `paused_spend_cap`:
 * `resume-operator-leg <hotkey>` resumes and resets the count. An unreadable
   ledger fails closed: the entry is paused, nothing rented.
 
+**The miner's own total budget.** `cascade fund --max-total-spend USD` (lane
+A; header `X-Max-Total-Spend`, signed, positive) is stored on the entry as
+`max_total_spend_usd`; a re-fund may change it. Before every miner-key rent,
+all spend so far plus the next leg's projection must fit. Otherwise the
+entry parks `paused_budget`, with the same never-reject guarantees as the
+waste cap and one alert. A running leg is never killed for an overrun;
+Lium key budgets are the hard backstop. A re-fund with a higher budget
+resumes it, as does `resume-operator-leg`.
+
 The payer-balance check (`payer_projected_rate_per_hour`) reads the miner's
 balance with their vaulted key (never logged). A miner-chosen type is
 projected at the miner's own cap, else the funded ceiling. An unknown

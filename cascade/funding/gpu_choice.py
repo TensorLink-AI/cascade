@@ -37,6 +37,8 @@ __all__ = [
     "GpuCatalog",
     "GpuChoice",
     "gpu_signed_segment",
+    "parse_budget_header",
+    "join_segments",
     "parse_gpu_headers",
     "wall_warning",
 ]
@@ -44,6 +46,9 @@ __all__ = [
 GPU_HEADER = "X-Gpu-Type"
 GPU_FALLBACK_HEADER = "X-Gpu-Allow-Fallback"
 GPU_MAX_PRICE_HEADER = "X-Gpu-Max-Price"
+# A miner-set TOTAL budget for one submission (all its pods, success included),
+# enforced before every rent on the miner's key. Signed with the request.
+BUDGET_HEADER = "X-Max-Total-Spend"
 
 _TRUE = ("1", "true", "yes")
 _FALSE = ("0", "false", "no")
@@ -189,3 +194,25 @@ def wall_warning(choice: GpuChoice, catalog: GpuCatalog | None) -> str:
                 f"past the {cap:.0f}s wall — the leg may stop at the wall and is judged "
                 f"as it stands")
     return ""
+
+
+def parse_budget_header(headers) -> tuple[float | None, str, dict | None]:
+    """``(budget | None, signed_part, None)`` or ``(None, "", error_body)``.
+    Absent = no budget; present = a positive, finite USD figure."""
+    raw = (headers.get(BUDGET_HEADER) or "").strip()
+    if not raw:
+        return None, "", None
+    try:
+        value = float(raw)
+    except ValueError:
+        value = float("nan")
+    if not math.isfinite(value) or value <= 0:
+        return None, "", {"code": "bad_max_total_spend",
+                          "message": f"{BUDGET_HEADER} must be a positive USD figure "
+                                     "(omit it for no budget)"}
+    return value, f"budget={raw}", None
+
+
+def join_segments(*parts: str) -> str:
+    """The signed v3 segment of several optional fields ("" when none)."""
+    return ";".join(p for p in parts if p)

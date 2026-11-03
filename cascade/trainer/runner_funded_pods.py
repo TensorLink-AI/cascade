@@ -1200,10 +1200,11 @@ class _FundedPodMixin:
             if not adopt_live and not is_king:
                 # The miner waste cap, before EVERY rent on the miner's key
                 # (a lemon re-rent and a retrain included).
-                from .miner_spend_guard import waste_cap_check
+                from .miner_spend_guard import budget_check, waste_cap_check
 
                 try:
                     waste_cap_check(self, gen)
+                    budget_check(self, gen, gpu_choice)      # the miner's own total budget
                 except _FundedLegSkip:
                     self._ledger_remove(expected_id)
                     raise

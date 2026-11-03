@@ -142,6 +142,50 @@ def trip(runner, gen, entry, s, cap: float) -> None:
                          "re-fund or contact the operator — your submission is kept"))
 
 
+def budget_check(runner, gen, gpu_choice=None) -> None:
+    """Before ANY rent on a miner's key: the miner's own TOTAL budget
+    (``max_total_spend_usd``) must cover all spend so far (success included)
+    plus this leg's projection (rate × (expected wall + ready timeout)).
+    Otherwise nothing is rented and the entry parks ``paused_budget`` —
+    never failed, burned, expired or rejected. A running leg is never killed
+    for a budget overrun (Lium key budgets are the hard backstop)."""
+    from ..funding.queue import BUDGET_CLASS
+
+    e = _entry(runner, gen.hotkey)
+    budget = getattr(e, "max_total_spend_usd", None) if e is not None else None
+    if budget is None:
+        return
+    led = _ledger(runner)
+    try:
+        spent = led.summary(gen.hotkey, ref=e.ref, funded_at=e.funded_at).spend_usd if led else 0.0
+    except SpendUnknown:
+        _pause_as(runner, gen, BUDGET_CLASS, "paused: the operator's spend record for this "
+                  "submission is unreadable — nothing rented, nothing burned")
+    rnd = runner.cfg.round
+    try:
+        wall = float(runner._leg_wall_seconds())
+    except Exception:  # noqa: BLE001 — unknown wall: a full day (strict)
+        wall = 24 * 3600.0
+    hours = (wall + float(getattr(rnd, "funded_ready_timeout_seconds", 0.0) or 0.0)) / 3600.0
+    need = fallback_rate(runner, gpu_choice) * hours
+    if spent + need <= float(budget):
+        return
+    from .money_guard import alert
+
+    alert(runner, "miner_budget", gen.hotkey[:16],
+          f"{gen.hotkey[:12]} (uid {getattr(gen, 'uid', '?')}): budget ${budget:.2f}, spent "
+          f"${spent:.2f}, next leg ≈${need:.2f} — paused, nothing rented")
+    _pause_as(runner, gen, BUDGET_CLASS,
+              f"budget ${budget:.0f} {'reached' if spent >= budget else 'insufficient'} "
+              f"(${spent:.0f} spent, this leg needs ≈${need:.0f}); raise it or re-fund — "
+              "your submission is kept")
+
+
+def _pause_as(runner, gen, cls: str, msg: str) -> None:
+    runner._record_funded_failure(gen.hotkey, msg, miner_fault=False, error_class=cls, burn=False)
+    raise _FundedLegSkip(gen.hotkey)
+
+
 def capped(runner, gen) -> bool:
     """This submission tripped the cap (and was not reset / re-funded)."""
     led, e = _ledger(runner), _entry(runner, gen.hotkey)
@@ -153,5 +197,6 @@ def capped(runner, gen) -> bool:
         return True
 
 
-__all__ = ["INFRA", "MINER", "RESULT", "WASTE", "capped", "fallback_rate", "spend_end",
+__all__ = ["INFRA", "MINER", "RESULT", "WASTE", "budget_check", "capped", "fallback_rate",
+           "spend_end",
            "spend_start", "trip", "waste_cap_check"]

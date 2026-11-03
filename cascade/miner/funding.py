@@ -70,7 +70,7 @@ def prepare_funding_request(args, out, *, funding: bool, confirmation: str,
 def build_intake_headers(action, hotkey, ref, api_key, sign_fn, *, now=None,
                          label="", key_digest=None, gpu="", allow_fallback=False,
                          max_price=None, fund_action="fund", signed_ref=None,
-                         target_headers=None):
+                         target_headers=None, max_total_spend=None):
     """Keep each lane's canonical identity while sharing v2/v3 header construction.
 
     Withdrawals send neither keys nor GPU choices. A direct credential deposit
@@ -85,6 +85,12 @@ def build_intake_headers(action, hotkey, ref, api_key, sign_fn, *, now=None,
     if key_digest is None:
         key_digest = hashlib.sha256(api_key.encode()).hexdigest() if sends_key else "-"
     extra, segment = gpu_headers(gpu if action == fund_action else "", allow_fallback, max_price)
+    if max_total_spend is not None and action == fund_action:
+        from ..funding.gpu_choice import BUDGET_HEADER, join_segments
+
+        raw = repr(float(max_total_spend))
+        extra = {**extra, BUDGET_HEADER: raw}
+        segment = join_segments(segment, f"budget={raw}")
     headers = {
         "X-Miner-Hotkey": hotkey,
         "X-Commit-Ref": ref,

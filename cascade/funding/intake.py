@@ -753,11 +753,16 @@ class FundingIntake:
         return out
 
     def fund(self, headers) -> tuple[int, dict]:
+        from .gpu_choice import join_segments, parse_budget_header
+
         self.sweep_pending()
         choice, segment, gpu_err = self._gpu_choice(headers)
         if gpu_err is not None:
             return 400, gpu_err
-        status, ctx = self._auth("fund", headers, gpu_segment=segment)
+        budget, budget_part, budget_err = parse_budget_header(headers)
+        if budget_err is not None:
+            return 400, budget_err
+        status, ctx = self._auth("fund", headers, gpu_segment=join_segments(segment, budget_part))
         if status is not None:
             return status, ctx
         # Belt over the reveal check's braces: a reveal implies the hotkey was
@@ -789,7 +794,7 @@ class FundingIntake:
         if gate is not None:
             return gate
         outcome = self.queue.add(hotkey, ref, int(reveal_block), label=label,
-                                 gpu_choice=choice)
+                                 gpu_choice=choice, max_total_spend_usd=budget)
         # Vault AFTER the queue accepts (mirrors PRISM: creds stored only once
         # the row is real) — and on every accepted outcome, so a re-fund of a
         # queued entry refreshes a key that may be nearing its TTL.

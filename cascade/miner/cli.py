@@ -1364,7 +1364,7 @@ def _add_fund(sub: argparse._SubParsersAction) -> None:
                         "shown beside your hotkey in the public queue and roster. "
                         "Cosmetic only — never identity; a re-fund with a "
                         "new --label renames, without one keeps the old name.")
-    add_gpu_args(p)
+    add_gpu_args(p, budget=True)
     p.set_defaults(func=_cmd_fund)
 
 
@@ -1409,7 +1409,7 @@ def _cmd_credentials(args: argparse.Namespace) -> int:
     return OK
 
 
-def add_gpu_args(p: argparse.ArgumentParser) -> None:
+def add_gpu_args(p: argparse.ArgumentParser, *, budget: bool = False) -> None:
     """DEC-CA-0060 ``--gpu`` / ``--allow-fallback`` / ``--max-price`` on a fund
     command (lane A ``fund``, ``lane-b fund`` and ``lane-c fund``)."""
     p.add_argument("--gpu", default="",
@@ -1428,6 +1428,15 @@ def add_gpu_args(p: argparse.ArgumentParser) -> None:
                         "listing's whole-pod price, e.g. all 8 GPUs of an 8xH100; falls back to "
                         "the per-GPU price if a listing lacks it) "
                         "(default: none — you accept the listed price).")
+    if not budget:
+        return
+    p.add_argument("--max-total-spend", type=float, default=None,
+                   help="Your TOTAL budget in USD for this submission: every pod on your key, "
+                        "the successful one included. No pod is rented when what you have "
+                        "spent plus the next leg's projected cost would exceed it (the entry "
+                        "pauses, never rejected; fund again with a higher budget to resume). "
+                        "A running leg is never killed — set a Lium key budget as the hard "
+                        "backstop. Default: no budget.")
 
 
 def cli_gpu_choice(args: argparse.Namespace) -> tuple[str, bool, float | None] | None:
@@ -1490,7 +1499,8 @@ def build_fund_headers(action: str, hotkey_ss58: str, ref: str, api_key: str,
                        sign_fn, *, now=None, label: str = "",
                        key_digest: str | None = None, gpu: str = "",
                        allow_fallback: bool = False,
-                       max_price: float | None = None) -> dict[str, str]:
+                       max_price: float | None = None,
+                       max_total_spend: float | None = None) -> dict[str, str]:
     """The signed header set for one intake request (pure; testable).
 
     ``sign_fn(message: bytes) -> bytes`` is the hotkey's sr25519 signer. The
@@ -1509,7 +1519,8 @@ def build_fund_headers(action: str, hotkey_ss58: str, ref: str, api_key: str,
 
     return build_intake_headers(action, hotkey_ss58, ref, api_key, sign_fn,
                                 now=now, label=label, key_digest=key_digest, gpu=gpu,
-                                allow_fallback=allow_fallback, max_price=max_price)
+                                allow_fallback=allow_fallback, max_price=max_price,
+                                max_total_spend=max_total_spend)
 
 
 def _cli_label(args: argparse.Namespace) -> str | None:
@@ -1567,10 +1578,17 @@ def _cmd_fund(args: argparse.Namespace) -> int:
         key_hint="key itself as an argument")
     if isinstance(prepared, int):
         return prepared
+    budget = getattr(args, "max_total_spend", None) if action == "fund" else None
+    if budget is not None:
+        import math
+
+        if not math.isfinite(budget) or budget <= 0:
+            return reporter(args).fail("bad_max_total_spend",
+                                       "--max-total-spend must be a positive USD figure", USAGE)
     headers = build_fund_headers(
         action, prepared.hotkey, args.ref, prepared.api_key, prepared.sign_fn,
         label=prepared.label, gpu=prepared.choice[0], allow_fallback=prepared.choice[1],
-        max_price=prepared.choice[2])
+        max_price=prepared.choice[2], max_total_spend=budget)
     req = urllib.request.Request(f"{prepared.base}/v1/{action}", method="POST", headers=headers)
     answer = post_intake(req, out, timeout=30)
     if answer is None:

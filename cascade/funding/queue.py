@@ -53,6 +53,8 @@ __all__ = [
     "COUNTED_OPERATOR_CLASSES",
     "KEPT_POD_CLASS",
     "OPERATOR_BACKOFF_CLASSES",
+    "BUDGET_CLASS",
+    "PAUSED_BUDGET_STATUS",
     "PAUSED_SPEND_STATUS",
     "PAYER_BALANCE_CLASS",
     "SPEND_CAP_CLASS",
@@ -150,7 +152,15 @@ PAUSED_SPEND_STATUS = "paused_spend_cap"
 # The payer's balance cannot finish the leg: nothing rented, requeued with a
 # backoff, never counted against any cap (the miner tops up).
 PAYER_BALANCE_CLASS = "payer_balance"
-_PARKED = (PAUSED_STATUS, AWAITING_APPROVAL_STATUS, PAUSED_SPEND_STATUS)
+# The miner's own TOTAL budget for the submission (``max_total_spend_usd``)
+# cannot cover the next leg: the same never-reject guarantees as the waste
+# cap; a re-fund with a higher budget (or the owner) resumes it.
+BUDGET_CLASS = "budget"
+PAUSED_BUDGET_STATUS = "paused_budget"
+_PARKED = (PAUSED_STATUS, AWAITING_APPROVAL_STATUS, PAUSED_SPEND_STATUS, PAUSED_BUDGET_STATUS)
+_PARK_BY_CLASS = {APPROVAL_CLASS: AWAITING_APPROVAL_STATUS, SPEND_CAP_CLASS: PAUSED_SPEND_STATUS,
+                  BUDGET_CLASS: PAUSED_BUDGET_STATUS}
+_KEEP = object()
 
 # Public, bounded lifecycle telemetry. Never store provider error text or keys.
 PHASES = frozenset({"admitted", "waiting_admission", "preparing_data", "waiting_gpu",
@@ -158,7 +168,7 @@ PHASES = frozenset({"admitted", "waiting_admission", "preparing_data", "waiting_
                     "booting", "training", "harvesting", "evaluating",
                     "awaiting_settlement", "waiting_operator", "queued", "done",
                     "failed", "withdrawn", PAUSED_STATUS, AWAITING_APPROVAL_STATUS,
-                    "paused_spend_cap"})
+                    "paused_spend_cap", "paused_budget"})
 PHASE_REASONS = frozenset({"", "availability_check", "market_capacity", "king_priority",
                           "operator_recovery"})
 
@@ -234,6 +244,10 @@ class FundedEntry:
     gpu: str = ""
     gpu_allow_fallback: bool = False
     gpu_max_price_per_hour: float = 0.0
+    # The miner's TOTAL budget for this submission (USD; None = none): every
+    # pod on their key, success included, plus the next leg's projection
+    # must fit. Set by every fund (the latest request wins).
+    max_total_spend_usd: float | None = None
     phase: str = ""
     phase_at: float = 0.0
     phase_reason: str = ""
@@ -296,7 +310,8 @@ def _phase(entry: FundedEntry, phase: str, now: float, reason: str = "", *, forc
 
 # DEC-CA-0060 fields, written to the queue file only when set: an entry
 # without a GPU choice serialises exactly as before the fields existed.
-_GPU_FIELD_DEFAULTS = {"gpu": "", "gpu_allow_fallback": False, "gpu_max_price_per_hour": 0.0}
+_GPU_FIELD_DEFAULTS = {"gpu": "", "gpu_allow_fallback": False, "gpu_max_price_per_hour": 0.0,
+                       "max_total_spend_usd": None}
 
 
 def _gpu_fields(choice) -> dict:
@@ -435,6 +450,8 @@ class FundedQueue:
                 gpu=str(item.get("gpu", "") or ""),
                 gpu_allow_fallback=bool(item.get("gpu_allow_fallback", False)),
                 gpu_max_price_per_hour=float(item.get("gpu_max_price_per_hour", 0.0) or 0.0),
+                max_total_spend_usd=(float(item["max_total_spend_usd"])
+                                     if item.get("max_total_spend_usd") is not None else None),
                 phase=str(item.get("phase", "") or ""),
                 phase_at=float(item.get("phase_at", 0.0) or 0.0),
                 phase_reason=str(item.get("phase_reason", "") or ""),
@@ -481,7 +498,7 @@ class FundedQueue:
     # ── lifecycle ────────────────────────────────────────────────────────────
 
     def add(self, hotkey: str, ref: str, reveal_block: int, *,
-            label: str = "", gpu_choice=None) -> str:
+            label: str = "", gpu_choice=None, max_total_spend_usd=_KEEP) -> str:
         """Fund (or re-fund) a submission; returns the outcome for the caller.
 
         ``label`` (already normalised) names the entry for dashboards; an
@@ -501,6 +518,9 @@ class FundedQueue:
         including over a terminal one (a resubmit after done/failed frees the
         slot: entry cost is the compute funding, not a lifetime bar).
         """
+        budget = ({} if max_total_spend_usd is _KEEP else {
+            "max_total_spend_usd": (float(max_total_spend_usd)
+                                    if max_total_spend_usd is not None else None)})
         with self._locked() as entries:
             now = self.clock()
             prev = entries.get(hotkey)
@@ -512,13 +532,13 @@ class FundedQueue:
                     entries[hotkey] = replace(prev, last_active=now, queued_ref="",
                                               queued_reveal_block=0,
                                               label=label or prev.label,
-                                              **_gpu_fields(gpu_choice))
+                                              **_gpu_fields(gpu_choice), **budget)
                     self._save(entries)
                     return "already-queued"
                 entries[hotkey] = replace(prev, queued_ref=ref,
                                           queued_reveal_block=int(reveal_block),
                                           last_active=now, label=label or prev.label,
-                                          **_gpu_fields(gpu_choice))
+                                          **_gpu_fields(gpu_choice), **budget)
                 self._save(entries)
                 return "queued-behind"
             if prev is not None and prev.status in _PARKED:
@@ -534,7 +554,7 @@ class FundedQueue:
                     funded_at=now, last_active=now, status="queued",
                     operator_billed=False, operator_requeues=0, operator_fault_cause="",
                     infra_streak=0, not_before=0.0,
-                    label=label or prev.label, **_gpu_fields(gpu_choice)), "queued", now, force=True)
+                    label=label or prev.label, **_gpu_fields(gpu_choice), **budget), "queued", now, force=True)
                 self._save(entries)
                 return "queued" if same else "replaced"
             if prev is not None and prev.status in ("pending_reveal", "queued", "in_round"):
@@ -543,7 +563,7 @@ class FundedQueue:
                     # an actively-tended entry never TTL-expires under you.
                     entries[hotkey] = replace(prev, last_active=now,
                                               label=label or prev.label,
-                                              **_gpu_fields(gpu_choice))
+                                              **_gpu_fields(gpu_choice), **budget)
                     self._save(entries)
                     return "already-queued"
                 if prev.status == "in_round":
@@ -553,12 +573,12 @@ class FundedQueue:
                 entries[hotkey] = replace(
                     prev, ref=ref, reveal_block=int(reveal_block),
                     funded_at=now, last_active=now, status="queued",
-                    label=label or prev.label, **_gpu_fields(gpu_choice))
+                    label=label or prev.label, **_gpu_fields(gpu_choice), **budget)
                 self._save(entries)
                 return "replaced" if prev.ref != ref else "queued"
             entries[hotkey] = FundedEntry(
                 hotkey=hotkey, ref=ref, reveal_block=int(reveal_block),
-                funded_at=now, last_active=now, label=label, **_gpu_fields(gpu_choice))
+                funded_at=now, last_active=now, label=label, **_gpu_fields(gpu_choice), **budget)
             self._save(entries)
             return "queued"
 
@@ -766,7 +786,8 @@ class FundedQueue:
             now = self.clock()
             entries[hotkey] = _phase(replace(
                 e, status="queued", not_before=0.0, infra_streak=0, last_active=now,
-                operator_requeues=(0 if expect_status in (PAUSED_STATUS, PAUSED_SPEND_STATUS)
+                operator_requeues=(0 if expect_status in (PAUSED_STATUS, PAUSED_SPEND_STATUS,
+                                                          PAUSED_BUDGET_STATUS)
                                    else e.operator_requeues),
                 operator_fault_cause="" if expect_status == PAUSED_STATUS else e.operator_fault_cause,
                 operator_billed=(False if deny else e.operator_billed
@@ -807,7 +828,8 @@ class FundedQueue:
             hotkey=hotkey, ref=e.queued_ref, reveal_block=int(e.queued_reveal_block),
             funded_at=now, last_active=now, label=e.label, gpu=e.gpu,
             gpu_allow_fallback=e.gpu_allow_fallback,
-            gpu_max_price_per_hour=e.gpu_max_price_per_hour)
+            gpu_max_price_per_hour=e.gpu_max_price_per_hour,
+            max_total_spend_usd=e.max_total_spend_usd)
 
     def expire_stale(self, max_age_seconds: float | None = None) -> int:
         """Terminally expire idle queued entries past the payer-key TTL.
@@ -947,12 +969,11 @@ class FundedQueue:
                     self._after_flight(entries, hotkey)
                 self._save(entries)
                 return False
-            if error_class in (APPROVAL_CLASS, SPEND_CAP_CLASS) and not burn_attempt:
-                # Parked for a one-shot owner approval / at the miner waste
-                # cap: never re-dispatched, nothing consumed, the flight's
-                # stamps cleared; the attempt count is untouched.
-                status = (AWAITING_APPROVAL_STATUS if error_class == APPROVAL_CLASS
-                          else PAUSED_SPEND_STATUS)
+            if error_class in _PARK_BY_CLASS and not burn_attempt:
+                # Parked for an owner approval / at the miner waste cap / at
+                # the miner's own budget: never re-dispatched, nothing
+                # consumed, the flight's stamps cleared; attempts untouched.
+                status = _PARK_BY_CLASS[error_class]
                 entries[hotkey] = _phase(replace(
                     e, status=status, last_error=error[:500],
                     last_error_class=error_class, last_active=now, target_boundary=0,
@@ -1094,7 +1115,8 @@ class FundedQueue:
             if not s or s.get("ref") != e.ref or (s.get("funded_at") is not None
                                                   and float(s["funded_at"]) != e.funded_at):
                 return {}
-            return {"miner_spend_usd": s["miner_spend_usd"], "miner_waste_usd": s["miner_waste_usd"]}
+            return {"miner_spend_usd": s["miner_spend_usd"], "miner_waste_usd": s["miner_waste_usd"],
+                    "spend_usd": s["miner_spend_usd"]}
 
         return {
             "as_of": datetime.fromtimestamp(self.clock(), UTC).isoformat(),
@@ -1127,6 +1149,8 @@ class FundedQueue:
                     **({"operator_requeues": e.operator_requeues}
                        if e.operator_requeues else {}),
                     **_spent(e),
+                    **({"budget_usd": round(e.max_total_spend_usd, 2)}
+                       if e.max_total_spend_usd is not None else {}),
                     "label": e.label,
                     # DEC-CA-0060: "" = the default (cheapest fitting type)
                     "gpu": e.gpu,
