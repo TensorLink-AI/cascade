@@ -515,9 +515,10 @@ def test_leg_ttl_covers_the_cap_boot_bench_and_margin(tmp_path):
     runner.cfg.eval = SimpleNamespace(bench_hold_max_hours=2.0)
     runner._keep_funded_pod_for_bench = lambda: False
     contract = SimpleNamespace(max_train_seconds=8333)
-    assert provider_ttl_seconds(runner, contract=contract) == 8333 + 900 + 600 + 3600
+    boot = runner.cfg.round.funded_ready_timeout_seconds      # 420 since money safety II
+    assert provider_ttl_seconds(runner, contract=contract) == 8333 + boot + 600 + 3600
     runner._keep_funded_pod_for_bench = lambda: True
-    assert provider_ttl_seconds(runner, contract=contract) == 8333 + 900 + 600 + 7200 + 3600
+    assert provider_ttl_seconds(runner, contract=contract) == 8333 + boot + 600 + 7200 + 3600
     off = _runner(tmp_path, provider_ttl_margin_seconds=0)
     assert provider_ttl_seconds(off, contract=contract) == 0.0
 

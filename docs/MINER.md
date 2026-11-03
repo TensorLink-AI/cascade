@@ -674,8 +674,13 @@ cascade lane-c fund https://submissions.cascadesub.net --target mkt:returns \
 - The operator's price caps (`funded_max_price_per_hour`,
   `funded_max_leg_cost_usd`) do **not** apply to a type you chose. Your own
   `--max-price` does: USD per hour for the whole rented pod, compared
-  with the provider's listed pod price (`price_per_hour`). Without it you
-  accept the listed price.
+  with the provider's listed pod price (`price_per_hour`; a listing with
+  only a per-GPU price is compared at per-GPU price × the pod's GPU count).
+  Without `--max-price` the operator's `funded_max_price_per_hour` applies
+  to your chosen type too; `--max-price 0` is the only way to rent it
+  uncapped (you accept any listed price).
+- With `--allow-fallback`, the fallback type is rented under the LOWER of
+  your `--max-price` and the operator caps.
 - If the type is unavailable, your leg **waits** for it and requeues like any
   capacity miss: no attempt burned, nothing rented, nothing charged. That is
   the default, `allow_fallback = false`. Add `--allow-fallback` to rent the

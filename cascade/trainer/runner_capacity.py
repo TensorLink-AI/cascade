@@ -77,6 +77,18 @@ class _FundedCapacityMixin:
             "default_wall_seconds": float(default),
         }
 
+    def _fallback_price_caps(self, choice) -> dict:
+        """The default path's caps for a leg that FELL BACK from its chosen
+        type (``allow_fallback``; money safety II): the operator caps, with
+        the $/h ceiling lowered to the miner's own cap when that is lower —
+        a fallback never rents above what the miner agreed to pay."""
+        caps = dict(self._funded_price_caps())
+        own = float(getattr(choice, "max_price_per_hour", 0.0) or 0.0)
+        if own > 0:
+            op = float(caps.get("max_price_per_hour") or 0.0)
+            caps["max_price_per_hour"] = min(own, op) if op > 0 else own
+        return caps
+
     def _chosen_gpu_rent(self, choice, describe: str = "") -> tuple[tuple[str, ...], dict] | None:
         """DEC-CA-0060: ``((sku,), price_caps)`` for a miner-chosen GPU type,
         or None for the default path (no choice; a locked-type network; a

@@ -91,22 +91,30 @@ def _kept_pod_record(runner, pod_id: str):
 
 
 def _kept_past_budget(runner, pod_id: str, now: float) -> bool:
-    """``pod_id`` was kept after OUR harvest fault longer than
-    ``[round] harvest_keep_max_seconds``: release it (priced alert, run lost)."""
+    """``pod_id`` was kept after OUR harvest fault past its PRICED keep
+    (:func:`~cascade.trainer.harvest_guard.keep_budget_seconds`): release it
+    (priced alert, run lost)."""
     try:
+        from .harvest_guard import keep_budget_seconds
+
         hk, rec = _kept_pod_record(runner, pod_id)
-        limit = float(getattr(runner.cfg.round, "harvest_keep_max_seconds", 600) or 0)
-        if rec is None or not limit or time.time() - float(rec.get("kept_since") or now) < limit:
+        if rec is None:
+            return False
+        limit = keep_budget_seconds(runner, rec)
+        if time.time() - float(rec.get("kept_since") or now) < limit:
             return False
         from .box_health import BoxHealth, miner_lost_usd
         from .money_guard import alert
 
         BoxHealth.for_runner(runner).note_leg(hk, {"kept": False})
         who = "MINER" if rec.get("payer") else "operator"
+        r2 = ("the pod → R2 push was tried" if rec.get("r2_tried")
+              else "NO pod → R2 push was tried (R2 not configured or not reached)")
         alert(runner, "miner_billed_loss" if rec.get("payer") else "operator_billed_loss",
-              hk[:16], f"kept pod {pod_id} released after the {limit:.0f} s keep budget — the "
-              f"finished run is lost: ≤ ${miner_lost_usd(runner):.2f} billed to the {who}; a "
-              "retrain needs the owner's approval", severity="critical")
+              hk[:16], f"kept pod {pod_id} released after the priced keep of {limit:.0f} s "
+              f"({r2}) — the finished run is lost: ≤ ${miner_lost_usd(runner):.2f} billed to "
+              f"the {who}; its retrain is an operator make-good (owner approval)",
+              severity="critical")
         log.error("funded sweep: releasing KEPT pod %s of %s — past the %.0f s keep budget",
                   pod_id, hk[:12], limit)
         return True
@@ -668,6 +676,45 @@ class _FundedPodMixin:
                     log.warning("sweep unreachable records not persisted: %s", e)
             return since
 
+    def _sweep_finished_path(self) -> Path:
+        return Path(self.work_root) / "sweep_finished_unharvested.json"
+
+    def _sweep_finished(self, pod_id: str, now: float, *, seen: bool | None) -> float | None:
+        """``pod_id``'s persisted "last seen: exited 0, unharvested" stamp
+        (money safety II). ``seen`` True records it (first sighting kept),
+        False clears it, None only reads. Returns the stamp or None."""
+        if getattr(self, "work_root", None) is None:
+            return None
+        from ..shared.atomic import read_text_with_backup, write_text_atomic
+
+        lock = self.__dict__.setdefault("_sweep_finished_lock", threading.Lock())
+        with lock:
+            recs = self.__dict__.get("_sweep_finished_recs")
+            if recs is None:
+                recs = {}
+                try:
+                    rows, _ = read_text_with_backup(
+                        self._sweep_finished_path(),
+                        lambda t: {str(k): float(v) for k, v in dict(json.loads(t)).items()})
+                    recs.update(rows or {})
+                except Exception as e:  # noqa: BLE001 — empty: a fresh record
+                    log.debug("sweep finished-run records unreadable (%s)", e)
+                self.__dict__["_sweep_finished_recs"] = recs
+            before = dict(recs)
+            if seen is True:
+                recs.setdefault(str(pod_id), float(now))
+            elif seen is False:
+                recs.pop(str(pod_id), None)
+            for k in [k for k, v in recs.items() if now - v > self.SWEEP_UNREACHABLE_FORGET_SECONDS]:
+                recs.pop(k, None)
+            if recs != before:
+                try:
+                    write_text_atomic(self._sweep_finished_path(),
+                                      json.dumps(recs, indent=0, sort_keys=True), backup=True)
+                except OSError as e:
+                    log.warning("sweep finished-run records not persisted: %s", e)
+            return recs.get(str(pod_id))
+
     def _operator_pod_provider(self, pod):
         """The provider ``_teardown_operator_pod`` would terminate ``pod`` on."""
         from ..provision.core import LiumProvider
@@ -778,6 +825,22 @@ class _FundedPodMixin:
                               "inside the %.0fs grace (unreachable is not dead)", what, pod_id,
                               why, down, self.SWEEP_UNREACHABLE_GRACE_SECONDS)
                     return True
+                # Money safety II: its last observed state was a FINISHED,
+                # unharvested run (exit 0): an unreachable pod may still hold
+                # the only copy of a paid run — kept until the priced keep
+                # (half the run's cost, capped) is spent, never 30 min.
+                finished = self._sweep_finished(pod_id, now, seen=None)
+                if finished is not None:
+                    from .harvest_guard import keep_budget_seconds
+
+                    budget = keep_budget_seconds(self)
+                    if now - finished < budget:
+                        log.error("funded sweep: KEEPING %s %s — unreachable (%s) but last seen "
+                                  "with a FINISHED unharvested run %.0fs ago; kept for the "
+                                  "priced keep (%.0fs)", what, pod_id, why, now - finished,
+                                  budget)
+                        return True
+                    self._sweep_finished(pod_id, now, seen=False)
                 log.error("funded sweep: %s %s unreachable (%s) for %.0fs, past the %.0fs "
                           "grace — releasing", what, pod_id, why, down,
                           self.SWEEP_UNREACHABLE_GRACE_SECONDS)
@@ -798,6 +861,7 @@ class _FundedPodMixin:
                            if harvested_at < now - age]
             fresh = [(d, age) for d, age in unharvested
                      if age < self.SWEEP_UNHARVESTED_KEEP_SECONDS]
+            self._sweep_finished(pod_id, now, seen=bool(fresh))
             if fresh and _kept_past_budget(self, pod_id, now):
                 # A pod WE kept after our own harvest fault: bounded at
                 # [round] harvest_keep_max_seconds, not the 6 h restart grace —
@@ -847,7 +911,7 @@ class _FundedPodMixin:
         configured the wrapper's accounting is unchanged.
         """
         queue = self._funded_queue()
-        if queue is None or self._operator_recovery_available():
+        if queue is None or self._operator_recovery_available(hotkey):
             return more
         if not queue.set_operator_billed(hotkey, True):
             return more
@@ -859,6 +923,49 @@ class _FundedPodMixin:
             log.warning("funded leg %s: operator-side loss %d/%d — no further pod on the "
                         "miner's key this attempt", hotkey[:12], faults, self.OPERATOR_FAULT_RETRIES)
         return allowed
+
+    def _route_lost_run_to_operator(self, round_id: str, gen) -> None:
+        """A finished run of ``gen`` was lost on OUR side (money safety II):
+        its retrain is an operator make-good — gated by the owner's approval
+        (``make_good`` with the miner's loss priced in the request), then an
+        operator lane or an operator-rented pod. Without operator capacity it
+        waits (``operator_blocked``): the miner's key is never charged again.
+        Always raises (a routing exception or :class:`_FundedLegSkip`)."""
+        from ..funding.queue import OPERATOR_BLOCKED_CLASS
+        from .box_health import miner_lost_usd
+        from .money_guard import alert, gate_or_adopt
+
+        lost = miner_lost_usd(self)
+        if not self._operator_recovery_available(gen.hotkey):
+            alert(self, "lost_run_needs_operator", gen.hotkey[:16],
+                  f"{gen.hotkey[:12]}: a finished run (≤ ${lost:.2f} of the miner's money) was "
+                  "lost on our side and its retrain needs OPERATOR capacity (an operator lane "
+                  "or funded_operator_fallback) — it waits; the miner's key is not charged",
+                  severity="critical")
+            self._record_funded_failure(
+                gen.hotkey, "your finished run was lost on the operator's side; its retrain "
+                "runs on the operator's account once capacity is configured — your key is not "
+                "charged again", miner_fault=False, error_class=OPERATOR_BLOCKED_CLASS,
+                burn=False)
+            raise _FundedLegSkip(gen.hotkey)
+        lanes = self._operator_fallback_lanes()
+        gate_or_adopt(self, round_id, gen, kind="make_good", rent=not lanes, lost_usd=lost)
+        # Approved: from here on the entry is operator-billed (the next try
+        # routes through the make-good branch, never the payer's key).
+        q = self._funded_queue()
+        if q is not None:
+            with contextlib.suppress(Exception):
+                q.set_operator_billed(gen.hotkey, True)
+        from .box_health import BoxHealth
+
+        with contextlib.suppress(Exception):
+            BoxHealth.for_runner(self).forget_leg(gen.hotkey)
+        log.warning("final challenger %s: retrain after a LOST finished run — operator-billed "
+                    "make-good (%s), never on the miner's key", gen.hotkey,
+                    "operator lane" if lanes else "operator-rented pod")
+        if lanes:
+            raise _FundedOperatorFallback(gen.hotkey)
+        raise _FundedOperatorRent(gen.hotkey)
 
     def _rent_funded_host(self, round_id: str, gen: ResolvedGenerator, *, gpu_choice=None):
         """:meth:`_rent_funded_host_unguarded`; an own-key KING rent is
@@ -899,7 +1006,7 @@ class _FundedPodMixin:
         queue = self._funded_queue()
         flagged = queue.get(gen.hotkey) if queue is not None else None
         if (flagged is not None and bool(getattr(flagged, "operator_billed", False))
-                and not self._operator_recovery_available()):
+                and not self._operator_recovery_available(gen.hotkey)):
             # No operator capacity is configured, so a make-good can never run.
             # The leg retries on the miner's key with a new pod; a prior
             # allocation not confirmed released still blocks the rent (ledger
@@ -936,7 +1043,7 @@ class _FundedPodMixin:
             from .money_guard import gate_or_adopt
 
             lanes = self._operator_fallback_lanes()
-            if not lanes and self._operator_rent_allowed():
+            if not lanes and self._operator_rent_allowed(gen.hotkey):
                 # Owner 2026-11-02: never on our account without the owner's
                 # approval of THIS leg (parks awaiting_operator_approval); a
                 # leg already holding its operator pod is adopted (F1).
@@ -993,7 +1100,6 @@ class _FundedPodMixin:
         lost_leg = BoxHealth.for_runner(self).leg(gen.hotkey) if queue is not None else None
         if lost_leg and (not lost_leg.get("trained") or lost_leg.get("ref", gen.ref) != gen.ref):
             lost_leg = None
-        retrain_gated = False
         pod_live: bool | None = None
         if prior_alloc:
             # Is this leg's ledgered pod actually live and adoptable? A stale
@@ -1031,15 +1137,11 @@ class _FundedPodMixin:
                     error_class=OPERATOR_TRANSIENT_CLASS, burn=False)
                 raise _FundedLegSkip(gen.hotkey)
             else:
-                # The finished run is gone (or its pod was never kept): no
-                # blind retrain on the miner's key — the owner's approval comes
-                # BEFORE any rent (review N1/N6). Approved ⇒ an ordinary leg.
-                from .money_guard import operator_leg_gate
-
-                operator_leg_gate(self, gen, kind="retrain_after_loss", rent=True)
-                retrain_gated = True
-                lost_leg = None
-                prior_alloc = False
+                # The finished run is gone (or its pod was never kept). Money
+                # safety II: the retrain is OUR make-good — OPERATOR-billed
+                # (an operator lane or an operator-rented pod), with the
+                # owner's approval, NEVER on the miner's key again.
+                self._route_lost_run_to_operator(round_id, gen)
         # Disk guard (2026-10-31): never start a NEW leg the box may not have
         # room to finish (harvest, ledgers, pending records); also the box
         # health halt and the pre-rent canary. An adopted allocation is a live
@@ -1121,7 +1223,7 @@ class _FundedPodMixin:
                             "on an OPERATOR lane (operator-billed; "
                             "funded_operator_fallback)", gen.hotkey)
                 raise _FundedOperatorFallback(gen.hotkey)
-            if self._operator_rent_allowed():
+            if self._operator_rent_allowed(gen.hotkey):
                 # A queued entrant whose key aged out while the marketplace was
                 # sold out is not dropped: with no operator lane on file the leg
                 # rents a pod on the OPERATOR's account — ONLY once the owner
@@ -1190,6 +1292,7 @@ class _FundedPodMixin:
                 payer_credential_id=credential_id))
 
         stale_pods = 0
+        fell_back = False
         if chosen is not None:
             log.info("funded leg %s: miner-chosen GPU %s (miner cap %s; %s)",
                      gen.hotkey[:12], chosen[0][0],
@@ -1283,7 +1386,8 @@ class _FundedPodMixin:
                 else:
                     # Open market: only the types a leg started now still fits.
                     fit, caps = (self._skus_fitting_now(skus) or skus,
-                                 self._funded_price_caps())
+                                 self._fallback_price_caps(gpu_choice) if fell_back
+                                 else self._funded_price_caps())
                 from .cost_guards import doomed_leg_reason, provider_ttl_seconds
                 from .gpu_health import health_for
 
@@ -1327,27 +1431,45 @@ class _FundedPodMixin:
                     ttl_seconds=provider_ttl_seconds(self, kind="leg"),
                 )
                 if not result.ok and not result.leaked_pod:
-                    from .miner_spend_guard import spend_end
+                    from .miner_spend_guard import MAKE_GOOD, spend_end
 
                     for pod_id in allocated:
                         release_executor_of(self, pod_id)
                         if pod_id != expected_id:
                             self._ledger_remove(pod_id)
-                        # a lemon / failed rent: the miner paid for nothing
-                        spend_end(self, gen.hotkey, pod_id, outcome="waste",
-                                  reason=f"rent failed: {str(result.error)[:120]}")
+                        # A lemon (the platform never delivered it) is the
+                        # host's fault, never the miner's: booked as an
+                        # operator make-good (money safety II), not their
+                        # waste. Any other failed rent: the miner paid for
+                        # nothing — waste.
+                        # a lemon or any allocated-then-failed rent (no ssh
+                        # key pin, no identity): the host's / our fault — an
+                        # operator make-good of its cost, never their waste
+                        lemon = result.error_class != "auth"
+                        landed = getattr(result, "price_per_hour", None)
+                        if landed:
+                            # the real price, never the flat fallback (S2)
+                            from .miner_spend_guard import spend_start
+
+                            spend_start(self, gen.hotkey, pod_id, rate=landed)
+                        from .miner_spend_guard import INFRA, MINER
+
+                        spend_end(self, gen.hotkey, pod_id,
+                                  outcome=MAKE_GOOD if lemon else "waste",
+                                  kind=INFRA if lemon else MINER,
+                                  reason=f"{'post-rent failure' if lemon else 'rent failed'}: "
+                                         f"{str(result.error)[:120]}")
                 if result.ok and result.pod is not None and not is_king:
                     from .miner_spend_guard import fallback_rate, spend_start
 
                     landed = getattr(result, "price_per_hour", None)
                     spend_start(self, gen.hotkey, result.pod.instance_id,
                                 rate=landed or fallback_rate(self, gpu_choice))
-                if (not result.ok and allocated and result.error_class != "auth"
-                        and (result.leaked_pod or result.error_class != LEMON_CLASS)
-                        and self._operator_recovery_available()):
-                    queue = self._funded_queue()
-                    if queue is not None:
-                        queue.set_operator_billed(gen.hotkey, True)
+                # Review (5EvqPCMN): a failed rent / post-rent reject never
+                # proposes a FULL-leg operator make-good — what the miner lost
+                # is the reject's own cost, booked make_good with one priced
+                # alert (miner_spend_guard.note_make_good); the leg retries on
+                # their key under the bad-pod budget and the waste cap.
                 if result.ok and result.machine_id:
                     claim_executor(self, result.machine_id,
                                    result.pod.instance_id if result.pod is not None else "")
@@ -1362,11 +1484,6 @@ class _FundedPodMixin:
                     # releases the pod, keeps its executor excluded and rents
                     # again — the miner is never blamed.
                     adopted = bool(getattr(result, "adopted", False))
-                    if retrain_gated:
-                        from .money_guard import note_operator_launch
-
-                        note_operator_launch(self, gen.hotkey)
-                        BoxHealth.for_runner(self).forget_leg(gen.hotkey)
                     # The pod's REAL host, now that its ssh address is known: a
                     # listing that could not resolve hosts must never train on
                     # a quarantined/blocklisted machine (2026-11-01 05:16,
@@ -1408,13 +1525,27 @@ class _FundedPodMixin:
                                     "and renting again (%d stale pod(s) so far)",
                                     gen.hotkey[:12], result.pod.instance_id if result.pod
                                     else "?", why, stale_pods)
+                        if str(why).startswith("short pod") and result.machine_id:
+                            from ..provision.short_pods import strike
+
+                            strike(executor_id=result.machine_id,
+                                   ip=getattr(result.address, "ip", "") or "",
+                                   reason=f"{gen.hotkey[:12]}: {why}")
+                        if result.pod is not None and not is_king:
+                            # OUR post-rent reject (short pod / stale image /
+                            # slow host / NCCL) on the miner's key: an
+                            # operator make-good, never the miner's waste,
+                            # with one priced alert (money safety II).
+                            from .miner_spend_guard import MAKE_GOOD, spend_end
+
+                            spend_end(self, gen.hotkey, result.pod.instance_id,
+                                      outcome=MAKE_GOOD,
+                                      reason=f"post-rent reject: {str(why)[:120]}")
                         self._teardown_funded_pod(result.pod)
                         # A confirmed release permits the bounded replacement
                         # loop. An unconfirmed release must block another rent.
                         if result.pod and any(p.instance_id == result.pod.instance_id
                                               for p in self._load_funded_ledger()):
-                            if queue is not None and self._operator_recovery_available():
-                                queue.set_operator_billed(gen.hotkey, True)
                             result = replace(result, ok=False, error_class="infra",
                                              burn_attempt=False, leaked_pod=result.pod.instance_id)
                             break
@@ -1459,6 +1590,7 @@ class _FundedPodMixin:
                          "back to the cheapest fitting type (allow_fallback)",
                          gen.hotkey[:12], chosen[0][0])
                 chosen = None
+                fell_back = True        # min(miner cap, operator caps) from now on
                 continue
             # Sold out RIGHT NOW is not a verdict: wait for a GPU (outside the
             # rent lock, so sibling legs that find one proceed) and rent again.
@@ -1467,14 +1599,16 @@ class _FundedPodMixin:
 
             report_progress(self, "waiting_gpu", "market_capacity")
             from ..provision.payer_pool import payer_capacity
-            wait_caps = chosen[1] if chosen is not None else self._funded_price_caps()
+            wait_caps = (chosen[1] if chosen is not None else
+                         self._fallback_price_caps(gpu_choice) if fell_back
+                         else self._funded_price_caps())
             waited = self._wait_for_funded_capacity(
                 chosen[0] if chosen is not None else skus,
                 describe=f"funded leg {gen.hotkey[:12]}", hotkey=gen.hotkey,
                 capacity_probe=lambda fitting, wait_caps=wait_caps: payer_capacity(api_key, fitting, wait_caps,
                     live_claimed_executors(self), health_for(self)),
                 allow_paid_fallback=chosen is None,
-                **({"price_caps": chosen[1]} if chosen is not None else {}))
+                **({"price_caps": wait_caps} if chosen is not None or fell_back else {}))
             if waited in ("operator_rent", "operator"):
                 from .money_guard import gate_or_adopt
 
@@ -1501,13 +1635,9 @@ class _FundedPodMixin:
             # (a leaked pod keeps its ledger row for the sweep).
             if not result.leaked_pod:
                 self._ledger_remove(expected_id)
-            else:
-                # a leaked pod: its record closes now (it produced nothing); the
-                # sweep keeps trying to stop it (review S1)
-                from .miner_spend_guard import spend_end
-
-                spend_end(self, gen.hotkey, result.leaked_pod, outcome="waste",
-                          reason="leaked: teardown not confirmed")
+            # A LEAKED pod's spend record stays OPEN (money safety II): it may
+            # still bill the miner, so its cost keeps growing until the sweep
+            # CONFIRMS it gone (the sweep's teardown closes it as waste).
             msg = result.error
             if chosen is not None and result.error_class == "no_capacity":
                 msg = (f"no {chosen[0][0]} capacity (miner-chosen GPU, no fallback) before "
@@ -1842,7 +1972,19 @@ class _FundedPodMixin:
                         label, err, want)
             return ""
         if got < want:
-            return f"short pod: {got} GPU(s) visible, rented as {sku} ({want})"
+            why = f"short pod: {got} GPU(s) visible, rented as {sku} ({want})"
+            # The missing cards are the HOST's (every executor id it lists
+            # sells the same short machine): quarantine its IP, not just the
+            # executor id (money safety II; 17 post-rent rejects Oct 30-Nov 3).
+            ip = str(getattr(host, "host", "") or "")
+            if ip:
+                from ..provision.core import record_host_quarantine
+
+                record_host_quarantine(ip, f"{label}: {why}", host_fault=True)
+            # The persistent short-pod blacklist is struck ONCE, by the caller
+            # that knows the executor id (review N1): the payer reject site,
+            # the operator-leg / king lemon paths.
+            return why
         return ""
 
     def _funded_pod_too_slow(self, result, profile) -> str:
@@ -1892,9 +2034,15 @@ class _FundedPodMixin:
         try:
             leftovers = teardown_funded([pod], vault)
         except Exception as e:  # noqa: BLE001
+            from .money_watch import note_teardown
+
+            note_teardown(self, pod.instance_id, ok=False)
             log.error("funded pod %s teardown crashed (kept on ledger for the "
                       "startup sweep): %s", pod.instance_id, e)
             return
+        from .money_watch import note_teardown
+
+        note_teardown(self, pod.instance_id, ok=not leftovers)
         if leftovers:
             log.error("funded pod %s could not be confirmed gone — still "
                       "billing payer %s; kept on ledger", pod.instance_id,

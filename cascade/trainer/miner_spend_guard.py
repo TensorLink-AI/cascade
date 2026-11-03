@@ -20,7 +20,15 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from ..funding.miner_spend import INFRA, MINER, RESULT, WASTE, MinerSpend, SpendUnknown
+from ..funding.miner_spend import (
+    INFRA,
+    MAKE_GOOD,
+    MINER,
+    RESULT,
+    WASTE,
+    MinerSpend,
+    SpendUnknown,
+)
 from ..funding.queue import SPEND_CAP_CLASS
 from .faults import _FundedLegSkip
 
@@ -91,14 +99,88 @@ def close_vanished(runner) -> None:
 
 def spend_end(runner, hotkey: str, pod_id: str, *, outcome: str, reason: str = "",
               kind: str = INFRA) -> None:
-    """Close a pod's record (``result`` / ``waste``). Never raises — a
-    teardown is never blocked by bookkeeping."""
+    """Close a pod's record (``result`` / ``waste`` / ``make_good``). Never
+    raises — a teardown is never blocked by bookkeeping. An infra ``waste``
+    may file the early make-good request (:func:`early_make_good`); a
+    ``make_good`` raises the owner's make-good alert (:func:`note_make_good`)."""
     try:
         led = _any_ledger(runner)
         if led is not None and pod_id:
             led.end(hotkey or None, pod_id, outcome=outcome, reason=reason, kind=kind)
     except Exception as exc:  # noqa: BLE001
         log.warning("miner spend: could not close pod %s of %s (%s)", pod_id, hotkey[:12], exc)
+        return
+    if not hotkey:
+        return
+    if outcome == WASTE and kind == INFRA:
+        early_make_good(runner, hotkey)
+    elif outcome == MAKE_GOOD:
+        note_make_good(runner, hotkey)
+
+
+def note_make_good(runner, hotkey: str) -> None:
+    """ONE alert (refreshed) pricing what post-rent rejects / lemons on this
+    miner's key cost them — the operator owes it back. Never raises."""
+    try:
+        led, e = _ledger(runner), _entry(runner, hotkey)
+        if led is None or e is None:
+            return
+        s = led.summary(hotkey, ref=e.ref, funded_at=e.funded_at)
+        if s.make_good_usd <= 0:
+            return
+        from .money_guard import alert
+
+        n = sum(1 for p in s.pods if p.get("outcome") == MAKE_GOOD)
+        alert(runner, "miner_make_good_owed", hotkey[:16],
+              f"{hotkey[:12]}: ${s.make_good_usd:.2f} of the MINER's money went to {n} pod(s) "
+              "we rejected after the rent or that never came up (short pod / stale image / "
+              "slow host / NCCL / lemon) — operator make-good owed; not counted as their "
+              "waste", severity="critical", make_good_usd=s.make_good_usd)
+        log.error("miner spend: %s — $%.2f operator make-good owed (%d rejected/lemon pod(s))",
+                  hotkey[:12], s.make_good_usd, n)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("miner spend: make-good alert skipped (%s)", exc)
+
+
+def early_make_good(runner, hotkey: str) -> None:
+    """Money safety II: the FIRST infra loss taking a submission's infra
+    waste to ``[round] miner_waste_alert_usd`` files the
+    ``spend_cap_make_good`` owner request (and one critical alert) at once —
+    not at the next rent, one leg late. Filed once per submission. Never
+    raises; the leg itself is not paused here (the waste cap still is)."""
+    try:
+        threshold = float(getattr(runner.cfg.round, "miner_waste_alert_usd", 0.0) or 0.0)
+        if threshold <= 0:
+            return
+        led, e = _ledger(runner), _entry(runner, hotkey)
+        if led is None or e is None:
+            return
+        s = led.summary(hotkey, ref=e.ref, funded_at=e.funded_at)
+        if s.infra_waste_usd < threshold or s.make_good_requested:
+            return
+        if not led.mark_make_good_requested(hotkey, e.ref):
+            return
+        from ..funding.operator_approvals import OperatorApprovals
+        from .money_guard import alert, projected_operator_leg_cost
+
+        q = runner._funded_queue()
+        sku, rate, hours, op_cost = projected_operator_leg_cost(runner)
+        OperatorApprovals.for_work_root(runner.work_root).request(
+            Path(q.path).name, hotkey, ref=e.ref, attempt_id=e.attempt_id,
+            queue_path=str(q.path), uid=None, sku=sku, rate_per_hour=rate,
+            expected_hours=hours, projected_cost_usd=op_cost, kind="spend_cap_make_good",
+            funded_at=e.funded_at, miner_lost_usd=s.infra_waste_usd,
+            reason=(f"the miner lost ${s.infra_waste_usd:.2f} to infra failures (alert "
+                    f"threshold ${threshold:.2f})"))
+        alert(runner, "miner_waste_alert", hotkey[:16],
+              f"{hotkey[:12]}: ${s.infra_waste_usd:.2f} of the miner's money lost to infra "
+              f"failures (≥ ${threshold:.2f}) — make-good ≈${op_cost:.2f} on the operator "
+              f"account filed: `cascade-trainer approve-operator-leg {hotkey}`",
+              severity="critical")
+        log.error("miner spend: %s infra waste $%.2f ≥ $%.2f — spend_cap_make_good filed",
+                  hotkey[:12], s.infra_waste_usd, threshold)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("miner spend: early make-good request skipped (%s)", exc)
 
 
 def _pause(runner, gen, msg: str) -> None:
@@ -127,7 +209,10 @@ def waste_cap_check(runner, gen) -> None:
               f"{gen.hotkey[:12]} paused (fail closed)", severity="critical")
         _pause(runner, gen, "paused: the operator's spend record for this submission is "
                "unreadable — nothing rented, nothing burned; the operator will review")
-    if s.waste_usd < cap:
+    # the operator make-good owed (post-rent rejects, lemons) counts toward
+    # the pause too: a systemic bad-host streak must not bill the miner
+    # without bound (it is never their waste, and never a full-leg make-good)
+    if s.waste_usd + s.make_good_usd < cap:
         return
     trip(runner, gen, e, s, cap)
 
@@ -157,6 +242,8 @@ def trip(runner, gen, entry, s, cap: float) -> None:
           f"${s.waste_usd:.2f} on pods that produced nothing (cap ${cap:.2f}) — paused"
           + (f"; make-good on the operator account ≈ ${op_cost:.2f} awaits "
              f"`cascade-trainer approve-operator-leg {gen.hotkey}`" if infra else
+             f"; ${s.make_good_usd:.2f} of it is post-rent rejects / lemons we owe back "
+             "(make good that amount; no leg retrain proposed)" if s.make_good_usd else
              "; miner-side causes: a re-fund resumes it") + f". Pods: {pods}",
           severity="critical")
     log.error("miner waste cap: %s paused — $%.2f wasted of $%.2f spent (cap $%.2f)%s",
@@ -225,6 +312,7 @@ def capped(runner, gen) -> bool:
         return True
 
 
-__all__ = ["INFRA", "MINER", "RESULT", "WASTE", "budget_check", "capped", "fallback_rate",
+__all__ = ["INFRA", "MAKE_GOOD", "MINER", "RESULT", "WASTE", "budget_check", "capped",
+           "early_make_good", "fallback_rate", "note_make_good",
            "spend_end",
            "spend_start", "trip", "waste_cap_check"]

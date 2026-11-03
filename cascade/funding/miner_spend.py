@@ -33,6 +33,12 @@ from pathlib import Path
 
 MINER_SPEND_FILE = "miner_spend.json"
 RESULT, WASTE = "result", "waste"
+# A pod on the miner's key that OUR side rejected right after the rent (a
+# short pod, a stale image, a slow host, NCCL) or that never came up (a
+# lemon): the miner paid, the operator owes it back. Spend, never waste — it
+# is excluded from the miner's waste view and the waste cap, and summed as
+# ``make_good_usd`` for the owner (money safety II).
+MAKE_GOOD = "make_good"
 INFRA, MINER = "infra", "miner"
 
 
@@ -47,6 +53,8 @@ class Spend:
     infra_waste_usd: float
     pods: tuple[dict, ...]
     capped: bool
+    make_good_usd: float = 0.0
+    make_good_requested: bool = False
 
 
 def _cost(p: dict, now: float) -> float:
@@ -181,6 +189,16 @@ class MinerSpend:
                 self._save(recs)
             return n
 
+    def mark_make_good_requested(self, hotkey: str, ref: str) -> bool:
+        """Mark the early make-good request as filed; False if it already was."""
+        with self._locked() as recs:
+            r = recs.get(self._key(hotkey, ref))
+            if r is None or r.get("make_good_requested"):
+                return False
+            r["make_good_requested"] = True
+            self._save(recs)
+            return True
+
     def mark_capped(self, hotkey: str, ref: str, capped: bool = True) -> None:
         with self._locked() as recs:
             k = self._key(hotkey, ref)
@@ -208,9 +226,12 @@ class MinerSpend:
         pods = tuple(dict(p) for p in r["pods"])
         spend = sum(_cost(p, now) for p in pods)
         waste = [p for p in pods if p.get("outcome") == WASTE]
+        owed = [p for p in pods if p.get("outcome") == MAKE_GOOD]
         return Spend(round(spend, 2), round(sum(_cost(p, now) for p in waste), 2),
                      round(sum(_cost(p, now) for p in waste if p.get("kind", INFRA) == INFRA), 2),
-                     pods, bool(r.get("capped")))
+                     pods, bool(r.get("capped")),
+                     make_good_usd=round(sum(_cost(p, now) for p in owed), 2),
+                     make_good_requested=bool(r.get("make_good_requested")))
 
     def public(self) -> dict[tuple[str, str], dict]:
         """``{(hotkey, ref): {miner_spend_usd, miner_waste_usd, funded_at}}``."""

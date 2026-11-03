@@ -666,6 +666,9 @@ class LegOps:
                                manifest.round_id)
         log.info("published manifest round=%s entries=%d signed=True → %s",
                  manifest.round_id, len(manifest.entries), key)
+        from .money_watch import note_published_settlement
+
+        note_published_settlement(self.r, manifest)       # the rejected-receipt watch
         self.r._publish_training_summary(manifest)
 
     def publish_bench(self, round_id: str, created_block: int, entries: list, *,
@@ -1294,14 +1297,14 @@ class RollingScheduler:
                 log.warning("rolling: in-flight leg %s targets unknown era %d — requeued",
                             e.hotkey[:12], e.era_index)
                 queue.requeue(e.hotkey, error="trainer restarted; era state lost",
-                              error_class="infra", burn_attempt=False)
+                              error_class="infra", burn_attempt=False, backoff=False)
                 continue
             gen = ResolvedGen(e.hotkey, self._uid_of(client, e.hotkey), e.ref, e.reveal_block)
             if v2_era_active(self.cfg, era.start_block) and (
                     e.training_init != era.warm_start_ckpt
                     or e.training_contract_digest != self._contract_identity(era)):
                 queue.requeue(e.hotkey, error="in-flight init/contract is missing or incompatible after restart",
-                              error_class="infra", burn_attempt=False, operator_billed=True)
+                              error_class="infra", burn_attempt=False, backoff=False, operator_billed=True)
                 continue
             started, target = self._flight_stamp(e, era, block, queue)
             self._launch_leg(gen, era, started, target, e.label, resumed=True)
@@ -1605,7 +1608,7 @@ class RollingScheduler:
         if queue is not None:
             for leg in stale:
                 queue.requeue(leg.hotkey, error=reason,
-                              error_class="infra", burn_attempt=False, operator_billed=True)
+                              error_class="infra", burn_attempt=False, backoff=False, operator_billed=True)
 
     def _roll_era(self, client, era: EraSpec, block: int) -> None:
         with self._lock:
@@ -2642,7 +2645,7 @@ class RollingScheduler:
                     log.error("rolling: superseded pod cleanup for %s failed: %s", gen.hotkey[:12], e)
                 if queue is not None:
                     queue.requeue(gen.hotkey, error="training contract changed at v2 launch",
-                                  error_class="infra", burn_attempt=False, operator_billed=True)
+                                  error_class="infra", burn_attempt=False, backoff=False, operator_billed=True)
                 return
             self._leg_walls().record(gen.ref, self.clock() - t_launch,
                                      sku=str(getattr(entry, "gpu_name", "") or ""))
@@ -2999,7 +3002,7 @@ class RollingScheduler:
                     queue.requeue(f.hotkey, error=f"trained at block {tb}, outside era "
                                   f"{cur.index}'s window [{lo}, {hi}) or contract — trainer "
                                   "fault, retrained",
-                                  error_class="infra", burn_attempt=False, operator_billed=True)
+                                  error_class="infra", burn_attempt=False, backoff=False, operator_billed=True)
             with self._lock:
                 self.state.finished = [f for f in self.state.finished if f not in bad]
                 ready = [f for f in ready if f not in bad]

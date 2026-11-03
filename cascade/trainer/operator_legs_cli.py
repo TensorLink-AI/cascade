@@ -6,6 +6,8 @@
     cascade-trainer resume-operator-leg  <hotkey> [--queue NAME]
     cascade-trainer rent-status          [--json]
     cascade-trainer resume-rents         --reason TEXT
+    cascade-trainer block-executor       <executor-id | ip> [--days N] [--reason TEXT]
+    cascade-trainer unblock-executor     <executor-id | ip>
 
 ``list`` shows legs awaiting approval (hotkey, uid, SKU, projected cost, why)
 and entries paused after operator-side faults. ``approve`` records a
@@ -21,19 +23,32 @@ entry to the queue with its operator-fault count reset — run it only once the
 cause is fixed.
 
 Pure file operations under the trainer's work root (flock'd, like the
-queue); no chain, no provider, no key material. Run them on the trainer box
-from the deployment directory (the work root and queue paths are relative).
+queue); no chain, no provider, no key material. The work root is resolved
+the same way from ANY directory (2026-11-03: run from /root, approve said
+"no pending operator-billed leg" while legs were pending under
+/root/cascade/_train_work): ``--work-root`` when given; else ``_train_work``
+beside ``--chain-toml``; else beside ``./chain.toml`` (the deployment dir);
+else under ``$CASCADE_ROOT``; else ``/root/cascade/_train_work`` when it
+exists. Every command prints the resolved queue path, and a missing queue
+file is an error (exit 2), never a silent "nothing pending".
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
+WORK_DIRNAME = "_train_work"
+DEFAULT_DEPLOY_ROOT = Path("/root/cascade")
+QUEUE_FILE = "funded_queue.json"
+
 COMMANDS = ("list-operator-legs", "approve-operator-leg", "deny-operator-leg",
-            "resume-operator-leg", "rent-status", "resume-rents")
+            "resume-operator-leg", "rent-status", "resume-rents", "block-executor",
+            "unblock-executor")
+_NO_QUEUE = ("rent-status", "resume-rents", "block-executor", "unblock-executor")
 KINDS = ("", "expired_key", "make_good", "operator_lane", "paid_fallback", "retrain_after_loss")
 
 
@@ -68,13 +83,44 @@ def _queue_for(work_root: Path, rec: dict | None, queue_name: str | None):
     return None
 
 
+def resolve_work_root(work_root: Path | None = None, *, chain_toml: Path | None = None,
+                      cwd: Path | None = None, env: dict | None = None,
+                      deploy_root: Path = DEFAULT_DEPLOY_ROOT) -> tuple[Path, str]:
+    """``(work_root, how)`` — the trainer's work root, independent of the
+    caller's CWD (see the module doc for the order)."""
+    env = os.environ if env is None else env
+    cwd = Path.cwd() if cwd is None else Path(cwd)
+    if work_root is not None:
+        return Path(work_root).expanduser().resolve(), "--work-root"
+    if chain_toml is not None:
+        return Path(chain_toml).expanduser().resolve().parent / WORK_DIRNAME, "--chain-toml"
+    if (cwd / "chain.toml").is_file():
+        return (cwd / WORK_DIRNAME).resolve(), f"chain.toml in {cwd}"
+    root = str(env.get("CASCADE_ROOT", "") or "").strip()
+    if root:
+        return Path(root).expanduser().resolve() / WORK_DIRNAME, "$CASCADE_ROOT"
+    if (deploy_root / WORK_DIRNAME).is_dir():
+        return deploy_root / WORK_DIRNAME, str(deploy_root)
+    return (cwd / WORK_DIRNAME).resolve(), "the current directory (no deployment found)"
+
+
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="cascade-trainer", description=__doc__.split("\n\n")[0])
     sub = p.add_subparsers(dest="cmd", required=True)
     for cmd in COMMANDS:
         s = sub.add_parser(cmd)
-        s.add_argument("--work-root", type=Path, default=Path("./_train_work"))
-        if cmd not in ("list-operator-legs", "rent-status", "resume-rents"):
+        s.add_argument("--work-root", type=Path, default=None,
+                       help="the trainer's work root (default: _train_work beside "
+                            "--chain-toml / ./chain.toml, else $CASCADE_ROOT, else "
+                            "/root/cascade/_train_work)")
+        s.add_argument("--chain-toml", type=Path, default=None,
+                       help="the deployment's chain.toml; its directory holds _train_work")
+        if cmd in ("block-executor", "unblock-executor"):
+            s.add_argument("ident", help="a Lium executor id, or a host IP")
+            if cmd == "block-executor":
+                s.add_argument("--days", type=float, default=7.0)
+                s.add_argument("--reason", default="blocked by the operator")
+        elif cmd not in ("list-operator-legs", "rent-status", "resume-rents"):
             s.add_argument("hotkey")
             s.add_argument("--queue", default=None,
                            help="queue file name when the hotkey has entries in several lanes")
@@ -107,8 +153,23 @@ def main(argv: list[str]) -> int:
     )
 
     args = _parser().parse_args(argv)
-    wr = Path(args.work_root)
+    wr, how = resolve_work_root(args.work_root, chain_toml=args.chain_toml)
+    queue_path = wr / QUEUE_FILE
+    # Every command names what it read (the human must see WHICH queue).
+    out = sys.stderr if getattr(args, "json", False) else sys.stdout
+    print(f"work root: {wr} (from {how}); queue: {queue_path}", file=out)
+    if not wr.is_dir():
+        print(f"error: work root {wr} does not exist — pass --work-root (the trainer's "
+              "_train_work) or run from the deployment directory", file=sys.stderr)
+        return 2
     store = OperatorApprovals.for_work_root(wr)
+    if (args.cmd not in _NO_QUEUE and not queue_path.is_file()
+            and not _queues(wr) and not Path(store.path).is_file()):
+        print(f"error: no funding queue at {queue_path} (and no approvals file) — wrong work "
+              "root? pass --work-root (nothing was read, nothing was changed)", file=sys.stderr)
+        return 2
+    if args.cmd in ("block-executor", "unblock-executor"):
+        return _short_pods_cmd(args, wr)
     if args.cmd in ("rent-status", "resume-rents"):
         return _rents(args, wr)
     if args.cmd == "list-operator-legs":
@@ -242,6 +303,34 @@ def _halt(work_root: Path) -> dict | None:
         return {"reason": f"box health unreadable: {e}"}
 
 
+def _short_pods_cmd(args, work_root: Path) -> int:
+    from ..provision import short_pods
+
+    f = work_root / short_pods.FILE_NAME
+    kind = "ip" if args.ident.count(".") == 3 else "executor"
+    if args.cmd == "block-executor":
+        short_pods.block(args.ident, kind=kind, seconds=float(args.days) * 86400.0,
+                         reason=args.reason, file=f)
+        print(f"blocked {kind} {args.ident} for {args.days:g} d ({f})")
+        return 0
+    n = short_pods.unblock(args.ident, file=f)
+    print(f"unblocked {args.ident} ({n} record(s)) in {f}")
+    return 0 if n else 1
+
+
+def _short_pod_lines(work_root: Path) -> list[str]:
+    import time as _t
+
+    from ..provision import short_pods
+
+    now = _t.time()
+    out = []
+    for k, v in sorted(short_pods.active(file=work_root / short_pods.FILE_NAME).items()):
+        out.append(f"  short-pod blacklist {k}: strikes={v.get('strikes')} for "
+                   f"{(float(v['until']) - now) / 3600:.0f} h more — {str(v.get('reason'))[:120]}")
+    return out
+
+
 def _rents(args, work_root: Path) -> int:
     from .box_health import BoxHealth
 
@@ -254,8 +343,12 @@ def _rents(args, work_root: Path) -> int:
         return 0
     st = bh.state()
     if getattr(args, "json", False):
+        from ..provision import short_pods
+
         print(json.dumps({"rents_halted": st.get("halt"), "recent_faults": st.get("events"),
-                          "legs": st.get("legs"), "last_clear": st.get("last_clear")},
+                          "legs": st.get("legs"), "last_clear": st.get("last_clear"),
+                          "short_pod_blacklist": short_pods.active(
+                              file=work_root / short_pods.FILE_NAME)},
                          indent=2, default=str))
         return 0
     h = st.get("halt")
@@ -266,6 +359,8 @@ def _rents(args, work_root: Path) -> int:
     for hk, rec in (st.get("legs") or {}).items():
         print(f"  leg {hk[:12]}: {rec.get('cls')} trained={rec.get('trained')} "
               f"kept={rec.get('kept')} pod={rec.get('pod_id')}")
+    for line in _short_pod_lines(work_root):
+        print(line)
     return 0
 
 

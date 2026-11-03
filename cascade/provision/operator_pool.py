@@ -341,11 +341,16 @@ class OperatorPool:
 
 
 def enabled(runner):
+    """Whether operator rents go through the multi-provider pool. Money safety
+    II (audit M): a spend CAP never switches the pool on by itself any more
+    (setting ``ops_operator_daily_cap_usd`` / ``ops_operator_leg_cap_usd`` used
+    to silently re-route every operator rent); ``ops_operator_pool_enabled``
+    is the explicit switch, and the pool's own features (more providers,
+    king backups, the paid fallback) still need it."""
     cfg = runner.cfg.round
     return bool(
-        cfg.ops_operator_providers != ("lium",)
-        or cfg.ops_operator_leg_cap_usd
-        or cfg.ops_operator_daily_cap_usd
+        getattr(cfg, "ops_operator_pool_enabled", False)
+        or cfg.ops_operator_providers != ("lium",)
         or cfg.ops_king_backup_after_seconds
         or cfg.ops_paid_fallback_after_seconds
     )

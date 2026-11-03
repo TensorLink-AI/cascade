@@ -22,7 +22,43 @@ def leg_corpus(runner, gen, seeds, contract, *, era_index: int | None = None) ->
     for every other leg (its dispatch stays byte-identical)."""
     if getattr(contract, "corpus_mode", "") != "shards":
         return {}
-    return {"corpus_files": runner._leg_corpus(gen, seeds, contract, era_index=era_index)}
+    # The CPU-VM tier is OPERATOR money: the per-coldkey slot covers it for
+    # every leg (money safety II, audit F); king legs are exempt; reentrant
+    # under an operator-billed leg's own slot.
+    from .admission import owner_admission
+
+    king = bool(getattr(getattr(runner, "__dict__", {}).get("_leg_local_obj"),
+                        "funded_is_king", False))
+    hotkey = str(getattr(gen, "hotkey", "") or "")
+    with owner_admission(runner, hotkey, exempt=king or not hotkey, cpu_tier=True):
+        return {"corpus_files": runner._leg_corpus(gen, seeds, contract, era_index=era_index)}
+
+
+def _ledger_only_providers(ledger, providers, gcfg) -> list:
+    """CPU adapters for every provider a VM-ledger row names that the current
+    config no longer lists (money safety II, audit M): a provider dropped from
+    ``[generation] providers`` must not leave its VMs billing unreaped."""
+    import json
+    from dataclasses import replace as _replace
+
+    try:
+        rows = json.loads(Path(ledger).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    have = {getattr(p, "name", "") for p in providers}
+    names = sorted({str(r.get("provider") or "") for r in rows if isinstance(r, dict)}
+                   - have - {""})
+    if not names:
+        return []
+    from ..provision.cpu import cpu_providers
+
+    out = []
+    for name in names:
+        try:
+            out += cpu_providers(_replace(gcfg, providers=(name,)))
+        except Exception as e:  # noqa: BLE001 — unknown provider: the row stays recorded
+            log.warning("generation VM reap: no adapter for ledger provider %s (%s)", name, e)
+    return out
 
 
 SHUTDOWN_TEARDOWN_SECONDS = 60.0
@@ -144,6 +180,7 @@ class _GenerationMixin:
         if stage is None:
             from ..generation.stage import GenerationStage
             from ..provision.cpu import cpu_providers
+            from .money_guard import BookedCpuProvider
 
             key = self._generation_ssh_key()
             pub = Path(key + ".pub").expanduser()
@@ -151,7 +188,9 @@ class _GenerationMixin:
                 raise RuntimeError(f"generation tier: no public key at {pub} for the CPU VMs")
             stage = GenerationStage(
                 cfg=self.cfg, store=self._corpus_store(),
-                providers=cpu_providers(self.cfg.generation),
+                # Money safety II: every cgen VM launch is re-checked against
+                # the operator runway / daily cap and booked at its price.
+                providers=[BookedCpuProvider(self, p) for p in cpu_providers(self.cfg.generation)],
                 ssh_key_path=key, ssh_pubkey=pub.read_text(encoding="utf-8").strip(),
                 vm_image=self.cfg.generation.vm_image,
                 ledger_path=self._generation_vm_ledger(),
@@ -290,6 +329,7 @@ class _GenerationMixin:
                 from ..provision.cpu import cpu_providers
 
                 providers = cpu_providers(self.cfg.generation)
+            providers += _ledger_only_providers(ledger, providers, self.cfg.generation)
             return reap_generation_vms(ledger, providers)
         except Exception as e:  # noqa: BLE001 — a reaper must never sink the loop
             log.warning("generation VM reap failed (retried next pass): %s", e)

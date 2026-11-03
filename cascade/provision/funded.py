@@ -26,6 +26,7 @@ grow a path that rents operator-billed pods.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
 import time
@@ -501,6 +502,13 @@ def rent_funded_pod(
                                 host_key=host_key, sku=landed, price_per_hour=price)
     except Exception as e:  # noqa: BLE001 — classify everything; the taxonomy decides
         leaked = ""
+        # The landed $/h of what was launched (money safety II: a lemon's spend
+        # record is never priced at the flat fallback when the price is known).
+        failed_price = None
+        price_fn = getattr(provider, "price_of", None)
+        if launched and callable(price_fn):
+            with contextlib.suppress(Exception):
+                failed_price = price_fn(launched[0])
         for pid in launched:
             try:
                 if not terminate_verified(provider, pid):
@@ -539,6 +547,8 @@ def rent_funded_pod(
             # Not the taxonomy's "infra" (which spends one of the miner's
             # attempts): the caller rents again on another host.
             res = replace(res, error_class=LEMON_CLASS, burn_attempt=False)
+        if failed_price:
+            res = replace(res, price_per_hour=failed_price)
         return res
 
 
@@ -610,6 +620,11 @@ def teardown_funded(
             from ..funding.providers import forget_lease
 
             try:
+                # Money safety II: a pod CONFIRMED gone resolves every create
+                # intent of its leg name — a lemon rm'd and verified gone
+                # must never leave ``create_unresolved`` blocking (and
+                # re-polling) the leg forever.
+                resolve_scope_intents(vault, inst.instance_id.removesuffix("-0"))
                 forget_lease(vault, getattr(inst, "payer_credential_id", ""))
             except OSError as e:
                 # The pod IS gone; a lease row left behind by a full disk
@@ -622,6 +637,21 @@ def teardown_funded(
                       inst.instance_id, inst.payer_hotkey)
             orphaned.append(inst)
     return orphaned
+
+
+def resolve_scope_intents(vault, scope: str) -> int:
+    """Resolve every create intent of leg name ``scope`` (its pod is
+    confirmed gone); returns how many were resolved."""
+    from ..funding.providers import create_intents, resolve_create
+
+    n = 0
+    for row in list(create_intents(vault, scope)):
+        resolve_create(vault, str(row.get("token") or ""))
+        n += 1
+    if n:
+        log.info("funded: %d create intent(s) of %s resolved — the pod is confirmed gone",
+                 n, scope)
+    return n
 
 
 def payer_pod_pattern(hotkey: str, netuid: int) -> re.Pattern:

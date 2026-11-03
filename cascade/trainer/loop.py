@@ -148,6 +148,39 @@ def _r2_fallback_available(runner) -> bool:
         return False
 
 
+def harvest_max_bytes(rnd, preset: str = "") -> int | None:
+    """The byte ceiling of one ssh checkpoint harvest: the model size's
+    expected checkpoint (``expected_checkpoint_gb_by_preset[preset]``, with
+    ``expected_checkpoint_gb`` as the floor) x ``harvest_max_bytes_factor``
+    (0 = unbounded)."""
+    table = dict(getattr(rnd, "expected_checkpoint_gb_by_preset", ()) or ())
+    gb = max(float(getattr(rnd, "expected_checkpoint_gb", 0.0) or 0.0),
+             float(table.get(str(preset or ""), 0.0) or 0.0))
+    factor = float(getattr(rnd, "harvest_max_bytes_factor", 0.0) or 0.0)
+    if gb <= 0 or factor <= 0:
+        return None
+    return int(gb * factor * (1 << 30))
+
+
+def _check_harvest_dir(remote_dir: str) -> None:
+    """A receipt's ``checkpoint_dir`` must stay inside the worker's space: a
+    path RELATIVE to the pod workdir (no ``..``, not the workdir itself), or
+    an absolute path inside a ``_train_work`` tree — never the pod's root or
+    home (the stream is size-bounded either way)."""
+    from pathlib import PurePosixPath
+
+    from .faults import CheckpointUnverifiable
+
+    path = PurePosixPath(str(remote_dir or ""))
+    parts = [p for p in path.parts if p not in (".", "")]
+    bad = (not parts or ".." in parts or parts[-1] == "_train_work"
+           or (path.is_absolute() and "_train_work" not in parts))
+    if bad:
+        raise CheckpointUnverifiable(
+            f"receipt checkpoint_dir {str(remote_dir)[:160]!r} is not inside the worker's "
+            "_train_work layout — refused, unburned")
+
+
 def _mark_harvested(runner, host, entry):
     """After a verified harvest + upload: record WHEN this pod endpoint was
     harvested (orchestrator-side, persisted), so the pod sweep knows a
@@ -777,7 +810,35 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
 
         job_id = harvest_job_id(receipt, suffix)
         dest = harvest_dir(self.work_root, seeds.base_seed, receipt.miner_hotkey, job_id=job_id)
-        harvest_remote_dir(host, receipt.checkpoint_dir, dest)
+        # Money safety II (audit B): the pod names its checkpoint dir and
+        # streams it — a hostile pod must not point us at its whole disk or
+        # fill our volume (ENOSPC halts every rent; other miners lose runs).
+        _check_harvest_dir(receipt.checkpoint_dir)
+        bound = harvest_max_bytes(self.cfg.round, contract.arch_preset)
+        try:
+            harvest_remote_dir(host, receipt.checkpoint_dir, dest, max_bytes=bound)
+        except Exception as e:  # noqa: BLE001 — only the size breach is re-classed
+            if "exceeds its storage limit" not in str(e):
+                raise
+            why = (f"checkpoint stream from {getattr(host, 'name', '?')} exceeds "
+                   f"{(bound or 0) / 1e9:.1f} GB ({contract.arch_preset}: "
+                   "expected_checkpoint_gb[_by_preset] x harvest_max_bytes_factor)")
+            payer = bool(getattr(self.__dict__.get("_leg_local_obj"), "harvest_pod_payer",
+                                 False))
+            from .money_guard import alert
+
+            alert(self, "harvest_oversize", receipt.miner_hotkey[:16],
+                  f"{why} — {'payer pod: refused as unverifiable' if payer else 'OPERATOR pod: kept; raise expected_checkpoint_gb_by_preset if the model grew'}",
+                  severity="critical")
+            if payer:
+                from .faults import CheckpointUnverifiable
+
+                raise CheckpointUnverifiable(f"{why} — refused, unburned; not a disk fault") from e
+            # review M2: on OUR pod an oversize stream is our model / our bound
+            # — an operator fault that keeps the pod, never a miner verdict
+            from .harvest_guard import HarvestKeepPod
+
+            raise HarvestKeepPod(f"{why} — operator pod kept for the re-attach") from e
         # Owner 2026-11-01: a leg path that tears its pod down at leg end arms
         # an early release; the box copy must first match the pod's own
         # listing file for file (one re-harvest on a mismatch, else kept).

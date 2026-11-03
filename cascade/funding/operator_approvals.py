@@ -47,6 +47,10 @@ PENDING, APPROVED, LAUNCHED, DENIED, CONSUMED = (
     "pending", "approved", "launched", "denied", "consumed")
 
 
+# An approval without an explicit --max-cost is bound to its projection x this.
+DEFAULT_CEILING_FACTOR = 1.25
+
+
 def _key(queue_name: str, hotkey: str) -> str:
     return f"{queue_name}:{hotkey}"
 
@@ -149,7 +153,9 @@ class OperatorApprovals:
                 queue_path: str = "", uid: int | None = None, sku: str = "",
                 rate_per_hour: float = 0.0, expected_hours: float = 0.0,
                 projected_cost_usd: float = 0.0, kind: str = "", reason: str = "",
-                funded_at: float | None = None, miner_lost_usd: float = 0.0) -> bool:
+                funded_at: float | None = None, miner_lost_usd: float = 0.0,
+                last_error: str = "", error_class: str = "",
+                evidence: dict | None = None) -> bool:
         """File (or refresh) a PENDING request; True only when it is NEW —
         the caller alerts once per request, never per poll. Never overwrites
         an owner decision that still applies to this leg."""
@@ -172,6 +178,11 @@ class OperatorApprovals:
                 "expected_hours": round(float(expected_hours), 3),
                 "projected_cost_usd": round(float(projected_cost_usd), 2),
                 "miner_lost_usd": round(float(miner_lost_usd), 2),
+                # money safety II: the owner decides on the facts — the
+                # failure that led here and what our side could prove
+                "last_error": str(last_error or "")[:400],
+                "error_class": str(error_class or ""),
+                "evidence": dict(evidence or {}),
                 "state": PENDING,
                 "request_attempt_id": attempt_id if fresh else prev.get("request_attempt_id", ""),
                 "requested_at": now if fresh else prev.get("requested_at", now),
@@ -191,6 +202,22 @@ class OperatorApprovals:
                 return False
             recs[k] = {**r, "state": LAUNCHED, "launched_attempt_id": attempt_id,
                        "launched_at": self.clock(), "launched_cost_usd": round(cost_usd, 2)}
+            self._save(recs)
+            return True
+
+    def require_reapproval(self, queue_name: str, hotkey: str, *, cost_usd: float,
+                           reason: str) -> bool:
+        """The landed cost broke the approval's ceiling: the approval is
+        withdrawn and the request is PENDING again at the real cost (one new
+        owner decision). False when there was no approval to withdraw."""
+        with self._locked() as recs:
+            k = _key(queue_name, hotkey)
+            r = recs.get(k)
+            if not r or r.get("state") != APPROVED:
+                return False
+            recs[k] = {**r, "state": PENDING, "projected_cost_usd": round(float(cost_usd), 2),
+                       "reason": reason[:400], "max_cost_usd": None,
+                       "requested_at": self.clock(), "last_seen_at": self.clock()}
             self._save(recs)
             return True
 
@@ -244,6 +271,11 @@ class OperatorApprovals:
                      "request_attempt_id": "", "requested_at": self.clock()}
             else:
                 raise LookupError(f"no pending operator-billed leg for {hotkey}")
+            if approve and max_cost_usd is None and float(r.get("projected_cost_usd") or 0) > 0:
+                # money safety II: an approval is never open-ended — default
+                # ceiling = the projection x DEFAULT_CEILING_FACTOR; a landed
+                # cost above it needs a new approval
+                max_cost_usd = round(float(r["projected_cost_usd"]) * DEFAULT_CEILING_FACTOR, 2)
             rec = {**r, "state": APPROVED if approve else DENIED, "decided_at": self.clock(),
                    "max_cost_usd": (float(max_cost_usd) if approve and max_cost_usd is not None
                                     else None)}

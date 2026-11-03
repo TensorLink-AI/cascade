@@ -282,7 +282,7 @@ def test_approved_leg_books_spend_only_at_launch_and_lasts_for_the_leg(tmp_path,
     assert q.get(HK).status == "queued"
     _redispatch(q)
     assert money_guard.operator_leg_gate(r, GEN, kind="expired_key", rent=True) is None
-    assert money_guard.OperatorSpend.for_runner(r).total() == 0.0      # nothing rented yet
+    assert money_guard.OperatorSpend.for_runner(r).rows() == []        # nothing rented yet
     # the rent found no capacity: requeued, and the approval SURVIVES (F3)
     q.requeue(HK, error="sold out", error_class="no_capacity", burn_attempt=False)
     _redispatch(q)
@@ -359,6 +359,7 @@ def test_cli_lists_pending_and_paused(tmp_path, capsys):
 def test_trainer_main_dispatches_the_subcommands(tmp_path, capsys):
     from cascade.trainer.main import main
 
+    FundedQueue(tmp_path / "funded_queue.json").add(HK, REF, 10)
     assert main(["list-operator-legs", "--work-root", str(tmp_path)]) == 0
     assert "no operator-billed legs" in capsys.readouterr().out
 
@@ -417,6 +418,9 @@ def test_balance_shortfall_refuses_the_leg_only_and_the_king_still_rents(tmp_pat
         def launch(self, spec):
             return ["king-0"]
 
+    # (money safety II: the RUNWAY guard holds the king too when the balance
+    # cannot cover it — here the account can, so only the leg was refused)
+    r._operator_balance_reader = lambda: 1000.0
     assert money_guard.guard_operator_provider(r, _King(), enforce=False).launch("s") == ["king-0"]
     money_guard.OperatorBreaker.for_runner(r).trip("402 BALANCE_REQUIRED on a challenger rent")
     assert money_guard.guard_operator_provider(r, _King(), enforce=False).launch("s") == ["king-0"]
