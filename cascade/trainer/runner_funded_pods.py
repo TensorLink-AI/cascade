@@ -1112,6 +1112,13 @@ class _FundedPodMixin:
                 log.warning("funded leg %s: ledgered pod %s is not live — a fresh rent, every "
                             "rent guard applies", gen.hotkey[:12], expected_id)
                 prior_alloc = False
+                # The lost pod's own rent closes at its LAST-SEEN-ALIVE time as
+                # infra waste (a host loss) — before the fresh rent of the same
+                # pod name can open (2026-11-03 5EvqPCMN).
+                from .miner_spend_guard import spend_end
+
+                spend_end(self, gen.hotkey, expected_id, outcome="waste", at_last_seen=True,
+                          reason="lost: not live at re-attach (closed at its last-seen time)")
         if lost_leg is not None:
             from ..funding.queue import OPERATOR_DISK_CLASS, OPERATOR_TRANSIENT_CLASS
 
@@ -1364,7 +1371,13 @@ class _FundedPodMixin:
                     if not is_king:
                         from .miner_spend_guard import fallback_rate, spend_start
 
-                        spend_start(self, gen.hotkey, pod_id, rate=fallback_rate(self, gpu_choice))
+                        # a fresh create (a machine id) is a NEW rent record —
+                        # never the previous rent of this reused pod name;
+                        # an adopted allocation ("" machine) updates its own
+                        spend_start(self, gen.hotkey, pod_id, rate=fallback_rate(self, gpu_choice),
+                                    new_rent=bool(machine_id),
+                                    rent_id=f"{machine_id}@{time.time():.0f}" if machine_id
+                                    else "")
                     if selected_provider["credential_id"]:
                         self._ledger_add(PodInstance(
                             provider=selected_provider["name"], instance_id=pod_id, stage="funded",

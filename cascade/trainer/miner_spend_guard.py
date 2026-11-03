@@ -58,13 +58,17 @@ def fallback_rate(runner, gpu_choice=None) -> float:
     return own or float(getattr(runner.cfg.round, "funded_max_price_per_hour", 0.0) or 0.0)
 
 
-def spend_start(runner, hotkey: str, pod_id: str, *, rate: float) -> None:
-    """A pod allocated on the miner's key. Best-effort (never raises)."""
+def spend_start(runner, hotkey: str, pod_id: str, *, rate: float, new_rent: bool = False,
+                rent_id: str = "") -> None:
+    """A pod allocated on the miner's key (``new_rent``: a fresh create — a
+    new record, never the previous rent of the same pod name). Best-effort
+    (never raises)."""
     try:
         led, e = _ledger(runner), _entry(runner, hotkey)
         if led is None or e is None:
             return
-        led.start(hotkey, ref=e.ref, funded_at=e.funded_at, pod_id=pod_id, rate=rate)
+        led.start(hotkey, ref=e.ref, funded_at=e.funded_at, pod_id=pod_id, rate=rate,
+                  new_rent=new_rent, rent_id=rent_id)
     except Exception as exc:  # noqa: BLE001 — accounting never blocks a rent
         log.warning("miner spend: could not record pod %s of %s (%s)", pod_id, hotkey[:12], exc)
 
@@ -98,7 +102,7 @@ def close_vanished(runner) -> None:
 
 
 def spend_end(runner, hotkey: str, pod_id: str, *, outcome: str, reason: str = "",
-              kind: str = INFRA) -> None:
+              kind: str = INFRA, at_last_seen: bool = False) -> None:
     """Close a pod's record (``result`` / ``waste`` / ``make_good``). Never
     raises — a teardown is never blocked by bookkeeping. An infra ``waste``
     may file the early make-good request (:func:`early_make_good`); a
@@ -106,7 +110,8 @@ def spend_end(runner, hotkey: str, pod_id: str, *, outcome: str, reason: str = "
     try:
         led = _any_ledger(runner)
         if led is not None and pod_id:
-            led.end(hotkey or None, pod_id, outcome=outcome, reason=reason, kind=kind)
+            led.end(hotkey or None, pod_id, outcome=outcome, reason=reason, kind=kind,
+                    at_last_seen=at_last_seen)
     except Exception as exc:  # noqa: BLE001
         log.warning("miner spend: could not close pod %s of %s (%s)", pod_id, hotkey[:12], exc)
         return
@@ -209,10 +214,12 @@ def waste_cap_check(runner, gen) -> None:
               f"{gen.hotkey[:12]} paused (fail closed)", severity="critical")
         _pause(runner, gen, "paused: the operator's spend record for this submission is "
                "unreadable — nothing rented, nothing burned; the operator will review")
-    # the operator make-good owed (post-rent rejects, lemons) counts toward
-    # the pause too: a systemic bad-host streak must not bill the miner
-    # without bound (it is never their waste, and never a full-leg make-good)
-    if s.waste_usd + s.make_good_usd < cap:
+    # The pause gates on genuine waste only (miner-side + infra host losses).
+    # A make-good owed (post-rent rejects, lemons) is OUR debt to the miner,
+    # alerted and repaid by the owner — never a reason to pause their entry
+    # (2026-11-03 5EvqPCMN). The per-attempt bad-pod budget and the short-pod
+    # blacklist bound a bad-host streak instead.
+    if s.waste_usd < cap:
         return
     trip(runner, gen, e, s, cap)
 

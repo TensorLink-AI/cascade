@@ -1358,8 +1358,15 @@ Trainer-only; nothing here reaches a manifest or a validator verdict.
   cascade-trainer block-executor f092246d-5704-4c9e-b57f-7c0710a06deb --reason "3 GPUs x2"
   ```
 * **Post-rent rejects / lemons** never propose a full-leg operator make-good:
-  their cost is booked `make_good` (one priced alert, sized to the loss) and
-  counts toward the waste-cap pause, so a bad-host streak is bounded.
+  their cost is booked `make_good` (one priced alert, sized to the loss). A
+  make-good owed is OUR debt to the miner and never counts toward the
+  waste-cap pause (that gates on genuine waste: miner-side + infra host
+  losses); the per-attempt bad-pod budget and the short-pod blacklist bound a
+  bad-host streak.
+* **Spend is booked per RENT**, never per pod name (names are reused across
+  rents): a fresh create opens its own record (`rent_id`), and a pod found
+  lost ("not live" at a re-attach, or still open when its name is rented
+  again) closes at its LAST-SEEN-ALIVE time as infra waste.
 * **Withdraw** of a live (`in_flight`, `in_round`, parked …) entry is a 409
   and keeps the key; a withdrawn entry is terminal (never requeued) and never
   gets an operator request.

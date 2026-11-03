@@ -1185,7 +1185,7 @@ def test_an_in_flight_operator_leg_keeps_its_recovery_with_the_fallback_off(tmp_
     assert _OperatorPodMixin._operator_rent_allowed(r, HK) is False      # nothing on our bill
 
 
-def test_post_rent_rejects_never_propose_a_full_leg_make_good_but_count_to_the_cap(tmp_path):
+def test_post_rent_rejects_never_propose_a_full_leg_make_good_nor_pause(tmp_path):
     import inspect
 
     from cascade.trainer import miner_spend_guard as g
@@ -1204,8 +1204,8 @@ def test_post_rent_rejects_never_propose_a_full_leg_make_good_but_count_to_the_c
         recs[led._key(HK, REF)]["pods"][0]["start"] -= 1200     # 20 min at $36/h = $12
         led._save(recs)
     g.spend_end(r, HK, "short-0", outcome=MAKE_GOOD, reason="post-rent reject: short pod")
-    with pytest.raises(_Skip):
-        g.waste_cap_check(r, SimpleNamespace(hotkey=HK, ref=REF, uid=1))   # bounded
+    # a make-good owed is OUR debt: it never pauses the miner (rc20, 5EvqPCMN)
+    g.waste_cap_check(r, SimpleNamespace(hotkey=HK, ref=REF, uid=1))
     assert OperatorApprovals.for_work_root(tmp_path).pending() == []      # no leg make-good
 
 
