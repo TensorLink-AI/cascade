@@ -117,3 +117,34 @@ def test_duplicate_stage_cannot_clear_an_existing_workers_live_marker(tmp_path):
     finally:
         with stage._LIVE_GUARD:
             stage._LIVE.discard(name)
+
+
+def test_a_pre_launch_refusal_drops_its_intent_so_the_retry_can_rent(tmp_path):
+    """2026-11-03: the runway guard refused a CPU launch BEFORE any provider
+    call, but the write-ahead intent stayed, and every retry failed with
+    "prior CPU launch needs reconciliation" until a hand edit. A
+    LaunchRefused means nothing was created: the intent goes, the retry rents."""
+    from cascade.provision.core import LaunchRefused, OperatorRentsHeld
+
+    class Refusing(FakeProvider):
+        refuse = True
+
+        def launch(self, *args, **kwargs):
+            if self.refuse:
+                raise OperatorRentsHeld("NO NEW OPERATOR RENTS: balance below reserve")
+            return super().launch(*args, **kwargs)
+
+    assert issubclass(OperatorRentsHeld, LaunchRefused)
+    provider = Refusing()
+    st, _, _ = _stage(tmp_path, provider, FakeStore())
+    st.ledger_path = tmp_path / "ledger.json"
+    with pytest.raises(stage.GenerationInfraError, match="launch failed"):
+        _go(st, tmp_path)
+    assert stage._ledger_load(st.ledger_path) == []        # no stale intent
+    assert provider.launched == []
+    provider.refuse = False
+    try:
+        _go(st, tmp_path)                                    # the retry is not blocked
+    except stage.GenerationInfraError as e:
+        assert "reconciliation" not in str(e)
+    assert len(provider.launched) == 1
