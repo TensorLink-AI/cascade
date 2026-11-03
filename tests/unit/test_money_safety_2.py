@@ -492,11 +492,11 @@ def test_a_chosen_gpu_without_max_price_takes_the_operator_cap():
 
 
 def test_the_allow_fallback_path_uses_the_lower_of_the_miner_and_operator_caps():
-    from cascade.trainer.runner_capacity import _CapacityMixin
+    from cascade.trainer.runner_capacity import _FundedCapacityMixin
 
     r = SimpleNamespace(_funded_price_caps=lambda: {"max_price_per_hour": 20.0,
                                                     "max_leg_cost_usd": 100.0})
-    f = _CapacityMixin._fallback_price_caps
+    f = _FundedCapacityMixin._fallback_price_caps
     assert f(r, SimpleNamespace(max_price_per_hour=12.0))["max_price_per_hour"] == 12.0
     assert f(r, SimpleNamespace(max_price_per_hour=30.0))["max_price_per_hour"] == 20.0
     assert f(r, SimpleNamespace(max_price_per_hour=0.0))["max_price_per_hour"] == 20.0
