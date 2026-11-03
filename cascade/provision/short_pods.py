@@ -16,6 +16,14 @@ ALL legs, payer and operator accounts, and restarts, and it is filtered in
 ``LiumProvider._list_executors`` BEFORE any rent. ``cascade-trainer
 rent-status`` shows it; ``block-executor`` / ``unblock-executor`` edit it.
 
+NOT-READY lemons (2026-11-03: executor 3cfaf487… "not ready within 420s"
+twice in one day for the same miner — its 3 h bad-executor mark had expired)
+feed the same file: :func:`not_ready_strike` records each host-side
+never-ready rent, and :data:`NOT_READY_STRIKES` of them within
+:data:`NOT_READY_WINDOW_SECONDS` (7 d) turn into an executor strike above
+(same 72 h / 7 d escalation, same IP rule). One never-ready rent alone blocks
+nothing persistent — a slow first boot happens on good hosts too.
+
 Lium's ``lium ls --format json`` carries no free-GPU field, so a listing
 cannot reveal a short machine before the rent: the strike after the first
 short rent is what keeps it out from then on.
@@ -45,6 +53,11 @@ RESTRIKE_IGNORE_SECONDS = 600.0
 # One Lium NAT IP fronts several executors: an IP is blocked only once short
 # rents hit at least this many DISTINCT executor ids behind it.
 IP_DISTINCT_EXECUTORS = 2
+
+# Never-ready (lemon) rents: this many host-side not-ready rejections of ONE
+# executor within the window block it (as one short-pod strike would).
+NOT_READY_STRIKES = 2
+NOT_READY_WINDOW_SECONDS = 7 * 86400.0
 
 _PATH: Path | None = None
 _LOCK = threading.Lock()
@@ -137,6 +150,49 @@ def strike(*, executor_id: str = "", ip: str = "", reason: str = "",
     return out
 
 
+def not_ready_strike(*, executor_id: str, ip: str = "", reason: str = "",
+                     now: float | None = None, file: Path | None = None) -> dict[str, float]:
+    """Record one host-side NEVER-READY rent of ``executor_id`` (a lemon:
+    the platform took the rent and the pod never became usable). At
+    :data:`NOT_READY_STRIKES` such rents within :data:`NOT_READY_WINDOW_SECONDS`
+    the executor (and ``ip``, under the distinct-executor rule) takes a
+    :func:`strike` — blocked 72 h, 7 d on a repeat. Returns ``{key: until}``
+    of what was blocked ({} = counted only). Callers record only host-side
+    faults, never a miner's (auth / funding / rate limit). Never raises."""
+    eid = str(executor_id or "").strip()
+    if not eid:
+        return {}
+    t = time.time() if now is None else float(now)
+    p = file or path()
+    count = 0
+    try:
+        with _locked(p):
+            doc = _load(p)
+            k = _key("notready", eid)
+            prev = doc.get(k) or {}
+            hits = [float(x) for x in (prev.get("hits") or ())
+                    if isinstance(x, (int, float)) and t - float(x) <= NOT_READY_WINDOW_SECONDS]
+            if hits and t - max(hits) < RESTRIKE_IGNORE_SECONDS:
+                return {}       # the same reject seen twice: not a second strike
+            hits.append(t)
+            count = len(hits)
+            # never "in force" itself (until 0): it only counts toward a block
+            doc[k] = {"kind": "notready", "id": eid, "hits": hits, "last_strike": t,
+                      "until": 0.0, "reason": str(reason)[:200]}
+            _save(p, doc)
+    except OSError as e:
+        log.warning("not-ready strike not recorded (%s)", e)
+        return {}
+    if count < NOT_READY_STRIKES:
+        log.warning("short-pod blacklist: executor %s never became ready (%d/%d in %.0f d; "
+                    "not blocked yet) — %s", eid, count, NOT_READY_STRIKES,
+                    NOT_READY_WINDOW_SECONDS / 86400.0, str(reason)[:160])
+        return {}
+    return strike(executor_id=eid, ip=ip, now=t, file=file,
+                  reason=f"never ready {count}x in {NOT_READY_WINDOW_SECONDS / 86400.0:.0f} d"
+                         f" (not-ready lemon): {reason}")
+
+
 def block(ident: str, *, kind: str = "executor", seconds: float = FIRST_STRIKE_SECONDS,
           reason: str = "blocked by the operator", now: float | None = None,
           file: Path | None = None) -> None:
@@ -190,5 +246,6 @@ def blocked_ids(*, now: float | None = None, file: Path | None = None) -> tuple[
             {v["id"] for v in a.values() if v.get("kind") == "ip"})
 
 
-__all__ = ["FIRST_STRIKE_SECONDS", "REPEAT_STRIKE_SECONDS", "active", "block", "blocked_ids",
+__all__ = ["FIRST_STRIKE_SECONDS", "NOT_READY_STRIKES", "NOT_READY_WINDOW_SECONDS",
+           "REPEAT_STRIKE_SECONDS", "active", "block", "blocked_ids", "not_ready_strike",
            "path", "set_path", "strike", "unblock"]

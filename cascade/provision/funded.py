@@ -208,6 +208,32 @@ def quarantine_lemon_host(provider: Provider, pod_id: str, reason: str) -> str:
     return host
 
 
+def record_not_ready_strike(provider: Provider, pod_id: str, reason: str, *,
+                            ip: str = "") -> str:
+    """Count a host-side NEVER-READY rent of ``pod_id`` against its executor
+    on the persistent blacklist (:func:`cascade.provision.short_pods.
+    not_ready_strike`; blocked at the second within 7 d). The 3 h bad mark
+    and the host quarantine the lemon path sets both expire, and the same
+    lemon was re-rented the same day (2026-11-03, 3cfaf487…). Only an
+    executor the platform LISTED the pod on counts (a ghost create proves
+    nothing about a host); the caller rules out miner-side causes. Returns
+    the executor struck ("" = none). Never raises."""
+    resolver = getattr(provider, "listed_executor_of", None)
+    if not callable(resolver):
+        return ""
+    try:
+        executor = str(resolver(pod_id) or "")
+        if executor:
+            from .short_pods import not_ready_strike
+
+            not_ready_strike(executor_id=executor, ip=str(ip or ""),
+                             reason=f"{pod_id}: {reason}")
+        return executor
+    except Exception as e:  # noqa: BLE001 — never mask the lemon
+        log.warning("lium: could not record the not-ready strike of %s: %s", pod_id, e)
+        return ""
+
+
 @dataclass(frozen=True)
 class FundedRentResult:
     """One funded rent attempt, success or classified failure."""
@@ -450,9 +476,14 @@ def rent_funded_pod(
             # The platform took the rent and delivered nothing usable: a lemon
             # host (2026-09-13: RUNNING with no ports for 900 s, four ids on
             # one machine). Remember the HOST before the pod record vanishes.
-            if classify_rent_failure(why) in {"auth", "rate_limited"}:
+            cls = classify_rent_failure(why)
+            if cls in {"auth", "rate_limited"}:
                 raise ProvisionError(why)
-            quarantine_lemon_host(provider, pod_id, why)
+            host = quarantine_lemon_host(provider, pod_id, why)
+            if cls == "infra":
+                # a plain host fault (never a miner's key / balance / limit):
+                # a persistent strike, blocked at the second within 7 d
+                record_not_ready_strike(provider, pod_id, why, ip=host)
             raise LemonPodError(why)
         addr = provider.get_ip(pod_id)
         if addr is None:
