@@ -198,3 +198,114 @@ def test_invalid_or_partial_forecasts_cannot_be_scored(tmp_path, kind):
     np.savez(path, **values)
     with pytest.raises(ValueError):
         read_forecasts(path, "identity", [window], 8)
+
+
+# ── streamed private forecasts (2026-11-03: the validator box OOM'd while a
+# duel's full sample list sat in RAM next to a trainer restart) ─────────────
+
+def _fake_transport(tmp_path, worker):
+    host = RemoteHost("targon-fixture", "fixture", user="ubuntu", port=40123,
+                      workdir=str(tmp_path / "remote"))
+    root = Path(host.workdir)
+    root.mkdir()
+
+    def run(argv, _timeout):
+        if argv[0] == "scp":
+            source, dest = (a.split(":", 1)[-1] if a.startswith("ubuntu@fixture:") else a
+                            for a in argv[-2:])
+            shutil.copyfile(source, dest)
+        else:
+            command = shlex.split(argv[-1])
+            if "mkdir" in command:
+                Path(command[-1]).mkdir(parents=True)
+            elif "cascade.validator.private_worker" in command:
+                i = command.index("cascade.validator.private_worker")
+                worker(*[str(root / name) for name in command[i + 1:i + 4]])
+            elif command[0] == "stat":
+                return SimpleNamespace(returncode=0, stdout=str(Path(command[-1]).stat().st_size))
+            elif command[0] == "rm":
+                shutil.rmtree(command[-1], ignore_errors=True)
+        return SimpleNamespace(returncode=0, stdout="")
+
+    return host, run
+
+
+def test_streamed_forecasts_are_the_same_arrays_and_release_the_local_file(checkpoint, tmp_path):
+    from cascade.validator.eval_offload import StreamedForecasts
+
+    directory, contract = checkpoint
+    host, run = _fake_transport(
+        tmp_path, lambda *p: run_request(*p, device="cpu", workers=1))
+    windows = _windows()
+    got = forecasts_via_host(host, directory, windows, contract=contract,
+                             num_samples=8, runner=run)
+    assert isinstance(got, StreamedForecasts) and len(got) == len(windows)
+    local = got.path
+    assert local.exists()
+    streamed = list(got)                       # exhausting it releases the temp dir
+    assert not local.exists()
+    (tmp_path / "again").mkdir()
+    host2, run2 = _fake_transport(
+        tmp_path / "again", lambda *p: run_request(*p, device="cpu", workers=1))
+    again = forecasts_via_host(host2, directory, windows, contract=contract,
+                               num_samples=8, runner=run2)
+    reference = read_forecasts(again.path, _identity(again), windows, 8)
+    again.close()
+    assert not again.path.exists()
+    assert len(streamed) == len(reference)
+    assert all(np.array_equal(a, b) for a, b in zip(streamed, reference, strict=True))
+
+
+def _identity(streamed):
+    with np.load(streamed.path, allow_pickle=False) as data:
+        return data["request_sha256"].tobytes().decode()
+
+
+def test_a_corrupt_reply_holds_as_infrastructure_before_any_score(checkpoint, tmp_path,
+                                                                  monkeypatch):
+    import tempfile
+
+    directory, contract = checkpoint
+    local_tmp = tmp_path / "local-tmp"
+    local_tmp.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(local_tmp))
+
+    def nan_worker(ckpt, request, output):
+        run_request(ckpt, request, output, device="cpu", workers=1)
+        with np.load(output, allow_pickle=False) as data:
+            arrays = {k: data[k].copy() for k in data.files}
+        arrays["s_1"][0, 0, 0] = np.nan       # a LATE window: the whole reply is checked first
+        np.savez(output, **arrays)
+
+    host, run = _fake_transport(tmp_path, nan_worker)
+    with pytest.raises(PrivateEvalUnavailable):
+        forecasts_via_host(host, directory, _windows(), contract=contract,
+                           num_samples=8, runner=run)
+    assert not list(local_tmp.iterdir())       # the local copy is released on failure
+
+
+def test_evaluate_closes_the_stream_after_scoring(checkpoint, cfg, monkeypatch):
+    from cascade.validator import eval_offload
+    from cascade.validator.evaluation import EvaluationMixin
+
+    directory, contract = checkpoint
+    windows = _windows()
+    reference = [np.full((w.n_channels, 8, w.horizon), 1.0) for w in windows]
+    closed = []
+
+    class Fake:
+        def __iter__(self):
+            return iter(reference)
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(eval_offload, "forecasts_via_host", lambda *a, **k: Fake())
+    runner = SimpleNamespace(
+        evaluate_fn=None, _fetch_checkpoint_dir=lambda _: directory, cfg=replace(
+            cfg, eval=replace(cfg.eval, num_samples=8)),
+        private_eval_host_fn=lambda: object(), private_eval_workers=1,
+        private_eval_timeout_s=60)
+    rows = EvaluationMixin._evaluate(runner, SimpleNamespace(size=contract.arch_preset),
+                                     windows, contract)
+    assert rows and closed == [True]
