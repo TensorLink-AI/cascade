@@ -3171,7 +3171,7 @@ class RollingScheduler:
             log.warning("rolling: champion publish failed (ignored): %s", e)
         log.info("rolling: SETTLEMENT %s at boundary %d — era %d king %s + %d challenger(s)%s",
                  round_id, epoch_start, cur.index, cur.king_hotkey[:12], len(ready),
-                 f" + {len(carried)} carried (budget-deferred)" if carried else "")
+                 f" + {len(carried)} carried (budget-deferred / infra-failed)" if carried else "")
 
     def _needs_settlement_progress(self, boundary: int) -> bool:
         """Existing king-only envelopes advance auxiliary lanes and arbiters.
@@ -3277,19 +3277,30 @@ class RollingScheduler:
                 report = load_bench_report(texts[rid])
             except (ValueError, KeyError, TypeError):
                 continue
-            for d in report.budget_deferred:
+            # an INFRA-failed challenger sweep (timeout / OOM / store / a
+            # sidecar crash — never the miner's loss) is carried exactly like a
+            # budget-deferred one: our failure must not drop a clearer's verdict
+            # (2026-11-03: a lcb +0.0072 clearer timed out on our upload).
+            # Only challenger rows; the king / init can never ride (``taken`` /
+            # ``by_ptr`` below), and the carry cap bounds a persistent failure.
+            listed = list(report.budget_deferred) + [
+                f for f in report.infra_failed
+                if str(f.get("role", "challenger") or "challenger") == "challenger"]
+            for d in listed:
                 ptr = str(d.get("trained_pointer", ""))
                 f = by_ptr.get(ptr)
                 if f is None or f.hotkey in taken:
                     continue
                 n = int(self.state.vbench_carries.get(ptr, 0))
                 if n >= VBENCH_MAX_CARRIES:
-                    log.warning("rolling: %s's leg was budget-deferred again (report %s) "
+                    log.warning("rolling: %s's leg was deferred / infra-failed again (report %s) "
                                 "after %d carr%s — not carried (skipped, never a loss)",
                                 f.hotkey[:12], rid, n, "y" if n == 1 else "ies")
                     continue
-                log.info("rolling: carrying %s's budget-deferred leg (report %s, carry %d/%d)",
-                         f.hotkey[:12], rid, n + 1, VBENCH_MAX_CARRIES)
+                why = ("infra-failed" if report.infra_reason(ptr) is not None
+                       and report.deferred_reason(ptr) is None else "budget-deferred")
+                log.info("rolling: carrying %s's %s leg (report %s, carry %d/%d)",
+                         f.hotkey[:12], why, rid, n + 1, VBENCH_MAX_CARRIES)
                 out.append(f)
                 taken.add(f.hotkey)
         return out
