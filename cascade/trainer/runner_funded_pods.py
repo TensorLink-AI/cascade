@@ -95,7 +95,7 @@ def _kept_past_budget(runner, pod_id: str, now: float) -> bool:
     ``[round] harvest_keep_max_seconds``: release it (priced alert, run lost)."""
     try:
         hk, rec = _kept_pod_record(runner, pod_id)
-        limit = float(getattr(runner.cfg.round, "harvest_keep_max_seconds", 1800) or 0)
+        limit = float(getattr(runner.cfg.round, "harvest_keep_max_seconds", 600) or 0)
         if rec is None or not limit or time.time() - float(rec.get("kept_since") or now) < limit:
             return False
         from .box_health import BoxHealth, miner_lost_usd
@@ -889,6 +889,16 @@ class _FundedPodMixin:
             # that keeps recurring (a broken image, our credential setup) must
             # not keep billing the miner: after the cap the entry pauses.
             faults = int(getattr(flagged, "operator_faults", 0) or 0)
+            from .miner_spend_guard import capped
+
+            if capped(self, gen):
+                # A make-good approved after the miner waste cap: NEVER again
+                # on the miner's key — it waits for operator capacity.
+                self._record_funded_failure(
+                    gen.hotkey, "the operator make-good after the waste cap needs operator "
+                    "capacity; your key is not charged again", miner_fault=False,
+                    error_class="operator_blocked", burn=False)
+                raise _FundedLegSkip(gen.hotkey)
             if faults >= self.OPERATOR_FAULT_RETRIES:
                 self._record_funded_failure(
                     gen.hotkey, f"paused after {faults} operator-side failures; the operator "
@@ -1061,13 +1071,24 @@ class _FundedPodMixin:
                 and float(getattr(rnd, "payer_projected_rate_per_hour", 0.0) or 0.0) > 0):
             # A key that cannot pay for the whole leg never starts it: the
             # miner would pay for a pod that dies mid-run (no attempt charged).
+            from ..funding.queue import PAYER_BALANCE_CLASS
             from .money_guard import payer_balance_refusal
 
-            poor = payer_balance_refusal(self, api_key, hours=self._leg_wall_seconds() / 3600.0)
+            # A miner-chosen type is projected at the miner's own cap (an
+            # 8xH200 at $30+/h must not be under-projected at the knob) or,
+            # uncapped, at the operator's funded ceiling.
+            knob = float(getattr(rnd, "payer_projected_rate_per_hour", 0.0) or 0.0)
+            chosen_rate = (float(getattr(gpu_choice, "max_price_per_hour", 0.0) or 0.0)
+                           or float(getattr(rnd, "funded_max_price_per_hour", 0.0) or 0.0)
+                           ) if getattr(gpu_choice, "gpu", "") else 0.0
+            poor = payer_balance_refusal(self, api_key, hours=self._leg_wall_seconds() / 3600.0,
+                                         rate=max(knob, chosen_rate))
             if poor:
+                # nothing rented, requeued with a backoff — never terminal,
+                # never a burn, never counted against any cap
                 log.warning("funded leg %s: %s", gen.hotkey[:12], poor)
-                self._record_funded_failure(gen.hotkey, poor, miner_fault=True,
-                                            error_class="auth", burn=False)
+                self._record_funded_failure(gen.hotkey, poor, miner_fault=False,
+                                            error_class=PAYER_BALANCE_CLASS, burn=False)
                 raise _FundedLegSkip(gen.hotkey)
         if not api_key:
             from .money_guard import gate_or_adopt
@@ -1176,6 +1197,16 @@ class _FundedPodMixin:
                     gen.hotkey, "king still needs GPU capacity — challenger requeued",
                     miner_fault=False, error_class="no_capacity", burn=False)
                 raise _FundedLegSkip(gen.hotkey)
+            if not adopt_live and not is_king:
+                # The miner waste cap, before EVERY rent on the miner's key
+                # (a lemon re-rent and a retrain included).
+                from .miner_spend_guard import waste_cap_check
+
+                try:
+                    waste_cap_check(self, gen)
+                except _FundedLegSkip:
+                    self._ledger_remove(expected_id)
+                    raise
             if not adopt_live:
                 # The full halt check (it may probe) runs BEFORE the rent lock;
                 # under the lock only the standing verdict is read (D1).
@@ -1208,6 +1239,10 @@ class _FundedPodMixin:
 
                     report_progress(self, "booting")
                     allocated.append(pod_id)
+                    if not is_king:
+                        from .miner_spend_guard import fallback_rate, spend_start
+
+                        spend_start(self, gen.hotkey, pod_id, rate=fallback_rate(self, gpu_choice))
                     if selected_provider["credential_id"]:
                         self._ledger_add(PodInstance(
                             provider=selected_provider["name"], instance_id=pod_id, stage="funded",
@@ -1273,10 +1308,21 @@ class _FundedPodMixin:
                     ttl_seconds=provider_ttl_seconds(self, kind="leg"),
                 )
                 if not result.ok and not result.leaked_pod:
+                    from .miner_spend_guard import spend_end
+
                     for pod_id in allocated:
                         release_executor_of(self, pod_id)
                         if pod_id != expected_id:
                             self._ledger_remove(pod_id)
+                        # a lemon / failed rent: the miner paid for nothing
+                        spend_end(self, gen.hotkey, pod_id, outcome="waste",
+                                  reason=f"rent failed: {str(result.error)[:120]}")
+                if result.ok and result.pod is not None and not is_king:
+                    from .miner_spend_guard import fallback_rate, spend_start
+
+                    landed = getattr(result, "price_per_hour", None)
+                    spend_start(self, gen.hotkey, result.pod.instance_id,
+                                rate=landed or fallback_rate(self, gpu_choice))
                 if (not result.ok and allocated and result.error_class != "auth"
                         and (result.leaked_pod or result.error_class != LEMON_CLASS)
                         and self._operator_recovery_available()):
@@ -1797,6 +1843,13 @@ class _FundedPodMixin:
 
     def _teardown_funded_pod(self, pod) -> None:
         """Tear one funded pod down NOW (leg finished); ledger reflects reality."""
+        # A pod torn down without a recorded result produced nothing for the
+        # miner: close its spend record as waste (a no-op after a result).
+        from .miner_spend_guard import spend_end
+
+        spend_end(self, str(getattr(pod, "payer_hotkey", "") or ""),
+                  str(getattr(pod, "instance_id", "") or ""), outcome="waste",
+                  reason="torn down without a harvested result")
         # The leg is over: its Hub robot dies first, whatever the pod does.
         self._revoke_robot(pod)
         vault = self._payer_vault()

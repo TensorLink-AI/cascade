@@ -455,7 +455,7 @@ def test_payer_balance_check(tmp_path):
     r, _q = _gate_runner(tmp_path, payer_projected_rate_per_hour=10.0)
     r._payer_balance_reader = lambda key: 20.0
     why = money_guard.payer_balance_refusal(r, "sk", hours=3.0)
-    assert "cannot finish" in why and "$30.00" in why
+    assert why.startswith("top up: need") and "$30.00" in why and "balance $20.00" in why
     r._payer_balance_reader = lambda key: None              # unknown never blocks a miner
     assert money_guard.payer_balance_refusal(r, "sk", hours=3.0) == ""
     r2, _ = _gate_runner(tmp_path / "x")

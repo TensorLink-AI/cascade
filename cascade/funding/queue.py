@@ -53,6 +53,9 @@ __all__ = [
     "COUNTED_OPERATOR_CLASSES",
     "KEPT_POD_CLASS",
     "OPERATOR_BACKOFF_CLASSES",
+    "PAUSED_SPEND_STATUS",
+    "PAYER_BALANCE_CLASS",
+    "SPEND_CAP_CLASS",
     "OPERATOR_TRANSIENT_CLASS",
     "OPERATOR_BLOCKED_CLASS",
     "OPERATOR_DISK_CLASS",
@@ -124,7 +127,7 @@ KEPT_POD_RETRY_SECONDS = 60.0
 DISK_BACKOFF_BASE_SECONDS = 60.0
 DISK_BACKOFF_MAX_SECONDS = 600.0
 OPERATOR_BACKOFF_CLASSES = frozenset({"operator", OPERATOR_DISK_CLASS, OPERATOR_BLOCKED_CLASS,
-                                      OPERATOR_TRANSIENT_CLASS})
+                                      OPERATOR_TRANSIENT_CLASS, "payer_balance"})
 # Only these count toward the cap — and only CONSECUTIVE faults of the SAME
 # cause (a different real cause restarts the count at 1).
 COUNTED_OPERATOR_CLASSES = frozenset({"operator", KEPT_POD_CLASS})
@@ -138,14 +141,24 @@ OPERATOR_PAUSE_RESUME_SECONDS = 6 * 3600.0
 OPERATOR_FAULT_CAP = 3
 # Paused: not failed, not burned, never re-dispatched until ``resume``.
 PAUSED_STATUS = "paused"
-_PARKED = (PAUSED_STATUS, AWAITING_APPROVAL_STATUS)
+# The miner waste cap (cascade.funding.miner_spend): pods on the miner's key
+# that produced nothing reached ``[round] miner_waste_cap_usd``. Never failed,
+# burned, TTL-expired or rejected; resumed by a re-fund, the owner's
+# resume (it resets the count) or an approved operator make-good.
+SPEND_CAP_CLASS = "spend_cap"
+PAUSED_SPEND_STATUS = "paused_spend_cap"
+# The payer's balance cannot finish the leg: nothing rented, requeued with a
+# backoff, never counted against any cap (the miner tops up).
+PAYER_BALANCE_CLASS = "payer_balance"
+_PARKED = (PAUSED_STATUS, AWAITING_APPROVAL_STATUS, PAUSED_SPEND_STATUS)
 
 # Public, bounded lifecycle telemetry. Never store provider error text or keys.
 PHASES = frozenset({"admitted", "waiting_admission", "preparing_data", "waiting_gpu",
                     "waiting_launch",
                     "booting", "training", "harvesting", "evaluating",
                     "awaiting_settlement", "waiting_operator", "queued", "done",
-                    "failed", "withdrawn", PAUSED_STATUS, AWAITING_APPROVAL_STATUS})
+                    "failed", "withdrawn", PAUSED_STATUS, AWAITING_APPROVAL_STATUS,
+                    "paused_spend_cap"})
 PHASE_REASONS = frozenset({"", "availability_check", "market_capacity", "king_priority",
                           "operator_recovery"})
 
@@ -738,7 +751,7 @@ class FundedQueue:
     # ── owner actions on parked entries (cascade-trainer *-operator-leg) ────
 
     def unpark(self, hotkey: str, *, expect_status: str, deny: bool = False,
-               reason: str = "") -> bool:
+               reason: str = "", operator_billed: bool | None = None) -> bool:
         """Return a parked entry (``expect_status``: awaiting approval / paused)
         to the queue. ``deny`` additionally clears ``operator_billed`` and
         stamps :data:`DENIED_CLASS` — the leg then runs on the miner's own key
@@ -753,9 +766,11 @@ class FundedQueue:
             now = self.clock()
             entries[hotkey] = _phase(replace(
                 e, status="queued", not_before=0.0, infra_streak=0, last_active=now,
-                operator_requeues=0 if expect_status == PAUSED_STATUS else e.operator_requeues,
+                operator_requeues=(0 if expect_status in (PAUSED_STATUS, PAUSED_SPEND_STATUS)
+                                   else e.operator_requeues),
                 operator_fault_cause="" if expect_status == PAUSED_STATUS else e.operator_fault_cause,
-                operator_billed=False if deny else e.operator_billed,
+                operator_billed=(False if deny else e.operator_billed
+                                 if operator_billed is None else bool(operator_billed)),
                 last_error=(reason or e.last_error)[:500],
                 last_error_class=DENIED_CLASS if deny else e.last_error_class),
                 "queued", now, force=True)
@@ -932,15 +947,18 @@ class FundedQueue:
                     self._after_flight(entries, hotkey)
                 self._save(entries)
                 return False
-            if error_class == APPROVAL_CLASS and not burn_attempt:
-                # Parked for a one-shot owner approval: never re-dispatched,
-                # nothing consumed, the flight's stamps cleared.
+            if error_class in (APPROVAL_CLASS, SPEND_CAP_CLASS) and not burn_attempt:
+                # Parked for a one-shot owner approval / at the miner waste
+                # cap: never re-dispatched, nothing consumed, the flight's
+                # stamps cleared; the attempt count is untouched.
+                status = (AWAITING_APPROVAL_STATUS if error_class == APPROVAL_CLASS
+                          else PAUSED_SPEND_STATUS)
                 entries[hotkey] = _phase(replace(
-                    e, status=AWAITING_APPROVAL_STATUS, last_error=error[:500],
+                    e, status=status, last_error=error[:500],
                     last_error_class=error_class, last_active=now, target_boundary=0,
                     era_index=0, started_block=0, training_init=None,
                     training_contract_digest="", not_before=0.0, requeues=e.requeues + 1),
-                    AWAITING_APPROVAL_STATUS, now, force=True)
+                    status, now, force=True)
                 if was_flight and e.queued_ref:
                     self._after_flight(entries, hotkey)
                 self._save(entries)
@@ -1050,6 +1068,14 @@ class FundedQueue:
 
     # ── transparency feed ────────────────────────────────────────────────────
 
+    def _spend_view(self) -> dict:
+        try:
+            from .miner_spend import MinerSpend
+
+            return MinerSpend.beside(self.path).public()
+        except Exception:  # noqa: BLE001 — telemetry only
+            return {}
+
     def public_view(self) -> dict:
         """The queue as miners may see it — no key material, no sealed field.
 
@@ -1061,6 +1087,15 @@ class FundedQueue:
         anyway.
         """
         current = self.entries()
+        spend = self._spend_view()
+
+        def _spent(e: FundedEntry) -> dict:
+            s = spend.get(e.hotkey)
+            if not s or s.get("ref") != e.ref or (s.get("funded_at") is not None
+                                                  and float(s["funded_at"]) != e.funded_at):
+                return {}
+            return {"miner_spend_usd": s["miner_spend_usd"], "miner_waste_usd": s["miner_waste_usd"]}
+
         return {
             "as_of": datetime.fromtimestamp(self.clock(), UTC).isoformat(),
             "queued_depth": sum(1 for e in current if e.status == "queued"),
@@ -1091,6 +1126,7 @@ class FundedQueue:
                     **({"operator_faults": e.operator_faults} if e.operator_faults else {}),
                     **({"operator_requeues": e.operator_requeues}
                        if e.operator_requeues else {}),
+                    **_spent(e),
                     "label": e.label,
                     # DEC-CA-0060: "" = the default (cheapest fitting type)
                     "gpu": e.gpu,

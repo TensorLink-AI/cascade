@@ -236,6 +236,9 @@ class FundedRentResult:
     # GPU type the pod landed on (open-market rents choose per leg); ``sku``
     # as requested when the adapter cannot tell.
     sku: str = ""
+    # The landed executor's $/h (None when the adapter cannot tell): the
+    # miner-spend ledger books it (cascade.funding.miner_spend).
+    price_per_hour: float | None = None
 
 
 def _log_key_cannot_stop(hotkey: str, pod_name: str, err: Exception, api_key: str) -> None:
@@ -482,9 +485,14 @@ def rent_funded_pod(
         getter = getattr(provider, "machine_of", None)
         if getter is not None:
             machine = getter(pod_id) or ""
+        price_fn = getattr(provider, "price_of", None)
+        try:
+            price = price_fn(pod_id) if callable(price_fn) else None
+        except Exception:  # noqa: BLE001 — unknown price: the ledger falls back
+            price = None
         return FundedRentResult(hotkey=hotkey, ok=True, pod=pod, address=addr,
                                 machine_id=machine, pod_uid=pod_uid,
-                                host_key=host_key, sku=landed)
+                                host_key=host_key, sku=landed, price_per_hour=price)
     except Exception as e:  # noqa: BLE001 — classify everything; the taxonomy decides
         leaked = ""
         for pid in launched:

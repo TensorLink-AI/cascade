@@ -274,7 +274,7 @@ def handle_our_side_fault(runner, gen, exc: BaseException, *, pod_id: str, payer
         prev = bh.leg(hk) or {}
         since = prev.get("kept_since") if prev.get("pod_id") == pod_id else None
         now = time.time()
-        limit = float(getattr(runner.cfg.round, "harvest_keep_max_seconds", 1800) or 0)
+        limit = float(getattr(runner.cfg.round, "harvest_keep_max_seconds", 600) or 0)
         if since is None:
             since = now
         if limit and now - since >= limit:

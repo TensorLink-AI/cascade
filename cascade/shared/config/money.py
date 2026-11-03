@@ -21,8 +21,9 @@ MONEY_KNOBS: dict[str, tuple[object, str]] = {
     "payer_projected_rate_per_hour": (0.0, "usd"),
     "expected_checkpoint_gb": (15.0, "gb"),
     "harvest_disk_retries": (2, "count"),
-    "harvest_disk_retry_seconds": (60, "seconds"),
-    "harvest_keep_max_seconds": (1800, "seconds"),
+    "harvest_disk_retry_seconds": (30, "seconds"),
+    "harvest_keep_max_seconds": (600, "seconds"),
+    "miner_waste_cap_usd": (30.0, "usd"),
     "operator_pause_resume_seconds": (21600, "seconds"),
     "box_fault_window_seconds": (7200, "seconds"),
 }

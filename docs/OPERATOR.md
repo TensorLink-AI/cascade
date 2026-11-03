@@ -733,7 +733,7 @@ noticed. Now:
   re-harvests its **kept** pod; it is never retrained. Before any rent, the
   kept pod's liveness is asked through the payer's provider. A blip is
   retried and never reads as "gone".
-  The pod is kept at most `harvest_keep_max_seconds` (1800) and is
+  The pod is kept at most `harvest_keep_max_seconds` (600) and is
   re-attached every 60 s. If the finished run is gone, the retrain needs the
   owner's approval even on the miner's key (`retrain_after_loss`), decided
   before any pod is rented. One critical alert prices what the miner
@@ -777,8 +777,44 @@ noticed. Now:
   anywhere in a leg is classed `operator` and never burns a miner attempt.
   It halts rents at once. The partial copy is dropped, space is reclaimed,
   and the harvest is retried `harvest_disk_retries` (2) times with doubling
-  waits from `harvest_disk_retry_seconds` (60). If R2 is configured, the last
+  waits from `harvest_disk_retry_seconds` (30). If R2 is configured, the last
   resort is pod → R2 directly. Otherwise the pod is kept (above).
+
+### Miner spend and the waste cap
+
+Every pod rented on a miner's key is recorded per submission (ref +
+funding; a re-fund starts a fresh count) in `_train_work/miner_spend.json`.
+Each record holds:
+* the landed $/h (else the miner's or the funded price cap);
+* start and end;
+* the outcome: a harvested, verified result, or waste. Waste covers a
+  lemon, a lost or unreachable host, a crash, an our-side fault, or a pod
+  kept during our re-harvest that never produced.
+
+The queue's public view shows `miner_spend_usd` / `miner_waste_usd`, rounded
+dollars. Before **every** rent on a miner's key (a fresh leg, a retry, a
+lemon re-rent, a retrain after a loss), waste at or above `[round]
+miner_waste_cap_usd` (30; 0 = off) pauses the entry as `paused_spend_cap`:
+* It is never failed, burned or rejected. The payer-key TTL, era rollovers
+  and the attempt cap don't touch it. Its reveal keeps its seniority: the
+  only reveal check is the fixed competition opening, never reveal age.
+* One critical `miner_waste_cap` alert lists the spend, the waste and the
+  pods.
+* **Infra / our-side waste** files a `spend_cap_make_good` approval. Approve
+  (`approve-operator-leg <hotkey>`) and the leg finishes **operator-billed**
+  through the normal gates; it never runs on the miner's key again. Deny and
+  it stays paused until a miner re-fund.
+* **Miner-caused waste** is a pause only; a re-fund resumes it. Generator
+  faults still fail by the normal rules.
+* `resume-operator-leg <hotkey>` resumes and resets the count. An unreadable
+  ledger fails closed: the entry is paused, nothing rented.
+
+The payer-balance check (`payer_projected_rate_per_hour`) reads the miner's
+balance with their vaulted key (never logged). A miner-chosen type is
+projected at the miner's own cap, else the funded ceiling. An unknown
+balance is retried and then the rent proceeds. A shortfall requeues
+unburned as `payer_balance` ("top up: need ≈$X, balance $Y"), never counted
+against any cap.
 
 **The new knobs need no TOML change.** Every default above is live as
 shipped. Integral floats such as `3600.0` are accepted for every

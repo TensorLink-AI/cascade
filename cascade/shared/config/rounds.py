@@ -366,11 +366,16 @@ class RoundConfig:
     # retries the harvest this many times (space reclaimed in between) before
     # the leg is requeued unburned with the pod kept for the re-attach.
     harvest_disk_retries: int = 2
-    harvest_disk_retry_seconds: int = 60
+    harvest_disk_retry_seconds: int = 30
     # A pod KEPT after OUR disk failed its harvest may bill the MINER: kept at
     # most this long (then released with a critical "miner-billed loss"
     # alert so the owner can make it good). Review F6.
-    harvest_keep_max_seconds: int = 1800
+    harvest_keep_max_seconds: int = 600
+    # Miner waste cap (cascade.funding.miner_spend): pods on a miner's key
+    # that produced nothing, summed per submission (ref + funding), at or
+    # above this pause the entry ("paused_spend_cap": never failed, burned,
+    # expired or rejected). 0 = off.
+    miner_waste_cap_usd: float = 30.0
     # A paused entry (operator-fault cap) resumes by itself after this long;
     # 0 = manual `cascade-trainer resume-operator-leg` only.
     operator_pause_resume_seconds: int = 21600

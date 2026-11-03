@@ -88,6 +88,9 @@ def _parser() -> argparse.ArgumentParser:
                            help="a pre-approval (no pending request) for this kind only")
         if cmd in ("list-operator-legs", "rent-status"):
             s.add_argument("--json", action="store_true")
+        if cmd == "resume-operator-leg":
+            s.add_argument("--reset-spend", action="store_true",
+                           help="also reset the miner waste count (a waste-cap pause always does)")
         if cmd == "resume-rents":
             s.add_argument("--reason", required=True,
                            help="why it is safe to rent again (logged)")
@@ -96,7 +99,7 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str]) -> int:
     from ..funding.operator_approvals import OperatorApprovals
-    from ..funding.queue import AWAITING_APPROVAL_STATUS, PAUSED_STATUS
+    from ..funding.queue import AWAITING_APPROVAL_STATUS, PAUSED_SPEND_STATUS, PAUSED_STATUS
 
     args = _parser().parse_args(argv)
     wr = Path(args.work_root)
@@ -105,9 +108,10 @@ def main(argv: list[str]) -> int:
         return _rents(args, wr)
     if args.cmd == "list-operator-legs":
         pending = store.pending()
-        paused = [{"queue": q.path.name, "hotkey": e.hotkey, "ref": e.ref,
+        paused = [{"queue": q.path.name, "hotkey": e.hotkey, "ref": e.ref, "status": e.status,
                    "operator_requeues": e.operator_requeues, "last_error": e.last_error}
-                  for q in _queues(wr) for e in q.entries() if e.status == PAUSED_STATUS]
+                  for q in _queues(wr) for e in q.entries()
+                  if e.status in (PAUSED_STATUS, PAUSED_SPEND_STATUS)]
         halt = _halt(wr)
         spend = _spend(wr)
         if args.json:
@@ -142,7 +146,14 @@ def main(argv: list[str]) -> int:
                 continue
             if q.unpark(hk, expect_status=PAUSED_STATUS,
                         reason="resumed by the operator after a fault pause"):
+                if getattr(args, "reset_spend", False):
+                    _reset_spend(q, hk)
                 print(f"resumed {hk} in {q.path.name} (operator-fault count reset)")
+                return 0
+            if q.unpark(hk, expect_status=PAUSED_SPEND_STATUS,
+                        reason="resumed by the operator after the waste cap"):
+                _reset_spend(q, hk)                # a waste-cap resume IS a fresh count
+                print(f"resumed {hk} in {q.path.name} (miner waste count reset)")
                 return 0
         print(f"no paused entry for {hk}", file=sys.stderr)
         return 1
@@ -156,10 +167,19 @@ def main(argv: list[str]) -> int:
         print(f"refused: {e}", file=sys.stderr)
         return 1
     q = _queue_for(wr, rec, args.queue)
-    moved = bool(q is not None and q.unpark(
-        hk, expect_status=AWAITING_APPROVAL_STATUS, deny=not approve,
-        reason=("approved by the operator (single use)" if approve
-                else "the operator declined to pay for this leg")))
+    if rec.get("origin") == "spend_cap_make_good" or (
+            not approve and rec.get("kind") == "spend_cap_make_good"):
+        # Approve: the paused leg finishes OPERATOR-billed (never the miner's
+        # key again). Deny: it stays paused for a miner re-fund — never
+        # rejected.
+        moved = bool(approve and q is not None and q.unpark(
+            hk, expect_status=PAUSED_SPEND_STATUS, operator_billed=True,
+            reason="the operator finishes this leg on its own account (make-good)"))
+    else:
+        moved = bool(q is not None and q.unpark(
+            hk, expect_status=AWAITING_APPROVAL_STATUS, deny=not approve,
+            reason=("approved by the operator (single use)" if approve
+                    else "the operator declined to pay for this leg")))
     verb = "APPROVED (single use)" if approve else "DENIED"
     cost = rec.get("projected_cost_usd")
     print(f"{verb}: {hk} uid={rec.get('uid')} {rec.get('kind')} ~${float(cost or 0):.2f}"
@@ -169,6 +189,12 @@ def main(argv: list[str]) -> int:
     return 0
 
 
+def _reset_spend(queue, hotkey: str) -> None:
+    from ..funding.miner_spend import MinerSpend
+
+    MinerSpend.beside(queue.path).reset(hotkey)
+
+
 def _live_entry(work_root: Path, hotkey: str, queue_name: str | None, *, kind: str) -> dict | None:
     """The hotkey's live queue entry as a pre-approval binding, or None."""
     for q in _queues(work_root):
@@ -176,7 +202,7 @@ def _live_entry(work_root: Path, hotkey: str, queue_name: str | None, *, kind: s
             continue
         e = q.get(hotkey)
         if e is not None and e.status in ("queued", "in_flight", "awaiting_operator_approval",
-                                          "paused"):
+                                          "paused", "paused_spend_cap"):
             return {"queue": q.path.name, "queue_path": str(q.path), "ref": e.ref,
                     "funded_at": e.funded_at, "kind": kind}
     return None

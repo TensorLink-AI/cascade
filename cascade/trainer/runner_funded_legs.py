@@ -345,6 +345,8 @@ class _FundedLegMixin:
             # on R2 with the r2 transport) and nothing benches on this pod —
             # stop its bill before the upload / Hippius push.
             if not released:
+                # verified harvest: this pod PRODUCED the result (never waste)
+                _spend_result(self, gen.hotkey, pod)
                 self._teardown_funded_pod(pod)
                 released.append(True)
 
@@ -461,6 +463,7 @@ class _FundedLegMixin:
                 self._final_role_hosts[
                     ("challenger", contract.arch_preset, gen.hotkey)] = host
                 keep = True
+            _spend_result(self, gen.hotkey, pod)
             return entry
         except _FundedTamper as e:
             self._record_funded_failure(gen.hotkey, f"pod identity: {e}",
@@ -554,6 +557,13 @@ class _FundedLegMixin:
         finally:
             self.__dict__["_leg_local_obj"].harvest_pod_payer = False
             if not keep and not released and not hold_pod:
+                verdict = self._funded_leg_failures.get(gen.hotkey)
+                if verdict is not None and verdict[1]:
+                    # a genuine miner fault: waste of THEIR making (no make-good)
+                    from .miner_spend_guard import MINER, spend_end
+
+                    spend_end(self, gen.hotkey, str(getattr(pod, "instance_id", "") or ""),
+                              outcome="waste", reason=str(verdict[0])[:120], kind=MINER)
                 self._teardown_funded_pod(pod)
 
     def _keep_funded_pod_for_bench(self) -> bool:
@@ -650,6 +660,13 @@ def _with_leg_watchdog(runner, disp, gen, pod, contract, host=None):
                          key_check=key_check if payer else None,
                          host=str(getattr(host, "host", "") or ""))
     return disp if watch is None else replace(disp, on_progress=watch)
+
+
+def _spend_result(runner, hotkey: str, pod) -> None:
+    from .miner_spend_guard import RESULT, spend_end
+
+    spend_end(runner, hotkey, str(getattr(pod, "instance_id", "") or ""), outcome=RESULT,
+              reason="harvested and verified")
 
 
 def _harvested_in_dispatch(runner) -> bool:

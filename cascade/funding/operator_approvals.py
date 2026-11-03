@@ -247,6 +247,10 @@ class OperatorApprovals:
             rec = {**r, "state": APPROVED if approve else DENIED, "decided_at": self.clock(),
                    "max_cost_usd": (float(max_cost_usd) if approve and max_cost_usd is not None
                                     else None)}
+            if r.get("kind") == "spend_cap_make_good":
+                # finishing a waste-capped leg on the operator's account runs
+                # through the ordinary make-good gate
+                rec.update(kind="make_good", origin="spend_cap_make_good")
             recs[k] = rec
             self._save(recs)
             return dict(rec)

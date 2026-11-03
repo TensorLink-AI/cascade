@@ -414,18 +414,23 @@ def payer_balance_refusal(runner, api_key: str, *, hours: float, rate: float | N
 
         def reader(key):
             return lium_balance(api_key=key)
-    try:
-        bal = reader(api_key)
-    except Exception:  # noqa: BLE001 — unknown never blocks a miner
-        return ""
+    bal = None
+    for _ in range(3):                  # an API blip is retried; unknown never blocks
+        try:
+            bal = reader(api_key)
+        except Exception:  # noqa: BLE001 — the key is never logged
+            bal = None
+        if bal is not None:
+            break
     if bal is None:
+        log.warning("payer balance unknown after retries — the rent proceeds (its own 402 "
+                    "still classifies)")
         return ""
     need = r * float(hours)
     if bal >= need:
         return ""
-    return (f"payer balance ${bal:.2f} cannot finish this leg (~${need:.2f} projected at "
-            f"${r:.2f}/h for {hours:.1f} h) — top up, then fund again; nothing rented, no "
-            "attempt charged")
+    return (f"top up: need ≈${need:.2f} for this leg (${r:.2f}/h for {hours:.1f} h), balance "
+            f"${bal:.2f} — nothing rented, no attempt charged; it retries by itself")
 
 
 # ── the per-leg owner approval gate ─────────────────────────────────────────
