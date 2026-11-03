@@ -84,7 +84,14 @@ class ProvisionError(RuntimeError):
     """A provisioning step failed (capacity, launch, teardown, or config)."""
 
 
-class OperatorRentsHeld(ProvisionError):
+class LaunchRefused(ProvisionError):
+    """A launch refused BEFORE any provider API call: nothing was created and
+    nothing is billing. Callers that wrote a write-ahead intent may drop it
+    (2026-11-03: a runway-held CPU launch left an intent row that blocked
+    every later corpus attempt with "prior CPU launch needs reconciliation")."""
+
+
+class OperatorRentsHeld(LaunchRefused):
     """No new OPERATOR-account rent of any kind (the king's included): the
     runway guard or the daily cap holds them (cascade.trainer.money_guard).
     Not a lemon and not a capacity miss — callers wait it out, never spin."""
