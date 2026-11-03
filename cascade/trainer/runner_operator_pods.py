@@ -467,9 +467,21 @@ class _OperatorPodMixin:
         if self.cfg.round.funded_pods != "rent":
             return False
         if hotkey:
-            from .money_guard import approval_on_file
+            from .money_guard import approval_on_file, grandfathered
 
             if approval_on_file(self, hotkey):
+                return True
+            # review H3: a leg ALREADY on the operator's bill — its operator
+            # pod on the ledger, or in flight operator-billed and re-attached —
+            # keeps its recovery whatever funded_operator_fallback says (a
+            # restart with the flag off must never flip it to the miner's key
+            # while its operator pod trains)
+            try:
+                ledgered = any(self._is_operator_leg_pod_of(p.instance_id, {hotkey})
+                               for p in self._load_funded_ledger() if not p.payer_hotkey)
+            except Exception:  # noqa: BLE001
+                ledgered = False
+            if ledgered or grandfathered(self, hotkey, allocated=False):
                 return True
         loc = self.__dict__.get("_leg_local_obj")
         return bool(getattr(self.cfg.round, "funded_operator_fallback", False)

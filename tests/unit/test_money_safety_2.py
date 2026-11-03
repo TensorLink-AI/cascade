@@ -69,7 +69,7 @@ def test_new_knobs_are_registered_with_their_defaults():
         assert getattr(rnd, name) == MONEY_KNOBS[name][0], name
     assert rnd.harvest_keep_max_seconds == 10800 and rnd.harvest_keep_cost_fraction == 0.5
     assert rnd.miner_waste_alert_usd == 15.0 and rnd.operator_runway_alert_hours == 6.0
-    assert rnd.operator_daily_cap_scope == "all"
+    assert rnd.operator_daily_cap_scope == "miner_legs"
     assert rnd.funded_ready_timeout_seconds == 420.0
 
 
@@ -77,7 +77,7 @@ def test_new_knobs_round_trip_through_the_loader_integral_floats_included(tmp_pa
     p = _edited(tmp_path,
                 "harvest_keep_max_seconds = 7200.0\nharvest_keep_cost_fraction = 0.25\n"
                 "operator_runway_alert_hours = 8\nminer_waste_alert_usd = 20\n"
-                'operator_daily_cap_scope = "miner_legs"\n'
+                'operator_daily_cap_scope = "all_incl_king"\n'
                 "king_pod_ttl_margin_seconds = 3600.0\nking_idle_reap_checks = 3.0\n"
                 "king_idle_check_seconds = 600\noperator_inventory_interval_seconds = 1800.0\n"
                 'operator_inventory_allow = ["paracast-bw"]\n'
@@ -90,7 +90,7 @@ def test_new_knobs_round_trip_through_the_loader_integral_floats_included(tmp_pa
     r = load_chain_config(p).round
     assert (r.harvest_keep_max_seconds, r.harvest_keep_cost_fraction) == (7200, 0.25)
     assert (r.operator_runway_alert_hours, r.miner_waste_alert_usd) == (8.0, 20.0)
-    assert r.operator_daily_cap_scope == "miner_legs"
+    assert r.operator_daily_cap_scope == "all_incl_king"
     assert (r.king_pod_ttl_margin_seconds, r.king_idle_reap_checks,
             r.king_idle_check_seconds, r.operator_inventory_interval_seconds) == (3600, 3, 600,
                                                                                    1800)
@@ -193,18 +193,27 @@ def test_runway_alert_fires_once_and_clears(tmp_path):
     assert json.loads((tmp_path / money_guard.RUNWAY_FILE).read_text())["balance_usd"] == 5000.0
 
 
-def test_no_new_rents_refuses_the_king_too_and_clears_on_recovery(tmp_path):
+def test_no_new_rents_holds_legs_and_the_king_only_below_the_reserve(tmp_path):
     r = _runner(tmp_path, balance=100.0, operator_daily_spend_cap_usd=0.0)
-    prov = money_guard.guard_operator_provider(r, _Prov([KING + "-0"]), enforce=False)
-    spec = SimpleNamespace(name_prefix=KING)
+    leg = "cascade-n91-777-funded-abc-op"
+    legs = money_guard.guard_operator_provider(r, _Prov([leg + "-0"]))
     with pytest.raises(OperatorRentsHeld, match="NO NEW OPERATOR RENTS"):
-        prov.launch(spec)                         # 100 - 0 - 20 x 12 h < 50
-    assert prov._provider.launched == 0           # nothing created
+        legs.launch(SimpleNamespace(name_prefix=leg))       # 100 - 0 - 20 x 3 h < 50
+    assert legs._provider.launched == 0                      # nothing created
     assert "operator_rents_held" in {c["code"] for c in money_guard.health_conditions(r, {})}
     # distinct from the 402 breaker: the breaker stays closed
     assert money_guard.OperatorBreaker.for_runner(r).open_record() is None
+    # the king's own era projection not fitting is ALERT-ONLY (review M1) ...
+    king = money_guard.guard_operator_provider(r, _Prov([KING + "-0"]), enforce=False)
+    r._operator_offer_rate = lambda skus: 5.0                # judged at the best offer
+    assert king.launch(SimpleNamespace(name_prefix=KING, sku="8xH100")) == [KING + "-0"]
+    assert "operator_runway_king" in {c["code"] for c in money_guard.health_conditions(r, {})}
+    # ... it is held only when balance - committed < reserve at all
+    r._operator_balance_reader = lambda: 30.0
+    with pytest.raises(OperatorRentsHeld):
+        king.launch(SimpleNamespace(name_prefix=KING, sku="8xH100"))
     r._operator_balance_reader = lambda: 10_000.0
-    assert prov.launch(spec) == [KING + "-0"]
+    assert legs.launch(SimpleNamespace(name_prefix=leg)) == [leg + "-0"]
 
 
 def test_every_operator_launch_is_booked_and_a_lemon_settles_to_its_real_cost(tmp_path):
@@ -228,21 +237,25 @@ def test_every_operator_launch_is_booked_and_a_lemon_settles_to_its_real_cost(tm
     assert len(rows) == 2 and rows[-1]["kind"] == "make_good" and rows[-1]["hotkey"] == HK
 
 
-def test_daily_cap_counts_the_king_and_cpu_vms_unless_scoped_to_miner_legs(tmp_path):
+def test_the_daily_cap_counts_the_king_only_when_explicitly_included(tmp_path):
     r = _runner(tmp_path, balance=10_000.0, operator_daily_spend_cap_usd=250.0)
     king = money_guard.guard_operator_provider(r, _Prov([KING + "-0"]), enforce=False)
-    # the king is COUNTED but never refused by the cap (the runway guards it)
+    # the king is never refused by the cap (the runway guards it) ...
     assert king.launch(SimpleNamespace(name_prefix=KING)) == [KING + "-0"]     # $240
-    assert money_guard.OperatorSpend.for_runner(r).total() == pytest.approx(240.0)
+    spend = money_guard.OperatorSpend.for_runner(r)
+    assert spend.total() == pytest.approx(240.0)                         # raw total
+    assert spend.total(scope="miner_legs") == spend.total(scope="all") == 0.0
+    # ... and by default (miner_legs) its booking never refuses a make-good
     leg = "cascade-n91-777-funded-abc-op"
     legs = money_guard.guard_operator_provider(r, _Prov([leg + "-0"]))
-    with pytest.raises(OperatorRentsHeld, match="daily cap"):
-        legs.launch(SimpleNamespace(name_prefix=leg))           # 240 + 60 > 250
+    assert legs.launch(SimpleNamespace(name_prefix=leg)) == [leg + "-0"]       # 0 + 60 <= 250
     gen = SimpleNamespace(hotkey=HK, ref=REF)
+    assert money_guard.would_rent_refusal(r, gen, operator=True) == ("", "")
+    # only "all_incl_king" lets the king's spend count against the cap
+    r.cfg.round = dataclasses.replace(r.cfg.round, operator_daily_cap_scope="all_incl_king")
+    with pytest.raises(OperatorRentsHeld, match="daily cap"):
+        legs.launch(SimpleNamespace(name_prefix=leg))                    # 240 + 60 + 60 > 250
     assert "daily spend cap" in money_guard.would_rent_refusal(r, gen, operator=True)[0]
-    r.cfg.round = dataclasses.replace(r.cfg.round, operator_daily_cap_scope="miner_legs")
-    assert money_guard.OperatorSpend.for_runner(r).total(scope="miner_legs") == 0.0
-    assert legs.launch(SimpleNamespace(name_prefix=leg)) == [leg + "-0"]
 
 
 def test_cpu_vms_are_booked_and_held_with_every_operator_rent(tmp_path):
@@ -820,9 +833,11 @@ def test_payer_side_evidence_proves_a_miner_cause():
     pod = _pod("p-0", payer=HK)
     assert payer_loss_evidence(_payer_runner(None), pod)["miner"] is False
     assert payer_loss_evidence(_payer_runner(None, balance=0.0), pod)["miner"] is True
-    assert payer_loss_evidence(_payer_runner(None, status="STOPPED"), pod)["miner"] is True
-    ev = payer_loss_evidence(_payer_runner(None, status=None), pod)       # absent: not proof
-    assert ev["pod_status"] == "absent" and ev["miner"] is False
+    # a stopped / absent pod is NOT proof (platform, host, our TTL): ended only
+    ev = payer_loss_evidence(_payer_runner(None, status="STOPPED"), pod)
+    assert ev["miner"] is False and ev["ended"] is True
+    ev = payer_loss_evidence(_payer_runner(None, status=None), pod)
+    assert ev["pod_status"] == "absent" and ev["miner"] is False and ev["ended"] is True
 
 
 def test_a_watchdog_abort_with_a_foreign_gpu_hog_is_the_miners(monkeypatch):
@@ -853,8 +868,11 @@ def test_foreign_gpu_processes_are_told_from_ours():
     from cascade.trainer.remote import parse_foreign_gpu_procs
 
     out = ("GPU:11:python -m cascade.trainer.worker --role challenger\n"
-           "GPU:12:/usr/bin/python3 /root/miner/hog.py\n__CASCADE_GPU_PROCS__\n")
+           "GPU:12:/usr/bin/python3 /root/miner/hog.py\n"
+           "GPU:913377:\n"            # a host-namespace pid: cmdline unreadable = UNKNOWN
+           "GPU:913378:   \n__CASCADE_GPU_PROCS__\n")
     assert parse_foreign_gpu_procs(out) == ["12:/usr/bin/python3 /root/miner/hog.py"]
+    assert parse_foreign_gpu_procs("GPU:913377:\n__CASCADE_GPU_PROCS__\n") == []
 
 
 def test_an_approval_request_carries_the_failure_and_the_evidence(tmp_path):
@@ -888,6 +906,11 @@ def test_the_harvest_dir_must_be_the_workers_layout():
             _check_harvest_dir(bad)
     assert harvest_max_bytes(RoundConfig(expected_checkpoint_gb=15.0)) == int(15 * 1.2 * 2 ** 30)
     assert harvest_max_bytes(RoundConfig(harvest_max_bytes_factor=0.0)) is None
+    # the bound follows the model size; expected_checkpoint_gb is the floor (M2)
+    rnd = RoundConfig(expected_checkpoint_gb=15.0,
+                      expected_checkpoint_gb_by_preset=(("big", 40.0), ("tiny", 1.0)))
+    assert harvest_max_bytes(rnd, "big") == int(40 * 1.2 * 2 ** 30)
+    assert harvest_max_bytes(rnd, "tiny") == int(15 * 1.2 * 2 ** 30)
 
 
 # ── C: withdraw of a running leg ─────────────────────────────────────────────
@@ -1121,3 +1144,61 @@ def test_the_coldkey_limit_never_holds_a_miner_key_leg(tmp_path):
     assert not A.owner_busy(r, "hk2")                 # a miner-key leg is never held
     billed["hk2"] = SimpleNamespace(operator_billed=True)
     assert A.owner_busy(r, "hk2")                     # two operator-paid legs of one owner
+
+
+
+# ══ review of #419 at 4d2658e ═══════════════════════════════════════════════
+
+
+def test_a_real_lium_listing_is_priced_at_its_whole_pod_price():
+    # the shape of `lium ls --format json` (2026-11-03): BOTH prices present
+    row = {"id": "c95ba58d-8039-416a-9feb-093fbfb1346d", "huid": "zesty-comet-ec",
+           "config": "8×RTX3090", "gpu_type": "RTX3090", "gpu_count": 8,
+           "price_per_gpu_hour": 0.29, "price_per_hour": 2.32, "country": "Germany"}
+    assert executor_price_per_hour(row) == 2.32          # never 8 x 2.32, never 0.29
+    assert executor_gpu_count(row) == 8
+    no_whole = {k: v for k, v in row.items() if k != "price_per_hour"}
+    assert executor_price_per_hour(no_whole) == pytest.approx(2.32)
+
+
+def test_an_in_flight_operator_leg_keeps_its_recovery_with_the_fallback_off(tmp_path):
+    from cascade.trainer.runner_operator_pods import _OperatorPodMixin
+
+    op_pod = "cascade-n91-777-funded-5dpyoy8pxp5x-op-0"
+    r = _runner(tmp_path, ledger=[_pod(op_pod)], funded_pods="rent",
+                funded_operator_fallback=False)
+    q = _queue(tmp_path)
+    r._funded_queue = lambda: q
+    r._is_operator_leg_pod_of = lambda pid, hks: _OperatorPodMixin._is_operator_leg_pod_of(
+        r, pid, hks)
+    r.OPERATOR_LEG_POD_TAG = _OperatorPodMixin.OPERATOR_LEG_POD_TAG
+    r._operator_fallback_lanes = lambda: []
+    r._operator_rent_allowed = lambda hk=None: _OperatorPodMixin._operator_rent_allowed(r, hk)
+    assert _OperatorPodMixin._operator_rent_allowed(r, HK) is True       # its op pod trains
+    assert _OperatorPodMixin._operator_recovery_available(r, HK) is True
+    r.rows.clear()
+    assert _OperatorPodMixin._operator_rent_allowed(r, HK) is False      # nothing on our bill
+
+
+def test_post_rent_rejects_never_propose_a_full_leg_make_good_but_count_to_the_cap(tmp_path):
+    import inspect
+
+    from cascade.trainer import miner_spend_guard as g
+    from cascade.trainer.runner_funded_pods import _FundedPodMixin
+
+    src = inspect.getsource(_FundedPodMixin._rent_funded_host_unguarded)
+    start = src.index("OUR post-rent reject")
+    block = src[start:src.index("continue", start)]
+    assert len(block) > 200 and "set_operator_billed" not in block
+    r = _runner(tmp_path, miner_waste_cap_usd=10.0)
+    q = _queue(tmp_path)
+    r._funded_queue = lambda: q
+    led = MinerSpend.beside(q.path)
+    g.spend_start(r, HK, "short-0", rate=36.0)
+    with led._locked() as recs:
+        recs[led._key(HK, REF)]["pods"][0]["start"] -= 1200     # 20 min at $36/h = $12
+        led._save(recs)
+    g.spend_end(r, HK, "short-0", outcome=MAKE_GOOD, reason="post-rent reject: short pod")
+    with pytest.raises(_Skip):
+        g.waste_cap_check(r, SimpleNamespace(hotkey=HK, ref=REF, uid=1))   # bounded
+    assert OperatorApprovals.for_work_root(tmp_path).pending() == []      # no leg make-good

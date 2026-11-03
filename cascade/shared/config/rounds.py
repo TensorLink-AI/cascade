@@ -396,11 +396,12 @@ class RoundConfig:
     # Standing operator pods the ledger cannot see (validator eval pods,
     # hand-rented lanes): ``{name = usd_per_hour}`` (TOML table).
     operator_standing_pods_usd_per_hour: tuple[tuple[str, float], ...] = ()
-    # Which booked operator spend the daily cap counts: "all" (king pods,
-    # backups, CPU VMs, lemons, miner legs) or "miner_legs" (#417 behaviour).
-    # The king pod and its backups are counted but never refused by the cap
-    # (the runway guard holds them); every other operator launch is.
-    operator_daily_cap_scope: str = "all"
+    # Which booked operator spend the daily cap counts: "miner_legs" (default:
+    # operator-billed miner legs), "all" (+ CPU VMs, lemons, other operator
+    # pods — not the king / backups) or "all_incl_king" (everything). The king
+    # pod and its backups are never REFUSED by the cap (the runway guard
+    # covers total spend).
+    operator_daily_cap_scope: str = "miner_legs"
     # The FIRST infra loss on a miner's key taking the submission's infra
     # waste to this files the spend_cap_make_good request (one alert) —
     # before the next rent, never one leg late. 0 = off (the cap still trips).
@@ -427,6 +428,10 @@ class RoundConfig:
     # x this; past it the checkpoint is refused UNBURNED as unverifiable (a
     # hostile pod must not fill our volume). 0 = unbounded.
     harvest_max_bytes_factor: float = 1.2
+    # The expected checkpoint size per model size: ``{arch_preset = GB}``
+    # (expected_checkpoint_gb is the floor) — the harvest bound follows the
+    # model, so a bigger model never trips it as a "hostile" stream.
+    expected_checkpoint_gb_by_preset: tuple[tuple[str, float], ...] = ()
     # The operator multi-provider pool (cascade.provision.operator_pool) is on
     # only when switched on here (or by its own features: more providers, king
     # backups, the paid fallback) — never by a spend cap.

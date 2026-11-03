@@ -209,7 +209,10 @@ def waste_cap_check(runner, gen) -> None:
               f"{gen.hotkey[:12]} paused (fail closed)", severity="critical")
         _pause(runner, gen, "paused: the operator's spend record for this submission is "
                "unreadable — nothing rented, nothing burned; the operator will review")
-    if s.waste_usd < cap:
+    # the operator make-good owed (post-rent rejects, lemons) counts toward
+    # the pause too: a systemic bad-host streak must not bill the miner
+    # without bound (it is never their waste, and never a full-leg make-good)
+    if s.waste_usd + s.make_good_usd < cap:
         return
     trip(runner, gen, e, s, cap)
 
@@ -239,6 +242,8 @@ def trip(runner, gen, entry, s, cap: float) -> None:
           f"${s.waste_usd:.2f} on pods that produced nothing (cap ${cap:.2f}) — paused"
           + (f"; make-good on the operator account ≈ ${op_cost:.2f} awaits "
              f"`cascade-trainer approve-operator-leg {gen.hotkey}`" if infra else
+             f"; ${s.make_good_usd:.2f} of it is post-rent rejects / lemons we owe back "
+             "(make good that amount; no leg retrain proposed)" if s.make_good_usd else
              "; miner-side causes: a re-fund resumes it") + f". Pods: {pods}",
           severity="critical")
     log.error("miner waste cap: %s paused — $%.2f wasted of $%.2f spent (cap $%.2f)%s",

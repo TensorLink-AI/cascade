@@ -1442,16 +1442,22 @@ class _FundedPodMixin:
                         # operator make-good (money safety II), not their
                         # waste. Any other failed rent: the miner paid for
                         # nothing — waste.
-                        lemon = result.error_class == LEMON_CLASS
+                        # a lemon or any allocated-then-failed rent (no ssh
+                        # key pin, no identity): the host's / our fault — an
+                        # operator make-good of its cost, never their waste
+                        lemon = result.error_class != "auth"
                         landed = getattr(result, "price_per_hour", None)
                         if landed:
                             # the real price, never the flat fallback (S2)
                             from .miner_spend_guard import spend_start
 
                             spend_start(self, gen.hotkey, pod_id, rate=landed)
+                        from .miner_spend_guard import INFRA, MINER
+
                         spend_end(self, gen.hotkey, pod_id,
                                   outcome=MAKE_GOOD if lemon else "waste",
-                                  reason=f"{'lemon' if lemon else 'rent failed'}: "
+                                  kind=INFRA if lemon else MINER,
+                                  reason=f"{'post-rent failure' if lemon else 'rent failed'}: "
                                          f"{str(result.error)[:120]}")
                 if result.ok and result.pod is not None and not is_king:
                     from .miner_spend_guard import fallback_rate, spend_start
@@ -1459,12 +1465,11 @@ class _FundedPodMixin:
                     landed = getattr(result, "price_per_hour", None)
                     spend_start(self, gen.hotkey, result.pod.instance_id,
                                 rate=landed or fallback_rate(self, gpu_choice))
-                if (not result.ok and allocated and result.error_class != "auth"
-                        and (result.leaked_pod or result.error_class != LEMON_CLASS)
-                        and self._operator_recovery_available(gen.hotkey)):
-                    queue = self._funded_queue()
-                    if queue is not None:
-                        queue.set_operator_billed(gen.hotkey, True)
+                # Review (5EvqPCMN): a failed rent / post-rent reject never
+                # proposes a FULL-leg operator make-good — what the miner lost
+                # is the reject's own cost, booked make_good with one priced
+                # alert (miner_spend_guard.note_make_good); the leg retries on
+                # their key under the bad-pod budget and the waste cap.
                 if result.ok and result.machine_id:
                     claim_executor(self, result.machine_id,
                                    result.pod.instance_id if result.pod is not None else "")
@@ -1535,8 +1540,6 @@ class _FundedPodMixin:
                         # loop. An unconfirmed release must block another rent.
                         if result.pod and any(p.instance_id == result.pod.instance_id
                                               for p in self._load_funded_ledger()):
-                            if queue is not None and self._operator_recovery_available(gen.hotkey):
-                                queue.set_operator_billed(gen.hotkey, True)
                             result = replace(result, ok=False, error_class="infra",
                                              burn_attempt=False, leaked_pod=result.pod.instance_id)
                             break

@@ -1275,16 +1275,14 @@ Trainer-only; nothing here reaches a manifest or a validator verdict.
   VMs' included, is refused right before the create; it clears by itself.
 * **Every operator allocation is booked** in `operator_spend.json` at its
   landed $/h × expected hours (lemons too, settled to their real cost at
-  teardown), and the daily cap counts it per `operator_daily_cap_scope`
-  (`"all"` default: king pods, backups, CPU VMs, lemons, miner legs;
-  `"miner_legs"` = the #417 behaviour). Every operator launch is checked
-  against the cap right before the create — except the king pod and its
-  backups, which are COUNTED but never refused by it (one king era at the
-  ceiling exceeds any sane daily cap, and a refused king stalls every
-  settlement; the runway guard protects the account from the king). With
-  scope "all", king spend uses up the cap for miner-leg operator rents and
-  CPU VMs: **size `operator_daily_spend_cap_usd` for the king's spend before
-  deploying** (two king eras a day at the king's $/h × 12 h each).
+  teardown), and the daily cap counts it per `operator_daily_cap_scope`:
+  `"miner_legs"` (default: operator-billed miner legs), `"all"` (+ CPU VMs,
+  lemons, other operator pods — never the king / backups) or
+  `"all_incl_king"` (everything). The king pod and its backups are never
+  REFUSED by the cap; the runway guard covers total spend. A king launch is
+  judged at the best live offer and held only when balance − committed <
+  reserve; when only its own projection does not fit, one
+  `operator_runway_king` alert (it rents anyway).
 * **Priced keep** (above), the **lost-run retrain is operator-billed**, an
   unreachable pod last seen with a finished unharvested run is kept for the
   priced keep, not the 30 min unreachable grace.
@@ -1322,20 +1320,28 @@ Trainer-only; nothing here reaches a manifest or a validator verdict.
 #### Second audit (rc19 = main 1cc20cb)
 
 * **A miner-caused payer-pod loss is the miner's.** A generic loss of a payer
-  pod asks the PAYER's account first: a balance ≤ 0 or a pod their account
-  lists as stopped / cancelled is a `payer_side` miner fault (unburned, never
-  operator-billed). A generic `infra` loss never sets `operator_billed` on
+  pod asks the PAYER's account first: only a balance ≤ 0 proves a payer-side
+  cause (`payer_side`: requeued UNBURNED with the reason shown, never failed,
+  never operator-billed). A pod listed stopped / terminated / absent is NOT
+  proof (platform terminations, host failures, our own TTL): `payer_pod_lost`,
+  requeued unburned on the miner's key with no make-good and no quarantine.
+  An unreadable GPU-process cmdline (host-namespace PIDs) is unknown, never
+  foreign. A generic `infra` loss never sets `operator_billed` on
   its own (only an operator-class verdict with our-side evidence does). A
   throughput / first-step abort of a payer pod probes for foreign GPU
   processes first (a miner's GPU hog ⇒ `payer_side`, no host quarantine).
   Every approval request records `last_error`, `error_class` and that
   `evidence`.
-* **Bounded ssh harvest.** A receipt's `checkpoint_dir` must lie in the
-  worker's `_train_work` layout; the stream stops at `expected_checkpoint_gb`
-  × `harvest_max_bytes_factor` (1.2). A breach is a terminal, UNBURNED
-  `checkpoint_unverifiable`, never a disk fault. Check that
-  `expected_checkpoint_gb` covers the real checkpoints (+ shadow EMA files)
-  before deploying.
+* **Bounded ssh harvest.** A receipt's `checkpoint_dir` must be relative to
+  the pod workdir (no `..`) or inside a `_train_work` tree; the stream stops
+  at the model size's expected checkpoint (`expected_checkpoint_gb_by_preset`,
+  `expected_checkpoint_gb` the floor) × `harvest_max_bytes_factor` (1.2). On
+  a PAYER pod a breach is a terminal, UNBURNED `checkpoint_unverifiable`; on
+  an OPERATOR pod it is an operator fault that keeps the pod (our model grew
+  — raise the table). Never a disk fault.
+* **Post-rent rejects / lemons** never propose a full-leg operator make-good:
+  their cost is booked `make_good` (one priced alert, sized to the loss) and
+  counts toward the waste-cap pause, so a bad-host streak is bounded.
 * **Withdraw** of a live (`in_flight`, `in_round`, parked …) entry is a 409
   and keeps the key; a withdrawn entry is terminal (never requeued) and never
   gets an operator request.
@@ -1361,6 +1367,9 @@ Trainer-only; nothing here reaches a manifest or a validator verdict.
   always allows that leg's operator rent; `funded_operator_fallback` only
   decides whether a non-miner fault PROPOSES an operator make-good** (files
   the request) — turning it off no longer strands approved make-goods.
+* **Restart safety:** a leg already on the operator's bill (its operator pod
+  on the ledger, or in flight operator-billed and re-attached) keeps its
+  operator recovery whatever `funded_operator_fallback` says.
 * **Per-coldkey limit** (`ops_max_active_per_coldkey`) bounds only
   OPERATOR-paid work: the CPU-VM tier of every leg and operator-billed legs.
   A miner-key GPU rent never takes a slot, king legs are exempt, and an

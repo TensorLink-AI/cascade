@@ -235,7 +235,16 @@ class _BreakerGuardedProvider:
         hours = 0.0
         if runner is not None:
             hours = expected_pod_hours(runner, kind)
-            operator_launch_check(runner, kind=kind, projected_usd=ceiling_rate(runner) * hours)
+            rate = ceiling_rate(runner)
+            if kind in (KING_KIND, KING_BACKUP_KIND):
+                # review M1: the king is judged at the market's best offer, not
+                # the ceiling (a $25 x 12 h ceiling projection held it)
+                skus = tuple(getattr(spec, "sku_choices", ()) or ()) or (
+                    (getattr(spec, "sku", ""),) if getattr(spec, "sku", "") else ())
+                best = best_offer_rate(runner, skus) if skus else None
+                if best:
+                    rate = min(best, rate) if rate else best
+            operator_launch_check(runner, kind=kind, projected_usd=rate * hours)
         try:
             ids = self._provider.launch(spec, *args, **kwargs)
         except Exception as e:
@@ -357,6 +366,15 @@ OPERATOR_LEG_KIND, OPERATOR_OTHER_KIND, CPU_VM_KIND = "operator_leg", "operator"
 NON_MINER_KINDS = frozenset({KING_KIND, KING_BACKUP_KIND, CPU_VM_KIND, OPERATOR_OTHER_KIND})
 
 
+def _scoped(rows: list[dict], scope: str) -> list[dict]:
+    """The rows a daily-cap ``scope`` counts (see ``DAILY_CAP_SCOPES``)."""
+    if scope == "all_incl_king":
+        return rows
+    if scope == "all":
+        return [r for r in rows if r.get("kind") not in (KING_KIND, KING_BACKUP_KIND)]
+    return [r for r in rows if r.get("kind") not in NON_MINER_KINDS]
+
+
 class OperatorSpend:
     """``<work_root>/operator_spend.json``: operator spend, one row per
     allocation (``pod_id``, landed ``rate``, ``hours`` projected), keyed by UTC
@@ -418,19 +436,17 @@ class OperatorSpend:
                     out.append(r)
         return out
 
-    def total(self, now: float | None = None, *, scope: str = "all",
+    def total(self, now: float | None = None, *, scope: str = "all_incl_king",
               exclude: str = "") -> float:
         """Booked operator spend over the last 24 h (+ live reservations, but
         ``exclude``); ``scope="miner_legs"`` leaves out the king, backups, CPU
         VMs and other operator pods."""
         t = time.time() if now is None else float(now)
-        rows = self._window(self._load(), t, exclude=exclude)
-        if scope == "miner_legs":
-            rows = [r for r in rows if r.get("kind") not in NON_MINER_KINDS]
+        rows = _scoped(self._window(self._load(), t, exclude=exclude), scope)
         return float(sum(float(r.get("usd", 0.0)) for r in rows))
 
     def reserve_if_room(self, hotkey: str, usd: float, *, cap: float, kind: str,
-                        scope: str = "all", now: float | None = None) -> str | None:
+                        scope: str = "miner_legs", now: float | None = None) -> str | None:
         """Atomically: when the window + ``usd`` fits ``cap`` (0 = no cap),
         record a reservation and return its id; else None."""
         import uuid
@@ -438,10 +454,8 @@ class OperatorSpend:
         t = time.time() if now is None else float(now)
         with self._locked():
             doc = self._load()
-            rows = [r for r in self._window(doc, t)
-                    if not (r.get("reservation") and r.get("hotkey") == hotkey)]
-            if scope == "miner_legs":
-                rows = [r for r in rows if r.get("kind") not in NON_MINER_KINDS]
+            rows = _scoped([r for r in self._window(doc, t)
+                            if not (r.get("reservation") and r.get("hotkey") == hotkey)], scope)
             if cap and sum(float(r.get("usd", 0.0)) for r in rows) + float(usd) > cap:
                 return None
             # one live reservation per hotkey: a re-gated retry REPLACES it
@@ -651,7 +665,7 @@ def operator_rent_preflight(runner, gen, cost_usd: float) -> str | None:
     clear_alert(runner, "operator_leg_cap", hk[:16])
     cap = daily_cap_usd(rnd)
     spent = OperatorSpend.for_runner(runner).total(
-        scope=str(getattr(rnd, "operator_daily_cap_scope", "all") or "all"))
+        scope=str(getattr(rnd, "operator_daily_cap_scope", "miner_legs") or "miner_legs"))
     if cap and spent + cost_usd > cap:
         alert(runner, "operator_daily_cap", "operator",
               f"today ${spent:.2f} + projected ${cost_usd:.2f} > daily cap ${cap:.2f}")
@@ -686,7 +700,7 @@ def operator_rent_preflight(runner, gen, cost_usd: float) -> str | None:
     # the real allocation) or on a no-rent; expires by itself.
     rid = OperatorSpend.for_runner(runner).reserve_if_room(
         hk, cost_usd, cap=cap, kind="reservation",
-        scope=str(getattr(rnd, "operator_daily_cap_scope", "all") or "all"))
+        scope=str(getattr(rnd, "operator_daily_cap_scope", "miner_legs") or "miner_legs"))
     if rid is None:
         alert(runner, "operator_daily_cap", "operator",
               f"daily cap ${cap:.2f} reached by a concurrent reservation")
@@ -812,15 +826,15 @@ def _operator_launch_check(runner, *, kind: str, projected_usd: float) -> None:
     from ..provision.core import OperatorRentsHeld
 
     rnd = runner.cfg.round
-    scope = str(getattr(rnd, "operator_daily_cap_scope", "all") or "all")
+    scope = str(getattr(rnd, "operator_daily_cap_scope", "miner_legs") or "miner_legs")
     cap = daily_cap_usd(rnd)
-    # The king pod and its backups COUNT toward the cap (scope "all") but are
+    # The king pod and its backups COUNT toward the cap ("all_incl_king") but are
     # never refused by it: one king era at the ceiling exceeds any sane daily
     # cap and a refused king stalls every settlement. The runway guard below
     # is what protects the account from the king (backups also keep their
     # own ops_king_backup_cap_usd).
     if cap and kind not in (KING_KIND, KING_BACKUP_KIND) and (
-            scope == "all" or kind not in NON_MINER_KINDS):
+            scope in ("all", "all_incl_king") or kind not in NON_MINER_KINDS):
         mine = (getattr(_leg_local(runner), "operator_approval", None) or {}).get(
             "reservation", "")
         spent = OperatorSpend.for_runner(runner).total(scope=scope, exclude=mine)
@@ -834,7 +848,19 @@ def _operator_launch_check(runner, *, kind: str, projected_usd: float) -> None:
         log.warning("runway: operator balance unknown at a %s launch — not held here (the "
                     "miner-leg preflight fails closed on it)", kind)
         return
-    rw = operator_runway(runner, balance=bal, extra_usd=projected_usd)
+    king = kind in (KING_KIND, KING_BACKUP_KIND)
+    rw = operator_runway(runner, balance=bal, extra_usd=0.0 if king else projected_usd)
+    if king and not rw["held"]:
+        short = operator_runway(runner, balance=bal, extra_usd=projected_usd)
+        if short["held"]:
+            # review M1: a king whose own era projection does not fit is
+            # ALERTED, never held — only balance - committed < reserve holds it
+            alert(runner, "operator_runway_king", "operator",
+                  f"king launch ≈${projected_usd:.2f} does not fit the operator balance "
+                  f"${bal:.2f} - committed ${rw['committed_usd']:.2f} - reserve "
+                  f"${rw['reserve_usd']:.2f} — renting anyway (the king is required); top up",
+                  severity="critical")
+        return
     if rw["held"]:
         msg = (f"NO NEW OPERATOR RENTS: balance ${bal:.2f} - committed "
                f"${rw['committed_usd']:.2f} - this {kind} launch ≈${projected_usd:.2f} < the "
@@ -914,7 +940,7 @@ def would_rent_refusal(runner, gen, *, operator: bool) -> tuple[str, str]:
         cap = daily_cap_usd(rnd)
         if cap:
             spent = OperatorSpend.for_runner(runner).total(
-                scope=str(getattr(rnd, "operator_daily_cap_scope", "all") or "all"))
+                scope=str(getattr(rnd, "operator_daily_cap_scope", "miner_legs") or "miner_legs"))
             if spent + projected > cap:
                 return (f"operator daily spend cap reached (${spent:.2f} + ${projected:.2f} > "
                         f"${cap:.2f}); nothing rented", OPERATOR_BLOCKED_CLASS)

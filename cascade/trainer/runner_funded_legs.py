@@ -490,7 +490,7 @@ class _FundedLegMixin:
                                         burn=False)
             raise
         except PayerPodInterference as e:
-            self._record_funded_failure(gen.hotkey, f"payer-side: {e}", miner_fault=True,
+            self._record_funded_failure(gen.hotkey, f"payer-side: {e}", miner_fault=False,
                                         error_class=PayerPodInterference.error_class,
                                         burn=False)
             raise
@@ -555,8 +555,14 @@ class _FundedLegMixin:
                 ev = payer_loss_evidence(self, pod)
                 _loc.loss_evidence = ev
                 if ev.get("miner"):
-                    miner_fault, error_class, burn = True, PayerPodInterference.error_class, False
-                    text = f"payer-side loss ({ev}): {text}"
+                    # proven payer-side (balance <= 0): unburned, NON-terminal
+                    error_class, burn = PayerPodInterference.error_class, False
+                    text = f"payer-side loss (top up your key; {ev}): {text}"
+                elif ev.get("ended"):
+                    # the pod ended without proof of whose doing: requeued
+                    # unburned on the miner's key, no make-good, no quarantine
+                    error_class, burn = "payer_pod_lost", False
+                    text = f"payer pod ended mid-leg ({ev}): {text}"
             self._record_funded_failure(gen.hotkey, text, miner_fault=miner_fault,
                                         error_class=error_class, burn=burn)
             from .harvest_guard import handle_our_side_fault, keeps_pod, local_disk_error
@@ -570,7 +576,8 @@ class _FundedLegMixin:
                 raise
             if keeps_pod(e) or local_disk_error(e) is not None:
                 raise                  # our side: never an operator make-good
-            if not miner_fault and error_class != "infra":
+            if not miner_fault and error_class not in (
+                    "infra", PayerPodInterference.error_class, "payer_pod_lost"):
                 # an operator make-good ONLY with our-side evidence (an
                 # operator-class verdict, e.g. our storage); a generic infra
                 # loss of a miner's pod is never billed to us on its own
@@ -582,7 +589,7 @@ class _FundedLegMixin:
             self.__dict__["_leg_local_obj"].harvest_pod_payer = False
             if not keep and not released and not hold_pod:
                 verdict = self._funded_leg_failures.get(gen.hotkey)
-                if verdict is not None and verdict[1]:
+                if verdict is not None and (verdict[1] or verdict[2] == "payer_side"):
                     # a genuine miner fault: waste of THEIR making (no make-good)
                     from .miner_spend_guard import MINER, spend_end
 
@@ -806,9 +813,10 @@ def _dispatch_watched(disp, host, *, payer_pod: bool = False, **kw):
 
 
 class PayerPodInterference(Exception):
-    """The MINER's own pod did it (money safety II): a foreign process on its
-    GPUs during a watchdog abort, the payer stopped / cancelled the pod, or
-    their balance ran out. The miner's fault — unburned, never
+    """The MINER's own pod did it (money safety II): a readable foreign
+    process on its GPUs during a watchdog abort, or their balance ran out.
+    NON-terminal (review H1): requeued unburned on the miner's key with the
+    reason shown (they top up / fix it) — never failed, never
     operator-billed, no host quarantine, no operator make-good."""
 
     error_class = "payer_side"
@@ -842,9 +850,13 @@ def payer_loss_evidence(runner, pod) -> dict:
     except Exception as e:  # noqa: BLE001 — unknown: no miner verdict from it
         ev["error"] = f"{type(e).__name__}: {str(e)[:120]}"
     status = str(ev.get("pod_status", "")).upper()
-    ev["miner"] = bool(
-        ("payer_balance_usd" in ev and ev["payer_balance_usd"] <= 0)
-        or any(t in status for t in ("STOPPED", "STOPPING", "CANCEL", "TERMINAT", "DELETED")))
+    # Only a payer balance at or below zero PROVES a payer-side cause (review
+    # H1b): a stopped / terminated / deleted status also covers platform
+    # terminations, host failures and our own provider TTL — recorded as
+    # evidence (``ended``), never read as the miner's doing.
+    ev["miner"] = bool("payer_balance_usd" in ev and ev["payer_balance_usd"] <= 0)
+    ev["ended"] = any(t in status for t in ("STOPPED", "STOPPING", "CANCEL", "TERMINAT",
+                                             "DELETED", "ABSENT"))
     return ev
 
 

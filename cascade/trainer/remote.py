@@ -1178,12 +1178,17 @@ def _gpu_procs_command() -> str:
 
 
 def parse_foreign_gpu_procs(stdout: str) -> list[str]:
-    """``GPU:<pid>:<cmdline>`` lines whose cmdline is not one of ours."""
+    """``GPU:<pid>:<cmdline>`` lines whose cmdline is READABLE and not one of
+    ours. Inside a container nvidia-smi often reports host-namespace PIDs
+    whose ``/proc/<pid>/cmdline`` is empty or missing: that is UNKNOWN, never
+    foreign (review H1a — our own worker must never read as a miner's hog)."""
     out = []
     for ln in (stdout or "").splitlines():
         if not ln.startswith("GPU:"):
             continue
         _tag, _pid, cmd = (ln.split(":", 2) + ["", ""])[:3]
+        if not cmd.strip():
+            continue                        # unreadable: unknown, not foreign
         if not any(m in cmd for m in _OUR_GPU_PROC_MARKERS):
             out.append(ln[4:][:200])
     return out

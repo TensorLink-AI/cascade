@@ -35,7 +35,7 @@ MONEY_KNOBS: dict[str, tuple[object, str]] = {
     # ── money safety II (2026-11-03 money-leak audit) ──
     "operator_runway_alert_hours": (6.0, "hours"),
     "operator_standing_pods_usd_per_hour": ((), "rates"),
-    "operator_daily_cap_scope": ("all", "scope"),
+    "operator_daily_cap_scope": ("miner_legs", "scope"),
     "miner_waste_alert_usd": (15.0, "usd"),
     "king_pod_ttl_margin_seconds": (0, "seconds"),
     "king_idle_reap_checks": (2, "count"),
@@ -46,6 +46,9 @@ MONEY_KNOBS: dict[str, tuple[object, str]] = {
     # second audit (B): an ssh checkpoint harvest is bounded at
     # expected_checkpoint_gb x this (0 = unbounded)
     "harvest_max_bytes_factor": (1.2, "gb"),
+    # review M2: the expected checkpoint per model size (arch preset → GB);
+    # expected_checkpoint_gb is the floor
+    "expected_checkpoint_gb_by_preset": ((), "rates"),
     # audit M: the operator pool is switched on explicitly, never by a cap
     "ops_operator_pool_enabled": (False, "bool"),
     # audit D: our own validator's hotkey; its rejected receipts of OUR
@@ -54,9 +57,12 @@ MONEY_KNOBS: dict[str, tuple[object, str]] = {
 }
 
 # ``operator_daily_cap_scope``: which booked operator spend counts toward the
-# daily cap. "all" = every operator allocation (king pods, backups, CPU VMs,
-# lemons, miner legs); "miner_legs" = the #417 behaviour (miner legs only).
-DAILY_CAP_SCOPES = ("all", "miner_legs")
+# daily cap. "miner_legs" (default) = operator-billed miner legs only (the #417
+# behaviour); "all" = + CPU VMs, lemons and other operator pods, but NOT the
+# king pod / backups; "all_incl_king" = everything (review H2: a king era's
+# ~$240-300 booking would otherwise refuse every make-good until midnight).
+# The runway guard covers total spend either way.
+DAILY_CAP_SCOPES = ("miner_legs", "all", "all_incl_king")
 
 
 def _whole(value: object) -> int | None:
