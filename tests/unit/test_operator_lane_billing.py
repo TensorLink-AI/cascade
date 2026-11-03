@@ -354,26 +354,36 @@ def _flight_queue(tmp_path, t, **kw):
     return q
 
 
-def test_operator_billed_operator_fault_retries_fixed_without_streak(tmp_path):
+def test_operator_billed_operator_fault_backs_off_from_the_knob_and_pauses_at_the_cap(tmp_path):
+    """2026-11-02: no flat hot loop — the operator-billed retry doubles from
+    ``operator_billed_retry_seconds``; every fault counts; the cap pauses."""
+    from cascade.funding.queue import PAUSED_STATUS
+
     t = [1000.0]
     q = _flight_queue(tmp_path, t)
     q.set_operator_billed("hk", True)
-    for i in range(5):
+    for i in range(2):
         assert q.requeue("hk", error="lane fault", error_class=OPERATOR_FAULT_CLASS,
                          burn_attempt=False)
         e = q.get("hk")
-        assert e.not_before == t[0] + 60.0 and e.infra_streak == 0 and e.attempts == 0
+        assert e.not_before == t[0] + 60.0 * 2 ** i and e.infra_streak == i + 1
+        assert e.attempts == 0 and e.operator_requeues == i + 1 and e.status == "queued"
         t[0] = e.not_before
         assert q.mark_in_flight("hk", "r@1", target_boundary=1, era_index=1,
                                 started_block=2 + i)
+    q.requeue("hk", error="lane fault", error_class=OPERATOR_FAULT_CLASS, burn_attempt=False)
+    e = q.get("hk")
+    assert e.status == PAUSED_STATUS and e.attempts == 0 and e.operator_requeues == 3
+    t[0] += 10 ** 6
+    assert not q.mark_in_flight("hk", "r@1", target_boundary=1, era_index=1, started_block=9)
 
 
-def test_requeue_flagging_operator_billed_gets_the_fixed_retry(tmp_path):
+def test_requeue_flagging_operator_billed_starts_from_the_knob(tmp_path):
     t = [1000.0]
     q = _flight_queue(tmp_path, t, operator_billed_retry_seconds=30)
     q.requeue("hk", error="x", error_class=OPERATOR_FAULT_CLASS, burn_attempt=False,
               operator_billed=True)
-    assert q.get("hk").not_before == 1030.0 and q.get("hk").infra_streak == 0
+    assert q.get("hk").not_before == 1030.0 and q.get("hk").infra_streak == 1
 
 
 def test_miner_billed_operator_fault_keeps_the_doubling_backoff(tmp_path):
@@ -440,7 +450,7 @@ def test_operator_capacity_probe_uses_the_operator_cap(monkeypatch):
     seen = []
     monkeypatch.setattr(cap_mod, "_lium_provider",
                         lambda rnd, price_caps=None: seen.append(price_caps) or object())
-    monkeypatch.setattr(op_mod, "operator_provider", lambda runner, factory: factory())
+    monkeypatch.setattr(op_mod, "operator_provider", lambda runner, factory, **kw: factory())
     r = _caps_runner(funded_max_price_per_hour=7.0, operator_max_price_per_hour=40.0)
     r._provider_capacity = lambda prov, skus, exclude: 3
     assert TrainerRunner._probe_funded_capacity(r, ("RTX4090",)) == 3
@@ -464,3 +474,8 @@ def test_operator_pool_adapter_uses_the_operator_cap(monkeypatch):
     pool = SimpleNamespace(runner=r, factory=lambda provider, key: object())
     op_mod.OperatorPool._adapter(pool, SimpleNamespace(provider="lium", api_key="k"))
     assert seen["max_price_per_hour"] == 40.0
+
+
+# The owner-approval gate (2026-11-02) is tested in test_money_safety.py;
+# these tests drive the operator-lane / operator-rent machinery behind it.
+pytestmark = pytest.mark.usefixtures("operator_legs_preapproved")

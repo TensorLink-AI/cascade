@@ -231,14 +231,14 @@ def train_mkt_leg(ops, leg: dict, recipe: MktLegRecipe) -> dict:  # pragma: no c
         if recovery is not None and recovery.operator_billed:
             raise LegFailure("operator-funded MarketCast recovery is waiting for operator "
                              "capacity; the miner is not charged again", miner_fault=False,
-                             error_class=OPERATOR_FAULT_CLASS, burn=False) from e
+                             error_class="operator_transient", burn=False) from e
         raise LegFailure(f"no marketplace capacity on the payer key ({e})",
                          miner_fault=False, error_class="no_capacity", burn=False) from e
     except Exception as e:
         verdict = r._funded_leg_failures.pop(leg["hotkey"], None)
         if verdict is None:
             raise LegFailure(f"marketcast leg failed (operator side): {e}", miner_fault=False,
-                             error_class=OPERATOR_FAULT_CLASS, burn=False) from e
+                             error_class="operator_transient", burn=False) from e
         msg, miner_fault, error_class, burn = verdict
         raise LegFailure(msg or str(e), miner_fault=miner_fault, error_class=error_class,
                          burn=burn) from e

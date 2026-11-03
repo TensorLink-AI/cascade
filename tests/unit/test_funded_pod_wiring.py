@@ -103,7 +103,8 @@ def _runner(tmp_path, *, sku="RTX4090", image="ghcr.io/x/worker@sha256:" + "c" *
                  "_operator_rent_allowed", "_operator_recovery_available",
                  "_operator_leg_pod_prefix",
                  "_is_operator_leg_pod_of", "_rent_operator_leg_host",
-                 "_run_operator_rented_leg", "_payer_pod_provider", "_operator_pod_provider"):
+                 "_run_operator_rented_leg", "_payer_pod_provider", "_operator_pod_provider",
+                 "_route_lost_run_to_operator", "_fallback_price_caps"):
         setattr(fake, name, getattr(TrainerRunner, name).__get__(fake))
     # The sweep's per-pod guard (live worker / unharvested run / unreachable
     # grace) has its own tests (test_sweep_pod_guard.py); here every candidate
@@ -1478,3 +1479,8 @@ def test_restart_sweep_reaps_other_payers_orphans_while_legs_are_in_flight(tmp_p
                         lambda o, v, **kw: (seen.update(kw), [])[1])
     runner._reconcile_funded_pods(keep_payers={"hkA"})
     assert seen and set(seen["exclude"]) == {"hkA"}
+
+
+# The owner-approval gate (2026-11-02) is tested in test_money_safety.py;
+# these tests drive the operator-lane / operator-rent machinery behind it.
+pytestmark = pytest.mark.usefixtures("operator_legs_preapproved")

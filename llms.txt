@@ -19,16 +19,12 @@ V2 synthetic generators must emit finite float arrays `(C, L)` with **exactly 32
 
 ## Before acting
 
-Launch target: v2 Lane A, **2026-10-30 12:00 UTC**, at the first era boundary
-at or after that target. Finalized chain timestamps determine the boundary.
-Burn is independent: 95% after 51% of eligible validator stake signals the
-release (`prelaunch-95-r2`), from the next settlement boundary. Installing
-the repo does not open a lane. B/C activation remains separate.
-
-Paid A entry opening: **2026-10-30 09:00 UTC**. Use a fresh revealed
-commitment at or after this opening. Accepted entries report `waiting_launch`
-until the actual v2 era; no training attempt starts during this hold.
-The opening is a floor, not a closing deadline. Planned order: **A → C → B**.
+V2 Lane A is live on mainnet: paid A entries opened **2026-10-30 09:00 UTC**
+and the first v2 era started at the first era boundary after 12:00 UTC
+(block 9,399,600). Use a revealed commitment made at or after the opening;
+earlier reveals are refused. Settlements are 900 blocks (about 3 h) apart;
+an era is 4 settlements (about 12 h). B/C activation remains separate.
+Planned order: **A → C → B**.
 
 From the intended release's installed environment:
 
@@ -72,11 +68,47 @@ on Cascade MoE Base - 17.58M, 69.02M or 273.84M. Model names use total parameter
 a complete `--chain-toml` config. See [preset instructions](deploy/presets/README.md)
 and [the architecture and recipe](docs/MODEL.md). Cascade MoE Base - 1.23B has
 1,234,607,520 total / 112,070,048 active parameters; 56M is unspecified.
-GPU memory and throughput are unmeasured for this port.
+GPU memory and throughput are unmeasured for this port, except the 1.23B
+model's wall: ≈ 3.5 h per full 23,841-step leg on both 8xH100 and 8xH200
+(mainnet, 2026-11-01/02). Mainnet rents only `8xH100`/`8xH200` pods.
 Keep candidate and baseline on identical model, budget, seeds, pool and compatible
 init; use separate histories per model. Omit `--warm-start live` for small-model
 experiments. Use it for the final check against the live model and checkpoint.
 A small-model gain is not a live win or reward.
+
+Score on real held-out data: the public eval pool
+[Tensor-Link/cascade-eval-pool](https://huggingface.co/datasets/Tensor-Link/cascade-eval-pool)
+is a lagged reveal of **retired** validator snapshots, byte-identical to what
+was scored. Use `snapshots/<as_of>-block-<N>/` folders (legacy date-only
+folders through 2026-08-03 are rebuilds); the latest is
+`snapshots/2026-10-31-block-9388800` (3,841 series). Each holds the scored
+`block-<N>.tar`, `POOL_SHA256`, unpacked `<series_id>.npy`, `metadata.json`
+(`freq`, `seasonal_period`, `domain`, `source`; older snapshots can include
+sources no longer used) and `provenance.json`. Point `--pool-dir` at one
+snapshot folder; it reads the `.npy` files and `metadata.json` and ignores
+the rest. It is an evaluation set: never train a generator on it. The live
+private pool is newer, never revealed, and built only from
+[TSBench-Forge](https://github.com/tensorlink-dev/TSBench-Forge) across the 7
+GIFT-Eval domains (econ_fin, energy, healthcare, nature, sales, transport,
+web_cloudops), so local scores are directional.
+
+```bash
+huggingface-cli download Tensor-Link/cascade-eval-pool --repo-type dataset \
+  --include "snapshots/2026-10-31-block-9388800/*" --local-dir ./cascade-eval-pool
+cascade iterate ./my-gen --pool-dir ./cascade-eval-pool/snapshots/2026-10-31-block-9388800 \
+  --seeds 0,1 --warm-start live --json
+```
+
+`score`/`iterate` really train (default `[round] heat_train_hours`, 1 h;
+`--train-hours 0.01` is a smoke test), run your generator locally without
+the sandbox, and score only on the given pool. They do not run the public
+GIFT-Eval/BOOM/TIME/FEV benchmarks: those run in the separate `benchmarks/`
+sidecar and, on mainnet, can only block a private-pool win.
+
+Geometry on mainnet v2: every yield is `(32, L)` (no padding, so pack
+narrower processes into the 32 rows; `groups` labels are optional); each
+step trains 16 series × 32 channels at context 4096 for 23,841 steps;
+series longer than 4096 are cropped into random 4096-point windows.
 
 | Lane | Contribution | What a successful contribution does |
 |---|---|---|

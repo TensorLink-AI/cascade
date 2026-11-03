@@ -365,7 +365,7 @@ def test_identity_cache_persists_across_a_restart(tmp_path):
     assert (tmp_path / A.IDENTITY_FILE).is_file()
     restarted, failures = _admission_runner(tmp_path)               # a new process, cold memory
     assert A.owner_of(restarted, "hk") == "owner"
-    with A.owner_admission(restarted, "hk"):
+    with A.owner_admission(restarted, "hk", cpu_tier=True):        # an operator-paid CPU slot
         assert restarted._owner_slots.active == 1
     assert failures == []
 
@@ -375,6 +375,8 @@ def test_persisted_identity_still_expires(tmp_path):
         json.dumps({"hk": ["owner", 1.0]}))                          # resolved long ago
     r, _ = _admission_runner(tmp_path)
     assert A.owner_of(r, "hk") == ""
+    # ... except for the per-coldkey limit, which uses the last persisted one
+    assert A.owner_of(r, "hk", max_age=None) == "owner"
 
 
 def test_a_corrupt_identity_file_starts_cold_never_crashes(tmp_path):
@@ -385,21 +387,17 @@ def test_a_corrupt_identity_file_starts_cold_never_crashes(tmp_path):
     assert A.owner_of(r, "hk") == "o"
 
 
-def test_new_admission_still_needs_an_identity_but_a_reattach_does_not():
-    from cascade.trainer.faults import _FundedLegSkip
-
+def test_an_unknown_owner_never_blocks_and_miner_key_legs_take_no_slot():
+    """Money safety II (audit F): the per-coldkey limit bounds OPERATOR-paid
+    work only; an unknown owner proceeds (a slow chain read never blocks)."""
     r, failures = _admission_runner()
-    with pytest.raises(_FundedLegSkip), A.owner_admission(r, "hk"):
-        pass
-    assert failures and "coldkey identity is unavailable" in failures[0][1]
-    A.mark_admitted(r, "hk")
     entered = []
-    with A.owner_admission(r, "hk"), A.owner_admission(r, "hk"):    # outer + the leg's nested gate
+    with A.owner_admission(r, "hk", cpu_tier=True), A.owner_admission(r, "hk", cpu_tier=True):
         entered.append(True)
-    assert entered == [True]
-    A.clear_admitted(r, "hk")
-    with pytest.raises(_FundedLegSkip), A.owner_admission(r, "hk"):
-        pass
+    assert entered == [True] and failures == []
+    A.remember_owners(r, [types.SimpleNamespace(hotkey="hk", coldkey="o", commit_block=1)])
+    with A.owner_admission(r, "hk"):                                # a miner-key GPU leg
+        assert getattr(r, "_owner_slots", None) is None or r._owner_slots.active == 0
 
 
 def test_a_reattached_leg_takes_its_slot_over_the_owner_limit():
@@ -410,14 +408,14 @@ def test_a_reattached_leg_takes_its_slot_over_the_owner_limit():
     hold, done = threading.Event(), threading.Event()
 
     def first():
-        with A.owner_admission(r, "hk1"):
+        with A.owner_admission(r, "hk1", cpu_tier=True):
             hold.set()
             done.wait(5)
 
     t = threading.Thread(target=first)
     t.start()
     assert hold.wait(5)
-    with A.owner_admission(r, "hk2", deadline=0.0):                 # never waits, never refused
+    with A.owner_admission(r, "hk2", deadline=0.0, cpu_tier=True):  # never waits, never refused
         assert r._owner_slots.owners["same"] == 2
     done.set()
     t.join(5)

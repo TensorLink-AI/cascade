@@ -27,6 +27,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import os
 import re
 import secrets
 import shlex
@@ -97,12 +98,18 @@ class RemoteDispatchError(RuntimeError):
     pod's lanes rather than blaming the leg. ``None`` for parse/timeout/logic
     failures that carry no ssh status."""
 
-    def __init__(self, *args, returncode: int | None = None) -> None:
+    def __init__(self, *args, returncode: int | None = None,
+                 final_exception: str = "") -> None:
         super().__init__(*args)
         self.returncode = returncode
         # set by the dispatcher from the worker's exit + stdout only
         # (:func:`worker_image_refusal`) — never from message text
         self.image_refusal = False
+        # The worker's final traceback exception line, parsed from its stderr
+        # by the dispatcher (final_exception_line) — the ONLY input the shard
+        # fault classifier trusts, never the message text, which carries a
+        # stderr tail anything on the pod could have printed.
+        self.final_exception = final_exception
 
 
 HOST_STAGES = ("any", "heat", "final")
@@ -389,7 +396,7 @@ def pod_lane_count(host: RemoteHost, hosts: list[RemoteHost] | None) -> int:
 
 def build_remote_command(
     host: RemoteHost, argv: list[str], env: dict[str, str],
-    *, lane_count: int | None = None,
+    *, lane_count: int | None = None, wrap=None,
 ) -> tuple[str, str | None]:
     """The shell string ssh runs on the pod plus the stdin payload that carries
     the forwarded env: ``(command, stdin_env)``.
@@ -427,6 +434,8 @@ def build_remote_command(
     # `set -m` gives the backgrounded job its own pgid ($w); `wait` collects
     # the worker's rc; `kill -- -$w` reaps the group; the rc is preserved.
     guarded = _guarded_worker(prefix, argv)
+    if wrap is not None:                 # e.g. the shard prefetch (with_prefetch)
+        guarded = wrap(guarded)
     command = f"{PREEMPT_BENCHMARKS}cd {shlex.quote(host.workdir)} && {source}{guarded}"
     return command, stdin_env
 
@@ -724,6 +733,20 @@ def last_traceback(lines: list[str], *, max_lines: int = 60) -> list[str]:
     return block[-max_lines:]
 
 
+def final_exception_line(stderr: str) -> str:
+    """The exception line that closes the worker's LAST real traceback in
+    ``stderr`` — ``""`` when there is none, or when the block is cut off
+    before its exception line (the tail ended inside the frames)."""
+    lines, _ = split_job_notices(stderr or "")
+    tb = last_traceback(lines)
+    if len(tb) < 2:
+        return ""
+    last = tb[-1]
+    if not last.strip() or last[:1].isspace() or last.lstrip().startswith(_TRACEBACK_HEAD):
+        return ""
+    return last.strip()
+
+
 def summarize_failure(stderr: str, *, rc, progress: dict | None = None,
                       tail_chars: int = 1500) -> tuple[str, str]:
     """``(cause, detail)`` for a failed leg. ``cause`` is one line — exit
@@ -802,9 +825,33 @@ def save_failed_leg_evidence(root, hotkey: str, *, header: dict, stdout: str, st
 
 
 def _detached_kill_command(host: RemoteHost, run_dir: str) -> str:
+    """Kill a detached leg: its whole SESSION (the launcher's ``setsid``
+    makes the recorded pid the session id; the guarded worker runs under
+    ``set -m`` in its own process GROUP inside it, so a group kill of the
+    pid misses it), then the shard prefetch's own session (with_prefetch).
+    Each pid is first checked against ``/proc/<pid>/cmdline`` — the leg's
+    shell names its run dir, the prefetch its script — so a pid the kernel
+    reused for an unrelated process is never signalled."""
     rd = shlex.quote(run_dir)
     return (f"cd {shlex.quote(host.workdir)} && p=$(cat {rd}/pid 2>/dev/null); "
-            f"[ -n \"$p\" ] && {{ kill -KILL -- -$p 2>/dev/null; kill -KILL $p 2>/dev/null; }}; true")
+            f"[ -n \"$p\" ] && tr '\\0' ' ' </proc/$p/cmdline 2>/dev/null "
+            f"| grep -qF -- {rd} && "
+            f"{{ pkill -KILL -s $p 2>/dev/null; kill -KILL -- -$p 2>/dev/null; "
+            f"kill -KILL $p 2>/dev/null; }}; "
+            f"q=$(cat {rd}/{PREFETCH_PID_NAME} 2>/dev/null); "
+            f"[ -n \"$q\" ] && {_prefetch_alive('$q')} && "
+            f"{{ pkill -KILL -s $q 2>/dev/null; kill -KILL -- -$q 2>/dev/null; "
+            f"kill -KILL $q 2>/dev/null; }}; true")
+
+
+def _prefetch_alive(pid_expr: str) -> str:
+    """A shell test: ``pid_expr`` is a live process whose argv[1] IS a
+    prefetch.sh path (``bash <corpus>/prefetch.sh <ppid>``). Matching argv[1]
+    alone, not the whole command line: every prefetch-wrapped leg shell
+    (``bash -c "... $pfd/prefetch.sh ..."``) also holds that text, and a stale
+    pid the kernel reused for another lane's leg shell must never pass."""
+    return (f"tr '\\0' '\\n' </proc/{pid_expr}/cmdline 2>/dev/null "
+            f"| sed -n 2p | grep -q '/prefetch[.]sh$'")
 
 
 def run_detached(host: RemoteHost, body: str, stdin_env: str | None, run_dir: str, *,
@@ -1132,6 +1179,52 @@ def probe_pod_hygiene(host: RemoteHost, checkpoint_dir: str, *, timeout: float =
     return parse_hygiene_output(p.stdout or "")
 
 
+# Money safety II: before a watchdog abort on a MINER's pod is booked as our
+# fault (an operator make-good, a quarantined host), the pod is asked whether
+# something other than our worker holds its GPUs (a miner's own GPU hog).
+_GPU_PROCS_TOKEN = "__CASCADE_GPU_PROCS__"
+_OUR_GPU_PROC_MARKERS = ("cascade.trainer.worker", "cascade/trainer/worker", "cascade-train-worker",
+                         "torchrun", "cascade.trainer", "host_probe", "nccl_preflight")
+
+
+def _gpu_procs_command() -> str:
+    return ("for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null); do "
+            "printf 'GPU:%s:' \"$p\"; tr '\\0' ' ' < /proc/$p/cmdline 2>/dev/null; echo; done; "
+            f"echo {_GPU_PROCS_TOKEN}")
+
+
+def parse_foreign_gpu_procs(stdout: str) -> list[str]:
+    """``GPU:<pid>:<cmdline>`` lines whose cmdline is READABLE and not one of
+    ours. Inside a container nvidia-smi often reports host-namespace PIDs
+    whose ``/proc/<pid>/cmdline`` is empty or missing: that is UNKNOWN, never
+    foreign (review H1a — our own worker must never read as a miner's hog)."""
+    out = []
+    for ln in (stdout or "").splitlines():
+        if not ln.startswith("GPU:"):
+            continue
+        _tag, _pid, cmd = (ln.split(":", 2) + ["", ""])[:3]
+        if not cmd.strip():
+            continue                        # unreadable: unknown, not foreign
+        if not any(m in cmd for m in _OUR_GPU_PROC_MARKERS):
+            out.append(ln[4:][:200])
+    return out
+
+
+def probe_foreign_gpu_procs(host: RemoteHost, *, timeout: float = 60.0,
+                            runner=None) -> tuple[list[str] | None, str]:
+    """``(foreign GPU processes, "")`` on ``host`` — compute apps whose
+    cmdline is not our worker's — or ``(None, why)`` when the pod could not
+    be asked (unknown is never read as "clean" nor as "foreign")."""
+    run = runner or run_ssh
+    try:
+        p = run(build_ssh_argv(host, _gpu_procs_command()), int(timeout), "")
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return None, f"{type(e).__name__}: {e}"
+    if p.returncode != 0 or _GPU_PROCS_TOKEN not in (p.stdout or ""):
+        return None, f"rc={p.returncode} {(p.stderr or '').strip()[-160:]}"
+    return parse_foreign_gpu_procs(p.stdout or ""), ""
+
+
 HOST_BENCH_PROBE_TIMEOUT_SECONDS = 120.0
 _HOST_BENCH_PROBE_PY = (
     "import json; from cascade.trainer.host_probe import host_bench; "
@@ -1445,6 +1538,59 @@ class _ProgressReader:
 # caller's infra path), never hang the leg — for the era king, forever.
 HARVEST_TIMEOUT_SECONDS = 3600
 HARVEST_STALL_SECONDS = 300.0
+# Past ``timeout`` a stream that is still MOVING at a usable average rate keeps
+# going (2026-11-03: a 14.8 GB make-good checkpoint off a ~2.6 MB/s host was
+# killed at 3600 s with 14.68 GB received and the pod torn down — the finished
+# run lost). The stall guard above still kills a dead stream within 300 s; a
+# trickle below HARVEST_MIN_RATE_BYTES_PER_S fails at ``timeout`` as before, and
+# HARVEST_HARD_CAP_SECONDS bounds every harvest absolutely.
+HARVEST_MIN_RATE_BYTES_PER_S = 1_000_000
+HARVEST_HARD_CAP_SECONDS = 6 * 3600
+
+
+# The rate judged past ``timeout`` is the RECENT one (money safety II, #418
+# follow-up): an average since start let a fast-start-then-trickle stream
+# live ~3.9 h on its early bytes.
+HARVEST_RATE_WINDOW_SECONDS = 600.0
+
+
+def harvest_total_breach(elapsed: float, nbytes: int, timeout: float, *,
+                         recent_rate: float | None = None) -> str | None:
+    """Why a still-flowing harvest stream must stop now, or ``None``: past
+    ``timeout`` only when its rate is below the floor — ``recent_rate`` (the
+    last :data:`HARVEST_RATE_WINDOW_SECONDS`) when given, else the average —
+    and always past the hard cap."""
+    if elapsed > HARVEST_HARD_CAP_SECONDS:
+        return (f"no complete archive within the {HARVEST_HARD_CAP_SECONDS}s hard cap "
+                f"({nbytes} bytes received)")
+    rate = recent_rate if recent_rate is not None else nbytes / max(elapsed, 1e-9)
+    what = (f"last {HARVEST_RATE_WINDOW_SECONDS:.0f}s" if recent_rate is not None
+            else "average")
+    if elapsed > timeout and rate < HARVEST_MIN_RATE_BYTES_PER_S:
+        return (f"no complete archive within {timeout}s ({nbytes} bytes received, "
+                f"{rate / 1e6:.2f} MB/s {what} < "
+                f"{HARVEST_MIN_RATE_BYTES_PER_S / 1e6:.2f} MB/s floor)")
+    return None
+
+
+class _RateWindow:
+    """``(t, nbytes)`` samples → the byte rate over the last ``window`` s
+    (None until the window is covered)."""
+
+    def __init__(self, window: float = HARVEST_RATE_WINDOW_SECONDS) -> None:
+        import collections
+
+        self.window = float(window)
+        self.samples = collections.deque()
+
+    def add(self, t: float, nbytes: int) -> float | None:
+        self.samples.append((t, nbytes))
+        while len(self.samples) > 1 and t - self.samples[1][0] >= self.window:
+            self.samples.popleft()
+        t0, n0 = self.samples[0]
+        if t - t0 < self.window:
+            return None
+        return (nbytes - n0) / max(t - t0, 1e-9)
 
 
 def harvest_remote_dir(host: RemoteHost, remote_dir: str, dest: Path | str,
@@ -1462,17 +1608,21 @@ def harvest_remote_dir(host: RemoteHost, remote_dir: str, dest: Path | str,
     refused — a hostile archive fails the harvest instead of writing outside
     it (or smuggling ``/etc`` into the later upload via a symlink).
 
-    Bounded twice: ``timeout`` seconds for the whole stream and
-    ``stall_timeout`` seconds without a single byte. A watchdog thread kills
+    Bounded three ways: ``stall_timeout`` seconds without a single byte;
+    ``timeout`` seconds for the whole stream unless it is still averaging at
+    least :data:`HARVEST_MIN_RATE_BYTES_PER_S`; and
+    :data:`HARVEST_HARD_CAP_SECONDS` absolutely. A watchdog thread kills
     ssh on either breach, and the harvest raises :class:`RemoteDispatchError`."""
     import shutil
-    import tarfile
     import threading
 
     dest = Path(dest)
     if dest.exists():
         shutil.rmtree(dest)
-    dest.mkdir(parents=True)
+    if runner is not None:
+        dest.mkdir(parents=True)
+    else:
+        dest.parent.mkdir(parents=True, exist_ok=True)
     # The worker runs under ``cd host.workdir`` (see build_remote_command), so a
     # ``--local-only`` receipt's checkpoint dir is relative to THAT — but this is
     # a fresh ssh session whose cwd is the login home. Resolve the harvest in the
@@ -1488,19 +1638,74 @@ def harvest_remote_dir(host: RemoteHost, remote_dir: str, dest: Path | str,
                 f"checkpoint harvest from {host.name}:{remote_dir} failed "
                 f"(rc={proc.returncode})", returncode=proc.returncode)
         return dest
+    # Saved robustly (2026-11-02): extracted into a sibling ``.partial-*``
+    # dir, fsynced, then renamed onto ``dest`` — a half-written checkpoint
+    # never looks complete, and any failure (ENOSPC mid-write included)
+    # removes the partial copy instead of leaving it to fill the disk.
+    work = dest.with_name(f"{dest.name}.partial-{os.getpid()}-{threading.get_ident()}")
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True)
+    try:
+        _harvest_stream_into(host, remote_dir, argv, work, timeout=timeout,
+                             stall_timeout=stall_timeout, max_bytes=max_bytes)
+        _fsync_tree(work)
+        os.replace(work, dest)
+        _fsync_dir(dest.parent)
+    except BaseException:
+        shutil.rmtree(work, ignore_errors=True)
+        raise
+    return dest
+
+
+def _fsync_dir(path: Path) -> None:
+    with contextlib.suppress(OSError):
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
+def _fsync_tree(root: Path) -> None:
+    """fsync every regular file and directory under ``root`` (durable before
+    the rename publishes it)."""
+    for dirpath, _dirs, files in os.walk(root):
+        for name in files:
+            p = Path(dirpath) / name
+            if p.is_symlink() or not p.is_file():
+                continue
+            fd = os.open(p, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        _fsync_dir(Path(dirpath))
+
+
+def _harvest_stream_into(host, remote_dir: str, argv: list[str], dest: Path, *,
+                         timeout: int, stall_timeout: float, max_bytes: int | None) -> None:
+    """The tar-over-ssh stream of :func:`harvest_remote_dir`, extracted into
+    ``dest`` under the ``"data"`` filter and both deadlines."""
+    import tarfile
+    import threading
+
     ssh = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     stream = _ProgressReader(ssh.stdout)
     started = time.monotonic()
     stop = threading.Event()
     breach: list[str] = []
 
+    rate_window = _RateWindow()
+
     def _watchdog() -> None:
         poll = max(0.05, min(5.0, float(stall_timeout) / 4))
         while not stop.wait(poll):
             now = time.monotonic()
-            if now - started > timeout:
-                breach.append(f"no complete archive within {timeout}s "
-                              f"({stream.nbytes} bytes received)")
+            recent = rate_window.add(now, stream.nbytes)
+            why = harvest_total_breach(now - started, stream.nbytes, timeout,
+                                       recent_rate=recent)
+            if why:
+                breach.append(why)
             elif now - stream.last_progress > stall_timeout:
                 breach.append(f"stream stalled: no bytes for {stall_timeout:.0f}s "
                               f"({stream.nbytes} bytes received)")
@@ -1574,7 +1779,6 @@ def harvest_remote_dir(host: RemoteHost, remote_dir: str, dest: Path | str,
             f"checkpoint harvest from {host.name}:{remote_dir} failed "
             f"(ssh rc={ssh_rc}): {err!r}", returncode=ssh_rc)
     ssh.stderr.close()
-    return dest
 
 
 # The pod-side hash of a whole checkpoint dir (~14.5 GB: weights,
@@ -1704,6 +1908,11 @@ class RemoteDispatcher:
     # dispatch (cascade.trainer.leg_pins.dispatch_host_hook) — installed only
     # while an automatic image repin is configured; None = unchanged dispatch.
     host_hook: object = field(default=None, repr=False)
+    # Shards legs: start the pod-side corpus prefetch beside the worker
+    # (prefetch_files / with_prefetch; [round] funded_prefetch_shards). Off by
+    # default here so test doubles keep their exact ssh call sequence; the
+    # live trainer arms it from config.
+    prefetch_shards: bool = False
     _runner: object = field(default=None, repr=False)  # injectable for tests
 
     def dispatch(
@@ -1768,10 +1977,29 @@ class RemoteDispatcher:
                     if role == "mkt_finetune" and finetune_recipe else finetune_recipe), "suffix": repo_suffix,
                 "train_hours": train_hours, "router_slow": router_slow, "anneal": anneal})
         corpus_dir = None
+        prefetch = None
         if corpus_files:
-            corpus_dir = push_corpus_files(host, corpus_files,
-                                           f"{role}-{hotkey[:12]}-{int(base_seed)}",
+            corpus_tag = f"{role}-{hotkey[:12]}-{int(base_seed)}"
+            corpus_dir = push_corpus_files(host, corpus_files, corpus_tag,
                                            runner=self._runner)
+            if self.prefetch_shards:
+                prefetch = prefetch_files(corpus_files, corpus_dir)
+
+        def _arm_prefetch(command: str, run_dir: str | None = None) -> str:
+            # Push + start the corpus prefetch beside a FRESH launch only (a
+            # reattach must not rewrite a script a live prefetch is running).
+            # Any failure here launches the worker exactly as before.
+            if not prefetch:
+                return command
+            try:
+                push_corpus_files(host, prefetch, corpus_tag, runner=self._runner)
+            except (RemoteDispatchError, subprocess.TimeoutExpired, OSError) as e:
+                log.warning("dispatch role=%s → %s: shard prefetch not started (%s) — "
+                            "the worker streams shards itself", role, host.name, e)
+                return command
+            log.info("dispatch role=%s → %s: shard prefetch armed (%d shards) in %s",
+                     role, host.name, prefetch[PREFETCH_LIST_NAME].count("\n"), corpus_dir)
+            return with_prefetch(command, corpus_dir, run_dir)
         argv = worker_argv(
             host, gen_ref=gen_ref, uid=uid, hotkey=hotkey, role=role,
             base_seed=base_seed, block=block, trainer_spec=self.trainer_spec,
@@ -1811,6 +2039,8 @@ class RemoteDispatcher:
             run_dir = prior or detached_run_dir(host, tag)
             body = _guarded_worker(_lane_prefix(host, lane_count) + _progress_prefix(run_dir),
                                    argv)
+            if prior is None:
+                body = _arm_prefetch(body, run_dir)
             if mirror is not None and prior is None:
                 mirror.restore()
             try:
@@ -1826,7 +2056,8 @@ class RemoteDispatcher:
                 if mirror is not None:
                     mirror.close()
         else:
-            remote_cmd, stdin_env = build_remote_command(host, argv, env, lane_count=lane_count)
+            remote_cmd, stdin_env = build_remote_command(
+                host, argv, env, lane_count=lane_count, wrap=_arm_prefetch)
             ssh_argv = build_ssh_argv(host, remote_cmd)
             try:
                 proc = (self._runner or run_ssh)(ssh_argv, self.timeout_seconds, stdin_env)
@@ -1858,6 +2089,7 @@ class RemoteDispatcher:
             err = RemoteDispatchError(
                 f"remote {role} on {host.name} failed (rc={proc.returncode}) {cause}{where}"
                 + (f"\n{detail}" if detail else ""),
+                final_exception=final_exception_line(proc.stderr or ""),
                 returncode=proc.returncode,
             )
             err.image_refusal = worker_image_refusal(proc.returncode, proc.stdout or "")
@@ -1905,6 +2137,254 @@ def push_corpus_files(host: RemoteHost, files: dict[str, str], tag: str, *,
             raise RemoteDispatchError(
                 f"pushing {name} to {host.name} failed: {(proc.stderr or '')[-300:]}")
     return pod_dir
+
+
+# ── shard prefetch (trainer-side; works with any worker image) ──────────────
+#
+# A shards leg's worker streams its corpus from pre-signed links while it
+# trains; a reader on an older image has no retry, so one bad download kills
+# the leg mid-run (2026-11-02 c4-00030: step 7650/23841 on an 8xH200). The
+# dispatcher therefore pushes a small pod-side script next to corpus.json /
+# urls.json and starts it in the BACKGROUND alongside the worker. It fetches
+# every shard in the reader's own consumption order (shard k of every child
+# before shard k+1), each with bounded retries + timeouts, checks the bytes
+# against corpus.json's sha256, writes to a hidden temp name and only then
+# renames it into place. Why that is safe against a reader that is already
+# running (cascade.generation.shards._child_iter, unchanged since the rc15
+# image's 5e3fade):
+#
+# * the reader only ever opens ``<dir>/<name>``; a rename(2) within one
+#   directory is atomic, so it sees either no file or the complete, verified
+#   one — never a partial write (temps are ``.<name>.prefetch-<pid>``, which
+#   no reader looks at and which cannot collide with get_file's ``.part``);
+# * a shard already on disk is read in place, NOT downloaded (``start(i)``
+#   returns None when the file exists; the plain path when all exist) — and
+#   the plain path reads with verify=False, which is why the prefetch must
+#   verify BEFORE the rename;
+# * same bytes ⇒ same series in the same order: the prefetch never changes
+#   what trains, only where the reader gets the bytes from;
+# * a rename over a file the reader holds open leaves its fd on the old inode
+#   (identical bytes), and the reader's unlink-after-read of a remote shard
+#   at worst makes a lagging prefetch re-land a file no one reads again.
+#
+# The script never fails the leg: it skips with a WARNING when the pod lacks
+# the disk, gives up a shard after its retries (the worker then fetches that
+# one itself, as before), always exits 0, and is killed when the worker
+# exits (or stops itself when the leg's shell is gone). A prefetch problem is
+# therefore at worst the status quo — never a charge to the miner.
+
+PREFETCH_SCRIPT_NAME = "prefetch.sh"
+PREFETCH_PID_NAME = "prefetch.pid"      # in the leg's detached run dir
+PREFETCH_LIST_NAME = "prefetch.tsv"
+PREFETCH_PARALLEL = 8
+PREFETCH_ATTEMPTS = 5
+# Free disk the prefetch requires beyond the corpus's stored bytes: +10% and
+# a flat 20 GiB for checkpoints/logs the leg writes on the same volume.
+PREFETCH_MARGIN_FRACTION = 0.10
+PREFETCH_MARGIN_BYTES = 20 * 1024 ** 3
+_PREFETCH_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
+_PREFETCH_SHA_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def prefetch_need_bytes(stored_bytes: int) -> int:
+    """Free bytes the pod needs before a prefetch is started."""
+    return int(stored_bytes * (1.0 + PREFETCH_MARGIN_FRACTION)) + PREFETCH_MARGIN_BYTES
+
+
+def prefetch_list(index: dict, urls: dict[str, str]) -> str:
+    """``name<TAB>sha256<TAB>expiry<TAB>url`` per shard, in the reader's
+    consumption order (round-robin over children by shard position — the
+    order iter_corpus reaches them), so the prefetch lands ahead of it.
+    Raises ``ValueError`` on anything the shell side could misparse."""
+    from ..generation.transfer import link_expiry_epoch
+
+    children = sorted(index.get("children") or [], key=lambda c: int(c["index"]))
+    depth = max((len(c.get("shards") or []) for c in children), default=0)
+    rows = []
+    for k in range(depth):
+        for c in children:
+            shards = c.get("shards") or []
+            if k >= len(shards):
+                continue
+            sh = shards[k]
+            name, sha = str(sh.get("name", "")), str(sh.get("sha256", ""))
+            url = urls.get(name)
+            if url is None:
+                continue                    # a local shard: nothing to fetch
+            if not _PREFETCH_NAME_RE.match(name) or not _PREFETCH_SHA_RE.match(sha):
+                raise ValueError(f"unexpected shard entry {name[:40]!r}")
+            if not url.startswith(("https://", "http://")) or any(
+                    ch in url for ch in '"\\\t\r\n '):
+                raise ValueError(f"unexpected download link for {name}")
+            rows.append(f"{name}\t{sha}\t{link_expiry_epoch(url)}\t{url}\n")
+    return "".join(rows)
+
+
+def prefetch_script(corpus_dir: str, *, need_bytes: int, n_shards: int,
+                    parallel: int = PREFETCH_PARALLEL,
+                    attempts: int = PREFETCH_ATTEMPTS,
+                    floor_bytes: int | None = None) -> str:
+    """The pod-side bash prefetch (see the block comment above). Argument 1
+    is the pid of the leg's shell; the script stops itself once that is gone.
+    Links are fed to curl on stdin (``-K -``), never on a command line, and
+    are never printed — log lines carry shard names, codes and counts only."""
+    d = shlex.quote(corpus_dir)
+    need_kb = (int(need_bytes) + 1023) // 1024
+    floor_kb = (int(PREFETCH_MARGIN_BYTES if floor_bytes is None else floor_bytes) + 1023) // 1024
+    return f"""#!/usr/bin/env bash
+# cascade shard prefetch — generated by cascade.trainer.remote; do not edit.
+set -u
+dir={d}
+list="$dir/{PREFETCH_LIST_NAME}"
+owner="${{1:-}}"
+P={int(parallel)}; A={int(attempts)}; need_kb={need_kb}; floor_kb={floor_kb}; total={int(n_shards)}
+say() {{ echo "cascade-prefetch: $*" >&2; }}
+alive() {{ [ -z "$owner" ] || kill -0 "$owner" 2>/dev/null; }}
+free_kb() {{ df -Pk "$dir" 2>/dev/null | awk 'NR==2{{print $4}}'; }}
+if ! command -v curl >/dev/null 2>&1 || ! command -v sha256sum >/dev/null 2>&1; then
+  say "WARNING: curl/sha256sum missing; prefetch skipped, the worker streams shards itself"; exit 0
+fi
+avail_kb=$(free_kb)
+case "$avail_kb" in ''|*[!0-9]*)
+  say "WARNING: free disk unreadable for $dir; prefetch skipped, the worker streams shards itself"; exit 0;;
+esac
+if [ "$avail_kb" -lt "$need_kb" ]; then
+  say "WARNING: free disk ${{avail_kb}}KiB < needed ${{need_kb}}KiB; prefetch skipped, the worker streams shards itself"; exit 0
+fi
+rm -f "$dir"/.*.prefetch-* "$dir/.prefetch-failed" "$dir/.prefetch-expired" "$dir/.prefetch-stop" 2>/dev/null
+: > "$dir/.prefetch-failed"
+t0=$(date +%s)
+say "start: $total shards, $P parallel, ${{avail_kb}}KiB free"
+fetch() {{
+  local name=$1 sha=$2 exp=$3 url=$4 f="$dir/$1" a=1 delay=2 code rc tmp
+  if [ -f "$f" ] && [ "$(sha256sum < "$f" | cut -c1-64)" = "$sha" ]; then return 0; fi
+  tmp="$dir/.$name.prefetch-$BASHPID"
+  while :; do
+    [ -e "$dir/.prefetch-expired" ] || [ -e "$dir/.prefetch-stop" ] && return 1
+    alive || return 1
+    # Re-checked before every try: other lanes' legs on the same volume
+    # (or the worker's own checkpoints) may have used the room since start.
+    local fk; fk=$(free_kb)
+    case "$fk" in ''|*[!0-9]*) fk=0;; esac
+    if [ "$fk" -lt "$floor_kb" ]; then
+      [ -e "$dir/.prefetch-stop" ] || say "WARNING: free disk ${{fk}}KiB under the ${{floor_kb}}KiB floor; prefetch stopped, the worker streams the rest itself"
+      : > "$dir/.prefetch-stop"; return 1
+    fi
+    rm -f "$tmp"
+    code=$(printf 'url = "%s"\\n' "$url" | curl -sS -K - -o "$tmp" -w '%{{http_code}}' \\
+      --connect-timeout 30 --max-time 900 --speed-limit 102400 --speed-time 60 2>/dev/null)
+    rc=$?
+    if [ "$rc" -eq 0 ] && [ "$code" = 200 ] \\
+       && [ "$(sha256sum < "$tmp" | cut -c1-64)" = "$sha" ]; then
+      mv -f "$tmp" "$f" && return 0
+    fi
+    rm -f "$tmp"
+    if [ "$code" = 401 ] || [ "$code" = 403 ]; then
+      if [ "$exp" -gt 0 ] && [ "$(date +%s)" -ge "$exp" ]; then
+        : > "$dir/.prefetch-expired"
+        say "WARNING: $name: download link EXPIRED (HTTP $code); prefetch stopped — links need re-signing"
+        echo "$name" >> "$dir/.prefetch-failed"; return 1
+      fi
+    fi
+    if [ "$a" -ge "$A" ]; then
+      say "WARNING: $name: gave up after $A tries (curl rc=$rc, HTTP ${{code:-none}}); the worker fetches it itself"
+      echo "$name" >> "$dir/.prefetch-failed"; return 1
+    fi
+    say "$name: try $a/$A failed (curl rc=$rc, HTTP ${{code:-none}}); retrying"
+    sleep $(( delay / 2 + RANDOM % (delay / 2 + 1) ))
+    a=$((a + 1)); delay=$((delay * 2)); [ "$delay" -gt 60 ] && delay=60
+  done
+}}
+running=0
+while IFS=$'\\t' read -r name sha exp url; do
+  [ -n "$name" ] || continue
+  alive || {{ say "leg shell gone; prefetch stopped"; kill 0; exit 0; }}
+  [ -e "$dir/.prefetch-expired" ] || [ -e "$dir/.prefetch-stop" ] && break
+  fetch "$name" "$sha" "$exp" "$url" &
+  running=$((running + 1))
+  if [ "$running" -ge "$P" ]; then wait -n; running=$((running - 1)); fi
+done < "$list"
+wait
+nf=$(wc -l < "$dir/.prefetch-failed" | tr -d ' ')
+say "done: $total shards in $(( $(date +%s) - t0 ))s, $nf not prefetched"
+exit 0
+"""
+
+
+def prefetch_files(corpus_files: dict[str, str], corpus_dir: str) -> dict[str, str] | None:
+    """The prefetch script + its shard list for a remote corpus, or ``None``
+    (with a WARNING) when there is nothing to prefetch or the index cannot
+    size it. ``None`` means: launch as before, the worker streams."""
+    from ..generation.shards import INDEX_NAME, URLS_NAME
+
+    if URLS_NAME not in corpus_files or INDEX_NAME not in corpus_files:
+        return None
+    try:
+        index = json.loads(corpus_files[INDEX_NAME])
+        urls = json.loads(corpus_files[URLS_NAME])
+        if not isinstance(urls, dict):
+            raise ValueError("urls.json is not a mapping")
+        listing = prefetch_list(index, urls)
+        stored = int(index.get("stored_bytes") or 0)
+    except (ValueError, TypeError, KeyError) as e:
+        log.warning("shard prefetch skipped for %s: %s — the worker streams shards itself",
+                    corpus_dir, e)
+        return None
+    n = listing.count("\n")
+    if not n:
+        return None
+    if stored <= 0:
+        log.warning("shard prefetch skipped for %s: corpus.json carries no stored_bytes "
+                    "to size the disk check — the worker streams shards itself", corpus_dir)
+        return None
+    # The per-try floor also reserves room for every in-flight download (P
+    # parallel, sized at twice the mean shard) so P concurrent tries that all
+    # passed the check cannot overshoot it.
+    floor = PREFETCH_MARGIN_BYTES + PREFETCH_PARALLEL * 2 * -(-stored // n)
+    script = prefetch_script(corpus_dir, need_bytes=prefetch_need_bytes(stored), n_shards=n,
+                             floor_bytes=floor)
+    return {PREFETCH_LIST_NAME: listing, PREFETCH_SCRIPT_NAME: script}
+
+
+def _ere_escape(text: str) -> str:
+    """``text`` as a literal POSIX extended regex (for ``pgrep -f``)."""
+    out = []
+    for c in text:
+        if c in ".[]()*+?{}|$":
+            out.append(f"[{c}]")
+        elif c in "^\\":
+            out.append("\\" + c)
+        else:
+            out.append(c)
+    return "".join(out)
+
+
+def with_prefetch(command: str, corpus_dir: str, run_dir: str | None = None) -> str:
+    """``command`` (the guarded worker) with the corpus prefetch started
+    beside it in its OWN session (``setsid``: its own process group, so the
+    worker's group reap never touches it and it is killed as a group the
+    moment the worker exits). The worker's exit code is preserved; the
+    prefetch's never matters.
+
+    A prefetch of the same corpus left over from an earlier launch (a killed
+    or timed-out leg) is killed first, by group. The pattern is a regex whose
+    ``[.]`` cannot match this launching shell's own command line, and the
+    script is started as ``"$pfd/prefetch.sh"`` so that command line never
+    holds the expanded path either: the sweep never hits the leg itself.
+    With ``run_dir`` the new prefetch's pid is recorded there for
+    :func:`_detached_kill_command`."""
+    script = f"{corpus_dir}/{PREFETCH_SCRIPT_NAME}"
+    pattern = shlex.quote("bash " + _ere_escape(script))
+    sweep = (f"for q in $(pgrep -f {pattern} 2>/dev/null); do "
+             f"kill -KILL -- -$q 2>/dev/null; kill -KILL $q 2>/dev/null; done; ")
+    record = (f"echo $pf > {shlex.quote(f'{run_dir}/{PREFETCH_PID_NAME}')}; "
+              if run_dir else "")
+    return (f"{{ pfd={shlex.quote(corpus_dir)}; {sweep}"
+            f"setsid bash \"$pfd/{PREFETCH_SCRIPT_NAME}\" $$ </dev/null >/dev/null & "
+            f"pf=$!; {record}"
+            f"{command}; rc=$?; "
+            f"{_prefetch_alive('$pf')} && {{ pkill -TERM -s $pf 2>/dev/null; "
+            f"kill -TERM -- -$pf 2>/dev/null; kill -TERM $pf 2>/dev/null; }}; (exit $rc); }}")
 
 
 def run_ssh(ssh_argv: list[str], timeout: int, stdin_text: str | None = None):

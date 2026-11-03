@@ -300,3 +300,8 @@ def test_king_rent_without_adoption_support_rents_as_before(tmp_path, monkeypatc
     host = r._rent_king_host("42")
     assert (host.host, host.port) == ("9.9.9.9", 41000)
     assert len(launched) == 1 and torn == []
+
+
+# The owner-approval gate (2026-11-02) is tested in test_money_safety.py;
+# these tests drive the operator-lane / operator-rent machinery behind it.
+pytestmark = pytest.mark.usefixtures("operator_legs_preapproved")

@@ -11,8 +11,11 @@ headers:
                           (absent = false: the leg WAITS for the chosen type
                           and requeues like any capacity miss; true = rent the
                           cheapest fitting type when the chosen one has none)
-    X-Gpu-Max-Price:      the miner's own $/h cap on the chosen type (absent
-                          or 0 = no cap — the miner accepts the listed price)
+    X-Gpu-Max-Price:      the miner's own $/h cap on the chosen type. ABSENT
+                          = the operator's ``funded_max_price_per_hour``
+                          (money safety II: a chosen type is never uncapped
+                          by omission); an explicit ``0`` = no cap (the
+                          miner accepts the listed price).
 
 A chosen type is rented under the MINER's cap only: the operator's
 ``funded_max_price_per_hour`` / ``funded_max_leg_cost_usd`` exist to protect
@@ -37,6 +40,8 @@ __all__ = [
     "GpuCatalog",
     "GpuChoice",
     "gpu_signed_segment",
+    "parse_budget_header",
+    "join_segments",
     "parse_gpu_headers",
     "wall_warning",
 ]
@@ -44,6 +49,9 @@ __all__ = [
 GPU_HEADER = "X-Gpu-Type"
 GPU_FALLBACK_HEADER = "X-Gpu-Allow-Fallback"
 GPU_MAX_PRICE_HEADER = "X-Gpu-Max-Price"
+# A miner-set TOTAL budget for one submission (all its pods, success included),
+# enforced before every rent on the miner's key. Signed with the request.
+BUDGET_HEADER = "X-Max-Total-Spend"
 
 _TRUE = ("1", "true", "yes")
 _FALSE = ("0", "false", "no")
@@ -80,6 +88,9 @@ class GpuCatalog:
     skus: tuple[str, ...] | None = None
     walls: tuple[tuple[str, int], ...] = ()
     wall_cap_seconds: float = 0.0
+    # The $/h cap a chosen type gets when the request names none (the
+    # operator's funded_max_price_per_hour; 0 = none configured).
+    default_max_price_per_hour: float = 0.0
 
     @classmethod
     def from_config(cls, cfg) -> GpuCatalog:
@@ -91,7 +102,8 @@ class GpuCatalog:
         except Exception:  # noqa: BLE001 — no contract ⇒ no warning, never a refusal
             cap = 0.0
         return cls(skus=skus, walls=tuple(getattr(rnd, "funded_sku_wall_seconds", ()) or ()),
-                   wall_cap_seconds=cap)
+                   wall_cap_seconds=cap, default_max_price_per_hour=float(
+                       getattr(rnd, "funded_max_price_per_hour", 0.0) or 0.0))
 
     def canonical(self, sku: str) -> str | None:
         """The catalog's spelling of ``sku`` (case-insensitive), else None."""
@@ -150,7 +162,8 @@ def parse_gpu_headers(headers, catalog: GpuCatalog | None
         return GpuChoice(), "", {
             "code": "bad_gpu_fallback",
             "message": f"{GPU_FALLBACK_HEADER} must be 1/true/yes or 0/false/no"}
-    price = 0.0
+    # No header ⇒ the operator's default cap; only an explicit 0 is uncapped.
+    price = float(cat.default_max_price_per_hour or 0.0)
     if p:
         try:
             price = float(p)
@@ -189,3 +202,27 @@ def wall_warning(choice: GpuChoice, catalog: GpuCatalog | None) -> str:
                 f"past the {cap:.0f}s wall — the leg may stop at the wall and is judged "
                 f"as it stands")
     return ""
+
+
+def parse_budget_header(headers) -> tuple[float | None, str, dict | None]:
+    """``(budget | None, signed_part, None)`` or ``(None, "", error_body)``.
+    Absent (None) = keep the entry's budget as it is (a re-fund never clears
+    it silently; review S3); ``0`` = clear it explicitly; otherwise a
+    positive, finite USD figure."""
+    raw = (headers.get(BUDGET_HEADER) or "").strip()
+    if not raw:
+        return None, "", None
+    try:
+        value = float(raw)
+    except ValueError:
+        value = float("nan")
+    if not math.isfinite(value) or value < 0:
+        return None, "", {"code": "bad_max_total_spend",
+                          "message": f"{BUDGET_HEADER} must be a positive USD figure "
+                                     "(0 clears the budget; omit it to keep the current one)"}
+    return value, f"budget={raw}", None
+
+
+def join_segments(*parts: str) -> str:
+    """The signed v3 segment of several optional fields ("" when none)."""
+    return ";".join(p for p in parts if p)

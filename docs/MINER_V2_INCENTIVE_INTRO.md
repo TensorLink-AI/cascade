@@ -1,7 +1,9 @@
 # Cascade v2: what changes for miners
 
-v2 launches on mainnet (netuid 91) at **2026-10-30 12:00 UTC**; commits open
-at 09:00 UTC. This page lists only what is different from today's Lane A.
+v2 has been live on mainnet (netuid 91) since **2026-10-30**: commits opened
+at 09:00 UTC and the first v2 era started at the first era boundary after
+12:00 UTC (block 9,399,600). This page lists only what differs from the
+pre-v2 Lane A.
 Everything not listed works as before ([MINER.md](MINER.md)). Signed receipts
 and `cascade status --json` are authoritative over this page.
 
@@ -18,13 +20,19 @@ and `cascade status --json` are authoritative over this page.
 | Dethrone bar | 0.4 → 0.2 increment units | **1% → 0.5%** level (first 7 days), then **0.10 → 0.01** increment |
 | Public benchmarks | GIFT-Eval, BOOM, TIME | adds **FEV**; run on the main validator's GPU |
 | Rewards | court split | **king ladder**, see below |
-| GPUs | one card per leg | **4×/8× multi-GPU pods** (see below) |
+| GPUs | one card per leg | **8-GPU pods: `8xH100` or `8xH200`** (see below) |
 
 ## 32-channel generators
 
-Every yield must be a `(32, L)` array, length 64–4096. A generator that
-emits fewer channels is refused before any compute is rented. You may pack
-independent groups inside the 32 channels ([INTERFACE.md](INTERFACE.md)).
+Every yield must be a `(32, L)` array (deployed `[generator] min_channels =
+max_channels = 32`). A generator that emits any other width is refused
+before any compute is rented. The trainer never pads or merges channels, so
+32 is forced on you: if your process has fewer related channels, pack
+independent series into the 32 rows yourself. Optional `groups` labels mark
+which rows belong together ([INTERFACE.md](INTERFACE.md#pack-independent-groups-in-one-yield)).
+Length: 64–4096 in ordinary verification; the v2 CPU shard tier accepts
+longer series (check `cascade verify --live`), which training crops into
+random 4096-point windows (`[v2.training] long_series = "crop"`).
 `cascade init` creates a 32-channel starter; check yours with
 `cascade verify`.
 
@@ -48,8 +56,9 @@ therefore costs you a later start, not training time.
 
 ## Batch and budget
 
-A step trains 16 packed series of 32 channels at context 4096, about 2.1M
-points. 23,841 steps make the ≈ 50B-point budget. Every leg in an era trains
+A step trains 16 series of 32 channels at context 4096, about 2.1M
+points (`[v2.training] batch_size = 512` counted in `"sequences"`: 512 ÷ 32
+channels = 16 series, split into 8 micro-batches). 23,841 steps make the ≈ 50B-point budget. Every leg in an era trains
 the same model, recipe, init and seeds; your corpus is the only difference.
 
 ## One submission per hotkey per round
@@ -75,6 +84,15 @@ at a time. Burns from before v2 are lifted. Operator-side losses never burn.
 The metric and test are unchanged: the geomean of CRPS and MASE on the
 private windows at horizons 64/256/720, and a paired-bootstrap lower
 confidence bound (LCB) on your advantage over the king.
+
+The private pool on mainnet is built only from the
+[TSBench-Forge](https://github.com/tensorlink-dev/TSBench-Forge) live
+catalog, labelled with the 7 GIFT-Eval domains (`econ_fin`, `energy`,
+`healthcare`, `nature`, `sales`, `transport`, `web_cloudops`). Retired
+snapshots are revealed with a lag at
+[Tensor-Link/cascade-eval-pool](https://huggingface.co/datasets/Tensor-Link/cascade-eval-pool);
+use them as held-out data for `cascade score`/`iterate --pool-dir`, never as
+training data ([MINER.md](MINER.md#held-out-data-the-public-eval-pool)).
 
 - **Margin:** in increment units the bar is **0.10** against a fresh king,
   falling linearly to **0.01** over 18,000 blocks (≈ 2.5 days) of tenure.
@@ -110,7 +128,7 @@ burns.
 
 ## The carried-over king
 
-Today's king, **uid 31** (`5Gsa19SF…`), is the first v2 king.
+The king at launch, **uid 31** (`5Gsa19SF…`), was carried over as the first v2 king.
 
 - **Channels:** its generator predates the 32-channel rule, so its current
   commitment alone may train at 1–32 channels. A re-commit, or any newly
@@ -120,50 +138,61 @@ Today's king, **uid 31** (`5Gsa19SF…`), is the first v2 king.
 - **Duels:** every challenger in an era duels its v2-trained leg.
   Dethroning it makes you era king at once.
 
-The pin is uid 31's commitment as of block 9,339,038. If uid 31 is
-dethroned or re-commits before launch, the operator updates it.
+The pin is uid 31's commitment as of block 9,339,038
+(`[generator] king_min_channels_refs`).
 
 ## GPUs
 
 v2 legs train on multi-GPU pods. Each leg rents one pod on your key and
 trains on all its GPUs: the 8 micro-batches of every step are split across
-the GPUs and their gradients summed, so a 4× and an 8× leg train the same
-model, step for step. More GPUs only finish sooner.
+the GPUs and their gradients summed, so every layout trains the same model,
+step for step. More GPUs only finish sooner.
 
-| Layout | Wall | Lium $/h seen (median) | Typical leg | **Plan for** |
+**Rentable on mainnet today: `8xH100` and `8xH200` only** (deployed
+`[round] funded_pod_skus`). A `--gpu` outside that list is refused at
+funding (`unknown_gpu`); 4× layouts and Blackwell are not currently offered.
+
+| Layout | Measured wall (mainnet) | Lium $/h actually charged | Typical leg | **Plan for** |
 |---|---:|---:|---:|---:|
-| `8xH200` | 3.4–4.0 h | $24–46 ($31) | ~$125 | **up to $255** |
-| `8xH100` | 3.8 h | $14–24 ($16) | ~$70 | **up to $135** |
-| `4xH200` | 3.5 h | ~$16 (few rentals) | ~$65 | **up to $110** |
-| `4xH100` | 3.7 h | not rented recently | — | check the live price |
+| `8xH100` | ≈ 3.5 h | $14.40–23.20 | ~$60–95 | **up to ~$105** |
+| `8xH200` | ≈ 3.5 h | $24–46 (median ~$31) | ~$125 | **up to ~$210** |
 
-Prices are what Lium actually charged for 8x/4x pods from 2026-10-29 to
-11-01, not advertised rates. They move by the hour and **8xH200 has nearly
-doubled** from the $18/h this table used to show. Walls are measured
-full-budget v2 legs (23,841 steps).
+*Measured 2026-11-01/02 on mainnet:* a full v2 leg is 23,841 steps, and
+legs ran at about 112–115 steps per minute on **both** 8xH100 and 8xH200,
+so ≈ 3.5 h of GPU training either way. Prices are what Lium charged for
+8× pods on 2026-11-01/02, not advertised rates; they move by the hour. The
+trainer's own planning walls (deployed `funded_sku_wall_seconds`, measured
+2026-10-31 with a 5% margin) are 12,270 s (3.4 h) for 8xH200 and 13,600 s
+(3.8 h) for 8xH100.
 
-- **Typical leg** = median price × (wall + ~30 min boot, data and upload).
-- **Plan for** = the highest price seen × 5.5 h: the 5 h hard training wall
-  plus boot and upload. A slow host can run to the wall. A leg that fails on
-  a bad host and reruns also bills the pod time it already used, so keep
-  room for one rerun on top if your key's budget is tight.
-- Set a Lium key budget (daily or lifetime) that covers the **Plan for**
-  column, not the typical one.
+- **Typical leg** = price × (wall + ~30 min boot, data and upload).
+- **Plan for** = the highest hourly rate you will accept × (wall + 1 h),
+  i.e. × 4.5 h. Use that number for `cascade preflight --max-spend` and for
+  your Lium key budget. Standard Lane A funding enforces only the hourly
+  cap (`--max-price`, or the operator caps below); preflight's
+  `--max-spend` is a review input, not an enforced total.
+- A slow host can run to the 18,000 s (5 h) hard training wall, and a leg
+  that fails on a bad host and reruns also bills the pod time it already
+  used. Keep room for one rerun if your key's budget is tight.
 
 - **Default:** without `--gpu`, the leg rents the cheapest layout under the
   operator's caps: currently **$40 per pod-hour** and an estimated
-  **$110 per leg** (read the live values with `cascade status --json`). At
-  recent prices that is usually `8xH100`.
-- **Opt-in:** name a dearer layout with `--gpu`; your own `--max-price`
-  (USD per pod-hour) applies instead of the operator's caps:
+  **$110 per leg** (price × the planning wall above; read the live values
+  with `cascade status --json`). At recent prices that is usually `8xH100`;
+  an 8xH200 above ~$32/h fails the $110 leg cap.
+- **Opt-in:** name a layout with `--gpu`; your own `--max-price` (USD per
+  pod-hour, compared with the pod's listed hourly price) applies instead of
+  the operator's caps:
 
   ```bash
   cascade fund https://submissions.cascadesub.net --ref IMMUTABLE_REF \
-    --wallet-name W --wallet-hotkey H --gpu 4xH100 --max-price 30 --yes
+    --wallet-name W --wallet-hotkey H --gpu 8xH200 --max-price 35 --yes
   ```
 
 - **Providers:** layouts rent on **Lium**. Other providers do not offer
   them yet.
-- **Blackwell (B200, B300) is not available at launch.** The training image
-  is built for CUDA 12.4, which cannot run on Blackwell. `4xB200`,
-  `8xB200`, `4xB300` and `8xB300` join when the image moves to CUDA 12.8.
+- **Blackwell (B200, B300) is not available.** The training image is built
+  for CUDA 12.4 (`torch==2.4.1+cu124`), which cannot run on Blackwell; a
+  CUDA 12.8 image has not shipped. The `4xB200`/`8xB200`/`4xB300`/`8xB300`
+  entries in the repository's wall table are not rentable until both the
+  image and `funded_pod_skus` change.

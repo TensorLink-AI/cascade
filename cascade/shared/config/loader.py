@@ -13,6 +13,7 @@ from .generation import parse_generation
 from .lane_c import parse_lane_c
 from .lane_d import parse_lane_d
 from .marketcast import check_marketcast_arming, parse_marketcast
+from .money import parse_money_safety, parse_validator_cache
 from .reliability import parse_reliability
 from .rounds import RoundConfig, check_rollover_alignment
 from .scoring import (
@@ -436,6 +437,7 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
         training=training,
         round=RoundConfig(
             **parse_reliability(r),
+            **parse_money_safety(r),
             epoch_blocks=int(r.get("epoch_blocks", 7200)),
             round_hours=float(r.get("round_hours", 24.0)),
             epoch_blocks_prev=int(r.get("epoch_blocks_prev", 0)),
@@ -465,7 +467,7 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
             funded_pod_image=str(r.get("funded_pod_image", "")),
             worker_code_fingerprint=str(r.get("worker_code_fingerprint", "")).strip().lower(),
             funded_ready_timeout_seconds=float(
-                r.get("funded_ready_timeout_seconds", 900.0)),
+                r.get("funded_ready_timeout_seconds", RoundConfig.funded_ready_timeout_seconds)),
             funded_robot_duration_days=max(1, int(r.get("funded_robot_duration_days", 1))),
             funded_pod_checkpoint=str(r.get("funded_pod_checkpoint", "harvest")),
             **parse_ckpt_transport(r),
@@ -527,6 +529,7 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
             detached_dispatch=bool(r.get("detached_dispatch", True)),
             dispatch_poll_seconds=max(5, int(r.get("dispatch_poll_seconds", 30))),
             dispatch_reattach_grace_seconds=max(0, int(r.get("dispatch_reattach_grace_seconds", 900))),
+            funded_prefetch_shards=bool(r.get("funded_prefetch_shards", True)),
             funded_operator_fallback=bool(r.get("funded_operator_fallback", False)),
             funded_operator_fallback_fresh_window_seconds=max(
                 0, int(r.get("funded_operator_fallback_fresh_window_seconds", 3600))),
@@ -694,6 +697,7 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
             warm_start_init_path=str(v.get("warm_start_init_path", "warm_start_init.json")),
             bootstrap_from_receipts=bool(v.get("bootstrap_from_receipts", True)),
             force_burn=bool(v.get("force_burn", False)),
+            **parse_validator_cache(v),
         ),
         wandb=WandbConfig(
             enabled=bool(wb.get("enabled", False)),

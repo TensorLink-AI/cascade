@@ -1,7 +1,8 @@
 # Cascade v2 FAQ
 
-Answers to miners' questions before the v2 launch (mainnet, netuid 91,
-**2026-10-30 12:00 UTC**; commits open 09:00 UTC). For what changes overall,
+Answers to miners' questions about v2 (live on mainnet, netuid 91, since
+**2026-10-30**: commits opened 09:00 UTC, the first v2 era started at the
+first era boundary after 12:00 UTC, block 9,399,600). For what changes overall,
 see [MINER_V2_INCENTIVE_INTRO.md](MINER_V2_INCENTIVE_INTRO.md). Signed
 receipts and `cascade status --json` are authoritative over this page.
 
@@ -58,15 +59,14 @@ the rule it was judged under.
 
 ### Which generator is the first v2 king?
 
-Today's mainnet king, **uid 31** (`5Gsa19SF…`), with its current
-commitment:
+The mainnet king at launch, **uid 31** (`5Gsa19SF…`), with this
+commitment (deployed `[generator] king_min_channels_refs`):
 
     vault/direct@sha256:04e226724e3be088e01134a189598300b9c381779df59b159059c62f5afec73e
 
 It carries into v2 as the first era king. Its v2 leg is trained on the v2
-contract from random init, like every other leg. If uid 31 is dethroned or
-re-commits before launch, the operator updates this pin; check with
-`cascade round`.
+contract from random init, like every other leg. The current king can
+change at any settlement; check it with `cascade round`.
 
 ### Is its code published, so I can test against it?
 
@@ -107,11 +107,11 @@ means **one Lane A submission per hotkey per round**, not per lifetime. A
 round is one 900-block settlement (about 3 hours). After your leg is judged,
 or refused for your own fault, the hotkey may commit and fund again from
 the next round. It must stay registered and can have only one live leg at a
-time. Burns from before v2 are lifted. This ships with the launch release.
+time. Burns from before v2 are lifted. This has applied since launch.
 
 ### Can a commit made before launch be judged under v1 rules?
 
-No. `[round] commit_floor_block` is the v1 floor and is kept only so v1
+No (this mattered on launch day, 2026-10-30). `[round] commit_floor_block` is the v1 floor and is kept only so v1
 history replays. v2 has its own floor, `[v2] commit_from_block`, resolved
 from the 09:00 UTC opening (`commit_open_at_utc`).
 
@@ -168,24 +168,94 @@ It is part of the contract digest, so it cannot change silently.
   10 layers, patch size 32, context 4096.
 - **Loss masking:** `contiguous_patch`.
 - **Output head:** a 21-quantile head with a copula loss term.
-- **Smaller variants:** `cascade-moe-v2-2m`, `-7m` and `-28m` are released
-  in `deploy/presets/` for cheaper local iteration with `cascade score` and
-  `cascade iterate`.
+- **Smaller variants:** Cascade MoE Base - 17.58M, 69.02M and 273.84M
+  (earlier aliases `2m`, `7m`, `28m`) are in `deploy/presets/` for cheaper
+  local iteration with `cascade score` and `cascade iterate`;
+  `python scripts/pyramid_config.py --size 17.58m --out ./chain.local-17m.toml`
+  writes a complete `--chain-toml`.
 
 Any later architecture change is a new contract, announced in advance with
 a new digest.
 
 ### What GPU memory and throughput have been measured?
 
-Wall times come from the owner's Lium runs of the same 512-row step,
-scaled to v2's step count; GPU memory has not been published yet. v2 legs
-train on 4× and 8× H100/H200 pods, data-parallel across every GPU. Without
-`--gpu` a leg rents the cheapest layout under the operator's caps (currently
-$40 per pod-hour and an estimated $110 per leg; see `cascade status --json`);
-4×H100 is opt-in with `--gpu 4xH100`. Lium prices move: recent legs cost
-about $70 (8×H100) to $125 (8×H200), and you should budget up to about
-$135 (8×H100) or $255 (8×H200) per leg. Blackwell (B200, B300) waits for a CUDA 12.8 image. The
-table is in [MINER_V2_INCENTIVE_INTRO.md](MINER_V2_INCENTIVE_INTRO.md#gpus).
+Wall time for the 1.23B competition model is measured on mainnet; GPU
+memory and the smaller variants' speed are not.
+
+- **Measured 2026-11-01/02:** a full leg is 23,841 steps; legs ran at about
+  112–115 steps per minute on **both** 8×H100 and 8×H200, ≈ 3.5 h of GPU
+  training either way. Legs train data-parallel across all 8 GPUs.
+- **Rentable layouts:** only `8xH100` and `8xH200` (deployed `[round]
+  funded_pod_skus`). 4× layouts are not offered on mainnet, and Blackwell
+  (B200, B300) needs a CUDA 12.8 image that has not shipped.
+- **Default choice:** without `--gpu` a leg rents the cheapest layout under
+  the operator's caps (currently $40 per pod-hour and an estimated $110 per
+  leg; see `cascade status --json`). That is usually 8×H100.
+- **Prices Lium actually charged, 2026-11-01/02:** 8×H100 $14.40–23.20/h;
+  8×H200 $24–46/h (median ~$31). Budget the highest hourly rate you would
+  accept × (wall + 1 h): about $105 for 8×H100 or $210 for 8×H200 at the
+  top of those ranges.
+
+The table is in [MINER_V2_INCENTIVE_INTRO.md](MINER_V2_INCENTIVE_INTRO.md#gpus).
+
+### What exactly is the training geometry?
+
+Every yield is `(32, L)`: deployed `[generator] min_channels =
+max_channels = 32`. The trainer never pads or merges channels, so a process
+with fewer channels must be packed into the 32 rows by your generator
+(optional `groups` labels say which rows belong together; see
+[INTERFACE.md](INTERFACE.md#pack-independent-groups-in-one-yield)). Each step
+trains 16 series × 32 channels at context 4096 (`[v2.training] batch_size =
+512` counted in sequences, 512 ÷ 32 = 16, in 8 micro-batches), for 23,841
+steps (≈ 50B points). Series longer than 4096 are cropped into random
+4096-point windows (`long_series = "crop"`).
+
+## Local scoring and the eval pool
+
+### Where do I get held-out data to score against?
+
+Use the public eval pool:
+[Tensor-Link/cascade-eval-pool](https://huggingface.co/datasets/Tensor-Link/cascade-eval-pool).
+It is a lagged public reveal of **retired** held-out eval pool snapshots,
+byte-identical to what validators scored. Use the
+`snapshots/<as_of>-block-<N>/` folders; the legacy `snapshots/<YYYY-MM-DD>/`
+folders (through 2026-08-03) are rebuilds, not byte mirrors. The latest
+revealed snapshot is `snapshots/2026-10-31-block-9388800` (3,841 series,
+sha256 `cb9b64d24f30fc41321058bb56583a60986a0a8e480bd5967962d21fe6896649`).
+Download and score instructions are in
+[MINER.md](MINER.md#3-verify-and-score-locally).
+
+It is an **evaluation** set: use it as held-out data for scoring, never as
+generator training data. The live private pool is newer and never revealed,
+so local scores are directional.
+
+### What does the private pool contain?
+
+On mainnet the pool is built only from the
+[TSBench-Forge](https://github.com/tensorlink-dev/TSBench-Forge) live catalog
+(`tsbench_forge` source, via the bucket relay), labelled with the 7
+GIFT-Eval domains: `econ_fin`, `energy`, `healthcare`, `nature`, `sales`,
+`transport`, `web_cloudops`. Other sources the pool builder supports are not
+used on mainnet ([EVAL_POOL.md](EVAL_POOL.md#sources-shipped)).
+
+### What do `cascade score` and `cascade iterate` do, and not do?
+
+- They really train: the same trainer as live legs (`Toto2Trainer`, which
+  hands the v2 contract to the pyramid MoE trainer), from random init or
+  `--warm-start live`.
+- The budget is `--train-hours`, default `[round] heat_train_hours` (1 h):
+  the step count is scaled from the full leg (23,841 steps over 3 h of
+  reference compute), and the run also stops at that many hours of wall
+  time (at least 900 s). `--train-hours 0.01` (79 steps) is a smoke test.
+- Your generator runs locally **without the sandbox**, as your own trusted
+  code.
+- They score only on the pool you give them (`--pool-dir`, else `--pool`,
+  else a small synthetic sample).
+- They do **not** run the public GIFT-Eval/BOOM/TIME/FEV benchmarks. Those
+  run in the separate `benchmarks/` sidecar ([benchmarks/README.md](../benchmarks/README.md)
+  shows how to run it on a checkpoint). On mainnet the main validator runs
+  them on its own GPU only for a private-pool winner, as a gate that can only
+  block that win.
 
 ## Lanes
 

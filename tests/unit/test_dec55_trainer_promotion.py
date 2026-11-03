@@ -314,7 +314,8 @@ def test_hash_link_is_rollout_gated():
 def test_an_unrecorded_leg_failure_never_burns():
     ops = LegOpsNoRunner()
     msg, miner_fault, cls, burn = ops.leg_failure("ALFA")
-    assert (miner_fault, cls, burn) == (False, OPERATOR_FAULT_CLASS, False)
+    # transient (review F4): never burned, never counted toward the cap
+    assert (miner_fault, cls, burn) == (False, "operator_transient", False)
 
 
 class LegOpsNoRunner(R.LegOps):

@@ -476,3 +476,8 @@ def test_funded_leg_passes_expert_kwargs_to_the_dispatcher(cfg, tmp_path, monkey
                           expert_selection={0: [3]})
     assert seen["role"] == "expert" and seen["domain"] == "energy"
     assert seen["expert_selection"] == {0: [3]} and seen["warm_start_ref"] == "k"
+
+
+# The owner-approval gate (2026-11-02) is tested in test_money_safety.py;
+# these tests drive the operator-lane / operator-rent machinery behind it.
+pytestmark = pytest.mark.usefixtures("operator_legs_preapproved")

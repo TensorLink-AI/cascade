@@ -364,7 +364,8 @@ def test_unmeasured_image_refuses_the_rent_unburned(tmp_path, monkeypatch, caplo
         runner._rent_funded_host("777", _challenger("hkA"))
     assert rents == []                                             # nothing rented
     msg, miner_fault, cls, burn = runner._funded_leg_failures["hkA"]
-    assert (miner_fault, cls, burn) == (False, "operator", False)
+    # a config gate, not a fault: backed off, never counted (review F4)
+    assert (miner_fault, cls, burn) == (False, "operator_blocked", False)
     assert any("no measured wall" in r.getMessage() for r in caplog.records)
     assert not (tmp_path / "funded_pods.json").exists() or json.loads(
         (tmp_path / "funded_pods.json").read_text()) == []         # no write-ahead row left
@@ -514,9 +515,10 @@ def test_leg_ttl_covers_the_cap_boot_bench_and_margin(tmp_path):
     runner.cfg.eval = SimpleNamespace(bench_hold_max_hours=2.0)
     runner._keep_funded_pod_for_bench = lambda: False
     contract = SimpleNamespace(max_train_seconds=8333)
-    assert provider_ttl_seconds(runner, contract=contract) == 8333 + 900 + 600 + 3600
+    boot = runner.cfg.round.funded_ready_timeout_seconds      # 420 since money safety II
+    assert provider_ttl_seconds(runner, contract=contract) == 8333 + boot + 600 + 3600
     runner._keep_funded_pod_for_bench = lambda: True
-    assert provider_ttl_seconds(runner, contract=contract) == 8333 + 900 + 600 + 7200 + 3600
+    assert provider_ttl_seconds(runner, contract=contract) == 8333 + boot + 600 + 7200 + 3600
     off = _runner(tmp_path, provider_ttl_margin_seconds=0)
     assert provider_ttl_seconds(off, contract=contract) == 0.0
 

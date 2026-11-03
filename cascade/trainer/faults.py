@@ -6,6 +6,7 @@ import logging
 import re
 import subprocess
 
+from ..funding.queue import OPERATOR_FAULT_CLASS
 from ..shared.hippius import StorageError
 
 log = logging.getLogger("cascade.trainer")
@@ -45,6 +46,24 @@ class _OperatorFault(RuntimeError):
     retry, a stale worker image the provider booted, the CPU generation tier.
     Infra, requeued, and it never burns one of the entry's attempts — that
     budget is for failures on the miner's own pod (DEC-CA-0036)."""
+
+
+class StorageFault(_OperatorFault):
+    """OUR storage lost a verified checkpoint's upload after every retry (the
+    harvested copy is kept for the re-upload): an operator fault the box
+    health tracks (cascade.trainer.box_health — the same class on two legs
+    halts every rent)."""
+
+
+class CheckpointUnverifiable(Exception):
+    """A payer pod's checkpoint still differs from the pod's OWN listing after
+    a re-harvest and a retry. Flaky host hardware, a write race or our own bug
+    look exactly like tampering here, so this is a terminal but UNBURNED
+    verdict (``checkpoint_unverifiable``): no hotkey burn, at most the one
+    attempt; the box copy and both manifests are kept as evidence, and any
+    burn is the owner's manual call (review F7)."""
+
+    error_class = "checkpoint_unverifiable"
 
 
 class _FundedLegSkip(Exception):
@@ -113,23 +132,117 @@ def _http_status_in_chain(exc: BaseException | None) -> int | None:
 STALL_CLASS = "stall"
 _STALL_MARKER = "generator_stalled"
 
+# A worker that died fetching ITS CORPUS from our storage (a shards leg's
+# pre-signed download: transport error after every retry, a sha256 mismatch on
+# the downloaded bytes, an expired link). The corpus was written, hashed and
+# uploaded by the operator's own tier, so this is our storage boundary —
+# never the miner's generator. Requeued unburned as an operator fault
+# (2026-11-02: c4-00030 sha mismatch killed a make-good leg at step 7650).
+#
+# Forgery-resistant by construction: it is consulted ONLY for shards legs
+# (corpus_files pushed, no miner code runs on the pod — a streaming leg's
+# generator could print anything), and only on the worker's final traceback
+# exception line as the DISPATCHER parsed it from stderr
+# (RemoteDispatchError.final_exception, remote.final_exception_line) — never
+# on the message text, whose stderr tail could carry a forged block. The line
+# must match in full the fully-qualified class names the interpreter prints.
+#
+# Bounded: the corpus is reused across retries, so a persistently bad stored
+# object would fail every retry the same way. After SHARD_FAULT_REQUEUE_CAP
+# unburned shard faults for one corpus (hotkey, seed, ref) the next one is
+# plain "infra" again (burns, as before this class existed).
+SHARD_FAULT_REQUEUE_CAP = 2
+_SHARD_FETCH_EXC_RE = re.compile(
+    r"^cascade\.generation\.shards\.(?:"
+    r"ShardLinkExpired: shard [A-Za-z0-9_.-]+: download link expired"
+    r"|ShardError: downloaded shard [A-Za-z0-9_.-]+ fails its sha256"
+    r"|ShardError: shard [A-Za-z0-9_.-]+ could not be downloaded: )")
+
+
+def final_exception_of(exc: BaseException | None) -> str:
+    """The dispatcher-parsed final traceback exception line carried by
+    ``exc`` or an exception in its cause chain (``""`` when none does)."""
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if hasattr(exc, "final_exception"):
+            # The first dispatch error in the chain decides, even when it parsed
+            # no line: a retry that failed without a traceback must not inherit
+            # an EARLIER attempt's shard verdict through ``__context__``.
+            line = getattr(exc, "final_exception", "")
+            return line if isinstance(line, str) else ""
+        exc = exc.__cause__ or exc.__context__
+    return ""
+
+
+def shard_fetch_failure(final_exception: str) -> bool:
+    """Whether a worker's final traceback exception line (as the dispatcher
+    parsed it) is a remote shard fetch failure. Callers gate it on the leg
+    being a shards leg."""
+    return bool(_SHARD_FETCH_EXC_RE.match((final_exception or "").strip()))
+
 
 def classify_funded_worker_failure(rc: int | None, text: str, *,
-                                   stalled_before: bool) -> tuple[bool, str, bool]:
+                                   stalled_before: bool,
+                                   shards_leg: bool = False,
+                                   final_exception: str = "",
+                                   shard_faults_before: int = 0) -> tuple[bool, str, bool]:
     """``(miner_fault, error_class, burn_attempt)`` for a funded worker exit.
 
     ``rc == 3`` is the worker's "miner submission rejected" exit (CorpusError).
     A rejection whose text is a stream STALL is classed :data:`STALL_CLASS`
     (infra-side, unburned) the first time and ``"generator"`` (the miner's
     shot) only when this hotkey already stalled once before. Every other
-    rejection stays ``"generator"``; any other exit is ``"infra"`` and burns
-    one of the entry's retry attempts, as before.
+    rejection stays ``"generator"``. On a ``shards_leg`` (the corpus was
+    pushed; no miner code ran on the pod) a non-rejection exit whose
+    dispatcher-parsed ``final_exception`` is a remote shard fetch failure
+    (:func:`shard_fetch_failure` — our storage) is :data:`OPERATOR_FAULT_CLASS`,
+    unburned, while ``shard_faults_before`` (this corpus's earlier ones) is
+    under :data:`SHARD_FAULT_REQUEUE_CAP`; any other exit is ``"infra"`` and
+    burns one of the entry's retry attempts, as before.
     """
     if rc == 3:
         if _STALL_MARKER in (text or "") and not stalled_before:
             return False, STALL_CLASS, False
         return True, "generator", False
+    if (shards_leg and shard_fetch_failure(final_exception)
+            and shard_faults_before < SHARD_FAULT_REQUEUE_CAP):
+        return False, OPERATOR_FAULT_CLASS, False
     return False, "infra", True
+
+
+def classify_leg_exception(runner, gen, seeds, exc: BaseException, *, rc: int | None,
+                           text: str, stalled_before: bool,
+                           shards_leg: bool) -> tuple[bool, str, bool]:
+    """:func:`classify_funded_worker_failure` for a failed funded leg, with
+    the per-corpus shard-fault count kept on ``runner`` (in memory; a trainer
+    restart resets it — still bounded per process)."""
+    import threading
+
+    from .harvest_guard import local_disk_error
+
+    if local_disk_error(exc) is not None or getattr(exc, "keep_pod", False):
+        # 2026-11-02: OUR disk (ENOSPC/EIO/... anywhere in the leg) or a
+        # harvest our side could not finish — an operator fault, never a
+        # miner burn, whatever the message says.
+        return False, OPERATOR_FAULT_CLASS, False
+    final = final_exception_of(exc)
+    key = (str(getattr(gen, "hotkey", "")), str(getattr(seeds, "base_seed", "")),
+           str(getattr(gen, "ref", "")))
+    lock = runner.__dict__.setdefault("_shard_fault_lock", threading.Lock())
+    with lock:
+        counts = runner.__dict__.setdefault("_shard_fault_counts", {})
+        before = int(counts.get(key, 0))
+        verdict = classify_funded_worker_failure(
+            rc, text, stalled_before=stalled_before, shards_leg=shards_leg,
+            final_exception=final, shard_faults_before=before)
+        if shards_leg and rc != 3 and shard_fetch_failure(final):
+            counts[key] = before + 1
+            if verdict[1] != OPERATOR_FAULT_CLASS:
+                log.warning("leg %s: shard fetch failure #%d for one corpus (cap %d) — "
+                            "classed infra; check the stored object (%s)",
+                            key[0][:12], before + 1, SHARD_FAULT_REQUEUE_CAP, final[:200])
+    return verdict
 
 
 # Storage-layer failure fingerprints: a run that died inside the artifact /

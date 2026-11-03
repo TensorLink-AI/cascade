@@ -65,6 +65,40 @@ class SuiteResult:
         return bool(self.max_series) or bool(self.n_expected) and self.n_series < expected
 
 
+# Per-row metric floor (operator decision 2026-11-02). The validator's public
+# bench gate (cascade.eval.public_guards._usable) treats a row metric that is
+# not strictly > 0 as UNUSABLE, so an exact 0 — a perfect forecast of a
+# constant series, which a confident model's float32 median hits exactly —
+# read as an omitted task and failed the challenger. Both gate metrics are
+# scale-free (CRPS = weighted quantile loss ÷ Σ|y|; MASE ÷ in-sample naive
+# error), so a fixed floor is unit-consistent: any finite value in
+# [0, ROW_METRIC_FLOOR) is published as ROW_METRIC_FLOOR. Two sub-floor values
+# (0 vs 1.2e-9) then pair as an exact tie instead of a fake 1000x ratio.
+# NaN / inf / negative / missing values are left untouched, so the gate's
+# protection against omitted or broken tasks is unchanged. Only the per-row
+# fields the gate reads are floored; headline aggregates are computed from the
+# unfloored values. Interim: the in-gate fix rides the next consensus release.
+ROW_METRIC_FLOOR = 1e-6
+FLOORED_ROW_METRICS = ("CRPS", "MASE")
+
+
+def floor_row_metrics(row: dict) -> dict:
+    """``row`` with every finite ``CRPS`` / ``MASE`` in ``[0, ROW_METRIC_FLOOR)``
+    raised to the floor. Anything else (NaN, inf, negative, absent, non-numeric)
+    is returned as-is."""
+    if not isinstance(row, dict):
+        return row
+    out = dict(row)
+    for k in FLOORED_ROW_METRICS:
+        v = out.get(k)
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            continue
+        f = float(v)
+        if f == f and 0.0 <= f < ROW_METRIC_FLOOR:
+            out[k] = ROW_METRIC_FLOOR
+    return out
+
+
 @dataclass
 class BenchmarkReport:
     checkpoint: str
@@ -76,7 +110,10 @@ class BenchmarkReport:
     def to_dict(self) -> dict:
         return {
             "checkpoint": self.checkpoint,
-            "suites": [{**asdict(s), "partial": s.partial} for s in self.suites],
+            "suites": [{**asdict(s), "partial": s.partial,
+                        "rows": [floor_row_metrics(r) for r in s.rows]}
+                       for s in self.suites],
+            "row_metric_floor": ROW_METRIC_FLOOR,
             "data_revisions": dict(self.data_revisions),
             "methodology": {s.suite: METHODOLOGY[s.suite] for s in self.suites
                             if s.suite in METHODOLOGY},

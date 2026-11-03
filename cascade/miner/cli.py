@@ -174,17 +174,33 @@ def _add_score(sub: argparse._SubParsersAction) -> None:
 def add_score_options(p: argparse.ArgumentParser) -> None:
     """The local-scoring knobs shared by ``score`` and ``iterate``."""
     p.epilog = (
-        "Improve generators cheaply with score or iterate on a smaller model once released, "
-        "using a complete --chain-toml configuration. The planned 2M, 7M, 28M, 56M and ~120M "
-        "variants are currently blocked placeholders. Compare candidate and baseline with "
+        "Improve generators cheaply with score or iterate on a smaller Cascade MoE Base "
+        "preset (17.58M, 69.02M, 273.84M; 1.23B is the competition candidate) using a complete "
+        "--chain-toml from `python scripts/pyramid_config.py --size 17.58m --out FILE` "
+        "(aliases 2m/7m/28m/120m); the 56M variant remains blocked. Compare candidate and baseline with "
         "the same model, budget, seeds, pool and compatible starting checkpoint. Recheck "
         "promising ideas with --warm-start live: it selects the live competition model and "
         "init. A small-model improvement does not establish a live win.")
-    p.add_argument("--pool-dir", type=Path, default=None,
-                   help="Local dir of .npy/.npz held-out series to score on (recommended: your "
-                        "own real data). Falls back to --pool, then an offline synthetic sample.")
-    p.add_argument("--pool", default="", dest="pool_ref",
-                   help="A Hippius Hub pool ref (repo@digest) to score on instead of --pool-dir.")
+    pool = p.add_mutually_exclusive_group()
+    pool.add_argument("--pool-dir", type=Path, default=None,
+                      help="Local dir of .npy/.npz held-out series to score on (recommended: your "
+                           "own real data). Falls back to --pool, then an offline synthetic sample.")
+    pool.add_argument("--pool", default="", dest="pool_ref",
+                      help="A Hippius Hub pool ref (repo@digest) to score on instead of --pool-dir.")
+    pool.add_argument("--pool-hf", nargs="?", const="latest", default=None,
+                      metavar="latest|SNAPSHOT",
+                      help="Score on a RETIRED eval-pool snapshot from the public HF dataset "
+                           "Tensor-Link/cascade-eval-pool: 'latest' (the default value; the newest "
+                           "'<date>-block-<N>' folder) or an exact folder name, downloaded from one "
+                           "pinned dataset commit. The tar's sha256 is checked against the "
+                           "dataset's own POOL_SHA256 (download integrity, not authenticity) and "
+                           "the extraction is cached by sha256 under iterate's --work-dir "
+                           "(score: ./.cascade-work); a cached snapshot is reused offline. Directional only; "
+                           "evaluation data, never train on it. Place it after the repo path.")
+    p.add_argument("--keep-ckpt", type=Path, default=None, metavar="DIR",
+                   help="Keep the trained checkpoint(s) in DIR instead of a discarded temp dir "
+                        "(score: DIR must be absent or empty; iterate: one subdirectory per "
+                        "generator/settings/seed), e.g. to run `cascade bench` on them.")
     p.add_argument("--train-hours", type=float, default=None,
                    help="Training budget (default: [round] heat_train_hours — the cheap local budget).")
     p.add_argument("--n-windows", type=int, default=None,
@@ -204,7 +220,30 @@ def score_result_dict(r) -> dict:
             "n_series": r.n_series, "train_seconds": r.train_seconds,
             "pool": r.pool_label, "init": r.init_label,
             "contract_digest": getattr(r, "contract_digest", ""),
-            "train_tokens": getattr(r, "train_tokens", 0)}
+            "train_tokens": getattr(r, "train_tokens", 0),
+            "pool_snapshot": getattr(r, "pool_snapshot", "") or "",
+            "pool_sha256": getattr(r, "pool_sha256", "") or "",
+            "checkpoint_dir": getattr(r, "checkpoint_dir", "") or ""}
+
+
+def resolve_pool_hf(args, cache_root: Path, out):
+    """``(exit_code, HfPool | None)`` for ``--pool-hf``; prints the retired-pool note."""
+    if getattr(args, "pool_hf", None) is None:
+        return OK, None
+    from .hf_pool import RETIRED_POOL_NOTE, HfPoolError, HfPoolIntegrityError, resolve_hf_pool
+
+    out.warn(RETIRED_POOL_NOTE)
+    try:
+        pool = resolve_hf_pool(args.pool_hf, cache_root, warn=out.warn)
+    except HfPoolIntegrityError as e:
+        return out.fail("pool_hf_integrity", str(e), REJECTED), None
+    except HfPoolError as e:
+        return out.fail("pool_hf_unavailable", str(e), NETWORK), None
+    except OSError as e:
+        return out.fail("pool_hf_unavailable", f"could not fetch the HF pool: {e}", NETWORK), None
+    out.info(f"pool: {pool.snapshot} (sha256 {pool.sha256}, HF revision "
+             f"{pool.revision or 'unknown'}) matches its POOL_SHA256; cached at {pool.path}")
+    return OK, pool
 
 
 def _cmd_score(args: argparse.Namespace) -> int:
@@ -230,10 +269,14 @@ def _cmd_score(args: argparse.Namespace) -> int:
         if not report.ok:
             out.result(verify=report.to_dict())
             return out.fail("verify_failed", "verify failed — fix before scoring:\n" + report.render())
+    from .iterate import DEFAULT_WORK_DIR
     from .training_context import UnresolvedLaunch
 
+    rc, pool_hf = resolve_pool_hf(args, DEFAULT_WORK_DIR, out)
+    if rc != OK:
+        return rc
     try:
-        r = _run_score(args, cfg)
+        r = _run_score(args, cfg, pool_hf=pool_hf)
     except LiveStateUnavailable as e:
         return out.fail("live_warm_start_unavailable", str(e), NETWORK)
     except UnresolvedLaunch as e:
@@ -244,25 +287,33 @@ def _cmd_score(args: argparse.Namespace) -> int:
     except Exception as e:  # noqa: BLE001 — surface any train/eval failure cleanly
         return out.fail("scoring_failed", f"scoring failed: {type(e).__name__}: {e}")
     out.result(**score_result_dict(r), lower_is_better=True)
-    same = "--pool-dir <same pool>" + (f" --warm-start {args.warm_start}" if args.warm_start else "")
+    same = ((f"--pool-hf {pool_hf.snapshot}" if pool_hf is not None else "--pool-dir <same pool>")
+            + (f" --warm-start {args.warm_start}" if args.warm_start else ""))
     out.info(
         f"\nscore: geomean={r.geomean:.5f}  (lower is better)\n"
         f"  pool:    {r.pool_label}  ({r.n_windows} windows)\n"
         f"  corpus:  {r.n_series} series, digest {r.corpus_digest[:12]}…\n"
         f"  init:    {r.init_label}\n"
         f"  trained: {r.train_seconds:.0f}s\n"
-        f"\ncompare against the king:  cascade iterate {args.repo_dir} {same}"
+        + (f"  kept:    {r.checkpoint_dir}  (bench it: cascade bench {r.checkpoint_dir} "
+           f"--king KING_CKPT)\n" if getattr(r, "checkpoint_dir", "") else "")
+        + f"\ncompare against the king:  cascade iterate {args.repo_dir} {same}"
     )
     return OK
 
 
-def _run_score(args: argparse.Namespace, cfg):
+def _run_score(args: argparse.Namespace, cfg, pool_hf=None):
     from .score import score_generator
 
+    extra = {}
+    if pool_hf is not None:
+        extra["pool_hf"] = pool_hf
+    if getattr(args, "keep_ckpt", None) is not None:
+        extra["keep_ckpt"] = args.keep_ckpt
     return score_generator(
         args.repo_dir, cfg, pool_dir=args.pool_dir, pool_ref=args.pool_ref,
         train_hours=args.train_hours, n_windows=args.n_windows, device=args.device,
-        seed=args.seed, warm_start=args.warm_start, at_block=args.at_block,
+        seed=args.seed, warm_start=args.warm_start, at_block=args.at_block, **extra,
     )
 
 
@@ -637,8 +688,13 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     unbound = not getattr(args, "live", False) and getattr(args, "at_block", None) is None
     report = verify_repo(args.repo_dir, cfg, skip_runtime=args.skip_runtime, quick=args.quick,
                          across_launch=unbound)
-    out.result(**report.to_dict())
+    from .geometry import render_geometry, safe_geometry
+
+    geo = safe_geometry(cfg, unbound)
+    out.result(**report.to_dict(), **({"geometry": geo} if geo is not None else {}))
     out.info(report.render())
+    if geo is not None:
+        out.info("\n".join(render_geometry(geo)))
     if not report.ok:
         out.error = {"code": "verify_failed",
                      "message": "; ".join(f"[{s}] {r.reason}" for s, r in report.failures)}
@@ -1308,7 +1364,7 @@ def _add_fund(sub: argparse._SubParsersAction) -> None:
                         "shown beside your hotkey in the public queue and roster. "
                         "Cosmetic only — never identity; a re-fund with a "
                         "new --label renames, without one keeps the old name.")
-    add_gpu_args(p)
+    add_gpu_args(p, budget=True)
     p.set_defaults(func=_cmd_fund)
 
 
@@ -1353,23 +1409,37 @@ def _cmd_credentials(args: argparse.Namespace) -> int:
     return OK
 
 
-def add_gpu_args(p: argparse.ArgumentParser) -> None:
+def add_gpu_args(p: argparse.ArgumentParser, *, budget: bool = False) -> None:
     """DEC-CA-0060 ``--gpu`` / ``--allow-fallback`` / ``--max-price`` on a fund
     command (lane A ``fund``, ``lane-b fund`` and ``lane-c fund``)."""
     p.add_argument("--gpu", default="",
-                   help="GPU type your key rents (one of chain.toml [round] funded_pod_skus, "
-                        "e.g. H100). Same token budget and wall as every leg — a faster "
+                   help="GPU type your key rents (one of chain.toml [round] funded_pod_skus; "
+                        "mainnet: 8xH100 or 8xH200). Same token budget and wall as every leg — a faster "
                         "type costs more per hour, never buys more compute. Default: the "
                         "cheapest fitting type under the operator's price caps. The "
-                        "operator caps do not apply to a chosen type; --max-price does. "
+                        "operator caps do not apply to a chosen type; --max-price does "
+                        "(without it the operator's funded_max_price_per_hour applies). "
                         "A re-fund without --gpu resets to the default.")
     p.add_argument("--allow-fallback", action="store_true",
                    help="With --gpu: rent the cheapest fitting type when the chosen one "
                         "has no capacity (default: wait for it; the entry requeues "
                         "unburned like any capacity miss).")
     p.add_argument("--max-price", type=float, default=None,
-                   help="With --gpu: your own cap in USD per GPU-hour on the chosen type "
-                        "(default: none — you accept the listed price).")
+                   help="With --gpu: your own cap in USD per pod-hour on the chosen type (the "
+                        "listing's whole-pod price, e.g. all 8 GPUs of an 8xH100; falls back to "
+                        "the per-GPU price x the pod's GPU count if a listing lacks it). "
+                        "Default (flag omitted): the operator's funded_max_price_per_hour. "
+                        "--max-price 0 = explicitly uncapped (you accept any listed price).")
+    if not budget:
+        return
+    p.add_argument("--max-total-spend", type=float, default=None,
+                   help="Your TOTAL budget in USD for this submission: every pod on your key, "
+                        "the successful one included. No pod is rented when what you have "
+                        "spent plus the next leg's projected cost would exceed it (the entry "
+                        "pauses, never rejected; fund again with a higher budget to resume). "
+                        "A running leg is never killed — set a Lium key budget as the hard "
+                        "backstop. A re-fund without this flag KEEPS the stored budget; "
+                        "--max-total-spend 0 clears it. Default: no budget.")
 
 
 def cli_gpu_choice(args: argparse.Namespace) -> tuple[str, bool, float | None] | None:
@@ -1432,7 +1502,8 @@ def build_fund_headers(action: str, hotkey_ss58: str, ref: str, api_key: str,
                        sign_fn, *, now=None, label: str = "",
                        key_digest: str | None = None, gpu: str = "",
                        allow_fallback: bool = False,
-                       max_price: float | None = None) -> dict[str, str]:
+                       max_price: float | None = None,
+                       max_total_spend: float | None = None) -> dict[str, str]:
     """The signed header set for one intake request (pure; testable).
 
     ``sign_fn(message: bytes) -> bytes`` is the hotkey's sr25519 signer. The
@@ -1451,7 +1522,8 @@ def build_fund_headers(action: str, hotkey_ss58: str, ref: str, api_key: str,
 
     return build_intake_headers(action, hotkey_ss58, ref, api_key, sign_fn,
                                 now=now, label=label, key_digest=key_digest, gpu=gpu,
-                                allow_fallback=allow_fallback, max_price=max_price)
+                                allow_fallback=allow_fallback, max_price=max_price,
+                                max_total_spend=max_total_spend)
 
 
 def _cli_label(args: argparse.Namespace) -> str | None:
@@ -1509,10 +1581,18 @@ def _cmd_fund(args: argparse.Namespace) -> int:
         key_hint="key itself as an argument")
     if isinstance(prepared, int):
         return prepared
+    budget = getattr(args, "max_total_spend", None) if action == "fund" else None
+    if budget is not None:
+        import math
+
+        if not math.isfinite(budget) or budget < 0:
+            return reporter(args).fail("bad_max_total_spend",
+                                       "--max-total-spend must be a positive USD figure "
+                                       "(0 clears your budget)", USAGE)
     headers = build_fund_headers(
         action, prepared.hotkey, args.ref, prepared.api_key, prepared.sign_fn,
         label=prepared.label, gpu=prepared.choice[0], allow_fallback=prepared.choice[1],
-        max_price=prepared.choice[2])
+        max_price=prepared.choice[2], max_total_spend=budget)
     req = urllib.request.Request(f"{prepared.base}/v1/{action}", method="POST", headers=headers)
     answer = post_intake(req, out, timeout=30)
     if answer is None:
@@ -1549,6 +1629,7 @@ def _add_json_flag(parser: argparse.ArgumentParser, *, root: bool = True) -> Non
 
 
 def build_parser() -> argparse.ArgumentParser:
+    from .bench import add_bench
     from .direct import add_direct
     from .discovery_check import add_discovery_check
     from .iterate import add_iterate
@@ -1566,6 +1647,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_verify(sub)
     add_iterate(sub)
     _add_score(sub)
+    add_bench(sub)
     _add_submit(sub)
     _add_deploy(sub)
     _add_fund(sub)

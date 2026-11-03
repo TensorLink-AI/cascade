@@ -77,6 +77,18 @@ class _FundedCapacityMixin:
             "default_wall_seconds": float(default),
         }
 
+    def _fallback_price_caps(self, choice) -> dict:
+        """The default path's caps for a leg that FELL BACK from its chosen
+        type (``allow_fallback``; money safety II): the operator caps, with
+        the $/h ceiling lowered to the miner's own cap when that is lower —
+        a fallback never rents above what the miner agreed to pay."""
+        caps = dict(self._funded_price_caps())
+        own = float(getattr(choice, "max_price_per_hour", 0.0) or 0.0)
+        if own > 0:
+            op = float(caps.get("max_price_per_hour") or 0.0)
+            caps["max_price_per_hour"] = min(own, op) if op > 0 else own
+        return caps
+
     def _chosen_gpu_rent(self, choice, describe: str = "") -> tuple[tuple[str, ...], dict] | None:
         """DEC-CA-0060: ``((sku,), price_caps)`` for a miner-chosen GPU type,
         or None for the default path (no choice; a locked-type network; a
@@ -270,6 +282,16 @@ class _FundedCapacityMixin:
         # [round] operator_lanes_operator_billed_only: a miner-funded leg never
         # leaves this wait for an operator lane (requeues no_capacity instead).
         lanes_ok = operator_lane_allowed(self, hotkey, for_king=for_king)
+        # Owner 2026-11-02: a challenger leaves for operator capacity (lane or
+        # paid fallback) only with an owner approval of this leg on file.
+        from .money_guard import preapproved
+
+        try:
+            king_scope = self._funded_queue() is None      # a king leg: not gated
+        except Exception:  # noqa: BLE001 — unreadable queue: gated (not approved)
+            king_scope = False
+        if lanes_ok and not for_king and not king_scope and not preapproved(self, hotkey):
+            lanes_ok = False
         if not lanes_ok:
             log.debug("%s: miner-funded — operator lanes reserved for operator-billed "
                       "work (operator_lanes_operator_billed_only)", describe)
@@ -324,7 +346,8 @@ class _FundedCapacityMixin:
                 entry = queue.get(hotkey) if queue is not None else None
                 if (threshold and entry is not None and now_fn() - entry.funded_at >= threshold
                         and self.cfg.round.ops_operator_leg_cap_usd > 0
-                        and self.cfg.round.ops_operator_daily_cap_usd > 0):
+                        and self.cfg.round.ops_operator_daily_cap_usd > 0
+                        and preapproved(self, hotkey)):
                     return 'operator_rent'
             if not polled:
                 log.info("%s: no %s capacity on lium — polling every %.0fs until %s "

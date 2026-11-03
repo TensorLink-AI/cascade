@@ -140,18 +140,18 @@ Before you fund:
 - **Private by default**: `cascade submit` keeps your code in the operator's
   vault and publishes it only if it takes the throne ([§5](#5-submit)).
 - **Every module is a `.py` file** ([§2](#2-write-a-generator)), and
-  multichannel `(C, L)` yields are allowed and billed per channel
-  ([§11](#11-multichannel-generators)).
+  every v2 yield is a `(32, L)` array: exactly 32 channels, packed by your
+  generator ([§11](#11-multichannel-generators)).
 
 ## 1. Install
 
-For this v2 rollout, use a fresh commitment revealed at or after **30 October
-2026, 09:00 UTC**. The updated paid Lane A intake refuses earlier entries.
-Accepted entries remain queued until the first v2 activation era at or after
-the **12:00 UTC** target; neither CPU generation nor GPU training starts under
-v1. Submissions remain open afterward. A queued entry is not a consumed
-training attempt. The one-submission-per-hotkey rule still applies when it is
-judged or rejected for a miner-caused fault.
+V2 has been live on mainnet since **30 October 2026**: paid Lane A entries
+opened at 09:00 UTC and the first v2 era started at the first era boundary
+after 12:00 UTC (block 9,399,600). The paid Lane A intake refuses
+commitments revealed before the 09:00 UTC opening; make a fresh one. A queued
+entry is not a consumed training attempt. The one-submission-per-hotkey
+rule applies per round (one 900-block settlement) when an entry is judged or
+rejected for a miner-caused fault.
 
 The earlier `[round] commit_floor_block` remains for v1 replay. V2 has its own
 `[v2] commit_from_block`, resolved from the opening's finalized timestamp.
@@ -270,8 +270,10 @@ Use fresh discovery and `cascade preflight` as well; the live trainer and
 validator still decide admission and the result.
 
 The packed-source check follows the `[static_guard]` of the `chain.toml` it
-loads. To check against the strict rule, point it at the testnet file, which
-sets `packed_sources = "reject"`:
+loads. **Mainnet rejects packed sources**: the deployed config sets
+`packed_sources = "reject"` from block 9,169,200, while the checked-in
+`chain.toml` still defaults to `"scan"`. To check against the strict rule
+offline, point verify at the testnet file, which also sets `"reject"`:
 `cascade verify ./my-generator --chain-toml chain.testnet.toml`.
 
 Use `cascade verify ./my-generator --quick --json` after edits for two small
@@ -279,10 +281,77 @@ deterministic corpora with a 30-second timeout. A quick pass is not full admissi
 verification; retain the full check before submission.
 
 `cascade score` trains the fixed model on your data at a cheap budget and
-scores it on a pool you control (the default budget is `[round]
-heat_train_hours`, 1 h; override with `--train-hours`). Needs the `[train]`
-extra and ideally a GPU. Compare against the king on the same pool with the
-same init:
+scores it on a pool you control. Needs the `[train]` extra and ideally a GPU.
+What it does and does not do (`cascade/miner/score.py`):
+
+- **It really trains**, with the same trainer as live legs (`Toto2Trainer`,
+  which hands the v2 contract to the pyramid MoE trainer), from random init
+  or the init named by `--warm-start`.
+- **Budget = `--train-hours`**, default `[round] heat_train_hours` (1 h).
+  The step count is the full leg's 23,841 steps scaled by
+  `train_hours / 3` (the contract's `target_train_hours`), and the run also
+  stops after that many hours of wall time (never less than 900 s). The
+  `--train-hours 0.01` examples in this guide (79 steps) are smoke tests,
+  not a meaningful comparison.
+- **Your generator runs locally without the sandbox**, as your own trusted
+  code. Do not point it at someone else's generator.
+- **It scores only on the pool you pass**: `--pool-dir`, else `--pool`
+  (a Hub ref), else a small offline synthetic sample that only catches
+  gross regressions.
+- **It does not run the public benchmarks** (GIFT-Eval, BOOM, TIME, FEV).
+  Those run in the separate `benchmarks/` sidecar; see
+  [benchmarks/README.md](../benchmarks/README.md) to run it on a checkpoint.
+  On mainnet they are a gate that can only block a private-pool win
+  ([§7](#7-how-the-verdict-works)).
+
+#### Held-out data: the public eval pool
+
+Score against real held-out data from
+[Tensor-Link/cascade-eval-pool](https://huggingface.co/datasets/Tensor-Link/cascade-eval-pool):
+a lagged public reveal of **retired** held-out eval pool snapshots,
+byte-identical to what validators scored. Each
+`snapshots/<as_of>-block-<N>/` folder contains:
+
+| File | What it is |
+|---|---|
+| `block-<N>.tar` | the exact tar validators scored |
+| `POOL_SHA256` | its sha256 (matches receipts and the publisher index) |
+| `<series_id>.npy` | the same series, unpacked |
+| `metadata.json` | `{series_id: {freq, seasonal_period, domain, source, …}}` |
+| `provenance.json` | the build configuration recorded at publish time |
+
+The latest revealed snapshot is `snapshots/2026-10-31-block-9388800`
+(3,841 series, sha256
+`cb9b64d24f30fc41321058bb56583a60986a0a8e480bd5967962d21fe6896649`). Use the
+`-block-<N>` folders: the legacy `snapshots/<YYYY-MM-DD>/` folders (through
+2026-08-03) are rebuilds, not byte mirrors. Every `metadata.json` entry
+carries a `source` field (recent snapshots also `domain` and
+`source_family`); older and legacy snapshots can include sources that are
+no longer used. The mainnet private pool is built only from the
+[TSBench-Forge](https://github.com/tensorlink-dev/TSBench-Forge) catalog,
+labelled with the 7 GIFT-Eval domains `econ_fin`, `energy`, `healthcare`,
+`nature`, `sales`, `transport` and `web_cloudops`.
+
+```bash
+huggingface-cli download Tensor-Link/cascade-eval-pool --repo-type dataset \
+  --include "snapshots/2026-10-31-block-9388800/*" --local-dir ./cascade-eval-pool
+cascade iterate ./my-gen --pool-dir ./cascade-eval-pool/snapshots/2026-10-31-block-9388800 \
+  --warm-start live --seeds 0,1
+```
+
+`--pool-dir` loads every `*.npy`/`*.npz` under the folder, **recursively**,
+and reads `metadata.json` from the folder itself
+(`window_source_from_dir` in `cascade/validator/pool.py`). The `.tar`,
+`POOL_SHA256` and `provenance.json` are ignored, so the snapshot folder
+works as downloaded. Point it at **one** snapshot folder, not the download
+root (that would merge every snapshot), and do not extract the `.tar` inside
+it (that would load each series twice).
+
+This is an **evaluation** set: use it as held-out data for scoring, never as
+generator training data. The live private pool is newer and never revealed,
+so a local score is directional.
+
+Compare against the king on the same pool with the same init:
 
 ```bash
 cascade iterate ./my-gen --pool-dir ./my-heldout --warm-start live --seeds 0,1
@@ -309,7 +378,10 @@ Run the Python command with your installed environment (for example,
 Earlier aliases `2m`, `7m`, `28m` and `120m` remain supported.
 The [presets](../deploy/presets/README.md) give exact counts and the
 [model specification](MODEL.md) explains the recipe. GPU memory and speed are
-unmeasured for this port. The 56M variant remains unspecified.
+unmeasured for this port, except the 1.23B competition model's wall: on
+mainnet (2026-11-01/02) a full 23,841-step leg ran at about 112–115 steps
+per minute, ≈ 3.5 h, on both 8×H100 and 8×H200. The 56M variant remains
+unspecified.
 
 Compare candidate and baseline on the same model, budget, seeds, pool and
 compatible init. Keep separate histories per model. Omit `--warm-start live`
@@ -325,6 +397,38 @@ without that current contract cannot support live comparisons with this CLI.
 `iterate` pins both for both generators and every seed; a changed checkpoint
 or contract gets a separate score cache/history.
 Without it you train from random init, which ranks generators differently.
+
+### Retired pools, kept checkpoints and the bench preview
+
+Three flags for local iteration (worked example:
+[local iteration demo](DEMO_LOCAL_ITERATE.md)):
+
+- `--pool-hf [latest|SNAPSHOT]` on `cascade score` / `cascade iterate` scores
+  on a **retired** eval-pool snapshot from the public HF dataset
+  `Tensor-Link/cascade-eval-pool`. `latest` picks the newest
+  `<date>-block-<N>` folder; legacy date-only folders are rebuilds and are
+  never used. The `block-<N>.tar` is checked against the folder's
+  `POOL_SHA256` (download integrity, not authenticity) and scored from the
+  extracted tar. It is cached by sha256 under the work directory, so a
+  re-run works offline. The snapshot and sha256 are recorded in the result and
+  in `history.jsonl`, and they key the iterate cache. It cannot be combined
+  with `--pool-dir` or `--pool`. A retired pool is directional only. It is
+  evaluation data: never train on it.
+- `--keep-ckpt DIR` keeps the trained checkpoint instead of a temp directory
+  (`cascade score`: DIR must be empty; `cascade iterate`: one subdirectory per
+  generator, settings and seed).
+- `cascade iterate --bench` (or `cascade bench CKPT_DIR --king KING_CKPT_DIR`)
+  runs the [benchmark sidecar](../benchmarks/README.md) on the best candidate
+  seed and the baseline at the same seed. It applies the validator's own
+  bench-gate function with `[scoring] bench_gate_tolerance` and
+  `bench_gate_min_win_rate` from your `--chain-toml`, and prints whether the
+  public bench gate would block. Install the sidecar first with
+  `uv sync --project benchmarks --frozen --extra time --extra fev` and stage
+  data with `--bench-data-dir`. A suite without staged data is skipped, and the
+  verdict is then reported as partial. It is a preview: the validator seeds
+  the bootstrap with the round's block hash and runs the gate only after a
+  private-pool win. The preview ignores `bench_gate_mode` and prints the
+  configured mode; a gate set to `off` or `shadow` never blocks.
 
 ## 4. Register a hotkey
 
@@ -460,8 +564,23 @@ This does not establish a total-dollar cap.
 
 An API key does not itself prove that a budget is configured. Cascade does
 not create keys, raise budgets or verify their remaining allowance. Its
-`--max-price` is an hourly price ceiling for a selected GPU; standard A/B/C
-funding has no cumulative total-dollar budget across providers or retries.
+`--max-price` is an hourly price ceiling for a selected GPU.
+
+On lane A, `cascade fund` takes `--max-total-spend USD`: a **total budget
+for the submission**. It counts every pod on your key across all retries, the
+successful one included. Before each rent, the operator projects your spend
+so far plus the next leg (its price × the expected wall + the boot
+timeout). If that would exceed the budget, no pod is rented and the entry
+pauses as `paused_budget`. It is never rejected; fund again with a higher
+budget to resume. The budget is part of the signed request. A re-fund
+without the flag keeps your stored budget; `--max-total-spend 0` clears it.
+
+A leg already running is **never** killed for an overrun, so set a
+[Lium key budget](https://docs.lium.io/pod-users/api-keys#budgets) as the
+hard backstop. The queue status shows `spend_usd` / `budget_usd`, and
+`miner_waste_usd` (pods that produced nothing). If waste reaches the
+operator's cap the entry pauses as `paused_spend_cap`. Your submission is
+kept: the operator reviews infra losses, or a re-fund resumes it.
 
 | Provider | Documented spending control | Cascade behavior |
 |---|---|---|
@@ -538,9 +657,13 @@ Every leg trains the same token budget inside the same wall. You may still
 pick which GPU type your key rents, paying more per hour to finish sooner.
 Picking a type never buys more compute.
 
+On mainnet v2 the list is **`8xH100` and `8xH200`** (deployed `[round]
+funded_pod_skus`); 4× layouts and Blackwell are not offered. Prices and
+measured walls are in [MINER_V2_INCENTIVE_INTRO.md](MINER_V2_INCENTIVE_INTRO.md#gpus).
+
 ```bash
 cascade fund https://submissions.cascadesub.net --ref <repo@digest> \
-    --wallet-name my-miner --wallet-hotkey gen1 --gpu H100 --max-price 2.50 --yes
+    --wallet-name my-miner --wallet-hotkey gen1 --gpu 8xH200 --max-price 35 --yes
 cascade lane-c fund https://submissions.cascadesub.net --target mkt:returns \
     --ref <repo@digest> --wallet-name my-miner --wallet-hotkey gen1 --gpu L40S --yes
 ```
@@ -550,8 +673,14 @@ cascade lane-c fund https://submissions.cascadesub.net --target mkt:returns \
   locks one type (`funded_sku_per_leg` off).
 - The operator's price caps (`funded_max_price_per_hour`,
   `funded_max_leg_cost_usd`) do **not** apply to a type you chose. Your own
-  `--max-price` (USD per GPU-hour) does. Without it you accept the listed
-  price.
+  `--max-price` does: USD per hour for the whole rented pod, compared
+  with the provider's listed pod price (`price_per_hour`; a listing with
+  only a per-GPU price is compared at per-GPU price × the pod's GPU count).
+  Without `--max-price` the operator's `funded_max_price_per_hour` applies
+  to your chosen type too; `--max-price 0` is the only way to rent it
+  uncapped (you accept any listed price).
+- With `--allow-fallback`, the fallback type is rented under the LOWER of
+  your `--max-price` and the operator caps.
 - If the type is unavailable, your leg **waits** for it and requeues like any
   capacity miss: no attempt burned, nothing rented, nothing charged. That is
   the default, `allow_fallback = false`. Add `--allow-fallback` to rent the
@@ -622,7 +751,11 @@ verdict; they are not universally log-only telemetry.
 
 The ~3 h grid is 900 blocks. `chain.toml` ships `[round] epoch_blocks = 3600`;
 the on-chain rollover to rolling intake (DEC-CA-0045) switches the grid to
-`[activation] epoch_blocks_after = 900` from the rollover block.
+`[activation] epoch_blocks_after = 900` from the rollover block. On mainnet
+that rollover resolved to block 9,136,800, so the live grid is 900 blocks
+(a settlement about every 3 h) and an era is 4 settlements (3,600 blocks,
+about 12 h). Rounds were 24 h (7,200 blocks) only until block 8,726,400
+(2026-07-29).
 
 **Eras.** The effective configuration defines era length (mainnet's rolling
 grid uses 4 settlements, approximately 12 h). Each era pins its contract and
@@ -939,9 +1072,11 @@ The registry also holds the current king and every published champion, so a
 re-wrap of the king is judged against the king.
 
 Rotated-out eval windows are published with a lag to
-[Tensor-Link/cascade-eval-pool](https://huggingface.co/datasets/Tensor-Link/cascade-eval-pool).
-Use them to replay past verdicts locally; live settlements always score on
-windows that were never published.
+[Tensor-Link/cascade-eval-pool](https://huggingface.co/datasets/Tensor-Link/cascade-eval-pool)
+(layout and download in [§3](#held-out-data-the-public-eval-pool)). Use the
+`snapshots/<as_of>-block-<N>/` folders to replay past verdicts locally or as
+held-out scoring data, never as training data; live settlements always score
+on windows that were never published.
 
 ## 10. Troubleshooting
 
@@ -965,16 +1100,21 @@ windows that were never published.
 
 ## 11. Multichannel generators
 
-A worked eight-channel submission: what width costs, the layout, what the
+A worked 32-channel submission: what width costs, the layout, what the
 packed-source scan refuses, and a checklist. The rules themselves are in
 [INTERFACE.md](INTERFACE.md#multivariate-series). A leg trains, settles and
 is audited under the billing rule of the era it started in.
 
 ### What a channel costs
 
-The checked-in mainnet contracts use `budget_denomination = "series_points"`:
-a `(C, L)` series costs `L` budget points. More channels still cost more GPU
-time and memory, and the contract's wall can stop a slow run early.
+**Mainnet v2 Lane A** (`[v2.training]`) has a fixed step budget: 23,841
+optimizer steps, each 16 series × 32 channels at context 4096
+(`batch_size = 512` counted in `"sequences"`), ≈ 50B points. Every yield is
+exactly 32 channels, so width is not a choice and costs nothing extra; what
+you control is what the 32 rows contain. The pre-v2 contract
+(`[training]`) used `budget_denomination = "series_points"`: a `(C, L)`
+series cost `L` budget points. Under any contract the wall can stop a slow
+run early.
 The [interface reference](INTERFACE.md#which-limits-apply) distinguishes the
 templates and the CPU shard tier's length limit.
 
@@ -1005,8 +1145,9 @@ Two things the rule does not do:
   billed under this rule, and extra channels use GPU time under either rule.
   A duplicate channel supplies no new signal.
 - It does not by itself teach the model cross-channel structure. Only coupled
-  channels do that. Stack channels that genuinely depend on each other, or do
-  not stack.
+  channels do that. In v2 you must fill 32 rows either way: put channels that
+  genuinely depend on each other in one group, and pack independent series as
+  separate `groups` rather than pretending they are coupled.
 
 ### Layout: one generator, many modules, every module a file
 
@@ -1113,8 +1254,9 @@ Notes on the shape contract:
   v2 CPU shard tier allows up to 32768.
 - Eval windows carry at most 32 channels whatever your `C`, and a multichannel
   eval window scores once, its channels averaged.
-- Mixing legal widths is fine: a corpus can be 70% `(8, L)` and 30% `(16, L)`.
-  Every yield must independently have exactly 32 channels. Billing is per yield.
+- Mixing widths is not possible in v2: every yield has exactly 32 channels.
+  Mix lengths and processes instead, and pack narrower processes into the 32
+  rows (optionally labelled with `groups`). Billing is per yield.
 
 ### Code in strings is rejected
 

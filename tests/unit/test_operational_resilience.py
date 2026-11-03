@@ -79,21 +79,20 @@ def test_owner_gate_skips_blocked_owner_without_starving_other_owners():
     assert gate.active == 0 and gate.owners == {}
 
 
-def test_owner_gate_reentrant_handoff_and_unknown_identity_refusal():
-    from cascade.trainer.faults import _FundedLegSkip
-
+def test_owner_gate_reentrant_handoff_and_unknown_identity_proceeds():
     failures = []
     runner = SimpleNamespace(
         cfg=SimpleNamespace(round=replace(RoundConfig(), ops_max_active_per_coldkey=1)),
         _record_funded_failure=lambda *a, **kw: failures.append(a),
     )
-    with pytest.raises(_FundedLegSkip), owner_admission(runner, "hk"):
+    with owner_admission(runner, "hk", cpu_tier=True):              # unknown owner: proceeds
         pass
     remember_owners(runner, [SimpleNamespace(hotkey="hk", coldkey="owner", commit_block=1)])
-    with owner_admission(runner, "hk"), owner_admission(runner, "hk"):
+    with owner_admission(runner, "hk", cpu_tier=True), owner_admission(runner, "hk",
+                                                                       cpu_tier=True):
         assert runner._owner_slots.active == 1
     assert runner._owner_slots.active == 0
-    assert failures
+    assert failures == []
 
 
 def test_reliability_policy_refuses_unbounded_paid_backups():
@@ -277,6 +276,10 @@ def test_owner_busy_sees_other_lanes_from_the_shared_scheduler():
     runner._rolling_sched = SimpleNamespace(
         _threads={}, lane_b=None, lane_c=SimpleNamespace(live_hotkeys=lambda: {"lane-c-miner"})
     )
+    # money safety II (audit F): only OPERATOR-paid legs count / are held
+    assert not owner_busy(runner, "lane-a-miner")
+    billed = {h: SimpleNamespace(operator_billed=True) for h in ("lane-a-miner", "lane-c-miner")}
+    runner._funded_queue = lambda: SimpleNamespace(get=billed.get)
     assert owner_busy(runner, "lane-a-miner")
     assert not owner_busy(runner, "lane-c-miner")
 
@@ -440,3 +443,8 @@ def test_a_tick_that_times_out_reconnects_before_the_next_poll(cfg, tmp_path, mo
     with pytest.raises(SystemExit):
         runner.run_forever(client)
     assert reconnects == [True]
+
+
+# The owner-approval gate (2026-11-02) is tested in test_money_safety.py;
+# these tests drive the operator-lane / operator-rent machinery behind it.
+pytestmark = pytest.mark.usefixtures("operator_legs_preapproved")

@@ -272,3 +272,8 @@ def test_isolated_lane_parses_and_drops_forwarded_env(tmp_path, monkeypatch):
             names = dict.fromkeys((*host.forward_env, *disp.extra_forward_env))
             env = {k: os.environ[k] for k in names if k in os.environ}
         assert env == expect
+
+
+# The owner-approval gate (2026-11-02) is tested in test_money_safety.py;
+# these tests drive the operator-lane / operator-rent machinery behind it.
+pytestmark = pytest.mark.usefixtures("operator_legs_preapproved")

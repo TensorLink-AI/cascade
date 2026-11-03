@@ -73,7 +73,8 @@ def test_remote_corpus_digest_matches_the_index(tmp_path):
         assert st.digest == idx["corpus_digest"]
 
 
-def test_a_tampered_remote_shard_is_refused(tmp_path):
+def test_a_tampered_remote_shard_is_refused(tmp_path, monkeypatch):
+    monkeypatch.setattr(S, "_SLEEP", lambda s: None)    # retried, then refused
     idx = _corpus(tmp_path / "src")
     _remote_copy(tmp_path / "src", tmp_path / "pod")
     victim = idx["children"][1]["shards"][1]["name"]

@@ -138,7 +138,7 @@ class RoundConfig:
     # still echoes the injected digest env; this it cannot fake. Empty ⇒ off.
     worker_code_fingerprint: str = ""
     # Ceiling on one funded pod's boot (launch → SSH-ready), seconds.
-    funded_ready_timeout_seconds: float = 900.0
+    funded_ready_timeout_seconds: float = 420.0
     # Harbor expiry (days) on the per-pod Hub robot a funded leg gets
     # (cascade.funding.robots). Revocation at teardown is the real bound;
     # this is the backstop if a revoke ever fails.
@@ -302,6 +302,16 @@ class RoundConfig:
     detached_dispatch: bool = True
     dispatch_poll_seconds: int = 30
     dispatch_reattach_grace_seconds: int = 900
+    # Shards legs (a remote corpus: urls.json on the pod): start a pod-side
+    # prefetch of EVERY shard alongside the worker — curl with per-shard
+    # retries + timeouts, sha256-checked against corpus.json, written to a
+    # temp name and atomically renamed into place — so the worker reads
+    # verified local files instead of downloading mid-run (2026-11-02: one
+    # bad shard download killed an 8xH200 leg at step 7650). Skipped with a
+    # WARNING when the pod lacks the disk (stored_bytes + margin); a prefetch
+    # failure never fails the leg (the worker streams as before). Works with
+    # worker images that predate the reader-side retry. False = stream only.
+    funded_prefetch_shards: bool = True
     # Hybrid fallback: a funded leg (or the JIT king) still WAITING for
     # marketplace capacity takes an OPERATOR final lane from hosts.toml as
     # soon as one is on file — operator-billed for that leg only. Off ⇒
@@ -324,6 +334,112 @@ class RoundConfig:
     # does not grow — the operator's own fault never backs off its make-good.
     # 0 = the legacy doubling backoff (INFRA_BACKOFF_*) for these entries too.
     operator_billed_retry_seconds: int = 60
+    # ── money safety (2026-11-02 incident: a full disk burned miner attempts,
+    # an expired-key make-good drained the operator Lium account, a 402 then
+    # hot-looped). Trainer-only: never changes what validators compute.
+    #
+    # Operator-side faults (error_class "operator") an entry may take before
+    # it PAUSES (status "paused": not failed, not burned, never re-dispatched
+    # until the operator resumes it). Counted on EVERY occurrence. 0 = no cap.
+    operator_fault_cap: int = 3
+    # A balance refusal (402 / BALANCE_REQUIRED) on an OPERATOR rent opens the
+    # operator-account circuit breaker: no operator rent of any kind for this
+    # many seconds (one alert, no per-leg retries).
+    operator_breaker_cooldown_seconds: int = 3600
+    # Before an operator-billed miner leg rents: the operator's Lium balance
+    # must cover the projected leg cost × this factor plus the reserve below
+    # (the reserve keeps the validator's eval pods alive). Unknown = refused.
+    operator_cost_safety_factor: float = 1.25
+    operator_balance_reserve_usd: float = 50.0
+    # Hard daily ceiling (UTC day) on projected operator spend for miner legs
+    # rented on the operator account. 0 = off. ops_operator_daily_cap_usd,
+    # when set, also applies (the lower positive value wins).
+    operator_daily_spend_cap_usd: float = 200.0
+    # Payer-key balance check before a miner's own-key rent: the payer's Lium
+    # balance must cover this hourly rate × the leg's expected wall. 0 = off.
+    payer_projected_rate_per_hour: float = 0.0
+    # Disk reservation before ANY pod rent (ssh harvest transport): free space
+    # under work_root ≥ expected checkpoint × (legs holding a pod + 1) +
+    # min_free_disk_gb, after reclaimable data was evicted.
+    expected_checkpoint_gb: float = 15.0
+    # A local-disk fault while harvesting (ENOSPC/EIO/...) keeps the pod and
+    # retries the harvest this many times (space reclaimed in between) before
+    # the leg is requeued unburned with the pod kept for the re-attach.
+    harvest_disk_retries: int = 2
+    harvest_disk_retry_seconds: int = 30
+    # A pod KEPT after OUR side failed its harvest (it may bill the MINER) is
+    # kept while the keep costs less than ``harvest_keep_cost_fraction`` of
+    # the run it protects (rate x the leg's trained hours; the rate cancels:
+    # keep hours < fraction x trained hours), and never past this hard cap.
+    # Then released with a critical priced alert (money safety II).
+    harvest_keep_max_seconds: int = 10800
+    harvest_keep_cost_fraction: float = 0.5
+    # Miner waste cap (cascade.funding.miner_spend): pods on a miner's key
+    # that produced nothing, summed per submission (ref + funding), at or
+    # above this pause the entry ("paused_spend_cap": never failed, burned,
+    # expired or rejected). 0 = off.
+    miner_waste_cap_usd: float = 30.0
+    # A paused entry (operator-fault cap) resumes by itself after this long;
+    # 0 = manual `cascade-trainer resume-operator-leg` only.
+    operator_pause_resume_seconds: int = 21600
+    # Box health breaker: the same our-side fault class on >= 2 legs within
+    # this window (or ANY local-disk fault) halts every new GPU rent.
+    box_fault_window_seconds: int = 7200
+    # ── money safety II (2026-11-03 money-leak audit) ──
+    # Operator RUNWAY: committed = sum(rate x remaining wall) of every live
+    # operator pod (ledger rows: king, backups, operator legs) + the standing
+    # pods below x the alert horizon; runway = (balance - committed -
+    # operator_balance_reserve_usd) / burn rate. Below this many hours: ONE
+    # critical alert. balance - committed < the reserve: NO new operator
+    # rent of any kind (king included) until it recovers. 0 = alert off.
+    operator_runway_alert_hours: float = 6.0
+    # Standing operator pods the ledger cannot see (validator eval pods,
+    # hand-rented lanes): ``{name = usd_per_hour}`` (TOML table).
+    operator_standing_pods_usd_per_hour: tuple[tuple[str, float], ...] = ()
+    # Which booked operator spend the daily cap counts: "miner_legs" (default:
+    # operator-billed miner legs), "all" (+ CPU VMs, lemons, other operator
+    # pods — not the king / backups) or "all_incl_king" (everything). The king
+    # pod and its backups are never REFUSED by the cap (the runway guard
+    # covers total spend).
+    operator_daily_cap_scope: str = "miner_legs"
+    # The FIRST infra loss on a miner's key taking the submission's infra
+    # waste to this files the spend_cap_make_good request (one alert) —
+    # before the next rent, never one leg late. 0 = off (the cap still trips).
+    miner_waste_alert_usd: float = 15.0
+    # King pod / backup provider TTL = time to the era's end + this margin
+    # (Lium ``--ttl``; cannot be extended, so it is a backstop). 0 = no TTL.
+    king_pod_ttl_margin_seconds: int = 0
+    # The idle-king reaper: a king/backup pod of a PAST era (or a current-era
+    # backup that is not the king's host) with no live worker and no
+    # unharvested finished run on this many consecutive checks
+    # ``king_idle_check_seconds`` apart is terminated (verified) with one
+    # alert. 0 = off.
+    king_idle_reap_checks: int = 2
+    king_idle_check_seconds: int = 900
+    # Operator-account inventory: every this-many seconds ``lium ps`` on the
+    # OPERATOR account is diffed against the allowlist (funded ledger, king
+    # pods, the names below, and every host IP in the listed host files —
+    # eval_hosts.toml, hosts.toml); each unknown pod raises ONE alert with
+    # its name and $/h. Never deletes anything. 0 = off.
+    operator_inventory_interval_seconds: int = 3600
+    operator_inventory_allow: tuple[str, ...] = ()
+    operator_inventory_host_files: tuple[str, ...] = ()
+    # An ssh checkpoint harvest off a pod streams at most expected_checkpoint_gb
+    # x this; past it the checkpoint is refused UNBURNED as unverifiable (a
+    # hostile pod must not fill our volume). 0 = unbounded.
+    harvest_max_bytes_factor: float = 1.2
+    # The expected checkpoint size per model size: ``{arch_preset = GB}``
+    # (expected_checkpoint_gb is the floor) — the harvest bound follows the
+    # model, so a bigger model never trips it as a "hostile" stream.
+    expected_checkpoint_gb_by_preset: tuple[tuple[str, float], ...] = ()
+    # The operator multi-provider pool (cascade.provision.operator_pool) is on
+    # only when switched on here (or by its own features: more providers, king
+    # backups, the paid fallback) — never by a spend cap.
+    ops_operator_pool_enabled: bool = False
+    # Our own validator's hotkey (ss58): its rejected receipt of a settlement
+    # WE published raises one critical alert naming the legs it carried
+    # (read-only; "" = off).
+    receipt_watch_validator_hotkey: str = ""
     # Trainer recovery controls; scientific contracts and reward rules are unchanged.
     ops_max_active_per_coldkey: int = 0
     ops_gpu_failure_threshold: int = 0

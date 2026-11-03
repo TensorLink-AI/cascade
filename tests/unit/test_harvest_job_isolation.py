@@ -38,7 +38,7 @@ def test_two_actual_harvest_paths_do_not_overwrite_each_other(cfg, tmp_path, mon
                       base_trainer=None, work_root=tmp_path)
     barrier = threading.Barrier(2)
     results, errors = {}, []
-    def harvest(host, remote, dest):
+    def harvest(host, remote, dest, **kw):
         dest.mkdir(parents=True, exist_ok=True)
         (dest / "bytes").write_text(host)
     def upload(runner, record, *, base_seed):

@@ -26,6 +26,7 @@ grow a path that rents operator-billed pods.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
 import time
@@ -236,6 +237,9 @@ class FundedRentResult:
     # GPU type the pod landed on (open-market rents choose per leg); ``sku``
     # as requested when the adapter cannot tell.
     sku: str = ""
+    # The landed executor's $/h (None when the adapter cannot tell): the
+    # miner-spend ledger books it (cascade.funding.miner_spend).
+    price_per_hour: float | None = None
 
 
 def _log_key_cannot_stop(hotkey: str, pod_name: str, err: Exception, api_key: str) -> None:
@@ -386,9 +390,15 @@ def rent_funded_pod(
             getter = getattr(provider, "machine_of", None)
             if getter is not None:
                 machine = getter(live_name) or ""
+            price_fn = getattr(provider, "price_of", None)
+            try:
+                price = price_fn(live_name) if callable(price_fn) else None
+            except Exception:  # noqa: BLE001 — unknown price: the ledger falls back
+                price = None
             return FundedRentResult(hotkey=hotkey, ok=True, pod=pod, address=live_addr,
                                     machine_id=machine, pod_uid=pod_uid,
-                                    host_key=host_key, sku=landed, adopted=True)
+                                    host_key=host_key, sku=landed, adopted=True,
+                                    price_per_hour=price)
         except Exception as e:  # noqa: BLE001 — never tear the live pod down; retry later
             res = _fail(f"live pod {live_name} could not be adopted: {e}", leaked_pod=live_name)
             return replace(res, error_class="infra", burn_attempt=False)
@@ -482,11 +492,23 @@ def rent_funded_pod(
         getter = getattr(provider, "machine_of", None)
         if getter is not None:
             machine = getter(pod_id) or ""
+        price_fn = getattr(provider, "price_of", None)
+        try:
+            price = price_fn(pod_id) if callable(price_fn) else None
+        except Exception:  # noqa: BLE001 — unknown price: the ledger falls back
+            price = None
         return FundedRentResult(hotkey=hotkey, ok=True, pod=pod, address=addr,
                                 machine_id=machine, pod_uid=pod_uid,
-                                host_key=host_key, sku=landed)
+                                host_key=host_key, sku=landed, price_per_hour=price)
     except Exception as e:  # noqa: BLE001 — classify everything; the taxonomy decides
         leaked = ""
+        # The landed $/h of what was launched (money safety II: a lemon's spend
+        # record is never priced at the flat fallback when the price is known).
+        failed_price = None
+        price_fn = getattr(provider, "price_of", None)
+        if launched and callable(price_fn):
+            with contextlib.suppress(Exception):
+                failed_price = price_fn(launched[0])
         for pid in launched:
             try:
                 if not terminate_verified(provider, pid):
@@ -525,6 +547,8 @@ def rent_funded_pod(
             # Not the taxonomy's "infra" (which spends one of the miner's
             # attempts): the caller rents again on another host.
             res = replace(res, error_class=LEMON_CLASS, burn_attempt=False)
+        if failed_price:
+            res = replace(res, price_per_hour=failed_price)
         return res
 
 
@@ -596,6 +620,11 @@ def teardown_funded(
             from ..funding.providers import forget_lease
 
             try:
+                # Money safety II: a pod CONFIRMED gone resolves every create
+                # intent of its leg name — a lemon rm'd and verified gone
+                # must never leave ``create_unresolved`` blocking (and
+                # re-polling) the leg forever.
+                resolve_scope_intents(vault, inst.instance_id.removesuffix("-0"))
                 forget_lease(vault, getattr(inst, "payer_credential_id", ""))
             except OSError as e:
                 # The pod IS gone; a lease row left behind by a full disk
@@ -608,6 +637,21 @@ def teardown_funded(
                       inst.instance_id, inst.payer_hotkey)
             orphaned.append(inst)
     return orphaned
+
+
+def resolve_scope_intents(vault, scope: str) -> int:
+    """Resolve every create intent of leg name ``scope`` (its pod is
+    confirmed gone); returns how many were resolved."""
+    from ..funding.providers import create_intents, resolve_create
+
+    n = 0
+    for row in list(create_intents(vault, scope)):
+        resolve_create(vault, str(row.get("token") or ""))
+        n += 1
+    if n:
+        log.info("funded: %d create intent(s) of %s resolved — the pod is confirmed gone",
+                 n, scope)
+    return n
 
 
 def payer_pod_pattern(hotkey: str, netuid: int) -> re.Pattern:

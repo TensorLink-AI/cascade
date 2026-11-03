@@ -587,11 +587,13 @@ class LegOps:
         # start, so a path that fails without recording one (the operator-
         # lane fallback, a dispatcher/config error) is OURS, never the
         # miner's — operator class: no burned attempt, the queue backs off.
-        from ..funding.queue import OPERATOR_FAULT_CLASS
+        # Transient (review F4): backed off, never counted toward the
+        # operator-fault cap — a real fault always records its own verdict.
+        from ..funding.queue import OPERATOR_TRANSIENT_CLASS
 
         return self.r._funded_leg_failures.get(
             hotkey, ("challenger leg failed without a recorded verdict (operator side)",
-                     False, OPERATOR_FAULT_CLASS, False))
+                     False, OPERATOR_TRANSIENT_CLASS, False))
 
     def king_funding(self, era: EraState, gen) -> str:
         """DEC-CA-0055: who paid for ``era``'s persisted king leg ("king" /
@@ -665,6 +667,9 @@ class LegOps:
                                manifest.round_id)
         log.info("published manifest round=%s entries=%d signed=True → %s",
                  manifest.round_id, len(manifest.entries), key)
+        from .money_watch import note_published_settlement
+
+        note_published_settlement(self.r, manifest)       # the rejected-receipt watch
         self.r._publish_training_summary(manifest)
 
     def publish_bench(self, round_id: str, created_block: int, entries: list, *,
@@ -1293,7 +1298,7 @@ class RollingScheduler:
                 log.warning("rolling: in-flight leg %s targets unknown era %d — requeued",
                             e.hotkey[:12], e.era_index)
                 queue.requeue(e.hotkey, error="trainer restarted; era state lost",
-                              error_class="infra", burn_attempt=False)
+                              error_class="infra", burn_attempt=False, backoff=False)
                 continue
             gen = ResolvedGen(e.hotkey, self._uid_of(client, e.hotkey), e.ref, e.reveal_block)
             # DEC-CA-0067: under the decoupled rule a leg whose digest differs
@@ -1303,7 +1308,7 @@ class RollingScheduler:
                     e.training_init != era.warm_start_ckpt
                     or self._stale_contract(era)(e.training_contract_digest)):
                 queue.requeue(e.hotkey, error="in-flight init/contract is missing or incompatible after restart",
-                              error_class="infra", burn_attempt=False, operator_billed=True)
+                              error_class="infra", burn_attempt=False, backoff=False, operator_billed=True)
                 continue
             started, target = self._flight_stamp(e, era, block, queue)
             self._launch_leg(gen, era, started, target, e.label, resumed=True)
@@ -1649,7 +1654,7 @@ class RollingScheduler:
         if queue is not None:
             for leg in stale:
                 queue.requeue(leg.hotkey, error=reason,
-                              error_class="infra", burn_attempt=False, operator_billed=True)
+                              error_class="infra", burn_attempt=False, backoff=False, operator_billed=True)
 
     def _roll_era(self, client, era: EraSpec, block: int) -> None:
         with self._lock:
@@ -1997,6 +2002,15 @@ class RollingScheduler:
                     era.king_bench = bench
                     self._save()
             except Exception as e:  # noqa: BLE001 — retried next tick; never kills the loop
+                if _rents_halted(e):
+                    # The box-health halt held the king's rent: not the pod's
+                    # fault — never counted, never a rotation (review R2).
+                    log.error("rolling: era %d king leg waits for the box-health halt: %s",
+                              era.index, error_tail(e, 200))
+                    with self._lock:
+                        era.king_leg_failed = error_tail(e, 300)
+                        self._save()
+                    return
                 log.error("rolling: era %d king leg FAILED: %s", era.index, e)
                 with self._lock:
                     era.king_leg_failed = error_tail(e, 300)
@@ -2677,7 +2691,7 @@ class RollingScheduler:
                     log.error("rolling: superseded pod cleanup for %s failed: %s", gen.hotkey[:12], e)
                 if queue is not None:
                     queue.requeue(gen.hotkey, error="training contract changed at v2 launch",
-                                  error_class="infra", burn_attempt=False, operator_billed=True)
+                                  error_class="infra", burn_attempt=False, backoff=False, operator_billed=True)
                 return
             self._leg_walls().record(gen.ref, self.clock() - t_launch,
                                      sku=str(getattr(entry, "gpu_name", "") or ""))
@@ -2756,6 +2770,7 @@ class RollingScheduler:
                     _finish(cached)
                     return
                 entry = self.ops.train_challenger(gen, era, block, end_wall=end_wall)
+                _forget_lost_leg(self.r, gen.hotkey)            # trained + harvested (N5)
                 _finish(entry)
             except Exception as e:  # noqa: BLE001 — settle the leg from its outcome
                 msg, miner_fault, error_class, burn = self.ops.leg_failure(gen.hotkey)
@@ -2763,6 +2778,7 @@ class RollingScheduler:
                     if miner_fault:
                         queue.fail(gen.hotkey, error=msg or str(e), error_class=error_class,
                                    expect_ref=gen.ref)
+                        _forget_lost_leg(self.r, gen.hotkey)    # terminal: no stale record (N5)
                         if error_class in ("generator", "tamper"):
                             self.ops.burn([gen], block)
                     else:
@@ -3032,7 +3048,7 @@ class RollingScheduler:
                     queue.requeue(f.hotkey, error=f"trained at block {tb}, outside era "
                                   f"{cur.index}'s window [{lo}, {hi}) or contract — trainer "
                                   "fault, retrained",
-                                  error_class="infra", burn_attempt=False, operator_billed=True)
+                                  error_class="infra", burn_attempt=False, backoff=False, operator_billed=True)
             with self._lock:
                 self.state.finished = [f for f in self.state.finished if f not in bad]
                 ready = [f for f in ready if f not in bad]
@@ -3725,3 +3741,27 @@ class RollingScheduler:
                          for e in entries if e.status == "failed"],
             "rents": list(self.state.rents),
         }
+
+
+def _forget_lost_leg(runner, hotkey: str) -> None:
+    """End a hotkey's box-health lost-run record (review N5). Never raises."""
+    try:
+        from .box_health import BoxHealth
+
+        if getattr(runner, "work_root", None) is not None:
+            BoxHealth.for_runner(runner).forget_leg(hotkey)
+    except Exception as e:  # noqa: BLE001
+        log.warning("box health: could not clear the leg record of %s (%s)", hotkey[:12], e)
+
+
+def _rents_halted(exc: BaseException | None) -> bool:
+    """A failure that is the box-health halt holding the rent (review R2)."""
+    from .box_health import RentsHalted
+
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, RentsHalted):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False

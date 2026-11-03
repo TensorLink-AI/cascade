@@ -84,6 +84,12 @@ class ProvisionError(RuntimeError):
     """A provisioning step failed (capacity, launch, teardown, or config)."""
 
 
+class OperatorRentsHeld(ProvisionError):
+    """No new OPERATOR-account rent of any kind (the king's included): the
+    runway guard or the daily cap holds them (cascade.trainer.money_guard).
+    Not a lemon and not a capacity miss — callers wait it out, never spin."""
+
+
 class UncertainCreateError(ProvisionError):
     """A create may have allocated; retain its intent regardless of error prose."""
 
@@ -156,22 +162,72 @@ def shadeform_delete_at(ttl_seconds: float, *, now: float | None = None) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
 
 
-def executor_price_per_hour(executor: dict) -> float | None:
-    """An executor's USD/h from ``lium ls`` JSON (``price_per_hour``, else
-    ``price_per_gpu_hour``); None when the listing carries neither."""
-    for key in ("price_per_hour", "price_per_gpu_hour"):
-        v = executor.get(key)
-        if v is None or isinstance(v, bool):
-            continue
-        try:
-            import math
+def _positive(v) -> float | None:
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    return x if math.isfinite(x) and x > 0 else None
 
-            price = float(v)
-            if math.isfinite(price) and price > 0:
-                return price
-        except (TypeError, ValueError):
-            continue
+
+def executor_gpu_count(executor: dict) -> int | None:
+    """The executor's GPU count from a ``lium ls`` / ``lium ps`` record
+    (``gpu_count``, ``num_gpus``, ``gpus``, or the same under ``machine``);
+    None when the listing does not say."""
+    for rec in (executor, executor.get("machine") if isinstance(executor.get("machine"), dict)
+                else {}):
+        for key in ("gpu_count", "num_gpus", "gpus"):
+            n = _positive(rec.get(key))
+            if n is not None and float(n).is_integer():
+                return int(n)
     return None
+
+
+def _drop_short_pods(sku: str, execs: list[dict]) -> list[dict]:
+    """``execs`` minus every executor on the persistent short-pod blacklist
+    (by id, or by a known host IP — listed or learned). Unreadable ⇒ no
+    filtering (the post-rent GPU-count check still rejects)."""
+    try:
+        from .lium_identity import load_identities
+        from .short_pods import blocked_ids
+
+        ids, ips = blocked_ids()
+        if not ids and not ips:
+            return execs
+        learned = load_identities()["executors"] if ips else {}
+        kept, dropped = [], []
+        for e in execs:
+            eid = str(e.get("id", ""))
+            known = {str(e.get("executor_ip_address") or "")} | set(
+                (learned.get(eid) or {}).get("ips") or ())
+            (dropped if eid in ids or (known & ips) else kept).append(e)
+        if dropped:
+            log.info("lium: %d %s executor(s) skipped — on the short-pod blacklist (%s)",
+                     len(dropped), sku, ", ".join(str(e.get("id"))[:8] for e in dropped[:6]))
+        return kept
+    except Exception as e:  # noqa: BLE001
+        log.warning("short-pod blacklist unreadable (%s) — not filtered", e)
+        return execs
+
+
+def executor_price_per_hour(executor: dict, *, gpu_count: int | None = None) -> float | None:
+    """An executor's WHOLE-POD USD/h from ``lium ls`` JSON: ``price_per_hour``,
+    else ``price_per_gpu_hour`` × its GPU count (``gpu_count``, else the
+    listing's own count); None when neither is known. A per-GPU figure is
+    never compared with a pod cap on its own (money safety II: an 8-GPU pod
+    read at its per-GPU price slipped under every cap 8x loose)."""
+    whole = _positive(executor.get("price_per_hour"))
+    if whole is not None:
+        return whole
+    per = _positive(executor.get("price_per_gpu_hour"))
+    if per is None:
+        return None
+    n = gpu_count or executor_gpu_count(executor)
+    if not n:
+        return None                  # unknown count ⇒ unpriced (a cap drops it)
+    return per * int(n)
 
 
 def image_digest_of(image: str) -> str:
@@ -875,33 +931,42 @@ def pick_shadeform_cpu_offer(types_json: dict, min_vcpus: int,
     GPU-less type (``num_gpus == 0``), when listed at all, sorts ahead of any
     GPU type at the same or higher price — we rent the cores, not the card.
     Each offer: ``{cloud, region, shade_instance_type, vcpus, memory_gb,
-    price_usd_hr, num_gpus}``."""
-    out: list[tuple[int, float, dict]] = []
+    price_usd_hr, num_gpus}``.
+
+    One offer PER available on-demand region, in the API's region order:
+    the generation stage quarantines (provider, cloud, region, type), so a
+    region whose VMs never come up must not hide the same type's other
+    regions (2026-11-02: latitude/cpu_32 listed dallas, ashburn, TYO3, LON;
+    only dallas was ever offered, and it errored on create 3/3)."""
+    out: list[tuple[int, float, int, dict]] = []
     for t in types_json.get("instance_types", []):
         conf = t.get("configuration", {}) or {}
         vcpus = int(conf.get("vcpus", 0) or 0)
         price = int(t.get("hourly_price", 1 << 30)) / 100.0
         if vcpus < int(min_vcpus) or price > float(max_price_usd_hr):
             continue
-        region = next(
-            (a.get("region") for a in t.get("availability", [])
-             if a.get("available") and a.get("rental_type", "on_demand") == "on_demand"),
-            None,
-        )
-        if not region:
-            continue
+        regions: list[str] = []
+        for a in t.get("availability", []) or []:
+            r = a.get("region")
+            if (r and r not in regions and a.get("available")
+                    and a.get("rental_type", "on_demand") == "on_demand"):
+                regions.append(r)
         gpus = int(conf.get("num_gpus", 0) or 0)
-        out.append((0 if gpus == 0 else 1, price, {
-            "cloud": t.get("cloud"),
-            "region": region,
-            "shade_instance_type": t.get("shade_instance_type"),
-            "vcpus": vcpus,
-            "memory_gb": float(conf.get("memory_in_gb", 0) or 0),
-            "price_usd_hr": price,
-            "num_gpus": gpus,
-        }))
-    out.sort(key=lambda x: (x[0], x[1]))
-    return [o for _, _, o in out]
+        for i, region in enumerate(regions):
+            out.append((0 if gpus == 0 else 1, price, i, {
+                "cloud": t.get("cloud"),
+                "region": region,
+                "shade_instance_type": t.get("shade_instance_type"),
+                "vcpus": vcpus,
+                "memory_gb": float(conf.get("memory_in_gb", 0) or 0),
+                "price_usd_hr": price,
+                "num_gpus": gpus,
+            }))
+    # Stable sort: the first region of every type at a price still comes
+    # before the second region of any of them (index i), so a cheaper type's
+    # spare regions never outrank a different type's primary one.
+    out.sort(key=lambda x: (x[0], x[1], x[2]))
+    return [o for *_, o in out]
 
 
 def shadeform_offer_price_usd_hr(types_json: dict, sku: str) -> float | None:
@@ -1197,7 +1262,14 @@ class LiumProvider:
                 self._cli(["ls", "--gpu", base, "--format", "json"]).stdout)
         except ProvisionError as e:
             raise self._scrub_key(e) from None
-        shaped = [e for e in execs if int(e.get("gpu_count", 1) or 1) == int(gpus)]
+        # EXACT shape before any rent (money safety II): the listed count must
+        # be the layout's (a multi-GPU rent never assumes a missing count).
+        # Lium's listing has no free-GPU field, so a SHORT machine (listed 8,
+        # exposes 4) is only known after a rent: the persistent short-pod
+        # blacklist keeps every struck executor / host out from then on.
+        shaped = [e for e in execs
+                  if (executor_gpu_count(e) or (1 if int(gpus) == 1 else 0)) == int(gpus)]
+        shaped = _drop_short_pods(sku, shaped)
         cooling = cooling_executors()
         if cooling:
             kept = [e for e in shaped if str(e.get("id")) not in cooling]
@@ -1376,6 +1448,23 @@ class LiumProvider:
         process's launches only); "" when unknown."""
         return self._sku_by_name.get(pod_id, "")
 
+    def price_of(self, pod_id: str) -> float | None:
+        """The landed executor's $/h: this process's launch record, else the
+        account's pod listing (an ADOPTED pod; review S2); None when unknown."""
+        known = self.__dict__.get("_price_by_name", {}).get(pod_id)
+        if known:
+            return known
+        try:
+            row = self._pod(pod_id) or {}
+        except Exception:  # noqa: BLE001 — unknown, never a guess
+            return None
+        for cand in (row, row.get("executor") or {}, row.get("machine") or {}):
+            if isinstance(cand, dict):
+                price = executor_price_per_hour(cand)
+                if price:
+                    return float(price)
+        return None
+
     def _list_pods(self) -> list[dict]:
         try:
             return parse_lium_pods(self._cli(["ps", "--format", "json"]).stdout)
@@ -1485,6 +1574,8 @@ class LiumProvider:
                      if executor_price_per_hour(ex) is not None else "")
             self._executor_by_name[name] = str(ex.get("id"))
             self._sku_by_name[name] = landed
+            # the LANDED $/h: operator spend is booked at the real rent price
+            self.__dict__.setdefault("_price_by_name", {})[name] = executor_price_per_hour(ex)
             cached = self._executor_records_cache
             if cached and cached[1].get(str(ex.get("id"))):
                 # Keep its GPU / site identity even after it leaves the listing.

@@ -154,3 +154,8 @@ def test_miner_funded_next_attempt_polls_its_own_key(tmp_path):
     _arm_wait(runner, deadline_offsets=3600, capacity_seq=[0, 2])
     runner._operator_fallback_eligible = lambda hotkey, now, deadline: True
     assert runner._wait_for_funded_capacity("RTX4090", describe="leg", hotkey="hk") is True
+
+
+# The owner-approval gate (2026-11-02) is tested in test_money_safety.py;
+# these tests drive the operator-lane / operator-rent machinery behind it.
+pytestmark = pytest.mark.usefixtures("operator_legs_preapproved")

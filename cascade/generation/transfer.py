@@ -15,6 +15,7 @@ for that object, not an account key.
 
 from __future__ import annotations
 
+import http.client
 import logging
 import math
 import shutil
@@ -67,16 +68,49 @@ def download_plan(store, base: str, index: dict,
     return {name: presign(store, "get_object", base + name, expires_s) for name in names}
 
 
-def _retry(what: str, fn):
-    for attempt in range(1, _ATTEMPTS + 1):
+class LinkExpiredError(OSError):
+    """A pre-signed link was refused (HTTP 401/403) and its signed expiry has
+    passed: the link itself is dead, so no retry of it can succeed."""
+
+
+def link_expiry_epoch(url: str) -> int:
+    """A pre-signed link's signed expiry (unix seconds), read locally from
+    its SigV4 ``X-Amz-Date`` + ``X-Amz-Expires`` (or SigV2 ``Expires``) query
+    fields; 0 when the link carries neither."""
+    import calendar
+    from urllib.parse import parse_qs, urlsplit
+
+    q = {k.lower(): v[0] for k, v in parse_qs(urlsplit(url).query).items() if v}
+    try:
+        if "x-amz-date" in q and "x-amz-expires" in q:
+            return int(calendar.timegm(time.strptime(q["x-amz-date"], "%Y%m%dT%H%M%SZ"))
+                       + int(q["x-amz-expires"]))
+        if "expires" in q:
+            return int(q["expires"])
+    except (ValueError, OverflowError):
+        return 0
+    return 0
+
+
+def link_expired(url: str, now: float | None = None) -> bool:
+    """Whether a pre-signed link's signed validity window has ended (a link
+    with no readable expiry is never called expired)."""
+    exp = link_expiry_epoch(url)
+    return exp > 0 and (time.time() if now is None else now) >= exp
+
+
+def _retry(what: str, fn, attempts: int = _ATTEMPTS):
+    for attempt in range(1, attempts + 1):
         try:
             return fn()
-        except OSError as e:
-            if attempt == _ATTEMPTS:
+        except LinkExpiredError:
+            raise                      # a dead link stays dead: never retried
+        except (OSError, http.client.HTTPException) as e:
+            if attempt == attempts:
                 raise
             delay = min(60.0, 2.0 ** attempt)
             log.warning("%s failed (%s); retry %d/%d in %.0fs", what, e, attempt,
-                        _ATTEMPTS - 1, delay)
+                        attempts - 1, delay)
             time.sleep(delay)
     return None
 
@@ -96,14 +130,39 @@ def put_file(url: str, path: Path | str, *, timeout: float = 600.0) -> None:
     _retry(f"upload {p.name}", _once)
 
 
-def get_file(url: str, path: Path | str, *, timeout: float = 600.0) -> None:
-    """Download a pre-signed GET link into ``path`` (written via a temp file)."""
+def get_file(url: str, path: Path | str, *, timeout: float = 600.0,
+             attempts: int = _ATTEMPTS) -> None:
+    """Download a pre-signed GET link into ``path`` (written via a temp file
+    and renamed into place, so ``path`` is only ever absent or complete).
+
+    ``attempts`` bounds this function's own transport retries. The shard
+    reader (:func:`cascade.generation.shards._fetch_shard`) passes 1 and owns
+    the retry loop itself — it must also retry a sha256 mismatch, which this
+    layer cannot see — so the two never compound. A body shorter than its
+    ``Content-Length`` is an error (``OSError``), never a silently short
+    file; an HTTP 401/403 on a link past its signed expiry raises
+    :class:`LinkExpiredError` and is not retried."""
+    import urllib.error
+
     p = Path(path)
     tmp = p.with_suffix(p.suffix + ".part")
 
     def _once() -> None:
-        with urllib.request.urlopen(url, timeout=timeout) as resp, open(tmp, "wb") as fh:  # noqa: S310
-            shutil.copyfileobj(resp, fh, length=1 << 20)
-        tmp.replace(p)
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as resp, open(tmp, "wb") as fh:  # noqa: S310
+                shutil.copyfileobj(resp, fh, length=1 << 20)
+                want = resp.headers.get("Content-Length") if resp.headers else None
+                got = fh.tell()
+            if want is not None and str(want).strip().isdigit() and int(want) != got:
+                raise OSError(f"short read: {got} of {int(want)} bytes")
+            tmp.replace(p)
+        except urllib.error.HTTPError as e:
+            tmp.unlink(missing_ok=True)
+            if e.code in (401, 403) and link_expired(url):
+                raise LinkExpiredError(f"HTTP {e.code} on an expired link") from e
+            raise OSError(f"HTTP {e.code}") from e
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
 
-    _retry(f"download {p.name}", _once)
+    _retry(f"download {p.name}", _once, attempts=max(1, int(attempts)))

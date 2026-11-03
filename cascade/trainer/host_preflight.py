@@ -17,6 +17,7 @@ OPERATOR-side fault: nothing burns a miner's attempt.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 log = logging.getLogger("cascade.trainer")
 
@@ -35,6 +36,15 @@ def sync_host_blocklist(runner) -> tuple[str, ...]:
     """Point the process-wide provider blocklist at the live config's
     ``[round] funded_host_blocklist`` (replace, never merge: an IP removed
     from the knob is rentable again). Never raises."""
+    try:
+        from ..provision import short_pods
+
+        wr = getattr(runner, "work_root", None)
+        if wr is not None:
+            # the persistent short-pod blacklist lives under the work root
+            short_pods.set_path(Path(wr) / short_pods.FILE_NAME)
+    except Exception as e:  # noqa: BLE001
+        log.warning("short-pod blacklist path not set (%s)", e)
     try:
         from ..provision.core import set_host_blocklist
 
