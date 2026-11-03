@@ -159,15 +159,19 @@ def harvest_max_bytes(rnd) -> int | None:
 
 
 def _check_harvest_dir(remote_dir: str) -> None:
-    """A receipt's ``checkpoint_dir`` must be the worker's own layout: under
-    ``_train_work/`` (relative to the pod workdir, or an absolute path whose
-    components include it), never ``..`` or a bare root."""
+    """A receipt's ``checkpoint_dir`` must stay inside the worker's space: a
+    path RELATIVE to the pod workdir (no ``..``, not the workdir itself), or
+    an absolute path inside a ``_train_work`` tree — never the pod's root or
+    home (the stream is size-bounded either way)."""
     from pathlib import PurePosixPath
 
     from .faults import CheckpointUnverifiable
 
-    parts = PurePosixPath(str(remote_dir or "")).parts
-    if not parts or ".." in parts or "_train_work" not in parts or parts[-1] == "_train_work":
+    path = PurePosixPath(str(remote_dir or ""))
+    parts = [p for p in path.parts if p not in (".", "")]
+    bad = (not parts or ".." in parts or parts[-1] == "_train_work"
+           or (path.is_absolute() and "_train_work" not in parts))
+    if bad:
         raise CheckpointUnverifiable(
             f"receipt checkpoint_dir {str(remote_dir)[:160]!r} is not inside the worker's "
             "_train_work layout — refused, unburned")

@@ -882,7 +882,8 @@ def test_the_harvest_dir_must_be_the_workers_layout():
 
     _check_harvest_dir("_train_work/777/toto2-4m/challenger/checkpoint")
     _check_harvest_dir("/root/cascade/_train_work/mkt-5abc-12")
-    for bad in ("/", "/root", "_train_work", "_train_work/../../etc", ""):
+    _check_harvest_dir("remote/ckpt")                       # relative to the pod workdir
+    for bad in ("/", "/root", "/etc/x", "_train_work", "_train_work/../../etc", "", "."):
         with pytest.raises(CheckpointUnverifiable):
             _check_harvest_dir(bad)
     assert harvest_max_bytes(RoundConfig(expected_checkpoint_gb=15.0)) == int(15 * 1.2 * 2 ** 30)
