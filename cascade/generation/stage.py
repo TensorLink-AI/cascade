@@ -651,8 +651,17 @@ class GenerationStage:
                                  image=self.vm_image,
                                  **_ttl_kw(provider, self.cfg, leg.window_seconds))
         except Exception as e:  # noqa: BLE001 — a market miss is infra
-            # The row stays: a launch that raised may still have created a
-            # VM; the reaper resolves it (or logs it for a manual stop).
+            from ..provision.core import LaunchRefused
+
+            if isinstance(e, LaunchRefused):
+                # Refused before any provider call (runway guard, daily cap,
+                # breaker): no VM exists, so the intent must not outlive the
+                # refusal or every retry reads "needs reconciliation".
+                _ledger_drop(self.ledger_path, name)
+                with _LIVE_GUARD:
+                    _LAUNCHING.discard(name)
+            # Otherwise the row stays: a launch that raised may still have
+            # created a VM; the reaper resolves it (or logs it for a manual stop).
             raise GenerationInfraError(f"{provider.name}: launch failed: {e}") from e
         try:
             _ledger_put(self.ledger_path, {**row, "vm_id": str(vm)})

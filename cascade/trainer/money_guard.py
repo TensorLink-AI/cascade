@@ -223,11 +223,11 @@ class _BreakerGuardedProvider:
         return getattr(self._provider, name)
 
     def launch(self, spec, *args, **kwargs):
-        from ..provision.core import ProvisionError
+        from ..provision.core import LaunchRefused
 
         rec = self._breaker.open_record() if self._enforce else None
         if rec:
-            raise ProvisionError(f"operator rents paused: circuit breaker open until "
+            raise LaunchRefused(f"operator rents paused: circuit breaker open until "
                                  f"{time.strftime('%H:%M:%SZ', time.gmtime(rec['open_until']))} "
                                  f"({rec.get('reason', '')})")
         runner = self._runner
