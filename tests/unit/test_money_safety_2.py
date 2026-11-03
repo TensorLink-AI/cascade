@@ -1246,8 +1246,10 @@ def test_the_short_pod_block_expires_after_72h_and_a_second_strike_is_7d(tmp_pat
 
     f = tmp_path / "sp.json"
     short_pods.strike(executor_id="ex1", ip="1.2.3.4", reason="short pod", now=0.0, file=f)
+    # the same reject seen again moments later is NOT a second strike (N1)
+    short_pods.strike(executor_id="ex1", ip="1.2.3.4", reason="short pod", now=5.0, file=f)
     ids, ips = short_pods.blocked_ids(now=71 * 3600.0, file=f)
-    assert ids == {"ex1"} and ips == {"1.2.3.4"}
+    assert ids == {"ex1"} and ips == set()          # one executor never blocks its NAT IP
     assert short_pods.blocked_ids(now=73 * 3600.0, file=f) == (set(), set())
     short_pods.strike(executor_id="ex1", reason="short pod again", now=100 * 3600.0, file=f)
     (rec,) = [v for v in short_pods.active(now=100 * 3600.0, file=f).values()
@@ -1268,3 +1270,33 @@ def test_rent_status_shows_and_the_cli_edits_the_blacklist(tmp_path, capsys):
     assert "short-pod blacklist executor:3bb98239-513b" in capsys.readouterr().out
     assert olc.main(["unblock-executor", "3bb98239-513b", "--work-root", str(wr)]) == 0
     assert olc.main(["unblock-executor", "3bb98239-513b", "--work-root", str(wr)]) == 1
+
+
+
+def test_an_ip_is_blocked_only_after_two_distinct_short_executors(tmp_path):
+    from cascade.provision import short_pods
+
+    f = tmp_path / "sp.json"
+    short_pods.strike(executor_id="exA", ip="5.5.5.5", reason="short pod", now=0.0, file=f)
+    assert short_pods.blocked_ids(now=10.0, file=f) == ({"exA"}, set())   # sibling exB ok
+    short_pods.strike(executor_id="exA", ip="5.5.5.5", reason="short pod", now=3600.0, file=f)
+    assert short_pods.blocked_ids(now=3601.0, file=f)[1] == set()        # same executor again
+    short_pods.strike(executor_id="exB", ip="5.5.5.5", reason="short pod", now=7200.0, file=f)
+    assert short_pods.blocked_ids(now=7201.0, file=f) == ({"exA", "exB"}, {"5.5.5.5"})
+    short_pods.block("6.6.6.6", kind="ip", seconds=3600.0, file=f, now=0.0)
+    assert "6.6.6.6" in short_pods.blocked_ids(now=10.0, file=f)[1]      # by hand: at once
+
+
+def test_one_short_pod_reject_is_struck_once(tmp_path, monkeypatch):
+    import inspect
+
+    from cascade.trainer.runner_funded_pods import _FundedPodMixin
+
+    assert "strike(" not in inspect.getsource(_FundedPodMixin._host_gpu_shortfall)
+    from cascade.provision import short_pods
+
+    f = tmp_path / "sp.json"
+    short_pods.strike(executor_id="exZ", reason="short pod", now=0.0, file=f)
+    short_pods.strike(executor_id="exZ", reason="short pod", now=1.0, file=f)
+    (rec,) = short_pods.active(now=2.0, file=f).values()
+    assert rec["strikes"] == 1 and rec["until"] == pytest.approx(72 * 3600.0)

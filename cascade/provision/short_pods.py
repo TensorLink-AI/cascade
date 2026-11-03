@@ -39,6 +39,12 @@ PATH_ENV = "CASCADE_SHORT_POD_FILE"
 FIRST_STRIKE_SECONDS = 72 * 3600.0
 REPEAT_STRIKE_SECONDS = 7 * 86400.0
 STRIKE_MEMORY_SECONDS = 30 * 86400.0
+# A re-strike of the same key this soon is the SAME reject seen twice (two
+# call sites of one post-rent check) — never a second strike.
+RESTRIKE_IGNORE_SECONDS = 600.0
+# One Lium NAT IP fronts several executors: an IP is blocked only once short
+# rents hit at least this many DISTINCT executor ids behind it.
+IP_DISTINCT_EXECUTORS = 2
 
 _PATH: Path | None = None
 _LOCK = threading.Lock()
@@ -97,18 +103,27 @@ def strike(*, executor_id: str = "", ip: str = "", reason: str = "",
     try:
         with _locked(p):
             doc = _load(p)
-            for kind, ident in (("executor", executor_id), ("ip", ip)):
+            eid = str(executor_id or "").strip()
+            for kind, ident in (("executor", eid), ("ip", ip)):
                 ident = str(ident or "").strip()
                 if not ident:
                     continue
                 k = _key(kind, ident)
                 prev = doc.get(k) or {}
+                execs = sorted(set(prev.get("executors") or ()) | ({eid} if eid else set()))
+                if prev and t - float(prev.get("last_strike") or 0) < RESTRIKE_IGNORE_SECONDS:
+                    # the same reject seen twice: no second strike (review N1)
+                    doc[k] = {**prev, "executors": execs} if kind == "ip" else prev
+                    out[k] = float(prev.get("until") or 0)
+                    continue
                 recent = t - float(prev.get("last_strike") or 0) <= STRIKE_MEMORY_SECONDS
                 strikes = (int(prev.get("strikes") or 0) if recent else 0) + 1
                 until = t + (REPEAT_STRIKE_SECONDS if strikes >= 2 else FIRST_STRIKE_SECONDS)
                 doc[k] = {"kind": kind, "id": ident, "strikes": strikes, "last_strike": t,
                           "until": max(until, float(prev.get("until") or 0)),
                           "reason": str(reason)[:200]}
+                if kind == "ip":
+                    doc[k]["executors"] = execs
                 out[k] = doc[k]["until"]
             doc = {k: v for k, v in doc.items()
                    if float(v.get("until") or 0) > t
@@ -134,7 +149,7 @@ def block(ident: str, *, kind: str = "executor", seconds: float = FIRST_STRIKE_S
         doc[_key(kind, ident)] = {"kind": kind, "id": ident,
                                   "strikes": int(prev.get("strikes") or 0) + 1,
                                   "last_strike": t, "until": t + float(seconds),
-                                  "reason": reason[:200]}
+                                  "reason": reason[:200], "manual": True}
         _save(p, doc)
 
 
@@ -151,10 +166,21 @@ def unblock(ident: str, *, file: Path | None = None) -> int:
     return len(gone)
 
 
+def _in_force(v: dict, t: float) -> bool:
+    if float(v.get("until") or 0) <= t:
+        return False
+    if v.get("kind") == "ip" and not v.get("manual"):
+        # a shared NAT IP: blocked only after short rents on >= 2 DISTINCT
+        # executors behind it (review N2); otherwise the executor ids only
+        return len(set(v.get("executors") or ())) >= IP_DISTINCT_EXECUTORS
+    return True
+
+
 def active(*, now: float | None = None, file: Path | None = None) -> dict[str, dict]:
-    """``{key: record}`` of every block still in force."""
+    """``{key: record}`` of every block in force (an IP record only once it
+    covers >= ``IP_DISTINCT_EXECUTORS`` distinct executors, or by hand)."""
     t = time.time() if now is None else float(now)
-    return {k: v for k, v in _load(file or path()).items() if float(v.get("until") or 0) > t}
+    return {k: v for k, v in _load(file or path()).items() if _in_force(v, t)}
 
 
 def blocked_ids(*, now: float | None = None, file: Path | None = None) -> tuple[set, set]:

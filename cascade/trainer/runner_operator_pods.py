@@ -163,7 +163,8 @@ class _OperatorPodMixin:
                     from ..provision.short_pods import strike
 
                     with contextlib.suppress(Exception):
-                        strike(executor_id=str(provider.machine_of(pod_id) or ""), reason=why)
+                        strike(executor_id=str(provider.machine_of(pod_id) or ""),
+                               ip=str(getattr(addr, "ip", "") or ""), reason=why)
                 # Verified teardown, ledger row dropped only when CONFIRMED
                 # gone (bare terminate swallows a failed rm as success).
                 try:
@@ -609,7 +610,8 @@ class _OperatorPodMixin:
                 from ..provision.short_pods import strike
 
                 with contextlib.suppress(Exception):
-                    strike(executor_id=str(provider.machine_of(pod_id) or ""), reason=why)
+                    strike(executor_id=str(provider.machine_of(pod_id) or ""),
+                               ip=str(getattr(addr, "ip", "") or ""), reason=why)
             try:
                 if terminate_verified(provider, pod_id):
                     self._ledger_remove(pod_id)

@@ -1979,12 +1979,11 @@ class _FundedPodMixin:
             ip = str(getattr(host, "host", "") or "")
             if ip:
                 from ..provision.core import record_host_quarantine
-                from ..provision.short_pods import strike
 
                 record_host_quarantine(ip, f"{label}: {why}", host_fault=True)
-                # the persistent blacklist (72 h, a second strike 7 d): every
-                # leg, account and restart skips this machine before renting
-                strike(ip=ip, reason=f"{label}: {why}")
+            # The persistent short-pod blacklist is struck ONCE, by the caller
+            # that knows the executor id (review N1): the payer reject site,
+            # the operator-leg / king lemon paths.
             return why
         return ""
 
