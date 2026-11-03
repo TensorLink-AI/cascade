@@ -738,3 +738,51 @@ def test_an_unreachable_pod_last_seen_finished_is_kept_for_the_priced_keep(tmp_p
     assert r._sweep_keeps_pod(A(), "pod-f", what="t")                  # priced keep: 0.5 x 4 h
     r.t[0] = t0 + 2 * 3600 + 20
     assert not r._sweep_keeps_pod(A(), "pod-f", what="t")              # the keep is spent
+
+
+# ── the operator CLI resolves the work root independent of the CWD ──────────
+
+
+def test_operator_cli_resolves_the_work_root_from_anywhere(tmp_path, monkeypatch, capsys):
+    from cascade.trainer import operator_legs_cli as olc
+
+    deploy = (tmp_path / "cascade").resolve()
+    (deploy / "_train_work").mkdir(parents=True)
+    (deploy / "chain.toml").write_text("")
+    elsewhere = tmp_path / "home"
+    elsewhere.mkdir()
+    # resolution order: --work-root, --chain-toml, ./chain.toml, $CASCADE_ROOT, the deploy dir
+    assert olc.resolve_work_root(deploy / "x")[0] == (deploy / "x").resolve()
+    assert olc.resolve_work_root(chain_toml=deploy / "chain.toml")[0] == deploy / "_train_work"
+    assert olc.resolve_work_root(cwd=deploy, env={})[0] == deploy / "_train_work"
+    assert olc.resolve_work_root(cwd=elsewhere, env={"CASCADE_ROOT": str(deploy)})[0] == \
+        deploy / "_train_work"
+    assert olc.resolve_work_root(cwd=elsewhere, env={}, deploy_root=deploy)[0] == \
+        deploy / "_train_work"
+    # run from another directory: the pending leg under the deployment is found
+    q = FundedQueue(deploy / "_train_work" / "funded_queue.json")
+    q.add(HK, REF, 10)
+    OperatorApprovals.for_work_root(deploy / "_train_work").request(
+        "funded_queue.json", HK, ref=REF, attempt_id="", queue_path=str(q.path),
+        kind="make_good", funded_at=q.get(HK).funded_at)
+    monkeypatch.chdir(elsewhere)
+    monkeypatch.setenv("CASCADE_ROOT", str(deploy))
+    assert olc.main(["list-operator-legs"]) == 0
+    out = capsys.readouterr().out
+    assert f"queue: {deploy / '_train_work' / 'funded_queue.json'}" in out
+    assert f"AWAITING  {HK}" in out
+    assert olc.main(["approve-operator-leg", HK]) == 0
+    assert "APPROVED" in capsys.readouterr().out
+
+
+def test_operator_cli_fails_loud_when_the_queue_is_missing(tmp_path, capsys):
+    from cascade.trainer import operator_legs_cli as olc
+
+    (tmp_path / "wr").mkdir()
+    for argv in (["list-operator-legs"], ["approve-operator-leg", HK],
+                 ["deny-operator-leg", HK], ["resume-operator-leg", HK]):
+        assert olc.main([*argv, "--work-root", str(tmp_path / "wr")]) == 2
+        err = capsys.readouterr().err
+        assert "no funding queue at" in err and str(tmp_path / "wr") in err
+    assert olc.main(["rent-status", "--work-root", str(tmp_path / "missing")]) == 2
+    assert olc.main(["rent-status", "--work-root", str(tmp_path / "wr")]) == 0

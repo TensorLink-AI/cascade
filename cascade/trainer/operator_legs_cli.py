@@ -21,16 +21,27 @@ entry to the queue with its operator-fault count reset — run it only once the
 cause is fixed.
 
 Pure file operations under the trainer's work root (flock'd, like the
-queue); no chain, no provider, no key material. Run them on the trainer box
-from the deployment directory (the work root and queue paths are relative).
+queue); no chain, no provider, no key material. The work root is resolved
+the same way from ANY directory (2026-11-03: run from /root, approve said
+"no pending operator-billed leg" while legs were pending under
+/root/cascade/_train_work): ``--work-root`` when given; else ``_train_work``
+beside ``--chain-toml``; else beside ``./chain.toml`` (the deployment dir);
+else under ``$CASCADE_ROOT``; else ``/root/cascade/_train_work`` when it
+exists. Every command prints the resolved queue path, and a missing queue
+file is an error (exit 2), never a silent "nothing pending".
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
+
+WORK_DIRNAME = "_train_work"
+DEFAULT_DEPLOY_ROOT = Path("/root/cascade")
+QUEUE_FILE = "funded_queue.json"
 
 COMMANDS = ("list-operator-legs", "approve-operator-leg", "deny-operator-leg",
             "resume-operator-leg", "rent-status", "resume-rents")
@@ -68,12 +79,38 @@ def _queue_for(work_root: Path, rec: dict | None, queue_name: str | None):
     return None
 
 
+def resolve_work_root(work_root: Path | None = None, *, chain_toml: Path | None = None,
+                      cwd: Path | None = None, env: dict | None = None,
+                      deploy_root: Path = DEFAULT_DEPLOY_ROOT) -> tuple[Path, str]:
+    """``(work_root, how)`` — the trainer's work root, independent of the
+    caller's CWD (see the module doc for the order)."""
+    env = os.environ if env is None else env
+    cwd = Path.cwd() if cwd is None else Path(cwd)
+    if work_root is not None:
+        return Path(work_root).expanduser().resolve(), "--work-root"
+    if chain_toml is not None:
+        return Path(chain_toml).expanduser().resolve().parent / WORK_DIRNAME, "--chain-toml"
+    if (cwd / "chain.toml").is_file():
+        return (cwd / WORK_DIRNAME).resolve(), f"chain.toml in {cwd}"
+    root = str(env.get("CASCADE_ROOT", "") or "").strip()
+    if root:
+        return Path(root).expanduser().resolve() / WORK_DIRNAME, "$CASCADE_ROOT"
+    if (deploy_root / WORK_DIRNAME).is_dir():
+        return deploy_root / WORK_DIRNAME, str(deploy_root)
+    return (cwd / WORK_DIRNAME).resolve(), "the current directory (no deployment found)"
+
+
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="cascade-trainer", description=__doc__.split("\n\n")[0])
     sub = p.add_subparsers(dest="cmd", required=True)
     for cmd in COMMANDS:
         s = sub.add_parser(cmd)
-        s.add_argument("--work-root", type=Path, default=Path("./_train_work"))
+        s.add_argument("--work-root", type=Path, default=None,
+                       help="the trainer's work root (default: _train_work beside "
+                            "--chain-toml / ./chain.toml, else $CASCADE_ROOT, else "
+                            "/root/cascade/_train_work)")
+        s.add_argument("--chain-toml", type=Path, default=None,
+                       help="the deployment's chain.toml; its directory holds _train_work")
         if cmd not in ("list-operator-legs", "rent-status", "resume-rents"):
             s.add_argument("hotkey")
             s.add_argument("--queue", default=None,
@@ -107,7 +144,19 @@ def main(argv: list[str]) -> int:
     )
 
     args = _parser().parse_args(argv)
-    wr = Path(args.work_root)
+    wr, how = resolve_work_root(args.work_root, chain_toml=args.chain_toml)
+    queue_path = wr / QUEUE_FILE
+    # Every command names what it read (the human must see WHICH queue).
+    out = sys.stderr if getattr(args, "json", False) else sys.stdout
+    print(f"work root: {wr} (from {how}); queue: {queue_path}", file=out)
+    if not wr.is_dir():
+        print(f"error: work root {wr} does not exist — pass --work-root (the trainer's "
+              "_train_work) or run from the deployment directory", file=sys.stderr)
+        return 2
+    if args.cmd not in ("rent-status", "resume-rents") and not queue_path.is_file():
+        print(f"error: no funding queue at {queue_path} — wrong work root? pass --work-root "
+              "(nothing was read, nothing was changed)", file=sys.stderr)
+        return 2
     store = OperatorApprovals.for_work_root(wr)
     if args.cmd in ("rent-status", "resume-rents"):
         return _rents(args, wr)

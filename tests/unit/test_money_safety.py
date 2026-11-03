@@ -359,6 +359,7 @@ def test_cli_lists_pending_and_paused(tmp_path, capsys):
 def test_trainer_main_dispatches_the_subcommands(tmp_path, capsys):
     from cascade.trainer.main import main
 
+    FundedQueue(tmp_path / "funded_queue.json").add(HK, REF, 10)
     assert main(["list-operator-legs", "--work-root", str(tmp_path)]) == 0
     assert "no operator-billed legs" in capsys.readouterr().out
 
