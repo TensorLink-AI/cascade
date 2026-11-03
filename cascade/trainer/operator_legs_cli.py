@@ -118,7 +118,7 @@ def _parser() -> argparse.ArgumentParser:
         if cmd in ("block-executor", "unblock-executor"):
             s.add_argument("ident", help="a Lium executor id, or a host IP")
             if cmd == "block-executor":
-                s.add_argument("--days", type=float, default=3.0)
+                s.add_argument("--days", type=float, default=7.0)
                 s.add_argument("--reason", default="blocked by the operator")
         elif cmd not in ("list-operator-legs", "rent-status", "resume-rents"):
             s.add_argument("hotkey")

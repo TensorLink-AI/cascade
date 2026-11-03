@@ -1346,16 +1346,16 @@ Trainer-only; nothing here reaches a manifest or a validator verdict.
   30 days, 7 days. It applies to every leg, payer and operator account, and
   survives restarts, because `LiumProvider._list_executors` filters it before
   any rent. `cascade-trainer rent-status` shows it.
-  `cascade-trainer block-executor <id|ip> [--days N]` and
+  `cascade-trainer block-executor <id|ip>` (7 days by default) and
   `unblock-executor <id|ip>` edit it. Lium's listing has no free-GPU field, so
   a short machine is only found by renting it; the blacklist keeps it out after
   that. One-off seed from the trainer.log findings (29 short-pod rejects since
   Oct 25):
 
   ```
-  cascade-trainer block-executor 3bb98239-513b-4e07-a577-4e3ffa1004d7 --days 7 --reason "golden-lion-db: 4/8 GPUs x4"
-  cascade-trainer block-executor 63cadadb-b379-4c45-8a01-04a81b135933 --days 7 --reason "1 GPU x3"
-  cascade-trainer block-executor f092246d-5704-4c9e-b57f-7c0710a06deb --days 7 --reason "3 GPUs x2"
+  cascade-trainer block-executor 3bb98239-513b-4e07-a577-4e3ffa1004d7 --reason "golden-lion-db: 4/8 GPUs x4"
+  cascade-trainer block-executor 63cadadb-b379-4c45-8a01-04a81b135933 --reason "1 GPU x3"
+  cascade-trainer block-executor f092246d-5704-4c9e-b57f-7c0710a06deb --reason "3 GPUs x2"
   ```
 * **Post-rent rejects / lemons** never propose a full-leg operator make-good:
   their cost is booked `make_good` (one priced alert, sized to the loss) and
