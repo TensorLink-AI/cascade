@@ -448,18 +448,23 @@ def test_a_short_pod_quarantines_its_host_ip(monkeypatch):
     assert why.startswith("short pod") and seen == [("9.9.9.9", True)]
 
 
-def test_listings_are_filtered_on_the_exact_and_free_gpu_count(monkeypatch):
+def test_listings_are_filtered_on_the_exact_gpu_count(monkeypatch, tmp_path):
     from cascade.provision import core
 
     prov = core.LiumProvider()
     rows = [{"id": "a", "gpu_count": 8, "price_per_hour": 20.0},
             {"id": "b", "price_per_hour": 20.0},                          # count unknown
-            {"id": "c", "gpu_count": 8, "available_gpu_count": 6, "price_per_hour": 20.0},
             {"id": "d", "gpu_count": 6, "price_per_hour": 15.0}]
     monkeypatch.setattr(prov, "_cli", lambda args: SimpleNamespace(stdout=json.dumps(rows)))
     monkeypatch.setattr(prov, "_steer_hosts", lambda sku, shaped: shaped)
     monkeypatch.setattr(core, "cooling_executors", lambda: set())
-    assert [e["id"] for e in prov._list_executors("8xH200")] == ["a"]
+    from cascade.provision import short_pods
+
+    short_pods.set_path(tmp_path / "sp.json")
+    try:
+        assert [e["id"] for e in prov._list_executors("8xH200")] == ["a"]
+    finally:
+        short_pods.set_path(None)
 
 
 def test_ready_timeout_default_is_420():
@@ -1202,3 +1207,64 @@ def test_post_rent_rejects_never_propose_a_full_leg_make_good_but_count_to_the_c
     with pytest.raises(_Skip):
         g.waste_cap_check(r, SimpleNamespace(hotkey=HK, ref=REF, uid=1))   # bounded
     assert OperatorApprovals.for_work_root(tmp_path).pending() == []      # no leg make-good
+
+
+
+# ── the persistent short-pod blacklist (owner 2026-11-03) ───────────────────
+
+
+def test_a_short_pod_blocks_its_executor_across_legs_and_restarts(tmp_path, monkeypatch):
+    import importlib
+
+    from cascade.provision import core, short_pods
+
+    f = tmp_path / "_train_work" / short_pods.FILE_NAME
+    rows = [json.loads(json.dumps(r)) for r in (
+        {"id": "3bb98239-513b-4e07-a577-4e3ffa1004d7", "huid": "golden-lion-db",
+         "gpu_count": 8, "price_per_hour": 45.44, "price_per_gpu_hour": 5.68},
+        {"id": "0a0cd0c1-ccbf-40ea-afe9-74939ba87009", "huid": "brave-eagle-3a",
+         "gpu_count": 8, "price_per_hour": 14.4, "price_per_gpu_hour": 1.8})]
+    prov = core.LiumProvider()
+    monkeypatch.setattr(prov, "_cli", lambda args: SimpleNamespace(stdout=json.dumps(rows)))
+    monkeypatch.setattr(prov, "_steer_hosts", lambda sku, shaped: shaped)
+    monkeypatch.setattr(core, "cooling_executors", lambda: set())
+    short_pods.set_path(f)
+    try:
+        assert len(prov._list_executors("8xH200")) == 2
+        short_pods.strike(executor_id=rows[0]["id"], ip="9.9.9.9",
+                          reason="short pod: 4 GPU(s) visible, rented as 8xH200 (8)")
+        assert [e["id"] for e in prov._list_executors("8xH200")] == [rows[1]["id"]]
+        importlib.reload(short_pods)                   # a restart: fresh module state
+        short_pods.set_path(f)
+        assert [e["id"] for e in prov._list_executors("8xH200")] == [rows[1]["id"]]
+    finally:
+        short_pods.set_path(None)
+
+
+def test_the_short_pod_block_expires_after_72h_and_a_second_strike_is_7d(tmp_path):
+    from cascade.provision import short_pods
+
+    f = tmp_path / "sp.json"
+    short_pods.strike(executor_id="ex1", ip="1.2.3.4", reason="short pod", now=0.0, file=f)
+    ids, ips = short_pods.blocked_ids(now=71 * 3600.0, file=f)
+    assert ids == {"ex1"} and ips == {"1.2.3.4"}
+    assert short_pods.blocked_ids(now=73 * 3600.0, file=f) == (set(), set())
+    short_pods.strike(executor_id="ex1", reason="short pod again", now=100 * 3600.0, file=f)
+    (rec,) = [v for v in short_pods.active(now=100 * 3600.0, file=f).values()
+              if v["id"] == "ex1"]
+    assert rec["strikes"] == 2 and rec["until"] == pytest.approx(100 * 3600.0 + 7 * 86400.0)
+    assert short_pods.unblock("ex1", file=f) == 1
+    assert "ex1" not in short_pods.blocked_ids(now=100 * 3600.0, file=f)[0]
+
+
+def test_rent_status_shows_and_the_cli_edits_the_blacklist(tmp_path, capsys):
+    from cascade.trainer import operator_legs_cli as olc
+
+    wr = tmp_path / "_train_work"
+    wr.mkdir()
+    assert olc.main(["block-executor", "3bb98239-513b", "--days", "7", "--work-root",
+                     str(wr)]) == 0
+    assert olc.main(["rent-status", "--work-root", str(wr)]) == 0
+    assert "short-pod blacklist executor:3bb98239-513b" in capsys.readouterr().out
+    assert olc.main(["unblock-executor", "3bb98239-513b", "--work-root", str(wr)]) == 0
+    assert olc.main(["unblock-executor", "3bb98239-513b", "--work-root", str(wr)]) == 1

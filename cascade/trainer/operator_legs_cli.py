@@ -6,6 +6,8 @@
     cascade-trainer resume-operator-leg  <hotkey> [--queue NAME]
     cascade-trainer rent-status          [--json]
     cascade-trainer resume-rents         --reason TEXT
+    cascade-trainer block-executor       <executor-id | ip> [--days N] [--reason TEXT]
+    cascade-trainer unblock-executor     <executor-id | ip>
 
 ``list`` shows legs awaiting approval (hotkey, uid, SKU, projected cost, why)
 and entries paused after operator-side faults. ``approve`` records a
@@ -44,7 +46,9 @@ DEFAULT_DEPLOY_ROOT = Path("/root/cascade")
 QUEUE_FILE = "funded_queue.json"
 
 COMMANDS = ("list-operator-legs", "approve-operator-leg", "deny-operator-leg",
-            "resume-operator-leg", "rent-status", "resume-rents")
+            "resume-operator-leg", "rent-status", "resume-rents", "block-executor",
+            "unblock-executor")
+_NO_QUEUE = ("rent-status", "resume-rents", "block-executor", "unblock-executor")
 KINDS = ("", "expired_key", "make_good", "operator_lane", "paid_fallback", "retrain_after_loss")
 
 
@@ -111,7 +115,12 @@ def _parser() -> argparse.ArgumentParser:
                             "/root/cascade/_train_work)")
         s.add_argument("--chain-toml", type=Path, default=None,
                        help="the deployment's chain.toml; its directory holds _train_work")
-        if cmd not in ("list-operator-legs", "rent-status", "resume-rents"):
+        if cmd in ("block-executor", "unblock-executor"):
+            s.add_argument("ident", help="a Lium executor id, or a host IP")
+            if cmd == "block-executor":
+                s.add_argument("--days", type=float, default=3.0)
+                s.add_argument("--reason", default="blocked by the operator")
+        elif cmd not in ("list-operator-legs", "rent-status", "resume-rents"):
             s.add_argument("hotkey")
             s.add_argument("--queue", default=None,
                            help="queue file name when the hotkey has entries in several lanes")
@@ -154,11 +163,13 @@ def main(argv: list[str]) -> int:
               "_train_work) or run from the deployment directory", file=sys.stderr)
         return 2
     store = OperatorApprovals.for_work_root(wr)
-    if (args.cmd not in ("rent-status", "resume-rents") and not queue_path.is_file()
+    if (args.cmd not in _NO_QUEUE and not queue_path.is_file()
             and not _queues(wr) and not Path(store.path).is_file()):
         print(f"error: no funding queue at {queue_path} (and no approvals file) — wrong work "
               "root? pass --work-root (nothing was read, nothing was changed)", file=sys.stderr)
         return 2
+    if args.cmd in ("block-executor", "unblock-executor"):
+        return _short_pods_cmd(args, wr)
     if args.cmd in ("rent-status", "resume-rents"):
         return _rents(args, wr)
     if args.cmd == "list-operator-legs":
@@ -292,6 +303,34 @@ def _halt(work_root: Path) -> dict | None:
         return {"reason": f"box health unreadable: {e}"}
 
 
+def _short_pods_cmd(args, work_root: Path) -> int:
+    from ..provision import short_pods
+
+    f = work_root / short_pods.FILE_NAME
+    kind = "ip" if args.ident.count(".") == 3 else "executor"
+    if args.cmd == "block-executor":
+        short_pods.block(args.ident, kind=kind, seconds=float(args.days) * 86400.0,
+                         reason=args.reason, file=f)
+        print(f"blocked {kind} {args.ident} for {args.days:g} d ({f})")
+        return 0
+    n = short_pods.unblock(args.ident, file=f)
+    print(f"unblocked {args.ident} ({n} record(s)) in {f}")
+    return 0 if n else 1
+
+
+def _short_pod_lines(work_root: Path) -> list[str]:
+    import time as _t
+
+    from ..provision import short_pods
+
+    now = _t.time()
+    out = []
+    for k, v in sorted(short_pods.active(file=work_root / short_pods.FILE_NAME).items()):
+        out.append(f"  short-pod blacklist {k}: strikes={v.get('strikes')} for "
+                   f"{(float(v['until']) - now) / 3600:.0f} h more — {str(v.get('reason'))[:120]}")
+    return out
+
+
 def _rents(args, work_root: Path) -> int:
     from .box_health import BoxHealth
 
@@ -304,8 +343,12 @@ def _rents(args, work_root: Path) -> int:
         return 0
     st = bh.state()
     if getattr(args, "json", False):
+        from ..provision import short_pods
+
         print(json.dumps({"rents_halted": st.get("halt"), "recent_faults": st.get("events"),
-                          "legs": st.get("legs"), "last_clear": st.get("last_clear")},
+                          "legs": st.get("legs"), "last_clear": st.get("last_clear"),
+                          "short_pod_blacklist": short_pods.active(
+                              file=work_root / short_pods.FILE_NAME)},
                          indent=2, default=str))
         return 0
     h = st.get("halt")
@@ -316,6 +359,8 @@ def _rents(args, work_root: Path) -> int:
     for hk, rec in (st.get("legs") or {}).items():
         print(f"  leg {hk[:12]}: {rec.get('cls')} trained={rec.get('trained')} "
               f"kept={rec.get('kept')} pod={rec.get('pod_id')}")
+    for line in _short_pod_lines(work_root):
+        print(line)
     return 0
 
 

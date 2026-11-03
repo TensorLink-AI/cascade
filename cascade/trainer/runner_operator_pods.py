@@ -159,6 +159,11 @@ class _OperatorPodMixin:
                 from .money_guard import settle_operator_pod
 
                 settle_operator_pod(self, pod_id)        # booked at launch: its real cost
+                if "short pod" in why:
+                    from ..provision.short_pods import strike
+
+                    with contextlib.suppress(Exception):
+                        strike(executor_id=str(provider.machine_of(pod_id) or ""), reason=why)
                 # Verified teardown, ledger row dropped only when CONFIRMED
                 # gone (bare terminate swallows a failed rm as success).
                 try:
@@ -600,6 +605,11 @@ class _OperatorPodMixin:
             from .money_guard import settle_operator_pod
 
             settle_operator_pod(self, pod_id)            # booked at launch: its real cost
+            if "short pod" in why:
+                from ..provision.short_pods import strike
+
+                with contextlib.suppress(Exception):
+                    strike(executor_id=str(provider.machine_of(pod_id) or ""), reason=why)
             try:
                 if terminate_verified(provider, pod_id):
                     self._ledger_remove(pod_id)

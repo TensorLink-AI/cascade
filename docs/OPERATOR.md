@@ -1289,8 +1289,9 @@ Trainer-only; nothing here reaches a manifest or a validator verdict.
 * **Post-rent rejects** (short pod, stale image, slow host, NCCL) and lemons
   on a miner's key are booked `make_good` in the miner spend ledger (spend,
   never their waste) with one `miner_make_good_owed` alert carrying the
-  amount. A short pod's host IP is quarantined. Listings are filtered on the
-  exact GPU count (and a listed free-GPU count) before renting. A listing
+  amount. A short pod's host IP is quarantined and both it and the executor go
+  on the persistent short-pod blacklist (below). Listings are filtered on the
+  exact GPU count before renting. A listing
   without a whole-pod price is priced at per-GPU × GPU count, never per-GPU.
 * **Waste alert.** The first infra loss taking a submission's infra waste to
   `miner_waste_alert_usd` (15) files the `spend_cap_make_good` request at
@@ -1339,6 +1340,23 @@ Trainer-only; nothing here reaches a manifest or a validator verdict.
   a PAYER pod a breach is a terminal, UNBURNED `checkpoint_unverifiable`; on
   an OPERATOR pod it is an operator fault that keeps the pod (our model grew
   — raise the table). Never a disk fault.
+* **Persistent short-pod blacklist** (`_train_work/short_pod_blacklist.json`,
+  flock'd). A short-pod reject (fewer GPUs visible than the layout rented)
+  blocks the executor id AND the pod's host IP for 72 h; a second strike within
+  30 days, 7 days. It applies to every leg, payer and operator account, and
+  survives restarts, because `LiumProvider._list_executors` filters it before
+  any rent. `cascade-trainer rent-status` shows it.
+  `cascade-trainer block-executor <id|ip> [--days N]` and
+  `unblock-executor <id|ip>` edit it. Lium's listing has no free-GPU field, so
+  a short machine is only found by renting it; the blacklist keeps it out after
+  that. One-off seed from the trainer.log findings (29 short-pod rejects since
+  Oct 25):
+
+  ```
+  cascade-trainer block-executor 3bb98239-513b-4e07-a577-4e3ffa1004d7 --days 7 --reason "golden-lion-db: 4/8 GPUs x4"
+  cascade-trainer block-executor 63cadadb-b379-4c45-8a01-04a81b135933 --days 7 --reason "1 GPU x3"
+  cascade-trainer block-executor f092246d-5704-4c9e-b57f-7c0710a06deb --days 7 --reason "3 GPUs x2"
+  ```
 * **Post-rent rejects / lemons** never propose a full-leg operator make-good:
   their cost is booked `make_good` (one priced alert, sized to the loss) and
   counts toward the waste-cap pause, so a bad-host streak is bounded.

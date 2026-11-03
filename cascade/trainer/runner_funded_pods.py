@@ -1525,6 +1525,12 @@ class _FundedPodMixin:
                                     "and renting again (%d stale pod(s) so far)",
                                     gen.hotkey[:12], result.pod.instance_id if result.pod
                                     else "?", why, stale_pods)
+                        if str(why).startswith("short pod") and result.machine_id:
+                            from ..provision.short_pods import strike
+
+                            strike(executor_id=result.machine_id,
+                                   ip=getattr(result.address, "ip", "") or "",
+                                   reason=f"{gen.hotkey[:12]}: {why}")
                         if result.pod is not None and not is_king:
                             # OUR post-rent reject (short pod / stale image /
                             # slow host / NCCL) on the miner's key: an
@@ -1973,8 +1979,12 @@ class _FundedPodMixin:
             ip = str(getattr(host, "host", "") or "")
             if ip:
                 from ..provision.core import record_host_quarantine
+                from ..provision.short_pods import strike
 
                 record_host_quarantine(ip, f"{label}: {why}", host_fault=True)
+                # the persistent blacklist (72 h, a second strike 7 d): every
+                # leg, account and restart skips this machine before renting
+                strike(ip=ip, reason=f"{label}: {why}")
             return why
         return ""
 

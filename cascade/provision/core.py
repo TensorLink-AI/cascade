@@ -185,20 +185,31 @@ def executor_gpu_count(executor: dict) -> int | None:
     return None
 
 
-def executor_free_gpus(executor: dict) -> int | None:
-    """GPUs the listing says are FREE to rent on the executor (a partially
-    rented / GPU-split machine lists fewer than it has), or None when the
-    listing carries no such field."""
-    for key in ("available_gpu_count", "available_gpus", "free_gpu_count", "free_gpus"):
-        v = executor.get(key)
-        if isinstance(v, (list, tuple)):
-            return len(v)
-        if v is not None and not isinstance(v, bool):
-            try:
-                return max(0, int(v))
-            except (TypeError, ValueError):
-                continue
-    return None
+def _drop_short_pods(sku: str, execs: list[dict]) -> list[dict]:
+    """``execs`` minus every executor on the persistent short-pod blacklist
+    (by id, or by a known host IP — listed or learned). Unreadable ⇒ no
+    filtering (the post-rent GPU-count check still rejects)."""
+    try:
+        from .lium_identity import load_identities
+        from .short_pods import blocked_ids
+
+        ids, ips = blocked_ids()
+        if not ids and not ips:
+            return execs
+        learned = load_identities()["executors"] if ips else {}
+        kept, dropped = [], []
+        for e in execs:
+            eid = str(e.get("id", ""))
+            known = {str(e.get("executor_ip_address") or "")} | set(
+                (learned.get(eid) or {}).get("ips") or ())
+            (dropped if eid in ids or (known & ips) else kept).append(e)
+        if dropped:
+            log.info("lium: %d %s executor(s) skipped — on the short-pod blacklist (%s)",
+                     len(dropped), sku, ", ".join(str(e.get("id"))[:8] for e in dropped[:6]))
+        return kept
+    except Exception as e:  # noqa: BLE001
+        log.warning("short-pod blacklist unreadable (%s) — not filtered", e)
+        return execs
 
 
 def executor_price_per_hour(executor: dict, *, gpu_count: int | None = None) -> float | None:
@@ -1252,11 +1263,13 @@ class LiumProvider:
         except ProvisionError as e:
             raise self._scrub_key(e) from None
         # EXACT shape before any rent (money safety II): the listed count must
-        # be the layout's (a multi-GPU rent never assumes a missing count),
-        # and a listing that says fewer GPUs are free is skipped too.
+        # be the layout's (a multi-GPU rent never assumes a missing count).
+        # Lium's listing has no free-GPU field, so a SHORT machine (listed 8,
+        # exposes 4) is only known after a rent: the persistent short-pod
+        # blacklist keeps every struck executor / host out from then on.
         shaped = [e for e in execs
-                  if (executor_gpu_count(e) or (1 if int(gpus) == 1 else 0)) == int(gpus)
-                  and (executor_free_gpus(e) is None or executor_free_gpus(e) >= int(gpus))]
+                  if (executor_gpu_count(e) or (1 if int(gpus) == 1 else 0)) == int(gpus)]
+        shaped = _drop_short_pods(sku, shaped)
         cooling = cooling_executors()
         if cooling:
             kept = [e for e in shaped if str(e.get("id")) not in cooling]
