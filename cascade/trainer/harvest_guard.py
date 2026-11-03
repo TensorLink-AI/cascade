@@ -101,9 +101,14 @@ def keep_budget_seconds(runner, rec: dict | None = None) -> float:
     rnd = runner.cfg.round
     frac = float(getattr(rnd, "harvest_keep_cost_fraction", 0.5) or 0.0)
     cap = float(getattr(rnd, "harvest_keep_max_seconds", 10800) or 0.0)
-    priced = frac * trained_seconds_of(runner, rec)
-    if priced <= 0:
+    if frac <= 0:
         return 0.0
+    trained = trained_seconds_of(runner, rec)
+    if trained <= 0:
+        # The run's length is unknown: never price it at 0 (that would
+        # release a finished, paid run at once) — the hard cap applies.
+        return cap if cap > 0 else 10800.0
+    priced = frac * trained
     return min(priced, cap) if cap > 0 else priced
 
 
