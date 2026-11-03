@@ -36,6 +36,7 @@ from cascade.provision.state import PodInstance
 from cascade.shared.config import RoundConfig, load_chain_config
 from cascade.shared.config.money import MONEY_KNOBS
 from cascade.trainer import money_guard, money_watch
+from cascade.trainer.faults import _FundedLegSkip as _Skip
 
 REPO_TOML = Path(__file__).resolve().parents[2] / "chain.toml"
 HK = "5DpyoY8pxp5xCXvErnuUDDygBT6rXQcTEBYJHBYo4rpPpGRT"
@@ -44,7 +45,9 @@ NEW_KNOBS = ("harvest_keep_cost_fraction", "operator_runway_alert_hours",
              "operator_standing_pods_usd_per_hour", "operator_daily_cap_scope",
              "miner_waste_alert_usd", "king_pod_ttl_margin_seconds", "king_idle_reap_checks",
              "king_idle_check_seconds", "operator_inventory_interval_seconds",
-             "operator_inventory_allow", "operator_inventory_host_files")
+             "operator_inventory_allow", "operator_inventory_host_files",
+             "harvest_max_bytes_factor", "ops_operator_pool_enabled",
+             "receipt_watch_validator_hotkey")
 
 
 # ── knobs: defaults + loader parse + round trip ─────────────────────────────
@@ -80,6 +83,8 @@ def test_new_knobs_round_trip_through_the_loader_integral_floats_included(tmp_pa
                 'operator_inventory_allow = ["paracast-bw"]\n'
                 'operator_inventory_host_files = ["/root/cascade/eval_hosts.toml"]\n'
                 "progress_first_step_seconds = 2700\n"
+                "harvest_max_bytes_factor = 2\nops_operator_pool_enabled = true\n"
+                'receipt_watch_validator_hotkey = " 5Val "\n'
                 "operator_standing_pods_usd_per_hour = "
                 "{ valeval-blackwell2 = 1.6, targon-eval = 2 }\n")
     r = load_chain_config(p).round
@@ -94,13 +99,17 @@ def test_new_knobs_round_trip_through_the_loader_integral_floats_included(tmp_pa
     assert r.operator_standing_pods_usd_per_hour == (("targon-eval", 2.0),
                                                      ("valeval-blackwell2", 1.6))
     assert r.progress_first_step_seconds == 2700
+    assert (r.harvest_max_bytes_factor, r.ops_operator_pool_enabled,
+            r.receipt_watch_validator_hotkey) == (2.0, True, "5Val")
 
 
 @pytest.mark.parametrize("line", ['operator_daily_cap_scope = "king"',
                                   "harvest_keep_cost_fraction = 1.5",
                                   "king_idle_reap_checks = 1.5",
                                   "miner_waste_alert_usd = -1",
-                                  'operator_inventory_allow = "x"'])
+                                  'operator_inventory_allow = "x"',
+                                  'ops_operator_pool_enabled = "yes"',
+                                  "receipt_watch_validator_hotkey = 5"])
 def test_bad_new_knobs_fail_loud(tmp_path, line):
     with pytest.raises(ValueError, match=line.split(" ")[0]):
         load_chain_config(_edited(tmp_path, line + "\n"))
@@ -786,3 +795,328 @@ def test_operator_cli_fails_loud_when_the_queue_is_missing(tmp_path, capsys):
         assert "no funding queue at" in err and str(tmp_path / "wr") in err
     assert olc.main(["rent-status", "--work-root", str(tmp_path / "missing")]) == 2
     assert olc.main(["rent-status", "--work-root", str(tmp_path / "wr")]) == 0
+
+
+# ══ second audit (rc19 = main 1cc20cb) ══════════════════════════════════════
+
+
+# ── A: a miner-caused payer-pod loss is never our fault ─────────────────────
+
+
+def _payer_runner(tmp_path, *, status="RUNNING", balance=50.0):
+    vault = SimpleNamespace(get=lambda hk: "sk-payer")
+
+    class _P:
+        def _pod(self, pod_id):
+            return None if status is None else {"status": status}
+
+    return SimpleNamespace(_payer_vault=lambda: vault, _payer_pod_provider=lambda v, pod: _P(),
+                           _payer_balance_reader=lambda key: balance)
+
+
+def test_payer_side_evidence_proves_a_miner_cause():
+    from cascade.trainer.runner_funded_legs import payer_loss_evidence
+
+    pod = _pod("p-0", payer=HK)
+    assert payer_loss_evidence(_payer_runner(None), pod)["miner"] is False
+    assert payer_loss_evidence(_payer_runner(None, balance=0.0), pod)["miner"] is True
+    assert payer_loss_evidence(_payer_runner(None, status="STOPPED"), pod)["miner"] is True
+    ev = payer_loss_evidence(_payer_runner(None, status=None), pod)       # absent: not proof
+    assert ev["pod_status"] == "absent" and ev["miner"] is False
+
+
+def test_a_watchdog_abort_with_a_foreign_gpu_hog_is_the_miners(monkeypatch):
+    from cascade.trainer import host_preflight, remote, runner_funded_legs
+    from cascade.trainer.cost_guards import THROUGHPUT_ABORT
+
+    quarantined = []
+    monkeypatch.setattr(host_preflight, "quarantine_host_ip",
+                        lambda ip, why: quarantined.append(ip))
+    monkeypatch.setattr(remote, "probe_foreign_gpu_procs",
+                        lambda host: (["4242:python hog.py"], ""))
+    with pytest.raises(runner_funded_legs.PayerPodInterference, match="hog.py"):
+        runner_funded_legs._dispatch_watched(_aborting(f"{THROUGHPUT_ABORT}: slow"),
+                                             SimpleNamespace(host="1.2.3.4"), payer_pod=True,
+                                             hotkey=HK)
+    assert quarantined == []
+    monkeypatch.setattr(remote, "probe_foreign_gpu_procs", lambda host: ([], ""))
+    from cascade.trainer.faults import _OperatorFault
+
+    with pytest.raises(_OperatorFault):
+        runner_funded_legs._dispatch_watched(_aborting(f"{THROUGHPUT_ABORT}: slow"),
+                                             SimpleNamespace(host="1.2.3.4"), payer_pod=True,
+                                             hotkey=HK)
+    assert quarantined == ["1.2.3.4"]
+
+
+def test_foreign_gpu_processes_are_told_from_ours():
+    from cascade.trainer.remote import parse_foreign_gpu_procs
+
+    out = ("GPU:11:python -m cascade.trainer.worker --role challenger\n"
+           "GPU:12:/usr/bin/python3 /root/miner/hog.py\n__CASCADE_GPU_PROCS__\n")
+    assert parse_foreign_gpu_procs(out) == ["12:/usr/bin/python3 /root/miner/hog.py"]
+
+
+def test_an_approval_request_carries_the_failure_and_the_evidence(tmp_path):
+    r = _runner(tmp_path)
+    q = _queue(tmp_path)
+    r._funded_queue = lambda: q
+    assert q.mark_in_flight(HK, REF, target_boundary=1, era_index=1, started_block=1)
+    q.requeue(HK, error="pod lost mid-run", error_class="infra", burn_attempt=False)
+    assert q.mark_in_flight(HK, REF, target_boundary=1, era_index=1, started_block=2) or True
+    money_guard._leg_local(r).loss_evidence = {"pod_status": "absent", "miner": False}
+    with pytest.raises(_Skip):
+        money_guard.operator_leg_gate(r, SimpleNamespace(hotkey=HK, ref=REF, uid=7),
+                                      kind="make_good", rent=True)
+    (req,) = OperatorApprovals.for_work_root(tmp_path).pending()
+    assert req["last_error"] == "pod lost mid-run" and req["error_class"] == "infra"
+    assert req["evidence"] == {"pod_status": "absent", "miner": False}
+
+
+# ── B: a bounded, contained ssh harvest ─────────────────────────────────────
+
+
+def test_the_harvest_dir_must_be_the_workers_layout():
+    from cascade.trainer.faults import CheckpointUnverifiable
+    from cascade.trainer.loop import _check_harvest_dir, harvest_max_bytes
+
+    _check_harvest_dir("_train_work/777/toto2-4m/challenger/checkpoint")
+    _check_harvest_dir("/root/cascade/_train_work/mkt-5abc-12")
+    for bad in ("/", "/root", "_train_work", "_train_work/../../etc", ""):
+        with pytest.raises(CheckpointUnverifiable):
+            _check_harvest_dir(bad)
+    assert harvest_max_bytes(RoundConfig(expected_checkpoint_gb=15.0)) == int(15 * 1.2 * 2 ** 30)
+    assert harvest_max_bytes(RoundConfig(harvest_max_bytes_factor=0.0)) is None
+
+
+# ── C: withdraw of a running leg ─────────────────────────────────────────────
+
+
+def test_withdraw_of_an_in_flight_entry_keeps_its_key_and_never_resurrects(tmp_path):
+    from tests.unit.test_funding_intake import HK as IHK
+    from tests.unit.test_funding_intake import REF as IREF
+    from tests.unit.test_funding_intake import make_intake
+
+    intake, _ = make_intake(tmp_path)
+    intake.fund({"X-Miner-Hotkey": IHK, "X-Commit-Ref": IREF, "X-Lium-Api-Key": "sk"})
+    assert intake.queue.mark_in_flight(IHK, IREF, target_boundary=1, era_index=1,
+                                       started_block=1)
+    status, body = intake.withdraw({"X-Miner-Hotkey": IHK, "X-Commit-Ref": IREF})
+    assert (status, body["code"]) == (409, "not_queued")
+    assert intake.vault.get(IHK) == "sk" and intake.queue.get(IHK).status == "in_flight"
+    q = _queue(tmp_path / "w")
+    assert q.withdraw(HK)
+    assert not q.requeue(HK, error="x", error_class="infra", burn_attempt=False)
+    assert q.get(HK).status == "withdrawn"
+    r = _runner(tmp_path / "w")
+    r._funded_queue = lambda: q
+    with pytest.raises(_Skip):
+        money_guard.operator_leg_gate(r, SimpleNamespace(hotkey=HK, ref=REF, uid=1),
+                                      kind="expired_key", rent=True)
+    assert OperatorApprovals.for_work_root(tmp_path / "w").pending() == []
+
+
+# ── D: our validator's rejected receipt is seen ─────────────────────────────
+
+
+def test_a_rejected_receipt_of_our_settlement_raises_one_alert(tmp_path):
+    r = _runner(tmp_path, receipt_watch_validator_hotkey="5Val")
+    money_watch.note_published_settlement(r, SimpleNamespace(
+        round_id="r-9", entries=[SimpleNamespace(miner_hotkey=HK)]))
+    doc = {"round_id": "r-9", "status": "rejected", "reject_reason": "era_init_mismatch: x"}
+    got = money_watch.rejected_receipt_tick(r, now=1000.0, reader=lambda: json.dumps(doc))
+    assert got["hotkeys"] == [HK]
+    (a,) = [c for c in money_guard.health_conditions(r, {}) if c["code"] == "settlement_rejected"]
+    assert "era_init_mismatch" in a["message"]
+    other = {"round_id": "theirs", "status": "rejected"}
+    assert money_watch.rejected_receipt_tick(r, now=2000.0,
+                                             reader=lambda: json.dumps(other)) is None
+
+
+# ── G: approvals have a default cost ceiling ────────────────────────────────
+
+
+def test_an_approval_defaults_to_a_ceiling_and_a_dearer_landing_needs_reapproval(tmp_path):
+    store = OperatorApprovals.for_work_root(tmp_path)
+    store.request("funded_queue.json", HK, ref=REF, attempt_id="a1", projected_cost_usd=40.0,
+                  kind="make_good")
+    rec = store.decide(HK, approve=True)
+    assert rec["max_cost_usd"] == pytest.approx(50.0)
+    r = _runner(tmp_path)
+    money_guard._leg_local(r).operator_approval = {
+        "queue": "funded_queue.json", "hotkey": HK, "ref": REF, "attempt_id": "a1",
+        "cost": 40.0, "hours": 3.0, "kind": "make_good", "book": True, "reservation": ""}
+    assert money_guard.note_operator_launch(r, HK, landed_rate=20.0, pod_id="p-0") is False
+    (req,) = store.pending()
+    assert req["projected_cost_usd"] == pytest.approx(60.0)
+
+
+# ── H: the daily cap is reserved atomically over a rolling 24 h ─────────────
+
+
+def test_reservations_are_atomic_and_the_window_rolls(tmp_path):
+    spend = money_guard.OperatorSpend(tmp_path / "operator_spend.json")
+    a = spend.reserve_if_room("hkA", 60.0, cap=100.0, kind="reservation", now=1000.0)
+    assert a and spend.reserve_if_room("hkB", 60.0, cap=100.0, kind="reservation",
+                                       now=1000.0) is None
+    # the same leg re-gated REPLACES its reservation
+    assert spend.reserve_if_room("hkA", 70.0, cap=100.0, kind="reservation", now=1001.0)
+    assert spend.total(now=1002.0) == pytest.approx(70.0)
+    assert spend.total(now=1001.0 + spend.RESERVATION_TTL_SECONDS + 1) == 0.0     # expired
+    spend.charge("", 50.0, kind="operator_leg", pod_id="p-0", rate=10.0, hours=5.0, now=2000.0)
+    assert spend.total(now=2000.0 + 23 * 3600) == pytest.approx(50.0)
+    assert spend.total(now=2000.0 + 25 * 3600) == 0.0                              # rolled off
+    assert spend.settle("p-0", now=2000.0 + 8 * 3600, true_up=True) == pytest.approx(80.0)
+
+
+# ── I: a live operator pod is never torn down on one failed probe ───────────
+
+
+def test_adoption_retries_and_never_kills_a_pod_with_a_live_worker():
+    import inspect
+
+    from cascade.trainer.runner_operator_pods import _OperatorPodMixin
+
+    src = inspect.getsource(_OperatorPodMixin._rent_operator_leg_host)
+    assert "ADOPT_PROBE_TRIES" in src
+    assert src.index("_operator_pod_worker_alive") < src.index('_lemon("adopted operator leg')
+    assert _OperatorPodMixin.ADOPT_PROBE_TRIES >= 3
+
+
+# ── J: mismatch evidence copies are reclaimable when old / many ─────────────
+
+
+def test_evidence_copies_are_kept_young_and_few(tmp_path):
+    import os
+
+    from cascade.shared.disk_space import EVIDENCE_KEEP_SECONDS, _evidence_protected
+
+    seed = tmp_path / "777"
+    seed.mkdir()
+    proofs = []
+    for i in range(3):
+        pf = seed / f"job{i}.unverifiable.json"
+        pf.write_text("{}")
+        os.utime(pf, (1000.0 + i, 1000.0 + i))
+        proofs.append(pf)
+    now = 1010.0
+    assert not _evidence_protected(tmp_path, proofs[0], now=now)       # beyond the newest 2
+    assert _evidence_protected(tmp_path, proofs[2], now=now)
+    assert not _evidence_protected(tmp_path, proofs[2], now=1002.0 + EVIDENCE_KEEP_SECONDS + 1)
+
+
+# ── K: an unfunded rotated king key is refused ──────────────────────────────
+
+
+def test_an_unfunded_king_key_does_not_lift_the_slash(tmp_path, monkeypatch):
+    import requests
+
+    from cascade.trainer.runner_rolling import _RollingMixin
+
+    monkeypatch.setattr(requests, "get", lambda *a, **k: SimpleNamespace(ok=True))
+    vault = SimpleNamespace(get_shared=lambda hk: "sk-king")
+    r = SimpleNamespace(cfg=SimpleNamespace(round=RoundConfig(funded_max_price_per_hour=20.0)),
+                        _payer_vault=lambda: vault, _leg_wall_seconds=lambda sku=None: 4 * 3600.0,
+                        _payer_balance_reader=lambda key: 10.0, work_root=tmp_path)
+    assert _RollingMixin._rolling_king_key_ok(r, HK) is False
+    assert "king_key_unfunded" in {c["code"] for c in money_guard.health_conditions(r, {})}
+    r._payer_balance_reader = lambda key: 500.0
+    assert _RollingMixin._rolling_king_key_ok(r, HK) is True
+
+
+# ── L: a stuck teardown is priced and alerted ───────────────────────────────
+
+
+def test_a_stuck_teardown_raises_one_priced_alert(tmp_path):
+    r = _runner(tmp_path, ledger=[_pod("cascade-n91-1-funded-abc-op-0")])
+    money_watch.note_teardown(r, "cascade-n91-1-funded-abc-op-0", ok=False, now=1000.0)
+    assert money_watch.stuck_teardown_tick(r, now=1000.0 + 600) == []
+    assert money_watch.stuck_teardown_tick(r, now=1000.0 + 1800) == [
+        "cascade-n91-1-funded-abc-op-0"]
+    (a,) = [c for c in money_guard.health_conditions(r, {}) if c["code"] == "teardown_stuck"]
+    assert a["accrued_usd"] == pytest.approx(20.0 * 0.5)
+    money_watch.note_teardown(r, "cascade-n91-1-funded-abc-op-0", ok=True)
+    assert "teardown_stuck" not in {c["code"] for c in money_guard.health_conditions(r, {})}
+
+
+# ── M / E: knob traps ───────────────────────────────────────────────────────
+
+
+def test_caps_never_switch_the_operator_pool_on():
+    from cascade.provision.operator_pool import enabled
+
+    def r(**kw):
+        return SimpleNamespace(cfg=SimpleNamespace(round=RoundConfig(**kw)))
+
+    assert not enabled(r(ops_operator_daily_cap_usd=100.0, ops_operator_leg_cap_usd=50.0))
+    assert enabled(r(ops_operator_pool_enabled=True))
+    assert enabled(r(ops_operator_providers=("lium", "shadeform")))
+
+
+def test_an_approval_on_file_allows_the_operator_rent_whatever_the_fallback_flag(tmp_path,
+                                                                                monkeypatch):
+    from cascade.trainer.runner_operator_pods import _OperatorPodMixin
+
+    r = _runner(tmp_path, funded_pods="rent", funded_operator_fallback=False,
+                ops_paid_fallback_after_seconds=3600)
+    q = _queue(tmp_path)
+    r._funded_queue = lambda: q
+    allowed = _OperatorPodMixin._operator_rent_allowed
+    assert allowed(r, HK) is False          # no approval, fallback off, paid fallback scoped
+    store = OperatorApprovals.for_work_root(tmp_path)
+    store.request("funded_queue.json", HK, ref=REF, attempt_id="", kind="make_good",
+                  funded_at=q.get(HK).funded_at)
+    store.decide(HK, approve=True)
+    assert allowed(r, HK) is True           # an approved make-good never strands
+    r.cfg.round = dataclasses.replace(r.cfg.round, funded_operator_fallback=True)
+    r._leg_local_obj = SimpleNamespace(operator_rent_ok=True)
+    assert allowed(r, "someone-else") is True   # the flag only lets a leg PROPOSE
+
+
+def test_the_cpu_reaper_covers_providers_dropped_from_the_config(tmp_path):
+    from cascade.shared.config.generation import GenerationConfig
+    from cascade.trainer.runner_generation import _ledger_only_providers
+
+    ledger = tmp_path / "vms.json"
+    ledger.write_text(json.dumps([{"provider": "shadeform", "name": "cgen-1", "vm_id": "v"}]))
+    got = _ledger_only_providers(ledger, [], GenerationConfig())
+    assert [p.name for p in got] == ["shadeform"]
+    assert _ledger_only_providers(ledger, got, GenerationConfig()) == []
+
+
+# ── #418 follow-up: the recent rate judges a long harvest ───────────────────
+
+
+def test_a_fast_start_then_trickle_harvest_is_stopped_on_its_recent_rate():
+    from cascade.trainer.remote import (
+        HARVEST_RATE_WINDOW_SECONDS,
+        _RateWindow,
+        harvest_total_breach,
+    )
+
+    w = _RateWindow()
+    assert w.add(0.0, 0) is None
+    w.add(100.0, 10_000_000_000)                                   # a fast start
+    rate = w.add(100.0 + HARVEST_RATE_WINDOW_SECONDS + 1, 10_000_100_000)   # then a trickle
+    assert rate is not None and rate < 1_000_000
+    assert harvest_total_breach(4000.0, 10_000_100_000, 3600, recent_rate=rate)
+    assert harvest_total_breach(4000.0, 10_000_100_000, 3600) is None      # the average hid it
+
+
+# ── F: the per-coldkey limit bounds operator-paid work only ─────────────────
+
+
+def test_the_coldkey_limit_never_holds_a_miner_key_leg(tmp_path):
+    from cascade.trainer import admission as A
+
+    r = SimpleNamespace(cfg=SimpleNamespace(round=RoundConfig(ops_max_active_per_coldkey=1)),
+                        work_root=tmp_path, _record_funded_failure=lambda *a, **k: None)
+    A.remember_owners(r, [SimpleNamespace(hotkey=h, coldkey="same", commit_block=1)
+                          for h in ("hk1", "hk2")])
+    billed = {"hk1": SimpleNamespace(operator_billed=True),
+              "hk2": SimpleNamespace(operator_billed=False)}
+    r._funded_queue = lambda: SimpleNamespace(get=billed.get)
+    r._rolling_sched = SimpleNamespace(_threads={"hk1": 1}, lane_b=None, lane_c=None)
+    assert not A.owner_busy(r, "hk2")                 # a miner-key leg is never held
+    billed["hk2"] = SimpleNamespace(operator_billed=True)
+    assert A.owner_busy(r, "hk2")                     # two operator-paid legs of one owner

@@ -153,11 +153,12 @@ def main(argv: list[str]) -> int:
         print(f"error: work root {wr} does not exist — pass --work-root (the trainer's "
               "_train_work) or run from the deployment directory", file=sys.stderr)
         return 2
-    if args.cmd not in ("rent-status", "resume-rents") and not queue_path.is_file():
-        print(f"error: no funding queue at {queue_path} — wrong work root? pass --work-root "
-              "(nothing was read, nothing was changed)", file=sys.stderr)
-        return 2
     store = OperatorApprovals.for_work_root(wr)
+    if (args.cmd not in ("rent-status", "resume-rents") and not queue_path.is_file()
+            and not _queues(wr) and not Path(store.path).is_file()):
+        print(f"error: no funding queue at {queue_path} (and no approvals file) — wrong work "
+              "root? pass --work-root (nothing was read, nothing was changed)", file=sys.stderr)
+        return 2
     if args.cmd in ("rent-status", "resume-rents"):
         return _rents(args, wr)
     if args.cmd == "list-operator-legs":

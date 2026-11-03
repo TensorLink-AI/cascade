@@ -394,11 +394,31 @@ def harvest_source(root: Path | str, active: Callable[[], set[str]]) -> Source:
         base = p.with_name(p.name.split(".partial-", 1)[0])
         if base.with_name(base.name + PENDING_SUFFIX).exists():
             return False                    # push not confirmed: never reclaimable
-        if base.with_name(base.name + ".unverifiable.json").exists():
+        proof = base.with_name(base.name + ".unverifiable.json")
+        if proof.exists() and _evidence_protected(Path(root), proof):
             return False                    # mismatch evidence: the owner's to judge
         return str(base.resolve()) not in active()
 
     return Source(name="harvest", root=Path(root), list_items=items, reclaimable=ok)
+
+
+# Money safety II (audit J): mismatch evidence used to pin its ~15 GB box copy
+# forever. The ``.unverifiable.json`` manifests are never deleted (they are not
+# items); the COPIES stay protected only while young and among the newest few.
+EVIDENCE_KEEP_SECONDS = 72 * 3600.0
+EVIDENCE_KEEP_COPIES = 2
+
+
+def _evidence_protected(root: Path, proof: Path, *, now: float | None = None) -> bool:
+    t = time.time() if now is None else float(now)
+    try:
+        if t - proof.stat().st_mtime > EVIDENCE_KEEP_SECONDS:
+            return False
+        proofs = sorted(root.glob("*/*.unverifiable.json"),
+                        key=lambda q: q.stat().st_mtime, reverse=True)
+    except OSError:
+        return True                         # unsure: keep the evidence
+    return proof.resolve() in {q.resolve() for q in proofs[:EVIDENCE_KEEP_COPIES]}
 
 
 def leftover_source(work_root: Path | str, active: Callable[[], set[str]] = set) -> list[Source]:

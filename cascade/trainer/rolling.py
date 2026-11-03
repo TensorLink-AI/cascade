@@ -666,6 +666,9 @@ class LegOps:
                                manifest.round_id)
         log.info("published manifest round=%s entries=%d signed=True → %s",
                  manifest.round_id, len(manifest.entries), key)
+        from .money_watch import note_published_settlement
+
+        note_published_settlement(self.r, manifest)       # the rejected-receipt watch
         self.r._publish_training_summary(manifest)
 
     def publish_bench(self, round_id: str, created_block: int, entries: list, *,

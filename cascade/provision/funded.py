@@ -26,6 +26,7 @@ grow a path that rents operator-billed pods.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
 import time
@@ -501,6 +502,13 @@ def rent_funded_pod(
                                 host_key=host_key, sku=landed, price_per_hour=price)
     except Exception as e:  # noqa: BLE001 — classify everything; the taxonomy decides
         leaked = ""
+        # The landed $/h of what was launched (money safety II: a lemon's spend
+        # record is never priced at the flat fallback when the price is known).
+        failed_price = None
+        price_fn = getattr(provider, "price_of", None)
+        if launched and callable(price_fn):
+            with contextlib.suppress(Exception):
+                failed_price = price_fn(launched[0])
         for pid in launched:
             try:
                 if not terminate_verified(provider, pid):
@@ -539,6 +547,8 @@ def rent_funded_pod(
             # Not the taxonomy's "infra" (which spends one of the miner's
             # attempts): the caller rents again on another host.
             res = replace(res, error_class=LEMON_CLASS, burn_attempt=False)
+        if failed_price:
+            res = replace(res, price_per_hour=failed_price)
         return res
 
 

@@ -38,12 +38,14 @@ def money_periodic(runner, balance: float | None, *, now: float | None = None,
     t = time.time() if now is None else float(now)
     _run("runway", lambda: runway_tick(runner, balance))
     _run("payer TTL refresh", lambda: refresh_payer_ttls(runner))
+    _run("stuck teardowns", lambda: stuck_teardown_tick(runner, now=t))
 
     # The reaper (ssh probes) and the inventory (a provider listing) may be
     # slow: one background pass at a time, never holding the sampler.
     def slow():
         _run("king reaper", lambda: king_reaper_tick(runner, now=t))
         _run("inventory", lambda: inventory_tick(runner, now=t))
+        _run("receipt watch", lambda: rejected_receipt_tick(runner, now=t))
 
     if background:
         import threading
@@ -260,6 +262,148 @@ def inventory_tick(runner, *, now: float | None = None, lister=None) -> list[dic
     return unknown
 
 
+# ── stuck teardowns (audit L) ────────────────────────────────────────────────
+
+TEARDOWN_FILE = "teardown_failures.json"
+STUCK_TEARDOWN_SECONDS = 15 * 60.0
+
+
+def note_teardown(runner, pod_id: str, *, ok: bool, now: float | None = None) -> None:
+    """Record (``ok`` False) or clear a failed teardown of ``pod_id``; the
+    first failure's time is kept. Never raises."""
+    import json
+
+    from ..shared.atomic import write_text_atomic
+
+    try:
+        t = time.time() if now is None else float(now)
+        path = Path(runner.work_root) / TEARDOWN_FILE
+        try:
+            recs = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            recs = {}
+        before = dict(recs)
+        if ok:
+            recs.pop(str(pod_id), None)
+        else:
+            recs.setdefault(str(pod_id), t)
+        if recs != before:
+            write_text_atomic(path, json.dumps(recs, sort_keys=True))
+        if ok:
+            from .money_guard import clear_alert
+
+            clear_alert(runner, "teardown_stuck", str(pod_id)[-32:])
+    except Exception as e:  # noqa: BLE001
+        log.debug("teardown record skipped (%s)", e)
+
+
+def stuck_teardown_tick(runner, *, now: float | None = None) -> list[str]:
+    """One alert per ledger pod whose teardown has been failing for longer
+    than ``STUCK_TEARDOWN_SECONDS``, priced (the $ accrued since the first
+    failure at its booked rate, else the price ceiling)."""
+    import json
+
+    from .money_guard import OperatorSpend, alert, ceiling_rate
+
+    t = time.time() if now is None else float(now)
+    try:
+        recs = json.loads((Path(runner.work_root) / TEARDOWN_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    on_ledger = {p.instance_id: p for p in runner._load_funded_ledger()}
+    out = []
+    for pid, since in sorted(recs.items()):
+        if pid not in on_ledger:
+            note_teardown(runner, pid, ok=True)        # gone from the ledger: settled
+            continue
+        if t - float(since) < STUCK_TEARDOWN_SECONDS:
+            continue
+        row = OperatorSpend.for_runner(runner).row_for(pid) or {}
+        rate = float(row.get("rate") or ceiling_rate(runner))
+        accrued = rate * (t - float(since)) / 3600.0
+        payer = on_ledger[pid].payer_hotkey
+        alert(runner, "teardown_stuck", pid[-32:],
+              f"teardown of {pid} failing for {(t - float(since)) / 60:.0f} min "
+              f"({'payer ' + payer[:12] if payer else 'OPERATOR'} account) — ≈${accrued:.2f} "
+              "accrued and still billing; stop it by hand (bad key / CLI auth?)",
+              severity="critical", accrued_usd=round(accrued, 2))
+        out.append(pid)
+    return out
+
+
+# ── our own validator's rejected receipts (audit D) ─────────────────────────
+
+PUBLISHED_FILE = "published_settlements.json"
+
+
+def note_published_settlement(runner, manifest) -> None:
+    """Remember a settlement we published (round id → its entry hotkeys) so
+    the receipt watch can name the legs a rejection hit. Never raises."""
+    import json
+
+    from ..shared.atomic import write_text_atomic
+
+    try:
+        path = Path(runner.work_root) / PUBLISHED_FILE
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            doc = {}
+        doc[str(manifest.round_id)] = {
+            "at": time.time(),
+            "hotkeys": sorted({str(getattr(e, "miner_hotkey", "") or "")
+                               for e in getattr(manifest, "entries", ())} - {""})}
+        for k in sorted(doc, key=lambda k: doc[k].get("at", 0))[:-64]:
+            doc.pop(k, None)
+        write_text_atomic(path, json.dumps(doc, sort_keys=True))
+    except Exception as e:  # noqa: BLE001
+        log.debug("published-settlement record skipped (%s)", e)
+
+
+def rejected_receipt_tick(runner, *, now: float | None = None, reader=None) -> dict | None:
+    """Read our own validator's latest receipt (``[round]
+    receipt_watch_validator_hotkey``; "" = off). A REJECTED receipt for a
+    settlement WE published raises one critical alert naming the reason and
+    the legs it carried (read-only: no validator code or state is touched;
+    the requeue of those legs is the owner's call). Every 10 min at most."""
+    import json
+
+    from .money_guard import alert
+
+    hk = str(getattr(runner.cfg.round, "receipt_watch_validator_hotkey", "") or "")
+    t = time.time() if now is None else float(now)
+    if not hk or not _due(runner, "_receipt_watch_at", 600.0, t):
+        return None
+    if reader is None:
+        from ..shared.hippius import receipt_latest_key
+
+        store = runner.manifest_store()
+
+        def reader():
+            return store.get_text(receipt_latest_key(hk))
+    try:
+        doc = json.loads(reader())
+    except Exception as e:  # noqa: BLE001 — no receipt yet / storage blip
+        log.debug("receipt watch: latest receipt unreadable (%s)", e)
+        return None
+    rid, status = str(doc.get("round_id", "")), str(doc.get("status", ""))
+    if status != "rejected":
+        return None
+    try:
+        ours = json.loads((Path(runner.work_root) / PUBLISHED_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        ours = {}
+    if rid not in ours:
+        return None
+    legs = ours[rid].get("hotkeys") or []
+    alert(runner, "settlement_rejected", rid[:24],
+          f"our validator REJECTED settlement {rid}: {str(doc.get('reject_reason'))[:200]} — "
+          f"{len(legs)} leg(s) carried ({', '.join(h[:12] for h in legs[:8])}); their "
+          "results did not count: requeue them unburned (owner decision)",
+          severity="critical", hotkeys=legs)
+    return {"round_id": rid, "reason": doc.get("reject_reason"), "hotkeys": legs}
+
+
 # ── payer vault TTLs ─────────────────────────────────────────────────────────
 
 
@@ -316,5 +460,7 @@ def refresh_payer_ttls(runner) -> int:
     return n
 
 
-__all__ = ["inventory_tick", "king_reaper_tick", "money_periodic", "reap_candidates",
+__all__ = ["inventory_tick", "king_reaper_tick", "money_periodic", "note_published_settlement",
+           "note_teardown", "rejected_receipt_tick",
+           "reap_candidates", "stuck_teardown_tick",
            "refresh_payer_ttls", "unknown_operator_pods"]

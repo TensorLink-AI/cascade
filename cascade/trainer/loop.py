@@ -148,6 +148,31 @@ def _r2_fallback_available(runner) -> bool:
         return False
 
 
+def harvest_max_bytes(rnd) -> int | None:
+    """The byte ceiling of one ssh checkpoint harvest: ``expected_checkpoint_gb``
+    x ``harvest_max_bytes_factor`` (either 0 = unbounded)."""
+    gb = float(getattr(rnd, "expected_checkpoint_gb", 0.0) or 0.0)
+    factor = float(getattr(rnd, "harvest_max_bytes_factor", 0.0) or 0.0)
+    if gb <= 0 or factor <= 0:
+        return None
+    return int(gb * factor * (1 << 30))
+
+
+def _check_harvest_dir(remote_dir: str) -> None:
+    """A receipt's ``checkpoint_dir`` must be the worker's own layout: under
+    ``_train_work/`` (relative to the pod workdir, or an absolute path whose
+    components include it), never ``..`` or a bare root."""
+    from pathlib import PurePosixPath
+
+    from .faults import CheckpointUnverifiable
+
+    parts = PurePosixPath(str(remote_dir or "")).parts
+    if not parts or ".." in parts or "_train_work" not in parts or parts[-1] == "_train_work":
+        raise CheckpointUnverifiable(
+            f"receipt checkpoint_dir {str(remote_dir)[:160]!r} is not inside the worker's "
+            "_train_work layout — refused, unburned")
+
+
 def _mark_harvested(runner, host, entry):
     """After a verified harvest + upload: record WHEN this pod endpoint was
     harvested (orchestrator-side, persisted), so the pod sweep knows a
@@ -777,7 +802,23 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
 
         job_id = harvest_job_id(receipt, suffix)
         dest = harvest_dir(self.work_root, seeds.base_seed, receipt.miner_hotkey, job_id=job_id)
-        harvest_remote_dir(host, receipt.checkpoint_dir, dest)
+        # Money safety II (audit B): the pod names its checkpoint dir and
+        # streams it — a hostile pod must not point us at its whole disk or
+        # fill our volume (ENOSPC halts every rent; other miners lose runs).
+        _check_harvest_dir(receipt.checkpoint_dir)
+        try:
+            harvest_remote_dir(host, receipt.checkpoint_dir, dest,
+                               max_bytes=harvest_max_bytes(self.cfg.round))
+        except Exception as e:  # noqa: BLE001 — only the size breach is re-classed
+            if "exceeds its storage limit" in str(e):
+                from .faults import CheckpointUnverifiable
+
+                raise CheckpointUnverifiable(
+                    f"checkpoint stream from {getattr(host, 'name', '?')} exceeds "
+                    f"{harvest_max_bytes(self.cfg.round) / 1e9:.1f} GB "
+                    "(expected_checkpoint_gb x harvest_max_bytes_factor) — refused, "
+                    "unburned; not a disk fault") from e
+            raise
         # Owner 2026-11-01: a leg path that tears its pod down at leg end arms
         # an early release; the box copy must first match the pod's own
         # listing file for file (one re-harvest on a mismatch, else kept).

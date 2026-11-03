@@ -1005,7 +1005,9 @@ class FundedQueue:
 
         with self._locked() as entries:
             e = entries.get(hotkey)
-            if e is None:
+            if e is None or e.status == "withdrawn":
+                # a miner's withdrawal is terminal: never resurrected by a
+                # leg failure (money safety II)
                 return False
             now = self.clock()
             rl_since = 0.0

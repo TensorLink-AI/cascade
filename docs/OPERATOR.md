@@ -1319,6 +1319,56 @@ Trainer-only; nothing here reaches a manifest or a validator verdict.
   `operator_unknown_pod` alert per unknown pod with its name and $/h. Nothing
   is ever deleted.
 
+#### Second audit (rc19 = main 1cc20cb)
+
+* **A miner-caused payer-pod loss is the miner's.** A generic loss of a payer
+  pod asks the PAYER's account first: a balance ≤ 0 or a pod their account
+  lists as stopped / cancelled is a `payer_side` miner fault (unburned, never
+  operator-billed). A generic `infra` loss never sets `operator_billed` on
+  its own (only an operator-class verdict with our-side evidence does). A
+  throughput / first-step abort of a payer pod probes for foreign GPU
+  processes first (a miner's GPU hog ⇒ `payer_side`, no host quarantine).
+  Every approval request records `last_error`, `error_class` and that
+  `evidence`.
+* **Bounded ssh harvest.** A receipt's `checkpoint_dir` must lie in the
+  worker's `_train_work` layout; the stream stops at `expected_checkpoint_gb`
+  × `harvest_max_bytes_factor` (1.2). A breach is a terminal, UNBURNED
+  `checkpoint_unverifiable`, never a disk fault. Check that
+  `expected_checkpoint_gb` covers the real checkpoints (+ shadow EMA files)
+  before deploying.
+* **Withdraw** of a live (`in_flight`, `in_round`, parked …) entry is a 409
+  and keeps the key; a withdrawn entry is terminal (never requeued) and never
+  gets an operator request.
+* **Rejected settlements** (`receipt_watch_validator_hotkey`): our own
+  validator's rejected receipt of a settlement we published raises one
+  critical `settlement_rejected` alert naming its legs (read-only).
+* **Approvals** without `--max-cost` get a ceiling of projection × 1.25; a
+  landed cost above it releases the pod and re-opens the request.
+* **Daily cap** reads a rolling 24 h window; each preflight reserves its
+  projection atomically (flock), released at the launch / on a no-rent;
+  every operator pod is trued up to its real cost at teardown.
+* **Adoption** of a live operator pod retries the probe 3× with backoff and
+  never terminates a pod whose worker is alive.
+* **Evidence copies** (`.unverifiable.json`) stay protected for 72 h and only
+  the newest 2; the manifests are never deleted.
+* **King key**: a rotated king key must also hold the king leg's projected
+  cost (`GET /users/me`), else one `king_key_unfunded` alert.
+* **Stuck teardowns**: a ledger pod whose teardown keeps failing > 15 min
+  raises one `teardown_stuck` alert with the accrued $.
+* **Knobs**: `ops_operator_pool_enabled` (false) switches the operator pool
+  on; the spend caps no longer do. `ops_paid_fallback_after_seconds` no
+  longer allows operator rents for every caller. **An owner approval on file
+  always allows that leg's operator rent; `funded_operator_fallback` only
+  decides whether a non-miner fault PROPOSES an operator make-good** (files
+  the request) — turning it off no longer strands approved make-goods.
+* **Per-coldkey limit** (`ops_max_active_per_coldkey`) bounds only
+  OPERATOR-paid work: the CPU-VM tier of every leg and operator-billed legs.
+  A miner-key GPU rent never takes a slot, king legs are exempt, and an
+  unknown owner uses the last persisted identity (no TTL) or proceeds.
+* The CPU-VM reaper also covers providers a ledger row names that the config
+  dropped. A harvest past its soft deadline is judged on its last-10-min
+  rate. A lemon's spend record uses its landed price when known.
+
 #### Queue schema and the deploy order
 
 `funded_queue.json` now carries `schema_version` (2). Unknown entry keys

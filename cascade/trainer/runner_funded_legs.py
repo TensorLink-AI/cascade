@@ -382,7 +382,7 @@ class _FundedLegMixin:
             disp = _with_leg_watchdog(self, disp, gen, pod, contract, host)
             # (a harvest inside dispatch marks the leg trained — harvest_guard)
             entry = _dispatch_watched(
-                disp, host, lane_count=1,
+                disp, host, payer_pod=True, lane_count=1,
                 gen_ref=gen.ref, uid=gen.uid, hotkey=gen.hotkey,
                 role=role, base_seed=seeds.base_seed, block=block,
                 arch_preset=contract.arch_preset, warm_start_ref=warm_start_ref,
@@ -489,6 +489,11 @@ class _FundedLegMixin:
                                         error_class=CheckpointUnverifiable.error_class,
                                         burn=False)
             raise
+        except PayerPodInterference as e:
+            self._record_funded_failure(gen.hotkey, f"payer-side: {e}", miner_fault=True,
+                                        error_class=PayerPodInterference.error_class,
+                                        burn=False)
+            raise
         except _OperatorFault as e:
             # Our side (or the provider's) failed; the miner's pod and run
             # were fine — requeued, never one of their attempts.
@@ -542,6 +547,16 @@ class _FundedLegMixin:
                 stalled_before=bool(prior is not None
                                     and prior.last_error_class == STALL_CLASS),
                 shards_leg=bool(corpus.get("corpus_files")))
+            if not miner_fault and error_class == "infra":
+                # Money safety II: a lost MINER pod is asked of the payer's
+                # own account first — a pod they stopped / cancelled or a
+                # balance at zero is THEIR doing (unburned, never billed to
+                # us). The evidence rides the leg for any approval request.
+                ev = payer_loss_evidence(self, pod)
+                _loc.loss_evidence = ev
+                if ev.get("miner"):
+                    miner_fault, error_class, burn = True, PayerPodInterference.error_class, False
+                    text = f"payer-side loss ({ev}): {text}"
             self._record_funded_failure(gen.hotkey, text, miner_fault=miner_fault,
                                         error_class=error_class, burn=burn)
             from .harvest_guard import handle_our_side_fault, keeps_pod, local_disk_error
@@ -555,7 +570,10 @@ class _FundedLegMixin:
                 raise
             if keeps_pod(e) or local_disk_error(e) is not None:
                 raise                  # our side: never an operator make-good
-            if not miner_fault:
+            if not miner_fault and error_class != "infra":
+                # an operator make-good ONLY with our-side evidence (an
+                # operator-class verdict, e.g. our storage); a generic infra
+                # loss of a miner's pod is never billed to us on its own
                 queue = self._funded_queue()
                 if queue is not None:
                     queue.set_operator_billed(gen.hotkey, True)
@@ -684,7 +702,8 @@ def _pre_corpus_money_gates(runner, gen, gpu_choice=None, *, round_id: str = "")
     operator = False
     if billed:
         try:
-            operator = (not runner._operator_fallback_lanes()) and runner._operator_rent_allowed()
+            operator = ((not runner._operator_fallback_lanes())
+                        and runner._operator_rent_allowed(gen.hotkey))
         except Exception:  # noqa: BLE001 — unknown: the rent path decides
             operator = False
     why, cls = would_rent_refusal(runner, gen, operator=operator)
@@ -740,7 +759,7 @@ def _harvested_in_dispatch(runner) -> bool:
     return bool(getattr(runner.__dict__.get("_leg_local_obj"), "leg_trained", False))
 
 
-def _dispatch_watched(disp, host, **kw):
+def _dispatch_watched(disp, host, *, payer_pod: bool = False, **kw):
     """``disp.dispatch`` with a watchdog abort turned into an operator fault:
     the miner's pod and generator were fine, OUR wall estimate (or the
     host) was not. The host is quarantined for a day: a host that cannot hold
@@ -754,6 +773,21 @@ def _dispatch_watched(disp, host, **kw):
     try:
         return disp.dispatch(host, **kw)
     except LegAborted as e:
+        if payer_pod:
+            # Money safety II: on a MINER's pod, ask first whether something
+            # other than our worker holds the GPUs (their own GPU hog). Then
+            # the slowness is theirs: unburned, never operator-billed, the
+            # host never quarantined.
+            from .remote import probe_foreign_gpu_procs
+
+            foreign, err = probe_foreign_gpu_procs(host)
+            if foreign:
+                raise PayerPodInterference(
+                    f"{str(e)[:200]} — foreign GPU process(es) on the payer's pod: "
+                    + "; ".join(foreign[:3])) from e
+            if err:
+                log.warning("leg %s: GPU process probe inconclusive (%s)",
+                            str(kw.get("hotkey", ""))[:12], err)
         # Never a burn: OUR watchdog aborted it (an operator-side fault). A
         # hang before step 1 on a leg whose corpus was made OFF the pod (the
         # CPU tier) can only be the host — NCCL init, the driver — and its
@@ -769,6 +803,49 @@ def _dispatch_watched(disp, host, **kw):
                         str(kw.get("hotkey", ""))[:12])
         cls = HostHangFault if first_step and kw.get("corpus_files") else _OperatorFault
         raise cls(str(e)) from e
+
+
+class PayerPodInterference(Exception):
+    """The MINER's own pod did it (money safety II): a foreign process on its
+    GPUs during a watchdog abort, the payer stopped / cancelled the pod, or
+    their balance ran out. The miner's fault — unburned, never
+    operator-billed, no host quarantine, no operator make-good."""
+
+    error_class = "payer_side"
+
+
+def payer_loss_evidence(runner, pod) -> dict:
+    """What the PAYER's own account says about a lost pod: the pod's status
+    on their listing and their balance (both best-effort; unknown fields are
+    omitted). ``miner`` is True when the evidence proves a payer-side cause:
+    a balance at or below zero, or a pod the payer's account lists as
+    stopped / cancelled / terminated."""
+    ev: dict = {}
+    try:
+        vault = runner._payer_vault()
+        provider = runner._payer_pod_provider(vault, pod) if vault is not None else None
+        pod_fn = getattr(provider, "_pod", None)
+        if callable(pod_fn):
+            row = pod_fn(pod.instance_id)
+            ev["pod_status"] = "absent" if row is None else str(row.get("status") or "?")
+        key = vault.get(pod.payer_hotkey) if vault is not None else None
+        if key:
+            reader = getattr(runner, "_payer_balance_reader", None)
+            if reader is None:
+                from .operator_health import lium_balance
+
+                def reader(k):
+                    return lium_balance(api_key=k)
+            bal = reader(key)
+            if bal is not None:
+                ev["payer_balance_usd"] = round(float(bal), 2)
+    except Exception as e:  # noqa: BLE001 — unknown: no miner verdict from it
+        ev["error"] = f"{type(e).__name__}: {str(e)[:120]}"
+    status = str(ev.get("pod_status", "")).upper()
+    ev["miner"] = bool(
+        ("payer_balance_usd" in ev and ev["payer_balance_usd"] <= 0)
+        or any(t in status for t in ("STOPPED", "STOPPING", "CANCEL", "TERMINAT", "DELETED")))
+    return ev
 
 
 class HostHangFault(_OperatorFault):

@@ -199,10 +199,26 @@ def remember_owners(runner, rows):
     return rows
 
 
-def owner_of(runner, hotkey):
+def owner_of(runner, hotkey, *, max_age: float | None = IDENTITY_TTL_SECONDS):
+    """``hotkey``'s chain-resolved coldkey; ``max_age`` None = the last
+    persisted identity whatever its age (the per-coldkey limit's view)."""
     with _identity_lock(runner):
         owner, timestamp = _identities(runner).get(hotkey, ("", 0))
-    return owner if owner and time.time() - timestamp <= IDENTITY_TTL_SECONDS else ""
+    if not owner:
+        return ""
+    return owner if max_age is None or time.time() - timestamp <= max_age else ""
+
+
+def _operator_paid(runner, hotkey) -> bool:
+    """Whether ``hotkey``'s leg spends OPERATOR money beyond its CPU tier:
+    its lane-A entry is operator-billed (a make-good / an operator rent).
+    Unknown ⇒ False (a miner-key leg is never held by the coldkey limit)."""
+    try:
+        q = runner._funded_queue()
+        e = q.get(hotkey) if q is not None else None
+        return bool(e is not None and getattr(e, "operator_billed", False))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 # ── already-admitted legs (restart re-attach) ───────────────────────────────
@@ -227,24 +243,35 @@ def is_admitted(runner, hotkey) -> bool:
 
 
 def owner_busy(runner, hotkey):
+    """Money safety II (audit F): ``ops_max_active_per_coldkey`` bounds only
+    OPERATOR-paid work — an operator-billed leg (operator rent / lane) —
+    never a leg on the miner's own key; an unknown owner uses the last
+    persisted identity and, when there is none, never blocks."""
     limit = int(getattr(runner.cfg.round, "ops_max_active_per_coldkey", 0))
-    if not limit:
+    if not limit or not _operator_paid(runner, hotkey):
         return False
-    owner = owner_of(runner, hotkey)
+    owner = owner_of(runner, hotkey, max_age=None)
     if not owner:
-        return True
+        return False
     sched = runner.__dict__.get("_rolling_sched")
     live = set(getattr(sched, "_threads", {}))
     for name in ("lane_b", "lane_c"):
         driver = getattr(sched, name, None)
         if driver is not None:
             live.update(driver.live_hotkeys())
-    return sum(owner_of(runner, hk) == owner for hk in live if hk != hotkey) >= limit
+    return sum(owner_of(runner, hk, max_age=None) == owner and _operator_paid(runner, hk)
+               for hk in live if hk != hotkey) >= limit
 
 
 @contextmanager
-def owner_admission(runner, hotkey, *, exempt=False, deadline=None):
-    """A shared, reentrant owner slot covers generation, training and fallback.
+def owner_admission(runner, hotkey, *, exempt=False, deadline=None, cpu_tier=False):
+    """A shared, reentrant owner slot over OPERATOR-paid work (money safety
+    II, audit F): an operator-billed leg (operator rent / lane) end to end,
+    and the CPU-VM generation of ANY leg (``cpu_tier=True`` — the operator
+    pays for the VM). A leg on the miner's own key takes no slot for its GPU
+    rent; king legs are exempt. The owner is the last PERSISTED identity (no
+    TTL for the limit); with none at all the leg proceeds (logged), never
+    blocked by a slow chain read.
 
     Only a NEW admission needs a fresh coldkey identity. A leg marked
     :func:`mark_admitted` (re-attached after a restart) was admitted by the
@@ -261,21 +288,21 @@ def owner_admission(runner, hotkey, *, exempt=False, deadline=None):
     if held is not None and held[1] == hotkey:
         yield                               # reentrant: this thread already holds it
         return
-    owner = owner_of(runner, hotkey)
+    if not cpu_tier and not _operator_paid(runner, hotkey):
+        yield                               # a miner-key GPU leg: no operator slot
+        return
+    owner = owner_of(runner, hotkey, max_age=None)
     admitted = is_admitted(runner, hotkey)
-    if not owner and admitted:
-        log.warning("owner admission: %s re-attached with no coldkey identity cached — "
-                    "already admitted before the restart, proceeding", str(hotkey)[:12])
+    if not owner:                           # unknown never blocks (audit F)
+        log.warning("owner admission: %s has no coldkey identity on record%s — "
+                    "proceeding (the limit never blocks on an unknown owner)", str(hotkey)[:12],
+                    " (re-attached)" if admitted else "")
         local.held = ("", hotkey)
         try:
             yield
         finally:
             local.held = held
         return
-    if not owner:
-        runner._record_funded_failure(hotkey, "coldkey identity is unavailable; waiting for fresh chain metadata",
-                                      miner_fault=False, error_class="no_capacity", burn=False)
-        raise _FundedLegSkip(hotkey)
     gate = runner.__dict__.setdefault("_owner_slots", FairSlots())
     if deadline is None:
         deadline = time.time() + 1800

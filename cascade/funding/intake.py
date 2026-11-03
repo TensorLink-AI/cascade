@@ -881,11 +881,16 @@ class FundingIntake:
             log.info("withdraw %s", hotkey)
             return 200, {"status": "withdrawn"}
         entry = self.queue.get(hotkey)
-        if entry is not None and entry.status == "in_round":
+        # Money safety II (2026-11-03 00:59, 5C4hrfpM): the live status of a
+        # running leg is "in_flight" (rolling), not only "in_round". Checking
+        # only the latter fell through to the key removal below — the entry
+        # stayed live with no key and the trainer filed an "expired key"
+        # operator rent request. A live entry keeps its key: 409.
+        if entry is not None and entry.status not in ("done", "failed", "withdrawn"):
             return 409, {"code": "not_queued",
-                         "message": "an entry already in a round runs to its "
-                                    "verdict — the key is retained until then "
-                                    "(teardown needs it)"}
+                         "message": f"this submission is {entry.status} — a running leg runs to "
+                                    "its verdict and the key is retained until then (teardown "
+                                    "needs it); withdraw again once it settles"}
         # No live entry: nothing to unqueue, but honor the custody half — a
         # terminal (done/failed) or absent entry has no teardown claim on the
         # key, so the miner can make us forget it NOW rather than waiting out

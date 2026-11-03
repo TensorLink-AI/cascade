@@ -1163,6 +1163,47 @@ def probe_pod_hygiene(host: RemoteHost, checkpoint_dir: str, *, timeout: float =
     return parse_hygiene_output(p.stdout or "")
 
 
+# Money safety II: before a watchdog abort on a MINER's pod is booked as our
+# fault (an operator make-good, a quarantined host), the pod is asked whether
+# something other than our worker holds its GPUs (a miner's own GPU hog).
+_GPU_PROCS_TOKEN = "__CASCADE_GPU_PROCS__"
+_OUR_GPU_PROC_MARKERS = ("cascade.trainer.worker", "cascade/trainer/worker", "cascade-train-worker",
+                         "torchrun", "cascade.trainer", "host_probe", "nccl_preflight")
+
+
+def _gpu_procs_command() -> str:
+    return ("for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null); do "
+            "printf 'GPU:%s:' \"$p\"; tr '\\0' ' ' < /proc/$p/cmdline 2>/dev/null; echo; done; "
+            f"echo {_GPU_PROCS_TOKEN}")
+
+
+def parse_foreign_gpu_procs(stdout: str) -> list[str]:
+    """``GPU:<pid>:<cmdline>`` lines whose cmdline is not one of ours."""
+    out = []
+    for ln in (stdout or "").splitlines():
+        if not ln.startswith("GPU:"):
+            continue
+        _tag, _pid, cmd = (ln.split(":", 2) + ["", ""])[:3]
+        if not any(m in cmd for m in _OUR_GPU_PROC_MARKERS):
+            out.append(ln[4:][:200])
+    return out
+
+
+def probe_foreign_gpu_procs(host: RemoteHost, *, timeout: float = 60.0,
+                            runner=None) -> tuple[list[str] | None, str]:
+    """``(foreign GPU processes, "")`` on ``host`` — compute apps whose
+    cmdline is not our worker's — or ``(None, why)`` when the pod could not
+    be asked (unknown is never read as "clean" nor as "foreign")."""
+    run = runner or run_ssh
+    try:
+        p = run(build_ssh_argv(host, _gpu_procs_command()), int(timeout), "")
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return None, f"{type(e).__name__}: {e}"
+    if p.returncode != 0 or _GPU_PROCS_TOKEN not in (p.stdout or ""):
+        return None, f"rc={p.returncode} {(p.stderr or '').strip()[-160:]}"
+    return parse_foreign_gpu_procs(p.stdout or ""), ""
+
+
 HOST_BENCH_PROBE_TIMEOUT_SECONDS = 120.0
 _HOST_BENCH_PROBE_PY = (
     "import json; from cascade.trainer.host_probe import host_bench; "
@@ -1486,18 +1527,49 @@ HARVEST_MIN_RATE_BYTES_PER_S = 1_000_000
 HARVEST_HARD_CAP_SECONDS = 6 * 3600
 
 
-def harvest_total_breach(elapsed: float, nbytes: int, timeout: float) -> str | None:
+# The rate judged past ``timeout`` is the RECENT one (money safety II, #418
+# follow-up): an average since start let a fast-start-then-trickle stream
+# live ~3.9 h on its early bytes.
+HARVEST_RATE_WINDOW_SECONDS = 600.0
+
+
+def harvest_total_breach(elapsed: float, nbytes: int, timeout: float, *,
+                         recent_rate: float | None = None) -> str | None:
     """Why a still-flowing harvest stream must stop now, or ``None``: past
-    ``timeout`` only when its average rate is below the floor, and always
-    past the hard cap."""
+    ``timeout`` only when its rate is below the floor — ``recent_rate`` (the
+    last :data:`HARVEST_RATE_WINDOW_SECONDS`) when given, else the average —
+    and always past the hard cap."""
     if elapsed > HARVEST_HARD_CAP_SECONDS:
         return (f"no complete archive within the {HARVEST_HARD_CAP_SECONDS}s hard cap "
                 f"({nbytes} bytes received)")
-    if elapsed > timeout and nbytes / max(elapsed, 1e-9) < HARVEST_MIN_RATE_BYTES_PER_S:
+    rate = recent_rate if recent_rate is not None else nbytes / max(elapsed, 1e-9)
+    what = (f"last {HARVEST_RATE_WINDOW_SECONDS:.0f}s" if recent_rate is not None
+            else "average")
+    if elapsed > timeout and rate < HARVEST_MIN_RATE_BYTES_PER_S:
         return (f"no complete archive within {timeout}s ({nbytes} bytes received, "
-                f"{nbytes / max(elapsed, 1e-9) / 1e6:.2f} MB/s average < "
+                f"{rate / 1e6:.2f} MB/s {what} < "
                 f"{HARVEST_MIN_RATE_BYTES_PER_S / 1e6:.2f} MB/s floor)")
     return None
+
+
+class _RateWindow:
+    """``(t, nbytes)`` samples → the byte rate over the last ``window`` s
+    (None until the window is covered)."""
+
+    def __init__(self, window: float = HARVEST_RATE_WINDOW_SECONDS) -> None:
+        import collections
+
+        self.window = float(window)
+        self.samples = collections.deque()
+
+    def add(self, t: float, nbytes: int) -> float | None:
+        self.samples.append((t, nbytes))
+        while len(self.samples) > 1 and t - self.samples[1][0] >= self.window:
+            self.samples.popleft()
+        t0, n0 = self.samples[0]
+        if t - t0 < self.window:
+            return None
+        return (nbytes - n0) / max(t - t0, 1e-9)
 
 
 def harvest_remote_dir(host: RemoteHost, remote_dir: str, dest: Path | str,
@@ -1602,11 +1674,15 @@ def _harvest_stream_into(host, remote_dir: str, argv: list[str], dest: Path, *,
     stop = threading.Event()
     breach: list[str] = []
 
+    rate_window = _RateWindow()
+
     def _watchdog() -> None:
         poll = max(0.05, min(5.0, float(stall_timeout) / 4))
         while not stop.wait(poll):
             now = time.monotonic()
-            why = harvest_total_breach(now - started, stream.nbytes, timeout)
+            recent = rate_window.add(now, stream.nbytes)
+            why = harvest_total_breach(now - started, stream.nbytes, timeout,
+                                       recent_rate=recent)
             if why:
                 breach.append(why)
             elif now - stream.last_progress > stall_timeout:

@@ -404,39 +404,76 @@ class _OperatorPodMixin:
             from ..provision.operator_pool import OperatorPool
 
             provider = OperatorPool(self) if pod.provider == OperatorPool.name else LiumProvider()
+            from .money_guard import settle_operator_pod
+            from .money_watch import note_teardown
+
             if terminate_verified(provider, pod.instance_id):
+                settle_operator_pod(self, pod.instance_id, true_up=True)
+                note_teardown(self, pod.instance_id, ok=True)
                 release_executor_of(self, pod.instance_id)
                 self._ledger_remove(pod.instance_id)       # may hit ENOSPC: pod already gone
             else:
+                note_teardown(self, pod.instance_id, ok=False)
                 log.error("operator pod %s still LIVE after terminate — kept "
                           "on ledger for the next sweep", pod.instance_id)
         except Exception as e:  # noqa: BLE001
+            from .money_watch import note_teardown
+
+            note_teardown(self, pod.instance_id, ok=False)
             log.error("operator pod %s teardown crashed (kept on ledger): %s",
                       pod.instance_id, e)
 
     # ── operator-rented legs (payer key expired, no operator lane) ──────────
 
     OPERATOR_LEG_POD_TAG = "op"
+    ADOPT_PROBE_TRIES = 3
+    ADOPT_PROBE_RETRY_SECONDS = 20.0
 
-    def _operator_recovery_available(self) -> bool:
+    def _operator_pod_worker_alive(self, addr) -> bool:
+        """Whether the pod at ``addr`` still runs a detached worker (the
+        sweep's own read-only probe). Unknown (unreachable) is NOT alive here:
+        the caller already retried; a dead pod must not be kept forever."""
+        try:
+            from .remote import probe_pod_runs
+
+            host = self._sweep_probe_host(addr.ip, getattr(addr, "ssh_port", 22) or 22)
+            probe = probe_pod_runs(host, runner=getattr(self, "_sweep_ssh_runner", None),
+                                   timeout=60)
+            return bool(probe.reachable and (probe.live or probe.finished_ok))
+        except Exception as e:  # noqa: BLE001
+            log.warning("operator pod worker probe failed (%s)", e)
+            return False
+
+    def _operator_recovery_available(self, hotkey: str | None = None) -> bool:
         """Whether an operator-billed make-good could actually run: an operator
         lane on file or an allowed operator rental. Without either, flagging an
         entry strands it; the leg retries on the miner's key instead."""
-        return bool(self._operator_fallback_lanes()) or self._operator_rent_allowed()
+        return bool(self._operator_fallback_lanes()) or self._operator_rent_allowed(hotkey)
 
-    def _operator_rent_allowed(self) -> bool:
+    def _operator_rent_allowed(self, hotkey: str | None = None) -> bool:
         """True when an operator-billed leg with no lane on file may RENT an
-        operator pod: ``[round] funded_operator_fallback`` on, rent mode, and
-        the calling leg opted in (the rolling challenger path sets the
-        thread-local flag — every other caller keeps the old behaviour)."""
+        operator pod (money safety II, audit E — decoupled):
+
+        * an owner approval (any kind) on file for ``hotkey``'s current leg
+          ALWAYS allows it — an approved make-good never strands because
+          ``funded_operator_fallback`` is off;
+        * otherwise ``[round] funded_operator_fallback`` decides whether a
+          non-miner fault may PROPOSE an operator make-good (the gate then
+          files the approval request), for a calling leg that opted in.
+
+        ``ops_paid_fallback_after_seconds`` no longer turns this on for every
+        caller: the paid fallback is its own path (the capacity wait's
+        ``operator_rent`` verdict). Rent mode only."""
+        if self.cfg.round.funded_pods != "rent":
+            return False
+        if hotkey:
+            from .money_guard import approval_on_file
+
+            if approval_on_file(self, hotkey):
+                return True
         loc = self.__dict__.get("_leg_local_obj")
-        return bool(
-            (getattr(self.cfg.round, "funded_operator_fallback", False)
-             or getattr(self.cfg.round, "ops_paid_fallback_after_seconds", 0))
-            and self.cfg.round.funded_pods == "rent"
-            and loc is not None and (getattr(loc, "operator_rent_ok", False)
-                or bool(getattr(self.cfg.round, "ops_paid_fallback_after_seconds", 0)))
-        )
+        return bool(getattr(self.cfg.round, "funded_operator_fallback", False)
+                    and loc is not None and getattr(loc, "operator_rent_ok", False))
 
     def _operator_leg_pod_prefix(self, round_id: str, hotkey: str) -> str:
         from ..provision.funded import funded_pod_name
@@ -580,18 +617,32 @@ class _OperatorPodMixin:
         if addr is not None:
             log.warning("operator leg pod %s for %s is still LIVE at %s:%d — adopting it",
                         pod_id, gen.hotkey[:12], addr.ip, addr.ssh_port)
-            try:
-                host = self._push_deployed_chain_toml(
-                    _remote(addr, self._pin_king_host_key(pod_id, addr)))
-                why = probe_worker_runtime(host, **({"required_flags": ("--local-only", "--continuation-root")} if getattr(self.cfg.round, "ops_continuation_interval_seconds", 0) else {}))
-                if not why:
-                    _ledger(sku)
-                    return host, pod_id
-                log.warning("adopted operator leg pod %s rejected (%s); renting fresh",
-                            pod_id, why)
-            except Exception as e:  # noqa: BLE001 — unreachable ⇒ rent fresh
-                log.warning("adopting operator leg pod %s failed (%s); renting fresh",
-                            pod_id, e)
+            # Money safety II (audit I): ONE failed probe used to tear a live
+            # (possibly mid-training) operator pod down. Retried with backoff;
+            # a pod whose worker is still alive is never terminated here.
+            sleep = getattr(self, "_rent_wait_sleep", None) or time.sleep
+            last = ""
+            for attempt in range(self.ADOPT_PROBE_TRIES):
+                try:
+                    host = self._push_deployed_chain_toml(
+                        _remote(addr, self._pin_king_host_key(pod_id, addr)))
+                    why = probe_worker_runtime(host, **({"required_flags": ("--local-only", "--continuation-root")} if getattr(self.cfg.round, "ops_continuation_interval_seconds", 0) else {}))
+                    if not why:
+                        _ledger(sku)
+                        return host, pod_id
+                    last = f"runtime rejected: {why}"
+                    break                         # a definite verdict: no retry
+                except Exception as e:  # noqa: BLE001 — retried with backoff
+                    last = str(e)
+                    log.warning("adopting operator leg pod %s failed (try %d/%d: %s)",
+                                pod_id, attempt + 1, self.ADOPT_PROBE_TRIES, e)
+                    if attempt + 1 < self.ADOPT_PROBE_TRIES:
+                        sleep(self.ADOPT_PROBE_RETRY_SECONDS * 2 ** attempt)
+            if self._operator_pod_worker_alive(addr):
+                _skip(f"operator leg pod {pod_id} is live with a running worker but could not "
+                      f"be adopted yet ({last[:160]}) — kept, re-attach retried, nothing rented",
+                      "operator_transient")
+            log.warning("adopted operator leg pod %s unusable (%s); renting fresh", pod_id, last)
             with contextlib.suppress(ProvisionError):
                 _lemon("adopted operator leg pod unusable")
 
@@ -722,7 +773,20 @@ class _OperatorPodMixin:
                         landed = price_fn(pod_id) if callable(price_fn) else None
                     except Exception:  # noqa: BLE001 — unknown: the projection is booked
                         landed = None
-                    note_operator_launch(self, gen.hotkey, landed_rate=landed, pod_id=pod_id)
+                    if not note_operator_launch(self, gen.hotkey, landed_rate=landed,
+                                                pod_id=pod_id):
+                        # the landed cost broke the approval's ceiling (money
+                        # safety II): release the pod (not a lemon — the host
+                        # is fine) and park for the owner's re-approval
+                        from ..funding.queue import APPROVAL_CLASS
+                        from .money_guard import settle_operator_pod
+
+                        settle_operator_pod(self, pod_id)
+                        if terminate_verified(provider, pod_id):
+                            self._ledger_remove(pod_id)
+                        _skip("landed price above the approved ceiling — pod released, "
+                              "awaiting the owner's re-approval (nothing burned)",
+                              APPROVAL_CLASS)
                 return host, pod_id
             except ProvisionError as e:
                 from ..provision.core import OperatorRentsHeld
@@ -783,7 +847,13 @@ class _OperatorPodMixin:
         except Exception as e:  # noqa: BLE001 — classify, record, re-raise
             _record_generation_failure(self, gen, e)
             raise
-        host, pod_id = self._rent_operator_leg_host(str(seeds.base_seed), gen)
+        try:
+            host, pod_id = self._rent_operator_leg_host(str(seeds.base_seed), gen)
+        except _FundedLegSkip:
+            from .money_guard import release_reservation
+
+            release_reservation(self)            # no rent: free the daily-cap headroom
+            raise
         _loc = self.__dict__.get("_leg_local_obj")
         if _loc is not None:
             _loc.leg_trained = False           # set by the harvest (harvest_guard)

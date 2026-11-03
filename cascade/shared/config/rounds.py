@@ -423,6 +423,18 @@ class RoundConfig:
     operator_inventory_interval_seconds: int = 3600
     operator_inventory_allow: tuple[str, ...] = ()
     operator_inventory_host_files: tuple[str, ...] = ()
+    # An ssh checkpoint harvest off a pod streams at most expected_checkpoint_gb
+    # x this; past it the checkpoint is refused UNBURNED as unverifiable (a
+    # hostile pod must not fill our volume). 0 = unbounded.
+    harvest_max_bytes_factor: float = 1.2
+    # The operator multi-provider pool (cascade.provision.operator_pool) is on
+    # only when switched on here (or by its own features: more providers, king
+    # backups, the paid fallback) — never by a spend cap.
+    ops_operator_pool_enabled: bool = False
+    # Our own validator's hotkey (ss58): its rejected receipt of a settlement
+    # WE published raises one critical alert naming the legs it carried
+    # (read-only; "" = off).
+    receipt_watch_validator_hotkey: str = ""
     # Trainer recovery controls; scientific contracts and reward rules are unchanged.
     ops_max_active_per_coldkey: int = 0
     ops_gpu_failure_threshold: int = 0

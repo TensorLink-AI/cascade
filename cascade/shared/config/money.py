@@ -43,6 +43,14 @@ MONEY_KNOBS: dict[str, tuple[object, str]] = {
     "operator_inventory_interval_seconds": (3600, "seconds"),
     "operator_inventory_allow": ((), "names"),
     "operator_inventory_host_files": ((), "paths"),
+    # second audit (B): an ssh checkpoint harvest is bounded at
+    # expected_checkpoint_gb x this (0 = unbounded)
+    "harvest_max_bytes_factor": (1.2, "gb"),
+    # audit M: the operator pool is switched on explicitly, never by a cap
+    "ops_operator_pool_enabled": (False, "bool"),
+    # audit D: our own validator's hotkey; its rejected receipts of OUR
+    # settlements raise one critical alert ("" = off)
+    "receipt_watch_validator_hotkey": ("", "text"),
 }
 
 # ``operator_daily_cap_scope``: which booked operator spend counts toward the
@@ -106,6 +114,16 @@ def parse_money_safety(r: dict) -> dict:
             if value not in DAILY_CAP_SCOPES:
                 raise ValueError(f"[round] {name}={value!r} invalid; must be one of "
                                  f"{', '.join(DAILY_CAP_SCOPES)}")
+            out[name] = value
+            continue
+        if kind == "text":
+            if not isinstance(value, str):
+                raise ValueError(f"[round] {name}={value!r} invalid; must be a string")
+            out[name] = value.strip()
+            continue
+        if kind == "bool":
+            if not isinstance(value, bool):
+                raise ValueError(f"[round] {name}={value!r} invalid; must be true or false")
             out[name] = value
             continue
         if kind in ("names", "paths"):

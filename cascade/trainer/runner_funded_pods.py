@@ -911,7 +911,7 @@ class _FundedPodMixin:
         configured the wrapper's accounting is unchanged.
         """
         queue = self._funded_queue()
-        if queue is None or self._operator_recovery_available():
+        if queue is None or self._operator_recovery_available(hotkey):
             return more
         if not queue.set_operator_billed(hotkey, True):
             return more
@@ -936,7 +936,7 @@ class _FundedPodMixin:
         from .money_guard import alert, gate_or_adopt
 
         lost = miner_lost_usd(self)
-        if not self._operator_recovery_available():
+        if not self._operator_recovery_available(gen.hotkey):
             alert(self, "lost_run_needs_operator", gen.hotkey[:16],
                   f"{gen.hotkey[:12]}: a finished run (≤ ${lost:.2f} of the miner's money) was "
                   "lost on our side and its retrain needs OPERATOR capacity (an operator lane "
@@ -1006,7 +1006,7 @@ class _FundedPodMixin:
         queue = self._funded_queue()
         flagged = queue.get(gen.hotkey) if queue is not None else None
         if (flagged is not None and bool(getattr(flagged, "operator_billed", False))
-                and not self._operator_recovery_available()):
+                and not self._operator_recovery_available(gen.hotkey)):
             # No operator capacity is configured, so a make-good can never run.
             # The leg retries on the miner's key with a new pod; a prior
             # allocation not confirmed released still blocks the rent (ledger
@@ -1043,7 +1043,7 @@ class _FundedPodMixin:
             from .money_guard import gate_or_adopt
 
             lanes = self._operator_fallback_lanes()
-            if not lanes and self._operator_rent_allowed():
+            if not lanes and self._operator_rent_allowed(gen.hotkey):
                 # Owner 2026-11-02: never on our account without the owner's
                 # approval of THIS leg (parks awaiting_operator_approval); a
                 # leg already holding its operator pod is adopted (F1).
@@ -1223,7 +1223,7 @@ class _FundedPodMixin:
                             "on an OPERATOR lane (operator-billed; "
                             "funded_operator_fallback)", gen.hotkey)
                 raise _FundedOperatorFallback(gen.hotkey)
-            if self._operator_rent_allowed():
+            if self._operator_rent_allowed(gen.hotkey):
                 # A queued entrant whose key aged out while the marketplace was
                 # sold out is not dropped: with no operator lane on file the leg
                 # rents a pod on the OPERATOR's account — ONLY once the owner
@@ -1443,6 +1443,12 @@ class _FundedPodMixin:
                         # waste. Any other failed rent: the miner paid for
                         # nothing — waste.
                         lemon = result.error_class == LEMON_CLASS
+                        landed = getattr(result, "price_per_hour", None)
+                        if landed:
+                            # the real price, never the flat fallback (S2)
+                            from .miner_spend_guard import spend_start
+
+                            spend_start(self, gen.hotkey, pod_id, rate=landed)
                         spend_end(self, gen.hotkey, pod_id,
                                   outcome=MAKE_GOOD if lemon else "waste",
                                   reason=f"{'lemon' if lemon else 'rent failed'}: "
@@ -1455,7 +1461,7 @@ class _FundedPodMixin:
                                 rate=landed or fallback_rate(self, gpu_choice))
                 if (not result.ok and allocated and result.error_class != "auth"
                         and (result.leaked_pod or result.error_class != LEMON_CLASS)
-                        and self._operator_recovery_available()):
+                        and self._operator_recovery_available(gen.hotkey)):
                     queue = self._funded_queue()
                     if queue is not None:
                         queue.set_operator_billed(gen.hotkey, True)
@@ -1529,7 +1535,7 @@ class _FundedPodMixin:
                         # loop. An unconfirmed release must block another rent.
                         if result.pod and any(p.instance_id == result.pod.instance_id
                                               for p in self._load_funded_ledger()):
-                            if queue is not None and self._operator_recovery_available():
+                            if queue is not None and self._operator_recovery_available(gen.hotkey):
                                 queue.set_operator_billed(gen.hotkey, True)
                             result = replace(result, ok=False, error_class="infra",
                                              burn_attempt=False, leaked_pod=result.pod.instance_id)
@@ -2016,9 +2022,15 @@ class _FundedPodMixin:
         try:
             leftovers = teardown_funded([pod], vault)
         except Exception as e:  # noqa: BLE001
+            from .money_watch import note_teardown
+
+            note_teardown(self, pod.instance_id, ok=False)
             log.error("funded pod %s teardown crashed (kept on ledger for the "
                       "startup sweep): %s", pod.instance_id, e)
             return
+        from .money_watch import note_teardown
+
+        note_teardown(self, pod.instance_id, ok=not leftovers)
         if leftovers:
             log.error("funded pod %s could not be confirmed gone — still "
                       "billing payer %s; kept on ledger", pod.instance_id,

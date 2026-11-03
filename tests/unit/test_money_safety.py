@@ -282,7 +282,7 @@ def test_approved_leg_books_spend_only_at_launch_and_lasts_for_the_leg(tmp_path,
     assert q.get(HK).status == "queued"
     _redispatch(q)
     assert money_guard.operator_leg_gate(r, GEN, kind="expired_key", rent=True) is None
-    assert money_guard.OperatorSpend.for_runner(r).total() == 0.0      # nothing rented yet
+    assert money_guard.OperatorSpend.for_runner(r).rows() == []        # nothing rented yet
     # the rent found no capacity: requeued, and the approval SURVIVES (F3)
     q.requeue(HK, error="sold out", error_class="no_capacity", burn_attempt=False)
     _redispatch(q)

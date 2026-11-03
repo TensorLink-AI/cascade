@@ -488,8 +488,9 @@ class _RollingMixin:
         authenticated but unfunded rotated key passes here; the king's next
         own-key leg then fails as out of funds and re-opens a lapse — under
         the escalating slash that is a SECOND lapse (rest of the reign).
-        TODO(DEC-CA-0055): require balance >= the king leg's estimated cost
-        once a Lium balance endpoint is adopted."""
+        Money safety II: a plain Lium key must ALSO hold the king leg's
+        projected cost (``payer_balance_refusal`` via ``GET /users/me``); an
+        unreadable balance never blocks."""
         import hashlib
 
         import requests
@@ -520,9 +521,28 @@ class _RollingMixin:
                              timeout=20)
         except requests.RequestException:
             return False
-        if r.ok:
-            _king_failed_keys(self, lambda d: d.pop(hotkey, None))
-        return bool(r.ok)
+        if not r.ok:
+            return False
+        # Money safety II (audit K): authenticated is not FUNDED — a rotated
+        # key whose balance cannot pay the king's leg fails here (one alert),
+        # before a rent that would only open a second lapse. An unreadable
+        # balance never blocks (the rent's own 402 still classifies).
+        from .money_guard import alert, payer_balance_refusal
+
+        rate = max(float(getattr(self.cfg.round, "payer_projected_rate_per_hour", 0.0) or 0.0),
+                   float(getattr(self.cfg.round, "funded_max_price_per_hour", 0.0) or 0.0))
+        try:
+            hours = float(self._leg_wall_seconds()) / 3600.0
+        except Exception:  # noqa: BLE001
+            hours = 0.0
+        poor = payer_balance_refusal(self, key, hours=hours, rate=rate) if hours else ""
+        if poor:
+            alert(self, "king_key_unfunded", hotkey[:16],
+                  f"king {hotkey[:12]}: rotated key authenticates but is unfunded — {poor}",
+                  severity="critical")
+            return False
+        _king_failed_keys(self, lambda d: d.pop(hotkey, None))
+        return True
 
     def _rolling_refresh_king_key(self, hotkey: str) -> bool:
         """Re-stamp the king's payer-vault TTL while it is king (it trains

@@ -151,8 +151,8 @@ def _lost_runner(tmp_path, monkeypatch, *, live, kept=True):
 
 
 def _with_operator_rent(r, monkeypatch):
-    monkeypatch.setattr(r, "_operator_recovery_available", lambda: True, raising=False)
-    monkeypatch.setattr(r, "_operator_rent_allowed", lambda: True, raising=False)
+    monkeypatch.setattr(r, "_operator_recovery_available", lambda hotkey=None: True, raising=False)
+    monkeypatch.setattr(r, "_operator_rent_allowed", lambda hotkey=None: True, raising=False)
     monkeypatch.setattr(r, "_operator_fallback_lanes", lambda: [], raising=False)
     monkeypatch.setattr(r, "_operator_balance_reader", lambda: 10_000.0, raising=False)
 
@@ -194,7 +194,7 @@ def test_an_approved_retrain_is_operator_billed_never_on_the_miners_key(tmp_path
 def test_a_lost_run_without_operator_capacity_waits_and_never_charges_the_miner(
         tmp_path, monkeypatch):
     r, q, rents = _lost_runner(tmp_path, monkeypatch, live=(None, True))
-    monkeypatch.setattr(r, "_operator_recovery_available", lambda: False, raising=False)
+    monkeypatch.setattr(r, "_operator_recovery_available", lambda hotkey=None: False, raising=False)
     with pytest.raises(_FundedLegSkip):
         r._rent_funded_host("777", _challenger("hkA"))
     assert rents == []
