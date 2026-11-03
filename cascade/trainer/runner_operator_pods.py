@@ -622,7 +622,8 @@ class _OperatorPodMixin:
             # a pod whose worker is still alive is never terminated here.
             sleep = getattr(self, "_rent_wait_sleep", None) or time.sleep
             last = ""
-            for attempt in range(self.ADOPT_PROBE_TRIES):
+            tries = int(getattr(self, "ADOPT_PROBE_TRIES", 3))
+            for attempt in range(tries):
                 try:
                     host = self._push_deployed_chain_toml(
                         _remote(addr, self._pin_king_host_key(pod_id, addr)))
@@ -635,10 +636,10 @@ class _OperatorPodMixin:
                 except Exception as e:  # noqa: BLE001 — retried with backoff
                     last = str(e)
                     log.warning("adopting operator leg pod %s failed (try %d/%d: %s)",
-                                pod_id, attempt + 1, self.ADOPT_PROBE_TRIES, e)
-                    if attempt + 1 < self.ADOPT_PROBE_TRIES:
-                        sleep(self.ADOPT_PROBE_RETRY_SECONDS * 2 ** attempt)
-            if self._operator_pod_worker_alive(addr):
+                                pod_id, attempt + 1, tries, e)
+                    if attempt + 1 < tries:
+                        sleep(float(getattr(self, "ADOPT_PROBE_RETRY_SECONDS", 0.0)) * 2 ** attempt)
+            if _OperatorPodMixin._operator_pod_worker_alive(self, addr):
                 _skip(f"operator leg pod {pod_id} is live with a running worker but could not "
                       f"be adopted yet ({last[:160]}) — kept, re-attach retried, nothing rented",
                       "operator_transient")
