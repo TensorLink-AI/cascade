@@ -12,8 +12,8 @@ from types import SimpleNamespace
 from cascade.shared.bench_report import VBENCH_MAX_CARRIES, BenchReport, dump_bench_report
 from cascade.trainer.rolling import FinishedLeg, RollingScheduler, RollingState
 
-CHAL = "sha256-" + "c1" * 32
-KING = "sha256-" + "ab" * 32
+from .test_validator_bench import CHAL_PTR as CHAL
+from .test_validator_bench import KING_PTR as KING
 
 
 def _leg(hotkey, ptr, era=7):
