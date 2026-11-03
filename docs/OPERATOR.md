@@ -261,6 +261,46 @@ What refuses and what keeps running on a file without them:
   is typed once decided (or the already-locked rollover is typed). Plan that
   edit before then.
 
+**Note byte budget: the two ways to free room for `v2b-`.** The commitment
+field is 128 bytes. The main validator's live note today is 124 B
+(`cascade-ready:1:rolling-era-king:0:0:forfeit-42b1a486:9165600:9166500:margin-v2-d30eb443:9190800:9194400:prelaunch-95-r2:0:0`);
+`:v2b-150ec0d0:0:0` adds 17 B, and the locked segment
+(`:v2b-150ec0d0:<lock>:<switch>`) adds 29 B. The owner picks one of these
+(Approve-tier, chain.toml edits on every deployed copy):
+
+- **(a) type the decided forfeit / margin-v2 blocks** (required on mainnet):
+
+  ```toml
+  [scoring]
+  margin_v2_from_block    = 9194400   # = the block margin-v2-d30eb443 resolved
+  forfeit_from_block       = 9166500   # = the block forfeit-42b1a486 resolved
+  ```
+
+  This is behaviour-identical, because the restored lock-ins become no-ops. Both
+  segments leave the note: 73 B unlocked and 85 B locked on the main validator.
+  The release chain.toml already carries these two lines.
+- **(b) retire the UNLOCKED pre-launch burn vote**:
+
+  ```toml
+  [v2]
+  prelaunch_burn = 0.0   # was 0.95; the prelaunch-95-r2 vote never locked
+  ```
+
+  This is behaviour-identical only while that vote is unlocked: the burn shapes
+  pre-v2 settlements only, and only from a decided block, and every future
+  settlement is v2. A validator whose persisted
+  `activation_prelaunch_burn_state.json` is LOCKED refuses to start with
+  `prelaunch_burn = 0`; type `[v2] prelaunch_burn_from_block` instead.
+  **(b) alone is not enough on mainnet.** It frees 20 B, so the note is 121 B
+  unlocked but 133 B once v2b locks, and the startup check (which judges the
+  locked worst case) still refuses. On a repo-config validator (rollover
+  resolved from signals) even the unlocked note does not fit. Use (b) only
+  together with (a), for more headroom: 53 B / 65 B.
+
+At startup a validator logs one `activation: STARTUP — this node's note
+exceeds 128 bytes; segment '<feature>' will NOT be signalled` WARNING for each
+segment its 128-byte field would drop, so no vote is dropped silently.
+
 Steps (Approve-tier; snapshot each file first):
 1. Hand-edit every deployed chain.toml (trainer box `/root/cascade/chain.toml`,
    the main validator's, any satellite / intake copy): add the two `[v2]` keys
@@ -3013,9 +3053,14 @@ integration qualification.
 
 ### V2 private evidence budget and pool rebuild
 
-The mainnet candidate sets `[v2] eval_n_windows = 4000`, applied only to
-settlements judging v2 eras. Trainer, validators and audit must share that
-configuration. The legacy single-horizon draw's 1,200-window target is not
+**Correction (DEC-CA-0067):** the mainnet chain.toml's `eval_n_windows = 4000`
+sits under `[round]`, where nothing reads it. It is a dead key: v2 settlements
+judge on `[eval] n_windows` (2000) until the DEC-CA-0067 switch. From the
+switch era, the bundled `[v2] eval_n_windows_after = 4000` is what moves the v2
+verdict budget to 4000. Do not move the dead key into `[v2]` by hand, because
+that would change the budget on one node only and fork it. `[v2] eval_n_windows`
+(parsed, 0 = off), when set, is applied only to settlements judging v2 eras.
+Trainer, validators and audit must share that configuration. The legacy single-horizon draw's 1,200-window target is not
 applied to that v2 budget. New pool builds default to 800/domain,
 400/domain-frequency, 32 maximum native channels and source-family clustering.
 Update any explicit 600/300 publish-cron flags; repository edits do not change

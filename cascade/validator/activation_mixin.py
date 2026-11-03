@@ -378,6 +378,29 @@ class ActivationMixin:
             # DEC-CA-0067: a validator whose note drops the v2b- segment never
             # votes on it (only a WARNING per write) — refuse to start instead
             raise ActivationStartupRefused(f"activation: refusing to start — {trim}")
+        from ..shared.activation import (
+            NOTE_MAX_BYTES,
+            note_trimmed_segments,
+            prelaunch_retirement_problem,
+        )
+
+        # DEC-CA-0067 note budget option (b): retiring the pre-launch burn
+        # vote ([v2] prelaunch_burn = 0) is only safe while it never locked
+        if pstore is not None and pspec is None:
+            retire = prelaunch_retirement_problem(self._base_cfg(), pstore.load())
+            if retire:
+                raise ActivationStartupRefused(f"activation: refusing to start — {retire}")
+        # Any segment the 128-byte field would drop NOW is a vote this node
+        # silently does not cast (one WARNING per write otherwise): say so loud
+        # at startup, with the remedy.
+        for feature in note_trimmed_segments(self._base_cfg(), self._activation, self._forfeit,
+                                             self._margin_v2, self._prelaunch,
+                                             image_decoupled_record=self._image_decoupled):
+            log.warning("activation: STARTUP — this node's note exceeds %d bytes; segment %r "
+                        "will NOT be signalled (vote silently dropped). Free room: type the "
+                        "decided [scoring] forfeit_from_block / margin_v2_from_block, or "
+                        "retire an unlocked vote (e.g. [v2] prelaunch_burn = 0)",
+                        NOTE_MAX_BYTES, feature)
         self._signal_hotkey = str(getattr(client, "hotkey_ss58", lambda: "")() or "")
         if self._activation.locked and self._activation.source != "config":
             log.info("activation: restored lock-in (block %d, rollover %d, via %s)",

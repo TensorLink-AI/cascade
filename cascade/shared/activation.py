@@ -1151,6 +1151,39 @@ def own_signal_payload(cfg: ChainConfig, record: ActivationRecord,
     overlay puts in force now) drops the segment of any feature whose block
     that config TYPES: an overlay that types a decided block frees its room.
     Both default off, so the note is byte-identical without an overlay."""
+    parts = _own_note_parts(cfg, record, forfeit_record, margin_v2_record, prelaunch_record,
+                            netconfig_segment, in_force, image_decoupled_record)
+    if parts is None:
+        return None
+    head, extras, tail = parts
+    note = format_signals(head, *extras, *tail)
+    while len(note.encode("utf-8")) > NOTE_MAX_BYTES and (extras or tail):
+        # The commitment field is Raw0-128: a note past it cannot be written
+        # at all, which would silence EVERY vote this node carries. The newest
+        # feature segment is dropped (logged) until the note fits — the
+        # DEC-CA-0057 ``cfg-`` segment only once every other extra is gone;
+        # typing an already-decided block into chain.toml (or an overlay)
+        # removes its segment and frees room.
+        dropped = extras.pop() if extras else tail.pop()
+        log.warning("activation: note over %d bytes; segment %r NOT signalled (type a "
+                    "decided feature's block into chain.toml to free room)",
+                    NOTE_MAX_BYTES, dropped.feature)
+        note = format_signals(head, *extras, *tail)
+    return note
+
+
+def _own_note_parts(cfg: ChainConfig, record: ActivationRecord,
+                    forfeit_record: ActivationRecord | None = None,
+                    margin_v2_record: ActivationRecord | None = None,
+                    prelaunch_record: ActivationRecord | None = None,
+                    netconfig_segment: ReadySignal | None = None,
+                    in_force: ChainConfig | None = None,
+                    image_decoupled_record: ActivationRecord | None = None,
+                    ) -> tuple[ReadySignal, list[ReadySignal], list[ReadySignal]] | None:
+    """``(head, extras, tail)`` of :func:`own_signal_payload`'s note BEFORE the
+    128-byte trim (``None`` = no note). Shared with
+    :func:`note_trimmed_segments` so the startup warning sees exactly the
+    segments the writer would drop."""
     if not cfg.activation.enabled:
         return None
     typed = in_force if in_force is not None and in_force is not cfg else None
@@ -1180,20 +1213,7 @@ def own_signal_payload(cfg: ChainConfig, record: ActivationRecord,
     if not primary.decided_on_chain and not extras and not tail:
         return None                                  # typed-in rollover: the note is inert
     head = _segment_for(primary, record) if primary.decided_on_chain else ReadySignal(primary.name)
-    note = format_signals(head, *extras, *tail)
-    while len(note.encode("utf-8")) > NOTE_MAX_BYTES and (extras or tail):
-        # The commitment field is Raw0-128: a note past it cannot be written
-        # at all, which would silence EVERY vote this node carries. The newest
-        # feature segment is dropped (logged) until the note fits — the
-        # DEC-CA-0057 ``cfg-`` segment only once every other extra is gone;
-        # typing an already-decided block into chain.toml (or an overlay)
-        # removes its segment and frees room.
-        dropped = extras.pop() if extras else tail.pop()
-        log.warning("activation: note over %d bytes; segment %r NOT signalled (type a "
-                    "decided feature's block into chain.toml to free room)",
-                    NOTE_MAX_BYTES, dropped.feature)
-        note = format_signals(head, *extras, *tail)
-    return note
+    return head, extras, tail
 
 
 # Horizon for the note-budget worst case: blocks are judged at the digit count
@@ -1232,9 +1252,58 @@ def v2b_note_problem(cfg: ChainConfig, record: ActivationRecord | None = None,
     if spec.name in note.split(":"):
         return ""
     return (f"the activation note would exceed {NOTE_MAX_BYTES} bytes and TRIM the "
-            f"{spec.name} segment (note without it: {note!r}) — type the decided "
-            "[scoring] forfeit_from_block / margin_v2_from_block (release chain.toml) to "
-            "free room")
+            f"{spec.name} segment (note without it: {note!r}) — free room: (a) type the "
+            "decided [scoring] forfeit_from_block / margin_v2_from_block (release "
+            "chain.toml), and/or (b) retire the UNLOCKED pre-launch burn vote ([v2] "
+            "prelaunch_burn = 0); (b) alone does not fit a locked v2b segment on mainnet")
+
+
+def note_trimmed_segments(cfg: ChainConfig, record: ActivationRecord | None = None,
+                          forfeit_record: ActivationRecord | None = None,
+                          margin_v2_record: ActivationRecord | None = None,
+                          prelaunch_record: ActivationRecord | None = None,
+                          netconfig_segment: ReadySignal | None = None,
+                          in_force: ChainConfig | None = None,
+                          image_decoupled_record: ActivationRecord | None = None) -> list[str]:
+    """The feature names this node's note would DROP right now to fit
+    :data:`NOTE_MAX_BYTES` (newest first, exactly as :func:`own_signal_payload`
+    trims), with its CURRENT records. ``[]`` = everything is signalled. Used
+    for the startup WARNING: a trimmed segment is a vote this node silently
+    does not cast."""
+    parts = _own_note_parts(cfg, record or ActivationRecord(), forfeit_record,
+                            margin_v2_record, prelaunch_record, netconfig_segment, in_force,
+                            image_decoupled_record)
+    if parts is None:
+        return []
+    head, extras, tail = parts
+    dropped: list[str] = []
+    while (len(format_signals(head, *extras, *tail).encode("utf-8")) > NOTE_MAX_BYTES
+           and (extras or tail)):
+        dropped.append(str((extras.pop() if extras else tail.pop()).feature))
+    return dropped
+
+
+def prelaunch_retirement_problem(cfg: ChainConfig, stored: ActivationRecord | None) -> str:
+    """Why ``[v2] prelaunch_burn = 0`` (retiring the DEC-CA-0055 pre-launch
+    burn vote to free note room, DEC-CA-0067 note budget option (b)) is NOT
+    safe on this node, or "". Retiring is behaviour-identical only while the
+    vote never locked: the burn shapes pre-v2 settlements only, and only from
+    a decided block. A LOCKED record (``stored``: this node's persisted
+    ``activation_prelaunch_burn_state.json``) means a decided burn that the
+    audit replays on every pre-v2 receipt — dropping it would change those
+    verdicts, so type ``[v2] prelaunch_burn_from_block`` instead (its segment
+    leaves the note just the same)."""
+    if not cfg.activation.enabled or prelaunch_burn_feature(cfg) is not None:
+        return ""
+    if float(getattr(getattr(cfg, "v2", None), "prelaunch_burn", 0.0) or 0.0) > 0.0:
+        return ""
+    if stored is None or not stored.locked or stored.source == "config":
+        return ""
+    return (f"[v2] prelaunch_burn = 0 retires the pre-launch burn vote, but this node's "
+            f"persisted record {stored.feature!r} is LOCKED (burn from block "
+            f"{stored.activation_block}) — a decided burn cannot be retired; restore "
+            f"[v2] prelaunch_burn and type prelaunch_burn_from_block = "
+            f"{stored.activation_block} instead")
 
 
 def ensure_signal(client: Any, cfg: ChainConfig, record: ActivationRecord, *,
