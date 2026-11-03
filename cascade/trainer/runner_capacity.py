@@ -261,13 +261,18 @@ class _FundedCapacityMixin:
                                   for_king: bool = False,
                                   hotkey: str | None = None,
                                   price_caps: dict | None = None,
-                                  capacity_probe=None, allow_paid_fallback=False) -> bool:
+                                  capacity_probe=None, allow_paid_fallback=False,
+                                  choice_changed=None) -> bool:
         """Poll the marketplace for ``sku`` until it shows capacity or the leg's
         latest safe start passes. Legs start INDEPENDENTLY as GPUs appear; a
         leg still without a GPU at the deadline requeues. Returns True when
         capacity appeared, ``"operator"`` when the leg should take an operator
         lane instead, False otherwise. ``price_caps`` (a miner-chosen type,
-        DEC-CA-0060) replaces the operator caps on the probe."""
+        DEC-CA-0060) replaces the operator caps on the probe.
+        ``choice_changed`` (a funded leg with a miner-chosen GPU) is asked on
+        every poll; True ends the wait with ``"gpu_changed"`` so the caller
+        re-derives the SKU, caps and deadline (a raising callable = no
+        change)."""
         skus = (sku,) if isinstance(sku, str) else tuple(sku)
         sku = "/".join(skus)
         deadline = self._funded_rent_wait_deadline_for(skus[0] if len(skus) == 1 else None)
@@ -309,6 +314,15 @@ class _FundedCapacityMixin:
                 log.info("%s: capacity wait cancelled (the king cannot be rented "
                          "this attempt)", describe)
                 return False
+            if choice_changed is not None:
+                try:
+                    changed = bool(choice_changed())
+                except Exception:  # noqa: BLE001 — unreadable ⇒ keep waiting as is
+                    changed = False
+                if changed:
+                    log.info("%s: the miner changed its GPU choice — leaving the %s "
+                             "wait", describe, sku)
+                    return "gpu_changed"
             # Hybrid fallback: operator lanes on file end the wait — the leg
             # runs there, operator-billed. Fresh legs keep polling the
             # marketplace until the fresh window (Lium first).

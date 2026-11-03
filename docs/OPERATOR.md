@@ -226,6 +226,18 @@ executor across `[round] funded_pod_skus` under the price caps
 (`funded_sku_per_leg`), with `[training] expected_gpu = ""`. Equal compute
 comes from the fixed series-point budget, not from matching silicon.
 
+A miner may choose the type itself (`cascade fund --gpu …`, DEC-CA-0060:
+`gpu`, `gpu_allow_fallback`, `gpu_max_price_per_hour` on its queue entry).
+A re-fund that changes that choice reaches a lane-A leg already **waiting
+for capacity**: every poll re-reads the in-flight entry (same ref and
+attempt; not a new ref queued behind the flight) and, on a change, logs
+`funded leg X: miner changed GPU choice A → B` and switches the next rent to
+the new type, cap and latest safe start. A type that can no longer land
+before the leg's target settlement is never rented (the doomed-leg check
+requeues the leg unburned). An unreadable queue keeps the current choice.
+King legs, default-path legs and lane B / marketcast legs (explicit
+choices) are never re-steered; a pod already rented is never touched.
+
 Pinning one SKU (`expected_gpu = "<exact torch.cuda.get_device_name string>"`)
 is a LOCKED contract term — a coordinated validator upgrade — and buys
 byte-exact re-derivation of checkpoints on that SKU + image.
@@ -1357,6 +1369,15 @@ Trainer-only; nothing here reaches a manifest or a validator verdict.
   cascade-trainer block-executor 63cadadb-b379-4c45-8a01-04a81b135933 --reason "1 GPU x3"
   cascade-trainer block-executor f092246d-5704-4c9e-b57f-7c0710a06deb --reason "3 GPUs x2"
   ```
+  **Never-ready lemons** feed the same file. A funded pod rejected as
+  "not ready within …" on a host-side fault (never an auth / balance / rate
+  limit from `lium up`, never a create the platform did not list) records a
+  not-ready strike on its executor. Two within 7 days block the executor
+  with the short-pod durations above (72 h, then 7 d on a repeat), with the
+  reason `never ready 2x in 7 d (not-ready lemon)`; the pod's host IP follows
+  the same rule (blocked only once two distinct executors behind it are).
+  One strike alone blocks nothing beyond the existing 3 h bad-executor mark
+  and 0.5 h host quarantine. `unblock-executor` also clears the count.
 * **Post-rent rejects / lemons** never propose a full-leg operator make-good:
   their cost is booked `make_good` (one priced alert, sized to the loss). A
   make-good owed is OUR debt to the miner and never counts toward the

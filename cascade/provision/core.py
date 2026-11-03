@@ -1843,15 +1843,21 @@ class LiumProvider:
         try:
             from .lium_identity import mark_executor_bad
 
-            if self._pod(pod_id) is None:
-                return ""
-            executor = self._executor_by_name.get(pod_id) or self._executor_of_pod(pod_id)
+            executor = self.listed_executor_of(pod_id)
             if executor:
                 mark_executor_bad(executor, f"{pod_id}: {reason}")
             return executor or ""
         except Exception as e:  # noqa: BLE001
             log.warning("lium: could not mark the executor of %s bad: %s", pod_id, e)
             return ""
+
+    def listed_executor_of(self, pod_id: str) -> str:
+        """The executor ``pod_id`` sits on, only when the platform LISTS the
+        pod ("" for a ``lium up`` that deployed nothing — a ghost/cooldown,
+        never proof of a bad host). Raises on a listing error."""
+        if self._pod(pod_id) is None:
+            return ""
+        return self._executor_by_name.get(pod_id) or self._executor_of_pod(pod_id) or ""
 
     def _executor_hosts(self) -> dict[str, str]:
         """executor id → host IP for the whole marketplace (the CLI's ``ls`` JSON

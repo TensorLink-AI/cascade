@@ -63,6 +63,57 @@ def _entry_gpu_choice(entry, ref: str):
                                               or 0.0))
 
 
+def _gpu_choice_key(choice) -> tuple:
+    """A comparable form of a ``GpuChoice`` (the type case-insensitive; the
+    fallback flag and cap only mean something with a type chosen)."""
+    gpu = str(getattr(choice, "gpu", "") or "").strip().lower()
+    if not gpu:
+        return ("", False, 0.0)
+    return (gpu, bool(getattr(choice, "allow_fallback", False)),
+            float(getattr(choice, "max_price_per_hour", 0.0) or 0.0))
+
+
+def _changed_gpu_choice(runner, hotkey: str, ref: str, attempt_id: str, current):
+    """The miner's NEW GPU choice for a leg waiting for capacity, or None to
+    keep ``current`` (incident 2026-11-03: a re-fund switched 8xH200 → 8xH100
+    but the waiting leg polled for 8xH200 until its deadline).
+
+    Only the SAME in-flight entry counts — status ``in_flight``, this leg's
+    ``ref`` and ``attempt_id`` — and not one whose re-fund queued a new ref
+    behind the flight (that choice belongs to the queued submission). Any read
+    failure keeps the current choice: a torn queue never ends a leg."""
+    from ..funding.gpu_choice import GpuChoice
+
+    try:
+        queue = runner._funded_queue()
+        entry = queue.get(hotkey) if queue is not None else None
+        if (entry is None or getattr(entry, "status", "") != "in_flight"
+                or getattr(entry, "ref", None) != ref
+                or str(getattr(entry, "attempt_id", "") or "") != attempt_id
+                or getattr(entry, "queued_ref", "")):
+            return None
+        gpu = str(getattr(entry, "gpu", "") or "")
+        new = GpuChoice(gpu=gpu,
+                        allow_fallback=bool(getattr(entry, "gpu_allow_fallback", False))
+                        if gpu else False,
+                        max_price_per_hour=float(getattr(entry, "gpu_max_price_per_hour", 0.0)
+                                                 or 0.0) if gpu else 0.0)
+    except Exception as e:  # noqa: BLE001 — unreadable queue: keep the current choice
+        log.debug("funded leg %s: GPU choice re-read failed (%s) — keeping %s",
+                  hotkey[:12], e, getattr(current, "gpu", "") or "the default")
+        return None
+    return None if _gpu_choice_key(new) == _gpu_choice_key(current) else new
+
+
+def _describe_gpu_choice(choice) -> str:
+    gpu = str(getattr(choice, "gpu", "") or "")
+    if not gpu:
+        return "default (cheapest fitting type)"
+    cap = float(getattr(choice, "max_price_per_hour", 0.0) or 0.0)
+    return (f"{gpu} (cap {f'${cap:.2f}/h' if cap else 'none'}"
+            f"{', fallback allowed' if getattr(choice, 'allow_fallback', False) else ''})")
+
+
 @contextlib.contextmanager
 def allocation_lock(lock):
     """Serialize selection/launch; release once its executor is claimed."""
@@ -1063,8 +1114,14 @@ class _FundedPodMixin:
                         "running on an operator lane (%d on file), never on the payer's key",
                         gen.hotkey, len(lanes))
             raise _FundedOperatorFallback(gen.hotkey)
+        # A lane-A leg's choice lives on its in-flight queue entry and is
+        # RE-READ while the leg waits for capacity (a re-fund may change it);
+        # an explicit choice (king: the default; lane B / marketcast: their
+        # own store) is fixed for the leg.
+        reread_choice = gpu_choice is None
         if gpu_choice is None:
             gpu_choice = _entry_gpu_choice(flagged, gen.ref)
+        flight_attempt = str(getattr(flagged, "attempt_id", "") or "")
         rnd = self.cfg.round
         from ..provision.funded import funded_pod_name
         from .cost_guards import measured_wall_refusal
@@ -1307,7 +1364,35 @@ class _FundedPodMixin:
                      if chosen[1]["max_price_per_hour"] else "none",
                      "falls back to the cheapest type" if gpu_choice.allow_fallback
                      else "waits for this type")
+        # Only a leg that started WITH a miner choice follows later changes;
+        # king legs and default-path legs are never re-steered.
+        reread_choice = bool(reread_choice and not is_king and not adopt_live
+                             and getattr(gpu_choice, "gpu", ""))
+
+        def choice_update():
+            if not reread_choice:
+                return None
+            return _changed_gpu_choice(self, gen.hotkey, gen.ref, flight_attempt, gpu_choice)
+
         while True:
+            new_choice = choice_update()
+            if new_choice is not None:
+                # The miner re-funded with another GPU choice while this leg
+                # waited: switch to it before the next rent attempt — its SKU,
+                # its cap, and (through the wait / doomed-leg checks below)
+                # its own latest safe start; a type that no longer fits the
+                # leg's target settlement is never rented.
+                log.warning("funded leg %s: miner changed GPU choice %s → %s",
+                            gen.hotkey[:12], _describe_gpu_choice(gpu_choice),
+                            _describe_gpu_choice(new_choice))
+                gpu_choice = new_choice
+                chosen = (self._chosen_gpu_rent(gpu_choice, f"funded leg {gen.hotkey[:12]}")
+                          if gpu_choice.gpu else None)
+                fell_back = False
+                if chosen is not None:
+                    round_sku = chosen[0][0]
+                elif skus:
+                    round_sku = skus[0]
             queue = self._funded_queue()
             recovery = queue.get(gen.hotkey) if queue is not None else None
             if recovery is not None and recovery.operator_billed:
@@ -1363,7 +1448,8 @@ class _FundedPodMixin:
                 allocated = []
 
                 def on_allocated(machine_id, pod_id, *, allocated=allocated,
-                                 release_allocation=release_allocation):
+                                 release_allocation=release_allocation,
+                                 gpu_choice=gpu_choice, round_sku=round_sku):
                     from .progress import report_progress
 
                     report_progress(self, "booting")
@@ -1621,7 +1707,11 @@ class _FundedPodMixin:
                 capacity_probe=lambda fitting, wait_caps=wait_caps: payer_capacity(api_key, fitting, wait_caps,
                     live_claimed_executors(self), health_for(self)),
                 allow_paid_fallback=chosen is None,
+                **({"choice_changed": lambda: choice_update() is not None}
+                   if reread_choice else {}),
                 **({"price_caps": wait_caps} if chosen is not None or fell_back else {}))
+            if waited == "gpu_changed":
+                continue                  # re-derived at the top of the loop
             if waited in ("operator_rent", "operator"):
                 from .money_guard import gate_or_adopt
 
