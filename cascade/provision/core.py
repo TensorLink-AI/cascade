@@ -1386,9 +1386,21 @@ class LiumProvider:
         return self._sku_by_name.get(pod_id, "")
 
     def price_of(self, pod_id: str) -> float | None:
-        """The landed executor's $/h for a pod this process launched; None
-        when unknown (an unpriced listing, another process's launch)."""
-        return self.__dict__.get("_price_by_name", {}).get(pod_id)
+        """The landed executor's $/h: this process's launch record, else the
+        account's pod listing (an ADOPTED pod; review S2); None when unknown."""
+        known = self.__dict__.get("_price_by_name", {}).get(pod_id)
+        if known:
+            return known
+        try:
+            row = self._pod(pod_id) or {}
+        except Exception:  # noqa: BLE001 — unknown, never a guess
+            return None
+        for cand in (row, row.get("executor") or {}, row.get("machine") or {}):
+            if isinstance(cand, dict):
+                price = executor_price_per_hour(cand)
+                if price:
+                    return float(price)
+        return None
 
     def _list_pods(self) -> list[dict]:
         try:

@@ -198,7 +198,9 @@ def wall_warning(choice: GpuChoice, catalog: GpuCatalog | None) -> str:
 
 def parse_budget_header(headers) -> tuple[float | None, str, dict | None]:
     """``(budget | None, signed_part, None)`` or ``(None, "", error_body)``.
-    Absent = no budget; present = a positive, finite USD figure."""
+    Absent (None) = keep the entry's budget as it is (a re-fund never clears
+    it silently; review S3); ``0`` = clear it explicitly; otherwise a
+    positive, finite USD figure."""
     raw = (headers.get(BUDGET_HEADER) or "").strip()
     if not raw:
         return None, "", None
@@ -206,10 +208,10 @@ def parse_budget_header(headers) -> tuple[float | None, str, dict | None]:
         value = float(raw)
     except ValueError:
         value = float("nan")
-    if not math.isfinite(value) or value <= 0:
+    if not math.isfinite(value) or value < 0:
         return None, "", {"code": "bad_max_total_spend",
                           "message": f"{BUDGET_HEADER} must be a positive USD figure "
-                                     "(omit it for no budget)"}
+                                     "(0 clears the budget; omit it to keep the current one)"}
     return value, f"budget={raw}", None
 
 

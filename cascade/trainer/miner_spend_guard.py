@@ -61,16 +61,42 @@ def spend_start(runner, hotkey: str, pod_id: str, *, rate: float) -> None:
         log.warning("miner spend: could not record pod %s of %s (%s)", pod_id, hotkey[:12], exc)
 
 
+def _any_ledger(runner) -> MinerSpend | None:
+    led = _ledger(runner)
+    if led is None and getattr(runner, "work_root", None) is not None:
+        led = MinerSpend(Path(runner.work_root) / "miner_spend.json")
+    return led
+
+
+def spend_touch(runner, hotkey: str, pod_id: str) -> None:
+    """The pod was seen alive (bounds its cost if it later vanishes)."""
+    try:
+        led = _any_ledger(runner)
+        if led is not None and hotkey:
+            led.touch(hotkey, pod_id)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def close_vanished(runner) -> None:
+    """Close open records of pods no longer on the funded ledger at their
+    last-seen-alive time (review S1). Best-effort."""
+    try:
+        led = _any_ledger(runner)
+        if led is not None:
+            led.close_missing(p.instance_id for p in runner._load_funded_ledger())
+    except Exception as exc:  # noqa: BLE001
+        log.debug("miner spend: vanished-pod close skipped (%s)", exc)
+
+
 def spend_end(runner, hotkey: str, pod_id: str, *, outcome: str, reason: str = "",
               kind: str = INFRA) -> None:
     """Close a pod's record (``result`` / ``waste``). Never raises — a
     teardown is never blocked by bookkeeping."""
     try:
-        led = _ledger(runner)
-        if led is None and getattr(runner, "work_root", None) is not None:
-            led = MinerSpend(Path(runner.work_root) / "miner_spend.json")
-        if led is not None and hotkey:
-            led.end(hotkey, pod_id, outcome=outcome, reason=reason, kind=kind)
+        led = _any_ledger(runner)
+        if led is not None and pod_id:
+            led.end(hotkey or None, pod_id, outcome=outcome, reason=reason, kind=kind)
     except Exception as exc:  # noqa: BLE001
         log.warning("miner spend: could not close pod %s of %s (%s)", pod_id, hotkey[:12], exc)
 
@@ -91,6 +117,7 @@ def waste_cap_check(runner, gen) -> None:
     led, e = _ledger(runner), _entry(runner, gen.hotkey)
     if led is None or e is None:
         return
+    close_vanished(runner)
     try:
         s = led.summary(gen.hotkey, ref=e.ref, funded_at=e.funded_at)
     except SpendUnknown as exc:
@@ -112,7 +139,7 @@ def trip(runner, gen, entry, s, cap: float) -> None:
 
     led = _ledger(runner)
     if led is not None:
-        led.mark_capped(gen.hotkey)
+        led.mark_capped(gen.hotkey, entry.ref)
     infra = s.infra_waste_usd >= cap
     sku, rate, hours, op_cost = projected_operator_leg_cost(runner)
     pods = ", ".join(f"{p['pod_id'][-14:]} ${float(p.get('rate') or 0):.2f}/h "
@@ -156,6 +183,7 @@ def budget_check(runner, gen, gpu_choice=None) -> None:
     if budget is None:
         return
     led = _ledger(runner)
+    close_vanished(runner)
     try:
         spent = led.summary(gen.hotkey, ref=e.ref, funded_at=e.funded_at).spend_usd if led else 0.0
     except SpendUnknown:

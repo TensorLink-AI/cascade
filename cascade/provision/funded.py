@@ -389,9 +389,15 @@ def rent_funded_pod(
             getter = getattr(provider, "machine_of", None)
             if getter is not None:
                 machine = getter(live_name) or ""
+            price_fn = getattr(provider, "price_of", None)
+            try:
+                price = price_fn(live_name) if callable(price_fn) else None
+            except Exception:  # noqa: BLE001 — unknown price: the ledger falls back
+                price = None
             return FundedRentResult(hotkey=hotkey, ok=True, pod=pod, address=live_addr,
                                     machine_id=machine, pod_uid=pod_uid,
-                                    host_key=host_key, sku=landed, adopted=True)
+                                    host_key=host_key, sku=landed, adopted=True,
+                                    price_per_hour=price)
         except Exception as e:  # noqa: BLE001 — never tear the live pod down; retry later
             res = _fail(f"live pod {live_name} could not be adopted: {e}", leaked_pod=live_name)
             return replace(res, error_class="infra", burn_attempt=False)

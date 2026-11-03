@@ -793,8 +793,13 @@ class FundingIntake:
         gate = self._lane_a_gate(reveal_block)
         if gate is not None:
             return gate
+        from .queue import _KEEP
+
+        # absent ⇒ keep the stored budget; 0 ⇒ clear it (review S3)
         outcome = self.queue.add(hotkey, ref, int(reveal_block), label=label,
-                                 gpu_choice=choice, max_total_spend_usd=budget)
+                                 gpu_choice=choice,
+                                 max_total_spend_usd=(_KEEP if budget is None
+                                                      else None if budget == 0 else budget))
         # Vault AFTER the queue accepts (mirrors PRISM: creds stored only once
         # the row is real) — and on every accepted outcome, so a re-fund of a
         # queued entry refreshes a key that may be nearing its TTL.

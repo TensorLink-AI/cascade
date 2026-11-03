@@ -572,7 +572,8 @@ successful one included. Before each rent, the operator projects your spend
 so far plus the next leg (its price × the expected wall + the boot
 timeout). If that would exceed the budget, no pod is rented and the entry
 pauses as `paused_budget`. It is never rejected; fund again with a higher
-budget to resume. The budget is part of the signed request.
+budget to resume. The budget is part of the signed request. A re-fund
+without the flag keeps your stored budget; `--max-total-spend 0` clears it.
 
 A leg already running is **never** killed for an overrun, so set a
 [Lium key budget](https://docs.lium.io/pod-users/api-keys#budgets) as the

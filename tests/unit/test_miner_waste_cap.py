@@ -49,8 +49,8 @@ def _seed(tmp_path, q, pods):
     now = time.time()
     rows = [{"pod_id": pid, "rate": rate, "start": now - 3600 * h - 1, "end": now - 1,
              "outcome": outcome, "kind": kind} for pid, rate, h, outcome, kind in pods]
-    (tmp_path / "miner_spend.json").write_text(json.dumps({"records": {HK: {
-        "ref": e.ref, "funded_at": e.funded_at, "pods": rows, "capped": False}}}))
+    (tmp_path / "miner_spend.json").write_text(json.dumps({"records": {f"{HK}::{e.ref}": {
+        "hotkey": HK, "ref": e.ref, "funded_at": e.funded_at, "pods": rows, "capped": False}}}))
 
 
 def _settle(r, q):
@@ -182,8 +182,8 @@ def _make_good_runner(tmp_path, monkeypatch):
     monkeypatch.setattr(funded_mod, "rent_funded_pod", lambda **kw: rents.append(kw) or _rent_ok())
     e = q.get("hkA")
     now = time.time()
-    (tmp_path / "miner_spend.json").write_text(json.dumps({"records": {"hkA": {
-        "ref": e.ref, "funded_at": e.funded_at, "capped": False, "pods": [
+    (tmp_path / "miner_spend.json").write_text(json.dumps({"records": {f"hkA::{e.ref}": {
+        "hotkey": "hkA", "ref": e.ref, "funded_at": e.funded_at, "capped": False, "pods": [
             {"pod_id": "p1", "rate": 20.0, "start": now - 7201, "end": now - 1,
              "outcome": "waste", "kind": "infra"}]}}}))
     return r, q, rents
@@ -339,7 +339,7 @@ def test_the_cli_flag_round_trips_through_the_intake(tmp_path):
     assert status >= 400 and intake.queue.get(GHK).max_total_spend_usd == 75.0
 
 
-@pytest.mark.parametrize("raw", ["-5", "0", "nan", "inf", "abc"])
+@pytest.mark.parametrize("raw", ["-5", "nan", "inf", "abc"])
 def test_the_intake_rejects_a_bad_budget(tmp_path, raw):
     from cascade.funding.gpu_choice import BUDGET_HEADER
     from cascade.miner.cli import build_fund_headers
@@ -350,3 +350,74 @@ def test_the_intake_rejects_a_bad_budget(tmp_path, raw):
     h = build_fund_headers("fund", GHK, GREF, "sk", _sign, now=_clock)
     status, body = _intake(tmp_path).fund({**h, BUDGET_HEADER: raw})
     assert status == 400 and body["code"] == "bad_max_total_spend"
+
+
+
+# ── pre-merge review: S1-S4 ─────────────────────────────────────────────────
+
+
+def test_a_refund_without_the_flag_keeps_the_budget_and_0_clears_it(tmp_path):
+    """S3: an absent header never silently drops the miner's budget."""
+    from cascade.funding.gpu_choice import BUDGET_HEADER
+    from cascade.miner.cli import build_fund_headers
+    from tests.unit.test_miner_chosen_gpu import HK as GHK
+    from tests.unit.test_miner_chosen_gpu import REF as GREF
+    from tests.unit.test_miner_chosen_gpu import _intake, _sign
+
+    intake = _intake(tmp_path)
+    t = [1_000_000.0]
+    intake.fund(build_fund_headers("fund", GHK, GREF, "sk", _sign, now=lambda: t[0],
+                                   max_total_spend=75.0))
+    t[0] += 1
+    intake.fund(build_fund_headers("fund", GHK, GREF, "sk", _sign, now=lambda: t[0]))
+    assert intake.queue.get(GHK).max_total_spend_usd == 75.0
+    t[0] += 1
+    h = build_fund_headers("fund", GHK, GREF, "sk", _sign, now=lambda: t[0], max_total_spend=0.0)
+    assert h[BUDGET_HEADER] == "0.0"
+    intake.fund(h)
+    assert intake.queue.get(GHK).max_total_spend_usd is None
+
+
+def test_lane_records_never_share_a_spend_history(tmp_path):
+    """S4: a lane-B start of the same hotkey keeps lane A's waste."""
+    led = MinerSpend(tmp_path / "miner_spend.json")
+    led.start(HK, ref="a@1", funded_at=1.0, pod_id="pa", rate=10.0)
+    led.end(HK, "pa", outcome="waste")
+    led.start(HK, ref="t1|b@1", funded_at=2.0, pod_id="pb", rate=10.0)
+    assert [p["pod_id"] for p in led.summary(HK, ref="a@1", funded_at=1.0).pods] == ["pa"]
+    assert [p["pod_id"] for p in led.summary(HK, ref="t1|b@1", funded_at=2.0).pods] == ["pb"]
+
+
+def test_a_vanished_pods_cost_stops_at_last_seen(tmp_path):
+    t = [1000.0]
+    led = MinerSpend(tmp_path / "miner_spend.json", clock=lambda: t[0])
+    led.start(HK, ref="a@1", funded_at=1.0, pod_id="p1", rate=36.0)
+    t[0] += 600
+    led.touch(HK, "p1")                                       # seen alive at +10 min
+    t[0] += 36_000                                            # ... then it vanished
+    assert led.close_missing([]) == 1
+    s = led.summary(HK, ref="a@1", funded_at=1.0)
+    assert s.waste_usd == pytest.approx(6.0) and s.pods[0]["end"] == 1600.0
+    t[0] += 10 ** 6
+    assert led.summary(HK, ref="a@1", funded_at=1.0).spend_usd == pytest.approx(6.0)
+
+
+def test_the_account_sweep_and_a_leaked_pod_close_their_records(tmp_path, monkeypatch):
+    """S1: every payer-pod teardown closes the record (never accrues at now)."""
+    import cascade.provision.funded as pf
+    from cascade.provision.funded import FundedRentResult
+
+    r, q, rents = _setup(tmp_path, monkeypatch)
+    led = MinerSpend(tmp_path / "miner_spend.json")
+    e = q.get(HK)
+    led.start(HK, ref=e.ref, funded_at=e.funded_at, pod_id="swept-0", rate=10.0)
+    monkeypatch.setattr(pf, "reconcile_funded", lambda *a, **k: ["swept-0"])
+    r._sweep_payer_account(HK, why="test")
+    assert led.summary(HK, ref=e.ref, funded_at=e.funded_at).pods[0]["outcome"] == "waste"
+    led.start(HK, ref=e.ref, funded_at=e.funded_at, pod_id="leak-0", rate=10.0)
+    monkeypatch.setattr(funded_mod, "rent_funded_pod", lambda **kw: FundedRentResult(
+        hotkey=HK, ok=False, error="boot failed", error_class="infra", leaked_pod="leak-0"))
+    with pytest.raises(_FundedLegSkip):
+        r._rent_funded_host("777", _challenger(HK))
+    pods = {p["pod_id"]: p for p in led.summary(HK, ref=e.ref, funded_at=e.funded_at).pods}
+    assert pods["leak-0"]["end"] is not None and pods["leak-0"]["outcome"] == "waste"

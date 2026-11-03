@@ -485,6 +485,12 @@ class _FundedPodMixin:
             if pods:
                 leftovers = teardown_funded(pods, vault)
                 gone = {x.instance_id for x in pods} - {x.instance_id for x in leftovers}
+                from .miner_spend_guard import spend_end
+
+                for x in pods:
+                    if x.instance_id in gone:      # the sweep's teardown (review S1)
+                        spend_end(self, x.payer_hotkey, x.instance_id, outcome="waste",
+                                  reason="swept without a harvested result")
                 with self._funded_ledger_lock:
                     # Only CONFIRMED-gone rows leave the ledger: a kept pod's
                     # row must survive, or the listing sweep below would read
@@ -497,10 +503,16 @@ class _FundedPodMixin:
                               "ledger for the next sweep",
                               inst.instance_id, inst.payer_hotkey)
             # Orphans of every payer without an in-flight leg.
-            reconcile_funded(self._load_funded_ledger(), vault,
-                             netuid=self.cfg.subnet.netuid, exclude=keep_payers,
-                             keep=lambda adapter, pod_id, hotkey: self._sweep_keeps_pod(
-                                 adapter, pod_id, what=f"payer {hotkey[:12]} off-ledger pod"))
+            killed = reconcile_funded(self._load_funded_ledger(), vault,
+                                      netuid=self.cfg.subnet.netuid, exclude=keep_payers,
+                                      keep=lambda adapter, pod_id, hotkey: self._sweep_keeps_pod(
+                                          adapter, pod_id,
+                                          what=f"payer {hotkey[:12]} off-ledger pod"))
+            from .miner_spend_guard import close_vanished, spend_end
+
+            for name in killed or ():
+                spend_end(self, "", str(name), outcome="waste", reason="off-ledger pod swept")
+            close_vanished(self)                     # open records of pods long gone
         except Exception as e:  # noqa: BLE001
             log.warning("funded pod reconcile failed (ignored): %s", e)
 
@@ -679,7 +691,13 @@ class _FundedPodMixin:
             return None, False
         if not callable(live):
             return None, False
-        return probe_pod_live(live, pod_id, sleep=getattr(self, "_rent_wait_sleep", None))
+        addr, definitive = probe_pod_live(live, pod_id,
+                                          sleep=getattr(self, "_rent_wait_sleep", None))
+        if addr is not None and pod is not None:
+            from .miner_spend_guard import spend_touch
+
+            spend_touch(self, pod.payer_hotkey, pod_id)        # seen alive
+        return addr, definitive
 
     def _payer_pod_provider(self, vault, pod):
         """``pod``'s payer-account adapter (its vaulted key), or None."""
@@ -1483,6 +1501,13 @@ class _FundedPodMixin:
             # (a leaked pod keeps its ledger row for the sweep).
             if not result.leaked_pod:
                 self._ledger_remove(expected_id)
+            else:
+                # a leaked pod: its record closes now (it produced nothing); the
+                # sweep keeps trying to stop it (review S1)
+                from .miner_spend_guard import spend_end
+
+                spend_end(self, gen.hotkey, result.leaked_pod, outcome="waste",
+                          reason="leaked: teardown not confirmed")
             msg = result.error
             if chosen is not None and result.error_class == "no_capacity":
                 msg = (f"no {chosen[0][0]} capacity (miner-chosen GPU, no fallback) before "

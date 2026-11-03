@@ -1436,7 +1436,8 @@ def add_gpu_args(p: argparse.ArgumentParser, *, budget: bool = False) -> None:
                         "spent plus the next leg's projected cost would exceed it (the entry "
                         "pauses, never rejected; fund again with a higher budget to resume). "
                         "A running leg is never killed — set a Lium key budget as the hard "
-                        "backstop. Default: no budget.")
+                        "backstop. A re-fund without this flag KEEPS the stored budget; "
+                        "--max-total-spend 0 clears it. Default: no budget.")
 
 
 def cli_gpu_choice(args: argparse.Namespace) -> tuple[str, bool, float | None] | None:
@@ -1582,9 +1583,10 @@ def _cmd_fund(args: argparse.Namespace) -> int:
     if budget is not None:
         import math
 
-        if not math.isfinite(budget) or budget <= 0:
+        if not math.isfinite(budget) or budget < 0:
             return reporter(args).fail("bad_max_total_spend",
-                                       "--max-total-spend must be a positive USD figure", USAGE)
+                                       "--max-total-spend must be a positive USD figure "
+                                       "(0 clears your budget)", USAGE)
     headers = build_fund_headers(
         action, prepared.hotkey, args.ref, prepared.api_key, prepared.sign_fn,
         label=prepared.label, gpu=prepared.choice[0], allow_fallback=prepared.choice[1],

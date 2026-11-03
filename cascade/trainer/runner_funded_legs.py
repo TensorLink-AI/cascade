@@ -615,8 +615,12 @@ class _FundedLegMixin:
         factory = self.__dict__.get("_funded_provider_factory") or lium_provider_for_key
         killed = reconcile_funded([], vault, netuid=self.cfg.subnet.netuid,
                                   provider_factory=factory, hotkeys=[hotkey])
+        from .miner_spend_guard import spend_end
+
         for name in killed:
             release_executor_of(self, name)
+            spend_end(self, hotkey, name, outcome="waste",       # the account sweep (S1)
+                      reason="account sweep without a harvested result")
         with self._funded_ledger_lock:
             self._save_funded_ledger([x for x in self._load_funded_ledger()
                                       if x.payer_hotkey != hotkey])
@@ -655,6 +659,9 @@ def _with_leg_watchdog(runner, disp, gen, pod, contract, host=None):
 
     def key_check():
         check_payer_key(runner, hotkey=gen.hotkey, pod_name=str(pod.instance_id), pod=pod)
+        from .miner_spend_guard import spend_touch
+
+        spend_touch(runner, gen.hotkey, str(pod.instance_id))    # seen alive (review S1)
 
     watch = leg_watchdog(runner, gen=gen, pod=pod, contract=contract,
                          key_check=key_check if payer else None,

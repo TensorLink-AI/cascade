@@ -1111,9 +1111,8 @@ class FundedQueue:
         spend = self._spend_view()
 
         def _spent(e: FundedEntry) -> dict:
-            s = spend.get(e.hotkey)
-            if not s or s.get("ref") != e.ref or (s.get("funded_at") is not None
-                                                  and float(s["funded_at"]) != e.funded_at):
+            s = spend.get((e.hotkey, e.ref))
+            if not s or (s.get("funded_at") is not None and float(s["funded_at"]) != e.funded_at):
                 return {}
             return {"miner_spend_usd": s["miner_spend_usd"], "miner_waste_usd": s["miner_waste_usd"],
                     "spend_usd": s["miner_spend_usd"]}

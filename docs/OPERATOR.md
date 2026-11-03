@@ -811,7 +811,8 @@ miner_waste_cap_usd` (30; 0 = off) pauses the entry as `paused_spend_cap`:
 
 **The miner's own total budget.** `cascade fund --max-total-spend USD` (lane
 A; header `X-Max-Total-Spend`, signed, positive) is stored on the entry as
-`max_total_spend_usd`; a re-fund may change it. Before every miner-key rent,
+`max_total_spend_usd`. A re-fund without the header keeps it; `0` clears
+it. Before every miner-key rent,
 all spend so far plus the next leg's projection must fit. Otherwise the
 entry parks `paused_budget`, with the same never-reject guarantees as the
 waste cap and one alert. A running leg is never killed for an overrun;

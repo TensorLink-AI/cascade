@@ -99,6 +99,19 @@ class MinerSpend:
             funded_at is None or r.get("funded_at") is None
             or float(r["funded_at"]) == float(funded_at))
 
+    # Records are keyed by (hotkey, entry ref): lane A and lane B / C entries
+    # of one hotkey never share (or erase) each other's history (review S4).
+
+    @staticmethod
+    def _key(hotkey: str, ref: str) -> str:
+        return f"{hotkey}::{ref}"
+
+    @staticmethod
+    def _of(recs: dict, hotkey: str | None):
+        for k, r in recs.items():
+            if hotkey is None or not hotkey or k.split("::", 1)[0] == hotkey:
+                yield k, r
+
     # ── the rent / teardown sites ────────────────────────────────────────────
 
     def start(self, hotkey: str, *, ref: str, funded_at: float | None, pod_id: str,
@@ -106,54 +119,89 @@ class MinerSpend:
         """A pod was allocated on the miner's key (idempotent per pod id; a
         known landed rate updates an earlier estimate)."""
         with self._locked() as recs:
-            r = recs.get(hotkey)
+            k = self._key(hotkey, ref)
+            r = recs.get(k)
             if not self._bound(r, ref, funded_at):
-                r = {"ref": ref, "funded_at": funded_at, "pods": [], "capped": False}
-            pods = r["pods"]
-            for p in pods:
+                r = {"hotkey": hotkey, "ref": ref, "funded_at": funded_at, "pods": [],
+                     "capped": False}
+            now = self.clock()
+            for p in r["pods"]:
                 if p["pod_id"] == pod_id and p.get("end") is None:
                     if rate:
                         p["rate"] = round(float(rate), 4)
+                    p["seen"] = now
                     break
             else:
-                pods.append({"pod_id": pod_id, "rate": round(float(rate or 0), 4),
-                             "start": self.clock(), "end": None, "outcome": None})
-            recs[hotkey] = r
+                r["pods"].append({"pod_id": pod_id, "rate": round(float(rate or 0), 4),
+                                  "start": now, "seen": now, "end": None, "outcome": None})
+            recs[k] = r
             self._save(recs)
 
-    def end(self, hotkey: str, pod_id: str, *, outcome: str, reason: str = "",
+    def end(self, hotkey: str | None, pod_id: str, *, outcome: str, reason: str = "",
             kind: str = INFRA) -> None:
-        """Close the open record of ``pod_id`` (no-op when none is open)."""
+        """Close the open record of ``pod_id`` (any of the hotkey's
+        submissions; ``hotkey`` None/"" = any hotkey). No-op when none is open."""
         with self._locked() as recs:
-            r = recs.get(hotkey)
-            if not r:
-                return
             changed = False
-            for p in r["pods"]:
-                if p["pod_id"] == pod_id and p.get("end") is None:
-                    p.update(end=self.clock(), outcome=outcome, reason=reason[:200],
-                             kind=kind)
-                    changed = True
+            for _k, r in self._of(recs, hotkey):
+                for p in r["pods"]:
+                    if p["pod_id"] == pod_id and p.get("end") is None:
+                        p.update(end=self.clock(), outcome=outcome, reason=reason[:200],
+                                 kind=kind)
+                        changed = True
             if changed:
                 self._save(recs)
 
-    def mark_capped(self, hotkey: str, capped: bool = True) -> None:
+    def touch(self, hotkey: str, pod_id: str) -> None:
+        """The pod was seen alive now (the cap for a later vanish)."""
         with self._locked() as recs:
-            if hotkey in recs:
-                recs[hotkey]["capped"] = bool(capped)
+            changed = False
+            for _k, r in self._of(recs, hotkey):
+                for p in r["pods"]:
+                    if p["pod_id"] == pod_id and p.get("end") is None:
+                        p["seen"] = self.clock()
+                        changed = True
+            if changed:
+                self._save(recs)
+
+    def close_missing(self, alive_ids) -> int:
+        """Close open records whose pod no longer exists (not on the funded
+        ledger): ended at its LAST-SEEN-ALIVE time, never ``now`` — a vanished
+        pod's cost never grows (review S1). Returns how many were closed."""
+        alive = set(alive_ids)
+        with self._locked() as recs:
+            n = 0
+            for _k, r in recs.items():
+                for p in r["pods"]:
+                    if p.get("end") is None and p["pod_id"] not in alive:
+                        p.update(end=p.get("seen") or p.get("start"), outcome=WASTE,
+                                 reason="pod gone without a result", kind=INFRA)
+                        n += 1
+            if n:
+                self._save(recs)
+            return n
+
+    def mark_capped(self, hotkey: str, ref: str, capped: bool = True) -> None:
+        with self._locked() as recs:
+            k = self._key(hotkey, ref)
+            if k in recs:
+                recs[k]["capped"] = bool(capped)
                 self._save(recs)
 
     def reset(self, hotkey: str) -> None:
         """The owner's resume (``--reset-spend``): a fresh count."""
         with self._locked() as recs:
-            if recs.pop(hotkey, None) is not None:
+            gone = [k for k, _r in self._of(recs, hotkey)]
+            for k in gone:
+                recs.pop(k, None)
+            if gone:
                 self._save(recs)
 
     # ── reads ────────────────────────────────────────────────────────────────
 
     def summary(self, hotkey: str, *, ref: str, funded_at: float | None) -> Spend:
         with self._locked() as recs:
-            r = recs.get(hotkey)
+            r = recs.get(self._key(hotkey, ref))
         if not self._bound(r, ref, funded_at):
             return Spend(0.0, 0.0, 0.0, (), False)
         now = self.clock()
@@ -164,17 +212,17 @@ class MinerSpend:
                      round(sum(_cost(p, now) for p in waste if p.get("kind", INFRA) == INFRA), 2),
                      pods, bool(r.get("capped")))
 
-    def public(self) -> dict[str, dict]:
-        """``{hotkey: {miner_spend_usd, miner_waste_usd}}`` (rounded dollars)."""
+    def public(self) -> dict[tuple[str, str], dict]:
+        """``{(hotkey, ref): {miner_spend_usd, miner_waste_usd, funded_at}}``."""
         try:
             with self._locked() as recs:
-                hks = list(recs)
-                refs = {hk: (recs[hk].get("ref"), recs[hk].get("funded_at")) for hk in hks}
+                rows = [(r.get("hotkey") or k.split("::", 1)[0], r.get("ref"), r.get("funded_at"))
+                        for k, r in recs.items()]
         except SpendUnknown:
             return {}
         out = {}
-        for hk in hks:
-            s = self.summary(hk, ref=refs[hk][0], funded_at=refs[hk][1])
-            out[hk] = {"miner_spend_usd": round(s.spend_usd), "miner_waste_usd": round(s.waste_usd),
-                       "ref": refs[hk][0], "funded_at": refs[hk][1]}
+        for hk, ref, fa in rows:
+            s = self.summary(hk, ref=ref, funded_at=fa)
+            out[(hk, ref)] = {"miner_spend_usd": round(s.spend_usd),
+                              "miner_waste_usd": round(s.waste_usd), "funded_at": fa}
         return out
