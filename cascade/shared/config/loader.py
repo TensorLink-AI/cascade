@@ -468,6 +468,8 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
             worker_code_fingerprint=str(r.get("worker_code_fingerprint", "")).strip().lower(),
             funded_ready_timeout_seconds=float(
                 r.get("funded_ready_timeout_seconds", RoundConfig.funded_ready_timeout_seconds)),
+            make_good_rerun_below_usd=max(0.0, float(
+                r.get("make_good_rerun_below_usd", RoundConfig.make_good_rerun_below_usd))),
             funded_robot_duration_days=max(1, int(r.get("funded_robot_duration_days", 1))),
             funded_pod_checkpoint=str(r.get("funded_pod_checkpoint", "harvest")),
             **parse_ckpt_transport(r),
