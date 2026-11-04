@@ -149,7 +149,9 @@ def main(argv: list[str] | None = None) -> int:
         from .operator_legs_cli import main as operator_legs_main
 
         return operator_legs_main(raw)
+    from ..shared.codepath import verify_release_code_path
     from ..shared.env import load_env_files
+    verify_release_code_path("cascade-trainer")
     load_env_files()
     args = _build_parser().parse_args(argv)
     if args.direct_runtime_config is not None:

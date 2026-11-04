@@ -842,8 +842,56 @@ def test_payer_side_evidence_proves_a_miner_cause():
     # a stopped / absent pod is NOT proof (platform, host, our TTL): ended only
     ev = payer_loss_evidence(_payer_runner(None, status="STOPPED"), pod)
     assert ev["miner"] is False and ev["ended"] is True
-    ev = payer_loss_evidence(_payer_runner(None, status=None), pod)
+    ev = payer_loss_evidence(_payer_runner(None, status=None), pod, recheck_sleep=lambda s: None)
     assert ev["pod_status"] == "absent" and ev["miner"] is False and ev["ended"] is True
+    assert ev["known"] is True
+
+
+def test_unknown_evidence_never_says_ended(monkeypatch):
+    """2026-11-04: an unanswered listing (adapter error, no key, API hiccup)
+    is NOT evidence that the pod ended — ``known`` is False, ``ended`` False."""
+    from cascade.trainer.runner_funded_legs import payer_loss_evidence
+
+    pod = _pod("p-0", payer=HK)
+    vault = SimpleNamespace(get=lambda hk: "sk-payer")
+
+    class _Boom:
+        def _pod(self, pod_id):
+            raise RuntimeError("lium: 502")
+
+    r = SimpleNamespace(_payer_vault=lambda: vault, _payer_pod_provider=lambda v, pod: _Boom(),
+                        _payer_balance_reader=lambda key: 50.0)
+    ev = payer_loss_evidence(r, pod)
+    assert ev["known"] is False and ev["ended"] is False and ev["miner"] is False
+    # no adapter at all (no key): the same
+    r2 = SimpleNamespace(_payer_vault=lambda: vault, _payer_pod_provider=lambda v, pod: None,
+                         _payer_balance_reader=lambda key: 50.0)
+    ev = payer_loss_evidence(r2, pod)
+    assert ev["known"] is False and ev["ended"] is False
+    # a single listing miss is re-checked before 'absent' is believed
+    seen = []
+
+    class _Flaky:
+        def _pod(self, pod_id):
+            seen.append(1)
+            return None if len(seen) == 1 else {"status": "RUNNING"}
+
+    r3 = SimpleNamespace(_payer_vault=lambda: vault, _payer_pod_provider=lambda v, pod: _Flaky(),
+                         _payer_balance_reader=lambda key: 50.0)
+    ev = payer_loss_evidence(r3, pod, recheck_sleep=lambda s: None)
+    assert ev["pod_status"] == "RUNNING" and ev["ended"] is False and len(seen) == 2
+
+
+def test_teardown_books_the_leg_verdict_not_blanket_infra():
+    from cascade.funding.miner_spend import INFRA, MINER, UNPROVEN
+    from cascade.trainer.runner_funded_pods import teardown_spend_kind
+
+    assert teardown_spend_kind(None) == (INFRA, False, "")
+    assert teardown_spend_kind(("x", False, "infra")) == (INFRA, False, " [infra]")
+    assert teardown_spend_kind(("x", True, "generator"))[0] == MINER
+    assert teardown_spend_kind(("x", False, "payer_side"))[0] == MINER
+    kind, last_seen, why = teardown_spend_kind(("x", False, "payer_pod_lost"))
+    assert (kind, last_seen) == (UNPROVEN, True) and "unproven" in why
 
 
 def test_a_watchdog_abort_with_a_foreign_gpu_hog_is_the_miners(monkeypatch):

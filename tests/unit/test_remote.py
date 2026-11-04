@@ -834,3 +834,92 @@ def test_attached_pushed_receipt_role_mismatch_is_rejected(monkeypatch):
     with pytest.raises(RemoteDispatchError, match="receipt role"):
         disp.dispatch(_isolated_host(), lane_count=1, gen_ref=REF_A,
                       uid=1, hotkey="hkA", role="king", base_seed=7, block=12)
+
+
+# ── harvest stream retry (2026-11-04): one broken stream never loses a run ──
+
+
+def _truncated_tar(tmp_path, name="trunc.tar"):
+    whole = _tar_bytes([("./weights.safetensors", b"W" * 4096), ("./config.json", b"{}")])
+    p = tmp_path / name
+    p.write_bytes(whole[: len(whole) // 2])      # EOF mid-archive
+    return p
+
+
+def _no_sleep(monkeypatch):
+    monkeypatch.setattr(remote_mod.time, "sleep", lambda s: None)
+
+
+def test_harvest_retries_a_broken_stream_while_the_pod_answers(tmp_path, monkeypatch):
+    _no_sleep(monkeypatch)
+    bad = _truncated_tar(tmp_path)
+    good = tmp_path / "ok.tar"
+    good.write_bytes(_tar_bytes([("./weights.safetensors", b"W" * 8), ("./config.json", b"{}")]))
+    calls: list[str] = []
+
+    def argv(host, cmd):
+        calls.append(cmd)
+        return ["cat", str(bad if len(calls) == 1 else good)]
+
+    monkeypatch.setattr(remote_mod, "build_ssh_argv", argv)
+    monkeypatch.setattr(remote_mod, "remote_dir_reachable", lambda h, d: True)
+    dest = remote_mod.harvest_remote_dir(RemoteHost(name="p", host="h"), "/w/checkpoint",
+                                         tmp_path / "out")
+    assert (dest / "weights.safetensors").read_bytes() == b"W" * 8
+    assert len(calls) == 2
+    assert not list(tmp_path.glob("out.partial-*"))
+
+
+def test_harvest_keeps_a_reachable_pod_after_the_retry_budget(tmp_path, monkeypatch):
+    _no_sleep(monkeypatch)
+    bad = _truncated_tar(tmp_path)
+    monkeypatch.setattr(remote_mod, "build_ssh_argv", lambda h, c: ["cat", str(bad)])
+    monkeypatch.setattr(remote_mod, "remote_dir_reachable", lambda h, d: True)
+    with pytest.raises(remote_mod.RemoteDispatchError) as ei:
+        remote_mod.harvest_remote_dir(RemoteHost(name="p", host="h"), "/w/checkpoint",
+                                      tmp_path / "out")
+    e = ei.value
+    assert isinstance(e, remote_mod.HarvestStreamError)
+    assert e.pod_reachable is True and e.keep_pod is True
+    assert f"attempt {remote_mod.HARVEST_STREAM_ATTEMPTS}/{remote_mod.HARVEST_STREAM_ATTEMPTS}" in str(e)
+    assert "still reachable" in str(e)
+    from cascade.trainer.harvest_guard import keeps_pod
+    assert keeps_pod(e)                        # the leg handler holds the pod
+
+
+def test_harvest_fails_fast_when_the_pod_is_gone(tmp_path, monkeypatch):
+    _no_sleep(monkeypatch)
+    bad = _truncated_tar(tmp_path)
+    calls = []
+    monkeypatch.setattr(remote_mod, "build_ssh_argv",
+                        lambda h, c: (calls.append(c), ["cat", str(bad)])[1])
+    monkeypatch.setattr(remote_mod, "remote_dir_reachable", lambda h, d: False)
+    with pytest.raises(remote_mod.RemoteDispatchError) as ei:
+        remote_mod.harvest_remote_dir(RemoteHost(name="p", host="h"), "/w/checkpoint",
+                                      tmp_path / "out")
+    e = ei.value
+    assert e.pod_reachable is False and not getattr(e, "keep_pod", False)
+    assert len(calls) == 1                     # no retry against a dead pod
+    assert "unreachable" in str(e) and "ssh rc=" in str(e)
+
+
+def test_remote_dir_reachable_probe():
+    import types as _t
+
+    host = RemoteHost(name="p", host="h")
+    ok = lambda argv, timeout, stdin: _t.SimpleNamespace(returncode=0, stdout="HARVEST_DIR_OK\n")  # noqa: E731
+    gone = lambda argv, timeout, stdin: _t.SimpleNamespace(returncode=255, stdout="")  # noqa: E731
+    assert remote_mod.remote_dir_reachable(host, "/w/ck", runner=ok) is True
+    assert remote_mod.remote_dir_reachable(host, "/w/ck", runner=gone) is False
+
+    def raises(argv, timeout, stdin):
+        raise OSError("no route")
+
+    assert remote_mod.remote_dir_reachable(host, "/w/ck", runner=raises) is False
+
+
+def test_error_tail_keeps_the_head_of_a_one_line_message():
+    msg = "payer pod ended mid-leg ({'pod_status': 'absent'}): checkpoint harvest failed " * 3
+    out = remote_mod.error_tail(msg, 80)
+    assert out.startswith("payer pod ended") and out.endswith("harvest failed ")
+    assert " … " in out and len(out) <= 83

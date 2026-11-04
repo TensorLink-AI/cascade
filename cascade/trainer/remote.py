@@ -58,7 +58,11 @@ def error_tail(text: object, limit: int = 300) -> str:
         return s
     lines = [ln.rstrip() for ln in s.splitlines() if ln.strip()]
     if len(lines) <= 1:
-        return s[-limit:]
+        # one line: keep the HEAD (what failed) and the tail (why) — a bare
+        # ``s[-limit:]`` logged ``alse, 'ended': True})`` for a lost leg
+        # (2026-11-04)
+        head_n = max(1, limit // 2 - 2)
+        return s[:head_n] + " … " + s[-(limit - head_n - 3):]
     head = lines[0]
     if len(head) > limit // 2:
         head = head[: limit // 2 - 1] + "…"
@@ -74,6 +78,17 @@ def error_tail(text: object, limit: int = 300) -> str:
         last = lines[-1]
         tail = [last if len(last) <= budget else "…" + last[-(budget - 1):]]
     return head + " … " + "\n".join(reversed(tail))
+
+
+class HarvestStreamError(RuntimeError):
+    """The checkpoint harvest stream broke (truncated / malformed archive)
+    and did not recover within :data:`HARVEST_STREAM_ATTEMPTS` attempts.
+
+    ``pod_reachable`` says whether the pod still answered ssh after the LAST
+    break: True → the checkpoint is still on the pod, so the leg handler keeps
+    the pod for a re-attach instead of tearing it down (``keep_pod``); False →
+    the pod is gone and the loss is classified from the payer's evidence as
+    before. Raised as a :class:`RemoteDispatchError` subclass (below)."""
 
 
 class RemoteDispatchError(RuntimeError):
@@ -1571,6 +1586,13 @@ HARVEST_HARD_CAP_SECONDS = 6 * 3600
 # follow-up): an average since start let a fast-start-then-trickle stream
 # live ~3.9 h on its early bytes.
 HARVEST_RATE_WINDOW_SECONDS = 600.0
+# A broken stream (early EOF / malformed archive, NOT a watchdog breach) is
+# retried while the pod still answers: up to this many attempts in all, with
+# a short backoff. 2026-11-04: one truncated stream failed a FINISHED leg
+# outright and the pod was torn down with the only checkpoint copy on it.
+HARVEST_STREAM_ATTEMPTS = 3
+HARVEST_STREAM_RETRY_BACKOFF_SECONDS = 20.0
+HARVEST_REACH_PROBE_SECONDS = 45
 
 
 def harvest_total_breach(elapsed: float, nbytes: int, timeout: float, *,
@@ -1662,18 +1684,60 @@ def harvest_remote_dir(host: RemoteHost, remote_dir: str, dest: Path | str,
     # never looks complete, and any failure (ENOSPC mid-write included)
     # removes the partial copy instead of leaving it to fill the disk.
     work = dest.with_name(f"{dest.name}.partial-{os.getpid()}-{threading.get_ident()}")
-    shutil.rmtree(work, ignore_errors=True)
-    work.mkdir(parents=True)
-    try:
-        _harvest_stream_into(host, remote_dir, argv, work, timeout=timeout,
-                             stall_timeout=stall_timeout, max_bytes=max_bytes)
-        _fsync_tree(work)
-        os.replace(work, dest)
-        _fsync_dir(dest.parent)
-    except BaseException:
+    for attempt in range(1, HARVEST_STREAM_ATTEMPTS + 1):
         shutil.rmtree(work, ignore_errors=True)
-        raise
-    return dest
+        work.mkdir(parents=True)
+        try:
+            _harvest_stream_into(host, remote_dir, argv, work, timeout=timeout,
+                                 stall_timeout=stall_timeout, max_bytes=max_bytes)
+            _fsync_tree(work)
+            os.replace(work, dest)
+            _fsync_dir(dest.parent)
+            return dest
+        except RemoteDispatchError as e:
+            shutil.rmtree(work, ignore_errors=True)
+            if not _is_broken_stream(e):
+                raise                   # a watchdog breach / refusal: not retried
+            reachable = remote_dir_reachable(host, remote_dir)
+            if not reachable or attempt >= HARVEST_STREAM_ATTEMPTS:
+                raise _HarvestStreamFailure(
+                    f"{e} [stream attempt {attempt}/{HARVEST_STREAM_ATTEMPTS}; pod "
+                    f"{'still reachable — kept' if reachable else 'unreachable'}]",
+                    pod_reachable=reachable) from e
+            log.warning("harvest from %s:%s: broken stream on attempt %d/%d (%s); pod still "
+                        "answers — retrying in %.0fs", host.name, remote_dir, attempt,
+                        HARVEST_STREAM_ATTEMPTS, error_tail(e, 160),
+                        HARVEST_STREAM_RETRY_BACKOFF_SECONDS)
+            time.sleep(HARVEST_STREAM_RETRY_BACKOFF_SECONDS)
+        except BaseException:
+            shutil.rmtree(work, ignore_errors=True)
+            raise
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def _is_broken_stream(e: RemoteDispatchError) -> bool:
+    """A truncated/malformed archive (retryable) vs a watchdog breach."""
+    return "malformed archive" in str(e) and "timed out" not in str(e)
+
+
+class _HarvestStreamFailure(RemoteDispatchError, HarvestStreamError):
+    def __init__(self, msg: str, *, pod_reachable: bool) -> None:
+        RemoteDispatchError.__init__(self, msg)
+        self.pod_reachable = bool(pod_reachable)
+        # harvest_guard.keeps_pod(): a reachable pod still holds the checkpoint
+        self.keep_pod = bool(pod_reachable)
+
+
+def remote_dir_reachable(host: RemoteHost, remote_dir: str, *, runner=None,
+                         timeout: int = HARVEST_REACH_PROBE_SECONDS) -> bool:
+    """Does ``host`` still answer ssh AND hold ``remote_dir``? Read-only."""
+    run = runner or run_ssh
+    cmd = f"cd {shlex.quote(host.workdir)} && test -d {shlex.quote(remote_dir)} && echo HARVEST_DIR_OK"
+    try:
+        p = run(build_ssh_argv(host, cmd), timeout, "")
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return p.returncode == 0 and "HARVEST_DIR_OK" in (p.stdout or "")
 
 
 def _fsync_dir(path: Path) -> None:
@@ -1758,11 +1822,17 @@ def _harvest_stream_into(host, remote_dir: str, argv: list[str], dest: Path, *,
             tf.extractall(dest, filter=checked_member)
     except tarfile.TarError as e:
         stop.set()
+        rc = ssh.poll()                 # already exited (pod gone / tar died)?
         ssh.kill()
         ssh.wait()
+        err_tail = ""
+        with contextlib.suppress(Exception):
+            err_tail = (ssh.stderr.read() or b"").decode("utf-8", "replace").strip()[-300:]
+        evidence = f" [ssh rc={rc if rc is not None else 'running'}" + (
+            f"; stderr: {err_tail}]" if err_tail else "]")
         raise (_timed_out() or RemoteDispatchError(
             f"checkpoint harvest from {host.name}:{remote_dir}: refused or "
-            f"malformed archive: {e}")) from e
+            f"malformed archive: {e}{evidence}", returncode=rc)) from e
     except Exception as e:
         stop.set()
         ssh.kill()

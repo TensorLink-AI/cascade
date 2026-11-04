@@ -412,8 +412,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from ..shared.codepath import verify_release_code_path
     from ..shared.env import load_env_files
 
+    verify_release_code_path("cascade-provisioner")
     load_env_files()
     args = _build_parser().parse_args(argv)
     logging.basicConfig(level=args.log_level,

@@ -47,6 +47,33 @@ def _parse_funded_ledger(text):
     return [PodInstance(**{k: v for k, v in d.items() if k in known}) for d in raw]
 
 
+def teardown_spend_kind(verdict) -> tuple[str, bool, str]:
+    """How a pod torn down after a failed leg is booked on the miner's spend
+    ledger: ``(kind, at_last_seen, reason suffix)`` from the leg's recorded
+    verdict ``(text, miner_fault, error_class)``.
+
+    2026-11-04: every teardown booked ``INFRA`` waste, so a pod that vanished
+    mid-leg with no proof of whose doing (``payer_pod_lost``) filed an
+    operator make-good for the whole rent — against the rule that only OUR
+    faults are made good. A payer-side / miner-fault verdict books ``MINER``;
+    an unproven loss books ``UNPROVEN`` (excluded from the infra-waste make-
+    good trigger) closed at the pod's last-seen-alive time; anything else
+    stays ``INFRA`` (our side)."""
+    from ..funding.miner_spend import INFRA, MINER, UNPROVEN
+
+    if not verdict:
+        return INFRA, False, ""
+    try:
+        _text, miner_fault, error_class = verdict[0], bool(verdict[1]), str(verdict[2] or "")
+    except (IndexError, TypeError):
+        return INFRA, False, ""
+    if miner_fault or error_class in ("payer_side", "payer_interference"):
+        return MINER, False, f" [{error_class or 'miner'}]"
+    if error_class == "payer_pod_lost":
+        return UNPROVEN, True, " [payer_pod_lost: cause unproven]"
+    return INFRA, False, f" [{error_class}]" if error_class else ""
+
+
 def _entry_gpu_choice(entry, ref: str):
     """The GPU choice (DEC-CA-0060) of ``entry`` when it is the in-flight
     lane-A entry for ``ref``, else the default ``GpuChoice()`` — a king leg on
@@ -2179,9 +2206,12 @@ class _FundedPodMixin:
         # miner: close its spend record as waste (a no-op after a result).
         from .miner_spend_guard import spend_end
 
+        kind, at_last_seen, why = teardown_spend_kind(
+            self._funded_leg_failures.get(str(getattr(pod, "payer_hotkey", "") or "")))
         spend_end(self, str(getattr(pod, "payer_hotkey", "") or ""),
                   str(getattr(pod, "instance_id", "") or ""), outcome="waste",
-                  reason="torn down without a harvested result")
+                  reason=f"torn down without a harvested result{why}", kind=kind,
+                  at_last_seen=at_last_seen)
         # The leg is over: its Hub robot dies first, whatever the pod does.
         self._revoke_robot(pod)
         vault = self._payer_vault()
