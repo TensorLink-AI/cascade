@@ -1544,6 +1544,17 @@ class _FundedPodMixin:
                         # a lemon or any allocated-then-failed rent (no ssh
                         # key pin, no identity): the host's / our fault — an
                         # operator make-good of its cost, never their waste
+                        if getattr(result, "create_refused", False):
+                            # The platform refused the create: nothing was ever
+                            # allocated or billed — closed at its start, $0
+                            # (before any re-price, which would move last-seen).
+                            from .miner_spend_guard import INFRA as _INFRA
+
+                            spend_end(self, gen.hotkey, pod_id, outcome=MAKE_GOOD, kind=_INFRA,
+                                      at_last_seen=True,
+                                      reason=f"create refused by the platform (nothing "
+                                             f"allocated): {str(result.error)[:100]}")
+                            continue
                         lemon = result.error_class != "auth"
                         landed = getattr(result, "price_per_hour", None)
                         if landed:

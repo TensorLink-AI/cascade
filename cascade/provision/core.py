@@ -837,6 +837,18 @@ def parse_lium_executors(stdout: str) -> list[dict]:
     return data
 
 
+# ``lium up`` output that means the platform refused the create itself (the
+# executor is gone), as opposed to a create whose outcome is unknown.
+_LIUM_UP_REJECTED = (("node with id", "not found"), ("executor", "not found"),
+                     ("no such node",), ("node not found",))
+
+
+def lium_up_rejected(output: str) -> bool:
+    """True when ``lium up`` output says the platform refused the create."""
+    low = (output or "").lower()
+    return any(all(m in low for m in group) for group in _LIUM_UP_REJECTED)
+
+
 def parse_lium_pods(stdout: str) -> list[dict]:
     """Parse ``lium ps --format json`` → list of pod dicts (``[]`` if none)."""
     text = (stdout or "").strip()
@@ -1608,6 +1620,11 @@ class LiumProvider:
     def create_unresolved(self, pod_id: str) -> bool:
         return bool(self.__dict__.get("_unresolved_creates", {}).get(pod_id))
 
+    def create_rejected(self, pod_id: str) -> bool:
+        """The platform refused ``pod_id``'s ``lium up`` outright (see
+        :func:`lium_up_rejected`) and it never listed: nothing was allocated."""
+        return pod_id in self.__dict__.get("_rejected_creates", set())
+
     def create_requested(self, pod_id: str) -> bool:
         """A ``lium up`` for ``pod_id`` was issued by this instance. False when
         ``launch`` failed before it (the ``lium ls`` listing, the template):
@@ -1699,6 +1716,16 @@ class LiumProvider:
                             pod_id, LIUM_APPEAR_TIMEOUT, tail[-400:] or "(no up log captured)")
                 from ..funding.faults import is_auth_or_permission, is_funding_failure
 
+                if lium_up_rejected(tail):
+                    # The platform REFUSED the create itself (2026-11-04: "Node with
+                    # ID '<executor>' not found" — the executor vanished between the
+                    # listing and the rent): nothing was allocated, so the create is
+                    # resolved as never made. Left unresolved it read as a possibly
+                    # LEAKED pod and blocked the leg until the epoch ended.
+                    self.__dict__.setdefault("_unresolved_creates", {})[pod_id] = False
+                    self.__dict__.setdefault("_rejected_creates", set()).add(pod_id)
+                    log.warning("lium pod %s: `lium up` was refused by the platform (%s) — "
+                                "nothing was created", pod_id, tail[-160:])
                 if is_funding_failure(tail) or is_auth_or_permission(tail):
                     # The account refused the rent (2026-10-29: Lium 403 "renting
                     # needs a balance above 15 minutes of the node's hourly
@@ -1927,8 +1954,11 @@ class LiumProvider:
         # The vacated executor deploys nothing for a while: keep every listing
         # (ours and each payer's) off it until the cooldown passes.
         record_executor_cooldown(executor)
-        if rm_error and self.create_unresolved(pod_id):
-            self._settle_ghost(pod_id, rm_error)
+        if self.create_unresolved(pod_id):
+            # `lium rm` by name can exit 0 for a target that never existed, so a
+            # clean rm is no evidence either way — the listings decide
+            # (_settle_ghost still refuses on an auth / rate-limit rm error).
+            self._settle_ghost(pod_id, rm_error or "no such pod (rm exited cleanly)")
 
     def list_tagged(self, prefix: str) -> list[str]:
         """Live pod names starting with ``prefix`` (Lium addresses pods by name)."""

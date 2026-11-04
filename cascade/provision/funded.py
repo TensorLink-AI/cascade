@@ -249,6 +249,10 @@ class FundedRentResult:
     # DISTINCT executors instead of racing for the listing's first row.
     machine_id: str = ""
     adopted: bool = False           # a live pod of this name was reused, not rented
+    # The platform refused every create of this attempt outright (``lium up``:
+    # "Node with ID … not found"): nothing was allocated, so nothing billed —
+    # the caller books the rent at zero cost and never as a leak.
+    create_refused: bool = False
     burn_attempt: bool = False      # True only for "infra" (the taxonomy's rule)
     # Platform identity of the pod that answered (Lium pod id + huid) and the
     # container's SSH host key, both read once the pod is READY: the trainer
@@ -540,8 +544,18 @@ def rent_funded_pod(
         if launched and callable(price_fn):
             with contextlib.suppress(Exception):
                 failed_price = price_fn(launched[0])
+        rejected = getattr(provider, "create_rejected", lambda _pid: False)
+        refused = bool(launched) and all(rejected(pid) for pid in launched)
         for pid in launched:
             try:
+                if rejected(pid):
+                    # The platform refused this create: nothing of THIS rent
+                    # exists. A same-named pod still listed is an earlier rent
+                    # being torn down (names are reused per leg), never a leak
+                    # of this one — terminate it again, best effort.
+                    with contextlib.suppress(Exception):
+                        provider.terminate(pid)
+                    continue
                 if not terminate_verified(provider, pid):
                     raise ProvisionError("still listed live after terminate")
             except Exception as te:  # noqa: BLE001 — record loudly; never silent
@@ -572,6 +586,8 @@ def rent_funded_pod(
 
             forget_lease(vault, credential_id)
         res = _fail(e, leaked_pod=leaked)
+        if refused and not leaked:
+            res = replace(res, create_refused=True)
         if leaked:
             res = replace(res, burn_attempt=False)
         if isinstance(e, LemonPodError):
