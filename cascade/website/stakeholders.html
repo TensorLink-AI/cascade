@@ -909,6 +909,11 @@ function v2Scope(idx){
     return b>=from;
   });
   out.v2_from_block=from; out.pre_v2_rounds=idx.rounds.length-out.rounds.length;
+  // v2 not announced yet (no status/v2.json block) and nothing settled at or
+  // after the fallback block: there is no v2 history to show — keep the index
+  // whole rather than render an empty competition
+  var announced=!!(_v2&&_v2.golive&&Number(_v2.golive.from_block)>0);
+  if(!out.rounds.length&&!announced) return idx;
   return out;
 }
 var _bench = {}, _benchMissing = {}, _benchInflight = {};
