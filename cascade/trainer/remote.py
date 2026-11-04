@@ -1715,9 +1715,18 @@ def harvest_remote_dir(host: RemoteHost, remote_dir: str, dest: Path | str,
     raise AssertionError("unreachable")  # pragma: no cover
 
 
+_BROKEN_STREAM_MARKERS = ("unexpected end of data", "truncated", "empty file", "empty header")
+
+
 def _is_broken_stream(e: RemoteDispatchError) -> bool:
-    """A truncated/malformed archive (retryable) vs a watchdog breach."""
-    return "malformed archive" in str(e) and "timed out" not in str(e)
+    """A stream that ENDED early (retryable: the pod or the link dropped) vs a
+    watchdog breach or a refused archive (``..`` members, symlink escapes, a
+    continuation over its storage limit — a hostile or oversized archive is
+    never re-pulled)."""
+    text = str(e)
+    if "timed out" in text or "malformed archive" not in text:
+        return False
+    return any(m in text for m in _BROKEN_STREAM_MARKERS)
 
 
 class _HarvestStreamFailure(RemoteDispatchError, HarvestStreamError):
@@ -1735,9 +1744,9 @@ def remote_dir_reachable(host: RemoteHost, remote_dir: str, *, runner=None,
     cmd = f"cd {shlex.quote(host.workdir)} && test -d {shlex.quote(remote_dir)} && echo HARVEST_DIR_OK"
     try:
         p = run(build_ssh_argv(host, cmd), timeout, "")
-    except (subprocess.TimeoutExpired, OSError):
+        return p.returncode == 0 and "HARVEST_DIR_OK" in (p.stdout or "")
+    except Exception:  # noqa: BLE001 — any failure to ask = not proven reachable
         return False
-    return p.returncode == 0 and "HARVEST_DIR_OK" in (p.stdout or "")
 
 
 def _fsync_dir(path: Path) -> None:
