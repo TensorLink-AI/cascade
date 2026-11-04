@@ -963,6 +963,19 @@ def test_a_rejected_receipt_of_our_settlement_raises_one_alert(tmp_path):
                                              reader=lambda: json.dumps(other)) is None
 
 
+def test_a_no_contest_receipt_is_not_a_rejection(tmp_path):
+    """2026-11-04 07:32: a king-only settlement (status "rejected", reason
+    no_king_challenger_pair — the validator's designed no-contest) raised a
+    critical "settlement_rejected" for the king's own era leg. No leg lost a
+    result there: never an alert."""
+    r = _runner(tmp_path, receipt_watch_validator_hotkey="5Val")
+    money_watch.note_published_settlement(r, SimpleNamespace(
+        round_id="r-k", entries=[SimpleNamespace(miner_hotkey=HK)]))
+    doc = {"round_id": "r-k", "status": "rejected", "reject_reason": "no_king_challenger_pair"}
+    assert money_watch.rejected_receipt_tick(r, now=1000.0, reader=lambda: json.dumps(doc)) is None
+    assert not [c for c in money_guard.health_conditions(r, {}) if c["code"] == "settlement_rejected"]
+
+
 # ── G: approvals have a default cost ceiling ────────────────────────────────
 
 
