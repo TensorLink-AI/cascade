@@ -77,5 +77,6 @@ def test_knob_and_timeout_defaults_and_parse(tmp_path):
     p.write_text(src.replace("\n[round]\n", "\n[round]\nmake_good_rerun_below_usd = 7.5\n", 1))
     assert load_chain_config(p).round.make_good_rerun_below_usd == 7.5
     p.write_text(src.replace("\n[round]\n", "\n[round]\nmake_good_rerun_below_usd = -3\n", 1))
-    assert load_chain_config(p).round.make_good_rerun_below_usd == 0.0
+    with pytest.raises(ValueError):
+        load_chain_config(p)
     assert load_chain_config(DEFAULT_CHAIN_TOML).round.make_good_rerun_below_usd == 20.0

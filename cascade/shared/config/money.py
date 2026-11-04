@@ -54,6 +54,9 @@ MONEY_KNOBS: dict[str, tuple[object, str]] = {
     # audit D: our own validator's hotkey; its rejected receipts of OUR
     # settlements raise one critical alert ("" = off)
     "receipt_watch_validator_hotkey": ("", "text"),
+    # owner 2026-11-04: an our-side lemon loss below this reruns on the
+    # miner's own key instead of an approval-gated operator make-good (0 = off)
+    "make_good_rerun_below_usd": (20.0, "usd"),
 }
 
 # ``operator_daily_cap_scope``: which booked operator spend counts toward the
