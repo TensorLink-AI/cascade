@@ -629,6 +629,7 @@ def write_pool(
         "summary": asdict(summary),
         "archetypes": {
             "model_version": getattr(archetypes, "version", None),
+            "model_fitted": getattr(archetypes, "fitted", "") or None,
             "model_sha256": getattr(archetypes, "sha256", "") or None,
             "steering": float(cfg.archetype_steering or 0.0),
             "catalog_sha256": catalog_sha256 or None,

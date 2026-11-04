@@ -378,6 +378,16 @@ dilutes any builder-side share — one reason to prefer `S < 1`.
 series over tagged series only; the unknown fraction is reported beside it,
 and the same number per benchmark from `ref_share_by_bench`.
 
+**Model file format.** The forge's `archetypes.json` (version 1, fitted
+2026-11-03) stores every per-archetype vector as a list aligned with its
+top-level `names` (`["A00", …, "A11"]`) and carries an integer `version`; the
+reader accepts that form, a dict keyed by archetype id, and a row list. The
+file also publishes the forge's own `pool_share` and `overlap`; the report
+recomputes their overlap with our formula and prints both (`forge published
+daily-or-faster 0.811; our formula on their pool_share 0.811`), so a formula
+drift between the two sides is visible without any data. A byte copy of the
+real file is the fixture `tests/fixtures/tsbench_forge_archetypes_v1.json`.
+
 **Dry run** — nothing written or published; the before numbers (`S = 0`) come
 from the same code and candidates as the after:
 

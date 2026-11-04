@@ -8,6 +8,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 from collections import Counter
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -22,6 +23,11 @@ from cascade.pool.builder import (
     steering_sweep,
 )
 from cascade.pool.source import HarvestContext, HarvestedSeries
+
+FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
+# Byte copy of the forge's real model file (bucket root archetypes.json, version 1,
+# fitted 2026-11-03; sha256 378756e4…) — the list form aligned with ``names``.
+REAL_MODEL = FIXTURES / "tsbench_forge_archetypes_v1.json"
 
 CTX = HarvestContext(as_of=dt.date(2026, 6, 1), context_length=512, horizon=16, max_series=10_000)
 
@@ -100,6 +106,46 @@ def test_model_parses_flat_and_list_forms_and_normalises():
     # an "unknown" reference share is never accepted: the untagged have none
     m = A.parse_archetype_model({"model_version": "x", "ref_share_daily_or_faster": {"A01": 1, "unknown": 5}})
     assert m.ref_share == {"A01": 1.0}
+
+
+def test_real_forge_model_file_parses_in_its_list_form_and_reproduces_the_published_overlaps():
+    m = A.load_archetype_model(REAL_MODEL)
+    assert m is not None
+    assert m.version == "1" and m.fitted == "2026-11-03"
+    assert m.sha256 == "378756e42dadbcdb58735ff90ff0918b25c0628c73504b233b49ad5f8e6f2be1"
+    assert m.archetypes == tuple(f"A{i:02d}" for i in range(12))
+    assert sum(m.ref_share.values()) == pytest.approx(1.0)
+    assert set(m.ref_share_by_bench) == {"gift", "boom", "time"}
+    for shares in m.ref_share_by_bench.values():
+        assert set(shares) == set(m.archetypes) and sum(shares.values()) == pytest.approx(1.0)
+    # the numbers in the forge's request table (A09 6.7% -> 17.4%, A04 2.0% -> 4.9%)
+    assert m.ref_share["A09"] == pytest.approx(0.1735, abs=1e-4)
+    assert m.published_pool_share["A09"] == pytest.approx(0.0671, abs=1e-4)
+    assert m.ref_share["A04"] == pytest.approx(0.0492, abs=1e-4)
+    # our overlap formula on their published pool mix gives their published
+    # 0.811 (daily-or-faster) and 0.701 / 0.623 / 0.668 per benchmark
+    chk = A.published_check(m)
+    assert chk["agrees"] is True
+    assert chk["recomputed_daily_or_faster"] == pytest.approx(m.published_overlap["daily_or_faster"], abs=1e-3)
+    assert chk["recomputed_by_bench"]["gift"] == pytest.approx(0.701, abs=1e-3)
+    assert chk["recomputed_by_bench"]["boom"] == pytest.approx(0.623, abs=1e-3)
+    assert chk["recomputed_by_bench"]["time"] == pytest.approx(0.668, abs=1e-3)
+    # the report and provenance carry the cross-check
+    rep = A.archetype_report(Counter({"A09": 1}), Counter({"A09": 1}), m, steering=0.0, n_sources=1, n_series=1)
+    assert rep["forge_published"]["agrees"] is True and rep["model_fitted"] == "2026-11-03"
+    assert "forge published daily-or-faster 0.811" in A.render_report(rep)
+
+
+def test_list_form_needs_names_of_the_same_length():
+    doc = json.loads(REAL_MODEL.read_text())
+    with pytest.raises(A.ArchetypeModelError, match="12 entries for 11 names"):
+        A.parse_archetype_model({**doc, "names": doc["names"][:-1]})
+    with pytest.raises(A.ArchetypeModelError, match="carries no names"):
+        A.parse_archetype_model({k: v for k, v in doc.items() if k != "names"})
+    # a by-bench list of the wrong length is an error too, not a silent drop
+    bad = {**doc, "ref_share_by_bench": {**doc["ref_share_by_bench"], "gift": doc["ref_share_by_bench"]["gift"][:3]}}
+    with pytest.raises(A.ArchetypeModelError, match=r"ref_share_by_bench\[gift\] has 3 entries"):
+        A.parse_archetype_model(bad)
 
 
 def test_overlap_is_sum_of_mins_over_tagged_series_only():
