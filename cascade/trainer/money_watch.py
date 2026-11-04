@@ -360,6 +360,10 @@ def note_published_settlement(runner, manifest) -> None:
         log.debug("published-settlement record skipped (%s)", e)
 
 
+# Receipt reject_reasons that are a designed no-contest, not a lost settlement.
+NO_CONTEST_REASONS = frozenset({"no_king_challenger_pair"})
+
+
 def rejected_receipt_tick(runner, *, now: float | None = None, reader=None) -> dict | None:
     """Read our own validator's latest receipt (``[round]
     receipt_watch_validator_hotkey``; "" = off). A REJECTED receipt for a
@@ -388,6 +392,16 @@ def rejected_receipt_tick(runner, *, now: float | None = None, reader=None) -> d
         return None
     rid, status = str(doc.get("round_id", "")), str(doc.get("status", ""))
     if status != "rejected":
+        return None
+    if str(doc.get("reject_reason", "")) in NO_CONTEST_REASONS:
+        # A king-only settlement is a DESIGNED no-contest (the receipt's
+        # machine status stays "rejected" for the audit trail; the validator
+        # labels it "no-contest (king holds)"): no leg lost its result, nothing
+        # to requeue, no owner decision — never an alert (2026-11-04 07:32,
+        # settlement 3802248244847292146 raised a critical for the king's own
+        # era leg).
+        log.info("receipt watch: settlement %s is a no-contest (%s) — king holds, not a rejection",
+                 rid, doc.get("reject_reason"))
         return None
     try:
         ours = json.loads((Path(runner.work_root) / PUBLISHED_FILE).read_text(encoding="utf-8"))
