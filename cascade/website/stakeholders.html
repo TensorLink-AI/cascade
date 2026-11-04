@@ -891,6 +891,26 @@ var COMMUNITY = {
 };
 
 var _index = null, _chain = null, _v2 = null, _lb = null, _gens = 0, _state = "loading", _metric = "mase";
+
+// v2 era scope (2026-11-04, owner: the dashboards must reset to the fresh
+// round): every settlement before the v2 activation block is history from the
+// previous contract, not this competition — tiles, tables and miner counts read
+// only rounds at or after it. The block comes from status/v2.json golive
+// .from_block once loaded; V2_FROM_BLOCK is the announced value as a fallback.
+var V2_FROM_BLOCK = 9399600;
+var _rawIndex = null;
+function v2FromBlock(){ var b=_v2&&_v2.golive&&Number(_v2.golive.from_block); return b>0?b:V2_FROM_BLOCK; }
+function v2Scope(idx){
+  if(!idx||!idx.rounds) return idx;
+  var from=v2FromBlock(), out={};
+  for(var k in idx) if(Object.prototype.hasOwnProperty.call(idx,k)) out[k]=idx[k];
+  out.rounds=idx.rounds.filter(function(r){
+    var b=Number(r.era_start_block)>0?Number(r.era_start_block):Number(r.epoch_start_block||0);
+    return b>=from;
+  });
+  out.v2_from_block=from; out.pre_v2_rounds=idx.rounds.length-out.rounds.length;
+  return out;
+}
 var _bench = {}, _benchMissing = {}, _benchInflight = {};
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -1337,11 +1357,11 @@ var _pollN=0;
 function poll(){
   _pollN++;
   fetchJSON("receipts/index.json")
-    .then(function(d){ _index=collapseByRound(d); _state="live"; renderAll(); scanBench(); })
+    .then(function(d){ _rawIndex=collapseByRound(d); _index=v2Scope(_rawIndex); _state="live"; renderAll(); scanBench(); })
     .catch(function(){ _state="offline"; renderChrome(); });
   fetchJSON("status/chain.json").then(function(d){ _chain=d; renderTiles(); }).catch(function(){});
   // v2 status (trainer, unsigned): go-live, lineage counter, merged experts
-  fetchJSON("status/v2.json").then(function(d){ _v2=d; renderTiles(); }).catch(function(){});
+  fetchJSON("status/v2.json").then(function(d){ _v2=d; if(_rawIndex){ _index=v2Scope(_rawIndex); renderAll(); } else renderTiles(); }).catch(function(){});
   if(_pollN===1||_pollN%10===0||!_lb)
     fetchJSON("benchmarks/leaderboard-reference.json").catch(function(){
       // the bucket copy can 403/404: fall back to the packaged reference the
