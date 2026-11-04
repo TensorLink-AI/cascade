@@ -666,7 +666,10 @@ def test_error_tail_short_and_single_line_inputs():
 
     assert error_tail("boom", 300) == "boom"
     assert error_tail(RuntimeError("x" * 50), 300) == "x" * 50
-    assert error_tail("y" * 1000, 100) == "y" * 100
+    # a long one-liner keeps its HEAD and its tail (2026-11-04: a tail-only cut
+    # logged "alse, 'ended': True})" for a lost leg)
+    out = error_tail("y" * 600 + "Z" * 400, 100)
+    assert out.startswith("y" * 40) and out.endswith("Z" * 40) and " … " in out and len(out) <= 100
     assert error_tail(None, 10) == ""
 
 
