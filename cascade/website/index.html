@@ -2404,6 +2404,31 @@ function renderAll(){ renderStatus(); renderHeader(); renderV2Strip(); renderVer
 // the anchored latest receipt (lane_b, lane_b_pay, weights) and, per
 // settlement, the index row's lane_b_verdicts.
 var _v2 = null, _satMetric = "overlap";
+
+// v2 era scope (2026-11-04, owner: the dashboards must reset to the fresh
+// round): every settlement before the v2 activation block is history from the
+// previous contract, not this competition — tiles, tables and miner counts read
+// only rounds at or after it. The block comes from status/v2.json golive
+// .from_block once loaded; V2_FROM_BLOCK is the announced value as a fallback.
+var V2_FROM_BLOCK = 9399600;
+var _rawIndex = null;
+function v2FromBlock(){ var b=_v2&&_v2.golive&&Number(_v2.golive.from_block); return b>0?b:V2_FROM_BLOCK; }
+function v2Scope(idx){
+  if(!idx||!idx.rounds) return idx;
+  var from=v2FromBlock(), out={};
+  for(var k in idx) if(Object.prototype.hasOwnProperty.call(idx,k)) out[k]=idx[k];
+  out.rounds=idx.rounds.filter(function(r){
+    var b=Number(r.era_start_block)>0?Number(r.era_start_block):Number(r.epoch_start_block||0);
+    return b>=from;
+  });
+  out.v2_from_block=from; out.pre_v2_rounds=idx.rounds.length-out.rounds.length;
+  // v2 not announced yet (no status/v2.json block) and nothing settled at or
+  // after the fallback block: there is no v2 history to show — keep the index
+  // whole rather than render an empty competition
+  var announced=!!(_v2&&_v2.golive&&Number(_v2.golive.from_block)>0);
+  if(!out.rounds.length&&!announced) return idx;
+  return out;
+}
 // the lane-B commitment a miner posts (cascade.shared.expert_manifest)
 var EXPERT_COMMIT_PREFIX = "metro-v1:expert:";
 function v2Golive(){ return (_v2&&_v2.golive)||null; }
@@ -3568,7 +3593,7 @@ function renderTrainTable(rows){
 })();
 
 function poll(){
-  fetchJSON("receipts/index.json").then(function(d){ _index=collapseByRound(d); _dataState="live"; renderAll(); loadWarmHistory(); loadLastScored(); if(_page==="train") loadBench(); })
+  fetchJSON("receipts/index.json").then(function(d){ _rawIndex=collapseByRound(d); _index=v2Scope(_rawIndex); _dataState="live"; renderAll(); loadWarmHistory(); loadLastScored(); if(_page==="train") loadBench(); })
     .catch(function(){ _dataState="offline"; renderStatus(); });
   loadPromotion();
   fetchJSON("receipts/"+RECEIPT_ANCHOR+"/latest.json")
@@ -3586,7 +3611,7 @@ function poll(){
   // Era roster (rolling mode): republished by the trainer at every settlement.
   fetchJSON("funded/latest.json").then(function(d){ _roster=d; renderHeat(); }).catch(function(){});
   // v2 status (trainer, unsigned): go-live, lane-B driver state, MoE health
-  fetchJSON("status/v2.json").then(function(d){ _v2=d; renderV2(); }).catch(function(){});
+  fetchJSON("status/v2.json").then(function(d){ _v2=d; if(_rawIndex&&v2FromBlock()!==(_index&&_index.v2_from_block)){ _index=v2Scope(_rawIndex); renderAll(); } renderV2(); }).catch(function(){});
   // lane-C queue (trainer, unsigned; absent while lane C is off)
   fetchJSON("status/lane_c.json").then(function(d){ _lc=d; if(_page==="lanec") renderLaneC(); }).catch(function(){});
 }
