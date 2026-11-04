@@ -148,6 +148,8 @@ class RoundConfig:
     # simply reruns on the miner's own key and the small loss stays a
     # make-good owed. 0 disables (every operator-side loss routes to approval).
     make_good_rerun_below_usd: float = 20.0
+    # See money.py: keep an unreachable pod the provider still lists alive.
+    unreachable_alive_extend_seconds: int = 7200
     # Harbor expiry (days) on the per-pod Hub robot a funded leg gets
     # (cascade.funding.robots). Revocation at teardown is the real bound;
     # this is the backstop if a revoke ever fails.
