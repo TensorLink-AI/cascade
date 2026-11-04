@@ -930,5 +930,5 @@ def test_remote_dir_reachable_probe():
 def test_error_tail_keeps_the_head_of_a_one_line_message():
     msg = "payer pod ended mid-leg ({'pod_status': 'absent'}): checkpoint harvest failed " * 3
     out = remote_mod.error_tail(msg, 80)
-    assert out.startswith("payer pod ended") and out.endswith("harvest failed ")
+    assert out.startswith("payer pod ended") and out.endswith("harvest failed")
     assert " … " in out and len(out) <= 83
