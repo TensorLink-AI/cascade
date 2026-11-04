@@ -476,6 +476,10 @@ DETACHED_STDERR_MARK = "__CASCADE_DETACHED_STDERR__"
 _SLEEP = time.sleep  # test seam
 
 
+# How often a past-grace unreachable pod's provider listing is re-checked.
+ALIVE_CHECK_SECONDS = 300
+
+
 def detached_run_dir(host: RemoteHost, tag: str) -> str:
     """A fresh per-leg run dir under the pod's workdir (absolute)."""
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", tag)[:80]
@@ -844,7 +848,8 @@ def run_detached(host: RemoteHost, body: str, stdin_env: str | None, run_dir: st
                  runner=None, describe: str = "remote leg",
                  preempt: str = PREEMPT_BENCHMARKS, launch: bool = True,
                  on_running=None, cancel=None,
-                 on_progress=None) -> subprocess.CompletedProcess:
+                 on_progress=None, alive=None,
+                 alive_extend_seconds: int = 0) -> subprocess.CompletedProcess:
     """Run ``body`` detached on ``host`` and return a CompletedProcess-shaped
     result (returncode, stdout, stderr) exactly like the attached ssh would —
     the caller's receipt/rc handling is unchanged.
@@ -852,7 +857,9 @@ def run_detached(host: RemoteHost, body: str, stdin_env: str | None, run_dir: st
     ``runner(argv, timeout, stdin_text)`` is the ssh call (``run_ssh`` in
     production, a scripted double in tests). Transport failures during the
     poll are tolerated for ``grace_seconds`` of consecutive unreachability;
-    the leg is only declared lost (rc=255) past that. ``timeout`` is the
+    the leg is only declared lost (rc=255) past that — unless ``alive()`` (the
+    provider's own listing of the pod: True alive / False gone / None unknown)
+    still says alive, which extends it by up to ``alive_extend_seconds``. ``timeout`` is the
     overall wall for the leg; on expiry the detached process group is killed
     best-effort and the leg reported timed out.
 
@@ -879,6 +886,8 @@ def run_detached(host: RemoteHost, body: str, stdin_env: str | None, run_dir: st
         log.info("%s: attaching to the run already on the pod (%s)", describe, run_dir)
     t0 = time.time()
     last_seen = t0
+    alive_checked = 0.0
+    alive_state: bool | None = None
     misses = 0
     rc: int | None = None
     vanished = False
@@ -906,9 +915,35 @@ def run_detached(host: RemoteHost, body: str, stdin_env: str | None, run_dir: st
             misses += 1
             gap = now - last_seen
             if gap > grace_seconds:
+                # 2026-11-04 uid 78: a pod that stopped answering ssh ~3.5 h into
+                # its run was declared lost after 900 s and torn down, unharvested
+                # — the run was finished or nearly so. While the PROVIDER still
+                # lists the pod alive, keep it and keep polling (an ssh/network
+                # outage is not a dead worker), up to ``alive_extend_seconds``
+                # more; only a provider "gone" (or the extension spent) ends it.
+                verdict = None
+                if alive is not None and gap <= grace_seconds + alive_extend_seconds:
+                    if now - alive_checked >= ALIVE_CHECK_SECONDS:
+                        alive_checked = now
+                        try:
+                            alive_state = alive()
+                        except Exception as e:  # noqa: BLE001 — unsure ⇒ keep the pod
+                            log.warning("%s: provider liveness check failed (%s) — keeping "
+                                        "the pod", describe, e)
+                            alive_state = True
+                    verdict = alive_state
+                if verdict:
+                    if misses % 10 == 1:
+                        log.warning("%s: ssh unreachable for %.0fs but the provider still "
+                                    "lists the pod alive — keeping it and polling (up to "
+                                    "%ds past the %ds grace)", describe, gap,
+                                    alive_extend_seconds, grace_seconds)
+                    continue
                 raise RemoteDispatchError(
                     f"{describe}: pod unreachable for {int(gap)}s while the detached "
-                    f"worker ran ({misses} failed polls) — leg lost", returncode=255)
+                    f"worker ran ({misses} failed polls"
+                    + ("; the provider no longer lists it alive" if verdict is False else "")
+                    + ") — leg lost", returncode=255)
             if misses in (1, 5) or misses % 20 == 0:
                 log.warning("%s: poll unreachable (%d in a row, %.0fs since last contact; "
                             "grace %ds) — the detached worker keeps running",
@@ -1885,6 +1920,13 @@ class RemoteDispatcher:
     # on every RUNNING poll (the funded leg's progress watchdog — see
     # cascade.trainer.cost_guards.ProgressWatchdog).
     on_progress: object = field(default=None, repr=False)
+    # Detached legs only: ``pod_alive() -> True | False | None`` — the
+    # provider's listing of the leg's pod. A pod past the reattach grace that
+    # the provider still lists alive is kept for up to
+    # ``unreachable_alive_extend_seconds`` more (2026-11-04: an ssh outage
+    # tore down a finished, unharvested run).
+    pod_alive: object = field(default=None, repr=False)
+    unreachable_alive_extend_seconds: int = 0
     # Where a failed leg's fetched stdout/stderr tails are saved on the
     # orchestrator box (save_failed_leg_evidence); None = not saved.
     evidence_dir: str | None = None
@@ -2028,7 +2070,10 @@ class RemoteDispatcher:
                     describe=f"remote {role} on {host.name}", launch=prior is None,
                     **({"on_running": mirror.poll} if mirror else {}),
                     **({"cancel": cancel} if cancel is not None else {}),
-                    **({"on_progress": self.on_progress} if self.on_progress else {}))
+                    **({"on_progress": self.on_progress} if self.on_progress else {}),
+                    **({"alive": self.pod_alive,
+                        "alive_extend_seconds": int(self.unreachable_alive_extend_seconds)}
+                       if self.pod_alive is not None else {}))
             finally:
                 if mirror is not None:
                     mirror.close()

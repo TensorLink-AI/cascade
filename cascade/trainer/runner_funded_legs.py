@@ -750,7 +750,41 @@ def _with_leg_watchdog(runner, disp, gen, pod, contract, host=None):
     watch = leg_watchdog(runner, gen=gen, pod=pod, contract=contract,
                          key_check=key_check if payer else None,
                          host=str(getattr(host, "host", "") or ""))
-    return disp if watch is None else replace(disp, on_progress=watch)
+    out = disp if watch is None else replace(disp, on_progress=watch)
+    extend = int(getattr(runner.cfg.round, "unreachable_alive_extend_seconds", 0) or 0)
+    if payer and extend > 0:
+        out = replace(out, pod_alive=lambda: payer_pod_alive(runner, pod),
+                      unreachable_alive_extend_seconds=extend)
+    return out
+
+
+def payer_pod_alive(runner, pod) -> bool | None:
+    """The PROVIDER's view of a payer pod: True listed and not terminal, False
+    not listed (or terminal), None unknown (no key / no listing seam). Never
+    raises — the caller treats an error as unknown."""
+    try:
+        vault = runner._payer_vault()
+        if vault is None:
+            return None
+        from ..funding.providers import pod_credential
+        from ..provision.funded import provider_for_key
+
+        cred = pod_credential(vault, pod)
+        if cred is None:
+            return None
+        adapter = provider_for_key(cred.provider, cred.api_key)
+        ident = getattr(adapter, "pod_identity", None)
+        if ident is None:
+            return None
+        seen = ident(str(pod.instance_id))
+        if seen is None:
+            return False
+        status = str(seen.get("status") or "").upper()
+        return status not in {"TERMINATED", "STOPPED", "FAILED", "DELETED", "ERROR"}
+    except Exception as e:  # noqa: BLE001
+        log.warning("funded leg: provider liveness of %s unknown (%s)",
+                    getattr(pod, "instance_id", "?"), e)
+        return None
 
 
 def _spend_result(runner, hotkey: str, pod) -> None:
