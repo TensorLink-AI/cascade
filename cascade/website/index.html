@@ -1389,7 +1389,7 @@ th, td, .stat .v, .tile .v, .gate-cell .v { font-variant-numeric:tabular-nums; }
     <div>
       <div class="section-label"><span>Reigns</span></div>
       <div class="panel"><div class="scroll-box scroll-reigns">
-        <table><thead><tr><th>#</th><th>Hotkey</th><th class="num">UID</th><th>Generator</th><th>Crowned</th></tr></thead><tbody id="reigns"></tbody></table>
+        <table><thead><tr><th title="Reigns within the receipts index window, newest first">Reign</th><th>Hotkey</th><th class="num">UID</th><th>Generator</th><th>Crowned</th></tr></thead><tbody id="reigns"></tbody></table>
       </div></div>
     </div>
     <div>
@@ -1575,7 +1575,7 @@ var HUB_BASE = "https://hub.hippius.com/models/";
 var KING_GITHUB = "https://github.com/TensorLink-AI/cascade/tree/main/champions/king";
 var HUB_REF = "main";
 var POLL_MS = 120000;
-var _index = null, _latest = null, _status = null,
+var _index = null, _latest = null, _status = null, _lastScored = null, _lastScoredLoading = "",
     _subsSeen = null, _chartMode = "geomean", _smooth = 0, _dataState = "loading",
     _wsHist = null, _roster = null;
 
@@ -1649,6 +1649,50 @@ function reigns(){
     if(r.dethroned){ cur={n:out.length+1,hotkey:r.chal_hotkey,uid:r.chal_uid,gen_ref:r.chal_gen_ref,round:r.round_id,block:r.epoch_start_block}; out.push(cur); }
   });
   return out;
+}
+// The newest SCORED index row. A rejected (king re-sync) or no-contest
+// settlement can be the newest row — it names no king and carries no ladder,
+// emission or weights — so the verdict, cohort and king panels read this one
+// (2026-11-04: a king_resyncing receipt superseded the crowning 21 s later).
+function latestScoredRow(){
+  var rs=(_index&&_index.rounds)||[];
+  for(var i=rs.length-1;i>=0;i--) if(rs[i].status==="scored") return rs[i];
+  return null;
+}
+// The anchor's receipt body for a round, when loaded: the latest, or the
+// newest scored one (_lastScored, fetched by loadLastScored()).
+function receiptFor(rid){
+  rid=String(rid);
+  if(_latest&&String(_latest.round_id)===rid) return _latest;
+  if(_lastScored&&String(_lastScored.round_id)===rid) return _lastScored;
+  return null;
+}
+function scoredReceipt(){ return (_latest&&_latest.status==="scored")?_latest:_lastScored; }
+// The sitting king's hotkey: the latest receipt's posterior state, else its
+// verdict, else the newest scored row's post-round king, else the newest reign.
+function currentKingHotkey(){
+  var sp=_latest&&_latest.state_post;
+  if(sp&&sp.king) return String(sp.king);
+  var v=_latest&&_latest.status==="scored"&&_latest.verdict;
+  if(v&&v.king_hotkey) return String(v.king_hotkey);
+  var r=latestScoredRow();
+  if(r&&r.post_round_king_hotkey) return String(r.post_round_king_hotkey);
+  var rg=reigns(); return rg.length?rg[rg.length-1].hotkey||null:null;
+}
+// When the latest receipt is not scored, fetch the newest scored round's
+// receipt once (immutable per round) so the field, ladder and split panels
+// keep the last signed data instead of going blank.
+function loadLastScored(){
+  if(!_latest||_latest.status==="scored") return;
+  var r=latestScoredRow(); if(!r||!r.receipt_key) return;
+  var id=String(r.round_id);
+  if((_lastScored&&String(_lastScored.round_id)===id)||_lastScoredLoading===id) return;
+  _lastScoredLoading=id;
+  fetchJSON(r.receipt_key,{bust:false}).then(function(d){
+    if(d&&String(d.round_id)===id&&d.status==="scored"){
+      _lastScored=d; renderField(); renderSubs(); renderCohort(); renderV2Strip(); renderLaneALadder();
+    }
+  }).catch(function(){}).then(function(){ if(_lastScoredLoading===id) _lastScoredLoading=""; });
 }
 function verdictClass(r){ if(r.status==="rejected")return"rejected"; if(r.inconclusive)return"inconclusive"; return r.challenger_wins_round?"win":"hold"; }
 function verdictLabel(r){ if(r.status==="rejected")return"Rejected"; if(r.inconclusive)return"Inconclusive"; return r.challenger_wins_round?(r.dethroned?"Dethroned":"Challenger wins"):"King holds"; }
@@ -1740,11 +1784,16 @@ function stat(k,v,o){
     '<div class="k">'+esc(k)+infoTip(k,o.title)+'</div><div class="v'+(o.range?' range':'')+'">'+v+'</div></div>';
 }
 function renderVerdict(){
-  var rs=_index&&_index.rounds||[], r=rs.length?rs[rs.length-1]:null, el=document.getElementById("verdict");
+  var rs=_index&&_index.rounds||[], newest=rs.length?rs[rs.length-1]:null, el=document.getElementById("verdict");
+  var r=latestScoredRow()||newest;
   if(!r){ el.innerHTML='<div class="empty">Waiting for the first published round…</div>'; return; }
   var cn=chainNow(), rolling=!!(cn&&cn.rolling&&rollingRow(r)), vlab=roundLabel(r);
   document.getElementById("verdict-title").textContent=(rolling?"Latest settlement ":"Round ")+shortRoundId(r.round_id)+(vlab!==shortRoundId(r.round_id)?" · "+vlab:"");
-  document.getElementById("verdict-when").textContent=r.published_at?"settled "+timeAgo(r.published_at):"";
+  // a newer unscored settlement (rejected re-sync / no-contest) is a secondary note only
+  var later=newest&&newest!==r?newest:null;
+  document.getElementById("verdict-when").textContent=(r.published_at?"settled "+timeAgo(r.published_at):"")+
+    (later?" · newer settlement "+shortRoundId(later.round_id)+" "+String(later.status||"unscored")+
+      (later.reject_reason?" ("+String(later.reject_reason)+")":"")+" — the king is unchanged":"");
   renderEraSettlements(r,cn);
   var cls=verdictClass(r), cells=[];
   cells.push(stat("Verdict",'<span class="badge '+cls+'">'+esc(verdictLabel(r))+'</span>'));
@@ -1822,7 +1871,7 @@ function renderEraSettlements(r,cn){
 // rounds carry cohort_lcbs only (DEC-CA-0012) — still listed, LCB column only.
 // Single-challenger, single-horizon rounds render nothing (panel stays hidden).
 function cohortSource(r){
-  var v=(_latest&&String(_latest.round_id)===String(r.round_id)&&_latest.verdict)||{};
+  var v=(receiptFor(r.round_id)||{}).verdict||{};
   function pick(k){ var x=r[k]; if(x==null) x=v[k]; return (x&&typeof x==="object")?x:null; }
   return {per_horizon:pick("per_horizon"), geos:pick("cohort_geomeans")||{}, lcbs:pick("cohort_lcbs")||{},
           phs:pick("cohort_per_horizon")||{}, king:r.king_geomean, margin:r.margin,
@@ -1839,13 +1888,13 @@ function gapPct(cell){ if(!cell||cell.king==null||cell.chal==null||!Number(cell.
 function signedPct(g,dp){ return g==null?"--":(g>0?"+":"")+g.toFixed(dp==null?2:dp)+"%"; }
 function uidOfHotkey(hk,r){
   if(hk===r.chal_hotkey&&r.chal_uid!=null) return r.chal_uid;
-  var ps=(_latest&&String(_latest.round_id)===String(r.round_id)&&_latest.participants)||[];
+  var ps=(receiptFor(r.round_id)||{}).participants||[];
   for(var i=0;i<ps.length;i++){ if(ps[i].hotkey===hk) return ps[i].uid; }
   return null;
 }
 function horizonKeys(o){ return Object.keys(o||{}).sort(function(a,b){ return Number(a)-Number(b); }); }
 function renderCohort(){
-  var rs=_index&&_index.rounds||[], r=rs.length?rs[rs.length-1]:null, el=document.getElementById("cohort-panel");
+  var r=latestScoredRow(), el=document.getElementById("cohort-panel");
   if(!r||r.status==="rejected"){ el.hidden=true; el.innerHTML=""; return; }
   var s=cohortSource(r), html="";
   if(s.per_horizon&&horizonKeys(s.per_horizon).length){
@@ -1972,20 +2021,24 @@ function renderReigns(){
     var cur=i===0;
     // the crowning block is tooltip detail — a 6th column made the half-width
     // table scroll sideways, and the round id already identifies the crowning
-    return '<tr><td>'+(cur?'<span class="crown">&#9819;</span> ':'')+'#'+r.n+'</td>'+
+    // no absolute reign numbers: the index keeps a bounded window, so its
+    // oldest reign is not the subnet's first
+    return '<tr><td>'+(cur?'<span class="crown">&#9819;</span> current':'<span class="muted">'+i+' back</span>')+'</td>'+
       '<td title="'+esc(r.hotkey||"")+'">'+esc(shortHk(r.hotkey))+'</td>'+
       '<td class="num">'+(r.uid!=null?r.uid:"--")+'</td>'+
       '<td>'+refLink(r.gen_ref)+'</td>'+
       '<td'+(r.block!=null?' title="block '+esc(r.block)+'"':'')+'>'+
-      (r.round?esc(shortRoundId(r.round)):'<span class="muted">genesis</span>')+'</td></tr>';
+      (r.round?esc(shortRoundId(r.round)):'<span class="muted">before the index window</span>')+'</td></tr>';
   }).join("");
 }
 function renderField(){
   var tb=document.getElementById("field"), when=document.getElementById("field-when");
-  var parts=(_latest&&_latest.participants)||[];
-  when.textContent=_latest?("round "+shortRoundId(_latest.round_id)):"";
+  var src=_latest, sc=scoredReceipt();
+  if(!((src&&src.participants)||[]).length&&sc) src=sc;      // a rejected receipt may carry none
+  var parts=(src&&src.participants)||[];
+  when.textContent=src?("round "+shortRoundId(src.round_id)):"";
   if(!parts.length){ tb.innerHTML='<tr><td colspan="4" class="empty">No participant set on the latest receipt</td></tr>'; return; }
-  var kingHk=_latest&&_latest.verdict&&_latest.verdict.king_hotkey;
+  var kingHk=currentKingHotkey();
   tb.innerHTML=parts.slice().sort(function(a,b){ return a.uid-b.uid; }).map(function(p){
     var crown=p.hotkey&&p.hotkey===kingHk?'<span class="crown">&#9819;</span> ':'';
     return '<tr><td class="num">'+p.uid+'</td><td title="'+esc(p.hotkey)+'">'+crown+esc(shortHk(p.hotkey))+'</td>'+
@@ -2214,7 +2267,7 @@ function renderSubs(){
   var cn=chainNow(), es=cn?cn.epochStart:null;
   if(_subsSeen===null){ _subsSeen={}; subs.forEach(function(s){ _subsSeen[s.hotkey+"@"+s.commit_block]=1; }); }
   if(!subs.length){ tb.innerHTML='<tr><td colspan="5" class="empty">No submissions revealed yet</td></tr>'; return; }
-  var kingHk=_latest&&_latest.verdict&&_latest.verdict.king_hotkey;
+  var kingHk=currentKingHotkey();
   tb.innerHTML=subs.slice().sort(function(a,b){ return (b.commit_block-a.commit_block)||(a.uid-b.uid); }).map(function(s){
     var isNew=!_subsSeen[s.hotkey+"@"+s.commit_block];
     var next=es!=null&&s.commit_block>=es;
@@ -2405,9 +2458,15 @@ function latestRow(){
 function latestSplit(){
   var row=latestRow();
   if(row&&row.emission_split&&(!_latest||String(row.round_id)===String(_latest.round_id))) return row.emission_split;
-  var r=_latest;
-  if(r&&Array.isArray(r.weights)&&r.weights.length) return emissionSplit(r.weights, r.reward_uids, r.lane_b_pay||{wins:[]}, r.lane_c_pay||null);
-  return row&&row.emission_split||null;
+  // a rejected / no-contest latest receipt has weights=[]: fall back to the
+  // newest scored receipt, then the newest index row that carries a split
+  var cands=[_latest,_lastScored];
+  for(var c=0;c<cands.length;c++){ var r=cands[c];
+    if(r&&Array.isArray(r.weights)&&r.weights.length) return emissionSplit(r.weights, r.reward_uids, r.lane_b_pay||{wins:[]}, r.lane_c_pay||null); }
+  if(row&&row.emission_split) return row.emission_split;
+  var rs=(_index&&_index.rounds)||[];
+  for(var i=rs.length-1;i>=0;i--) if(rs[i].emission_split) return rs[i].emission_split;
+  return null;
 }
 function splitBar(s){
   if(!s) return "";
@@ -2454,8 +2513,16 @@ function laneALadder(){
   if(!lad&&_latest&&_latest.emission){ var e=_latest.emission, l=e.ladder||{}, pol=e.policy||{};
     lad={king_share:l.bp!=null?Number(l.bp)/10000:pol.king_share, event:l.event, court_hotkey:l.court_hotkey, court_until_block:l.court_until_block, slashed:!!l.slashed, former_share:pol.former_share, king_slash:pol.king_slash}; }
   if(!kc&&_latest&&_latest.king_check) kc=_latest.king_check;
+  // a rejected / no-contest latest receipt carries neither record: the newest
+  // scored receipt's, then walk the index back (as for the last judged check)
+  var sc=_lastScored;
+  if(!lad&&sc&&sc.emission){ var e2=sc.emission, l2=e2.ladder||{}, pol2=e2.policy||{};
+    lad={king_share:l2.bp!=null?Number(l2.bp)/10000:pol2.king_share, event:l2.event, court_hotkey:l2.court_hotkey, court_until_block:l2.court_until_block, slashed:!!l2.slashed, former_share:pol2.former_share, king_slash:pol2.king_slash}; }
+  if(!kc&&sc&&sc.king_check) kc=sc.king_check;
+  var rs=(_index&&_index.rounds)||[];
+  if(!lad){ for(var j=rs.length-1;j>=0;j--) if(rs[j].ladder){ lad=rs[j].ladder; break; } }
   // the last JUDGED king check: walk the index back when the latest row has none
-  if(!kc){ var rs=(_index&&_index.rounds)||[]; for(var i=rs.length-1;i>=0;i--) if(rs[i].king_check){ kc=rs[i].king_check; break; } }
+  if(!kc){ for(var i=rs.length-1;i>=0;i--) if(rs[i].king_check){ kc=rs[i].king_check; break; } }
   return {ladder:lad, check:kc};
 }
 function renderLaneALadder(){
@@ -3501,12 +3568,12 @@ function renderTrainTable(rows){
 })();
 
 function poll(){
-  fetchJSON("receipts/index.json").then(function(d){ _index=collapseByRound(d); _dataState="live"; renderAll(); loadWarmHistory(); if(_page==="train") loadBench(); })
+  fetchJSON("receipts/index.json").then(function(d){ _index=collapseByRound(d); _dataState="live"; renderAll(); loadWarmHistory(); loadLastScored(); if(_page==="train") loadBench(); })
     .catch(function(){ _dataState="offline"; renderStatus(); });
   loadPromotion();
   fetchJSON("receipts/"+RECEIPT_ANCHOR+"/latest.json")
     .catch(function(){ return fetchJSON("receipts/latest.json"); })
-    .then(function(d){ _latest=d; renderField(); renderHeat(); renderCohort(); renderV2Strip(); renderLaneALadder(); if(_page==="laneb") renderLaneB(); if(_page==="lanec") renderLaneC(); }).catch(function(){});
+    .then(function(d){ _latest=d; loadLastScored(); renderField(); renderHeat(); renderCohort(); renderV2Strip(); renderLaneALadder(); if(_page==="laneb") renderLaneB(); if(_page==="lanec") renderLaneC(); }).catch(function(){});
   // Live chain status (validator poll cadence). The first live doc resets the
   // new-marker baseline, so ● new only ever flags a commit that appeared while
   // THIS page was watching real data. On failure keep the last good doc (or the
