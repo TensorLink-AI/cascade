@@ -2207,7 +2207,8 @@ class _FundedPodMixin:
         from .miner_spend_guard import spend_end
 
         kind, at_last_seen, why = teardown_spend_kind(
-            self._funded_leg_failures.get(str(getattr(pod, "payer_hotkey", "") or "")))
+            (getattr(self, "_funded_leg_failures", None) or {}).get(
+                str(getattr(pod, "payer_hotkey", "") or "")))
         spend_end(self, str(getattr(pod, "payer_hotkey", "") or ""),
                   str(getattr(pod, "instance_id", "") or ""), outcome="waste",
                   reason=f"torn down without a harvested result{why}", kind=kind,
