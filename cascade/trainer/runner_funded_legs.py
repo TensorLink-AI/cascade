@@ -572,9 +572,11 @@ class _FundedLegMixin:
                     error_class, burn = "payer_pod_lost", False
                     text = f"payer pod ended mid-leg: {text} [evidence {ev}]"
                 elif not ev.get("known"):
-                    # no listing answered: NOTHING is proven — never burn the
-                    # miner's attempt on unknown evidence (2026-11-04 review)
-                    burn = False
+                    # no listing answered: nothing is proven either way — the
+                    # verdict stays a plain infra loss (its attempt still
+                    # counts: the attempt cap is what stops a flaky pod from
+                    # retrying on the miner's money forever); the evidence
+                    # rides the text for the owner (2026-11-04 review)
                     text = f"pod state unknown: {text} [evidence {ev}]"
             self._record_funded_failure(gen.hotkey, text, miner_fault=miner_fault,
                                         error_class=error_class, burn=burn)
