@@ -858,18 +858,24 @@ def test_harvest_retries_a_broken_stream_while_the_pod_answers(tmp_path, monkeyp
     bad = _truncated_tar(tmp_path)
     good = tmp_path / "ok.tar"
     good.write_bytes(_tar_bytes([("./weights.safetensors", b"W" * 8), ("./config.json", b"{}")]))
-    calls: list[str] = []
+    # the ssh argv is built once per harvest (as in production); the "pod"
+    # serves the truncated archive first and the whole one after the probe
+    ptr = tmp_path / "serve"
+    ptr.write_text(str(bad))
+    monkeypatch.setattr(remote_mod, "build_ssh_argv",
+                        lambda h, c: ["sh", "-c", f"cat \"$(cat {ptr})\""])
+    probes: list[str] = []
 
-    def argv(host, cmd):
-        calls.append(cmd)
-        return ["cat", str(bad if len(calls) == 1 else good)]
+    def reachable(host, remote_dir):
+        probes.append(remote_dir)
+        ptr.write_text(str(good))             # the link is back
+        return True
 
-    monkeypatch.setattr(remote_mod, "build_ssh_argv", argv)
-    monkeypatch.setattr(remote_mod, "remote_dir_reachable", lambda h, d: True)
+    monkeypatch.setattr(remote_mod, "remote_dir_reachable", reachable)
     dest = remote_mod.harvest_remote_dir(RemoteHost(name="p", host="h"), "/w/checkpoint",
                                          tmp_path / "out")
     assert (dest / "weights.safetensors").read_bytes() == b"W" * 8
-    assert len(calls) == 2
+    assert probes == ["/w/checkpoint"]        # one break, one probe, one retry
     assert not list(tmp_path.glob("out.partial-*"))
 
 
