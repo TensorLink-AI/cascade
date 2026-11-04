@@ -40,16 +40,23 @@ def sh(argv, **kw):
     return subprocess.run(argv, check=True, capture_output=True, text=True, **kw)
 
 
-def _anchor_receipt_king(args) -> dict | None:
+def _anchor_receipt_king(args, get_text=None) -> dict | None:
     """Fetch + signature-verify the anchor validator's latest receipt (public
-    read) and resolve the king by :func:`champions_archive.king_from_receipt`."""
+    read) and resolve the king by :func:`champions_archive.king_from_receipt`.
+
+    When that receipt names no king (a rejected king re-sync or no-contest
+    settlement superseded the crowning's scored receipt — 2026-11-04), walk
+    the round manifests' ``prev_round_id`` chain back to the newest SCORED,
+    anchor-signed receipt (:func:`champions_archive.walk_back_receipt_king`,
+    bounded); nothing found ⇒ None (the caller keeps the archived king).
+    ``get_text(key) -> str`` overrides the public bucket read (tests)."""
     import urllib.request
 
     sys.path.insert(0, str(args.cascade_tree))
     import champions_archive as ca
 
     from cascade.shared.config import load_chain_config
-    from cascade.shared.hippius import receipt_latest_key
+    from cascade.shared.hippius import manifest_round_key, receipt_latest_key, receipt_round_key
     from cascade.shared.receipt import load_receipt, verify_receipt_signature
 
     cfg = load_chain_config(args.cascade_tree / args.chain_toml)
@@ -57,11 +64,31 @@ def _anchor_receipt_king(args) -> dict | None:
     if not anchor:
         raise ValueError("[manifest] validator_hotkey is unset — no receipt anchor")
     base = f"{str(cfg.storage.s3_endpoint).rstrip('/')}/{cfg.storage.manifest_bucket}"
-    text = urllib.request.urlopen(f"{base}/{receipt_latest_key(anchor)}", timeout=60).read().decode()
-    if not verify_receipt_signature(load_receipt(text), anchor):
+    if get_text is None:
+        def get_text(key: str) -> str:
+            return urllib.request.urlopen(f"{base}/{key}", timeout=60).read().decode()
+
+    def verify(text: str) -> bool:
+        return bool(verify_receipt_signature(load_receipt(text), anchor))
+
+    text = get_text(receipt_latest_key(anchor))
+    if not verify(text):
         raise ValueError(f"receipt signature does not verify against the anchor {anchor[:12]}")
     forfeited = frozenset(getattr(cfg.scoring, "forfeit_hotkeys", ()) or ())
-    return ca.king_from_receipt(json.loads(text), forfeited=forfeited)
+    body = json.loads(text)
+    king = ca.king_from_receipt(body, forfeited=forfeited)
+    if king is not None or not str(body.get("round_id") or ""):
+        return king
+    if str(body.get("status")) == "scored" and (body.get("verdict") or {}).get("king_hotkey"):
+        return None      # it names a king, but a forfeited one — never an older king
+    walked = ca.walk_back_receipt_king(
+        get_text, str(body["round_id"]), manifest_key=manifest_round_key,
+        receipt_key=lambda rid: receipt_round_key(rid, anchor), verify=verify,
+        forfeited=forfeited)
+    if walked is not None:
+        print(f"latest receipt (round {body['round_id']}, status {body.get('status')}) names "
+              f"no king — king from the scored receipt of round {walked['round_id']}")
+    return walked
 
 
 def main() -> int:

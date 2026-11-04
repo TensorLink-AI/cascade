@@ -779,6 +779,48 @@ def latest_receipt_body(store, anchor: str = "") -> dict | None:
     return None
 
 
+LANE_A_WALK_LIMIT = 12
+
+
+def lane_a_receipt_body(store, anchor: str, body: dict | None, *,
+                        limit: int = LANE_A_WALK_LIMIT) -> dict | None:
+    """The newest receipt body that carries the lane-A records
+    (:func:`lane_a_view` non-empty), starting at ``body`` (the latest).
+
+    A rejected (king re-sync) or no-contest receipt carries no ladder /
+    emission / king check, yet it replaces ``latest.json`` — 2026-11-04 one
+    superseded the crowning's scored receipt 21 s later and status/v2.json lost
+    the King-rewards panel. Walk the round manifests' ``prev_round_id`` chain
+    back (at most ``limit`` settlements) through the anchor's per-round
+    receipts, as the trainer's receipt-king walk does. Presentational, like
+    :func:`latest_receipt_body` (not signature-verified). ``body`` itself when
+    nothing older is found. Never raises."""
+    import json
+
+    if not isinstance(body, dict) or lane_a_view(body):
+        return body
+    try:
+        from .hippius import manifest_round_key, receipt_round_key
+    except Exception:  # noqa: BLE001
+        return body
+    rid = str(body.get("round_id") or "")
+    for _ in range(max(0, int(limit)) if rid else 0):
+        try:
+            rid = str((json.loads(store.get_text(manifest_round_key(rid))) or {})
+                      .get("prev_round_id") or "")
+        except Exception:  # noqa: BLE001 — a broken chain ends the walk
+            break
+        if not rid:
+            break
+        try:
+            older = json.loads(store.get_text(receipt_round_key(rid, anchor)))
+        except Exception:  # noqa: BLE001 — no receipt for that round: keep walking
+            continue
+        if isinstance(older, dict) and lane_a_view(older):
+            return older
+    return body
+
+
 # ── receipt index columns ────────────────────────────────────────────────────
 
 
@@ -977,10 +1019,14 @@ def publish_trainer_v2_status(sched, block: int, *, min_interval_s: float = MIN_
                 log.debug("lane C status unavailable: %s", e)
         # The trainer has no validator slot state: lane-C holders and the
         # lane-A ladder / king check come from the latest receipt
-        receipt = None
+        receipt = lane_a_body = None
         try:
             anchor = str(getattr(getattr(cfg, "manifest", None), "validator_hotkey", "") or "")
-            receipt = latest_receipt_body(sched.r.manifest_store(), anchor)
+            store = sched.r.manifest_store()
+            receipt = latest_receipt_body(store, anchor)
+            # a rejected / no-contest latest receipt carries no ladder or king
+            # check: lane A reads the newest receipt that does
+            lane_a_body = lane_a_receipt_body(store, anchor, receipt)
         except Exception as e:  # noqa: BLE001 — presentational
             log.debug("v2 status: latest receipt unavailable: %s", e)
         if lc_drv is not None and callable(getattr(lc_drv, "observe_receipt", None)):
@@ -994,7 +1040,8 @@ def publish_trainer_v2_status(sched, block: int, *, min_interval_s: float = MIN_
                               era_index=getattr(cur, "index", None), king_pointer=ptr,
                               lane_c_trainer=lc_status,
                               lane_c_state=lane_c_state_from_receipt(receipt),
-                              lane_a=lane_a_view(receipt))
+                              lane_a=lane_a_view(lane_a_body if lane_a_body is not None
+                                                 else receipt))
         from .submission_progress import receipt_progress
 
         doc["submission_receipt"] = receipt_progress(receipt)
@@ -1087,7 +1134,8 @@ def publish_trainer_v2_status(sched, block: int, *, min_interval_s: float = MIN_
 
 __all__ = [
     "V2_STATUS_KEY", "build_v2_status", "driver_king_load", "emission_split", "golive",
-    "king_check_fields", "king_routing_health", "ladder_fields", "lane_a_view", "lane_b_view",
+    "king_check_fields", "king_routing_health", "ladder_fields", "lane_a_receipt_body",
+    "lane_a_view", "lane_b_view",
     "lane_c_state_from_receipt", "lane_c_view", "latest_receipt_body", "moe_model_card",
     "payout_terms",
     "publish_trainer_v2_status", "publish_v2_status", "v2_from_block", "v2_index_fields",

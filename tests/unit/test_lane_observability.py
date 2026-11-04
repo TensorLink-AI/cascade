@@ -386,6 +386,58 @@ def test_trainer_publisher_reads_holders_and_ladder_from_receipts(cfg, monkeypat
     assert doc["lane_a"]["ladder"]["court_until_block"] == 50000
 
 
+def test_trainer_publisher_walks_back_past_a_rejected_latest_receipt(cfg, monkeypatch):
+    """2026-11-04: a rejected king re-sync receipt (no ladder / emission /
+    king check) superseded the crowning's scored receipt — lane A must come
+    from the newest receipt that carries it, lane C still from the latest."""
+    from cascade.shared import hippius, v2_status
+
+    anchor = "5Anchor"
+    rejected = {"status": "rejected", "round_id": "r-91", "reject_reason": "king_resyncing"}
+    texts = {hippius.receipt_latest_key(anchor): json.dumps(rejected),
+             hippius.manifest_round_key("r-91"): json.dumps({"prev_round_id": "r-90"}),
+             hippius.manifest_round_key("r-90"): json.dumps({"prev_round_id": "r-89"}),
+             hippius.receipt_round_key("r-89", anchor): json.dumps(RECEIPT_BODY)}
+
+    def get(key):
+        if key not in texts:
+            raise FileNotFoundError(key)
+        return texts[key]
+    store = SimpleNamespace(get_text=get)
+    c = replace(cfg, manifest=replace(cfg.manifest, validator_hotkey=anchor))
+    sched = SimpleNamespace(cfg=c, lane_b=None, lane_c=None, state=SimpleNamespace(current=None),
+                            r=SimpleNamespace(manifest_store=lambda: store))
+    published = []
+    monkeypatch.setattr(v2_status, "publish_v2_status", lambda s, doc: published.append(doc))
+    assert v2_status.publish_trainer_v2_status(sched, 22000, min_interval_s=0)
+    lane_a = published[0]["lane_a"]
+    assert lane_a["ladder"]["court_until_block"] == 50000
+    assert lane_a["king_check"]["result"] == "pass"
+    assert lane_a["round_id"] == str(RECEIPT_BODY.get("round_id", ""))
+
+
+def test_lane_a_receipt_body_is_bounded_and_fail_safe():
+    from cascade.shared import hippius
+    from cascade.shared.v2_status import lane_a_receipt_body
+
+    rejected = {"status": "rejected", "round_id": "r30"}
+    texts = {hippius.manifest_round_key(f"r{i}"): json.dumps({"prev_round_id": f"r{i - 1}"})
+             for i in range(1, 31)}
+    texts[hippius.receipt_round_key("r0", "a")] = json.dumps(RECEIPT_BODY)
+
+    def get(key):
+        if key not in texts:
+            raise FileNotFoundError(key)
+        return texts[key]
+    store = SimpleNamespace(get_text=get)
+    assert lane_a_receipt_body(store, "a", rejected) is rejected          # beyond 12 steps
+    assert lane_a_receipt_body(store, "a", {**rejected, "round_id": "r5"}) == RECEIPT_BODY
+    assert lane_a_receipt_body(store, "a", RECEIPT_BODY) is RECEIPT_BODY  # already has lane A
+    assert lane_a_receipt_body(SimpleNamespace(get_text=get), "a", None) is None
+    broken = SimpleNamespace(get_text=lambda k: (_ for _ in ()).throw(OSError("down")))
+    assert lane_a_receipt_body(broken, "a", rejected) is rejected
+
+
 def test_lane_b_view_lists_horizon_slots(cfg):
     doc = build_v2_status(cfg, block=100, as_of="t")
     lb = doc["lane_b"]

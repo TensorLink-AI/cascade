@@ -149,6 +149,47 @@ def king_from_receipt(receipt: dict, *, forfeited: frozenset | set = frozenset()
             "crowned_here": dethroned and e.get("role") == "challenger"}
 
 
+RECEIPT_WALK_LIMIT = 12
+
+
+def walk_back_receipt_king(get_text, round_id: str, *, manifest_key, receipt_key, verify,
+                           forfeited: frozenset | set = frozenset(),
+                           limit: int = RECEIPT_WALK_LIMIT) -> dict | None:
+    """The king of the newest SCORED anchor receipt BEFORE ``round_id`` — the
+    trainer's walk-back (``TrainerRunner._walk_back_receipt_king``).
+
+    The anchor's ``latest.json`` can be a rejected (king re-sync) or no-contest
+    receipt that names no king, yet it supersedes the crowning's scored
+    receipt (2026-11-04: 21 s after it was written). Follow the round
+    manifests' ``prev_round_id`` chain back from ``round_id`` (exclusive) at
+    most ``limit`` settlements, reading ``receipt_key(rid)``; a receipt that is
+    missing or fails ``verify(text)`` is skipped, the first verified SCORED one
+    that names a king ends the walk with :func:`king_from_receipt` (None when
+    that king is forfeited — never an older king). None when the chain breaks
+    or nothing is found. ``get_text(key) -> str`` raises on a miss. Never raises."""
+    rid = str(round_id or "")
+    for _ in range(max(0, int(limit))):
+        try:
+            rid = str((json.loads(get_text(manifest_key(rid))) or {}).get("prev_round_id") or "")
+        except Exception:  # noqa: BLE001 — a broken chain ends the walk
+            return None
+        if not rid:
+            return None
+        try:
+            text = get_text(receipt_key(rid))
+            body = json.loads(text)
+        except Exception:  # noqa: BLE001 — no receipt for that round: keep walking
+            continue
+        try:
+            if not isinstance(body, dict) or not verify(text):
+                continue
+        except Exception:  # noqa: BLE001 — an unverifiable receipt is skipped
+            continue
+        if str(body.get("status")) == "scored" and (body.get("verdict") or {}).get("king_hotkey"):
+            return king_from_receipt(body, forfeited=forfeited)
+    return None
+
+
 def reign_for_digest(rows: list[dict], digest: str, current: dict | None = None) -> dict | None:
     """The reign record to file ``digest`` under. A reign the receipts already
     list as king wins; otherwise a king crowned by the newest dethrone
