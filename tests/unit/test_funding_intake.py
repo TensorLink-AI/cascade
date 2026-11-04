@@ -465,7 +465,10 @@ def test_withdraw_during_a_live_phase_keeps_the_key(tmp_path):
     intake.fund(headers)
     assert intake.queue.mark_in_flight(HK, REF, target_boundary=9000, era_index=1,
                                        started_block=100)
-    intake.queue.set_phase(HK, "harvesting", expect_ref=REF)
+    e = intake.queue.get(HK)
+    intake.queue.set_phase(HK, "harvesting", expect_ref=REF, expect_started_block=e.started_block,
+                           expect_funded_at=e.funded_at, expect_attempt_id=e.attempt_id)
+    assert intake.queue.get(HK).phase == "harvesting"
     status, body = intake.withdraw({"X-Miner-Hotkey": HK, "X-Commit-Ref": REF})
     assert status == 409 and body["code"] == "not_queued"
     assert "harvesting" in body["message"]
