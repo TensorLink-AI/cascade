@@ -970,6 +970,57 @@ class _FundedPodMixin:
         self._funded_leg_failures[hotkey] = (error_tail(msg, 500), miner_fault,
                                              error_class, burn)
 
+    # The payer-vs-operator control listing (PayerCapacityWatch): the control
+    # runs after this many consecutive empty payer polls, at most this often,
+    # and this many consecutive controls showing capacity convict the account.
+    PAYER_CONTROL_AFTER_ZERO_POLLS = 3
+    PAYER_CONTROL_INTERVAL_SECONDS = 300.0
+    PAYER_CONTROL_HITS_NEEDED = 2
+
+    def _payer_capacity_watch(self, api_key, wait_caps: dict):
+        """The capacity probe for a payer-funded wait: the payer's own listing,
+        checked against the OPERATOR's listing under the same caps and the
+        same GPU-health guard whenever the payer's stays empty
+        (:class:`~cascade.provision.payer_pool.PayerCapacityWatch`)."""
+        from ..provision.payer_pool import PayerCapacityWatch, payer_capacity
+        from .gpu_health import health_for
+
+        def payer(fitting):
+            return payer_capacity(api_key, fitting, wait_caps, live_claimed_executors(self),
+                                  health_for(self))
+
+        def control(fitting):
+            health = health_for(self)
+            fit = tuple(health.allowed(tuple(fitting))) if health.threshold else tuple(fitting)
+            if not fit:
+                return 0            # quarantined for everyone: not the payer's account
+            return self._probe_funded_capacity(fit, live_claimed_executors(self),
+                                               price_caps=wait_caps)
+
+        cls = _FundedPodMixin
+        return PayerCapacityWatch(
+            payer_probe=payer, control_probe=control,
+            now=getattr(self, "_rent_wait_now", None) or time.time,
+            zero_polls_before_control=int(getattr(
+                self, "PAYER_CONTROL_AFTER_ZERO_POLLS", cls.PAYER_CONTROL_AFTER_ZERO_POLLS)),
+            control_interval_seconds=float(getattr(
+                self, "PAYER_CONTROL_INTERVAL_SECONDS", cls.PAYER_CONTROL_INTERVAL_SECONDS)),
+            control_hits_needed=int(getattr(
+                self, "PAYER_CONTROL_HITS_NEEDED", cls.PAYER_CONTROL_HITS_NEEDED)))
+
+    def _payer_account_message(self, api_key, watch) -> str:
+        """The miner-readable ``payer_account`` verdict: what the listings
+        showed, whether the key can read its own balance, what to do. Never
+        carries the key."""
+        from .money_guard import payer_balance_note
+
+        verdict = getattr(watch, "verdict", None)
+        why = str(verdict) if verdict is not None else "your GPU provider account lists nothing"
+        note = payer_balance_note(self, api_key)
+        return (f"{why}{'; ' + note if note else ''} — check the key's permissions and the "
+                "account's balance/standing with your GPU provider, then fund again; "
+                "nothing rented, no attempt charged")
+
     def _small_loss_rerun(self, gen, entry, queue) -> bool:
         """Owner 2026-11-04: a SMALL our-side loss never becomes an operator
         make-good leg. When the miner's lemon / infra-waste on this submission
@@ -1343,7 +1394,7 @@ class _FundedPodMixin:
                            or float(getattr(rnd, "funded_max_price_per_hour", 0.0) or 0.0)
                            ) if getattr(gpu_choice, "gpu", "") else 0.0
             poor = payer_balance_refusal(self, api_key, hours=self._leg_wall_seconds() / 3600.0,
-                                         rate=max(knob, chosen_rate))
+                                         rate=max(knob, chosen_rate), who=gen.hotkey[:12])
             if poor:
                 # nothing rented, requeued with a backoff — never terminal,
                 # never a burn, never counted against any cap
@@ -1785,21 +1836,31 @@ class _FundedPodMixin:
             from .progress import report_progress
 
             report_progress(self, "waiting_gpu", "market_capacity")
-            from ..provision.payer_pool import payer_capacity
             wait_caps = (chosen[1] if chosen is not None else
                          self._fallback_price_caps(gpu_choice) if fell_back
                          else self._funded_price_caps())
+            # The probe tells an empty ACCOUNT from an empty MARKET: the
+            # payer's listing against the operator's under the same caps.
+            watch = self._payer_capacity_watch(api_key, wait_caps)
             waited = self._wait_for_funded_capacity(
                 chosen[0] if chosen is not None else skus,
                 describe=f"funded leg {gen.hotkey[:12]}", hotkey=gen.hotkey,
-                capacity_probe=lambda fitting, wait_caps=wait_caps: payer_capacity(api_key, fitting, wait_caps,
-                    live_claimed_executors(self), health_for(self)),
+                capacity_probe=watch,
                 allow_paid_fallback=chosen is None,
                 **({"choice_changed": lambda: choice_update() is not None}
                    if reread_choice else {}),
                 **({"price_caps": wait_caps} if chosen is not None or fell_back else {}))
             if waited == "gpu_changed":
                 continue                  # re-derived at the top of the loop
+            if waited == "payer_account":
+                # The miner's account (key refused / lists nothing while the
+                # market has the type): a terminal, unburned verdict the
+                # miner can read and act on — never another era of polling.
+                from ..funding.queue import PAYER_ACCOUNT_CLASS
+
+                result = replace(result, error=self._payer_account_message(api_key, watch),
+                                 error_class=PAYER_ACCOUNT_CLASS, burn_attempt=False)
+                break
             if waited in ("operator_rent", "operator"):
                 from .money_guard import gate_or_adopt
 
@@ -1837,8 +1898,10 @@ class _FundedPodMixin:
                 msg += (f" [LEAKED pod {result.leaked_pod} may still bill this "
                         f"payer — stop it through its GPU provider on your "
                         f"account]")
+            from ..funding.queue import PAYER_ACCOUNT_CLASS
+
             self._record_funded_failure(
-                gen.hotkey, msg, miner_fault=(result.error_class == "auth"),
+                gen.hotkey, msg, miner_fault=result.error_class in ("auth", PAYER_ACCOUNT_CLASS),
                 error_class=result.error_class, burn=result.burn_attempt)
             raise _FundedLegSkip(gen.hotkey)
         # Replace the intent row with the real pod record (same instance id).

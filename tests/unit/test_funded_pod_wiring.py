@@ -91,6 +91,7 @@ def _runner(tmp_path, *, sku="RTX4090", image="ghcr.io/x/worker@sha256:" + "c" *
                  "_funded_ledger_path", "_load_funded_ledger", "_save_funded_ledger",
                  "_ledger_add", "_ledger_remove", "_reconcile_funded_pods",
                  "_record_funded_failure", "_count_funded_loss", "_rent_funded_host",
+                 "_payer_capacity_watch", "_payer_account_message",
                  "_teardown_funded_pod", "_run_funded_leg",
                  "_keep_funded_pod_for_bench", "_teardown_kept_funded_pod",
                  "_sweep_payer_account", "_funded_harvest",

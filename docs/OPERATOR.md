@@ -842,6 +842,25 @@ balance is retried and then the rent proceeds. A shortfall requeues
 unburned as `payer_balance` ("top up: need ≈$X, balance $Y"), never counted
 against any cap.
 
+**Empty account vs empty market** (`payer_account`, 2026-11-04). A funded
+leg's capacity wait probes the PAYER's listing; when that stays empty for
+`PAYER_CONTROL_AFTER_ZERO_POLLS` (3) consecutive polls, the trainer runs
+the same read-only listing on the OPERATOR key under the miner's price caps
+and GPU-health guard, at most every `PAYER_CONTROL_INTERVAL_SECONDS` (300).
+`PAYER_CONTROL_HITS_NEEDED` (2) consecutive controls that show capacity
+while every payer poll in between saw nothing end the wait with a terminal,
+unburned `payer_account` verdict ("your account lists no 8xH100 executor …
+while the marketplace shows N …; balance $X / the key cannot read its own
+balance") — the miner fixes the key/account and funds again; the entry is
+never re-dispatched. A payer listing that fails with auth-class text
+(401/403/"invalid api key") convicts at once. A control that is empty too
+keeps the wait a market `no_capacity`. On a king's own key the verdict
+counts as a key failure (the operator takes the leg over, DEC-CA-0055).
+Every empty `lium ls` now logs one line with the raw row count and what each
+filter removed (`lium (payer key): 8xH100 listing — 0 raw row(s) …`), and a
+probe exception in the wait is logged instead of swallowed. The constants
+live on the trainer mixin (`runner_funded_pods.py`), not in chain.toml.
+
 **The new knobs need no TOML change.** Every default above is live as
 shipped. Integral floats such as `3600.0` are accepted for every
 seconds/count knob.

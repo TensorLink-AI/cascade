@@ -58,6 +58,7 @@ __all__ = [
     "BUDGET_CLASS",
     "PAUSED_BUDGET_STATUS",
     "PAUSED_SPEND_STATUS",
+    "PAYER_ACCOUNT_CLASS",
     "PAYER_BALANCE_CLASS",
     "SPEND_CAP_CLASS",
     "OPERATOR_TRANSIENT_CLASS",
@@ -159,6 +160,13 @@ PAUSED_SPEND_STATUS = "paused_spend_cap"
 # The payer's balance cannot finish the leg: nothing rented, requeued with a
 # backoff, never counted against any cap (the miner tops up).
 PAYER_BALANCE_CLASS = "payer_balance"
+# The payer's provider ACCOUNT lists nothing (or refuses the key on a
+# listing) while the operator's control listing shows the same GPU types
+# under the same caps: not the market, so never ``no_capacity``. Terminal
+# like ``auth`` — the miner fixes the key / balance / account standing and
+# funds again; nothing rented, no attempt charged, never re-dispatched
+# (2026-11-04: one entry polled "no capacity" for five days on a dead key).
+PAYER_ACCOUNT_CLASS = "payer_account"
 # The miner's own TOTAL budget for the submission (``max_total_spend_usd``)
 # cannot cover the next leg: the same never-reject guarantees as the waste
 # cap; a re-fund with a higher budget (or the owner) resumes it.
