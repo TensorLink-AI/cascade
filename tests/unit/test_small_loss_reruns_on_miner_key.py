@@ -52,7 +52,7 @@ def test_a_small_loss_reruns_on_the_miners_key(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("kw", [dict(lost=60.0), dict(cap=0.0), dict(faults=3),
-                                dict(is_capped=True)])
+                                dict(is_capped=True), dict(lost=0.0)])
 def test_the_approval_path_is_kept_otherwise(tmp_path, monkeypatch, kw):
     cleared, q = _run(tmp_path, monkeypatch, **kw)
     assert not cleared and q.billed is True

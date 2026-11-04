@@ -974,7 +974,11 @@ class _FundedPodMixin:
                 return False
             s = led.summary(gen.hotkey, ref=entry.ref, funded_at=entry.funded_at)
             lost = float(s.make_good_usd) + float(s.infra_waste_usd)
-            if lost >= cap:
+            # Only a flag that came from LEMON losses (a recorded make-good on
+            # the miner's key) is this rule's to clear: an operator-billed
+            # entry with no such loss was flagged for another reason (an
+            # expired key, a lost finished run, our storage) — approval path.
+            if float(s.make_good_usd) <= 0 or lost >= cap:
                 return False
         except Exception as e:  # noqa: BLE001 — unsure ⇒ the approval path decides
             log.warning("funded leg %s: small-loss rerun check failed (%s) — owner approval "
