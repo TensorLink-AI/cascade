@@ -927,7 +927,7 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 11px;
 .badge.win { background: var(--chal); color: var(--bone-light); border-color: var(--chal); }
 .badge.hold { background: var(--slate); color: var(--bone-light); border-color: var(--slate); }
 [data-theme="dark"] .badge.hold { background: var(--bone-light); color: var(--slate); border-color: var(--bone-light); }
-.badge.inconclusive, .badge.rejected { background: none; color: var(--muted); border-color: var(--muted); }
+.badge.inconclusive, .badge.rejected, .badge.nocontest { background: none; color: var(--muted); border-color: var(--muted); }
 
 /* chart */
 .chart-wrap { width: 100%; aspect-ratio: 5/2; }
@@ -1694,8 +1694,15 @@ function loadLastScored(){
     }
   }).catch(function(){}).then(function(){ if(_lastScoredLoading===id) _lastScoredLoading=""; });
 }
-function verdictClass(r){ if(r.status==="rejected")return"rejected"; if(r.inconclusive)return"inconclusive"; return r.challenger_wins_round?"win":"hold"; }
-function verdictLabel(r){ if(r.status==="rejected")return"Rejected"; if(r.inconclusive)return"Inconclusive"; return r.challenger_wins_round?(r.dethroned?"Dethroned":"Challenger wins"):"King holds"; }
+// A king-only round has nothing to score: the validator's receipt keeps the
+// machine-readable status "rejected" (audit, bootstrap and archived signatures
+// branch on it) with reason no_king_challenger_pair, but it is a designed
+// no-contest, not a rejection — label it as such everywhere on the page.
+var NO_CONTEST_REASONS={no_king_challenger_pair:"No challenger this round — the king holds"};
+function isNoContest(r){ return !!(r&&r.status==="rejected"&&NO_CONTEST_REASONS[String(r.reject_reason||"")]); }
+function reasonLabel(r){ var k=String((r&&r.reject_reason)||""); return NO_CONTEST_REASONS[k]||k||"--"; }
+function verdictClass(r){ if(isNoContest(r))return"nocontest"; if(r.status==="rejected")return"rejected"; if(r.inconclusive)return"inconclusive"; return r.challenger_wins_round?"win":"hold"; }
+function verdictLabel(r){ if(isNoContest(r))return"No contest"; if(r.status==="rejected")return"Rejected"; if(r.inconclusive)return"Inconclusive"; return r.challenger_wins_round?(r.dethroned?"Dethroned":"Challenger wins"):"King holds"; }
 
 // ── render ─────────────────────────────────────────────────────────────────
 function renderHeader(){
@@ -1792,13 +1799,15 @@ function renderVerdict(){
   // a newer unscored settlement (rejected re-sync / no-contest) is a secondary note only
   var later=newest&&newest!==r?newest:null;
   document.getElementById("verdict-when").textContent=(r.published_at?"settled "+timeAgo(r.published_at):"")+
-    (later?" · newer settlement "+shortRoundId(later.round_id)+" "+String(later.status||"unscored")+
-      (later.reject_reason?" ("+String(later.reject_reason)+")":"")+" — the king is unchanged":"");
+    (later?" · newer settlement "+shortRoundId(later.round_id)+" "+
+      (isNoContest(later)?"no contest ("+reasonLabel(later).toLowerCase()+")"
+        :String(later.status||"unscored")+(later.reject_reason?" ("+reasonLabel(later)+")":""))+
+      (isNoContest(later)?"":" — the king is unchanged"):"");
   renderEraSettlements(r,cn);
   var cls=verdictClass(r), cells=[];
   cells.push(stat("Verdict",'<span class="badge '+cls+'">'+esc(verdictLabel(r))+'</span>'));
   if(r.status==="rejected"){
-    cells.push(stat("Reason",'<span class="muted" style="font-size:13px;font-family:var(--font-sans);white-space:normal">'+esc(r.reject_reason||"--")+'</span>'));
+    cells.push(stat("Reason",'<span class="muted" style="font-size:13px;font-family:var(--font-sans);white-space:normal">'+esc(reasonLabel(r))+'</span>'));
   } else {
     var betterV=r.chal_geomean!=null&&r.king_geomean!=null&&r.chal_geomean<r.king_geomean;
     var ERR_TIP="geomean(CRPS · MASE) — lower is better";
