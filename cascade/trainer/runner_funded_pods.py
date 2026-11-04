@@ -951,15 +951,17 @@ class _FundedPodMixin:
         stays a make-good owed). Never for a leg the owner already approved
         on our account, past the miner waste cap, or past the operator-fault
         pause (a systemic fault). True when the flag was cleared."""
-        cap = float(getattr(self.cfg.round, "make_good_rerun_below_usd", 0.0) or 0.0)
-        if cap <= 0 or not getattr(self.cfg, "round", None):
-            return False
         try:
+            cap = float(getattr(getattr(getattr(self, "cfg", None), "round", None),
+                                "make_good_rerun_below_usd", 0.0) or 0.0)
+            if cap <= 0:
+                return False
             from .miner_spend_guard import _ledger, capped
 
             if capped(self, gen):
                 return False
-            if int(getattr(entry, "operator_faults", 0) or 0) >= self.OPERATOR_FAULT_RETRIES:
+            if int(getattr(entry, "operator_faults", 0) or 0) >= int(
+                    getattr(self, "OPERATOR_FAULT_RETRIES", 0) or 0):
                 return False
             from ..funding.operator_approvals import APPROVED, LAUNCHED, OperatorApprovals
 
@@ -1129,7 +1131,7 @@ class _FundedPodMixin:
             queue.set_operator_billed(gen.hotkey, False)
             flagged = queue.get(gen.hotkey)
         if (flagged is not None and bool(getattr(flagged, "operator_billed", False))
-                and self._small_loss_rerun(gen, flagged, queue)):
+                and _FundedPodMixin._small_loss_rerun(self, gen, flagged, queue)):
             flagged = queue.get(gen.hotkey)
         if flagged is not None and bool(getattr(flagged, "operator_billed", False)):
             # Owner make-good: this entry's leg is on the operator's bill — an
