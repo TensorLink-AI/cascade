@@ -302,7 +302,9 @@ def _run_direct(args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from ..shared.codepath import verify_release_code_path
     from ..shared.env import load_env_files
+    verify_release_code_path("cascade-validator")
     load_env_files()
     args = _build_parser().parse_args(argv)
     if args.netconfig_policy:

@@ -33,6 +33,49 @@ _REVEAL_CACHE_SECONDS = 30.0
 _CHAIN_DEADLINE_SECONDS = 30.0
 
 
+def ledger_pod_live(ledger_path: Path):
+    """``hotkey -> bool``: does the trainer's funded-pod ledger (its work
+    root's ``funded_pods.json``) still carry a pod on this payer's key?
+    Read-only; the ledger's own backup copy is consulted on a torn write."""
+    import json
+
+    from ..shared.atomic import read_text_with_backup
+
+    def _rows(text):
+        raw = json.loads(text)
+        return raw if isinstance(raw, list) else []
+
+    def live(hotkey: str) -> bool:
+        rows, source = read_text_with_backup(ledger_path, _rows)
+        if source == "absent":
+            return False
+        if rows is None:
+            raise RuntimeError(f"funded ledger {ledger_path} unreadable")
+        return any(str((r or {}).get("payer_hotkey") or "") == hotkey for r in rows)
+
+    return live
+
+
+def withdrawn_clears_approvals(queue_path: Path):
+    """``hotkey -> None``: drop the hotkey's PENDING or APPROVED-but-unlaunched
+    operator make-good request for this queue (``work_root/operator_approvals
+    .json``) — a withdrawn entry can never consume it, and a parked request
+    keeps the owner's critical alert up forever. A launched request stays."""
+    from .operator_approvals import APPROVALS_FILE, APPROVED, PENDING, OperatorApprovals
+
+    approvals = OperatorApprovals(queue_path.parent / APPROVALS_FILE)
+    queue_name = queue_path.name
+
+    def clear(hotkey: str) -> None:
+        rec = approvals.get(queue_name, hotkey)
+        if rec is not None and rec.get("state") in (PENDING, APPROVED):
+            approvals.clear(queue_name, hotkey)
+            log.info("withdraw %s: cleared its %s operator request (%s, ~$%s)", hotkey,
+                     rec.get("state"), rec.get("kind"), rec.get("projected_cost_usd", "?"))
+
+    return clear
+
+
 class _DeadlineCachedPoll:
     """A chain read behind a cache and a hard poll deadline (shared plumbing).
 
@@ -323,6 +366,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     logging.basicConfig(level=args.log_level,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    from ..shared.codepath import verify_release_code_path
+    verify_release_code_path("cascade-intake")
     load_env_files()
 
     cfg = None
@@ -466,6 +511,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         lane_b_targets=lane_b_slots,
         lane_b_max_targets=lane_b_cap,
         lane_a_admission=lane_a_admission,
+        pod_live=ledger_pod_live(Path(args.queue_path).parent / "funded_pods.json"),
+        on_withdrawn=withdrawn_clears_approvals(Path(args.queue_path)),
     )
     server = intake.make_server(args.host, args.port,
                                 max_connections=args.max_connections,

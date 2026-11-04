@@ -40,6 +40,11 @@ RESULT, WASTE = "result", "waste"
 # ``make_good_usd`` for the owner (money safety II).
 MAKE_GOOD = "make_good"
 INFRA, MINER = "infra", "miner"
+# A pod that vanished mid-leg with NO proof of whose doing (``payer_pod_lost``):
+# the miner's money is gone, but it is neither an operator-side infra loss
+# (no early make-good filed from it) nor the miner's own fault. The owner
+# sees it in the spend view and decides (2026-11-04, 5GhPUmHV).
+UNPROVEN = "unproven"
 
 
 class SpendUnknown(RuntimeError):

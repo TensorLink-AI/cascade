@@ -194,6 +194,12 @@ PHASES = frozenset({"admitted", "waiting_admission", "preparing_data", "waiting_
                     "awaiting_settlement", "waiting_operator", "queued", "done",
                     "failed", "withdrawn", PAUSED_STATUS, AWAITING_APPROVAL_STATUS,
                     "paused_spend_cap", "paused_budget"})
+# Phases during which a leg has (or may still have) a pod on the payer's key:
+# the key must be retained (teardown / re-attach / harvest need it) whatever
+# the entry's status says (money safety III, 2026-11-04).
+LIVE_LEG_PHASES = frozenset({"admitted", "waiting_admission", "preparing_data", "waiting_gpu",
+                             "waiting_launch", "booting", "training", "harvesting",
+                             "evaluating", "awaiting_settlement"})
 PHASE_REASONS = frozenset({"", "availability_check", "market_capacity", "king_priority",
                           "operator_recovery"})
 

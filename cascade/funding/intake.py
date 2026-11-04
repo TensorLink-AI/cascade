@@ -160,7 +160,7 @@ from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .gpu_choice import GpuCatalog, GpuChoice, parse_gpu_headers, wall_warning
-from .queue import FundedQueue
+from .queue import LIVE_LEG_PHASES, FundedQueue
 from .vault import PayerKeyVault
 
 __all__ = [
@@ -397,7 +397,19 @@ class FundingIntake:
         lane_b_targets: tuple[str, ...] | None = None,
         lane_b_max_targets: int | None = None,
         lane_a_admission: Callable[[int | None], tuple[int, dict] | None] | None = None,
+        pod_live: Callable[[str], bool] | None = None,
+        on_withdrawn: Callable[[str], None] | None = None,
     ) -> None:
+        # ``on_withdrawn(hotkey)``: the entry left the queue by the miner's
+        # hand — any operator make-good request still parked for it is moot
+        # (2026-11-04: a withdrawn 5GhPUmHV kept a pending $89 request alive).
+        self.on_withdrawn = on_withdrawn
+        # Money safety III (2026-11-04): ``pod_live(hotkey)`` — does the
+        # trainer's funded-pod ledger still carry a pod on this payer's key?
+        # While it does, a withdraw never forgets the key (teardown / harvest
+        # / re-attach need it); the key goes with the pod. None = no ledger
+        # (tests / dev) → status-only custody as before.
+        self.pod_live = pod_live
         self.direct_intake = direct_intake
         self.lane_a_admission = lane_a_admission
         # DEC-CA-0059 item 8 lane B: the domain-expert funding queue + its
@@ -877,27 +889,67 @@ class FundingIntake:
             return status, ctx
         hotkey = ctx["hotkey"]
         if self.queue.withdraw(hotkey):
+            if self.on_withdrawn is not None:
+                try:
+                    self.on_withdrawn(hotkey)
+                except Exception as e:  # noqa: BLE001 — bookkeeping never blocks custody
+                    log.warning("withdraw %s: on_withdrawn hook failed (%s)", hotkey, e)
+            if self._pod_live(hotkey):
+                log.info("withdraw %s: entry withdrawn; a pod on this key is still on the "
+                         "ledger — key retained until its teardown", hotkey)
+                return 200, {"status": "withdrawn", "key": "retained-until-teardown"}
             self.vault.remove(hotkey)
             log.info("withdraw %s", hotkey)
-            return 200, {"status": "withdrawn"}
+            return 200, {"status": "withdrawn", "key": "forgotten"}
         entry = self.queue.get(hotkey)
         # Money safety II (2026-11-03 00:59, 5C4hrfpM): the live status of a
         # running leg is "in_flight" (rolling), not only "in_round". Checking
         # only the latter fell through to the key removal below — the entry
         # stayed live with no key and the trainer filed an "expired key"
         # operator rent request. A live entry keeps its key: 409.
-        if entry is not None and entry.status not in ("done", "failed", "withdrawn"):
+        if entry is not None and (entry.status not in ("done", "failed", "withdrawn")
+                                  or (entry.phase or "") in LIVE_LEG_PHASES):
+            # Money safety III (2026-11-04, 5GhPUmHV): the status check alone
+            # is not enough — a leg in a live PHASE (booting, training,
+            # harvesting, ...) has a pod on the miner's key whose teardown
+            # and re-attach need that key. Dropping it mid-harvest left a
+            # finished run's only checkpoint copy on a pod we could no
+            # longer reach ($90 lost). Both halves must say "settled".
+            log.info("withdraw %s refused: status=%s phase=%s (live leg keeps its key)",
+                     hotkey, entry.status, entry.phase or "")
             return 409, {"code": "not_queued",
-                         "message": f"this submission is {entry.status} — a running leg runs to "
-                                    "its verdict and the key is retained until then (teardown "
-                                    "needs it); withdraw again once it settles"}
+                         "message": f"this submission is {entry.status}"
+                                    f"{' (' + entry.phase + ')' if entry.phase else ''} — a "
+                                    "running leg runs to its verdict and the key is retained "
+                                    "until then (teardown needs it); withdraw again once it "
+                                    "settles"}
         # No live entry: nothing to unqueue, but honor the custody half — a
         # terminal (done/failed) or absent entry has no teardown claim on the
         # key, so the miner can make us forget it NOW rather than waiting out
         # the 36h TTL (review 2026-09-02).
+        if self._pod_live(hotkey):
+            log.info("withdraw %s: no live entry but a pod on this key is still on the "
+                     "ledger — key retained until its teardown", hotkey)
+            return 200, {"status": "key-retained",
+                         "message": "a pod rented on this key is still live; the key is "
+                                    "kept until the trainer has torn it down — withdraw "
+                                    "again afterwards (or let the TTL expire it)"}
         self.vault.remove(hotkey)
-        log.info("withdraw %s: no live entry — key forgotten", hotkey)
+        log.info("withdraw %s: no live entry (status=%s phase=%s) — key forgotten", hotkey,
+                 getattr(entry, "status", None), getattr(entry, "phase", "") or "")
         return 200, {"status": "key-forgotten"}
+
+    def _pod_live(self, hotkey: str) -> bool:
+        """True when the funded ledger still carries a pod on ``hotkey``'s
+        key. Fails CLOSED (True) when the ledger cannot be read: an unreadable
+        ledger is not evidence that the pod is gone."""
+        if self.pod_live is None:
+            return False
+        try:
+            return bool(self.pod_live(hotkey))
+        except Exception as e:  # noqa: BLE001 — custody fails closed
+            log.warning("withdraw %s: funded ledger unreadable (%s) — key retained", hotkey, e)
+            return True
 
     # ── lane C (DEC-CA-0056) ─────────────────────────────────────────────────
 

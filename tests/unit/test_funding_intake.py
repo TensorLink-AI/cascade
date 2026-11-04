@@ -452,3 +452,91 @@ def test_http_per_ip_rate_limit_returns_429(tmp_path):
     finally:
         server.shutdown()
         server.server_close()
+
+
+# ── money safety III (2026-11-04, 5GhPUmHV): the key goes with the POD ───────
+
+
+def test_withdraw_during_a_live_phase_keeps_the_key(tmp_path):
+    """A leg in a live phase (harvesting here) has a pod on the miner's key:
+    withdraw is refused whatever the status says, and the key stays."""
+    intake, _ = make_intake(tmp_path)
+    headers = {"X-Miner-Hotkey": HK, "X-Commit-Ref": REF, "X-Lium-Api-Key": "sk"}
+    intake.fund(headers)
+    assert intake.queue.mark_in_flight(HK, REF, target_boundary=9000, era_index=1,
+                                       started_block=100)
+    e = intake.queue.get(HK)
+    intake.queue.set_phase(HK, "harvesting", expect_ref=REF, expect_started_block=e.started_block,
+                           expect_funded_at=e.funded_at, expect_attempt_id=e.attempt_id)
+    assert intake.queue.get(HK).phase == "harvesting"
+    status, body = intake.withdraw({"X-Miner-Hotkey": HK, "X-Commit-Ref": REF})
+    assert status == 409 and body["code"] == "not_queued"
+    assert "harvesting" in body["message"]
+    assert intake.vault.get(HK) == "sk"
+
+
+def test_withdraw_keeps_the_key_while_a_pod_is_on_the_ledger(tmp_path):
+    """Queued again after a kept-pod fault, the entry may be withdrawn — but
+    the key is retained while the funded ledger still carries a pod on it;
+    once the pod is torn down the next withdraw forgets the key."""
+    live = {"pods": {HK}}
+    intake, _ = make_intake(tmp_path)
+    intake.pod_live = lambda hk: hk in live["pods"]
+    headers = {"X-Miner-Hotkey": HK, "X-Commit-Ref": REF, "X-Lium-Api-Key": "sk"}
+    intake.fund(headers)
+    status, body = intake.withdraw({"X-Miner-Hotkey": HK, "X-Commit-Ref": REF})
+    assert (status, body["status"], body["key"]) == (200, "withdrawn", "retained-until-teardown")
+    assert intake.vault.get(HK) == "sk"
+    # still live: the no-entry path retains it too
+    status, body = intake.withdraw({"X-Miner-Hotkey": HK, "X-Commit-Ref": REF})
+    assert (status, body["status"]) == (200, "key-retained")
+    assert intake.vault.get(HK) == "sk"
+    live["pods"].clear()                      # the trainer tore the pod down
+    status, body = intake.withdraw({"X-Miner-Hotkey": HK, "X-Commit-Ref": REF})
+    assert (status, body["status"]) == (200, "key-forgotten")
+    assert intake.vault.get(HK) is None
+
+
+def test_withdraw_fails_closed_when_the_ledger_is_unreadable(tmp_path):
+    intake, _ = make_intake(tmp_path)
+
+    def boom(hk):
+        raise OSError("ledger torn")
+
+    intake.pod_live = boom
+    headers = {"X-Miner-Hotkey": HK, "X-Commit-Ref": REF, "X-Lium-Api-Key": "sk"}
+    intake.fund(headers)
+    status, body = intake.withdraw({"X-Miner-Hotkey": HK, "X-Commit-Ref": REF})
+    assert (status, body["key"]) == (200, "retained-until-teardown")
+    assert intake.vault.get(HK) == "sk"
+
+
+def test_ledger_pod_live_reads_the_trainer_ledger(tmp_path):
+    import json
+
+    from cascade.funding.main import ledger_pod_live
+
+    path = tmp_path / "funded_pods.json"
+    live = ledger_pod_live(path)
+    assert live(HK) is False                       # absent ledger: no pod
+    path.write_text(json.dumps([{"instance_id": "p-0", "payer_hotkey": HK},
+                                {"instance_id": "p-1", "payer_hotkey": "5Other"}]))
+    assert live(HK) is True and live("5Nobody") is False
+
+
+def test_withdraw_clears_a_parked_operator_request(tmp_path):
+    from cascade.funding.main import withdrawn_clears_approvals
+    from cascade.funding.operator_approvals import APPROVALS_FILE, OperatorApprovals
+
+    qpath = tmp_path / "funded_queue.json"
+    approvals = OperatorApprovals(tmp_path / APPROVALS_FILE)
+    approvals.request("funded_queue.json", HK, ref=REF, attempt_id="a1", kind="spend_cap_make_good",
+                      projected_cost_usd=89.38, funded_at=1.0)
+    assert approvals.get("funded_queue.json", HK)["state"] == "pending"
+    intake, _ = make_intake(tmp_path)
+    intake.queue = __import__("cascade.funding.queue", fromlist=["FundedQueue"]).FundedQueue(qpath)
+    intake.on_withdrawn = withdrawn_clears_approvals(qpath)
+    intake.fund({"X-Miner-Hotkey": HK, "X-Commit-Ref": REF, "X-Lium-Api-Key": "sk"})
+    status, body = intake.withdraw({"X-Miner-Hotkey": HK, "X-Commit-Ref": REF})
+    assert (status, body["status"]) == (200, "withdrawn")
+    assert approvals.get("funded_queue.json", HK) is None
