@@ -6,7 +6,10 @@ to another provider: a timeout does not prove that the first create was rejected
 
 from __future__ import annotations
 
-from dataclasses import replace
+import logging
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
 
 from ..funding.faults import classify_rent_failure
 from ..funding.providers import (
@@ -18,6 +21,8 @@ from ..funding.providers import (
     resolve_create,
 )
 from .core import PriceCapUnavailable, ProvisionError
+
+log = logging.getLogger("cascade.provision.payer_pool")
 
 
 def rent_from_pool(options, rent_one):
@@ -301,3 +306,110 @@ def payer_capacity(raw, skus, price_caps, exclude_ids=(), gpu_health=None):
         if available:
             return 1
     return 0
+
+
+class PayerAccountSuspect(Exception):
+    """The payer's ACCOUNT, not the market, is what lists nothing.
+
+    Raised by :class:`PayerCapacityWatch` out of a capacity probe, so the
+    funded wait ends with a miner-readable verdict instead of polling
+    ``no_capacity`` until the latest safe start and re-dispatching every era
+    (2026-10-31 → 11-04: one key saw an empty ``lium ls`` for five days
+    while two other payers rented the same types). The text never carries
+    key material: the provider adapters scrub it before it reaches here."""
+
+    def __init__(self, kind: str, *, skus=(), control: int | None = None,
+                 zero_polls: int = 0, span_seconds: float = 0.0, detail: str = ""):
+        self.kind = str(kind)               # "empty_listing" | "auth"
+        self.skus = tuple(skus)
+        self.control = control
+        self.zero_polls = int(zero_polls)
+        self.span_seconds = float(span_seconds)
+        self.detail = str(detail or "")
+        super().__init__(self.describe())
+
+    def describe(self) -> str:
+        types = "/".join(self.skus) or "the requested GPU types"
+        if self.kind == "auth":
+            return (f"your GPU provider refused the key when listing {types}: "
+                    f"{self.detail[-300:]}")
+        return (f"your GPU provider account lists no {types} executor under your price caps "
+                f"({self.zero_polls} polls over {self.span_seconds / 60.0:.0f} min) while the "
+                f"marketplace shows {self.control} on the operator's listing under the same caps")
+
+
+@dataclass
+class PayerCapacityWatch:
+    """A funded leg's capacity probe that tells an EMPTY ACCOUNT from an
+    empty MARKET.
+
+    ``payer_probe`` counts the payer's own listing (``payer_capacity``);
+    ``control_probe`` is the same read-only listing on the OPERATOR's key
+    under the payer's price caps and GPU-health guard. After
+    ``zero_polls_before_control`` consecutive payer zeros the control runs
+    (at most every ``control_interval_seconds``); ``control_hits_needed``
+    consecutive controls that show capacity — while every payer poll in
+    between still saw nothing — raise :class:`PayerAccountSuspect`. A control
+    that is empty too resets the count (a real drought stays ``no_capacity``).
+    A payer probe whose error classifies ``auth`` raises at once; any other
+    probe failure is logged and answered "unknown" (None), never swallowed."""
+
+    payer_probe: Callable[[tuple[str, ...]], int | None]
+    control_probe: Callable[[tuple[str, ...]], int | None]
+    now: Callable[[], float] = time.time
+    zero_polls_before_control: int = 3
+    control_interval_seconds: float = 300.0
+    control_hits_needed: int = 2
+    zero_polls: int = field(default=0, init=False)
+    first_zero_at: float = field(default=0.0, init=False)
+    control_hits: int = field(default=0, init=False)
+    last_control_at: float = field(default=0.0, init=False)
+    last_control: int | None = field(default=None, init=False)
+    verdict: PayerAccountSuspect | None = field(default=None, init=False)
+
+    def __call__(self, skus) -> int | None:
+        skus = tuple(skus)
+        try:
+            n = self.payer_probe(skus)
+        except PayerAccountSuspect:
+            raise
+        except Exception as e:  # noqa: BLE001 — classified and logged, never swallowed
+            text = str(e)
+            if classify_rent_failure(text) == "auth":
+                self.verdict = PayerAccountSuspect("auth", skus=skus, detail=text)
+                raise self.verdict from None
+            log.warning("payer capacity probe for %s failed (%s: %s) — no answer this poll",
+                        "/".join(skus), type(e).__name__, text[-200:])
+            return None
+        if n is None:
+            return None
+        if n:
+            self.zero_polls, self.control_hits, self.first_zero_at = 0, 0, 0.0
+            return n
+        t = float(self.now())
+        if not self.zero_polls:
+            self.first_zero_at = t
+        self.zero_polls += 1
+        if (self.zero_polls >= int(self.zero_polls_before_control)
+                and t - self.last_control_at >= float(self.control_interval_seconds)):
+            self.last_control_at = t
+            try:
+                c = self.control_probe(skus)
+            except Exception as e:  # noqa: BLE001 — an unreadable control never convicts
+                log.warning("operator control listing for %s failed (%s: %s) — not counted",
+                            "/".join(skus), type(e).__name__, str(e)[-200:])
+                c = None
+            self.last_control = c
+            if c:
+                self.control_hits += 1
+                log.info("payer listing empty for %s on %d poll(s) while the operator's listing "
+                         "shows %d under the same caps (%d/%d controls)", "/".join(skus),
+                         self.zero_polls, c, self.control_hits, self.control_hits_needed)
+            else:
+                self.control_hits = 0
+            if self.control_hits >= int(self.control_hits_needed):
+                self.verdict = PayerAccountSuspect(
+                    "empty_listing", skus=skus, control=c, zero_polls=self.zero_polls,
+                    span_seconds=t - self.first_zero_at)
+                raise self.verdict
+        return 0

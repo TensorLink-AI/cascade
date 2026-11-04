@@ -1288,6 +1288,7 @@ class LiumProvider:
         # blacklist keeps every struck executor / host out from then on.
         shaped = [e for e in execs
                   if (executor_gpu_count(e) or (1 if int(gpus) == 1 else 0)) == int(gpus)]
+        n_shaped = len(shaped)
         shaped = _drop_short_pods(sku, shaped)
         cooling = cooling_executors()
         if cooling:
@@ -1308,7 +1309,16 @@ class LiumProvider:
                          len(shaped) - len(kept), sku, ", ".join(sorted(
                              {cpus[str(e["id"])] for e in shaped if e not in kept})))
             shaped = kept
-        return self._price_filter(sku, shaped)
+        priced = self._price_filter(sku, shaped)
+        if not priced:
+            # One line per empty poll, so an account that lists NOTHING (raw
+            # 0 — 2026-11-04: five days read as a market miss) is told apart
+            # from a listing the shape or the filters emptied. Never the key.
+            log.info("lium%s: %s listing — %d raw row(s), %d of the %d-GPU shape, %d after the "
+                     "blacklist/cooldown/steer/CPU filters, 0 under the price caps — nothing "
+                     "rentable", " (payer key)" if self.api_key else "", sku, len(execs),
+                     n_shaped, int(gpus), len(shaped))
+        return priced
 
     def _steer_hosts(self, sku: str, shaped: list[dict]) -> list[dict]:
         """Keep prior-fault hosts and API-flagged executors out of a listing.

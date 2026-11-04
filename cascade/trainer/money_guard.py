@@ -957,16 +957,10 @@ def would_rent_refusal(runner, gen, *, operator: bool) -> tuple[str, str]:
     return "", ""
 
 
-def payer_balance_refusal(runner, api_key: str, *, hours: float, rate: float | None = None) -> str:
-    """Why a miner's own-key leg must not start ("" = go): the payer's Lium
-    balance cannot cover ``rate`` × ``hours`` (``[round]
-    payer_projected_rate_per_hour``; 0 = off). An unreadable balance (not a
-    Lium key, API down) never blocks — the rent's own 402 still classifies."""
-    rnd = runner.cfg.round
-    r = float(rate if rate is not None else getattr(rnd, "payer_projected_rate_per_hour", 0.0)
-              or 0.0)
-    if r <= 0 or not api_key:
-        return ""
+def _payer_balance_read(runner, api_key: str, *, tries: int = 3):
+    """The payer's balance through the runner's reader seam (Lium ``GET
+    /users/me`` with the payer key), retried; None = unreadable. The key is
+    never logged."""
     reader = getattr(runner, "_payer_balance_reader", None)
     if reader is None:
         from .operator_health import lium_balance
@@ -974,16 +968,46 @@ def payer_balance_refusal(runner, api_key: str, *, hours: float, rate: float | N
         def reader(key):
             return lium_balance(api_key=key)
     bal = None
-    for _ in range(3):                  # an API blip is retried; unknown never blocks
+    for _ in range(max(1, int(tries))):
         try:
             bal = reader(api_key)
         except Exception:  # noqa: BLE001 — the key is never logged
             bal = None
         if bal is not None:
             break
+    return bal
+
+
+def payer_balance_note(runner, api_key: str) -> str:
+    """One clause for a miner-facing verdict: what the payer's key says about
+    its own balance ("balance $12.30" / "the key cannot read its own balance
+    (GET /users/me failed)"); "" without a key."""
+    if not api_key:
+        return ""
+    bal = _payer_balance_read(runner, api_key)
     if bal is None:
-        log.warning("payer balance unknown after retries — the rent proceeds (its own 402 "
-                    "still classifies)")
+        return "the key cannot read its own account balance (GET /users/me failed)"
+    return f"balance ${float(bal):.2f}"
+
+
+def payer_balance_refusal(runner, api_key: str, *, hours: float, rate: float | None = None,
+                          who: str = "") -> str:
+    """Why a miner's own-key leg must not start ("" = go): the payer's Lium
+    balance cannot cover ``rate`` × ``hours`` (``[round]
+    payer_projected_rate_per_hour``; 0 = off). An unreadable balance (not a
+    Lium key, API down) never blocks — the rent's own 402 still classifies —
+    but it is logged against ``who`` (a hotkey prefix) so a key that cannot
+    read its own account is visible per leg."""
+    rnd = runner.cfg.round
+    r = float(rate if rate is not None else getattr(rnd, "payer_projected_rate_per_hour", 0.0)
+              or 0.0)
+    if r <= 0 or not api_key:
+        return ""
+    bal = _payer_balance_read(runner, api_key)   # an API blip is retried; unknown never blocks
+    if bal is None:
+        log.warning("%spayer balance unknown after retries (GET /users/me failed on the payer "
+                    "key) — the rent proceeds (its own 402 still classifies)",
+                    f"funded leg {who}: " if who else "")
         return ""
     need = r * float(hours)
     if bal >= need:
@@ -1238,5 +1262,5 @@ __all__ = ["AWAITING_APPROVAL_STATUS", "OperatorBreaker", "OperatorSpend", "aler
            "clear_alert", "daily_cap_usd", "guard_operator_provider", "health_conditions",
            "is_balance_refusal", "operator_leg_gate", "operator_rent_preflight",
            "gate_or_adopt", "grandfathered", "note_operator_launch", "operator_leg_allocated",
-           "take_deferred_gate", "payer_balance_refusal", "preapproved",
+           "take_deferred_gate", "payer_balance_note", "payer_balance_refusal", "preapproved",
            "projected_operator_leg_cost"]
