@@ -70,7 +70,7 @@ def test_new_knobs_are_registered_with_their_defaults():
     assert rnd.harvest_keep_max_seconds == 10800 and rnd.harvest_keep_cost_fraction == 0.5
     assert rnd.miner_waste_alert_usd == 15.0 and rnd.operator_runway_alert_hours == 6.0
     assert rnd.operator_daily_cap_scope == "miner_legs"
-    assert rnd.funded_ready_timeout_seconds == 420.0
+    assert rnd.funded_ready_timeout_seconds == 600.0   # 2026-11-04: measured Lium p90 496 s
 
 
 def test_new_knobs_round_trip_through_the_loader_integral_floats_included(tmp_path):
@@ -467,8 +467,9 @@ def test_listings_are_filtered_on_the_exact_gpu_count(monkeypatch, tmp_path):
         short_pods.set_path(None)
 
 
-def test_ready_timeout_default_is_420():
-    assert RoundConfig().funded_ready_timeout_seconds == 420.0
+def test_ready_timeout_default_is_600():
+    # 2026-11-04: 51 healthy Lium rents, launch -> ready p90 496 s, max 555 s
+    assert RoundConfig().funded_ready_timeout_seconds == 600.0
 
 
 def test_post_rent_rejects_are_operator_make_good_not_miner_waste(tmp_path):

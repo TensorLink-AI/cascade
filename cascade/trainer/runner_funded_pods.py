@@ -943,6 +943,53 @@ class _FundedPodMixin:
         self._funded_leg_failures[hotkey] = (error_tail(msg, 500), miner_fault,
                                              error_class, burn)
 
+    def _small_loss_rerun(self, gen, entry, queue) -> bool:
+        """Owner 2026-11-04: a SMALL our-side loss never becomes an operator
+        make-good leg. When the miner's lemon / infra-waste on this submission
+        is below ``[round] make_good_rerun_below_usd``, the operator-billed
+        flag is cleared and the leg reruns on the miner's own key (the loss
+        stays a make-good owed). Never for a leg the owner already approved
+        on our account, past the miner waste cap, or past the operator-fault
+        pause (a systemic fault). True when the flag was cleared."""
+        try:
+            cap = float(getattr(getattr(getattr(self, "cfg", None), "round", None),
+                                "make_good_rerun_below_usd", 0.0) or 0.0)
+            if cap <= 0:
+                return False
+            from .miner_spend_guard import _ledger, capped
+
+            if capped(self, gen):
+                return False
+            if int(getattr(entry, "operator_faults", 0) or 0) >= int(
+                    getattr(self, "OPERATOR_FAULT_RETRIES", 0) or 0):
+                return False
+            from ..funding.operator_approvals import APPROVED, LAUNCHED, OperatorApprovals
+
+            rec = OperatorApprovals.for_work_root(self.work_root).get(
+                Path(queue.path).name, gen.hotkey)
+            if rec and rec.get("state") in (APPROVED, LAUNCHED):
+                return False
+            led = _ledger(self)
+            if led is None:
+                return False
+            s = led.summary(gen.hotkey, ref=entry.ref, funded_at=entry.funded_at)
+            lost = float(s.make_good_usd) + float(s.infra_waste_usd)
+            # Only a flag that came from LEMON losses (a recorded make-good on
+            # the miner's key) is this rule's to clear: an operator-billed
+            # entry with no such loss was flagged for another reason (an
+            # expired key, a lost finished run, our storage) — approval path.
+            if float(s.make_good_usd) <= 0 or lost >= cap:
+                return False
+        except Exception as e:  # noqa: BLE001 — unsure ⇒ the approval path decides
+            log.warning("funded leg %s: small-loss rerun check failed (%s) — owner approval "
+                        "path", gen.hotkey[:12], e)
+            return False
+        queue.set_operator_billed(gen.hotkey, False)
+        log.warning("funded leg %s: our-side loss $%.2f < $%.2f — reruns on the MINER's own "
+                    "key (no operator make-good leg; the $%.2f stays a make-good owed)",
+                    gen.hotkey[:12], lost, cap, lost)
+        return True
+
     def _count_funded_loss(self, hotkey: str, *, more: bool) -> bool:
         """Count one billed allocation that delivered nothing (a lemon, a
         stale or slow pod released before training) as an operator-side loss
@@ -1086,6 +1133,9 @@ class _FundedPodMixin:
                         "make-good configured; retrying on the miner's key with a new pod",
                         gen.hotkey, faults, self.OPERATOR_FAULT_RETRIES)
             queue.set_operator_billed(gen.hotkey, False)
+            flagged = queue.get(gen.hotkey)
+        if (flagged is not None and bool(getattr(flagged, "operator_billed", False))
+                and _FundedPodMixin._small_loss_rerun(self, gen, flagged, queue)):
             flagged = queue.get(gen.hotkey)
         if flagged is not None and bool(getattr(flagged, "operator_billed", False)):
             # Owner make-good: this entry's leg is on the operator's bill — an
