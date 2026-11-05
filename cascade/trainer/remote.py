@@ -857,6 +857,22 @@ def _prefetch_alive(pid_expr: str) -> str:
             f"| sed -n 2p | grep -q '/prefetch[.]sh$'")
 
 
+def _quarantine_run_host(host, describe: str, why: str) -> None:
+    """Quarantine the host a detached run was on (2026-11-05 5G6jNi6Y: a pod
+    went dark 49 min mid-run, then its worker vanished at step 15,600 — and the
+    host stayed rentable, because only OUR watchdog's hang abort quarantined).
+    Best-effort; an ADOPTED pod skips the host check, so the run already on
+    that host is still re-attached and harvested."""
+    ip = str(getattr(host, "host", "") or "")
+    try:
+        from .host_preflight import quarantine_host_ip
+
+        quarantine_host_ip(ip, f"{describe}: {why}")
+        log.warning("%s: host %s quarantined — %s", describe, ip, why)
+    except Exception as e:  # noqa: BLE001 — never fails the poll
+        log.warning("%s: host quarantine of %s failed (ignored): %s", describe, ip, e)
+
+
 def run_detached(host: RemoteHost, body: str, stdin_env: str | None, run_dir: str, *,
                  timeout: int, poll_seconds: int = DETACHED_POLL_SECONDS,
                  grace_seconds: int = DETACHED_REATTACH_GRACE_SECONDS,
@@ -907,6 +923,7 @@ def run_detached(host: RemoteHost, body: str, stdin_env: str | None, run_dir: st
     rc: int | None = None
     vanished = False
     last_progress: dict | None = None    # the worker's last step record seen by a poll
+    dark_quarantined = False
     poll_argv = build_ssh_argv(host, _detached_poll_command(host, run_dir))
     while True:
         if cancel is not None and cancel.is_set():
@@ -930,6 +947,13 @@ def run_detached(host: RemoteHost, body: str, stdin_env: str | None, run_dir: st
             misses += 1
             gap = now - last_seen
             if gap > grace_seconds:
+                if not dark_quarantined:
+                    # Dark past the grace mid-run: no new leg may rent this
+                    # host, whatever the provider says about THIS pod.
+                    dark_quarantined = True
+                    _quarantine_run_host(host, describe,
+                                         f"ssh dark {int(gap)}s mid-run (past the "
+                                         f"{grace_seconds}s grace)")
                 # 2026-11-04 uid 78: a pod that stopped answering ssh ~3.5 h into
                 # its run was declared lost after 900 s and torn down, unharvested
                 # — the run was finished or nearly so. While the PROVIDER still
@@ -984,6 +1008,10 @@ def run_detached(host: RemoteHost, body: str, stdin_env: str | None, run_dir: st
         if token == "GONE":
             vanished = True
             rc = 1
+            step = (last_progress or {}).get("step")
+            _quarantine_run_host(host, describe, "detached worker vanished mid-run without "
+                                 "an exit code" + (f" (last step {step})" if step is not None
+                                                   else ""))
             break
         try:
             rc = int(token.split(":", 1)[1])
