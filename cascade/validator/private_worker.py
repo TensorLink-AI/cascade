@@ -98,8 +98,10 @@ def run_request(checkpoint, request, output, *, device="cuda", workers=1, qualif
                         if str(device).startswith("cuda") else ["cpu"])}
 
 
-def read_forecasts(path, request_hash, windows, num_samples):
-    """Check exact coverage, request binding, shape and dtype before scoring."""
+def check_forecasts(path, request_hash, windows, num_samples) -> None:
+    """Check exact coverage, request binding, shape, dtype and finiteness of
+    EVERY window before any score is computed — one window in memory at a
+    time (the validator box holds 7 GB; a full duel's samples are ~GBs)."""
     import zipfile
 
     max_bytes = sum(w.n_channels * num_samples * w.horizon * 8 for w in windows)
@@ -112,15 +114,34 @@ def read_forecasts(path, request_hash, windows, num_samples):
             raise ValueError("private evaluation output coverage mismatch")
         if data["request_sha256"].tobytes().decode() != request_hash:
             raise ValueError("private evaluation response belongs to another request")
-        samples = []
         for i, window in enumerate(windows):
             arr = data[f"s_{i}"]
-            if arr.dtype != np.float64 or arr.shape != (window.n_channels, num_samples, window.horizon):
-                raise ValueError("private evaluation forecast shape/dtype mismatch")
-            if not np.isfinite(arr).all():
-                raise ValueError("private evaluation forecast is non-finite")
-            samples.append(arr)
-    return samples
+            _check_window(arr, window, num_samples)
+            del arr
+
+
+def _check_window(arr, window, num_samples) -> None:
+    if arr.dtype != np.float64 or arr.shape != (window.n_channels, num_samples, window.horizon):
+        raise ValueError("private evaluation forecast shape/dtype mismatch")
+    if not np.isfinite(arr).all():
+        raise ValueError("private evaluation forecast is non-finite")
+
+
+def iter_forecasts(path, windows, num_samples):
+    """Yield each window's samples in window order, read lazily from the NPZ
+    (call :func:`check_forecasts` first). Same arrays, same order as
+    :func:`read_forecasts` — only the peak memory differs."""
+    with np.load(path, allow_pickle=False) as data:
+        for i, window in enumerate(windows):
+            arr = data[f"s_{i}"]
+            _check_window(arr, window, num_samples)
+            yield arr
+
+
+def read_forecasts(path, request_hash, windows, num_samples):
+    """Check exact coverage, request binding, shape and dtype before scoring."""
+    check_forecasts(path, request_hash, windows, num_samples)
+    return list(iter_forecasts(path, windows, num_samples))
 
 
 def main(argv=None):

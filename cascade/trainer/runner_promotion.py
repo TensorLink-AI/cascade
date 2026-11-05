@@ -73,6 +73,10 @@ def promotion_event(record: object) -> dict:
             "signed": getattr(record, "signature", None) is not None}
 
 
+# Settlements walked back from a latest receipt that names no king (12 = 1.5 d).
+RECEIPT_WALK_LIMIT = 12
+
+
 class _PromotionMixin:
     """Reign tracking + promotion (DEC-CA-0013) and bench dispatch."""
 
@@ -108,6 +112,7 @@ class _PromotionMixin:
                 return getattr(self, "_last_receipt_king", None)
             store = self.manifest_store()
             problems: list[str] = []
+            walk_from = ""
             for key in (receipt_latest_key(anchor), RECEIPT_LATEST_KEY):
                 try:
                     receipt = load_receipt(store.get_text(key))
@@ -118,6 +123,7 @@ class _PromotionMixin:
                     problems.append(f"{key}: round {receipt.round_id} fails the anchor "
                                     "signature check")
                     continue
+                walk_from = walk_from or str(receipt.round_id or "")
                 v = receipt.verdict
                 if receipt.status == "scored" and v is not None and v.king_hotkey:
                     if receipt_has_unknown_fields(receipt):
@@ -131,6 +137,21 @@ class _PromotionMixin:
                     return self._last_receipt_king
                 problems.append(f"{key}: round {receipt.round_id} names no king "
                                 f"(status {receipt.status})")
+            # The latest receipt can name no king while the throne is known: a
+            # rejected (king re-sync) or no-contest receipt never changes the
+            # king, yet it replaces latest.json. 2026-11-04: the crowning's
+            # scored receipt was superseded 21 s later by the next settlement's
+            # rejected re-sync receipt, and a freshly restarted trainer (no
+            # sticky king) kept naming the dethroned king. Walk the settlement
+            # chain back to the newest SCORED receipt instead.
+            walked = self._walk_back_receipt_king(store, anchor, walk_from) if walk_from else None
+            if walked:
+                hk, rid = walked
+                self._note_receipt_problem(
+                    f"latest receipt names no king; king {hk[:12]} from the scored receipt "
+                    f"of round {rid}", level=logging.INFO)
+                self._last_receipt_king = hk
+                return hk
             self._note_receipt_problem(
                 "no verifiable receipt names a king — keeping the last known king "
                 f"{(self._last_receipt_king or '<none>')[:12]}, which may be STALE: "
@@ -138,6 +159,36 @@ class _PromotionMixin:
         except Exception as e:  # noqa: BLE001 — the sticky/incentive fallbacks cover a miss
             self._note_receipt_problem(f"receipt king read failed: {type(e).__name__}: {e}")
         return self._last_receipt_king
+
+    def _walk_back_receipt_king(self, store, anchor: str, round_id: str,
+                                limit: int = RECEIPT_WALK_LIMIT) -> tuple[str, str] | None:
+        """``(king hotkey, round id)`` from the newest anchor-signed SCORED
+        receipt reached by following the manifests' ``prev_round_id`` chain
+        back from ``round_id`` (exclusive), at most ``limit`` settlements; None
+        when the chain breaks or no scored receipt is found. Never raises."""
+        from ..shared.hippius import manifest_round_key, receipt_round_key
+        from ..shared.manifest import load_manifest
+        from ..shared.receipt import load_receipt, verify_receipt_signature
+
+        rid = str(round_id or "")
+        for _ in range(max(0, int(limit))):
+            try:
+                rid = str(load_manifest(store.get_text(manifest_round_key(rid))).prev_round_id
+                          or "")
+            except Exception:  # noqa: BLE001 — a broken chain ends the walk
+                return None
+            if not rid:
+                return None
+            try:
+                receipt = load_receipt(store.get_text(receipt_round_key(rid, anchor)))
+            except Exception:  # noqa: BLE001 — no receipt for that round: keep walking
+                continue
+            if anchor and not verify_receipt_signature(receipt, anchor):
+                continue
+            v = receipt.verdict
+            if receipt.status == "scored" and v is not None and v.king_hotkey:
+                return str(v.king_hotkey), rid
+        return None
 
     def _note_receipt_problem(self, msg: str, *, level: int = logging.ERROR) -> None:
         """Log a receipt-read problem once per distinct message; "" clears it."""

@@ -6,7 +6,9 @@ import logging
 import time
 
 from ..funding.queue import OPERATOR_FAULT_RETRIES
+from ..provision.payer_pool import PayerAccountSuspect
 from .lane_pool import _lium_provider
+from .remote import error_tail
 
 log = logging.getLogger("cascade.trainer")
 
@@ -261,13 +263,22 @@ class _FundedCapacityMixin:
                                   for_king: bool = False,
                                   hotkey: str | None = None,
                                   price_caps: dict | None = None,
-                                  capacity_probe=None, allow_paid_fallback=False) -> bool:
+                                  capacity_probe=None, allow_paid_fallback=False,
+                                  choice_changed=None) -> bool:
         """Poll the marketplace for ``sku`` until it shows capacity or the leg's
         latest safe start passes. Legs start INDEPENDENTLY as GPUs appear; a
         leg still without a GPU at the deadline requeues. Returns True when
         capacity appeared, ``"operator"`` when the leg should take an operator
         lane instead, False otherwise. ``price_caps`` (a miner-chosen type,
-        DEC-CA-0060) replaces the operator caps on the probe."""
+        DEC-CA-0060) replaces the operator caps on the probe.
+        ``choice_changed`` (a funded leg with a miner-chosen GPU) is asked on
+        every poll; True ends the wait with ``"gpu_changed"`` so the caller
+        re-derives the SKU, caps and deadline (a raising callable = no
+        change). A ``capacity_probe`` that raises
+        :class:`~cascade.provision.payer_pool.PayerAccountSuspect` ends the
+        wait with ``"payer_account"`` (the payer's account, not the market,
+        lists nothing); any other probe failure is logged and counts as no
+        answer for that poll."""
         skus = (sku,) if isinstance(sku, str) else tuple(sku)
         sku = "/".join(skus)
         deadline = self._funded_rent_wait_deadline_for(skus[0] if len(skus) == 1 else None)
@@ -309,6 +320,15 @@ class _FundedCapacityMixin:
                 log.info("%s: capacity wait cancelled (the king cannot be rented "
                          "this attempt)", describe)
                 return False
+            if choice_changed is not None:
+                try:
+                    changed = bool(choice_changed())
+                except Exception:  # noqa: BLE001 — unreadable ⇒ keep waiting as is
+                    changed = False
+                if changed:
+                    log.info("%s: the miner changed its GPU choice — leaving the %s "
+                             "wait", describe, sku)
+                    return "gpu_changed"
             # Hybrid fallback: operator lanes on file end the wait — the leg
             # runs there, operator-billed. Fresh legs keep polling the
             # marketplace until the fresh window (Lium first).
@@ -320,7 +340,13 @@ class _FundedCapacityMixin:
             if capacity_probe is not None:
                 try:
                     n = capacity_probe(self._skus_fitting_now(skus) or skus)
-                except Exception:
+                except PayerAccountSuspect as e:
+                    log.warning("%s: %s — leaving the %s wait with a payer_account verdict "
+                                "(not a market miss)", describe, e, sku)
+                    return "payer_account"
+                except Exception as e:  # noqa: BLE001 — logged, counted as no answer
+                    log.warning("%s: %s capacity probe failed (%s: %s) — no answer this poll",
+                                describe, sku, type(e).__name__, error_tail(str(e), 200))
                     n = None
             else:
                 n = self._probe_funded_capacity(self._skus_fitting_now(skus) or skus,

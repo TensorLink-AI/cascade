@@ -302,12 +302,14 @@ def _run_direct(args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from ..shared.codepath import verify_release_code_path
+    from ..shared.env import load_env_files
+    verify_release_code_path("cascade-validator")
     # DEC-CA-0067: this process votes on / acts on the v2b vote — a config
     # whose pinned feature is missing or wrong refuses to load
     from ..shared.config.loader import require_vote_pin
 
     require_vote_pin()
-    from ..shared.env import load_env_files
     load_env_files()
     args = _build_parser().parse_args(argv)
     if args.netconfig_policy:

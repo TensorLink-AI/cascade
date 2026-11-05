@@ -891,6 +891,31 @@ var COMMUNITY = {
 };
 
 var _index = null, _chain = null, _v2 = null, _lb = null, _gens = 0, _state = "loading", _metric = "mase";
+
+// v2 era scope (2026-11-04, owner: the dashboards must reset to the fresh
+// round): every settlement before the v2 activation block is history from the
+// previous contract, not this competition — tiles, tables and miner counts read
+// only rounds at or after it. The block comes from status/v2.json golive
+// .from_block once loaded; V2_FROM_BLOCK is the announced value as a fallback.
+var V2_FROM_BLOCK = 9399600;
+var _rawIndex = null;
+function v2FromBlock(){ var b=_v2&&_v2.golive&&Number(_v2.golive.from_block); return b>0?b:V2_FROM_BLOCK; }
+function v2Scope(idx){
+  if(!idx||!idx.rounds) return idx;
+  var from=v2FromBlock(), out={};
+  for(var k in idx) if(Object.prototype.hasOwnProperty.call(idx,k)) out[k]=idx[k];
+  out.rounds=idx.rounds.filter(function(r){
+    var b=Number(r.era_start_block)>0?Number(r.era_start_block):Number(r.epoch_start_block||0);
+    return b>=from;
+  });
+  out.v2_from_block=from; out.pre_v2_rounds=idx.rounds.length-out.rounds.length;
+  // v2 not announced yet (no status/v2.json block) and nothing settled at or
+  // after the fallback block: there is no v2 history to show — keep the index
+  // whole rather than render an empty competition
+  var announced=!!(_v2&&_v2.golive&&Number(_v2.golive.from_block)>0);
+  if(!out.rounds.length&&!announced) return idx;
+  return out;
+}
 var _bench = {}, _benchMissing = {}, _benchInflight = {};
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -1019,19 +1044,44 @@ function scanBench(){
       .catch(function(){ delete _benchInflight[id]; _benchMissing[id]=true; });
   });
 }
-// Every settlement's KING checkpoint on GIFT-Eval, oldest first (signed reports).
+// Every settlement's post-round KING checkpoint on GIFT-Eval, oldest first
+// (signed reports). Per round the entry of the round's post_round_king_hotkey:
+// in a crowning round the role "king" entry is the DEFENDER (the deposed
+// king) and the new king is the challenger entry. One point per (round, size);
+// rejected / no-contest rows name no post-round king and are skipped.
 function kingSeries(){
   var out=[];
   byBlock(allRounds()).forEach(function(r){
+    var hk=String(r.post_round_king_hotkey||""); if(!hk) return;
     var rep=_bench[String(r.round_id)]; if(!rep) return;
+    var want=r.dethroned?"challenger":"king", bySize={}, sizes=[];
     (rep.entries||rep.checkpoints||[]).forEach(function(e){
-      if(String(e.role||"")!=="king") return;
+      if(String(e.miner_hotkey||"")!==hk) return;
+      var role=String(e.role||""); if(role==="init") return;
       var g=giftOf(e); if(!g) return;
-      out.push({round_id:r.round_id, at:r.published_at, mase:g.mase, crps:g.crps,
-                pointer:String(e.trained_pointer||""), hotkey:String(e.miner_hotkey||"")});
+      var size=String(e.size||""), prev=bySize[size];
+      if(prev&&(prev.role===want||role!==want)) return;
+      if(!prev) sizes.push(size);
+      bySize[size]={round_id:r.round_id, at:r.published_at, mase:g.mase, crps:g.crps, size:size, role:role,
+                    pointer:String(e.trained_pointer||""), hotkey:hk};
     });
+    sizes.forEach(function(z){ out.push(bySize[z]); });
   });
   return out;
+}
+// The king view the hero, trend and footer share: the newest point, the
+// series of that point's model size only (toto2-4m and v2 sizes are never
+// joined on one line), and whether the newest point is the SITTING king's —
+// current only when its pointer equals status/v2.json king.pointer and its
+// hotkey is the newest scored round's post-round king (index.html
+// kingTrajectory); otherwise it is pending.
+function kingView(){
+  var ks=kingSeries(); if(!ks.length) return {series:[], king:null, current:false, size:""};
+  var last=ks[ks.length-1], size=last.size;
+  var newest=byBlock(scoredRounds()).pop(), expected=newest&&newest.post_round_king_hotkey;
+  var ptr=_v2&&_v2.king&&_v2.king.pointer;
+  var current=(!expected||last.hotkey===String(expected))&&(!ptr||last.pointer===String(ptr));
+  return {series:ks.filter(function(p){ return p.size===size; }), king:last, current:current, size:size};
 }
 // The leaderboard reference (benchmarks/leaderboard-reference.json, refreshed
 // by scripts/refresh_leaderboard_reference.py from the GIFT-Eval space). The
@@ -1047,7 +1097,7 @@ function placeInField(v, metric){
 
 // ── render: hero ────────────────────────────────────────────────────────────
 function renderHero(){
-  var el=document.getElementById("hero"), ks=kingSeries(), king=ks.length?ks[ks.length-1]:null;
+  var el=document.getElementById("hero"), kvw=kingView(), king=kvw.king;
   var ref=headlineRef(), metric=_metric, label=metric==="mase"?"MASE":"CRPS";
   var kv=king?king[metric]:null, rv=ref?refVal(ref,metric):null;
   var big, rows=[];
@@ -1064,7 +1114,8 @@ function renderHero(){
   if(kv!=null){
     var pl=placeInField(kv,metric);
     big+='<div class="hq" title="King checkpoint of settlement '+esc(king.round_id)+' — signed bench report (the trainer&rsquo;s, or the main validator&rsquo;s once [v2] bench_source = validator)">'+
-      'king '+label+' <b>'+num(kv,3)+'</b> · '+esc(prettyDay(king.at))+'</div>';
+      'king '+label+' <b>'+num(kv,3)+'</b>'+(king.size?' · '+esc(king.size):'')+' · '+esc(prettyDay(king.at))+'</div>';
+    if(!kvw.current) big+='<div class="hq" title="The newest benched king checkpoint is not the one status/v2.json names as the sitting king">pending &mdash; the sitting king&rsquo;s checkpoint is not benched yet</div>';
     if(pl) big+='<div class="place" title="Where the king&rsquo;s '+label+' geomean would sit among the leaderboard&rsquo;s '+(pl.of-1)+
       ' entries without test-data leakage (by geomean; the board itself sorts by mean rank)">would place <b>#'+pl.pos+'</b> of '+pl.of+'</div>';
     if(IS_TESTNET) big+='<div class="hq" title="Testnet benches a truncated battery (cascade_bench_max_series)">testnet battery is truncated &mdash; not comparable</div>';
@@ -1208,7 +1259,7 @@ function liveEta(g){
 function renderTrend(){
   var svg=document.getElementById("chart-gap"), W=1000, H=380, pad={l:70,r:18,t:16,b:40};
   svg.setAttribute("viewBox","0 0 "+W+" "+H);
-  var ref=headlineRef(), metric=_metric, rv=ref?refVal(ref,metric):null, ks=kingSeries();
+  var ref=headlineRef(), metric=_metric, rv=ref?refVal(ref,metric):null, kvw=kingView(), ks=kvw.series;
   document.getElementById("trend-title").textContent="King vs "+(ref?ref.model:REF_HEADLINE)+" · GIFT-Eval "+(metric==="mase"?"MASE":"CRPS");
   document.getElementById("trend-ref").textContent=ref?ref.model:REF_HEADLINE;
   if(rv==null||!ks.length){
@@ -1236,8 +1287,9 @@ function renderTrend(){
   var d=pts.map(function(p,i){ return (i?"L":"M")+X(i).toFixed(1)+" "+Y(p.v).toFixed(1); }).join(" ");
   if(n>1) out.push('<path d="'+d+'" fill="none" stroke="var(--accent)" stroke-width="2.5" stroke-linejoin="round"/>');
   pts.forEach(function(p,i){
-    out.push('<circle cx="'+X(i).toFixed(1)+'" cy="'+Y(p.v).toFixed(1)+'" r="'+(i===n-1?5.5:3)+'" fill="var(--accent)" stroke="var(--paper)" stroke-width="1.5"><title>'+
-      esc(prettyDay(p.at)+" · king "+num(p.raw,4)+" · "+(p.v>0?"+":"")+p.v.toFixed(2)+"% vs "+ref.model)+'</title></circle>');
+    var pend=i===n-1&&!kvw.current;
+    out.push('<circle cx="'+X(i).toFixed(1)+'" cy="'+Y(p.v).toFixed(1)+'" r="'+(i===n-1?5.5:3)+'" fill="'+(pend?'var(--paper)':'var(--accent)')+'" stroke="'+(pend?'var(--accent)':'var(--paper)')+'" stroke-width="'+(pend?2:1.5)+'"><title>'+
+      esc(prettyDay(p.at)+" · king "+num(p.raw,4)+" · "+(p.v>0?"+":"")+p.v.toFixed(2)+"% vs "+ref.model+(pend?" · pending":""))+'</title></circle>');
   });
   var ticks=n<=4?pts.map(function(_,i){ return i; }):[0,Math.round((n-1)/3),Math.round(2*(n-1)/3),n-1], seen={};
   ticks.forEach(function(i){ var lab=shortDay(pts[i].at); if(!lab||seen[lab]) return; seen[lab]=1;
@@ -1245,7 +1297,7 @@ function renderTrend(){
   out.push('<text transform="rotate(-90)" x="'+(-(pad.t+(H-pad.t-pad.b)/2))+'" y="14" text-anchor="middle" fill="currentColor" opacity=".6" font-size="12" font-family="IBM Plex Mono,monospace">gap (below 0 = ahead)</text>');
   svg.innerHTML=out.join("");
   var last=pts[n-1];
-  document.getElementById("trend-note").textContent=n+" benched settlements · latest "+(last.v>0?"+":"")+last.v.toFixed(1)+"%";
+  document.getElementById("trend-note").textContent=(kvw.size?kvw.size+" · ":"")+n+" benched settlements · latest "+(last.v>0?"+":"")+last.v.toFixed(1)+"%"+(kvw.current?"":" (pending)");
   document.getElementById("trend-when").textContent=prettyDay(last.at);
 }
 
@@ -1263,11 +1315,13 @@ function renderCommunity(){
   }).join("");
 }
 function renderFoot(){
-  var ks=kingSeries(), king=ks.length?ks[ks.length-1]:null, parts=[];
+  var kvw=kingView(), king=kvw.king, parts=[];
   parts.push('<a href="'+KING_GITHUB+'" target="_blank" rel="noopener" title="The sitting king&rsquo;s generator code (champions/king)">king generator</a>');
   var r=byBlock(scoredRounds()).pop();
-  if(r&&r.post_round_king_hotkey&&r.king_gen_ref) parts.push('<a href="'+genUrl(r.king_gen_ref)+'" target="_blank" rel="noopener" title="'+esc(r.king_gen_ref)+'">registry digest</a>');
-  if(king) parts.push('<span title="'+esc(king.pointer)+'">king checkpoint · settlement '+esc(String(king.round_id).slice(0,8))+'</span>');
+  // a crowning round's king_gen_ref is the DEPOSED king's: the new king's is chal_gen_ref
+  var ref=r&&r.post_round_king_hotkey?(r.dethroned?r.chal_gen_ref:r.king_gen_ref):null;
+  if(ref) parts.push('<a href="'+genUrl(ref)+'" target="_blank" rel="noopener" title="'+esc(ref)+'">registry digest</a>');
+  if(king) parts.push('<span title="'+esc(king.pointer)+'">king checkpoint · settlement '+esc(String(king.round_id).slice(0,8))+(kvw.current?'':' · pending')+'</span>');
   parts.push('<span>signed receipts · bench reports · leaderboard reference</span>');
   document.getElementById("foot").innerHTML=parts.join("");
 }
@@ -1308,13 +1362,20 @@ var _pollN=0;
 function poll(){
   _pollN++;
   fetchJSON("receipts/index.json")
-    .then(function(d){ _index=collapseByRound(d); _state="live"; renderAll(); scanBench(); })
+    .then(function(d){ _rawIndex=collapseByRound(d); _index=v2Scope(_rawIndex); _state="live"; renderAll(); scanBench(); })
     .catch(function(){ _state="offline"; renderChrome(); });
   fetchJSON("status/chain.json").then(function(d){ _chain=d; renderTiles(); }).catch(function(){});
   // v2 status (trainer, unsigned): go-live, lineage counter, merged experts
-  fetchJSON("status/v2.json").then(function(d){ _v2=d; renderTiles(); }).catch(function(){});
+  fetchJSON("status/v2.json").then(function(d){ _v2=d; if(_rawIndex){ _index=v2Scope(_rawIndex); renderAll(); } else renderTiles(); }).catch(function(){});
   if(_pollN===1||_pollN%10===0||!_lb)
-    fetchJSON("benchmarks/leaderboard-reference.json").then(function(d){ _lb=d; renderHero(); renderTrend(); }).catch(function(){});
+    fetchJSON("benchmarks/leaderboard-reference.json").catch(function(){
+      // the bucket copy can 403/404: fall back to the packaged reference the
+      // static host serves (index.html does the same for the model catalog)
+      return fetch("data/gift-eval-reference.json",{cache:"no-cache"}).then(function(response){
+        if(!response.ok) throw Error("leaderboard reference unavailable");
+        return response.json();
+      });
+    }).then(function(d){ if(d&&Array.isArray(d.models)){ _lb=d; renderHero(); renderTrend(); } }).catch(function(){});
   fetchJSON("promotions/index.json").then(function(d){ _gens=Number(d&&d.latest_generation)||0; renderTiles(); }).catch(function(){});
 }
 renderCommunity();

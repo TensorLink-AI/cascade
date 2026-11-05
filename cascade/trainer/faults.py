@@ -6,7 +6,7 @@ import logging
 import re
 import subprocess
 
-from ..funding.queue import OPERATOR_FAULT_CLASS
+from ..funding.queue import OPERATOR_FAULT_CLASS, PAYER_ACCOUNT_CLASS
 from ..shared.hippius import StorageError
 
 log = logging.getLogger("cascade.trainer")
@@ -335,7 +335,7 @@ def king_key_failed(verdict: tuple | None, exc: BaseException | None = None) -> 
     if verdict:
         msg = str(verdict[0] or "")
         cls = str(verdict[2] or "") if len(verdict) > 2 else ""
-    if cls in ("auth", "tamper"):
+    if cls in ("auth", "tamper", PAYER_ACCOUNT_CLASS):
         return True
     text = (msg + " " + (str(exc) if exc is not None else "")).lower()
     return any(m in text for m in _NO_FUNDS_MARKERS) or bool(_NO_FUNDS_CODE_RE.search(text))

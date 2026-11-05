@@ -200,7 +200,15 @@ class _FundedLegMixin:
                         # DEC-CA-0067: an image refusal never moves the bill
                         # either (only make-goods train on the operator account).
                         ours_kept = keeps_pod(exc) or local_disk_error(exc) is not None
-                        if (local.funded_allocated and not ours_kept
+                        # The leg body already decided (money safety II): a
+                        # generic infra loss, a payer-side cause or an unproven
+                        # pod loss is never billed to us — this outer flag
+                        # overrode that for every non-miner failure (2026-11-04
+                        # review); it now covers only verdict-less failures and
+                        # operator-class ones.
+                        never_ours = verdict is not None and str(verdict[2] or "") in (
+                            "infra", "payer_pod_lost", "payer_side")
+                        if (local.funded_allocated and not ours_kept and not never_ours
                                 and not isinstance(exc, LegImageMismatch)
                                 and (verdict is None or not verdict[1])):
                             queue = self._funded_queue()
@@ -624,7 +632,14 @@ class _FundedLegMixin:
                     # the pod ended without proof of whose doing: requeued
                     # unburned on the miner's key, no make-good, no quarantine
                     error_class, burn = "payer_pod_lost", False
-                    text = f"payer pod ended mid-leg ({ev}): {text}"
+                    text = f"payer pod ended mid-leg: {text} [evidence {ev}]"
+                elif not ev.get("known"):
+                    # no listing answered: nothing is proven either way — the
+                    # verdict stays a plain infra loss (its attempt still
+                    # counts: the attempt cap is what stops a flaky pod from
+                    # retrying on the miner's money forever); the evidence
+                    # rides the text for the owner (2026-11-04 review)
+                    text = f"pod state unknown: {text} [evidence {ev}]"
             self._record_funded_failure(gen.hotkey, text, miner_fault=miner_fault,
                                         error_class=error_class, burn=burn)
             from .harvest_guard import handle_our_side_fault, keeps_pod, local_disk_error
@@ -812,7 +827,41 @@ def _with_leg_watchdog(runner, disp, gen, pod, contract, host=None):
     watch = leg_watchdog(runner, gen=gen, pod=pod, contract=contract,
                          key_check=key_check if payer else None,
                          host=str(getattr(host, "host", "") or ""))
-    return disp if watch is None else replace(disp, on_progress=watch)
+    out = disp if watch is None else replace(disp, on_progress=watch)
+    extend = int(getattr(runner.cfg.round, "unreachable_alive_extend_seconds", 0) or 0)
+    if payer and extend > 0:
+        out = replace(out, pod_alive=lambda: payer_pod_alive(runner, pod),
+                      unreachable_alive_extend_seconds=extend)
+    return out
+
+
+def payer_pod_alive(runner, pod) -> bool | None:
+    """The PROVIDER's view of a payer pod: True listed and not terminal, False
+    not listed (or terminal), None unknown (no key / no listing seam). Never
+    raises — the caller treats an error as unknown."""
+    try:
+        vault = runner._payer_vault()
+        if vault is None:
+            return None
+        from ..funding.providers import pod_credential
+        from ..provision.funded import provider_for_key
+
+        cred = pod_credential(vault, pod)
+        if cred is None:
+            return None
+        adapter = provider_for_key(cred.provider, cred.api_key)
+        ident = getattr(adapter, "pod_identity", None)
+        if ident is None:
+            return None
+        seen = ident(str(pod.instance_id))
+        if seen is None:
+            return False
+        status = str(seen.get("status") or "").upper()
+        return status not in {"TERMINATED", "STOPPED", "FAILED", "DELETED", "ERROR"}
+    except Exception as e:  # noqa: BLE001
+        log.warning("funded leg: provider liveness of %s unknown (%s)",
+                    getattr(pod, "instance_id", "?"), e)
+        return None
 
 
 def _spend_result(runner, hotkey: str, pod) -> None:
@@ -884,7 +933,10 @@ class PayerPodInterference(Exception):
     error_class = "payer_side"
 
 
-def payer_loss_evidence(runner, pod) -> dict:
+ABSENT_RECHECK_SECONDS = 15.0
+
+
+def payer_loss_evidence(runner, pod, *, recheck_sleep=None) -> dict:
     """What the PAYER's own account says about a lost pod: the pod's status
     on their listing and their balance (both best-effort; unknown fields are
     omitted). ``miner`` is True when the evidence proves a payer-side cause:
@@ -897,7 +949,13 @@ def payer_loss_evidence(runner, pod) -> dict:
         pod_fn = getattr(provider, "_pod", None)
         if callable(pod_fn):
             row = pod_fn(pod.instance_id)
+            if row is None:
+                # one listing miss is not a verdict (a Lium hiccup lists
+                # nothing): ask again before calling the pod gone
+                (recheck_sleep or time.sleep)(ABSENT_RECHECK_SECONDS)
+                row = pod_fn(pod.instance_id)
             ev["pod_status"] = "absent" if row is None else str(row.get("status") or "?")
+            ev["known"] = True
         key = vault.get(pod.payer_hotkey) if vault is not None else None
         if key:
             reader = getattr(runner, "_payer_balance_reader", None)
@@ -917,8 +975,9 @@ def payer_loss_evidence(runner, pod) -> dict:
     # terminations, host failures and our own provider TTL — recorded as
     # evidence (``ended``), never read as the miner's doing.
     ev["miner"] = bool("payer_balance_usd" in ev and ev["payer_balance_usd"] <= 0)
-    ev["ended"] = any(t in status for t in ("STOPPED", "STOPPING", "CANCEL", "TERMINAT",
-                                             "DELETED", "ABSENT"))
+    ev["known"] = bool(ev.get("known"))     # the payer listing actually answered
+    ev["ended"] = ev["known"] and any(t in status for t in (
+        "STOPPED", "STOPPING", "CANCEL", "TERMINAT", "DELETED", "ABSENT"))
     return ev
 
 

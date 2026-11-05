@@ -76,6 +76,9 @@ def _bucket(*, v2_from: int, block: int, lane_b: bool) -> dict:
     body = json.loads(receipt.canonical_body())
     row = {**summarize_receipt(receipt), "published_at": NOW,
            "receipt_key": f"receipts/round-{receipt.round_id}.json"}
+    # a hold by king_hk: the bench report's king entry IS the post-round king
+    row.update(dethroned=False, challenger_wins_round=False, post_round_king_hotkey="king_hk",
+               post_round_king_uid=0)
     if lane_b:
         n = len(body["weights"])
         weights = [0.0] * max(n, 20)
@@ -132,7 +135,7 @@ def _bucket(*, v2_from: int, block: int, lane_b: bool) -> dict:
     v2 = build_v2_status(cfg, block=block, state=state, health=health, era_index=5,
                          king_pointer=PTR, health_domains=2 if lane_b else 0, as_of=NOW)
     bench = {"round_id": receipt.round_id, "created_block": 1, "entries": [
-        {"role": "king", "size": "toto2-22m", "miner_hotkey": "hk-king", "miner_uid": 0,
+        {"role": "king", "size": "toto2-22m", "miner_hotkey": "king_hk", "miner_uid": 0,
          "trained_pointer": PTR, "scores": dict(SIX)}]}
     return {
         "receipts/index.json": index,
@@ -177,7 +180,7 @@ def test_header_links_current_warm_init_not_trained_king_or_future_promotion(tmp
 def test_fev_report_display_and_timestral_reference(tmp_path, fev):
     fx = _bucket(v2_from=1000, block=50000, lane_b=True)
     fx["receipts/index.json"]["rounds"][0].update(
-        post_round_king_hotkey="hk-king", dethroned=False)
+        post_round_king_hotkey="king_hk", dethroned=False)
     bench = next(v for k, v in fx.items() if k.startswith("benchmarks/round-"))
     if fev:
         bench["entries"][0]["scores"].update(fev)
@@ -290,3 +293,105 @@ def test_nothing_published_renders_pending_states(tmp_path):
     assert "not published" in _html(els, "lb-gate")
     st = _render("stakeholders.html", {}, "dashboard.casdesub.net", STAKE_CALLS, tmp_path)
     assert "awaiting" in _html(st, "hero") and "awaiting" in _html(st, "tiles")
+
+
+# ── 2026-11-04: a rejected king re-sync receipt superseded the crowning ──────
+
+ANCHOR = "5FcCsoB2R5M55RdrNrvPQv7xmLJRFzs7R7C73UUSxgUCyfsw"
+RESYNC_ID = "17758994360717789943"
+OLD_PTR = "metro-v1:trained:hippius:cascade/ckpt-old-king@sha256:" + "0" * 64
+
+
+def _crowning_then_resync(*, v2_pointer: str = PTR) -> tuple[dict, str]:
+    """The crowning (scored: chal_hk dethrones king_hk, court king_hk at 5 %
+    until block 9464400) followed 21 s later by a rejected king_resyncing
+    receipt that names no king and has no ladder / emission / weights."""
+    from .receipt_fixture import make_rejected_receipt
+
+    fx = _bucket(v2_from=0, block=9_500_000, lane_b=False)
+    latest_key = f"receipts/{ANCHOR}/latest.json"
+    scored = fx.pop(latest_key)
+    crown = fx["receipts/index.json"]["rounds"][0]
+    rid = str(crown["round_id"])
+    crown.update(dethroned=True, challenger_wins_round=True, post_round_king_hotkey="chal_hk",
+                 post_round_king_uid=1, receipt_key=f"receipts/{ANCHOR}/round-{rid}.json",
+                 ladder={"king_share": 0.5, "event": "crown", "court_hotkey": "king_hk",
+                         "court_until_block": 9464400, "slashed": False, "former_share": 0.05})
+    scored["verdict"].update(king_hotkey="chal_hk", king_uid=1, dethroned=True)
+    fx[f"receipts/{ANCHOR}/round-{rid}.json"] = scored
+    rej = json.loads(make_rejected_receipt(reason="king_resyncing").canonical_body())
+    rej["round_id"] = RESYNC_ID
+    fx[latest_key] = rej
+    fx["receipts/index.json"]["rounds"].append(
+        {**summarize_receipt(make_rejected_receipt(reason="king_resyncing")),
+         "round_id": RESYNC_ID, "epoch_start_block": int(crown["epoch_start_block"]) + 900,
+         "published_at": NOW, "receipt_key": f"receipts/{ANCHOR}/round-{RESYNC_ID}.json"})
+    fx[f"benchmarks/round-{rid}.json"] = {"round_id": rid, "created_block": 1, "entries": [
+        {"role": "king", "size": "toto2-4m", "miner_hotkey": "king_hk", "miner_uid": 0,
+         "trained_pointer": OLD_PTR, "scores": {**SIX, "gifteval_mase": 0.9, "gifteval_crps": 0.8}},
+        {"role": "challenger", "size": "toto2-4m", "miner_hotkey": "chal_hk", "miner_uid": 1,
+         "trained_pointer": PTR, "scores": {**SIX, "gifteval_mase": 0.5, "gifteval_crps": 0.4}}]}
+    fx["status/v2.json"]["king"]["pointer"] = v2_pointer
+    fx["status/chain.json"]["submissions"] = [
+        {"uid": 1, "hotkey": "chal_hk", "gen_ref": crown["chal_gen_ref"], "commit_block": 9_499_000},
+        {"uid": 0, "hotkey": "king_hk", "gen_ref": crown["king_gen_ref"], "commit_block": 9_498_000}]
+    return fx, rid
+
+
+def test_index_keeps_the_new_king_behind_a_rejected_resync(tmp_path):
+    fx, rid = _crowning_then_resync()
+    calls = INDEX_CALLS + [
+        f"if(String(latestScoredRow().round_id)!=={json.dumps(rid)}) throw Error('verdict reads the rejected row')",
+        "if(currentKingHotkey()!=='chal_hk') throw Error('crown is not the new king')",
+        "if(!_lastScored||_lastScored.status!=='scored') throw Error('scored receipt not walked back')"]
+    els = _render("index.html", fx, "dashboard.casdesub.net", calls, tmp_path)
+    verdict = _html(els, "verdict")
+    assert "Dethroned" in verdict and "Rejected" not in verdict
+    assert "king_resyncing" in _html(els, "verdict-when")
+    assert 'crown">&#9819;</span> chal_hk' in _html(els, "field")
+    assert 'crown">&#9819;</span> king_hk' not in _html(els, "field")
+    assert 'crown">&#9819;</span> chal_hk' in _html(els, "subs")
+    assert not els["la-ladder-wrap"]["hidden"]
+    ladder = _html(els, "la-ladder")
+    assert "50%" in ladder and "9464400" in ladder and "king_hk" in ladder
+    assert "lane A" in _html(els, "v2-split")
+    reigns = _html(els, "reigns")
+    assert "before the index window" in reigns and "genesis" not in reigns and "#1" not in reigns
+
+
+@pytest.mark.parametrize("current", [True, False])
+def test_stakeholders_hero_is_the_new_king_not_the_defender(tmp_path, current):
+    fx, _rid = _crowning_then_resync(v2_pointer=PTR if current else OLD_PTR.replace("0" * 64, "9" * 64))
+    st = _render("stakeholders.html", fx, "dashboard.casdesub.net", ["renderAll()"], tmp_path)
+    hero = _html(st, "hero")
+    assert "king MASE <b>0.500</b>" in hero and "0.900" not in hero
+    assert ("pending" in hero) != current
+    foot = _html(st, "foot")
+    assert "bob/gen" in foot and "alice/gen" not in foot        # chal_gen_ref on a crowning
+    assert ("pending" in foot) != current
+    assert "toto2-4m" in _html(st, "trend-note")
+
+
+def test_stakeholders_trend_never_joins_model_sizes(tmp_path):
+    fx, rid = _crowning_then_resync()
+    rows = fx["receipts/index.json"]["rounds"]
+    older = {**rows[0], "round_id": "1001", "epoch_start_block": int(rows[0]["epoch_start_block"]) - 900,
+             "dethroned": False, "post_round_king_hotkey": "king_hk"}
+    rows.insert(0, older)
+    fx["benchmarks/round-1001.json"] = {"round_id": "1001", "created_block": 1, "entries": [
+        {"role": "king", "size": "v2-120m", "miner_hotkey": "king_hk", "trained_pointer": OLD_PTR,
+         "scores": dict(SIX)}]}
+    st = _render("stakeholders.html", fx, "dashboard.casdesub.net", [
+        "if(kingSeries().length!==2) throw Error('both sizes are king points')",
+        "if(kingView().series.length!==1||kingView().size!=='toto2-4m') throw Error('sizes joined')"],
+        tmp_path)
+    assert "toto2-4m · 1 benched settlements" in _html(st, "trend-note")
+
+
+def test_stakeholders_hero_falls_back_to_the_packaged_reference(tmp_path):
+    fx = _bucket(v2_from=0, block=9_500_000, lane_b=False)
+    fx["data/gift-eval-reference.json"] = fx.pop("benchmarks/leaderboard-reference.json")
+    st = _render("stakeholders.html", fx, "dashboard.casdesub.net", STAKE_CALLS, tmp_path)
+    hero = _html(st, "hero")
+    assert "Timestral-209M" in hero and "would place" in hero
+    assert "awaiting the leaderboard reference" not in hero

@@ -51,6 +51,7 @@ ERROR_TEXT = {
     "spend_cap": "Paused after failed attempts cost too much of your funding. Your submission is kept (never rejected); the operator reviews infra losses, or fund again to resume.",
     "budget": "Your total budget cannot cover the next leg; fund again with a higher --max-total-spend. Nothing was rented.",
     "payer_balance": "Your provider balance cannot finish this leg: top up; nothing was rented and no attempt was consumed.",
+    "payer_account": "Your GPU provider account lists no rentable executor (or refused the key) while the marketplace has the type: check the key's permissions and the account's balance/standing, then fund again. Nothing was rented and no attempt was consumed.",
     "infra": "An infrastructure failure caused a retry.",
     "auth": "The payer credential is missing, expired or refused; review funding with the operator.",
     "funding_expired": "Funding expired while idle; review a new funding request.",

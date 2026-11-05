@@ -506,6 +506,18 @@ executor across `[round] funded_pod_skus` under the price caps
 (`funded_sku_per_leg`), with `[training] expected_gpu = ""`. Equal compute
 comes from the fixed series-point budget, not from matching silicon.
 
+A miner may choose the type itself (`cascade fund --gpu …`, DEC-CA-0060:
+`gpu`, `gpu_allow_fallback`, `gpu_max_price_per_hour` on its queue entry).
+A re-fund that changes that choice reaches a lane-A leg already **waiting
+for capacity**: every poll re-reads the in-flight entry (same ref and
+attempt; not a new ref queued behind the flight) and, on a change, logs
+`funded leg X: miner changed GPU choice A → B` and switches the next rent to
+the new type, cap and latest safe start. A type that can no longer land
+before the leg's target settlement is never rented (the doomed-leg check
+requeues the leg unburned). An unreadable queue keeps the current choice.
+King legs, default-path legs and lane B / marketcast legs (explicit
+choices) are never re-steered; a pod already rented is never touched.
+
 Pinning one SKU (`expected_gpu = "<exact torch.cuda.get_device_name string>"`)
 is a LOCKED contract term — a coordinated validator upgrade — and buys
 byte-exact re-derivation of checkpoints on that SKU + image.
@@ -1110,6 +1122,25 @@ balance is retried and then the rent proceeds. A shortfall requeues
 unburned as `payer_balance` ("top up: need ≈$X, balance $Y"), never counted
 against any cap.
 
+**Empty account vs empty market** (`payer_account`, 2026-11-04). A funded
+leg's capacity wait probes the PAYER's listing; when that stays empty for
+`PAYER_CONTROL_AFTER_ZERO_POLLS` (3) consecutive polls, the trainer runs
+the same read-only listing on the OPERATOR key under the miner's price caps
+and GPU-health guard, at most every `PAYER_CONTROL_INTERVAL_SECONDS` (300).
+`PAYER_CONTROL_HITS_NEEDED` (2) consecutive controls that show capacity
+while every payer poll in between saw nothing end the wait with a terminal,
+unburned `payer_account` verdict ("your account lists no 8xH100 executor …
+while the marketplace shows N …; balance $X / the key cannot read its own
+balance") — the miner fixes the key/account and funds again; the entry is
+never re-dispatched. A payer listing that fails with auth-class text
+(401/403/"invalid api key") convicts at once. A control that is empty too
+keeps the wait a market `no_capacity`. On a king's own key the verdict
+counts as a key failure (the operator takes the leg over, DEC-CA-0055).
+Every empty `lium ls` now logs one line with the raw row count and what each
+filter removed (`lium (payer key): 8xH100 listing — 0 raw row(s) …`), and a
+probe exception in the wait is logged instead of swallowed. The constants
+live on the trainer mixin (`runner_funded_pods.py`), not in chain.toml.
+
 **The new knobs need no TOML change.** Every default above is live as
 shipped. Integral floats such as `3600.0` are accepted for every
 seconds/count knob.
@@ -1637,9 +1668,25 @@ Trainer-only; nothing here reaches a manifest or a validator verdict.
   cascade-trainer block-executor 63cadadb-b379-4c45-8a01-04a81b135933 --reason "1 GPU x3"
   cascade-trainer block-executor f092246d-5704-4c9e-b57f-7c0710a06deb --reason "3 GPUs x2"
   ```
+  **Never-ready lemons** feed the same file. A funded pod rejected as
+  "not ready within …" on a host-side fault (never an auth / balance / rate
+  limit from `lium up`, never a create the platform did not list) records a
+  not-ready strike on its executor. Two within 7 days block the executor
+  with the short-pod durations above (72 h, then 7 d on a repeat), with the
+  reason `never ready 2x in 7 d (not-ready lemon)`; the pod's host IP follows
+  the same rule (blocked only once two distinct executors behind it are).
+  One strike alone blocks nothing beyond the existing 3 h bad-executor mark
+  and 0.5 h host quarantine. `unblock-executor` also clears the count.
 * **Post-rent rejects / lemons** never propose a full-leg operator make-good:
-  their cost is booked `make_good` (one priced alert, sized to the loss) and
-  counts toward the waste-cap pause, so a bad-host streak is bounded.
+  their cost is booked `make_good` (one priced alert, sized to the loss). A
+  make-good owed is OUR debt to the miner and never counts toward the
+  waste-cap pause (that gates on genuine waste: miner-side + infra host
+  losses); the per-attempt bad-pod budget and the short-pod blacklist bound a
+  bad-host streak.
+* **Spend is booked per RENT**, never per pod name (names are reused across
+  rents): a fresh create opens its own record (`rent_id`), and a pod found
+  lost ("not live" at a re-attach, or still open when its name is rented
+  again) closes at its LAST-SEEN-ALIVE time as infra waste.
 * **Withdraw** of a live (`in_flight`, `in_round`, parked …) entry is a 409
   and keeps the key; a withdrawn entry is terminal (never requeued) and never
   gets an operator request.

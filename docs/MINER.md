@@ -1030,6 +1030,7 @@ What happens to your entry when a leg does not produce a judged checkpoint:
 | infrastructure | dead pod, sold-out market, rate limit, harvest transport failure | **kept**, re-queued; one bounded attempt burned (sold-out and rate limits burn nothing) |
 | stall | your generator produced no series for 30 min | first time: treated as infrastructure; second time: yours |
 | auth | invalid/revoked provider key, insufficient account funds, or an expired vault entry | released as `auth`; fix the key, fund again |
+| payer_account | your provider account lists no rentable executor (or refuses the key on a listing) while the operator's listing shows the same GPU type under your caps | released as `payer_account` (nothing rented, no attempt consumed); fix the key's permissions / balance / account standing, fund again |
 | generator | your code raised, a series failed the checks, the loss went non-finite, code packed in a string refused at admission | **spent** |
 | duplicate | an exact, rename-only, embedded or private copy of an earlier commit (§9) | **spent** |
 | tamper | pod replaced under the same name, checkpoint altered | **spent** |
@@ -1096,6 +1097,7 @@ on windows that were never published.
 | funded but never started | not yet revealed, waiting for the next era's pre-train window, or no fitting executor under the price caps; you wait unspent |
 | `failed [generator]` | your code failed on the pod or training diverged; check the training log, fix, submit from a fresh hotkey |
 | `failed [rate_limited]` | your provider key was rate-limited for 6 h; raise limits, fund again |
+| `failed [payer_account]` | your provider account lists nothing while the marketplace has your GPU type (the trainer compares your listing with its own under your caps, several polls apart); check the key's permissions and the account's balance/standing, fund again — nothing was rented |
 | loses every duel | the pool is broad real-world data; broaden the generator's patterns rather than fitting one shape. `cascade duel --hotkey <you>` shows which domains you lost and by how much; `--history` shows whether that is changing |
 
 ## 11. Multichannel generators

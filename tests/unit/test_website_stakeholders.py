@@ -112,7 +112,11 @@ def test_king_numbers_come_from_signed_bench_reports(html: str):
     prefix, suffix = bench_report_key("XYZ").split("XYZ")
     assert re.search(rf'fetchJSON\("{re.escape(prefix)}"\+id\+"{re.escape(suffix)}",\{{bust:false\}}\)', html)
     body = _fn(html, "kingSeries")
-    assert 'String(e.role||"")!=="king"' in body and "e.trained_pointer" in body
+    # the round's POST-round king (a crowning's "king" entry is the defender)
+    assert "r.post_round_king_hotkey" in body and "e.miner_hotkey" in body
+    assert 'String(e.role||"")!=="king"' not in body and "e.trained_pointer" in body
+    view = _fn(html, "kingView")
+    assert "_v2.king.pointer" in view and "p.size===size" in view
     g = _fn(html, "giftOf")
     assert "gifteval_mase" in g and "gifteval_crps" in g
 
@@ -131,7 +135,8 @@ def test_page_reads_only_fields_the_summary_publishes(html: str):
     receipt, _k, _c = make_scored_receipt()
     summary = summarize_receipt(receipt)
     consumed = {"status", "round_id", "epoch_start_block", "cohort_k", "cohort_lcbs",
-                "chal_hotkey", "king_hotkey", "n_participants", "king_gen_ref",
+                "chal_hotkey", "king_hotkey", "n_participants", "king_gen_ref", "chal_gen_ref",
+                "dethroned",
                 "post_round_king_hotkey", "validator_hotkey"}
     assert not consumed - set(summary)
     for f in consumed:
@@ -173,3 +178,13 @@ def test_links_to_and_from_the_mining_dashboard(html: str):
     assert 'href="index.html"' in html
     index = (REPO / "cascade" / "website" / "index.html").read_text(encoding="utf-8")
     assert f'href="{WEBSITE_STAKEHOLDERS_KEY}"' in index
+
+
+def test_footer_registry_digest_is_the_new_kings_on_a_crowning(html: str):
+    foot = _fn(html, "renderFoot")
+    assert "r.dethroned?r.chal_gen_ref:r.king_gen_ref" in foot
+
+
+def test_hero_falls_back_to_the_packaged_reference(html: str):
+    assert 'fetch("data/gift-eval-reference.json"' in html
+    assert REFERENCE.is_file()

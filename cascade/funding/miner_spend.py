@@ -40,6 +40,11 @@ RESULT, WASTE = "result", "waste"
 # ``make_good_usd`` for the owner (money safety II).
 MAKE_GOOD = "make_good"
 INFRA, MINER = "infra", "miner"
+# A pod that vanished mid-leg with NO proof of whose doing (``payer_pod_lost``):
+# the miner's money is gone, but it is neither an operator-side infra loss
+# (no early make-good filed from it) nor the miner's own fault. The owner
+# sees it in the spend view and decides (2026-11-04, 5GhPUmHV).
+UNPROVEN = "unproven"
 
 
 class SpendUnknown(RuntimeError):
@@ -123,9 +128,16 @@ class MinerSpend:
     # ── the rent / teardown sites ────────────────────────────────────────────
 
     def start(self, hotkey: str, *, ref: str, funded_at: float | None, pod_id: str,
-              rate: float) -> None:
-        """A pod was allocated on the miner's key (idempotent per pod id; a
-        known landed rate updates an earlier estimate)."""
+              rate: float, new_rent: bool = False, rent_id: str = "") -> None:
+        """A pod was allocated on the miner's key.
+
+        Pod NAMES are reused across rents (``…-funded-<slug>-0``), so a record
+        is one RENT, never one name (2026-11-03 5EvqPCMN: a 2-minute short-pod
+        reject inherited the start of the lost pod before it and booked 42
+        min). ``new_rent`` (a fresh create): any record still open under this
+        name is closed at its LAST-SEEN-ALIVE time as infra waste (a host
+        loss) and a NEW record (``rent_id``) opens now. Otherwise the call is
+        an update of the open rent (a known landed rate replaces an estimate)."""
         with self._locked() as recs:
             k = self._key(hotkey, ref)
             r = recs.get(k)
@@ -133,29 +145,38 @@ class MinerSpend:
                 r = {"hotkey": hotkey, "ref": ref, "funded_at": funded_at, "pods": [],
                      "capped": False}
             now = self.clock()
-            for p in r["pods"]:
-                if p["pod_id"] == pod_id and p.get("end") is None:
-                    if rate:
-                        p["rate"] = round(float(rate), 4)
-                    p["seen"] = now
-                    break
+            open_ = [p for p in r["pods"] if p["pod_id"] == pod_id and p.get("end") is None]
+            if new_rent:
+                for p in open_:
+                    p.update(end=p.get("seen") or p.get("start"), outcome=WASTE, kind=INFRA,
+                             reason="lost before the next rent of this pod name (closed at "
+                                    "its last-seen-alive time)")
+                open_ = []
+            if open_:
+                p = open_[-1]
+                if rate:
+                    p["rate"] = round(float(rate), 4)
+                p["seen"] = now
             else:
-                r["pods"].append({"pod_id": pod_id, "rate": round(float(rate or 0), 4),
+                r["pods"].append({"pod_id": pod_id, "rent_id": rent_id or f"{pod_id}@{now:.3f}",
+                                  "rate": round(float(rate or 0), 4),
                                   "start": now, "seen": now, "end": None, "outcome": None})
             recs[k] = r
             self._save(recs)
 
     def end(self, hotkey: str | None, pod_id: str, *, outcome: str, reason: str = "",
-            kind: str = INFRA) -> None:
-        """Close the open record of ``pod_id`` (any of the hotkey's
-        submissions; ``hotkey`` None/"" = any hotkey). No-op when none is open."""
+            kind: str = INFRA, at_last_seen: bool = False) -> None:
+        """Close the open record of ``pod_id`` (the CURRENT rent of that name;
+        any of the hotkey's submissions; ``hotkey`` None/"" = any hotkey) now,
+        or at its last-seen-alive time (``at_last_seen``: a pod found lost).
+        No-op when none is open."""
         with self._locked() as recs:
             changed = False
             for _k, r in self._of(recs, hotkey):
                 for p in r["pods"]:
                     if p["pod_id"] == pod_id and p.get("end") is None:
-                        p.update(end=self.clock(), outcome=outcome, reason=reason[:200],
-                                 kind=kind)
+                        end = (p.get("seen") or p.get("start")) if at_last_seen else self.clock()
+                        p.update(end=end, outcome=outcome, reason=reason[:200], kind=kind)
                         changed = True
             if changed:
                 self._save(recs)

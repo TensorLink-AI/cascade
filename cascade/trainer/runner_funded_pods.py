@@ -50,6 +50,33 @@ def _parse_funded_ledger(text):
     return [PodInstance(**{k: v for k, v in d.items() if k in known}) for d in raw]
 
 
+def teardown_spend_kind(verdict) -> tuple[str, bool, str]:
+    """How a pod torn down after a failed leg is booked on the miner's spend
+    ledger: ``(kind, at_last_seen, reason suffix)`` from the leg's recorded
+    verdict ``(text, miner_fault, error_class)``.
+
+    2026-11-04: every teardown booked ``INFRA`` waste, so a pod that vanished
+    mid-leg with no proof of whose doing (``payer_pod_lost``) filed an
+    operator make-good for the whole rent — against the rule that only OUR
+    faults are made good. A payer-side / miner-fault verdict books ``MINER``;
+    an unproven loss books ``UNPROVEN`` (excluded from the infra-waste make-
+    good trigger) closed at the pod's last-seen-alive time; anything else
+    stays ``INFRA`` (our side)."""
+    from ..funding.miner_spend import INFRA, MINER, UNPROVEN
+
+    if not verdict:
+        return INFRA, False, ""
+    try:
+        _text, miner_fault, error_class = verdict[0], bool(verdict[1]), str(verdict[2] or "")
+    except (IndexError, TypeError):
+        return INFRA, False, ""
+    if miner_fault or error_class in ("payer_side", "payer_interference"):
+        return MINER, False, f" [{error_class or 'miner'}]"
+    if error_class == "payer_pod_lost":
+        return UNPROVEN, True, " [payer_pod_lost: cause unproven]"
+    return INFRA, False, f" [{error_class}]" if error_class else ""
+
+
 def _entry_gpu_choice(entry, ref: str):
     """The GPU choice (DEC-CA-0060) of ``entry`` when it is the in-flight
     lane-A entry for ``ref``, else the default ``GpuChoice()`` — a king leg on
@@ -64,6 +91,57 @@ def _entry_gpu_choice(entry, ref: str):
                      allow_fallback=bool(getattr(entry, "gpu_allow_fallback", False)),
                      max_price_per_hour=float(getattr(entry, "gpu_max_price_per_hour", 0.0)
                                               or 0.0))
+
+
+def _gpu_choice_key(choice) -> tuple:
+    """A comparable form of a ``GpuChoice`` (the type case-insensitive; the
+    fallback flag and cap only mean something with a type chosen)."""
+    gpu = str(getattr(choice, "gpu", "") or "").strip().lower()
+    if not gpu:
+        return ("", False, 0.0)
+    return (gpu, bool(getattr(choice, "allow_fallback", False)),
+            float(getattr(choice, "max_price_per_hour", 0.0) or 0.0))
+
+
+def _changed_gpu_choice(runner, hotkey: str, ref: str, attempt_id: str, current):
+    """The miner's NEW GPU choice for a leg waiting for capacity, or None to
+    keep ``current`` (incident 2026-11-03: a re-fund switched 8xH200 → 8xH100
+    but the waiting leg polled for 8xH200 until its deadline).
+
+    Only the SAME in-flight entry counts — status ``in_flight``, this leg's
+    ``ref`` and ``attempt_id`` — and not one whose re-fund queued a new ref
+    behind the flight (that choice belongs to the queued submission). Any read
+    failure keeps the current choice: a torn queue never ends a leg."""
+    from ..funding.gpu_choice import GpuChoice
+
+    try:
+        queue = runner._funded_queue()
+        entry = queue.get(hotkey) if queue is not None else None
+        if (entry is None or getattr(entry, "status", "") != "in_flight"
+                or getattr(entry, "ref", None) != ref
+                or str(getattr(entry, "attempt_id", "") or "") != attempt_id
+                or getattr(entry, "queued_ref", "")):
+            return None
+        gpu = str(getattr(entry, "gpu", "") or "")
+        new = GpuChoice(gpu=gpu,
+                        allow_fallback=bool(getattr(entry, "gpu_allow_fallback", False))
+                        if gpu else False,
+                        max_price_per_hour=float(getattr(entry, "gpu_max_price_per_hour", 0.0)
+                                                 or 0.0) if gpu else 0.0)
+    except Exception as e:  # noqa: BLE001 — unreadable queue: keep the current choice
+        log.debug("funded leg %s: GPU choice re-read failed (%s) — keeping %s",
+                  hotkey[:12], e, getattr(current, "gpu", "") or "the default")
+        return None
+    return None if _gpu_choice_key(new) == _gpu_choice_key(current) else new
+
+
+def _describe_gpu_choice(choice) -> str:
+    gpu = str(getattr(choice, "gpu", "") or "")
+    if not gpu:
+        return "default (cheapest fitting type)"
+    cap = float(getattr(choice, "max_price_per_hour", 0.0) or 0.0)
+    return (f"{gpu} (cap {f'${cap:.2f}/h' if cap else 'none'}"
+            f"{', fallback allowed' if getattr(choice, 'allow_fallback', False) else ''})")
 
 
 @contextlib.contextmanager
@@ -896,6 +974,104 @@ class _FundedPodMixin:
         self._funded_leg_failures[hotkey] = (error_tail(msg, 500), miner_fault,
                                              error_class, burn)
 
+    # The payer-vs-operator control listing (PayerCapacityWatch): the control
+    # runs after this many consecutive empty payer polls, at most this often,
+    # and this many consecutive controls showing capacity convict the account.
+    PAYER_CONTROL_AFTER_ZERO_POLLS = 3
+    PAYER_CONTROL_INTERVAL_SECONDS = 300.0
+    PAYER_CONTROL_HITS_NEEDED = 2
+
+    def _payer_capacity_watch(self, api_key, wait_caps: dict):
+        """The capacity probe for a payer-funded wait: the payer's own listing,
+        checked against the OPERATOR's listing under the same caps and the
+        same GPU-health guard whenever the payer's stays empty
+        (:class:`~cascade.provision.payer_pool.PayerCapacityWatch`)."""
+        from ..provision.payer_pool import PayerCapacityWatch, payer_capacity
+        from .gpu_health import health_for
+
+        def payer(fitting):
+            return payer_capacity(api_key, fitting, wait_caps, live_claimed_executors(self),
+                                  health_for(self))
+
+        def control(fitting):
+            health = health_for(self)
+            fit = tuple(health.allowed(tuple(fitting))) if health.threshold else tuple(fitting)
+            if not fit:
+                return 0            # quarantined for everyone: not the payer's account
+            return self._probe_funded_capacity(fit, live_claimed_executors(self),
+                                               price_caps=wait_caps)
+
+        cls = _FundedPodMixin
+        return PayerCapacityWatch(
+            payer_probe=payer, control_probe=control,
+            now=getattr(self, "_rent_wait_now", None) or time.time,
+            zero_polls_before_control=int(getattr(
+                self, "PAYER_CONTROL_AFTER_ZERO_POLLS", cls.PAYER_CONTROL_AFTER_ZERO_POLLS)),
+            control_interval_seconds=float(getattr(
+                self, "PAYER_CONTROL_INTERVAL_SECONDS", cls.PAYER_CONTROL_INTERVAL_SECONDS)),
+            control_hits_needed=int(getattr(
+                self, "PAYER_CONTROL_HITS_NEEDED", cls.PAYER_CONTROL_HITS_NEEDED)))
+
+    def _payer_account_message(self, api_key, watch) -> str:
+        """The miner-readable ``payer_account`` verdict: what the listings
+        showed, whether the key can read its own balance, what to do. Never
+        carries the key."""
+        from .money_guard import payer_balance_note
+
+        verdict = getattr(watch, "verdict", None)
+        why = str(verdict) if verdict is not None else "your GPU provider account lists nothing"
+        note = payer_balance_note(self, api_key)
+        return (f"{why}{'; ' + note if note else ''} — check the key's permissions and the "
+                "account's balance/standing with your GPU provider, then fund again; "
+                "nothing rented, no attempt charged")
+
+    def _small_loss_rerun(self, gen, entry, queue) -> bool:
+        """Owner 2026-11-04: a SMALL our-side loss never becomes an operator
+        make-good leg. When the miner's lemon / infra-waste on this submission
+        is below ``[round] make_good_rerun_below_usd``, the operator-billed
+        flag is cleared and the leg reruns on the miner's own key (the loss
+        stays a make-good owed). Never for a leg the owner already approved
+        on our account, past the miner waste cap, or past the operator-fault
+        pause (a systemic fault). True when the flag was cleared."""
+        try:
+            cap = float(getattr(getattr(getattr(self, "cfg", None), "round", None),
+                                "make_good_rerun_below_usd", 0.0) or 0.0)
+            if cap <= 0:
+                return False
+            from .miner_spend_guard import _ledger, capped
+
+            if capped(self, gen):
+                return False
+            if int(getattr(entry, "operator_faults", 0) or 0) >= int(
+                    getattr(self, "OPERATOR_FAULT_RETRIES", 0) or 0):
+                return False
+            from ..funding.operator_approvals import APPROVED, LAUNCHED, OperatorApprovals
+
+            rec = OperatorApprovals.for_work_root(self.work_root).get(
+                Path(queue.path).name, gen.hotkey)
+            if rec and rec.get("state") in (APPROVED, LAUNCHED):
+                return False
+            led = _ledger(self)
+            if led is None:
+                return False
+            s = led.summary(gen.hotkey, ref=entry.ref, funded_at=entry.funded_at)
+            lost = float(s.make_good_usd) + float(s.infra_waste_usd)
+            # Only a flag that came from LEMON losses (a recorded make-good on
+            # the miner's key) is this rule's to clear: an operator-billed
+            # entry with no such loss was flagged for another reason (an
+            # expired key, a lost finished run, our storage) — approval path.
+            if float(s.make_good_usd) <= 0 or lost >= cap:
+                return False
+        except Exception as e:  # noqa: BLE001 — unsure ⇒ the approval path decides
+            log.warning("funded leg %s: small-loss rerun check failed (%s) — owner approval "
+                        "path", gen.hotkey[:12], e)
+            return False
+        queue.set_operator_billed(gen.hotkey, False)
+        log.warning("funded leg %s: our-side loss $%.2f < $%.2f — reruns on the MINER's own "
+                    "key (no operator make-good leg; the $%.2f stays a make-good owed)",
+                    gen.hotkey[:12], lost, cap, lost)
+        return True
+
     def _count_funded_loss(self, hotkey: str, *, more: bool) -> bool:
         """Count one billed allocation that delivered nothing (a lemon, a
         stale or slow pod released before training) as an operator-side loss
@@ -1040,6 +1216,9 @@ class _FundedPodMixin:
                         gen.hotkey, faults, self.OPERATOR_FAULT_RETRIES)
             queue.set_operator_billed(gen.hotkey, False)
             flagged = queue.get(gen.hotkey)
+        if (flagged is not None and bool(getattr(flagged, "operator_billed", False))
+                and _FundedPodMixin._small_loss_rerun(self, gen, flagged, queue)):
+            flagged = queue.get(gen.hotkey)
         if flagged is not None and bool(getattr(flagged, "operator_billed", False)):
             # Owner make-good: this entry's leg is on the operator's bill — an
             # operator lane (or an operator-rented pod), never the payer's key;
@@ -1067,8 +1246,14 @@ class _FundedPodMixin:
                         "running on an operator lane (%d on file), never on the payer's key",
                         gen.hotkey, len(lanes))
             raise _FundedOperatorFallback(gen.hotkey)
+        # A lane-A leg's choice lives on its in-flight queue entry and is
+        # RE-READ while the leg waits for capacity (a re-fund may change it);
+        # an explicit choice (king: the default; lane B / marketcast: their
+        # own store) is fixed for the leg.
+        reread_choice = gpu_choice is None
         if gpu_choice is None:
             gpu_choice = _entry_gpu_choice(flagged, gen.ref)
+        flight_attempt = str(getattr(flagged, "attempt_id", "") or "")
         from .leg_pins import leg_round
 
         # DEC-CA-0067: the leg's era pins (the after image from the switch on;
@@ -1120,6 +1305,13 @@ class _FundedPodMixin:
                 log.warning("funded leg %s: ledgered pod %s is not live — a fresh rent, every "
                             "rent guard applies", gen.hotkey[:12], expected_id)
                 prior_alloc = False
+                # The lost pod's own rent closes at its LAST-SEEN-ALIVE time as
+                # infra waste (a host loss) — before the fresh rent of the same
+                # pod name can open (2026-11-03 5EvqPCMN).
+                from .miner_spend_guard import spend_end
+
+                spend_end(self, gen.hotkey, expected_id, outcome="waste", at_last_seen=True,
+                          reason="lost: not live at re-attach (closed at its last-seen time)")
         if lost_leg is not None:
             from ..funding.queue import OPERATOR_DISK_CLASS, OPERATOR_TRANSIENT_CLASS
 
@@ -1210,7 +1402,7 @@ class _FundedPodMixin:
                            or float(getattr(rnd, "funded_max_price_per_hour", 0.0) or 0.0)
                            ) if getattr(gpu_choice, "gpu", "") else 0.0
             poor = payer_balance_refusal(self, api_key, hours=self._leg_wall_seconds() / 3600.0,
-                                         rate=max(knob, chosen_rate))
+                                         rate=max(knob, chosen_rate), who=gen.hotkey[:12])
             if poor:
                 # nothing rented, requeued with a backoff — never terminal,
                 # never a burn, never counted against any cap
@@ -1308,7 +1500,35 @@ class _FundedPodMixin:
                      if chosen[1]["max_price_per_hour"] else "none",
                      "falls back to the cheapest type" if gpu_choice.allow_fallback
                      else "waits for this type")
+        # Only a leg that started WITH a miner choice follows later changes;
+        # king legs and default-path legs are never re-steered.
+        reread_choice = bool(reread_choice and not is_king and not adopt_live
+                             and getattr(gpu_choice, "gpu", ""))
+
+        def choice_update():
+            if not reread_choice:
+                return None
+            return _changed_gpu_choice(self, gen.hotkey, gen.ref, flight_attempt, gpu_choice)
+
         while True:
+            new_choice = choice_update()
+            if new_choice is not None:
+                # The miner re-funded with another GPU choice while this leg
+                # waited: switch to it before the next rent attempt — its SKU,
+                # its cap, and (through the wait / doomed-leg checks below)
+                # its own latest safe start; a type that no longer fits the
+                # leg's target settlement is never rented.
+                log.warning("funded leg %s: miner changed GPU choice %s → %s",
+                            gen.hotkey[:12], _describe_gpu_choice(gpu_choice),
+                            _describe_gpu_choice(new_choice))
+                gpu_choice = new_choice
+                chosen = (self._chosen_gpu_rent(gpu_choice, f"funded leg {gen.hotkey[:12]}")
+                          if gpu_choice.gpu else None)
+                fell_back = False
+                if chosen is not None:
+                    round_sku = chosen[0][0]
+                elif skus:
+                    round_sku = skus[0]
             queue = self._funded_queue()
             recovery = queue.get(gen.hotkey) if queue is not None else None
             if recovery is not None and recovery.operator_billed:
@@ -1364,7 +1584,8 @@ class _FundedPodMixin:
                 allocated = []
 
                 def on_allocated(machine_id, pod_id, *, allocated=allocated,
-                                 release_allocation=release_allocation):
+                                 release_allocation=release_allocation,
+                                 gpu_choice=gpu_choice, round_sku=round_sku):
                     from .progress import report_progress
 
                     report_progress(self, "booting")
@@ -1372,7 +1593,13 @@ class _FundedPodMixin:
                     if not is_king:
                         from .miner_spend_guard import fallback_rate, spend_start
 
-                        spend_start(self, gen.hotkey, pod_id, rate=fallback_rate(self, gpu_choice))
+                        # a fresh create (a machine id) is a NEW rent record —
+                        # never the previous rent of this reused pod name;
+                        # an adopted allocation ("" machine) updates its own
+                        spend_start(self, gen.hotkey, pod_id, rate=fallback_rate(self, gpu_choice),
+                                    new_rent=bool(machine_id),
+                                    rent_id=f"{machine_id}@{time.time():.0f}" if machine_id
+                                    else "")
                     if selected_provider["credential_id"]:
                         self._ledger_add(PodInstance(
                             provider=selected_provider["name"], instance_id=pod_id, stage="funded",
@@ -1453,6 +1680,17 @@ class _FundedPodMixin:
                         # a lemon or any allocated-then-failed rent (no ssh
                         # key pin, no identity): the host's / our fault — an
                         # operator make-good of its cost, never their waste
+                        if getattr(result, "create_refused", False):
+                            # The platform refused the create: nothing was ever
+                            # allocated or billed — closed at its start, $0
+                            # (before any re-price, which would move last-seen).
+                            from .miner_spend_guard import INFRA as _INFRA
+
+                            spend_end(self, gen.hotkey, pod_id, outcome=MAKE_GOOD, kind=_INFRA,
+                                      at_last_seen=True,
+                                      reason=f"create refused by the platform (nothing "
+                                             f"allocated): {str(result.error)[:100]}")
+                            continue
                         lemon = result.error_class != "auth"
                         landed = getattr(result, "price_per_hour", None)
                         if landed:
@@ -1624,17 +1862,31 @@ class _FundedPodMixin:
             from .progress import report_progress
 
             report_progress(self, "waiting_gpu", "market_capacity")
-            from ..provision.payer_pool import payer_capacity
             wait_caps = (chosen[1] if chosen is not None else
                          self._fallback_price_caps(gpu_choice) if fell_back
                          else self._funded_price_caps())
+            # The probe tells an empty ACCOUNT from an empty MARKET: the
+            # payer's listing against the operator's under the same caps.
+            watch = self._payer_capacity_watch(api_key, wait_caps)
             waited = self._wait_for_funded_capacity(
                 chosen[0] if chosen is not None else skus,
                 describe=f"funded leg {gen.hotkey[:12]}", hotkey=gen.hotkey,
-                capacity_probe=lambda fitting, wait_caps=wait_caps: payer_capacity(api_key, fitting, wait_caps,
-                    live_claimed_executors(self), health_for(self)),
+                capacity_probe=watch,
                 allow_paid_fallback=chosen is None,
+                **({"choice_changed": lambda: choice_update() is not None}
+                   if reread_choice else {}),
                 **({"price_caps": wait_caps} if chosen is not None or fell_back else {}))
+            if waited == "gpu_changed":
+                continue                  # re-derived at the top of the loop
+            if waited == "payer_account":
+                # The miner's account (key refused / lists nothing while the
+                # market has the type): a terminal, unburned verdict the
+                # miner can read and act on — never another era of polling.
+                from ..funding.queue import PAYER_ACCOUNT_CLASS
+
+                result = replace(result, error=self._payer_account_message(api_key, watch),
+                                 error_class=PAYER_ACCOUNT_CLASS, burn_attempt=False)
+                break
             if waited in ("operator_rent", "operator"):
                 from .money_guard import gate_or_adopt
 
@@ -1672,8 +1924,10 @@ class _FundedPodMixin:
                 msg += (f" [LEAKED pod {result.leaked_pod} may still bill this "
                         f"payer — stop it through its GPU provider on your "
                         f"account]")
+            from ..funding.queue import PAYER_ACCOUNT_CLASS
+
             self._record_funded_failure(
-                gen.hotkey, msg, miner_fault=(result.error_class == "auth"),
+                gen.hotkey, msg, miner_fault=result.error_class in ("auth", PAYER_ACCOUNT_CLASS),
                 error_class=result.error_class, burn=result.burn_attempt)
             raise _FundedLegSkip(gen.hotkey)
         # Replace the intent row with the real pod record (same instance id).
@@ -2043,9 +2297,13 @@ class _FundedPodMixin:
         # miner: close its spend record as waste (a no-op after a result).
         from .miner_spend_guard import spend_end
 
+        kind, at_last_seen, why = teardown_spend_kind(
+            (getattr(self, "_funded_leg_failures", None) or {}).get(
+                str(getattr(pod, "payer_hotkey", "") or "")))
         spend_end(self, str(getattr(pod, "payer_hotkey", "") or ""),
                   str(getattr(pod, "instance_id", "") or ""), outcome="waste",
-                  reason="torn down without a harvested result")
+                  reason=f"torn down without a harvested result{why}", kind=kind,
+                  at_last_seen=at_last_seen)
         # The leg is over: its Hub robot dies first, whatever the pod does.
         self._revoke_robot(pod)
         vault = self._payer_vault()

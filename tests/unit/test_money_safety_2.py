@@ -70,7 +70,7 @@ def test_new_knobs_are_registered_with_their_defaults():
     assert rnd.harvest_keep_max_seconds == 10800 and rnd.harvest_keep_cost_fraction == 0.5
     assert rnd.miner_waste_alert_usd == 15.0 and rnd.operator_runway_alert_hours == 6.0
     assert rnd.operator_daily_cap_scope == "miner_legs"
-    assert rnd.funded_ready_timeout_seconds == 420.0
+    assert rnd.funded_ready_timeout_seconds == 600.0   # 2026-11-04: measured Lium p90 496 s
 
 
 def test_new_knobs_round_trip_through_the_loader_integral_floats_included(tmp_path):
@@ -467,8 +467,9 @@ def test_listings_are_filtered_on_the_exact_gpu_count(monkeypatch, tmp_path):
         short_pods.set_path(None)
 
 
-def test_ready_timeout_default_is_420():
-    assert RoundConfig().funded_ready_timeout_seconds == 420.0
+def test_ready_timeout_default_is_600():
+    # 2026-11-04: 51 healthy Lium rents, launch -> ready p90 496 s, max 555 s
+    assert RoundConfig().funded_ready_timeout_seconds == 600.0
 
 
 def test_post_rent_rejects_are_operator_make_good_not_miner_waste(tmp_path):
@@ -841,8 +842,56 @@ def test_payer_side_evidence_proves_a_miner_cause():
     # a stopped / absent pod is NOT proof (platform, host, our TTL): ended only
     ev = payer_loss_evidence(_payer_runner(None, status="STOPPED"), pod)
     assert ev["miner"] is False and ev["ended"] is True
-    ev = payer_loss_evidence(_payer_runner(None, status=None), pod)
+    ev = payer_loss_evidence(_payer_runner(None, status=None), pod, recheck_sleep=lambda s: None)
     assert ev["pod_status"] == "absent" and ev["miner"] is False and ev["ended"] is True
+    assert ev["known"] is True
+
+
+def test_unknown_evidence_never_says_ended(monkeypatch):
+    """2026-11-04: an unanswered listing (adapter error, no key, API hiccup)
+    is NOT evidence that the pod ended — ``known`` is False, ``ended`` False."""
+    from cascade.trainer.runner_funded_legs import payer_loss_evidence
+
+    pod = _pod("p-0", payer=HK)
+    vault = SimpleNamespace(get=lambda hk: "sk-payer")
+
+    class _Boom:
+        def _pod(self, pod_id):
+            raise RuntimeError("lium: 502")
+
+    r = SimpleNamespace(_payer_vault=lambda: vault, _payer_pod_provider=lambda v, pod: _Boom(),
+                        _payer_balance_reader=lambda key: 50.0)
+    ev = payer_loss_evidence(r, pod)
+    assert ev["known"] is False and ev["ended"] is False and ev["miner"] is False
+    # no adapter at all (no key): the same
+    r2 = SimpleNamespace(_payer_vault=lambda: vault, _payer_pod_provider=lambda v, pod: None,
+                         _payer_balance_reader=lambda key: 50.0)
+    ev = payer_loss_evidence(r2, pod)
+    assert ev["known"] is False and ev["ended"] is False
+    # a single listing miss is re-checked before 'absent' is believed
+    seen = []
+
+    class _Flaky:
+        def _pod(self, pod_id):
+            seen.append(1)
+            return None if len(seen) == 1 else {"status": "RUNNING"}
+
+    r3 = SimpleNamespace(_payer_vault=lambda: vault, _payer_pod_provider=lambda v, pod: _Flaky(),
+                         _payer_balance_reader=lambda key: 50.0)
+    ev = payer_loss_evidence(r3, pod, recheck_sleep=lambda s: None)
+    assert ev["pod_status"] == "RUNNING" and ev["ended"] is False and len(seen) == 2
+
+
+def test_teardown_books_the_leg_verdict_not_blanket_infra():
+    from cascade.funding.miner_spend import INFRA, MINER, UNPROVEN
+    from cascade.trainer.runner_funded_pods import teardown_spend_kind
+
+    assert teardown_spend_kind(None) == (INFRA, False, "")
+    assert teardown_spend_kind(("x", False, "infra")) == (INFRA, False, " [infra]")
+    assert teardown_spend_kind(("x", True, "generator"))[0] == MINER
+    assert teardown_spend_kind(("x", False, "payer_side"))[0] == MINER
+    kind, last_seen, why = teardown_spend_kind(("x", False, "payer_pod_lost"))
+    assert (kind, last_seen) == (UNPROVEN, True) and "unproven" in why
 
 
 def test_a_watchdog_abort_with_a_foreign_gpu_hog_is_the_miners(monkeypatch):
@@ -960,6 +1009,19 @@ def test_a_rejected_receipt_of_our_settlement_raises_one_alert(tmp_path):
     other = {"round_id": "theirs", "status": "rejected"}
     assert money_watch.rejected_receipt_tick(r, now=2000.0,
                                              reader=lambda: json.dumps(other)) is None
+
+
+def test_a_no_contest_receipt_is_not_a_rejection(tmp_path):
+    """2026-11-04 07:32: a king-only settlement (status "rejected", reason
+    no_king_challenger_pair — the validator's designed no-contest) raised a
+    critical "settlement_rejected" for the king's own era leg. No leg lost a
+    result there: never an alert."""
+    r = _runner(tmp_path, receipt_watch_validator_hotkey="5Val")
+    money_watch.note_published_settlement(r, SimpleNamespace(
+        round_id="r-k", entries=[SimpleNamespace(miner_hotkey=HK)]))
+    doc = {"round_id": "r-k", "status": "rejected", "reject_reason": "no_king_challenger_pair"}
+    assert money_watch.rejected_receipt_tick(r, now=1000.0, reader=lambda: json.dumps(doc)) is None
+    assert not [c for c in money_guard.health_conditions(r, {}) if c["code"] == "settlement_rejected"]
 
 
 # ── G: approvals have a default cost ceiling ────────────────────────────────
@@ -1185,7 +1247,7 @@ def test_an_in_flight_operator_leg_keeps_its_recovery_with_the_fallback_off(tmp_
     assert _OperatorPodMixin._operator_rent_allowed(r, HK) is False      # nothing on our bill
 
 
-def test_post_rent_rejects_never_propose_a_full_leg_make_good_but_count_to_the_cap(tmp_path):
+def test_post_rent_rejects_never_propose_a_full_leg_make_good_nor_pause(tmp_path):
     import inspect
 
     from cascade.trainer import miner_spend_guard as g
@@ -1204,8 +1266,8 @@ def test_post_rent_rejects_never_propose_a_full_leg_make_good_but_count_to_the_c
         recs[led._key(HK, REF)]["pods"][0]["start"] -= 1200     # 20 min at $36/h = $12
         led._save(recs)
     g.spend_end(r, HK, "short-0", outcome=MAKE_GOOD, reason="post-rent reject: short pod")
-    with pytest.raises(_Skip):
-        g.waste_cap_check(r, SimpleNamespace(hotkey=HK, ref=REF, uid=1))   # bounded
+    # a make-good owed is OUR debt: it never pauses the miner (rc20, 5EvqPCMN)
+    g.waste_cap_check(r, SimpleNamespace(hotkey=HK, ref=REF, uid=1))
     assert OperatorApprovals.for_work_root(tmp_path).pending() == []      # no leg make-good
 
 

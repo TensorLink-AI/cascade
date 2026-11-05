@@ -188,3 +188,59 @@ def test_reign_for_digest_uses_the_resolved_receipt_king():
     rows = [_row("r1", 100, "v1", _A, _RA, _A)]
     k = ca.king_from_receipt(_receipt())
     assert ca.reign_for_digest(rows, "b" * 64, current=k)["reign"] == 2
+
+
+# ── walk-back: a rejected / no-contest latest receipt names no king ──────────
+
+def _chain_store(receipts: dict, manifests: dict) -> dict:
+    """Bucket text by key: ``m/<rid>`` = manifest JSON, ``r/<rid>`` = receipt."""
+    out = {f"m/{rid}": json.dumps({"round_id": rid, "prev_round_id": prev})
+           for rid, prev in manifests.items()}
+    out.update({f"r/{rid}": json.dumps(body) for rid, body in receipts.items()})
+    return out
+
+
+def _walk(store: dict, start: str, *, verify=lambda t: True, **kw):
+    def get(key):
+        if key not in store:
+            raise FileNotFoundError(key)
+        return store[key]
+    return ca.walk_back_receipt_king(get, start, manifest_key=lambda r: f"m/{r}",
+                                     receipt_key=lambda r: f"r/{r}", verify=verify, **kw)
+
+
+def test_walk_back_finds_the_crowning_scored_receipt_behind_a_rejected_one():
+    # r10 crowned _B (scored); r11's rejected king_resyncing receipt superseded it
+    crown = {**_receipt(), "round_id": "r10"}
+    resync = {"status": "rejected", "round_id": "r11", "reject_reason": "king_resyncing"}
+    store = _chain_store({"r10": crown, "r11": resync}, {"r11": "r10", "r10": "r9"})
+    k = _walk(store, "r11")
+    assert k["hotkey"] == _B and k["round_id"] == "r10" and k["gen_ref"] == _RB
+
+
+def test_walk_back_skips_rejected_missing_and_unverified_receipts():
+    old = {**_receipt(king=_A, dethroned=False), "round_id": "r7"}
+    forged = {**_receipt(king=_C, dethroned=False), "round_id": "r9", "forged": True}
+    store = _chain_store({"r7": old, "r9": forged,
+                          "r10": {"status": "rejected", "round_id": "r10"}},
+                         {"r11": "r10", "r10": "r9", "r9": "r8", "r8": "r7"})
+    k = _walk(store, "r11", verify=lambda t: '"forged"' not in t)
+    assert k["hotkey"] == _A and k["round_id"] == "r7"
+
+
+def test_walk_back_is_bounded_and_fail_safe():
+    rej = {"status": "rejected"}
+    store = _chain_store({f"r{i}": rej for i in range(30)},
+                         {f"r{i}": f"r{i - 1}" for i in range(1, 30)})
+    store["r/r0"] = json.dumps({**_receipt(), "round_id": "r0"})
+    assert _walk(store, "r29") is None                       # 12-step bound
+    assert _walk(store, "r5")["hotkey"] == _B
+    assert _walk({}, "r5") is None                           # broken chain
+    assert _walk(_chain_store({}, {"r5": ""}), "r5") is None   # chain start
+
+
+def test_walk_back_stops_at_a_forfeited_king_never_an_older_one():
+    store = _chain_store({"r10": {**_receipt(), "round_id": "r10"},
+                          "r9": {**_receipt(king=_A, dethroned=False), "round_id": "r9"}},
+                         {"r11": "r10", "r10": "r9", "r9": ""})
+    assert _walk(store, "r11", forfeited={_B}) is None

@@ -208,6 +208,32 @@ def quarantine_lemon_host(provider: Provider, pod_id: str, reason: str) -> str:
     return host
 
 
+def record_not_ready_strike(provider: Provider, pod_id: str, reason: str, *,
+                            ip: str = "") -> str:
+    """Count a host-side NEVER-READY rent of ``pod_id`` against its executor
+    on the persistent blacklist (:func:`cascade.provision.short_pods.
+    not_ready_strike`; blocked at the second within 7 d). The 3 h bad mark
+    and the host quarantine the lemon path sets both expire, and the same
+    lemon was re-rented the same day (2026-11-03, 3cfaf487…). Only an
+    executor the platform LISTED the pod on counts (a ghost create proves
+    nothing about a host); the caller rules out miner-side causes. Returns
+    the executor struck ("" = none). Never raises."""
+    resolver = getattr(provider, "listed_executor_of", None)
+    if not callable(resolver):
+        return ""
+    try:
+        executor = str(resolver(pod_id) or "")
+        if executor:
+            from .short_pods import not_ready_strike
+
+            not_ready_strike(executor_id=executor, ip=str(ip or ""),
+                             reason=f"{pod_id}: {reason}")
+        return executor
+    except Exception as e:  # noqa: BLE001 — never mask the lemon
+        log.warning("lium: could not record the not-ready strike of %s: %s", pod_id, e)
+        return ""
+
+
 @dataclass(frozen=True)
 class FundedRentResult:
     """One funded rent attempt, success or classified failure."""
@@ -223,6 +249,10 @@ class FundedRentResult:
     # DISTINCT executors instead of racing for the listing's first row.
     machine_id: str = ""
     adopted: bool = False           # a live pod of this name was reused, not rented
+    # The platform refused every create of this attempt outright (``lium up``:
+    # "Node with ID … not found"): nothing was allocated, so nothing billed —
+    # the caller books the rent at zero cost and never as a leak.
+    create_refused: bool = False
     burn_attempt: bool = False      # True only for "infra" (the taxonomy's rule)
     # Platform identity of the pod that answered (Lium pod id + huid) and the
     # container's SSH host key, both read once the pod is READY: the trainer
@@ -450,9 +480,14 @@ def rent_funded_pod(
             # The platform took the rent and delivered nothing usable: a lemon
             # host (2026-09-13: RUNNING with no ports for 900 s, four ids on
             # one machine). Remember the HOST before the pod record vanishes.
-            if classify_rent_failure(why) in {"auth", "rate_limited"}:
+            cls = classify_rent_failure(why)
+            if cls in {"auth", "rate_limited"}:
                 raise ProvisionError(why)
-            quarantine_lemon_host(provider, pod_id, why)
+            host = quarantine_lemon_host(provider, pod_id, why)
+            if cls == "infra":
+                # a plain host fault (never a miner's key / balance / limit):
+                # a persistent strike, blocked at the second within 7 d
+                record_not_ready_strike(provider, pod_id, why, ip=host)
             raise LemonPodError(why)
         addr = provider.get_ip(pod_id)
         if addr is None:
@@ -509,8 +544,18 @@ def rent_funded_pod(
         if launched and callable(price_fn):
             with contextlib.suppress(Exception):
                 failed_price = price_fn(launched[0])
+        rejected = getattr(provider, "create_rejected", lambda _pid: False)
+        refused = bool(launched) and all(rejected(pid) for pid in launched)
         for pid in launched:
             try:
+                if rejected(pid):
+                    # The platform refused this create: nothing of THIS rent
+                    # exists. A same-named pod still listed is an earlier rent
+                    # being torn down (names are reused per leg), never a leak
+                    # of this one — terminate it again, best effort.
+                    with contextlib.suppress(Exception):
+                        provider.terminate(pid)
+                    continue
                 if not terminate_verified(provider, pid):
                     raise ProvisionError("still listed live after terminate")
             except Exception as te:  # noqa: BLE001 — record loudly; never silent
@@ -541,6 +586,8 @@ def rent_funded_pod(
 
             forget_lease(vault, credential_id)
         res = _fail(e, leaked_pod=leaked)
+        if refused and not leaked:
+            res = replace(res, create_refused=True)
         if leaked:
             res = replace(res, burn_attempt=False)
         if isinstance(e, LemonPodError):

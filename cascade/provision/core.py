@@ -837,6 +837,18 @@ def parse_lium_executors(stdout: str) -> list[dict]:
     return data
 
 
+# ``lium up`` output that means the platform refused the create itself (the
+# executor is gone), as opposed to a create whose outcome is unknown.
+_LIUM_UP_REJECTED = (("node with id", "not found"), ("executor", "not found"),
+                     ("no such node",), ("node not found",))
+
+
+def lium_up_rejected(output: str) -> bool:
+    """True when ``lium up`` output says the platform refused the create."""
+    low = (output or "").lower()
+    return any(all(m in low for m in group) for group in _LIUM_UP_REJECTED)
+
+
 def parse_lium_pods(stdout: str) -> list[dict]:
     """Parse ``lium ps --format json`` → list of pod dicts (``[]`` if none)."""
     text = (stdout or "").strip()
@@ -1276,6 +1288,7 @@ class LiumProvider:
         # blacklist keeps every struck executor / host out from then on.
         shaped = [e for e in execs
                   if (executor_gpu_count(e) or (1 if int(gpus) == 1 else 0)) == int(gpus)]
+        n_shaped = len(shaped)
         shaped = _drop_short_pods(sku, shaped)
         cooling = cooling_executors()
         if cooling:
@@ -1296,7 +1309,16 @@ class LiumProvider:
                          len(shaped) - len(kept), sku, ", ".join(sorted(
                              {cpus[str(e["id"])] for e in shaped if e not in kept})))
             shaped = kept
-        return self._price_filter(sku, shaped)
+        priced = self._price_filter(sku, shaped)
+        if not priced:
+            # One line per empty poll, so an account that lists NOTHING (raw
+            # 0 — 2026-11-04: five days read as a market miss) is told apart
+            # from a listing the shape or the filters emptied. Never the key.
+            log.info("lium%s: %s listing — %d raw row(s), %d of the %d-GPU shape, %d after the "
+                     "blacklist/cooldown/steer/CPU filters, 0 under the price caps — nothing "
+                     "rentable", " (payer key)" if self.api_key else "", sku, len(execs),
+                     n_shaped, int(gpus), len(shaped))
+        return priced
 
     def _steer_hosts(self, sku: str, shaped: list[dict]) -> list[dict]:
         """Keep prior-fault hosts and API-flagged executors out of a listing.
@@ -1608,6 +1630,11 @@ class LiumProvider:
     def create_unresolved(self, pod_id: str) -> bool:
         return bool(self.__dict__.get("_unresolved_creates", {}).get(pod_id))
 
+    def create_rejected(self, pod_id: str) -> bool:
+        """The platform refused ``pod_id``'s ``lium up`` outright (see
+        :func:`lium_up_rejected`) and it never listed: nothing was allocated."""
+        return pod_id in self.__dict__.get("_rejected_creates", set())
+
     def create_requested(self, pod_id: str) -> bool:
         """A ``lium up`` for ``pod_id`` was issued by this instance. False when
         ``launch`` failed before it (the ``lium ls`` listing, the template):
@@ -1699,6 +1726,16 @@ class LiumProvider:
                             pod_id, LIUM_APPEAR_TIMEOUT, tail[-400:] or "(no up log captured)")
                 from ..funding.faults import is_auth_or_permission, is_funding_failure
 
+                if lium_up_rejected(tail):
+                    # The platform REFUSED the create itself (2026-11-04: "Node with
+                    # ID '<executor>' not found" — the executor vanished between the
+                    # listing and the rent): nothing was allocated, so the create is
+                    # resolved as never made. Left unresolved it read as a possibly
+                    # LEAKED pod and blocked the leg until the epoch ended.
+                    self.__dict__.setdefault("_unresolved_creates", {})[pod_id] = False
+                    self.__dict__.setdefault("_rejected_creates", set()).add(pod_id)
+                    log.warning("lium pod %s: `lium up` was refused by the platform (%s) — "
+                                "nothing was created", pod_id, tail[-160:])
                 if is_funding_failure(tail) or is_auth_or_permission(tail):
                     # The account refused the rent (2026-10-29: Lium 403 "renting
                     # needs a balance above 15 minutes of the node's hourly
@@ -1843,15 +1880,21 @@ class LiumProvider:
         try:
             from .lium_identity import mark_executor_bad
 
-            if self._pod(pod_id) is None:
-                return ""
-            executor = self._executor_by_name.get(pod_id) or self._executor_of_pod(pod_id)
+            executor = self.listed_executor_of(pod_id)
             if executor:
                 mark_executor_bad(executor, f"{pod_id}: {reason}")
             return executor or ""
         except Exception as e:  # noqa: BLE001
             log.warning("lium: could not mark the executor of %s bad: %s", pod_id, e)
             return ""
+
+    def listed_executor_of(self, pod_id: str) -> str:
+        """The executor ``pod_id`` sits on, only when the platform LISTS the
+        pod ("" for a ``lium up`` that deployed nothing — a ghost/cooldown,
+        never proof of a bad host). Raises on a listing error."""
+        if self._pod(pod_id) is None:
+            return ""
+        return self._executor_by_name.get(pod_id) or self._executor_of_pod(pod_id) or ""
 
     def _executor_hosts(self) -> dict[str, str]:
         """executor id → host IP for the whole marketplace (the CLI's ``ls`` JSON
@@ -1921,8 +1964,11 @@ class LiumProvider:
         # The vacated executor deploys nothing for a while: keep every listing
         # (ours and each payer's) off it until the cooldown passes.
         record_executor_cooldown(executor)
-        if rm_error and self.create_unresolved(pod_id):
-            self._settle_ghost(pod_id, rm_error)
+        if self.create_unresolved(pod_id):
+            # `lium rm` by name can exit 0 for a target that never existed, so a
+            # clean rm is no evidence either way — the listings decide
+            # (_settle_ghost still refuses on an auth / rate-limit rm error).
+            self._settle_ghost(pod_id, rm_error or "no such pod (rm exited cleanly)")
 
     def list_tagged(self, prefix: str) -> list[str]:
         """Live pod names starting with ``prefix`` (Lium addresses pods by name)."""

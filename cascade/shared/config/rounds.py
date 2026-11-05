@@ -137,8 +137,19 @@ class RoundConfig:
     # funded dispatch — a host that starts a stale image under the pinned tag
     # still echoes the injected digest env; this it cannot fake. Empty ⇒ off.
     worker_code_fingerprint: str = ""
-    # Ceiling on one funded pod's boot (launch → SSH-ready), seconds.
-    funded_ready_timeout_seconds: float = 420.0
+    # Ceiling on one funded pod's boot (launch → SSH-ready), seconds. 600:
+    # measured 2026-11-04 over 51 healthy Lium rents, launch → ready p50 177 s,
+    # p90 496 s, max 555 s — the 420 s cut killed ~1 in 10 HEALTHY pods as
+    # "lemons" (5 of the 7 rent failures since Nov 1).
+    funded_ready_timeout_seconds: float = 600.0
+    # Owner 2026-11-04: a leg whose OUR-side loss on the miner's key (lemons +
+    # infra waste, ``MinerSpend``) is below this many USD is never turned into
+    # an operator make-good leg (an approval-gated retrain on our account): it
+    # simply reruns on the miner's own key and the small loss stays a
+    # make-good owed. 0 disables (every operator-side loss routes to approval).
+    make_good_rerun_below_usd: float = 20.0
+    # See money.py: keep an unreachable pod the provider still lists alive.
+    unreachable_alive_extend_seconds: int = 7200
     # Harbor expiry (days) on the per-pod Hub robot a funded leg gets
     # (cascade.funding.robots). Revocation at teardown is the real bound;
     # this is the backstop if a revoke ever fails.
