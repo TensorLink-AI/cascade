@@ -244,7 +244,8 @@ class _BreakerGuardedProvider:
                 best = best_offer_rate(runner, skus) if skus else None
                 if best:
                     rate = min(best, rate) if rate else best
-            operator_launch_check(runner, kind=kind, projected_usd=rate * hours)
+            operator_launch_check(runner, kind=kind, projected_usd=rate * hours,
+                                  launching=str(getattr(spec, "name_prefix", "") or ""))
         try:
             ids = self._provider.launch(spec, *args, **kwargs)
         except Exception as e:
@@ -738,14 +739,20 @@ def _parse_iso(text: str) -> float | None:
         return None
 
 
-def committed_spend(runner, *, now: float | None = None) -> dict:
+def committed_spend(runner, *, now: float | None = None, launching: str = "") -> dict:
     """``{committed_usd, burn_usd_per_hour, pods: [...]}`` — every live
     operator pod (funded-ledger rows with no payer: king pods, backups,
     operator legs) at its booked rate (else the ceiling) x its remaining
     expected wall, plus each standing pod (``[round]
     operator_standing_pods_usd_per_hour``: eval pods, hand-rented lanes) at
-    its rate x the alert horizon (they run at least that long)."""
+    its rate x the alert horizon (they run at least that long).
+
+    ``launching`` (a launch's name prefix) leaves out the write-ahead row of
+    the pod ABOUT to be created: the launch check adds that pod's projection
+    itself, so counting its intent row too charged one leg twice (2026-11-05:
+    a $89 make-good refused at a $205 balance)."""
     t = time.time() if now is None else float(now)
+    own = f"{launching}-" if launching else ""
     rnd = runner.cfg.round
     spend = OperatorSpend.for_runner(runner)
     ceiling = ceiling_rate(runner)
@@ -759,6 +766,8 @@ def committed_spend(runner, *, now: float | None = None) -> dict:
         if getattr(pod, "payer_hotkey", ""):
             continue                                    # a miner's own key pays it
         pid = str(getattr(pod, "instance_id", "") or "")
+        if own and pid.startswith(own):
+            continue                                    # this launch's own intent row
         row = spend.row_for(pid) or {}
         kind = row.get("kind") or launch_kind(pid)
         rate = float(row.get("rate") or ceiling)
@@ -785,13 +794,13 @@ def _read_balance(runner) -> float | None:
 
 
 def operator_runway(runner, *, balance: float | None, now: float | None = None,
-                    extra_usd: float = 0.0) -> dict:
+                    extra_usd: float = 0.0, launching: str = "") -> dict:
     """The runway verdict. ``held`` = balance - committed (- ``extra_usd``,
     a launch about to happen) < the reserve: no new operator rent of any
     kind. ``runway_hours`` = (balance - committed - reserve) / burn rate
     (inf with nothing burning). An unknown balance is never ``held`` here
     (the miner-leg preflight already fails closed on it)."""
-    c = committed_spend(runner, now=now)
+    c = committed_spend(runner, now=now, launching=launching)
     reserve = float(getattr(runner.cfg.round, "operator_balance_reserve_usd", 0.0) or 0.0)
     out = {**c, "balance_usd": balance, "reserve_usd": reserve, "held": False,
            "runway_hours": None}
@@ -805,7 +814,8 @@ def operator_runway(runner, *, balance: float | None, now: float | None = None,
     return out
 
 
-def operator_launch_check(runner, *, kind: str, projected_usd: float) -> None:
+def operator_launch_check(runner, *, kind: str, projected_usd: float,
+                          launching: str = "") -> None:
     """Right before EVERY operator launch (the king's included): the runway
     guard (balance - committed - this launch < reserve ⇒ refused) and the
     daily cap (over its scope). A refusal raises
@@ -814,7 +824,8 @@ def operator_launch_check(runner, *, kind: str, projected_usd: float) -> None:
     from ..provision.core import OperatorRentsHeld
 
     try:
-        _operator_launch_check(runner, kind=kind, projected_usd=projected_usd)
+        _operator_launch_check(runner, kind=kind, projected_usd=projected_usd,
+                               launching=launching)
     except OperatorRentsHeld:
         raise
     except Exception as e:  # noqa: BLE001 — a bookkeeping fault never blocks a launch
@@ -822,7 +833,8 @@ def operator_launch_check(runner, *, kind: str, projected_usd: float) -> None:
                     "other gates decide", kind, e)
 
 
-def _operator_launch_check(runner, *, kind: str, projected_usd: float) -> None:
+def _operator_launch_check(runner, *, kind: str, projected_usd: float,
+                           launching: str = "") -> None:
     from ..provision.core import OperatorRentsHeld
 
     rnd = runner.cfg.round
@@ -849,9 +861,11 @@ def _operator_launch_check(runner, *, kind: str, projected_usd: float) -> None:
                     "miner-leg preflight fails closed on it)", kind)
         return
     king = kind in (KING_KIND, KING_BACKUP_KIND)
-    rw = operator_runway(runner, balance=bal, extra_usd=0.0 if king else projected_usd)
+    rw = operator_runway(runner, balance=bal, extra_usd=0.0 if king else projected_usd,
+                         launching="" if king else launching)
     if king and not rw["held"]:
-        short = operator_runway(runner, balance=bal, extra_usd=projected_usd)
+        short = operator_runway(runner, balance=bal, extra_usd=projected_usd,
+                                launching=launching)
         if short["held"]:
             # review M1: a king whose own era projection does not fit is
             # ALERTED, never held — only balance - committed < reserve holds it
