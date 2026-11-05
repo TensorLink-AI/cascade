@@ -160,9 +160,10 @@ def test_loader_parses_both_knobs(tmp_path):
     assert c.scoring.forfeit_successor_hotkey == S
     assert c.round.blocked_hotkeys == (K, X) and c.round.blocked_from_block == 9_190_800
     # the shipped chain.toml ARMS the forfeiture (owner 2026-09-28): one listed hotkey, a
-    # successor outside the list, block decided on chain
+    # successor outside the list; the block the on-chain vote decided (9166500)
+    # is typed since DEC-CA-0067 (frees its note segment, behaviour-identical)
     base = load_chain_config(root / "chain.toml")
-    assert len(base.scoring.forfeit_hotkeys) == 1 and base.scoring.forfeit_from_block == 0
+    assert len(base.scoring.forfeit_hotkeys) == 1 and base.scoring.forfeit_from_block == 9166500
     assert base.scoring.forfeit_successor_hotkey not in ("", *base.scoring.forfeit_hotkeys)
     assert base.round.blocked_hotkeys == () and base.round.blocked_from_block == 0
     assert base.round.blocked_hotkeys == () and base.round.blocked_from_block == 0

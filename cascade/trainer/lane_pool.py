@@ -203,6 +203,43 @@ class _FinalLanePool(queue.Queue):
         shrinks as dead (or, with ``sync_from_file``, removed) lanes leave."""
         return list(self._known.values())
 
+    def _get_where(self, match, timeout: float):
+        """An idle lane ``match(host)`` accepts, removed from the queue; every
+        other idle lane STAYS IDLE for other legs (never held while waiting).
+        ``match`` may probe the lane (ssh), so it runs OUTSIDE the queue lock
+        on a snapshot; the chosen lane is then taken only if still idle.
+        ``timeout`` 0 = no wait. Raises ``queue.Empty``."""
+        end = time.time() + max(0.0, float(timeout))
+        rejected: set[int] = set()
+        while True:
+            with self.mutex:
+                snapshot = [h for h in self.queue if id(h) not in rejected]
+            for h in snapshot:
+                try:
+                    ok = match(h) is True
+                except Exception:  # noqa: BLE001 — an unprovable lane never matches
+                    ok = False
+                if not ok:
+                    rejected.add(id(h))
+                    continue
+                with self.mutex:
+                    for i, cur in enumerate(self.queue):
+                        if cur is h:
+                            del self.queue[i]
+                            self.not_full.notify()
+                            return h
+                # taken by another leg meanwhile: rescan
+            remaining = end - time.time()
+            if remaining <= 0:
+                raise queue.Empty
+            with self.not_empty:
+                # woken by any put (notify_all below); re-check the new lanes
+                if all(id(h) in rejected for h in self.queue):
+                    self.not_empty.wait(min(remaining, 5.0))
+            with self.mutex:
+                live = {id(h) for h in self.queue}
+            rejected &= live      # a lane handed back is re-judged (re-bootstrap)
+
     def put(self, item, block: bool = True, timeout: float | None = None) -> None:
         """Hand a lane back (a leg finished with it). A file change recorded
         while it was busy applies now: the lane leaves the rotation — removed
@@ -214,6 +251,7 @@ class _FinalLanePool(queue.Queue):
             # gate's ssh probe. A change recorded right after this check is
             # applied to the then-idle lane by the next refresh.
             super().put(item, block, timeout)
+            self._wake_all()
             return
         with self._absorb_lock:
             why = self._pending.pop(name, None)
@@ -223,6 +261,13 @@ class _FinalLanePool(queue.Queue):
                          name, why)
                 return
         super().put(item, block, timeout)
+        self._wake_all()
+
+    def _wake_all(self) -> None:
+        """Every waiter re-checks: a leg filtering by image must see a lane
+        that another leg's waiter was notified for."""
+        with self.not_empty:
+            self.not_empty.notify_all()
 
     def _sync_known(self, fresh: list) -> None:
         """Apply the file to KNOWN lanes (caller holds ``_absorb_lock``): a lane
@@ -329,13 +374,20 @@ class _FinalLanePool(queue.Queue):
         return latest
 
     def get(self, block: bool = True, timeout: float | None = None, *,
-            deadline=None):
+            deadline=None, match=None):
         """``deadline`` (wall-clock, blocking form only): the latest moment a
         lane may still be handed out — past it the wait ends with
         ``_LaneDeadlinePassed`` and a lane that frees later stays in the pool
         for a leg that CAN still fit. None = wait forever. A callable ``host -> deadline`` gives every lane its own (per-SKU)
         latest safe start: a lane freed past ITS deadline goes back for a
-        leg that fits it; the wait itself lasts until the latest of them."""
+        leg that fits it; the wait itself lasts until the latest of them.
+
+        ``match`` (``host -> bool``, DEC-CA-0067): only a lane it accepts is
+        handed out (a leg's era image); other lanes stay idle for other legs
+        while this one waits. No KNOWN lane matching ⇒ ``_NoOperatorLanes``
+        (nothing that could ever serve this leg)."""
+        if match is not None:
+            return self._get_matching(deadline, match, block=block, timeout=timeout)
         if not block or timeout is not None:
             return super().get(block=block, timeout=timeout)
         while True:
@@ -381,6 +433,53 @@ class _FinalLanePool(queue.Queue):
                     time.sleep(min(1.0, max(0.0, (latest or 0) - time.time())) or 0.05)
                 continue                         # next pass raises
             return host
+
+
+    def _no_matching_lane(self, match) -> None:
+        self._raise_if_no_lanes()
+        known = self.known_hosts()
+
+        def state(h):
+            # True / False / None (unknown — e.g. unreachable right now: the
+            # leg waits and retries, it is never told "no lane")
+            try:
+                return match(h)
+            except Exception:  # noqa: BLE001
+                return None
+        if known and all(state(h) is False for h in known):
+            raise _NoOperatorLanes("no operator lane on this leg's era image (DEC-CA-0067) "
+                                   "— none of " + ", ".join(
+                                       sorted(getattr(h, "name", "?") for h in known)))
+
+    def _get_matching(self, deadline, match, *, block=True, timeout=None):
+        """:meth:`get` restricted to lanes ``match`` accepts (same deadline
+        semantics, never holding a non-matching lane)."""
+        if not block:
+            return self._get_where(match, 0.0)
+        if timeout is not None:
+            return self._get_where(match, timeout)
+        while True:
+            latest = self._latest_deadline(deadline)
+            self._absorb_new()
+            self._no_matching_lane(match)
+            if latest is not None and latest - time.time() <= 0:
+                try:
+                    return self._get_where(match, 0.0)
+                except queue.Empty:
+                    raise _LaneDeadlinePassed(
+                        f"no operator lane on this leg's image free at its latest safe "
+                        f"start ({time.strftime('%H:%M:%SZ', time.gmtime(latest))})") from None
+            wait = self.REFRESH_INTERVAL_S
+            if latest is not None:
+                wait = max(0.0, min(wait, latest - time.time()))
+
+            def fits(h):
+                own = self._deadline_of(deadline, h)
+                return (own is None or time.time() < own) and match(h) is True
+            try:
+                return self._get_where(fits, wait)
+            except queue.Empty:
+                continue
 
 
 def _lium_provider(rnd, *, price_caps: dict | None = None, **kw):

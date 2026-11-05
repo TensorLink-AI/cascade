@@ -623,6 +623,40 @@ reign_warm_start_blocks = 0
 prelaunch_burn = 0.0
 carryover_king_share = 0.0
 king_ladder = false
+# DEC-CA-0067 (CONSENSUS, release-then-activate): the image-decoupled
+# training contract. From the first ERA START after the stake-majority lock-in
+# of the "v2b-<hash>" feature ([activation] threshold; every validator on this
+# release signals it at startup), a v2 settlement's legs are gated on
+# numerics_contract_digest (the contract minus train_image_digest) instead of
+# the full contract digest, so a worker-image repin keeps the carried king and
+# the finished legs. 0 = decided on chain; a typed era-start block is the
+# owner override. Repin the image only AFTER the switch era has started.
+image_decoupled_from_block = 0
+# Bundled with the same block (part of the vote's hash): the v2 private
+# verdict budget becomes this many windows. Inert until the switch. Testnet
+# keeps its small budget (DEC-CA-0066: = [eval] n_windows) but carries a
+# non-zero value so the vote's feature hash and the explicit verdict draw are
+# rehearsed exactly as on mainnet.
+eval_n_windows_after = 300
+# Fork guard: the v2b feature name eval_n_windows_after = 300 hashes to.
+image_decoupled_feature = "v2b-c74823cc"
+# TRAINER-ONLY provenance (not consensus, not in the vote): earlier
+# v2.training train_image_digest pins, exactly as once typed, so the trainer
+# can PROVE a pre-repin leg differs only in its image. Append the old pin here
+# when re-pinning.
+prior_train_image_digests = []
+# DEC-CA-0067 AUTOMATIC image repin at the switch (TRAINER-ONLY; one release,
+# all-or-none, load-checked): legs of eras from the resolved switch run these
+# pins (pod image, v2.training image, worker code fingerprint, and the image the
+# SKU walls were measured on — required while [round]
+# funded_sku_wall_measured_image is set); earlier eras keep the current pins.
+# The pre-switch pin joins the numerics proof automatically. Empty = off.
+train_image_digest_after = ""
+funded_pod_image_after = ""
+worker_code_fingerprint_after = ""
+funded_sku_wall_measured_image_after = ""
+# Enforced qualification rule for the *_after pins (see chain.toml).
+image_after_unqualified_override = false
 # The escalating key slash's minimum for a first lapse (eras; mainnet value).
 # Read only under king_ladder, so inert here.
 key_slash_min_eras = 6

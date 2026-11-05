@@ -97,7 +97,9 @@ class _OperatorPodMixin:
             from .remote import RemoteHost
 
             sync_host_blocklist(self)
-            rnd = self.cfg.round
+            from .leg_pins import leg_round
+
+            rnd = leg_round(self)        # DEC-CA-0067: the king leg's era pins
             profile = self._funded_pod_profile()
             key_path = Path(profile.key_path or "").expanduser()
             ssh_pubkey = (key_path.parent / (key_path.name + ".pub")
@@ -535,7 +537,9 @@ class _OperatorPodMixin:
         from .runner_funded_pods import allocation_lock
 
         sync_host_blocklist(self)
-        rnd = self.cfg.round
+        from .leg_pins import leg_round
+
+        rnd = leg_round(self)            # DEC-CA-0067: the leg's era pins
         profile = self._funded_pod_profile()
         key_path = Path(profile.key_path or "").expanduser()
         ssh_pubkey = (key_path.parent / (key_path.name + ".pub")
@@ -854,14 +858,16 @@ class _OperatorPodMixin:
         is harvested by the rolling dispatcher (credential-free pod)."""
         from ..funding.store import parse_vault_ref
         from ..provision.state import PodInstance
+        from .leg_pins import LegImageMismatch, leg_contract_scope
         from .money_guard import operator_leg_allocated, would_rent_refusal
         from .runner_funded_legs import _record_generation_failure
 
         # Money safety II: the money gates as a side-effect-free "would it
         # rent?" verdict BEFORE the corpus — no CPU VM is paid for a leg
         # that cannot rent (nothing rented, requeued unburned).
-        why, cls = (("", "") if operator_leg_allocated(self, str(seeds.base_seed), gen.hotkey)
-                    else would_rent_refusal(self, gen, operator=True))
+        with leg_contract_scope(self, contract):      # DEC-CA-0067: the leg's era pins
+            why, cls = (("", "") if operator_leg_allocated(self, str(seeds.base_seed), gen.hotkey)
+                        else would_rent_refusal(self, gen, operator=True))
         if why:
             log.warning("operator leg %s: %s — no corpus generated", gen.hotkey[:12], why)
             self._record_funded_failure(gen.hotkey, why, miner_fault=False, error_class=cls,
@@ -873,8 +879,9 @@ class _OperatorPodMixin:
             _record_generation_failure(self, gen, e)
             raise
         try:
-            host, pod_id = self._rent_operator_leg_host(str(seeds.base_seed), gen)
-        except _FundedLegSkip:
+            with leg_contract_scope(self, contract):  # DEC-CA-0067: the leg's era image
+                host, pod_id = self._rent_operator_leg_host(str(seeds.base_seed), gen)
+        except (_FundedLegSkip, LegImageMismatch):
             from .money_guard import release_reservation
 
             release_reservation(self)            # no rent: free the daily-cap headroom

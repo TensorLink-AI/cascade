@@ -117,9 +117,31 @@ def provider_names(raw: dict, policy: ProvisionPolicy) -> list[str]:
 
 
 
+def _after_release_gate(cfg) -> dict:
+    """The health gate's alternate (DEC-CA-0067 after) release, or ``{}``
+    while none is configured or it is not qualified (then a lane on it fails
+    the gate like any other wrong image)."""
+    v2 = cfg.v2
+    if not v2.train_image_digest_after:
+        return {}
+    from ..shared.image_qualification import qualification_status
+
+    st = qualification_status(cfg)
+    if not st.usable:
+        log.error("DEC-CA-0067: lanes on the after image %s are NOT admitted — %s",
+                  v2.train_image_digest_after[:19], st.reason)
+        return {}
+    if st.override and not st.qualified:
+        log.error("DEC-CA-0067: admitting after-image lanes UNQUALIFIED under [v2] "
+                  "image_after_unqualified_override — %s", st.reason)
+    return {"alt_image_digest": v2.train_image_digest_after,
+            "alt_code_fingerprint": v2.worker_code_fingerprint_after}
+
+
 def make_health_check(policy: ProvisionPolicy, render: RenderSettings, *,
                       image_digest: str, min_disk_gb: float,
-                      hippius_probe, code_fingerprint: str = "") -> callable:
+                      hippius_probe, code_fingerprint: str = "",
+                      alt_image_digest: str = "", alt_code_fingerprint: str = "") -> callable:
     """Bind the pure :class:`HealthGate` to a real ``ssh`` transport per pod.
 
     Gates are built lazily per ``(stage, provider)``: the pod's user/workdir/
@@ -146,6 +168,9 @@ def make_health_check(policy: ProvisionPolicy, render: RenderSettings, *,
                 remote_python=prof.remote_python, workdir=prof.workdir,
                 image_digest=image_digest, min_disk_gb=min_disk_gb,
                 code_fingerprint=code_fingerprint,
+                **({"alt_image_digest": alt_image_digest,
+                    "alt_code_fingerprint": alt_code_fingerprint}
+                   if alt_code_fingerprint else {}),
                 hippius_probe=hippius_probe,
                 home_dir=("/root" if prof.user == "root" else f"/home/{prof.user}"),
             )
@@ -638,6 +663,10 @@ def _run(args) -> int:
             min_disk_gb=float(top.get("min_disk_gb", 20.0)),
             hippius_probe=hippius_probe,
             code_fingerprint=cfg.round.worker_code_fingerprint,
+            # DEC-CA-0067: a lane on the after release also passes — only
+            # once that release is QUALIFIED (owner rule; see
+            # cascade.shared.image_qualification)
+            **_after_release_gate(cfg),
         ),
         bootstrap=bootstrap,
         prewarm=make_config_push(render, box_chain_toml=str(args.chain_toml),

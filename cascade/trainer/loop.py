@@ -333,6 +333,9 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
     activation_store: object | None = None
     _activation: object | None = field(default=None, repr=False)
     _forfeit: object | None = field(default=None, repr=False)
+    # DEC-CA-0067 image-decoupled contract, resolved READ-ONLY like the
+    # forfeiture (``activation_image_decoupled_state.json``).
+    _image_decoupled: object | None = field(default=None, repr=False)
     # DEC-CA-0057 owner-signed network config, resolved READ-ONLY (the trainer
     # never signals): the resolver (None = inert) and, while an overlay is in
     # force, the base config ``self.cfg`` is a view of (activation lock-ins
@@ -668,8 +671,21 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
             if rec.locked and rec.source != "config":
                 self.apply_activation_block(rec.activation_block)
             self._forfeit_tick(client, block)
+            self._image_decoupled_tick(client, block)
         except Exception as e:  # noqa: BLE001 — activation must never sink a tick
             log.warning("activation step failed (%s); retrying next poll", e)
+
+    def _image_qualification_tick(self) -> None:
+        """DEC-CA-0067 owner rule: a loud ERROR every tick while the ``[v2]
+        *_after`` release is unqualified (refused) or used under the emergency
+        override. The operator watchdog raises the matching alert. Never
+        raises."""
+        try:
+            from .leg_pins import log_image_qualification
+
+            log_image_qualification(self.cfg)
+        except Exception as e:  # noqa: BLE001 — a signal, never a tick failure
+            log.warning("image qualification check failed (%s)", e)
 
     def _forfeit_tick(self, client, block: int) -> None:
         """DEC-CA-0048 forfeiture decided on chain: the trainer resolves the
@@ -718,6 +734,59 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
                 log.warning("activation: DEC-CA-0048 forfeiture ARMED at block %d — the era whose "
                             "first settlement reaches it trains the successor's king leg",
                             new_cfg.scoring.forfeit_from_block)
+
+    def _image_decoupled_tick(self, client, block: int) -> None:
+        """DEC-CA-0067 decided on chain: the trainer resolves the SAME tally the
+        validators do (same resolver, same as-of-boundary reads, same notes
+        for a late start — it never signals) and applies the resolved era
+        start to ``[v2] image_decoupled_from_block``. Deterministic: the
+        manifest fields and the numerics stale rule key off exactly the block
+        every validator applies, so the trainer never stamps them early (the
+        block is 0 until this resolves) and a lock-in always lands at least
+        one settlement before its era starts (``align="era"``)."""
+        from ..shared.activation import (
+            ActivationRecord,
+            ActivationStore,
+            apply_image_decoupled_activation,
+            image_decoupled_feature,
+            record_for,
+            resolve_activation,
+        )
+
+        spec = image_decoupled_feature(self._base_cfg())
+        if spec is None or not spec.decided_on_chain:
+            return
+        store = None
+        base = getattr(self.activation_store, "path", None)
+        if base is not None:
+            store = ActivationStore(Path(base).with_name("activation_image_decoupled_state.json"))
+        rec = self._image_decoupled
+        if rec is None:
+            rec = record_for(self._base_cfg(),
+                             store.load() if store is not None else ActivationRecord(), spec)
+            self._image_decoupled = rec
+            if rec.locked and rec.source != "config":
+                log.info("activation: restored image-decoupled lock-in (block %d, rule from "
+                         "%d, via %s)", rec.lock_block, rec.activation_block, rec.source)
+        res = resolve_activation(self._base_cfg(), client, now_block=int(block), record=rec,
+                                 feature=spec)
+        if res.changed:
+            self._image_decoupled = res.record
+            if store is not None:
+                store.save(res.record)
+        rec = self._image_decoupled
+        if rec.locked and rec.source != "config":
+            base = self._base_cfg()
+            new_cfg = apply_image_decoupled_activation(base, rec.activation_block)
+            if new_cfg is not base:
+                self._set_base_cfg(new_cfg)
+                if self._cfg_base is None:
+                    # no overlay view: the scheduler holds its own reference
+                    self._point_cfg_consumers(new_cfg)
+                log.warning("activation: DEC-CA-0067 image-decoupled contract ARMED at block "
+                            "%d — settlements of eras from it stamp numerics_contract_digest "
+                            "and keep image-only-stale legs",
+                            new_cfg.v2.image_decoupled_from_block)
 
     def _harvest_leg(self, host, receipt, *, base_seed: int, repo_suffix: str = ""):
         """Dispatcher hook for ISOLATED hosts that were not dispatched
@@ -1562,10 +1631,82 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
                 log.warning("lane breaker bookkeeping failed (ignored): %s", be)
                 return False
 
+        # DEC-CA-0067 automatic repin: with the dispatcher's per-leg image hook
+        # armed, take a lane that runs THIS leg's era image (the hook would
+        # refuse any other) — never take one and fail on it.
+        from .leg_pins import LegImageMismatch
+
+        _hook = getattr(disp, "host_hook", None)
+        _state = getattr(_hook, "match_state", None)
+        _filters = getattr(_hook, "filters", None)
+        _block = kw.get("contract_block")
+        _plain_take = _take
+
+        _require = getattr(_hook, "require_qualified", None)
+
+        def _take_matching():
+            # matching is a no-op (today's lane handout) unless this leg's era
+            # is under the resolved switch with the after pins armed
+            if _state is None or _block is None or (callable(_filters) and not _filters(_block)):
+                return _plain_take()
+            if _require is not None:
+                _require(_block)        # an unqualified after release: no lane is taken
+            known = getattr(free_lanes, "known_hosts", None)
+            pool = list(known()) if callable(known) else list(hosts)
+            if pool and all(_state(h, _block) is False for h in pool):
+                raise LegImageMismatch(
+                    f"{describe}: no lane runs this leg's era image (contract block "
+                    f"{_block}); bring a lane up on that image")
+
+            def _is_era_lane(h):
+                return _state(h, _block)
+
+            if isinstance(free_lanes, _FinalLanePool):
+                # filtered take: lanes of the other era stay idle for their
+                # legs while this one waits (deadline semantics unchanged)
+                return free_lanes.get(deadline=deadline, match=_is_era_lane)
+            # a plain queue: never hold a lane while waiting — hand each
+            # non-matching one straight back and retry briefly
+            for _ in range(4 * max(1, len(pool))):
+                lane = _plain_take()
+                if _is_era_lane(lane) is True:
+                    return lane
+                free_lanes.put(lane)
+                time.sleep(0.05)
+            raise LegImageMismatch(f"{describe}: no free lane on this leg's era image")
+
+        _take = _take_matching
         host = _take()
         try:
             entry = disp.dispatch(_ready(host), lane_count=pod_lane_count(host, hosts), **kw)
+        except LegImageMismatch:
+            # the leg's image, not the lane's health: back in the rotation,
+            # never counted by the lane breaker
+            free_lanes.put(host)
+            raise
         except Exception as e:  # noqa: BLE001 — any dispatch failure is retryable once
+            from .leg_pins import WRONG_IMAGE_BAD_SECONDS, worker_refused_image
+
+            if (worker_refused_image(e) and _block is not None and callable(_filters)
+                    and _filters(_block)):
+                # A POST-SWITCH leg's worker refused FINAL (exit 2 + its stdout
+                # sentinel; nothing of the miner's ran). Pre-switch legs keep
+                # the release's exact handling below. The lane is held out
+                # only on OUR measured evidence (its code is another release);
+                # otherwise it is our config skew — back in the rotation.
+                evidence = False
+                try:
+                    evidence = _hook._observe(host, fresh=True)[0] != _hook._want(_block)[0]
+                except Exception:  # noqa: BLE001 — unverified: no blame
+                    evidence = False
+                if evidence and hasattr(free_lanes, "mark_dead"):
+                    free_lanes.mark_dead(host, f"wrong worker release: {error_tail(e, 160)}",
+                                         lane_only=True, hold_s=WRONG_IMAGE_BAD_SECONDS)
+                else:
+                    free_lanes.put(host)
+                raise LegImageMismatch(
+                    f"{describe}: lane {getattr(host, 'name', host)} refused FINAL for this "
+                    f"leg's image ({error_tail(e, 200)})", code_evidence=evidence) from e
             transport = _transport_failure(e)
             if transport and hasattr(free_lanes, "mark_dead"):
                 # ssh refused / worker unreachable: the POD is gone, not the
@@ -1847,6 +1988,7 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
                 # BEFORE the grid is derived: a lock-in arms rolling intake at
                 # the very boundary it names.
                 self._activation_tick(client, block)
+                self._image_qualification_tick()
                 from ..shared.calendar_launch import resolve_calendar_launch
 
                 base = self._base_cfg()

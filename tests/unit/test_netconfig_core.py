@@ -387,7 +387,8 @@ def test_resolved_activation_blocks_survive_an_overlay():
     raw = copy.deepcopy(SHIPPED_RAW)
     raw["netconfig"] = {"owner_hotkey": OWNER.ss58_address}
     raw["scoring"].update(forfeit_hotkeys=[], win_margin_start_v2=0.0, win_margin_end_v2=0.0,
-                          margin_warmup_blocks_v2=0)
+                          margin_warmup_blocks_v2=0, forfeit_from_block=0,
+                          margin_v2_from_block=0)
     raw["v2"]["prelaunch_burn"] = 0.0
     shipped = parse_chain_config(raw)
     armed = A.apply_activation(shipped, R)              # the fleet's DEC-CA-0045 decision

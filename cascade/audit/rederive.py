@@ -78,6 +78,23 @@ def contract_for_replay(receipt: RoundReceipt, cfg: ChainConfig) -> TrainingCont
 TIER2_SCORE_RTOL = 0.05
 
 
+
+def entry_replay_contract(contract: TrainingContractConfig, entry,
+                          manifest) -> TrainingContractConfig:
+    """DEC-CA-0067: the contract ONE leg trained under. On a settlement past
+    the image-decoupled switch (it carries ``numerics_contract_digest``) every
+    entry publishes its own runtime terms — a carried leg may have run the
+    pre-repin image or another continuation protocol — so the replay uses
+    THEM (the continuation protocol also decides the shard stream's
+    accounting, hence the recorded corpus digest). Earlier settlements: the
+    era contract, unchanged."""
+    if not getattr(manifest, "numerics_contract_digest", ""):
+        return contract
+    from dataclasses import replace as _replace
+
+    return _replace(contract, train_image_digest=str(entry.train_image_digest or ""),
+                    continuation_protocol=str(entry.continuation_protocol or ""))
+
 def _fetch_generator(gen_ref: str, dest: Path, cfg: ChainConfig) -> Path:
     """Fetch a pinned generator, preferring anonymous access.
 
@@ -113,6 +130,7 @@ def _rederive_digest(
     budget_denomination: str = "points",
     corpus_epochs: int = 0,
     corpus_dir: Path | None = None,
+    continuation_protocol: str = "",
 ) -> str:
     """Re-derive one corpus digest exactly as the trainer derived it — under
     the round's OWN budget denomination (DEC-CA-0042): it decides where the
@@ -153,6 +171,7 @@ def _rederive_digest(
         budget_denomination=budget_denomination,
         corpus_epochs=corpus_epochs,
         corpus_dir=corpus_dir,
+        **({"continuation_protocol": continuation_protocol} if continuation_protocol else {}),
     ) as rs:
         for _ in rs.series():
             pass
@@ -196,6 +215,8 @@ def run_tier1(
             results.append(CheckResult(
                 name, FAIL, f"entry size {entry.size!r} is not a configured size"))
             continue
+        contract = entry_replay_contract(contract, entry, manifest)
+        proto = str(getattr(contract, "continuation_protocol", "") or "")
         mode = contract.corpus_mode
         if mode == "stream_gpu":
             results.append(CheckResult(
@@ -210,7 +231,7 @@ def run_tier1(
             continue
         epochs = int(getattr(contract, "corpus_epochs", 0) or 0)
         if mode == "shards":
-            cdir = (corpus_root / entry.hotkey) if corpus_root is not None else None
+            cdir = (corpus_root / entry.miner_hotkey) if corpus_root is not None else None
             if cdir is None or not (cdir / "corpus.json").is_file():
                 results.append(CheckResult(
                     name, WARN, "shards corpus not available locally (only crowned "
@@ -222,7 +243,7 @@ def run_tier1(
                     cfg.for_king(entry.gen_ref) if entry.role == "king" else cfg, mode=mode,
                     token_budget=contract.train_tokens,
                     budget_denomination=getattr(contract, "budget_denomination", "points"),
-                    corpus_epochs=epochs, corpus_dir=cdir)
+                    corpus_epochs=epochs, corpus_dir=cdir, continuation_protocol=proto)
             except Exception as e:  # noqa: BLE001 — a bad shard set fails the audit
                 results.append(CheckResult(
                     name, FAIL, f"shards corpus fails verification ({type(e).__name__}: {e})"))
@@ -234,7 +255,7 @@ def run_tier1(
             continue
         cache_key = (entry.gen_ref, mode,
                      contract.train_tokens if (mode != "cache_reuse" or epochs) else 0,
-                     entry.role == "king")
+                     entry.role == "king", proto)
         try:
             if cache_key in digest_cache:
                 digest = digest_cache[cache_key]
@@ -249,7 +270,7 @@ def run_tier1(
                     max_wall_seconds=contract.max_train_seconds,
                     seed_mix=int(getattr(contract, "gen_seed_mix", 1) or 1),
                     budget_denomination=getattr(contract, "budget_denomination", "points"),
-                    corpus_epochs=epochs,
+                    corpus_epochs=epochs, continuation_protocol=proto,
                 )
                 digest_cache[cache_key] = digest
         except Exception as e:  # noqa: BLE001 — fetch/build failure is a WARN, not proof
@@ -354,6 +375,12 @@ def run_tier2(
         if contract is None:
             results.append(CheckResult(name, FAIL, f"unknown size {entry.size!r}"))
             continue
+        # DEC-CA-0067: the leg's OWN image/protocol (a carried leg may predate
+        # the repin): byte-exact only on the image it actually ran
+        contract = entry_replay_contract(contract, entry, manifest)
+        entry_img = _image_sha256(contract.train_image_digest)
+        entry_image_matched = (image_matched if entry_img == pinned_img
+                               else entry_img is not None and runtime_img == entry_img)
         try:
             gen_dir = workdir / "generators" / hashlib.sha256(
                 entry.gen_ref.encode()).hexdigest()[:16]
@@ -396,7 +423,7 @@ def run_tier2(
                                                    f"({type(e).__name__}: {e})"))
             continue
 
-        exact_ok = image_matched and entry.gpu_name and entry.gpu_name == local_gpu
+        exact_ok = entry_image_matched and entry.gpu_name and entry.gpu_name == local_gpu
         if exact_ok:
             ours, theirs = _dir_file_digests(out_dir), _dir_file_digests(published_dir)
             # the power-EMA comparison files are never published — compare
@@ -446,17 +473,34 @@ def _tier2_score_compare(
             # The ladder draw is keyed on the CONFIG budget (per-rung size =
             # n_windows // len(horizons)); the receipt's total reflects rung
             # equalisation and would re-key the per-rung draws.
+            # DEC-CA-0067: from the switch the validator keys the ladder on
+            # the settlement's v2 budget (``eval_windows_at``); before it on
+            # ``[eval] n_windows`` exactly as this replay always did.
+            from ..shared.era import image_decoupled_at
+
+            budget = (cfg.eval_windows_at(receipt.epoch_start_block)
+                      if image_decoupled_at(cfg, receipt.epoch_start_block)
+                      else cfg.eval.n_windows)
             windows = ladder_windows_for_round(
-                source, horizons=horizons, n_windows=cfg.eval.n_windows,
+                source, horizons=horizons, n_windows=budget,
                 context_length=cfg.eval.context_length,
                 round_seed=receipt.base_seed, block=receipt.epoch_start_block,
             )
         else:
+            from ..shared.era import image_decoupled_at, v2_eval_windows_at, v2_settlement_active
+
             n = (receipt.eval_context.n_windows if receipt.eval_context
                  else cfg.eval.n_windows)
-            windows = source.windows_for_round(
-                receipt.base_seed, n, block=receipt.epoch_start_block
-            )
+            draw = source.windows_for_round
+            b = receipt.epoch_start_block
+            if (image_decoupled_at(cfg, b) and v2_eval_windows_at(cfg, b)
+                    and v2_settlement_active(cfg, b)):
+                # DEC-CA-0067: the validator's explicit-evidence verdict draw
+                # (cascade.validator.expert_lane.verdict_windows), keyed on the
+                # SAME budget — the recorded count may be pool-capped
+                n = cfg.eval_windows_at(b)
+                draw = getattr(source, "windows_for_verdict", draw)
+            windows = draw(receipt.base_seed, n, block=b)
         # Both checkpoints go through the ingest guard under the round's own
         # contract: the PUBLISHED one may have come off a miner-funded pod.
         contract = contract_for_replay(receipt, cfg)

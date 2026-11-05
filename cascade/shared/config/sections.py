@@ -447,6 +447,10 @@ class ActivationConfig:
     # wrote into ``[v2] prelaunch_burn_from_block`` (DEC-CA-0055 decided on
     # chain), so a resolved block is distinguishable from a typed-in one.
     resolved_prelaunch_burn_block: int = 0
+    # RUNTIME ONLY: the DEC-CA-0067 block ``apply_image_decoupled_activation``
+    # wrote into ``[v2] image_decoupled_from_block`` (decided on chain), so a
+    # resolved block is distinguishable from a typed-in one.
+    resolved_image_decoupled_block: int = 0
 
     @property
     def enabled(self) -> bool:

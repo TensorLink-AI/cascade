@@ -32,6 +32,17 @@ _LIVE_CREDENTIAL_ENV = (
 
 
 @pytest.fixture(autouse=True)
+def _vote_pin_mode_is_per_test():
+    """DEC-CA-0067: a test that runs a validator/trainer/audit ``main`` turns
+    the process-wide vote-pin guard on; never leak it into the next test."""
+    from cascade.shared.config.loader import require_vote_pin, vote_pin_required
+
+    before = vote_pin_required()
+    yield
+    require_vote_pin(before)
+
+
+@pytest.fixture(autouse=True)
 def _no_live_credentials(monkeypatch):
     """Scrub storage/API credentials so no test can touch live services."""
     for name in _LIVE_CREDENTIAL_ENV:
@@ -114,6 +125,8 @@ def cfg() -> ChainConfig:
     raw["v2"]["commit_open_at_utc"] = ""
     raw["v2"]["commit_from_block"] = 0
     raw["netconfig"]["owner_hotkey"] = ""
+    raw["scoring"]["forfeit_from_block"] = 0        # DEC-CA-0067 typed blocks: see scoring=
+    raw["scoring"]["margin_v2_from_block"] = 0
     return replace(c, training=replace(c.training, expected_gpu="",
                                        train_image_digest=""),
                    raw=raw,
@@ -141,7 +154,11 @@ def cfg() -> ChainConfig:
                    # a scheduled fresh-king margin change ships armed: pin the
                    # steady value so fixtures judge every block the same way
                    scoring=replace(c.scoring, win_margin_start_prev=0.0,
-                                   margin_activation_block=0),
+                                   margin_activation_block=0,
+                                   # DEC-CA-0067 typed the already-decided
+                                   # forfeit / margin-v2 blocks (real-chain
+                                   # state): fixtures keep them undecided
+                                   forfeit_from_block=0, margin_v2_from_block=0),
                    manifest=replace(c.manifest, validator_hotkey=""))
 
 

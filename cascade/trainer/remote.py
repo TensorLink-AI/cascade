@@ -80,6 +80,19 @@ def error_tail(text: object, limit: int = 300) -> str:
     return head + " … " + "\n".join(reversed(tail))
 
 
+def worker_image_refusal(returncode, stdout: str) -> bool:
+    """DEC-CA-0067: the worker's own structured FINAL image refusal — exit 2
+    AND :data:`cascade.trainer.contract.IMAGE_REFUSAL_SENTINEL` as the LAST
+    non-empty stdout line. Never inferred from free text (miner output,
+    stderr tails). Workers that predate the sentinel never match."""
+    from .contract import IMAGE_REFUSAL_SENTINEL
+
+    if returncode != 2:
+        return False
+    lines = [ln.strip() for ln in str(stdout or "").splitlines() if ln.strip()]
+    return bool(lines) and lines[-1] == IMAGE_REFUSAL_SENTINEL
+
+
 class HarvestStreamError(RuntimeError):
     """The checkpoint harvest stream broke (truncated / malformed archive)
     and did not recover within :data:`HARVEST_STREAM_ATTEMPTS` attempts.
@@ -104,6 +117,9 @@ class RemoteDispatchError(RuntimeError):
                  final_exception: str = "") -> None:
         super().__init__(*args)
         self.returncode = returncode
+        # set by the dispatcher from the worker's exit + stdout only
+        # (:func:`worker_image_refusal`) — never from message text
+        self.image_refusal = False
         # The worker's final traceback exception line, parsed from its stderr
         # by the dispatcher (final_exception_line) — the ONLY input the shard
         # fault classifier trusts, never the message text, which carries a
@@ -2009,6 +2025,10 @@ class RemoteDispatcher:
     # Where a failed leg's fetched stdout/stderr tails are saved on the
     # orchestrator box (save_failed_leg_evidence); None = not saved.
     evidence_dir: str | None = None
+    # DEC-CA-0067: ``host_hook(host, contract_block) -> host`` run before every
+    # dispatch (cascade.trainer.leg_pins.dispatch_host_hook) — installed only
+    # while an automatic image repin is configured; None = unchanged dispatch.
+    host_hook: object = field(default=None, repr=False)
     # Shards legs: start the pod-side corpus prefetch beside the worker
     # (prefetch_files / with_prefetch; [round] funded_prefetch_shards). Off by
     # default here so test doubles keep their exact ssh call sequence; the
@@ -2046,6 +2066,9 @@ class RemoteDispatcher:
         cancel = cancel if cancel is not None else self.cancel_event
         if cancel is not None and cancel.is_set():
             raise RemoteDispatchError("redundant king replica cancelled", returncode=254)
+        if self.host_hook is not None:
+            # the leg's era image: right worker code, right deployed config
+            host = self.host_hook(host, contract_block)
         auto_harvest = False
         if host.isolated and not local_checkpoint:
             if self.harvest is None:
@@ -2187,12 +2210,14 @@ class RemoteDispatcher:
         if proc.returncode != 0:
             cause, detail = summarize_failure(proc.stderr or "", rc=proc.returncode,
                                               progress=progress)
-            raise RemoteDispatchError(
+            err = RemoteDispatchError(
                 f"remote {role} on {host.name} failed (rc={proc.returncode}) {cause}{where}"
                 + (f"\n{detail}" if detail else ""),
                 final_exception=final_exception_line(proc.stderr or ""),
                 returncode=proc.returncode,
             )
+            err.image_refusal = worker_image_refusal(proc.returncode, proc.stdout or "")
+            raise err
         receipt = parse_receipt(proc.stdout or "")
         if (local_checkpoint and self.detached and prior
                 and "local_checkpoint_dir" not in receipt and "trained_pointer" in receipt):

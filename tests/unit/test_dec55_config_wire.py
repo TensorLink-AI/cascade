@@ -71,7 +71,8 @@ def test_prelaunch_feature_rides_the_note():
     assert A.prelaunch_burn_feature_name(0.955) == "prelaunch-95.5"
     assert A.prelaunch_burn_feature_name(0.0) == ""
     note = A.own_signal_payload(cfg, A.ActivationRecord())
-    assert note.endswith(":prelaunch-95-r2:0:0")
+    # (the DEC-CA-0067 "v2b-" segment, newer, rides after it)
+    assert ":prelaunch-95-r2:0:0" in note
     # typed ⇒ owner override, nothing signalled for it
     typed = replace(cfg, v2=replace(cfg.v2, prelaunch_burn_from_block=7200))
     assert not A.prelaunch_burn_feature(typed).decided_on_chain

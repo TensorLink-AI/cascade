@@ -132,6 +132,13 @@ class HealthGate:
     # FILES, so a stale-tag container cannot pass it by echoing the env we
     # injected (2026-09-12 Lium 91.224.44.x incident).
     code_fingerprint: str = ""
+    # DEC-CA-0067 automatic repin: the AFTER release (``[v2]
+    # train_image_digest_after`` / ``worker_code_fingerprint_after``) also
+    # passes — a lane brought up on it serves the post-switch eras; the
+    # trainer's per-leg hook then sends each leg only to a lane on ITS era's
+    # image. "" = no alternate (the gate is byte-identical).
+    alt_image_digest: str = ""
+    alt_code_fingerprint: str = ""
     min_disk_gb: float = 20.0
     expected_python: str = EXPECTED_PYTHON
     expected_torch: str = EXPECTED_TORCH
@@ -255,6 +262,9 @@ class HealthGate:
             return False, "CASCADE_TRAIN_IMAGE_DIGEST unset on pod (inject at launch)"
         runtime = _sha256_of(value)
         if runtime != pinned:
+            alt = _sha256_of(self.alt_image_digest) if self.alt_image_digest else None
+            if alt is not None and runtime == alt:
+                return True, "after-image release (DEC-CA-0067)"
             return False, f"pod digest {runtime} != pinned {pinned}"
         return True, ""
 
@@ -273,7 +283,10 @@ class HealthGate:
         got, n, err = remote_code_fingerprint(run_ssh, workdir=self.workdir)
         if err:
             return False, f"code fingerprint unavailable: {err}"
+        alt = (self.alt_code_fingerprint or "").strip().lower()
         if got != pinned:
+            if alt and got == alt:
+                return True, f"{n} files (after-image release, DEC-CA-0067)"
             return False, (f"pod code {got[:12]}… ({n} files) != pinned {pinned[:12]}… "
                            f"— stale image under the pinned tag")
         return True, f"{n} files"

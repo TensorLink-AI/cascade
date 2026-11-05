@@ -302,12 +302,15 @@ def main(argv: list[str] | None = None) -> int:
         # Full-budget leg: this pod is the runtime, so the
         # contract's train_image_digest pin (if set) must match the image digest
         # injected at pod launch. Refuse loudly rather than train off-contract.
-        from .contract import TrainImageMismatch, assert_train_image
+        from .contract import IMAGE_REFUSAL_SENTINEL, TrainImageMismatch, assert_train_image
 
         try:
             assert_train_image(training)
         except TrainImageMismatch as e:
             log.error("%s", e)
+            # the structured refusal the orchestrator reads (last stdout
+            # line, rc 2); nothing of the miner's has run yet
+            print(IMAGE_REFUSAL_SENTINEL, flush=True)
             return 2
     try:
         # heat=is_heat ⇒ a reduced-budget leg's S3/wandb telemetry lands at

@@ -438,6 +438,8 @@ class SatelliteRunner(ActivationMixin):
     _margin_v2_tally: Any = field(default=None, repr=False)
     _prelaunch: ActivationRecord = field(default_factory=ActivationRecord, repr=False)
     _prelaunch_tally: Any = field(default=None, repr=False)
+    _image_decoupled: ActivationRecord = field(default_factory=ActivationRecord, repr=False)
+    _image_decoupled_tally: Any = field(default=None, repr=False)
     _cfg_base: Any = field(default=None, repr=False)
     _settlement_block: int | None = field(default=None, repr=False)
     _netconfig_now: int | None = field(default=None, repr=False)
@@ -690,9 +692,20 @@ class SatelliteRunner(ActivationMixin):
         self.push(client, now_block=now)
         return self.write_status(now)
 
-    def run_forever(self, client: Any) -> None:  # pragma: no cover — live loop
-        with contextlib.suppress(Exception):
+    def activation_startup(self, client: Any) -> None:
+        """Best-effort activation startup — except the DEC-CA-0067 note-budget
+        refusal, which stops the satellite (it votes like a validator)."""
+        from .activation_mixin import ActivationStartupRefused
+
+        try:
             self._activation_startup(client)
+        except ActivationStartupRefused:
+            raise
+        except Exception as e:  # noqa: BLE001 — activation never disturbs the replay
+            log.warning("satellite activation startup failed (%s); retried by the tick", e)
+
+    def run_forever(self, client: Any) -> None:  # pragma: no cover — live loop
+        self.activation_startup(client)
         while True:
             try:
                 self.poll(client)
@@ -766,8 +779,7 @@ def run_from_args(args: argparse.Namespace) -> int:
     log.info("satellite up: netuid=%s main validator %s, stale after %d blocks", cfg.netuid,
              runner.owner, runner.sat.stale_after_blocks)
     if getattr(args, "once", False):
-        with contextlib.suppress(Exception):
-            runner._activation_startup(client)
+        runner.activation_startup(client)
         print(json.dumps(runner.poll(client), indent=2, sort_keys=True))
         return 0
     runner.run_forever(client)
@@ -775,6 +787,11 @@ def run_from_args(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # DEC-CA-0067: the satellite signals and tallies the v2b vote — a config
+    # whose pinned feature is missing or wrong refuses to load
+    from ..shared.config.loader import require_vote_pin
+
+    require_vote_pin()
     from ..shared.env import load_env_files
 
     load_env_files()

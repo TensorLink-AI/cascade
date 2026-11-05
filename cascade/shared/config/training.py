@@ -123,6 +123,15 @@ class TrainingContractConfig:
     # injected at pod launch). Folded into contract_digest, so re-pinning the
     # image is a new contract. Empty ⇒ unpinned (no check).
     train_image_digest: str = ""
+    # DEC-CA-0067 automatic image repin (a SCHEDULE, never in contract_digest
+    # — see manifest._NEVER_IN_DIGEST): from ``train_image_after_block`` (the
+    # resolved / typed ``[v2] image_decoupled_from_block``) the EFFECTIVE
+    # contract (:meth:`at_block`) pins ``train_image_digest_after`` instead.
+    # Bound by the loader from ``[v2] train_image_digest_after`` onto the v2
+    # contract (cascade.shared.config.chain_config.bind_image_after). ""/0 = no
+    # schedule.
+    train_image_digest_after: str = ""
+    train_image_after_block: int = 0
     # Extra model sizes trained alongside the base (primary) size in the final
     # stage. Empty ⇒ single-size rounds (the legacy behaviour). Folded into
     # contract_digest, so a validator's contract gate covers every size at once.
@@ -476,6 +485,13 @@ class TrainingContractConfig:
         if ctx > 0 and cgate > 0 and block is not None and int(block) >= cgate:
             out = replace(out, context_length=ctx,
                           context_length_after=0, context_length_after_block=0)
+        img = str(self.train_image_digest_after or "")
+        igate = int(self.train_image_after_block or 0)
+        if img and igate > 0 and block is not None and int(block) >= igate:
+            # DEC-CA-0067: the era's legs run the after image (the schedule
+            # fields are digest-free, so only the pin itself moves)
+            out = replace(out, train_image_digest=img, train_image_digest_after="",
+                          train_image_after_block=0)
         return out
 
     @property

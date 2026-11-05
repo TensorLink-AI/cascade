@@ -34,6 +34,9 @@ from .runner_common import (
 
 log = logging.getLogger("cascade.trainer")
 
+# the rent-time check's MEASURED mismatch (vs an unverifiable probe)
+STALE_CODE_PREFIX = "stale worker image:"
+
 
 def _parse_funded_ledger(text):
     from dataclasses import fields
@@ -412,7 +415,8 @@ class _FundedPodMixin:
                 return None
         return entry
 
-    def _push_deployed_chain_toml(self, host):
+    def _push_deployed_chain_toml(self, host, *, src=None,
+                                  dest_name: str = "chain.deployed.toml"):
         """Copy the orchestrator's deployed chain.toml onto a pod the trainer
         rented itself and return the host pinned to it.
 
@@ -426,12 +430,12 @@ class _FundedPodMixin:
         import subprocess
         from dataclasses import replace as dc_replace
 
-        src = getattr(self, "deployed_chain_toml", None)
+        src = src or getattr(self, "deployed_chain_toml", None)
         if not src:
             return host
         from .remote import build_scp_argv, build_ssh_argv
 
-        dest = f"{host.workdir}/chain.deployed.toml"
+        dest = f"{host.workdir}/{dest_name}"
         runner = getattr(self, "_scp_runner", None) or (
             lambda argv: subprocess.run(argv, check=True, capture_output=True, timeout=120))
         runner(build_ssh_argv(host, f"mkdir -p {shlex.quote(host.workdir)}"))
@@ -1250,7 +1254,11 @@ class _FundedPodMixin:
         if gpu_choice is None:
             gpu_choice = _entry_gpu_choice(flagged, gen.ref)
         flight_attempt = str(getattr(flagged, "attempt_id", "") or "")
-        rnd = self.cfg.round
+        from .leg_pins import leg_round
+
+        # DEC-CA-0067: the leg's era pins (the after image from the switch on;
+        # cfg.round itself otherwise)
+        rnd = leg_round(self)
         from ..provision.funded import funded_pod_name
         from .cost_guards import measured_wall_refusal
 
@@ -1758,6 +1766,24 @@ class _FundedPodMixin:
                             # The stale cache lives on the HOST: every executor
                             # id it lists would boot the same image.
                             record_host_quarantine(result.address.ip, why)
+                        from .leg_pins import (
+                            WRONG_IMAGE_BAD_SECONDS,
+                            contract_runs_after,
+                            leg_contract,
+                        )
+
+                        if (why and not blocked and result.machine_id
+                                and why.startswith(STALE_CODE_PREFIX)
+                                and contract_runs_after(self.cfg, leg_contract(self))):
+                            # owner rule 2026-11-02 (never the wrong image), post-
+                            # switch legs only: the pod's code was MEASURED as
+                            # another release — the executor and its learned
+                            # identity too, so a relisted id is not rented again
+                            # for it (an unverifiable check is never blamed here)
+                            from ..provision.lium_identity import mark_executor_bad
+
+                            mark_executor_bad(result.machine_id, f"wrong worker image: {why}",
+                                              seconds=WRONG_IMAGE_BAD_SECONDS)
                         why = why or slow
                         log.warning("funded leg %s: pod %s rejected — %s; releasing "
                                     "and renting again (%d stale pod(s) so far)",
@@ -2097,7 +2123,9 @@ class _FundedPodMixin:
         transport failure is a mismatch too: a pod we cannot verify is a pod
         we do not dispatch to.
         """
-        pinned = (self.cfg.round.worker_code_fingerprint or "").strip().lower()
+        from .leg_pins import leg_round
+
+        pinned = (leg_round(self).worker_code_fingerprint or "").strip().lower()
         if not pinned or result.address is None:
             return ""
         from ..provision.codeprint import CHECK_TIMEOUT_SECONDS, remote_code_fingerprint
@@ -2121,7 +2149,7 @@ class _FundedPodMixin:
         if err:
             return f"code fingerprint unavailable: {err}"
         if got != pinned:
-            return (f"stale worker image: pod code {got[:12]}… ({n} files) != pinned "
+            return (f"{STALE_CODE_PREFIX} pod code {got[:12]}… ({n} files) != pinned "
                     f"{pinned[:12]}…")
         return ""
 

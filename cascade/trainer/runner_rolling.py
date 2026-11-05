@@ -200,9 +200,20 @@ class _RollingMixin:
                 "continuation_interval": self.cfg.round.ops_continuation_interval_seconds,
                 "continuation_max_bytes": self.cfg.round.ops_continuation_max_bytes}
                if self.cfg.round.ops_continuation_interval_seconds else {}),
+            **self._leg_pins_hook(),
             prefetch_shards=bool(getattr(self.cfg.round, "funded_prefetch_shards", True)),
             **self._dispatch_mode(),
         )
+
+    def _leg_pins_hook(self) -> dict:
+        """DEC-CA-0067: the per-leg image hook, only while a repin is armed."""
+        from ..shared.era import image_after_armed
+
+        if not image_after_armed(self.cfg):
+            return {}
+        from .leg_pins import dispatch_host_hook
+
+        return {"host_hook": dispatch_host_hook(self)}
 
     def _rolling_seeds(self, era):
         return RoundSeeds.derive(int(era.base_seed), self.cfg.training)
@@ -247,9 +258,16 @@ class _RollingMixin:
         """One funded challenger leg outside any round: payer pod (or the
         operator-lane fallback), the era's seeds and init, its own target
         boundary as the rent-wait deadline."""
+        contract = self.cfg.throne_contracts_at(int(era.start_block))[0]
+        from .leg_pins import leg_contract_scope
+
+        with leg_contract_scope(self, contract):
+            return self._rolling_train_challenger_in(gen, era, block, contract,
+                                                     end_wall=end_wall)
+
+    def _rolling_train_challenger_in(self, gen, era, block: int, contract, *, end_wall: float):
         from ..funding.store import parse_vault_ref
 
-        contract = self.cfg.throne_contracts_at(int(era.start_block))[0]
         seeds = self._rolling_seeds(era)
         suffix = f"-u{gen.uid}"
         ws_ref = self._rolling_warm_start_ref(era, contract)
@@ -595,6 +613,12 @@ class _RollingMixin:
                         if not pod.payer_hotkey and pod.instance_id == prefix:
                             self._teardown_operator_pod(pod)
         def backup(cancel):
+            from .leg_pins import leg_contract_scope
+
+            with leg_contract_scope(self, contract):
+                return _backup(cancel)
+
+        def _backup(cancel):
             from .runner_generation import leg_corpus
             self._leg_local.king_cancel = cancel
             self._leg_local.funded_is_king = True
@@ -648,6 +672,16 @@ class _RollingMixin:
         return entry
 
     def _rolling_train_king_single(self, gen, era, block: int, *, end_wall: float, persist=True):
+        """See :meth:`_rolling_train_king_single_in` (DEC-CA-0067: the leg's
+        contract names its era pins on this thread)."""
+        from .leg_pins import leg_contract_scope
+
+        with leg_contract_scope(self, self.cfg.throne_contracts_at(int(era.start_block))[0]):
+            return self._rolling_train_king_single_in(gen, era, block, end_wall=end_wall,
+                                                      persist=persist)
+
+    def _rolling_train_king_single_in(self, gen, era, block: int, *, end_wall: float,
+                                      persist=True):
         """The era king's leg on the operator's JIT pod (kept for the era: the
         top-N re-bench targets it). ``end_wall`` — the era's last settlement —
         is the leg's own target (thread-local), so the king rent waits out a
@@ -906,7 +940,12 @@ class _RollingMixin:
                 abort = getattr(self, "_funded_wait_abort", None)
                 was_set = abort.is_set() if abort is not None else True
                 try:
-                    host = self._rent_king_host(str(era.base_seed))
+                    from .leg_pins import leg_contract_scope
+
+                    # DEC-CA-0067: the bench pod is rented on THIS era's image
+                    # pins (leg_round reads the era contract on this thread)
+                    with leg_contract_scope(self, contract):
+                        host = self._rent_king_host(str(era.base_seed))
                 except Exception as e:  # noqa: BLE001 — retried by the scheduler
                     if abort is not None and not was_set:
                         abort.clear()   # a bench rent's give-up never releases challengers
@@ -938,7 +977,8 @@ class _RollingMixin:
             return None
         scores = self._remote_bench_scores(host, entry, str(era.base_seed),
                                            contract.arch_preset, role_dir="king",
-                                           require_fev=_bench_fev_required(self.cfg, era))
+                                           require_fev=_bench_fev_required(self.cfg, era),
+                                           contract_block=self._era_contract_block(era))
         return dataclasses.asdict(scores) if scores is not None else None
 
     def _rolling_bench_init(self, era) -> dict | None:
@@ -1230,7 +1270,8 @@ class _RollingMixin:
         role_dir = f"challenger-u{entry.miner_uid}"
         scores = self._remote_bench_scores(host, entry, str(era.base_seed),
                                            contract.arch_preset, role_dir=role_dir,
-                                           require_fev=_bench_fev_required(self.cfg, era))
+                                           require_fev=_bench_fev_required(self.cfg, era),
+                                           contract_block=self._era_contract_block(era))
         if scores is None:
             return None
         if not getattr(host, "isolated", False):

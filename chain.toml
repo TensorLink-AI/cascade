@@ -705,7 +705,7 @@ margin_warmup_rounds = 8         # rounds of tenure to reach the floor (~4d at 1
 win_margin_start_v2     = 0.4
 win_margin_end_v2       = 0.2
 margin_warmup_blocks_v2 = 18000
-margin_v2_from_block    = 0
+margin_v2_from_block    = 9194400   # TYPED 2026-11-01 (DEC-CA-0067): = the block the margin-v2-d30eb443 vote resolved (locked in at 9190800, applied at 9194400) — behaviour-identical; frees its note segment
 # Era king (DEC-CA-0043) — CONSENSUS, release-then-activate with the external
 # validators; audit replays each settlement under its own block. From a
 # settlement whose epoch boundary is >= this block the validator verifies the
@@ -737,7 +737,7 @@ king_resync_max_blocks = 18000   # = king_resync_max_rounds (5) × 3600 blocks �
 # legitimate holder of that code.
 forfeit_hotkeys          = ["5HDvXrTbUgK72UEkc7HrSpEtd6HpUDXuwh5pvePmWraqLHwu"]
 forfeit_successor_hotkey = "5DZv2yrGtcc9GHqhojwTQ7XWTvVL9xdab9LJhVNn4tF5S5H9"
-forfeit_from_block       = 0     # decided on chain (see above); a typed settlement boundary overrides
+forfeit_from_block       = 9166500   # TYPED 2026-11-01 (DEC-CA-0067): = the block the forfeit-42b1a486 vote resolved (locked in at 9165600, applied at 9166500) — behaviour-identical; frees its note segment
 min_windows          = 200       # below this many common windows, no decision
 min_clusters         = 0         # min distinct window clusters (pool `source` labels)
                                  # for a decision; raise to ~30 once the pool
@@ -1185,6 +1185,42 @@ carryover_king_share = 0.05
 # +10 % per pass to 95 %, a fail drops to 10 %; the last former king 5 % for
 # 36000 blocks), and the 1 % slash for a king leg the operator had to fund.
 king_ladder = true
+# DEC-CA-0067 (CONSENSUS, release-then-activate): the image-decoupled
+# training contract. From the first ERA START after the stake-majority lock-in
+# of the "v2b-<hash>" feature ([activation] threshold; every validator on this
+# release signals it at startup), a v2 settlement's legs are gated on
+# numerics_contract_digest (the contract minus train_image_digest) instead of
+# the full contract digest, so a worker-image repin keeps the carried king and
+# the finished legs. 0 = decided on chain; a typed era-start block is the
+# owner override. Repin the image only AFTER the switch era has started.
+image_decoupled_from_block = 0
+# Bundled with the same block (part of the vote's hash): the v2 private
+# verdict budget becomes this many windows. Inert until the switch.
+eval_n_windows_after = 4000
+# Fork guard (CONSENSUS): the v2b feature name the two values above hash to.
+# Every node loads only if it computes exactly this name (missing or another
+# eval_n_windows_after => refuses to start, never votes on another feature).
+image_decoupled_feature = "v2b-150ec0d0"
+# TRAINER-ONLY provenance (not consensus, not in the vote): earlier
+# v2.training train_image_digest pins, exactly as once typed, so the trainer
+# can PROVE a pre-repin leg differs only in its image. Append the old pin here
+# when re-pinning.
+prior_train_image_digests = []
+# DEC-CA-0067 AUTOMATIC image repin at the switch (TRAINER-ONLY; one release,
+# all-or-none, load-checked): legs of eras from the resolved switch run these
+# pins (pod image, v2.training image, worker code fingerprint, and the image the
+# SKU walls were measured on — required while [round]
+# funded_sku_wall_measured_image is set); earlier eras keep the current pins.
+# The pre-switch pin joins the numerics proof automatically. Empty = off.
+train_image_digest_after = ""
+funded_pod_image_after = ""
+worker_code_fingerprint_after = ""
+funded_sku_wall_measured_image_after = ""
+# Owner rule (enforced): the trainer uses the *_after pins only with a valid
+# qualifications/<from12>-to-<to12>.json record (bit-identical plus bitwise
+# resume at every GPU count of funded_pod_skus; scripts/write_image_qualification.py). EMERGENCY ONLY:
+# true uses them unqualified, with an ERROR + operator alert every tick.
+image_after_unqualified_override = false
 # Margin-tiered start share (owner 2026-10-20, CONSENSUS, overlay-settable):
 # a king crowned at an INCREMENT-unit settlement starts at the start_bp of the
 # highest [lcb_threshold, start_bp] tier its crowning LCB (the family-wise

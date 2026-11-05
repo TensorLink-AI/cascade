@@ -282,6 +282,10 @@ def _lane_fault(exc: BaseException) -> bool:
     not the lane's) and never a transport loss (the dead-pod drain owns it)."""
     if isinstance(exc, (_FundedTamper, _FundedDiverged, _LaneDeadlinePassed)):
         return False
+    from .leg_pins import LegImageMismatch
+
+    if isinstance(exc, LegImageMismatch):
+        return False        # DEC-CA-0067: the leg's image (or its qualification), not the lane
     if getattr(exc, "returncode", None) == 3:
         return False
     return not (_storage_failure(exc) or _transport_failure(exc))

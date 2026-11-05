@@ -1,0 +1,27 @@
+{
+  "_source": "main validator activation_*_state.json, copied 2026-11-01 (DEC-CA-0067 typed blocks)",
+  "forfeit": {
+    "activation_block": 9166500,
+    "feature": "forfeit-42b1a486",
+    "lock_block": 9165600,
+    "source": "signals"
+  },
+  "margin_v2": {
+    "activation_block": 9194400,
+    "feature": "margin-v2-d30eb443",
+    "lock_block": 9190800,
+    "source": "tally"
+  },
+  "prelaunch": {
+    "activation_block": 0,
+    "feature": "prelaunch-95-r2",
+    "lock_block": 0,
+    "source": ""
+  },
+  "rollover": {
+    "activation_block": 9136800,
+    "feature": "rolling-era-king",
+    "lock_block": 9133200,
+    "source": "config"
+  }
+}

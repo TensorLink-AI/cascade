@@ -323,6 +323,104 @@ def check_margin_v2(receipt: RoundReceipt, cfg: ChainConfig,
                      f">= {cfg.activation.threshold:.0%} of stake (lock-in at {lock})")
 
 
+def check_numerics_contract(receipt: RoundReceipt, cfg: ChainConfig,
+                            client: object | None = None) -> CheckResult:
+    """DEC-CA-0067: the image-decoupled per-leg contract rule, replayed under
+    the receipt's own block (``cfg`` already carries a recorded
+    ``image_decoupled_block`` — ``apply_receipt_activation``).
+
+    * The recorded block (when any) is the typed one or the one validators
+      agree on in their notes (the :func:`check_margin_v2` shape).
+    * Before the switch (or off a v2 settlement): the signed manifest carries
+      NO ``numerics_contract_digest`` anywhere — the trainer never stamps it
+      early.
+    * From it: the manifest's ``numerics_contract_digest`` is the numerics
+      projection of its own published ``contract_body`` (else the local
+      contract), and every entry carries that same value — exactly the
+      validator's ``era_numerics_*`` / ``era_entry_numerics_*`` gate.
+
+    Joined to the Tier-0 run only when a switch is configured or recorded,
+    so every other receipt's output is unchanged."""
+    from ..shared.activation import (
+        agreed_activation,
+        configured_image_decoupled_block,
+        image_decoupled_feature,
+    )
+    from ..shared.era import image_decoupled_at, v2_settlement_active
+    from ..shared.manifest import numerics_contract_digest
+
+    name = "numerics-contract"
+    man = receipt.manifest or {}
+    entries = [e for e in (man.get("entries") or []) if isinstance(e, dict)]
+    block = int(getattr(receipt, "image_decoupled_block", 0) or 0)
+    notes = ""
+    if block:
+        typed = configured_image_decoupled_block(cfg)
+        if typed and typed != block:
+            return _fail(name, f"recorded image_decoupled_block {block} != the block typed "
+                               f"into the audit config ({typed})")
+        if int(getattr(cfg.v2, "image_decoupled_from_block", 0) or 0) != block:
+            return _fail(name, f"recorded image_decoupled_block {block} could not be applied "
+                               "to the audit config")
+        spec = image_decoupled_feature(cfg)
+        if not typed and spec is not None and client is not None:
+            try:
+                agreed = agreed_activation(
+                    spec.name, list(client.validator_stakes()),  # type: ignore[attr-defined]
+                    dict(client.read_plain_commitments()),  # type: ignore[attr-defined]
+                    threshold=cfg.activation.threshold,
+                    block=int(client.current_block()),  # type: ignore[attr-defined]
+                    dormant_after_blocks=cfg.activation.dormant_after_blocks,
+                    round_cfg=cfg.round, align=spec.align)
+            except Exception as e:  # noqa: BLE001
+                agreed, notes = None, f"; chain read failed ({e})"
+            if agreed is not None and agreed[1] != block:
+                return _fail(name, f"recorded image_decoupled_block {block} != the block "
+                                   f"validators agree on ({agreed[1]}, locked in at "
+                                   f"{agreed[0]})")
+            if agreed is None and not notes:
+                notes = "; validator agreement not (yet) visible in the notes"
+        elif not typed:
+            notes = "; validator agreement not verified (no chain)"
+    boundary = int(receipt.epoch_start_block)
+    active = v2_settlement_active(cfg, boundary) and image_decoupled_at(cfg, boundary)
+    stamped = bool(man.get("numerics_contract_digest")) or any(
+        e.get("numerics_contract_digest") for e in entries)
+    if not active:
+        if stamped:
+            return _fail(name, "manifest carries numerics_contract_digest before the "
+                               "settlement's [v2] image_decoupled_from_block")
+        return _ok(name, "image-decoupled rule not in force for this settlement" + notes)
+    if receipt.status == "rejected" and not man:
+        return _ok(name, "rejected round without a manifest body" + notes)
+    got = str(man.get("numerics_contract_digest", "") or "")
+    if not got:
+        return _fail(name, "settlement past the switch carries no numerics_contract_digest")
+    body = man.get("contract_body")
+    want = numerics_contract_digest(body if isinstance(body, dict)
+                                    else receipt_training(receipt, cfg))
+    if got != want:
+        return _fail(name, f"manifest numerics {got[:16]}… != its contract's {want[:16]}…")
+    from ..shared.manifest import entry_contract_payload
+
+    source = body if isinstance(body, dict) else receipt_training(receipt, cfg)
+    for e in entries:
+        if str(e.get("numerics_contract_digest", "") or "") != got:
+            return _fail(name, f"{e.get('role')} uid{e.get('miner_uid')} numerics "
+                               f"{str(e.get('numerics_contract_digest', ''))[:16] or '<none>'} "
+                               f"!= the settlement's {got[:16]}…")
+        derived = contract_digest(entry_contract_payload(
+            source, str(e.get("train_image_digest", "") or ""),
+            str(e.get("continuation_protocol", "") or "")))
+        if derived != str(e.get("training_contract_digest", "") or ""):
+            return _fail(name, f"{e.get('role')} uid{e.get('miner_uid')} "
+                               "training_contract_digest is not the era contract with its "
+                               f"published image/protocol (re-derives to {derived[:16]}…)")
+    return _ok(name, f"every entry trained under the settlement's numerics {got[:16]}… "
+                     "and re-derives its full contract digest from its own image/protocol"
+                     + notes)
+
+
 def check_era(receipt: RoundReceipt, cfg: ChainConfig, client: object | None = None) -> CheckResult:
     """DEC-CA-0043 era envelope, replayed under the receipt's own block.
 
@@ -3385,6 +3483,9 @@ _REJECTION_CHECK_FOR_REASON = (
     ("era_", "era"),
     ("manifest_chain_broken", "era"),
     ("contract_digest_mismatch", "contract-digest"),
+    ("era_numerics_", "numerics-contract"),
+    ("era_entry_numerics_", "numerics-contract"),
+    ("era_entry_contract_unproven", "numerics-contract"),
     ("base_arch_digest_mismatch", "base-arch-digest"),
 )
 
@@ -3795,6 +3896,9 @@ def run_tier0(
         check_era(receipt, cfg, client),
         check_block_hash_onchain(receipt, client),
         check_contract_digest(receipt, cfg),
+        *([check_numerics_contract(receipt, cfg, client)]
+          if (int(getattr(cfg.v2, "image_decoupled_from_block", 0) or 0)
+              or int(getattr(receipt, "image_decoupled_block", 0) or 0)) else []),
         check_contract_declaration(receipt, cfg),
         check_base_arch_digest(receipt, cfg),
         check_commit_cutoff(receipt, client),

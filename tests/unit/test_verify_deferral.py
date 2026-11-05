@@ -34,6 +34,7 @@ def _fake(isolated=True, verify=("ok", None)):
                            ("king", "toto2-4m", "KING"): KING_POD},
         cascade_bench_plan=object(),
         _remote_bench_scores=lambda *a, **k: SCORES,
+        _era_contract_block=lambda era: None,      # no contract switch scheduled
         verify_calls=[],
     )
     f._rolling_verify_host = lambda king, era: TrainerRunner._rolling_verify_host(f, king, era)

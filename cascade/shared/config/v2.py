@@ -97,6 +97,53 @@ class V2Config:
     # PREVIOUS epoch's init (the report read is the previous settlement's).
     # 0 = off (every build before it behaves identically).
     init_epoch_bind_from_block: int = 0
+    # DEC-CA-0067 image-decoupled contract (CONSENSUS, release-then-activate):
+    # from the ERA starting at or after this block, a v2 settlement's per-leg
+    # contract check compares ``numerics_contract_digest`` (the contract minus
+    # the worker-image pin) instead of the full ``training_contract_digest``,
+    # so an image repin keeps the carried king and the finished legs. Decided
+    # ON CHAIN as a DEC-CA-0045 secondary feature (``v2b-<hash>``): lock-in
+    # writes the first ERA START after the lock-in boundary here
+    # (``activation.resolved_image_decoupled_block`` marks it). A typed block
+    # is the owner override; 0 = vote (or off with [activation] off).
+    image_decoupled_from_block: int = 0
+    # DEC-CA-0067 bundle (CONSENSUS): from the SAME block, a v2 settlement's
+    # private verdict budget is this many windows (the explicit-evidence
+    # verdict draw, exactly as ``eval_n_windows``). 0 = no change.
+    eval_n_windows_after: int = 0
+    # DEC-CA-0067 CONSENSUS guard: the ``v2b-<hash>`` feature name this node
+    # must compute (it hashes ``eval_n_windows_after``). Required while
+    # ``[activation]`` is on and v2 is scheduled; the loader REFUSES the
+    # config when it is absent or differs from the computed name, so two nodes
+    # can never silently vote on different features (a deployed chain.toml
+    # missing ``eval_n_windows_after`` computes another name).
+    image_decoupled_feature: str = ""
+    # DEC-CA-0067 TRAINER-ONLY provenance (never consensus, not in the vote):
+    # earlier ``train_image_digest`` pins, exactly as once typed, that a leg
+    # trained before a repin may have recorded. The trainer proves such a
+    # leg's numerics digest by re-hashing the current contract with each of
+    # these (cascade.shared.manifest.prove_numerics_digest). Append the OLD
+    # pin here when re-pinning the image.
+    prior_train_image_digests: tuple[str, ...] = ()
+    # DEC-CA-0067 AUTOMATIC image repin at the switch (TRAINER-ONLY, never
+    # consensus; all-or-none, load-checked as one release): legs of eras
+    # starting at or after ``image_decoupled_from_block`` run these pins —
+    # the [v2.training] image (bound onto the v2 contract as a schedule), the
+    # rented pod image, the worker code fingerprint and the image the SKU wall
+    # table was measured on (required when ``[round]
+    # funded_sku_wall_measured_image`` is set). Earlier eras keep the current
+    # pins. "" = no automatic repin (every pin byte-identical).
+    train_image_digest_after: str = ""
+    funded_pod_image_after: str = ""
+    worker_code_fingerprint_after: str = ""
+    funded_sku_wall_measured_image_after: str = ""
+    # DEC-CA-0067 owner EMERGENCY override (TRAINER-ONLY): use the ``*_after``
+    # pins although no valid ``qualifications/<from12>-to-<to12>.json`` record
+    # qualifies them bit-identical against the current pin
+    # (cascade.shared.image_qualification). The trainer logs an ERROR every
+    # tick and raises an operator alert while it is true. Default false: an
+    # unqualified after release is refused (no post-switch rent/dispatch).
+    image_after_unqualified_override: bool = False
     # Emission burns (CONSENSUS on the weight vector, see
     # cascade.shared.emission). ``prelaunch_burn``: the fraction of every
     # pre-v2 vector sent to ``burn_uid`` by a validator on this release.
@@ -312,7 +359,7 @@ def parse_v2_economics(v2raw: dict) -> dict:
     if readiness and (not readiness.isascii() or not readiness.isalnum() or len(readiness) > 12):
         raise ValueError("v2 prelaunch_burn_readiness must be up to 12 ASCII letters/digits")
     out.update(launch_at_utc=launch, commit_open_at_utc=opening, prelaunch_burn_readiness=readiness)
-    for k in ("random_init_eras", "reign_warm_start_blocks", "prelaunch_burn_from_block", "commit_from_block", "eval_n_windows", "init_epoch_bind_from_block"):
+    for k in ("random_init_eras", "reign_warm_start_blocks", "prelaunch_burn_from_block", "commit_from_block", "eval_n_windows", "init_epoch_bind_from_block", "image_decoupled_from_block", "eval_n_windows_after"):
         raw = v2raw.get(k, 0)
         if isinstance(raw, bool) or not isinstance(raw, int):
             raise ValueError(f"[v2] {k} must be an integer; got {raw!r}")
@@ -327,6 +374,22 @@ def parse_v2_economics(v2raw: dict) -> dict:
             raise ValueError(f"[v2] {k} must be in [0, 1); got {raw}")
         out[k] = float(raw)
     out["bench_gate_v2_from_block"] = parse_bench_gate_v2_from_block(v2raw)
+    if out["eval_n_windows_after"] > EVAL_WINDOWS_MAX:
+        # the verdict draw is capped by the pool anyway; a value past this is a
+        # typo that would multiply every validator's CPU scoring time
+        raise ValueError(f"[v2] eval_n_windows_after must be <= {EVAL_WINDOWS_MAX}; got "
+                         f"{out['eval_n_windows_after']}")
+    feat = v2raw.get("image_decoupled_feature", "")
+    if not isinstance(feat, str):
+        raise ValueError(f"[v2] image_decoupled_feature must be a string; got {feat!r}")
+    out["image_decoupled_feature"] = feat.strip()
+    out["prior_train_image_digests"] = _parse_prior_images(
+        v2raw.get("prior_train_image_digests", []))
+    out.update(parse_image_after(v2raw))
+    ov = v2raw.get("image_after_unqualified_override", False)
+    if not isinstance(ov, bool):
+        raise ValueError(f"[v2] image_after_unqualified_override must be true/false; got {ov!r}")
+    out["image_after_unqualified_override"] = ov
     out["bench_source"], out["bench_source_from_block"] = parse_bench_source(v2raw)
     out.update(parse_bench_source_bounds(v2raw))
     ladder = v2raw.get("king_ladder", False)
@@ -367,6 +430,76 @@ def parse_v2_economics(v2raw: dict) -> dict:
         v2raw.get("ladder_start_tiers", LADDER_START_TIERS),
         fail_bp=lad["ladder_fail_bp"], cap_bp=lad["ladder_cap_bp"])
     return out
+
+
+EVAL_WINDOWS_MAX = 20000
+
+IMAGE_AFTER_KEYS = ("train_image_digest_after", "funded_pod_image_after",
+                    "worker_code_fingerprint_after", "funded_sku_wall_measured_image_after")
+
+
+def parse_image_after(v2raw: dict) -> dict:
+    """The DEC-CA-0067 ``*_after`` pins, validated as ONE release: the image,
+    the pod image and the code fingerprint all set or all empty; both images
+    pinned by digest and naming the same digest; the fingerprint 64 hex; the
+    wall image a digest (or empty). Cross-section checks (the v2 contract, the
+    measured-wall gate) run in the loader."""
+    import re
+
+    out = {}
+    for k in IMAGE_AFTER_KEYS:
+        v = v2raw.get(k, "")
+        if not isinstance(v, str):
+            raise ValueError(f"[v2] {k} must be a string; got {v!r}")
+        out[k] = v.strip()
+    out["worker_code_fingerprint_after"] = out["worker_code_fingerprint_after"].lower()
+    core = [out[k] for k in IMAGE_AFTER_KEYS[:3]]
+    if any(core) and not all(core):
+        raise ValueError("[v2] train_image_digest_after, funded_pod_image_after and "
+                         "worker_code_fingerprint_after must be set together (one release) "
+                         "or all left empty")
+    if not any(core):
+        if out["funded_sku_wall_measured_image_after"]:
+            raise ValueError("[v2] funded_sku_wall_measured_image_after needs the other "
+                             "*_after pins")
+        return out
+    digest = re.compile(r"(?:^|@)(sha256:[0-9a-f]{64})$")
+    m_train = digest.search(out["train_image_digest_after"].lower())
+    m_pod = digest.search(out["funded_pod_image_after"].lower())
+    if m_train is None or m_pod is None or "@" not in out["funded_pod_image_after"]:
+        raise ValueError("[v2] train_image_digest_after must be sha256:<64 hex> (or a "
+                         "…@sha256: ref) and funded_pod_image_after a digest-pinned image "
+                         "ref (…@sha256:<64 hex>)")
+    if m_train.group(1) != m_pod.group(1):
+        raise ValueError("[v2] funded_pod_image_after and train_image_digest_after must name "
+                         "the same image digest")
+    if not re.fullmatch(r"[0-9a-f]{64}", out["worker_code_fingerprint_after"]):
+        raise ValueError("[v2] worker_code_fingerprint_after must be 64 hex")
+    wall = out["funded_sku_wall_measured_image_after"]
+    if wall:
+        mw = digest.search(wall.lower())
+        if mw is None:
+            raise ValueError("[v2] funded_sku_wall_measured_image_after must be "
+                             "sha256:<64 hex> or a …@sha256: ref")
+        out["funded_sku_wall_measured_image_after"] = mw.group(1)
+    return out
+
+
+def _parse_prior_images(raw: object) -> tuple[str, ...]:
+    """``[v2] prior_train_image_digests``: a list of ``sha256:<64 hex>`` (or
+    ``repo@sha256:<64 hex>``) strings, order and duplicates dropped-preserving."""
+    import re
+
+    if not isinstance(raw, (list, tuple)):
+        raise ValueError(f"[v2] prior_train_image_digests must be a list of strings; got {raw!r}")
+    out: list[str] = []
+    for v in raw:
+        if not isinstance(v, str) or not re.search(r"(?:^|@)sha256:[0-9a-f]{64}$", v.strip()):
+            raise ValueError("[v2] prior_train_image_digests entries must be sha256:<64 hex> "
+                             f"(or repo@sha256:<64 hex>); got {v!r}")
+        if v.strip() not in out:
+            out.append(v.strip())
+    return tuple(out)
 
 
 LANE_B_REMAINDERS = ("burn", "lane_a")

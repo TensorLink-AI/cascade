@@ -916,9 +916,16 @@ def would_rent_refusal(runner, gen, *, operator: bool) -> tuple[str, str]:
     from ..funding.queue import OPERATOR_DISK_CLASS
     from .box_health import rent_halt_refusal
     from .cost_guards import doomed_leg_reason, measured_wall_refusal
+    from .leg_pins import LegImageMismatch, leg_round
 
     try:
-        rnd = runner.cfg.round
+        # DEC-CA-0067: the leg's era pins (the after view for a post-switch
+        # leg; ``runner.cfg.round`` itself otherwise — byte-identical until
+        # the switch). An unqualified after release is a refusal here too.
+        try:
+            rnd = leg_round(runner)
+        except LegImageMismatch as e:
+            return (f"operator-side fault: {e} — nothing rented", OPERATOR_BLOCKED_CLASS)
         why = measured_wall_refusal(rnd)
         if why:
             return why, OPERATOR_BLOCKED_CLASS

@@ -219,6 +219,304 @@ Tier 2 uses the match to decide when a byte-exact checkpoint comparison
 applies. Rented pods boot `[round] funded_pod_image`; pin it as described in
 [Credentials on payer pods](#credentials-on-payer-pods).
 
+### Re-pinning the image inside a v2 seed epoch (DEC-CA-0067)
+
+`train_image_digest` is part of `contract_digest`. Before DEC-CA-0067 is in
+force, re-pinning it mid-epoch makes the trainer drop the carried king entry
+and every finished leg (`_stale_contract`) and retrain them (operator-billed),
+and validators reject any entry with a different full digest
+(`era_entry_init_mismatch`). Do not re-pin inside a v2 seed epoch until the
+switch below is in force.
+
+Once `[v2] image_decoupled_from_block` is in force for an era, every v2
+settlement of that era stamps `numerics_contract_digest` (the contract minus
+`train_image_digest`) on the manifest and on every entry. Validators gate legs
+on that value. An image-only re-pin then keeps the king entry and pointer and
+the finished legs. A numerics change still retrains. The pod still refuses a
+FINAL whose runtime image differs from the pin.
+
+**Deploying this release: the chain.toml values first.** Every deployed
+chain.toml must carry `[v2] eval_n_windows_after = 4000`,
+`[v2] image_decoupled_feature = "v2b-150ec0d0"`, and the typed
+`[scoring] forfeit_from_block = 9166500` / `margin_v2_from_block = 9194400`.
+The feature name hashes `eval_n_windows_after`, so a file without it would
+vote on `v2b-6bbd262b` and fork from the fleet.
+
+**Restarting a validator on this release is a vote.** With the pins in its
+chain.toml, a validator signals `v2b-150ec0d0` in its on-chain note from its
+first loop: there is no separate "release, then vote" step. Lock-in follows
+at 51 % of stake, and the switch is the first era start after the lock-in
+boundary. So:
+1. **Trainer first.** If lock-in happens while the trainer still runs older
+   code, every upgraded validator rejects every post-switch settlement
+   (`era_numerics_missing`). Restart the trainer on this release (no legs in
+   flight, not inside a validator scoring window) before any validator.
+2. **Then validators, timed to the seed epoch.** The switch must not start
+   inside a v2 seed epoch the reign still depends on. Hold validator restarts
+   until the lock-in boundary would put the switch at or after the epoch's
+   end (or ship a typed `[v2] image_decoupled_from_block` to everyone — a
+   consensus pin, no signal). From the switch the verdict budget goes from
+   `[eval] n_windows` to `eval_n_windows_after` with a new draw: check
+   validator RAM/CPU and the trainer's lane-B self-judge load first.
+3. Announce the release to the external validators only when 1 and 2 hold.
+
+What refuses and what keeps running on a file without them:
+- **Refuse to start:** `cascade-validator`, `cascade-satellite` (both signal
+  and tally the vote), `cascade-trainer`, `cascade-audit` (they act on it);
+  their `main` sets the loader's vote-pin guard. The validator and the
+  satellite also refuse to start when their own note would trim the `v2b-`
+  segment, which is what happens with the pins but without the typed
+  `[scoring]` blocks.
+- **Keep running, ERROR logged:** train workers on pods
+  (`cascade-train-worker`, the pod-side snippets), the miner CLI (`cascade`),
+  `cascade-intake` (funding), `cascade-provisioner`, `cascade-pool`,
+  `cascade-generate`.
+- **Note headroom (time-limited):** the note-budget check judges blocks at
+  the digit count they reach within ~30 days. With the release chain.toml
+  (rollover resolved from signals, a locked `cfg-` overlay segment) the
+  `v2b-` segment no longer fits once blocks reach 8 digits, so from head
+  ~9,784,000 a validator on that config refuses to start until v2b's block
+  is typed once decided (or the already-locked rollover is typed). Plan that
+  edit before then.
+
+**Note byte budget: the two ways to free room for `v2b-`.** The commitment
+field is 128 bytes. The main validator's live note today is 124 B
+(`cascade-ready:1:rolling-era-king:0:0:forfeit-42b1a486:9165600:9166500:margin-v2-d30eb443:9190800:9194400:prelaunch-95-r2:0:0`);
+`:v2b-150ec0d0:0:0` adds 17 B, and the locked segment
+(`:v2b-150ec0d0:<lock>:<switch>`) adds 29 B. The owner picks one of these
+(Approve-tier, chain.toml edits on every deployed copy):
+
+- **(a) type the decided forfeit / margin-v2 blocks** (required on mainnet):
+
+  ```toml
+  [scoring]
+  margin_v2_from_block    = 9194400   # = the block margin-v2-d30eb443 resolved
+  forfeit_from_block       = 9166500   # = the block forfeit-42b1a486 resolved
+  ```
+
+  This is behaviour-identical, because the restored lock-ins become no-ops. Both
+  segments leave the note: 73 B unlocked and 85 B locked on the main validator.
+  The release chain.toml already carries these two lines.
+- **(b) retire the UNLOCKED pre-launch burn vote**:
+
+  ```toml
+  [v2]
+  prelaunch_burn = 0.0   # was 0.95; the prelaunch-95-r2 vote never locked
+  ```
+
+  This is behaviour-identical only while that vote is unlocked: the burn shapes
+  pre-v2 settlements only, and only from a decided block, and every future
+  settlement is v2. A validator whose persisted
+  `activation_prelaunch_burn_state.json` is LOCKED refuses to start with
+  `prelaunch_burn = 0`; type `[v2] prelaunch_burn_from_block` instead.
+  **(b) alone is not enough on mainnet.** It frees 20 B, so the note is 121 B
+  unlocked but 133 B once v2b locks, and the startup check (which judges the
+  locked worst case) still refuses. On a repo-config validator (rollover
+  resolved from signals) even the unlocked note does not fit. Use (b) only
+  together with (a), for more headroom: 53 B / 65 B.
+
+At startup a validator logs one `activation: STARTUP — this node's note
+exceeds 128 bytes; segment '<feature>' will NOT be signalled` WARNING for each
+segment its 128-byte field would drop, so no vote is dropped silently.
+
+Steps (Approve-tier; snapshot each file first):
+1. Hand-edit every deployed chain.toml (trainer box `/root/cascade/chain.toml`,
+   the main validator's, any satellite / intake copy): add the two `[v2]` keys
+   and type the two `[scoring]` blocks.
+2. Validate THAT exact file with the release loader before restarting
+   anything, as the voting processes will:
+
+   ```bash
+   PYTHONPATH=<release checkout> <venv>/bin/python -c "
+   from cascade.shared.config.loader import load_chain_config, require_vote_pin
+   from cascade.shared.activation import image_decoupled_feature
+   require_vote_pin(); c = load_chain_config('<deployed chain.toml>')
+   print(image_decoupled_feature(c))"
+   ```
+
+   It must print `v2b-150ec0d0` and raise nothing.
+3. Only then restart, one service at a time (validator, trainer, audit,
+   intake, provisioner, satellite), and check each log for the startup line
+   and no `image_decoupled_feature` ERROR.
+
+How it activates: validators on the release signal `v2b-<hash>` at startup. At
+the first settlement boundary where `[activation] threshold` of eligible stake
+has signalled, the vote locks in. The switch is the first era start after that
+boundary. Trainer and validators resolve the same block. A typed
+`[v2] image_decoupled_from_block` is the owner override. The same block also
+switches the v2 verdict budget to `[v2] eval_n_windows_after`.
+
+Re-pin runbook, once `status/chain.json` (`activation.image_decoupled`) shows
+the lock-in:
+
+1. Wait until the switch era has started (head block >= the activation block).
+2. Append the CURRENT `[v2.training] train_image_digest`, exactly as typed, to
+   `[v2] prior_train_image_digests` in the deployed chain.toml. The trainer
+   uses it to prove that a pre-repin leg differs only in its image. A leg it
+   cannot prove is retrained and logged at ERROR.
+3. Re-pin `[v2.training] train_image_digest` and `[round] funded_pod_image` to
+   the new release (`scripts/repin_worker_image.sh`). Push `chain.deployed.toml`
+   and spot-check one pod per stage.
+4. Restart the trainer, preferably with no legs in flight. A leg dispatched
+   before the re-pin is re-attached after the restart: under the decoupled
+   rule the restore check and the receipt check accept a digest that is
+   provably the era contract with the old image (`_stale_contract`,
+   `leg_pins.receipt_contract_ok`). A leg with other numerics is still
+   requeued.
+5. Verify that the next settlement keeps the king (`numerics proven` at INFO in
+   trainer.log) and that the validators accept it.
+
+### Automatic image repin at the switch (DEC-CA-0067)
+
+Instead of the hand repin above, the trainer can switch images by itself at the
+switch era. Set these in the deployed chain.toml `[v2]`, all together:
+
+```toml
+train_image_digest_after = "sha256:34375845b2c4412ccd8462a6e9ca5ad78837567115bc7f9b56320458ba991409"
+funded_pod_image_after = "ghcr.io/tensorlink-ai/cascade-worker:worker-v2.0.0-rc16@sha256:34375845b2c4412ccd8462a6e9ca5ad78837567115bc7f9b56320458ba991409"
+worker_code_fingerprint_after = "5fe6ed7c0f0d5305b6101e589aab50b2ca5a76573cbc7afb3f44bc7354ce8fd0"
+# only while [round] funded_sku_wall_measured_image is set:
+# funded_sku_wall_measured_image_after = "sha256:<the image the walls were measured on>"
+```
+
+These values are rc16. The repo chain.toml ships them empty.
+
+**Owner rule (enforced).** Set an image as `*_after` only after a
+bit-identical qualification against the current image: weights and optimizer
+state, plus crash/resume, at every world size the trainer can rent for a v2
+leg. Those are the GPU counts of `[round] funded_pod_skus` / `funded_pod_sku`
+(mainnet `8xH200, 8xH100, 4xH200, 4xH100` ⇒ worlds 4 and 8; world 1 only with
+a one-GPU SKU). Adding a SKU with a new GPU count needs that size qualified.
+Record the qualification in OPSLOG first. The trainer enforces it: without a valid
+`qualifications/<from12>-to-<to12>.json` for exactly this pair it refuses
+every post-switch rent and dispatch on the after image (ERROR every tick plus
+an `image_after_unqualified` operator alert; legs wait as unburned operator
+faults, never on the old image). Make the record from the harness outputs:
+
+```bash
+# on the qualification pod: A = checkout from the FROM image, B = from the TO image
+python scripts/qualify_pyramid_bitwise.py --ref /root/qual-a --cand /root/qual-b \
+    --worlds 4,8 --chain-toml /root/cascade/chain.deployed.toml --out /root/qual-out
+# copy /root/qual-out back (ckpt/ dirs + summary.json), then on the box:
+python3 scripts/write_image_qualification.py \
+    --from-image sha256:<current> --to-image sha256:<after> \
+    --from-fingerprint <current worker_code_fingerprint> \
+    --to-fingerprint <worker_code_fingerprint_after> \
+    --run-id <run id> --qual-out /root/qual-out --manifests-dir /root/qual-manifests \
+    --chain-toml /root/cascade/chain.toml   # the DEPLOYED file: required worlds from its SKUs
+```
+
+Commit the record it writes and deploy it with the trainer code. It writes
+nothing when any world, the resume check or any tensor is missing or differs.
+Emergency only: `[v2] image_after_unqualified_override = true` uses the after
+pins unqualified (ERROR every tick, `image_after_override` alert).
+
+What changes, and when:
+- Nothing changes until the vote resolves the switch (or a typed
+  `image_decoupled_from_block`). Every pin, file and dispatch stays
+  byte-identical.
+- Legs of eras starting at or after the switch get the after pins: rented pod
+  image, worker-code check, wall gate, the `[v2.training]` image in the leg's
+  contract, and a deployed chain.toml with those pins substituted
+  (`chain.deployed.after.toml`).
+- Legs of earlier eras keep the current pins, and in-flight legs keep their
+  image.
+- Before every dispatch, the worker-code fingerprint of each lane and pod is
+  checked against the leg's era pin. A host on the other image never takes the
+  leg.
+- The pre-switch pin joins the numerics proof automatically, so the carried
+  king is kept without editing `prior_train_image_digests`.
+- No trainer restart is needed at the switch.
+
+Lanes:
+- The lane pool hands each leg a lane on its era's image.
+- The provisioner health gate accepts either release.
+- A lane re-bootstrapped onto rc16 is picked up within 300 s (the fingerprint
+  cache TTL), and is re-measured before any refusal.
+- A refusal never trips the lane breaker.
+
+Lane and pod behaviour once armed:
+- Lane matching acts only on legs of eras under the RESOLVED switch. A
+  pre-switch leg, and every leg while the vote is unresolved, is handed lanes
+  and dispatched exactly as without the repin (no probe; the worker's own
+  FINAL image check still guards it).
+- A post-switch leg takes only a lane whose worker code AND runtime image
+  identity (`CASCADE_TRAIN_IMAGE_DIGEST`, what the worker checks) are the
+  after release; other lanes stay idle for the other era's legs. A lane seen
+  on another release is re-probed at most once a minute.
+- An ssh failure while probing a lane makes it "unknown": the leg waits and
+  retries; it is never told "no lane on this image". An ssh failure at
+  dispatch is a transport failure (the pod is drained like any unreachable
+  pod), not an image mismatch.
+- Never the wrong image (owner rule 2026-11-02), post-switch legs only (a
+  pre-switch leg is handled exactly as in the release before): a pod or lane
+  that cannot run the leg's image is released at once and the leg retries
+  unburned on the same billing. Its host and executor are marked bad for
+  24 h (a lane leaves the rotation) ONLY when the trainer itself measured the
+  pod's worker code as another release; a mismatch of the image env we
+  injected, our deployed config, or a probe that could not run is never
+  blamed on the host. A worker's own FINAL refusal counts only as exit 2
+  with the worker's stdout sentinel as its last line
+  (`contract.IMAGE_REFUSAL_SENTINEL`, printed before any miner code runs;
+  workers that predate it never trigger this path) — never from free text.
+  At most 2 such pods per leg (hotkey, role, era) per hour, counted in
+  `<work-root>/image_refusals.json` across restarts; then the leg waits
+  (`no_capacity`, requeued), so a miner is never billed repeatedly for our
+  image skew.
+- The runtime image probe reads what the worker will see: the host's
+  `static_env` (sourced into the worker's session), else `printenv` in a
+  plain ssh session (the worker runs in one, `remote.build_remote_command`).
+  A probe whose remote command fails (python, OOM, disk) is "unknown".
+- MarketCast legs of a post-switch era carry the era's `--contract-block`, so
+  they get the image check and the after-image config. Direct-MoE gangs
+  (`cascade/direct`) rent their own signed, qualified pod profiles and are not
+  touched by the `*_after` pins.
+- The bench-only king pod is rented under its era's contract.
+- A typed `[v2] image_decoupled_from_block` must be an era start. While the
+  DEC-CA-0045 rollover is still decided on chain it is checked on the
+  post-rollover grid (`[activation] epoch_blocks_after × era_settlements`).
+
+Gaps:
+- The provisioner still pins `CASCADE_TRAIN_IMAGE_DIGEST` on its pods from the
+  base `[training]` pin (pre-existing). Lanes for v2 legs should be rented pods
+  or hand-managed hosts.toml lanes.
+- An era-kept king pod is reused within one seed epoch. If the king must
+  retrain after the switch, the hook refuses the old pod; retire it.
+- Continuation for post-switch legs only, in the same step, is a follow-up:
+  `[round] ops_continuation_*` is global.
+
+### Enabling continuation after the switch (DEC-CA-0067)
+
+`continuation_protocol` is excluded from the numerics digest along with the
+image pin. Once the DEC-CA-0067 switch is in force, turning on mid-run backup
+checkpoints keeps the carried king and the finished legs. The trainer tries both
+protocol values ("" and `cascade-continuation/1`) automatically, so there is no
+list to maintain for this term. Before the switch it is a full contract change:
+legs are retrained and validators reject them. Do not arm it earlier.
+
+1. Wait until the switch era has started.
+2. In the deployed chain.toml:
+   - `[v2.training] continuation_protocol = "cascade-continuation/1"`;
+   - `[round] ops_continuation_image_digest` = the qualified worker image's
+     immutable digest (it must equal the running `CASCADE_TRAIN_IMAGE_DIGEST`,
+     or the worker refuses);
+   - `[round] ops_continuation_interval_seconds = 1800`;
+   - `[round] ops_continuation_max_bytes = 34359738368` (32 GiB; an rc16 leg
+     with its EMA snapshot is about 24 GB, and the default is 16 GiB).
+3. If the image changes in the same step, append the old pin to
+   `[v2] prior_train_image_digests` as in the re-pin runbook.
+4. Point the box-side snapshot mirror at the large volume. The orchestrator
+   mirrors to `<--work-root>/_continuations` (`cascade/trainer/runner_rolling.py`
+   `_dispatcher`). There is no separate flag, so either run the trainer with
+   `--work-root` on the large volume, or replace `_train_work/_continuations`
+   with a symlink to it while no leg is in flight. A dedicated
+   `--continuation-root` is a follow-up. The pod side writes to
+   `<host workdir>/_continuations/<job>` (`continuation_transport.py`); that is
+   set per host in hosts.toml.
+5. Restart with no legs in flight. Detached dispatch is required, and the
+   dispatcher refuses continuation unless a training contract declares the
+   protocol.
+
 ### GPU type
 
 The GPU type is chosen **per leg**: the trainer rents the cheapest fitting
@@ -2820,9 +3118,14 @@ integration qualification.
 
 ### V2 private evidence budget and pool rebuild
 
-The mainnet candidate sets `[v2] eval_n_windows = 4000`, applied only to
-settlements judging v2 eras. Trainer, validators and audit must share that
-configuration. The legacy single-horizon draw's 1,200-window target is not
+**Correction (DEC-CA-0067):** the mainnet chain.toml's `eval_n_windows = 4000`
+sits under `[round]`, where nothing reads it. It is a dead key: v2 settlements
+judge on `[eval] n_windows` (2000) until the DEC-CA-0067 switch. From the
+switch era, the bundled `[v2] eval_n_windows_after = 4000` is what moves the v2
+verdict budget to 4000. Do not move the dead key into `[v2]` by hand, because
+that would change the budget on one node only and fork it. `[v2] eval_n_windows`
+(parsed, 0 = off), when set, is applied only to settlements judging v2 eras.
+Trainer, validators and audit must share that configuration. The legacy single-horizon draw's 1,200-window target is not
 applied to that v2 budget. New pool builds default to 800/domain,
 400/domain-frequency, 32 maximum native channels and source-family clustering.
 Update any explicit 600/300 publish-cron flags; repository edits do not change

@@ -772,4 +772,91 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
             v2_from_block=_v2_from, lane_c_from_block=int(cfg.lane_c.from_block),
             validator_bench_from=(_bs if str(cfg.v2.bench_source) == "validator" else 0),
             owner_hotkey=str(cfg.netconfig.owner_hotkey or ""))
-    return cfg
+    # DEC-CA-0067 automatic image repin: the *_after pins are one release for
+    # the v2 contract; a measured-wall gate in force needs the after image's
+    # measured walls too (else every post-switch rent would be refused).
+    _idb = int(cfg.v2.image_decoupled_from_block)
+    if _idb:
+        # a typed switch is an ERA START at or after the v2 go-live (a
+        # resolved one is checked the same way by the activation apply)
+        _idb_grid = _ebp if (_eab and _ebp and _idb < _eab) else _eb
+        if not _eab and _act_grid_after and cfg.activation.feature:
+            # the DEC-CA-0045 rollover is decided on chain (block unknown
+            # here): the switch is necessarily past it, on the post-rollover
+            # grid (the pre-rollover era is a multiple of it)
+            _idb_grid = _act_grid_after
+        if _idb % (max(1, _idb_grid) * max(1, _era_settlements)):
+            raise ValueError(f"[v2] image_decoupled_from_block={_idb} is not an era start "
+                             f"(era = {max(1, _idb_grid) * max(1, _era_settlements)} blocks)")
+        if cfg.v2.from_block and _idb < int(cfg.v2.from_block):
+            raise ValueError(f"[v2] image_decoupled_from_block={_idb} precedes [v2] "
+                             f"from_block={cfg.v2.from_block}")
+    if cfg.v2.train_image_digest_after:
+        if cfg.training.v2_contract is None:
+            raise ValueError("[v2] train_image_digest_after needs a [v2.training] contract")
+        if (cfg.round.funded_sku_wall_measured_image
+                and not cfg.v2.funded_sku_wall_measured_image_after):
+            raise ValueError("[v2] funded_sku_wall_measured_image_after is required while "
+                             "[round] funded_sku_wall_measured_image gates rents")
+    check_image_decoupled_feature(cfg)
+    from .chain_config import bind_image_after
+
+    return bind_image_after(cfg)
+
+
+# DEC-CA-0067 fork guard mode. Set ONLY by the entry points of processes
+# that vote on or act on the v2b vote (cascade-validator, cascade-trainer,
+# cascade-audit) via :func:`require_vote_pin`: they REFUSE a config whose
+# pinned feature is missing or wrong. Every other process (train workers on
+# pods, the miner CLI, intake/funding, the provisioner, the satellite) logs
+# an ERROR and keeps working — it neither signals nor tallies the vote.
+_REQUIRE_VOTE_PIN = False
+
+
+def require_vote_pin(enabled: bool = True) -> None:
+    """Make :func:`check_image_decoupled_feature` refuse (raise) instead of
+    logging, for the rest of this process. Called first thing by the
+    validator, trainer and audit ``main``."""
+    global _REQUIRE_VOTE_PIN
+    _REQUIRE_VOTE_PIN = bool(enabled)
+
+
+def vote_pin_required() -> bool:
+    return _REQUIRE_VOTE_PIN
+
+
+def check_image_decoupled_feature(cfg) -> None:
+    """DEC-CA-0067 fork guard: the ``v2b-`` feature this config would vote on
+    must equal the PINNED ``[v2] image_decoupled_feature``. Its name hashes
+    ``eval_n_windows_after``, so a node whose chain.toml lacks (or changes)
+    that key would signal — and tally — a different feature, silently: the
+    trainer would never resolve the switch and validators would fork. Pinned
+    key required whenever the feature exists (``[activation]`` on, v2
+    scheduled); a pinned key is checked even when it does not."""
+    from ..activation import image_decoupled_feature, v2b_feature_name
+
+    pinned = str(getattr(cfg.v2, "image_decoupled_feature", "") or "")
+    spec = image_decoupled_feature(cfg)
+    want = (spec.name if spec is not None
+            else v2b_feature_name(int(cfg.v2.eval_n_windows_after or 0)))
+    why = ""
+    if spec is not None and not pinned:
+        why = (f"[v2] image_decoupled_feature is not pinned: this config votes on {want} "
+               f"([v2] eval_n_windows_after={int(cfg.v2.eval_n_windows_after or 0)}). Deploy the "
+               "release chain.toml values ([v2] eval_n_windows_after and "
+               "image_decoupled_feature)")
+    elif pinned and pinned != want:
+        why = (f"[v2] image_decoupled_feature = {pinned!r} but this config computes {want} "
+               f"([v2] eval_n_windows_after={int(cfg.v2.eval_n_windows_after or 0)}): it would "
+               "vote on a different DEC-CA-0067 feature than the fleet — fix "
+               "eval_n_windows_after to the release value")
+    if not why:
+        return
+    if _REQUIRE_VOTE_PIN:
+        raise ValueError(why + " — refusing to start (this process votes on or acts on the "
+                         "v2b vote)")
+    import logging
+
+    logging.getLogger("cascade.config").error(
+        "%s — continuing: this process neither signals nor tallies the vote, but the "
+        "validator / trainer / audit on this config will refuse to start", why)

@@ -58,8 +58,11 @@ def inspect_health(
     balances,
     cfg,
     gpu_blocked=None,
+    image_qualification=None,
 ):
-    """Pure condition evaluator; diagnostic ages never change settlement identity."""
+    """Pure condition evaluator; diagnostic ages never change settlement identity.
+    ``image_qualification``: the DEC-CA-0067 after-release condition
+    (``cascade.trainer.leg_pins.image_qualification_condition``), or None."""
     conditions = []
 
     def add(code, scope, **data):
@@ -124,6 +127,8 @@ def inspect_health(
             add("queue_backlog", lane, oldest_wait_seconds=round(age, 1), count=len(starts))
     for sku, until in (gpu_blocked or {}).items():
         add("gpu_type_cooldown", sku, until=until)
+    if image_qualification:
+        conditions.append(dict(image_qualification))
     return {
         "as_of": now,
         "block": current_block,
@@ -132,6 +137,18 @@ def inspect_health(
         "king_ready": bool(era is not None and getattr(era, "king_entry", None)),
         "gpu_blocked": gpu_blocked or {},
     }
+
+
+def _image_qualification_condition(runner):
+    """The after-release qualification condition; a check failure is itself
+    reported (never silently healthy)."""
+    try:
+        from .leg_pins import image_qualification_condition
+
+        return image_qualification_condition(runner.cfg)
+    except Exception as e:  # noqa: BLE001
+        return {"code": "image_after_unqualified", "scope": "image",
+                "reason": f"qualification check failed: {type(e).__name__}"}
 
 
 class OperatorMonitor:
@@ -294,6 +311,7 @@ class OperatorMonitor:
             balances=balances,
             cfg=runner.cfg.round,
             gpu_blocked=health_for(runner).blocked(),
+            image_qualification=_image_qualification_condition(runner),
         )
         # Money safety (2026-11-02): approvals pending, paused entries, the
         # operator breaker and every rent block — one alert per activation.

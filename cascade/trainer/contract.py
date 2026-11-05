@@ -91,6 +91,14 @@ TRAIN_IMAGE_DIGEST_ENV = "CASCADE_TRAIN_IMAGE_DIGEST"
 
 _SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}")
 
+# DEC-CA-0067 (owner rule "never the wrong image"): the ONE line a worker
+# prints on stdout, as its very last line, when assert_train_image refuses a
+# FINAL — written before any miner code has run, then the worker exits 2. The
+# orchestrator acts only on rc == 2 with this as the last stdout line, and
+# even then blames a host only on evidence it measures itself; no free text
+# (miner output, stderr tails) is ever matched.
+IMAGE_REFUSAL_SENTINEL = "@@CASCADE-WORKER-IMAGE-REFUSAL/1@@"
+
 
 class TrainImageMismatch(RuntimeError):
     """The runtime image does not satisfy ``[training] train_image_digest``."""

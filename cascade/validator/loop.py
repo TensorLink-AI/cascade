@@ -275,6 +275,10 @@ class ValidatorRunner(
     # persisted beside the others (``activation_prelaunch_burn_state.json``).
     _prelaunch: ActivationRecord = field(default_factory=ActivationRecord, repr=False)
     _prelaunch_tally: Tally | None = field(default=None, repr=False)
+    # DEC-CA-0067 image-decoupled contract + window budget decided on chain:
+    # its own record + tally (``activation_image_decoupled_state.json``).
+    _image_decoupled: ActivationRecord = field(default_factory=ActivationRecord, repr=False)
+    _image_decoupled_tally: Tally | None = field(default=None, repr=False)
     # Lane B (DEC-CA-0050): the domain-winner state (``<state_db>.lane_b.json``),
     # the store its expert manifests are read from, the settlement block of the
     # last judged manifest (the weight vector's decay clock), and the merged

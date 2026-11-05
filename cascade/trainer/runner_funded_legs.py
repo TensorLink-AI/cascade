@@ -191,11 +191,14 @@ class _FundedLegMixin:
                         return entry
                     except Exception as exc:
                         from .harvest_guard import keeps_pod, local_disk_error
+                        from .leg_pins import LegImageMismatch
 
                         verdict = self._funded_leg_failures.get(gen.hotkey)
                         local = self.__dict__["_leg_local_obj"]
                         # A pod KEPT after our disk failed is re-attached on
                         # the miner's own key: never flagged operator-billed.
+                        # DEC-CA-0067: an image refusal never moves the bill
+                        # either (only make-goods train on the operator account).
                         ours_kept = keeps_pod(exc) or local_disk_error(exc) is not None
                         # The leg body already decided (money safety II): a
                         # generic infra loss, a payer-side cause or an unproven
@@ -206,6 +209,7 @@ class _FundedLegMixin:
                         never_ours = verdict is not None and str(verdict[2] or "") in (
                             "infra", "payer_pod_lost", "payer_side")
                         if (local.funded_allocated and not ours_kept and not never_ours
+                                and not isinstance(exc, LegImageMismatch)
                                 and (verdict is None or not verdict[1])):
                             queue = self._funded_queue()
                             if queue is not None:
@@ -237,6 +241,9 @@ class _FundedLegMixin:
         runner = self
 
         class RecoveryDispatcher:
+            # DEC-CA-0067: the lane pool picks a lane on the leg's era image
+            host_hook = getattr(disp, "host_hook", None)
+
             def dispatch(self, host, **kw):
                 # MarketCast requires local-only even on an operator lane.
                 # Harvest under THIS specialist's scheduled contract, not the
@@ -317,6 +324,42 @@ class _FundedLegMixin:
         # A new leg: a verdict left by this hotkey's previous leg must never
         # be read back as this one's (leg_failure falls back to its default).
         self._funded_leg_failures.pop(gen.hotkey, None)
+        # DEC-CA-0067 owner rule: a post-switch leg never rents (nor builds its
+        # corpus) on an UNQUALIFIED after release — an operator fault, unburned,
+        # and the billing stays the payer's (the miner's pod did nothing wrong).
+        from .leg_pins import (
+            IMAGE_RETRY_CAP,
+            IMAGE_RETRY_WINDOW_S,
+            ImageAfterUnqualified,
+            ImageRetryCapped,
+            after_image_refusal,
+            contract_runs_after,
+            image_retry_exhausted,
+            leg_key,
+        )
+
+        key = leg_key(gen.hotkey, role, getattr(seeds, "base_seed", ""))
+        if contract_runs_after(self.cfg, contract) and image_retry_exhausted(self, key):
+            # owner rule: never the wrong image — and a miner is never billed
+            # over and over for OUR image skew: the leg WAITS (unburned,
+            # no_capacity, requeued), it is not dropped
+            msg = (f"{IMAGE_RETRY_CAP} pods could not run this leg's image within "
+                   f"{IMAGE_RETRY_WINDOW_S / 3600:.0f} h — waiting before another rent "
+                   "(operator image skew, never the miner's)")
+            log.error("funded leg %s: %s", gen.hotkey[:12], msg)
+            self._record_funded_failure(gen.hotkey, msg, miner_fault=False,
+                                        error_class="no_capacity", burn=False)
+            raise ImageRetryCapped(msg)
+
+        if contract_runs_after(self.cfg, contract):
+            why = after_image_refusal(self.cfg)
+            if why:
+                self._record_funded_failure(
+                    gen.hotkey, f"operator-side fault: after image not qualified — {why}",
+                    miner_fault=False, error_class=OPERATOR_FAULT_CLASS, burn=False)
+                log.error("funded leg %s: REFUSED — the post-switch after image is not "
+                          "qualified (%s)", gen.hotkey[:12], why)
+                raise ImageAfterUnqualified(f"after image not qualified (rent): {why}")
         # A previous attempt of THIS leg (same era seeds, ref, size, init)
         # trained and verified fine but lost its upload: re-upload the local
         # copy instead of renting and retraining.
@@ -404,10 +447,12 @@ class _FundedLegMixin:
             )
             trained = True
             if getattr(contract, "base_arch", "") in ("cascade_moe", "cascade_pyramid") and role != "mkt_finetune":
-                from ..shared.manifest import contract_digest
+                from .leg_pins import receipt_contract_ok
 
                 if (getattr(entry, "init_pointer", None) != (warm_start_ref or "")
-                        or getattr(entry, "training_contract_digest", "") != contract_digest(contract)):
+                        or not receipt_contract_ok(
+                            self.cfg, contract, getattr(entry, "training_contract_digest", ""),
+                            contract_block)):
                     raise _OperatorFault(
                         "worker receipt lacks or disagrees with the dispatched init/contract; "
                         "rebuild and repin the v2 worker image")
@@ -510,6 +555,9 @@ class _FundedLegMixin:
             self._record_funded_failure(gen.hotkey, f"operator-side fault: {e}",
                                         miner_fault=False, error_class=OPERATOR_FAULT_CLASS,
                                         burn=False)
+            # DEC-CA-0067: a wrong-image pod counts against the leg's image
+            # retry cap (host blamed only on measured code evidence)
+            _wrong_image_pod(self, key, host, pod, e)
             # box health (may halt every rent) + the bounded keep (F6)
             if handle_our_side_fault(self, gen, e, pod_id=str(getattr(pod, "instance_id", "") or ""), payer=True,
                                      trained=trained or _harvested_in_dispatch(self),
@@ -520,9 +568,8 @@ class _FundedLegMixin:
                 raise
             if keeps_pod(e):
                 raise                  # our harvest failed: never an operator make-good
-            queue = self._funded_queue()
-            if queue is not None:
-                queue.set_operator_billed(gen.hotkey, True)
+            # an image refusal (LegImageMismatch) keeps the leg's billing
+            bill_operator_after_fault(self, gen.hotkey, e)
             raise
         except _FundedDiverged as e:
             # The same verdict the worker's own rc=3 gives a non-finite loss
@@ -540,6 +587,21 @@ class _FundedLegMixin:
                                         kind="lost", reason=str(e))
             rc = getattr(e, "returncode", None)
             text = str(e)
+            from .leg_pins import contract_runs_after as _runs_after
+            from .leg_pins import worker_refused_image
+
+            if worker_refused_image(e) and _runs_after(self.cfg, contract):
+                # A post-switch leg's worker refused FINAL (exit 2 + its own
+                # stdout sentinel, before any corpus streaming or training).
+                # Released (finally below), unburned, billing unchanged,
+                # capped; the host is blamed only if OUR fingerprint probe
+                # of the pod shows another release (_wrong_image_pod).
+                refusal = _confirm_image_refusal(self, host, text)
+                self._record_funded_failure(
+                    gen.hotkey, f"operator-side fault: {refusal}", miner_fault=False,
+                    error_class=OPERATOR_FAULT_CLASS, burn=False)
+                _wrong_image_pod(self, key, host, pod, refusal)
+                raise refusal from e
             if "Host key verification failed" in text:
                 # The pinned host key did not match: a different container
                 # answered at the pod's address mid-leg.
@@ -1012,3 +1074,71 @@ def _funded_pod_benched_here(runner, bench: bool) -> bool:
     if getattr(local, "funded_is_king", False):
         return False
     return not bool(getattr(local, "validator_bench", False))
+
+
+def bill_operator_after_fault(runner, hotkey: str, exc: BaseException) -> bool:
+    """After an operator-side fault the leg's retry is operator-billed —
+    EXCEPT a DEC-CA-0067 image refusal (``LegImageMismatch``: the pod runs
+    another image than the leg's era pins, or the after release is not
+    qualified): the billing is left as it was (owner rule: only make-goods
+    train on the operator account; a payer-billed leg stays payer-billed, a
+    make-good stays one). Returns whether it flipped the billing."""
+    from .leg_pins import LegImageMismatch
+
+    if isinstance(exc, LegImageMismatch):
+        return False
+    queue = runner._funded_queue()
+    if queue is None:
+        return False
+    queue.set_operator_billed(hotkey, True)
+    return True
+
+
+def _confirm_image_refusal(runner, host, text: str):
+    """The LegImageMismatch for a worker's FINAL image refusal, with
+    ``code_evidence`` only when the trainer's own fresh fingerprint probe of
+    the pod shows another release than the leg's pin."""
+    from .leg_pins import (
+        LegImageMismatch,
+        LegImageUnverified,
+        host_code_fingerprint,
+        leg_round,
+    )
+    from .remote import RemoteDispatchError
+
+    want = str(leg_round(runner).worker_code_fingerprint or "").lower()
+    evidence = False
+    if want and host is not None:
+        try:
+            evidence = host_code_fingerprint(host, fresh=True) != want
+        except (RemoteDispatchError, LegImageUnverified):
+            evidence = False
+    return LegImageMismatch(
+        f"worker refused FINAL (image){' — pod code is another release' if evidence else ''}: "
+        f"{str(text)[-200:]}", code_evidence=evidence)
+
+
+def _wrong_image_pod(runner, key: str, host, pod, exc: BaseException) -> None:
+    """Owner rule: a pod the leg cannot use for its image counts against the
+    leg's retry cap; its host and executor are marked bad ONLY on measured
+    code evidence (never our injected env / config, never an unverified
+    probe, never an unqualified after release — our own config)."""
+    from .leg_pins import (
+        ImageAfterUnqualified,
+        ImageRetryCapped,
+        LegImageMismatch,
+        LegImageUnverified,
+        mark_wrong_image_host,
+        note_image_refusal,
+    )
+
+    if (not isinstance(exc, LegImageMismatch)
+            or isinstance(exc, (ImageAfterUnqualified, LegImageUnverified, ImageRetryCapped))):
+        return
+    if getattr(exc, "code_evidence", False):
+        try:
+            mark_wrong_image_host(runner, host, pod, str(exc))
+        except Exception as e:  # noqa: BLE001 — never mask the refusal
+            log.warning("wrong-image pod bookkeeping failed: %s", e)
+    note_image_refusal(runner, key)
+

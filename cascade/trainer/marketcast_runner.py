@@ -178,6 +178,20 @@ def mkt_leg_contract(cfg, base):
         guard_floor_seconds=int(getattr(rnd, "heat_guard_floor_seconds", 0) or 0))
 
 
+def mkt_contract_block_kw(cfg, era) -> dict:
+    """DEC-CA-0067: a MarketCast leg of an era past the automatic image repin
+    carries ``contract_block`` = the era start, so the dispatcher's image hook
+    checks the pod's worker code, pushes the post-switch chain.toml and the
+    worker resolves (and verifies) the after image — the rent already used the
+    era's pins (``funded_contract``). Any other leg: no key (byte-identical)."""
+    from ..shared.era import image_after_armed, image_decoupled_era
+
+    start = int(getattr(era, "start_block", 0) or 0)
+    if image_after_armed(cfg) and image_decoupled_era(cfg, start):
+        return {"contract_block": start}
+    return {}
+
+
 def train_mkt_leg(ops, leg: dict, recipe: MktLegRecipe) -> dict:  # pragma: no cover — pods
     """One MarketCast leg on the MINER's key through the lane-C funded path
     (``RunnerLaneCOps``): returns the driver's result dict, with the
@@ -204,6 +218,7 @@ def train_mkt_leg(ops, leg: dict, recipe: MktLegRecipe) -> dict:  # pragma: no c
             r._dispatcher(), gen, seeds, int(leg["started_block"]), contract,
             leg_suffix(leg["target"], int(leg["uid"])),
             warm_start_ref=r.cfg.marketcast.base_ref, era_index=era.index,
+            **mkt_contract_block_kw(r.cfg, era),
             role="mkt_finetune", finetune_recipe=recipe.to_json(), bench=False,
             funded_queue=ops.queue(),
             gpu_choice=GpuChoice(

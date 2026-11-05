@@ -143,6 +143,27 @@ def test_bench_scores_bench_annealed_dir_when_armed(cfg, monkeypatch):
     assert benched["role"] == "king-anneal-u7"
 
 
+def test_bench_anneal_carries_the_era_contract_block(cfg, monkeypatch):
+    """DEC-CA-0067 review: the anneal leg carries its duel's ``--contract-block``
+    so the dispatcher's image hook checks the pod's era image (and the worker
+    resolves that era's contract); without one, no flag (unchanged)."""
+    r = _runner(cfg, monkeypatch, 0.15)
+    host = RemoteHost(name="h", host="1.2.3.4")
+    seen: list = []
+
+    def _fake_dispatch(self, h, **kw):
+        seen.append(kw)
+        return _entry()
+
+    monkeypatch.setattr("cascade.trainer.remote.RemoteDispatcher.dispatch", _fake_dispatch)
+    monkeypatch.setattr("cascade.trainer.bench_hook.run_post_round_benchmark",
+                        lambda *a, **k: None)
+    r._remote_bench_scores(host, _entry(uid=7), "42", "toto2-4m", contract_block=86400)
+    r._remote_bench_scores(host, _entry(uid=7), "42", "toto2-4m")
+    assert seen[0]["contract_block"] == 86400
+    assert "contract_block" not in seen[1]
+
+
 def test_bench_falls_back_to_raw_checkpoint_on_anneal_failure(cfg, monkeypatch):
     r = _runner(cfg, monkeypatch, 0.15)
     host = RemoteHost(name="h", host="1.2.3.4")
