@@ -87,7 +87,8 @@ era's last settlement, so no era is judged under two rules.
 - **Bundle.** From the same block, a v2 settlement's private verdict budget is
   `[v2] eval_n_windows_after`, using the explicit-evidence verdict draw. Lane A,
   lane B, the trainer's lane-B self-judge and the audit replay all use it.
-  Mainnet ships 4000; testnet ships 0, so it keeps its small budget.
+  Mainnet ships 4000; testnet ships 300 (= its `[eval] n_windows`), so it
+  keeps its small budget.
   - Finding: the mainnet `eval_n_windows = 4000` that DEC-CA-0066 describes sits
     under `[round]`, not `[v2]`. No parser reads it there, so v2 settlements
     judge on `[eval] n_windows`.

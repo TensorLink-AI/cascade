@@ -242,6 +242,24 @@ chain.toml must carry `[v2] eval_n_windows_after = 4000`,
 The feature name hashes `eval_n_windows_after`, so a file without it would
 vote on `v2b-6bbd262b` and fork from the fleet.
 
+**Restarting a validator on this release is a vote.** With the pins in its
+chain.toml, a validator signals `v2b-150ec0d0` in its on-chain note from its
+first loop: there is no separate "release, then vote" step. Lock-in follows
+at 51 % of stake, and the switch is the first era start after the lock-in
+boundary. So:
+1. **Trainer first.** If lock-in happens while the trainer still runs older
+   code, every upgraded validator rejects every post-switch settlement
+   (`era_numerics_missing`). Restart the trainer on this release (no legs in
+   flight, not inside a validator scoring window) before any validator.
+2. **Then validators, timed to the seed epoch.** The switch must not start
+   inside a v2 seed epoch the reign still depends on. Hold validator restarts
+   until the lock-in boundary would put the switch at or after the epoch's
+   end (or ship a typed `[v2] image_decoupled_from_block` to everyone — a
+   consensus pin, no signal). From the switch the verdict budget goes from
+   `[eval] n_windows` to `eval_n_windows_after` with a new draw: check
+   validator RAM/CPU and the trainer's lane-B self-judge load first.
+3. Announce the release to the external validators only when 1 and 2 hold.
+
 What refuses and what keeps running on a file without them:
 - **Refuse to start:** `cascade-validator`, `cascade-satellite` (both signal
   and tally the vote), `cascade-trainer`, `cascade-audit` (they act on it);
