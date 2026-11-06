@@ -155,7 +155,7 @@ def test_knobs_round_trip_through_the_loader(tmp_path):
 
     cfg = load_chain_config(_with(tmp_path, image_decoupled_from_block=9403200,
                                   eval_n_windows_after=3000,
-                                  image_decoupled_feature=f'"{v2b_feature_name(3000)}"',
+                                  image_decoupled_feature=f'"{v2b_feature_name(3000, True)}"',
                                   prior_train_image_digests=f'["{OLD}", "repo@{NEW}"]'))
     assert cfg.v2.image_decoupled_from_block == 9403200
     assert cfg.v2.eval_n_windows_after == 3000
@@ -312,7 +312,8 @@ def test_feature_name_hashes_the_bundle_and_rides_the_note(vcfg):
     spec = A.image_decoupled_feature(vcfg)
     assert spec is not None and spec.decided_on_chain and spec.align == "epoch"
     assert re.fullmatch(r"v2b-[0-9a-f]{8}", spec.name)
-    assert spec.name == A.v2b_feature_name(4000) != A.v2b_feature_name(3000)
+    assert spec.name == A.v2b_feature_name(4000, True) != A.v2b_feature_name(3000, True)
+    assert spec.name != A.v2b_feature_name(4000)          # the knob is in the hash
     note = A.own_signal_payload(vcfg, A.ActivationRecord())
     assert note == f"cascade-ready:1:{PRIMARY}:0:0:{spec.name}:0:0"
     assert A.signal_for(note, spec.name) == A.ReadySignal(spec.name)
