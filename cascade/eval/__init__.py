@@ -17,6 +17,7 @@ from .crps import (
     geomean_wql_from_components,
     mwsql_components,
     mwsql_from_components,
+    pinball_components,
     wql_per_window,
 )
 from .koth import KothParams, RoundResult, evaluate_round, margin_for_tenure
@@ -27,6 +28,7 @@ from .scoring import (
     global_geomean,
     score_forecaster_on_windows,
     score_joint_forecaster_on_windows,
+    score_joint_quantile_forecaster_on_windows,
     stack_components,
 )
 from .window import EvalWindow
@@ -40,6 +42,7 @@ __all__ = [
     "DEFAULT_QUANTILE_LEVELS",
     "mwsql_components",
     "mwsql_from_components",
+    "pinball_components",
     "geomean_wql_from_components",
     "wql_per_window",
     "KothParams",
@@ -52,6 +55,7 @@ __all__ = [
     "adapt_per_channel",
     "score_forecaster_on_windows",
     "score_joint_forecaster_on_windows",
+    "score_joint_quantile_forecaster_on_windows",
     "stack_components",
     "EvalWindow",
 ]

@@ -53,6 +53,37 @@ def mwsql_components(
         raise ValueError("quantile_levels must lie in the open interval (0, 1)")
 
     q_preds = np.quantile(samples, qs, axis=1)            # (num_q, B, H)
+    return pinball_components(q_preds, obs, qs)
+
+
+def pinball_components(
+    q_preds: np.ndarray,
+    obs: np.ndarray,
+    quantile_levels: Sequence[float] = DEFAULT_QUANTILE_LEVELS,
+) -> tuple[np.ndarray, np.ndarray]:
+    """:func:`mwsql_components` from PREDICTED QUANTILES instead of samples —
+    the same ``(qloss_per_q, abs_target)`` tensors, the same arithmetic, for a
+    model that emits its quantiles directly (DEC-CA-0067 ``quantile_head_after``:
+    no Monte-Carlo step between the head and the pinball loss).
+
+    Args:
+        q_preds: shape ``(num_q, B, H)`` — the forecast quantile at each level
+            of ``quantile_levels``, in that order.
+        obs: shape ``(B, H)`` — ground-truth target per window.
+        quantile_levels: floats in (0, 1), one per leading row of ``q_preds``.
+    """
+    qs = np.asarray(quantile_levels, dtype=np.float64)
+    if qs.ndim != 1 or qs.size == 0:
+        raise ValueError(f"quantile_levels must be a non-empty 1-D sequence; got {qs.shape}")
+    if not np.all((qs > 0.0) & (qs < 1.0)):
+        raise ValueError("quantile_levels must lie in the open interval (0, 1)")
+    if q_preds.ndim != 3 or q_preds.shape[0] != qs.size:
+        raise ValueError(f"q_preds must be (num_q={qs.size}, B, H); got {q_preds.shape}")
+    if obs.shape != (q_preds.shape[1], q_preds.shape[2]):
+        raise ValueError(
+            f"obs shape {obs.shape} incompatible with q_preds {q_preds.shape}; "
+            f"expected ({q_preds.shape[1]}, {q_preds.shape[2]})"
+        )
     diff = obs[None, :, :] - q_preds                       # (num_q, B, H)
     q_b = qs[:, None, None]
     pinball = np.maximum(q_b * diff, (q_b - 1.0) * diff)   # (num_q, B, H)

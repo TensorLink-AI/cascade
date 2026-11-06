@@ -34,6 +34,7 @@ from .crps import (
     geomean_wql_from_components,
     mwsql_components,
     mwsql_from_components,
+    pinball_components,
     wql_per_window,
 )
 from .mase import mase as mase_one
@@ -56,6 +57,12 @@ ForecastFn = Callable[[np.ndarray, int, int], np.ndarray]
 # forecasts across the variate axis (DEC-CA-0026). At ``C = 1`` this is the
 # univariate contract with an extra leading axis.
 JointForecastFn = Callable[[np.ndarray, int, int], np.ndarray]
+
+# A JOINT QUANTILE forecaster (DEC-CA-0067 ``quantile_head_after``):
+# ``f(history_2d, horizon)`` with history ``(C, L)`` returning
+# ``(C, H, num_q)`` — the model's own quantiles at the scorer's grid, in grid
+# order. No sampling anywhere: the pinball loss reads the head directly.
+JointQuantileFn = Callable[[np.ndarray, int], np.ndarray]
 
 
 def adapt_per_channel(forecast_fn: ForecastFn) -> JointForecastFn:
@@ -193,6 +200,73 @@ def score_joint_forecaster_on_windows(
                 samples, tgt_c[None, :], quantile_levels=q_tuple
             )
             point = np.median(samples[0], axis=0)           # (H,)
+            m = mase_one(point, tgt_c, hist_c, period)
+            src = w.metadata.get("source")
+            out.append(
+                WindowScore(
+                    series_id=w.series_id,
+                    mase=m,
+                    qloss_per_q=qloss_per_q[0],
+                    abs_target=float(abs_target[0]),
+                    quantile_levels=q_tuple,
+                    channel=c,
+                    domain=str(w.metadata.get("domain", "") or ""),
+                    source=str(src) if src else None,
+                )
+            )
+    return out
+
+
+def score_joint_quantile_forecaster_on_windows(
+    quantile_fn: JointQuantileFn,
+    windows: list[EvalWindow],
+    quantile_levels: Sequence[float] = DEFAULT_QUANTILE_LEVELS,
+) -> list[WindowScore]:
+    """Score a joint ``(C, L)`` QUANTILE forecaster on each window — ONE call
+    per window, no Monte-Carlo step (DEC-CA-0067 ``quantile_head_after``).
+
+    ``quantile_fn(history_2d, horizon)`` returns ``(C, horizon, num_q)``: the
+    checkpoint's own forecast quantiles at ``quantile_levels``, in that order.
+    Each channel's quantiles produce one :class:`WindowScore` row of exactly
+    the shape the sample path produces — the pinball components come from
+    :func:`cascade.eval.crps.pinball_components` instead of empirical
+    quantiles of samples, and the MASE point forecast is the 0.5 quantile
+    (the sample path's median of samples), so the round statistic and the
+    paired bootstrap are unchanged. Non-finite or wrong-shape quantiles raise
+    ``ValueError`` — a deterministic fault of the checkpoint, never silently
+    scored.
+    """
+    q_tuple = tuple(float(q) for q in quantile_levels)
+    medians = [i for i, q in enumerate(q_tuple) if q == 0.5]
+    if len(medians) != 1:
+        raise ValueError("quantile_levels must contain the 0.5 level exactly once")
+    median_idx = medians[0]
+    out: list[WindowScore] = []
+    for w in windows:
+        history = np.asarray(w.history, dtype=np.float64)   # (C, L)
+        target = np.asarray(w.target, dtype=np.float64)     # (C, H)
+        n_channels = int(target.shape[0])
+        horizon = int(target.shape[-1])
+        period = _resolve_seasonal_period(w.metadata)
+        q_all = np.asarray(quantile_fn(history, horizon), dtype=np.float64)
+        if q_all.shape != (n_channels, horizon, len(q_tuple)):
+            raise ValueError(
+                f"quantile forecaster returned shape {q_all.shape}; "
+                f"expected ({n_channels}, {horizon}, {len(q_tuple)})"
+            )
+        for c in range(n_channels):
+            hist_c = history[c]                              # (L,)
+            tgt_c = target[c]                                # (H,)
+            q_c = q_all[c]                                   # (H, nq)
+            if not np.isfinite(q_c).all():
+                raise ValueError(
+                    f"quantile forecaster produced non-finite quantiles on window "
+                    f"{w.series_id!r} channel {c}"
+                )
+            qloss_per_q, abs_target = pinball_components(
+                q_c.T[:, None, :], tgt_c[None, :], quantile_levels=q_tuple
+            )
+            point = q_c[:, median_idx]                      # (H,)
             m = mase_one(point, tgt_c, hist_c, period)
             src = w.metadata.get("source")
             out.append(

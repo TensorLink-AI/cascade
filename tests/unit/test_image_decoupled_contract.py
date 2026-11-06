@@ -180,15 +180,19 @@ def test_knobs_refuse_bad_values(tmp_path, key, value):
 
 
 def test_shipped_configs_pin_the_feature_they_compute():
-    from cascade.shared.activation import v2b_feature_name
+    from cascade.shared.activation import v2b_feature_name, v2b_feature_name_for
 
-    for path, name in (("chain.toml", "v2b-90bc5237"), ("chain.testnet.toml", "v2b-3a259561")):
+    for path, name in (("chain.toml", "v2b-b10591aa"), ("chain.testnet.toml", "v2b-f2eefcb3")):
         cfg = load_chain_config(REPO / path)
         assert cfg.v2.image_decoupled_feature == name
-        assert v2b_feature_name(cfg.v2.eval_n_windows_after) == name
+        assert v2b_feature_name_for(cfg.v2) == name
+        assert v2b_feature_name(cfg.v2.eval_n_windows_after, cfg.v2.quantile_head_after) == name
+        # the knob is in the hash: dropping it would vote on another feature
+        assert v2b_feature_name(cfg.v2.eval_n_windows_after, False) != name
 
 
-def _deployed_style(tmp_path, drop=("eval_n_windows_after", "image_decoupled_feature")):
+def _deployed_style(tmp_path, drop=("eval_n_windows_after", "quantile_head_after",
+                                    "image_decoupled_feature")):
     """The release chain.toml as a deployment that predates the keys would
     carry it (the live mainnet file lacked eval_n_windows_after)."""
     text = (REPO / "chain.toml").read_text()
@@ -214,8 +218,12 @@ def test_deployed_config_missing_the_keys_refuses_to_load(tmp_path, voting):
 
 
 def test_missing_budget_with_the_release_pin_refuses(tmp_path, voting):
-    p = _deployed_style(tmp_path, drop=("eval_n_windows_after",))
+    p = _deployed_style(tmp_path, drop=("eval_n_windows_after", "quantile_head_after"))
     with pytest.raises(ValueError, match="computes v2b-80853b4a"):
+        load_chain_config(p)
+    # the quantile-head knob alone missing computes the pre-knob name
+    p = _deployed_style(tmp_path, drop=("quantile_head_after",))
+    with pytest.raises(ValueError, match="computes v2b-90bc5237"):
         load_chain_config(p)
 
 
@@ -813,7 +821,7 @@ def test_untyped_blocks_would_trim_the_v2b_segment(tmp_path):
     cfg = _untyped_blocks(tmp_path)
     rec, fr, mr = _live_records()
     why = A.v2b_note_problem(cfg, rec, fr, mr)
-    assert "TRIM" in why and "v2b-90bc5237" in why
+    assert "TRIM" in why and "v2b-b10591aa" in why
     assert A.v2b_note_problem(load_chain_config(REPO / "chain.toml"), rec,
                               head_block=9_420_000) == ""                  # typed: fits
     s = A.summary(cfg, rec, None, fr, None, mr)
@@ -831,7 +839,7 @@ def test_validator_refuses_to_start_when_its_note_would_trim_v2b(tmp_path):
     A.ActivationStore(tmp_path / "activation_margin_v2_state.json").save(mr)
     runner = ValidatorRunner(cfg=cfg, activation_store=A.ActivationStore(tmp_path / "act.json"))
     chain = SimpleNamespace(current_block=lambda: 9_400_000, hotkey_ss58=lambda: "v1")
-    with pytest.raises(RuntimeError, match="refusing to start.*v2b-90bc5237"):
+    with pytest.raises(RuntimeError, match="refusing to start.*v2b-b10591aa"):
         runner._activation_startup(chain)
 
 

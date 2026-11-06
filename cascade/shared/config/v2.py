@@ -111,8 +111,16 @@ class V2Config:
     # private verdict budget is this many windows (the explicit-evidence
     # verdict draw, exactly as ``eval_n_windows``). 0 = no change.
     eval_n_windows_after: int = 0
+    # DEC-CA-0067 bundle (CONSENSUS, part of the vote's hash when true): from
+    # the SAME switch era, a v2 settlement scores every checkpoint's QUANTILE
+    # HEAD directly — the pinball loss reads the wrapper's
+    # ``forecast_quantiles_batch`` at the scorer's grid, no copula sampling,
+    # no Monte-Carlo noise (the benchmark path's method). False = the sample
+    # path, byte-identical to before the knob existed.
+    quantile_head_after: bool = False
     # DEC-CA-0067 CONSENSUS guard: the ``v2b-<hash>`` feature name this node
-    # must compute (it hashes ``eval_n_windows_after``). Required while
+    # must compute (it hashes ``eval_n_windows_after`` and, when true,
+    # ``quantile_head_after``). Required while
     # ``[activation]`` is on and v2 is scheduled; the loader REFUSES the
     # config when it is absent or differs from the computed name, so two nodes
     # can never silently vote on different features (a deployed chain.toml
@@ -383,6 +391,10 @@ def parse_v2_economics(v2raw: dict) -> dict:
     if not isinstance(feat, str):
         raise ValueError(f"[v2] image_decoupled_feature must be a string; got {feat!r}")
     out["image_decoupled_feature"] = feat.strip()
+    qh = v2raw.get("quantile_head_after", False)
+    if not isinstance(qh, bool):
+        raise ValueError(f"[v2] quantile_head_after must be true/false; got {qh!r}")
+    out["quantile_head_after"] = qh
     out["prior_train_image_digests"] = _parse_prior_images(
         v2raw.get("prior_train_image_digests", []))
     out.update(parse_image_after(v2raw))

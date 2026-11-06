@@ -415,7 +415,8 @@ class ValidatorRunner(
         king_scores: list[WindowScore] = []
         _t0 = _time.perf_counter()
         for size in paired_sizes:
-            ks = self._evaluate(king_by_size[size], windows, self._training_for(manifest))
+            ks = self._evaluate(king_by_size[size], windows, self._training_for(manifest),
+                                block=self._epoch_start_block(manifest))
             king_scores += ks
             score_records.append(EntryScores(
                 role="king", size=size,
@@ -509,7 +510,8 @@ class ValidatorRunner(
             _t1 = _time.perf_counter()
             try:
                 for size in paired_sizes:
-                    cs = self._evaluate(by_size[size], windows, self._training_for(manifest))
+                    cs = self._evaluate(by_size[size], windows, self._training_for(manifest),
+                                        block=epoch_block)
                     chal_scores += cs
                     chal_records.append(EntryScores(
                         role="challenger", size=size,

@@ -139,8 +139,20 @@ class EvaluationMixin:
 
         return verdict_windows(self.cfg, window_source, round_seed, block=block)
 
+    def _quantile_head_at(self, block: int | None) -> bool:
+        """DEC-CA-0067 ``[v2] quantile_head_after``: whether the settlement at
+        boundary ``block`` scores the quantile head directly. ``None`` (a
+        caller without a boundary) = the sample path, as always."""
+        fn = getattr(self.cfg, "quantile_head_at", None)
+        return bool(fn(block)) if (fn is not None and block is not None) else False
+
     def _evaluate(self, entry: TrainedEntry, windows: list[EvalWindow],
-                  training=None) -> list[WindowScore]:
+                  training=None, *, block: int | None = None) -> list[WindowScore]:
+        """Score ``entry`` on ``windows``. ``block`` is the settlement boundary
+        the scoring rule is read at (``quantile_head_at``): the quantile-head
+        verdict from the v2b switch era on, else the sample path — the same
+        boundary the window budget is read at, so one era is never judged
+        under two rules."""
         if self.evaluate_fn is not None:
             return self.evaluate_fn(entry, windows)
         # Default path: fetch the checkpoint from the Hippius Hub registry and
@@ -156,31 +168,40 @@ class EvaluationMixin:
         training = self.cfg.training if training is None else training
         size = getattr(entry, "size", "") or training.arch_preset
         contract = training.contract_for(size)
+        quantile_head = self._quantile_head_at(block)
         private_host_fn = getattr(self, "private_eval_host_fn", None)
         workers = getattr(self, "private_eval_workers", 1)
         if private_host_fn is not None:
-            from ..eval.scoring import score_joint_forecaster_on_windows
+            from ..eval.crps import DEFAULT_QUANTILE_LEVELS
+            from ..eval.scoring import (
+                score_joint_forecaster_on_windows,
+                score_joint_quantile_forecaster_on_windows,
+            )
             from .eval_offload import PrivateEvalUnavailable, forecasts_via_host
 
             host = private_host_fn()
             if host is None:
                 raise PrivateEvalUnavailable("configured private evaluation GPU host is unavailable")
+            levels = DEFAULT_QUANTILE_LEVELS if quantile_head else None
             forecasts = forecasts_via_host(
                 host, dest, windows, contract=contract, num_samples=self.cfg.eval.num_samples,
-                workers=workers, timeout_s=self.private_eval_timeout_s)
+                workers=workers, timeout_s=self.private_eval_timeout_s, quantile_levels=levels)
             # Streamed one window at a time (validated in full first); the
             # downloaded samples file is released as soon as scoring ends.
             try:
-                samples = iter(forecasts)
+                arrays = iter(forecasts)
+                if quantile_head:
+                    return score_joint_quantile_forecaster_on_windows(
+                        lambda *_: next(arrays), windows, levels)
                 return score_joint_forecaster_on_windows(
-                    lambda *_: next(samples), windows, self.cfg.eval.num_samples)
+                    lambda *_: next(arrays), windows, self.cfg.eval.num_samples)
             finally:
                 close = getattr(forecasts, "close", None)
                 if callable(close):
                     close()
         return evaluate_checkpoint(
             dest, windows, num_samples=self.cfg.eval.num_samples, device=self.device,
-            contract=contract, workers=workers,
+            contract=contract, workers=workers, quantile_head=quantile_head,
         )
 
     @staticmethod
@@ -250,7 +271,8 @@ class EvaluationMixin:
             gen_ref="", trained_pointer=manifest.warm_start_ckpt,
             corpus_digest="", train_block=0, size=size,
         )
-        scores = self._evaluate(entry, windows, self._training_for(manifest))
+        scores = self._evaluate(entry, windows, self._training_for(manifest),
+                                block=self._epoch_start_block(manifest))
         score_records.append(EntryScores(
             role="baseline", size=size, hotkey=self.BASELINE_HOTKEY, uid=-1,
             scores=self._window_records(scores, manifest),
