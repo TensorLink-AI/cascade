@@ -346,6 +346,69 @@ Signed window scores now carry each window's `domain`
 lane-B verdicts can be replayed from a receipt alone
 (`cascade.eval.expert_lane.judge_expert_leg` over the paired signed scores).
 
+## Archetype-aware selection (`--archetype-steering`, cascade-pool/2)
+
+The forge tags every catalog entry with a statistical archetype
+(`stat_archetype`, twelve classes, re-assigned from fresh data on every sync;
+feeds without enough history are untagged) and ships `archetypes.json` next to
+`sources.yaml` with each archetype's benchmark reference share
+(`ref_share_daily_or_faster`, and `ref_share_by_bench` for GIFT-Eval, BOOM and
+TIME). The balanced picker can steer the pool's archetype mix toward those
+shares:
+
+    target_a = S × ref_share_a + (1 − S) × natural_share_a        S = --archetype-steering ∈ [0, 1]
+
+`natural_share` is the mix of the eligible candidates, so `S = 0` (the default)
+selects exactly the unsteered pool; `S = 1` matches the benchmark mix as far as
+supply and the caps allow. Untagged series form their own `unknown` bucket at
+its natural share — never traded away, never given an invented reference.
+
+Steering only changes **which source family is served next inside a pass** of
+the round-robin (the family whose head series' archetype is furthest under its
+target goes first). One series per family per pass, the per-domain and
+per-(domain, freq) caps, the capacity floor and the seeded rotation are all
+unchanged, and the family stays the scoring key. `--min-clusters N` refuses a
+pool with fewer distinct clusters than N, so steering can never buy its mix
+with less bootstrap breadth. Validators ignore the new `stat_archetype`
+metadata key and still apply their per-round jitter (DEC-CA-0032), which
+dilutes any builder-side share — one reason to prefer `S < 1`.
+
+**Overlap** (the forge team's `stat_clusters.alignment`):
+`Σ_a min(pool_share_a, ref_share_a)` over the tagged archetypes, pool shares in
+series over tagged series only; the unknown fraction is reported beside it,
+and the same number per benchmark from `ref_share_by_bench`.
+
+**Model file format.** The forge's `archetypes.json` (version 1, fitted
+2026-11-03) stores every per-archetype vector as a list aligned with its
+top-level `names` (`["A00", …, "A11"]`) and carries an integer `version`; the
+reader accepts that form, a dict keyed by archetype id, and a row list. The
+file also publishes the forge's own `pool_share` and `overlap`; the report
+recomputes their overlap with our formula and prints both (`forge published
+daily-or-faster 0.811; our formula on their pool_share 0.811`), so a formula
+drift between the two sides is visible without any data. A byte copy of the
+real file is the fixture `tests/fixtures/tsbench_forge_archetypes_v1.json`.
+
+**Dry run** — nothing written or published; the before numbers (`S = 0`) come
+from the same code and candidates as the after:
+
+    TSFORGE_DIR=./tsforge cascade-pool build --dry-run --steering-sweep 0,0.5,1 \
+        --sources tsbench_forge --selection balanced <the publish caps> --out /tmp/x
+
+or `workflow_dispatch` the publish-pool workflow with `archetype_dry_run =
+0,0.5,1` (report uploaded as an artifact). It prints, per S: overlap
+daily-or-faster and per benchmark, unknown fraction, chosen vs supply per
+archetype (and which archetypes are supply-limited at this pool size),
+clusters, per-domain counts and drops.
+
+**Provenance.** `provenance.json` (inside the signed tar) carries
+`builder_version = cascade-pool/2` and an `archetypes` block: model version and
+file hash, steering, the catalog's sha256, the per-cluster tags actually used
+(tags move between syncs), the chosen mix and the report. A `/1` snapshot is
+not byte-reproducible by this builder — that is what the version bump says.
+Switch steering on only for a FUTURE effective block (snapshots are
+future-effective), announce it to miners at that snapshot boundary, and keep
+the independent check of the forge's overlap recipe before shipping.
+
 ## The MarketCast pool (`--lane mkt`, DEC-CA-0064)
 
 Lane C has no pool of its own: the DEC-CA-0056 public-feed `pool_c` (and

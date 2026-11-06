@@ -139,6 +139,23 @@ MIN_CONTEXT = 256
 _TS_FALLBACK_FORMATS = ("%Y%m%d%H", "%Y %m %d %H %M", "%Y %m %d")
 
 
+def catalog_sha256(forge_dir: str | Path) -> str:
+    """sha256 of the catalog file as synced (``""`` when absent) — recorded in
+    pool provenance so a snapshot names the catalog (and its archetype tags)
+    it was built from."""
+    import hashlib
+
+    p = Path(forge_dir) / "sources.yaml"
+    return hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else ""
+
+
+def archetypes_path(forge_dir: str | Path) -> Path:
+    """Where the forge drops its archetype model next to the catalog."""
+    from ..archetypes import ARCHETYPES_FILE
+
+    return Path(forge_dir) / ARCHETYPES_FILE
+
+
 class TsbenchForgeSource:
     name = "tsbench_forge"
 
@@ -233,6 +250,9 @@ class TsbenchForgeSource:
                 continue
             domain = str(entry.get("domain", "unknown"))
             dgp_class = str(entry.get("dgp_class", ""))
+            # statistical archetype (forge tagger; re-assigned per sync) — the
+            # bucket archetype steering balances; empty = the "unknown" bucket
+            stat_archetype = str(entry.get("stat_archetype") or "").strip()
             # DEC-CA-0041 mv_channels contract (docs/EVAL_POOL.md): an ordered
             # list of value-columns within one (source, panel_row). Pack them to
             # (C, L) when armed; else project to the first (one univariate row).
@@ -261,7 +281,8 @@ class TsbenchForgeSource:
                     domain=domain,
                     seasonal_period=seasonal_period,
                     source=sid,
-                    attrs={"dgp_class": dgp_class, **panel_key, "source_family": families[str(sid)]},
+                    attrs={"dgp_class": dgp_class, **panel_key, "source_family": families[str(sid)],
+                           "stat_archetype": stat_archetype},
                 )
                 emitted += 1
 

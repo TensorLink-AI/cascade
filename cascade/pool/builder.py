@@ -49,7 +49,11 @@ import numpy as np
 from ..eval.seasonality import get_seasonality
 from .source import DataSource, FetchJson, HarvestContext, HarvestedSeries, HttpFetcher
 
-BUILDER_VERSION = "cascade-pool/1"
+# cascade-pool/2 (2026-11-04): archetype-aware selection — provenance.json carries
+# an ``archetypes`` block (model version, steering, catalog hash, tags used) and
+# PoolBuildConfig grew ``archetype_steering`` / ``min_clusters``; a /1 snapshot
+# cannot be rebuilt byte-identically by this builder, which is what the bump says.
+BUILDER_VERSION = "cascade-pool/2"
 SELECTION_MODES = ("first", "balanced")
 
 _SAFE_ID = re.compile(r"[^A-Za-z0-9._-]+")
@@ -67,6 +71,26 @@ UNLABELED_DOMAINS = frozenset({"", "unknown", "none"})
 
 class DomainFloorError(ValueError):
     """A pool build left some domain under ``min_series_per_domain``."""
+
+
+class ClusterFloorError(ValueError):
+    """The pool holds fewer scoring clusters than ``min_clusters`` allows."""
+
+
+def cluster_count(records: Iterable[SeriesRecord]) -> int:
+    """Distinct scoring clusters (``metadata.source``) in ``records``."""
+    return len({_source_key(r) for r in records})
+
+
+def check_cluster_floor(records: list[SeriesRecord], floor: int | None) -> None:
+    """Raise :class:`ClusterFloorError` when fewer than ``floor`` distinct
+    clusters remain — the breadth the KOTH bootstrap resamples over. Archetype
+    steering may never buy its mix with fewer clusters (2026-11-04)."""
+    if not floor:
+        return
+    n = cluster_count(records)
+    if n < int(floor):
+        raise ClusterFloorError(f"pool holds {n} scoring clusters < min_clusters={floor}")
 
 
 def check_domain_floor(per_domain: dict, floor: int | None) -> None:
@@ -128,6 +152,14 @@ class PoolBuildConfig:
     # the choice is reproducible from the published snapshot alone.
     selection: str = "first"
     selection_seed: str = ""
+    # Archetype steering (cascade.pool.archetypes): 0 = off (the unsteered
+    # pool, byte-identical in selection), 1 = match the benchmark reference
+    # shares as far as supply and the caps allow. Needs a model file; with
+    # none the value is recorded but nothing steers.
+    archetype_steering: float = 0.0
+    # Scoring-breadth floor: refuse a pool with fewer distinct clusters
+    # (source families) than this. None = no floor.
+    min_clusters: int | None = None
 
     @property
     def min_length(self) -> int:
@@ -266,6 +298,10 @@ def prepare_series(
     # without one; the sampler degrades to domain-level jitter only.
     if hs.attrs and hs.attrs.get("dgp_class"):
         metadata["dgp_class"] = str(hs.attrs["dgp_class"])
+    # Statistical archetype (tsbench-forge catalog ``stat_archetype``): the
+    # bucket archetype steering balances; absent = the "unknown" bucket.
+    if hs.attrs and hs.attrs.get("stat_archetype"):
+        metadata["stat_archetype"] = str(hs.attrs["stat_archetype"])
 
     values = cleaned.astype(np.float32)
     if values.shape[0] == 1:  # store univariate as 1-D; loader promotes to (1, L)
@@ -288,6 +324,7 @@ def collect_records(
     ctx: HarvestContext,
     cfg: PoolBuildConfig,
     fetch: FetchJson,
+    archetypes=None,
 ) -> tuple[list[SeriesRecord], Counter]:
     """Harvest from every source, clean/validate, dedup, and apply caps.
 
@@ -298,7 +335,7 @@ def collect_records(
     if cfg.selection not in SELECTION_MODES:
         raise ValueError(f"selection must be one of {SELECTION_MODES}; got {cfg.selection!r}")
     if cfg.selection == "balanced":
-        return _collect_balanced(sources, ctx, cfg, fetch)
+        return _collect_balanced(sources, ctx, cfg, fetch, archetypes=archetypes)
 
     records: list[SeriesRecord] = []
     drops: Counter = Counter()
@@ -374,6 +411,7 @@ def _collect_balanced(
     ctx: HarvestContext,
     cfg: PoolBuildConfig,
     fetch: FetchJson,
+    archetypes=None,
 ) -> tuple[list[SeriesRecord], Counter]:
     """``selection = "balanced"``: clean + dedup EVERYTHING, then deal capped
     slots round-robin across sources in a seeded order.
@@ -381,6 +419,19 @@ def _collect_balanced(
     Candidates are put in a canonical order first (sources by key, series by
     content hash), so the harvest order has no say — only the seed does.
     """
+    by_source, drops = gather_candidates(sources, ctx, cfg, fetch)
+    return select_balanced(by_source, cfg, drops, archetypes=archetypes)
+
+
+def gather_candidates(
+    sources: Iterable[DataSource],
+    ctx: HarvestContext,
+    cfg: PoolBuildConfig,
+    fetch: FetchJson,
+) -> tuple[dict[str, list[SeriesRecord]], Counter]:
+    """Harvest + clean + dedup every candidate, grouped by cluster key. The
+    expensive half of a balanced build; :func:`select_balanced` can then be
+    run several times (a steering sweep) over the same candidates."""
     drops: Counter = Counter()
     seen_hash: set[str] = set()
     by_source: dict[str, list[SeriesRecord]] = {}
@@ -395,7 +446,37 @@ def _collect_balanced(
                 continue
             seen_hash.add(rec.content_hash)
             by_source.setdefault(_source_key(rec), []).append(rec)
+    return by_source, drops
 
+
+def eligible_archetype_counts(by_source: dict[str, list[SeriesRecord]]) -> Counter:
+    """Supply per archetype bucket among the deduplicated candidates."""
+    from .archetypes import archetype_of
+
+    return Counter(archetype_of(r.metadata) for recs in by_source.values() for r in recs)
+
+
+def select_balanced(
+    by_source: dict[str, list[SeriesRecord]],
+    cfg: PoolBuildConfig,
+    drops: Counter | None = None,
+    *,
+    archetypes=None,
+) -> tuple[list[SeriesRecord], Counter]:
+    """Deal the capped slots round-robin across clusters in the seeded order.
+
+    With ``cfg.archetype_steering > 0`` and an :class:`ArchetypeModel`, each
+    pass serves first the clusters whose head series' archetype is furthest
+    below its target share (``steering_targets``); the pass still takes at
+    most one series per cluster, so rotation, caps and floors are unchanged.
+    At 0 the pass order is the seeded order exactly (byte-identical pools).
+    """
+    from .archetypes import archetype_of, steering_targets
+
+    drops = Counter() if drops is None else drops
+    steer = float(cfg.archetype_steering or 0.0) if archetypes is not None else 0.0
+    targets = (steering_targets(eligible_archetype_counts(by_source), archetypes, steer)
+               if steer > 0 else None)
     rng = seeded_rng(cfg.selection_seed, "sources")
     keys = sorted(by_source)
     order = [keys[i] for i in rng.permutation(len(keys))]
@@ -408,10 +489,25 @@ def _collect_balanced(
     chosen: list[SeriesRecord] = []
     per_domain: Counter = Counter()
     per_cell: Counter = Counter()
+    per_arch: Counter = Counter()
     progressed = True
     while progressed:
         progressed = False
-        for k in order:
+        pass_order = order
+        if targets is not None:
+            # deficit of a cluster = how far its head series' archetype sits
+            # under its target share right now (on the first pass: the target
+            # itself); largest deficit served first, ties (and the unsteered
+            # case) keep the seeded order
+            n = max(1, len(chosen))
+            deficit = {}
+            for k in order:
+                if queues[k]:
+                    a = archetype_of(queues[k][0].metadata)
+                    deficit[k] = targets.get(a, 0.0) - per_arch[a] / n
+            pass_order = sorted((k for k in order if queues[k]),
+                                key=lambda k: -deficit[k])
+        for k in pass_order:
             q = queues[k]
             if not q:
                 continue
@@ -437,6 +533,7 @@ def _collect_balanced(
             chosen.append(rec)
             per_domain[rec.domain] += 1
             per_cell[cell] += 1
+            per_arch[archetype_of(rec.metadata)] += 1
             progressed = True
 
     # Id disambiguation over a canonical order, so it is seed- and
@@ -469,6 +566,9 @@ def write_pool(
     cfg: PoolBuildConfig,
     drops: Counter | None = None,
     overwrite: bool = False,
+    archetypes=None,
+    archetype_report: dict | None = None,
+    catalog_sha256: str = "",
 ) -> BuildSummary:
     """Write records to ``out_dir`` in the validator-pool layout.
 
@@ -511,10 +611,34 @@ def write_pool(
         per_domain=dict(per_domain),
         dropped=dict(drops or {}),
     )
+    from .archetypes import TAG_KEY, UNKNOWN, archetype_of
+
+    # Archetype provenance (cascade-pool/2): the model version and file hash,
+    # the catalog hash and the tag of every chosen cluster AS USED — the forge
+    # re-assigns tags from fresh data, so the snapshot must say which tags it
+    # was built from, not just which model.
+    tags_used: dict[str, str] = {}
+    for rec in records:
+        tag = str(rec.metadata.get(TAG_KEY) or "")
+        if tag:
+            tags_used[_source_key(rec)] = tag
+    arch_counts = Counter(archetype_of(r.metadata) for r in records)
     provenance = {
         "builder_version": BUILDER_VERSION,
         "config": asdict(cfg),
         "summary": asdict(summary),
+        "archetypes": {
+            "model_version": getattr(archetypes, "version", None),
+            "model_fitted": getattr(archetypes, "fitted", "") or None,
+            "model_sha256": getattr(archetypes, "sha256", "") or None,
+            "steering": float(cfg.archetype_steering or 0.0),
+            "catalog_sha256": catalog_sha256 or None,
+            "n_clusters": cluster_count(records),
+            "by_archetype": dict(sorted(arch_counts.items())),
+            "unknown_series": int(arch_counts.get(UNKNOWN, 0)),
+            "tags_used": dict(sorted(tags_used.items())),
+            "report": archetype_report,
+        },
     }
     (dest / "provenance.json").write_text(
         json.dumps(provenance, indent=2, sort_keys=True), encoding="utf-8"
@@ -530,13 +654,65 @@ def build_pool(
     *,
     fetch: FetchJson | None = None,
     overwrite: bool = False,
+    archetypes=None,
+    catalog_sha256: str = "",
 ) -> BuildSummary:
     """Harvest → clean/validate → dedup → write. The one-call entry point."""
     fetch = fetch or HttpFetcher()
-    records, drops = collect_records(sources, ctx, cfg, fetch)
+    report = None
+    if cfg.selection == "balanced":
+        # gather once; the report needs the eligible (pre-cap) supply too
+        from .archetypes import archetype_of, archetype_report
+
+        by_source, drops = gather_candidates(sources, ctx, cfg, fetch)
+        records, drops = select_balanced(by_source, cfg, drops, archetypes=archetypes)
+        report = archetype_report(Counter(archetype_of(r.metadata) for r in records),
+                                  eligible_archetype_counts(by_source), archetypes,
+                                  steering=float(cfg.archetype_steering or 0.0),
+                                  n_sources=cluster_count(records), n_series=len(records))
+    else:
+        records, drops = collect_records(sources, ctx, cfg, fetch)
     from collections import Counter as _Counter
 
     check_domain_floor(_Counter(r.domain for r in records), cfg.min_series_per_domain)
+    check_cluster_floor(records, cfg.min_clusters)
     return write_pool(
-        records, out_dir, as_of=ctx.as_of.isoformat(), cfg=cfg, drops=drops, overwrite=overwrite
+        records, out_dir, as_of=ctx.as_of.isoformat(), cfg=cfg, drops=drops, overwrite=overwrite,
+        archetypes=archetypes, archetype_report=report, catalog_sha256=catalog_sha256,
     )
+
+
+def steering_sweep(
+    sources: Iterable[DataSource],
+    ctx: HarvestContext,
+    cfg: PoolBuildConfig,
+    *,
+    archetypes,
+    steerings: Iterable[float] = (0.0, 0.5, 1.0),
+    fetch: FetchJson | None = None,
+) -> list[dict]:
+    """DRY RUN: gather the candidates once, select at each steering value and
+    return one :func:`archetype_report` per value (plus per-domain counts,
+    drops and the cluster count). Nothing is written. The "before" numbers
+    (S = 0) come from the same code and the same candidates as the "after"."""
+    from dataclasses import replace
+
+    from .archetypes import archetype_of, archetype_report
+
+    fetch = fetch or HttpFetcher()
+    base = replace(cfg, selection="balanced")
+    by_source, drops0 = gather_candidates(sources, ctx, base, fetch)
+    supply = eligible_archetype_counts(by_source)
+    out: list[dict] = []
+    for s in steerings:
+        c = replace(base, archetype_steering=float(s))
+        queues = {k: list(v) for k, v in by_source.items()}
+        records, drops = select_balanced(queues, c, Counter(drops0), archetypes=archetypes)
+        rep = archetype_report(Counter(archetype_of(r.metadata) for r in records), supply,
+                               archetypes, steering=float(s), n_sources=cluster_count(records),
+                               n_series=len(records))
+        rep["per_domain"] = dict(sorted(Counter(r.domain for r in records).items()))
+        rep["dropped"] = dict(sorted(drops.items()))
+        rep["series_ids"] = [r.series_id for r in records]
+        out.append(rep)
+    return out
