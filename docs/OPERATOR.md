@@ -242,7 +242,7 @@ chain.toml must carry `[v2] eval_n_windows_after = 4000`,
 `[scoring] forfeit_from_block = 9166500` / `margin_v2_from_block = 9194400`.
 The feature name hashes `eval_n_windows_after` and `quantile_head_after`, so
 a file missing either would vote on another name (`v2b-80853b4a` without
-both, `v2b-b10591aa` without the quantile-head knob) and fork from the fleet.
+both, `v2b-90bc5237` without the quantile-head knob) and fork from the fleet.
 
 **What the bundle switches (all at the same era start).** The image-decoupled
 per-leg contract rule, the 4000-window verdict budget, and the quantile-head

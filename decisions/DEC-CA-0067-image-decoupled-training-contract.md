@@ -229,6 +229,23 @@ and a 100-sample forward where one would do.
 - **Not a model change.** The pyramid wrapper and model bytes are untouched;
   `base_arch_digest` and the checkpoint guard are unchanged. Carried king
   checkpoints are scored by their quantile head as they stand.
+- **Multichannel windows.** `forecast_quantiles_batch` runs the channels as
+  independent batch items (the benchmark path's per-variate convention),
+  where the sample path's `forecast_joint` conditioned across channels. Every
+  private window is univariate today, so nothing changes; should the pool
+  ever carry C>1 windows, the head path scores them channel by channel — the
+  same on every validator (no fork), stated here so it is a known choice.
+  Changing the wrapper to a joint quantile call would be a wrapper-bytes
+  (checkpoint-guard) change and is not part of this item.
+- **Trainer parity.** The trainer's lane-B self-judge and its merge-acceptance
+  pre-check (`RunnerLaneBOps.judge` / `merge_scores`) read the same rule at
+  the same boundary, so the manifest the trainer publishes is judged as the
+  fleet will judge it. Miner-local tooling (`cascade score` / `iterate`, the
+  direct runtime, calibration) keeps the sample path: it is not consensus and
+  differs from the live verdict by the Monte-Carlo residual only.
+- **Non-finite head.** The wrapper refuses a non-finite quantile tensor; the
+  evaluator surfaces that as `EvaluatorError` (`quantile_head_forward_failed`),
+  a deterministic entry fault, never an endless settlement retry.
 - **Comparability.** Scores on the two paths differ by the Monte-Carlo
   residual only; the first switch-era settlement is not compared with a
   pre-switch one in absolute terms anyway (new seeds, forced king retrain).

@@ -98,9 +98,12 @@ def load_quantile_forecaster(
     forecaster ``f(history_2d, horizon) -> (C, H, num_q)`` at ``quantile_levels``
     (DEC-CA-0067 ``quantile_head_after``): the wrapper's
     ``forecast_quantiles_batch(histories, horizon) -> (B, H, num_q_head)`` is
-    called once per window with the channels as the batch — the same
-    per-channel forward the sample path runs on a univariate window — and the
-    scorer's grid is picked out of the head's ``quantile_levels`` by exact
+    called once per window with the channels as the batch — on a univariate
+    window (every private window today) the same forward the sample path
+    runs; a multichannel window is scored channel by channel, the benchmark
+    path's convention, where the sample path's ``forecast_joint`` conditioned
+    across channels — and the scorer's grid is picked out of the head's
+    ``quantile_levels`` by exact
     match (nothing interpolated). Runs the same ingest guard as
     :func:`load_forecaster`. A wrapper without a quantile head, or whose head
     lacks a grid level, raises :class:`EvaluatorError` (``quantile_head_
@@ -120,7 +123,14 @@ def load_quantile_forecaster(
 
     def quantile_fn(history: np.ndarray, horizon: int) -> np.ndarray:
         hist = np.atleast_2d(np.asarray(history, dtype=np.float64))
-        arr = np.asarray(batch_fn(list(hist), int(horizon)), dtype=np.float64)
+        try:
+            arr = np.asarray(batch_fn(list(hist), int(horizon)), dtype=np.float64)
+        except Exception as e:  # noqa: BLE001 — the wrapper's own refusal (e.g. a
+            # non-finite head) is deterministic for these bytes: an entry fault,
+            # never an endless retry. (An out-of-memory text stays transient:
+            # EvaluationMixin._entry_fault_reason reads it.)
+            raise EvaluatorError(
+                f"quantile_head_forward_failed: {type(e).__name__}: {e}") from e
         expect = (int(hist.shape[0]), int(horizon))
         if arr.ndim != 3 or arr.shape[:2] != expect:
             raise EvaluatorError(

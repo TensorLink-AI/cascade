@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from dataclasses import replace
 from pathlib import Path
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -221,7 +221,6 @@ def test_evaluate_reads_the_rule_at_the_settlement_boundary(switched, monkeypatc
     monkeypatch.setattr(ev, "evaluate_checkpoint", fake_evaluate)
     runner = SimpleNamespace(evaluate_fn=None, _fetch_checkpoint_dir=lambda _: tmp_path,
                              cfg=cfg, device="cpu")
-    runner._quantile_head_at = MethodType(EvaluationMixin._quantile_head_at, runner)
     entry = SimpleNamespace(size=cfg.training.arch_preset)
     training = cfg.training
     EvaluationMixin._evaluate(runner, entry, [], training, block=switch)

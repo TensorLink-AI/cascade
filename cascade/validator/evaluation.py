@@ -139,13 +139,6 @@ class EvaluationMixin:
 
         return verdict_windows(self.cfg, window_source, round_seed, block=block)
 
-    def _quantile_head_at(self, block: int | None) -> bool:
-        """DEC-CA-0067 ``[v2] quantile_head_after``: whether the settlement at
-        boundary ``block`` scores the quantile head directly. ``None`` (a
-        caller without a boundary) = the sample path, as always."""
-        fn = getattr(self.cfg, "quantile_head_at", None)
-        return bool(fn(block)) if (fn is not None and block is not None) else False
-
     def _evaluate(self, entry: TrainedEntry, windows: list[EvalWindow],
                   training=None, *, block: int | None = None) -> list[WindowScore]:
         """Score ``entry`` on ``windows``. ``block`` is the settlement boundary
@@ -168,7 +161,11 @@ class EvaluationMixin:
         training = self.cfg.training if training is None else training
         size = getattr(entry, "size", "") or training.arch_preset
         contract = training.contract_for(size)
-        quantile_head = self._quantile_head_at(block)
+        # DEC-CA-0067 ``[v2] quantile_head_after``: the settlement at boundary
+        # ``block`` scores the quantile head directly; ``None`` (a caller
+        # without a boundary) = the sample path, as always.
+        rule = getattr(self.cfg, "quantile_head_at", None)
+        quantile_head = bool(rule(block)) if (rule is not None and block is not None) else False
         private_host_fn = getattr(self, "private_eval_host_fn", None)
         workers = getattr(self, "private_eval_workers", 1)
         if private_host_fn is not None:

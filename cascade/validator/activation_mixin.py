@@ -259,9 +259,12 @@ class ActivationMixin:
             return False
         self.cfg = new_cfg
         log.warning("activation: DEC-CA-0067 image-decoupled contract ARMED at block %d — "
-                    "v2 settlements of eras from it gate legs on numerics_contract_digest "
-                    "and draw %s verdict windows", new_cfg.v2.image_decoupled_from_block,
-                    int(new_cfg.v2.eval_n_windows_after or 0) or "the unchanged count of")
+                    "v2 settlements of eras from it gate legs on numerics_contract_digest, "
+                    "draw %s verdict windows and score the %s",
+                    new_cfg.v2.image_decoupled_from_block,
+                    int(new_cfg.v2.eval_n_windows_after or 0) or "the unchanged count of",
+                    "quantile head directly" if getattr(new_cfg.v2, "quantile_head_after", False)
+                    else "sample path as before")
         return True
 
     def _image_decoupled_step(self, client: object, *, now_block: int) -> None:
