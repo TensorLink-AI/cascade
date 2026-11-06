@@ -16,10 +16,11 @@ def acceptance_seed(block: int, base: str) -> str:
 def acceptance_block(cfg, manifest, runner=None):
     """A seed epoch retains its original init even across activation eras.
 
-    DEC-CA-0067 rule 2: a v2b switch era opens a seed epoch but keeps the
-    running init (and its merges), so the block is the INIT epoch's start —
-    known to a validator ``runner`` (its ``_init_epoch_start``) and equal to
-    the seed epoch's start without an applied switch (unchanged then)."""
+    DEC-CA-0067: the block is the INIT epoch's start as a validator ``runner``
+    knows it (its ``_init_epoch_start``). Under rule ``image-decoupled/3`` a
+    v2b switch opens no seed epoch, so that is the seed epoch's start too; the
+    runner path is kept from ``/2`` (switch era = new seeds, same init) and is
+    byte-identical without an applied switch."""
     from ..shared.era import EraSpec, era_length_blocks, image_decoupled_from
 
     era = EraSpec.from_json(manifest.era)

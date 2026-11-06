@@ -783,9 +783,10 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
         manifest fields and the numerics stale rule key off exactly the block
         every validator applies, so the trainer never stamps them early (the
         block is 0 until this resolves) and a lock-in always lands a full era
-        before its switch era starts (``align="epoch"``): that era opens a v2
-        seed epoch (DEC-CA-0067 rule 2), so its king leg and seeds are
-        prepared — in the era before it — already under the switch."""
+        before its switch era starts (``align="epoch"``): that era is prepared
+        — in the era before it — already under the switch (its legs' image
+        pin, its manifests' numerics stamps). The running seed epoch
+        continues across it (DEC-CA-0067 rule 2, ``image-decoupled/3``)."""
         from ..shared.activation import (
             ActivationRecord,
             ActivationStore,

@@ -373,11 +373,11 @@ def activation_block_for(round_cfg: Any, lock_block: int, align: str = "boundary
     new — the clean restart point. ``align="era"`` (DEC-CA-0049): the first
     ERA START strictly after ``lock_block`` instead, so a decision never
     lands mid-era (a lock-in exactly on an era start takes the next one).
-    ``align="epoch"`` (DEC-CA-0067 rule 2): the era start TWO eras after the
+    ``align="epoch"`` (DEC-CA-0067): the era start TWO eras after the
     lock-in boundary's era (:func:`cascade.shared.era.min_effective_era`, the
-    notice a v2 promotion gets) — the switch era opens a seed epoch, so the
-    trainer must learn of it before that era's king pre-train window opens
-    (which happens inside the era before it)."""
+    notice a v2 promotion gets) — the trainer prepares an era (its legs' image
+    pin, its manifests' stamps) inside the era before it, so it must have
+    applied the switch by then."""
     if align == "epoch":
         from .era import min_effective_era
 
@@ -420,7 +420,7 @@ class FeatureSpec:
     # DEC-CA-0048 forfeiture); "era" = the next ERA START (DEC-CA-0049 bar
     # v2 — every settlement of one era is judged under one bar); "epoch" =
     # the era start two eras after the lock-in boundary's era (DEC-CA-0067
-    # v2b: that era opens a seed epoch, given a promotion's era of notice).
+    # v2b: a promotion's era of notice, so the trainer prepares that era under it).
     align: str = "boundary"
 
     @property
@@ -645,18 +645,20 @@ def apply_prelaunch_burn_activation(cfg: ChainConfig, block: int) -> ChainConfig
 # DEC-CA-0067 consensus bundle "v2b": the image-decoupled contract rule (its
 # rule version + the image/runtime field list) and the bundled v2 verdict
 # window budget. The params ARE the feature: a changed bundle is a fresh vote.
-# Rule /2 (rule 2, "the v2b switch era opens a seed epoch"): the switch takes
-# effect two eras after the lock-in boundary's era and that era starts a v2
-# seed epoch (:func:`cascade.shared.era.v2_seed_epoch_start`) — /1 could
-# switch inside a running epoch (the 2026-11-01 mid-epoch repin class).
+# Rule /3 (rule 2 as amended 2026-11-06): the switch takes effect two eras
+# after the lock-in boundary's era and KEEPS the running seed epoch — the
+# carried king and the finished legs pass the decoupled check (numerics digest
+# + proven runtime terms), so nothing retrains. /2 made that era open a seed
+# epoch (new seeds, a forced king retrain) and was never signalled; /1 could
+# switch inside a running epoch with the full-digest check still in force.
 # ``quantile_head_after`` (the quantile-head verdict, DEC-CA-0067 bundle
 # item 3) joins the body ONLY when true, so a config without it computes the
 # very same name as before the knob existed.
-V2B_RULE = "image-decoupled/2"
+V2B_RULE = "image-decoupled/3"
 
 
 def v2b_feature_name(eval_n_windows_after: int, quantile_head_after: bool = False) -> str:
-    """``v2b-<sha256("image-decoupled/2|<fields>|eval_n_windows_after=<n>"
+    """``v2b-<sha256("image-decoupled/3|<fields>|eval_n_windows_after=<n>"
     [+ "|quantile_head_after=1"])[:8]>``. Kept short on purpose: the note is
     ONE 128-byte commitment field shared with every other segment
     (:data:`NOTE_MAX_BYTES`)."""
@@ -695,12 +697,13 @@ def image_decoupled_feature(cfg: ChainConfig) -> FeatureSpec | None:
     signals it at startup; ``typed_block`` = the typed ``[v2]
     image_decoupled_from_block`` (the override — nothing is signalled). Takes
     effect at the era start two eras after the lock-in boundary's era
-    (``align="epoch"``), and that era OPENS A V2 SEED EPOCH (DEC-CA-0067 rule
-    2, :func:`cascade.shared.era.v2b_switch_era`): the contract rule never
-    changes inside an epoch, whenever a promotion does or does not fire.
-    ``None`` = activation off or no v2 schedule (a typed block is then the
-    only way; any era start at or after the v2 go-live is legal for it, since
-    the switch era itself starts an epoch)."""
+    (``align="epoch"``, a promotion's notice: the trainer prepares that era
+    in the era before it). The running seed epoch continues across it
+    (DEC-CA-0067 rule 2 as ``image-decoupled/3``,
+    :func:`cascade.shared.era.v2b_switch_era`): the carried king and finished
+    legs pass the decoupled check, nothing retrains. ``None`` = activation off
+    or no v2 schedule (a typed block is then the only way; any era start at
+    or after the v2 go-live is legal for it)."""
     v2 = getattr(cfg, "v2", None)
     if not cfg.activation.enabled or v2 is None or not (
             int(getattr(v2, "from_block", 0) or 0) or getattr(v2, "launch_at_utc", "")):
@@ -731,13 +734,13 @@ def stamp_typed_image_decoupled(cfg: ChainConfig, record: ActivationRecord,
 
 def v2b_typed_notice_problem(cfg: ChainConfig, record: ActivationRecord | None,
                              now_block: int) -> str:
-    """Why a TYPED v2b switch gives too little notice, or "" (DEC-CA-0067 rule
-    2). The switch era opens a seed epoch, so — exactly like the vote
-    (``align="epoch"``) — it must lie at or after the era start two eras after
-    the era the switch was FIRST loaded in (``record.lock_block`` from
-    :func:`stamp_typed_image_decoupled`, else ``now_block``): the trainer
-    prepares that era's king leg and seeds in the era before it, and every
-    validator must run the same typed value by then. Once the switch era has
+    """Why a TYPED v2b switch gives too little notice, or "" (DEC-CA-0067).
+    Exactly like the vote (``align="epoch"``) it must lie at or after the era
+    start two eras after the era the switch was FIRST loaded in
+    (``record.lock_block`` from :func:`stamp_typed_image_decoupled`, else
+    ``now_block``): the trainer prepares that era — its legs' image pin, its
+    manifests' numerics stamps — in the era before it, and every validator
+    must run the same typed value by then. Once the switch era has
     started there is nothing left to give notice for (""), and a node that
     passed once never re-judges itself (the first-seen block persists). Not
     checkable at load (the loader has no chain head): the validator and the
@@ -756,9 +759,10 @@ def v2b_typed_notice_problem(cfg: ChainConfig, record: ActivationRecord | None,
         return ""
     return (f"[v2] image_decoupled_from_block = {typed} gives too little notice: first loaded "
             f"at block {seen}, the earliest switch era it may name is {need} (two eras after "
-            "that block's era — the switch era opens a v2 seed epoch, DEC-CA-0067 rule 2). "
-            f"Type an era start >= {need} on EVERY validator and the trainer before that "
-            "era's pre-train window, or leave it 0 and let the vote decide")
+            "that block's era — the vote's notice, DEC-CA-0067: the trainer prepares the "
+            f"switch era in the era before it). Type an era start >= {need} on EVERY "
+            "validator and the trainer before that era's pre-train window, or leave it 0 "
+            "and let the vote decide")
 
 
 def apply_image_decoupled_activation(cfg: ChainConfig, block: int) -> ChainConfig:
@@ -766,7 +770,8 @@ def apply_image_decoupled_activation(cfg: ChainConfig, block: int) -> ChainConfi
     at rollover ``block`` (the era start two eras after the lock-in boundary's
     era): ``[v2] image_decoupled_from_block`` = that block — which also switches
     ``eval_n_windows_after`` in (:func:`cascade.shared.era.v2_eval_windows_at`)
-    and opens a v2 seed epoch there (:func:`cascade.shared.era.v2b_switch_era`).
+    and the quantile-head verdict; the running seed epoch continues
+    (:func:`cascade.shared.era.v2b_switch_era`).
     A typed block is returned unchanged (the owner override); a block already
     applied is idempotent; a different block after lock-in raises (one-way);
     a block that is not an era start raises."""

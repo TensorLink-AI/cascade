@@ -93,22 +93,23 @@ era's last settlement, so no era is judged under two rules.
     under `[round]`, not `[v2]`. No parser reads it there, so v2 settlements
     judge on `[eval] n_windows`.
 
-## Activation: stake majority, then a seed-epoch-opening era start
+## Activation: stake majority, then an era start two eras later
 
 This is the DEC-CA-0045 secondary-feature path, aligned to eras like
 DEC-CA-0049.
 
 - **Feature.** The name is
-  `v2b-<sha256("image-decoupled/2|train_image_digest,continuation_protocol|eval_n_windows_after=<n>[|quantile_head_after=1]")[:8]>`
-  (mainnet: `v2b-b10591aa` with the quantile-head item, bundle item 3 below;
-  `v2b-90bc5237` without it). It is short because of the note budget below.
-  A changed bundle is a fresh vote.
+  `v2b-<sha256("image-decoupled/3|train_image_digest,continuation_protocol|eval_n_windows_after=<n>[|quantile_head_after=1]")[:8]>`
+  (mainnet: `v2b-69630f92` with the quantile-head item, bundle item 3 below;
+  `v2b-1abeaeb4` without it; testnet `v2b-c1ffa858`). It is short because of
+  the note budget below. A changed bundle is a fresh vote.
 - **Signal.** Validators on this release add the segment to their note at startup
   whenever `[activation]` is on and v2 is scheduled.
 - **Lock-in.** It locks in at the first boundary where `[activation] threshold` of
   eligible stake has signalled. The switch is the era start TWO eras after the
   lock-in boundary's era (`align="epoch"`, the notice a v2 promotion gets:
-  `min_effective_era`), and that era opens a v2 seed epoch (rule 2 below).
+  `min_effective_era`); the running seed epoch continues across it (rule 2
+  below).
 - **Persistence.** The record lives in `activation_image_decoupled_state.json`
   and is one-way. A late node adopts the block from the notes
   (`agreed_activation`).
@@ -118,68 +119,75 @@ DEC-CA-0049.
 - **Trainer.** The trainer resolves the same feature read-only, with the same
   resolver, the same as-of-boundary reads and the same notes, and never signals.
   It cannot stamp early, because the block is 0 until it resolves. A lock-in
-  always lands a full era before its switch era starts, so the switch era's
-  seeds and king leg are prepared under it.
+  always lands a full era before its switch era starts, so the switch era is
+  prepared under it: its legs are pinned to the after image and its manifests
+  carry the numerics stamps.
 
-## Rule 2: the v2b switch era opens a seed epoch (`image-decoupled/2`)
+## Rule 2: the v2b switch keeps the running seed epoch (`image-decoupled/3`)
 
-A contract rule that changes inside a running seed epoch breaks consensus: the
-epoch's carried king leg and finished legs were checked under the old rule
-(the 2026-11-01 mid-epoch image repin made every validator reject
-king-pointer / entry contracts). Seed-epoch starts are not on a fixed grid —
-they follow promotions — and promotion state is off-chain and seen by nodes at
-different times, so the switch cannot WAIT for an epoch start. Instead:
+Amended 2026-11-06, before any validator signalled. `/2` made the switch era
+OPEN a seed epoch — new seeds, the same init, a forced king retrain — on the
+argument that a contract rule changing inside a running epoch breaks
+consensus (the 2026-11-01 mid-epoch image repin). That argument was wrong for
+this switch: the Nov 1 break was a `contract_digest` CHANGE under the
+full-digest check, and rule 1 is precisely what makes a pre-switch entry valid
+under the post-switch check. The decision whose purpose is "stop retraining
+the king when the image changes" must not start by retraining the king, on
+the king's own key, for a change the king did not make.
 
-- **The applied switch era IS a seed-epoch start.** `v2_seed_epoch_start`
-  counts `v2b_switch_era(cfg)` (the era of `[v2] image_decoupled_from_block`,
-  typed or resolved) as an epoch start beside the first v2 era and the
-  promotion effective eras. It is derived from config alone, so it is the same
-  on every node. Every era from it uses the switch era's seed block until the
-  next promotion opens its own epoch. A promotion landing ON the switch era is
-  one epoch.
-- **Same init, new seeds, forced king retrain.** No promotion is implied.
-  `v2_init_epoch_start` (the warm-start-only rule) still names the init
-  epoch: the ledger init, the validator's `epoch_init` check, the trainer's
-  lane-B merged init (reused with `apply_pending=False`) and the lane-B
-  acceptance block all key on it. The king's pointer is held per SEED epoch,
-  so the king trains a fresh leg at the switch era (no carry), and the init
-  bench / random-init pointer is redone for the new seed block.
-- **Notice.** The vote takes effect two eras after the lock-in era, so the
-  trainer prepares the switch era (its pre-train window opens in the era
-  before) already under the switch; a prepared next era the switch moved is
-  discarded and re-prepared.
+- **The switch changes the check, not the epoch.** `v2_seed_epoch_start`
+  ignores the switch (`v2b_switch_era(cfg)` remains the era the new check
+  takes effect). Seed epochs begin only at the first v2 era and at promotion
+  effective eras — exactly DEC-CA-0055. Same seeds, same init, same king
+  pointer across the switch; `v2_init_epoch_start` equals it.
+- **The king and the finished legs carry.** At the first post-switch
+  settlement the trainer stamps `numerics_contract_digest` on the carried
+  king entry and on every finished leg (`_build_manifest`) and proves their
+  runtime terms from the pre-switch pins (`leg_pins.proven_runtime_terms`);
+  validators check numerics + proven terms (`era_gate`) instead of the full
+  digest. The train-block window `[seed_block, era end)` is unchanged because
+  the seed block is. No king leg, no init-pointer rebuild, no discarded
+  prepared era, no make-good.
+- **Why it is sound.** A pre-switch entry's numerics digest equals the era's
+  (only the image/runtime terms may differ), so it is bit-for-bit the model
+  the full-digest check accepted; the bundle's scoring changes (window budget,
+  quantile head) apply to king and challenger alike at every post-switch
+  settlement. v1 KOTH judged a king from an earlier round against challengers
+  of a later one for months.
+- **Notice (unchanged).** The vote takes effect two eras after the lock-in
+  era (`align="epoch"`), so the trainer has applied the switch before it
+  prepares the first post-switch era — the after-image pin for its legs, the
+  lane hook, the manifest stamps — and every validator runs the release
+  before the switch era (an old validator rejects every post-switch manifest,
+  `signature_invalid` on the new keys).
 - **Owner override.** Any typed era start at or after `[v2] from_block` is
-  legal on the grid (the loader's existing check): it opens its own epoch.
-  It must give the vote's NOTICE too: at least the era start two eras after
-  the era the node FIRST loaded it in (`v2b_typed_notice_problem`). The loader
-  has no chain head, so the validator (and satellite) and the trainer check
-  it at startup and REFUSE to start on a short notice. The first-seen block
-  is persisted in `activation_image_decoupled_state.json` (`lock_block` of
-  the `config` record), so a node that started fine never refuses itself as
-  blocks advance; once the switch era has started there is nothing to check.
-  Every validator and the trainer must deploy the SAME typed value before
-  the switch era's pre-train window (the era before it); a node that loads
-  it later refuses until the switch era starts.
-- **Restarts.** The trainer reconciles its prepared eras against the applied
-  switch on every tick (a restart included): a persisted next era still in
-  the old epoch is discarded and re-prepared; the running era never is.
+  legal on the grid (the loader's existing check). It must give the vote's
+  NOTICE too: at least the era start two eras after the era the node FIRST
+  loaded it in (`v2b_typed_notice_problem`). The loader has no chain head, so
+  the validator (and satellite) and the trainer check it at startup and
+  REFUSE to start on a short notice. The first-seen block is persisted in
+  `activation_image_decoupled_state.json` (`lock_block` of the `config`
+  record), so a node that started fine never refuses itself as blocks
+  advance; once the switch era has started there is nothing to check. Every
+  validator and the trainer must deploy the SAME typed value before the
+  switch era's pre-train window (the era before it); a node that loads it
+  later refuses until the switch era starts.
+- **Restarts.** `_reconcile_prepared_epoch` stays as the safety net for a
+  prepared era whose seed epoch moved (and `_discard_prepared_era` keeps the
+  make-good rule below); the switch itself never moves one.
 - **Miner money.** A leg still training for a discarded prepared era is our
   loss, never the miner's: recorded for the owner's make-good review
   (`make_good_review.jsonl` + a WARNING naming the payer and the attempt) and
   requeued unburned (`operator_blocked`) when it ends, whatever its outcome.
-- **Who pays the forced retrain.** The switch era's king leg is an ordinary
-  epoch-start king leg: under `king_ladder` it trains on the king's own key,
-  falling back to the operator with the key slash exactly as for any epoch
-  start. Inside the random-init window only the init POINTER is unchanged
-  (random init): the random weights re-derive from the new seeds, so the
-  random-init checkpoint is rebuilt and re-benched for the new seed block.
-- **Audit.** `_epoch_start_for_seed` accepts the switch era as a start and
-  rejects an era at or after it that names an older seed block.
-- **Fresh vote.** The rule version is `image-decoupled/2`: mainnet
-  `v2b-90bc5237`, testnet `v2b-3a259561` (was `v2b-150ec0d0` / `v2b-c74823cc`;
-  never signalled — #410 was not deployed). Superseded again by bundle item 3
-  below before any external validator signalled: mainnet `v2b-b10591aa`,
-  testnet `v2b-f2eefcb3`.
+- **Audit.** `_epoch_start_for_seed` is the plain DEC-CA-0055 shape rule; an
+  era at or after the switch names the running epoch's seed block.
+- **Fresh vote.** The rule version is `image-decoupled/3`: mainnet
+  `v2b-69630f92`, testnet `v2b-c1ffa858` (a file without `quantile_head_after`
+  computes `v2b-1abeaeb4` / `v2b-c31c2c8e`; without both knobs
+  `v2b-1e520694`). History, none ever signalled by an external validator:
+  `/1` `v2b-150ec0d0` / `v2b-c74823cc` (#410 not deployed); `/2`
+  `v2b-90bc5237` / `v2b-3a259561`, then with bundle item 3 `v2b-b10591aa` /
+  `v2b-f2eefcb3` (0/9 validators at every boundary through 2026-11-06).
 
 ## Bundle item 3: the quantile-head verdict (`[v2] quantile_head_after`)
 
@@ -247,8 +255,8 @@ and a 100-sample forward where one would do.
   evaluator surfaces that as `EvaluatorError` (`quantile_head_forward_failed`),
   a deterministic entry fault, never an endless settlement retry.
 - **Comparability.** Scores on the two paths differ by the Monte-Carlo
-  residual only; the first switch-era settlement is not compared with a
-  pre-switch one in absolute terms anyway (new seeds, forced king retrain).
+  residual only; the carried king and the epoch's legs are scored on the same
+  path at every post-switch settlement, so no duel mixes the two.
 - **Receipts.** `eval_context.num_samples` keeps recording `[eval]
   num_samples`; the scoring rule is a function of the receipt's boundary
   (`cfg.quantile_head_at(epoch_start_block)`), so the signed body needs no
@@ -515,11 +523,11 @@ Lane handling:
    deploys the release `chain.toml` values: the typed `[scoring]
    forfeit_from_block = 9166500` / `margin_v2_from_block = 9194400`, `[v2]
    eval_n_windows_after = 4000`, `[v2] quantile_head_after = true` and `[v2]
-   image_decoupled_feature = "v2b-b10591aa"`. The main validator's and the
+   image_decoupled_feature = "v2b-69630f92"`. The main validator's and the
    trainer's live files are edited by hand.
    **Fork guard:** the feature name hashes `eval_n_windows_after` and
-   `quantile_head_after`; a file without them computes `v2b-80853b4a` (or
-   `v2b-90bc5237` without the quantile-head knob) and would signal and tally another
+   `quantile_head_after`; a file without them computes `v2b-1e520694` (or
+   `v2b-1abeaeb4` without the quantile-head knob) and would signal and tally another
    feature, silently. The loader therefore refuses to start any node whose
    computed name differs from the pinned `image_decoupled_feature`, or whose
    pin is absent while `[activation]` is on and v2 is scheduled.

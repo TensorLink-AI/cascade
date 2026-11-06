@@ -408,12 +408,16 @@ def v2_era_active(cfg: Any, era_start: int | None) -> bool:
 
 
 def v2b_switch_era(cfg: Any) -> int | None:
-    """CONSENSUS (DEC-CA-0067 rule 2, "the v2b switch era opens a seed
-    epoch"): the era index of the APPLIED image-decoupled switch (``[v2]
-    image_decoupled_from_block``, typed or resolved from the ``v2b-`` vote),
-    or ``None`` when it is unset or not an era start (the loader and
-    :func:`cascade.shared.activation.apply_image_decoupled_activation` refuse
-    both). Derived from config alone, so it is the same on every node."""
+    """CONSENSUS (DEC-CA-0067): the era index of the APPLIED image-decoupled
+    switch (``[v2] image_decoupled_from_block``, typed or resolved from the
+    ``v2b-`` vote), or ``None`` when it is unset or not an era start (the
+    loader and :func:`cascade.shared.activation.apply_image_decoupled_activation`
+    refuse both). Derived from config alone, so it is the same on every node.
+    Rule 2 (``image-decoupled/3``): the switch era changes the CHECK a v2
+    settlement's entries pass (numerics digest + proven runtime terms instead
+    of the full contract digest) and nothing else — it does NOT open a seed
+    epoch (``/2`` did, forcing a king retrain the decoupled check makes
+    unnecessary)."""
     n = image_decoupled_from(cfg)
     if n <= 0 or n % era_length_blocks(cfg.round, n):
         return None
@@ -425,8 +429,8 @@ def v2_init_epoch_start(cfg: Any, era_index: int, warm_eras: Iterable[int]) -> i
     ``era_index`` — the first v2 era (random init) or the latest v2-lineage
     promotion's ``effective_era`` (``warm_eras``) at or before it — or ``None``
     pre-v2. The init (and any lane-B merge into it) changes only here. Equal
-    to :func:`v2_seed_epoch_start` except across a DEC-CA-0067 switch era,
-    which opens a seed epoch but keeps the running init."""
+    to :func:`v2_seed_epoch_start` (kept apart by name: ``/2`` let a v2b
+    switch open a seed epoch while keeping the init; ``/3`` does not)."""
     first = v2_first_era(cfg)
     if first is None or int(era_index) < first:
         return None
@@ -443,19 +447,14 @@ def v2_seed_epoch_start(cfg: Any, era_index: int, warm_eras: Iterable[int]) -> i
     epoch trained with the same seeds and init, so its checkpoint is the
     king's leg for the rest of it.
 
-    DEC-CA-0067 rule 2: the applied v2b switch era (:func:`v2b_switch_era`)
-    ALSO opens a seed epoch — a fresh seed set and a forced king retrain under
-    the new contract rule, with the running init kept
-    (:func:`v2_init_epoch_start`) — so the rule never changes inside an epoch.
-    A promotion landing on the switch era is one epoch, not two. Without an
-    applied switch the result is exactly the warm-start rule."""
-    start = v2_init_epoch_start(cfg, era_index, warm_eras)
-    if start is None:
-        return None
-    switch = v2b_switch_era(cfg)
-    if switch is not None and start < switch <= int(era_index):
-        return switch
-    return start
+    DEC-CA-0067 rule 2 (``image-decoupled/3``): the applied v2b switch era
+    (:func:`v2b_switch_era`) does NOT open a seed epoch. The epoch's carried
+    king entry and finished legs are judged under the decoupled check from the
+    switch on (their numerics digest equals the era's; their runtime terms are
+    proven from the pre-switch pins), so nothing retrains and the seeds stay.
+    ``/2`` opened a seed epoch here (new seeds, a forced king retrain) and was
+    never signalled; the epoch rule is exactly DEC-CA-0055's."""
+    return v2_init_epoch_start(cfg, era_index, warm_eras)
 
 
 def v2_era_seed_block(cfg: Any, era: EraSpec, warm_eras: Iterable[int]) -> int:

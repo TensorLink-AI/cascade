@@ -238,11 +238,11 @@ FINAL whose runtime image differs from the pin.
 **Deploying this release: the chain.toml values first.** Every deployed
 chain.toml must carry `[v2] eval_n_windows_after = 4000`,
 `[v2] quantile_head_after = true`,
-`[v2] image_decoupled_feature = "v2b-b10591aa"`, and the typed
+`[v2] image_decoupled_feature = "v2b-69630f92"`, and the typed
 `[scoring] forfeit_from_block = 9166500` / `margin_v2_from_block = 9194400`.
 The feature name hashes `eval_n_windows_after` and `quantile_head_after`, so
-a file missing either would vote on another name (`v2b-80853b4a` without
-both, `v2b-90bc5237` without the quantile-head knob) and fork from the fleet.
+a file missing either would vote on another name (`v2b-1e520694` without
+both, `v2b-1abeaeb4` without the quantile-head knob) and fork from the fleet.
 
 **What the bundle switches (all at the same era start).** The image-decoupled
 per-leg contract rule, the 4000-window verdict budget, and the quantile-head
@@ -254,28 +254,29 @@ release on that host too — an older worker refuses the quantile request and
 the round holds until it is upgraded (never a silent fallback to samples).
 
 **Restarting a validator on this release is a vote.** With the pins in its
-chain.toml, a validator signals `v2b-b10591aa` in its on-chain note from its
+chain.toml, a validator signals `v2b-69630f92` in its on-chain note from its
 first loop: there is no separate "release, then vote" step. Lock-in follows
 at 51 % of stake, and the switch is the era start two eras after the lock-in
-boundary's era — an era that opens a v2 seed epoch (new seeds, a forced king
-retrain, the same init; DEC-CA-0067 rule 2). A TYPED `[v2]
-image_decoupled_from_block` must give the same notice (an era start at least
-two eras after the era the node first loads it in) and must be deployed to
-every validator and the trainer before the switch era's pre-train window: a
-node that loads it later refuses to start (`too little notice`) until the
-switch era begins. So:
+boundary's era. The running v2 seed epoch CONTINUES across it (DEC-CA-0067
+rule 2 as `image-decoupled/3`): same seeds, same init, the carried king and
+the finished legs pass the decoupled check — no king leg, no init-pointer
+rebuild, nothing discarded. A TYPED `[v2] image_decoupled_from_block` must
+give the same notice (an era start at least two eras after the era the node
+first loads it in) and must be deployed to every validator and the trainer
+before the switch era's pre-train window: a node that loads it later refuses
+to start (`too little notice`) until the switch era begins. So:
 1. **Trainer first.** If lock-in happens while the trainer still runs older
    code, every upgraded validator rejects every post-switch settlement
    (`era_numerics_missing`). Restart the trainer on this release (no legs in
    flight, not inside a validator scoring window) before any validator.
-2. **Then validators, timed to the seed epoch.** The switch must not start
-   inside a v2 seed epoch the reign still depends on. Hold validator restarts
-   until the lock-in boundary would put the switch at or after the epoch's
-   end (or ship a typed `[v2] image_decoupled_from_block` to everyone — a
-   consensus pin, no signal). From the switch the verdict budget goes from
-   `[eval] n_windows` to `eval_n_windows_after` with a new draw: check
-   validator RAM/CPU and the trainer's lane-B self-judge load first.
+2. **Then validators, any time outside their own scoring window.** The
+   switch does not touch the seed epoch, so there is nothing to time it to.
+   From the switch the verdict budget goes from `[eval] n_windows` to
+   `eval_n_windows_after` with a new draw: check validator RAM/CPU and the
+   trainer's lane-B self-judge load first.
 3. Announce the release to the external validators only when 1 and 2 hold.
+   Every validator must run it before the switch era: one still on the old
+   release rejects every post-switch settlement (`signature_invalid`).
 
 What refuses and what keeps running on a file without them:
 - **Refuse to start:** `cascade-validator`, `cascade-satellite` (both signal
@@ -299,8 +300,8 @@ What refuses and what keeps running on a file without them:
 **Note byte budget: the two ways to free room for `v2b-`.** The commitment
 field is 128 bytes. The main validator's live note today is 124 B
 (`cascade-ready:1:rolling-era-king:0:0:forfeit-42b1a486:9165600:9166500:margin-v2-d30eb443:9190800:9194400:prelaunch-95-r2:0:0`);
-`:v2b-b10591aa:0:0` adds 17 B, and the locked segment
-(`:v2b-b10591aa:<lock>:<switch>`) adds 29 B. The owner picks one of these
+`:v2b-69630f92:0:0` adds 17 B, and the locked segment
+(`:v2b-69630f92:<lock>:<switch>`) adds 29 B. The owner picks one of these
 (Approve-tier, chain.toml edits on every deployed copy):
 
 - **(a) type the decided forfeit / margin-v2 blocks** (required on mainnet):
@@ -351,7 +352,7 @@ Steps (Approve-tier; snapshot each file first):
    print(image_decoupled_feature(c))"
    ```
 
-   It must print `v2b-b10591aa` and raise nothing.
+   It must print `v2b-69630f92` and raise nothing.
 3. Only then restart, one service at a time (validator, trainer, audit,
    intake, provisioner, satellite), and check each log for the startup line
    and no `image_decoupled_feature` ERROR.
