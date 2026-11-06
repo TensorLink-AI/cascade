@@ -259,7 +259,7 @@ def checked(env, monkeypatch):
                                        king_since_block=gate + era, king_pointer=KP),
                     reign_start=gate)
         r._fetch_bench_report = lambda rid, **k: report
-        r._evaluate = lambda entry, windows, training: []
+        r._evaluate = lambda entry, windows, training, **_: []
         return r
     return cfg, gate, era, b, make, pool
 
