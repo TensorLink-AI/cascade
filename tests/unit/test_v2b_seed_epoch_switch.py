@@ -352,7 +352,14 @@ def test_audit_epoch_shape_accepts_the_switch_and_rejects_a_seed_across_it(base)
     assert _epoch_start_for_seed(on, replace(e, seed_block=(warm + 1) * era)) is None
     # unchanged without a switch
     assert _epoch_start_for_seed(cfg, replace(e, seed_block=(first - 1) * era)) == first
-    assert _epoch_start_for_seed(cfg, replace(e, seed_block=(sw - 1) * era)) is None
+    # (era sw is past the random-init window: without a switch it is still a
+    # legal warm-start SHAPE — whether a promotion fired is the record's to show)
+    assert _epoch_start_for_seed(cfg, replace(e, seed_block=(sw - 1) * era)) == sw
+    # ...but inside the random-init window only the switch makes it legal
+    early = _switch(cfg, first + 3, era)
+    e3 = era_for_block(cfg.round, (first + 5) * era)
+    assert _epoch_start_for_seed(cfg, replace(e3, seed_block=(first + 2) * era)) is None
+    assert _epoch_start_for_seed(early, replace(e3, seed_block=(first + 2) * era)) == first + 3
     # a promotion after the switch is still legal
     e2 = era_for_block(cfg.round, (sw + 9) * era)
     assert _epoch_start_for_seed(on, replace(e2, seed_block=(sw + 4) * era)) == sw + 5
