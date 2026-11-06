@@ -253,20 +253,20 @@ def test_every_validator_scoring_site_passes_its_boundary():
 def test_knob_is_in_the_bundle_hash_and_round_trips_the_loader(tmp_path):
     cfg = load_chain_config(ROOT / "chain.toml")
     assert cfg.v2.quantile_head_after is True
-    assert cfg.v2.image_decoupled_feature == A.v2b_feature_name_for(cfg.v2) == "v2b-b10591aa"
+    assert cfg.v2.image_decoupled_feature == A.v2b_feature_name_for(cfg.v2) == "v2b-69630f92"
     spec = A.image_decoupled_feature(replace(cfg, v2=replace(cfg.v2, from_block=9_000_000)))
-    assert spec is not None and spec.name == "v2b-b10591aa"
+    assert spec is not None and spec.name == "v2b-69630f92"
     # off ⇒ the pre-knob name, so a non-opting deployment is unchanged
-    assert A.v2b_feature_name_for(replace(cfg.v2, quantile_head_after=False)) == "v2b-90bc5237"
+    assert A.v2b_feature_name_for(replace(cfg.v2, quantile_head_after=False)) == "v2b-1abeaeb4"
     text = (ROOT / "chain.toml").read_text()
     p = tmp_path / "chain.toml"
     p.write_text(re.sub(r"(?m)^quantile_head_after = true$", 'quantile_head_after = "yes"', text))
     with pytest.raises(ValueError, match="quantile_head_after must be true/false"):
         load_chain_config(p)
     p.write_text(re.sub(r"(?m)^quantile_head_after = true$", "quantile_head_after = false",
-                        text).replace('"v2b-b10591aa"', '"v2b-90bc5237"'))
+                        text).replace('"v2b-69630f92"', '"v2b-1abeaeb4"'))
     off = load_chain_config(p)
-    assert off.v2.quantile_head_after is False and off.v2.image_decoupled_feature == "v2b-90bc5237"
+    assert off.v2.quantile_head_after is False and off.v2.image_decoupled_feature == "v2b-1abeaeb4"
     assert A.summary(cfg, A.ActivationRecord(), None, None, None, None)["image_decoupled"][
         "quantile_head_after"] is True
 

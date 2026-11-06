@@ -503,14 +503,13 @@ def _epoch_start_for_seed(cfg: ChainConfig, era) -> int | None:
     named start is the first v2 era or a warm-startable era
     (``>= v2_first_warm_era``) no later than the era itself; else None.
 
-    DEC-CA-0067 rule 2: the applied v2b switch era (:func:`v2b_switch_era`,
-    from the receipt's ``image_decoupled_block`` or the typed block) is a
-    legal start too, and an era AT or after it may not name a start before it
-    (the switch opened a seed epoch there — an older seed would be mid-epoch
-    across the rule change). Shape only: whether a warm start really fired is
-    the promotion record's to show."""
+    DEC-CA-0067 rule 2 (``image-decoupled/3``): the applied v2b switch opens
+    NO seed epoch, so an era at or after it names the running epoch's seed
+    block exactly as before it (``/2`` made the switch era a legal start and
+    rejected older seeds across it). Shape only: whether a warm start really
+    fired is the promotion record's to show."""
     from ..shared.emission import ladder_on
-    from ..shared.era import era_length_blocks, v2_first_era, v2_first_warm_era, v2b_switch_era
+    from ..shared.era import era_length_blocks, v2_first_era, v2_first_warm_era
 
     if not ladder_on(cfg) or not cfg.v2.active(int(era.start_block)):
         return None
@@ -521,12 +520,6 @@ def _epoch_start_for_seed(cfg: ChainConfig, era) -> int | None:
     first, warm = v2_first_era(cfg), v2_first_warm_era(cfg)
     if first is None or warm is None or not (first <= start < int(era.index)):
         return None
-    switch = v2b_switch_era(cfg)
-    if switch is not None and first < switch <= int(era.index):
-        if start < switch:
-            return None
-        if start == switch:
-            return start
     return start if (start == first or start >= warm) else None
 
 
@@ -2942,10 +2935,11 @@ def _lane_b_acceptance_pay(receipt, cfg):
     switch = image_decoupled_from(cfg)
     merges = manifest.get("warm_start_merges", ()) or ()
     if switch and block == switch and merges:
-        # DEC-CA-0067 rule 2: a v2b switch era opens a seed epoch but keeps the
-        # running init — carried merges were accepted at the INIT epoch's
-        # start, an earlier era start (the audit cannot see warm starts; the
-        # validators bind it, tier 1 re-derives it)
+        # DEC-CA-0067: carried merges were accepted at the INIT epoch's start,
+        # which may be an earlier era start than this stamp's (kept from rule
+        # /2, whose switch era opened a seed epoch while keeping the init; the
+        # audit cannot see warm starts — the validators bind it, tier 1
+        # re-derives it)
         named = int((merges[0].get("acceptance") or {}).get("block", 0) or 0)
         if 0 < named <= block and not named % length:
             block = named

@@ -8,7 +8,7 @@ verdict window budget.
   digest re-hashes from the current contract with a known image.
 * The knobs parse, round-trip and refuse bad values; they ship OFF.
 * The vote: signal segment, tally lock-in → the era start two eras after its
-  era (rule 2: that era opens a seed epoch), the
+  era (a promotion's notice; the seed epoch continues across it), the
   typed override, one-way persistence, late-node adoption from notes; the
   validator signals at startup, locks in, persists and restores.
 * Before the switch everything is byte-identical (manifest bytes, window draw,
@@ -182,7 +182,7 @@ def test_knobs_refuse_bad_values(tmp_path, key, value):
 def test_shipped_configs_pin_the_feature_they_compute():
     from cascade.shared.activation import v2b_feature_name, v2b_feature_name_for
 
-    for path, name in (("chain.toml", "v2b-b10591aa"), ("chain.testnet.toml", "v2b-f2eefcb3")):
+    for path, name in (("chain.toml", "v2b-69630f92"), ("chain.testnet.toml", "v2b-c1ffa858")):
         cfg = load_chain_config(REPO / path)
         assert cfg.v2.image_decoupled_feature == name
         assert v2b_feature_name_for(cfg.v2) == name
@@ -213,17 +213,17 @@ def voting():
 
 
 def test_deployed_config_missing_the_keys_refuses_to_load(tmp_path, voting):
-    with pytest.raises(ValueError, match="image_decoupled_feature is not pinned.*v2b-80853b4a"):
+    with pytest.raises(ValueError, match="image_decoupled_feature is not pinned.*v2b-1e520694"):
         load_chain_config(_deployed_style(tmp_path))
 
 
 def test_missing_budget_with_the_release_pin_refuses(tmp_path, voting):
     p = _deployed_style(tmp_path, drop=("eval_n_windows_after", "quantile_head_after"))
-    with pytest.raises(ValueError, match="computes v2b-80853b4a"):
+    with pytest.raises(ValueError, match="computes v2b-1e520694"):
         load_chain_config(p)
     # the quantile-head knob alone missing computes the pre-knob name
     p = _deployed_style(tmp_path, drop=("quantile_head_after",))
-    with pytest.raises(ValueError, match="computes v2b-90bc5237"):
+    with pytest.raises(ValueError, match="computes v2b-1abeaeb4"):
         load_chain_config(p)
 
 
@@ -346,8 +346,8 @@ def test_tally_locks_in_two_eras_after_the_boundary_era(vcfg):
     res = A.resolve_activation(vcfg, chain, now_block=mid + 5, record=A.ActivationRecord(),
                                feature=spec)
     assert res.record.locked and res.record.lock_block == mid
-    # rule 2: the era start two eras after the lock-in era (a promotion's
-    # notice) — never mid-era, and the switch era opens a seed epoch
+    # the era start two eras after the lock-in era (a promotion's notice) —
+    # never mid-era; the running seed epoch continues across it (rule /3)
     assert res.record.activation_block == B0 + 10800
     # below the threshold nothing locks
     low = FakeChain(_fleet(40, 60), {"v1": note}, block=mid + 5)
@@ -822,7 +822,7 @@ def test_untyped_blocks_would_trim_the_v2b_segment(tmp_path):
     cfg = _untyped_blocks(tmp_path)
     rec, fr, mr = _live_records()
     why = A.v2b_note_problem(cfg, rec, fr, mr)
-    assert "TRIM" in why and "v2b-b10591aa" in why
+    assert "TRIM" in why and "v2b-69630f92" in why
     assert A.v2b_note_problem(load_chain_config(REPO / "chain.toml"), rec,
                               head_block=9_420_000) == ""                  # typed: fits
     s = A.summary(cfg, rec, None, fr, None, mr)
@@ -840,7 +840,7 @@ def test_validator_refuses_to_start_when_its_note_would_trim_v2b(tmp_path):
     A.ActivationStore(tmp_path / "activation_margin_v2_state.json").save(mr)
     runner = ValidatorRunner(cfg=cfg, activation_store=A.ActivationStore(tmp_path / "act.json"))
     chain = SimpleNamespace(current_block=lambda: 9_400_000, hotkey_ss58=lambda: "v1")
-    with pytest.raises(RuntimeError, match="refusing to start.*v2b-b10591aa"):
+    with pytest.raises(RuntimeError, match="refusing to start.*v2b-69630f92"):
         runner._activation_startup(chain)
 
 

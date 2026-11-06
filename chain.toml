@@ -1188,13 +1188,14 @@ king_ladder = true
 # DEC-CA-0067 (CONSENSUS, release-then-activate): the image-decoupled
 # training contract. From the era start TWO eras after the era of the
 # stake-majority lock-in of the "v2b-<hash>" feature ([activation] threshold;
-# every validator on this release signals it at startup) — an era that OPENS A
-# V2 SEED EPOCH (rule 2: new seeds, forced king retrain, same init; the rule
-# never changes inside an epoch) — a v2 settlement's legs are gated on
-# numerics_contract_digest (the contract minus train_image_digest) instead of
-# the full contract digest, so a worker-image repin keeps the carried king and
-# the finished legs. 0 = decided on chain; a typed era-start block is the
-# owner override. Repin the image only AFTER the switch era has started.
+# every validator on this release signals it at startup) — the running v2 seed
+# epoch CONTINUES across it (rule 2 as image-decoupled/3: same seeds, same
+# init, the carried king and the finished legs pass the new check, nothing
+# retrains) — a v2 settlement's legs are gated on numerics_contract_digest
+# (the contract minus train_image_digest) instead of the full contract digest,
+# so a worker-image repin keeps the carried king and the finished legs. 0 =
+# decided on chain; a typed era-start block is the owner override. Repin the
+# image only AFTER the switch era has started.
 image_decoupled_from_block = 0
 # Bundled with the same block (part of the vote's hash): the v2 private
 # verdict budget becomes this many windows. Inert until the switch.
@@ -1209,7 +1210,7 @@ quantile_head_after = true
 # Every node loads only if it computes exactly this name (missing or another
 # eval_n_windows_after / quantile_head_after => refuses to start, never votes
 # on another feature).
-image_decoupled_feature = "v2b-b10591aa"
+image_decoupled_feature = "v2b-69630f92"
 # TRAINER-ONLY provenance (not consensus, not in the vote): earlier
 # v2.training train_image_digest pins, exactly as once typed, so the trainer
 # can PROVE a pre-repin leg differs only in its image. Append the old pin here

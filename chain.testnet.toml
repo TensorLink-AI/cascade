@@ -643,9 +643,9 @@ eval_n_windows_after = 300
 # v2 settlement scores the quantile head directly (no copula sampling) —
 # rehearsed on testnet exactly as on mainnet.
 quantile_head_after = true
-# Fork guard: the v2b feature name eval_n_windows_after = 300 +
-# quantile_head_after = true hashes to.
-image_decoupled_feature = "v2b-f2eefcb3"
+# Fork guard: the v2b feature name (rule image-decoupled/3) eval_n_windows_after
+# = 300 + quantile_head_after = true hashes to.
+image_decoupled_feature = "v2b-c1ffa858"
 # TRAINER-ONLY provenance (not consensus, not in the vote): earlier
 # v2.training train_image_digest pins, exactly as once typed, so the trainer
 # can PROVE a pre-repin leg differs only in its image. Append the old pin here

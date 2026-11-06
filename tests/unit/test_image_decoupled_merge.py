@@ -33,7 +33,7 @@ from .test_image_decoupled_contract import (
     _untyped_blocks,
 )
 
-V2B = "v2b-b10591aa"
+V2B = "v2b-69630f92"
 
 
 # ── pre-switch byte identity (manifests, signatures, receipts) ───────────────

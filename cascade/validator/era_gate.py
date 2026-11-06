@@ -203,8 +203,8 @@ class EraGateMixin:
             return (f"era_init_mismatch: era {era.index} declares generation "
                     f"{era.generation} member {era.member_index}, the ledger names "
                     f"generation {generation} member {expected_index}")
-        # the INIT epoch (== the seed epoch except across a DEC-CA-0067 switch
-        # era that is not a warm start: new seeds there, the same init)
+        # the INIT epoch (== the seed epoch: a DEC-CA-0067 v2b switch opens no
+        # epoch since rule image-decoupled/3)
         epoch = self._init_epoch_start(era)
         if epoch is not None and epoch != int(era.index):
             # DEC-CA-0055: one init per seed epoch — a merge (or any other
@@ -427,7 +427,7 @@ class EraGateMixin:
         if epoch is not None and (not self.state.epoch_init
                                   or int(self.state.epoch_init.get("epoch", -1)) != epoch):
             # the seed epoch's init, recorded at its first handled settlement
-            # (keyed by the INIT epoch: a DEC-CA-0067 switch era keeps it)
+            # (keyed by the INIT epoch, which a DEC-CA-0067 v2b switch keeps)
             self.state = replace(self.state, epoch_init={
                 "epoch": int(epoch), "init": str(manifest.warm_start_ckpt or "")})
 
