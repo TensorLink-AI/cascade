@@ -247,7 +247,12 @@ chain.toml, a validator signals `v2b-90bc5237` in its on-chain note from its
 first loop: there is no separate "release, then vote" step. Lock-in follows
 at 51 % of stake, and the switch is the era start two eras after the lock-in
 boundary's era — an era that opens a v2 seed epoch (new seeds, a forced king
-retrain, the same init; DEC-CA-0067 rule 2). So:
+retrain, the same init; DEC-CA-0067 rule 2). A TYPED `[v2]
+image_decoupled_from_block` must give the same notice (an era start at least
+two eras after the era the node first loads it in) and must be deployed to
+every validator and the trainer before the switch era's pre-train window: a
+node that loads it later refuses to start (`too little notice`) until the
+switch era begins. So:
 1. **Trainer first.** If lock-in happens while the trainer still runs older
    code, every upgraded validator rejects every post-switch settlement
    (`era_numerics_missing`). Restart the trainer on this release (no legs in

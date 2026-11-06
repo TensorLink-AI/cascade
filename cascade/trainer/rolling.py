@@ -930,6 +930,9 @@ class RollingScheduler:
         era = era_for_block(self.cfg.round, block)
         self._sync_generations()
         self._reconcile_prepared_inits()
+        # every tick (a restart included): a prepared era the applied v2b
+        # switch moved to a new seed epoch is never rolled into
+        self._reconcile_prepared_epoch()
         if not self._started:
             self._startup(client, block)
             self._started = True
@@ -1650,9 +1653,9 @@ class RollingScheduler:
             if (era is not None and v2_era_active(cfg, era.start_block)
                     and not v2_era_active(old, era.start_block)):
                 self._discard_prepared_era(name, "training contract changed at v2 launch")
-        self._reconcile_prepared_epoch(old)
+        self._reconcile_prepared_epoch()
 
-    def _reconcile_prepared_epoch(self, old) -> None:
+    def _reconcile_prepared_epoch(self) -> None:
         """DEC-CA-0067 rule 2: a newly applied v2b switch opens a seed epoch at
         its era. The vote gives a full era of notice (``align="epoch"``), so
         the era is normally prepared after the switch is applied; a PREPARED
@@ -1660,11 +1663,18 @@ class RollingScheduler:
         late, or a typed block) is discarded and re-prepared with the new
         epoch's seeds and its own king leg — never trained mid-epoch on the
         old seeds. The running era is never discarded (the switch is always a
-        future era start); a mismatch there is logged."""
+        future era start); a mismatch there is logged once.
+
+        Runs on every tick and from :meth:`update_config`: a restart loads the
+        persisted ``next`` built before the switch was applied (a typed block
+        arrives only with a restart; a late resolve can be followed by one),
+        and :meth:`_roll_era` would otherwise reuse it. A no-op (byte-identical
+        behaviour) while no switch is applied."""
         from ..shared.era import image_decoupled_from
 
-        if image_decoupled_from(old) == image_decoupled_from(self.cfg):
+        if not image_decoupled_from(self.cfg):
             return
+        logged = self.__dict__.setdefault("_epoch_mismatch_logged", set())
         for name in ("current", "next"):
             era = getattr(self.state, name)
             if era is None or int(era.epoch_start) < 0:
@@ -1674,7 +1684,8 @@ class RollingScheduler:
                 continue
             if name == "next":
                 self._discard_prepared_era(name, "the v2b switch opens a seed epoch at this era")
-            else:
+            elif era.index not in logged:
+                logged.add(era.index)
                 log.error("rolling: running era %d is in seed epoch %d but the v2b switch "
                           "now names %d — not discarded (validators judge the era under "
                           "the config they applied)", era.index, era.epoch_start, want)
@@ -1686,6 +1697,7 @@ class RollingScheduler:
                 return
             # Running callbacks retain this object and must discard their result.
             era._superseded = True
+            era._superseded_reason = str(reason)
             setattr(self.state, name, None)
             stale = [leg for leg in self.state.finished if leg.era_index == era.index]
             self.state.finished = [leg for leg in self.state.finished if leg.era_index != era.index]
@@ -1697,6 +1709,33 @@ class RollingScheduler:
             for leg in stale:
                 queue.requeue(leg.hotkey, error=reason,
                               error_class="infra", burn_attempt=False, backoff=False, operator_billed=True)
+            # Our discard, never the miner's fault: a leg still TRAINING for the
+            # discarded era is requeued unburned when it ends (``_launch_leg``)
+            # and recorded now for the owner's make-good review — the money it
+            # spent bought nothing.
+            in_flight = getattr(queue, "in_flight", None)
+            for e in (in_flight() if callable(in_flight) else ()):
+                if int(getattr(e, "era_index", -1) or -1) == int(era.index):
+                    self._record_make_good(e, era.index, reason)
+
+    def _record_make_good(self, entry, era_index: int, reason: str) -> None:
+        """One make-good review line (``make_good_review.jsonl`` in the work
+        root) plus a WARNING naming the payer and the attempt: an in-flight leg
+        lost to an operator-side discard. Never raises."""
+        payer = "operator" if bool(getattr(entry, "operator_billed", False)) else "miner key"
+        attempt = str(getattr(entry, "attempt_id", "") or "")
+        log.warning("rolling: MAKE-GOOD REVIEW — %s's in-flight leg (payer: %s, attempt %s) "
+                    "belongs to discarded era %d (%s); requeued unburned when it ends",
+                    entry.hotkey[:12], payer, attempt or "?", era_index, reason)
+        try:
+            row = {"hotkey": entry.hotkey, "attempt_id": attempt, "payer": payer,
+                   "ref": str(getattr(entry, "ref", "") or ""), "era_index": int(era_index),
+                   "reason": str(reason), "at": float(self.clock())}
+            path = Path(self.r.work_root) / "make_good_review.jsonl"
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row, sort_keys=True) + "\n")
+        except Exception as e:  # noqa: BLE001 — the WARNING above is the record of last resort
+            log.error("rolling: make-good review row not written (%s)", e)
 
     def _roll_era(self, client, era: EraSpec, block: int) -> None:
         with self._lock:
@@ -2725,15 +2764,24 @@ class RollingScheduler:
         end_wall = wall_of_block(target, now=self.clock(), block_now=block)
         t_launch = self.clock()
 
+        def _superseded_requeue() -> None:
+            # our discard of the era (``_discard_prepared_era``): never burned,
+            # never the miner's fault — an operator-side block, retried at once
+            if queue is not None:
+                from ..funding.queue import OPERATOR_BLOCKED_CLASS
+
+                queue.requeue(gen.hotkey, error=getattr(
+                    era, "_superseded_reason", "training contract changed at v2 launch"),
+                    error_class=OPERATOR_BLOCKED_CLASS, burn_attempt=False, backoff=False,
+                    operator_billed=True)
+
         def _finish(entry: TrainedEntry) -> None:
             if getattr(era, "_superseded", False):
                 try:
                     self.ops.teardown_kept_pod(gen.hotkey)
                 except Exception as e:  # noqa: BLE001
                     log.error("rolling: superseded pod cleanup for %s failed: %s", gen.hotkey[:12], e)
-                if queue is not None:
-                    queue.requeue(gen.hotkey, error="training contract changed at v2 launch",
-                                  error_class="infra", burn_attempt=False, backoff=False, operator_billed=True)
+                _superseded_requeue()
                 return
             self._leg_walls().record(gen.ref, self.clock() - t_launch,
                                      sku=str(getattr(entry, "gpu_name", "") or ""))
@@ -2816,6 +2864,13 @@ class RollingScheduler:
                 _finish(entry)
             except Exception as e:  # noqa: BLE001 — settle the leg from its outcome
                 msg, miner_fault, error_class, burn = self.ops.leg_failure(gen.hotkey)
+                if getattr(era, "_superseded", False):
+                    # the era was discarded under it: whatever the failure,
+                    # the leg was ours to lose — requeued unburned
+                    _superseded_requeue()
+                    log.warning("rolling: %s's leg for discarded era %d ended [%s] — "
+                                "requeued unburned", gen.hotkey[:12], era.index, error_class)
+                    return
                 if queue is not None:
                     if miner_fault:
                         queue.fail(gen.hotkey, error=msg or str(e), error_class=error_class,

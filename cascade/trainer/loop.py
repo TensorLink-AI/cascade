@@ -735,6 +735,46 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
                             "first settlement reaches it trains the successor's king leg",
                             new_cfg.scoring.forfeit_from_block)
 
+    def _image_decoupled_startup(self, client) -> None:
+        """DEC-CA-0067 rule 2 for a TYPED ``[v2] image_decoupled_from_block``:
+        the same notice the vote gives (two eras after the era it was first
+        loaded in — :func:`cascade.shared.activation.v2b_typed_notice_problem`),
+        judged once at startup against the first-seen block persisted in
+        ``activation_image_decoupled_state.json`` (shared rule with the
+        validators). Raises ``RuntimeError`` on a short notice; a chain that
+        cannot serve the head skips the check (logged)."""
+        from ..shared.activation import (
+            ActivationRecord,
+            ActivationStore,
+            configured_image_decoupled_block,
+            image_decoupled_feature,
+            record_for,
+            stamp_typed_image_decoupled,
+            v2b_typed_notice_problem,
+        )
+
+        cfg = self._base_cfg()
+        spec = image_decoupled_feature(cfg)
+        if spec is None or not configured_image_decoupled_block(cfg):
+            return
+        try:
+            head = int(client.current_block())
+        except Exception as e:  # noqa: BLE001
+            log.warning("activation: typed v2b notice not checked at startup (%s)", e)
+            return
+        store = None
+        base = getattr(self.activation_store, "path", None)
+        if base is not None:
+            store = ActivationStore(Path(base).with_name("activation_image_decoupled_state.json"))
+        rec = record_for(cfg, store.load() if store is not None else ActivationRecord(), spec)
+        stamped = stamp_typed_image_decoupled(cfg, rec, head)
+        why = v2b_typed_notice_problem(cfg, stamped, head)
+        if why:
+            raise RuntimeError(f"activation: refusing to start — {why}")
+        if stamped is not rec and store is not None:
+            store.save(stamped)
+        self._image_decoupled = stamped
+
     def _image_decoupled_tick(self, client, block: int) -> None:
         """DEC-CA-0067 decided on chain: the trainer resolves the SAME tally the
         validators do (same resolver, same as-of-boundary reads, same notes
@@ -1979,6 +2019,9 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
         poll = self.cfg.manifest.poll_seconds
         waiting_logged: int | None = None
         last_upkeep = float("-inf")
+        # DEC-CA-0067 rule 2: a typed v2b switch without the vote's notice
+        # refuses to start (raises out of run — never half-applied)
+        self._image_decoupled_startup(client)
         while True:
             if time.monotonic() - last_upkeep >= self.UPKEEP_INTERVAL_SECONDS:
                 # Startup, then every interval: before the first tick, so a

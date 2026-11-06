@@ -298,12 +298,21 @@ def test_trainer_lane_b_reuses_the_init_epochs_merged_init_at_the_switch(cfg, tm
     v2cfg = replace(v2cfg, v2=replace(v2cfg.v2, image_decoupled_from_block=v2_block + 5 * L))
 
     class Drv:
+        """Mirrors ``LaneBDriver.init_for``: building persists the merged init
+        per era; ``apply_pending=False`` READS the one built for that era."""
+
         def __init__(self):
-            self.calls = []
+            self.calls, self.built = [], {}
 
         def init_for(self, era_index, ckpt, work_dir, apply_pending=True, era_start=None):
             self.calls.append((era_index, apply_pending))
-            return (f"merged-{era_index}", [{"m": 1}]) if apply_pending else (ckpt, [])
+            key = str(era_index)
+            if key in self.built:
+                return self.built[key]
+            if not apply_pending:
+                return ckpt, []
+            self.built[key] = (f"merged-{era_index}", [{"m": 1}])
+            return self.built[key]
 
     clock = Clock()
     sched, _ = _sched(v2cfg, tmp_path, clock, ops=EpochOps(tmp_path, clock))
@@ -312,8 +321,12 @@ def test_trainer_lane_b_reuses_the_init_epochs_merged_init_at_the_switch(cfg, tm
     sched.state.generations = {"1": {"members": [["M", "s"]], "effective_era": w}}
     at_w = sched._new_era_state(FakeClient(), era_for_block(v2cfg.round, v2_block + 3 * L))
     at_sw = sched._new_era_state(FakeClient(), era_for_block(v2cfg.round, v2_block + 5 * L))
+    assert at_w.warm_start_ckpt == f"merged-{w}" and at_w.warm_start_base == "M"
     assert at_sw.epoch_start == sw and at_sw.base_seed != at_w.base_seed
-    assert at_sw.warm_start_ckpt == "M" and at_sw.warm_start_merges == []   # no new merge
+    # the switch era trains from the init epoch's MERGED init — the same init,
+    # no merge pending since applied
+    assert at_sw.warm_start_ckpt == f"merged-{w}" and at_sw.warm_start_base == "M"
+    assert at_sw.warm_start_merges == at_w.warm_start_merges == [{"m": 1}]
     assert sched.lane_b.calls == [(w, True), (w, False)]
 
 
@@ -333,6 +346,200 @@ def test_trainer_discards_a_prepared_era_the_switch_moved(cfg, tmp_path):
     sched.update_config(replace(v2cfg, v2=replace(v2cfg.v2,
                                                   image_decoupled_from_block=v2_block + 2 * L)))
     assert sched.state.next is None                             # re-prepared on the new epoch
+
+
+def test_restart_discards_a_persisted_stale_switch_era_and_reprepares_it(cfg, tmp_path):
+    """Review #1: a typed block (or a late resolve) arrives with a RESTART —
+    the scheduler is built from persisted state whose prepared ``next`` (the
+    switch era) still sits in the old epoch with the carried king leg. It is
+    discarded at the first tick's reconcile and re-prepared on the new
+    epoch's seeds with no carried king; the running era is never discarded."""
+    from cascade.shared.manifest import TrainedEntry
+    from cascade.trainer.rolling import _entry_to_json
+    from tests.unit.test_dec55_trainer_epochs import EpochOps, _v2
+    from tests.unit.test_rolling import Clock, FakeClient, _ptr, _sched
+
+    v2cfg, v2_block, L = _v2(cfg)
+    first = era_for_block(v2cfg.round, v2_block).index
+    clock = Clock()
+    sched, _ = _sched(v2cfg, tmp_path, clock, ops=EpochOps(tmp_path, clock))
+    cur = sched._new_era_state(FakeClient(), era_for_block(v2cfg.round, v2_block + L))
+    nxt = sched._new_era_state(FakeClient(), era_for_block(v2cfg.round, v2_block + 2 * L))
+    king = _entry_to_json(TrainedEntry("KING", 1, "king", "king/gen@sha256:" + "0" * 64,
+                                       _ptr(f"KKING-{first}"), "d", v2_block))
+    for era in (cur, nxt):
+        era.king_hotkey, era.king_entry, era.king_init = "KING", dict(king), era.warm_start_ckpt
+    sched.state.current, sched.state.next = cur, nxt
+    sched._save()
+    assert nxt.epoch_start == cur.epoch_start == first
+    # restart with the switch at the prepared era (typed in chain.toml)
+    sw_block = v2_block + 2 * L
+    on = replace(v2cfg, v2=replace(v2cfg.v2, image_decoupled_from_block=sw_block))
+    ops = EpochOps(tmp_path, clock)
+    again, _ = _sched(on, tmp_path, clock, ops=ops)
+    assert again.state.next is not None and again.state.next.epoch_start == first
+    again._reconcile_prepared_epoch()                  # what every tick runs first
+    assert again.state.next is None and ops.retired == [first + 2]
+    assert again.state.current.index == first + 1      # the running era is kept
+    again._reconcile_prepared_epoch()                  # idempotent, logs once
+    assert again.state.current.index == first + 1
+    again._roll_era(FakeClient(), era_for_block(on.round, sw_block), sw_block + 1)
+    new = again.state.current
+    assert new.index == first + 2 and new.epoch_start == first + 2
+    assert new.seed_block == era_for_block(on.round, sw_block).seed_block
+    assert new.base_seed != nxt.base_seed and new.king_entry is None   # retrains
+
+
+def _in_flight_leg(sched, ops, era, *, fail=None):
+    import threading
+
+    from cascade.trainer.rolling import ResolvedGen
+    from tests.unit.test_rolling import REF
+
+    q = ops.queue()
+    q.add("ALFA", REF["ALFA"], reveal_block=1)
+    assert q.mark_in_flight("ALFA", REF["ALFA"], target_boundary=era.start_block + 900,
+                            era_index=era.index, started_block=era.start_block - 10)
+    attempt = q.get("ALFA").attempt_id
+    ops.hold["ALFA"] = threading.Event()
+    if fail is not None:
+        ops.failures["ALFA"] = fail
+    sched._launch_leg(ResolvedGen("ALFA", 2, REF["ALFA"], 1), era, era.start_block - 10,
+                      era.start_block + 900, "challenger")
+    return q, attempt
+
+
+def _discard_with_leg_in_flight(cfg, tmp_path, fail=None):
+    import json
+
+    from tests.unit.test_dec55_trainer_epochs import EpochOps, _join, _v2
+    from tests.unit.test_rolling import Clock, FakeClient, _sched
+
+    v2cfg, v2_block, L = _v2(cfg)
+    clock = Clock()
+    ops = EpochOps(tmp_path, clock)
+    sched, _ = _sched(v2cfg, tmp_path, clock, ops=ops)
+    nxt = sched._new_era_state(FakeClient(), era_for_block(v2cfg.round, v2_block + 2 * L))
+    sched.state.next = nxt
+    q, attempt = _in_flight_leg(sched, ops, nxt, fail=fail)
+    sched.update_config(replace(v2cfg, v2=replace(v2cfg.v2,
+                                                  image_decoupled_from_block=v2_block + 2 * L)))
+    assert sched.state.next is None and nxt._superseded
+    rows = [json.loads(x) for x in
+            (tmp_path / "make_good_review.jsonl").read_text().splitlines()]
+    assert rows == [{"hotkey": "ALFA", "attempt_id": attempt, "payer": "miner key",
+                     "ref": rows[0]["ref"], "era_index": nxt.index,
+                     "reason": "the v2b switch opens a seed epoch at this era",
+                     "at": rows[0]["at"]}]
+    ops.hold["ALFA"].set()
+    _join(sched)
+    return q.get("ALFA")
+
+
+def test_in_flight_miner_leg_of_a_discarded_era_is_requeued_unburned_for_make_good(cfg,
+                                                                                    tmp_path):
+    """Review #6: our discard never costs the miner — the in-flight leg is
+    recorded for make-good (payer + attempt) and requeued unburned when it
+    ends."""
+    from cascade.funding.queue import OPERATOR_BLOCKED_CLASS
+
+    e = _discard_with_leg_in_flight(cfg, tmp_path)
+    assert e.status == "queued" and e.attempts == 0
+    assert e.last_error_class == OPERATOR_BLOCKED_CLASS
+    assert "seed epoch" in e.last_error
+
+
+def test_a_superseded_legs_failure_is_never_charged_to_the_miner(cfg, tmp_path):
+    from cascade.funding.queue import OPERATOR_BLOCKED_CLASS
+
+    e = _discard_with_leg_in_flight(cfg, tmp_path, fail=("bad", True, "generator", True))
+    assert e.status == "queued" and e.attempts == 0
+    assert e.last_error_class == OPERATOR_BLOCKED_CLASS
+
+
+# ── a typed switch needs the vote's notice ───────────────────────────────────
+
+
+@pytest.fixture
+def vcfg():
+    """test_image_decoupled_contract's ``vcfg``: the shipped chain.toml with
+    the rollover typed and the other secondary features disarmed."""
+    from .test_image_decoupled_contract import B0
+
+    c = load_chain_config(ROOT / "chain.toml")
+    return replace(
+        c,
+        round=replace(c.round, rolling_from_block=B0, epoch_blocks=900,
+                      epoch_blocks_prev=3600, epoch_activation_block=B0),
+        scoring=replace(c.scoring, era_king_from_block=B0, tenure_blocks_from_block=B0,
+                        cohort_maxt_increment_from_block=B0, forfeit_hotkeys=(),
+                        forfeit_from_block=0, forfeit_successor_hotkey="",
+                        win_margin_start_v2=0.0, win_margin_end_v2=0.0,
+                        margin_warmup_blocks_v2=0, margin_v2_from_block=0),
+        v2=replace(c.v2, prelaunch_burn=0.0))
+
+
+def _typed(c, block):
+    return replace(c, v2=replace(c.v2, image_decoupled_from_block=block))
+
+
+def test_typed_switch_needs_two_eras_of_notice_judged_once(vcfg):
+    from .test_image_decoupled_contract import B0
+
+    L = era_length_blocks(vcfg.round, B0)
+    T = B0 + 4 * L
+    on = _typed(vcfg, T)
+    assert A.v2b_typed_notice_problem(on, None, T - 2 * L) == ""          # exactly enough
+    why = A.v2b_typed_notice_problem(on, None, T - L + 5)
+    assert "too little notice" in why and str(T + L) in why
+    # judged against the FIRST-SEEN block: a node that passed never refuses itself
+    seen = A.stamp_typed_image_decoupled(on, A.ActivationRecord(), T - 2 * L)
+    assert (seen.source, seen.activation_block, seen.lock_block) == ("config", T, T - 2 * L)
+    assert A.stamp_typed_image_decoupled(on, seen, T - 1) is seen
+    assert A.v2b_typed_notice_problem(on, seen, T - 1) == ""
+    # a changed typed block is a fresh first sight
+    later = _typed(vcfg, T + L)
+    assert A.stamp_typed_image_decoupled(later, seen, T - 1).lock_block == T - 1
+    # once the switch era started there is nothing to give notice for
+    assert A.v2b_typed_notice_problem(on, None, T) == ""
+    assert A.v2b_typed_notice_problem(vcfg, None, T - 1) == ""            # nothing typed
+
+
+def test_validator_and_trainer_refuse_to_start_on_a_short_typed_notice(vcfg, tmp_path):
+    from cascade.trainer.loop import TrainerRunner
+    from cascade.validator.activation_mixin import ActivationStartupRefused
+    from cascade.validator.loop import ValidatorRunner
+
+    from .test_activation import FakeChain, _v
+    from .test_image_decoupled_contract import B0
+
+    L = era_length_blocks(vcfg.round, B0)
+    T = B0 + 4 * L
+    on = _typed(vcfg, T)
+    head = T - L + 5
+    chain = FakeChain([_v("v1", 60), _v("v2", 40)], {}, block=head, hotkey="v1")
+    runner = ValidatorRunner(cfg=on, activation_store=A.ActivationStore(tmp_path / "act.json"))
+    with pytest.raises(ActivationStartupRefused, match="too little notice"):
+        runner._activation_startup(chain)
+
+    (tmp_path / "t").mkdir()
+    trainer = TrainerRunner.__new__(TrainerRunner)
+    trainer.cfg, trainer._cfg_base, trainer.netconfig = on, None, None
+    trainer.activation_store = A.ActivationStore(tmp_path / "t" / "activation_state.json")
+    trainer._image_decoupled = None
+    with pytest.raises(RuntimeError, match="too little notice"):
+        trainer._image_decoupled_startup(chain)
+
+    # both nodes first loaded it in time (persisted first-seen): they start
+    for path in (tmp_path / "activation_image_decoupled_state.json",
+                 tmp_path / "t" / "activation_image_decoupled_state.json"):
+        A.ActivationStore(path).save(A.stamp_typed_image_decoupled(on, A.ActivationRecord(),
+                                                                   T - 3 * L))
+    ok = ValidatorRunner(cfg=on, activation_store=A.ActivationStore(tmp_path / "act.json"))
+    ok._activation_startup(chain)
+    assert ok._image_decoupled.lock_block == T - 3 * L
+    trainer._image_decoupled_startup(chain)
+    assert trainer._image_decoupled.lock_block == T - 3 * L
 
 
 # ── the audit ────────────────────────────────────────────────────────────────

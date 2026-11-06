@@ -698,6 +698,57 @@ def image_decoupled_feature(cfg: ChainConfig) -> FeatureSpec | None:
                        align="epoch")
 
 
+def stamp_typed_image_decoupled(cfg: ChainConfig, record: ActivationRecord,
+                                now_block: int) -> ActivationRecord:
+    """The v2b record for a TYPED ``[v2] image_decoupled_from_block``: source
+    ``config``, ``activation_block`` = the typed block and ``lock_block`` = the
+    block this node FIRST loaded it at (kept across restarts, so the notice
+    check below is judged once, never re-judged as blocks advance). A record
+    already stamped for the same typed block is returned unchanged; nothing
+    typed (or ``[activation]`` off — no v2b feature) returns ``record``."""
+    spec = image_decoupled_feature(cfg)
+    typed = configured_image_decoupled_block(cfg)
+    if spec is None or not typed:
+        return record
+    if (record.feature == spec.name and record.source == "config"
+            and int(record.activation_block) == typed and int(record.lock_block)):
+        return record
+    return ActivationRecord(feature=spec.name, lock_block=int(now_block), activation_block=typed,
+                            source="config")
+
+
+def v2b_typed_notice_problem(cfg: ChainConfig, record: ActivationRecord | None,
+                             now_block: int) -> str:
+    """Why a TYPED v2b switch gives too little notice, or "" (DEC-CA-0067 rule
+    2). The switch era opens a seed epoch, so — exactly like the vote
+    (``align="epoch"``) — it must lie at or after the era start two eras after
+    the era the switch was FIRST loaded in (``record.lock_block`` from
+    :func:`stamp_typed_image_decoupled`, else ``now_block``): the trainer
+    prepares that era's king leg and seeds in the era before it, and every
+    validator must run the same typed value by then. Once the switch era has
+    started there is nothing left to give notice for (""), and a node that
+    passed once never re-judges itself (the first-seen block persists). Not
+    checkable at load (the loader has no chain head): the validator and the
+    trainer refuse to START on it."""
+    typed = configured_image_decoupled_block(cfg)
+    if not typed or int(now_block) >= typed:
+        return ""
+    seen = int(now_block)
+    if (record is not None and record.source == "config"
+            and int(record.activation_block) == typed and int(record.lock_block)):
+        seen = min(seen, int(record.lock_block))
+    from .era import min_effective_era
+
+    need = int(min_effective_era(cfg.round, seen)) * int(era_length_blocks(cfg.round, seen))
+    if typed >= need:
+        return ""
+    return (f"[v2] image_decoupled_from_block = {typed} gives too little notice: first loaded "
+            f"at block {seen}, the earliest switch era it may name is {need} (two eras after "
+            "that block's era — the switch era opens a v2 seed epoch, DEC-CA-0067 rule 2). "
+            f"Type an era start >= {need} on EVERY validator and the trainer before that "
+            "era's pre-train window, or leave it 0 and let the vote decide")
+
+
 def apply_image_decoupled_activation(cfg: ChainConfig, block: int) -> ChainConfig:
     """The config the owner would have typed for the DEC-CA-0067 bundle decided
     at rollover ``block`` (the era start two eras after the lock-in boundary's

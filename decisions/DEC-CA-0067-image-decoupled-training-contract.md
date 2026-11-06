@@ -148,7 +148,30 @@ different times, so the switch cannot WAIT for an epoch start. Instead:
   before) already under the switch; a prepared next era the switch moved is
   discarded and re-prepared.
 - **Owner override.** Any typed era start at or after `[v2] from_block` is
-  legal (the loader's existing check): it opens its own epoch.
+  legal on the grid (the loader's existing check): it opens its own epoch.
+  It must give the vote's NOTICE too: at least the era start two eras after
+  the era the node FIRST loaded it in (`v2b_typed_notice_problem`). The loader
+  has no chain head, so the validator (and satellite) and the trainer check
+  it at startup and REFUSE to start on a short notice. The first-seen block
+  is persisted in `activation_image_decoupled_state.json` (`lock_block` of
+  the `config` record), so a node that started fine never refuses itself as
+  blocks advance; once the switch era has started there is nothing to check.
+  Every validator and the trainer must deploy the SAME typed value before
+  the switch era's pre-train window (the era before it); a node that loads
+  it later refuses until the switch era starts.
+- **Restarts.** The trainer reconciles its prepared eras against the applied
+  switch on every tick (a restart included): a persisted next era still in
+  the old epoch is discarded and re-prepared; the running era never is.
+- **Miner money.** A leg still training for a discarded prepared era is our
+  loss, never the miner's: recorded for the owner's make-good review
+  (`make_good_review.jsonl` + a WARNING naming the payer and the attempt) and
+  requeued unburned (`operator_blocked`) when it ends, whatever its outcome.
+- **Who pays the forced retrain.** The switch era's king leg is an ordinary
+  epoch-start king leg: under `king_ladder` it trains on the king's own key,
+  falling back to the operator with the key slash exactly as for any epoch
+  start. Inside the random-init window only the init POINTER is unchanged
+  (random init): the random weights re-derive from the new seeds, so the
+  random-init checkpoint is rebuilt and re-benched for the new seed block.
 - **Audit.** `_epoch_start_for_seed` accepts the switch era as a start and
   rejects an era at or after it that names an older seed block.
 - **Fresh vote.** The rule version is `image-decoupled/2`: mainnet
