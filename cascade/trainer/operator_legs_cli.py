@@ -8,6 +8,14 @@
     cascade-trainer resume-rents         --reason TEXT
     cascade-trainer block-executor       <executor-id | ip> [--days N] [--reason TEXT]
     cascade-trainer unblock-executor     <executor-id | ip>
+    cascade-trainer rebuild-init-pointer [--reason TEXT]
+
+``rebuild-init-pointer`` asks the running trainer to retry the seed epoch's
+random-init pointer build NOW (the DEC-CA-0063 "init" entry the validators'
+king check benches): it resets the per-epoch try counter of every era that
+still wants its init. The trainer consumes the request on its next tick and
+logs "operator requested an init pointer rebuild"; nothing is rented for it
+— the build still waits for an operator-billed pod of the epoch.
 
 ``list`` shows legs awaiting approval (hotkey, uid, SKU, projected cost, why)
 and entries paused after operator-side faults. ``approve`` records a
@@ -47,8 +55,12 @@ QUEUE_FILE = "funded_queue.json"
 
 COMMANDS = ("list-operator-legs", "approve-operator-leg", "deny-operator-leg",
             "resume-operator-leg", "rent-status", "resume-rents", "block-executor",
-            "unblock-executor")
-_NO_QUEUE = ("rent-status", "resume-rents", "block-executor", "unblock-executor")
+            "unblock-executor", "rebuild-init-pointer")
+_NO_QUEUE = ("rent-status", "resume-rents", "block-executor", "unblock-executor",
+             "rebuild-init-pointer")
+# The request file ``rebuild-init-pointer`` writes under the work root; the
+# scheduler (``RollingScheduler._consume_init_pointer_rebuild``) removes it.
+INIT_POINTER_REBUILD_FILE = "init_pointer_rebuild.json"
 KINDS = ("", "expired_key", "make_good", "operator_lane", "paid_fallback", "retrain_after_loss")
 
 
@@ -120,6 +132,9 @@ def _parser() -> argparse.ArgumentParser:
             if cmd == "block-executor":
                 s.add_argument("--days", type=float, default=7.0)
                 s.add_argument("--reason", default="blocked by the operator")
+        elif cmd == "rebuild-init-pointer":
+            s.add_argument("--reason", default="owner request",
+                           help="why (logged by the trainer when it picks the request up)")
         elif cmd not in ("list-operator-legs", "rent-status", "resume-rents"):
             s.add_argument("hotkey")
             s.add_argument("--queue", default=None,
@@ -172,6 +187,8 @@ def main(argv: list[str]) -> int:
         return _short_pods_cmd(args, wr)
     if args.cmd in ("rent-status", "resume-rents"):
         return _rents(args, wr)
+    if args.cmd == "rebuild-init-pointer":
+        return _rebuild_init_pointer(args, wr)
     if args.cmd == "list-operator-legs":
         pending = store.pending()
         paused = [{"queue": q.path.name, "hotkey": e.hotkey, "ref": e.ref, "status": e.status,
@@ -316,6 +333,23 @@ def _short_pods_cmd(args, work_root: Path) -> int:
     n = short_pods.unblock(args.ident, file=f)
     print(f"unblocked {args.ident} ({n} record(s)) in {f}")
     return 0 if n else 1
+
+
+def _rebuild_init_pointer(args, work_root: Path) -> int:
+    """Write the rebuild request the scheduler consumes on its next tick
+    (atomic rename; a request already waiting is replaced)."""
+    import time as _t
+
+    path = work_root / INIT_POINTER_REBUILD_FILE
+    tmp = path.with_suffix(".json.tmp")
+    body = {"requested_at": _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime()),
+            "reason": str(args.reason or "owner request")}
+    tmp.write_text(json.dumps(body, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    print(f"init pointer rebuild requested ({body['reason']}) → {path}; the trainer resets "
+          "the try counter of every era still wanting its init on its next tick and logs "
+          "'operator requested an init pointer rebuild'")
+    return 0
 
 
 def _short_pod_lines(work_root: Path) -> list[str]:
