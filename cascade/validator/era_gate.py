@@ -203,10 +203,13 @@ class EraGateMixin:
             return (f"era_init_mismatch: era {era.index} declares generation "
                     f"{era.generation} member {era.member_index}, the ledger names "
                     f"generation {generation} member {expected_index}")
-        epoch = self._epoch_start(era)
+        # the INIT epoch (== the seed epoch except across a DEC-CA-0067 switch
+        # era that is not a warm start: new seeds there, the same init)
+        epoch = self._init_epoch_start(era)
         if epoch is not None and epoch != int(era.index):
             # DEC-CA-0055: one init per seed epoch — a merge (or any other
-            # init change) lands only at a warm start, never mid-epoch
+            # init change) lands only at a warm start, never mid-epoch (nor at
+            # a v2b switch era)
             if manifest.warm_start_merges and (
                     not self.state.epoch_init
                     or int(self.state.epoch_init.get("epoch", -1)) != epoch
@@ -259,7 +262,7 @@ class EraGateMixin:
         from .merge_acceptance import acceptance_block
 
         acceptance_required = (manifest.era is not None and self.cfg.lane_b.acceptance_at_era(
-            acceptance_block(self.cfg, manifest)))
+            acceptance_block(self.cfg, manifest, self)))
         if acceptance_required:
             from .merge_acceptance import verify_acceptance
 
@@ -420,10 +423,11 @@ class EraGateMixin:
             pointer = str(king.trained_pointer)
         if self.state.era_index != key or pointer != self.state.king_pointer:
             self.state = replace(self.state, era_index=int(key), king_pointer=pointer)
-        epoch = self._epoch_start(era)
+        epoch = self._init_epoch_start(era)
         if epoch is not None and (not self.state.epoch_init
                                   or int(self.state.epoch_init.get("epoch", -1)) != epoch):
             # the seed epoch's init, recorded at its first handled settlement
+            # (keyed by the INIT epoch: a DEC-CA-0067 switch era keeps it)
             self.state = replace(self.state, epoch_init={
                 "epoch": int(epoch), "init": str(manifest.warm_start_ckpt or "")})
 

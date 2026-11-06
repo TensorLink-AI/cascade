@@ -372,7 +372,17 @@ def activation_block_for(round_cfg: Any, lock_block: int, align: str = "boundary
     count crossed finishes on the old rules; the one after starts on the
     new — the clean restart point. ``align="era"`` (DEC-CA-0049): the first
     ERA START strictly after ``lock_block`` instead, so a decision never
-    lands mid-era (a lock-in exactly on an era start takes the next one)."""
+    lands mid-era (a lock-in exactly on an era start takes the next one).
+    ``align="epoch"`` (DEC-CA-0067 rule 2): the era start TWO eras after the
+    lock-in boundary's era (:func:`cascade.shared.era.min_effective_era`, the
+    notice a v2 promotion gets) — the switch era opens a seed epoch, so the
+    trainer must learn of it before that era's king pre-train window opens
+    (which happens inside the era before it)."""
+    if align == "epoch":
+        from .era import min_effective_era
+
+        length = int(era_length_blocks(round_cfg, int(lock_block)))
+        return int(min_effective_era(round_cfg, int(lock_block))) * length
     if align == "era":
         length = int(era_length_blocks(round_cfg, int(lock_block)))
         return (int(lock_block) // length + 1) * length
@@ -408,7 +418,9 @@ class FeatureSpec:
     # Where the decision takes effect after the lock-in boundary: "boundary"
     # = the next settlement boundary (the DEC-CA-0043 rollover and the
     # DEC-CA-0048 forfeiture); "era" = the next ERA START (DEC-CA-0049 bar
-    # v2 — every settlement of one era is judged under one bar).
+    # v2 — every settlement of one era is judged under one bar); "epoch" =
+    # the era start two eras after the lock-in boundary's era (DEC-CA-0067
+    # v2b: that era opens a seed epoch, given a promotion's era of notice).
     align: str = "boundary"
 
     @property
@@ -633,11 +645,15 @@ def apply_prelaunch_burn_activation(cfg: ChainConfig, block: int) -> ChainConfig
 # DEC-CA-0067 consensus bundle "v2b": the image-decoupled contract rule (its
 # rule version + the image/runtime field list) and the bundled v2 verdict
 # window budget. The params ARE the feature: a changed bundle is a fresh vote.
-V2B_RULE = "image-decoupled/1"
+# Rule /2 (rule 2, "the v2b switch era opens a seed epoch"): the switch takes
+# effect two eras after the lock-in boundary's era and that era starts a v2
+# seed epoch (:func:`cascade.shared.era.v2_seed_epoch_start`) — /1 could
+# switch inside a running epoch (the 2026-11-01 mid-epoch repin class).
+V2B_RULE = "image-decoupled/2"
 
 
 def v2b_feature_name(eval_n_windows_after: int) -> str:
-    """``v2b-<sha256("image-decoupled/1|<fields>|eval_n_windows_after=<n>")[:8]>``.
+    """``v2b-<sha256("image-decoupled/2|<fields>|eval_n_windows_after=<n>")[:8]>``.
     Kept short on purpose: the note is ONE 128-byte commitment field shared
     with every other segment (:data:`NOTE_MAX_BYTES`)."""
     from .manifest import IMAGE_RUNTIME_FIELDS
@@ -666,22 +682,28 @@ def image_decoupled_feature(cfg: ChainConfig) -> FeatureSpec | None:
     (``[v2] from_block`` or ``launch_at_utc``) — a validator on this release
     signals it at startup; ``typed_block`` = the typed ``[v2]
     image_decoupled_from_block`` (the override — nothing is signalled). Takes
-    effect at the first ERA START after the lock-in boundary. ``None`` =
-    activation off or no v2 schedule (a typed block is then the only way)."""
+    effect at the era start two eras after the lock-in boundary's era
+    (``align="epoch"``), and that era OPENS A V2 SEED EPOCH (DEC-CA-0067 rule
+    2, :func:`cascade.shared.era.v2b_switch_era`): the contract rule never
+    changes inside an epoch, whenever a promotion does or does not fire.
+    ``None`` = activation off or no v2 schedule (a typed block is then the
+    only way; any era start at or after the v2 go-live is legal for it, since
+    the switch era itself starts an epoch)."""
     v2 = getattr(cfg, "v2", None)
     if not cfg.activation.enabled or v2 is None or not (
             int(getattr(v2, "from_block", 0) or 0) or getattr(v2, "launch_at_utc", "")):
         return None
     name = v2b_feature_name(int(getattr(v2, "eval_n_windows_after", 0) or 0))
     return FeatureSpec(name=name, typed_block=configured_image_decoupled_block(cfg),
-                       align="era")
+                       align="epoch")
 
 
 def apply_image_decoupled_activation(cfg: ChainConfig, block: int) -> ChainConfig:
     """The config the owner would have typed for the DEC-CA-0067 bundle decided
-    at rollover ``block`` (the first era start after the lock-in boundary):
-    ``[v2] image_decoupled_from_block`` = that block — which also switches
-    ``eval_n_windows_after`` in (:func:`cascade.shared.era.v2_eval_windows_at`).
+    at rollover ``block`` (the era start two eras after the lock-in boundary's
+    era): ``[v2] image_decoupled_from_block`` = that block — which also switches
+    ``eval_n_windows_after`` in (:func:`cascade.shared.era.v2_eval_windows_at`)
+    and opens a v2 seed epoch there (:func:`cascade.shared.era.v2b_switch_era`).
     A typed block is returned unchanged (the owner override); a block already
     applied is idempotent; a different block after lock-in raises (one-way);
     a block that is not an era start raises."""

@@ -742,8 +742,10 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
         start to ``[v2] image_decoupled_from_block``. Deterministic: the
         manifest fields and the numerics stale rule key off exactly the block
         every validator applies, so the trainer never stamps them early (the
-        block is 0 until this resolves) and a lock-in always lands at least
-        one settlement before its era starts (``align="era"``)."""
+        block is 0 until this resolves) and a lock-in always lands a full era
+        before its switch era starts (``align="epoch"``): that era opens a v2
+        seed epoch (DEC-CA-0067 rule 2), so its king leg and seeds are
+        prepared — in the era before it — already under the switch."""
         from ..shared.activation import (
             ActivationRecord,
             ActivationStore,

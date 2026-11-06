@@ -65,6 +65,7 @@ from ..shared.era import (
     v2_era_seed_block,
     v2_first_warm_era,
     v2_generation_usable,
+    v2_init_epoch_start,
     v2_seed_epoch_start,
     validator_bench_at,
     validator_bench_era,
@@ -1537,6 +1538,14 @@ class RollingScheduler:
             return None
         return v2_seed_epoch_start(self.cfg, int(era_index), self._warm_eras())
 
+    def _init_epoch_of(self, era_index: int) -> int | None:
+        """First era of the INIT epoch containing ``era_index`` — the seed
+        epoch's start except across a DEC-CA-0067 switch era, which opens a
+        seed epoch but keeps the running init (``None`` as :meth:`_epoch_of`)."""
+        if not getattr(getattr(self.cfg, "v2", None), "king_ladder", False):
+            return None
+        return v2_init_epoch_start(self.cfg, int(era_index), self._warm_eras())
+
     @staticmethod
     def _in_epoch_tail(era: EraState | None) -> bool:
         """``era`` is a LATER era of its seed epoch: no init change, no king
@@ -1559,6 +1568,9 @@ class RollingScheduler:
         # the train window and the era's training seeds both derive from it).
         warm = self._warm_eras()
         epoch = self._epoch_of(era.index)
+        # the init epoch: == epoch except at/after a DEC-CA-0067 switch era that
+        # is not itself a warm start (new seeds, same init)
+        init_epoch = self._init_epoch_of(era.index)
         seed_block = (int(v2_era_seed_block(self.cfg, era, warm)) if epoch is not None
                       else int(era.seed_block))
         base, merges = "", []
@@ -1566,12 +1578,14 @@ class RollingScheduler:
             from .merge_acceptance import MergeAcceptancePending
 
             try:
-                if epoch is not None and int(epoch) != int(era.index):
+                if init_epoch is not None and int(init_epoch) != int(era.index):
                     # Lane-B merges change the init only at a warm start: a
-                    # later era of the epoch reuses the epoch's merged init
-                    # (if any) and never applies a merge pending since.
+                    # later era of the epoch — or a DEC-CA-0067 switch era
+                    # that is not a warm start — reuses the init epoch's
+                    # merged init (if any) and never applies a merge pending
+                    # since.
                     merged, merges = self.lane_b.init_for(
-                        int(epoch), ckpt, Path(self.r.work_root) / "lane_b",
+                        int(init_epoch), ckpt, Path(self.r.work_root) / "lane_b",
                         apply_pending=False)
                 else:
                     prepare = getattr(self.lane_b, "prepare_init_for", self.lane_b.init_for)
@@ -1636,6 +1650,34 @@ class RollingScheduler:
             if (era is not None and v2_era_active(cfg, era.start_block)
                     and not v2_era_active(old, era.start_block)):
                 self._discard_prepared_era(name, "training contract changed at v2 launch")
+        self._reconcile_prepared_epoch(old)
+
+    def _reconcile_prepared_epoch(self, old) -> None:
+        """DEC-CA-0067 rule 2: a newly applied v2b switch opens a seed epoch at
+        its era. The vote gives a full era of notice (``align="epoch"``), so
+        the era is normally prepared after the switch is applied; a PREPARED
+        next era whose seed epoch the switch moved (a trainer that resolved
+        late, or a typed block) is discarded and re-prepared with the new
+        epoch's seeds and its own king leg — never trained mid-epoch on the
+        old seeds. The running era is never discarded (the switch is always a
+        future era start); a mismatch there is logged."""
+        from ..shared.era import image_decoupled_from
+
+        if image_decoupled_from(old) == image_decoupled_from(self.cfg):
+            return
+        for name in ("current", "next"):
+            era = getattr(self.state, name)
+            if era is None or int(era.epoch_start) < 0:
+                continue
+            want = self._epoch_of(era.index)
+            if want is None or int(want) == int(era.epoch_start):
+                continue
+            if name == "next":
+                self._discard_prepared_era(name, "the v2b switch opens a seed epoch at this era")
+            else:
+                log.error("rolling: running era %d is in seed epoch %d but the v2b switch "
+                          "now names %d — not discarded (validators judge the era under "
+                          "the config they applied)", era.index, era.epoch_start, want)
 
     def _discard_prepared_era(self, name, reason):
         with self._lock:

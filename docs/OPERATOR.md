@@ -237,16 +237,17 @@ FINAL whose runtime image differs from the pin.
 
 **Deploying this release: the chain.toml values first.** Every deployed
 chain.toml must carry `[v2] eval_n_windows_after = 4000`,
-`[v2] image_decoupled_feature = "v2b-150ec0d0"`, and the typed
+`[v2] image_decoupled_feature = "v2b-90bc5237"`, and the typed
 `[scoring] forfeit_from_block = 9166500` / `margin_v2_from_block = 9194400`.
 The feature name hashes `eval_n_windows_after`, so a file without it would
-vote on `v2b-6bbd262b` and fork from the fleet.
+vote on `v2b-80853b4a` and fork from the fleet.
 
 **Restarting a validator on this release is a vote.** With the pins in its
-chain.toml, a validator signals `v2b-150ec0d0` in its on-chain note from its
+chain.toml, a validator signals `v2b-90bc5237` in its on-chain note from its
 first loop: there is no separate "release, then vote" step. Lock-in follows
-at 51 % of stake, and the switch is the first era start after the lock-in
-boundary. So:
+at 51 % of stake, and the switch is the era start two eras after the lock-in
+boundary's era — an era that opens a v2 seed epoch (new seeds, a forced king
+retrain, the same init; DEC-CA-0067 rule 2). So:
 1. **Trainer first.** If lock-in happens while the trainer still runs older
    code, every upgraded validator rejects every post-switch settlement
    (`era_numerics_missing`). Restart the trainer on this release (no legs in
@@ -282,8 +283,8 @@ What refuses and what keeps running on a file without them:
 **Note byte budget: the two ways to free room for `v2b-`.** The commitment
 field is 128 bytes. The main validator's live note today is 124 B
 (`cascade-ready:1:rolling-era-king:0:0:forfeit-42b1a486:9165600:9166500:margin-v2-d30eb443:9190800:9194400:prelaunch-95-r2:0:0`);
-`:v2b-150ec0d0:0:0` adds 17 B, and the locked segment
-(`:v2b-150ec0d0:<lock>:<switch>`) adds 29 B. The owner picks one of these
+`:v2b-90bc5237:0:0` adds 17 B, and the locked segment
+(`:v2b-90bc5237:<lock>:<switch>`) adds 29 B. The owner picks one of these
 (Approve-tier, chain.toml edits on every deployed copy):
 
 - **(a) type the decided forfeit / margin-v2 blocks** (required on mainnet):
@@ -334,7 +335,7 @@ Steps (Approve-tier; snapshot each file first):
    print(image_decoupled_feature(c))"
    ```
 
-   It must print `v2b-150ec0d0` and raise nothing.
+   It must print `v2b-90bc5237` and raise nothing.
 3. Only then restart, one service at a time (validator, trainer, audit,
    intake, provisioner, satellite), and check each log for the startup line
    and no `image_decoupled_feature` ERROR.
