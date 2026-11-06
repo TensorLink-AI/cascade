@@ -44,12 +44,16 @@ class PrivateEvalUnavailable(RuntimeError):
 
 
 def forecasts_via_host(host, checkpoint, windows, *, contract, num_samples,
-                       workers=1, timeout_s=3600, runner=None):
+                       workers=1, timeout_s=3600, runner=None, quantile_levels=None):
     """Send only histories to an explicitly configured operator-owned host.
 
     Score returned samples locally against the original targets. A missing,
     corrupt, stale or partial reply holds the round; it never invents scores
     or silently switches a consensus comparison to another execution mode.
+    ``quantile_levels`` set (DEC-CA-0067 ``quantile_head_after``) ⇒ the host is
+    asked for each window's ``(C, H, num_q)`` quantiles at those levels
+    instead of samples; a worker from before the knob refuses the request and
+    the round holds — the validator never falls back to the sample path.
     """
     from ..eval.checkpoint_guard import CheckpointTampered, verify_checkpoint
     from .evaluator import EvaluatorError
@@ -77,8 +81,8 @@ def forecasts_via_host(host, checkpoint, windows, *, contract, num_samples,
     try:
         local = Path(tmpdir.name)
         request = local / "request.npz"
-        identity = write_request(request, checkpoint, windows,
-                                 contract=contract, num_samples=num_samples)
+        identity = write_request(request, checkpoint, windows, contract=contract,
+                                 num_samples=num_samples, quantile_levels=quantile_levels)
         step(build_ssh_argv(host, f"umask 077 && mkdir -p {shlex.quote(base + '/checkpoint')}"))
         for name in CHECKPOINT_FILES:
             step(build_scp_argv(host, str(Path(checkpoint) / name), f"{base}/checkpoint/{name}"))
@@ -94,7 +98,8 @@ def forecasts_via_host(host, checkpoint, windows, *, contract, num_samples,
                    + " ".join(shlex.quote(a) for a in argv))
         step(build_ssh_argv(host, command))
         size = step(build_ssh_argv(host, f"stat -c %s {shlex.quote(base + '/samples.npz')}"))
-        budget = (sum(w.n_channels * num_samples * w.horizon * 8 for w in windows)
+        depth = len(quantile_levels) if quantile_levels is not None else int(num_samples)
+        budget = (sum(w.n_channels * depth * w.horizon * 8 for w in windows)
                   + (len(windows) + 1) * 8192)
         if not 0 < int(size.stdout.strip()) <= budget:
             raise PrivateEvalUnavailable("private evaluation response exceeds its shape budget")
@@ -106,8 +111,9 @@ def forecasts_via_host(host, checkpoint, windows, *, contract, num_samples,
         # the round as infrastructure, never a miner fault), then stream
         # the samples one window at a time into the scorer: the full
         # duel's samples never sit in the validator's RAM at once.
-        check_forecasts(output, identity, windows, num_samples)
-        streamed = StreamedForecasts(output, windows, num_samples, tmpdir)
+        check_forecasts(output, identity, windows, num_samples, quantile_levels)
+        streamed = StreamedForecasts(output, windows, num_samples, tmpdir,
+                                     quantile_levels=quantile_levels)
         tmpdir = None              # owned by ``streamed`` now
         return streamed
     except PrivateEvalUnavailable:
@@ -132,8 +138,9 @@ class StreamedForecasts:
     the iterator) removes it. A read failure here is infrastructure
     (:class:`PrivateEvalUnavailable`) — the reply was already validated."""
 
-    def __init__(self, path, windows, num_samples, tmpdir):
+    def __init__(self, path, windows, num_samples, tmpdir, quantile_levels=None):
         self.path, self.windows, self.num_samples = Path(path), list(windows), int(num_samples)
+        self.quantile_levels = None if quantile_levels is None else tuple(quantile_levels)
         self._tmpdir = tmpdir
         self._gen = None
 
@@ -148,7 +155,8 @@ class StreamedForecasts:
 
         def gen():
             try:
-                yield from iter_forecasts(self.path, self.windows, self.num_samples)
+                yield from iter_forecasts(self.path, self.windows, self.num_samples,
+                                          self.quantile_levels)
             except Exception as e:  # noqa: BLE001 — validated already: never a miner fault
                 raise PrivateEvalUnavailable(
                     f"private evaluation samples unreadable: {type(e).__name__}") from e

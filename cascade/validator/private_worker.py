@@ -17,7 +17,25 @@ from pathlib import Path
 import numpy as np
 
 SCHEMA = "cascade-private-eval/1"
+# DEC-CA-0067 ``quantile_head_after``: a request for the checkpoint's QUANTILES
+# (``(C, H, num_q)`` per window at ``metadata["quantile_levels"]``) instead of
+# samples. A distinct schema string, so a worker from before the knob refuses
+# the request outright ("incompatible") instead of answering with samples the
+# validator would then reject — either way the round holds as infrastructure.
+SCHEMA_QUANTILES = "cascade-private-eval/2-quantiles"
 CHECKPOINT_FILES = ("config.json", "forecast_wrapper.py", "model.py", "weights.safetensors")
+
+
+def _per_window_depth(num_samples, quantile_levels) -> int:
+    """Rows per (channel, horizon step) in a reply: the quantile count on the
+    quantile-head path, else the sample count."""
+    return len(quantile_levels) if quantile_levels is not None else int(num_samples)
+
+
+def _expected_shape(window, num_samples, quantile_levels) -> tuple[int, int, int]:
+    if quantile_levels is not None:
+        return (window.n_channels, window.horizon, len(quantile_levels))
+    return (window.n_channels, int(num_samples), window.horizon)
 
 
 def file_hash(path: Path) -> str:
@@ -32,7 +50,9 @@ def checkpoint_hashes(directory: Path) -> dict:
     return {name: file_hash(directory / name) for name in CHECKPOINT_FILES}
 
 
-def write_request(path, checkpoint, windows, *, contract, num_samples):
+def write_request(path, checkpoint, windows, *, contract, num_samples, quantile_levels=None):
+    """``quantile_levels`` set ⇒ a quantile-head request (:data:`SCHEMA_QUANTILES`);
+    None ⇒ the sample request, byte-identical to before the knob."""
     from ..eval.torch_runtime import capture_runtime
 
     metadata = {"schema": SCHEMA, "contract": asdict(contract),
@@ -40,6 +60,9 @@ def write_request(path, checkpoint, windows, *, contract, num_samples):
                 "num_samples": int(num_samples),
                 "horizons": [w.horizon for w in windows],
                 "checkpoint": checkpoint_hashes(Path(checkpoint))}
+    if quantile_levels is not None:
+        metadata["schema"] = SCHEMA_QUANTILES
+        metadata["quantile_levels"] = [float(q) for q in quantile_levels]
     arrays = {f"h_{i}": np.ascontiguousarray(w.history, dtype=np.float64)
               for i, w in enumerate(windows)}
     arrays["metadata"] = np.frombuffer(json.dumps(metadata, allow_nan=False).encode(), dtype=np.uint8)
@@ -59,8 +82,13 @@ def run_request(checkpoint, request, output, *, device="cuda", workers=1, qualif
     request_hash = file_hash(Path(request))
     with np.load(request, allow_pickle=False) as data:
         metadata = json.loads(data["metadata"].tobytes())
-        if metadata.get("schema") != SCHEMA:
+        if metadata.get("schema") not in (SCHEMA, SCHEMA_QUANTILES):
             raise ValueError("incompatible private evaluation request")
+        quantile_levels = None
+        if metadata["schema"] == SCHEMA_QUANTILES:
+            quantile_levels = tuple(float(q) for q in metadata["quantile_levels"])
+            if not quantile_levels:
+                raise ValueError("private evaluation quantile request names no levels")
         horizons = metadata["horizons"]
         if set(data.files) != {"metadata"} | {f"h_{i}" for i in range(len(horizons))}:
             raise ValueError("private evaluation input coverage mismatch")
@@ -77,12 +105,12 @@ def run_request(checkpoint, request, output, *, device="cuda", workers=1, qualif
         started = time.perf_counter()
         baseline = forecast_checkpoint_windows(
             checkpoint, histories, horizons, num_samples=int(metadata["num_samples"]),
-            device=device, contract=contract, workers=1)
+            device=device, contract=contract, workers=1, quantile_levels=quantile_levels)
         baseline_seconds = time.perf_counter() - started
     started = time.perf_counter()
     samples = forecast_checkpoint_windows(
         checkpoint, histories, horizons, num_samples=int(metadata["num_samples"]),
-        device=device, contract=contract, workers=workers)
+        device=device, contract=contract, workers=workers, quantile_levels=quantile_levels)
     seconds = time.perf_counter() - started
     if baseline is not None and (len(samples) != len(baseline) or any(
             not np.array_equal(a, b) for a, b in zip(samples, baseline, strict=True))):
@@ -90,7 +118,7 @@ def run_request(checkpoint, request, output, *, device="cuda", workers=1, qualif
     arrays = {f"s_{i}": s for i, s in enumerate(samples)}
     arrays["request_sha256"] = np.frombuffer(request_hash.encode(), dtype=np.uint8)
     np.savez(output, **arrays)
-    return {"schema": SCHEMA, "request_sha256": request_hash, "windows": len(histories),
+    return {"schema": metadata["schema"], "request_sha256": request_hash, "windows": len(histories),
             "workers": workers, "seconds": seconds, "sequential_seconds": baseline_seconds,
             "qualified": bool(qualify), "device": device,
             "torch": torch.__version__, "cuda": torch.version.cuda, "numpy": np.__version__,
@@ -98,13 +126,15 @@ def run_request(checkpoint, request, output, *, device="cuda", workers=1, qualif
                         if str(device).startswith("cuda") else ["cpu"])}
 
 
-def check_forecasts(path, request_hash, windows, num_samples) -> None:
+def check_forecasts(path, request_hash, windows, num_samples, quantile_levels=None) -> None:
     """Check exact coverage, request binding, shape, dtype and finiteness of
     EVERY window before any score is computed — one window in memory at a
-    time (the validator box holds 7 GB; a full duel's samples are ~GBs)."""
+    time (the validator box holds 7 GB; a full duel's samples are ~GBs).
+    ``quantile_levels`` set ⇒ the reply holds ``(C, H, num_q)`` quantiles."""
     import zipfile
 
-    max_bytes = sum(w.n_channels * num_samples * w.horizon * 8 for w in windows)
+    depth = _per_window_depth(num_samples, quantile_levels)
+    max_bytes = sum(w.n_channels * depth * w.horizon * 8 for w in windows)
     with zipfile.ZipFile(path) as archive:
         if sum(f.file_size for f in archive.infolist()) > max_bytes + (len(windows) + 1) * 4096:
             raise ValueError("private evaluation result exceeds its shape budget")
@@ -116,32 +146,32 @@ def check_forecasts(path, request_hash, windows, num_samples) -> None:
             raise ValueError("private evaluation response belongs to another request")
         for i, window in enumerate(windows):
             arr = data[f"s_{i}"]
-            _check_window(arr, window, num_samples)
+            _check_window(arr, window, num_samples, quantile_levels)
             del arr
 
 
-def _check_window(arr, window, num_samples) -> None:
-    if arr.dtype != np.float64 or arr.shape != (window.n_channels, num_samples, window.horizon):
+def _check_window(arr, window, num_samples, quantile_levels=None) -> None:
+    if arr.dtype != np.float64 or arr.shape != _expected_shape(window, num_samples, quantile_levels):
         raise ValueError("private evaluation forecast shape/dtype mismatch")
     if not np.isfinite(arr).all():
         raise ValueError("private evaluation forecast is non-finite")
 
 
-def iter_forecasts(path, windows, num_samples):
-    """Yield each window's samples in window order, read lazily from the NPZ
-    (call :func:`check_forecasts` first). Same arrays, same order as
-    :func:`read_forecasts` — only the peak memory differs."""
+def iter_forecasts(path, windows, num_samples, quantile_levels=None):
+    """Yield each window's samples (or quantiles) in window order, read lazily
+    from the NPZ (call :func:`check_forecasts` first). Same arrays, same order
+    as :func:`read_forecasts` — only the peak memory differs."""
     with np.load(path, allow_pickle=False) as data:
         for i, window in enumerate(windows):
             arr = data[f"s_{i}"]
-            _check_window(arr, window, num_samples)
+            _check_window(arr, window, num_samples, quantile_levels)
             yield arr
 
 
-def read_forecasts(path, request_hash, windows, num_samples):
+def read_forecasts(path, request_hash, windows, num_samples, quantile_levels=None):
     """Check exact coverage, request binding, shape and dtype before scoring."""
-    check_forecasts(path, request_hash, windows, num_samples)
-    return list(iter_forecasts(path, windows, num_samples))
+    check_forecasts(path, request_hash, windows, num_samples, quantile_levels)
+    return list(iter_forecasts(path, windows, num_samples, quantile_levels))
 
 
 def main(argv=None):

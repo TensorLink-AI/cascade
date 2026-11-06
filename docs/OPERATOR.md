@@ -237,13 +237,24 @@ FINAL whose runtime image differs from the pin.
 
 **Deploying this release: the chain.toml values first.** Every deployed
 chain.toml must carry `[v2] eval_n_windows_after = 4000`,
-`[v2] image_decoupled_feature = "v2b-90bc5237"`, and the typed
+`[v2] quantile_head_after = true`,
+`[v2] image_decoupled_feature = "v2b-b10591aa"`, and the typed
 `[scoring] forfeit_from_block = 9166500` / `margin_v2_from_block = 9194400`.
-The feature name hashes `eval_n_windows_after`, so a file without it would
-vote on `v2b-80853b4a` and fork from the fleet.
+The feature name hashes `eval_n_windows_after` and `quantile_head_after`, so
+a file missing either would vote on another name (`v2b-80853b4a` without
+both, `v2b-90bc5237` without the quantile-head knob) and fork from the fleet.
+
+**What the bundle switches (all at the same era start).** The image-decoupled
+per-leg contract rule, the 4000-window verdict budget, and the quantile-head
+verdict: from the switch era a v2 settlement scores each checkpoint's quantile
+head directly (the wrapper's `forecast_quantiles_batch` at the 9-level scoring
+grid, the benchmark path's method) instead of drawing 100 copula sample
+paths. A validator that offloads private eval to a GPU host must run this
+release on that host too — an older worker refuses the quantile request and
+the round holds until it is upgraded (never a silent fallback to samples).
 
 **Restarting a validator on this release is a vote.** With the pins in its
-chain.toml, a validator signals `v2b-90bc5237` in its on-chain note from its
+chain.toml, a validator signals `v2b-b10591aa` in its on-chain note from its
 first loop: there is no separate "release, then vote" step. Lock-in follows
 at 51 % of stake, and the switch is the era start two eras after the lock-in
 boundary's era — an era that opens a v2 seed epoch (new seeds, a forced king
@@ -288,8 +299,8 @@ What refuses and what keeps running on a file without them:
 **Note byte budget: the two ways to free room for `v2b-`.** The commitment
 field is 128 bytes. The main validator's live note today is 124 B
 (`cascade-ready:1:rolling-era-king:0:0:forfeit-42b1a486:9165600:9166500:margin-v2-d30eb443:9190800:9194400:prelaunch-95-r2:0:0`);
-`:v2b-90bc5237:0:0` adds 17 B, and the locked segment
-(`:v2b-90bc5237:<lock>:<switch>`) adds 29 B. The owner picks one of these
+`:v2b-b10591aa:0:0` adds 17 B, and the locked segment
+(`:v2b-b10591aa:<lock>:<switch>`) adds 29 B. The owner picks one of these
 (Approve-tier, chain.toml edits on every deployed copy):
 
 - **(a) type the decided forfeit / margin-v2 blocks** (required on mainnet):
@@ -327,7 +338,7 @@ segment its 128-byte field would drop, so no vote is dropped silently.
 
 Steps (Approve-tier; snapshot each file first):
 1. Hand-edit every deployed chain.toml (trainer box `/root/cascade/chain.toml`,
-   the main validator's, any satellite / intake copy): add the two `[v2]` keys
+   the main validator's, any satellite / intake copy): add the three `[v2]` keys
    and type the two `[scoring]` blocks.
 2. Validate THAT exact file with the release loader before restarting
    anything, as the voting processes will:
@@ -340,7 +351,7 @@ Steps (Approve-tier; snapshot each file first):
    print(image_decoupled_feature(c))"
    ```
 
-   It must print `v2b-90bc5237` and raise nothing.
+   It must print `v2b-b10591aa` and raise nothing.
 3. Only then restart, one service at a time (validator, trainer, audit,
    intake, provisioner, satellite), and check each log for the startup line
    and no `image_decoupled_feature` ERROR.

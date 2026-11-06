@@ -108,15 +108,23 @@ def test_no_switch_applied_is_exactly_the_warm_start_rule(base):
 
 def test_feature_name_is_the_rule_2_bundle():
     assert A.V2B_RULE == "image-decoupled/2"
+    # without the quantile-head knob the name is exactly the pre-knob one
     for n, want in ((4000, "v2b-90bc5237"), (300, "v2b-3a259561")):
         body = f"image-decoupled/2|train_image_digest,continuation_protocol|eval_n_windows_after={n}"
         assert want == "v2b-" + hashlib.sha256(body.encode()).hexdigest()[:8]
-        assert A.v2b_feature_name(n) == want
+        assert A.v2b_feature_name(n) == want == A.v2b_feature_name(n, False)
+    # quantile_head_after = true is part of the bundle: a fresh name
+    for n, want in ((4000, "v2b-b10591aa"), (300, "v2b-f2eefcb3")):
+        body = (f"image-decoupled/2|train_image_digest,continuation_protocol|"
+                f"eval_n_windows_after={n}|quantile_head_after=1")
+        assert want == "v2b-" + hashlib.sha256(body.encode()).hexdigest()[:8]
+        assert A.v2b_feature_name(n, True) == want != A.v2b_feature_name(n)
     assert A.v2b_feature_name(4000) != "v2b-150ec0d0"           # the /1 name is retired
     main = load_chain_config(ROOT / "chain.toml")
     test = load_chain_config(ROOT / "chain.testnet.toml")
-    assert main.v2.image_decoupled_feature == "v2b-90bc5237"
-    assert test.v2.image_decoupled_feature == "v2b-3a259561"
+    assert main.v2.quantile_head_after and test.v2.quantile_head_after
+    assert main.v2.image_decoupled_feature == "v2b-b10591aa" == A.v2b_feature_name_for(main.v2)
+    assert test.v2.image_decoupled_feature == "v2b-f2eefcb3" == A.v2b_feature_name_for(test.v2)
 
 
 def test_lock_in_takes_effect_two_eras_after_its_era(base):

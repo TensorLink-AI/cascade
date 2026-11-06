@@ -114,7 +114,7 @@ class Runner(EraGateMixin, LaneBMixin):
     def _fetch_checkpoint_dir(self, entry):
         return self.ops.fetch(entry.trained_pointer)
 
-    def _evaluate(self, entry, windows, contract):
+    def _evaluate(self, entry, windows, contract, **_):
         return self.ops.merge_scores(entry.trained_pointer, 20)
 
     def _lane_b_state_path(self):

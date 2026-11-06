@@ -99,8 +99,9 @@ This is the DEC-CA-0045 secondary-feature path, aligned to eras like
 DEC-CA-0049.
 
 - **Feature.** The name is
-  `v2b-<sha256("image-decoupled/2|train_image_digest,continuation_protocol|eval_n_windows_after=<n>")[:8]>`
-  (mainnet: `v2b-90bc5237`). It is short because of the note budget below.
+  `v2b-<sha256("image-decoupled/2|train_image_digest,continuation_protocol|eval_n_windows_after=<n>[|quantile_head_after=1]")[:8]>`
+  (mainnet: `v2b-b10591aa` with the quantile-head item, bundle item 3 below;
+  `v2b-90bc5237` without it). It is short because of the note budget below.
   A changed bundle is a fresh vote.
 - **Signal.** Validators on this release add the segment to their note at startup
   whenever `[activation]` is on and v2 is scheduled.
@@ -176,7 +177,82 @@ different times, so the switch cannot WAIT for an epoch start. Instead:
   rejects an era at or after it that names an older seed block.
 - **Fresh vote.** The rule version is `image-decoupled/2`: mainnet
   `v2b-90bc5237`, testnet `v2b-3a259561` (was `v2b-150ec0d0` / `v2b-c74823cc`;
-  never signalled — #410 was not deployed).
+  never signalled — #410 was not deployed). Superseded again by bundle item 3
+  below before any external validator signalled: mainnet `v2b-b10591aa`,
+  testnet `v2b-f2eefcb3`.
+
+## Bundle item 3: the quantile-head verdict (`[v2] quantile_head_after`)
+
+The v2 pyramid model has a unified quantile/copula head. The benchmark path
+(GIFT-Eval / BOOM / TIME, the promotion geomean) already scores the head
+directly — `forecast_quantiles_batch`, gluonts `QuantileForecast`, no
+sampling — exactly as the official Toto 2 leaderboard runs do. The private
+verdict did not: it drew 100 copula sample paths per window
+(`forecast_joint`), took empirical quantiles of those samples and fed them to
+the pinball loss. The samples' marginals ARE the head's quantiles (the copula
+sampler maps Gaussian noise through the head's quantile function), so the
+Monte-Carlo step adds only noise — the same noise for king and challenger on
+the same seeded draws, but noise in the paired bootstrap's floor nonetheless,
+and a 100-sample forward where one would do.
+
+- **The rule.** From the applied v2b switch era on
+  (`v2_quantile_head_at(cfg, boundary)`: the `v2_eval_windows_at` convention —
+  the settlement AT the switch block is the previous era's last and keeps the
+  sample path), every v2 settlement scores each checkpoint's quantile head
+  directly: `load_quantile_forecaster` calls the wrapper's
+  `forecast_quantiles_batch(histories, horizon)` once per window with the
+  channels as the batch (every private window is univariate, so this is the
+  same per-channel forward the sample path ran) and picks the scorer's
+  9-level grid out of the head's 21 levels by exact match — nothing is
+  interpolated; a head missing a grid level is a deterministic fault of the
+  checkpoint (`quantile_head_unavailable`). `score_joint_quantile_forecaster_
+  on_windows` then produces `WindowScore` rows of the exact shape the sample
+  path produced (`pinball_components` is `mwsql_components` minus the
+  `np.quantile` of samples; the MASE point is the 0.5 quantile, the sample
+  path's median of samples), so the round statistic, the paired bootstrap,
+  the receipts and the audit are unchanged.
+- **Everywhere the validator scores.** The settlement duel, the increment
+  baseline, lane B's king / expert judgement, merge acceptance and the king
+  check all pass the settlement boundary into `_evaluate(..., block=)`, which
+  reads the rule there. The private GPU offload asks the worker for
+  quantiles (`cascade-private-eval/2-quantiles`); a worker from before this
+  release refuses the request and the round holds as infrastructure — a
+  validator never falls back to the sample path. The audit's score replay
+  (`rederive`) reads the same rule at the receipt's boundary.
+- **Part of the bundle.** `quantile_head_after = true` joins the v2b feature
+  hash (`...|quantile_head_after=1`), so the fleet votes on the scoring rule
+  together with the contract rule and the window budget and every node
+  switches at the same era start. A config without the knob (or with it
+  false) computes the pre-knob name and runs the sample path, byte-identical:
+  nothing changes for a deployment that does not opt in. The loader's fork
+  guard pins the name as before.
+- **Not a model change.** The pyramid wrapper and model bytes are untouched;
+  `base_arch_digest` and the checkpoint guard are unchanged. Carried king
+  checkpoints are scored by their quantile head as they stand.
+- **Multichannel windows.** `forecast_quantiles_batch` runs the channels as
+  independent batch items (the benchmark path's per-variate convention),
+  where the sample path's `forecast_joint` conditioned across channels. Every
+  private window is univariate today, so nothing changes; should the pool
+  ever carry C>1 windows, the head path scores them channel by channel — the
+  same on every validator (no fork), stated here so it is a known choice.
+  Changing the wrapper to a joint quantile call would be a wrapper-bytes
+  (checkpoint-guard) change and is not part of this item.
+- **Trainer parity.** The trainer's lane-B self-judge and its merge-acceptance
+  pre-check (`RunnerLaneBOps.judge` / `merge_scores`) read the same rule at
+  the same boundary, so the manifest the trainer publishes is judged as the
+  fleet will judge it. Miner-local tooling (`cascade score` / `iterate`, the
+  direct runtime, calibration) keeps the sample path: it is not consensus and
+  differs from the live verdict by the Monte-Carlo residual only.
+- **Non-finite head.** The wrapper refuses a non-finite quantile tensor; the
+  evaluator surfaces that as `EvaluatorError` (`quantile_head_forward_failed`),
+  a deterministic entry fault, never an endless settlement retry.
+- **Comparability.** Scores on the two paths differ by the Monte-Carlo
+  residual only; the first switch-era settlement is not compared with a
+  pre-switch one in absolute terms anyway (new seeds, forced king retrain).
+- **Receipts.** `eval_context.num_samples` keeps recording `[eval]
+  num_samples`; the scoring rule is a function of the receipt's boundary
+  (`cfg.quantile_head_at(epoch_start_block)`), so the signed body needs no
+  new field.
 
 ## Blast radius / fork risk (state BEFORE deploying)
 
@@ -438,11 +514,12 @@ Lane handling:
 2. Every node, external validators, the main validator and the trainer,
    deploys the release `chain.toml` values: the typed `[scoring]
    forfeit_from_block = 9166500` / `margin_v2_from_block = 9194400`, `[v2]
-   eval_n_windows_after = 4000` and `[v2] image_decoupled_feature =
-   "v2b-90bc5237"`. The main validator's and the trainer's live files are
-   edited by hand (the live trainer file lacks `eval_n_windows_after`).
-   **Fork guard:** the feature name hashes `eval_n_windows_after`; a file
-   without it computes `v2b-80853b4a` and would signal and tally another
+   eval_n_windows_after = 4000`, `[v2] quantile_head_after = true` and `[v2]
+   image_decoupled_feature = "v2b-b10591aa"`. The main validator's and the
+   trainer's live files are edited by hand.
+   **Fork guard:** the feature name hashes `eval_n_windows_after` and
+   `quantile_head_after`; a file without them computes `v2b-80853b4a` (or
+   `v2b-90bc5237` without the quantile-head knob) and would signal and tally another
    feature, silently. The loader therefore refuses to start any node whose
    computed name differs from the pinned `image_decoupled_feature`, or whose
    pin is absent while `[activation]` is on and v2 is scheduled.

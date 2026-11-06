@@ -828,28 +828,28 @@ def vote_pin_required() -> bool:
 def check_image_decoupled_feature(cfg) -> None:
     """DEC-CA-0067 fork guard: the ``v2b-`` feature this config would vote on
     must equal the PINNED ``[v2] image_decoupled_feature``. Its name hashes
-    ``eval_n_windows_after``, so a node whose chain.toml lacks (or changes)
-    that key would signal — and tally — a different feature, silently: the
-    trainer would never resolve the switch and validators would fork. Pinned
-    key required whenever the feature exists (``[activation]`` on, v2
-    scheduled); a pinned key is checked even when it does not."""
-    from ..activation import image_decoupled_feature, v2b_feature_name
+    ``eval_n_windows_after`` and ``quantile_head_after``, so a node whose
+    chain.toml lacks (or changes) a key would signal — and tally — a different
+    feature, silently: the trainer would never resolve the switch and
+    validators would fork. Pinned key required whenever the feature exists
+    (``[activation]`` on, v2 scheduled); a pinned key is checked even when it
+    does not."""
+    from ..activation import image_decoupled_feature, v2b_feature_name_for
 
     pinned = str(getattr(cfg.v2, "image_decoupled_feature", "") or "")
     spec = image_decoupled_feature(cfg)
-    want = (spec.name if spec is not None
-            else v2b_feature_name(int(cfg.v2.eval_n_windows_after or 0)))
+    want = spec.name if spec is not None else v2b_feature_name_for(cfg.v2)
+    inputs = (f"[v2] eval_n_windows_after={int(cfg.v2.eval_n_windows_after or 0)}, "
+              f"quantile_head_after={str(bool(cfg.v2.quantile_head_after)).lower()}")
     why = ""
     if spec is not None and not pinned:
         why = (f"[v2] image_decoupled_feature is not pinned: this config votes on {want} "
-               f"([v2] eval_n_windows_after={int(cfg.v2.eval_n_windows_after or 0)}). Deploy the "
-               "release chain.toml values ([v2] eval_n_windows_after and "
-               "image_decoupled_feature)")
+               f"({inputs}). Deploy the release chain.toml values ([v2] eval_n_windows_after, "
+               "quantile_head_after and image_decoupled_feature)")
     elif pinned and pinned != want:
         why = (f"[v2] image_decoupled_feature = {pinned!r} but this config computes {want} "
-               f"([v2] eval_n_windows_after={int(cfg.v2.eval_n_windows_after or 0)}): it would "
-               "vote on a different DEC-CA-0067 feature than the fleet — fix "
-               "eval_n_windows_after to the release value")
+               f"({inputs}): it would vote on a different DEC-CA-0067 feature than the "
+               "fleet — fix eval_n_windows_after / quantile_head_after to the release values")
     if not why:
         return
     if _REQUIRE_VOTE_PIN:

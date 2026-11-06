@@ -605,7 +605,7 @@ class KingCheckMixin:
                 king_scores, base_scores, tenure = stash[1], stash[2], stash[3]
             else:
                 king_scores, base_scores, tenure = (
-                    self._evaluate(king, windows, training), None, None)
+                    self._evaluate(king, windows, training, block=boundary), None, None)
                 fresh.append(EntryScores(
                     role="king", size=size, hotkey=king.miner_hotkey, uid=king.miner_uid,
                     scores=self._window_records(king_scores, manifest)))
@@ -613,7 +613,7 @@ class KingCheckMixin:
                 base_scores = self._evaluate(TrainedEntry(
                     miner_hotkey=self.BASELINE_HOTKEY, miner_uid=-1, role="king",
                     gen_ref="", trained_pointer=init_pointer, corpus_digest="",
-                    train_block=0, size=size), windows, training)
+                    train_block=0, size=size), windows, training, block=boundary)
                 fresh.append(EntryScores(
                     role="init", size=size, hotkey=self.BASELINE_HOTKEY, uid=-1,
                     scores=self._window_records(base_scores, manifest)))

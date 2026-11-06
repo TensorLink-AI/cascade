@@ -1465,11 +1465,15 @@ class RunnerLaneBOps:
 
         contract = cfg.training.at_block(
             settlement_contract_block(cfg.round, int(block))).primary_size
+        # DEC-CA-0067 quantile_head_after: the validator's rule at the same
+        # boundary (ValidatorRunner._evaluate(block=)) — the self-judge must
+        # score exactly as the fleet will.
+        quantile_head = bool(cfg.quantile_head_at(int(block)))
 
         def _eval(pointer: str):
             return evaluate_checkpoint(self.fetch(pointer), windows,
                                        num_samples=cfg.eval.num_samples, device=self.device,
-                                       contract=contract)
+                                       contract=contract, quantile_head=quantile_head)
 
         return judge_manifest(manifest, king_pointer=manifest.king_pointer,
                               king_scores=_eval(manifest.king_pointer), evaluate=_eval,
@@ -1484,7 +1488,8 @@ class RunnerLaneBOps:
         windows = verdict_windows(cfg, self.source, int(block), block=int(block))
         return evaluate_checkpoint(
             self.fetch(pointer), windows, num_samples=cfg.eval.num_samples,
-            device=self.device, contract=cfg.training.at_block(int(block)).primary_size)
+            device=self.device, contract=cfg.training.at_block(int(block)).primary_size,
+            quantile_head=bool(cfg.quantile_head_at(int(block))))
 
 
 def lane_b_queue_of(runner):

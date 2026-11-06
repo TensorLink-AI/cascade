@@ -108,7 +108,7 @@ def _settle(cfg, gate, era, b, *, report, king_scale=0.7, n=256, reign_start=Non
     r._fetch_bench_report = lambda rid, **k: report
     init = make_scores(1.0, 7, n=n)
     king = _scaled(init, king_scale)
-    r._evaluate = lambda entry, windows, training: list(
+    r._evaluate = lambda entry, windows, training, **_: list(
         init if entry.trained_pointer == IP else king)
     m = _manifest(b, warm=(IP if stash else ""))
     entry_scores = ()
@@ -315,7 +315,7 @@ def test_receipt_bytes_unchanged_without_a_check(env, variant):
     r.cascade = CascadeController(reign_days=1.0, state=CascadeState(
         king_hotkey=KING, reign_start_block=gate + era, clock_observed=True))
     r._fetch_bench_report = lambda rid, **k: _report()
-    r._evaluate = lambda *a: make_scores(1.0, 7)
+    r._evaluate = lambda *a, **_: make_scores(1.0, 7)
     m = _manifest(b)
     r._v2_settlement_economics(m, [], SEED, None, KING)
     assert r._king_check_for(m.round_id) is None

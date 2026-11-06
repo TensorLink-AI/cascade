@@ -148,7 +148,8 @@ def verify_acceptance(runner, manifest):
                 if pointer not in scores_cache:
                     try:
                         scores_cache[pointer] = runner._evaluate(
-                            replace(king, trained_pointer=pointer), windows, contract)
+                            replace(king, trained_pointer=pointer), windows, contract,
+                            block=block)
                     except Exception as e:
                         raise StorageError(f"acceptance scoring unavailable: {e}") from e
                 return scores_cache[pointer]

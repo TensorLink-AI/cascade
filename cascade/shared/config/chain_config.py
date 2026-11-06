@@ -140,6 +140,14 @@ class ChainConfig:
                  else int(self.v2.eval_n_windows))
         return int(n) if active and n else int(self.eval.n_windows)
 
+    def quantile_head_at(self, block: int | None) -> bool:
+        """DEC-CA-0067 ``[v2] quantile_head_after``: whether the settlement at
+        boundary ``block`` scores the quantile head directly
+        (:func:`cascade.shared.era.v2_quantile_head_at`); ``None`` = never."""
+        from ..era import v2_quantile_head_at
+
+        return v2_quantile_head_at(self, block)
+
     def koth_params(self, block: int | None = None) -> Any:
         """Build a :class:`cascade.eval.koth.KothParams` from ``[scoring]``
         for the round at epoch boundary ``block`` (``None`` = the steady-state

@@ -1199,10 +1199,17 @@ image_decoupled_from_block = 0
 # Bundled with the same block (part of the vote's hash): the v2 private
 # verdict budget becomes this many windows. Inert until the switch.
 eval_n_windows_after = 4000
-# Fork guard (CONSENSUS): the v2b feature name the two values above hash to.
+# Bundled with the same block (part of the vote's hash): from the switch era a
+# v2 settlement scores every checkpoint's QUANTILE HEAD directly — the pinball
+# loss reads the wrapper's forecast_quantiles_batch at the 9-level scoring
+# grid (the benchmark path's method), no copula sampling, no Monte-Carlo
+# noise. Inert until the switch; false = the sample path, byte-identical.
+quantile_head_after = true
+# Fork guard (CONSENSUS): the v2b feature name the three values above hash to.
 # Every node loads only if it computes exactly this name (missing or another
-# eval_n_windows_after => refuses to start, never votes on another feature).
-image_decoupled_feature = "v2b-90bc5237"
+# eval_n_windows_after / quantile_head_after => refuses to start, never votes
+# on another feature).
+image_decoupled_feature = "v2b-b10591aa"
 # TRAINER-ONLY provenance (not consensus, not in the vote): earlier
 # v2.training train_image_digest pins, exactly as once typed, so the trainer
 # can PROVE a pre-repin leg differs only in its image. Append the old pin here

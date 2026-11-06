@@ -575,6 +575,21 @@ def v2_eval_windows_at(cfg: Any, boundary: int | None) -> int:
     return int(getattr(v2, "eval_n_windows", 0) or 0)
 
 
+def v2_quantile_head_at(cfg: Any, boundary: int | None) -> bool:
+    """CONSENSUS (DEC-CA-0067 bundle, ``[v2] quantile_head_after``): whether a
+    v2 settlement at ``boundary`` scores every checkpoint's QUANTILE HEAD
+    directly (pinball loss on the model's own quantiles, no Monte-Carlo
+    sampling) — true from the applied v2b switch era on when the knob is set
+    (the :func:`v2_eval_windows_at` convention: the settlement AT the switch
+    block is the previous era's last and keeps the sample path). False
+    everywhere else, including every pre-v2 and every pre-switch settlement,
+    so the sample path stays byte-identical until the switch."""
+    v2 = getattr(cfg, "v2", None)
+    if not bool(getattr(v2, "quantile_head_after", False)):
+        return False
+    return v2_settlement_active(cfg, boundary) and image_decoupled_at(cfg, boundary)
+
+
 def image_after_armed(cfg: Any) -> bool:
     """DEC-CA-0067: an automatic image repin is configured (``[v2]
     train_image_digest_after`` and its companion pins)."""

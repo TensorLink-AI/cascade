@@ -649,18 +649,30 @@ def apply_prelaunch_burn_activation(cfg: ChainConfig, block: int) -> ChainConfig
 # effect two eras after the lock-in boundary's era and that era starts a v2
 # seed epoch (:func:`cascade.shared.era.v2_seed_epoch_start`) — /1 could
 # switch inside a running epoch (the 2026-11-01 mid-epoch repin class).
+# ``quantile_head_after`` (the quantile-head verdict, DEC-CA-0067 bundle
+# item 3) joins the body ONLY when true, so a config without it computes the
+# very same name as before the knob existed.
 V2B_RULE = "image-decoupled/2"
 
 
-def v2b_feature_name(eval_n_windows_after: int) -> str:
-    """``v2b-<sha256("image-decoupled/2|<fields>|eval_n_windows_after=<n>")[:8]>``.
-    Kept short on purpose: the note is ONE 128-byte commitment field shared
-    with every other segment (:data:`NOTE_MAX_BYTES`)."""
+def v2b_feature_name(eval_n_windows_after: int, quantile_head_after: bool = False) -> str:
+    """``v2b-<sha256("image-decoupled/2|<fields>|eval_n_windows_after=<n>"
+    [+ "|quantile_head_after=1"])[:8]>``. Kept short on purpose: the note is
+    ONE 128-byte commitment field shared with every other segment
+    (:data:`NOTE_MAX_BYTES`)."""
     from .manifest import IMAGE_RUNTIME_FIELDS
 
     body = (f"{V2B_RULE}|{','.join(IMAGE_RUNTIME_FIELDS)}|"
             f"eval_n_windows_after={int(eval_n_windows_after or 0)}")
+    if quantile_head_after:
+        body += "|quantile_head_after=1"
     return "v2b-" + hashlib.sha256(body.encode("utf-8")).hexdigest()[:8]
+
+
+def v2b_feature_name_for(v2: object) -> str:
+    """:func:`v2b_feature_name` of a ``[v2]`` config (duck-typed)."""
+    return v2b_feature_name(int(getattr(v2, "eval_n_windows_after", 0) or 0),
+                            bool(getattr(v2, "quantile_head_after", False)))
 
 
 def configured_image_decoupled_block(cfg: ChainConfig) -> int:
@@ -693,7 +705,7 @@ def image_decoupled_feature(cfg: ChainConfig) -> FeatureSpec | None:
     if not cfg.activation.enabled or v2 is None or not (
             int(getattr(v2, "from_block", 0) or 0) or getattr(v2, "launch_at_utc", "")):
         return None
-    name = v2b_feature_name(int(getattr(v2, "eval_n_windows_after", 0) or 0))
+    name = v2b_feature_name_for(v2)
     return FeatureSpec(name=name, typed_block=configured_image_decoupled_block(cfg),
                        align="epoch")
 
@@ -1476,6 +1488,7 @@ def summary(cfg: ChainConfig, record: ActivationRecord, t: Tally | None,
         io: dict = {
             "feature": v2b.name,
             "eval_n_windows_after": int(getattr(cfg.v2, "eval_n_windows_after", 0) or 0),
+            "quantile_head_after": bool(getattr(cfg.v2, "quantile_head_after", False)),
             "typed_block": int(v2b.typed_block),
             "lock_block": int(rec.lock_block),
             "activation_block": int(rec.activation_block),

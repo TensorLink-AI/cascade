@@ -238,10 +238,10 @@ class LaneBMixin:
 
         training = self._training_for(manifest)
         try:
-            king_scores = self._evaluate(king, windows, training)
+            king_scores = self._evaluate(king, windows, training, block=block)
             js = judge_manifest(
                 em, king_pointer=king.trained_pointer, king_scores=king_scores,
-                evaluate=lambda p: self._evaluate(_as_entry(p), windows, training),
+                evaluate=lambda p: self._evaluate(_as_entry(p), windows, training, block=block),
                 fetch_dir=lambda p: self._fetch_checkpoint_dir(_as_entry(p)),
                 cfg=self.cfg.lane_b, seed=str(base_seed),
                 # DEC-CA-0050 merge guards: refuse a non-finite expert delta

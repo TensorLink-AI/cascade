@@ -504,12 +504,15 @@ def _tier2_score_compare(
         # Both checkpoints go through the ingest guard under the round's own
         # contract: the PUBLISHED one may have come off a miner-funded pod.
         contract = contract_for_replay(receipt, cfg)
+        # DEC-CA-0067 quantile_head_after: replay under the round's own scoring
+        # rule (the validator's ``_evaluate`` reads it at the same boundary).
+        quantile_head = bool(cfg.quantile_head_at(receipt.epoch_start_block))
         ours = global_geomean(evaluate_checkpoint(
             retrained, windows, num_samples=cfg.eval.num_samples, device=device,
-            contract=contract))
+            contract=contract, quantile_head=quantile_head))
         theirs = global_geomean(evaluate_checkpoint(
             published, windows, num_samples=cfg.eval.num_samples, device=device,
-            contract=contract))
+            contract=contract, quantile_head=quantile_head))
     except Exception as e:  # noqa: BLE001
         return CheckResult(name, WARN, f"score comparison unavailable "
                                        f"({type(e).__name__}: {e}); {why}")
