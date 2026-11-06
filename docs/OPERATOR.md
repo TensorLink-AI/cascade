@@ -1981,9 +1981,9 @@ no longer holds a pod for it but keeps retrying every
 `INIT_BENCH_RETRY_SECONDS` (1 h) until the pointer lands (the log says "GAVE UP
 fast retries", then "slow retry N failed"; 2026-10-31 the old hard give-up
 after three ssh timeouts left seed epoch 2611 without a pointer, so no king
-check could pass for the whole epoch). `cascade-trainer rebuild-init-pointer
-[--reason TEXT]` resets the counter of every era still wanting its init and the
-trainer retries on its next tick (the request file
+check could pass for the whole epoch). `cascade-trainer rebuild-init-pointer`
+(an optional `--reason TEXT` is logged) resets the counter of every era still
+wanting its init and the trainer retries on its next tick (the request file
 `_train_work/init_pointer_rebuild.json` is consumed). A warm-started epoch
 needs nothing (the pointer is `warm_start_ckpt`).
 
