@@ -159,13 +159,19 @@ def test_validator_era_reuses_the_epochs_published_pointer(cfg, tmp_path, wired)
 
 
 def test_scheduler_owes_nothing_for_a_warm_started_validator_era(cfg):
-    v = _vsrc(cfg)
-    sched = SimpleNamespace(cfg=v, _ladder_era=lambda era: True,
-                            INIT_BENCH_MAX_TRIES=RollingScheduler.INIT_BENCH_MAX_TRIES)
+    def fake(c):
+        ns = SimpleNamespace(cfg=c, _ladder_era=lambda era: True,
+                             INIT_BENCH_MAX_TRIES=RollingScheduler.INIT_BENCH_MAX_TRIES)
+        ns._init_bench_wanted = lambda era: RollingScheduler._init_bench_wanted(ns, era)
+        return ns
+
+    sched = fake(_vsrc(cfg))
     assert RollingScheduler._init_bench_owed(sched, _era(warm_start_ckpt=WARM_PTR)) is False
     assert RollingScheduler._init_bench_owed(sched, _era()) is True       # random init
-    legacy = SimpleNamespace(cfg=cfg, _ladder_era=lambda era: True,
-                             INIT_BENCH_MAX_TRIES=RollingScheduler.INIT_BENCH_MAX_TRIES)
+    # past the cap: still wanted (slow retries), no longer owed (no pod held)
+    assert RollingScheduler._init_bench_owed(sched, _era(init_bench_tries=3)) is False
+    assert RollingScheduler._init_bench_wanted(sched, _era(init_bench_tries=3)) is True
+    legacy = fake(cfg)
     assert RollingScheduler._init_bench_owed(legacy, _era(warm_start_ckpt=WARM_PTR)) is True
 
 
