@@ -2141,20 +2141,68 @@ class RollingScheduler:
 
     INIT_BENCH_SECONDS = 600.0
     INIT_BENCH_MAX_TRIES = 3
+    # After the cap the pointer is still WANTED (the king check defers without
+    # it for the whole seed epoch — 2026-10-31: three ssh timeouts blocked every
+    # promotion of epoch 2611 for good), so the trainer keeps retrying at this
+    # slower cadence; it just no longer holds a pod for it (``_init_bench_owed``).
+    INIT_BENCH_RETRY_SECONDS = 3600.0
 
-    def _init_bench_owed(self, era: EraState) -> bool:
+    def _init_bench_wanted(self, era: EraState) -> bool:
         """A v2 seed epoch's init still needs its bench (the "init" entry of
         the signed bench report the king check compares against) — or, in a
         validator-sourced era (DEC-CA-0063), only its published random-init
-        POINTER (the runner benches nothing and rents no pod for it). The
-        tries cap is per seed epoch (carried across its eras)."""
+        POINTER (the runner benches nothing and rents no pod for it).
+        Regardless of how often it has failed."""
         if era.warm_start_ckpt and validator_bench_era(self.cfg, int(era.start_block)):
             # DEC-CA-0063: the main validator benches the init itself and a
             # warm-started epoch's init pointer IS warm_start_ckpt — nothing owed
             return False
         return (int(era.epoch_start) >= 0 and self._ladder_era(era)
-                and era.init_bench is None
+                and era.init_bench is None)
+
+    def _init_bench_owed(self, era: EraState) -> bool:
+        """:meth:`_init_bench_wanted` AND still inside the fast-retry cap: the
+        only state that keeps an operator king pod alive for it. The tries cap
+        is per seed epoch (carried across its eras); past it the pointer is
+        retried every ``INIT_BENCH_RETRY_SECONDS`` on whatever operator pod the
+        epoch has, never on a pod held for the purpose."""
+        return (self._init_bench_wanted(era)
                 and int(era.init_bench_tries) < self.INIT_BENCH_MAX_TRIES)
+
+    def _consume_init_pointer_rebuild(self, era: EraState) -> None:
+        """``cascade-trainer rebuild-init-pointer`` drops a request file in the
+        work root: every era of the state (and ``era``) that still wants its
+        init gets its tries reset and is retried on the next tick. The file is
+        consumed (removed) once read; a malformed one is removed too, logged."""
+        from .operator_legs_cli import INIT_POINTER_REBUILD_FILE
+
+        path = Path(self.state_path).parent / INIT_POINTER_REBUILD_FILE
+        try:
+            if not path.is_file():
+                return
+            try:
+                req = json.loads(path.read_text(encoding="utf-8")) or {}
+            except (OSError, ValueError) as e:
+                log.warning("rolling: init pointer rebuild request %s unreadable (%s); removed",
+                            path, e)
+                req = {}
+            with self._lock:
+                seen: set[int] = set()
+                for e in (era, self.state.current, self.state.next):
+                    if e is None or e.index in seen or not self._init_bench_wanted(e):
+                        continue
+                    seen.add(e.index)
+                    e.init_bench_tries = 0
+                    self._init_bench_at.pop(e.index, None)
+                self._save()
+            log.info("rolling: operator requested an init pointer rebuild (%s) — tries reset "
+                     "for era(s) %s; retrying now", str(req.get("reason") or "no reason given"),
+                     sorted(seen) or "none (nothing wanted)")
+        finally:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as e:  # noqa: BLE001 — leave it; re-read next tick
+                log.warning("rolling: could not remove %s: %s", path, e)
 
     def _ladder_era(self, era: EraState) -> bool:
         """A v2 era under the DEC-CA-0055 king ladder (``[v2] king_ladder``):
@@ -2166,11 +2214,16 @@ class RollingScheduler:
         """Bench the CURRENT init once per seed epoch on the era's operator
         king pod (after the king leg: the pod exists then). A later era of the
         epoch carries the numbers (``_carry_epoch_king``)."""
-        if era is None or era.king_entry is None or not self._init_bench_owed(era):
+        if era is None or era.king_entry is None:
+            return
+        self._consume_init_pointer_rebuild(era)
+        if not self._init_bench_wanted(era):
             return
         if era.index in self._king_threads or era.index in self._init_threads:
             return
-        if now - self._init_bench_at.get(era.index, 0.0) < self.INIT_BENCH_SECONDS:
+        capped = int(era.init_bench_tries) >= self.INIT_BENCH_MAX_TRIES
+        every = self.INIT_BENCH_RETRY_SECONDS if capped else self.INIT_BENCH_SECONDS
+        if now - self._init_bench_at.get(era.index, 0.0) < every:
             return
         self._init_bench_at[era.index] = now
 
@@ -2178,10 +2231,17 @@ class RollingScheduler:
                 else "init bench")
 
         def _gave_up() -> None:
-            if int(era.init_bench_tries) >= self.INIT_BENCH_MAX_TRIES:
-                log.warning("rolling: era %d %s GAVE UP after %d tries — not retried this "
-                            "seed epoch (the king check defers without it)", era.index, what,
-                            int(era.init_bench_tries))
+            tries = int(era.init_bench_tries)
+            if tries == self.INIT_BENCH_MAX_TRIES:
+                log.warning("rolling: era %d %s GAVE UP fast retries after %d tries — retrying "
+                            "every %d s for the rest of this seed epoch without holding a pod "
+                            "(the king check defers without it); `cascade-trainer "
+                            "rebuild-init-pointer` retries now", era.index, what, tries,
+                            int(self.INIT_BENCH_RETRY_SECONDS))
+            elif tries > self.INIT_BENCH_MAX_TRIES:
+                log.warning("rolling: era %d %s slow retry %d failed — next in %d s (the king "
+                            "check still defers without it)", era.index, what, tries,
+                            int(self.INIT_BENCH_RETRY_SECONDS))
 
         def _run():
             try:

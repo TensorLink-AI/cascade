@@ -1976,7 +1976,15 @@ operator king pod, else an idle operator lane (never the last idle one), else
 the request is parked and the next operator-billed challenger pod of the seed
 epoch builds it right after its leg's verified harvest, before its release.
 While parked the king check defers with "no init pointer"; a failed build
-counts against `INIT_BENCH_MAX_TRIES` per seed epoch. A warm-started epoch
+counts against `INIT_BENCH_MAX_TRIES` per seed epoch. Past the cap the trainer
+no longer holds a pod for it but keeps retrying every
+`INIT_BENCH_RETRY_SECONDS` (1 h) until the pointer lands (the log says "GAVE UP
+fast retries", then "slow retry N failed"; 2026-10-31 the old hard give-up
+after three ssh timeouts left seed epoch 2611 without a pointer, so no king
+check could pass for the whole epoch). `cascade-trainer rebuild-init-pointer`
+(an optional `--reason TEXT` is logged) resets the counter of every era still
+wanting its init and the trainer retries on its next tick (the request file
+`_train_work/init_pointer_rebuild.json` is consumed). A warm-started epoch
 needs nothing (the pointer is `warm_start_ckpt`).
 
 The random-init repo is named `ckpt-<base_seed>-<arch>-random-init-sb<seed_block>`.

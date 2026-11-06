@@ -12,6 +12,7 @@ benches itself under DEC-CA-0063).
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import threading
 import time
@@ -158,13 +159,19 @@ def test_validator_era_reuses_the_epochs_published_pointer(cfg, tmp_path, wired)
 
 
 def test_scheduler_owes_nothing_for_a_warm_started_validator_era(cfg):
-    v = _vsrc(cfg)
-    sched = SimpleNamespace(cfg=v, _ladder_era=lambda era: True,
-                            INIT_BENCH_MAX_TRIES=RollingScheduler.INIT_BENCH_MAX_TRIES)
+    def fake(c):
+        ns = SimpleNamespace(cfg=c, _ladder_era=lambda era: True,
+                             INIT_BENCH_MAX_TRIES=RollingScheduler.INIT_BENCH_MAX_TRIES)
+        ns._init_bench_wanted = lambda era: RollingScheduler._init_bench_wanted(ns, era)
+        return ns
+
+    sched = fake(_vsrc(cfg))
     assert RollingScheduler._init_bench_owed(sched, _era(warm_start_ckpt=WARM_PTR)) is False
     assert RollingScheduler._init_bench_owed(sched, _era()) is True       # random init
-    legacy = SimpleNamespace(cfg=cfg, _ladder_era=lambda era: True,
-                             INIT_BENCH_MAX_TRIES=RollingScheduler.INIT_BENCH_MAX_TRIES)
+    # past the cap: still wanted (slow retries), no longer owed (no pod held)
+    assert RollingScheduler._init_bench_owed(sched, _era(init_bench_tries=3)) is False
+    assert RollingScheduler._init_bench_wanted(sched, _era(init_bench_tries=3)) is True
+    legacy = fake(cfg)
     assert RollingScheduler._init_bench_owed(legacy, _era(warm_start_ckpt=WARM_PTR)) is True
 
 
@@ -280,21 +287,122 @@ class _EmptyInitOps(FakeOps):
         return None
 
 
-def test_init_retries_are_capped_and_give_up_once(cfg, tmp_path, caplog):
+def _tick_init(sched, era, clock, step):
+    clock.t += step + 1
+    sched._maybe_bench_init(era, clock.t)
+    end = time.time() + 10
+    while sched._init_threads and time.time() < end:
+        time.sleep(0.01)
+
+
+def test_init_retries_slow_down_after_the_cap_but_never_stop(cfg, tmp_path, caplog):
+    """2026-10-31: three ssh timeouts GAVE UP the pointer for the whole seed
+    epoch and every king check deferred for days. The cap now only ends the
+    fast cadence (and the pod hold); the pointer is retried every
+    INIT_BENCH_RETRY_SECONDS until it lands."""
     clock = Clock()
     sched, ops = _sched(_armed(cfg), tmp_path, clock, ops=_EmptyInitOps(tmp_path, clock))
     sched._ladder_era = lambda era: True
     era = _era()
     with caplog.at_level(logging.WARNING, logger="cascade.trainer.rolling"):
         for _ in range(6):
-            clock.t += sched.INIT_BENCH_SECONDS + 1
-            sched._maybe_bench_init(era, clock.t)
-            end = time.time() + 10
-            while sched._init_threads and time.time() < end:
-                time.sleep(0.01)
+            _tick_init(sched, era, clock, sched.INIT_BENCH_SECONDS)
+    # the fast cadence stops at the cap …
     assert ops.init_calls == sched.INIT_BENCH_MAX_TRIES
     assert era.init_bench_tries == sched.INIT_BENCH_MAX_TRIES
     assert caplog.text.count("GAVE UP") == 1
+    assert "rebuild-init-pointer" in caplog.text
+    # … the pointer is no longer OWED (no pod is held for it) but still WANTED
+    assert sched._init_bench_owed(era) is False
+    assert sched._init_bench_wanted(era) is True
+    # … and the slow cadence keeps trying
+    with caplog.at_level(logging.WARNING, logger="cascade.trainer.rolling"):
+        _tick_init(sched, era, clock, sched.INIT_BENCH_RETRY_SECONDS)
+    assert ops.init_calls == sched.INIT_BENCH_MAX_TRIES + 1
+    assert era.init_bench_tries == sched.INIT_BENCH_MAX_TRIES + 1
+    assert "slow retry 4 failed" in caplog.text
+    assert caplog.text.count("GAVE UP") == 1                 # logged once, at the cap
+
+
+def test_a_landed_pointer_ends_the_slow_retries(cfg, tmp_path):
+    clock = Clock()
+
+    class _LandsLater(_EmptyInitOps):
+        def bench_init(self, era):
+            self.init_calls += 1
+            if self.init_calls <= RollingScheduler.INIT_BENCH_MAX_TRIES:
+                return None
+            return {**RR.pointer_only_init_scores(), "_pointer": INIT_PTR}
+
+    sched, ops = _sched(_armed(cfg), tmp_path, clock, ops=_LandsLater(tmp_path, clock))
+    sched._ladder_era = lambda era: True
+    era = _era()
+    for _ in range(3):
+        _tick_init(sched, era, clock, sched.INIT_BENCH_SECONDS)
+    _tick_init(sched, era, clock, sched.INIT_BENCH_RETRY_SECONDS)
+    assert era.init_pointer == INIT_PTR and era.init_bench is not None
+    assert sched._init_bench_wanted(era) is False
+    _tick_init(sched, era, clock, sched.INIT_BENCH_RETRY_SECONDS)
+    assert ops.init_calls == 4                              # nothing more once landed
+
+
+def test_rebuild_request_resets_the_tries_and_retries_now(cfg, tmp_path, caplog):
+    from cascade.trainer.operator_legs_cli import INIT_POINTER_REBUILD_FILE
+
+    clock = Clock()
+    sched, ops = _sched(_armed(cfg), tmp_path, clock, ops=_EmptyInitOps(tmp_path, clock))
+    sched._ladder_era = lambda era: True
+    era = _era()
+    for _ in range(4):
+        _tick_init(sched, era, clock, sched.INIT_BENCH_SECONDS)
+    assert ops.init_calls == 3 and era.init_bench_tries == 3
+    # a fast tick does nothing while capped …
+    _tick_init(sched, era, clock, sched.INIT_BENCH_SECONDS)
+    assert ops.init_calls == 3
+    # … the owner's request resets the counter and the next fast tick retries
+    req = Path(sched.state_path).parent / INIT_POINTER_REBUILD_FILE
+    req.write_text(json.dumps({"requested_at": "now", "reason": "ssh fixed"}), encoding="utf-8")
+    with caplog.at_level(logging.INFO, logger="cascade.trainer.rolling"):
+        _tick_init(sched, era, clock, sched.INIT_BENCH_SECONDS)
+    assert not req.exists()                                  # consumed
+    assert "operator requested an init pointer rebuild (ssh fixed)" in caplog.text
+    assert ops.init_calls == 4 and era.init_bench_tries == 1  # reset to 0, then one failure
+    # a malformed request is consumed too, and still resets
+    era.init_bench_tries = 3
+    req.write_text("{not json", encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="cascade.trainer.rolling"):
+        _tick_init(sched, era, clock, sched.INIT_BENCH_SECONDS)
+    assert not req.exists() and "unreadable" in caplog.text
+    assert ops.init_calls == 5 and era.init_bench_tries == 1
+
+
+def test_rebuild_request_resets_every_era_of_the_state_that_wants_its_init(cfg, tmp_path):
+    from cascade.trainer.operator_legs_cli import INIT_POINTER_REBUILD_FILE
+
+    clock = Clock()
+    sched, ops = _sched(_armed(cfg), tmp_path, clock, ops=_EmptyInitOps(tmp_path, clock))
+    sched._ladder_era = lambda era: True
+    cur, nxt, done = _era(init_bench_tries=3), _era(init_bench_tries=3), _era(
+        init_bench=dict(SIX), init_bench_tries=2, init_pointer=INIT_PTR)
+    nxt.index, done.index = 13, 14
+    sched.state.current, sched.state.next = cur, nxt
+    (Path(sched.state_path).parent / INIT_POINTER_REBUILD_FILE).write_text("{}", encoding="utf-8")
+    sched._consume_init_pointer_rebuild(done)
+    assert cur.init_bench_tries == 0 and nxt.init_bench_tries == 0
+    assert done.init_bench_tries == 2                        # landed: untouched
+    assert not (Path(sched.state_path).parent / INIT_POINTER_REBUILD_FILE).exists()
+
+
+def test_rebuild_init_pointer_command_writes_the_request(tmp_path, capsys):
+    from cascade.trainer.operator_legs_cli import INIT_POINTER_REBUILD_FILE, main
+
+    assert main(["rebuild-init-pointer", "--work-root", str(tmp_path),
+                 "--reason", "ssh timeouts fixed"]) == 0
+    body = json.loads((tmp_path / INIT_POINTER_REBUILD_FILE).read_text(encoding="utf-8"))
+    assert body["reason"] == "ssh timeouts fixed" and body["requested_at"].endswith("Z")
+    assert "rebuild requested" in capsys.readouterr().out
+    # no queue file is needed (the trainer's work root may hold none yet)
+    assert not (tmp_path / "funded_queue.json").exists()
 
 
 def test_the_tries_cap_carries_across_the_seed_epoch():
