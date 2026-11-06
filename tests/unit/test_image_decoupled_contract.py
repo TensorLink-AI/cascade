@@ -7,7 +7,8 @@ verdict window budget.
 * ``prove_numerics_digest`` keeps a pre-repin leg only when its recorded full
   digest re-hashes from the current contract with a known image.
 * The knobs parse, round-trip and refuse bad values; they ship OFF.
-* The vote: signal segment, tally lock-in → the first era start after it, the
+* The vote: signal segment, tally lock-in → the era start two eras after its
+  era (rule 2: that era opens a seed epoch), the
   typed override, one-way persistence, late-node adoption from notes; the
   validator signals at startup, locks in, persists and restores.
 * Before the switch everything is byte-identical (manifest bytes, window draw,
@@ -181,7 +182,7 @@ def test_knobs_refuse_bad_values(tmp_path, key, value):
 def test_shipped_configs_pin_the_feature_they_compute():
     from cascade.shared.activation import v2b_feature_name
 
-    for path, name in (("chain.toml", "v2b-150ec0d0"), ("chain.testnet.toml", "v2b-c74823cc")):
+    for path, name in (("chain.toml", "v2b-90bc5237"), ("chain.testnet.toml", "v2b-3a259561")):
         cfg = load_chain_config(REPO / path)
         assert cfg.v2.image_decoupled_feature == name
         assert v2b_feature_name(cfg.v2.eval_n_windows_after) == name
@@ -208,13 +209,13 @@ def voting():
 
 
 def test_deployed_config_missing_the_keys_refuses_to_load(tmp_path, voting):
-    with pytest.raises(ValueError, match="image_decoupled_feature is not pinned.*v2b-6bbd262b"):
+    with pytest.raises(ValueError, match="image_decoupled_feature is not pinned.*v2b-80853b4a"):
         load_chain_config(_deployed_style(tmp_path))
 
 
 def test_missing_budget_with_the_release_pin_refuses(tmp_path, voting):
     p = _deployed_style(tmp_path, drop=("eval_n_windows_after",))
-    with pytest.raises(ValueError, match="computes v2b-6bbd262b"):
+    with pytest.raises(ValueError, match="computes v2b-80853b4a"):
         load_chain_config(p)
 
 
@@ -301,7 +302,7 @@ def vcfg():
 
 def test_feature_name_hashes_the_bundle_and_rides_the_note(vcfg):
     spec = A.image_decoupled_feature(vcfg)
-    assert spec is not None and spec.decided_on_chain and spec.align == "era"
+    assert spec is not None and spec.decided_on_chain and spec.align == "epoch"
     assert re.fullmatch(r"v2b-[0-9a-f]{8}", spec.name)
     assert spec.name == A.v2b_feature_name(4000) != A.v2b_feature_name(3000)
     note = A.own_signal_payload(vcfg, A.ActivationRecord())
@@ -328,7 +329,7 @@ def test_typed_block_is_the_owner_override(vcfg):
     assert A.apply_image_decoupled_activation(typed, B0 + 3600) is typed
 
 
-def test_tally_locks_in_at_the_first_era_start_after_the_boundary(vcfg):
+def test_tally_locks_in_two_eras_after_the_boundary_era(vcfg):
     spec = A.image_decoupled_feature(vcfg)
     note = A.format_signals(A.ReadySignal(PRIMARY), A.ReadySignal(spec.name))
     mid = B0 + 3600 + 1800                              # a settlement boundary mid-era
@@ -336,7 +337,9 @@ def test_tally_locks_in_at_the_first_era_start_after_the_boundary(vcfg):
     res = A.resolve_activation(vcfg, chain, now_block=mid + 5, record=A.ActivationRecord(),
                                feature=spec)
     assert res.record.locked and res.record.lock_block == mid
-    assert res.record.activation_block == B0 + 7200      # the next ERA start, never mid-era
+    # rule 2: the era start two eras after the lock-in era (a promotion's
+    # notice) — never mid-era, and the switch era opens a seed epoch
+    assert res.record.activation_block == B0 + 10800
     # below the threshold nothing locks
     low = FakeChain(_fleet(40, 60), {"v1": note}, block=mid + 5)
     assert not A.resolve_activation(vcfg, low, now_block=mid + 5, record=A.ActivationRecord(),
@@ -399,7 +402,7 @@ def test_persistence_is_one_way_and_a_late_node_adopts_the_notes(vcfg, tmp_path)
     spec = A.image_decoupled_feature(vcfg)
     store = A.ActivationStore(tmp_path / "activation_image_decoupled_state.json")
     locked = A.ActivationRecord(feature=spec.name, lock_block=B0 + 1800,
-                                activation_block=B0 + 3600, last_checked_boundary=B0 + 1800,
+                                activation_block=B0 + 7200, last_checked_boundary=B0 + 1800,
                                 source="tally")
     store.save(locked)
     rec = A.record_for(vcfg, store.load(), spec)
@@ -412,13 +415,21 @@ def test_persistence_is_one_way_and_a_late_node_adopts_the_notes(vcfg, tmp_path)
     assert A.record_for(vcfg, replace(locked, feature="v2b-deadbeef"), spec) == A.ActivationRecord()
     # a node that missed the boundary adopts the pair the stake majority names
     note = A.format_signals(A.ReadySignal(PRIMARY),
-                            A.ReadySignal(spec.name, B0 + 1800, B0 + 3600))
+                            A.ReadySignal(spec.name, B0 + 1800, B0 + 7200))
     chain = FakeChain(_fleet(60, 40), {"v1": note}, block=B0 + 9000 + 5)
     chain.fail_as_of = True
     res = A.resolve_activation(vcfg, chain, now_block=B0 + 9000 + 5,
                                record=A.ActivationRecord(), feature=spec)
     assert res.record.source == "signals"
-    assert (res.record.lock_block, res.record.activation_block) == (B0 + 1800, B0 + 3600)
+    assert (res.record.lock_block, res.record.activation_block) == (B0 + 1800, B0 + 7200)
+    # a note naming the OLD (/1, next-era) pair is inadmissible under rule 2
+    stale = A.format_signals(A.ReadySignal(PRIMARY),
+                             A.ReadySignal(spec.name, B0 + 1800, B0 + 3600))
+    assert not A.valid_pair(vcfg.round, B0 + 1800, B0 + 3600, spec.align)
+    chain = FakeChain(_fleet(60, 40), {"v1": stale}, block=B0 + 9000 + 5)
+    chain.fail_as_of = True
+    assert not A.resolve_activation(vcfg, chain, now_block=B0 + 9000 + 5,
+                                    record=A.ActivationRecord(), feature=spec).record.locked
 
 
 def test_validator_signals_at_startup_locks_persists_restores_and_stamps(vcfg, tmp_path):
@@ -429,16 +440,16 @@ def test_validator_signals_at_startup_locks_persists_restores_and_stamps(vcfg, t
     chain = FakeChain(_fleet(60, 40), {}, block=B0 + 3600 + 1, hotkey="v1")
     runner._activation_startup(chain)
     assert chain.written[0] == f"cascade-ready:1:{PRIMARY}:0:0:{spec.name}:0:0"
-    assert chain.written[-1] == f"cascade-ready:1:{PRIMARY}:0:0:{spec.name}:{B0 + 3600}:{B0 + 7200}"
-    assert runner.cfg.v2.image_decoupled_from_block == B0 + 7200
-    assert runner.image_decoupled_block == B0 + 7200                 # stamped on receipts
+    assert chain.written[-1] == f"cascade-ready:1:{PRIMARY}:0:0:{spec.name}:{B0 + 3600}:{B0 + 10800}"
+    assert runner.cfg.v2.image_decoupled_from_block == B0 + 10800
+    assert runner.image_decoupled_block == B0 + 10800                # stamped on receipts
     saved = A.ActivationStore(tmp_path / "activation_image_decoupled_state.json").load()
-    assert saved.activation_block == B0 + 7200
+    assert saved.activation_block == B0 + 10800
     again = ValidatorRunner(cfg=vcfg, activation_store=A.ActivationStore(tmp_path / "act.json"))
     dead = SimpleNamespace(current_block=lambda: (_ for _ in ()).throw(RuntimeError("down")),
                            hotkey_ss58=lambda: "v1")
     again._activation_startup(dead)
-    assert again.cfg.v2.image_decoupled_from_block == B0 + 7200
+    assert again.cfg.v2.image_decoupled_from_block == B0 + 10800
 
 
 def test_receipt_field_is_drop_when_default_and_round_trips():
@@ -465,7 +476,7 @@ def test_trainer_resolves_the_same_block_read_only(vcfg, tmp_path):
     chain = FakeChain(_fleet(60, 40), {"v1": note}, block=B0 + 3600 + 1)
     runner._activation_tick(chain, B0 + 3600 + 1)
     assert chain.written == []                                         # never signals
-    assert runner.cfg.v2.image_decoupled_from_block == B0 + 7200
+    assert runner.cfg.v2.image_decoupled_from_block == B0 + 10800
 
 
 # ── the manifest wire ────────────────────────────────────────────────────────
@@ -802,7 +813,7 @@ def test_untyped_blocks_would_trim_the_v2b_segment(tmp_path):
     cfg = _untyped_blocks(tmp_path)
     rec, fr, mr = _live_records()
     why = A.v2b_note_problem(cfg, rec, fr, mr)
-    assert "TRIM" in why and "v2b-150ec0d0" in why
+    assert "TRIM" in why and "v2b-90bc5237" in why
     assert A.v2b_note_problem(load_chain_config(REPO / "chain.toml"), rec,
                               head_block=9_420_000) == ""                  # typed: fits
     s = A.summary(cfg, rec, None, fr, None, mr)
@@ -820,7 +831,7 @@ def test_validator_refuses_to_start_when_its_note_would_trim_v2b(tmp_path):
     A.ActivationStore(tmp_path / "activation_margin_v2_state.json").save(mr)
     runner = ValidatorRunner(cfg=cfg, activation_store=A.ActivationStore(tmp_path / "act.json"))
     chain = SimpleNamespace(current_block=lambda: 9_400_000, hotkey_ss58=lambda: "v1")
-    with pytest.raises(RuntimeError, match="refusing to start.*v2b-150ec0d0"):
+    with pytest.raises(RuntimeError, match="refusing to start.*v2b-90bc5237"):
         runner._activation_startup(chain)
 
 

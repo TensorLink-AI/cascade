@@ -93,20 +93,21 @@ era's last settlement, so no era is judged under two rules.
     under `[round]`, not `[v2]`. No parser reads it there, so v2 settlements
     judge on `[eval] n_windows`.
 
-## Activation: stake majority, then the next era start
+## Activation: stake majority, then a seed-epoch-opening era start
 
 This is the DEC-CA-0045 secondary-feature path, aligned to eras like
 DEC-CA-0049.
 
 - **Feature.** The name is
-  `v2b-<sha256("image-decoupled/1|train_image_digest,continuation_protocol|eval_n_windows_after=<n>")[:8]>`
-  (mainnet: `v2b-150ec0d0`). It is short because of the note budget below.
+  `v2b-<sha256("image-decoupled/2|train_image_digest,continuation_protocol|eval_n_windows_after=<n>")[:8]>`
+  (mainnet: `v2b-90bc5237`). It is short because of the note budget below.
   A changed bundle is a fresh vote.
 - **Signal.** Validators on this release add the segment to their note at startup
   whenever `[activation]` is on and v2 is scheduled.
 - **Lock-in.** It locks in at the first boundary where `[activation] threshold` of
-  eligible stake has signalled. The switch is the first ERA START strictly after
-  that boundary.
+  eligible stake has signalled. The switch is the era start TWO eras after the
+  lock-in boundary's era (`align="epoch"`, the notice a v2 promotion gets:
+  `min_effective_era`), and that era opens a v2 seed epoch (rule 2 below).
 - **Persistence.** The record lives in `activation_image_decoupled_state.json`
   and is one-way. A late node adopts the block from the notes
   (`agreed_activation`).
@@ -116,7 +117,66 @@ DEC-CA-0049.
 - **Trainer.** The trainer resolves the same feature read-only, with the same
   resolver, the same as-of-boundary reads and the same notes, and never signals.
   It cannot stamp early, because the block is 0 until it resolves. A lock-in
-  always lands at least one settlement before its era starts.
+  always lands a full era before its switch era starts, so the switch era's
+  seeds and king leg are prepared under it.
+
+## Rule 2: the v2b switch era opens a seed epoch (`image-decoupled/2`)
+
+A contract rule that changes inside a running seed epoch breaks consensus: the
+epoch's carried king leg and finished legs were checked under the old rule
+(the 2026-11-01 mid-epoch image repin made every validator reject
+king-pointer / entry contracts). Seed-epoch starts are not on a fixed grid —
+they follow promotions — and promotion state is off-chain and seen by nodes at
+different times, so the switch cannot WAIT for an epoch start. Instead:
+
+- **The applied switch era IS a seed-epoch start.** `v2_seed_epoch_start`
+  counts `v2b_switch_era(cfg)` (the era of `[v2] image_decoupled_from_block`,
+  typed or resolved) as an epoch start beside the first v2 era and the
+  promotion effective eras. It is derived from config alone, so it is the same
+  on every node. Every era from it uses the switch era's seed block until the
+  next promotion opens its own epoch. A promotion landing ON the switch era is
+  one epoch.
+- **Same init, new seeds, forced king retrain.** No promotion is implied.
+  `v2_init_epoch_start` (the warm-start-only rule) still names the init
+  epoch: the ledger init, the validator's `epoch_init` check, the trainer's
+  lane-B merged init (reused with `apply_pending=False`) and the lane-B
+  acceptance block all key on it. The king's pointer is held per SEED epoch,
+  so the king trains a fresh leg at the switch era (no carry), and the init
+  bench / random-init pointer is redone for the new seed block.
+- **Notice.** The vote takes effect two eras after the lock-in era, so the
+  trainer prepares the switch era (its pre-train window opens in the era
+  before) already under the switch; a prepared next era the switch moved is
+  discarded and re-prepared.
+- **Owner override.** Any typed era start at or after `[v2] from_block` is
+  legal on the grid (the loader's existing check): it opens its own epoch.
+  It must give the vote's NOTICE too: at least the era start two eras after
+  the era the node FIRST loaded it in (`v2b_typed_notice_problem`). The loader
+  has no chain head, so the validator (and satellite) and the trainer check
+  it at startup and REFUSE to start on a short notice. The first-seen block
+  is persisted in `activation_image_decoupled_state.json` (`lock_block` of
+  the `config` record), so a node that started fine never refuses itself as
+  blocks advance; once the switch era has started there is nothing to check.
+  Every validator and the trainer must deploy the SAME typed value before
+  the switch era's pre-train window (the era before it); a node that loads
+  it later refuses until the switch era starts.
+- **Restarts.** The trainer reconciles its prepared eras against the applied
+  switch on every tick (a restart included): a persisted next era still in
+  the old epoch is discarded and re-prepared; the running era never is.
+- **Miner money.** A leg still training for a discarded prepared era is our
+  loss, never the miner's: recorded for the owner's make-good review
+  (`make_good_review.jsonl` + a WARNING naming the payer and the attempt) and
+  requeued unburned (`operator_blocked`) when it ends, whatever its outcome.
+- **Who pays the forced retrain.** The switch era's king leg is an ordinary
+  epoch-start king leg: under `king_ladder` it trains on the king's own key,
+  falling back to the operator with the key slash exactly as for any epoch
+  start. Inside the random-init window only the init POINTER is unchanged
+  (random init): the random weights re-derive from the new seeds, so the
+  random-init checkpoint is rebuilt and re-benched for the new seed block.
+- **Audit.** `_epoch_start_for_seed` accepts the switch era as a start and
+  rejects an era at or after it that names an older seed block.
+- **Fresh vote.** The rule version is `image-decoupled/2`: mainnet
+  `v2b-90bc5237`, testnet `v2b-3a259561` (was `v2b-150ec0d0` / `v2b-c74823cc`;
+  never signalled — #410 was not deployed).
 
 ## Blast radius / fork risk (state BEFORE deploying)
 
@@ -379,10 +439,10 @@ Lane handling:
    deploys the release `chain.toml` values: the typed `[scoring]
    forfeit_from_block = 9166500` / `margin_v2_from_block = 9194400`, `[v2]
    eval_n_windows_after = 4000` and `[v2] image_decoupled_feature =
-   "v2b-150ec0d0"`. The main validator's and the trainer's live files are
+   "v2b-90bc5237"`. The main validator's and the trainer's live files are
    edited by hand (the live trainer file lacks `eval_n_windows_after`).
    **Fork guard:** the feature name hashes `eval_n_windows_after`; a file
-   without it computes `v2b-6bbd262b` and would signal and tally another
+   without it computes `v2b-80853b4a` and would signal and tally another
    feature, silently. The loader therefore refuses to start any node whose
    computed name differs from the pinned `image_decoupled_feature`, or whose
    pin is absent while `[activation]` is on and v2 is scheduled.

@@ -283,6 +283,24 @@ class ActivationMixin:
                 and self.apply_image_decoupled_block(self._image_decoupled.activation_block)):
             self._ensure_own_signal(client)
 
+    def _v2b_typed_notice_startup(self, store: ActivationStore | None, head: int) -> None:
+        """DEC-CA-0067 rule 2: a TYPED v2b switch must give the vote's notice
+        (:func:`cascade.shared.activation.v2b_typed_notice_problem`). The
+        first-seen block is persisted in the v2b record, so a node that started
+        fine never refuses itself later; one that does not refuses to start
+        (never swallowed, never half-applied)."""
+        from ..shared.activation import stamp_typed_image_decoupled, v2b_typed_notice_problem
+
+        cfg = self._base_cfg()
+        rec = stamp_typed_image_decoupled(cfg, self._image_decoupled, head)
+        why = v2b_typed_notice_problem(cfg, rec, head)
+        if why:
+            raise ActivationStartupRefused(f"activation: refusing to start — {why}")
+        if rec is not self._image_decoupled:
+            self._image_decoupled = rec
+            if store is not None:
+                store.save(rec)
+
     def _ensure_own_signal(self, client: object) -> None:
         """Write this validator's note when it is not the one already on
         chain. One chain read per CHANGE of note, not per poll: the payload
@@ -378,6 +396,8 @@ class ActivationMixin:
             # DEC-CA-0067: a validator whose note drops the v2b- segment never
             # votes on it (only a WARNING per write) — refuse to start instead
             raise ActivationStartupRefused(f"activation: refusing to start — {trim}")
+        if head is not None:
+            self._v2b_typed_notice_startup(istore, int(head))
         from ..shared.activation import (
             NOTE_MAX_BYTES,
             note_trimmed_segments,

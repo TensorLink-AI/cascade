@@ -13,12 +13,24 @@ def acceptance_seed(block: int, base: str) -> str:
     return f"lane-b-acceptance|{int(block)}|{base}"
 
 
-def acceptance_block(cfg, manifest):
-    """A seed epoch retains its original init even across activation eras."""
-    from ..shared.era import EraSpec, era_length_blocks
+def acceptance_block(cfg, manifest, runner=None):
+    """A seed epoch retains its original init even across activation eras.
+
+    DEC-CA-0067 rule 2: a v2b switch era opens a seed epoch but keeps the
+    running init (and its merges), so the block is the INIT epoch's start —
+    known to a validator ``runner`` (its ``_init_epoch_start``) and equal to
+    the seed epoch's start without an applied switch (unchanged then)."""
+    from ..shared.era import EraSpec, era_length_blocks, image_decoupled_from
 
     era = EraSpec.from_json(manifest.era)
-    return min(era.start_block, era.seed_block + era_length_blocks(cfg.round, era.start_block))
+    length = era_length_blocks(cfg.round, era.start_block)
+    block = min(era.start_block, era.seed_block + length)
+    init_start = getattr(runner, "_init_epoch_start", None)
+    if init_start is not None and image_decoupled_from(cfg):
+        start = init_start(era)
+        if start is not None:
+            block = min(block, int(start) * length)
+    return block
 
 
 def judge_acceptance(qualified, *, anchor_scores, before_scores, candidate_scores,
@@ -95,7 +107,7 @@ def verify_acceptance(runner, manifest):
     from .expert_lane import verdict_windows
     from .lane_b import LaneBTransient
 
-    block = acceptance_block(runner.cfg, manifest)
+    block = acceptance_block(runner.cfg, manifest, runner)
     key = hashlib.sha256(json.dumps(
         [manifest.warm_start_ckpt, manifest.warm_start_base, manifest.warm_start_merges, block],
         sort_keys=True).encode()).hexdigest()

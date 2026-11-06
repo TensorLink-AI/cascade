@@ -213,6 +213,17 @@ class KingCheckMixin:
             return None
         return v2_seed_epoch_start(self.cfg, int(era.index), self._v2_warm_eras())
 
+    def _init_epoch_start(self, era: EraSpec) -> int | None:
+        """The first era of ``era``'s INIT epoch (one init per it): its seed
+        epoch's start, except across a DEC-CA-0067 switch era that is not a
+        warm start — that era opens a seed epoch but keeps the running init
+        (:func:`cascade.shared.era.v2_init_epoch_start`)."""
+        from ..shared.era import v2_init_epoch_start
+
+        if not self._v2_epochs_active(era):
+            return None
+        return v2_init_epoch_start(self.cfg, int(era.index), self._v2_warm_eras())
+
     def _v2_pending_kept(self) -> bool:
         """Does the staged generation survive a dethrone? Only a v2 king-only
         promotion under the economics bundle (DEC-CA-0055)."""

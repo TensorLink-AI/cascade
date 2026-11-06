@@ -178,7 +178,7 @@ class LaneBMixin:
 
         result = self._lane_b_judge_experts(manifest)
         if (manifest.warm_start_merges and manifest.era is not None
-                and self.cfg.lane_b.acceptance_at_era(acceptance_block(self.cfg, manifest))):
+                and self.cfg.lane_b.acceptance_at_era(acceptance_block(self.cfg, manifest, self))):
             from ..shared.hippius import StorageError
             from .merge_acceptance import verify_acceptance
 

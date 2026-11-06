@@ -624,9 +624,10 @@ prelaunch_burn = 0.0
 carryover_king_share = 0.0
 king_ladder = false
 # DEC-CA-0067 (CONSENSUS, release-then-activate): the image-decoupled
-# training contract. From the first ERA START after the stake-majority lock-in
-# of the "v2b-<hash>" feature ([activation] threshold; every validator on this
-# release signals it at startup), a v2 settlement's legs are gated on
+# training contract. From the era start TWO eras after the era of the
+# stake-majority lock-in of the "v2b-<hash>" feature ([activation] threshold;
+# every validator on this release signals it at startup) — an era that opens a
+# v2 seed epoch under king_ladder (rule 2) — a v2 settlement's legs are gated on
 # numerics_contract_digest (the contract minus train_image_digest) instead of
 # the full contract digest, so a worker-image repin keeps the carried king and
 # the finished legs. 0 = decided on chain; a typed era-start block is the
@@ -639,7 +640,7 @@ image_decoupled_from_block = 0
 # rehearsed exactly as on mainnet.
 eval_n_windows_after = 300
 # Fork guard: the v2b feature name eval_n_windows_after = 300 hashes to.
-image_decoupled_feature = "v2b-c74823cc"
+image_decoupled_feature = "v2b-3a259561"
 # TRAINER-ONLY provenance (not consensus, not in the vote): earlier
 # v2.training train_image_digest pins, exactly as once typed, so the trainer
 # can PROVE a pre-repin leg differs only in its image. Append the old pin here
