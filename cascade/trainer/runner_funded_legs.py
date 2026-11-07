@@ -992,7 +992,17 @@ def _record_generation_failure(runner, gen, e: BaseException) -> None:
     tier. A generator fault (rc 3: :class:`GenerationFault`, ``CorpusError``)
     is the miner's, classed like the worker's own rc 3; everything else —
     no CPU capacity, a VM that never booted, a transfer — is the operator-run
-    tier's, requeued without burning an attempt."""
+    tier's, requeued without burning an attempt.
+
+    A :class:`~cascade.trainer.faults._FundedLegSkip` raised INSIDE the
+    corpus stage (the coldkey compute slot, a money gate) already settled
+    its own queue verdict; recording it again here would overwrite that
+    verdict with a bare "generation (operator tier): <hotkey>" classed
+    transient (observed 2026-11-07)."""
+    from .faults import _FundedLegSkip
+
+    if isinstance(e, _FundedLegSkip):
+        return
     rc = getattr(e, "returncode", None)
     if rc is None and type(e).__name__ == "CorpusError":
         rc = 3

@@ -1618,8 +1618,12 @@ Trainer-only; nothing here reaches a manifest or a validator verdict.
   Under `operator_runway_alert_hours` (6): one critical
   `operator_runway_low` alert. balance − committed − the launch's projection
   < the reserve: **no new operator rents** (`operator_rents_held`, distinct
-  from the 402 breaker) — every operator launch, the king's and the CPU
-  VMs' included, is refused right before the create; it clears by itself.
+  from the 402 breaker) — every operator launch paid from the account the
+  balance belongs to (Lium: the king's included) is refused right before the
+  create; it clears by itself. A CPU VM billed to another provider
+  (Shadeform) is not held by the Lium balance — its own 402 breaker and the
+  daily cap still apply. A launch refused by any of these gates rented
+  nothing and does not count toward the per-hotkey CPU rent cap.
 * **Every operator allocation is booked** in `operator_spend.json` at its
   landed $/h × expected hours (lemons too, settled to their real cost at
   teardown), and the daily cap counts it per `operator_daily_cap_scope`:

@@ -95,6 +95,29 @@ def test_owner_gate_reentrant_handoff_and_unknown_identity_proceeds():
     assert failures == []
 
 
+def test_a_busy_coldkey_slot_is_logged_when_the_wait_starts(caplog):
+    import logging
+
+    from cascade.trainer.faults import _FundedLegSkip
+
+    failures = []
+    runner = SimpleNamespace(
+        cfg=SimpleNamespace(round=replace(RoundConfig(), ops_max_active_per_coldkey=1)),
+        _record_funded_failure=lambda *a, **kw: failures.append(a),
+    )
+    remember_owners(runner, [SimpleNamespace(hotkey="hk1", coldkey="owner", commit_block=1),
+                             SimpleNamespace(hotkey="hk2", coldkey="owner", commit_block=1)])
+    # hk1 holds the coldkey's one slot; hk2 (same coldkey) waits, logs, times out.
+    with (owner_admission(runner, "hk1", cpu_tier=True), caplog.at_level(logging.INFO),
+          pytest.raises(_FundedLegSkip),
+          owner_admission(runner, "hk2", cpu_tier=True, deadline=time.time() + 0.05)):
+        pass
+    assert "waits for a coldkey compute slot" in caplog.text
+    assert "holds 1/1" in caplog.text
+    assert len(failures) == 1 and "coldkey compute slot remained busy" in failures[0][1]
+    assert runner._owner_slots.active == 0
+
+
 def test_reliability_policy_refuses_unbounded_paid_backups():
     with pytest.raises(ValueError, match="spending cap"):
         parse_reliability({"ops_king_backup_after_seconds": 60})

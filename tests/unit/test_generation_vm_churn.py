@@ -173,6 +173,39 @@ def test_rent_limiter_window():
     assert lim.recent("a") == 0
 
 
+def test_rent_limiter_forget_uncounts_the_latest_rent():
+    clock = Clock()
+    lim = RentLimiter(limit=2, window_s=100, clock=clock)
+    assert lim.record("a") == 1 and lim.forget("a") == 0 and lim.forget("a") == 0
+    assert lim.record("a") == 1 and lim.record("a") == 2 and lim.forget("a") == 1
+
+
+def test_a_refused_launch_is_not_a_rent_and_never_trips_the_cap(tmp_path):
+    # 2026-11-07: the runway guard refused a miner's CPU VM three times in an
+    # hour (LaunchRefused, nothing created) and the per-hotkey cap then
+    # refused the fourth attempt as "3 VM(s) rented". A refusal rents nothing.
+    from cascade.provision.core import LaunchRefused
+
+    clock = Clock()
+    prov = FakeProvider()
+    st, _ = _churn_stage(tmp_path, prov, clock)
+    st.existing = lambda **kw: None                           # force a fresh rent
+    real_launch = prov.launch
+
+    def refused(*a, **kw):
+        raise LaunchRefused("NO NEW OPERATOR RENTS: balance $59.09 < the $50.00 reserve")
+
+    prov.launch = refused
+    for _ in range(4):
+        with pytest.raises(GenerationInfraError, match="launch failed"):
+            _go(st, tmp_path)
+        clock.t += 60
+    assert prov.launched == [] and st.rent_limiter().recent(HK) == 0
+    prov.launch = real_launch
+    _go(st, tmp_path)                                         # the next attempt rents
+    assert len(prov.launched) == 1 and st.rent_limiter().recent(HK) == 1
+
+
 # ── teardown on every exit path ─────────────────────────────────────────────
 
 
