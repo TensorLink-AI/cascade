@@ -307,6 +307,18 @@ def owner_admission(runner, hotkey, *, exempt=False, deadline=None, cpu_tier=Fal
     gate = runner.__dict__.setdefault("_owner_slots", FairSlots())
     if deadline is None:
         deadline = time.time() + 1800
+    if not admitted:
+        with gate.condition:
+            holding = int(gate.owners.get(owner, 0))
+        if holding >= limit:
+            # Say so when the wait STARTS: a leg that sat 30 min on a busy
+            # coldkey slot used to log nothing until it was requeued
+            # (2026-11-07, two hotkeys of one coldkey).
+            log.info("owner admission: %s waits for a coldkey compute slot — coldkey %s… "
+                     "holds %d/%d (%s); requeued if none frees within %.0f s",
+                     str(hotkey)[:12], str(owner)[:12], holding, limit,
+                     "CPU generation" if cpu_tier else "operator leg",
+                     max(0.0, float(deadline) - time.time()))
     with gate.slot(2**31, owner=owner, owner_limit=limit, deadline=deadline,
                    force=admitted) as acquired:
         if not acquired:

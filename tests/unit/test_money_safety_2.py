@@ -284,9 +284,17 @@ def test_cpu_vms_are_booked_and_held_with_every_operator_rent(tmp_path):
     assert row["kind"] == "cpu_vm" and row["usd"] == pytest.approx(2.0)
     cpu.terminate("vm-1")
     assert inner.gone == ["vm-1"]
+    # The runway reserve protects the LIUM balance: a Shadeform CPU VM is not
+    # paid from it and is NOT held when that balance is low (2026-11-07) ...
     r._operator_balance_reader = lambda: 10.0
-    with pytest.raises(OperatorRentsHeld):
-        cpu.launch(SimpleNamespace(price_per_hour=1.0), name="cgen-y", ssh_pubkey="k")
+    assert cpu.launch(SimpleNamespace(price_per_hour=1.0), name="cgen-y", ssh_pubkey="k") == "vm-1"
+    # ... while a CPU VM billed to the balance's own account still is.
+    on_lium = _Cpu()
+    on_lium.name = "lium"
+    with pytest.raises(OperatorRentsHeld, match="NO NEW OPERATOR RENTS"):
+        money_guard.BookedCpuProvider(r, on_lium).launch(
+            SimpleNamespace(price_per_hour=1.0), name="cgen-z", ssh_pubkey="k")
+    assert on_lium.kw is None
 
 
 # ── 2. queue schema safety ───────────────────────────────────────────────────

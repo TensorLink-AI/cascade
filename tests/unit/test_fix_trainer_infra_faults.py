@@ -113,6 +113,17 @@ def test_generator_fault_on_the_cpu_tier_stays_the_miners():
     assert kw["miner_fault"] is True and kw["error_class"] == "generator"
 
 
+def test_a_leg_skip_raised_inside_the_corpus_stage_keeps_its_own_verdict():
+    # The coldkey compute slot (owner_admission) records "coldkey compute slot
+    # remained busy" and raises _FundedLegSkip from INSIDE leg_corpus; the
+    # generation handler must not overwrite that with a bare-hotkey transient.
+    from cascade.trainer.faults import _FundedLegSkip
+
+    r, rec = _rec_runner()
+    _record_generation_failure(r, _challenger("hkA"), _FundedLegSkip("hkA"))
+    assert rec == {}
+
+
 # ── a new leg never inherits the last leg's verdict ─────────────────────────
 
 def test_a_new_leg_clears_the_hotkeys_previous_verdict(tmp_path, monkeypatch):

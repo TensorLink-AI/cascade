@@ -278,7 +278,8 @@ class BookedCpuProvider:
 
         rate = float(getattr(shape, "price_per_hour", 0.0) or 0.0)
         hours = (float(ttl_seconds) if ttl_seconds else 2 * 3600.0) / 3600.0
-        operator_launch_check(self._runner, kind=CPU_VM_KIND, projected_usd=rate * hours)
+        operator_launch_check(self._runner, kind=CPU_VM_KIND, projected_usd=rate * hours,
+                              provider=str(getattr(self._provider, "name", "") or ""))
         kw = {"name": name, "ssh_pubkey": ssh_pubkey}
         if image is not None:
             kw["image"] = image
@@ -814,18 +815,39 @@ def operator_runway(runner, *, balance: float | None, now: float | None = None,
     return out
 
 
+BALANCE_ACCOUNT_PROVIDER = "lium"
+"""The provider whose account :func:`_read_balance` reads by default
+(``operator_health.lium_balance``). The runway reserve protects THAT
+account; a launch billed elsewhere does not draw on it."""
+
+
+def _bills_to_balance_account(runner, provider: str) -> bool:
+    """True when a launch on ``provider`` is paid from the account whose
+    balance the runway guard reads (``runner._operator_balance_provider``,
+    else Lium). An empty ``provider`` is unknown and treated as billed there
+    (fails closed, as before)."""
+    account = str(getattr(runner, "_operator_balance_provider", "") or BALANCE_ACCOUNT_PROVIDER)
+    return not provider or str(provider).lower() == account.lower()
+
+
 def operator_launch_check(runner, *, kind: str, projected_usd: float,
-                          launching: str = "") -> None:
+                          launching: str = "", provider: str = "") -> None:
     """Right before EVERY operator launch (the king's included): the runway
     guard (balance - committed - this launch < reserve ⇒ refused) and the
     daily cap (over its scope). A refusal raises
     :class:`~cascade.provision.core.OperatorRentsHeld` with one critical alert;
-    the state clears by itself once the balance / the day recovers."""
+    the state clears by itself once the balance / the day recovers.
+
+    ``provider`` names the provider that bills the launch. The daily cap
+    applies to every provider; the balance reserve only to launches paid
+    from the account the balance belongs to (a Shadeform CPU VM is not held
+    because the LIUM balance is low — observed 2026-11-07, a miner's corpus
+    refused for an hour over an account it never touched)."""
     from ..provision.core import OperatorRentsHeld
 
     try:
         _operator_launch_check(runner, kind=kind, projected_usd=projected_usd,
-                               launching=launching)
+                               launching=launching, provider=provider)
     except OperatorRentsHeld:
         raise
     except Exception as e:  # noqa: BLE001 — a bookkeeping fault never blocks a launch
@@ -834,7 +856,7 @@ def operator_launch_check(runner, *, kind: str, projected_usd: float,
 
 
 def _operator_launch_check(runner, *, kind: str, projected_usd: float,
-                           launching: str = "") -> None:
+                           launching: str = "", provider: str = "") -> None:
     from ..provision.core import OperatorRentsHeld
 
     rnd = runner.cfg.round
@@ -855,6 +877,11 @@ def _operator_launch_check(runner, *, kind: str, projected_usd: float,
                    f"≈${projected_usd:.2f} > ${cap:.2f} ({scope}) — no new operator rent")
             alert(runner, "operator_daily_cap", "operator", msg, severity="critical")
             raise OperatorRentsHeld(msg)
+    if kind == CPU_VM_KIND and not _bills_to_balance_account(runner, provider):
+        log.debug("runway: %s launch on %s is not paid from the %s account — the balance "
+                  "reserve does not apply (its own 402 breaker and the daily cap do)",
+                  kind, provider, BALANCE_ACCOUNT_PROVIDER)
+        return
     bal = _read_balance(runner)
     if bal is None:
         log.warning("runway: operator balance unknown at a %s launch — not held here (the "

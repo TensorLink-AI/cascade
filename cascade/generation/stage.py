@@ -389,6 +389,20 @@ class RentLimiter:
             self._rents[hotkey] = kept
             return len(kept)
 
+    def forget(self, hotkey: str) -> int:
+        """Uncount the hotkey's most recent rent — a launch REFUSED before any
+        provider call (runway guard, daily cap, breaker) rented nothing, and
+        counting it would let our own refusals trip the per-hotkey cap
+        (observed 2026-11-07: three refusals in an hour = "rent cap" for a
+        miner who never got a VM). Returns the rents left inside the window."""
+        now = self.clock()
+        with self._lock:
+            kept = [t for t in self._rents.get(hotkey, []) if now - t < self.window_s]
+            if kept:
+                kept.pop()
+            self._rents[hotkey] = kept
+            return len(kept)
+
 
 def _last_json(text: str) -> dict:
     for line in reversed((text or "").strip().splitlines()):
@@ -656,8 +670,10 @@ class GenerationStage:
             if isinstance(e, LaunchRefused):
                 # Refused before any provider call (runway guard, daily cap,
                 # breaker): no VM exists, so the intent must not outlive the
-                # refusal or every retry reads "needs reconciliation".
+                # refusal or every retry reads "needs reconciliation" — and
+                # nothing was rented, so the per-hotkey cap must not count it.
                 _ledger_drop(self.ledger_path, name)
+                self.rent_limiter().forget(hotkey)
                 with _LIVE_GUARD:
                     _LAUNCHING.discard(name)
             # Otherwise the row stays: a launch that raised may still have
