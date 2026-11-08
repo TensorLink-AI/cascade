@@ -380,7 +380,7 @@ def test_keep_horizon_is_recorded_in_provenance(tmp_path):
                CTX, cfg, fetch=None)
     prov = json.loads((tmp_path / "p" / "provenance.json").read_text())
     assert prov["config"]["keep_horizon"] == 180
-    series, _ids, _md = _load_series_dir(tmp_path / "p")
+    series, _ids = _load_series_dir(tmp_path / "p")
     assert sorted(int(s.shape[-1]) for s in series) == [300, 692]
 
 
