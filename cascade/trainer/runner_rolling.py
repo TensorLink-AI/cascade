@@ -340,22 +340,14 @@ class _RollingMixin:
                                     warm_start_ckpt=ws_ref or "")
         return entry
 
-    def _rolling_hosts_on_file(self) -> list:
-        """Every hosts.toml entry NOW: re-read on each call when the trainer
-        runs from a file (so a lane hand-rented after startup is seen), else
-        the startup snapshot."""
-        from .remote import load_hosts
-
-        if getattr(self, "remote_hosts_path", None) is not None:
-            return list(load_hosts(self.remote_hosts_path))
-        return list(getattr(self, "remote_hosts", None) or ())
-
     def _rolling_final_hosts(self) -> list:
         """The operator FINAL lanes on file NOW (``stage`` ``"any"`` /
-        ``"final"``), profile-only and init-only entries excluded."""
+        ``"final"``; hosts.toml re-read every call when the trainer runs from
+        a file, so a lane hand-rented after startup is seen), profile-only and
+        init-only entries excluded."""
         from .remote import is_profile_only
 
-        lanes = [h for h in self._rolling_hosts_on_file()
+        lanes = [h for h in _hosts_on_file(self)
                  if getattr(h, "stage", "any") in ("any", "final") and not is_profile_only(h)]
         return [_with_deployed_chain_toml(self, h) for h in lanes]
 
@@ -371,7 +363,7 @@ class _RollingMixin:
         from .remote import is_profile_only
 
         out = []
-        for h in self._rolling_hosts_on_file():
+        for h in _hosts_on_file(self):
             if getattr(h, "stage", "any") != "init" or is_profile_only(h):
                 continue
             try:
@@ -1535,6 +1527,17 @@ def record_lane_breaker_victim(runner, hotkey: str, exc: BaseException) -> bool:
         f"different legs in a row and left the rotation — requeued without backoff "
         f"({str(exc)[-300:]})", miner_fault=False, error_class="no_capacity", burn=False)
     return True
+
+
+def _hosts_on_file(runner) -> list:
+    """Every hosts.toml entry NOW: re-read on each call when the trainer runs
+    from a file (so a lane hand-rented after startup is seen), else the
+    startup snapshot."""
+    from .remote import load_hosts
+
+    if getattr(runner, "remote_hosts_path", None) is not None:
+        return list(load_hosts(runner.remote_hosts_path))
+    return list(getattr(runner, "remote_hosts", None) or ())
 
 
 def _with_deployed_chain_toml(runner, host):
