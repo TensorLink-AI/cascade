@@ -341,18 +341,42 @@ class _RollingMixin:
         return entry
 
     def _rolling_final_hosts(self) -> list:
-        """The operator FINAL lanes on file NOW: hosts.toml re-read every call
-        when the trainer runs from a file (so a lane hand-rented after startup
-        is seen), profile-only entries excluded."""
-        from .remote import is_profile_only, load_hosts
+        """The operator FINAL lanes on file NOW (``stage`` ``"any"`` /
+        ``"final"``; hosts.toml re-read every call when the trainer runs from
+        a file, so a lane hand-rented after startup is seen), profile-only and
+        init-only entries excluded."""
+        from .remote import is_profile_only
 
-        if getattr(self, "remote_hosts_path", None) is not None:
-            hosts = list(load_hosts(self.remote_hosts_path))
-        else:
-            hosts = list(self.remote_hosts or ())
-        lanes = [h for h in hosts
+        lanes = [h for h in _hosts_on_file(self)
                  if getattr(h, "stage", "any") in ("any", "final") and not is_profile_only(h)]
         return [_with_deployed_chain_toml(self, h) for h in lanes]
+
+    def _rolling_init_lanes(self) -> list:
+        """The ``stage = "init"`` lanes on file NOW: operator-rented hosts that
+        exist ONLY to build the seed epoch's random-init checkpoint
+        (:meth:`_rolling_publish_init_pointer`). Never a leg target
+        (:meth:`_rolling_final_hosts` and the capacity count skip the stage),
+        so no miner code runs there and the entry needs no ``isolated`` flag;
+        operator-billed by definition — the operator put it on file. Blocked /
+        quarantined hosts are left out (logged)."""
+        from .host_preflight import host_blocked_reason
+        from .remote import is_profile_only
+
+        out = []
+        for h in _hosts_on_file(self):
+            if getattr(h, "stage", "any") != "init" or is_profile_only(h):
+                continue
+            try:
+                why = host_blocked_reason(self, str(getattr(h, "host", "") or ""))
+            except Exception as e:  # noqa: BLE001 — an unreadable blocklist blocks nothing
+                log.warning("rolling: init lane %s block check failed (ignored): %s",
+                            getattr(h, "name", h), e)
+                why = ""
+            if why:
+                log.warning("rolling: init lane %s left out (%s)", getattr(h, "name", h), why)
+                continue
+            out.append(_with_deployed_chain_toml(self, h))
+        return out
 
     def _rolling_lane_pool(self):
         """ONE lane pool for every rolling fallback leg (created lazily): lane
@@ -1062,7 +1086,11 @@ class _RollingMixin:
            seed epoch's king leg, which trains from this same random init);
         2. an IDLE operator lane (checked out of the lane pool, so no leg can
            take it meanwhile; never the last idle lane);
-        3. otherwise the request is parked: the next operator-billed
+        3. an INIT-ONLY lane on file (hosts.toml ``stage = "init"``,
+           :meth:`_rolling_init_lanes`) — the operator's way to supply a pod
+           when the epoch has no operator king pod and no lane pool (2026-11-08:
+           an own-key king, every leg on payer pods, pointer parked for days);
+        4. otherwise the request is parked: the next operator-billed
            challenger pod of this seed epoch builds it right after its leg's
            harvest, before its release (:meth:`_rolling_init_on_leg_pod`).
 
@@ -1098,15 +1126,22 @@ class _RollingMixin:
                                                    "idle operator lane")
             finally:
                 pool.put(lane_host)
+        for init_lane in self._rolling_init_lanes():
+            # the lane trains on the DEPLOYED chain.toml like a rented pod (the
+            # on-pod build checks the contract digest against it)
+            push = getattr(self, "_push_deployed_chain_toml", None)
+            target = push(init_lane) if callable(push) else init_lane
+            return self._rolling_init_entry_on(target, era, contract, "init lane")
         self.__dict__.setdefault("_init_pointer_wanted", {})[str(era.base_seed)] = era
         why = ("the era's king pod is a payer (miner-key) pod" if host is not None
                else "no operator king pod (cached/carried or own-key king leg, or released)")
         logged = self.__dict__.setdefault("_init_defer_logged", set())
         if era.index not in logged:
             logged.add(era.index)
-            log.warning("rolling: era %d init pointer deferred — %s and no idle operator lane; "
-                        "NOT renting one. The next operator-billed challenger pod of seed "
-                        "epoch %s builds it after its leg", era.index, why, era.base_seed)
+            log.warning("rolling: era %d init pointer deferred — %s, no idle operator lane and "
+                        "no init lane (hosts.toml stage = \"init\") on file; NOT renting one. "
+                        "The next operator-billed challenger pod of seed epoch %s builds it "
+                        "after its leg", era.index, why, era.base_seed)
         return {"_deferred": why}
 
     def _rolling_init_entry_on(self, host, era, contract, what: str) -> dict:
@@ -1492,6 +1527,17 @@ def record_lane_breaker_victim(runner, hotkey: str, exc: BaseException) -> bool:
         f"different legs in a row and left the rotation — requeued without backoff "
         f"({str(exc)[-300:]})", miner_fault=False, error_class="no_capacity", burn=False)
     return True
+
+
+def _hosts_on_file(runner) -> list:
+    """Every hosts.toml entry NOW: re-read on each call when the trainer runs
+    from a file (so a lane hand-rented after startup is seen), else the
+    startup snapshot."""
+    from .remote import load_hosts
+
+    if getattr(runner, "remote_hosts_path", None) is not None:
+        return list(load_hosts(runner.remote_hosts_path))
+    return list(getattr(runner, "remote_hosts", None) or ())
 
 
 def _with_deployed_chain_toml(runner, host):

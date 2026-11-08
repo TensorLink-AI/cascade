@@ -127,7 +127,7 @@ class RemoteDispatchError(RuntimeError):
         self.final_exception = final_exception
 
 
-HOST_STAGES = ("any", "heat", "final")
+HOST_STAGES = ("any", "heat", "final", "init")
 
 
 @dataclass(frozen=True)
@@ -146,6 +146,10 @@ class RemoteHost:
     ``stage`` tags which legs the host may serve: ``"final"`` and ``"any"``
     entries are operator lanes / the rented-pod profile; ``"heat"`` is still
     accepted in hosts files (the retired screen stage) and never dispatched to.
+    ``"init"`` is an INIT-ONLY lane: an operator-rented host the trainer uses
+    solely to build the seed epoch's random-init checkpoint (the DEC-CA-0063
+    pointer) — never a leg target, never counted as capacity, so no miner code
+    runs there (``cascade.trainer.runner_rolling._RollingMixin._rolling_init_lanes``).
     """
 
     name: str
@@ -207,7 +211,8 @@ def load_hosts(path: Path | str) -> list[RemoteHost]:
         workdir = "/root/cascade"
         cuda_device = "0"
         forward_env = ["HIPPIUS_S3_ACCESS_KEY", "HIPPIUS_S3_SECRET_KEY", "HIPPIUS_HUB_TOKEN"]
-        stage = "any"       # "final" | "any" (operator lane); "heat" is accepted, unused
+        stage = "any"       # "final" | "any" (operator lane); "init" = init-build-only
+                            # lane (never a leg); "heat" is accepted, unused
         sku = "L40S"        # optional: the lane's GPU type (per-SKU latest safe start)
         isolated = true     # optional: the pod receives NOTHING from the orchestrator's
                             # environment (forward_env ignored); its legs train
