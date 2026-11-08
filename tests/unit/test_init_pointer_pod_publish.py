@@ -509,6 +509,69 @@ def test_a_deferral_spends_no_try(cfg, tmp_path):
     assert type(ops).calls == 5 and era.init_bench_tries == 0 and era.init_bench is None
 
 
+# ── init-only lanes (hosts.toml stage = "init") ──────────────────────────────
+
+def _hosts_file(tmp_path, *entries):
+    """hosts.toml with one ``[[host]]`` per ``(name, ip, stage)``."""
+    text = "".join(
+        f'[[host]]\nname = "{n}"\nhost = "{ip}"\nkey_path = "/k"\n'
+        f'remote_python = "/root/cascade/.venv/bin/python"\nworkdir = "/root/cascade"\n'
+        f'stage = "{stage}"\n\n' for n, ip, stage in entries)
+    p = tmp_path / "hosts.toml"
+    p.write_text(text)
+    return p
+
+
+def test_hosts_file_accepts_the_init_stage(tmp_path):
+    from cascade.trainer.remote import load_hosts
+
+    (h,) = load_hosts(_hosts_file(tmp_path, ("init-lane", "10.0.0.9", "init")))
+    assert h.stage == "init"
+
+
+def test_an_init_lane_on_file_builds_the_pointer_without_a_pool(cfg, tmp_path, wired):
+    r = _Runner(_vsrc(_gated(cfg)), tmp_path)
+    r.remote_hosts_path = _hosts_file(tmp_path, ("profile", "127.0.0.1", "final"),
+                                      ("init-lane", "10.0.0.9", "init"))
+    assert r._rolling_bench_init(_era())["_pointer"] == INIT_PTR
+    assert [h.name for h in r.builds] == ["init-lane"] and r.rents == []
+    assert "4242" not in r.__dict__.get("_init_pointer_wanted", {})   # no longer parked
+    assert r._rolling_final_hosts() == []                             # never a leg lane
+    # the second ask reuses the published pointer (no second build)
+    assert r._rolling_bench_init(_era())["_pointer"] == INIT_PTR and len(r.builds) == 1
+
+
+def test_init_lanes_are_read_live_and_blocked_ones_are_skipped(cfg, tmp_path, wired,
+                                                               monkeypatch):
+    r = _Runner(_vsrc(_gated(cfg)), tmp_path)
+    r.remote_hosts_path = _hosts_file(tmp_path, ("profile", "127.0.0.1", "final"))
+    assert "_deferred" in r._rolling_bench_init(_era())                # nothing on file: parked
+    _hosts_file(tmp_path, ("profile", "127.0.0.1", "final"), ("bad", "10.0.0.1", "init"),
+                ("good", "10.0.0.2", "init"))                             # hand-rented later
+    monkeypatch.setattr("cascade.trainer.host_preflight.host_blocked_reason",
+                        lambda runner, ip: "quarantined" if ip == "10.0.0.1" else "")
+    assert r._rolling_bench_init(_era())["_pointer"] == INIT_PTR
+    assert [h.name for h in r.builds] == ["good"]
+
+
+def test_final_lanes_and_profiles_are_not_init_lanes(cfg, tmp_path, wired):
+    r = _Runner(_vsrc(_gated(cfg)), tmp_path)
+    r.remote_hosts_path = _hosts_file(tmp_path, ("lane-a", "10.0.0.5", "final"),
+                                      ("loop", "127.0.0.1", "init"))
+    assert "_deferred" in r._rolling_bench_init(_era())
+    assert r.builds == [] and r.rents == []
+
+
+def test_init_lane_gets_the_deployed_chain_toml(cfg, tmp_path, wired):
+    r = _Runner(_vsrc(_gated(cfg)), tmp_path)
+    r.remote_hosts_path = _hosts_file(tmp_path, ("init-lane", "10.0.0.9", "init"))
+    pushed = []
+    r._push_deployed_chain_toml = lambda host: (pushed.append(host.name)
+                                                or replace(host, chain_toml="/root/cascade/chain.deployed.toml"))
+    assert r._rolling_bench_init(_era())["_pointer"] == INIT_PTR
+    assert pushed == ["init-lane"] and r.builds[0].chain_toml == "/root/cascade/chain.deployed.toml"
+
+
 # The owner-approval gate (2026-11-02) is tested in test_money_safety.py;
 # these tests drive the operator-lane / operator-rent machinery behind it.
 pytestmark = pytest.mark.usefixtures("operator_legs_preapproved")

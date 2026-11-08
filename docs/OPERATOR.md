@@ -783,6 +783,18 @@ Two GPUs on one box → one entry per card (`cuda_device = "0"` / `"1"`); see
 SSH answers, the pod runs this release's worker image, and the host clears the
 per-SKU bench floor. A lane whose SSH is refused is quarantined.
 
+An entry with `stage = "init"` is an **init-only lane**: the trainer uses it
+solely to build the seed epoch's random-init checkpoint (the DEC-CA-0063
+pointer the main validator benches) when the epoch has no operator king pod
+and no idle operator lane — never for a leg, never counted as capacity, so no
+miner code runs there and `isolated` is not needed. Rent the cheapest pod that
+runs the worker image, add the entry (the trainer pushes its deployed
+`chain.toml` before the CPU-only build, which takes minutes), and remove the
+entry once the trainer logs `random-init checkpoint built on init lane`. Mind
+the timing: the pointer first appears in the trainer's bench report of the next
+settlement, and the king check that reads it should fall on the first or second
+settlement of an era so the fired promotion still has its full notice.
+
 Keep `isolated = true` on every lane: miner code runs there. `forward_env`
 (forwarding `HIPPIUS_*` credentials so the pod pushes its own checkpoint)
 remains only as a deliberate exception, and the trainer logs a WARNING at
