@@ -400,7 +400,10 @@ future-unknowable but near-random-walk, so use it as a minor domain only.
   content pushed to the same Hub repo yields the same OCI `repo@digest`. Re-build
   to audit.
 - **Cleaning**: gaps interpolated per channel (series dropped above
-  `--max-missing-frac`), tails truncated under the configured keep length,
+  `--max-missing-frac`), tails truncated under the configured keep length
+  (`context_length + keep_horizon`; the publisher sizes `keep_horizon` to the
+  longest `[eval] scored_horizons` rung so every rung sees a full context —
+  shorter series keep what they have, eligibility is unchanged),
   short/constant/invalid series dropped, and exact duplicates removed.
   Multichannel series are allowed up to the effective `max_channels` limit;
   a coupled group is not rejected merely for having several channels.

@@ -16,7 +16,9 @@ Cleaning rules (a series is **dropped**, never silently corrupted, if it fails):
 
 * gaps (NaN/None) are linearly interpolated per channel, but a series with more
   than ``max_missing_frac`` missing is dropped (too unreliable to score on);
-* it is truncated to the freshest ``context_length + horizon`` points (older
+* it is truncated to the freshest ``context_length + keep_horizon`` points
+  (``keep_horizon`` defaults to ``horizon``; the publisher passes the LONGEST
+  scored horizon so every rung of the ladder sees a full context — older
   history is unused by the scorer, so dropping it shrinks the pool for free);
 * it must still be at least ``min_length`` long after that;
 * series with more than ``max_channels`` variates are rejected, and degenerate
@@ -95,6 +97,15 @@ class PoolBuildConfig:
     # window with a few hundred steps of context is still a valid eval task. The
     # backbone (hourly) sources fill the full context.
     min_context: int = 256
+    # Horizon the KEPT TAIL is sized for. The scorer cuts the last ``h`` points
+    # as the target and up to ``context_length`` before them as history, so a
+    # tail of ``context_length + horizon`` only affords the full context at
+    # ``horizon`` itself: at a longer rung of the scored ladder the context is
+    # ``horizon_rung - horizon`` points short (4096 - 656 at h=720 under the
+    # 64-step default). ``None`` keeps the legacy ``horizon`` sizing; the
+    # publisher passes ``max([eval] scored_horizons)``. Eligibility
+    # (``min_length``) is unchanged: a shorter series keeps what it has.
+    keep_horizon: int | None = None
     max_missing_frac: float = 0.2
     max_channels: int = 1
     min_std: float = 1e-8
@@ -129,13 +140,24 @@ class PoolBuildConfig:
     selection: str = "first"
     selection_seed: str = ""
 
+    def __post_init__(self) -> None:
+        if self.keep_horizon is not None and int(self.keep_horizon) < int(self.horizon):
+            raise ValueError(
+                f"keep_horizon={self.keep_horizon} is shorter than horizon={self.horizon}: "
+                "the kept tail could not afford the scored target"
+            )
+
     @property
     def min_length(self) -> int:
         return self.horizon + self.min_context
 
     @property
+    def effective_keep_horizon(self) -> int:
+        return int(self.horizon if self.keep_horizon is None else self.keep_horizon)
+
+    @property
     def keep_length(self) -> int:
-        return self.context_length + self.horizon
+        return self.context_length + self.effective_keep_horizon
 
 
 @dataclass(frozen=True)

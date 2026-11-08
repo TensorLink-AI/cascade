@@ -224,6 +224,10 @@ jobs:
           #   stations into every snapshot.
           #   Operator-side only: validators load whatever signed snapshot is
           #   current (no release needed).
+          # Kept tail = context_length + max([eval] scored_horizons) (4096+720),
+          #   resolved from $TOML by the CLI (--keep-horizon overrides): the
+          #   720 rung sees a full 4096 context instead of 4096-656. Series
+          #   shorter than that keep whatever they have (eligibility unchanged).
           TSFORGE_DIR=./tsforge cascade-pool publish \
             --chain-toml "$TOML" \
             --sources tsbench_forge \
