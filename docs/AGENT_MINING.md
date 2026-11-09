@@ -64,6 +64,14 @@ cascade iterate ./my-a --pool-dir ./cascade-eval-pool/snapshots/2026-10-31-block
   --seeds 0,1 --warm-start live --train-hours 0.01 --device cpu --json
 ```
 
+`--seeds 0,1` are replicate seeds for your own A/B robustness; they are not the
+live epoch's seed. `cascade status --json` publishes that under `data.seed`
+(`seed_block`, `base_seed`, `training_seed`, `reproduce_with`): pass
+`--seed <base_seed>` to train under exactly the init and data order the king and
+every challenger of the current seed epoch were trained with. The derivation is
+the trainer's own (`RoundSeeds.derive` from the seed block's hash), independent
+of hotkey and role, and re-rolls only when a promotion opens a new seed epoch.
+
 The held-out data above is the public eval pool
 ([Tensor-Link/cascade-eval-pool](https://huggingface.co/datasets/Tensor-Link/cascade-eval-pool)):
 a lagged reveal of **retired** held-out snapshots, byte-identical to what

@@ -132,3 +132,23 @@ def test_live_scoring_network_failure_is_not_random_init(monkeypatch, cfg):
     monkeypatch.setattr("cascade.miner.dashboard.fetch_public_json", lambda *a, **k: None)
     with pytest.raises(LiveStateUnavailable, match="stale or unconfirmed"):
         resolve_live_warm_start(cfg)
+
+
+def test_seed_epoch_passes_through_and_status_prints_the_seed_flag(monkeypatch, capsys):
+    d = docs()
+    d["competition"]["seed"] = {"seed_block": 9396000, "base_seed": 14349492220266598742,
+                                "training_seed": 123, "reproduce_with": "--seed 14349492220266598742"}
+    assert status_snapshot(d, now=NOW, max_age=180)["seed"]["base_seed"] == 14349492220266598742
+    assert status_snapshot(docs(), now=NOW, max_age=180)["seed"] is None
+    for doc in d.values():
+        doc["as_of"] = datetime.now(UTC).isoformat()
+    by_path = {"status/chain.json": d["chain"], "status/v2.json": d["competition"]}
+    monkeypatch.setattr("cascade.miner.dashboard.fetch_public_json",
+                        lambda storage, key, **_: copy.deepcopy(by_path.get(key)))
+    assert cli.main(["status"]) == 0
+    cap = capsys.readouterr()
+    assert "Seed epoch: block 9396000 → base seed 14349492220266598742" in cap.out
+    assert "--seed 14349492220266598742" in cap.out
+    by_path["status/v2.json"].pop("seed")
+    assert cli.main(["status"]) == 0
+    assert "Seed epoch" not in capsys.readouterr().out

@@ -363,3 +363,37 @@ def test_trainer_hook_reads_driver_state_and_king_health():
     h = doc["king"]["routing_health"]
     assert len(h["layers"]) == 7 and h["layers"][0]["max_over_mean"] == 1.0
     assert [x["layer"] for x in h["layers"]] == doc["model"]["moe_blocks"]
+
+
+# ── the seed epoch for miners ─────────────────────────────────
+
+
+def test_trainer_publishes_the_seed_epoch_for_miners():
+    from cascade.trainer.contract import RoundSeeds
+    store = _Store()
+    sch = _sched(store)
+    cur = sch.state.current
+    cur.base_seed, cur.seed_block, cur.epoch_start = 14349492220266598742, 9396000, 2611
+    sch.cfg.training = SimpleNamespace(train_seed_salt=7)
+    assert publish_trainer_v2_status(sch, 100, clock=lambda: 0.0)
+    seed = store.writes[-1][1]["seed"]
+    want = RoundSeeds.derive(14349492220266598742, sch.cfg.training)
+    assert seed["seed_block"] == 9396000 and seed["epoch_start_era"] == 2611
+    assert seed["base_seed"] == want.base_seed == 14349492220266598742
+    assert seed["training_seed"] == want.training_seed
+    assert seed["generation_seed"] == want.generation_seed
+    assert seed["train_seed_salt"] == 7
+    assert seed["reproduce_with"] == "--seed 14349492220266598742"
+
+
+def test_seed_epoch_is_absent_without_an_era_seed_or_a_training_section():
+    store = _Store()
+    sch = _sched(store)
+    sch.cfg.training = SimpleNamespace(train_seed_salt=7)     # era has no base_seed yet
+    assert publish_trainer_v2_status(sch, 100, clock=lambda: 0.0)
+    assert "seed" not in store.writes[-1][1]
+    store = _Store()
+    sch = _sched(store)
+    sch.state.current.base_seed = 5                           # no training section
+    assert publish_trainer_v2_status(sch, 100, clock=lambda: 0.0)
+    assert "seed" not in store.writes[-1][1]
