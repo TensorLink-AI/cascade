@@ -96,6 +96,9 @@ def status_snapshot(docs: dict, *, now: datetime, max_age: float) -> dict:
             and (comp.get("golive") or {}).get("admission_state") not in {"closed", "queued"}),
         "source_kind": "public_telemetry_not_consensus",
         "chain": chain, "warm_start": warm,
+        # the live seed epoch (seed_block / base_seed / training_seed): pass
+        # ``--seed base_seed`` to score under exactly the king's init + data order
+        "seed": comp.get("seed"),
         "golive": comp.get("golive"), "model": comp.get("model"),
         "training_contract": comp.get("training_contract"),
         "compute": comp.get("compute"),
@@ -203,6 +206,11 @@ def cmd_status(args: argparse.Namespace) -> int:
             out.info(f"Competition status: {'fresh' if snapshot['fresh'] else 'stale or unavailable'}")
             if not hotkey:
                 out.info(f"Warm start: {snapshot['warm_start'].get('pointer') or snapshot['warm_start'].get('mode', 'unavailable')}")
+                seed = snapshot.get("seed") or {}
+                if seed.get("base_seed") is not None:
+                    out.info(f"Seed epoch: block {seed.get('seed_block')} → base seed {seed['base_seed']} "
+                             f"(training seed {seed.get('training_seed')}); pass `--seed {seed['base_seed']}` "
+                             "to score under the live init and data order")
             if not watch:
                 break
             time.sleep(args.refresh if snapshot["fresh"] and queue_ok else min(120, args.refresh * 2))

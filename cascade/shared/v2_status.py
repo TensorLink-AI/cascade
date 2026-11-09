@@ -599,6 +599,31 @@ def lane_c_view(lc, state=None, *, block: int | None, trainer: dict | None = Non
     }
 
 
+def seed_view(era, training) -> dict | None:
+    """The era's seed epoch, for miners: the public chain block whose hash is
+    the base seed, the base seed itself and the generation / training seeds the
+    trainer derives from it (``RoundSeeds.derive`` — the SAME derivation every
+    king and challenger leg of the epoch trains under; nothing in it depends on
+    the hotkey, the role or the round). ``cascade score --seed <base_seed>``
+    reproduces the live init and data order. ``None`` before an era exists or
+    when the running config has no training section."""
+    base = getattr(era, "base_seed", None)
+    if base is None or training is None or not hasattr(training, "train_seed_salt"):
+        return None
+    from ..trainer.contract import RoundSeeds
+
+    seeds = RoundSeeds.derive(int(base), training)
+    return {"seed_block": int(getattr(era, "seed_block", 0) or 0),
+            "epoch_start_era": int(getattr(era, "epoch_start", -1)),
+            "base_seed": int(seeds.base_seed),
+            "generation_seed": int(seeds.generation_seed),
+            "training_seed": int(seeds.training_seed),
+            "train_seed_salt": int(getattr(training, "train_seed_salt", 0) or 0),
+            "scope": "identical for the king and every challenger leg of this seed epoch; "
+                     "re-rolled only when a promotion opens a new epoch",
+            "reproduce_with": f"--seed {int(seeds.base_seed)}"}
+
+
 def build_v2_status(cfg, *, block: int | None, state=None, health: dict | None = None,
                     era_index: int | None = None, king_pointer: str = "",
                     health_domains: int = 0, as_of: str | None = None,
@@ -1058,6 +1083,11 @@ def publish_trainer_v2_status(sched, block: int, *, min_interval_s: float = MIN_
                 "generation": int(getattr(cur, "generation", 0)),
                 "member_index": int(getattr(cur, "member_index", 0)),
             }
+        # The seed epoch miners train under (``cascade status`` → ``seed``):
+        # the exact seeds the trainer derives, so a local ``--seed`` can match.
+        seed = seed_view(cur, getattr(cfg, "training", None))
+        if seed is not None:
+            doc["seed"] = seed
         # Agent-facing policy comes from the running trainer's resolved config;
         # never ask miners to infer live rules from their packaged chain.toml.
         doc["policy"] = {
