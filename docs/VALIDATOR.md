@@ -372,6 +372,12 @@ holds the round instead of switching to local inference or penalizing a miner.
 Transient directories are removed after success/failure; cleanup failures are
 logged for the operator to remove on the worker.
 
+**Update the GPU host with the validator.** The worker runs this repo's code on
+the host, so deploy the same release there every time you update the validator.
+Before uploading a checkpoint the validator asks the host what it supports. A
+host on older code holds the round with an ERROR naming the missing contract
+fields. Failed worker runs log the worker's own error in the validator log.
+
 `--private-eval-workers N` defaults to `1`. Parallel workers each load a model
 and keep the original per-window forecast call and deterministic draws; local
 parallel mode limits torch to one CPU thread per worker. Size this explicitly

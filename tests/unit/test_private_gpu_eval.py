@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import dataclasses
 import json
+import logging
 import shlex
 import shutil
 import subprocess
@@ -309,3 +311,117 @@ def test_evaluate_closes_the_stream_after_scoring(checkpoint, cfg, monkeypatch):
     rows = EvaluationMixin._evaluate(runner, SimpleNamespace(size=contract.arch_preset),
                                      windows, contract)
     assert rows and closed == [True]
+
+
+# ── pre-upload compatibility probe + the worker's own error in the log ──────
+
+
+def _probe_host():
+    return RemoteHost("gpu-fixture", "fixture", user="ubuntu", port=40123, workdir="/w")
+
+
+def _probe_reply(fields, schemas=("cascade-private-eval/1", "cascade-private-eval/2-quantiles")):
+    def run(_argv, _timeout):
+        return SimpleNamespace(returncode=0, stderr="", stdout=(
+            "motd noise\n" + json.dumps({"contract_fields": list(fields), "schemas": list(schemas)})))
+    return run
+
+
+@dataclasses.dataclass
+class _Contract:
+    alpha: int = 1
+    beta: int = 2
+
+
+def test_probe_refuses_a_host_missing_a_contract_field_and_names_it(caplog):
+    from cascade.validator.eval_offload import check_private_worker
+
+    with caplog.at_level(logging.ERROR, "cascade.validator.eval_offload"), \
+            pytest.raises(PrivateEvalUnavailable, match="out of date"):
+        check_private_worker(_probe_host(), _Contract(), run=_probe_reply(["alpha"]))
+    assert "beta" in caplog.text
+
+
+def test_probe_passes_a_matching_host_and_only_warns_on_a_newer_one(caplog):
+    from cascade.validator.eval_offload import check_private_worker
+
+    check_private_worker(_probe_host(), _Contract(), run=_probe_reply(["alpha", "beta"]))
+    assert not caplog.records
+    with caplog.at_level(logging.WARNING, "cascade.validator.eval_offload"):
+        check_private_worker(_probe_host(), _Contract(), run=_probe_reply(["alpha", "beta", "gamma"]))
+    assert "gamma" in caplog.text
+
+
+def test_probe_requires_the_quantile_schema_only_for_quantile_requests():
+    from cascade.validator.eval_offload import check_private_worker
+
+    old = _probe_reply(["alpha", "beta"], schemas=("cascade-private-eval/1", ""))
+    check_private_worker(_probe_host(), _Contract(), run=old)
+    with pytest.raises(PrivateEvalUnavailable):
+        check_private_worker(_probe_host(), _Contract(), quantile_levels=(0.5,), run=old)
+
+
+@pytest.mark.parametrize("reply", [
+    SimpleNamespace(returncode=1, stdout="", stderr="ssh: refused"),
+    SimpleNamespace(returncode=0, stdout="", stderr=""),
+    SimpleNamespace(returncode=0, stdout="not json", stderr=""),
+    SimpleNamespace(returncode=0, stdout=json.dumps({"schemas": []}), stderr=""),
+])
+def test_a_failed_probe_never_decides_the_round(reply):
+    from cascade.validator.eval_offload import check_private_worker
+
+    check_private_worker(_probe_host(), _Contract(), run=lambda *_: reply)
+
+
+def test_a_raising_probe_never_decides_the_round():
+    from cascade.validator.eval_offload import check_private_worker
+
+    def boom(*_):
+        raise TimeoutError("ssh hung")
+
+    check_private_worker(_probe_host(), _Contract(), run=boom)
+
+
+def test_the_probe_script_reports_this_release(tmp_path):
+    from cascade.shared.config.training import TrainingContractConfig
+    from cascade.validator.eval_offload import WORKER_PROBE
+    from cascade.validator.private_worker import SCHEMA, SCHEMA_QUANTILES
+
+    proc = subprocess.run([sys.executable, "-c", WORKER_PROBE], capture_output=True, text=True,
+                          check=True, timeout=300)
+    info = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert set(info["contract_fields"]) == {f.name for f in dataclasses.fields(TrainingContractConfig)}
+    assert set(info["schemas"]) == {SCHEMA, SCHEMA_QUANTILES}
+
+
+def test_an_out_of_date_host_gets_no_upload(checkpoint, tmp_path):
+    directory, contract = checkpoint
+    host = RemoteHost("gpu-fixture", "fixture", workdir=str(tmp_path))
+    calls = []
+
+    def run(argv, _timeout):
+        calls.append(argv)
+        if argv[0] == "ssh" and " -c " in argv[-1]:
+            return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps(
+                {"contract_fields": ["only_this"], "schemas": ["cascade-private-eval/1"]}))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    with pytest.raises(PrivateEvalUnavailable, match="out of date"):
+        forecasts_via_host(host, directory, _windows(), contract=contract, num_samples=8, runner=run)
+    assert not [a for a in calls if a[0] == "scp"]
+    assert calls[-1][-1].startswith("rm -rf ")
+
+
+def test_the_workers_own_error_reaches_the_validator_log(checkpoint, tmp_path, caplog):
+    directory, contract = checkpoint
+    host = RemoteHost("gpu-fixture", "fixture", workdir=str(tmp_path))
+
+    def run(argv, _timeout):
+        if "cascade.validator.private_worker" in " ".join(argv) and " -c " not in argv[-1]:
+            return SimpleNamespace(returncode=1, stdout="", stderr="TypeError: unexpected keyword")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    with caplog.at_level(logging.ERROR, "cascade.validator.eval_offload"), \
+            pytest.raises(PrivateEvalUnavailable):
+        forecasts_via_host(host, directory, _windows(), contract=contract, num_samples=8, runner=run)
+    assert "TypeError: unexpected keyword" in caplog.text

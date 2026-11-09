@@ -20,7 +20,7 @@ import tempfile
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 from ..eval.benchmarks import bench_uv_args, bench_workers_arg, gift_rows_from_report
@@ -41,6 +41,73 @@ DEFAULT_UV_BIN = "~/.local/bin/uv"
 
 class PrivateEvalUnavailable(RuntimeError):
     """A trusted GPU transport failed; never a miner-caused rejection."""
+
+
+# Seconds the pre-upload compatibility probe may take.
+WORKER_PROBE_SECONDS = 60
+# Tail of a failed step's stderr kept in the validator's log.
+STEP_STDERR_TAIL = 600
+# What the host's code accepts, asked of the code itself so the probe also
+# answers on a host that predates it. Run from ``host.workdir`` like the worker,
+# so it imports the same package the worker would.
+WORKER_PROBE = (
+    "import dataclasses, json\n"
+    "from cascade.shared.config.training import TrainingContractConfig as T\n"
+    "from cascade.validator import private_worker as w\n"
+    "print(json.dumps({'contract_fields': [f.name for f in dataclasses.fields(T)],\n"
+    "                  'schemas': [getattr(w, 'SCHEMA', ''), getattr(w, 'SCHEMA_QUANTILES', '')]}))\n"
+)
+
+
+def check_private_worker(host, contract, *, quantile_levels=None, run=None,
+                         timeout_s=WORKER_PROBE_SECONDS) -> None:
+    """Refuse before any upload when ``host`` provably cannot serve this request.
+
+    The worker rebuilds the contract with ``TrainingContractConfig(**fields)``,
+    so a host on older code dies with a TypeError on every attempt, after the
+    checkpoint has crossed the wire (2026-11-09: 8 hours of held rounds). The
+    round holds either way; this names the cause once per attempt.
+
+    Only a clear answer refuses. A probe that fails or returns nothing readable
+    logs a warning and the eval proceeds exactly as it would have. A host that
+    knows MORE fields than this validator only warns: the worker fills them
+    from its defaults, as it always has.
+    """
+    run = run or run_ssh
+    command = (f"cd {shlex.quote(host.workdir)} && "
+               f"{shlex.quote(host.remote_python)} -c {shlex.quote(WORKER_PROBE)}")
+    try:
+        proc = run(build_ssh_argv(host, command), timeout_s)
+        if proc.returncode:
+            log.warning("private eval host %s: compatibility probe failed (exit %s): %s",
+                        host.name, proc.returncode, _stderr_tail(proc))
+            return
+        info = json.loads(proc.stdout.strip().splitlines()[-1])
+        remote_fields = {str(f) for f in info["contract_fields"]}
+        remote_schemas = {str(s) for s in info["schemas"]}
+    except Exception as e:  # noqa: BLE001 — the probe never decides a round on its own failure
+        log.warning("private eval host %s: compatibility probe unreadable (%s: %s)",
+                    host.name, type(e).__name__, e)
+        return
+    local_fields = set(asdict(contract))
+    missing = sorted(local_fields - remote_fields)
+    needs_quantiles = quantile_levels is not None
+    from .private_worker import SCHEMA_QUANTILES
+
+    if missing or (needs_quantiles and SCHEMA_QUANTILES not in remote_schemas):
+        log.error("private eval host %s runs code older than this validator (contract fields "
+                  "it lacks: %s; quantile requests supported: %s) — deploy this validator's "
+                  "release to the host; the round holds until then",
+                  host.name, ", ".join(missing) or "none", SCHEMA_QUANTILES in remote_schemas)
+        raise PrivateEvalUnavailable("private evaluation worker is out of date")
+    extra = sorted(remote_fields - local_fields)
+    if extra:
+        log.warning("private eval host %s runs code newer than this validator (extra contract "
+                    "fields: %s)", host.name, ", ".join(extra))
+
+
+def _stderr_tail(proc) -> str:
+    return (getattr(proc, "stderr", "") or "")[-STEP_STDERR_TAIL:]
 
 
 def forecasts_via_host(host, checkpoint, windows, *, contract, num_samples,
@@ -68,25 +135,32 @@ def forecasts_via_host(host, checkpoint, windows, *, contract, num_samples,
     work = f"_private_eval_offload/{uuid.uuid4().hex}"
     base = f"{host.workdir}/{work}"
 
-    def step(argv):
+    def step(argv, what):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise PrivateEvalUnavailable("private evaluation deadline expired")
         proc = run(argv, remaining)
         if proc.returncode:
+            log.error("private eval %s failed on %s (exit %s): %s",
+                      what, host.name, proc.returncode, _stderr_tail(proc))
             raise PrivateEvalUnavailable("private evaluation transport/worker failed")
         return proc
 
     tmpdir = tempfile.TemporaryDirectory(prefix="cascade-private-eval-")
     try:
+        check_private_worker(host, contract, quantile_levels=quantile_levels, run=run,
+                             timeout_s=max(1, min(WORKER_PROBE_SECONDS,
+                                                  deadline - time.monotonic())))
         local = Path(tmpdir.name)
         request = local / "request.npz"
         identity = write_request(request, checkpoint, windows, contract=contract,
                                  num_samples=num_samples, quantile_levels=quantile_levels)
-        step(build_ssh_argv(host, f"umask 077 && mkdir -p {shlex.quote(base + '/checkpoint')}"))
+        step(build_ssh_argv(host, f"umask 077 && mkdir -p {shlex.quote(base + '/checkpoint')}"),
+             "workdir setup")
         for name in CHECKPOINT_FILES:
-            step(build_scp_argv(host, str(Path(checkpoint) / name), f"{base}/checkpoint/{name}"))
-        step(build_scp_argv(host, str(request), f"{base}/request.npz"))
+            step(build_scp_argv(host, str(Path(checkpoint) / name), f"{base}/checkpoint/{name}"),
+                 f"upload of {name}")
+        step(build_scp_argv(host, str(request), f"{base}/request.npz"), "upload of the request")
         argv = [host.remote_python, "-m", "cascade.validator.private_worker",
                 f"{work}/checkpoint", f"{work}/request.npz", f"{work}/samples.npz",
                 "--device", "cuda", "--workers", str(workers)]
@@ -96,8 +170,9 @@ def forecasts_via_host(host, checkpoint, windows, *, contract, num_samples,
         command = (f"cd {shlex.quote(host.workdir)} && " + env
                    + f"timeout --signal=TERM --kill-after=15s {max(1, int(deadline - time.monotonic()) - 15)}s "
                    + " ".join(shlex.quote(a) for a in argv))
-        step(build_ssh_argv(host, command))
-        size = step(build_ssh_argv(host, f"stat -c %s {shlex.quote(base + '/samples.npz')}"))
+        step(build_ssh_argv(host, command), "worker")
+        size = step(build_ssh_argv(host, f"stat -c %s {shlex.quote(base + '/samples.npz')}"),
+                    "reply size check")
         depth = len(quantile_levels) if quantile_levels is not None else int(num_samples)
         budget = (sum(w.n_channels * depth * w.horizon * 8 for w in windows)
                   + (len(windows) + 1) * 8192)
@@ -106,7 +181,7 @@ def forecasts_via_host(host, checkpoint, windows, *, contract, num_samples,
         output = local / "samples.npz"
         download = build_scp_argv(host, "unused", "unused")
         download[-2:] = [f"{host.user}@{host.host}:{base}/samples.npz", str(output)]
-        step(download)
+        step(download, "download of the reply")
         # Validate EVERY window first (a corrupt/partial reply still holds
         # the round as infrastructure, never a miner fault), then stream
         # the samples one window at a time into the scorer: the full
