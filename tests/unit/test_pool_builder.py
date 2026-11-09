@@ -323,3 +323,75 @@ def test_balanced_seed_is_recorded_in_provenance(tmp_path):
     prov = json.loads((tmp_path / "p" / "provenance.json").read_text())
     assert prov["config"]["selection"] == "balanced"
     assert prov["config"]["selection_seed"] == "block:1"
+
+
+# ── keep_horizon: full context at every rung of the scored ladder ───────────
+
+
+def test_keep_horizon_default_is_byte_identical_to_horizon_sizing():
+    cfg = PoolBuildConfig(context_length=512, horizon=16, min_context=64)
+    assert cfg.keep_horizon is None
+    assert cfg.effective_keep_horizon == 16
+    assert cfg.keep_length == 512 + 16
+    assert cfg.min_length == 16 + 64
+
+
+def test_keep_horizon_widens_tail_without_touching_eligibility():
+    cfg = PoolBuildConfig(context_length=512, horizon=16, min_context=64, keep_horizon=180)
+    assert cfg.keep_length == 512 + 180
+    assert cfg.min_length == 16 + 64          # unchanged: shorter series stay eligible
+    rec, reason = prepare_series(_series(n=900), cfg)
+    assert reason is None and rec is not None
+    assert rec.values.shape[-1] == 692
+    # every rung of the ladder now sees the full context from the kept tail
+    for h in (16, 64, 180):
+        (w,) = build_windows_from_series([rec.values], context_length=512, horizon=h)
+        assert w.history.shape[-1] == 512
+        assert w.target.shape[-1] == h
+    # the legacy tail (context_length + horizon) is short at the long rungs
+    legacy, _ = prepare_series(_series(n=900), PoolBuildConfig(context_length=512, horizon=16,
+                                                               min_context=64))
+    (w,) = build_windows_from_series([legacy.values], context_length=512, horizon=180)
+    assert w.history.shape[-1] == 528 - 180
+
+
+def test_keep_horizon_short_series_keep_what_they_have():
+    cfg = PoolBuildConfig(context_length=512, horizon=16, min_context=64, keep_horizon=180)
+    rec, reason = prepare_series(_series(n=300), cfg)
+    assert reason is None and rec is not None
+    assert rec.values.shape[-1] == 300          # never padded, never cut
+    (w,) = build_windows_from_series([rec.values], context_length=512, horizon=180)
+    assert w.history.shape[-1] == 300 - 180
+    # eligibility floor is still horizon + min_context, not keep_length
+    rec2, reason2 = prepare_series(_series(n=79), cfg)
+    assert rec2 is None and reason2 == "too_short"
+    rec3, reason3 = prepare_series(_series(n=80), cfg)
+    assert reason3 is None and rec3.values.shape[-1] == 80
+
+
+def test_keep_horizon_below_horizon_is_rejected():
+    with pytest.raises(ValueError, match="keep_horizon"):
+        PoolBuildConfig(context_length=512, horizon=64, keep_horizon=16)
+
+
+def test_keep_horizon_is_recorded_in_provenance(tmp_path):
+    cfg = PoolBuildConfig(context_length=512, horizon=16, min_context=64, keep_horizon=180)
+    build_pool([_ListSource([_series("a", n=900), _series("b", n=300)])], tmp_path / "p",
+               CTX, cfg, fetch=None)
+    prov = json.loads((tmp_path / "p" / "provenance.json").read_text())
+    assert prov["config"]["keep_horizon"] == 180
+    series, _ids = _load_series_dir(tmp_path / "p")
+    assert sorted(int(s.shape[-1]) for s in series) == [300, 692]
+
+
+def test_cli_resolves_keep_horizon_from_scored_ladder():
+    from types import SimpleNamespace
+
+    from cascade.pool.cli import resolve_keep_horizon
+
+    ladder = SimpleNamespace(scored_horizons=(64, 256, 720))
+    assert resolve_keep_horizon(None, ladder, 64) == 720      # mainnet: 4096 + 720
+    assert resolve_keep_horizon(None, SimpleNamespace(scored_horizons=()), 64) == 64
+    assert resolve_keep_horizon(None, SimpleNamespace(), 64) == 64
+    assert resolve_keep_horizon(1000, ladder, 64) == 1000     # explicit flag wins
+    assert resolve_keep_horizon(8, ladder, 64) == 64          # never below the base horizon

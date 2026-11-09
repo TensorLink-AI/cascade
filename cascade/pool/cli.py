@@ -76,6 +76,9 @@ def _add_build_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--context-length", type=int, default=None, help="Override [eval] context_length.")
     p.add_argument("--horizon", type=int, default=None, help="Override [eval] horizon.")
     p.add_argument("--min-context", type=int, default=256, help="Minimum context a kept window affords.")
+    p.add_argument("--keep-horizon", type=int, default=None,
+                   help="Size each kept tail for this horizon (context_length + N points). "
+                        "Default: the longest of [eval] scored_horizons, else --horizon.")
     p.add_argument("--max-missing-frac", type=float, default=0.2, help="Drop series gappier than this.")
     p.add_argument("--mv-pack", action="store_true",
                    help="DEC-CA-0041: pack each tagged source's mv_channels into one "
@@ -428,10 +431,26 @@ def _cmd_sources(args: argparse.Namespace) -> int:
     return 0
 
 
+def resolve_keep_horizon(explicit: int | None, eval_cfg, horizon: int) -> int:
+    """Horizon the kept tail is sized for (``PoolBuildConfig.keep_horizon``).
+
+    ``--keep-horizon`` wins; otherwise the LONGEST ``[eval] scored_horizons``
+    rung, so the pool affords ``context_length`` of history at every rung the
+    validator scores (a tail sized for the base ``horizon`` alone is 656 steps
+    short at h=720). Falls back to ``horizon`` when the ladder is unset. Never
+    below ``horizon`` — the tail must still carry the base target.
+    """
+    if explicit is not None:
+        return max(int(explicit), int(horizon))
+    ladder = tuple(int(h) for h in (getattr(eval_cfg, "scored_horizons", ()) or ()))
+    return max((*ladder, int(horizon)))
+
+
 def _build(args: argparse.Namespace, cfg, *, out_dir: Path, overwrite: bool):
     """Shared harvest → build into ``out_dir``. Returns the BuildSummary."""
     context_length = args.context_length or cfg.eval.context_length
     horizon = args.horizon or cfg.eval.horizon
+    keep_horizon = resolve_keep_horizon(getattr(args, "keep_horizon", None), cfg.eval, horizon)
     sources = get_sources([s.strip() for s in args.sources.split(",") if s.strip()])
     if getattr(args, "max_panel_series_per_feed", None) is not None:
         for src in sources:
@@ -462,6 +481,7 @@ def _build(args: argparse.Namespace, cfg, *, out_dir: Path, overwrite: bool):
         context_length=context_length,
         horizon=horizon,
         min_context=args.min_context,
+        keep_horizon=keep_horizon,
         max_missing_frac=args.max_missing_frac,
         max_series_per_domain=args.max_series_per_domain,
         max_series_per_domain_freq=args.max_series_per_domain_freq,
