@@ -50,16 +50,19 @@ def checkpoint_hashes(directory: Path) -> dict:
     return {name: file_hash(directory / name) for name in CHECKPOINT_FILES}
 
 
-def write_request(path, checkpoint, windows, *, contract, num_samples, quantile_levels=None):
+def write_request(path, checkpoint, windows, *, contract, num_samples, quantile_levels=None,
+                  hashes=None):
     """``quantile_levels`` set ⇒ a quantile-head request (:data:`SCHEMA_QUANTILES`);
-    None ⇒ the sample request, byte-identical to before the knob."""
+    None ⇒ the sample request, byte-identical to before the knob. ``hashes``:
+    the caller's :func:`checkpoint_hashes` of ``checkpoint`` (saves a re-hash)."""
     from ..eval.torch_runtime import capture_runtime
 
     metadata = {"schema": SCHEMA, "contract": asdict(contract),
                 "runtime": capture_runtime(),
                 "num_samples": int(num_samples),
                 "horizons": [w.horizon for w in windows],
-                "checkpoint": checkpoint_hashes(Path(checkpoint))}
+                "checkpoint": (dict(hashes) if hashes is not None
+                                else checkpoint_hashes(Path(checkpoint)))}
     if quantile_levels is not None:
         metadata["schema"] = SCHEMA_QUANTILES
         metadata["quantile_levels"] = [float(q) for q in quantile_levels]

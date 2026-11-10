@@ -106,44 +106,49 @@ def test_worker_refuses_checkpoint_changed_after_request(checkpoint, tmp_path):
         run_request(directory, request, tmp_path / "samples.npz", device="cpu")
 
 
+def _shell_runner(root, worker, calls=None, fail=None):
+    """A local stand-in for the SSH/SCP bridge: scp copies files, ssh commands
+    run in a real shell (the validator's remote commands exercised as
+    written), and the worker command runs ``worker`` in-process on CPU with
+    its paths resolved against the host workdir ``root``. ``fail(argv)`` true
+    ⇒ that call returns exit 1."""
+    root = Path(root)
+
+    def run(argv, _timeout):
+        if calls is not None:
+            calls.append(argv)
+        if fail is not None and fail(argv):
+            return SimpleNamespace(returncode=1, stdout="", stderr="injected failure")
+        if argv[0] == "scp":
+            source, dest = (a.split(":", 1)[-1] if "@fixture:" in a else a for a in argv[-2:])
+            shutil.copyfile(source, dest)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        tokens = shlex.split(argv[-1])
+        if "cascade.validator.private_worker" in tokens:
+            i = tokens.index("cascade.validator.private_worker")
+            worker(*[str(root / name) for name in tokens[i + 1:i + 4]])
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        proc = subprocess.run(["bash", "-c", argv[-1]], capture_output=True, text=True, timeout=120)
+        return SimpleNamespace(returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
+
+    return run
+
+
 def test_private_transport_scores_locally_and_cleans_up(checkpoint, tmp_path):
     directory, contract = checkpoint
     host = RemoteHost("targon-fixture", "fixture", user="ubuntu", port=40123,
                       workdir=str(tmp_path / "remote"))
     host_root = Path(host.workdir)
     host_root.mkdir()
-    bases = []
-
-    def run(argv, _timeout):
-        if argv[0] == "scp":
-            source, dest = argv[-2:]
-            source = source.split(":", 1)[-1] if source.startswith("ubuntu@fixture:") else source
-            dest = dest.split(":", 1)[-1] if dest.startswith("ubuntu@fixture:") else dest
-            shutil.copyfile(source, dest)
-        else:
-            command = shlex.split(argv[-1])
-            if "mkdir" in command:
-                path = Path(command[-1])
-                bases.append(path.parent)
-                path.mkdir(parents=True)
-            elif "cascade.validator.private_worker" in command:
-                i = command.index("cascade.validator.private_worker")
-                # SSH runs the worker after cd into host.workdir; model the
-                # working directory without changing the test process cwd.
-                paths = [str(host_root / name) for name in command[i + 1:i + 4]]
-                run_request(*paths, device="cpu", workers=2)
-            elif command[0] == "stat":
-                return SimpleNamespace(returncode=0, stdout=str(Path(command[-1]).stat().st_size))
-            elif command[0] == "rm":
-                shutil.rmtree(command[-1], ignore_errors=True)
-        return SimpleNamespace(returncode=0, stdout="")
+    run = _shell_runner(host_root, lambda *p: run_request(*p, device="cpu", workers=2))
 
     windows = _windows()
     samples = iter(forecasts_via_host(host, directory, windows, contract=contract,
                                      num_samples=8, workers=2, runner=run))
     got = score_joint_forecaster_on_windows(lambda *_: next(samples), windows, 8)
     _equal(evaluate_checkpoint(directory, windows, num_samples=8, contract=contract), got)
-    assert bases and all(not p.exists() for p in bases)
+    # the run dir is gone; only the verified checkpoint cache stays
+    assert sorted(p.name for p in (host_root / "_private_eval_offload").iterdir()) == ["cache"]
 
 
 def test_transport_failure_is_infrastructure_and_always_cleans_up(checkpoint, tmp_path):
@@ -210,26 +215,7 @@ def _fake_transport(tmp_path, worker):
                       workdir=str(tmp_path / "remote"))
     root = Path(host.workdir)
     root.mkdir()
-
-    def run(argv, _timeout):
-        if argv[0] == "scp":
-            source, dest = (a.split(":", 1)[-1] if a.startswith("ubuntu@fixture:") else a
-                            for a in argv[-2:])
-            shutil.copyfile(source, dest)
-        else:
-            command = shlex.split(argv[-1])
-            if "mkdir" in command:
-                Path(command[-1]).mkdir(parents=True)
-            elif "cascade.validator.private_worker" in command:
-                i = command.index("cascade.validator.private_worker")
-                worker(*[str(root / name) for name in command[i + 1:i + 4]])
-            elif command[0] == "stat":
-                return SimpleNamespace(returncode=0, stdout=str(Path(command[-1]).stat().st_size))
-            elif command[0] == "rm":
-                shutil.rmtree(command[-1], ignore_errors=True)
-        return SimpleNamespace(returncode=0, stdout="")
-
-    return host, run
+    return host, _shell_runner(root, worker)
 
 
 def test_streamed_forecasts_are_the_same_arrays_and_release_the_local_file(checkpoint, tmp_path):
@@ -425,3 +411,115 @@ def test_the_workers_own_error_reaches_the_validator_log(checkpoint, tmp_path, c
             pytest.raises(PrivateEvalUnavailable):
         forecasts_via_host(host, directory, _windows(), contract=contract, num_samples=8, runner=run)
     assert "TypeError: unexpected keyword" in caplog.text
+
+
+# ── checkpoint cache on the private host (2026-11-10: a lossy link made every
+# held re-run re-upload two 4.6 GB checkpoints, ~75 min per duel) ───────────
+
+
+def _weight_uploads(calls):
+    return [a for a in calls if a[0] == "scp" and a[-2].endswith("weights.safetensors")]
+
+
+def _cache_entries(root):
+    cache = Path(root) / "_private_eval_offload" / "cache"
+    return sorted(p.name for p in cache.iterdir()) if cache.is_dir() else []
+
+
+def test_a_rerun_reuses_the_verified_cached_checkpoint(checkpoint, tmp_path):
+    directory, contract = checkpoint
+    root = tmp_path / "remote"
+    root.mkdir()
+    host = RemoteHost("gpu-fixture", "fixture", user="ubuntu", workdir=str(root))
+    calls = []
+    run = _shell_runner(root, lambda *p: run_request(*p, device="cpu", workers=1), calls=calls)
+    windows = _windows()
+    first = list(forecasts_via_host(host, directory, windows, contract=contract,
+                                    num_samples=8, runner=run))
+    second = list(forecasts_via_host(host, directory, windows, contract=contract,
+                                     num_samples=8, runner=run))
+    assert len(_weight_uploads(calls)) == 1          # the re-run uploaded nothing
+    assert all(np.array_equal(a, b) for a, b in zip(first, second, strict=True))
+    assert len(_cache_entries(root)) == 1
+
+
+def test_a_tampered_cache_entry_is_uploaded_again(checkpoint, tmp_path):
+    directory, contract = checkpoint
+    root = tmp_path / "remote"
+    root.mkdir()
+    host = RemoteHost("gpu-fixture", "fixture", user="ubuntu", workdir=str(root))
+    calls = []
+    run = _shell_runner(root, lambda *p: run_request(*p, device="cpu", workers=1), calls=calls)
+    windows = _windows()
+    list(forecasts_via_host(host, directory, windows, contract=contract, num_samples=8, runner=run))
+    (entry,) = _cache_entries(root)
+    weights = root / "_private_eval_offload" / "cache" / entry / "weights.safetensors"
+    weights.write_bytes(weights.read_bytes() + b"x")
+    list(forecasts_via_host(host, directory, windows, contract=contract, num_samples=8, runner=run))
+    assert len(_weight_uploads(calls)) == 2          # mismatch ⇒ fresh upload, never reuse
+    assert _cache_entries(root) == [entry]
+
+
+def test_a_failed_upload_leaves_no_partial_entry(checkpoint, tmp_path):
+    directory, contract = checkpoint
+    root = tmp_path / "remote"
+    root.mkdir()
+    host = RemoteHost("gpu-fixture", "fixture", user="ubuntu", workdir=str(root))
+    run = _shell_runner(root, lambda *p: run_request(*p, device="cpu", workers=1),
+                        fail=lambda a: a[0] == "scp" and a[-2].endswith("weights.safetensors"))
+    with pytest.raises(PrivateEvalUnavailable):
+        forecasts_via_host(host, directory, _windows(), contract=contract, num_samples=8,
+                           runner=run)
+    assert _cache_entries(root) == []
+    assert sorted(p.name for p in (root / "_private_eval_offload").iterdir()) == ["cache"]
+
+
+def test_the_cache_keeps_only_the_most_recent_entries(tmp_path):
+    import os
+    import time as _time
+
+    from cascade.validator.eval_offload import (
+        PRIVATE_CACHE_KEEP,
+        private_cache_setup_command,
+    )
+
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    now = _time.time()
+    names = [f"entry{i}" for i in range(PRIVATE_CACHE_KEEP + 3)]
+    for i, name in enumerate(names):                  # entry0 newest … oldest last
+        (cache / name).mkdir()
+        os.utime(cache / name, (now - 60 * i, now - 60 * i))
+    os.utime(cache / names[-1], (now - 3600 * 24, now - 3600 * 24))
+    (cache / "fresh.part-aaaa").mkdir()               # an upload in flight: kept
+    stale = cache / "old.part-bbbb"
+    stale.mkdir()
+    os.utime(stale, (now - 3600 * 24, now - 3600 * 24))
+    key = names[-1]                                   # the oldest entry is the one in use
+    proc = subprocess.run(["bash", "-c", private_cache_setup_command(
+        str(tmp_path / "run"), str(cache), key)], capture_output=True, text=True, check=True)
+    left = sorted(p.name for p in cache.iterdir())
+    assert key in left and "fresh.part-aaaa" in left and "old.part-bbbb" not in left
+    assert sorted(n for n in left if n.startswith("entry")) == sorted(
+        names[:PRIVATE_CACHE_KEEP - 1] + [key])
+    assert (tmp_path / "run").is_dir()
+    assert proc.stdout == ""                          # no files in the entry ⇒ nothing to reuse
+
+
+def test_parse_sha256sum_reads_text_and_binary_mode_lines():
+    from cascade.validator.eval_offload import parse_sha256sum
+
+    h = "a" * 64
+    assert parse_sha256sum(f"{h}  config.json\n{h.upper()} *model.py\nnoise\n") == {
+        "config.json": h, "model.py": h}
+    assert parse_sha256sum("") == {} and parse_sha256sum(None) == {}
+
+
+def test_write_request_with_precomputed_hashes_is_byte_identical(checkpoint, tmp_path):
+    from cascade.validator.private_worker import checkpoint_hashes
+
+    directory, contract = checkpoint
+    a = write_request(tmp_path / "a.npz", directory, _windows(), contract=contract, num_samples=8)
+    b = write_request(tmp_path / "b.npz", directory, _windows(), contract=contract, num_samples=8,
+                      hashes=checkpoint_hashes(directory))
+    assert a == b

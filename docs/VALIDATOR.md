@@ -371,6 +371,10 @@ and score calculation stay local. A missing host, timeout or invalid reply
 holds the round instead of switching to local inference or penalizing a miner.
 Transient directories are removed after success/failure; cleanup failures are
 logged for the operator to remove on the worker.
+Checkpoints stay on the host under `_private_eval_offload/cache`, keyed by
+the sha256 of their files and re-checked with `sha256sum` before each reuse,
+so re-running a duel uploads nothing. The four most recently used are kept,
+so allow about 20 GB of host disk.
 
 **Update the GPU host with the validator.** The worker runs this repo's code on
 the host, so deploy the same release there every time you update the validator.
