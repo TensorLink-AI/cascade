@@ -188,3 +188,17 @@ def test_footer_registry_digest_is_the_new_kings_on_a_crowning(html: str):
 def test_hero_falls_back_to_the_packaged_reference(html: str):
     assert 'fetch("data/gift-eval-reference.json"' in html
     assert REFERENCE.is_file()
+
+
+def test_v2_lineage_tokens_restart_at_the_v2_block(html: str):
+    """From v2 the lineage is one v2 leg per v2 promotion plus the king's own,
+    priced at [v2.training]; the v1 generations are a different model
+    (2026-11-10 the tile showed 16 v1 legs = 639B for a 1-leg v2 king)."""
+    m = re.search(r"var V2_LEG_BUDGET = (\{[^}]*\});", html)
+    b = json.loads(re.sub(r"(\w+):", r'"\1":', m.group(1)))
+    t = load_chain_config(REPO / "chain.toml").training.v2_contract
+    assert b == {"steps": t.training_steps, "batch": t.batch_size, "ctx": t.context_length}
+    lt = _fn(html, "lineageTokens")
+    assert "v2LegPoints()" in lt and "_v2Gens" in lt and "random_init" in lt
+    walk = _fn(html, "walkV2Gens")
+    assert "v2FromBlock()" in walk and "effective_era" in walk and "fired_block" in walk
