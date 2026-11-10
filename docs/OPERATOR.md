@@ -182,8 +182,11 @@ edited `chain.toml` before shipping it.
    AT a lane's launch boundary still belongs to the preceding era.
 10. **MarketCast** (only when arming `[marketcast] from_block`): start
     `cascade-pool mkt-record` (and `mkt-record-alpha` if `alpha` assets are
-    listed) at least `snapshot_days` (21) before the block — the loader
-    cannot see the recorder; install the `marketcast` extra on the main
+    listed) no later than the block — since 2026-11-10 there is no lead
+    time: every series is cut from its own native candle bank, the first
+    recorder pass backfills the API's full depth, and the recorder then
+    captures each window's realized candles before the API drops them (the
+    loader cannot see the recorder); install the `marketcast` extra on the main
     validator; the loader then requires an era boundary ≥ `[v2]` and
     `[lane_c] from_block`, the validator bench source in force by then,
     `owner_hotkey`, a commit-pinned `base_ref` + `base_sha256`, and a built
@@ -2175,14 +2178,17 @@ boundary that is:
 - set while `[netconfig] owner_hotkey` names the main validator.
 
 The loader refuses anything else. Lane C is MarketCast-only (DEC-CA-0056,
-owner 2026-10-20): the shipped `[lane_c] targets` are already the
-`mkt:<suite>` targets of `[marketcast] suites` (`mkt:returns`, `mkt:vol`),
-and the loader refuses any non-`mkt:` target ("lane-C competitions need a
+owner 2026-10-20). Since 2026-11-10 (owner: "a model good at forecasting
+markets", DEC-CA-0064 addendum) the shipped `[lane_c] targets` are the ONE
+composite target `mkt:market` (`[marketcast] composite = true`), judged over
+every `[marketcast] suites` member at once; `composite = false` is the
+per-suite shape (`mkt:<suite>`, one slot each). The loader refuses any
+non-`mkt:` target ("lane-C competitions need a
 forward-only eval — only MarketCast (mkt:) has one") and `[lane_c]
 pool_prefix` (retired; there is no `pool_c` and no `cascade-pool publish
 --lane c`). With lane C armed and MarketCast off, no target is active, so
-lane C's share burns. Add a suite to `[lane_c] targets` only when it is in
-`[marketcast] suites`. The loader also refuses arming while a class that lists
+lane C's share burns. With `composite = false`, add a suite to `[lane_c]
+targets` only when it is in `[marketcast] suites`. The loader also refuses arming while a class that lists
 assets has an empty or unbuilt `[marketcast.data_sources]` entry. Empty the
 class, or pick a built source.
 
@@ -2224,21 +2230,37 @@ other signer):
 50 5 * * *   cascade-pool reveal --lane mkt --hf-repo <org>/cascade-eval-pool
 ```
 
-**The forward bar recorder is required** (review M15). `mkt-record`
-appends every CLOSED Hyperliquid 1m bar + funding sample to the bar store as
-it closes; each pass re-fetches the last 48 h and merges, so an outage
-shorter than ~3 days loses nothing, and an unrecorded minute stays missing
-(never interpolated). `publish --lane mkt` builds the snapshot's minute bank
-from the store and refuses to run without `--bar-store` (`--allow-cold`
-only for tests). Start the recorder at least `snapshot_days` (21) before
-arming: the config cannot see it, so arming cannot check it.
+**The forward bar recorder is required** (review M15; native intervals
+2026-11-10). `mkt-record` records every CLOSED Hyperliquid candle at 1m, at
+each `[marketcast] native_intervals` interval (5m, 15m) and at 1h, plus the
+funding samples, into the bar store (`<store>/<class>/<asset>/<day>/` for 1m,
+`<store>/<class>/<asset>/<interval>/<day>/` for the others). The FIRST pass
+of an (asset, interval) the store holds nothing for backfills the API's full
+~5000-candle depth (`--no-backfill` to skip); later passes re-fetch the last
+48 h and merge, so an outage shorter than ~3 days loses nothing, and an
+unrecorded candle stays missing (never interpolated). `publish --lane mkt`
+builds the snapshot's 1-minute bank from the store, and the native and
+hourly banks from the API with the store filling what the API no longer
+serves; it refuses to run without `--bar-store` (`--allow-cold` only for
+tests).
 
-It carries the last `snapshot_days` (21) of bars on one UTC-minute grid,
-plus a block → time anchor, plus a coarse HOURLY bank of
-`coarse_history_days` (180) that every series forecast at ≥ 1h is cut from
-(realized vol at ≥ 1d only: the std of the day's 24 hourly returns). It goes
-to `pool_mkt/snapshots/block-<N>.tar` plus `pool_mkt/index.json` in the pool
-bucket. Publish often: an entry's windows exist only once a snapshot
+**No recording lead time** (owner 2026-11-10). A series at frequency `f` is
+cut from the COARSEST bank whose interval divides `f`: the 1-minute bars
+(`snapshot_days`, 10 — a 4096-step 1m context is 2.8 days, plus the 6-day
+verdict wait), a native 5m / 15m bank (`native_history_days`: 21 / 50) or
+the hourly bank (`coarse_history_days`, 180). Every suite value is a
+function of the block's OHLCV candle (open = first open, high / low = max /
+min, close = last close, volume = sum), so the bank is a history-depth choice
+only: a 15m value cut from 1m bars equals the one cut from native 15m
+candles. At arming each series needs only its CONTEXT, which the API depth
+(1m ≈ 3.6 d, 5m ≈ 17 d, 15m ≈ 52 d, 1h ≈ 208 d) covers; the recorder,
+started at arming, then keeps every candle a window's context and target
+need. The config cannot see the recorder, so arming cannot check it.
+
+A snapshot carries the 1-minute bars on one UTC-minute grid, the native
+banks (`n5m/`, `n15m/`, body `native`), the coarse HOURLY bank and a block →
+time anchor. It goes to `pool_mkt/snapshots/block-<N>.tar` plus
+`pool_mkt/index.json` in the pool bucket. Publish often: an entry's windows exist only once a snapshot
 covering them is active. The verdict waits up to `verdict_wait_blocks` for
 them.
 
@@ -2250,8 +2272,9 @@ from listing. So:
 
 - the hourly bank fits (180 < 208 days), and is what makes the 1d horizons
   scorable (21 daily bars could never hold the 32-step minimum context);
-- the API alone fills only the newest ~3.6 days of the 21-day minute grid
-  (less than the 6-day verdict wait) — hence the recorder above;
+- the API alone keeps only ~3.6 days of 1m candles, less than the 6-day
+  verdict wait — hence the recorder above (each window's realized candles
+  must be captured before the API drops them);
 - a recipe's embargoed training range (≥ 30 days old) has no minute bars on
   Hyperliquid; the training snapshot also fetches the hourly bank, so ≥ 1h
   suites train on real data and sub-hourly ones only on the generator's.
@@ -2260,7 +2283,7 @@ Window eligibility and the verdict (review II, 2026-10-19): per (asset,
 horizon) `windows_per_cell` (48) windows spread evenly over the eligible
 span; a window needs ≥ `min_bar_coverage` (0.8) live bars and ≥
 `min_dollar_volume_24h` ($1M; 0 = off) traded in the 24 h before it, and a
-price window (`returns`, `alpha`) a context that is not flat. Nothing reads
+price window (`returns`, `alpha`, `ohlcv`) a context that is not flat. Nothing reads
 the realised target: `min_target_abs_bp` was removed (red-team F3,
 2026-10-20) and the loader refuses it. The bootstrap clusters are asset
 class × `cluster_block_hours` (6 h). The gain is the geomean over (class ×
@@ -2268,8 +2291,8 @@ horizon) of the ratio of MEAN CRPS (red-team F1); horizons and asset classes
 weigh equally; a verdict needs ≥ `min_time_blocks` (8) blocks. A class × block
 × horizon cell whose base mean loss is ≤ `zero_scale_frac` × its horizon's
 median is masked (counted on the receipt row as `mkt.masked_cells`), and each
-ratio is clipped to `cell_ratio_cap`. The calibration gate runs on
-`mkt:returns` AND `mkt:vol`. Per horizon it is two-sided on
+ratio is clipped to `cell_ratio_cap`. The calibration gate runs on the
+`returns` AND `vol` suites (in the composite: on each one's own windows). Per horizon it is two-sided on
 `coverage_gate_levels` (`coverage_tolerance` below, `coverage_tolerance_over`
 above). The tail hit rates at `tail_levels` must be within `tail_tolerance`
 of 5 %, per horizon and pooled. Every rate is class-weighted like the gain,
@@ -2277,12 +2300,55 @@ and every band is widened to `calibration_z` standard errors. Tune the
 liquidity floor once the recorder shows real volumes: it was not measured
 per asset.
 
-The loader refuses a configuration with an unscorable (suite, horizon): its
-frequency's history (`coarse_history_days` for a ≥ 1h series, else
-`snapshot_days`) must hold the 32-step context + the horizon, and the
+The loader refuses a configuration with an unscorable (suite, horizon): the
+history of the bank its frequency is cut from (`coarse_history_days`,
+`native_history_days` or `snapshot_days`) must hold the 32-step context + the
+horizon, and the
 forward wait (`verdict_wait_blocks` × 12 s − `start_margin_seconds`) must
 hold two aligned windows (≥ 3 × the horizon). `5d` was dropped from
 `mkt:returns` for that reason.
+
+**Suites and the composite verdict** (owner 2026-11-10). The shipped launch
+set is `ohlcv`, `returns`, `vol`, `high`, `low`, `range`, `liquidity`
+(`funding` stays off: Hyperliquid publishes the predicted next rate, so part
+of the target is public before the window closes; `alpha` needs its own
+recorder):
+
+| suite | target (per block) | frequencies → horizons |
+|---|---|---|
+| `ohlcv` | the actual next-bar high / low / close price and volume (`ohlcv.h` / `.l` / `.c` / `.v`; the open with `ohlcv_open_weight`, default 0 — a perp's open is the previous close) | 5m, 1h, 1d → 5m, 1h, 4h, 1d |
+| `returns` | log return of the close, bp | 1m, 5m, 1h, 1d → 1m, 5m, 1h, 4h, 1d |
+| `vol` | ln Garman–Klass vol of the block candle, bp (was: std of 1m returns) | 5m, 15m, 1h, 1d → same |
+| `high` / `low` | max up / down excursion from the block's open, bp | 1h, 4h, 1d → same |
+| `range` | ln ln(max H / min L) | 1h, 4h, 1d → same |
+| `liquidity` | ln Σ volume | 1h, 1d → same |
+
+`ohlcv` windows forecast LEVELS and are scored with scale-normalised CRPS:
+each window's CRPS is divided by a scale fixed before it opens (a price
+field's last observed context value; volume's mean over the last 64 context
+values), so BTC and EUR weigh alike. Every other suite's loss keeps its
+units (CRPS in bp or on a log level).
+
+`mkt:market` is ONE lane-C slot (lane C's share undivided). Its gain is
+the geomean over suites of each suite's gain — inside a suite exactly the
+per-suite statistic (class × horizon-balanced ratio of mean losses, ohlcv
+fields as extra columns) — with ONE cluster bootstrap (class × 6 h block)
+giving the composite LCB and every suite's LCB from the same draws. It wins
+iff the composite LCB ≥ `gain_margin` at `alpha / k`, the point gain > 0,
+the window / cluster / time-block floors hold, every enabled suite has
+paired windows, the `returns` and `vol` calibration gates pass, and NO
+suite's LCB is below `-composite_suite_floor` (0.02; the no-regression
+floor: a large gain on one suite cannot buy a regression on another). The
+signed report rows carry every window of every suite (window ids
+`<class>:<asset>|<label>|<horizon>|<start>`, labels `ohlcv.<field>` for the
+level windows); the receipt row records each suite's gain / LCB / windows
+under `mkt.suites`.
+
+**Validator GPU cost is unmeasured.** The composite forecasts every enabled
+suite's windows: 24 (suite, horizon) cells — 36 window series with the four
+scored ohlcv fields — vs 9 for the old returns + vol set, about 4× the
+windows (and base + fine-tune forward passes) per entry. Measure it on
+the main validator's GPU before arming (`windows_per_cell` is the lever).
 
 **Main validator**:
 
