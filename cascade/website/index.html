@@ -2313,7 +2313,7 @@ function renderWarmEra(cn,panel,when){
   html+='<div><span class="muted">Era '+(rn?"r"+rn:esc(era.index))+' trains from:</span> '+
     (ck?'<b title="'+esc(ck)+'">'+esc(wsLabelOf(ck))+'</b>':'<span class="muted">random init</span>')+
     (era.generation!=null?' <span class="muted">· generation '+esc(era.generation)+(era.member_index!=null?', member '+esc(era.member_index):'')+'</span>':'')+'</div>';
-  if(_promo&&_promo.effective_era>Number(era.index)){
+  if(promoLive()&&_promo.effective_era>Number(era.index)){
     var en=roundNoOfBlock(_promo.effective_era*cn.eraBlocks);
     html+='<div><span class="muted">Generation '+_promo.gen+' takes effect from era '+(en?"r"+en:_promo.effective_era)+'.</span></div>';
   }
@@ -2363,13 +2363,17 @@ function loadWarmHistory(){
 // onto the gen-1 cycle, 2026-08-15): no record ⇒ no sequence line, never a
 // wrong one.
 var _promo=null;
+// The newest promotion only describes the live lineage if it activated at or
+// after the v2 block once v2 is live: v1's generation-15 roster is a
+// different model (v2 restarted from a fresh random init).
+function promoLive(){ return !!(_promo&&!(v2IsLive()&&genStartBlock(_promo)<v2FromBlock())); }
 function loadPromotion(){
   fetchJSON("promotions/index.json").then(function(d){
     var gen=Number(d&&d.latest_generation);
     if(!gen||gen<1){ _promo=null; renderWarmHistory(); return; }
     if(_promo&&_promo.gen===gen) return;           // roster already loaded
     fetchJSON("promotions/gen-"+gen+".json").then(function(rec){
-      _promo={gen:gen, effective_era:Number(rec&&rec.effective_era)||0,
+      _promo={gen:gen, effective_era:Number(rec&&rec.effective_era)||0, fired_block:Number(rec&&rec.fired_block)||0,
               members:((rec&&rec.members)||[]).map(function(m){ return m.checkpoint_id; })};
       renderWarmHistory(); renderWarm();
     }).catch(function(){});
@@ -2393,7 +2397,7 @@ function renderWarmHistory(){
       '<td class="muted">'+(r.published_at?timeAgo(r.published_at):"--")+'</td></tr>';
   }).join("");
   var seqHtml="";
-  if(_promo&&_promo.members.length){
+  if(promoLive()&&_promo.members.length){
     seqHtml='<div class="muted" style="margin:10px 0 2px;font-size:.9em">Rotation roster &mdash; generation '+
       _promo.gen+' (cycles each round): '+
       _promo.members.map(function(c){ return '<b title="'+esc(c)+'">'+esc(wsLabel(c))+'</b>'; }).join(' &rarr; ')+
@@ -3637,7 +3641,7 @@ function poll(){
   // Era roster (rolling mode): republished by the trainer at every settlement.
   fetchJSON("funded/latest.json").then(function(d){ _roster=d; renderHeat(); }).catch(function(){});
   // v2 status (trainer, unsigned): go-live, lane-B driver state, MoE health
-  fetchJSON("status/v2.json").then(function(d){ _v2=d; if(_rawIndex&&v2FromBlock()!==(_index&&_index.v2_from_block)){ _index=v2Scope(_rawIndex); renderAll(); } renderV2(); renderTrain(); }).catch(function(){});
+  fetchJSON("status/v2.json").then(function(d){ _v2=d; if(_rawIndex&&v2FromBlock()!==(_index&&_index.v2_from_block)){ _index=v2Scope(_rawIndex); renderAll(); } renderV2(); renderTrain(); renderWarm(); renderWarmHistory(); }).catch(function(){});
   // lane-C queue (trainer, unsigned; absent while lane C is off)
   fetchJSON("status/lane_c.json").then(function(d){ _lc=d; if(_page==="lanec") renderLaneC(); }).catch(function(){});
 }

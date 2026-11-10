@@ -230,3 +230,14 @@ def test_v2_leg_budget_matches_chain_toml(page: str):
     v2 = re.search(r"function v2Budget\(\)\{(.*?)\n\}", page, re.S).group(1)
     for k in ("training_contract", "training_steps", "batch_size", "context_length"):
         assert k in v2, f"v2Budget() never reads the published contract's {k}"
+
+
+def test_v1_rotation_roster_hidden_under_v2(page: str):
+    """Once v2 is live the newest v1 promotion (generation 15) is not the v2
+    lineage's roster; the warm-start panel must not show it."""
+    live = re.search(r"function promoLive\(\)\{(.*?)\}\n", page)
+    assert live and "v2IsLive()" in live.group(1) and "v2FromBlock()" in live.group(1)
+    for fn in ("renderWarmEra", "renderWarmHistory"):
+        body = re.search(rf"function {fn}\([^)]*\)\{{(.*?)\n\}}", page, re.S).group(1)
+        assert "if(_promo&&" not in body, f"{fn}() still reads the roster unchecked"
+    assert page.count("promoLive()&&_promo") == 2
