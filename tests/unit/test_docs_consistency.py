@@ -96,8 +96,9 @@ def test_reward_examples_include_all_pools_decay_expiry_and_burn():
     assert "| A king | 30% |" in example
     assert "| Eligible immediate former king | 2.5% |" in example
     assert "| One full-pay B holder | 2.5% |" in example
-    assert "| One full-pay C holder (mkt:returns) | 12.5% |" in example
-    assert "| Burn | 52.5% |" in example
+    # owner 2026-11-10: ONE composite MarketCast slot holds all of C
+    assert "| One full-pay C holder (mkt:market) | 25% |" in example
+    assert "| Burn | 40% |" in example
 
 
 def test_wrong_reward_arithmetic_in_document_is_rejected(tmp_path):
