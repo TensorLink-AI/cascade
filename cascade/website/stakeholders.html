@@ -880,6 +880,16 @@ var REF_HEADLINE = "Timestral-209M";
 // throughput, series-points). Used for the lineage only before v2 is live;
 // from v2 the trainer's own lineage counter (status/v2.json) is read instead.
 var LEG_BUDGET = { train_h: 3.0, ref_tps: 3700000 };
+// v2's [v2.training] is an explicit update budget (training_steps, batch
+// sequences × context points per step), read from the published contract in
+// status/v2.json; these are the announced values as the fallback.
+var V2_LEG_BUDGET = { steps: 23841, batch: 512, ctx: 4096 };
+function v2LegPoints(){
+  var c=(_v2&&_v2.training_contract&&_v2.training_contract.body)||{}, d=V2_LEG_BUDGET;
+  var steps=Number(c.training_steps)>0?Number(c.training_steps):d.steps;
+  var batch=Number(c.batch_size)>0?Number(c.batch_size):d.batch, ctx=Number(c.context_length)>0?Number(c.context_length):d.ctx;
+  return steps*batch*ctx;
+}
 var BENCH_SCAN_MAX = 60, BENCH_RETRY_NEWEST = 6;
 var ERA_BLOCKS_FALLBACK = 3600;
 var KING_GITHUB = "https://github.com/TensorLink-AI/cascade/tree/main/champions/king";
@@ -1190,12 +1200,38 @@ function v2Live(){ return !!(_v2&&_v2.golive&&_v2.golive.state==="live"); }
 // Tokens on the king lineage: from v2 the trainer's own lineage counter (every
 // finished era's king leg); before it, one contracted leg per promotion
 // generation plus the king's own (the training tab's lineage depth).
+// v2 restarted lane A from a fresh random init, so its lineage counts only
+// the promotions that activated at or after [v2] from_block (_v2Gens, walked
+// from the newest record back); the v1 generations trained a different model.
 function lineageTokens(){
   var lb=_v2&&_v2.lane_b&&_v2.lane_b.gate;
   if(v2Live()&&lb&&Number(lb.lineage_tokens)>0) return {v:Number(lb.lineage_tokens), src:"v2"};
   if(!allRounds().length) return null;
-  var legs=(_gens||0)+1;
-  return {v:legs*LEG_BUDGET.train_h*3600*LEG_BUDGET.ref_tps, src:"contract", legs:legs};
+  if(v2Live()){
+    var ws=_v2&&_v2.warm_start, g=_v2Gens!=null?_v2Gens:(ws&&ws.mode==="random_init"?0:null);
+    if(g==null) return null;
+    return {v:(g+1)*v2LegPoints(), src:"contract", legs:g+1, per:v2LegPoints()};
+  }
+  var legs=(_gens||0)+1, per=LEG_BUDGET.train_h*3600*LEG_BUDGET.ref_tps;
+  return {v:legs*per, src:"contract", legs:legs, per:per};
+}
+// Count the promotion generations that start at or after the v2 block:
+// newest first, stopping at the first one older than v2 (records are
+// immutable, so each is fetched once).
+var _v2Gens=null, _genStart={};
+function walkV2Gens(latest){
+  var from=v2FromBlock(), eb=eraBlocks(), n=0;
+  function step(g){
+    if(g<1){ _v2Gens=n; renderTiles(); return; }
+    var done=function(start){ if(start>=from){ n++; step(g-1); } else { _v2Gens=n; renderTiles(); } };
+    if(_genStart[g]!=null) return done(_genStart[g]);
+    fetchJSON("promotions/gen-"+g+".json",{bust:false}).then(function(rec){
+      var era=Number(rec&&rec.effective_era)||0;
+      _genStart[g]=(era&&eb)?era*eb:(Number(rec&&rec.fired_block)||0);
+      done(_genStart[g]);
+    }).catch(function(){});
+  }
+  step(latest);
 }
 function competitions(){
   var rs=allRounds(); if(!rs.length) return null;
@@ -1225,7 +1261,7 @@ function renderTiles(){
   t.push(tileHtml({k:"Lineage tokens", v:lt?fmtBig(lt.v):"&mdash;", state:lt?"live":"pend",
     q:lt?(lt.src==="v2"?"king lineage · trainer counter":lt.legs+" leg"+(lt.legs===1?"":"s")+" · contract"):"awaiting first round",
     title:lt?(lt.src==="v2"?"Series-points trained on the king lineage, counted by the trainer (status/v2.json): one contract budget per finished era king leg."
-      :"Series-points behind the king's checkpoint: one contracted leg ("+fmtBig(LEG_BUDGET.train_h*3600*LEG_BUDGET.ref_tps)+") per promotion generation plus its own."):""}));
+      :"Series-points behind the king's checkpoint: one contracted leg ("+fmtBig(lt.per)+") per promotion generation"+(v2Live()?" since v2's fresh start":"")+" plus its own."):""}));
   t.push(tileHtml({k:"Competitions", v:c?String(c.settlements):"&mdash;", state:c?"live":"pend",
     q:c?(c.eras+" era"+(c.eras===1?"":"s")+" · "+c.legs+" challenger leg"+(c.legs===1?"":"s")):"awaiting first round",
     title:"Settlements = signed round receipts"+(cap?" (the index keeps the latest "+INDEX_MAX_KEEP+")":"")+
@@ -1376,7 +1412,7 @@ function poll(){
         return response.json();
       });
     }).then(function(d){ if(d&&Array.isArray(d.models)){ _lb=d; renderHero(); renderTrend(); } }).catch(function(){});
-  fetchJSON("promotions/index.json").then(function(d){ _gens=Number(d&&d.latest_generation)||0; renderTiles(); }).catch(function(){});
+  fetchJSON("promotions/index.json").then(function(d){ _gens=Number(d&&d.latest_generation)||0; walkV2Gens(_gens); renderTiles(); }).catch(function(){});
 }
 renderCommunity();
 renderAll();

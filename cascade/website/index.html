@@ -2313,7 +2313,7 @@ function renderWarmEra(cn,panel,when){
   html+='<div><span class="muted">Era '+(rn?"r"+rn:esc(era.index))+' trains from:</span> '+
     (ck?'<b title="'+esc(ck)+'">'+esc(wsLabelOf(ck))+'</b>':'<span class="muted">random init</span>')+
     (era.generation!=null?' <span class="muted">· generation '+esc(era.generation)+(era.member_index!=null?', member '+esc(era.member_index):'')+'</span>':'')+'</div>';
-  if(_promo&&_promo.effective_era>Number(era.index)){
+  if(promoLive()&&_promo.effective_era>Number(era.index)){
     var en=roundNoOfBlock(_promo.effective_era*cn.eraBlocks);
     html+='<div><span class="muted">Generation '+_promo.gen+' takes effect from era '+(en?"r"+en:_promo.effective_era)+'.</span></div>';
   }
@@ -2363,13 +2363,17 @@ function loadWarmHistory(){
 // onto the gen-1 cycle, 2026-08-15): no record ⇒ no sequence line, never a
 // wrong one.
 var _promo=null;
+// The newest promotion only describes the live lineage if it activated at or
+// after the v2 block once v2 is live: v1's generation-15 roster is a
+// different model (v2 restarted from a fresh random init).
+function promoLive(){ return !!(_promo&&!(v2IsLive()&&genStartBlock(_promo)<v2FromBlock())); }
 function loadPromotion(){
   fetchJSON("promotions/index.json").then(function(d){
     var gen=Number(d&&d.latest_generation);
     if(!gen||gen<1){ _promo=null; renderWarmHistory(); return; }
     if(_promo&&_promo.gen===gen) return;           // roster already loaded
     fetchJSON("promotions/gen-"+gen+".json").then(function(rec){
-      _promo={gen:gen, effective_era:Number(rec&&rec.effective_era)||0,
+      _promo={gen:gen, effective_era:Number(rec&&rec.effective_era)||0, fired_block:Number(rec&&rec.fired_block)||0,
               members:((rec&&rec.members)||[]).map(function(m){ return m.checkpoint_id; })};
       renderWarmHistory(); renderWarm();
     }).catch(function(){});
@@ -2393,7 +2397,7 @@ function renderWarmHistory(){
       '<td class="muted">'+(r.published_at?timeAgo(r.published_at):"--")+'</td></tr>';
   }).join("");
   var seqHtml="";
-  if(_promo&&_promo.members.length){
+  if(promoLive()&&_promo.members.length){
     seqHtml='<div class="muted" style="margin:10px 0 2px;font-size:.9em">Rotation roster &mdash; generation '+
       _promo.gen+' (cycles each round): '+
       _promo.members.map(function(c){ return '<b title="'+esc(c)+'">'+esc(wsLabel(c))+'</b>'; }).join(' &rarr; ')+
@@ -3084,7 +3088,13 @@ function loadGenerations(){
 // Activation block of a generation: its effective era's first block under the
 // rolling grid, else the block the reign clock fired at.
 function genStartBlock(G){ var cn=chainNow(); return (G.effective_era&&cn&&cn.eraBlocks)?G.effective_era*cn.eraBlocks:G.fired_block; }
-function genOfBlock(b){ var best=0; Object.keys(_gens).forEach(function(k){ var G=_gens[k]; if(genStartBlock(G)<=b&&G.gen>best) best=G.gen; }); return best; }
+// v2 (DEC-CA-0050) restarted lane A from a fresh random init at [v2]
+// from_block, so a v2 round's lineage counts only the promotions that
+// activated at or after it — the v1 generations trained a different model.
+// Counted, not read off the record number, so it holds however the trainer
+// numbers the first v2 promotion.
+function lineageFloor(b){ var from=v2FromBlock(); return (from>0&&b>=from)?from:0; }
+function genOfBlock(b){ var floor=lineageFloor(b), n=0; Object.keys(_gens).forEach(function(k){ var s=genStartBlock(_gens[k]); if(s>=floor&&s<=b) n++; }); return n; }
 var _trainScope="king";
 var _paretoBenchmark="gifteval", _paretoAxes="size-mase", _paretoHistory=true;
 var _paretoCatalog=null, _paretoLoading=false, _paretoFetched=0, _paretoPoints=[];
@@ -3098,8 +3108,19 @@ var _paretoCatalog=null, _paretoLoading=false, _paretoFetched=0, _paretoPoints=[
 // holds for every channel mix). Contracted spend: a leg the wall stopped early
 // (deadline_hit) trained fewer steps than plotted.
 var TRAIN_BUDGET = { train_h: 3.0, ref_tps: 3700000, batch: 64, ctx: 4096 };
-function tokensPerLeg(){ return TRAIN_BUDGET.train_h*3600*TRAIN_BUDGET.ref_tps; }
-function stepsPerLeg(){ return Math.round(tokensPerLeg()/(TRAIN_BUDGET.batch*TRAIN_BUDGET.ctx)); }
+// v2's [v2.training] is an explicit update budget (training_steps; ref
+// throughput is 0), read from the published status/v2.json contract, with
+// the announced values as the fallback. Every step bills batch × context
+// points ("sequences" and "series" batches alike).
+var V2_TRAIN_BUDGET = { steps: 23841, batch: 512, ctx: 4096 };
+function v2Budget(){
+  var c=(_v2&&_v2.training_contract&&_v2.training_contract.body)||{}, d=V2_TRAIN_BUDGET;
+  var steps=Number(c.training_steps)>0?Number(c.training_steps):d.steps;
+  var batch=Number(c.batch_size)>0?Number(c.batch_size):d.batch, ctx=Number(c.context_length)>0?Number(c.context_length):d.ctx;
+  return {steps:steps, batch:batch, ctx:ctx, points:steps*batch*ctx};
+}
+function tokensPerLeg(b){ return lineageFloor(Number(b)||0)?v2Budget().points:TRAIN_BUDGET.train_h*3600*TRAIN_BUDGET.ref_tps; }
+function stepsPerLeg(b){ return lineageFloor(Number(b)||0)?v2Budget().steps:Math.round(tokensPerLeg(0)/(TRAIN_BUDGET.batch*TRAIN_BUDGET.ctx)); }
 function fmtSteps(v){ if(v==null||!isFinite(v)) return "--"; if(v>=1e6) return (v/1e6).toFixed(v>=1e7?0:1)+"M steps"; if(v>=1e3) return Math.round(v/1e3)+"k steps"; return Math.round(v)+" steps"; }
 function fmtTokens(v){ if(v==null||!isFinite(v)) return "--"; if(v>=1e12) return (v/1e12).toFixed(2)+"T tokens"; if(v>=1e9) return Math.round(v/1e9)+"B tokens"; if(v>=1e6) return (v/1e6).toFixed(1)+"M tokens"; if(v>=1e3) return Math.round(v/1e3)+"k tokens"; return Math.round(v)+" tokens"; }
 var SIX_KEYS=["gifteval_crps","gifteval_mase","boom_crps","boom_mase","time_crps","time_mase"];
@@ -3177,11 +3198,11 @@ function trainRoundLabel(r){ var rn=roundNoOf(r.round_id); return rn?"r"+rn:shor
 // value entry: steps × batch × C × context); a row from a worker image that
 // predates the counter has only the billed count, which equals channel
 // tokens at C = 1 — flagged, never guessed.
-function legPrice(kl){
+function legPrice(kl, b){
   var measured=!!(kl&&kl.measured&&kl.steps!=null);
-  var points=(measured&&kl.tokens_seen!=null)?Number(kl.tokens_seen):tokensPerLeg();
+  var points=(measured&&kl.tokens_seen!=null)?Number(kl.tokens_seen):tokensPerLeg(b);
   var chan=(measured&&kl.channel_tokens!=null)?Number(kl.channel_tokens):null;
-  return {measured:measured, steps:measured?Number(kl.steps):stepsPerLeg(), points:points,
+  return {measured:measured, steps:measured?Number(kl.steps):stepsPerLeg(b), points:points,
           tokens:chan!=null?chan:points, exact:chan!=null,
           width:(kl&&kl.max_channels_seen!=null)?Number(kl.max_channels_seen):(measured?1:null),
           deadline:!!(kl&&kl.deadline_hit), gpu:kl&&kl.gpu_name||""};
@@ -3222,19 +3243,19 @@ function trainRows(){
     var king=null; entries.forEach(function(e){ if(e.role==="king"&&!king) king=e; });
     var doc=_train[id], kl=null;
     ((doc&&doc.legs)||[]).forEach(function(l){ if(l.role==="king"&&!kl) kl=l; });
-    var gen=genOfBlock(Number(r.epoch_start_block)||0), depth=gen+1;
+    var rb=Number(r.epoch_start_block)||0, gen=genOfBlock(rb), depth=gen+1;
     // lineage walk: this leg, then the init it trained from, and so on
-    var chain=[], price=legPrice(kl), init=doc?String(doc.warm_start_ckpt||""):null;
+    var chain=[], price=legPrice(kl, rb), init=doc?String(doc.warm_start_ckpt||""):null;
     chain.push(price);
     var guard=0;
     while(init&&chain.length<depth&&guard++<64){
       var hit=byPtr[init]; if(!hit){ break; }
-      chain.push(legPrice(hit.leg)); init=String(hit.doc.warm_start_ckpt||"");
+      chain.push(legPrice(hit.leg, rb)); init=String(hit.doc.warm_start_ckpt||"");
     }
     var lin={steps:0,tokens:0,points:0,measured:0,exact:0,deadline:0,legs:depth,resolved:chain.length};
     chain.forEach(function(c){ lin.steps+=c.steps; lin.tokens+=c.tokens; lin.points+=c.points; if(c.measured) lin.measured++; if(c.exact) lin.exact++; if(c.deadline) lin.deadline++; });
-    for(var k=chain.length; k<depth; k++){ lin.steps+=stepsPerLeg(); lin.tokens+=tokensPerLeg(); lin.points+=tokensPerLeg(); }
-    if(entries.length) out.push({r:r, id:id, label:trainRoundLabel(r), gen:gen, depth:depth, leg:price, lineage:lin,
+    for(var k=chain.length; k<depth; k++){ lin.steps+=stepsPerLeg(rb); lin.tokens+=tokensPerLeg(rb); lin.points+=tokensPerLeg(rb); }
+    if(entries.length) out.push({r:r, id:id, block:rb, label:trainRoundLabel(r), gen:gen, depth:depth, leg:price, lineage:lin,
                                      steps:lin.steps, tokens:lin.tokens, entries:entries, king:king});
   });
   // One column per generation: every round of a generation trained the same
@@ -3503,7 +3524,7 @@ function renderTrainStats(rows, info){
   // A newly crowned challenger has its own measured leg, even though both
   // contestants share the same warm-start ancestry for this settlement.
   if(lin&&lastK.e!==lastRow.king){
-    var hit=legIndex()[lastK.e.pointer], own=legPrice(hit&&hit.leg), adjusted={};
+    var hit=legIndex()[lastK.e.pointer], own=legPrice(hit&&hit.leg, lastRow.block), adjusted={};
     for(var field in lin) adjusted[field]=lin[field];
     ["steps","tokens","points"].forEach(function(field){ adjusted[field]+=own[field]-leg[field]; });
     ["measured","exact","deadline"].forEach(function(field){ adjusted[field]+=Number(!!own[field])-Number(!!leg[field]); });
@@ -3620,7 +3641,7 @@ function poll(){
   // Era roster (rolling mode): republished by the trainer at every settlement.
   fetchJSON("funded/latest.json").then(function(d){ _roster=d; renderHeat(); }).catch(function(){});
   // v2 status (trainer, unsigned): go-live, lane-B driver state, MoE health
-  fetchJSON("status/v2.json").then(function(d){ _v2=d; if(_rawIndex&&v2FromBlock()!==(_index&&_index.v2_from_block)){ _index=v2Scope(_rawIndex); renderAll(); } renderV2(); }).catch(function(){});
+  fetchJSON("status/v2.json").then(function(d){ _v2=d; if(_rawIndex&&v2FromBlock()!==(_index&&_index.v2_from_block)){ _index=v2Scope(_rawIndex); renderAll(); } renderV2(); renderTrain(); renderWarm(); renderWarmHistory(); }).catch(function(){});
   // lane-C queue (trainer, unsigned; absent while lane C is off)
   fetchJSON("status/lane_c.json").then(function(d){ _lc=d; if(_page==="lanec") renderLaneC(); }).catch(function(){});
 }

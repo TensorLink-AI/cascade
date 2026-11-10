@@ -148,7 +148,7 @@ def test_lineage_depth_is_one_leg_per_generation(page: str):
     assert "genOfBlock(" in b and "depth=gen+1" in b, "depth is not one leg per generation"
     assert "warm_start_ckpt" in b, "the lineage walk never follows the round's init"
     assert 'l.role==="king"' in b, "a challenger's leg would price the king's lineage"
-    assert "stepsPerLeg()" in b and "tokensPerLeg()" in b, "no contracted fallback for an unresolved leg"
+    assert "stepsPerLeg(rb)" in b and "tokensPerLeg(rb)" in b, "no contracted fallback for an unresolved leg"
     for field in ("steps", "tokens_seen", "channel_tokens", "max_channels_seen", "deadline_hit", "measured"):
         assert re.search(rf"\.{field}\b", page[page.index("function legPrice"):page.index("function legIndex")]), (
             f"legPrice() never reads the training summary's {field!r}")
@@ -205,3 +205,39 @@ def test_benchmark_cells_are_tagged_when_the_king_beats_timestral(page: str):
     assert body and 'return (rv!=null&&s[key]<rv)?"beats "+ref.label:""' in body.group(1)
     assert 'tag=beat(key)' in body.group(1)
     assert '["mase","crps"]' in body.group(1)
+
+
+def test_v2_lineage_restarts_at_the_v2_block(page: str):
+    """v2 trained a NEW model from a fresh random init at [v2] from_block: a v2
+    round's lineage must not count the v1 promotions (2026-11-10 the page showed
+    15 generations / 16 legs / 2.4M steps for a 1-leg v2 king)."""
+    floor = re.search(r"function lineageFloor\(b\)\{(.*?)\}\n", page, re.S)
+    assert floor and "v2FromBlock()" in floor.group(1)
+    gen = re.search(r"function genOfBlock\(b\)\{(.*?)\}\n", page)
+    assert gen and "lineageFloor(b)" in gen.group(1) and "s>=floor" in gen.group(1)
+    for fn in ("tokensPerLeg", "stepsPerLeg"):
+        body = re.search(rf"function {fn}\(b\)\{{(.*?)\}}\n", page)
+        assert body and "lineageFloor(" in body.group(1) and "v2Budget()" in body.group(1), fn
+
+
+def test_v2_leg_budget_matches_chain_toml(page: str):
+    """A v2 leg is an explicit update budget: training_steps x batch x context."""
+    m = re.search(r"var V2_TRAIN_BUDGET\s*=\s*(\{[^}]*\})\s*;", page)
+    assert m
+    b = json.loads(re.sub(r"(\w+):", r'"\1":', m.group(1)))
+    t = load_chain_config(REPO / "chain.toml").training.v2_contract
+    assert b == {"steps": t.training_steps, "batch": t.batch_size, "ctx": t.context_length}
+    v2 = re.search(r"function v2Budget\(\)\{(.*?)\n\}", page, re.S).group(1)
+    for k in ("training_contract", "training_steps", "batch_size", "context_length"):
+        assert k in v2, f"v2Budget() never reads the published contract's {k}"
+
+
+def test_v1_rotation_roster_hidden_under_v2(page: str):
+    """Once v2 is live the newest v1 promotion (generation 15) is not the v2
+    lineage's roster; the warm-start panel must not show it."""
+    live = re.search(r"function promoLive\(\)\{(.*?)\}\n", page)
+    assert live and "v2IsLive()" in live.group(1) and "v2FromBlock()" in live.group(1)
+    for fn in ("renderWarmEra", "renderWarmHistory"):
+        body = re.search(rf"function {fn}\([^)]*\)\{{(.*?)\n\}}", page, re.S).group(1)
+        assert "if(_promo&&" not in body, f"{fn}() still reads the roster unchecked"
+    assert page.count("promoLive()&&_promo") == 2
