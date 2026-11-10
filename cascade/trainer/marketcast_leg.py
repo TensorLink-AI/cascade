@@ -164,36 +164,50 @@ class MktSampler:
         self.series: dict[tuple, np.ndarray] = {}
         self.geom: dict[tuple[str, str], tuple[int, int]] = {}
         assets = dict(recipe.assets)
-        for suite, w in dict(recipe.suite_weights).items():
-            if w <= 0 or suite not in mc.horizons_map:
-                continue
-            freqs = [f for f in mc.frequencies_map[suite] if f in freqs_ok]
-            hz = (dict(recipe.horizon_mix) if suite == recipe.suite
-                  else {h: 1.0 for h in mc.horizons_map[suite]})
-            for h in hz:
-                try:
-                    self.geom[(suite, h)] = window_geometry(freqs, h)
-                except ValueError:
-                    continue
-            from ..shared.config.marketcast import SUITE_CLASSES
+        from ..shared.config.marketcast import SUITE_CLASSES, base_suite
 
-            have = False
-            for cls, syms in assets.items():
-                if cls not in SUITE_CLASSES.get(suite, ()):
-                    continue
-                for a in syms:
-                    if a not in snap.assets(cls):
+        # the composite target (owner 2026-11-10) trains on every weighted
+        # suite with the recipe's horizon_mix; ohlcv splits into one series
+        # label per scored field (``ohlcv.<field>``), its weight shared
+        composite = recipe.suite not in mc.horizons_map
+        labels_of = getattr(mc, "series_labels", lambda s: (s,))
+        for base, w in dict(recipe.suite_weights).items():
+            if w <= 0 or base not in mc.horizons_map:
+                continue
+            labels = labels_of(base)
+            freqs = [f for f in mc.frequencies_map[base] if f in freqs_ok]
+            if base == recipe.suite or composite:
+                hz = {h: x for h, x in dict(recipe.horizon_mix).items()
+                      if h in mc.horizons_map[base]} or {h: 1.0 for h in mc.horizons_map[base]}
+            else:
+                hz = {h: 1.0 for h in mc.horizons_map[base]}
+            for suite in labels:
+                for h in hz:
+                    try:
+                        self.geom[(suite, h)] = window_geometry(freqs, h)
+                    except ValueError:
                         continue
-                    for (s2, _h), (f, _st) in self.geom.items():
-                        if s2 != suite or (suite, cls, a, f) in self.series:
+                have = False
+                for cls, syms in assets.items():
+                    if cls not in SUITE_CLASSES.get(base_suite(suite), ()):
+                        continue
+                    for a in syms:
+                        if a not in snap.assets(cls):
                             continue
-                        x = asset_series(snap, cls, a, suite, f)
-                        if x is not None and np.isfinite(x).sum() > MIN_CONTEXT:
-                            self.series[(suite, cls, a, f)] = x
-                            have = True
-            if have:
-                self.suites[suite] = float(w)
-        if recipe.suite not in self.suites:
+                        for (s2, _h), (f, _st) in self.geom.items():
+                            if s2 != suite or (suite, cls, a, f) in self.series:
+                                continue
+                            x = asset_series(snap, cls, a, suite, f)
+                            if x is not None and np.isfinite(x).sum() > MIN_CONTEXT:
+                                self.series[(suite, cls, a, f)] = x
+                                have = True
+                if have:
+                    self.suites[suite] = float(w) / len(labels)
+        if composite:
+            if not self.suites:
+                raise MktLegError("no training data for any suite of the composite target "
+                                  "over the recipe's assets / frequencies / date range")
+        elif not any(base_suite(s) == recipe.suite for s in self.suites):
             raise MktLegError(f"no training data for the target suite {recipe.suite!r} "
                               "over the recipe's assets / frequencies / date range")
 
@@ -238,11 +252,14 @@ class MktSampler:
 
     def batch(self, size: int) -> Batch:
         from ..pool.marketcast import window_covariates
+        from ..shared.config.marketcast import base_suite
 
         suite = _pick(self.rng, self.suites)
         hz = [h for (s, h) in self.geom if s == suite]
-        mix = dict(self.r.horizon_mix) if suite == self.r.suite else {h: 1.0 for h in hz}
-        h = _pick(self.rng, {k: v for k, v in mix.items() if k in hz})
+        own = base_suite(suite) == self.r.suite or self.r.suite not in self.mc.horizons_map
+        mix = dict(self.r.horizon_mix) if own else {h: 1.0 for h in hz}
+        mix = {k: v for k, v in mix.items() if k in hz} or {h: 1.0 for h in hz}
+        h = _pick(self.rng, mix)
         f, steps = self.geom[(suite, h)]
         samples, synth = [], 0
         for _ in range(int(size)):

@@ -64,7 +64,8 @@ def cmd_snapshot(args):
     except (ValueError, OSError) as exc:
         return out.fail("bad_recipe", str(exc), USAGE)
     # Fetch only the recipe universe, rather than every asset configured live.
-    mc = replace(cfg.marketcast, assets=recipe.assets, suites=(recipe.suite,))
+    mc = replace(cfg.marketcast, assets=recipe.assets, composite=False,
+                 suites=cfg.marketcast.suites_of(recipe.suite))
     try:
         if args.evaluation:
             meta = build_snapshot(args.out, mc, end_time=now, days=args.days, anchor_block=0,

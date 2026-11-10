@@ -1415,10 +1415,11 @@ from_block = 0
 share      = 0.25                  # owner-tunable: taken from lane A ⇒ A 50 / B 25 / C 25
 takes_from = "lane_a"
 remainder  = "burn"                # unpaid decay + empty target slots burn
-# One emission slot each: "mkt:<suite>" for a [marketcast] suites member
-# (the list must match it). Listed but inactive while [marketcast]
+# Owner 2026-11-10: ONE composite slot, "mkt:market" — judged over every
+# [marketcast] suite at once ([marketcast] composite = true; per-suite slots
+# "mkt:<suite>" are the composite = false shape). Listed but inactive while [marketcast]
 # from_block = 0: zero active slots, lane C's whole share burns.
-targets = ["mkt:returns", "mkt:vol"]
+targets = ["mkt:market"]
 # Payout schedule in ERAS (lane B's rule): 100 % for a GAIN-TIERED full
 # period after the judging settlement, then halving every half_life_rounds
 # eras to floor; payout STOPS at win_ttl_eras. full_pay_tiers (owner
@@ -1571,7 +1572,7 @@ from_block         = 0                          # off; an era-boundary block arm
 base_ref           = "mistralai/Timestral-28M@180698bbf5a50dda3516aa6419798437fb03a430"
 base_sha256        = "dfc83c6220937ce5fc6687b35a4df94cd25e28a2cfe6fb92a23dad6301b2015d"  # model.safetensors (HF LFS oid)
 base_arch          = "timestral"
-suites             = ["returns", "vol"]         # launch set; also range | funding | liquidity | alpha
+suites             = ["ohlcv", "returns", "vol", "high", "low", "range", "liquidity"]  # owner 2026-11-10 launch set; funding | alpha off
 coverage_levels    = [0.5, 0.8, 0.98]           # calibration gate on mkt:returns AND mkt:vol
 coverage_tolerance = 0.05                       # owner-tunable: fail if empirical < nominal - tolerance
 alpha              = 0.05
@@ -1594,7 +1595,7 @@ eval_context_length = 4096                      # context steps the base and the
 windows_per_cell   = 48                         # per (asset, horizon), spread evenly: 2 per 6 h block over 6 days
 start_margin_seconds = 3600                     # windows start >= 1 h after the train block
 verdict_wait_blocks = 43200                     # an entry waits up to 6 days for its windows to close
-snapshot_days      = 21                         # realized 1m bars per eval snapshot
+snapshot_days      = 10                         # 1m bank: 4096-step 1m context (2.8 d) + the 6-day verdict wait
 coarse_history_days = 180                       # hourly bars for >= 1h series (HL serves ~208 d of 1h)
 report_timeout_settlements = 8                  # trainer records a missing report "absent" after this
 max_infra_deferrals = 8                         # main-validator compute failures before an uncharged drop
@@ -1615,6 +1616,13 @@ tail_tolerance     = 0.025                      # per horizon AND pooled over ho
 calibration_z      = 3.0                        # every calibration tolerance >= 3 standard errors (thin classes)
 near_dup_tol       = 0.02                       # mean |dq| / base 5-95 % width vs a senior entry below this => duplicate
 max_open_legs_per_coldkey = 1                   # trainer policy: open MarketCast legs per coldkey
+# Owner 2026-11-10 (DEC-CA-0064 addendum): one composite target over every
+# suite, native candle banks (no recording lead time), Garman–Klass vol.
+composite          = true                       # mkt:market = geomean of the suites' gains
+composite_suite_floor = 0.02                    # any suite's gain LCB < -this fails the entry
+ohlcv_open_weight  = 0.0                        # HL perps: open = previous close
+native_intervals   = ["5m", "15m"]              # native candle banks (+ 1m bars + 1h coarse)
+native_history_days = { "5m" = 21, "15m" = 50 } # HL keeps ~17 d of 5m, ~52 d of 15m (recorder fills)
 
 [marketcast.assets]                             # the Hyperliquid-listed universe (2026-10-19)
 crypto      = ["BTC", "ETH", "SOL", "XRP", "HYPE", "BNB", "DOGE", "ADA", "AVAX", "LINK",

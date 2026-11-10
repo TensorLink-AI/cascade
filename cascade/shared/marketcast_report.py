@@ -25,7 +25,7 @@ from dataclasses import asdict, dataclass, field, replace
 
 import numpy as np
 
-from .config.marketcast import COVERAGE_GATE_SUITES, duration_minutes
+from .config.marketcast import COMPOSITE_TARGET, COVERAGE_GATE_SUITES, base_suite, duration_minutes
 
 MKT_REPORT_VERSION = 3
 # the entry status of a row set the main validator could not compute
@@ -95,6 +95,16 @@ class MktWindowRow:
     @property
     def horizon(self) -> str:
         return self.wid.split("|")[2]
+
+    @property
+    def suite_label(self) -> str:
+        """The window's series label (``ohlcv.c``, ``returns``, …)."""
+        return self.wid.split("|")[1]
+
+    @property
+    def suite(self) -> str:
+        """The configured suite the window belongs to (``ohlcv.c`` → ``ohlcv``)."""
+        return base_suite(self.suite_label)
 
     @property
     def end(self) -> int:
@@ -231,12 +241,15 @@ def decode_quantiles(data: bytes, steps, n_knots: int) -> list[tuple[np.ndarray,
     return out
 
 
-def score_windows(targets, base_q, ft_q, *, knots, coverage_levels, gated: bool,
-                  tail_levels=()) -> list[tuple[float, float, tuple[int, ...], int,
-                                                tuple[int, ...]]]:
+def score_windows(targets, base_q, ft_q, *, knots, coverage_levels, gated,
+                  tail_levels=(), scales=None) -> list[tuple[float, float, tuple[int, ...], int,
+                                                             tuple[int, ...]]]:
     """``[(base loss, ft loss, cov_in, cov_n, tail), ...]`` per window (row
     order) from the PUBLISHED quantiles: CRPS per window (:func:`cascade.
-    eval.marketcast.window_crps`) and, on a calibration-gated suite, the
+    eval.marketcast.window_crps`) divided by the window's ``scales[i]`` (the
+    ohlcv level windows' scale-normalised CRPS; default 1) and, on a
+    calibration-gated window (``gated``: one bool for every window or one
+    per window — the composite mixes gated and ungated suites), the
     fine-tune's interval tallies and tail tallies (``tail_levels``). A window
     with a non-finite loss carries no tallies (it never enters the verdict).
     Windows are scored grouped by their step count in row order — the main
@@ -244,6 +257,10 @@ def score_windows(targets, base_q, ft_q, *, knots, coverage_levels, gated: bool,
     from ..eval.marketcast import window_coverage_counts, window_crps, window_tail_counts
 
     n = len(targets)
+    gate = [bool(gated)] * n if isinstance(gated, (bool, np.bool_)) else [bool(x) for x in gated]
+    sc = [1.0] * n if scales is None else [float(x) for x in scales]
+    if len(gate) != n or len(sc) != n:
+        raise ValueError("gated / scales must have one value per window")
     out: list = [None] * n
     groups: dict[int, list[int]] = {}
     for i, y in enumerate(targets):
@@ -255,8 +272,10 @@ def score_windows(targets, base_q, ft_q, *, knots, coverage_levels, gated: bool,
         lb, lf = window_crps(qb, y, knots), window_crps(qf, y, knots)
         for j, i in enumerate(idx):
             b, f = float(lb[j]), float(lf[j])
+            if sc[i] != 1.0:
+                b, f = b / sc[i], f / sc[i]
             ci, cn, tl = (), 0, ()
-            if gated and math.isfinite(b) and math.isfinite(f):
+            if gate[i] and math.isfinite(b) and math.isfinite(f):
                 ins, cn = window_coverage_counts(qf[j], y[j], knots, coverage_levels)
                 ci = tuple(int(x) for x in ins)
                 tl = tuple(int(x) for x in window_tail_counts(qf[j], y[j], knots,
@@ -288,9 +307,9 @@ def window_weights(rows) -> list[float]:
     ok = [math.isfinite(float(w.base)) for w in rows]
     for w, good in zip(rows, ok, strict=True):
         if good:
-            k = (w.asset_class, w.horizon)
+            k = (w.suite_label, w.asset_class, w.horizon)
             n[k] = n.get(k, 0) + 1
-    return [1.0 / n[(w.asset_class, w.horizon)] if good else 0.0
+    return [1.0 / n[(w.suite_label, w.asset_class, w.horizon)] if good else 0.0
             for w, good in zip(rows, ok, strict=True)]
 
 
@@ -385,6 +404,9 @@ def verdict_from_rows(rows: MktEntryRows, mc, *, suite: str, k: int, seed: str,
 
     levels = tuple(coverage_levels if coverage_levels is not None else mc.coverage_levels)
     ws = rows.windows
+    if suite == COMPOSITE_TARGET:
+        return composite_from_rows(rows, mc, k=k, seed=seed, levels=levels,
+                                   tail_levels=tail_levels)
     cov = (calibration_gate(ws, mc, levels, tail_levels)
            if suite in COVERAGE_GATE_SUITES else None)
     hrs = int(mc.cluster_block_hours)
@@ -397,6 +419,36 @@ def verdict_from_rows(rows: MktEntryRows, mc, *, suite: str, k: int, seed: str,
         horizons=[w.horizon for w in ws], weights=window_weights(ws),
         time_blocks=[w.time_block(hrs) for w in ws], min_time_blocks=int(mc.min_time_blocks),
         zero_scale_frac=float(mc.zero_scale_frac), ratio_cap=float(mc.cell_ratio_cap))
+
+
+def composite_from_rows(rows: MktEntryRows, mc, *, k: int, seed: str, levels,
+                        tail_levels=None):
+    """The composite verdict (owner 2026-11-10, ``mkt:market``,
+    :func:`cascade.eval.marketcast.judge_composite`) from one entry's signed
+    rows over every enabled suite: the rows' suite labels split the suites,
+    each calibration-gated suite (:data:`COVERAGE_GATE_SUITES`) gets its OWN
+    :func:`calibration_gate` over its rows, the in-horizon class weights are
+    per suite (:func:`window_weights` keyed by suite), level ``alpha / k``."""
+    from ..eval.marketcast import judge_composite
+
+    ws = rows.windows
+    hrs = int(mc.cluster_block_hours)
+    cov = {}
+    for s in COVERAGE_GATE_SUITES:
+        sub = [w for w in ws if w.suite == s]
+        if s in tuple(mc.suites) and sub:
+            cov[s] = calibration_gate(sub, mc, levels, tail_levels)
+    lw = {"ohlcv.o": float(getattr(mc, "ohlcv_open_weight", 0.0))}
+    return judge_composite(
+        [w.base for w in ws], [w.ft for w in ws], suites=[w.suite_label for w in ws],
+        horizons=[w.horizon for w in ws], clusters=[w.time_cluster(hrs) for w in ws],
+        alpha=float(mc.alpha) / max(1, int(k)), B=int(mc.bootstrap_B),
+        gain_margin=float(mc.gain_margin), seed=seed,
+        suite_floor=float(mc.composite_suite_floor), min_windows=int(mc.min_windows),
+        min_clusters=int(mc.min_clusters), coverage=cov, weights=window_weights(ws),
+        time_blocks=[w.time_block(hrs) for w in ws], min_time_blocks=int(mc.min_time_blocks),
+        zero_scale_frac=float(mc.zero_scale_frac), ratio_cap=float(mc.cell_ratio_cap),
+        label_weights=lw, expected_suites=tuple(mc.suites), name=COMPOSITE_TARGET)
 
 
 def behaviour_distance(base_q, ft_q, ref_q) -> tuple[float, float]:
@@ -453,7 +505,7 @@ class MktReportState:
 __all__ = [
     "INFRA_DEFERRED", "MKT_REPORT_VERSION", "MktEntryRows", "MktReport", "MktReportState",
     "MktWindowRow", "REPORT_ABSENT", "base_cov_gain", "behaviour_distance", "calibration_gate",
-    "decode_quantiles", "encode_quantiles", "load_mkt_report", "mkt_ref_quantiles_key",
+    "composite_from_rows", "decode_quantiles", "encode_quantiles", "load_mkt_report", "mkt_ref_quantiles_key",
     "mkt_quantiles_key", "mkt_report_key", "mkt_text_digest", "published_quantiles",
     "score_windows", "sign_mkt_report", "verdict_from_rows", "verify_mkt_report",
     "window_weights",

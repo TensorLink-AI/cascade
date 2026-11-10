@@ -3659,7 +3659,8 @@ def check_marketcast(receipt: RoundReceipt, cfg: ChainConfig,
     if not mkt:
         return _ok(name, "no MarketCast rows at this settlement")
     from ..eval.marketcast import COVERAGE_GATE_SUITES
-    from ..pool.marketcast import snapshot_windows
+    from ..pool.marketcast import target_windows
+    from ..shared.config.marketcast import base_suite
     from ..shared.marketcast_report import (
         behaviour_distance,
         decode_quantiles,
@@ -3784,7 +3785,7 @@ def check_marketcast(receipt: RoundReceipt, cfg: ChainConfig,
             if not (w.start > float(ent.after) and w.end <= int(snap_rec.get("end", 0))):
                 return _fail(name, f"{who}: window {w.wid} is not forward-only "
                                    f"(after {ent.after}, snapshot end {snap_rec.get('end')})")
-            c = (w.cluster, w.horizon)
+            c = (w.suite_label, w.cluster, w.horizon)
             cells[c] = cells.get(c, 0) + 1
         over = [c for c, n in cells.items() if n > int(mc.windows_per_cell)]
         if over:
@@ -3795,7 +3796,7 @@ def check_marketcast(receipt: RoundReceipt, cfg: ChainConfig,
         if snap is None:
             _miss("snapshot")
         else:
-            want = snapshot_windows(snap, mc, suite, after=float(ent.after))
+            want = target_windows(snap, mc, suite, after=float(ent.after))
             got_ids = [w.wid for w in ent.windows]
             want_ids = [w.wid for w in want]
             if got_ids != want_ids:
@@ -3822,8 +3823,10 @@ def check_marketcast(receipt: RoundReceipt, cfg: ChainConfig,
                                       [q[1] for q in qs], knots=tuple(mc.quantile_knots),
                                       coverage_levels=tuple(rep.coverage_levels
                                                             or mc.coverage_levels),
-                                      gated=suite in COVERAGE_GATE_SUITES,
-                                      tail_levels=tuple(rep.tail_levels or mc.tail_levels))
+                                      gated=[base_suite(w.suite) in COVERAGE_GATE_SUITES
+                                             for w in want],
+                                      tail_levels=tuple(rep.tail_levels or mc.tail_levels),
+                                      scales=[w.scale for w in want])
                 for w, (b, f, ci, cn, tl) in zip(ent.windows, again, strict=True):
                     same = all((math.isnan(x) and math.isnan(y)) or x == y
                                for x, y in ((float(w.base), b), (float(w.ft), f)))
