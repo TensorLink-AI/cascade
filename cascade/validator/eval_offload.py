@@ -13,6 +13,7 @@ failure. Neither path forwards wallets or provider keys.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import logging
 import shlex
@@ -46,6 +47,14 @@ class PrivateEvalUnavailable(RuntimeError):
 # Seconds the pre-upload compatibility probe may take.
 WORKER_PROBE_SECONDS = 60
 # Tail of a failed step's stderr kept in the validator's log.
+# Checkpoints stay on the private host between evals, keyed by the sha256 of
+# their files and re-verified with sha256sum before every reuse, so a duel
+# re-run (a held round, the next settlement's king) uploads nothing. The
+# PRIVATE_CACHE_KEEP most recently used entries are kept.
+PRIVATE_CACHE_DIR = "_private_eval_offload/cache"
+PRIVATE_CACHE_KEEP = 4
+# Abandoned partial uploads older than this are removed by the next eval.
+PRIVATE_PART_MAX_MINUTES = 360
 STEP_STDERR_TAIL = 600
 # What the host's code accepts, asked of the code itself so the probe also
 # answers on a host that predates it. Run from ``host.workdir`` like the worker,
@@ -106,6 +115,41 @@ def check_private_worker(host, contract, *, quantile_levels=None, run=None,
                     "fields: %s)", host.name, ", ".join(extra))
 
 
+def private_cache_key(hashes: dict) -> str:
+    """Cache entry name for a checkpoint: the sha256 of its file hashes."""
+    return hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest()[:32]
+
+
+def private_cache_setup_command(base: str, cache_root: str, key: str) -> str:
+    """Make the run dir and the cache; prune the cache to the most recently used
+    entries plus ``key`` and drop stale partial uploads; then print the
+    sha256sum of ``key``'s files, if cached, after marking it used. A prune or
+    hash failure never fails the step (no output = no reusable copy)."""
+    from .private_worker import CHECKPOINT_FILES
+
+    q = shlex.quote
+    files = " ".join(q(f) for f in CHECKPOINT_FILES)
+    prune = (f"cd {q(cache_root)} && "
+             f"find . -maxdepth 1 -name '*.part-*' -mmin +{PRIVATE_PART_MAX_MINUTES} "
+             "-exec rm -rf {} + ; "
+             f"ls -1t | grep -v -e '[.]part-' -e {q('^' + key + '$')} "
+             f"| tail -n +{PRIVATE_CACHE_KEEP} | xargs -r rm -rf --")
+    return (f"umask 077 && mkdir -p {q(base)} {q(cache_root)} && "
+            f"{{ ( {prune} ) || true; }} && "
+            f"{{ cd {q(cache_root + '/' + key)} 2>/dev/null && touch . && "
+            f"sha256sum -- {files} 2>/dev/null || true; }}")
+
+
+def parse_sha256sum(text: str | None) -> dict:
+    """``{name: hex}`` from sha256sum output; anything unparseable is skipped."""
+    out = {}
+    for line in (text or "").splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) == 2 and len(parts[0]) == 64:
+            out[parts[1].lstrip("*")] = parts[0].lower()
+    return out
+
+
 def _stderr_tail(proc) -> str:
     return (getattr(proc, "stderr", "") or "")[-STEP_STDERR_TAIL:]
 
@@ -124,7 +168,7 @@ def forecasts_via_host(host, checkpoint, windows, *, contract, num_samples,
     """
     from ..eval.checkpoint_guard import CheckpointTampered, verify_checkpoint
     from .evaluator import EvaluatorError
-    from .private_worker import CHECKPOINT_FILES, check_forecasts, write_request
+    from .private_worker import CHECKPOINT_FILES, check_forecasts, checkpoint_hashes, write_request
 
     try:
         verify_checkpoint(checkpoint, contract)
@@ -134,6 +178,7 @@ def forecasts_via_host(host, checkpoint, windows, *, contract, num_samples,
     deadline = time.monotonic() + timeout_s
     work = f"_private_eval_offload/{uuid.uuid4().hex}"
     base = f"{host.workdir}/{work}"
+    part = ""
 
     def step(argv, what):
         remaining = deadline - time.monotonic()
@@ -153,16 +198,36 @@ def forecasts_via_host(host, checkpoint, windows, *, contract, num_samples,
                                                   deadline - time.monotonic())))
         local = Path(tmpdir.name)
         request = local / "request.npz"
+        hashes = checkpoint_hashes(Path(checkpoint))
         identity = write_request(request, checkpoint, windows, contract=contract,
-                                 num_samples=num_samples, quantile_levels=quantile_levels)
-        step(build_ssh_argv(host, f"umask 077 && mkdir -p {shlex.quote(base + '/checkpoint')}"),
-             "workdir setup")
-        for name in CHECKPOINT_FILES:
-            step(build_scp_argv(host, str(Path(checkpoint) / name), f"{base}/checkpoint/{name}"),
-                 f"upload of {name}")
+                                 num_samples=num_samples, quantile_levels=quantile_levels,
+                                 hashes=hashes)
+        key = private_cache_key(hashes)
+        cache_root = f"{host.workdir}/{PRIVATE_CACHE_DIR}"
+        cached = f"{cache_root}/{key}"
+        part = f"{cached}.part-{uuid.uuid4().hex[:12]}"
+        setup = step(build_ssh_argv(host, private_cache_setup_command(base, cache_root, key)),
+                     "workdir setup")
+        if parse_sha256sum(setup.stdout) == hashes:
+            log.info("private eval: checkpoint %s already on %s (sha256 verified) — upload skipped",
+                     key[:16], host.name)
+        else:
+            started = time.monotonic()
+            step(build_ssh_argv(host, f"umask 077 && mkdir -p {shlex.quote(part)}"),
+                 "cache setup")
+            for name in CHECKPOINT_FILES:
+                step(build_scp_argv(host, str(Path(checkpoint) / name), f"{part}/{name}"),
+                     f"upload of {name}")
+            step(build_ssh_argv(host, f"rm -rf {shlex.quote(cached)} && "
+                                f"mv {shlex.quote(part)} {shlex.quote(cached)}"),
+                 "cache publish")
+            log.info("private eval: uploaded checkpoint %s (%.1f GB) to %s in %.0fs",
+                     key[:16], sum((Path(checkpoint) / n).stat().st_size
+                                   for n in CHECKPOINT_FILES) / 1e9,
+                     host.name, time.monotonic() - started)
         step(build_scp_argv(host, str(request), f"{base}/request.npz"), "upload of the request")
         argv = [host.remote_python, "-m", "cascade.validator.private_worker",
-                f"{work}/checkpoint", f"{work}/request.npz", f"{work}/samples.npz",
+                f"{PRIVATE_CACHE_DIR}/{key}", f"{work}/request.npz", f"{work}/samples.npz",
                 "--device", "cuda", "--workers", str(workers)]
         env = "OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 "
         if host.cuda_device is not None:
@@ -197,7 +262,8 @@ def forecasts_via_host(host, checkpoint, windows, *, contract, num_samples,
         raise PrivateEvalUnavailable(f"private evaluation response unavailable: {type(e).__name__}") from e
     finally:
         try:
-            cleanup = run(build_ssh_argv(host, f"rm -rf {shlex.quote(base)}"), 15)
+            doomed = shlex.quote(base) + (f" {shlex.quote(part)}" if part else "")
+            cleanup = run(build_ssh_argv(host, f"rm -rf {doomed}"), 15)
             if cleanup.returncode:
                 log.warning("private eval cleanup failed on %s; remove %s", host.name, base)
         except Exception:
