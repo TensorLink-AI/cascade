@@ -136,14 +136,14 @@ def test_c_holder_gets_paid_before_b_and_audit_rejects_a_premature_b_pool(tmp_pa
     r = _runner(cfg, ChampionState(king_hotkey=KING, king_uid=3,
                                    king_since_block=start + 1, king_share_bp=5000))
     r._lane_b_block = r._lane_c_block = boundary
-    r._lane_c().record(TargetWin("mkt:returns", "specialist", 5, "confirmed", boundary,
+    r._lane_c().record(TargetWin("mkt:market", "specialist", 5, "confirmed", boundary,
                                  gain_lcb=.05, tier=.05, full_eras=10))
     m = _manifest(boundary)
     r._v2_settlement_economics(m, [], 1, None, KING)
     vector = r._apply_weights(_Client(boundary, {KING: 3, "specialist": 5}),
                               m.round_id, [3], boundary=boundary)
     assert vector[3] == pytest.approx(.375 if ladder else .75)
-    assert vector[5] == pytest.approx(.125)
+    assert vector[5] == pytest.approx(.25)   # one composite slot holds all of lane C (0.25)
     assert sum(vector) == pytest.approx(1)
     assert r._last_lane_b_pay is None
     receipt = replace(_receipt(r, m, boundary, [3], vector), lane_c_pay=r._last_lane_c_pay, lane_c=[])
