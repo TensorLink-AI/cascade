@@ -1,0 +1,18 @@
+# Elastic bench host for the MAIN validator (cascade-validator --bench-lease).
+# Operator-local, never consensus. Pass the SAME file as --eval-hosts that
+# hosts_path names. See docs/OPERATOR.md "Elastic bench host".
+[bench_lease]
+hosts_path      = "/root/cascade/bench-eval-hosts.toml"   # == --eval-hosts
+state_path      = "/root/cascade/bench_lease_state.json"
+image           = "REPLACE/with-the-deployed-worker-image@sha256:..."   # digest-pinned
+ssh_pubkey_path = "~/.ssh/id_ed25519.pub"
+# Lium gpu_type names, every one QUALIFIED by one measured sweep inside
+# [v2] bench_sweep_hours. "Edition" = RTX PRO 6000 Blackwell 96 GB.
+gpu_types       = ["Edition"]
+min_vram_gb     = 32
+min_cuda        = 13.0      # listed max_cuda_version (driver >= 580)
+min_driver      = 580       # re-checked on the booted pod
+max_price_per_hour   = 2.00
+max_wait_hours       = 2.0  # settlement HOLDS this long for a pod, then the clearer is deferred
+idle_release_minutes = 20
+ttl_hours            = 12   # provider-side auto-terminate backstop

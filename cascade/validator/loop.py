@@ -331,6 +331,13 @@ class ValidatorRunner(
     # the paired pass ([eval] bench_paired; tests: entries -> one raw report
     # each). With only ``bench_sweep_fn`` injected, sweeps stay one at a time.
     bench_sweep_many_fn: Callable[[list], list] | None = None
+    # Elastic bench host (``--bench-lease``, operator-local): a
+    # :class:`~cascade.validator.bench_lease.BenchLease` that rents the sweep
+    # pod on demand. None = static ``--eval-hosts`` (unchanged behaviour).
+    bench_lease: object | None = None
+    # The round that last HELD waiting for the leased host (skips re-scoring
+    # the private pool on every poll while the pod is still being rented).
+    _vbench_lease_wait: str | None = field(default=None, repr=False)
     _vbench: dict | None = field(default=None, repr=False)
     _vbench_cache: dict = field(default_factory=dict, repr=False)
     _vbench_reports: dict = field(default_factory=dict, repr=False)
@@ -1045,6 +1052,7 @@ class ValidatorRunner(
                 self._reassert_weights_at_head(client)
             except Exception as e:  # noqa: BLE001
                 log.warning("weight re-assert check failed: %s", e)
+            self._vbench_lease_tick()
             time.sleep(poll)
 
     def _reassert_weights_at_head(self, client: object) -> None:
