@@ -1,5 +1,6 @@
 """Offline documentation checks must catch drift in both directions."""
 
+import re
 import shutil
 
 import pytest
@@ -17,6 +18,13 @@ from scripts.check_docs import (
     reward_reference,
     training_reference,
 )
+
+
+def _break_burn_row(example):
+    """Corrupt the burn share, whatever the live configuration makes it."""
+    broken, n = re.subn(r"(\| Burn \| )[0-9.]+%", r"\g<1>999%", example)
+    assert n == 1, "worked example lost its burn row"
+    return broken
 
 
 def test_current_guides_match_interfaces_and_configuration():
@@ -105,7 +113,7 @@ def test_wrong_reward_arithmetic_in_document_is_rejected(tmp_path):
     shutil.copy2(ROOT / "chain.toml", tmp_path / "chain.toml")
     guide = tmp_path / "guide.md"
     guide.write_text("<!-- cascade:rewards:worked-example:start -->\n"
-                     + reward_reference()["worked-example"].replace("52.5%", "0%")
+                     + _break_burn_row(reward_reference()["worked-example"])
                      + "\n<!-- cascade:rewards:worked-example:end -->\n")
     issues = reward_issues([guide], root=tmp_path)
     assert len(issues) == 1 and "worked-example" in issues[0]
