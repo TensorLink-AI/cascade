@@ -106,6 +106,11 @@ VBENCH_SWEEP_ATTEMPTS = 2
 BUDGET_DEFERRED_REASON = "bench budget exhausted (deferred to a later settlement)"
 # The trainer's "absent" record of a validator bench report (DEC-CA-0063).
 RECORD_ABSENT = "absent"
+# The reason a clearer is published with when the elastic bench host
+# (``--bench-lease``) could not be rented inside its bounded wait — the same
+# never-a-loss carry as a budget deferral.
+HOST_DEFERRED_REASON = ("bench host unavailable (elastic lease wait spent; deferred to a "
+                        "later settlement)")
 
 
 class ValidatorBenchHold(StorageError):
@@ -218,6 +223,14 @@ class ValidatorBenchMixin:
         if (st["main"] and self._vbench_record(rid) is None
                 and self._vbench_own_published(rid) is None):
             st["mode"] = "sweep"
+            lease = getattr(self, "bench_lease", None)
+            if (lease is not None and self.__dict__.get("_vbench_lease_wait") == rid
+                    and not lease.ready() and not lease.expired()):
+                # This settlement already held for the elastic bench host and it
+                # is still being rented: hold again WITHOUT re-scoring the
+                # private pool every poll (nothing is judged either way).
+                lease.tick()
+                raise ValidatorBenchHold(f"bench_host_pending: round={rid}: {lease.status()}")
             prev = str(manifest.prev_round_id or "")
             if prev:
                 self._vbench_seed_cache(prev)
@@ -376,6 +389,8 @@ class ValidatorBenchMixin:
             return st["rows"][ptr], _scores_dict(st["entries"][ptr].scores)
         if ptr in st["failed"] or ptr in st["deferred"] or ptr in st["faults"]:
             return None, None
+        if not self._vbench_lease_gate(st, entry, role):
+            return None, None
         hit = self._vbench_cache_hit(ptr, st)
         if hit is None:
             got = self._vbench_sweep_bounded(entry, role=role, st=st, capped=capped,
@@ -383,6 +398,13 @@ class ValidatorBenchMixin:
             if got is None:
                 return None, None
             scores, rows, revisions = got
+            if st.get("lease_hw"):
+                from .bench_lease import HW_KEY
+
+                self.bench_lease.sweep_ok()
+
+                # provenance: rows from two different machines never pair
+                revisions = {**(revisions or {}), HW_KEY: st["lease_hw"]}
             self._vbench_cache_put(ptr, scores, rows, revisions)
         else:
             scores, rows, revisions = hit["scores"], hit["rows"], hit.get("revisions") or {}
@@ -405,7 +427,20 @@ class ValidatorBenchMixin:
             if "current_data_revisions" not in st:
                 st["current_data_revisions"] = self._vbench_current_data_revisions()
             current = st["current_data_revisions"]
-            if not current or hit.get("revisions") != current:
+            from .bench_lease import HW_KEY
+
+            data_pins = {k: v for k, v in (hit.get("revisions") or {}).items()
+                         if k != HW_KEY}
+            if not current or data_pins != current:
+                hit = None
+        if hit is not None and getattr(self, "bench_lease", None) is not None:
+            from .bench_lease import HW_KEY
+
+            # Elastic host: reuse a cached side only when it was swept on the
+            # SAME hardware fingerprint as the pod this settlement sweeps on
+            # (a different GPU model / driver / torch build re-sweeps it).
+            if (not st.get("lease_hw")
+                    or (hit.get("revisions") or {}).get(HW_KEY) != st["lease_hw"]):
                 hit = None
         return hit
 
@@ -537,6 +572,77 @@ class ValidatorBenchMixin:
             return None, None
         return rows, _scores_dict(e.scores)
 
+    # ── the elastic bench host (``--bench-lease``, operator-local) ──────────
+
+    def _vbench_lease_gate(self, st: dict, entry: TrainedEntry, role: str) -> bool:
+        """Sweep mode, elastic host: may ``entry``'s side be produced now?
+
+        True ⇒ the leased pod is ready (its fingerprint is pinned for this
+        settlement in ``st["lease_hw"]``). While it is still being rented the
+        settlement HOLDS (:class:`ValidatorBenchHold` — never a verdict).
+        Once the bounded wait is spent the side is published as never-a-loss:
+        a challenger ``budget_deferred`` (the trainer carries its leg and it
+        is judged again), a king / init ``infra_failed`` — and False. Static
+        mode (no lease): always True, behaviour unchanged."""
+        lease = getattr(self, "bench_lease", None)
+        if lease is None or st.get("lease_hw"):
+            return True
+        ptr = entry.trained_pointer
+        if not st.get("lease_expired"):
+            if lease.need():
+                st["lease_hw"] = lease.hw()
+                self.__dict__.pop("_vbench_lease_wait", None)
+                return True
+            if not lease.expired():
+                self._vbench_lease_wait = st["round_id"]
+                raise ValidatorBenchHold(
+                    f"bench_host_pending: round={st['round_id']} ({role} "
+                    f"{entry.miner_hotkey[:12] or ptr[-16:]} needs a sweep): {lease.status()}")
+            st["lease_expired"] = True
+            self.__dict__.pop("_vbench_lease_wait", None)
+            log.error("validator-bench round=%s: NO bench host after the lease's bounded wait "
+                      "(%s) — publishing never-a-loss deferrals; check the provider",
+                      st["round_id"], lease.status())
+        st["roles"][ptr] = role
+        if role == "challenger":
+            st["deferred"][ptr] = HOST_DEFERRED_REASON
+            log.warning("validator-bench round=%s: challenger %s DEFERRED (no bench host) — "
+                        "never swept, never a loss; re-judged at a later settlement",
+                        st["round_id"], entry.miner_hotkey[:12])
+        else:
+            st["failed"][ptr] = "bench host unavailable (elastic lease wait spent)"
+        return False
+
+    def _vbench_lease_after_failure(self, st: dict, failure: tuple[str, str]) -> None:
+        """Elastic host: an infra sweep failure on a pod that is no longer
+        reachable is the HOST's, not the sweep's — drop the pod, re-rent, and
+        hold the settlement (rolled back; the sweep is redone on the new pod)
+        instead of publishing the clearer infra."""
+        lease = getattr(self, "bench_lease", None)
+        if lease is None or not st.get("lease_hw"):
+            return
+        from ..eval.benchmarks import SWEEP_FAULT_CHECKPOINT
+
+        if failure and failure[0] == SWEEP_FAULT_CHECKPOINT:
+            return                      # the checkpoint's evidence, not the host's
+        if lease.ready() and lease.reachable():
+            return                      # the host is fine: an ordinary infra failure
+        lease.host_lost(f"{failure[0]}: {failure[1]}"[:200] if failure else "unreachable")
+        self._vbench_lease_wait = st["round_id"]
+        raise ValidatorBenchHold(f"bench_host_lost: round={st['round_id']} — re-renting the "
+                                 f"bench host ({lease.status()})")
+
+    def _vbench_lease_tick(self) -> None:
+        """Once per poll: release an idle leased pod / retry a pending rent.
+        Never raises (a lease problem must not stop the validator loop)."""
+        lease = getattr(self, "bench_lease", None)
+        if lease is None:
+            return
+        try:
+            lease.tick()
+        except Exception as e:  # noqa: BLE001
+            log.error("bench lease tick failed: %s: %s", type(e).__name__, e)
+
     # ── the sweep ────────────────────────────────────────────────────────────
 
     def _vbench_clock(self) -> float:
@@ -644,6 +750,7 @@ class ValidatorBenchMixin:
             log.warning("validator-bench round=%s: sweep of %s %s FAILED (paired pass, "
                         "attempt 1/%d, %s: %s)", st["round_id"], role, who,
                         VBENCH_SWEEP_ATTEMPTS, failure[0], failure[1])
+            self._vbench_lease_after_failure(st, failure)
         for attempt in range(first, VBENCH_SWEEP_ATTEMPTS + 1):
             left = allowance - used
             if left <= 0:
@@ -663,6 +770,7 @@ class ValidatorBenchMixin:
             log.warning("validator-bench round=%s: sweep of %s %s FAILED (attempt %d/%d, "
                         "%s: %s)", st["round_id"], role, who, attempt, VBENCH_SWEEP_ATTEMPTS,
                         failure[0], failure[1])
+            self._vbench_lease_after_failure(st, failure)
         from ..eval.benchmarks import SWEEP_FAULT_CHECKPOINT
 
         if (len(failures) == VBENCH_SWEEP_ATTEMPTS
@@ -770,8 +878,12 @@ class ValidatorBenchMixin:
         timeout_s = min(cap, int(timeout_s)) if timeout_s else cap
         num_samples = ec.benchmark_num_samples or ec.num_samples
         workers = getattr(ec, "bench_workers", "1")
-        dests = [self._fetch_checkpoint_dir(e) for e in entries]
         host = self._eval_host()
+        if host is None and getattr(self, "bench_lease", None) is not None:
+            # Elastic mode never sweeps on this box's own device: the pod is
+            # gone (the caller re-rents and holds).
+            raise RuntimeError("bench lease: no bench host published")
+        dests = [self._fetch_checkpoint_dir(e) for e in entries]
         log.info("validator-bench: sweeping %s on %s (suites=%s, max_series=%d, workers=%s, "
                  "timeout=%ds)", "+".join(e.trained_pointer[-24:] for e in entries),
                  host.name if host is not None else self.device, ",".join(suites),
@@ -854,6 +966,9 @@ class ValidatorBenchMixin:
             raise StorageError(f"validator_bench_publish_failed: round={st['round_id']}: "
                                f"{e}") from e
         st["published_sha"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        lease = getattr(self, "bench_lease", None)
+        if lease is not None and st.get("lease_expired"):
+            lease.end_need()            # the next need starts a fresh bounded wait
         log.info("validator-bench round=%s: published %d entr%s [%s] + %d infra-failed + %d "
                  "budget-deferred + %d checkpoint-fault → %s", st["round_id"],
                  len(report.entries), "y" if len(report.entries) == 1 else "ies",

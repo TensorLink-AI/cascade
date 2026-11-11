@@ -2073,6 +2073,36 @@ under `enforce`, the round is inconclusive and the king holds. Size
 turns every sweep into an infra timeout. If the publish itself fails, the
 settlement is rolled back and held until the next poll.
 
+#### Elastic bench host (`--bench-lease`)
+
+The main validator can rent its sweep pod on demand instead of keeping one
+standing: `cascade-validator --bench-lease bench_lease.toml --eval-hosts
+<the hosts_path it names>` (template: `deploy/bench_lease.example.toml`).
+The lease rents only when a sweep is needed (a clearer reaches the bench
+gate, or the king check is due), bootstraps it with
+`deploy/bench_pod_bootstrap.sh` (sidecar from `benchmarks/uv.lock`, pinned
+data), publishes it to `--eval-hosts` and terminates it after
+`idle_release_minutes` with no sweep (never while a benchmark process runs).
+
+Miner safety:
+
+* while the pod is renting, the settlement holds: no verdict, no report, and
+  the private pool is not re-scored on every poll;
+* the hold is bounded by `max_wait_hours`, which the loader checks fits
+  inside `[v2] bench_report_timeout_settlements`. Past it, a clearer is
+  published `budget_deferred` (never swept, never a loss, carried by the
+  trainer) and a king / init `infra_failed`;
+* a pod lost under a sweep is re-rented and the settlement holds again; a
+  second loss before a good sweep goes straight to the deferral;
+* rows carry a `hw` revision (GPU model, driver major, sidecar torch). A
+  cached king swept on other hardware is re-swept, and the gate never pairs
+  two fingerprints;
+* with a lease there is no local fallback.
+
+Before arming: qualify every `gpu_types` entry with one measured sweep, set
+`[eval] gift_gate_data_dir` to the bootstrap's data dir (`/data/bench`), and
+keep the standing pod until the first leased sweep has published.
+
 #### Sizing the sweep (concurrent workers, paired passes)
 
 The sidecar runs each suite as independent work units (one GIFT-Eval config,
