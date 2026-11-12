@@ -45,6 +45,7 @@ def test_after_launch_the_trainer_tree_need_not_match_the_image_pin(cfg, tmp_pat
     from cascade.trainer import launch_preflight as lp
 
     stale = replace(cfg, v2=replace(cfg.v2, from_block=43200),
+                    manifest=replace(cfg.manifest, validator_hotkey="5Fixture"),
                     round=replace(cfg.round, worker_code_fingerprint="0" * 64,
                                   funded_pod_image="fixture/image@sha256:" + "a" * 64),
                     training=replace(cfg.training, v2_contract=replace(
