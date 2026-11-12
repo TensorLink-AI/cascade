@@ -677,8 +677,10 @@ def test_another_count_than_the_pin_refuses(tmp_path, voting):
     p = _edit(tmp_path, r"^shared_ladder_windows\s*=.*$", "shared_ladder_windows = 2000")
     with pytest.raises(ValueError, match="computes lad-"):
         load_chain_config(p)
+    # With the release's typed from_block, the [eval] parse refuses a zero
+    # count before the pin is read; either refusal keeps the node down.
     p = _edit(tmp_path, r"^shared_ladder_windows\s*=.*$", "shared_ladder_windows = 0")
-    with pytest.raises(ValueError, match="shared_ladder_windows is not set"):
+    with pytest.raises(ValueError, match="shared_ladder_windows (is not set|is 0)"):
         load_chain_config(p)
 
 
