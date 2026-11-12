@@ -305,7 +305,8 @@ def vcfg():
                         forfeit_from_block=0, forfeit_successor_hotkey="",
                         win_margin_start_v2=0.0, win_margin_end_v2=0.0,
                         margin_warmup_blocks_v2=0, margin_v2_from_block=0),
-        v2=replace(c.v2, prelaunch_burn=0.0))
+        v2=replace(c.v2, prelaunch_burn=0.0),
+        eval=replace(c.eval, shared_ladder_windows=0))
 
 
 def test_feature_name_hashes_the_bundle_and_rides_the_note(vcfg):
@@ -763,8 +764,10 @@ def test_mainnet_note_carries_v2b_within_the_field(rollover_typed):
                                     A.ActivationRecord(), None, None, v2b_rec)
         assert LIVE_FORFEIT[0] not in note and LIVE_MARGIN_V2[0] not in note
         assert ":prelaunch-95-r2:0:0:" in note                 # left alone
-        assert note.endswith(":" + tail)
-        assert len(note.encode("utf-8")) <= A.NOTE_MAX_BYTES - 24   # room to spare
+        # the DEC-CA-0068 "lad-" segment (newer) rides after it; nothing trimmed
+        assert f":{tail}:" in note + ":"
+        assert A.shared_ladder_feature(cfg).name in note.split(":")
+        assert len(note.encode("utf-8")) <= A.NOTE_MAX_BYTES
 
 
 def test_note_with_a_locked_cfg_segment_and_the_v2b_type_rule():
