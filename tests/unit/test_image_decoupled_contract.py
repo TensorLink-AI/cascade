@@ -766,7 +766,8 @@ def test_mainnet_note_carries_v2b_within_the_field(rollover_typed):
         assert ":prelaunch-95-r2:0:0:" in note                 # left alone
         # the DEC-CA-0068 "lad-" segment (newer) rides after it; nothing trimmed
         assert f":{tail}:" in note + ":"
-        assert A.shared_ladder_feature(cfg).name in note.split(":")
+        lad = A.shared_ladder_feature(cfg)
+        assert (lad.name in note.split(":")) == lad.decided_on_chain   # typed ⇒ not signalled
         assert len(note.encode("utf-8")) <= A.NOTE_MAX_BYTES
 
 

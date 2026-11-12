@@ -72,6 +72,16 @@ NaN", "roll it out quickly".
   self-judge draws what the fleet scores. A typed `shared_ladder_from_block`
   (an era start at or after `scored_from_block`) is the owner override.
   Changing the count or the horizons renames the feature (a fresh vote).
+* **Typed at release (owner 2026-11-12).** The release chain.toml types
+  `shared_ladder_from_block = 9494100`: the FIRST settlement of the era
+  starting 9493200 (Fri 13 Nov 01:23 UTC), exactly where the DEC-CA-0067
+  quantile head starts (the settlement AT 9493200 is the previous era's last
+  and keeps the sample path — a 12 000-window sample-path duel would ship
+  ~3 GB back from the private host). The main validator is the network's only
+  full evaluator (the others are satellites that replay its signed receipts),
+  so the vote is not what keeps scorers in agreement: every scorer and every
+  audit replay reads this release value. A typed block is not signalled and
+  not stamped on receipts. The vote path stays in the code for a later count.
 * **Receipts and audit.** The validator stamps `shared_ladder_block` on every
   receipt it judges under a chain-decided block (drop-when-default, so older
   signatures stay valid); `cascade-audit` replays the receipt's windows under

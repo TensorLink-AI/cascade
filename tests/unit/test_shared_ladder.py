@@ -113,10 +113,16 @@ class FakeChain:
 def test_shipped_values_parse_and_default_off(tmp_path):
     shipped = load_chain_config(DEFAULT_CHAIN_TOML)
     assert shipped.eval.shared_ladder_windows == 4000          # the owner's count
-    assert shipped.eval.shared_ladder_from_block == 0          # decided on chain
+    # typed by the owner: the first settlement of the era starting 9493200 —
+    # the same settlement the DEC-CA-0067 quantile head starts at
+    assert shipped.eval.shared_ladder_from_block == 9494100
     assert shipped.eval.scored_horizons == HORIZONS
     assert shared_ladder_configured(shipped.eval)
-    assert not shared_ladder_active(shipped.eval, 10_000_000)  # no block yet
+    assert not shared_ladder_active(shipped.eval, 9493200)     # the old era's last settlement
+    assert shared_ladder_active(shipped.eval, 9494100)
+    assert shipped.quantile_head_at(9494100) and not shipped.quantile_head_at(9493200) or \
+        not shipped.v2.image_decoupled_from_block              # aligned when v2b is applied
+    assert not A.shared_ladder_feature(shipped).decided_on_chain   # typed: nothing signalled
     # The vote's name is pinned: a changed count or ladder is a FRESH vote.
     assert A.shared_ladder_feature_name(4000, HORIZONS) == "lad-556b1b98"
     assert A.shared_ladder_feature(shipped).name == "lad-556b1b98"
@@ -485,7 +491,12 @@ def test_resolver_locks_in_and_the_draw_applies_from_the_next_era_start(cfg):
 
 
 def test_note_carries_the_segment_and_stays_under_the_budget_with_every_mainnet_segment_locked():
+    # the release TYPES the block (nothing signalled); this pins the vote form's
+    # byte budget in case a later count change goes through the vote
     shipped = load_chain_config(DEFAULT_CHAIN_TOML)
+    assert A.shared_ladder_feature(shipped).name not in (
+        A.own_signal_payload(shipped, A.ActivationRecord()) or "").split(":")
+    shipped = replace(shipped, eval=replace(shipped.eval, shared_ladder_from_block=0))
     assert shipped.activation.enabled
     lad = A.shared_ladder_feature(shipped)
     v2b = A.image_decoupled_feature(shipped)

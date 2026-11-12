@@ -48,6 +48,7 @@ from .scoring import _GIFT_GATE_MODES as _GIFT_GATE_MODES
 from .scoring import _INIT_GATE_MODES as _INIT_GATE_MODES
 from .scoring import _MARGIN_MODES as _MARGIN_MODES
 from .scoring import (
+    SHARED_LADDER_QUANTILE_BATCH,
     EvalConfig,
     ScoringConfig,
     check_margin_v2,
@@ -191,6 +192,7 @@ __all__ = [
     "check_margin_v2",
     "check_rollover_alignment",
     "check_shared_ladder",
+    "SHARED_LADDER_QUANTILE_BATCH",
     "shared_ladder_active",
     "shared_ladder_quantile_batch",
     "shared_ladder_configured",
