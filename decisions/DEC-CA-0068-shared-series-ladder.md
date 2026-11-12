@@ -36,6 +36,24 @@ NaN", "roll it out quickly".
   snapshot has 4525 series, minimum length 320, none shorter than 784 in two
   of seven domains: at 4000 every domain contributes (sales all 423, the
   rest ~590–605 each) and only the 720 rung carries padded windows.
+* **Batched decode.** From the same gate the quantile head decodes the
+  verdict windows in FIXED batches of `SHARED_LADDER_QUANTILE_BATCH = 32`:
+  window indices in order, cut into runs of at most 32 consecutive
+  univariate windows sharing one horizon (`quantile_chunks`; a multichannel
+  window is its own chunk). Every history is padded to the full 4096-step
+  context and each horizon is one forward pass, so a chunk is one GPU call.
+  Measured on an RTX 5090 with the king checkpoint (2026-11-12, 256 windows
+  per horizon): 26 ms → 2.5 ms per window (10.1–10.7×), peak 5.4 GB,
+  bit-identical run to run. Batch-32 numerics differ from batch 1 (up to
+  0.4–1.7 % of a series' scale on single quantiles) and depend on the
+  batch-mates at ~1e-5 — the MoE has no capacity limit, so routing is
+  per token and only kernel rounding moves — hence the size and composition
+  are rule, hashed into the vote name (`shared-ladder/2|…|batch=32`), and
+  every round before the gate keeps the batch-1 decode byte-identical. The
+  offload request uses a new schema (`cascade-private-eval/3-quantiles-
+  batched`): a GPU host on older code refuses it and the round holds; it is
+  never silently decoded at batch 1. The validator, the audit replay and the
+  trainer's lane-B self-judge all read the batch from the same gate.
 * **What it replaces.** The per-rung ladder (`n_windows` or the DEC-CA-0067
   v2 budget split across rungs, each rung its own draw, rung sizes equalised
   to the scarcest) stays the rule for every round before the gate and for
@@ -44,8 +62,8 @@ NaN", "roll it out quickly".
   in force.
 * **Activation.** `shared_ladder_from_block = 0` = decided on chain. A
   validator on a release carrying the rule adds one segment to its readiness
-  note — `lad-<sha256("shared-ladder/1|4000|64,256,720")[:8]>` =
-  `lad-d0b94833` — after the DEC-CA-0067 `v2b-` segment. At the first
+  note — `lad-<sha256("shared-ladder/2|4000|64,256,720|batch=32")[:8]>` =
+  `lad-556b1b98` — after the DEC-CA-0067 `v2b-` segment. At the first
   boundary where 51% of eligible validator stake has signalled it LOCKS IN
   (one-way, `activation_shared_ladder_state.json`) and the draw applies from
   the first ERA START after the lock-in boundary (`FeatureSpec.align =
@@ -99,7 +117,7 @@ reached. The alternative — growing the pool's short domains first — is the
   33 bytes if headroom is ever needed.
 * Fork guard: the rule exists only where a node's chain.toml carries
   `shared_ladder_windows`, so — like `[v2] image_decoupled_feature` — the
-  config pins `[eval] shared_ladder_feature = "lad-d0b94833"`. Wherever the
+  config pins `[eval] shared_ladder_feature = "lad-556b1b98"`. Wherever the
   ladder can apply (`[activation]` on, `scored_horizons` set) a missing key or
   a different computed name REFUSES the validator, trainer and audit at start
   (other processes log an ERROR). Without it, a node on the release with an

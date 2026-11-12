@@ -61,6 +61,7 @@ from .scoring import (
     mv_score_active,
     shared_ladder_active,
     shared_ladder_configured,
+    shared_ladder_quantile_batch,
 )
 from .scoring import _gift_gate_mode as _gift_gate_mode
 from .scoring import _init_gate_mode as _init_gate_mode
@@ -191,6 +192,7 @@ __all__ = [
     "check_rollover_alignment",
     "check_shared_ladder",
     "shared_ladder_active",
+    "shared_ladder_quantile_batch",
     "shared_ladder_configured",
     "check_v2_activation",
     "cohort_maxt_active",

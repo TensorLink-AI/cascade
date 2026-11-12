@@ -521,12 +521,17 @@ def _tier2_score_compare(
         # DEC-CA-0067 quantile_head_after: replay under the round's own scoring
         # rule (the validator's ``_evaluate`` reads it at the same boundary).
         quantile_head = bool(cfg.quantile_head_at(receipt.epoch_start_block))
+        # DEC-CA-0068: the round's own decode batch (1 before the shared ladder)
+        from ..shared.config import shared_ladder_quantile_batch
+
+        qbatch = (shared_ladder_quantile_batch(cfg.eval, receipt.epoch_start_block)
+                  if quantile_head else 1)
         ours = global_geomean(evaluate_checkpoint(
             retrained, windows, num_samples=cfg.eval.num_samples, device=device,
-            contract=contract, quantile_head=quantile_head))
+            contract=contract, quantile_head=quantile_head, quantile_batch=qbatch))
         theirs = global_geomean(evaluate_checkpoint(
             published, windows, num_samples=cfg.eval.num_samples, device=device,
-            contract=contract, quantile_head=quantile_head))
+            contract=contract, quantile_head=quantile_head, quantile_batch=qbatch))
     except Exception as e:  # noqa: BLE001
         return CheckResult(name, WARN, f"score comparison unavailable "
                                        f"({type(e).__name__}: {e}); {why}")

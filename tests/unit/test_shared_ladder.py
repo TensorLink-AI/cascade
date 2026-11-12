@@ -118,8 +118,8 @@ def test_shipped_values_parse_and_default_off(tmp_path):
     assert shared_ladder_configured(shipped.eval)
     assert not shared_ladder_active(shipped.eval, 10_000_000)  # no block yet
     # The vote's name is pinned: a changed count or ladder is a FRESH vote.
-    assert A.shared_ladder_feature_name(4000, HORIZONS) == "lad-d0b94833"
-    assert A.shared_ladder_feature(shipped).name == "lad-d0b94833"
+    assert A.shared_ladder_feature_name(4000, HORIZONS) == "lad-556b1b98"
+    assert A.shared_ladder_feature(shipped).name == "lad-556b1b98"
 
     src = re.sub(r"^shared_ladder_(windows|from_block)\s*=.*$", "",
                  DEFAULT_CHAIN_TOML.read_text(), flags=re.M)
@@ -642,7 +642,7 @@ def _edit(tmp_path, pattern, repl):
 
 def test_release_config_loads_with_the_pin(voting):
     c = load_chain_config(DEFAULT_CHAIN_TOML)
-    assert c.eval.shared_ladder_feature == "lad-d0b94833"
+    assert c.eval.shared_ladder_feature == "lad-556b1b98"
     assert c.eval.shared_ladder_feature == A.shared_ladder_feature(c).name
     load_chain_config(REPO / "chain.testnet.toml")              # no ladder there: exempt
 
@@ -656,7 +656,7 @@ def test_a_deployed_config_without_the_keys_refuses_to_start(tmp_path, voting):
 
 def test_a_missing_pin_refuses(tmp_path, voting):
     p = _edit(tmp_path, r"^shared_ladder_feature\s*=.*$", "")
-    with pytest.raises(ValueError, match="shared_ladder_feature is not pinned.*lad-d0b94833"):
+    with pytest.raises(ValueError, match="shared_ladder_feature is not pinned.*lad-556b1b98"):
         load_chain_config(p)
 
 
@@ -720,3 +720,156 @@ def test_only_the_satellite_relaxes_the_pin():
     assert "allow_missing_shared_ladder()" in inspect.getsource(satellite.main)
     for mod in (validator_main, trainer_main, audit_main):
         assert "allow_missing_shared_ladder" not in inspect.getsource(mod)
+
+
+# ── the fixed-batch quantile decode ────────────────────────────────
+
+
+def test_decode_batch_follows_the_rule_gate():
+    from cascade.shared.config import SHARED_LADDER_QUANTILE_BATCH, shared_ladder_quantile_batch
+
+    assert SHARED_LADDER_QUANTILE_BATCH == 32
+    e = SimpleNamespace(scored_horizons=HORIZONS, scored_from_block=1000,
+                        shared_ladder_windows=40, shared_ladder_from_block=5000)
+    assert shared_ladder_quantile_batch(e, 5000) == 32
+    assert shared_ladder_quantile_batch(e, 4999) == 1          # before the gate: batch 1
+    assert shared_ladder_quantile_batch(e, None) == 1
+    assert shared_ladder_quantile_batch(replace_ns(e, shared_ladder_from_block=0), 9000) == 1
+    assert shared_ladder_quantile_batch(replace_ns(e, scored_horizons=()), 9000) == 1
+
+
+def test_the_batch_size_is_part_of_the_vote_name(monkeypatch):
+    import cascade.shared.config.scoring as sc
+
+    a = A.shared_ladder_feature_name(4000, HORIZONS)
+    monkeypatch.setattr(sc, "SHARED_LADDER_QUANTILE_BATCH", 16)
+    assert A.shared_ladder_feature_name(4000, HORIZONS) != a
+
+
+def test_chunks_are_fixed_consecutive_same_horizon_univariate_runs():
+    from cascade.validator.evaluator import quantile_chunks
+
+    hs = [64] * 70 + [256] * 5 + [720] * 3
+    cs = [1] * len(hs)
+    cs[71] = 3                                                  # one multichannel window
+    chunks = quantile_chunks(hs, cs, 32)
+    assert [len(c) for c in chunks] == [32, 32, 6, 1, 1, 3, 3]
+    assert chunks[3] == [70] and chunks[4] == [71] and chunks[5] == [72, 73, 74]
+    assert [i for c in chunks for i in c] == list(range(len(hs)))   # order kept, all covered
+    assert all(len({hs[i] for i in c}) == 1 for c in chunks)
+    assert quantile_chunks(hs, cs, 1) == [[i] for i in range(len(hs))]
+    assert quantile_chunks(hs, cs, 32) == quantile_chunks(hs, cs, 32)   # deterministic
+    with pytest.raises(ValueError):
+        quantile_chunks([64], [1, 1], 32)
+
+
+class _BatchWrapper:
+    """A stand-in quantile head: records each forward's row count; the output
+    of a row depends only on that row (as the real MoE: no capacity limit)."""
+
+    quantile_levels = tuple(np.round(np.linspace(0.1, 0.9, 9), 10))
+
+    def __init__(self):
+        self.calls: list[int] = []
+
+    def forecast_quantiles_batch(self, histories, horizon):
+        self.calls.append(len(histories))
+        out = []
+        for h in histories:
+            h = np.asarray(h, dtype=np.float64).reshape(-1)
+            base = h[-1] + np.arange(1, horizon + 1)[:, None] * 0.01
+            out.append(base + np.linspace(-1, 1, 9)[None, :])
+        return np.stack(out)
+
+
+def _patch_wrapper(monkeypatch, wrapper):
+    import cascade.validator.evaluator as ev
+
+    monkeypatch.setattr(ev, "_import_wrapper", lambda *a, **k: wrapper)
+
+
+def test_batched_decode_uses_fixed_chunks_and_matches_per_window_scores(monkeypatch):
+    from cascade.eval.window import EvalWindow
+    from cascade.validator.evaluator import evaluate_checkpoint
+
+    rng = np.random.default_rng(1)
+    windows = []
+    for h, n in ((64, 40), (720, 10)):
+        for i in range(n):
+            hist = rng.normal(size=500).cumsum()
+            tgt = rng.normal(size=h).cumsum() + hist[-1]
+            if h == 720 and i % 3 == 0:
+                tgt[300:] = np.nan                               # a padded window
+            windows.append(EvalWindow(f"h{h}-s{i}", hist, tgt))
+    w1 = _BatchWrapper()
+    _patch_wrapper(monkeypatch, w1)
+    seq = evaluate_checkpoint("x", windows, num_samples=100, quantile_head=True,
+                              trust_checkpoint_code=True)
+    assert w1.calls == [1] * 50                                   # today: one window per forward
+    w32 = _BatchWrapper()
+    _patch_wrapper(monkeypatch, w32)
+    bat = evaluate_checkpoint("x", windows, num_samples=100, quantile_head=True,
+                              trust_checkpoint_code=True, quantile_batch=32)
+    assert w32.calls == [32, 8, 10]                               # fixed, same-horizon chunks
+    assert [s.series_id for s in bat] == [s.series_id for s in seq]
+    for a, b in zip(bat, seq, strict=True):                       # row-independent stand-in
+        assert np.array_equal(a.qloss_per_q, b.qloss_per_q) and a.mase == b.mase
+    # parallel workers keep the SAME chunk composition
+    wpar = _BatchWrapper()
+    _patch_wrapper(monkeypatch, wpar)
+    par = evaluate_checkpoint("x", windows, num_samples=100, quantile_head=True,
+                              trust_checkpoint_code=True, quantile_batch=32, workers=3)
+    assert sorted(wpar.calls) == sorted([32, 8, 10])
+    assert [s.series_id for s in par] == [s.series_id for s in seq]
+
+
+def test_offload_request_carries_the_batch_and_old_workers_refuse(tmp_path, cfg):
+    from cascade.eval.window import EvalWindow
+    from cascade.validator import private_worker as pw
+
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    for name in pw.CHECKPOINT_FILES:
+        (ckpt / name).write_text(name)
+    windows = [EvalWindow(f"h64-s{i}", np.arange(100.0), np.arange(64.0)) for i in range(3)]
+    contract = cfg.training.primary_size
+    q = tuple(np.linspace(0.1, 0.9, 9))
+    plain = tmp_path / "plain.npz"
+    pw.write_request(plain, ckpt, windows, contract=contract, num_samples=100, quantile_levels=q)
+    batched = tmp_path / "batched.npz"
+    pw.write_request(batched, ckpt, windows, contract=contract, num_samples=100,
+                     quantile_levels=q, quantile_batch=32)
+    import json as _json
+
+    with np.load(plain) as d:
+        md = _json.loads(d["metadata"].tobytes())
+    assert md["schema"] == pw.SCHEMA_QUANTILES and "quantile_batch" not in md   # unchanged
+    with np.load(batched) as d:
+        md = _json.loads(d["metadata"].tobytes())
+    assert md["schema"] == pw.SCHEMA_QUANTILES_BATCHED and md["quantile_batch"] == 32
+    with pytest.raises(ValueError, match="quantile-head request only"):
+        pw.write_request(tmp_path / "bad.npz", ckpt, windows, contract=contract,
+                         num_samples=100, quantile_batch=32)
+
+
+def test_host_probe_refuses_a_worker_without_the_batched_schema(cfg):
+    from cascade.validator import eval_offload as eo
+    from cascade.validator import private_worker as pw
+
+    host = SimpleNamespace(name="h", workdir="/w", remote_python="python", host="x", port=1,
+                           user="u", key_path=None, ssh_options=(), cuda_device=None)
+    fields = [f for f in __import__("dataclasses").asdict(cfg.training.primary_size)]
+
+    def answer(schemas):
+        out = json.dumps({"contract_fields": fields, "schemas": schemas})
+        return lambda argv, timeout: SimpleNamespace(returncode=0, stdout=out, stderr="")
+
+    q = tuple(np.linspace(0.1, 0.9, 9))
+    old = answer([pw.SCHEMA, pw.SCHEMA_QUANTILES, ""])
+    eo.check_private_worker(host, cfg.training.primary_size, quantile_levels=q, run=old)
+    with pytest.raises(eo.PrivateEvalUnavailable, match="out of date"):
+        eo.check_private_worker(host, cfg.training.primary_size, quantile_levels=q, run=old,
+                                quantile_batch=32)
+    new = answer([pw.SCHEMA, pw.SCHEMA_QUANTILES, pw.SCHEMA_QUANTILES_BATCHED])
+    eo.check_private_worker(host, cfg.training.primary_size, quantile_levels=q, run=new,
+                            quantile_batch=32)

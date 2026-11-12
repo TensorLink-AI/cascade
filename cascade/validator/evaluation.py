@@ -166,6 +166,11 @@ class EvaluationMixin:
         # without a boundary) = the sample path, as always.
         rule = getattr(self.cfg, "quantile_head_at", None)
         quantile_head = bool(rule(block)) if (rule is not None and block is not None) else False
+        # DEC-CA-0068: the shared ladder's fixed-batch decode (1 = before it)
+        from ..shared.config import shared_ladder_quantile_batch
+
+        qbatch = (shared_ladder_quantile_batch(self.cfg.eval, block)
+                  if quantile_head and block is not None else 1)
         private_host_fn = getattr(self, "private_eval_host_fn", None)
         workers = getattr(self, "private_eval_workers", 1)
         if private_host_fn is not None:
@@ -182,7 +187,8 @@ class EvaluationMixin:
             levels = DEFAULT_QUANTILE_LEVELS if quantile_head else None
             forecasts = forecasts_via_host(
                 host, dest, windows, contract=contract, num_samples=self.cfg.eval.num_samples,
-                workers=workers, timeout_s=self.private_eval_timeout_s, quantile_levels=levels)
+                workers=workers, timeout_s=self.private_eval_timeout_s, quantile_levels=levels,
+                quantile_batch=qbatch)
             # Streamed one window at a time (validated in full first); the
             # downloaded samples file is released as soon as scoring ends.
             try:
@@ -199,6 +205,7 @@ class EvaluationMixin:
         return evaluate_checkpoint(
             dest, windows, num_samples=self.cfg.eval.num_samples, device=self.device,
             contract=contract, workers=workers, quantile_head=quantile_head,
+            quantile_batch=qbatch,
         )
 
     @staticmethod

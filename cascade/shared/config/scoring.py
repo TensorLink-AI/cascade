@@ -507,6 +507,29 @@ def shared_ladder_active(eval_cfg: EvalConfig, block: int | None) -> bool:
             and shared_ladder_configured(eval_cfg))
 
 
+# DEC-CA-0068 rule: the quantile head decodes the shared ladder's windows in
+# FIXED batches of this many univariate windows (consecutive in window order,
+# one horizon per batch). Batch 32 is ~10x batch 1 on an RTX 5090 (2026-11-12:
+# 26 ms -> 2.5 ms per window) and deterministic run to run, but its numerics
+# differ from batch 1 (cuBLAS / MoE grouped-GEMM shapes) and depend on the
+# batch-mates at ~1e-5 — so the size and the composition are part of the rule
+# (hashed into the vote name). Every round before the gate decodes at batch 1,
+# byte-identical to before.
+SHARED_LADDER_QUANTILE_BATCH = 32
+
+
+def shared_ladder_quantile_batch(eval_cfg: EvalConfig, block: int | None) -> int:
+    """CONSENSUS: the quantile-head decode batch for a round at epoch boundary
+    ``block`` — :data:`SHARED_LADDER_QUANTILE_BATCH` once the shared-series
+    ladder is in force there (the scored ladder AND its shared draw), else 1."""
+    horizons = tuple(getattr(eval_cfg, "scored_horizons", ()) or ())
+    gate = int(getattr(eval_cfg, "scored_from_block", 0) or 0)
+    if (not horizons or gate <= 0 or block is None or int(block) < gate
+            or not shared_ladder_active(eval_cfg, block)):
+        return 1
+    return SHARED_LADDER_QUANTILE_BATCH
+
+
 def check_shared_ladder(windows: int, from_block: int, horizons, scored_from_block: int) -> None:
     """Load-time guardrails for DEC-CA-0068: non-negative values; a typed
     block needs the count AND a scored ladder, and cannot precede the ladder's

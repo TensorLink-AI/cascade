@@ -799,12 +799,13 @@ def apply_image_decoupled_activation(cfg: ChainConfig, block: int) -> ChainConfi
 
 
 # DEC-CA-0068 rule tag: one draw over every series, NaN-padded targets at the
-# rungs a short series cannot fill. A changed rule is a fresh vote.
-SHARED_LADDER_RULE = "shared-ladder/1"
+# rungs a short series cannot fill, quantile head decoded in fixed batches
+# (``/2``: the batch size joins the name). A changed rule is a fresh vote.
+SHARED_LADDER_RULE = "shared-ladder/2"
 
 
 def shared_ladder_feature_name(n_windows: int, horizons) -> str:
-    """``lad-<sha256("shared-ladder/1|<n>|<h1,h2,...>")[:8]>`` — the per-horizon
+    """``lad-<sha256("shared-ladder/2|<n>|<h1,h2,...>|batch=<B>")[:8]>`` — the per-horizon
     count and the rungs ARE the feature, so two validators shipping different
     values never count each other. Four-letter prefix on purpose: the note is
     ONE 128-byte field (:data:`NOTE_MAX_BYTES`) shared with every older
@@ -812,7 +813,10 @@ def shared_ladder_feature_name(n_windows: int, horizons) -> str:
     hs = tuple(int(h) for h in (horizons or ()))
     if int(n_windows or 0) <= 0 or not hs:
         return ""
-    body = f"{SHARED_LADDER_RULE}|{int(n_windows)}|{','.join(str(h) for h in hs)}"
+    from .config.scoring import SHARED_LADDER_QUANTILE_BATCH
+
+    body = (f"{SHARED_LADDER_RULE}|{int(n_windows)}|{','.join(str(h) for h in hs)}"
+            f"|batch={SHARED_LADDER_QUANTILE_BATCH}")
     return "lad-" + hashlib.sha256(body.encode("utf-8")).hexdigest()[:8]
 
 

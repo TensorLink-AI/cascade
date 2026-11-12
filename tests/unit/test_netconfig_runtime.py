@@ -22,10 +22,20 @@ from .test_netconfig_core import (
     GRID,
     MemStore,
     R,
-    base_cfg,
     base_raw,
     publish,
 )
+from .test_netconfig_core import base_cfg as _armed_base_cfg
+
+
+def base_cfg(owner=None):
+    """The netconfig fixture with the DEC-CA-0068 ``lad-`` vote disarmed IN
+    MEMORY: these tests pin the exact cfg-/rollover note. (A chain.toml FILE
+    without it is refused by the validator's pin — see the publish CLI test,
+    which loads the production-true ``base_raw``.)"""
+    cfg = _armed_base_cfg(owner)
+    return replace(cfg, eval=replace(cfg.eval, shared_ladder_windows=0,
+                                     shared_ladder_feature=""))
 
 
 def _fleet():
