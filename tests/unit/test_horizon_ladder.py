@@ -29,7 +29,8 @@ def test_scored_knobs_parse_and_default_off(tmp_path):
     from cascade.shared.config import DEFAULT_CHAIN_TOML, load_chain_config
 
     # The shipped toml may carry the armed keys; strip them to pin the defaults.
-    src = re.sub(r"^scored_(horizons|from_block)\s*=.*$", "",
+    # The shared-ladder keys need scored_horizons, so strip them too.
+    src = re.sub(r"^(scored_(horizons|from_block)|shared_ladder_\w+)\s*=.*$", "",
                  DEFAULT_CHAIN_TOML.read_text(), flags=re.M)
     p = tmp_path / "chain.toml"
     p.write_text(src)
