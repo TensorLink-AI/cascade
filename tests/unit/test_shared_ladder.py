@@ -868,11 +868,12 @@ def test_offload_request_carries_the_batch_and_old_workers_refuse(tmp_path, cfg)
 
 
 def test_host_probe_refuses_a_worker_without_the_batched_schema(cfg):
+    from cascade.trainer.remote import RemoteHost
     from cascade.validator import eval_offload as eo
     from cascade.validator import private_worker as pw
 
-    host = SimpleNamespace(name="h", workdir="/w", remote_python="python", host="x", port=1,
-                           user="u", key_path=None, ssh_options=(), cuda_device=None)
+    # A real host: the probe swallows any ssh-argv error as "unreadable".
+    host = RemoteHost("gpu-fixture", "fixture", user="ubuntu", port=40123, workdir="/w")
     fields = [f for f in __import__("dataclasses").asdict(cfg.training.primary_size)]
 
     def answer(schemas):
