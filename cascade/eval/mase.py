@@ -43,4 +43,11 @@ def mase(
     if point_forecast.shape != obs.shape:
         raise ValueError(f"point_forecast {point_forecast.shape} != obs {obs.shape}")
     scale = in_sample_naive_mae(history, seasonal_period)
+    finite = np.isfinite(obs)
+    if not finite.all():
+        # DEC-CA-0068 NaN-padded targets: the error is averaged over the steps
+        # the series actually reached. Finite targets keep the path below.
+        if not finite.any():
+            raise ValueError("obs has no finite step to score")
+        return float(np.mean(np.abs(obs[finite] - point_forecast[finite])) / scale)
     return float(np.mean(np.abs(obs - point_forecast)) / scale)

@@ -64,12 +64,13 @@ WORKER_PROBE = (
     "from cascade.shared.config.training import TrainingContractConfig as T\n"
     "from cascade.validator import private_worker as w\n"
     "print(json.dumps({'contract_fields': [f.name for f in dataclasses.fields(T)],\n"
-    "                  'schemas': [getattr(w, 'SCHEMA', ''), getattr(w, 'SCHEMA_QUANTILES', '')]}))\n"
+    "                  'schemas': [getattr(w, 'SCHEMA', ''), getattr(w, 'SCHEMA_QUANTILES', ''),\n"
+    "                              getattr(w, 'SCHEMA_QUANTILES_BATCHED', '')]}))\n"
 )
 
 
 def check_private_worker(host, contract, *, quantile_levels=None, run=None,
-                         timeout_s=WORKER_PROBE_SECONDS) -> None:
+                         timeout_s=WORKER_PROBE_SECONDS, quantile_batch=1) -> None:
     """Refuse before any upload when ``host`` provably cannot serve this request.
 
     The worker rebuilds the contract with ``TrainingContractConfig(**fields)``,
@@ -101,8 +102,14 @@ def check_private_worker(host, contract, *, quantile_levels=None, run=None,
     local_fields = set(asdict(contract))
     missing = sorted(local_fields - remote_fields)
     needs_quantiles = quantile_levels is not None
-    from .private_worker import SCHEMA_QUANTILES
+    from .private_worker import SCHEMA_QUANTILES, SCHEMA_QUANTILES_BATCHED
 
+    needs_batched = needs_quantiles and int(quantile_batch) > 1
+    if needs_batched and SCHEMA_QUANTILES_BATCHED not in remote_schemas:
+        log.error("private eval host %s cannot decode in fixed batches (DEC-CA-0068 "
+                  "shared ladder, batch %d) — deploy this validator's release to the host; "
+                  "the round holds until then", host.name, int(quantile_batch))
+        raise PrivateEvalUnavailable("private evaluation worker is out of date")
     if missing or (needs_quantiles and SCHEMA_QUANTILES not in remote_schemas):
         log.error("private eval host %s runs code older than this validator (contract fields "
                   "it lacks: %s; quantile requests supported: %s) — deploy this validator's "
@@ -155,7 +162,8 @@ def _stderr_tail(proc) -> str:
 
 
 def forecasts_via_host(host, checkpoint, windows, *, contract, num_samples,
-                       workers=1, timeout_s=3600, runner=None, quantile_levels=None):
+                       workers=1, timeout_s=3600, runner=None, quantile_levels=None,
+                       quantile_batch=1):
     """Send only histories to an explicitly configured operator-owned host.
 
     Score returned samples locally against the original targets. A missing,
@@ -195,13 +203,14 @@ def forecasts_via_host(host, checkpoint, windows, *, contract, num_samples,
     try:
         check_private_worker(host, contract, quantile_levels=quantile_levels, run=run,
                              timeout_s=max(1, min(WORKER_PROBE_SECONDS,
-                                                  deadline - time.monotonic())))
+                                                  deadline - time.monotonic())),
+                             quantile_batch=quantile_batch)
         local = Path(tmpdir.name)
         request = local / "request.npz"
         hashes = checkpoint_hashes(Path(checkpoint))
         identity = write_request(request, checkpoint, windows, contract=contract,
                                  num_samples=num_samples, quantile_levels=quantile_levels,
-                                 hashes=hashes)
+                                 hashes=hashes, quantile_batch=quantile_batch)
         key = private_cache_key(hashes)
         cache_root = f"{host.workdir}/{PRIVATE_CACHE_DIR}"
         cached = f"{cache_root}/{key}"

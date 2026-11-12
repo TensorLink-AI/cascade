@@ -25,6 +25,7 @@ from .scoring import (
     _init_gate_mode,
     _margin_mode,
     check_margin_v2,
+    check_shared_ladder,
     parse_bench_workers,
 )
 from .sections import (
@@ -230,6 +231,10 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
     _mv2_blocks = int(s.get("margin_warmup_blocks_v2", 0) or 0)
     _mv2_from = int(s.get("margin_v2_from_block", 0) or 0)
     check_margin_v2(_mv2_start, _mv2_end, _mv2_blocks, _mv2_from)
+    check_shared_ladder(int(e.get("shared_ladder_windows", 0) or 0),
+                        int(e.get("shared_ladder_from_block", 0) or 0),
+                        tuple(e.get("scored_horizons", ()) or ()),
+                        int(e.get("scored_from_block", 0) or 0))
     _rolling = max(0, int(r.get("rolling_from_block", 0) or 0))
     _era_king = max(0, int(s.get("era_king_from_block", 0) or 0))
     _tenure_blocks = max(0, int(s.get("tenure_blocks_from_block", 0) or 0))
@@ -578,6 +583,9 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
             calib_num_samples=int(e.get("calib_num_samples", 32)),
             scored_horizons=tuple(int(h) for h in e.get("scored_horizons", ())),
             scored_from_block=int(e.get("scored_from_block", 0) or 0),
+            shared_ladder_windows=int(e.get("shared_ladder_windows", 0) or 0),
+            shared_ladder_from_block=int(e.get("shared_ladder_from_block", 0) or 0),
+            shared_ladder_feature=_shared_ladder_pin(e.get("shared_ladder_feature", "")),
             bench_hold_max_hours=float(e.get("bench_hold_max_hours", 2.0)),
             bench_workers=parse_bench_workers(e.get("bench_workers", "auto")),
             bench_paired=bool(e.get("bench_paired", True)),
@@ -799,6 +807,7 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
             raise ValueError("[v2] funded_sku_wall_measured_image_after is required while "
                              "[round] funded_sku_wall_measured_image gates rents")
     check_image_decoupled_feature(cfg)
+    check_shared_ladder_feature(cfg)
     from .chain_config import bind_image_after
 
     return bind_image_after(cfg)
@@ -823,6 +832,89 @@ def require_vote_pin(enabled: bool = True) -> None:
 
 def vote_pin_required() -> bool:
     return _REQUIRE_VOTE_PIN
+
+
+# DEC-CA-0068: a satellite signals the shared-ladder vote but never draws or
+# scores windows (it replays the main validator's signed receipts), so a
+# satellite config WITHOUT the rule only means it does not vote — harmless.
+# It logs an ERROR and keeps running instead of refusing (and going dark on
+# weights over an eval knob it never uses). A config whose keys compute a
+# DIFFERENT name still refuses: that would put a wrong vote on chain.
+_SHARED_LADDER_MISSING_OK = False
+
+
+def allow_missing_shared_ladder(enabled: bool = True) -> None:
+    """Called by the satellite ``main`` only (see above)."""
+    global _SHARED_LADDER_MISSING_OK
+    _SHARED_LADDER_MISSING_OK = bool(enabled)
+
+
+def missing_shared_ladder_allowed() -> bool:
+    return _SHARED_LADDER_MISSING_OK
+
+
+def _shared_ladder_pin(value) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"[eval] shared_ladder_feature must be a string; got {value!r}")
+    return value.strip()
+
+
+def check_shared_ladder_feature(cfg) -> None:
+    """DEC-CA-0068 fork guard (the :func:`check_image_decoupled_feature`
+    pattern). The shared-series ladder exists only if a node's chain.toml
+    carries ``[eval] shared_ladder_windows``: a node on the release whose
+    deployed chain.toml lacks it would neither signal NOR apply the fleet's
+    lock-in, and would keep scoring the per-rung ladder after the switch — a
+    silent verdict fork. So wherever the ladder can apply (``[activation]`` on
+    and ``scored_horizons`` set) the config must pin ``[eval]
+    shared_ladder_feature`` to the name its own values compute; missing, or a
+    different count / ladder, refuses the validator, trainer and audit
+    (:func:`require_vote_pin`). A pinned key is checked even off the ladder."""
+    from ..activation import shared_ladder_feature_name
+
+    e = cfg.eval
+    pinned = str(getattr(e, "shared_ladder_feature", "") or "")
+    horizons = tuple(int(h) for h in (getattr(e, "scored_horizons", ()) or ()))
+    want = shared_ladder_feature_name(int(getattr(e, "shared_ladder_windows", 0) or 0), horizons)
+    inputs = (f"[eval] shared_ladder_windows={int(getattr(e, 'shared_ladder_windows', 0) or 0)}, "
+              f"scored_horizons={list(horizons)}")
+    applies = bool(cfg.activation.enabled) and bool(horizons)
+    why = ""
+    missing = False
+    if applies and not want:
+        missing = True
+        why = (f"[eval] shared_ladder_windows is not set ({inputs}): this release judges "
+               "the DEC-CA-0068 shared-series ladder once the fleet decides it, and a node "
+               "without it would keep the per-rung draw after the switch. Deploy the release "
+               "chain.toml values ([eval] shared_ladder_windows, shared_ladder_from_block and "
+               "shared_ladder_feature)")
+    elif applies and not pinned:
+        missing = True
+        why = (f"[eval] shared_ladder_feature is not pinned: this config votes on {want} "
+               f"({inputs}). Deploy the release chain.toml values")
+    elif pinned and pinned != want:
+        why = (f"[eval] shared_ladder_feature = {pinned!r} but this config computes "
+               f"{want or 'no feature'} ({inputs}): it would vote on — and judge — a different "
+               "DEC-CA-0068 rule than the fleet; fix shared_ladder_windows / scored_horizons "
+               "to the release values")
+    if not why:
+        return
+    if _REQUIRE_VOTE_PIN and not (missing and _SHARED_LADDER_MISSING_OK):
+        raise ValueError(why + " — refusing to start (this process votes on or acts on the "
+                         "shared-ladder vote)")
+    if missing and _SHARED_LADDER_MISSING_OK:
+        import logging
+
+        logging.getLogger("cascade.config").error(
+            "%s — satellite continuing: it does NOT vote on the shared-series ladder until "
+            "its chain.toml carries the release values (it never scores windows, so its "
+            "receipts and weights are unaffected)", why)
+        return
+    import logging
+
+    logging.getLogger("cascade.config").error(
+        "%s — continuing: this process neither signals nor tallies the vote, but the "
+        "validator / trainer / audit on this config will refuse to start", why)
 
 
 def check_image_decoupled_feature(cfg) -> None:

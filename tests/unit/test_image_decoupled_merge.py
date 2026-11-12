@@ -104,7 +104,7 @@ def test_option_b_drops_the_prelaunch_segment_and_option_a_still_needed(tmp_path
                                 None, A.ActivationRecord(feature=V2B, lock_block=9504000,
                                                          activation_block=9507600,
                                                          source="tally"))
-    assert both.endswith(f":{V2B}:9504000:9507600") and "prelaunch-" not in both
+    assert f":{V2B}:9504000:9507600:" in both + ":" and "prelaunch-" not in both
 
 
 def test_retiring_a_locked_prelaunch_vote_is_refused():
@@ -155,7 +155,8 @@ def test_startup_warns_for_every_segment_the_note_would_trim(tmp_path, caplog):
     cfg = replace(cfg, v2=replace(cfg.v2, image_decoupled_from_block=9504000))
     rec, fr, mr = _live_records()
     assert A.v2b_note_problem(cfg, rec, fr, mr) == ""
-    assert A.note_trimmed_segments(cfg, rec, fr, mr) == ["prelaunch-95-r2"]
+    # (the newer DEC-CA-0068 "lad-" segment goes first; the prelaunch one follows)
+    assert "prelaunch-95-r2" in A.note_trimmed_segments(cfg, rec, fr, mr)
     with caplog.at_level(logging.WARNING, logger="cascade.validator"):
         _startup(cfg, tmp_path)
     assert any("STARTUP" in r.getMessage() and "'prelaunch-95-r2'" in r.getMessage()

@@ -434,29 +434,10 @@ def horizon_draw(
     across different draws.
     """
     prefix = id_prefix if id_prefix is not None else f"h{int(horizon)}-"
-    eligible: dict[str, list[int]] = {}
-    for i, s in enumerate(series):
-        if np.atleast_2d(np.asarray(s)).shape[-1] >= horizon + min_context:
-            dom = str(metadata[i].get("domain", "") or "")
-            eligible.setdefault(dom, []).append(i)
-    if not eligible:
+    picked = _pick_series(series, metadata, min_length=horizon + min_context,
+                          n_windows=n_windows, seed=seed)
+    if not picked:
         return []
-
-    rng = np.random.default_rng(seed)
-    picked: list[int] = []
-    want = n_windows
-    # Scarce domains first at capacity, then the even split over the rest —
-    # iterate smallest-first so freed budget flows to domains that can absorb it.
-    remaining = dict(eligible)
-    while remaining and want > 0:
-        share = max(1, want // len(remaining))
-        dom = min(remaining, key=lambda d: len(remaining[d]))
-        idxs = remaining.pop(dom)
-        take = min(len(idxs), share if remaining else want)
-        order = rng.permutation(len(idxs))
-        picked.extend(idxs[j] for j in order[:take])
-        want -= take
-    picked.sort()  # stable window order — pairing across checkpoints
 
     windows = build_windows_from_series(
         [series[i] for i in picked],
@@ -475,6 +456,189 @@ def horizon_draw(
     log.info("window draw h=%d: %d windows (%s)", horizon, len(windows),
              ", ".join(f"{d or '?'}:{c}" for d, c in sorted(counts.items())))
     return windows
+
+
+def _pick_series(series: list[np.ndarray], metadata: list[dict], *, min_length: int,
+                 n_windows: int, seed: int) -> list[int]:
+    """The even-by-domain seeded pick behind :func:`horizon_draw` — pool
+    indices of up to ``n_windows`` series at least ``min_length`` steps long,
+    sorted. Domains that cannot fill an even share contribute everything they
+    have (DEC-CA-0032); the remainder splits evenly across the rest. The RNG
+    call sequence is exactly the pre-factoring one, so every draw stays
+    byte-identical."""
+    eligible: dict[str, list[int]] = {}
+    for i, s in enumerate(series):
+        if np.atleast_2d(np.asarray(s)).shape[-1] >= int(min_length):
+            dom = str(metadata[i].get("domain", "") or "")
+            eligible.setdefault(dom, []).append(i)
+    if not eligible:
+        return []
+
+    rng = np.random.default_rng(seed)
+    picked: list[int] = []
+    want = int(n_windows)
+    # Scarce domains first at capacity, then the even split over the rest —
+    # iterate smallest-first so freed budget flows to domains that can absorb it.
+    remaining = dict(eligible)
+    while remaining and want > 0:
+        share = max(1, want // len(remaining))
+        dom = min(remaining, key=lambda d: len(remaining[d]))
+        idxs = remaining.pop(dom)
+        take = min(len(idxs), share if remaining else want)
+        order = rng.permutation(len(idxs))
+        picked.extend(idxs[j] for j in order[:take])
+        want -= take
+    picked.sort()  # stable window order — pairing across checkpoints
+    return picked
+
+
+def shared_ladder(eval_cfg, block: int | None) -> int:
+    """The DEC-CA-0068 per-horizon series count in force for a round at
+    ``block``, or 0 when every rung draws its own series (the
+    :func:`scored_ladder` rule). Block-gated like the ladder itself; needs the
+    ladder (no horizons ⇒ 0) — the gate is ``[eval] shared_ladder_from_block``,
+    typed or written by the fleet's lock-in."""
+    from ..shared.config import shared_ladder_active
+
+    if not scored_ladder(eval_cfg, block) or not shared_ladder_active(eval_cfg, block):
+        return 0
+    return int(eval_cfg.shared_ladder_windows)
+
+
+def build_padded_windows(
+    series: list[np.ndarray],
+    *,
+    context_length: int,
+    horizon: int,
+    metadata: list[dict] | dict | None = None,
+    id_prefix: str = "w",
+    min_context: int = 64,
+) -> list[EvalWindow]:
+    """:func:`build_windows_from_series` for the shared ladder (DEC-CA-0068):
+    a series with at least ``horizon + min_context`` steps is cut EXACTLY as
+    there (the last ``horizon`` steps are the target, up to ``context_length``
+    before them the history). A shorter one keeps its first ``min_context``
+    steps as history and its whole remaining tail as the target, NaN-padded to
+    ``horizon`` — the scorer masks the padded steps, so the series is judged on
+    every step it actually reached. A series of ``min_context`` steps or fewer
+    (no observed target step) is skipped."""
+    if context_length <= 0 or horizon <= 0:
+        raise ValueError("context_length and horizon must be positive")
+    if min_context <= 0:
+        raise ValueError("min_context must be positive")
+    out: list[EvalWindow] = []
+    for i, raw in enumerate(series):
+        arr = np.atleast_2d(np.asarray(raw, dtype=np.float64))   # (C, L)
+        length = arr.shape[-1]
+        if length >= horizon + min_context:
+            ctx = min(context_length, length - horizon)
+            history = arr[:, length - horizon - ctx : length - horizon]
+            target = arr[:, length - horizon :]
+        else:
+            if length <= min_context:
+                continue
+            history = arr[:, :min_context]
+            tail = arr[:, min_context:]
+            target = np.full((arr.shape[0], horizon), np.nan, dtype=np.float64)
+            target[:, : tail.shape[-1]] = tail
+        if metadata is None:
+            md: dict = {}
+        elif isinstance(metadata, dict):
+            md = metadata
+        else:
+            md = metadata[i]
+        out.append(
+            EvalWindow(series_id=f"{id_prefix}{i}", history=history, target=target, metadata=md)
+        )
+    return out
+
+
+def shared_ladder_windows(
+    series: list[np.ndarray],
+    metadata: list[dict],
+    *,
+    horizons: tuple[int, ...],
+    n_windows: int,
+    context_length: int,
+    seed: int,
+    min_context: int = 64,
+) -> list[EvalWindow]:
+    """DEC-CA-0068: ONE even-by-domain seeded pick of ``n_windows`` series,
+    then every horizon of ``horizons`` cuts a window from each picked series
+    (:func:`build_padded_windows`), so each rung scores the SAME series and
+    rung sizes are equal by construction. Eligibility is ``min_context + 1``
+    steps (one observed target step at the longest rung); a pool holding
+    fewer eligible series than asked contributes every one of them (logged —
+    deterministic, so the fleet still agrees). Window ids are
+    ``h<horizon>-s<pool_index>`` exactly as the per-rung ladder stamps them.
+    Deterministic in ``seed``; raises when nothing is eligible or ``horizons``
+    is empty (a silent fall-back would fork the fleet)."""
+    horizons = tuple(int(h) for h in horizons)
+    if not horizons:
+        raise ValueError("horizons must be non-empty")
+    if int(n_windows) <= 0:
+        raise ValueError("n_windows must be positive")
+    picked = _pick_series(series, metadata, min_length=int(min_context) + 1,
+                          n_windows=n_windows, seed=int(seed))
+    if not picked:
+        raise ValueError("no eligible series for the shared ladder")
+    if len(picked) < int(n_windows):
+        log.warning("shared ladder draw: %d series asked per horizon, the pool holds %d "
+                    "eligible — every eligible series drawn", int(n_windows), len(picked))
+    sub_series = [series[i] for i in picked]
+    sub_meta = [metadata[i] for i in picked]
+    out: list[EvalWindow] = []
+    for h in horizons:
+        prefix = f"h{h}-"
+        windows = build_padded_windows(sub_series, context_length=context_length, horizon=h,
+                                       metadata=sub_meta, id_prefix=prefix,
+                                       min_context=min_context)
+        if len(windows) != len(picked):
+            raise ValueError(f"shared ladder cut {len(windows)} windows from {len(picked)} "
+                             f"picked series at horizon {h}")
+        windows = [replace(w, series_id=f"{prefix}s{picked[j]}")
+                   for j, w in enumerate(windows)]
+        padded = sum(1 for w in windows if not np.isfinite(w.target).all())
+        log.info("shared ladder h=%d: %d windows, %d NaN-padded", h, len(windows), padded)
+        out.extend(windows)
+    counts: dict[str, int] = {}
+    for i in picked:
+        d = str(metadata[i].get("domain", "") or "")
+        counts[d] = counts.get(d, 0) + 1
+    log.info("shared ladder draw: %d series x %d horizons (%s)", len(picked), len(horizons),
+             ", ".join(f"{d or '?'}:{c}" for d, c in sorted(counts.items())))
+    return out
+
+
+def shared_ladder_windows_for_round(
+    window_source: object,
+    *,
+    horizons: tuple[int, ...],
+    n_windows: int,
+    context_length: int,
+    round_seed: int | str,
+    block: int | None,
+    min_context: int = 64,
+) -> list[EvalWindow]:
+    """Draw one round's shared-series ladder (DEC-CA-0068) from the source's
+    raw series — :func:`ladder_windows_for_round`'s plumbing, the shared cut.
+    A source with no series directory is an error, never a fall-back."""
+    from pathlib import Path
+
+    dir_fn = getattr(window_source, "snapshot_dir_for_round", None)
+    pool_dir = dir_fn(block=block) if dir_fn is not None else None
+    if pool_dir is None:
+        raise ValueError(
+            "shared ladder active but the window source exposes no series directory"
+        )
+    from .calibration import load_pool_series
+
+    series, _ids, metadata = load_pool_series(Path(pool_dir))
+    return shared_ladder_windows(
+        series, metadata, horizons=horizons, n_windows=n_windows,
+        context_length=context_length, seed=_seed_to_int(round_seed),
+        min_context=min_context,
+    )
 
 
 def scored_ladder(eval_cfg, block: int | None) -> tuple[int, ...]:

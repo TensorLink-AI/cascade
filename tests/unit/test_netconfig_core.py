@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 import json
 import tomllib
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -457,7 +458,10 @@ def test_note_trimming_drops_older_segments_before_the_cfg_segment():
 
 
 def test_cfg_segment_alone_keeps_a_typed_rollover_note_alive():
+    # the DEC-CA-0068 "lad-" vote disarmed in memory (the loader's pin refuses
+    # a config file without it in voting processes) so the note is cfg- only
     cfg = base_cfg()
+    cfg = replace(cfg, eval=replace(cfg.eval, shared_ladder_windows=0, shared_ladder_feature=""))
     rec = A.ActivationRecord()
     assert A.own_signal_payload(cfg, rec) is None             # typed rollover: inert
     note = A.own_signal_payload(cfg, rec, netconfig_segment=A.ReadySignal("cfg-0123abcd"))

@@ -499,7 +499,8 @@ def vcfg():
                         forfeit_from_block=0, forfeit_successor_hotkey="",
                         win_margin_start_v2=0.0, win_margin_end_v2=0.0,
                         margin_warmup_blocks_v2=0, margin_v2_from_block=0),
-        v2=replace(c.v2, prelaunch_burn=0.0))
+        v2=replace(c.v2, prelaunch_burn=0.0),
+        eval=replace(c.eval, shared_ladder_windows=0))
 
 
 def _typed(c, block):

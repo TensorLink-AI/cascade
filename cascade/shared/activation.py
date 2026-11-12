@@ -65,6 +65,9 @@ lock-in writes the first ERA START after the lock-in boundary into ``[v2]
 image_decoupled_from_block`` (:func:`apply_image_decoupled_activation`) — the
 image-decoupled per-leg contract rule and ``[v2] eval_n_windows_after`` both
 switch there.
+The DEC-CA-0068 shared-series ladder is the fifth (``lad-<sha256(params)[:8]>``):
+lock-in writes the first ERA START after the lock-in boundary into ``[eval]
+shared_ladder_from_block`` (:func:`apply_shared_ladder_activation`).
 """
 
 from __future__ import annotations
@@ -82,6 +85,7 @@ from .config import (
     check_rollover_alignment,
     effective_epoch_blocks,
     margin_v2_configured,
+    shared_ladder_configured,
 )
 from .era import era_length_blocks
 
@@ -794,6 +798,83 @@ def apply_image_decoupled_activation(cfg: ChainConfig, block: int) -> ChainConfi
         activation=replace(cfg.activation, resolved_image_decoupled_block=block)))
 
 
+# DEC-CA-0068 rule tag: one draw over every series, NaN-padded targets at the
+# rungs a short series cannot fill, quantile head decoded in fixed batches
+# (``/2``: the batch size joins the name). A changed rule is a fresh vote.
+SHARED_LADDER_RULE = "shared-ladder/2"
+
+
+def shared_ladder_feature_name(n_windows: int, horizons) -> str:
+    """``lad-<sha256("shared-ladder/2|<n>|<h1,h2,...>|batch=<B>")[:8]>`` — the per-horizon
+    count and the rungs ARE the feature, so two validators shipping different
+    values never count each other. Four-letter prefix on purpose: the note is
+    ONE 128-byte field (:data:`NOTE_MAX_BYTES`) shared with every older
+    segment. ``""`` when the rule is unset."""
+    hs = tuple(int(h) for h in (horizons or ()))
+    if int(n_windows or 0) <= 0 or not hs:
+        return ""
+    from .config.scoring import SHARED_LADDER_QUANTILE_BATCH
+
+    body = (f"{SHARED_LADDER_RULE}|{int(n_windows)}|{','.join(str(h) for h in hs)}"
+            f"|batch={SHARED_LADDER_QUANTILE_BATCH}")
+    return "lad-" + hashlib.sha256(body.encode("utf-8")).hexdigest()[:8]
+
+
+def configured_shared_ladder_block(cfg: ChainConfig) -> int:
+    """The DEC-CA-0068 block TYPED into chain.toml (0 = none / decided on
+    chain). A block written by :func:`apply_shared_ladder_activation` is not
+    typed (``activation.resolved_shared_ladder_block`` marks it)."""
+    if int(getattr(cfg.activation, "resolved_shared_ladder_block", 0) or 0):
+        return 0
+    return int(getattr(cfg.eval, "shared_ladder_from_block", 0) or 0)
+
+
+def resolved_shared_ladder_block(cfg: ChainConfig) -> int:
+    return int(getattr(cfg.activation, "resolved_shared_ladder_block", 0) or 0)
+
+
+def shared_ladder_feature(cfg: ChainConfig) -> FeatureSpec | None:
+    """The DEC-CA-0068 shared-series ladder as a feature the fleet decides
+    (the DEC-CA-0049 shape): present when ``[activation]`` is on and the rule
+    is defined (``[eval] shared_ladder_windows`` > 0 with a scored ladder);
+    ``typed_block`` = the typed ``shared_ladder_from_block`` (the override —
+    nothing is signalled). Takes effect at the first ERA START after the
+    lock-in boundary (``align="era"``: every settlement of one era draws one
+    way). ``None`` = rule unset or activation off."""
+    if not cfg.activation.enabled or not shared_ladder_configured(cfg.eval):
+        return None
+    name = shared_ladder_feature_name(cfg.eval.shared_ladder_windows, cfg.eval.scored_horizons)
+    if not name:
+        return None
+    return FeatureSpec(name=name, typed_block=configured_shared_ladder_block(cfg), align="era")
+
+
+def apply_shared_ladder_activation(cfg: ChainConfig, block: int) -> ChainConfig:
+    """The config the owner would have typed for a shared ladder decided at
+    rollover ``block``: ``[eval] shared_ladder_from_block`` = that block — the
+    first ERA START after the lock-in boundary, so the era in which the count
+    crossed finishes on the per-rung draw and no era mixes the two. A typed
+    block is returned unchanged (the owner override); a block already applied
+    is idempotent; a different block after lock-in raises (one-way); a block
+    that is not an era start raises."""
+    block = int(block or 0)
+    if block <= 0 or configured_shared_ladder_block(cfg):
+        return cfg
+    if not shared_ladder_configured(cfg.eval):
+        return cfg
+    have = resolved_shared_ladder_block(cfg)
+    if have == block:
+        return cfg
+    if have:
+        raise ValueError(f"shared ladder {have} already applied; a lock-in is one-way and "
+                         f"cannot move it to {block}")
+    if block % int(era_length_blocks(cfg.round, block - 1)):
+        raise ValueError(f"shared-ladder block {block} is not an era start (DEC-CA-0068 "
+                         "switches the draw only at a fresh era)")
+    return replace(cfg, eval=replace(cfg.eval, shared_ladder_from_block=block),
+                   activation=replace(cfg.activation, resolved_shared_ladder_block=block))
+
+
 def apply_activation(cfg: ChainConfig, block: int) -> ChainConfig:
     """The config the owner would have typed for a rollover at ``block``.
 
@@ -1212,6 +1293,14 @@ def apply_receipt_activation(cfg: ChainConfig, receipt: Any) -> ChainConfig:
         except ValueError as e:
             log.warning("activation: receipt image-decoupled block %d not applied to the "
                         "audit config (%s)", idb, e)
+    # DEC-CA-0068: the fleet-decided shared-ladder block, likewise.
+    slb = int(getattr(receipt, "shared_ladder_block", 0) or 0)
+    if slb and not configured_shared_ladder_block(cfg):
+        try:
+            cfg = apply_shared_ladder_activation(cfg, slb)
+        except ValueError as e:
+            log.warning("activation: receipt shared-ladder block %d not applied to the "
+                        "audit config (%s)", slb, e)
     return cfg
 
 
@@ -1228,7 +1317,8 @@ def own_signal_payload(cfg: ChainConfig, record: ActivationRecord,
                        prelaunch_record: ActivationRecord | None = None,
                        netconfig_segment: ReadySignal | None = None,
                        in_force: ChainConfig | None = None,
-                       image_decoupled_record: ActivationRecord | None = None) -> str | None:
+                       image_decoupled_record: ActivationRecord | None = None,
+                       shared_ladder_record: ActivationRecord | None = None) -> str | None:
     """The note this node should have on chain right now (``None`` when
     signalling is off): plain readiness until lock-in, then the agreed block
     — per segment. With no forfeiture decided on chain the note is exactly
@@ -1242,7 +1332,8 @@ def own_signal_payload(cfg: ChainConfig, record: ActivationRecord,
     that config TYPES: an overlay that types a decided block frees its room.
     Both default off, so the note is byte-identical without an overlay."""
     parts = _own_note_parts(cfg, record, forfeit_record, margin_v2_record, prelaunch_record,
-                            netconfig_segment, in_force, image_decoupled_record)
+                            netconfig_segment, in_force, image_decoupled_record,
+                            shared_ladder_record)
     if parts is None:
         return None
     head, extras, tail = parts
@@ -1269,6 +1360,7 @@ def _own_note_parts(cfg: ChainConfig, record: ActivationRecord,
                     netconfig_segment: ReadySignal | None = None,
                     in_force: ChainConfig | None = None,
                     image_decoupled_record: ActivationRecord | None = None,
+                    shared_ladder_record: ActivationRecord | None = None,
                     ) -> tuple[ReadySignal, list[ReadySignal], list[ReadySignal]] | None:
     """``(head, extras, tail)`` of :func:`own_signal_payload`'s note BEFORE the
     128-byte trim (``None`` = no note). Shared with
@@ -1299,6 +1391,12 @@ def _own_note_parts(cfg: ChainConfig, record: ActivationRecord,
     if (v2b is not None and v2b.decided_on_chain
             and not (typed is not None and configured_image_decoupled_block(typed))):
         extras.append(_segment_for(v2b, image_decoupled_record))
+    # DEC-CA-0068 rides after it (newer ⇒ trimmed before it); the 4-letter
+    # prefix keeps the mainnet note under the budget with every segment locked.
+    lad = shared_ladder_feature(cfg)
+    if (lad is not None and lad.decided_on_chain
+            and not (typed is not None and configured_shared_ladder_block(typed))):
+        extras.append(_segment_for(lad, shared_ladder_record))
     tail = [netconfig_segment] if netconfig_segment is not None else []
     if not primary.decided_on_chain and not extras and not tail:
         return None                                  # typed-in rollover: the note is inert
@@ -1354,7 +1452,8 @@ def note_trimmed_segments(cfg: ChainConfig, record: ActivationRecord | None = No
                           prelaunch_record: ActivationRecord | None = None,
                           netconfig_segment: ReadySignal | None = None,
                           in_force: ChainConfig | None = None,
-                          image_decoupled_record: ActivationRecord | None = None) -> list[str]:
+                          image_decoupled_record: ActivationRecord | None = None,
+                          shared_ladder_record: ActivationRecord | None = None) -> list[str]:
     """The feature names this node's note would DROP right now to fit
     :data:`NOTE_MAX_BYTES` (newest first, exactly as :func:`own_signal_payload`
     trims), with its CURRENT records. ``[]`` = everything is signalled. Used
@@ -1362,7 +1461,7 @@ def note_trimmed_segments(cfg: ChainConfig, record: ActivationRecord | None = No
     does not cast."""
     parts = _own_note_parts(cfg, record or ActivationRecord(), forfeit_record,
                             margin_v2_record, prelaunch_record, netconfig_segment, in_force,
-                            image_decoupled_record)
+                            image_decoupled_record, shared_ladder_record)
     if parts is None:
         return []
     head, extras, tail = parts
@@ -1403,13 +1502,14 @@ def ensure_signal(client: Any, cfg: ChainConfig, record: ActivationRecord, *,
                   prelaunch_record: ActivationRecord | None = None,
                   netconfig_segment: ReadySignal | None = None,
                   in_force: ChainConfig | None = None,
-                  image_decoupled_record: ActivationRecord | None = None) -> bool:
+                  image_decoupled_record: ActivationRecord | None = None,
+                  shared_ladder_record: ActivationRecord | None = None) -> bool:
     """Write this validator's note unless the chain already carries it.
     Returns True when a write happened. Never raises (a failed write is
     retried on the next call)."""
     want = own_signal_payload(cfg, record, forfeit_record, margin_v2_record,
                               prelaunch_record, netconfig_segment, in_force,
-                              image_decoupled_record)
+                              image_decoupled_record, shared_ladder_record)
     if want is None:
         return False
     try:
@@ -1432,7 +1532,9 @@ def summary(cfg: ChainConfig, record: ActivationRecord, t: Tally | None,
             prelaunch_record: ActivationRecord | None = None,
             prelaunch_tally: Tally | None = None,
             image_decoupled_record: ActivationRecord | None = None,
-            image_decoupled_tally: Tally | None = None) -> dict:
+            image_decoupled_tally: Tally | None = None,
+            shared_ladder_record: ActivationRecord | None = None,
+            shared_ladder_tally: Tally | None = None) -> dict:
     """Presentational block for ``status/chain.json`` / dashboards."""
     out: dict = {
         "feature": cfg.activation.feature,
@@ -1509,4 +1611,19 @@ def summary(cfg: ChainConfig, record: ActivationRecord, t: Tally | None,
         if trim:
             io["note_problem"] = trim
         out["image_decoupled"] = io
+    lad = shared_ladder_feature(cfg)
+    if lad is not None:
+        rec = shared_ladder_record or ActivationRecord()
+        lo: dict = {
+            "feature": lad.name,
+            "shared_ladder_windows": int(cfg.eval.shared_ladder_windows),
+            "scored_horizons": [int(h) for h in cfg.eval.scored_horizons],
+            "typed_block": int(lad.typed_block),
+            "lock_block": int(rec.lock_block),
+            "activation_block": int(rec.activation_block),
+            "source": rec.source,
+        }
+        if shared_ladder_tally is not None:
+            lo["tally"] = shared_ladder_tally.to_json()
+        out["shared_ladder"] = lo
     return out

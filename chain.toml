@@ -577,6 +577,29 @@ scored_horizons   = [64, 256, 720]
 scored_from_block = 8992800      # = [round] duel_from_block — LIVE on main since
                                  # 2026-09-04; no longer tied to funded_activation_block
                                  # (which moved to 9046800). DO NOT move a passed gate.
+# DEC-CA-0068 shared-series ladder — DECIDED ON CHAIN (DEC-CA-0045 vote, note
+# segment "lad-<8 hex>" = sha256("shared-ladder/2|<windows>|<horizons>|batch=32")). From
+# shared_ladder_from_block every rung above scores the SAME shared_ladder_windows
+# series: ONE even-by-domain draw over ALL of the snapshot's series (the 2026-11-12
+# snapshot holds 4525; sales, the scarce domain, contributes all 423), no longer
+# n_windows / the v2 budget split across rungs. A series shorter than a rung keeps
+# 64 steps of history and its whole tail as the target, NaN-PADDED to the horizon;
+# the scorer masks the padded steps; the quantile head decodes in FIXED batches of
+# 32 consecutive same-horizon windows (~10x batch 1). Lock-in writes the first era start after it;
+# a typed block (an era start >= scored_from_block) is the owner override.
+# CHANGING shared_ladder_windows after release is a fresh vote / a new typed block.
+# TYPED (owner 2026-11-12, "4k per horizon ... want it out now"): 9494100 = the FIRST
+# settlement of the era starting 9493200 (Fri 13 Nov 01:23 UTC) — exactly where the
+# DEC-CA-0067 quantile head starts (the settlement AT 9493200 is the previous era's
+# last and keeps the sample path). The main validator is the network's only full
+# evaluator, so every scorer and every audit replay reads this release value; the
+# vote is not needed (a typed block is the owner override — nothing is signalled).
+shared_ladder_windows    = 4000
+shared_ladder_from_block = 9494100
+# Fork guard (CONSENSUS): the lad- name the two values above hash to. A validator /
+# trainer / audit whose chain.toml lacks it — or computes another — REFUSES to start
+# (a node without the rule would keep the per-rung draw after the switch).
+shared_ladder_feature    = "lad-556b1b98"
 
 # Public-benchmark logging (LOG-ONLY; never feeds scoring/weights/KOTH). Runs
 # out of process via the benchmarks/ sidecar; best-effort. See benchmarks/README.md.

@@ -35,11 +35,18 @@ _LIVE_CREDENTIAL_ENV = (
 def _vote_pin_mode_is_per_test():
     """DEC-CA-0067: a test that runs a validator/trainer/audit ``main`` turns
     the process-wide vote-pin guard on; never leak it into the next test."""
-    from cascade.shared.config.loader import require_vote_pin, vote_pin_required
+    from cascade.shared.config.loader import (
+        allow_missing_shared_ladder,
+        missing_shared_ladder_allowed,
+        require_vote_pin,
+        vote_pin_required,
+    )
 
     before = vote_pin_required()
+    lad_before = missing_shared_ladder_allowed()
     yield
     require_vote_pin(before)
+    allow_missing_shared_ladder(lad_before)
 
 
 @pytest.fixture(autouse=True)
