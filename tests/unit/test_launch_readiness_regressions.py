@@ -37,6 +37,40 @@ def test_stale_worker_pin_is_rejected_before_a_paid_launch():
         check_worker_release(cfg)
 
 
+def test_after_launch_the_trainer_tree_need_not_match_the_image_pin(cfg, tmp_path):
+    """2026-11-12: every trainer release after the pinned worker image blocked
+    the king leg (only king legs pass the launch preflight). After a verified
+    launch root exists, the pin names the image (pods verify themselves); the
+    image pins must still name one release."""
+    from cascade.trainer import launch_preflight as lp
+
+    stale = replace(cfg, v2=replace(cfg.v2, from_block=43200),
+                    round=replace(cfg.round, worker_code_fingerprint="0" * 64,
+                                  funded_pod_image="fixture/image@sha256:" + "a" * 64),
+                    training=replace(cfg.training, v2_contract=replace(
+                        cfg.training.v2_contract, train_image_digest="sha256:" + "a" * 64)))
+    with pytest.raises(ValueError, match="rebuild from this source"):
+        check_worker_release(stale)                               # launch day: refused
+    check_worker_release(stale, launched=True)                    # after launch: the image is pinned
+    with pytest.raises(ValueError, match="same release"):
+        check_worker_release(replace(stale, round=replace(
+            stale.round, funded_pod_image="fixture/image@sha256:" + "b" * 64)), launched=True)
+
+    # ready(): the launch root's presence is what marks "after launch".
+    seen = []
+    real = lp.check_worker_release
+    lp_check = lambda c, *, launched=False: seen.append(launched) or real(c, launched=launched)  # noqa: E731
+    try:
+        lp.check_worker_release = lp_check
+        with pytest.raises(ValueError, match="rebuild from this source"):
+            lp.ready(stale, "fixture/gen@sha256:" + "c" * 64, tmp_path)
+        (tmp_path / "v2-launch.json").write_text("{}")
+        assert lp.ready(stale, "fixture/gen@sha256:" + "c" * 64, tmp_path) is False   # no proof match
+    finally:
+        lp.check_worker_release = real
+    assert seen == [False, True]
+
+
 def test_worker_release_requires_matching_fingerprint_and_image_pins(cfg):
     root = Path(__file__).resolve().parents[2]
     fingerprint = canonical_fingerprint((str(p.relative_to(root)), hashlib.sha256(p.read_bytes()).hexdigest())

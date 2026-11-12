@@ -11,8 +11,18 @@ from ..shared.atomic import write_text_atomic
 from ..shared.manifest import contract_digest
 
 
-def check_worker_release(cfg):
-    """Check release pins before the dated launch, without renting a pod."""
+def check_worker_release(cfg, *, launched: bool = False):
+    """Check release pins before the dated launch, without renting a pod.
+
+    ``launched`` (a verified ``v2-launch.json`` root exists): the whole-tree
+    comparison of THIS process's source against ``[round]
+    worker_code_fingerprint`` is a launch-day check only. After launch the
+    trainer ships its own releases while the pods keep the pinned image, so
+    the two legitimately differ; the pin names the image and every pod
+    verifies its own code against it (provision health, leg pins). Comparing
+    the trainer's tree blocked every king leg after the first trainer release
+    past the image (2026-11-12: era 2637 king leg refused for 7 h). The image
+    pins must still name one release."""
     if not cfg.v2.launch_at_utc and not cfg.v2.from_block:
         return
     from ..provision.codeprint import canonical_fingerprint
@@ -39,7 +49,7 @@ def check_worker_release(cfg):
         if not st.usable:
             raise ValueError(f"v2 after release is not qualified (owner rule): {st.reason}")
         return
-    if cfg.round.worker_code_fingerprint != current:
+    if cfg.round.worker_code_fingerprint != current and not launched:
         raise ValueError("v2 worker image is not qualified for this release: rebuild from this source "
                          f"and repin worker_code_fingerprint (expected {current}) and image digests")
     image = image_digest_of(cfg.round.funded_pod_image)
@@ -75,7 +85,7 @@ def qualify(cfg, ref, work_root):
     from ..miner.verify import verify_repo
     from ..shared.hippius import HubConfig, fetch_from_hub
 
-    check_worker_release(cfg)
+    check_worker_release(cfg, launched=(Path(work_root) / "v2-launch.json").exists())
     expected = identity(cfg, ref)
     effective = with_contract(cfg.for_king(ref), cfg.training.v2_contract)
     with tempfile.TemporaryDirectory(prefix="cascade-v2-baseline-") as directory:
@@ -89,12 +99,12 @@ def qualify(cfg, ref, work_root):
 
 
 def ready(cfg, ref, work_root):
-    check_worker_release(cfg)
+    root = Path(work_root) / "v2-launch.json"
+    check_worker_release(cfg, launched=root.exists())
     expected = identity(cfg, ref)
     anchor = cfg.manifest.validator_hotkey
     if not anchor:
         raise ValueError("v2 launch needs a pinned validator receipt anchor")
-    root = Path(work_root) / "v2-launch.json"
     for path in (root, proof_path(work_root, ref)):
         try:
             proof = json.loads(path.read_text())
