@@ -577,6 +577,18 @@ scored_horizons   = [64, 256, 720]
 scored_from_block = 8992800      # = [round] duel_from_block — LIVE on main since
                                  # 2026-09-04; no longer tied to funded_activation_block
                                  # (which moved to 9046800). DO NOT move a passed gate.
+# DEC-CA-0068 shared-series ladder — DECIDED ON CHAIN (DEC-CA-0045 vote, note
+# segment "lad-<8 hex>" = sha256("shared-ladder/1|<windows>|<horizons>")). From
+# shared_ladder_from_block every rung above scores the SAME shared_ladder_windows
+# series: ONE even-by-domain draw over ALL of the snapshot's series (the 2026-11-12
+# snapshot holds 4525; sales, the scarce domain, contributes all 423), no longer
+# n_windows / the v2 budget split across rungs. A series shorter than a rung keeps
+# 64 steps of history and its whole tail as the target, NaN-PADDED to the horizon;
+# the scorer masks the padded steps. Lock-in writes the first era start after it;
+# a typed block (an era start >= scored_from_block) is the owner override.
+# 0 here = vote; CHANGING shared_ladder_windows after release is a fresh vote.
+shared_ladder_windows    = 4000
+shared_ladder_from_block = 0
 
 # Public-benchmark logging (LOG-ONLY; never feeds scoring/weights/KOTH). Runs
 # out of process via the benchmarks/ sidecar; best-effort. See benchmarks/README.md.

@@ -25,6 +25,7 @@ from .scoring import (
     _init_gate_mode,
     _margin_mode,
     check_margin_v2,
+    check_shared_ladder,
     parse_bench_workers,
 )
 from .sections import (
@@ -230,6 +231,10 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
     _mv2_blocks = int(s.get("margin_warmup_blocks_v2", 0) or 0)
     _mv2_from = int(s.get("margin_v2_from_block", 0) or 0)
     check_margin_v2(_mv2_start, _mv2_end, _mv2_blocks, _mv2_from)
+    check_shared_ladder(int(e.get("shared_ladder_windows", 0) or 0),
+                        int(e.get("shared_ladder_from_block", 0) or 0),
+                        tuple(e.get("scored_horizons", ()) or ()),
+                        int(e.get("scored_from_block", 0) or 0))
     _rolling = max(0, int(r.get("rolling_from_block", 0) or 0))
     _era_king = max(0, int(s.get("era_king_from_block", 0) or 0))
     _tenure_blocks = max(0, int(s.get("tenure_blocks_from_block", 0) or 0))
@@ -578,6 +583,8 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
             calib_num_samples=int(e.get("calib_num_samples", 32)),
             scored_horizons=tuple(int(h) for h in e.get("scored_horizons", ())),
             scored_from_block=int(e.get("scored_from_block", 0) or 0),
+            shared_ladder_windows=int(e.get("shared_ladder_windows", 0) or 0),
+            shared_ladder_from_block=int(e.get("shared_ladder_from_block", 0) or 0),
             bench_hold_max_hours=float(e.get("bench_hold_max_hours", 2.0)),
             bench_workers=parse_bench_workers(e.get("bench_workers", "auto")),
             bench_paired=bool(e.get("bench_paired", True)),

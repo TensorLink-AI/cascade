@@ -13,6 +13,7 @@ from ..shared.activation import (
     apply_image_decoupled_activation,
     apply_margin_v2_activation,
     apply_prelaunch_burn_activation,
+    apply_shared_ladder_activation,
     ensure_signal,
     forfeit_feature,
     image_decoupled_feature,
@@ -24,6 +25,8 @@ from ..shared.activation import (
     resolved_margin_v2_block,
     resolved_prelaunch_burn_block,
     resolved_rollover,
+    resolved_shared_ladder_block,
+    shared_ladder_feature,
 )
 from .weights import WEIGHTS_RATE_LIMIT_BLOCKS
 
@@ -101,6 +104,7 @@ class ActivationMixin:
             self._margin_v2_step(client, now_block=now_block)
             self._prelaunch_step(client, now_block=now_block)
             self._image_decoupled_step(client, now_block=now_block)
+            self._shared_ladder_step(client, now_block=now_block)
             self._netconfig_step(client, now_block=now_block)
         except Exception as e:  # noqa: BLE001 — activation must never disturb a round
             log.warning("activation step failed (%s); retrying next poll", e)
@@ -286,6 +290,51 @@ class ActivationMixin:
                 and self.apply_image_decoupled_block(self._image_decoupled.activation_block)):
             self._ensure_own_signal(client)
 
+    @property
+    def shared_ladder_block(self) -> int:
+        """The DEC-CA-0068 shared-ladder block resolved FROM VALIDATOR SIGNALS
+        and applied to the live config (0 = none, or typed into chain.toml) —
+        stamped on receipts so the audit replays the draw."""
+        return resolved_shared_ladder_block(self.cfg)
+
+    def _shared_ladder_store(self) -> ActivationStore | None:
+        store = self.activation_store
+        if store is None or store.path is None:
+            return None
+        return ActivationStore(store.path.with_name("activation_shared_ladder_state.json"))
+
+    def apply_shared_ladder_block(self, block: int) -> bool:
+        """Write the fleet-decided shared-ladder block into the live config
+        (``[eval] shared_ladder_from_block``). Returns True when it changed."""
+        new_cfg = apply_shared_ladder_activation(self.cfg, block)
+        if new_cfg is self.cfg:
+            return False
+        self.cfg = new_cfg
+        log.warning("activation: DEC-CA-0068 shared-series ladder ARMED at block %d — from "
+                    "that era start every rung of %s scores the same %d series (NaN-padded "
+                    "where short)", new_cfg.eval.shared_ladder_from_block,
+                    list(new_cfg.eval.scored_horizons), new_cfg.eval.shared_ladder_windows)
+        return True
+
+    def _shared_ladder_step(self, client: object, *, now_block: int) -> None:
+        """The shared ladder's own resolver pass (same tally rule, its own
+        record). No-op without the rule or under a typed block."""
+        spec = shared_ladder_feature(self.cfg)
+        if spec is None or not spec.decided_on_chain:
+            return
+        res = resolve_activation(self.cfg, client, now_block=int(now_block),
+                                 record=self._shared_ladder, feature=spec)
+        if res.tally is not None:
+            self._shared_ladder_tally = res.tally
+        if res.changed:
+            self._shared_ladder = res.record
+            store = self._shared_ladder_store()
+            if store is not None:
+                store.save(res.record)
+        if (self._shared_ladder.locked and self._shared_ladder.source != "config"
+                and self.apply_shared_ladder_block(self._shared_ladder.activation_block)):
+            self._ensure_own_signal(client)
+
     def _v2b_typed_notice_startup(self, store: ActivationStore | None, head: int) -> None:
         """DEC-CA-0067 rule 2: a TYPED v2b switch must give the vote's notice
         (:func:`cascade.shared.activation.v2b_typed_notice_problem`). The
@@ -315,7 +364,8 @@ class ActivationMixin:
         seg, in_force = self._netconfig_note_parts()
         want = own_signal_payload(self._base_cfg(), self._activation, self._forfeit,
                                   self._margin_v2, self._prelaunch, seg, in_force,
-                                  self._image_decoupled)
+                                  self._image_decoupled,
+                                  shared_ladder_record=self._shared_ladder)
         if want is None or want == self._signal_sent:
             return
         v2b = image_decoupled_feature(self._base_cfg())
@@ -339,6 +389,7 @@ class ActivationMixin:
                       prelaunch_record=self._prelaunch,
                       netconfig_segment=seg, in_force=in_force,
                       image_decoupled_record=self._image_decoupled,
+                      shared_ladder_record=self._shared_ladder,
                       current=have)
 
     def _activation_startup(self, client: object) -> None:
@@ -387,6 +438,14 @@ class ActivationMixin:
                          "%d, via %s)", self._image_decoupled.lock_block,
                          self._image_decoupled.activation_block, self._image_decoupled.source)
                 self.apply_image_decoupled_block(self._image_decoupled.activation_block)
+        lstore, lspec = self._shared_ladder_store(), shared_ladder_feature(self.cfg)
+        if lstore is not None and lspec is not None:
+            self._shared_ladder = record_for(self.cfg, lstore.load(), lspec)
+            if self._shared_ladder.locked and self._shared_ladder.source != "config":
+                log.info("activation: restored shared-ladder lock-in (block %d, draw from "
+                         "%d, via %s)", self._shared_ladder.lock_block,
+                         self._shared_ladder.activation_block, self._shared_ladder.source)
+                self.apply_shared_ladder_block(self._shared_ladder.activation_block)
         from ..shared.activation import v2b_note_problem
 
         try:
@@ -418,7 +477,8 @@ class ActivationMixin:
         # at startup, with the remedy.
         for feature in note_trimmed_segments(self._base_cfg(), self._activation, self._forfeit,
                                              self._margin_v2, self._prelaunch,
-                                             image_decoupled_record=self._image_decoupled):
+                                             image_decoupled_record=self._image_decoupled,
+                                             shared_ladder_record=self._shared_ladder):
             log.warning("activation: STARTUP — this node's note exceeds %d bytes; segment %r "
                         "will NOT be signalled (vote silently dropped). Free room: type the "
                         "decided [scoring] forfeit_from_block / margin_v2_from_block, or "

@@ -1124,6 +1124,12 @@ def publish_trainer_v2_status(sched, block: int, *, min_interval_s: float = MIN_
             for section in ("lane_b", "lane_c", "marketcast", "generator", "generation", "eval", "scoring"):
                 doc["policy"][section] = asdict(getattr(cfg, section))
             doc["policy"]["eval"]["n_windows"] = cfg.eval_windows_at(start, settlement=False)
+            from .config import shared_ladder_active
+
+            if shared_ladder_active(cfg.eval, start) and cfg.eval.scored_horizons:
+                # DEC-CA-0068: the rule's own count, every rung — not the budget
+                doc["policy"]["eval"]["n_windows"] = (
+                    int(cfg.eval.shared_ladder_windows) * len(cfg.eval.scored_horizons))
             if (cfg.v2.eval_n_windows or (
                     cfg.v2.eval_n_windows_after and image_decoupled_era(cfg, start))) \
                     and cfg.v2.active(start):

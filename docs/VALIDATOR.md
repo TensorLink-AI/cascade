@@ -309,13 +309,30 @@ For a supported overlay, follow its adoption/effective-block evidence without
 manually changing constants. Confirm the applied config identity and next
 settlement's vector agree with the expected network state.
 
+### Shared-series horizon ladder (DEC-CA-0068)
+
+From its decided block, every rung of `[eval] scored_horizons` (64 / 256 / 720)
+scores the SAME `[eval] shared_ladder_windows` series (4000): one seeded
+even-by-domain draw over all of the snapshot's series, one window per series
+per rung. A series too short for a rung keeps 64 steps of history and its
+whole tail as the target, NaN-padded to the horizon; the scorer masks the
+padded steps. Nothing to configure: a validator on the release signals the
+`lad-<hash>` segment, lock-in at 51% of stake writes
+`shared_ladder_from_block` (the first era start after it), receipts carry
+`shared_ladder_block`, and `cascade-audit` replays each round under its own
+rule (`shared-ladder` row). Before the block — and for every older receipt —
+the per-rung ladder keyed on the window budget applies unchanged.
+`decisions/DEC-CA-0068-shared-series-ladder.md`.
+
 ### Stake-based activation
 
 Some changes are decided on chain by validator stake (DEC-CA-0045). At
 startup your validator posts one plain commitment from your hotkey — the
 readiness note, `cascade-ready:1:rolling-era-king:<lock>:<block>` plus one
 `<feature>:<lock>:<block>` segment per pending on-chain decision (king
-forfeiture `forfeit-<hash>`, dethrone bar v2 `margin-v2-<hash>`). You'll see
+forfeiture `forfeit-<hash>`, dethrone bar v2 `margin-v2-<hash>`, the
+DEC-CA-0067 bundle `v2b-<hash>`, the DEC-CA-0068 shared-series ladder
+`lad-<hash>`). You'll see
 `activation: signalled …` in the log. Posting is a signed `set_commitment`
 (the intent is logged before signing; a rejected extrinsic is retried next
 poll). At every boundary every validator sums the stake of permit-holding

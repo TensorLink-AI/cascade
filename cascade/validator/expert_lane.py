@@ -56,7 +56,12 @@ def verdict_windows(cfg, window_source, round_seed, *, block):
     so both score the identical set: the scored horizon ladder when active at
     ``block``, else the single-horizon rotating draw."""
     from ..shared.era import v2_eval_windows_at, v2_settlement_active
-    from .windows import ladder_windows_for_round, scored_ladder
+    from .windows import (
+        ladder_windows_for_round,
+        scored_ladder,
+        shared_ladder,
+        shared_ladder_windows_for_round,
+    )
 
     budget_fn = getattr(cfg, "eval_windows_at", None)
     budget = budget_fn(block) if budget_fn else cfg.eval.n_windows
@@ -68,6 +73,14 @@ def verdict_windows(cfg, window_source, round_seed, *, block):
         if v2_eval_windows_at(cfg, block) and v2_settlement_active(cfg, block):
             draw = getattr(window_source, "windows_for_verdict", draw)
         return draw(round_seed, budget, block=block)
+    n_shared = shared_ladder(cfg.eval, block)
+    if n_shared:
+        # DEC-CA-0068: the same series at every rung, NaN-padded where short;
+        # the count is the rule's own, not the window budget.
+        return shared_ladder_windows_for_round(
+            window_source, horizons=horizons, n_windows=n_shared,
+            context_length=cfg.eval.context_length, round_seed=round_seed, block=block,
+        )
     return ladder_windows_for_round(
         window_source, horizons=horizons, n_windows=budget,
         context_length=cfg.eval.context_length, round_seed=round_seed, block=block,
