@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 import json
 import tomllib
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -47,7 +48,6 @@ def base_raw(owner: str | None = None) -> dict:
                           margin_warmup_blocks_v2=0, margin_v2_from_block=0)
     raw["v2"]["prelaunch_burn"] = 0.0
     raw["v2"]["launch_at_utc"] = ""
-    raw["eval"]["shared_ladder_windows"] = 0          # no DEC-CA-0068 "lad-" vote either
     raw["v2"]["commit_open_at_utc"] = ""
     raw["v2"]["commit_from_block"] = 0
     raw["netconfig"] = {"owner_hotkey": OWNER.ss58_address if owner is None else owner}
@@ -458,7 +458,10 @@ def test_note_trimming_drops_older_segments_before_the_cfg_segment():
 
 
 def test_cfg_segment_alone_keeps_a_typed_rollover_note_alive():
+    # the DEC-CA-0068 "lad-" vote disarmed in memory (the loader's pin refuses
+    # a config file without it in voting processes) so the note is cfg- only
     cfg = base_cfg()
+    cfg = replace(cfg, eval=replace(cfg.eval, shared_ladder_windows=0, shared_ladder_feature=""))
     rec = A.ActivationRecord()
     assert A.own_signal_payload(cfg, rec) is None             # typed rollover: inert
     note = A.own_signal_payload(cfg, rec, netconfig_segment=A.ReadySignal("cfg-0123abcd"))
