@@ -834,6 +834,25 @@ def vote_pin_required() -> bool:
     return _REQUIRE_VOTE_PIN
 
 
+# DEC-CA-0068: a satellite signals the shared-ladder vote but never draws or
+# scores windows (it replays the main validator's signed receipts), so a
+# satellite config WITHOUT the rule only means it does not vote — harmless.
+# It logs an ERROR and keeps running instead of refusing (and going dark on
+# weights over an eval knob it never uses). A config whose keys compute a
+# DIFFERENT name still refuses: that would put a wrong vote on chain.
+_SHARED_LADDER_MISSING_OK = False
+
+
+def allow_missing_shared_ladder(enabled: bool = True) -> None:
+    """Called by the satellite ``main`` only (see above)."""
+    global _SHARED_LADDER_MISSING_OK
+    _SHARED_LADDER_MISSING_OK = bool(enabled)
+
+
+def missing_shared_ladder_allowed() -> bool:
+    return _SHARED_LADDER_MISSING_OK
+
+
 def _shared_ladder_pin(value) -> str:
     if not isinstance(value, str):
         raise ValueError(f"[eval] shared_ladder_feature must be a string; got {value!r}")
@@ -861,13 +880,16 @@ def check_shared_ladder_feature(cfg) -> None:
               f"scored_horizons={list(horizons)}")
     applies = bool(cfg.activation.enabled) and bool(horizons)
     why = ""
+    missing = False
     if applies and not want:
+        missing = True
         why = (f"[eval] shared_ladder_windows is not set ({inputs}): this release judges "
                "the DEC-CA-0068 shared-series ladder once the fleet decides it, and a node "
                "without it would keep the per-rung draw after the switch. Deploy the release "
                "chain.toml values ([eval] shared_ladder_windows, shared_ladder_from_block and "
                "shared_ladder_feature)")
     elif applies and not pinned:
+        missing = True
         why = (f"[eval] shared_ladder_feature is not pinned: this config votes on {want} "
                f"({inputs}). Deploy the release chain.toml values")
     elif pinned and pinned != want:
@@ -877,9 +899,17 @@ def check_shared_ladder_feature(cfg) -> None:
                "to the release values")
     if not why:
         return
-    if _REQUIRE_VOTE_PIN:
+    if _REQUIRE_VOTE_PIN and not (missing and _SHARED_LADDER_MISSING_OK):
         raise ValueError(why + " — refusing to start (this process votes on or acts on the "
                          "shared-ladder vote)")
+    if missing and _SHARED_LADDER_MISSING_OK:
+        import logging
+
+        logging.getLogger("cascade.config").error(
+            "%s — satellite continuing: it does NOT vote on the shared-series ladder until "
+            "its chain.toml carries the release values (it never scores windows, so its "
+            "receipts and weights are unaffected)", why)
+        return
     import logging
 
     logging.getLogger("cascade.config").error(

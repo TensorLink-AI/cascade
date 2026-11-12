@@ -789,9 +789,12 @@ def run_from_args(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     # DEC-CA-0067: the satellite signals and tallies the v2b vote — a config
     # whose pinned feature is missing or wrong refuses to load
-    from ..shared.config.loader import require_vote_pin
+    from ..shared.config.loader import allow_missing_shared_ladder, require_vote_pin
 
     require_vote_pin()
+    # DEC-CA-0068: a satellite never draws windows — a config without the
+    # shared ladder only skips that vote (logged), a wrong one still refuses
+    allow_missing_shared_ladder()
     from ..shared.env import load_env_files
 
     load_env_files()

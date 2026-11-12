@@ -685,3 +685,38 @@ def test_the_pin_is_read_where_the_rule_applies():
     off = replace(shipped, activation=replace(shipped.activation, feature=""),
                   eval=replace(shipped.eval, shared_ladder_windows=0, shared_ladder_feature=""))
     check_shared_ladder_feature(off)                             # activation off, no pin: silent
+
+
+def test_a_satellite_without_the_keys_logs_and_keeps_running(tmp_path, voting, caplog):
+    from cascade.shared.config.loader import allow_missing_shared_ladder
+
+    allow_missing_shared_ladder()                 # what the satellite main sets
+    p = _edit(tmp_path, r"^shared_ladder_\w+\s*=.*$", "")
+    with caplog.at_level("ERROR", logger="cascade.config"):
+        c = load_chain_config(p)
+    assert A.shared_ladder_feature(c) is None    # it simply does not vote
+    assert any("satellite continuing" in r.getMessage() for r in caplog.records)
+    p = _edit(tmp_path, r"^shared_ladder_feature\s*=.*$", "")
+    load_chain_config(p)                          # count set, pin missing: also tolerated
+
+
+def test_a_satellite_with_a_wrong_name_still_refuses(tmp_path, voting):
+    from cascade.shared.config.loader import allow_missing_shared_ladder
+
+    allow_missing_shared_ladder()
+    p = _edit(tmp_path, r"^shared_ladder_windows\s*=.*$", "shared_ladder_windows = 2000")
+    with pytest.raises(ValueError, match="computes lad-.*refusing to start"):
+        load_chain_config(p)
+
+
+def test_only_the_satellite_relaxes_the_pin():
+    import inspect
+
+    from cascade.audit import main as audit_main
+    from cascade.trainer import main as trainer_main
+    from cascade.validator import main as validator_main
+    from cascade.validator import satellite
+
+    assert "allow_missing_shared_ladder()" in inspect.getsource(satellite.main)
+    for mod in (validator_main, trainer_main, audit_main):
+        assert "allow_missing_shared_ladder" not in inspect.getsource(mod)
