@@ -98,6 +98,12 @@ class EvalConfig:
     # and the trainer run the same values before the block.
     shared_ladder_windows: int = 0
     shared_ladder_from_block: int = 0
+    # DEC-CA-0068 fork guard: the ``lad-`` feature name this config must vote
+    # on (the DEC-CA-0067 ``image_decoupled_feature`` pattern). Required
+    # whenever ``[activation]`` is on and ``scored_horizons`` is set; a config
+    # missing it or computing another name REFUSES to start the validator,
+    # trainer and audit (:func:`cascade.shared.config.loader.check_shared_ladder_feature`).
+    shared_ladder_feature: str = ""
     # Ceiling, in hours, on one public-benchmark sweep of a duel checkpoint
     # when the battery is uncapped (``cascade_bench_max_series = 0``): the
     # remote bench timeout trainer.main hands the BenchPlan (a capped battery

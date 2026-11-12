@@ -589,6 +589,10 @@ scored_from_block = 8992800      # = [round] duel_from_block — LIVE on main si
 # 0 here = vote; CHANGING shared_ladder_windows after release is a fresh vote.
 shared_ladder_windows    = 4000
 shared_ladder_from_block = 0
+# Fork guard (CONSENSUS): the lad- name the two values above hash to. A validator /
+# trainer / audit whose chain.toml lacks it — or computes another — REFUSES to start
+# (a node without the rule would keep the per-rung draw after the switch).
+shared_ladder_feature    = "lad-d0b94833"
 
 # Public-benchmark logging (LOG-ONLY; never feeds scoring/weights/KOTH). Runs
 # out of process via the benchmarks/ sidecar; best-effort. See benchmarks/README.md.

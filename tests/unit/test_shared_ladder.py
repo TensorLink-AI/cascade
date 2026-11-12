@@ -618,3 +618,70 @@ def test_netconfig_effective_raw_writes_the_resolved_block(cfg):
     assert effective_raw(c)["eval"]["shared_ladder_from_block"] == B0 + 3600
     assert "shared_ladder_from_block" not in effective_raw(_typed(cfg)).get("eval", {}) or \
         effective_raw(_typed(cfg))["eval"]["shared_ladder_from_block"] == 0
+
+
+# ── the fork guard: the release pin ────────────────────────────────
+
+
+@pytest.fixture
+def voting():
+    """A validator / trainer / audit process (their ``main`` sets this)."""
+    from cascade.shared.config.loader import require_vote_pin
+
+    require_vote_pin()          # reset after the test by tests/conftest.py
+
+
+def _edit(tmp_path, pattern, repl):
+    src = DEFAULT_CHAIN_TOML.read_text()
+    out, n = re.subn(pattern, repl, src, flags=re.M)
+    assert n >= 1, pattern
+    p = tmp_path / "chain.toml"
+    p.write_text(out)
+    return p
+
+
+def test_release_config_loads_with_the_pin(voting):
+    c = load_chain_config(DEFAULT_CHAIN_TOML)
+    assert c.eval.shared_ladder_feature == "lad-d0b94833"
+    assert c.eval.shared_ladder_feature == A.shared_ladder_feature(c).name
+    load_chain_config(REPO / "chain.testnet.toml")              # no ladder there: exempt
+
+
+def test_a_deployed_config_without_the_keys_refuses_to_start(tmp_path, voting):
+    # the main validator's deployed chain.toml today: ladder on, no shared keys
+    p = _edit(tmp_path, r"^shared_ladder_\w+\s*=.*$", "")
+    with pytest.raises(ValueError, match="shared_ladder_windows is not set.*refusing to start"):
+        load_chain_config(p)
+
+
+def test_a_missing_pin_refuses(tmp_path, voting):
+    p = _edit(tmp_path, r"^shared_ladder_feature\s*=.*$", "")
+    with pytest.raises(ValueError, match="shared_ladder_feature is not pinned.*lad-d0b94833"):
+        load_chain_config(p)
+
+
+def test_another_count_than_the_pin_refuses(tmp_path, voting):
+    p = _edit(tmp_path, r"^shared_ladder_windows\s*=.*$", "shared_ladder_windows = 2000")
+    with pytest.raises(ValueError, match="computes lad-"):
+        load_chain_config(p)
+    p = _edit(tmp_path, r"^shared_ladder_windows\s*=.*$", "shared_ladder_windows = 0")
+    with pytest.raises(ValueError, match="shared_ladder_windows is not set"):
+        load_chain_config(p)
+
+
+def test_a_non_voting_process_logs_and_keeps_working(tmp_path, caplog):
+    p = _edit(tmp_path, r"^shared_ladder_\w+\s*=.*$", "")
+    with caplog.at_level("ERROR", logger="cascade.config"):
+        c = load_chain_config(p)
+    assert c.eval.shared_ladder_windows == 0
+    assert any("shared_ladder_windows is not set" in r.getMessage() for r in caplog.records)
+
+
+def test_the_pin_is_read_where_the_rule_applies():
+    from cascade.shared.config.loader import check_shared_ladder_feature
+
+    shipped = load_chain_config(DEFAULT_CHAIN_TOML)
+    check_shared_ladder_feature(shipped)                         # consistent: silent
+    off = replace(shipped, activation=replace(shipped.activation, feature=""),
+                  eval=replace(shipped.eval, shared_ladder_windows=0, shared_ladder_feature=""))
+    check_shared_ladder_feature(off)                             # activation off, no pin: silent
