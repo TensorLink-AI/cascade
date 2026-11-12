@@ -66,10 +66,14 @@ Three independent per-horizon draws of ~666 series each (today's 1998-window
 verdict) measure three different subsets of the pool. The owner wants one
 population judged at every horizon, and more of it: 4000 series at every
 rung is 12 000 scored windows per model against 1998 today. Private scoring
-runs on the offloaded GPU host (`--private-eval-hosts`), ~3.5–4.5 min per
-model for 1998 windows, so the budget is affordable; the quantile-head
-verdict (DEC-CA-0067, in force from era 2637) ships quantiles, not 100 sample
-paths, which keeps the transfer small.
+runs on the offloaded GPU host (`--private-eval-hosts`): 1998 windows took
+~3.5–8 min per model (Nov 2026), so 12 000 windows (6×) is ~20–47 min per
+model — close to the default `--private-eval-timeout` of 3600 s per model.
+Measure one 12 000-window evaluation on the private host before the vote can
+lock, and raise the timeout on any validator that needs it (operator-local,
+not consensus). The quantile-head verdict (DEC-CA-0067, in force from era
+2637) ships quantiles, not 100 sample paths: ~0.3 GB per model at 12 000
+windows, below today's sample-path transfer.
 
 NaN padding is what makes "the same 4000 at every horizon" possible: only
 3455 pool series are long enough for a 720-step target, and refusing the
@@ -93,6 +97,16 @@ reached. The alternative — growing the pool's short domains first — is the
   validator WARNS at startup and on every write). Typing the already-decided
   `[v2] prelaunch_burn_from_block = 9486900` into the release chain.toml frees
   33 bytes if headroom is ever needed.
+* Fork guard: the rule exists only where a node's chain.toml carries
+  `shared_ladder_windows`, so — like `[v2] image_decoupled_feature` — the
+  config pins `[eval] shared_ladder_feature = "lad-d0b94833"`. Wherever the
+  ladder can apply (`[activation]` on, `scored_horizons` set) a missing key or
+  a different computed name REFUSES the validator, trainer and audit at start
+  (other processes log an ERROR). Without it, a node on the release with an
+  older deployed chain.toml would neither signal nor apply the lock-in and
+  would keep the per-rung draw after the switch, silently. Deploying the
+  release therefore means adding the three `[eval] shared_ladder_*` keys to
+  every deployed chain.toml (the main validator's and the trainer's included).
 * Scorer: NaN-masked branches run only on a padded target; every finite
   target takes the unchanged code path, pinned by test.
 * Not touched: the training contract, seeds, `contract_digest`, the bench

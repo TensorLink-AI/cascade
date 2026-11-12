@@ -321,8 +321,12 @@ padded steps. Nothing to configure: a validator on the release signals the
 `shared_ladder_from_block` (the first era start after it), receipts carry
 `shared_ladder_block`, and `cascade-audit` replays each round under its own
 rule (`shared-ladder` row). Before the block — and for every older receipt —
-the per-rung ladder keyed on the window budget applies unchanged.
-`decisions/DEC-CA-0068-shared-series-ladder.md`.
+the per-rung ladder keyed on the window budget applies unchanged. Your
+deployed chain.toml MUST carry the release's three `[eval]
+shared_ladder_*` keys (including the `shared_ladder_feature` pin): without
+them the validator refuses to start rather than fork. Expect ~6× today's
+private-eval time per model; raise `--private-eval-timeout` (default 3600 s)
+if your private host needs it. `decisions/DEC-CA-0068-shared-series-ladder.md`.
 
 ### Stake-based activation
 
