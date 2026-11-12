@@ -371,13 +371,17 @@ def test_a_raising_probe_never_decides_the_round():
 def test_the_probe_script_reports_this_release(tmp_path):
     from cascade.shared.config.training import TrainingContractConfig
     from cascade.validator.eval_offload import WORKER_PROBE
-    from cascade.validator.private_worker import SCHEMA, SCHEMA_QUANTILES
+    from cascade.validator.private_worker import (
+        SCHEMA,
+        SCHEMA_QUANTILES,
+        SCHEMA_QUANTILES_BATCHED,
+    )
 
     proc = subprocess.run([sys.executable, "-c", WORKER_PROBE], capture_output=True, text=True,
                           check=True, timeout=300)
     info = json.loads(proc.stdout.strip().splitlines()[-1])
     assert set(info["contract_fields"]) == {f.name for f in dataclasses.fields(TrainingContractConfig)}
-    assert set(info["schemas"]) == {SCHEMA, SCHEMA_QUANTILES}
+    assert set(info["schemas"]) == {SCHEMA, SCHEMA_QUANTILES, SCHEMA_QUANTILES_BATCHED}
 
 
 def test_an_out_of_date_host_gets_no_upload(checkpoint, tmp_path):
