@@ -627,8 +627,10 @@ def test_netconfig_effective_raw_writes_the_resolved_block(cfg):
 
     c = A.apply_shared_ladder_activation(_typed(cfg), B0 + 3600)
     assert effective_raw(c)["eval"]["shared_ladder_from_block"] == B0 + 3600
-    assert "shared_ladder_from_block" not in effective_raw(_typed(cfg)).get("eval", {}) or \
-        effective_raw(_typed(cfg))["eval"]["shared_ladder_from_block"] == 0
+    # Nothing resolved on chain: the raw keeps whatever the toml typed (the
+    # release types 9494100), never a block the vote did not decide.
+    typed_raw = (cfg.raw or {}).get("eval", {}).get("shared_ladder_from_block")
+    assert effective_raw(_typed(cfg)).get("eval", {}).get("shared_ladder_from_block") == typed_raw
 
 
 # ── the fork guard: the release pin ────────────────────────────────
