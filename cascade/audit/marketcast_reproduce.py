@@ -146,7 +146,7 @@ def reproduce_marketcast(receipt, mc, *, reports: dict, quantiles: dict, snapsho
     "base") -> (forecaster, covariates)`` (None = torch / timestral not
     installed: WARN); ``bar_fetch`` overrides the Hyperliquid fetch (tests)."""
     from ..eval.timestral_adapter import batched_forecasts
-    from ..pool.marketcast import snapshot_windows, window_covariates
+    from ..pool.marketcast import target_windows, window_covariates
     from ..shared.marketcast_report import decode_quantiles, load_mkt_report
 
     out: list[CheckResult] = []
@@ -183,7 +183,7 @@ def reproduce_marketcast(receipt, mc, *, reports: dict, quantiles: dict, snapsho
             data = quantiles.get(e.quantiles_key) if e.quantiles_key else None
             if e.deferred or e.fault or data is None:
                 continue
-            ws = snapshot_windows(snap, mc, e.target.split(":", 1)[1], after=float(e.after))
+            ws = target_windows(snap, mc, e.target.split(":", 1)[1], after=float(e.after))
             qs = decode_quantiles(data, [w.steps for w in ws], len(knots))
             ft, covs = forecaster_fn(e.trained_pointer)
             pick = set(sample_ids([w.wid for w in ws], sample, f"{rep.round_id}|{e.hotkey}"))

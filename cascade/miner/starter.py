@@ -22,9 +22,13 @@ def add_init(sub):
 def marketcast_starter(mc, target):
     from ..shared.config.marketcast import SUITE_CLASSES
 
-    suite = target.removeprefix("mkt:")
-    if target != f"mkt:{suite}" or suite not in mc.suites:
+    name = target.removeprefix("mkt:")
+    if target != f"mkt:{name}" or name not in mc.target_names:
         raise ValueError("Choose a configured mkt:<suite> target.")
+    # the composite target (mkt:market) trains on every enabled suite; the
+    # starter weights them equally and takes its data / horizons from the first
+    suites = mc.suites_of(name)
+    suite = suites[0]
     cls, assets = next((c, syms) for c, syms in mc.assets_map.items() if syms and c in SUITE_CLASSES[suite])
     end = datetime.now(UTC).date() - timedelta(days=int(mc.embargo_days) + 1)
     return {"target": target,
@@ -34,7 +38,7 @@ def marketcast_starter(mc, target):
             "context_length": min(4096, mc.max_context_length),
             "horizon_mix": {h: 1.0 for h in mc.horizons_map[suite]},
             "covariates": [], "augmentations": [],
-            "objective": {"suite_weights": {suite: 1.0}, "coverage_penalty": 0.5},
+            "objective": {"suite_weights": {s: 1.0 for s in suites}, "coverage_penalty": 0.5},
             "optimizer": {"lr": min(1e-4, mc.max_lr), "schedule": "cosine", "warmup_fraction": 0.05,
                           "steps": min(100, mc.max_steps), "batch": min(8, mc.max_batch),
                           "weight_decay": 0.01, "clip": 1.0, "ema_decay": 0.999},

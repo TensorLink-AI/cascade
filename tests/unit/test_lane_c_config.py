@@ -32,7 +32,10 @@ def test_shipped_configs_are_inert_with_the_defaults():
         assert lc.from_block == 0 and not lc.active(10**12)
         assert lc.share == 0.25 and lc.remainder == "burn"
         assert lc.takes_from == ("lane_a" if f == "chain.toml" else "lane_b")
-        assert lc.targets == DEFAULT_TARGETS == ("mkt:returns", "mkt:vol")
+        # owner 2026-11-10: the shipped lane C is ONE composite MarketCast slot;
+        # the code-level default keeps the per-suite shape
+        assert lc.targets == ("mkt:market",)
+        assert DEFAULT_TARGETS == ("mkt:returns", "mkt:vol")
         assert (lc.full_pay_tiers, lc.half_life_rounds, lc.floor, lc.win_ttl_eras) == (
             ((0.05, 10), (0.02, 5), (0.01, 2)), 1.0, 0.1, 28)
         assert (lc.alpha, lc.bootstrap_B, lc.gain_margin, lc.min_target_windows) == \
@@ -63,7 +66,10 @@ def test_shipped_configs_load_with_marketcast_off_and_zero_active_slots():
     for f in ("chain.toml", "chain.testnet.toml"):
         cfg = load_chain_config(ROOT / f)
         assert cfg.marketcast.from_block == 0
-        assert tuple(cfg.marketcast.suites) == SUITES
+        from cascade.shared.config.marketcast import COMPOSITE_LAUNCH_SUITES
+
+        assert tuple(cfg.marketcast.suites) == COMPOSITE_LAUNCH_SUITES
+        assert cfg.marketcast.composite
         for block in (0, 7201, 10**9):
             assert active_targets(cfg.lane_c, block, cfg.marketcast) == ()
 

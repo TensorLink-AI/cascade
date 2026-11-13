@@ -13,17 +13,20 @@ Pure and deterministic, mirroring :func:`cascade.shared.lane_c.parse_recipe`
 
 Recipe keys (all required at the top level):
 
-* ``target``            ``mkt:<suite>`` — the lane-C slot the entry competes for;
+* ``target``            ``mkt:<suite>`` (or ``mkt:market``, the composite) — the
+                        lane-C slot the entry competes for;
 * ``data``              ``assets`` {class: [symbols ⊆ config]}, ``class_weights``
                         {class: w ≥ 0, sum > 0}, ``frequencies`` (⊆ the config's),
                         ``start`` / ``end`` ISO dates — ``end`` at least
                         ``embargo_days`` before the submission (forward-only eval);
 * ``context_length``    ``[patch, max_context_length]`` (≤ 32768);
-* ``horizon_mix``       {horizon: w ≥ 0, sum > 0}, horizons of the target suite;
+* ``horizon_mix``       {horizon: w ≥ 0, sum > 0}, horizons of the target suite
+                        (the composite: of any enabled suite);
 * ``covariates``        ⊆ ``[marketcast] covariates`` (inputs, never targets);
 * ``augmentations``     [{``name`` ∈ allow-list, ``p`` ∈ [0, 1], ``params``
                         {str: finite number}}], at most ``MAX_AUGMENTATIONS``;
-* ``objective``         ``suite_weights`` {suite: w ≥ 0; target's > 0},
+* ``objective``         ``suite_weights`` {suite: w ≥ 0; target's > 0 — the
+                        composite needs only a positive sum},
                         optional ``quantile_weights`` (one ≥ 0 per base knot,
                         sum > 0), optional ``coverage_penalty`` ∈ [0, 10];
 * ``optimizer``         ``lr`` (0, max_lr], ``schedule``, ``warmup_fraction``
@@ -174,11 +177,13 @@ def parse_marketcast_recipe(obj: Any, cfg: Any, *, target: str | None = None,
             raise ValueError(f"marketcast recipe is not valid JSON: {e}") from e
     top = _obj(obj, "", TOP_KEYS, TOP_KEYS)
     suites = tuple(cfg.suites)
-    spec = check_target(str(top["target"]), mkt_suites=suites)
+    names = tuple(getattr(cfg, "target_names", suites))
+    spec = check_target(str(top["target"]), mkt_suites=names)
     if not spec.startswith("mkt:"):
         raise ValueError(f"marketcast recipe target {spec!r} must be mkt:<suite>")
     suite = spec.split(":", 1)[1]
-    if target is not None and check_target(str(target), mkt_suites=suites) != spec:
+    judged = cfg.suites_of(suite) if hasattr(cfg, "suites_of") else (suite,)
+    if target is not None and check_target(str(target), mkt_suites=names) != spec:
         raise ValueError(f"marketcast recipe target {spec!r} != committed target {target!r}")
 
     from .config.marketcast import duration_minutes
@@ -213,7 +218,9 @@ def parse_marketcast_recipe(obj: Any, cfg: Any, *, target: str | None = None,
 
     ctx = _i(top["context_length"], "context_length", TIMESTRAL_PATCH,
              int(cfg.max_context_length))
-    hmix = _weights(top["horizon_mix"], "horizon_mix", tuple(cfg.horizons_map.get(suite, ())))
+    hz_ok = tuple(sorted({h for s in judged for h in cfg.horizons_map.get(s, ())},
+                         key=duration_minutes))
+    hmix = _weights(top["horizon_mix"], "horizon_mix", hz_ok)
     covs = _labels(top["covariates"], "covariates", tuple(cfg.covariates))
 
     augs_raw = top["augmentations"]
@@ -239,7 +246,7 @@ def parse_marketcast_recipe(obj: Any, cfg: Any, *, target: str | None = None,
 
     ob = _obj(top["objective"], "objective", OBJECTIVE_KEYS, ("suite_weights",))
     sw = _weights(ob["suite_weights"], "objective.suite_weights", suites)
-    if sw.get(suite, 0.0) <= 0.0:
+    if len(judged) == 1 and sw.get(suite, 0.0) <= 0.0:
         raise ValueError(f"marketcast recipe objective.suite_weights must weight the target "
                          f"suite {suite!r} > 0")
     knots = tuple(cfg.quantile_knots)
@@ -331,7 +338,8 @@ def meta_problem(meta: Any, cfg: Any, *, size: int | None = None) -> str:
             or str(meta["base_sha256"]).lower() != cfg.base_sha256):
         return "marketcast_meta.json names a base other than the pinned [marketcast] base"
     t = str(meta["target"])
-    if not t.startswith("mkt:") or t.split(":", 1)[1] not in tuple(cfg.suites):
+    if not t.startswith("mkt:") or t.split(":", 1)[1] not in tuple(
+            getattr(cfg, "target_names", cfg.suites)):
         return f"marketcast_meta.json target {t!r} is not an enabled MarketCast suite"
     return covariates_problem(meta["covariates"], cfg)
 

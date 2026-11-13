@@ -949,3 +949,70 @@ refused), so this DEC's arming checks are unchanged. After an `until_block`
 the validator's MarketCast pipeline judges nothing: new entries, carried
 pending entries and backlog candidates get `ended` rows and the backlog
 empties; held `mkt:` wins wind down per the competition's rule.
+
+## Addendum 2026-11-10 — native candles, OHLCV, one composite target (owner)
+
+Owner decisions (chat, 2026-11-10): "a model good at forecasting markets";
+forecast actual OHLCV as well as the other metrics; collect 5m and 1h (and
+1m) candles so the metrics need no 21 days of recorded data; one composite
+score, not a slot per suite. Built in one release, shipped INERT
+(`[marketcast] from_block = 0`); consensus terms, so release-then-activate
+like every MarketCast change.
+
+**Data — no recording lead time.** Every suite value is now a function of
+the block's OHLCV candle (open = first open, high / low = max / min, close =
+last close, volume = sum; exact aggregation), so a series may be cut from any
+bank whose interval divides its frequency. A snapshot carries native banks
+(`native_intervals = ["5m", "15m"]`, `native_history_days` 21 / 50) beside
+the 1-minute bars (`snapshot_days` 21 → 10: a 4096-step 1m context + the
+6-day wait) and the hourly bank (180 d); a series reads the coarsest bank
+that divides its frequency. `mkt-record` records 1m, the native intervals
+and 1h; its first pass of an empty (asset, interval) backfills the API's
+full depth. At arming each series needs only its context, which the API
+depth covers (1m 3.6 d, 5m 17 d, 15m 52 d, 1h 208 d) — so the recorder can
+start at arming. It is still required: it captures each window's realized
+candles before the API drops them.
+
+**vol = Garman–Klass** on the block candle (`½ ln(H/L)² − (2 ln 2 − 1)
+ln(C/O)²`), the same rule for context and target. The std of 1-minute
+returns needed minute history over 4096 blocks of 5m / 15m (14–43 days),
+which is what forced the 21-day bank.
+
+**New suites.** `ohlcv`: the actual next-bar high, low, close and volume
+(window labels `ohlcv.h` / `.l` / `.c` / `.v`; the open carried with
+`ohlcv_open_weight`, default 0, since a Hyperliquid perp's open is the
+previous close), scored with scale-normalised CRPS — each window's CRPS
+divided by a scale fixed before it opens (price: last context value; volume:
+mean of the last 64 context values), so assets of every price level weigh
+alike. `high` / `low`: the block's max up / down excursion from its open
+(bp). `range` and `liquidity` join the launch set; `funding` stays off (the
+predicted next rate is published, a leak to check first); `alpha` needs its
+recorder or an archive backfill.
+
+**Composite target `mkt:market`** (`composite = true`). ONE lane-C slot. Its
+gain is the geomean over suites of each suite's gain (inside a suite the
+red-team F1 statistic: class × horizon-balanced ratio of mean losses; the
+ohlcv fields are extra columns), with ONE cluster bootstrap (class × 6 h
+block) for the composite LCB and every suite's LCB. It wins iff the
+composite LCB ≥ `gain_margin` at `alpha / k`, the point gain > 0, the
+window / cluster / time-block floors hold, every enabled suite has paired
+windows, the `returns` / `vol` calibration gates pass (each on its own
+windows), and no suite's LCB is below `-composite_suite_floor` (0.02, the
+no-regression floor). Per-suite gains are recorded on the receipt row
+(`mkt.suites`). `composite = false` keeps the per-suite `mkt:<suite>` slots;
+the code-level (absent-table) default is still that per-suite shape with
+returns + vol.
+
+**New keys** (both tomls): `composite`, `composite_suite_floor`,
+`ohlcv_open_weight`, `native_intervals`, `native_history_days`; `suites`,
+`snapshot_days` and `[lane_c] targets = ["mkt:market"]` changed. All
+release-only (not on the overlay allow-list). The snapshot format is still
+version 1 (the `native` record is optional); the report is still version 3
+(window ids carry the suite label).
+
+**Open.** The validator-GPU cost is unmeasured and about 4× the windows of
+returns + vol (36 window series vs 9) — measure before arming;
+`windows_per_cell` is the lever. The payout tiers stay uncalibrated
+placeholders. The trainer's fine-tune loss on `ohlcv` level series is in
+raw units (BTC-sized levels dominate a mixed batch); the eval normalises,
+training does not — a recipe concern to revisit. `funding` leak check.

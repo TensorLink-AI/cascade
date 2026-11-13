@@ -48,6 +48,7 @@ for _k in (FAKE, FAKE2):
         register_competition_kind(_k, eval="test forward-only eval", forward_only=True,
                                   parse_value=lambda v: v)
 M, V = "mkt:returns", "mkt:vol"
+MKT = "mkt:market"   # the shipped composite target
 FA, FB, FC = f"{FAKE}:a", f"{FAKE}:b", f"{FAKE}:c"
 MC = parse_marketcast({"from_block": 2 * ERA})          # MarketCast starts at 2 eras
 
@@ -352,20 +353,21 @@ def test_shipped_tomls_are_marketcast_only_weight_one_and_unchanged():
         lc = c.lane_c
         assert lc.competitions == (LaneCCompetition("mkt", weight=1.0),)
         assert lc.competition_list == replace(lc, competitions=()).competition_list
-        # armed, the single competition is exactly the old equal split
+        # armed, the single competition pays its single composite target the whole pool
+        assert lc.targets == (MKT,)
         mc = replace(c.marketcast, from_block=4 * ERA)
         armed = replace(lc, from_block=2 * ERA)
-        st = LaneCState(slots={M: _win(M, "a", 4 * ERA, 1)})
+        st = LaneCState(slots={MKT: _win(MKT, "a", 4 * ERA, 1)})
         for block in (0, 3 * ERA, 4 * ERA - 1, 4 * ERA, 5 * ERA, 40 * ERA, 10**9):
             rec = lane_c_pay_record(st, block=block, era_blocks=ERA, cfg=armed, n_uids=8,
                                     mc=mc)
             live = mc.active(block)
-            assert rec["slots"] == (2 if live else 0)
-            assert rec["slot_frac"] == ({M: 0.5, V: 0.5} if live else {})
+            assert rec["slots"] == (1 if live else 0)
+            assert rec["slot_frac"] == ({MKT: 1.0} if live else {})
             assert [x["state"] for x in rec["competitions"]] == [
                 "active" if live else "pending"]
             v = _vec(rec, armed, 8)
-            want = armed.share / 2 * (rec["wins"][0]["multiplier"] if rec["wins"] else 0.0)
+            want = armed.share * (rec["wins"][0]["multiplier"] if rec["wins"] else 0.0)
             assert bool(rec["wins"]) == (live and block < 4 * ERA + 28 * ERA)   # TTL
             assert v[1] == pytest.approx(want) and sum(v) == pytest.approx(armed.share)
         # MarketCast off (the shipped state): nothing active at any block

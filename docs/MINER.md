@@ -1002,8 +1002,8 @@ holders, and all other B/C slots are empty:
 | A king | 30% |
 | Eligible immediate former king | 2.5% |
 | One full-pay B holder | 2.5% |
-| One full-pay C holder (mkt:returns) | 12.5% |
-| Burn | 52.5% |
+| One full-pay C holder (mkt:market) | 25% |
+| Burn | 40% |
 <!-- cascade:rewards:worked-example:end -->
 
 The total is 100%. Burns combine A's unused ladder share, B's unused slots,

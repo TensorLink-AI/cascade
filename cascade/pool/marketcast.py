@@ -15,6 +15,16 @@ Layout of a snapshot directory::
     snapshot.json                       signed body (below) + signature
     bars/<class>/<asset>/<field>.npy    float64, length ``minutes`` (NaN = missing)
     coarse/<class>/<asset>/<field>.npy  float64 HOURLY bars, length ``coarse.steps``
+    n<iv>/<class>/<asset>/<field>.npy   float64 native ``<iv>`` (5m / 15m) candles,
+                                        length ``native.<iv>.steps`` (2026-11-10)
+
+Native banks (owner 2026-11-10): Hyperliquid's own 5m / 15m candles, with
+``[marketcast] native_history_days`` of history (the API keeps ~17 / ~52
+days), so a 5m / 15m series needs no 1-minute history. The body's ``native``
+record (``{iv: {t0, steps, bar_minutes}}``) is present only when a native bank
+is. A series is cut from the coarsest bank whose interval divides its
+frequency (:meth:`~cascade.shared.config.marketcast.MarketCastConfig.
+bank_minutes`, :meth:`MktSnapshot.bank`).
 
 The coarse (hourly) bank (review 2026-10-19) carries ``[marketcast]
 coarse_history_days`` of history for the series forecast at >= 1h
@@ -55,7 +65,9 @@ from ..shared.config.marketcast import (
     BLOCK_SECONDS,
     COARSE_BAR_MINUTES,
     MarketCastConfig,
+    base_suite,
     coarse_frequency,
+    duration_minutes,
 )
 
 log = logging.getLogger("cascade.pool.marketcast")
@@ -105,20 +117,29 @@ def verify_snapshot_signature(meta: dict, signer_hotkey: str) -> bool:
 # ── writing ──────────────────────────────────────────────────────────────────
 
 
+def native_dir(interval: str) -> str:
+    """The snapshot directory of a native bank (``"5m"`` → ``"n5m"``)."""
+    return f"n{interval}"
+
+
 def write_snapshot(out_dir: Path | str, *, t0: int, minutes: int,
                    bars: dict[tuple[str, str], dict[str, np.ndarray]],
                    sources: dict[str, str], anchor_block: int, anchor_time: float,
                    cross: dict | None = None, signer: str = "", wallet=None,
                    block_seconds: float = BLOCK_SECONDS,
                    coarse: dict[tuple[str, str], dict[str, np.ndarray]] | None = None,
-                   coarse_t0: int = 0, coarse_steps: int = 0) -> dict:
+                   coarse_t0: int = 0, coarse_steps: int = 0,
+                   native: dict[str, tuple[int, int, dict]] | None = None) -> dict:
     """Write a snapshot directory from ``bars`` (``{(class, asset): {field:
     array}}``, every array of length ``minutes`` on the grid at ``t0``) and,
     optionally, the coarse hourly bank ``coarse`` (arrays of length
     ``coarse_steps`` on the hourly grid at ``coarse_t0``, a UTC day
     boundary), and return its (signed when ``wallet`` is given) meta.
     Deterministic: the same arrays give the same bytes (``np.save`` of
-    float64); without ``coarse`` the body is exactly the pre-bank one."""
+    float64); without ``coarse`` the body is exactly the pre-bank one.
+    ``native`` = ``{interval: (t0, steps, {(class, asset): {field: array}})}``
+    adds the native banks (each ``t0`` a UTC day boundary); without it the
+    body is exactly the pre-2026-11-10 one."""
     out = Path(out_dir)
     if int(t0) % 60:
         raise SnapshotError(f"t0 {t0} is not a minute boundary")
@@ -127,8 +148,13 @@ def write_snapshot(out_dir: Path | str, *, t0: int, minutes: int,
     out.mkdir(parents=True, exist_ok=True)
     files: dict[str, str] = {}
     assets: dict[str, list[str]] = {}
-    for bank, n, data in (("bars", int(minutes), bars),
-                          ("coarse", int(coarse_steps), coarse or {})):
+    nat = {iv: v for iv, v in sorted((native or {}).items()) if v[2]}
+    for iv, (nt0, _n, _d) in nat.items():
+        if int(nt0) % 86400:
+            raise SnapshotError(f"native {iv} t0 {nt0} is not a UTC day boundary")
+    banks = [("bars", int(minutes), bars), ("coarse", int(coarse_steps), coarse or {})]
+    banks += [(native_dir(iv), int(n_), d) for iv, (_t, n_, d) in nat.items()]
+    for bank, n, data in banks:
         for (cls, asset), fields_ in sorted(data.items()):
             for name, arr in sorted(fields_.items()):
                 a = np.asarray(arr, dtype=np.float64)
@@ -152,6 +178,10 @@ def write_snapshot(out_dir: Path | str, *, t0: int, minutes: int,
     if coarse:
         meta["coarse"] = {"t0": int(coarse_t0), "steps": int(coarse_steps),
                           "bar_minutes": COARSE_BAR_MINUTES}
+    if nat:
+        meta["native"] = {iv: {"t0": int(t), "steps": int(n_),
+                               "bar_minutes": duration_minutes(iv)}
+                          for iv, (t, n_, _d) in nat.items()}
     if wallet is not None:
         meta = sign_snapshot_meta(meta, wallet)
     (out / SNAPSHOT_FILE).write_text(json.dumps(meta, sort_keys=True, indent=1),
@@ -177,23 +207,43 @@ def coarse_grid(end_time: float, days: int) -> tuple[int, int]:
     return t0, (end_h - t0) // 3600
 
 
+def native_grid(end_time: float, days: int, bar_minutes: int) -> tuple[int, int]:
+    """``(t0, steps)`` of a native bank of ``bar_minutes`` candles: complete
+    candles up to the last closed one at or before ``end_time``, from the
+    UTC day boundary ``days`` days earlier."""
+    step = 60 * int(bar_minutes)
+    end = int(end_time) // step * step
+    t0 = (end - int(days) * DAY) // DAY * DAY
+    return t0, (end - t0) // step
+
+
 def fetch_coarse_bars(cls: str, asset: str, sources: tuple[str, ...], t0: int, steps: int, *,
-                      post, alpha_rows=None) -> dict[str, np.ndarray]:
-    """Hourly bars of one asset for the coarse bank from its class's
-    PRIMARY source: Hyperliquid ``1h`` candles (+ hourly funding / premium
-    for a perp), or the recorded alpha rows bucketed hourly. Binance is a
-    1-minute cross-check only and has no coarse leg."""
+                      post, alpha_rows=None, store=None, interval: str = "1h"
+                      ) -> dict[str, np.ndarray]:
+    """``interval`` bars (the hourly coarse bank, or a native 5m / 15m bank)
+    of one asset from its class's PRIMARY source: Hyperliquid candles at
+    that interval (+ funding / premium for a perp), or the recorded alpha
+    rows bucketed. With ``store`` (the forward recording) a Hyperliquid
+    primary's missing steps are filled from what was recorded (the API keeps
+    only its last ~5000 candles of an interval; the API wins where both
+    have a bar). Binance is a 1-minute cross-check only and has no leg here."""
     from . import marketcast_feeds as F
 
     if not sources:
         raise SnapshotError(f"{cls}: no data source configured")
-    hm = COARSE_BAR_MINUTES
+    hm = duration_minutes(interval)
     start_ms, end_ms = int(t0) * 1000, (int(t0) + 60 * hm * int(steps)) * 1000
     primary = sources[0]
     if primary in ("hyperliquid", "hyperliquid_xyz"):
         coin = F.hl_coin(primary, asset)
-        bars = F.bars_on_grid(F.fetch_hl_candles(post, coin, start_ms, end_ms, interval="1h"),
+        bars = F.bars_on_grid(F.fetch_hl_candles(post, coin, start_ms, end_ms,
+                                                 interval=interval),
                               t0, steps, step_minutes=hm)
+        if store is not None:
+            rec = store.read(cls, asset, t0, steps, interval=interval)
+            for k in F.FIELDS:
+                miss = ~np.isfinite(bars[k])
+                bars[k][miss] = rec[k][miss]
         fu, pr = F.funding_on_grid(F.fetch_hl_funding(post, coin, start_ms, end_ms),
                                    t0, steps, step_minutes=hm)
         bars["funding"], bars["premium"] = fu, pr
@@ -204,17 +254,24 @@ def fetch_coarse_bars(cls: str, asset: str, sources: tuple[str, ...], t0: int, s
     raise SnapshotError(f"{cls}/{asset}: source {primary!r} has no coarse adapter")
 
 
-def needs_coarse(mc: MarketCastConfig) -> bool:
-    """Whether any enabled (suite, horizon) is forecast from the coarse bank."""
+def needed_banks(mc: MarketCastConfig) -> set[int]:
+    """The bar intervals (minutes) the enabled (suite, horizon)s are cut
+    from (:meth:`~cascade.shared.config.marketcast.MarketCastConfig.
+    bank_minutes`)."""
+    out: set[int] = set()
     for s in mc.suites:
         for h in mc.horizons_map.get(s, ()):
             try:
                 f, _steps = _geometry(mc.frequencies_map.get(s, ()), h)
             except ValueError:
                 continue
-            if coarse_frequency(s, f):
-                return True
-    return False
+            out.add(int(mc.bank_minutes(f)))
+    return out
+
+
+def needs_coarse(mc: MarketCastConfig) -> bool:
+    """Whether any enabled (suite, horizon) is forecast from the coarse bank."""
+    return COARSE_BAR_MINUTES in needed_banks(mc)
 
 
 def fetch_class_bars(cls: str, asset: str, sources: tuple[str, ...], t0: int, minutes: int, *,
@@ -274,7 +331,12 @@ def build_snapshot(out_dir: Path | str, mc: MarketCastConfig, *, end_time: float
     out (logged); the classes' sources are recorded."""
     t0, minutes = snapshot_grid(end_time, int(days or mc.snapshot_days))
     ct0, csteps = coarse_grid(end_time, int(mc.coarse_history_days))
-    want_coarse = needs_coarse(mc)
+    want = needed_banks(mc)
+    want_coarse = COARSE_BAR_MINUTES in want
+    nat_grid = {iv: native_grid(end_time, int(mc.native_history_map.get(iv, 1)),
+                                duration_minutes(iv))
+                for iv in mc.native_intervals if duration_minutes(iv) in want}
+    native: dict = {iv: {} for iv in nat_grid}
     bars: dict = {}
     coarse: dict = {}
     cross: dict = {}
@@ -294,10 +356,20 @@ def build_snapshot(out_dir: Path | str, mc: MarketCastConfig, *, end_time: float
             bars[(cls, asset)] = b
             if rep:
                 cross[f"{cls}:{asset}"] = rep
+            for iv, (nt0, nsteps) in nat_grid.items():
+                try:
+                    nb = fetch_coarse_bars(cls, asset, srcs, nt0, nsteps, post=post,
+                                           alpha_rows=alpha_rows, store=store, interval=iv)
+                except Exception as e:  # noqa: BLE001 — its series then go missing
+                    log.warning("marketcast snapshot: %s/%s %s bars skipped (%s)", cls, asset,
+                                iv, e)
+                    continue
+                if any(np.isfinite(v).any() for v in nb.values()):
+                    native[iv][(cls, asset)] = nb
             if want_coarse:
                 try:
                     cb = fetch_coarse_bars(cls, asset, srcs, ct0, csteps, post=post,
-                                           alpha_rows=alpha_rows)
+                                           alpha_rows=alpha_rows, store=store)
                 except Exception as e:  # noqa: BLE001 — its >= 1h series then go missing
                     log.warning("marketcast snapshot: %s/%s coarse bars skipped (%s)", cls,
                                 asset, e)
@@ -308,7 +380,9 @@ def build_snapshot(out_dir: Path | str, mc: MarketCastConfig, *, end_time: float
                           sources={c: mc.data_sources_map.get(c, "") for c in mc.armed_classes},
                           anchor_block=anchor_block, anchor_time=anchor_time, cross=cross,
                           signer=signer, wallet=wallet, coarse=coarse or None,
-                          coarse_t0=ct0, coarse_steps=csteps)
+                          coarse_t0=ct0, coarse_steps=csteps,
+                          native={iv: (nat_grid[iv][0], nat_grid[iv][1], d)
+                                  for iv, d in native.items()} or None)
 
 
 # ── reading ──────────────────────────────────────────────────────────────────
@@ -356,12 +430,25 @@ class MktSnapshot:
     def bank(self, cls: str, asset: str, suite: str, freq_minutes: int
              ) -> tuple[dict[str, np.ndarray], int, int]:
         """``(bars, t0, bar_minutes)`` a suite series at ``freq_minutes`` is
-        cut from: the coarse hourly bank for a coarse frequency when the
-        snapshot carries one, else the 1-minute bars."""
+        cut from: the coarse hourly bank for a whole-hour frequency when the
+        snapshot carries one, else the coarsest native bank (5m / 15m) whose
+        interval divides the frequency, else the 1-minute bars (every suite
+        value is a function of the block candle, so this is a depth choice
+        only — ``suite`` is kept for the call sites)."""
+        f = int(freq_minutes)
         c = self.meta.get("coarse")
-        if c and coarse_frequency(suite, freq_minutes):
+        if c and coarse_frequency(suite, f):
             return (self.bars(cls, asset, bank="coarse"), int(c["t0"]),
                     int(c.get("bar_minutes", COARSE_BAR_MINUTES)))
+        best = None
+        for iv, rec in sorted((self.meta.get("native") or {}).items()):
+            bm = int(rec.get("bar_minutes", duration_minutes(iv)))
+            if f % bm == 0 and (best is None or bm > best[2]):
+                best = (iv, int(rec["t0"]), bm)
+        if best is not None:
+            got = self.bars(cls, asset, bank=native_dir(best[0]))
+            if got:
+                return got, best[1], best[2]
         return self.bars(cls, asset), self.t0, 1
 
 
@@ -382,7 +469,8 @@ def load_snapshot(root: Path | str, *, signer_hotkey: str = "",
         if ".." in Path(rel).parts or not p.is_file() or _sha256_file(p) != sha:
             raise SnapshotError(f"snapshot file {rel} missing or sha256 mismatch")
     listed = set(meta.get("files", {}))
-    extra = sorted(str(p.relative_to(root)) for bank in ("bars", "coarse")
+    banks = ("bars", "coarse") + tuple(native_dir(iv) for iv in (meta.get("native") or {}))
+    extra = sorted(str(p.relative_to(root)) for bank in banks
                    if (root / bank).is_dir() for p in (root / bank).rglob("*")
                    if p.is_file() and str(p.relative_to(root)) not in listed)
     if extra:
@@ -401,9 +489,16 @@ def asset_series(snap: MktSnapshot, cls: str, asset: str, suite: str,
     """The suite series of one asset, block 0 at ``snap.bank(...)``'s ``t0``
     (None when the snapshot lacks the fields it needs, e.g. funding for a
     spot-only asset)."""
+    from ..shared.config.marketcast import OHLCV_FIELD_NAMES
+
     b, _t0, bm = snap.bank(cls, asset, suite, freq_minutes)
-    need = {"returns": ("close",), "vol": ("close",), "range": ("open", "high", "low"),
-            "funding": ("funding",), "liquidity": ("volume",), "alpha": ("price",)}[suite]
+    if base_suite(suite) == "ohlcv":
+        need = (OHLCV_FIELD_NAMES.get(suite.split(".", 1)[-1], "close"),)
+    else:
+        need = {"returns": ("close",), "vol": ("open", "high", "low", "close"),
+                "range": ("open", "high", "low"), "high": ("open", "high", "low"),
+                "low": ("open", "high", "low"), "funding": ("funding",),
+                "liquidity": ("volume",), "alpha": ("price",)}[suite]
     if not all(k in b for k in need):
         return None
     return suite_series(suite, b, freq_minutes, bar_minutes=bm)
@@ -446,7 +541,7 @@ def liquidity_filter(snap: MktSnapshot, mc: MarketCastConfig, cls: str, asset: s
 # price-return suites: a window whose recent CONTEXT is exactly flat (the
 # market stopped printing) is out — read from the context, never the target
 # (red-team F3). Funding changes are legitimately flat for long spans.
-STALE_CONTEXT_SUITES = ("returns", "alpha")
+STALE_CONTEXT_SUITES = ("returns", "alpha", "ohlcv")
 
 
 def snapshot_windows(snap: MktSnapshot, mc: MarketCastConfig, suite: str, *,
@@ -462,21 +557,36 @@ def snapshot_windows(snap: MktSnapshot, mc: MarketCastConfig, suite: str, *,
     a zero-scale cell is masked in the verdict instead. Sorted by window id."""
     out: list[MktWindow] = []
     freqs = mc.frequencies_map[suite]
+    labels = mc.series_labels(suite) if hasattr(mc, "series_labels") else (suite,)
     for h in mc.horizons_map[suite]:
         f, steps = _geometry(freqs, h)
         for cls, asset in mc.suite_assets(suite):
             if asset not in snap.assets(cls):
                 continue
-            s = asset_series(snap, cls, asset, suite, f)
-            if s is None:
-                continue
-            out.extend(cut_windows(
-                s, cls=cls, asset=asset, suite=suite, horizon=h, freq_minutes=f, steps=steps,
-                t0=snap.bank(cls, asset, suite, f)[1],
-                context_length=int(mc.eval_context_length), after=float(after),
-                now=float(snap.end), limit=int(mc.windows_per_cell),
-                eligible=liquidity_filter(snap, mc, cls, asset, suite, f),
-                stale_context=suite in STALE_CONTEXT_SUITES))
+            for lab in labels:
+                s = asset_series(snap, cls, asset, lab, f)
+                if s is None:
+                    continue
+                out.extend(cut_windows(
+                    s, cls=cls, asset=asset, suite=lab, horizon=h, freq_minutes=f,
+                    steps=steps, t0=snap.bank(cls, asset, lab, f)[1],
+                    context_length=int(mc.eval_context_length), after=float(after),
+                    now=float(snap.end), limit=int(mc.windows_per_cell),
+                    eligible=liquidity_filter(snap, mc, cls, asset, lab, f),
+                    stale_context=base_suite(lab) in STALE_CONTEXT_SUITES))
+    return sorted(out, key=lambda w: w.wid)
+
+
+def target_windows(snap: MktSnapshot, mc: MarketCastConfig, name: str, *,
+                   after: float) -> list[MktWindow]:
+    """Every scorable window of the lane-C target ``mkt:<name>``: one
+    suite's :func:`snapshot_windows`, or — the composite ``mkt:market``
+    (owner 2026-11-10) — every enabled suite's, in window-id order (the row
+    order of the entry's report and quantile sidecar)."""
+    suites = mc.suites_of(name) if hasattr(mc, "suites_of") else (name,)
+    if len(suites) == 1 and suites[0] == name:
+        return snapshot_windows(snap, mc, name, after=after)
+    out = [w for s in suites for w in snapshot_windows(snap, mc, s, after=after)]
     return sorted(out, key=lambda w: w.wid)
 
 
@@ -560,4 +670,5 @@ __all__ = [
     "fetch_class_bars", "fetch_coarse_bars", "needs_coarse",
     "load_snapshot", "sign_snapshot_meta", "snapshot_digest", "snapshot_grid",
     "snapshot_windows", "verify_snapshot_signature", "window_covariates", "write_snapshot",
+    "native_dir", "native_grid", "needed_banks", "target_windows",
 ]

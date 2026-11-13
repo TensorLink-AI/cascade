@@ -284,6 +284,12 @@ def judge_marketcast_entry(entry: LaneCEntry, rows: MktEntryRows | None, *, mc, 
     if rows.near_dup:
         rec["near_dup"] = dict(rows.near_dup)
     v = verdict_from_rows(rows, mc, suite=suite_of(entry.target), k=k, seed=seed)
+    if v.diagnostics.get("suites"):
+        # the composite (owner 2026-11-10): every suite's gain / LCB / windows
+        rec["suites"] = {s: {k_: (float(x) if isinstance(x, float) and math.isfinite(x)
+                                  else (None if isinstance(x, float) else x))
+                             for k_, x in d.items()}
+                         for s, d in v.diagnostics["suites"].items()}
     inc = _inconclusive(v.reason)
     rec["inconclusive"] = inc
     excluded = sum(1 for w in rows.windows if not math.isfinite(float(w.base)))
@@ -373,11 +379,11 @@ def compute_entry_rows(entry: LaneCEntry, *, phase: str, after: float, snap, mc,
     (:func:`~cascade.shared.marketcast_report.score_windows`)."""
     from ..eval.marketcast import COVERAGE_GATE_SUITES
     from ..eval.timestral_adapter import batched_forecasts
-    from ..pool.marketcast import snapshot_windows
+    from ..pool.marketcast import target_windows
+    from ..shared.config.marketcast import base_suite
 
-    suite = suite_of(entry.target)
     knots = tuple(mc.quantile_knots)
-    windows = snapshot_windows(snap, mc, suite, after=after)
+    windows = target_windows(snap, mc, suite_of(entry.target), after=after)
     base_rows = MktEntryRows(entry.miner_hotkey, entry.trained_pointer, entry.target, phase,
                              float(after))
     try:
@@ -431,13 +437,15 @@ def compute_entry_rows(entry: LaneCEntry, *, phase: str, after: float, snap, mc,
                                   past=pp if any(p is not None for p in pp) else None,
                                   known=kk if any(k is not None for k in kk) else None)
             sc = score_windows([windows[i].target for i in idx], list(q), list(q), knots=knots,
-                               coverage_levels=(), gated=False)
+                               coverage_levels=(), gated=False,
+                               scales=[windows[i].scale for i in idx])
             for i, row in zip(idx, sc, strict=True):
                 bc[i] = row[0]
     scored = score_windows([w.target for w in windows], qb, qf, knots=knots,
                            coverage_levels=tuple(mc.coverage_levels),
-                           gated=suite in COVERAGE_GATE_SUITES,
-                           tail_levels=tuple(mc.tail_levels))
+                           gated=[base_suite(w.suite) in COVERAGE_GATE_SUITES for w in windows],
+                           tail_levels=tuple(mc.tail_levels),
+                           scales=[w.scale for w in windows])
     # a non-finite BASE forecast leaves base = null: the window is excluded for
     # everyone (verdict_from_rows) and the row records it
     out = tuple(MktWindowRow(w.wid, b, f, ci, cn, bc[i], tl)
@@ -485,12 +493,12 @@ def near_dup_record(rows: MktEntryRows, data: bytes, refs, *, snap, mc, load_ft:
     distance from published bytes."""
     import hashlib
 
-    from ..pool.marketcast import snapshot_windows
+    from ..pool.marketcast import target_windows
     from ..shared.marketcast_report import decode_quantiles
 
     if not refs or not rows.windows:
         return {}, None
-    windows = snapshot_windows(snap, mc, suite_of(rows.target), after=float(rows.after))
+    windows = target_windows(snap, mc, suite_of(rows.target), after=float(rows.after))
     qs = decode_quantiles(data, [w.steps for w in windows], len(mc.quantile_knots))
     qb = [q[0] for q in qs]
     qf = [q[1] for q in qs]

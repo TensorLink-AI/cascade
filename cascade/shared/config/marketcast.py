@@ -51,11 +51,31 @@ from dataclasses import dataclass
 
 from .v2 import FULL_PAY_TIERS, parse_full_pay_tiers
 
-# The six suites (DEC-CA-0064 §Suites). A suite is the lane-C target
-# ``mkt:<suite>``.
-SUITES: tuple[str, ...] = ("returns", "vol", "range", "funding", "liquidity", "alpha")
-# Recommended launch set (research 2026-10-19): returns + vol.
+# The suites (DEC-CA-0064 §Suites; ``ohlcv`` / ``high`` / ``low`` added
+# 2026-11-10, owner). With ``composite = false`` a suite is its own lane-C
+# target ``mkt:<suite>``; with ``composite = true`` the ONE target
+# ``mkt:market`` (:data:`COMPOSITE_TARGET`) is judged over every enabled suite.
+SUITES: tuple[str, ...] = ("returns", "vol", "range", "funding", "liquidity", "alpha",
+                           "ohlcv", "high", "low")
+# The code-level (absent-table) default: the original launch set. The
+# SHIPPED chain.toml enables the 2026-11-10 composite launch set instead
+# (:data:`COMPOSITE_LAUNCH_SUITES`).
 DEFAULT_SUITES: tuple[str, ...] = ("returns", "vol")
+# Owner 2026-11-10 ("a model good at forecasting markets"): one composite
+# target over these suites; funding stays off (its next rate is published).
+COMPOSITE_LAUNCH_SUITES: tuple[str, ...] = ("ohlcv", "returns", "vol", "high", "low", "range",
+                                            "liquidity")
+COMPOSITE_TARGET = "market"
+# ``ohlcv`` forecasts the actual next-bar levels of these fields, one series
+# each (window suite label ``ohlcv.<field>``), scored with scale-normalised
+# CRPS; ``o`` is carried with ``ohlcv_open_weight`` (default 0 = not scored:
+# a Hyperliquid perp's open is the previous close).
+OHLCV_FIELDS: tuple[str, ...] = ("o", "h", "l", "c", "v")
+OHLCV_FIELD_NAMES: dict[str, str] = {"o": "open", "h": "high", "l": "low", "c": "close",
+                                     "v": "volume"}
+# Native Hyperliquid candle intervals a snapshot may carry as their own bank
+# besides the 1-minute bars and the hourly (coarse) bank.
+NATIVE_INTERVALS: tuple[str, ...] = ("5m", "15m")
 # Calibration is a GATE (AND-ed into the verdict) on these suites only: the
 # central-interval coverage gate and the tail hit-rate gate (red-team F1b,
 # 2026-10-20 — vol was ungated, so collapsed log-RV quantiles passed).
@@ -108,6 +128,7 @@ PERP_CLASSES: tuple[str, ...] = ("crypto", "fx", "metals", "commodities", "equit
 SUITE_CLASSES: dict[str, tuple[str, ...]] = {
     "returns": PERP_CLASSES, "vol": PERP_CLASSES, "range": PERP_CLASSES,
     "funding": PERP_CLASSES, "liquidity": PERP_CLASSES, "alpha": ("alpha",),
+    "ohlcv": PERP_CLASSES, "high": PERP_CLASSES, "low": PERP_CLASSES,
 }
 # Series sampling intervals per suite (what the base sees as one step).
 DEFAULT_FREQUENCIES: dict[str, tuple[str, ...]] = {
@@ -117,6 +138,9 @@ DEFAULT_FREQUENCIES: dict[str, tuple[str, ...]] = {
     "funding": ("8h",),
     "liquidity": ("1h", "1d"),
     "alpha": ("1h", "1d"),
+    "ohlcv": ("5m", "1h", "1d"),
+    "high": ("1h", "4h", "1d"),
+    "low": ("1h", "4h", "1d"),
 }
 # Forecast horizons per suite (durations). ``5d`` was dropped from returns
 # (review 2026-10-19): a 6-day verdict wait cannot hold two aligned 5-day
@@ -129,6 +153,9 @@ DEFAULT_HORIZONS: dict[str, tuple[str, ...]] = {
     "funding": ("8h",),
     "liquidity": ("1h", "1d"),
     "alpha": ("1h", "1d"),
+    "ohlcv": ("5m", "1h", "4h", "1d"),
+    "high": ("1h", "4h", "1d"),
+    "low": ("1h", "4h", "1d"),
 }
 # Recipe allow-lists. Covariates are INPUTS, never targets (DEC-CA-0064
 # §Covariates); each has a builder in :func:`cascade.eval.marketcast.
@@ -168,15 +195,20 @@ BLOCK_SECONDS = 12.0
 # The fewest finite context steps a window needs (:func:`cascade.eval.
 # marketcast.cut_windows`).
 MIN_CONTEXT = 32
-# Coarse bank (review 2026-10-19): series at >= 1h frequencies are cut from
-# hourly bars kept for ``coarse_history_days`` (Hyperliquid serves only the
-# most recent ~5000 candles per interval — measured 2026-10-19: 1m ~3.6 days,
-# 5m ~17 days, 15m ~52 days, 1h ~208 days, 4h ~833 days), so a daily series
-# has enough history to be scored. Realized vol needs >= 2 returns inside a
-# block, so it reads the coarse bank only at >= 1d (24 hourly returns a day).
+# Banks (review 2026-10-19; native intervals 2026-11-10). Hyperliquid serves
+# only the most recent ~5000 candles per interval (measured 2026-10-19: 1m
+# ~3.6 days, 5m ~17 days, 15m ~52 days, 1h ~208 days, 4h ~833 days). A series
+# at frequency ``f`` is cut from the COARSEST bank whose bar interval divides
+# ``f`` (:meth:`MarketCastConfig.bank_minutes`): the 1-minute bars
+# (``snapshot_days``), a native bank of ``native_intervals`` (5m / 15m,
+# ``native_history_days``) or the hourly coarse bank (``coarse_history_days``).
+# Every suite value is a function of the block's OHLCV candle (open = first
+# bar's open, high / low = max / min, close = last bar's close, volume = sum),
+# so cutting it from a finer bank gives the same value — the bank is only a
+# history-depth choice. Realized vol is Garman–Klass on that candle (2026-11-10,
+# owner: computable from native candles, so no 1-minute history is needed).
 COARSE_BAR_MINUTES = 60
 COARSE_MIN_FREQ_MINUTES = 60
-COARSE_MIN_FREQ_MINUTES_VOL = 1440
 
 _DUR_RE = re.compile(r"^([1-9][0-9]{0,4})(m|h|d)$")
 _DUR_MIN = {"m": 1, "h": 60, "d": 1440}
@@ -198,9 +230,17 @@ def duration_minutes(spec: str) -> int:
 
 def coarse_frequency(suite: str, freq_minutes: int) -> bool:
     """Whether ``suite`` at ``freq_minutes`` is cut from the snapshot's
-    coarse (hourly) bank rather than its 1-minute bars."""
-    lo = COARSE_MIN_FREQ_MINUTES_VOL if suite == "vol" else COARSE_MIN_FREQ_MINUTES
-    return int(freq_minutes) >= lo
+    coarse (hourly) bank: every whole-hour frequency (``suite`` is kept for
+    the call sites; since the Garman–Klass vol of 2026-11-10 no suite needs
+    finer bars inside a block)."""
+    f = int(freq_minutes)
+    return f >= COARSE_MIN_FREQ_MINUTES and f % COARSE_MIN_FREQ_MINUTES == 0
+
+
+def base_suite(label: str) -> str:
+    """A window's suite label → its configured suite (``"ohlcv.c"`` →
+    ``"ohlcv"``)."""
+    return str(label).split(".", 1)[0]
 
 
 def split_base_ref(ref: str) -> tuple[str, str]:
@@ -313,6 +353,19 @@ class MarketCastConfig:
     near_dup_tol: float = 0.02
     # F6 — trainer policy: open MarketCast legs per coldkey.
     max_open_legs_per_coldkey: int = 1
+    # Owner 2026-11-10 — one composite target (``mkt:market``) over every
+    # enabled suite: the gain is the geomean over suites of each suite's
+    # (class × horizon)-balanced gain, one cluster bootstrap for all; an entry
+    # whose gain LCB on ANY suite is below ``-composite_suite_floor`` fails
+    # (no-regression floor). ``false`` = the per-suite ``mkt:<suite>`` slots.
+    composite: bool = False
+    composite_suite_floor: float = 0.02
+    # ohlcv: the scoring weight of the open field (the other fields weigh 1)
+    ohlcv_open_weight: float = 0.0
+    # Native candle banks (owner 2026-11-10) and the days each carries; empty =
+    # the 1-minute + hourly banks only (the pre-2026-11-10 layout).
+    native_intervals: tuple[str, ...] = ()
+    native_history_days: tuple[tuple[str, int], ...] = (("15m", 50), ("5m", 21))
 
     def active(self, block: int | None) -> bool:
         """Whether MarketCast judges a settlement at ``block``."""
@@ -327,14 +380,64 @@ class MarketCastConfig:
         return mkt_base_pointer(self)
 
     @property
+    def target_names(self) -> tuple[str, ...]:
+        """The ``mkt:<name>`` lane-C target names this config defines:
+        ``("market",)`` when ``composite``, else one per suite."""
+        return (COMPOSITE_TARGET,) if self.composite else tuple(self.suites)
+
+    @property
     def target_suites(self) -> tuple[str, ...]:
-        """The suites whose ``mkt:<suite>`` lane-C targets are admitted —
-        none while MarketCast is inert."""
-        return tuple(self.suites) if self.from_block > 0 else ()
+        """The target names whose ``mkt:<name>`` lane-C targets are admitted
+        — none while MarketCast is inert."""
+        return self.target_names if self.from_block > 0 else ()
 
     @property
     def targets(self) -> tuple[str, ...]:
-        return tuple(f"mkt:{s}" for s in self.suites)
+        return tuple(f"mkt:{s}" for s in self.target_names)
+
+    def suites_of(self, name: str) -> tuple[str, ...]:
+        """The suites a target name is judged over (the composite: every
+        enabled suite)."""
+        return tuple(self.suites) if name == COMPOSITE_TARGET else (str(name),)
+
+    def series_labels(self, suite: str) -> tuple[str, ...]:
+        """The window suite labels of one suite: ``ohlcv`` → one per scored
+        field (``ohlcv.<field>``; the open only with ``ohlcv_open_weight``
+        > 0), every other suite itself."""
+        if suite != "ohlcv":
+            return (suite,)
+        return tuple(f"ohlcv.{f}" for f in OHLCV_FIELDS
+                     if f != "o" or float(self.ohlcv_open_weight) > 0)
+
+    @property
+    def native_history_map(self) -> dict[str, int]:
+        return dict(self.native_history_days)
+
+    def bank_minutes(self, freq_minutes: int) -> int:
+        """The bar interval (minutes) a series at ``freq_minutes`` is cut
+        from: the coarsest of 1m, the ``native_intervals`` and the hourly
+        bank that divides it."""
+        f = int(freq_minutes)
+        if coarse_frequency("", f):
+            return COARSE_BAR_MINUTES
+        best = 1
+        for iv in self.native_intervals:
+            m = duration_minutes(iv)
+            if f % m == 0 and m > best:
+                best = m
+        return best
+
+    def bank_days(self, bar_minutes: int) -> int:
+        """Days of history the bank of ``bar_minutes`` carries."""
+        bm = int(bar_minutes)
+        if bm == COARSE_BAR_MINUTES:
+            return int(self.coarse_history_days)
+        if bm == 1:
+            return int(self.snapshot_days)
+        for iv, d in self.native_history_days:
+            if duration_minutes(iv) == bm:
+                return int(d)
+        return int(self.snapshot_days)
 
     @property
     def assets_map(self) -> dict[str, tuple[str, ...]]:
@@ -404,9 +507,9 @@ def scorability_problems(mc: MarketCastConfig) -> list[str]:
     every one is scorable). Per enabled suite and horizon, at the frequency
     it is forecast at (:func:`cascade.eval.marketcast.window_geometry`):
 
-    * the snapshot's history at that frequency — ``coarse_history_days``
-      for a coarse-bank series, else ``snapshot_days`` — holds at least
-      ``MIN_CONTEXT + steps`` blocks;
+    * the history of the bank the series is cut from
+      (:meth:`MarketCastConfig.bank_days`) holds at least ``MIN_CONTEXT +
+      steps`` blocks;
     * the forward wait ``verdict_wait_blocks × BLOCK_SECONDS −
       start_margin_seconds`` holds at least TWO non-overlapping windows at
       the worst grid alignment (window origins sit on the absolute UTC grid,
@@ -424,7 +527,7 @@ def scorability_problems(mc: MarketCastConfig) -> list[str]:
             except ValueError as e:
                 out.append(f"{s}/{h}: {e}")
                 continue
-            days = mc.coarse_history_days if coarse_frequency(s, f) else mc.snapshot_days
+            days = mc.bank_days(mc.bank_minutes(f))
             blocks = int(days) * 1440 // int(f)
             if blocks < MIN_CONTEXT + steps:
                 out.append(f"{s}/{h} at {f}m: {days} days of history hold {blocks} blocks < "
@@ -672,6 +775,34 @@ def parse_marketcast(raw: object) -> MarketCastConfig:
                 integer=True)
     if molc < 1:
         raise ValueError("[marketcast] max_open_legs_per_coldkey must be >= 1")
+    comp = mc.get("composite", False)
+    if not isinstance(comp, bool):
+        raise ValueError(f"[marketcast] composite must be true or false; got {comp!r}")
+    floor = _num(mc.get("composite_suite_floor", 0.02), "composite_suite_floor")
+    if not 0.0 <= floor < 1.0:
+        raise ValueError(f"[marketcast] composite_suite_floor must be in [0, 1); got {floor}")
+    ow = _num(mc.get("ohlcv_open_weight", 0.0), "ohlcv_open_weight")
+    if not 0.0 <= ow <= 1.0:
+        raise ValueError(f"[marketcast] ohlcv_open_weight must be in [0, 1]; got {ow}")
+    nat = _str_list(mc.get("native_intervals", ()), "native_intervals")
+    if len(set(nat)) != len(nat) or not set(nat) <= set(NATIVE_INTERVALS):
+        raise ValueError(f"[marketcast] native_intervals must be unique members of "
+                         f"{NATIVE_INTERVALS}; got {list(nat)}")
+    nhd_raw = mc.get("native_history_days", {"5m": 21, "15m": 50})
+    if not isinstance(nhd_raw, dict):
+        raise ValueError(f"[marketcast] native_history_days must be a table interval -> days; "
+                         f"got {nhd_raw!r}")
+    nhd = {"5m": 21, "15m": 50}
+    for iv, d in nhd_raw.items():
+        if iv not in NATIVE_INTERVALS:
+            raise ValueError(f"[marketcast] native_history_days names {iv!r}; intervals are "
+                             f"{NATIVE_INTERVALS}")
+        nhd[iv] = _num(d, f"native_history_days.{iv}", integer=True)
+        if nhd[iv] < 1:
+            raise ValueError(f"[marketcast] native_history_days.{iv} must be >= 1")
+    if comp and len(suites) < 2:
+        raise ValueError("[marketcast] composite needs at least two suites (one suite is its "
+                         "own mkt:<suite> target)")
     from .training import _continuation_protocol
     cfg_out = MarketCastConfig(
         continuation_protocol=_continuation_protocol(mc.get("continuation_protocol", "")),
@@ -694,6 +825,8 @@ def parse_marketcast(raw: object) -> MarketCastConfig:
         coverage_gate_levels=cgl, zero_scale_frac=zsf, cell_ratio_cap=cap, tail_levels=tls,
         tail_tolerance=ttol, calibration_z=cz, near_dup_tol=ndt,
         max_open_legs_per_coldkey=molc,
+        composite=comp, composite_suite_floor=floor, ohlcv_open_weight=ow,
+        native_intervals=nat, native_history_days=tuple(sorted(nhd.items())),
     )
     unscorable = scorability_problems(cfg_out)
     if unscorable:
@@ -744,5 +877,6 @@ __all__ = [
     "IMPLEMENTED_SOURCES", "PERP_CLASSES", "SUITE_CLASSES", "TIMESTRAL_PINNED_REF",
     "TIMESTRAL_REVISION", "TIMESTRAL_SHA256", "arming_problems", "check_marketcast_arming",
     "split_sources", "COARSE_BAR_MINUTES", "MIN_CONTEXT", "coarse_frequency",
-    "mkt_base_pointer", "scorability_problems",
+    "mkt_base_pointer", "scorability_problems", "COMPOSITE_LAUNCH_SUITES", "COMPOSITE_TARGET",
+    "NATIVE_INTERVALS", "OHLCV_FIELDS", "OHLCV_FIELD_NAMES", "base_suite",
 ]

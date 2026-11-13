@@ -42,12 +42,15 @@ def test_shipped_tables_parse_inert(toml):
     mc = cfg.marketcast
     assert mc.from_block == 0 and not mc.active(10**9)
     assert mc.target_suites == ()
-    assert mc.suites == ("returns", "vol") and mc.base_arch == "timestral"
+    from cascade.shared.config.marketcast import COMPOSITE_LAUNCH_SUITES
+
+    assert mc.suites == COMPOSITE_LAUNCH_SUITES and mc.base_arch == "timestral"
     assert mc.pool_prefix == "pool_mkt" and mc.gain_margin == 0.01
     assert mc.quantile_knots == TIMESTRAL_KNOTS and len(TIMESTRAL_KNOTS) == 21
-    # MarketCast-only lane C: the shipped targets are exactly its suites
+    # MarketCast-only lane C: the shipped target is its ONE composite slot
+    # (owner 2026-11-10)
     assert all(is_mkt_target(t) for t in cfg.lane_c.targets)
-    assert tuple(t.split(":", 1)[1] for t in cfg.lane_c.targets) == mc.suites
+    assert mc.composite and tuple(cfg.lane_c.targets) == mc.targets == ("mkt:market",)
 
 
 def test_missing_table_is_the_default():
@@ -206,9 +209,10 @@ def test_shipped_marketcast_cannot_admit_mkt_targets():
     """Off ⇒ the intake / commit / recipe surfaces admit no mkt: target,
     while the shipped [lane_c] targets still load (they are inactive)."""
     cfg = load_chain_config("chain.toml")
-    with pytest.raises(ValueError):
-        check_target("mkt:returns", mkt_suites=cfg.marketcast.target_suites)
-    assert cfg.lane_c.targets == ("mkt:returns", "mkt:vol")
+    for t in ("mkt:returns", "mkt:market"):
+        with pytest.raises(ValueError):
+            check_target(t, mkt_suites=cfg.marketcast.target_suites)
+    assert cfg.lane_c.targets == ("mkt:market",)
 
 
 # ── recipe ──────────────────────────────────────────────────────────────────
@@ -581,7 +585,9 @@ def test_miner_cli_refuses_mkt_while_inactive(tmp_path):
     assert mkt_inactive(cfg, "domain:energy") is None
     from cascade.shared.config.lane_c import parse_lane_c as _plc
 
-    armed = replace(cfg, marketcast=replace(cfg.marketcast, from_block=7200),
+    # the per-suite shape (composite = false) admits mkt:returns
+    armed = replace(cfg, marketcast=replace(cfg.marketcast, from_block=7200, composite=False,
+                                            suites=("returns", "vol")),
                     lane_c=_plc({"targets": ["mkt:returns"]}, mkt_suites=("returns", "vol")))
     d = tmp_path / "tree"
     d.mkdir()
