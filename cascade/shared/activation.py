@@ -1163,6 +1163,12 @@ def resolve_activation(
         log.info("activation: %s LOCKED IN at boundary %d (%.1f%% of eligible stake, %d/%d "
                  "validators) — rollover at block %d", feature, boundary, 100 * t.ratio,
                  len(t.signed), len(t.eligible), act)
+        # the drift guard's "type this" (cascade.shared.decided): the decided
+        # block belongs in the release chain.toml + decided_votes.toml once it
+        # has applied — a hand edit on one node is how main drifted (2026-11-13)
+        from .decided import type_hint
+
+        log.warning("activation: %s", type_hint(feature, act))
     else:
         log.info("activation: %s at boundary %d: %.1f%% of eligible stake signed (%d/%d "
                  "validators, threshold %.0f%%) — not yet", feature, boundary, 100 * t.ratio,

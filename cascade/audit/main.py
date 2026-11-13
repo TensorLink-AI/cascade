@@ -17,6 +17,10 @@ Commands:
   with torch + the ``timestral`` extra installed, re-forecasts a sample of
   windows from the public checkpoints. It reports; it never changes
   consensus.
+* ``cascade-audit decided`` — the drift guard: ``chain.toml`` vs
+  ``decided_votes.toml`` (the fleet's decided on-chain votes and the live
+  image pins) and, with ``--state-dir``, vs this node's persisted lock-ins.
+  Prints the exact lines to type; exit 1 on drift. Reads only.
 
 ``--tier`` picks the depth (0 = seconds/CPU, 1 = +corpus re-derivation,
 2 = +re-training, experimental). ``--json`` emits machine-readable results.
@@ -116,6 +120,21 @@ def _build_parser() -> argparse.ArgumentParser:
                        help="--reproduce forecast device (default cpu).")
     mkt_p.add_argument("--workdir", type=Path, default=Path("./_audit_work/marketcast"))
     mkt_p.add_argument("--json", action="store_true")
+    dec_p = sub.add_parser(
+        "decided",
+        help="Drift guard: compare chain.toml with decided_votes.toml (the fleet's decided "
+             "on-chain votes and live image pins) and, with --state-dir, with this node's "
+             "activation_*_state.json lock-ins. Prints the exact lines to type. Exit 1 on drift.")
+    dec_p.add_argument("--config", type=Path, default=None,
+                       help="chain.toml path (default: the repo's).")
+    dec_p.add_argument("--decided", type=Path, default=None,
+                       help="decided_votes.toml path (default: beside --config).")
+    dec_p.add_argument("--state-dir", type=Path, default=None,
+                       help="A service's state dir (its activation_*_state.json files): also "
+                            "report lock-ins this node holds that the record lacks or disputes.")
+    dec_p.add_argument("--as-of-block", type=int, default=None,
+                       help="Judge 'applied' against this block (default: the record's).")
+    dec_p.add_argument("--json", action="store_true")
     round_p = sub.add_parser("round", help="Audit one round by id.")
     round_p.add_argument("round_id", help="Round id (the base seed / manifest round_id).")
     sub.add_parser("latest", help="Audit the newest published receipt.")
@@ -638,6 +657,27 @@ def audit_receipt(
     return results
 
 
+def _decided(args) -> int:
+    """``cascade-audit decided`` — the decided-votes drift guard (reads only)."""
+    from ..shared import decided as D
+
+    cfg = load_chain_config(args.config)
+    decided_path = args.decided or D.default_decided_path(args.config)
+    record = D.load_decided(decided_path)
+    findings = D.drift_report(cfg, record, as_of_block=args.as_of_block)
+    if args.state_dir is not None:
+        findings += D.state_report(D.read_state_records(args.state_dir), record)
+    if args.json:
+        print(json.dumps({"ok": not any(f.fails for f in findings),
+                          "as_of_block": int(args.as_of_block or record.as_of_block),
+                          "decided": str(decided_path),
+                          "findings": [f.as_dict() for f in findings]}, indent=2,
+                         sort_keys=True))
+    else:
+        print(D.render(findings))
+    return 1 if any(f.fails for f in findings) else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     # DEC-CA-0067: this process votes on / acts on the v2b vote — a config
     # whose pinned feature is missing or wrong refuses to load
@@ -653,6 +693,8 @@ def main(argv: list[str] | None = None) -> int:
         return _marketcast(args)
     if args.command == "bench":
         return _bench(args)
+    if args.command == "decided":
+        return _decided(args)
     logging.basicConfig(level=args.log_level,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     cfg = load_chain_config(args.config)
