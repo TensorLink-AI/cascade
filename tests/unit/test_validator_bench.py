@@ -220,6 +220,9 @@ def test_loader_refuses_v2_go_live_without_a_main_validator(tmp_path):
     text = re.sub(r"(?m)^(\[v2\]\n(?:[^\[][^\n]*\n)*?from_block\s*=\s*)\d+", rf"\g<1>{v2}",
                   (root / "chain.toml").read_text(encoding="utf-8"))
     assert f"from_block = {v2}" in text
+    # the shipped file types the v2b switch (9493200); keep it OPEN here so the
+    # loader's "precedes [v2] from_block" check does not fire before the one under test
+    text = re.sub(r"(?m)^image_decoupled_from_block\s*=\s*\d+", "image_decoupled_from_block = 0", text)
     text = text.replace(f'owner_hotkey = "{cfg.netconfig.owner_hotkey}"', 'owner_hotkey = ""', 1)
     p = tmp_path / "chain.toml"
     p.write_text(text, encoding="utf-8")
