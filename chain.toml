@@ -284,13 +284,13 @@ ops_gpu_cooldown_seconds = 10800
 # operators (a validator on a stale value silently picks a different snapshot).
 # NOT part of contract_digest ([training] only). The DEC-CA-0045 rollover
 # switches it to [activation] epoch_blocks_after.
-epoch_blocks     = 3600   # ≈12h at a 12s block time
+epoch_blocks     = 900    # DECIDED rollover (rolling-era-king, lock 9133200 → 9136800): 3600 → 900 (3h)
 round_hours      = 12.0   # informational: wall-clock span of an epoch
 # Scheduled switch (0/0 = steady state). Last used: 7200 → 3600 at 8726400,
 # 2026-07-29. To schedule another, the block must be a boundary of BOTH grids
 # (load-checked); set both back to 0 once it is safely past.
-epoch_blocks_prev      = 0
-epoch_activation_block = 0
+epoch_blocks_prev      = 3600      # DECIDED rollover typed (see rolling_from_block)
+epoch_activation_block = 9136800   # DECIDED rollover typed (see rolling_from_block)
 # Rolling intake + era king (DEC-CA-0043, block-gated). Trainer POLICY: from
 # this block challengers train the moment they are funded, legs cross
 # boundaries, every boundary publishes ONE settlement manifest (era king +
@@ -305,7 +305,11 @@ epoch_activation_block = 0
 # the six external validators run a release carrying the era envelope.
 # With every key at 0 the block is DECIDED ON CHAIN by validator stake
 # ([activation] below, DEC-CA-0045); typing a block here overrides that.
-rolling_from_block = 0
+# DECIDED 2026-10-31 (lock-in 9133200 → 9136800, the block the trainer's
+# published 900-block settlements have followed since). Typed 2026-11-13 so a
+# restarting node needs no activation history or archive RPC; a node whose own
+# record says otherwise follows this typed value (configured_rollover).
+rolling_from_block = 9136800
 # Settlements per era (consecutive boundaries sharing one set of training
 # seeds, one init and one cached king checkpoint): 4 on the 3h grid = 12h
 # eras — today's king-leg cadence with 3h verdicts inside it.
@@ -692,7 +696,7 @@ increment_from_block = 9046800  # = cohort_maxt_from_block (both flip at the eve
 # Do NOT type "v2" / a block after the rollover here: it breaks that ordering
 # (apply_activation refuses it) and would move live pre-v2 era-king
 # settlements back to level units (2026-10-20 review; DEC-CA-0039 note).
-cohort_maxt_increment_from_block = 0
+cohort_maxt_increment_from_block = 9136800   # DECIDED rollover typed (what apply_activation sets)
 # Multivariate scoring activation (DEC-CA-0041): from this block a multivariate
 # window's channels are averaged into ONE per-window contribution (GIFT-Eval
 # weighting — the window counts once, not once per channel), so the round point
@@ -742,12 +746,12 @@ margin_v2_from_block    = 9194400   # TYPED 2026-11-01 (DEC-CA-0067): = the bloc
 # pinned). Must equal [round] rolling_from_block and be >=
 # cohort_maxt_increment_from_block >= cohort_maxt_from_block (load-checked).
 # 0 = off (bit-identical to the ungated validator).
-era_king_from_block = 0
+era_king_from_block = 9136800   # DECIDED rollover typed
 # Tenure / ripeness in BLOCKS from the rollover (CONSENSUS): the margin decay
 # and the promotion clock keep their wall-time length across the 3600 → 900
 # grid switch instead of running 4× faster. Both *_blocks values are inert
 # until tenure_blocks_from_block is set (= ROLLOVER).
-tenure_blocks_from_block = 0
+tenure_blocks_from_block = 9136800   # DECIDED rollover typed
 margin_warmup_blocks = 28800     # = 8 rounds × 3600 blocks (~4 d) — same decay as today
 cascade_reign_blocks = 18000     # = 5 rounds × 3600 blocks (~2.5 d) — same ripeness as today
 king_resync_max_blocks = 18000   # = king_resync_max_rounds (5) × 3600 blocks — same valve as today
@@ -1123,7 +1127,9 @@ dormant_after_blocks = 0
 [v2]
 launch_at_utc = "2026-10-30T12:00:00Z"
 commit_open_at_utc = "2026-10-30T09:00:00Z"  # V2 reveals queue here; training waits for v2
-commit_from_block = 0  # resolved from finalized timestamps, or explicitly pinned by operator
+# Pinned 2026-11-13: block 9395601 is the first finalized block at/after
+# commit_open_at_utc (stamped 2026-10-30T09:00:00Z; archive read).
+commit_from_block = 9395601
 prelaunch_burn_readiness = "r2"
 # cascade v2 (DEC-CA-0050): Cascade-MOE-28M king lineage (lane A) + the
 # domain-expert lane (lane B). Finalized chain timestamps resolve launch_at_utc
@@ -1135,7 +1141,10 @@ prelaunch_burn_readiness = "r2"
 # router bites once the routing gate opens, receipts stamp `v2_block`, and
 # lane A keeps 100 % until another lane launches. Planned order: C first
 # (A/C 75/25), then B (A/B/C 50/25/25); activation remains separate for each.
-from_block = 0
+# Pinned 2026-11-13 = what launch_at_utc resolved to: the 12:00:00Z crossing is
+# block 9396501, the next era start on the decided grid is 9136800 + 73×3600.
+# With both blocks typed a restart reads no historical timestamps (no archive).
+from_block = 9399600
 # Rides the same go-live (DEC-CA-0054): every v2 settlement enforces the
 # bench gate (the mode; the RULE is DEC-CA-0054's three suites + six-number
 # geomean only until bench_gate_v2_from_block below, which on mainnet is the
