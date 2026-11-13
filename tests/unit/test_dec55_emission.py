@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from cascade.eval.expert_lane import LaneBWin
-from cascade.shared.config import load_chain_config, parse_lane_b
+from cascade.shared.config import parse_lane_b
 from cascade.shared.emission import (
     COURT_BLOCKS,
     EmissionPolicy,
@@ -27,8 +27,11 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.fixture(scope="module")
-def typed():
-    cfg = load_chain_config(ROOT / "chain.toml")
+def typed(tmp_path_factory):
+    # a synthetic v2 gate + the burn VOTE: the pre-decision release file
+    from tests.unit.predecision_main import predecision_main
+
+    cfg = predecision_main(tmp_path_factory.mktemp("predecision"))
     era = cfg.round.epoch_blocks * cfg.round.era_settlements
     gate = 10_000 * era
     cfg = replace(cfg, v2=replace(cfg.v2, from_block=gate),

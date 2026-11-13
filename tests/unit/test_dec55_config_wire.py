@@ -27,11 +27,13 @@ CID = "alice/gen@sha256:" + "a" * 64
 CKPT = format_trained_pointer("cascade/ckpt@sha256:" + "b" * 64)
 
 
-def test_mainnet_and_testnet_values():
+def test_mainnet_and_testnet_values(tmp_path):
     v2 = load_chain_config(ROOT / "chain.toml").v2
     assert (v2.random_init_eras, v2.reign_warm_start_blocks, v2.prelaunch_burn,
             v2.carryover_king_share, v2.king_ladder) == (14, 21600, 0.95, 0.05, True)
-    assert v2.prelaunch_burn_from_block == 0                  # decided by the vote
+    assert v2.prelaunch_burn_from_block == 9486900            # decided by the vote, typed 2026-11-13
+    from tests.unit.predecision_main import predecision_main
+    assert predecision_main(tmp_path).v2.prelaunch_burn_from_block == 0   # the vote decided it
     t = load_chain_config(ROOT / "chain.testnet.toml").v2
     assert (t.random_init_eras, t.reign_warm_start_blocks, t.prelaunch_burn,
             t.carryover_king_share, t.king_ladder) == (0, 0, 0.0, 0.0, False)

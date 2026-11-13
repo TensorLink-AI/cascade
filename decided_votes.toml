@@ -50,8 +50,10 @@ feature = "prelaunch-95-r2"
 lock_block = 9486000
 activation_block = 9486900
 source = "tally"
-type_it = false
-reason = "HELD (owner decision pending, 2026-11-13): decided and applied on every node seen (operator + the external validator's note both carry 9486000:9486900); typing [v2] prelaunch_burn_from_block = 9486900 is behaviour-identical and frees another note segment, but it is a release chain.toml edit the owner has not yet approved. Next one-line PR."
+# typed in chain.toml 2026-11-13 (owner go): decided on every node seen
+# (operator + the external validator's note both carry 9486000:9486900).
+# Behaviour-identical: the burn applies only before the first v2 settlement
+# and v2 is active from 9399600, so it never applied.
 
 [[vote]]
 feature = "v2b-69630f92"

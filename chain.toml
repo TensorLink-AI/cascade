@@ -1210,6 +1210,11 @@ reign_warm_start_blocks = 21600
 # to burn_uid (miners keep their split of the rest); it ends at the first v2
 # settlement. prelaunch_burn_from_block = <block> types it instead (override).
 prelaunch_burn = 0.95
+# DECIDED (prelaunch-95-r2: lock 9486000 → 9486900, the block every node seen
+# carries); typed 2026-11-13 (owner go). Behaviour-identical: the burn applies
+# only before the first v2 settlement (emission_policy), and v2 is active from
+# 9399600 < 9486900, so it never applied — typing frees the note segment.
+prelaunch_burn_from_block = 9486900
 # The carried (toto2) king's court is paid at most 5 % of total emissions from
 # the v2 block until a king is crowned at a v2 settlement (lane B unchanged).
 carryover_king_share = 0.05

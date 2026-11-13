@@ -26,6 +26,8 @@ UNTYPED = (
     ("scoring", "tenure_blocks_from_block", "0"),
     ("v2", "commit_from_block", "0"),
     ("v2", "from_block", "0"),
+    # absent before (the vote decided it): None = delete the typed line
+    ("v2", "prelaunch_burn_from_block", None),
 )
 
 
@@ -38,8 +40,12 @@ def predecision_text(text: str | None = None) -> str:
         assert head, section
         nxt = re.search(r"(?m)^\[", text[head.end():])
         end = head.end() + (nxt.start() if nxt else len(text) - head.end())
-        body, n = re.subn(rf"(?m)^{re.escape(key)}(\s*)=\s*[^\n#]*?(\s*#.*)?$",
-                          rf"{key}\g<1>= {value}", text[head.end():end], count=1)
+        if value is None:
+            body, n = re.subn(rf"(?m)^{re.escape(key)}\s*=[^\n]*\n", "",
+                              text[head.end():end], count=1)
+        else:
+            body, n = re.subn(rf"(?m)^{re.escape(key)}(\s*)=\s*[^\n#]*?(\s*#.*)?$",
+                              rf"{key}\g<1>= {value}", text[head.end():end], count=1)
         assert n == 1, (section, key)
         text = text[:head.end()] + body + text[end:]
     return text

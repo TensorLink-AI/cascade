@@ -30,7 +30,9 @@ def test_release_has_the_noon_utc_launch_and_separate_update_vote(tmp_path):
     assert predecision_main(tmp_path).v2.from_block == 0
     assert cfg.v2.launch_at_utc == "2026-10-30T12:00:00Z"
     assert cfg.v2.prelaunch_burn == 0.95
-    assert cfg.v2.prelaunch_burn_from_block == 0
+    # 2026-11-13: the decided pre-launch burn vote is typed (inert post-v2)
+    assert cfg.v2.prelaunch_burn_from_block == 9486900
+    assert predecision_main(tmp_path).v2.prelaunch_burn_from_block == 0
     assert cfg.activation.threshold == 0.51
     assert prelaunch_burn_feature(cfg).name == "prelaunch-95-r2"
 
@@ -194,7 +196,11 @@ def test_shipped_main_restarts_on_a_lite_rpc_without_reading_history(tmp_path):
     # the startup trial nor the first poll reads a single block timestamp.
     from dataclasses import fields, is_dataclass
 
-    from cascade.shared.activation import apply_activation, configured_rollover
+    from cascade.shared.activation import (
+        apply_activation,
+        apply_prelaunch_burn_activation,
+        configured_rollover,
+    )
 
     shipped = load_chain_config()
     assert configured_rollover(shipped) == 9136800
@@ -215,7 +221,8 @@ def test_shipped_main_restarts_on_a_lite_rpc_without_reading_history(tmp_path):
     opening = launch_timestamp(before.v2.commit_open_at_utc)
     real = SimpleNamespace(finalized_block=lambda: head,
                            block_timestamp=lambda b: opening + (b - 9395601) * 12.0)
-    live = resolve_calendar_launch(apply_activation(before, 9136800), real)
+    live = apply_prelaunch_burn_activation(
+        resolve_calendar_launch(apply_activation(before, 9136800), real), 9486900)
     assert (live.v2.from_block, live.v2.commit_from_block) == (9399600, 9395601)
     diffs = []
     for f in fields(shipped):
@@ -227,4 +234,5 @@ def test_shipped_main_restarts_on_a_lite_rpc_without_reading_history(tmp_path):
         elif a != b:
             diffs.append((f.name,))
     # the only difference is the marker that the rollover was resolved, not typed
-    assert diffs == [("activation", "resolved_block")]
+    assert diffs == [("activation", "resolved_block"),
+                     ("activation", "resolved_prelaunch_burn_block")]

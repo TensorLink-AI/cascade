@@ -27,13 +27,15 @@ def _flat(doc, prefix=""):
 def test_predecision_main_is_the_exact_inverse():
     shipped = _flat(tomllib.loads((REPO / "chain.toml").read_text()))
     before = _flat(tomllib.loads(predecision_text()))
-    assert shipped.keys() == before.keys()
-    differ = {k for k in shipped if shipped[k] != before[k]}
+    removed = {f"{s}.{k}" for s, k, v in UNTYPED if v is None}
+    assert shipped.keys() - before.keys() == removed and before.keys() <= shipped.keys()
+    differ = {k for k in before if shipped[k] != before[k]} | removed
     want = {f"{section}.{key}" for section, key, _ in UNTYPED}
     # every untyped line really is typed in the release, and nothing else moved
     assert differ == want
     for section, key, value in UNTYPED:
-        assert before[f"{section}.{key}"] == tomllib.loads(f"x = {value}")["x"]
+        if value is not None:
+            assert before[f"{section}.{key}"] == tomllib.loads(f"x = {value}")["x"]
     # the decided values themselves (a bad edit to either side fails here)
     assert {k: shipped[k] for k in want} == {
         "round.epoch_blocks": 900, "round.epoch_blocks_prev": 3600,
@@ -41,4 +43,5 @@ def test_predecision_main_is_the_exact_inverse():
         "scoring.cohort_maxt_increment_from_block": 9136800,
         "scoring.era_king_from_block": 9136800, "scoring.tenure_blocks_from_block": 9136800,
         "v2.commit_from_block": 9395601, "v2.from_block": 9399600,
+        "v2.prelaunch_burn_from_block": 9486900,
     }

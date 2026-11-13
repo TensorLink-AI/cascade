@@ -82,7 +82,8 @@ def test_inert_by_default(tmp_path):
     # 2026-11-13: main types v2 at 9399600 ⇒ inert through the settlement AT the
     # block, then a pre-v2 king is capped at the carryover share
     cfg = load_chain_config(ROOT / "chain.toml")
-    assert cfg.v2.prelaunch_burn_from_block == 0
+    # the decided burn block is typed, but it follows the v2 block: never applies
+    assert cfg.v2.prelaunch_burn_from_block == 9486900 > cfg.v2.from_block
     assert emission_policy(cfg, boundary=9399600, king_since_block=None).inert
     assert (emission_policy(cfg, boundary=10**9, king_since_block=None)
             == EmissionPolicy(lane_a_cap=cfg.v2.carryover_king_share) and not
