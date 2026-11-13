@@ -640,16 +640,19 @@ def _validator_setup(cfg, *, on: bool):
 
 
 V2_IMAGE = load_chain_config(REPO / "chain.toml").training.v2_contract.train_image_digest
+# The shipped era's own protocol (main ships continuation ON since 2026-11-13).
+V2_PROTO = load_chain_config(REPO / "chain.toml").training.v2_contract.continuation_protocol
 
 
-def _stamp(m, numerics, *, entry_numerics=None, digest=None, image=None, protocol=""):
+def _stamp(m, numerics, *, entry_numerics=None, digest=None, image=None, protocol=None):
     """Stamp the DEC-CA-0067 fields like the trainer: numerics + the leg's OWN
     runtime terms (``image`` defaults to the era's pin, or OLD with an
-    old-image ``digest``)."""
+    old-image ``digest``; ``protocol`` defaults to the era contract's)."""
     img = image if image is not None else (OLD if digest else V2_IMAGE)
+    proto = V2_PROTO if protocol is None else protocol
     entries = [replace(e, numerics_contract_digest=(numerics if entry_numerics is None
                                                     else entry_numerics),
-                       train_image_digest=img, continuation_protocol=protocol,
+                       train_image_digest=img, continuation_protocol=proto,
                        **({"training_contract_digest": digest} if digest else {}))
                for e in m.entries]
     return replace(m, entries=entries, numerics_contract_digest=numerics)
@@ -667,6 +670,14 @@ def test_validator_active_accepts_image_only_and_rejects_numerics_or_missing(cfg
     n = numerics_contract_digest(v2c)
     assert r.check_manifest(_stamp(m, n, digest=old)) is None          # image-only: accepted
     assert r.check_manifest(_stamp(m, n)) is None
+    # a leg trained with continuation OFF (the carried king, pre-2026-11-13
+    # legs) still verifies in an era whose contract ships it ON — and vice versa
+    off = contract_digest(replace(v2c, train_image_digest=OLD, continuation_protocol=""))
+    assert r.check_manifest(_stamp(m, n, digest=off, protocol="")) is None
+    on = contract_digest(replace(v2c, train_image_digest=OLD, continuation_protocol=PROTO))
+    assert r.check_manifest(_stamp(m, n, digest=on, protocol=PROTO)) is None
+    assert r.check_manifest(_stamp(m, n, digest=off, protocol=PROTO)).startswith(
+        "era_entry_contract_unproven")                                  # lying protocol
     other = numerics_contract_digest(replace(v2c, base_lr=v2c.base_lr * 2))
     assert r.check_manifest(_stamp(m, n, entry_numerics=other)).startswith(
         "era_entry_numerics_mismatch")

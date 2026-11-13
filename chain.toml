@@ -1350,6 +1350,11 @@ router_lr_scale = 0.1
 route_bias_rate_scale = 0.25
 # Fit the existing 50B unique-corpus cap; the full reference preset is 27,500.
 training_steps = 23841
+# Mid-run continuation snapshots (live on the trainer since 2026-11-13 20:42).
+# Runtime-only (manifest.IMAGE_RUNTIME_FIELDS): excluded from the numerics
+# digest validators check; each leg's own protocol is proven per entry via
+# CONTINUATION_PROTOCOLS, so legs trained with or without it both verify.
+continuation_protocol = "cascade-continuation/1"
 train_image_digest = "sha256:5d41d94bc0c0d3ae3dfd042b0cc7e4d900c7d1f48173808436c12bf764a67641"   # rc15, LIVE since 2026-10-31 (was rc11 2fd193ca…); synced to main 2026-11-13
 expected_gpu = ""
 long_series = "crop"
