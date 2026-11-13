@@ -50,7 +50,32 @@ def check_calendar_launch(cfg, client) -> None:
     """
     if not dated_launch_pending(cfg):
         return
-    check_launch_loads(cfg, int(client.finalized_block()))
+    head = int(client.finalized_block())
+    if launch_date_passed(cfg, client, head):
+        # 2026-11-13: the trial below arms v2 at the era AFTER the head — right
+        # before the date, wrong after it: the real block is in the past
+        # (mainnet 9399600), so a typed later switch (``[v2]
+        # image_decoupled_from_block = 9493200``, #457) "precedes" the fake
+        # trial block and every node that pulled main refused to start. Past
+        # the date, the first poll's :func:`resolve_calendar_launch` parses the
+        # config at the REAL block from finalized timestamps and refuses a
+        # config that cannot load there.
+        return
+    check_launch_loads(cfg, head)
+
+
+def launch_date_passed(cfg, client, head: int) -> bool:
+    """The finalized head is at or past ``[v2] launch_at_utc`` (chain time).
+    ``False`` when the head's timestamp cannot be read — the pre-date trial
+    then runs as before (refusing is the safe side)."""
+    target = launch_timestamp(cfg.v2.launch_at_utc)
+    if target is None:
+        return False
+    try:
+        stamp = float(client.block_timestamp(int(head)))
+    except Exception:  # noqa: BLE001 — unreadable chain time: keep the trial
+        return False
+    return math.isfinite(stamp) and stamp >= target
 
 
 def _first_finalized_at(client, head, target):
