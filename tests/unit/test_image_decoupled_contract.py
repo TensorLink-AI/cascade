@@ -133,8 +133,12 @@ def test_knobs_ship_typed_on_mainnet_and_off_on_testnet():
     assert cfg.v2.eval_n_windows_after == 4000
     assert cfg.v2.prior_train_image_digests == ()
     assert cfg.activation.resolved_image_decoupled_block == 0
-    assert image_decoupled_at(cfg, 9493200) and not image_decoupled_at(cfg, 9493199)
-    assert v2_eval_windows_at(cfg, 10**9) == 4000
+    assert image_decoupled_at(cfg, 10**9) and v2_eval_windows_at(cfg, 10**9) == 4000
+    # on the live 900 grid (the fleet's resolved rollover) the settlement AT
+    # the switch block is the previous era's last; the next one is under the rule
+    live = replace(cfg, round=replace(cfg.round, rolling_from_block=9136800, epoch_blocks=900,
+                                      epoch_blocks_prev=3600, epoch_activation_block=9136800))
+    assert not image_decoupled_at(live, 9493200) and image_decoupled_at(live, 9494100)
     # testnet: still decided on chain, inert until then
     cfg = load_chain_config(REPO / "chain.testnet.toml")
     assert cfg.v2.image_decoupled_from_block == 0
