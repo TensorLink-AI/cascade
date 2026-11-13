@@ -270,16 +270,9 @@ def drift_report(cfg: ChainConfig, record: DecidedRecord, *,
             continue
         typed = int(config_value(cfg, key) or 0)
         if v.feature not in features:
-            if typed and typed == v.activation_block:
-                # typed and therefore not computed as an open vote (forfeit
-                # with its hotkeys, say) — that is the goal state
-                out.append(Finding(OK, v.feature, key, v.activation_block, typed))
-                continue
-            if typed:
-                out.append(Finding(MISMATCH, v.feature, key, v.activation_block, typed,
-                                   detail="typed to a block the fleet did not decide",
-                                   fix=toml_line(key, v.activation_block)))
-                continue
+            # a typed feature keeps its computed name (the spec carries the
+            # typed block), so a missing name means the params changed or the
+            # vote was retired — whatever the key says
             out.append(Finding(STALE, v.feature, key, v.activation_block, typed,
                                detail="the config computes no feature of this name (vote "
                                "params changed = a fresh vote, or the vote was retired); "
