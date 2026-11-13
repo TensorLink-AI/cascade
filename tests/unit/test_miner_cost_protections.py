@@ -230,7 +230,10 @@ def test_poll_command_prints_the_progress_record_before_the_token(tmp_path):
     host = RemoteHost(name="x", host="h", workdir=str(tmp_path))
     cmd = remote_mod._detached_poll_command(host, str(rd))
     out = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True).stdout
-    assert out.splitlines() == ["RUNNING"]                       # no file: unchanged
+    # no progress file: the resource line, then the token (2026-11-13)
+    assert out.splitlines()[-1] == "RUNNING" and len(out.splitlines()) == 2
+    assert out.splitlines()[0].startswith(remote_mod.DETACHED_RESOURCES_MARK)
+    assert parse_progress(out.splitlines()) is None
     (rd / "progress.json").write_text('{"step": 50,\n "tokens": 7}')
     out = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True).stdout
     lines = out.splitlines()

@@ -559,12 +559,109 @@ def _progress_prefix(run_dir: str) -> str:
     return f"{PROGRESS_FILE_ENV}={shlex.quote(detached_progress_path(run_dir))} "
 
 
+# 2026-11-13: three legs died with the pod dark 6-15 min and back with its run
+# dir GONE (empty log tails) at steps 14400-16450 — container recreated, or a
+# leak of ours killing it? Every poll now reads the pod's resources (host
+# MemAvailable, the container cgroup's memory use/limit, free disk in the
+# workdir, kernel uptime, pid 1's start) on one line before the token, so the
+# lead-up to a death is on record and a restart/reboot is PROVEN, not guessed.
+DETACHED_RESOURCES_MARK = "RES:"
+# fields, in order: mem_avail_kb cg_mem_bytes cg_max uptime_s pid1_start_ticks disk_free_kb
+_RESOURCES_SHELL = (
+    "printf '" + DETACHED_RESOURCES_MARK + "%s %s %s %s %s %s\\n' "
+    "\"$(awk '/^MemAvailable:/{print $2}' /proc/meminfo 2>/dev/null)\" "
+    "\"$(cat /sys/fs/cgroup/memory.current 2>/dev/null"
+    " || cat /sys/fs/cgroup/memory/memory.usage_in_bytes 2>/dev/null)\" "
+    "\"$(cat /sys/fs/cgroup/memory.max 2>/dev/null"
+    " || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null)\" "
+    "\"$(cut -d' ' -f1 /proc/uptime 2>/dev/null)\" "
+    "\"$(awk '{print $22}' /proc/1/stat 2>/dev/null)\" "
+    "\"$(df -Pk . 2>/dev/null | awk 'NR==2{print $4}')\"; "
+)
+# Resource samples kept per leg (one per poll: 30 s × 120 = the last hour);
+# one INFO line of them every RESOURCE_LOG_SECONDS while the worker runs.
+RESOURCE_HISTORY = 120
+RESOURCE_LOG_SECONDS = 1800
+
+
+def parse_resources(lines) -> dict | None:
+    """The resource record a poll printed (:data:`DETACHED_RESOURCES_MARK`),
+    or ``None``. Missing / unreadable fields are ``None``; never raises."""
+    names = ("mem_avail_kb", "cg_mem_bytes", "cg_max", "uptime_s", "pid1_start", "disk_free_kb")
+    for ln in lines:
+        if not ln.startswith(DETACHED_RESOURCES_MARK):
+            continue
+        vals = ln[len(DETACHED_RESOURCES_MARK):].split(" ")
+        out: dict = {}
+        for name, raw in zip(names, vals + [""] * len(names), strict=False):
+            raw = raw.strip()
+            if name == "cg_max" and raw == "max":
+                out[name] = "max"
+                continue
+            try:
+                out[name] = float(raw) if name == "uptime_s" else int(raw)
+            except ValueError:
+                out[name] = None
+        return out
+    return None
+
+
+def resource_verdict(history: list[dict]) -> str:
+    """What the resource samples PROVE about a death (``""`` = nothing):
+    pid 1 started again (container recreated) or the kernel uptime went
+    backwards (host rebooted) between the first and the last sample."""
+    seen = [r for r in history if r]
+    if len(seen) < 2:
+        return ""
+    first, last = seen[0], seen[-1]
+    up0, up1 = first.get("uptime_s"), last.get("uptime_s")
+    if up0 is not None and up1 is not None and up1 < up0:
+        return (f"HOST REBOOTED (kernel uptime {up0:.0f}s → {up1:.0f}s)")
+    p0, p1 = first.get("pid1_start"), last.get("pid1_start")
+    if p0 is not None and p1 is not None and p1 != p0:
+        return f"CONTAINER RESTARTED (pid 1 start {p0} → {p1} ticks after boot)"
+    return ""
+
+
+def _fmt_resources(r: dict | None) -> str:
+    if not r:
+        return "n/a"
+
+    def gib(v, scale):
+        return "?" if not isinstance(v, int) else f"{v * scale / 2**30:.1f}G"
+
+    lim = r.get("cg_max")
+    lim_s = "max" if lim == "max" else gib(lim, 1)
+    up = r.get("uptime_s")
+    return (f"mem_avail={gib(r.get('mem_avail_kb'), 1024)} cg_mem={gib(r.get('cg_mem_bytes'), 1)}"
+            f"/{lim_s} disk_free={gib(r.get('disk_free_kb'), 1024)} "
+            f"uptime={'?' if up is None else f'{up:.0f}s'} pid1_start={r.get('pid1_start')}")
+
+
+def _detached_postmortem_command(host: RemoteHost, run_dir: str) -> str:
+    """Read-only facts from a pod whose worker vanished, taken BEFORE teardown:
+    resources, boot / pid-1 times, whether the run dir survived, the kernel's
+    OOM lines when readable. Best-effort; every step tolerates failure."""
+    rd = shlex.quote(run_dir)
+    return (f"cd {shlex.quote(host.workdir)} 2>/dev/null; " + _RESOURCES_SHELL
+            + "echo \"boot: $(uptime -s 2>/dev/null)  now: $(date -u +%FT%TZ)\"; "
+            "echo \"pid1: $(ps -o lstart= -p 1 2>/dev/null) $(cat /proc/1/comm 2>/dev/null)\"; "
+            f"if [ -d {rd} ]; then echo \"run dir: present\"; ls -la {rd} 2>/dev/null | head -20; "
+            "else echo \"run dir: MISSING\"; fi; "
+            f"ls -la --time-style=+%FT%T {shlex.quote(DETACHED_RUN_ROOT)} 2>/dev/null | head -10; "
+            "(dmesg -T 2>/dev/null || journalctl -k --no-pager 2>/dev/null) "
+            "| grep -iE 'oom|killed process|out of memory|nvrm|xid' | tail -20; "
+            "free -m 2>/dev/null; df -h . /dev/shm 2>/dev/null; true")
+
+
 def _detached_poll_command(host: RemoteHost, run_dir: str) -> str:
     rd = shlex.quote(run_dir)
     pf = shlex.quote(detached_progress_path(run_dir))
     # A RUNNING worker also prints its progress record (when it writes one)
-    # on the line BEFORE the token — the token stays the last line.
-    return (f"cd {shlex.quote(host.workdir)} && if [ -f {rd}/exit_code ]; then "
+    # on the line BEFORE the token — the token stays the last line. Every poll
+    # leads with the pod's resource line (:data:`_RESOURCES_SHELL`).
+    return (f"cd {shlex.quote(host.workdir)} && " + _RESOURCES_SHELL
+            + f"if [ -f {rd}/exit_code ]; then "
             f"echo EXIT:$(cat {rd}/exit_code); elif [ -f {rd}/pid ] && "
             f"kill -0 $(cat {rd}/pid) 2>/dev/null; then "
             f"[ -f {pf} ] && printf '{DETACHED_PROGRESS_MARK}%s\\n' "
@@ -944,6 +1041,8 @@ def run_detached(host: RemoteHost, body: str, stdin_env: str | None, run_dir: st
     rc: int | None = None
     vanished = False
     last_progress: dict | None = None    # the worker's last step record seen by a poll
+    resources: list[dict] = []           # the pod's resource samples (parse_resources)
+    res_logged = 0.0
     dark_quarantined = False
     poll_argv = build_ssh_argv(host, _detached_poll_command(host, run_dir))
     while True:
@@ -1009,8 +1108,19 @@ def run_detached(host: RemoteHost, body: str, stdin_env: str | None, run_dir: st
                             "grace %ds) — the detached worker keeps running",
                             describe, misses, gap, grace_seconds)
             continue
+        res = parse_resources(lines)
+        if res is not None:
+            res["t"] = round(now, 1)
+            resources.append(res)
+            del resources[:-RESOURCE_HISTORY]
         if misses:
-            log.info("%s: pod reachable again after %d failed poll(s)", describe, misses)
+            log.info("%s: pod reachable again after %d failed poll(s) — %s%s", describe, misses,
+                     _fmt_resources(res),
+                     (f" — {resource_verdict(resources)}" if resource_verdict(resources) else ""))
+        elif res is not None and now - res_logged >= RESOURCE_LOG_SECONDS:
+            res_logged = now
+            log.info("%s: pod resources (step %s): %s", describe,
+                     (last_progress or {}).get("step"), _fmt_resources(res))
         misses = 0
         last_seen = now
         if token == "RUNNING":
@@ -1030,9 +1140,11 @@ def run_detached(host: RemoteHost, body: str, stdin_env: str | None, run_dir: st
             vanished = True
             rc = 1
             step = (last_progress or {}).get("step")
+            verdict = resource_verdict(resources)
             _quarantine_run_host(host, describe, "detached worker vanished mid-run without "
                                  "an exit code" + (f" (last step {step})" if step is not None
-                                                   else ""))
+                                                   else "")
+                                 + (f" — {verdict}" if verdict else ""))
             break
         try:
             rc = int(token.split(":", 1)[1])
@@ -1059,11 +1171,31 @@ def run_detached(host: RemoteHost, body: str, stdin_env: str | None, run_dir: st
     stdout, _, stderr = out.partition(DETACHED_STDERR_MARK)
     stderr, _, fetched = stderr.partition(DETACHED_FETCH_PROGRESS_MARK)
     progress = _parse_fetched_progress(fetched) or last_progress
+    evidence = ""
     if vanished:
+        # read-only, best-effort, AFTER the log fetch (the pod is torn down
+        # seconds later): what happened to the box itself
+        postmortem = ""
+        try:
+            pm = run(build_ssh_argv(host, _detached_postmortem_command(host, run_dir)), 90, "")
+            postmortem = (pm.stdout or "")[-8000:]
+        except Exception as e:  # noqa: BLE001 — evidence only, never fail the leg on it
+            postmortem = f"(postmortem failed: {e})"
+        # The failure TEXT stays exactly as before: the fault classifier
+        # (faults.classify_*) reads it to decide infra vs miner billing, and a
+        # dmesg "Killed process" line must never move that decision. The
+        # evidence rides separately (``proc.postmortem``) into the saved log.
         stderr = stderr.rstrip() + "\n[detached worker process vanished without an exit code]"
+        verdict = resource_verdict(resources)
+        evidence = ("=== verdict: " + (verdict or "not proven by the resource samples") + " ===\n"
+                    "=== pod postmortem (after the log fetch, before teardown) ===\n"
+                    + postmortem.rstrip()
+                    + "\n=== pod resources, last " + str(len(resources)) + " poll(s) ===\n"
+                    + "\n".join(f"{r.get('t')} {_fmt_resources(r)}" for r in resources))
     proc = subprocess.CompletedProcess(args=fetch_argv, returncode=rc,
                                        stdout=stdout, stderr=stderr)
     proc.progress = progress          # the worker's last step record (or None)
+    proc.postmortem = evidence
     return proc
 
 
@@ -2230,7 +2362,9 @@ class RemoteDispatcher:
                 header={"role": role, "host": host.name, "address": f"{host.host}:{host.port}",
                         "base_seed": base_seed, "exit_code": proc.returncode,
                         "progress": progress},
-                stdout=proc.stdout or "", stderr=proc.stderr or "")
+                stdout=proc.stdout or "",
+                stderr=(proc.stderr or "") + (("\n" + proc.postmortem)
+                                              if getattr(proc, "postmortem", "") else ""))
             where = f" [evidence: {saved}]" if saved else ""
         if proc.returncode == 3:
             # Worker rc=3 = miner submission rejected (CorpusError): the
