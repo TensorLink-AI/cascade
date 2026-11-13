@@ -62,7 +62,9 @@ def test_repo_chain_toml_and_record_are_in_sync(shipped, record):
     assert kinds["forfeit-42b1a486"] == D.OK
     assert kinds["margin-v2-d30eb443"] == D.OK
     assert kinds["lad-556b1b98"] == D.OK
-    for held in ("rolling-era-king", "prelaunch-95-r2"):
+    assert kinds["rolling-era-king"] == D.OK          # typed 2026-11-13 (9136800)
+    assert record.vote("rolling-era-king").type_it
+    for held in ("prelaunch-95-r2",):
         assert kinds[held] == D.HELD
         assert record.vote(held).reason
     assert all(f.kind == D.OK for f in _by(findings, "pins"))
@@ -123,16 +125,33 @@ def test_typed_block_that_disagrees_with_the_decision_is_mismatch(shipped, recor
 
 
 def test_held_row_is_never_asked_for(shipped, record):
-    # rolling is open in the shipped file and HELD in the record: no TYPE
-    (f,) = _by(D.drift_report(shipped, record), "rolling-era-king")
+    # prelaunch is open in the shipped file and HELD in the record: no TYPE
+    (f,) = _by(D.drift_report(shipped, record), "prelaunch-95-r2")
     assert f.kind == D.HELD and not f.fails
-    assert "9374400" in f.detail                      # the known disagreement
-    # ... but a typed value that is not the recorded one is still a MISMATCH
+    assert record.vote("prelaunch-95-r2").reason in f.detail
+    # a HELD rolling row against the pre-2026-11-13 file (rollover untyped)
+    import tempfile
+
+    from tests.unit.predecision_main import predecision_text
+    held = D.DecidedRecord(as_of_block=record.as_of_block, votes=(
+        D.DecidedVote("rolling-era-king", 9133200, 9136800, "config", type_it=False,
+                      reason="nodes disagree: 9374400→9378000"),))
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "c.toml"
+        p.write_text(predecision_text())
+        untyped = load_chain_config(p)
+    (f,) = _by(D.drift_report(untyped, held), "rolling-era-king")
+    assert f.kind == D.HELD and not f.fails and "9374400" in f.detail
+
+
+def test_typed_rollover_other_than_the_decided_one_is_a_mismatch(shipped, record):
+    # the external node's own resolution (9378000) typed instead: MISMATCH
     cfg = replace(shipped, round=replace(shipped.round, rolling_from_block=9378000,
                                          epoch_blocks=900, epoch_blocks_prev=3600,
                                          epoch_activation_block=9378000))
     (f,) = _by(D.drift_report(cfg, record), "rolling-era-king")
-    assert f.kind == D.MISMATCH
+    assert f.kind == D.MISMATCH and f.fails
+    assert f.expected == 9136800 and f.actual == 9378000
 
 
 def test_pin_drift(shipped, record):
@@ -154,7 +173,9 @@ def test_stale_row_and_unknown_feature(shipped, record):
     assert kinds["v2b-deadbeef"] == D.STALE
     assert kinds["promotion-carry"] == D.UNKNOWN
     # the open votes of the config with no row at all are reported as pending
-    assert kinds["rolling-era-king"] == D.PENDING and kinds["prelaunch-95-r2"] == D.PENDING
+    # (the rollover is typed since 2026-11-13: no longer an open vote)
+    assert kinds["prelaunch-95-r2"] == D.PENDING
+    assert kinds.get("rolling-era-king") in (None, D.OK)
 
 
 def test_state_report(record):

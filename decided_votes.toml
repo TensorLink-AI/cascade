@@ -25,8 +25,11 @@ feature = "rolling-era-king"
 lock_block = 9133200
 activation_block = 9136800
 source = "config"
-type_it = false
-reason = "nodes resolved it differently: the operator node 9133200→9136800, one external validator 9374400→9378000 (it restarted late and adopted other notes). Typing either value in main would override a block some nodes decided; the operator types its own on its deployed file only."
+# typed in chain.toml 2026-11-13 (owner decision): 9136800 is the block the
+# trainer's published 900-block settlements have followed since. One external
+# validator recorded 9374400→9378000 (it restarted late and adopted other
+# notes); the grids coincide from 9378000 on, so its live scoring is unchanged
+# and the typed value wins over its record (configured_rollover).
 
 [[vote]]
 feature = "forfeit-42b1a486"

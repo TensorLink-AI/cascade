@@ -183,3 +183,46 @@ def test_an_enforced_v2_gate_cannot_be_configured_with_a_capped_sweep():
     raw["eval"]["cascade_bench_max_series"] = 3
     with pytest.raises(ValueError, match="complete benchmark suites"):
         parse_chain_config(raw)
+
+
+def test_shipped_main_restarts_on_a_lite_rpc_without_reading_history(tmp_path):
+    # 2026-11-13: an external validator restarting on main had no archive RPC.
+    # Main now types the decided rollover and the resolved launch, so neither
+    # the startup trial nor the first poll reads a single block timestamp.
+    from dataclasses import fields, is_dataclass
+
+    from cascade.shared.activation import apply_activation, configured_rollover
+    from tests.unit.predecision_main import predecision_main
+
+    shipped = load_chain_config()
+    assert configured_rollover(shipped) == 9136800
+    assert (shipped.v2.from_block, shipped.v2.commit_from_block) == (9399600, 9395601)
+    head = 9502000
+
+    def no_history(block):
+        raise AssertionError(f"read the timestamp of block {block}")
+
+    lite = SimpleNamespace(finalized_block=lambda: head, block_timestamp=no_history,
+                           current_block=lambda: head)
+    check_calendar_launch(shipped, lite)
+    assert resolve_calendar_launch(shipped, lite) is shipped
+    # ... and it is exactly what a node on the pre-2026-11-13 file computes once
+    # the fleet's rollover applies and the dated launch resolves on the real
+    # chain: 9395601 stamped 09:00:00Z, 9396501 the 12:00:00Z crossing.
+    before = predecision_main(tmp_path)
+    opening = launch_timestamp(before.v2.commit_open_at_utc)
+    real = SimpleNamespace(finalized_block=lambda: head,
+                           block_timestamp=lambda b: opening + (b - 9395601) * 12.0)
+    live = resolve_calendar_launch(apply_activation(before, 9136800), real)
+    assert (live.v2.from_block, live.v2.commit_from_block) == (9399600, 9395601)
+    diffs = []
+    for f in fields(shipped):
+        a, b = getattr(live, f.name), getattr(shipped, f.name)
+        if f.name == "raw":
+            continue
+        if is_dataclass(a):
+            diffs += [(f.name, g.name) for g in fields(a) if getattr(a, g.name) != getattr(b, g.name)]
+        elif a != b:
+            diffs.append((f.name,))
+    # the only difference is the marker that the rollover was resolved, not typed
+    assert diffs == [("activation", "resolved_block")]

@@ -397,7 +397,7 @@ deployment or qualification succeeded:
 <!-- cascade:config-reference:start -->
 | Template | V2 block | Loaded B gate | C / MarketCast blocks | Random-init eras | B pool | CPU generation |
 |---|---:|---:|---|---:|---|---|
-| `chain.toml` | 0 | 0 | 0 / 0 | 14 | 25% | enabled for shards; 90 min configured |
+| `chain.toml` | 9399600 | 0 | 0 / 0 | 14 | 25% | enabled for shards; 90 min configured |
 | `chain.testnet.toml` | 8190000 | 8190001 | 0 / 0 | 0 | 50% | off; 90 min configured |
 <!-- cascade:config-reference:end -->
 
