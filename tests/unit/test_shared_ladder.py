@@ -123,7 +123,11 @@ def test_shipped_values_parse_and_default_off(tmp_path):
     # the release types both switches at the same era (v2b 9493200 → the
     # quantile head from its first settlement; v2 live from 9399600 on chain)
     assert shipped.v2.image_decoupled_from_block == 9493200
-    live = replace(shipped, v2=replace(shipped.v2, from_block=9399600))
+    # ... on the fleet's resolved 900 grid: the repo file ships rolling and v2
+    # undecided (3600 grid, where 9494100 is not a boundary at all)
+    live = replace(shipped, v2=replace(shipped.v2, from_block=9399600),
+                   round=replace(shipped.round, rolling_from_block=9136800, epoch_blocks=900,
+                                 epoch_blocks_prev=3600, epoch_activation_block=9136800))
     assert live.quantile_head_at(9494100) and not live.quantile_head_at(9493200)
     assert not A.shared_ladder_feature(shipped).decided_on_chain   # typed: nothing signalled
     # The vote's name is pinned: a changed count or ladder is a FRESH vote.
