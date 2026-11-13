@@ -1221,7 +1221,7 @@ king_ladder = true
 # so a worker-image repin keeps the carried king and the finished legs. 0 =
 # decided on chain; a typed era-start block is the owner override. Repin the
 # image only AFTER the switch era has started.
-image_decoupled_from_block = 0
+image_decoupled_from_block = 9493200   # TYPED 2026-11-13 (DEC-CA-0067): = the block the v2b-69630f92 vote resolved (locked in at 9486000, 85.9% of stake, applied at the era start 9493200 = Thu 12 Nov 22:23 UTC) — behaviour-identical; frees its note segment. Without it a validator whose rolling-era-king vote is still signalled overflows the 128-byte note and REFUSES to start (seen 2026-11-13 00:13 UTC).
 # Bundled with the same block (part of the vote's hash): the v2 private
 # verdict budget becomes this many windows. Inert until the switch.
 eval_n_windows_after = 4000
