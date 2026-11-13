@@ -25,7 +25,8 @@ def typed():
     gate = 10_000 * era
     # the shipped DEC-CA-0055 timing keys zeroed: each test arms what it models
     cfg = replace(cfg, v2=replace(cfg.v2, from_block=gate, random_init_eras=0,
-                                  reign_warm_start_blocks=0),
+                                  reign_warm_start_blocks=0,
+                                  prelaunch_burn_from_block=0),   # typed 2026-11-13: the vote reopened
                   training=replace(cfg.training, v2_from_block=gate))
     return cfg, gate, era
 

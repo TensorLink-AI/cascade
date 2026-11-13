@@ -176,7 +176,11 @@ def test_note_parts_refactor_keeps_the_note_bytes(tmp_path):
     for cfg in (_untyped_blocks(tmp_path), load_chain_config(REPO / "chain.toml")):
         for rf, rm in ((fr, mr), (None, None)):
             note = A.own_signal_payload(cfg, rec, rf, rm, A.ActivationRecord())
-            head, extras, tail = A._own_note_parts(cfg, rec, rf, rm, A.ActivationRecord())
+            parts = A._own_note_parts(cfg, rec, rf, rm, A.ActivationRecord())
+            if parts is None:      # every vote typed (release since 2026-11-13): no note
+                assert note is None
+                continue
+            head, extras, tail = parts
             dropped = A.note_trimmed_segments(cfg, rec, rf, rm, A.ActivationRecord())
             kept = [s for s in extras if s.feature not in dropped]
             assert note == A.format_signals(head, *kept, *tail)

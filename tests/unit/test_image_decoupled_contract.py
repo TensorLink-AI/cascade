@@ -771,7 +771,8 @@ def test_mainnet_note_carries_v2b_within_the_field(rollover_typed):
     rollover resolved from signals); True is the main validator's deployed
     shape (rolling_from_block typed)."""
     cfg = load_chain_config(REPO / "chain.toml")
-    cfg = replace(cfg, v2=replace(cfg.v2, image_decoupled_from_block=0))   # the vote still open
+    cfg = replace(cfg, v2=replace(cfg.v2, image_decoupled_from_block=0,    # the vote still open
+                                  prelaunch_burn_from_block=0))        # (typed 2026-11-13)
     feature = A.primary_feature(cfg).name
     if rollover_typed:
         cfg = A.apply_activation(cfg, LIVE_ROLLOVER[1])

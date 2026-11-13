@@ -66,8 +66,17 @@ def test_loader_refuses_non_bool_ladder(tmp_path):
 # ── the pre-launch burn vote ─────────────────────────────────────────────────
 
 
-def test_prelaunch_feature_rides_the_note():
-    cfg = load_chain_config(ROOT / "chain.toml")
+def test_prelaunch_feature_rides_the_note(tmp_path):
+    from tests.unit.predecision_main import predecision_main
+
+    # the shipped release types the decided block (2026-11-13): an owner
+    # override, nothing signalled for it
+    shipped = load_chain_config(ROOT / "chain.toml")
+    s = A.prelaunch_burn_feature(shipped)
+    assert s.name == "prelaunch-95-r2" and not s.decided_on_chain and s.typed_block == 9486900
+    assert "prelaunch-95-r2" not in (A.own_signal_payload(shipped, A.ActivationRecord()) or "")
+    # the vote itself, on the pre-decision release file
+    cfg = predecision_main(tmp_path)
     spec = A.prelaunch_burn_feature(cfg)
     assert spec is not None and spec.name == "prelaunch-95-r2" and spec.decided_on_chain
     assert A.prelaunch_burn_feature_name(0.955) == "prelaunch-95.5"
@@ -83,6 +92,7 @@ def test_prelaunch_feature_rides_the_note():
 
 def test_note_never_exceeds_the_commitment_field():
     cfg = load_chain_config(ROOT / "chain.toml")
+    cfg = replace(cfg, v2=replace(cfg.v2, prelaunch_burn_from_block=0))   # the burn vote open
     lp = A.ActivationRecord(feature=A.primary_feature(cfg).name, lock_block=91830000,
                             activation_block=91833600)
     lf = A.ActivationRecord(feature=A.forfeit_feature(cfg).name, lock_block=91854000,
@@ -95,6 +105,7 @@ def test_note_never_exceeds_the_commitment_field():
 
 def test_apply_prelaunch_activation_is_one_way_and_boundary_aligned():
     cfg = load_chain_config(ROOT / "chain.toml")
+    cfg = replace(cfg, v2=replace(cfg.v2, prelaunch_burn_from_block=0))   # the burn vote open
     eb = cfg.round.epoch_blocks
     b = 2600 * eb
     armed = A.apply_prelaunch_burn_activation(cfg, b)

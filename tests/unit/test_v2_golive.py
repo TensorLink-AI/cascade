@@ -67,7 +67,8 @@ def test_mainnet_ships_inert_with_the_v2_contract_scheduled(tmp_path):
     # 2026-11-13: main types the resolved launch; v2-derived blocks follow it
     assert cfg.v2 == replace(before.v2, from_block=9399600, commit_from_block=9395601,
                              bench_gate_v2_from_block=9399600,
-                             bench_source_from_block=9399600)
+                             bench_source_from_block=9399600,
+                             prelaunch_burn_from_block=9486900)   # the decided burn vote, typed
     assert cfg.v2.active(9399600) and not cfg.v2.active(9399600 - 1)
     assert cfg.lane_b.from_block == 0 and not cfg.lane_b.active(10**9)
     v2c = cfg.training.v2_contract
