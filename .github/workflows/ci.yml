@@ -49,4 +49,4 @@ jobs:
 
       - name: Unit tests
         # Passed tests need no retained checkpoint trees; keep failed fixtures.
-        run: uv run --frozen pytest tests/unit -q --maxfail=1 -o tmp_path_retention_policy=failed -o tmp_path_retention_count=1
+        run: uv run --frozen pytest tests/unit -q --maxfail=300 -o tmp_path_retention_policy=failed -o tmp_path_retention_count=1
