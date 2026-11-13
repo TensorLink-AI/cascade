@@ -175,7 +175,7 @@ def test_stale_row_and_unknown_feature(shipped, record):
     # the open votes of the config with no row at all are reported as pending
     # (the rollover is typed since 2026-11-13: no longer an open vote)
     assert kinds["prelaunch-95-r2"] == D.PENDING
-    assert kinds.get("rolling-era-king") in (None, D.OK)
+    assert "rolling-era-king" not in kinds
 
 
 def test_state_report(record):

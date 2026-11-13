@@ -121,7 +121,7 @@ def test_service_start_refuses_a_dated_launch_whose_v2_config_cannot_load(tmp_pa
     check_calendar_launch(replace(cfg, v2=replace(cfg.v2, launch_at_utc="")), object())
 
 
-def test_shipped_file_starts_after_the_launch_date_with_the_typed_v2b_switch(tmp_path):
+def test_predecision_file_starts_after_the_launch_date_with_the_typed_v2b_switch(tmp_path):
     # 2026-11-13 regression: main types [v2] image_decoupled_from_block =
     # 9493200 (#457); v2 launched 2026-10-30 at 9399600. The startup trial
     # armed v2 at the era AFTER the head (9500400) and refused every node
