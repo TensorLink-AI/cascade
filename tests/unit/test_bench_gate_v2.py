@@ -388,11 +388,15 @@ def test_parse_key():
             parse_bench_gate_v2_from_block({"bench_gate_v2_from_block": bad})
 
 
-def test_shipped_configs():
+def test_shipped_configs(tmp_path):
     from cascade.shared.config import load_chain_config
+    from tests.unit.predecision_main import predecision_main
 
     main = load_chain_config("chain.toml")
-    assert main.v2.from_block == 0 and main.v2.bench_gate_v2_from_block == 0
+    # 2026-11-13: main types the resolved v2 launch; the gate's "v2" follows it
+    assert main.v2.from_block == 9399600 and main.v2.bench_gate_v2_from_block == 9399600
+    before = predecision_main(tmp_path)
+    assert before.v2.from_block == 0 and before.v2.bench_gate_v2_from_block == 0
     assert main.scoring.bench_gate_tolerance == 0.01
     assert main.scoring.bench_gate_min_win_rate == 0.5
     test = load_chain_config("chain.testnet.toml")

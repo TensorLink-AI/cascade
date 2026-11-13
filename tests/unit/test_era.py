@@ -11,8 +11,18 @@ import pytest
 
 from cascade.shared import era as E
 from cascade.shared.config import load_chain_config
+from tests.unit.predecision_main import predecision_main, predecision_path
 
 REPO = Path(__file__).resolve().parents[2]
+
+
+def _pre(tmp_path: Path) -> Path:
+    """The pre-decision release chain.toml (rollover untyped) — the base the
+    synthetic small-block loader scenarios below are built on. Written to its
+    own subdirectory so ``_toml_with`` never overwrites its source."""
+    d = tmp_path / "predecision"
+    d.mkdir(exist_ok=True)
+    return predecision_path(d)
 
 
 def _armed(cfg, rollover: int, *, settlements: int = 4, prev: int = 0):
@@ -185,15 +195,27 @@ def _toml_with(path: Path, tmp_path: Path, **overrides) -> Path:
     return p
 
 
-def test_shipped_tomls_parse_the_knobs():
+def test_shipped_tomls_parse_the_knobs(tmp_path):
     main = load_chain_config(REPO / "chain.toml")
-    assert main.round.rolling_from_block == 0
-    assert main.scoring.era_king_from_block == 0
-    assert main.scoring.tenure_blocks_from_block == 0
+    # the decided DEC-CA-0043 rollover is typed into the release (2026-11-13)
+    assert main.round.rolling_from_block == 9136800
+    assert main.scoring.era_king_from_block == 9136800
+    assert main.scoring.tenure_blocks_from_block == 9136800
     assert main.round.era_settlements == 4
-    assert main.scoring.margin_warmup_blocks == 8 * main.round.epoch_blocks
-    assert main.scoring.cascade_reign_blocks == main.scoring.cascade_reign_days * main.round.epoch_blocks
-    assert main.scoring.king_resync_max_blocks == main.scoring.king_resync_max_rounds * main.round.epoch_blocks
+    # the *_blocks values keep the wall time of the PRE-rollover 3600 grid
+    assert (main.round.epoch_blocks_prev, main.round.epoch_blocks) == (3600, 900)
+    assert main.scoring.margin_warmup_blocks == 8 * main.round.epoch_blocks_prev
+    assert main.scoring.cascade_reign_blocks == main.scoring.cascade_reign_days * main.round.epoch_blocks_prev
+    assert main.scoring.king_resync_max_blocks == main.scoring.king_resync_max_rounds * main.round.epoch_blocks_prev
+    # before it was typed every rollover key was 0 and the grid was 3600
+    pre = predecision_main(tmp_path)
+    assert pre.round.rolling_from_block == 0
+    assert pre.scoring.era_king_from_block == 0
+    assert pre.scoring.tenure_blocks_from_block == 0
+    assert pre.round.era_settlements == 4
+    assert pre.scoring.margin_warmup_blocks == 8 * pre.round.epoch_blocks
+    assert pre.scoring.cascade_reign_blocks == pre.scoring.cascade_reign_days * pre.round.epoch_blocks
+    assert pre.scoring.king_resync_max_blocks == pre.scoring.king_resync_max_rounds * pre.round.epoch_blocks
     test = load_chain_config(REPO / "chain.testnet.toml")
     eb = test.round.epoch_blocks
     # armed at the first ERA boundary (the rollover must start an era)
@@ -209,7 +231,7 @@ def test_shipped_tomls_parse_the_knobs():
 
 
 def test_loader_rejects_unequal_rollover_keys(tmp_path):
-    p = _toml_with(REPO / "chain.toml", tmp_path, rolling_from_block=7200,
+    p = _toml_with(_pre(tmp_path), tmp_path, rolling_from_block=7200,
                    era_king_from_block=10800, tenure_blocks_from_block=7200,
                    cohort_maxt_from_block=1, cohort_maxt_increment_from_block=1)
     with pytest.raises(ValueError, match="same block"):
@@ -217,14 +239,14 @@ def test_loader_rejects_unequal_rollover_keys(tmp_path):
 
 
 def test_loader_rejects_a_partially_set_rollover(tmp_path):
-    p = _toml_with(REPO / "chain.toml", tmp_path, rolling_from_block=7200,
+    p = _toml_with(_pre(tmp_path), tmp_path, rolling_from_block=7200,
                    cohort_maxt_from_block=1, cohort_maxt_increment_from_block=1)
     with pytest.raises(ValueError, match="ONE block"):
         load_chain_config(p)
 
 
 def test_loader_rejects_a_misaligned_rollover(tmp_path):
-    p = _toml_with(REPO / "chain.toml", tmp_path, rolling_from_block=3601,
+    p = _toml_with(_pre(tmp_path), tmp_path, rolling_from_block=3601,
                    era_king_from_block=3601, tenure_blocks_from_block=3601,
                    cohort_maxt_from_block=1, cohort_maxt_increment_from_block=1)
     with pytest.raises(ValueError, match="boundary"):
@@ -234,7 +256,7 @@ def test_loader_rejects_a_misaligned_rollover(tmp_path):
 def test_loader_requires_the_rollover_on_both_grids(tmp_path):
     # rollover 10800 is a boundary of 3600 but the grid switch to 900 must
     # land on the same block
-    p = _toml_with(REPO / "chain.toml", tmp_path, rolling_from_block=10800,
+    p = _toml_with(_pre(tmp_path), tmp_path, rolling_from_block=10800,
                    era_king_from_block=10800, tenure_blocks_from_block=10800,
                    epoch_blocks=900, epoch_blocks_prev=3600,
                    epoch_activation_block=14400,
@@ -244,7 +266,7 @@ def test_loader_requires_the_rollover_on_both_grids(tmp_path):
 
 
 def test_loader_requires_the_stack_order(tmp_path):
-    p = _toml_with(REPO / "chain.toml", tmp_path, rolling_from_block=14400,
+    p = _toml_with(_pre(tmp_path), tmp_path, rolling_from_block=14400,
                    era_king_from_block=14400, tenure_blocks_from_block=14400,
                    cohort_maxt_from_block=1, cohort_maxt_increment_from_block=28800)
     with pytest.raises(ValueError, match="stacks on"):
@@ -254,7 +276,7 @@ def test_loader_requires_the_stack_order(tmp_path):
 def test_loader_requires_the_rollover_to_start_an_era(tmp_path):
     # 7200 is a boundary of the 3600 grid but not of the 4-settlement era
     # grid (14400): the first era would have started 7200 blocks earlier.
-    p = _toml_with(REPO / "chain.toml", tmp_path, rolling_from_block=7200,
+    p = _toml_with(_pre(tmp_path), tmp_path, rolling_from_block=7200,
                    era_king_from_block=7200, tenure_blocks_from_block=7200,
                    cohort_maxt_from_block=1, cohort_maxt_increment_from_block=1)
     with pytest.raises(ValueError, match="start an era"):
@@ -265,7 +287,7 @@ def test_loader_requires_the_rollover_to_switch_the_grid(tmp_path):
     # every rollover key set and aligned, but no epoch_blocks_prev /
     # epoch_activation_block: rolling intake would run on the 12h grid with
     # 48h eras, silently
-    p = _toml_with(REPO / "chain.toml", tmp_path, rolling_from_block=14400,
+    p = _toml_with(_pre(tmp_path), tmp_path, rolling_from_block=14400,
                    era_king_from_block=14400, tenure_blocks_from_block=14400,
                    cohort_maxt_from_block=3600, cohort_maxt_increment_from_block=7200)
     with pytest.raises(ValueError, match="switch the grid"):
@@ -277,12 +299,12 @@ def test_loader_requires_rent_and_the_jit_king_for_rolling(tmp_path):
                   tenure_blocks_from_block=14400, epoch_blocks=900,
                   epoch_blocks_prev=3600, epoch_activation_block=14400,
                   cohort_maxt_from_block=3600, cohort_maxt_increment_from_block=7200)
-    assert load_chain_config(_toml_with(REPO / "chain.toml", tmp_path, **recipe))
+    assert load_chain_config(_toml_with(_pre(tmp_path), tmp_path, **recipe))
     with pytest.raises(ValueError, match="funded_pods"):
-        load_chain_config(_toml_with(REPO / "chain.toml", tmp_path, funded_pods="off",
+        load_chain_config(_toml_with(_pre(tmp_path), tmp_path, funded_pods="off",
                                      **recipe))
     with pytest.raises(ValueError, match="funded_king_rent"):
-        load_chain_config(_toml_with(REPO / "chain.toml", tmp_path,
+        load_chain_config(_toml_with(_pre(tmp_path), tmp_path,
                                      funded_king_rent=False, **recipe))
 
 
@@ -304,7 +326,7 @@ def test_resync_valve_keeps_its_wall_time_across_the_grid_switch(cfg):
 
 
 def test_loader_accepts_the_rollover_recipe(tmp_path):
-    p = _toml_with(REPO / "chain.toml", tmp_path, rolling_from_block=14400,
+    p = _toml_with(_pre(tmp_path), tmp_path, rolling_from_block=14400,
                    era_king_from_block=14400, tenure_blocks_from_block=14400,
                    epoch_blocks=900, epoch_blocks_prev=3600,
                    epoch_activation_block=14400,

@@ -222,7 +222,7 @@ def test_f2_strict_rebuild_refuses_overlap_and_non_finite():
     check_finite_rows(c, {0: [1]}, names)                          # other rows are fine
 
 
-def test_merge_guard_config_and_load_check():
+def test_merge_guard_config_and_load_check(tmp_path):
     lb = parse_lane_b({"from_block": 1001, "domains": ["energy"]})
     assert lb.merge_guard_from_block == 1000                       # "v2" default
     assert lb.merge_guard_at_era(1000) and not lb.merge_guard_at_era(999)
@@ -248,7 +248,12 @@ def test_merge_guard_config_and_load_check():
     with pytest.raises(ValueError, match="era boundary"):
         load_chain_config(raw=raw)
     main = load_chain_config("chain.toml").lane_b
-    assert main.leg_funding == "miner" and main.merge_guard_from_block == 0   # = v2 (unset)
+    # 2026-11-13: main types [v2] from_block, so the "v2" default resolves to it
+    assert main.leg_funding == "miner" and main.merge_guard_from_block == 9399600   # = v2
+    from tests.unit.predecision_main import predecision_main
+
+    before = predecision_main(tmp_path).lane_b
+    assert before.leg_funding == "miner" and before.merge_guard_from_block == 0   # = v2 (unset)
 
 
 def test_validator_era_init_refuses_overlapping_merges_under_the_guard(cfg, tmp_path):

@@ -14,7 +14,6 @@ import pytest
 
 from cascade.audit.checks import check_weights
 from cascade.shared.bench_report import BenchEntry, BenchReport
-from cascade.shared.config import load_chain_config
 from cascade.shared.emission import COURT_BLOCKS
 from cascade.shared.era import (
     EraSpec,
@@ -36,6 +35,8 @@ from cascade.shared.receipt import RoundReceipt
 from cascade.validator.cascade import CascadeController, CascadeState
 from cascade.validator.loop import ValidatorRunner
 from cascade.validator.state import ChampionState
+
+from .predecision_main import predecision_main
 
 ROOT = Path(__file__).resolve().parents[2]
 KING, OLD = "5King", "5Old"
@@ -67,7 +68,8 @@ class _Client:
 
 @pytest.fixture
 def env(tmp_path):
-    cfg = load_chain_config(ROOT / "chain.toml")
+    # synthetic v2 gate on the pre-decision main (no typed rollover / v2 launch)
+    cfg = predecision_main(tmp_path)
     era = era_length_blocks(cfg.round, 0)
     gate = 10_000 * era
     cfg = replace(cfg, v2=replace(cfg.v2, from_block=gate),

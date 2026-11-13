@@ -30,6 +30,8 @@ from cascade.shared.era import (
     v2b_switch_era,
 )
 
+from .predecision_main import predecision_main
+
 ROOT = Path(__file__).resolve().parents[2]
 
 MAIN, TEST = "v2b-69630f92", "v2b-c1ffa858"            # rule /3, quantile head on
@@ -37,9 +39,10 @@ MAIN_NOQ, TEST_NOQ = "v2b-1abeaeb4", "v2b-c31c2c8e"    # rule /3, knob missing/f
 
 
 @pytest.fixture
-def base():
+def base(tmp_path):
     """Mainnet chain.toml with v2 at a fixed era (ladder on, as shipped)."""
-    cfg = load_chain_config(ROOT / "chain.toml")
+    # synthetic v2 gate on the pre-decision main (no typed rollover / v2 launch)
+    cfg = predecision_main(tmp_path)
     era = era_length_blocks(cfg.round, 0)
     gate = 10_000 * era
     cfg = replace(cfg, v2=replace(cfg.v2, from_block=gate, image_decoupled_from_block=0),

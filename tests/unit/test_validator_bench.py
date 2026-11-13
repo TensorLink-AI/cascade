@@ -39,6 +39,8 @@ from cascade.validator.loop import ValidatorRunner
 from cascade.validator.state import genesis
 from cascade.validator.validator_bench import ValidatorBenchHold
 
+from .predecision_main import predecision_main
+
 CID = "alice/gen@sha256:" + "a" * 64
 KING_PTR = format_trained_pointer("cascade/king@sha256:" + "b" * 64)
 CHAL_PTR = format_trained_pointer("cascade/chal@sha256:" + "c" * 64)
@@ -199,13 +201,17 @@ def test_check_bench_source_refusals():
     check_bench_source(v2=V2Config(), owner_hotkey="", era_blocks=3600)
 
 
-def test_mainnet_arms_validator_source_with_v2_testnet_stays_trainer():
+def test_mainnet_arms_validator_source_with_v2_testnet_stays_trainer(tmp_path):
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[2]
     main = load_chain_config(root / "chain.toml")
     assert main.v2.bench_source == "validator"
-    assert main.v2.bench_source_from_block == 0          # "v2" while from_block = 0
+    # 2026-11-13: main types [v2] from_block = 9399600, so "v2" resolves to it
+    assert main.v2.bench_source_from_block == main.v2.from_block == 9399600
+    pre = predecision_main(tmp_path)
+    assert pre.v2.bench_source == "validator"
+    assert pre.v2.bench_source_from_block == 0           # "v2" while from_block = 0
     test = load_chain_config(root / "chain.testnet.toml")
     assert test.v2.bench_source == "trainer" and test.v2.bench_source_from_block == 0
 

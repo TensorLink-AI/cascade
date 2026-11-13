@@ -25,9 +25,12 @@ SCRIPT = textwrap.dedent("""
     from pathlib import Path
     from cascade.shared.config import load_chain_config
     from tests.unit import test_satellite_replay as T
+    from tests.unit.predecision_main import predecision_path
 
     audit_main._fetch_text = lambda cfg, key: (_ for _ in ()).throw(RuntimeError("offline"))
-    cfg = T._keyed(load_chain_config(Path("chain.toml")))
+    # small fake blocks: replay on the pre-decision release (no typed rollover)
+    with tempfile.TemporaryDirectory() as pre:
+        cfg = T._keyed(load_chain_config(predecision_path(pre)))
     store = T.DictStore()
     T.make_settlement(cfg, store, 0)
     with tempfile.TemporaryDirectory() as d:

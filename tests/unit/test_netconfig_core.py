@@ -16,9 +16,14 @@ from cascade.shared import netconfig as nc
 from cascade.shared.config import load_chain_config, parse_chain_config
 from cascade.shared.hippius import ObjectNotFound
 
+from .predecision_main import predecision_text
+
 REPO = Path(__file__).resolve().parents[2]
 with (REPO / "chain.toml").open("rb") as _fh:
     SHIPPED_RAW = tomllib.load(_fh)
+# the release as it was before 2026-11-13 typed the decided rollover and the
+# v2 launch: the base for hypothetical overlays / votes at test blocks
+PREDECISION_RAW = tomllib.loads(predecision_text())
 
 # A typed DEC-CA-0043 rollover (3600 -> 900 grid at R, eras of 4 x 900 after
 # it), so only the overlay's own cfg- segment is ever voted on in these tests.
@@ -38,7 +43,7 @@ OWNER = owner_keypair()
 
 
 def base_raw(owner: str | None = None) -> dict:
-    raw = copy.deepcopy(SHIPPED_RAW)
+    raw = copy.deepcopy(PREDECISION_RAW)
     raw["round"].update(rolling_from_block=R, epoch_blocks=900, epoch_blocks_prev=3600,
                         epoch_activation_block=R)
     raw["scoring"].update(era_king_from_block=R, tenure_blocks_from_block=R,
@@ -104,7 +109,13 @@ def test_netconfig_table_defaults_inert_and_refuses_typos():
             assert c.netconfig.enabled
         else:
             assert c.netconfig.owner_hotkey == "" and not c.netconfig.enabled
+    # the shipped release (v2 launch typed, validator bench source armed)
+    # needs its [netconfig] owner: dropping the table is refused
     raw = copy.deepcopy(SHIPPED_RAW)
+    raw.pop("netconfig", None)
+    with pytest.raises(ValueError, match="needs \\[netconfig\\] owner_hotkey"):
+        parse_chain_config(raw)
+    raw = copy.deepcopy(PREDECISION_RAW)       # pre-launch: a missing table is inert
     raw.pop("netconfig", None)
     missing = parse_chain_config(raw).netconfig
     assert missing.owner_hotkey == "" and not missing.enabled
@@ -385,7 +396,10 @@ def test_config_at_walks_the_history_by_block():
 
 
 def test_resolved_activation_blocks_survive_an_overlay():
-    raw = copy.deepcopy(SHIPPED_RAW)
+    # the release now TYPES the decided rollover (2026-11-13): nothing to resolve
+    typed_main = load_chain_config(REPO / "chain.toml")
+    assert A.configured_rollover(typed_main) == 9136800 and A.resolved_rollover(typed_main) == 0
+    raw = copy.deepcopy(PREDECISION_RAW)       # the vote-open file the fleet resolved
     raw["netconfig"] = {"owner_hotkey": OWNER.ss58_address}
     raw["scoring"].update(forfeit_hotkeys=[], win_margin_start_v2=0.0, win_margin_end_v2=0.0,
                           margin_warmup_blocks_v2=0, forfeit_from_block=0,
