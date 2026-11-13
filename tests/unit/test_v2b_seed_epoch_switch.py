@@ -42,8 +42,8 @@ def base():
     cfg = load_chain_config(ROOT / "chain.toml")
     era = era_length_blocks(cfg.round, 0)
     gate = 10_000 * era
-    cfg = replace(cfg, v2=replace(cfg.v2, from_block=gate),
-                  training=replace(cfg.training, v2_from_block=gate))
+    cfg = replace(cfg, v2=replace(cfg.v2, from_block=gate, image_decoupled_from_block=0),
+                  training=replace(cfg.training, v2_from_block=gate))   # the vote still open
     return cfg, era
 
 
@@ -499,7 +499,7 @@ def vcfg():
                         forfeit_from_block=0, forfeit_successor_hotkey="",
                         win_margin_start_v2=0.0, win_margin_end_v2=0.0,
                         margin_warmup_blocks_v2=0, margin_v2_from_block=0),
-        v2=replace(c.v2, prelaunch_burn=0.0),
+        v2=replace(c.v2, prelaunch_burn=0.0, image_decoupled_from_block=0),  # vote open
         eval=replace(c.eval, shared_ladder_windows=0))
 
 

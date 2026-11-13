@@ -124,15 +124,25 @@ def test_prove_numerics_digest_needs_the_leg_image():
 # ── the knobs ────────────────────────────────────────────────────────────────
 
 
-def test_knobs_ship_off_and_inert():
-    for path, after in (("chain.toml", 4000), ("chain.testnet.toml", 300)):
-        cfg = load_chain_config(REPO / path)
-        assert cfg.v2.image_decoupled_from_block == 0
-        assert cfg.v2.eval_n_windows_after == after
-        assert cfg.v2.prior_train_image_digests == ()
-        assert cfg.activation.resolved_image_decoupled_block == 0
-        assert not image_decoupled_at(cfg, 10**9)
-        assert v2_eval_windows_at(cfg, 10**9) == int(cfg.v2.eval_n_windows)
+def test_knobs_ship_typed_on_mainnet_and_off_on_testnet():
+    # mainnet: the v2b-69630f92 vote resolved (locked 9486000, 85.9% of stake,
+    # applied at the era start 9493200) and the release TYPES that block
+    # (2026-11-13) to free its note segment; nothing is resolved from chain
+    cfg = load_chain_config(REPO / "chain.toml")
+    assert cfg.v2.image_decoupled_from_block == 9493200
+    assert cfg.v2.eval_n_windows_after == 4000
+    assert cfg.v2.prior_train_image_digests == ()
+    assert cfg.activation.resolved_image_decoupled_block == 0
+    assert image_decoupled_at(cfg, 9493200) and not image_decoupled_at(cfg, 9493199)
+    assert v2_eval_windows_at(cfg, 10**9) == 4000
+    # testnet: still decided on chain, inert until then
+    cfg = load_chain_config(REPO / "chain.testnet.toml")
+    assert cfg.v2.image_decoupled_from_block == 0
+    assert cfg.v2.eval_n_windows_after == 300
+    assert cfg.v2.prior_train_image_digests == ()
+    assert cfg.activation.resolved_image_decoupled_block == 0
+    assert not image_decoupled_at(cfg, 10**9)
+    assert v2_eval_windows_at(cfg, 10**9) == int(cfg.v2.eval_n_windows)
 
 
 def _with(tmp_path, **kv):
@@ -305,7 +315,7 @@ def vcfg():
                         forfeit_from_block=0, forfeit_successor_hotkey="",
                         win_margin_start_v2=0.0, win_margin_end_v2=0.0,
                         margin_warmup_blocks_v2=0, margin_v2_from_block=0),
-        v2=replace(c.v2, prelaunch_burn=0.0),
+        v2=replace(c.v2, prelaunch_burn=0.0, image_decoupled_from_block=0),  # vote open
         eval=replace(c.eval, shared_ladder_windows=0))
 
 
