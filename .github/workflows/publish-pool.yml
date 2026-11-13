@@ -59,6 +59,10 @@ on:
         description: "effective_block: 999999999999 = inert test snapshot; a real future epoch block for production; 'auto' needs a trainer manifest"
         required: false
         default: "999999999999"
+      archetype_dry_run:
+        description: "Archetype steering DRY RUN: comma-separated S values (e.g. 0,0.5,1). Builds nothing, publishes nothing; prints and uploads the report."
+        required: false
+        default: ""
 
 concurrency:
   group: publish-pool          # never let two publishes race on pool/index.json
@@ -186,7 +190,39 @@ jobs:
           du -sh ./tsforge || true
           test "$n" -gt 0 || { echo "::error::forge mirror is empty"; exit 1; }
 
+      - name: Archetype steering dry run  (no publish)
+        if: github.event.inputs.archetype_dry_run != ''
+        env:
+          NETWORK: ${{ github.event.inputs.network || 'mainnet' }}
+          SWEEP: ${{ github.event.inputs.archetype_dry_run }}
+        run: |
+          TOML=chain.toml
+          [ "$NETWORK" = "testnet" ] && TOML=chain.testnet.toml
+          # Same caps and selection as the scheduled publish; nothing is written
+          # or published — the report (overlap before/after, per benchmark,
+          # unknown fraction, supply per archetype, clusters, per-domain counts)
+          # is printed and uploaded. archetypes.json comes down with the forge sync.
+          TSFORGE_DIR=./tsforge cascade-pool build --dry-run \
+            --chain-toml "$TOML" \
+            --sources tsbench_forge \
+            --max-panel-series-per-feed 5 \
+            --max-series-per-domain-freq 400 \
+            --max-series-per-domain 800 \
+            --selection balanced \
+            --steering-sweep "$SWEEP" \
+            --report-json archetype-dry-run.json \
+            --out /tmp/archetype-dry-run | tee archetype-dry-run.txt
+      - name: Upload dry-run report
+        if: github.event.inputs.archetype_dry_run != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: archetype-dry-run
+          path: |
+            archetype-dry-run.txt
+            archetype-dry-run.json
+
       - name: Build + publish snapshot  (CASCADE key)
+        if: github.event.inputs.archetype_dry_run == ''
         env:
           NETWORK: ${{ github.event.inputs.network || 'mainnet' }}
           EFFECTIVE_BLOCK: ${{ github.event.inputs.effective_block || 'auto' }}
@@ -252,7 +288,7 @@ jobs:
       # Idempotent per snapshot — backlog backfills across runs (max 6/run).
       # Skipped cleanly if HF_TOKEN isn't set.
       - name: Reveal retired snapshots to public HF  (exact bytes)
-        if: env.HF_TOKEN != ''
+        if: env.HF_TOKEN != '' && github.event.inputs.archetype_dry_run == ''
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_EVAL_REPO: ${{ vars.HF_EVAL_REPO || 'Tensor-Link/cascade-eval-pool' }}

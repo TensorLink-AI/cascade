@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import logging
 import sys
 from pathlib import Path
@@ -142,6 +143,17 @@ def _add_build_args(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument("--selection-seed", default=None,
                    help="Override the balanced-selection seed (recorded in provenance.json).")
+    p.add_argument("--archetype-steering", type=float, default=0.0,
+                   help="Archetype steering S in [0, 1] (balanced selection only): target mix = "
+                        "S x benchmark reference shares + (1 - S) x the catalog's natural mix; "
+                        "0 = off (default), 1 = match the benchmark mix as far as supply and the "
+                        "caps allow. Needs the forge's archetypes.json (see --archetypes).")
+    p.add_argument("--archetypes", type=Path, default=None,
+                   help="Path to the archetype model file (default: <forge dir>/archetypes.json "
+                        "when the tsbench_forge source is used; absent = nothing steers).")
+    p.add_argument("--min-clusters", type=int, default=None,
+                   help="Refuse a pool with fewer distinct scoring clusters (source families) "
+                        "than this — steering never buys its mix with fewer clusters.")
     p.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
     p.add_argument("--timeout", type=float, default=30.0, help="Per-request HTTP timeout (s).")
     _add_lane_args(p)
@@ -184,6 +196,14 @@ def _add_build(sub: argparse._SubParsersAction) -> None:
         help="Hub repo id (namespace/name) to push the pool to (default: <namespace>/eval-pool).",
     )
     _add_build_args(p)
+    p.add_argument("--dry-run", action="store_true",
+                   help="Harvest and select, write NOTHING: print the archetype report "
+                        "(mix before/after, overlap daily-or-faster and per benchmark, unknown "
+                        "fraction, supply per archetype, clusters, per-domain counts).")
+    p.add_argument("--steering-sweep", default="0,0.5,1",
+                   help="Comma-separated steering values a --dry-run reports (default 0,0.5,1).")
+    p.add_argument("--report-json", type=Path, default=None,
+                   help="--dry-run: also write the full reports (incl. chosen series ids) here.")
     p.set_defaults(func=_cmd_build)
 
 
@@ -493,10 +513,47 @@ def _build(args: argparse.Namespace, cfg, *, out_dir: Path, overwrite: bool):
         max_channels=int(getattr(args, "max_channels", 1) or 1),
         selection=selection,
         selection_seed=seed,
+        archetype_steering=float(getattr(args, "archetype_steering", 0.0) or 0.0),
+        min_clusters=getattr(args, "min_clusters", None),
     )
+    if not 0.0 <= build_cfg.archetype_steering <= 1.0:
+        raise ValueError(f"--archetype-steering must be in [0, 1]; got {build_cfg.archetype_steering}")
+    archetypes, catalog_sha = _archetype_inputs(args, sources)
+    if build_cfg.archetype_steering > 0 and archetypes is None:
+        raise ValueError("--archetype-steering > 0 but no archetypes.json was found "
+                         "(pass --archetypes or sync the forge mirror)")
+    if build_cfg.archetype_steering > 0 and selection != "balanced":
+        raise ValueError("--archetype-steering needs --selection balanced")
+    if getattr(args, "dry_run", False):
+        from .builder import steering_sweep
+
+        steerings = [float(x) for x in str(getattr(args, "steering_sweep", "0,0.5,1")).split(",") if x.strip()]
+        return steering_sweep(sources, ctx, build_cfg, archetypes=archetypes, steerings=steerings,
+                              fetch=HttpFetcher(timeout=args.timeout))
     return build_pool(
-        sources, out_dir, ctx, build_cfg, fetch=HttpFetcher(timeout=args.timeout), overwrite=overwrite
+        sources, out_dir, ctx, build_cfg, fetch=HttpFetcher(timeout=args.timeout), overwrite=overwrite,
+        archetypes=archetypes, catalog_sha256=catalog_sha,
     )
+
+
+def _archetype_inputs(args: argparse.Namespace, sources) -> tuple[object | None, str]:
+    """The archetype model (``--archetypes``, else ``<forge dir>/archetypes.json``
+    of a tsbench_forge source) and the catalog hash for provenance."""
+    from .archetypes import load_archetype_model
+
+    path = getattr(args, "archetypes", None)
+    catalog_sha = ""
+    for src in sources:
+        forge_dir = getattr(src, "forge_dir", None)
+        if forge_dir is not None:
+            from .sources.tsbench_forge import archetypes_path, catalog_sha256
+
+            catalog_sha = catalog_sha256(forge_dir)
+            if path is None:
+                path = archetypes_path(forge_dir)
+            break
+    model = load_archetype_model(path) if path is not None else None
+    return model, catalog_sha
 
 
 def _warn_if_small(summary, cfg) -> None:
@@ -518,6 +575,23 @@ def _cmd_build(args: argparse.Namespace) -> int:
     except (ValueError, FileExistsError) as e:
         print(f"build failed: {e}", file=sys.stderr)
         return 1
+
+    if getattr(args, "dry_run", False):
+        from .archetypes import render_report
+
+        reports = summary                       # steering_sweep() output
+        for rep in reports:
+            print(render_report(rep))
+            print("  by domain: " + ", ".join(f"{k}={v}" for k, v in rep["per_domain"].items()))
+            if rep.get("dropped"):
+                print("  dropped: " + ", ".join(f"{k}={v}" for k, v in rep["dropped"].items()))
+            print()
+        if getattr(args, "report_json", None):
+            Path(args.report_json).write_text(json.dumps(reports, indent=2, sort_keys=True),
+                                              encoding="utf-8")
+            print(f"full reports → {args.report_json}")
+        print("dry run: nothing written")
+        return 0
 
     print(summary.render())
     _warn_if_small(summary, cfg)
