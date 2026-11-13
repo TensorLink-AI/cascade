@@ -151,6 +151,7 @@ def test_loader_arms_lane_c_on_an_era_boundary(tmp_path):
     v2 = 10_000 * era
     raw = copy.deepcopy(cfg.raw)
     raw["v2"]["from_block"] = v2
+    raw["v2"]["image_decoupled_from_block"] = 0      # the typed v2b switch: vote open here
     # DEC-CA-0063 needs [netconfig] owner_hotkey once v2 is typed; lane C only
     raw["v2"]["bench_source"] = "trainer"
     # Lane C takes its allocation from B, which now launches independently.
