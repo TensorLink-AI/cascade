@@ -68,7 +68,9 @@ def test_pre_lock_receipts_carry_no_switch_and_match_the_v3_golden():
 
     from .receipt_fixture import make_scored_receipt
 
-    runner = ValidatorRunner(cfg=load_chain_config(REPO / "chain.toml"))
+    release = load_chain_config(REPO / "chain.toml")
+    untyped = replace(release, v2=replace(release.v2, image_decoupled_from_block=0))
+    runner = ValidatorRunner(cfg=untyped)
     assert runner.image_decoupled_block == 0                    # nothing locked, nothing typed
     receipt, _, _ = make_scored_receipt()
     stamped = replace(receipt, image_decoupled_block=runner.image_decoupled_block)
@@ -100,7 +102,8 @@ def test_option_b_drops_the_prelaunch_segment_and_option_a_still_needed(tmp_path
     release = load_chain_config(REPO / "chain.toml")
     assert A.v2b_note_problem(release, rec, head_block=9_420_000) == ""
     assert A.v2b_note_problem(_retired(release), rec, head_block=9_420_000) == ""
-    both = A.own_signal_payload(_retired(release), rec, None, None, A.ActivationRecord(), None,
+    open_vote = replace(release, v2=replace(release.v2, image_decoupled_from_block=0))
+    both = A.own_signal_payload(_retired(open_vote), rec, None, None, A.ActivationRecord(), None,
                                 None, A.ActivationRecord(feature=V2B, lock_block=9504000,
                                                          activation_block=9507600,
                                                          source="tally"))

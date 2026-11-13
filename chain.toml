@@ -241,8 +241,10 @@ expected_gpu = ""                # was "NVIDIA L40S" (DEC-CA-0002)
 # launch-env injection + the provisioner health gate; digest computed
 # orchestrator-side). Folded into contract_digest — re-pin ⇒ trainer AND
 # validators restart together at an epoch boundary, pods pull the new image.
-train_image_digest = "sha256:43c07d4207d7693517d74203f6783fdd2c2f91e3d475f38db38e4798ae97785e"
-# ^ ghcr cascade-worker:worker-v0.9.0 — built 2026-09-16 09:38 UTC from this
+train_image_digest = "sha256:205ff68242ae78fc923c8a5c7d2c4a4eccdd8afc7c7739cae99187475ba96d6f"
+# ^ LIVE SYNC 2026-11-13: worker-v0.13.0 (main 4fbed80, built 2026-09-28) = the
+#   deployed pin since 2026-09-28; main still named v0.9.0 below.
+# (was) ghcr cascade-worker:worker-v0.9.0 — built 2026-09-16 09:38 UTC from this
 #   branch (publish-worker run 35080201768): budget_denomination (DEC-CA-0042)
 #   parsed on the pod, PLUS check_loss_finite (840e900, 2026-09-14) which the
 #   v0.8.0 image (main@9346a52) never carried — three NaN legs trained to the
@@ -352,14 +354,14 @@ funded_pods = "rent"
 payer_vault_dir = "payer_vault" # cascade-intake --vault-dir (work_root-relative)
 funded_pod_sku = ""             # unused with funded_pod_skus set (per-round pick)
 # Worker image funded pods boot — keep = the fleet's pinned digest.
-funded_pod_image = "ghcr.io/tensorlink-ai/cascade-worker:worker-v2.0.0-rc11@sha256:2fd193cad6be7bef87f110246a2074de84cde44511e153a21d1d0301d93cba64"
+funded_pod_image = "ghcr.io/tensorlink-ai/cascade-worker:worker-v2.0.0-rc15@sha256:5d41d94bc0c0d3ae3dfd042b0cc7e4d900c7d1f48173808436c12bf764a67641"   # LIVE since 2026-10-31 (rc15 = main 5e3fade); synced to main 2026-11-13
 # sha256 of that image's cascade/**/*.py (scripts/worker_code_fingerprint.py
 # <repo>@<digest>). Every rented final/funded pod must hash its files to this
 # BEFORE a leg is dispatched — the digest env a template injects is echoed
 # faithfully by a host that started a STALE image under the pinned tag
 # (2026-09-12: Lium 91.224.44.222/.223 ran worker-v0.7.0 as "v0.8.0"; three
 # miners' legs stalled and were burned). Re-derive on every image re-pin.
-worker_code_fingerprint = "33b0d42fad8fa46b93c09ce1abb3d1d07a349905c171b795671cc68f06d7e907"   # 271 files, worker-v2.0.0-rc11 (2fd193ca…); registry walk, rc10 walk reproduced its pin 2026-10-30
+worker_code_fingerprint = "2d8261aa40e86d3821f8fbeac0d60a0ac7528434a686c17e204c2b20198e293c"   # 274 files, worker-v2.0.0-rc15 (5d41d94b…); registry walk = local 5e3fade source = on-pod hash, 2026-10-31
 funded_ready_timeout_seconds = 900.0
 # How a funded leg's checkpoint leaves its payer pod. "harvest" (default):
 # CREDENTIAL-FREE pods — the worker trains --local-only (nothing at all in the
@@ -1219,7 +1221,7 @@ king_ladder = true
 # so a worker-image repin keeps the carried king and the finished legs. 0 =
 # decided on chain; a typed era-start block is the owner override. Repin the
 # image only AFTER the switch era has started.
-image_decoupled_from_block = 0
+image_decoupled_from_block = 9493200   # TYPED 2026-11-13 (DEC-CA-0067): = the block the v2b-69630f92 vote resolved (locked in at 9486000, 85.9% of stake, applied at the era start 9493200 = Thu 12 Nov 22:23 UTC) — behaviour-identical; frees its note segment. Without it a validator whose rolling-era-king vote is still signalled overflows the 128-byte note and REFUSES to start (seen 2026-11-13 00:13 UTC).
 # Bundled with the same block (part of the vote's hash): the v2 private
 # verdict budget becomes this many windows. Inert until the switch.
 eval_n_windows_after = 4000
@@ -1348,7 +1350,7 @@ router_lr_scale = 0.1
 route_bias_rate_scale = 0.25
 # Fit the existing 50B unique-corpus cap; the full reference preset is 27,500.
 training_steps = 23841
-train_image_digest = "sha256:2fd193cad6be7bef87f110246a2074de84cde44511e153a21d1d0301d93cba64"
+train_image_digest = "sha256:5d41d94bc0c0d3ae3dfd042b0cc7e4d900c7d1f48173808436c12bf764a67641"   # rc15, LIVE since 2026-10-31 (was rc11 2fd193ca…); synced to main 2026-11-13
 expected_gpu = ""
 long_series = "crop"
 power_ema_scope = "leg"

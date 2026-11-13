@@ -134,12 +134,16 @@ def cfg() -> ChainConfig:
     raw["netconfig"]["owner_hotkey"] = ""
     raw["scoring"]["forfeit_from_block"] = 0        # DEC-CA-0067 typed blocks: see scoring=
     raw["scoring"]["margin_v2_from_block"] = 0
+    raw["v2"]["image_decoupled_from_block"] = 0     # the typed v2b switch: see v2=
     return replace(c, training=replace(c.training, expected_gpu="",
                                        train_image_digest=""),
                    raw=raw,
                    netconfig=replace(c.netconfig, owner_hotkey=""),
                    v2=replace(c.v2, launch_at_utc="", commit_open_at_utc="",
-                              commit_from_block=0, prelaunch_burn_readiness=""),
+                              commit_from_block=0, prelaunch_burn_readiness="",
+                              # the release types the decided v2b switch (real-
+                              # chain state); fixtures keep the vote undecided
+                              image_decoupled_from_block=0),
                    # corpus_target_points ships ARMED (DEC-CA-0031): a points-
                    # denominated drain would override every fixture's small
                    # corpus_n_series with a 67M-point draw. Tests that exercise

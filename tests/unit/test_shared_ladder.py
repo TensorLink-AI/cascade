@@ -120,8 +120,15 @@ def test_shipped_values_parse_and_default_off(tmp_path):
     assert shared_ladder_configured(shipped.eval)
     assert not shared_ladder_active(shipped.eval, 9493200)     # the old era's last settlement
     assert shared_ladder_active(shipped.eval, 9494100)
-    assert shipped.quantile_head_at(9494100) and not shipped.quantile_head_at(9493200) or \
-        not shipped.v2.image_decoupled_from_block              # aligned when v2b is applied
+    # the release types both switches at the same era (v2b 9493200 → the
+    # quantile head from its first settlement; v2 live from 9399600 on chain)
+    assert shipped.v2.image_decoupled_from_block == 9493200
+    # ... on the fleet's resolved 900 grid: the repo file ships rolling and v2
+    # undecided (3600 grid, where 9494100 is not a boundary at all)
+    live = replace(shipped, v2=replace(shipped.v2, from_block=9399600),
+                   round=replace(shipped.round, rolling_from_block=9136800, epoch_blocks=900,
+                                 epoch_blocks_prev=3600, epoch_activation_block=9136800))
+    assert live.quantile_head_at(9494100) and not live.quantile_head_at(9493200)
     assert not A.shared_ladder_feature(shipped).decided_on_chain   # typed: nothing signalled
     # The vote's name is pinned: a changed count or ladder is a FRESH vote.
     assert A.shared_ladder_feature_name(4000, HORIZONS) == "lad-556b1b98"
@@ -496,7 +503,8 @@ def test_note_carries_the_segment_and_stays_under_the_budget_with_every_mainnet_
     shipped = load_chain_config(DEFAULT_CHAIN_TOML)
     assert A.shared_ladder_feature(shipped).name not in (
         A.own_signal_payload(shipped, A.ActivationRecord()) or "").split(":")
-    shipped = replace(shipped, eval=replace(shipped.eval, shared_ladder_from_block=0))
+    shipped = replace(shipped, eval=replace(shipped.eval, shared_ladder_from_block=0),
+                      v2=replace(shipped.v2, image_decoupled_from_block=0))   # both votes open
     assert shipped.activation.enabled
     lad = A.shared_ladder_feature(shipped)
     v2b = A.image_decoupled_feature(shipped)

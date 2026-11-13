@@ -55,7 +55,10 @@ def test_mainnet_ships_inert_with_the_v2_contract_scheduled():
                               bench_budget_hours=6.0, bench_sweep_hours=2.0,
                               # DEC-CA-0067: bundled budget, inert until the v2b vote
                               eval_n_windows_after=4000, quantile_head_after=True,
-                              image_decoupled_feature="v2b-69630f92")
+                              image_decoupled_feature="v2b-69630f92",
+                              # the vote resolved (locked 9486000, 85.9%): typed
+                              # 2026-11-13 to free its note segment
+                              image_decoupled_from_block=9493200)
     assert not cfg.v2.active(10**9)
     assert cfg.lane_b.from_block == 0 and not cfg.lane_b.active(10**9)
     v2c = cfg.training.v2_contract
