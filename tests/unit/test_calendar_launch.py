@@ -118,6 +118,43 @@ def test_service_start_refuses_a_dated_launch_whose_v2_config_cannot_load():
     check_calendar_launch(replace(cfg, v2=replace(cfg.v2, launch_at_utc="")), object())
 
 
+def test_shipped_file_starts_after_the_launch_date_with_the_typed_v2b_switch():
+    # 2026-11-13 regression: main types [v2] image_decoupled_from_block =
+    # 9493200 (#457); v2 launched 2026-10-30 at 9399600. The startup trial
+    # armed v2 at the era AFTER the head (9500400) and refused every node
+    # that pulled main: "image_decoupled_from_block=9493200 precedes [v2]
+    # from_block=9500400".
+    from cascade.shared.activation import apply_activation
+
+    shipped = load_chain_config()
+    assert shipped.v2.image_decoupled_from_block == 9493200 and not shipped.v2.from_block
+    live = apply_activation(shipped, 9136800)              # the fleet's 900 grid
+    launch = launch_timestamp(shipped.v2.launch_at_utc)
+    head = 9497650
+    past = SimpleNamespace(finalized_block=lambda: head,
+                           block_timestamp=lambda block: launch + (block - 9399000) * 12.0)
+    check_calendar_launch(live, past)                      # starts (was: ValueError)
+    # ... and the date really is behind the head: the real resolution lands on
+    # the live v2 block and that config loads with the typed switch
+    resolved = resolve_calendar_launch(live, past)
+    assert resolved.v2.from_block == 9399600
+    assert resolved.v2.image_decoupled_from_block == 9493200
+    # BEFORE the date the trial still runs (and still refuses a bad config)
+    early = SimpleNamespace(finalized_block=lambda: 9390000,
+                            block_timestamp=lambda block: launch - 3600.0)
+    check_calendar_launch(live, early)
+    raw = effective_raw(live)
+    raw["netconfig"]["owner_hotkey"] = ""
+    with pytest.raises(ValueError, match="launch_at_utc"):
+        check_calendar_launch(parse_chain_config(raw), early)
+    # an unreadable head timestamp keeps the trial (the safe side)
+    def boom(block):
+        raise RuntimeError("pruned")
+    dark = SimpleNamespace(finalized_block=lambda: 9390000, block_timestamp=boom)
+    with pytest.raises(ValueError, match="launch_at_utc"):
+        check_calendar_launch(parse_chain_config(raw), dark)
+
+
 def test_a_pruned_late_joiner_gets_an_actionable_error_not_a_guess():
     cfg = load_chain_config()
     raw = effective_raw(cfg)
