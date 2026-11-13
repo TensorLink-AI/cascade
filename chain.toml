@@ -271,9 +271,6 @@ train_image_digest = "sha256:205ff68242ae78fc923c8a5c7d2c4a4eccdd8afc7c7739cae99
 # target_train_hours = 0.0    # per-size budget hours (313M increments ~6h; set
 #                             # jointly with the margin re-unitisation from the
 #                             # null-LCB noise-floor measurement)
-# DEC-CA-0042 billing switch, LIVE since block 9165600 (synced to main 2026-11-13).
-budget_denomination_after       = "points+mv20"
-budget_denomination_after_block = 9165600
 
 [round]
 
@@ -948,10 +945,6 @@ blocked = [
     "cascade.validator",
     "cascade.shared.chain",
 ]
-# Packed/obfuscated generator sources are REJECTED from block 9169200 — LIVE on the
-# deployment since then; synced to main 2026-11-13 so `cascade verify` matches intake.
-packed_sources            = "reject"
-packed_sources_from_block = 9169200
 
 [storage]
 # Hippius storage layer: Hub OCI registry for models/checkpoints/generators
