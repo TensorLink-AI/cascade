@@ -1,0 +1,71 @@
+# Decided on-chain votes and the live worker-image pins — the drift-guard record.
+#
+# Stake-weighted activation (DEC-CA-0045) lets the fleet decide a feature's
+# block on chain. Once decided and applied, the block is TYPED into the release
+# chain.toml: behaviour-identical, and it frees the feature's segment of the
+# 128-byte readiness note. This file records what the fleet decided so that
+# `tests/unit/test_decided_votes.py` (CI) and `cascade-audit decided` (the box)
+# can tell when chain.toml has not caught up. See cascade/shared/decided.py.
+#
+# Maintenance, every time a vote locks in (the validator logs "DECIDED: …"):
+#   1. add or update the [[vote]] row (feature, lock_block, activation_block, source);
+#   2. once activation_block has passed, type the block in chain.toml (the row's
+#      key, from decided.TYPED_KEY_BY_PREFIX) in the same PR;
+#   3. bump as_of_block to the boundary you are at.
+# A row with type_it = false is HELD: the guard reports it and never asks to
+# type it; `reason` says why (nodes disagree, or an owner decision is pending).
+#
+# Pins: the image digests the network trains on. Moving one in chain.toml
+# without updating this file (or vice versa) fails CI.
+
+as_of_block = 9494100   # Fri 13 Nov 2026 01:23 UTC settlement (the last boundary passed when written)
+
+[[vote]]
+feature = "rolling-era-king"
+lock_block = 9133200
+activation_block = 9136800
+source = "config"
+type_it = false
+reason = "nodes resolved it differently: the operator node 9133200→9136800, one external validator 9374400→9378000 (it restarted late and adopted other notes). Typing either value in main would override a block some nodes decided; the operator types its own on its deployed file only."
+
+[[vote]]
+feature = "forfeit-42b1a486"
+lock_block = 9165600
+activation_block = 9166500
+source = "signals"
+# typed in chain.toml 2026-11-06
+
+[[vote]]
+feature = "margin-v2-d30eb443"
+lock_block = 9190800
+activation_block = 9194400
+source = "tally"
+# typed in chain.toml 2026-11-06
+
+[[vote]]
+feature = "prelaunch-95-r2"
+lock_block = 9486000
+activation_block = 9486900
+source = "tally"
+type_it = false
+reason = "HELD (owner decision pending, 2026-11-13): decided and applied on every node seen (operator + the external validator's note both carry 9486000:9486900); typing [v2] prelaunch_burn_from_block = 9486900 is behaviour-identical and frees another note segment, but it is a release chain.toml edit the owner has not yet approved. Next one-line PR."
+
+[[vote]]
+feature = "v2b-69630f92"
+lock_block = 9486000
+activation_block = 9493200
+source = "tally"
+# typed in chain.toml 2026-11-13 (PR #457)
+
+[[vote]]
+feature = "lad-556b1b98"
+lock_block = 0
+activation_block = 9494100
+source = "config"
+# typed from the release (rc35, PR #455, owner 2026-11-12): never an open vote
+
+[pins]
+"training.train_image_digest" = "sha256:205ff68242ae78fc923c8a5c7d2c4a4eccdd8afc7c7739cae99187475ba96d6f"
+"round.funded_pod_image" = "ghcr.io/tensorlink-ai/cascade-worker:worker-v2.0.0-rc15@sha256:5d41d94bc0c0d3ae3dfd042b0cc7e4d900c7d1f48173808436c12bf764a67641"
+"round.worker_code_fingerprint" = "2d8261aa40e86d3821f8fbeac0d60a0ac7528434a686c17e204c2b20198e293c"
+"v2.training.train_image_digest" = "sha256:5d41d94bc0c0d3ae3dfd042b0cc7e4d900c7d1f48173808436c12bf764a67641"

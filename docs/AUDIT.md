@@ -494,6 +494,38 @@ cascade-audit direct-moe --journal-bucket BUCKET --trainer-hotkey TRAINER_SS58 -
 A private panel is only revealed after the trainer rotates it out, so a recent
 decision's private half WARNs until then; the public half reproduces at once.
 
+## Decided votes vs `chain.toml` (the drift guard)
+
+Stake-weighted activation (DEC-CA-0045) lets the fleet decide a feature's
+block on chain. Once decided and applied, the block is **typed** into the
+release `chain.toml`: behaviour-identical, and it frees that feature's segment
+of the 128-byte readiness note. Until 2026-11-13 the typing happened only on
+the operator's deployed file; `main` lagged, and a validator that pulled `main`
+overflowed its note and refused to start.
+
+`decided_votes.toml` (beside `chain.toml`) records what the fleet decided —
+each vote's feature name, lock block, activation block and the key that types
+it — plus the worker-image pins the network trains on.
+
+```
+cascade-audit decided                              # the repo's chain.toml vs the record
+cascade-audit decided --config /path/chain.toml    # a deployed file
+cascade-audit decided --state-dir /path/to/state   # + this node's activation_*_state.json
+```
+
+Findings: `TYPE` (decided, applied, not typed — the exact lines to type are
+printed), `MISMATCH` (typed to another block), `PIN_DRIFT` (a pin moved on one
+side), `STALE` (a row the config no longer computes: changed params = a fresh
+vote), `UNRECORDED` (this node locked in a vote the record lacks — the
+`[[vote]]` row to add is printed); informational: `PENDING` (not yet applied),
+`HELD` (`type_it = false`, with the reason — nodes disagree, or an owner
+decision is pending), `DISAGREE` (this node resolved a vote to a different
+block than the record), `UNKNOWN` (a retired feature's state file). Exit 1 on
+any of the first five. `tests/unit/test_decided_votes.py` runs the same check
+on the repo's own files, so CI goes red when a vote resolves and is not typed.
+The validator logs `DECIDED: … type … in the release chain.toml` at every
+lock-in. Everything here reads; nothing changes consensus.
+
 ## Trust anchors
 
 Two ss58 addresses in `chain.toml [manifest]` anchor the audit:
