@@ -759,6 +759,7 @@ def test_mainnet_note_carries_v2b_within_the_field(rollover_typed):
     rollover resolved from signals); True is the main validator's deployed
     shape (rolling_from_block typed)."""
     cfg = load_chain_config(REPO / "chain.toml")
+    cfg = replace(cfg, v2=replace(cfg.v2, image_decoupled_from_block=0))   # the vote still open
     feature = A.primary_feature(cfg).name
     if rollover_typed:
         cfg = A.apply_activation(cfg, LIVE_ROLLOVER[1])
@@ -792,6 +793,7 @@ def test_note_with_a_locked_cfg_segment_and_the_v2b_type_rule():
     type its block into chain.toml (behaviour-identical) and its segment
     leaves the note."""
     cfg = load_chain_config(REPO / "chain.toml")
+    cfg = replace(cfg, v2=replace(cfg.v2, image_decoupled_from_block=0))   # the vote still open
     v2b = A.image_decoupled_feature(cfg).name
     for digits, fits in ((7, True), (8, False)):
         low = 10 ** (digits - 1)
@@ -816,9 +818,9 @@ def test_note_with_a_locked_cfg_segment_and_the_v2b_type_rule():
 
 def _untyped_blocks(tmp_path):
     """The release chain.toml (pins set) WITHOUT the typed forfeit / margin-v2
-    blocks — a deployment that applied the pins but not the typed blocks."""
+    / v2b blocks — a deployment that applied the pins but not the typed blocks."""
     text = (REPO / "chain.toml").read_text()
-    for k in ("forfeit_from_block", "margin_v2_from_block"):
+    for k in ("forfeit_from_block", "margin_v2_from_block", "image_decoupled_from_block"):
         text, n = re.subn(rf"(?m)^{k}\s*=.*$", f"{k} = 0", text)
         assert n == 1, k
     p = tmp_path / "untyped.toml"
@@ -876,8 +878,10 @@ def test_note_budget_worst_case_scales_to_8_digit_blocks():
     """Review 4: the worst case uses the digit count blocks reach within the
     horizon; 8 digits (head unknown, or within ~30 days of 10,000,000) trims
     the release config's v2b segment beside a locked cfg- overlay — the
-    documented rule: type v2b's block once it is decided."""
+    documented rule: type v2b's block once it is decided (the release now
+    does; this judges the vote-form config)."""
     cfg = load_chain_config(REPO / "chain.toml")
+    cfg = replace(cfg, v2=replace(cfg.v2, image_decoupled_from_block=0))
     rec = _live_records()[0]
     assert A.v2b_note_problem(cfg, rec, head_block=9_420_000) == ""
     assert "TRIM" in A.v2b_note_problem(cfg, rec, head_block=9_800_000)
