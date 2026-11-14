@@ -109,7 +109,7 @@ def _isolate_default_settlement_journal(tmp_path, monkeypatch):
 
 
 @pytest.fixture(scope="session")
-def cfg() -> ChainConfig:
+def cfg(tmp_path_factory) -> ChainConfig:
     """The mainnet template with its ENFORCING pins neutralized.
 
     chain.toml carries the real launch pins (expected_gpu, the worker-image
@@ -122,7 +122,14 @@ def cfg() -> ChainConfig:
     """
     from dataclasses import replace
 
-    c = load_chain_config(REPO_ROOT / "chain.toml")
+    from tests.unit.predecision_main import predecision_path
+
+    # The release TYPES the decided rollover (9136800) and the resolved v2
+    # launch (9399600) since 2026-11-13 — real-chain state, like the pins.
+    # Fixtures run on tiny fake block clocks, so they start from the release
+    # file with those blocks untyped (the vote/launch undecided), exactly the
+    # file every fixture ran on before. Shipped-file facts: load chain.toml.
+    c = load_chain_config(predecision_path(tmp_path_factory.mktemp("predecision")))
     # Tests using fake block clocks also reparse raw configuration (satellites,
     # overlays). Neutralize the real calendar there as well as on cfg.v2.
     import copy

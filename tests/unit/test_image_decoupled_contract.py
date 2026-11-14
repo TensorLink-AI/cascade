@@ -37,6 +37,7 @@ from cascade.shared.manifest import (
     prove_numerics_digest,
 )
 
+from .predecision_main import predecision_main, predecision_text
 from .test_activation import FakeChain, _v
 
 REPO = Path(__file__).resolve().parents[2]
@@ -770,7 +771,8 @@ def test_mainnet_note_carries_v2b_within_the_field(rollover_typed):
     rollover resolved from signals); True is the main validator's deployed
     shape (rolling_from_block typed)."""
     cfg = load_chain_config(REPO / "chain.toml")
-    cfg = replace(cfg, v2=replace(cfg.v2, image_decoupled_from_block=0))   # the vote still open
+    cfg = replace(cfg, v2=replace(cfg.v2, image_decoupled_from_block=0,    # the vote still open
+                                  prelaunch_burn_from_block=0))        # (typed 2026-11-13)
     feature = A.primary_feature(cfg).name
     if rollover_typed:
         cfg = A.apply_activation(cfg, LIVE_ROLLOVER[1])
@@ -797,13 +799,14 @@ def test_mainnet_note_carries_v2b_within_the_field(rollover_typed):
         assert len(note.encode("utf-8")) <= A.NOTE_MAX_BYTES
 
 
-def test_note_with_a_locked_cfg_segment_and_the_v2b_type_rule():
+def test_note_with_a_locked_cfg_segment_and_the_v2b_type_rule(tmp_path):
     """The DEC-CA-0057 ``cfg-`` overlay segment rides last. With 7-digit
     blocks a locked cfg- and a locked v2b both fit; past block 10,000,000
     (8 digits) the locked v2b is trimmed — the rule: once v2b is DECIDED,
     type its block into chain.toml (behaviour-identical) and its segment
-    leaves the note."""
-    cfg = load_chain_config(REPO / "chain.toml")
+    leaves the note. Judged on the pre-decision release (rollover untyped, so
+    the primary segment rides the note as on a vote-form node)."""
+    cfg = predecision_main(tmp_path)
     cfg = replace(cfg, v2=replace(cfg.v2, image_decoupled_from_block=0))   # the vote still open
     v2b = A.image_decoupled_feature(cfg).name
     for digits, fits in ((7, True), (8, False)):
@@ -829,8 +832,10 @@ def test_note_with_a_locked_cfg_segment_and_the_v2b_type_rule():
 
 def _untyped_blocks(tmp_path):
     """The release chain.toml (pins set) WITHOUT the typed forfeit / margin-v2
-    / v2b blocks — a deployment that applied the pins but not the typed blocks."""
-    text = (REPO / "chain.toml").read_text()
+    / v2b blocks — a deployment that applied the pins but not the typed blocks
+    (so neither the 2026-11-13 typed rollover / v2 launch: the pre-decision
+    release text)."""
+    text = predecision_text()
     for k in ("forfeit_from_block", "margin_v2_from_block", "image_decoupled_from_block"):
         text, n = re.subn(rf"(?m)^{k}\s*=.*$", f"{k} = 0", text)
         assert n == 1, k
@@ -885,13 +890,14 @@ def test_the_trainer_never_refuses_for_the_note_budget(tmp_path):
     assert "v2b_note_problem" not in inspect.getsource(trainer_loop)
 
 
-def test_note_budget_worst_case_scales_to_8_digit_blocks():
+def test_note_budget_worst_case_scales_to_8_digit_blocks(tmp_path):
     """Review 4: the worst case uses the digit count blocks reach within the
     horizon; 8 digits (head unknown, or within ~30 days of 10,000,000) trims
     the release config's v2b segment beside a locked cfg- overlay — the
     documented rule: type v2b's block once it is decided (the release now
-    does; this judges the vote-form config)."""
-    cfg = load_chain_config(REPO / "chain.toml")
+    does; this judges the vote-form config — the pre-decision release, whose
+    rollover is untyped so its primary segment rides the note)."""
+    cfg = predecision_main(tmp_path)
     cfg = replace(cfg, v2=replace(cfg.v2, image_decoupled_from_block=0))
     rec = _live_records()[0]
     assert A.v2b_note_problem(cfg, rec, head_block=9_420_000) == ""

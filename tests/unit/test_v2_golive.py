@@ -36,12 +36,15 @@ def _text(name="chain.toml"):
 # ── config: independent era-aligned launches ────────────────────────────────
 
 
-def test_mainnet_ships_inert_with_the_v2_contract_scheduled():
+def test_mainnet_ships_inert_with_the_v2_contract_scheduled(tmp_path):
+    from tests.unit.predecision_main import predecision_main
+
     cfg = load_chain_config(ROOT / "chain.toml")
     # DEC-CA-0054 rides the go-live: the bench gate enforces from the v2 block
     # DEC-CA-0055's launch economics ship configured but inert until the block
     # (the pre-launch burn waits for its on-chain vote: no start block yet)
-    assert cfg.v2 == V2Config(from_block=0, launch_at_utc="2026-10-30T12:00:00Z",
+    before = predecision_main(tmp_path)   # main before 2026-11-13 typed the launch
+    assert before.v2 == V2Config(from_block=0, launch_at_utc="2026-10-30T12:00:00Z",
                               commit_open_at_utc="2026-10-30T09:00:00Z",
                               prelaunch_burn_readiness="r2",
                               bench_gate_mode="enforce", random_init_eras=14,
@@ -59,13 +62,21 @@ def test_mainnet_ships_inert_with_the_v2_contract_scheduled():
                               # the vote resolved (locked 9486000, 85.9%): typed
                               # 2026-11-13 to free its note segment
                               image_decoupled_from_block=9493200)
-    assert not cfg.v2.active(10**9)
+    assert not before.v2.active(10**9)
+    assert before.training.at_block(10**9) is before.training
+    # 2026-11-13: main types the resolved launch; v2-derived blocks follow it
+    assert cfg.v2 == replace(before.v2, from_block=9399600, commit_from_block=9395601,
+                             bench_gate_v2_from_block=9399600,
+                             bench_source_from_block=9399600,
+                             prelaunch_burn_from_block=9486900)   # the decided burn vote, typed
+    assert cfg.v2.active(9399600) and not cfg.v2.active(9399600 - 1)
     assert cfg.lane_b.from_block == 0 and not cfg.lane_b.active(10**9)
     v2c = cfg.training.v2_contract
     assert v2c is not None and v2c.base_arch == "cascade_pyramid"
     assert (v2c.router_lr_scale, v2c.route_bias_rate_scale) == (0.1, 0.25)
-    # inert: every block resolves to the toto2 contract, same object
-    assert cfg.training.at_block(10**9) is cfg.training
+    # pre-v2 blocks resolve to the toto2 contract (same object), v2 blocks to v2's
+    assert cfg.training.at_block(9399600 - 1) is cfg.training
+    assert cfg.training.at_block(10**9).base_arch == "cascade_pyramid"
     assert cfg.lane_b.domains == ("econ_fin", "energy", "healthcare", "nature", "sales",
                                   "transport", "web_cloudops")
     assert (cfg.lane_b.full_pay_tiers, cfg.lane_b.half_life_rounds, cfg.lane_b.floor,

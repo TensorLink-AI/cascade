@@ -14,6 +14,7 @@ from cascade.shared.calendar_launch import (
 )
 from cascade.shared.config import load_chain_config, parse_chain_config
 from cascade.shared.netconfig import effective_raw
+from tests.unit.predecision_main import predecision_main
 
 
 def _chain(target, head):
@@ -22,12 +23,16 @@ def _chain(target, head):
                            current_block=lambda: pytest.fail("must use finalized timestamps"))
 
 
-def test_release_has_the_noon_utc_launch_and_separate_update_vote():
+def test_release_has_the_noon_utc_launch_and_separate_update_vote(tmp_path):
     cfg = load_chain_config()
-    assert cfg.v2.from_block == 0
+    # 2026-11-13: main types the resolved launch (pre-decision file left it 0)
+    assert (cfg.v2.from_block, cfg.v2.commit_from_block) == (9399600, 9395601)
+    assert predecision_main(tmp_path).v2.from_block == 0
     assert cfg.v2.launch_at_utc == "2026-10-30T12:00:00Z"
     assert cfg.v2.prelaunch_burn == 0.95
-    assert cfg.v2.prelaunch_burn_from_block == 0
+    # 2026-11-13: the decided pre-launch burn vote is typed (inert post-v2)
+    assert cfg.v2.prelaunch_burn_from_block == 9486900
+    assert predecision_main(tmp_path).v2.prelaunch_burn_from_block == 0
     assert cfg.activation.threshold == 0.51
     assert prelaunch_burn_feature(cfg).name == "prelaunch-95-r2"
 
@@ -45,8 +50,8 @@ def test_old_release_votes_cannot_activate_the_new_release_burn():
     assert current.locked and current.signed == ("updated",)
 
 
-def test_calendar_uses_the_same_finalized_era_for_live_and_late_nodes():
-    cfg = load_chain_config()
+def test_calendar_uses_the_same_finalized_era_for_live_and_late_nodes(tmp_path):
+    cfg = predecision_main(tmp_path)
     raw = effective_raw(cfg)
     raw["netconfig"]["owner_hotkey"] = cfg.manifest.validator_hotkey
     cfg = parse_chain_config(raw)
@@ -64,8 +69,8 @@ def test_calendar_uses_the_same_finalized_era_for_live_and_late_nodes():
     assert resolve_calendar_launch(first, object()) is first
 
 
-def test_a_node_observing_launch_immediately_needs_only_recent_timestamps():
-    cfg = load_chain_config()
+def test_a_node_observing_launch_immediately_needs_only_recent_timestamps(tmp_path):
+    cfg = predecision_main(tmp_path)
     raw = effective_raw(cfg)
     raw["netconfig"]["owner_hotkey"] = cfg.manifest.validator_hotkey
     cfg = parse_chain_config(raw)
@@ -93,8 +98,8 @@ def test_launch_requires_an_unambiguous_utc_timestamp(bad):
         launch_timestamp(bad)
 
 
-def test_failed_or_nonfinite_chain_time_does_not_guess_a_launch():
-    cfg = load_chain_config()
+def test_failed_or_nonfinite_chain_time_does_not_guess_a_launch(tmp_path):
+    cfg = predecision_main(tmp_path)
     chain = _chain(launch_timestamp(cfg.v2.launch_at_utc), 30001)
     chain.block_timestamp = lambda _: float("nan")
     with pytest.raises(ValueError, match="unresolved"):
@@ -105,9 +110,9 @@ def test_failed_or_nonfinite_chain_time_does_not_guess_a_launch():
     assert resolve_calendar_launch(typed, object()) is typed
 
 
-def test_service_start_refuses_a_dated_launch_whose_v2_config_cannot_load():
+def test_service_start_refuses_a_dated_launch_whose_v2_config_cannot_load(tmp_path):
     # A deployment missing the main-validator pin is refused before launch.
-    cfg = load_chain_config()
+    cfg = predecision_main(tmp_path)
     head = SimpleNamespace(finalized_block=lambda: 30000)
     check_calendar_launch(cfg, head)
     assert cfg.netconfig.owner_hotkey == cfg.manifest.validator_hotkey
@@ -118,7 +123,7 @@ def test_service_start_refuses_a_dated_launch_whose_v2_config_cannot_load():
     check_calendar_launch(replace(cfg, v2=replace(cfg.v2, launch_at_utc="")), object())
 
 
-def test_shipped_file_starts_after_the_launch_date_with_the_typed_v2b_switch():
+def test_predecision_file_starts_after_the_launch_date_with_the_typed_v2b_switch(tmp_path):
     # 2026-11-13 regression: main types [v2] image_decoupled_from_block =
     # 9493200 (#457); v2 launched 2026-10-30 at 9399600. The startup trial
     # armed v2 at the era AFTER the head (9500400) and refused every node
@@ -126,7 +131,7 @@ def test_shipped_file_starts_after_the_launch_date_with_the_typed_v2b_switch():
     # from_block=9500400".
     from cascade.shared.activation import apply_activation
 
-    shipped = load_chain_config()
+    shipped = predecision_main(tmp_path)  # the pre-2026-11-13 main (v2 launch still dated)
     assert shipped.v2.image_decoupled_from_block == 9493200 and not shipped.v2.from_block
     live = apply_activation(shipped, 9136800)              # the fleet's 900 grid
     launch = launch_timestamp(shipped.v2.launch_at_utc)
@@ -155,8 +160,8 @@ def test_shipped_file_starts_after_the_launch_date_with_the_typed_v2b_switch():
         check_calendar_launch(parse_chain_config(raw), dark)
 
 
-def test_a_pruned_late_joiner_gets_an_actionable_error_not_a_guess():
-    cfg = load_chain_config()
+def test_a_pruned_late_joiner_gets_an_actionable_error_not_a_guess(tmp_path):
+    cfg = predecision_main(tmp_path)
     raw = effective_raw(cfg)
     raw["netconfig"]["owner_hotkey"] = cfg.manifest.validator_hotkey
     cfg = parse_chain_config(raw)
@@ -173,9 +178,9 @@ def test_a_pruned_late_joiner_gets_an_actionable_error_not_a_guess():
         resolve_calendar_launch(cfg, chain)
 
 
-def test_an_enforced_v2_gate_cannot_be_configured_with_a_capped_sweep():
+def test_an_enforced_v2_gate_cannot_be_configured_with_a_capped_sweep(tmp_path):
     # Launch benchmarks must be complete: a capped sweep is partial by design.
-    cfg = load_chain_config()
+    cfg = predecision_main(tmp_path)
     raw = effective_raw(cfg)
     raw["netconfig"]["owner_hotkey"] = cfg.manifest.validator_hotkey
     raw["v2"]["from_block"] = 43200
@@ -183,3 +188,51 @@ def test_an_enforced_v2_gate_cannot_be_configured_with_a_capped_sweep():
     raw["eval"]["cascade_bench_max_series"] = 3
     with pytest.raises(ValueError, match="complete benchmark suites"):
         parse_chain_config(raw)
+
+
+def test_shipped_main_restarts_on_a_lite_rpc_without_reading_history(tmp_path):
+    # 2026-11-13: an external validator restarting on main had no archive RPC.
+    # Main now types the decided rollover and the resolved launch, so neither
+    # the startup trial nor the first poll reads a single block timestamp.
+    from dataclasses import fields, is_dataclass
+
+    from cascade.shared.activation import (
+        apply_activation,
+        apply_prelaunch_burn_activation,
+        configured_rollover,
+    )
+
+    shipped = load_chain_config()
+    assert configured_rollover(shipped) == 9136800
+    assert (shipped.v2.from_block, shipped.v2.commit_from_block) == (9399600, 9395601)
+    head = 9502000
+
+    def no_history(block):
+        raise AssertionError(f"read the timestamp of block {block}")
+
+    lite = SimpleNamespace(finalized_block=lambda: head, block_timestamp=no_history,
+                           current_block=lambda: head)
+    check_calendar_launch(shipped, lite)
+    assert resolve_calendar_launch(shipped, lite) is shipped
+    # ... and it is exactly what a node on the pre-2026-11-13 file computes once
+    # the fleet's rollover applies and the dated launch resolves on the real
+    # chain: 9395601 stamped 09:00:00Z, 9396501 the 12:00:00Z crossing.
+    before = predecision_main(tmp_path)
+    opening = launch_timestamp(before.v2.commit_open_at_utc)
+    real = SimpleNamespace(finalized_block=lambda: head,
+                           block_timestamp=lambda b: opening + (b - 9395601) * 12.0)
+    live = apply_prelaunch_burn_activation(
+        resolve_calendar_launch(apply_activation(before, 9136800), real), 9486900)
+    assert (live.v2.from_block, live.v2.commit_from_block) == (9399600, 9395601)
+    diffs = []
+    for f in fields(shipped):
+        a, b = getattr(live, f.name), getattr(shipped, f.name)
+        if f.name == "raw":
+            continue
+        if is_dataclass(a):
+            diffs += [(f.name, g.name) for g in fields(a) if getattr(a, g.name) != getattr(b, g.name)]
+        elif a != b:
+            diffs.append((f.name,))
+    # the only difference is the marker that the rollover was resolved, not typed
+    assert diffs == [("activation", "resolved_block"),
+                     ("activation", "resolved_prelaunch_burn_block")]

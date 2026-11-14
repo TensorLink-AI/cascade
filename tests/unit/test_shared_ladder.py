@@ -504,7 +504,8 @@ def test_note_carries_the_segment_and_stays_under_the_budget_with_every_mainnet_
     assert A.shared_ladder_feature(shipped).name not in (
         A.own_signal_payload(shipped, A.ActivationRecord()) or "").split(":")
     shipped = replace(shipped, eval=replace(shipped.eval, shared_ladder_from_block=0),
-                      v2=replace(shipped.v2, image_decoupled_from_block=0))   # both votes open
+                      v2=replace(shipped.v2, image_decoupled_from_block=0,
+                                 prelaunch_burn_from_block=0))   # the votes open (typed 2026-11-13)
     assert shipped.activation.enabled
     lad = A.shared_ladder_feature(shipped)
     v2b = A.image_decoupled_feature(shipped)

@@ -87,10 +87,11 @@ def test_worker_release_requires_matching_fingerprint_and_image_pins(cfg):
             funded_pod_image="fixture/image@sha256:" + "b" * 64)))
 
 
-def test_calendar_replay_uses_finalized_time_not_the_receipts_claim():
+def test_calendar_replay_uses_finalized_time_not_the_receipts_claim(tmp_path):
+    from tests.unit.predecision_main import predecision_main
     from tests.unit.test_calendar_launch import _chain
 
-    cfg = load_chain_config()
+    cfg = predecision_main(tmp_path)  # dated-launch scenario: the pre-2026-11-13 file
     raw = effective_raw(cfg)
     raw["netconfig"]["owner_hotkey"] = cfg.manifest.validator_hotkey
     cfg = parse_chain_config(raw)

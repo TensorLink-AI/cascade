@@ -28,6 +28,7 @@ from cascade.shared.config import (
     load_chain_config,
     margin_v2_active,
 )
+from tests.unit.predecision_main import predecision_main
 
 REPO = Path(__file__).resolve().parents[2]
 PRIMARY = "rolling-era-king"
@@ -36,11 +37,12 @@ K, S = "KINGKINGKINGKING", "SUCCESSORSUCCESSOR"
 
 
 @pytest.fixture
-def cfg():
-    """The shipped chain.toml (it carries the v2 bar, decided on chain) with
-    the DEC-CA-0048 forfeiture and the DEC-CA-0055 pre-launch burn disarmed,
-    so each test arms what it needs."""
-    c = load_chain_config(REPO / "chain.toml")
+def cfg(tmp_path_factory):
+    """The release chain.toml as it shipped BEFORE the decided rollover was
+    typed (rollover still open to the stake vote; it carries the v2 bar,
+    decided on chain) with the DEC-CA-0048 forfeiture and the DEC-CA-0055
+    pre-launch burn disarmed, so each test arms what it needs."""
+    c = predecision_main(tmp_path_factory.mktemp("predecision"))
     return replace(c, scoring=replace(c.scoring, forfeit_hotkeys=(), forfeit_from_block=0,
                                       forfeit_successor_hotkey="", margin_v2_from_block=0),
                    # no v2 schedule ⇒ no DEC-CA-0067 "v2b-" vote either

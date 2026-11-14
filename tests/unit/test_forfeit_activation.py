@@ -18,8 +18,8 @@ from types import SimpleNamespace
 import pytest
 
 import cascade.shared.activation as A
-from cascade.shared.config import load_chain_config
 from cascade.shared.era import forfeit_successor, forfeited_hotkeys
+from tests.unit.predecision_main import predecision_main
 
 REPO = Path(__file__).resolve().parents[2]
 PRIMARY = "rolling-era-king"
@@ -29,11 +29,13 @@ K, S = "KINGKINGKINGKING", "SUCCESSORSUCCESSOR"
 
 
 @pytest.fixture
-def cfg():
-    """The shipped chain.toml with its DEC-CA-0048 forfeiture, DEC-CA-0049
-    margin-v2 bar and DEC-CA-0055 pre-launch burn DISARMED: these tests model
-    the plain fleet (none configured) and arm one explicitly."""
-    c = load_chain_config(REPO / "chain.toml")
+def cfg(tmp_path_factory):
+    """The release chain.toml as it shipped BEFORE the decided rollover was
+    typed (rollover still open to the stake vote), with its DEC-CA-0048
+    forfeiture, DEC-CA-0049 margin-v2 bar and DEC-CA-0055 pre-launch burn
+    DISARMED: these tests model the plain fleet (none configured) and arm one
+    explicitly."""
+    c = predecision_main(tmp_path_factory.mktemp("predecision"))
     return replace(c, scoring=replace(c.scoring, forfeit_hotkeys=(), forfeit_from_block=0,
                                       forfeit_successor_hotkey="", win_margin_start_v2=0.0,
                                       win_margin_end_v2=0.0, margin_warmup_blocks_v2=0,

@@ -292,15 +292,17 @@ def test_activation_block_must_be_on_both_grids(tmp_path):
 
     import pytest
 
-    from cascade.shared.config import DEFAULT_CHAIN_TOML, load_chain_config
+    from cascade.shared.config import load_chain_config
+    from tests.unit.predecision_main import predecision_text
 
     # The shipped template types the decided v2b switch (an era start on the
     # live 900 grid); the synthetic 3600-grid seam below is not that grid.
     src = re.sub(r"^image_decoupled_from_block\s*=.*$", "image_decoupled_from_block = 0",
-                 DEFAULT_CHAIN_TOML.read_text(), flags=re.M)
+                 predecision_text(), flags=re.M)
     p = tmp_path / "chain.toml"
-    # The shipped template is in the steady state (0/0); build the scheduled
-    # pair explicitly so the test does not depend on a live seam being armed.
+    # The pre-decision release (the shipped one now types the decided 3600 →
+    # 900 seam) is in the steady state (0/0); build the scheduled pair
+    # explicitly so the test does not depend on a live seam being armed.
     steady = ("epoch_blocks_prev      = 0\nepoch_activation_block = 0")
     assert steady in src
 
@@ -321,10 +323,12 @@ def test_cadence_keys_must_be_set_together(tmp_path):
 
     import pytest
 
-    from cascade.shared.config import DEFAULT_CHAIN_TOML, load_chain_config
+    from cascade.shared.config import load_chain_config
+    from tests.unit.predecision_main import predecision_text
 
+    # the pre-decision release: its seam keys are in the steady state (0/0)
     src = re.sub(r"^image_decoupled_from_block\s*=.*$", "image_decoupled_from_block = 0",
-                 DEFAULT_CHAIN_TOML.read_text(), flags=re.M)
+                 predecision_text(), flags=re.M)
     p = tmp_path / "chain.toml"
     steady = ("epoch_blocks_prev      = 0\nepoch_activation_block = 0")
     p.write_text(src.replace(steady, "epoch_blocks_prev      = 0\n"

@@ -17,6 +17,7 @@ import pytest
 import cascade.shared.activation as A
 from cascade.shared.config import load_chain_config
 from cascade.shared.era import era_king_active, rolling_active, tenure_blocks_active
+from tests.unit.predecision_main import predecision_main, predecision_text
 
 REPO = Path(__file__).resolve().parents[2]
 FEATURE = "rolling-era-king"
@@ -27,11 +28,13 @@ B0 = 9046800 + GRID
 
 
 @pytest.fixture
-def cfg():
-    """The shipped chain.toml with its DEC-CA-0048 forfeiture, DEC-CA-0049
-    margin-v2 bar and DEC-CA-0055 pre-launch burn DISARMED: these tests model
-    the plain fleet (none configured) and arm one explicitly."""
-    c = load_chain_config(REPO / "chain.toml")
+def cfg(tmp_path_factory):
+    """The release chain.toml as it shipped BEFORE the decided rollover was
+    typed (the rollover still open to the stake vote — what these tests
+    exercise), with its DEC-CA-0048 forfeiture, DEC-CA-0049 margin-v2 bar and
+    DEC-CA-0055 pre-launch burn DISARMED: these tests model the plain fleet
+    (none configured) and arm one explicitly."""
+    c = predecision_main(tmp_path_factory.mktemp("predecision"))
     return replace(c, scoring=replace(c.scoring, forfeit_hotkeys=(), forfeit_from_block=0,
                                       forfeit_successor_hotkey="", win_margin_start_v2=0.0,
                                       win_margin_end_v2=0.0, margin_warmup_blocks_v2=0,
@@ -383,17 +386,24 @@ def test_startup_activation_arms_from_the_notes_and_persists(cfg, tmp_path):
 # ── config loading ───────────────────────────────────────────────────────────
 
 
-def test_shipped_configs_carry_the_activation_section():
+def test_shipped_configs_carry_the_activation_section(tmp_path):
     main = load_chain_config(REPO / "chain.toml")
     assert main.activation.enabled and main.activation.feature == FEATURE
     assert main.activation.threshold == 0.51 and main.activation.epoch_blocks_after == 900
-    assert main.round.rolling_from_block == 0            # the fleet decides the block
+    # the fleet's decided rollover is typed into the release (2026-11-13)
+    assert main.round.rolling_from_block == 9136800
+    assert A.configured_rollover(main) == 9136800
+    # before it was typed the release left the block to the fleet's vote
+    pre = predecision_main(tmp_path)
+    assert pre.activation.enabled and pre.activation.feature == FEATURE
+    assert pre.round.rolling_from_block == 0 and A.configured_rollover(pre) == 0
     test = load_chain_config(REPO / "chain.testnet.toml")
     assert test.activation.enabled and A.configured_rollover(test) == 600  # typed in wins
 
 
 def test_loader_rejects_a_bad_threshold_or_grid(tmp_path):
-    src = (REPO / "chain.toml").read_text(encoding="utf-8")
+    # the pre-decision release: the grid checks bite on an untyped rollover
+    src = predecision_text()
     p = tmp_path / "chain.toml"
     p.write_text(src.replace("threshold = 0.51", "threshold = 1.5"), encoding="utf-8")
     with pytest.raises(ValueError, match="threshold"):

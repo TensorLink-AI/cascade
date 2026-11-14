@@ -9,6 +9,7 @@ import pytest
 
 from cascade.shared.config import load_chain_config
 from cascade.shared.era import bench_gate_configured, bench_gate_mode_at
+from tests.unit.predecision_main import predecision_main
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -18,12 +19,28 @@ def mainnet():
     return load_chain_config(ROOT / "chain.toml")
 
 
-def test_mainnet_bundle_is_inert_until_v2(mainnet):
-    assert mainnet.v2.from_block == 0
-    assert mainnet.training.corpus_mode == "stream_cpu"          # the live contract
-    assert mainnet.training.at_block(10**9).corpus_mode == "stream_cpu"
-    assert bench_gate_mode_at(mainnet, 10**9) == "off"
-    assert not bench_gate_configured(mainnet)
+@pytest.fixture(scope="module")
+def predecision(tmp_path_factory):
+    """main before 2026-11-13 typed the resolved v2 launch (from_block 0)."""
+    return predecision_main(tmp_path_factory.mktemp("predecision"))
+
+
+def test_mainnet_bundle_is_inert_until_v2(mainnet, predecision):
+    # 2026-11-13: main types the resolved launch, so the bundle switches at 9399600
+    assert mainnet.v2.from_block == mainnet.training.v2_from_block == 9399600
+    assert mainnet.training.corpus_mode == "stream_cpu"          # the pre-v2 contract
+    assert mainnet.training.at_block(9399600 - 1).corpus_mode == "stream_cpu"
+    assert mainnet.training.at_block(9399600).corpus_mode == "shards"
+    assert mainnet.training.at_block(10**9).corpus_mode == "shards"
+    assert bench_gate_mode_at(mainnet, 9399600) == "off"         # judges the last pre-v2 era
+    assert bench_gate_mode_at(mainnet, 10**9) == "enforce"
+    assert bench_gate_configured(mainnet)
+    # the pre-decision file stays inert until v2 is typed
+    assert predecision.v2.from_block == 0
+    assert predecision.training.corpus_mode == "stream_cpu"
+    assert predecision.training.at_block(10**9).corpus_mode == "stream_cpu"
+    assert bench_gate_mode_at(predecision, 10**9) == "off"
+    assert not bench_gate_configured(predecision)
 
 
 def test_v2_contract_carries_the_bundle(mainnet):
@@ -58,11 +75,12 @@ def test_shards_contract_needs_the_tier(tmp_path):
         load_chain_config(p)
 
 
-def test_generation_lead_applies_once_v2_is_typed(mainnet):
+def test_generation_lead_applies_once_v2_is_typed(predecision):
     from types import SimpleNamespace
 
     from cascade.trainer.runner_generation import _GenerationMixin
 
+    mainnet = predecision                                     # v2 still dated (from_block 0)
     lead = _GenerationMixin._generation_lead_seconds
     assert lead(SimpleNamespace(cfg=mainnet)) == 0.0          # v2 not typed: no lead
     era = mainnet.round.epoch_blocks * mainnet.round.era_settlements
@@ -78,11 +96,12 @@ def _typed(mainnet):
                    training=replace(mainnet.training, v2_from_block=gate)), gate, era
 
 
-def test_settlement_waits_for_the_kings_bench(mainnet):
+def test_settlement_waits_for_the_kings_bench(predecision):
     from types import SimpleNamespace
 
     from cascade.trainer.rolling import RollingScheduler
 
+    mainnet = predecision                                     # hypothetical typed gate on the pre-decision file
     cfg, gate, era = _typed(mainnet)
     me = SimpleNamespace(cfg=cfg)
     ready = [SimpleNamespace(hotkey="A", bench={"x": 1}), SimpleNamespace(hotkey="B", bench=None)]

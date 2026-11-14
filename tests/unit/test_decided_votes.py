@@ -62,9 +62,10 @@ def test_repo_chain_toml_and_record_are_in_sync(shipped, record):
     assert kinds["forfeit-42b1a486"] == D.OK
     assert kinds["margin-v2-d30eb443"] == D.OK
     assert kinds["lad-556b1b98"] == D.OK
-    for held in ("rolling-era-king", "prelaunch-95-r2"):
-        assert kinds[held] == D.HELD
-        assert record.vote(held).reason
+    assert kinds["rolling-era-king"] == D.OK          # typed 2026-11-13 (9136800)
+    assert record.vote("rolling-era-king").type_it
+    assert kinds["prelaunch-95-r2"] == D.OK           # typed 2026-11-13 (9486900)
+    assert not [v.feature for v in record.votes if not v.type_it]   # nothing held
     assert all(f.kind == D.OK for f in _by(findings, "pins"))
     assert {f.key for f in _by(findings, "pins")} == set(D.PIN_KEYS)
     assert record.as_of_block >= max(v.activation_block for v in record.votes
@@ -123,16 +124,34 @@ def test_typed_block_that_disagrees_with_the_decision_is_mismatch(shipped, recor
 
 
 def test_held_row_is_never_asked_for(shipped, record):
-    # rolling is open in the shipped file and HELD in the record: no TYPE
-    (f,) = _by(D.drift_report(shipped, record), "rolling-era-king")
-    assert f.kind == D.HELD and not f.fails
-    assert "9374400" in f.detail                      # the known disagreement
-    # ... but a typed value that is not the recorded one is still a MISMATCH
+    # HELD rows against the pre-2026-11-13 file (rollover + burn vote untyped):
+    # the guard reports them with their reason and never asks to type them
+    import tempfile
+
+    from tests.unit.predecision_main import predecision_text
+    held = D.DecidedRecord(as_of_block=record.as_of_block, votes=(
+        D.DecidedVote("rolling-era-king", 9133200, 9136800, "config", type_it=False,
+                      reason="nodes disagree: 9374400→9378000"),
+        D.DecidedVote("prelaunch-95-r2", 9486000, 9486900, "tally", type_it=False,
+                      reason="owner decision pending"),))
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "c.toml"
+        p.write_text(predecision_text())
+        untyped = load_chain_config(p)
+    (f,) = _by(D.drift_report(untyped, held), "rolling-era-king")
+    assert f.kind == D.HELD and not f.fails and "9374400" in f.detail
+    (f,) = _by(D.drift_report(untyped, held), "prelaunch-95-r2")
+    assert f.kind == D.HELD and not f.fails and "owner decision pending" in f.detail
+
+
+def test_typed_rollover_other_than_the_decided_one_is_a_mismatch(shipped, record):
+    # the external node's own resolution (9378000) typed instead: MISMATCH
     cfg = replace(shipped, round=replace(shipped.round, rolling_from_block=9378000,
                                          epoch_blocks=900, epoch_blocks_prev=3600,
                                          epoch_activation_block=9378000))
     (f,) = _by(D.drift_report(cfg, record), "rolling-era-king")
-    assert f.kind == D.MISMATCH
+    assert f.kind == D.MISMATCH and f.fails
+    assert f.expected == 9136800 and f.actual == 9378000
 
 
 def test_pin_drift(shipped, record):
@@ -153,8 +172,18 @@ def test_stale_row_and_unknown_feature(shipped, record):
     kinds = {f.feature: f.kind for f in findings}
     assert kinds["v2b-deadbeef"] == D.STALE
     assert kinds["promotion-carry"] == D.UNKNOWN
-    # the open votes of the config with no row at all are reported as pending
-    assert kinds["rolling-era-king"] == D.PENDING and kinds["prelaunch-95-r2"] == D.PENDING
+    # the shipped file has no open vote left (all typed 2026-11-13) ...
+    assert "prelaunch-95-r2" not in kinds and "rolling-era-king" not in kinds
+    # ... while open votes with no row at all are reported as pending
+    import tempfile
+
+    from tests.unit.predecision_main import predecision_text
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "c.toml"
+        p.write_text(predecision_text())
+        untyped = load_chain_config(p)
+    kinds = {f.feature: f.kind for f in D.drift_report(untyped, stale)}
+    assert kinds["prelaunch-95-r2"] == D.PENDING and kinds["rolling-era-king"] == D.PENDING
 
 
 def test_state_report(record):
@@ -211,7 +240,7 @@ def test_cli_in_sync_and_drifted(tmp_path, capsys):
 
     rc = audit_main(["decided", "--config", str(REPO / "chain.toml")])
     out = capsys.readouterr().out
-    assert rc == 0 and "in sync" in out and "[HELD] prelaunch-95-r2" in out
+    assert rc == 0 and "in sync" in out and "[HELD]" not in out   # nothing held since 2026-11-13
 
     src = re.sub(r"(?m)^image_decoupled_from_block\s*=\s*\d+", "image_decoupled_from_block = 0",
                  (REPO / "chain.toml").read_text(encoding="utf-8"))
