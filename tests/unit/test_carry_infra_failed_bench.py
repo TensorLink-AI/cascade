@@ -63,3 +63,34 @@ def test_infra_carry_is_bounded_and_one_per_hotkey():
     # never across eras
     assert RollingScheduler._vbench_carry(_sched(leg), SimpleNamespace(index=8, king_hotkey="k"),
                                           [], {"101": both}) == []
+
+
+def _entry(role, ptr, hotkey):
+    from cascade.shared.bench_report import BenchEntry
+    from cascade.shared.manifest import BenchScores
+
+    return BenchEntry(role=role, size="s", miner_hotkey=hotkey, miner_uid=2, trained_pointer=ptr,
+                      scores=BenchScores(*([1.0] * 6)))
+
+
+def test_a_failed_king_sweep_carries_the_swept_challengers():
+    """2026-11-15: the challenger swept fine, the KING's sweep failed (full
+    bench disk) ⇒ the clearer's gate was infra and it was skipped. It must
+    ride the next settlement of its era like any infra-failed clearer."""
+    leg = _leg("chal", CHAL)
+    cur = SimpleNamespace(index=7, king_hotkey="king_hk")
+    text = _report(entries=(_entry("challenger", CHAL, "chal"),),
+                   infra_failed=({"trained_pointer": KING, "role": "king",
+                                  "reason": "sweep failed (2 attempts): sidecar produced no report"},))
+    assert RollingScheduler._vbench_carry(_sched(leg), cur, [], {"101": text}) == [leg]
+    # a king checkpoint fault is infra too
+    fault = _report(entries=(_entry("challenger", CHAL, "chal"),),
+                    checkpoint_fault=({"trained_pointer": KING, "role": "king", "reason": "x"},))
+    assert RollingScheduler._vbench_carry(_sched(leg), cur, [], {"101": fault}) == [leg]
+    # the cap still holds
+    s = _sched(leg)
+    s.state.vbench_carries = {CHAL: VBENCH_MAX_CARRIES}
+    assert RollingScheduler._vbench_carry(s, cur, [], {"101": text}) == []
+    # a healthy king sweep carries nothing
+    ok = _report(entries=(_entry("challenger", CHAL, "chal"), _entry("king", KING, "king_hk")))
+    assert RollingScheduler._vbench_carry(_sched(leg), cur, [], {"101": ok}) == []
