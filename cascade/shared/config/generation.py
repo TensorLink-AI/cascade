@@ -84,6 +84,13 @@ class GenerationConfig:
     # pregen starts once exhausted. Each build is charged at
     # max_price_per_hour x (max_window_seconds + boot/upload overhead).
     pregen_max_usd_per_epoch: float = 50.0
+    # cgen VM offers whose VMs never boot (2026-11-15: latitude/dallas-usa-1/
+    # cpu_32 failed 6x in two days): the base quarantine after a boot failure
+    # (doubling per repeat, capped at 6 h; persisted across trainer restarts),
+    # and offers that are ALWAYS skipped, as "provider/cloud/region/type"
+    # (a trailing segment may be omitted to block every type in that region).
+    boot_fail_cooldown_seconds: int = 10800
+    exclude_offers: tuple[str, ...] = ()
 
     @property
     def n_children(self) -> int:
@@ -156,6 +163,8 @@ def parse_generation(raw: dict | None) -> GenerationConfig:
         pregen_enabled=g.get("pregen_enabled", False),
         pregen_max_parallel=g.get("pregen_max_parallel", 4),
         pregen_max_usd_per_epoch=g.get("pregen_max_usd_per_epoch", 50.0),
+        boot_fail_cooldown_seconds=g.get("boot_fail_cooldown_seconds", 10800),
+        exclude_offers=g.get("exclude_offers", ()),
     )
     import re
     from urllib.parse import urlsplit
@@ -210,6 +219,16 @@ def parse_generation(raw: dict | None) -> GenerationConfig:
             or not 0 <= float(budget) < float("inf")):
         raise ValueError("[generation] pregen_max_usd_per_epoch must be a finite number >= 0")
     cfg = replace(cfg, pregen_max_usd_per_epoch=float(budget))
+    cool = cfg.boot_fail_cooldown_seconds
+    if isinstance(cool, bool) or not isinstance(cool, int) or not 60 <= cool <= 6 * 3600:
+        raise ValueError("[generation] boot_fail_cooldown_seconds must be an integer in 60..21600")
+    offers = cfg.exclude_offers
+    if not isinstance(offers, (list, tuple)) or not all(
+            isinstance(o, str) and 2 <= len(o.split("/")) <= 4 and all(o.split("/"))
+            for o in offers):
+        raise ValueError('[generation] exclude_offers must be a list of '
+                         '"provider/cloud/region[/type]" strings')
+    cfg = replace(cfg, exclude_offers=tuple(offers))
     if cfg.enabled and not providers:
         raise ValueError("[generation] enabled needs at least one provider")
     return cfg

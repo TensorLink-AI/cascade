@@ -337,11 +337,54 @@ class OfferQuarantine:
     cooldown_s: float = 1800.0
     max_cooldown_s: float = 6 * 3600.0
     clock: Callable[[], float] = field(default=time.monotonic, repr=False)
+    # 2026-11-15: strikes lived only in memory, so every trainer restart reset a
+    # dead offer to "strike 1" and it was re-rented within the hour. With
+    # ``path`` set, strikes + deadlines persist (deadlines in WALL time — a
+    # monotonic clock does not survive a restart). ``excluded`` offers
+    # ("provider/cloud/region[/type]") are always blocked.
+    path: Path | None = None
+    excluded: tuple[str, ...] = ()
     _until: dict = field(default_factory=dict, init=False, repr=False)
     _strikes: dict = field(default_factory=dict, init=False, repr=False)
     _lock: object = field(default_factory=threading.Lock, init=False, repr=False)
 
+    def __post_init__(self) -> None:
+        if self.path is None:
+            return
+        self.clock = time.time
+        try:
+            doc = json.loads(Path(self.path).read_text(encoding="utf-8"))
+            for row in doc.get("offers", []):
+                key = tuple(str(x) for x in row["key"])
+                if len(key) == 4:
+                    self._strikes[key] = int(row.get("strikes", 0))
+                    self._until[key] = float(row.get("until", 0.0))
+        except FileNotFoundError:
+            pass
+        except Exception as e:  # noqa: BLE001 — a torn file must never stop generation
+            log.warning("offer quarantine: %s unreadable (%s); starting empty", self.path, e)
+
+    def _persist(self) -> None:
+        if self.path is None:
+            return
+        rows = [{"key": list(k), "strikes": self._strikes.get(k, 0), "until": self._until.get(k, 0.0)}
+                for k in sorted(set(self._strikes) | set(self._until))]
+        try:
+            write_text_atomic(Path(self.path), json.dumps({"offers": rows}, sort_keys=True))
+        except Exception as e:  # noqa: BLE001 — persistence is best effort
+            log.warning("offer quarantine: could not persist %s (%s)", self.path, e)
+
+    def is_excluded(self, provider, shape) -> bool:
+        key = offer_key(provider, shape)
+        for spec in self.excluded:
+            parts = spec.split("/")
+            if tuple(key[: len(parts)]) == tuple(parts):
+                return True
+        return False
+
     def blocked(self, provider, shape) -> bool:
+        if self.is_excluded(provider, shape):
+            return True
         key = offer_key(provider, shape)
         with self._lock:
             return self._until.get(key, 0.0) > self.clock()
@@ -354,6 +397,7 @@ class OfferQuarantine:
             self._strikes[key] = n
             cool = min(self.max_cooldown_s, self.cooldown_s * (2 ** (n - 1)))
             self._until[key] = self.clock() + cool
+            self._persist()
             return n, cool
 
     def clear(self, provider, shape) -> None:
@@ -361,6 +405,7 @@ class OfferQuarantine:
         with self._lock:
             self._strikes.pop(key, None)
             self._until.pop(key, None)
+            self._persist()
 
 
 @dataclass
@@ -456,6 +501,10 @@ class GenerationStage:
     # repeat); a hotkey renting more than ``max_vms_per_hotkey`` VMs inside
     # ``vm_rent_window_s`` is refused with an alarm (0 ⇒ uncapped).
     boot_fail_cooldown_s: float = 1800.0
+    # Persisted quarantine file (None ⇒ in-memory, tests) and always-skipped
+    # offers ([generation] exclude_offers).
+    offer_quarantine_path: Path | None = None
+    exclude_offers: tuple[str, ...] = ()
     max_vms_per_hotkey: int = 3
     vm_rent_window_s: float = 3600.0
     sleep: Callable[[float], None] = field(default=time.sleep, repr=False)
@@ -468,7 +517,8 @@ class GenerationStage:
         q = self.__dict__.get("_offer_quarantine")
         if q is None:
             q = self.__dict__.setdefault("_offer_quarantine", OfferQuarantine(
-                cooldown_s=self.boot_fail_cooldown_s, clock=self.clock))
+                cooldown_s=self.boot_fail_cooldown_s, clock=self.clock,
+                path=self.offer_quarantine_path, excluded=tuple(self.exclude_offers)))
         return q
 
     def rent_limiter(self) -> RentLimiter:
