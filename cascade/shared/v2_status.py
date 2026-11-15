@@ -1023,7 +1023,16 @@ def publish_trainer_v2_status(sched, block: int, *, min_interval_s: float = MIN_
         ptr = str(getattr(king, "trained_pointer", "") or "")
         health, n = {}, 0
         if drv is not None and ptr:
-            load, n = driver_king_load(drv, ptr, block=block, allow_probe=allow_probe)
+            # A cache miss builds the king model and runs a forward pass per
+            # lane-B domain ON THIS BOX. With lane B inactive nothing else
+            # probes, so every trainer restart paid that cold burst for a
+            # dashboard panel (2026-11-15: RSS 2→6.9 GB, swap full, on a 7 GB
+            # host shared with the validator). Inactive ⇒ cached probes only.
+            lb_cfg = getattr(cfg, "lane_b", None)
+            live = bool(lb_cfg is not None and callable(getattr(lb_cfg, "active", None))
+                        and lb_cfg.active(block))
+            load, n = driver_king_load(drv, ptr, block=block,
+                                       allow_probe=allow_probe and live)
             if load is not None:
                 training = getattr(cfg, "training", None)
                 if hasattr(training, "at_block"):
