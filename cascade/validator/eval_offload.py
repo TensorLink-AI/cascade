@@ -222,6 +222,14 @@ def forecasts_via_host(host, checkpoint, windows, *, contract, num_samples,
                      key[:16], host.name)
         else:
             started = time.monotonic()
+            # count-pruned cache (PRIVATE_CACHE_KEEP) is not a byte budget: evict
+            # LRU entries until this upload + headroom fits, or hold loudly
+            need = (sum((Path(checkpoint) / n).stat().st_size for n in CHECKPOINT_FILES)
+                    + BENCH_DISK_HEADROOM_BYTES)
+            room = step(build_ssh_argv(host, bench_make_room_command(cache_root, [key], need)),
+                        "cache space check")
+            if not _room_ok(host, room, need, f"the private upload of {key[:16]}"):
+                raise PrivateEvalUnavailable("private evaluation host disk short")
             step(build_ssh_argv(host, f"umask 077 && mkdir -p {shlex.quote(part)}"),
                  "cache setup")
             for name in CHECKPOINT_FILES:

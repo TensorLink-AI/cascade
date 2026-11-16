@@ -527,3 +527,27 @@ def test_write_request_with_precomputed_hashes_is_byte_identical(checkpoint, tmp
     b = write_request(tmp_path / "b.npz", directory, _windows(), contract=contract, num_samples=8,
                       hashes=checkpoint_hashes(directory))
     assert a == b
+
+
+def test_a_short_disk_holds_the_round_loudly_before_any_upload(checkpoint, tmp_path, caplog):
+    """2026-11-16 review: the private cache was pruned by COUNT only (the
+    bench pod's 2026-11-15 failure class). The upload now evicts LRU entries
+    until it fits, and a disk still short holds the round as infra."""
+    directory, contract = checkpoint
+    root = tmp_path / "remote"
+    root.mkdir()
+    host = RemoteHost("gpu-fixture", "fixture", user="ubuntu", workdir=str(root))
+    calls = []
+    inner = _shell_runner(root, lambda *p: run_request(*p, device="cpu", workers=1), calls=calls)
+
+    def run(argv, timeout):
+        if "CASCADE_FREE=" in argv[-1]:
+            calls.append(argv)
+            return SimpleNamespace(returncode=0, stdout="CASCADE_FREE=1\n", stderr="")
+        return inner(argv, timeout)
+    with caplog.at_level("ERROR"), pytest.raises(PrivateEvalUnavailable, match="disk short"):
+        forecasts_via_host(host, directory, _windows(), contract=contract, num_samples=8,
+                           runner=run)
+    assert _weight_uploads(calls) == []
+    assert "BENCH DISK SHORT" in caplog.text
+    assert _cache_entries(root) == []
