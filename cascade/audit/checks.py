@@ -1454,6 +1454,22 @@ def _bench_gate_pair(receipt: RoundReceipt, cfg: ChainConfig, manifest: Training
     return kings[size], chals[size]
 
 
+def _comparable_details(replayed, recorded):
+    """The two DEC-CA-0061 details as the replay compares them. When BOTH say
+    the gate was uncomputable, the free-text ``reason`` is dropped: it names
+    WHY a side was missing ("validator bench infra: sweep failed …" on the
+    main validator vs "signed bench rows missing" in a replay that only sees
+    the signed report), which is not part of the outcome. Everything else
+    (computed / passed / rule / thresholds / numbers) still has to match.
+    2026-11-16: an infra round (king sweep failed on a full bench pod) failed
+    this check on every replaying node on that text alone."""
+    if (isinstance(replayed, dict) and isinstance(recorded, dict)
+            and replayed.get("computed") is False and recorded.get("computed") is False):
+        return ({k: v for k, v in replayed.items() if k != "reason"},
+                {k: v for k, v in recorded.items() if k != "reason"})
+    return replayed, recorded
+
+
 def _same_detail(a, b) -> bool:
     """Recursive equality with float tolerance (``_close``)."""
     if isinstance(a, dict) and isinstance(b, dict):
@@ -1566,7 +1582,7 @@ def check_bench_gate(receipt: RoundReceipt, cfg: ChainConfig,
     if replayed != v.bench_gate_passed:
         return _fail(name, f"rule {rule}: recorded bench_gate_passed={v.bench_gate_passed} "
                            f"!= replayed {replayed} ({gate.reason or 'pass'})")
-    if rule == RULE_V2 and not _same_detail(gate.detail(), detail):
+    if rule == RULE_V2 and not _same_detail(*_comparable_details(gate.detail(), detail)):
         return _fail(name, f"rule {RULE_V2}: recorded detail (avg ratio / worst suite LCB / "
                            "win rate / per-suite ratios) differs from the replay over the "
                            "signed rows")
