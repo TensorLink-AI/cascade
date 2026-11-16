@@ -1407,7 +1407,8 @@ def test_an_unreadable_ceiling_logs_and_fails_closed(tmp_path, monkeypatch, capl
 
 
 def test_no_cap_or_a_real_price_is_unchanged(tmp_path):
-    r = _runner(tmp_path, balance=10_000.0, operator_max_price_per_hour=0.0)
+    r = _runner(tmp_path, balance=10_000.0, operator_max_price_per_hour=0.0,
+                operator_daily_spend_cap_usd=0.0, ops_operator_daily_cap_usd=0.0)
     assert money_guard.unpriced_refusal(r, 0.0) == ""          # no daily cap: as before
     r2 = _runner(tmp_path, balance=10_000.0, operator_daily_spend_cap_usd=250.0)
     assert money_guard.unpriced_refusal(r2, 20.0) == ""
