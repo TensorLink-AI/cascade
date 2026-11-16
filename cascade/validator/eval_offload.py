@@ -441,6 +441,53 @@ def _cacheable(ckpt_dir: str | Path) -> bool:
     return name.startswith("sha256-") and len(name) > len("sha256-") + 16
 
 
+# Free bytes the pod must keep beyond an upload (and before the sidecar runs):
+# its report, logs and dataset-cache writes. 2026-11-15: a count-only cache
+# (6 × 4.6 GB on a 43 GB disk) filled the bench pod, the KING sweep died with
+# "sidecar produced no report" and a +0.14 LCB clearer was judged infra.
+BENCH_DISK_HEADROOM_BYTES = 4 << 30
+# Run dirs (``_eval_offload/<name>-<uuid>``) older than this are abandoned
+# (a killed validator never reached its ``finally``) and are removed.
+BENCH_STALE_RUN_MINUTES = 24 * 60
+_FREE_TAG = "CASCADE_FREE="
+
+
+def bench_make_room_command(cache: str, keep: list[str], need_bytes: int) -> str:
+    """Shell (run on the pod) that evicts least-recently-used cached
+    checkpoints — never one in ``keep`` nor an in-flight ``.part-`` upload —
+    until the cache's filesystem has ``need_bytes`` free, then prints
+    ``CASCADE_FREE=<bytes>``. Cache hits ``touch`` their dir, so mtime is LRU."""
+    excl = " ".join(f"-e {shlex.quote(k)}" for k in keep if k) or "-e ''"
+    avail = "df -PB1 . | awk 'NR==2{print $4}'"
+    return (f"cd {shlex.quote(cache)} && while :; do f=$({avail}); "
+            f"[ \"${{f:-0}}\" -ge {int(need_bytes)} ] && break; "
+            f"v=$(ls -1tr | grep -v -e '\\.part-' | grep -vxF {excl} | head -n 1); "
+            "[ -n \"$v\" ] || break; rm -rf -- \"$v\"; done; "
+            f"echo {_FREE_TAG}$({avail})")
+
+
+def bench_free_bytes(stdout: str | None) -> int | None:
+    """The ``CASCADE_FREE=`` figure a make-room step printed (``None`` when
+    absent or unparseable — the caller then proceeds, as before this guard)."""
+    for line in reversed(str(stdout or "").splitlines()):
+        if line.startswith(_FREE_TAG):
+            try:
+                return int(line[len(_FREE_TAG):].strip())
+            except ValueError:
+                return None
+    return None
+
+
+def _room_ok(host: RemoteHost, proc, need_bytes: int, what: str) -> bool:
+    free = bench_free_bytes(getattr(proc, "stdout", ""))
+    if getattr(proc, "returncode", 1) != 0 or free is None or free >= need_bytes:
+        return True
+    log.error("BENCH DISK SHORT on %s before %s: %.1f GB free after evicting the "
+              "bench cache, need %.1f GB — clean the pod (non-cascade files?) "
+              "and re-run the settlement", host.name, what, free / 1e9, need_bytes / 1e9)
+    return False
+
+
 def build_bench_remote_command(
     host: RemoteHost, remote_ckpt: str, remote_report: str, *,
     suites: str, num_samples: int = 100, batch_size: int = 512, max_series: int = 0,
@@ -552,9 +599,13 @@ def run_bench_via_host_many(
         # prep: the run dir, the cache, and a prune of old cache entries /
         # abandoned partial uploads (never the ones this sweep uses)
         keep = " ".join(f"-e {shlex.quote(k)}" for k in keys if k) or "-e ''"
+        parent = f"{host.workdir}/_eval_offload"
         prune = (f"cd {shlex.quote(cache)} && rm -rf -- *.part-* && "
                  f"ls -1t | grep -vxF {keep} | tail -n +{BENCH_CACHE_KEEP} "
-                 "| xargs -r rm -rf --")
+                 "| xargs -r rm -rf -- ; "
+                 f"find {shlex.quote(parent)} -mindepth 1 -maxdepth 1 ! -name cache "
+                 f"! -path {shlex.quote(base)} -mmin +{BENCH_STALE_RUN_MINUTES} "
+                 "-exec rm -rf -- {} +")
         prep = step(build_ssh_argv(
             host, f"rm -rf {shlex.quote(base)} && mkdir -p {shlex.quote(base)} "
             + " ".join(shlex.quote(c) for k, c in zip(keys, ckpts, strict=True) if not k)
@@ -581,6 +632,10 @@ def run_bench_via_host_many(
                     log.info("eval-offload: %s already on %s — upload skipped",
                              key[-24:], host.name)
                     continue
+            need = sum(f.stat().st_size for f in files) + BENCH_DISK_HEADROOM_BYTES
+            room = step(build_ssh_argv(host, bench_make_room_command(cache, keys, need)), 300)
+            if not _room_ok(host, room, need, f"uploading {Path(str(local)).name[-24:]}"):
+                return out
             dest = f"{remote}.part-{tag}" if key else remote
             if key:
                 mk = step(build_ssh_argv(host, f"mkdir -p {shlex.quote(dest)}"), 60)
@@ -608,6 +663,10 @@ def run_bench_via_host_many(
                     log.warning("eval-offload cache publish failed on %s: %s", host.name,
                                 (fin.stderr or "")[-200:])
                     return out
+        room = step(build_ssh_argv(
+            host, bench_make_room_command(cache, keys, BENCH_DISK_HEADROOM_BYTES)), 300)
+        if not _room_ok(host, room, BENCH_DISK_HEADROOM_BYTES, "the benchmark"):
+            return out
         # the benchmark's own budget starts now, not at the first scp
         deadline = time.monotonic() + timeout_s
         cmd = build_bench_remote_command(

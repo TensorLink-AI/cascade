@@ -139,3 +139,58 @@ def test_the_upload_budget_still_bounds_a_stuck_upload(tmp_path, monkeypatch):
     assert got == [None, None]
     assert not any("cascade-benchmark" in c[-1] for c in r.calls)
     assert len(r.scps()) == 1
+
+
+# ── disk-aware cache eviction (2026-11-15: a count-only cache filled the bench
+# pod, the king sweep died "sidecar produced no report", a clearer went infra) ──
+
+def test_make_room_evicts_lru_but_never_this_sweeps_keys_or_partials():
+    cmd = eo.bench_make_room_command("/w/_eval_offload/cache", [DIGEST, ""], 123)
+    assert "ls -1tr" in cmd and f"-e {DIGEST}" in cmd and "\\.part-" in cmd
+    assert "-ge 123" in cmd and cmd.rstrip().endswith("awk 'NR==2{print $4}')")
+    assert eo.bench_free_bytes("noise\nCASCADE_FREE=42\n") == 42
+    assert eo.bench_free_bytes("") is None and eo.bench_free_bytes("CASCADE_FREE=x") is None
+
+
+class _ShortDisk(_Runner):
+    def __init__(self, free, **kw):
+        super().__init__(**kw)
+        self.free = free
+
+    def __call__(self, argv, timeout):
+        if "CASCADE_FREE=" in " ".join(argv):
+            self.calls.append(argv)
+            return SimpleNamespace(returncode=0, stdout=f"CASCADE_FREE={self.free}\n", stderr="")
+        return super().__call__(argv, timeout)
+
+
+def test_a_short_disk_refuses_the_upload_loudly_instead_of_a_silent_sidecar_crash(
+        tmp_path, caplog):
+    d = _ckpt(tmp_path)
+    r = _ShortDisk(free=1)
+    with caplog.at_level("ERROR"):
+        assert run_bench_via_host_many(_host(), [d], suites="time", runner=r) == [None]
+    assert r.scps() == [] and not any("cascade-benchmark" in c[-1] for c in r.calls)
+    assert "BENCH DISK SHORT" in caplog.text
+
+
+def test_a_fully_cached_sweep_still_needs_sidecar_headroom(tmp_path, caplog):
+    d = _ckpt(tmp_path)
+    r = _ShortDisk(free=eo.BENCH_DISK_HEADROOM_BYTES - 1,
+                   cached_manifest=bench_upload_manifest(bench_upload_files(d)))
+    with caplog.at_level("ERROR"):
+        assert run_bench_via_host_many(_host(), [d], suites="time", runner=r) == [None]
+    assert "before the benchmark" in caplog.text
+
+
+def test_enough_room_after_eviction_proceeds(tmp_path):
+    d = _ckpt(tmp_path)
+    r = _ShortDisk(free=eo.BENCH_DISK_HEADROOM_BYTES + 10_000)
+    assert run_bench_via_host_many(_host(), [d], suites="time", runner=r) == [{"ok": 1}]
+    assert len(r.scps()) == 1
+
+
+def test_prep_removes_abandoned_run_dirs_but_never_the_cache():
+    import inspect
+    src = inspect.getsource(eo.run_bench_via_host_many)
+    assert "! -name cache" in src and "BENCH_STALE_RUN_MINUTES" in src
