@@ -891,11 +891,15 @@ class ValidatorBenchMixin:
         if host is not None:
             from .eval_offload import run_bench_via_host_many
 
+            # on_wait: the weight keep-alive (re-pushes the last vector that
+            # landed, never recomputed) so a multi-hour sweep does not starve
+            # the weight loop; evidence_label names the kept report files.
             return run_bench_via_host_many(
                 host, dests, suites=",".join(suites), num_samples=num_samples,
                 max_series=ec.cascade_bench_max_series,
                 data_dir=(ec.gift_gate_data_dir or None), device="cuda", timeout_s=timeout_s,
-                workers=workers)
+                workers=workers, on_wait=getattr(self, "_weights_keepalive_tick", None),
+                evidence_label="+".join(f"{e.role}-{e.miner_hotkey[:12]}" for e in entries))
         from ..eval.benchmarks import run_bench_reports
 
         return run_bench_reports(
