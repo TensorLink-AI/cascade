@@ -411,13 +411,15 @@ def test_active_lane_b_probes_on_a_cache_miss():
     cfg = _cfg(1)
     drv = _ProbeDriver(cfg)
     store = _Store()
-    assert publish_trainer_v2_status(_sched(store, cfg=cfg, drv=drv), 20000,
-                                     clock=lambda: 0.0)
+    # both schedulers stay referenced: the rate limit keys on id(sched), and a
+    # freed temporary's id can be reused by the next one (flaked in CI)
+    sch1 = _sched(store, cfg=cfg, drv=drv)
+    assert publish_trainer_v2_status(sch1, 20000, clock=lambda: 0.0)
     assert sorted(drv.calls) == sorted(DOMAINS)
     # and the caller's veto still wins over an active lane
     drv2 = _ProbeDriver(cfg)
-    assert publish_trainer_v2_status(_sched(_Store(), cfg=cfg, drv=drv2), 20000,
-                                     clock=lambda: 0.0, allow_probe=False)
+    sch2 = _sched(_Store(), cfg=cfg, drv=drv2)
+    assert publish_trainer_v2_status(sch2, 20000, clock=lambda: 0.0, allow_probe=False)
     assert drv2.calls == []
 
 
