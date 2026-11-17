@@ -69,3 +69,56 @@ def test_website_renders_the_gate():
     assert "bench_gate_detail" in page and "function benchGateHtml(r)" in page
     m = re.search(r"function renderCohort\(\)\{(.*?)\nfunction renderChart", page, re.S)
     assert m and "benchGateHtml(r)" in m.group(1)
+
+
+# ── per-dataset breakdown ───────────────────────────────────────────────────
+
+def _rows(pairs):
+    return {"gift": {"status": "ok", "rows": [
+        {"item": item, "crps": c, "mase": m} for item, c, m in pairs]}}
+
+
+def test_groups_match_the_gate_unit_and_sort_by_drag():
+    king = _rows([("solar/H/short", 1.0, 1.0), ("solar/H/long", 1.0, 1.0),
+                  ("m4_daily/D/short", 1.0, 1.0), ("ett1/H/short", 1.0, 1.0),
+                  ("bad/H/short", 0.0, 1.0)])
+    chal = _rows([("solar/H/short", 1.1, 1.1), ("solar/H/long", 1.1, 1.1),
+                  ("m4_daily/D/short", 1.3, 1.3), ("ett1/H/short", 0.9, 0.9),
+                  ("bad/H/short", 1.0, 1.0)])
+    cells = dash.bench_dataset_groups(king, chal)["gift"]
+    # drag: m4_daily ln 1.3 = 0.26 > solar 2 × ln 1.1 = 0.19; the masked task is dropped
+    assert [c["dataset"] for c in cells] == ["m4_daily", "solar", "ett1"]
+    solar = cells[1]
+    assert solar["n"] == 2 and solar["wins"] == 0 and abs(solar["ratio"] - 1.1) < 1e-12
+    assert cells[-1]["wins"] == 1 and cells[-1]["ratio"] < 1
+    lines = dash.bench_dataset_lines({"gift": cells}, limit=2)
+    assert "GIFT-Eval — 3 datasets" in lines[1] and "+1 more" in lines[1]
+    assert lines[2].split()[0] == "m4_daily" and len(lines) == 4
+    assert len(dash.bench_dataset_lines({"gift": cells}, limit=None)) == 5
+
+
+def test_fetch_datasets_follows_the_report(monkeypatch):
+    king = _rows([("solar/H/short", 1.0, 1.0)])
+    chal = _rows([("solar/H/short", 2.0, 2.0)])
+    docs = {"bench_v/round-1.json": {"entries": [
+                {"role": "challenger", "rows_key": "rows/c"}, {"role": "king", "rows_key": "rows/k"}]},
+            "rows/k": king, "rows/c": chal}
+    monkeypatch.setattr(dash, "fetch_public_json", lambda st, key, **k: docs.get(key))
+    got = dash.fetch_bench_datasets(object(), "bench_v/round-1.json")
+    assert got["gift"][0]["dataset"] == "solar" and abs(got["gift"][0]["ratio"] - 2.0) < 1e-12
+    assert dash.fetch_bench_datasets(object(), None) is None
+    docs.pop("rows/k")
+    assert dash.fetch_bench_datasets(object(), "bench_v/round-1.json") is None
+
+
+def test_receipt_gives_the_report_key(monkeypatch):
+    monkeypatch.setattr(dash, "fetch_public_json", lambda *a, **k: {
+        "verdict": {"bench_gate_detail": DETAIL}, "bench_report": {"key": "bench_v/round-7.json"}})
+    rows = [{"status": "scored", "receipt_key": "receipts/b/x.json"}]
+    assert dash.fetch_bench_receipt(object(), rows) == (DETAIL, "bench_v/round-7.json")
+
+
+def test_website_has_the_lazy_dataset_panel():
+    page = (Path(__file__).resolve().parents[2] / "cascade" / "website" / "index.html").read_text()
+    assert "function benchGroups(king,chal)" in page and "bench_report.key" in page
+    assert 'class="bench-ds"' in page and 'addEventListener("toggle"' in page
