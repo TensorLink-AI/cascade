@@ -328,7 +328,7 @@ The execution stage and `evaluation` are separate observations:
 
 | Lane | Execution and scientific progress | Result evidence |
 |---|---|---|
-| A | Admission → data preparation → GPU provisioning → training → harvest → settlement | `cascade duel --hotkey HOTKEY --history --json`; queue `done` does not establish a win |
+| A | Admission → data preparation → GPU provisioning → training → harvest → settlement | `cascade duel --hotkey HOTKEY --history --json`; queue `done` does not establish a win. A private-pool win can still be blocked by the public benchmark check: read `bench_gate` / `bench_datasets` in the same JSON ([MINER.md](MINER.md#watching-it)) |
 | B | The shared execution stages, then target qualification → waiting for warm-start acceptance → accepted or rejected | `evaluation.stage` reports the exact attempt when available; qualified contributions may wait across eras for non-overlapping merge rows/target slots |
 | C | The shared execution stages, then publication → forward judging → pending confirmation, deferred, dropped, confirmed or below-holder result | `evaluation.reported` names the origin and observed receipt boundary; a passing confirmation below the holder's LCB does not take its slot |
 
