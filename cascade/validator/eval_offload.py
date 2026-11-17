@@ -457,6 +457,124 @@ BENCH_DISK_HEADROOM_BYTES = 4 << 30
 # Run dirs (``_eval_offload/<name>-<uuid>``) older than this are abandoned
 # (a killed validator never reached its ``finally``) and are removed.
 BENCH_STALE_RUN_MINUTES = 24 * 60
+# Every offloaded sweep's raw sidecar reports + stderr are kept on THIS box
+# (the run dir on the pod is deleted after the reports are read). A suite that
+# comes back partial / errored is otherwise unexplainable after the fact
+# (2026-11-16: a pool clearer was held INFRA on "gift-eval:partial" twice and
+# the skipped configs + reasons were lost). Operator-local evidence only —
+# never read by scoring, so no consensus effect. Relative to the validator's
+# cwd unless CASCADE_BENCH_EVIDENCE_DIR is set; the newest
+# BENCH_EVIDENCE_KEEP sweeps are kept.
+BENCH_EVIDENCE_DIR_ENV = "CASCADE_BENCH_EVIDENCE_DIR"
+BENCH_EVIDENCE_DEFAULT_DIR = "_bench_evidence"
+BENCH_EVIDENCE_KEEP = 60
+BENCH_EVIDENCE_STDERR_MAX = 2 << 20
+# How many skipped configs a sweep's warning names (the file has them all).
+BENCH_SKIP_LOG_MAX = 8
+# While the sidecar runs, ``on_wait`` (the validator's weight keep-alive) is
+# called this often so a multi-hour sweep never starves the weight loop.
+BENCH_WAIT_TICK_SECONDS = 60.0
+
+
+def run_ssh_ticking(argv: list[str], timeout: float, tick: Callable[[], None],
+                    every: float = BENCH_WAIT_TICK_SECONDS):
+    """:func:`run_ssh` that calls ``tick()`` every ``every`` seconds while the
+    command runs. Same result (a text-mode ``CompletedProcess``) and the same
+    ``subprocess.TimeoutExpired`` past ``timeout`` (the child is killed). A
+    raising ``tick`` is logged and ignored — it can never fail the command."""
+    import subprocess
+
+    end = time.monotonic() + max(0.0, float(timeout))
+    with subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, text=True) as proc:
+        while True:
+            left = end - time.monotonic()
+            if left <= 0:
+                proc.kill()
+                out, err = proc.communicate()
+                raise subprocess.TimeoutExpired(argv, timeout, output=out, stderr=err)
+            try:
+                out, err = proc.communicate(timeout=min(every, left))
+            except subprocess.TimeoutExpired:
+                try:
+                    tick()
+                except Exception as e:  # noqa: BLE001 — a tick never fails the sweep
+                    log.warning("eval-offload: wait tick failed: %s", e)
+                continue
+            return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+
+
+def bench_report_problems(report: dict | None) -> list[str]:
+    """Human-readable problems in one sidecar report: a suite whose status is
+    not ``ok``, or any skipped config (``full`` / ``stage`` / ``reason``).
+    FEV's declared multivariate scope skips (``stage == "scope"``) are not
+    problems. ``["no report"]`` for ``None``. Never raises."""
+    if report is None:
+        return ["no report"]
+    out: list[str] = []
+    try:
+        for s in report.get("suites", []) or []:
+            name = s.get("suite")
+            if s.get("status") != "ok":
+                detail = str(s.get("detail") or "").strip().splitlines()
+                out.append(f"{name}: status={s.get('status')}"
+                           + (f" ({detail[0][:200]})" if detail else ""))
+            for k in s.get("skipped") or []:
+                if isinstance(k, dict):
+                    if name == "fev" and k.get("stage") == "scope":
+                        continue
+                    out.append(f"{name}: skipped {k.get('full')} at {k.get('stage')}: "
+                               f"{str(k.get('reason'))[:200]}")
+                else:
+                    out.append(f"{name}: skipped {str(k)[:200]}")
+    except Exception as e:  # noqa: BLE001 — evidence must never fail a sweep
+        out.append(f"unparseable report: {e}")
+    return out
+
+
+def record_bench_evidence(label: str, *, reports: list[dict | None], proc=None,
+                          note: str = "", root: str | Path | None = None) -> Path | None:
+    """Write one sweep's evidence (raw reports, the sidecar's exit code and
+    stderr, a problems summary) to ``<root>/<utc>-<label>.json`` and prune to
+    the newest :data:`BENCH_EVIDENCE_KEEP`. Logs a WARNING naming the first
+    skipped configs when any report has problems. Returns the path, or
+    ``None`` when nothing could be written. Never raises."""
+    import datetime
+    import os
+
+    try:
+        problems = [f"report {i}: {p}" for i, r in enumerate(reports)
+                    for p in bench_report_problems(r)]
+        stderr = str(getattr(proc, "stderr", "") or "") if proc is not None else ""
+        if problems:
+            log.warning("eval-offload: sweep %s has %d problem(s): %s%s", label,
+                        len(problems), "; ".join(problems[:BENCH_SKIP_LOG_MAX]),
+                        " …" if len(problems) > BENCH_SKIP_LOG_MAX else "")
+            tail = stderr.strip()[-STEP_STDERR_TAIL:]
+            if tail:
+                log.warning("eval-offload: sweep %s sidecar stderr tail: %s", label, tail)
+        base = Path(root or os.environ.get(BENCH_EVIDENCE_DIR_ENV) or BENCH_EVIDENCE_DEFAULT_DIR)
+        base.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%SZ")
+        safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in label)[:120]
+        path = base / f"{stamp}-{safe}-{uuid.uuid4().hex[:6]}.json"
+        payload = {
+            "label": label, "note": note, "problems": problems,
+            "returncode": getattr(proc, "returncode", None) if proc is not None else None,
+            "stderr": stderr[-BENCH_EVIDENCE_STDERR_MAX:],
+            "reports": reports,
+        }
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, default=str))
+        tmp.replace(path)
+        kept = sorted(base.glob("*.json"), key=lambda p: p.name, reverse=True)
+        for old in kept[BENCH_EVIDENCE_KEEP:]:
+            with contextlib.suppress(OSError):
+                old.unlink()
+        return path
+    except Exception as e:  # noqa: BLE001 — evidence must never fail a sweep
+        log.warning("eval-offload: could not record bench evidence for %s: %s", label, e)
+        return None
 _FREE_TAG = "CASCADE_FREE="
 
 
@@ -565,7 +683,8 @@ def run_bench_via_host_many(
     num_samples: int = 100, batch_size: int = 512, max_series: int = 0,
     datasets: str = "", data_dir: str | None = None, device: str = "cuda",
     timeout_s: int = 3600, runner=None, workers: str | int | None = None,
-    upload_timeout_s: int | None = None,
+    upload_timeout_s: int | None = None, on_wait: Callable[[], None] | None = None,
+    evidence_label: str = "",
 ) -> list[dict | None]:
     """:func:`run_bench_via_host` for several checkpoints in ONE paired
     sidecar pass on the pod (``--extra-checkpoint``) — one report (or
@@ -577,7 +696,12 @@ def run_bench_via_host_many(
     retried settlement does not upload again. The upload has its own budget
     (``upload_timeout_s``, default :data:`BENCH_UPLOAD_SECONDS_PER_CKPT` per
     checkpoint); ``timeout_s`` is the benchmark's, counted from when the
-    uploads finish."""
+    uploads finish.
+
+    ``on_wait`` (no ``runner`` only) is called every
+    :data:`BENCH_WAIT_TICK_SECONDS` while the sidecar runs — the validator's
+    weight keep-alive. Whatever comes back (reports, exit code, stderr) is
+    kept by :func:`record_bench_evidence` under ``evidence_label``."""
     run = runner or run_ssh
     n = len(ckpt_dirs)
     out: list[dict | None] = [None] * n
@@ -684,10 +808,20 @@ def run_bench_via_host_many(
             extra=tuple(zip(ckpts[1:], reports[1:], strict=True)),
             timeout_s=max(1, int(deadline - time.monotonic()) - 15),
         )
-        proc = step(build_ssh_argv(host, cmd))
+        label = evidence_label or "+".join(Path(str(d)).name[-24:] for d in ckpt_dirs)
+        bench_argv = build_ssh_argv(host, cmd)
+        if on_wait is not None and runner is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("public benchmark offload deadline expired")
+            proc = run_ssh_ticking(bench_argv, remaining, on_wait)
+        else:
+            proc = step(bench_argv)
         if proc.returncode != 0:
             log.warning("eval-offload benchmark (%s) failed on %s (exit %s): %s",
                         suites, host.name, proc.returncode, (proc.stderr or "")[-400:])
+            record_bench_evidence(label, reports=list(out), proc=proc,
+                                  note=f"sidecar exit {proc.returncode} on {host.name}")
             return out
         for i, rep in enumerate(reports):
             deadline = max(deadline, time.monotonic() + 120)
@@ -697,9 +831,12 @@ def run_bench_via_host_many(
                             (cat.stderr or "")[-200:])
                 continue
             out[i] = json.loads(cat.stdout)
+        record_bench_evidence(label, reports=list(out), proc=proc, note=f"on {host.name}")
         return out
     except Exception as e:  # noqa: BLE001 — an eval helper must never raise into a round
         log.warning("eval-offload errored on %s: %s", host.name, e)
+        record_bench_evidence(evidence_label or "sweep", reports=[None] * n,
+                              note=f"errored on {host.name}: {type(e).__name__}: {e}")
         return [None] * n
     finally:
         with contextlib.suppress(Exception):

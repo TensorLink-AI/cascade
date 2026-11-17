@@ -397,3 +397,32 @@ def test_dethrone_keeps_a_staged_v2_promotion(env):
     assert r._v2_pending_kept()
     r.cascade.note_dethrone("5New", block=gate + 5 * era, keep_pending=r._v2_pending_kept())
     assert r.cascade.state.pending_generation == 1 and r.cascade.state.pending_members == (KP,)
+
+
+def test_rate_limited_push_still_stamps_the_emission_record(env):
+    """2026-11-16 round 10613571513987485143: the settlement's push hit the
+    100-block rate limit and the receipt shipped a king check with no ladder
+    (no reign clock), which the audit cannot replay. The record describes
+    what the round decided, so it is stamped even when the chain refuses."""
+    cfg, gate, era = env
+    b = gate + 20 * era
+    st = ChampionState(king_hotkey=KING, king_uid=3, king_since_block=gate + 2 * era,
+                       king_share_bp=7000, court_hotkey=OLD, court_until_block=b + 100,
+                       former_kings=(OLD, "5Older"))
+    r = _runner(cfg, st)
+    m = _manifest(b)
+    r._v2_settlement_economics(m, [], 1, None, KING)
+
+    class _Refuses(_Client):
+        def set_weight_vector(self, vec):
+            super().set_weight_vector(vec)
+            return False                                # "last set 44 blocks ago"
+
+    c = _Refuses(b + 50, {KING: 3, OLD: 4, "5Older": 5})
+    uids = r._reward_uids(m, None, c)
+    r._lane_b_block = b
+    assert r._apply_weights(c, m.round_id, uids, boundary=b) == ()
+    assert len(c.vectors) == 1
+    assert r._last_emission is not None and r._last_emission["ladder"]["event"] == "none"
+    rc = _receipt(r, m, b, uids, ())
+    assert check_weights(rc, cfg).status != "FAIL"      # empty vector: WARN, retried
