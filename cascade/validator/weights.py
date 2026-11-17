@@ -522,16 +522,23 @@ class WeightsMixin:
                           c_slot_frac=(dict(pay_c["slot_frac"]) if pay_c is not None else None))
         vec = tuple(emission_vector(a, b if (pay is not None or pay_c is not None) else None,
                                     policy, burn_uid=burn, lane_a_uids=reward_uids))
-        if client.set_weight_vector(list(vec)) is False:  # type: ignore[attr-defined]
-            return self._weights_not_set(round_id)
-        self._last_lane_b_pay = pay
-        self._last_lane_c_pay = pay_c
+        # The emission record (policy + this settlement's ladder step, incl. the
+        # reign clock a king check was judged from) describes what the round
+        # DECIDED, not whether the chain took the push — so it is stamped
+        # before the push. 2026-11-16 round 10613571513987485143: the
+        # settlement's push hit the 100-block rate limit (a re-assert had
+        # landed 44 blocks earlier) and the receipt went out with a king check
+        # but no ladder, which the audit cannot replay ("no reign clock").
         ladder = getattr(self, "_settlement_ladder", None)
         if not policy.inert:
             self._last_emission = emission_record(
                 policy, boundary=boundary, king_since_block=self.state.king_since_block,
                 ladder=(ladder[1] if ladder is not None and ladder[0] == str(round_id)
                         else None))
+        if client.set_weight_vector(list(vec)) is False:  # type: ignore[attr-defined]
+            return self._weights_not_set(round_id)
+        self._last_lane_b_pay = pay
+        self._last_lane_c_pay = pay_c
         log.info("round=%s weights set under the DEC-CA-0055 policy %s: %s", round_id,
                  policy.as_record(), {u: round(w, 4) for u, w in enumerate(vec) if w > 0})
         with contextlib.suppress(Exception):
