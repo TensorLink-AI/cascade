@@ -635,6 +635,7 @@ def _cmd_duel(args: argparse.Namespace) -> int:
     cfg = load_chain_config(args.chain_toml)
     from .dashboard import (
         duel_round_rows,
+        fetch_bench_gate,
         fetch_public_receipt_index,
         render_duel,
         render_duel_domain_history,
@@ -661,8 +662,9 @@ def _cmd_duel(args: argparse.Namespace) -> int:
         return out.fail("round_not_found",
                         f"no receipt-index rows for {target} — receipts land a few minutes "
                         "after the duel manifest; try 'cascade duel --history'")
-    out.result(rows=rows)
-    out.info(render_duel(rows, me=me))
+    bench_gate = fetch_bench_gate(cfg.storage, rows)
+    out.result(rows=rows, bench_gate=bench_gate)
+    out.info(render_duel(rows, me=me, bench_gate=bench_gate))
     return OK
 
 

@@ -492,7 +492,64 @@ def _duel_validators_line(rows: list[dict]) -> str | None:
     return "  validators     " + " · ".join(parts) if parts else None
 
 
-def render_duel(rows: list[dict], *, me: str | None = None) -> str:
+# ── public-benchmark gate (verdict.bench_gate_detail on the signed receipt) ──
+#
+# The gate only runs once a challenger clears the private pool, and it can only
+# BLOCK a dethrone. The index row carries just the private-pool verdict, so the
+# per-suite detail is read from the round's full receipt (``receipt_key``).
+
+BENCH_SUITE_NAMES = {"gift": "GIFT-Eval", "boom": "BOOM", "time": "TIME", "fev": "FEV"}
+
+
+def fetch_bench_gate(storage: object, rows: list[dict], *,
+                     timeout: float = 30.0) -> dict | None:
+    """The ``bench_gate_detail`` of the round's scored receipt, or None (no
+    scored row, no ``receipt_key``, fetch failed, or no gate recorded)."""
+    scored = [r for r in rows if str(r.get("status")) == "scored" and r.get("receipt_key")]
+    if not scored:
+        return None
+    doc = fetch_public_json(storage, str(scored[-1]["receipt_key"]), timeout=timeout)
+    verdict = doc.get("verdict") if isinstance(doc, dict) else None
+    detail = verdict.get("bench_gate_detail") if isinstance(verdict, dict) else None
+    return detail if isinstance(detail, dict) else None
+
+
+def bench_gate_lines(detail: dict | None) -> list[str]:
+    """Per-suite lines for the public-benchmark gate, weakest suite first."""
+    if not isinstance(detail, dict):
+        return []
+    if detail.get("computed") is False:
+        return [f"  public bench   not computed — {detail.get('reason') or 'bench rows missing'}"]
+    win, minw = _as_float(detail.get("win_rate")), _as_float(detail.get("min_win_rate"))
+    avg = _as_float(detail.get("avg_ratio"))
+    head = "passed" if detail.get("passed") else "BLOCKED the dethrone"
+    if win is not None:
+        head += f" — mean win rate {win * 100:.1f}%"
+        if minw is not None:
+            head += f" (needs {minw * 100:.0f}%)"
+    if avg is not None:
+        head += f" · mean error ratio {avg:.3f}"
+    lines = [f"  public bench   {head}",
+             "    suite        error ratio  ratio LCB  win rate  series   (ratio < 1 = challenger better)"]
+    suites = detail.get("suites") if isinstance(detail.get("suites"), dict) else {}
+    cells = []
+    for key, cell in suites.items():
+        if isinstance(cell, dict):
+            cells.append((key, _as_float(cell.get("ratio")), _as_float(cell.get("ratio_lcb")),
+                          _as_float(cell.get("win_rate")), _as_int(cell.get("n"))))
+    cells.sort(key=lambda c: 1.0 if c[3] is None else c[3])
+    for key, ratio, lcb, rate, n in cells:
+        mark = "  ← below the bar" if rate is not None and minw is not None and rate < minw else ""
+        lines.append(f"    {BENCH_SUITE_NAMES.get(key, key):<12} "
+                     f"{'--' if ratio is None else f'{ratio:.3f}':>11}  "
+                     f"{'--' if lcb is None else f'{lcb:.3f}':>9}  "
+                     f"{'--' if rate is None else f'{rate * 100:.1f}%':>8}  "
+                     f"{'--' if n is None else n:>6}{mark}")
+    return lines
+
+
+def render_duel(rows: list[dict], *, me: str | None = None,
+                bench_gate: dict | None = None) -> str:
     """The standalone ``cascade duel`` view of one settled round's index rows.
     ``me`` (a hotkey) appends that miner's own per-domain scores against the
     king — see :func:`my_domain_lines`."""
@@ -554,6 +611,7 @@ def render_duel(rows: list[dict], *, me: str | None = None) -> str:
     gift = row.get("gift_gate_passed")
     if gift is not None:
         lines.append("  gift gate      " + ("passed" if gift else "BLOCKED the dethrone"))
+    lines += bench_gate_lines(bench_gate)
     # Archived boundary-round receipts carry a heat summary; rolling ones don't.
     heat = row.get("heat")
     if isinstance(heat, dict) and heat.get("n_entrants") is not None:

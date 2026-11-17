@@ -1902,6 +1902,39 @@ function uidOfHotkey(hk,r){
   return null;
 }
 function horizonKeys(o){ return Object.keys(o||{}).sort(function(a,b){ return Number(a)-Number(b); }); }
+// The public-benchmark gate (verdict.bench_gate_detail on the signed receipt):
+// it only runs once a challenger clears the private pool, and it can only
+// BLOCK a dethrone. Per suite: the challenger/king error ratio (< 1 = the
+// challenger is better) and the share of series it won; the gate needs the
+// suites' mean win rate at or above min_win_rate.
+var BENCH_SUITES={gift:"GIFT-Eval",boom:"BOOM",time:"TIME",fev:"FEV"};
+function benchGateHtml(r){
+  var rc=receiptFor(r.round_id), d=rc&&rc.verdict&&rc.verdict.bench_gate_detail;
+  if(!d||typeof d!=="object") return "";
+  if(d.computed===false){
+    return '<div><div class="cohort-head">Public benchmarks <span class="muted">— not computed: '+esc(d.reason||"bench rows missing")+'</span></div></div>';
+  }
+  var su=d.suites||{}, names=Object.keys(su).sort(function(a,b){ return (su[a].win_rate==null?1:su[a].win_rate)-(su[b].win_rate==null?1:su[b].win_rate); });
+  var minw=d.min_win_rate;
+  var rows=names.map(function(k){
+    var c=su[k]||{}, better=c.ratio!=null&&c.ratio<1, won=c.win_rate!=null&&minw!=null&&c.win_rate>=minw;
+    return '<tr><td>'+esc(BENCH_SUITES[k]||k)+'</td>'+
+      '<td class="num'+(better?' good':'')+'">'+fmt(c.ratio,3)+'</td>'+
+      '<td class="num">'+fmt(c.ratio_lcb,3)+'</td>'+
+      '<td class="num'+(won?' good':'')+'">'+(c.win_rate!=null?(c.win_rate*100).toFixed(1)+"%":"--")+'</td>'+
+      '<td class="num">'+(c.n!=null?c.n:"--")+'</td></tr>';
+  }).join("");
+  var head=(d.passed?'<span class="heat-pill adv">✓ passed</span>':'<span class="heat-pill nofit">✗ blocked the dethrone</span>')+
+    ' <span class="muted">— mean win rate '+(d.win_rate!=null?(d.win_rate*100).toFixed(1)+"%":"--")+
+    (minw!=null?' (needs '+(minw*100).toFixed(0)+'%)':'')+' · mean error ratio '+fmt(d.avg_ratio,3)+
+    (d.reason&&!d.passed?' · '+esc(d.reason):'')+' · weakest suite first; ratio &lt; 1 = challenger better</span>';
+  return '<div><div class="cohort-head">Public benchmarks '+head+'</div>'+
+    '<div class="scroll-box"><table><thead><tr><th>Suite</th>'+
+    '<th class="num" title="Challenger error / king error — below 1 means the challenger is better">Error ratio</th>'+
+    '<th class="num" title="Bootstrap lower bound on the ratio">Ratio LCB</th>'+
+    '<th class="num" title="Share of series where the challenger beat the king">Win rate</th>'+
+    '<th class="num">Series</th></tr></thead><tbody>'+rows+'</tbody></table></div></div>';
+}
 function renderCohort(){
   var r=latestScoredRow(), el=document.getElementById("cohort-panel");
   if(!r||r.status==="rejected"){ el.hidden=true; el.innerHTML=""; return; }
@@ -1929,6 +1962,7 @@ function renderCohort(){
       '<div class="scroll-box"><table><thead><tr><th>Domain</th><th class="num">King</th><th class="num">Challenger</th>'+
       '<th class="num">Gap</th><th class="num">Win rate</th><th class="num">n</th></tr></thead><tbody>'+drows+'</tbody></table></div></div>';
   }
+  html+=benchGateHtml(r);
   var seen={}, hks=[];
   Object.keys(s.geos).concat(Object.keys(s.lcbs)).forEach(function(hk){ if(!seen[hk]){ seen[hk]=1; hks.push(hk); } });
   if(hks.length>1||(hks.length===1&&Object.keys(s.geos).length)){
