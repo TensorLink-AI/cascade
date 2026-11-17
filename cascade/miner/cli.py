@@ -670,7 +670,7 @@ def _cmd_duel(args: argparse.Namespace) -> int:
     datasets = fetch_bench_datasets(cfg.storage, report_key) if bench_gate else None
     out.result(rows=rows, bench_gate=bench_gate, bench_datasets=datasets)
     out.info(render_duel(rows, me=me, bench_gate=bench_gate, bench_datasets=datasets,
-                         dataset_limit=None if args.all_datasets else 5))
+                         dataset_limit=None if getattr(args, "all_datasets", False) else 5))
     return OK
 
 
