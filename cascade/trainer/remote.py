@@ -2401,14 +2401,30 @@ class RemoteDispatcher:
             entry = receipt_to_entry(receipt)
             if entry.role != receipt_role(role):
                 raise RemoteDispatchError(f"receipt role {entry.role!r} != dispatched {role!r}")
+            _discard_mirror(mirror)
             return entry
         entry = (receipt_to_local(receipt) if local_checkpoint
                  else receipt_to_entry(receipt))
         if entry.role != receipt_role(role):
             raise RemoteDispatchError(f"receipt role {entry.role!r} != dispatched {role!r}")
         if auto_harvest:
-            return self.harvest(host, entry, base_seed=base_seed, repo_suffix=repo_suffix)
+            entry = self.harvest(host, entry, base_seed=base_seed, repo_suffix=repo_suffix)
+        # The checkpoint is safe (harvested, or pushed by the worker): the
+        # continuation mirror can no longer be restored from. Failed legs keep
+        # theirs, since a retry on a replacement pod resumes from it.
+        _discard_mirror(mirror)
         return entry
+
+
+def _discard_mirror(mirror) -> None:
+    """Best-effort removal of a finished leg's continuation mirror; a failure
+    here never fails the leg."""
+    if mirror is None:
+        return
+    try:
+        mirror.discard()
+    except Exception as e:  # noqa: BLE001 — cleanup only
+        log.warning("continuation mirror %s not removed: %s", mirror.root, e)
 
 
 def push_corpus_files(host: RemoteHost, files: dict[str, str], tag: str, *,
