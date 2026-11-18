@@ -16,6 +16,12 @@ from .continuation import PROTOCOL, VERSION_RE, SnapshotStore, canonical, digest
 
 log = logging.getLogger(__name__)
 
+# Free space a pull must leave on the mirror's filesystem after the new
+# generation lands: the old generation is only removed once the new one is in
+# place, and the trainer/validator share that disk (2026-11-17/18: settled
+# legs' mirrors filled the box's / to 21 MB during validator scoring).
+PULL_HEADROOM_BYTES = 2 << 30
+
 
 class ContinuationMirror:
     def __init__(self, host, root, remote_root, *, max_bytes, interval, runner=None):
@@ -47,6 +53,7 @@ class ContinuationMirror:
         if not isinstance(version, str) or not VERSION_RE.fullmatch(version):
             raise ValueError("invalid remote continuation generation")
         self.root.mkdir(parents=True, exist_ok=True)
+        self._check_headroom(version)
         staging = self.root / ("pull-" + uuid.uuid4().hex)
         try:
             harvest_remote_dir(
@@ -94,6 +101,40 @@ class ContinuationMirror:
                         shutil.rmtree(folder)
         finally:
             shutil.rmtree(staging, ignore_errors=True)
+
+    def _check_headroom(self, version):
+        """Refuse a pull the local disk cannot hold with headroom to spare.
+        Raises OSError (the poller logs it and keeps the previous copy)."""
+        import shlex
+
+        out = self._run(f"du -sb {shlex.quote(self.remote_root + '/' + version)}")
+        try:
+            size = int(out.split()[0])
+        except (IndexError, ValueError):
+            raise ValueError("unreadable remote continuation size") from None
+        free = shutil.disk_usage(self.root).free
+        need = size + PULL_HEADROOM_BYTES
+        if free < need:
+            log.warning("continuation pull skipped: %.1f GB free under %s, need %.1f GB "
+                        "(%.1f GB generation + %.1f GB headroom)", free / 1e9, self.root,
+                        need / 1e9, size / 1e9, PULL_HEADROOM_BYTES / 1e9)
+            raise OSError("not enough local disk for the continuation pull")
+
+    def discard(self):
+        """Delete this job's local mirror once its leg is done (checkpoint
+        harvested): nothing restores from it any more. Waits for an in-flight
+        pull; leaves the mirror in place if that pull does not finish."""
+        self.close()
+        transfer = path_lock(self.root / "transfer")
+        if not transfer.acquire(timeout=900):
+            log.warning("continuation mirror %s kept: a pull is still running", self.root)
+            return
+        try:
+            with path_lock(self.root):
+                shutil.rmtree(self.root, ignore_errors=True)
+        finally:
+            transfer.release()
+        log.info("continuation mirror %s removed (leg finished)", self.root.name[:12])
 
     def restore(self):
         import shlex

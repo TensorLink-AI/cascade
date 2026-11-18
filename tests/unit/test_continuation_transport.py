@@ -18,6 +18,64 @@ from cascade.trainer.continuation_transport import ContinuationMirror
 from cascade.trainer.remote import RemoteHost
 
 
+def _fake_remote(root, cmd):
+    """The two SSH reads a pull makes: ``du -sb <generation>`` and ``cat CURRENT``."""
+    if cmd.startswith("du -sb "):
+        gen = root / json.loads((root / "CURRENT").read_text())["version"]
+        size = sum(f.stat().st_size for f in gen.iterdir())
+        return f"{size}\t{gen}\n"
+    return (root / "CURRENT").read_text()
+
+
+def _mirror(tmp_path, monkeypatch):
+    remote = SnapshotStore(tmp_path / "remote", {"init": "pinned", "seed": 7})
+    remote.save(2, {"step": 2, "weights": torch.arange(8.0)})
+    mirror = ContinuationMirror(RemoteHost("fixture", "127.0.0.1"), tmp_path / "local",
+                                str(remote.root), max_bytes=1024**2, interval=0)
+    monkeypatch.setattr(mirror, "_run", lambda cmd, **kw: _fake_remote(remote.root, cmd))
+    monkeypatch.setattr("cascade.trainer.remote.harvest_remote_dir",
+                        lambda host, source, dest, **kw: shutil.copytree(source, dest))
+    return remote, mirror
+
+
+def test_pull_refuses_when_the_disk_cannot_hold_it_and_keeps_the_last_copy(tmp_path, monkeypatch):
+    import cascade.trainer.continuation_transport as transport
+
+    remote, mirror = _mirror(tmp_path, monkeypatch)
+    mirror.pull()
+    assert SnapshotStore(mirror.root, remote.binding).load()["step"] == 2
+    remote.save(3, {"step": 3, "weights": torch.arange(8.0)})
+    monkeypatch.setattr(transport.shutil, "disk_usage",
+                        lambda p: SimpleNamespace(total=10, used=10, free=1 << 20))
+    with pytest.raises(OSError, match="not enough local disk"):
+        mirror.pull()
+    assert SnapshotStore(mirror.root, remote.binding).load()["step"] == 2
+    assert not [p for p in mirror.root.iterdir() if p.name.startswith("pull-")]
+
+
+def test_discard_removes_the_finished_legs_mirror(tmp_path, monkeypatch):
+    _, mirror = _mirror(tmp_path, monkeypatch)
+    mirror.pull()
+    assert (mirror.root / "CURRENT").exists()
+    mirror.discard()
+    assert not mirror.root.exists()
+    assert mirror.closed
+    mirror.discard()  # idempotent: nothing left to remove
+
+
+def test_discard_mirror_never_fails_the_leg(tmp_path):
+    from cascade.trainer.remote import _discard_mirror
+
+    class Broken:
+        root = tmp_path
+
+        def discard(self):
+            raise OSError("disk went away")
+
+    _discard_mirror(Broken())
+    _discard_mirror(None)
+
+
 def test_mirror_keeps_last_verified_copy_after_partial_corrupt_or_old_update(tmp_path, monkeypatch):
     remote = SnapshotStore(tmp_path / "remote", {"init": "pinned", "seed": 7})
     remote.save(2, {"step": 2, "weights": torch.arange(8.0)})
@@ -28,7 +86,7 @@ def test_mirror_keeps_last_verified_copy_after_partial_corrupt_or_old_update(tmp
         max_bytes=1024**2,
         interval=0,
     )
-    monkeypatch.setattr(mirror, "_run", lambda *a, **kw: (remote.root / "CURRENT").read_text())
+    monkeypatch.setattr(mirror, "_run", lambda cmd, **kw: _fake_remote(remote.root, cmd))
 
     def harvest(host, source, dest, **kwargs):
         shutil.copytree(source, dest)
