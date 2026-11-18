@@ -30311,19 +30311,1027 @@ def _k0_record(x):
     return a if out is None else out
 
 
+# ═══════════════ EXH (append-only, trunk-level from child yield 0): EXACT HOLDS where _held_rate / _step_level blur a hold they drew ══
+# WHAT. Two base sources draw a staircase hold and then blur it: _held_rate makes 20 % "noise rows" (Gaussian sd U(0.001, 0.01)
+# x scale on the grid staircase; the nonneg prior then rounds most of them, so the noise becomes integer flicker, the rest stay
+# real-valued jitter); _step_level makes 15 % noise rows (sd U(0.0005, 0.01) x scale). EXH makes the held segments of those rows
+# (between the source's own event positions) EXACTLY constant at one of the row's own values and changes nothing else.
+# (Design EXH 51657b41 + skeptic fixes 11-05: the "drift" tier and the renewal option are removed; apply rule E1024S below.)
+# HOW (RNG alignment). The sources are NOT changed: _held_rate / _step_level below are the original text plus no-RNG probes (the
+# event positions of the noise rows); their returned arrays are identical and no random draw is added, skipped or reordered.
+# Every value-dependent decision downstream (nonneg prior, zero inflation, tail rebase, couplings, C91 / LP / y_qhold hold
+# layers, PKN, MAGGUARD, MVKEEP labels) therefore sees K's values. A blurred row is registered (content hash -> its segments)
+# when it leaves the base stream unchanged since its family block was finished; its segments are made exact only at the record
+# filter (_k0_record, after PKN), the last point before the RNG-free packer. K's own hold layers that edit a registered row
+# (C91 / C124B2 / y_qhold run insertions, LP tail holds) are followed (segments mapped through the edit); any other edit leaves
+# the row as K made it. Groups / labels, packing and every other row are byte-identical to K (EXH-OFF = K in every regime).
+# RULE (E1024S). Each segment is set to its lower median (an existing value of the row: no new magnitude; boundaries are K's
+# event positions: no new change point). (a) FULL: the whole registered row, first segment included, when the rebuilt row's
+# first move stays at or before point _EXH_EARLY_FM = 1024 (patch <= 32, far from the PKN / flat-history zone at >= 2560) and
+# the MAGGUARD cap exponent is unchanged; constant results are never taken. (b) otherwise GUARDED: the row's first segment is
+# kept (prefix and first-move index stay K's), later segments are clipped at the first move, and a segment changes only when
+# the rebuilt history before it moves in fewer than _EXH_STAIR_MAX = 20 % of its diffs (no "noisy history -> exact hold"
+# hybrids). _EXH_EARLY_FM <= 0 = guarded rule only (first moves never later). Registration guards: segments are clipped at K's
+# tail-rebase boundary and dropped when they hold a point K's zero inflation set to 0.
+# DOSE. _EXH_FRAC = keyed share of registered rows (coin = blake2b(row || _EXH_TAG), no random draw); _EXH_REAL_ONLY = only
+# rows with a non-integer value; _EXH_SRC = the sources in force (frozenset() = OFF, byte-identical to K).
+import hashlib as _exh_hashlib
 
-# ═══════════════ LCP-LATE (append-only, last; late-only sibling of SINGMV10PKN1024-32G: cooldown-only change): 'pknback:1536+set:_YM_MIN_N=2560+set:_C128_HYDRO_CUM=(0.12,0.44,0.74,0.79,0.84,0.88,0.92,0.95,1.0)+set:_XA_N_CUM=(0.0,0.0,1.0)+set:_XA_N_FWD=(1700,4064)+set:_XA_P_SHIFT=0.1+set:_MVK_TAG=0x4D564B51' for child yields k >= _LCP_K0 ═══
+_EXH_SRC = frozenset({"held_rate", "step_level"})
+_EXH_FRAC = 1.0
+_EXH_REAL_ONLY = False
+_EXH_EARLY_FM = 1024
+_EXH_STAIR_MAX = 0.2
+_EXH_TAG = b"EXH1"
+_EXH_MINSEG = 2
+_EXH_REG_CAP = 8192
+_EXH_REG = {}            # blake2b(row bytes at base exit) -> (source, segments)
+_EXH_STASH = {}          # id(builder output block) -> [source, per-row segments, block, tail boundaries]
+_EXH_PTR = {}            # base_seed -> (chunk_index, {row data pointer: (block, source, segments, key)})
+_EXH_STATS = {"stashed": 0, "registered": 0, "applied": 0, "rows_changed": 0, "points_changed": 0}
+
+
+def _exh_key(row):
+    return _exh_hashlib.blake2b(np.ascontiguousarray(row, dtype=np.float64).tobytes(), digest_size=16).digest()
+
+
+def _exh_register(row, src, segs):
+    if len(_EXH_REG) >= _EXH_REG_CAP:
+        _EXH_REG.pop(next(iter(_EXH_REG)))
+    _EXH_REG[_exh_key(row)] = (src, segs)
+    _EXH_STATS["registered"] += 1
+
+
+def _exh_bounds_to_segs(bounds, L):
+    b = [int(v) for v in bounds if 0 < int(v) < L]
+    edges = [0] + b + [L]
+    return tuple((edges[j], edges[j + 1], None) for j in range(len(edges) - 1) if edges[j + 1] > edges[j])
+
+
+def _held_rate(rng: np.random.Generator, n: int, L: int) -> np.ndarray:
+    base = rng.uniform(-2.0, 8.0, size=(n, 1))
+    grid = rng.choice(np.array([0.05, 0.1, 0.25, 0.5]), size=(n, 1))
+    k = rng.integers(0, 4, size=(n, 1))
+    draw = rng.random((n, L))
+    at = draw < (_held_hazard(k, 2.0, False) / max(L, 1))
+    del draw
+    at[:, 0] = False
+    ev = [np.flatnonzero(at[r]) for r in range(n)] if "held_rate" in _EXH_SRC else None
+    lvl = rng.choice(np.array([-2.,-1.,1.,2.]), size=(n, L))
+    lvl *= grid
+    lvl *= at
+    del at
+    np.cumsum(lvl, axis=1, out=lvl)
+    lvl += base
+    exact = rng.random((n, 1)) < 0.8
+    sd = np.where(exact, 0.0, rng.uniform(0.001, 0.01, size=(n, 1)))
+    noise = rng.normal(0.0, 1.0, size=(n, L))
+    noise *= sd
+    lvl += noise
+    del noise
+    scale = np.exp(rng.uniform(np.log(0.5), np.log(200.0), size=(n, 1)))
+    lvl *= scale
+    if ev is not None:
+        segs = [None if bool(exact[r, 0]) else _exh_bounds_to_segs(ev[r], L) for r in range(n)]
+        if any(s is not None for s in segs):
+            _EXH_STASH[id(lvl)] = ["held_rate", segs, lvl, None]
+            _EXH_STATS["stashed"] += sum(s is not None for s in segs)
+    return lvl
+
+
+def _step_level(
+    rng: np.random.Generator,
+    n: int,
+    L: int,
+    *,
+    jumps_lo: float = 1.0,
+    jumps_hi: float = 8.0,
+    exact_frac: float = 0.6,
+    noise_lo: float = 0.002,
+    noise_hi: float = 0.03,
+) -> np.ndarray:
+    jumps = rng.uniform(jumps_lo, jumps_hi, size=(n, 1))
+    at = rng.random((n, L)) < (jumps / max(L, 1))
+    at[:, 0] = True
+    size = rng.normal(0.0, 1.0, size=(n, L)) * rng.uniform(0.4, 3.0, size=(n, 1))
+    level = np.cumsum(at * size, axis=1)
+    scale = np.exp(rng.uniform(np.log(1.0), np.log(2000.0), size=(n, 1)))
+    exact = rng.random((n, 1)) < exact_frac
+    sd = np.where(exact, 0.0, rng.uniform(noise_lo, noise_hi, size=(n, 1)))
+    out = (rng.uniform(-2.0, 2.0, size=(n, 1)) + level) * scale
+    out = out + rng.normal(0.0, 1.0, size=(n, L)) * sd * scale
+    integral = rng.random((n, 1)) < 0.65
+    res = np.where(integral, np.rint(out), out)
+    if "step_level" in _EXH_SRC:
+        segs = [None if bool(exact[r, 0]) else _exh_bounds_to_segs(np.flatnonzero(at[r]), L) for r in range(n)]
+        if any(s is not None for s in segs):
+            _EXH_STASH[id(res)] = ["step_level", segs, res, None]
+            _EXH_STATS["stashed"] += sum(s is not None for s in segs)
+    return res
+
+
+_EXH_PREV_ZERO_INFLATION = _apply_zero_inflation
+
+
+def _apply_zero_inflation(rng, block):
+    st = _EXH_STASH.get(id(block))
+    if st is None:
+        return _EXH_PREV_ZERO_INFLATION(rng, block)
+    before = np.array(block, dtype=np.float64, copy=True)
+    out = _EXH_PREV_ZERO_INFLATION(rng, block)
+    if out is block:
+        zi = (before != 0.0) & (block == 0.0)
+        st.append({r: zi[r] for r in np.flatnonzero(zi.any(axis=1))})
+    else:
+        _EXH_STASH.pop(id(block), None)
+    return out
+
+
+_EXH_PREV_TAIL_REBASE = _apply_tail_rebase
+
+
+def _apply_tail_rebase(rng, block, rate, **kwargs):
+    st = _EXH_STASH.get(id(block))
+    if st is None:
+        return _EXH_PREV_TAIL_REBASE(rng, block, rate, **kwargs)
+    before = np.array(block, dtype=np.float64, copy=True)
+    out = _EXH_PREV_TAIL_REBASE(rng, block, rate, **kwargs)
+    if out is block:
+        tb = []
+        for r in range(block.shape[0]):
+            ch = np.flatnonzero(block[r] != before[r])
+            tb.append(int(ch[0]) if ch.size else int(block.shape[1]))
+        st[3] = tb
+    else:
+        _EXH_STASH.pop(id(block), None)
+    return out
+
+
+_EXH_PREV_UNIQUE_IDEA = _apply_unique_idea
+
+
+def _apply_unique_idea(family, block, base_seed, chunk_index, fam):
+    out = _EXH_PREV_UNIQUE_IDEA(family, block, base_seed, chunk_index, fam)
+    st = _EXH_STASH.pop(id(block), None)
+    if st is not None and out is block and st[2] is block and block.ndim == 2 and block.flags.c_contiguous:
+        src, segs, _, tb = st[:4]
+        zim = st[4] if len(st) > 4 else {}
+        m = _EXH_PTR.get(int(base_seed))
+        if m is None or m[0] != int(chunk_index):
+            m = (int(chunk_index), {})
+            _EXH_PTR[int(base_seed)] = m
+        p0 = int(block.__array_interface__["data"][0])
+        rb = int(block.strides[0])
+        L = int(block.shape[1])
+        for r, sg in enumerate(segs):
+            if sg is None:
+                continue
+            cut = L if tb is None else int(tb[r])
+            sg = tuple((s, min(e, cut), f) for s, e, f in sg if min(e, cut) - s >= _EXH_MINSEG)
+            z = zim.get(r)
+            if z is not None:
+                sg = tuple((s, e, f) for s, e, f in sg if not z[s:e].any())
+            if sg:
+                m[1][p0 + r * rb] = (block, src, sg, _exh_key(block[r]))
+    return out
+
+
+_EXH_PREV_ENGINE_GENERATE = _EngineGenerator.generate
+
+
+def _exh_engine_generate(self, n_series):
+    inner = _EXH_PREV_ENGINE_GENERATE(self, n_series)
+    try:
+        for row in inner:
+            if _EXH_PTR and isinstance(row, np.ndarray) and row.ndim == 1:
+                p = int(row.__array_interface__["data"][0])
+                for m in _EXH_PTR.values():
+                    ent = m[1].pop(p, None)
+                    if ent is not None:
+                        if np.shares_memory(row, ent[0]) and _exh_key(row) == ent[3]:
+                            _exh_register(row, ent[1], ent[2])
+                        break
+            yield row
+    finally:
+        inner.close()
+
+
+_EngineGenerator.generate = _exh_engine_generate
+
+
+def _exh_cap_exp(row):
+    pk = float(np.abs(row).max())
+    return int(np.ceil(np.log10(pk / _MG2_PEAK))) if pk > _MG2_PEAK else 0
+
+
+def _exh_lowmed(seg):
+    return float(np.sort(seg)[(seg.size - 1) // 2])
+
+
+def _exh_apply_full(row, segs):
+    new = None
+    for s, e, f in segs:
+        s = int(s)
+        e = min(int(e), row.shape[0])
+        if e - s < _EXH_MINSEG:
+            continue
+        seg = row[s:e]
+        if seg.min() == seg.max():
+            continue
+        v = _exh_lowmed(seg) if f is None else float(f)
+        if new is None:
+            new = np.array(row, dtype=np.float64, copy=True)
+        new[s:e] = v
+    return new
+
+
+def _exh_apply_guarded(row, segs):
+    nz = np.flatnonzero(row != row[0])
+    if nz.size == 0:
+        return None
+    fm = int(nz[0])
+    new = None
+    for s, e, f in segs:
+        if int(s) <= 0:
+            continue
+        s2 = max(int(s), fm)
+        e = min(int(e), row.shape[0])
+        if e - s2 < _EXH_MINSEG:
+            continue
+        seg = row[s2:e]
+        if seg.min() == seg.max():
+            continue
+        h = row if new is None else new
+        pre = h[:s2].astype(np.float32)
+        if s2 > 2 and np.count_nonzero(pre[1:] != pre[:-1]) >= _EXH_STAIR_MAX * (s2 - 1):
+            continue
+        v = _exh_lowmed(seg) if f is None else float(f)
+        if s2 == fm and v == row[0]:
+            continue
+        if new is None:
+            new = np.array(row, dtype=np.float64, copy=True)
+        new[s2:e] = v
+    if new is None or _exh_cap_exp(new) != _exh_cap_exp(row):
+        return None
+    return new
+
+
+def _exh_apply(row, key, segs):
+    if _EXH_FRAC < 1.0:
+        u = int.from_bytes(_exh_hashlib.blake2b(key + _EXH_TAG, digest_size=8).digest(), "little") / 18446744073709551616.0
+        if u >= _EXH_FRAC:
+            return None
+    if _EXH_REAL_ONLY and bool(np.all(row == np.rint(row))):
+        return None
+    if _EXH_EARLY_FM > 0:
+        new = _exh_apply_full(row, segs)
+        if new is not None:
+            nz = np.flatnonzero(new != new[0])
+            if nz.size and int(nz[0]) <= _EXH_EARLY_FM and _exh_cap_exp(new) == _exh_cap_exp(row):
+                return new
+    return _exh_apply_guarded(row, segs)
+
+
+# FOLLOW. In the open regime K's own hold layers edit some registered rows before the record filter: C91 / C124B2 and y_qhold
+# lengthen exact runs (copies appended at a run end, front trimmed), LP holds the value before b to the row end. These edits are
+# K's (made on K's values, with K's random draws); EXH re-registers the edited row with its segments mapped through the edit, so
+# the same held segments are made exact. Any edit that does not match these two shapes drops the row (K's values are kept).
+def _exh_rle(x):
+    ch = np.flatnonzero(x[1:] != x[:-1]) + 1
+    return np.concatenate(([0], ch)), np.concatenate((ch, [x.size]))
+
+
+def _exh_map_insert(v, w, segs):
+    sv, ev = _exh_rle(v)
+    sw, ew = _exh_rle(w)
+    off = sv.size - sw.size
+    if off < 0 or not np.array_equal(v[sv[off:]], w[sw]):
+        return None
+    if np.any((ew - sw)[1:] < (ev - sv)[off + 1:]):
+        return None
+    out = []
+    for s, e, f in segs:
+        js = int(np.searchsorted(ev, s, side="right"))
+        je = int(np.searchsorted(ev, e - 1, side="right"))
+        if js <= off:
+            if je <= off:
+                continue
+            js, s = off + 1, int(sv[off + 1])
+        s2 = int(sw[js - off] + (s - sv[js]))
+        e2 = int(ew[je - off]) if e == ev[je] else int(sw[je - off] + (e - sv[je]))
+        if e2 - s2 >= _EXH_MINSEG:
+            out.append((s2, e2, f))
+    return tuple(out) or None
+
+
+def _exh_map_suffix(v, w, segs):
+    d = np.flatnonzero(v != w)
+    if d.size == 0:
+        return segs
+    j = int(d[0])
+    if j == 0:
+        return None
+    hold = bool(np.all(w[j:] == w[j - 1]))
+    out = []
+    for s, e, f in segs:
+        if s >= j:
+            continue
+        if e <= j:
+            out.append((s, e, f))
+        elif hold:
+            out.append((s, int(w.size), float(w[j - 1])))
+        elif j - s >= _EXH_MINSEG:
+            out.append((s, j, f))
+    return tuple(out) or None
+
+
+def _exh_follow(v, w, mapper):
+    ent = _EXH_REG.get(_exh_key(v))
+    if ent is None:
+        return
+    sg = mapper(np.asarray(v, dtype=np.float64), np.asarray(w, dtype=np.float64), ent[1])
+    if sg:
+        _exh_register(w, ent[0], sg)
+        _EXH_STATS["followed"] = _EXH_STATS.get("followed", 0) + 1
+
+
+_EXH_PREV_C91_EXTEND = _c91_extend
+
+
+def _c91_extend(x, r):
+    w = _EXH_PREV_C91_EXTEND(x, r)
+    if w is not None and _EXH_REG and np.ndim(x) == 1 and np.shape(w) == np.shape(x):
+        _exh_follow(x, w, _exh_map_insert)
+    return w
+
+
+_EXH_PREV_YQH_EXTEND = _yqh_extend
+
+
+def _yqh_extend(v, r, k):
+    w = _EXH_PREV_YQH_EXTEND(v, r, k)
+    if w is not None and _EXH_REG and np.shape(w) == np.shape(v):
+        for c in range(v.shape[0]):
+            _exh_follow(v[c], w[c], _exh_map_insert)
+    return w
+
+
+_EXH_PREV_LP = _c215lp_lp
+
+
+def _c215lp_lp(x, r):
+    w = _EXH_PREV_LP(x, r)
+    if w is not x and _EXH_REG:
+        a = np.atleast_2d(np.asarray(x))
+        b = np.atleast_2d(np.asarray(w))
+        if a.shape == b.shape:
+            for c in range(a.shape[0]):
+                _exh_follow(a[c], b[c], _exh_map_suffix)
+    return w
+
+
+_EXH_PREV_RECORD = _k0_record
+
+
+def _k0_record(x):
+    a = _EXH_PREV_RECORD(x)
+    if a is None or not _EXH_REG or _PKN_BACK == 1024:   # EXH-LATE: exact holds only after the LCP switch (cooldown: _PKN_BACK 1536)
+        return a
+    out = None
+    for c in range(a.shape[0]):
+        key = _exh_key(a[c])
+        ent = _EXH_REG.pop(key, None)
+        if ent is None:
+            continue
+        _EXH_STATS["applied"] += 1
+        new = _exh_apply(a[c], key, ent[1])
+        if new is None:
+            continue
+        if out is None:
+            out = np.array(a, dtype=np.float64, copy=True)
+        _EXH_STATS["rows_changed"] += 1
+        _EXH_STATS["changed:" + ent[0]] = _EXH_STATS.get("changed:" + ent[0], 0) + 1
+        _EXH_STATS["points_changed"] += int(np.count_nonzero(new != a[c]))
+        out[c] = new
+    return a if out is None else out
+# ═══════════════ RELAYOUT-CORE (gen4 padded-layout lens, 11-09; DRAFT for the builders; append-only, after EXH-late) ════════════════
+# Shared core of the LAYMATCH4 / TWINPAD4 / CADPAD4 / PUSHPAD4 blocks: a value-only row classifier and the eval-layout re-layout
+# y = x.copy(); y[:P] = x[P] (first-value pad, the layout pyramid_wrapper._prep gives every eval history shorter than 4096).
+# The re-laid row keeps every value, level and change point of K's row from P on (no new magnitude, no new change point, no new
+# dynamics: in-distribution content in the eval's padded layout). Classifier = gen4/padded-layout/dynclass.py + pricelike.py
+# verbatim (relay_rules.py is the replayed reference; check_draft.py proves block == reference on the K40 dumps).
+# Never re-laid: MVKEEP group members (label count > 1), constant rows, 0/1-only rows, rows ending in an exact run >= 64 (K's hold
+# contexts: FEWPAD / hold-precision territory), price-like random walks (econ / crypto proxy: recall 56 % on eval econ_fin windows,
+# pricelike.out), few-level rows (FEWPAD's population) and the sub-hourly daily-cycle classes d96 / d288 / d144 / d1440 (the
+# energy-like padded prior that ZEROP / DISP15 bent). Accept: x[P] not 0 / 1, first move of y < 2560 (PKN 1536 boundary: the
+# zero-history fan), y not constant, y[P:] == x[P:], max|y| <= max|x|. No K stream is drawn: only keyed blake2b / SeedSequence.
+import hashlib as _rl_hashlib
+
+_RL_LAST_FM = 4096 - 1536
+_RL_TAIL_MAX = 64
+_RL_F0_MAX = 1024
+_RL_EXCL = frozenset({"const", "binary", "fewlvl", "d96", "d288", "d144", "d1440"})
+_RL_LAGS = (12, 24, 48, 72, 96, 144, 288, 720, 1440)
+_RL_CYC = ((96, 48), (288, 144), (24, 12), (48, 24), (144, 72), (1440, 720))
+_RL_STATS = {"eligible": 0, "changed": 0, "zero_one_pad": 0, "late_fm": 0, "reject": 0, "skip_hold": 0, "skip_price": 0, "error": 0}
+
+
+def _rl_acf(x, lags):
+    x = x - x.mean()
+    v = float(np.dot(x, x))
+    n = x.size
+    if v <= 0 or n < 4:
+        return {l: 0.0 for l in lags}
+    m = 1 << int(np.ceil(np.log2(2 * n)))
+    f = np.fft.rfft(x, m)
+    r = np.fft.irfft(f * np.conj(f), m)[: max(lags) + 1] / v
+    return {l: (float(r[l]) if l < n // 2 else 0.0) for l in lags}
+
+
+def _rl_fm(x):
+    nz = np.flatnonzero(x != x[0])
+    return int(nz[0]) if nz.size else int(x.size)
+
+
+def _rl_tail(x):
+    nz = np.flatnonzero(x != x[-1])
+    return int(x.size - 1 - nz[-1]) if nz.size else int(x.size)
+
+
+def _rl_class(real):
+    """dynclass.dyn_class(row_feats(real)) verbatim."""
+    n = int(real.size)
+    if n < 2:
+        return "const"
+    u = np.unique(real)
+    if u.size <= 1:
+        return "const"
+    if bool(np.all((real == 0.0) | (real == 1.0))):
+        return "binary"
+    if float(np.mean(real == 0.0)) >= 0.6 and float(np.mean(real < 0)) == 0.0:
+        return "intermit"
+    if u.size <= 5:
+        return "fewlvl"
+    d = np.diff(real)
+    if float(np.mean(d == 0.0)) > 0.5:
+        return "stair"
+    if bool(np.all(real == np.round(real))):
+        return "count"
+    sx = float(np.std(real))
+    a = _rl_acf(real, _RL_LAGS) if sx > 0 else {l: 0.0 for l in _RL_LAGS}
+    for l, h in _RL_CYC:
+        if a[l] >= 0.4 and a[l] >= a[h] + 0.1:
+            return f"d{l}"
+    return "smooth" if (float(np.std(d)) / sx if sx > 0 else 0.0) < 0.05 else "rough"
+
+
+def _rl_price_like(real):
+    """pricelike.price_like(pfeat(real)) verbatim: a random-walk-like mover (econ / crypto proxy)."""
+    n = real.size
+    if n < 64 or float(np.ptp(real)) == 0.0:
+        return False
+    d = np.diff(real)
+    vd = float(np.var(d))
+    if vd <= 0:
+        return False
+    rep = float(np.mean(d == 0))
+    if rep >= 0.3 or float(np.mean(real == 0)) >= 0.05:
+        return False
+    dc = d - d.mean()
+    den = float(np.dot(dc, dc))
+    ac1d = float(np.dot(dc[1:], dc[:-1]) / den) if den > 0 else 0.0
+    vr16 = float(np.var(real[16:] - real[:-16]) / (16 * vd))
+    cyc = max(_rl_acf(d, (24, 96, 168, 288, 672, 1440)).values())
+    rough = float(np.std(d) / max(float(np.std(real)), 1e-300))
+    return abs(ac1d) < 0.35 and 0.3 < vr16 < 1.6 and cyc < 0.1 and rough < 0.6
+
+
+def _rl_eligible(x, f0_max=None):
+    """-> class name if K's singleton row x may be re-laid, else None (stats counted)."""
+    f0 = _rl_fm(x)
+    if f0 >= x.size or f0 >= (_RL_F0_MAX if f0_max is None else f0_max):
+        return None
+    if bool(np.all((x == 0.0) | (x == 1.0))):
+        return None
+    if _rl_tail(x) >= _RL_TAIL_MAX:
+        _RL_STATS["skip_hold"] += 1
+        return None
+    real = x[max(f0 - 1, 0):]
+    c = _rl_class(real)
+    if c in _RL_EXCL:
+        return None
+    if _rl_price_like(real):
+        _RL_STATS["skip_price"] += 1
+        return None
+    return c
+
+
+def _rl_keyed(x, tag):
+    h = _rl_hashlib.blake2b(np.ascontiguousarray(x, dtype=np.float64).tobytes() + tag, digest_size=16).digest()
+    return int.from_bytes(h[:8], "little") / 18446744073709551616.0, np.random.default_rng(int.from_bytes(h[8:], "little"))
+
+
+def _rl_draw_P(rng, mix):
+    u = rng.random()
+    acc = 0.0
+    for w, lo, hi in mix:
+        acc += w
+        if u < acc:
+            return int(rng.integers(lo, hi + 1))
+    w, lo, hi = mix[-1]
+    return int(rng.integers(lo, hi + 1))
+
+
+def _rl_relay(x, P):
+    """The eval layout of K's row x cut at P, or None (K's row stays)."""
+    v = float(x[P])
+    if v == 0.0 or v == 1.0:
+        _RL_STATS["zero_one_pad"] += 1
+        return None
+    y = x.copy()
+    y[:P] = v
+    if _rl_fm(y) >= _RL_LAST_FM:
+        _RL_STATS["late_fm"] += 1
+        return None
+    if not (np.array_equal(y[P:], x[P:]) and float(y.max()) > float(y.min()) and float(np.abs(y).max()) <= float(np.abs(x).max())):
+        _RL_STATS["reject"] += 1
+        return None
+    _RL_STATS["changed"] += 1
+    return y
+
+
+# ---- full-plan helpers (TWINPAD4 / LAYPLAN4): destination layout by class ------------------------------------------------------
+_RL_SUBH = frozenset({"d96", "d288", "d144", "d1440"})     # 4160-point 15-min / 5-min / 10-min / 1-min feeds: modes only
+_RL_EXCL_PLAN = frozenset({"const", "binary", "fewlvl"})
+_RL_MIX_MODE = ((0.45, 192, 192), (0.55, 656, 656))       # the eval's exact short-pad modes (H256 / H720 of 4160-point series)
+_RL_MIX_BAND = ((0.7, 2048, 2527), (0.3, 1536, 2047))     # the legal long band (first move < 2560)
+_RL_W_MODE = 0.35                                          # mode share of a non-sub-hourly source (eval deficit proportions)
+
+
+def _rl_plan_source(x):
+    """-> (class, first move) when K's singleton row x may be a full-plan source, else None."""
+    f0 = _rl_fm(x)
+    if f0 >= 1024 or bool(np.all((x == 0.0) | (x == 1.0))):
+        return None
+    if _rl_tail(x) >= _RL_TAIL_MAX:
+        _RL_STATS["skip_hold"] += 1
+        return None
+    real = x[max(f0 - 1, 0):]
+    c = _rl_class(real)
+    if c in _RL_EXCL_PLAN or (c in _RL_SUBH and f0 >= 32):
+        return None
+    if _rl_price_like(real):
+        _RL_STATS["skip_price"] += 1
+        return None
+    return c, f0
+
+
+# ═══════════════ MODEPAD4 (gen4 padded-layout lens, 11-09; DRAFT; append after relayout_core.py): THE EVAL'S EXACT SHORT-PAD MODES ═══
+# WHY (eval_layout.out). 22.3 % of all eval windows are the H256 / H720 rungs of 4160-point series: history 3904 / 3440 points, i.e.
+# EXACTLY pad 192 (9.9 %) and pad 656 (12.4 %) - energy-charts, wikimedia, crypto, opensensemap, USGS, EA, elia. K's cooldown puts
+# 3.1 % / 3.6 % of its movers near those first moves (160-224 / 600-720) and 49.4 % inside the first patch (eval 8.7 %).
+# WHAT. Last Generator layer, gate _PKN_BACK != 1024. Rows: singleton movers whose first move is < 32 (they move from the start),
+# not 0/1, no tail hold >= 64, not price-like, not few-level; the sub-hourly cycle classes ARE included (the 4160-point feeds are
+# 15-min / 5-min / 1-min). Keyed coin < _MP_Q; P = 192 (45 %) or 656 (55 %), y[:P] = x[P]. Removes 192 / 656 points (mean 455).
+# Dose (relay_sim / check_draft): 8.2 % of cooldown channels at _MP_Q 0.40, ~11 % at 0.55 (K movers at the modes 6.7 -> ~23 %). First moves stay < 1200: far from the PKN boundary and the zfan zone.
+_MP_ON = True
+_MP_TAG = b"MODEPAD4C"          # THIRD DRAW of MODEPAD4 (first draw b"MODEPAD4"; nothing else changes)
+_MP_Q = 0.55
+_MP_MIX = ((0.45, 192, 192), (0.55, 656, 656))
+_MP_EXCL = frozenset({"const", "binary", "fewlvl"})
+
+
+def _mp_eligible(x):
+    if _rl_fm(x) >= 32 or bool(np.all((x == 0.0) | (x == 1.0))):
+        return None
+    if _rl_tail(x) >= _RL_TAIL_MAX:
+        _RL_STATS["skip_hold"] += 1
+        return None
+    real = x[max(_rl_fm(x) - 1, 0):]
+    c = _rl_class(real)
+    if c in _MP_EXCL:
+        return None
+    if _rl_price_like(real):
+        _RL_STATS["skip_price"] += 1
+        return None
+    return c
+
+
+def _mp_yield(y):
+    v = y["values"]
+    g = np.asarray(y["groups"], dtype=np.int64)
+    cnt = np.bincount(g)
+    out = None
+    for ch in range(v.shape[0]):
+        if cnt[g[ch]] != 1:
+            continue
+        try:
+            with np.errstate(all="ignore"):
+                x = np.asarray(v[ch], dtype=np.float64)
+                if _mp_eligible(x) is None:
+                    continue
+                _RL_STATS["eligible"] += 1
+                u, rng = _rl_keyed(x, _MP_TAG)
+                if u >= _MP_Q:
+                    continue
+                new = _rl_relay(x, _rl_draw_P(rng, _MP_MIX))
+        except Exception:
+            _RL_STATS["error"] += 1
+            new = None
+        if new is None:
+            continue
+        if out is None:
+            out = np.array(v, dtype=np.float64, copy=True)
+        out[ch] = new
+    if out is None:
+        return y
+    y = dict(y)
+    y["values"] = np.ascontiguousarray(out, dtype=np.float64)
+    return y
+
+
+_MP_PARENT = Generator
+
+
+class Generator(_MP_PARENT):
+    def generate(self, n_series):
+        inner = super().generate(n_series)
+        try:
+            for y in inner:
+                if _MP_ON and _PKN_BACK != 1024 and isinstance(y, dict):   # cooldown only
+                    try:
+                        y = _mp_yield(y)
+                    except Exception:
+                        pass
+                yield y
+        finally:
+            inner.close()
+
+
+# ═══════════════ LONGPER (long-horizon periodic rows, 11-17; append after MODEPAD4, before the LCP-LATE banner): FULL-LENGTH
+# SUB-HOURLY DAILY / WEEKLY-CYCLE SERIES WRITTEN INTO M'S OWN FULL-LENGTH MOVER SLOTS (cooldown only; gate _PKN_BACK != 1024) ══════
+# WHY. The live M / H / SHL3 legs fail the bench gate vs K17 only on the win rate, and the losses sit on LONG-horizon tasks:
+# GIFT-Eval sub-hourly series forecast 480-900 steps (15-29 patches) ahead from a full 4096-point context (solar 10T / H,
+# loop_seattle 5T, electricity / ett / sz_taxi / Finland_Traffic 15T, jena 10T, bitbrains 5T) plus TIME / FEV long tasks. Such a
+# context holds 14 (5T) to 170 (H) days of a strong daily cycle (and a weekly one for traffic / load), and the forecast has to
+# carry that cycle, its amplitude and its exact-zero nights far past the last observed patch. In M's cooldown only ~14 % of the
+# rows move inside their first patch, and only a quarter of those carry a daily cycle at all.
+# WHAT (count-neutral layout). Rewrites only rows that ALREADY are full-length movers in M's cooldown: singleton rows
+#   (bincount(groups) == 1; MVKEEP members never read or written), first move < _LPR_FM_MAX (float64 and float32 view), not 0/1,
+#   no tail hold >= _RL_TAIL_MAX (hold contexts never touched), class in _LPR_ALLOW (relayout_core classifier: the sub-hourly
+#   cycle classes, stairs, intermittent and few-level rows are never recipients), not price-like (econ / crypto proxies never
+#   touched), scale S = q90 |x| in [_LPR_SMIN, _MG2_PEAK], integer rows only at S >= _LPR_INT_MIN. Keyed coin u < _LPR_Q from
+#   _rl_keyed(row, _LPR_TAG + draw) (coin first, then the recipient test: same rows written, fewer classifier calls), at most
+#   _LPR_MAX rows per yield. The row is REPLACED by one 4096-point series (one sampling step for the whole row):
+#   5T / 10T / 15T / H = 288 / 144 / 96 / 24 steps per day, weekly cycle 7 x that, of one family:
+#     0 solar-like: exact-zero nights; daytime bell sin(pi u)^gam inside a production window whose length and peak drift with the
+#       season (day of year drawn per row; H rows span ~170 days); day-to-day cloud factor (logistic of a persistent daily AR(1));
+#       intra-day multiplicative noise, larger on overcast days. The row starts in daylight (never an exact-zero prefix).
+#     1 traffic / load-like: base + morning and evening peaks (+ optional midday plateau), weekday / weekend profiles, slow trend,
+#       slow level wander, smooth day factor, short-memory multiplicative noise; a share are speed-like (dips at the peaks);
+#       integer recipients get Poisson counts.
+#     2 sensor-like (temperature / jena): smooth daily cycle (1-2 harmonics) with a day-to-day amplitude factor, multi-day weather
+#       wander, an annual-cycle drift and short-memory noise; strictly positive.
+#   Scaled to the recipient (q90 |y| = S), rounded to a decimal resolution _LPR_RES x the robust range (integers for integer
+#   recipients), MAGGUARD peak rule (_mg2_cap: peak > _MG2_PEAK -> / 10^k). Accepted only if finite, >= 0 (sensor: > 0),
+#   y[0] != 0, not constant, not 0/1-only, first move < _LPR_FM_MAX in float64 and float32, and no exact run >= _LPR_RUN_MAX
+#   (solar: outside its exact-zero nights) in either view. Up to _LPR_TRIES keyed draws; no match -> M's row stays.
+#   => the first-move census, MVKEEP rows, every padded row, every hold-ending row and every price-like row are exactly M's.
+# Calibration (lhfix/calib/calib.out, local GIFT copies): solar 10T night share 0.46-0.72 (median 0.55), daily-max CV 0.25, lag-1
+#   acf 0.33, resolution ~0.3 % of the daily range; electricity H daily-max CV 0.17, lag-1 acf 0.80, weekly ratio 0.02-0.35;
+#   jena 10T amplitude / level 0.02-3, lag-1 acf of the daily max 0.79; ett 15T 3-4 daily peaks, noise / amplitude 0.4.
+# SAFETY. No M stream drawn, skipped or reordered (keyed blake2b rng per row only); float64 C-contiguous (32, 4096), groups
+#   object unchanged; never raises (an error keeps M's row). _LPR_ON = False or _LPR_Q = 0 -> M byte-identical.
+_LPR_ON = True
+_LPR_TAG = b"LONGPER"
+_LPR_DRAW = 1                      # keyed-draw number (a re-draw changes this NUMBER token; the tag is name-masked by dedup)
+_LPR_Q = 0.192                      # keyed coin per eligible recipient: ~5.4 % of cooldown rows are recipients -> ~1 % replaced
+_LPR_MAX = 2                       # rows written per cooldown yield
+_LPR_FM_MAX = 32                   # recipient and new row move inside the first patch (float64 and float32 view)
+_LPR_ALLOW = frozenset({"count", "smooth", "rough"})
+_LPR_SMIN = 1e-3                   # recipient scale q90 |x| lower bound (upper bound _MG2_PEAK)
+_LPR_INT_MIN = 20.0                # integer recipients: integer rows only at scale >= 20 (else not a recipient)
+_LPR_TRIES = 8
+_LPR_RUN_MAX = 48                  # longest exact run allowed (solar rows: outside the exact-zero nights)
+_LPR_FREQ = ((0.25, 288), (0.25, 144), (0.30, 96), (0.20, 24))   # steps per day: 5T / 10T / 15T / H
+_LPR_FAM = ((0.30, 0), (0.40, 1), (0.30, 2))                     # 0 solar, 1 traffic / load, 2 sensor
+_LPR_FAM_INT = ((0.30, 0), (0.70, 1))                            # integer recipients: integer solar or Poisson counts
+_LPR_RES = (0.001, 0.01)         # rounding resolution / robust range q99-q01 (log-uniform, then down to a power of ten)
+_LPR_YEAR = 365.25                 # days per year (annual drifts)
+_LPR_SOL_DAY = (0.38, 0.50)        # solar: production window, fraction of the day (annual mean)
+_LPR_SOL_SWING = (0.03, 0.13)      # annual swing of the window (+- fraction of the day)
+_LPR_SOL_NOON = 0.04               # |solar noon offset| (fraction of the day)
+_LPR_SOL_GAM = (0.7, 1.6)          # bell sharpness
+_LPR_SOL_SEAS = (0.1, 0.5)         # annual swing of the clear-sky peak (relative)
+_LPR_SOL_SOUTH = 0.15              # share with the season sign flipped
+_LPR_SOL_CMU = (0.5, 2.0)          # cloud factor = logistic(mu + sd * AR1): mostly clear days, some overcast ones
+_LPR_SOL_CSD = (1.0, 2.0)
+_LPR_SOL_CPHI = (0.1, 0.6)         # day-to-day cloud persistence
+_LPR_SOL_NOISE = (0.02, 0.08)      # intra-day log-noise sd on clear days (log-uniform) ...
+_LPR_SOL_NOISE_OC = (0.3, 0.8)    # ... plus this x (1 - cloud factor)
+_LPR_SOL_TAU = (0.01, 0.04)        # intra-day noise correlation time (days)
+_LPR_TRF_BASE = (0.1, 0.6)         # traffic / load: night floor relative to the peaks
+_LPR_TRF_AM = (6.5, 9.5)           # morning peak hour
+_LPR_TRF_PM = (16.0, 19.5)         # evening peak hour
+_LPR_TRF_W = (1.0, 3.0)            # peak width (hours)
+_LPR_TRF_H = (0.3, 1.0)            # peak heights
+_LPR_TRF_MID = (0.0, 0.6)          # midday plateau height (load-like)
+_LPR_TRF_WKND = (0.6, 1.05)        # weekend level factor
+_LPR_TRF_WKAM = (0.2, 1.0)         # weekend morning-peak factor
+_LPR_TRF_TREND = 0.3               # |log trend| over the row
+_LPR_TRF_SLOW = (0.04, 0.2)        # slow level wander sd (log) ...
+_LPR_TRF_SLOWTAU = (3.0, 15.0)     # ... correlation time (days)
+_LPR_TRF_DAY = (0.03, 0.12)         # smooth day factor sd (log) ...
+_LPR_TRF_DAYPHI = (0.5, 0.9)       # ... day-to-day persistence
+_LPR_TRF_NOISE = (0.03, 0.2)      # sample log-noise sd (log-uniform) ...
+_LPR_TRF_NTAU = (0.1, 1.0)         # ... correlation time (hours, log-uniform)
+_LPR_TRF_SPEED = 0.25              # speed-like share (dips at the peaks: loop_seattle / sz_taxi)
+_LPR_TRF_DIP = (0.1, 0.6)          # speed dip depth
+_LPR_SEN_RANGE = (0.03, 0.8)       # sensor: daily range / level (log-uniform)
+_LPR_SEN_HMAX = (13.0, 17.0)       # hour of the daily maximum
+_LPR_SEN_H2 = (0.0, 0.4)           # second-harmonic share
+_LPR_SEN_DAYSD = (0.2, 0.7)        # day-to-day amplitude factor sd (log) ...
+_LPR_SEN_DAYPHI = (0.3, 0.8)       # ... persistence
+_LPR_SEN_WX = (0.3, 1.5)           # weather wander sd / half range ...
+_LPR_SEN_WXTAU = (2.0, 7.0)        # ... correlation time (days)
+_LPR_SEN_SEAS = (0.0, 3.0)         # annual-cycle amplitude / half range
+_LPR_SEN_NOISE = (0.02, 0.15)      # sample noise sd / half range (log-uniform) ...
+_LPR_SEN_NTAU = (10.0, 60.0)       # ... correlation time (minutes)
+_LPR_SEN_DEV = 0.8                 # |deviation| / level bound (a uniform rescale above it, never a clip)
+_LPR_STATS = {"coin": 0, "recipients": 0, "written": 0, "no_match": 0, "reject_finish": 0, "reject_check": 0,
+              "reject_runs": 0, "error": 0, "fam0": 0, "fam1": 0, "fam2": 0, "m288": 0, "m144": 0, "m96": 0, "m24": 0}
+
+
+def _lpr_pick(rng, mix):
+    u = rng.random()
+    acc = 0.0
+    for w, v in mix:
+        acc += w
+        if u < acc:
+            return v
+    return mix[-1][1]
+
+
+def _lpr_u(rng, lohi):
+    return float(rng.uniform(lohi[0], lohi[1]))
+
+
+def _lpr_logu(rng, lohi):
+    return float(np.exp(rng.uniform(np.log(lohi[0]), np.log(lohi[1]))))
+
+
+def _lpr_ar1(rng, n, phi):
+    """stationary unit-variance AR(1) of length n (phi in [0, 1))"""
+    phi = float(min(max(phi, 0.0), 0.999999))
+    e = rng.standard_normal(n) * np.sqrt(1.0 - phi * phi)
+    z0 = rng.standard_normal()
+    return lfilter([1.0], [1.0, -phi], e, zi=np.array([phi * z0]))[0]
+
+
+def _lpr_bump(h, c, w):
+    """circular Gaussian bump on the day (h, c in days mod 1, width w in days)"""
+    d = np.abs(np.mod(h - c, 1.0))
+    d = np.minimum(d, 1.0 - d)
+    return np.exp(-0.5 * (d / w) ** 2)
+
+
+def _lpr_days(n, m, t0):
+    """step clock from offset t0 (steps): (t, day index, time of day in [0, 1))"""
+    t = np.arange(n, dtype=np.float64) + float(t0)
+    d = np.floor(t / m).astype(np.int64)
+    return t, d, (t - d * m) / m
+
+
+def _lpr_daily(v, t, m):
+    """per-day values v (day centres) interpolated to the step clock (no midnight jumps)"""
+    return np.interp(t / m, np.arange(v.size, dtype=np.float64) + 0.5, v)
+
+
+def _lpr_solar(rng, n, m):
+    hem = -1.0 if rng.random() < _LPR_SOL_SOUTH else 1.0
+    pf0 = _lpr_u(rng, _LPR_SOL_DAY)
+    sw = _lpr_u(rng, _LPR_SOL_SWING)
+    noon = 0.5 + float(rng.uniform(-_LPR_SOL_NOON, _LPR_SOL_NOON))
+    gam = _lpr_u(rng, _LPR_SOL_GAM)
+    a_s = _lpr_u(rng, _LPR_SOL_SEAS)
+    doy0 = float(rng.uniform(0.0, _LPR_YEAR))
+    nd = n // m + 3
+    dd = np.arange(nd, dtype=np.float64)
+    seas = hem * np.sin(2.0 * np.pi * (doy0 + dd - 80.0) / _LPR_YEAR)
+    pf = pf0 + sw * seas                                          # production window per day
+    amp = 1.0 + a_s * seas                                        # clear-sky peak per day
+    mu, sd, phi = _lpr_u(rng, _LPR_SOL_CMU), _lpr_u(rng, _LPR_SOL_CSD), _lpr_u(rng, _LPR_SOL_CPHI)
+    cl = 1.0 / (1.0 + np.exp(-(mu + sd * _lpr_ar1(rng, nd, phi))))   # cloud factor per day
+    h0 = noon - 0.5 * pf[0] + pf[0] * float(rng.uniform(0.15, 0.85))  # the row starts in daylight
+    t, d, h = _lpr_days(n, m, np.floor(h0 * m))
+    u = (h - (noon - 0.5 * pf[d])) / pf[d]
+    bell = np.where((u > 0.0) & (u < 1.0), np.sin(np.pi * np.clip(u, 0.0, 1.0)) ** gam, 0.0)
+    sig = _lpr_logu(rng, _LPR_SOL_NOISE) + _lpr_u(rng, _LPR_SOL_NOISE_OC) * (1.0 - cl[d])
+    zt = _lpr_ar1(rng, n, float(np.exp(-1.0 / max(_lpr_u(rng, _LPR_SOL_TAU) * m, 1.0))))
+    y = amp[d] * cl[d] * bell * np.exp(sig * zt - 0.5 * sig * sig)
+    return y, {"fam": 0, "m": m, "pf": round(pf0, 3), "gam": round(gam, 2), "south": bool(hem < 0)}
+
+
+def _lpr_traffic(rng, n, m):
+    b = _lpr_u(rng, _LPR_TRF_BASE)
+    hm, he = _lpr_u(rng, _LPR_TRF_AM) / 24.0, _lpr_u(rng, _LPR_TRF_PM) / 24.0
+    wm, we = _lpr_u(rng, _LPR_TRF_W) / 24.0, _lpr_u(rng, _LPR_TRF_W) / 24.0
+    am, ae, ad = _lpr_u(rng, _LPR_TRF_H), _lpr_u(rng, _LPR_TRF_H), _lpr_u(rng, _LPR_TRF_MID)
+    kw, km = _lpr_u(rng, _LPR_TRF_WKND), _lpr_u(rng, _LPR_TRF_WKAM)
+    sh = float(rng.uniform(0.0, 2.0)) / 24.0                     # weekend morning peak comes later and wider
+    speed = bool(rng.random() < _LPR_TRF_SPEED)
+    t, d, h = _lpr_days(n, m, int(rng.integers(0, m)) + m * int(rng.integers(0, 7)))
+    mid = ad * _lpr_bump(h, 0.54, 0.12)
+    pw = b + am * _lpr_bump(h, hm, wm) + ae * _lpr_bump(h, he, we) + mid
+    pk = kw * (b + am * km * _lpr_bump(h, hm + sh, 1.4 * wm) + ae * _lpr_bump(h, he, 1.2 * we) + mid)
+    prof = np.where(np.mod(d, 7) >= 5, pk, pw)
+    if speed:                                                     # free-flow level with dips at the busy hours
+        rel = np.clip((prof - b) / max(float(prof.max()) - b, 1e-9), 0.0, 1.0)
+        prof = 1.0 - _lpr_u(rng, _LPR_TRF_DIP) * rel ** float(rng.uniform(1.0, 3.0))
+    nd = int(d.max()) + 2
+    tr = float(rng.uniform(-_LPR_TRF_TREND, _LPR_TRF_TREND))
+    slow = _lpr_u(rng, _LPR_TRF_SLOW) * _lpr_ar1(rng, n, float(np.exp(-1.0 / (m * _lpr_u(rng, _LPR_TRF_SLOWTAU)))))
+    day = _lpr_u(rng, _LPR_TRF_DAY) * _lpr_ar1(rng, nd, _lpr_u(rng, _LPR_TRF_DAYPHI))
+    sn = _lpr_logu(rng, _LPR_TRF_NOISE)
+    zt = _lpr_ar1(rng, n, float(np.exp(-1.0 / max(_lpr_logu(rng, _LPR_TRF_NTAU) * m / 24.0, 0.5))))
+    lv = tr * (np.arange(n, dtype=np.float64) / n - 0.5) + slow + _lpr_daily(day, t, m)
+    if speed:
+        lv, sn = 0.3 * lv, 0.5 * sn
+    y = prof * np.exp(lv + sn * zt)
+    return y, {"fam": 1, "m": m, "speed": speed, "base": round(b, 3), "wknd": round(kw, 3)}
+
+
+def _lpr_sensor(rng, n, m):
+    half = 0.5 * _lpr_logu(rng, _LPR_SEN_RANGE)
+    hx = _lpr_u(rng, _LPR_SEN_HMAX) / 24.0
+    r2, p2 = _lpr_u(rng, _LPR_SEN_H2), float(rng.uniform(0.0, 1.0))
+    doy0 = float(rng.uniform(0.0, _LPR_YEAR))
+    t, d, h = _lpr_days(n, m, int(rng.integers(0, m)))
+    diur = np.cos(2.0 * np.pi * (h - hx)) + r2 * np.cos(4.0 * np.pi * (h - p2))
+    nd = int(d.max()) + 2
+    damp = np.exp(_lpr_u(rng, _LPR_SEN_DAYSD) * _lpr_ar1(rng, nd, _lpr_u(rng, _LPR_SEN_DAYPHI)))
+    wx = _lpr_u(rng, _LPR_SEN_WX) * _lpr_ar1(rng, n, float(np.exp(-1.0 / (m * _lpr_u(rng, _LPR_SEN_WXTAU)))))
+    seas = _lpr_u(rng, _LPR_SEN_SEAS) * np.sin(2.0 * np.pi * (doy0 + t / m - 110.0) / _LPR_YEAR)
+    nz = _lpr_logu(rng, _LPR_SEN_NOISE) * _lpr_ar1(rng, n, float(np.exp(-1.0 / max(_lpr_u(rng, _LPR_SEN_NTAU) * m / 1440.0, 0.5))))
+    dev = half * (diur * _lpr_daily(damp, t, m) + wx + seas + nz)
+    mx = float(np.abs(dev).max())
+    if mx > _LPR_SEN_DEV:
+        dev = dev * (_LPR_SEN_DEV / mx)
+    return 1.0 + dev, {"fam": 2, "m": m, "range": round(2.0 * half, 4)}
+
+
+def _lpr_runs(z, skip_zero):
+    """longest exact run of z (runs of exact 0 ignored when skip_zero)"""
+    c = np.flatnonzero(z[1:] != z[:-1]) + 1
+    st = np.concatenate(([0], c))
+    ln = np.diff(np.concatenate((st, [z.size])))
+    if skip_zero:
+        ln = ln[z[st] != 0.0]
+    return int(ln.max()) if ln.size else 0
+
+
+def _lpr_finish(y, S, isint, fam, rng):
+    """unit-scale positive series -> the recipient's scale, a published resolution, MAGGUARD peak rule; or None"""
+    if not bool(np.isfinite(y).all()):
+        return None
+    q = float(np.quantile(np.abs(y), 0.9))
+    if not q > 0.0:
+        return None
+    y = y * (S / q)
+    if isint:
+        y = rng.poisson(np.minimum(y, 1e9)).astype(np.float64) if fam == 1 else np.rint(y)
+    else:
+        lo, hi = np.quantile(y, [0.01, 0.99])
+        span = float(hi - lo)
+        if not span > 0.0:
+            return None
+        res = 10.0 ** np.floor(np.log10(span * _lpr_logu(rng, _LPR_RES)))
+        y = np.rint(y / res) * res
+    pk = float(np.abs(y).max())
+    if pk > _MG2_PEAK:
+        y = y / 10.0 ** np.ceil(np.log10(pk / _MG2_PEAK))
+    return np.ascontiguousarray(y, dtype=np.float64)
+
+
+def _lpr_recipient(x):
+    """M's singleton row x (float64) -> (scale S, integer flag) of a LONGPER recipient, else None."""
+    f = _rl_fm(x)
+    if f >= _LPR_FM_MAX or _rl_fm(x.astype(np.float32).astype(np.float64)) >= _LPR_FM_MAX:
+        return None
+    if bool(np.all((x == 0.0) | (x == 1.0))) or _rl_tail(x) >= _RL_TAIL_MAX:
+        return None
+    real = x[max(f - 1, 0):]
+    if _rl_class(real) not in _LPR_ALLOW or _rl_price_like(real):
+        return None
+    S = float(np.quantile(np.abs(x), 0.9))
+    isint = bool(np.all(x == np.round(x)))
+    if not (_LPR_SMIN <= S <= _MG2_PEAK) or (isint and S < _LPR_INT_MIN):
+        return None
+    return S, isint
+
+
+def _lpr_row(x, S, isint, rng):
+    """-> (new full-length periodic row, info) at the recipient's scale, or (None, None). Fixed draw order."""
+    n = x.size
+    for k in range(_LPR_TRIES):
+        fam = _lpr_pick(rng, _LPR_FAM_INT if isint else _LPR_FAM)
+        m = _lpr_pick(rng, _LPR_FREQ)
+        y, info = (_lpr_solar if fam == 0 else (_lpr_traffic if fam == 1 else _lpr_sensor))(rng, n, m)
+        y = _lpr_finish(y, S, isint, fam, rng)
+        if y is None:
+            _LPR_STATS["reject_finish"] += 1
+            continue
+        z = y.astype(np.float32).astype(np.float64)
+        if not (y.shape == (n,) and bool(np.isfinite(y).all()) and float(np.abs(y).max()) <= _MG2_PEAK
+                and float(y.max()) > float(y.min()) and float(y.min()) >= 0.0 and (fam != 2 or float(y.min()) > 0.0)
+                and y[0] != 0.0 and not bool(np.all((y == 0.0) | (y == 1.0)))
+                and _rl_fm(y) < _LPR_FM_MAX and _rl_fm(z) < _LPR_FM_MAX):
+            _LPR_STATS["reject_check"] += 1
+            continue
+        if _lpr_runs(y, fam == 0) >= _LPR_RUN_MAX or _lpr_runs(z, fam == 0) >= _LPR_RUN_MAX:
+            _LPR_STATS["reject_runs"] += 1
+            continue
+        info.update(scale=S, integer=isint, tries=k + 1)
+        return y, info
+    _LPR_STATS["no_match"] += 1
+    return None, None
+
+
+def _lpr_yield(y, log=None):
+    v = y["values"]
+    g = np.asarray(y["groups"], dtype=np.int64)
+    cnt = np.bincount(g)
+    out = None
+    wrote = 0
+    for ch in range(v.shape[0]):
+        if wrote >= _LPR_MAX:
+            break
+        if cnt[g[ch]] != 1:
+            continue                                               # MVKEEP group member: never read or written
+        try:
+            with np.errstate(all="ignore"):
+                x = np.asarray(v[ch], dtype=np.float64)
+                u, rng = _rl_keyed(x, _LPR_TAG + str(_LPR_DRAW).encode())
+                if u >= _LPR_Q:
+                    continue
+                _LPR_STATS["coin"] += 1
+                r = _lpr_recipient(x)
+                if r is None:
+                    continue
+                _LPR_STATS["recipients"] += 1
+                new, info = _lpr_row(x, *r, rng)
+        except Exception:
+            _LPR_STATS["error"] += 1
+            new = None
+        if new is None:
+            continue
+        if out is None:
+            out = np.array(v, dtype=np.float64, copy=True)
+        out[ch] = new
+        wrote += 1
+        _LPR_STATS["written"] += 1
+        _LPR_STATS["fam%d" % info["fam"]] += 1
+        _LPR_STATS["m%d" % info["m"]] += 1
+        if log is not None:
+            log.append((ch, info))
+    if out is None:
+        return y
+    y = dict(y)
+    y["values"] = np.ascontiguousarray(out, dtype=np.float64)
+    return y
+
+
+_LPR_PARENT = Generator
+
+
+class Generator(_LPR_PARENT):
+    def generate(self, n_series):
+        inner = super().generate(n_series)
+        try:
+            for y in inner:
+                if _LPR_ON and _PKN_BACK != 1024 and isinstance(y, dict):   # cooldown only
+                    try:
+                        y = _lpr_yield(y)
+                    except Exception:
+                        pass
+                yield y
+        finally:
+            inner.close()
+
+
+
+# ═══════════════ LCP-LATE (append-only, last; late-only sibling of SINGMV10PKN1024-32G: cooldown-only change): 'set:_PKN_BACK=1536+set:_YM_MIN_N=2560+set:_C128_HYDRO_CUM=(0.12,0.44,0.74,0.79,0.84,0.88,0.92,0.95,1.0)+set:_XA_N_CUM=(0.0,0.0,1.0)+set:_XA_N_FWD=(1700,4064)+set:_XA_P_SHIFT=0.1+set:_MVK_TAG=0x4D564B51' for child yields k >= _LCP_K0 ═══
 # The trainer reads the 32 child streams round-robin, one (32, 4096) yield each, 16 per update: update u consumes child yield
 # floor(u / 2), and the WSD cooldown (updates 21,674..23,840) starts at child yield 10,837 = _LCP_K0. This wrapper counts ITS OWN
 # yields and switches the hooks in _LCP_SWITCH from their base values to their late values just before it pulls yield _LCP_K0 from
 # the parent chain; yields k < _LCP_K0 are the parent's objects, untouched, built while every hook held its base value (no hook
 # draws or skips a random number). Record-level hooks act on every c268 record pulled after the switch (records the packer already
-# carried keep the base behaviour). Built by mk_late.py on generator md5 646e77e1ffb2dcce930a3c55213cef37 (base package md5 646e77e1ffb2dcce930a3c55213cef37).
+# carried keep the base behaviour). Built by mk_late.py on generator md5 e7519e9fe080f1907268fe71146874f5 (base package md5 e7519e9fe080f1907268fe71146874f5).
 _LCP_K0 = 10837
 _LCP_TEST = False
-_LCP_SPEC = 'pknback:1536+set:_YM_MIN_N=2560+set:_C128_HYDRO_CUM=(0.12,0.44,0.74,0.79,0.84,0.88,0.92,0.95,1.0)+set:_XA_N_CUM=(0.0,0.0,1.0)+set:_XA_N_FWD=(1700,4064)+set:_XA_P_SHIFT=0.1+set:_MVK_TAG=0x4D564B51'
-_LCP_SRC_MD5 = '646e77e1ffb2dcce930a3c55213cef37'
-_LCP_BASE_MD5 = '646e77e1ffb2dcce930a3c55213cef37'
+_LCP_SPEC = 'set:_PKN_BACK=1536+set:_YM_MIN_N=2560+set:_C128_HYDRO_CUM=(0.12,0.44,0.74,0.79,0.84,0.88,0.92,0.95,1.0)+set:_XA_N_CUM=(0.0,0.0,1.0)+set:_XA_N_FWD=(1700,4064)+set:_XA_P_SHIFT=0.1+set:_MVK_TAG=0x4D564B51'
+_LCP_SRC_MD5 = 'e7519e9fe080f1907268fe71146874f5'
+_LCP_BASE_MD5 = 'e7519e9fe080f1907268fe71146874f5'
 _LCP_PARENT = Generator
 
 _LCP_SWITCH = {  # module global: (base value for k < _LCP_K0, late value for k >= _LCP_K0)
