@@ -566,6 +566,9 @@ class RoundReceipt:
     # this validator resolved FROM VALIDATOR SIGNALS (0 = none, or typed into
     # chain.toml), so the audit replays each settlement under its rule.
     image_decoupled_block: int = 0
+    # DEC-CA-0068: the shared-ladder block this validator resolved from
+    # validator signals (0 = none / typed into chain.toml). Drop-when-default.
+    shared_ladder_block: int = 0
     # cascade v2 (DEC-CA-0050, drop-when-default): ``[v2] from_block`` when
     # this settlement judges a v2 era (its era starts at or after it), else 0
     # — so every pre-v2 receipt serialises byte-for-byte as before and the
@@ -684,6 +687,8 @@ class RoundReceipt:
             body["margin_v2_block"] = int(self.margin_v2_block)
         if self.image_decoupled_block:
             body["image_decoupled_block"] = int(self.image_decoupled_block)
+        if self.shared_ladder_block:
+            body["shared_ladder_block"] = int(self.shared_ladder_block)
         if self.v2_block:
             body["v2_block"] = int(self.v2_block)
         if self.lane_b is not None:
@@ -752,6 +757,7 @@ def build_receipt(
     activation_block: int = 0,
     margin_v2_block: int = 0,
     image_decoupled_block: int = 0,
+    shared_ladder_block: int = 0,
     lane_b: list[dict] | None = None,
     lane_b_pay: dict | None = None,
     v2_block: int = 0,
@@ -796,6 +802,7 @@ def build_receipt(
         activation_block=int(activation_block or 0),
         margin_v2_block=int(margin_v2_block or 0),
         image_decoupled_block=int(image_decoupled_block or 0),
+        shared_ladder_block=int(shared_ladder_block or 0),
         v2_block=int(v2_block or 0),
         lane_b=None if lane_b is None else tuple(dict(r) for r in lane_b),
         lane_b_pay=None if lane_b_pay is None else dict(lane_b_pay),
@@ -979,6 +986,7 @@ def _receipt_from_obj(obj: dict) -> RoundReceipt:
         activation_block=int(obj.get("activation_block", 0) or 0),
         margin_v2_block=int(obj.get("margin_v2_block", 0) or 0),
         image_decoupled_block=int(obj.get("image_decoupled_block", 0) or 0),
+        shared_ladder_block=int(obj.get("shared_ladder_block", 0) or 0),
         v2_block=int(obj.get("v2_block", 0) or 0),
         lane_b=(None if obj.get("lane_b") is None
                 else tuple(dict(r) for r in obj["lane_b"])),
@@ -1159,6 +1167,8 @@ def summarize_receipt(receipt: RoundReceipt) -> dict:
         "activation_block": int(receipt.activation_block or 0),
         # DEC-CA-0049: the margin-v2 block resolved from validator signals.
         "margin_v2_block": int(receipt.margin_v2_block or 0),
+        # DEC-CA-0068: the shared-ladder block resolved from validator signals.
+        "shared_ladder_block": int(receipt.shared_ladder_block or 0),
         **_v2_index_fields(receipt),
     }
 

@@ -23,6 +23,11 @@ SCHEMA = "cascade-private-eval/1"
 # the request outright ("incompatible") instead of answering with samples the
 # validator would then reject — either way the round holds as infrastructure.
 SCHEMA_QUANTILES = "cascade-private-eval/2-quantiles"
+# DEC-CA-0068: a quantile request decoded in fixed batches
+# (``metadata["quantile_batch"]``, :func:`cascade.validator.evaluator.quantile_chunks`).
+# A distinct schema, so a worker from before it REFUSES instead of answering at
+# batch 1 (whose numerics differ) — the round holds as infrastructure.
+SCHEMA_QUANTILES_BATCHED = "cascade-private-eval/3-quantiles-batched"
 CHECKPOINT_FILES = ("config.json", "forecast_wrapper.py", "model.py", "weights.safetensors")
 
 
@@ -51,7 +56,7 @@ def checkpoint_hashes(directory: Path) -> dict:
 
 
 def write_request(path, checkpoint, windows, *, contract, num_samples, quantile_levels=None,
-                  hashes=None):
+                  hashes=None, quantile_batch=1):
     """``quantile_levels`` set ⇒ a quantile-head request (:data:`SCHEMA_QUANTILES`);
     None ⇒ the sample request, byte-identical to before the knob. ``hashes``:
     the caller's :func:`checkpoint_hashes` of ``checkpoint`` (saves a re-hash)."""
@@ -66,6 +71,11 @@ def write_request(path, checkpoint, windows, *, contract, num_samples, quantile_
     if quantile_levels is not None:
         metadata["schema"] = SCHEMA_QUANTILES
         metadata["quantile_levels"] = [float(q) for q in quantile_levels]
+        if int(quantile_batch) > 1:
+            metadata["schema"] = SCHEMA_QUANTILES_BATCHED
+            metadata["quantile_batch"] = int(quantile_batch)
+    elif int(quantile_batch) > 1:
+        raise ValueError("a batched decode is a quantile-head request only")
     arrays = {f"h_{i}": np.ascontiguousarray(w.history, dtype=np.float64)
               for i, w in enumerate(windows)}
     arrays["metadata"] = np.frombuffer(json.dumps(metadata, allow_nan=False).encode(), dtype=np.uint8)
@@ -85,13 +95,19 @@ def run_request(checkpoint, request, output, *, device="cuda", workers=1, qualif
     request_hash = file_hash(Path(request))
     with np.load(request, allow_pickle=False) as data:
         metadata = json.loads(data["metadata"].tobytes())
-        if metadata.get("schema") not in (SCHEMA, SCHEMA_QUANTILES):
+        if metadata.get("schema") not in (SCHEMA, SCHEMA_QUANTILES, SCHEMA_QUANTILES_BATCHED):
             raise ValueError("incompatible private evaluation request")
         quantile_levels = None
-        if metadata["schema"] == SCHEMA_QUANTILES:
+        quantile_batch = 1
+        if metadata["schema"] in (SCHEMA_QUANTILES, SCHEMA_QUANTILES_BATCHED):
             quantile_levels = tuple(float(q) for q in metadata["quantile_levels"])
             if not quantile_levels:
                 raise ValueError("private evaluation quantile request names no levels")
+        if metadata["schema"] == SCHEMA_QUANTILES_BATCHED:
+            quantile_batch = metadata.get("quantile_batch")
+            if isinstance(quantile_batch, bool) or not isinstance(quantile_batch, int) \
+                    or quantile_batch < 2:
+                raise ValueError("private evaluation batched request names no batch")
         horizons = metadata["horizons"]
         if set(data.files) != {"metadata"} | {f"h_{i}" for i in range(len(horizons))}:
             raise ValueError("private evaluation input coverage mismatch")
@@ -108,12 +124,14 @@ def run_request(checkpoint, request, output, *, device="cuda", workers=1, qualif
         started = time.perf_counter()
         baseline = forecast_checkpoint_windows(
             checkpoint, histories, horizons, num_samples=int(metadata["num_samples"]),
-            device=device, contract=contract, workers=1, quantile_levels=quantile_levels)
+            device=device, contract=contract, workers=1, quantile_levels=quantile_levels,
+            quantile_batch=quantile_batch)
         baseline_seconds = time.perf_counter() - started
     started = time.perf_counter()
     samples = forecast_checkpoint_windows(
         checkpoint, histories, horizons, num_samples=int(metadata["num_samples"]),
-        device=device, contract=contract, workers=workers, quantile_levels=quantile_levels)
+        device=device, contract=contract, workers=workers, quantile_levels=quantile_levels,
+        quantile_batch=quantile_batch)
     seconds = time.perf_counter() - started
     if baseline is not None and (len(samples) != len(baseline) or any(
             not np.array_equal(a, b) for a, b in zip(samples, baseline, strict=True))):
@@ -122,7 +140,7 @@ def run_request(checkpoint, request, output, *, device="cuda", workers=1, qualif
     arrays["request_sha256"] = np.frombuffer(request_hash.encode(), dtype=np.uint8)
     np.savez(output, **arrays)
     return {"schema": metadata["schema"], "request_sha256": request_hash, "windows": len(histories),
-            "workers": workers, "seconds": seconds, "sequential_seconds": baseline_seconds,
+            "workers": workers, "quantile_batch": quantile_batch, "seconds": seconds, "sequential_seconds": baseline_seconds,
             "qualified": bool(qualify), "device": device,
             "torch": torch.__version__, "cuda": torch.version.cuda, "numpy": np.__version__,
             "devices": ([torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]

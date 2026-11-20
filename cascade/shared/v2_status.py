@@ -1023,7 +1023,16 @@ def publish_trainer_v2_status(sched, block: int, *, min_interval_s: float = MIN_
         ptr = str(getattr(king, "trained_pointer", "") or "")
         health, n = {}, 0
         if drv is not None and ptr:
-            load, n = driver_king_load(drv, ptr, block=block, allow_probe=allow_probe)
+            # A cache miss builds the king model and runs a forward pass per
+            # lane-B domain ON THIS BOX. With lane B inactive nothing else
+            # probes, so every trainer restart paid that cold burst for a
+            # dashboard panel (2026-11-15: RSS 2→6.9 GB, swap full, on a 7 GB
+            # host shared with the validator). Inactive ⇒ cached probes only.
+            lb_cfg = getattr(cfg, "lane_b", None)
+            live = bool(lb_cfg is not None and callable(getattr(lb_cfg, "active", None))
+                        and lb_cfg.active(block))
+            load, n = driver_king_load(drv, ptr, block=block,
+                                       allow_probe=allow_probe and live)
             if load is not None:
                 training = getattr(cfg, "training", None)
                 if hasattr(training, "at_block"):
@@ -1124,6 +1133,15 @@ def publish_trainer_v2_status(sched, block: int, *, min_interval_s: float = MIN_
             for section in ("lane_b", "lane_c", "marketcast", "generator", "generation", "eval", "scoring"):
                 doc["policy"][section] = asdict(getattr(cfg, section))
             doc["policy"]["eval"]["n_windows"] = cfg.eval_windows_at(start, settlement=False)
+            # the era's FIRST settlement boundary (the one AT ``start`` belongs
+            # to the previous era — the v2b / settlement_contract_block convention)
+            from .config import effective_epoch_blocks, shared_ladder_active
+
+            first = int(start) + int(effective_epoch_blocks(cfg.round, int(start)))
+            if shared_ladder_active(cfg.eval, first) and cfg.eval.scored_horizons:
+                # DEC-CA-0068: the rule's own count, every rung — not the budget
+                doc["policy"]["eval"]["n_windows"] = (
+                    int(cfg.eval.shared_ladder_windows) * len(cfg.eval.scored_horizons))
             if (cfg.v2.eval_n_windows or (
                     cfg.v2.eval_n_windows_after and image_decoupled_era(cfg, start))) \
                     and cfg.v2.active(start):

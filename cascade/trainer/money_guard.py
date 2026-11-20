@@ -244,6 +244,9 @@ class _BreakerGuardedProvider:
                 best = best_offer_rate(runner, skus) if skus else None
                 if best:
                     rate = min(best, rate) if rate else best
+            why = unpriced_refusal(runner, rate)
+            if why:
+                raise LaunchRefused(why)
             operator_launch_check(runner, kind=kind, projected_usd=rate * hours,
                                   launching=str(getattr(spec, "name_prefix", "") or ""))
         try:
@@ -563,8 +566,25 @@ def ceiling_rate(runner) -> float:
 
     try:
         return float(operator_max_price_per_hour(runner.cfg.round) or 0.0)
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001 — callers that gate money refuse a 0 (below)
+        log.error("operator $/h ceiling unreadable (%s: %s) — projecting $0/h; "
+                  "cap-gated operator rents refuse it", type(e).__name__, e)
         return 0.0
+
+
+def unpriced_refusal(runner, rate: float, rnd=None) -> str:
+    """Why an operator rent must be refused for projecting at ``rate`` $/h:
+    with a daily spend cap configured, a non-positive rate (ceiling unreadable
+    or unset) would project $0 and pass the cap check silently — fail closed.
+    "" = fine (no cap, or a real price)."""
+    try:
+        cap = daily_cap_usd(rnd if rnd is not None else runner.cfg.round)
+    except Exception:  # noqa: BLE001 — unreadable cap: the cap check itself decides
+        return ""
+    if cap and not float(rate or 0.0) > 0.0:
+        return (f"operator $/h ceiling unknown ({rate!r}) — cannot project against the "
+                f"${cap:.2f} daily spend cap; nothing rented")
+    return ""
 
 
 def era_wall_seconds(rnd) -> float:
@@ -984,7 +1004,11 @@ def would_rent_refusal(runner, gen, *, operator: bool) -> tuple[str, str]:
             return (f"operator rents paused (circuit breaker: {rec.get('reason', '')}); nothing "
                     "rented, nothing burned", OPERATOR_BLOCKED_CLASS)
         hours = expected_pod_hours(runner, OPERATOR_LEG_KIND)
-        projected = ceiling_rate(runner) * hours
+        rate = ceiling_rate(runner)
+        why = unpriced_refusal(runner, rate, rnd)
+        if why:
+            return why, OPERATOR_BLOCKED_CLASS
+        projected = rate * hours
         cap = daily_cap_usd(rnd)
         if cap:
             spent = OperatorSpend.for_runner(runner).total(

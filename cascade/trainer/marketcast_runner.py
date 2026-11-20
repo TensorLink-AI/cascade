@@ -273,10 +273,29 @@ def mkt_contract_block_kw(cfg, era) -> dict:
     era's pins (``funded_contract``). Any other leg: no key (byte-identical)."""
     from ..shared.era import image_after_armed, image_decoupled_era
 
+    if getattr(getattr(cfg, "marketcast", None), "pod_image", ""):
+        return {}       # its own image ([marketcast] pod_image): never the fleet's after pins
     start = int(getattr(era, "start_block", 0) or 0)
     if image_after_armed(cfg) and image_decoupled_era(cfg, start):
         return {"contract_block": start}
     return {}
+
+
+def mkt_bars_store(storage, bucket: str):
+    """The bar-recording bucket's store: ``MKT_BARS_S3_ACCESS_KEY`` /
+    ``MKT_BARS_S3_SECRET_KEY`` when set (the recorder's bucket is read-only to
+    the trainer and need not share its manifest creds), else the trainer's
+    ``HIPPIUS_S3_*``."""
+    import os
+
+    from ..shared.hippius import S3Config, S3Store
+
+    own = bool(os.environ.get("MKT_BARS_S3_ACCESS_KEY"))
+    base = S3Config.from_storage(storage, bucket=bucket)
+    return S3Store(S3Config(
+        endpoint=base.endpoint, region=base.region, bucket=bucket,
+        access_key_env="MKT_BARS_S3_ACCESS_KEY" if own else base.access_key_env,
+        secret_key_env="MKT_BARS_S3_SECRET_KEY" if own else base.secret_key_env))
 
 
 def mkt_relay_corpus(cfg, finetune_recipe: str, *, store=None) -> dict:
@@ -295,9 +314,7 @@ def mkt_relay_corpus(cfg, finetune_recipe: str, *, store=None) -> dict:
         return {}
     bucket, prefix = mc.bar_relay.split("/", 1)
     if store is None:
-        from ..shared.hippius import S3Config, S3Store
-
-        store = S3Store(S3Config.from_storage(cfg.storage, bucket=bucket))
+        store = mkt_bars_store(cfg.storage, bucket)
     wrap = json.loads(finetune_recipe)
     train_time = float(wrap.get("train_time", 0.0) or 0.0) or None
     recipe = parse_marketcast_recipe(wrap["marketcast"], mc,
@@ -328,18 +345,21 @@ def train_mkt_leg(ops, leg: dict, recipe: MktLegRecipe) -> dict:  # pragma: no c
     gen = ResolvedGenerator(hotkey=leg["hotkey"], uid=int(leg["uid"]), ref=leg["ref"])
     r._funded_leg_failures.pop(leg["hotkey"], None)
     r._mkt_harvested.pop(leg["hotkey"], None)
+    from .leg_pins import mkt_leg_scope
+
     try:
-        entry = r._run_funded_leg(
-            r._dispatcher(), gen, seeds, int(leg["started_block"]), contract,
-            leg_suffix(leg["target"], int(leg["uid"])),
-            warm_start_ref=r.cfg.marketcast.base_ref, era_index=era.index,
-            **mkt_contract_block_kw(r.cfg, era),
-            role="mkt_finetune", finetune_recipe=recipe.to_json(), bench=False,
-            funded_queue=ops.queue(),
-            gpu_choice=GpuChoice(
-                gpu=str(leg.get("gpu", "") or ""),
-                allow_fallback=bool(leg.get("gpu_allow_fallback", False)),
-                max_price_per_hour=float(leg.get("gpu_max_price_per_hour", 0.0) or 0.0)))
+        with mkt_leg_scope(r):
+            entry = r._run_funded_leg(
+                r._dispatcher(), gen, seeds, int(leg["started_block"]), contract,
+                leg_suffix(leg["target"], int(leg["uid"])),
+                warm_start_ref=r.cfg.marketcast.base_ref, era_index=era.index,
+                **mkt_contract_block_kw(r.cfg, era),
+                role="mkt_finetune", finetune_recipe=recipe.to_json(), bench=False,
+                funded_queue=ops.queue(),
+                gpu_choice=GpuChoice(
+                    gpu=str(leg.get("gpu", "") or ""),
+                    allow_fallback=bool(leg.get("gpu_allow_fallback", False)),
+                    max_price_per_hour=float(leg.get("gpu_max_price_per_hour", 0.0) or 0.0)))
     except _FundedOperatorFallback as e:
         q = ops.queue()
         recovery = q.get(gen.hotkey) if q is not None else None

@@ -365,6 +365,64 @@ def test_trainer_hook_reads_driver_state_and_king_health():
     assert [x["layer"] for x in h["layers"]] == doc["model"]["moe_blocks"]
 
 
+class _ProbeDriver:
+    """A lane-B driver whose cache is empty: any ``_probe`` call is a cold
+    model build on the trainer box."""
+
+    def __init__(self, cfg):
+        self.cfg, self.st, self._probes, self.calls = cfg, _driver_state(), {}, []
+
+    def _probe(self, pointer, slice_king, domain, block):
+        self.calls.append(domain)
+        return SimpleNamespace(affinity=np.ones((7, 256)))
+
+
+def _off_cfg():
+    """Lane B configured with domains but not armed (mainnet today)."""
+    return SimpleNamespace(lane_b=LaneBConfig(from_block=0, domains=DOMAINS),
+                           subnet=SimpleNamespace(netuid=91), v2=SimpleNamespace(from_block=0))
+
+
+def test_inactive_lane_b_never_builds_the_king_on_the_box():
+    # 2026-11-15: lane B off (from_block = 0), yet every restart built the
+    # king once per domain for the dashboard's routing panel
+    cfg = _off_cfg()
+    assert not cfg.lane_b.active(20000)
+    drv = _ProbeDriver(cfg)
+    store = _Store()
+    assert publish_trainer_v2_status(_sched(store, cfg=cfg, drv=drv), 20000,
+                                     clock=lambda: 0.0)
+    assert drv.calls == []
+    assert not (store.writes[0][1].get("king") or {}).get("routing_health")
+
+
+def test_inactive_lane_b_still_reads_cached_probes():
+    cfg = _off_cfg()
+    drv = _ProbeDriver(cfg)
+    drv._probes = {(PTR, d, "x"): SimpleNamespace(affinity=np.ones((7, 256))) for d in DOMAINS}
+    store = _Store()
+    assert publish_trainer_v2_status(_sched(store, cfg=cfg, drv=drv), 20000,
+                                     clock=lambda: 0.0)
+    assert drv.calls == []
+    assert len(store.writes[0][1]["king"]["routing_health"]["layers"]) == 7
+
+
+def test_active_lane_b_probes_on_a_cache_miss():
+    cfg = _cfg(1)
+    drv = _ProbeDriver(cfg)
+    store = _Store()
+    # both schedulers stay referenced: the rate limit keys on id(sched), and a
+    # freed temporary's id can be reused by the next one (flaked in CI)
+    sch1 = _sched(store, cfg=cfg, drv=drv)
+    assert publish_trainer_v2_status(sch1, 20000, clock=lambda: 0.0)
+    assert sorted(drv.calls) == sorted(DOMAINS)
+    # and the caller's veto still wins over an active lane
+    drv2 = _ProbeDriver(cfg)
+    sch2 = _sched(_Store(), cfg=cfg, drv=drv2)
+    assert publish_trainer_v2_status(sch2, 20000, clock=lambda: 0.0, allow_probe=False)
+    assert drv2.calls == []
+
+
 # ── the seed epoch for miners ─────────────────────────────────
 
 

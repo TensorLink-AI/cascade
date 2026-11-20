@@ -328,7 +328,7 @@ The execution stage and `evaluation` are separate observations:
 
 | Lane | Execution and scientific progress | Result evidence |
 |---|---|---|
-| A | Admission → data preparation → GPU provisioning → training → harvest → settlement | `cascade duel --hotkey HOTKEY --history --json`; queue `done` does not establish a win |
+| A | Admission → data preparation → GPU provisioning → training → harvest → settlement | `cascade duel --hotkey HOTKEY --history --json`; queue `done` does not establish a win. A private-pool win can still be blocked by the public benchmark check: read `bench_gate` / `bench_datasets` in the same JSON ([MINER.md](MINER.md#watching-it)) |
 | B | The shared execution stages, then target qualification → waiting for warm-start acceptance → accepted or rejected | `evaluation.stage` reports the exact attempt when available; qualified contributions may wait across eras for non-overlapping merge rows/target slots |
 | C | The shared execution stages, then publication → forward judging → pending confirmation, deferred, dropped, confirmed or below-holder result | `evaluation.reported` names the origin and observed receipt boundary; a passing confirmation below the holder's LCB does not take its slot |
 
@@ -397,7 +397,7 @@ deployment or qualification succeeded:
 <!-- cascade:config-reference:start -->
 | Template | V2 block | Loaded B gate | C / MarketCast blocks | Random-init eras | B pool | CPU generation |
 |---|---:|---:|---|---:|---|---|
-| `chain.toml` | 0 | 0 | 0 / 0 | 14 | 25% | enabled for shards; 90 min configured |
+| `chain.toml` | 9399600 | 0 | 9579600 / 9579600 | 14 | 25% | enabled for shards; 90 min configured |
 | `chain.testnet.toml` | 8190000 | 8190001 | 0 / 0 | 0 | 50% | off; 90 min configured |
 <!-- cascade:config-reference:end -->
 

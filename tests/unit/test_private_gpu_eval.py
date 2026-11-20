@@ -371,13 +371,17 @@ def test_a_raising_probe_never_decides_the_round():
 def test_the_probe_script_reports_this_release(tmp_path):
     from cascade.shared.config.training import TrainingContractConfig
     from cascade.validator.eval_offload import WORKER_PROBE
-    from cascade.validator.private_worker import SCHEMA, SCHEMA_QUANTILES
+    from cascade.validator.private_worker import (
+        SCHEMA,
+        SCHEMA_QUANTILES,
+        SCHEMA_QUANTILES_BATCHED,
+    )
 
     proc = subprocess.run([sys.executable, "-c", WORKER_PROBE], capture_output=True, text=True,
                           check=True, timeout=300)
     info = json.loads(proc.stdout.strip().splitlines()[-1])
     assert set(info["contract_fields"]) == {f.name for f in dataclasses.fields(TrainingContractConfig)}
-    assert set(info["schemas"]) == {SCHEMA, SCHEMA_QUANTILES}
+    assert set(info["schemas"]) == {SCHEMA, SCHEMA_QUANTILES, SCHEMA_QUANTILES_BATCHED}
 
 
 def test_an_out_of_date_host_gets_no_upload(checkpoint, tmp_path):
@@ -523,3 +527,27 @@ def test_write_request_with_precomputed_hashes_is_byte_identical(checkpoint, tmp
     b = write_request(tmp_path / "b.npz", directory, _windows(), contract=contract, num_samples=8,
                       hashes=checkpoint_hashes(directory))
     assert a == b
+
+
+def test_a_short_disk_holds_the_round_loudly_before_any_upload(checkpoint, tmp_path, caplog):
+    """2026-11-16 review: the private cache was pruned by COUNT only (the
+    bench pod's 2026-11-15 failure class). The upload now evicts LRU entries
+    until it fits, and a disk still short holds the round as infra."""
+    directory, contract = checkpoint
+    root = tmp_path / "remote"
+    root.mkdir()
+    host = RemoteHost("gpu-fixture", "fixture", user="ubuntu", workdir=str(root))
+    calls = []
+    inner = _shell_runner(root, lambda *p: run_request(*p, device="cpu", workers=1), calls=calls)
+
+    def run(argv, timeout):
+        if "CASCADE_FREE=" in argv[-1]:
+            calls.append(argv)
+            return SimpleNamespace(returncode=0, stdout="CASCADE_FREE=1\n", stderr="")
+        return inner(argv, timeout)
+    with caplog.at_level("ERROR"), pytest.raises(PrivateEvalUnavailable, match="disk short"):
+        forecasts_via_host(host, directory, _windows(), contract=contract, num_samples=8,
+                           runner=run)
+    assert _weight_uploads(calls) == []
+    assert "BENCH DISK SHORT" in caplog.text
+    assert _cache_entries(root) == []

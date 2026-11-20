@@ -84,6 +84,20 @@ def pinball_components(
             f"obs shape {obs.shape} incompatible with q_preds {q_preds.shape}; "
             f"expected ({q_preds.shape[1]}, {q_preds.shape[2]})"
         )
+    finite = np.isfinite(obs)
+    if not finite.all():
+        # DEC-CA-0068 NaN-padded targets: a step the series never reached
+        # carries no observation, so it adds nothing to either component —
+        # exactly as if the horizon ended there. Only a padded window takes
+        # this branch; every finite target runs the unchanged path below.
+        obs_f = np.where(finite, obs, 0.0)
+        diff = obs_f[None, :, :] - q_preds                 # (num_q, B, H)
+        q_b = qs[:, None, None]
+        pinball = np.where(finite[None, :, :],
+                           np.maximum(q_b * diff, (q_b - 1.0) * diff), 0.0)
+        qloss_per_q = pinball.sum(axis=-1).T               # (B, num_q)
+        abs_target = np.abs(obs_f).sum(axis=-1)            # (B,)
+        return qloss_per_q.astype(np.float64), abs_target.astype(np.float64)
     diff = obs[None, :, :] - q_preds                       # (num_q, B, H)
     q_b = qs[:, None, None]
     pinball = np.maximum(q_b * diff, (q_b - 1.0) * diff)   # (num_q, B, H)

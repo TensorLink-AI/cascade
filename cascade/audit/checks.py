@@ -323,6 +323,69 @@ def check_margin_v2(receipt: RoundReceipt, cfg: ChainConfig,
                      f">= {cfg.activation.threshold:.0%} of stake (lock-in at {lock})")
 
 
+def check_shared_ladder(receipt: RoundReceipt, cfg: ChainConfig,
+                        client: object | None = None) -> CheckResult:
+    """DEC-CA-0068: the shared-ladder block a receipt records was decided by
+    the validators, not invented by one — the :func:`check_margin_v2` shape.
+    A receipt without ``shared_ladder_block`` PASSES (pre-field, or the block
+    is typed into chain.toml). ``cfg`` already carries the recorded block
+    (``apply_receipt_activation``), so the window replay draws under it."""
+    from ..shared.activation import (
+        agreed_activation,
+        apply_shared_ladder_activation,
+        configured_shared_ladder_block,
+        resolved_shared_ladder_block,
+        shared_ladder_feature,
+    )
+
+    name = "shared-ladder"
+    block = int(getattr(receipt, "shared_ladder_block", 0) or 0)
+    if not block:
+        return _ok(name, "no chain-decided shared ladder recorded (typed-in config applies)")
+    typed = configured_shared_ladder_block(cfg)
+    if typed:
+        if typed != block:
+            return _fail(name, f"recorded shared_ladder_block {block} != the block typed into "
+                               f"the audit config ({typed})")
+        return _ok(name, f"shared ladder from {block} matches the typed-in config")
+    spec = shared_ladder_feature(cfg)
+    if spec is None:
+        return _fail(name, f"receipt records shared_ladder_block {block} but the loaded config "
+                           "defines no shared ladder (or [activation] is off)")
+    applied = resolved_shared_ladder_block(cfg)
+    if applied != block:
+        try:
+            apply_shared_ladder_activation(cfg, block)
+        except ValueError as e:
+            return _fail(name, f"recorded shared_ladder_block {block} cannot be applied to the "
+                               f"audit config: {e}")
+        return _fail(name, f"recorded shared_ladder_block {block} != the block the audit "
+                           f"config carries ({applied})")
+    if client is None:
+        return _warn(name, f"shared ladder from {block} recorded; validator agreement not "
+                           "verified (no chain)")
+    try:
+        validators = list(client.validator_stakes())  # type: ignore[attr-defined]
+        signals = dict(client.read_plain_commitments())  # type: ignore[attr-defined]
+        now_block = int(client.current_block())  # type: ignore[attr-defined]
+    except Exception as e:  # noqa: BLE001
+        return _warn(name, f"shared ladder from {block} recorded; chain read failed ({e})")
+    agreed = agreed_activation(spec.name, validators, signals,
+                               threshold=cfg.activation.threshold, block=now_block,
+                               dormant_after_blocks=cfg.activation.dormant_after_blocks,
+                               round_cfg=cfg.round, align=spec.align)
+    if agreed is None:
+        return _warn(name, f"shared ladder from {block} recorded; validators holding "
+                           f"{cfg.activation.threshold:.0%} of stake do not (yet) name one "
+                           "block in their notes")
+    lock, act = agreed
+    if act != block:
+        return _fail(name, f"recorded shared_ladder_block {block} != the block validators "
+                           f"agree on ({act}, locked in at {lock})")
+    return _ok(name, f"shared ladder from {block} agreed by validators holding "
+                     f">= {cfg.activation.threshold:.0%} of stake (lock-in at {lock})")
+
+
 def check_numerics_contract(receipt: RoundReceipt, cfg: ChainConfig,
                             client: object | None = None) -> CheckResult:
     """DEC-CA-0067: the image-decoupled per-leg contract rule, replayed under
@@ -1391,6 +1454,22 @@ def _bench_gate_pair(receipt: RoundReceipt, cfg: ChainConfig, manifest: Training
     return kings[size], chals[size]
 
 
+def _comparable_details(replayed, recorded):
+    """The two DEC-CA-0061 details as the replay compares them. When BOTH say
+    the gate was uncomputable, the free-text ``reason`` is dropped: it names
+    WHY a side was missing ("validator bench infra: sweep failed …" on the
+    main validator vs "signed bench rows missing" in a replay that only sees
+    the signed report), which is not part of the outcome. Everything else
+    (computed / passed / rule / thresholds / numbers) still has to match.
+    2026-11-16: an infra round (king sweep failed on a full bench pod) failed
+    this check on every replaying node on that text alone."""
+    if (isinstance(replayed, dict) and isinstance(recorded, dict)
+            and replayed.get("computed") is False and recorded.get("computed") is False):
+        return ({k: v for k, v in replayed.items() if k != "reason"},
+                {k: v for k, v in recorded.items() if k != "reason"})
+    return replayed, recorded
+
+
 def _same_detail(a, b) -> bool:
     """Recursive equality with float tolerance (``_close``)."""
     if isinstance(a, dict) and isinstance(b, dict):
@@ -1503,7 +1582,7 @@ def check_bench_gate(receipt: RoundReceipt, cfg: ChainConfig,
     if replayed != v.bench_gate_passed:
         return _fail(name, f"rule {rule}: recorded bench_gate_passed={v.bench_gate_passed} "
                            f"!= replayed {replayed} ({gate.reason or 'pass'})")
-    if rule == RULE_V2 and not _same_detail(gate.detail(), detail):
+    if rule == RULE_V2 and not _same_detail(*_comparable_details(gate.detail(), detail)):
         return _fail(name, f"rule {RULE_V2}: recorded detail (avg ratio / worst suite LCB / "
                            "win rate / per-suite ratios) differs from the replay over the "
                            "signed rows")
@@ -4024,6 +4103,7 @@ def run_tier0(
         check_epoch_alignment(receipt, cfg),
         check_activation(receipt, cfg, client),
         check_margin_v2(receipt, cfg, client),
+        check_shared_ladder(receipt, cfg, client),
         check_v2(receipt, cfg),
         check_era(receipt, cfg, client),
         check_block_hash_onchain(receipt, client),

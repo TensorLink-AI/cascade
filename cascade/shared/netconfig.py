@@ -329,6 +329,9 @@ def effective_raw(cfg: ChainConfig) -> dict:
     if int(getattr(ac, "resolved_image_decoupled_block", 0) or 0):
         raw.setdefault("v2", {})["image_decoupled_from_block"] = int(
             cfg.v2.image_decoupled_from_block)
+    if int(getattr(ac, "resolved_shared_ladder_block", 0) or 0):
+        raw.setdefault("eval", {})["shared_ladder_from_block"] = int(
+            cfg.eval.shared_ladder_from_block)
     return raw
 
 
@@ -400,6 +403,9 @@ def build_config(base: ChainConfig, body: dict, *, applied_block: int = 0) -> Ch
         "resolved_image_decoupled_block": (
             0 if _sets(ov, "v2", "image_decoupled_from_block")
             else int(getattr(bac, "resolved_image_decoupled_block", 0) or 0)),
+        "resolved_shared_ladder_block": (
+            0 if _sets(ov, "eval", "shared_ladder_from_block")
+            else int(getattr(bac, "resolved_shared_ladder_block", 0) or 0)),
     }
     return replace(
         cfg, activation=replace(ac, **flags),

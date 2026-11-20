@@ -9,10 +9,68 @@ This page is the step-by-step path. The full rules (recipe schema, every gate,
 every number) are in [MINER.md §14](MINER.md#14-marketcast-lane-c-the-composite-mktmarket-target--dec-ca-0064);
 when they disagree, §14 and the live `chain.toml` win.
 
-> **Status.** The checked-in `chain.toml` ships MarketCast **off**
-> (`[marketcast] from_block = 0`). Until the owner arms it, every `mkt:`
-> command is refused (`marketcast_inactive` at the intake). Check the live
-> network before spending anything.
+> **Status.** The checked-in `chain.toml` arms MarketCast at block
+> **9579600** (`[marketcast]` and `[lane_c] from_block`; about Tue 24 Nov 2026
+> 22:23 UTC). Once validators and the trainer run this release you can commit
+> and fund `mkt:market`, but no leg rents (and nothing is charged) before the
+> first lane-C era starts at that block; queued entries go first. On a
+> release with `from_block = 0` every `mkt:` command is refused
+> (`marketcast_inactive`). Check the live network before spending anything.
+
+## What you are trying to do
+
+Make a small, general forecaster **better at describing what real markets do
+next** — as a full probability distribution, not one number. Your fine-tune of
+Timestral-28M wins if, for the listed assets and every timeframe from 1-minute
+to daily bars, its quantile forecasts of the coming path are:
+
+- **More accurate as a distribution.** The score is CRPS, which rewards the
+  whole spread of outcomes you predict. A confident wrong call costs more
+  than an honest, wider one; an over-wide one costs too.
+- **Calibrated.** Your 50 % and 80 % intervals contain the realised value
+  that often, and your 5 % / 95 % tails are hit about 5 % of the time.
+- **Better everywhere, worse nowhere.** The composite is a geometric mean
+  over seven suites (location, volatility, range, highs, lows, liquidity,
+  OHLCV) and every asset class. A gain in one place never buys a confident
+  loss in another; the guards and the simple baselines enforce that.
+- **Good on a future it has not seen.** You are scored only on windows that
+  open after your leg starts, and your training data ends 30+ days before
+  you submit. What wins is structure that holds across regimes, not a
+  memorised stretch of history.
+
+### Where the gains are
+
+Directions, not a recipe — the field is open:
+
+- **Market structure the base model lacks:** volatility clustering and its
+  decay, intraday and weekly session patterns, fat tails, the link between
+  volume and volatility, cross-asset moves (BTC/ETH, equities, gold, FX).
+- **Scheduled events.** FOMC, CPI and payrolls are known in advance (the
+  `calendar`, `session` and `events` covariates); markets behave differently
+  around them.
+- **The right covariates.** Past `volume`, `funding`, `open_interest`,
+  `spread` and the `cross_*` series are available; use the ones that carry
+  signal and leave out the ones that add noise.
+- **Coverage the bars lack.** A generator (`synthetic_fraction` > 0) can
+  teach regimes the recorded history is too short for, and with
+  `synthetic_channels` its samples carry their own covariate rows (volume,
+  funding, cross-asset, a clock for calendar / session / events) — but
+  synthetic data that does not look like real markets hurts.
+- **Small, careful updates.** The test is "confidently better, nowhere
+  worse", so a conservative fine-tune (LoRA, a low learning rate, enough
+  steps) that keeps what the base does well usually beats an aggressive
+  full fine-tune.
+
+### What this is not
+
+- **Not a trading competition.** Nothing scores profit or direction alone;
+  getting the width and shape of the distribution right is most of the score.
+- **Not about the eval windows.** They have not happened when you train, and
+  nothing about them leaks in advance.
+- **Not about copying.** A near-duplicate of an earlier entry is judged a
+  duplicate; seniority is the commitment block.
+- **Not about hardware.** The model is 28M parameters; a bigger GPU buys
+  speed you rarely need.
 
 ## At a glance
 

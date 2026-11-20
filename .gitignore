@@ -13,6 +13,7 @@ htmlcov/
 _train_work/
 _audit_work/
 _eval_ckpts/
+_bench_evidence/
 validator_state.db
 *.db
 .DS_Store

@@ -37,6 +37,7 @@ from cascade.shared.manifest import (
     prove_numerics_digest,
 )
 
+from .predecision_main import predecision_main, predecision_text
 from .test_activation import FakeChain, _v
 
 REPO = Path(__file__).resolve().parents[2]
@@ -124,15 +125,29 @@ def test_prove_numerics_digest_needs_the_leg_image():
 # ── the knobs ────────────────────────────────────────────────────────────────
 
 
-def test_knobs_ship_off_and_inert():
-    for path, after in (("chain.toml", 4000), ("chain.testnet.toml", 300)):
-        cfg = load_chain_config(REPO / path)
-        assert cfg.v2.image_decoupled_from_block == 0
-        assert cfg.v2.eval_n_windows_after == after
-        assert cfg.v2.prior_train_image_digests == ()
-        assert cfg.activation.resolved_image_decoupled_block == 0
-        assert not image_decoupled_at(cfg, 10**9)
-        assert v2_eval_windows_at(cfg, 10**9) == int(cfg.v2.eval_n_windows)
+def test_knobs_ship_typed_on_mainnet_and_off_on_testnet():
+    # mainnet: the v2b-69630f92 vote resolved (locked 9486000, 85.9% of stake,
+    # applied at the era start 9493200) and the release TYPES that block
+    # (2026-11-13) to free its note segment; nothing is resolved from chain
+    cfg = load_chain_config(REPO / "chain.toml")
+    assert cfg.v2.image_decoupled_from_block == 9493200
+    assert cfg.v2.eval_n_windows_after == 4000
+    assert cfg.v2.prior_train_image_digests == ()
+    assert cfg.activation.resolved_image_decoupled_block == 0
+    assert image_decoupled_at(cfg, 10**9) and v2_eval_windows_at(cfg, 10**9) == 4000
+    # on the live 900 grid (the fleet's resolved rollover) the settlement AT
+    # the switch block is the previous era's last; the next one is under the rule
+    live = replace(cfg, round=replace(cfg.round, rolling_from_block=9136800, epoch_blocks=900,
+                                      epoch_blocks_prev=3600, epoch_activation_block=9136800))
+    assert not image_decoupled_at(live, 9493200) and image_decoupled_at(live, 9494100)
+    # testnet: still decided on chain, inert until then
+    cfg = load_chain_config(REPO / "chain.testnet.toml")
+    assert cfg.v2.image_decoupled_from_block == 0
+    assert cfg.v2.eval_n_windows_after == 300
+    assert cfg.v2.prior_train_image_digests == ()
+    assert cfg.activation.resolved_image_decoupled_block == 0
+    assert not image_decoupled_at(cfg, 10**9)
+    assert v2_eval_windows_at(cfg, 10**9) == int(cfg.v2.eval_n_windows)
 
 
 def _with(tmp_path, **kv):
@@ -305,7 +320,8 @@ def vcfg():
                         forfeit_from_block=0, forfeit_successor_hotkey="",
                         win_margin_start_v2=0.0, win_margin_end_v2=0.0,
                         margin_warmup_blocks_v2=0, margin_v2_from_block=0),
-        v2=replace(c.v2, prelaunch_burn=0.0))
+        v2=replace(c.v2, prelaunch_burn=0.0, image_decoupled_from_block=0),  # vote open
+        eval=replace(c.eval, shared_ladder_windows=0))
 
 
 def test_feature_name_hashes_the_bundle_and_rides_the_note(vcfg):
@@ -625,16 +641,19 @@ def _validator_setup(cfg, *, on: bool):
 
 
 V2_IMAGE = load_chain_config(REPO / "chain.toml").training.v2_contract.train_image_digest
+# The shipped era's own protocol (main ships continuation ON since 2026-11-13).
+V2_PROTO = load_chain_config(REPO / "chain.toml").training.v2_contract.continuation_protocol
 
 
-def _stamp(m, numerics, *, entry_numerics=None, digest=None, image=None, protocol=""):
+def _stamp(m, numerics, *, entry_numerics=None, digest=None, image=None, protocol=None):
     """Stamp the DEC-CA-0067 fields like the trainer: numerics + the leg's OWN
     runtime terms (``image`` defaults to the era's pin, or OLD with an
-    old-image ``digest``)."""
+    old-image ``digest``; ``protocol`` defaults to the era contract's)."""
     img = image if image is not None else (OLD if digest else V2_IMAGE)
+    proto = V2_PROTO if protocol is None else protocol
     entries = [replace(e, numerics_contract_digest=(numerics if entry_numerics is None
                                                     else entry_numerics),
-                       train_image_digest=img, continuation_protocol=protocol,
+                       train_image_digest=img, continuation_protocol=proto,
                        **({"training_contract_digest": digest} if digest else {}))
                for e in m.entries]
     return replace(m, entries=entries, numerics_contract_digest=numerics)
@@ -652,6 +671,14 @@ def test_validator_active_accepts_image_only_and_rejects_numerics_or_missing(cfg
     n = numerics_contract_digest(v2c)
     assert r.check_manifest(_stamp(m, n, digest=old)) is None          # image-only: accepted
     assert r.check_manifest(_stamp(m, n)) is None
+    # a leg trained with continuation OFF (the carried king, pre-2026-11-13
+    # legs) still verifies in an era whose contract ships it ON — and vice versa
+    off = contract_digest(replace(v2c, train_image_digest=OLD, continuation_protocol=""))
+    assert r.check_manifest(_stamp(m, n, digest=off, protocol="")) is None
+    on = contract_digest(replace(v2c, train_image_digest=OLD, continuation_protocol=PROTO))
+    assert r.check_manifest(_stamp(m, n, digest=on, protocol=PROTO)) is None
+    assert r.check_manifest(_stamp(m, n, digest=off, protocol=PROTO)).startswith(
+        "era_entry_contract_unproven")                                  # lying protocol
     other = numerics_contract_digest(replace(v2c, base_lr=v2c.base_lr * 2))
     assert r.check_manifest(_stamp(m, n, entry_numerics=other)).startswith(
         "era_entry_numerics_mismatch")
@@ -744,6 +771,8 @@ def test_mainnet_note_carries_v2b_within_the_field(rollover_typed):
     rollover resolved from signals); True is the main validator's deployed
     shape (rolling_from_block typed)."""
     cfg = load_chain_config(REPO / "chain.toml")
+    cfg = replace(cfg, v2=replace(cfg.v2, image_decoupled_from_block=0,    # the vote still open
+                                  prelaunch_burn_from_block=0))        # (typed 2026-11-13)
     feature = A.primary_feature(cfg).name
     if rollover_typed:
         cfg = A.apply_activation(cfg, LIVE_ROLLOVER[1])
@@ -763,17 +792,22 @@ def test_mainnet_note_carries_v2b_within_the_field(rollover_typed):
                                     A.ActivationRecord(), None, None, v2b_rec)
         assert LIVE_FORFEIT[0] not in note and LIVE_MARGIN_V2[0] not in note
         assert ":prelaunch-95-r2:0:0:" in note                 # left alone
-        assert note.endswith(":" + tail)
-        assert len(note.encode("utf-8")) <= A.NOTE_MAX_BYTES - 24   # room to spare
+        # the DEC-CA-0068 "lad-" segment (newer) rides after it; nothing trimmed
+        assert f":{tail}:" in note + ":"
+        lad = A.shared_ladder_feature(cfg)
+        assert (lad.name in note.split(":")) == lad.decided_on_chain   # typed ⇒ not signalled
+        assert len(note.encode("utf-8")) <= A.NOTE_MAX_BYTES
 
 
-def test_note_with_a_locked_cfg_segment_and_the_v2b_type_rule():
+def test_note_with_a_locked_cfg_segment_and_the_v2b_type_rule(tmp_path):
     """The DEC-CA-0057 ``cfg-`` overlay segment rides last. With 7-digit
     blocks a locked cfg- and a locked v2b both fit; past block 10,000,000
     (8 digits) the locked v2b is trimmed — the rule: once v2b is DECIDED,
     type its block into chain.toml (behaviour-identical) and its segment
-    leaves the note."""
-    cfg = load_chain_config(REPO / "chain.toml")
+    leaves the note. Judged on the pre-decision release (rollover untyped, so
+    the primary segment rides the note as on a vote-form node)."""
+    cfg = predecision_main(tmp_path)
+    cfg = replace(cfg, v2=replace(cfg.v2, image_decoupled_from_block=0))   # the vote still open
     v2b = A.image_decoupled_feature(cfg).name
     for digits, fits in ((7, True), (8, False)):
         low = 10 ** (digits - 1)
@@ -798,9 +832,11 @@ def test_note_with_a_locked_cfg_segment_and_the_v2b_type_rule():
 
 def _untyped_blocks(tmp_path):
     """The release chain.toml (pins set) WITHOUT the typed forfeit / margin-v2
-    blocks — a deployment that applied the pins but not the typed blocks."""
-    text = (REPO / "chain.toml").read_text()
-    for k in ("forfeit_from_block", "margin_v2_from_block"):
+    / v2b blocks — a deployment that applied the pins but not the typed blocks
+    (so neither the 2026-11-13 typed rollover / v2 launch: the pre-decision
+    release text)."""
+    text = predecision_text()
+    for k in ("forfeit_from_block", "margin_v2_from_block", "image_decoupled_from_block"):
         text, n = re.subn(rf"(?m)^{k}\s*=.*$", f"{k} = 0", text)
         assert n == 1, k
     p = tmp_path / "untyped.toml"
@@ -854,12 +890,15 @@ def test_the_trainer_never_refuses_for_the_note_budget(tmp_path):
     assert "v2b_note_problem" not in inspect.getsource(trainer_loop)
 
 
-def test_note_budget_worst_case_scales_to_8_digit_blocks():
+def test_note_budget_worst_case_scales_to_8_digit_blocks(tmp_path):
     """Review 4: the worst case uses the digit count blocks reach within the
     horizon; 8 digits (head unknown, or within ~30 days of 10,000,000) trims
     the release config's v2b segment beside a locked cfg- overlay — the
-    documented rule: type v2b's block once it is decided."""
-    cfg = load_chain_config(REPO / "chain.toml")
+    documented rule: type v2b's block once it is decided (the release now
+    does; this judges the vote-form config — the pre-decision release, whose
+    rollover is untyped so its primary segment rides the note)."""
+    cfg = predecision_main(tmp_path)
+    cfg = replace(cfg, v2=replace(cfg.v2, image_decoupled_from_block=0))
     rec = _live_records()[0]
     assert A.v2b_note_problem(cfg, rec, head_block=9_420_000) == ""
     assert "TRIM" in A.v2b_note_problem(cfg, rec, head_block=9_800_000)

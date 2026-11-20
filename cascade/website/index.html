@@ -988,6 +988,10 @@ th.num { text-align: right; }
 .panel.cohort td.chips { white-space: normal; min-width: 220px; }
 .cohort-head { font-family: var(--font-mono); font-weight: 700; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--ink); margin-bottom: 8px; }
 .cohort-head .muted { font-weight: 400; text-transform: none; letter-spacing: 0; }
+.bench-ds { margin-top: 10px; display: grid; gap: 12px; }
+.bench-ds > summary { cursor: pointer; font-family: var(--font-mono); font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--ink); }
+.bench-ds > summary .muted { font-weight: 400; text-transform: none; letter-spacing: 0; }
+.bench-ds > summary:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
 .h-gap { display: inline-block; font-family: var(--font-mono); font-size: 11px; color: var(--muted); margin-right: 8px; }
 .h-gap.good { color: var(--good); font-weight: 700; }
 tr.throne td { background: var(--hatch); }
@@ -1902,6 +1906,106 @@ function uidOfHotkey(hk,r){
   return null;
 }
 function horizonKeys(o){ return Object.keys(o||{}).sort(function(a,b){ return Number(a)-Number(b); }); }
+// The public-benchmark gate (verdict.bench_gate_detail on the signed receipt):
+// it only runs once a challenger clears the private pool, and it can only
+// BLOCK a dethrone. Per suite: the challenger/king error ratio (< 1 = the
+// challenger is better) and the share of series it won; the gate needs the
+// suites' mean win rate at or above min_win_rate.
+var BENCH_SUITES={gift:"GIFT-Eval",boom:"BOOM",time:"TIME",fev:"FEV"};
+function benchGateHtml(r){
+  var rc=receiptFor(r.round_id), d=rc&&rc.verdict&&rc.verdict.bench_gate_detail;
+  if(!d||typeof d!=="object") return "";
+  if(d.computed===false){
+    return '<div><div class="cohort-head">Public benchmarks <span class="muted">— not computed: '+esc(d.reason||"bench rows missing")+'</span></div></div>';
+  }
+  var su=d.suites||{}, names=Object.keys(su).sort(function(a,b){ return (su[a].win_rate==null?1:su[a].win_rate)-(su[b].win_rate==null?1:su[b].win_rate); });
+  var minw=d.min_win_rate;
+  var rows=names.map(function(k){
+    var c=su[k]||{}, better=c.ratio!=null&&c.ratio<1, won=c.win_rate!=null&&minw!=null&&c.win_rate>=minw;
+    return '<tr><td>'+esc(BENCH_SUITES[k]||k)+'</td>'+
+      '<td class="num'+(better?' good':'')+'">'+fmt(c.ratio,3)+'</td>'+
+      '<td class="num">'+fmt(c.ratio_lcb,3)+'</td>'+
+      '<td class="num'+(won?' good':'')+'">'+(c.win_rate!=null?(c.win_rate*100).toFixed(1)+"%":"--")+'</td>'+
+      '<td class="num">'+(c.n!=null?c.n:"--")+'</td></tr>';
+  }).join("");
+  var head=(d.passed?'<span class="heat-pill adv">✓ passed</span>':'<span class="heat-pill nofit">✗ blocked the dethrone</span>')+
+    ' <span class="muted">— mean win rate '+(d.win_rate!=null?(d.win_rate*100).toFixed(1)+"%":"--")+
+    (minw!=null?' (needs '+(minw*100).toFixed(0)+'%)':'')+' · mean error ratio '+fmt(d.avg_ratio,3)+
+    (d.reason&&!d.passed?' · '+esc(d.reason):'')+' · weakest suite first; ratio &lt; 1 = challenger better</span>';
+  return '<div><div class="cohort-head">Public benchmarks '+head+'</div>'+
+    '<div class="scroll-box"><table><thead><tr><th>Suite</th>'+
+    '<th class="num" title="Challenger error / king error — below 1 means the challenger is better">Error ratio</th>'+
+    '<th class="num" title="Bootstrap lower bound on the ratio">Ratio LCB</th>'+
+    '<th class="num" title="Share of series where the challenger beat the king">Win rate</th>'+
+    '<th class="num">Series</th></tr></thead><tbody>'+rows+'</tbody></table></div>'+
+    benchDatasetsHtml(r)+'</div>';
+}
+// Per-dataset breakdown, fetched only when the reader opens it: the receipt's
+// bench_report.key -> the signed bench report -> each entry's per-task rows
+// (~650 KB each). A task's score is the gate's own unit (bench_gate.
+// task_log_ratios): log s = (log r_crps + log r_mase)/2, r = chal/king; the
+// challenger wins the task when s < 1. Tasks group by dataset (the first "/"
+// segment of the item id), biggest drag (sum of log s) first.
+var _benchDs={}, _benchDsOpen={};
+function benchUsable(x){ return typeof x==="number"&&isFinite(x)&&x>0; }
+function benchGroups(king,chal){
+  var out={};
+  Object.keys(BENCH_SUITES).forEach(function(suite){
+    var ks=king&&king[suite], cs=chal&&chal[suite]; if(!ks||!cs) return;
+    var kmap={}; (ks.rows||[]).forEach(function(r){ if(r&&r.item!=null) kmap[String(r.item)]=r; });
+    var g={};
+    (cs.rows||[]).forEach(function(r){
+      if(!r) return; var k=kmap[String(r.item)];
+      if(!k||!benchUsable(k.crps)||!benchUsable(k.mase)||!benchUsable(r.crps)||!benchUsable(r.mase)) return;
+      var ls=0.5*(Math.log(r.crps/k.crps)+Math.log(r.mase/k.mase)), ds=String(r.item).split("/")[0];
+      (g[ds]=g[ds]||[]).push(ls);
+    });
+    out[suite]=Object.keys(g).map(function(ds){
+      var logs=g[ds], sum=0, wins=0;
+      logs.forEach(function(x){ sum+=x; wins+=x<0?1:(x===0?0.5:0); });
+      return {dataset:ds, ratio:Math.exp(sum/logs.length), wins:wins, n:logs.length, drag:sum};
+    }).sort(function(a,b){ return b.drag-a.drag||(a.dataset<b.dataset?-1:1); });
+  });
+  return out;
+}
+function benchDatasetsLoad(rid){
+  if(_benchDs[rid]) return;
+  var rc=receiptFor(rid), key=rc&&rc.bench_report&&rc.bench_report.key;
+  if(!key){ _benchDs[rid]={err:"per-task rows not published for this round"}; renderCohort(); return; }
+  _benchDs[rid]={loading:true}; renderCohort();
+  fetchJSON(key,{bust:false}).then(function(rep){
+    var ks={}; ((rep&&rep.entries)||[]).forEach(function(e){ if(e&&e.role) ks[e.role]=e.rows_key; });
+    if(!ks.king||!ks.challenger) throw new Error("no rows");
+    return Promise.all([fetchJSON(ks.king,{bust:false}),fetchJSON(ks.challenger,{bust:false})]);
+  }).then(function(kc){ _benchDs[rid]={groups:benchGroups(kc[0],kc[1])}; })
+    .catch(function(){ _benchDs[rid]={err:"per-task rows unavailable right now"}; })
+    .then(function(){ renderCohort(); });
+}
+function benchDatasetsHtml(r){
+  var rid=String(r.round_id), st=_benchDs[rid], body;
+  if(!st) body='<div class="muted">Open to load the per-task rows (~1.3 MB).</div>';
+  else if(st.loading) body='<div class="muted">Loading per-task rows…</div>';
+  else if(st.err) body='<div class="muted">'+esc(st.err)+'</div>';
+  else body=Object.keys(BENCH_SUITES).filter(function(s){ return st.groups[s]&&st.groups[s].length; }).map(function(s){
+    var cells=st.groups[s];
+    var trs=cells.map(function(c){
+      return '<tr><td>'+esc(c.dataset)+'</td><td class="num'+(c.ratio<1?' good':'')+'">'+fmt(c.ratio,3)+'</td>'+
+        '<td class="num">'+(Math.round(c.wins*10)/10)+'/'+c.n+'</td></tr>';
+    }).join("");
+    return '<div><div class="cohort-head">'+esc(BENCH_SUITES[s])+' <span class="muted">— '+cells.length+' datasets, biggest drag on the challenger first</span></div>'+
+      '<div class="scroll-box scroll-field"><table><thead><tr><th>Dataset</th>'+
+      '<th class="num" title="Challenger / king, geomean over the dataset\'s tasks of sqrt(CRPS ratio × MASE ratio); below 1 = challenger better">Ratio</th>'+
+      '<th class="num" title="Tasks the challenger won / tasks">Wins</th></tr></thead><tbody>'+trs+'</tbody></table></div></div>';
+  }).join("");
+  return '<details class="bench-ds" data-rid="'+esc(rid)+'"'+(_benchDsOpen[rid]?' open':'')+'>'+
+    '<summary>By dataset <span class="muted">— which datasets in each benchmark the challenger lost</span></summary>'+body+'</details>';
+}
+// <details> toggle does not bubble: capture it at the document
+document.addEventListener("toggle",function(event){
+  var d=event.target; if(!d||!d.classList||!d.classList.contains("bench-ds")) return;
+  var rid=d.getAttribute("data-rid"); _benchDsOpen[rid]=d.open;
+  if(d.open) benchDatasetsLoad(rid);
+},true);
 function renderCohort(){
   var r=latestScoredRow(), el=document.getElementById("cohort-panel");
   if(!r||r.status==="rejected"){ el.hidden=true; el.innerHTML=""; return; }
@@ -1929,6 +2033,7 @@ function renderCohort(){
       '<div class="scroll-box"><table><thead><tr><th>Domain</th><th class="num">King</th><th class="num">Challenger</th>'+
       '<th class="num">Gap</th><th class="num">Win rate</th><th class="num">n</th></tr></thead><tbody>'+drows+'</tbody></table></div></div>';
   }
+  html+=benchGateHtml(r);
   var seen={}, hks=[];
   Object.keys(s.geos).concat(Object.keys(s.lcbs)).forEach(function(hk){ if(!seen[hk]){ seen[hk]=1; hks.push(hk); } });
   if(hks.length>1||(hks.length===1&&Object.keys(s.geos).length)){

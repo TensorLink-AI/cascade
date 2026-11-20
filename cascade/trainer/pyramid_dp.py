@@ -37,6 +37,36 @@ log = logging.getLogger(__name__)
 
 GANG_ENV = "CASCADE_TRAIN_GPUS"
 _TIMEOUT = datetime.timedelta(seconds=600)
+
+# NCCL picks its all-reduce algorithm, protocol and channel count from the
+# pod's detected topology (NVLink / NVSwitch / PCIe / NUMA), so two pods with
+# the same GPUs sum the gradients in different orders and the runs split at
+# the first optimizer steps (measured 2026-11-20: same 4 GPUs repeated =
+# bit-identical; two GPU subsets of one pod under default NCCL diverged at
+# step 3; the same two subsets under this pin = bit-identical weights). Fixing
+# the algorithm, protocol and channel count makes the reduction order a
+# function of the world size alone. Set on every rank before its
+# process group initialises; a pod-provided value is overridden (and logged),
+# because a leg's numerics must not depend on the host's environment.
+NCCL_PIN = {
+    "NCCL_ALGO": "Ring",
+    "NCCL_PROTO": "Simple",
+    "NCCL_NVLS_ENABLE": "0",
+    "NCCL_MIN_NCHANNELS": "4",
+    "NCCL_MAX_NCHANNELS": "4",
+}
+
+
+def pin_nccl_env(environ=None) -> dict[str, str]:
+    """Apply :data:`NCCL_PIN` to ``environ`` (default ``os.environ``); return
+    the prior values it replaced (empty when none differed)."""
+    env = os.environ if environ is None else environ
+    replaced = {k: env[k] for k, v in NCCL_PIN.items() if k in env and env[k] != v}
+    env.update(NCCL_PIN)
+    if replaced:
+        log.warning("pyramid: overriding host NCCL settings %s with the pinned all-reduce %s",
+                    replaced, NCCL_PIN)
+    return replaced
 _STEP, _STOP, _GATHER, _SCATTER = 1, 0, 2, 3
 
 
@@ -87,6 +117,8 @@ class Gang:
         with socket.socket() as s:
             s.bind(("127.0.0.1", 0))
             port = s.getsockname()[1]
+        # before the spawn, so every helper inherits it (it pins again itself)
+        pin_nccl_env()
         ctx = mp.get_context("spawn")
         self.errors = ctx.Queue()
         self.procs = [ctx.Process(target=_follower, daemon=True,
@@ -478,6 +510,7 @@ def _follower(rank, world, port, cfg_dict, deterministic, seed, errors) -> None:
         torch.cuda.set_device(rank)
         bound_cpu_threads(world)
         device = torch.device("cuda", rank)
+        pin_nccl_env()
         dist.init_process_group("nccl", init_method=f"tcp://127.0.0.1:{port}", rank=rank,
                                 world_size=world, timeout=_TIMEOUT)
         torch.manual_seed(seed)

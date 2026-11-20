@@ -763,6 +763,14 @@ def _mainnet():
     return load_chain_config(Path(__file__).resolve().parents[2] / "chain.toml")
 
 
+def _predecision(tmp_path):
+    """chain.toml as shipped BEFORE 2026-11-13 typed the decided rollover (the
+    rollover keys back at 0, resolved by ``apply_activation``)."""
+    from .predecision_main import predecision_main
+
+    return predecision_main(tmp_path)
+
+
 def _mainnet_rollover(cfg) -> int:
     """A rollover block the mainnet [activation] could resolve: a boundary of
     the loaded 3600 grid, an era start of the 900 × 4 grid after it, after
@@ -771,8 +779,8 @@ def _mainnet_rollover(cfg) -> int:
     return (int(cfg.scoring.cohort_maxt_from_block) // era + 10) * era
 
 
-def test_mainnet_v2_cohort_settlement_is_judged_in_increment_units(cfg):
-    """chain.toml types ``cohort_maxt_increment_from_block = 0``, but the
+def test_mainnet_v2_cohort_settlement_is_judged_in_increment_units(cfg, tmp_path):
+    """chain.toml typed ``cohort_maxt_increment_from_block = 0``, but the
     mainnet era machinery is decided on chain (DEC-CA-0045) and
     ``apply_activation`` fills that key with the rollover block (the era king
     is judged under the increment-unit max-T, load-checked ``era_king >=
@@ -790,8 +798,15 @@ def test_mainnet_v2_cohort_settlement_is_judged_in_increment_units(cfg):
     from cascade.shared.config import cohort_maxt_increment_active
     from cascade.validator.loop import ValidatorRunner
 
-    main = _mainnet()
-    assert main.scoring.cohort_maxt_increment_from_block == 0     # as typed
+    # the release now TYPES the decided rollover (2026-11-13) — what
+    # apply_activation filled in from the vote on the pre-decision file
+    shipped = _mainnet()
+    assert shipped.scoring.cohort_maxt_increment_from_block == 9136800
+    assert shipped.scoring.era_king_from_block == shipped.round.rolling_from_block == 9136800
+    main = _predecision(tmp_path)
+    assert main.scoring.cohort_maxt_increment_from_block == 0     # as typed pre-decision
+    assert (apply_activation(main, 9136800).scoring.cohort_maxt_increment_from_block
+            == shipped.scoring.cohort_maxt_increment_from_block)
     R = _mainnet_rollover(main)
     resolved = apply_activation(main, R)
     s = resolved.scoring
@@ -846,7 +861,7 @@ def test_mainnet_v2_cohort_settlement_is_judged_in_increment_units(cfg):
     assert C.check_duel_cohort(receipt, typed).status == C.FAIL
 
 
-def test_mainnet_cohort_increment_gate_cannot_trail_the_rollover(cfg):
+def test_mainnet_cohort_increment_gate_cannot_trail_the_rollover(cfg, tmp_path):
     """Why chain.toml does not type ``cohort_maxt_increment_from_block = "v2"``:
     a gate later than the rollover breaks the load-checked ordering ``era_king
     >= cohort_maxt_increment`` — ``apply_activation`` refuses it — and would
@@ -855,7 +870,7 @@ def test_mainnet_cohort_increment_gate_cannot_trail_the_rollover(cfg):
 
     from cascade.shared.activation import apply_activation
 
-    main = _mainnet()
+    main = _predecision(tmp_path)   # the vote-open file: a hypothetical rollover R
     R = _mainnet_rollover(main)
     assert apply_activation(main, R).scoring.cohort_maxt_increment_from_block == R
     era_after = 900 * int(main.round.era_settlements)

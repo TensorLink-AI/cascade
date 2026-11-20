@@ -93,6 +93,7 @@ class ReceiptMixin:
                 activation_block=self.activation_block,
                 margin_v2_block=self.margin_v2_block,
                 image_decoupled_block=self.image_decoupled_block,
+                shared_ladder_block=self.shared_ladder_block,
                 lane_b=lane_b, lane_b_pay=lane_b_pay,
                 v2_block=self._v2_receipt_block(epoch_start_block),
                 prelaunch_burn_block=self.prelaunch_burn_block,
@@ -134,6 +135,7 @@ class ReceiptMixin:
             activation_block=self.activation_block,
             margin_v2_block=self.margin_v2_block,
             image_decoupled_block=self.image_decoupled_block,
+            shared_ladder_block=self.shared_ladder_block,
             lane_b=lane_b, lane_b_pay=lane_b_pay,
             v2_block=self._v2_receipt_block(epoch_start_block),
             prelaunch_burn_block=self.prelaunch_burn_block,
@@ -371,7 +373,9 @@ class ReceiptMixin:
                                              self._margin_v2, self._margin_v2_tally,
                                              self._prelaunch, self._prelaunch_tally,
                                              self._image_decoupled,
-                                             self._image_decoupled_tally)
+                                             self._image_decoupled_tally,
+                                             shared_ladder_record=self._shared_ladder,
+                                             shared_ladder_tally=self._shared_ladder_tally)
                           if self.cfg.activation.enabled else None)
             status = build_chain_status(
                 self.cfg,

@@ -492,7 +492,178 @@ def _duel_validators_line(rows: list[dict]) -> str | None:
     return "  validators     " + " · ".join(parts) if parts else None
 
 
-def render_duel(rows: list[dict], *, me: str | None = None) -> str:
+# ── public-benchmark gate (verdict.bench_gate_detail on the signed receipt) ──
+#
+# The gate only runs once a challenger clears the private pool, and it can only
+# BLOCK a dethrone. The index row carries just the private-pool verdict, so the
+# per-suite detail is read from the round's full receipt (``receipt_key``).
+
+BENCH_SUITE_NAMES = {"gift": "GIFT-Eval", "boom": "BOOM", "time": "TIME", "fev": "FEV"}
+
+
+def fetch_bench_receipt(storage: object, rows: list[dict], *,
+                        timeout: float = 60.0) -> tuple[dict | None, str | None]:
+    """``(bench_gate_detail, bench report key)`` from the round's scored
+    receipt; either is None when absent (no scored row, no ``receipt_key``,
+    fetch failed, no gate recorded, no bench report pointer)."""
+    scored = [r for r in rows if str(r.get("status")) == "scored" and r.get("receipt_key")]
+    if not scored:
+        return None, None
+    doc = fetch_public_json(storage, str(scored[-1]["receipt_key"]), timeout=timeout)
+    if not isinstance(doc, dict):
+        return None, None
+    verdict = doc.get("verdict") if isinstance(doc.get("verdict"), dict) else {}
+    detail = verdict.get("bench_gate_detail")
+    br = doc.get("bench_report") if isinstance(doc.get("bench_report"), dict) else {}
+    key = br.get("key")
+    return (detail if isinstance(detail, dict) else None,
+            str(key) if isinstance(key, str) and key else None)
+
+
+def fetch_bench_gate(storage: object, rows: list[dict], *,
+                     timeout: float = 60.0) -> dict | None:
+    """The ``bench_gate_detail`` of the round's scored receipt, or None."""
+    return fetch_bench_receipt(storage, rows, timeout=timeout)[0]
+
+
+# ── per-dataset breakdown (the signed per-task rows behind each suite) ───────
+#
+# Each bench report entry points at its signed per-task rows (``rows_key``):
+# ``{suite: {"status", "rows": [{"item", "crps", "mase"}]}}``. A task's score
+# is the gate's own unit (cascade.eval.bench_gate.task_log_ratios):
+# ``log s = (log r_crps + log r_mase) / 2`` with ``r = chal / king``; the
+# challenger wins the task when ``s < 1``. Tasks are grouped by dataset — the
+# first ``/`` segment of the item id (``m4_yearly/A/short`` → ``m4_yearly``).
+# Display only: the gate itself is the signed ``bench_gate_detail``.
+
+
+def _usable_metric(x: object) -> bool:
+    import math
+
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) and x > 0
+
+
+def dataset_of(item: str) -> str:
+    return str(item).split("/", 1)[0]
+
+
+def bench_dataset_groups(king_rows: dict | None, chal_rows: dict | None
+                         ) -> dict[str, list[dict]]:
+    """``{suite: [{"dataset", "ratio", "wins", "n", "drag"}]}``, the datasets
+    that pulled the challenger down most first (``drag`` = the sum of their
+    task log-ratios). Only tasks both sides scored with usable CRPS
+    and MASE count (the gate's inner join + mask)."""
+    import math
+
+    out: dict[str, list[dict]] = {}
+    if not isinstance(king_rows, dict) or not isinstance(chal_rows, dict):
+        return out
+    for suite in sorted(set(king_rows) & set(chal_rows)):
+        ks, cs = king_rows.get(suite), chal_rows.get(suite)
+        if not isinstance(ks, dict) or not isinstance(cs, dict):
+            continue
+        king = {str(r.get("item")): r for r in ks.get("rows") or [] if isinstance(r, dict)}
+        groups: dict[str, list[float]] = {}
+        for r in cs.get("rows") or []:
+            if not isinstance(r, dict):
+                continue
+            k = king.get(str(r.get("item")))
+            if k is None or not all(_usable_metric(x.get(m)) for x in (k, r)
+                                    for m in ("crps", "mase")):
+                continue
+            log_s = 0.5 * (math.log(r["crps"] / k["crps"]) + math.log(r["mase"] / k["mase"]))
+            groups.setdefault(dataset_of(str(r.get("item"))), []).append(log_s)
+        cells = []
+        for name, logs in groups.items():
+            wins = sum(1.0 if x < 0 else 0.5 if x == 0 else 0.0 for x in logs)
+            cells.append({"dataset": name, "ratio": math.exp(math.fsum(logs) / len(logs)),
+                          "wins": wins, "n": len(logs), "drag": math.fsum(logs)})
+        # by total drag on the suite (sum of task log-ratios), so a dataset
+        # that lost many tasks outranks a one-task outlier
+        cells.sort(key=lambda c: (-c["drag"], c["dataset"]))
+        out[suite] = cells
+    return out
+
+
+def fetch_bench_datasets(storage: object, report_key: str | None, *,
+                         timeout: float = 30.0) -> dict[str, list[dict]] | None:
+    """Fetch the signed bench report and both entries' per-task rows, and
+    group them (:func:`bench_dataset_groups`). None when anything is missing."""
+    if not report_key:
+        return None
+    rep = fetch_public_json(storage, report_key, timeout=timeout)
+    entries = rep.get("entries") if isinstance(rep, dict) else None
+    if not isinstance(entries, list):
+        return None
+    keys = {str(e.get("role")): e.get("rows_key") for e in entries if isinstance(e, dict)}
+    if not keys.get("king") or not keys.get("challenger"):
+        return None
+    king = fetch_public_json(storage, str(keys["king"]), timeout=timeout)
+    chal = fetch_public_json(storage, str(keys["challenger"]), timeout=timeout)
+    if king is None or chal is None:
+        return None
+    return bench_dataset_groups(king, chal) or None
+
+
+def bench_dataset_lines(groups: dict[str, list[dict]] | None, *,
+                        limit: int | None = 5) -> list[str]:
+    """Per suite, the ``limit`` datasets where the challenger did worst
+    (``None`` = every dataset)."""
+    if not groups:
+        return []
+    lines = ["  by dataset     biggest drag on the challenger first · ratio = chal/king "
+             "(< 1 = challenger better) · wins = tasks won"]
+    for suite in ("gift", "fev", "boom", "time"):
+        cells = groups.get(suite)
+        if not cells:
+            continue
+        shown = cells if limit is None else cells[:limit]
+        more = "" if len(shown) == len(cells) else f"  (+{len(cells) - len(shown)} more; --all-datasets)"
+        lines.append(f"    {BENCH_SUITE_NAMES.get(suite, suite)} — {len(cells)} datasets{more}")
+        for c in shown:
+            wins = f"{c['wins']:g}/{c['n']}"
+            lines.append(f"      {c['dataset'][:34]:<34} {c['ratio']:7.3f}  {wins:>9}")
+    return lines
+
+
+def bench_gate_lines(detail: dict | None) -> list[str]:
+    """Per-suite lines for the public-benchmark gate, weakest suite first."""
+    if not isinstance(detail, dict):
+        return []
+    if detail.get("computed") is False:
+        return [f"  public bench   not computed — {detail.get('reason') or 'bench rows missing'}"]
+    win, minw = _as_float(detail.get("win_rate")), _as_float(detail.get("min_win_rate"))
+    avg = _as_float(detail.get("avg_ratio"))
+    head = "passed" if detail.get("passed") else "BLOCKED the dethrone"
+    if win is not None:
+        head += f" — mean win rate {win * 100:.1f}%"
+        if minw is not None:
+            head += f" (needs {minw * 100:.0f}%)"
+    if avg is not None:
+        head += f" · mean error ratio {avg:.3f}"
+    lines = [f"  public bench   {head}",
+             "    suite        error ratio  ratio LCB  win rate  series   (ratio < 1 = challenger better)"]
+    suites = detail.get("suites") if isinstance(detail.get("suites"), dict) else {}
+    cells = []
+    for key, cell in suites.items():
+        if isinstance(cell, dict):
+            cells.append((key, _as_float(cell.get("ratio")), _as_float(cell.get("ratio_lcb")),
+                          _as_float(cell.get("win_rate")), _as_int(cell.get("n"))))
+    cells.sort(key=lambda c: 1.0 if c[3] is None else c[3])
+    for key, ratio, lcb, rate, n in cells:
+        mark = "  ← below the bar" if rate is not None and minw is not None and rate < minw else ""
+        lines.append(f"    {BENCH_SUITE_NAMES.get(key, key):<12} "
+                     f"{'--' if ratio is None else f'{ratio:.3f}':>11}  "
+                     f"{'--' if lcb is None else f'{lcb:.3f}':>9}  "
+                     f"{'--' if rate is None else f'{rate * 100:.1f}%':>8}  "
+                     f"{'--' if n is None else n:>6}{mark}")
+    return lines
+
+
+def render_duel(rows: list[dict], *, me: str | None = None,
+                bench_gate: dict | None = None,
+                bench_datasets: dict[str, list[dict]] | None = None,
+                dataset_limit: int | None = 5) -> str:
     """The standalone ``cascade duel`` view of one settled round's index rows.
     ``me`` (a hotkey) appends that miner's own per-domain scores against the
     king — see :func:`my_domain_lines`."""
@@ -554,6 +725,8 @@ def render_duel(rows: list[dict], *, me: str | None = None) -> str:
     gift = row.get("gift_gate_passed")
     if gift is not None:
         lines.append("  gift gate      " + ("passed" if gift else "BLOCKED the dethrone"))
+    lines += bench_gate_lines(bench_gate)
+    lines += bench_dataset_lines(bench_datasets, limit=dataset_limit)
     # Archived boundary-round receipts carry a heat summary; rolling ones don't.
     heat = row.get("heat")
     if isinstance(heat, dict) and heat.get("n_entrants") is not None:
