@@ -82,7 +82,8 @@ def test_pre_fix_behaviour_is_unchanged_while_the_gate_is_off(cfg):
 @pytest.mark.parametrize("fix_at", ["rollover", "later"])
 def test_post_gate_king_keeps_its_crowning_block(cfg, fix_at):
     base, rollover, eb_new = _base(
-        cfg, fix_from=(lambda r: r) if fix_at == "rollover" else (lambda r: r + 4 * eb_new))
+        cfg, fix_from=(lambda r: r) if fix_at == "rollover"
+        else (lambda r: r + cfg.round.epoch_blocks))       # = the crowning (4 × new grid)
     r, out, crowned = _new_king_first_settlement(base, rollover, eb_new)
     assert r.state.king_since_block == crowned          # the real crowning, kept
     assert out.king_tenure_rounds == 2                  # 2 settlements reigned
