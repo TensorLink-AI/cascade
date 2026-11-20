@@ -87,7 +87,14 @@ The full schema with every key is in
   the trainer produced (e.g. the current holder's). You are still judged
   against the pinned base, and against the holder to take the slot.
 - **`synthetic_fraction`** — > 0 needs a `generator.py` (lane A's sandboxed
-  `generate()` contract).
+  `generate()` contract). A horizon with no real bars in your range trains on
+  generator series alone, so a generator is how you train the short
+  horizons while the minute recording is still younger than the embargo.
+- **`synthetic_channels`** — name your generator's rows (`"target"` first,
+  then past covariates and an optional `"time"` clock) so synthetic samples
+  carry their own covariates instead of missing ones. The clock's step sets
+  the bar size the array is used at, so 1 m and 1 h series can differ. Units and an example
+  are in [§14](MINER.md#what-you-submit).
 
 ### 3. Check, upload, commit
 
@@ -223,7 +230,7 @@ never displaces a MarketCast holder.
 
 **Do I upload training data?** No. The trainer fetches the permitted public
 bars itself. A generator (`synthetic_fraction` > 0) is the only way to add
-your own series.
+your own series, with their own covariates if you set `synthetic_channels`.
 
 **Can I see the windows I am scored on?** Not before they happen — that is
 the point. After scoring, the signed report and the forecasts are public.

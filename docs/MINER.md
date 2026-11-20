@@ -1547,7 +1547,7 @@ an OPTIONAL generator:
 ```
 
 - Every key is required (except `quantile_weights`, `coverage_penalty`,
-  `ema_decay`, `leg_hours` and `init`). Unknown keys are refused at every level, and every bound
+  `ema_decay`, `leg_hours`, `init` and `synthetic_channels`). Unknown keys are refused at every level, and every bound
   comes from `[marketcast]`.
 - `horizon_mix` keys are the target's horizons, written `<bar>x<steps>`: a
   forecast of `steps` bars of `<bar>` ahead. Every suite is scored on every
@@ -1578,9 +1578,41 @@ an OPTIONAL generator:
   export.
 - `synthetic_fraction` > 0 needs a generator in the tree (`generator.py`).
   It uses the same sandboxed `generate()` contract as lane A. Its series are
-  mixed in at that share (0–1), and synthetic samples carry no
-  covariates. You choose the mix: `0` trains on real data only, `1` on your
-  generator only — then `data.assets` and `data.class_weights` may be `{}`.
+  mixed in at that share (0–1). You choose the mix: `0` trains on real data
+  only, `1` on your generator only — then `data.assets` and
+  `data.class_weights` may be `{}`. A horizon with no real bars in your
+  range (e.g. `1mx60` while the minute recording is younger than the
+  embargo) trains on generator series alone; without a generator it is not
+  trained at all.
+- `synthetic_channels` (optional) gives your generator's samples their own
+  covariates. Without it, every row of a generated `(C, L)` array is a
+  separate target series and synthetic samples carry NaN (missing)
+  covariates. With it, it names the rows of EVERY generated array, and each
+  array is one sample: row 0 must be `"target"`, the others any of your
+  recipe's PAST covariates, plus optionally `"time"` (the unix start of each
+  step), from which the known rows (`calendar`, `session`, `events`) are
+  computed. The clock's step is the array's BAR SIZE: an array whose `time`
+  row is finite with a constant whole-minute step (60 s, 300 s, 3600 s, …)
+  is used only for horizons at that bar, so you can generate 1 m and 1 h
+  dynamics separately. An array without a usable clock is used at any bar,
+  with its known rows missing. A horizon that neither your generator's
+  clocks nor any real series covers is not trained (never a failed leg). A
+  covariate you list but do not generate is a NaN row; non-finite values are
+  missing; an array with the wrong number of rows fails the leg as your
+  fault. Generate the
+  rows in the units the real rows use:
+
+  | Row | Units |
+  |---|---|
+  | `volume` | `ln Σ volume` per step |
+  | `funding` | funding rate per interval, bp |
+  | `cross_asset`, `cross_eth`, `cross_equity`, `cross_gold`, `cross_fx` | log return of that market per step, bp |
+  | `open_interest` | change of log open interest per step, bp |
+  | `spread` | impact bid / ask spread, bp |
+
+  Example: `"covariates": ["volume", "cross_asset", "calendar"],
+  "synthetic_channels": ["target", "volume", "cross_asset", "time"]`, with
+  `generate()` yielding `(4, L)` arrays in that row order.
 - `leg_hours` (optional) is your fine-tune leg's wall clock, in hours, up to
   `[marketcast] max_leg_hours` (12). You pay the pod for it. Without it the
   leg runs `[lane_c] leg_hours` (1). Your forward windows start at dispatch,
