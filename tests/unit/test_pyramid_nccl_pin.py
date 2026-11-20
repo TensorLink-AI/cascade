@@ -75,7 +75,11 @@ def test_rank0_pins_before_spawning_helpers(monkeypatch):
 
     import torch.multiprocessing as mp
 
+    class _Cfg:
+        def to_dict(self):
+            return {}
+
     monkeypatch.setattr(mp, "get_context", lambda _: _Ctx())
     with pytest.raises(_Stop):
-        pyramid_dp.Gang(2, None, deterministic=True, seed=0)
+        pyramid_dp.Gang(2, _Cfg(), deterministic=True, seed=0)
     assert seen == NCCL_PIN
