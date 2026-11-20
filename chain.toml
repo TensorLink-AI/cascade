@@ -241,8 +241,10 @@ expected_gpu = ""                # was "NVIDIA L40S" (DEC-CA-0002)
 # launch-env injection + the provisioner health gate; digest computed
 # orchestrator-side). Folded into contract_digest — re-pin ⇒ trainer AND
 # validators restart together at an epoch boundary, pods pull the new image.
-train_image_digest = "sha256:43c07d4207d7693517d74203f6783fdd2c2f91e3d475f38db38e4798ae97785e"
-# ^ ghcr cascade-worker:worker-v0.9.0 — built 2026-09-16 09:38 UTC from this
+train_image_digest = "sha256:205ff68242ae78fc923c8a5c7d2c4a4eccdd8afc7c7739cae99187475ba96d6f"
+# ^ LIVE SYNC 2026-11-13: worker-v0.13.0 (main 4fbed80, built 2026-09-28) = the
+#   deployed pin since 2026-09-28; main still named v0.9.0 below.
+# (was) ghcr cascade-worker:worker-v0.9.0 — built 2026-09-16 09:38 UTC from this
 #   branch (publish-worker run 35080201768): budget_denomination (DEC-CA-0042)
 #   parsed on the pod, PLUS check_loss_finite (840e900, 2026-09-14) which the
 #   v0.8.0 image (main@9346a52) never carried — three NaN legs trained to the
@@ -282,13 +284,13 @@ ops_gpu_cooldown_seconds = 10800
 # operators (a validator on a stale value silently picks a different snapshot).
 # NOT part of contract_digest ([training] only). The DEC-CA-0045 rollover
 # switches it to [activation] epoch_blocks_after.
-epoch_blocks     = 3600   # ≈12h at a 12s block time
+epoch_blocks     = 900    # DECIDED rollover (rolling-era-king, lock 9133200 → 9136800): 3600 → 900 (3h)
 round_hours      = 12.0   # informational: wall-clock span of an epoch
 # Scheduled switch (0/0 = steady state). Last used: 7200 → 3600 at 8726400,
 # 2026-07-29. To schedule another, the block must be a boundary of BOTH grids
 # (load-checked); set both back to 0 once it is safely past.
-epoch_blocks_prev      = 0
-epoch_activation_block = 0
+epoch_blocks_prev      = 3600      # DECIDED rollover typed (see rolling_from_block)
+epoch_activation_block = 9136800   # DECIDED rollover typed (see rolling_from_block)
 # Rolling intake + era king (DEC-CA-0043, block-gated). Trainer POLICY: from
 # this block challengers train the moment they are funded, legs cross
 # boundaries, every boundary publishes ONE settlement manifest (era king +
@@ -303,7 +305,11 @@ epoch_activation_block = 0
 # the six external validators run a release carrying the era envelope.
 # With every key at 0 the block is DECIDED ON CHAIN by validator stake
 # ([activation] below, DEC-CA-0045); typing a block here overrides that.
-rolling_from_block = 0
+# DECIDED 2026-10-31 (lock-in 9133200 → 9136800, the block the trainer's
+# published 900-block settlements have followed since). Typed 2026-11-13 so a
+# restarting node needs no activation history or archive RPC; a node whose own
+# record says otherwise follows this typed value (configured_rollover).
+rolling_from_block = 9136800
 # Settlements per era (consecutive boundaries sharing one set of training
 # seeds, one init and one cached king checkpoint): 4 on the 3h grid = 12h
 # eras — today's king-leg cadence with 3h verdicts inside it.
@@ -352,14 +358,14 @@ funded_pods = "rent"
 payer_vault_dir = "payer_vault" # cascade-intake --vault-dir (work_root-relative)
 funded_pod_sku = ""             # unused with funded_pod_skus set (per-round pick)
 # Worker image funded pods boot — keep = the fleet's pinned digest.
-funded_pod_image = "ghcr.io/tensorlink-ai/cascade-worker:worker-v2.0.0-rc11@sha256:2fd193cad6be7bef87f110246a2074de84cde44511e153a21d1d0301d93cba64"
+funded_pod_image = "ghcr.io/tensorlink-ai/cascade-worker:worker-v2.0.0-rc15@sha256:5d41d94bc0c0d3ae3dfd042b0cc7e4d900c7d1f48173808436c12bf764a67641"   # LIVE since 2026-10-31 (rc15 = main 5e3fade); synced to main 2026-11-13
 # sha256 of that image's cascade/**/*.py (scripts/worker_code_fingerprint.py
 # <repo>@<digest>). Every rented final/funded pod must hash its files to this
 # BEFORE a leg is dispatched — the digest env a template injects is echoed
 # faithfully by a host that started a STALE image under the pinned tag
 # (2026-09-12: Lium 91.224.44.222/.223 ran worker-v0.7.0 as "v0.8.0"; three
 # miners' legs stalled and were burned). Re-derive on every image re-pin.
-worker_code_fingerprint = "33b0d42fad8fa46b93c09ce1abb3d1d07a349905c171b795671cc68f06d7e907"   # 271 files, worker-v2.0.0-rc11 (2fd193ca…); registry walk, rc10 walk reproduced its pin 2026-10-30
+worker_code_fingerprint = "2d8261aa40e86d3821f8fbeac0d60a0ac7528434a686c17e204c2b20198e293c"   # 274 files, worker-v2.0.0-rc15 (5d41d94b…); registry walk = local 5e3fade source = on-pod hash, 2026-10-31
 funded_ready_timeout_seconds = 900.0
 # How a funded leg's checkpoint leaves its payer pod. "harvest" (default):
 # CREDENTIAL-FREE pods — the worker trains --local-only (nothing at all in the
@@ -577,6 +583,29 @@ scored_horizons   = [64, 256, 720]
 scored_from_block = 8992800      # = [round] duel_from_block — LIVE on main since
                                  # 2026-09-04; no longer tied to funded_activation_block
                                  # (which moved to 9046800). DO NOT move a passed gate.
+# DEC-CA-0068 shared-series ladder — DECIDED ON CHAIN (DEC-CA-0045 vote, note
+# segment "lad-<8 hex>" = sha256("shared-ladder/2|<windows>|<horizons>|batch=32")). From
+# shared_ladder_from_block every rung above scores the SAME shared_ladder_windows
+# series: ONE even-by-domain draw over ALL of the snapshot's series (the 2026-11-12
+# snapshot holds 4525; sales, the scarce domain, contributes all 423), no longer
+# n_windows / the v2 budget split across rungs. A series shorter than a rung keeps
+# 64 steps of history and its whole tail as the target, NaN-PADDED to the horizon;
+# the scorer masks the padded steps; the quantile head decodes in FIXED batches of
+# 32 consecutive same-horizon windows (~10x batch 1). Lock-in writes the first era start after it;
+# a typed block (an era start >= scored_from_block) is the owner override.
+# CHANGING shared_ladder_windows after release is a fresh vote / a new typed block.
+# TYPED (owner 2026-11-12, "4k per horizon ... want it out now"): 9494100 = the FIRST
+# settlement of the era starting 9493200 (Fri 13 Nov 01:23 UTC) — exactly where the
+# DEC-CA-0067 quantile head starts (the settlement AT 9493200 is the previous era's
+# last and keeps the sample path). The main validator is the network's only full
+# evaluator, so every scorer and every audit replay reads this release value; the
+# vote is not needed (a typed block is the owner override — nothing is signalled).
+shared_ladder_windows    = 4000
+shared_ladder_from_block = 9494100
+# Fork guard (CONSENSUS): the lad- name the two values above hash to. A validator /
+# trainer / audit whose chain.toml lacks it — or computes another — REFUSES to start
+# (a node without the rule would keep the per-rung draw after the switch).
+shared_ladder_feature    = "lad-556b1b98"
 
 # Public-benchmark logging (LOG-ONLY; never feeds scoring/weights/KOTH). Runs
 # out of process via the benchmarks/ sidecar; best-effort. See benchmarks/README.md.
@@ -667,7 +696,7 @@ increment_from_block = 9046800  # = cohort_maxt_from_block (both flip at the eve
 # Do NOT type "v2" / a block after the rollover here: it breaks that ordering
 # (apply_activation refuses it) and would move live pre-v2 era-king
 # settlements back to level units (2026-10-20 review; DEC-CA-0039 note).
-cohort_maxt_increment_from_block = 0
+cohort_maxt_increment_from_block = 9136800   # DECIDED rollover typed (what apply_activation sets)
 # Multivariate scoring activation (DEC-CA-0041): from this block a multivariate
 # window's channels are averaged into ONE per-window contribution (GIFT-Eval
 # weighting — the window counts once, not once per channel), so the round point
@@ -717,12 +746,12 @@ margin_v2_from_block    = 9194400   # TYPED 2026-11-01 (DEC-CA-0067): = the bloc
 # pinned). Must equal [round] rolling_from_block and be >=
 # cohort_maxt_increment_from_block >= cohort_maxt_from_block (load-checked).
 # 0 = off (bit-identical to the ungated validator).
-era_king_from_block = 0
+era_king_from_block = 9136800   # DECIDED rollover typed
 # Tenure / ripeness in BLOCKS from the rollover (CONSENSUS): the margin decay
 # and the promotion clock keep their wall-time length across the 3600 → 900
 # grid switch instead of running 4× faster. Both *_blocks values are inert
 # until tenure_blocks_from_block is set (= ROLLOVER).
-tenure_blocks_from_block = 0
+tenure_blocks_from_block = 9136800   # DECIDED rollover typed
 margin_warmup_blocks = 28800     # = 8 rounds × 3600 blocks (~4 d) — same decay as today
 cascade_reign_blocks = 18000     # = 5 rounds × 3600 blocks (~2.5 d) — same ripeness as today
 king_resync_max_blocks = 18000   # = king_resync_max_rounds (5) × 3600 blocks — same valve as today
@@ -1098,7 +1127,9 @@ dormant_after_blocks = 0
 [v2]
 launch_at_utc = "2026-10-30T12:00:00Z"
 commit_open_at_utc = "2026-10-30T09:00:00Z"  # V2 reveals queue here; training waits for v2
-commit_from_block = 0  # resolved from finalized timestamps, or explicitly pinned by operator
+# Pinned 2026-11-13: block 9395601 is the first finalized block at/after
+# commit_open_at_utc (stamped 2026-10-30T09:00:00Z; archive read).
+commit_from_block = 9395601
 prelaunch_burn_readiness = "r2"
 # cascade v2 (DEC-CA-0050): Cascade-MOE-28M king lineage (lane A) + the
 # domain-expert lane (lane B). Finalized chain timestamps resolve launch_at_utc
@@ -1110,7 +1141,10 @@ prelaunch_burn_readiness = "r2"
 # router bites once the routing gate opens, receipts stamp `v2_block`, and
 # lane A keeps 100 % until another lane launches. Planned order: C first
 # (A/C 75/25), then B (A/B/C 50/25/25); activation remains separate for each.
-from_block = 0
+# Pinned 2026-11-13 = what launch_at_utc resolved to: the 12:00:00Z crossing is
+# block 9396501, the next era start on the decided grid is 9136800 + 73×3600.
+# With both blocks typed a restart reads no historical timestamps (no archive).
+from_block = 9399600
 # Rides the same go-live (DEC-CA-0054): every v2 settlement enforces the
 # bench gate (the mode; the RULE is DEC-CA-0054's three suites + six-number
 # geomean only until bench_gate_v2_from_block below, which on mainnet is the
@@ -1176,6 +1210,11 @@ reign_warm_start_blocks = 21600
 # to burn_uid (miners keep their split of the rest); it ends at the first v2
 # settlement. prelaunch_burn_from_block = <block> types it instead (override).
 prelaunch_burn = 0.95
+# DECIDED (prelaunch-95-r2: lock 9486000 → 9486900, the block every node seen
+# carries); typed 2026-11-13 (owner go). Behaviour-identical: the burn applies
+# only before the first v2 settlement (emission_policy), and v2 is active from
+# 9399600 < 9486900, so it never applied — typing frees the note segment.
+prelaunch_burn_from_block = 9486900
 # The carried (toto2) king's court is paid at most 5 % of total emissions from
 # the v2 block until a king is crowned at a v2 settlement (lane B unchanged).
 carryover_king_share = 0.05
@@ -1196,7 +1235,7 @@ king_ladder = true
 # so a worker-image repin keeps the carried king and the finished legs. 0 =
 # decided on chain; a typed era-start block is the owner override. Repin the
 # image only AFTER the switch era has started.
-image_decoupled_from_block = 0
+image_decoupled_from_block = 9493200   # TYPED 2026-11-13 (DEC-CA-0067): = the block the v2b-69630f92 vote resolved (locked in at 9486000, 85.9% of stake, applied at the era start 9493200 = Thu 12 Nov 22:23 UTC) — behaviour-identical; frees its note segment. Without it a validator whose rolling-era-king vote is still signalled overflows the 128-byte note and REFUSES to start (seen 2026-11-13 00:13 UTC).
 # Bundled with the same block (part of the vote's hash): the v2 private
 # verdict budget becomes this many windows. Inert until the switch.
 eval_n_windows_after = 4000
@@ -1325,7 +1364,12 @@ router_lr_scale = 0.1
 route_bias_rate_scale = 0.25
 # Fit the existing 50B unique-corpus cap; the full reference preset is 27,500.
 training_steps = 23841
-train_image_digest = "sha256:2fd193cad6be7bef87f110246a2074de84cde44511e153a21d1d0301d93cba64"
+# Mid-run continuation snapshots (live on the trainer since 2026-11-13 20:42).
+# Runtime-only (manifest.IMAGE_RUNTIME_FIELDS): excluded from the numerics
+# digest validators check; each leg's own protocol is proven per entry via
+# CONTINUATION_PROTOCOLS, so legs trained with or without it both verify.
+continuation_protocol = "cascade-continuation/1"
+train_image_digest = "sha256:5d41d94bc0c0d3ae3dfd042b0cc7e4d900c7d1f48173808436c12bf764a67641"   # rc15, LIVE since 2026-10-31 (was rc11 2fd193ca…); synced to main 2026-11-13
 expected_gpu = ""
 long_series = "crop"
 power_ema_scope = "leg"

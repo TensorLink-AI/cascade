@@ -314,8 +314,76 @@ class WeightsMixin:
         eb = int(effective_epoch_blocks(self.cfg.round, int(cur)))
         return int(cur) // eb * eb
 
+    def _weights_keepalive_tick(self) -> None:
+        """Freshness push DURING a long blocking step (the validator-bench
+        sweep, up to hours): re-push EXACTLY the last vector that landed on
+        chain — nothing recomputed from state, so it is safe mid-settlement
+        (an open settlement transaction is never read) and cannot move the
+        throne. Same cadence and retry rules as :meth:`_maybe_reassert_weights`.
+        Skipped when the metagraph changed under a paid uid (a re-registered
+        uid must never inherit the old vector), when uid count changed, under
+        ``force_burn``, or before this process has pushed once. Never raises
+        into the caller (the offload wrapper also guards it)."""
+        client = getattr(self, "_keepalive_client", None)
+        last = getattr(self, "_last_pushed", None)
+        if client is None or last is None or self.cfg.validator.force_burn:
+            return
+        interval = int(self.cfg.validator.weight_set_interval_blocks)
+        if interval <= 0 or self._last_weight_block is None:
+            return
+        cur = int(client.current_block())  # type: ignore[attr-defined]
+        if cur - self._last_weight_block < interval:
+            return
+        failed_at = getattr(self, "_keepalive_retry_from", None)
+        if failed_at is not None and cur - failed_at < WEIGHT_RETRY_BLOCKS:
+            return
+        vec, paid = last
+        n = int(client.n_uids())  # type: ignore[attr-defined]
+        if n != len(vec):
+            log.warning("weight keep-alive skipped: uid count %d != last vector's %d "
+                        "(the next poll re-asserts from state)", n, len(vec))
+            self._last_pushed = None
+            return
+        hotkeys = list(client.registered_hotkeys())  # type: ignore[attr-defined]
+        moved = [u for u, hk in paid.items() if u >= len(hotkeys) or hotkeys[u] != hk]
+        if moved:
+            log.warning("weight keep-alive skipped: paid uid(s) %s changed hotkey since the "
+                        "last push (the next poll re-asserts from state)", moved)
+            self._last_pushed = None
+            return
+        log.info("weight keep-alive during a long step (last set %d blocks ago, block %d): "
+                 "re-pushing the last vector %s", cur - self._last_weight_block, cur,
+                 {u: round(w, 4) for u, w in enumerate(vec) if w > 0})
+        if client.set_weight_vector(list(vec)) is False:  # type: ignore[attr-defined]
+            log.warning("weight keep-alive NOT accepted; retried in %d blocks",
+                        WEIGHT_RETRY_BLOCKS)
+            self._keepalive_retry_from = cur
+            return
+        self._keepalive_retry_from = None
+        with contextlib.suppress(Exception):
+            self._last_weight_block = int(client.current_block())  # type: ignore[attr-defined]
+
     def _apply_weights(self, client: object, round_id: str, reward_uids: list[int], *,
                        boundary: int | None = None) -> tuple[float, ...]:
+        """:meth:`_apply_weights_inner`, remembering the vector that LANDED
+        (with the hotkeys it paid) for :meth:`_weights_keepalive_tick`."""
+        before = self._last_weight_block
+        vec = self._apply_weights_inner(client, round_id, reward_uids, boundary=boundary)
+        if vec and self._last_weight_block is not None and self._last_weight_block != before:
+            self._keepalive_client = client
+            try:
+                hotkeys = list(client.registered_hotkeys())  # type: ignore[attr-defined]
+                burn = int(self.cfg.scoring.burn_uid)
+                paid = {u: hotkeys[u] for u, w in enumerate(vec)
+                        if w > 0 and u != burn and u < len(hotkeys)}
+                self._last_pushed = (tuple(float(w) for w in vec), paid)
+            except Exception as e:  # noqa: BLE001 — keep-alive is best-effort
+                log.debug("weight keep-alive snapshot unavailable: %s", e)
+                self._last_pushed = None
+        return vec
+
+    def _apply_weights_inner(self, client: object, round_id: str, reward_uids: list[int], *,
+                             boundary: int | None = None) -> tuple[float, ...]:
         """Set the equal-share weight vector on chain; return it (empty on failure).
 
         Shared by the scored path and the king-resync path. Always sets weights —
@@ -454,16 +522,23 @@ class WeightsMixin:
                           c_slot_frac=(dict(pay_c["slot_frac"]) if pay_c is not None else None))
         vec = tuple(emission_vector(a, b if (pay is not None or pay_c is not None) else None,
                                     policy, burn_uid=burn, lane_a_uids=reward_uids))
-        if client.set_weight_vector(list(vec)) is False:  # type: ignore[attr-defined]
-            return self._weights_not_set(round_id)
-        self._last_lane_b_pay = pay
-        self._last_lane_c_pay = pay_c
+        # The emission record (policy + this settlement's ladder step, incl. the
+        # reign clock a king check was judged from) describes what the round
+        # DECIDED, not whether the chain took the push — so it is stamped
+        # before the push. 2026-11-16 round 10613571513987485143: the
+        # settlement's push hit the 100-block rate limit (a re-assert had
+        # landed 44 blocks earlier) and the receipt went out with a king check
+        # but no ladder, which the audit cannot replay ("no reign clock").
         ladder = getattr(self, "_settlement_ladder", None)
         if not policy.inert:
             self._last_emission = emission_record(
                 policy, boundary=boundary, king_since_block=self.state.king_since_block,
                 ladder=(ladder[1] if ladder is not None and ladder[0] == str(round_id)
                         else None))
+        if client.set_weight_vector(list(vec)) is False:  # type: ignore[attr-defined]
+            return self._weights_not_set(round_id)
+        self._last_lane_b_pay = pay
+        self._last_lane_c_pay = pay_c
         log.info("round=%s weights set under the DEC-CA-0055 policy %s: %s", round_id,
                  policy.as_record(), {u: round(w, 4) for u, w in enumerate(vec) if w > 0})
         with contextlib.suppress(Exception):

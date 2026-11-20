@@ -561,6 +561,9 @@ def test_cmd_duel_prints_the_breakdown(monkeypatch, cfg, capsys):
     monkeypatch.setattr(cli, "load_chain_config", lambda *_a, **_k: cfg)
     monkeypatch.setattr("cascade.miner.dashboard.fetch_public_receipt_index",
                         lambda *_a, **_k: {"rounds": [_duel_row("10")]})
+    # the public-bench receipt fetch stays offline in tests
+    monkeypatch.setattr("cascade.miner.dashboard.fetch_bench_receipt",
+                        lambda *_a, **_k: (None, None))
     args = types.SimpleNamespace(chain_toml=None, round_id=None, history=False, limit=20)
     assert cli._cmd_duel(args) == 0
     assert "DETHRONED" in capsys.readouterr().out

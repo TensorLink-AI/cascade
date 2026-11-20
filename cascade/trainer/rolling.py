@@ -3512,6 +3512,16 @@ class RollingScheduler:
             listed = list(report.budget_deferred) + [
                 f for f in report.infra_failed
                 if str(f.get("role", "challenger") or "challenger") == "challenger"]
+            # A KING / init sweep that failed (infra, or a king's checkpoint
+            # fault — infra by rule) leaves EVERY clearer of that settlement
+            # without a computable gate: each was skipped, never judged. Carry
+            # the settlement's swept challengers too (2026-11-15: 5GMz cleared
+            # the private pool at lcb +0.143, the king's sweep failed on a full
+            # bench disk, and the clearer was silently dropped).
+            if any(str(f.get("role", "") or "") in ("king", "init")
+                   for f in tuple(report.infra_failed) + tuple(report.checkpoint_fault)):
+                listed += [{"trained_pointer": e.trained_pointer, "role": "challenger"}
+                           for e in report.entries if str(e.role) == "challenger"]
             for d in listed:
                 ptr = str(d.get("trained_pointer", ""))
                 f = by_ptr.get(ptr)
@@ -3523,8 +3533,9 @@ class RollingScheduler:
                                 "after %d carr%s — not carried (skipped, never a loss)",
                                 f.hotkey[:12], rid, n, "y" if n == 1 else "ies")
                     continue
-                why = ("infra-failed" if report.infra_reason(ptr) is not None
-                       and report.deferred_reason(ptr) is None else "budget-deferred")
+                why = ("budget-deferred" if report.deferred_reason(ptr) is not None
+                       else "infra-failed" if report.infra_reason(ptr) is not None
+                       else "king-sweep-infra")
                 log.info("rolling: carrying %s's %s leg (report %s, carry %d/%d)",
                          f.hotkey[:12], why, rid, n + 1, VBENCH_MAX_CARRIES)
                 out.append(f)

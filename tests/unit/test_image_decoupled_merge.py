@@ -68,7 +68,9 @@ def test_pre_lock_receipts_carry_no_switch_and_match_the_v3_golden():
 
     from .receipt_fixture import make_scored_receipt
 
-    runner = ValidatorRunner(cfg=load_chain_config(REPO / "chain.toml"))
+    release = load_chain_config(REPO / "chain.toml")
+    untyped = replace(release, v2=replace(release.v2, image_decoupled_from_block=0))
+    runner = ValidatorRunner(cfg=untyped)
     assert runner.image_decoupled_block == 0                    # nothing locked, nothing typed
     receipt, _, _ = make_scored_receipt()
     stamped = replace(receipt, image_decoupled_block=runner.image_decoupled_block)
@@ -100,11 +102,12 @@ def test_option_b_drops_the_prelaunch_segment_and_option_a_still_needed(tmp_path
     release = load_chain_config(REPO / "chain.toml")
     assert A.v2b_note_problem(release, rec, head_block=9_420_000) == ""
     assert A.v2b_note_problem(_retired(release), rec, head_block=9_420_000) == ""
-    both = A.own_signal_payload(_retired(release), rec, None, None, A.ActivationRecord(), None,
+    open_vote = replace(release, v2=replace(release.v2, image_decoupled_from_block=0))
+    both = A.own_signal_payload(_retired(open_vote), rec, None, None, A.ActivationRecord(), None,
                                 None, A.ActivationRecord(feature=V2B, lock_block=9504000,
                                                          activation_block=9507600,
                                                          source="tally"))
-    assert both.endswith(f":{V2B}:9504000:9507600") and "prelaunch-" not in both
+    assert f":{V2B}:9504000:9507600:" in both + ":" and "prelaunch-" not in both
 
 
 def test_retiring_a_locked_prelaunch_vote_is_refused():
@@ -155,7 +158,8 @@ def test_startup_warns_for_every_segment_the_note_would_trim(tmp_path, caplog):
     cfg = replace(cfg, v2=replace(cfg.v2, image_decoupled_from_block=9504000))
     rec, fr, mr = _live_records()
     assert A.v2b_note_problem(cfg, rec, fr, mr) == ""
-    assert A.note_trimmed_segments(cfg, rec, fr, mr) == ["prelaunch-95-r2"]
+    # (the newer DEC-CA-0068 "lad-" segment goes first; the prelaunch one follows)
+    assert "prelaunch-95-r2" in A.note_trimmed_segments(cfg, rec, fr, mr)
     with caplog.at_level(logging.WARNING, logger="cascade.validator"):
         _startup(cfg, tmp_path)
     assert any("STARTUP" in r.getMessage() and "'prelaunch-95-r2'" in r.getMessage()
@@ -169,10 +173,15 @@ def test_note_parts_refactor_keeps_the_note_bytes(tmp_path):
     """own_signal_payload is built from _own_note_parts: same note as the
     trim of the parts, for every shape the tests above use."""
     rec, fr, mr = _live_records()
-    for cfg in (_untyped_blocks(tmp_path), load_chain_config(REPO / "chain.toml")):
+    untyped = _untyped_blocks(tmp_path)
+    for cfg in (untyped, load_chain_config(REPO / "chain.toml")):
         for rf, rm in ((fr, mr), (None, None)):
             note = A.own_signal_payload(cfg, rec, rf, rm, A.ActivationRecord())
-            head, extras, tail = A._own_note_parts(cfg, rec, rf, rm, A.ActivationRecord())
+            parts = A._own_note_parts(cfg, rec, rf, rm, A.ActivationRecord())
+            if parts is None:      # every vote typed (release since 2026-11-13): no note
+                assert cfg is not untyped and note is None
+                continue
+            head, extras, tail = parts
             dropped = A.note_trimmed_segments(cfg, rec, rf, rm, A.ActivationRecord())
             kept = [s for s in extras if s.feature not in dropped]
             assert note == A.format_signals(head, *kept, *tail)

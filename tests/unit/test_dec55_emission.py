@@ -29,6 +29,8 @@ ROOT = Path(__file__).resolve().parents[2]
 @pytest.fixture(scope="module")
 def typed():
     cfg = load_chain_config(ROOT / "chain.toml")
+    # the live cadence, with the burn VOTE reopened (typed 2026-11-13)
+    cfg = replace(cfg, v2=replace(cfg.v2, prelaunch_burn_from_block=0))
     era = cfg.round.epoch_blocks * cfg.round.era_settlements
     gate = 10_000 * era
     cfg = replace(cfg, v2=replace(cfg.v2, from_block=gate),

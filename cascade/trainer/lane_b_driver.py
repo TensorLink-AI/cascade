@@ -1469,11 +1469,16 @@ class RunnerLaneBOps:
         # boundary (ValidatorRunner._evaluate(block=)) — the self-judge must
         # score exactly as the fleet will.
         quantile_head = bool(cfg.quantile_head_at(int(block)))
+        # DEC-CA-0068: the validator's decode batch at the same boundary
+        from ..shared.config import shared_ladder_quantile_batch
+
+        qbatch = shared_ladder_quantile_batch(cfg.eval, int(block)) if quantile_head else 1
 
         def _eval(pointer: str):
             return evaluate_checkpoint(self.fetch(pointer), windows,
                                        num_samples=cfg.eval.num_samples, device=self.device,
-                                       contract=contract, quantile_head=quantile_head)
+                                       contract=contract, quantile_head=quantile_head,
+                                       quantile_batch=qbatch)
 
         return judge_manifest(manifest, king_pointer=manifest.king_pointer,
                               king_scores=_eval(manifest.king_pointer), evaluate=_eval,
@@ -1486,10 +1491,14 @@ class RunnerLaneBOps:
 
         cfg = self.r.cfg
         windows = verdict_windows(cfg, self.source, int(block), block=int(block))
+        from ..shared.config import shared_ladder_quantile_batch
+
+        quantile_head = bool(cfg.quantile_head_at(int(block)))
         return evaluate_checkpoint(
             self.fetch(pointer), windows, num_samples=cfg.eval.num_samples,
             device=self.device, contract=cfg.training.at_block(int(block)).primary_size,
-            quantile_head=bool(cfg.quantile_head_at(int(block))))
+            quantile_head=quantile_head,
+            quantile_batch=shared_ladder_quantile_batch(cfg.eval, int(block)) if quantile_head else 1)
 
 
 def lane_b_queue_of(runner):

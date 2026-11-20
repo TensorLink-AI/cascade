@@ -15,20 +15,21 @@ import pytest
 
 from cascade.miner.training_context import UnresolvedLaunch, configured_context
 from cascade.miner.verify import VerifyReport
-from cascade.shared.config import load_chain_config, parse_chain_config
+from cascade.shared.config import parse_chain_config
 from cascade.shared.manifest import TrainedEntry, contract_digest
 from cascade.shared.netconfig import effective_raw
 from cascade.trainer import sandbox as sandbox_mod
 from cascade.trainer.corpus import CorpusError
 from cascade.trainer.worker import _pod_fault
+from tests.unit.predecision_main import predecision_main, predecision_path
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def _shipped_with_main_validator():
-    """chain.toml as shipped (dated launch, from_block 0) plus the one key the
-    operator must type before launch, so the v2 config loads."""
-    cfg = load_chain_config(ROOT / "chain.toml")
+def _shipped_with_main_validator(tmp_path):
+    """chain.toml as shipped before 2026-11-13 (dated launch, from_block 0) plus
+    the one key the operator must type before launch, so the v2 config loads."""
+    cfg = predecision_main(tmp_path)
     raw = effective_raw(cfg)
     raw["netconfig"]["owner_hotkey"] = cfg.manifest.validator_hotkey
     return parse_chain_config(raw)
@@ -36,8 +37,8 @@ def _shipped_with_main_validator():
 
 # ── miner tooling judges admission the way the trainer does ──────────────────
 
-def test_at_block_cannot_pin_an_unresolved_dated_launch_offline():
-    shipped = load_chain_config(ROOT / "chain.toml")
+def test_at_block_cannot_pin_an_unresolved_dated_launch_offline(tmp_path):
+    shipped = predecision_main(tmp_path)  # dated-launch scenario: the pre-2026-11-13 file
     with pytest.raises(UnresolvedLaunch, match="--at-block"):
         configured_context(shipped, 9_999_999)
     assert configured_context(shipped, None).training.base_arch == shipped.training.base_arch
@@ -45,11 +46,13 @@ def test_at_block_cannot_pin_an_unresolved_dated_launch_offline():
     assert configured_context(typed, 43200 + 1).training is not None
 
 
-def test_verify_at_block_is_a_usage_error_while_the_launch_is_dated(example_generator_dir, capsys):
+def test_verify_at_block_is_a_usage_error_while_the_launch_is_dated(example_generator_dir, capsys,
+                                                                   tmp_path):
     from cascade.miner.cli import main
 
+    # dated-launch scenario: the pre-2026-11-13 file
     rc = main(["verify", str(example_generator_dir), "--quick", "--at-block", "9999999",
-               "--json", "--chain-toml", str(ROOT / "chain.toml")])
+               "--json", "--chain-toml", str(predecision_path(tmp_path))])
     doc = json.loads(capsys.readouterr().out)
     assert rc == 2 and doc["exit_code"] == 2
     assert doc["error"]["code"] == "launch_unresolved"
@@ -110,8 +113,8 @@ def test_a_generator_printing_unshare_errors_cannot_relabel_its_own_crash(monkey
 
 # ── an enforced gate refuses a capped sweep however it is configured ─────────
 
-def test_capped_sweep_is_refused_while_the_launch_is_still_dated():
-    cfg = load_chain_config(ROOT / "chain.toml")
+def test_capped_sweep_is_refused_while_the_launch_is_still_dated(tmp_path):
+    cfg = predecision_main(tmp_path)  # dated-launch scenario: the pre-2026-11-13 file
     raw = effective_raw(cfg)
     raw["netconfig"]["owner_hotkey"] = cfg.manifest.validator_hotkey
     raw["eval"]["cascade_bench_max_series"] = 3
@@ -120,10 +123,10 @@ def test_capped_sweep_is_refused_while_the_launch_is_still_dated():
         parse_chain_config(raw)
 
 
-def test_an_overlay_cannot_cap_the_sweep_or_dodge_the_check_by_reverting_the_rule():
+def test_an_overlay_cannot_cap_the_sweep_or_dodge_the_check_by_reverting_the_rule(tmp_path):
     from cascade.shared.netconfig import NetConfigError, build_config
 
-    base = _shipped_with_main_validator()
+    base = _shipped_with_main_validator(tmp_path)
     network = {"netuid": base.subnet.netuid, "chain": base.netconfig.network_id}
     era = base.round.epoch_blocks * base.round.era_settlements
 

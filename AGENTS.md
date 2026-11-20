@@ -279,7 +279,7 @@ All read-only or local:
 | `cascade status --json` | Fresh lane rules, current warm-start init, budgets and queue snapshots |
 | `cascade status --hotkey HK --lane a --ref REF --intake URL --json` | Exact submission stage, retries, later-round eligibility and next action; poll every 30–60 seconds |
 | `cascade round --once` | Block, epoch and countdown to the next settlement |
-| `cascade duel [--hotkey HK] [--history]` | Settled verdicts, per-domain scores |
+| `cascade duel [--hotkey HK] [--history] [--all-datasets]` | Settled verdicts, per-domain scores, public-benchmark check per suite and per dataset ([MINER.md](docs/MINER.md#watching-it)) |
 | `cascade queue [--hotkey HK]` | Funded roster |
 | `cascade reveal-status HK` | Has a reveal landed in time? |
 | `cascade direct status [--hotkey HK]` | Direct-MoE round, king, cohort and your jobs |

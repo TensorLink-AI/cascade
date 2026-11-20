@@ -64,12 +64,13 @@ WORKER_PROBE = (
     "from cascade.shared.config.training import TrainingContractConfig as T\n"
     "from cascade.validator import private_worker as w\n"
     "print(json.dumps({'contract_fields': [f.name for f in dataclasses.fields(T)],\n"
-    "                  'schemas': [getattr(w, 'SCHEMA', ''), getattr(w, 'SCHEMA_QUANTILES', '')]}))\n"
+    "                  'schemas': [getattr(w, 'SCHEMA', ''), getattr(w, 'SCHEMA_QUANTILES', ''),\n"
+    "                              getattr(w, 'SCHEMA_QUANTILES_BATCHED', '')]}))\n"
 )
 
 
 def check_private_worker(host, contract, *, quantile_levels=None, run=None,
-                         timeout_s=WORKER_PROBE_SECONDS) -> None:
+                         timeout_s=WORKER_PROBE_SECONDS, quantile_batch=1) -> None:
     """Refuse before any upload when ``host`` provably cannot serve this request.
 
     The worker rebuilds the contract with ``TrainingContractConfig(**fields)``,
@@ -101,8 +102,14 @@ def check_private_worker(host, contract, *, quantile_levels=None, run=None,
     local_fields = set(asdict(contract))
     missing = sorted(local_fields - remote_fields)
     needs_quantiles = quantile_levels is not None
-    from .private_worker import SCHEMA_QUANTILES
+    from .private_worker import SCHEMA_QUANTILES, SCHEMA_QUANTILES_BATCHED
 
+    needs_batched = needs_quantiles and int(quantile_batch) > 1
+    if needs_batched and SCHEMA_QUANTILES_BATCHED not in remote_schemas:
+        log.error("private eval host %s cannot decode in fixed batches (DEC-CA-0068 "
+                  "shared ladder, batch %d) — deploy this validator's release to the host; "
+                  "the round holds until then", host.name, int(quantile_batch))
+        raise PrivateEvalUnavailable("private evaluation worker is out of date")
     if missing or (needs_quantiles and SCHEMA_QUANTILES not in remote_schemas):
         log.error("private eval host %s runs code older than this validator (contract fields "
                   "it lacks: %s; quantile requests supported: %s) — deploy this validator's "
@@ -155,7 +162,8 @@ def _stderr_tail(proc) -> str:
 
 
 def forecasts_via_host(host, checkpoint, windows, *, contract, num_samples,
-                       workers=1, timeout_s=3600, runner=None, quantile_levels=None):
+                       workers=1, timeout_s=3600, runner=None, quantile_levels=None,
+                       quantile_batch=1):
     """Send only histories to an explicitly configured operator-owned host.
 
     Score returned samples locally against the original targets. A missing,
@@ -195,13 +203,14 @@ def forecasts_via_host(host, checkpoint, windows, *, contract, num_samples,
     try:
         check_private_worker(host, contract, quantile_levels=quantile_levels, run=run,
                              timeout_s=max(1, min(WORKER_PROBE_SECONDS,
-                                                  deadline - time.monotonic())))
+                                                  deadline - time.monotonic())),
+                             quantile_batch=quantile_batch)
         local = Path(tmpdir.name)
         request = local / "request.npz"
         hashes = checkpoint_hashes(Path(checkpoint))
         identity = write_request(request, checkpoint, windows, contract=contract,
                                  num_samples=num_samples, quantile_levels=quantile_levels,
-                                 hashes=hashes)
+                                 hashes=hashes, quantile_batch=quantile_batch)
         key = private_cache_key(hashes)
         cache_root = f"{host.workdir}/{PRIVATE_CACHE_DIR}"
         cached = f"{cache_root}/{key}"
@@ -213,6 +222,14 @@ def forecasts_via_host(host, checkpoint, windows, *, contract, num_samples,
                      key[:16], host.name)
         else:
             started = time.monotonic()
+            # count-pruned cache (PRIVATE_CACHE_KEEP) is not a byte budget: evict
+            # LRU entries until this upload + headroom fits, or hold loudly
+            need = (sum((Path(checkpoint) / n).stat().st_size for n in CHECKPOINT_FILES)
+                    + BENCH_DISK_HEADROOM_BYTES)
+            room = step(build_ssh_argv(host, bench_make_room_command(cache_root, [key], need)),
+                        "cache space check")
+            if not _room_ok(host, room, need, f"the private upload of {key[:16]}"):
+                raise PrivateEvalUnavailable("private evaluation host disk short")
             step(build_ssh_argv(host, f"umask 077 && mkdir -p {shlex.quote(part)}"),
                  "cache setup")
             for name in CHECKPOINT_FILES:
@@ -432,6 +449,171 @@ def _cacheable(ckpt_dir: str | Path) -> bool:
     return name.startswith("sha256-") and len(name) > len("sha256-") + 16
 
 
+# Free bytes the pod must keep beyond an upload (and before the sidecar runs):
+# its report, logs and dataset-cache writes. 2026-11-15: a count-only cache
+# (6 × 4.6 GB on a 43 GB disk) filled the bench pod, the KING sweep died with
+# "sidecar produced no report" and a +0.14 LCB clearer was judged infra.
+BENCH_DISK_HEADROOM_BYTES = 4 << 30
+# Run dirs (``_eval_offload/<name>-<uuid>``) older than this are abandoned
+# (a killed validator never reached its ``finally``) and are removed.
+BENCH_STALE_RUN_MINUTES = 24 * 60
+# Every offloaded sweep's raw sidecar reports + stderr are kept on THIS box
+# (the run dir on the pod is deleted after the reports are read). A suite that
+# comes back partial / errored is otherwise unexplainable after the fact
+# (2026-11-16: a pool clearer was held INFRA on "gift-eval:partial" twice and
+# the skipped configs + reasons were lost). Operator-local evidence only —
+# never read by scoring, so no consensus effect. Relative to the validator's
+# cwd unless CASCADE_BENCH_EVIDENCE_DIR is set; the newest
+# BENCH_EVIDENCE_KEEP sweeps are kept.
+BENCH_EVIDENCE_DIR_ENV = "CASCADE_BENCH_EVIDENCE_DIR"
+BENCH_EVIDENCE_DEFAULT_DIR = "_bench_evidence"
+BENCH_EVIDENCE_KEEP = 60
+BENCH_EVIDENCE_STDERR_MAX = 2 << 20
+# How many skipped configs a sweep's warning names (the file has them all).
+BENCH_SKIP_LOG_MAX = 8
+# While the sidecar runs, ``on_wait`` (the validator's weight keep-alive) is
+# called this often so a multi-hour sweep never starves the weight loop.
+BENCH_WAIT_TICK_SECONDS = 60.0
+
+
+def run_ssh_ticking(argv: list[str], timeout: float, tick: Callable[[], None],
+                    every: float = BENCH_WAIT_TICK_SECONDS):
+    """:func:`run_ssh` that calls ``tick()`` every ``every`` seconds while the
+    command runs. Same result (a text-mode ``CompletedProcess``) and the same
+    ``subprocess.TimeoutExpired`` past ``timeout`` (the child is killed). A
+    raising ``tick`` is logged and ignored — it can never fail the command."""
+    import subprocess
+
+    end = time.monotonic() + max(0.0, float(timeout))
+    with subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, text=True) as proc:
+        while True:
+            left = end - time.monotonic()
+            if left <= 0:
+                proc.kill()
+                out, err = proc.communicate()
+                raise subprocess.TimeoutExpired(argv, timeout, output=out, stderr=err)
+            try:
+                out, err = proc.communicate(timeout=min(every, left))
+            except subprocess.TimeoutExpired:
+                try:
+                    tick()
+                except Exception as e:  # noqa: BLE001 — a tick never fails the sweep
+                    log.warning("eval-offload: wait tick failed: %s", e)
+                continue
+            return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+
+
+def bench_report_problems(report: dict | None) -> list[str]:
+    """Human-readable problems in one sidecar report: a suite whose status is
+    not ``ok``, or any skipped config (``full`` / ``stage`` / ``reason``).
+    FEV's declared multivariate scope skips (``stage == "scope"``) are not
+    problems. ``["no report"]`` for ``None``. Never raises."""
+    if report is None:
+        return ["no report"]
+    out: list[str] = []
+    try:
+        for s in report.get("suites", []) or []:
+            name = s.get("suite")
+            if s.get("status") != "ok":
+                detail = str(s.get("detail") or "").strip().splitlines()
+                out.append(f"{name}: status={s.get('status')}"
+                           + (f" ({detail[0][:200]})" if detail else ""))
+            for k in s.get("skipped") or []:
+                if isinstance(k, dict):
+                    if name == "fev" and k.get("stage") == "scope":
+                        continue
+                    out.append(f"{name}: skipped {k.get('full')} at {k.get('stage')}: "
+                               f"{str(k.get('reason'))[:200]}")
+                else:
+                    out.append(f"{name}: skipped {str(k)[:200]}")
+    except Exception as e:  # noqa: BLE001 — evidence must never fail a sweep
+        out.append(f"unparseable report: {e}")
+    return out
+
+
+def record_bench_evidence(label: str, *, reports: list[dict | None], proc=None,
+                          note: str = "", root: str | Path | None = None) -> Path | None:
+    """Write one sweep's evidence (raw reports, the sidecar's exit code and
+    stderr, a problems summary) to ``<root>/<utc>-<label>.json`` and prune to
+    the newest :data:`BENCH_EVIDENCE_KEEP`. Logs a WARNING naming the first
+    skipped configs when any report has problems. Returns the path, or
+    ``None`` when nothing could be written. Never raises."""
+    import datetime
+    import os
+
+    try:
+        problems = [f"report {i}: {p}" for i, r in enumerate(reports)
+                    for p in bench_report_problems(r)]
+        stderr = str(getattr(proc, "stderr", "") or "") if proc is not None else ""
+        if problems:
+            log.warning("eval-offload: sweep %s has %d problem(s): %s%s", label,
+                        len(problems), "; ".join(problems[:BENCH_SKIP_LOG_MAX]),
+                        " …" if len(problems) > BENCH_SKIP_LOG_MAX else "")
+            tail = stderr.strip()[-STEP_STDERR_TAIL:]
+            if tail:
+                log.warning("eval-offload: sweep %s sidecar stderr tail: %s", label, tail)
+        base = Path(root or os.environ.get(BENCH_EVIDENCE_DIR_ENV) or BENCH_EVIDENCE_DEFAULT_DIR)
+        base.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%SZ")
+        safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in label)[:120]
+        path = base / f"{stamp}-{safe}-{uuid.uuid4().hex[:6]}.json"
+        payload = {
+            "label": label, "note": note, "problems": problems,
+            "returncode": getattr(proc, "returncode", None) if proc is not None else None,
+            "stderr": stderr[-BENCH_EVIDENCE_STDERR_MAX:],
+            "reports": reports,
+        }
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, default=str))
+        tmp.replace(path)
+        kept = sorted(base.glob("*.json"), key=lambda p: p.name, reverse=True)
+        for old in kept[BENCH_EVIDENCE_KEEP:]:
+            with contextlib.suppress(OSError):
+                old.unlink()
+        return path
+    except Exception as e:  # noqa: BLE001 — evidence must never fail a sweep
+        log.warning("eval-offload: could not record bench evidence for %s: %s", label, e)
+        return None
+_FREE_TAG = "CASCADE_FREE="
+
+
+def bench_make_room_command(cache: str, keep: list[str], need_bytes: int) -> str:
+    """Shell (run on the pod) that evicts least-recently-used cached
+    checkpoints — never one in ``keep`` nor an in-flight ``.part-`` upload —
+    until the cache's filesystem has ``need_bytes`` free, then prints
+    ``CASCADE_FREE=<bytes>``. Cache hits ``touch`` their dir, so mtime is LRU."""
+    excl = " ".join(f"-e {shlex.quote(k)}" for k in keep if k) or "-e ''"
+    avail = "df -PB1 . | awk 'NR==2{print $4}'"
+    return (f"cd {shlex.quote(cache)} && while :; do f=$({avail}); "
+            f"[ \"${{f:-0}}\" -ge {int(need_bytes)} ] && break; "
+            f"v=$(ls -1tr | grep -v -e '\\.part-' | grep -vxF {excl} | head -n 1); "
+            "[ -n \"$v\" ] || break; rm -rf -- \"$v\"; done; "
+            f"echo {_FREE_TAG}$({avail})")
+
+
+def bench_free_bytes(stdout: str | None) -> int | None:
+    """The ``CASCADE_FREE=`` figure a make-room step printed (``None`` when
+    absent or unparseable — the caller then proceeds, as before this guard)."""
+    for line in reversed(str(stdout or "").splitlines()):
+        if line.startswith(_FREE_TAG):
+            try:
+                return int(line[len(_FREE_TAG):].strip())
+            except ValueError:
+                return None
+    return None
+
+
+def _room_ok(host: RemoteHost, proc, need_bytes: int, what: str) -> bool:
+    free = bench_free_bytes(getattr(proc, "stdout", ""))
+    if getattr(proc, "returncode", 1) != 0 or free is None or free >= need_bytes:
+        return True
+    log.error("BENCH DISK SHORT on %s before %s: %.1f GB free after evicting the "
+              "bench cache, need %.1f GB — clean the pod (non-cascade files?) "
+              "and re-run the settlement", host.name, what, free / 1e9, need_bytes / 1e9)
+    return False
+
+
 def build_bench_remote_command(
     host: RemoteHost, remote_ckpt: str, remote_report: str, *,
     suites: str, num_samples: int = 100, batch_size: int = 512, max_series: int = 0,
@@ -501,7 +683,8 @@ def run_bench_via_host_many(
     num_samples: int = 100, batch_size: int = 512, max_series: int = 0,
     datasets: str = "", data_dir: str | None = None, device: str = "cuda",
     timeout_s: int = 3600, runner=None, workers: str | int | None = None,
-    upload_timeout_s: int | None = None,
+    upload_timeout_s: int | None = None, on_wait: Callable[[], None] | None = None,
+    evidence_label: str = "",
 ) -> list[dict | None]:
     """:func:`run_bench_via_host` for several checkpoints in ONE paired
     sidecar pass on the pod (``--extra-checkpoint``) — one report (or
@@ -513,7 +696,12 @@ def run_bench_via_host_many(
     retried settlement does not upload again. The upload has its own budget
     (``upload_timeout_s``, default :data:`BENCH_UPLOAD_SECONDS_PER_CKPT` per
     checkpoint); ``timeout_s`` is the benchmark's, counted from when the
-    uploads finish."""
+    uploads finish.
+
+    ``on_wait`` (no ``runner`` only) is called every
+    :data:`BENCH_WAIT_TICK_SECONDS` while the sidecar runs — the validator's
+    weight keep-alive. Whatever comes back (reports, exit code, stderr) is
+    kept by :func:`record_bench_evidence` under ``evidence_label``."""
     run = runner or run_ssh
     n = len(ckpt_dirs)
     out: list[dict | None] = [None] * n
@@ -543,9 +731,13 @@ def run_bench_via_host_many(
         # prep: the run dir, the cache, and a prune of old cache entries /
         # abandoned partial uploads (never the ones this sweep uses)
         keep = " ".join(f"-e {shlex.quote(k)}" for k in keys if k) or "-e ''"
+        parent = f"{host.workdir}/_eval_offload"
         prune = (f"cd {shlex.quote(cache)} && rm -rf -- *.part-* && "
                  f"ls -1t | grep -vxF {keep} | tail -n +{BENCH_CACHE_KEEP} "
-                 "| xargs -r rm -rf --")
+                 "| xargs -r rm -rf -- ; "
+                 f"find {shlex.quote(parent)} -mindepth 1 -maxdepth 1 ! -name cache "
+                 f"! -path {shlex.quote(base)} -mmin +{BENCH_STALE_RUN_MINUTES} "
+                 "-exec rm -rf -- {} +")
         prep = step(build_ssh_argv(
             host, f"rm -rf {shlex.quote(base)} && mkdir -p {shlex.quote(base)} "
             + " ".join(shlex.quote(c) for k, c in zip(keys, ckpts, strict=True) if not k)
@@ -572,6 +764,10 @@ def run_bench_via_host_many(
                     log.info("eval-offload: %s already on %s — upload skipped",
                              key[-24:], host.name)
                     continue
+            need = sum(f.stat().st_size for f in files) + BENCH_DISK_HEADROOM_BYTES
+            room = step(build_ssh_argv(host, bench_make_room_command(cache, keys, need)), 300)
+            if not _room_ok(host, room, need, f"uploading {Path(str(local)).name[-24:]}"):
+                return out
             dest = f"{remote}.part-{tag}" if key else remote
             if key:
                 mk = step(build_ssh_argv(host, f"mkdir -p {shlex.quote(dest)}"), 60)
@@ -599,6 +795,10 @@ def run_bench_via_host_many(
                     log.warning("eval-offload cache publish failed on %s: %s", host.name,
                                 (fin.stderr or "")[-200:])
                     return out
+        room = step(build_ssh_argv(
+            host, bench_make_room_command(cache, keys, BENCH_DISK_HEADROOM_BYTES)), 300)
+        if not _room_ok(host, room, BENCH_DISK_HEADROOM_BYTES, "the benchmark"):
+            return out
         # the benchmark's own budget starts now, not at the first scp
         deadline = time.monotonic() + timeout_s
         cmd = build_bench_remote_command(
@@ -608,10 +808,20 @@ def run_bench_via_host_many(
             extra=tuple(zip(ckpts[1:], reports[1:], strict=True)),
             timeout_s=max(1, int(deadline - time.monotonic()) - 15),
         )
-        proc = step(build_ssh_argv(host, cmd))
+        label = evidence_label or "+".join(Path(str(d)).name[-24:] for d in ckpt_dirs)
+        bench_argv = build_ssh_argv(host, cmd)
+        if on_wait is not None and runner is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("public benchmark offload deadline expired")
+            proc = run_ssh_ticking(bench_argv, remaining, on_wait)
+        else:
+            proc = step(bench_argv)
         if proc.returncode != 0:
             log.warning("eval-offload benchmark (%s) failed on %s (exit %s): %s",
                         suites, host.name, proc.returncode, (proc.stderr or "")[-400:])
+            record_bench_evidence(label, reports=list(out), proc=proc,
+                                  note=f"sidecar exit {proc.returncode} on {host.name}")
             return out
         for i, rep in enumerate(reports):
             deadline = max(deadline, time.monotonic() + 120)
@@ -621,9 +831,12 @@ def run_bench_via_host_many(
                             (cat.stderr or "")[-200:])
                 continue
             out[i] = json.loads(cat.stdout)
+        record_bench_evidence(label, reports=list(out), proc=proc, note=f"on {host.name}")
         return out
     except Exception as e:  # noqa: BLE001 — an eval helper must never raise into a round
         log.warning("eval-offload errored on %s: %s", host.name, e)
+        record_bench_evidence(evidence_label or "sweep", reports=[None] * n,
+                              note=f"errored on {host.name}: {type(e).__name__}: {e}")
         return [None] * n
     finally:
         with contextlib.suppress(Exception):

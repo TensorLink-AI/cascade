@@ -27,6 +27,7 @@ from cascade.validator.cascade import CascadeController, CascadeState
 from cascade.validator.loop import ValidatorRunner
 from cascade.validator.state import ChampionState
 
+from .predecision_main import predecision_path
 from .receipt_fixture import make_scores
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -56,7 +57,8 @@ class _Client:
 
 @pytest.fixture
 def env(tmp_path):
-    cfg = load_chain_config(ROOT / "chain.toml")
+    # hypothetical v2 gate at 10_000 eras: built on the pre-decision release
+    cfg = load_chain_config(predecision_path(tmp_path))
     era = era_length_blocks(cfg.round, 0)
     gate = 10_000 * era
     cfg = replace(cfg, v2=replace(cfg.v2, from_block=gate),

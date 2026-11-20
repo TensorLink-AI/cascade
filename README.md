@@ -233,7 +233,7 @@ Start with `cascade --help`; each command also has `--help` and JSON output.
 | `cascade submit`, `deploy`, `fund` | Lane A publication/commitment/funding workflows |
 | `cascade lane-b fund`, `lane-c upload`, `lane-c commit`, `lane-c fund` | Specialist/application participation; explicit paid-action consent where required |
 | `cascade status --hotkey ... --lane ... --ref ...` | Track the exact entry and its scientific progress |
-| `cascade round`, `queue`, `duel`, `reveal-status`, `fetch` | Clock, roster, settled verdicts, reveal checks and public artifacts |
+| `cascade round`, `queue`, `duel`, `reveal-status`, `fetch` | Clock, roster, settled verdicts (including the public-benchmark breakdown per suite and dataset), reveal checks and public artifacts |
 
 All existing CLI entry points and flags remain available. See
 [AGENTS.md](AGENTS.md#output-contract) for the JSON envelope and exit codes.

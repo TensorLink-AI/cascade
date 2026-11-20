@@ -18,13 +18,13 @@ from cascade.shared.calendar_launch import (
     launch_timestamp,
     resolve_calendar_launch,
 )
-from cascade.shared.config import load_chain_config
+from tests.unit.predecision_main import predecision_main
 
 
-def test_opening_and_launch_resolve_independently_for_live_and_late_nodes():
+def test_opening_and_launch_resolve_independently_for_live_and_late_nodes(tmp_path):
     from tests.unit.test_calendar_launch import _chain
 
-    cfg = load_chain_config()
+    cfg = predecision_main(tmp_path)  # dated-launch scenario: the pre-2026-11-13 file
     launch = launch_timestamp(cfg.v2.launch_at_utc)
     assert launch - launch_timestamp(cfg.v2.commit_open_at_utc) == 3 * 3600
     before = resolve_calendar_launch(cfg, _chain(launch, 29100))
@@ -168,11 +168,11 @@ def test_cli_treats_unknown_launch_rules_as_retryable_without_hiding_the_code(mo
     assert calls[0][0][0] == "launch_rules_unavailable" and calls[0][0][2] == 3
 
 
-def test_running_intake_remembers_opening_when_the_node_later_prunes_it():
+def test_running_intake_remembers_opening_when_the_node_later_prunes_it(tmp_path):
     from cascade.funding.main import ChainLaunchAdmission
     from tests.unit.test_calendar_launch import _chain
 
-    cfg = load_chain_config()
+    cfg = predecision_main(tmp_path)  # dated-launch scenario: the pre-2026-11-13 file
     target = launch_timestamp(cfg.v2.launch_at_utc)
     chain = _chain(target, 29101)
     admission = ChainLaunchAdmission(cfg, chain)

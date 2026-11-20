@@ -9,6 +9,7 @@ One folder per reign, oldest first. `champions/king` is the sitting king; this a
 | 3 | [`03-5ChSeTyWeKrj`](03-5ChSeTyWeKrj/) | 86 | `5ChSeTyWeKrj…` | 2026-07-30 06:36 | 4 | `buddy777/gen-76e283f5465a@sha256:a4e1ca5889c0cb8` | 0 |
 | 4 | [`04-5EHRZQYxSe7v`](04-5EHRZQYxSe7v/) | 158 | `5EHRZQYxSe7v…` | 2026-07-31 02:06 | 14 | `foreverking/gen-174dcba780e5@hf:ad5b79f60fa56ea4` | 0 |
 | 5 | [`05-5HKdGFgsyBC4`](05-5HKdGFgsyBC4/) | 246 | `5HKdGFgsyBC4…` | 2026-08-02 13:52 | 6 | `rltrainer/gen33@sha256:6996d9f0f7e3e402001fe96d7` | 0 |
+| 6 | [`06-5G6jNi6YAWfD`](06-5G6jNi6YAWfD/) | 164 | `5G6jNi6YAWfD…` | 2026-11-18 07:34 | 1 | `vault/direct@sha256:52af214e50b4a8da9535ec2fba73` | 0 |
 | 6 | [`06-5G8nFYRp9XCj`](06-5G8nFYRp9XCj/) | 49 | `5G8nFYRp9XCj…` | 2026-08-03 14:04 | 20 | `angry-bird/gen-d79b2f553e11@hf:71076df6e00a9c7b4` | 0 |
 | 7 | [`07-5HpRNHE8keQr`](07-5HpRNHE8keQr/) | 31 | `5HpRNHE8keQr…` | 2026-08-08 14:40 | 8 | `cascade-private/gen334@sha256:05e741f76e4fe83ca4` | 0 |
 | 8 | [`08-5FdwqFmr6Wtf`](08-5FdwqFmr6Wtf/) | 124 | `5FdwqFmr6Wtf…` | 2026-08-10 14:28 | 21 | `garuda-labs/gen-04f5171856b6@hf:1ebecb706d193f1b` | 0 |

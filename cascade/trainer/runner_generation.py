@@ -194,6 +194,10 @@ class _GenerationMixin:
                 ssh_key_path=key, ssh_pubkey=pub.read_text(encoding="utf-8").strip(),
                 vm_image=self.cfg.generation.vm_image,
                 ledger_path=self._generation_vm_ledger(),
+                # boot-failed offers stay quarantined across trainer restarts
+                offer_quarantine_path=Path(self.work_root) / "generation_offer_quarantine.json",
+                boot_fail_cooldown_s=float(self.cfg.generation.boot_fail_cooldown_seconds),
+                exclude_offers=tuple(self.cfg.generation.exclude_offers),
                 capacity_wait_s=self.GENERATION_CAPACITY_WAIT_SECONDS,
                 observer=self._observe_generation)
             self.__dict__["_generation_stage_obj"] = stage

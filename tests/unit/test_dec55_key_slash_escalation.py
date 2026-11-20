@@ -19,7 +19,8 @@ from cascade.shared.emission import KeySlash, key_slash_step
 from cascade.shared.settlement_state import settlement_state
 from cascade.validator.state import ChampionState, apply_forfeit, dumps, loads
 
-from .test_dec55_validator import KING, ROOT, _Client, _manifest, _receipt, _runner
+from .predecision_main import predecision_main
+from .test_dec55_validator import KING, _Client, _manifest, _receipt, _runner
 
 LANE_A = 0.5            # lane A's pool on this config (lane B live)
 
@@ -27,10 +28,10 @@ LANE_A = 0.5            # lane A's pool on this config (lane B live)
 @pytest.fixture
 def env(tmp_path):
     """The DEC-CA-0055 validator fixture (``test_dec55_validator.env``)."""
-    from cascade.shared.config import load_chain_config
     from cascade.shared.era import era_length_blocks
 
-    cfg = load_chain_config(ROOT / "chain.toml")
+    # synthetic v2 gate on the pre-decision main (no typed rollover / v2 launch)
+    cfg = predecision_main(tmp_path)
     era = era_length_blocks(cfg.round, 0)
     gate = 10_000 * era
     cfg = replace(cfg, v2=replace(cfg.v2, from_block=gate),

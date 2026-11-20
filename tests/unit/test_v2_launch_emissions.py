@@ -25,7 +25,8 @@ def typed():
     gate = 10_000 * era
     # the shipped DEC-CA-0055 timing keys zeroed: each test arms what it models
     cfg = replace(cfg, v2=replace(cfg.v2, from_block=gate, random_init_eras=0,
-                                  reign_warm_start_blocks=0),
+                                  reign_warm_start_blocks=0,
+                                  prelaunch_burn_from_block=0),   # typed 2026-11-13: the vote reopened
                   training=replace(cfg.training, v2_from_block=gate))
     return cfg, gate, era
 
@@ -72,11 +73,22 @@ def test_carried_king_is_capped_until_a_v2_crowning(typed):
     assert emission_policy(cfg, boundary=mid + era, king_since_block=mid).inert
 
 
-def test_inert_by_default():
+def test_inert_by_default(tmp_path):
+    from tests.unit.predecision_main import predecision_main
+
+    # main before 2026-11-13: v2 untyped and the burn not yet voted ⇒ inert
+    before = predecision_main(tmp_path)
+    assert before.v2.prelaunch_burn_from_block == 0
+    assert emission_policy(before, boundary=10**9, king_since_block=None).inert
+    # 2026-11-13: main types v2 at 9399600 ⇒ inert through the settlement AT the
+    # block, then a pre-v2 king is capped at the carryover share
     cfg = load_chain_config(ROOT / "chain.toml")
-    # the shipped chain.toml: v2 untyped and the burn not yet voted ⇒ inert
-    assert cfg.v2.prelaunch_burn_from_block == 0
-    assert emission_policy(cfg, boundary=10**9, king_since_block=None).inert
+    # the decided burn block is typed, but it follows the v2 block: never applies
+    assert cfg.v2.prelaunch_burn_from_block == 9486900 > cfg.v2.from_block
+    assert emission_policy(cfg, boundary=9399600, king_since_block=None).inert
+    assert (emission_policy(cfg, boundary=10**9, king_since_block=None)
+            == EmissionPolicy(lane_a_cap=cfg.v2.carryover_king_share) and not
+            emission_policy(cfg, boundary=10**9, king_since_block=None).inert)
     assert apply_emission_policy([1.0, 0.0], EmissionPolicy(), burn_uid=0) == [1.0, 0.0]
 
 

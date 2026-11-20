@@ -138,7 +138,45 @@ def load_quantile_forecaster(
                 f"({expect[0]}, {expect[1]}, num_q)")
         return arr[:, :, picks].reshape(expect[0], expect[1], n_q)
 
+    def quantile_batch_fn(histories: list, horizon: int) -> np.ndarray:
+        """DEC-CA-0068: ONE forward over several UNIVARIATE windows (rows =
+        windows) → ``(B, H, num_q)``. A one-row call is exactly
+        ``quantile_fn``'s call on a univariate window."""
+        rows = [np.asarray(h, dtype=np.float64).reshape(-1) for h in histories]
+        try:
+            arr = np.asarray(batch_fn(rows, int(horizon)), dtype=np.float64)
+        except Exception as e:  # noqa: BLE001 — as quantile_fn
+            raise EvaluatorError(
+                f"quantile_head_forward_failed: {type(e).__name__}: {e}") from e
+        if arr.ndim != 3 or arr.shape[:2] != (len(rows), int(horizon)):
+            raise EvaluatorError(
+                f"wrapper.forecast_quantiles_batch returned {arr.shape}; expected "
+                f"({len(rows)}, {int(horizon)}, num_q)")
+        return arr[:, :, picks].reshape(len(rows), int(horizon), n_q)
+
+    quantile_fn.batch = quantile_batch_fn  # type: ignore[attr-defined]
     return quantile_fn
+
+
+def quantile_chunks(horizons, channels, batch: int) -> list[list[int]]:
+    """CONSENSUS (DEC-CA-0068): the fixed batch composition of a batched
+    quantile decode — window indices in order, cut into runs of at most
+    ``batch`` CONSECUTIVE univariate windows sharing one horizon. A
+    multichannel window is its own chunk (its channels are already the
+    batch). ``batch <= 1`` ⇒ one window per chunk (the pre-rule decode).
+    Deterministic in the inputs alone: it never depends on workers, devices
+    or timing, so every replay batches exactly the same windows together."""
+    if len(horizons) != len(channels):
+        raise ValueError("horizons / channels length mismatch")
+    batch = max(1, int(batch))
+    out: list[list[int]] = []
+    for i, (h, c) in enumerate(zip(horizons, channels, strict=True)):
+        if (batch > 1 and int(c) == 1 and out and len(out[-1]) < batch
+                and int(horizons[out[-1][0]]) == int(h) and int(channels[out[-1][0]]) == 1):
+            out[-1].append(i)
+        else:
+            out.append([i])
+    return out
 
 
 def load_forecaster(
@@ -206,6 +244,7 @@ def evaluate_checkpoint(
     trust_checkpoint_code: bool = False,
     workers: int = 1,
     quantile_head: bool = False,
+    quantile_batch: int = 1,
 ) -> list[WindowScore]:
     """Load the checkpoint and score it on ``windows``. Convenience wrapper over
     :func:`load_forecaster` + :func:`score_joint_forecaster_on_windows`.
@@ -219,10 +258,13 @@ def evaluate_checkpoint(
     unused (no Monte-Carlo step). False is byte-identical to before the knob."""
     if quantile_head:
         levels = DEFAULT_QUANTILE_LEVELS
-        if workers > 1:
+        if workers > 1 or int(quantile_batch) > 1:
+            # DEC-CA-0068: a batched decode goes through the chunked path even
+            # with one worker (the chunk composition is the rule's)
             scores = forecast_checkpoint_windows(
                 checkpoint_dir, [w.history for w in windows], [w.horizon for w in windows],
-                num_samples=num_samples, device=device, contract=contract, workers=workers,
+                num_samples=num_samples, device=device, contract=contract,
+                workers=max(1, workers), quantile_batch=int(quantile_batch),
                 trust_checkpoint_code=trust_checkpoint_code, quantile_levels=levels,
                 _transform=lambda i, q: score_joint_quantile_forecaster_on_windows(
                     lambda *_: q, [windows[i]], levels))
@@ -247,7 +289,8 @@ def evaluate_checkpoint(
 def forecast_checkpoint_windows(checkpoint_dir, histories, horizons, *, num_samples: int,
                                 device: str = "cpu", contract=None, workers: int = 1,
                                 trust_checkpoint_code: bool = False,
-                                _transform=None, quantile_levels=None) -> list:
+                                _transform=None, quantile_levels=None,
+                                quantile_batch: int = 1) -> list:
     """Parallel independent windows without changing a model's batch or RNG.
 
     Each worker owns a wrapper; no mutable model cache is shared between
@@ -257,6 +300,11 @@ def forecast_checkpoint_windows(checkpoint_dir, histories, horizons, *, num_samp
     ``quantile_levels`` set ⇒ the quantile-head path: each result is the
     window's ``(C, H, num_q)`` quantiles at those levels
     (:func:`load_quantile_forecaster`); ``num_samples`` is then only validated.
+
+    ``quantile_batch > 1`` (DEC-CA-0068, quantile path only) ⇒ the work units
+    are :func:`quantile_chunks` — fixed runs of consecutive univariate windows
+    of one horizon, each decoded in ONE forward; the composition never depends
+    on the worker count, so ``workers`` only parallelises whole chunks.
     """
     import queue
     from concurrent.futures import ThreadPoolExecutor
@@ -281,21 +329,33 @@ def forecast_checkpoint_windows(checkpoint_dir, histories, horizons, *, num_samp
             checkpoint_dir, device=devices[i % len(devices)], contract=contract,
             trust_checkpoint_code=trust_checkpoint_code) for i in range(count)]
     pending = queue.Queue()
-    for i in range(len(histories)):
-        pending.put(i)
+    batched = quantile_levels is not None and int(quantile_batch) > 1
+    if batched:
+        channels = [int(np.atleast_2d(np.asarray(h)).shape[0]) for h in histories]
+        for chunk in quantile_chunks(horizons, channels, int(quantile_batch)):
+            pending.put(chunk)
+    else:
+        for i in range(len(histories)):
+            pending.put([i])
     results = [None] * len(histories)
 
     def run(forecaster):
         while True:
             try:
-                i = pending.get_nowait()
+                chunk = pending.get_nowait()
             except queue.Empty:
                 return
-            if quantile_levels is not None:
-                sample = forecaster(histories[i], int(horizons[i]))
+            if batched and (len(chunk) > 1 or channels[chunk[0]] == 1):
+                rows = [np.atleast_2d(np.asarray(histories[i], dtype=np.float64))[0]
+                        for i in chunk]
+                arr = forecaster.batch(rows, int(horizons[chunk[0]]))
+                outs = [arr[j : j + 1] for j in range(len(chunk))]       # (1, H, nq) each
+            elif quantile_levels is not None:
+                outs = [forecaster(histories[chunk[0]], int(horizons[chunk[0]]))]
             else:
-                sample = forecaster(histories[i], int(horizons[i]), num_samples)
-            results[i] = _transform(i, sample) if _transform is not None else sample
+                outs = [forecaster(histories[chunk[0]], int(horizons[chunk[0]]), num_samples)]
+            for i, sample in zip(chunk, outs, strict=True):
+                results[i] = _transform(i, sample) if _transform is not None else sample
 
     with ThreadPoolExecutor(max_workers=count, thread_name_prefix="private-eval") as pool:
         # Consume every future: a failed window cannot silently disappear.
