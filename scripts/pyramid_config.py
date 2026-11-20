@@ -92,6 +92,7 @@ def local_config(size, template=None):
     raw["v2"].update(from_block=0, launch_at_utc="", commit_open_at_utc="", commit_from_block=0)
     raw["lane_b"]["from_block"] = 0
     raw["lane_c"]["from_block"] = 0
+    raw["marketcast"]["from_block"] = 0
     raw["netconfig"]["owner_hotkey"] = ""
     raw["round"].update(screen_size=raw["training"]["arch_preset"],
                         throne_sizes=[raw["training"]["arch_preset"]])

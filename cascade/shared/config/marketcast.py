@@ -394,6 +394,13 @@ class MarketCastConfig:
     # "<bucket>/<prefix>/" on the [storage] S3 endpoint, read with the
     # HIPPIUS_S3_* credentials; "" = off (the pod fetches the API itself)
     bar_relay: str = ""
+    # the worker image MarketCast legs boot (trainer-only, release-only): a
+    # "<repo>:<tag>@sha256:<64 hex>" ref with its worker_code_fingerprint
+    # (scripts/worker_code_fingerprint.py), both or neither. Set, every
+    # MarketCast leg rents and code-checks on these pins while every other leg
+    # keeps [round] funded_pod_image / worker_code_fingerprint; "" = the fleet's.
+    pod_image: str = ""
+    worker_code_fingerprint: str = ""
     # the leg splits each recipe batch into micro-batches of at most this many
     # context steps (batch x context_length) and accumulates their gradients
     # (release-only): any recipe the bounds admit fits a 16 GB card (measured
@@ -870,6 +877,16 @@ def parse_marketcast(raw: object) -> MarketCastConfig:
     mbt = _num(mc.get("micro_batch_tokens", 524_288), "micro_batch_tokens", integer=True)
     if mbt < 1:
         raise ValueError(f"[marketcast] micro_batch_tokens must be >= 1; got {mbt}")
+    pod_image = str(mc.get("pod_image", "") or "")
+    wcf = str(mc.get("worker_code_fingerprint", "") or "").lower()
+    if bool(pod_image) != bool(wcf):
+        raise ValueError("[marketcast] pod_image and worker_code_fingerprint are set together "
+                         "(both or neither)")
+    if pod_image and not re.search(r"@sha256:[0-9a-f]{64}$", pod_image):
+        raise ValueError(f"[marketcast] pod_image must be pinned by digest "
+                         f"('<repo>:<tag>@sha256:<64 hex>'); got {pod_image!r}")
+    if wcf and not re.fullmatch(r"[0-9a-f]{64}", wcf):
+        raise ValueError(f"[marketcast] worker_code_fingerprint must be 64 hex; got {wcf!r}")
     if bar_relay and ("/" not in bar_relay.strip("/") or not bar_relay.endswith("/")):
         raise ValueError(f"[marketcast] bar_relay must be '<bucket>/<prefix>/'; got {bar_relay!r}")
     if crps_scale not in CRPS_SCALES:
@@ -995,6 +1012,7 @@ def parse_marketcast(raw: object) -> MarketCastConfig:
         report_timeout_settlements=rto, max_infra_deferrals=mid,
         cluster_block_hours=cbh, min_time_blocks=mtb,
         min_bar_coverage=mbc, min_dollar_volume_24h=mdv, coverage_tolerance_over=tov, crps_scale=crps_scale, bar_relay=bar_relay,
+        pod_image=pod_image, worker_code_fingerprint=wcf,
         micro_batch_tokens=mbt,
         coverage_gate_levels=cgl, zero_scale_frac=zsf, cell_ratio_cap=cap, tail_levels=tls,
         tail_tolerance=ttol, calibration_z=cz, near_dup_tol=ndt,

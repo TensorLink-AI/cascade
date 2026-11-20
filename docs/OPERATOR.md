@@ -2584,10 +2584,19 @@ hold a pod, the provisioner rents a cheap one on demand:
 # provision.toml (beside the validator)
 mkt_hosts_path  = "/root/cascade/mkt_hosts.toml"
 mkt_lease_hours = 3.0
+[provisioner]
+image = "<[marketcast] pod_image from chain.toml>"   # NOT the fleet's funded_pod_image
 [provisioner.mkt]
-sku = "NVIDIA GeForce RTX 3090"; market_sku = "RTX 3090"
+sku = "NVIDIA GeForce RTX 3090"; market_sku = "RTX3090"   # Lium's listing name: no space
 max_pods = 1; providers = ["lium"]; max_price_hr = 0.40
 ```
+
+The pod runs `cascade.validator.mkt_worker`, which only ships in the
+MarketCast release, so this provisioner boots `[marketcast] pod_image` (the
+image the trainer's MarketCast legs use; lane A and king legs keep `[round]
+funded_pod_image`). Run it as its own provisioner if this box's provisioner
+also serves stages on the fleet image. With `[marketcast] pod_image` empty,
+use the fleet image only when that image already carries MarketCast.
 
 ```bash
 cascade-validator ... --mkt-eval-hosts /root/cascade/mkt_hosts.toml   # --mkt-host-wait 1800

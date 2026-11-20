@@ -216,3 +216,20 @@ def test_feeds_back_off_on_429_and_5xx_only():
         F.with_backoff(lambda: (n.append(1), (_ for _ in ()).throw(_http(429)))[1],
                        attempts=3, sleep=lambda s: None)
     assert len(n) == 3
+
+
+def test_bar_relay_reads_its_own_creds_when_set(monkeypatch):
+    """The recorder's bucket need not share the trainer's manifest creds:
+    ``MKT_BARS_S3_*`` when set, else ``HIPPIUS_S3_*``."""
+    from types import SimpleNamespace
+
+    from cascade.trainer.marketcast_runner import mkt_bars_store
+
+    st = SimpleNamespace(s3_endpoint="https://s3.example", s3_region="r")
+    monkeypatch.delenv("MKT_BARS_S3_ACCESS_KEY", raising=False)
+    c = mkt_bars_store(st, "bars-bucket").cfg
+    assert (c.access_key_env, c.secret_key_env) == ("HIPPIUS_S3_ACCESS_KEY", "HIPPIUS_S3_SECRET_KEY")
+    monkeypatch.setenv("MKT_BARS_S3_ACCESS_KEY", "x")
+    c = mkt_bars_store(st, "bars-bucket").cfg
+    assert (c.access_key_env, c.secret_key_env) == ("MKT_BARS_S3_ACCESS_KEY", "MKT_BARS_S3_SECRET_KEY")
+    assert (c.endpoint, c.region, c.bucket) == ("https://s3.example", "r", "bars-bucket")

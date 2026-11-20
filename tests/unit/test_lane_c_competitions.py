@@ -347,6 +347,9 @@ def test_loader_refuses_a_non_boundary_until_block(tmp_path):
 # ── the shipped tomls: MarketCast only, weight 1, exactly as before ──────────
 
 
+SHIPPED_MKT_FROM = {"chain.toml": 9579600, "chain.testnet.toml": 0}
+
+
 def test_shipped_tomls_are_marketcast_only_weight_one_and_unchanged():
     for f in ("chain.toml", "chain.testnet.toml"):
         c = load_chain_config(ROOT / f)
@@ -370,9 +373,13 @@ def test_shipped_tomls_are_marketcast_only_weight_one_and_unchanged():
             want = armed.share * (rec["wins"][0]["multiplier"] if rec["wins"] else 0.0)
             assert bool(rec["wins"]) == (live and block < 4 * ERA + 28 * ERA)   # TTL
             assert v[1] == pytest.approx(want) and sum(v) == pytest.approx(armed.share)
-        # MarketCast off (the shipped state): nothing active at any block
-        for block in (0, 7201, 10**9):
+        # the shipped state: nothing active before [marketcast] from_block
+        # (owner 2026-11-20: mainnet arms at 9579600; testnet ships off)
+        fb = SHIPPED_MKT_FROM[f]
+        for block in (0, 7201, *((fb - 1,) if fb else ()), *(() if fb else (10**9,))):
             assert lane_c_split(lc, block, ERA, c.marketcast)[1] == {}
+        if fb:
+            assert lane_c_split(lc, fb, ERA, c.marketcast)[1] == {MKT: 1.0}
 
 
 # ── overlay (DEC-CA-0057) ────────────────────────────────────────────────────

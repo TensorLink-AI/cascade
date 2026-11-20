@@ -26,10 +26,18 @@ SUITES = ("returns", "vol")
 ROOT = Path(__file__).resolve().parents[2]
 
 
+SHIPPED_FROM = {"chain.toml": 9579600, "chain.testnet.toml": 0}
+
+
 def test_shipped_configs_are_inert_with_the_defaults():
     for f in ("chain.toml", "chain.testnet.toml"):
         lc = load_chain_config(ROOT / f).lane_c
-        assert lc.from_block == 0 and not lc.active(10**12)
+        # owner 2026-11-20: mainnet arms lane C at 9579600 (an era boundary);
+        # testnet ships it off
+        fb = SHIPPED_FROM[f]
+        assert lc.from_block == fb and lc.active(10**12) == bool(fb)
+        if fb:
+            assert not lc.active(fb - 1) and not lc.active(fb) and lc.active(fb + 1)
         assert lc.share == 0.25 and lc.remainder == "burn"
         assert lc.takes_from == ("lane_a" if f == "chain.toml" else "lane_b")
         # owner 2026-11-10: the shipped lane C is ONE composite MarketCast slot;
@@ -60,18 +68,22 @@ def test_c_from_a_cannot_overallocate_the_remaining_pool():
     assert mainnet.lane_c.share == 0.25 and mainnet.lane_c.takes_from == "lane_a"
 
 
-def test_shipped_configs_load_with_marketcast_off_and_zero_active_slots():
-    """MarketCast off (from_block 0): the shipped mkt: targets load, count no
-    active slot at any block, so an armed lane C would burn its whole share."""
+def test_shipped_configs_count_no_active_slot_before_marketcast_arms():
+    """Before [marketcast] from_block (mainnet 9579600, owner 2026-11-20;
+    testnet off) the shipped mkt: targets load and count no active slot, so
+    lane C would burn its whole share; from it, the one composite slot."""
     for f in ("chain.toml", "chain.testnet.toml"):
         cfg = load_chain_config(ROOT / f)
-        assert cfg.marketcast.from_block == 0
+        fb = SHIPPED_FROM[f]
+        assert cfg.marketcast.from_block == fb
         from cascade.shared.config.marketcast import COMPOSITE_LAUNCH_SUITES
 
         assert tuple(cfg.marketcast.suites) == COMPOSITE_LAUNCH_SUITES
         assert cfg.marketcast.composite
-        for block in (0, 7201, 10**9):
+        for block in (0, 7201, *((fb - 1,) if fb else (10**9,))):
             assert active_targets(cfg.lane_c, block, cfg.marketcast) == ()
+        if fb:
+            assert active_targets(cfg.lane_c, fb, cfg.marketcast) == ("mkt:market",)
 
 
 def test_target_specs():
@@ -163,6 +175,7 @@ def test_loader_arms_lane_c_on_an_era_boundary(tmp_path):
     # Lane C takes its allocation from B, which now launches independently.
     raw["lane_b"]["from_block"] = v2
     raw["lane_c"]["from_block"] = v2 + era
+    raw["marketcast"]["from_block"] = 0             # lane C's own gate, MarketCast off
     armed = parse_chain_config(raw)
     assert armed.lane_c.from_block == v2 + era
     # The raw launch boundary is aligned; the effective B gate excludes
