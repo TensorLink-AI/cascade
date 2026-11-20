@@ -246,9 +246,15 @@ def test_check_recorded_when_not_due_fails(env):
     assert not v2_check_due(longer, boundary=b, reign_start_block=gate + era)
     row = check_king_check(rc, longer, {"report": _report()})
     assert row.status == FAIL and "not due" in row.detail
-    # a reign clock before the crowning is not the clock the validator read
-    row = check_king_check(_ladder(rc, reign_start_block=gate), cfg, {"report": _report()})
+    # a reign clock before the crowning is not the clock the validator read —
+    # once [scoring] crowning_anchor_from_block is in force for that crowning
+    # (DEC-CA-0069); before it the recorded crowning may be the known pre-fix
+    # re-anchor (one handled settlement late) and is not flagged
+    early = _ladder(rc, reign_start_block=gate)
+    fixed = replace(cfg, scoring=replace(cfg.scoring, crowning_anchor_from_block=gate))
+    row = check_king_check(early, fixed, {"report": _report()})
     assert row.status == FAIL and "precedes the crowning" in row.detail
+    assert "precedes the crowning" not in check_king_check(early, cfg, {"report": _report()}).detail
     row = check_king_check(_ladder(rc, reign_start_block=b + 1), cfg, {"report": _report()})
     assert row.status == FAIL and "after the settlement" in row.detail
 
