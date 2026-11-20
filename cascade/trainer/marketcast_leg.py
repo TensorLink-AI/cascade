@@ -249,50 +249,61 @@ class MktSampler:
     # arrays drawn looking for one that fits a batch's bar size
     SYN_PULLS = 32
 
-    def _syn_array(self) -> tuple[object, int | None]:
-        """The generator's next array and its bar size in minutes. Without
+    def _syn_arrays(self) -> list[tuple[object, int | None]]:
+        """The generator's next yield as ``[(array, bar minutes)]``. Without
         ``synthetic_channels`` that is the raw array, untagged (each row a
-        target series). With them it is ``{name: row}``, tagged by its
-        ``time`` row when that is a clock — finite, a constant whole-minute
-        step — else untagged with the row dropped (known rows missing)."""
+        target series). With them a ``(C, L)`` yield is cut into consecutive
+        groups of ``len(synthetic_channels)`` rows — the sandbox fixes ``C``
+        (``[generator] min_channels`` / ``max_channels``, 32 on mainnet), so
+        one yield carries ``C // n`` samples and its last ``C % n`` rows are
+        ignored — each ``{name: row}``, tagged by its ``time`` row when that
+        is a clock (finite, a constant whole-minute step), else untagged with
+        the row dropped (known rows missing)."""
         arr = np.asarray(next(self.synthetic), dtype=np.float64)
         chans = tuple(self.r.synthetic_channels)
         if not chans:
-            return arr, None
-        if arr.ndim == 1 and chans == ("target",):
+            return [(arr, None)]
+        if arr.ndim == 1:
             arr = arr.reshape(1, -1)
-        if arr.ndim != 2 or arr.shape[0] != len(chans):
+        n = len(chans)
+        if arr.ndim != 2 or arr.shape[0] < n:
             raise MktLegError(f"generator series has shape {arr.shape}; synthetic_channels "
-                              f"names {len(chans)} rows {list(chans)}")
-        named = dict(zip(chans, arr, strict=True))
+                              f"names {n} rows {list(chans)}")
+        out = []
+        for g in range(arr.shape[0] // n):
+            named = dict(zip(chans, arr[g * n:(g + 1) * n], strict=True))
+            out.append((named, self._clock_bar(named)))
+        return out
+
+    @staticmethod
+    def _clock_bar(named: dict) -> int | None:
         t = named.get("time")
         if t is None:
-            return named, None
+            return None
         d = np.diff(t)
         if (d.size and np.isfinite(t).all() and d[0] > 0
                 and np.allclose(d, d[0], rtol=0.0, atol=1e-3)
                 and abs(d[0] / 60.0 - round(d[0] / 60.0)) < 1e-6):
-            return named, int(round(d[0] / 60.0))
+            return int(round(d[0] / 60.0))
         named.pop("time")
-        return named, None
+        return None
 
     def _syn_take(self, f: int):
-        """An array usable at bar size ``f``: one tagged ``f`` or untagged,
-        held back or newly drawn; None when ``SYN_PULLS`` draws gave none."""
+        """A sample usable at bar size ``f``: one tagged ``f`` or untagged,
+        held back or newly drawn; None when ``SYN_PULLS`` yields gave none."""
         from collections import deque
 
         hold = self.__dict__.setdefault("_syn_hold", {})
-        for key in (f, None):
-            if hold.get(key):
-                return hold[key].popleft()
-        for _ in range(self.SYN_PULLS):
+        for _ in range(self.SYN_PULLS + 1):
+            for key in (f, None):
+                if hold.get(key):
+                    return hold[key].popleft()
             try:
-                a, bar = self._syn_array()
+                got = self._syn_arrays()
             except StopIteration as e:
                 raise MktLegError("the generator stopped producing series") from e
-            if bar in (f, None):
-                return a
-            hold.setdefault(bar, deque(maxlen=self.SYN_HOLD)).append(a)
+            for a, bar in got:
+                hold.setdefault(bar, deque(maxlen=self.SYN_HOLD)).append(a)
         return None
 
     def _synthetic(self, steps: int, f: int = 0):
@@ -316,7 +327,7 @@ class MktSampler:
             else:
                 if not self._synthetic_channels:
                     try:
-                        arr, _bar = self._syn_array()
+                        ((arr, _bar),) = self._syn_arrays()
                     except StopIteration as e:
                         raise MktLegError("the generator stopped producing series") from e
                     self._synthetic_channels.extend(arr if arr.ndim == 2 else [arr.reshape(-1)])

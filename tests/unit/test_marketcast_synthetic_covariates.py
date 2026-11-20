@@ -205,3 +205,17 @@ def test_untagged_arrays_serve_every_bar_size(tmp_path):
     s = L.MktSampler(r, MC, _snap(tmp_path), seed=5,
                      synthetic=iter([_arr(time=False) for _ in range(4000)]))
     assert {s.batch(4).freq_minutes for _ in range(12)} == {1, 5}
+
+
+def test_a_32_row_yield_is_cut_into_channel_groups(tmp_path):
+    """The sandbox fixes 32 rows per yield on mainnet: 3 names ⇒ 10 samples
+    from one yield, its last 2 rows ignored."""
+    L = pytest.importorskip("cascade.trainer.marketcast_leg")
+    one = np.concatenate([_tagged(1, 1000.0 + 100 * g) for g in range(10)]
+                         + [np.full((2, N), 9e9)])
+    assert one.shape == (32, N)
+    s = L.MktSampler(_parse(), MC, _snap(tmp_path), seed=5, synthetic=iter([one] * 50))
+    got = [s._syn_take(1) for _ in range(10)]
+    assert all(g is not None for g in got)
+    assert sorted(int(g["volume"][0]) for g in got) == [1000 + 100 * g for g in range(10)]
+    assert all(np.all(g["volume"] < 9e9) for g in got)   # the 2 spare rows never used

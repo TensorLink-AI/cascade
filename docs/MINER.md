@@ -1587,8 +1587,12 @@ an OPTIONAL generator:
 - `synthetic_channels` (optional) gives your generator's samples their own
   covariates. Without it, every row of a generated `(C, L)` array is a
   separate target series and synthetic samples carry NaN (missing)
-  covariates. With it, it names the rows of EVERY generated array, and each
-  array is one sample: row 0 must be `"target"`, the others any of your
+  covariates. With it, it names a GROUP of rows, and every yield is cut into
+  consecutive groups of that many rows, each one sample. The sandbox fixes
+  `C` (`[generator] min_channels` / `max_channels`: exactly 32 on mainnet)
+  and each series' length (`max_length` 4096, so a synthetic sample's
+  context is at most 4096 − horizon steps), so 4 names give 8 samples per
+  yield and 3 names give 10, with the last 2 rows ignored. In each group, row 0 must be `"target"`, the others any of your
   recipe's PAST covariates, plus optionally `"time"` (the unix start of each
   step), from which the known rows (`calendar`, `session`, `events`) are
   computed. The clock's step is the array's BAR SIZE: an array whose `time`
@@ -1598,8 +1602,11 @@ an OPTIONAL generator:
   with its known rows missing. A horizon that neither your generator's
   clocks nor any real series covers is not trained (never a failed leg). A
   covariate you list but do not generate is a NaN row; non-finite values are
-  missing; an array with the wrong number of rows fails the leg as your
-  fault. Generate the
+  missing; a yield with fewer rows than the names fails the leg as your
+  fault. The sandbox's channel-correlation gate (`channel_corr_mode`) is
+  telemetry only today (`"shadow"`); if it is ever set to `"enforce"`, a
+  yield with two near-identical rows (|corr| > `max_channel_corr`, 0.999) is
+  refused — a linear `time` row next to a smooth trending target can be. Generate the
   rows in the units the real rows use:
 
   | Row | Units |
