@@ -35,11 +35,18 @@ _LIVE_CREDENTIAL_ENV = (
 def _vote_pin_mode_is_per_test():
     """DEC-CA-0067: a test that runs a validator/trainer/audit ``main`` turns
     the process-wide vote-pin guard on; never leak it into the next test."""
-    from cascade.shared.config.loader import require_vote_pin, vote_pin_required
+    from cascade.shared.config.loader import (
+        allow_missing_shared_ladder,
+        missing_shared_ladder_allowed,
+        require_vote_pin,
+        vote_pin_required,
+    )
 
     before = vote_pin_required()
+    lad_before = missing_shared_ladder_allowed()
     yield
     require_vote_pin(before)
+    allow_missing_shared_ladder(lad_before)
 
 
 @pytest.fixture(autouse=True)
@@ -102,7 +109,7 @@ def _isolate_default_settlement_journal(tmp_path, monkeypatch):
 
 
 @pytest.fixture(scope="session")
-def cfg() -> ChainConfig:
+def cfg(tmp_path_factory) -> ChainConfig:
     """The mainnet template with its ENFORCING pins neutralized.
 
     chain.toml carries the real launch pins (expected_gpu, the worker-image
@@ -115,7 +122,14 @@ def cfg() -> ChainConfig:
     """
     from dataclasses import replace
 
-    c = load_chain_config(REPO_ROOT / "chain.toml")
+    from tests.unit.predecision_main import predecision_path
+
+    # The release TYPES the decided rollover (9136800) and the resolved v2
+    # launch (9399600) since 2026-11-13 — real-chain state, like the pins.
+    # Fixtures run on tiny fake block clocks, so they start from the release
+    # file with those blocks untyped (the vote/launch undecided), exactly the
+    # file every fixture ran on before. Shipped-file facts: load chain.toml.
+    c = load_chain_config(predecision_path(tmp_path_factory.mktemp("predecision")))
     # Tests using fake block clocks also reparse raw configuration (satellites,
     # overlays). Neutralize the real calendar there as well as on cfg.v2.
     import copy
@@ -127,12 +141,16 @@ def cfg() -> ChainConfig:
     raw["netconfig"]["owner_hotkey"] = ""
     raw["scoring"]["forfeit_from_block"] = 0        # DEC-CA-0067 typed blocks: see scoring=
     raw["scoring"]["margin_v2_from_block"] = 0
+    raw["v2"]["image_decoupled_from_block"] = 0     # the typed v2b switch: see v2=
     return replace(c, training=replace(c.training, expected_gpu="",
                                        train_image_digest=""),
                    raw=raw,
                    netconfig=replace(c.netconfig, owner_hotkey=""),
                    v2=replace(c.v2, launch_at_utc="", commit_open_at_utc="",
-                              commit_from_block=0, prelaunch_burn_readiness=""),
+                              commit_from_block=0, prelaunch_burn_readiness="",
+                              # the release types the decided v2b switch (real-
+                              # chain state); fixtures keep the vote undecided
+                              image_decoupled_from_block=0),
                    # corpus_target_points ships ARMED (DEC-CA-0031): a points-
                    # denominated drain would override every fixture's small
                    # corpus_n_series with a 67M-point draw. Tests that exercise

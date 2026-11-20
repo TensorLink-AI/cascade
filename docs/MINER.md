@@ -790,6 +790,7 @@ cascade round                 # next-boundary countdown, latest verdict, dethron
 cascade duel                  # the settled verdict: margin, geomeans, per-domain scores
 cascade duel --hotkey <you>   # + YOUR domains: where you beat the king and by how much
 cascade duel --hotkey <you> --history   # your gap vs the king per domain, per settlement
+cascade duel --all-datasets   # every dataset in the public-benchmark breakdown, not just the top 5
 ```
 
 `cascade duel --hotkey <you>` prints a `your domains` block: for every pool
@@ -800,6 +801,31 @@ strength. `--history` turns it into one line per settlement you were judged
 in, with a per-domain average at the bottom: the "am I getting better at web"
 view. The website's cohort panel shows the same per-domain gaps for every
 judged challenger.
+
+`cascade duel` also prints the **public benchmark check** for the latest
+judged challenger. That check can block a dethrone even after a private-pool
+win (rule: [DEC-CA-0061](../decisions/DEC-CA-0061-lane-a-four-suite-strict-gate.md)).
+It reads from the settled receipt and shows:
+
+- **Overall:** a `public bench` line says whether the check passed or
+  BLOCKED the dethrone, the mean win rate across the four benchmarks against
+  the bar (50%), and the mean error ratio (challenger/king; below 1 = better).
+- **Per benchmark:** one row each for GIFT-Eval, FEV, BOOM and TIME, weakest
+  win rate first, with the task count and ratio. A row under the bar is
+  marked `← below the bar`. If the bench rows were missing, it prints
+  `not computed` and the reason.
+- **By dataset:** within each benchmark, the five datasets that pulled the
+  challenger down most (largest summed log-ratio) come first, with their
+  ratio and wins/tasks. `--all-datasets` lists every dataset. These come
+  from the signed per-task bench rows, so they add up to the per-benchmark
+  win rates exactly.
+
+`--json` carries the same data under `bench_gate` (the receipt's
+`verdict.bench_gate_detail`) and `bench_datasets`. Reading the receipt
+downloads tens of MB, so the command can take a few seconds longer than
+before. The website shows a **Public benchmarks** table under each round's
+verdict, and a collapsible **By dataset** section that loads only when
+opened.
 
 Every leg also streams a public JSONL training log (`logs/round-<id>/…`) with
 per-step loss, throughput and `data_wait_frac`, plus a `host` record for the

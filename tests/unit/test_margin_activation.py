@@ -164,9 +164,12 @@ def test_cohort_maxt_increment_knob_parses_and_defaults_off(tmp_path):
         cohort_maxt_increment_active,
         load_chain_config,
     )
+    from tests.unit.predecision_main import predecision_text
 
+    # The pre-decision release (rollover untyped): with the decided rollover
+    # typed, era_king_from_block stacks on this key, so it cannot go absent.
     bare = re.sub(r"^cohort_maxt_increment_from_block\s*=.*$", "",
-                  DEFAULT_CHAIN_TOML.read_text(), flags=re.M)
+                  predecision_text(), flags=re.M)
     p = tmp_path / "chain.toml"
     p.write_text(bare)
     cfg = load_chain_config(p)

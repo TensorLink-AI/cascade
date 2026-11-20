@@ -80,6 +80,11 @@ def test_parse_is_all_or_none_and_one_digest():
 
 def _with(tmp_path, **kv):
     text = (REPO / "chain.toml").read_text()
+    # the release types the decided v2b switch; these tests arm the AFTER pins
+    # with the vote still open (unbound schedule)
+    text, n = re.subn(r"(?m)^image_decoupled_from_block\s*=.*$",
+                      "image_decoupled_from_block = 0", text)
+    assert n == 1
     for k, v in kv.items():
         text, n = re.subn(rf"(?m)^{k}\s*=.*$", f'{k} = "{v}"', text)
         assert n == 1, k
@@ -119,7 +124,8 @@ def acfg():
                                  funded_sku_wall_measured_image=""),
                 scoring=replace(c.scoring, era_king_from_block=B0, tenure_blocks_from_block=B0,
                                 cohort_maxt_increment_from_block=B0),
-                v2=replace(c.v2, from_block=B0, launch_at_utc="", **AFTER),
+                v2=replace(c.v2, from_block=B0, launch_at_utc="", image_decoupled_from_block=0,
+                           **AFTER),                               # the vote still open
                 training=replace(c.training, v2_from_block=B0))
     return bind_image_after(c)
 

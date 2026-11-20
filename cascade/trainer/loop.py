@@ -336,6 +336,7 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
     # DEC-CA-0067 image-decoupled contract, resolved READ-ONLY like the
     # forfeiture (``activation_image_decoupled_state.json``).
     _image_decoupled: object | None = field(default=None, repr=False)
+    _shared_ladder: object | None = field(default=None, repr=False)
     # DEC-CA-0057 owner-signed network config, resolved READ-ONLY (the trainer
     # never signals): the resolver (None = inert) and, while an overlay is in
     # force, the base config ``self.cfg`` is a view of (activation lock-ins
@@ -672,6 +673,7 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
                 self.apply_activation_block(rec.activation_block)
             self._forfeit_tick(client, block)
             self._image_decoupled_tick(client, block)
+            self._shared_ladder_tick(client, block)
         except Exception as e:  # noqa: BLE001 — activation must never sink a tick
             log.warning("activation step failed (%s); retrying next poll", e)
 
@@ -830,6 +832,54 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
                             "%d — settlements of eras from it stamp numerics_contract_digest "
                             "and keep image-only-stale legs",
                             new_cfg.v2.image_decoupled_from_block)
+
+    def _shared_ladder_tick(self, client, block: int) -> None:
+        """DEC-CA-0068 decided on chain: the trainer resolves the SAME tally the
+        validators do (never signals) and applies the resolved era start to
+        ``[eval] shared_ladder_from_block``, so the lane-B self-judge
+        (``verdict_windows``) draws exactly what the fleet will score."""
+        from ..shared.activation import (
+            ActivationRecord,
+            ActivationStore,
+            apply_shared_ladder_activation,
+            record_for,
+            resolve_activation,
+            shared_ladder_feature,
+        )
+
+        spec = shared_ladder_feature(self._base_cfg())
+        if spec is None or not spec.decided_on_chain:
+            return
+        store = None
+        base = getattr(self.activation_store, "path", None)
+        if base is not None:
+            store = ActivationStore(Path(base).with_name("activation_shared_ladder_state.json"))
+        rec = self._shared_ladder
+        if rec is None:
+            rec = record_for(self._base_cfg(),
+                             store.load() if store is not None else ActivationRecord(), spec)
+            self._shared_ladder = rec
+            if rec.locked and rec.source != "config":
+                log.info("activation: restored shared-ladder lock-in (block %d, draw from "
+                         "%d, via %s)", rec.lock_block, rec.activation_block, rec.source)
+        res = resolve_activation(self._base_cfg(), client, now_block=int(block), record=rec,
+                                 feature=spec)
+        if res.changed:
+            self._shared_ladder = res.record
+            if store is not None:
+                store.save(res.record)
+        rec = self._shared_ladder
+        if rec.locked and rec.source != "config":
+            base = self._base_cfg()
+            new_cfg = apply_shared_ladder_activation(base, rec.activation_block)
+            if new_cfg is not base:
+                self._set_base_cfg(new_cfg)
+                if self._cfg_base is None:
+                    self._point_cfg_consumers(new_cfg)
+                log.warning("activation: DEC-CA-0068 shared-series ladder ARMED at block %d — "
+                            "the lane-B self-judge draws %d shared series per rung from it",
+                            new_cfg.eval.shared_ladder_from_block,
+                            new_cfg.eval.shared_ladder_windows)
 
     def _harvest_leg(self, host, receipt, *, base_seed: int, repo_suffix: str = ""):
         """Dispatcher hook for ISOLATED hosts that were not dispatched

@@ -1370,3 +1370,45 @@ def test_one_short_pod_reject_is_struck_once(tmp_path, monkeypatch):
     short_pods.strike(executor_id="exZ", reason="short pod", now=1.0, file=f)
     (rec,) = short_pods.active(now=2.0, file=f).values()
     assert rec["strikes"] == 1 and rec["until"] == pytest.approx(72 * 3600.0)
+
+
+# ── fail closed on an unknown $/h ceiling (2026-11-16 review: ceiling_rate()
+# returned 0.0 silently, so a cap-gated projection read $0 and passed) ──────
+
+
+def test_an_unknown_ceiling_refuses_cap_gated_operator_rents(tmp_path):
+    from cascade.provision.core import LaunchRefused
+
+    r = _runner(tmp_path, balance=10_000.0, operator_daily_spend_cap_usd=250.0,
+                operator_max_price_per_hour=0.0)
+    leg = "cascade-n91-777-funded-abc-op"
+    prov = _Prov([leg + "-0"])
+    legs = money_guard.guard_operator_provider(r, prov)
+    with pytest.raises(LaunchRefused, match="ceiling unknown"):
+        legs.launch(SimpleNamespace(name_prefix=leg))
+    assert prov.launched == 0
+    why, cls = money_guard.would_rent_refusal(r, SimpleNamespace(hotkey=HK, ref=REF),
+                                              operator=True)
+    assert "ceiling unknown" in why and cls == money_guard.OPERATOR_BLOCKED_CLASS
+
+
+def test_an_unreadable_ceiling_logs_and_fails_closed(tmp_path, monkeypatch, caplog):
+    import cascade.provision.operator_pool as op
+
+    r = _runner(tmp_path, balance=10_000.0, operator_daily_spend_cap_usd=250.0)
+
+    def boom(_rnd):
+        raise RuntimeError("bad config")
+    monkeypatch.setattr(op, "operator_max_price_per_hour", boom)
+    with caplog.at_level("ERROR"):
+        assert money_guard.ceiling_rate(r) == 0.0
+    assert "ceiling unreadable" in caplog.text
+    assert money_guard.unpriced_refusal(r, money_guard.ceiling_rate(r))
+
+
+def test_no_cap_or_a_real_price_is_unchanged(tmp_path):
+    r = _runner(tmp_path, balance=10_000.0, operator_max_price_per_hour=0.0,
+                operator_daily_spend_cap_usd=0.0, ops_operator_daily_cap_usd=0.0)
+    assert money_guard.unpriced_refusal(r, 0.0) == ""          # no daily cap: as before
+    r2 = _runner(tmp_path, balance=10_000.0, operator_daily_spend_cap_usd=250.0)
+    assert money_guard.unpriced_refusal(r2, 20.0) == ""

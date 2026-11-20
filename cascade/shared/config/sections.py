@@ -451,6 +451,10 @@ class ActivationConfig:
     # wrote into ``[v2] image_decoupled_from_block`` (decided on chain), so a
     # resolved block is distinguishable from a typed-in one.
     resolved_image_decoupled_block: int = 0
+    # RUNTIME ONLY: the DEC-CA-0068 block ``apply_shared_ladder_activation``
+    # wrote into ``[eval] shared_ladder_from_block`` (decided on chain), so a
+    # resolved block is distinguishable from a typed-in one.
+    resolved_shared_ladder_block: int = 0
 
     @property
     def enabled(self) -> bool:

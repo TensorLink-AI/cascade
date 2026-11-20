@@ -623,6 +623,9 @@ def _add_duel(sub: argparse._SubParsersAction) -> None:
                    "domains you beat the king in this round and by how much.")
     p.add_argument("--limit", type=int, default=20,
                    help="Rounds listed by --history (default: 20).")
+    p.add_argument("--all-datasets", action="store_true",
+                   help="List every public-benchmark dataset, not just the 5 worst "
+                   "for the challenger per suite.")
     p.set_defaults(func=_cmd_duel)
 
 
@@ -635,6 +638,8 @@ def _cmd_duel(args: argparse.Namespace) -> int:
     cfg = load_chain_config(args.chain_toml)
     from .dashboard import (
         duel_round_rows,
+        fetch_bench_datasets,
+        fetch_bench_receipt,
         fetch_public_receipt_index,
         render_duel,
         render_duel_domain_history,
@@ -661,8 +666,11 @@ def _cmd_duel(args: argparse.Namespace) -> int:
         return out.fail("round_not_found",
                         f"no receipt-index rows for {target} — receipts land a few minutes "
                         "after the duel manifest; try 'cascade duel --history'")
-    out.result(rows=rows)
-    out.info(render_duel(rows, me=me))
+    bench_gate, report_key = fetch_bench_receipt(cfg.storage, rows)
+    datasets = fetch_bench_datasets(cfg.storage, report_key) if bench_gate else None
+    out.result(rows=rows, bench_gate=bench_gate, bench_datasets=datasets)
+    out.info(render_duel(rows, me=me, bench_gate=bench_gate, bench_datasets=datasets,
+                         dataset_limit=None if getattr(args, "all_datasets", False) else 5))
     return OK
 
 

@@ -84,6 +84,26 @@ class EvalConfig:
     # receipt's ``epoch_start_block``.
     scored_horizons: tuple[int, ...] = ()
     scored_from_block: int = 0
+    # DEC-CA-0068 shared-series ladder, DECIDED ON CHAIN (the DEC-CA-0049 vote
+    # shape, feature ``lad-<8 hex>``): from ``shared_ladder_from_block`` every
+    # rung of ``scored_horizons`` scores the SAME ``shared_ladder_windows``
+    # series — ONE seeded even-by-domain draw over all of the snapshot's series
+    # (no draw per rung; ``n_windows`` / the v2 budget no longer size the
+    # ladder). A series too short for a rung keeps ``min_context`` steps of
+    # history and its whole tail as the target, NaN-PADDED to the rung's
+    # horizon; the scorer masks the padded steps (``cascade.eval.crps`` /
+    # ``cascade.eval.mase``), so every series serves every rung. 0 / 0 = off.
+    # A typed block (an era start) is the owner override; otherwise the vote's
+    # lock-in writes the first era start after it. CONSENSUS: every validator
+    # and the trainer run the same values before the block.
+    shared_ladder_windows: int = 0
+    shared_ladder_from_block: int = 0
+    # DEC-CA-0068 fork guard: the ``lad-`` feature name this config must vote
+    # on (the DEC-CA-0067 ``image_decoupled_feature`` pattern). Required
+    # whenever ``[activation]`` is on and ``scored_horizons`` is set; a config
+    # missing it or computing another name REFUSES to start the validator,
+    # trainer and audit (:func:`cascade.shared.config.loader.check_shared_ladder_feature`).
+    shared_ladder_feature: str = ""
     # Ceiling, in hours, on one public-benchmark sweep of a duel checkpoint
     # when the battery is uncapped (``cascade_bench_max_series = 0``): the
     # remote bench timeout trainer.main hands the BenchPlan (a capped battery
@@ -469,6 +489,65 @@ def check_margin_v2(start: float, end: float, warmup_blocks: int, from_block: in
     if int(from_block) > 0 and not all(vals):
         raise ValueError("[scoring] margin_v2_from_block is set but the v2 bar is not "
                          "(win_margin_start_v2 / win_margin_end_v2 / margin_warmup_blocks_v2)")
+
+
+def shared_ladder_configured(eval_cfg: EvalConfig) -> bool:
+    """Whether the DEC-CA-0068 shared-series ladder is defined (a positive
+    per-horizon count AND a scored horizon ladder to apply it to)."""
+    return (int(getattr(eval_cfg, "shared_ladder_windows", 0) or 0) > 0
+            and bool(tuple(getattr(eval_cfg, "scored_horizons", ()) or ())))
+
+
+def shared_ladder_active(eval_cfg: EvalConfig, block: int | None) -> bool:
+    """CONSENSUS gate (DEC-CA-0068): the round at epoch boundary ``block``
+    draws the shared-series ladder. False with no block, with the rule
+    undefined, or before ``shared_ladder_from_block`` (0 = not yet decided)."""
+    gate = int(getattr(eval_cfg, "shared_ladder_from_block", 0) or 0)
+    return (gate > 0 and block is not None and int(block) >= gate
+            and shared_ladder_configured(eval_cfg))
+
+
+# DEC-CA-0068 rule: the quantile head decodes the shared ladder's windows in
+# FIXED batches of this many univariate windows (consecutive in window order,
+# one horizon per batch). Batch 32 is ~10x batch 1 on an RTX 5090 (2026-11-12:
+# 26 ms -> 2.5 ms per window) and deterministic run to run, but its numerics
+# differ from batch 1 (cuBLAS / MoE grouped-GEMM shapes) and depend on the
+# batch-mates at ~1e-5 — so the size and the composition are part of the rule
+# (hashed into the vote name). Every round before the gate decodes at batch 1,
+# byte-identical to before.
+SHARED_LADDER_QUANTILE_BATCH = 32
+
+
+def shared_ladder_quantile_batch(eval_cfg: EvalConfig, block: int | None) -> int:
+    """CONSENSUS: the quantile-head decode batch for a round at epoch boundary
+    ``block`` — :data:`SHARED_LADDER_QUANTILE_BATCH` once the shared-series
+    ladder is in force there (the scored ladder AND its shared draw), else 1."""
+    horizons = tuple(getattr(eval_cfg, "scored_horizons", ()) or ())
+    gate = int(getattr(eval_cfg, "scored_from_block", 0) or 0)
+    if (not horizons or gate <= 0 or block is None or int(block) < gate
+            or not shared_ladder_active(eval_cfg, block)):
+        return 1
+    return SHARED_LADDER_QUANTILE_BATCH
+
+
+def check_shared_ladder(windows: int, from_block: int, horizons, scored_from_block: int) -> None:
+    """Load-time guardrails for DEC-CA-0068: non-negative values; a typed
+    block needs the count AND a scored ladder, and cannot precede the ladder's
+    own gate (a shared draw over a single-horizon round is undefined)."""
+    if int(windows) < 0:
+        raise ValueError(f"[eval] shared_ladder_windows={windows} must be >= 0")
+    if int(from_block) < 0:
+        raise ValueError(f"[eval] shared_ladder_from_block={from_block} must be >= 0")
+    if int(from_block) > 0:
+        if int(windows) <= 0:
+            raise ValueError("[eval] shared_ladder_from_block is set but shared_ladder_windows "
+                             "is 0 (the per-horizon series count)")
+        if not tuple(horizons or ()):
+            raise ValueError("[eval] shared_ladder_from_block is set but scored_horizons is "
+                             "empty (the shared draw needs the horizon ladder)")
+        if int(scored_from_block) <= 0 or int(from_block) < int(scored_from_block):
+            raise ValueError(f"[eval] shared_ladder_from_block={from_block} must be >= "
+                             f"scored_from_block={scored_from_block} (> 0)")
 
 
 def cohort_maxt_active(scoring: ScoringConfig, block: int | None) -> bool:

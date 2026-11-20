@@ -14,8 +14,9 @@ from cascade.audit.checks import _epoch_start_for_seed
 from cascade.funding.intake import FundingIntake, canonical_fund_message
 from cascade.funding.queue import FundedQueue
 from cascade.funding.vault import PayerKeyVault
-from cascade.shared.config import load_chain_config
 from cascade.shared.era import era_for_block, era_length_blocks, v2_first_era, v2_first_warm_era
+
+from .predecision_main import predecision_main
 
 ROOT = Path(__file__).resolve().parents[2]
 HK = "5FakeHotkeyAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
@@ -101,8 +102,9 @@ def test_route_is_wired(tmp_path):
     assert it.vault.get(HK) == "sk-new"
 
 
-def test_audit_accepts_only_legal_seed_epoch_starts():
-    cfg = load_chain_config(ROOT / "chain.toml")
+def test_audit_accepts_only_legal_seed_epoch_starts(tmp_path):
+    # synthetic v2 gate on the pre-decision main (no typed rollover / v2 launch)
+    cfg = predecision_main(tmp_path)
     era = era_length_blocks(cfg.round, 0)
     gate = 10_000 * era
     cfg = replace(cfg, v2=replace(cfg.v2, from_block=gate),

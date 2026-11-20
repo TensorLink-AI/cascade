@@ -42,6 +42,13 @@ def _build_parser() -> argparse.ArgumentParser:
                         "file just runs that eval locally on --device. Wallet + all "
                         "consensus decisions stay on this box; only the heavy eval "
                         "runs on the pod. Omit to always run locally.")
+    p.add_argument("--bench-lease", type=Path, default=None,
+                   help="MAIN validator only: bench_lease.toml for an ELASTIC bench host — "
+                        "rent the DEC-CA-0063 sweep pod on demand (a clearer / the king "
+                        "check), publish it to --eval-hosts (must be the same file), "
+                        "terminate it when idle. While it rents the settlement HOLDS "
+                        "(never a verdict); past the bounded wait a clearer is deferred "
+                        "(never a loss). Omit for a standing --eval-hosts pod.")
     p.add_argument("--force-burn", action="store_true",
                    help="Operator kill-switch: burn to [scoring] burn_uid on every "
                         "weight-set instead of voting the champion, while staying "
@@ -458,6 +465,18 @@ def main(argv: list[str] | None = None) -> int:
     except RuntimeError as e:
         print(e, file=sys.stderr)
         return 2
+    if args.bench_lease is not None:
+        from .bench_lease import BenchLeaseConfigError, build_bench_lease
+
+        try:
+            runner.bench_lease = build_bench_lease(
+                args.bench_lease, runner.cfg, eval_hosts=args.eval_hosts,
+                is_main=runner._vbench_is_main())
+        except BenchLeaseConfigError as e:
+            print(e, file=sys.stderr)
+            return 2
+        log.info("bench lease armed from %s: sweeps rent their host on demand (%s)",
+                 args.bench_lease, runner.bench_lease.status())
     if runner.cfg.storage.pool_bucket:
         from .pool import load_bucket_pool
 

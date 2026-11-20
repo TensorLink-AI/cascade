@@ -214,7 +214,9 @@ def test_evaluate_reads_the_rule_at_the_settlement_boundary(switched, monkeypatc
     cfg, gate, switch, epoch = switched
     seen = []
 
-    def fake_evaluate(dest, windows, *, num_samples, device, contract, workers, quantile_head):
+    def fake_evaluate(dest, windows, *, num_samples, device, contract, workers, quantile_head,
+                      quantile_batch=1):
+        assert quantile_head or quantile_batch == 1       # DEC-CA-0068: batch only with quantiles
         seen.append(quantile_head)
         return []
 
