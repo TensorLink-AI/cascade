@@ -1478,6 +1478,8 @@ earliest block it can lift.
 
 ## 14. MarketCast (lane C, the composite `mkt:market` target) — DEC-CA-0064
 
+New to MarketCast? Start with the step-by-step [MarketCast miner guide](MARKETCAST.md); this section is the full rule reference.
+
 **Lane C currently accepts MarketCast recipes only.** Its tests use market
 windows that start after training is dispatched and are scored once they
 close. Training data has a separate embargo cutoff.
