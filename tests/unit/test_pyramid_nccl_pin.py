@@ -54,7 +54,8 @@ def test_follower_pins_before_its_process_group(monkeypatch):
     monkeypatch.setattr(pyramid_dp.torch.cuda, "set_device", lambda *_: None)
     monkeypatch.setattr(dist, "init_process_group", init_process_group)
     errors = queue.Queue()
-    pyramid_dp._follower(1, 2, 0, {}, True, 0, errors)
+    with pytest.raises(_Stop):            # the helper reports, then re-raises
+        pyramid_dp._follower(1, 2, 0, {}, True, 0, errors)
     assert seen == NCCL_PIN
     assert errors.get_nowait()[0] == "_Stop"
 
