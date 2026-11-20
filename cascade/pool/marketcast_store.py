@@ -106,6 +106,27 @@ class MktBarStore:
                 os.replace(tmp, d / f"{f}.npy")
         return n
 
+    def write_ctx(self, cls: str, asset: str, rows) -> int:
+        """Merge live-context samples ``[(time_ms, open_interest, spread_bp),
+        ...]`` (owner 2026-11-18; dedup by time) into ``ctx.jsonl``."""
+        p = self._dir(cls, asset) / "ctx.jsonl"
+        have = {int(r["t"]): r for r in self._funding_rows(p)}
+        new = 0
+
+        def _j(x):
+            return None if not np.isfinite(x) else float(x)
+
+        for t, oi, spr in rows:
+            if int(t) not in have:
+                new += 1
+            have[int(t)] = {"t": int(t), "oi": _j(oi), "spread": _j(spr)}
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".jsonl.tmp")
+        tmp.write_text("".join(json.dumps(have[k], sort_keys=True) + "\n" for k in sorted(have)),
+                       encoding="utf-8")
+        os.replace(tmp, p)
+        return new
+
     def write_funding(self, cls: str, asset: str, rows) -> int:
         """Merge hourly funding samples ``[(time_ms, rate, premium), ...]``
         (dedup by time)."""
@@ -172,6 +193,13 @@ class MktBarStore:
                 for r in self._funding_rows(self._dir(cls, asset) / "funding.jsonl")]
         out["funding"], out["premium"] = funding_on_grid(rows, int(t0), n,
                                                          step_minutes=step // 60)
+        ctx = [(int(r["t"]), float("nan") if r.get("oi") is None else float(r["oi"]),
+                float("nan") if r.get("spread") is None else float(r["spread"]))
+               for r in self._funding_rows(self._dir(cls, asset) / "ctx.jsonl")]
+        if ctx:
+            from .marketcast_feeds import ctx_on_grid
+
+            out["oi"], out["spread"] = ctx_on_grid(ctx, int(t0), n, step_minutes=step // 60)
         return out
 
     def coverage(self, cls: str, asset: str, t0: int, minutes: int) -> float:
@@ -206,6 +234,15 @@ def record_once(store: MktBarStore, mc, *, post, now: float,
     end_ms = int(now) // 60 * 60 * 1000
     out: dict = {}
     am = mc.assets_map
+    # owner 2026-11-18: one live-context sample per dex per pass (open
+    # interest + impact spread — the API serves no history of either)
+    ctxs: dict[str, dict] = {}
+    for src, dex in (("hyperliquid", ""), ("hyperliquid_xyz", F.XYZ_DEX)):
+        if any((mc.sources_for(c) or ("",))[0] == src for c in mc.armed_classes):
+            try:
+                ctxs[src] = F.parse_hl_asset_ctxs(post(F.HL_INFO_URL, F.hl_ctx_request(dex)))
+            except Exception:  # noqa: BLE001 — the candles never wait on it
+                ctxs[src] = {}
     for cls in mc.armed_classes:
         srcs = mc.sources_for(cls)
         if not srcs or srcs[0] not in ("hyperliquid", "hyperliquid_xyz"):
@@ -226,6 +263,9 @@ def record_once(store: MktBarStore, mc, *, post, now: float,
                         n1 = n
                 start_ms = end_ms - int(lookback_minutes) * MINUTE_MS
                 store.write_funding(cls, asset, F.fetch_hl_funding(post, coin, start_ms, end_ms))
+                got = ctxs.get(srcs[0], {}).get(coin)
+                if got is not None:
+                    store.write_ctx(cls, asset, [(end_ms, got[0], got[1])])
                 out[f"{cls}:{asset}"] = n1
             except Exception as e:  # noqa: BLE001 — one asset never stops the recorder
                 out[f"{cls}:{asset}"] = f"error: {type(e).__name__}: {e}"[:200]

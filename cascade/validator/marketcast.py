@@ -78,8 +78,11 @@ from ..shared.marketcast_report import (
     MktReport,
     MktWindowRow,
     base_cov_gain,
+    baseline_scores,
     behaviour_distance,
     encode_quantiles,
+    guard_scores,
+    holder_gain,
     load_mkt_report,
     mkt_quantiles_key,
     mkt_ref_quantiles_key,
@@ -168,6 +171,19 @@ def mkt_prechecks(entry: LaneCEntry, *, lc, mc, commitments) -> tuple[str, str] 
     return None
 
 
+def entry_gap_end(entry: LaneCEntry, mc, phase: str) -> float:
+    """The submission instant an entry's ``gap_horizons`` windows end by
+    (owner 2026-11-18): the trainer-stamped ``train_time`` on a judge, 0 on a
+    confirm (the gap is the judge's evidence; a confirm needs fresh windows)
+    or when no gap horizon is configured."""
+    if phase != "judge" or not tuple(getattr(mc, "gap_horizons", ())):
+        return 0.0
+    t = mkt_train_time(entry)
+    if t is None:
+        raise ValueError("no train_time on the entry's marketcast record")
+    return float(t)
+
+
 def entry_after(entry: LaneCEntry, mc, *, fresh_after: float = 0.0) -> float:
     """The instant an entry's windows must start strictly after: the
     TRAINER-stamped dispatch time ``train_time`` + ``start_margin_seconds``
@@ -184,6 +200,15 @@ def anchor_time(train_block: int, snapshot_meta: dict) -> float:
     audit's consistency check against ``train_time``)."""
     return float(snapshot_meta["anchor_time"]) + (int(train_block) - int(
         snapshot_meta["anchor_block"])) * float(snapshot_meta["block_seconds"])
+
+
+def _finite_tree(x):
+    """A diagnostics tree with every non-finite float as None (JSON-safe)."""
+    if isinstance(x, dict):
+        return {str(k): _finite_tree(v) for k, v in x.items()}
+    if isinstance(x, float):
+        return x if math.isfinite(x) else None
+    return x
 
 
 def _inconclusive(reason: str) -> str:
@@ -290,6 +315,14 @@ def judge_marketcast_entry(entry: LaneCEntry, rows: MktEntryRows | None, *, mc, 
                                   else (None if isinstance(x, float) else x))
                              for k_, x in d.items()}
                          for s, d in v.diagnostics["suites"].items()}
+    for key in ("vs_baseline", "base_vs_baseline"):
+        # owner 2026-11-18: skill vs the strong simple baselines (reported; the
+        # composite's baseline_gate is inside the verdict)
+        if v.diagnostics.get(key):
+            rec[key] = _finite_tree(v.diagnostics[key])
+    vs = holder_gain(rows, mc, k=k, seed=seed)
+    if vs is not None:
+        rec["vs_holder"] = vs        # owner 2026-11-18: the paired slot test
     inc = _inconclusive(v.reason)
     rec["inconclusive"] = inc
     excluded = sum(1 for w in rows.windows if not math.isfinite(float(w.base)))
@@ -330,7 +363,8 @@ def _covariate_rows(windows, snap, mc, covs) -> tuple[list, list]:
     past, known = [], []
     for w in windows:
         p, kn = window_covariates(snap, w, tuple(covs),
-                                  context_length=int(mc.eval_context_length))
+                                  context_length=int(mc.eval_context_length),
+                                  event_times=tuple(getattr(mc, "event_times", ())))
         past.append(p)
         known.append(kn)
     return past, known
@@ -383,9 +417,10 @@ def compute_entry_rows(entry: LaneCEntry, *, phase: str, after: float, snap, mc,
     from ..shared.config.marketcast import base_suite
 
     knots = tuple(mc.quantile_knots)
-    windows = target_windows(snap, mc, suite_of(entry.target), after=after)
+    gap_end = entry_gap_end(entry, mc, phase)
+    windows = target_windows(snap, mc, suite_of(entry.target), after=after, gap_end=gap_end)
     base_rows = MktEntryRows(entry.miner_hotkey, entry.trained_pointer, entry.target, phase,
-                             float(after))
+                             float(after), gap_end=gap_end)
     try:
         ft_fc, covs = load_ft(entry.trained_pointer)
     except MktFault as e:
@@ -448,7 +483,11 @@ def compute_entry_rows(entry: LaneCEntry, *, phase: str, after: float, snap, mc,
                            scales=[w.scale for w in windows])
     # a non-finite BASE forecast leaves base = null: the window is excluded for
     # everyone (verdict_from_rows) and the row records it
-    out = tuple(MktWindowRow(w.wid, b, f, ci, cn, bc[i], tl)
+    gs = guard_scores([w.target for w in windows], qb, qf, knots=knots,
+                      guards=[mc.guards_of(w.suite) for w in windows],
+                      scales=[w.scale for w in windows])
+    bls = baseline_scores(windows, knots=knots)
+    out = tuple(MktWindowRow(w.wid, b, f, ci, cn, bc[i], tl, **gs[i], bl=bls[i])
                 for i, (w, (b, f, ci, cn, tl)) in enumerate(zip(windows, scored, strict=True)))
     data = encode_quantiles(qb, qf)
     import hashlib
@@ -498,7 +537,8 @@ def near_dup_record(rows: MktEntryRows, data: bytes, refs, *, snap, mc, load_ft:
 
     if not refs or not rows.windows:
         return {}, None
-    windows = target_windows(snap, mc, suite_of(rows.target), after=float(rows.after))
+    windows = target_windows(snap, mc, suite_of(rows.target), after=float(rows.after),
+                             gap_end=float(rows.gap_end))
     qs = decode_quantiles(data, [w.steps for w in windows], len(mc.quantile_knots))
     qb = [q[0] for q in qs]
     qf = [q[1] for q in qs]
@@ -525,6 +565,44 @@ def near_dup_record(rows: MktEntryRows, data: bytes, refs, *, snap, mc, load_ft:
              "mean_rel": float(best[0]), "max_rel": float(best[1]),
              "n_windows": len(windows), "quantiles_key": key,
              "quantiles_sha256": hashlib.sha256(blob).hexdigest()}, blob)
+
+
+def holder_record(rows: MktEntryRows, data: bytes, holder, *, snap, mc, load_ft: Callable,
+                  ft_cache: dict, round_id: str) -> tuple[MktEntryRows, bytes | None]:
+    """Owner 2026-11-18: the PAIRED challenger-vs-holder evidence — the
+    target's slot holder (``holder`` = ``(hotkey, pointer, commit_block)``)
+    forecast on the entry's own windows, its per-window losses scored by the
+    one loss rule (:func:`~cascade.shared.marketcast_report.score_windows`)
+    into the rows' ``hold``, its quantiles published as ``encode_quantiles(
+    base, holder)`` so the audit recomputes them. ``(rows, None)`` unchanged
+    when there is no holder, it is the entry itself, or it cannot be
+    forecast (the slot rule then falls back to the recorded-LCB comparison)."""
+    import hashlib
+
+    from ..pool.marketcast import target_windows
+    from ..shared.marketcast_report import decode_quantiles, mkt_holder_quantiles_key
+
+    if holder is None or not rows.windows or holder[1] == rows.trained_pointer:
+        return rows, None
+    windows = target_windows(snap, mc, suite_of(rows.target), after=float(rows.after),
+                             gap_end=float(rows.gap_end))
+    qb = [q[0] for q in decode_quantiles(data, [w.steps for w in windows],
+                                         len(mc.quantile_knots))]
+    try:
+        qh = reference_quantiles(holder[1], windows, snap=snap, mc=mc, load_ft=load_ft,
+                                 ft_cache=ft_cache)
+    except Exception as e:  # noqa: BLE001 — an unmeasurable holder is skipped
+        log.warning("marketcast holder pairing: %s unusable for %s (%s)", holder[1][:40],
+                    rows.trained_pointer[:40], e)
+        return rows, None
+    sc = score_windows([w.target for w in windows], qb, qh, knots=tuple(mc.quantile_knots),
+                       coverage_levels=(), gated=False, scales=[w.scale for w in windows])
+    blob = encode_quantiles(qb, qh)
+    key = mkt_holder_quantiles_key(round_id, rows.hotkey, rows.trained_pointer, rows.phase)
+    out = tuple(replace(w, hold=float(s[1])) for w, s in zip(rows.windows, sc, strict=True))
+    return replace(rows, windows=out, holder={
+        "hotkey": str(holder[0]), "pointer": str(holder[1]), "quantiles_key": key,
+        "quantiles_sha256": hashlib.sha256(blob).hexdigest()}), blob
 
 
 def snapshot_record(snap, key: str, sha256: str) -> dict:
@@ -616,6 +694,14 @@ class MarketCastMixin:
 
     mkt_forecaster_fn: Callable | None = None
     mkt_snapshot_fn: Callable | None = None
+    # GPU offload (cascade.validator.mkt_offload): the hosts file the
+    # provisioner's [provisioner.mkt] stage publishes (None = forecast on
+    # --device); how long one publish run waits for the pod; injectable
+    # lease / session factories (tests)
+    mkt_eval_hosts: Path | None = None
+    mkt_host_wait_s: float = 1800.0
+    mkt_lease_fn: Callable | None = None
+    mkt_session_fn: Callable | None = None
 
     def _mkt_main_hotkey(self) -> str:
         return str(getattr(getattr(self.cfg, "netconfig", None), "owner_hotkey", "") or "")
@@ -654,6 +740,9 @@ class MarketCastMixin:
         fn = self.mkt_forecaster_fn
         if fn is not None:
             return fn("base")[0]
+        sess = self.__dict__.get("_mkt_sess")
+        if sess is not None:
+            return sess.forecaster(self._mkt_base_dir_local(), key="base")
         hit = getattr(self, "_mkt_base_fc", None)
         if hit is None:  # pragma: no cover — GPU + the timestral extra
             from ..eval.timestral_adapter import load_pinned_base
@@ -665,6 +754,13 @@ class MarketCastMixin:
             self._mkt_base_fc = hit
             self._mkt_base_dir = _d
         return hit
+
+    def _mkt_base_dir_local(self) -> Path:  # pragma: no cover — the timestral extra
+        d = getattr(self, "_mkt_base_dir", None)
+        if d is None:
+            d = self._mkt_base_dir = resolve_pinned_base_dir(
+                self.cfg.marketcast, cache_dir=getattr(self, "cache_dir", None))
+        return Path(d)
 
     def _mkt_load_ft(self, pointer: str):
         fn = self.mkt_forecaster_fn
@@ -684,10 +780,10 @@ class MarketCastMixin:
         )
         from ..shared.marketcast_recipe import meta_problem
 
-        self._mkt_base()
+        base_dir = self._mkt_base_dir_local()
         dest = self._fetch_checkpoint_dir(SimpleNamespace(trained_pointer=pointer))
         try:
-            diff = same_structure(Path(self._mkt_base_dir) / WEIGHTS_FILE, dest / WEIGHTS_FILE)
+            diff = same_structure(base_dir / WEIGHTS_FILE, dest / WEIGHTS_FILE)
             if diff:
                 raise MktFault(f"fine-tune is not the base architecture: {diff[:3]}")
             if not safetensors_all_finite(dest / WEIGHTS_FILE):
@@ -697,7 +793,9 @@ class MarketCastMixin:
             why = meta_problem(meta, self.cfg.marketcast, size=len(raw))
             if why:
                 raise MktFault(why)
-            fc = TimestralQuantileForecaster.from_dir(dest, device=str(self.device))
+            sess = self.__dict__.get("_mkt_sess")
+            fc = (sess.forecaster(dest) if sess is not None
+                  else TimestralQuantileForecaster.from_dir(dest, device=str(self.device)))
         except MktFault:
             raise
         except (ValueError, KeyError, OSError) as e:
@@ -904,8 +1002,13 @@ class MarketCastMixin:
         plan.backlog, plan.seen = backlog, work.mkt_seen
         if self._mkt_is_main():
             holders = _slot_holders(work)
-            for item in backlog:
-                if not item.get("arbiter"):
+            todo = [item for item in backlog if not item.get("arbiter")]
+            if self.mkt_eval_hosts is not None:
+                # offloaded: off the settlement thread (the pod may take
+                # minutes to come up; the trainer's arbiter waits for it)
+                self._mkt_publish_async(copy.deepcopy(todo), dict(holders))
+            else:
+                for item in todo:
                     self._mkt_publish_round(item, holders=holders)
         from .lane_c import OUTCOME_BELOW_HOLDER, OUTCOME_CONFIRMED, _holder_dict
 
@@ -1044,6 +1147,10 @@ class MarketCastMixin:
                         rows, why_e = None, (f"the report cuts windows after {rows.after}, the "
                                              f"trainer's dispatch time gives "
                                              f"{entry_after(e, mc, fresh_after=fresh)}")
+                    elif not rows.deferred and float(rows.gap_end) != entry_gap_end(e, mc, phase):
+                        rows, why_e = None, (f"the report cuts gap windows before "
+                                             f"{rows.gap_end}, the trainer's dispatch time "
+                                             f"gives {entry_gap_end(e, mc, phase)}")
                 j = judge_marketcast_entry(
                     e, rows, mc=mc, k=k, phase=phase, seed=f"{R}|{e.miner_hotkey}|{e.target}",
                     round_block=B, origin_block=origin, base_pointer=mc.base_pointer, report=rec,
@@ -1069,6 +1176,8 @@ class MarketCastMixin:
                        round_id: str, sidecars: dict) -> list:
         """Attach each computed entry's ``near_dup`` record (red-team F4)
         and stage the reference sidecars in ``sidecars``."""
+        from .mkt_offload import MktOffloadError
+
         mc = self.cfg.marketcast
         out = []
         same_target: dict = {}
@@ -1086,6 +1195,8 @@ class MarketCastMixin:
                 nd, blob = near_dup_record(r, got[0], refs, snap=snap, mc=mc,
                                            load_ft=self._mkt_load_ft, ft_cache=ft_cache,
                                            round_id=round_id)
+            except MktOffloadError:
+                raise                       # the pod, not the entry: the round waits
             except Exception as e:  # noqa: BLE001 — never blocks the report
                 log.warning("marketcast round=%s: near-dup test failed for %s (%s)", round_id,
                             r.hotkey[:12], e)
@@ -1093,10 +1204,86 @@ class MarketCastMixin:
             if nd and blob is not None:
                 sidecars[nd["quantiles_key"]] = blob
                 r = replace(r, near_dup=nd)
+            try:
+                r, hblob = holder_record(r, got[0], holders.get(r.target), snap=snap, mc=mc,
+                                         load_ft=self._mkt_load_ft, ft_cache=ft_cache,
+                                         round_id=round_id)
+            except MktOffloadError:
+                raise
+            except Exception as e:  # noqa: BLE001 — never blocks the report
+                log.warning("marketcast round=%s: holder pairing failed for %s (%s)", round_id,
+                            r.hotkey[:12], e)
+                hblob = None
+            if hblob is not None:
+                sidecars[r.holder["quantiles_key"]] = hblob
             out.append(r)
         return out
 
     # ── the main validator's rows ──
+
+    def _mkt_publish_async(self, todo: list, holders: dict) -> bool:
+        """Offloaded publishing: one background run over ``todo`` (False =
+        a run is still going; the next settlement retries what it leaves)."""
+        t = self.__dict__.get("_mkt_pub_thread")
+        if t is not None and t.is_alive():
+            log.info("marketcast: an offloaded publish run is still going; %d round(s) "
+                     "retried at the next settlement", len(todo))
+            return False
+        if not todo:
+            return False
+        import threading
+
+        t = threading.Thread(target=self._mkt_publish_remote, args=(todo, holders),
+                             name="mkt-publish", daemon=True)
+        self.__dict__["_mkt_pub_thread"] = t
+        t.start()
+        return True
+
+    def _mkt_publish_remote(self, todo: list, holders: dict) -> int:
+        """Lease the MarketCast pod, publish every round of ``todo`` still
+        lacking a report on it, release. Never raises; returns the number
+        published (0 when no pod came up within ``mkt_host_wait_s``)."""
+        from ..shared.hippius import ObjectNotFound
+        from .mkt_offload import MktLease, MktSession
+
+        store = self._mkt_store()
+        need = []
+        for item in todo:
+            try:
+                store.get_text(mkt_report_key(str(item["round_id"])))
+            except ObjectNotFound:
+                need.append(item)
+            except Exception as e:  # noqa: BLE001 — unknown: retried next settlement
+                log.warning("marketcast round=%s: report existence unreadable (%s)",
+                            item["round_id"], e)
+        if not need:
+            return 0
+        rid0 = str(need[0]["round_id"])
+        lease = (self.mkt_lease_fn or MktLease)(self.mkt_eval_hosts)
+        published = 0
+        try:
+            host = lease.acquire(rid0, float(self.mkt_host_wait_s))
+            if host is None:
+                log.error("marketcast: no offload pod published to %s within %.0fs; %d "
+                          "round(s) retried at the next settlement", self.mkt_eval_hosts,
+                          self.mkt_host_wait_s, len(need))
+                return 0
+            sess = (self.mkt_session_fn or MktSession)(host)
+            try:
+                sess.start()
+                self.__dict__["_mkt_sess"] = sess
+                for item in need:
+                    lease.touch(str(item["round_id"]))
+                    published += bool(self._mkt_publish_round(item, holders=holders))
+            finally:
+                self.__dict__.pop("_mkt_sess", None)
+                sess.close()
+        except Exception as e:  # noqa: BLE001 — never kills the validator
+            log.error("marketcast: offloaded publish run failed (%s); retried at the next "
+                      "settlement", e)
+        finally:
+            lease.release()
+        return published
 
     def _mkt_publish_round(self, item: dict, *, holders: dict | None = None) -> bool:
         """Main validator: compute + sign + publish round ``item``'s report
@@ -1126,6 +1313,11 @@ class MarketCastMixin:
                         "next settlement", rid, e)
             return False
         mc = self.cfg.marketcast
+        sess = self.__dict__.get("_mkt_sess")
+        if self.mkt_eval_hosts is not None and sess is None:
+            log.warning("marketcast round=%s: offload configured but no pod session; "
+                        "retried at the next settlement", rid)
+            return False
         try:
             got = self._mkt_snapshot(int(item["block"]))
         except Exception as e:  # noqa: BLE001
@@ -1140,11 +1332,17 @@ class MarketCastMixin:
         cache = getattr(self, "_mkt_base_cache", None)
         if cache is None or len(cache) > MKT_BASE_CACHE_MAX:
             cache = self._mkt_base_cache = {}
+        from .mkt_offload import MktOffloadError
+
         base_fc, base_err = None, ""
         for _ in range(MKT_COMPUTE_ATTEMPTS):
             try:
                 base_fc = self._mkt_base()
                 break
+            except MktOffloadError as e:
+                log.error("marketcast round=%s: offload pod failed loading the base (%s); "
+                          "retried at the next settlement", rid, e)
+                return False
             except Exception as e:  # noqa: BLE001 — the base must load: infra
                 base_err = f"{type(e).__name__}: {e}"
         entries, sidecars = [], {}
@@ -1155,7 +1353,8 @@ class MarketCastMixin:
             fresh = float((p.mkt or {}).get("fresh_after", 0.0) or 0.0) \
                 if (p is not None and phase == "confirm") else 0.0
             after = entry_after(e, mc, fresh_after=fresh)
-            stub = MktEntryRows(e.miner_hotkey, e.trained_pointer, e.target, phase, after)
+            stub = MktEntryRows(e.miner_hotkey, e.trained_pointer, e.target, phase, after,
+                                gap_end=entry_gap_end(e, mc, phase))
             n = int((p.mkt or {}).get("infra_deferrals", 0) or 0) + 1 if p is not None else 1
             # the trainer requeues (uncharged) an entry whose deferral is its last
             cap = (f" — past max_infra_deferrals ({n} > {mc.max_infra_deferrals})"
@@ -1174,6 +1373,12 @@ class MarketCastMixin:
                         load_ft=self._mkt_load_ft, base_cache=cache, round_id=rid,
                         ft_cache=ft_cache)
                     break
+                except MktOffloadError as x:
+                    # the POD failed, not this entry: nothing is deferred or
+                    # charged — the whole round waits for the next settlement
+                    log.error("marketcast round=%s: offload pod failed (%s); retried at "
+                              "the next settlement", rid, x)
+                    return False
                 except Exception as x:  # noqa: BLE001 — OOM / fetch / library: retried
                     err = f"{type(x).__name__}: {x}"
                     fwd.append(str(x) if isinstance(x, MktForwardError) else "")
@@ -1193,8 +1398,13 @@ class MarketCastMixin:
             if data is not None:
                 sidecars[rows.quantiles_key] = data
                 datas[(rows.hotkey, rows.trained_pointer, rows.phase)] = (data, _seniority(c))
-        entries = self._mkt_near_dups(entries, datas, holders or {}, snap=snap, ft_cache=ft_cache,
-                                      round_id=rid, sidecars=sidecars)
+        try:
+            entries = self._mkt_near_dups(entries, datas, holders or {}, snap=snap,
+                                          ft_cache=ft_cache, round_id=rid, sidecars=sidecars)
+        except MktOffloadError as x:
+            log.error("marketcast round=%s: offload pod failed in the reference tests (%s); "
+                      "retried at the next settlement", rid, x)
+            return False
         entries.sort(key=lambda r: (r.target, r.hotkey, r.trained_pointer, r.phase))
         report = MktReport(round_id=rid, created_block=int(item.get("created_block", 0)),
                            snapshot=snapshot_record(snap, skey, ssha), entries=tuple(entries),
@@ -1225,6 +1435,13 @@ class MarketCastMixin:
         log.info("marketcast round=%s: published %d entr%s → %s", rid, len(entries),
                  "y" if len(entries) == 1 else "ies", key)
         return True
+
+
+def resolve_pinned_base_dir(mc, *, cache_dir=None) -> Path:  # pragma: no cover — timestral extra
+    """The pinned base's verified local directory (nothing loaded)."""
+    from ..eval.timestral_adapter import resolve_pinned_base
+
+    return resolve_pinned_base(mc.base_ref, mc.base_sha256, cache_dir=cache_dir)
 
 
 def _near_dup_refs(rows: MktEntryRows, sen: tuple, datas: dict, holders: dict) -> list:
@@ -1272,6 +1489,6 @@ def fold_mkt_plan(st, plan: MktPlan | None) -> list:
 
 __all__ = [
     "MKT_COMPUTE_ATTEMPTS", "MarketCastMixin", "MktFault", "MktPlan", "anchor_time",
-    "compute_entry_rows", "entry_after", "fold_mkt_plan", "judge_marketcast_entry",
+    "compute_entry_rows", "holder_record", "entry_after", "entry_gap_end", "fold_mkt_plan", "judge_marketcast_entry",
     "mkt_prechecks", "mkt_train_time", "snapshot_record", "suite_of",
 ]

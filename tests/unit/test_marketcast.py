@@ -594,6 +594,7 @@ def test_miner_cli_refuses_mkt_while_inactive(tmp_path):
     assert "marketcast.json" in recipe_error(armed, d, "mkt:returns")
     (d / "marketcast.json").write_text(_json.dumps(_recipe(
         data={"assets": {"crypto": ["BTC"]}, "class_weights": {"crypto": 1.0},
-              "frequencies": ["1m"], "start": "2024-01-01", "end": "2024-06-01"})))
+              "frequencies": ["1m"], "start": "2024-01-01", "end": "2024-06-01"},
+        horizon_mix={"1hx48": 1.0, "1dx7": 0.5})))
     assert recipe_error(armed, d, "mkt:returns") is None
     assert "not active" in recipe_error(replace(cfg, lane_c=armed.lane_c), d, "mkt:returns")

@@ -167,6 +167,10 @@ class TargetWin:
     tier: float | None = None
     full_eras: int | None = None
     below_floor: bool = False
+    # owner 2026-11-18 (MarketCast): the slot holder this win was PAIRED
+    # against on the same windows, and whether it beat it there
+    holder_pointer: str = ""
+    beats_holder: bool = False
 
     def full_pay_record(self) -> dict:
         """``{gain_lcb, tier, full_eras, below_floor}`` — what the payout
@@ -238,16 +242,22 @@ def win_beats(new: TargetWin, cur: TargetWin) -> bool:
       win — by ``(win_block, round_id)`` — holds; a holder trained on an older
       king no longer defends (kings only move forward, so the later win is the
       one on the current king);
-    * same ``base_pointer``: only a STRICTLY higher recorded ``gain_lcb`` vs
-      the king takes the slot (and so restarts the payout clock); on an exact
-      tie the EARLIER win holds. No special case for the holder's own hotkey.
+    * same ``base_pointer`` and ``new`` was PAIRED against ``cur`` (owner
+      2026-11-18, MarketCast: ``new.holder_pointer`` is ``cur``'s checkpoint
+      — both forecast the SAME windows): ``new`` takes the slot iff it beat
+      ``cur`` there (``beats_holder``: the paired gain LCB ≥ the margin);
+    * otherwise same ``base_pointer``: only a STRICTLY higher recorded
+      ``gain_lcb`` vs the king takes the slot (and so restarts the payout
+      clock); on an exact tie the EARLIER win holds. No special case for the
+      holder's own hotkey. Those LCBs come from different settlements'
+      windows: a conservative point comparison, not a paired test.
 
-    The LCBs compared come from different settlements' windows: a
-    conservative point comparison of recorded values, not a paired test.
-    Pure in the four fields, hence order-independent."""
+    Pure in the recorded fields, hence order-independent."""
     newer = (int(new.win_block), str(new.round_id)) > (int(cur.win_block), str(cur.round_id))
     if new.base_pointer != cur.base_pointer:
         return newer
+    if new.holder_pointer and new.holder_pointer == cur.trained_pointer:
+        return bool(new.beats_holder)
     if float(new.gain_lcb) != float(cur.gain_lcb):
         return float(new.gain_lcb) > float(cur.gain_lcb)
     return not newer and (int(new.win_block), str(new.round_id)) != (int(cur.win_block),
@@ -280,6 +290,9 @@ class LaneCState:
     # DEC-CA-0064 exact-identity dedup: checkpoint sha256 -> {"hotkey",
     # "pointer", "target", "commit_block", "train_block"} of the earliest commit
     mkt_seen: dict = field(default_factory=dict)
+    # any other competition's own state, {kind: {...}}
+    # (cascade.validator.lane_c_competitions; persisted only when non-empty)
+    comp: dict = field(default_factory=dict)
 
     def set_pending(self, pending: list[PendingEntry]) -> None:
         for p in pending:
@@ -332,6 +345,8 @@ class LaneCState:
             d["mkt_backlog"] = self.mkt_backlog
         if self.mkt_seen:
             d["mkt_seen"] = self.mkt_seen
+        if self.comp:
+            d["comp"] = self.comp
         return json.dumps(d, sort_keys=True)
 
     @classmethod
@@ -350,7 +365,8 @@ class LaneCState:
                    pending=[PendingEntry(**p) for p in obj.get("pending") or ()],
                    last_rows=obj.get("last_rows"),
                    mkt_backlog=list(obj.get("mkt_backlog") or ()),
-                   mkt_seen=dict(obj.get("mkt_seen") or {}))
+                   mkt_seen=dict(obj.get("mkt_seen") or {}),
+                   comp=dict(obj.get("comp") or {}))
 
 
 def _pending_dict(p: PendingEntry) -> dict:

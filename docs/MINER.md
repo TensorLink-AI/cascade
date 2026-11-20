@@ -71,7 +71,7 @@ cascade status --hotkey YOUR_SS58 --lane a --ref IMMUTABLE_REF \
   --intake https://submissions.cascadesub.net --watch
 cascade status --hotkey YOUR_SS58 --lane b --targets energy --ref IMMUTABLE_REF \
   --intake https://submissions.cascadesub.net --watch
-cascade status --hotkey YOUR_SS58 --lane c --target mkt:returns --ref IMMUTABLE_REF \
+cascade status --hotkey YOUR_SS58 --lane c --target mkt:market --ref IMMUTABLE_REF \
   --intake https://submissions.cascadesub.net --watch
 ```
 
@@ -664,7 +664,7 @@ measured walls are in [MINER_V2_INCENTIVE_INTRO.md](MINER_V2_INCENTIVE_INTRO.md#
 ```bash
 cascade fund https://submissions.cascadesub.net --ref <repo@digest> \
     --wallet-name my-miner --wallet-hotkey gen1 --gpu 8xH200 --max-price 35 --yes
-cascade lane-c fund https://submissions.cascadesub.net --target mkt:returns \
+cascade lane-c fund https://submissions.cascadesub.net --target mkt:market \
     --ref <repo@digest> --wallet-name my-miner --wallet-hotkey gen1 --gpu L40S --yes
 ```
 
@@ -937,8 +937,8 @@ holders keep their remaining eligible pay while replacements are pending.
 is unpaid. A later confirmation must win the target slot; passing below the
 holder's required bound does not earn that slot. C splits its pool by each
 competition's weight over **all configured competition weights**, then equally
-over that competition's target slots. With only MarketCast and its current two
-targets, each full-pay slot reserves **25% / 2 = 12.5% of total emissions**.
+over that competition's target slots. With only MarketCast and its one composite
+target (`mkt:market`), its full-pay slot reserves **all 25% of total emissions**.
 That is a slot maximum, not a promise of paying an unfilled slot. Pending,
 unstarted or ended competitions do not donate their allocation to active ones.
 
@@ -993,8 +993,8 @@ start/end blocks; use these alongside the reward records.
 
 **Worked allocation example, not a measured payout.** All three lanes have
 launched; A's king has a 60%-of-A ladder share, its immediate former king is
-eligible, one B target and one of the two MarketCast targets have full-pay
-holders, and all other B/C slots are empty:
+eligible, one B target and the MarketCast target (`mkt:market`) have full-pay
+holders, and all other B slots are empty:
 
 <!-- cascade:rewards:worked-example:start -->
 | Recipient in the worked example | Share of total emissions |
@@ -1476,13 +1476,15 @@ own-key leg, and that counts as a second lapse. `cascade round` shows the
 slash reason (`operator_paid` / `min_window` / `repeat_lapse`) and the
 earliest block it can lift.
 
-## 14. MarketCast (lane C, `mkt:<suite>` targets) — DEC-CA-0064
+## 14. MarketCast (lane C, the composite `mkt:market` target) — DEC-CA-0064
 
 **Lane C currently accepts MarketCast recipes only.** Its tests use market
 windows that start after training is dispatched and are scored once they
 close. Training data has a separate embargo cutoff.
-Today the only such competition is MarketCast, so the lane-C targets are
-`mkt:returns` and `mkt:vol` (the `[marketcast] suites`). The old DEC-CA-0056
+Today the only such competition is MarketCast, and its shipped lane-C target is
+ONE composite, `mkt:market`, judged over every `[marketcast] suites` member at
+once (`composite = true`; `composite = false` is the per-suite shape,
+`mkt:<suite>`, one slot each). The old DEC-CA-0056
 targets (`domain:…`, `freq:…`, `horizon:…`, judged on the public-feed
 `pool_c` snapshot) are gone. Their windows could be scraped and memorised
 before they were revealed. `cascade lane-c`, the intake and the chain
@@ -1502,12 +1504,14 @@ you called. This section describes live entry after activation.
 MarketCast is a fine-tune eval. You fine-tune a PINNED third-party base,
 `mistralai/Timestral-28M@180698bbf5a50dda3516aa6419798437fb03a430` (its
 `model.safetensors` sha256 is
-`dfc83c6220937ce5fc6687b35a4df94cd25e28a2cfe6fb92a23dad6301b2015d`), for one market suite. The
-suites are `mkt:returns`, `mkt:vol`, `mkt:range`, `mkt:funding`,
-`mkt:liquidity` and `mkt:alpha`; the launch set is returns and vol. Each suite
-is its own lane-C slot, with lane C's decay and TTL; its full-pay period is
-tiered by `[marketcast] full_pay_tiers` (same placeholder table as lane C's,
-kept separate because the MarketCast gain is a different statistic).
+`dfc83c6220937ce5fc6687b35a4df94cd25e28a2cfe6fb92a23dad6301b2015d`), to forecast the
+market. The shipped suites are `ohlcv` (the next bars' high / low / close
+price and volume), `returns`, `vol` (Garman–Klass), `high` / `low` (the
+bar's up / down excursion from its open), `range` and `liquidity` (log
+volume); `funding` and `alpha` exist but are off. `mkt:market` is one lane-C
+slot, with lane C's decay and TTL; its full-pay period is tiered by
+`[marketcast] full_pay_tiers` (same placeholder table as lane C's, kept
+separate because the MarketCast gain is a different statistic).
 
 Licence: the pinned weights use a
 [Modified MIT licence](https://huggingface.co/mistralai/Timestral-28M/blob/180698bbf5a50dda3516aa6419798437fb03a430/LICENSE).
@@ -1521,17 +1525,18 @@ A tree, uploaded like a lane-C tree, with `marketcast.json` at its root and
 an OPTIONAL generator:
 
 ```json
-{"target": "mkt:returns",
+{"target": "mkt:market",
  "data": {"assets": {"crypto": ["BTC", "ETH", "SOL"], "metals": ["GOLD"]},
           "class_weights": {"crypto": 2.0, "metals": 1.0},
-          "frequencies": ["1m", "5m", "1h"],
+          "frequencies": ["5m", "15m", "1h", "4h", "1d"],
           "start": "2025-06-01", "end": "2026-09-01"},
  "context_length": 4096,
- "horizon_mix": {"5m": 1.0, "1h": 1.0, "1d": 0.5},
- "covariates": ["volume", "calendar", "session"],
+ "horizon_mix": {"5mx36": 1.0, "15mx96": 1.0, "1hx48": 1.0, "1dx7": 0.5},
+ "covariates": ["volume", "calendar", "session", "cross_eth", "open_interest"],
  "augmentations": [{"name": "jitter", "p": 0.5, "params": {"sigma": 0.01}},
                    {"name": "crop", "p": 0.3, "params": {"min_frac": 0.5}}],
- "objective": {"suite_weights": {"returns": 1.0, "vol": 0.2}, "coverage_penalty": 0.5},
+ "objective": {"suite_weights": {"ohlcv": 1.0, "returns": 1.0, "vol": 1.0, "range": 0.5},
+               "coverage_penalty": 0.5},
  "optimizer": {"lr": 1e-4, "schedule": "cosine", "warmup_fraction": 0.05,
                "steps": 2000, "batch": 64, "weight_decay": 0.01, "clip": 1.0,
                "ema_decay": 0.999},
@@ -1539,17 +1544,30 @@ an OPTIONAL generator:
  "synthetic_fraction": 0.0}
 ```
 
-- Every key is required (except `quantile_weights`, `coverage_penalty` and
-  `ema_decay`). Unknown keys are refused at every level, and every bound
+- Every key is required (except `quantile_weights`, `coverage_penalty`,
+  `ema_decay`, `leg_hours` and `init`). Unknown keys are refused at every level, and every bound
   comes from `[marketcast]`.
+- `horizon_mix` keys are the target's horizons, written `<bar>x<steps>`: a
+  forecast of `steps` bars of `<bar>` ahead. Every suite is scored on every
+  timeframe (owner 2026-11-18): `1mx60` (the next hour of minutes), `5mx36`
+  (3 h), `15mx96` (a day), `1hx48` (2 days), `4hx42` and `1dx7` (a week).
+  Old names such as `1h` are refused.
 - `data.assets` must be a subset of `[marketcast.assets]`: the universe
   Hyperliquid lists. FX is only `EUR`, `JPY` and `GBP` there.
 - `data.end` must be at least `embargo_days` (30) before your submission.
   In live training the trainer fetches the permitted public data itself;
   you do not upload a private training dataset. Local snapshot commands can
   fetch public data for research.
-- `covariates` ⊆ `cross_asset`, `funding`, `volume`, `calendar`,
-  `session`. Covariates are inputs and are never scored.
+- `covariates` ⊆ `cross_asset` (BTC returns), `cross_eth`, `cross_equity`
+  (the S&P 500 perp), `cross_gold`, `cross_fx` (EUR), `funding`, `volume`,
+  `open_interest`, `spread`, `calendar`, `session`, `events`. Covariates are
+  inputs and are never scored. The cross markets are returns on your
+  window's own bars. `open_interest` (the change of log open interest) and
+  `spread` (the impact bid / ask spread, bp) come from Hyperliquid's live
+  asset contexts, which the API serves only live: the recorder samples them
+  each pass from 2026-11-18 on, so earlier history is missing (NaN rows).
+  `events` marks scheduled high-impact releases from `[marketcast]
+  event_times` (the block an event falls in, and the hours to the next one).
 - `augmentations` ⊆ `scale`, `jitter`, `crop`, `time_warp`, `mixup`, each
   with a probability `p` and numeric `params`.
 - `trainable.scope` is one of `full`, `last_n_blocks` (+ `n_blocks` 1–12),
@@ -1558,8 +1576,22 @@ an OPTIONAL generator:
   export.
 - `synthetic_fraction` > 0 needs a generator in the tree (`generator.py`).
   It uses the same sandboxed `generate()` contract as lane A. Its series are
-  mixed in at that share (≤ 0.5), and synthetic samples carry no
-  covariates.
+  mixed in at that share (0–1), and synthetic samples carry no
+  covariates. You choose the mix: `0` trains on real data only, `1` on your
+  generator only — then `data.assets` and `data.class_weights` may be `{}`.
+- `leg_hours` (optional) is your fine-tune leg's wall clock, in hours, up to
+  `[marketcast] max_leg_hours` (12). You pay the pod for it. Without it the
+  leg runs `[lane_c] leg_hours` (1). Your forward windows start at dispatch,
+  so a longer leg trains longer but does not delay the verdict clock.
+- `init` (optional) warm-starts from an EARLIER MarketCast checkpoint instead
+  of the pinned base: its trained pointer (`metro-v1:trained:hippius:…`),
+  e.g. the current slot holder's or your own last fine-tune. The trainer
+  accepts only a checkpoint IT produced from a leg dispatched before your
+  submission; anything else is refused as your fault before a pod is
+  rented. That keeps every chain of warm-starts outside the embargo gap
+  and keeps out models trained elsewhere. The pod loads exactly that
+  checkpoint (sha256, base architecture, finite weights). Either way you are
+  scored against the pinned base AND, to take the slot, the holder.
 
 Local recipe/quality tests are covered in the
 [agent walkthrough](AGENT_MINING.md#lane-c-test-a-marketcast-recipe).
@@ -1567,26 +1599,26 @@ Once MarketCast is open, check, upload, commit and fund with the human's
 authorization:
 
 ```bash
-cascade lane-c check ./my-mkt --target mkt:returns
-cascade lane-c upload ./my-mkt --target mkt:returns --hub-repo NAMESPACE/NAME --json
-cascade lane-c commit --target mkt:returns --ref <repo@digest> --repo-dir ./my-mkt \
+cascade lane-c check ./my-mkt --target mkt:market
+cascade lane-c upload ./my-mkt --target mkt:market --hub-repo NAMESPACE/NAME --json
+cascade lane-c commit --target mkt:market --ref <repo@digest> --repo-dir ./my-mkt \
     --wallet-name W --wallet-hotkey H
 cascade reveal-status HOTKEY --json
 export LIUM_API_KEY=...
-cascade lane-c fund https://<intake> --target mkt:returns --ref <repo@digest> \
+cascade lane-c fund https://<intake> --target mkt:market --ref <repo@digest> \
     --wallet-name W --wallet-hotkey H --gpu L40S --yes
 ```
 
 Use the upload result's exact `data.ref` for commitment and funding. Uploading
 publishes the recipe; it does not commit or rent a GPU. Before funding, run
-`cascade preflight ./my-mkt --lane c --targets mkt:returns --hotkey HOTKEY
+`cascade preflight ./my-mkt --lane c --targets mkt:market --hotkey HOTKEY
 --ref IMMUTABLE_REF --max-price RATE --max-spend TOTAL --json` and review the
 result. Preflight's total cap is a review input, not an enforced A/B/C spend cap.
 
 The leg runs on YOUR key, with the same token budget and wall as any lane-C
-leg (`[lane_c] leg_hours`), on the GPU type you chose (DEC-CA-0060). An
+leg (your `leg_hours`, else `[lane_c] leg_hours`), on the GPU type you chose (DEC-CA-0060). An
 unavailable type waits and is never burned. The leg fine-tunes the pinned
-base, never the king, so a king change never makes it stale. A bad recipe or
+base (or your `init` checkpoint), never the king, so a king change never makes it stale. A bad recipe or
 a diverged loss is your fault and ends the entry. Infra faults requeue.
 
 Every lane-C entry (DEC-CA-0056 review 2026-10-19):
@@ -1629,13 +1661,29 @@ Every lane-C entry (DEC-CA-0056 review 2026-10-19):
   I/O error stays infra). Eligibility never looks at the realised outcome:
   a window is chosen from what is known when it starts (liquidity, and a
   price context that is not flat).
-- **Calibration gate (`mkt:returns` and `mkt:vol`, red-team 2026-10-20).**
+- **What is forecast.** Every window is a path of `<steps>` bars at its
+  horizon's bar (see `horizon_mix` above). `1mx60`, `5mx36`, `15mx96` and
+  `1hx48` windows are forward-only. `4hx42` and `1dx7` cannot close inside
+  the 6-day wait, so they are cut from the EMBARGO GAP instead (`[marketcast]
+  gap_horizons`): the days between the last day a recipe may train on
+  (`data.end` ≤ your submission's UTC date − 30 days) and your submission.
+  No leg ever reads those days. They are judge-phase evidence only; the
+  confirmation has no fresh gap. The rows record the submission instant
+  they were cut before (`gap_end`, the trainer's `train_time`).
+- **Score per window:** mean CRPS over the path's steps (2 × mean pinball
+  over the 21 knots), divided by the seasonal-naive mean absolute error of
+  the window's context (`crps_scale = "seasonal_naive"`, GIFT-Eval's MASE
+  denominator, season one day of bars; lag 1, then the level scale, when the
+  context is flat). It is fixed before the window opens, so a volatile
+  window cannot dominate its cell.
+- **Calibration gate (`returns` and `vol` windows, red-team 2026-10-20).**
   At EVERY horizon the 50 / 80 % intervals must cover within −0.05 / +0.10
   of nominal, and the share of outcomes below your 5 % quantile and above
   your 95 % quantile must each be 5 % ± 2.5 %, per horizon and pooled over
   horizons. Every rate is averaged over asset CLASSES (3 FX pairs count as
   much as 28 crypto perps), and every band widens to 3 standard errors where
-  the counts are thin. Narrowing your quantiles does not pay: the score is
+  the counts are thin — counted in WINDOWS, not path steps, which share one
+  origin. Narrowing your quantiles does not pay: the score is
   mean CRPS (see Verdict), and narrow tails fail this gate.
 - The trainer checks your recipe's `data.end` against the embargo at
   dispatch (before anything is rented), and your pod never sees a bar after
@@ -1648,11 +1696,37 @@ Every lane-C entry (DEC-CA-0056 review 2026-10-19):
   suite this round, or the slot holder), you are a `duplicate`. Nudging a
   copied checkpoint's weights does not escape it. Slots compare fine-tunes against the
   pinned base, so a king change never displaces a MarketCast slot holder.
-- **Verdict:** per asset class and horizon, the ratio of your MEAN CRPS to
-  the base's mean CRPS over the class's windows; the gain is `1 −` the
-  geomean of those ratios (classes equal inside a horizon, horizons equal),
-  and its bootstrap `LCB ≥ 0.01` at `alpha / k`. Never a per-window log
-  ratio, so a too-narrow forecast cannot beat an honest one. `k = C × m`:
+- **Verdict: proven better overall, never confidently worse anywhere.** Per
+  asset class and horizon, the ratio of your MEAN loss to the base's over
+  the class's windows; inside a suite the geomean of those ratios (classes
+  equal inside a horizon, horizons equal, the ohlcv fields as extra
+  columns); across suites a WEIGHTED geomean (`[marketcast]
+  composite_suite_weights`), so each property of a forecast counts once:
+  location (returns 0.25 + ohlcv close) 0.30, dispersion (vol 0.18 + range
+  0.12) 0.30, extremes (high 0.075 + low 0.075 + ohlcv high / low) 0.25,
+  activity (liquidity 0.10 + ohlcv volume) 0.15, the ohlcv suite's 0.20 being
+  its four fields at 0.05 each. The composite gain's bootstrap `LCB ≥ 0.01`
+  at `alpha / k`. Never a per-window log ratio, so a too-narrow forecast
+  cannot beat an honest one. On top of that, from the SAME bootstrap, the
+  entry fails when it is CONFIDENTLY worse (its upper bound below 0) than:
+  - the base on any one suite (`composite_suite_floor` 0);
+  - the base on any guard (`guards`, `guard_floor` 0), each a second proper
+    loss on the same windows: `mase` (median absolute error ÷ the same
+    seasonal-naive scale, on every suite but returns), `qlike` (QLIKE of
+    your forecast's mean variance on vol) and `tail` (the quantile score at
+    1 / 5 / 95 / 99 %, on returns and vol) — a CRPS win bought by worse
+    medians, variance or tails fails;
+  - the strong simple baselines on any suite (`baseline_gate`): a random walk
+    with EWMA volatility and filtered-historical-simulation innovations for
+    returns and price levels, a seasonal profile + AR(1) for vol, range,
+    excursions and volume. Your composite gain over them must also have
+    `LCB ≥ 0`. Measured 2026-11-18, the untouched base beats them by 9.9 %
+    overall but only ties on returns, and loses on 1d returns (−6.4 %) and
+    1d highs (−10.7 %).
+
+  A noisy near-tie on one part passes; a real regression does not. Every
+  part's gain, LCB and UCB is on the receipt row (`mkt.suites`,
+  `mkt.vs_baseline`, `mkt.base_vs_baseline`). `k = C × m`:
   `C` = distinct OWNERS (coldkeys) with an entry on the suite in the round,
   `m` = your coldkey's own entries there. Extra hotkeys on one coldkey share
   that coldkey's level and never raise the bar for others. The trainer also
@@ -1661,8 +1735,12 @@ Every lane-C entry (DEC-CA-0056 review 2026-10-19):
   (asset class × 6 h block) clusters, and the calibration gate above.
 - An initial pass is **pending confirmation**, with no payment. A later
   settlement must pass it again at `alpha` on windows starting after the first
-  snapshot ended. Confirmation must also win the target slot; passing below
-  the current holder's required bound does not replace it or start payment.
+  snapshot ended. Confirmation must also win the target slot: the main
+  validator forecasts the current holder on YOUR windows, and you take the
+  slot only by beating it there (paired gain `LCB ≥ gain_margin`, recorded as
+  `mkt.vs_holder`), not by a higher LCB the holder recorded on another week.
+  If the holder cannot be forecast, the recorded-LCB comparison applies.
+  Passing the base but not the holder does not replace it or start payment.
   Expired or deregistered holders no longer block a replacement. Each target
   has one final `confirmed` holder per settlement; an initial-test runner-up
   is labelled `not_selected` and earns no reward.

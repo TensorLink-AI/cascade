@@ -183,7 +183,8 @@ def reproduce_marketcast(receipt, mc, *, reports: dict, quantiles: dict, snapsho
             data = quantiles.get(e.quantiles_key) if e.quantiles_key else None
             if e.deferred or e.fault or data is None:
                 continue
-            ws = target_windows(snap, mc, e.target.split(":", 1)[1], after=float(e.after))
+            ws = target_windows(snap, mc, e.target.split(":", 1)[1], after=float(e.after),
+                                gap_end=float(getattr(e, "gap_end", 0.0)))
             qs = decode_quantiles(data, [w.steps for w in ws], len(knots))
             ft, covs = forecaster_fn(e.trained_pointer)
             pick = set(sample_ids([w.wid for w in ws], sample, f"{rep.round_id}|{e.hotkey}"))
@@ -191,7 +192,8 @@ def reproduce_marketcast(receipt, mc, *, reports: dict, quantiles: dict, snapsho
                 if w.wid not in pick:
                     continue
                 p, kn = window_covariates(snap, w, tuple(covs),
-                                          context_length=int(mc.eval_context_length))
+                                          context_length=int(mc.eval_context_length),
+                                          event_times=tuple(getattr(mc, "event_times", ())))
                 rb = batched_forecasts(base, [w.context], w.steps, levels=knots)[0]
                 rf = batched_forecasts(ft, [w.context], w.steps, levels=knots,
                                        past=None if p is None else [p],

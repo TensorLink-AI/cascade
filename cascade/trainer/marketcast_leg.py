@@ -45,6 +45,7 @@ import math
 import time
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import asdict, dataclass
+from pathlib import Path
 
 import numpy as np
 
@@ -138,6 +139,7 @@ class Batch:
     past: np.ndarray | None         # (B, C_p, T)
     known: np.ndarray | None        # (B, C_f, T + steps)
     synthetic: int
+    freq_minutes: int = 0           # the series' step (the seasonal-naive season)
 
 
 def _pick(rng: np.random.Generator, weights: dict[str, float]) -> str:
@@ -164,6 +166,9 @@ class MktSampler:
         self.series: dict[tuple, np.ndarray] = {}
         self.geom: dict[tuple[str, str], tuple[int, int]] = {}
         assets = dict(recipe.assets)
+        # owner 2026-11-16: a pure-synthetic recipe trains every weighted suite
+        # on generator series alone (no real series needed)
+        pure = float(recipe.synthetic_fraction) >= 1.0
         from ..shared.config.marketcast import SUITE_CLASSES, base_suite
 
         # the composite target (owner 2026-11-10) trains on every weighted
@@ -201,8 +206,16 @@ class MktSampler:
                             if x is not None and np.isfinite(x).sum() > MIN_CONTEXT:
                                 self.series[(suite, cls, a, f)] = x
                                 have = True
-                if have:
+                if have or (pure and any(s2 == suite for s2, _h in self.geom)):
                     self.suites[suite] = float(w) / len(labels)
+        # a horizon whose frequency has no real series (e.g. 15m in an
+        # embargoed range: the training snapshot holds 1m + 1h only) trains
+        # on generator series or not at all — never a batch that cannot be cut
+        if self.synthetic is None:
+            real = {(k[0], k[3]) for k in self.series}
+            self.geom = {sh: g for sh, g in self.geom.items() if (sh[0], g[0]) in real}
+            self.suites = {s: w for s, w in self.suites.items()
+                           if any(s2 == s for s2, _h in self.geom)}
         if composite:
             if not self.suites:
                 raise MktLegError("no training data for any suite of the composite target "
@@ -292,7 +305,9 @@ class MktSampler:
                 else:
                     w = MktWindow("", key[1], key[2], suite, h, f, steps, 0.0, 0.0, k, c, y)
                     p, kn = window_covariates(self.snap, w, names,
-                                              context_length=int(self.r.context_length))
+                                              context_length=int(self.r.context_length),
+                                              event_times=tuple(getattr(self.mc, "event_times",
+                                                                        ())))
                     past.append(p)
                     known.append(kn)
         T = max(c.size for c in out_c)
@@ -312,7 +327,7 @@ class MktSampler:
                 P[i, :, T - n:] = past[i][:, -n:]
             if K is not None and known[i] is not None:
                 K[i, :, T - n:] = known[i][:, -(n + steps):]
-        return Batch(suite, h, steps, C, np.stack(out_y), P, K, synth)
+        return Batch(suite, h, steps, C, np.stack(out_y), P, K, synth, int(f))
 
 
 # ── loss + the fine-tune loop (torch) ────────────────────────────────────────
@@ -334,10 +349,16 @@ def lr_at(step: int, *, total: int, lr: float, warmup_fraction: float, schedule:
 
 
 def quantile_loss(pred, target, context, levels: Sequence[float], weights: Sequence[float],
-                  coverage_penalty: float = 0.0, coverage_levels=(0.5, 0.8, 0.98)):
+                  coverage_penalty: float = 0.0, coverage_levels=(0.5, 0.8, 0.98),
+                  freq_minutes: int | None = None):
     """Knot-weighted pinball on the scale-normalised target (scale = mean
     |Δ context| per sample, ≥ 1e-6), NaN targets masked, + the optional
-    soft coverage penalty ``Σ relu(nominal − soft coverage)²``."""
+    soft coverage penalty ``Σ relu(nominal − soft coverage)²``. With
+    ``freq_minutes`` (``[marketcast] crps_scale = "seasonal_naive"``) the scale
+    is the eval's own per-window divisor, the GIFT-Eval seasonal-naive error
+    of the context (:func:`~cascade.eval.marketcast.seasonal_naive_scale`),
+    so the leg trains on what the verdict scores; a sample with no such scale
+    keeps the mean |Δ| one."""
     import torch
 
     q = torch.as_tensor(levels, dtype=pred.dtype, device=pred.device)
@@ -347,6 +368,13 @@ def quantile_loss(pred, target, context, levels: Sequence[float], weights: Seque
     d = torch.diff(ctx, dim=-1)
     ok = torch.isfinite(d)
     scale = torch.where(ok, d.abs(), torch.zeros_like(d)).sum(-1) / ok.sum(-1).clamp_min(1)
+    if freq_minutes:
+        from ..eval.marketcast import seasonal_naive_scale
+
+        sn = torch.as_tensor([seasonal_naive_scale(r, int(freq_minutes))
+                              for r in np.asarray(context, dtype=np.float64)],
+                             dtype=pred.dtype, device=pred.device)
+        scale = torch.where(torch.isfinite(sn), sn, scale)
     scale = scale.clamp_min(1e-6)[:, None, None]
     mask = torch.isfinite(y)
     yy = torch.where(mask, y, torch.zeros_like(y))[..., None]
@@ -431,13 +459,27 @@ def finetune(model, forward: Callable, sampler: MktSampler, recipe, *, levels: S
             input_hash = hashlib.sha256((input_hash + batch_digest(b)).encode()).hexdigest()
         syn += b.synthetic
         real += b.contexts.shape[0] - b.synthetic
-        pred = forward(b.contexts, b.steps, b.past, b.known)
-        loss = quantile_loss(pred, b.targets, b.contexts, levels, recipe.quantile_weights,
-                             recipe.coverage_penalty)
-        if not torch.isfinite(loss):
-            raise MktLegError(f"non-finite training loss at step {step}")
+        sn = getattr(sampler.mc, "crps_scale", "seasonal_naive") == "seasonal_naive"
+        n = int(b.contexts.shape[0])
+        # gradient accumulation: one optimizer step per recipe batch, at most
+        # micro_batch_tokens context steps per forward (one chunk = unchanged)
+        mb = max(1, int(getattr(sampler.mc, "micro_batch_tokens", 0) or n * b.contexts.shape[1])
+                 // max(1, int(b.contexts.shape[1])))
         opt.zero_grad(set_to_none=True)
-        loss.backward()
+        loss = None
+        for i in range(0, n, mb):
+            j = min(n, i + mb)
+            pred = forward(b.contexts[i:j], b.steps,
+                           None if b.past is None else b.past[i:j],
+                           None if b.known is None else b.known[i:j])
+            part = quantile_loss(pred, b.targets[i:j], b.contexts[i:j], levels,
+                                 recipe.quantile_weights, recipe.coverage_penalty,
+                                 freq_minutes=(b.freq_minutes or None) if sn else None)
+            if not torch.isfinite(part):
+                raise MktLegError(f"non-finite training loss at step {step}")
+            part = part * ((j - i) / n) if (i, j) != (0, n) else part
+            part.backward()
+            loss = part.detach() if loss is None else loss + part.detach()
         torch.nn.utils.clip_grad_norm_(params, float(recipe.clip))
         opt.step()
         if ema is not None:
@@ -470,8 +512,47 @@ def recipe_digest(recipe) -> str:
                                      separators=(",", ":")).encode()).hexdigest()
 
 
+def training_span(recipe, not_after: float | None = None) -> tuple[int, int]:
+    """``(t0, t1)`` of a recipe's real data: ``[data.start, data.end + 1
+    day)``, clipped to the last whole hour before ``not_after``."""
+    from datetime import UTC, date, datetime
+
+    t0 = int(datetime.combine(date.fromisoformat(recipe.start), datetime.min.time(),
+                              tzinfo=UTC).timestamp())
+    t1 = int(datetime.combine(date.fromisoformat(recipe.end), datetime.min.time(),
+                              tzinfo=UTC).timestamp()) + 86400
+    if not_after is not None:
+        t1 = max(t0, min(t1, int(float(not_after)) // 3600 * 3600))
+    return t0, t1
+
+
+def training_intervals(mc: MarketCastConfig) -> tuple[str, ...]:
+    """The recording intervals a training snapshot reads: the minute bars,
+    every native interval an enabled series is cut from, and 1h when a
+    series uses the hourly bank."""
+    from ..pool.marketcast import needed_banks, needs_coarse
+    from ..shared.config.marketcast import duration_minutes
+
+    want = needed_banks(mc)
+    natives = tuple(iv for iv in mc.native_intervals if duration_minutes(iv) in want)
+    return ("1m", *natives, *(("1h",) if needs_coarse(mc) else ()))
+
+
+def training_relay_plan(store, prefix: str, mc: MarketCastConfig, recipe,
+                        not_after: float | None = None) -> dict:
+    """The trainer-side relay plan (:mod:`cascade.pool.marketcast_relay`)
+    for one leg: GET links for the recording a recipe's training snapshot
+    reads, Hyperliquid classes only (other sources are fetched on the pod)."""
+    from ..pool.marketcast_relay import relay_plan, relay_rels
+
+    t0, t1 = training_span(recipe, not_after)
+    hl = [(c, a) for c, a in recipe.assets
+          if mc.sources_for(c)[:1] and mc.sources_for(c)[0] in ("hyperliquid", "hyperliquid_xyz")]
+    return relay_plan(store, prefix, relay_rels(hl, training_intervals(mc), t0, t1))
+
+
 def build_training_snapshot(out_dir, mc: MarketCastConfig, recipe, *, post, get,
-                            not_after: float | None = None) -> dict:
+                            not_after: float | None = None, store=None) -> dict:
     """The recipe's real data: its assets over ``[data.start, data.end + 1
     day)`` from the classes' primary sources (unsigned — digested into the
     entry's ``data_digest``), with the coarse hourly bank over the same span
@@ -482,34 +563,63 @@ def build_training_snapshot(out_dir, mc: MarketCastConfig, recipe, *, post, get,
     ever fetched (review M12; the embargo already keeps ``data.end`` far
     before it — this is the pod-side backstop). Feed failures raise
     :class:`MktDataUnavailable`; a successful empty response is kept empty,
-    so an unavailable feed cannot be mistaken for an invalid recipe."""
-    from datetime import UTC, date, datetime
+    so an unavailable feed cannot be mistaken for an invalid recipe.
 
-    from ..pool.marketcast import fetch_class_bars, fetch_coarse_bars, needs_coarse, write_snapshot
+    With ``store`` (a :class:`~cascade.pool.marketcast_store.MktBarStore` the
+    trainer relayed from the forward recording) every Hyperliquid bank — the
+    1m bars, each native interval (5m / 15m) and the hourly bank — is read
+    from the recording ALONE, never the API: the API keeps only its last
+    ~5000 candles per interval (5m ≈ 17 days), so an embargoed range has no
+    sub-hour candles there, and a recording is fixed bytes, so the same
+    recipe and ``not_after`` give the same ``data_digest``."""
+    from ..pool.marketcast import (
+        fetch_class_bars,
+        fetch_coarse_bars,
+        needed_banks,
+        needs_coarse,
+        write_snapshot,
+    )
+    from ..shared.config.marketcast import duration_minutes
 
-    t0 = int(datetime.combine(date.fromisoformat(recipe.start), datetime.min.time(),
-                              tzinfo=UTC).timestamp())
-    t1 = int(datetime.combine(date.fromisoformat(recipe.end), datetime.min.time(),
-                              tzinfo=UTC).timestamp()) + 86400
-    if not_after is not None:
-        t1 = max(t0, min(t1, int(float(not_after)) // 3600 * 3600))
+    t0, t1 = training_span(recipe, not_after)
     minutes = (t1 - t0) // 60
     hours = (t1 - t0) // 3600
     want_coarse = needs_coarse(mc)
+    want = needed_banks(mc)
+    natives = [iv for iv in mc.native_intervals if duration_minutes(iv) in want]
     bars: dict = {}
     coarse: dict = {}
+    native: dict = {iv: {} for iv in natives}
+
+    def _hl(cls):
+        return mc.sources_for(cls)[:1][0] in ("hyperliquid", "hyperliquid_xyz")
+
+    def _banked(cls, a, interval, steps):
+        if store is not None and _hl(cls):
+            return store.read(cls, a, t0, steps, interval=interval)
+        return fetch_coarse_bars(cls, a, mc.sources_for(cls)[:1], t0, steps, post=post,
+                                 interval=interval)
+
     for cls, syms in recipe.assets:
         for a in syms:
             try:
                 b, _rep = fetch_class_bars(cls, a, mc.sources_for(cls)[:1], t0, minutes,
-                                           post=post, get=get)
+                                           post=post, get=get,
+                                           store=store if _hl(cls) else None)
             except Exception as e:  # noqa: BLE001 — feed errors are infrastructure faults
                 raise MktDataUnavailable(f"{cls}/{a} training feed unavailable: {e}") from e
             if any(np.isfinite(v).any() for v in b.values()):
                 bars[(cls, a)] = b
+            for iv in natives:
+                try:
+                    nb = _banked(cls, a, iv, (t1 - t0) // (60 * duration_minutes(iv)))
+                except Exception as e:  # noqa: BLE001 — same fault split for native banks
+                    raise MktDataUnavailable(f"{cls}/{a} {iv} feed unavailable: {e}") from e
+                if any(np.isfinite(nb[k]).any() for k in ("close",)):
+                    native[iv][(cls, a)] = nb
             if want_coarse:
                 try:
-                    cb = fetch_coarse_bars(cls, a, mc.sources_for(cls)[:1], t0, hours, post=post)
+                    cb = _banked(cls, a, "1h", hours)
                 except Exception as e:  # noqa: BLE001 — same fault split for coarse feeds
                     raise MktDataUnavailable(f"{cls}/{a} coarse feed unavailable: {e}") from e
                 if any(np.isfinite(v).any() for v in cb.values()):
@@ -517,7 +627,37 @@ def build_training_snapshot(out_dir, mc: MarketCastConfig, recipe, *, post, get,
     return write_snapshot(out_dir, t0=t0, minutes=minutes, bars=bars,
                           sources={c: mc.data_sources_map.get(c, "") for c, _ in recipe.assets},
                           anchor_block=0, anchor_time=float(t0), coarse=coarse or None,
-                          coarse_t0=t0, coarse_steps=hours)
+                          coarse_t0=t0, coarse_steps=hours,
+                          native={iv: (t0, (t1 - t0) // (60 * duration_minutes(iv)), d)
+                                  for iv, d in native.items() if d} or None)
+
+
+def load_init_weights(model, ckpt_dir, *, base_dir, sha256: str) -> None:
+    """Owner 2026-11-18: warm-start ``model`` (the base, in place) from an
+    earlier MarketCast checkpoint the trainer resolved: its weights' sha256
+    must be ``sha256``, its architecture the base's and every weight finite;
+    ``RuntimeError`` otherwise — an OPERATOR fault (the trainer's own
+    lineage disagrees with the registry), never the miner's: never trained on."""
+    from safetensors.torch import load_file
+
+    from ..eval.timestral_adapter import (
+        WEIGHTS_FILE,
+        safetensors_all_finite,
+        same_structure,
+        sha256_file,
+    )
+
+    p = Path(ckpt_dir) / WEIGHTS_FILE
+    if not p.is_file() or sha256_file(p) != str(sha256):
+        raise RuntimeError("warm-start checkpoint is not the one the trainer resolved")
+    diff = same_structure(Path(base_dir) / WEIGHTS_FILE, p)
+    if diff:
+        raise RuntimeError(f"warm-start checkpoint is not the base architecture: {diff[:3]}")
+    if not safetensors_all_finite(p):
+        raise RuntimeError("warm-start checkpoint weights are not finite")
+    sd = load_file(str(p))
+    dev = next(model.parameters()).device
+    model.load_state_dict({k: v.to(dev) for k, v in sd.items()}, strict=True)
 
 
 def run_mkt_leg(*, recipe, mc: MarketCastConfig, base_dir, base_fc_inner, train_snap,
@@ -560,5 +700,5 @@ __all__ = [
     "AUG_DEFAULTS", "Batch", "FinetuneResult", "MktDataUnavailable", "MktLegError",
     "MktSampler", "augment",
     "build_training_snapshot", "finetune", "lr_at", "quantile_loss", "recipe_digest",
-    "run_mkt_leg",
+    "run_mkt_leg", "load_init_weights", "training_intervals", "training_relay_plan", "training_span",
 ]

@@ -2137,15 +2137,16 @@ Point `cascade-validator --eval-hosts` at its `hosts.toml`. Leave `cuda_device`
 unset to expose all visible GPUs, or list one entry per GPU on that same VM;
 the resolver combines those masks. It selects one physical machine, not a
 distributed fleet. `--device cuda` runs on a GPU VM hosting the validator itself.
-MarketCast currently uses the validator's own `--device`.
+MarketCast uses its own flag, `--mkt-eval-hosts` (see
+[MarketCast GPU offload](#marketcast-gpu-offload)).
 
 For an evaluation-only Targon VM, start the validator with both
 `--eval-hosts targon-eval.toml` and `--private-eval-hosts targon-eval.toml`.
 The private path covers A verdicts, king checks and B acceptance through the
 shared evaluator; the public path covers GIFT-Eval, BOOM, TIME and FEV.
-MarketCast C uses the validator's own `--device` and is not routed by either
-hosts flag. Run the main validator itself on its intended GPU for C, or qualify
-a separate C offload implementation before launch. A configured private host
+MarketCast C is not routed by either hosts flag: it forecasts on the
+validator's own `--device` unless `--mkt-eval-hosts` names the elastic
+MarketCast pod (below). A configured private host
 that disappears holds evaluation. Public benchmarks retain the documented
 local-device fallback when their host is unavailable. The repository does not
 prove these flags are present in a running service.
@@ -2203,7 +2204,9 @@ audit reproduction, not by every validator to derive the recorded verdict):
     ETFs and mega-caps.
 
   These are perp prices: they carry a basis and drift off-hours, which is
-  acceptable for a forecasting eval.
+  acceptable for a forecasting eval. Every Hyperliquid call retries a 429 /
+  5xx with exponential backoff (`with_backoff`: 6 attempts, `Retry-After`
+  honoured up to 60 s) — without it a 429 burst dropped whole banks.
 - Binance spot 1m klines are the crypto cross-check. Its result is reported
   in `snapshot.json` `cross_check` and never gates.
 - dTAO alpha comes from `cascade-pool mkt-record-alpha --out <file>`, cron'd
@@ -2234,7 +2237,12 @@ other signer):
 2026-11-10). `mkt-record` records every CLOSED Hyperliquid candle at 1m, at
 each `[marketcast] native_intervals` interval (5m, 15m) and at 1h, plus the
 funding samples, into the bar store (`<store>/<class>/<asset>/<day>/` for 1m,
-`<store>/<class>/<asset>/<interval>/<day>/` for the others). The FIRST pass
+`<store>/<class>/<asset>/<interval>/<day>/` for the others). Since 2026-11-18
+each pass also samples Hyperliquid's LIVE asset contexts once per dex
+(`metaAndAssetCtxs`: open interest and the impact bid / ask spread) into
+`<store>/<class>/<asset>/ctx.jsonl`. The API serves no history of either, so
+the `open_interest` / `spread` covariates exist only from the first recorded
+pass on; a sample older than 3 h reads as missing. The FIRST pass
 of an (asset, interval) the store holds nothing for backfills the API's full
 ~5000-candle depth (`--no-backfill` to skip); later passes re-fetch the last
 48 h and merge, so an outage shorter than ~3 days loses nothing, and an
@@ -2275,9 +2283,19 @@ from listing. So:
 - the API alone keeps only ~3.6 days of 1m candles, less than the 6-day
   verdict wait — hence the recorder above (each window's realized candles
   must be captured before the API drops them);
-- a recipe's embargoed training range (≥ 30 days old) has no minute bars on
-  Hyperliquid; the training snapshot also fetches the hourly bank, so ≥ 1h
-  suites train on real data and sub-hourly ones only on the generator's.
+- a recipe's embargoed training range (≥ 30 days old) has no minute or
+  5-minute bars on Hyperliquid. Set `[marketcast] bar_relay =
+  "<bucket>/<prefix>/"` (the recorder's mirror on the `[storage]` endpoint,
+  e.g. `tsbench-forge-sources/marketcast/bars/`; `HIPPIUS_S3_*` credentials
+  on the TRAINER only) and the trainer lists the recording inside the
+  recipe's range and presigns one GET link per object (24 h) into
+  `mkt_bars.json` in the leg's `--corpus-dir` (DEC-CA-0053's pattern: the pod
+  holds no credential). The pod downloads exactly those files and builds its
+  training snapshot from the recording alone, so the same recording gives
+  the same `data_digest`. Empty `bar_relay` = the API path, where sub-hour
+  suites train only on the generator's series. Real sub-hour data exists
+  only once the recording is 30 days older than the submission (Hippius
+  2026-11-18: 5m from ~2026-11-28, 1m from ~2026-12-10).
 
 Window eligibility and the verdict (review II, 2026-10-19): per (asset,
 horizon) `windows_per_cell` (48) windows spread evenly over the eligible
@@ -2303,10 +2321,25 @@ per asset.
 The loader refuses a configuration with an unscorable (suite, horizon): the
 history of the bank its frequency is cut from (`coarse_history_days`,
 `native_history_days` or `snapshot_days`) must hold the 32-step context + the
-horizon, and the
-forward wait (`verdict_wait_blocks` × 12 s − `start_margin_seconds`) must
-hold two aligned windows (≥ 3 × the horizon). `5d` was dropped from
-`mkt:returns` for that reason.
+horizon, and the span its windows are cut from must hold ONE aligned window
+(≥ 2 × the horizon; 2026-11-18, was two): the forward wait
+(`verdict_wait_blocks` × 12 s − `start_margin_seconds`), or for a
+`gap_horizons` horizon the `embargo_days` gap.
+
+**The horizon grid** (owner 2026-11-18). A horizon is `<bar>x<steps>`: a
+path of `steps` bars of `<bar>`; every shipped suite is scored on every
+timeframe (`[marketcast.frequencies]` / `[marketcast.horizons]` in both
+tomls): `1mx60`, `5mx36`, `15mx96`, `1hx48` forward-only, and `4hx42`,
+`1dx7` in `gap_horizons` — a week cannot close inside the 6-day wait, so
+those windows are cut from the embargo gap before the submission
+(`pool.marketcast.gap_span`: from the first UTC day no recipe can train on
+up to `train_time`). Gap windows exist in the JUDGE phase only (a confirm
+has none); each entry's rows carry the `gap_end` they were cut before,
+which validators and the audit bind to the trainer's `train_time`. On the
+real 9-asset test subset (4 forward days) the grid cut 4320 / 2710 / 260 /
+80 / 270 / 270 windows (1mx60 … 1dx7): the 2-day and week paths are thin
+(1–4 windows per asset per round), but each carries 7–96 steps. The
+calibration slack counts windows, not path steps.
 
 **Suites and the composite verdict** (owner 2026-11-10). The shipped launch
 set is `ohlcv`, `returns`, `vol`, `high`, `low`, `range`, `liquidity`
@@ -2314,41 +2347,88 @@ set is `ohlcv`, `returns`, `vol`, `high`, `low`, `range`, `liquidity`
 of the target is public before the window closes; `alpha` needs its own
 recorder):
 
-| suite | target (per block) | frequencies → horizons |
-|---|---|---|
-| `ohlcv` | the actual next-bar high / low / close price and volume (`ohlcv.h` / `.l` / `.c` / `.v`; the open with `ohlcv_open_weight`, default 0 — a perp's open is the previous close) | 5m, 1h, 1d → 5m, 1h, 4h, 1d |
-| `returns` | log return of the close, bp | 1m, 5m, 1h, 1d → 1m, 5m, 1h, 4h, 1d |
-| `vol` | ln Garman–Klass vol of the block candle, bp (was: std of 1m returns) | 5m, 15m, 1h, 1d → same |
-| `high` / `low` | max up / down excursion from the block's open, bp | 1h, 4h, 1d → same |
-| `range` | ln ln(max H / min L) | 1h, 4h, 1d → same |
-| `liquidity` | ln Σ volume | 1h, 1d → same |
+| suite | target (per block) |
+|---|---|
+| `ohlcv` | the actual next-bar high / low / close price and volume (`ohlcv.h` / `.l` / `.c` / `.v`; the open with `ohlcv_open_weight`, default 0 — a perp's open is the previous close) |
+| `returns` | log return of the close, bp |
+| `vol` | ln Garman–Klass vol of the block candle, bp (was: std of 1m returns) |
+| `high` / `low` | max up / down excursion from the block's open, bp |
+| `range` | ln ln(max H / min L) |
+| `liquidity` | ln Σ volume |
 
-`ohlcv` windows forecast LEVELS and are scored with scale-normalised CRPS:
-each window's CRPS is divided by a scale fixed before it opens (a price
-field's last observed context value; volume's mean over the last 64 context
-values), so BTC and EUR weigh alike. Every other suite's loss keeps its
-units (CRPS in bp or on a log level).
+Every window's CRPS is divided by a scale fixed before it opens:
+`crps_scale = "seasonal_naive"` (default since 2026-11-18) is GIFT-Eval's
+MASE denominator, the mean |x_t − x_{t−m}| of the context with m one day of
+bars (1 at 1d), falling back to lag 1 and then to the level scale
+(`"level"`: a price field's last context value, volume's mean of the last
+64, 1 elsewhere) when the context is flat. So BTC and EUR, calm and wild
+weeks weigh alike; the training loss uses the same scale.
 
 `mkt:market` is ONE lane-C slot (lane C's share undivided). Its gain is
-the geomean over suites of each suite's gain — inside a suite exactly the
-per-suite statistic (class × horizon-balanced ratio of mean losses, ohlcv
-fields as extra columns) — with ONE cluster bootstrap (class × 6 h block)
-giving the composite LCB and every suite's LCB from the same draws. It wins
-iff the composite LCB ≥ `gain_margin` at `alpha / k`, the point gain > 0,
-the window / cluster / time-block floors hold, every enabled suite has
-paired windows, the `returns` and `vol` calibration gates pass, and NO
-suite's LCB is below `-composite_suite_floor` (0.02; the no-regression
-floor: a large gain on one suite cannot buy a regression on another). The
+the WEIGHTED geomean over suites (`composite_suite_weights`, renormalised
+over the enabled suites; 2026-11-18) of each suite's gain — inside a suite
+exactly the per-suite statistic (class × horizon-balanced ratio of mean
+losses, ohlcv fields as extra columns) — with ONE cluster bootstrap (class ×
+6 h block) giving the composite LCB / UCB and every suite's from the same
+draws. The weights count each forecast property once instead of once per
+suite that re-measures it: location (returns 0.25 + ohlcv.c) 0.30,
+dispersion (vol 0.18 + range 0.12) 0.30, extremes (high / low 0.075 each +
+ohlcv.h / .l) 0.25, activity (liquidity 0.10 + ohlcv.v) 0.15, ohlcv's 0.20
+being its four fields at 0.05. The rule is **proven better overall, never
+confidently worse anywhere** (owner 2026-11-19). It wins iff the composite
+LCB ≥ `gain_margin` at `alpha / k`, the point gain > 0, the window / cluster
+/ time-block floors hold, every enabled suite has paired windows, the
+`returns` and `vol` calibration gates pass, and none of these has its UCB
+below the floor (one-sided 95 % at `alpha / k`):
+
+- any suite vs the base (`composite_suite_floor`, 0; was LCB ≥ −0.02, which
+  failed models equal to the base on noisy suites);
+- any guard vs the base (`guards = ["mase", "qlike", "tail"]`,
+  `guard_floor` 0; a report without the guard losses fails): `mase`, the
+  forecast median's absolute error ÷ the window's CRPS scale, on every
+  suite but returns (a returns median is ~0); `qlike`, Patton's QLIKE of the
+  quantile-implied MEAN variance on vol (robust to the noisy realised
+  proxy); `tail`, 2 × mean pinball at 1 / 5 / 95 / 99 % ÷ the scale, on
+  returns and vol;
+- any suite vs the strong simple baselines (`baseline_gate = true`;
+  `cascade/eval/marketcast_baselines.py`: `rw_fhs`, a random walk with EWMA
+  λ = 0.97 volatility and filtered-historical-simulation innovations, for
+  returns and the ohlcv prices; `seasonal_ar`, a per-time-of-day profile +
+  AR(1) on the residual with empirical innovations, for vol / range /
+  high / low / liquidity / ohlcv volume) — and the composite gain over the
+  baselines must have LCB ≥ 0. The baselines are deterministic in each
+  window's context, so the audit re-derives them from the snapshot.
+  Measured 2026-11-18 on the e2e windows: the untouched base +9.9 % over
+  them (LCB +5.1 %), returns +0.5 %, 1d returns −6.4 %, 1d high −10.7 %.
+
+Measured on the 2026-11-18 e2e fine-tune (48 windows per cell, 17 time
+blocks): bootstrap half-widths composite ±0.8 %, mase ±1.8 %, qlike
+±7.8 %, tail ±1.5 % — set by the number of TIME BLOCKS, not windows
+(doubling windows per cell did not narrow them). The
 signed report rows carry every window of every suite (window ids
 `<class>:<asset>|<label>|<horizon>|<start>`, labels `ohlcv.<field>` for the
 level windows); the receipt row records each suite's gain / LCB / windows
-under `mkt.suites`.
+under `mkt.suites` (gain / LCB / UCB), the guards' and the baselines' under
+`mkt.vs_baseline` / `mkt.base_vs_baseline`, and the paired holder test under
+`mkt.vs_holder`.
 
-**Validator GPU cost is unmeasured.** The composite forecasts every enabled
-suite's windows: 24 (suite, horizon) cells — 36 window series with the four
-scored ohlcv fields — vs 9 for the old returns + vol set, about 4× the
-windows (and base + fine-tune forward passes) per entry. Measure it on
-the main validator's GPU before arming (`windows_per_cell` is the lever).
+**The slot is won against the holder on the same windows** (2026-11-18).
+`win_beats` used to compare the challenger's recorded LCB vs the base with
+the holder's — two different weeks. Now, when the confirm row was PAIRED
+against the current holder (`TargetWin.holder_pointer` = the holder's
+`trained_pointer`), the challenger takes the slot iff it beat the holder
+there (`beats_holder`: the paired composite gain LCB ≥ `gain_margin`, gain
+> 0, at `alpha / k`). The recorded-LCB comparison remains the fallback when
+no pairing was measured (the holder could not be forecast, or the slot
+moved inside the round).
+
+**Validator GPU cost.** Measured 2026-11-17 on an RTX 3060 (12 GB): about
+10 ms per window per model (one-pass Timestral), peak 0.5 GiB, so any ≥ 4 GB
+card serves; the old grid was ~15–20 min per model per round. The
+2026-11-18 grid cuts 7 suites (10 series) × 6 horizons, with paths of
+7–96 steps (one pass each), plus one forward of the slot holder per entry
+(the paired test) and CPU baselines — re-measure on the main validator's
+GPU before arming (`windows_per_cell` is the lever).
 
 **Main validator**:
 
@@ -2377,6 +2457,12 @@ the main validator:
    the closest reference as `near_dup`, with that reference's forecasts as a
    second sidecar (`marketcast/round-<id>/r-*.npy`). This is one extra pass
    per reference not already forecast;
+4b. forecasts the target's SLOT HOLDER on each entry's own windows (reusing
+   step 4's pass when the holder was a reference) and records its
+   per-window losses as the rows' `hold`, the holder under `holder`, and its
+   forecasts as `marketcast/round-<id>/h-*.npy` (the audit recomputes
+   `hold` from it). Each row also carries the guard losses (`mase_b/_f`,
+   `qlike_b/_f`, `tail_b/_f`) and the baseline's loss (`bl`);
 5. publishes the float32 quantile sidecars and then
    `marketcast/round-<id>.json`, signed, public-read. It never overwrites a
    report; a missing snapshot or a failed publish is retried at the next
@@ -2414,15 +2500,40 @@ item).
 **Trainer:** a MarketCast leg rides the lane-C queue and payer-pod path. The
 pod runs `cascade-train-worker --role mkt_finetune --local-only` and needs
 the `marketcast` extra in the worker image. The leg rents and harvests under
-the throne contract reduced to `[lane_c] leg_hours` (`mkt_leg_contract`,
-red-team F5), not the 5 h throne wall. The trainer stamps the leg's dispatch
+the throne contract at the LEG's own wall (`mkt_leg_contract`, red-team F5):
+the recipe's `leg_hours` (≤ `[marketcast] max_leg_hours`, 12) or else
+`[lane_c] leg_hours`. That wall may exceed the throne's `max_train_seconds`
+(owner 2026-11-16); before, it was clamped to it, which on testnet's 300 s
+fast-round throne cut every MarketCast leg to 5 minutes. The trainer stamps the leg's dispatch
 time (`train_time`, unix) into the signed `marketcast` record — the
 forward-only clock. It also stamps the dispatching commitment's `coldkey`
 (red-team F6: validators count the Bonferroni family by owner), and keeps at
 most `max_open_legs_per_coldkey` (1) MarketCast legs open per coldkey. The harvest checks the weights' sha256, the base's
 architecture, the base's `config.json`, finite weights and
 `marketcast_meta.json` (required fields, the pinned base, covariates in the
-allow-list, ≤ 64 KiB). While MarketCast is active the trainer reads the main
+allow-list, ≤ 64 KiB). A leg micro-batches its gradient
+(`[marketcast] micro_batch_tokens`, 524288 context tokens per forward;
+gradients accumulate to the recipe's batch), so a 32768 × 512 recipe no
+longer needs ~300 GiB.
+
+**Warm-start lineage** (2026-11-18). A recipe's optional `init` names an
+earlier MarketCast checkpoint. At recipe read (before anything is rented)
+the trainer resolves it against `<work_root>/marketcast_lineage.json`, the
+append-only record of every MarketCast checkpoint IT harvested (pointer →
+`train_time`, `checkpoint_sha256`, `init_pointer`): only one it produced from
+a leg dispatched strictly before this submission is accepted (else the
+miner's `RecipeError`). That checkpoint's data ended `embargo_days` before
+ITS submission, so no chain of warm-starts reads the current gap, and
+nothing trained off-platform gets in. The wrap carries `init_pointer` /
+`init_sha256`; the pod fetches it from the Hub and checks sha256, the base
+architecture and finite weights (a mismatch is an operator fault, never
+the miner's) before loading it into the base; the trainer stamps
+`init_pointer` into the signed `marketcast` record and the lineage. Keep
+`marketcast_lineage.json` with the trainer's state: losing it only refuses
+later `init`s. The audit checks each `init_pointer` against earlier signed
+lane-C manifests.
+
+While MarketCast is active the trainer reads the main
 validator's reports from the manifest bucket at every settlement and records
 them in the lane-C manifest (`mkt_reports`), publishing a lane-C manifest
 even when no leg finished.
@@ -2432,6 +2543,58 @@ every other checkpoint, which is public by design (`cascade/shared/
 hippius.py` notes the namespace serves anonymous pulls), so a judged
 MarketCast fine-tune is public-read from its harvest on — what
 `cascade-audit marketcast --reproduce` needs.
+
+#### MarketCast GPU offload
+
+Only the MAIN validator computes MarketCast rows (every other validator reads
+its signed report). Timestral-28M needs minutes of GPU per round. Rather than
+hold a pod, the provisioner rents a cheap one on demand:
+
+```toml
+# provision.toml (beside the validator)
+mkt_hosts_path  = "/root/cascade/mkt_hosts.toml"
+mkt_lease_hours = 3.0
+[provisioner.mkt]
+sku = "NVIDIA GeForce RTX 3090"; market_sku = "RTX 3090"
+max_pods = 1; providers = ["lium"]; max_price_hr = 0.40
+```
+
+```bash
+cascade-validator ... --mkt-eval-hosts /root/cascade/mkt_hosts.toml   # --mkt-host-wait 1800
+```
+
+How it runs:
+
+- At a settlement with rounds lacking a report, the validator starts ONE
+  background publish run (the settlement thread never waits). It touches
+  `mkt_hosts.toml.request` while it needs the pod.
+- The provisioner rents the pod when the request is live (touched within 30
+  minutes), health-gates it, and publishes it to `mkt_hosts.toml` (never the
+  trainer's or the eval pod's file).
+- The run opens one ssh session to `python -m cascade.validator.mkt_worker
+  --serve`. It uploads the pinned base and each fine-tune once into a
+  content-addressed cache on the pod (`_mkt_offload/cache`, sha256-checked
+  before every load). It forecasts through it. Only contexts and covariates
+  cross; targets, losses, the verdict, the report and the wallet stay local.
+- When the run ends the request is removed and the pod is torn down. The TTL
+  `mkt_lease_hours` backstops a validator that keeps it alive.
+- No pod within `--mkt-host-wait`, or a pod or transport failure mid-run: the
+  round is simply not published yet and is retried at the next settlement.
+  Nothing is infra-deferred and no miner is charged. The trainer records a
+  report `"absent"` only after `report_timeout_settlements` (8 = 24 h).
+
+The worker image must carry the `marketcast` extra. Qualify a pod before
+enabling (remote vs local CPU quantiles within the audit's re-forecast
+tolerance):
+
+```bash
+python -m cascade.validator.mkt_offload /root/cascade/mkt_hosts.toml --chain-toml chain.toml
+```
+
+Another lane-C competition can share this pod. It holds its own request file
+(`mkt_hosts.toml.<kind>.request`), and the pod stays up while any request is
+fresh. See [LANE_C_COMPETITIONS.md](LANE_C_COMPETITIONS.md) for adding a
+competition.
 
 ### Direct submissions (private code, champion-only publication)
 

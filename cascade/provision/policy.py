@@ -5,12 +5,14 @@ API. The service loop (``cascade.provision.loop``) feeds these functions the
 observed world and acts on the answer; keeping the decisions pure makes every
 rule unit-testable without a cloud account.
 
-The provisioner's one rental stage is the validator's **eval** pod (one box,
+The provisioner's main rental stage is the validator's **eval** pod (one box,
 usually one GPU) for its heavy evals (GIFT-Eval gate, cascade bench). It is
 manifest-triggered — rented when a round's manifest publishes — and dies when
 that round's receipt appears (or a newer manifest makes it moot, or the TTL).
 Absent config (``policy.eval is None`` / ``max_pods = 0``) the stage does not
-exist and validators eval locally. The trainer rents its own pods (payer legs,
+exist and validators eval locally. The optional **mkt** stage is a cheap GPU
+the main validator's MarketCast forecasts run on, request-file triggered
+(:mod:`cascade.validator.mkt_offload`). The trainer rents its own pods (payer legs,
 the era king) — see :mod:`cascade.provision.funded`.
 """
 
@@ -106,6 +108,12 @@ class ProvisionPolicy:
     max_spend_per_round: float
     ttl_epochs: int = 1
     eval: StagePolicy | None = None
+    # The MarketCast stage (DEC-CA-0064): a cheap GPU pod the MAIN validator
+    # forecasts on, rented while its request file is live (it needs rows) and
+    # released once the request is gone; ``mkt_lease_hours`` is its own hard
+    # TTL (a MarketCast round is minutes of GPU, never an epoch).
+    mkt: StagePolicy | None = None
+    mkt_lease_hours: float = 3.0
 
 
 def pods_for_slots(slots: int, gpus_per_pod: int, max_pods: int) -> int:
@@ -128,6 +136,7 @@ def teardown_due(
     ttl_hours: float,
     receipt_seen: bool = False,
     newer_manifest: bool = False,
+    mkt_idle: bool = False,
 ) -> bool:
     """Whether a pod of ``stage`` should be terminated NOW.
 
@@ -141,10 +150,14 @@ def teardown_due(
     the pod dies regardless of signals — a silent validator or an unreadable
     store must never turn into an eternally-billing pod. ``heat``/``final``
     pods are only ever ledger leftovers of the retired per-round fleet: the
-    TTL alone reaps them.
+    TTL alone reaps them. **mkt** pods die once the validator's MarketCast
+    request is gone (``mkt_idle`` — its rows are published) or at their TTL
+    (the caller passes ``[provisioner] mkt_lease_hours``).
     """
-    if stage not in ("heat", "final", "eval"):
-        raise ValueError(f"stage must be 'heat', 'final', or 'eval'; got {stage!r}")
+    if stage not in ("heat", "final", "eval", "mkt"):
+        raise ValueError(f"stage must be 'heat', 'final', 'eval' or 'mkt'; got {stage!r}")
     if now - rented_at >= ttl_hours * 3600.0:
         return True
+    if stage == "mkt":
+        return mkt_idle
     return stage == "eval" and (receipt_seen or newer_manifest)

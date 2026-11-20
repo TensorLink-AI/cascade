@@ -353,7 +353,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def run_mkt_worker(args, cfg, log, *, post=None, get=None, synthetic_fn=None,
-                   base_loader=None) -> int:
+                   base_loader=None, init_fetch=None) -> int:
     """``--role mkt_finetune`` (DEC-CA-0064): fine-tune the PINNED Timestral
     base from the miner's MarketCast recipe on this credential-free pod and
     print a ``--local-only`` receipt (the orchestrator harvests). rc 2 =
@@ -361,7 +361,12 @@ def run_mkt_worker(args, cfg, log, *, post=None, get=None, synthetic_fn=None,
     fault), 1 = anything else. ``post`` / ``get`` / ``synthetic_fn`` /
     ``base_loader`` are injectable (tests)."""
     from ..shared.marketcast_recipe import parse_marketcast_recipe
-    from .marketcast_leg import MktLegError, build_training_snapshot, run_mkt_leg
+    from .marketcast_leg import (
+        MktDataUnavailable,
+        MktLegError,
+        build_training_snapshot,
+        run_mkt_leg,
+    )
 
     mc = cfg.marketcast
     if not args.local_only or not args.recipe_json or not args.warm_start_ref:
@@ -404,17 +409,43 @@ def run_mkt_worker(args, cfg, log, *, post=None, get=None, synthetic_fn=None,
         from .continuation import PROTOCOL, restore_marketcast_data, worker_context
         if getattr(args, "continuation_root", None) and mc.continuation_protocol != PROTOCOL:
             raise ValueError("continuation requires an explicitly activated MarketCast contract")
-        max_s = float(cfg.lane_c.leg_hours) * 3600.0
+        from .marketcast_runner import mkt_leg_hours
+        max_s = mkt_leg_hours(cfg, recipe.leg_hours) * 3600.0
         binding = {"backend": "marketcast", "base": mc.base_ref,
             "base_sha256": mc.base_sha256, "recipe": {k: v for k, v in wrap.items() if k != "train_time"},
             "continuation_protocol": mc.continuation_protocol,
             "seed": int(args.base_seed), "gen_ref": args.gen_ref, "hotkey": args.hotkey,
             "max_seconds": max_s}
         if not restore_marketcast_data(args, cfg, binding, work / "_mkt_train"):
+            from ..pool.marketcast_relay import fetch_relay, read_relay_file
+
+            # the trainer's relay of the bar recording (sub-hour candles the
+            # API no longer serves for an embargoed range); absent → the API
+            plan = read_relay_file(getattr(args, "corpus_dir", None))
+            try:
+                store = fetch_relay(plan, work / "_mkt_bars") if plan is not None else None
+            except OSError as e:
+                raise MktDataUnavailable(f"bar recording relay failed: {e}") from e
             build_training_snapshot(work / "_mkt_train", mc, recipe, post=post or http_post_json,
-                                    get=get or http_get_json, not_after=train_time)
+                                    get=get or http_get_json, not_after=train_time, store=store)
         snap = load_snapshot(work / "_mkt_train", verify_signature=False)
         out_dir = work / f"mkt-{args.hotkey[:12]}-{int(args.block)}"
+        init_ptr = str(wrap.get("init_pointer", "") or "")
+        if init_ptr:
+            # owner 2026-11-18: warm-start from the trainer-resolved checkpoint
+            from ..shared.manifest import parse_trained_pointer
+            from .marketcast_leg import load_init_weights
+
+            init_dir = work / "_mkt_init"
+            if init_fetch is not None:
+                init_fetch(init_ptr, init_dir)
+            else:  # pragma: no cover — the Hub on a pod
+                from ..shared.hippius import HubConfig, fetch_from_hub
+
+                fetch_from_hub(parse_trained_pointer(init_ptr), init_dir,
+                               HubConfig.from_storage(cfg.storage))
+            load_init_weights(getattr(base, "inner", base).model, init_dir, base_dir=base_dir,
+                              sha256=str(wrap.get("init_sha256", "")))
         continuation = worker_context(args, cfg, {**binding, "data": snap.digest})
 
         def _run(synthetic):
@@ -422,7 +453,8 @@ def run_mkt_worker(args, cfg, log, *, post=None, get=None, synthetic_fn=None,
                                base_fc_inner=getattr(base, "inner", base), train_snap=snap,
                                out_dir=out_dir, seed=int(args.base_seed), max_seconds=max_s,
                                synthetic=synthetic,
-                               meta_extra={"hotkey": args.hotkey, "gen_ref": args.gen_ref},
+                               meta_extra={"hotkey": args.hotkey, "gen_ref": args.gen_ref,
+                                           **({"init_pointer": init_ptr} if init_ptr else {})},
                                **({"continuation": continuation} if continuation is not None else {}))
 
         if recipe.synthetic_fraction > 0:

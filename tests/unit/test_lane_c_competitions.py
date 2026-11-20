@@ -423,3 +423,27 @@ def test_status_and_dashboard_show_competitions():
     v = _vec(rec, lc, 4)
     split = emission_split(v, [], {"wins": []}, lane_c_pay=rec)
     assert split["lane_c"] == pytest.approx(lc.share / 2 / 3, abs=1e-6)
+
+
+def test_a_long_recipe_is_rechecked_against_the_end_before_any_rent(tmp_path):
+    """The dispatch checks the [lane_c] default leg (1 h); a MarketCast recipe
+    may ask up to [marketcast] max_leg_hours — once fetched, a leg that would
+    outrun the end fails uncharged before anything is rented."""
+    from cascade.funding.queue import COMPETITION_ENDED_CLASS
+    from cascade.trainer.lane_c_driver import LaneCDriver
+    from cascade.trainer.marketcast_runner import MktLegRecipe
+
+    from .test_lane_c_trainer_driver import FROM, KING, REF, Clock, E, FakeOps, _cfg, _fund
+
+    base = _cfg()
+    until = FROM + 2 * ERA
+    lc = replace(base.lane_c, competitions=(LaneCCompetition("mkt", until_block=until),))
+    c = SimpleNamespace(lane_c=lc, marketcast=base.marketcast)
+    ops = FakeOps(tmp_path, Clock())
+    ops.recipes[REF["ALFA"]] = MktLegRecipe(E, json.dumps({"leg_hours": 12.0}), False)
+    drv = LaneCDriver(c, ops, tmp_path / "d.json")
+    _fund(ops, "ALFA", E)
+    assert [x["hotkey"] for x in drv.tick(until - 400, 10, KING, FROM)] == ["ALFA"]
+    e = ops.q.get("ALFA")
+    assert (e.status, e.last_error_class, e.attempts) == ("failed", COMPETITION_ENDED_CLASS, 0)
+    assert ops.trained == [] and drv.st.open == []

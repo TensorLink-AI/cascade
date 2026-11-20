@@ -3014,11 +3014,15 @@ def _lane_c_holder_kept(row: dict, boundary: int, round_id: str) -> bool:
     if not h:
         return False
     t = str(row.get("target"))
+    vs = dict((row.get("mkt") or {}).get("vs_holder") or {})
     new = TargetWin(target=t, hotkey=str(row.get("hotkey")), uid=0, round_id=str(round_id),
                     win_block=int(boundary), base_pointer=str(row.get("base_pointer", "")),
-                    gain_lcb=float(row.get("gain_lcb") or 0.0))
+                    gain_lcb=float(row.get("gain_lcb") or 0.0),
+                    holder_pointer=str(vs.get("pointer", "") or ""),
+                    beats_holder=bool(vs.get("beats", False)))
     cur = TargetWin(target=t, hotkey=str(h.get("hotkey")), uid=0,
                     round_id=str(h.get("round_id", "")), win_block=int(h.get("win_block", 0)),
+                    trained_pointer=str(h.get("trained_pointer", "")),
                     base_pointer=str(h.get("base_pointer", "")),
                     gain_lcb=float(h.get("gain_lcb") or 0.0))
     return not win_beats(new, cur)
@@ -3597,10 +3601,46 @@ def _mkt_train_time(r: dict, m: dict, cfg: ChainConfig, manifests: dict | None,
 
                     # red-team F6: the owner the trainer stamped (coldkey)
                     cache[("owner", e.miner_hotkey, e.trained_pointer)] = mkt_owner(e)
+                    cache[("init", e.miner_hotkey, e.trained_pointer)] = str(
+                        dict(e.marketcast or {}).get("init_pointer", "") or "")
                     t = dict(e.marketcast or {}).get("train_time")
                     return (float(t), "manifest") if t is not None else (None, "manifest")
     t = m.get("train_time")
     return (None if t is None else float(t)), "row"
+
+
+def _mkt_init_lineage(init: str, train_time: float, cfg: ChainConfig, manifests: dict | None,
+                      cache: dict) -> str | None:
+    """Owner 2026-11-19: a warm-started MarketCast entry's lineage — its
+    ``init_pointer`` must be the trained pointer of a MarketCast entry in an
+    EARLIER trainer-signed lane-C manifest (``train_time`` strictly before
+    this entry's): the trainer's own lineage check, re-derived from signed
+    records. ``""`` = verified, a reason = the lineage is broken, None = no
+    signed manifest the auditor holds settles it (reported as missing)."""
+    from ..shared.config.lane_c import is_mkt_target
+    from ..shared.lane_c_manifest import load_lane_c_manifest, verify_lane_c_manifest
+
+    seen = False
+    for rid, text in sorted((manifests or {}).items()):
+        cm = cache.get(rid)
+        if cm is None:
+            try:
+                cm = load_lane_c_manifest(text)
+                ok = verify_lane_c_manifest(cm, str(cfg.manifest.trainer_hotkey or ""))
+            except Exception:  # noqa: BLE001
+                ok = False
+            cm = cache[rid] = cm if ok else False
+        if not cm:
+            continue
+        seen = True
+        for e in cm.entries:
+            if e.trained_pointer == init and is_mkt_target(e.target):
+                t = dict(e.marketcast or {}).get("train_time")
+                if t is not None and float(t) < float(train_time):
+                    return ""
+                return f"warm-start {init[:48]} was dispatched at {t}, not before {train_time}"
+    return None if not seen else (f"warm-start {init[:48]} is in no trainer-signed MarketCast "
+                                  f"manifest the auditor holds")
 
 
 def check_marketcast(receipt: RoundReceipt, cfg: ChainConfig,
@@ -3659,11 +3699,15 @@ def check_marketcast(receipt: RoundReceipt, cfg: ChainConfig,
     if not mkt:
         return _ok(name, "no MarketCast rows at this settlement")
     from ..eval.marketcast import COVERAGE_GATE_SUITES
-    from ..pool.marketcast import target_windows
+    from ..pool.marketcast import gap_span, target_windows
     from ..shared.config.marketcast import base_suite
     from ..shared.marketcast_report import (
+        GUARD_FIELDS,
+        baseline_scores,
         behaviour_distance,
         decode_quantiles,
+        guard_scores,
+        holder_gain,
         load_mkt_report,
         mkt_text_digest,
         score_windows,
@@ -3730,6 +3774,13 @@ def check_marketcast(receipt: RoundReceipt, cfg: ChainConfig,
         tt, src = _mkt_train_time(r, m, cfg, lane_c_manifests, mcache)
         if src == "row":
             _miss("lane-C manifest (train_time)")
+        init = mcache.get(("init", str(r.get("hotkey")), str(r.get("trained_pointer"))), "")
+        if init and tt is not None:
+            why = _mkt_init_lineage(init, tt, cfg, lane_c_manifests, mcache)
+            if why is None:
+                _miss("lane-C manifest (warm-start lineage)")
+            elif why:
+                return _fail(name, f"{who}: {why}")
         own = mcache.get(("owner", str(r.get("hotkey")), str(r.get("trained_pointer"))))
         if own is not None and str(m.get("owner") or "") != own:
             return _fail(name, f"{who}: owner {m.get('owner')!r} but the trainer-signed lane-C "
@@ -3758,6 +3809,11 @@ def check_marketcast(receipt: RoundReceipt, cfg: ChainConfig,
         if want_after is None or not usable:
             return _fail(name, f"{who}: windows start after {ent.after}, the trainer's dispatch "
                                f"time gives {want_after}")
+        want_gap = (float(tt) if str(r.get("phase", ent.phase)) == "judge"
+                    and tuple(getattr(mc, "gap_horizons", ())) else 0.0)
+        if float(ent.gap_end) != want_gap:
+            return _fail(name, f"{who}: gap windows end by {ent.gap_end}, the trainer's dispatch "
+                               f"time gives {want_gap}")
         # red-team F4: the near-duplicate record and the stage it implies
         from ..validator.marketcast import near_duplicate_of
 
@@ -3781,8 +3837,15 @@ def check_marketcast(receipt: RoundReceipt, cfg: ChainConfig,
             return _fail(name, f"{who}: fine-tune loss non-finite on {nonfinite[:2]} — that "
                                f"entry is a fault, not a verdict")
         cells: dict[tuple, int] = {}
+        gaps = tuple(getattr(mc, "gap_horizons", ()))
         for w in ent.windows:
-            if not (w.start > float(ent.after) and w.end <= int(snap_rec.get("end", 0))):
+            if w.horizon in gaps:
+                # owner 2026-11-18: a gap window sits inside the embargo gap
+                lo, hi = gap_span(mc, float(ent.gap_end)) if ent.gap_end else (0.0, -1.0)
+                if not (w.start > lo and w.end <= hi):
+                    return _fail(name, f"{who}: gap window {w.wid} is outside the embargo "
+                                       f"gap before {ent.gap_end}")
+            elif not (w.start > float(ent.after) and w.end <= int(snap_rec.get("end", 0))):
                 return _fail(name, f"{who}: window {w.wid} is not forward-only "
                                    f"(after {ent.after}, snapshot end {snap_rec.get('end')})")
             c = (w.suite_label, w.cluster, w.horizon)
@@ -3796,7 +3859,8 @@ def check_marketcast(receipt: RoundReceipt, cfg: ChainConfig,
         if snap is None:
             _miss("snapshot")
         else:
-            want = target_windows(snap, mc, suite, after=float(ent.after))
+            want = target_windows(snap, mc, suite, after=float(ent.after),
+                                  gap_end=float(ent.gap_end))
             got_ids = [w.wid for w in ent.windows]
             want_ids = [w.wid for w in want]
             if got_ids != want_ids:
@@ -3827,9 +3891,18 @@ def check_marketcast(receipt: RoundReceipt, cfg: ChainConfig,
                                              for w in want],
                                       tail_levels=tuple(rep.tail_levels or mc.tail_levels),
                                       scales=[w.scale for w in want])
-                for w, (b, f, ci, cn, tl) in zip(ent.windows, again, strict=True):
+                gs = guard_scores([w.target for w in want], [q[0] for q in qs],
+                                  [q[1] for q in qs], knots=tuple(mc.quantile_knots),
+                                  guards=[mc.guards_of(w.suite) for w in want],
+                                  scales=[w.scale for w in want])
+                bls = baseline_scores(want, knots=tuple(mc.quantile_knots))
+                for w, (b, f, ci, cn, tl), g, bl in zip(ent.windows, again, gs, bls,
+                                                        strict=True):
                     same = all((math.isnan(x) and math.isnan(y)) or x == y
-                               for x, y in ((float(w.base), b), (float(w.ft), f)))
+                               for x, y in ((float(w.base), b), (float(w.ft), f),
+                                            (float(w.bl), bl),
+                                            *((float(getattr(w, k)), g.get(k, math.nan))
+                                              for k in GUARD_FIELDS)))
                     if (not same or tuple(w.cov_in) != tuple(ci) or int(w.cov_n) != int(cn)
                             or tuple(w.tail) != tuple(tl)):
                         return _fail(name, f"{who}: window {w.wid} recomputes to base={b} "
@@ -3866,6 +3939,42 @@ def check_marketcast(receipt: RoundReceipt, cfg: ChainConfig,
                             return _fail(name, f"{who}: near_dup recomputes to mean={dm} "
                                                f"max={dx} over {len(want)} windows; the report "
                                                f"says {nd}")
+                # owner 2026-11-18: the holder pairing's losses from its sidecar
+                hd = dict(ent.holder or {})
+                if hd:
+                    hdata = (quantiles or {}).get(str(hd.get("quantiles_key", "")))
+                    if hdata is None:
+                        _miss("holder sidecar")
+                    else:
+                        if hashlib.sha256(bytes(hdata)).hexdigest() != hd.get(
+                                "quantiles_sha256"):
+                            return _fail(name, f"{who}: holder sidecar is not the bound one")
+                        try:
+                            hq = decode_quantiles(hdata, [w.steps for w in want],
+                                                  len(mc.quantile_knots))
+                        except ValueError as e:
+                            return _fail(name, f"{who}: holder sidecar unusable: {e}")
+                        hs = score_windows([w.target for w in want], [q[0] for q in qs],
+                                           [q[1] for q in hq], knots=tuple(mc.quantile_knots),
+                                           coverage_levels=(), gated=False,
+                                           scales=[w.scale for w in want])
+                        bad = [w.wid for w, x in zip(ent.windows, hs, strict=True)
+                               if not ((math.isnan(float(w.hold)) and math.isnan(x[1]))
+                                       or float(w.hold) == x[1])]
+                        if bad:
+                            return _fail(name, f"{who}: holder loss on {bad[0]} does not "
+                                               f"recompute from the holder sidecar")
+        hd = dict(ent.holder or {})
+        hrow = r.get("holder") or {}
+        if hd and hrow.get("trained_pointer") and str(hd.get("pointer")) != str(
+                hrow.get("trained_pointer")):
+            return _fail(name, f"{who}: paired against {hd.get('pointer')} but the slot holder "
+                               f"was {hrow.get('trained_pointer')}")
+        vs_want = holder_gain(ent, mc, k=int(r.get("k", 1) or 1),
+                              seed=f"{m.get('round', '')}|{r.get('hotkey')}|{r.get('target')}")
+        if (vs_want or None) != (m.get("vs_holder") or None):
+            return _fail(name, f"{who}: vs_holder {m.get('vs_holder')} but the rows re-derive "
+                               f"{vs_want}")
         if stage == "duplicate":
             replayed += 1
             continue

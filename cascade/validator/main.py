@@ -32,6 +32,14 @@ def _build_parser() -> argparse.ArgumentParser:
                    "Default 1 preserves sequential execution; qualify on the chosen hardware")
     p.add_argument("--private-eval-timeout", type=int, default=3600,
                    help="total private GPU offload deadline in seconds")
+    p.add_argument("--mkt-eval-hosts", type=Path, default=None,
+                   help="MAIN validator: forecast MarketCast rows on the GPU pod the "
+                   "provisioner's [provisioner.mkt] stage publishes to this hosts file "
+                   "(requested via <file>.request while rows are due; off the settlement "
+                   "thread). Unset = MarketCast forecasts on --device")
+    p.add_argument("--mkt-host-wait", type=float, default=1800.0,
+                   help="seconds one MarketCast publish run waits for its pod before the "
+                   "rounds are retried at the next settlement")
     p.add_argument("--eval-hosts", type=Path, default=None,
                    help="hosts.toml with a GPU pod to offload the public-benchmark "
                         "evals to — the GIFT-Eval gate and, on the main validator, "
@@ -393,6 +401,12 @@ def main(argv: list[str] | None = None) -> int:
         private_eval_timeout_s=args.private_eval_timeout,
     )
 
+    if args.mkt_eval_hosts is not None:
+        runner.mkt_eval_hosts = Path(args.mkt_eval_hosts)
+        runner.mkt_host_wait_s = float(args.mkt_host_wait)
+        logging.getLogger("cascade.validator").info(
+            "marketcast offload: rows forecast on the pod published to %s (request %s.request, "
+            "wait %.0fs)", args.mkt_eval_hosts, args.mkt_eval_hosts, args.mkt_host_wait)
     if args.force_burn and not runner.cfg.validator.force_burn:
         from dataclasses import replace
         runner.cfg = replace(
