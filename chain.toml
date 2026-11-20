@@ -713,6 +713,9 @@ mv_score_from_block  = 9068400
 # settlement in a retry loop. CONSENSUS (changes verdicts) — arm lockstep at an
 # announced block. 0 = off (inert).
 entry_fault_from_block = 0
+# Post-gate kings keep their recorded crowning block (no legacy re-anchor
+# at a new king's first settlement). Release-then-activate. 0 = off.
+crowning_anchor_from_block = 0
 win_margin_end       = 0.005     # decayed floor (> 0!) — reached at margin_warmup_rounds
 margin_warmup_rounds = 8         # rounds of tenure to reach the floor (~4d at 12h rounds)
 # Dethrone bar v2 (DEC-CA-0049, owner 2026-10-01) — CONSENSUS. Since the

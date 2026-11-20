@@ -615,6 +615,8 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
                 0, int(s.get("cohort_maxt_increment_from_block", 0) or 0)),
             mv_score_from_block=max(0, int(s.get("mv_score_from_block", 0) or 0)),
             entry_fault_from_block=max(0, int(s.get("entry_fault_from_block", 0) or 0)),
+            crowning_anchor_from_block=max(
+                0, int(s.get("crowning_anchor_from_block", 0) or 0)),
             min_windows=int(s["min_windows"]),
             bootstrap_B=int(s["bootstrap_B"]),
             bootstrap_alpha=float(s["bootstrap_alpha"]),

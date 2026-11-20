@@ -2128,7 +2128,7 @@ def check_king_check(receipt: RoundReceipt, cfg: ChainConfig,
     * Deferrals: the stated reason against what is derivable; transient
       reasons WARN."""
     from ..shared.emission import CHECK_RESULTS, crowned_in_v2
-    from ..shared.era import min_effective_era, v2_check_due
+    from ..shared.era import crowning_anchor_active, min_effective_era, v2_check_due
     from ..validator.king_check import RULE_V2 as KC_RULE_V2
     from ..validator.king_check import bench_failures, bench_fields, pool_reason
 
@@ -2192,7 +2192,12 @@ def check_king_check(receipt: RoundReceipt, cfg: ChainConfig,
         if int(reign) > boundary:
             problems.append(f"reign start {reign} is after the settlement {boundary}")
         ksb = emission.get("king_since_block")
-        if crowned_in_v2(cfg, ksb) and int(reign) < int(ksb):
+        # A recorded crowning block BEFORE [scoring] crowning_anchor_from_block
+        # may be the pre-fix re-anchor (the new king's first handled
+        # settlement, later than the ladder's true reign start): the known
+        # one-settlement offset, identical on every validator — not flagged.
+        if (crowned_in_v2(cfg, ksb) and int(reign) < int(ksb)
+                and crowning_anchor_active(cfg.scoring, int(ksb))):
             problems.append(f"reign start {reign} precedes the crowning at {ksb}")
         if not v2_check_due(cfg, boundary=boundary, reign_start_block=int(reign)):
             problems.append(f"recorded at {boundary} but not due (reign from {reign}, "
