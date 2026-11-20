@@ -338,6 +338,11 @@ class TelemetryConfig:
     funded_bench: bool = True
     funded_bench_verify_top: int = 1
     funded_bench_verify_tolerance: float = 0.02
+    # MoE routing health on the training log (cascade.trainer.routing_telemetry):
+    # per-layer load entropy / dead experts / load ratios every N optimizer
+    # steps, read from the counts the step already holds — logging only, no
+    # numerics change. Default = the per-step log cadence (50); 0 = off.
+    routing_every_steps: int = 50
 
 
 @dataclass(frozen=True)
