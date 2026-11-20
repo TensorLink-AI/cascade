@@ -771,7 +771,12 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
         check_marketcast_arming(
             cfg.marketcast, era_blocks=max(1, _mc_grid) * max(1, _era_settlements),
             v2_from_block=_v2_from, lane_c_from_block=int(cfg.lane_c.from_block),
-            validator_bench_from=(_bs if str(cfg.v2.bench_source) == "validator" else 0),
+            # TESTNET-ONLY (branch testnet/mkt-e2e, never merged): MarketCast rehearsed
+            # without moving testnet lane A to validator benches (king_ladder would
+            # re-judge settled testnet eras).
+            validator_bench_from=(_bs if str(cfg.v2.bench_source) == "validator"
+                                  else _mc if str(cfg.netconfig.network_id) == "bittensor:test"
+                                  else 0),
             owner_hotkey=str(cfg.netconfig.owner_hotkey or ""))
     # DEC-CA-0067 automatic image repin: the *_after pins are one release for
     # the v2 contract; a measured-wall gate in force needs the after image's

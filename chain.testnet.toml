@@ -612,7 +612,7 @@ dormant_after_blocks = 0
 # keeps toto2 byte-for-byte; the first v2 era trains the MoE from random init).
 # Trainer and validators must run the v2 release before this block; if the
 # deploy slips past it, move it to a later multiple of 600.
-from_block = 8190000
+from_block = 8310600  # TESTNET MKT-E2E
 # DEC-CA-0055 launch economics stay OFF here: testnet v2 is already live, and
 # random_init_eras / king_ladder (which also turns on warm-start seed epochs)
 # / carryover_king_share are all counted from [v2] from_block — arming them
@@ -742,7 +742,7 @@ power_ema_scope = "leg"
 
 [lane_b]
 # Preserve the existing testnet launch; mainnet launches B separately (see chain.toml).
-from_block = 8190000
+from_block = 8310600  # TESTNET MKT-E2E
 share     = 0.5
 remainder = "burn"
 domains = ["econ_fin", "energy", "healthcare", "nature", "sales", "transport", "web_cloudops"]
@@ -780,7 +780,7 @@ affinity_windows  = 256
 # era grid (head ≈ 8.25M on 2026-10-19 by the 8186845 @ 2026-10-10 anchor).
 # Validators must run the release before it; if the deploy slips past it,
 # move it to a later multiple of 600.
-merge_guard_from_block = 8280000
+merge_guard_from_block = 8310600  # TESTNET MKT-E2E
 # Preserve settled testnet economics; announce a future era to enable this.
 acceptance_from_block = 0
 leg_funding = "miner"              # lane-B legs on the miner's key (/v1/lane-b/fund)
@@ -798,7 +798,7 @@ leg_funding = "miner"              # lane-B legs on the miner's key (/v1/lane-b/
 # one is MarketCast (DEC-CA-0064, mkt:<suite>); the generic domain: / freq: /
 # horizon: targets on the public-feed pool_c are refused at load (their
 # windows could be scraped and memorised). Lane C has no pool of its own.
-from_block = 0
+from_block = 8485200  # TESTNET MKT-E2E
 share      = 0.25                  # owner-tunable: taken from lane B ⇒ A 50 / B 25 / C 25
 takes_from = "lane_b"
 remainder  = "burn"                # unpaid decay + empty target slots burn
@@ -828,8 +828,8 @@ win_ttl_eras     = 28              # owner-tunable: 14 days of 12 h eras
 alpha              = 0.05
 bootstrap_B        = 10000
 gain_margin        = 0.01          # owner-tunable
-min_target_windows = 100
-min_target_clusters = 5
+min_target_windows = 30  # TESTNET MKT-E2E
+min_target_clusters = 2  # TESTNET MKT-E2E
 n_windows          = 1000          # windows drawn per target per settlement
 tau_public         = 0.01
 min_public_items   = 10
@@ -901,7 +901,7 @@ network_id = "bittensor:test"
 # `cfg-<8 hex>` note segment, 51 % of permit stake) and applies at its
 # era-start effective_block (or the first era start after a late lock-in).
 # "" = completely inert: nothing fetched, signalled or applied.
-owner_hotkey = ""
+owner_hotkey = "5F1VmMSaPPi2qm91HE8VyMiHoCz4YxGaexJ3qmbyAPBUcUtR"  # TESTNET MKT-E2E
 poll_seconds = 300                 # how often latest.json is re-read
 
 [satellite]
@@ -947,15 +947,15 @@ gain_margin     = 0.01
 # source for every class that lists assets. Base, activation and data contract
 # are release-only; listed numeric verdict/payout/liveness controls allow overlays.
 [marketcast]
-from_block         = 0                          # off; an era-boundary block arms it
+from_block         = 8485200  # TESTNET MKT-E2E
 base_ref           = "mistralai/Timestral-28M@180698bbf5a50dda3516aa6419798437fb03a430"
 base_sha256        = "dfc83c6220937ce5fc6687b35a4df94cd25e28a2cfe6fb92a23dad6301b2015d"  # model.safetensors (HF LFS oid)
 base_arch          = "timestral"
 suites             = ["ohlcv", "returns", "vol", "high", "low", "range", "liquidity"]  # owner 2026-11-10 launch set; funding | alpha off
 coverage_levels    = [0.5, 0.8, 0.98]           # calibration gate on mkt:returns AND mkt:vol
-coverage_tolerance = 0.05                       # owner-tunable: fail if empirical < nominal - tolerance
-alpha              = 0.05
-gain_margin        = 0.01                       # never 0
+coverage_tolerance = 0.45  # TESTNET MKT-E2E
+alpha              = 0.45  # TESTNET MKT-E2E
+gain_margin        = 0.0001  # TESTNET MKT-E2E
 # Gain-tiered full-pay period of an mkt: win (owner 2026-10-20), on lane C's
 # slot TTL and decay: [[lcb_threshold, full_eras], ...] like [lane_c]'s, but
 # its OWN table — the MarketCast LCB is a horizon-equal clustered geomean gain
@@ -964,26 +964,26 @@ gain_margin        = 0.01                       # never 0
 # full_eras <= [lane_c] win_ttl_eras
 # (load-checked). UNCALIBRATED PLACEHOLDERS.
 full_pay_tiers     = [[0.05, 10], [0.02, 5], [0.01, 2]]
-min_windows        = 200                        # spread over >= min_time_blocks (review M10)
-min_clusters       = 8                          # distinct (asset class, time block) clusters
+min_windows        = 30  # TESTNET MKT-E2E
+min_clusters       = 2  # TESTNET MKT-E2E
 pool_prefix        = "pool_mkt"
 max_context_length = 32768
 embargo_days       = 30                         # recipe training data ends this long before submission
 max_synthetic_fraction = 1.0                    # miner generator share of the training mix (1.0 = pure synthetic allowed)
 max_leg_hours      = 12.0                       # cap on a recipe's own leg_hours (miner-paid wall); no leg_hours = [lane_c] leg_hours
 eval_context_length = 4096                      # context steps the base and the fine-tune both see
-windows_per_cell   = 48                         # per (asset, horizon), spread evenly: 2 per 6 h block over 6 days
-start_margin_seconds = 3600                     # windows start >= 1 h after the train block
-verdict_wait_blocks = 43200                     # an entry waits up to 6 days for its windows to close
+windows_per_cell   = 24  # TESTNET MKT-E2E
+start_margin_seconds = 300  # TESTNET MKT-E2E
+verdict_wait_blocks = 900  # TESTNET MKT-E2E
 snapshot_days      = 10                         # 1m bank: 4096-step 1m context (2.8 d) + the 6-day verdict wait
 coarse_history_days = 180                       # hourly bars for >= 1h series (HL serves ~208 d of 1h)
-report_timeout_settlements = 8                  # trainer records a missing report "absent" after this
-max_infra_deferrals = 8                         # main-validator compute failures before an uncharged drop
-cluster_block_hours = 6                         # bootstrap clusters = asset class x 6 h block
-min_time_blocks    = 8                          # >= 2 days of distinct 6 h blocks before a verdict
+report_timeout_settlements = 4  # TESTNET MKT-E2E
+max_infra_deferrals = 4  # TESTNET MKT-E2E
+cluster_block_hours = 1  # TESTNET MKT-E2E
+min_time_blocks    = 2  # TESTNET MKT-E2E
 min_bar_coverage   = 0.8                        # live-bar share in the 24 h before a window
 min_dollar_volume_24h = 1000000.0               # USD traded in the 24 h before a window (0 = off)
-coverage_tolerance_over = 0.10                  # gated levels also fail above nominal + this
+coverage_tolerance_over = 0.45  # TESTNET MKT-E2E
 coverage_gate_levels = [0.5, 0.8]               # per horizon, class-weighted like the gain; 98 % report-only
 # Red-team fixes 2026-10-20 (DEC-CA-0064 §Red-team fixes). The gain is a
 # geomean over cells (asset class x 6 h block x horizon) of each cell's ratio
@@ -994,29 +994,29 @@ cell_ratio_cap     = 4.0                        # each cell's ft/base ratio clip
 crps_scale         = "seasonal_naive"           # per-window CRPS ÷ context seasonal-naive MAE (GIFT-Eval MASE denominator); "level" = old
 bar_relay          = "tsbench-forge-sources/marketcast/bars/"   # trainer relays the recorder to pods (HIPPIUS_S3_* creds); "" = pod fetches the API
 tail_levels        = [0.05, 0.95]               # tail gate: hit rate beyond q_l within tail_tolerance of 5 %
-tail_tolerance     = 0.025                      # per horizon AND pooled over horizons
+tail_tolerance     = 0.45  # TESTNET MKT-E2E
 calibration_z      = 3.0                        # every calibration tolerance >= 3 standard errors (thin classes)
 near_dup_tol       = 0.02                       # mean |dq| / base 5-95 % width vs a senior entry below this => duplicate
 max_open_legs_per_coldkey = 1                   # trainer policy: open MarketCast legs per coldkey
 # Owner 2026-11-10 (DEC-CA-0064 addendum): one composite target over every
 # suite, native candle banks (no recording lead time), Garman–Klass vol.
 composite          = true                       # mkt:market = geomean of the suites' gains
-composite_suite_floor = 0.0                     # a suite CONFIDENTLY worse than the base (UCB < -this) fails the entry
+composite_suite_floor = 0.5  # TESTNET MKT-E2E
 ohlcv_open_weight  = 0.0                        # HL perps: open = previous close
 # Owner 2026-11-18: the composite's balance. CRPS is the one score; each of four
 # forecast properties counts once — location (returns + ohlcv.c) 0.30, dispersion
 # (vol + range) 0.30, extremes (high + low + ohlcv.h/l) 0.25, activity
 # (liquidity + ohlcv.v) 0.15 (ohlcv's 0.20 = its 4 scored fields at 0.05).
 composite_suite_weights = { returns = 0.25, vol = 0.18, range = 0.12, high = 0.075, low = 0.075, liquidity = 0.10, ohlcv = 0.20 }
-guards             = ["mase", "qlike", "tail"]  # no-regression vs base: median (MASE), vol variance (QLIKE), 1/5/95/99 % quantile score
+guards             = []  # TESTNET MKT-E2E
 guard_floor        = 0.0                        # a guard CONFIDENTLY worse than the base (UCB < -this) fails the entry
 # Owner 2026-11-18: every suite on every timeframe, each a multi-step PATH
 # (<bar>x<steps>): 1m x 60 (1 h), 5m x 36 (3 h), 15m x 96 (1 d), 1h x 48 (2 d),
 # 4h x 42 and 1d x 7 (7 d). The 7-day paths cannot close inside the 6-day wait,
 # so they are judged on the embargo gap (the days before the submission no
 # training leg reads); the shorter paths stay forward-only.
-gap_horizons       = ["4hx42", "1dx7"]
-baseline_gate      = true                       # must beat random walk + EWMA/FHS and seasonal AR(1): composite LCB >= 0, no suite confidently worse
+gap_horizons       = ["4hx42", "1dx7"]  # TESTNET MKT-E2E
+baseline_gate      = false  # TESTNET MKT-E2E
 # Owner 2026-11-19: the official calendars (federalreserve.gov FOMC calendar — statement 14:00 ET
 # on the meeting's last day, 2027 tentative; bls.gov CPI + Employment Situation, 08:30 ET),
 # converted to UTC with the US DST rule. Extend before 2028.
@@ -1042,22 +1042,22 @@ native_intervals   = ["5m", "15m"]              # native candle banks (+ 1m bars
 native_history_days = { "5m" = 21, "15m" = 50 } # HL keeps ~17 d of 5m, ~52 d of 15m (recorder fills)
 
 [marketcast.frequencies]                        # the bars each suite is forecast on
-ohlcv     = ["1m", "5m", "15m", "1h", "4h", "1d"]
-returns   = ["1m", "5m", "15m", "1h", "4h", "1d"]
-vol       = ["1m", "5m", "15m", "1h", "4h", "1d"]
-high      = ["1m", "5m", "15m", "1h", "4h", "1d"]
-low       = ["1m", "5m", "15m", "1h", "4h", "1d"]
-range     = ["1m", "5m", "15m", "1h", "4h", "1d"]
-liquidity = ["1m", "5m", "15m", "1h", "4h", "1d"]
+ohlcv     = ["1m", "5m", "4h", "1d"]
+returns   = ["1m", "5m", "4h", "1d"]
+vol       = ["1m", "5m", "4h", "1d"]
+high      = ["1m", "5m", "4h", "1d"]
+low       = ["1m", "5m", "4h", "1d"]
+range     = ["1m", "5m", "4h", "1d"]
+liquidity = ["1m", "5m", "4h", "1d"]
 
 [marketcast.horizons]                           # <bar>x<steps>: the path each timeframe forecasts
-ohlcv     = ["1mx60", "5mx36", "15mx96", "1hx48", "4hx42", "1dx7"]
-returns   = ["1mx60", "5mx36", "15mx96", "1hx48", "4hx42", "1dx7"]
-vol       = ["1mx60", "5mx36", "15mx96", "1hx48", "4hx42", "1dx7"]
-high      = ["1mx60", "5mx36", "15mx96", "1hx48", "4hx42", "1dx7"]
-low       = ["1mx60", "5mx36", "15mx96", "1hx48", "4hx42", "1dx7"]
-range     = ["1mx60", "5mx36", "15mx96", "1hx48", "4hx42", "1dx7"]
-liquidity = ["1mx60", "5mx36", "15mx96", "1hx48", "4hx42", "1dx7"]
+ohlcv     = ["1mx60", "5mx12", "4hx42", "1dx7"]
+returns   = ["1mx60", "5mx12", "4hx42", "1dx7"]
+vol       = ["1mx60", "5mx12", "4hx42", "1dx7"]
+high      = ["1mx60", "5mx12", "4hx42", "1dx7"]
+low       = ["1mx60", "5mx12", "4hx42", "1dx7"]
+range     = ["1mx60", "5mx12", "4hx42", "1dx7"]
+liquidity = ["1mx60", "5mx12", "4hx42", "1dx7"]
 
 [marketcast.assets]                             # the Hyperliquid-listed universe (2026-10-19)
 crypto      = ["BTC", "ETH", "SOL", "XRP", "HYPE", "BNB", "DOGE", "ADA", "AVAX", "LINK",
