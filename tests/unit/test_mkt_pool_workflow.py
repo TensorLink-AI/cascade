@@ -56,3 +56,14 @@ def test_scheduled_runs_are_gated_on_marketcast_being_armed():
 def test_dispatch_defaults_to_the_inert_sentinel_block():
     on = WORKFLOW.get('on', WORKFLOW.get(True))
     assert on['workflow_dispatch']['inputs']['effective_block']['default'] == '999999999999'
+
+
+def test_hf_reveal_is_the_exact_byte_mkt_reveal_and_skips_without_a_token():
+    step = _step('Reveal retired MarketCast snapshots')
+    assert step['if'] == 'steps.gate.outputs.run'
+    run = step['run']
+    assert 'cascade-pool reveal --lane mkt' in run and '--hf-repo' in run
+    assert run.index('-z "$HF_TOKEN"') < run.index('cascade-pool reveal')   # no token -> exit 0
+    holders = [s['name'] for s in STEPS if 'HF_TOKEN' in str(s.get('env', {}))]
+    assert holders == [step['name']]
+    assert STEPS.index(step) > STEPS.index(_step('Build + sign + publish'))

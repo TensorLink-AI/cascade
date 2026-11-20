@@ -18,6 +18,8 @@
 #                       keeps at wallets/<name>/hotkeys/<hotkey>; never the
 #                       coldkey). Its ss58 must equal [netconfig] owner_hotkey
 #                       or the CLI refuses: validators reject any other signer.
+# OPTIONAL: HF_TOKEN (already used by publish-pool.yml) enables the public reveal
+# of RETIRED MarketCast snapshots to HF_EVAL_REPO under pool_mkt/ (~48h lag).
 #
 # Inert while MarketCast is off: a SCHEDULED run exits 0 before building when
 # the chosen toml has [marketcast] from_block = 0. A dispatched run always
@@ -148,6 +150,24 @@ jobs:
             --bar-store ./mkt/bars \
             --wallet-name mkt --wallet-hotkey signer --wallet-path "$RUNNER_TEMP/wallets" \
             --effective-block "$EFFECTIVE_BLOCK"
+
+      # Same public reveal as publish-pool.yml, under pool_mkt/ in the same HF
+      # dataset: the exact pinned tars, sha256-verified against
+      # pool_mkt/index.json, and only RETIRED ones (the newest two are withheld,
+      # sentinel blocks are skipped), so a revealed MarketCast snapshot can never
+      # be selected by a current or future round. The HF_TOKEN check is in the
+      # script, not an `if:`, because a step's own env is not visible to its `if:`.
+      - name: Reveal retired MarketCast snapshots to public HF  (exact bytes)
+        if: steps.gate.outputs.run
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_EVAL_REPO: ${{ vars.HF_EVAL_REPO || 'Tensor-Link/cascade-eval-pool' }}
+          BACKUP_S3_ACCESS_KEY: ${{ secrets.BACKUP_S3_ACCESS_KEY }}
+          BACKUP_S3_SECRET_KEY: ${{ secrets.BACKUP_S3_SECRET_KEY }}
+        run: |
+          if [ -z "$HF_TOKEN" ]; then echo "HF_TOKEN not set; skipping the public reveal."; exit 0; fi
+          cascade-pool reveal --lane mkt --chain-toml "${{ steps.gate.outputs.toml }}" \
+            --hf-repo "$HF_EVAL_REPO" --out ./_reveal_stage_mkt
 
       - name: Remove the signer hotkey
         if: always()
