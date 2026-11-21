@@ -2,15 +2,15 @@
   "mode": "bootstrap",
   "generated_by": "orchestrator (hand-maintained until W0c reaches L3, plan \u00a717)",
   "generated_at": "2026-11-21T13:17Z",
-  "origin_main": "714a8230386a1f027d138ad32bcbdf7723120185",
+  "origin_main": "caa7ea773f67ffc03a2dc6da3215348ab6f66611",
   "plan_on_main": true,
   "plan_pr": "483 merged",
   "wps": {
     "W0c": {
-      "level": "L0",
+      "level": "L1",
       "side_state": null,
       "evidence": [],
-      "activity": "tests-only PR #484 open (78 tests fail on main for the right reason); waiting for owner merge -> L1"
+      "activity": "tests on main (#484, caa7ea7); builder running"
     },
     "W0": {
       "level": "L0",
@@ -25,7 +25,8 @@
     "R1": {
       "level": "L0",
       "side_state": null,
-      "evidence": []
+      "evidence": [],
+      "activity": "test author running"
     },
     "R2": {
       "level": "L0",
@@ -55,7 +56,8 @@
     "R6": {
       "level": "L0",
       "side_state": null,
-      "evidence": []
+      "evidence": [],
+      "activity": "test author running"
     },
     "R6x": {
       "level": "L0",
@@ -472,6 +474,6 @@
   },
   "milestone": "none (pre Build-complete)",
   "pending_merges": [
-    484
+    485
   ]
 }

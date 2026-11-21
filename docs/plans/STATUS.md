@@ -8,16 +8,16 @@ Milestone: none. Open decisions: none. Owner inputs open: OA4, OA5, OA6, OA8. OA
 
 | WP | Level | Side state | Activity |
 |---|---|---|---|
-| W0c | L0 |  | tests-only PR #484 open; waiting for merge -> L1 |
+| W0c | L1 |  | tests on main (#484); builder running |
 | W0 | L0 |  |  |
 | W0b | L0 |  |  |
-| R1 | L0 |  |  |
+| R1 | L0 |  | test author running |
 | R2 | L0 |  |  |
 | R2x | L0 |  |  |
 | R3 | L0 |  |  |
 | R4 | L0 |  |  |
 | R5 | L0 |  |  |
-| R6 | L0 |  |  |
+| R6 | L0 |  | test author running |
 | R6x | L0 |  |  |
 | R7 | L0 |  |  |
 | R7t | L0 |  |  |
