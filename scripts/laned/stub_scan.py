@@ -20,7 +20,8 @@ import re
 import sys
 from pathlib import Path
 
-import lanedlib
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # `python -P` drops the script dir
+import lanedlib  # noqa: E402
 
 MARKERS = (("TO" + "DO", "todo"), ("FIX" + "ME", "fixme"))
 MARKER_RES = [(re.compile(r"\b" + word + r"\b"), rule) for word, rule in MARKERS]

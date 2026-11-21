@@ -20,7 +20,8 @@ import re
 import sys
 from pathlib import Path
 
-import lanedlib
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # `python -P` drops the script dir
+import lanedlib  # noqa: E402
 
 LEVELS = frozenset(("info", "warning", "error", "critical", "exception"))
 TAG = re.compile(r"^lane_d_[a-z0-9_]+")
