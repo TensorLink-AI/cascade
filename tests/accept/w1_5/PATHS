@@ -1,0 +1,21 @@
+# W1.5 walking skeleton (plan rev6 §3.0 W1.5 row; README.md has the contract).
+# `make laned-e2e` (CI): the top-level Makefile is new.
+Makefile
+# Intake service package: storage interface + filesystem adapter, intake.
+cascade/lane_d/
+# Ingest guards (W4 owns the full version) and the lane-D-only BF16 dtype path.
+cascade/eval/lane_d_ingest.py
+cascade/eval/checkpoint_guard.py
+# No-pad, quantile-head scorer (W5d owns the full version).
+cascade/eval/lane_d_scorer.py
+# Box-side settlement, signed report, lane_d_state.json (W5*, W7a-c later).
+cascade/validator/lane_d.py
+cascade/validator/lane_d_report.py
+cascade/validator/lane_d_state.py
+# Audit check_lane_d (W9 owns the full version).
+cascade/audit/lane_d.py
+# Emission: lane D in lane_parts, taken from lane A (W8 owns the full version).
+cascade/shared/emission.py
+cascade/shared/lane_c.py
+# R8's every-path-classifies test: the new top-level Makefile needs an AREA.
+scripts/deploy_gate.py
