@@ -660,6 +660,13 @@ def cut_windows(series, *, cls: str, asset: str, suite: str, horizon: str,
         if not (start > float(after) and end <= float(now)):
             continue
         ctx = s[max(0, k - int(context_length)):k]
+        # owner 2026-11-21: the banks are sized for a 32k context the
+        # recording only fills over time — the unrecorded NaN run before the
+        # first finite value carries nothing, so it is not sent (a context is
+        # as long as its history, growing toward ``context_length``)
+        fin = np.isfinite(ctx)
+        if fin.any():
+            ctx = ctx[int(fin.argmax()):]
         tgt = s[k:k + h]
         if int(np.isfinite(ctx).sum()) < int(min_context) or not np.isfinite(tgt).any():
             continue

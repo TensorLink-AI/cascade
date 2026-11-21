@@ -49,3 +49,17 @@ def test_failed_repin_preserves_original_file(tmp_path, monkeypatch, fault):
     with pytest.raises((ValueError, OSError)):
         repin.main([str(config), IMAGE])
     assert config.read_text() == original
+
+
+def test_repin_leaves_the_marketcast_image_alone(tmp_path, monkeypatch):
+    """A fleet repin rewrites the fleet pins only: [marketcast] pod_image /
+    worker_code_fingerprint name MarketCast's own release (owner 2026-11-20)."""
+    config = tmp_path / "chain.toml"
+    config.write_text((ROOT / "chain.toml").read_text())
+    before = tomllib.loads(config.read_text())["marketcast"]
+    fp = fingerprint()
+    monkeypatch.setattr(repin, "registry_code_fingerprint", lambda image: (fp, 300))
+    assert repin.main([str(config), IMAGE]) == 0
+    after = tomllib.loads(config.read_text())["marketcast"]
+    assert (after["pod_image"], after["worker_code_fingerprint"]) == (
+        before["pod_image"], before["worker_code_fingerprint"])

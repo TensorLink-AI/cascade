@@ -22,7 +22,10 @@ Pipeline (:func:`run_mkt_leg`):
    random origin; with probability ``synthetic_fraction`` a sample is cut from
    the miner's generator series instead (the sandboxed ``generate()``
    contract, :func:`cascade.trainer.sandbox.stream_series`) — synthetic
-   samples carry NaN (missing) covariate rows;
+   samples carry NaN (missing) covariate rows, unless the recipe names its
+   generator's rows (``synthetic_channels``): then each ``(C, L)`` array is
+   one sample whose past covariates are its own rows and whose known rows
+   (calendar / session / events) come from its ``time`` row;
 5. allow-listed augmentations (:func:`augment`, pure, seeded) per sample;
 6. the fine-tune (:func:`finetune`): the recipe's trainable scope
    (:func:`cascade.eval.timestral_adapter.select_trainable`), AdamW at
@@ -241,51 +244,149 @@ class MktSampler:
                 return key, k, c, y
         return None
 
-    def _synthetic(self, steps: int):
+    # generator arrays held back for another bar size (per size, bounded)
+    SYN_HOLD = 64
+    # arrays drawn looking for one that fits a batch's bar size
+    SYN_PULLS = 32
+
+    def _syn_arrays(self) -> list[tuple[object, int | None]]:
+        """The generator's next yield as ``[(array, bar minutes)]``. Without
+        ``synthetic_channels`` that is the raw array, untagged (each row a
+        target series). With them a ``(C, L)`` yield is cut into consecutive
+        groups of ``len(synthetic_channels)`` rows — the sandbox fixes ``C``
+        (``[generator] min_channels`` / ``max_channels``, 32 on mainnet), so
+        one yield carries ``C // n`` samples and its last ``C % n`` rows are
+        ignored — each ``{name: row}``, tagged by its ``time`` row when that
+        is a clock (finite, a constant whole-minute step), else untagged with
+        the row dropped (known rows missing)."""
+        arr = np.asarray(next(self.synthetic), dtype=np.float64)
+        chans = tuple(self.r.synthetic_channels)
+        if not chans:
+            return [(arr, None)]
+        if arr.ndim == 1:
+            arr = arr.reshape(1, -1)
+        n = len(chans)
+        if arr.ndim != 2 or arr.shape[0] < n:
+            raise MktLegError(f"generator series has shape {arr.shape}; synthetic_channels "
+                              f"names {n} rows {list(chans)}")
+        out = []
+        for g in range(arr.shape[0] // n):
+            named = dict(zip(chans, arr[g * n:(g + 1) * n], strict=True))
+            out.append((named, self._clock_bar(named)))
+        return out
+
+    @staticmethod
+    def _clock_bar(named: dict) -> int | None:
+        t = named.get("time")
+        if t is None:
+            return None
+        d = np.diff(t)
+        if (d.size and np.isfinite(t).all() and d[0] > 0
+                and np.allclose(d, d[0], rtol=0.0, atol=1e-3)
+                and abs(d[0] / 60.0 - round(d[0] / 60.0)) < 1e-6):
+            return int(round(d[0] / 60.0))
+        named.pop("time")
+        return None
+
+    def _syn_take(self, f: int):
+        """A sample usable at bar size ``f``: one tagged ``f`` or untagged,
+        held back or newly drawn; None when ``SYN_PULLS`` yields gave none."""
+        from collections import deque
+
+        hold = self.__dict__.setdefault("_syn_hold", {})
+        for _ in range(self.SYN_PULLS + 1):
+            for key in (f, None):
+                if hold.get(key):
+                    return hold[key].popleft()
+            try:
+                got = self._syn_arrays()
+            except StopIteration as e:
+                raise MktLegError("the generator stopped producing series") from e
+            for a, bar in got:
+                hold.setdefault(bar, deque(maxlen=self.SYN_HOLD)).append(a)
+        return None
+
+    def _synthetic(self, steps: int, f: int = 0):
+        """``(context, target, rows)`` cut from a generator array usable at
+        bar size ``f``: ``rows`` None, or (with ``synthetic_channels``)
+        ``{"past": {name: context-aligned row}, "time": context + horizon
+        unix starts or None}``."""
         from collections import deque
 
         ctx = int(self.r.context_length)
+        chans = tuple(self.r.synthetic_channels)
         if not hasattr(self, "_synthetic_channels"):
             self._synthetic_channels = deque()
         for _ in range(16):
-            try:
+            if chans:
+                named = self._syn_take(f)
+                if named is None:
+                    return None
+                named = dict(named)
+                v = named.pop("target")
+            else:
                 if not self._synthetic_channels:
-                    arr = np.asarray(next(self.synthetic), dtype=np.float64)
+                    try:
+                        ((arr, _bar),) = self._syn_arrays()
+                    except StopIteration as e:
+                        raise MktLegError("the generator stopped producing series") from e
                     self._synthetic_channels.extend(arr if arr.ndim == 2 else [arr.reshape(-1)])
                 v = self._synthetic_channels.popleft()
-            except StopIteration as e:
-                raise MktLegError("the generator stopped producing series") from e
             if v.size < MIN_CONTEXT + steps:
                 continue
             k = int(self.rng.integers(MIN_CONTEXT, v.size - steps + 1))
-            c, y = v[max(0, k - ctx):k], v[k:k + steps]
-            if np.isfinite(c).sum() >= MIN_CONTEXT and np.isfinite(y).any():
-                return c, y
+            k0 = max(0, k - ctx)
+            c, y = v[k0:k], v[k:k + steps]
+            if not (np.isfinite(c).sum() >= MIN_CONTEXT and np.isfinite(y).any()):
+                continue
+            rows = None
+            if chans:
+                t = named.pop("time", None)
+                rows = {"past": {n: np.where(np.isfinite(r[k0:k]), r[k0:k], np.nan)
+                                 for n, r in named.items()},
+                        "time": None if t is None else t[k0:k + steps]}
+            return c, y, rows
         return None
 
     def batch(self, size: int) -> Batch:
+        from ..eval.marketcast import PAST_COVARIATES, build_covariates
         from ..pool.marketcast import window_covariates
         from ..shared.config.marketcast import base_suite
 
-        suite = _pick(self.rng, self.suites)
-        hz = [h for (s, h) in self.geom if s == suite]
-        own = base_suite(suite) == self.r.suite or self.r.suite not in self.mc.horizons_map
-        mix = dict(self.r.horizon_mix) if own else {h: 1.0 for h in hz}
-        mix = {k: v for k, v in mix.items() if k in hz} or {h: 1.0 for h in hz}
-        h = _pick(self.rng, mix)
-        f, steps = self.geom[(suite, h)]
-        samples, synth = [], 0
-        for _ in range(int(size)):
-            if self.synthetic is not None and self.rng.random() < self.r.synthetic_fraction:
-                got = self._synthetic(steps)
+        while True:
+            suite = _pick(self.rng, self.suites)
+            hz = [h for (s, h) in self.geom if s == suite]
+            own = base_suite(suite) == self.r.suite or self.r.suite not in self.mc.horizons_map
+            mix = dict(self.r.horizon_mix) if own else {h: 1.0 for h in hz}
+            mix = {k: v for k, v in mix.items() if k in hz} or {h: 1.0 for h in hz}
+            h = _pick(self.rng, mix)
+            f, steps = self.geom[(suite, h)]
+            samples, synth = [], 0
+            for _ in range(int(size)):
+                if self.synthetic is not None and self.rng.random() < self.r.synthetic_fraction:
+                    got = self._synthetic(steps, f)
+                    if got is not None:
+                        c, y, rows = got
+                        samples.append((None, rows, c, y))
+                        synth += 1
+                        continue
+                got = self._real(suite, f, steps)
                 if got is not None:
-                    samples.append((None, None, *got))
-                    synth += 1
+                    samples.append(got)
+            if samples:
+                break
+            if (self.r.synthetic_channels
+                    and not any(k[0] == suite and k[3] == f for k in self.series)):
+                # the generator's clocks never give this bar size and no real
+                # series has it: the horizon trains not at all, like a
+                # horizon with neither (never a leg killed by it)
+                log.warning("marketcast leg: no generator series at %dm and no real series — "
+                            "%s/%s is not trained", f, suite, h)
+                del self.geom[(suite, h)]
+                if not any(s2 == suite for s2, _h in self.geom):
+                    self.suites.pop(suite, None)
+                if self.suites:
                     continue
-            got = self._real(suite, f, steps)
-            if got is not None:
-                samples.append(got)
-        if not samples:
             raise MktLegError(f"could not cut a {suite}/{h} training sample")
         out_c, out_y, past, known = [], [], [], []
         names = tuple(self.r.covariates)
@@ -299,9 +400,20 @@ class MktSampler:
             out_c.append(c2)
             out_y.append(y2)
             if names:
-                if key is None:
+                if key is None and k is None:
                     past.append(None)
                     known.append(None)
+                elif key is None:
+                    # synthetic with named rows: its own past rows (a covariate
+                    # it does not carry is a NaN row), known rows from its clock
+                    want = names if k["time"] is not None else tuple(
+                        n for n in names if n in PAST_COVARIATES)
+                    p, kn = build_covariates(
+                        want, block_starts=k["time"] if k["time"] is not None else c[:0],
+                        n_context=int(c.size), series=k["past"],
+                        event_times=tuple(getattr(self.mc, "event_times", ())))
+                    past.append(p)
+                    known.append(kn)
                 else:
                     w = MktWindow("", key[1], key[2], suite, h, f, steps, 0.0, 0.0, k, c, y)
                     p, kn = window_covariates(self.snap, w, names,
@@ -508,7 +620,10 @@ def finetune(model, forward: Callable, sampler: MktSampler, recipe, *, levels: S
 
 
 def recipe_digest(recipe) -> str:
-    return hashlib.sha256(json.dumps(asdict(recipe), sort_keys=True,
+    d = asdict(recipe)
+    if not d.get("synthetic_channels"):
+        d.pop("synthetic_channels", None)   # recipes without it keep their digest
+    return hashlib.sha256(json.dumps(d, sort_keys=True,
                                      separators=(",", ":")).encode()).hexdigest()
 
 

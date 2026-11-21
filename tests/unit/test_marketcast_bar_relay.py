@@ -219,13 +219,14 @@ def test_feeds_back_off_on_429_and_5xx_only():
 
 
 def test_bar_relay_reads_its_own_creds_when_set(monkeypatch):
-    """The recorder's bucket need not share the trainer's manifest creds:
-    ``MKT_BARS_S3_*`` when set, else ``HIPPIUS_S3_*``."""
+    """A bucket other than the eval pool: ``MKT_BARS_S3_*`` when set, else
+    ``HIPPIUS_S3_*``."""
     from types import SimpleNamespace
 
     from cascade.trainer.marketcast_runner import mkt_bars_store
 
-    st = SimpleNamespace(s3_endpoint="https://s3.example", s3_region="r")
+    st = SimpleNamespace(s3_endpoint="https://s3.example", s3_region="r",
+                         pool_bucket="the-pool")
     monkeypatch.delenv("MKT_BARS_S3_ACCESS_KEY", raising=False)
     c = mkt_bars_store(st, "bars-bucket").cfg
     assert (c.access_key_env, c.secret_key_env) == ("HIPPIUS_S3_ACCESS_KEY", "HIPPIUS_S3_SECRET_KEY")
@@ -233,3 +234,32 @@ def test_bar_relay_reads_its_own_creds_when_set(monkeypatch):
     c = mkt_bars_store(st, "bars-bucket").cfg
     assert (c.access_key_env, c.secret_key_env) == ("MKT_BARS_S3_ACCESS_KEY", "MKT_BARS_S3_SECRET_KEY")
     assert (c.endpoint, c.region, c.bucket) == ("https://s3.example", "r", "bars-bucket")
+
+
+def test_bar_relay_on_the_eval_pool_reads_it_like_every_pool_reader(monkeypatch):
+    """Owner 2026-11-21: the relay lives in the eval pool bucket — the pool
+    endpoint and ``POOL_S3_*`` (when set), a plain store that presigns."""
+    from types import SimpleNamespace
+
+    from cascade.shared.hippius import S3Store
+    from cascade.trainer.marketcast_runner import mkt_bars_store
+
+    st = SimpleNamespace(s3_endpoint="https://s3.example", s3_region="r", pool_bucket="the-pool",
+                         pool_s3_endpoint="https://r2.example", pool_s3_region="auto",
+                         pool_backup_bucket="", backup_s3_endpoint="")
+    monkeypatch.setenv("MKT_BARS_S3_ACCESS_KEY", "ignored-for-the-pool")
+    monkeypatch.setenv("POOL_S3_ACCESS_KEY", "x")
+    s = mkt_bars_store(st, "the-pool")
+    assert isinstance(s, S3Store)
+    assert (s.cfg.endpoint, s.cfg.region, s.cfg.bucket) == ("https://r2.example", "auto", "the-pool")
+    assert (s.cfg.access_key_env, s.cfg.secret_key_env) == ("POOL_S3_ACCESS_KEY", "POOL_S3_SECRET_KEY")
+    monkeypatch.delenv("POOL_S3_ACCESS_KEY")
+    assert mkt_bars_store(st, "the-pool").cfg.access_key_env == "HIPPIUS_S3_ACCESS_KEY"
+
+
+def test_shipped_relay_is_the_eval_pool_bucket():
+    from cascade.shared.config import load_chain_config
+
+    for toml in ("chain.toml", "chain.testnet.toml"):
+        c = load_chain_config(toml)
+        assert c.marketcast.bar_relay == f"{c.storage.pool_bucket}/marketcast/bars/"

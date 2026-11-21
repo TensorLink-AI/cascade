@@ -52,8 +52,10 @@ Directions, not a recipe — the field is open:
   `spread` and the `cross_*` series are available; use the ones that carry
   signal and leave out the ones that add noise.
 - **Coverage the bars lack.** A generator (`synthetic_fraction` > 0) can
-  teach regimes the recorded history is too short for — but synthetic data
-  that does not look like real markets hurts.
+  teach regimes the recorded history is too short for, and with
+  `synthetic_channels` its samples carry their own covariate rows (volume,
+  funding, cross-asset, a clock for calendar / session / events) — but
+  synthetic data that does not look like real markets hurts.
 - **Small, careful updates.** The test is "confidently better, nowhere
   worse", so a conservative fine-tune (LoRA, a low learning rate, enough
   steps) that keeps what the base does well usually beats an aggressive
@@ -86,6 +88,78 @@ Directions, not a recipe — the field is open:
 | Reward | Lane C's share (25 % of emissions, taken from lane A), paid to the slot holder by a gain-tiered schedule |
 | Licence | Timestral's [Modified MIT licence](https://huggingface.co/mistralai/Timestral-28M/blob/180698bbf5a50dda3516aa6419798437fb03a430/LICENSE) restricts companies over USD 20M revenue and their derivatives — read it first |
 
+## What you control and what you can access
+
+### What you control
+
+Everything below is yours to choose in `marketcast.json` or at funding.
+Bounds are the shipped `[marketcast]` values; the live `chain.toml` wins.
+
+| Lever | Your options |
+|---|---|
+| Assets | Any subset of the universe, with a weight per class (`data.assets`, `data.class_weights`). Scored classes: `crypto` (28 perps: BTC, ETH, SOL, XRP, HYPE, BNB, DOGE, ADA, AVAX, LINK, SUI, TRX, LTC, DOT, BCH, NEAR, APT, ARB, OP, TAO, ENA, AAVE, UNI, INJ, TIA, SEI, WIF, JUP), `equity_etf` (SP500, XYZ100, JP225, KR200, SMH, XLE, TLT, XBI, EWJ, EWY, EWZ, EWT, AAPL, MSFT, NVDA, AMZN, GOOGL, META, TSLA), `metals` (GOLD, SILVER, PLATINUM, PALLADIUM), `commodities` (CL, BRENTOIL, NATGAS, COPPER), `fx` (EUR, JPY, GBP) |
+| Training range | `data.start` … `data.end`, ending ≥ 30 days before you submit |
+| Bar sizes | `data.frequencies` ⊆ `1m`, `5m`, `15m`, `1h`, `4h`, `1d` |
+| Horizon mix | Weights over `1mx60`, `5mx36`, `15mx96`, `1hx48`, `4hx42`, `1dx7` (all six are judged whatever you weight) |
+| Context | `context_length` 32 – 32768 steps (the eval feeds up to 32768: as much of that as the bar's recorded history holds, so longer contexts pay off more as the recording grows) |
+| Inputs | `covariates` ⊆ `volume`, `funding`, `open_interest`, `spread`, `cross_asset`, `cross_eth`, `cross_equity`, `cross_gold`, `cross_fx`, `calendar`, `session`, `events` |
+| Augmentations | Up to the allowed set — `scale`, `jitter`, `crop`, `time_warp`, `mixup` — each with a probability and numeric params |
+| Loss | `objective.suite_weights`, optional `quantile_weights` (one per each of the 21 quantile knots, 1 %…99 %), `coverage_penalty` 0 – 10 |
+| Optimiser | `lr` ≤ 1e-3; `cosine` / `linear` / `constant`; warmup ≤ 0.2; `steps` ≤ 100 000; `batch` ≤ 512; weight decay 0 – 1; clip ≤ 10; optional EMA |
+| What trains | `full`, `last_n_blocks` (1 – 12 of Timestral's 12 blocks), `frozen_embeddings`, or `lora` (rank ≤ 64) |
+| Synthetic data | Your own `generator.py`, mixed at `synthetic_fraction` 0 – 1 (1 = generator only); `synthetic_channels` gives its samples their own covariates and bar size |
+| Warm start | `init`: an earlier MarketCast checkpoint the trainer produced — yours or the current holder's |
+| Compute | `leg_hours` ≤ 12 (you pay for it); GPU type, max price and provider order at `fund` |
+
+### What you can access
+
+- **The model.** Timestral-28M at its pinned revision, weights public on
+  Hugging Face; `cascade lane-c fetch-base` downloads and digest-checks it.
+  12 transformer blocks, patch 32, context up to 32768, 21 quantile knots.
+- **Public market data, locally.** `cascade lane-c snapshot ./my-mkt --out
+  train-snap` fetches your recipe's training range from the public feeds;
+  `--evaluation --days 7` fetches a recent held-out snapshot to test on. Use
+  them with `cascade lane-c test`.
+- **What your live leg trains on.** The trainer relays the operator's bar
+  recording (Hyperliquid and Hyperliquid xyz, the classes' primary sources)
+  for exactly your recipe's assets and range (`data.start` to `data.end` +
+  1 day), at every bar size your recipe uses. The recording is young: sub-hour bars only exist from the day it
+  started recording them, so an embargoed range may have no `1m` / `5m`
+  bars yet — those horizons then train on your generator or not at all.
+  `open_interest` and `spread` exist only from 2026-11-18 (NaN before).
+- **Every verdict, in full.** After scoring, the signed report
+  (`marketcast/round-<id>.json`) publishes every window's losses — yours,
+  the base's and the baselines' — and the forecasts themselves as quantile
+  sidecars. `cascade-audit marketcast --reproduce` recomputes them. Your
+  receipt row breaks the gain down per suite, guard and baseline.
+- **Other entries.** Uploaded recipe trees are public and commitments
+  reveal on chain, so recipes can be read once revealed; trained checkpoints
+  are published as trained pointers (usable as `init`). Copying does not
+  pay: a byte-identical or near-identical fine-tune of an earlier commitment
+  is a `duplicate`.
+- **The queue.** `cascade lane-c status <intake>` shows the public lane-C
+  queue; `cascade status --lane c` tracks your entry.
+
+### What you cannot access
+
+- **The windows you are scored on**, before they happen. Every judged window
+  opens at least an hour after your leg is dispatched (or sits in your
+  embargo gap, which no leg reads).
+- **Anything after your leg's dispatch time.** The pod never receives a bar
+  at or after it, and never anything after `data.end` + 1 day.
+- **Your own dataset.** There is no upload of private training data; a
+  generator is the only way to add series.
+- **The network, from your generator.** It runs sandboxed on the training
+  pod: no network (network namespace + socket block), 4 GB memory, a
+  128 MB code-only tree (no weights), exactly 32 rows per yield, series of
+  64 – 4096 steps. It does not see the market data either.
+- **The training pod's controls.** The pod is rented on your provider key
+  and billed to you, but the trainer drives it, relays its inputs and
+  verifies the checkpoint it copies back; a copy that keeps differing from
+  the pod's own listing is treated as tampering.
+- **The holder's verdict on other weeks.** To take the slot you must beat
+  the holder on *your* windows; its old LCB does not count.
+
 ## What you need
 
 - A registered hotkey on the subnet and this repo's pinned environment
@@ -108,10 +182,11 @@ MarketCast leg per **coldkey** (`max_open_legs_per_coldkey` = 1).
 ### 1. Test locally (no chain, no rental)
 
 ```bash
-cascade lane-c fetch-base --json                       # pinned Timestral, digest-checked
-cascade lane-c snapshot ...                            # public bars → local train / eval snapshots
+cascade lane-c fetch-base --json                                   # pinned Timestral, digest-checked
+cascade lane-c snapshot ./my-mkt --out train-snap                  # your recipe's training range
+cascade lane-c snapshot ./my-mkt --out eval-snap --evaluation --days 7   # recent held-out data
 cascade lane-c test ./my-mkt --target mkt:market \
-    --train-snapshot TRAIN --eval-snapshot EVAL --device cuda --json
+    --train-snapshot train-snap --eval-snapshot eval-snap --device cuda --json
 ```
 
 `lane-c test` trains your recipe and scores it against the base the way the
@@ -143,7 +218,14 @@ The full schema with every key is in
   the trainer produced (e.g. the current holder's). You are still judged
   against the pinned base, and against the holder to take the slot.
 - **`synthetic_fraction`** — > 0 needs a `generator.py` (lane A's sandboxed
-  `generate()` contract).
+  `generate()` contract). A horizon with no real bars in your range trains on
+  generator series alone, so a generator is how you train the short
+  horizons while the minute recording is still younger than the embargo.
+- **`synthetic_channels`** — name your generator's rows (`"target"` first,
+  then past covariates and an optional `"time"` clock) so synthetic samples
+  carry their own covariates instead of missing ones. The clock's step sets
+  the bar size the array is used at, so 1 m and 1 h series can differ. Units and an example
+  are in [§14](MINER.md#what-you-submit).
 
 ### 3. Check, upload, commit
 
@@ -279,7 +361,7 @@ never displaces a MarketCast holder.
 
 **Do I upload training data?** No. The trainer fetches the permitted public
 bars itself. A generator (`synthetic_fraction` > 0) is the only way to add
-your own series.
+your own series, with their own covariates if you set `synthetic_channels`.
 
 **Can I see the windows I am scored on?** Not before they happen — that is
 the point. After scoring, the signed report and the forecasts are public.

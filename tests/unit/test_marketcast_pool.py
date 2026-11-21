@@ -169,6 +169,25 @@ def test_window_geometry():
         M.window_geometry(("1h",), "5m")
 
 
+def test_cut_windows_context_grows_with_the_recorded_history():
+    # owner 2026-11-21: a 32k context over a bank the recording only partly
+    # fills is the recorded part — no unrecorded NaN run in front; a gap
+    # INSIDE the history stays (NaN = missing)
+    s = np.full(200, np.nan)
+    s[120:] = np.arange(80.0)
+    s[130] = np.nan
+    ws = M.cut_windows(s, cls="crypto", asset="BTC", suite="returns", horizon="5m",
+                       freq_minutes=1, steps=5, t0=T0, context_length=32768, after=T0,
+                       now=T0 + 60 * 200, min_context=10)
+    assert [w.context.size for w in ws][:3] == [10, 15, 20]
+    assert all(np.isfinite(w.context[0]) and w.context.size == w.index - 120 for w in ws)
+    assert np.isnan(ws[-1].context[10])
+    cap = M.cut_windows(s, cls="crypto", asset="BTC", suite="returns", horizon="5m",
+                        freq_minutes=1, steps=5, t0=T0, context_length=32, after=T0,
+                        now=T0 + 60 * 200, min_context=10)
+    assert max(w.context.size for w in cap) == 32
+
+
 def test_cut_windows_forward_only_and_stable_ids():
     s = np.arange(200, dtype=np.float64)
     t0 = T0
@@ -528,4 +547,4 @@ def test_load_check_refuses_an_unscorable_horizon():
         mc = load_chain_config(path).marketcast
         assert scorability_problems(mc) == [] and "5d" not in mc.horizons_map["returns"]
         assert (mc.coarse_history_days, mc.report_timeout_settlements,
-                mc.max_infra_deferrals) == (180, 8, 8)
+                mc.max_infra_deferrals) == (1372, 8, 8)

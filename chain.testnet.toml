@@ -971,12 +971,12 @@ max_context_length = 32768
 embargo_days       = 30                         # recipe training data ends this long before submission
 max_synthetic_fraction = 1.0                    # miner generator share of the training mix (1.0 = pure synthetic allowed)
 max_leg_hours      = 12.0                       # cap on a recipe's own leg_hours (miner-paid wall); no leg_hours = [lane_c] leg_hours
-eval_context_length = 4096                      # context steps the base and the fine-tune both see
+eval_context_length = 32768                     # owner 2026-11-21: UP TO 32k context steps the base and the fine-tune both see (shorter while the bank's history is shorter)
 windows_per_cell   = 48                         # per (asset, horizon), spread evenly: 2 per 6 h block over 6 days
 start_margin_seconds = 3600                     # windows start >= 1 h after the train block
 verdict_wait_blocks = 43200                     # an entry waits up to 6 days for its windows to close
-snapshot_days      = 10                         # 1m bank: 4096-step 1m context (2.8 d) + the 6-day verdict wait
-coarse_history_days = 180                       # hourly bars for >= 1h series (HL serves ~208 d of 1h)
+snapshot_days      = 30                         # 1m bank: 32768-step 1m context (22.8 d) + the 6-day verdict wait (recorder fills it forward)
+coarse_history_days = 1372                      # hourly bank: 32768 h (1365 d) + the wait; HL serves ~208 d of 1h, the recorder the rest as it accrues
 report_timeout_settlements = 8                  # trainer records a missing report "absent" after this
 max_infra_deferrals = 8                         # main-validator compute failures before an uncharged drop
 cluster_block_hours = 6                         # bootstrap clusters = asset class x 6 h block
@@ -992,7 +992,7 @@ coverage_gate_levels = [0.5, 0.8]               # per horizon, class-weighted li
 zero_scale_frac    = 0.001                      # cell masked (recorded) if base mean CRPS <= this x its horizon's median cell
 cell_ratio_cap     = 4.0                        # each cell's ft/base ratio clipped to [1/4, 4]
 crps_scale         = "seasonal_naive"           # per-window CRPS ÷ context seasonal-naive MAE (GIFT-Eval MASE denominator); "level" = old
-bar_relay          = "tsbench-forge-sources/marketcast/bars/"   # trainer relays the recorder to pods (HIPPIUS_S3_* creds); "" = pod fetches the API
+bar_relay          = "cascade-testnet-eval-pool/marketcast/bars/"   # the eval pool bucket (pool endpoint + POOL_S3_* creds); "" = pod fetches the API
 tail_levels        = [0.05, 0.95]               # tail gate: hit rate beyond q_l within tail_tolerance of 5 %
 tail_tolerance     = 0.025                      # per horizon AND pooled over horizons
 calibration_z      = 3.0                        # every calibration tolerance >= 3 standard errors (thin classes)
@@ -1039,7 +1039,7 @@ event_times        = [
     "2027-11-10T13:30:00Z", "2027-11-17T19:00:00Z", "2027-12-03T13:30:00Z", "2027-12-10T13:30:00Z",
 ]
 native_intervals   = ["5m", "15m"]              # native candle banks (+ 1m bars + 1h coarse)
-native_history_days = { "5m" = 21, "15m" = 50 } # HL keeps ~17 d of 5m, ~52 d of 15m (recorder fills)
+native_history_days = { "5m" = 121, "15m" = 348 } # 32768 steps + the wait; HL keeps ~17 d of 5m, ~52 d of 15m (recorder fills)
 
 [marketcast.frequencies]                        # the bars each suite is forecast on
 ohlcv     = ["1m", "5m", "15m", "1h", "4h", "1d"]

@@ -2284,9 +2284,12 @@ tests).
 
 **No recording lead time** (owner 2026-11-10). A series at frequency `f` is
 cut from the COARSEST bank whose interval divides `f`: the 1-minute bars
-(`snapshot_days`, 10 — a 4096-step 1m context is 2.8 days, plus the 6-day
-verdict wait), a native 5m / 15m bank (`native_history_days`: 21 / 50) or
-the hourly bank (`coarse_history_days`, 180). Every suite value is a
+(`snapshot_days`, 30 — a 32768-step 1m context is 22.8 days, plus the 6-day
+verdict wait), a native 5m / 15m bank (`native_history_days`: 121 / 348) or
+the hourly bank (`coarse_history_days`, 1372). Each bank is sized for the
+full `eval_context_length` (32768, owner 2026-11-21); bars neither the API
+nor the recording holds stay NaN, so a window's context is as long as the
+recorded history and grows toward 32k as the recorder accrues. Every suite value is a
 function of the block's OHLCV candle (open = first open, high / low = max /
 min, close = last close, volume = sum), so the bank is a history-depth choice
 only: a 15m value cut from 1m bars equals the one cut from native 15m
@@ -2315,9 +2318,11 @@ from listing. So:
   must be captured before the API drops them);
 - a recipe's embargoed training range (≥ 30 days old) has no minute or
   5-minute bars on Hyperliquid. Set `[marketcast] bar_relay =
-  "<bucket>/<prefix>/"` (the recorder's mirror on the `[storage]` endpoint,
-  e.g. `tsbench-forge-sources/marketcast/bars/`; `HIPPIUS_S3_*` credentials
-  on the TRAINER only) and the trainer lists the recording inside the
+  "<bucket>/<prefix>/"` (shipped: `cascade-eval-pool/marketcast/bars/`, the
+  eval pool bucket, which `publish-mkt-pool.yml` mirrors the recording into
+  after each publish; read with the pool endpoint and `POOL_S3_*`
+  credentials, exactly as every pool reader — on the TRAINER only. Any other
+  bucket: `MKT_BARS_S3_*` when set, else `HIPPIUS_S3_*`) and the trainer lists the recording inside the
   recipe's range and presigns one GET link per object (24 h) into
   `mkt_bars.json` in the leg's `--corpus-dir` (DEC-CA-0053's pattern: the pod
   holds no credential). The pod downloads exactly those files and builds its

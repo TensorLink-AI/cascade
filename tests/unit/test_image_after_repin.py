@@ -612,6 +612,10 @@ def test_receipt_of_a_reattached_old_image_leg_is_accepted(acfg):
 def test_marketcast_post_switch_leg_carries_its_contract_block(acfg):
     from cascade.trainer.marketcast_runner import mkt_contract_block_kw
 
+    # on the FLEET image ([marketcast] pod_image unset; a set one: its own
+    # release, test_marketcast_pod_image.py)
+    acfg = replace(acfg, marketcast=replace(acfg.marketcast, pod_image="",
+                                            worker_code_fingerprint=""))
     armed = A.apply_image_decoupled_activation(acfg, SW)
     assert mkt_contract_block_kw(armed, SimpleNamespace(start_block=SW)) == {"contract_block": SW}
     assert mkt_contract_block_kw(armed, SimpleNamespace(start_block=SW - 3600)) == {}

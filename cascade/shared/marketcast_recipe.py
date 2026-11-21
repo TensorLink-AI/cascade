@@ -40,6 +40,12 @@ Recipe keys (all required at the top level):
 Optional:
 * ``leg_hours``         (0, max_leg_hours] — the fine-tune leg's wall clock (the miner
                         pays the pod for it); absent = ``[lane_c] leg_hours``.
+* ``synthetic_channels`` the row names of each generator ``(C, L)`` array, row 0
+                        ``"target"``, then any of the recipe's PAST covariates and
+                        ``"time"`` (unix seconds per step, for the known rows):
+                        each array is then ONE synthetic sample with its own
+                        covariate rows (DEC-CA-0064 open item 5). Absent = every
+                        row is a separate target series with NaN covariates.
 """
 
 from __future__ import annotations
@@ -55,8 +61,9 @@ from .config.marketcast import TIMESTRAL_BLOCKS, TIMESTRAL_PATCH, TRAINABLE_SCOP
 
 MARKETCAST_RECIPE_FILE = "marketcast.json"
 TOP_KEYS = ("target", "data", "context_length", "horizon_mix", "covariates", "augmentations",
-            "objective", "optimizer", "trainable", "synthetic_fraction", "leg_hours", "init")
-TOP_REQUIRED = TOP_KEYS[:-2]
+            "objective", "optimizer", "trainable", "synthetic_fraction", "leg_hours", "init",
+            "synthetic_channels")
+TOP_REQUIRED = TOP_KEYS[:-3]
 DATA_KEYS = ("assets", "class_weights", "frequencies", "start", "end")
 OBJECTIVE_KEYS = ("suite_weights", "quantile_weights", "coverage_penalty")
 OPTIMIZER_KEYS = ("lr", "schedule", "warmup_fraction", "steps", "batch", "weight_decay", "clip",
@@ -103,6 +110,9 @@ class MarketCastRecipe:
     # trained pointer; "" = the pinned base) — the trainer accepts only one it
     # produced from a leg dispatched before this submission
     init: str = ""
+    # the row names of each generator (C, L) array: "target" first, then past
+    # covariates and "time"; () = rows are separate target series
+    synthetic_channels: tuple[str, ...] = ()
 
 
 def _obj(v: Any, where: str, keys: tuple[str, ...], required: tuple[str, ...]) -> dict:
@@ -321,6 +331,16 @@ def parse_marketcast_recipe(obj: Any, cfg: Any, *, target: str | None = None,
         init = str(top["init"])
         if parse_trained_pointer(init) is None:
             raise ValueError(f"marketcast recipe init {init!r} is not a trained pointer")
+    chans: tuple[str, ...] = ()
+    if top.get("synthetic_channels") is not None:
+        from ..eval.marketcast import PAST_COVARIATES
+
+        if syn <= 0.0:
+            raise ValueError("marketcast recipe synthetic_channels needs synthetic_fraction > 0")
+        chans = _labels(top["synthetic_channels"], "synthetic_channels",
+                        ("target", "time", *(c for c in covs if c in PAST_COVARIATES)))
+        if not chans or chans[0] != "target":
+            raise ValueError('marketcast recipe synthetic_channels must start with "target"')
     leg_hours = 0.0
     if top.get("leg_hours") is not None:
         leg_hours = _f(top["leg_hours"], "leg_hours", 0.0, float(cfg.max_leg_hours),
@@ -335,6 +355,7 @@ def parse_marketcast_recipe(obj: Any, cfg: Any, *, target: str | None = None,
         lr=lr, schedule=str(sched), warmup_fraction=wf, steps=steps, batch=batch,
         weight_decay=wd, clip=clip, ema_decay=ema, scope=str(scope), n_blocks=n_blocks,
         lora_rank=lora_rank, synthetic_fraction=syn, leg_hours=leg_hours, init=init,
+        synthetic_channels=chans,
     )
 
 

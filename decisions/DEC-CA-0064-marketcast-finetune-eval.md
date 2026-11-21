@@ -396,9 +396,11 @@ Still open:
    testnet before arming.
 4. **Coverage gate tolerance** (0.05), and whether the 98 % level gates or
    is only reported.
-5. **Generator output fields for covariates:** synthetic samples carry NaN
-   covariates today. A MarketCast field set (target + covariate channels)
-   beside the gated lane-A `accepted_fields` is not built.
+5. **Generator output fields for covariates:** BUILT 2026-11-20 as the
+   recipe's optional `synthetic_channels` (row 0 `"target"`, then past
+   covariates and an optional `"time"` clock for the known rows); without it
+   synthetic samples still carry NaN covariates. No lane-A
+   `accepted_fields` change.
 6. **"Bring your own checkpoint" intake:** not built.
 7. **"cpm":** meaning unclear; ask.
 8. **Unverified research items:**

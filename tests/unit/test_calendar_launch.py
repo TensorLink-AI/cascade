@@ -233,6 +233,9 @@ def test_shipped_main_restarts_on_a_lite_rpc_without_reading_history(tmp_path):
             diffs += [(f.name, g.name) for g in fields(a) if getattr(a, g.name) != getattr(b, g.name)]
         elif a != b:
             diffs.append((f.name,))
-    # the only difference is the marker that the rollover was resolved, not typed
+    # the only differences: the marker that the rollover was resolved, not
+    # typed, and the 2026-11-20 MarketCast arming the fixture untypes (a typed
+    # owner block, no vote or calendar resolves it)
     assert diffs == [("activation", "resolved_block"),
-                     ("activation", "resolved_prelaunch_burn_block")]
+                     ("activation", "resolved_prelaunch_burn_block"),
+                     ("lane_c", "from_block"), ("marketcast", "from_block")]

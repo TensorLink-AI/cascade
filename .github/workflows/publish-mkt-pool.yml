@@ -149,6 +149,40 @@ jobs:
             --wallet-name mkt --wallet-hotkey signer --wallet-path "$RUNNER_TEMP/wallets" \
             --effective-block "$EFFECTIVE_BLOCK"
 
+      # Training pods read the RAW recording through the trainer's relay
+      # ([marketcast] bar_relay = "<pool bucket>/marketcast/bars/"), read with
+      # the pool keys like every pool reader. Mirror what was synced above into
+      # it; `sync` uploads only the changed day files after the first run.
+      - name: Mirror the recording into the pool bucket  (POOL key)
+        if: steps.gate.outputs.run
+        env:
+          TOML: ${{ steps.gate.outputs.toml }}
+          AWS_MAX_ATTEMPTS: "10"
+          AWS_RETRY_MODE: adaptive
+        run: |
+          read -r RELAY ENDPOINT < <(python3 - "$TOML" <<'PY'
+          import sys, tomllib
+          c = tomllib.load(open(sys.argv[1], "rb"))
+          st, mc = c.get("storage", {}), c.get("marketcast", {})
+          print(mc.get("bar_relay", "") or "-",
+                st.get("pool_s3_endpoint") or st.get("s3_endpoint") or "https://s3.hippius.com")
+          PY
+          )
+          if [ "$RELAY" = "-" ]; then echo "bar_relay unset: nothing to mirror"; exit 0; fi
+          export AWS_ACCESS_KEY_ID="${POOL_S3_ACCESS_KEY:-$HIPPIUS_S3_ACCESS_KEY}"
+          export AWS_SECRET_ACCESS_KEY="${POOL_S3_SECRET_KEY:-$HIPPIUS_S3_SECRET_KEY}"
+          test -n "$AWS_ACCESS_KEY_ID" || { echo "::error::no POOL_S3 / CASCADE_S3 key to write the relay"; exit 1; }
+          ok=""
+          for pass in 1 2 3; do
+            if aws s3 sync ./mkt/bars "s3://${RELAY%/}" --endpoint-url "$ENDPOINT" --exact-timestamps; then
+              ok=1; break
+            fi
+            echo "::warning::relay mirror pass $pass failed; retrying the remainder"
+            sleep 30
+          done
+          test -n "$ok" || { echo "::error::relay mirror failed after 3 passes"; exit 1; }
+          echo "mirrored to s3://${RELAY%/} on $ENDPOINT"
+
       - name: Remove the signer hotkey
         if: always()
         run: rm -rf "$RUNNER_TEMP/wallets"
