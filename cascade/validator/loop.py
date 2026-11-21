@@ -47,6 +47,8 @@ from ..shared.emission import crown_units
 from ..shared.era import (
     bench_gate_mode_at,
     bench_gate_rule_at,
+    crowned_post_gate,
+    crowning_anchor_active,
     legacy_king_anchor,
     settlement_contract_block,
     tenure_blocks_active,
@@ -856,6 +858,15 @@ class ValidatorRunner(
         gate = int(self.cfg.scoring.tenure_blocks_from_block)
         if state.tenure_anchor_gate == gate:
             return state                         # anchored once at this gate already
+        if (crowning_anchor_active(self.cfg.scoring, block)
+                and crowned_post_gate(self.cfg.scoring, state.king_since_block)):
+            # A king crowned after the gate (a dethrone resets
+            # tenure_anchor_gate): its recorded crowning block is already the
+            # value every validator holds — keep it. Re-anchoring it from its
+            # 0-round counter moved the anchor to this settlement's block.
+            log.info("tenure: king %s… crowned at block %d (post-gate); kept as its anchor",
+                     state.king_hotkey[:8], int(state.king_since_block))
+            return replace(state, tenure_anchor_gate=gate)
         # EVERY validator re-anchors from the counter at the gate — a
         # crowning block recorded before the gate (a validator that upgraded
         # before that king's crowning) is discarded, or two upgraded
