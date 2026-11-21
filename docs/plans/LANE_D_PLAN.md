@@ -2312,3 +2312,256 @@ per new king, roughly as v2.
     1/4). The test checks the draw is deterministic from the hash and
     uniform over `sentinel_suites`.
 
+---
+
+## Appendix A: run status and owner actions
+
+This mirrors `docs/plans/LANE_D_PROGRESS.md`. **This plan is the working
+document;** the separate file exists for the PR.
+
+Branch `claude/sleepy-cray-7uutm1`. One PR, owner merges. Report-only:
+
+- no chain.toml values, consensus code, `cascade/pool/` or prod-box changes;
+- W2–W12 are not built.
+
+Status values: `todo` | `in progress` | `done` | `blocked: needs owner` |
+`blocked: <other>`.
+
+### Owner actions
+
+These are the inputs the S1 runs need. They're never guessed; the dependent
+runs stay blocked until each one is answered here.
+
+1. **OA1, prior-king pairs (B1 null type 2).** List the checkpoint refs
+   (`repo@sha256:…`) of ≥ 3 consecutive lane A v2 kings that are light
+   fine-tunes of each other (same lineage, adjacent reigns). Write them here
+   as `king_t, king_t+1` pairs.
+2. **OA2, seed replicas (B1 null type 2b).** Do any same-corpus,
+   different-seed replicas exist (DEC-CA-0061, docs/OPERATOR.md
+   seed-noise)? If yes, give their refs. If none, write "none".
+3. **OA3, per-era false-crown target.** The recommended value is 5%. Confirm
+   or set a value; it gates S4 (T14) and sizes `d_margin`.
+4. **OA4, pod approval for B1 scoring and the B2 16k memory fit.** Either:
+   - (a) use valpriv-4090 **outside lane A duel windows** (no rental; it
+     touches an eval pod), or
+   - (b) approve renting one pinned-torch pod (torch 2.4.1+cu124 capable,
+     ≥ 24 GB), with a cost cap.
+
+   State which, plus the time window.
+5. **OA5, forge-mirror read access for B2.** The B2 history-length counts
+   (≥ 16k, and the S8 lengths) and first-seen checks can't come from pool
+   snapshots: they truncate history to 4096+720 and carry no timestamps.
+   Approve running `scripts/laned_w1_measure.py` (or a mirror variant) on
+   GitHub Actions or the builder with the `TSFORGE_S3` read credentials. Say
+   where.
+6. **OA6, pinned pool snapshots for B2's snapshot-diff bound.** Approve
+   fetching ≥ 2 consecutive pinned daily `pool` snapshots and one `pool_mkt`
+   run of snapshots to a non-box host (GitHub Actions or the builder), and say
+   where. They're never fetched to the prod box.
+8. **OA8, pod approval for LB6 (WB19).** Approve one pinned-torch testnet pod (8×H100, matching the lane A full-leg SKU) for an expert-only leg vs a full leg on the same SKU. Give a cost cap.
+7. **OA7, input plan.** The brief's PLAN START/END block contained only the
+   template placeholder. I used the latest local plan (v2 design + the v3
+   loop-readiness §3) as commit 1. If you meant a different v2 file, say so
+   and the PR is rebuilt on it.
+
+### Items
+
+| Item | Status | Notes |
+|---|---|---|
+| Commit 1: input plan unchanged | done | `docs/plans/LANE_D_PLAN.md` (see OA7) |
+| A1 forward-only: data time AND first-seen; `max_mirror_lag_hours`; first-seen WP | done | first-seen absence verified (no `first_seen`/`ingested_at` in `cascade/pool/`) |
+| A2 repeated attempts, confirmation duel, per-era margin | done | |
+| A3 horizon h = 64 | done | already in v2 §1.1 "Horizon" |
+| A4 testnet exit criteria and floors | done | repo fact corrected: pool_mkt scheduled runs skip while `[marketcast] from_block = 0` (both networks) → new WP R15 |
+| A5 descope long context to 4k/8k/16k; S8 | done | |
+| A6 BF16 only | done | |
+| A7 unpaid share [DECIDE] | done | |
+| A8 coldkey caps per lane + resolution [DECIDE] | done | |
+| A9 verifiability | done | |
+| A10 low-frequency check | done | |
+| A11 smaller fixes | done | |
+| B1 script + tests (`scripts/null_fpr.py`) | done | py_compile + ruff clean; 10 tests; CI runs them (never run on the prod box) |
+| B1 run | blocked: needs owner | OA1, OA2, OA3, OA4 |
+| B2 script + tests (`scripts/laned_w1_measure.py`) | done | py_compile + ruff clean; 8 tests; must run off-box (OA6) |
+| B2: first-seen exists? | done | No: `grep -rnE "first_seen\|ingested_at\|ingest_time\|landed_at\|LastModified" cascade/pool/` finds nothing |
+| B2 run: snapshot-diff bound, pool_mkt | blocked: needs owner | OA6 |
+| B2 run: history ≥ 4k…128k, pool_d size | blocked: needs owner | OA5 |
+| B2 run: 16k memory fit | blocked: needs owner | OA4 |
+| C: DEC-CA-0070 draft (proposed) | done | 0069 is taken by unmerged PR #482 |
+| §15 incentive review folded in as [DECIDE] D25–D32 | done | |
+| Lifecycle trace `docs/plans/lane_d_lifecycle.md` | in progress | |
+| rev4 lane B (§12b, WB10–WB21, TB10–TB22, SB track, D35–D42) | done | |
+| DEC-CA-0069 amendment rev4 (on top of PR #482's text) | done | |
+| LB6 expert-leg cost measurement | blocked: needs owner | OA8 |
+| PR | todo | |
+
+---
+
+## Appendix B: S1 results
+
+This mirrors `docs/plans/LANE_D_S1_RESULTS.md`. Raw outputs are in
+`docs/plans/lane_d_s1/`.
+
+**Evidence rule.** Every number below cites its command, the pool snapshot
+sha256, the host and a raw output file under `docs/plans/lane_d_s1/`. There
+are no estimates, extrapolations or placeholders. Anything not run says
+`not run: <blocker>`; anything below its floor says `below floor` plus the
+counts.
+
+Owner inputs are requested in `LANE_D_PROGRESS.md` → **Owner actions**
+(OA1–OA7).
+
+### B2: W1 measurements
+
+| Measurement | Result | Command | Snapshot sha256 | Host | Raw output |
+|---|---|---|---|---|---|
+| Do first-seen or ingest timestamps exist in `cascade/pool/`? | **No.** No match for `first_seen`, `ingested_at`, `ingest_time`, `landed_at` or `LastModified` (grep exit 1) | `grep -rnE "first_seen\|ingested_at\|ingest_time\|landed_at\|LastModified" cascade/pool/` at repo `3c67b64` | n/a (code check) | droplet (prod box, read-only grep) | `lane_d_s1/b2_first_seen_grep.txt` |
+| pool_mkt cadence | **Scheduled every 6 h (`30 */6 * * *`), but scheduled runs skip while `[marketcast] from_block = 0`, which is the current value on mainnet and testnet.** Today pool_mkt publishes only on manual dispatch | `grep -nE "cron\|schedule" .github/workflows/publish-mkt-pool.yml` plus `publish-mkt-pool.yml:84-95` | n/a (code check) | droplet (read-only) | `lane_d_s1/b2_pool_mkt_cadence.txt` |
+| Forward-eligible windows and distinct sources per daily snapshot (6 h margin, h = 64) | **not run: blocked: needs owner (OA6)**, a non-box host to fetch ≥ 2 consecutive pinned `pool` snapshots. Pool records carry no timestamps, so this run can only produce a **snapshot-diff bound (upper bound on eligible counts)**, never measured first-seen | `python -I scripts/laned_w1_measure.py diff …` (script in this PR) | — | — | — |
+| Floors met under the snapshot-diff upper bound? | **not run** (depends on the row above) | — | — | — | — |
+| Same for pool_mkt at 6 h | **not run: blocked: needs owner (OA6)**, plus pool_mkt isn't published on schedule while MarketCast is off (row 2) | — | — | — | — |
+| Series and sources with history ≥ 4k / 8k / 16k (+64), the launch `pool_d` | **not run: blocked: needs owner (OA5).** Not answerable from pool snapshots, which truncate every series to 4096 + 720 (`builder.py:264-266`). Needs the forge mirror (`TSFORGE_S3`) | — | — | — | — |
+| Series and sources with history ≥ 32k / 64k / 128k (+64), for S8 | **not run: blocked: needs owner (OA5)** (same reason) | — | — | — | — |
+| Launch `pool_d` size | **not run: blocked: needs owner (OA5)** | — | — | — | — |
+| 16k-context batch memory fit on valpriv-4090 (24 GB) | **not run: blocked: needs owner (OA4)**, pod approval (valpriv-4090 outside lane A duel windows, or a rented pinned-torch pod) | — | — | — | — |
+
+### B1: null FPR
+
+| Measurement | Result |
+|---|---|
+| Prior-king pairs (null type 1, primary) | **not run: blocked: needs owner (OA1** pairs, **OA4** pod) |
+| Seed replicas (null type 2) | **not run: blocked: needs owner (OA2)** |
+| Perturbed king (null type 3, the easy case; no recommendation from it alone) | **not run: blocked: needs owner (OA4)** pod approval |
+| Per-entry FPR, null LCB quantiles 50/90/95/99, disjoint/resampled spread ratio, confirmation-duel FPR, per-era FPR at k = 1 / 8 / 32, `d_margin` for per-era targets 1/5/10%, at min_clusters 20/30/40 | **not run** (depends on the rows above). The per-era target itself awaits **OA3** |
+
+Other notes from the build:
+
+- `score` doesn't pass a training contract to `evaluate_checkpoint`, so the
+  config.json and weights-header pin isn't armed. The code-identity
+  byte-check still runs.
+- The snapshot sha256 the scripts record is a digest of the unpacked
+  directory; the published tar sha256 is recorded as given.
+- W1 holds two snapshots in float64, so it must run off the prod box (OA6).
+
+The script (`scripts/null_fpr.py`) and its tests
+(`tests/unit/test_null_fpr.py`) are in this PR. CI runs the tests; nothing
+was executed on the prod box.
+
+**Repo fact affecting B1 (verified by the script build):**
+
+- `calib_draw` (`cascade/validator/calibration.py:52`, wrapping
+  `windows.horizon_draw` at `windows.py:414`) cuts **one window per series**:
+  the last 64 points.
+- A pinned pool of about 4.6k series (snapshot 9509400: 4,633) therefore
+  gives about **4.6k windows at h = 64, not ~12k**. That allows about **4
+  disjoint 1000-window sets, not 12**, for the spread check. Fewer sets make
+  the disjoint SD noisier; the script reports the set count with the ratio.
+- Reaching ~12 disjoint sets would need several snapshots' windows, which
+  conflicts with "one window list", or a smaller `--n`.
+
+**Known limitation (B1):** the scoring snapshot isn't forward-only, and fresh
+forward windows shift in distribution. A forward-window re-check happens at
+the S6a shadow.
+
+---
+
+## Appendix C: DEC-CA-0069 amendment rev4 (text)
+
+This is the amendment as drafted in
+`decisions/DEC-CA-0069-lane-b-public-suite-targets.md`, on top of PR #482.
+
+### Amendment rev4 (proposed, 2026-11-21)
+
+Status of this amendment: **PROPOSED**. This file carries PR #482's
+unmerged text above unchanged, with this amendment on top. The full design
+is in `docs/plans/LANE_D_PLAN.md` §12b; this section records the decisions.
+
+**Owner direction (2026-11-21).** Lane B stays **trainer-run**: miners
+submit a code-only generator and our trainer trains. Miners may also
+(1) **choose which expert rows** are trained, and (2) **target one public
+suite**, improving it significantly while regressing nowhere.
+
+1. **Open option (b) is adopted: miner-chosen experts.**
+   - The commit declares `declared_rows = {layer: [indices]}`, validated
+     against `experts_per_layer = (128, 256, 256, 512, 512, 512, 512)`
+     (`cascade/trainer/pyramid_model.py:42`). Typed refusals:
+     `declared_rows_out_of_range`, `declared_rows_bad_layer`,
+     `declared_rows_count`.
+   - The per-layer clamp becomes fractional (D39): `min_experts_frac =
+     0.03125`, `max_experts_frac = 0.1484375`. That gives 128 → 4..19,
+     256 → 8..38 and 512 → 16..76, replacing the 256-era `min_experts = 8` /
+     `max_experts = 38`.
+   - Claims follow the existing merge-acceptance deferral. The earliest
+     reveal wins; a deferred claim shows `deferred: rows_held`.
+   - ESFT stays the default when nothing is declared, and both modes
+     coexist.
+   - **Router rows, [DECIDE] D40:** (a) frozen, today's compact-rows
+     backend (`cascade/trainer/expert_training.py:112-122`), recommended for
+     first arming; or (b) the FlexOlmo unfreeze of the declared rows' router
+     entries and bias, with a `traffic_steal_bound` guard.
+2. **The static contamination check is a precondition, not an open item.**
+   - `suite_targets` arms only after the check ships **and passes on
+     testnet**.
+   - At intake, before compute, exact and normalised (scale-, offset- and
+     rounding-robust) hashes of every GIFT-Eval, BOOM, TIME and FEV test
+     window are matched against `.py` numeric literals, `config.json` and
+     any non-code bytes. A match is refused as `benchmark_series_embedded`.
+   - The hash set is versioned and digest-pinned
+     (`[lane_b] contamination_hashset`), refreshed only when a suite
+     identity changes.
+   - Guard 4 (whole-pool point gain ≥ 0) and the anchor guard stay the
+     backstop for procedurally recreated series.
+   - **[DECIDE] D38:** `suite_target_max_repo_mb = 8` (recommended) vs keep
+     `[generator] max_repo_mb = 128` (`chain.toml:47`). DEC-CA-0028 already
+     plans to stop `config.json` carrying bulk data.
+3. **The opening gate is replaced ([DECIDE] D41).**
+   - The routing-saturation co-gate (`routing_overlap` 0.8, `routing_jaccard`
+     0.7) **has never been measured on mainnet**. The driver state shows
+     `gate_opened_block = 0`, an empty `routing_history` and
+     `lineage_tokens = 0`, because lane B is off.
+   - The only measurement, the 2026-11-20 probe, found king-vs-init top-8
+     overlap of about 1.1/8.
+   - Options: (a) `open_tokens` + a passing lane A king check
+     (**recommended**); (b) `open_tokens` alone; (c) keep the co-gate with
+     re-measured thresholds.
+   - The new key is `[lane_b] open_rule`, overlay-settable after the
+     capability release.
+4. **Sentinel ([DECIDE] D35).**
+   - With the cross-lane rotating sentinel (plan §16), a suite-target entry
+     whose target is the current sentinel **defers** to the next era: typed
+     `deferred: sentinel_target`, not charged, bounded by
+     `sentinel_max_defer_eras` (recommended).
+   - The alternative is to exempt lane B's own target from the sentinel.
+5. **Routing information for miners** (informational only, never consensus):
+   per-king per-expert load, dead experts and per-suite context-only routing
+   affinity, in a digest-pinned artefact.
+6. **Expert-leg cost (D42)** is measured before deciding a smaller SKU, a
+   shorter leg or operator funding (pod approval pending).
+
+New `[lane_b]` keys:
+
+- `suite_targets`
+- `contamination_hashset`
+- `contamination_min_hits`
+- `suite_target_max_repo_mb`
+- `min_experts_frac`
+- `max_experts_frac`
+- `router_rows`
+- `traffic_steal_bound`
+- `open_rule`
+- `sentinel_target_rule`
+- `sentinel_max_defer_eras`
+
+Each key: drop-when-default in the digest, overlay-settable via
+`ALLOWED["lane_b"] = None` (`remainder` stays release-only), loader parse,
+round-trip and mutation tests (plan WB10).
+
+---
+
+## Appendix D: related records
+
+- `decisions/DEC-CA-0070-lane-d-open-weights.md`: lane D decision record
+  (proposed). Its [DECIDE] table is the same as §6.
+- `scripts/null_fpr.py`, `scripts/laned_w1_measure.py` (+ tests): S1
+  measurement tools (B1, B2).
+
