@@ -1662,8 +1662,8 @@ bar_relay          = "cascade-eval-pool/marketcast/bars/"   # owner 2026-11-21: 
 # lane A / king legs keep [round] funded_pod_image. Both or neither; "" = the
 # fleet's. Re-derive the fingerprint with scripts/worker_code_fingerprint.py on
 # every re-pin, and point the main validator's [provisioner.mkt] image at it.
-pod_image          = "ghcr.io/tensorlink-ai/cascade-worker:worker-v2.1.0-mkt-rc1@sha256:fa20552b56b8c480c26f13fdc9eb5ff9d9e59118fa5e6f5a35de308a43d62c94"   # built from 89992b3 (publish-worker run 44828784868), 2026-11-20
-worker_code_fingerprint = "81011e6de6a912b9da311b2355ea6d991411fec7d4f30660f392bf957731ad59"   # 303 files; registry walk = local 89992b3 source
+pod_image          = "ghcr.io/tensorlink-ai/cascade-worker:worker-v2.1.0-mkt-rc2@sha256:0205f761fde14da71b9a90b4f1ecdc862d657f982accb11450e0ce22c61d2f12"   # built from 6c9cab9 (publish-worker run 44848132705), 2026-11-21
+worker_code_fingerprint = "37484df946cf1de8243e4570fad9ba325f766416f9d5d55dbbbd043ae9ab98ee"   # 303 files; registry walk = local 6c9cab9 source
 tail_levels        = [0.05, 0.95]               # tail gate: hit rate beyond q_l within tail_tolerance of 5 %
 tail_tolerance     = 0.025                      # per horizon AND pooled over horizons
 calibration_z      = 3.0                        # every calibration tolerance >= 3 standard errors (thin classes)
