@@ -36,6 +36,11 @@ revisions, is an older commit of this plan branch, sitting directly on main
 | D42 | **Owner decision:** cheaper GPUs via a lane B GPU list; miner-chosen `train_hours` 0.5–6 h; D42b new | §12b.0, §12b.6, D42, D42b, WB19, WB22, WB23, TB23–TB27, OA8, Appendix C |
 | Harvest | **Owner request:** start long-history harvesting (to 128k) now, score from S8 | §1.7, R16, §5 S1 |
 | D43 | **Owner decision:** lane D reveals immediately (Proposed change 19 adopted) | §1.2 step 4, W10, D43 |
+| D44 | **(rev5) DECIDED (owner 2026-11-21):** power EMA instead of cooldown, lanes A and B | No cooldown for EMA-scored legs; the scored weights are the EMA. Blocked on WE1 (scored EMA constant), WE2 (identical-trunk finding) and WE4 (testnet measurement). §12c |
+| D44b | **(rev5)** Where the no-cooldown switch lives (§12c) | (a) image-only, activated by init like the power EMA (**recommended**); (b) a `[v2.training] lr_schedule` contract value activated at a typed block |
+| D45 | **(rev5) DECIDED (owner 2026-11-21):** go-live rule | No shadow modes: every feature goes live at one activation block on every node at full effect. Testnet + S1 replace shadow evidence; release-then-activate (observed stake ≥ 2/3 **before** the block) and the kill switch stay. §5 |
+| D44 | **Owner decision:** power EMA instead of cooldown for lanes A and B; D44b new; WE1–WE5, TE1–TE4, OA9 | §12c, §6, Appendix A |
+| D45 | **Owner decision:** no shadow modes; one activation block, everywhere, full effect | §5 (go-live rule, S6, SB5 and exit gate), D10, D19, D37, X6a, §14.5, §16 sentinel, W-S1, Appendix B note |
 | New proposals | 18 house lineage T; 19 lane D reveal timing (adopted as D43); 20 lane A/B pre-T leakage shadow; 21 retire duplicate files | Proposed design changes |
 
 **Propagation table:**
@@ -419,7 +424,7 @@ the code). Each is verified where marked.
 13. **Testnet overlay is inert:** `owner_hotkey = ""`
     (`chain.testnet.toml:903`, verified). It's handled as a setup task in
     R14, with no design change, but noted here.
-14. **Shadow semantics.** Proposed: S6a crowns are provisional and
+14. **(rev5) Moot under D45 (no shadow).** ~~Shadow semantics.~~ Proposed: S6a crowns are provisional and
     unpublished, and `lane_d_state` resets at the S6b `effective_block` (or
     say explicitly that they carry). Affects §5 S6a.
 15. **Invariant 8 may not hold over time.** Later `pool_d_hist` snapshots
@@ -458,7 +463,7 @@ the code). Each is verified where marked.
 20. **(rev5) Lanes A and B aren't forward-only.** Their pool snapshots "may
     include observations that existed before submission"
     (`docs/EVAL_POOL.md:22-24`). A generator can embed recent public series
-    from the same feeds. Proposed: a shadow-only check, once W6 timestamps
+    from the same feeds. Proposed: a **monitoring metric** (never gating, and not a rollout mode, so D45 isn't affected), once W6 timestamps
     exist, comparing each new lane A king's paired LCB on windows whose
     targets precede the generator's reveal against windows after it. A large
     gap is a memorisation flag, logged and never gating.
@@ -1290,7 +1295,7 @@ Accept command exits 0**, never on a builder's word. Conventions:
 | WP | What | Depends | Runs in | Accept |
 |---|---|---|---|---|
 | W0c | Loop tooling: `scripts/laned/accept`; `stub_scan.py` (refuses `TODO`, `FIXME`, `pass`-only bodies, `NotImplementedError`, `...` bodies, hardcoded sample values and mock imports outside `tests/`); `unread_keys.py` (every `[lane_d]`/`[lane_d_ops]` key is read by a parser); `follower_patterns.py` (every lane D log call has a cascade-ops follower pattern) | — | ci | `scripts/laned/accept W0c` (self-tests: each script fails on a planted violation fixture and passes on a clean one) |
-| W0 | DEC-CA-0070 (supersedes DEC-CA-0062's recipe design) recording **(rev5)** D1–D43 and D42b (D25–D32 from §15, D33–D35 §16, D36–D42 §12b) | — | ci + owner merge | `scripts/laned/accept W0` (front matter valid; `supersedes: DEC-CA-0062`; **(rev5)** every decision D1–D43 and D42b answered or marked resolved) |
+| W0 | DEC-CA-0070 (supersedes DEC-CA-0062's recipe design) recording **(rev5)** D1–D45, D42b and D44b (D25–D32 from §15, D33–D35 §16, D36–D42 §12b) | — | ci + owner merge | `scripts/laned/accept W0` (front matter valid; `supersedes: DEC-CA-0062`; **(rev5)** every decision D1–D45, D42b and D44b answered or marked resolved) |
 | W0b | Context-equivalence test: the lane D scorer at 4096 equals the pinned `pyramid_wrapper` output (within tolerance) on windows with ≥ 4096 history; a 4096 checkpoint loads `strict=True` at every context variant | W5d | ci | `scripts/laned/accept W0b` |
 
 **Rollout tooling (prerequisites for S0a–S0c, S4–S6)**
@@ -1393,7 +1398,7 @@ Every new `[lane_b]` key below ships with:
 | WB23 | **(rev5)** Miner-chosen leg length (D42, D42b): `train_hours` on the funding request (0.5–`max_leg_hours`, 0.5 h steps); steps fixed at admission and signed in the leg record; guard = `train_hours × guard_factor` + overhead, capped at `[lane_b] max_leg_seconds` (lane B contract derivation; `[training] max_train_seconds` untouched); expected landing boundary returned to the miner; validator check of recorded steps and guard | keys `max_leg_hours`, `max_leg_seconds`, `guard_factor`; `status/lane_b.json` shows steps, GPU and landing boundary | WB10, WB22 | ci | `scripts/laned/accept WB23` (TB25–TB27) |
 | WB20 | Lane B docs (MINER, INTERFACE, AGENT_MINING, VALIDATOR) | — | WB13–WB18 | ci | `scripts/laned/accept WB20` |
 | WB21 | DEC-CA-0069 amendment (this PR drafts it; owner accepts) | — | — | ci + owner | `scripts/laned/accept WB21` |
-| W-S1 | **(rev4: now in §3)** §16 sentinel draw + lane A gate rule behind `sentinel_from_block` + receipt field + `[v2]` overlay keys + shadow logging. **(rev5) Changed consensus code:** the bench gate (`cascade/eval/bench_gate.py`) **and `king_check_gate` (`cascade/validator/king_check.py:93`)**, both of which must drop the sentinel suite from the rule; block-gated by `sentinel_from_block` | `[v2] sentinel_from_block`, `sentinel_suites`, `sentinel_ratchet`, `sentinel_tau` | W0c | ci | `scripts/laned/accept W-S1` (TS1–TS3, TS5) |
+| W-S1 | **(rev4: now in §3)** §16 sentinel draw + lane A gate rule behind `sentinel_from_block` + receipt field + `[v2]` overlay keys (**(rev5)** no shadow logging, D45). **(rev5) Changed consensus code:** the bench gate (`cascade/eval/bench_gate.py`) **and `king_check_gate` (`cascade/validator/king_check.py:93`)**, both of which must drop the sentinel suite from the rule; block-gated by `sentinel_from_block` | `[v2] sentinel_from_block`, `sentinel_suites`, `sentinel_ratchet`, `sentinel_tau` | W0c | ci | `scripts/laned/accept W-S1` (TS1–TS3, TS5) |
 | W-S2 | **(rev4: now in §3)** lane B guard/target exclusion for the sentinel | — | W-S1 | ci | `scripts/laned/accept W-S2` (TS4) |
 | W-S3 | **(rev4: now in §3)** sentinel numbers on the status boards | — | W-S1 | ci | `scripts/laned/accept W-S3` |
 
@@ -1411,7 +1416,7 @@ BLOCKING item, and each finding is either fixed or filed as a WP.
 | X3 | S3 testnet matrix T1–T29 | testnet | `scripts/laned/accept X3 --evidence evidence/s3_matrix.json` (each row's recorded pass, 6 clean eras, ≥ 1 crowning, ≥ 1 house retake) |
 | X4 | S4 release + valeval-laned provisioning + dry-run + announcement + staged revert overlay | owner | `scripts/laned/accept X4 --evidence evidence/s4.json` |
 | X5 | S5 capability-release upgrade (eval host → validator → intake → trainer; satellites) | owner | `scripts/laned/accept X5 --evidence evidence/s5.json` (lane A unchanged ≥ 2 settlements; `--netconfig-policy` lists `lane_d`) |
-| X6a | S6a readiness probe + shadow (+ D19 test entry) | owner | `scripts/laned/accept X6a --evidence evidence/s6a.json` (R4 shows ≥ 2/3 `cfg-` stake before `effective_block`; ≥ 2 eras of valid reports; satellite replay matches; webhook test alert delivered) |
+| X6a | **(rev5)** S6 readiness probe (observed `cfg-` stake before the activation block); D19 test entries moved to testnet | owner | `scripts/laned/accept X6a --evidence evidence/s6a.json` (R4 shows ≥ 2/3 `cfg-` stake before `effective_block`; ≥ 2 eras of valid reports; satellite replay matches; webhook test alert delivered) |
 | X6b | S6b pay | owner | `scripts/laned/accept X6b --evidence evidence/s6b.json` |
 | X7 | S7 operate | owner | `scripts/laned/accept X7 --evidence evidence/s7.json` |
 
@@ -1618,11 +1623,37 @@ from four things:
 - announcements we couldn't verify.
 
 So the order is: **de-drift → prove the overlay → catch-up release →
-capability release → stake-proven shadow → pay.**
+capability release → (rev5) one activation block, live everywhere.**
+
+**(rev5) Go-live rule (owner 2026-11-21, D45): no shadow modes.**
+
+- **Every feature goes live at one announced activation block, on every node,
+  at once, at full effect.** That covers lane D, lane B, the sentinel, the D42
+  leg options, D43 and EMA-without-cooldown (§12c). There are no `share = 0`
+  eras, no log-only or "would-be verdict" periods, and no partial or
+  per-validator rollout. Pay starts at the activation block.
+- **What replaces shadow evidence:** CI, plus a **full testnet run
+  (netuid 259)** that exercises real duels, real payouts and satellite replay
+  (§4), plus the S1 measurements. Calibration that shadow eras used to provide
+  (`d_margin`, gate tolerances, the sentinel) must come from testnet and S1
+  **before** the block.
+- **What stays (it isn't shadow):**
+  - **Release-then-activate.** Six external validators run netuid 91. The
+    activation overlay is published with an `effective_block` far enough
+    ahead, and the **observed** `cfg-` stake must reach ≥ 2/3 (incl.
+    5E2LP6) **before** that block. If it doesn't, publish seq N+1 with a later
+    block. That's an upgrade check before the switch, not a trial after it.
+    Without it the fleet forks.
+  - **Activation at an era boundary**, never mid-seed-epoch for anything
+    touching the image or contract.
+  - **The kill switch** (revert overlay, §5).
+- **Consequence:** a bug at activation pays out live until the revert overlay
+  lands (up to about one era). Testnet exit gates (§4) are therefore stricter:
+  every T-row must pass on testnet before the mainnet block is announced.
 
 | # | Stage | Work | Exit gate (all must hold) |
 |---|---|---|---|
-| 1 | **S0 Decide** | **(rev5)** D1–D43 and D42b (incl. the §15 incentive [DECIDE]s D25–D32, the §16 sentinel D33–D35 and lane B D36–D42) (§6) in writing; W0 | All answered |
+| 1 | **S0 Decide** | **(rev5)** D1–D45, D42b and D44b (incl. the §15 incentive [DECIDE]s D25–D32, the §16 sentinel D33–D35 and lane B D36–D42) (§6) in writing; W0 | All answered |
 | 2 | **S0a De-drift** | Classify the 21 `LIVE OVERRIDE`s in the deployed chain.toml: main, overlay, or documented operator-only; type the decided blocks in main. Overlays merge onto **each node's own base** (`build_config(base, body)` merges onto `effective_raw(base)`, `netconfig.py:346-354`), so base drift survives any overlay | `cascade-audit decided --config /root/cascade/chain.toml` = 0 drift; the validator-read consensus-key diff between deployed and main is empty |
 | 3 | **S0b Note budget** | Decode the live mainnet readiness notes and add the `cfg-` segment. It's trimmed **last** (`activation.py:1334-1357`), so older pending segments go first | No still-pending segment would be trimmed (type their decided blocks in main first if needed); T22 passes on testnet |
 | 4 | **S0c Overlay bring-up** | Publish a **benign seq-1 overlay** (restates current values only) on testnet, then mainnet. Then a deliberately refused overlay on testnet | The 404-every-poll is gone. Fetched from S3 **and** the HF mirror by our validator, the trainer and satellites. `cfg-` lock ≥ 51% in `status/chain.json`. Receipts stamp `netconfig_seq`; the `cascade-audit` netconfig check passes; the trainer logs the same apply block. The refused overlay applies nothing |
@@ -1632,10 +1663,10 @@ capability release → stake-proven shadow → pay.**
 | 8 | **S3 Testnet** | §4 matrix including T22–T29 | §4 exit gate |
 | 9 | **S4 Release** | Cut the **capability release** (lane D unarmed, `lane_d` allow-listed). Provision valeval-laned (on-rent check, pinned known_hosts, handshake); dry-run the house. **Stage and review the revert overlay.** Send the announcement (§11.3) | Dry-run within the measured cross-host tolerance; announcement sent; revert overlay reviewed |
 | 10 | **S5 Upgrade** | Snapshot all state (§10.8). Order, each through `deploy_gate check`/`verify` in quiet windows: **eval host → validator → lane D intake (systemd unit with the code-path guard) → trainer** (no legs in flight; memory-burst check; confirm preflight and worker-fingerprint lines unchanged). Satellites upgrade. Arm the broad watcher | Lane A unchanged on ≥ 2 settlements; `cascade-validator --netconfig-policy` lists `lane_d` on our nodes |
-| 11 | **S6a Readiness probe + shadow** | **[DECIDE D19]** at least one owner-run test entry on a dedicated hotkey during the shadow (recommended); without it S6a proves only plumbing. Overlay seq N: `[lane_d] from_block` at a far era boundary, **`share = 0`**, all lane A keys **byte-identical** to seq N-1 (no lane A tuning in a lane D overlay, ever) | **Observed** `cfg-` stake ≥ 2/3 (incl. the largest holder, 5E2LP6 at about 49%) at a boundary before `effective_block`. That's the only stake-weighted proof of upgrade, because only nodes on the capability release can verify a `[lane_d]` overlay. Else publish seq N+1 with a later block. Webhook test alert delivered. Keep-alive live. Then ≥ 2 eras of signed lane D reports at share 0: satellite replay matches, `check_lane_d` passes, no weight gap |
-| 12 | **S6b Pay** | Overlay seq N+1: `share = 0.20`, `takes_from = "lane_a"`, lane A keys byte-identical | First paid settlement's vectors match on ≥ 2 validators |
+| 11 | **(rev5) S6 Activate (no shadow, D45)** | **D19 (rev5):** the owner-run test entries run on **testnet** (S3), not in a mainnet shadow. Overlay seq N, **one overlay**: `[lane_d] from_block` at a far era boundary **with `share = 0.20` and `takes_from = "lane_a"`**, all lane A keys **byte-identical** to seq N-1 (no lane A tuning in a lane D overlay, ever). ~~share = 0 shadow~~ | **Observed** `cfg-` stake ≥ 2/3 (incl. the largest holder, 5E2LP6 at about 49%) at a boundary before `effective_block`. That's the only stake-weighted proof of upgrade, because only nodes on the capability release can verify a `[lane_d]` overlay. Else publish seq N+1 with a later block. Webhook test alert delivered. Keep-alive live. **(rev5)** All §4 T-rows green on testnet before the block is announced. From the block: lane D live and paid everywhere; first paid settlement's vectors match on ≥ 2 validators, satellite replay matches, `check_lane_d` passes |
+| 12 | ~~S6b Pay~~ **(rev5) merged into S6 (D45)** | — | — |
 | 12b | **(rev5) NOT PLANNED.** ~~(rev3) S6c Lane B~~ (rev4: superseded by the SB track below; it was for the parked §12 variant) | Overlay: `[lane_b] from_block` at an era boundary (shadow first: `[lane_b] share = 0` for ≥ 2 eras, then the D1 split) | TB1–TB8 passed in S3; ≥ 2 eras of valid lane B reports at share 0 with satellite replay matching; then first paid settlement's vectors match on ≥ 2 validators |
-| 12c | **(rev4) Lane B track SB0–SB5** (runs in parallel with lane D's S2–S3; depends on **S0a–S0c** de-drift, note budget and overlay bring-up, and on the shared S5 capability release) | **SB0** decide D35–D42, D42b · **SB1** build WB10–WB18, **(rev5)** WB22–WB23, W-S1–W-S2 · **SB2** WB19 measurement per GPU type (owner pod yes) · **SB3** testnet: TB10–TB27 (rev5), TS1–TS5, contamination check passing · **SB4** capability release (shared S5) · **SB5** overlay: `[lane_b] from_block` with `share = 0` until the D41 gate opens, then `suite_targets` only after SB3 passed (LB1), then pay. **(rev5)** If D40(b) is chosen: an image repin step (EMA constant fixed first; repin outside a seed epoch; moves lane A too) before SB3 | SB3 green including LB1's contamination check; SB5 shadow ≥ 2 eras with satellite replay matching; gate-open evidence recorded |
+| 12c | **(rev4) Lane B track SB0–SB5** (runs in parallel with lane D's S2–S3; depends on **S0a–S0c** de-drift, note budget and overlay bring-up, and on the shared S5 capability release) | **SB0** decide D35–D42, D42b · **SB1** build WB10–WB18, **(rev5)** WB22–WB23, W-S1–W-S2 · **SB2** WB19 measurement per GPU type (owner pod yes) · **SB3** testnet: TB10–TB27 (rev5), TS1–TS5, contamination check passing · **SB4** capability release (shared S5) · **SB5 (rev5, D45)** one overlay, once the D41 gate rule is satisfied and SB3 has passed (LB1): `[lane_b] from_block` with full share and `suite_targets` together, live everywhere at that block; no `share = 0` period. **(rev5)** If D40(b) is chosen: an image repin step (EMA constant fixed first; repin outside a seed epoch; moves lane A too) before SB3 | SB3 green including LB1's contamination check; **(rev5)** from the SB5 block, lane B live everywhere: first paid settlement's vectors match on ≥ 2 validators and satellite replay matches; gate-open evidence recorded |
 | 13 | **S7 Operate** | §10.4 runbook; §10.7 checks; revert overlay stays staged | No pending past its latency expectation without progress; first crowning (reported immediately, with seated and judged counts) or a house hold observed end-to-end |
 | 14 | **(rev3) S8 Long context** | W6-S8; rent valeval-laned (96 GB pinned torch) with owner yes; T7 at 32k/64k/128k; then an overlay adds the passing variants to `contexts` (D10) | Each added variant: T7 inside the settlement budget, W1 `min_long_series` met, overlay adopted ≥ 51% |
 
@@ -1677,7 +1708,7 @@ cross-checked from two sources. There are past off-by-ones (§13).
 | D7 | Court | 2 prior miner kings, decay 0.5; house never in the court |
 | D8 | Losers | Private; vault TTL 4 eras; owner-only archive 14 days; then delete |
 | D9 | House paid? | No: the slot burns; prior miner tails keep paying |
-| D10 | Activation | Two overlays: S6a `from_block` with `share = 0` (shadow ≥ 2 eras, observed `cfg-` stake ≥ 2/3), then S6b `share = 0.20`; kill switch by a staged revert overlay (latency up to about one era); **(rev3)** the S8 long-context arming is also an overlay (`contexts`) |
+| D10 | Activation | **(rev5, D45)** One overlay: `from_block` with `share = 0.20` and `takes_from = "lane_a"` together (no `share = 0` shadow), published with an `effective_block` far enough ahead that observed `cfg-` stake reaches ≥ 2/3 before it; kill switch by a staged revert overlay (latency up to about one era); **(rev3)** the S8 long-context arming is also an overlay (`contexts`), live at its block, no shadow |
 | D11 | Eval host | **(rev3)** Launch: valpriv-4090 or another pinned-torch 2.4.1+cu124 pod (≥ 24 GB; the 16k fit is checked in B2). **Not** Blackwell sm_120. valeval-laned (H100/A100 80 GB class, pinned torch) only at S8 |
 | D12 | Pool packaging | `pool` untouched (keep length never raised); **(rev3)** launch `pool_d` = `pool`'s series ids joined, history to 16384 + 64, A1 timestamps, `pool_d_hist` (no targets) to the eval pod, `pool_d_tgt` on the box; 32k–128k history work at S8; dedicated builder |
 | D13 | Weights license | Open licenses only (Apache-2.0 / OpenMDW-1.1); kings are published |
@@ -1686,7 +1717,7 @@ cross-checked from two sources. There are past off-by-ones (§13).
 | D16 | Standing approval | Automated vault TTL deletion and archive expiry (otherwise Approve-tier per deletion) |
 | D17 | Trust | Accept that lane D loser rows are signed-but-not-reproducible (satellites verify structure and bootstrap; kings become re-scorable after publication) |
 | D18 | Data path | **Targets stay on the box** (histories-only to the pod, D12), keeping the private-offload rule. Alternative: let the pod hold targets, which is a new rule; **(rev3)** launch `pool_d_hist` carries ≤ 16384 history per series |
-| D19 | Shadow test entry | At least one owner-run test entry on a dedicated hotkey during S6a (recommended), so the shadow exercises a real duel, not only plumbing |
+| D19 | **(rev5)** Test entry | Owner-run test entries on dedicated **testnet** hotkeys during S3, so a real duel and payout are exercised before the mainnet block (no mainnet shadow, D45) |
 | D20 | **(rev3)** King change between first clear and confirmation | (a) restart the duel against the new king (**recommended**); (b) confirm against the king at the first clear |
 | D21 | **(rev3)** Unpaid lane D king slot while the house reigns | Option 1 burn (v2 default, kept) vs option 2 return to lane A. Tokenomics call, not adopted (§1.4 table) |
 | D22 | **(rev3)** Coldkey resolution | (b) record at `/v1/lane-d/ready`, re-check at reveal, carry in the signed report (**recommended**); (a) archive-state resolution at T |
@@ -1704,7 +1735,7 @@ cross-checked from two sources. There are past off-by-ones (§13).
 | D34 | **(rev3)** Sentinel ratchet vs the house | **Optional, recommended on**: every lane's candidates must not fall below the current lane A king on the sentinel by more than `sentinel_tau` (0.01), re-scored paired on one host. Off = the sentinel is publish-only, and a regression on it alone is never blocked |
 | D35 | **(rev3)** Sentinel vs DEC-CA-0069 (pending: PR #482) lane B suite targets | While a suite is the sentinel it is **not** a lane B target or guard that era. Entries already declared on it are judged on the remaining suites, or deferred to the next era. Recommended: **defer** (the target stays honest) |
 | D36 | **(rev4) resolved:** lane B arms **trainer-run** (generator + optional declared rows + optional suite target). The miner-weights variant (§12) is not planned |
-| D37 | **(rev4)** Lane B share and what it does before the gate opens | Deployed `[lane_b] share = 0.25` (A/B 75/25 while C off; DEC-CA-0050 burns empty slots). **Assumption stated:** while lane B is armed but its opening gate is closed, every lane B slot is empty, so **its whole share burns**. Recommended: set `[lane_b] from_block` only once the gate rule (D41) is satisfied, or arm at `share = 0` until the gate opens (SB5). The split itself is D28 |
+| D37 | **(rev4)** Lane B share and what it does before the gate opens | Deployed `[lane_b] share = 0.25` (A/B 75/25 while C off; DEC-CA-0050 burns empty slots). **Assumption stated:** while lane B is armed but its opening gate is closed, every lane B slot is empty, so **its whole share burns**. Recommended: set `[lane_b] from_block` only once the gate rule (D41) is satisfied, or arm at `share = 0` until the gate opens (SB5). The split itself is D28. **(rev5, D45)** No `share = 0` arming: `[lane_b] from_block` is set only once the D41 gate rule is satisfied, and lane B goes live at full share at that block |
 | D38 | **(rev4)** `max_repo_mb` for lane B suite-target entries (LB1) | (a) 8 MB via `[lane_b] suite_target_max_repo_mb` (**recommended**); (b) keep 128 MB (`chain.toml:47`) |
 | D39 | **(rev4)** Per-layer expert clamp (LB2) | Fractions `min_experts_frac = 0.03125`, `max_experts_frac = 0.1484375` ⇒ 128: 4..19, 256: 8..38, 512: 16..76 (**recommended**); or fixed per-layer lists |
 | D40 | **(rev4)** Router rows (LB2) | (a) frozen (**recommended for first arming**; no image change); (b) FlexOlmo unfreeze of the declared rows' router entries and bias, with the `traffic_steal_bound` guard. **(rev5)** (b) changes on-pod `expert_training.py` ⇒ a **shared worker-image repin that also moves lane A** + DEC-CA-0067 qualification, and since any image ≥ rc16 arms power EMA for lane A, (b) is **blocked on fixing the scored EMA constant first** (§3 Services touched) |
@@ -2352,6 +2383,105 @@ type, OA8):**
 
 ---
 
+## 12c. (rev5) Lanes A and B: power EMA instead of cooldown (owner 2026-11-21, D44)
+
+**Owner decision:** lanes A and B move to the power EMA so that legs no longer
+need a cooldown.
+
+**How it works today (verified on main):**
+
+- **Cooldown.** Every pyramid leg spends its last `round(steps / 11)` steps on
+  a linear LR decay to 0 (`pyramid_optimizer.py:97-106`, `schedule_factor`;
+  `pyramid_trainer.py:322-323`). At 23,841 steps that's **2,167 steps, about
+  9.1% of the leg**.
+- **Lineage skips the cooldown.** At the cooldown's first step, a full leg
+  saves `weights_stable` plus the optimizer (`pyramid_trainer.py:393`). The
+  next warm start resumes that raw lineage, so the cooldown compute only
+  produces the scored endpoint. Lane B legs (`slices`) take no stable
+  snapshot.
+- **Power EMA is image-only** (owner decision 2026-11-01,
+  `pyramid_trainer.py:105-126`): σ_rel `(0.05, 0.10)`, and the scored file is
+  the 0.10 average (`POWER_EMA_EVAL = 1`). It's not in `contract_digest`; the
+  contract keeps `power_ema_sigma_rels = []`.
+- **Which legs score it:** derived only from the leg's init
+  (`power_ema_active`, `:156-181`). Warm-start king and challenger legs score
+  the EMA. A lane B leg follows its king's `config.json` marker. Random-init
+  legs stay raw. So a seed epoch is never mixed.
+- **Deployment:** rc15 (deployed) has no power EMA. Any image ≥ rc16 turns it
+  on for lane A at the next warm-start epoch (owner note). Today the EMA would
+  be scored **on top of** a cooldown endpoint, not instead of one.
+
+**The change:**
+
+1. **No cooldown for EMA-scored legs.** `schedule_factor` stays at 1.0 after
+   warmup to the last step whenever the leg is EMA-scored. The same
+   init-derived rule (`power_ema_active`) applies, so the king's retrain and
+   every challenger in a seed epoch match. Lane B follows its king.
+2. **The scored weights are the EMA**, and the raw endpoint is the lineage. A
+   full leg's `weights_stable` becomes the final raw weights; no mid-leg
+   snapshot is needed.
+3. **What it buys:**
+   - about 9% of every leg's steps that only ever fed the scored endpoint now
+     advance the lineage;
+   - lane B's short legs no longer spend their last ~9% annealing;
+   - the scored checkpoint no longer depends on where the decay happened to
+     end.
+4. **Prerequisites (blocking, in order):**
+   - **(a) Fix the scored EMA constant first** (owner note): settle the scored
+     σ_rel and `POWER_EMA_EVAL` before any image ≥ rc16 ships, because that
+     image arms the EMA for lane A automatically.
+   - **(b) Resolve the open identical-trunk finding** (OPSLOG "Warm-start loss
+     check", OPEN). In round 824229856147703689, the legs of u164, u105, u92
+     and u69 had bit-identical trunk losses through step 21,674 and differed
+     only from the cooldown. Without a cooldown, the scored EMA comes from the
+     trunk alone, so if trunks don't depend on the miner's data, every miner's
+     scored model would be the same. This must be explained before the
+     cooldown goes.
+   - **(c) A testnet measurement, not a mainnet shadow (D45):** paired legs
+     on the same corpus, init and SKU, comparing (i) today's cooldown
+     endpoint, (ii) cooldown + EMA and (iii) EMA with no cooldown. Score them
+     on the private pool and the four bench suites. It needs a GPU pod
+     (owner yes; OA9). The change ships only if (iii) is no worse than (i)
+     within the seed-noise band.
+5. **[DECIDE D44b] Where the schedule switch lives:**
+   - (a) **image-only, like the power EMA** (recommended for consistency):
+     the no-cooldown rule ships in the worker image and activates by init at
+     the first warm-start seed epoch after the image. No contract digest
+     change.
+   - (b) **a contract term:** a new `lr_schedule` value (e.g. `"wsd-ema"`)
+     in `[v2.training]`, released and then activated at a typed block
+     (`*_after`). It's more honest in the digest, but it's a contract change
+     for every validator.
+6. **Rollout (D45, no shadow):** one image repin with 5 pins plus the wall
+   gate, outside a seed epoch, at an era boundary. **The image is shared by
+   lanes A and B** (`[round] funded_pod_image`, `[v2.training]
+   train_image_digest`), so both move at once. From the first warm-start
+   epoch after the repin, every leg in both lanes trains without a cooldown
+   and is scored on the EMA. No mixed epoch, no shadow.
+7. **Unchanged:** the KOTH verdict, the margins, the bench gate, lane B's merge
+   (it merges the EMA rows, verified by `merge_expert_slices`), and the
+   cascade warm-start promotion, which promotes the scored (EMA) checkpoint
+   as-is.
+
+**Work and tests.**
+
+| WP | What | Depends on | Runs in | Accept |
+|---|---|---|---|---|
+| WE1 | Scored EMA constant fixed (σ_rel, `POWER_EMA_EVAL`), with a test pinning it | owner decision | ci | `scripts/laned/accept WE1` |
+| WE2 | Identical-trunk finding explained, with a fix if it's a bug (OPSLOG OPEN item) | — | ci + pod (owner yes) | `scripts/laned/accept WE2 --evidence evidence/we2.json` |
+| WE3 | No-cooldown schedule for EMA-scored legs (init-derived, both lanes); `weights_stable` = final raw; continuation resume bitwise | WE1, D44b | ci | `scripts/laned/accept WE3` (TE1–TE4) |
+| WE4 | Testnet paired measurement (i)/(ii)/(iii) | WE3, OA9 | pod (owner yes) | `scripts/laned/accept WE4 --evidence evidence/we4.json` |
+| WE5 | Image build + 5-pin repin + wall gate + DEC-CA-0067 qualification; also carries D40(b) if chosen | WE2, WE4 | testnet then mainnet | `scripts/laned/accept WE5` |
+
+| T-row | Case | Expect |
+|---|---|---|
+| TE1 | Warm-start leg on the new image | LR = 1.0 from warmup to the last step; scored file = EMA σ 0.10 (or the WE1 value); `weights_raw` = lineage |
+| TE2 | Random-init leg on the new image | Unchanged: cooldown kept, raw scored (rule derived from the init) |
+| TE3 | Lane B leg from an EMA king, and from a raw king | Follows the king: no cooldown + EMA, or today's path |
+| TE4 | Continuation resumed mid-leg | Bitwise-identical EMA and raw state vs an uninterrupted leg |
+
+---
+
 ## 13. Lessons from past incidents (OPSLOG review 2026-11-21)
 
 | Past failure class | Example | Defence here |
@@ -2495,9 +2625,9 @@ All folded into §5:
 - S2b catch-up release, so the lane D release diffs only lane D.
 - S5 capability release to every node **including the trainer** (shared
   overlay resolver).
-- S6a/S6b: activation and payment are **overlays** (shadow at `share = 0`
-  first). The observed `cfg-` stake on the first `[lane_d]` overlay is the
-  upgrade proof.
+- **(rev5)** S6: activation and payment are **one overlay** (D45, no
+  `share = 0` shadow). The observed `cfg-` stake before its `effective_block`
+  is the upgrade proof.
 - Every `[lane_d]` overlay restates lane A keys byte-identically, because an
   old node refuses the whole overlay.
 
@@ -2606,9 +2736,9 @@ per new king, roughly as v2.
     `ALLOWED["v2"]` entry (`netconfig.py:99-108` lists the `[v2]` allow-set
     explicitly) and round-trip and mutation tests.
   - It ships in the **S2b catch-up** or the S5 capability release.
-  - It arms by overlay at an era boundary, with shadow first: log the
-    sentinel and the would-be verdicts for ≥ 2 eras before it affects the
-    gate.
+  - **(rev5, D45)** It arms by overlay at an era boundary and affects the
+    gate from that block, with no shadow eras. Its behaviour is proven on
+    testnet first (TS1–TS5).
 - **Lane B:** it's off, so it adopts the sentinel from its first armed era.
   DEC-CA-0069 (pending: PR #482) needs a one-paragraph amendment for D35.
 - **Lane D:** built in from launch (§1.3b).
@@ -2619,8 +2749,8 @@ per new king, roughly as v2.
 **Work and tests.**
 
 - **WP W-S1:** the sentinel draw, the lane A gate rule change behind
-  `sentinel_from_block`, the receipt field, the overlay keys, and the
-  shadow logging.
+  `sentinel_from_block`, the receipt field and the overlay keys (**(rev5)**
+  no shadow logging, D45).
 - **WP W-S2:** the lane B guard/target exclusion (with the DEC-CA-0069
   amendment).
 - **WP W-S3:** publication on the status boards.
@@ -2688,6 +2818,7 @@ runs stay blocked until each one is answered here.
    loop-readiness §3) as commit 1. If you meant a different v2 file, say so
    and the PR is rebuilt on it.
 8. **OA8, pod approval for LB6 (WB19).** (rev5) Approve short pinned-torch testnet pods: one 8×H100 (expert-only leg plus one full lane A leg), and one of each cheaper GPU type you want offered to lane B miners (name them). Give a total cost cap.
+9. **OA9, pod approval for WE2/WE4 (§12c).** (rev5) Approve pinned-torch testnet pods for the identical-trunk check and the paired cooldown-vs-EMA legs (same corpus, init and SKU). Give a cost cap.
 
 ### Items
 
@@ -2785,8 +2916,8 @@ was executed on the prod box.
   conflicts with "one window list", or a smaller `--n`.
 
 **Known limitation (B1):** the scoring snapshot isn't forward-only, and fresh
-forward windows shift in distribution. A forward-window re-check happens at
-the S6a shadow.
+forward windows shift in distribution. **(rev5)** The forward-window re-check
+happens on testnet (S3); there's no mainnet shadow (D45).
 
 ---
 
