@@ -121,7 +121,7 @@ def test_classifies_the_21_markers_exactly(run):
     got = load_cls(out)["markers"]
     assert [(m["line"], m["table"], m["key"]) for m in got] == \
         [(m["line"], m["table"], m["key"]) for m in EXPECTED]
-    for g, e in zip(got, EXPECTED):
+    for g, e in zip(got, EXPECTED, strict=True):
         assert g == e, f"marker at line {e['line']} [{e['table']}] {e['key']}: {g} != {e}"
 
 
