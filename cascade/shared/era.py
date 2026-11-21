@@ -227,6 +227,22 @@ def effective_resync_cap_rounds(round_cfg: RoundConfig, scoring: ScoringConfig,
     return int(scoring.king_resync_max_rounds)
 
 
+def crowning_anchor_active(scoring: ScoringConfig, block: int | None) -> bool:
+    """CONSENSUS gate (``[scoring] crowning_anchor_from_block``): a king
+    crowned at or after ``tenure_blocks_from_block`` keeps its recorded
+    crowning block instead of the gate's legacy re-anchor."""
+    gate = int(getattr(scoring, "crowning_anchor_from_block", 0) or 0)
+    return gate > 0 and block is not None and int(block) >= gate
+
+
+def crowned_post_gate(scoring: ScoringConfig, king_since_block: int | None) -> bool:
+    """A recorded crowning block at or after the tenure-blocks gate: written by
+    a post-gate dethrone / forfeit / demotion on every validator alike, so it
+    is a consensus value and needs no imputation."""
+    gate = int(getattr(scoring, "tenure_blocks_from_block", 0) or 0)
+    return gate > 0 and king_since_block is not None and int(king_since_block) >= gate
+
+
 def legacy_king_anchor(round_cfg: RoundConfig, scoring: ScoringConfig, *,
                        block: int, tenure_rounds: int) -> int:
     """CONSENSUS: the crowning block imputed to a king that reigned before

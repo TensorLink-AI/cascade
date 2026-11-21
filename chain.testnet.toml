@@ -336,6 +336,9 @@ mv_score_from_block = 1   # MV-TEST: joint multivariate window scoring live from
 # settlement in a retry loop. CONSENSUS (changes verdicts) — arm lockstep at an
 # announced block. 0 = off (inert).
 entry_fault_from_block = 0
+# Post-gate kings keep their recorded crowning block (no legacy re-anchor
+# at a new king's first settlement). Release-then-activate. 0 = off.
+crowning_anchor_from_block = 0
 
 # King-of-the-hill — single-round dethroning with a TENURE-DECAYING margin
 # (DEC-CA-0016, TESTNET TRIAL). margin_for_tenure is affine from start (tenure
