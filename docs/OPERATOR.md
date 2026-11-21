@@ -2315,9 +2315,11 @@ from listing. So:
   must be captured before the API drops them);
 - a recipe's embargoed training range (≥ 30 days old) has no minute or
   5-minute bars on Hyperliquid. Set `[marketcast] bar_relay =
-  "<bucket>/<prefix>/"` (the recorder's mirror on the `[storage]` endpoint,
-  e.g. `tsbench-forge-sources/marketcast/bars/`; `HIPPIUS_S3_*` credentials
-  on the TRAINER only) and the trainer lists the recording inside the
+  "<bucket>/<prefix>/"` (shipped: `cascade-eval-pool/marketcast/bars/`, the
+  eval pool bucket, which `publish-mkt-pool.yml` mirrors the recording into
+  after each publish; read with the pool endpoint and `POOL_S3_*`
+  credentials, exactly as every pool reader — on the TRAINER only. Any other
+  bucket: `MKT_BARS_S3_*` when set, else `HIPPIUS_S3_*`) and the trainer lists the recording inside the
   recipe's range and presigns one GET link per object (24 h) into
   `mkt_bars.json` in the leg's `--corpus-dir` (DEC-CA-0053's pattern: the pod
   holds no credential). The pod downloads exactly those files and builds its

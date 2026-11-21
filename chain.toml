@@ -1657,7 +1657,7 @@ coverage_gate_levels = [0.5, 0.8]               # per horizon, class-weighted li
 zero_scale_frac    = 0.001                      # cell masked (recorded) if base mean CRPS <= this x its horizon's median cell
 cell_ratio_cap     = 4.0                        # each cell's ft/base ratio clipped to [1/4, 4]
 crps_scale         = "seasonal_naive"           # per-window CRPS ÷ context seasonal-naive MAE (GIFT-Eval MASE denominator); "level" = old
-bar_relay          = "tsbench-forge-sources/marketcast/bars/"   # trainer relays the recorder to pods (MKT_BARS_S3_* creds, else HIPPIUS_S3_*); "" = pod fetches the API
+bar_relay          = "cascade-eval-pool/marketcast/bars/"   # owner 2026-11-21: the eval pool bucket (pool endpoint + POOL_S3_* creds; publish-mkt-pool.yml mirrors the recorder there); "" = pod fetches the API
 # Owner 2026-11-20: MarketCast legs boot their OWN worker image (trainer-only):
 # lane A / king legs keep [round] funded_pod_image. Both or neither; "" = the
 # fleet's. Re-derive the fingerprint with scripts/worker_code_fingerprint.py on

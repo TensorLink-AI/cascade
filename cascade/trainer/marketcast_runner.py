@@ -282,14 +282,19 @@ def mkt_contract_block_kw(cfg, era) -> dict:
 
 
 def mkt_bars_store(storage, bucket: str):
-    """The bar-recording bucket's store: ``MKT_BARS_S3_ACCESS_KEY`` /
-    ``MKT_BARS_S3_SECRET_KEY`` when set (the recorder's bucket is read-only to
-    the trainer and need not share its manifest creds), else the trainer's
-    ``HIPPIUS_S3_*``."""
+    """The bar-recording bucket's store. The eval pool bucket (``[storage]
+    pool_bucket``) is read exactly as every pool reader reads it — the pool
+    endpoint and ``POOL_S3_*`` when set (:func:`~cascade.shared.hippius.
+    pool_s3_store`; its primary, which presigns). Any other bucket:
+    ``MKT_BARS_S3_ACCESS_KEY`` / ``MKT_BARS_S3_SECRET_KEY`` when set, else the
+    trainer's ``HIPPIUS_S3_*``."""
     import os
 
-    from ..shared.hippius import S3Config, S3Store
+    from ..shared.hippius import S3Config, S3Store, pool_s3_store
 
+    if bucket == (getattr(storage, "pool_bucket", "") or "cascade-eval-pool"):
+        st = pool_s3_store(storage, bucket=bucket)
+        return getattr(st, "primary", st)
     own = bool(os.environ.get("MKT_BARS_S3_ACCESS_KEY"))
     base = S3Config.from_storage(storage, bucket=bucket)
     return S3Store(S3Config(
