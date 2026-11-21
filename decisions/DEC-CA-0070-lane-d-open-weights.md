@@ -37,6 +37,7 @@ Lane D is specified in `docs/plans/LANE_D_PLAN.md` (rev3). In summary:
   - Each verdict carries `rows_sha256`; the coldkey is recorded at `ready`
     and carried in the report.
   - The lane D state is bound into receipts.
+- **Lane B (in scope).** The §12 expert-delta variant is built with lane D (WB1–WB7) and armed at S6c by overlay after lane D pays.
 - **Rollout.** Gated stages S0–S8 (no dates). Activation and payment go by
   signed overlay (DEC-CA-0057): the S6a shadow at share 0, then S6b. Kill
   switch by overlay.
@@ -89,6 +90,8 @@ on the unmerged PR #482, so this is DEC-CA-0070.
 | D33 | **(rev3)** Cross-lane rotating sentinel (§16) | **Adopt**: one suite per era, drawn from the era-boundary block hash, held out of every gate and target in lanes A, B and D, swept and published for every new king. Alternative: no sentinel (v2: lane A gates all four; lane D holds TIME out) |
 | D34 | **(rev3)** Sentinel ratchet vs the house | **Optional, recommended on**: every lane's candidates must not fall below the current lane A king on the sentinel by more than `sentinel_tau` (0.01), re-scored paired on one host. Off = the sentinel is publish-only, and a regression on it alone is never blocked |
 | D35 | **(rev3)** Sentinel vs DEC-CA-0069 (pending: PR #482) lane B suite targets | While a suite is the sentinel it is **not** a lane B target or guard that era. Entries already declared on it are judged on the remaining suites, or deferred to the next era. Recommended: **defer** (the target stays honest) |
+| D36 | **(rev3)** Lane B at S6c: which variant arms | Expert-delta variant (§12) arms at S6c. Whether trainer-run legs **also** stay on is **D32** (recommended: delta variant only once D runs) |
+| D37 | **(rev3)** Lane B share at arm | The deployed `[lane_b] share = 0.25` (A/B 75/25 while C is off) vs a smaller share given D32's dominance finding; set in the S6c overlay |
 
 D33–D35 add a cross-lane rotating held-out sentinel (plan §16) that also changes lane A's gate and lane B's targets; they're recorded here because lane D depends on them, but lane A/B adoption may warrant its own DEC.
 

@@ -338,12 +338,12 @@ the code). Each is verified where marked.
 - **Context.** Miners may run their weights at up to **128k context**, a
   scorer-side setting (§1.1).
 - **Later phases.** Lane E (test-time optimisation) and the lane A recipe menu
-  are phases 2 and 3 (§7, §8). The lane B expert-weights variant is §12.
+  are phases 2 and 3 (§7, §8). The lane B expert-weights variant is §12, and **(rev3) it ships as part of this plan** (WB1–WB7, TB1–TB8, stage S6c).
 
 | Lane | Miner submits | Who trains | Judged on | Rollout |
 |---|---|---|---|---|
 | A (live) | data generator | us (fixed recipe) | private pool + bench gate | live |
-| B (built, off) | generator + target | us | per-target gain + guards | DEC-CA-0069 (pending: PR #482); §12 variant |
+| B (built, off) | **(rev3)** expert-weight deltas (§12), plus generator + target legs until D32 decides | **the miner** (delta variant) / us (legs) | forward-only per-target gain + guards + §16 sentinel | **in this plan: stage S6c (§5), after lane D pays** |
 | C (built, off) | fine-tune recipe | us | per-target eval | off |
 | **D (this plan)** | **weights, our architecture** | **the miner, anywhere** | **forward-only private windows vs KING_D** | **gated stages S0–S7 (§5)** |
 | E (phase 2) | test-time procedure | none | private pool vs KING_A plain | after D |
@@ -1330,7 +1330,7 @@ capability release → stake-proven shadow → pay.**
 
 | # | Stage | Work | Exit gate (all must hold) |
 |---|---|---|---|
-| 1 | **S0 Decide** | D1–D35 (incl. the §15 incentive [DECIDE]s and the §16 sentinel) (§6) in writing; W0 | All answered |
+| 1 | **S0 Decide** | D1–D37 (incl. the §15 incentive [DECIDE]s and the §16 sentinel) (§6) in writing; W0 | All answered |
 | 2 | **S0a De-drift** | Classify the 21 `LIVE OVERRIDE`s in the deployed chain.toml: main, overlay, or documented operator-only; type the decided blocks in main. Overlays merge onto **each node's own base** (`build_config(base, body)` merges onto `effective_raw(base)`, `netconfig.py:346-354`), so base drift survives any overlay | `cascade-audit decided --config /root/cascade/chain.toml` = 0 drift; the validator-read consensus-key diff between deployed and main is empty |
 | 3 | **S0b Note budget** | Decode the live mainnet readiness notes and add the `cfg-` segment. It's trimmed **last** (`activation.py:1334-1357`), so older pending segments go first | No still-pending segment would be trimmed (type their decided blocks in main first if needed); T22 passes on testnet |
 | 4 | **S0c Overlay bring-up** | Publish a **benign seq-1 overlay** (restates current values only) on testnet, then mainnet. Then a deliberately refused overlay on testnet | The 404-every-poll is gone. Fetched from S3 **and** the HF mirror by our validator, the trainer and satellites. `cfg-` lock ≥ 51% in `status/chain.json`. Receipts stamp `netconfig_seq`; the `cascade-audit` netconfig check passes; the trainer logs the same apply block. The refused overlay applies nothing |
@@ -1342,6 +1342,7 @@ capability release → stake-proven shadow → pay.**
 | 10 | **S5 Upgrade** | Snapshot all state (§10.8). Order, each through `deploy_gate check`/`verify` in quiet windows: **eval host → validator → lane D intake (systemd unit with the code-path guard) → trainer** (no legs in flight; memory-burst check; confirm preflight and worker-fingerprint lines unchanged). Satellites upgrade. Arm the broad watcher | Lane A unchanged on ≥ 2 settlements; `cascade-validator --netconfig-policy` lists `lane_d` on our nodes |
 | 11 | **S6a Readiness probe + shadow** | **[DECIDE D19]** at least one owner-run test entry on a dedicated hotkey during the shadow (recommended); without it S6a proves only plumbing. Overlay seq N: `[lane_d] from_block` at a far era boundary, **`share = 0`**, all lane A keys **byte-identical** to seq N-1 (no lane A tuning in a lane D overlay, ever) | **Observed** `cfg-` stake ≥ 2/3 (incl. the largest holder, 5E2LP6 at about 49%) at a boundary before `effective_block`. That's the only stake-weighted proof of upgrade, because only nodes on the capability release can verify a `[lane_d]` overlay. Else publish seq N+1 with a later block. Webhook test alert delivered. Keep-alive live. Then ≥ 2 eras of signed lane D reports at share 0: satellite replay matches, `check_lane_d` passes, no weight gap |
 | 12 | **S6b Pay** | Overlay seq N+1: `share = 0.20`, `takes_from = "lane_a"`, lane A keys byte-identical | First paid settlement's vectors match on ≥ 2 validators |
+| 12b | **(rev3) S6c Lane B** | Overlay: `[lane_b] from_block` at an era boundary (shadow first: `[lane_b] share = 0` for ≥ 2 eras, then the D1 split) | TB1–TB8 passed in S3; ≥ 2 eras of valid lane B reports at share 0 with satellite replay matching; then first paid settlement's vectors match on ≥ 2 validators |
 | 13 | **S7 Operate** | §10.4 runbook; §10.7 checks; revert overlay stays staged | No pending past its latency expectation without progress; first crowning (reported immediately, with seated and judged counts) or a house hold observed end-to-end |
 | 14 | **(rev3) S8 Long context** | W6-S8; rent valeval-laned (96 GB pinned torch) with owner yes; T7 at 32k/64k/128k; then an overlay adds the passing variants to `contexts` (D10) | Each added variant: T7 inside the settlement budget, W1 `min_long_series` met, overlay adopted ≥ 51% |
 
@@ -1393,6 +1394,8 @@ cross-checked from two sources. There are past off-by-ones (§13).
 | D33 | **(rev3)** Cross-lane rotating sentinel (§16) | **Adopt**: one suite per era, drawn from the era-boundary block hash, held out of every gate and target in lanes A, B and D, swept and published for every new king. Alternative: no sentinel (v2: lane A gates all four; lane D holds TIME out) |
 | D34 | **(rev3)** Sentinel ratchet vs the house | **Optional, recommended on**: every lane's candidates must not fall below the current lane A king on the sentinel by more than `sentinel_tau` (0.01), re-scored paired on one host. Off = the sentinel is publish-only, and a regression on it alone is never blocked |
 | D35 | **(rev3)** Sentinel vs DEC-CA-0069 (pending: PR #482) lane B suite targets | While a suite is the sentinel it is **not** a lane B target or guard that era. Entries already declared on it are judged on the remaining suites, or deferred to the next era. Recommended: **defer** (the target stays honest) |
+| D36 | **(rev3)** Lane B at S6c: which variant arms | Expert-delta variant (§12) arms at S6c. Whether trainer-run legs **also** stay on is **D32** (recommended: delta variant only once D runs) |
+| D37 | **(rev3)** Lane B share at arm | The deployed `[lane_b] share = 0.25` (A/B 75/25 while C is off) vs a smaller share given D32's dominance finding; set in the S6c overlay |
 
 ---
 
@@ -1662,9 +1665,9 @@ Docs gate: all of the above in the release PR set, links resolve, and
 
 ---
 
-## 12. Lane B variant: miners submit expert weights
+## 12. Lane B variant: miners submit expert weights (rev3: in scope of this plan)
 
-**Yes, as a follow-on to lane D.** **(rev3)** Caveat: most low-frequency domains will rarely reach the forward-only floors, so forward-only judging of per-domain expert deltas works mainly for sub-hourly domains. It reuses lane D's vault, forward-only
+**(rev3) In scope: built, tested and armed as part of this plan** (owner 2026-11-21), in S2 alongside lane D, tested in S3, armed at **S6c** after lane D pays (S6b). **(rev3)** Caveat: most low-frequency domains will rarely reach the forward-only floors, so forward-only judging of per-domain expert deltas works mainly for sub-hourly domains. It reuses lane D's vault, forward-only
 judging and GPU ingest.
 
 - **Entry:**
@@ -1687,9 +1690,46 @@ judging and GPU ingest.
 - **Interaction:** a won delta merges into KING_A at the era boundary. It's
   the only path by which miner-trained weights reach lane A, bounded by the
   byte-check, the rebase and re-verification.
-- **New design:** this is *not* DEC-CA-0069 (pending: PR #482)'s Open option (b). That option is
-  miner-declared rows with trainer-run training. A DEC-CA-0069 (pending: PR #482) amendment
-  would record this variant.
+- **New design:** this is *not* DEC-CA-0069 (pending: PR #482)'s Open
+  option (b). That option is miner-declared rows with trainer-run training.
+  **(rev3) WB7 writes the DEC-CA-0069 amendment** that records this variant,
+  the §16 sentinel rule (D35) and forward-only judging.
+
+**(rev3) Execution in this plan**
+
+- **Deployed state:** `[lane_b] from_block = 0` (off) and `leg_funding =
+  "miner"`. The A/B split is 75/25 while C is off.
+- **Arming:** `[lane_b]` is fully overlay-settable (`ALLOWED["lane_b"] =
+  None`, `netconfig.py:83-87`; `remainder` stays release-only), so S6c arms
+  lane B **by signed overlay**, with no validator action. The capability
+  release (S5) carries the lane B code.
+- **Existing code reused:**
+  - `merge_expert_slices` and `rebase_expert_delta` (`pyramid_model.py:706,
+    738`) for the byte-check and rebase;
+  - `check_lane_b` (`cascade/audit/checks.py:2887`) for the audit;
+  - lane D's W3 intake, W3a vault, W4 ingest, W5a/W5b forward eligibility,
+    W7 report pattern and W15 prefetch.
+
+| WP | What | Depends | Runs in | Accept |
+|---|---|---|---|---|
+| WB1 | Expert-delta submission format (base-king digest, declared (layer, expert) rows, optional router and route-bias rows, BF16 safetensors delta of only those tensors, declared target) + intake via the lane D service (`/v1/lane-b/submit`, `/ready`) | W3, W3a | ci + testnet | `scripts/laned/accept WB1` |
+| WB2 | Verification: `merge_expert_slices` byte-check (only declared rows differ from the base king); `rebase_expert_delta` onto the current king; `max_base_age_eras`; re-run verdict and guards on the rebased model | WB1, W4 | ci + pod | `scripts/laned/accept WB2` |
+| WB3 | Row claims: rows held from `ready` to verdict or merge, earliest reveal wins; **row-level dedup against published KING_D rows** (D32; cosine/L2 within ε ⇒ refuse) | WB1, W13 | ci | `scripts/laned/accept WB3` |
+| WB4 | Forward-only per-target judging for lane B (lane D's W5a/W5b eligibility on the target's windows; floors; the confirmation duel per D20) + guards on every other domain and suite + §16 sentinel exclusion (W-S2) | WB2, W5a, W5b, W-S2 | ci | `scripts/laned/accept WB4` |
+| WB5 | Lane B report fields (rows digest, claims, rebase base digest, merge identity), satellite replay and the `check_lane_b` extension | WB4, W7a, W9 | ci | `scripts/laned/accept WB5` |
+| WB6 | Lane B docs: `docs/MINER.md` and `docs/AGENT_MINING.md` lane B sections for expert deltas, the LANE_D.md cross-reference, VALIDATOR.md/OPERATOR.md lane B notes | WB5 | ci | `scripts/laned/accept WB6` |
+| WB7 | DEC-CA-0069 (pending: PR #482) amendment: expert-delta variant, forward-only judging, the D35 sentinel rule | — | ci + owner merge | `scripts/laned/accept WB7` |
+
+| Test | Case | Expected |
+|---|---|---|
+| TB1 | Delta touching an undeclared row | Refused at the byte-check |
+| TB2 | Delta trained on a base king 1 era old | Rebased onto the current king and re-verified; a base older than `max_base_age_eras` is refused |
+| TB3 | Router-row delta that pulls other domains' traffic | Blocked by the other-domain guards |
+| TB4 | Two entries claiming overlapping rows | The earliest reveal holds the claim; the other is refused with a typed reason |
+| TB5 | Delta copied from a published KING_D's rows | Refused by the row-level dedup |
+| TB6 | Lane B unarmed | Byte-identical receipts and weights (invariant 1) |
+| TB7 | A lane B entry targeting the current sentinel suite | Deferred (D35) |
+| TB8 | A won delta merges at the era boundary | KING_A updated; the house refreshes in lane D (§1.4) |
 
 ---
 
