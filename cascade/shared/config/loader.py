@@ -384,7 +384,8 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
         era_blocks=max(1, _lc_grid) * max(1, _era_settlements),
         era_settlements=_era_settlements,
         lane_b_share=float((raw.get("lane_b", {}) or {}).get("share", 0.5)),
-        mkt_suites=tuple(marketcast.suites),
+        # the composite (owner 2026-11-10) admits mkt:market, else mkt:<suite>
+        mkt_suites=tuple(marketcast.target_names),
         # concurrent competitions (owner 2026-10-20): MarketCast's start is
         # [marketcast] from_block (one source of truth); a competition block
         # is an era boundary on the grid in force at it

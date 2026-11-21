@@ -65,8 +65,8 @@ from typing import Protocol
 
 from ..funding.queue import COMPETITION_ENDED_CLASS, OPERATOR_FAULT_CLASS, split_lane_c_ref
 from ..shared.atomic import read_text_with_backup, write_text_atomic
-from ..shared.config.lane_c import is_mkt_target
 from .finetune import LegRecipe, RecipeError
+from .lane_c_competitions import trainer_competition
 
 log = logging.getLogger("cascade.trainer.lane_c")
 
@@ -78,18 +78,20 @@ OUTCOMES_KEEP = 256
 RECIPE_CLASS = "recipe"
 
 
-def competition_ends_before_leg(lc, target: str, block: int) -> str:
+def competition_ends_before_leg(lc, target: str, block: int, hours: float | None = None) -> str:
     """Trainer policy (concurrent competitions, owner 2026-10-20): why a
     queued ``target`` entry must not be dispatched at ``block`` ("" = it may)
     — its competition's ``until_block`` falls before a leg started now could
-    finish (``[lane_c] leg_hours``), so it could never be judged."""
+    finish (``hours``, default ``[lane_c] leg_hours``; a MarketCast recipe's
+    own ``leg_hours`` is re-checked once fetched), so it could never be judged."""
     import math
 
     comp = lc.competition_of(target)
     until = int(getattr(comp, "until_block", 0) or 0)
     if not until:
         return ""
-    leg_blocks = int(math.ceil(float(lc.leg_hours) * 3600.0 / BLOCK_SECONDS))
+    h = float(lc.leg_hours if hours is None else hours)
+    leg_blocks = int(math.ceil(h * 3600.0 / BLOCK_SECONDS))
     if int(block) + leg_blocks <= until:
         return ""
     return (f"lane-C competition {comp.kind!r} ends at block {until}: a leg dispatched at "
@@ -145,6 +147,9 @@ class LaneCDriverState:
     # commitment is refused (``spent``) unless the queue requeued it for an
     # operator fault (persisted only when non-empty)
     spent: list[str] = field(default_factory=list)
+    # every OTHER competition's awaited reports: {kind: [{"rid", "age"}]}
+    # (persisted only when non-empty)
+    awaits: dict = field(default_factory=dict)
 
 
 class LaneCDriver:
@@ -177,7 +182,7 @@ class LaneCDriver:
 
     def save(self) -> None:
         d = asdict(self.st)
-        for k in ("mkt_await", "spent"):
+        for k in ("mkt_await", "spent", "awaits"):
             if not d.get(k):
                 d.pop(k, None)
         write_text_atomic(self.path, json.dumps(d, sort_keys=True), backup=True)
@@ -276,17 +281,16 @@ class LaneCDriver:
                     continue
                 if open_per.get(target, 0) >= int(lc.legs_per_target) or e.hotkey in busy:
                     continue
-                mc = getattr(self.cfg, "marketcast", None)
-                if not is_mkt_target(target) or mc is None or not mc.active(block):
-                    continue                 # DEC-CA-0064: only while MarketCast is live
+                comp = trainer_competition(target)
+                if comp is None or not comp.live(self.cfg, block):
+                    continue                 # only while the target's competition is live
                 c = latest.get(e.hotkey)
                 if c is None:
                     continue                 # no commitment visible (yet): wait (TTL bounds it)
                 from ..shared.lane_c_manifest import parse_finetune_commit
 
                 if parse_finetune_commit(getattr(c, "payload", "") or "",
-                                         mkt_suites=tuple(getattr(mc, "target_suites", ()))
-                                         ) != (target, ref):
+                                         mkt_suites=_mkt_suites(self.cfg)) != (target, ref):
                     queue.fail(e.hotkey, error="the hotkey's latest commitment is no longer "
                                f"metro-v1:ft:{target}:hippius:{ref} — re-commit and fund again",
                                error_class="superseded", expect_ref=e.ref)
@@ -304,7 +308,7 @@ class LaneCDriver:
                     continue                 # one leg per hotkey across lanes (shared pod names)
                 ck = str(getattr(c, "coldkey", "") or "")
                 if ck and sum(1 for x in self.st.open if x.get("coldkey") == ck) >= int(
-                            getattr(mc, "max_open_legs_per_coldkey", 1)):
+                            comp.coldkey_cap(self.cfg)):
                     continue                 # red-team F6: one owner's sybils share its cap
                 if not queue.mark_in_flight(e.hotkey, e.ref, target_boundary=0,
                                             era_index=int(era_index), started_block=int(block)):
@@ -358,6 +362,16 @@ class LaneCDriver:
             td = getattr(self.ops, "tree_digest", None)
             if callable(td):
                 leg["tree_digest"] = str(td(leg["ref"]) or "")
+            comp = trainer_competition(leg["target"])
+            hours = comp.leg_hours(self.cfg, recipe) if comp is not None else None
+            if hours is not None:
+                # the recipe's own wall, not the [lane_c] default the dispatch
+                # checked: nothing rented yet
+                why = competition_ends_before_leg(
+                    self.cfg.lane_c, leg["target"], int(leg["started_block"]), hours=hours)
+                if why:
+                    raise LegFailure(why, miner_fault=True, error_class=COMPETITION_ENDED_CLASS,
+                                     burn=False)
         except RecipeError as e:
             self._leg_done(leg, failure=LegFailure(str(e), miner_fault=True,
                                                    error_class=RECIPE_CLASS, burn=True))
@@ -408,7 +422,10 @@ class LaneCDriver:
                                           if "train_time" in leg else {}),
                                        **({"coldkey": str(leg["coldkey"])}
                                           if leg.get("coldkey") else {})}}
-                       if result.get("marketcast") else {})})
+                       if result.get("marketcast") else {}),
+                    # any other competition's entry data (rides the manifest)
+                    **({"competition": dict(result["competition"])}
+                       if result.get("competition") else {})})
                 log.info("lane C: leg %s/%s finished → %s (settles at the next boundary)",
                          leg["hotkey"][:8], leg["target"], result["trained_pointer"])
             else:
@@ -467,9 +484,11 @@ class LaneCDriver:
             if pend is None:
                 todo = list(self.st.finished)   # DEC-CA-0064: the pinned base never moves
                 mkt_reports, mkt_await = self._mkt_arbiters(rid, block)
-                if not todo and not mkt_reports:
+                reports, awaits = self._arbiters(rid, block)
+                if not todo and not mkt_reports and not reports:
                     self.st.settled[rid] = {"digest": "", "key": "", "entries": 0}
                     self.st.mkt_await = mkt_await
+                    self.st.awaits = awaits
                     self._trim_settled()
                     self.save()
                     return ""
@@ -480,13 +499,15 @@ class LaneCDriver:
                     trained_pointer=f["trained_pointer"], train_block=int(f["train_block"]),
                     funded_by="miner",
                     marketcast=dict(f.get("marketcast") or {}),
+                    competition=dict(f.get("competition") or {}),
                     tree_digest=str(f.get("tree_digest", "") or ""))
                     for f in todo)
                 manifest = LaneCManifest(
                     round_id=rid, era_index=int(era_index),
                     created_block=int(block if created_block is None else created_block),
                     base_pointer=str(base_pointer), base_round_id=str(base_round_id or rid),
-                    pool_block=int(pool_block), entries=entries, mkt_reports=mkt_reports)
+                    pool_block=int(pool_block), entries=entries, mkt_reports=mkt_reports,
+                    reports=reports)
                 manifest = self.ops.sign(manifest)
                 text = dump_lane_c_manifest(manifest)
                 pend = {"rid": rid, "key": lane_c_manifest_key(rid), "text": text,
@@ -494,6 +515,8 @@ class LaneCDriver:
                         "pointers": [f["trained_pointer"] for f in todo]}
                 if mkt_reports or mkt_await != self.st.mkt_await:
                     pend["mkt_await"] = mkt_await
+                if reports or awaits != self.st.awaits:
+                    pend["awaits"] = awaits
                 self.st.pending = pend
                 self.save()            # write-ahead BEFORE the first byte goes out
             else:
@@ -525,6 +548,8 @@ class LaneCDriver:
                                          "trained_pointer": f["trained_pointer"]} for f in done]}
             if "mkt_await" in pend:
                 self.st.mkt_await = list(pend["mkt_await"])
+            if "awaits" in pend:
+                self.st.awaits = dict(pend["awaits"])
             self._trim_settled()
             self.st.pending = None
             self.save()
@@ -568,6 +593,57 @@ class LaneCDriver:
         if not any(a["rid"] == str(rid) for a in keep):
             keep.append({"rid": str(rid), "age": 0})
         return out, keep
+
+    def _arbiters(self, rid: str, block: int) -> tuple[dict, dict]:
+        """``(reports, next awaits)`` for every competition OTHER than
+        MarketCast that has an arbiter report
+        (:meth:`~cascade.trainer.lane_c_competitions.TrainerCompetition.report_key`):
+        the :meth:`_mkt_arbiters` rule per kind — a readable report recorded
+        by its digest, one awaited ``report_timeout`` settlements as
+        ``"absent"``, ``rid`` joining the awaited list while the kind is live.
+        Caller holds the lock."""
+        from ..shared.marketcast_report import REPORT_ABSENT
+        from .lane_c_competitions import TRAINER_COMPETITIONS
+
+        read = getattr(self.ops, "read_report", None)
+        reports: dict = {}
+        awaits: dict = {}
+        for kind, comp in sorted(TRAINER_COMPETITIONS.items()):
+            if kind == "mkt" or comp.report_key(str(rid)) is None:
+                continue
+            prev = list(self.st.awaits.get(kind) or ())
+            if not comp.live(self.cfg, block):
+                if prev:
+                    awaits[kind] = prev
+                continue
+            out: dict = {}
+            keep: list[dict] = []
+            for a in prev:
+                r, age = str(a["rid"]), int(a.get("age", 0)) + 1
+                text = None
+                if read is not None:
+                    try:
+                        text = read(comp.report_key(r))
+                    except Exception as e:  # noqa: BLE001 — unreadable now: still awaited
+                        log.warning("lane C: %s report of %s unreadable (%s)", kind, r, e)
+                if text is not None:
+                    out[r] = comp.report_digest(text)
+                    try:
+                        comp.on_report(self, text)
+                    except Exception as e:  # noqa: BLE001 — best effort
+                        log.warning("lane C: %s on_report(%s) failed: %s", kind, r, e)
+                elif age >= int(comp.report_timeout(self.cfg)):
+                    out[r] = REPORT_ABSENT
+                    log.warning("lane C: %s report of %s absent after %d settlement(s) — "
+                                "recorded absent", kind, r, age)
+                else:
+                    keep.append({"rid": r, "age": age})
+            if not any(a["rid"] == str(rid) for a in keep):
+                keep.append({"rid": str(rid), "age": 0})
+            if out:
+                reports[kind] = out
+            awaits[kind] = keep
+        return reports, awaits
 
     def _mkt_infra_requeue(self, text: str) -> None:
         """Requeue, uncharged (the operator error class), every entry a
@@ -715,6 +791,14 @@ class LaneCDriver:
             }
 
 
+def _mkt_suites(cfg) -> tuple[str, ...]:
+    """The MarketCast suites a commitment may name (() while it is off)."""
+    from .lane_c_competitions import trainer_competition
+
+    mkt = trainer_competition("mkt")
+    return mkt.admitted_values(cfg) if mkt is not None else ()
+
+
 def spent_key(hotkey: str, target: str, ref: str, commit_block: int) -> str:
     """The identity of one lane-C commitment (a re-commit — a new reveal —
     is a new one, even of the same ref)."""
@@ -786,7 +870,8 @@ class RunnerLaneCOps:
         from ..shared.hippius import StorageError, fetch_from_hub
         from ..shared.lane_c_manifest import tree_digest
 
-        if not is_mkt_target(target):
+        comp = trainer_competition(target)
+        if comp is None:
             raise RecipeError(f"lane-C target {target!r}: {FORWARD_ONLY_REQUIRED}")
         d = Path(self.r.work_root) / "_lane_c_recipes" / hashlib.sha256(
             ref.encode()).hexdigest()[:16]
@@ -800,13 +885,8 @@ class RunnerLaneCOps:
                     raise RecipeError(f"recipe tree unreachable: HTTP {status} for {ref}") from e
                 raise
             self._tree_digests = {**getattr(self, "_tree_digests", {}), ref: tree_digest(d)}
-            # DEC-CA-0064: marketcast.json (+ an optional generator tree);
-            # the embargo against the commit time, the pod clipped to
-            # train_time (review M12)
-            from .marketcast_runner import read_mkt_recipe
-
-            return read_mkt_recipe(d, self.r.cfg, target=target,
-                                   submission_time=submission_time, train_time=train_time)
+            return comp.read_recipe(self, d, target=target, submission_time=submission_time,
+                                    train_time=train_time)
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
@@ -821,16 +901,16 @@ class RunnerLaneCOps:
         return (self.r._rolling_seeds(era) if era is not None else None), era
 
     def train_leg(self, leg: dict, recipe: LegRecipe) -> dict:
-        """One MarketCast fine-tune leg on the MINER's key
-        (:func:`cascade.trainer.marketcast_runner.train_mkt_leg`), never
-        benched, never on an operator lane."""
+        """One fine-tune leg on the MINER's key, by its competition
+        (MarketCast: :func:`cascade.trainer.marketcast_runner.train_mkt_leg`),
+        never benched, never on an operator lane."""
         from ..shared.config.lane_c import FORWARD_ONLY_REQUIRED
-        from .marketcast_runner import train_mkt_leg
 
-        if not is_mkt_target(leg["target"]):
+        comp = trainer_competition(leg["target"])
+        if comp is None:
             raise LegFailure(f"lane-C target {leg['target']!r}: {FORWARD_ONLY_REQUIRED}",
                              miner_fault=True, error_class="target", burn=True)
-        return train_mkt_leg(self, leg, recipe)
+        return comp.train_leg(self, leg, recipe)
 
     def sign(self, manifest):
         from ..shared.lane_c_manifest import sign_lane_c_manifest
@@ -851,6 +931,16 @@ class RunnerLaneCOps:
 
         try:
             return self.r.manifest_store().get_text(mkt_report_key(round_id))
+        except ObjectNotFound:
+            return None
+
+    def read_report(self, key: str) -> str | None:
+        """A competition's arbiter report at ``key`` (None = not published
+        yet; a read failure raises)."""
+        from ..shared.hippius import ObjectNotFound
+
+        try:
+            return self.r.manifest_store().get_text(key)
         except ObjectNotFound:
             return None
 

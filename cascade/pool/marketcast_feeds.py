@@ -90,6 +90,68 @@ def hl_funding_request(coin: str, start_ms: int, end_ms: int) -> dict:
             "endTime": int(end_ms)}
 
 
+def hl_ctx_request(dex: str = "") -> dict:
+    """``metaAndAssetCtxs`` — every coin's LIVE context (open interest,
+    impact prices, …) on the main dex or ``dex``."""
+    return {"type": "metaAndAssetCtxs", **({"dex": str(dex)} if dex else {})}
+
+
+def parse_hl_asset_ctxs(resp) -> dict[str, tuple[float, float]]:
+    """``{coin: (open interest in coins, impact spread bp)}`` from a
+    ``metaAndAssetCtxs`` answer (owner 2026-11-18: order-flow inputs the API
+    serves only LIVE, so the recorder samples them). The impact spread is
+    ``(impact ask − impact bid) / mid`` in bp — the cost of a standard-size
+    market order, a liquidity / stress gauge. NaN where a field is missing."""
+    if not (isinstance(resp, list) and len(resp) == 2 and isinstance(resp[0], dict)
+            and isinstance(resp[1], list)):
+        raise FeedError("metaAndAssetCtxs answered an unexpected shape")
+    uni = resp[0].get("universe") or []
+    out: dict[str, tuple[float, float]] = {}
+    for meta, ctx in zip(uni, resp[1], strict=False):
+        if not isinstance(meta, dict) or not isinstance(ctx, dict) or "name" not in meta:
+            continue
+
+        def _f(x):
+            try:
+                v = float(x)
+            except (TypeError, ValueError):
+                return float("nan")
+            return v if np.isfinite(v) else float("nan")
+
+        oi = _f(ctx.get("openInterest"))
+        imp = ctx.get("impactPxs") or []
+        mid = _f(ctx.get("midPx"))
+        if not np.isfinite(mid):
+            mid = _f(ctx.get("markPx"))
+        spr = float("nan")
+        if isinstance(imp, list) and len(imp) == 2 and np.isfinite(mid) and mid > 0:
+            bid, ask = _f(imp[0]), _f(imp[1])
+            if np.isfinite(bid) and np.isfinite(ask) and ask >= bid:
+                spr = 1e4 * (ask - bid) / mid
+        out[str(meta["name"])] = (oi, spr)
+    return out
+
+
+def ctx_on_grid(rows: Sequence[tuple], t0: int, steps: int, *, step_minutes: int = 1,
+                max_stale_minutes: int = 180) -> tuple[np.ndarray, np.ndarray]:
+    """``(open_interest, spread_bp)`` per grid step: the latest recorded
+    sample at or before the step's END, NaN when none is within
+    ``max_stale_minutes`` (a recorder outage is missing, not flat)."""
+    oi = np.full(int(steps), np.nan)
+    sp = np.full(int(steps), np.nan)
+    if not rows:
+        return oi, sp
+    rs = sorted(rows)
+    ts = np.array([int(r[0]) for r in rs], dtype=np.int64)
+    ends = (int(t0) + 60 * int(step_minutes) * (np.arange(int(steps)) + 1)) * 1000
+    idx = np.searchsorted(ts, ends, side="right") - 1
+    ok = (idx >= 0)
+    ok[ok] &= (ends[ok] - ts[idx[ok]]) <= int(max_stale_minutes) * MINUTE_MS
+    oi[ok] = [float(rs[i][1]) for i in idx[ok]]
+    sp[ok] = [float(rs[i][2]) for i in idx[ok]]
+    return oi, sp
+
+
 def binance_klines_url(symbol: str, start_ms: int, end_ms: int, interval: str = "1m",
                        limit: int = BINANCE_LIMIT) -> str:
     return (f"{BINANCE_KLINES_URL}?symbol={symbol}&interval={interval}"
@@ -363,20 +425,52 @@ def append_alpha_row(path, row: AlphaRow) -> None:
 # ── production network (publisher / training leg only) ──────────────────────
 
 
+RETRY_STATUSES = (429, 500, 502, 503, 504)
+RETRY_ATTEMPTS = 6                  # 1 + 2 + 4 + 8 + 16 s of backoff (plus Retry-After)
+
+
+def with_backoff(fn, *, attempts: int = RETRY_ATTEMPTS, sleep=None):
+    """``fn()`` retried on a rate limit / transient server status (finding
+    2026-11-16: Hyperliquid's 429 dropped whole native / coarse banks of a
+    publish — 37 of 217 calls for 9 assets). Exponential backoff, honouring
+    ``Retry-After`` (capped at 60 s); any other error, or the last attempt's,
+    propagates unchanged."""
+    import time
+    import urllib.error
+
+    sleep = time.sleep if sleep is None else sleep
+    for i in range(max(1, int(attempts))):
+        try:
+            return fn()
+        except urllib.error.HTTPError as e:
+            if e.code not in RETRY_STATUSES or i == int(attempts) - 1:
+                raise
+            ra = (e.headers.get("Retry-After") if e.headers else None) or ""
+            wait = float(ra) if ra.strip().replace(".", "", 1).isdigit() else 2.0 ** i
+            sleep(min(60.0, wait))
+    raise AssertionError("unreachable")
+
+
 def http_post_json(url: str, body: dict, *, timeout: float = 30.0):  # pragma: no cover — network
     import urllib.request
 
-    req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"),
-                                 headers={"Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as r:     # noqa: S310 — fixed https URLs
-        return json.loads(r.read().decode("utf-8"))
+    def _once():
+        req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"),
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as r:  # noqa: S310 — fixed https URLs
+            return json.loads(r.read().decode("utf-8"))
+
+    return with_backoff(_once)
 
 
 def http_get_json(url: str, *, timeout: float = 30.0):  # pragma: no cover — network
     import urllib.request
 
-    with urllib.request.urlopen(url, timeout=timeout) as r:     # noqa: S310 — fixed https URLs
-        return json.loads(r.read().decode("utf-8"))
+    def _once():
+        with urllib.request.urlopen(url, timeout=timeout) as r:  # noqa: S310 — fixed https URLs
+            return json.loads(r.read().decode("utf-8"))
+
+    return with_backoff(_once)
 
 
 __all__ = [
@@ -385,6 +479,7 @@ __all__ = [
     "alpha_on_grid", "append_alpha_row", "bars_on_grid", "binance_klines_url", "binance_symbol",
     "cross_check", "fetch_binance_klines", "fetch_hl_candles", "fetch_hl_funding",
     "funding_on_grid", "hl_candle_request", "hl_coin", "hl_funding_request", "http_get_json",
+    "ctx_on_grid", "hl_ctx_request", "parse_hl_asset_ctxs",
     "http_post_json", "load_alpha_rows", "parse_binance_klines", "parse_hl_candles",
-    "parse_hl_funding", "read_alpha_state",
+    "parse_hl_funding", "read_alpha_state", "with_backoff",
 ]

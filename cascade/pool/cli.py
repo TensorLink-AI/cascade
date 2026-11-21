@@ -237,12 +237,17 @@ def _add_mkt_args(p: argparse.ArgumentParser) -> None:
 
 def _add_record_bars(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("mkt-record",
-                       help="DEC-CA-0064 (review M15): record closed Hyperliquid 1m bars + "
-                            "funding forward into the bar store publish --lane mkt reads.")
+                       help="DEC-CA-0064 (review M15; native intervals 2026-11-10): record "
+                            "closed Hyperliquid 1m + [marketcast] native_intervals + 1h candles "
+                            "and funding forward into the bar store publish --lane mkt reads; "
+                            "the first pass of an empty asset backfills the API's full depth.")
     p.add_argument("--store", type=Path, required=True, help="Bar store directory.")
     p.add_argument("--lookback-hours", type=float, default=48.0,
                    help="Re-fetch window per pass (default 48; <= ~83 h, the API's 5000-candle "
                         "1m depth).")
+    p.add_argument("--no-backfill", action="store_true",
+                   help="Do not backfill the API's full depth for an (asset, interval) the "
+                        "store has nothing for yet.")
     p.add_argument("--chain-toml", type=Path, default=None, help="Override chain.toml path.")
     p.set_defaults(func=_cmd_record_bars)
 
@@ -255,9 +260,10 @@ def _cmd_record_bars(args: argparse.Namespace) -> int:  # pragma: no cover — n
 
     cfg = load_chain_config(args.chain_toml)
     got = record_once(MktBarStore(args.store), cfg.marketcast, post=http_post_json,
-                      now=time.time(), lookback_minutes=int(args.lookback_hours * 60))
+                      now=time.time(), lookback_minutes=int(args.lookback_hours * 60),
+                      backfill=not args.no_backfill)
     bad = {k: v for k, v in got.items() if isinstance(v, str)}
-    print(f"recorded {sum(v for v in got.values() if isinstance(v, int))} minute(s) over "
+    print(f"recorded {sum(v for v in got.values() if isinstance(v, int))} 1m candle(s) over "
           f"{len(got) - len(bad)} asset(s) → {args.store}; {len(bad)} failed")
     for k, v in sorted(bad.items())[:10]:
         print(f"  {k}: {v}", file=sys.stderr)

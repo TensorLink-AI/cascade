@@ -97,7 +97,12 @@ def build_policy(raw: dict) -> ProvisionPolicy:
     ttl_epochs = int(top.get("ttl_epochs", 1))
     if ttl_epochs < 1:
         raise ProvisionError(f"ttl_epochs must be >= 1; got {ttl_epochs}")
-    return ProvisionPolicy(max_spend_per_round=max_spend, ttl_epochs=ttl_epochs, eval=eval_sp)
+    mkt_sp = build_stage_policy(top["mkt"], "mkt") if "mkt" in top else None
+    lease = float(top.get("mkt_lease_hours", 3.0))
+    if not 0 < lease <= 24:
+        raise ProvisionError(f"mkt_lease_hours must be in (0, 24]; got {lease}")
+    return ProvisionPolicy(max_spend_per_round=max_spend, ttl_epochs=ttl_epochs, eval=eval_sp,
+                           mkt=mkt_sp, mkt_lease_hours=lease)
 
 
 def provider_names(raw: dict, policy: ProvisionPolicy) -> list[str]:
@@ -107,6 +112,7 @@ def provider_names(raw: dict, policy: ProvisionPolicy) -> list[str]:
     orphan reaper."""
     top = raw.get("provisioner", raw)
     names = list(policy.eval.providers) if policy.eval is not None else []
+    names += list(policy.mkt.providers) if policy.mkt is not None else []
     for stage in ("heat", "final"):
         names += [str(p) for p in (top.get(stage, {}) or {}).get("providers", ())]
     return list(dict.fromkeys(names))
@@ -154,7 +160,7 @@ def make_health_check(policy: ProvisionPolicy, render: RenderSettings, *,
               sku: str = "", gpus: int = 0, attested_digest: str = "",
               adopted: bool = False) -> HealthReport:
         prof = render.profile_for(provider)
-        sp = policy.eval if stage == "eval" else None
+        sp = {"eval": policy.eval, "mkt": policy.mkt}.get(stage)
         # The gate asserts what was ACTUALLY rented — with SKU fallback the
         # device can be any configured candidate, not just the primary. The
         # loop always passes the rented sku/gpus (adopted pods: the ledger's),
@@ -601,6 +607,15 @@ def _run(args) -> int:
         raise ProvisionError("eval_hosts_path must differ from hosts_path — the "
                              "validator's eval file must never clobber the trainer's fleet")
 
+    # MarketCast pod (DEC-CA-0064): [provisioner.mkt] + mkt_hosts_path — the
+    # main validator's --mkt-eval-hosts file (its request file sits beside it).
+    mkt_hosts_path = Path(top["mkt_hosts_path"]) if top.get("mkt_hosts_path") else None
+    if policy.mkt is not None and policy.mkt.max_pods > 0 and mkt_hosts_path is None:
+        raise ProvisionError("[provisioner.mkt] is configured but mkt_hosts_path is not "
+                             "set — the marketcast pod would have nowhere to publish")
+    if mkt_hosts_path is not None and mkt_hosts_path in (hosts_path, eval_hosts_path):
+        raise ProvisionError("mkt_hosts_path must differ from hosts_path and eval_hosts_path")
+
     # Operator's static [[host]] entries (e.g. a long-lived operator lane) — appended
     # verbatim to every hosts.toml publish so provisioner activity never drops them.
     static_hosts_text = ""
@@ -657,6 +672,7 @@ def _run(args) -> int:
         manifest_store=manifest_store,
         eval_hosts_path=eval_hosts_path,
         receipt_prefix=receipt_prefix,
+        mkt_hosts_path=mkt_hosts_path,
         health_check=make_health_check(
             policy, render,
             image_digest=cfg.training.train_image_digest,
@@ -683,8 +699,11 @@ def _run(args) -> int:
                  or eval_hosts_path is None
                  else f"{policy.eval.max_pods}×{policy.eval.sku}"
                       f"({policy.eval.gpus_per_pod}x)→{eval_hosts_path}")
-    log.info("provisioner up: eval=%s cap=$%.2f/rental ttl=%d epoch(s)%s",
-             eval_desc, policy.max_spend_per_round, policy.ttl_epochs,
+    mkt_desc = ("off" if policy.mkt is None or policy.mkt.max_pods == 0
+                or mkt_hosts_path is None
+                else f"{policy.mkt.sku}≤{policy.mkt_lease_hours:g}h→{mkt_hosts_path}")
+    log.info("provisioner up: eval=%s mkt=%s cap=$%.2f/rental ttl=%d epoch(s)%s",
+             eval_desc, mkt_desc, policy.max_spend_per_round, policy.ttl_epochs,
              " [DRY RUN]" if args.dry_run else "")
     if args.once:
         loop.run_once()

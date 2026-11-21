@@ -1,6 +1,7 @@
 """MarketCast (DEC-CA-0064) — the pure scoring pieces: series construction
-from 1-minute bars, quantile metrics, the coverage gate, knot mapping, the
-forward-only window rule and the per-suite paired verdict.
+from bars (1-minute, native 5m / 15m or hourly), quantile metrics, the
+coverage gate, knot mapping, the forward-only window rule, the per-suite
+paired verdict and the composite verdict (owner 2026-11-10).
 
 numpy only, no I/O, deterministic in ``seed`` (validators, satellites and
 ``cascade-audit`` replay it bit-for-bit). Nothing here is reachable from a
@@ -8,8 +9,10 @@ live verdict while ``[marketcast] from_block`` is 0 (the shipped value).
 
 Conventions:
 
-* Inputs are 1-minute bars in time order; NaN marks a missing bar (Timestral
-  reads NaN as missing). Prices must be > 0 where finite.
+* Inputs are bars in time order; NaN marks a missing bar (Timestral reads NaN
+  as missing). Prices must be > 0 where finite. Every suite value is a
+  function of the BLOCK's OHLCV candle (:func:`block_ohlcv`), so a series is
+  the same whichever bank it is cut from.
 * Path quantities (per-block realized vol, range, excursions) are their OWN
   series, never derived from marginal quantiles of returns (the base outputs
   marginals; long horizons autoregress on the median).
@@ -24,7 +27,13 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from ..shared.config.marketcast import COVERAGE_GATE_SUITES, MIN_CONTEXT, TIMESTRAL_KNOTS
+from ..shared.config.marketcast import (
+    COVERAGE_GATE_SUITES,
+    MIN_CONTEXT,
+    OHLCV_FIELD_NAMES,
+    TIMESTRAL_KNOTS,
+    base_suite,
+)
 
 BP = 1e4
 
@@ -106,6 +115,55 @@ def range_excursions(open_, high, low, horizon: int) -> dict[str, np.ndarray]:
         up[i] = max(0.0, np.log(mh / o0))
         dn[i] = max(0.0, np.log(o0 / ml))
     return {"range": rng, "up": up, "down": dn}
+
+
+_GK_C = 2.0 * np.log(2.0) - 1.0
+
+
+def block_ohlcv(bars: Mapping[str, np.ndarray], block: int) -> dict[str, np.ndarray]:
+    """One OHLCV candle per consecutive block of ``block`` bars (trailing
+    partial dropped): ``open`` = the block's FIRST bar's open, ``close`` =
+    its LAST bar's close (NaN when that bar is missing — the block-end rule
+    of the returns series), ``high`` / ``low`` = max / min over the finite
+    bars, ``volume`` = the sum over the finite bars (NaN when none). Exact
+    aggregation: the 5m candle of five 1m bars is the native 5m candle."""
+    b = _step(block, "block")
+    out: dict[str, np.ndarray] = {}
+    with np.errstate(invalid="ignore"):
+        for k in ("open", "high", "low", "close", "volume"):
+            if k not in bars:
+                continue
+            x = np.asarray(bars[k], dtype=np.float64)
+            n = x.size // b
+            m = x[:n * b].reshape(n, b) if n else np.empty((0, b))
+            if k == "open":
+                out[k] = m[:, 0].copy()
+            elif k == "close":
+                out[k] = m[:, -1].copy()
+            else:
+                fin = np.isfinite(m)
+                if k == "high":
+                    v = np.where(fin, m, -np.inf).max(axis=1) if n else np.empty(0)
+                elif k == "low":
+                    v = np.where(fin, m, np.inf).min(axis=1) if n else np.empty(0)
+                else:
+                    v = np.where(fin, m, 0.0).sum(axis=1) if n else np.empty(0)
+                out[k] = np.where(fin.any(axis=1), v, np.nan) if n else v
+    return out
+
+
+def garman_klass_vol_bp(open_, high, low, close) -> np.ndarray:
+    """Garman–Klass (1980) realized vol of each candle, in bp:
+    ``σ² = ½ ln(H/L)² − (2 ln 2 − 1) ln(C/O)²``, ``1e4 · √σ²``. NaN where a
+    price is missing / not > 0 or ``σ²`` is not > 0 (a flat candle). The
+    2026-11-10 vol definition (owner): computable from native candles, the
+    same rule for context and target."""
+    o, h, lo, c = (np.asarray(x, dtype=np.float64) for x in (open_, high, low, close))
+    with np.errstate(invalid="ignore", divide="ignore"):
+        ok = (np.isfinite(o) & np.isfinite(h) & np.isfinite(lo) & np.isfinite(c)
+              & (o > 0) & (h > 0) & (lo > 0) & (c > 0))
+        var = 0.5 * np.log(h / lo) ** 2 - _GK_C * np.log(c / o) ** 2
+        return np.where(ok & (var > 0), BP * np.sqrt(np.where(var > 0, var, 0.0)), np.nan)
 
 
 def log_volume(volume, block: int) -> np.ndarray:
@@ -263,14 +321,21 @@ def _lead_nan_diff(x: np.ndarray) -> np.ndarray:
 def suite_series(suite: str, bars: Mapping[str, np.ndarray], freq_minutes: int, *,
                  bar_minutes: int = 1) -> np.ndarray:
     """The series a suite forecasts, one value per ``freq_minutes`` block
-    of ``bars`` sampled every ``bar_minutes`` (1 = the 1-minute bank; 60 =
-    the coarse hourly bank, where ``vol`` is the std of the block's HOURLY bp
-    returns — the same construction for context and target):
+    of ``bars`` sampled every ``bar_minutes`` (1 = the 1-minute bank; 5 / 15
+    = a native bank; 60 = the coarse hourly bank). Every value is a function
+    of the block's candle (:func:`block_ohlcv`), so context and target share
+    one construction whatever the bank:
 
     * ``returns`` — log return of the block-end close vs the previous
       block-end close, bp (block 0 NaN);
-    * ``vol``     — ``ln`` realized vol (std of the block's 1m bp returns);
+    * ``vol``     — ``ln`` Garman–Klass realized vol of the block's candle
+      (bp; owner 2026-11-10 — was the std of the block's 1m returns);
     * ``range``   — ``ln`` of ``ln(max H / min L)`` over the block;
+    * ``high`` / ``low`` — the block's max up / down excursion from its
+      open, ``1e4 · ln(max H / o)`` / ``1e4 · ln(o / min L)`` (bp, ≥ 0);
+    * ``ohlcv.<o|h|l|c|v>`` — the block candle's actual open / high / low /
+      close price or summed volume (levels; scored with scale-normalised
+      CRPS, :func:`level_scale`);
     * ``funding`` — change of the block-end funding rate, bp (block 0 NaN);
     * ``liquidity`` — ``ln Σ volume`` over the block;
     * ``alpha``   — log return of the block-end alpha price, bp.
@@ -282,13 +347,25 @@ def suite_series(suite: str, bars: Mapping[str, np.ndarray], freq_minutes: int, 
         raise ValueError(f"freq {f}m is not a multiple of the {bm}m bars")
     f //= bm
     with np.errstate(divide="ignore", invalid="ignore"):
+        if suite == "vol":
+            k = block_ohlcv(bars, f)
+            rv = garman_klass_vol_bp(k["open"], k["high"], k["low"], k["close"])
+            return np.where(rv > 0, np.log(rv), np.nan)
+        if suite in ("high", "low"):
+            ex = range_excursions(bars["open"], bars["high"], bars["low"], f)
+            return BP * ex["up" if suite == "high" else "down"]
+        if base_suite(suite) == "ohlcv":
+            fld = OHLCV_FIELD_NAMES.get(suite.split(".", 1)[1] if "." in suite else "")
+            if fld is None:
+                raise ValueError(f"ohlcv series {suite!r} must be ohlcv.<o|h|l|c|v>")
+            x = block_ohlcv({fld: bars[fld]}, f)[fld]
+            if fld == "volume":
+                return np.where(np.isfinite(x) & (x >= 0), x, np.nan)
+            return np.where(x > 0, x, np.nan)
         if suite in ("returns", "alpha"):
             px = np.asarray(bars["close" if suite == "returns" else "price"], dtype=np.float64)
             px = np.where(px > 0, px, np.nan)
             return BP * _lead_nan_diff(np.log(_block_end(px, f)))
-        if suite == "vol":
-            rv = realized_vol_bp(bars["close"], f)
-            return np.where(rv > 0, np.log(rv), np.nan)
         if suite == "range":
             r = range_excursions(bars["open"], bars["high"], bars["low"], f)["range"]
             return np.where(r > 0, np.log(r), np.nan)
@@ -301,11 +378,26 @@ def suite_series(suite: str, bars: Mapping[str, np.ndarray], freq_minutes: int, 
 
 
 def window_geometry(freqs: Sequence[str], horizon: str) -> tuple[int, int]:
-    """``(freq_minutes, steps)`` a horizon is forecast at: the COARSEST
-    configured frequency ``f`` with ``f ≤ h`` that divides ``h``, and
-    ``steps = h / f`` (≤ :data:`TIMESTRAL_MAX_HORIZON`, one pass)."""
-    from ..shared.config.marketcast import TIMESTRAL_MAX_HORIZON, duration_minutes
+    """``(freq_minutes, steps)`` a horizon is forecast at: a multi-step
+    horizon ``<bar>x<steps>`` its bar (which must be a configured frequency)
+    and steps; a duration horizon the COARSEST configured frequency ``f``
+    with ``f ≤ h`` that divides ``h``, and ``steps = h / f``. Steps ≤
+    :data:`TIMESTRAL_MAX_HORIZON` (one pass)."""
+    from ..shared.config.marketcast import (
+        TIMESTRAL_MAX_HORIZON,
+        duration_minutes,
+        horizon_path,
+    )
 
+    path = horizon_path(horizon)
+    if path is not None:
+        if path[0] not in tuple(freqs):
+            raise ValueError(f"horizon {horizon!r} bar {path[0]} is not a frequency in "
+                             f"{list(freqs)}")
+        f, steps = duration_minutes(path[0]), path[1]
+        if steps > TIMESTRAL_MAX_HORIZON:
+            raise ValueError(f"horizon {horizon} is {steps} steps > {TIMESTRAL_MAX_HORIZON}")
+        return f, steps
     h = duration_minutes(horizon)
     fit = [duration_minutes(f) for f in freqs if duration_minutes(f) <= h
            and h % duration_minutes(f) == 0]
@@ -366,27 +458,65 @@ def session_rows(times) -> np.ndarray:
     return out
 
 
-PAST_COVARIATES = ("cross_asset", "funding", "volume")
-KNOWN_COVARIATES = ("calendar", "session")
+def event_rows(times, events: Sequence[float], *, horizon_hours: float = 168.0) -> np.ndarray:
+    """``(2, N)`` known-future rows of a pinned SCHEDULED-event calendar
+    (owner 2026-11-18; ``[marketcast] event_times``, e.g. FOMC / CPI / NFP
+    release instants, unix): 1 when an event falls inside the block that
+    starts at ``times[j]`` (blocks are the gaps between successive starts;
+    the last one as long as the one before), and the hours until the next
+    event, clipped to ``horizon_hours`` and divided by it (1 = none soon)."""
+    t = np.asarray(times, dtype=np.float64)
+    ev = np.sort(np.asarray(list(events), dtype=np.float64))
+    out = np.zeros((2, t.size))
+    out[1] = 1.0
+    if not t.size or not ev.size:
+        return out
+    step = np.diff(t)
+    ends = np.r_[t[1:], t[-1] + (step[-1] if step.size else 60.0)]
+    i0 = np.searchsorted(ev, t, side="left")
+    i1 = np.searchsorted(ev, ends, side="left")
+    out[0] = (i1 > i0).astype(np.float64)
+    nxt = np.where(i0 < ev.size, ev[np.minimum(i0, ev.size - 1)] - t, np.inf)
+    out[1] = np.minimum(nxt / 3600.0, horizon_hours) / horizon_hours
+    return out
+
+
+# Cross-market context (owner 2026-11-18): the series of these assets'
+# returns, aligned to the window's own blocks — BTC (``cross_asset``, the
+# original), ETH, the S&P 500 perp, gold and the euro (a dollar gauge)
+CROSS_SERIES: dict[str, tuple[str, str]] = {
+    "cross_asset": ("crypto", "BTC"), "cross_eth": ("crypto", "ETH"),
+    "cross_equity": ("equity_etf", "SP500"), "cross_gold": ("metals", "GOLD"),
+    "cross_fx": ("fx", "EUR"),
+}
+PAST_COVARIATES = ("cross_asset", "funding", "volume", "cross_eth", "cross_equity",
+                   "cross_gold", "cross_fx", "open_interest", "spread")
+KNOWN_COVARIATES = ("calendar", "session", "events")
 
 
 def build_covariates(names: Sequence[str], *, block_starts, n_context: int,
                      volume_series=None, funding_series=None,
-                     cross_series=None) -> tuple[np.ndarray | None, np.ndarray | None]:
+                     cross_series=None, series: Mapping[str, object] | None = None,
+                     event_times: Sequence[float] = ()
+                     ) -> tuple[np.ndarray | None, np.ndarray | None]:
     """``(past, known)`` covariate rows for one window: ``past`` is
     ``(C_p, n_context)``, ``known`` ``(C_f, len(block_starts))`` where
     ``block_starts`` are the unix starts of the context + horizon blocks.
     Rows come in the order of :data:`PAST_COVARIATES` / :data:`KNOWN_COVARIATES`
     (never the recipe's order), so a fine-tune reads its rows identically in
     training and eval. A past series missing for the asset is a NaN row
-    (missing to the base). ``None`` when no row of that kind is asked."""
+    (missing to the base). ``None`` when no row of that kind is asked.
+    ``series`` carries the 2026-11-18 past rows by name (the other cross
+    markets, ``open_interest``, ``spread``); ``event_times`` the calendar."""
     want = set(names)
     bad = sorted(want - set(PAST_COVARIATES) - set(KNOWN_COVARIATES))
     if bad:
         raise ValueError(f"unknown covariates {bad}")
     past = []
-    for name, src in (("cross_asset", cross_series), ("funding", funding_series),
-                      ("volume", volume_series)):
+    srcs = {"cross_asset": cross_series, "funding": funding_series, "volume": volume_series,
+            **dict(series or {})}
+    for name in PAST_COVARIATES:
+        src = srcs.get(name)
         if name in want:
             row = (np.full(n_context, np.nan) if src is None
                    else np.asarray(src, dtype=np.float64))
@@ -398,11 +528,66 @@ def build_covariates(names: Sequence[str], *, block_starts, n_context: int,
         known.append(calendar_rows(block_starts))
     if "session" in want:
         known.append(session_rows(block_starts))
+    if "events" in want:
+        known.append(event_rows(block_starts, event_times))
     return (np.stack(past) if past else None,
             np.concatenate(known) if known else None)
 
 
 # ── forward-only windows over a bar bank ─────────────────────────────────────
+
+
+LEVEL_VOLUME_SCALE_STEPS = 64
+
+
+def gift_season(freq_minutes: int) -> int:
+    """GIFT-Eval's seasonality (gluonts ``get_seasonality``): one day of steps
+    for intraday frequencies (1m → 1440, 5m → 288, 15m → 96, 1h → 24,
+    4h → 6), 1 at a day or coarser or when a day is not a whole number of
+    steps."""
+    f = int(freq_minutes)
+    return 1440 // f if 0 < f < 1440 and 1440 % f == 0 else 1
+
+
+def seasonal_naive_scale(context, freq_minutes: int) -> float:
+    """The MASE denominator GIFT-Eval uses (gluonts
+    ``calculate_seasonal_error``): mean ``|x_t − x_{t−m}|`` over the finite
+    pairs of the CONTEXT, ``m`` = :func:`gift_season`, falling back to
+    ``m = 1`` when the context is not longer than a season or its seasonal
+    error is not > 0. Known before the window opens. NaN when no lag gives a
+    finite error > 0 (a flat context — :func:`cut_windows` then keeps the
+    window on :func:`level_scale`, red-team F3)."""
+    c = np.asarray(context, dtype=np.float64)
+    for m in dict.fromkeys((gift_season(freq_minutes), 1)):
+        if c.size <= m:
+            continue
+        d = np.abs(c[m:] - c[:-m])
+        d = d[np.isfinite(d)]
+        v = float(d.mean()) if d.size else float("nan")
+        if np.isfinite(v) and v > 0:
+            return v
+    return float("nan")
+
+
+def level_scale(suite: str, context) -> float:
+    """The per-window CRPS scale of an ``ohlcv.<field>`` window (owner
+    2026-11-10: actual levels, scale-normalised CRPS) — fixed by what is
+    known BEFORE the window opens: a price field's last finite context
+    value; the volume field's mean over the last
+    :data:`LEVEL_VOLUME_SCALE_STEPS` finite context values. 1.0 for every
+    other suite (its loss keeps its units) and NaN when the context has no
+    usable value (the window is then not cut)."""
+    if base_suite(suite) != "ohlcv":
+        return 1.0
+    c = np.asarray(context, dtype=np.float64)
+    c = c[np.isfinite(c)]
+    if suite.endswith(".v"):
+        c = c[-LEVEL_VOLUME_SCALE_STEPS:]
+        v = float(c.mean()) if c.size else float("nan")
+    else:
+        v = float(c[-1]) if c.size else float("nan")
+    return v if np.isfinite(v) and v > 0 else float("nan")
+
 
 
 @dataclass(frozen=True)
@@ -422,6 +607,7 @@ class MktWindow:
     index: int                      # first target block on the series
     context: np.ndarray = field(repr=False)
     target: np.ndarray = field(repr=False)
+    scale: float = 1.0              # CRPS divisor (level_scale; 1 = the loss keeps its units)
 
 
 def window_id(cls: str, asset: str, suite: str, horizon: str, start: float) -> str:
@@ -444,7 +630,7 @@ def cut_windows(series, *, cls: str, asset: str, suite: str, horizon: str,
                 freq_minutes: int, steps: int, t0: float, context_length: int,
                 after: float, now: float, min_context: int = MIN_CONTEXT,
                 limit: int | None = None, eligible=None,
-                stale_context: bool = False) -> list[MktWindow]:
+                stale_context: bool = False, crps_scale: str = "seasonal_naive") -> list[MktWindow]:
     """Every forward-only window of one series: origins on the ABSOLUTE
     UTC grid (block index ``k`` with ``(t0/60/f + k) % steps == 0``, so a
     window id is stable across snapshots), start strictly after ``after``,
@@ -474,6 +660,13 @@ def cut_windows(series, *, cls: str, asset: str, suite: str, horizon: str,
         if not (start > float(after) and end <= float(now)):
             continue
         ctx = s[max(0, k - int(context_length)):k]
+        # owner 2026-11-21: the banks are sized for a 32k context the
+        # recording only fills over time — the unrecorded NaN run before the
+        # first finite value carries nothing, so it is not sent (a context is
+        # as long as its history, growing toward ``context_length``)
+        fin = np.isfinite(ctx)
+        if fin.any():
+            ctx = ctx[int(fin.argmax()):]
         tgt = s[k:k + h]
         if int(np.isfinite(ctx).sum()) < int(min_context) or not np.isfinite(tgt).any():
             continue
@@ -483,8 +676,13 @@ def cut_windows(series, *, cls: str, asset: str, suite: str, horizon: str,
                 continue
         if eligible is not None and not eligible(start):
             continue
+        sc = seasonal_naive_scale(ctx, f) if crps_scale == "seasonal_naive" else float("nan")
+        if not np.isfinite(sc):
+            sc = level_scale(suite, ctx)
+        if not np.isfinite(sc):
+            continue
         out.append(MktWindow(window_id(cls, asset, suite, horizon, start), cls, asset, suite,
-                             horizon, f, h, start, end, k, ctx, tgt))
+                             horizon, f, h, start, end, k, ctx, tgt, sc))
     if limit is not None:
         out = [out[i] for i in spread_select(len(out), int(limit))]
     return out
@@ -572,6 +770,54 @@ def qlike(vol_true, vol_pred) -> np.ndarray:
         out = x - np.log(x) - 1.0
     ok = np.isfinite(t) & np.isfinite(p) & (t > 0) & (p > 0)
     return np.where(ok, out, np.nan)
+
+
+def _step_mean(x: np.ndarray) -> np.ndarray:
+    """``(N, H)`` per-step losses → ``(N,)`` means over the finite steps
+    (NaN for a window with none)."""
+    fin = np.isfinite(x)
+    tot = np.where(fin, x, 0.0).sum(axis=-1)
+    cnt = fin.sum(axis=-1)
+    return np.where(cnt > 0, tot / np.maximum(cnt, 1), np.nan)
+
+
+def window_median_ae(q_pred, y, levels=TIMESTRAL_KNOTS) -> np.ndarray:
+    """Per-window mean absolute error of the forecast MEDIAN (the MASE
+    numerator; ÷ the window's seasonal-naive scale it is MASE): ``q_pred``
+    ``(N, H, K)``, ``y`` ``(N, H)`` → ``(N,)``."""
+    med = map_quantiles(q_pred, levels, (0.5,))[..., 0]
+    with np.errstate(invalid="ignore"):
+        return _step_mean(np.abs(med - np.asarray(y, dtype=np.float64)))
+
+
+# the level grid the quantile function is integrated on (midpoints of 200
+# equal bins; the flat ends past the outer knots are map_quantiles' clamp)
+_MEAN_GRID = (np.arange(200) + 0.5) / 200
+
+
+def window_qlike_logvol(q_pred, y, levels=TIMESTRAL_KNOTS) -> np.ndarray:
+    """Per-window QLIKE (:func:`qlike`) of a LOG-vol forecast: the realised
+    variance ``exp(2 y)`` against the quantile-implied MEAN variance
+    ``∫ exp(2 Q(u)) du`` — QLIKE's optimum is the conditional mean of the
+    variance, not its median, so a calibrated distribution scores best.
+    Computed in logs (``x = exp(2y − ln E σ²)``) so no level overflows.
+    ``(N, H, K)``, ``(N, H)`` → ``(N,)``; scale-free (no CRPS scale)."""
+    q = map_quantiles(q_pred, levels, _MEAN_GRID)
+    with np.errstate(invalid="ignore", over="ignore"):
+        m = 2.0 * q.max(axis=-1)
+        ln_ev = m + np.log(np.exp(2.0 * q - m[..., None]).mean(axis=-1))
+        lnx = 2.0 * np.asarray(y, dtype=np.float64) - ln_ev
+        out = np.exp(lnx) - lnx - 1.0
+    return _step_mean(np.where(np.isfinite(lnx), out, np.nan))
+
+
+def window_tail_score(q_pred, y, levels=TIMESTRAL_KNOTS,
+                      tail_levels: Sequence[float] = (0.01, 0.05, 0.95, 0.99)) -> np.ndarray:
+    """Per-window tail quantile score: ``2 · mean`` pinball at ``tail_levels``
+    (the proper score of those quantiles — a VaR forecast's loss), mean over
+    the finite steps. ``(N, H, K)``, ``(N, H)`` → ``(N,)``."""
+    tq = map_quantiles(q_pred, levels, tuple(tail_levels))
+    return _step_mean(2.0 * pinball(tq, y, tail_levels).mean(axis=-1))
 
 
 def interval_coverage(q_pred, y, levels=TIMESTRAL_KNOTS,
@@ -1009,16 +1255,266 @@ def judge_suite(suite: str, base_loss, ft_loss, *, alpha: float, B: int, gain_ma
     return _v(True, "win", gain=gain, gain_lcb=lcb)
 
 
+def composite_gain_detail(base_loss, ft_loss, *, clusters: Sequence, suites: Sequence,
+                          horizons: Sequence, weights=None, alpha: float, B: int, seed: str,
+                          zero_scale_frac: float = 1e-3, ratio_cap: float = 4.0,
+                          label_weights: Mapping[str, float] | None = None,
+                          suite_weights: Mapping[str, float] | None = None) -> dict:
+    """The composite statistic (owner 2026-11-10): per row its window SUITE
+    LABEL (``suites``; ``ohlcv.<field>`` labels fold into ``ohlcv``) and
+    horizon. Inside one suite exactly :func:`clustered_gain_detail`'s
+    statistic — per (label × horizon) column the class-balanced mean of the
+    clipped ``ln(Σ ft / Σ base)`` over the class's unmasked clusters, the
+    columns averaged with equal weight (``label_weights[label]`` scales a
+    label's columns, e.g. the ohlcv open) — then the suites averaged with
+    ``suite_weights`` (equal when None; renormalised over the suites that
+    have rows): ``gain = 1 − exp(Σ_s w_s ln r_s)``, the weighted geomean of
+    the per-suite loss ratios. ONE cluster bootstrap (class × time block, the
+    same bag for every suite and column) gives the composite LCB and every
+    suite's LCB from the same draws. Returns ``{"gain", "lcb", "suites":
+    {suite: {"gain", "lcb"}}, "masked", "cells"}`` (NaN when empty)."""
+    from .bootstrap import _seed_to_int
+
+    nan = float("nan")
+    if not np.asarray(base_loss).size:
+        return {"gain": nan, "lcb": nan, "suites": {}, "masked": [], "cells": 0}
+    cols = [f"{s}|{h}" for s, h in zip(suites, horizons, strict=True)]
+    Sb, Sf, labels, col_labels, masked = cell_sums(
+        base_loss, ft_loss, clusters=clusters, horizons=cols, weights=weights,
+        zero_scale_frac=zero_scale_frac)
+    g, nh = Sb.shape
+    by_cls: dict[str, list[int]] = {}
+    for i, c in enumerate(labels):
+        by_cls.setdefault(_class_of(c), []).append(i)
+    cap = float(np.log(float(ratio_cap)))
+    col_suite = [base_suite(c.split("|", 1)[0]) for c in col_labels]
+    lw = dict(label_weights or {})
+    col_w = np.array([float(lw.get(c.split("|", 1)[0], 1.0)) for c in col_labels])
+    order = sorted(set(col_suite))
+    sw = np.array([float((suite_weights or {}).get(s, 1.0)) for s in order])[:, None]
+
+    def _stat(Mw: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        per_col = []
+        for j in range(nh):
+            rows = []
+            for idx in by_cls.values():
+                sb = Mw[:, idx] @ Sb[idx, j]
+                sf = Mw[:, idx] @ Sf[idx, j]
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    lr = np.log(np.maximum(sf, 0.0)) - np.log(np.where(sb > 0, sb, 1.0))
+                rows.append(np.where(sb > 0, np.clip(lr, -cap, cap), np.nan))
+            r = np.stack(rows)
+            ok = np.isfinite(r)
+            per_col.append(np.where(ok.any(axis=0), np.where(ok, r, 0.0).sum(axis=0)
+                                    / np.maximum(ok.sum(axis=0), 1), np.nan))
+        pc = np.stack(per_col)                                     # (cols, draws)
+        per_s = []
+        for s in order:
+            js = [j for j in range(nh) if col_suite[j] == s and col_w[j] > 0]
+            if not js:
+                per_s.append(np.full(pc.shape[1], np.nan))
+                continue
+            x, w = pc[js], col_w[js][:, None]
+            ok = np.isfinite(x)
+            den = np.where(ok, w, 0.0).sum(axis=0)
+            per_s.append(np.where(den > 0, np.where(ok, x * w, 0.0).sum(axis=0)
+                                  / np.where(den > 0, den, 1.0), np.nan))
+        ps = np.stack(per_s)                                       # (suites, draws)
+        ok = np.isfinite(ps)
+        den = np.where(ok, sw, 0.0).sum(axis=0)
+        comp = np.where(den > 0, np.where(ok, ps * sw, 0.0).sum(axis=0)
+                        / np.where(den > 0, den, 1.0), np.nan)
+        return comp, ps
+
+    c1, s1 = _stat(np.ones((1, g)))
+    rng = np.random.default_rng(_seed_to_int(seed))
+    idx = rng.integers(0, g, size=(int(B), g))
+    Mw = np.zeros((int(B), g))
+    np.add.at(Mw, (np.repeat(np.arange(int(B)), g), idx.ravel()), 1.0)
+    cb, sb_ = _stat(Mw)
+
+    def _lcb(x: np.ndarray, a: float = alpha) -> float:
+        x = 1.0 - np.exp(x)
+        x = x[np.isfinite(x)]
+        return float(np.quantile(x, a)) if x.size else nan
+
+    per = {s: {"gain": float(1.0 - np.exp(s1[i, 0])), "lcb": _lcb(sb_[i]),
+               "ucb": _lcb(sb_[i], 1.0 - alpha)} for i, s in enumerate(order)}
+    return {"gain": float(1.0 - np.exp(c1[0])), "lcb": _lcb(cb), "ucb": _lcb(cb, 1.0 - alpha),
+            "suites": per, "masked": masked, "cells": int((Sb > 0).sum())}
+
+
+def judge_composite(base_loss, ft_loss, *, suites: Sequence, horizons: Sequence,
+                    clusters: Sequence, alpha: float, B: int, gain_margin: float, seed: str,
+                    suite_floor: float, min_windows: int = 1, min_clusters: int = 1,
+                    coverage: Mapping[str, CoverageGate] | None = None, weights=None,
+                    time_blocks: Sequence | None = None, min_time_blocks: int = 1,
+                    zero_scale_frac: float = 1e-3, ratio_cap: float = 4.0,
+                    label_weights: Mapping[str, float] | None = None,
+                    expected_suites: Sequence[str] = (),
+                    suite_weights: Mapping[str, float] | None = None,
+                    guards: Mapping[str, tuple] | None = None, guard_floor: float = 0.02,
+                    baseline: tuple | None = None, baseline_gate: bool = False,
+                    name: str = "market") -> SuiteVerdict:
+    """The composite verdict (owner 2026-11-10, ``mkt:market``): the
+    fine-tune vs the untouched base on the SAME eligible windows of every
+    enabled suite, :func:`composite_gain_detail`. Pass iff the composite
+    ``LCB ≥ gain_margin`` and point gain > 0, ≥ ``min_windows`` paired finite
+    windows over ≥ ``min_clusters`` clusters and ≥ ``min_time_blocks``
+    blocks, EVERY suite of ``expected_suites`` has paired windows, NO suite is
+    CONFIDENTLY worse (its upper bound ``UCB`` below ``−suite_floor``, owner
+    2026-11-19: proven better overall, never proven worse anywhere) and every
+    calibration-gated suite's :class:`CoverageGate` (``coverage[suite]``)
+    passed, and every no-regression GUARD (owner 2026-11-18) holds:
+    ``guards[name] = (base, ft, weights)`` — per row a second loss (NaN where
+    the guard does not apply) and its in-horizon class weights — is judged by
+    the same statistic, bootstrap and suite weights, and fails the entry when
+    it is confidently worse — its UCB below ``−guard_floor`` (or it has no
+    paired rows).
+    With ``baseline = (losses, weights)`` (owner 2026-11-18: the strong
+    simple baselines, :mod:`.marketcast_baselines`) the fine-tune is also
+    judged against the baseline by the same statistic —
+    ``diagnostics["vs_baseline"]`` (and the base's own skill,
+    ``diagnostics["base_vs_baseline"]``) — and with ``baseline_gate`` it
+    fails unless that composite LCB is ≥ 0 and no suite is CONFIDENTLY
+    worse than the baseline (its upper bound < 0): a near-tie passes, a
+    real loss to a random walk does not.
+    ``diagnostics["suites"]`` records each suite's gain / LCB / windows,
+    ``diagnostics["guards"]`` each guard's."""
+    if not 0.0 < float(gain_margin) < 1.0:
+        raise ValueError(f"gain_margin must be in (0, 1); got {gain_margin}")
+    b = np.asarray(base_loss, dtype=np.float64)
+    f = np.asarray(ft_loss, dtype=np.float64)
+    if b.shape != f.shape or b.ndim != 1:
+        raise ValueError(f"paired 1-D losses required; got {b.shape} vs {f.shape}")
+    ok = np.isfinite(b) & np.isfinite(f) & (b >= 0) & (f >= 0)
+    sl = [s for s, m in zip(suites, ok, strict=True) if m]
+    hz = [h for h, m in zip(horizons, ok, strict=True) if m]
+    cl = [c for c, m in zip(clusters, ok, strict=True) if m]
+    tb = None if time_blocks is None else {t for t, m in zip(time_blocks, ok, strict=True) if m}
+    wt = None if weights is None else np.asarray(weights, dtype=np.float64)[ok]
+    b, f = b[ok], f[ok]
+    n, g = int(b.size), len(set(cl))
+    counts: dict[str, int] = {}
+    for s_ in sl:
+        counts[base_suite(s_)] = counts.get(base_suite(s_), 0) + 1
+    cov = dict(coverage or {})
+    diag: dict = {"suites": {s_: {"n": counts.get(s_, 0)} for s_ in
+                             sorted(set(expected_suites) | set(counts))}}
+    merged = combine_gates(list(cov.values())) if cov else None
+
+    def _v(passed, reason, **kw):
+        return SuiteVerdict(name, bool(passed), reason, n, int(g), coverage=merged,
+                            diagnostics=diag, **kw)
+
+    if n < max(1, int(min_windows)):
+        return _v(False, f"inconclusive: {n} windows < {min_windows}")
+    if g < max(1, int(min_clusters)):
+        return _v(False, f"inconclusive: {g} clusters < {min_clusters}")
+    if tb is not None and len(tb) < max(1, int(min_time_blocks)):
+        return _v(False, f"inconclusive: {len(tb)} time blocks < {min_time_blocks}")
+    missing = [s_ for s_ in expected_suites if not counts.get(s_)]
+    if missing:
+        return _v(False, f"inconclusive: no paired windows for suites {missing}")
+    d = composite_gain_detail(b, f, clusters=cl, suites=sl, horizons=hz, weights=wt,
+                              alpha=alpha, B=B, seed=f"{seed}|mkt:{name}",
+                              zero_scale_frac=zero_scale_frac, ratio_cap=ratio_cap,
+                              label_weights=label_weights, suite_weights=suite_weights)
+    gd: dict = {}
+    for gname, (gb, gf, gw) in sorted((guards or {}).items()):
+        gb, gf = np.asarray(gb, dtype=np.float64)[ok], np.asarray(gf, dtype=np.float64)[ok]
+        gm = np.isfinite(gb) & np.isfinite(gf) & (gb >= 0) & (gf >= 0)
+        if not gm.any():
+            gd[gname] = {"n": 0, "gain": float("nan"), "gain_lcb": float("nan"),
+                         "gain_ucb": float("nan")}
+            continue
+        pick = np.flatnonzero(gm)
+        x = composite_gain_detail(
+            gb[gm], gf[gm], clusters=[cl[i] for i in pick], suites=[sl[i] for i in pick],
+            horizons=[hz[i] for i in pick], weights=np.asarray(gw, dtype=np.float64)[ok][gm],
+            alpha=alpha, B=B, seed=f"{seed}|mkt:{name}|guard:{gname}",
+            zero_scale_frac=zero_scale_frac, ratio_cap=ratio_cap, label_weights=label_weights,
+            suite_weights=suite_weights)
+        gd[gname] = {"n": int(gm.sum()), "gain": x["gain"], "gain_lcb": x["lcb"],
+                     "gain_ucb": x["ucb"]}
+    if gd:
+        diag["guards"] = gd
+    vb = None
+    if baseline is not None:
+        bl = np.asarray(baseline[0], dtype=np.float64)[ok]
+        bw = np.asarray(baseline[1], dtype=np.float64)[ok]
+        bm = np.isfinite(bl) & (bl >= 0)
+        pick = np.flatnonzero(bm)
+        if pick.size:
+            kw = dict(clusters=[cl[i] for i in pick], suites=[sl[i] for i in pick],
+                      horizons=[hz[i] for i in pick], weights=bw[bm], alpha=alpha, B=B,
+                      zero_scale_frac=zero_scale_frac, ratio_cap=ratio_cap,
+                      label_weights=label_weights, suite_weights=suite_weights)
+            vb = composite_gain_detail(bl[bm], f[bm], seed=f"{seed}|mkt:{name}|baseline", **kw)
+            bb = composite_gain_detail(bl[bm], b[bm], seed=f"{seed}|mkt:{name}|baseline", **kw)
+            diag["vs_baseline"] = {"n": int(bm.sum()), "gain": vb["gain"], "lcb": vb["lcb"],
+                                   "suites": vb["suites"]}
+            diag["base_vs_baseline"] = {"gain": bb["gain"], "lcb": bb["lcb"],
+                                        "suites": {s_: {"gain": v["gain"]}
+                                                   for s_, v in bb["suites"].items()}}
+    for s_, v in d["suites"].items():
+        diag["suites"].setdefault(s_, {}).update(gain=v["gain"], gain_lcb=v["lcb"],
+                                                 gain_ucb=v["ucb"])
+    diag["cells"] = int(d["cells"])
+    diag["masked_cells"] = len(d["masked"])
+    if d["masked"]:
+        diag["masked"] = d["masked"][:8]
+    gain, lcb = d["gain"], d["lcb"]
+    gated = [s_ for s_ in COVERAGE_GATE_SUITES if counts.get(s_)]
+    nocov = [s_ for s_ in gated if s_ not in cov]
+    if nocov:
+        return _v(False, f"coverage gate missing for {nocov}", gain=gain, gain_lcb=lcb)
+    if not (np.isfinite(lcb) and lcb >= gain_margin):
+        return _v(False, f"gain LCB {lcb:.4g} < margin {gain_margin}", gain=gain, gain_lcb=lcb)
+    if not gain > 0.0:
+        return _v(False, "non-positive point gain", gain=gain, gain_lcb=lcb)
+    # owner 2026-11-19: a suite fails only when it is CONFIDENTLY worse than the
+    # base (its upper bound below -suite_floor) — the composite LCB already
+    # demands a proven win; a noisy suite near zero is not a regression
+    worse = sorted(s_ for s_, v in d["suites"].items()
+                   if not (np.isfinite(v["ucb"]) and v["ucb"] >= -float(suite_floor)))
+    if worse:
+        return _v(False, f"suite regression: confidently worse (UCB below -{suite_floor}) on "
+                         f"{worse}", gain=gain, gain_lcb=lcb)
+    if baseline_gate:
+        if vb is None or not (np.isfinite(vb["lcb"]) and vb["lcb"] >= 0.0):
+            return _v(False, f"does not beat the simple baselines: composite LCB "
+                             f"{(vb or {}).get('lcb', float('nan')):.4g} < 0", gain=gain,
+                      gain_lcb=lcb)
+        below = sorted(s_ for s_, v in vb["suites"].items()
+                       if np.isfinite(v["ucb"]) and v["ucb"] < 0.0)
+        if below:
+            return _v(False, f"confidently worse than the simple baseline on {below}",
+                      gain=gain, gain_lcb=lcb)
+    lost = sorted(g_ for g_, v in gd.items()
+                  if not (np.isfinite(v["gain_ucb"]) and v["gain_ucb"] >= -float(guard_floor)))
+    if lost:
+        return _v(False, f"guard regression: confidently worse (UCB below -{guard_floor}) on "
+                         f"{lost}", gain=gain, gain_lcb=lcb)
+    bad = [f"{s_}:{r.key}{'<' if r.under else '>'}" for s_ in gated if not cov[s_].passed
+           for r in cov[s_].rows if r.gated and (r.under or r.over)]
+    if bad:
+        return _v(False, f"coverage gate failed at {bad}", gain=gain, gain_lcb=lcb)
+    return _v(True, "win", gain=gain, gain_lcb=lcb)
+
+
 __all__ = [
+    "composite_gain_detail", "judge_composite", "block_ohlcv", "garman_klass_vol_bp",
+    "level_scale", "gift_season", "seasonal_naive_scale",
     "MIN_CONTEXT", "KNOWN_COVARIATES", "MktWindow", "PAST_COVARIATES", "adv", "alpha_price", "basis_bp",
     "build_covariates", "calendar_rows", "corwin_schultz_spread_bp", "cut_windows",
     "dollar_volume", "funding_bp", "log_depth", "session_rows", "suite_series",
     "window_geometry", "window_id", "window_coverage_counts", "coverage_from_counts",
     "window_tail_counts", "cell_sums", "clustered_gain_detail",
-    "BP", "CoverageGate", "CoverageRow", "SuiteVerdict", "clustered_gain", "combine_gates",
+    "CROSS_SERIES", "event_rows", "BP", "CoverageGate", "CoverageRow", "SuiteVerdict", "clustered_gain", "combine_gates",
     "coverage_gate", "crps_quantile", "spread_select",
     "eligible_mask", "funding_change_bp", "interval_coverage", "judge_suite", "log_returns_bp",
     "log_volume", "map_quantiles", "mase_median", "pinball", "qlike", "range_excursions",
     "rank_auc", "rank_ic", "realized_vol_bp", "to_repo_levels", "window_crps",
-    "window_eligible",
+    "window_eligible", "window_median_ae", "window_qlike_logvol", "window_tail_score",
 ]

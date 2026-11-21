@@ -184,12 +184,14 @@ def cmd_lane_c_test(args):
 
 def test_lane_c(args, cfg):
     from ..eval.timestral_adapter import TimestralQuantileForecaster, verify_checkpoint
-    from ..pool.marketcast import load_snapshot, snapshot_windows, window_covariates
-    from ..shared.config.marketcast import COVERAGE_GATE_SUITES
+    from ..pool.marketcast import load_snapshot, target_windows, window_covariates
+    from ..shared.config.marketcast import COVERAGE_GATE_SUITES, base_suite
     from ..shared.marketcast_recipe import parse_marketcast_recipe
     from ..shared.marketcast_report import (
         MktEntryRows,
         MktWindowRow,
+        baseline_scores,
+        guard_scores,
         score_windows,
         verdict_from_rows,
     )
@@ -211,7 +213,7 @@ def test_lane_c(args, cfg):
     if (train.t0 < start or train.end > end or heldout.t0 < train.end
             or coarse_start < start or coarse_end > end or coarse_end > heldout.t0):
         raise ValueError("Training snapshot must lie inside recipe dates; held-out snapshot must start after training ends.")
-    windows = snapshot_windows(heldout, mc, recipe.suite, after=train.end)
+    windows = target_windows(heldout, mc, recipe.suite, after=train.end)
     if not windows:
         raise ValueError("No forward held-out windows; check snapshot coverage, liquidity filters and context length.")
     verify_checkpoint(args.base_dir / "model.safetensors", mc.base_sha256)
@@ -220,7 +222,8 @@ def test_lane_c(args, cfg):
     def predict(covariates):
         result = []
         for w in windows:
-            past, known = window_covariates(heldout, w, covariates, context_length=mc.eval_context_length)
+            past, known = window_covariates(heldout, w, covariates, context_length=mc.eval_context_length,
+                                            event_times=tuple(mc.event_times))
             result.append(forecaster.forecast_quantiles(w.context, w.steps, past_covariates=past, future_covariates=known))
         return result
 
@@ -248,10 +251,15 @@ def test_lane_c(args, cfg):
         candidate_q = predict(recipe.covariates)
     rows = score_windows([w.target for w in windows], base_q, candidate_q,
                          knots=mc.quantile_knots, coverage_levels=mc.coverage_levels,
-                         tail_levels=mc.tail_levels, gated=recipe.suite in COVERAGE_GATE_SUITES)
+                         tail_levels=mc.tail_levels,
+                         gated=[base_suite(w.suite) in COVERAGE_GATE_SUITES for w in windows],
+                         scales=[w.scale for w in windows])
+    gs = guard_scores([w.target for w in windows], base_q, candidate_q, knots=mc.quantile_knots,
+                      guards=[mc.guards_of(w.suite) for w in windows], scales=[w.scale for w in windows])
+    bls = baseline_scores(windows, knots=mc.quantile_knots)
     entry = MktEntryRows(hotkey="local", trained_pointer="local", target=args.target, phase="judge", after=train.end,
-                         windows=tuple(MktWindowRow(wid=w.wid, base=b, ft=f, cov_in=ci, cov_n=cn, tail=tail)
-                                       for w, (b, f, ci, cn, tail) in zip(windows, rows, strict=True)))
+                         windows=tuple(MktWindowRow(wid=w.wid, base=b, ft=f, cov_in=ci, cov_n=cn, tail=tail, **g, bl=x)
+                                       for w, (b, f, ci, cn, tail), g, x in zip(windows, rows, gs, bls, strict=True)))
     verdict = verdict_from_rows(entry, mc, suite=recipe.suite, k=1, seed=f"local:{args.seed}")
     return {"directional_only": True, "target": args.target, "seed": args.seed,
             "base_ref": mc.base_ref, "base_sha256": mc.base_sha256,

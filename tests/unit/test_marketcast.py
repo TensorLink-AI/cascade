@@ -38,16 +38,23 @@ from cascade.shared.netconfig import NetConfigError, check_overrides
 
 @pytest.mark.parametrize("toml", ["chain.toml", "chain.testnet.toml"])
 def test_shipped_tables_parse_inert(toml):
+    """Testnet ships MarketCast off; mainnet arms it at 9579600 (owner
+    2026-11-20) and is inert before that block."""
     cfg = load_chain_config(toml)
     mc = cfg.marketcast
-    assert mc.from_block == 0 and not mc.active(10**9)
-    assert mc.target_suites == ()
-    assert mc.suites == ("returns", "vol") and mc.base_arch == "timestral"
+    fb = 9579600 if toml == "chain.toml" else 0
+    assert mc.from_block == fb and mc.active(10**9) == bool(fb)
+    assert not mc.active(fb - 1)
+    assert mc.target_suites == (("market",) if fb else ())
+    from cascade.shared.config.marketcast import COMPOSITE_LAUNCH_SUITES
+
+    assert mc.suites == COMPOSITE_LAUNCH_SUITES and mc.base_arch == "timestral"
     assert mc.pool_prefix == "pool_mkt" and mc.gain_margin == 0.01
     assert mc.quantile_knots == TIMESTRAL_KNOTS and len(TIMESTRAL_KNOTS) == 21
-    # MarketCast-only lane C: the shipped targets are exactly its suites
+    # MarketCast-only lane C: the shipped target is its ONE composite slot
+    # (owner 2026-11-10)
     assert all(is_mkt_target(t) for t in cfg.lane_c.targets)
-    assert tuple(t.split(":", 1)[1] for t in cfg.lane_c.targets) == mc.suites
+    assert mc.composite and tuple(cfg.lane_c.targets) == mc.targets == ("mkt:market",)
 
 
 def test_missing_table_is_the_default():
@@ -103,7 +110,8 @@ def test_loader_refuses_arming_without_lane_c(tmp_path):
     from pathlib import Path
 
     text = (Path(__file__).resolve().parents[2] / "chain.toml").read_text(encoding="utf-8")
-    old = "from_block         = 0                          # off; an era-boundary block arms it"
+    old = ("from_block         = 9579600                    # owner 2026-11-20: era boundary "
+           "~ Tue 24 Nov 22:23 UTC (Wed 09:23 AEDT)")
     assert old in text
     p = tmp_path / "chain.toml"
     p.write_text(text.replace(old, "from_block = 7200000"), encoding="utf-8")
@@ -203,12 +211,18 @@ def test_mkt_targets_only_with_config():
 
 
 def test_shipped_marketcast_cannot_admit_mkt_targets():
-    """Off ⇒ the intake / commit / recipe surfaces admit no mkt: target,
-    while the shipped [lane_c] targets still load (they are inactive)."""
-    cfg = load_chain_config("chain.toml")
+    """Off (testnet) ⇒ the intake / commit / recipe surfaces admit no mkt:
+    target, while the shipped [lane_c] targets still load (they are inactive).
+    Armed (mainnet, 9579600) ⇒ only the composite mkt:market is admitted."""
+    cfg = load_chain_config("chain.testnet.toml")
+    for t in ("mkt:returns", "mkt:market"):
+        with pytest.raises(ValueError):
+            check_target(t, mkt_suites=cfg.marketcast.target_suites)
+    assert cfg.lane_c.targets == ("mkt:market",)
+    main = load_chain_config("chain.toml")
+    assert check_target("mkt:market", mkt_suites=main.marketcast.target_suites) == "mkt:market"
     with pytest.raises(ValueError):
-        check_target("mkt:returns", mkt_suites=cfg.marketcast.target_suites)
-    assert cfg.lane_c.targets == ("mkt:returns", "mkt:vol")
+        check_target("mkt:returns", mkt_suites=main.marketcast.target_suites)
 
 
 # ── recipe ──────────────────────────────────────────────────────────────────
@@ -576,18 +590,21 @@ def test_miner_cli_refuses_mkt_while_inactive(tmp_path):
 
     from cascade.miner.lane_c import mkt_inactive, recipe_error
 
-    cfg = load_chain_config("chain.toml")
+    cfg = load_chain_config("chain.testnet.toml")      # ships MarketCast off
     assert "not active" in mkt_inactive(cfg, "mkt:returns")
     assert mkt_inactive(cfg, "domain:energy") is None
     from cascade.shared.config.lane_c import parse_lane_c as _plc
 
-    armed = replace(cfg, marketcast=replace(cfg.marketcast, from_block=7200),
+    # the per-suite shape (composite = false) admits mkt:returns
+    armed = replace(cfg, marketcast=replace(cfg.marketcast, from_block=7200, composite=False,
+                                            suites=("returns", "vol")),
                     lane_c=_plc({"targets": ["mkt:returns"]}, mkt_suites=("returns", "vol")))
     d = tmp_path / "tree"
     d.mkdir()
     assert "marketcast.json" in recipe_error(armed, d, "mkt:returns")
     (d / "marketcast.json").write_text(_json.dumps(_recipe(
         data={"assets": {"crypto": ["BTC"]}, "class_weights": {"crypto": 1.0},
-              "frequencies": ["1m"], "start": "2024-01-01", "end": "2024-06-01"})))
+              "frequencies": ["1m"], "start": "2024-01-01", "end": "2024-06-01"},
+        horizon_mix={"1hx48": 1.0, "1dx7": 0.5})))
     assert recipe_error(armed, d, "mkt:returns") is None
     assert "not active" in recipe_error(replace(cfg, lane_c=armed.lane_c), d, "mkt:returns")

@@ -226,7 +226,7 @@ def test_lane_c_upload_returns_an_immutable_ref_without_committing(cfg, monkeypa
 def test_snapshot_command_limits_public_download_to_recipe_assets(cfg, monkeypatch, tmp_path, capsys):
     from cascade.miner.starter import marketcast_starter
 
-    recipe = marketcast_starter(cfg.marketcast, "mkt:returns")
+    recipe = marketcast_starter(cfg.marketcast, "mkt:market")
     (tmp_path / "marketcast.json").write_text(json.dumps(recipe))
     calls = []
 
@@ -240,7 +240,7 @@ def test_snapshot_command_limits_public_download_to_recipe_assets(cfg, monkeypat
     assert {k: list(v) for k, v in calls[0].items()} == recipe["data"]["assets"]
 
 
-@pytest.mark.parametrize("lane,target", [("a", None), ("b", "energy"), ("c", "mkt:returns")])
+@pytest.mark.parametrize("lane,target", [("a", None), ("b", "energy"), ("c", "mkt:market")])
 def test_starters_work_offline_and_never_overwrite(cfg, monkeypatch, tmp_path, capsys, lane, target):
     monkeypatch.setattr("urllib.request.urlopen", lambda *a, **kw: pytest.fail("network access"))
     path = tmp_path / "entry"

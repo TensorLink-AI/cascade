@@ -46,6 +46,10 @@ def env(tmp_path):
     cfg = replace(cfg, v2=replace(cfg.v2, from_block=gate),
                   training=replace(cfg.training, v2_from_block=gate),
                   lane_b=replace(cfg.lane_b, from_block=gate + 1, share=0.5),
+                  # the shipped lane C / MarketCast block (9579600) precedes this
+                  # fixture's v2 gate; these receipts carry no lane-C payout record
+                  lane_c=replace(cfg.lane_c, from_block=0),
+                  marketcast=replace(cfg.marketcast, from_block=0),
                   validator=replace(cfg.validator, state_db_path=str(tmp_path / "s.json")))
     return cfg, gate, era
 

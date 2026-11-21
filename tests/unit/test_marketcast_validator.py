@@ -545,7 +545,7 @@ def test_deterministic_meta_error_is_a_fault_never_a_hold(cfg, tmp_path):
     store = _Store()
     es = [_entry("alice"), _entry("dave")]
     r = _runner(cfg, tmp_path / "v", store, lambda b: s1, history=_history(es))
-    r._covs[_ptr("alice")] = ("open_interest",)      # not in the allow-list / no builder
+    r._covs[_ptr("alice")] = ("sentiment",)      # not in the allow-list / no builder
     orig = r.mkt_forecaster_fn
 
     def _fc(key):
@@ -558,7 +558,7 @@ def test_deterministic_meta_error_is_a_fault_never_a_hold(cfg, tmp_path):
     got = _judge(r, _settle(store, "1002", [], prev="1001", block=BLOCK + EB,
                             reports={"1001": _recorded(store, "1001")}))
     a, d = got[("alice", "judge", "")], got[("dave", "judge", "")]
-    assert a["stage"] == "fault" and "open_interest" in a["reason"]
+    assert a["stage"] == "fault" and "sentiment" in a["reason"]
     assert d["stage"] == "fault" and not d["passed"]
 
 

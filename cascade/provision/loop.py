@@ -91,7 +91,7 @@ POD_TAG = "cascade-"                       # every rented pod's name starts with
 # matched them would reap the live king mid-leg (it can't see the trainer's
 # ledger). heat/final stay in the pattern so a ledger leftover of the retired
 # per-round fleet is still reaped.
-_PROVISIONER_POD_RE = re.compile(r"^cascade-\d+-(heat|final|eval)(-|$)")
+_PROVISIONER_POD_RE = re.compile(r"^cascade-\d+-(heat|final|eval|mkt)(-|$)")
 # The exact lane-name shape render_hosts_toml gives THIS service's pods
 # (``cascade-<round>-<stage>-<i>-g<g>``, integer slot). A hosts.toml entry of
 # that shape whose pod is not in the ledger is a stale self-published lane
@@ -221,6 +221,16 @@ class ProvisionerLoop:
     # ``<prefix>round-<manifest_round_id>.json``. Empty ⇒ receipts are never
     # seen and the newer-manifest / TTL signals bound the pod's life instead.
     receipt_prefix: str = ""
+    # The MAIN validator's MarketCast hosts file (``--mkt-eval-hosts``): the
+    # mkt pod is published here and cleared on teardown. The validator asks
+    # for the pod with a request file beside it (``<path>.request``,
+    # :mod:`cascade.validator.mkt_offload`), touched while it waits/computes.
+    # None disables the stage even when a [provisioner.mkt] policy exists.
+    mkt_hosts_path: Path | None = None
+    # A request whose mtime is older than this is a dead validator's: ignored.
+    mkt_request_stale_s: float = 1800.0
+    # After a failed/capacity-less rent, the next attempt waits this long.
+    mkt_retry_s: float = 600.0
     health_check: Callable[[PodAddress, str], HealthReport] | None = None
     # Provisions a bare pod over SSH (rsync source + uv sync) before the health
     # gate — the testnet path while no digest-pinned worker image is published.
@@ -268,6 +278,9 @@ class ProvisionerLoop:
     _last_heartbeat_at: float = field(default=0.0, init=False, repr=False)
     _eval_inflight: bool = field(default=False, init=False, repr=False)
     _eval_thread: object = field(default=None, init=False, repr=False)
+    _mkt_inflight: bool = field(default=False, init=False, repr=False)
+    _mkt_thread: object = field(default=None, init=False, repr=False)
+    _mkt_retry_at: float = field(default=0.0, init=False, repr=False)
     _state_lock: object = field(default_factory=__import__("threading").RLock,
                                 init=False, repr=False)
     # The eval stage's rent-once latch: the manifest round an eval pod was
@@ -352,6 +365,7 @@ class ProvisionerLoop:
                 self.on_cycle()
         self._maybe_apply_activation(block)
         self._maybe_provision_eval()
+        self._maybe_provision_mkt()
 
     @staticmethod
     def _with_deadline(fn, seconds: float):
@@ -665,7 +679,7 @@ class ProvisionerLoop:
         t.start()
 
     def _regate_adopted(self, insts: tuple[PodInstance, ...]) -> None:
-        dropped_fleet = dropped_eval = False
+        dropped_fleet = dropped_eval = dropped_mkt = False
         for inst in insts:
             prov = self.providers.get(inst.provider)
             if prov is None:
@@ -683,6 +697,8 @@ class ProvisionerLoop:
             self._terminate_and_drop(prov, inst.instance_id)
             if inst.stage == "eval":
                 dropped_eval = True
+            elif inst.stage == "mkt":
+                dropped_mkt = True
             else:
                 dropped_fleet = True
         # Same split as the teardown sweep: each hosts file re-renders only
@@ -692,6 +708,8 @@ class ProvisionerLoop:
             self._republish_from_ledger()
         if dropped_eval:
             self._clear_eval_hosts()
+        if dropped_mkt:
+            self._clear_mkt_hosts()
 
     def _regate_one(self, prov: object, inst: PodInstance) -> bool:
         """One adopted pod through the existing gate, with a bounded retry.
@@ -1039,6 +1057,109 @@ class ProvisionerLoop:
         except Exception:  # noqa: BLE001 — not published yet (or store down: TTL backstops)
             return False
 
+    # ── MARKETCAST POD (request-file triggered elastic stage) ────────────────
+
+    @property
+    def _mkt_enabled(self) -> bool:
+        return (self.policy.mkt is not None and self.policy.mkt.max_pods > 0
+                and self.mkt_hosts_path is not None)
+
+    @property
+    def mkt_request_path(self) -> Path | None:
+        from ..validator.mkt_offload import request_path_for
+
+        return request_path_for(self.mkt_hosts_path) if self.mkt_hosts_path else None
+
+    def _mkt_requested(self) -> bool:
+        """The main validator's MarketCast request is live: the file exists and
+        was touched within ``mkt_request_stale_s`` (a crashed validator's
+        leftover never rents)."""
+        if self.mkt_request_path is None:
+            return False
+        from ..validator.mkt_offload import request_paths
+
+        for p in request_paths(self.mkt_hosts_path):   # every competition sharing the pod
+            try:
+                age = self.clock() - p.stat().st_mtime
+            except OSError:
+                continue
+            if age <= float(self.mkt_request_stale_s):
+                return True
+        return False
+
+    def _maybe_provision_mkt(self) -> None:
+        """Rent the MarketCast pod while the validator's request is live and
+        none is owned (one pod; a failed rent waits ``mkt_retry_s``). The
+        rows wait (never lost, never charged) until the pod is published."""
+        if not self._mkt_enabled or self._mkt_inflight or not self._mkt_requested():
+            return
+        if self._state is not None and instances_for_stage(self._state, "mkt"):
+            return
+        now = self.clock()
+        if now < self._mkt_retry_at:
+            return
+        self._mkt_retry_at = now + float(self.mkt_retry_s)
+        sp = self.policy.mkt
+        picked = self._pick_offer(sp, 1, "mkt")
+        if picked is None:
+            log.error("marketcast pod: no provider has capacity; the validator's rows "
+                      "wait (retried in %.0fs)", self.mkt_retry_s)
+            return
+        prov, price, cand, pods = picked
+        worst = price * pods * float(self.policy.mkt_lease_hours)
+        if worst > self.policy.max_spend_per_round:
+            log.warning("marketcast pod: skipped by budget — $%.2f > cap $%.2f",
+                        worst, self.policy.max_spend_per_round)
+            return
+        if self.dry_run:
+            log.info("[dry-run] marketcast: WOULD rent %d × %d-GPU %s pod on %s @ $%.2f/hr "
+                     "(tag cascade-<n>-mkt, lease %.1fh)", pods, cand.gpus_per_pod, cand.sku,
+                     prov.name, price, self.policy.mkt_lease_hours)
+            return
+        tag = str(int(now))
+        with self._state_lock:
+            if self._state is None:              # a fresh service: no ledger yet
+                self._state = RoundState(round_id="")
+
+        def _rent_mkt() -> None:
+            try:
+                healthy = self._rent_stage(tag, "mkt", prov, cand, pods)
+                if not healthy:
+                    log.error("marketcast pod: every rented pod failed its health gate; "
+                              "the validator's rows wait")
+                    return
+                self._publish_mkt_hosts(tag, healthy)
+            except Exception as e:  # noqa: BLE001 — a failed rent never kills the loop
+                log.exception("marketcast pod provisioning failed: %s", e)
+            finally:
+                self._mkt_inflight = False
+
+        self._mkt_inflight = True
+        t = threading.Thread(target=_rent_mkt, name=f"mkt-rent-{tag}", daemon=True)
+        self._mkt_thread = t                     # tests join() for determinism
+        t.start()
+
+    def _publish_mkt_hosts(self, tag: str, entries: list[tuple[PodInstance, PodAddress]]) -> None:
+        """The mkt pod into the VALIDATOR's MarketCast hosts file only
+        (``stage="any"``, atomic — the validator re-reads it while it waits)."""
+        inst = entries[0][0]
+        prof = self.render.profile_for(inst.provider)
+        text = render_hosts_toml(
+            [addr for _inst, addr in entries],
+            key_path=self.render.key_path, forward_env=self.render.forward_env,
+            remote_python=prof.remote_python, workdir=prof.workdir, user=prof.user,
+            chain_toml=self.render.chain_toml, name_prefix=f"{POD_TAG}{tag}-mkt",
+            provider=inst.provider, stage="any",
+            gpus_per_pod=inst.gpus or self._stage_gpus("mkt"))
+        write_hosts(self.mkt_hosts_path, text)
+        log.info("published %s: marketcast pod %s", self.mkt_hosts_path, inst.instance_id)
+
+    def _clear_mkt_hosts(self) -> None:
+        if self.mkt_hosts_path is None:
+            return
+        clear_hosts(self.mkt_hosts_path)
+        log.info("cleared %s (marketcast pod gone)", self.mkt_hosts_path)
+
     # ── WATCH + TEARDOWN ─────────────────────────────────────────────────────
 
     def _teardown_due_pods(self) -> None:
@@ -1057,14 +1178,18 @@ class ProvisionerLoop:
             latest = self._latest_round_id()
             newer = (bool(self._last_evaled_round) and latest is not None
                      and latest != self._last_evaled_round)
+        mkt_idle = (any(i.stage == "mkt" for i in self._state.instances)
+                    and not self._mkt_inflight and not self._mkt_requested())
         dead: set[str] = set()
         for inst in self._state.instances:
+            ttl = (float(self.policy.mkt_lease_hours) if inst.stage == "mkt"
+                   else self.ttl_hours)
             if not teardown_due(inst.stage, receipt_seen=receipt, newer_manifest=newer,
-                                rented_at=_iso_ts(inst.rented_at_iso), now=now,
-                                ttl_hours=self.ttl_hours):
+                                mkt_idle=mkt_idle, rented_at=_iso_ts(inst.rented_at_iso),
+                                now=now, ttl_hours=ttl):
                 continue
-            log.info("tearing down %s pod %s (receipt=%s newer=%s ttl=%.1fh)",
-                     inst.stage, inst.instance_id, receipt, newer, self.ttl_hours)
+            log.info("tearing down %s pod %s (receipt=%s newer=%s mkt_idle=%s ttl=%.1fh)",
+                     inst.stage, inst.instance_id, receipt, newer, mkt_idle, ttl)
             prov = self.providers.get(inst.provider)
             if prov is None:
                 log.error("no adapter for provider %r — pod %s may be LEAKED",
@@ -1083,15 +1208,19 @@ class ProvisionerLoop:
         if dead:
             dead_eval = {i.instance_id for i in self._state.instances
                          if i.instance_id in dead and i.stage == "eval"}
+            dead_mkt = {i.instance_id for i in self._state.instances
+                        if i.instance_id in dead and i.stage == "mkt"}
             with self._state_lock:
                 self._state = drop_instances(self._state, dead)
                 self._save()
             # Each hosts file re-renders only when ITS pods died: the trainer's
             # file must never be touched by eval churn, and vice versa.
-            if dead - dead_eval:
+            if dead - dead_eval - dead_mkt:
                 self._republish_from_ledger()
             if dead_eval:
                 self._clear_eval_hosts()
+            if dead_mkt:
+                self._clear_mkt_hosts()
 
     def _latest_round_id(self) -> str | None:
         if self.manifest_store is None:
@@ -1118,7 +1247,7 @@ class ProvisionerLoop:
         lost track of," not "pods that look cascade-related." And like every
         provider mutation, termination is gated on ``dry_run``.
         """
-        if self._eval_inflight:
+        if self._eval_inflight or self._mkt_inflight:
             # A rent worker is between a provider's create call and its
             # ledger write-ahead at unpredictable moments — reaping now could
             # kill a pod that is owned but not yet recorded. Skipping a tick
