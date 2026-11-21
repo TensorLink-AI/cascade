@@ -1,4 +1,6 @@
-"""Lane D (DEC-CA-0062) is wired as an inert placeholder."""
+"""Lane D (LANE_D_PLAN W2): the shipped tables load unarmed; arming is an
+era-boundary ``from_block`` (by signed overlay), and the DEC-CA-0062 keys
+are still validated."""
 
 import pytest
 
@@ -13,9 +15,13 @@ def test_shipped_tables_parse_inert(toml):
     assert not ld.active(10**9)
 
 
-def test_arming_is_refused_until_implemented():
-    with pytest.raises(ValueError, match="not implemented"):
-        parse_lane_d({"from_block": 9_000_000})
+def test_arming_needs_an_era_boundary():
+    era = lambda _b: 3600  # noqa: E731
+    ld = parse_lane_d({"from_block": 9_000_000}, era_blocks_at=era)
+    assert ld.from_block == 9_000_000
+    assert not ld.active(9_000_000) and ld.active(9_000_900)
+    with pytest.raises(ValueError, match="era boundary"):
+        parse_lane_d({"from_block": 9_000_001}, era_blocks_at=era)
 
 
 @pytest.mark.parametrize("raw", [

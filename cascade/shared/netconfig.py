@@ -85,6 +85,9 @@ ALLOWED: dict[str, frozenset[str] | None] = {
     "eval": None,
     "lane_b": None,
     "lane_c": None,
+    # LANE_D_PLAN §14.2: every lane D tuning key (activation, kill switch,
+    # judging, court, rate limits, TTLs); remainder stays release-only below.
+    "lane_d": None,
     # the [round] SCHEDULE: the grid and its seam, the DEC-CA-0043 rollover,
     # the era length, the blocked-hotkey gate and the commit floor
     "round": frozenset({
@@ -207,7 +210,8 @@ def check_overrides(overrides: object) -> dict:
             continue
         allowed = ALLOWED[table]
         for key, value in kv.items():
-            if (table, key) in (("scoring", "burn_uid"), ("lane_b", "remainder")):
+            if (table, key) in (("scoring", "burn_uid"), ("lane_b", "remainder"),
+                                ("lane_c", "remainder"), ("lane_d", "remainder")):
                 bad.append(f"[{table}] {key} (burn destination is release-only)")
             elif isinstance(value, dict) and table in ("v2",):
                 bad.append(f"[{table}.{key}] (nested tables are release-only)")

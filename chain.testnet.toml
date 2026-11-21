@@ -918,14 +918,45 @@ stale_after_blocks = 3600          # one MAINNET era (= 6 eras on this 600-block
 poll_seconds       = 60            # how often the main validator's receipts are re-read
 max_walk           = 64            # receipts walked back per poll to reach the last replayed one
 
-# ── Lane D: distillation / real data (DEC-CA-0062) — WIRED, NOT IMPLEMENTED ──
-# Placeholder table so config, overlays and dashboards have a home for it.
-# from_block > 0 is REFUSED at load until the DEC is filled in and the trainer
-# + validator halves ship. Owner fills in targets, teacher and real corpus.
+# ── Lane D: open weights (LANE_D_PLAN §1, §14.2; DEC-CA-0062) — SHIPPED OFF ──
+# from_block = 0: never active, no digest/receipt/weight moves (invariant 1).
+# Activation is a SIGNED OVERLAY setting from_block (an era boundary; D10/D45),
+# never an edit here and never a DEC-CA-0045 vote. Kill switch: an overlay
+# until_block or share = 0. Every key but remainder is overlay-settable.
 [lane_d]
-from_block      = 0              # refused > 0 until implemented
-share           = 0.0            # of the total, carved from takes_from
+from_block      = 0              # 0 = off; arm by signed overlay at an era boundary
+until_block     = 0              # 0 = no end; an era boundary after from_block closes the lane
+share           = 0.0            # of the total, carved from takes_from (D1: 0.25 from lane_a by overlay)
 takes_from      = "lane_b"       # lane_a | lane_b | lane_c
+remainder       = "burn"         # release-only burn destination (D21)
+contexts        = [4096, 8192, 16384]  # D2 launch set; subset of 4k..128k (cap 131072)
+horizon         = 64             # points; <= 512 (§1.1)
+dtypes          = ["BF16"]       # D14: BF16 only
+forward_margin_hours = 6.0       # D5
+min_windows     = 1000           # D5
+min_clusters    = 20             # D5: sources
+min_long_series = 300
+max_source_share = 0.25          # B14
+d_margin        = 0.01           # D5
+alpha           = 0.05
+bootstrap_B     = 10000
+gate_suites     = ["gift", "boom", "time", "fev"]  # §16 names
+gate_weights    = { gift = 1.0, boom = 1.0, time = 1.0, fev = 1.0 }  # D2b: equal (absent = equal over gate_suites)
+tau_public      = 0.01
+lowfreq_freqs   = ["D", "W", "M", "ME", "MS", "Q", "QE", "QS", "A", "Y", "YE"]  # A10: daily and slower
+reward_prior_kings = 2           # D7
+king_decay      = 0.5            # D7
+confirm_on_king_change = "restart"  # D20 (a)
+max_entries_per_settlement = 8   # D3
+max_open_per_coldkey = 2         # D3
+max_judged_per_coldkey_per_settlement = 2  # A8
+max_coldkey_unresolved_settlements = 4     # A8
+max_reveal_delay_days = 14       # A9
+max_bench_holds = 4
+loser_ttl_eras  = 4              # D8
+max_mirror_lag_hours = 6.0       # A1
+ready_ttl_blocks = 7200          # B10: ~24 h at 12 s blocks
+# DEC-CA-0062 keys, still parsed and carried as written.
 targets         = []             # TBD
 teacher_ref     = ""             # TBD: the teacher to distil from
 teacher_api     = "ephemeris"    # owner: Ephemeris TS foundation-model API (validators never call it)

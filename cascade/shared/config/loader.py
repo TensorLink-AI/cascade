@@ -739,7 +739,12 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
                     **parse_v2_economics(v2raw)),
         generation=generation,
         lane_c=lane_c,
-        lane_d=parse_lane_d(raw.get("lane_d", {})),
+        # LANE_D_PLAN §14.2: an armed / ending block is an era boundary on the
+        # grid in force at it (activation by signed overlay, as lanes B and C).
+        lane_d=parse_lane_d(
+            raw.get("lane_d", {}),
+            era_blocks_at=lambda b: max(1, _ebp if (_eab and _ebp and 0 < b < _eab) else _eb)
+            * max(1, _era_settlements)),
         marketcast=marketcast,
         netconfig=parse_netconfig(raw.get("netconfig"), activation_feature=_act_feature),
         raw=raw,
