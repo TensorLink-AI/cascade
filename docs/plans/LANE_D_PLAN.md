@@ -748,11 +748,14 @@ every challenger shares one window draw and the king's scores
 
   There's no "best-ever miner king" ratchet. A contaminated king would set an
   inflated best-ever and block honest successors. The house is the anchor.
-- **Unselected suite:** TIME is never drawn. It's swept for each new king and
-  only published.
-  - It's **unselected, not unbiased**. TIME is public, so miners can train on
-    it too.
-  - If TIME falls for 3 kings in a row, that's an alert and an owner review.
+- **(rev3) Held-out suite = the cross-lane rotating sentinel (§16).** The
+  v2 fixed "TIME unselected" is replaced.
+  - Each era one suite is the held-out **sentinel** for all lanes (A, B and
+    D).
+  - Lane D's drawn gate suite comes from the remaining suites.
+  - The sentinel is swept for each new KING_D and published only.
+  - If the sentinel falls for 3 kings in a row, that's an alert and an owner
+    review.
 - **Faults:** a candidate whose sweep errors, returns partial, NaN or a
   missing metric is a **`checkpoint_fault`, the miner's fault** (T17).
   - Suite identity is verified per drawn suite. Scope-skips are not
@@ -1327,7 +1330,7 @@ capability release → stake-proven shadow → pay.**
 
 | # | Stage | Work | Exit gate (all must hold) |
 |---|---|---|---|
-| 1 | **S0 Decide** | D1–D24 (+ the §15 incentive [DECIDE]s) (§6) in writing; W0 | All answered |
+| 1 | **S0 Decide** | D1–D35 (incl. the §15 incentive [DECIDE]s and the §16 sentinel) (§6) in writing; W0 | All answered |
 | 2 | **S0a De-drift** | Classify the 21 `LIVE OVERRIDE`s in the deployed chain.toml: main, overlay, or documented operator-only; type the decided blocks in main. Overlays merge onto **each node's own base** (`build_config(base, body)` merges onto `effective_raw(base)`, `netconfig.py:346-354`), so base drift survives any overlay | `cascade-audit decided --config /root/cascade/chain.toml` = 0 drift; the validator-read consensus-key diff between deployed and main is empty |
 | 3 | **S0b Note budget** | Decode the live mainnet readiness notes and add the `cfg-` segment. It's trimmed **last** (`activation.py:1334-1357`), so older pending segments go first | No still-pending segment would be trimmed (type their decided blocks in main first if needed); T22 passes on testnet |
 | 4 | **S0c Overlay bring-up** | Publish a **benign seq-1 overlay** (restates current values only) on testnet, then mainnet. Then a deliberately refused overlay on testnet | The 404-every-poll is gone. Fetched from S3 **and** the HF mirror by our validator, the trainer and satellites. `cfg-` lock ≥ 51% in `status/chain.json`. Receipts stamp `netconfig_seq`; the `cascade-audit` netconfig check passes; the trainer logs the same apply block. The refused overlay applies nothing |
@@ -1364,7 +1367,7 @@ cross-checked from two sources. There are past off-by-ones (§13).
 |---|---|---|
 | D1 | Share and source | 20% from lane A, burn remainder; with B and C armed: A 30 / B 25 / C 25 / D 20 |
 | D2 | Context variants | **(rev3)** Launch arms {4k, 8k, 16k}. {32k, 64k, 128k} arm at **S8** by overlay (`contexts`), each only after T7 and W1 `min_long_series` (owner goal 128k kept) |
-| D2b | Gate | GIFT/BOOM/FEV drawn equally; TIME unselected; `tau_public` 0.01; anchors = KING_D and house |
+| D2b | Gate | **(rev3)** One gate suite drawn per crowning from the suites **not** held out this era; the held-out suite is the §16 cross-lane sentinel (replaces fixed "TIME unselected"); `tau_public` 0.01; anchors = KING_D and house |
 | D3 | Rate limits | 1 open per hotkey; 2 open per coldkey; 8 judged per settlement |
 | D4 | Eval fee | None at launch |
 | D5 | Margins and floors | `d_margin` 0.01 (level units, re-checked by T14); `forward_margin` 6 h; 1000 windows / 20 sources |
@@ -1387,6 +1390,9 @@ cross-checked from two sources. There are past off-by-ones (§13).
 | D22 | **(rev3)** Coldkey resolution | (b) record at `/v1/lane-d/ready`, re-check at reveal, carry in the signed report (**recommended**); (a) archive-state resolution at T |
 | D23 | **(rev3)** Loser re-scoring | (ii) targets, window ids, `rows_sha256` and bootstrap verifiable; histories private (**default, as v2**); (i) publish `pool_d_hist` after the dispute window |
 | D24 | **(rev3)** Per-era false-crown target (sets `d_margin` via B1) | 5% recommended (OA3); `d_margin` stays 0.01 until B1 runs |
+| D33 | **(rev3)** Cross-lane rotating sentinel (§16) | **Adopt**: one suite per era, drawn from the era-boundary block hash, held out of every gate and target in lanes A, B and D, swept and published for every new king. Alternative: no sentinel (v2: lane A gates all four; lane D holds TIME out) |
+| D34 | **(rev3)** Sentinel ratchet vs the house | **Optional, recommended on**: every lane's candidates must not fall below the current lane A king on the sentinel by more than `sentinel_tau` (0.01), re-scored paired on one host. Off = the sentinel is publish-only, and a regression on it alone is never blocked |
+| D35 | **(rev3)** Sentinel vs DEC-CA-0069 (pending: PR #482) lane B suite targets | While a suite is the sentinel it is **not** a lane B target or guard that era. Entries already declared on it are judged on the remaining suites, or deferred to the next era. Recommended: **defer** (the target stays honest) |
 
 ---
 
@@ -1755,6 +1761,7 @@ we drifted into relying on hand-edited files and ad-hoc satellite updates.
 |---|---|---|
 | New code (lane D scorer, report schema, replay rules, intake, audit) | **One capability release** | Update **once** |
 | Lane D tuning: `from_block`, `until_block`, `share`, `takes_from`, `contexts`, `horizon`, `forward_margin_hours`, floors, `d_margin`, `alpha`, `bootstrap_B`, `gate_suites`, `gate_weights`, `unselected_suite`, `tau_public`, court, rate limits, TTLs, `max_bench_holds`, **(rev3)** `max_mirror_lag_hours`, `confirm_on_king_change`, `max_judged_per_coldkey_per_settlement`, `max_coldkey_unresolved_settlements`, `max_reveal_delay_days`, `lowfreq_freqs` | **Signed overlay** (add `ALLOWED["lane_d"] = None` minus `remainder`, which stays release-only as a burn destination, the same rule as `lane_b.remainder`) | **None**: nodes poll every 300 s, adopt by stake, apply at `effective_block` |
+| **(rev3)** Cross-lane sentinel (§16): `[v2] sentinel_from_block`, `sentinel_suites`, `sentinel_ratchet`, `sentinel_tau` | **Signed overlay** once the capability release adds them to `ALLOWED["v2"]` (`netconfig.py:99-108`) | None after that release |
 | Activation | Overlay types `[lane_d] from_block` (at an era boundary, as lanes B and C allow today) | None |
 | Kill switch | Overlay sets `until_block` or `share = 0` | None |
 | Main-validator-only operations (vault bucket, `pool_d` location, eval host, sub tokens, bench queue policy) | A **non-consensus** `[lane_d_ops]` table read only by our main validator and the lane D intake; satellites never read it | Our main validator only |
@@ -1847,6 +1854,7 @@ at `ready`) was found sound against target leakage. The weak part is pay.
 | **D28** | **Split.** v2 has A 30 / B 25 / C 25 / D 20 when all are armed | v2 split | Reviewer: **A 40 / D 25 / B 20 / C 15**, with D ramping 15 → 25% after ≥ 3 miner crowns pass the gate with the unselected suite not falling. Now (B, C off): A80/D20 is acceptable. Interacts with **D21**: the reviewer prefers returning the unpaid house slot to lane A over burning it |
 | **D29** | **Frequency bias in frozen sets.** Sub-hourly data reaches the floors first, so miners specialise on sub-hourly | v2 freeze rule | Per-frequency-bucket and per-domain window quotas inside a frozen set, equal cluster weights. Freeze when every bucket meets its quota or a max wait passes |
 | **D30** | **TIME isn't truly unselected.** It's in lane A's `require_public` gate and the king check, and DEC-CA-0069 (pending: PR #482) adds `suite:time` as a lane B target, so the house is optimised on it | Keep TIME as the unselected suite | Drop `s-time` from DEC-CA-0069, or choose a sentinel that no lane gates or pays on |
+|  | *(rev3) D30 is addressed by D33: with a rotating sentinel no suite is permanently gated or targeted, so the held-out reading stays unbiased in expectation.* | | |
 | **D31** | **Sybil queue griefing.** Cheap coldkeys can fill the 8 judged slots with junk | The A8 caps + registration cost | Round-robin by coldkey; priority by hotkey age or prior non-junk LCB; a cheap pre-screen (small window subset; drop LCB < −x before a full frozen set) |
 | **D32** | **Lane B vs D.** Once D runs it dominates lane B as designed (one D king slot ~11–20% of emission vs ~1.8% per B slot) | Keep B as trainer-run legs | Re-scope B to the §12 expert-delta variant when D arms, with row-level dedup against published D kings' rows |
 
@@ -1862,4 +1870,96 @@ The reviewer's view on the v3 "Proposed design changes": adopt 1–4, 7–10, 12
 and 14 before S6b (with 10 = gate at 4096 for everyone). Treat 5, 6, 11, 13,
 15 and 16 as incentive-neutral ops. Those remain owner decisions and are
 **not** applied here.
+
+---
+
+## 16. Cross-lane rotating held-out sentinel (rev3)
+
+**Why.** Every public suite we gate or pay on gets optimised by miners and by
+our own pipeline. Today:
+
+- lane A gates on all four suites (`[v2] bench_gate_mode = "enforce"`, the
+  `avg_noninf_winrate` rule; `require_public` for lane B);
+- the lane A king check averages all six numbers;
+- DEC-CA-0069 (pending: PR #482) would add suites as lane B targets.
+
+So no suite stays a clean "are we really improving" reading. That's the D30
+problem. A fixed held-out suite doesn't fix it either: a suite held out
+forever drops out of regression coverage, and miners can still optimise for
+it.
+
+**Rule (D33).**
+
+1. **The draw.** At each era boundary, one suite from `sentinel_suites`
+   (default `["gift", "boom", "time", "fev"]`) is drawn from the
+   **era-boundary block hash**, the same for every validator and
+   unpredictable at commit time.
+   - The main validator records the drawn suite in the settlement receipt
+     and the lane D report as a structured field. Satellites verify it from
+     the block hash; block hashes stay readable on pruned nodes, unlike
+     past-block state.
+   - A satellite that can't read the hash replays the recorded value.
+2. **Held out that era, in every lane:**
+   - **Lane A:** the gate and the king check use the remaining three suites.
+     The sentinel is swept for each candidate that reaches the gate.
+   - **Lane B:** it's neither a guard nor a target that era (D35).
+   - **Lane D:** it isn't the drawn gate suite (§1.3b); it's swept for each
+     new KING_D.
+3. **The other suites remain full regression guards** in every lane. That's
+   stronger than a rotating gate, which would check only one suite per
+   crowning.
+4. **Published every era:** each lane's new king's sentinel numbers, plus the
+   house's, on a per-suite board in `status/lane_d.json` and the lane A
+   status.
+5. **Optional ratchet (D34).** A candidate in any lane must satisfy
+   `LCB_α(sentinel) ≥ −sentinel_tau` against the **current lane A king**,
+   re-scored paired on one host, never against stored numbers. With the
+   ratchet on, a regression on the held-out suite is still blocked; it's
+   just never used to *select* or *pay*.
+
+**Cost.** Lane A's bench sweep stays at four suites: three gate and one
+sentinel. With the ratchet off, the sentinel sweep can run after the verdict
+and stays off the critical path. Lane D: one drawn suite plus the sentinel
+per new king, roughly as v2.
+
+**Consensus and rollout.**
+
+- **Lane A:**
+  - This is a change to lane A's gate rule, so it's a capability release,
+    then a signed-overlay switch-on.
+  - New `[v2]` keys: `sentinel_from_block` (0 = off), `sentinel_suites`,
+    `sentinel_ratchet` (bool), `sentinel_tau`. Each needs a loader parse, an
+    `ALLOWED["v2"]` entry (`netconfig.py:99-108` lists the `[v2]` allow-set
+    explicitly) and round-trip and mutation tests.
+  - It ships in the **S2b catch-up** or the S5 capability release.
+  - It arms by overlay at an era boundary, with shadow first: log the
+    sentinel and the would-be verdicts for ≥ 2 eras before it affects the
+    gate.
+- **Lane B:** it's off, so it adopts the sentinel from its first armed era.
+  DEC-CA-0069 (pending: PR #482) needs a one-paragraph amendment for D35.
+- **Lane D:** built in from launch (§1.3b).
+- **Satellites:** they verify the recorded draw against the block hash and
+  re-run the gate arithmetic from signed rows (§14.3). They need no bench
+  hardware.
+
+**Work and tests.**
+
+- **WP W-S1:** the sentinel draw, the lane A gate rule change behind
+  `sentinel_from_block`, the receipt field, the overlay keys, and the
+  shadow logging.
+- **WP W-S2:** the lane B guard/target exclusion (with the DEC-CA-0069
+  amendment).
+- **WP W-S3:** publication on the status boards.
+- **Test rows:**
+  - **TS1:** two validators derive the same sentinel from the block hash, and
+    a satellite replays the recorded value when the hash is unreadable.
+  - **TS2:** lane A with the sentinel armed. Verdicts use three suites, and
+    a candidate regressing only on the sentinel is blocked iff the ratchet is
+    on.
+  - **TS3:** lane A **unarmed ⇒ byte-identical** receipts and verdicts
+    (invariant 1 applies to lane A here).
+  - **TS4:** a lane B entry targeting the sentinel suite is deferred (D35).
+  - **TS5:** draws are independent per era (a repeat has probability
+    1/4). The test checks the draw is deterministic from the hash and
+    uniform over `sentinel_suites`.
 
