@@ -1,8 +1,8 @@
 {
   "schema": "laned_build/1",
-  "ref": "c95a996c0debc618496478e9d3a817bd6e089a54",
-  "commit": "c95a996c0debc618496478e9d3a817bd6e089a54",
-  "generated_at": "2026-11-21T22:11:10Z",
+  "ref": "86923de0441948879199cdaeec8106fe8291a35c",
+  "commit": "86923de0441948879199cdaeec8106fe8291a35c",
+  "generated_at": "2026-11-21T22:12:35Z",
   "wps": {
     "W0c": {
       "level": "L3",
@@ -14,7 +14,7 @@
       "expect_fail_success": true,
       "l2_commit": "36bb8f2b22f041330521cdff64ddb6568308b974",
       "last_main_run": {
-        "head_sha": "c95a996c0debc618496478e9d3a817bd6e089a54",
+        "head_sha": "86923de0441948879199cdaeec8106fe8291a35c",
         "conclusion": "success"
       },
       "evidence": "ci-only",
@@ -30,7 +30,7 @@
       "expect_fail_success": true,
       "l2_commit": "a15368814c031bafd3bf4b329e7e3867c4ab7aee",
       "last_main_run": {
-        "head_sha": "c95a996c0debc618496478e9d3a817bd6e089a54",
+        "head_sha": "86923de0441948879199cdaeec8106fe8291a35c",
         "conclusion": "success"
       },
       "evidence": "evidence/w0.json: evidence file missing"
@@ -54,7 +54,7 @@
       "expect_fail_success": true,
       "l2_commit": "c95a996c0debc618496478e9d3a817bd6e089a54",
       "last_main_run": {
-        "head_sha": "c95a996c0debc618496478e9d3a817bd6e089a54",
+        "head_sha": "86923de0441948879199cdaeec8106fe8291a35c",
         "conclusion": "success"
       },
       "evidence": "ci-only",
@@ -70,7 +70,7 @@
       "expect_fail_success": true,
       "l2_commit": "b366e9b45972077aad7e6085bf3915c383c571b7",
       "last_main_run": {
-        "head_sha": "c95a996c0debc618496478e9d3a817bd6e089a54",
+        "head_sha": "86923de0441948879199cdaeec8106fe8291a35c",
         "conclusion": "success"
       },
       "evidence": "ci-only",
@@ -87,7 +87,7 @@
     },
     "R3": {
       "level": "L0",
-      "side_state": "blocked:dependency",
+      "side_state": null,
       "runs_in": "ci",
       "external": false,
       "group": "build",
@@ -122,7 +122,7 @@
       "expect_fail_success": true,
       "l2_commit": "3c7803adef8e7c719ad593b35e6ec13d42758c05",
       "last_main_run": {
-        "head_sha": "c95a996c0debc618496478e9d3a817bd6e089a54",
+        "head_sha": "86923de0441948879199cdaeec8106fe8291a35c",
         "conclusion": "success"
       },
       "evidence": "ci-only",
@@ -193,7 +193,7 @@
     },
     "R11": {
       "level": "L0",
-      "side_state": "blocked:dependency",
+      "side_state": null,
       "runs_in": "ci",
       "external": false,
       "group": "build",
@@ -255,17 +255,24 @@
       "expect_fail_success": false
     },
     "W2": {
-      "level": "L1",
+      "level": "L3",
       "side_state": null,
       "runs_in": "ci",
       "external": false,
       "group": "laned_core",
       "paths": true,
-      "expect_fail_success": true
+      "expect_fail_success": true,
+      "l2_commit": "86923de0441948879199cdaeec8106fe8291a35c",
+      "last_main_run": {
+        "head_sha": "86923de0441948879199cdaeec8106fe8291a35c",
+        "conclusion": "success"
+      },
+      "evidence": "ci-only",
+      "review": null
     },
     "W2b": {
       "level": "L0",
-      "side_state": "blocked:dependency",
+      "side_state": null,
       "runs_in": "ci",
       "external": false,
       "group": "laned_core",
@@ -274,7 +281,7 @@
     },
     "W1.5": {
       "level": "L0",
-      "side_state": "blocked:dependency",
+      "side_state": null,
       "runs_in": "ci",
       "external": false,
       "group": "laned_core",
@@ -1628,21 +1635,18 @@
     "blocked": [
       {
         "reason": "dependency",
-        "count": 62,
+        "count": 58,
         "wps": [
-          "R11",
           "R12",
           "R14",
           "R15",
           "R16",
-          "R3",
           "R7m",
           "R7t",
           "R9",
           "W-S2",
           "W-S3",
           "W0b",
-          "W1.5",
           "W11",
           "W12a",
           "W12b",
@@ -1653,7 +1657,6 @@
           "W17",
           "W18",
           "W19",
-          "W2b",
           "W3",
           "W3b1",
           "W3b2",
