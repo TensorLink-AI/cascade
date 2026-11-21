@@ -6,17 +6,21 @@ only the paths in `PATHS`. R1 owns no T-rows and no invariants.
 
 ## Where it lives
 
-- `cascade/lane_d/blocks.py`: the arithmetic and the `blocks` subcommands.
-- `cascade/lane_d/cli.py`: `main(argv=None) -> int`, which dispatches
+- `cascade/laned/blocks.py`: the arithmetic and the `blocks` subcommands.
+- `cascade/laned/cli.py`: `main(argv=None) -> int`, which dispatches
   `cascade-laned <command>`. Here the only command is `blocks`. It must run as
-  `python -m cascade.lane_d.cli` (an `if __name__ == "__main__"` guard calling
+  `python -m cascade.laned.cli` (an `if __name__ == "__main__"` guard calling
   `sys.exit(main())`).
-- `cascade/lane_d/__init__.py`.
-- `pyproject.toml`: add **only** `cascade-laned = "cascade.lane_d.cli:main"`
+- `cascade/laned/__init__.py`. The package is shared with R6 (`cascade.laned.dedrift`,
+  PR #486). Whichever WP lands second must keep the other's files intact, and
+  `cli.py` must stay a dispatcher that other `cascade-laned` commands can join.
+  The package is rollout tooling, not the `cascade/lane_d/` intake service (W3,
+  deploy_gate area `lane_d_intake`).
+- `pyproject.toml`: add **only** `cascade-laned = "cascade.laned.cli:main"`
   under `[project.scripts]`. Don't touch dependencies, the torch pin or
   `uv.lock`.
 
-The tests drive it as a subprocess: `python -m cascade.lane_d.cli blocks
+The tests drive it as a subprocess: `python -m cascade.laned.cli blocks
 <query> <args> --grid FILE [--config FILE]`, with cwd and `PYTHONPATH` set to
 the repo. The tool must not need a chain connection, torch, or anything
 outside the stdlib and `cascade.shared`.
@@ -132,7 +136,7 @@ The past off-by-one cases pinned are:
 
 ## Failure on main
 
-The module `cascade.lane_d` doesn't exist, so every subprocess exits 1 and
+The module `cascade.laned` doesn't exist, so every subprocess exits 1 and
 every tool test fails with an `AssertionError`. The pyproject test fails on the
 missing entry point, also with an `AssertionError`. Only
 `test_golden_vectors_agree_with_shared_code` passes. There are no syntax,

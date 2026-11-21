@@ -3,7 +3,7 @@
 Plan: docs/plans/LANE_D_PLAN.md §3.0 row R1, §5 "Block arithmetic", §13.
 Contract: tests/accept/r1/README.md.
 
-The tool is driven as a subprocess, ``python -m cascade.lane_d.cli blocks
+The tool is driven as a subprocess, ``python -m cascade.laned.cli blocks
 <query> ... --grid FILE [--config FILE]``, with cwd and PYTHONPATH set to this
 repo. Nothing here touches a chain: the "live grid" is a JSON fixture.
 
@@ -60,7 +60,7 @@ def _run(*args: str) -> subprocess.CompletedProcess:
     env = dict(os.environ)
     env["PYTHONPATH"] = str(REPO)
     return subprocess.run(
-        [sys.executable, "-m", "cascade.lane_d.cli", "blocks", *args],
+        [sys.executable, "-m", "cascade.laned.cli", "blocks", *args],
         cwd=REPO, env=env, capture_output=True, text=True, timeout=60,
     )
 
@@ -441,7 +441,7 @@ def test_negative_block_exits_2(tmp_path):
 def test_pyproject_declares_cascade_laned_entry_point():
     data = tomllib.loads((REPO / "pyproject.toml").read_text())
     scripts = data.get("project", {}).get("scripts", {})
-    assert scripts.get("cascade-laned") == "cascade.lane_d.cli:main", scripts
+    assert scripts.get("cascade-laned") == "cascade.laned.cli:main", scripts
 
 
 # ── the golden vectors are ground truth (passes on main) ─────────────────────
