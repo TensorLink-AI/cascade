@@ -1,0 +1,232 @@
+{
+  "markers": [
+    {
+      "line": 276,
+      "table": "round",
+      "key": "blocked_hotkeys",
+      "deployed": [
+        "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+        "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+      ],
+      "main": null,
+      "drift": true,
+      "class": "overlay",
+      "reason": "overlay_key"
+    },
+    {
+      "line": 283,
+      "table": "round",
+      "key": "ops_max_active_per_coldkey",
+      "deployed": 1,
+      "main": 1,
+      "drift": false,
+      "class": "operator-only",
+      "reason": "trainer_only_policy"
+    },
+    {
+      "line": 292,
+      "table": "round",
+      "key": "epoch_blocks",
+      "deployed": 900,
+      "main": 900,
+      "drift": false,
+      "class": "main",
+      "reason": "decided_block"
+    },
+    {
+      "line": 297,
+      "table": "round",
+      "key": "epoch_blocks_prev",
+      "deployed": 3600,
+      "main": 3600,
+      "drift": false,
+      "class": "main",
+      "reason": "decided_block"
+    },
+    {
+      "line": 298,
+      "table": "round",
+      "key": "epoch_activation_block",
+      "deployed": 9136800,
+      "main": 9136800,
+      "drift": false,
+      "class": "main",
+      "reason": "decided_block"
+    },
+    {
+      "line": 317,
+      "table": "round",
+      "key": "rolling_from_block",
+      "deployed": 9136800,
+      "main": 9136800,
+      "drift": false,
+      "class": "main",
+      "reason": "decided_block"
+    },
+    {
+      "line": 366,
+      "table": "round",
+      "key": "funded_pod_image",
+      "deployed": "ghcr.io/tensorlink-ai/cascade-worker:worker-v2.0.0-rc15@sha256:5d41d94bc0c0d3ae3dfd042b0cc7e4d900c7d1f48173808436c12bf764a67641",
+      "main": "ghcr.io/tensorlink-ai/cascade-worker:worker-v2.0.0-rc15@sha256:5d41d94bc0c0d3ae3dfd042b0cc7e4d900c7d1f48173808436c12bf764a67641",
+      "drift": false,
+      "class": "main",
+      "reason": "decided_pin"
+    },
+    {
+      "line": 397,
+      "table": "round",
+      "key": "funded_pod_skus",
+      "deployed": [
+        "8xH200",
+        "4xH200"
+      ],
+      "main": [
+        "8xH200",
+        "8xH100",
+        "4xH200",
+        "4xH100"
+      ],
+      "drift": true,
+      "class": "main",
+      "reason": "release_only_key"
+    },
+    {
+      "line": 437,
+      "table": "round",
+      "key": "funded_max_price_per_hour",
+      "deployed": 32.5,
+      "main": 40.0,
+      "drift": true,
+      "class": "main",
+      "reason": "release_only_key"
+    },
+    {
+      "line": 470,
+      "table": "round",
+      "key": "funded_operator_fallback",
+      "deployed": true,
+      "main": false,
+      "drift": true,
+      "class": "main",
+      "reason": "release_only_key"
+    },
+    {
+      "line": 642,
+      "table": "eval",
+      "key": "gift_gate_data_dir",
+      "deployed": "/srv/bench",
+      "main": "",
+      "drift": true,
+      "class": "operator-only",
+      "reason": "host_path"
+    },
+    {
+      "line": 643,
+      "table": "eval",
+      "key": "calib_horizons",
+      "deployed": [],
+      "main": null,
+      "drift": true,
+      "class": "operator-only",
+      "reason": "log_only"
+    },
+    {
+      "line": 705,
+      "table": "scoring",
+      "key": "cohort_maxt_increment_from_block",
+      "deployed": 9136800,
+      "main": 9136800,
+      "drift": false,
+      "class": "main",
+      "reason": "decided_block"
+    },
+    {
+      "line": 758,
+      "table": "scoring",
+      "key": "era_king_from_block",
+      "deployed": 9136800,
+      "main": 9136800,
+      "drift": false,
+      "class": "main",
+      "reason": "decided_block"
+    },
+    {
+      "line": 763,
+      "table": "scoring",
+      "key": "tenure_blocks_from_block",
+      "deployed": 9136800,
+      "main": 9136800,
+      "drift": false,
+      "class": "main",
+      "reason": "decided_block"
+    },
+    {
+      "line": 983,
+      "table": "storage",
+      "key": "hf_backup_repo",
+      "deployed": "opsorg/cascade-mirror",
+      "main": "",
+      "drift": true,
+      "class": "main",
+      "reason": "release_only_table"
+    },
+    {
+      "line": 1156,
+      "table": "v2",
+      "key": "from_block",
+      "deployed": 9399600,
+      "main": 9399600,
+      "drift": false,
+      "class": "main",
+      "reason": "decided_block"
+    },
+    {
+      "line": 1553,
+      "table": "generation",
+      "key": "providers",
+      "deployed": [
+        "targon"
+      ],
+      "main": [
+        "targon",
+        "shadeform"
+      ],
+      "drift": true,
+      "class": "operator-only",
+      "reason": "operator_only_table"
+    },
+    {
+      "line": 1555,
+      "table": "generation",
+      "key": "fallback_vcpus",
+      "deployed": [
+        8
+      ],
+      "main": null,
+      "drift": true,
+      "class": "operator-only",
+      "reason": "operator_only_table"
+    },
+    {
+      "line": 1558,
+      "table": "generation",
+      "key": "max_parallel_jobs",
+      "deployed": 4,
+      "main": 2,
+      "drift": true,
+      "class": "operator-only",
+      "reason": "operator_only_table"
+    },
+    {
+      "line": 1566,
+      "table": "generation",
+      "key": "vm_image",
+      "deployed": "ubuntu-22-04-lts",
+      "main": "",
+      "drift": true,
+      "class": "operator-only",
+      "reason": "operator_only_table"
+    }
+  ]
+}
