@@ -1,0 +1,6 @@
+# command: grep -rnE "first_seen|ingested_at|ingest_time|landed_at|LastModified" cascade/pool/
+# repo: TensorLink-AI/cascade @ 3c67b64a8e97f4d2c00ad60cefba0185c6779d69 (branch claude/sleepy-cray-7uutm1)
+# host: droplet (prod box; read-only grep)
+# utc: 2026-11-21T12:01:52Z
+# output (empty means no match):
+# exit status: 1
