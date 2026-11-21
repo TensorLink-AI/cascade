@@ -39,8 +39,12 @@ Scope of T13 and invariant 2 at skeleton level:
 
 ## Two fixture kinds, one box-side pipeline
 
-`test_w1_5_e2e.py`'s `chain` fixture is parametrised, and every pipeline test
-runs on both kinds:
+`test_w1_5_e2e.py`'s `chain_kind` fixture is parametrised, and every pipeline
+test runs on both kinds. The fixture holds only the kind and a scratch dir: it
+imports no `PATHS` module and builds nothing. Each test body calls `_chain()`,
+which first imports the box-side W1.5 modules (on main the test fails there,
+inside the body). It then builds the chain and the test signer once per kind
+and reuses them:
 
 - **`model`** (marked `torch`; CI installs torch with `uv sync --all-extras`).
   This is the real chain.

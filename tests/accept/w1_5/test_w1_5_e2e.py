@@ -5,7 +5,7 @@ fixture ``pool_d`` (with ``end_ts``) -> tiny checkpoint -> intake (filesystem
 adapter behind the real storage interface) -> ingest guards -> scorer ->
 signed report -> ``lane_d_state.json`` -> emission -> ``check_lane_d``.
 
-The ``chain`` fixture comes in two kinds:
+The chain (built from each test body by ``_chain``) comes in two kinds:
 
 * ``model`` (marked ``torch``): the real chain. Two tiny 2m pyramid
   checkpoints are built with the repo's model code (the house is F32 with its
@@ -101,7 +101,7 @@ def _synthetic_chain(tmp: Path) -> SimpleNamespace:
 
 
 def _model_chain(tmp: Path) -> SimpleNamespace:
-    # The W1.5 modules before any model work: on main the fixture stops here.
+    # The W1.5 modules before any model work: on main the test stops here.
     import torch
     from cascade.eval.lane_d_ingest import ingest_entry
     from cascade.eval.lane_d_scorer import SCORING_LEVELS, forecast_quantiles
@@ -162,14 +162,32 @@ def _model_chain(tmp: Path) -> SimpleNamespace:
 
 
 @pytest.fixture(scope="module", params=["synthetic", pytest.param("model", marks=torch_mark)])
-def chain(request, tmp_path_factory):
-    tmp = tmp_path_factory.mktemp(f"w1_5_{request.param}")
-    return _synthetic_chain(tmp) if request.param == "synthetic" else _model_chain(tmp)
+def chain_kind(request, tmp_path_factory):
+    """Only the kind and a scratch dir. Fixtures import nothing from PATHS and
+    build nothing, so on main every failure happens inside a test body."""
+    return SimpleNamespace(kind=request.param,
+                           tmp=tmp_path_factory.mktemp(f"w1_5_{request.param}"))
 
 
-@pytest.fixture(scope="module")
-def signer(tmp_path_factory):
-    return make_signer(tmp_path_factory.mktemp("w1_5_key"))
+_BUILT: dict[str, tuple[SimpleNamespace, object]] = {}
+
+
+def _chain(spec: SimpleNamespace) -> tuple[SimpleNamespace, object]:
+    """Called from each test body: the box-side W1.5 modules are imported
+    first (on main the test stops here), then the chain and the test signer
+    are built once per kind and reused."""
+    import cascade.audit.lane_d  # noqa: F401
+    import cascade.validator.lane_d  # noqa: F401
+    import cascade.validator.lane_d_report  # noqa: F401
+
+    from cascade.shared.emission import lane_d_vector  # noqa: F401
+
+    key = str(spec.tmp)
+    if key not in _BUILT:
+        built = (_synthetic_chain(spec.tmp / "chain") if spec.kind == "synthetic"
+                 else _model_chain(spec.tmp / "chain"))
+        _BUILT[key] = (built, make_signer(spec.tmp / "key"))
+    return _BUILT[key]
 
 
 LANE_A_FILES = {"cascade_state.json": b'{"king": "lane-a-king", "king_since_block": 9000000}',
@@ -232,7 +250,8 @@ def _assert_judged_rows(report, chain):
 # ── the W1.5 row ────────────────────────────────────────────────────────────
 
 
-def test_e2e_challenger_gets_nonzero_lane_d_weight(chain, signer, tmp_path):
+def test_e2e_challenger_gets_nonzero_lane_d_weight(chain_kind, tmp_path):
+    chain, signer = _chain(chain_kind)
     cfg = lane_d_cfg()
     state_path = _state_dir(tmp_path) / "lane_d_state.json"
     _, s2 = _settle_both(chain, cfg, state_path, signer)
@@ -259,7 +278,8 @@ def test_e2e_challenger_gets_nonzero_lane_d_weight(chain, signer, tmp_path):
     assert state["house"]["digest"] == chain.house_digest
 
 
-def test_e2e_audit_passes(chain, signer, tmp_path):
+def test_e2e_audit_passes(chain_kind, tmp_path):
+    chain, signer = _chain(chain_kind)
     cfg = lane_d_cfg()
     s1, s2 = _settle_both(chain, cfg, _state_dir(tmp_path) / "lane_d_state.json", signer)
     _assert_valid_report(s1.report, cfg, signer, BOUNDARY_1)
@@ -267,7 +287,8 @@ def test_e2e_audit_passes(chain, signer, tmp_path):
     _assert_valid_report(s2.report, cfg, signer, BOUNDARY_2)
 
 
-def test_e2e_tampered_row_fails(chain, signer, tmp_path):
+def test_e2e_tampered_row_fails(chain_kind, tmp_path):
+    chain, signer = _chain(chain_kind)
     from cascade.audit.lane_d import check_lane_d
     from cascade.validator.lane_d_report import sign_report, verify_report
 
@@ -292,7 +313,8 @@ def test_e2e_tampered_row_fails(chain, signer, tmp_path):
 # ── invariant 1: unarmed => byte-identical (paired, invariant 10) ───────────
 
 
-def test_inv1_weights_unchanged_when_unarmed(chain, signer, tmp_path):
+def test_inv1_weights_unchanged_when_unarmed(chain_kind, tmp_path):
+    chain, signer = _chain(chain_kind)
     cfg = lane_d_cfg(from_block=0)       # everything else as armed, share 0.25 included
     assert not cfg.active(BOUNDARY_1) and not cfg.active(BOUNDARY_2)
     state_dir = _state_dir(tmp_path)
@@ -304,7 +326,8 @@ def test_inv1_weights_unchanged_when_unarmed(chain, signer, tmp_path):
     assert sorted(p.name for p in state_dir.iterdir()) == before, "unarmed lane D wrote state"
 
 
-def test_inv1_weights_armed_nonempty_lane_d_effect(chain, signer, tmp_path):
+def test_inv1_weights_armed_nonempty_lane_d_effect(chain_kind, tmp_path):
+    chain, signer = _chain(chain_kind)
     cfg = lane_d_cfg()
     _, s2 = _settle_both(chain, cfg, _state_dir(tmp_path) / "lane_d_state.json", signer)
     assert s2.report is not None and s2.pay is not None
@@ -321,7 +344,8 @@ def _lane_a_files_unchanged(state_dir: Path) -> None:
         assert (state_dir / name).read_bytes() == data, f"lane D settlement changed {name}"
 
 
-def test_inv2_t13_lane_a_court_unchanged_when_unarmed(chain, signer, tmp_path):
+def test_inv2_t13_lane_a_court_unchanged_when_unarmed(chain_kind, tmp_path):
+    chain, signer = _chain(chain_kind)
     cfg = lane_d_cfg(from_block=0)
     state_dir = _state_dir(tmp_path)
     a_today, _ = today_parts()
@@ -331,7 +355,8 @@ def test_inv2_t13_lane_a_court_unchanged_when_unarmed(chain, signer, tmp_path):
     _lane_a_files_unchanged(state_dir)
 
 
-def test_inv2_t13_lane_a_court_armed_nonempty_lane_d_effect(chain, signer, tmp_path):
+def test_inv2_t13_lane_a_court_armed_nonempty_lane_d_effect(chain_kind, tmp_path):
+    chain, signer = _chain(chain_kind)
     cfg = lane_d_cfg()
     state_dir = _state_dir(tmp_path)
     a_today, _ = today_parts()
@@ -354,7 +379,8 @@ def test_inv2_t13_lane_a_court_armed_nonempty_lane_d_effect(chain, signer, tmp_p
 # ── invariant 9: share = 0 => vector identical, report still valid (paired) ─
 
 
-def test_inv9_share_zero_vector_unchanged_when_unarmed(chain, signer, tmp_path):
+def test_inv9_share_zero_vector_unchanged_when_unarmed(chain_kind, tmp_path):
+    chain, signer = _chain(chain_kind)
     cfg0 = lane_d_cfg(share=0.0)
     unarmed = lane_d_cfg(from_block=0)
     s_unarmed = _settle_both(chain, unarmed, _state_dir(tmp_path / "u") / "lane_d_state.json",
@@ -367,7 +393,8 @@ def test_inv9_share_zero_vector_unchanged_when_unarmed(chain, signer, tmp_path):
         assert as_bytes(vector_with_lane_d(sz.pay, cfg0)) == as_bytes(today_vector())
 
 
-def test_inv9_share_zero_vector_armed_nonempty_lane_d_effect(chain, signer, tmp_path):
+def test_inv9_share_zero_vector_armed_nonempty_lane_d_effect(chain_kind, tmp_path):
+    chain, signer = _chain(chain_kind)
     cfg0 = lane_d_cfg(share=0.0)
     s1, s2 = _settle_both(chain, cfg0, _state_dir(tmp_path) / "lane_d_state.json", signer)
     _assert_valid_report(s1.report, cfg0, signer, BOUNDARY_1)
@@ -375,7 +402,8 @@ def test_inv9_share_zero_vector_armed_nonempty_lane_d_effect(chain, signer, tmp_
     _assert_valid_report(s2.report, cfg0, signer, BOUNDARY_2)
 
 
-def test_fixture_pool_d_carries_end_ts(chain):
+def test_fixture_pool_d_carries_end_ts(chain_kind):
+    chain, _ = _chain(chain_kind)
     """The fixture itself: every series has ``end_ts`` and both clocks."""
     meta = json.loads((chain.pool_dirs[1] / "metadata.json").read_text())
     assert meta["series"]

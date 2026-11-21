@@ -142,25 +142,33 @@ def file_digest(path: Path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def keypair_class():
+    """The sr25519 Keypair the repo verifies with: ``bittensor.sp_core`` on the
+    pinned bittensor 11.x (``cascade/shared/sr25519.py``), the top-level
+    ``bittensor.Keypair`` on an older SDK."""
+    try:
+        from bittensor.sp_core import Keypair
+    except ImportError:
+        from bittensor import Keypair
+    return Keypair
+
+
 def fixture_hotkey(name: str) -> str:
     """A deterministic TEST ss58 address (never a real key)."""
-    import bittensor as bt
-
-    return bt.Keypair.create_from_uri(f"//w1_5-{name}").ss58_address
+    return keypair_class().create_from_uri(f"//w1_5-{name}").ss58_address
 
 
 def make_signer(directory: Path):
     """A fresh sr25519 test keypair whose secret lives only in ``directory``."""
     import secrets
 
-    import bittensor as bt
 
     directory.mkdir(parents=True, exist_ok=True)
     secret = secrets.token_hex(16)
     path = directory / "signer.uri"
     path.write_text(secret)
     path.chmod(0o600)
-    return bt.Keypair.create_from_uri("//w1_5-signer-" + path.read_text())
+    return keypair_class().create_from_uri("//w1_5-signer-" + path.read_text())
 
 
 def pyramid_contract():
