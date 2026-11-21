@@ -321,6 +321,9 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
     steps = contract.training_steps
     cooldown = max(1, round(steps / 11))
     trunk = steps - cooldown
+    from .expert_load import ExpertLoadTelemetry
+
+    expert_load = ExpertLoadTelemetry(trunk)   # log-only; never read by training
     step = tokens = channel_tokens = 0
     last_loss = last_joint = 0.0
     stable = None
@@ -431,13 +434,15 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
             # on rank 0 (sync_after_step) — never per micro-batch or per GPU
             for ema in emas:
                 ema.update(model)
+            expert_load.record(step, load)
             tokens += batch_points(values, contract.budget_denomination)
             channel_tokens += values.size
             step += 1
             last_loss, last_joint = loss_m, loss_j
             if logger and (step == 1 or step % 50 == 0):
                 logger({"event": "step", "step": step, "tokens": tokens, "loss": loss_m,
-                        "copula_es": loss_j, "energy_weight": energy_weight, "lr": optimizer.param_groups[0]["lr"]})
+                        "copula_es": loss_j, "energy_weight": energy_weight, "lr": optimizer.param_groups[0]["lr"],
+                        **({"expert_load": w} if (w := expert_load.window()) else {})})
             if continuation and continuation.due():
                 checkpoint_start = time.time()
                 if gang is not None:
@@ -525,6 +530,9 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
         metrics.update(power_ema_eval_sigma_rel=ema_sigmas[ema_eval])
     if slices:
         metrics.update(expert_training_backend="compact_rows", expert_trainable_param_count=sum(p.numel() for p in params))
+    load_summary = expert_load.summary()
+    if load_summary:
+        metrics["expert_load_telemetry"] = load_summary
     if grouped_corpus:
         summary = channel_stats.summary()
         if summary is not None:

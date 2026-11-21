@@ -1344,6 +1344,19 @@ class TrainerRunner(_FundedCapacityMixin, _FundedPodMixin, _OperatorPodMixin, _F
                 seeds.base_seed, log_role, m.get("deadline_hit"),
                 m.get("tokens_frac"), m.get("data_wait_s"), m.get("data_wait_frac"),
             )
+        # Routed-expert load on the training stream (log-only; expert_load.py):
+        # the worst layer per phase, so one grep shows a training-time collapse.
+        tel = m.get("expert_load_telemetry")
+        if isinstance(tel, dict):
+            parts = []
+            for phase, layers in tel.items():
+                if layers:
+                    parts.append(f"{phase}_min_eff={min(x['eff'] for x in layers)} "
+                                 f"{phase}_max_dead={max(x['dead'] for x in layers)} "
+                                 f"{phase}_max_mean={max(x['max_mean'] for x in layers)}")
+            if parts:
+                log.info("round=%s run=%s expert_load: %s", seeds.base_seed, log_role,
+                         " ".join(parts))
         return result, corpus_digest, n_series, total_points
 
     def _host_snapshot(self) -> dict:
