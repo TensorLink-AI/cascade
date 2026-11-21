@@ -1,0 +1,198 @@
+"""Shared helpers for the lane D loop tooling (plan §3 conventions, §17).
+
+Imported by ``accept``, ``status`` and the scanners, which all live next to
+this file and are run as ``python scripts/laned/<tool>``; Python puts the
+script's directory first on ``sys.path``, so ``import lanedlib`` resolves here.
+Stdlib only.
+"""
+
+from __future__ import annotations
+
+import fnmatch
+import json
+import re
+import subprocess
+from pathlib import Path
+
+GLOB_CHARS = ("*", "?", "[")
+PRUNE_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", ".mypy_cache",
+              ".pytest_cache", ".ruff_cache"}
+
+
+def wp_dir(wp: str) -> str:
+    """WP id -> its tests/accept directory name (``W1.5`` -> ``w1_5``)."""
+    return wp.lower().replace(".", "_").replace("-", "_")
+
+
+def resolve(root: Path, path: str | Path) -> Path:
+    p = Path(path)
+    return p if p.is_absolute() else root / p
+
+
+# ---------------------------------------------------------------------------
+# PATHS files
+# ---------------------------------------------------------------------------
+
+def parse_paths(text: str) -> list[str]:
+    entries = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        entries.append(line)
+    return entries
+
+
+def path_matches(rel: str, entries: list[str]) -> bool:
+    """True when the repo-relative path ``rel`` is matched by a PATHS entry."""
+    while rel.startswith("./"):
+        rel = rel[2:]
+    for entry in entries:
+        if any(c in entry for c in GLOB_CHARS):
+            if fnmatch.fnmatchcase(rel, entry):
+                return True
+        elif entry.endswith("/"):
+            if rel.startswith(entry) or rel + "/" == entry:
+                return True
+        elif rel == entry:
+            return True
+    return False
+
+
+def module_in_paths(module: str, entries: list[str]) -> bool:
+    """True when module ``a.b`` maps to ``a/b.py`` or ``a/b/`` under PATHS."""
+    base = module.replace(".", "/")
+    candidates = (base + ".py", base + "/", base + "/__init__.py")
+    return any(path_matches(c, entries) for c in candidates)
+
+
+def walk_files(root: Path, start: Path) -> list[Path]:
+    """Every regular file under ``start`` (pruning VCS/venv/cache dirs)."""
+    if start.is_file():
+        return [start]
+    out: list[Path] = []
+    if not start.is_dir():
+        return out
+    for path in sorted(start.iterdir()):
+        if path.is_dir():
+            if path.name in PRUNE_DIRS:
+                continue
+            out.extend(walk_files(root, path))
+        elif path.is_file():
+            out.append(path)
+    return out
+
+
+def expand_entries(root: Path, entries: list[str]) -> list[Path]:
+    """Files under ``root`` selected by PATHS-style entries or CLI paths."""
+    selected: dict[str, Path] = {}
+    all_files: list[Path] | None = None
+    for entry in entries:
+        if any(c in entry for c in GLOB_CHARS):
+            if all_files is None:
+                all_files = walk_files(root, root)
+            for f in all_files:
+                rel = f.relative_to(root).as_posix()
+                if fnmatch.fnmatchcase(rel, entry):
+                    selected[rel] = f
+            continue
+        target = resolve(root, entry)
+        for f in walk_files(root, target):
+            try:
+                rel = f.resolve().relative_to(root.resolve()).as_posix()
+            except ValueError:
+                rel = f.as_posix()
+            selected[rel] = f
+    return [selected[k] for k in sorted(selected)]
+
+
+# ---------------------------------------------------------------------------
+# Evidence verification (shared by accept --evidence, accept --gate, status)
+# ---------------------------------------------------------------------------
+
+OPEN_BLOCKING = re.compile(r"^\s*[-*]\s*\[ \]\s*BLOCKING\b(.*)$", re.M)
+
+
+def check_json_evidence(text: str | None, wp: str) -> tuple[bool, str]:
+    if text is None:
+        return False, "evidence file missing"
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        return False, f"evidence is not JSON: {exc}"
+    if not isinstance(data, dict):
+        return False, "evidence is not a JSON object"
+    if data.get("wp") != wp:
+        return False, f"evidence wp={data.get('wp')!r}, expected {wp!r}"
+    if data.get("passed") is not True:
+        return False, "evidence does not record passed: true"
+    return True, "ok"
+
+
+def open_blocking_items(text: str) -> list[str]:
+    return [m.group(0).strip() for m in OPEN_BLOCKING.finditer(text)]
+
+
+def check_review_evidence(text: str | None) -> tuple[bool, str]:
+    if text is None:
+        return False, "review file missing"
+    items = open_blocking_items(text)
+    if items:
+        return False, "open BLOCKING items: " + "; ".join(items)
+    return True, "ok"
+
+
+def check_evidence(text: str | None, name: str, wp: str) -> tuple[bool, str]:
+    if name.endswith(".md"):
+        return check_review_evidence(text)
+    return check_json_evidence(text, wp)
+
+
+def check_gate(text: str | None, stage: str) -> tuple[bool, str]:
+    if text is None:
+        return False, "gate evidence missing"
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        return False, f"gate evidence is not JSON: {exc}"
+    if not isinstance(data, dict):
+        return False, "gate evidence is not a JSON object"
+    if data.get("stage") != stage:
+        return False, f"gate evidence stage={data.get('stage')!r}, expected {stage!r}"
+    checks = data.get("checks")
+    if not isinstance(checks, list) or not checks:
+        return False, "gate evidence records no checks"
+    failed = [c.get("name", "?") if isinstance(c, dict) else repr(c)
+              for c in checks if not (isinstance(c, dict) and c.get("passed") is True)]
+    if failed:
+        return False, "gate checks not passed: " + ", ".join(map(str, failed))
+    return True, "ok"
+
+
+def gate_path(stage: str) -> str:
+    return f"evidence/gates/{stage.lower()}.json"
+
+
+# ---------------------------------------------------------------------------
+# Token matching of WP / decision ids in plan cells
+# ---------------------------------------------------------------------------
+
+def token_re(token: str) -> re.Pattern[str]:
+    """Whole-token matcher: ``W0`` never matches ``W0c`` or ``W1`` ``W1.5``."""
+    return re.compile(r"(?<![A-Za-z0-9_.\-])" + re.escape(token) + r"(?![A-Za-z0-9_\-]|\.[A-Za-z0-9])")
+
+
+def has_token(text: str, token: str) -> bool:
+    return bool(token_re(token).search(text))
+
+
+# ---------------------------------------------------------------------------
+# git
+# ---------------------------------------------------------------------------
+
+def git(root: Path, *args: str, check: bool = True,
+        env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    proc = subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True, env=env)
+    if check and proc.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
+    return proc

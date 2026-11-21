@@ -1,0 +1,606 @@
+#!/usr/bin/env python3
+"""Lane D status board (plan §17).
+
+    status --root R --ref REF --ci-results FILE --out DIR
+           [--release-tag-glob GLOB] [--push REMOTE] [--include SRC:DEST ...]
+
+Computes every WP's level (L0-L7) and side state, the stage and milestone
+state, the decision register, the owner inputs and the §17.3 counters. Every
+input is read from REF's tree (`git show REF:path`), never the working tree:
+the plan, tests/accept/*, evidence/* and the release tags. GitHub Actions
+results come from --ci-results ({"runs": [...]}, see tests/accept/w0c/README).
+
+Writes DIR/docs/plans/STATUS.md and DIR/status/laned_build.json. With
+--push REMOTE it commits them (plus any --include files) to branch
+laned/build-state on REMOTE, fast-forward only; main is never touched.
+Without --release-tag-glob no tag counts as a capability release (no L6).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import tempfile
+from datetime import UTC, datetime
+from pathlib import Path
+
+import lanedlib
+
+PLAN = "docs/plans/LANE_D_PLAN.md"
+BUILD_STATE = "laned/build-state"
+EXTERNAL_WORDS = ("builder", "pod", "testnet", "owner")
+CLOSED_DECISION = ("decided", "withdrawn", "deferred-to-stage")
+N_INVARIANTS = 12
+STAGE_ORDER = ("S0", "S0a", "S0b", "S0c", "S1", "S2", "S2b", "S3", "S4", "S5", "S6",
+               "SB0", "SB1", "SB2", "SB3", "SB4", "SB5", "S7", "S8")
+# §5 row 12c: the SB1 build set and the SB0 decision set.
+SB1_WPS = ("WB10", "WB11", "WB12", "WB13", "WB14", "WB15", "WB16", "WB17", "WB18",
+           "WB22", "WB23", "W-S1", "W-S2")
+SB0_DECISIONS = ("D35", "D36", "D37", "D38", "D39", "D40", "D41", "D42", "D42b")
+T_ROW = re.compile(r"^T\d+[a-z]?$")
+
+
+def clean(cell: str) -> str:
+    return cell.replace("**", "").replace("`", "").strip()
+
+
+def split_row(line: str) -> list[str]:
+    body = line.strip()
+    if body.startswith("|"):
+        body = body[1:]
+    if body.endswith("|"):
+        body = body[:-1]
+    return [c.strip() for c in body.split("|")]
+
+
+def lvl(n: int) -> str:
+    return f"L{n}"
+
+
+# ---------------------------------------------------------------------------
+# Inputs at REF
+# ---------------------------------------------------------------------------
+
+class RefTree:
+    def __init__(self, root: Path, ref: str):
+        self.root = root
+        self.ref = ref
+        self.commit = lanedlib.git(root, "rev-parse", f"{ref}^{{commit}}").stdout.strip()
+        self.files = set(lanedlib.git(root, "ls-tree", "-r", "--name-only", self.commit).stdout.split("\n"))
+        self.files.discard("")
+        self._cache: dict[str, str | None] = {}
+        log = lanedlib.git(root, "log", "--first-parent", "--reverse", "--diff-merges=first-parent",
+                           "--name-only", "--format=%x01%H", self.commit).stdout
+        self.history: list[tuple[str, list[str]]] = []
+        for chunk in log.split("\x01")[1:]:
+            lines = [ln for ln in chunk.split("\n") if ln.strip()]
+            self.history.append((lines[0].strip(), lines[1:]))
+        self.position = {sha: i for i, (sha, _) in enumerate(self.history)}
+
+    def show(self, path: str) -> str | None:
+        if path not in self._cache:
+            if path in self.files:
+                self._cache[path] = lanedlib.git(self.root, "show", f"{self.commit}:{path}").stdout
+            else:
+                self._cache[path] = None
+        return self._cache[path]
+
+
+def parse_plan(text: str) -> dict:
+    wps: dict[str, dict] = {}
+    decisions: dict[str, dict] = {}
+    owner_inputs: dict[str, dict] = {}
+    t_rows: list[str] = []
+    t_owners: dict[str, str] = {}
+    lines = text.splitlines()
+    heading = ""
+    group_label = ""
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("## "):
+            heading, group_label = line, ""
+        elif line.startswith("**") and not line.startswith("|"):
+            group_label = line
+        if not line.lstrip().startswith("|"):
+            i += 1
+            continue
+        block = []
+        while i < len(lines) and lines[i].lstrip().startswith("|"):
+            block.append(lines[i])
+            i += 1
+        header = [clean(c) for c in split_row(block[0])]
+        rows = [split_row(r) for r in block[2:]] if len(block) > 2 else []
+        col = {name: k for k, name in enumerate(header)}
+
+        def cell(row: list[str], name: str, col: dict[str, int] = col) -> str:
+            k = col.get(name)
+            return row[k] if k is not None and k < len(row) else ""
+
+        if header and header[0] == "WP" and "Runs in" in col:
+            if "Stage" in col:
+                group = "execution"
+            elif "lane b" in group_label.lower():
+                group = "laneb"
+            elif "lane d core" in group_label.lower():
+                group = "laned_core"
+            else:
+                group = "build"
+            parked = "parked" in heading.lower()
+            for row in rows:
+                wp = clean(row[0])
+                if not wp or wp in wps:
+                    continue
+                accept = cell(row, "Accept")
+                m = re.search(r"--evidence\s+([^\s`)]+)", accept)
+                runs_in = clean(cell(row, "Runs in"))
+                wps[wp] = {
+                    "depends": clean(cell(row, "Depends")),
+                    "runs_in": runs_in,
+                    "external": any(re.search(rf"\b{w}\b", runs_in) for w in EXTERNAL_WORDS),
+                    "evidence": m.group(1) if m else None,
+                    "group": group,
+                    "parked": parked,
+                    "stage": clean(cell(row, "Stage")),
+                }
+        elif header[:5] == ["D", "Status", "Option chosen", "Class", "Decided"]:
+            for row in rows:
+                d = clean(row[0])
+                if d:
+                    decisions[d] = {"status": clean(cell(row, "Status")),
+                                    "option": clean(cell(row, "Option chosen")),
+                                    "class": clean(cell(row, "Class")),
+                                    "decided": clean(cell(row, "Decided"))}
+        elif header[:4] == ["OA", "Status", "Unblocks", "Evidence file"]:
+            for row in rows:
+                oa = clean(row[0])
+                if not oa:
+                    continue
+                ev_cell = cell(row, "Evidence file")
+                m = re.search(r"`([^`]+)`", ev_cell) or re.search(r"(evidence/\S+)", ev_cell)
+                owner_inputs[oa] = {"status": clean(cell(row, "Status")),
+                                    "unblocks": clean(cell(row, "Unblocks")),
+                                    "evidence": m.group(1) if m else None}
+        elif header[:3] == ["#", "Case", "Expected"]:
+            for row in rows:
+                t = clean(row[0])
+                if T_ROW.match(t) and t not in t_rows:
+                    t_rows.append(t)
+        elif header[:2] == ["Row", "WPs"]:
+            for row in rows:
+                t = clean(row[0])
+                if t:
+                    t_owners[t] = clean(cell(row, "WPs"))
+    return {"wps": wps, "decisions": decisions, "owner_inputs": owner_inputs,
+            "t_rows": t_rows, "t_owners": t_owners}
+
+
+# ---------------------------------------------------------------------------
+# Levels
+# ---------------------------------------------------------------------------
+
+class Board:
+    def __init__(self, tree: RefTree, plan: dict, runs: list[dict], tag_glob: str | None):
+        self.tree = tree
+        self.plan = plan
+        self.runs = [r for r in runs if r.get("workflow", "laned-accept") == "laned-accept"]
+        self.tags: list[str] = []
+        if tag_glob:
+            out = lanedlib.git(tree.root, "tag", "--list", tag_glob).stdout
+            self.tags = [t for t in out.split("\n") if t]
+        self.levels: dict[str, int] = {}
+        self.detail: dict[str, dict] = {}
+
+    # -- per-level conditions ------------------------------------------------
+    def paths_commit(self, d: str) -> int | None:
+        rel = f"tests/accept/{d}/PATHS"
+        for i, (_, files) in enumerate(self.tree.history):
+            if rel in files:
+                return i
+        return None
+
+    def l2_commit(self, wp: str, paths: list[str]) -> int | None:
+        start = self.paths_commit(lanedlib.wp_dir(wp))
+        if start is None:
+            return None
+        for i in range(start + 1, len(self.tree.history)):
+            files = self.tree.history[i][1]
+            if not files:
+                continue
+            if not any(not f.startswith("tests/accept/") for f in files):
+                continue
+            if all(lanedlib.path_matches(f, paths) for f in files):
+                return i
+        return None
+
+    def evidence_ok(self, wp: str) -> tuple[bool, str]:
+        info = self.plan["wps"][wp]
+        if not info["external"]:
+            return True, "ci-only"
+        path = info["evidence"] or f"evidence/{lanedlib.wp_dir(wp)}.json"
+        ok, why = lanedlib.check_evidence(self.tree.show(path), path, wp)
+        return ok, f"{path}: {why}"
+
+    def reviewed(self, wp: str) -> str | None:
+        for path in sorted(self.tree.files):
+            if not re.match(r"^evidence/rv\d+\.md$", path):
+                continue
+            text = self.tree.show(path) or ""
+            covers = re.search(r"^Covers:(.*)$", text, re.M)
+            if not covers or not lanedlib.has_token(covers.group(1), wp):
+                continue
+            if any(lanedlib.has_token(item, wp) for item in lanedlib.open_blocking_items(text)):
+                continue
+            return path
+        return None
+
+    def released(self, sha: str) -> str | None:
+        for tag in self.tags:
+            proc = lanedlib.git(self.tree.root, "merge-base", "--is-ancestor", sha, f"refs/tags/{tag}",
+                                check=False)
+            if proc.returncode == 0:
+                return tag
+        return None
+
+    def live(self, wp: str) -> bool:
+        text = self.tree.show(f"evidence/l7/{lanedlib.wp_dir(wp)}.json")
+        if text is None:
+            return False
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return False
+        if not isinstance(data, dict):
+            return False
+        block = data.get("activation_block")
+        era = data.get("era_range")
+        return (isinstance(block, int) and not isinstance(block, bool)
+                and data.get("monitor") == "green"
+                and isinstance(era, list) and len(era) == 2
+                and all(isinstance(e, int) and not isinstance(e, bool) for e in era)
+                and era[1] >= era[0])
+
+    def level(self, wp: str) -> int:
+        d = lanedlib.wp_dir(wp)
+        det: dict = {}
+        self.detail[wp] = det
+        paths_text = self.tree.show(f"tests/accept/{d}/PATHS")
+        expect_fail_ok = any(r.get("wp") == wp and r.get("mode") == "expect-fail"
+                             and r.get("conclusion") == "success" for r in self.runs)
+        det["paths"] = paths_text is not None
+        det["expect_fail_success"] = expect_fail_ok
+        if paths_text is None or not expect_fail_ok:
+            return 0
+        l2 = self.l2_commit(wp, lanedlib.parse_paths(paths_text))
+        if l2 is None:
+            return 1
+        l2_sha = self.tree.history[l2][0]
+        det["l2_commit"] = l2_sha
+        relevant = [r for r in self.runs
+                    if r.get("wp") == wp and r.get("event") == "push" and r.get("mode") == "accept"
+                    and self.tree.position.get(r.get("head_sha", ""), -1) >= l2]
+        relevant.sort(key=lambda r: (self.tree.position[r["head_sha"]], r.get("created_at", "")))
+        if not relevant:
+            return 2
+        last = relevant[-1]
+        det["last_main_run"] = {"head_sha": last["head_sha"], "conclusion": last.get("conclusion")}
+        if last.get("conclusion") != "success":
+            return 2
+        ok, why = self.evidence_ok(wp)
+        det["evidence"] = why
+        if not ok:
+            return 3
+        review = self.reviewed(wp)
+        det["review"] = review
+        if review is None:
+            # §17.1: L4 is "n/a" for ci-only WPs. They pass it automatically on
+            # the way up, but never stop at it: their level is L3 until L5.
+            return 4 if self.plan["wps"][wp]["external"] else 3
+        tag = self.released(l2_sha)
+        det["release_tag"] = tag
+        if tag is None:
+            return 5
+        if not self.live(wp):
+            return 6
+        return 7
+
+    # -- side states ---------------------------------------------------------
+    def side_state(self, wp: str) -> str | None:
+        info = self.plan["wps"][wp]
+        if info["parked"]:
+            return "parked"
+        blocked = self.tree.show(f"evidence/blocked/{lanedlib.wp_dir(wp)}.md")
+        if blocked is not None:
+            first = blocked.strip().split("\n", 1)[0] if blocked.strip() else ""
+            m = re.match(r"^Reason:\s*([A-Za-z0-9_-]+)", first)
+            return f"blocked:{m.group(1) if m else 'unspecified'}"
+        for did, dec in self.plan["decisions"].items():
+            if decision_blocking(dec) and lanedlib.has_token(info["depends"], did):
+                return f"blocked:{did}"
+        for oa in self.plan["owner_inputs"].values():
+            if (oa["status"].lower().startswith("open") and lanedlib.has_token(oa["unblocks"], wp)
+                    and (not oa["evidence"] or self.tree.show(oa["evidence"]) is None)):
+                return "blocked:owner"
+        if self.levels[wp] < 2:
+            for dep in self.plan["wps"]:
+                if dep != wp and lanedlib.has_token(info["depends"], dep) and self.levels[dep] < 2:
+                    return "blocked:dependency"
+        return None
+
+
+def decision_closed(dec: dict) -> bool:
+    return dec["status"].lower().startswith(CLOSED_DECISION)
+
+
+def decision_blocking(dec: dict) -> bool:
+    return dec["status"].lower().startswith("open") and dec["class"].startswith("S")
+
+
+# ---------------------------------------------------------------------------
+# Stages, milestones, counters
+# ---------------------------------------------------------------------------
+
+def compute(tree: RefTree, plan: dict, runs: list[dict], tag_glob: str | None) -> dict:
+    board = Board(tree, plan, runs, tag_glob)
+    wps = plan["wps"]
+    for wp in wps:
+        board.levels[wp] = board.level(wp)
+    sides = {wp: board.side_state(wp) for wp in wps}
+    levels = board.levels
+
+    def at(names, n: int) -> tuple[bool, str]:
+        names = list(names)
+        low = [w for w in names if levels.get(w, -1) < n]
+        return (bool(names) and not low,
+                f"{', '.join(names) if len(names) <= 6 else str(len(names)) + ' WPs'} at >= L{n}"
+                + (f" (below: {', '.join(low)})" if low else ""))
+
+    group = lambda g: [w for w, i in wps.items() if i["group"] == g and not i["parked"]]  # noqa: E731
+    build = group("build") + group("laned_core")
+    exec_for = {}
+    for w, i in wps.items():
+        m = re.search(r"\b(S[0-9B]\w*)\b", i["stage"]) if i["group"] == "execution" else None
+        if m and m.group(1) not in exec_for:
+            exec_for[m.group(1)] = w
+
+    t_total = plan["t_rows"]
+    matrix_text = tree.show("evidence/s3_matrix.json")
+    passed_rows: set[str] = set()
+    if matrix_text:
+        try:
+            rows = json.loads(matrix_text).get("rows", {})
+            passed_rows = {t for t, v in rows.items() if isinstance(v, dict) and v.get("passed") is True}
+        except (json.JSONDecodeError, AttributeError):
+            passed_rows = set()
+    t_passed = [t for t in t_total if t in passed_rows]
+
+    decs = plan["decisions"]
+    all_closed = all(decision_closed(d) for d in decs.values())
+    sb0_closed = all(d in decs and decision_closed(decs[d]) for d in SB0_DECISIONS)
+
+    reqs: dict[str, list[tuple[bool, str]]] = {
+        "S0": [(all_closed, "every decision decided, withdrawn or deferred-to-stage"), at(["W0"], 3)],
+        "S0a": [at(["R6x"], 4)],
+        "S0b": [at(["R2x"], 4)],
+        "S0c": [at(["R7t", "R7m"], 4)],
+        "S1": [at(["W1", "W0b", "W3a", "R16"], 4)],
+        "S2": [at(build, 5)],
+        "S2b": [at(["R9"], 4)],
+        "S3": [at(["X3"], 4), (bool(t_total) and len(t_passed) == len(t_total), "every T-row passed")],
+        "S4": [at(["X4"], 4), at(build, 6)],
+        "S5": [at(["X5"], 4), at(build, 6)],
+        "S6": [at(["X6a"], 4), at(group("laned_core"), 7)],
+        "SB0": [(sb0_closed, "D35-D42 and D42b decided")],
+        "SB1": [at(SB1_WPS, 5)],
+        "SB2": [at(["WB19"], 4)],
+        "SB3": [],
+        "SB4": [],
+        "SB5": [at(group("laneb"), 7)],
+        "S7": [at(["X7"], 4)],
+        "S8": [at(["W6-S8"], 4)],
+    }
+    stages: dict[str, dict] = {}
+    for stage in STAGE_ORDER:
+        if stage in exec_for:
+            w = exec_for[stage]
+            path = wps[w]["evidence"] or f"evidence/{lanedlib.wp_dir(w)}.json"
+            g_ok, g_why = lanedlib.check_evidence(tree.show(path), path, w)
+        else:
+            path = lanedlib.gate_path(stage)
+            g_ok, g_why = lanedlib.check_gate(tree.show(path), stage)
+        checks = [{"check": why, "passed": ok} for ok, why in reqs[stage]]
+        if stage == "SB4":
+            checks.append({"check": "S5 complete (shared release)",
+                           "passed": stages["S5"]["state"] == "complete"})
+        complete = all(c["passed"] for c in checks) and g_ok
+        stages[stage] = {"state": "complete" if complete else "incomplete", "requirements": checks,
+                         "gate": {"evidence": path, "passed": g_ok, "detail": g_why}}
+
+    done = lambda *ss: all(stages[s]["state"] == "complete" for s in ss)  # noqa: E731
+    milestones = {
+        "Build-complete": done("S2"),
+        "Launch-ready": done("S0", "S0a", "S0b", "S0c", "S1", "S2", "S2b", "S3", "S4", "S5"),
+        "Live": done("S6", "SB5"),
+        "Done": done("S7"),
+    }
+    milestones = {k: "complete" if v else "incomplete" for k, v in milestones.items()}
+
+    covered: set[int] = set()
+    for wp in wps:
+        if levels[wp] < 3:
+            continue
+        prefix = f"tests/accept/{lanedlib.wp_dir(wp)}/"
+        for path in sorted(tree.files):
+            if path.startswith(prefix) and path.endswith(".py"):
+                for n in re.findall(r"def\s+test_inv(\d+)_", tree.show(path) or ""):
+                    if 1 <= int(n) <= N_INVARIANTS:
+                        covered.add(int(n))
+
+    orphans = []
+    for t in t_total:
+        owners = plan["t_owners"].get(t)
+        if owners is None or not any(lanedlib.has_token(owners, w) for w in wps):
+            orphans.append(t)
+
+    blocked: dict[str, list[str]] = {}
+    for wp in wps:
+        s = sides[wp]
+        if s and s.startswith("blocked:"):
+            blocked.setdefault(s.split(":", 1)[1], []).append(wp)
+
+    oa_out = {}
+    for oa, info in plan["owner_inputs"].items():
+        ev = info["evidence"]
+        oa_out[oa] = {"status": info["status"], "unblocks": info["unblocks"], "evidence": ev,
+                      "present": bool(ev) and tree.show(ev) is not None}
+
+    return {
+        "schema": "laned_build/1",
+        "ref": tree.ref,
+        "commit": tree.commit,
+        "generated_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "wps": {wp: {"level": lvl(levels[wp]), "side_state": sides[wp],
+                     "runs_in": wps[wp]["runs_in"], "external": wps[wp]["external"],
+                     "group": wps[wp]["group"], **board.detail.get(wp, {})} for wp in wps},
+        "stages": stages,
+        "milestones": milestones,
+        "decisions": {d: {**info, "blocking": decision_blocking(info)} for d, info in decs.items()},
+        "owner_inputs": oa_out,
+        "counters": {
+            "t_rows": {"passed": len(t_passed), "total": len(t_total)},
+            "invariants": {"covered": sorted(covered), "total": N_INVARIANTS},
+            "orphans": orphans,
+            "blocked": [{"reason": r, "count": len(ws), "wps": sorted(ws)} for r, ws in blocked.items()],
+        },
+    }
+
+
+def render_md(data: dict) -> str:
+    c = data["counters"]
+    out = [
+        "# Lane D build status",
+        "",
+        f"Generated by `scripts/laned/status` at {data['generated_at']} from `{data['ref']}` "
+        f"(`{data['commit'][:12]}`). Do not edit by hand (plan §17).",
+        "",
+        "## Counters",
+        "",
+        f"- T-rows passed: {c['t_rows']['passed']}/{c['t_rows']['total']}",
+        f"- Invariants covered at L3+: {len(c['invariants']['covered'])}/{c['invariants']['total']} "
+        f"({', '.join(map(str, c['invariants']['covered'])) or 'none'})",
+        f"- Orphan T-rows: {', '.join(c['orphans']) or 'none'}",
+        "- Blocked: " + ("; ".join(f"{b['reason']} {b['count']} ({', '.join(b['wps'])})"
+                                   for b in c["blocked"]) or "none"),
+        "",
+        "## Milestones",
+        "",
+        "| Milestone | State |",
+        "|---|---|",
+        *[f"| {k} | {v} |" for k, v in data["milestones"].items()],
+        "",
+        "## Stages",
+        "",
+        "| Stage | State | Gate evidence |",
+        "|---|---|---|",
+        *[f"| {s} | {v['state']} | `{v['gate']['evidence']}`: {v['gate']['detail']} |"
+          for s, v in data["stages"].items()],
+        "",
+        "## Work packages",
+        "",
+        "| WP | Level | State |",
+        "|---|---|---|",
+        *[f"| {wp} | {v['level']} | {v['side_state'] or '-'} |" for wp, v in data["wps"].items()],
+        "",
+        "## Open decisions and owner inputs",
+        "",
+    ]
+    open_d = [f"- {d}: {v['status']} (class {v['class']}{', blocking' if v['blocking'] else ''})"
+              for d, v in data["decisions"].items() if not v["status"].lower().startswith(CLOSED_DECISION)]
+    open_oa = [f"- {oa}: {v['status']}; evidence `{v['evidence']}` {'present' if v['present'] else 'absent'}"
+               for oa, v in data["owner_inputs"].items() if v["status"].lower().startswith("open")]
+    out.extend(open_d + open_oa or ["- none"])
+    out.append("")
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# Publishing to laned/build-state
+# ---------------------------------------------------------------------------
+
+def push(root: Path, remote: str, files: dict[str, Path], ref_commit: str) -> str:
+    branch = f"refs/heads/{BUILD_STATE}"
+    remote_head = lanedlib.git(root, "ls-remote", remote, branch).stdout.split()
+    parent = None
+    if remote_head:
+        lanedlib.git(root, "fetch", "--no-tags", "-q", remote, branch)
+        parent = lanedlib.git(root, "rev-parse", "FETCH_HEAD").stdout.strip()
+        if parent != remote_head[0]:
+            raise RuntimeError(f"fetched {parent} but {remote} has {remote_head[0]}")
+    with tempfile.TemporaryDirectory(prefix="laned-status-") as tmp:
+        env = dict(os.environ, GIT_INDEX_FILE=str(Path(tmp) / "index"))
+
+        def g(*args: str) -> str:
+            return lanedlib.git(root, *args, env=env).stdout.strip()
+
+        if parent:
+            g("read-tree", parent)
+        else:
+            g("read-tree", "--empty")
+        for dest, src in files.items():
+            blob = g("hash-object", "-w", str(src))
+            g("update-index", "--add", "--cacheinfo", f"100644,{blob},{dest}")
+        tree = g("write-tree")
+        args = ["commit-tree", tree, "-m", f"status: laned build board for {ref_commit[:12]}"]
+        if parent:
+            args[2:2] = ["-p", parent]
+        commit = g(*args)
+    lanedlib.git(root, "push", "-q", remote, f"{commit}:{branch}")
+    return commit
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="status", description=__doc__.split("\n\n")[0])
+    ap.add_argument("--root", default=".")
+    ap.add_argument("--ref", default="origin/main")
+    ap.add_argument("--ci-results", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--release-tag-glob")
+    ap.add_argument("--push", metavar="REMOTE")
+    ap.add_argument("--include", action="append", default=[], metavar="SRC:DEST",
+                    help="extra file committed to laned/build-state with --push")
+    args = ap.parse_args(argv)
+    root = Path(args.root).resolve()
+    tree = RefTree(root, args.ref)
+    plan_text = tree.show(PLAN)
+    if plan_text is None:
+        print(f"status: {PLAN} not found at {args.ref}", file=sys.stderr)
+        return 1
+    ci_path = lanedlib.resolve(root, args.ci_results)
+    runs = json.loads(ci_path.read_text()).get("runs", []) if ci_path.is_file() else []
+    data = compute(tree, parse_plan(plan_text), runs, args.release_tag_glob)
+    out = lanedlib.resolve(root, args.out)
+    md_path = out / "docs" / "plans" / "STATUS.md"
+    json_path = out / "status" / "laned_build.json"
+    md_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.write_text(json.dumps(data, indent=2, sort_keys=False) + "\n")
+    md_path.write_text(render_md(data))
+    summary = ", ".join(f"{wp} {v['level']}" for wp, v in data["wps"].items())
+    print(f"status: {len(data['wps'])} WP(s) at {tree.commit[:12]}: {summary}")
+    if args.push:
+        files = {"docs/plans/STATUS.md": md_path, "status/laned_build.json": json_path}
+        for spec in args.include:
+            src, _, dest = spec.partition(":")
+            if not dest:
+                ap.error(f"--include needs SRC:DEST, got {spec!r}")
+            files[dest] = lanedlib.resolve(root, src)
+        commit = push(root, args.push, files, tree.commit)
+        print(f"status: pushed {commit[:12]} to {args.push} {BUILD_STATE}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
