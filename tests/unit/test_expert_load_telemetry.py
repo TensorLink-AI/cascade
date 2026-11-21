@@ -17,7 +17,6 @@ from cascade.trainer import expert_load as el  # noqa: E402
 from cascade.trainer.toto2_trainer import Toto2Trainer  # noqa: E402
 from scripts.pyramid_config import local_config  # noqa: E402
 
-
 # ── stats ──────────────────────────────────────────────────────────────────
 
 def test_balanced_load_has_every_expert_effective():
