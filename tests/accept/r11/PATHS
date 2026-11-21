@@ -1,0 +1,6 @@
+# R11 shipped-config startup-gate harness (plan §3.0 R11, T26).
+# cascade/laned/ is shared with R1 (cli.py, blocks.py), R2 (notes.py), R6
+# (dedrift.py) and R10 (restore.py): the builder keeps __init__.py and other
+# WPs' files intact.
+cascade/laned/__init__.py
+cascade/laned/startup_gates.py
