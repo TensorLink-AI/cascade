@@ -39,6 +39,7 @@ runs stay blocked until each one is answered here.
    fetching ≥ 2 consecutive pinned daily `pool` snapshots and one `pool_mkt`
    run of snapshots to a non-box host (GitHub Actions or the builder), and say
    where. They're never fetched to the prod box.
+8. **OA8, pod approval for LB6 (WB19).** Approve one pinned-torch testnet pod (8×H100, matching the lane A full-leg SKU) for an expert-only leg vs a full leg on the same SKU. Give a cost cap.
 7. **OA7, input plan.** The brief's PLAN START/END block contained only the
    template placeholder. I used the latest local plan (v2 design + the v3
    loop-readiness §3) as commit 1. If you meant a different v2 file, say so
@@ -70,4 +71,7 @@ runs stay blocked until each one is answered here.
 | C: DEC-CA-0070 draft (proposed) | done | 0069 is taken by unmerged PR #482 |
 | §15 incentive review folded in as [DECIDE] D25–D32 | done | |
 | Lifecycle trace `docs/plans/lane_d_lifecycle.md` | in progress | |
+| rev4 lane B (§12b, WB10–WB21, TB10–TB22, SB track, D35–D42) | done | |
+| DEC-CA-0069 amendment rev4 (on top of PR #482's text) | done | |
+| LB6 expert-leg cost measurement | blocked: needs owner | OA8 |
 | PR | todo | |
