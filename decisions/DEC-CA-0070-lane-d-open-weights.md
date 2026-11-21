@@ -102,6 +102,7 @@ Rows D25–D32 are tokenomics or owner calls from the rev3 incentive review
 ## Not decided here
 
 - The loop-readiness build pass runs after these are settled.
-- The S1 numbers that size `d_margin` and the floors are in
-  `docs/plans/LANE_D_S1_RESULTS.md`. Runs blocked on owner inputs are listed
-  in `docs/plans/LANE_D_PROGRESS.md`.
+- The S1 numbers that size `d_margin` and the floors are in the plan's
+  Appendix B (`docs/plans/LANE_D_PLAN.md`). Runs blocked on owner inputs are
+  listed in the plan's §17.4 and on the status board (`docs/plans/STATUS.md`
+  on branch `laned/build-state`).

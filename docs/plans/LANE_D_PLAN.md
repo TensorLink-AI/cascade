@@ -1,9 +1,69 @@
 # Plan: lane D "open weights" (anything goes on our architecture), with lane E and lane A flexibility — v3
 
-Status: **PLAN v3, rev5 (proposed 2026-11-21)**: v2's design, made buildable by an
+Status: **PLAN v3, rev6 (proposed 2026-11-21)**: v2's design, made buildable by an
 autonomous loop. A work package is done **only when its Accept command exits
-0**. Owner decisions are marked **[DECIDE]**. Nothing is armed. **No calendar
+0**; **(rev6)** its level is only what `scripts/laned/status` computes (§17),
+never a claim. Owner decisions are marked **[DECIDE]**. Nothing is armed. **No calendar
 dates**: stages are gated (§5).
+
+## rev6 (completion rubric, loop-readiness fixes, stale items; main @ 07117e1, 2026-11-21)
+
+Plan text only. No code, chain.toml or prod-box changes, and **no design
+change**. Every changed item is marked **(rev6)**. Anything else I'd change is
+under "Proposed design changes" (change 22), not applied.
+
+**Base.** The branch `claude/sleepy-cray-7uutm1` is on the remote and already
+contains origin/main `07117e1` (main hasn't moved since rev5), so no rebase was
+needed and no force-push was done. The repo facts below were re-checked on
+`07117e1`.
+
+**Changelog (brief item → where it landed):**
+
+| Item | Change | Landed in |
+|---|---|---|
+| 1 | §17 "Completion rubric and status board": `scripts/laned/status` → `docs/plans/STATUS.md` + `status/laned_build.json` on `laned/build-state` (never merged); 17.1 levels L0–L7 + side states; 17.2 stage completion; 17.3 counters; 17.4 decision register (status, option, class S/O, who/when) + owner inputs OA1–OA8; 17.5 milestones; 17.6 agent rules | §17 (new); status line; §3 conventions |
+| 2a | §3.1 rule 6: a tests-only PR then ONE implementation PR; consistent with rule 1. Rule 7 and the Review WPs paragraph count WPs at L3 | §3.1, §3.0 Review WPs |
+| 2b | W0c adds (i) `scripts/laned/status` + `accept --gate`; (ii) `laned-accept.yml` (PRs labelled `laned:<WP>`, expect-fail mode for tests-only PRs, main after merge); (iii) the rule-1 CI check (and the `PATHS` check); (iv) self-tests (fixture repo ⇒ exact levels; planted rule-1 violation fails) | §3.0 W0c |
+| 2c | Roles named (test author, builder, preparer, reviewer); a builder never edits `tests/accept/`, the plan, `scripts/laned/` or the status files | §3 conventions, §17.6 |
+| 3a | S6 is one stage (D45): X6b removed; X6a Accept = observed `cfg-` stake ≥ 2/3 before `effective_block`, webhook test alert, first paid settlement's vectors match on ≥ 2 validators and satellite replay matches; no "≥ 2 eras of reports" | §3.0 X6a/X6b, Self-check stage map |
+| 3b | S2b: "diffs only W2–W12" → "diffs only the lane D and lane B build WPs (§5 S2)" | §5 row 7, §14.5 |
+| 3c | Appendix A → a pointer to §17 and STATUS.md; OA1–OA8 moved to §17.4 with status, what each unblocks and its evidence file; `LANE_D_PROGRESS.md` retired (pointer) | Appendix A, §17.4, Appendix B, `LANE_D_PROGRESS.md`, `decisions/DEC-CA-0070-…` |
+| 3d | Leftover shadow / separate pay stage: §1.4 D21 table ("share-0 shadow (S6a)"), §1.4 "S6b signed overlay", §5 row 12b (struck), §13 row, §15 "before S6b", v3 changelog items 4, 6, 14, Proposed change 5; `LANE_D_S1_RESULTS.md` ("S6a shadow") is retired to a pointer (change 21) | those places |
+| extra | W14 was still "blocked: needs owner (Proposed change 4)", but change 4 is accepted: W14 unblocked; T27 and the §5 kill-switch text now say "until W14 lands" | W14, T27, §5 kill switch, rev5 A2 rows |
+| extra | §5 S0 gate reads the §17.4 register | §5 row 1 |
+| extra | Proposed change 22: five §15 rows (D25–D27, D29, D31) have no recommended option; recorded as Option A, owner to confirm | Proposed design changes, §17.4 |
+
+**Propagation (item × place):**
+
+| Item | § | WP | T-row | Stage map | Docs |
+|---|---|---|---|---|---|
+| 1 §17 | done (§17, status line) | done (W0c builds the script) | n/a: no T-row tests build tooling | n/a: §17.2 is the stage rule itself | done (STATUS.md is generated, not committed) |
+| 2a rule 6 | done (§3.1 rules 6, 7; Review WPs) | n/a: applies to all WPs | n/a | n/a | n/a |
+| 2b W0c | done (§17.1 L1 expect-fail) | done (W0c) | n/a: W0c's own self-tests | n/a | n/a |
+| 2c roles | done (§3 conventions, §17.6) | n/a | n/a | n/a | n/a |
+| 3a S6 | done (§17.2 S6) | done (X6a, X6b removed) | n/a: T27 and T29 unaffected | done (S6 row) | n/a |
+| 3b S2b | done (§5 row 7, §14.5) | n/a: R9's Accept unchanged | n/a | n/a | n/a |
+| 3c Appendix A | done (Appendix A, §17.4, Appendix B) | n/a | n/a | n/a | done (`LANE_D_PROGRESS.md`, `LANE_D_S1_RESULTS.md`, DEC-CA-0070 pointer) |
+| 3d shadow leftovers | done (§1.4, §5 row 12b, §13, §15, v3 changelog, change 5) | n/a | n/a | done (S6) | done (`LANE_D_S1_RESULTS.md`) |
+| W14 unblocked | done (§5 kill switch) | done (W14) | done (T27) | n/a | n/a |
+
+**Repo facts that turned out wrong or missing:**
+
+- **W14 "blocked: needs owner (Proposed change 4)"** was stale: changes 1–17
+  were accepted in rev5.
+- **"The lane D release diffs only W2–W12"** (S2b) and Appendix A's "W2–W12 are
+  not built": the build set is W1.5–W19, W-S1–W-S3, WB10–WB23 and W-EMA (§5 S2).
+- **`LANE_D_S1_RESULTS.md`** still said the forward re-check "happens at the S6a
+  shadow"; Appendix B had the rev5 fix.
+- **Nothing runs `tests/accept/` in CI today.** `.github/workflows/ci.yml` runs
+  `pytest tests/unit` only. L1 and L3 need W0c's workflow (ii).
+- **There's no Makefile on main**, so W1.5 creates `make laned-e2e` from
+  nothing (a new top-level `Makefile`).
+- **No `laned:*` GitHub labels exist.** Creating them is an owner step before
+  the first tests-only PR (W0c row).
+- **`tests/accept/`, `scripts/laned/`, `evidence/` and branch
+  `laned/build-state` don't exist yet**, as expected before W0c.
+
 
 ## rev5 (code alignment and review gaps; main @ 07117e1, 2026-11-21)
 
@@ -21,7 +81,7 @@ cited in earlier revisions, was an older commit of this branch.
 | Item | Change | Landed in |
 |---|---|---|
 | A1 | Training rows 128 patches; 8k/16k/32k/128k = 2×/4×/8×/32×; CPM span ≤ 16 patches ⇒ horizons ≤ 512 points | §1.1 (architecture facts, 128k bullet, Horizon "longer rungs") |
-| A2 | Missing lane D report = check can't run: old vector re-asserted for `stale_after_blocks` (3600), then a whole-vector burn; W14 blocked on Proposed change 4 | §5 kill switch, §10.8, W14, T27, Proposed change 4 |
+| A2 | Missing lane D report = check can't run: old vector re-asserted for `stale_after_blocks` (3600), then a whole-vector burn; W14 blocked on Proposed change 4 (**(rev6)** change 4 accepted; W14 unblocked) | §5 kill switch, §10.8, W14, T27, Proposed change 4 |
 | A3 | `[generation] king_publish` (`chain.toml:1555` on `07117e1`) | §15 D26 |
 | A4 | King check = `king_check_gate` over four suites; W-S1 names it | §16, W-S1 |
 | A5 | `netconfig.py:210`; `lane_d.py:78-79` | W2 |
@@ -59,7 +119,7 @@ cited in earlier revisions, was an older commit of this branch.
 | Item | § | WP | T-row | Key list | §14.2 | Report schema | State | Docs |
 |---|---|---|---|---|---|---|---|---|
 | A1 | done | n/a: fact only | n/a: T7 measures contexts | n/a | n/a | n/a | n/a | n/a: LANE_D.md cites §1.1 |
-| A2 | done | done (W14) | done (T27) | n/a | n/a | n/a: change 4 undecided | n/a | n/a: OPERATOR row points at §5 |
+| A2 | done | done (W14) | done (T27) | n/a | n/a | n/a: change 4 undecided (**(rev6)** accepted) | n/a | n/a: OPERATOR row points at §5 |
 | A3 | done | n/a | n/a | n/a | n/a | n/a | n/a | n/a |
 | A4 | done | done (W-S1) | n/a: TS1–TS3 unchanged | n/a | n/a | n/a | n/a | n/a |
 | A5 | done | done (W2) | n/a | n/a | n/a | n/a | n/a | n/a |
@@ -170,7 +230,8 @@ new. Every changed item is marked **(rev4)**.
 This pass changes the design: items A1–A11 of the rev3 brief, plus the
 incentive review in §15. Every changed item is marked **(rev3)**. New
 decisions are D20–D24 and D25–D32 (§15). The S1 measurements are in
-`LANE_D_S1_RESULTS.md` and the run status in `LANE_D_PROGRESS.md`. The
+`LANE_D_S1_RESULTS.md` and the run status in `LANE_D_PROGRESS.md` **(rev6: both retired; status is
+§17, results are Appendix B)**. The
 v3 loop-readiness material below predates rev3. A new loop-readiness pass
 runs only after the owner settles rev3's [DECIDE]s.
 
@@ -201,12 +262,13 @@ and decisions D1–D18 stay as they were in v2. Changes:
    lane D intake → trainer, and all 8 snapshot files from §10.8 are listed.
 3. **§14.4 / §14.5:** "S1b" renamed to S0a–S0c (§5).
 4. **§13** "live overrides" row: "typed-block activation" → "signed-overlay
-   activation (D10; S0c, S6a)".
+   activation (D10; S0c, S6a)" **(rev6: S6a is now S6, D45)**.
 5. **§1.2:** sub tokens were said to suit the eval pod, which contradicted
    "presigned GETs only, no credentials on pods". It now says builder only;
    the pod gets presigned GETs.
 6. **§1.4:** the `takes_from` change goes by the S6b signed overlay, not a
-   chain.toml edit (consistent with §5 S6b and §14.2).
+   chain.toml edit (consistent with §5 S6b and §14.2). **(rev6)** S6b is
+   merged into S6: it's the one S6 activation overlay (D45).
 7. **§1.3:** "judged once on that frozen set" → "judged once on its cohort's
    intersection set, ⊆ its frozen set" (consistent with §1.3 Cohorts).
 8. **§1.3b:** "rows come from cached sweeps" → "re-swept in the same host
@@ -243,7 +305,8 @@ and decisions D1–D18 stay as they were in v2. Changes:
 
     The invariants also now name their owning WPs.
 14. **§5 S6a and §6: D19**, an owner-run shadow test entry on a dedicated
-    hotkey (recommended).
+    hotkey (recommended). **(rev6) Superseded** by D45 and D19 (rev5): the test
+    entries run on testnet in S3; there's no mainnet shadow and no S6a.
 15. **§3 restructured for the loop:**
     - Accept and Runs-in columns.
     - The `scripts/laned/accept` convention.
@@ -359,8 +422,7 @@ and decisions D1–D18 stay as they were in v2. Changes:
 | S3 | R14, X3 |
 | S4 | R12, X4 |
 | S5 | R5, R8, X5 |
-| S6a | R4, X6a |
-| S6b | X6b |
+| S6 **(rev6)**: one stage (D45); S6a/S6b and X6b removed | R4, X6a |
 | S7 | W11, X7 |
 
 **§11.1 → WPs:**
@@ -436,7 +498,7 @@ the code). Each is verified where marked.
      have refused seq N;
    - or a code change that clears refusals on release upgrade.
 
-   Affects §5 S6a, §14.1, T23.
+   Affects §5 S6 **(rev6)**, §14.1, T23.
 6. **Reuse MarketCast** (DEC-CA-0064: forward windows, absolute-grid window
    ids, signed per-window report with quantile sidecars, absent/deferred
    states) instead of reinventing W5/W7. Affects W5a–W7d.
@@ -517,6 +579,17 @@ the code). Each is verified where marked.
 21. **(rev5) Retire `LANE_D_PROGRESS.md` and `LANE_D_S1_RESULTS.md`.**
     Appendices A and B duplicate them, and the progress file still has the
     old OA order and OA8 text. Keep one copy (the plan).
+    **(rev6) Applied:** `LANE_D_PROGRESS.md` and Appendix A are retired in
+    favour of the §17 status board; the owner inputs moved to §17.4;
+    `LANE_D_S1_RESULTS.md` is now a pointer to Appendix B (its copy still
+    said the forward re-check "happens at the S6a shadow").
+22. **(rev6) §15 rows with no recommendation.** D25, D26, D27, D29 and D31
+    give Option A (keep v2) and Option B, with no recommended option, so "all
+    other recs" doesn't strictly settle them. §17.4 records them as **decided:
+    Option A (keep v2, the design the WPs build)**, so they don't block W8 or
+    W5b. Proposed: the owner confirms Option A, or names the Option B rows to
+    adopt; any Option B is a structural change to W8 (court pay) and goes in
+    as a new WP row.
 
 ## 0. Summary
 
@@ -1033,8 +1106,8 @@ every challenger shares one window draw and the king's scores
 
   | | Option 1: **burn** (v2 default) | Option 2: **return to lane A** while the house reigns |
   |---|---|---|
-  | For | Matches §14.2, where `remainder` is a release-only burn destination. Lane A's share is fixed, so invariant 2, the share-0 shadow and satellite weight derivation are unchanged | The house is lane A miners' work, so lane A's contributors are paid for it |
-  | Against | Emission withheld whenever our pipeline is the best | §14.2 must change (a new release-only `house_remainder` destination). Lane A's share varies per settlement, which touches invariant 2, the share-0 shadow (S6a) and satellite derivation (W7d), and adds test rows |
+  | For | Matches §14.2, where `remainder` is a release-only burn destination. Lane A's share is fixed, so invariant 2 and satellite weight derivation are unchanged (**(rev6)** the share-0 shadow no longer exists, D45) | The house is lane A miners' work, so lane A's contributors are paid for it |
+  | Against | Emission withheld whenever our pipeline is the best | §14.2 must change (a new release-only `house_remainder` destination). Lane A's share varies per settlement, which touches invariant 2 and satellite derivation (W7d), and adds test rows (**(rev6)** no shadow stage, D45) |
   | Dethroned house | Never enters the court (the court is miner kings only). No tail | Same: no tail. The slot moves to the new miner king at once |
 
   Under **both** options the house is never a prior king, and prior miner
@@ -1043,8 +1116,9 @@ every challenger shares one window draw and the king's scores
 **Share [DECIDE D1]**
 
 - **(rev5, owner)** `[lane_d] share = 0.25`, `takes_from = "lane_a"`, `remainder = "burn"`.
-- The deployed file has `takes_from = "lane_b"`. It's changed **by the S6b
-  signed overlay** (§5, §14.2), not by a chain.toml edit.
+- The deployed file has `takes_from = "lane_b"`. It's changed **by the S6
+  activation overlay** **(rev6;** S6b merged into S6, D45**)** (§5, §14.2), not by
+  a chain.toml edit.
 - When B and C also arm, the split is **(rev5, owner) A 25 / B 25 / C 25 / D 25**.
 - Live emission is `lane_parts` + `lane_pool_shares` + `emission_vector`
   under the DEC-CA-0055 ladder (`cascade/shared/emission.py:330-420`). The
@@ -1351,6 +1425,22 @@ Accept command exits 0**, never on a builder's word. Conventions:
 - **Owner steps** (remote writes, spend, merges, publishes, announcements):
   the loop prepares the script and artefacts and runs their dry-run checks;
   the owner executes. Accept checks the recorded result.
+- **(rev6) Roles.** Each is a fresh-context agent; one agent never holds two
+  roles on the same WP.
+  - **Test author:** writes only `tests/accept/<wp>/` and its `PATHS`, from the
+    WP row, its T-rows and the invariants it owns, copied from this plan. The
+    tests must fail on main for the right reason (§17.1 L1). Opens a
+    tests-only PR labelled `laned:<WP>`.
+  - **Builder:** starts from origin/main after L1 and opens ONE implementation
+    PR labelled `laned:<WP>`, staged with explicit paths. **A builder never
+    edits `tests/accept/`, this plan, `scripts/laned/` or any status file
+    (`status/laned_build.json`, `docs/plans/STATUS.md`).**
+  - **Preparer** (external and owner WPs): writes the scripts and runs their
+    dry-runs only; the owner executes and the evidence verifier checks the
+    result.
+  - **Reviewer** (RVn): read-only on main; writes `evidence/rv<n>.md`.
+  - Completion is never self-reported: only `scripts/laned/status` moves a
+    level (§17.6).
 
 ### 3.0 Work packages
 
@@ -1358,7 +1448,7 @@ Accept command exits 0**, never on a builder's word. Conventions:
 
 | WP | What | Depends | Runs in | Accept |
 |---|---|---|---|---|
-| W0c | Loop tooling: `scripts/laned/accept`; `stub_scan.py` (refuses `TODO`, `FIXME`, `pass`-only bodies, `NotImplementedError`, `...` bodies, hardcoded sample values and mock imports outside `tests/`); `unread_keys.py` (every `[lane_d]`/`[lane_d_ops]` key is read by a parser); `follower_patterns.py` (every lane D log call has a cascade-ops follower pattern) | — | ci | `scripts/laned/accept W0c` (self-tests: each script fails on a planted violation fixture and passes on a clean one) |
+| W0c | Loop tooling: `scripts/laned/accept`; `stub_scan.py` (refuses `TODO`, `FIXME`, `pass`-only bodies, `NotImplementedError`, `...` bodies, hardcoded sample values and mock imports outside `tests/`); `unread_keys.py` (every `[lane_d]`/`[lane_d_ops]` key is read by a parser); `follower_patterns.py` (every lane D log call has a cascade-ops follower pattern). **(rev6) Also:** (i) `scripts/laned/status` per §17: computes every WP's level, the stage and milestone state, the decision register and the §17.3 counters from `git log origin/main`, GitHub Actions results on main and `evidence/`, and writes `docs/plans/STATUS.md` + `status/laned_build.json` to branch `laned/build-state` (never merged to main); `accept --gate <stage>` verifies a stage's exit-gate evidence (§17.2); (ii) a GitHub Actions workflow `.github/workflows/laned-accept.yml` that runs `scripts/laned/accept <WP>` on every PR labelled `laned:<WP>` and, on push to main, for every WP at ≥ L2. On a tests-only PR it runs in **expect-fail** mode: it passes only if the new tests are collected and fail for the right reason (an assertion failure, or a missing module/attribute named in the WP's `PATHS`), never on a syntax, fixture or import error elsewhere. Today `ci.yml` runs only `pytest tests/unit`, so nothing runs `tests/accept/` yet; (iii) the CI check that fails any PR that edits `tests/accept/` together with a path outside `tests/accept/` (rule 1), and any implementation PR touching a path not in its WP's `PATHS`; (iv) self-tests for (i)–(iii), listed in Accept. Creating the `laned:<WP>` label set is an owner step (`gh label create`); none exists today | — | ci | `scripts/laned/accept W0c` (self-tests: each script fails on a planted violation fixture and passes on a clean one; **(rev6)** `scripts/laned/status` on a fixture repo (fixture git history, CI results and evidence) yields the exact expected level for every fixture WP, including side states and a WP that regresses from L3 to L2; a planted rule-1 violation (tests + implementation in one PR) fails the workflow's check; an expect-fail run passes on correctly failing tests and fails on a syntax-error test file) |
 | W0 | DEC-CA-0070 (supersedes DEC-CA-0062's recipe design) recording **(rev5)** D1–D43, D45–D48 and D42b (D44 withdrawn) (D25–D32 from §15, D33–D35 §16, D36–D42 §12b) | — | ci + owner merge | `scripts/laned/accept W0` (front matter valid; `supersedes: DEC-CA-0062`; **(rev5)** every decision D1–D43, D45–D48 and D42b answered or marked resolved) |
 | W0b | Context-equivalence test: the lane D scorer at 4096 equals the pinned `pyramid_wrapper` output (within tolerance) on windows with ≥ 4096 history; a 4096 checkpoint loads `strict=True` at every context variant  **(rev5)** It compares **quantile-head** outputs at the 9-level grid (the lane A scoring path under `quantile_head_after`), not samples. | W5d | ci | `scripts/laned/accept W0b` |
 
@@ -1429,7 +1519,7 @@ Accept command exits 0**, never on a builder's word. Conventions:
 | W12a | Docs and agent surfaces (§11.2 text surfaces, website; **rev3:** LANE_D.md FAQ on coldkey caps, confirmation latency, both clocks, BF16; VALIDATOR.md on what satellites verify for the new report fields; OPERATOR.md on launch eval host, S8, first-seen recorder) | W10 | ci | `scripts/laned/accept W12a` (every §11.2 surface mentions lane D; links resolve; `llms.txt` lane list matches the status fixture) |
 | W12b | `cascade status --json` and `discovery-check` lane D fields | W2, W17 | ci | `scripts/laned/accept W12b` |
 | W13 | King publication (§11.1): Hippius Hub, R2, HF mirror, signed `champions/lane_d/index.json`, `laned-king-sync.yml`, cards, one-digest check  **(rev5)** A takedown path for the Hub and HF mirrors (licence or rights claim ⇒ unpublish the mirrors, keep the digest and verdict record). | W5e, W3a | ci + testnet | `scripts/laned/accept W13` |
-| W14 | **(rev5) blocked: needs owner (Proposed design change 4).** Lane D-only fast kill: a `lane_d: {status: "absent"}` receipt state with a lane D-only burn. Today a missing lane D report makes satellites re-assert the old vector for one era (`stale_after_blocks = 3600`) and then burn the whole vector (`satellite.py:30-45`) | W7c, change 4 decided | ci + testnet | `scripts/laned/accept W14` |
+| W14 | ~~**(rev5) blocked: needs owner (Proposed design change 4).**~~ **(rev6) Unblocked:** change 4 was accepted (owner 2026-11-21). Lane D-only fast kill: a `lane_d: {status: "absent"}` receipt state with a lane D-only burn. Today a missing lane D report makes satellites re-assert the old vector for one era (`stale_after_blocks = 3600`) and then burn the whole vector (`satellite.py:30-45`) | W7c | ci + testnet | `scripts/laned/accept W14` |
 | W15 | Prefetch cache, LRU with KING_D and house pinned | W4 | ci + pod | `scripts/laned/accept W15` |
 | W16 | Reference fine-tune script (miner kit) | W10 | ci (CPU tiny run) + pod | `scripts/laned/accept W16` |
 | W17 | `status/lane_d.json` producer (queue, pending progress, king, board; **rev3:** per-entry reason enum including `coldkey_cap_settlement`, `confirm_pending` and reveal deadline) | W5b, W7c | ci | `scripts/laned/accept W17` |
@@ -1468,7 +1558,7 @@ Every new `[lane_b]` key below ships with:
 | W-S3 | **(rev4: now in §3)** sentinel numbers on the status boards | — | W-S1 | ci | `scripts/laned/accept W-S3` |
 
 
-**Review WPs.** After every 5 build WPs merge (counting W/R build WPs, not
+**Review WPs.** After every 5 build WPs reach **L3** (**(rev6)**, §17.1; counting W/R build WPs, not
 owner execution WPs), a **fresh-context review WP** runs. RV1, RV2, … are
 read-only reviewers against main with the plan as the spec. Accept is
 `scripts/laned/accept RVn --evidence evidence/rv<n>.md`: no unresolved
@@ -1481,8 +1571,7 @@ BLOCKING item, and each finding is either fixed or filed as a WP.
 | X3 | S3 testnet matrix T1–T29 | testnet | `scripts/laned/accept X3 --evidence evidence/s3_matrix.json` (each row's recorded pass, 6 clean eras, ≥ 1 crowning, ≥ 1 house retake) |
 | X4 | S4 release + **(rev5)** launch eval host bring-up (D11; valeval-laned only at S8) + dry-run + announcement + staged revert overlay | owner | `scripts/laned/accept X4 --evidence evidence/s4.json` |
 | X5 | S5 capability-release upgrade (eval host → validator → intake → trainer; satellites) | owner | `scripts/laned/accept X5 --evidence evidence/s5.json` (lane A unchanged ≥ 2 settlements; `--netconfig-policy` lists `lane_d`) |
-| X6a | **(rev5)** S6 readiness probe (observed `cfg-` stake before the activation block); D19 test entries moved to testnet | owner | `scripts/laned/accept X6a --evidence evidence/s6a.json` (R4 shows ≥ 2/3 `cfg-` stake before `effective_block`; ≥ 2 eras of valid reports; satellite replay matches; webhook test alert delivered) |
-| X6b | S6b pay | owner | `scripts/laned/accept X6b --evidence evidence/s6b.json` |
+| X6a | **(rev5)** S6 readiness probe and activation evidence (observed `cfg-` stake before the activation block); D19 test entries moved to testnet **(rev6)** One stage: S6 (D45). | owner | `scripts/laned/accept X6a --evidence evidence/s6a.json` (**(rev6)** observed `cfg-` stake ≥ 2/3 before `effective_block` (R4); webhook test alert delivered; from the block, the first paid settlement's vectors match on ≥ 2 validators and satellite replay matches. No "≥ 2 eras of reports" before activation) |
 | X7 | S7 operate | owner | `scripts/laned/accept X7 --evidence evidence/s7.json` |
 
 ### 3.1 Build rules
@@ -1499,10 +1588,12 @@ BLOCKING item, and each finding is either fixed or filed as a WP.
    parser reads.
 5. **Every lane D log line** has a follower pattern, checked by
    `follower_patterns.py`.
-6. **One PR per WP,** explicit paths, no stacks, owner-merged. Dependents
-   start only after the dependency is **on main** (verify `git log
-   origin/main`, never a MERGED badge).
-7. **A fresh-context review WP** after every 5 build WPs.
+6. **(rev6) Each WP has a tests-only PR (`tests/accept/<wp>/`) followed by
+   ONE implementation PR.** Explicit paths, no stacks, owner-merged;
+   dependents start only after the dependency is **on main** (verify `git log
+   origin/main`, never a MERGED badge). This matches rule 1: the tests land
+   first and alone, and the implementation PR never touches them.
+7. **A fresh-context review WP** after every 5 build WPs reach L3 **(rev6)**.
 8. **Blocked is acceptable; faked completion is not.** If a WP can't be fully
    built, the builder stops and records the blocker in `evidence/blocked/<wp>.md`.
 
@@ -1670,7 +1761,7 @@ These are pinned by tests in the WPs named.
 | T24 | Old-code trainer with a `[lane_d]` overlay published | Trainer refuses that overlay. Proves why the trainer is in S5, and that lane A stays safe while it waits |
 | T25 | Upgrade from a **copy of mainnet state** (`validator_state.db`, `activation_*`, `netconfig_state`, `cascade_state.json`) | Clean start; identical next verdict |
 | T26 | Shipped chain.toml through every validator and trainer startup gate at the live head | Starts (the #457/#460 class) |
-| T27 | Revert overlay; stop-publishing path | **(rev5)** Overlay kill latency measured. Stop-publishing: the old vector (incl. the old lane D king) is re-asserted for `stale_after_blocks`, then the **whole** vector burns, logged (today's behaviour). The lane D-only burn row is added once change 4 is decided (W14) |
+| T27 | Revert overlay; stop-publishing path | **(rev5)** Overlay kill latency measured. Stop-publishing: the old vector (incl. the old lane D king) is re-asserted for `stale_after_blocks`, then the **whole** vector burns, logged (today's behaviour). **(rev6)** Change 4 is accepted: once W14 is on main, T27 adds the lane D-only burn row (stop-publishing then burns lane D only) |
 | T28 | Eval host updated before and after the validator | Handshake fails closed when mismatched; works in the documented order |
 | T29 | A docker-based satellite (code in `/app`) following the announcement verbatim | Upgrades and signals `cfg-` |
 
@@ -1726,19 +1817,19 @@ capability release → (rev5) one activation block, live everywhere.**
 
 | # | Stage | Work | Exit gate (all must hold) |
 |---|---|---|---|
-| 1 | **S0 Decide** | **(rev5)** D1–D43, D45–D48 and D42b (incl. the §15 incentive [DECIDE]s D25–D32, the §16 sentinel D33–D35 and lane B D36–D42) (§6) in writing; W0 | All answered |
+| 1 | **S0 Decide** | **(rev5)** D1–D43, D45–D48 and D42b (incl. the §15 incentive [DECIDE]s D25–D32, the §16 sentinel D33–D35 and lane B D36–D42) (§6) in writing; W0 | All answered **(rev6)**: every D-number in the §17.4 register is decided, withdrawn or deferred-to-stage |
 | 2 | **S0a De-drift** | Classify the 21 `LIVE OVERRIDE`s in the deployed chain.toml: main, overlay, or documented operator-only; type the decided blocks in main. Overlays merge onto **each node's own base** (`build_config(base, body)` merges onto `effective_raw(base)`, `netconfig.py:346-354`), so base drift survives any overlay | `cascade-audit decided --config /root/cascade/chain.toml` = 0 drift; the validator-read consensus-key diff between deployed and main is empty |
 | 3 | **S0b Note budget** | Decode the live mainnet readiness notes and add the `cfg-` segment. It's trimmed **last** (`activation.py:1334-1357`), so older pending segments go first | No still-pending segment would be trimmed (type their decided blocks in main first if needed); T22 passes on testnet |
 | 4 | **S0c Overlay bring-up** | Publish a **benign seq-1 overlay** (restates current values only) on testnet, then mainnet. Then a deliberately refused overlay on testnet | The 404-every-poll is gone. Fetched from S3 **and** the HF mirror by our validator, the trainer and satellites. `cfg-` lock ≥ 51% in `status/chain.json`. Receipts stamp `netconfig_seq`; the `cascade-audit` netconfig check passes; the trainer logs the same apply block. The refused overlay applies nothing |
 | 5 | **S1 Measure** | W1, W0b, W3a (live Hippius probe); **(rev5)** start R16 long-history harvest (runs continuously from here, scored only from S8) | Forward floors met at the chosen margin (or re-decided); ≥ 1 context variant has `min_long_series`; storage mechanism chosen |
 | 6 | **S2 Build** | **(rev5) All build WPs**, one PR each: W1.5, W2 (with `ALLOWED["lane_d"]`) then W3–W19, W-S1–W-S3, the WB track (WB10–WB23) and W-EMA | CI green. Receipt replay on the last N mainnet receipts at the release head: **unarmed ⇒ byte-identical; armed ⇒ lane A verdicts, court and lane A weight entries identical, and lane D fields present and schema-valid** (W3b touches `bench_gate.py`/`public_guards.py`, which lane A replays). Startup-gate test of the shipped chain.toml at the live head for validator **and** trainer (T26). Docs gate |
-| 7 | **S2b Catch-up release** | Ship main-as-of-now **without** lane D code to our validator, trainer and satellites, so the lane D release diffs only W2–W12 | 2 settlements with identical vectors; no satellite burn |
+| 7 | **S2b Catch-up release** | Ship main-as-of-now **without** lane D code to our validator, trainer and satellites, so the lane D release diffs only the lane D and lane B build WPs (§5 S2) **(rev6)** | 2 settlements with identical vectors; no satellite burn |
 | 8 | **S3 Testnet** | §4 matrix including T22–T29 | §4 exit gate |
 | 9 | **S4 Release** | Cut the **capability release** (lane D unarmed, `lane_d` allow-listed). **(rev5)** Bring up the launch eval host (D11; not valeval-laned, which is rented only at S8) (on-rent check, pinned known_hosts, handshake); dry-run the house. **Stage and review the revert overlay.** Send the announcement (§11.3) | Dry-run within the measured cross-host tolerance; announcement sent; revert overlay reviewed |
 | 10 | **S5 Upgrade** | Snapshot all state (§10.8). Order, each through `deploy_gate check`/`verify` in quiet windows: **eval host → validator → lane D intake (systemd unit with the code-path guard) → trainer** (no legs in flight; memory-burst check; confirm preflight and worker-fingerprint lines unchanged). Satellites upgrade. Arm the broad watcher | Lane A unchanged on ≥ 2 settlements; `cascade-validator --netconfig-policy` lists `lane_d` on our nodes |
 | 11 | **(rev5) S6 Activate (no shadow, D45)** | **D19 (rev5):** the owner-run test entries run on **testnet** (S3), not in a mainnet shadow. Overlay seq N, **one overlay**: `[lane_d] from_block` at a far era boundary **with `share = 0.25` (rev5, D1) and `takes_from = "lane_a"`**, all lane A keys **byte-identical** to seq N-1 (no lane A tuning in a lane D overlay, ever). ~~share = 0 shadow~~ | **Observed** `cfg-` stake ≥ 2/3 (incl. the largest holder, 5E2LP6 at about 49%) at a boundary before `effective_block`. That's the only stake-weighted proof of upgrade, because only nodes on the capability release can verify a `[lane_d]` overlay. Else publish seq N+1 with a later block. Webhook test alert delivered. Keep-alive live. **(rev5)** All §4 T-rows green on testnet before the block is announced. From the block: lane D live and paid everywhere; first paid settlement's vectors match on ≥ 2 validators, satellite replay matches, `check_lane_d` passes |
 | 12 | ~~S6b Pay~~ **(rev5) merged into S6 (D45)** | — | — |
-| 12b | **(rev5) NOT PLANNED.** ~~(rev3) S6c Lane B~~ (rev4: superseded by the SB track below; it was for the parked §12 variant) | Overlay: `[lane_b] from_block` at an era boundary (shadow first: `[lane_b] share = 0` for ≥ 2 eras, then the D1 split) | TB1–TB8 passed in S3; ≥ 2 eras of valid lane B reports at share 0 with satellite replay matching; then first paid settlement's vectors match on ≥ 2 validators |
+| 12b | **(rev5) NOT PLANNED.** ~~(rev3) S6c Lane B~~ (rev4: superseded by the SB track below; it was for the parked §12 variant) | ~~Overlay: `[lane_b] from_block` at an era boundary (shadow first: `[lane_b] share = 0` for ≥ 2 eras, then the D1 split)~~ **(rev6)** struck: no shadow (D45); lane B arms at SB5 | ~~TB1–TB8 passed in S3; ≥ 2 eras of valid lane B reports at share 0 with satellite replay matching; then first paid settlement's vectors match on ≥ 2 validators~~ |
 | 12c | **(rev4) Lane B track SB0–SB5** (runs in parallel with lane D's S2–S3; depends on **S0a–S0c** de-drift, note budget and overlay bring-up, and on the shared S5 capability release) | **SB0** decide D35–D42, D42b · **SB1** build WB10–WB18, **(rev5)** WB22–WB23, W-S1–W-S2 · **SB2** WB19 measurement per GPU type (owner pod yes) · **SB3** testnet: TB10–TB27 (rev5), TS1–TS5, contamination check passing · **SB4** capability release (shared S5) · **SB5 (rev5, D45)** one overlay, once the D41 gate rule is satisfied and SB3 has passed (LB1): `[lane_b] from_block` with full share and `suite_targets` together, live everywhere at that block; no `share = 0` period. **(rev5)** If D40(b) is chosen: an image repin step (EMA constant fixed first; repin outside a seed epoch; moves lane A too) before SB3 | SB3 green including LB1's contamination check; **(rev5)** from the SB5 block, lane B live everywhere: first paid settlement's vectors match on ≥ 2 validators and satellite replay matches; gate-open evidence recorded |
 | 13 | **S7 Operate** | §10.4 runbook; §10.7 checks; revert overlay stays staged | No pending past its latency expectation without progress; first crowning (reported immediately, with seated and judged counts) or a house hold observed end-to-end |
 | 14 | **(rev3) S8 Long context** | W6-S8; rent valeval-laned (96 GB pinned torch) with owner yes; T7 at 32k/64k/128k; then an overlay adds the passing variants to `contexts` (D10) | Each added variant: T7 inside the settlement budget, W1 `min_long_series` met, overlay adopted ≥ 51% |
@@ -1765,11 +1856,11 @@ cross-checked from two sources. There are past off-by-ones (§13).
   `shared/config/satellite.py:13`). So stopping lane D reports first freezes
   lane D's pay (no kill), then burns everything.
   "Stop publishing ⇒ only lane D burns" was wrong.
-  - Until Proposed design change 4 (a `lane_d: {status: "absent"}` receipt
-    state with a lane D-only burn) is decided and shipped, **the only kill is
-    the revert overlay above**.
+  - **(rev6)** Proposed design change 4 (a `lane_d: {status: "absent"}`
+    receipt state with a lane D-only burn) is accepted and built by W14.
+    Until W14 ships, **the only kill is the revert overlay above**.
   - T27 measures the overlay path, and tests stop-publishing as "old vector
-    re-asserted for one era, then a whole-vector burn" until change 4 lands.
+    re-asserted for one era, then a whole-vector burn" until W14 lands **(rev6)**.
 
 ## 6. Owner decisions (recommended defaults)
 
@@ -2514,7 +2605,7 @@ type, OA8):**
 | Hippius credential scope and rotation | rotated key lacking bucket access | W3a; rotation runbook; T20 |
 | Hippius outages, slow transfers | 500s; upload timeouts; 1 MB/s scp | prefetch at reveal; resumable cache; async mirror |
 | Box OOM / restart in scoring windows | 10-31 OOM killed all services | nothing big on the box; S5 rules; report size bound; `box_ram` |
-| Live overrides vs repo; startup gates at externals | 21 unPR'd overrides; a 128-byte note crash-loop | keys typed in main the same day; CI startup gates; signed-overlay activation (D10; S0c, S6a) |
+| Live overrides vs repo; startup gates at externals | 21 unPR'd overrides; a 128-byte note crash-loop | keys typed in main the same day; CI startup gates; signed-overlay activation (D10; S0c, S6 **(rev6)**) |
 | Stale service code | intake ran stale code for a day | `python -P` + code-path guard; deploy-gate verify |
 | Settlement-timing traps | S+2 rule; legs after the last settlement | pending carries across eras; T18 |
 | Satellite replay divergence | reason-string mismatch ⇒ burn | invariant 7; replay CI; T12 |
@@ -2640,7 +2731,8 @@ All folded into §5:
 
 - S0a de-drift, S0b note budget and S0c overlay bring-up before any lane D
   code ships.
-- S2b catch-up release, so the lane D release diffs only lane D.
+- S2b catch-up release, so the lane D release diffs only the lane D and lane B
+  build WPs (§5 S2) **(rev6)**.
 - S5 capability release to every node **including the trainer** (shared
   overlay resolver).
 - **(rev5)** S6: activation and payment are **one overlay** (D45, no
@@ -2664,7 +2756,7 @@ at `ready`) was found sound against target leakage. The weak part is pay.
 | # | Issue | Option A (keep v2) | Option B (proposed) |
 |---|---|---|---|
 | **D25** | **Court pays rent indefinitely; salami-slicing.** The court is rank-decayed (57/29/14% of D's share at `king_decay` 0.5, 2 priors) with no TTL, and the bar is a fixed 0.01. A 3% gain released as three 1% crowns fills the whole court | Simple; matches lane A's court shape | Pay D wins on lanes B and C's `full_pay_tiers` + `half_life_rounds` + `win_ttl_eras` shape, keyed to the crowning LCB over max(KING_D, house). Or a tenure-decaying bar (e.g. 0.03 → 0.01). Or time-bound prior-king tails, like lane A's `court_bp` / `court_blocks` |
-| **D26** | **Lane A is a free input to D, and D's 20% comes out of A.** The cheapest winning D entry is "fine-tune the published house". Generators and recipe are published (**(rev5)** `[generation] king_publish = "recipe"`, `chain.toml:1555` on main `07117e1`; not `[v2]`) | Lane A is paid by its own ladder; D pays only for beating the house | A **lineage royalty**: a fixed ρ ≈ 15–20% of each D win's pay goes to the lane A king hotkey that was the house at the winner's T_E. Calibrate ρ in shadow with a weight-space nearest-ancestor measurement. Never self-declared lineage |
+| **D26** | **Lane A is a free input to D, and D's 20% comes out of A.** **(rev6:** D's share is now 25% of the total, D1/D48**)** The cheapest winning D entry is "fine-tune the published house". Generators and recipe are published (**(rev5)** `[generation] king_publish = "recipe"`, `chain.toml:1555` on main `07117e1`; not `[v2]`) | Lane A is paid by its own ladder; D pays only for beating the house | A **lineage royalty**: a fixed ρ ≈ 15–20% of each D win's pay goes to the lane A king hotkey that was the house at the winner's T_E. Calibrate ρ in shadow with a weight-space nearest-ancestor measurement. Never self-declared lineage |
 | **D27** | **Withholding from A.** A strong generator may earn more used privately in D than published in A | Accept; monitor how many D kings are far from every published A checkpoint | The D26 royalty, plus keep A's share ≥ D's |
 | **D28** | **Split.** v2 has A 30 / B 25 / C 25 / D 20 when all are armed | v2 split | Reviewer: **A 40 / D 25 / B 20 / C 15**, with D ramping 15 → 25% after ≥ 3 miner crowns pass the gate with the unselected suite not falling. Now (B, C off): A80/D20 is acceptable. Interacts with **D21**: the reviewer prefers returning the unpaid house slot to lane A over burning it **(rev5) DECIDED (owner): A 25 / B 25 / C 25 / D 25** (§6 D1, D28). |
 |  | *(rev4) Share assumption: B launches trainer-run, so its share pays generator-funded legs merged into KING_A. Until B's gate opens its share burns (D37). The A40/D25/B20/C15 proposal stands as an option; no default change.* | | |
@@ -2684,7 +2776,7 @@ Synergies from the same review:
   never stacks on D pay for the same gain.
 
 The reviewer's view on the v3 "Proposed design changes": adopt 1–4, 7–10, 12
-and 14 before S6b (with 10 = gate at 4096 for everyone). Treat 5, 6, 11, 13,
+and 14 before S6 (**(rev6)** S6b is merged into S6, D45) (with 10 = gate at 4096 for everyone). Treat 5, 6, 11, 13,
 15 and 16 as incentive-neutral ops. Those remain owner decisions and are
 **not** applied here.
 
@@ -2787,23 +2879,153 @@ per new king, roughly as v2.
 
 ---
 
-## Appendix A: run status and owner actions
+## 17. Completion rubric and status board (rev6)
 
-This mirrors `docs/plans/LANE_D_PROGRESS.md`. **This plan is the working
-document;** the separate file exists for the PR.
+**(rev6)** This section is the one source of truth for completion.
 
-Branch `claude/sleepy-cray-7uutm1`. One PR, owner merges. Report-only:
+- `scripts/laned/status` (built by W0c) computes every level below from git
+  (`git log origin/main`), GitHub Actions results on main and the files under
+  `evidence/`. It writes two outputs to branch **`laned/build-state`**, which
+  is never merged to main:
+  - `docs/plans/STATUS.md`, for people;
+  - `status/laned_build.json`, for agents.
+- **Agents never hand-edit status.** "Done" claimed in a PR, in chat or in any
+  other file doesn't count. The rest of this plan's "a WP is done only when
+  its Accept exits 0" is the L3 rule below.
+- **Bootstrap.** Until W0c is at L3, the orchestrator maintains
+  `status/laned_build.json` on `laned/build-state` by hand, using these levels
+  and the same evidence. W0c is the first WP. From W0c at L3 on, status is
+  only what the script computes.
 
-- no chain.toml values, consensus code, `cascade/pool/` or prod-box changes;
-- W2–W12 are not built.
+### 17.1 WP levels
 
-Status values: `todo` | `in progress` | `done` | `blocked: needs owner` |
-`blocked: <other>`.
+Each level needs all the levels below it.
 
-### Owner actions
+| Level | Name | Condition |
+|---|---|---|
+| L0 | todo | Listed in §3 |
+| L1 | specified | `tests/accept/<wp>/` and `PATHS` merged on main, and those tests fail on main before L2 (checked by the W0c workflow's expect-fail run) |
+| L2 | built | Implementation PR merged on main (checked with `git log origin/main`), explicit paths only (every changed path is in the WP's `PATHS`) |
+| L3 | accepted | `scripts/laned/accept <WP>` green in CI on main after the merge. A later red run on main drops the WP back to L2 |
+| L4 | evidenced | External and owner WPs only (Runs in includes `builder`, `pod`, `testnet` or `owner`): evidence JSON present, and the verifier passes against the live resource. n/a for ci-only WPs, which pass L4 automatically |
+| L5 | reviewed | Covered by an RVn whose `evidence/rv<n>.md` has no open BLOCKING item for this WP |
+| L6 | released | Its commit is an ancestor of a tagged capability release |
+| L7 | live | Its activation block has passed on mainnet and its §10.7 monitor is green for ≥ 1 era. **Owner-confirmed:** the owner merges `evidence/l7/<wp>.json` (activation block, monitor, era range) |
 
-These are the inputs the S1 runs need. They're never guessed; the dependent
-runs stay blocked until each one is answered here.
+**Side states**, always with a reason:
+
+- `blocked:<decision Dnn | external | owner | dependency>`;
+- `parked` (e.g. the §12 variant).
+
+### 17.2 Stage completion
+
+A stage is complete when every WP it lists reaches its required level **and**
+its §5 exit gate has an evidence file the verifier accepts. That's the stage's
+execution-WP evidence where one exists (e.g. X3's `evidence/s3_matrix.json`),
+otherwise `evidence/gates/<stage>.json`, checked by
+`scripts/laned/accept --gate <stage>`.
+
+| Stage | Required |
+|---|---|
+| S0 | Every §6 decision is decided, withdrawn or deferred-to-stage in the §17.4 register; W0 at L3 |
+| S0a | R6x at L4 |
+| S0b | R2x at L4 |
+| S0c | R7t and R7m at L4 |
+| S1 | W1, W0b and W3a at L4; R16 archive growing (R16 evidence) |
+| S2 | Every build WP at L5; the S2 gate evidenced |
+| S2b | R9 at L4 |
+| S3 | X3 at L4, with every §4 T-row passed |
+| S4 | X4 at L4; all build WPs at L6 |
+| S5 | X5 at L4; all build WPs at L6 |
+| S6 | X6a at L4; the lane D WPs (§3.0 "Lane D core") at L7 |
+| SB0–SB5 | The same levels per §5 row 12c: SB0 as S0 for D35–D42 and D42b; SB1 as S2 for its WPs; SB2 WB19 at L4; SB3 as S3 for TB10–TB27 and TS1–TS5; SB4 = S5 (shared release); SB5 the lane B WPs at L7 |
+| S7 | X7 at L4 |
+| S8 | W6-S8 at L4; each added context rung at L7 |
+
+### 17.3 Coverage counters
+
+Published on every run, in both outputs:
+
+- **T-rows** passed on testnet / total (S3 needs 100%);
+- **invariants 1–12**, each with ≥ 1 test at L3 (S2 needs 100%);
+- **orphan check:** every WP row, T-row and decision maps to an owning WP;
+- **blocked count** by reason, oldest first.
+
+### 17.4 Decision register and owner inputs
+
+Each D-number has a status (`open` | `decided` | `withdrawn` |
+`deferred-to-stage`), the option chosen, the date and who decided. The status
+script parses this table on main; it changes only by an owner-merged plan PR.
+
+- An **open STRUCTURAL (S)** decision, one that changes code structure or a
+  release-only rule (e.g. D21, D40, D46, D48), **blocks its WPs**.
+- A decision that only sets an **overlay-tunable (O)** value, or an ops-only
+  choice, **doesn't block**. The WP builds with the recommended default and
+  lists it under "defaults assumed" in its PR.
+
+"Default" below means the §6 recommended default, accepted by the owner's
+2026-11-21 answer ("all other recs"; §6 header).
+
+| D | Status | Option chosen | Class | Decided |
+|---|---|---|---|---|
+| D1 | decided | `[lane_d] share = 0.25` from the total, `takes_from = "lane_a"`; A 25 / B 25 / C 25 / D 25 | O | owner, 2026-11-21 |
+| D2 | decided | Launch {4k, 8k, 16k}; {32k, 64k, 128k} at S8 by overlay | O | owner (default), 2026-11-21 |
+| D2b | decided | One gate suite per crowning from the suites not held out; the sentinel is held out | S | owner (default), 2026-11-21 |
+| D3 | decided | 1 open per hotkey, 2 per coldkey, 8 judged per settlement | O | owner (default), 2026-11-21 |
+| D4 | decided | No eval fee at launch | S | owner (default), 2026-11-21 |
+| D5 | decided | `d_margin` 0.01 (re-checked by T14), `forward_margin` 6 h, 1000 windows / 20 sources | O | owner (default), 2026-11-21 |
+| D6 | decided | Queue behind lane A; second pod if crownings slip > 1 settlement | O (ops) | owner (default), 2026-11-21 |
+| D7 | decided | 2 prior miner kings, decay 0.5; house never in the court | O | owner (default), 2026-11-21 |
+| D8 | decided | Losers private; vault TTL 4 eras; archive 14 days; delete | O | owner (default), 2026-11-21 |
+| D9 | decided | House unpaid: the slot burns | S | owner (default), 2026-11-21 |
+| D10 | decided | One activation overlay (D45) | S | owner, 2026-11-21 |
+| D11 | decided | Launch eval host: valpriv-4090 or a pinned-torch pod (≥ 24 GB) | O (ops) | owner (default), 2026-11-21 |
+| D12 | decided | `pool` untouched; `pool_d` joined to `pool`'s ids, history to 16384 + 64 | S | owner (default), 2026-11-21 |
+| D13 | decided | Open licences only; kings published | S | owner (default), 2026-11-21 |
+| D14 | decided | BF16 only | S | owner (default), 2026-11-21 |
+| D15 | decided | Lane D generation = lane A generation | S | owner (default), 2026-11-21 |
+| D16 | decided | Standing approval for automated TTL deletion granted | O (ops) | owner, 2026-11-21 |
+| D17 | decided | Loser rows signed-but-not-reproducible accepted | S | owner (default), 2026-11-21 |
+| D18 | decided | Targets stay on the box | S | owner (default), 2026-11-21 |
+| D19 | decided | Owner-run test entries on testnet in S3 | O (ops) | owner, 2026-11-21 |
+| D20 | decided | (a) restart the duel against the new king | S | owner (default), 2026-11-21 |
+| D21 | decided | Option 1: burn | S | owner (default), 2026-11-21 |
+| D22 | decided | (b) record at `ready`, re-check at reveal | S | owner (default), 2026-11-21 |
+| D23 | decided | (ii) targets, ids, `rows_sha256`, bootstrap verifiable | S | owner (default), 2026-11-21 |
+| D24 | decided | 5% per-era false-crown target | O | owner, 2026-11-21 |
+| D25 | decided | Option A (keep v2) **(see Proposed change 22)** | S | owner ("all other recs"), 2026-11-21 |
+| D26 | decided | Option A (keep v2); share source is D48 **(Proposed change 22)** | S | owner ("all other recs"), 2026-11-21 |
+| D27 | decided | Option A (accept) **(Proposed change 22)** | S | owner ("all other recs"), 2026-11-21 |
+| D28 | decided | A 25 / B 25 / C 25 / D 25 | O | owner, 2026-11-21 |
+| D29 | decided | Option A (keep v2) plus `max_source_share` (W5b) **(Proposed change 22)** | O | owner ("all other recs"), 2026-11-21 |
+| D30 | decided | Handled by the §16 sentinel (D33) | S | rev3 (D33) |
+| D31 | decided | Option A (the A8 caps) **(Proposed change 22)** | O | owner ("all other recs"), 2026-11-21 |
+| D32 | decided | Lane B trainer-run (§12b.7) | S | rev4 |
+| D33 | decided | Adopt the cross-lane rotating sentinel | S | owner (default), 2026-11-21 |
+| D34 | decided | Sentinel ratchet on | S | owner (default), 2026-11-21 |
+| D35 | decided | A sentinel suite is not a lane B target or guard that era | S | owner (default), 2026-11-21 |
+| D36 | decided | Lane B arms trainer-run | S | rev4 |
+| D37 | decided | `[lane_b] from_block` only once D41's gate is met; full share at that block (D45) | O | owner (default), 2026-11-21 |
+| D38 | decided | (a) 8 MB `suite_target_max_repo_mb` | O | owner (default), 2026-11-21 |
+| D39 | decided | Fractions 0.03125 / 0.1484375 | O | owner (default), 2026-11-21 |
+| D40 | decided | (a) router rows frozen | S | owner (default), 2026-11-21 |
+| D41 | decided | (a) `open_tokens` + a passing lane A king check | S | owner (default), 2026-11-21 |
+| D42 | decided | Cheaper GPUs via `[lane_b] funded_pod_skus`; miner-chosen leg ≤ 6 h | S | owner, 2026-11-21 |
+| D42b | decided | (a) real hours on the chosen GPU | S | owner, 2026-11-21 |
+| D43 | decided | Immediate reveal (`min_blocks`) | S | owner, 2026-11-21 |
+| D44 | withdrawn | — (lanes A and B keep cooldown) | — | owner, 2026-11-21 |
+| D45 | decided | No shadow modes; one activation block | S | owner, 2026-11-21 |
+| D46 | decided | (a) house dated by its lineage | S | owner, 2026-11-21 |
+| D47 | decided | (a) score the house as a BF16 cast; dedup against BF16 casts | S | owner (default), 2026-11-21 |
+| D48 | decided | Fixed 25% shares of the total; lane D takes from lane A's 25% | S | owner, 2026-11-21 |
+
+**No decision is open, so no WP is blocked on a decision.** Proposed change 22
+asks the owner to confirm the five §15 rows recorded from "all other recs".
+
+**Owner inputs** (moved from Appendix A, rev6). These are inputs to runs, not
+design decisions. They're never guessed: the dependent WP stays
+`blocked:owner` until the input's evidence file exists. "Here" in the list
+below now means that evidence file.
 
 1. **OA1, prior-king pairs (B1 null type 2).** List the checkpoint refs
    (`repo@sha256:…`) of ≥ 3 consecutive lane A v2 kings that are light
@@ -2837,42 +3059,52 @@ runs stay blocked until each one is answered here.
    and the PR is rebuilt on it.
 8. **OA8, pod approval for LB6 (WB19).** (rev5) Approve short pinned-torch testnet pods: one 8×H100 (expert-only leg plus one full lane A leg), and one of each cheaper GPU type you want offered to lane B miners (name them). Give a total cost cap.
 
-### Items
+| OA | Status | Unblocks | Evidence file |
+|---|---|---|---|
+| OA1 | open | B1 null type 1 (T14, S4 gate) | `evidence/owner/oa1.json` (king pairs) |
+| OA2 | open | B1 null type 2b | `evidence/owner/oa2.json` (refs, or `"none"`) |
+| OA3 | answered: 5% (D24) | — | — |
+| OA4 | open (pod yes + cost cap, or the valpriv-4090 window) | B1 scoring; W1's 16k memory fit | `evidence/owner/oa4.json` |
+| OA5 | open (host for `TSFORGE_S3` reads) | W1 history counts, `pool_d` size | `evidence/owner/oa5.json`, then `evidence/w1.json` |
+| OA6 | open (non-box host for pinned snapshots) | W1 snapshot-diff bound | `evidence/owner/oa6.json`, then `evidence/w1.json` |
+| OA7 | moot: the plan on the branch has been the input since rev3 | — | — |
+| OA8 | open (pod yes, GPU types, total cost cap) | WB19 (SB2) | `evidence/owner/oa8.json`, then `evidence/wb19.json` |
 
-| Item | Status | Notes |
-|---|---|---|
-| Commit 1: input plan unchanged | done | `docs/plans/LANE_D_PLAN.md` (see OA7) |
-| A1 forward-only: data time AND first-seen; `max_mirror_lag_hours`; first-seen WP | done | first-seen absence verified (no `first_seen`/`ingested_at` in `cascade/pool/`) |
-| A2 repeated attempts, confirmation duel, per-era margin | done | |
-| A3 horizon h = 64 | done | already in v2 §1.1 "Horizon" |
-| A4 testnet exit criteria and floors | done | repo fact corrected: pool_mkt scheduled runs skip while `[marketcast] from_block = 0` (both networks) → new WP R15 |
-| A5 descope long context to 4k/8k/16k; S8 | done | |
-| A6 BF16 only | done | |
-| A7 unpaid share [DECIDE] | done | |
-| A8 coldkey caps per lane + resolution [DECIDE] | done | |
-| A9 verifiability | done | |
-| A10 low-frequency check | done | |
-| A11 smaller fixes | done | |
-| B1 script + tests (`scripts/null_fpr.py`) | done | py_compile + ruff clean; 10 tests; CI runs them (never run on the prod box) |
-| B1 run | blocked: needs owner | OA1, OA2, OA3, OA4 |
-| B2 script + tests (`scripts/laned_w1_measure.py`) | done | py_compile + ruff clean; 8 tests; must run off-box (OA6) |
-| B2: first-seen exists? | done | No: `grep -rnE "first_seen\|ingested_at\|ingest_time\|landed_at\|LastModified" cascade/pool/` finds nothing |
-| B2 run: snapshot-diff bound, pool_mkt | blocked: needs owner | OA6 |
-| B2 run: history ≥ 4k…128k, pool_d size | blocked: needs owner | OA5 |
-| B2 run: 16k memory fit | blocked: needs owner | OA4 |
-| C: DEC-CA-0070 draft (proposed) | done | 0069 is taken by unmerged PR #482 |
-| §15 incentive review folded in as [DECIDE] D25–D32 | done | |
-| Lifecycle trace `docs/plans/lane_d_lifecycle.md` | in progress | |
-| rev4 lane B (§12b, WB10–WB21, TB10–TB22, SB track, D35–D42) | done | |
-| DEC-CA-0071 amendment rev4 (on top of PR #482's text) | done | |
-| LB6 expert-leg cost measurement | blocked: needs owner | OA8 |
-| PR | todo | |
+### 17.5 Milestones
+
+| Milestone | Condition |
+|---|---|
+| Build-complete | S2 complete |
+| Launch-ready | S0–S5 complete; S3 at 100%; the revert overlay staged |
+| Live | S6 complete (lane D) and SB5 complete (lane B) |
+| Done | S7 complete for D and B |
+
+S8 is tracked separately.
+
+### 17.6 Agent rules
+
+- Read `status/laned_build.json` (branch `laned/build-state`) before any work,
+  and run `scripts/laned/status` after it.
+- Only the status script (or the owner, for L7) moves a WP up a level. An agent
+  may only set `blocked`, with a reason.
+- Roles and the builder's no-edit list are in §3 conventions.
+- Appendix A and `LANE_D_PROGRESS.md` are retired in favour of this board
+  (Proposed change 21 adopted).
+
+---
+
+## Appendix A: run status and owner actions (rev6: retired)
+
+**(rev6)** Retired in favour of §17. Run status is the board
+(`docs/plans/STATUS.md` and `status/laned_build.json` on branch
+`laned/build-state`). The owner inputs OA1–OA8 are in §17.4.
 
 ---
 
 ## Appendix B: S1 results
 
-This mirrors `docs/plans/LANE_D_S1_RESULTS.md`. Raw outputs are in
+**(rev6)** `docs/plans/LANE_D_S1_RESULTS.md` is now a pointer to this appendix
+(Proposed change 21). Raw outputs are in
 `docs/plans/lane_d_s1/`.
 
 **Evidence rule.** Every number below cites its command, the pool snapshot
@@ -2881,8 +3113,7 @@ are no estimates, extrapolations or placeholders. Anything not run says
 `not run: <blocker>`; anything below its floor says `below floor` plus the
 counts.
 
-Owner inputs are requested in `LANE_D_PROGRESS.md` → **Owner actions**
-(OA1–OA7).
+**(rev6)** Owner inputs are listed in §17.4 (OA1–OA8).
 
 ### B2: W1 measurements
 
