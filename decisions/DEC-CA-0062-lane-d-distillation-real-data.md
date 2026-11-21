@@ -2,7 +2,8 @@
 id: DEC-CA-0062
 type: decision
 title: "Lane D: a distillation / real-data lane — wired as an inert placeholder (config table, wiring points), details to be filled in by the owner"
-status: proposed
+status: superseded
+note: "Superseded by DEC-CA-0070 (lane D open weights). The trainer-run distillation / real-data recipe lane is dropped; lane D miners train anywhere and submit weights, and a miner who wants distillation runs it on their own account. The inert [lane_d] wiring this record shipped is what DEC-CA-0070 builds on."
 date: 2026-10-19
 tags: [consensus, emissions, lanes, real-data, distillation, v2]
 revisit_when: "the owner fills in what is competed on, the teacher and the real corpus — then turn the Open list into decisions and build the halves"
