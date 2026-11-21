@@ -219,7 +219,7 @@ WP ids are matched as whole tokens, so `W0` never matches `W0c`.
 | L1 | `tests/accept/<wp>/PATHS` exists at REF **and** there is a successful `expect-fail` run for the WP (its sha need not be on main) |
 | L2 | there is an implementation commit on REF's first-parent history that descends from the commit that added the WP's `PATHS`, touches at least one path outside `tests/accept/`, and has every changed path in `PATHS`. The first such commit is "the L2 commit". |
 | L3 | the latest `push`/`accept` run for the WP (ordered by the position of `head_sha` in REF's history, then by `created_at`) whose sha is the L2 commit or a later one on REF has `conclusion: success`. Runs on earlier commits are ignored. A later red run drops the WP back to L2. |
-| L4 | it is a ci-only WP, **or** its evidence file exists at REF and the evidence check passes. The evidence file is `--evidence <file>` from the Accept cell, else `evidence/<wp>.json`. |
+| L4 | it is a ci-only WP (plan §17.1: "n/a for ci-only WPs, which pass L4 automatically"), **or** its evidence file exists at REF and the evidence check passes. The evidence file is `--evidence <file>` from the Accept cell, else `evidence/<wp>.json`. So an accepted ci-only WP that no RV covers yet is at L4, not L3. |
 | L5 | some `evidence/rv<n>.md` has a `Covers:` line naming the WP and no open `- [ ] BLOCKING <WP>` line |
 | L6 | the L2 commit is an ancestor of a tag matching `--release-tag-glob` |
 | L7 | `evidence/l7/<wp>.json` has `activation_block` (int), `monitor == "green"` and `era_range` `[start, end]` with `end >= start` |
@@ -280,7 +280,7 @@ and `<passed>/<total>`.
 |---|---|---|
 | W0c | L7 | Clean implementation, green push runs after the merge (a red run before the merge is ignored), ci-only, covered by RV1 with only a closed BLOCKING item, before tag `cap-1`, L7 evidence |
 | W0 | L3 | Runs in `ci + owner merge`, so it is external, and `evidence/w0.json` is absent (an uncommitted copy in the working tree is ignored) |
-| W1 | L2 | It was L3 at the `evidence` commit, then a red push run on the later `docs` commit dropped it back to L2 |
+| W1 | L2 | At the `evidence` commit it was accepted and, being ci-only and not covered by any RV, at L4. A red push run on the later `docs` commit dropped it back to L2. On a branch off `evidence` that adds an RV2 covering W1, it is L5 if RV2's BLOCKING items for W1 are all closed and L4 if one is open |
 | W2 | L1, `blocked:owner` | expect-fail passed, no implementation, and OA9 is open with no evidence |
 | W3 | L0 | Its expect-fail run failed |
 | W4 | L1 | Its implementation commit also edited `README.md`, which isn't in its `PATHS` |
