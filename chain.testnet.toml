@@ -918,6 +918,21 @@ stale_after_blocks = 3600          # one MAINNET era (= 6 eras on this 600-block
 poll_seconds       = 60            # how often the main validator's receipts are re-read
 max_walk           = 64            # receipts walked back per poll to reach the last replayed one
 
+[lane_d_ops]
+# Lane D operator settings (LANE_D_PLAN §14.2, W2b) — NON-CONSENSUS. Read only
+# by the main validator and the lane D intake (cascade/shared/config/lane_d_ops.py);
+# satellites never read it; never in a receipt, digest or overlay (operator-only).
+# Names and locations only: credentials are env-only (secret-shaped keys refused).
+# §10.3: the testnet stack is separate — its own vault bucket and pool_d location.
+vault_bucket       = "cascade-testnet-lane-d-vault"   # TESTNET (mainnet: cascade-lane-d-vault)
+vault_prefix       = "testnet/lane-d"                 # TESTNET (mainnet: lane-d)
+pool_d_bucket      = "cascade-testnet-lane-d-pool"    # TESTNET (mainnet: cascade-lane-d-pool)
+pool_d_prefix      = "testnet/pool_d"                 # TESTNET (mainnet: pool_d)
+eval_host          = ""                               # set on the deployment (testnet-eval, R14)
+queue_max_inflight = 1                                # forecast jobs in flight on the eval host
+queue_max_pending  = 64                               # intake backpressure (advisory)
+queue_poll_seconds = 60                               # ready-queue poll interval
+
 # ── Lane D: open weights (LANE_D_PLAN §1, §14.2; DEC-CA-0062) — SHIPPED OFF ──
 # from_block = 0: never active, no digest/receipt/weight moves (invariant 1).
 # Activation is a SIGNED OVERLAY setting from_block (an era boundary; D10/D45),
