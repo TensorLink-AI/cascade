@@ -1,8 +1,8 @@
 {
   "schema": "laned_build/1",
-  "ref": "8af5a9bd83b2d7c9ecd293bba1c27f8af1a56026",
-  "commit": "8af5a9bd83b2d7c9ecd293bba1c27f8af1a56026",
-  "generated_at": "2026-11-21T21:24:44Z",
+  "ref": "a15368814c031bafd3bf4b329e7e3867c4ab7aee",
+  "commit": "a15368814c031bafd3bf4b329e7e3867c4ab7aee",
+  "generated_at": "2026-11-21T21:25:53Z",
   "wps": {
     "W0c": {
       "level": "L0",
@@ -14,13 +14,19 @@
       "expect_fail_success": false
     },
     "W0": {
-      "level": "L1",
+      "level": "L3",
       "side_state": null,
       "runs_in": "ci + owner merge",
       "external": true,
       "group": "build",
       "paths": true,
-      "expect_fail_success": true
+      "expect_fail_success": true,
+      "l2_commit": "a15368814c031bafd3bf4b329e7e3867c4ab7aee",
+      "last_main_run": {
+        "head_sha": "a15368814c031bafd3bf4b329e7e3867c4ab7aee",
+        "conclusion": "success"
+      },
+      "evidence": "evidence/w0.json: evidence file missing"
     },
     "W0b": {
       "level": "L0",
@@ -887,8 +893,8 @@
           "passed": true
         },
         {
-          "check": "W0 at >= L3 (below: W0)",
-          "passed": false
+          "check": "W0 at >= L3",
+          "passed": true
         }
       ],
       "gate": {
