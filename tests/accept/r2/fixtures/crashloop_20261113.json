@@ -1,0 +1,34 @@
+{
+  "source": "OPSLOG 2026-11-13 00:13-02:25 UTC 'external validator crash-loops on the 128-byte note' (PR #457); refusal raised by cascade/validator/activation_mixin.py via cascade/shared/activation.py v2b_note_problem",
+  "logged_refusal": "the activation note would exceed 128 bytes and TRIM the v2b-69630f92 segment (note without it: 'cascade-ready:1:rolling-era-king:9374400:9378000:prelaunch-95-r2:9486000:9486900:cfg-ffffffff:9999999:9999999')",
+  "note_text": "cascade-ready:1:rolling-era-king:9374400:9378000:prelaunch-95-r2:9486000:9486900:v2b-69630f92:0:0",
+  "note_hex": "636173636164652d72656164793a313a726f6c6c696e672d6572612d6b696e673a393337343430303a393337383030303a7072656c61756e63682d39352d72323a393438363030303a393438363930303a7632622d36393633306639323a303a30",
+  "head_block": 9493750,
+  "head_block_note": "about 00:13 UTC 2026-11-13: the 01:23 UTC boundary 9494100 minus 70 min at 12 s/block; 7-digit worst case (head + 216000 < 10,000,000), as in the logged cfg- segment",
+  "records": {
+    "rolling-era-king": [
+      9374400,
+      9378000
+    ],
+    "prelaunch-95-r2": [
+      9486000,
+      9486900
+    ],
+    "v2b-69630f92": [
+      0,
+      0
+    ]
+  },
+  "records_note": "rolling-era-king and prelaunch-95-r2 as the external validator's log shows them (its rolling vote re-resolved ~10 d late); v2b-69630f92 is the still-open vote that v2b_note_problem judges at its longest (worst case: 10**7-1 for both blocks, as is the cfg- segment)",
+  "cfg": {
+    "feature": "cfg-ffffffff",
+    "lock_block": 9999999,
+    "activation_block": 9999999
+  },
+  "expected_note": "cascade-ready:1:rolling-era-king:9374400:9378000:prelaunch-95-r2:9486000:9486900:cfg-ffffffff:9999999:9999999",
+  "expected_trimmed": [
+    "v2b-69630f92"
+  ],
+  "fixed_by_pr457_note_text": "cascade-ready:1:rolling-era-king:9374400:9378000:prelaunch-95-r2:9486000:9486900",
+  "worst_case": true
+}
