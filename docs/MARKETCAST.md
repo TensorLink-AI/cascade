@@ -101,7 +101,7 @@ Bounds are the shipped `[marketcast]` values; the live `chain.toml` wins.
 | Training range | `data.start` … `data.end`, ending ≥ 30 days before you submit |
 | Bar sizes | `data.frequencies` ⊆ `1m`, `5m`, `15m`, `1h`, `4h`, `1d` |
 | Horizon mix | Weights over `1mx60`, `5mx36`, `15mx96`, `1hx48`, `4hx42`, `1dx7` (all six are judged whatever you weight) |
-| Context | `context_length` 32 – 32768 steps (the eval feeds 4096) |
+| Context | `context_length` 32 – 32768 steps (the eval feeds up to 32768: as much of that as the bar's recorded history holds, so longer contexts pay off more as the recording grows) |
 | Inputs | `covariates` ⊆ `volume`, `funding`, `open_interest`, `spread`, `cross_asset`, `cross_eth`, `cross_equity`, `cross_gold`, `cross_fx`, `calendar`, `session`, `events` |
 | Augmentations | Up to the allowed set — `scale`, `jitter`, `crop`, `time_warp`, `mixup` — each with a probability and numeric params |
 | Loss | `objective.suite_weights`, optional `quantile_weights` (one per each of the 21 quantile knots, 1 %…99 %), `coverage_penalty` 0 – 10 |

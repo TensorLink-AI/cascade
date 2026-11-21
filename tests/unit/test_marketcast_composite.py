@@ -57,11 +57,11 @@ def test_shipped_configs_are_the_composite_launch_set():
         assert mc.target_names == ("market",) and mc.targets == ("mkt:market",)
         assert cfg.lane_c.targets == ("mkt:market",)
         assert mc.native_intervals == ("5m", "15m")
-        assert mc.native_history_map == {"5m": 21, "15m": 50}
+        assert mc.native_history_map == {"5m": 121, "15m": 348}
         assert mc.ohlcv_open_weight == 0.0 and mc.composite_suite_floor == 0.0
         # every series reads a bank whose history the API depth (or the
         # recorder from arming) covers — no 21-day minute bank
-        assert mc.snapshot_days == 10
+        assert mc.snapshot_days == 30 and mc.eval_context_length == 32768
         assert mc.bank_minutes(5) == 5 and mc.bank_minutes(15) == 15
         assert mc.bank_minutes(60) == mc.bank_minutes(1440) == 60 and mc.bank_minutes(1) == 1
         assert mc.series_labels("ohlcv") == ("ohlcv.h", "ohlcv.l", "ohlcv.c", "ohlcv.v")

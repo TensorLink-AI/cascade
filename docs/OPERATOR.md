@@ -2284,9 +2284,12 @@ tests).
 
 **No recording lead time** (owner 2026-11-10). A series at frequency `f` is
 cut from the COARSEST bank whose interval divides `f`: the 1-minute bars
-(`snapshot_days`, 10 — a 4096-step 1m context is 2.8 days, plus the 6-day
-verdict wait), a native 5m / 15m bank (`native_history_days`: 21 / 50) or
-the hourly bank (`coarse_history_days`, 180). Every suite value is a
+(`snapshot_days`, 30 — a 32768-step 1m context is 22.8 days, plus the 6-day
+verdict wait), a native 5m / 15m bank (`native_history_days`: 121 / 348) or
+the hourly bank (`coarse_history_days`, 1372). Each bank is sized for the
+full `eval_context_length` (32768, owner 2026-11-21); bars neither the API
+nor the recording holds stay NaN, so a window's context is as long as the
+recorded history and grows toward 32k as the recorder accrues. Every suite value is a
 function of the block's OHLCV candle (open = first open, high / low = max /
 min, close = last close, volume = sum), so the bank is a history-depth choice
 only: a 15m value cut from 1m bars equals the one cut from native 15m
