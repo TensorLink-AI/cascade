@@ -1,8 +1,8 @@
 {
   "schema": "laned_build/1",
-  "ref": "75e11fdbf4e629f0234eeedaccf02a71931da3fe",
-  "commit": "75e11fdbf4e629f0234eeedaccf02a71931da3fe",
-  "generated_at": "2026-11-21T21:34:42Z",
+  "ref": "3c7803adef8e7c719ad593b35e6ec13d42758c05",
+  "commit": "3c7803adef8e7c719ad593b35e6ec13d42758c05",
+  "generated_at": "2026-11-21T21:45:11Z",
   "wps": {
     "W0c": {
       "level": "L0",
@@ -23,7 +23,7 @@
       "expect_fail_success": true,
       "l2_commit": "a15368814c031bafd3bf4b329e7e3867c4ab7aee",
       "last_main_run": {
-        "head_sha": "75e11fdbf4e629f0234eeedaccf02a71931da3fe",
+        "head_sha": "3c7803adef8e7c719ad593b35e6ec13d42758c05",
         "conclusion": "success"
       },
       "evidence": "evidence/w0.json: evidence file missing"
@@ -92,17 +92,24 @@
       "expect_fail_success": true
     },
     "R6": {
-      "level": "L1",
+      "level": "L3",
       "side_state": null,
       "runs_in": "ci",
       "external": false,
       "group": "build",
       "paths": true,
-      "expect_fail_success": true
+      "expect_fail_success": true,
+      "l2_commit": "3c7803adef8e7c719ad593b35e6ec13d42758c05",
+      "last_main_run": {
+        "head_sha": "3c7803adef8e7c719ad593b35e6ec13d42758c05",
+        "conclusion": "success"
+      },
+      "evidence": "ci-only",
+      "review": null
     },
     "R6x": {
       "level": "L0",
-      "side_state": "blocked:dependency",
+      "side_state": null,
       "runs_in": "owner",
       "external": true,
       "group": "build",
@@ -233,7 +240,7 @@
       "external": false,
       "group": "laned_core",
       "paths": false,
-      "expect_fail_success": false
+      "expect_fail_success": true
     },
     "W2b": {
       "level": "L0",
@@ -1596,7 +1603,7 @@
     "blocked": [
       {
         "reason": "dependency",
-        "count": 69,
+        "count": 68,
         "wps": [
           "R11",
           "R12",
@@ -1606,7 +1613,6 @@
           "R2x",
           "R3",
           "R4",
-          "R6x",
           "R7",
           "R7m",
           "R7t",
