@@ -8,7 +8,8 @@
 # push to main: Accept for every WP at >= L2, then `scripts/laned/status`
 #   recomputes the board and pushes it to branch laned/build-state (never main).
 # workflow_dispatch: an expect-fail run of one WP at a given commit (bootstrap
-#   for WPs whose tests landed before this workflow existed).
+#   for WPs whose tests landed before this workflow existed). The harvester keeps
+#   that result when the commit is an ancestor of the dispatched ref's head.
 #
 # Only GITHUB_TOKEN is used. Per-WP results travel as the `laned-results`
 # artifact and are kept in status/ci_runs.json on laned/build-state.
@@ -103,8 +104,12 @@ jobs:
           WPS: ${{ steps.select.outputs.wps }}
           EVENT: ${{ github.event_name }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || inputs.sha }}
+          RUN_HEAD_SHA: ${{ github.event_name == 'workflow_dispatch' && github.sha || '' }}
         run: |
           mkdir -p "$(dirname "$LANED_RESULTS")"
+          # workflow_dispatch: the entry carries the `sha` input, not the run's
+          # head; record the run's head so the harvester can cross-check it.
+          run_head=(); [ -n "$RUN_HEAD_SHA" ] && run_head=(--run-head-sha "$RUN_HEAD_SHA")
           status=0
           for wp in $WPS; do
             echo "::group::$wp"
@@ -128,7 +133,7 @@ jobs:
             fi
             [ "$rc" = 0 ] && conclusion=success || { conclusion=failure; status=1; }
             python3 "$LANED/ci_ledger.py" record --file "$LANED_RESULTS" --wp "$wp" --mode "$run_mode" \
-              --event "$EVENT" --head-sha "$HEAD_SHA" --conclusion "$conclusion"
+              --event "$EVENT" --head-sha "$HEAD_SHA" --conclusion "$conclusion" "${run_head[@]}"
             echo "::endgroup::"
           done
           exit $status
