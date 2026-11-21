@@ -15,7 +15,8 @@ Writes DIR/docs/plans/STATUS.md and DIR/status/laned_build.json. With
 laned/build-state on REMOTE, fast-forward only; main is never touched.
 Without --release-tag-glob no tag counts as a capability release (no L6).
 
-L4 (external WPs) and an execution-stage gate need the evidence blob at REF to
+Ci-only WPs pass L4 automatically (§17.1). L4 for external WPs and an
+execution-stage gate need the evidence blob at REF to
 have been verified by a green push/accept run (`accept <WP> --evidence F`,
 which exports LANED_EVIDENCE=F to the WP's own tests). Invariant coverage
 (§17.3) counts only test functions found by AST in
@@ -395,12 +396,11 @@ class Board:
         review = self.reviewed(wp)
         det["review"] = review
         if review is None:
-            # §17.1: L4 is "n/a" for ci-only WPs. They pass it automatically on
-            # the way up, but never stop at it: their level is L3 until L5.
-            # (RV1 item 3 asks for L4 here; the W0c fixture test pins an
-            # accepted, unreviewed ci-only WP at L3, so this stays until the
-            # tests change.)
-            return 4 if self.plan["wps"][wp]["external"] else 3
+            # §17.1: L4 is "n/a for ci-only WPs, which pass L4 automatically".
+            # evidence_ok() returns True for a ci-only WP, so an accepted,
+            # unreviewed WP is L4 whether it is external (evidence verified)
+            # or ci-only (RV1 item 3; pinned by the W0c fixture tests).
+            return 4
         tag = self.released(l2_sha)
         det["release_tag"] = tag
         if tag is None:
@@ -814,6 +814,8 @@ def cmd_selftest() -> int:
         lv, data = level(xf + [run(full, "X1", ok, evidence_sha=full_blob), run(full, "C1", True)], "X1")
         expect(lv == "L4", f"verified evidence gave {lv}, want L4")
         expect(data["wps"]["C1"]["evidence_verified"] is True, "ci-only C1 did not pass L4's evidence rule")
+        expect(data["wps"]["C1"]["level"] == "L4",
+               f"accepted, unreviewed ci-only C1 gave {data['wps']['C1']['level']}, want L4 (§17.1)")
 
         # A later edit to the evidence that no green run verified loses L4.
         put("evidence/x1.json", json.dumps({"wp": "X1", "passed": True, "request_id": "req-2"}))
