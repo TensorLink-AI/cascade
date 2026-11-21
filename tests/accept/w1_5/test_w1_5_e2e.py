@@ -102,7 +102,7 @@ def _synthetic_chain(tmp: Path) -> SimpleNamespace:
 
 def _model_chain(tmp: Path) -> SimpleNamespace:
     # The W1.5 modules before any model work: on main the test stops here.
-    import torch
+    import torch  # noqa: I001
     from cascade.eval.lane_d_ingest import ingest_entry
     from cascade.eval.lane_d_scorer import SCORING_LEVELS, forecast_quantiles
     from cascade.lane_d.intake import (
@@ -176,7 +176,7 @@ def _chain(spec: SimpleNamespace) -> tuple[SimpleNamespace, object]:
     """Called from each test body: the box-side W1.5 modules are imported
     first (on main the test stops here), then the chain and the test signer
     are built once per kind and reused."""
-    import cascade.audit.lane_d  # noqa: F401
+    import cascade.audit.lane_d  # noqa: F401, I001
     import cascade.validator.lane_d  # noqa: F401
     import cascade.validator.lane_d_report  # noqa: F401
 
@@ -220,7 +220,7 @@ def _settle_both(chain, cfg, state_path: Path, signer):
 
 
 def _assert_valid_report(report, cfg, signer, boundary):
-    from cascade.audit.lane_d import check_lane_d
+    from cascade.audit.lane_d import check_lane_d  # noqa: I001
     from cascade.validator.lane_d_report import REPORT_SCHEMA, verify_report
 
     from cascade.audit.checks import PASS
@@ -289,7 +289,7 @@ def test_e2e_audit_passes(chain_kind, tmp_path):
 
 def test_e2e_tampered_row_fails(chain_kind, tmp_path):
     chain, signer = _chain(chain_kind)
-    from cascade.audit.lane_d import check_lane_d
+    from cascade.audit.lane_d import check_lane_d  # noqa: I001
     from cascade.validator.lane_d_report import sign_report, verify_report
 
     from cascade.audit.checks import FAIL
