@@ -1,479 +1,1676 @@
 {
-  "mode": "bootstrap",
-  "generated_by": "orchestrator (hand-maintained until W0c reaches L3, plan \u00a717)",
-  "generated_at": "2026-11-21T13:17Z",
-  "origin_main": "caa7ea773f67ffc03a2dc6da3215348ab6f66611",
-  "plan_on_main": true,
-  "plan_pr": "483 merged",
+  "schema": "laned_build/1",
+  "ref": "36bb8f2b22f041330521cdff64ddb6568308b974",
+  "commit": "36bb8f2b22f041330521cdff64ddb6568308b974",
+  "generated_at": "2026-11-21T21:08:05Z",
   "wps": {
     "W0c": {
-      "level": "L1",
+      "level": "L0",
       "side_state": null,
-      "evidence": [],
-      "activity": "tests on main (#484, caa7ea7); builder running"
+      "runs_in": "ci",
+      "external": false,
+      "group": "build",
+      "paths": true,
+      "expect_fail_success": false
     },
     "W0": {
       "level": "L0",
       "side_state": null,
-      "evidence": []
+      "runs_in": "ci + owner merge",
+      "external": true,
+      "group": "build",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W0b": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci",
+      "external": false,
+      "group": "build",
+      "paths": false,
+      "expect_fail_success": false
     },
     "R1": {
       "level": "L0",
       "side_state": null,
-      "evidence": [],
-      "activity": "test author running"
+      "runs_in": "ci",
+      "external": false,
+      "group": "build",
+      "paths": true,
+      "expect_fail_success": false
     },
     "R2": {
       "level": "L0",
       "side_state": null,
-      "evidence": []
+      "runs_in": "ci (fixtures)",
+      "external": false,
+      "group": "build",
+      "paths": false,
+      "expect_fail_success": false
     },
     "R2x": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "owner (chain read)",
+      "external": true,
+      "group": "build",
+      "paths": false,
+      "expect_fail_success": false
     },
     "R3": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci",
+      "external": false,
+      "group": "build",
+      "paths": false,
+      "expect_fail_success": false
     },
     "R4": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci",
+      "external": false,
+      "group": "build",
+      "paths": false,
+      "expect_fail_success": false
     },
     "R5": {
       "level": "L0",
       "side_state": null,
-      "evidence": []
+      "runs_in": "ci (scripts) + owner (execute)",
+      "external": true,
+      "group": "build",
+      "paths": false,
+      "expect_fail_success": false
     },
     "R6": {
       "level": "L0",
       "side_state": null,
-      "evidence": [],
-      "activity": "test author running"
+      "runs_in": "ci",
+      "external": false,
+      "group": "build",
+      "paths": false,
+      "expect_fail_success": false
     },
     "R6x": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "owner",
+      "external": true,
+      "group": "build",
+      "paths": false,
+      "expect_fail_success": false
     },
     "R7": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci",
+      "external": false,
+      "group": "build",
+      "paths": false,
+      "expect_fail_success": false
     },
     "R7t": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "testnet + owner",
+      "external": true,
+      "group": "build",
+      "paths": false,
+      "expect_fail_success": false
     },
     "R7m": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "owner",
+      "external": true,
+      "group": "build",
+      "paths": false,
+      "expect_fail_success": false
     },
     "R8": {
       "level": "L0",
       "side_state": null,
-      "evidence": []
+      "runs_in": "\u2014",
+      "external": false,
+      "group": "build",
+      "paths": false,
+      "expect_fail_success": false
     },
     "R9": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "owner",
+      "external": true,
+      "group": "build",
+      "paths": false,
+      "expect_fail_success": false
     },
     "R10": {
       "level": "L0",
       "side_state": null,
-      "evidence": []
+      "runs_in": "ci (fixture state) + testnet",
+      "external": true,
+      "group": "build",
+      "paths": false,
+      "expect_fail_success": false
     },
     "R11": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci",
+      "external": false,
+      "group": "build",
+      "paths": false,
+      "expect_fail_success": false
     },
     "R12": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci (scripts) + pod + owner",
+      "external": true,
+      "group": "build",
+      "paths": false,
+      "expect_fail_success": false
     },
     "R13": {
       "level": "L0",
       "side_state": null,
-      "evidence": []
+      "runs_in": "builder + owner",
+      "external": true,
+      "group": "build",
+      "paths": false,
+      "expect_fail_success": false
     },
     "R14": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
-    },
-    "R15": {
-      "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "testnet + owner",
+      "external": true,
+      "group": "build",
+      "paths": false,
+      "expect_fail_success": false
     },
     "R16": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "builder + owner",
+      "external": true,
+      "group": "build",
+      "paths": false,
+      "expect_fail_success": false
+    },
+    "R15": {
+      "level": "L0",
+      "side_state": "blocked:dependency",
+      "runs_in": "ci + testnet",
+      "external": true,
+      "group": "build",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W1": {
       "level": "L0",
-      "side_state": "blocked:owner (OA5, OA6)",
-      "evidence": []
+      "side_state": "blocked:owner",
+      "runs_in": "builder (needs TSFORGE_S3)",
+      "external": true,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W2": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci",
+      "external": false,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W2b": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci",
+      "external": false,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W1.5": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci",
+      "external": false,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W3a": {
       "level": "L0",
       "side_state": null,
-      "evidence": []
+      "runs_in": "owner (live Hippius)",
+      "external": true,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W3": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci (fs adapter) + testnet",
+      "external": true,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W4": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci + pod (handshake live)",
+      "external": true,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W5a": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci",
+      "external": false,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W5b": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci",
+      "external": false,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W5c": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
-    },
-    "W5d": {
-      "level": "L0",
-      "side_state": null,
-      "evidence": []
-    },
-    "W5e": {
-      "level": "L0",
-      "side_state": null,
-      "evidence": []
-    },
-    "W5f": {
-      "level": "L0",
-      "side_state": null,
-      "evidence": []
-    },
-    "W5g": {
-      "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci",
+      "external": false,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W5h": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci",
+      "external": false,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
+    },
+    "W5d": {
+      "level": "L0",
+      "side_state": "blocked:dependency",
+      "runs_in": "ci (tiny model) + pod (real size, T7)",
+      "external": true,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
+    },
+    "W5e": {
+      "level": "L0",
+      "side_state": "blocked:dependency",
+      "runs_in": "ci",
+      "external": false,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
+    },
+    "W5f": {
+      "level": "L0",
+      "side_state": "blocked:dependency",
+      "runs_in": "ci",
+      "external": false,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
+    },
+    "W5g": {
+      "level": "L0",
+      "side_state": "blocked:dependency",
+      "runs_in": "ci",
+      "external": false,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W6a": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci + builder",
+      "external": true,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W6fs": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "builder",
+      "external": true,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W6b": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "builder",
+      "external": true,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W6c": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci + builder",
+      "external": true,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W6d": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "builder",
+      "external": true,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
+    },
+    "W6s-*n*": {
+      "level": "L0",
+      "side_state": "blocked:dependency",
+      "runs_in": "builder",
+      "external": true,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W6-S8": {
       "level": "L0",
-      "side_state": "parked (S8)",
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "builder + pod",
+      "external": true,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W3b1": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci",
+      "external": false,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W3b2": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci (recorded suite outputs) + pod",
+      "external": true,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W3b3": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci",
+      "external": false,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W3b4": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci",
+      "external": false,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W3b5": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci",
+      "external": false,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W7a": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci",
+      "external": false,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W7b": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci",
+      "external": false,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W7c": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci",
+      "external": false,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W7d": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci",
+      "external": false,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W8": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci",
+      "external": false,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W9": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci",
+      "external": false,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W10": {
       "level": "L0",
       "side_state": null,
-      "evidence": []
+      "runs_in": "submit \\",
+      "external": false,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W11": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci (cascade-ops repo)",
+      "external": false,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W12a": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci",
+      "external": false,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W12b": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci",
+      "external": false,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W13": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci + testnet",
+      "external": true,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W14": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci + testnet",
+      "external": true,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W15": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci + pod",
+      "external": true,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W16": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci (CPU tiny run) + pod",
+      "external": true,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W17": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci",
+      "external": false,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W18": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci (fs adapter) + owner",
+      "external": true,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W19": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci + testnet",
+      "external": true,
+      "group": "laned_core",
+      "paths": false,
+      "expect_fail_success": false
     },
     "WB10": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci",
+      "external": false,
+      "group": "laneb",
+      "paths": false,
+      "expect_fail_success": false
     },
     "WB11": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci + owner (pin)",
+      "external": true,
+      "group": "laneb",
+      "paths": false,
+      "expect_fail_success": false
     },
     "WB12": {
       "level": "L0",
       "side_state": null,
-      "evidence": []
+      "runs_in": "ci + pod",
+      "external": true,
+      "group": "laneb",
+      "paths": false,
+      "expect_fail_success": false
     },
     "WB13": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci",
+      "external": false,
+      "group": "laneb",
+      "paths": false,
+      "expect_fail_success": false
     },
     "WB14": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci",
+      "external": false,
+      "group": "laneb",
+      "paths": false,
+      "expect_fail_success": false
     },
     "WB15": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci",
+      "external": false,
+      "group": "laneb",
+      "paths": false,
+      "expect_fail_success": false
     },
     "WB16": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci + pod",
+      "external": true,
+      "group": "laneb",
+      "paths": false,
+      "expect_fail_success": false
     },
     "WB17": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci + testnet",
+      "external": true,
+      "group": "laneb",
+      "paths": false,
+      "expect_fail_success": false
     },
     "WB18": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci",
+      "external": false,
+      "group": "laneb",
+      "paths": false,
+      "expect_fail_success": false
     },
     "WB19": {
       "level": "L0",
-      "side_state": "blocked:owner (OA8)",
-      "evidence": []
+      "side_state": "blocked:owner",
+      "runs_in": "pod (owner yes, OA8)",
+      "external": true,
+      "group": "laneb",
+      "paths": false,
+      "expect_fail_success": false
+    },
+    "WB22": {
+      "level": "L0",
+      "side_state": "blocked:dependency",
+      "runs_in": "ci",
+      "external": false,
+      "group": "laneb",
+      "paths": false,
+      "expect_fail_success": false
+    },
+    "WB23": {
+      "level": "L0",
+      "side_state": "blocked:dependency",
+      "runs_in": "ci",
+      "external": false,
+      "group": "laneb",
+      "paths": false,
+      "expect_fail_success": false
+    },
+    "W-EMA": {
+      "level": "L0",
+      "side_state": null,
+      "runs_in": "ci + testnet",
+      "external": true,
+      "group": "laneb",
+      "paths": false,
+      "expect_fail_success": false
     },
     "WB20": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci",
+      "external": false,
+      "group": "laneb",
+      "paths": false,
+      "expect_fail_success": false
     },
     "WB21": {
       "level": "L0",
       "side_state": null,
-      "evidence": []
-    },
-    "WB22": {
-      "level": "L0",
-      "side_state": null,
-      "evidence": []
-    },
-    "WB23": {
-      "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "runs_in": "ci + owner",
+      "external": true,
+      "group": "laneb",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W-S1": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci",
+      "external": false,
+      "group": "laneb",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W-S2": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci",
+      "external": false,
+      "group": "laneb",
+      "paths": false,
+      "expect_fail_success": false
     },
     "W-S3": {
       "level": "L0",
-      "side_state": null,
-      "evidence": []
+      "side_state": "blocked:dependency",
+      "runs_in": "ci",
+      "external": false,
+      "group": "laneb",
+      "paths": false,
+      "expect_fail_success": false
     },
     "X3": {
       "level": "L0",
       "side_state": null,
-      "evidence": []
+      "runs_in": "testnet",
+      "external": true,
+      "group": "execution",
+      "paths": false,
+      "expect_fail_success": false
     },
     "X4": {
       "level": "L0",
       "side_state": null,
-      "evidence": []
+      "runs_in": "owner",
+      "external": true,
+      "group": "execution",
+      "paths": false,
+      "expect_fail_success": false
     },
     "X5": {
       "level": "L0",
       "side_state": null,
-      "evidence": []
+      "runs_in": "owner",
+      "external": true,
+      "group": "execution",
+      "paths": false,
+      "expect_fail_success": false
     },
     "X6a": {
       "level": "L0",
       "side_state": null,
-      "evidence": []
+      "runs_in": "owner",
+      "external": true,
+      "group": "execution",
+      "paths": false,
+      "expect_fail_success": false
     },
     "X7": {
       "level": "L0",
       "side_state": null,
-      "evidence": []
+      "runs_in": "owner",
+      "external": true,
+      "group": "execution",
+      "paths": false,
+      "expect_fail_success": false
+    },
+    "WB1": {
+      "level": "L0",
+      "side_state": "parked",
+      "runs_in": "ci + testnet",
+      "external": true,
+      "group": "build",
+      "paths": false,
+      "expect_fail_success": false
+    },
+    "WB2": {
+      "level": "L0",
+      "side_state": "parked",
+      "runs_in": "ci + pod",
+      "external": true,
+      "group": "build",
+      "paths": false,
+      "expect_fail_success": false
+    },
+    "WB3": {
+      "level": "L0",
+      "side_state": "parked",
+      "runs_in": "ci",
+      "external": false,
+      "group": "build",
+      "paths": false,
+      "expect_fail_success": false
+    },
+    "WB4": {
+      "level": "L0",
+      "side_state": "parked",
+      "runs_in": "ci",
+      "external": false,
+      "group": "build",
+      "paths": false,
+      "expect_fail_success": false
+    },
+    "WB5": {
+      "level": "L0",
+      "side_state": "parked",
+      "runs_in": "ci",
+      "external": false,
+      "group": "build",
+      "paths": false,
+      "expect_fail_success": false
+    },
+    "WB6": {
+      "level": "L0",
+      "side_state": "parked",
+      "runs_in": "ci",
+      "external": false,
+      "group": "build",
+      "paths": false,
+      "expect_fail_success": false
+    },
+    "WB7": {
+      "level": "L0",
+      "side_state": "parked",
+      "runs_in": "ci + owner merge",
+      "external": true,
+      "group": "build",
+      "paths": false,
+      "expect_fail_success": false
     }
+  },
+  "stages": {
+    "S0": {
+      "state": "incomplete",
+      "requirements": [
+        {
+          "check": "every decision decided, withdrawn or deferred-to-stage",
+          "passed": true
+        },
+        {
+          "check": "W0 at >= L3 (below: W0)",
+          "passed": false
+        }
+      ],
+      "gate": {
+        "evidence": "evidence/gates/s0.json",
+        "passed": false,
+        "detail": "gate evidence missing"
+      }
+    },
+    "S0a": {
+      "state": "incomplete",
+      "requirements": [
+        {
+          "check": "R6x at >= L4 (below: R6x)",
+          "passed": false
+        }
+      ],
+      "gate": {
+        "evidence": "evidence/gates/s0a.json",
+        "passed": false,
+        "detail": "gate evidence missing"
+      }
+    },
+    "S0b": {
+      "state": "incomplete",
+      "requirements": [
+        {
+          "check": "R2x at >= L4 (below: R2x)",
+          "passed": false
+        }
+      ],
+      "gate": {
+        "evidence": "evidence/gates/s0b.json",
+        "passed": false,
+        "detail": "gate evidence missing"
+      }
+    },
+    "S0c": {
+      "state": "incomplete",
+      "requirements": [
+        {
+          "check": "R7t, R7m at >= L4 (below: R7t, R7m)",
+          "passed": false
+        }
+      ],
+      "gate": {
+        "evidence": "evidence/gates/s0c.json",
+        "passed": false,
+        "detail": "gate evidence missing"
+      }
+    },
+    "S1": {
+      "state": "incomplete",
+      "requirements": [
+        {
+          "check": "W1, W0b, W3a, R16 at >= L4 (below: W1, W0b, W3a, R16)",
+          "passed": false
+        }
+      ],
+      "gate": {
+        "evidence": "evidence/gates/s1.json",
+        "passed": false,
+        "detail": "gate evidence missing"
+      }
+    },
+    "S2": {
+      "state": "incomplete",
+      "requirements": [
+        {
+          "check": "67 WPs at >= L5 (below: W0c, W0, W0b, R1, R2, R2x, R3, R4, R5, R6, R6x, R7, R7t, R7m, R8, R9, R10, R11, R12, R13, R14, R16, R15, W1, W2, W2b, W1.5, W3a, W3, W4, W5a, W5b, W5c, W5h, W5d, W5e, W5f, W5g, W6a, W6fs, W6b, W6c, W6d, W6s-*n*, W6-S8, W3b1, W3b2, W3b3, W3b4, W3b5, W7a, W7b, W7c, W7d, W8, W9, W10, W11, W12a, W12b, W13, W14, W15, W16, W17, W18, W19)",
+          "passed": false
+        }
+      ],
+      "gate": {
+        "evidence": "evidence/gates/s2.json",
+        "passed": false,
+        "detail": "gate evidence missing"
+      }
+    },
+    "S2b": {
+      "state": "incomplete",
+      "requirements": [
+        {
+          "check": "R9 at >= L4 (below: R9)",
+          "passed": false
+        }
+      ],
+      "gate": {
+        "evidence": "evidence/gates/s2b.json",
+        "passed": false,
+        "detail": "gate evidence missing"
+      }
+    },
+    "S3": {
+      "state": "incomplete",
+      "requirements": [
+        {
+          "check": "X3 at >= L4 (below: X3)",
+          "passed": false
+        },
+        {
+          "check": "every T-row passed",
+          "passed": false
+        }
+      ],
+      "gate": {
+        "evidence": "evidence/s3_matrix.json",
+        "passed": false,
+        "detail": "evidence file missing"
+      }
+    },
+    "S4": {
+      "state": "incomplete",
+      "requirements": [
+        {
+          "check": "X4 at >= L4 (below: X4)",
+          "passed": false
+        },
+        {
+          "check": "67 WPs at >= L6 (below: W0c, W0, W0b, R1, R2, R2x, R3, R4, R5, R6, R6x, R7, R7t, R7m, R8, R9, R10, R11, R12, R13, R14, R16, R15, W1, W2, W2b, W1.5, W3a, W3, W4, W5a, W5b, W5c, W5h, W5d, W5e, W5f, W5g, W6a, W6fs, W6b, W6c, W6d, W6s-*n*, W6-S8, W3b1, W3b2, W3b3, W3b4, W3b5, W7a, W7b, W7c, W7d, W8, W9, W10, W11, W12a, W12b, W13, W14, W15, W16, W17, W18, W19)",
+          "passed": false
+        }
+      ],
+      "gate": {
+        "evidence": "evidence/s4.json",
+        "passed": false,
+        "detail": "evidence file missing"
+      }
+    },
+    "S5": {
+      "state": "incomplete",
+      "requirements": [
+        {
+          "check": "X5 at >= L4 (below: X5)",
+          "passed": false
+        },
+        {
+          "check": "67 WPs at >= L6 (below: W0c, W0, W0b, R1, R2, R2x, R3, R4, R5, R6, R6x, R7, R7t, R7m, R8, R9, R10, R11, R12, R13, R14, R16, R15, W1, W2, W2b, W1.5, W3a, W3, W4, W5a, W5b, W5c, W5h, W5d, W5e, W5f, W5g, W6a, W6fs, W6b, W6c, W6d, W6s-*n*, W6-S8, W3b1, W3b2, W3b3, W3b4, W3b5, W7a, W7b, W7c, W7d, W8, W9, W10, W11, W12a, W12b, W13, W14, W15, W16, W17, W18, W19)",
+          "passed": false
+        }
+      ],
+      "gate": {
+        "evidence": "evidence/s5.json",
+        "passed": false,
+        "detail": "evidence file missing"
+      }
+    },
+    "S6": {
+      "state": "incomplete",
+      "requirements": [
+        {
+          "check": "X6a at >= L4 (below: X6a)",
+          "passed": false
+        },
+        {
+          "check": "44 WPs at >= L7 (below: W1, W2, W2b, W1.5, W3a, W3, W4, W5a, W5b, W5c, W5h, W5d, W5e, W5f, W5g, W6a, W6fs, W6b, W6c, W6d, W6s-*n*, W6-S8, W3b1, W3b2, W3b3, W3b4, W3b5, W7a, W7b, W7c, W7d, W8, W9, W10, W11, W12a, W12b, W13, W14, W15, W16, W17, W18, W19)",
+          "passed": false
+        }
+      ],
+      "gate": {
+        "evidence": "evidence/s6a.json",
+        "passed": false,
+        "detail": "evidence file missing"
+      }
+    },
+    "SB0": {
+      "state": "incomplete",
+      "requirements": [
+        {
+          "check": "D35-D42 and D42b decided",
+          "passed": true
+        }
+      ],
+      "gate": {
+        "evidence": "evidence/gates/sb0.json",
+        "passed": false,
+        "detail": "gate evidence missing"
+      }
+    },
+    "SB1": {
+      "state": "incomplete",
+      "requirements": [
+        {
+          "check": "13 WPs at >= L5 (below: WB10, WB11, WB12, WB13, WB14, WB15, WB16, WB17, WB18, WB22, WB23, W-S1, W-S2)",
+          "passed": false
+        }
+      ],
+      "gate": {
+        "evidence": "evidence/gates/sb1.json",
+        "passed": false,
+        "detail": "gate evidence missing"
+      }
+    },
+    "SB2": {
+      "state": "incomplete",
+      "requirements": [
+        {
+          "check": "WB19 at >= L4 (below: WB19)",
+          "passed": false
+        }
+      ],
+      "gate": {
+        "evidence": "evidence/gates/sb2.json",
+        "passed": false,
+        "detail": "gate evidence missing"
+      }
+    },
+    "SB3": {
+      "state": "incomplete",
+      "requirements": [],
+      "gate": {
+        "evidence": "evidence/gates/sb3.json",
+        "passed": false,
+        "detail": "gate evidence missing"
+      }
+    },
+    "SB4": {
+      "state": "incomplete",
+      "requirements": [
+        {
+          "check": "S5 complete (shared release)",
+          "passed": false
+        }
+      ],
+      "gate": {
+        "evidence": "evidence/gates/sb4.json",
+        "passed": false,
+        "detail": "gate evidence missing"
+      }
+    },
+    "SB5": {
+      "state": "incomplete",
+      "requirements": [
+        {
+          "check": "18 WPs at >= L7 (below: WB10, WB11, WB12, WB13, WB14, WB15, WB16, WB17, WB18, WB19, WB22, WB23, W-EMA, WB20, WB21, W-S1, W-S2, W-S3)",
+          "passed": false
+        }
+      ],
+      "gate": {
+        "evidence": "evidence/gates/sb5.json",
+        "passed": false,
+        "detail": "gate evidence missing"
+      }
+    },
+    "S7": {
+      "state": "incomplete",
+      "requirements": [
+        {
+          "check": "X7 at >= L4 (below: X7)",
+          "passed": false
+        }
+      ],
+      "gate": {
+        "evidence": "evidence/s7.json",
+        "passed": false,
+        "detail": "evidence file missing"
+      }
+    },
+    "S8": {
+      "state": "incomplete",
+      "requirements": [
+        {
+          "check": "W6-S8 at >= L4 (below: W6-S8)",
+          "passed": false
+        }
+      ],
+      "gate": {
+        "evidence": "evidence/gates/s8.json",
+        "passed": false,
+        "detail": "gate evidence missing"
+      }
+    }
+  },
+  "milestones": {
+    "Build-complete": "incomplete",
+    "Launch-ready": "incomplete",
+    "Live": "incomplete",
+    "Done": "incomplete"
   },
   "decisions": {
-    "open": [],
-    "note": "register in plan \u00a717.4; none open"
-  },
-  "owner_inputs": {
-    "OA1": "found (evidence/owner/oa1.json on laned/build-state; owner may correct)",
-    "OA2": "found: no different-seed replicas; same-seed re-runs listed (evidence/owner/oa2.json)",
-    "OA3": "answered",
-    "OA4": "open",
-    "OA5": "open",
-    "OA6": "open",
-    "OA7": "moot",
-    "OA8": "open"
-  },
-  "counters": {
-    "t_rows_passed_testnet": "0/total",
-    "invariants_with_L3_test": "0/12",
-    "orphans": "not computed (bootstrap)",
-    "blocked_by_reason": {
-      "owner": 2
+    "D1": {
+      "status": "decided",
+      "option": "[lane_d] share = 0.25 from the total, takes_from = \"lane_a\"; A 25 / B 25 / C 25 / D 25",
+      "class": "O",
+      "decided": "owner, 2026-11-21",
+      "blocking": false
+    },
+    "D2": {
+      "status": "decided",
+      "option": "Launch {4k, 8k, 16k}; {32k, 64k, 128k} at S8 by overlay",
+      "class": "O",
+      "decided": "owner (default), 2026-11-21",
+      "blocking": false
+    },
+    "D2b": {
+      "status": "decided",
+      "option": "One gate suite per crowning from the suites not held out; the sentinel is held out",
+      "class": "S",
+      "decided": "owner (default), 2026-11-21",
+      "blocking": false
+    },
+    "D3": {
+      "status": "decided",
+      "option": "1 open per hotkey, 2 per coldkey, 8 judged per settlement",
+      "class": "O",
+      "decided": "owner (default), 2026-11-21",
+      "blocking": false
+    },
+    "D4": {
+      "status": "decided",
+      "option": "No eval fee at launch",
+      "class": "S",
+      "decided": "owner (default), 2026-11-21",
+      "blocking": false
+    },
+    "D5": {
+      "status": "decided",
+      "option": "d_margin 0.01 (re-checked by T14), forward_margin 6 h, 1000 windows / 20 sources",
+      "class": "O",
+      "decided": "owner (default), 2026-11-21",
+      "blocking": false
+    },
+    "D6": {
+      "status": "decided",
+      "option": "Queue behind lane A; second pod if crownings slip > 1 settlement",
+      "class": "O (ops)",
+      "decided": "owner (default), 2026-11-21",
+      "blocking": false
+    },
+    "D7": {
+      "status": "decided",
+      "option": "2 prior miner kings, decay 0.5; house never in the court",
+      "class": "O",
+      "decided": "owner (default), 2026-11-21",
+      "blocking": false
+    },
+    "D8": {
+      "status": "decided",
+      "option": "Losers private; vault TTL 4 eras; archive 14 days; delete",
+      "class": "O",
+      "decided": "owner (default), 2026-11-21",
+      "blocking": false
+    },
+    "D9": {
+      "status": "decided",
+      "option": "House unpaid: the slot burns",
+      "class": "S",
+      "decided": "owner (default), 2026-11-21",
+      "blocking": false
+    },
+    "D10": {
+      "status": "decided",
+      "option": "One activation overlay (D45)",
+      "class": "S",
+      "decided": "owner, 2026-11-21",
+      "blocking": false
+    },
+    "D11": {
+      "status": "decided",
+      "option": "Launch eval host: valpriv-4090 or a pinned-torch pod (\u2265 24 GB)",
+      "class": "O (ops)",
+      "decided": "owner (default), 2026-11-21",
+      "blocking": false
+    },
+    "D12": {
+      "status": "decided",
+      "option": "pool untouched; pool_d joined to pool's ids, history to 16384 + 64",
+      "class": "S",
+      "decided": "owner (default), 2026-11-21",
+      "blocking": false
+    },
+    "D13": {
+      "status": "decided",
+      "option": "Open licences only; kings published",
+      "class": "S",
+      "decided": "owner (default), 2026-11-21",
+      "blocking": false
+    },
+    "D14": {
+      "status": "decided",
+      "option": "BF16 only",
+      "class": "S",
+      "decided": "owner (default), 2026-11-21",
+      "blocking": false
+    },
+    "D15": {
+      "status": "decided",
+      "option": "Lane D generation = lane A generation",
+      "class": "S",
+      "decided": "owner (default), 2026-11-21",
+      "blocking": false
+    },
+    "D16": {
+      "status": "decided",
+      "option": "Standing approval for automated TTL deletion granted",
+      "class": "O (ops)",
+      "decided": "owner, 2026-11-21",
+      "blocking": false
+    },
+    "D17": {
+      "status": "decided",
+      "option": "Loser rows signed-but-not-reproducible accepted",
+      "class": "S",
+      "decided": "owner (default), 2026-11-21",
+      "blocking": false
+    },
+    "D18": {
+      "status": "decided",
+      "option": "Targets stay on the box",
+      "class": "S",
+      "decided": "owner (default), 2026-11-21",
+      "blocking": false
+    },
+    "D19": {
+      "status": "decided",
+      "option": "Owner-run test entries on testnet in S3",
+      "class": "O (ops)",
+      "decided": "owner, 2026-11-21",
+      "blocking": false
+    },
+    "D20": {
+      "status": "decided",
+      "option": "(a) restart the duel against the new king",
+      "class": "S",
+      "decided": "owner (default), 2026-11-21",
+      "blocking": false
+    },
+    "D21": {
+      "status": "decided",
+      "option": "Option 1: burn",
+      "class": "S",
+      "decided": "owner (default), 2026-11-21",
+      "blocking": false
+    },
+    "D22": {
+      "status": "decided",
+      "option": "(b) record at ready, re-check at reveal",
+      "class": "S",
+      "decided": "owner (default), 2026-11-21",
+      "blocking": false
+    },
+    "D23": {
+      "status": "decided",
+      "option": "(ii) targets, ids, rows_sha256, bootstrap verifiable",
+      "class": "S",
+      "decided": "owner (default), 2026-11-21",
+      "blocking": false
+    },
+    "D24": {
+      "status": "decided",
+      "option": "5% per-era false-crown target",
+      "class": "O",
+      "decided": "owner, 2026-11-21",
+      "blocking": false
+    },
+    "D25": {
+      "status": "decided",
+      "option": "Option A (keep v2) (see Proposed change 22)",
+      "class": "S",
+      "decided": "owner (\"all other recs\"), 2026-11-21",
+      "blocking": false
+    },
+    "D26": {
+      "status": "decided",
+      "option": "Option A (keep v2); share source is D48 (Proposed change 22)",
+      "class": "S",
+      "decided": "owner (\"all other recs\"), 2026-11-21",
+      "blocking": false
+    },
+    "D27": {
+      "status": "decided",
+      "option": "Option A (accept) (Proposed change 22)",
+      "class": "S",
+      "decided": "owner (\"all other recs\"), 2026-11-21",
+      "blocking": false
+    },
+    "D28": {
+      "status": "decided",
+      "option": "A 25 / B 25 / C 25 / D 25",
+      "class": "O",
+      "decided": "owner, 2026-11-21",
+      "blocking": false
+    },
+    "D29": {
+      "status": "decided",
+      "option": "Option A (keep v2) plus max_source_share (W5b) (Proposed change 22)",
+      "class": "O",
+      "decided": "owner (\"all other recs\"), 2026-11-21",
+      "blocking": false
+    },
+    "D30": {
+      "status": "decided",
+      "option": "Handled by the \u00a716 sentinel (D33)",
+      "class": "S",
+      "decided": "rev3 (D33)",
+      "blocking": false
+    },
+    "D31": {
+      "status": "decided",
+      "option": "Option A (the A8 caps) (Proposed change 22)",
+      "class": "O",
+      "decided": "owner (\"all other recs\"), 2026-11-21",
+      "blocking": false
+    },
+    "D32": {
+      "status": "decided",
+      "option": "Lane B trainer-run (\u00a712b.7)",
+      "class": "S",
+      "decided": "rev4",
+      "blocking": false
+    },
+    "D33": {
+      "status": "decided",
+      "option": "Adopt the cross-lane rotating sentinel",
+      "class": "S",
+      "decided": "owner (default), 2026-11-21",
+      "blocking": false
+    },
+    "D34": {
+      "status": "decided",
+      "option": "Sentinel ratchet on",
+      "class": "S",
+      "decided": "owner (default), 2026-11-21",
+      "blocking": false
+    },
+    "D35": {
+      "status": "decided",
+      "option": "A sentinel suite is not a lane B target or guard that era",
+      "class": "S",
+      "decided": "owner (default), 2026-11-21",
+      "blocking": false
+    },
+    "D36": {
+      "status": "decided",
+      "option": "Lane B arms trainer-run",
+      "class": "S",
+      "decided": "rev4",
+      "blocking": false
+    },
+    "D37": {
+      "status": "decided",
+      "option": "[lane_b] from_block only once D41's gate is met; full share at that block (D45)",
+      "class": "O",
+      "decided": "owner (default), 2026-11-21",
+      "blocking": false
+    },
+    "D38": {
+      "status": "decided",
+      "option": "(a) 8 MB suite_target_max_repo_mb",
+      "class": "O",
+      "decided": "owner (default), 2026-11-21",
+      "blocking": false
+    },
+    "D39": {
+      "status": "decided",
+      "option": "Fractions 0.03125 / 0.1484375",
+      "class": "O",
+      "decided": "owner (default), 2026-11-21",
+      "blocking": false
+    },
+    "D40": {
+      "status": "decided",
+      "option": "(a) router rows frozen",
+      "class": "S",
+      "decided": "owner (default), 2026-11-21",
+      "blocking": false
+    },
+    "D41": {
+      "status": "decided",
+      "option": "(a) open_tokens + a passing lane A king check",
+      "class": "S",
+      "decided": "owner (default), 2026-11-21",
+      "blocking": false
+    },
+    "D42": {
+      "status": "decided",
+      "option": "Cheaper GPUs via [lane_b] funded_pod_skus; miner-chosen leg \u2264 6 h",
+      "class": "S",
+      "decided": "owner, 2026-11-21",
+      "blocking": false
+    },
+    "D42b": {
+      "status": "decided",
+      "option": "(a) real hours on the chosen GPU",
+      "class": "S",
+      "decided": "owner, 2026-11-21",
+      "blocking": false
+    },
+    "D43": {
+      "status": "decided",
+      "option": "Immediate reveal (min_blocks)",
+      "class": "S",
+      "decided": "owner, 2026-11-21",
+      "blocking": false
+    },
+    "D44": {
+      "status": "withdrawn",
+      "option": "\u2014 (lanes A and B keep cooldown)",
+      "class": "\u2014",
+      "decided": "owner, 2026-11-21",
+      "blocking": false
+    },
+    "D45": {
+      "status": "decided",
+      "option": "No shadow modes; one activation block",
+      "class": "S",
+      "decided": "owner, 2026-11-21",
+      "blocking": false
+    },
+    "D46": {
+      "status": "decided",
+      "option": "(a) house dated by its lineage",
+      "class": "S",
+      "decided": "owner, 2026-11-21",
+      "blocking": false
+    },
+    "D47": {
+      "status": "decided",
+      "option": "(a) score the house as a BF16 cast; dedup against BF16 casts",
+      "class": "S",
+      "decided": "owner (default), 2026-11-21",
+      "blocking": false
+    },
+    "D48": {
+      "status": "decided",
+      "option": "Fixed 25% shares of the total; lane D takes from lane A's 25%",
+      "class": "S",
+      "decided": "owner, 2026-11-21",
+      "blocking": false
     }
   },
-  "milestone": "none (pre Build-complete)",
-  "pending_merges": [
-    485
-  ]
+  "owner_inputs": {
+    "OA1": {
+      "status": "open",
+      "unblocks": "B1 null type 1 (T14, S4 gate)",
+      "evidence": "evidence/owner/oa1.json",
+      "present": false
+    },
+    "OA2": {
+      "status": "open",
+      "unblocks": "B1 null type 2b",
+      "evidence": "evidence/owner/oa2.json",
+      "present": false
+    },
+    "OA3": {
+      "status": "answered: 5% (D24)",
+      "unblocks": "\u2014",
+      "evidence": null,
+      "present": false
+    },
+    "OA4": {
+      "status": "open (pod yes + cost cap, or the valpriv-4090 window)",
+      "unblocks": "B1 scoring; W1's 16k memory fit",
+      "evidence": "evidence/owner/oa4.json",
+      "present": false
+    },
+    "OA5": {
+      "status": "open (host for TSFORGE_S3 reads)",
+      "unblocks": "W1 history counts, pool_d size",
+      "evidence": "evidence/owner/oa5.json",
+      "present": false
+    },
+    "OA6": {
+      "status": "open (non-box host for pinned snapshots)",
+      "unblocks": "W1 snapshot-diff bound",
+      "evidence": "evidence/owner/oa6.json",
+      "present": false
+    },
+    "OA7": {
+      "status": "moot: the plan on the branch has been the input since rev3",
+      "unblocks": "\u2014",
+      "evidence": null,
+      "present": false
+    },
+    "OA8": {
+      "status": "open (pod yes, GPU types, total cost cap)",
+      "unblocks": "WB19 (SB2)",
+      "evidence": "evidence/owner/oa8.json",
+      "present": false
+    }
+  },
+  "counters": {
+    "t_rows": {
+      "passed": 0,
+      "total": 38
+    },
+    "invariants": {
+      "covered": [],
+      "total": 12
+    },
+    "orphans": [
+      "T6b",
+      "T9b",
+      "T18b",
+      "T18c",
+      "T18d",
+      "T18e",
+      "T4b"
+    ],
+    "blocked": [
+      {
+        "reason": "dependency",
+        "count": 69,
+        "wps": [
+          "R11",
+          "R12",
+          "R14",
+          "R15",
+          "R16",
+          "R2x",
+          "R3",
+          "R4",
+          "R6x",
+          "R7",
+          "R7m",
+          "R7t",
+          "R9",
+          "W-S1",
+          "W-S2",
+          "W-S3",
+          "W0b",
+          "W1.5",
+          "W11",
+          "W12a",
+          "W12b",
+          "W13",
+          "W14",
+          "W15",
+          "W16",
+          "W17",
+          "W18",
+          "W19",
+          "W2",
+          "W2b",
+          "W3",
+          "W3b1",
+          "W3b2",
+          "W3b3",
+          "W3b4",
+          "W3b5",
+          "W4",
+          "W5a",
+          "W5b",
+          "W5c",
+          "W5d",
+          "W5e",
+          "W5f",
+          "W5g",
+          "W5h",
+          "W6-S8",
+          "W6a",
+          "W6b",
+          "W6c",
+          "W6d",
+          "W6fs",
+          "W6s-*n*",
+          "W7a",
+          "W7b",
+          "W7c",
+          "W7d",
+          "W8",
+          "W9",
+          "WB10",
+          "WB11",
+          "WB13",
+          "WB14",
+          "WB15",
+          "WB16",
+          "WB17",
+          "WB18",
+          "WB20",
+          "WB22",
+          "WB23"
+        ]
+      },
+      {
+        "reason": "owner",
+        "count": 2,
+        "wps": [
+          "W1",
+          "WB19"
+        ]
+      }
+    ]
+  }
 }

@@ -1,0 +1,19 @@
+{
+  "runs": [
+    {
+      "workflow": "laned-accept",
+      "event": "pull_request",
+      "mode": "accept",
+      "wp": "W0c",
+      "head_sha": "8206a8607ef45b50794ef02dc6191c371df0c1c3",
+      "conclusion": "success",
+      "created_at": "2026-11-21T20:49:04Z",
+      "run_id": 44948201599
+    }
+  ],
+  "harvested_run_ids": [
+    44948200960,
+    44948201599,
+    44949820452
+  ]
+}
