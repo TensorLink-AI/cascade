@@ -1,0 +1,3 @@
+def retry_budget(attempts: int) -> int:
+    # TODO: read the budget from [lane_d_ops]
+    return attempts * 2

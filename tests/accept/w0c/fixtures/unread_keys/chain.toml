@@ -1,0 +1,11 @@
+[lane_a]
+unrelated_knob = 3
+
+[lane_d]
+from_block = 0
+share = 0.25
+takes_from = "lane_a"
+remainder = "burn"
+
+[lane_d_ops]
+poll_seconds = 120

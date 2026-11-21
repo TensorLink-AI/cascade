@@ -1,0 +1,3 @@
+def window_count(windows: list[int]) -> int:
+    total = len(windows)  # FIXME off by one at the era boundary
+    return total

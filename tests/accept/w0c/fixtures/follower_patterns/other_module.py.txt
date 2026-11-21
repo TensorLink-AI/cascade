@@ -1,0 +1,7 @@
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def poll() -> None:
+    logger.info("manifest poll ok")
