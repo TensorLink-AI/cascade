@@ -1,0 +1,33 @@
+{
+  "input": "OA1",
+  "status": "found by orchestrator (read-only: /root/cascade/warm_start_init.json, validator.log, OPSLOG); owner may correct",
+  "lineage": "random init (era 2629) -> gen-16 promotion (u220 5CMfsDbJ) -> era-2637 king leg = gen-17 init -> 5G6j (u164) warm-started from gen 17, crowned round 11174384143140400514",
+  "kings": [
+    {
+      "name": "u220 5CMfsDbJ winning ckpt (gen 16)",
+      "ref": "metro-v1:trained:hippius:cascade/ckpt-r14349492220266598742-challenger-cascade-moe-v2-120m-u220@sha256:15fe5d38854f7a4b6b8e572177aeafa8d2afe75a67a76cc9546dd525a6d3125d"
+    },
+    {
+      "name": "u220 king leg from gen 16 (gen 17 init)",
+      "ref": "metro-v1:trained:hippius:cascade/ckpt-r17472041992776185935-challenger-cascade-moe-v2-120m-kingkey@sha256:4fffe119eafdec971eec214ad5c65fda3dab4f3aad4c16818608a07675f42827"
+    },
+    {
+      "name": "5G6j u164 leg warm from gen 17 (crowned 2026-11-18)",
+      "ref": "metro-v1:trained:hippius:cascade/ckpt-r824229856147703689-challenger-cascade-moe-v2-120m-u164@sha256:0d7e107f50e5ba38aef64f24454a0eff422b9e4409967a134654083d19aff1be"
+    }
+  ],
+  "pairs": [
+    [
+      0,
+      1
+    ],
+    [
+      1,
+      2
+    ]
+  ],
+  "caveats": [
+    "each step is a full 23,841-step warm-start leg, not a short fine-tune (OPSLOG 2026-11-21: no measurable trunk progress at full LR, so the pairs are close)",
+    "5G6j's crowned digest inferred as its only u164 ckpt in leg round 824229856147703689; confirm against the 11-18 signed receipt"
+  ]
+}

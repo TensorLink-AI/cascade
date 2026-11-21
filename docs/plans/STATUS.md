@@ -4,7 +4,7 @@ Hand-maintained by the orchestrator until W0c reaches L3 (plan §17); from then
 on `scripts/laned/status` writes this file. origin/main `07117e1`; the plan
 is not on main yet (PR #483).
 
-Milestone: none. Open decisions: none. Owner inputs open: OA1, OA2, OA4, OA5, OA6, OA8.
+Milestone: none. Open decisions: none. Owner inputs open: OA4, OA5, OA6, OA8. OA1 and OA2 found by the orchestrator (evidence/owner/, this branch).
 
 | WP | Level | Side state | Activity |
 |---|---|---|---|

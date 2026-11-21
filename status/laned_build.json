@@ -453,8 +453,8 @@
     "note": "register in plan \u00a717.4; none open"
   },
   "owner_inputs": {
-    "OA1": "open",
-    "OA2": "open",
+    "OA1": "found (evidence/owner/oa1.json on laned/build-state; owner may correct)",
+    "OA2": "found: no different-seed replicas; same-seed re-runs listed (evidence/owner/oa2.json)",
     "OA3": "answered",
     "OA4": "open",
     "OA5": "open",

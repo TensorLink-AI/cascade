@@ -1,0 +1,27 @@
+{
+  "input": "OA2",
+  "status": "found by orchestrator; owner may correct",
+  "different_seed_replicas": "none: training_seed is shared by king and every challenger within a round (contract.py:182, OPSLOG 2026-11-08)",
+  "same_seed_reruns": [
+    {
+      "hotkey": "u92",
+      "round": "14349492220266598742",
+      "refs": [
+        "metro-v1:trained:hippius:cascade/ckpt-r14349492220266598742-challenger-cascade-moe-v2-120m-u92@sha256:fdbf639668873cc4165fc19ec19e7ec6af91d2b4657bf2165495616c8279f7d5",
+        "metro-v1:trained:hippius:cascade/ckpt-r14349492220266598742-challenger-cascade-moe-v2-120m-u92@sha256:fcf9bc96dc42065835921e289cdd979f96cd9374d22f4c76c7784db4a41366c6"
+      ]
+    },
+    {
+      "hotkey": "u164",
+      "round": "14349492220266598742",
+      "refs": [
+        "metro-v1:trained:hippius:cascade/ckpt-r14349492220266598742-challenger-cascade-moe-v2-120m-u164@sha256:ff5e75ab304e32eb969a8b999ff4f296d46048f53805208e525ecdb8fc3f580b",
+        "metro-v1:trained:hippius:cascade/ckpt-r14349492220266598742-challenger-cascade-moe-v2-120m-u164@sha256:a7f3ad4dcf47ac06325a2412310e7c778b1b5f105be9b167d65fd89fab025e1e"
+      ]
+    }
+  ],
+  "caveats": [
+    "same corpus? not verified: two digests per hotkey could be re-legs on a changed generator; check the generator refs in the round manifest before using as a null",
+    "a same-seed re-run measures hardware/NCCL nondeterminism (B1 null type 2b weaker form), not seed noise"
+  ]
+}
