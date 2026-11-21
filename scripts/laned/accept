@@ -1,0 +1,303 @@
+#!/usr/bin/env python3
+"""Lane D Accept (plan §3 conventions, §3.1, invariant 10, §17.2).
+
+    accept <WP> [--evidence FILE] [--root R]
+        invariant10 -> pytest tests/accept/<wp>/ -> stub_scan over PATHS
+        -> make laned-e2e (when the Makefile defines it) -> evidence
+    accept <WP> --expect-fail [--root R]
+        tests-only PRs: tests collected and failing for a right reason only
+    accept <WP> --check-pr --base REF --head REF [--root R]
+        rule 1 and the WP's PATHS over `git diff --name-only BASE...HEAD`
+    accept --gate <STAGE> [--root R]
+        evidence/gates/<stage>.json: right stage, every check passed
+
+The pytest command is `uv run --frozen pytest` unless LANED_PYTEST_CMD is set
+(shlex-split). It always runs with cwd = --root. Exit 0 means pass.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+import lanedlib
+import stub_scan
+
+UNARMED = "unchanged_when_unarmed"
+ARMED = "armed_nonempty_lane_d_effect"
+DEF_RE = re.compile(r"^\s*(?:async\s+)?def\s+(test\w*)\s*\(", re.M)
+PROTECTED = ("docs/plans/LANE_D_PLAN.md", "docs/plans/STATUS.md", "status/laned_build.json")
+TOOLING_WP = "W0c"
+
+
+def fail(step: str, detail: str = "") -> int:
+    print(f"FAIL {step}" + (f": {detail}" if detail else ""))
+    return 1
+
+
+def pytest_cmd() -> list[str]:
+    env = os.environ.get("LANED_PYTEST_CMD")
+    return shlex.split(env) if env else ["uv", "run", "--frozen", "pytest"]
+
+
+def test_dir(root: Path, wp: str) -> Path:
+    return root / "tests" / "accept" / lanedlib.wp_dir(wp)
+
+
+def read_paths(root: Path, wp: str) -> list[str] | None:
+    pf = test_dir(root, wp) / "PATHS"
+    return lanedlib.parse_paths(pf.read_text()) if pf.is_file() else None
+
+
+# ---------------------------------------------------------------------------
+# invariant 10
+# ---------------------------------------------------------------------------
+
+def unpaired_tests(root: Path, wp: str) -> list[str]:
+    names: set[str] = set()
+    for f in sorted(test_dir(root, wp).rglob("test_*.py")):
+        names.update(DEF_RE.findall(f.read_text(encoding="utf-8", errors="replace")))
+    return sorted(n for n in names if UNARMED in n and n.replace(UNARMED, ARMED) not in names)
+
+
+def step_invariant10(root: Path, wp: str) -> int:
+    missing = unpaired_tests(root, wp)
+    if missing:
+        for name in missing:
+            print(f"unpaired {name} (needs {name.replace(UNARMED, ARMED)})")
+        return fail("invariant10", f"{len(missing)} unpaired unarmed test(s)")
+    print("ok invariant10")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# accept
+# ---------------------------------------------------------------------------
+
+def run_pytest(root: Path, wp: str, extra: list[str]) -> subprocess.CompletedProcess:
+    rel = f"tests/accept/{lanedlib.wp_dir(wp)}/"
+    cmd = pytest_cmd() + ["-q", *extra, rel]
+    print("+ " + shlex.join(cmd), flush=True)
+    return subprocess.run(cmd, cwd=str(root), capture_output=True, text=True)
+
+
+def step_evidence(root: Path, wp: str, evidence: str) -> int:
+    path = lanedlib.resolve(root, evidence)
+    text = path.read_text(encoding="utf-8") if path.is_file() else None
+    ok, why = lanedlib.check_evidence(text, path.name, wp)
+    if not ok:
+        return fail("evidence", f"{evidence}: {why}")
+    print(f"ok evidence {evidence}")
+    return 0
+
+
+def makefile_has_target(root: Path, target: str) -> bool:
+    for name in ("GNUmakefile", "makefile", "Makefile"):
+        mf = root / name
+        if mf.is_file():
+            return bool(re.search(rf"^{re.escape(target)}\s*:", mf.read_text(), re.M))
+    return False
+
+
+def cmd_accept(root: Path, wp: str, evidence: str | None) -> int:
+    if not test_dir(root, wp).is_dir():
+        return fail("pytest", f"no tests at tests/accept/{lanedlib.wp_dir(wp)}/")
+    if step_invariant10(root, wp):
+        return 1
+    proc = run_pytest(root, wp, [])
+    sys.stdout.write(proc.stdout[-20000:])
+    sys.stderr.write(proc.stderr[-5000:])
+    if proc.returncode != 0:
+        return fail("pytest", f"exit {proc.returncode}")
+    print("ok pytest")
+    paths = read_paths(root, wp)
+    if paths is None:
+        return fail("stub_scan", "no PATHS file")
+    lines, scanned = stub_scan.scan(root, paths)
+    for line in lines:
+        print(line)
+    if lines:
+        return fail("stub_scan", f"{len(lines)} finding(s)")
+    print(f"ok stub_scan ({scanned} file(s))")
+    if makefile_has_target(root, "laned-e2e"):
+        proc = subprocess.run(["make", "laned-e2e"], cwd=str(root), capture_output=True, text=True)
+        sys.stdout.write(proc.stdout[-20000:])
+        sys.stderr.write(proc.stderr[-5000:])
+        if proc.returncode != 0:
+            return fail("e2e", f"make laned-e2e exit {proc.returncode}")
+        print("ok e2e")
+    if evidence and step_evidence(root, wp, evidence):
+        return 1
+    print(f"PASS {wp}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# expect-fail
+# ---------------------------------------------------------------------------
+
+NO_MODULE = re.compile(r"No module named '([\w.]+)'")
+CANNOT_IMPORT = re.compile(r"cannot import name '(\w+)' from '([\w.]+)'")
+NO_ATTR = re.compile(r"module '([\w.]+)' has no attribute '(\w+)'")
+SYNTAX = re.compile(r"\b(SyntaxError|IndentationError|TabError)\b")
+FIXTURE = re.compile(r"fixture '[^']+' not found")
+
+
+def classify(kind: str, text: str, paths: list[str]) -> tuple[bool, str]:
+    """(right reason?, explanation) for one failed or errored test case."""
+    m = NO_MODULE.search(text)
+    if m:
+        mod = m.group(1)
+        return lanedlib.module_in_paths(mod, paths), f"missing module {mod}"
+    m = CANNOT_IMPORT.search(text) or NO_ATTR.search(text)
+    if m:
+        if m.re is CANNOT_IMPORT:
+            name, mod = m.group(1), m.group(2)
+        else:
+            mod, name = m.group(1), m.group(2)
+        ok = lanedlib.module_in_paths(f"{mod}.{name}", paths) or lanedlib.module_in_paths(mod, paths)
+        return ok, f"missing {mod}.{name}"
+    if SYNTAX.search(text):
+        return False, "syntax error"
+    if FIXTURE.search(text):
+        return False, "fixture error"
+    if kind == "error":
+        return False, "error outside a test body"
+    if "AssertionError" in text:
+        return True, "assertion failure"
+    return False, "failure that is not an assertion"
+
+
+def cmd_expect_fail(root: Path, wp: str) -> int:
+    if not test_dir(root, wp).is_dir():
+        return fail("expect-fail", f"no tests at tests/accept/{lanedlib.wp_dir(wp)}/")
+    paths = read_paths(root, wp)
+    if paths is None:
+        return fail("expect-fail", "no PATHS file")
+    if step_invariant10(root, wp):
+        return 1
+    with tempfile.TemporaryDirectory(prefix="laned-xf-") as tmp:
+        junit = Path(tmp) / "junit.xml"
+        proc = run_pytest(root, wp, [f"--junitxml={junit}", "--continue-on-collection-errors"])
+        sys.stdout.write(proc.stdout[-20000:])
+        if not junit.is_file():
+            sys.stderr.write(proc.stderr[-5000:])
+            return fail("expect-fail", f"pytest wrote no report (exit {proc.returncode})")
+        tree = ET.parse(junit)
+    cases = list(tree.iter("testcase"))
+    if not cases:
+        return fail("expect-fail", "no tests collected")
+    right = wrong = passed = 0
+    for case in cases:
+        name = f"{case.get('classname', '')}::{case.get('name', '')}"
+        bad = [(child.tag, (child.get("message") or "") + "\n" + (child.text or ""))
+               for child in case if child.tag in ("failure", "error")]
+        if not bad:
+            if not any(child.tag == "skipped" for child in case):
+                passed += 1
+            continue
+        for kind, text in bad:
+            ok, why = classify(kind, text, paths)
+            print(f"{'right' if ok else 'WRONG'} {kind} {name}: {why}")
+            if ok:
+                right += 1
+            else:
+                wrong += 1
+    print(f"expect-fail: {len(cases)} collected, {passed} passed, {right} right-reason, {wrong} wrong-reason")
+    if wrong:
+        return fail("expect-fail", f"{wrong} failure(s) for a wrong reason")
+    if not right:
+        return fail("expect-fail", "no test fails for a right reason")
+    print(f"PASS {wp} expect-fail")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# check-pr
+# ---------------------------------------------------------------------------
+
+def paths_at(root: Path, ref: str, wp: str) -> list[str] | None:
+    rel = f"tests/accept/{lanedlib.wp_dir(wp)}/PATHS"
+    proc = lanedlib.git(root, "show", f"{ref}:{rel}", check=False)
+    if proc.returncode == 0:
+        return lanedlib.parse_paths(proc.stdout)
+    return read_paths(root, wp)
+
+
+def cmd_check_pr(root: Path, wp: str, base: str, head: str) -> int:
+    diff = lanedlib.git(root, "diff", "--name-only", f"{base}...{head}").stdout.split()
+    if not diff:
+        return fail("paths", "the PR changes nothing")
+    tests = [p for p in diff if p.startswith("tests/accept/")]
+    others = [p for p in diff if not p.startswith("tests/accept/")]
+    if tests and others:
+        return fail("rule1", "tests/accept/ edited together with: " + " ".join(others))
+    if tests:
+        own = f"tests/accept/{lanedlib.wp_dir(wp)}/"
+        foreign = [p for p in tests if not p.startswith(own)]
+        if foreign:
+            return fail("rule1", f"tests-only PR for {wp} touches another WP's tests: " + " ".join(foreign))
+        print("MODE tests-only")
+        return 0
+    paths = paths_at(root, base, wp) or paths_at(root, head, wp)
+    if not paths:
+        return fail("paths", f"no tests/accept/{lanedlib.wp_dir(wp)}/PATHS")
+    outside = [p for p in diff if not lanedlib.path_matches(p, paths)]
+    if wp != TOOLING_WP:
+        outside += [p for p in diff if p.startswith("scripts/laned/") and p not in outside]
+    outside += [p for p in diff if p in PROTECTED and p not in outside]
+    if outside:
+        return fail("paths", "outside the WP's PATHS: " + " ".join(sorted(outside)))
+    print("MODE implementation")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# gate
+# ---------------------------------------------------------------------------
+
+def cmd_gate(root: Path, stage: str) -> int:
+    rel = lanedlib.gate_path(stage)
+    path = root / rel
+    text = path.read_text(encoding="utf-8") if path.is_file() else None
+    ok, why = lanedlib.check_gate(text, stage)
+    if not ok:
+        return fail("gate", f"{rel}: {why}")
+    print(f"PASS gate {stage}")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="accept", description=__doc__.split("\n\n")[0])
+    ap.add_argument("wp", nargs="?")
+    ap.add_argument("--root", default=".")
+    ap.add_argument("--evidence")
+    ap.add_argument("--expect-fail", action="store_true")
+    ap.add_argument("--check-pr", action="store_true")
+    ap.add_argument("--base")
+    ap.add_argument("--head")
+    ap.add_argument("--gate", metavar="STAGE")
+    args = ap.parse_args(argv)
+    root = Path(args.root).resolve()
+    if args.gate:
+        return cmd_gate(root, args.gate)
+    if not args.wp:
+        ap.error("a WP id is required (or --gate STAGE)")
+    if args.check_pr:
+        if not (args.base and args.head):
+            ap.error("--check-pr needs --base and --head")
+        return cmd_check_pr(root, args.wp, args.base, args.head)
+    if args.expect_fail:
+        return cmd_expect_fail(root, args.wp)
+    return cmd_accept(root, args.wp, args.evidence)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
