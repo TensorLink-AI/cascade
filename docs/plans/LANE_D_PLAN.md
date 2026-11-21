@@ -35,7 +35,8 @@ revisions, is an older commit of this plan branch, sitting directly on main
 | C | Deployment facts checked read-only (below) | this changelog, §1.2 and §9 OPSLOG refs |
 | D42 | **Owner decision:** cheaper GPUs via a lane B GPU list; miner-chosen `train_hours` 0.5–6 h; D42b new | §12b.0, §12b.6, D42, D42b, WB19, WB22, WB23, TB23–TB27, OA8, Appendix C |
 | Harvest | **Owner request:** start long-history harvesting (to 128k) now, score from S8 | §1.7, R16, §5 S1 |
-| New proposals | 18 house lineage T; 19 lane D reveal timing; 20 lane A/B pre-T leakage shadow; 21 retire duplicate files | Proposed design changes |
+| D43 | **Owner decision:** lane D reveals immediately (Proposed change 19 adopted) | §1.2 step 4, W10, D43 |
+| New proposals | 18 house lineage T; 19 lane D reveal timing (adopted as D43); 20 lane A/B pre-T leakage shadow; 21 retire duplicate files | Proposed design changes |
 
 **Propagation table:**
 
@@ -445,7 +446,8 @@ the code). Each is verified where marked.
     T, merged lane B deltas' T). A house refresh restarts confirmations only
     when that lineage T moves (crowning, promotion, lane B merge), not on a
     per-era retrain. Affects §1.3, §1.4, D20, T9b.
-19. **(rev5) Lane D reveal timing.** The standard timelock helper lands a
+19. **(rev5) ADOPTED by the owner as D43 (§1.2 step 4, W10).** *Lane D
+    reveal timing.* The standard timelock helper lands a
     reveal at `boundary − reveal_margin_blocks` (25) (`shared/chain.py:89-100`;
     copy-contest protection for lane A pointers). For lane D the weights stay
     private in the vault and exact-digest dedup applies, so revealing at once
@@ -743,8 +745,22 @@ settlement" is a separate, judging-time rule.
    - Checks the object list and sizes against the manifest. It never
      downloads the weights.
    - Records `ready_block` and returns `commit_payload`.
-4. **The miner commits** through the normal timelocked reveal. The **reveal
-   block is T**, the entry's commit time. Weights are immutable from here.
+4. **The miner commits** through a timelocked reveal. The **reveal block is
+   T**, the entry's commit time. Weights are immutable from here.
+   - **(rev5, owner-adopted, D43) Immediate reveal.** The lane D CLI sets
+     `blocks_until_reveal = min_blocks` (reveal now). It does **not** use the
+     lane A timing, which lands the reveal at `next boundary −
+     reveal_margin_blocks` (25) (`shared/chain.py:89-100`) to stop copiers of
+     public generator pointers.
+   - **Why that's safe for lane D:** the commitment reveals only the vault
+     ref and digest; the weights stay private in the vault; exact-digest dedup
+     refuses resubmissions; and `DigestOwned` drops a digest committed by a
+     hotkey other than its uploader.
+   - **Effect:** T, and with it the forward-data clock (§1.3), starts up to
+     one settlement (≈ 3 h, 900 blocks) earlier.
+   - The validator doesn't depend on the timing: it takes T from the observed
+     reveal block either way. A miner who uses a delayed reveal only delays
+     their own clock.
 5. **Prefetch.** On reveal, valeval-laned prefetches the entry into a
    sha-keyed, resumable cache, using presigned GETs. Hippius outages and slow
    transfers are the history (§13).
@@ -1274,7 +1290,7 @@ Accept command exits 0**, never on a builder's word. Conventions:
 | WP | What | Depends | Runs in | Accept |
 |---|---|---|---|---|
 | W0c | Loop tooling: `scripts/laned/accept`; `stub_scan.py` (refuses `TODO`, `FIXME`, `pass`-only bodies, `NotImplementedError`, `...` bodies, hardcoded sample values and mock imports outside `tests/`); `unread_keys.py` (every `[lane_d]`/`[lane_d_ops]` key is read by a parser); `follower_patterns.py` (every lane D log call has a cascade-ops follower pattern) | — | ci | `scripts/laned/accept W0c` (self-tests: each script fails on a planted violation fixture and passes on a clean one) |
-| W0 | DEC-CA-0070 (supersedes DEC-CA-0062's recipe design) recording **(rev5)** D1–D42 and D42b (D25–D32 from §15, D33–D35 §16, D36–D42 §12b) | — | ci + owner merge | `scripts/laned/accept W0` (front matter valid; `supersedes: DEC-CA-0062`; **(rev5)** every decision D1–D42 and D42b answered or marked resolved) |
+| W0 | DEC-CA-0070 (supersedes DEC-CA-0062's recipe design) recording **(rev5)** D1–D43 and D42b (D25–D32 from §15, D33–D35 §16, D36–D42 §12b) | — | ci + owner merge | `scripts/laned/accept W0` (front matter valid; `supersedes: DEC-CA-0062`; **(rev5)** every decision D1–D43 and D42b answered or marked resolved) |
 | W0b | Context-equivalence test: the lane D scorer at 4096 equals the pinned `pyramid_wrapper` output (within tolerance) on windows with ≥ 4096 history; a 4096 checkpoint loads `strict=True` at every context variant | W5d | ci | `scripts/laned/accept W0b` |
 
 **Rollout tooling (prerequisites for S0a–S0c, S4–S6)**
@@ -1339,7 +1355,7 @@ Accept command exits 0**, never on a builder's word. Conventions:
 | W7d | Satellite replay: an **independent** implementation, no imports from producer eligibility, verdict or weight code (invariant 12) | W7c | ci | `scripts/laned/accept W7d` (import-graph check included) |
 | W8 | Emission: lane D in `lane_parts` / `lane_pool_shares` (`emission.py:330-383`, `lane_c.py`), court decay, house burn | W1.5 | ci | `scripts/laned/accept W8` |
 | W9 | Audit `check_lane_d` + `derive_weights` (**rev3:** re-derives the judged set, coldkey caps, both-clock eligibility, the confirmation rule and `rows_sha256`), independent of producer code | W7c, W8 | ci | `scripts/laned/accept W9` |
-| W10 | Miner CLI `cascade lane-d export \| verify \| submit \| ready \| status`, **W3a-chosen upload path only** | W3a, W3, W4 | ci + testnet | `scripts/laned/accept W10` |
+| W10 | Miner CLI `cascade lane-d export \| verify \| submit \| ready \| status`, **W3a-chosen upload path only**. **(rev5, D43)** The commit reveals immediately (`blocks_until_reveal = min_blocks`), never at boundary − margin; a test asserts the lane D commit path never uses the lane A boundary timing | W3a, W3, W4 | ci + testnet | `scripts/laned/accept W10` |
 | W11 | cascade-ops checks (§10.7) + follower patterns | W5g, W7c | ci (cascade-ops repo) | `scripts/laned/accept W11` (includes `follower_patterns.py`) |
 | W12a | Docs and agent surfaces (§11.2 text surfaces, website; **rev3:** LANE_D.md FAQ on coldkey caps, confirmation latency, both clocks, BF16; VALIDATOR.md on what satellites verify for the new report fields; OPERATOR.md on launch eval host, S8, first-seen recorder) | W10 | ci | `scripts/laned/accept W12a` (every §11.2 surface mentions lane D; links resolve; `llms.txt` lane list matches the status fixture) |
 | W12b | `cascade status --json` and `discovery-check` lane D fields | W2, W17 | ci | `scripts/laned/accept W12b` |
@@ -1606,7 +1622,7 @@ capability release → stake-proven shadow → pay.**
 
 | # | Stage | Work | Exit gate (all must hold) |
 |---|---|---|---|
-| 1 | **S0 Decide** | **(rev5)** D1–D42 and D42b (incl. the §15 incentive [DECIDE]s D25–D32, the §16 sentinel D33–D35 and lane B D36–D42) (§6) in writing; W0 | All answered |
+| 1 | **S0 Decide** | **(rev5)** D1–D43 and D42b (incl. the §15 incentive [DECIDE]s D25–D32, the §16 sentinel D33–D35 and lane B D36–D42) (§6) in writing; W0 | All answered |
 | 2 | **S0a De-drift** | Classify the 21 `LIVE OVERRIDE`s in the deployed chain.toml: main, overlay, or documented operator-only; type the decided blocks in main. Overlays merge onto **each node's own base** (`build_config(base, body)` merges onto `effective_raw(base)`, `netconfig.py:346-354`), so base drift survives any overlay | `cascade-audit decided --config /root/cascade/chain.toml` = 0 drift; the validator-read consensus-key diff between deployed and main is empty |
 | 3 | **S0b Note budget** | Decode the live mainnet readiness notes and add the `cfg-` segment. It's trimmed **last** (`activation.py:1334-1357`), so older pending segments go first | No still-pending segment would be trimmed (type their decided blocks in main first if needed); T22 passes on testnet |
 | 4 | **S0c Overlay bring-up** | Publish a **benign seq-1 overlay** (restates current values only) on testnet, then mainnet. Then a deliberately refused overlay on testnet | The 404-every-poll is gone. Fetched from S3 **and** the HF mirror by our validator, the trainer and satellites. `cfg-` lock ≥ 51% in `status/chain.json`. Receipts stamp `netconfig_seq`; the `cascade-audit` netconfig check passes; the trainer logs the same apply block. The refused overlay applies nothing |
@@ -1695,6 +1711,7 @@ cross-checked from two sources. There are past off-by-ones (§13).
 | D41 | **(rev4)** Lane B opening rule (LB4) | (a) `open_tokens` + a passing lane A king check (**recommended**); (b) `open_tokens` alone; (c) co-gate with re-measured thresholds |
 | D42 | **(rev5) DECIDED (owner 2026-11-21):** expert-leg cost (LB6) | **Cheaper GPUs allowed** via a lane B-only `[lane_b] funded_pod_skus` (each type image-qualified and measured first), and **miner-chosen leg length** `train_hours` 0.5–6.0 h (`[lane_b] max_leg_hours = 6.0`), guard capped by a new `[lane_b] max_leg_seconds`, never by editing `[training] max_train_seconds`. Operator funding not adopted. §12b.6 |
 | D42b | **(rev5)** What `train_hours` means (§12b.6) | (a) wall hours on the chosen GPU, steps fixed at admission from the measured per-GPU rate (**recommended**); (b) reference hours, steps = 23,841 × h / 3 on any GPU |
+| D43 | **(rev5) DECIDED (owner 2026-11-21):** lane D reveal timing | **Immediate reveal** (`min_blocks`), not lane A's boundary − 25 blocks; T = the observed reveal block. Starts the forward clock up to ≈ 3 h earlier. §1.2 step 4, W10. (The commit-inclusion-block alternative is not adopted) |
 
 ---
 
