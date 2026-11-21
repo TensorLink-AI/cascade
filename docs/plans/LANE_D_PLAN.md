@@ -36,10 +36,9 @@ revisions, is an older commit of this plan branch, sitting directly on main
 | D42 | **Owner decision:** cheaper GPUs via a lane B GPU list; miner-chosen `train_hours` 0.5–6 h; D42b new | §12b.0, §12b.6, D42, D42b, WB19, WB22, WB23, TB23–TB27, OA8, Appendix C |
 | Harvest | **Owner request:** start long-history harvesting (to 128k) now, score from S8 | §1.7, R16, §5 S1 |
 | D43 | **Owner decision:** lane D reveals immediately (Proposed change 19 adopted) | §1.2 step 4, W10, D43 |
-| D44 | **(rev5) DECIDED (owner 2026-11-21):** power EMA instead of cooldown, lanes A and B | No cooldown for EMA-scored legs; the scored weights are the EMA. Blocked on WE1 (scored EMA constant), WE2 (identical-trunk finding) and WE4 (testnet measurement). §12c |
-| D44b | **(rev5)** Where the no-cooldown switch lives (§12c) | (a) image-only, activated by init like the power EMA (**recommended**); (b) a `[v2.training] lr_schedule` contract value activated at a typed block |
+| D44 | **(rev5) WITHDRAWN (owner 2026-11-21)** | Power EMA instead of cooldown was drafted and then dropped by the owner. Lanes A and B keep today's cooldown. Not planned |
 | D45 | **(rev5) DECIDED (owner 2026-11-21):** go-live rule | No shadow modes: every feature goes live at one activation block on every node at full effect. Testnet + S1 replace shadow evidence; release-then-activate (observed stake ≥ 2/3 **before** the block) and the kill switch stay. §5 |
-| D44 | **Owner decision:** power EMA instead of cooldown for lanes A and B; D44b new; WE1–WE5, TE1–TE4, OA9 | §12c, §6, Appendix A |
+| D44 | Drafted (EMA instead of cooldown), then **withdrawn by the owner**; only the D44 row remains, marked withdrawn | §6 |
 | D45 | **Owner decision:** no shadow modes; one activation block, everywhere, full effect | §5 (go-live rule, S6, SB5 and exit gate), D10, D19, D37, X6a, §14.5, §16 sentinel, W-S1, Appendix B note |
 | New proposals | 18 house lineage T; 19 lane D reveal timing (adopted as D43); 20 lane A/B pre-T leakage shadow; 21 retire duplicate files | Proposed design changes |
 
@@ -1295,7 +1294,7 @@ Accept command exits 0**, never on a builder's word. Conventions:
 | WP | What | Depends | Runs in | Accept |
 |---|---|---|---|---|
 | W0c | Loop tooling: `scripts/laned/accept`; `stub_scan.py` (refuses `TODO`, `FIXME`, `pass`-only bodies, `NotImplementedError`, `...` bodies, hardcoded sample values and mock imports outside `tests/`); `unread_keys.py` (every `[lane_d]`/`[lane_d_ops]` key is read by a parser); `follower_patterns.py` (every lane D log call has a cascade-ops follower pattern) | — | ci | `scripts/laned/accept W0c` (self-tests: each script fails on a planted violation fixture and passes on a clean one) |
-| W0 | DEC-CA-0070 (supersedes DEC-CA-0062's recipe design) recording **(rev5)** D1–D45, D42b and D44b (D25–D32 from §15, D33–D35 §16, D36–D42 §12b) | — | ci + owner merge | `scripts/laned/accept W0` (front matter valid; `supersedes: DEC-CA-0062`; **(rev5)** every decision D1–D45, D42b and D44b answered or marked resolved) |
+| W0 | DEC-CA-0070 (supersedes DEC-CA-0062's recipe design) recording **(rev5)** D1–D43, D45 and D42b (D44 withdrawn) (D25–D32 from §15, D33–D35 §16, D36–D42 §12b) | — | ci + owner merge | `scripts/laned/accept W0` (front matter valid; `supersedes: DEC-CA-0062`; **(rev5)** every decision D1–D43, D45 and D42b answered or marked resolved) |
 | W0b | Context-equivalence test: the lane D scorer at 4096 equals the pinned `pyramid_wrapper` output (within tolerance) on windows with ≥ 4096 history; a 4096 checkpoint loads `strict=True` at every context variant | W5d | ci | `scripts/laned/accept W0b` |
 
 **Rollout tooling (prerequisites for S0a–S0c, S4–S6)**
@@ -1629,7 +1628,7 @@ capability release → (rev5) one activation block, live everywhere.**
 
 - **Every feature goes live at one announced activation block, on every node,
   at once, at full effect.** That covers lane D, lane B, the sentinel, the D42
-  leg options, D43 and EMA-without-cooldown (§12c). There are no `share = 0`
+  leg options and D43. There are no `share = 0`
   eras, no log-only or "would-be verdict" periods, and no partial or
   per-validator rollout. Pay starts at the activation block.
 - **What replaces shadow evidence:** CI, plus a **full testnet run
@@ -1653,7 +1652,7 @@ capability release → (rev5) one activation block, live everywhere.**
 
 | # | Stage | Work | Exit gate (all must hold) |
 |---|---|---|---|
-| 1 | **S0 Decide** | **(rev5)** D1–D45, D42b and D44b (incl. the §15 incentive [DECIDE]s D25–D32, the §16 sentinel D33–D35 and lane B D36–D42) (§6) in writing; W0 | All answered |
+| 1 | **S0 Decide** | **(rev5)** D1–D43, D45 and D42b (incl. the §15 incentive [DECIDE]s D25–D32, the §16 sentinel D33–D35 and lane B D36–D42) (§6) in writing; W0 | All answered |
 | 2 | **S0a De-drift** | Classify the 21 `LIVE OVERRIDE`s in the deployed chain.toml: main, overlay, or documented operator-only; type the decided blocks in main. Overlays merge onto **each node's own base** (`build_config(base, body)` merges onto `effective_raw(base)`, `netconfig.py:346-354`), so base drift survives any overlay | `cascade-audit decided --config /root/cascade/chain.toml` = 0 drift; the validator-read consensus-key diff between deployed and main is empty |
 | 3 | **S0b Note budget** | Decode the live mainnet readiness notes and add the `cfg-` segment. It's trimmed **last** (`activation.py:1334-1357`), so older pending segments go first | No still-pending segment would be trimmed (type their decided blocks in main first if needed); T22 passes on testnet |
 | 4 | **S0c Overlay bring-up** | Publish a **benign seq-1 overlay** (restates current values only) on testnet, then mainnet. Then a deliberately refused overlay on testnet | The 404-every-poll is gone. Fetched from S3 **and** the HF mirror by our validator, the trainer and satellites. `cfg-` lock ≥ 51% in `status/chain.json`. Receipts stamp `netconfig_seq`; the `cascade-audit` netconfig check passes; the trainer logs the same apply block. The refused overlay applies nothing |
@@ -2383,105 +2382,6 @@ type, OA8):**
 
 ---
 
-## 12c. (rev5) Lanes A and B: power EMA instead of cooldown (owner 2026-11-21, D44)
-
-**Owner decision:** lanes A and B move to the power EMA so that legs no longer
-need a cooldown.
-
-**How it works today (verified on main):**
-
-- **Cooldown.** Every pyramid leg spends its last `round(steps / 11)` steps on
-  a linear LR decay to 0 (`pyramid_optimizer.py:97-106`, `schedule_factor`;
-  `pyramid_trainer.py:322-323`). At 23,841 steps that's **2,167 steps, about
-  9.1% of the leg**.
-- **Lineage skips the cooldown.** At the cooldown's first step, a full leg
-  saves `weights_stable` plus the optimizer (`pyramid_trainer.py:393`). The
-  next warm start resumes that raw lineage, so the cooldown compute only
-  produces the scored endpoint. Lane B legs (`slices`) take no stable
-  snapshot.
-- **Power EMA is image-only** (owner decision 2026-11-01,
-  `pyramid_trainer.py:105-126`): σ_rel `(0.05, 0.10)`, and the scored file is
-  the 0.10 average (`POWER_EMA_EVAL = 1`). It's not in `contract_digest`; the
-  contract keeps `power_ema_sigma_rels = []`.
-- **Which legs score it:** derived only from the leg's init
-  (`power_ema_active`, `:156-181`). Warm-start king and challenger legs score
-  the EMA. A lane B leg follows its king's `config.json` marker. Random-init
-  legs stay raw. So a seed epoch is never mixed.
-- **Deployment:** rc15 (deployed) has no power EMA. Any image ≥ rc16 turns it
-  on for lane A at the next warm-start epoch (owner note). Today the EMA would
-  be scored **on top of** a cooldown endpoint, not instead of one.
-
-**The change:**
-
-1. **No cooldown for EMA-scored legs.** `schedule_factor` stays at 1.0 after
-   warmup to the last step whenever the leg is EMA-scored. The same
-   init-derived rule (`power_ema_active`) applies, so the king's retrain and
-   every challenger in a seed epoch match. Lane B follows its king.
-2. **The scored weights are the EMA**, and the raw endpoint is the lineage. A
-   full leg's `weights_stable` becomes the final raw weights; no mid-leg
-   snapshot is needed.
-3. **What it buys:**
-   - about 9% of every leg's steps that only ever fed the scored endpoint now
-     advance the lineage;
-   - lane B's short legs no longer spend their last ~9% annealing;
-   - the scored checkpoint no longer depends on where the decay happened to
-     end.
-4. **Prerequisites (blocking, in order):**
-   - **(a) Fix the scored EMA constant first** (owner note): settle the scored
-     σ_rel and `POWER_EMA_EVAL` before any image ≥ rc16 ships, because that
-     image arms the EMA for lane A automatically.
-   - **(b) Resolve the open identical-trunk finding** (OPSLOG "Warm-start loss
-     check", OPEN). In round 824229856147703689, the legs of u164, u105, u92
-     and u69 had bit-identical trunk losses through step 21,674 and differed
-     only from the cooldown. Without a cooldown, the scored EMA comes from the
-     trunk alone, so if trunks don't depend on the miner's data, every miner's
-     scored model would be the same. This must be explained before the
-     cooldown goes.
-   - **(c) A testnet measurement, not a mainnet shadow (D45):** paired legs
-     on the same corpus, init and SKU, comparing (i) today's cooldown
-     endpoint, (ii) cooldown + EMA and (iii) EMA with no cooldown. Score them
-     on the private pool and the four bench suites. It needs a GPU pod
-     (owner yes; OA9). The change ships only if (iii) is no worse than (i)
-     within the seed-noise band.
-5. **[DECIDE D44b] Where the schedule switch lives:**
-   - (a) **image-only, like the power EMA** (recommended for consistency):
-     the no-cooldown rule ships in the worker image and activates by init at
-     the first warm-start seed epoch after the image. No contract digest
-     change.
-   - (b) **a contract term:** a new `lr_schedule` value (e.g. `"wsd-ema"`)
-     in `[v2.training]`, released and then activated at a typed block
-     (`*_after`). It's more honest in the digest, but it's a contract change
-     for every validator.
-6. **Rollout (D45, no shadow):** one image repin with 5 pins plus the wall
-   gate, outside a seed epoch, at an era boundary. **The image is shared by
-   lanes A and B** (`[round] funded_pod_image`, `[v2.training]
-   train_image_digest`), so both move at once. From the first warm-start
-   epoch after the repin, every leg in both lanes trains without a cooldown
-   and is scored on the EMA. No mixed epoch, no shadow.
-7. **Unchanged:** the KOTH verdict, the margins, the bench gate, lane B's merge
-   (it merges the EMA rows, verified by `merge_expert_slices`), and the
-   cascade warm-start promotion, which promotes the scored (EMA) checkpoint
-   as-is.
-
-**Work and tests.**
-
-| WP | What | Depends on | Runs in | Accept |
-|---|---|---|---|---|
-| WE1 | Scored EMA constant fixed (σ_rel, `POWER_EMA_EVAL`), with a test pinning it | owner decision | ci | `scripts/laned/accept WE1` |
-| WE2 | Identical-trunk finding explained, with a fix if it's a bug (OPSLOG OPEN item) | — | ci + pod (owner yes) | `scripts/laned/accept WE2 --evidence evidence/we2.json` |
-| WE3 | No-cooldown schedule for EMA-scored legs (init-derived, both lanes); `weights_stable` = final raw; continuation resume bitwise | WE1, D44b | ci | `scripts/laned/accept WE3` (TE1–TE4) |
-| WE4 | Testnet paired measurement (i)/(ii)/(iii) | WE3, OA9 | pod (owner yes) | `scripts/laned/accept WE4 --evidence evidence/we4.json` |
-| WE5 | Image build + 5-pin repin + wall gate + DEC-CA-0067 qualification; also carries D40(b) if chosen | WE2, WE4 | testnet then mainnet | `scripts/laned/accept WE5` |
-
-| T-row | Case | Expect |
-|---|---|---|
-| TE1 | Warm-start leg on the new image | LR = 1.0 from warmup to the last step; scored file = EMA σ 0.10 (or the WE1 value); `weights_raw` = lineage |
-| TE2 | Random-init leg on the new image | Unchanged: cooldown kept, raw scored (rule derived from the init) |
-| TE3 | Lane B leg from an EMA king, and from a raw king | Follows the king: no cooldown + EMA, or today's path |
-| TE4 | Continuation resumed mid-leg | Bitwise-identical EMA and raw state vs an uninterrupted leg |
-
----
-
 ## 13. Lessons from past incidents (OPSLOG review 2026-11-21)
 
 | Past failure class | Example | Defence here |
@@ -2818,7 +2718,6 @@ runs stay blocked until each one is answered here.
    loop-readiness §3) as commit 1. If you meant a different v2 file, say so
    and the PR is rebuilt on it.
 8. **OA8, pod approval for LB6 (WB19).** (rev5) Approve short pinned-torch testnet pods: one 8×H100 (expert-only leg plus one full lane A leg), and one of each cheaper GPU type you want offered to lane B miners (name them). Give a total cost cap.
-9. **OA9, pod approval for WE2/WE4 (§12c).** (rev5) Approve pinned-torch testnet pods for the identical-trunk check and the paired cooldown-vs-EMA legs (same corpus, init and SKU). Give a cost cap.
 
 ### Items
 
