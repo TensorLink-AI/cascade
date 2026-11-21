@@ -1,0 +1,7 @@
+# R1: block-arithmetic tool `cascade-laned blocks`.
+# pyproject.toml: ONLY the [project.scripts] line `cascade-laned`;
+# the builder must not touch dependencies or uv.lock.
+cascade/laned/__init__.py
+cascade/laned/cli.py
+cascade/laned/blocks.py
+pyproject.toml
