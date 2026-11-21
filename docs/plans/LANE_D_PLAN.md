@@ -5,92 +5,138 @@ autonomous loop. A work package is done **only when its Accept command exits
 0**. Owner decisions are marked **[DECIDE]**. Nothing is armed. **No calendar
 dates**: stages are gated (§5).
 
-## rev5 (code alignment, audit of main @ 5ce1f88, 2026-11-21)
+## rev5 (code alignment and review gaps; main @ 07117e1, 2026-11-21)
 
 Plan text and decision drafts only. No code, chain.toml or prod-box changes.
-Every changed item is marked **(rev5)**. **Base:** `3c67b64`, cited in earlier
-revisions, is an older commit of this plan branch, sitting directly on main
-`5ce1f88`, so the code the plan cites is identical to main's.
+Every changed item is marked **(rev5)**.
+
+**Base.** The branch `claude/sleepy-cray-7uutm1` is rebased onto main `07117e1`
+(2026-11-21) and pushed. Every fact below was re-checked on `07117e1`. The
+MarketCast PRs #475 and #478 were merged into stacked base branches, but their
+content is on main through #453's squash: the trees are identical. `3c67b64`,
+cited in earlier revisions, was an older commit of this branch.
 
 **Changelog (item → where it landed):**
 
 | Item | Change | Landed in |
 |---|---|---|
-| A1 | Training rows 128 patches; 8k/16k/32k/128k = 2×/4×/8×/32×; CPM span ≤ 16 patches ⇒ horizon ≤ 512 | §1.1 (architecture facts, 128k bullet, Horizon) |
-| A2 | Stop-publishing burns the **whole** vector; W14 blocked on Proposed change 4 | §5 kill switch, §10.8, W14, T27 |
-| A3 | `[generation] king_publish` | §15 D26 |
-| A4 | King check = `king_check_gate` over four suites; W-S1 names it as changed consensus code | §16, W-S1 |
-| A5 | `netconfig.py:210` (not :209/:207); `lane_d.py:78-79` | W2 |
-| A6 | TIME replaced by the era's sentinel; `unselected_suite` dropped | §1.3b, §1.6 capacity table, W2, W3b3, T7b, §10.4, §11.1, §11.2, §14.2 |
-| A7 | S0 and W0 cover D1–D42 + D42b; D25–D32 rows in §6 | §5 row 1, W0, §6 |
-| A8 | §12 "in scope … S6c" struck; §5 row 12b marked NOT PLANNED | §12, §5 |
-| A9 | §2 items 7/8 un-garbled; OA7/OA8 reordered | §2, Appendix A |
-| B1 | R8: AREA for `cascade/lane_d/`, every-path-classifies test, on-pod trainer modules in `WORKER_IMAGE`; consensus/worker-image paths listed | R8, §3 Services touched |
-| B2 | `declared_rows` keys = MoE ordinals 0–6 | §12b.2 LB2, WB14, TB13, Appendix C |
-| B3 | Clamp minimum only on layers with ≥ 1 row; TB15b | §12b.2, WB14, TB15, TB15b, Appendix C |
-| B4 | Declared rows need no image change (selection is `--selection-json` data); D40(b) is a shared-image repin that moves lane A and, at ≥ rc16, arms power EMA ⇒ blocked on the EMA constant fix (owner note) | D40, WB16, §3 Services touched, §5 SB track |
-| B5 | `contamination_hashset` release-only | §14.2, WB10, Appendix C |
-| B6 | W6a join rule (source, pre-suffix key, channel; same build); Proposed change 7 | W6a, Proposed change 7 |
-| B7 | Lane D scores with the quantile head, as lane A | §1.5, W5d, W7a |
-| C | Deployment facts checked read-only (below) | this changelog, §1.2 and §9 OPSLOG refs |
-| D42 | **Owner decision:** cheaper GPUs via a lane B GPU list; miner-chosen `train_hours` 0.5–6 h; D42b new | §12b.0, §12b.6, D42, D42b, WB19, WB22, WB23, TB23–TB27, OA8, Appendix C |
-| Harvest | **Owner request:** start long-history harvesting (to 128k) now, score from S8 | §1.7, R16, §5 S1 |
-| D43 | **Owner decision:** lane D reveals immediately (Proposed change 19 adopted) | §1.2 step 4, W10, D43 |
-| D44 | Drafted (EMA instead of cooldown), then **withdrawn by the owner**; only the D44 row remains, marked withdrawn | §6 |
-| D45 | **Owner decision:** no shadow modes; one activation block, everywhere, full effect | §5 (go-live rule, S6, SB5 and exit gate), D10, D19, D37, X6a, §14.5, §16 sentinel, W-S1, Appendix B note |
-| New proposals | 18 house lineage T; 19 lane D reveal timing (adopted as D43); 20 lane A/B pre-T leakage shadow; 21 retire duplicate files | Proposed design changes |
+| A1 | Training rows 128 patches; 8k/16k/32k/128k = 2×/4×/8×/32×; CPM span ≤ 16 patches ⇒ horizons ≤ 512 points | §1.1 (architecture facts, 128k bullet, Horizon "longer rungs") |
+| A2 | Missing lane D report = check can't run: old vector re-asserted for `stale_after_blocks` (3600), then a whole-vector burn; W14 blocked on Proposed change 4 | §5 kill switch, §10.8, W14, T27, Proposed change 4 |
+| A3 | `[generation] king_publish` (`chain.toml:1555` on `07117e1`) | §15 D26 |
+| A4 | King check = `king_check_gate` over four suites; W-S1 names it | §16, W-S1 |
+| A5 | `netconfig.py:210`; `lane_d.py:78-79` | W2 |
+| A6 | TIME → the era's sentinel; `unselected_suite` dropped (duplicates `[v2] sentinel_suites`) | §1.3b, §1.6, W2, W3b3, T7b, §10.4, §11.1, §11.2, §14.2 |
+| A7 | Lane B record renumbered **DEC-CA-0071** (main has 0069 MarketCast hooks; 0070 = lane D); file renamed | everywhere (20 refs), Appendix C, `decisions/DEC-CA-0071-…`, DEC-CA-0070 numbering note |
+| A8 | S0 and W0 cover D1–D43, D45–D48, D42b; D25–D32 rows in §6 | §5 row 1, W0, §6 |
+| A9 | T8 two-clock rule; launch eval host (not valeval-laned) at S4; S2 = all build WPs; self-check T14 → B1 + S4 gate; §12 and §5 row 12b; §2 items 7/8; OA order | T8, §1.2, §1.5, §1.7, §5 S2/S4, X4, §10.2, §10.4, §10.5 S4, T7, §11.2, self-check, §12, §2, App. A |
+| B1 | R8: AREA for `cascade/lane_d/`, every-path-classifies test, on-pod trainer modules in `WORKER_IMAGE`; consensus and worker-image paths listed | R8, §3 Services touched |
+| B2 | `declared_rows` keys = MoE ordinals 0–6 | LB2, WB14, TB13, Appendix C |
+| B3 | Clamp minimum only on layers with ≥ 1 row | LB2, WB14, TB15, TB15b, Appendix C |
+| B4 | Shared image; dispatch `_dispatch_funded` → `_run_funded_leg`; declared rows need no image change (confirmed: `--selection-json`); D40(b) a shared repin; D40(b) and every repin ≥ rc16 depend on W-EMA | §3, D40, WB16, SB track |
+| B5 | Release-only: `(lane_b, contamination_hashset)`, `(lane_c, remainder)`, `(lane_d, remainder)` | §14.2, WB10, Appendix C, §14.2 lane D row |
+| B6 | W6a join on (source, pre-suffix source key, channel), same build | W6a, Proposed change 7 |
+| B7 | Quantile head, 9-level grid, no copula sampling; W0b compares quantile-head outputs | §1.5, W0b, W5d, W7a |
+| B8 | Deregistration: entry voided `deregistered`; a court slot burns | §1.5 state, W5h, W8, T18c |
+| B9 | Lock only kings (copy at crowning); pending = content addressing + digest re-check; W3a probes `UploadPartCopy` | §1.2 storage, W3a |
+| B10 | `[lane_d] ready_ttl_blocks` ⇒ `ready_expired` | §1.5 state, W2, W3, W5h, T18d, §14.2 |
+| B11 | **W-EMA**: score the raw cooled endpoint on every leg; EMA files unscored; telemetry only | §8, W-EMA row (§3), §3 Services touched, D40, WB16 |
+| B12 | Daily Merkle root of the first-seen log committed before use | W6fs, W7a, §9 conflict of interest |
+| B13 | Licence attestation at `ready`; Hub/HF takedown path | W3, W13, §11.2 LANE_D.md |
+| B14 | `[lane_d] max_source_share` | W5b, T18e, D29 (§6), W2, §14.2 |
+| B15 | Rented eval host sees loser weights and `pool_d_hist` | §9 |
+| C1 | **D46** house T (lineage commit block recommended) | §6; Proposed change 18 withdrawn (wrong premise) |
+| C2 | **D47** house precision under BF16 | §6 |
+| C3 | **D48** where D's share comes from inside A; `lane_pool_shares` signature | §6, W8 |
+| D | Deployment facts (below) | this changelog |
+| D42 | Owner: lane B GPU list + miner `train_hours` 0.5–6 h; D42b | §12b.0, §12b.6, D42, D42b, WB19, WB22, WB23, TB23–TB27, OA8, App. C |
+| D43 | Owner: lane D reveals immediately | §1.2 step 4, W10, D43 |
+| D44 | Drafted (EMA instead of cooldown), **withdrawn by the owner** | §6 (withdrawn row) |
+| D45 | Owner: no shadow modes; one activation block | §5, D10, D19, D37, X6a, §14.5, §16, W-S1, SB5 |
+| Harvest | Owner: long-history harvest to 128k now, scored from S8 | §1.7, R16, §5 S1 |
 
-**Propagation table:**
+**Propagation table** ("n/a" says why):
 
-| Item | § text | WP | T-row | Key list | §14.2 | Report schema | Docs |
-|---|---|---|---|---|---|---|---|
-| A1 | done (§1.1) | n/a: no WP builds it | n/a: T7 already measures contexts | n/a | n/a | n/a | n/a: LANE_D.md row cites §1.1 |
-| A2 | done (§5, §10.8) | done (W14) | done (T27) | n/a | n/a | n/a: change 4 not decided | n/a: OPERATOR kill-switch row points at §5 |
-| A3 | done (§15) | n/a | n/a | n/a | n/a | n/a | n/a |
-| A4 | done (§16) | done (W-S1) | n/a: TS1–TS3 unchanged | n/a | n/a | n/a | n/a |
-| A5 | done | done (W2) | n/a | n/a | n/a | n/a | n/a |
-| A6 | done (§1.3b, §1.6, §10.4, §11.1) | done (W2, W3b3) | done (T7b) | done (`unselected_suite` dropped) | done | n/a: index row covers it | done (§11.2 LANE_D.md) |
-| A7 | done (§6) | done (W0) | n/a | n/a | n/a | n/a | n/a |
-| A8 | done (§12, §5) | n/a | n/a | n/a | n/a | n/a | n/a |
-| A9 | done (§2, App. A) | n/a | n/a | n/a | n/a | n/a | n/a |
-| B1 | done (§3) | done (R8) | n/a: R8's Accept carries the classify test | n/a | n/a | n/a | n/a |
-| B2 | done (LB2, App. C) | done (WB14) | done (TB13) | n/a | n/a | n/a | n/a: WB20 docs inherit LB2 |
-| B3 | done (LB2, App. C) | done (WB14) | done (TB15, TB15b) | n/a | n/a | n/a | n/a |
-| B4 | done (§3, D40) | done (WB16) | n/a: (b) undecided | n/a | n/a | n/a | n/a |
-| B5 | done (App. C) | done (WB10) | done in WB10's accept (overlay refused) | done | done | n/a | n/a |
-| B6 | done (Proposed change 7) | done (W6a) | n/a: W6a accept | n/a | n/a | n/a | n/a |
-| B7 | done (§1.5) | done (W5d) | done in W5d's CI test | n/a | n/a | done (W7a `scoring_method`) | n/a |
-| D42 | done (§12b.0, §12b.6) | done (WB19, WB22, WB23) | done (TB23–TB27) | done (WB10, §14.2) | done | done (signed leg record: steps, guard, `gpu_name`) | done (WB20 per-GPU cost table) |
-| Harvest | done (§1.7) | done (R16) | n/a: R16 accept | n/a | n/a | n/a | n/a |
+| Item | § | WP | T-row | Key list | §14.2 | Report schema | State | Docs |
+|---|---|---|---|---|---|---|---|---|
+| A1 | done | n/a: fact only | n/a: T7 measures contexts | n/a | n/a | n/a | n/a | n/a: LANE_D.md cites §1.1 |
+| A2 | done | done (W14) | done (T27) | n/a | n/a | n/a: change 4 undecided | n/a | n/a: OPERATOR row points at §5 |
+| A3 | done | n/a | n/a | n/a | n/a | n/a | n/a | n/a |
+| A4 | done | done (W-S1) | n/a: TS1–TS3 unchanged | n/a | n/a | n/a | n/a | n/a |
+| A5 | done | done (W2) | n/a | n/a | n/a | n/a | n/a | n/a |
+| A6 | done | done (W2, W3b3) | done (T7b) | done (dropped) | done | done (index row) | n/a | done (LANE_D.md) |
+| A7 | done | done (WB21) | n/a | n/a | n/a | n/a | n/a | done (DEC files) |
+| A8 | done | done (W0) | n/a | n/a | n/a | n/a | n/a | n/a |
+| A9 | done | done (X4, S2 list) | done (T7, T8) | n/a | n/a | n/a | n/a | done (OPERATOR row) |
+| B1 | done | done (R8) | n/a: R8 accept runs the classify test | n/a | n/a | n/a | n/a | n/a |
+| B2 | done | done (WB14) | done (TB13) | n/a | n/a | n/a | n/a | done (App. C) |
+| B3 | done | done (WB14) | done (TB15, TB15b) | n/a | n/a | n/a | n/a | done (App. C) |
+| B4 | done | done (WB16, W-EMA) | n/a: (b) undecided | n/a | n/a | n/a | n/a | n/a |
+| B5 | done | done (WB10, W2) | done (WB10/W2 accept: overlay refused) | done | done | n/a | n/a | done (App. C) |
+| B6 | done | done (W6a) | n/a: W6a accept | n/a | n/a | n/a | n/a | n/a |
+| B7 | done | done (W0b, W5d) | done (W5d CI test) | n/a | n/a | done (W7a `scoring_method`) | n/a | n/a |
+| B8 | done | done (W5h, W8) | done (T18c) | n/a | n/a | done (typed reason) | done (`deregistered`) | n/a: LANE_D.md FAQ via WB20/W-docs |
+| B9 | done | done (W3a) | n/a: W3a probe evidence | n/a | n/a | n/a | n/a | n/a |
+| B10 | done | done (W2, W3, W5h) | done (T18d) | done | done | done (typed reason) | done (`ready_expired`) | n/a: LANE_D.md covers the ready flow |
+| B11 | done (§8) | done (W-EMA) | done (W-EMA tests) | n/a: image constant, not a key | n/a | n/a: telemetry, not in the receipt | n/a | n/a |
+| B12 | done (§9) | done (W6fs, W7a) | n/a: W6fs accept | n/a | n/a | done (W7a roots) | n/a | n/a |
+| B13 | done | done (W3, W13) | n/a: W3/W13 accept | n/a | n/a | n/a | done (attestation at ready, W3) | done (LANE_D.md) |
+| B14 | done | done (W5b, W2) | done (T18e) | done | done | n/a: windows already listed | n/a | n/a |
+| B15 | done (§9) | n/a: accepted risk | n/a | n/a | n/a | n/a | n/a | n/a |
+| C1–C3 | done (§6) | done (W8 for C3) | n/a: until decided | n/a | n/a | n/a | n/a | n/a |
+| D42 | done | done | done (TB23–TB27) | done | done | done (signed leg record) | n/a | done (WB20) |
+| D43 | done | done (W10) | done (W10 test) | n/a | n/a | n/a | n/a | n/a |
+| D45 | done | done (X6a, W-S1) | n/a: removes shadow rows | n/a | n/a | n/a | n/a | n/a |
+| Harvest | done | done (R16) | n/a: R16 accept | n/a | n/a | n/a | n/a | n/a |
+
+**New keys** (each: loader parse, ALLOWED or release-only, round-trip and
+mutation tests):
+
+| Key | Parse + tests in | Overlay? | Tests named |
+|---|---|---|---|
+| `[lane_d] ready_ttl_blocks` | W2 | `ALLOWED["lane_d"]` | W2 accept: parse, round-trip, mutation, `unread_keys.py` |
+| `[lane_d] max_source_share` | W2 | `ALLOWED["lane_d"]` | W2 accept: same |
+| `[lane_d] remainder` (existing placeholder) | W2 | **release-only** (`netconfig.py:210` tuple) | W2 accept: an overlay setting it is refused |
+| `[lane_c] remainder` (existing) | W2 (shared release) | **release-only** (newly) | W2 accept: overlay refused; unarmed digests byte-identical |
+| `[lane_b] contamination_hashset` | WB10 | **release-only** | WB10 accept: overlay refused |
+| `[lane_b] funded_pod_skus`, `max_leg_hours`, `max_leg_seconds`, `guard_factor` | WB10 | `ALLOWED["lane_b"] = None` | WB10 accept: parse, digest drop-when-default, round-trip, mutation |
 
 **Repo facts in the brief that turned out wrong or imprecise:**
 
-- **A1:** `max_patches` is read, by lane B's horizon-affinity decode
-  (`expert_lane.py:365`). It isn't read by training. The CPM span is also
-  hard-coded `c_max=16` at `pyramid_trainer.py:402`.
-- **A5:** the remainder special case is `netconfig.py:210`; `:209` is the loop
-  line.
-- **B6:** "source id + content hash" can't be the join key. `content_hash`
-  is the sha256 of the values (`builder.py:295`), so it changes as tails move,
-  and `pool` and `pool_d` histories hash differently. rev5 uses (source,
+- **A1:** `max_patches` isn't "read by nothing". Lane B's horizon-affinity
+  decode reads it (`expert_lane.py:365`); training doesn't.
+- **A3:** on `07117e1`, `king_publish` is at `chain.toml:1555` (it was `:1554`
+  on `5ce1f88`).
+- **B6:** "source id + content hash" can't be the join key. `content_hash` is
+  the sha256 of the values (`builder.py:295`), so it changes as tails move,
+  and `pool` and `pool_d` histories hash differently. The plan uses (source,
   pre-suffix key, channel) within one build.
-- **B1 (extra):** `WORKER_IMAGE` doesn't list `expert_training.py`, though the
-  image bakes the whole repo (`deploy/Dockerfile:36`).
-- **My own earlier D42 text:** `ALLOWED["lane_b"] = None` means every key is
-  overlay-settable. It doesn't mean none are. Corrected in §12b.6.
+- **C3:** the king's ladder share runs from **10%** (after a fail) to 95%, not
+  25–95% (`chain.toml:1223-1226`).
+- **A7:** PR #479 also claims DEC-CA-0069 and needs its own new number.
+- **B11:** rc15n (#477's minimal image, built on rc15 `5e3fade` + the pin)
+  doesn't contain power EMA. W-EMA blocks #477's repin only if that image is
+  built from main.
+- **Earlier session errors corrected:**
+  - "Stop publishing ⇒ immediate whole burn" was wrong; it's a one-era
+    re-assert first (A2).
+  - "The king retrains every era" was wrong; it trains once per seed epoch
+    (Proposed change 18 withdrawn).
+  - "`ALLOWED["lane_b"] = None` blocks overlays" was wrong; it allows every
+    key.
 
-**C: deployment-only facts (read-only checks on the box):**
+**D: deployment-only facts (read-only checks on the box):**
 
 | Fact | Result |
 |---|---|
 | rc37 validator / rc41 trainer | **verified:** service PYTHONPATHs are `/root/cascade-val-rc37` and `/root/cascade-rc41` |
-| 21 LIVE OVERRIDEs | **verified:** `grep -c "LIVE OVERRIDE"` on the deployed chain.toml = 21 |
-| keep-alive (#471) absent from rc37 | **verified:** `_weights_keepalive_tick` count 0 in rc37's `validator/weights.py` |
-| valpriv-4090 spec (24 GB) | host listed in `valpriv-eval.toml`; **VRAM unverified (box):** not in config, and no pod ssh was done |
-| valeval-blackwell4 spec (43 GB disk, ~19 GB cache) | **unverified (box):** not in the deployed chain.toml (which lists only blackwell2 standing cost); no pod ssh |
-| `[lane_d] takes_from = "lane_b"` | **verified** on both the deployed file (`:1592`) and main (`:1589`) |
-| Lane B image = lane A image (owner note) | **verified:** `[round] funded_pod_image` and `[v2.training] train_image_digest` are both rc15 `5d41d94b…`; no image key under `[lane_b]` |
-| OPSLOG line refs | **drifted** (newest-first log). `:2329` → the entry heading cited in §1.2; `:164` **unverified**, fact not re-found |
+| 21 LIVE OVERRIDEs | **verified:** 21 in the deployed chain.toml |
+| keep-alive (#471) absent from rc37 | **verified:** `_weights_keepalive_tick` not in rc37 |
+| valpriv-4090 spec (24 GB) | host listed in `valpriv-eval.toml`; **VRAM unverified (box)** |
+| valeval-blackwell4 spec | **unverified (box):** not in the deployed config (only blackwell2's standing cost) |
+| `[lane_d] takes_from = "lane_b"` | **verified** on the deployed file and on main |
+| Lane B image = lane A image | **verified:** both pins are rc15 `5d41d94b…`; no image key under `[lane_b]` |
+| OPSLOG line refs | **drifted** (newest-first log). `:2329` is replaced by its entry heading; `:164` is unverified |
+| Any image ≥ rc16 in production? | **No evidence.** rc16 was built and qualified on 2026-11-01, but the switch was held as consensus-unsafe and the trainer stayed on rc15. rc15n (#477) was tried on 2026-11-20 and reverted. The deployed pin is rc15. Experiment pods aren't covered by this check |
 
 ## rev4 (lane B pass, 2026-11-21)
 
@@ -2504,7 +2550,7 @@ we drifted into relying on hand-edited files and ad-hoc satellite updates.
 | Change type | How it ships | Validator action |
 |---|---|---|
 | New code (lane D scorer, report schema, replay rules, intake, audit) | **One capability release** | Update **once** |
-| Lane D tuning: `from_block`, `until_block`, `share`, `takes_from`, `contexts`, `horizon`, `forward_margin_hours`, floors, `d_margin`, `alpha`, `bootstrap_B`, `gate_suites`, `gate_weights`, ~~`unselected_suite`~~ **(rev5) dropped:** the held-out suite is the §16 sentinel, drawn from `[v2] sentinel_suites` (W-S1); a lane D key would duplicate it, `tau_public`, court, rate limits, TTLs, `max_bench_holds`, **(rev3)** `max_mirror_lag_hours`, `confirm_on_king_change`, `max_judged_per_coldkey_per_settlement`, `max_coldkey_unresolved_settlements`, `max_reveal_delay_days`, `lowfreq_freqs` | **Signed overlay** (add `ALLOWED["lane_d"] = None` minus `remainder`, which stays release-only as a burn destination, the same rule as `lane_b.remainder`) | **None**: nodes poll every 300 s, adopt by stake, apply at `effective_block` |
+| Lane D tuning: `from_block`, `until_block`, `share`, `takes_from`, `contexts`, `horizon`, `forward_margin_hours`, floors, `d_margin`, `alpha`, `bootstrap_B`, `gate_suites`, `gate_weights`, ~~`unselected_suite`~~ **(rev5) dropped:** the held-out suite is the §16 sentinel, drawn from `[v2] sentinel_suites` (W-S1); a lane D key would duplicate it, `tau_public`, court, rate limits, TTLs, `max_bench_holds`, **(rev3)** `max_mirror_lag_hours`, `confirm_on_king_change`, `max_judged_per_coldkey_per_settlement`, `max_coldkey_unresolved_settlements`, `max_reveal_delay_days`, `lowfreq_freqs`, **(rev5)** `ready_ttl_blocks` (B10), `max_source_share` (B14); `remainder` is release-only (B5) | **Signed overlay** (add `ALLOWED["lane_d"] = None` minus `remainder`, which stays release-only as a burn destination, the same rule as `lane_b.remainder`) | **None**: nodes poll every 300 s, adopt by stake, apply at `effective_block` |
 | **(rev3)** Cross-lane sentinel (§16): `[v2] sentinel_from_block`, `sentinel_suites`, `sentinel_ratchet`, `sentinel_tau` | **Signed overlay** once the capability release adds them to `ALLOWED["v2"]` (`netconfig.py:99-108`) | None after that release |
 | **(rev4)** Lane B: `suite_targets`, `contamination_hashset`, `contamination_min_hits`, `suite_target_max_repo_mb`, `min_experts_frac`, `max_experts_frac`, `router_rows`, `traffic_steal_bound`, `open_rule`, `sentinel_target_rule`, `sentinel_max_defer_eras` | **Signed overlay** (`ALLOWED["lane_b"] = None`, `netconfig.py:83-87`) once the capability release ships the code; `remainder` stays release-only, **(rev5) and so do `contamination_hashset`, `[lane_c] remainder` and `[lane_d] remainder`**: the release adds `("lane_b", "contamination_hashset")`, `("lane_c", "remainder")` and `("lane_d", "remainder")` to the release-only tuple (`netconfig.py:210`). Lane C's remainder is overlay-settable today (`ALLOWED["lane_c"] = None`, `:87`, not in the tuple), an existing gap closed in the same release, because overlays can't replace release-only data pins (`docs/ARCHITECTURE.md:471`). The other new keys (incl. rev5 `funded_pod_skus`, `max_leg_hours`, `max_leg_seconds`, `guard_factor`) stay overlay-settable. Each key drops from the digest at its default, so unarmed digests don't move | None after that release |
 | Activation | Overlay types `[lane_d] from_block` (at an era boundary, as lanes B and C allow today) | None |
