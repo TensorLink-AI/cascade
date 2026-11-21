@@ -394,6 +394,12 @@ W19, R10, R11, R12, R13 and R14.
 
 ### Proposed design changes (NOT applied: owner decision)
 
+**(rev5) Owner 2026-11-21: changes 1–17, 20 and 21 are ACCEPTED.** 18 is
+withdrawn and 19 is adopted as D43. Each accepted change is built in the WPs
+its "Affects" line names. The § text it affects is rewritten when that WP
+lands, so until then the change text below is authoritative over the older
+§ wording it contradicts.
+
 These come from review round 2 (fresh context, read-only, checked against
 the code). Each is verified where marked.
 
@@ -1036,10 +1042,10 @@ every challenger shares one window draw and the king's scores
 
 **Share [DECIDE D1]**
 
-- `[lane_d] share = 0.20`, `takes_from = "lane_a"`, `remainder = "burn"`.
+- **(rev5, owner)** `[lane_d] share = 0.25`, `takes_from = "lane_a"`, `remainder = "burn"`.
 - The deployed file has `takes_from = "lane_b"`. It's changed **by the S6b
   signed overlay** (§5, §14.2), not by a chain.toml edit.
-- When B and C also arm, the split is **A 30 / B 25 / C 25 / D 20**.
+- When B and C also arm, the split is **(rev5, owner) A 25 / B 25 / C 25 / D 25**.
 - Live emission is `lane_parts` + `lane_pool_shares` + `emission_vector`
   under the DEC-CA-0055 ladder (`cascade/shared/emission.py:330-420`). The
   legacy `split_emissions` helper is not used. W8 extends `emission_vector`
@@ -1730,7 +1736,7 @@ capability release → (rev5) one activation block, live everywhere.**
 | 8 | **S3 Testnet** | §4 matrix including T22–T29 | §4 exit gate |
 | 9 | **S4 Release** | Cut the **capability release** (lane D unarmed, `lane_d` allow-listed). **(rev5)** Bring up the launch eval host (D11; not valeval-laned, which is rented only at S8) (on-rent check, pinned known_hosts, handshake); dry-run the house. **Stage and review the revert overlay.** Send the announcement (§11.3) | Dry-run within the measured cross-host tolerance; announcement sent; revert overlay reviewed |
 | 10 | **S5 Upgrade** | Snapshot all state (§10.8). Order, each through `deploy_gate check`/`verify` in quiet windows: **eval host → validator → lane D intake (systemd unit with the code-path guard) → trainer** (no legs in flight; memory-burst check; confirm preflight and worker-fingerprint lines unchanged). Satellites upgrade. Arm the broad watcher | Lane A unchanged on ≥ 2 settlements; `cascade-validator --netconfig-policy` lists `lane_d` on our nodes |
-| 11 | **(rev5) S6 Activate (no shadow, D45)** | **D19 (rev5):** the owner-run test entries run on **testnet** (S3), not in a mainnet shadow. Overlay seq N, **one overlay**: `[lane_d] from_block` at a far era boundary **with `share = 0.20` and `takes_from = "lane_a"`**, all lane A keys **byte-identical** to seq N-1 (no lane A tuning in a lane D overlay, ever). ~~share = 0 shadow~~ | **Observed** `cfg-` stake ≥ 2/3 (incl. the largest holder, 5E2LP6 at about 49%) at a boundary before `effective_block`. That's the only stake-weighted proof of upgrade, because only nodes on the capability release can verify a `[lane_d]` overlay. Else publish seq N+1 with a later block. Webhook test alert delivered. Keep-alive live. **(rev5)** All §4 T-rows green on testnet before the block is announced. From the block: lane D live and paid everywhere; first paid settlement's vectors match on ≥ 2 validators, satellite replay matches, `check_lane_d` passes |
+| 11 | **(rev5) S6 Activate (no shadow, D45)** | **D19 (rev5):** the owner-run test entries run on **testnet** (S3), not in a mainnet shadow. Overlay seq N, **one overlay**: `[lane_d] from_block` at a far era boundary **with `share = 0.25` (rev5, D1) and `takes_from = "lane_a"`**, all lane A keys **byte-identical** to seq N-1 (no lane A tuning in a lane D overlay, ever). ~~share = 0 shadow~~ | **Observed** `cfg-` stake ≥ 2/3 (incl. the largest holder, 5E2LP6 at about 49%) at a boundary before `effective_block`. That's the only stake-weighted proof of upgrade, because only nodes on the capability release can verify a `[lane_d]` overlay. Else publish seq N+1 with a later block. Webhook test alert delivered. Keep-alive live. **(rev5)** All §4 T-rows green on testnet before the block is announced. From the block: lane D live and paid everywhere; first paid settlement's vectors match on ≥ 2 validators, satellite replay matches, `check_lane_d` passes |
 | 12 | ~~S6b Pay~~ **(rev5) merged into S6 (D45)** | — | — |
 | 12b | **(rev5) NOT PLANNED.** ~~(rev3) S6c Lane B~~ (rev4: superseded by the SB track below; it was for the parked §12 variant) | Overlay: `[lane_b] from_block` at an era boundary (shadow first: `[lane_b] share = 0` for ≥ 2 eras, then the D1 split) | TB1–TB8 passed in S3; ≥ 2 eras of valid lane B reports at share 0 with satellite replay matching; then first paid settlement's vectors match on ≥ 2 validators |
 | 12c | **(rev4) Lane B track SB0–SB5** (runs in parallel with lane D's S2–S3; depends on **S0a–S0c** de-drift, note budget and overlay bring-up, and on the shared S5 capability release) | **SB0** decide D35–D42, D42b · **SB1** build WB10–WB18, **(rev5)** WB22–WB23, W-S1–W-S2 · **SB2** WB19 measurement per GPU type (owner pod yes) · **SB3** testnet: TB10–TB27 (rev5), TS1–TS5, contamination check passing · **SB4** capability release (shared S5) · **SB5 (rev5, D45)** one overlay, once the D41 gate rule is satisfied and SB3 has passed (LB1): `[lane_b] from_block` with full share and `suite_targets` together, live everywhere at that block; no `share = 0` period. **(rev5)** If D40(b) is chosen: an image repin step (EMA constant fixed first; repin outside a seed epoch; moves lane A too) before SB3 | SB3 green including LB1's contamination check; **(rev5)** from the SB5 block, lane B live everywhere: first paid settlement's vectors match on ≥ 2 validators and satellite replay matches; gate-open evidence recorded |
@@ -1767,9 +1773,27 @@ cross-checked from two sources. There are past off-by-ones (§13).
 
 ## 6. Owner decisions (recommended defaults)
 
+**(rev5) Owner answers, 2026-11-21.** Every recommended default in this table
+is **accepted** unless a row says otherwise. The explicit answers:
+
+- **D28/D1/D48:** an equal split, **A 25 / B 25 / C 25 / D 25**.
+- **D24:** 5% per-era false-crown target (OA3 answered).
+- **D46:** (a), date the house by its lineage.
+- **D42b:** (a), real hours on the chosen GPU.
+- **The duel reference is confirmed:** an entry must beat the lane A king
+  (the house) or, once the house has been beaten, the current lane D king.
+  That's KING_D as designed (§1.4).
+- **D21:** stays at its default (burn), under "all other recs".
+- **D16:** the standing deletion approval is granted.
+- **Proposed design changes 1–17, 20 and 21:** accepted. 18 is withdrawn and
+  19 is adopted as D43.
+- **Not covered by these answers (needs a separate yes with cost caps):** the
+  pod rentals in OA4, OA8 and §12b.6, and the data-host choices in OA5 and
+  OA6. Renting pods needs an explicit yes plus a cap.
+
 | # | Decision | Recommended |
 |---|---|---|
-| D1 | Share and source | 20% from lane A, burn remainder; with B and C armed: A 30 / B 25 / C 25 / D 20 |
+| D1 | Share and source | **(rev5) DECIDED (owner): 25% from the total; equal split A 25 / B 25 / C 25 / D 25 when all lanes are armed.** Mechanically `[lane_d] share = 0.25`, `takes_from = "lane_a"`: lane A gets "the rest" (`lane_pool_shares`, `shared/lane_c.py:584-605`), and the king ladder works inside lane A's 25%. While a lane is off, its share stays with lane A (today's code); while lane B is armed but gated, its share burns (D37). Remainder burns |
 | D2 | Context variants | **(rev3)** Launch arms {4k, 8k, 16k}. {32k, 64k, 128k} arm at **S8** by overlay (`contexts`), each only after T7 and W1 `min_long_series` (owner goal 128k kept) |
 | D2b | Gate | **(rev3)** One gate suite drawn per crowning from the suites **not** held out this era; the held-out suite is the §16 cross-lane sentinel (replaces fixed "TIME unselected"); `tau_public` 0.01; anchors = KING_D and house |
 | D3 | Rate limits | 1 open per hotkey; 2 open per coldkey; 8 judged per settlement |
@@ -1779,7 +1803,7 @@ cross-checked from two sources. There are past off-by-ones (§13).
 | D7 | Court | 2 prior miner kings, decay 0.5; house never in the court |
 | D8 | Losers | Private; vault TTL 4 eras; owner-only archive 14 days; then delete |
 | D9 | House paid? | No: the slot burns; prior miner tails keep paying |
-| D10 | Activation | **(rev5, D45)** One overlay: `from_block` with `share = 0.20` and `takes_from = "lane_a"` together (no `share = 0` shadow), published with an `effective_block` far enough ahead that observed `cfg-` stake reaches ≥ 2/3 before it; kill switch by a staged revert overlay (latency up to about one era); **(rev3)** the S8 long-context arming is also an overlay (`contexts`), live at its block, no shadow |
+| D10 | Activation | **(rev5, D45)** One overlay: `from_block` with **`share = 0.25`** (D1) and `takes_from = "lane_a"` together (no `share = 0` shadow), published with an `effective_block` far enough ahead that observed `cfg-` stake reaches ≥ 2/3 before it; kill switch by a staged revert overlay (latency up to about one era); **(rev3)** the S8 long-context arming is also an overlay (`contexts`), live at its block, no shadow |
 | D11 | Eval host | **(rev3)** Launch: valpriv-4090 or another pinned-torch 2.4.1+cu124 pod (≥ 24 GB; the 16k fit is checked in B2). **Not** Blackwell sm_120. valeval-laned (H100/A100 80 GB class, pinned torch) only at S8 |
 | D12 | Pool packaging | `pool` untouched (keep length never raised); **(rev3)** launch `pool_d` = `pool`'s series ids joined, history to 16384 + 64, A1 timestamps, `pool_d_hist` (no targets) to the eval pod, `pool_d_tgt` on the box; 32k–128k history work at S8; dedicated builder |
 | D13 | Weights license | Open licenses only (Apache-2.0 / OpenMDW-1.1); kings are published |
@@ -1790,14 +1814,14 @@ cross-checked from two sources. There are past off-by-ones (§13).
 | D18 | Data path | **Targets stay on the box** (histories-only to the pod, D12), keeping the private-offload rule. Alternative: let the pod hold targets, which is a new rule; **(rev3)** launch `pool_d_hist` carries ≤ 16384 history per series |
 | D19 | **(rev5)** Test entry | Owner-run test entries on dedicated **testnet** hotkeys during S3, so a real duel and payout are exercised before the mainnet block (no mainnet shadow, D45) |
 | D20 | **(rev3)** King change between first clear and confirmation | (a) restart the duel against the new king (**recommended**); (b) confirm against the king at the first clear |
-| D21 | **(rev3)** Unpaid lane D king slot while the house reigns | Option 1 burn (v2 default, kept) vs option 2 return to lane A. Tokenomics call, not adopted (§1.4 table) |
+| D21 | **(rev3)** Unpaid lane D king slot while the house reigns | Option 1 burn (v2 default, kept) vs option 2 return to lane A. Tokenomics call, not adopted (§1.4 table) **(rev5) DECIDED: burn** (the default, accepted). |
 | D22 | **(rev3)** Coldkey resolution | (b) record at `/v1/lane-d/ready`, re-check at reveal, carry in the signed report (**recommended**); (a) archive-state resolution at T |
 | D23 | **(rev3)** Loser re-scoring | (ii) targets, window ids, `rows_sha256` and bootstrap verifiable; histories private (**default, as v2**); (i) publish `pool_d_hist` after the dispute window |
-| D24 | **(rev3)** Per-era false-crown target (sets `d_margin` via B1) | 5% recommended (OA3); `d_margin` stays 0.01 until B1 runs |
+| D24 | **(rev3)** Per-era false-crown target (sets `d_margin` via B1) | 5% recommended (OA3); `d_margin` stays 0.01 until B1 runs **(rev5) DECIDED: 5%** (owner; OA3 answered). |
 | D25 | **(rev5 row; text in §15)** Court rent and salami-slicing | See §15 D25 |
 | D26 | **(rev5 row; text in §15)** Lane A as a free input to D; D's share out of A | See §15 D26 |
 | D27 | **(rev5 row; text in §15)** Withholding generators from A | See §15 D27 |
-| D28 | **(rev5 row; text in §15)** Lane split (A/B/C/D) | See §15 D28 |
+| D28 | **(rev5 row; text in §15)** Lane split (A/B/C/D) | See §15 D28 **(rev5) DECIDED: A 25 / B 25 / C 25 / D 25** (owner). |
 | D29 | **(rev5 row; text in §15)** Frequency bias in frozen sets | See §15 D29  **(rev5)** Partly addressed by `max_source_share` (B14, W5b). |
 | D30 | **(rev5 row; text in §15)** TIME isn't truly unselected (now handled by the §16 sentinel, D33) | See §15 D30 |
 | D31 | **(rev5 row; text in §15)** Sybil queue griefing | See §15 D31 |
@@ -1812,13 +1836,13 @@ cross-checked from two sources. There are past off-by-ones (§13).
 | D40 | **(rev4)** Router rows (LB2) | (a) frozen (**recommended for first arming**; no image change); (b) FlexOlmo unfreeze of the declared rows' router entries and bias, with the `traffic_steal_bound` guard. **(rev5)** (b) changes on-pod `expert_training.py` ⇒ a **shared worker-image repin that also moves lane A** + DEC-CA-0067 qualification, and since any image ≥ rc16 arms power EMA for lane A, (b) is **blocked on fixing the scored EMA constant first** (§3 Services touched)  **(rev5)** Depends on W-EMA (§8). |
 | D41 | **(rev4)** Lane B opening rule (LB4) | (a) `open_tokens` + a passing lane A king check (**recommended**); (b) `open_tokens` alone; (c) co-gate with re-measured thresholds |
 | D42 | **(rev5) DECIDED (owner 2026-11-21):** expert-leg cost (LB6) | **Cheaper GPUs allowed** via a lane B-only `[lane_b] funded_pod_skus` (each type image-qualified and measured first), and **miner-chosen leg length** `train_hours` 0.5–6.0 h (`[lane_b] max_leg_hours = 6.0`), guard capped by a new `[lane_b] max_leg_seconds`, never by editing `[training] max_train_seconds`. Operator funding not adopted. §12b.6 |
-| D42b | **(rev5)** What `train_hours` means (§12b.6) | (a) wall hours on the chosen GPU, steps fixed at admission from the measured per-GPU rate (**recommended**); (b) reference hours, steps = 23,841 × h / 3 on any GPU |
+| D42b | **(rev5)** What `train_hours` means (§12b.6) | (a) wall hours on the chosen GPU, steps fixed at admission from the measured per-GPU rate (**recommended**); (b) reference hours, steps = 23,841 × h / 3 on any GPU **(rev5) DECIDED: (a) real hours on the chosen GPU** (owner). |
 | D43 | **(rev5) DECIDED (owner 2026-11-21):** lane D reveal timing | **Immediate reveal** (`min_blocks`), not lane A's boundary − 25 blocks; T = the observed reveal block. Starts the forward clock up to ≈ 3 h earlier. §1.2 step 4, W10. (The commit-inclusion-block alternative is not adopted) |
 | D44 | **(rev5) WITHDRAWN (owner 2026-11-21)** | Power EMA instead of cooldown was drafted and then dropped by the owner. Lanes A and B keep today's cooldown. Not planned |
 | D45 | **(rev5) DECIDED (owner 2026-11-21):** go-live rule | No shadow modes: every feature goes live at one activation block on every node at full effect. Testnet + S1 replace shadow evidence; release-then-activate (observed stake ≥ 2/3 **before** the block) and the kill switch stay. §5 |
-| D46 | **(rev5, C1)** House T, which fixes starvation (§1.3, §1.4; interacts with D20) | Today the house's T resets on every KING_A change (a dethrone or a promotion; the king leg trains once per seed epoch, `shared/era.py:440-457`), so pending entries restart. If lane A changes king faster than lane D's commit-to-crown latency (about 2–8 days with confirmation), no challenger can crown. (a) **T_house = the latest commit (reveal) block of any generator in its lineage (recommended)**; (b) an entry keeps the T_K it froze against; (c) unchanged. B2 measures house refresh frequency |
+| D46 | **(rev5, C1)** House T, which fixes starvation (§1.3, §1.4; interacts with D20) | Today the house's T resets on every KING_A change (a dethrone or a promotion; the king leg trains once per seed epoch, `shared/era.py:440-457`), so pending entries restart. If lane A changes king faster than lane D's commit-to-crown latency (about 2–8 days with confirmation), no challenger can crown. (a) **T_house = the latest commit (reveal) block of any generator in its lineage (recommended)**; (b) an entry keeps the T_K it froze against; (c) unchanged. B2 measures house refresh frequency **(rev5) DECIDED: (a)** (owner). |
 | D47 | **(rev5, C2)** House precision under BF16-only | (a) **score the house as a BF16 cast of KING_A, and dedup entries against BF16 casts of every published checkpoint (recommended)**, so the house plays by the entry rules and a cast copy can't dodge dedup; (b) the house stays F32 |
-| D48 | **(rev5, C3)** Source of lane D's share inside lane A (W8) | (a) before the ladder (cuts the lane A king); (b) from the ladder's burned remainder: free to lane A miners, but D's budget varies with the king's ladder share (10% after a fail, up to 95%, `chain.toml:1223-1226`) and can be ~5%; (c) from the total. W8 changes `lane_pool_shares` (`shared/lane_c.py:584`), a consensus signature at every caller |
+| D48 | **(rev5, C3)** Source of lane D's share inside lane A (W8) | (a) before the ladder (cuts the lane A king); (b) from the ladder's burned remainder: free to lane A miners, but D's budget varies with the king's ladder share (10% after a fail, up to 95%, `chain.toml:1223-1226`) and can be ~5%; (c) from the total. W8 changes `lane_pool_shares` (`shared/lane_c.py:584`), a consensus signature at every caller **(rev5) DECIDED by the equal split:** fixed 25% shares of the total. Lane D takes from lane A, whose 25% is the pot the ladder works within, so lane D's budget never varies with the ladder. |
 
 ---
 
@@ -2642,7 +2666,7 @@ at `ready`) was found sound against target leakage. The weak part is pay.
 | **D25** | **Court pays rent indefinitely; salami-slicing.** The court is rank-decayed (57/29/14% of D's share at `king_decay` 0.5, 2 priors) with no TTL, and the bar is a fixed 0.01. A 3% gain released as three 1% crowns fills the whole court | Simple; matches lane A's court shape | Pay D wins on lanes B and C's `full_pay_tiers` + `half_life_rounds` + `win_ttl_eras` shape, keyed to the crowning LCB over max(KING_D, house). Or a tenure-decaying bar (e.g. 0.03 → 0.01). Or time-bound prior-king tails, like lane A's `court_bp` / `court_blocks` |
 | **D26** | **Lane A is a free input to D, and D's 20% comes out of A.** The cheapest winning D entry is "fine-tune the published house". Generators and recipe are published (**(rev5)** `[generation] king_publish = "recipe"`, `chain.toml:1555` on main `07117e1`; not `[v2]`) | Lane A is paid by its own ladder; D pays only for beating the house | A **lineage royalty**: a fixed ρ ≈ 15–20% of each D win's pay goes to the lane A king hotkey that was the house at the winner's T_E. Calibrate ρ in shadow with a weight-space nearest-ancestor measurement. Never self-declared lineage |
 | **D27** | **Withholding from A.** A strong generator may earn more used privately in D than published in A | Accept; monitor how many D kings are far from every published A checkpoint | The D26 royalty, plus keep A's share ≥ D's |
-| **D28** | **Split.** v2 has A 30 / B 25 / C 25 / D 20 when all are armed | v2 split | Reviewer: **A 40 / D 25 / B 20 / C 15**, with D ramping 15 → 25% after ≥ 3 miner crowns pass the gate with the unselected suite not falling. Now (B, C off): A80/D20 is acceptable. Interacts with **D21**: the reviewer prefers returning the unpaid house slot to lane A over burning it |
+| **D28** | **Split.** v2 has A 30 / B 25 / C 25 / D 20 when all are armed | v2 split | Reviewer: **A 40 / D 25 / B 20 / C 15**, with D ramping 15 → 25% after ≥ 3 miner crowns pass the gate with the unselected suite not falling. Now (B, C off): A80/D20 is acceptable. Interacts with **D21**: the reviewer prefers returning the unpaid house slot to lane A over burning it **(rev5) DECIDED (owner): A 25 / B 25 / C 25 / D 25** (§6 D1, D28). |
 |  | *(rev4) Share assumption: B launches trainer-run, so its share pays generator-funded legs merged into KING_A. Until B's gate opens its share burns (D37). The A40/D25/B20/C15 proposal stands as an option; no default change.* | | |
 | **D29** | **Frequency bias in frozen sets.** Sub-hourly data reaches the floors first, so miners specialise on sub-hourly | v2 freeze rule | Per-frequency-bucket and per-domain window quotas inside a frozen set, equal cluster weights. Freeze when every bucket meets its quota or a max wait passes |
 | **D30** | **TIME isn't truly unselected.** It's in lane A's `require_public` gate and the king check, and DEC-CA-0071 (pending: PR #482; rev5 renumber) adds `suite:time` as a lane B target, so the house is optimised on it | Keep TIME as the unselected suite | Drop `s-time` from DEC-CA-0071, or choose a sentinel that no lane gates or pays on |
@@ -2788,7 +2812,7 @@ runs stay blocked until each one is answered here.
 2. **OA2, seed replicas (B1 null type 2b).** Do any same-corpus,
    different-seed replicas exist (DEC-CA-0061, docs/OPERATOR.md
    seed-noise)? If yes, give their refs. If none, write "none".
-3. **OA3, per-era false-crown target.** The recommended value is 5%. Confirm
+3. **OA3, per-era false-crown target. (rev5) ANSWERED: 5%** (owner 2026-11-21). The recommended value is 5%. Confirm
    or set a value; it gates S4 (T14) and sizes `d_margin`.
 4. **OA4, pod approval for B1 scoring and the B2 16k memory fit.** Either:
    - (a) use valpriv-4090 **outside lane A duel windows** (no rental; it
