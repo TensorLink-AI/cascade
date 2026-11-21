@@ -1,0 +1,8 @@
+# R7: S0c overlay bring-up artefacts (plan §3.0 R7, §5 row 4, §14.4).
+cascade/laned/overlay.py
+# cli.py: ONLY add "overlay": "cascade.laned.overlay" to COMMANDS; keep
+# R1's blocks (and any other registered command) intact.
+cascade/laned/cli.py
+# docs/OPERATOR.md: ONLY a short `cascade-laned overlay` section (S0c runbook)
+# in "Network config overlays"; every --flag in its snippets must exist.
+docs/OPERATOR.md
