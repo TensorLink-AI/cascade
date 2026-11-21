@@ -19,6 +19,11 @@ only the paths in `PATHS`. R1 owns no T-rows and no invariants.
 - `pyproject.toml`: add **only** `cascade-laned = "cascade.laned.cli:main"`
   under `[project.scripts]`. Don't touch dependencies, the torch pin or
   `uv.lock`.
+- `docs/OPERATOR.md`: add **only** a short `cascade-laned blocks` section with a
+  CLI snippet. `scripts/check_docs.py` (line 264) fails CI with "Undocumented
+  console entrypoint" unless every `[project.scripts]` entry appears in a
+  snippet in a current guide. Every `--flag` in that snippet must be one the
+  CLI really accepts, because check_docs also refuses unknown options.
 
 The tests drive it as a subprocess: `python -m cascade.laned.cli blocks
 <query> <args> --grid FILE [--config FILE]`, with cwd and `PYTHONPATH` set to
