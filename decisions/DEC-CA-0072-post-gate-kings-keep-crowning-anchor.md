@@ -1,5 +1,5 @@
 ---
-id: DEC-CA-0069
+id: DEC-CA-0072
 type: decision
 title: "Post-gate kings keep their recorded crowning block as the tenure anchor ([scoring] crowning_anchor_from_block, release-then-activate)"
 status: accepted
