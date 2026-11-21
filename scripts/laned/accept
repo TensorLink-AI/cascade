@@ -4,10 +4,16 @@
     accept <WP> [--evidence FILE] [--root R]
         invariant10 -> pytest tests/accept/<wp>/ -> stub_scan over PATHS
         -> make laned-e2e (when the Makefile defines it) -> evidence
+        With --evidence, pytest and e2e see LANED_EVIDENCE=<abs FILE>: the
+        WP's own tests verify the evidence content (plan §3, §17.1 L4).
     accept <WP> --expect-fail [--root R]
         tests-only PRs: tests collected and failing for a right reason only
     accept <WP> --check-pr --base REF --head REF [--root R]
-        rule 1 and the WP's PATHS over `git diff --name-only BASE...HEAD`
+        rule 1 and the WP's PATHS over `git diff --name-only BASE...HEAD`;
+        for a review WP RV<n>: MODE review iff the diff is exactly an add or
+        modify of evidence/rv<n>.md (no tests run)
+    accept selftest
+        offline check of the review mode
     accept --gate <STAGE> [--root R]
         evidence/gates/<stage>.json: right stage, every check passed
 
@@ -18,6 +24,8 @@ The pytest command is `uv run --frozen pytest` unless LANED_PYTEST_CMD is set
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import os
 import re
 import shlex
@@ -27,8 +35,9 @@ import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-import lanedlib
-import stub_scan
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # `python -P` drops the script dir
+import lanedlib  # noqa: E402
+import stub_scan  # noqa: E402
 
 UNARMED = "unchanged_when_unarmed"
 ARMED = "armed_nonempty_lane_d_effect"
@@ -81,11 +90,23 @@ def step_invariant10(root: Path, wp: str) -> int:
 # accept
 # ---------------------------------------------------------------------------
 
-def run_pytest(root: Path, wp: str, extra: list[str]) -> subprocess.CompletedProcess:
+def run_pytest(root: Path, wp: str, extra: list[str],
+               env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     rel = f"tests/accept/{lanedlib.wp_dir(wp)}/"
     cmd = pytest_cmd() + ["-q", *extra, rel]
     print("+ " + shlex.join(cmd), flush=True)
-    return subprocess.run(cmd, cwd=str(root), capture_output=True, text=True)
+    return subprocess.run(cmd, cwd=str(root), capture_output=True, text=True, env=env)
+
+
+def evidence_env(root: Path, evidence: str | None) -> dict[str, str]:
+    """The WP's tests own the evidence content verifier: with --evidence they
+    see the file as LANED_EVIDENCE (absolute path); without it the variable is
+    removed so a stale value from the caller never leaks in."""
+    env = dict(os.environ)
+    env.pop("LANED_EVIDENCE", None)
+    if evidence:
+        env["LANED_EVIDENCE"] = str(lanedlib.resolve(root, evidence).resolve())
+    return env
 
 
 def step_evidence(root: Path, wp: str, evidence: str) -> int:
@@ -111,7 +132,8 @@ def cmd_accept(root: Path, wp: str, evidence: str | None) -> int:
         return fail("pytest", f"no tests at tests/accept/{lanedlib.wp_dir(wp)}/")
     if step_invariant10(root, wp):
         return 1
-    proc = run_pytest(root, wp, [])
+    env = evidence_env(root, evidence)
+    proc = run_pytest(root, wp, [], env=env)
     sys.stdout.write(proc.stdout[-20000:])
     sys.stderr.write(proc.stderr[-5000:])
     if proc.returncode != 0:
@@ -127,7 +149,7 @@ def cmd_accept(root: Path, wp: str, evidence: str | None) -> int:
         return fail("stub_scan", f"{len(lines)} finding(s)")
     print(f"ok stub_scan ({scanned} file(s))")
     if makefile_has_target(root, "laned-e2e"):
-        proc = subprocess.run(["make", "laned-e2e"], cwd=str(root), capture_output=True, text=True)
+        proc = subprocess.run(["make", "laned-e2e"], cwd=str(root), capture_output=True, text=True, env=env)
         sys.stdout.write(proc.stdout[-20000:])
         sys.stderr.write(proc.stderr[-5000:])
         if proc.returncode != 0:
@@ -231,7 +253,27 @@ def paths_at(root: Path, ref: str, wp: str) -> list[str] | None:
     return read_paths(root, wp)
 
 
+REVIEW_WP = re.compile(r"^RV(\d+)$")
+
+
+def cmd_check_pr_review(root: Path, wp: str, n: str, base: str, head: str) -> int:
+    """A review PR (label laned:RV<n>) adds or edits exactly evidence/rv<n>.md."""
+    want = f"evidence/rv{n}.md"
+    out = lanedlib.git(root, "diff", "--no-renames", "--name-status", f"{base}...{head}").stdout
+    changes = [tuple(line.split("\t", 1)) for line in out.splitlines() if line.strip()]
+    if not changes:
+        return fail("review", "the PR changes nothing")
+    bad = [f"{s} {p}" for s, p in changes if p != want or s not in ("A", "M")]
+    if bad:
+        return fail("review", f"a {wp} PR may only add or modify {want}; it also has: " + " ".join(bad))
+    print("MODE review")
+    return 0
+
+
 def cmd_check_pr(root: Path, wp: str, base: str, head: str) -> int:
+    m = REVIEW_WP.match(wp)
+    if m:
+        return cmd_check_pr_review(root, wp, m.group(1), base, head)
     diff = lanedlib.git(root, "diff", "--name-only", f"{base}...{head}").stdout.split()
     if not diff:
         return fail("paths", "the PR changes nothing")
@@ -274,7 +316,61 @@ def cmd_gate(root: Path, stage: str) -> int:
     return 0
 
 
+def cmd_selftest() -> int:
+    """Offline check of the RV<n> review mode of --check-pr."""
+    failures: list[str] = []
+    ident = ("-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false")
+    with tempfile.TemporaryDirectory(prefix="laned-accept-selftest-") as tmp:
+        root = Path(tmp) / "repo"
+        root.mkdir()
+
+        def put(rel: str, text: str) -> None:
+            (root / rel).parent.mkdir(parents=True, exist_ok=True)
+            (root / rel).write_text(text)
+
+        def commit(msg: str) -> str:
+            lanedlib.git(root, "add", "-A")
+            lanedlib.git(root, *ident, "commit", "-q", "-m", msg)
+            return lanedlib.git(root, "rev-parse", "HEAD").stdout.strip()
+
+        lanedlib.git(root, "init", "-q")
+        put("README.md", "x\n")
+        put("evidence/rv1.md", "Covers: W0c\n")
+        base = commit("base")
+
+        def case(name: str, files: dict[str, str | None], wp: str, want_ok: bool) -> None:
+            lanedlib.git(root, "checkout", "-q", "-B", name, base)
+            for rel, text in files.items():
+                if text is None:
+                    (root / rel).unlink()
+                else:
+                    put(rel, text)
+            head = commit(name)
+            with contextlib.redirect_stdout(io.StringIO()) as buf:
+                rc = cmd_check_pr(root, wp, base, head)
+            ok = rc == 0 and "MODE review" in buf.getvalue()
+            if ok != want_ok:
+                failures.append(f"{name}: {wp} check-pr {'passed' if ok else 'failed'}: {buf.getvalue().strip()}")
+
+        case("add", {"evidence/rv2.md": "Covers: W1\n"}, "RV2", True)
+        case("modify", {"evidence/rv1.md": "Covers: W0c, W0\n"}, "RV1", True)
+        case("plus-other", {"evidence/rv2.md": "r\n", "README.md": "y\n"}, "RV2", False)
+        case("wrong-review", {"evidence/rv2.md": "r\n"}, "RV1", False)
+        case("plus-tests", {"evidence/rv2.md": "r\n", "tests/accept/w1/test_x.py": "x = 1\n"}, "RV2", False)
+        case("delete", {"evidence/rv1.md": None}, "RV1", False)
+        case("other-file-only", {"docs/notes.md": "n\n"}, "RV3", False)
+    for f in failures:
+        print(f"accept selftest: FAIL {f}", file=sys.stderr)
+    if failures:
+        return 1
+    print("accept selftest: ok")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["selftest"]:
+        return cmd_selftest()
     ap = argparse.ArgumentParser(prog="accept", description=__doc__.split("\n\n")[0])
     ap.add_argument("wp", nargs="?")
     ap.add_argument("--root", default=".")

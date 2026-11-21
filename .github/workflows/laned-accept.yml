@@ -5,7 +5,10 @@
 #   PR stays inside the WP's PATHS), then --expect-fail on a tests-only PR or
 #   the full Accept on an implementation PR. The tooling comes from the base
 #   branch once it exists there, so a PR cannot loosen its own gate.
-# push to main: Accept for every WP at >= L2, then `scripts/laned/status`
+# push to main: Accept for every WP at >= L2 (with `--evidence <file>` from the
+#   WP's Accept cell when that file exists, so the WP's tests verify it via
+#   LANED_EVIDENCE), `accept --gate` for every stage gate file present (both
+#   record the verified blob sha in the ledger), then `scripts/laned/status`
 #   recomputes the board and pushes it to branch laned/build-state (never main).
 # workflow_dispatch: an expect-fail run of one WP at a given commit (bootstrap
 #   for WPs whose tests landed before this workflow existed). The harvester keeps
@@ -124,6 +127,13 @@ jobs:
                 --event "$EVENT" --head-sha "$HEAD_SHA" --conclusion failure
               status=1; echo "::endgroup::"; continue
             fi
+            if [ "$mode" = "review" ]; then
+              # laned:RV<n>: check-pr already verified the diff is exactly
+              # evidence/rv<n>.md; a review PR has no tests to run.
+              python3 "$LANED/ci_ledger.py" record --file "$LANED_RESULTS" --wp "$wp" --mode check-pr \
+                --event "$EVENT" --head-sha "$HEAD_SHA" --conclusion success
+              echo "::endgroup::"; continue
+            fi
             if [ "$mode" = "tests-only" ]; then
               run_mode=expect-fail
               uv run --frozen python "$LANED/accept" "$wp" --expect-fail --root . && rc=0 || rc=$?
@@ -137,6 +147,13 @@ jobs:
             echo "::endgroup::"
           done
           exit $status
+
+      - name: Loop tooling self-tests (W0c PRs)
+        if: contains(format(' {0} ', steps.select.outputs.wps), ' W0c ')
+        run: |
+          python3 scripts/laned/ci_ledger.py selftest
+          python3 scripts/laned/accept selftest
+          uv run --frozen python scripts/laned/status selftest
 
       - name: Upload per-WP results
         if: always() && steps.select.outputs.wps != ''
@@ -196,16 +213,40 @@ jobs:
           tag_args=(); [ -n "$RELEASE_TAG_GLOB" ] && tag_args=(--release-tag-glob "$RELEASE_TAG_GLOB")
           python3 scripts/laned/status --root . --ref "$GITHUB_SHA" --ci-results "$LANED_RESULTS" \
             --out "$RUNNER_TEMP/pre" "${tag_args[@]}"
-          wps=$(python3 -c 'import json, sys; d = json.load(open(sys.argv[1])); print(" ".join(w for w, v in d["wps"].items() if int(v["level"][1:]) >= 2))' "$RUNNER_TEMP/pre/status/laned_build.json")
-          echo "WPs at >= L2: ${wps:-none}"
+          board="$RUNNER_TEMP/pre/status/laned_build.json"
+          # "<WP> <evidence file or ->" for every WP at >= L2; the evidence file
+          # is the one named in the WP's §3.0 Accept cell (external WPs only).
+          rows=$(python3 -c 'import json, sys; d = json.load(open(sys.argv[1])); print("\n".join(w + " " + (v.get("evidence_file") or "-") for w, v in d["wps"].items() if int(v["level"][1:]) >= 2))' "$board")
+          echo "WPs at >= L2: ${rows:-none}"
           status=0
-          for wp in $wps; do
+          while read -r wp ev; do
+            [ -n "$wp" ] || continue
             echo "::group::$wp"
-            uv run --frozen python scripts/laned/accept "$wp" --root . && conclusion=success || { conclusion=failure; status=1; }
+            # L4: an external WP whose evidence file exists at this commit is
+            # accepted WITH it, so its own tests verify the content
+            # (LANED_EVIDENCE); the blob sha goes into the ledger.
+            ev_args=(); ev_sha=()
+            if [ "$ev" != "-" ] && [ -f "$ev" ]; then
+              ev_args=(--evidence "$ev")
+              ev_sha=(--evidence-sha "$(git rev-parse "HEAD:$ev")")
+            fi
+            uv run --frozen python scripts/laned/accept "$wp" --root . "${ev_args[@]}" && conclusion=success || { conclusion=failure; status=1; }
             python3 scripts/laned/ci_ledger.py record --file "$LANED_RESULTS" --wp "$wp" --mode accept \
-              --event push --head-sha "$GITHUB_SHA" --conclusion "$conclusion" --run-id "$GITHUB_RUN_ID"
+              --event push --head-sha "$GITHUB_SHA" --conclusion "$conclusion" --run-id "$GITHUB_RUN_ID" "${ev_sha[@]}"
             echo "::endgroup::"
-          done
+          done <<< "$rows"
+          # §17.2: every stage gate file present is verified by a gate run
+          # (stages whose gate is evidence/gates/<stage>.json, from the board).
+          gates=$(python3 -c 'import json, sys; d = json.load(open(sys.argv[1])); print("\n".join(s + " " + v["gate"]["evidence"] for s, v in d["stages"].items() if v["gate"]["evidence"].startswith("evidence/gates/")))' "$board")
+          while read -r stage gf; do
+            [ -n "$stage" ] && [ -f "$gf" ] || continue
+            echo "::group::gate $stage"
+            python3 scripts/laned/accept --gate "$stage" --root . && conclusion=success || conclusion=failure
+            python3 scripts/laned/ci_ledger.py record --file "$LANED_RESULTS" --wp "$stage" --mode gate \
+              --event push --head-sha "$GITHUB_SHA" --conclusion "$conclusion" --run-id "$GITHUB_RUN_ID" \
+              --evidence-sha "$(git rev-parse "HEAD:$gf")"
+            echo "::endgroup::"
+          done <<< "$gates"
           echo "ACCEPT_STATUS=$status" >> "$GITHUB_ENV"
 
       - name: Publish the status board to laned/build-state
