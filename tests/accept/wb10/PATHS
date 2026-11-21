@@ -1,0 +1,11 @@
+# WB10: [lane_b] config keys (parse, defaults, validation, drop-when-default),
+# the release-only contamination_hashset and ALLOWED["lane_b"] coverage.
+# The lane B parser lives in v2.py today; a split into lane_b.py is allowed.
+cascade/shared/config/v2.py
+cascade/shared/config/lane_b.py
+cascade/shared/config/__init__.py
+cascade/shared/config/loader.py
+cascade/shared/netconfig.py
+# [lane_b] defaults only; nothing armed (from_block and share unchanged).
+chain.toml
+chain.testnet.toml
