@@ -1,10 +1,22 @@
 # Plan: lane D "open weights" (anything goes on our architecture), with lane E and lane A flexibility — v3
 
-Status: **PLAN v3, rev6 (proposed 2026-11-21)**: v2's design, made buildable by an
+Status: **PLAN v3, rev6.1 (proposed 2026-11-21)**: v2's design, made buildable by an
 autonomous loop. A work package is done **only when its Accept command exits
 0**; **(rev6)** its level is only what `scripts/laned/status` computes (§17),
 never a claim. Owner decisions are marked **[DECIDE]**. Nothing is armed. **No calendar
 dates**: stages are gated (§5).
+
+## rev6.1 (RV1 rubric fixes; main @ bdeed4d, 2026-11-21)
+
+Plan text only, **no design change**. Every changed item is marked
+**(rev6.1)**. Source: RV1 (`evidence/rv1.md` on `laned/rv1`), non-blocking
+notes 1, 2, 10, 12 and the lane A consequence of R3's lint.
+
+| Item | Change | Landed in |
+|---|---|---|
+| 1 | W0 `Runs in` `ci + owner merge` → `ci`. The owner merge is the PR merge every WP has (§3.1 rule 6); as written it made W0 "external", so it needed an `evidence/w0.json` that nothing produces, blocking W0 at L4/L5 and so S2 (RV1 note 1) | §3.0 W0 |
+| 2 | "Build WP" defined for §17.2: the §3.0 WPs whose `Runs in` is ci-only, or ci plus pod/testnet for their CI-checkable parts; owner execution WPs (R2x, R6x, R7t, R7m, R9, R13, R14, R15, R16, X*) are excluded and gate their own stages. Consistent with the §3.0 Review WPs count (RV1 note 2) | §17.2 S2 row |
+| 3 | Proposed design changes 23 (code-enforced stake gate for `[lane_d] from_block`), 24 (`[lane_c] remainder` restatement refused) and 25 (lane A tuning after lane D activation). Not applied: owner decision (RV1 notes 10, 12) | Proposed design changes 23–25 |
 
 ## rev6 (completion rubric, loop-readiness fixes, stale items; main @ 07117e1, 2026-11-21)
 
@@ -590,6 +602,28 @@ the code). Each is verified where marked.
     W5b. Proposed: the owner confirms Option A, or names the Option B rows to
     adopt; any Option B is a structural change to W8 (court pay) and goes in
     as a new WP row.
+23. **(rev6.1) Code-enforced stake gate for activation.** Today only the
+    runbook enforces "observed `cfg-` stake ≥ 2/3 before `effective_block`"
+    (§5 row 11, X6a, D10). `ALLOWED["lane_d"] = None` lets an overlay
+    adopted at the 51% permit-stake lock-in set `[lane_d] from_block`, and
+    old-release nodes refuse that overlay whole (§14.1), so arming early
+    splits the fleet (RV1 note 10). Proposed: R3 (lint) or R7 (publish
+    wrapper) refuses to publish an overlay that sets `[lane_d] from_block`
+    unless R4's tracker output shows ≥ 2/3 observed `cfg-` stake.
+    Affects R3, R4, R7, §5 S6.
+24. **(rev6.1) `[lane_c] remainder` restatement.** It is now release-only
+    (W2, `netconfig.py:213-215`). An overlay that merely restates
+    `[lane_c] remainder = "burn"` would be refused whole by new nodes and
+    accepted by old ones in a mixed fleet (RV1 note 12). R3 already refuses
+    it; proposed: say so in §14.2 and in the operator runbook, so no
+    overlay body ever carries it. Affects §14.2, R3, `docs/OPERATOR.md`.
+25. **(rev6.1) Lane A tuning after lane D activation.** R3's lint, as its
+    row is written, applies to any overlay containing a `[lane_d]` table,
+    and overlays are full snapshots. After S6 every overlay carries
+    `[lane_d]`, so any lane A key change is refused: lane A can no longer be
+    tuned by overlay. Options: (a) accept it (lane A changes go through a
+    release); (b) allow lane A keys to change in a seq that leaves every
+    `[lane_d]` key byte-identical to seq N-1. Affects R3, §5, §14.2.
 
 ## 0. Summary
 
@@ -1449,7 +1483,7 @@ Accept command exits 0**, never on a builder's word. Conventions:
 | WP | What | Depends | Runs in | Accept |
 |---|---|---|---|---|
 | W0c | Loop tooling: `scripts/laned/accept`; `stub_scan.py` (refuses `TODO`, `FIXME`, `pass`-only bodies, `NotImplementedError`, `...` bodies, hardcoded sample values and mock imports outside `tests/`); `unread_keys.py` (every `[lane_d]`/`[lane_d_ops]` key is read by a parser); `follower_patterns.py` (every lane D log call has a cascade-ops follower pattern). **(rev6) Also:** (i) `scripts/laned/status` per §17: computes every WP's level, the stage and milestone state, the decision register and the §17.3 counters from `git log origin/main`, GitHub Actions results on main and `evidence/`, and writes `docs/plans/STATUS.md` + `status/laned_build.json` to branch `laned/build-state` (never merged to main); `accept --gate <stage>` verifies a stage's exit-gate evidence (§17.2); (ii) a GitHub Actions workflow `.github/workflows/laned-accept.yml` that runs `scripts/laned/accept <WP>` on every PR labelled `laned:<WP>` and, on push to main, for every WP at ≥ L2. On a tests-only PR it runs in **expect-fail** mode: it passes only if the new tests are collected and fail for the right reason (an assertion failure, or a missing module/attribute named in the WP's `PATHS`), never on a syntax, fixture or import error elsewhere. Today `ci.yml` runs only `pytest tests/unit`, so nothing runs `tests/accept/` yet; (iii) the CI check that fails any PR that edits `tests/accept/` together with a path outside `tests/accept/` (rule 1), and any implementation PR touching a path not in its WP's `PATHS`; (iv) self-tests for (i)–(iii), listed in Accept. Creating the `laned:<WP>` label set is an owner step (`gh label create`); none exists today | — | ci | `scripts/laned/accept W0c` (self-tests: each script fails on a planted violation fixture and passes on a clean one; **(rev6)** `scripts/laned/status` on a fixture repo (fixture git history, CI results and evidence) yields the exact expected level for every fixture WP, including side states and a WP that regresses from L3 to L2; a planted rule-1 violation (tests + implementation in one PR) fails the workflow's check; an expect-fail run passes on correctly failing tests and fails on a syntax-error test file) |
-| W0 | DEC-CA-0070 (supersedes DEC-CA-0062's recipe design) recording **(rev5)** D1–D43, D45–D48 and D42b (D44 withdrawn) (D25–D32 from §15, D33–D35 §16, D36–D42 §12b) | — | ci + owner merge | `scripts/laned/accept W0` (front matter valid; `supersedes: DEC-CA-0062`; **(rev5)** every decision D1–D43, D45–D48 and D42b answered or marked resolved) |
+| W0 | DEC-CA-0070 (supersedes DEC-CA-0062's recipe design) recording **(rev5)** D1–D43, D45–D48 and D42b (D44 withdrawn) (D25–D32 from §15, D33–D35 §16, D36–D42 §12b). **(rev6.1)** Owner-merged like every WP (§3.1 rule 6); that merge doesn't make W0 external | — | ci **(rev6.1)** | `scripts/laned/accept W0` (front matter valid; `supersedes: DEC-CA-0062`; **(rev5)** every decision D1–D43, D45–D48 and D42b answered or marked resolved) |
 | W0b | Context-equivalence test: the lane D scorer at 4096 equals the pinned `pyramid_wrapper` output (within tolerance) on windows with ≥ 4096 history; a 4096 checkpoint loads `strict=True` at every context variant  **(rev5)** It compares **quantile-head** outputs at the 9-level grid (the lane A scoring path under `quantile_head_after`), not samples. | W5d | ci | `scripts/laned/accept W0b` |
 
 **Rollout tooling (prerequisites for S0a–S0c, S4–S6)**
@@ -2932,7 +2966,7 @@ otherwise `evidence/gates/<stage>.json`, checked by
 | S0b | R2x at L4 |
 | S0c | R7t and R7m at L4 |
 | S1 | W1, W0b and W3a at L4; R16 archive growing (R16 evidence) |
-| S2 | Every build WP at L5; the S2 gate evidenced |
+| S2 | Every build WP at L5; the S2 gate evidenced. **(rev6.1)** A **build WP** is a §3.0 WP whose `Runs in` is ci-only, or ci plus pod/testnet for its CI-checkable parts. Owner execution WPs (R2x, R6x, R7t, R7m, R9, R13, R14, R15, R16 and every X*) are **not** build WPs; they belong to their own stages (S0a–S0c, S1, S2b, …). This is the set the §3.0 Review WPs paragraph counts ("W/R build WPs, not owner execution WPs") and the set "all build WPs" means in S4 and S5 |
 | S2b | R9 at L4 |
 | S3 | X3 at L4, with every §4 T-row passed |
 | S4 | X4 at L4; all build WPs at L6 |
