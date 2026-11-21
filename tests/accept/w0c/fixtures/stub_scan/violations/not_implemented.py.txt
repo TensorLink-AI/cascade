@@ -1,0 +1,4 @@
+def score_window(window: list[float]) -> float:
+    if not window:
+        return 0.0
+    raise NotImplementedError("quantile head scoring")

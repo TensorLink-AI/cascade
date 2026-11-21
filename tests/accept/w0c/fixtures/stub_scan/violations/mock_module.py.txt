@@ -1,0 +1,5 @@
+from unittest.mock import MagicMock
+
+
+def make_store():
+    return MagicMock()

@@ -1,0 +1,15 @@
+import logging
+
+log = logging.getLogger(__name__)
+
+
+def crown(hotkey: str, era: int) -> None:
+    log.info("lane_d_crowned hotkey=%s era=%d", hotkey, era)
+
+
+def hold(reason: str) -> None:
+    log.warning(f"lane_d_hold reason={reason}")
+
+
+def trace(step: str) -> None:
+    log.debug("scoring step %s", step)

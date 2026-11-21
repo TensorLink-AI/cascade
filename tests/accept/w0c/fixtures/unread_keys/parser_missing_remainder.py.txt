@@ -1,0 +1,14 @@
+ALLOWED = ("from_block", "share", "takes_from", "remainder")
+
+
+def parse_lane_d(raw: dict) -> dict:
+    """Parses from_block, share, takes_from and remainder."""
+    out = {"from_block": int(raw.get("from_block", 0))}
+    out["share"] = float(raw["share"])
+    # remainder is read elsewhere
+    out["takes_from"] = str(raw.get("takes_from", "lane_a"))
+    return out
+
+
+def parse_lane_d_ops(raw: dict) -> dict:
+    return {"poll_seconds": int(raw.get("poll_seconds", 120))}

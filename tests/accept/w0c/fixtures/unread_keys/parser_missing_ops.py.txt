@@ -1,0 +1,11 @@
+def parse_lane_d(raw: dict) -> dict:
+    return {
+        "from_block": int(raw.get("from_block", 0)),
+        "share": float(raw["share"]),
+        "takes_from": str(raw["takes_from"]),
+        "remainder": str(raw["remainder"]),
+    }
+
+
+def parse_lane_d_ops(raw: dict) -> dict:
+    return {}
