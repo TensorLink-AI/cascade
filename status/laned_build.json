@@ -1,8 +1,8 @@
 {
   "schema": "laned_build/1",
-  "ref": "3c7803adef8e7c719ad593b35e6ec13d42758c05",
-  "commit": "3c7803adef8e7c719ad593b35e6ec13d42758c05",
-  "generated_at": "2026-11-21T21:45:11Z",
+  "ref": "a7746b060886735f228b680f5d03d23568a3dfe4",
+  "commit": "a7746b060886735f228b680f5d03d23568a3dfe4",
+  "generated_at": "2026-11-21T21:47:18Z",
   "wps": {
     "W0c": {
       "level": "L0",
@@ -23,7 +23,7 @@
       "expect_fail_success": true,
       "l2_commit": "a15368814c031bafd3bf4b329e7e3867c4ab7aee",
       "last_main_run": {
-        "head_sha": "3c7803adef8e7c719ad593b35e6ec13d42758c05",
+        "head_sha": "a7746b060886735f228b680f5d03d23568a3dfe4",
         "conclusion": "success"
       },
       "evidence": "evidence/w0.json: evidence file missing"
@@ -101,7 +101,7 @@
       "expect_fail_success": true,
       "l2_commit": "3c7803adef8e7c719ad593b35e6ec13d42758c05",
       "last_main_run": {
-        "head_sha": "3c7803adef8e7c719ad593b35e6ec13d42758c05",
+        "head_sha": "a7746b060886735f228b680f5d03d23568a3dfe4",
         "conclusion": "success"
       },
       "evidence": "ci-only",
@@ -234,12 +234,12 @@
       "expect_fail_success": false
     },
     "W2": {
-      "level": "L0",
+      "level": "L1",
       "side_state": "blocked:dependency",
       "runs_in": "ci",
       "external": false,
       "group": "laned_core",
-      "paths": false,
+      "paths": true,
       "expect_fail_success": true
     },
     "W2b": {
