@@ -61,6 +61,7 @@ __all__ = [
     "safetensors_header",
     "verify_checkpoint",
     "verify_checkpoint_code",
+    "verify_lane_d_checkpoint",
     "verify_weights_finite",
 ]
 
@@ -72,6 +73,8 @@ MAX_HEADER_BYTES = 4 * 1024 * 1024
 # far below anything that could be a payload.
 BYTES_PER_PARAM = 4
 BUDGET_FACTOR = 3
+# Floating dtypes a whole checkpoint may be pinned to (lane A: F32 only).
+FLOAT_DTYPES = ("F32", "BF16")
 _DTYPE_BYTES = {"F64": 8, "F32": 4, "F16": 2, "BF16": 2, "I64": 8, "I32": 4,
                 "I16": 2, "I8": 1, "U8": 1, "BOOL": 1}
 
@@ -262,14 +265,21 @@ def _expected_state_spec(contract) -> tuple[dict[str, tuple[str, tuple[int, ...]
 
 
 def verify_checkpoint(checkpoint_dir: Path | str, contract=None, *,
-                      max_bytes: int | None = None) -> CheckpointReport:
+                      max_bytes: int | None = None,
+                      float_dtype: str = "F32") -> CheckpointReport:
     """Full ingest check; returns what was verified, raises on any deviation.
 
     ``contract`` is the entry's ``TrainingContractConfig`` (the validator
     knows it from the entry's size). With ``None`` only the code-identity
     check runs — enough to make executing the checkpoint safe, but not to
     bound its shape; every live scorer should pass the contract.
+
+    ``float_dtype`` is the safetensors dtype every floating tensor must carry.
+    Lane A passes nothing and keeps the pinned F32 spec unchanged; only lane D
+    ingest passes ``"BF16"`` (D14), through :func:`verify_lane_d_checkpoint`.
     """
+    if float_dtype not in FLOAT_DTYPES:
+        raise ValueError(f"float_dtype must be one of {FLOAT_DTYPES}; got {float_dtype!r}")
     d = Path(checkpoint_dir)
     arch = verify_checkpoint_code(d)
     if contract is not None:
@@ -301,6 +311,9 @@ def verify_checkpoint(checkpoint_dir: Path | str, contract=None, *,
                                  f"contract on {diff}")
 
     spec, n_params = _expected_state_spec(contract)
+    if float_dtype != "F32":
+        spec = {k: ((float_dtype if dt == "F32" else dt), shape)
+                for k, (dt, shape) in spec.items()}
     budget = max_bytes if max_bytes is not None else n_params * BYTES_PER_PARAM * BUDGET_FACTOR
     if size > budget:
         raise CheckpointTampered(f"{WEIGHTS_FILE} is {size} bytes; budget for "
@@ -327,3 +340,16 @@ def verify_checkpoint(checkpoint_dir: Path | str, contract=None, *,
             f"{WEIGHTS_FILE} tensors differ from the pinned model: "
             f"missing={missing[:5]} extra={extra[:5]} shape/dtype={wrong[:5]}")
     return CheckpointReport(n_params=n_params, weights_bytes=size, n_tensors=len(got))
+
+
+def verify_lane_d_checkpoint(checkpoint_dir: Path | str, contract, *,
+                             dtype: str = "BF16") -> CheckpointReport:
+    """Lane D's ingest check (LANE_D_PLAN §1.1, D14): the full
+    :func:`verify_checkpoint` with every floating tensor in ``dtype`` (BF16)
+    instead of lane A's pinned F32, then :func:`verify_weights_finite`. The
+    code, config and shape rules are lane A's, unchanged."""
+    if contract is None:
+        raise CheckpointTampered("lane D ingest needs the entry's contract")
+    report = verify_checkpoint(checkpoint_dir, contract, float_dtype=dtype)
+    verify_weights_finite(checkpoint_dir)
+    return report
