@@ -132,3 +132,49 @@ def test_v2_manifest_refuses_unbound_or_incompatible_worker_entries(cfg, tmp_pat
                                   pin_block=start)
     manifest = scheduler._build_manifest(era, entry, [], "50000", start, pin_block=start)
     assert manifest.entries[0].training_contract_digest == manifest.contract_digest
+
+
+def test_runtime_only_contract_changes_keep_a_verified_king_proof(cfg, tmp_path, monkeypatch):
+    """2026-11-15: arming ``continuation_protocol`` (an IMAGE_RUNTIME_FIELD,
+    numerics unchanged) moved the full contract digest; the per-king proof
+    carried the old one and the era-2642 king leg was refused for 5.5 h."""
+    import json
+
+    from cascade.shared.manifest import numerics_contract_digest
+    from cascade.trainer import launch_preflight as lp
+
+    monkeypatch.setattr(lp, "check_worker_release", lambda c, *, launched=False: None)
+    ref = "fixture/king@sha256:" + "c" * 64
+    base = replace(cfg, manifest=replace(cfg.manifest, validator_hotkey="5Fixture"),
+                   training=replace(cfg.training, v2_contract=replace(
+                       cfg.training.v2_contract, continuation_protocol="")))
+    report = {"ok": True, "scope": "full", "runtime_skipped": False, "corpus_digest": "d" * 64}
+    legacy = {k: v for k, v in lp.identity(base, ref).items() if k != "numerics_contract_digest"}
+    path = lp.proof_path(tmp_path, ref)
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({**legacy, "verification": report}))
+
+    armed = replace(base, training=replace(base.training, v2_contract=replace(
+        base.training.v2_contract, continuation_protocol="cascade-continuation/1")))
+    assert lp.identity(armed, ref)["contract_digest"] != legacy["contract_digest"]
+    # a legacy proof (full digest only) cannot prove a different full digest…
+    assert lp.ready(armed, ref, tmp_path) is False
+    # …but one successful match under its own contract stamps the numerics digest
+    assert lp.ready(base, ref, tmp_path) is True
+    stamped = json.loads(path.read_text())
+    assert stamped["numerics_contract_digest"] == numerics_contract_digest(base.training.v2_contract)
+    (tmp_path / "v2-launch.json").unlink()
+    # and from then on a runtime-only change keeps the king's proof valid
+    assert lp.ready(armed, ref, tmp_path) is True
+    repinned = replace(armed, training=replace(armed.training, v2_contract=replace(
+        armed.training.v2_contract, train_image_digest="sha256:" + "e" * 64)))
+    (tmp_path / "v2-launch.json").unlink()
+    assert lp.ready(repinned, ref, tmp_path) is True
+
+    # a numerics change is still refused
+    c = armed.training.v2_contract
+    changed = replace(armed, training=replace(armed.training, v2_contract=replace(
+        c, weight_decay=c.weight_decay * 2)))
+    assert numerics_contract_digest(changed.training.v2_contract) != stamped["numerics_contract_digest"]
+    (tmp_path / "v2-launch.json").unlink()
+    assert lp.ready(changed, ref, tmp_path) is False
