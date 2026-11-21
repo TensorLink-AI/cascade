@@ -1,0 +1,474 @@
+{
+  "mode": "bootstrap",
+  "generated_by": "orchestrator (hand-maintained until W0c reaches L3, plan \u00a717)",
+  "generated_at": "2026-11-21T13:17Z",
+  "origin_main": "07117e1138a2c243735c2461a56626194cb95d78",
+  "plan_on_main": false,
+  "plan_pr": 483,
+  "wps": {
+    "W0c": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": [],
+      "activity": "test author running (tests-only PR pending)"
+    },
+    "W0": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W0b": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "R1": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "R2": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "R2x": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "R3": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "R4": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "R5": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "R6": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "R6x": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "R7": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "R7t": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "R7m": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "R8": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "R9": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "R10": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "R11": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "R12": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "R13": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "R14": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "R15": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "R16": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W1": {
+      "level": "L0",
+      "side_state": "blocked:owner (OA5, OA6)",
+      "evidence": []
+    },
+    "W2": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W2b": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W1.5": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W3a": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W3": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W4": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W5a": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W5b": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W5c": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W5d": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W5e": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W5f": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W5g": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W5h": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W6a": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W6fs": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W6b": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W6c": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W6d": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W6-S8": {
+      "level": "L0",
+      "side_state": "parked (S8)",
+      "evidence": []
+    },
+    "W3b1": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W3b2": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W3b3": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W3b4": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W3b5": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W7a": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W7b": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W7c": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W7d": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W8": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W9": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W10": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W11": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W12a": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W12b": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W13": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W14": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W15": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W16": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W17": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W18": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W19": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "WB10": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "WB11": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "WB12": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "WB13": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "WB14": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "WB15": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "WB16": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "WB17": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "WB18": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "WB19": {
+      "level": "L0",
+      "side_state": "blocked:owner (OA8)",
+      "evidence": []
+    },
+    "WB20": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "WB21": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "WB22": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "WB23": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W-S1": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W-S2": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "W-S3": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "X3": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "X4": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "X5": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "X6a": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    },
+    "X7": {
+      "level": "L0",
+      "side_state": null,
+      "evidence": []
+    }
+  },
+  "decisions": {
+    "open": [],
+    "note": "register in plan \u00a717.4; none open"
+  },
+  "owner_inputs": {
+    "OA1": "open",
+    "OA2": "open",
+    "OA3": "answered",
+    "OA4": "open",
+    "OA5": "open",
+    "OA6": "open",
+    "OA7": "moot",
+    "OA8": "open"
+  },
+  "counters": {
+    "t_rows_passed_testnet": "0/total",
+    "invariants_with_L3_test": "0/12",
+    "orphans": "not computed (bootstrap)",
+    "blocked_by_reason": {
+      "owner": 2
+    }
+  },
+  "milestone": "none (pre Build-complete)"
+}
