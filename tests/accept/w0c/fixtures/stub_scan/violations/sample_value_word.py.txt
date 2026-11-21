@@ -1,0 +1,2 @@
+def teacher_endpoint() -> str:
+    return "placeholder"

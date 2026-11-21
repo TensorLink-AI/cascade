@@ -1,0 +1,3 @@
+def publish_report(report: dict) -> None:
+    """Publish the signed lane D report."""
+    pass

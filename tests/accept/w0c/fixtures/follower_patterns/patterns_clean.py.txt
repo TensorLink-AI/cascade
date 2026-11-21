@@ -1,0 +1,8 @@
+import re
+
+H = r"(?P<hotkey>5[1-9A-HJ-NP-Za-km-z]{11,47})"
+
+LANE_D_RULES = (
+    ("lane_d_crowned", "critical", re.compile(r"lane_d_crowned hotkey=" + H + r" era=(?P<era>\d+)")),
+    ("lane_d_hold", "warning", re.compile(r"lane_d_hold reason=(?P<reason>[a-z_]+)")),
+)

@@ -1,0 +1,8 @@
+import re
+
+H = r"(?P<hotkey>5[1-9A-HJ-NP-Za-km-z]{11,47})"
+
+# lane_d_hold is followed by the health timer instead
+LANE_D_RULES = (
+    ("crowned", "critical", re.compile(r"lane_d_crowned hotkey=" + H + r" era=(?P<era>\d+)")),
+)

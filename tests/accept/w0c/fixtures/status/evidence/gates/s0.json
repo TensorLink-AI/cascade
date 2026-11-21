@@ -1,0 +1,1 @@
+{"stage": "S0", "passed": true, "checks": [{"name": "decision_register_closed", "passed": true}, {"name": "w0_at_l3", "passed": true}]}
