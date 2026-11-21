@@ -2,9 +2,9 @@
   "mode": "bootstrap",
   "generated_by": "orchestrator (hand-maintained until W0c reaches L3, plan \u00a717)",
   "generated_at": "2026-11-21T13:17Z",
-  "origin_main": "2294d6404a66db145a23bde81695dfa47fb54bce",
-  "plan_on_main": false,
-  "plan_pr": 483,
+  "origin_main": "714a8230386a1f027d138ad32bcbdf7723120185",
+  "plan_on_main": true,
+  "plan_pr": "483 merged",
   "wps": {
     "W0c": {
       "level": "L0",
@@ -472,7 +472,6 @@
   },
   "milestone": "none (pre Build-complete)",
   "pending_merges": [
-    483,
     484
   ]
 }
