@@ -1,0 +1,5 @@
+# R2 note-budget decoder (plan §3.0 R2, §5 row 3 S0b, T22).
+# cascade/laned/ is shared with R1 (cli.py, blocks.py) and R6 (dedrift.py):
+# the builder adds __init__.py only if absent and keeps others' files intact.
+cascade/laned/__init__.py
+cascade/laned/notes.py
