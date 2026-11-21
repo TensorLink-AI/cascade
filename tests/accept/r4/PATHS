@@ -1,0 +1,6 @@
+# R4 stake-weighted upgrade tracker (plan §3.0 R4, §5 row 11 S6, X6a).
+# cascade/laned/ is shared with R1 (cli.py, blocks.py), R2 (notes.py),
+# R6 (dedrift.py) and R10 (restore.py): __init__.py already exists on main;
+# the builder keeps it and every other WP's file intact.
+cascade/laned/__init__.py
+cascade/laned/upgrade_tracker.py
