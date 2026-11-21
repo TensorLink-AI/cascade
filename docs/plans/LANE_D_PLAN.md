@@ -1411,7 +1411,14 @@ cross-checked from two sources. There are past off-by-ones (§13).
 
 - **Declared options:** window and context sampling, domain mix weights,
   cooldown fraction plus an optional higher-LR continuation, and power-EMA
-  averaging (built, off: `power_ema_sigma_rels = []`).
+  averaging. **(rev3) Correction:** power EMA isn't a config knob.
+  It's **image-only** (`POWER_EMA_SIGMA_RELS = (0.05, 0.10)`, hard-coded in
+  `pyramid_trainer.py`, owner decision 2026-11-01). The contract's
+  `power_ema_sigma_rels = []` only pins the contract value. The live rc15
+  image has no EMA code, but **the first repin to rc16 or later turns EMA on
+  automatically** at the next warm-start seed epoch, scoring the σ_rel 0.10
+  average. That would make warm-start legs look worse. Fix the scored
+  constant (0.05, raw, or cooldown-only averaging) **before** that repin.
 - **Reproducibility:** options are folded into each leg's effective contract
   and replayed by the trainer, validators and audit.
 - **Cost:** it's a lane A contract change (image, repin and seed-epoch rules;
