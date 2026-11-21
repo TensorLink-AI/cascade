@@ -11,7 +11,12 @@ import sys
 import types
 
 from cascade.shared.config import WandbConfig
-from cascade.trainer.wandb_sink import WandbSink, open_wandb_run, wandb_run_id
+from cascade.trainer.wandb_sink import (
+    WandbSink,
+    generator_ref_tag,
+    open_wandb_run,
+    wandb_run_id,
+)
 
 
 class _FakeRun:
@@ -209,3 +214,44 @@ def test_config_missing_section_defaults():
     # WandbConfig defaults stand alone (a chain.toml with no [wandb] block loads).
     w = WandbConfig()
     assert w.enabled is False and w.project == "cascade" and w.mode == "online"
+
+
+def test_new_submission_in_same_seed_epoch_gets_its_own_run(monkeypatch):
+    # Round 824229856147703689 / uid 203: two legs of ONE hotkey under one
+    # base_seed (a v2 seed epoch spans eras) with DIFFERENT generator refs.
+    # Without the ref in the id the second leg resumed the first leg's run.
+    monkeypatch.setenv("WANDB_API_KEY", "k")
+    cap = _install_fake_wandb(monkeypatch)
+    kw = dict(round_id="824", role="challenger-cascade-moe-v2-120m", hotkey="hk",
+              uid=203, size="cascade-moe-v2-120m")
+    open_wandb_run(WandbConfig(enabled=True), gen_ref="repo@sha256:" + "a" * 64, **kw)
+    leg1 = cap["kwargs"]
+    open_wandb_run(WandbConfig(enabled=True), gen_ref="repo@sha256:" + "b" * 64, **kw)
+    leg2 = cap["kwargs"]
+    assert leg1["id"] != leg2["id"] and leg1["name"] != leg2["name"]
+    tag = generator_ref_tag("repo@sha256:" + "b" * 64)
+    assert f"gen:{tag}" in leg2["tags"] and leg2["config"]["generator_ref"].endswith("b" * 64)
+    # a retry of the SAME submission still resumes its one run
+    open_wandb_run(WandbConfig(enabled=True), gen_ref="repo@sha256:" + "b" * 64, **kw)
+    assert cap["kwargs"]["id"] == leg2["id"] and cap["kwargs"]["resume"] == "allow"
+    # no ref ⇒ the pre-existing id and name (callers without a ref unchanged)
+    assert wandb_run_id("824", kw["role"], "hk") == wandb_run_id("824", kw["role"], "hk", gen_ref="")
+    open_wandb_run(WandbConfig(enabled=True), **kw)
+    assert cap["kwargs"]["name"] == "round-824-challenger-cascade-moe-v2-120m"
+
+
+def test_ref_tag_matches_the_generation_corpus_round():
+    from types import SimpleNamespace
+
+    from cascade.trainer.runner_generation import _GenerationMixin
+
+    gen, seeds = SimpleNamespace(ref="r@sha256:" + "c" * 64), SimpleNamespace(base_seed=7)
+    assert _GenerationMixin._leg_round_id(gen, seeds) == f"7-{generator_ref_tag(gen.ref)}"
+
+
+def test_routing_metrics_use_the_step_axis(monkeypatch):
+    monkeypatch.setenv("WANDB_API_KEY", "k")
+    cap = _install_fake_wandb(monkeypatch)
+    open_wandb_run(WandbConfig(enabled=True), round_id="2", role="r", hotkey="h",
+                   uid=0, size="s")
+    assert dict(cap["run"].metrics)["routing/*"]["step_metric"] == "step"

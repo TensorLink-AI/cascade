@@ -318,6 +318,11 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
         background(item)
 
     timed = _TimedStream(stream, observer=observe if background is not None else None)
+    from .routing_telemetry import ROUTING_EVERY_DEFAULT, RoutingTelemetry
+
+    # [telemetry] routing_every_steps, stamped on the trainer by the runner;
+    # absent (a bare Toto2Trainer, miner tooling) = the per-step log cadence.
+    routing = RoutingTelemetry(getattr(trainer, "routing_every_steps", ROUTING_EVERY_DEFAULT))
     steps = contract.training_steps
     cooldown = max(1, round(steps / 11))
     trunk = steps - cooldown
@@ -438,6 +443,9 @@ def train_pyramid(trainer, stream, contract, *, training_seed, token_budget, out
             if logger and (step == 1 or step % 50 == 0):
                 logger({"event": "step", "step": step, "tokens": tokens, "loss": loss_m,
                         "copula_es": loss_j, "energy_weight": energy_weight, "lr": optimizer.param_groups[0]["lr"]})
+            # Observability only: reads the step's routing counts (the same
+            # tensors update_bias just consumed) on host copies; never raises.
+            routing.emit(logger, step=step, tokens=tokens, model=model, loads=load)
             if continuation and continuation.due():
                 checkpoint_start = time.time()
                 if gang is not None:

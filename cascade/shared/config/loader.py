@@ -724,6 +724,7 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
             funded_bench_verify_top=int(tm.get("funded_bench_verify_top", 1)),
             funded_bench_verify_tolerance=float(
                 tm.get("funded_bench_verify_tolerance", 0.02)),
+            routing_every_steps=max(0, int(tm.get("routing_every_steps", 50))),
         ),
         activation=ActivationConfig(
             feature=str(ac.get("feature", "") or "").strip(),
