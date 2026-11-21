@@ -172,7 +172,7 @@ mutation tests):
   pre-suffix key, channel) within one build.
 - **C3:** the king's ladder share runs from **10%** (after a fail) to 95%, not
   25–95% (`chain.toml:1223-1226`).
-- **A7:** PR #479 also claims DEC-CA-0069 and needs its own new number.
+- **A7:** PR #479 also claimed DEC-CA-0069; **(rev6)** renumbered DEC-CA-0072 after merge.
 - **B11:** rc15n (#477's minimal image, built on rc15 `5e3fade` + the pin)
   doesn't contain power EMA. W-EMA blocks #477's repin only if that image is
   built from main.
