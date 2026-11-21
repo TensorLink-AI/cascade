@@ -136,7 +136,9 @@ def test_disjoint_partition_never_reuses_a_window():
     flat = np.concatenate(parts)
     assert len(flat) == len(set(flat.tolist())) == 50 * len(parts)
     assert set(flat.tolist()) <= set(pool.tolist())
-    pair, _ = nf.draw_disjoint_pair(rng, pool, np.asarray([str(i % 30) for i in pool]), 50, 20)
+    # clusters is indexed by window id, so it spans every id in the pool
+    clusters = np.asarray([str(i % 30) for i in range(int(pool.max()) + 1)])
+    pair, _ = nf.draw_disjoint_pair(rng, pool, clusters, 50, 20)
     assert not set(pair[0].tolist()) & set(pair[1].tolist())
 
 
