@@ -19,7 +19,8 @@ import sys
 import tomllib
 from pathlib import Path
 
-import lanedlib
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # `python -P` drops the script dir
+import lanedlib  # noqa: E402
 
 TABLES = ("lane_d", "lane_d_ops")
 READ_METHODS = frozenset(("get", "pop", "setdefault"))

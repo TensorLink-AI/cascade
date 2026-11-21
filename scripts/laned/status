@@ -14,20 +14,32 @@ Writes DIR/docs/plans/STATUS.md and DIR/status/laned_build.json. With
 --push REMOTE it commits them (plus any --include files) to branch
 laned/build-state on REMOTE, fast-forward only; main is never touched.
 Without --release-tag-glob no tag counts as a capability release (no L6).
+
+L4 (external WPs) and an execution-stage gate need the evidence blob at REF to
+have been verified by a green push/accept run (`accept <WP> --evidence F`,
+which exports LANED_EVIDENCE=F to the WP's own tests). Invariant coverage
+(§17.3) counts only test functions found by AST in
+tests/accept/<wp>/**/test_*.py.
+
+    status selftest     # offline check of both rules above
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
+import posixpath
 import re
+import subprocess
 import sys
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
-import lanedlib
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # `python -P` drops the script dir
+import lanedlib  # noqa: E402
 
 PLAN = "docs/plans/LANE_D_PLAN.md"
 BUILD_STATE = "laned/build-state"
@@ -87,6 +99,85 @@ class RefTree:
             else:
                 self._cache[path] = None
         return self._cache[path]
+
+    def blob(self, path: str, commit: str | None = None) -> str | None:
+        """Blob sha of ``path`` at ``commit`` (default REF), None when absent."""
+        commit = commit or self.commit
+        if commit == self.commit and path not in self.files:
+            return None
+        if not re.fullmatch(r"[0-9a-f]{7,64}", commit):
+            return None
+        proc = lanedlib.git(self.root, "rev-parse", "-q", "--verify", f"{commit}:{path}", check=False)
+        return proc.stdout.strip() if proc.returncode == 0 else None
+
+
+def evidence_path(info: dict, wp: str) -> str:
+    """The WP's evidence file: ``--evidence <file>`` in its Accept cell, else evidence/<wp>.json."""
+    return info["evidence"] or f"evidence/{lanedlib.wp_dir(wp)}.json"
+
+
+def run_verified_blob(tree: RefTree, run: dict, path: str, blob: str | None) -> tuple[bool, str]:
+    """Did the green ``run`` verify ``path`` with content ``blob``?
+
+    The push-to-main job runs ``accept <WP> --evidence <file>`` whenever the
+    evidence file exists at the pushed commit and records the file's blob sha
+    as ``evidence_sha``. A run that records ``evidence_sha`` verified exactly
+    that blob. A ledger entry without the field (fixtures; runs from before
+    the field existed) counts only when the file had the same blob at the
+    run's own commit, i.e. that push job ran with ``--evidence`` on it.
+    """
+    if blob is None:
+        return False, "evidence file missing"
+    if run.get("conclusion") != "success":
+        return False, "no green verifying run"
+    if "evidence_sha" in run:
+        if run.get("evidence_sha") == blob:
+            return True, f"ok (verified by the run at {str(run.get('head_sha'))[:12]})"
+        return False, (f"the latest green run verified {str(run.get('evidence_sha'))[:12]}, "
+                       f"not the current blob {blob[:12]}")
+    at_run = tree.blob(path, str(run.get("head_sha", "")))
+    if at_run == blob:
+        return True, f"ok (verified by the run at {str(run.get('head_sha'))[:12]})"
+    return False, f"no green run verified the current blob {blob[:12]}"
+
+
+INV_NAME = re.compile(r"^test_inv(\d+)_")
+
+
+def collected_tests(source: str) -> list[str]:
+    """Names of the test functions pytest collects from a test module, by AST.
+
+    Module-level ``def``s and methods of module-level ``Test*`` classes only.
+    String literals, nested functions and anything else never count (RV1).
+    """
+    try:
+        mod = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return []
+    names: list[str] = []
+    for node in mod.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            names.append(node.name)
+        elif isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
+            names.extend(n.name for n in node.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)))
+    return names
+
+
+def is_test_module(path: str) -> bool:
+    return path.endswith(".py") and posixpath.basename(path).startswith("test_")
+
+
+def invariants_in(sources: dict[str, str]) -> set[int]:
+    """§17.3: invariants n with a real ``test_inv<n>_*`` test in a test_*.py module."""
+    found: set[int] = set()
+    for path, text in sources.items():
+        if not is_test_module(path):
+            continue
+        for name in collected_tests(text):
+            m = INV_NAME.match(name)
+            if m and 1 <= int(m.group(1)) <= N_INVARIANTS:
+                found.add(int(m.group(1)))
+    return found
 
 
 def parse_plan(text: str) -> dict:
@@ -216,12 +307,19 @@ class Board:
                 return i
         return None
 
-    def evidence_ok(self, wp: str) -> tuple[bool, str]:
+    def evidence_ok(self, wp: str, run: dict) -> tuple[bool, str]:
+        """L4 for an external WP: the evidence file at REF passes the field check
+        **and** ``run`` (the green push/accept run that gave L3) verified that
+        exact blob, i.e. the WP's own tests ran against it via ``--evidence``
+        (``LANED_EVIDENCE``). Field presence alone never gives L4 (RV1)."""
         info = self.plan["wps"][wp]
         if not info["external"]:
             return True, "ci-only"
-        path = info["evidence"] or f"evidence/{lanedlib.wp_dir(wp)}.json"
+        path = evidence_path(info, wp)
         ok, why = lanedlib.check_evidence(self.tree.show(path), path, wp)
+        if not ok:
+            return False, f"{path}: {why}"
+        ok, why = run_verified_blob(self.tree, run, path, self.tree.blob(path))
         return ok, f"{path}: {why}"
 
     def reviewed(self, wp: str) -> str | None:
@@ -289,8 +387,9 @@ class Board:
         det["last_main_run"] = {"head_sha": last["head_sha"], "conclusion": last.get("conclusion")}
         if last.get("conclusion") != "success":
             return 2
-        ok, why = self.evidence_ok(wp)
+        ok, why = self.evidence_ok(wp, last)
         det["evidence"] = why
+        det["evidence_verified"] = ok
         if not ok:
             return 3
         review = self.reviewed(wp)
@@ -298,6 +397,9 @@ class Board:
         if review is None:
             # §17.1: L4 is "n/a" for ci-only WPs. They pass it automatically on
             # the way up, but never stop at it: their level is L3 until L5.
+            # (RV1 item 3 asks for L4 here; the W0c fixture test pins an
+            # accepted, unreviewed ci-only WP at L3, so this stays until the
+            # tests change.)
             return 4 if self.plan["wps"][wp]["external"] else 3
         tag = self.released(l2_sha)
         det["release_tag"] = tag
@@ -329,6 +431,27 @@ class Board:
                 if dep != wp and lanedlib.has_token(info["depends"], dep) and self.levels[dep] < 2:
                     return "blocked:dependency"
         return None
+
+
+def gate_ok(tree: RefTree, runs: list[dict], stage: str, path: str) -> tuple[bool, str]:
+    """§17.2 gate file: the --gate check at REF and the latest push ``gate`` run
+    (``accept --gate <stage>`` in the push-to-main job) green on this blob.
+
+    The push-to-main job runs the gate check for every gate file present and
+    records it before the board is computed, so on main the run always exists.
+    A ledger with no gate run at all for the stage (fixture ledgers, runs from
+    before the gate step existed) falls back to the --gate check alone, and the
+    detail says so.
+    """
+    ok, why = lanedlib.check_gate(tree.show(path), stage)
+    if not ok:
+        return False, why
+    gate_runs = [r for r in runs if r.get("wp") == stage and r.get("mode") == "gate"
+                 and r.get("event") == "push" and r.get("head_sha") in tree.position]
+    if not gate_runs:
+        return True, "ok (--gate check at REF; no gate run recorded)"
+    gate_runs.sort(key=lambda r: (tree.position[r["head_sha"]], r.get("created_at", "")))
+    return run_verified_blob(tree, gate_runs[-1], path, tree.blob(path))
 
 
 def decision_closed(dec: dict) -> bool:
@@ -405,12 +528,16 @@ def compute(tree: RefTree, plan: dict, runs: list[dict], tag_glob: str | None) -
     stages: dict[str, dict] = {}
     for stage in STAGE_ORDER:
         if stage in exec_for:
+            # The execution WP's evidence counts only as verified by its green
+            # push/accept --evidence run (the same rule as L4), never by fields.
             w = exec_for[stage]
-            path = wps[w]["evidence"] or f"evidence/{lanedlib.wp_dir(w)}.json"
-            g_ok, g_why = lanedlib.check_evidence(tree.show(path), path, w)
+            path = evidence_path(wps[w], w)
+            det = board.detail.get(w, {})
+            g_ok = bool(det.get("evidence_verified"))
+            g_why = det.get("evidence") or f"{w} has no green push/accept run (below L3)"
         else:
             path = lanedlib.gate_path(stage)
-            g_ok, g_why = lanedlib.check_gate(tree.show(path), stage)
+            g_ok, g_why = gate_ok(tree, board.runs, stage, path)
         checks = [{"check": why, "passed": ok} for ok, why in reqs[stage]]
         if stage == "SB4":
             checks.append({"check": "S5 complete (shared release)",
@@ -433,11 +560,8 @@ def compute(tree: RefTree, plan: dict, runs: list[dict], tag_glob: str | None) -
         if levels[wp] < 3:
             continue
         prefix = f"tests/accept/{lanedlib.wp_dir(wp)}/"
-        for path in sorted(tree.files):
-            if path.startswith(prefix) and path.endswith(".py"):
-                for n in re.findall(r"def\s+test_inv(\d+)_", tree.show(path) or ""):
-                    if 1 <= int(n) <= N_INVARIANTS:
-                        covered.add(int(n))
+        covered |= invariants_in({p: tree.show(p) or "" for p in sorted(tree.files)
+                                  if p.startswith(prefix) and is_test_module(p)})
 
     orphans = []
     for t in t_total:
@@ -464,6 +588,7 @@ def compute(tree: RefTree, plan: dict, runs: list[dict], tag_glob: str | None) -
         "generated_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "wps": {wp: {"level": lvl(levels[wp]), "side_state": sides[wp],
                      "runs_in": wps[wp]["runs_in"], "external": wps[wp]["external"],
+                     "evidence_file": evidence_path(wps[wp], wp) if wps[wp]["external"] else None,
                      "group": wps[wp]["group"], **board.detail.get(wp, {})} for wp in wps},
         "stages": stages,
         "milestones": milestones,
@@ -561,7 +686,152 @@ def push(root: Path, remote: str, files: dict[str, Path], ref_commit: str) -> st
     return commit
 
 
+# ---------------------------------------------------------------------------
+# selftest (offline; RV1 blocking items)
+# ---------------------------------------------------------------------------
+
+SELFTEST_PLAN = """# selftest plan
+
+## 3. Implementation
+
+| WP | What | Depends | Runs in | Accept |
+|---|---|---|---|---|
+| X1 | External probe | — | owner | `scripts/laned/accept X1 --evidence evidence/x1.json` |
+| C1 | ci-only tool | — | ci | `scripts/laned/accept C1` |
+"""
+
+# X1's own verifier: the evidence must carry a request id (a field the bare
+# {"wp", "passed"} shape lacks).
+SELFTEST_VERIFIER = """import json, os
+
+def test_inv2_evidence_has_request_id():
+    path = os.environ.get("LANED_EVIDENCE")
+    assert path, "accept did not export LANED_EVIDENCE"
+    data = json.load(open(path))
+    assert isinstance(data.get("request_id"), str) and data["request_id"]
+"""
+
+SELFTEST_HELPER = '''PLANTED = "def test_inv9_share_zero():\\n    assert True\\n"
+FIXTURE = """
+def test_inv1_unarmed():
+    assert True
+"""
+
+def test_inv4_in_a_helper_module():
+    pass
+'''
+
+
+def cmd_selftest() -> int:
+    failures: list[str] = []
+
+    def expect(cond: bool, what: str) -> None:
+        if not cond:
+            failures.append(what)
+
+    # (1) the invariant counter counts AST test defs in test_*.py only.
+    got = invariants_in({
+        "tests/accept/x1/helpers.py": SELFTEST_HELPER,
+        "tests/accept/x1/test_strings.py": ("S = 'def test_inv9_x(): pass'\n"
+                                            "T = '''\ndef test_inv1_unarmed():\n    assert True\n'''\n"),
+        "tests/accept/x1/test_real.py": ("def test_inv10_pairing():\n    assert 1\n"
+                                         "class TestX:\n    def test_inv11_method(self):\n        assert 1\n"
+                                         "def outer():\n    def test_inv12_nested():\n        pass\n"),
+    })
+    expect(9 not in got, "a planted 'def test_inv9_' string literal counted as invariant 9")
+    expect(1 not in got, "a 'def test_inv1_' string in a fixture counted as invariant 1")
+    expect(4 not in got, "a test_inv4_ def in a non-test (helper) module counted")
+    expect(12 not in got, "a nested test_inv12_ function counted")
+    expect(got == {10, 11}, f"invariants {sorted(got)}, want [10, 11]")
+
+    accept = Path(__file__).resolve().parent / "accept"
+    with tempfile.TemporaryDirectory(prefix="laned-status-selftest-") as tmp:
+        root = Path(tmp) / "repo"
+        root.mkdir()
+        ident = ("-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false")
+
+        def put(rel: str, text: str) -> None:
+            (root / rel).parent.mkdir(parents=True, exist_ok=True)
+            (root / rel).write_text(text)
+
+        def commit(msg: str) -> str:
+            lanedlib.git(root, "add", "-A")
+            lanedlib.git(root, *ident, "commit", "-q", "-m", msg)
+            return lanedlib.git(root, "rev-parse", "HEAD").stdout.strip()
+
+        lanedlib.git(root, "init", "-q")
+        put(PLAN, SELFTEST_PLAN)
+        commit("plan")
+        put("tests/accept/x1/PATHS", "x1/\n")
+        put("tests/accept/x1/test_x1.py", SELFTEST_VERIFIER)
+        put("tests/accept/c1/PATHS", "c1/\n")
+        put("tests/accept/c1/test_c1.py", "def test_c1():\n    assert True\n")
+        commit("tests")
+        put("x1/probe.py", "VALUE = 1\n")
+        commit("x1 impl")
+        put("c1/tool.py", "VALUE = 1\n")
+        impl = commit("c1 impl")
+
+        env = dict(os.environ, LANED_PYTEST_CMD=f"{sys.executable} -m pytest -p no:cacheprovider")
+
+        def run_accept(ev: str) -> bool:
+            proc = subprocess.run([sys.executable, str(accept), "X1", "--evidence", ev, "--root", str(root)],
+                                  capture_output=True, text=True, env=env)
+            return proc.returncode == 0
+
+        def level(runs: list[dict], wp: str) -> tuple[str, dict]:
+            tree = RefTree(root, "HEAD")
+            data = compute(tree, parse_plan(tree.show(PLAN) or ""), runs, None)
+            return data["wps"][wp]["level"], data
+
+        def run(sha: str, wp: str, ok: bool, **extra: str) -> dict:
+            return {"workflow": "laned-accept", "event": "push", "mode": "accept", "wp": wp,
+                    "head_sha": sha, "conclusion": "success" if ok else "failure",
+                    "created_at": "2026-01-01T00:00:00Z", **extra}
+
+        xf = [{"workflow": "laned-accept", "event": "pull_request", "mode": "expect-fail", "wp": w,
+               "head_sha": impl, "conclusion": "success"} for w in ("X1", "C1")]
+
+        # (2) a bare {"wp", "passed": true} fails X1's own verifier, so the push
+        # run is red and X1 never reaches L4.
+        put("evidence/x1.json", json.dumps({"wp": "X1", "passed": True}))
+        bare = commit("bare evidence")
+        bare_blob = lanedlib.git(root, "rev-parse", f"{bare}:evidence/x1.json").stdout.strip()
+        ok = run_accept("evidence/x1.json")
+        expect(not ok, "accept X1 --evidence passed on a bare {wp, passed} file")
+        lv, _ = level(xf + [run(bare, "X1", ok, evidence_sha=bare_blob)], "X1")
+        expect(lv != "L4", f"bare evidence reached {lv}")
+        # ... and a green run that never saw the evidence does not give L4 either.
+        lv, _ = level(xf + [run(bare, "X1", True, evidence_sha="0" * 40)], "X1")
+        expect(lv == "L3", f"a run that verified another blob gave {lv}, want L3")
+
+        # Full evidence passes the verifier; L4 follows only from that green run.
+        put("evidence/x1.json", json.dumps({"wp": "X1", "passed": True, "request_id": "req-1"}))
+        full = commit("full evidence")
+        full_blob = lanedlib.git(root, "rev-parse", f"{full}:evidence/x1.json").stdout.strip()
+        ok = run_accept("evidence/x1.json")
+        expect(ok, "accept X1 --evidence failed on evidence its verifier accepts")
+        lv, data = level(xf + [run(full, "X1", ok, evidence_sha=full_blob), run(full, "C1", True)], "X1")
+        expect(lv == "L4", f"verified evidence gave {lv}, want L4")
+        expect(data["wps"]["C1"]["evidence_verified"] is True, "ci-only C1 did not pass L4's evidence rule")
+
+        # A later edit to the evidence that no green run verified loses L4.
+        put("evidence/x1.json", json.dumps({"wp": "X1", "passed": True, "request_id": "req-2"}))
+        commit("unverified evidence edit")
+        lv, _ = level(xf + [run(full, "X1", True, evidence_sha=full_blob)], "X1")
+        expect(lv == "L3", f"evidence edited after the verifying run gave {lv}, want L3")
+    for f in failures:
+        print(f"status selftest: FAIL {f}", file=sys.stderr)
+    if failures:
+        return 1
+    print("status selftest: ok")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["selftest"]:
+        return cmd_selftest()
     ap = argparse.ArgumentParser(prog="status", description=__doc__.split("\n\n")[0])
     ap.add_argument("--root", default=".")
     ap.add_argument("--ref", default="origin/main")

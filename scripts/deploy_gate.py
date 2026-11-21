@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""Deploy gate: refuse an unsafe trainer/validator deploy before it happens, and
-verify it after. Read-only — it never restarts, kills or edits anything.
+"""Deploy gate: refuse an unsafe service deploy before it happens, and verify it
+after. Read-only — it never restarts, kills or edits anything.
 
 Built from the 2026-11-16 review of every logged deploy incident that cascaded
 to external validators or miners (restarts with legs in flight, consensus
 changes without an activation block, stale code running after a merge,
 version skew, restarts inside the validator's scoring window):
 
-  deploy_gate.py check  --service trainer|validator --from REV --to REV
-  deploy_gate.py verify --service trainer|validator --release DIR
+  deploy_gate.py check  --service SERVICE --from REV --to REV
+  deploy_gate.py verify --service SERVICE --release DIR
 
-``check`` classifies the diff (blast radius), then applies the timing guards
-for the service being restarted. Exit 0 = GO, 1 = REFUSE (reasons printed),
+SERVICE is trainer, validator, intake-laned (the lane D intake, cascade/lane_d/)
+or eval-host (the private eval pod running cascade/validator/private_worker.py).
+``check`` classifies the diff (blast radius; every tracked path lands in an
+AREA), then applies the timing guards for the service being restarted. Exit 0 = GO, 1 = REFUSE (reasons printed),
 2 = usage/IO error. ``verify`` checks the running process after a restart.
 ``--ack`` names a REFUSE rule the owner explicitly accepted (repeatable); the
 consensus rule can never be acked here — it needs release-then-activate.
@@ -46,17 +48,49 @@ CONSENSUS = (
     r"chain|bench_report|calendar_launch|promotion|settlement_state)\.py$",
     r"^cascade/shared/config/",
 )
-WORKER_IMAGE = (r"^deploy/Dockerfile", r"^cascade/trainer/worker\.py$", r"^cascade/interface/",
-                r"^uv\.lock$", r"^pyproject\.toml$")
+# Code that runs on a rented pod: the static import closure of
+# cascade/trainer/worker.py (module-level and lazy imports, every parent
+# package). worker.py imports trainer.main, so the closure spans these
+# packages; cascade/validator/private_worker.py (the eval host's entry point)
+# reaches the same set. tests/accept/r8 recomputes the closure and fails when
+# a new package enters it. The pod runs the whole baked repo (deploy/Dockerfile
+# COPY . /root/cascade) and worker_code_fingerprint hashes every
+# cascade/**/*.py, so over-covering here is the safe direction.
+ON_POD_CODE = (
+    r"^cascade/__init__\.py$",
+    r"^cascade/(direct|eval|funding|generation|interface|miner|pool|provision|shared|trainer|"
+    r"validator)/.*\.py$",
+)
+WORKER_IMAGE = (r"^deploy/Dockerfile", r"^deploy/entrypoint\.sh$", r"^\.dockerignore$",
+                r"^scripts/check_tls_trust\.py$",       # RUN inside the image build
+                r"^cascade/trainer/worker\.py$", r"^cascade/interface/",
+                r"^uv\.lock$", r"^pyproject\.toml$", *ON_POD_CODE)
+# What the eval host runs: the validator's release (private_worker + its
+# imports) in a `uv sync --frozen` venv, re-synced with every validator deploy.
+EVAL_HOST = (r"^cascade/validator/private_worker\.py$", *ON_POD_CODE,
+             r"^uv\.lock$", r"^pyproject\.toml$", r"^\.python-version$")
 AREAS = {
     "consensus": CONSENSUS,
     "worker_image": WORKER_IMAGE,
+    "eval_host": EVAL_HOST,
     "shared": (r"^cascade/shared/",),
     "trainer": (r"^cascade/(trainer|provision|funding|generation|direct)/",),
     "validator": (r"^cascade/validator/",),
+    "lane_d_intake": (r"^cascade/lane_d/",),            # the intake-laned service
+    "pool": (r"^cascade/pool/",),                        # cascade-pool (eval pool builder)
+    "miner_kit": (r"^cascade/miner/", r"^base_generator/"),
     "website": (r"^cascade/website/",),
-    "chain_toml": (r"^chain(\.[a-z]+)?\.toml$",),
+    "chain_toml": (r"^chain(\.[a-z]+)?\.toml$", r"^decided_votes\.toml$"),
+    "deploy": (r"^deploy/",),
+    "benchmarks": (r"^benchmarks/",),
+    "champions": (r"^champions/",),
+    "ops_tooling": (r"^cascade/laned/", r"^scripts/"),  # owner-run tools, no service
+    "ci": (r"^\.github/",),
 }
+SERVICES = ("trainer", "validator", "intake-laned", "eval-host")
+# Services that serve or depend on the validator's scoring: no restart while a
+# round is being judged (§10.5 S5 — the eval host runs that scoring).
+SCORING_GUARDED = ("validator", "intake-laned", "eval-host")
 # A consensus diff must carry its activation gate (DEC-CA-0045 typed blocks).
 GATE_RE = re.compile(r"^\+.*\b[a-z0-9_]*(from_block|activation_block|_after)\b", re.M)
 
@@ -192,6 +226,19 @@ def gate(*, service: str, areas: dict[str, list[str]], diff_text: str, now: date
     if "shared" in areas:
         v.notes.append("cascade/shared changed: restart BOTH trainer and validator onto it "
                        "(shared-code skew held a deposed king, 2026-10-02)")
+    if service == "validator" and "eval_host" in areas:
+        v.notes.append("the eval-host runs this code (cascade/validator/private_worker.py and its "
+                       "imports, in the release venv): sync the eval host to this release first "
+                       "(order eval host -> validator), then `verify --service eval-host`")
+    if "lane_d_intake" in areas and service != "intake-laned":
+        v.notes.append("cascade/lane_d changed: deploy the intake-laned service as well "
+                       "(`check --service intake-laned`)")
+    if "deploy" in areas:
+        v.notes.append("deploy/ changed: pod bootstrap, systemd units and restart scripts apply "
+                       "only when re-run or reinstalled, not through this restart")
+    if "benchmarks" in areas:
+        v.notes.append("benchmarks/ changed: bench hosts run it as its own project "
+                       "(benchmarks/uv.lock, benchmarks/Dockerfile) — sync them outside a bench sweep")
     if "website" in areas:
         v.notes.append("website changed: republish it (scripts/publish_website.py) for miners")
     if "chain_toml" in areas:
@@ -212,7 +259,7 @@ def gate(*, service: str, areas: dict[str, list[str]], diff_text: str, now: date
                                "still in progress")
         else:
             v.notes.append(f"next settlement in {to_next:.0f} min")
-    if service == "validator":
+    if service in SCORING_GUARDED:
         rid = validator_scoring(validator_lines)
         if rid:
             v.no("scoring", f"validator is still judging round {rid} (wait for its weights set)")
@@ -226,7 +273,49 @@ def gate(*, service: str, areas: dict[str, list[str]], diff_text: str, now: date
 
 # ── verify (after the restart) ───────────────────────────────────────────────
 
-PATTERNS = {"trainer": "cascade-trainer", "validator": "cascade-validator"}
+# Box-side services and the console script their python runs; each logs
+# "<service> up:" to <root>/<service>.log at start. The eval host is a rented pod
+# the validator reaches over ssh per eval, so it has no box process (see
+# verify_eval_host).
+PATTERNS = {"trainer": "cascade-trainer", "validator": "cascade-validator",
+            "intake-laned": "cascade-laned-intake"}
+# ...or the package it may be launched from as ``python -P -m``.
+MODULES = {"intake-laned": "cascade.lane_d"}
+
+# validator.log evidence about the eval host (cascade/validator/eval_offload.py).
+EVAL_HOST_OK = re.compile(r"private eval: (uploaded checkpoint|checkpoint \S+ already on)")
+EVAL_HOST_BAD = re.compile(
+    r"private eval host \S+ (compatibility probe (failed|unreadable)|cannot decode|"
+    r"runs code older)|private eval \S+ failed on |PrivateEvalUnavailable|"
+    r"private evaluation (worker is out of date|transport/worker failed|deadline expired|"
+    r"response)")
+
+
+def verify_eval_host(log: Path, *, since: datetime | None = None) -> list[str]:
+    """The eval host after a sync, judged from the validator's side: since the
+    sync, the validator ran a private eval on it and logged no probe or eval
+    failure. No eval yet means not verified yet (widen --since-minutes or wait
+    for the validator's next private eval)."""
+    lines = [ln for ln in tail(log, 1 << 20) if since is None or (_ts(ln) or since) >= since]
+    bad = [ln for ln in lines if EVAL_HOST_BAD.search(ln)]
+    if bad:
+        return [f"{len(bad)} eval-host failure line(s) in {log.name} since the sync, last: "
+                f"{bad[-1][:240]}"]
+    if not any(EVAL_HOST_OK.search(ln) for ln in lines):
+        return [f"no private eval on the eval host in {log.name} since the sync — not verified yet"]
+    return []
+
+
+def _runs_module(service: str, argv: list[bytes]) -> bool:
+    """``python [-P] -m <pkg>[.mod]`` for a service whose package is in MODULES."""
+    pkg = MODULES.get(service)
+    if not pkg:
+        return False
+    head = argv[1:4]
+    if b"-m" not in head or head.index(b"-m") + 1 >= len(head):
+        return False
+    mod = head[head.index(b"-m") + 1]
+    return mod == pkg.encode() or mod.startswith(pkg.encode() + b".")
 
 
 def _proc_pids(service: str) -> list[int]:
@@ -241,14 +330,16 @@ def _proc_pids(service: str) -> list[int]:
             continue
         # the python interpreter running the console script — never a shell
         # that merely mentions the name (the pgrep -f self-match class)
-        if len(argv) > 1 and argv[0].endswith(b"python") and any(
-                a.endswith(b"/" + needle) for a in argv[1:3]):
+        if len(argv) > 1 and argv[0].endswith(b"python") and (
+                any(a.endswith(b"/" + needle) for a in argv[1:3]) or _runs_module(service, argv)):
             out.append(int(d.name))
     return out
 
 
 def verify(service: str, release: Path, log: Path, *, since: datetime | None = None) -> list[str]:
     problems = []
+    if service == "eval-host":
+        return verify_eval_host(log, since=since)
     pids = _proc_pids(service)
     if len(pids) != 1:
         return [f"expected exactly one {service} process, found {len(pids)}: {pids}"]
@@ -266,7 +357,7 @@ def verify(service: str, release: Path, log: Path, *, since: datetime | None = N
     if ".scope" not in (proc / "cgroup").read_text():
         problems.append("not in a systemd scope (systemd-run --scope ...)")
     lines = tail(log, 1 << 20)
-    marker = "trainer up:" if service == "trainer" else "validator up:"
+    marker = f"{service} up:"
     ups = [ln for ln in lines if marker in ln and (since is None or (_ts(ln) or since) >= since)]
     if not ups:
         problems.append(f"no '{marker}' line in {log.name} since the restart")
@@ -287,7 +378,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("check")
-    c.add_argument("--service", choices=("trainer", "validator"), required=True)
+    c.add_argument("--service", choices=SERVICES, required=True)
     c.add_argument("--from", dest="rev_from", required=True, help="running release's commit")
     c.add_argument("--to", dest="rev_to", required=True, help="commit to deploy")
     c.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[1])
@@ -295,14 +386,17 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("--ack", action="append", default=[],
                    help="a REFUSE rule the owner explicitly accepted (never 'consensus')")
     vp = sub.add_parser("verify")
-    vp.add_argument("--service", choices=("trainer", "validator"), required=True)
-    vp.add_argument("--release", type=Path, required=True)
+    vp.add_argument("--service", choices=SERVICES, required=True)
+    vp.add_argument("--release", type=Path, required=True,
+                    help="the release dir the process must run (eval-host: judged from "
+                         "validator.log instead, the release lives on the pod)")
     vp.add_argument("--root", type=Path, default=Path(os.environ.get("CASCADE_ROOT", "/root/cascade")))
     vp.add_argument("--since-minutes", type=float, default=15)
     a = ap.parse_args(argv)
     now = datetime.now(UTC)
     if a.cmd == "verify":
-        probs = verify(a.service, a.release.resolve(), a.root / f"{a.service}.log",
+        log = a.root / ("validator.log" if a.service == "eval-host" else f"{a.service}.log")
+        probs = verify(a.service, a.release.resolve(), log,
                        since=now - timedelta(minutes=a.since_minutes))
         for p in probs:
             print(f"VERIFY FAIL: {p}")
