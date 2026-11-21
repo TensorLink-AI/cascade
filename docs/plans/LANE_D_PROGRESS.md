@@ -72,6 +72,6 @@ runs stay blocked until each one is answered here.
 | §15 incentive review folded in as [DECIDE] D25–D32 | done | |
 | Lifecycle trace `docs/plans/lane_d_lifecycle.md` | in progress | |
 | rev4 lane B (§12b, WB10–WB21, TB10–TB22, SB track, D35–D42) | done | |
-| DEC-CA-0069 amendment rev4 (on top of PR #482's text) | done | |
+| DEC-CA-0071 amendment rev4 (on top of PR #482's text) | done | |
 | LB6 expert-leg cost measurement | blocked: needs owner | OA8 |
 | PR | todo | |

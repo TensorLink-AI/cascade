@@ -46,8 +46,9 @@ When accepted, this supersedes DEC-CA-0062's recipe design (the trainer-run
 distillation / real-data recipe lane). **DEC-CA-0062 is not marked superseded
 until the owner accepts this record.**
 
-Numbering: DEC-CA-0069 is taken by the proposed lane B suite-targets record
-on the unmerged PR #482, so this is DEC-CA-0070.
+Numbering (rev5): main has DEC-CA-0069 (MarketCast recipe code hooks), so
+this is DEC-CA-0070 and the lane B suite-targets record (PR #482) becomes
+DEC-CA-0071. PR #479 also claims 0069 and needs its own new number.
 
 ## Open decisions ([DECIDE], with defaults)
 
@@ -83,13 +84,13 @@ on the unmerged PR #482, so this is DEC-CA-0070.
 | **D27** | **Withholding from A.** A strong generator may earn more used privately in D than published in A | Accept; monitor how many D kings are far from every published A checkpoint | The D26 royalty, plus keep A's share ≥ D's |
 | **D28** | **Split.** v2 has A 30 / B 25 / C 25 / D 20 when all are armed | v2 split | Reviewer: **A 40 / D 25 / B 20 / C 15**, with D ramping 15 → 25% after ≥ 3 miner crowns pass the gate with the unselected suite not falling. Now (B, C off): A80/D20 is acceptable. Interacts with **D21**: the reviewer prefers returning the unpaid house slot to lane A over burning it |
 | **D29** | **Frequency bias in frozen sets.** Sub-hourly data reaches the floors first, so miners specialise on sub-hourly | v2 freeze rule | Per-frequency-bucket and per-domain window quotas inside a frozen set, equal cluster weights. Freeze when every bucket meets its quota or a max wait passes |
-| **D30** | **TIME isn't truly unselected.** It's in lane A's `require_public` gate and the king check, and DEC-CA-0069 (pending: PR #482) adds `suite:time` as a lane B target, so the house is optimised on it | Keep TIME as the unselected suite | Drop `s-time` from DEC-CA-0069, or choose a sentinel that no lane gates or pays on |
+| **D30** | **TIME isn't truly unselected.** It's in lane A's `require_public` gate and the king check, and DEC-CA-0071 (pending: PR #482) adds `suite:time` as a lane B target, so the house is optimised on it | Keep TIME as the unselected suite | Drop `s-time` from DEC-CA-0071, or choose a sentinel that no lane gates or pays on |
 | **D31** | **Sybil queue griefing.** Cheap coldkeys can fill the 8 judged slots with junk | The A8 caps + registration cost | Round-robin by coldkey; priority by hotkey age or prior non-junk LCB; a cheap pre-screen (small window subset; drop LCB < −x before a full frozen set) |
 | **D32** | **Lane B vs D.** Once D runs it dominates lane B as designed (one D king slot ~11–20% of emission vs ~1.8% per B slot) | Keep B as trainer-run legs | Re-scope B to the §12 expert-delta variant when D arms, with row-level dedup against published D kings' rows |
 
 | D33 | **(rev3)** Cross-lane rotating sentinel (§16) | **Adopt**: one suite per era, drawn from the era-boundary block hash, held out of every gate and target in lanes A, B and D, swept and published for every new king. Alternative: no sentinel (v2: lane A gates all four; lane D holds TIME out) |
 | D34 | **(rev3)** Sentinel ratchet vs the house | **Optional, recommended on**: every lane's candidates must not fall below the current lane A king on the sentinel by more than `sentinel_tau` (0.01), re-scored paired on one host. Off = the sentinel is publish-only, and a regression on it alone is never blocked |
-| D35 | **(rev3)** Sentinel vs DEC-CA-0069 (pending: PR #482) lane B suite targets | While a suite is the sentinel it is **not** a lane B target or guard that era. Entries already declared on it are judged on the remaining suites, or deferred to the next era. Recommended: **defer** (the target stays honest) |
+| D35 | **(rev3)** Sentinel vs DEC-CA-0071 (pending: PR #482) lane B suite targets | While a suite is the sentinel it is **not** a lane B target or guard that era. Entries already declared on it are judged on the remaining suites, or deferred to the next era. Recommended: **defer** (the target stays honest) |
 | D36 | **(rev3)** Lane B at S6c: which variant arms | Expert-delta variant (§12) arms at S6c. Whether trainer-run legs **also** stay on is **D32** (recommended: delta variant only once D runs) |
 | D37 | **(rev3)** Lane B share at arm | The deployed `[lane_b] share = 0.25` (A/B 75/25 while C is off) vs a smaller share given D32's dominance finding; set in the S6c overlay |
 

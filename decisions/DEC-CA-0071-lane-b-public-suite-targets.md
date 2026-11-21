@@ -1,5 +1,5 @@
 ---
-id: DEC-CA-0069
+id: DEC-CA-0071
 type: decision
 title: "Lane B: improve one, regress none — a leg may target a public benchmark suite (GIFT-Eval, BOOM, TIME, FEV) as well as a pool domain or horizon; it wins only by significantly improving that suite while regressing nowhere, including the private cascade pool, a fixed anchor king, and the suite's own other metric"
 status: proposed
