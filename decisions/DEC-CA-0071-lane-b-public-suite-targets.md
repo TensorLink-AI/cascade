@@ -2,14 +2,14 @@
 id: DEC-CA-0071
 type: decision
 title: "Lane B: improve one, regress none — a leg may target a public benchmark suite (GIFT-Eval, BOOM, TIME, FEV) as well as a pool domain or horizon; it wins only by significantly improving that suite while regressing nowhere, including the private cascade pool, a fixed anchor king, and the suite's own other metric"
-status: proposed
+status: accepted
 date: 2026-11-21
 tags: [consensus, lane-b, eval, benchmarks, v2]
 revisit_when: "after the first testnet era with suite targets armed — record suite-target win rate, the per-item gains behind each win, private-pool deltas on suite-target merges, anchor-guard margins over successive merges, and any generator flagged for benchmark contamination"
-relations: {depends_on: [DEC-CA-0050, DEC-CA-0059], relates_to: [DEC-CA-0061, DEC-CA-0063]}
+relations: {depends_on: [DEC-CA-0050, DEC-CA-0059], relates_to: [DEC-CA-0061, DEC-CA-0063, DEC-CA-0070]}
 ---
 
-## Decision (proposed — owner 2026-11-21)
+## Decision (accepted — owner 2026-11-21)
 
 Owner: "what if they only need to improve 1 benchmark and not regress on any
 incl cascade eval" → "lets do for lane B".
@@ -113,6 +113,11 @@ the anchor's cached bench rows, swept once per anchor.
 
 ## Open
 
+These were the open items of PR #482. Amendment rev4 below resolves the
+miner-declared experts (item 1, D40), the static contamination check
+(item 2, D38), the opening gate (item 3, D41) and the 256-expert clamp
+(item 1, D39).
+
 - **Miner-declared experts.** Today expert rows are picked by the trainer with
   ESFT on the king's routing, with the router and bias frozen. A suite target
   has no single affinity slice to select from. The candidates are:
@@ -150,11 +155,13 @@ guard. The audit check `check_lane_b` re-derives both. All of it goes through
 testnet first and then release-then-activate on mainnet (six external
 validators).
 
-## Amendment rev4 (proposed, 2026-11-21)
+## Amendment rev4 (accepted, 2026-11-21)
 
-Status of this amendment: **PROPOSED**. This file carries PR #482's
-unmerged text above unchanged, with this amendment on top. The full design
-is in `docs/plans/LANE_D_PLAN.md` §12b; this section records the decisions.
+Status of this amendment: **ACCEPTED** by the owner on 2026-11-21 (plan §6
+owner answers and the §17.4 register). This file carries PR #482's text
+above, now accepted, with this amendment on top. The full design is in
+`docs/plans/LANE_D_PLAN.md` §12b; this section records the decisions, and
+the §17.4 register is the authority if the two ever differ.
 
 **Owner direction (2026-11-21).** Lane B stays **trainer-run**: miners
 submit a code-only generator and our trainer trains. Miners may also
@@ -164,10 +171,14 @@ suite**, improving it significantly while regressing nowhere.
 1. **Open option (b) is adopted: miner-chosen experts.**
    - The commit declares `declared_rows = {layer: [indices]}`, validated
      against `experts_per_layer = (128, 256, 256, 512, 512, 512, 512)`
-     (`cascade/trainer/pyramid_model.py:42`). Typed refusals:
-     `declared_rows_out_of_range`, `declared_rows_bad_layer`,
+     (`cascade/trainer/pyramid_model.py:42`). Layer keys are MoE
+     ordinals 0–6, not block indices (the MoE blocks are `(1, 2, 3, 5, 6, 7,
+     8)`; ordinal i has `experts_per_layer[i]` experts). The clamp minimum
+     applies only to layers with at least one declared row; zero rows on a
+     layer is allowed, and at least one row in total is required. Typed
+     refusals: `declared_rows_out_of_range`, `declared_rows_bad_layer`,
      `declared_rows_count`.
-   - The per-layer clamp becomes fractional (D39): `min_experts_frac =
+   - The per-layer clamp becomes fractional (D39, decided): `min_experts_frac =
      0.03125`, `max_experts_frac = 0.1484375`. That gives 128 → 4..19,
      256 → 8..38 and 512 → 16..76, replacing the 256-era `min_experts = 8` /
      `max_experts = 38`.
@@ -175,10 +186,10 @@ suite**, improving it significantly while regressing nowhere.
      reveal wins; a deferred claim shows `deferred: rows_held`.
    - ESFT stays the default when nothing is declared, and both modes
      coexist.
-   - **Router rows, [DECIDE] D40:** (a) frozen, today's compact-rows
-     backend (`cascade/trainer/expert_training.py:112-122`), recommended for
-     first arming; or (b) the FlexOlmo unfreeze of the declared rows' router
-     entries and bias, with a `traffic_steal_bound` guard.
+   - **Router rows (D40, decided): (a) frozen**, today's compact-rows
+     backend (`cascade/trainer/expert_training.py:112-122`), for first
+     arming. Option (b), the FlexOlmo unfreeze of the declared rows' router
+     entries and bias with a `traffic_steal_bound` guard, is not adopted.
 2. **The static contamination check is a precondition, not an open item.**
    - `suite_targets` arms only after the check ships **and passes on
      testnet**.
@@ -191,32 +202,62 @@ suite**, improving it significantly while regressing nowhere.
      identity changes.
    - Guard 4 (whole-pool point gain ≥ 0) and the anchor guard stay the
      backstop for procedurally recreated series.
-   - **[DECIDE] D38:** `suite_target_max_repo_mb = 8` (recommended) vs keep
-     `[generator] max_repo_mb = 128` (`chain.toml:47`). DEC-CA-0028 already
-     plans to stop `config.json` carrying bulk data.
-3. **The opening gate is replaced ([DECIDE] D41).**
+   - **D38, decided: (a)** `suite_target_max_repo_mb = 8` for lane B
+     suite-target entries; `[generator] max_repo_mb = 128` (`chain.toml:47`)
+     is unchanged for everyone else. DEC-CA-0028 already plans to stop
+     `config.json` carrying bulk data.
+3. **The opening gate is replaced (D41, decided: (a)).**
    - The routing-saturation co-gate (`routing_overlap` 0.8, `routing_jaccard`
      0.7) **has never been measured on mainnet**. The driver state shows
      `gate_opened_block = 0`, an empty `routing_history` and
      `lineage_tokens = 0`, because lane B is off.
    - The only measurement, the 2026-11-20 probe, found king-vs-init top-8
      overlap of about 1.1/8.
-   - Options: (a) `open_tokens` + a passing lane A king check
-     (**recommended**); (b) `open_tokens` alone; (c) keep the co-gate with
-     re-measured thresholds.
+   - Chosen: (a) `open_tokens` + a passing lane A king check. Not adopted:
+     (b) `open_tokens` alone; (c) keep the co-gate with re-measured
+     thresholds.
    - The new key is `[lane_b] open_rule`, overlay-settable after the
      capability release.
-4. **Sentinel ([DECIDE] D35).**
-   - With the cross-lane rotating sentinel (plan §16), a suite-target entry
-     whose target is the current sentinel **defers** to the next era: typed
+4. **Sentinel (D35, decided).**
+   - With the cross-lane rotating sentinel (plan §16), a sentinel suite is
+     not a lane B target or guard that era: a suite-target entry whose
+     target is the current sentinel **defers** to the next era, typed
      `deferred: sentinel_target`, not charged, bounded by
-     `sentinel_max_defer_eras` (recommended).
-   - The alternative is to exempt lane B's own target from the sentinel.
+     `sentinel_max_defer_eras`.
+   - The alternative, exempting lane B's own target from the sentinel, is
+     not adopted.
 5. **Routing information for miners** (informational only, never consensus):
    per-king per-expert load, dead experts and per-suite context-only routing
    affinity, in a digest-pinned artefact.
-6. **Expert-leg cost (D42)** is measured before deciding a smaller SKU, a
-   shorter leg or operator funding (pod approval pending).
+6. **Expert-leg cost (D42, decided):** lane B has its own GPU list, so
+   cheaper image-qualified GPUs are allowed, each measured first. The miner
+   chooses the leg length, `train_hours`, from 0.5 to 6 h. Steps are fixed at
+   admission and signed. The guard is capped by `[lane_b] max_leg_seconds`.
+   `[training] max_train_seconds` is not changed. The rules (plan §12b.6):
+   - **GPU list.** New `[lane_b] funded_pod_skus`, separate from `[round]`,
+     so adding a cheap GPU for lane B never opens it to lane A legs. A GPU
+     type enters the list only after the pinned image (torch 2.4.1+cu124) is
+     qualified on it, its expert-only step rate and leg overhead are
+     measured, and the leg fits memory without changing micro-batching. The
+     type is recorded on the leg (`gpu_name`), and an audit re-derivation
+     uses the same type.
+   - **Leg length.** The miner sets `train_hours` at funding:
+     `0.5 ≤ train_hours ≤ [lane_b] max_leg_hours`, with `max_leg_hours` = 6.0,
+     in 0.5 h steps.
+   - **D42b, decided: (a) real hours on the chosen GPU.** At admission,
+     `steps = floor(train_hours × 3600 × measured_steps_per_s[gpu])`; the
+     step count is fixed at admission and recorded in the signed leg record.
+     Option (b), reference hours, is not adopted.
+   - **Guard.** `train_hours × [lane_b] guard_factor` (1.25) plus the
+     measured overhead, capped at `[lane_b] max_leg_seconds` (6 h × 1.25 =
+     27,000 s), a new lane B cap. `[training] max_train_seconds` is not
+     changed: it is a contract-digest field and is never edited for this.
+     The lane B leg contract is derived with the lane B cap instead.
+   - **Consensus.** `max_leg_hours`, `max_leg_seconds`, `guard_factor` and
+     the `train_hours` range are consensus. The per-GPU step-rate table is
+     trainer-side operational config: steps are fixed at admission and
+     carried signed, so satellites never need the table.
+   - Operator funding is not adopted.
 
 New `[lane_b]` keys:
 
@@ -233,5 +274,22 @@ New `[lane_b]` keys:
 - `sentinel_max_defer_eras`
 
 Each key: drop-when-default in the digest, overlay-settable via
-`ALLOWED["lane_b"] = None` (`remainder` stays release-only), loader parse,
+`ALLOWED["lane_b"] = None` (`remainder` stays release-only, and so does
+`contamination_hashset`, added to the release-only tuple), loader parse,
 round-trip and mutation tests (plan WB10).
+
+### Decision register
+
+Copied from plan §17.4 (rows D35–D42 and D42b).
+
+| D | Status | Option chosen | Class | Decided |
+|---|---|---|---|---|
+| D35 | decided | A sentinel suite is not a lane B target or guard that era | S | owner (default), 2026-11-21 |
+| D36 | decided | Lane B arms trainer-run | S | rev4 |
+| D37 | decided | `[lane_b] from_block` only once D41's gate is met; full share at that block (D45) | O | owner (default), 2026-11-21 |
+| D38 | decided | (a) 8 MB `suite_target_max_repo_mb` | O | owner (default), 2026-11-21 |
+| D39 | decided | Fractions 0.03125 / 0.1484375 | O | owner (default), 2026-11-21 |
+| D40 | decided | (a) router rows frozen | S | owner (default), 2026-11-21 |
+| D41 | decided | (a) `open_tokens` + a passing lane A king check | S | owner (default), 2026-11-21 |
+| D42 | decided | Cheaper GPUs via `[lane_b] funded_pod_skus`; miner-chosen leg ≤ 6 h | S | owner, 2026-11-21 |
+| D42b | decided | (a) real hours on the chosen GPU | S | owner, 2026-11-21 |
