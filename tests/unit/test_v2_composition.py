@@ -55,8 +55,21 @@ def test_ladder_refusals(raw):
         parse_v2_economics(raw)
 
 
+def _base_lane_c_off():
+    """The release with lane C / MarketCast un-armed: an overlay drawing C from
+    B needs lane B live, which mainnet does not ship."""
+    import copy
+
+    from cascade.shared.config import parse_chain_config
+
+    raw = copy.deepcopy(_base().raw)
+    raw["lane_c"]["from_block"] = 0
+    raw["marketcast"]["from_block"] = 0
+    return parse_chain_config(raw)
+
+
 def test_overlay_sets_lane_shares_and_ladder():
-    base = _base()
+    base = _base_lane_c_off()
     body = {"protocol": "cascade-netconfig/2", "network": {"netuid": 91, "chain": "bittensor:finney"}, "seq": 1, "prev": "", "effective_block": 0,
             "overrides": {"lane_b": {"share": 0.6},
                           "lane_c": {"share": 0.3, "takes_from": "lane_b"},

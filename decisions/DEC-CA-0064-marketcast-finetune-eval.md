@@ -396,9 +396,11 @@ Still open:
    testnet before arming.
 4. **Coverage gate tolerance** (0.05), and whether the 98 % level gates or
    is only reported.
-5. **Generator output fields for covariates:** synthetic samples carry NaN
-   covariates today. A MarketCast field set (target + covariate channels)
-   beside the gated lane-A `accepted_fields` is not built.
+5. **Generator output fields for covariates:** BUILT 2026-11-20 as the
+   recipe's optional `synthetic_channels` (row 0 `"target"`, then past
+   covariates and an optional `"time"` clock for the known rows); without it
+   synthetic samples still carry NaN covariates. No lane-A
+   `accepted_fields` change.
 6. **"Bring your own checkpoint" intake:** not built.
 7. **"cpm":** meaning unclear; ask.
 8. **Unverified research items:**
@@ -1016,3 +1018,125 @@ returns + vol (36 window series vs 9) — measure before arming;
 placeholders. The trainer's fine-tune loss on `ohlcv` level series is in
 raw units (BTC-sized levels dominate a mixed batch); the eval normalises,
 training does not — a recipe concern to revisit. `funding` leak check.
+
+### Addendum 2026-11-16: miner-chosen leg wall and data mix
+
+Owner: "one hour should be up to say 12 hours (they can determine)" and
+"pure synthetic generator or data of those assets if they want".
+
+- **Leg wall.** A recipe may carry `leg_hours` in (0, `[marketcast]
+  max_leg_hours`], default cap 12 (loader ceiling 168). Absent, the leg runs
+  `[lane_c] leg_hours`. `mkt_leg_contract` now sets the leg's
+  `max_train_seconds` to that wall instead of capping it at the throne's
+  (5 h mainnet; testnet's 300 s throne had silently cut MarketCast legs to
+  5 min). The worker's loop stops at the same wall. Windows still start at
+  dispatch, so a longer leg costs the miner pod time, not verdict time.
+- **Data mix.** `[marketcast] max_synthetic_fraction` = 1.0 in both tomls and
+  the code default (was 0.5). At `synthetic_fraction` 1 a recipe may name no
+  assets (`data.assets = {}`); the sampler then trains every weighted suite
+  on generator series alone. `0` (real only) is unchanged.
+- **Risk accepted.** Pure-synthetic training removes the real-data anchor in
+  every batch. The forward-only verdict is unchanged, so a generator tuned to
+  the targets still has to beat the base on future windows. The generator is
+  not told which suite or horizon a batch is for, so a pure-synthetic recipe
+  trains every suite on the same kind of series.
+- Trainer policy and recipe bounds only; the verdict, report and receipt
+  formats are unchanged. `recipe_digest` now covers `leg_hours`.
+
+
+## Addendum 2026-11-19 — scale, grid, balance, guards, baselines, holder pairing, warm-start, inputs (owner)
+
+Owner goal throughout: "a model that is great at predicting the market".
+All shipped INERT (`[marketcast] from_block = 0`); consensus terms, so
+release-then-activate. Report format stays version 3: every new row field
+is omitted when absent (NaN / empty).
+
+**Scale.** `crps_scale = "seasonal_naive"` is the default (was `"level"`):
+each window's CRPS ÷ the seasonal-naive MAE of its context (GIFT-Eval's
+MASE denominator, season one day of bars; lag 1, then the level scale, when
+the context is flat — red-team F3: a flat context still keeps its window).
+The training loss uses the same scale.
+
+**Grid.** A horizon may be `<bar>x<steps>` (`horizon_path`); every shipped
+suite is scored on every timeframe: `1mx60`, `5mx36`, `15mx96`, `1hx48`
+forward-only, `4hx42` and `1dx7` in `gap_horizons`. A week cannot close
+inside the 6-day wait, so gap horizons are cut from the embargo gap
+(`gap_span`: from the first UTC day no recipe can read — `data.end` ≤ the
+submission's date − `embargo_days`, read whole — to `train_time`). Judge
+phase only; the rows' `gap_end` is bound to the trainer's `train_time` by
+validators and the audit. Scorability needs ONE aligned window (was two).
+The calibration slack counts windows, not path steps (steps share an
+origin). Risk accepted: the miner has SEEN the gap (only the leg has not),
+so gap cells test generalisation to unseen-by-training data, not to the
+future; the forward-only cells remain the check against data nobody has
+seen. Recipe code hooks (DEC-CA-0069) must not be able to carry gap data.
+
+**Balance.** The composite is a WEIGHTED geomean (`composite_suite_weights`):
+location 0.30 (returns 0.25 + ohlcv.c), dispersion 0.30 (vol 0.18 + range
+0.12), extremes 0.25 (high 0.075 + low 0.075 + ohlcv.h / .l), activity 0.15
+(liquidity 0.10 + ohlcv.v); ohlcv's 0.20 is its four fields at 0.05. Equal
+suite weights counted price information several times (ohlcv.c ≈ returns,
+ohlcv.h / .l ≈ high / low, ohlcv.v ≈ liquidity).
+
+**Rule: proven better overall, never confidently worse anywhere** (owner
+2026-11-19). The composite LCB ≥ `gain_margin` decides the win. A suite
+(`composite_suite_floor`), a guard (`guard_floor`) or a baseline suite fails
+the entry only when its UCB (same bootstrap, one-sided at `alpha / k`) is
+below −floor; floors 0. The old LCB ≥ −0.02 floor failed models EQUAL to
+the base: measured half-widths (48 windows / cell, 17 time blocks) were
+composite ±0.8 %, mase ±1.8 %, qlike ±7.8 %, tail ±1.5 %, liquidity ±3.2 %,
+set by time blocks, not windows.
+
+**Guards** (`guards = ["mase", "qlike", "tail"]`): second proper losses on
+the same windows, per-window in the signed rows (`mase_b/_f`, …) and
+recomputed by the audit. `mase`: median absolute error ÷ the CRPS scale, all
+suites but returns. `qlike`: QLIKE of the quantile-implied MEAN variance on
+vol. `tail`: 2 × mean pinball at 1 / 5 / 95 / 99 % ÷ the scale, on returns
+and vol. They stop a CRPS win bought by reshaping bands at the cost of the
+median, the variance or the tails. A report without them fails.
+
+**Strong baselines** (`baseline_gate = true`,
+`cascade/eval/marketcast_baselines.py`): `rw_fhs` (random walk, EWMA λ 0.97
+volatility, filtered-historical-simulation innovations; returns and ohlcv
+prices, price paths widening as σ√k) and `seasonal_ar` (per-time-of-day
+median profile + AR(1) on the residual, empirical innovations; vol, range,
+high / low, liquidity, ohlcv volume). Deterministic in each window's
+context; the row's `bl` is recomputed by the audit. The fine-tune's
+composite gain over them needs LCB ≥ 0 and no suite may be confidently
+worse. Measured on the 2026-11-18 e2e windows: base +9.9 % (LCB +5.1 %)
+overall, returns +0.5 % (a tie — returns are near-unpredictable), 1d
+returns −6.4 %, 1d high −10.7 %; the e2e fine-tune was −0.5 % on returns.
+
+**Paired holder test.** The main validator forecasts the slot holder on
+each entry's windows (`holder_record`: rows' `hold`, `holder`, sidecar
+`marketcast/round-<id>/h-*.npy`); `holder_gain` is the composite statistic
+with the holder in the base's place (`mkt.vs_holder`). `TargetWin` carries
+`holder_pointer` / `beats_holder`; `win_beats` decides by the pairing when
+the confirm row was paired against the current holder (beats ⇔ paired LCB ≥
+`gain_margin`, gain > 0), else the recorded-LCB comparison as before. The
+old rule compared LCBs from different weeks.
+
+**Warm-start.** A recipe's optional `init` (a trained pointer) starts the
+leg from an earlier MarketCast checkpoint. The trainer accepts only one IT
+produced (`marketcast_lineage.json`) from a leg dispatched before the
+submission, so a chain never reads the current gap and off-platform models
+cannot enter; the pod verifies sha256, structure and finiteness (operator
+fault on mismatch); `init_pointer` is trainer-stamped into the signed
+record; the audit checks it against earlier signed lane-C manifests. With
+the paired test, improvements compound across rounds.
+
+**Inputs.** New covariates: `cross_eth`, `cross_equity` (SP500),
+`cross_gold`, `cross_fx` (EUR) — returns on the window's own grid;
+`open_interest`, `spread` — sampled live by the recorder
+(`metaAndAssetCtxs` → `ctx.jsonl`, relayed to pods), so history starts at
+recording; `events` — known-future rows from the pinned `event_times`
+calendar (to be filled from the official FOMC / BLS schedules).
+
+**Also.** `bar_relay` (trainer-presigned Hippius links to the bar recording,
+`mkt_bars.json` in `--corpus-dir`; reproducible `data_digest`), feed
+backoff on 429 / 5xx, `micro_batch_tokens` gradient accumulation.
+
+**Open.** Validator GPU cost on the new grid unmeasured; the holder pairing
+and warm-start not yet run on a live pod / validator; thin long-horizon
+cells (1–4 windows per asset per round); no joint / cross-asset (sample
+path) scoring; tiers still placeholders.

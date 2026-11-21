@@ -190,6 +190,8 @@ def test_lane_c(args, cfg):
     from ..shared.marketcast_report import (
         MktEntryRows,
         MktWindowRow,
+        baseline_scores,
+        guard_scores,
         score_windows,
         verdict_from_rows,
     )
@@ -220,7 +222,8 @@ def test_lane_c(args, cfg):
     def predict(covariates):
         result = []
         for w in windows:
-            past, known = window_covariates(heldout, w, covariates, context_length=mc.eval_context_length)
+            past, known = window_covariates(heldout, w, covariates, context_length=mc.eval_context_length,
+                                            event_times=tuple(mc.event_times))
             result.append(forecaster.forecast_quantiles(w.context, w.steps, past_covariates=past, future_covariates=known))
         return result
 
@@ -251,9 +254,12 @@ def test_lane_c(args, cfg):
                          tail_levels=mc.tail_levels,
                          gated=[base_suite(w.suite) in COVERAGE_GATE_SUITES for w in windows],
                          scales=[w.scale for w in windows])
+    gs = guard_scores([w.target for w in windows], base_q, candidate_q, knots=mc.quantile_knots,
+                      guards=[mc.guards_of(w.suite) for w in windows], scales=[w.scale for w in windows])
+    bls = baseline_scores(windows, knots=mc.quantile_knots)
     entry = MktEntryRows(hotkey="local", trained_pointer="local", target=args.target, phase="judge", after=train.end,
-                         windows=tuple(MktWindowRow(wid=w.wid, base=b, ft=f, cov_in=ci, cov_n=cn, tail=tail)
-                                       for w, (b, f, ci, cn, tail) in zip(windows, rows, strict=True)))
+                         windows=tuple(MktWindowRow(wid=w.wid, base=b, ft=f, cov_in=ci, cov_n=cn, tail=tail, **g, bl=x)
+                                       for w, (b, f, ci, cn, tail), g, x in zip(windows, rows, gs, bls, strict=True)))
     verdict = verdict_from_rows(entry, mc, suite=recipe.suite, k=1, seed=f"local:{args.seed}")
     return {"directional_only": True, "target": args.target, "seed": args.seed,
             "base_ref": mc.base_ref, "base_sha256": mc.base_sha256,

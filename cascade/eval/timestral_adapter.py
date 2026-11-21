@@ -229,6 +229,14 @@ def load_pinned_base(base_ref: str, base_sha256: str, *, cache_dir: str | Path |
     """Resolve the pinned base (``<repo>@<40-hex commit>``) to a local
     directory, verify its ``model.safetensors`` against ``base_sha256``
     BEFORE any load, then load it. Returns ``(forecaster, directory)``."""
+    d = resolve_pinned_base(base_ref, base_sha256, cache_dir=cache_dir)
+    return TimestralQuantileForecaster.from_dir(d, device=device), d
+
+
+def resolve_pinned_base(base_ref: str, base_sha256: str, *,
+                        cache_dir: str | Path | None = None) -> Path:
+    """The pinned base's local directory, its weights verified against
+    ``base_sha256`` — nothing loaded (the MarketCast offload uploads it)."""
     from ..shared.config.marketcast import split_base_ref
 
     repo, rev = split_base_ref(base_ref)
@@ -240,7 +248,7 @@ def load_pinned_base(base_ref: str, base_sha256: str, *, cache_dir: str | Path |
 
     d = Path(resolve_checkpoint(repo, revision=rev, cache_dir=cache_dir))
     verify_checkpoint(d / WEIGHTS_FILE, base_sha256)
-    return TimestralQuantileForecaster.from_dir(d, device=device), d
+    return d
 
 
 def batched_forecasts(forecaster, contexts: list[np.ndarray], horizon: int, *,
@@ -546,7 +554,8 @@ __all__ = [
     "TIMESTRAL_LIB_VERSION", "TIMESTRAL_MODULE", "TimestralQuantileForecaster",
     "TimestralUnavailable", "WEIGHTS_FILE", "LoRALinear", "batched_forecasts",
     "check_base_sha256", "export_checkpoint", "forecast_windows", "forward_block",
-    "load_pinned_base", "load_timestral", "merge_lora", "read_meta", "safetensors_all_finite",
+    "load_pinned_base", "load_timestral", "merge_lora", "read_meta", "resolve_pinned_base",
+    "safetensors_all_finite",
     "safetensors_header", "same_structure", "select_trainable", "sha256_file",
     "verify_checkpoint",
 ]

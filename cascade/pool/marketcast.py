@@ -544,8 +544,20 @@ def liquidity_filter(snap: MktSnapshot, mc: MarketCastConfig, cls: str, asset: s
 STALE_CONTEXT_SUITES = ("returns", "alpha", "ohlcv")
 
 
+def gap_span(mc: MarketCastConfig, gap_end: float) -> tuple[float, float]:
+    """``(after, end)`` of the embargo gap before a submission at
+    ``gap_end`` (owner 2026-11-18, ``gap_horizons``): windows start on or
+    after the first UTC day a recipe can never train on — a recipe's
+    ``data.end`` is at most ``embargo_days`` before the submission's UTC
+    date (:func:`cascade.shared.marketcast_recipe.parse_marketcast_recipe`)
+    and the leg reads that end day whole — and end by the submission."""
+    day = float(gap_end) // 86400 * 86400
+    first = day - (int(mc.embargo_days) - 1) * 86400
+    return first - 1.0, float(gap_end)
+
+
 def snapshot_windows(snap: MktSnapshot, mc: MarketCastConfig, suite: str, *,
-                     after: float) -> list[MktWindow]:
+                     after: float, gap_end: float = 0.0) -> list[MktWindow]:
     """Every scorable window of ``suite`` for a submission whose windows
     must start after ``after`` (unix): per configured (class, asset) present
     in the snapshot and per suite horizon, ``windows_per_cell`` forward-only
@@ -554,12 +566,24 @@ def snapshot_windows(snap: MktSnapshot, mc: MarketCastConfig, suite: str, *,
     window's START). Never filtered on the realised target (red-team F3,
     2026-10-20 — the old ``min_target_abs_bp`` floor conditioned the test set
     on the outcome: a lattice forecaster moving mass off zero gained 18.7 %);
-    a zero-scale cell is masked in the verdict instead. Sorted by window id."""
+    a zero-scale cell is masked in the verdict instead. Sorted by window id.
+
+    A ``gap_horizons`` horizon (owner 2026-11-18) is cut from the embargo gap
+    before the submission instead (:func:`gap_span` of ``gap_end``, the
+    trainer's dispatch time) — and not at all when ``gap_end`` is 0 (a
+    confirm: the gap holds no fresh windows)."""
     out: list[MktWindow] = []
     freqs = mc.frequencies_map[suite]
     labels = mc.series_labels(suite) if hasattr(mc, "series_labels") else (suite,)
+    gaps = tuple(getattr(mc, "gap_horizons", ()))
     for h in mc.horizons_map[suite]:
         f, steps = _geometry(freqs, h)
+        if h in gaps:
+            if not gap_end:
+                continue
+            lo, hi = gap_span(mc, gap_end)
+        else:
+            lo, hi = float(after), float(snap.end)
         for cls, asset in mc.suite_assets(suite):
             if asset not in snap.assets(cls):
                 continue
@@ -570,31 +594,34 @@ def snapshot_windows(snap: MktSnapshot, mc: MarketCastConfig, suite: str, *,
                 out.extend(cut_windows(
                     s, cls=cls, asset=asset, suite=lab, horizon=h, freq_minutes=f,
                     steps=steps, t0=snap.bank(cls, asset, lab, f)[1],
-                    context_length=int(mc.eval_context_length), after=float(after),
-                    now=float(snap.end), limit=int(mc.windows_per_cell),
+                    context_length=int(mc.eval_context_length), after=lo,
+                    now=hi, limit=int(mc.windows_per_cell),
                     eligible=liquidity_filter(snap, mc, cls, asset, lab, f),
-                    stale_context=base_suite(lab) in STALE_CONTEXT_SUITES))
+                    stale_context=base_suite(lab) in STALE_CONTEXT_SUITES,
+                    crps_scale=str(getattr(mc, "crps_scale", "seasonal_naive"))))
     return sorted(out, key=lambda w: w.wid)
 
 
 def target_windows(snap: MktSnapshot, mc: MarketCastConfig, name: str, *,
-                   after: float) -> list[MktWindow]:
+                   after: float, gap_end: float = 0.0) -> list[MktWindow]:
     """Every scorable window of the lane-C target ``mkt:<name>``: one
     suite's :func:`snapshot_windows`, or — the composite ``mkt:market``
     (owner 2026-11-10) — every enabled suite's, in window-id order (the row
-    order of the entry's report and quantile sidecar)."""
+    order of the entry's report and quantile sidecar). ``gap_end``: see
+    :func:`snapshot_windows`."""
     suites = mc.suites_of(name) if hasattr(mc, "suites_of") else (name,)
     if len(suites) == 1 and suites[0] == name:
-        return snapshot_windows(snap, mc, name, after=after)
-    out = [w for s in suites for w in snapshot_windows(snap, mc, s, after=after)]
+        return snapshot_windows(snap, mc, name, after=after, gap_end=gap_end)
+    out = [w for s in suites for w in snapshot_windows(snap, mc, s, after=after,
+                                                       gap_end=gap_end)]
     return sorted(out, key=lambda w: w.wid)
 
 
 CROSS_ASSET = ("crypto", "BTC")
 
 
-def window_covariates(snap: MktSnapshot, w: MktWindow, names, *, context_length: int
-                      ) -> tuple[np.ndarray | None, np.ndarray | None]:
+def window_covariates(snap: MktSnapshot, w: MktWindow, names, *, context_length: int,
+                      event_times=()) -> tuple[np.ndarray | None, np.ndarray | None]:
     """The fine-tune's covariate rows for window ``w`` (the order of
     :data:`cascade.eval.marketcast.PAST_COVARIATES` / ``KNOWN_COVARIATES``):
     past rows aligned with ``w.context``, known rows over context + horizon."""
@@ -615,14 +642,31 @@ def window_covariates(snap: MktSnapshot, w: MktWindow, names, *, context_length:
         from ..eval.marketcast import _block_end, funding_bp
 
         fund = _past(funding_bp(_block_end(np.asarray(b["funding"]), f // bm)))
-    cross = None
-    if CROSS_ASSET[1] in snap.assets(CROSS_ASSET[0]):
-        cb, ct0, cbm = snap.bank(*CROSS_ASSET, w.suite, f)
+    from ..eval.marketcast import BP, CROSS_SERIES, _block_end, _lead_nan_diff
+
+    want = set(names)
+    extra: dict = {}
+    for name, (ccls, ca) in CROSS_SERIES.items():
+        # the cross market's returns on the window's OWN block grid (a bank
+        # on another grid — or the asset itself absent — is a NaN row)
+        if name not in want or ca not in snap.assets(ccls):
+            continue
+        cb, ct0, cbm = snap.bank(ccls, ca, w.suite, f)
         if "close" in cb and (ct0, cbm) == (t0, bm):
-            cross = _past(suite_series("returns", cb, f, bar_minutes=cbm))
+            extra[name] = _past(suite_series("returns", cb, f, bar_minutes=cbm))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        if "open_interest" in want and "oi" in b:
+            # owner 2026-11-18: the change of log open interest per block, bp
+            oi = _block_end(np.asarray(b["oi"], dtype=np.float64), f // bm)
+            extra["open_interest"] = _past(BP * _lead_nan_diff(np.log(np.where(oi > 0, oi,
+                                                                              np.nan))))
+        if "spread" in want and "spread" in b:
+            extra["spread"] = _past(_block_end(np.asarray(b["spread"], dtype=np.float64),
+                                               f // bm))
     starts = t0 + 60.0 * f * np.arange(k0, w.index + w.steps)
     return build_covariates(names, block_starts=starts, n_context=n_ctx, volume_series=vol,
-                            funding_series=fund, cross_series=cross)
+                            funding_series=fund, cross_series=extra.pop("cross_asset", None),
+                            series=extra, event_times=event_times)
 
 
 # ── the bucket source (validator side) ───────────────────────────────────────
@@ -665,7 +709,7 @@ class MktSnapshotSource:
 
 
 __all__ = [
-    "CROSS_ASSET", "MKT_SNAPSHOT_VERSION", "STALE_CONTEXT_SUITES", "liquidity_filter", "MktSnapshot", "MktSnapshotSource", "SNAPSHOT_FILE",
+    "CROSS_ASSET", "MKT_SNAPSHOT_VERSION", "gap_span", "STALE_CONTEXT_SUITES", "liquidity_filter", "MktSnapshot", "MktSnapshotSource", "SNAPSHOT_FILE",
     "SnapshotError", "asset_series", "build_snapshot", "canonical_body", "coarse_grid",
     "fetch_class_bars", "fetch_coarse_bars", "needs_coarse",
     "load_snapshot", "sign_snapshot_meta", "snapshot_digest", "snapshot_grid",

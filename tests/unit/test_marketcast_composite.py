@@ -49,17 +49,19 @@ def test_shipped_configs_are_the_composite_launch_set():
     for toml in ("chain.toml", "chain.testnet.toml"):
         cfg = load_chain_config(toml)
         mc = cfg.marketcast
-        assert mc.from_block == 0 and mc.target_suites == ()          # inert
+        # mainnet armed at 9579600 (owner 2026-11-20); testnet inert
+        fb = 9579600 if toml == "chain.toml" else 0
+        assert mc.from_block == fb and mc.target_suites == (("market",) if fb else ())
         assert mc.composite and mc.suites == COMPOSITE_LAUNCH_SUITES
         assert "funding" not in mc.suites
         assert mc.target_names == ("market",) and mc.targets == ("mkt:market",)
         assert cfg.lane_c.targets == ("mkt:market",)
         assert mc.native_intervals == ("5m", "15m")
-        assert mc.native_history_map == {"5m": 21, "15m": 50}
-        assert mc.ohlcv_open_weight == 0.0 and mc.composite_suite_floor == 0.02
+        assert mc.native_history_map == {"5m": 121, "15m": 348}
+        assert mc.ohlcv_open_weight == 0.0 and mc.composite_suite_floor == 0.0
         # every series reads a bank whose history the API depth (or the
         # recorder from arming) covers — no 21-day minute bank
-        assert mc.snapshot_days == 10
+        assert mc.snapshot_days == 30 and mc.eval_context_length == 32768
         assert mc.bank_minutes(5) == 5 and mc.bank_minutes(15) == 15
         assert mc.bank_minutes(60) == mc.bank_minutes(1440) == 60 and mc.bank_minutes(1) == 1
         assert mc.series_labels("ohlcv") == ("ohlcv.h", "ohlcv.l", "ohlcv.c", "ohlcv.v")
@@ -104,7 +106,7 @@ def test_composite_target_grammar_and_recipe():
         "target": "mkt:market",
         "data": {"assets": {"crypto": ["BTC"]}, "class_weights": {"crypto": 1.0},
                  "frequencies": ["1h"], "start": "2026-01-01", "end": "2026-02-01"},
-        "context_length": 512, "horizon_mix": {"1h": 1.0, "15m": 0.5},
+        "context_length": 512, "horizon_mix": {"1hx48": 1.0, "15mx96": 0.5},
         "covariates": [], "augmentations": [],
         "objective": {"suite_weights": {"returns": 1.0, "ohlcv": 1.0}},
         "optimizer": {"lr": 1e-4, "schedule": "cosine", "warmup_fraction": 0.05, "steps": 10,
@@ -327,11 +329,27 @@ def test_native_banks_snapshot_and_composite_windows(tmp_path):
     assert {"returns", "vol", "high", "low", "range", "liquidity", "ohlcv.h", "ohlcv.l",
             "ohlcv.c", "ohlcv.v"} <= labels and "ohlcv.o" not in labels
     lv = [w for w in ws if w.suite == "ohlcv.c"]
-    assert lv and all(w.scale == w.context[np.isfinite(w.context)][-1] for w in lv)
-    assert all(w.scale == 1.0 for w in ws if w.suite == "returns")
+    # every window ÷ its context's seasonal-naive MAE (the default crps_scale)
+    assert lv and all(w.scale == pytest.approx(M.seasonal_naive_scale(w.context, w.freq_minutes))
+                      for w in ws)
+    lw = P.target_windows(snap, replace(mc, crps_scale="level"), "market", after=after)
+    assert all(w.scale == w.context[np.isfinite(w.context)][-1] for w in lw if w.suite == "ohlcv.c")
+    assert all(w.scale == 1.0 for w in lw if w.suite == "returns")
     # a 15m vol window has a long context from the 15m bank, not the 10-day 1m bank
-    v15 = [w for w in ws if w.suite == "vol" and w.horizon == "15m"]
+    v15 = [w for w in ws if w.suite == "vol" and w.horizon == "15mx96"]
     assert v15 and max(w.context.size for w in v15) > 10 * 96
+    # every suite on every timeframe, each horizon a multi-step path (owner 2026-11-18)
+    assert {(w.horizon, w.freq_minutes, w.steps) for w in ws if w.suite == "returns"} >= {
+        ("1mx60", 1, 60), ("5mx36", 5, 36), ("15mx96", 15, 96), ("1hx48", 60, 48)}
+    # no gap_end ⇒ no gap-horizon windows; with one they sit inside the embargo gap
+    assert not any(w.horizon in mc.gap_horizons for w in ws)
+    sub = end - 6 * 86400
+    gw = [w for w in P.target_windows(snap, mc, "market", after=after, gap_end=sub)
+          if w.horizon in mc.gap_horizons]
+    lo, hi = P.gap_span(mc, sub)
+    assert gw and {w.horizon for w in gw} == {"4hx42", "1dx7"}
+    assert all(lo < w.start and w.end <= hi for w in gw)
+    assert lo + 1 == sub // 86400 * 86400 - (mc.embargo_days - 1) * 86400
     # one suite target is that suite's windows alone
     only = P.target_windows(snap, mc, "vol", after=after)
     assert {w.suite for w in only} == {"vol"}

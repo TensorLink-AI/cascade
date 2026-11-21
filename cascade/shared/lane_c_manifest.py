@@ -26,7 +26,10 @@ Each entry names what a validator needs to judge it:
   windows start after ``train_time + start_margin_seconds``, set by the
   trainer, never by the main validator's snapshot anchor). Omitted from the
   signed body when empty, so lane-C manifests without MarketCast entries are
-  byte-identical.
+  byte-identical;
+* ``competition`` — any OTHER competition's entry data (what its trainer
+  half returned; :mod:`cascade.trainer.lane_c_competitions`). Omitted when
+  empty; refused on an ``mkt:`` entry (MarketCast's is ``marketcast``).
 
 ``base_pointer`` (manifest level) is the era king's trained pointer every leg
 fine-tuned from — validators require it to equal the king pointer of the
@@ -40,6 +43,10 @@ report the trainer read (the sha256 of the exact text) or gave up on after
 MarketCast round's rows exactly when, and as, a manifest records it — never
 by a clock. Omitted from the signed body when empty (every manifest without
 MarketCast is byte-identical).
+
+``reports`` (manifest level) is the same arbiter for every OTHER competition
+with a report: ``{kind: {round_id: sha256 | "absent"}}``. Omitted when empty;
+``mkt`` is refused here (MarketCast's is ``mkt_reports``).
 """
 
 from __future__ import annotations
@@ -78,6 +85,7 @@ class LaneCEntry:
     # sha256 over the fetched recipe tree's files (:func:`tree_digest`): the
     # EXACT identity lane-C dedup orders by (DEC-CA-0008 spirit); "" = legacy
     tree_digest: str = ""
+    competition: dict = field(default_factory=dict)   # any other kind's entry data
 
     def __post_init__(self) -> None:
         from .config.lane_c import check_target, is_mkt_target
@@ -89,6 +97,8 @@ class LaneCEntry:
             if not re.fullmatch(r"mkt:[a-z0-9_\-]{1,32}", str(self.target)):
                 raise ValueError(f"malformed MarketCast target: {self.target!r}")
             object.__setattr__(self, "target", str(self.target))
+            if self.competition:
+                raise ValueError("a MarketCast entry carries its data as 'marketcast'")
         else:
             object.__setattr__(self, "target", check_target(self.target))
         if parse_trained_pointer(self.trained_pointer) is None:
@@ -111,6 +121,7 @@ class LaneCManifest:
     version: int = LANE_C_MANIFEST_VERSION
     signature: str = ""
     mkt_reports: dict = field(default_factory=dict)   # DEC-CA-0064: {round_id: sha | "absent"}
+    reports: dict = field(default_factory=dict)   # other kinds: {kind: {round_id: sha | "absent"}}
 
     def __post_init__(self) -> None:
         if parse_trained_pointer(self.base_pointer) is None:
@@ -119,12 +130,20 @@ class LaneCManifest:
         for rid, v in dict(self.mkt_reports or {}).items():
             if not str(rid) or not (v == "absent" or re.fullmatch(r"[0-9a-f]{64}", str(v))):
                 raise ValueError(f"malformed mkt_reports entry {rid!r}: {v!r}")
+        for kind, recs in dict(self.reports or {}).items():
+            if kind == "mkt" or not re.fullmatch(r"[a-z0-9_\-]{1,32}", str(kind)):
+                raise ValueError(f"malformed reports kind {kind!r}")
+            for rid, v in dict(recs or {}).items():
+                if not str(rid) or not (v == "absent" or re.fullmatch(r"[0-9a-f]{64}", str(v))):
+                    raise ValueError(f"malformed reports[{kind}] entry {rid!r}: {v!r}")
 
     def canonical_body(self) -> bytes:
         d = asdict(self)
         d.pop("signature")
         if not d.get("mkt_reports"):
             d.pop("mkt_reports", None)
+        if not d.get("reports"):
+            d.pop("reports", None)
         for e in d["entries"]:
             if not e.get("funded_by"):
                 e.pop("funded_by", None)
@@ -134,6 +153,8 @@ class LaneCManifest:
                 e.pop("marketcast", None)
             if not e.get("tree_digest"):
                 e.pop("tree_digest", None)
+            if not e.get("competition"):
+                e.pop("competition", None)
         return json.dumps(d, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
     def digest(self) -> str:
@@ -166,7 +187,8 @@ def load_lane_c_manifest(text: str) -> LaneCManifest:
                    funded_by=str(e.get("funded_by", "") or ""),
                    public_rows=dict(e.get("public_rows") or {}),
                    marketcast=dict(e.get("marketcast") or {}),
-                   tree_digest=str(e.get("tree_digest", "") or ""))
+                   tree_digest=str(e.get("tree_digest", "") or ""),
+                   competition=dict(e.get("competition") or {}))
         for e in o["entries"])
     return LaneCManifest(round_id=str(o["round_id"]), era_index=int(o["era_index"]),
                          created_block=int(o["created_block"]),
@@ -176,7 +198,9 @@ def load_lane_c_manifest(text: str) -> LaneCManifest:
                          entries=entries, version=int(o["version"]),
                          signature=str(o.get("signature", "") or ""),
                          mkt_reports={str(k): str(v)
-                                      for k, v in dict(o.get("mkt_reports") or {}).items()})
+                                      for k, v in dict(o.get("mkt_reports") or {}).items()},
+                         reports={str(kind): {str(k): str(v) for k, v in dict(recs or {}).items()}
+                                  for kind, recs in dict(o.get("reports") or {}).items()})
 
 
 def sign_lane_c_manifest(m: LaneCManifest, wallet: object) -> LaneCManifest:
@@ -199,12 +223,14 @@ def verify_lane_c_manifest(m: LaneCManifest, trainer_hotkey: str) -> bool:
 # ``metro-v1:ft:<kind>:<value>:hippius:<repo>@<digest>``. Neither the
 # lane-A parser (``metro-v1:gen:``) nor the lane-B parser (``metro-v1:expert:``)
 # accepts it, and vice versa. One commitment per hotkey on chain: a miner in
-# several lanes uses several hotkeys. MarketCast-only lane C (owner
-# 2026-10-20): the only kind is DEC-CA-0064's
-# ``metro-v1:ft:mkt:<suite>:hippius:<ref>``, accepted only for the suites the
-# caller admits (``mkt_suites``; none while MarketCast is off).
+# several lanes uses several hotkeys. DEC-CA-0064's
+# ``metro-v1:ft:mkt:<suite>:hippius:<ref>`` is accepted only for the suites
+# the caller admits (``mkt_suites``; none while MarketCast is off); any other
+# registered forward-only kind by its ``parse_value``.
 _FT_MKT_RE = re.compile(r"^metro-v1:ft:(?P<target>mkt:[a-z0-9_\-]{1,32})"
                         r":hippius:(?P<ref>.+)$")
+_FT_RE = re.compile(r"^metro-v1:ft:(?P<target>[a-z0-9_\-]{1,32}:[a-z0-9_\-.]{1,64})"
+                    r":hippius:(?P<ref>.+)$")
 
 
 def parse_finetune_commit(payload: str, *,
@@ -215,7 +241,10 @@ def parse_finetune_commit(payload: str, *,
     from .hippius import is_hub_ref
 
     text = (payload or "").strip()
-    m = _FT_MKT_RE.match(text) if mkt_suites else None
+    if text.startswith("metro-v1:ft:mkt:"):
+        m = _FT_MKT_RE.match(text) if mkt_suites else None
+    else:
+        m = _FT_RE.match(text)
     if not m:
         return None
     ref = m.group("ref").strip()

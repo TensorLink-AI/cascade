@@ -233,6 +233,7 @@ class _FundedLegMixin:
             raise _FundedOperatorFallback(gen.hotkey)
         corpus = leg_corpus(self, gen, seeds, contract,
                             **({"era_index": era_index} if era_index is not None else {}))
+        corpus = _mkt_corpus(self, role, finetune_recipe, corpus)
         digest = parse_vault_ref(gen.ref)
         def prepare(host):
             staged = self._stage_vault_zip_on(host, digest) if digest else host
@@ -283,7 +284,7 @@ class _FundedLegMixin:
                     self, gen, seeds, e, rc=getattr(e, "returncode", None), text=str(e),
                     stalled_before=bool(prior is not None
                                         and prior.last_error_class == STALL_CLASS),
-                    shards_leg=bool(corpus.get("corpus_files")))
+                    shards_leg=_shards_leg(contract, corpus))
                 if error_class == "infra":
                     error_class = OPERATOR_FAULT_CLASS
             from .faults import record_no_lanes_verdict
@@ -379,6 +380,7 @@ class _FundedLegMixin:
                 report_progress(self, "preparing_data")
             corpus = leg_corpus(self, gen, seeds, contract,
                                 **({"era_index": era_index} if era_index is not None else {}))
+            corpus = _mkt_corpus(self, role, finetune_recipe, corpus)
         except Exception as e:  # noqa: BLE001 — classify like a worker failure
             _record_generation_failure(self, gen, e)
             raise
@@ -616,7 +618,7 @@ class _FundedLegMixin:
                 self, gen, seeds, e, rc=rc, text=text,
                 stalled_before=bool(prior is not None
                                     and prior.last_error_class == STALL_CLASS),
-                shards_leg=bool(corpus.get("corpus_files")))
+                shards_leg=_shards_leg(contract, corpus))
             if not miner_fault and error_class == "infra":
                 # Money safety II: a lost MINER pod is asked of the payer's
                 # own account first — a pod they stopped / cancelled or a
@@ -762,6 +764,22 @@ def _leg_allocated(runner, round_id: str, hotkey: str) -> bool:
         return any(p.instance_id in names for p in runner._load_funded_ledger())
     except Exception:  # noqa: BLE001 — unknown: assume allocated (never strand a live leg)
         return True
+
+
+def _mkt_corpus(runner, role: str, finetune_recipe, corpus: dict) -> dict:
+    """A MarketCast leg's bar-recording relay (``[marketcast] bar_relay``)
+    as its ``corpus_files``; every other leg's corpus unchanged."""
+    if role != "mkt_finetune" or not finetune_recipe or corpus:
+        return corpus
+    from .marketcast_runner import mkt_relay_corpus
+
+    return mkt_relay_corpus(runner.cfg, finetune_recipe)
+
+
+def _shards_leg(contract, corpus: dict) -> bool:
+    """A DEC-CA-0053 shards leg (its corpus made off the pod) — never a
+    MarketCast relay, whose pod may still run the miner's generator."""
+    return getattr(contract, "corpus_mode", "") == "shards" and bool(corpus.get("corpus_files"))
 
 
 def _pre_corpus_money_gates(runner, gen, gpu_choice=None, *, round_id: str = "") -> None:
@@ -913,13 +931,14 @@ def _dispatch_watched(disp, host, *, payer_pod: bool = False, **kw):
         # includes the miner's generator, so it is not proof of a bad host:
         # still unburned, the host is not blamed (money safety II).
         first_step = FIRST_STEP_ABORT in str(e)
-        if not first_step or kw.get("corpus_files"):
+        off_pod = bool(kw.get("corpus_files")) and kw.get("role") != "mkt_finetune"
+        if not first_step or off_pod:
             quarantine_host_ip(str(getattr(host, "host", "") or ""), str(e)[-300:])
         else:
             log.warning("leg %s: first-step deadline with on-pod generation — not proof of a "
                         "bad host; requeued unburned, host not quarantined",
                         str(kw.get("hotkey", ""))[:12])
-        cls = HostHangFault if first_step and kw.get("corpus_files") else _OperatorFault
+        cls = HostHangFault if first_step and off_pod else _OperatorFault
         raise cls(str(e)) from e
 
 

@@ -27,6 +27,7 @@ A/B/C use 50%/25%/25%.
 |---|---|
 | Exploring the research | [agent.md](agent.md), then [llms.txt](llms.txt) |
 | A miner | [Miner guide](docs/MINER.md#quickstart) and [submission interface](docs/INTERFACE.md) |
+| A MarketCast (lane C) miner | [MarketCast miner guide](docs/MARKETCAST.md) |
 | A coding agent | [AGENTS.md](AGENTS.md) and [lane-specific walkthrough](docs/AGENT_MINING.md) |
 | A validator | [Validator guide](docs/VALIDATOR.md); choose satellite, full evaluator or designated main responsibilities |
 | The operator | [Operator runbook](docs/OPERATOR.md) |

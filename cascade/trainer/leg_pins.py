@@ -18,6 +18,9 @@ the pins follow it:
 
 Nothing here runs while ``[v2] train_image_digest_after`` is empty: every pin,
 file and dispatch is byte-identical to the release without it.
+
+A MarketCast leg (:func:`mkt_leg_scope`) with ``[marketcast] pod_image`` set
+rents and code-checks on that image instead — lane A never sees it.
 """
 
 from __future__ import annotations
@@ -74,6 +77,15 @@ def leg_round(runner):
     is ever rented on an unqualified image (and never on the old one for a
     post-switch leg)."""
     cfg = runner.cfg
+    mc = getattr(cfg, "marketcast", None)
+    if getattr(_local(runner), "mkt_leg", False) and getattr(mc, "pod_image", ""):
+        # a MarketCast leg on its own release ([marketcast] pod_image): the SKU
+        # wall table was measured for lane-A training, so its gate stays off
+        from dataclasses import replace
+
+        return replace(cfg.round, funded_pod_image=mc.pod_image,
+                       worker_code_fingerprint=mc.worker_code_fingerprint,
+                       funded_sku_wall_measured_image="")
     if not contract_runs_after(cfg, leg_contract(runner)):
         return cfg.round
     require_after_qualified(cfg, "rent")
@@ -135,6 +147,19 @@ def require_after_qualified(cfg, what: str) -> None:
                   "emergency only, set [v2] image_after_unqualified_override = true",
                   what, str(cfg.v2.train_image_digest_after)[:19], why)
         raise ImageAfterUnqualified(f"after image not qualified ({what}): {why}")
+
+
+@contextlib.contextmanager
+def mkt_leg_scope(runner):
+    """Mark the leg on this thread as a MarketCast leg for :func:`leg_round`
+    (its ``[marketcast] pod_image`` pins, when set)."""
+    loc = runner.__dict__.setdefault("_leg_local_obj", threading.local())
+    saved = getattr(loc, "mkt_leg", False)
+    loc.mkt_leg = True
+    try:
+        yield
+    finally:
+        loc.mkt_leg = saved
 
 
 @contextlib.contextmanager

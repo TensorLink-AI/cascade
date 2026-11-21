@@ -1455,7 +1455,7 @@ leg_funding = "miner"
 # one is MarketCast (DEC-CA-0064, mkt:<suite>); the generic domain: / freq: /
 # horizon: targets on the public-feed pool_c are refused at load (their
 # windows could be scraped and memorised). Lane C has no pool of its own.
-from_block = 0
+from_block = 9579600          # owner 2026-11-20: era boundary ~ Tue 24 Nov 22:23 UTC (Wed 09:23 AEDT)
 share      = 0.25                  # owner-tunable: taken from lane A ⇒ A 50 / B 25 / C 25
 takes_from = "lane_a"
 remainder  = "burn"                # unpaid decay + empty target slots burn
@@ -1612,7 +1612,7 @@ gain_margin     = 0.01
 # source for every class that lists assets. Base, activation and data contract
 # are release-only; listed numeric verdict/payout/liveness controls allow overlays.
 [marketcast]
-from_block         = 0                          # off; an era-boundary block arms it
+from_block         = 9579600                    # owner 2026-11-20: era boundary ~ Tue 24 Nov 22:23 UTC (Wed 09:23 AEDT)
 base_ref           = "mistralai/Timestral-28M@180698bbf5a50dda3516aa6419798437fb03a430"
 base_sha256        = "dfc83c6220937ce5fc6687b35a4df94cd25e28a2cfe6fb92a23dad6301b2015d"  # model.safetensors (HF LFS oid)
 base_arch          = "timestral"
@@ -1634,13 +1634,14 @@ min_clusters       = 8                          # distinct (asset class, time bl
 pool_prefix        = "pool_mkt"
 max_context_length = 32768
 embargo_days       = 30                         # recipe training data ends this long before submission
-max_synthetic_fraction = 0.5                    # miner generator share of the training mix
-eval_context_length = 4096                      # context steps the base and the fine-tune both see
+max_synthetic_fraction = 1.0                    # miner generator share of the training mix (1.0 = pure synthetic allowed)
+max_leg_hours      = 12.0                       # cap on a recipe's own leg_hours (miner-paid wall); no leg_hours = [lane_c] leg_hours
+eval_context_length = 32768                     # owner 2026-11-21: UP TO 32k context steps the base and the fine-tune both see (shorter while the bank's history is shorter)
 windows_per_cell   = 48                         # per (asset, horizon), spread evenly: 2 per 6 h block over 6 days
 start_margin_seconds = 3600                     # windows start >= 1 h after the train block
 verdict_wait_blocks = 43200                     # an entry waits up to 6 days for its windows to close
-snapshot_days      = 10                         # 1m bank: 4096-step 1m context (2.8 d) + the 6-day verdict wait
-coarse_history_days = 180                       # hourly bars for >= 1h series (HL serves ~208 d of 1h)
+snapshot_days      = 30                         # 1m bank: 32768-step 1m context (22.8 d) + the 6-day verdict wait (recorder fills it forward)
+coarse_history_days = 1372                      # hourly bank: 32768 h (1365 d) + the wait; HL serves ~208 d of 1h, the recorder the rest as it accrues
 report_timeout_settlements = 8                  # trainer records a missing report "absent" after this
 max_infra_deferrals = 8                         # main-validator compute failures before an uncharged drop
 cluster_block_hours = 6                         # bootstrap clusters = asset class x 6 h block
@@ -1655,6 +1656,14 @@ coverage_gate_levels = [0.5, 0.8]               # per horizon, class-weighted li
 # quantiles against an oracle base). No filter reads the realised target.
 zero_scale_frac    = 0.001                      # cell masked (recorded) if base mean CRPS <= this x its horizon's median cell
 cell_ratio_cap     = 4.0                        # each cell's ft/base ratio clipped to [1/4, 4]
+crps_scale         = "seasonal_naive"           # per-window CRPS ÷ context seasonal-naive MAE (GIFT-Eval MASE denominator); "level" = old
+bar_relay          = "cascade-eval-pool/marketcast/bars/"   # owner 2026-11-21: the eval pool bucket (pool endpoint + POOL_S3_* creds; publish-mkt-pool.yml mirrors the recorder there); "" = pod fetches the API
+# Owner 2026-11-20: MarketCast legs boot their OWN worker image (trainer-only):
+# lane A / king legs keep [round] funded_pod_image. Both or neither; "" = the
+# fleet's. Re-derive the fingerprint with scripts/worker_code_fingerprint.py on
+# every re-pin, and point the main validator's [provisioner.mkt] image at it.
+pod_image          = "ghcr.io/tensorlink-ai/cascade-worker:worker-v2.1.0-mkt-rc2@sha256:0205f761fde14da71b9a90b4f1ecdc862d657f982accb11450e0ce22c61d2f12"   # built from 6c9cab9 (publish-worker run 44848132705), 2026-11-21
+worker_code_fingerprint = "37484df946cf1de8243e4570fad9ba325f766416f9d5d55dbbbd043ae9ab98ee"   # 303 files; registry walk = local 6c9cab9 source
 tail_levels        = [0.05, 0.95]               # tail gate: hit rate beyond q_l within tail_tolerance of 5 %
 tail_tolerance     = 0.025                      # per horizon AND pooled over horizons
 calibration_z      = 3.0                        # every calibration tolerance >= 3 standard errors (thin classes)
@@ -1663,10 +1672,63 @@ max_open_legs_per_coldkey = 1                   # trainer policy: open MarketCas
 # Owner 2026-11-10 (DEC-CA-0064 addendum): one composite target over every
 # suite, native candle banks (no recording lead time), Garman–Klass vol.
 composite          = true                       # mkt:market = geomean of the suites' gains
-composite_suite_floor = 0.02                    # any suite's gain LCB < -this fails the entry
+composite_suite_floor = 0.0                     # a suite CONFIDENTLY worse than the base (UCB < -this) fails the entry
 ohlcv_open_weight  = 0.0                        # HL perps: open = previous close
+# Owner 2026-11-18: the composite's balance. CRPS is the one score; each of four
+# forecast properties counts once — location (returns + ohlcv.c) 0.30, dispersion
+# (vol + range) 0.30, extremes (high + low + ohlcv.h/l) 0.25, activity
+# (liquidity + ohlcv.v) 0.15 (ohlcv's 0.20 = its 4 scored fields at 0.05).
+composite_suite_weights = { returns = 0.25, vol = 0.18, range = 0.12, high = 0.075, low = 0.075, liquidity = 0.10, ohlcv = 0.20 }
+guards             = ["mase", "qlike", "tail"]  # no-regression vs base: median (MASE), vol variance (QLIKE), 1/5/95/99 % quantile score
+guard_floor        = 0.0                        # a guard CONFIDENTLY worse than the base (UCB < -this) fails the entry
+# Owner 2026-11-18: every suite on every timeframe, each a multi-step PATH
+# (<bar>x<steps>): 1m x 60 (1 h), 5m x 36 (3 h), 15m x 96 (1 d), 1h x 48 (2 d),
+# 4h x 42 and 1d x 7 (7 d). The 7-day paths cannot close inside the 6-day wait,
+# so they are judged on the embargo gap (the days before the submission no
+# training leg reads); the shorter paths stay forward-only.
+gap_horizons       = ["4hx42", "1dx7"]
+baseline_gate      = true                       # must beat random walk + EWMA/FHS and seasonal AR(1): composite LCB >= 0, no suite confidently worse
+# Owner 2026-11-19: the official calendars (federalreserve.gov FOMC calendar — statement 14:00 ET
+# on the meeting's last day, 2027 tentative; bls.gov CPI + Employment Situation, 08:30 ET),
+# converted to UTC with the US DST rule. Extend before 2028.
+event_times        = [
+    "2026-01-09T13:30:00Z", "2026-01-13T13:30:00Z", "2026-01-28T19:00:00Z", "2026-02-11T13:30:00Z",
+    "2026-02-13T13:30:00Z", "2026-03-06T13:30:00Z", "2026-03-11T12:30:00Z", "2026-03-18T18:00:00Z",
+    "2026-04-03T12:30:00Z", "2026-04-10T12:30:00Z", "2026-04-29T18:00:00Z", "2026-05-08T12:30:00Z",
+    "2026-05-12T12:30:00Z", "2026-06-05T12:30:00Z", "2026-06-10T12:30:00Z", "2026-06-17T18:00:00Z",
+    "2026-07-02T12:30:00Z", "2026-07-14T12:30:00Z", "2026-07-29T18:00:00Z", "2026-08-07T12:30:00Z",
+    "2026-08-12T12:30:00Z", "2026-09-04T12:30:00Z", "2026-09-11T12:30:00Z", "2026-09-16T18:00:00Z",
+    "2026-10-02T12:30:00Z", "2026-10-14T12:30:00Z", "2026-10-28T18:00:00Z", "2026-11-06T13:30:00Z",
+    "2026-11-10T13:30:00Z", "2026-12-04T13:30:00Z", "2026-12-09T19:00:00Z", "2026-12-10T13:30:00Z",
+    "2027-01-08T13:30:00Z", "2027-01-13T13:30:00Z", "2027-01-27T19:00:00Z", "2027-02-05T13:30:00Z",
+    "2027-02-11T13:30:00Z", "2027-03-05T13:30:00Z", "2027-03-10T13:30:00Z", "2027-03-17T18:00:00Z",
+    "2027-04-02T12:30:00Z", "2027-04-13T12:30:00Z", "2027-04-28T18:00:00Z", "2027-05-07T12:30:00Z",
+    "2027-05-12T12:30:00Z", "2027-06-04T12:30:00Z", "2027-06-09T18:00:00Z", "2027-06-10T12:30:00Z",
+    "2027-07-02T12:30:00Z", "2027-07-14T12:30:00Z", "2027-07-28T18:00:00Z", "2027-08-06T12:30:00Z",
+    "2027-08-11T12:30:00Z", "2027-09-03T12:30:00Z", "2027-09-14T12:30:00Z", "2027-09-15T18:00:00Z",
+    "2027-10-08T12:30:00Z", "2027-10-14T12:30:00Z", "2027-10-27T18:00:00Z", "2027-11-05T12:30:00Z",
+    "2027-11-10T13:30:00Z", "2027-11-17T19:00:00Z", "2027-12-03T13:30:00Z", "2027-12-10T13:30:00Z",
+]
 native_intervals   = ["5m", "15m"]              # native candle banks (+ 1m bars + 1h coarse)
-native_history_days = { "5m" = 21, "15m" = 50 } # HL keeps ~17 d of 5m, ~52 d of 15m (recorder fills)
+native_history_days = { "5m" = 121, "15m" = 348 } # 32768 steps + the wait; HL keeps ~17 d of 5m, ~52 d of 15m (recorder fills)
+
+[marketcast.frequencies]                        # the bars each suite is forecast on
+ohlcv     = ["1m", "5m", "15m", "1h", "4h", "1d"]
+returns   = ["1m", "5m", "15m", "1h", "4h", "1d"]
+vol       = ["1m", "5m", "15m", "1h", "4h", "1d"]
+high      = ["1m", "5m", "15m", "1h", "4h", "1d"]
+low       = ["1m", "5m", "15m", "1h", "4h", "1d"]
+range     = ["1m", "5m", "15m", "1h", "4h", "1d"]
+liquidity = ["1m", "5m", "15m", "1h", "4h", "1d"]
+
+[marketcast.horizons]                           # <bar>x<steps>: the path each timeframe forecasts
+ohlcv     = ["1mx60", "5mx36", "15mx96", "1hx48", "4hx42", "1dx7"]
+returns   = ["1mx60", "5mx36", "15mx96", "1hx48", "4hx42", "1dx7"]
+vol       = ["1mx60", "5mx36", "15mx96", "1hx48", "4hx42", "1dx7"]
+high      = ["1mx60", "5mx36", "15mx96", "1hx48", "4hx42", "1dx7"]
+low       = ["1mx60", "5mx36", "15mx96", "1hx48", "4hx42", "1dx7"]
+range     = ["1mx60", "5mx36", "15mx96", "1hx48", "4hx42", "1dx7"]
+liquidity = ["1mx60", "5mx36", "15mx96", "1hx48", "4hx42", "1dx7"]
 
 [marketcast.assets]                             # the Hyperliquid-listed universe (2026-10-19)
 crypto      = ["BTC", "ETH", "SOL", "XRP", "HYPE", "BNB", "DOGE", "ADA", "AVAX", "LINK",
