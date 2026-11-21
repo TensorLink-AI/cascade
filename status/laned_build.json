@@ -1,17 +1,24 @@
 {
   "schema": "laned_build/1",
-  "ref": "ccb2988d072db01b970c3f845e77a56a09253a7f",
-  "commit": "ccb2988d072db01b970c3f845e77a56a09253a7f",
-  "generated_at": "2026-11-21T21:49:56Z",
+  "ref": "81eab4a36af1f241476b5a38a8ed2b48c9b689ae",
+  "commit": "81eab4a36af1f241476b5a38a8ed2b48c9b689ae",
+  "generated_at": "2026-11-21T21:53:10Z",
   "wps": {
     "W0c": {
-      "level": "L0",
+      "level": "L3",
       "side_state": null,
       "runs_in": "ci",
       "external": false,
       "group": "build",
       "paths": true,
-      "expect_fail_success": false
+      "expect_fail_success": true,
+      "l2_commit": "36bb8f2b22f041330521cdff64ddb6568308b974",
+      "last_main_run": {
+        "head_sha": "81eab4a36af1f241476b5a38a8ed2b48c9b689ae",
+        "conclusion": "success"
+      },
+      "evidence": "ci-only",
+      "review": null
     },
     "W0": {
       "level": "L3",
@@ -23,7 +30,7 @@
       "expect_fail_success": true,
       "l2_commit": "a15368814c031bafd3bf4b329e7e3867c4ab7aee",
       "last_main_run": {
-        "head_sha": "ccb2988d072db01b970c3f845e77a56a09253a7f",
+        "head_sha": "81eab4a36af1f241476b5a38a8ed2b48c9b689ae",
         "conclusion": "success"
       },
       "evidence": "evidence/w0.json: evidence file missing"
@@ -101,7 +108,7 @@
       "expect_fail_success": true,
       "l2_commit": "3c7803adef8e7c719ad593b35e6ec13d42758c05",
       "last_main_run": {
-        "head_sha": "ccb2988d072db01b970c3f845e77a56a09253a7f",
+        "head_sha": "81eab4a36af1f241476b5a38a8ed2b48c9b689ae",
         "conclusion": "success"
       },
       "evidence": "ci-only",
@@ -235,7 +242,7 @@
     },
     "W2": {
       "level": "L1",
-      "side_state": "blocked:dependency",
+      "side_state": null,
       "runs_in": "ci",
       "external": false,
       "group": "laned_core",
@@ -622,7 +629,7 @@
     },
     "WB10": {
       "level": "L0",
-      "side_state": "blocked:dependency",
+      "side_state": null,
       "runs_in": "ci",
       "external": false,
       "group": "laneb",
@@ -757,7 +764,7 @@
     },
     "W-S1": {
       "level": "L0",
-      "side_state": "blocked:dependency",
+      "side_state": null,
       "runs_in": "ci",
       "external": false,
       "group": "laneb",
@@ -1588,7 +1595,11 @@
       "total": 38
     },
     "invariants": {
-      "covered": [],
+      "covered": [
+        1,
+        9,
+        10
+      ],
       "total": 12
     },
     "orphans": [
@@ -1603,7 +1614,7 @@
     "blocked": [
       {
         "reason": "dependency",
-        "count": 68,
+        "count": 65,
         "wps": [
           "R11",
           "R12",
@@ -1617,7 +1628,6 @@
           "R7m",
           "R7t",
           "R9",
-          "W-S1",
           "W-S2",
           "W-S3",
           "W0b",
@@ -1632,7 +1642,6 @@
           "W17",
           "W18",
           "W19",
-          "W2",
           "W2b",
           "W3",
           "W3b1",
@@ -1662,7 +1671,6 @@
           "W7d",
           "W8",
           "W9",
-          "WB10",
           "WB11",
           "WB13",
           "WB14",
