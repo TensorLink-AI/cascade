@@ -19,6 +19,18 @@ from cascade.shared.atomic import write_text_atomic  # noqa: E402
 from cascade.shared.config import parse_chain_config  # noqa: E402
 
 
+def _sub_in_section(text: str, section: str, field: str, value: str) -> tuple[str, int]:
+    """``text`` with ``field = "<value>"`` set inside ``[section]`` only."""
+    head = re.search(rf"(?m)^\[{re.escape(section)}\]\s*(#.*)?$", text)
+    if head is None:
+        return text, 0
+    nxt = re.search(r"(?m)^\[", text[head.end():])
+    end = head.end() + (nxt.start() if nxt else len(text) - head.end())
+    body, count = re.subn(rf'(?m)^{field}\s*=\s*"[^"\n]*"[^\n]*$',
+                          f'{field} = "{value}"', text[head.end():end])
+    return text[:head.end()] + body + text[end:], count
+
+
 def repinned_config(text: str, image: str, fingerprint: str) -> str:
     if not re.fullmatch(r"[\w./:-]+@sha256:[0-9a-f]{64}", image):
         raise ValueError("worker image must be an immutable registry reference")
@@ -30,15 +42,17 @@ def repinned_config(text: str, image: str, fingerprint: str) -> str:
     if fingerprint != local:
         raise ValueError("published worker source differs from this release; rebuild before repinning")
     digest = image.rsplit("@", 1)[1]
-    for field, value, expected in (
-        ("train_image_digest", digest, 2),
-        ("funded_pod_image", image, 1),
-        ("worker_code_fingerprint", fingerprint, 1),
+    # section-scoped: the fleet pins only ([marketcast] pod_image /
+    # worker_code_fingerprint name MarketCast's own release and are untouched)
+    for section, field, value in (
+        ("training", "train_image_digest", digest),
+        ("v2.training", "train_image_digest", digest),
+        ("round", "funded_pod_image", image),
+        ("round", "worker_code_fingerprint", fingerprint),
     ):
-        text, count = re.subn(rf'(?m)^{field}\s*=\s*"[^"\n]*"[^\n]*$',
-                              f'{field} = "{value}"', text)
-        if count != expected:
-            raise ValueError(f"expected {expected} {field} pin(s), found {count}")
+        text, count = _sub_in_section(text, section, field, value)
+        if count != 1:
+            raise ValueError(f"expected 1 [{section}] {field} pin, found {count}")
     cfg = parse_chain_config(tomllib.loads(text))
     if (cfg.training.train_image_digest != digest
             or cfg.training.v2_contract is None

@@ -71,6 +71,8 @@ def test_its_own_image_wins_over_the_fleet_after_repin(acfg, monkeypatch):  # no
     """A MarketCast leg on its own release never takes the fleet's DEC-CA-0067
     after pins: no contract_block for the image hook, its own pins at rent."""
     monkeypatch.setattr("cascade.trainer.leg_pins.after_image_refusal", lambda cfg: "")
+    acfg = replace(acfg, marketcast=replace(acfg.marketcast, pod_image="",
+                                            worker_code_fingerprint=""))      # the fleet image
     armed = A.apply_image_decoupled_activation(acfg, SW)
     assert mkt_contract_block_kw(armed, SimpleNamespace(start_block=SW)) == {"contract_block": SW}
     own = replace(armed, marketcast=replace(armed.marketcast, pod_image=MKT_REF,
@@ -83,6 +85,9 @@ def test_its_own_image_wins_over_the_fleet_after_repin(acfg, monkeypatch):  # no
             assert leg_round(runner).funded_pod_image == MKT_REF
 
 
-def test_shipped_release_pins_are_well_formed():
-    mc = load_chain_config(REPO / "chain.toml").marketcast
-    assert bool(mc.pod_image) == bool(mc.worker_code_fingerprint)
+def test_shipped_release_pins_its_own_image_apart_from_the_fleet():
+    cfg = load_chain_config(REPO / "chain.toml")
+    mc = cfg.marketcast
+    assert mc.pod_image and len(mc.worker_code_fingerprint) == 64
+    assert mc.pod_image != cfg.round.funded_pod_image
+    assert mc.worker_code_fingerprint != cfg.round.worker_code_fingerprint
