@@ -3351,6 +3351,10 @@ that prefix (the trainer's Hippius S3 pair works).
    the 51 % lock-in lands after it, the overlay applies at the first era
    start after the lock-in, and every changed `*_from_block` in it must then
    still be at or after that block, or the fleet refuses it.
+   Compute these blocks with `cascade-laned blocks --help`, never by hand.
+   It derives era starts, activation and apply blocks from a live-grid JSON,
+   computes each one twice (once with the shared consensus code, once by
+   walking the observed grid), and refuses to answer if the two disagree.
 3. Dry run (the default; signs and writes nothing):
 
    ```bash
