@@ -69,6 +69,16 @@
       "conclusion": "success",
       "created_at": "2026-11-21T21:12:05Z",
       "run_id": 44950233756
+    },
+    {
+      "workflow": "laned-accept",
+      "event": "workflow_dispatch",
+      "mode": "expect-fail",
+      "wp": "R8",
+      "head_sha": "db8acad0391c8391aa91b0837724936a63846ffa",
+      "conclusion": "success",
+      "created_at": "2026-11-21T21:17:57Z",
+      "run_id": 44950755726
     }
   ],
   "harvested_run_ids": [
@@ -87,6 +97,8 @@
     44950578089,
     44950578129,
     44950597182,
-    44950597760
+    44950597760,
+    44950755508,
+    44950755726
   ]
 }

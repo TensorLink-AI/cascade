@@ -1,8 +1,8 @@
 {
   "schema": "laned_build/1",
-  "ref": "db8acad0391c8391aa91b0837724936a63846ffa",
-  "commit": "db8acad0391c8391aa91b0837724936a63846ffa",
-  "generated_at": "2026-11-21T21:18:08Z",
+  "ref": "148b0c298787e2cba1cfc9542de4c854f82c506f",
+  "commit": "148b0c298787e2cba1cfc9542de4c854f82c506f",
+  "generated_at": "2026-11-21T21:20:52Z",
   "wps": {
     "W0c": {
       "level": "L0",
@@ -82,7 +82,7 @@
       "runs_in": "ci (scripts) + owner (execute)",
       "external": true,
       "group": "build",
-      "paths": false,
+      "paths": true,
       "expect_fail_success": false
     },
     "R6": {
@@ -131,13 +131,13 @@
       "expect_fail_success": false
     },
     "R8": {
-      "level": "L0",
+      "level": "L1",
       "side_state": null,
       "runs_in": "\u2014",
       "external": false,
       "group": "build",
       "paths": true,
-      "expect_fail_success": false
+      "expect_fail_success": true
     },
     "R9": {
       "level": "L0",
