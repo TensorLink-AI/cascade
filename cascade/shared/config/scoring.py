@@ -407,6 +407,15 @@ class ScoringConfig:
     # old grid keeps its wall-time tenure across the switch). 0 = off (the
     # two ``*_blocks`` knobs are inert). Must equal the ROLLOVER block.
     tenure_blocks_from_block: int = 0
+    # From this block (CONSENSUS, 0 = off): a king whose ``king_since_block``
+    # was recorded at or after ``tenure_blocks_from_block`` (a post-gate
+    # dethrone/forfeit/demotion, which every validator records identically)
+    # keeps that real crowning block. Before it, the gate's one-time legacy
+    # re-anchor also fired at every NEW king's first settlement (a dethrone
+    # resets ``tenure_anchor_gate``) and imputed the anchor from a counter of
+    # 0, i.e. that settlement's own block: post-gate kings' tenure started one
+    # handled settlement late. Release-then-activate via a netconfig overlay.
+    crowning_anchor_from_block: int = 0
     margin_warmup_blocks: int = 0
     cascade_reign_blocks: int = 0
     # King-resync safety valve in BLOCKS from ``tenure_blocks_from_block``
