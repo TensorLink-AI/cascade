@@ -15,6 +15,21 @@ if one of its files is locked or its archive copy fails, none of its files
 leaves the vault in that run. Re-runs resume: a verified archive copy is never
 written twice.
 
+Fail closed, twice over:
+
+* Lock detection: a version is unlocked only on an explicit
+  ``NoSuchObjectLockConfiguration`` answer or a retention whose
+  ``RetainUntilDate`` has passed. Any other answer (an error, a malformed
+  retention) is ``lock_unknown``: a keep, no archive copy, no delete. A legal
+  hold ``ON`` is ``legal_hold``. Lock-state reads never stop the run.
+* Storage errors: a failed listing, vault read, HEAD, version listing or
+  archive read-back, or any 503 / ``SlowDown`` / ``ServiceUnavailable`` (writes
+  and deletes included), stops the run at once. The failing step gets a
+  ``storage_error`` record, every unprocessed object a ``run_aborted`` keep,
+  the complete action log is written, and only then does ``sweep`` raise
+  :class:`SweepAborted`. Entries are swept one at a time, so a stop leaves
+  every entry either swept whole or untouched in the vault.
+
 A live run needs the owner's standing approval D16, read from the plan's
 §17.4 decision register; ``--dry-run`` needs none and makes no storage write.
 
@@ -33,8 +48,9 @@ The S3 mode takes the vault from ``[lane_d_ops] vault_bucket`` /
 ``HIPPIUS_S3_SECRET_KEY`` (env only, never argv, never logged). The fs mode
 imports no boto3 and opens no connection.
 
-Exit codes: 0 clean, 1 an action failed, 2 refused or usage error.
-Contract: ``tests/accept/w18/README.md``.
+Exit codes: 0 clean; 1 an action failed, or the run stopped on a storage error
+(stdout ``{"error": "storage_failed", "code": ..., "log": <log file>}``); 2
+refused or usage error. Contract: ``tests/accept/w18/README.md``.
 """
 
 from __future__ import annotations
@@ -83,9 +99,18 @@ CHUNK = 8 * 1024 * 1024
 PART_BYTES = 64 * 1024 * 1024            # Hippius: parts <= 512 MiB, <= 10,000 parts
 
 _HEX64 = re.compile(r"[0-9a-f]{64}")
-_NO_LOCK_CODES = frozenset({"NoSuchObjectLockConfiguration", "ObjectLockConfigurationNotFoundError",
-                            "InvalidRequest"})
+# The ONLY answer that means "no retention / no legal hold on this version".
+# Anything else (InvalidRequest, AccessDenied, 5xx, a malformed body) is unknown.
+_NO_LOCK_CODE = "NoSuchObjectLockConfiguration"
+_LOCK_MODES = frozenset({"COMPLIANCE", "GOVERNANCE"})
 _MISSING_CODES = frozenset({"NoSuchKey", "NotFound", "404", "NoSuchVersion"})
+_OUTAGE_CODES = frozenset({"SlowDown", "ServiceUnavailable", "503"})
+
+# lock states (LockState.kind)
+UNLOCKED = "unlocked"
+OBJECT_LOCK = "object_lock"
+LEGAL_HOLD = "legal_hold"
+LOCK_UNKNOWN = "lock_unknown"
 
 
 # ── errors ───────────────────────────────────────────────────────────────────
@@ -109,11 +134,49 @@ class ObjectLocked(Exception):
 
 
 class StoreError(Exception):
-    """A storage call failed; ``code`` is a short, secret-free error code."""
+    """A storage call failed; ``code`` is a short, secret-free error code.
+    A plain ``StoreError`` is a per-object outcome (a non-503 archive write or
+    vault delete failure): it stalls only its entry."""
 
     def __init__(self, code: str):
         super().__init__(code)
         self.code = code
+
+
+class StorageFailure(StoreError):
+    """A storage error that stops the run (README "Storage errors"): any failed
+    listing, read, HEAD or version listing, and any 503-class answer or
+    transport failure on any call."""
+
+
+class SweepAborted(Exception):
+    """A run stopped on a storage error. Raised only AFTER the complete action
+    log (``log``) was written to ``log_path``; ``code`` is the error code."""
+
+    def __init__(self, code: str, log: dict, log_path: Path):
+        super().__init__(f"storage_failed: {code} (action log: {log_path})")
+        self.code = code
+        self.log = log
+        self.log_path = log_path
+
+
+@dataclass(frozen=True)
+class LockState:
+    """A key's lock state over all its versions. ``kind`` is ``unlocked``,
+    ``object_lock`` (``retain_until`` set), ``legal_hold`` or ``lock_unknown``."""
+
+    kind: str
+    retain_until: datetime | None = None
+
+
+def _merge_lock(locked_ru: datetime | None, hold: bool, unknown: bool) -> LockState:
+    if locked_ru is not None:
+        return LockState(OBJECT_LOCK, locked_ru)
+    if hold:
+        return LockState(LEGAL_HOLD)
+    if unknown:
+        return LockState(LOCK_UNKNOWN)
+    return LockState(UNLOCKED)
 
 
 # ── time and JSON ────────────────────────────────────────────────────────────
@@ -192,6 +255,17 @@ def _is_missing(exc: BaseException) -> bool:
         return False
     status = (resp.get("ResponseMetadata") or {}).get("HTTPStatusCode")
     return _client_code(exc) in _MISSING_CODES or status == 404
+
+
+def _is_outage(exc: BaseException) -> bool:
+    """A 503-class answer, or a failure with no S3 answer at all (transport,
+    timeout): both stop the run. Fail closed: an unrecognised failure is an
+    outage, never a per-object outcome."""
+    resp = getattr(exc, "response", None)
+    if not isinstance(resp, dict):
+        return True
+    status = (resp.get("ResponseMetadata") or {}).get("HTTPStatusCode")
+    return status == 503 or _client_code(exc) in _OUTAGE_CODES
 
 
 # ── the policy and the D16 gate ──────────────────────────────────────────────
@@ -421,10 +495,16 @@ class FsStore:
 
     # the store surface
     def list_keys(self) -> list[str]:
+        """Every object key (sorted). A missing root is an empty store; any
+        error walking it is a :class:`StorageFailure`."""
         if not self.root.is_dir():
             return []
+
+        def _walk_error(e: OSError) -> None:
+            raise StorageFailure(_err_code(e))
+
         out = []
-        for dirpath, dirnames, filenames in os.walk(self.root):
+        for dirpath, dirnames, filenames in os.walk(self.root, onerror=_walk_error):
             d = Path(dirpath)
             if d == self.root:
                 dirnames[:] = [n for n in dirnames if n != META_DIR]
@@ -450,7 +530,7 @@ class FsStore:
                         return
                     yield c
         except OSError as e:
-            raise StoreError(_err_code(e)) from None
+            raise StorageFailure(_err_code(e)) from None
 
     def sha256(self, key: str) -> str | None:
         if not self.exists(key):
@@ -460,12 +540,25 @@ class FsStore:
             h.update(c)
         return h.hexdigest()
 
-    def locked_until(self, key: str, now: datetime) -> datetime | None:
-        m = self._read_meta(key)
-        ru = _aware(m.get("retain_until"))
-        if m.get("lock_mode") and ru is not None and ru > now:
-            return ru
-        return None
+    def lock_state(self, key: str, now: datetime) -> LockState:
+        """Unlocked only when the key has no lock record, or its retention has
+        passed; an unreadable or malformed lock record is ``lock_unknown``."""
+        mp = self._meta_path(key)
+        if not mp.exists() and not mp.is_symlink():
+            return LockState(UNLOCKED)
+        try:
+            m = _strict_loads(mp.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, ValueError):
+            return LockState(LOCK_UNKNOWN)
+        if not isinstance(m, dict):
+            return LockState(LOCK_UNKNOWN)
+        mode, raw_ru = m.get("lock_mode"), m.get("retain_until")
+        if mode is None and raw_ru is None:
+            return LockState(UNLOCKED)
+        ru = _aware(raw_ru)
+        if mode not in _LOCK_MODES or ru is None:
+            return LockState(LOCK_UNKNOWN)
+        return LockState(OBJECT_LOCK, ru) if ru > now else LockState(UNLOCKED)
 
     def archived_at(self, key: str) -> datetime | None:
         return _aware(self._read_meta(key).get("archived_at"))
@@ -496,10 +589,13 @@ class FsStore:
             d = d.parent
 
     def delete(self, key: str, *, now: datetime) -> None:
-        """Remove the object; ``ObjectLocked`` while ``retain_until > now``."""
-        ru = self.locked_until(key, now)
-        if ru is not None:
-            raise ObjectLocked(key, ru)
+        """Remove the object; ``ObjectLocked`` while ``retain_until > now``,
+        and no removal while the lock state is unknown."""
+        st = self.lock_state(key, now)
+        if st.kind == OBJECT_LOCK:
+            raise ObjectLocked(key, st.retain_until)
+        if st.kind != UNLOCKED:
+            raise StoreError(st.kind)
         p = self._path(key)
         try:
             p.unlink(missing_ok=True)
@@ -545,10 +641,15 @@ class S3Store:
         pre = self._base + "/"
         return full[len(pre):] if full.startswith(pre) else None
 
-    def _call(self, op: str, **kw):
+    def _call(self, op: str, *, write: bool = False, **kw):
+        """One client call. A failed read is always a :class:`StorageFailure`;
+        a failed write or delete is one on a 503-class or transport failure,
+        else a per-object :class:`StoreError`."""
         try:
             return getattr(self.client, op)(**kw)
         except Exception as e:  # botocore ClientError and transport errors alike
+            if not write or _is_outage(e):
+                raise StorageFailure(_err_code(e)) from None
             raise StoreError(_err_code(e)) from None
 
     def list_keys(self) -> list[str]:
@@ -563,7 +664,7 @@ class S3Store:
                     if rel:
                         out.append(rel)
         except Exception as e:
-            raise StoreError(_err_code(e)) from None
+            raise StorageFailure(_err_code(e)) from None
         return sorted(set(out))
 
     def _versions(self, key: str) -> list[tuple[str, bool]]:
@@ -580,50 +681,77 @@ class S3Store:
                     if v.get("Key") == full:
                         out.append((v.get("VersionId"), True))
         except Exception as e:
-            raise StoreError(_err_code(e)) from None
+            raise StorageFailure(_err_code(e)) from None
         return out
 
-    def _head(self, key: str, version: str | None = None) -> dict | None:
-        kw = {"Bucket": self.bucket, "Key": self._full(key)}
-        if version is not None:
-            kw["VersionId"] = version
+    def _head(self, key: str) -> dict | None:
+        """HEAD of the current version; None if there is none. Any other
+        failure is a :class:`StorageFailure`."""
         try:
-            return self.client.head_object(**kw)
+            return self.client.head_object(Bucket=self.bucket, Key=self._full(key))
         except Exception as e:
-            if _is_missing(e):
+            if _is_missing(e) and not _is_outage(e):
                 return None
-            raise StoreError(_err_code(e)) from None
+            raise StorageFailure(_err_code(e)) from None
 
     def exists(self, key: str) -> bool:
         return self._head(key) is not None
 
-    def _version_retain_until(self, key: str, version: str) -> datetime | None:
-        full = self._full(key)
+    def _version_retention(self, full: str, version: str, now: datetime) -> LockState:
+        """One version's retention. Unlocked only on NoSuchObjectLockConfiguration
+        or a well-formed retention that has passed; never raises."""
         try:
             r = self.client.get_object_retention(Bucket=self.bucket, Key=full, VersionId=version)
-        except Exception as e:
-            if _client_code(e) in _NO_LOCK_CODES:
-                return None
-            # Retention unreadable: fall back to the version's head (fail closed
-            # if that fails too: StoreError propagates).
-            h = self._head(key, version)
-            if h is None or not h.get("ObjectLockMode"):
-                return None
-            return _aware(h.get("ObjectLockRetainUntilDate"))
-        ret = (r or {}).get("Retention") or {}
-        if not ret.get("Mode"):
-            return None
-        return _aware(ret.get("RetainUntilDate"))
+        except Exception as e:  # any failure to read the lock state: unknown
+            if _client_code(e) == _NO_LOCK_CODE:
+                return LockState(UNLOCKED)
+            return LockState(LOCK_UNKNOWN)
+        ret = r.get("Retention") if isinstance(r, dict) else None
+        if not isinstance(ret, dict) or ret.get("Mode") not in _LOCK_MODES:
+            return LockState(LOCK_UNKNOWN)
+        ru = _aware(ret.get("RetainUntilDate"))
+        if ru is None:
+            return LockState(LOCK_UNKNOWN)
+        return LockState(OBJECT_LOCK, ru) if ru > now else LockState(UNLOCKED)
 
-    def locked_until(self, key: str, now: datetime) -> datetime | None:
-        latest = None
+    def _version_legal_hold(self, full: str, version: str) -> LockState:
+        """One version's legal hold: ``OFF`` or NoSuchObjectLockConfiguration is
+        no hold, ``ON`` is a hold, anything else unknown; never raises."""
+        try:
+            r = self.client.get_object_legal_hold(Bucket=self.bucket, Key=full, VersionId=version)
+        except Exception as e:  # any failure to read the hold: unknown
+            if _client_code(e) == _NO_LOCK_CODE:
+                return LockState(UNLOCKED)
+            return LockState(LOCK_UNKNOWN)
+        hold = r.get("LegalHold") if isinstance(r, dict) else None
+        status = hold.get("Status") if isinstance(hold, dict) else None
+        if status == "OFF":
+            return LockState(UNLOCKED)
+        if status == "ON":
+            return LockState(LEGAL_HOLD)
+        return LockState(LOCK_UNKNOWN)
+
+    def lock_state(self, key: str, now: datetime) -> LockState:
+        """The lock state over every version of ``key`` (retention and legal
+        hold, per VersionId). Listing the versions is a storage read (a
+        failure is a :class:`StorageFailure`); the lock reads never raise."""
+        full = self._full(key)
+        locked_ru: datetime | None = None
+        hold = unknown = False
         for vid, marker in self._versions(key):
-            if marker or vid is None:
+            if marker:
                 continue
-            ru = self._version_retain_until(key, vid)
-            if ru is not None and ru > now and (latest is None or ru > latest):
-                latest = ru
-        return latest
+            if vid is None:
+                unknown = True          # no VersionId: its lock state can't be read
+                continue
+            ret = self._version_retention(full, vid, now)
+            if ret.kind == OBJECT_LOCK and (locked_ru is None or ret.retain_until > locked_ru):
+                locked_ru = ret.retain_until
+            unknown = unknown or ret.kind == LOCK_UNKNOWN
+            lh = self._version_legal_hold(full, vid)
+            hold = hold or lh.kind == LEGAL_HOLD
+            unknown = unknown or lh.kind == LOCK_UNKNOWN
+        return _merge_lock(locked_ru, hold, unknown)
 
     def iter_bytes(self, key: str) -> Iterator[bytes]:
         resp = self._call("get_object", Bucket=self.bucket, Key=self._full(key))
@@ -633,7 +761,7 @@ class S3Store:
                 try:
                     c = body.read(CHUNK)
                 except Exception as e:
-                    raise StoreError(_err_code(e)) from None
+                    raise StorageFailure(_err_code(e)) from None
                 if not c:
                     return
                 yield c
@@ -658,6 +786,8 @@ class S3Store:
         return _aware(meta.get(ARCHIVED_AT_META))
 
     def write_archive(self, key: str, chunks: Iterator[bytes], archived_at: datetime) -> None:
+        """Write the archive copy (owner-only). ``chunks`` is the vault read: its
+        failures propagate as :class:`StorageFailure`."""
         full = self._full(key)
         meta = {ARCHIVED_AT_META: _iso(archived_at)}
         buf = bytearray()
@@ -668,24 +798,24 @@ class S3Store:
                 buf += c
                 while len(buf) >= PART_BYTES:
                     if upload_id is None:
-                        upload_id = self._call("create_multipart_upload", Bucket=self.bucket,
-                                               Key=full, ACL="private",
+                        upload_id = self._call("create_multipart_upload", write=True,
+                                               Bucket=self.bucket, Key=full, ACL="private",
                                                Metadata=meta)["UploadId"]
                     part, buf = bytes(buf[:PART_BYTES]), bytearray(buf[PART_BYTES:])
                     n = len(parts) + 1
-                    r = self._call("upload_part", Bucket=self.bucket, Key=full,
+                    r = self._call("upload_part", write=True, Bucket=self.bucket, Key=full,
                                    UploadId=upload_id, PartNumber=n, Body=part)
                     parts.append({"ETag": r["ETag"], "PartNumber": n})
             if upload_id is None:
-                self._call("put_object", Bucket=self.bucket, Key=full, Body=bytes(buf),
-                           ACL="private", Metadata=meta)
+                self._call("put_object", write=True, Bucket=self.bucket, Key=full,
+                           Body=bytes(buf), ACL="private", Metadata=meta)
                 return
             if buf:
                 n = len(parts) + 1
-                r = self._call("upload_part", Bucket=self.bucket, Key=full,
+                r = self._call("upload_part", write=True, Bucket=self.bucket, Key=full,
                                UploadId=upload_id, PartNumber=n, Body=bytes(buf))
                 parts.append({"ETag": r["ETag"], "PartNumber": n})
-            self._call("complete_multipart_upload", Bucket=self.bucket, Key=full,
+            self._call("complete_multipart_upload", write=True, Bucket=self.bucket, Key=full,
                        UploadId=upload_id, MultipartUpload={"Parts": parts})
             upload_id = None
         finally:
@@ -696,16 +826,21 @@ class S3Store:
                                                        UploadId=upload_id)
 
     def delete(self, key: str, *, now: datetime) -> None:
-        """Delete every version (and delete marker) by VersionId; ObjectLocked
-        (no delete call made) if any version is under unexpired retention."""
-        ru = self.locked_until(key, now)
-        if ru is not None:
-            raise ObjectLocked(key, ru)
+        """Delete every version (and delete marker) by VersionId. Re-checks the
+        lock state first: ``ObjectLocked`` (no delete call made) under unexpired
+        retention, a per-object ``StoreError`` (no delete call made) under a
+        legal hold or an unknown lock state."""
+        st = self.lock_state(key, now)
+        if st.kind == OBJECT_LOCK:
+            raise ObjectLocked(key, st.retain_until)
+        if st.kind != UNLOCKED:
+            raise StoreError(st.kind)
         full = self._full(key)
-        for vid, _marker in self._versions(key):
-            if vid is None:
-                raise StoreError("unversioned_object")
-            self._call("delete_object", Bucket=self.bucket, Key=full, VersionId=vid)
+        versions = self._versions(key)
+        if any(vid is None for vid, _marker in versions):
+            raise StoreError("unversioned_object")
+        for vid, _marker in versions:
+            self._call("delete_object", write=True, Bucket=self.bucket, Key=full, VersionId=vid)
         if self._versions(key):
             raise StoreError("versions_remain")
 
@@ -764,74 +899,86 @@ def _entry_reason(entry: LedgerEntry | None, led: Ledger, policy: SweepPolicy) -
 
 
 class _Run:
+    """One run's state. ``step`` is the (store, key, op) being worked on: a
+    storage error that stops the run is recorded against it (README "Storage
+    errors": ``op`` is ``archive`` for the lock check, vault read, archive
+    write and read-back, ``delete`` for the delete, ``list`` for a listing)."""
+
     def __init__(self, vault, archive, led: Ledger, policy: SweepPolicy, now: datetime,
                  live: bool):
         self.vault, self.archive, self.led = vault, archive, led
         self.policy, self.now, self.live = policy, now, live
         self.actions: list[dict] = []
+        self.step: tuple[str, str, str] = ("vault", "", "list")
 
     def add(self, *a, **kw) -> None:
         self.actions.append(_rec(*a, **kw))
 
+    def _keep_locked(self, store: str, key: str, st: LockState) -> None:
+        if st.kind == OBJECT_LOCK:
+            self.add(store, key, "keep", "kept", OBJECT_LOCK, retain_until=_iso(st.retain_until))
+        else:
+            self.add(store, key, "keep", "kept", st.kind)
+
     # vault phase
-    def _archive_one(self, key: str) -> tuple[bool, str | None]:
-        """Archive ``key`` (live) or plan it (dry-run). Returns (ok, sha256)."""
+    def _archive_one(self, key: str) -> bool:
+        """Archive ``key`` (live) or plan it (dry-run); True once a verified
+        copy is on record. A non-503 write failure or a read-back mismatch is a
+        per-object failure; every other storage error propagates."""
+        self.step = ("vault", key, "archive")
+        src = None
+        if self.archive.exists(key):
+            src = self.vault.sha256(key)
+            if src is not None and self.archive.sha256(key) == src:
+                self.add("vault", key, "archive", "already", None, sha256=src)
+                return True
+        if not self.live:
+            src = src or self.vault.sha256(key)
+            if src is None:
+                self.add("vault", key, "archive", "failed", "archive_copy_failed",
+                         error="vault_object_missing")
+                return False
+            self.add("vault", key, "archive", "planned", None, sha256=src)
+            return True
+        h = hashlib.sha256()
         try:
-            existing = self.archive.exists(key)
-            src = None
-            if existing:
-                src = self.vault.sha256(key)
-                if src is not None and self.archive.sha256(key) == src:
-                    self.add("vault", key, "archive", "already", None, sha256=src)
-                    return True, src
-            if not self.live:
-                src = src or self.vault.sha256(key)
-                if src is None:
-                    raise StoreError("vault_object_missing")
-                self.add("vault", key, "archive", "planned", None, sha256=src)
-                return True, src
-            h = hashlib.sha256()
             self.archive.write_archive(key, _chunks_hashed(self.vault.iter_bytes(key), h),
                                        self.now)
-            src = h.hexdigest()
+        except StorageFailure:
+            raise
         except (StoreError, OSError) as e:
             self.add("vault", key, "archive", "failed", "archive_copy_failed",
                      error=_err_code(e))
-            return False, None
-        try:
-            back = self.archive.sha256(key)
-        except (StoreError, OSError) as e:
-            self.add("vault", key, "archive", "failed", "archive_verify_failed",
-                     error=_err_code(e))
-            return False, None
-        if back != src:
+            return False
+        src = h.hexdigest()
+        if self.archive.sha256(key) != src:
             self.add("vault", key, "archive", "failed", "archive_verify_failed")
-            return False, None
+            return False
         self.add("vault", key, "archive", "done", None, sha256=src)
-        return True, src
+        return True
 
     def sweep_entry(self, keys: list[str]) -> list[str]:
-        """Sweep one due entry whole; returns the vault keys deleted."""
-        locked = {}
+        """Sweep one due entry whole: lock check, archive + verify every file,
+        then delete every file. Returns the vault keys deleted."""
+        states: dict[str, LockState] = {}
         for k in keys:
-            ru = self.vault.locked_until(k, self.now)
-            if ru is not None:
-                locked[k] = ru
-        if locked:
+            self.step = ("vault", k, "archive")
+            states[k] = self.vault.lock_state(k, self.now)
+        if any(st.kind != UNLOCKED for st in states.values()):
             for k in keys:
-                if k in locked:
-                    self.add("vault", k, "keep", "kept", "object_lock",
-                             retain_until=_iso(locked[k]))
+                if states[k].kind != UNLOCKED:
+                    self._keep_locked("vault", k, states[k])
                 else:
                     self.add("vault", k, "keep", "kept", "entry_incomplete")
             return []
-        done = [k for k in keys if self._archive_one(k)[0]]
+        done = [k for k in keys if self._archive_one(k)]
         if len(done) != len(keys):
             for k in done:
                 self.add("vault", k, "keep", "kept", "entry_incomplete")
             return []
         deleted = []
         for k in keys:
+            self.step = ("vault", k, "delete")
             if not self.live:
                 self.add("vault", k, "delete", "planned", None)
                 continue
@@ -841,6 +988,8 @@ class _Run:
                 self.add("vault", k, "delete", "failed", "object_lock",
                          retain_until=_iso(e.retain_until))
                 continue
+            except StorageFailure:
+                raise
             except (StoreError, OSError) as e:
                 self.add("vault", k, "delete", "failed", "delete_failed", error=_err_code(e))
                 continue
@@ -867,6 +1016,7 @@ class _Run:
     def archive_phase(self, archive_keys: list[str], vault_left: set[str]) -> None:
         window = timedelta(days=self.policy.archive_retention_days)
         for k in archive_keys:
+            self.step = ("archive", k, "delete")
             parts = split_key(k)
             if parts is None:
                 self.add("archive", k, "keep", "kept", "unreferenced")
@@ -886,9 +1036,9 @@ class _Run:
             if self.now - at <= window:
                 self.add("archive", k, "keep", "kept", "archive_retention_not_expired")
                 continue
-            ru = self.archive.locked_until(k, self.now)
-            if ru is not None:
-                self.add("archive", k, "keep", "kept", "object_lock", retain_until=_iso(ru))
+            st = self.archive.lock_state(k, self.now)
+            if st.kind != UNLOCKED:
+                self._keep_locked("archive", k, st)
                 continue
             if not self.live:
                 self.add("archive", k, "delete", "planned", None)
@@ -899,6 +1049,8 @@ class _Run:
                 self.add("archive", k, "delete", "failed", "object_lock",
                          retain_until=_iso(e.retain_until))
                 continue
+            except StorageFailure:
+                raise
             except (StoreError, OSError) as e:
                 self.add("archive", k, "delete", "failed", "delete_failed", error=_err_code(e))
                 continue
@@ -916,7 +1068,12 @@ def sweep(*, vault: Any, archive: Any, ledger: Any, policy: SweepPolicy, now: da
     writes it to ``log_dir/vault-sweep-<run_id>.json``.
 
     Refusals (``SweepRefused``, no storage call): ``ledger_invalid``,
-    ``d16_not_decided`` (live only), ``archive_overlaps_vault``."""
+    ``d16_not_decided`` (live only), ``archive_overlaps_vault``.
+
+    A storage error stops the run at once: it is recorded (``storage_error``),
+    every listed object without a record is kept (``run_aborted``), the log is
+    written, and then :class:`SweepAborted` is raised. Any other exception is
+    re-raised after the same log write."""
     started = datetime.now(UTC)
     _check_store(vault, "vault")
     _check_store(archive, "archive")
@@ -933,10 +1090,31 @@ def sweep(*, vault: Any, archive: Any, ledger: Any, policy: SweepPolicy, now: da
         raise SweepRefused("archive_overlaps_vault")
 
     run = _Run(vault, archive, led, policy, now, bool(live))
-    vault_keys = vault.list_keys()
-    archive_keys = archive.list_keys()
-    deleted = run.vault_phase(vault_keys)
-    run.archive_phase(archive_keys, set(vault_keys) - deleted)
+    vault_keys: list[str] = []
+    archive_keys: list[str] = []
+    failure: str | None = None
+    crash: Exception | None = None
+    try:
+        run.step = ("vault", "", "list")
+        vault_keys = vault.list_keys()
+        run.step = ("archive", "", "list")
+        archive_keys = archive.list_keys()
+        deleted = run.vault_phase(vault_keys)
+        run.archive_phase(archive_keys, set(vault_keys) - deleted)
+    except (StoreError, OSError) as e:
+        # Every per-object outcome is handled in the phases: whatever reaches
+        # here is a storage error, and the run stops on it.
+        failure = _err_code(e)
+        store, key, op = run.step
+        run.add(store, key, op, "failed", "storage_error", error=failure)
+    except Exception as e:  # noqa: BLE001 - re-raised below, after the log is on disk
+        crash = e
+    if failure is not None or crash is not None:
+        for store, keys in (("vault", vault_keys), ("archive", archive_keys)):
+            recorded = {a["key"] for a in run.actions if a["store"] == store}
+            for k in keys:
+                if k not in recorded:
+                    run.add(store, k, "keep", "kept", "run_aborted")
 
     log = {
         "schema": LOG_SCHEMA,
@@ -954,7 +1132,12 @@ def sweep(*, vault: Any, archive: Any, ledger: Any, policy: SweepPolicy, now: da
         "counts": _counts(run.actions),
     }
     text = _dumps(log)
-    _write_text_atomic(Path(log_dir) / f"vault-sweep-{log['run_id']}.json", text + "\n")
+    log_path = Path(log_dir) / f"vault-sweep-{log['run_id']}.json"
+    _write_text_atomic(log_path, text + "\n")
+    if crash is not None:
+        raise crash
+    if failure is not None:
+        raise SweepAborted(failure, log, log_path)
     return log
 
 
@@ -968,7 +1151,7 @@ def evidence(log: dict) -> dict:
 
 
 class _Usage(Exception):
-    pass
+    """A command-line usage error (exit 2)."""
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -1072,8 +1255,9 @@ def main(argv: list[str] | None = None, *,
     except _Usage as e:
         print(f"{MODULE}: {e}", file=sys.stderr)
         return 2
-    except StoreError as e:
-        print(json.dumps({"error": "storage_failed", "code": e.code}))
+    except SweepAborted as e:
+        # The run stopped on a storage error; its complete log is already on disk.
+        print(json.dumps({"error": "storage_failed", "code": e.code, "log": str(e.log_path)}))
         return 1
     print(_dumps(log))
     if args.evidence_out:
@@ -1081,9 +1265,10 @@ def main(argv: list[str] | None = None, *,
     return 1 if log["counts"]["failed"] else 0
 
 
-__all__ = ["ARCHIVE_RETENTION_DAYS", "FsStore", "ObjectLocked", "S3Store", "StoreError",
-           "SweepPolicy", "SweepRefused", "d16_status", "evidence", "main", "parse_ledger",
-           "policy_from_config", "split_key", "sweep"]
+__all__ = ["ARCHIVE_RETENTION_DAYS", "FsStore", "LockState", "ObjectLocked", "S3Store",
+           "StorageFailure", "StoreError", "SweepAborted", "SweepPolicy", "SweepRefused",
+           "d16_status", "evidence", "main", "parse_ledger", "policy_from_config", "split_key",
+           "sweep"]
 
 
 if __name__ == "__main__":
