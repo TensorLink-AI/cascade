@@ -45,7 +45,7 @@ import lanedlib  # noqa: E402
 
 WORKFLOW = "laned-accept"
 LEDGER_PATH = "status/ci_runs.json"
-MODES = ("accept", "expect-fail", "tests-correction", "check-pr", "gate")
+MODES = ("accept", "expect-fail", "tests-correction", "evidence", "check-pr", "gate")
 CONCLUSIONS = ("success", "failure")
 
 
