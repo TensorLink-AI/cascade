@@ -1,0 +1,29 @@
+# Lane D bench gate host (valeval-blackwell4 class; LANE_D_PLAN §10.4 "drawn
+# suite on valeval-blackwell4"). Pinned from the eval-host history:
+# - RTX PRO 6000 Blackwell 96 GB only: the RTX 6000 Ada fallback reproduces the
+#   bench metrics only to 1e-8 and must not share a gate (OPSLOG 2026-11-04).
+#   gpu_model is the exact name nvidia-smi prints on valeval-blackwell4 (both
+#   `-L` and `--query-gpu=name`; on-rent-check requires every GPU in both
+#   captures to equal it): "…Workstation Edition, 97887 MiB, driver 595.99.02"
+#   (read 2026-11-22). Another edition (Server, Max-Q) is refused as wrong_gpu.
+# - driver: 580.173.02 (valeval-blackwell3) and 595.99.02 (valeval-blackwell4)
+#   benched; Crusoe 535 / Warsaw 570 could not.
+# - disk: two 4.6 GB checkpoints = 9.2 GB free on /data before a duel
+#   (OPSLOG 2026-11-22: 5.7 GB free is the failure class).
+# - /data/bench: 17747 files, suite identities gift 30841734 / boom 69325b54 /
+#   time 83e3d0b3 / fev 6de245af (cascade.validator.bench_identity).
+schema = "laned_evalhost_profile/1"
+name = "bench_gate"
+gpu_model = "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+min_vram_mib = 97000
+min_driver = "580"
+disk_path = "/data"
+min_disk_free_bytes = 9200000000
+bench_dir = "/data/bench"
+bench_files = 17747
+
+[suite_identities]
+gift = "30841734"
+boom = "69325b54"
+time = "83e3d0b3"
+fev = "6de245af"
