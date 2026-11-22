@@ -50,6 +50,7 @@ from .helpers import (
     as_bytes,
     file_digest,
     fixture_hotkey,
+    gate_inputs,
     lane_d_cfg,
     make_series,
     make_signer,
@@ -204,12 +205,15 @@ def _state_dir(tmp_path: Path) -> Path:
 
 
 def _settle(chain, cfg, state_path: Path, signer, boundary: int, snap: int):
+    """`settle_lane_d`, with the W5e gate inputs when it accepts them
+    (`helpers.gate_inputs`): the skeleton crowns at BOUNDARY_2."""
     from cascade.validator.lane_d import settle_lane_d
 
     return settle_lane_d(cfg=cfg, boundary=boundary, pool_dir=chain.pool_dirs[snap],
                          entries=[dict(e) for e in chain.entries], house=dict(chain.house),
                          forecasts=chain.forecasts[snap], uid_of=dict(chain.uid_of),
-                         state_path=state_path, signer=signer)
+                         state_path=state_path, signer=signer,
+                         **gate_inputs(boundary, chain.house["digest"]))
 
 
 def _settle_both(chain, cfg, state_path: Path, signer):
