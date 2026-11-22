@@ -39,8 +39,12 @@ validator. Unarmed (``not cfg.active(boundary)``) it returns
    W3b5 computes ``pass``/``fail`` and its ``lowfreq_regression`` effect);
 6. writes the signed ``lane-d-report/1`` (W7a: the schema file
    ``schemas/lane_d_report_1.json``; every entry considered and not judged is
-   a typed skip, court slots that burn name a ``burn_reason``), the new
-   state, and returns the pay
+   a typed skip, court slots that burn name a ``burn_reason``; ``pool.snapshots``
+   binds every snapshot a judged window's version came from, the newest
+   always included, and each window names its ``snapshot_sha256``). The
+   signed report is checked by ``validate_report``: a report outside the
+   schema raises and nothing is returned or saved (fail closed). Then it
+   saves the new state and returns the pay
    record ``{"share", "court_uids"}`` — king first (``None`` while the house
    holds KING_D: that slot burns, D21), then up to ``reward_prior_kings``
    prior MINER kings (an unregistered one is ``None`` and burns).
@@ -63,7 +67,7 @@ from ..eval.bootstrap import cohort_maxt_lcbs
 from ..eval.lane_d_scorer import SCORING_LEVELS, SCORING_METHOD, score_window
 from .lane_d_forward import eligible_windows
 from .lane_d_frozen import advance_frozen_set
-from .lane_d_report import REPORT_SCHEMA, rows_sha256, sign_report
+from .lane_d_report import REPORT_SCHEMA, rows_sha256, sign_report, validate_report
 from .lane_d_state import load_state, refresh_house, save_state
 
 POOL_SCHEMA = "pool_d/1"
@@ -450,7 +454,32 @@ def _params(cfg) -> dict:
             "scoring_levels": [float(q) for q in SCORING_LEVELS],
             "gate_suites": [str(s) for s in cfg.gate_suites],
             "tau_public": float(cfg.tau_public),
-            "lowfreq_freqs": [str(f) for f in cfg.lowfreq_freqs]}
+            "lowfreq_freqs": [str(f) for f in cfg.lowfreq_freqs],
+            # §1.3b draw weights as parsed (a suite without a weight is absent),
+            # the T18e/B14 source cap and the §1.7 context floor.
+            "gate_weights": {str(s): float(w) for s, w in cfg.gate_weights},
+            "max_source_share": float(cfg.max_source_share),
+            "min_long_series": int(cfg.min_long_series)}
+
+
+def _pool_record(pools: list[dict], windows_out: dict) -> dict:
+    """``pool`` of the report: the newest snapshot's ``snapshot`` /
+    ``sha256``, and ``snapshots``, every loaded snapshot a judged window's
+    version came from plus the newest, oldest first, each once (two loaded
+    snapshots with equal bytes are one, listed as the newer).
+    ``first_seen_roots`` is the sorted union of the listed snapshots' roots."""
+    newest = pools[-1]
+    used = {w["snapshot_sha256"] for w in windows_out.values()} | {newest["sha256"]}
+    snaps, seen = [], set()
+    for p in reversed(pools):
+        if p["sha256"] in used and p["sha256"] not in seen:
+            seen.add(p["sha256"])
+            snaps.append({"snapshot": p["snapshot"], "sha256": p["sha256"],
+                          "first_seen_roots": sorted(p["first_seen_roots"])})
+    snaps.reverse()
+    roots = sorted({r for s in snaps for r in s["first_seen_roots"]})
+    return {"snapshot": newest["snapshot"], "sha256": newest["sha256"],
+            "first_seen_roots": roots, "snapshots": snaps}
 
 
 def _lowfreq_candidate(ws: list[dict], cfg) -> dict:
@@ -541,8 +570,6 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
                                         frozen_set=None)
         groups.setdefault((kd, stage), []).append(dg)
 
-    # The first-seen roots the judged windows rely on: every loaded snapshot's.
-    roots = sorted({r for p in pools for r in p["first_seen_roots"]})
     rows, windows_out, cohorts, verdicts = [], {}, [], []
     crowned: list[dict] = []
     for (kd, stage), members in sorted(groups.items()):
@@ -583,13 +610,15 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
                                   w["seasonal_period"]) for w in ws]
             scores[dg] = (np.asarray([p[0] for p in pairs]), np.asarray([p[1] for p in pairs]))
         for i, w in enumerate(ws):
-            feeds = index[w["window_id"]][1]["feeds"]
-            lag = (feeds.get(w["feed"]) or {}).get("mirror_lag_hours")
+            src_pool = index[w["window_id"]][1]
+            lag = (src_pool["feeds"].get(w["feed"]) or {}).get("mirror_lag_hours")
             windows_out[w["window_id"]] = {
                 "window_id": w["window_id"], "source": w["source"], "feed": w["feed"],
                 "min_target_ts": int(min(w["target_ts"])),
                 "min_first_seen_ts": int(min(w["first_seen_ts"])),
-                "mirror_lag_hours": None if lag is None else float(lag)}
+                "mirror_lag_hours": None if lag is None else float(lag),
+                # The snapshot whose version of the window was scored.
+                "snapshot_sha256": str(src_pool["sha256"])}
             for dg in scored:
                 rows.append({"window_id": w["window_id"], "digest": dg, "cohort": len(cohorts),
                              "crps": float(scores[dg][0][i]), "mase": float(scores[dg][1][i])})
@@ -610,7 +639,7 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
         cohorts.append({"index": len(cohorts), "king_digest": kd, "king_reveal_ts": int(king_ts),
                         "stage": stage, "members": list(members), "t_max": int(t_max),
                         "window_ids": [w["window_id"] for w in ws], "set_sha256": set_sha,
-                        "first_seen_roots": roots, "refused": refused})
+                        "first_seen_roots": [], "refused": refused})
         for m, r in zip(members, res, strict=True):
             rec = state["entries"][m]
             rec["used_windows"] = sorted(set(rec["used_windows"]) | {w["window_id"] for w in ws})
@@ -658,11 +687,18 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
                 v["outcome"] = "crowned"
     court = _court(state, cfg, uid_of)
     pay = {"share": float(cfg.share), "court_uids": [s["uid"] for s in court]}
+    pool_rec = _pool_record(pools, windows_out)
+    # The first-seen roots the frozen sets rely on: the union over the listed
+    # snapshots, known once every cohort is judged, so each cohort takes it
+    # here and the report's two root lists agree.
+    for c in cohorts:
+        c["first_seen_roots"] = list(pool_rec["first_seen_roots"])
     report = {
         "schema": REPORT_SCHEMA, "boundary": boundary, "scoring_method": SCORING_METHOD,
         "params": _params(cfg), "seed": seed,
-        "pool": {"snapshot": pool["snapshot"], "sha256": pool["sha256"], "horizon": h,
-                 "first_seen_roots": list(pool["first_seen_roots"])},
+        "pool": {"snapshot": pool_rec["snapshot"], "sha256": pool_rec["sha256"], "horizon": h,
+                 "first_seen_roots": pool_rec["first_seen_roots"],
+                 "snapshots": pool_rec["snapshots"]},
         "house": _king_record({**state["house"], "hotkey": None, "house": True}),
         "king_before": king_before, "king_after": _king_record(state["king"]),
         "crowned": new_king,
@@ -678,6 +714,10 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
         "pay": {"share": pay["share"], "court": court},
     }
     report = sign_report(report, signer)
+    # Fail closed: a report outside lane-d-report/1 is never returned and the
+    # state is not saved (ReportSchemaError propagates). Checked on the
+    # signed form, since ``signer`` and ``signature`` are required fields.
+    validate_report(report)
     state["boundary"] = boundary
     state["last_report"] = {"boundary": boundary, "rows_sha256": report["rows_sha256"],
                             "signature": report["signature"]}

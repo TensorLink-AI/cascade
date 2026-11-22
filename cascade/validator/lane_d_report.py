@@ -14,11 +14,14 @@ The published contract is the JSON Schema (draft 2020-12) file
 map is the optional top-level ``extensions``, which is never consensus.
 :func:`validate_report` enforces that file with a stdlib interpreter of the
 keyword subset the file uses (``type``, ``const``, ``enum``, ``pattern``,
-``minLength``, ``minimum``, ``required``, ``properties``,
-``additionalProperties``, ``propertyNames``, ``items``, ``$ref`` and
-``if``/``then``/``else``), plus two checks JSON Schema cannot state: numbers
-are finite, and ``rows_sha256`` is the canonical digest of ``rows`` (checked
-last). The signature is :func:`verify_report`'s job.
+``minLength``, ``minimum``, ``exclusiveMinimum``, ``maximum``, ``minItems``,
+``maxItems``, ``required``, ``properties``, ``additionalProperties``,
+``propertyNames``, ``items``, ``$ref`` and ``if``/``then``/``else``), plus the
+checks JSON Schema cannot state: numbers are finite (``extensions``
+included), the cross-field rules of :func:`_cross_field` (snapshot binding,
+the gate record's consistency with the report, ``gate_weights`` keys), and
+``rows_sha256`` is the canonical digest of ``rows`` (checked last). The
+signature is :func:`verify_report`'s job.
 
 Light imports only: this module sits on the validator package's import path.
 """
@@ -53,10 +56,17 @@ SKIP_REASONS = ("pending_floor", "coldkey_cap_settlement", "coldkey_unresolved",
                 "coldkey_changed", "king_unscored", "bench_hold", "deregistered",
                 "ready_expired", "reveal_delay_exceeded", "duplicate_digest",
                 "hotkey_has_open_entry", "context_not_armed", "checkpoint_fault",
-                "mirror_lag_exceeded")
+                "mirror_lag_exceeded", "lane_closed")
+# ``gate_regression``: a judged loss on the §1.3b gate (like
+# ``lowfreq_regression``), so an entry reason and never a skip reason.
 ENTRY_REASONS = SKIP_REASONS + ("confirm_pending", "lost_duel", "lost_confirmation",
-                                "lowfreq_regression", "crowned")
+                                "lowfreq_regression", "gate_regression", "crowned")
 BURN_REASONS = ("house_king", "deregistered")
+# The §1.3b paired gate's outcomes and references: W3b2's
+# ``lane_d_bench.OUTCOMES`` / ``REFS`` (stated here, not imported, to keep this
+# module's imports light; the acceptance tests pin the equality).
+GATE_OUTCOMES = ("pass", "gate_regression", "checkpoint_fault", "bench_hold")
+GATE_REFS = ("king_d", "house")
 CONFIRMATION_STAGES = ("first", "confirm")
 CONFIRM_RULES = ("restart", "original")
 LOWFREQ_RESULTS = ("pass", "fail", "no_windows", "not_candidate")
@@ -158,8 +168,19 @@ class _Validator:
                 raise ReportSchemaError("bad_value", path, "too short")
             if "pattern" in node and not _pattern(node["pattern"]).search(value):
                 raise ReportSchemaError("bad_value", path, f"does not match {node['pattern']}")
-        if _is_type(value, "number") and "minimum" in node and value < node["minimum"]:
-            raise ReportSchemaError("bad_value", path, f"below {node['minimum']}")
+        if _is_type(value, "number"):
+            if "minimum" in node and value < node["minimum"]:
+                raise ReportSchemaError("bad_value", path, f"below {node['minimum']}")
+            if "exclusiveMinimum" in node and value <= node["exclusiveMinimum"]:
+                raise ReportSchemaError("bad_value", path,
+                                        f"not above {node['exclusiveMinimum']}")
+            if "maximum" in node and value > node["maximum"]:
+                raise ReportSchemaError("bad_value", path, f"above {node['maximum']}")
+        if isinstance(value, list):
+            if len(value) < int(node.get("minItems", 0)):
+                raise ReportSchemaError("bad_value", path, f"fewer than {node['minItems']} items")
+            if "maxItems" in node and len(value) > int(node["maxItems"]):
+                raise ReportSchemaError("bad_value", path, f"more than {node['maxItems']} items")
         if isinstance(value, list) and "items" in node:
             for i, item in enumerate(value):
                 self.check(item, node["items"], _join(path, i))
@@ -210,16 +231,92 @@ def _same(a, b) -> bool:
     return a == b
 
 
+def _check_finite(value, path: str) -> None:
+    """Every number under ``value`` (the open ``extensions`` map, which the
+    schema does not describe) is finite: what validates must also sign."""
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ReportSchemaError("bad_value", path, "non-finite number")
+    if isinstance(value, dict):
+        for k, v in value.items():
+            _check_finite(v, _join(path, str(k)))
+    elif isinstance(value, list):
+        for i, v in enumerate(value):
+            _check_finite(v, _join(path, i))
+
+
+def _check_snapshots(report: dict) -> None:
+    """Invariant 4 (RV4): ``pool.snapshots`` lists each snapshot once (by
+    name, then by sha256), the newest (``pool.snapshot`` / ``pool.sha256``)
+    among them, and every window names a listed snapshot."""
+    pool = report["pool"]
+    names: set[str] = set()
+    shas: set[str] = set()
+    for i, snap in enumerate(pool["snapshots"]):
+        at = _join("pool.snapshots", i)
+        if snap["snapshot"] in names:
+            raise ReportSchemaError("bad_value", _join(at, "snapshot"), "snapshot listed twice")
+        if snap["sha256"] in shas:
+            raise ReportSchemaError("bad_value", _join(at, "sha256"), "sha256 listed twice")
+        names.add(snap["snapshot"])
+        shas.add(snap["sha256"])
+    newest = {"snapshot": pool["snapshot"], "sha256": pool["sha256"]}
+    if not any(s["snapshot"] == newest["snapshot"] and s["sha256"] == newest["sha256"]
+               for s in pool["snapshots"]):
+        raise ReportSchemaError("bad_value", "pool.snapshots",
+                                "the newest snapshot (pool.snapshot / pool.sha256) is not listed")
+    for i, w in enumerate(report["windows"]):
+        if w["snapshot_sha256"] not in shas:
+            raise ReportSchemaError("bad_value", _join(_join("windows", i), "snapshot_sha256"),
+                                    "not one of pool.snapshots[].sha256")
+
+
+def _check_gate(report: dict) -> None:
+    """The §1.3b gate record agrees with its report: drawn at the report's
+    boundary, the drawn suite is eligible, one result per candidate digest."""
+    gate = report["gate"]
+    if gate["block"] != report["boundary"]:
+        raise ReportSchemaError("bad_value", "gate.block", "not the report's boundary")
+    if gate["suite"] not in gate["eligible"]:
+        raise ReportSchemaError("bad_value", "gate.suite", "not one of gate.eligible")
+    seen: set[str] = set()
+    for i, res in enumerate(gate["results"]):
+        if res["digest"] in seen:
+            raise ReportSchemaError("bad_value", f"gate.results[{i}].digest",
+                                    "digest swept twice")
+        seen.add(res["digest"])
+
+
+def _check_gate_weights(report: dict) -> None:
+    """``params.gate_weights`` names only ``params.gate_suites`` members."""
+    suites = set(report["params"]["gate_suites"])
+    for suite in report["params"]["gate_weights"]:
+        if suite not in suites:
+            raise ReportSchemaError("bad_value", _join("params.gate_weights", suite),
+                                    "not one of params.gate_suites")
+
+
+def _cross_field(report: dict) -> None:
+    """The rules between fields, run after every structural check passes."""
+    _check_gate_weights(report)
+    _check_snapshots(report)
+    if "gate" in report:
+        _check_gate(report)
+
+
 def validate_report(report) -> None:
     """Raise :class:`ReportSchemaError` on the first defect of ``report``
     against ``lane-d-report/1``: not an object, then the ``schema`` field,
-    then every structural rule of the schema file, then ``rows_sha256``."""
+    then every structural rule of the schema file, then finite numbers in
+    ``extensions``, then the cross-field rules, then ``rows_sha256``."""
     if not isinstance(report, dict):
         raise ReportSchemaError("not_object", "", type(report).__name__)
     if report.get("schema") != REPORT_SCHEMA or not isinstance(report.get("schema"), str):
         raise ReportSchemaError("unknown_schema", "schema", repr(report.get("schema")))
     schema = load_schema()
     _Validator(schema).check(report, schema, "")
+    if "extensions" in report:
+        _check_finite(report["extensions"], "extensions")
+    _cross_field(report)
     if rows_sha256(report["rows"]) != report["rows_sha256"]:
         raise ReportSchemaError("rows_sha256_mismatch", "rows_sha256")
 
@@ -319,7 +416,7 @@ def pinned_report_signer(cfg) -> str:
 
 
 __all__ = ["BURN_REASONS", "CONFIRMATION_STAGES", "CONFIRM_RULES", "ENTRY_REASONS",
-           "ENTRY_STATUSES", "LOWFREQ_RESULTS", "REPORT_SCHEMA", "SCHEMA_ERROR_CODES",
+           "ENTRY_STATUSES", "GATE_OUTCOMES", "GATE_REFS", "LOWFREQ_RESULTS", "REPORT_SCHEMA", "SCHEMA_ERROR_CODES",
            "SCHEMA_PATH", "SIGNATURE_PATTERN", "SIGNATURE_SCHEME", "SKIP_REASONS",
            "VERDICT_OUTCOMES", "WINDOW_REFUSAL_REASONS", "ReportSchemaError", "canonical_body",
            "canonical_json", "load_schema", "pinned_report_signer", "rows_sha256",
