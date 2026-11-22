@@ -71,8 +71,58 @@ behaviour is change 3, and those tests fail on main.
 - A challenger that beats both clears as before (`confirm_pending`).
 - The house is scored on the cohort's set. Its `rows` cover exactly
   `cohorts[].window_ids`, next to the king's and the members'.
-- The verdict's `king_digest` stays KING_D. These tests don't pin how the
-  house comparison is reported beyond the outcome and the house rows.
+- The verdict's `king_digest` stays KING_D.
+
+### The house judgement in the report (RV5)
+
+§1.5 and §14.3 rules 1-2: a satellite re-derives every verdict from signed
+fields alone. So when a miner holds KING_D and the house is a second bar,
+the signed report records the house judgement.
+
+New report fields (for the W7a schema owner: add exactly these to
+`lane-d-report/1`; both are optional keys, present only in a cohort with a
+house bar):
+
+- `cohorts[].house_digest` (string, 64-hex): the house digest the cohort's
+  members were also judged against. It equals `report["house"]["digest"]`
+  and differs from `cohorts[].king_digest`.
+- `verdicts[].house` (object, exactly `digest`, `lcb`, `gain`, `cleared`):
+  `digest` equals the cohort's `house_digest`; `lcb` / `gain` / `cleared`
+  equal `judge_cohort(house_scores, member_scores, clusters=sources, cfg,
+  seed=report["seed"])` on the report's own rows over
+  `cohorts[].window_ids`, members in cohort order (the same max-T rule as the
+  KING_D judgement, the house as the bar).
+
+Rules:
+
+- `verdicts[].lcb` / `gain` stay the KING_D judgement, and
+  `verdicts[].cleared == (lcb >= d_margin and gain > 0) and house.cleared`.
+  An exact copy of the house has `house.gain == 0.0` and `house.cleared ==
+  false`.
+- Rows per cohort = `len(window_ids) * (2 + len(members))` with a house bar
+  (KING_D, house, members), `len(window_ids) * (1 + len(members))` without.
+- **When the house holds KING_D, neither key appears** (not `null`, not a
+  copy of the KING_D judgement). Why absent:
+  - there is one bar, so a copy would be a second signed reading of the same
+    number that every satellite must cross-check for no information;
+  - whether a house bar applies is itself re-derivable
+    (`cohorts[].king_digest != report["house"]["digest"]`), so an omission
+    can't hide anything: the audit requires the keys exactly when it applies;
+  - a house-KING_D report stays exactly today's shape, so it stays valid
+    under the current schema (`additionalProperties: false` on cohorts and
+    verdicts) and the W1.5 / W8 `verify_report` tests stay green.
+- The audit (`cascade.audit.lane_d.check_lane_d`, now in `PATHS`) counts
+  the house's rows, re-derives both judgements from the rows, and returns a
+  `FAIL` `CheckResult` (never an exception) when a house judgement is
+  omitted, nulled, names another digest, disagrees with the rows, is flipped
+  either way, has its rows dropped, or appears where the house holds KING_D.
+  The tampered reports are re-signed by the signer, so the signature alone
+  never decides.
+- **Schema validation of the new keys belongs to W7a** (its schema fix is
+  pending). These tests do not call `validate_report` / `verify_report` on a
+  report that carries them. Until W7a adds them, a miner-KING_D report
+  fails `validate_report` with `unknown_field`: land the W5c implementation
+  with, or after, the W7a schema change.
 
 ### Determinism
 
@@ -116,11 +166,27 @@ behaviour is change 3, and those tests fail on main.
 | change 3 control: weak house | `test_house_change3_control_beating_king_and_a_weak_house_clears` |
 | change 3: beats both | `test_house_change3_challenger_clearing_king_and_house_clears` |
 | change 3: house scored on the same set | `test_house_change3_house_is_scored_on_the_cohorts_set` |
+| RV5: cohort names the house bar, verdict carries `house` | `test_house_report_names_the_house_the_cohort_was_judged_against` |
+| RV5: `house` + `cleared` re-derived from the rows and seed | `test_house_report_verdict_rederives_from_the_reports_rows_alone` |
+| RV5: rows = windows x (KING_D + house + members) | `test_house_report_rows_account_for_the_house` |
+| RV5: house holds KING_D, no house keys | `test_house_holds_king_d_report_carries_no_house_judgement` |
+| RV5: audit PASSes every W5c fixture report | `test_audit_passes_every_report_the_w5c_fixtures_produce` |
+| RV5: audit FAILs a doctored house judgement (10 kinds) | `test_audit_fails_a_doctored_house_judgement` |
+| RV5: audit FAILs a vs-house loss flipped to a win | `test_audit_fails_a_vs_house_loss_flipped_to_a_win` |
+| RV5: audit FAILs house keys on a house-KING_D report | `test_audit_fails_a_house_judgement_where_the_house_holds_king_d` |
+
+The RV5 tests are in `test_w5c_house_report.py`. Its house scenarios are
+the `test_w5c_house.py` chain (four: copy of a sharp house, good vs a sharp
+house, good vs a bad house, sharp vs a fair house), each built once per
+module; every BOUNDARY_1/2/3 report of each is audited.
 
 ## On main
 
-- The three change 3 tests (tie, short vs house, house rows) fail on an
-  `AssertionError`. Main compares challengers with KING_D only, so Y goes
-  `confirm_pending`, and the house has no rows.
-- Every other test passes. W5b already implements those rules, and W5c now
-  owns them.
+- The change 3 tests in `test_w5c_house.py` pass (W5c #579).
+- In `test_w5c_house_report.py`, 25 tests fail on an `AssertionError`: main
+  writes no `house_digest` / `house`, and `check_lane_d` FAILs every
+  miner-KING_D report ("72 rows; the cohorts account for 48"), so each
+  tamper test fails its "the honest report must pass first" precondition.
+  `test_house_holds_king_d_report_carries_no_house_judgement` passes (that
+  shape is today's).
+- Every other test passes.
