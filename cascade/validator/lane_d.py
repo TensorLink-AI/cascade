@@ -38,10 +38,18 @@ validator. Unarmed (``not cfg.active(boundary)``) it returns
    copy of the house never clears); the house's rows sit next to the king's.
    A first clear goes ``confirm_pending`` and must clear again on a
    disjoint set (D20 ``confirm_on_king_change``) before it is crowned;
-   each verdict reports the §1.3b A10 low-frequency slice (report-only here:
-   W3b5 computes ``pass``/``fail`` and its ``lowfreq_regression`` effect);
+5a. runs the §1.3b A10 low-frequency non-inferiority check (W3b5,
+   :mod:`~cascade.validator.lane_d_lowfreq`) on EVERY verdict that cleared at
+   stage ``confirm``, whatever the gate draw: the slice is the newest
+   snapshot's windows whose ``freq`` is in ``lowfreq_freqs`` (the private
+   pool, not the forward-only set, §1.7), and the candidate's paired CRPS and
+   MASE ``LCB_α`` against the verdict's KING_D and the house must each be
+   ``≥ −tau_public``. ``fail`` is a judged, final loss
+   (``lost``/``lowfreq_regression``, never gated, never crowned);
+   ``no_windows`` (an empty slice) never blocks. The verdict's ``lowfreq``
+   block carries the four LCBs for ``pass``/``fail``;
 5b. gates the crowning candidates (W5e, §1.3b): every verdict that cleared
-   at stage ``confirm``, plus every entry still holding a cleared
+   at stage ``confirm`` and did not fail A10, plus every entry still holding a cleared
    confirmation the gate could not decide (``bench_hold``), is swept with
    KING_D and the house in the settlement's ``bench`` session on the ONE
    suite drawn from ``boundary_block_hash``
@@ -106,6 +114,9 @@ from .lane_d_bench import paired_gate
 from .lane_d_forward import eligible_windows
 from .lane_d_frozen import advance_frozen_set
 from .lane_d_gate import gate_record
+from .lane_d_lowfreq import forecast_ok as _forecast_ok
+from .lane_d_lowfreq import lowfreq_check, lowfreq_windows
+from .lane_d_lowfreq import target_usable as _target_usable
 from .lane_d_report import (
     REPORT_SCHEMA,
     SKIP_REASONS,
@@ -252,13 +263,6 @@ def load_pool(pool_dir, horizon: int) -> dict:
             "windows": windows}
 
 
-def _target_usable(w: dict, horizon: int) -> bool:
-    """The stored target is a finite, non-zero ``(horizon,)`` vector."""
-    t = w["target"]
-    return (t.shape == (horizon,) and bool(np.isfinite(t).all())
-            and float(np.abs(t).sum()) > 0.0)
-
-
 # ── statistic ───────────────────────────────────────────────────────────────
 
 
@@ -290,14 +294,6 @@ def judge_cohort(king: tuple, members: list[tuple], *, clusters: list, cfg, seed
 
 
 # ── settlement ──────────────────────────────────────────────────────────────
-
-
-def _forecast_ok(fc: dict | None, wid: str, horizon: int) -> bool | None:
-    """True = a usable forecast, None = absent, False = malformed (a fault)."""
-    if fc is None or wid not in fc:
-        return None
-    q = np.asarray(fc[wid], dtype=np.float64)
-    return bool(q.shape == (horizon, len(SCORING_LEVELS)) and np.isfinite(q).all())
 
 
 def _register(state: dict, entries: list[dict], cfg, uid_of: dict) -> list[dict]:
@@ -648,26 +644,9 @@ def _pool_record(pools: list[dict], windows_out: dict) -> dict:
             "first_seen_roots": roots, "snapshots": snaps}
 
 
-def _lowfreq_candidate(ws: list[dict], cfg) -> dict:
-    """The report's §1.3b A10 ``lowfreq`` block for a crowning candidate (a
-    verdict that cleared at stage ``confirm``): ``n_windows`` counts the
-    frozen set's windows whose frequency is in ``lowfreq_freqs``.
-
-    W7a reports the slice only and never changes a verdict or the crowning.
-    W3b5 owns the non-inferiority test itself (CRPS and MASE
-    ``LCB_α >= -tau_public`` against KING_D and the house) and its
-    ``pass``/``fail`` result (``fail`` = ``lowfreq_regression``, not crowned).
-    Until W3b5 lands, a candidate with no slice window is ``no_windows`` and a
-    candidate with slice windows is ``not_candidate`` (not evaluated) with the
-    true count."""
-    freqs = {str(f) for f in cfg.lowfreq_freqs}
-    n = sum(1 for w in ws if w["freq"] in freqs)
-    return {"result": "no_windows" if n == 0 else "not_candidate",
-            "freqs": [str(f) for f in cfg.lowfreq_freqs], "n_windows": n,
-            "tau_public": float(cfg.tau_public)}
-
-
 def _not_candidate(cfg) -> dict:
+    """The ``lowfreq`` block of a verdict that is not a crowning candidate
+    (a first clear or a loser): never checked by A10."""
     return {"result": "not_candidate", "freqs": [str(f) for f in cfg.lowfreq_freqs],
             "n_windows": 0, "tau_public": float(cfg.tau_public)}
 
@@ -775,6 +754,9 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     rows, windows_out, cohorts, verdicts = [], {}, [], []
     # The crowning candidates: verdicts that clear at stage ``confirm``.
     candidates: list[dict] = []
+    # §1.3b A10: the newest private-pool snapshot's low-frequency windows
+    # (not the forward-only frozen set, §1.7), the same for every candidate.
+    lf_slice = lowfreq_windows(pool, cfg)
     for (kd, stage), members in sorted(groups.items()):
         king_ts = _king_reveal_ts(state, kd)
         if king_ts is None and stage == "confirm":
@@ -865,9 +847,12 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
             confirmation = {"stage": stage, "rule": str(cfg.confirm_on_king_change),
                             "first_set_sha256": first["first_set_sha256"] if first else None,
                             "first_king_digest": first["king_digest"] if first else None}
-            # Report-only (W3b5 decides pass/fail): never changes the outcome.
-            lowfreq = (_lowfreq_candidate(ws, cfg) if r["cleared"] and stage == "confirm"
-                       else _not_candidate(cfg))
+            # W3b5 (A10): every crowning candidate is checked on the private
+            # pool's low-frequency slice before the gate; first clears and
+            # losers are not candidates.
+            lowfreq = (lowfreq_check(lf_slice, forecasts, candidate=m, king_d=kd, house=hd,
+                                     cfg=cfg, seed=seed)
+                       if r["cleared"] and stage == "confirm" else _not_candidate(cfg))
             if not r["cleared"]:
                 outcome = "lost"
                 rec.update(status="lost",
@@ -882,8 +867,13 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
                                     "rule": str(cfg.confirm_on_king_change),
                                     "boundary": boundary},
                            frozen_set=None)
+            elif lowfreq["result"] == "fail":
+                # A10 failed: a judged, final loss; never swept by the gate.
+                outcome = "lost"
+                rec.update(status="lost", reason="lowfreq_regression")
             else:
-                # A crowning candidate: crowned only through the §1.3b gate.
+                # A crowning candidate (A10 pass or no_windows): crowned
+                # only through the §1.3b gate.
                 outcome = "confirmed"
                 candidates.append({"digest": m, "lcb": float(r["lcb"]),
                                    "reveal_ts": int(rec["reveal_ts"]), "set_sha256": set_sha})
