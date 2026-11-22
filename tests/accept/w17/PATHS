@@ -1,0 +1,11 @@
+# W17: the status/lane_d.json producer and the W18 vault ledger
+# laned_vault_ledger/1 (plan rev6 §3.0 W17 row; rev6.2 item (e), PR #636;
+# §11.2, §11.3 Support, §1.3b Progress board, §16 rule 4; README.md has the
+# contract).
+# One new, pure module: build_lane_d_status (queue with the per-entry reason
+# enum and reveal deadline, pending progress against the floors, king,
+# board from the latest signed report, the embedded W-S3 sentinel board),
+# publish_lane_d_status (the status store interface) and build_vault_ledger
+# (the laned_vault_ledger/1 export W18's sweeper reads).
+# Production wiring of the publish call is W8b's (rev6.2 proposed), not here.
+cascade/validator/lane_d_status.py
