@@ -194,6 +194,31 @@ def _plan_row(line: str) -> list[str]:
     return [c.strip() for c in body.split("|")]
 
 
+def plan_wp_ids(plan_text: str) -> list[str]:
+    """Every WP id in the §3.0 WP tables (first header cell ``WP``, with a
+    ``Runs in`` column), in plan order, first occurrence only."""
+    ids: list[str] = []
+    lines = plan_text.splitlines()
+    i = 0
+    while i < len(lines):
+        if not lines[i].lstrip().startswith("|"):
+            i += 1
+            continue
+        block = []
+        while i < len(lines) and lines[i].lstrip().startswith("|"):
+            block.append(lines[i])
+            i += 1
+        header = [_plan_cell(c) for c in _plan_row(block[0])]
+        if not header or header[0] != "WP" or "Runs in" not in header:
+            continue
+        for raw in block[2:]:
+            row = _plan_row(raw)
+            wp = _plan_cell(row[0]) if row else ""
+            if wp and wp not in ids:
+                ids.append(wp)
+    return ids
+
+
 def accept_evidence_files(plan_text: str, wp: str) -> list[str]:
     """Every ``--evidence <file>`` in the Accept cell of ``wp``'s row in a §3.0
     WP table (first header cell ``WP``, with ``Runs in`` and ``Accept``
