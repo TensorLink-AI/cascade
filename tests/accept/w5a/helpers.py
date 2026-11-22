@@ -1,0 +1,212 @@
+"""Shared spec and fixture builders for the W5a forward-eligibility tests.
+
+Copied from docs/plans/LANE_D_PLAN.md (rev6): §1.3 (the rev3 two-clock rule,
+`max_mirror_lag_hours`, the refused v2 snapshot rule), Proposed design
+changes 1 and 2 (ACCEPTED rev5: present in S0 with `end_ts`; every target ts
+> end_ts(S0); series absent from S0 start their clock at first appearance;
+publish-ahead feeds), T8 and §3.2 invariant 4. README.md states the module
+contract.
+
+Nothing here imports a module in PATHS, so on main every test fails inside
+its own body: at its first import of `cascade.validator.lane_d_forward` (a
+`ModuleNotFoundError` for a path in PATHS) or at an `assert`.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from statistics import NormalDist
+
+import numpy as np
+
+REPO = Path(__file__).resolve().parents[3]
+# The v2 snapshot-diff rule (W1's report-only measurement; never for verdicts).
+REPO_SCRIPTS = REPO / "scripts" / "laned_w1_measure.py"
+
+HOUR = 3600
+HORIZON = 64                     # §1.1: lane D scores h = 64 only
+HISTORY = 256
+T0 = 1_790_000_000               # an entry's reveal time (unix s)
+MARGIN_H = 6.0                   # forward_margin_hours (recommended)
+LAG_H = 6.0                      # max_mirror_lag_hours (recommended)
+
+# The precedence order of the typed refusal reasons (README "Reasons").
+REASONS = ("missing_clock", "forecast_product", "over_lag", "before_margin",
+           "publish_ahead", "late_mirror", "absent_from_s0", "backfill")
+
+SCORING_LEVELS = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
+_Z = tuple(NormalDist().inv_cdf(level) for level in SCORING_LEVELS)
+
+_ABSENT = object()                # "the series records no frontier key"
+
+
+def lane_d_cfg(**over):
+    """The real W2 parse of an armed `[lane_d]` table with `over` applied."""
+    from cascade.shared.config.lane_d import parse_lane_d
+
+    raw = {"from_block": 2700 * 3600, "share": 0.25, "takes_from": "lane_a",
+           "remainder": "burn", "contexts": [4096, 8192, 16384], "horizon": HORIZON,
+           "forward_margin_hours": MARGIN_H, "max_mirror_lag_hours": LAG_H,
+           "min_windows": 12, "min_clusters": 3, "bootstrap_B": 200}
+    return parse_lane_d({**raw, **over}, era_blocks_at=lambda _block: 3600)
+
+
+def window_id(series_id: str, target_ts) -> str:
+    """§1.3 window identity `<series_id>:<target_start_ts>:h64`."""
+    return f"{series_id}:{int(target_ts[0])}:h{HORIZON}"
+
+
+def hourly(start: int) -> list[int]:
+    return [int(start + i * HOUR) for i in range(HORIZON)]
+
+
+def spec(series_id: str, source: str, target_ts, first_seen_ts, *, frontier=_ABSENT,
+         feed: str | None = None, end_ts=_ABSENT) -> dict:
+    """One pool_d/1 series record (README "pool_d/1 additions")."""
+    rec = {"series_id": series_id, "source": source, "freq": "H", "seasonal_period": 24,
+           "target_ts": [int(t) for t in target_ts],
+           "first_seen_ts": [int(t) for t in first_seen_ts]}
+    rec["first_target_ts"] = rec["target_ts"][0] if rec["target_ts"] else None
+    rec["end_ts"] = (rec["target_ts"][-1] if rec["target_ts"] else None) \
+        if end_ts is _ABSENT else end_ts
+    if frontier is not _ABSENT:
+        rec["frontier"] = [[int(a), int(e)] for a, e in frontier]
+    if feed is not None:
+        rec["feed"] = feed
+    return rec
+
+
+# ── one window per T8 case, built against a bound = wall(max T) + margin ─────
+#
+# Each builder makes exactly ONE rule fail (the case's reason) and keeps the
+# timeline physically consistent: a frontier record's end_ts never exceeds its
+# snapshot's as_of time.
+
+
+def ok_frontier(bound: int) -> list[list[int]]:
+    """S0 = the first snapshot after the bound; its frontier precedes the target."""
+    return [[bound + 2 * HOUR, bound + 1 * HOUR]]
+
+
+def case(kind: str, bound: int, series_id: str, source: str) -> dict:
+    start = bound + 3 * HOUR
+    ts = hourly(start)
+    seen = [t + 1800 for t in ts]
+    if kind == "eligible":
+        return spec(series_id, source, ts, seen, frontier=ok_frontier(bound))
+    if kind == "legacy":            # no frontier key: judged on the two clocks
+        return spec(series_id, source, ts, seen)
+    if kind == "before_margin":     # both clocks before the bound
+        old = hourly(bound - 70 * HOUR)
+        return spec(series_id, source, old, [t + 1800 for t in old],
+                    frontier=ok_frontier(bound))
+    if kind == "late_mirror":       # values public before T reached the mirror late
+        old = hourly(bound - 70 * HOUR)
+        return spec(series_id, source, old, [bound + HOUR + i for i in range(HORIZON)],
+                    frontier=[[bound + 2 * HOUR, bound - 80 * HOUR]])
+    if kind == "publish_ahead":     # future-stamped values the mirror saw before T
+        return spec(series_id, source, ts, [bound - HOUR] * HORIZON,
+                    frontier=ok_frontier(bound))
+    if kind == "over_lag":
+        return spec(series_id, source, ts, seen, frontier=ok_frontier(bound), feed="laggy")
+    if kind == "forecast_product":
+        return spec(series_id, source, ts, seen, frontier=ok_frontier(bound),
+                    feed="forecasts")
+    if kind == "backfill":          # behind the frontier S0 already had
+        return spec(series_id, source, ts, [ts[-1] + 2 * HOUR] * HORIZON,
+                    frontier=[[ts[-1] + HOUR, ts[-1]]])
+    if kind == "absent_from_s0":    # in no snapshot after the bound before this one
+        return spec(series_id, source, ts, seen, frontier=[])
+    raise ValueError(kind)
+
+
+TRAP_KINDS = ("before_margin", "late_mirror", "publish_ahead", "over_lag",
+              "forecast_product", "backfill", "absent_from_s0")
+# The traps today's two-clock `forward_eligible` (W1.5) already refuses.
+CLOCK_TRAPS = ("before_margin", "late_mirror", "publish_ahead")
+
+
+def feeds_block(sources) -> dict:
+    """Measured lags: every source within the limit, `laggy` over it,
+    `forecasts` a forecast product."""
+    out = {s: {"mirror_lag_hours": 1.0, "forecast_product": False} for s in sources}
+    out["laggy"] = {"mirror_lag_hours": LAG_H + 1.0, "forecast_product": False}
+    out["forecasts"] = {"mirror_lag_hours": 1.0, "forecast_product": True}
+    return out
+
+
+def target_values(series_id: str) -> tuple[np.ndarray, np.ndarray]:
+    seed = sum(ord(c) * (i + 1) for i, c in enumerate(series_id))
+    rng = np.random.default_rng(seed)
+    t = np.arange(HISTORY + HORIZON, dtype=np.float64)
+    full = 20.0 + 3.0 * np.sin(2 * np.pi * t / 24) + rng.normal(0, 0.5, t.size)
+    return full[:HISTORY], full[HISTORY:]
+
+
+def write_pool(directory: Path, series: list[dict], *, feeds: dict | None = None,
+               snapshot: str = "w5a") -> Path:
+    """Write one pool_d/1 snapshot (W1.5 README format + the W5a additions)."""
+    directory.mkdir(parents=True, exist_ok=True)
+    meta = {"schema": "pool_d/1", "snapshot": snapshot, "horizon": HORIZON,
+            "series": series}
+    if feeds is not None:
+        meta["feeds"] = feeds
+    (directory / "metadata.json").write_text(json.dumps(meta, sort_keys=True))
+    hist, tgt = {}, {}
+    for s in series:
+        h, y = target_values(s["series_id"])
+        hist[s["series_id"]], tgt[s["series_id"]] = h, y
+    np.savez(directory / "hist.npz", **hist)
+    np.savez(directory / "tgt.npz", **tgt)
+    return directory
+
+
+def quantiles_around(median: np.ndarray, spread: float) -> np.ndarray:
+    return np.stack([median + spread * z for z in _Z], axis=-1)
+
+
+def keypair_class():
+    try:
+        from bittensor.sp_core import Keypair
+    except ImportError:
+        from bittensor import Keypair
+    return Keypair
+
+
+def fixture_key(name: str):
+    """A deterministic TEST keypair (never a real key)."""
+    return keypair_class().create_from_uri(f"//w5a-{name}")
+
+
+def oracle_reason(rec: dict, feeds: dict | None, bound: float, cfg) -> str | None:
+    """The §1.3 rule re-derived here from the raw fixture record (independent
+    of the producer), with the README precedence order."""
+    ts, seen = rec["target_ts"], rec["first_seen_ts"]
+    if (len(ts) != HORIZON or len(seen) != HORIZON or rec.get("end_ts") is None
+            or int(rec["end_ts"]) != ts[-1]):
+        return "missing_clock"
+    feed = (feeds or {}).get(rec.get("feed") or rec["source"], {})
+    if feed.get("forecast_product"):
+        return "forecast_product"
+    lag = feed.get("mirror_lag_hours")
+    if lag is not None and float(lag) > float(cfg.max_mirror_lag_hours):
+        return "over_lag"
+    data_ok, seen_ok = min(ts) > bound, min(seen) > bound
+    if not data_ok and not seen_ok:
+        return "before_margin"
+    if not seen_ok:
+        return "publish_ahead"
+    if not data_ok:
+        return "late_mirror"
+    if "frontier" in rec:
+        after = [e for a, e in sorted(rec["frontier"]) if a > bound]
+        if not after:
+            return "absent_from_s0"
+        if min(ts) <= after[0]:
+            return "backfill"
+    return None
+
+
+def bound_of(t_entry: int, t_king: int, cfg) -> float:
+    return float(max(t_entry, t_king)) + HOUR * float(cfg.forward_margin_hours)
