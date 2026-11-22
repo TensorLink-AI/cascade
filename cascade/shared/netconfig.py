@@ -83,6 +83,7 @@ MAX_CHAIN_WALK = 1000
 ALLOWED: dict[str, frozenset[str] | None] = {
     "scoring": None,
     "eval": None,
+    # remainder and the WB10 contamination_hashset pin stay release-only below
     "lane_b": None,
     "lane_c": None,
     # LANE_D_PLAN §14.2: every lane D tuning key (activation, kill switch,
@@ -223,6 +224,9 @@ def check_overrides(overrides: object) -> dict:
             if (table, key) in (("scoring", "burn_uid"), ("lane_b", "remainder"),
                                 ("lane_c", "remainder"), ("lane_d", "remainder")):
                 bad.append(f"[{table}] {key} (burn destination is release-only)")
+            elif (table, key) in (("lane_b", "contamination_hashset"),):
+                # LANE_D_PLAN §14.2 (rev5): an overlay never replaces a data pin
+                bad.append(f"[{table}] {key} (data pin is release-only)")
             elif isinstance(value, dict) and table in ("v2",):
                 bad.append(f"[{table}.{key}] (nested tables are release-only)")
             elif allowed is not None and key not in allowed:

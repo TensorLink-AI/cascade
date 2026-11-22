@@ -24,6 +24,13 @@ from .generation import (
     GenerationConfig,
     parse_generation,
 )
+from .lane_b import (
+    LANE_B_OPEN_RULES,
+    LANE_B_ROUTER_ROWS,
+    LANE_B_SENTINEL_TARGET_RULES,
+    LANE_B_TRACK_DEFAULTS,
+    parse_lane_b_track,
+)
 from .lane_c import (
     LaneCConfig,
     check_target,
@@ -162,7 +169,11 @@ __all__ = [
     "GeneratorConfig",
     "HEAT_GUARD_FACTOR",
     "HEAT_GUARD_FLOOR_SECONDS",
+    "LANE_B_OPEN_RULES",
     "LANE_B_REMAINDERS",
+    "LANE_B_ROUTER_ROWS",
+    "LANE_B_SENTINEL_TARGET_RULES",
+    "LANE_B_TRACK_DEFAULTS",
     "LaneBConfig",
     "LaneCConfig",
     "LaunchConfigError",
@@ -214,6 +225,7 @@ __all__ = [
     "margin_v2_configured",
     "mv_score_active",
     "parse_lane_b",
+    "parse_lane_b_track",
     "parse_lane_c",
     "parse_lane_d",
     "LaneDConfig",

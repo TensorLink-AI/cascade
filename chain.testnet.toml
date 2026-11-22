@@ -787,6 +787,23 @@ merge_guard_from_block = 8280000
 # Preserve settled testnet economics; announce a future era to enable this.
 acceptance_from_block = 0
 leg_funding = "miner"              # lane-B legs on the miner's key (/v1/lane-b/fund)
+# Lane B track (LANE_D_PLAN §12b, DEC-CA-0071; WB10; see chain.toml). SHIPPED
+# UNARMED at the defaults; contamination_hashset is release-only.
+suite_targets            = false
+contamination_hashset    = ""
+contamination_min_hits   = { exact = 1, normalised = 3 }
+suite_target_max_repo_mb = 8
+min_experts_frac         = 0.03125
+max_experts_frac         = 0.1484375
+router_rows              = "frozen"
+traffic_steal_bound      = 0.02
+open_rule                = "cogate"
+sentinel_target_rule     = "defer"
+sentinel_max_defer_eras  = 4
+funded_pod_skus          = ["RTX4090", "RTX3090", "L40S", "L40", "A6000"]   # = [round] funded_pod_skus
+max_leg_hours            = 6.0
+max_leg_seconds          = 27000
+guard_factor             = 1.25
 
 
 [lane_c]
