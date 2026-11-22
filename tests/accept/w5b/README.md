@@ -92,6 +92,54 @@ tests must stay green.
   `until_block` the lane is inactive: `report` and `pay` are `None`, and the
   state file is untouched (existing behaviour).
 
+### (RV4) One version per window; the report names every judged snapshot
+
+A window id is stable across snapshots, but its `first_seen_ts`, values,
+`frontier` and its feed's measured `mirror_lag_hours` are not. RV4 found
+main admitting a window if *any* snapshot admits it and then scoring the
+*newest* snapshot's version, which §1.3 may refuse.
+
+- **Decision: the earliest admitting snapshot's version.** A judged window
+  is scored, and its `windows[]` row (`min_target_ts`, `min_first_seen_ts`,
+  `mirror_lag_hours`, `source`, `feed`) taken, from one snapshot: the
+  earliest loaded snapshot (oldest first, `pool_dir` last) whose
+  `eligible_windows` admits it for the cohort's max(T). Admission from one
+  snapshot is never combined with clocks, history, targets or lag from
+  another.
+  - Why earliest: §1.3 grows the union snapshot by snapshot, so a window
+    enters the entry's evidence at its first admitting snapshot, and that is
+    the version the set accumulated. Scoring it means a later snapshot can
+    never change what an already-collected window is scored on. A later
+    revision of values, clocks or lag (newer `pool_d` bytes) can't move a
+    verdict between freeze and judgment. Invariant 4 needs the scored version
+    to pass §1.3. The admitting version does, by construction, so a §1.5
+    audit of the report's declared timestamps passes.
+  - A window that no loaded snapshot admits is never judged. It isn't in
+    `windows`, `rows`, `cohorts[].window_ids` or the entry's
+    `frozen_set.window_ids`.
+  - No judged window has `min_first_seen_ts < bound`, `min_target_ts <
+    bound`, or `mirror_lag_hours > max_mirror_lag_hours`.
+  - Not pinned: a window refused by an older snapshot but admitted by a
+    newer one. The rule above scores the newer version, and refusing such a
+    window is also allowed.
+- **The report names every judged snapshot.** Two new fields, so the
+  `lane-d-report/1` schema (W7a) has to add them. The pending W7a RV4
+  correction doesn't define them yet, so **the W7a schema owner needs to
+  add**:
+  - `pool.snapshots`: a list of `{snapshot, sha256, first_seen_roots}`.
+    It has one entry per snapshot that supplied the version of at least one
+    judged window. It may also list other loaded snapshots, but only loaded
+    ones, each once. `pool.snapshot` / `pool.sha256` / `pool.horizon` stay
+    as they are (the newest snapshot; the seed uses it).
+  - `windows[].snapshot_sha256`: the `sha256` of the snapshot whose
+    version was scored. It is always one of `pool.snapshots[].sha256`.
+  - The two root lists agree. `pool.first_seen_roots` is the sorted union
+    of `pool.snapshots[].first_seen_roots`, and every
+    `cohorts[].first_seen_roots` equals it.
+
+  Until the schema has them, the tests assert on the settlement result
+  (`settle_lane_d(...).report`), not on `validate_report`.
+
 ### `cascade/validator/lane_d_state.py`
 
 - `ENTRY_REASONS` gains `"lane_closed"` (invariant 11: a typed reason).
@@ -119,6 +167,10 @@ tests must stay green.
 | T18e through the settlement (seeded by the settlement) | `test_t18e_settlement_caps_a_dominant_source_deterministically` |
 | invariant 5 flavour: replay from the same state | `test_inv5_replaying_a_settlement_from_the_same_state_is_identical` |
 | invariant 10 pair | `test_union_unchanged_when_unarmed` + `test_union_armed_nonempty_lane_d_effect` |
+| (RV4) invariant 4: a two-version window is scored from its earliest admitting snapshot | `test_a_two_version_window_is_scored_from_its_earliest_admitting_snapshot` |
+| (RV4) refused in every snapshot ⇒ never judged | `test_a_window_refused_in_every_snapshot_is_never_judged` |
+| (RV4) report lists both snapshots of a union; root lists agree | `test_report_names_every_snapshot_of_a_two_snapshot_union` |
+| (RV4) report names the admitting snapshot of a two-version window | `test_report_names_the_admitting_snapshot_of_a_two_version_window` |
 
 The fixtures use numpy quantile forecasts, as W5a's do: no torch, no
 checkpoint, and no signature verification. The floors are lowered to 24
@@ -133,3 +185,9 @@ code reads them from config.
 - The `until_block` test fails on an assertion: main judges the entry at the
   closing settlement.
 - `test_union_window_record_sanity` passes. It guards the fixture only.
+- (RV4, `test_w5b_versions.py`, after W5b was built) Three tests fail on an
+  assertion against the built W5b. The two-version scoring test sees
+  `min_first_seen_ts` 1790018000, which is below the bound 1790021600, so
+  main scores the newest version. The two report tests find no
+  `pool.snapshots`. The "refused in every snapshot" test passes. It keeps a
+  fix honest.
