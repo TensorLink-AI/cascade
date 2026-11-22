@@ -13,6 +13,8 @@ On main the test fails on an `assert`: `validate_report` refuses
 
 from __future__ import annotations
 
+from .helpers import assert_valid
+
 
 def _closing_settlement(tmp_path):
     """W5b's T18 `until_block` chain: two entries settled at BOUNDARY_1, then
@@ -42,7 +44,7 @@ def test_e2e_until_block_closing_report_validates(tmp_path):
 
     s1, closing, digests = _closing_settlement(tmp_path)
     assert s1.report is not None and closing.report is not None
-    validate_report(s1.report)
+    assert_valid(s1.report)
     r = closing.report
     # the fixture really is the closing settlement (W5b T18)
     listed = {e["digest"]: e for e in r["entries"]}
