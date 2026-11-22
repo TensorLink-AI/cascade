@@ -19,7 +19,7 @@ must keep this skeleton green (row: "every later WP keeps it green and adds
 | `make laned-e2e` exists | `test_makefile_defines_laned_e2e`: top-level `Makefile`; target `laned-e2e:`; `make -n laned-e2e` shows `uv run --frozen`, `pytest` and `tests/accept/w1_5` |
 | non-zero lane D weight for the challenger | `test_e2e_challenger_gets_nonzero_lane_d_weight` |
 | audit passes | `test_e2e_audit_passes` |
-| one tampered row fails | `test_e2e_tampered_row_fails`: a tampered row fails `check_lane_d`, both as published (stale signature) and re-signed by the same key (stale `rows_sha256`) |
+| one tampered row fails | `test_e2e_tampered_row_fails`: a tampered row fails `check_lane_d`, both as published (stale signature) and re-signed by the same key (stale `rows_sha256`); `verify_report` returns False for both, since it validates the report before checking the signature (W7b) |
 | unarmed byte-identical (inv. 1) | `test_inv1_weights_unchanged_when_unarmed` + `test_inv1_weights_armed_nonempty_lane_d_effect` |
 | `share = 0`: weights unchanged, valid report (inv. 9) | `test_inv9_share_zero_vector_unchanged_when_unarmed` + `test_inv9_share_zero_vector_armed_nonempty_lane_d_effect` |
 | T13, inv. 2: lane A verdicts and court identical | `test_inv2_t13_lane_a_court_unchanged_when_unarmed` + `test_inv2_t13_lane_a_court_armed_nonempty_lane_d_effect` |
