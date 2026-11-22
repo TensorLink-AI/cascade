@@ -132,8 +132,7 @@ def test_score_window_refuses_a_grid_other_than_nine_levels():
 
 
 def test_scorer_contexts_cover_every_lane_d_context():
-    from cascade.eval.lane_d_scorer import SCORER_CONTEXTS
-
+    from cascade.eval.lane_d_scorer import SCORER_CONTEXTS  # noqa: I001
     from cascade.shared.config.lane_d import LANE_D_CONTEXTS
 
     assert tuple(SCORER_CONTEXTS) == tuple(sorted(SCORER_CONTEXTS))
