@@ -2,8 +2,18 @@
 #
 # pull_request labelled laned:<WP>: `scripts/laned/accept <WP> --check-pr`
 #   (rule 1: tests/accept/ never together with another path; an implementation
-#   PR stays inside the WP's PATHS), then --expect-fail on a tests-only PR or
-#   the full Accept on an implementation PR. The tooling comes from the base
+#   PR stays inside the WP's PATHS), then the mode check-pr prints:
+#     MODE implementation   -> full Accept
+#     MODE tests-only       -> --expect-fail over the whole test dir (the WP has
+#                              no implementation (L2 commit) on the base yet)
+#     MODE tests-correction -> --tests-correction (tests-only PR for a WP already
+#                              built on the base, e.g. a review-driven test fix):
+#                              every test file the PR does not change must PASS
+#                              against the base's implementation; the files it
+#                              changes pass, or fail for a right reason only
+#                              (pending a follow-up implementation PR)
+#     MODE review           -> nothing to run (laned:RV<n>)
+#   The tooling comes from the base
 #   branch once it exists there, so a PR cannot loosen its own gate.
 # push to main: Accept for every WP at >= L2 (with `--evidence <file>` from the
 #   WP's Accept cell when that file exists, so the WP's tests verify it via
@@ -137,6 +147,12 @@ jobs:
             if [ "$mode" = "tests-only" ]; then
               run_mode=expect-fail
               uv run --frozen python "$LANED/accept" "$wp" --expect-fail --root . && rc=0 || rc=$?
+            elif [ "$mode" = "tests-correction" ]; then
+              # tests-only PR for an already-built WP: unchanged tests must pass,
+              # changed tests pass or fail for a right reason (accept --help).
+              run_mode=tests-correction
+              uv run --frozen python "$LANED/accept" "$wp" --tests-correction --base HEAD^1 --head HEAD \
+                --root . && rc=0 || rc=$?
             else
               run_mode=accept
               uv run --frozen python "$LANED/accept" "$wp" --root . && rc=0 || rc=$?
@@ -152,7 +168,7 @@ jobs:
         if: contains(format(' {0} ', steps.select.outputs.wps), ' W0c ')
         run: |
           python3 scripts/laned/ci_ledger.py selftest
-          python3 scripts/laned/accept selftest
+          uv run --frozen python scripts/laned/accept selftest
           uv run --frozen python scripts/laned/status selftest
 
       - name: Upload per-WP results
