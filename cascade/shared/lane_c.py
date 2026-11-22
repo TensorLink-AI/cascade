@@ -68,7 +68,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, NamedTuple
 
 from ..eval.expert_lane import FullPay, full_pay, reward_multiplier
 from .config.lane_c import (
@@ -581,12 +581,17 @@ def pay_wins(pay: dict | None) -> list[LaneCWin]:
                      multiplier=float(w["multiplier"])) for w in (pay or {}).get("wins", ())]
 
 
-def lane_pool_shares(lane_b_cfg, lane_c_cfg=None) -> tuple[float, float]:
-    """``(B, C)`` allocations; pass C only when it is active. A gets the rest.
+class LanePoolShares(NamedTuple):
+    """Lane B, C and D allocations, each a fraction of the total. Lane A's
+    pool is ``1 - b - c - d`` (before lane B's ``remainder = "lane_a"``
+    refund)."""
 
-    Mainnet takes C from A, preserving B's allocation. ``takes_from=lane_b``
-    retains the original split for existing configurations and receipts.
-    """
+    b: float
+    c: float
+    d: float
+
+
+def _lane_bc_shares(lane_b_cfg, lane_c_cfg) -> tuple[float, float]:
     share_b = float(getattr(lane_b_cfg, "share", 0.0) or 0.0) if lane_b_cfg is not None else 0.0
     if lane_c_cfg is None:
         return share_b, 0.0
@@ -598,11 +603,41 @@ def lane_pool_shares(lane_b_cfg, lane_c_cfg=None) -> tuple[float, float]:
     return share_b - share_c, share_c
 
 
+def lane_pool_shares(lane_b_cfg, lane_c_cfg=None, lane_d_cfg=None) -> LanePoolShares:
+    """``(b, c, d)`` allocations; pass C and D only when active. A gets the
+    rest, ``1 - b - c - d``.
+
+    Mainnet takes C from A, preserving B's allocation. ``takes_from=lane_b``
+    retains the original split for existing configurations and receipts.
+
+    Lane D (LANE_D_PLAN D1/D48, C3) is carved from its ``takes_from`` lane,
+    capped at what that lane holds: ``lane_a`` (mainnet) takes it from A's
+    pool so B and C are untouched; ``lane_b`` / ``lane_c`` lower that lane.
+    ``lane_d_cfg`` None = ``d == 0.0`` and ``(b, c)`` exactly as without it.
+    """
+    share_b, share_c = _lane_bc_shares(lane_b_cfg, lane_c_cfg)
+    if lane_d_cfg is None:
+        return LanePoolShares(share_b, share_c, 0.0)
+    want = max(0.0, float(lane_d_cfg.share))
+    src = str(lane_d_cfg.takes_from)
+    if src == "lane_a":
+        return LanePoolShares(share_b, share_c,
+                              min(want, max(0.0, 1.0 - share_b - share_c)))
+    if src == "lane_b":
+        share_d = min(want, max(0.0, share_b))
+        return LanePoolShares(share_b - share_d, share_c, share_d)
+    if src == "lane_c":
+        share_d = min(want, max(0.0, share_c))
+        return LanePoolShares(share_b, share_c - share_d, share_d)
+    raise ValueError(f"[lane_d] takes_from {src!r} is not a lane")
+
+
 def lane_c_shares(lane_b_cfg, lane_c_cfg, block: int | None) -> tuple[float, float]:
     """``(B, C)`` allocations at settlement ``block``; A receives the rest."""
     active_c = lane_c_cfg if lane_c_cfg is not None and lane_c_cfg.active(block) else None
     active_b = lane_b_cfg if lane_b_cfg is not None and lane_b_cfg.active(block) else None
-    return lane_pool_shares(active_b, active_c)
+    share_b, share_c, _ = lane_pool_shares(active_b, active_c)
+    return share_b, share_c
 
 
 def lane_c_vector(n_uids: int, *, cfg, wins: list[LaneCWin], burn_uid: int,
@@ -653,7 +688,8 @@ def lane_c_pay_record(state: LaneCState, *, block: int, era_blocks: int, cfg, n_
 
 
 __all__ = [
-    "PENDING_KINDS", "LaneCState", "LaneCWin", "MAX_WARMUP_FRACTION", "PendingEntry",
+    "PENDING_KINDS", "LaneCState", "LaneCWin", "LanePoolShares", "MAX_WARMUP_FRACTION",
+    "PendingEntry",
     "RECIPE_FILE", "RECIPE_KEYS", "Recipe",
     "TargetWin", "active_targets", "competition_closed", "competition_from_block",
     "competition_past_end", "competition_started", "competition_state", "full_pay_tiers_for",

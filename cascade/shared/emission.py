@@ -367,12 +367,8 @@ def lane_parts(court_uids: Sequence[int], n_uids: int, *, king_decay: float, bur
 
     court = decayed_share_vector(list(court_uids), n_uids, decay=king_decay, burn_uid=burn_uid)
     b = [0.0] * n_uids
-    share_b, share_c = lane_pool_shares(lane_b_cfg, lane_c_cfg)
-    pool_a = 1.0 - share_b - share_c
-    share_d = 0.0
-    if lane_d_cfg is not None:
-        share_b, share_c, pool_a, share_d = lane_d_allocation(share_b, share_c, pool_a,
-                                                              lane_d_cfg)
+    share_b, share_c, share_d = lane_pool_shares(lane_b_cfg, lane_c_cfg, lane_d_cfg)
+    pool_a = 1.0 - share_b - share_c - share_d
     if lane_b_cfg is not None:
         # DEC-CA-0059: one slot per lane-B target (domains + horizon targets)
         slot = share_b / max(1, len(getattr(lane_b_cfg, "targets", None)
@@ -398,25 +394,6 @@ def lane_parts(court_uids: Sequence[int], n_uids: int, *, king_decay: float, bur
                           king_decay=float(lane_d_cfg.king_decay), burn_uid=burn_uid)
         b = [x + y for x, y in zip(b, d, strict=True)]
     return [pool_a * w for w in court], b
-
-
-def lane_d_allocation(share_b: float, share_c: float, pool_a: float, lane_d_cfg: Any
-                      ) -> tuple[float, float, float, float]:
-    """``(share_b, share_c, pool_a, share_d)`` once lane D's share is carved
-    from its ``takes_from`` lane (D1/D48: ``lane_a`` on mainnet), capped at
-    what that lane holds."""
-    want = max(0.0, float(lane_d_cfg.share))
-    src = str(lane_d_cfg.takes_from)
-    if src == "lane_a":
-        share_d = min(want, max(0.0, pool_a))
-        return share_b, share_c, pool_a - share_d, share_d
-    if src == "lane_b":
-        share_d = min(want, max(0.0, share_b))
-        return share_b - share_d, share_c, pool_a, share_d
-    if src == "lane_c":
-        share_d = min(want, max(0.0, share_c))
-        return share_b, share_c - share_d, pool_a, share_d
-    raise ValueError(f"[lane_d] takes_from {src!r} is not a lane")
 
 
 def lane_d_vector(n_uids: int, *, share: float, court_uids: Sequence[int | None],
