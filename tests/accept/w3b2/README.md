@@ -7,24 +7,39 @@ one sweep, never against stored absolute numbers. CRPS **and** MASE must each
 satisfy `LCB_α ≥ −tau_public` against KING_D **and** against the current
 house. The era's §16 sentinel suite is swept and recorded but never gates.
 
-These tests are the spec. The builder may touch only the paths in `PATHS`,
-which is one new module, `cascade/validator/lane_d_bench.py`.
+These tests are the spec. The builder may touch only the paths in `PATHS`:
+`cascade/validator/lane_d_bench.py` (built, #574) and, since RV5, the new
+owner verify module `cascade/laned/bench_evidence.py` (see "The live verify").
 
 Some rules for the tests themselves:
 
-- Nothing is mocked. The only stand-in is the bench host's sweep, which is an
-  external service. `helpers.RecordingHost` returns recorded suite outputs and
-  logs each call.
+- Nothing is mocked. The only stand-ins are external services: the bench
+  host's sweep (`helpers.RecordingHost` returns recorded suite outputs and
+  logs each call), and the chain, the checkpoint registry and the
+  KING_D / house pointers for the live verify (`evidence_lib.FakeChain`,
+  `FakeRegistry`, `FakePointers`, read-only, logging every call).
 - No PATHS module is imported at module level, in a fixture or in
-  `helpers.py`. Every test imports it in its body.
+  `helpers.py` / `evidence_lib.py`. Every test imports it in its body.
 - No test needs torch or a GPU, and every test runs locally with
   `--noconftest`.
 
-On main every non-skipped test fails with a `ModuleNotFoundError` for
-`cascade.validator.lane_d_bench`, which is in `PATHS`. `accept W3b2
---expect-fail` reports 86 collected: 84 fail for a right reason, 0 for a
-wrong one, and 2 skip (the `test_evidence_*` pair, because `LANED_EVIDENCE`
-is unset).
+History: before #574 every non-skipped test failed with a
+`ModuleNotFoundError` for `cascade.validator.lane_d_bench`.
+
+**RV5 tests-correction (BLOCKING item 6).** On main (lane_d_bench built,
+`bench_evidence` absent) the unchanged files pass, and in the changed files:
+
+- `test_w3b2_live_verify.py` fails, every test but
+  `test_fakes_are_chain_client_shaped`, for a right reason: a
+  `ModuleNotFoundError` for `cascade.laned.bench_evidence` in-process, and an
+  `AssertionError` (exit 1, not the pinned refusal exit 2) for the CLI runs;
+- `test_w3b2_evidence.py` passes on main except the 2 `test_evidence_*`
+  skips. Its verifier lives in the tests (`evidence_lib.py`), and the old
+  forgery-accepting check (`test_verifier_accepts_consistent_evidence`) is
+  inverted into `test_verifier_refuses_self_consistent_synthetic_pod_evidence`
+  and `test_verifier_refuses_rv5_helper_rows_relabelled_as_pod`;
+- `test_w3b2_session.py` gains the host-omission tests (RV5 note 1), which
+  pass on main.
 
 ## Sweep records (the recorded suite outputs)
 
@@ -150,8 +165,15 @@ This is one host session. `sweep(digests, suites)` is the bench host
 - **A suite not yet swept** re-sweeps the cached digests for it.
 - **Two sessions' records never pair.** `paired_gate` refuses them with
   `mixed_session`.
+- **A digest the host omits** (RV5 note 1) gets a record with no entry for
+  the suite, and the gate classifies it as W3b4's `classify_suite` does: the
+  candidate alone absent, with both references complete, is the miner's
+  `checkpoint_fault` (code `absent`); an absent reference is a `bench_hold`
+  whatever the candidate's rows are. So a host adapter must report a
+  per-digest infra failure as a status (`timeout`, or `error` with detail),
+  never by leaving the digest out.
 
-## Pod evidence (`test_w3b2_evidence.py`)
+## Pod evidence (`test_w3b2_evidence.py`, `evidence_lib.py`)
 
 W3b2 runs in `ci (recorded suite outputs) + pod`. The pod part is one live
 paired sweep of a candidate, KING_D and the house on one bench host, in one
@@ -159,34 +181,166 @@ session, on a suite drawn by W3b1. Its evidence is `evidence/w3b2.json`
 (the default L4 evidence path), verified by `scripts/laned/accept W3b2
 --evidence evidence/w3b2.json`.
 
+**RV5 (BLOCKING item 6).** Under schema `laned_w3b2/1` the verifier checked
+only internal consistency: synthetic rows labelled `source: "pod"`, any block
+hash and `gate = paired_gate(...)` reached L4 with no pod run. Schema
+`laned_w3b2/2` binds the evidence to facts an offline writer can't choose,
+and the old fixture that showed a forgery passing is inverted: a
+self-consistent synthetic body (`evidence_lib.synthetic_body`, real pinned
+item ids and all) is **refused**.
+
 ```json
-{"schema": "laned_w3b2/1", "wp": "W3b2", "source": "pod", "host": "<bench host>",
+{"schema": "laned_w3b2/2", "wp": "W3b2", "source": "pod", "host": "<bench host>",
  "tool": {"git_sha": "<40 hex>", "git_dirty": false}, "session": "<session id>",
- "draw": {"block": 9612000, "block_hash": "0x<64 hex>"}, "suite": "boom", "sentinel": "gift",
+ "draw": {"network": "finney", "netuid": 91, "block": 9612000, "block_hash": "0x<64 hex>"},
+ "suite": "gift", "sentinel": "time",
+ "pin": {"suite": "gift", "version": "<pinned revision>", "items_sha256": "<64 hex>",
+         "n_items": 97, "digest": "<64 hex>"},
  "params": {"alpha": 0.05, "tau_public": 0.01, "B": 10000, "seed": "<seed>"},
+ "refs": {"candidate": "<repo>@sha256:<64 hex>", "king_d": "…", "house": "…"},
  "rows": {"candidate": <sweep record>, "king_d": <sweep record>, "house": <sweep record>},
- "gate": <paired_gate result>, "passed": true}
+ "gate": <paired_gate result, with pinned_identity = pin>, "passed": true,
+ "verified_live": <the owner's verify record, below>}
 ```
 
-The verifier checks the following:
+### (a) The suite identity is the repo pin
 
-- the schema, the WP and `source == "pod"` (fixture evidence is never
-  accepted), plus the host and a clean tool sha;
-- every record carries the evidence's `session`, a 64-hex digest, and the
-  drawn suite `ok` with at least 10 items;
-- the sentinel was swept, and the candidate's digest differs from both
-  references';
-- `suite` is W3b1's `gate_suite_for(draw.block_hash, …)` under the shipped
-  `chain.toml` with that sentinel;
-- `gate` equals `paired_gate` recomputed from the recorded rows and params,
-  so a hand-edited row or number fails;
-- the outcome is a computed verdict (`pass` or `gate_regression`), and the
-  sentinel has numbers.
+The repo pins a suite by its data revision,
+`benchmarks/cascade_benchmark/datasets.py` `DATASETS[<sidecar>].revision`
+(read by parsing the `DatasetSpec(...)` calls, not by importing it), and its
+item set, the keys of the suite's Seasonal-Naive baseline table
+`benchmarks/cascade_benchmark/data/gifteval_seasonal_naive.json` (`gift`, 97
+items) or `boom_seasonal_naive.json` (`boom`). `evidence_lib.repo_pin(suite)`
+builds W3b4's identity from those two (`test_repo_pin_is_w3b4_suite_identity_of_the_pinned_items`
+checks it equals `cascade.eval.suite_identity.suite_identity`).
+
+- `pin` must equal `repo_pin(suite)`.
+- Every role's drawn-suite entry carries `data_revision` equal to the pinned
+  revision, and its item ids are exactly the pinned set, no duplicates.
+- `gate` is recomputed with `pinned_identity = pin`. Every role's
+  `gate.identity` digest is the pin's digest.
+- **TIME and FEV have no repo item set** (and FEV no repo revision), so
+  evidence whose drawn suite is `time` or `fev` is refused ("no repo pin").
+  The owner runs on a block whose draw is `gift` or `boom`, or a pin lands
+  first. The sentinel suite isn't checked against a pin (W3b4).
+
+### (b) The checkpoints are published refs
+
+`refs.<role>` is `<repo>@sha256:<64 hex>` and its hex is
+`rows.<role>.digest`. The candidate's digest differs from both references'
+(KING_D may equal the house: while lane D is unarmed the house holds KING_D).
+Offline that's the format. The owner's verify resolves every ref in the
+checkpoint registry and checks `refs.king_d` / `refs.house` against the
+KING_D and house pointers in force at `draw.block`.
+
+### (c) The block, the draw and the params
+
+Offline: `draw.network == "finney"`, `draw.netuid` is chain.toml's
+`[subnet] netuid`, `draw.block` a positive int, `draw.block_hash` `0x` + 64
+hex, and `suite` is `gate_suite_for(draw.block_hash, …)` under the shipped
+`chain.toml` with the recorded sentinel. `params.alpha`, `tau_public` and `B`
+equal `[lane_d] alpha`, `tau_public` and `bootstrap_B`. Whether the hash is
+the chain's is only checkable live; that's the `verified_live` record.
+
+The rest of the `/1` checks stay: schema, WP, `source == "pod"`, host, a
+clean tool (`git_sha` a commit here containing
+`cascade/validator/lane_d_bench.py`, `git_dirty: false`), one session on
+every record, the drawn suite `ok` with ≥ 10 items, the sentinel swept to
+numbers, `gate` equal to the recomputation, and a computed verdict (`pass`
+or `gate_regression`).
+
+### (d) What is refused offline
+
+`test_verifier_rejects_tampering` covers, each refused by the body checks
+alone and again after a record is re-bound to the edited body: the gate, a
+row, the session, the source, the suite, a fault, the WP, made-up item ids,
+the same items dropped from every record, another revision, an edited pin,
+no pin, a bare digest as ref, a ref to another digest, no refs, a malformed
+hash, testnet, another netuid, and `alpha` / `tau_public` / `B` other than
+chain.toml's. `test_verifier_refuses_self_consistent_synthetic_pod_evidence`
+refuses a fully consistent body with no record, and
+`test_verifier_refuses_rv5_helper_rows_relabelled_as_pod` refuses RV5's
+literal forgery even with a record forged for it.
+
+## The live verify (`test_w3b2_live_verify.py`; module `cascade/laned/bench_evidence.py`)
+
+**Owner command** (from a clean checkout of main, after the pod run wrote
+`evidence/w3b2.json`; read-only chain access, no wallet, no keys):
+
+```
+python -P -m cascade.laned.bench_evidence verify --evidence evidence/w3b2.json
+```
+
+It re-reads, writes `verified_live` into the evidence (replacing an older
+one) and exits 0. On a refusal it exits 2 with the code on stderr and leaves
+the file byte-identical. A missing or non-JSON file exits 2 naming the file /
+saying "evidence". `not_pod` and `wrong_network` refusals come before any
+network use (the CLI tests run with every socket connect refused and
+bittensor/boto3 unimportable). The CLI builds the three adapters below from
+the deployed config, read-only (`ChainClient` reads only: no `set_weights`,
+no commitment, no wallet).
+
+**In-process:** `bench_evidence.verify_live(evidence, *, chain, registry,
+pointers, now=None) -> dict` returns the record, never mutates `evidence`,
+and raises `bench_evidence.VerifyRefused` (`.code`). Importing the module
+must not import bittensor or boto3.
+
+| adapter | the only reads it may use |
+|---|---|
+| `chain` | `ChainClient`-shaped: `finalized_block() -> int`, `block_hash(block) -> "0x…"` (raises for an unreadable block) |
+| `registry` | `resolve(ref) -> "sha256:<hex>"` of the manifest the ref pins, or `None` when the registry doesn't hold it |
+| `pointers` | `at_block(block) -> {"house": ref, "king_d": ref}`: lane A's king checkpoint (the house, §1.4) and KING_D in force at `block` (the house while lane D is unarmed) |
+
+Any other attribute use on an adapter is a failure (`forbidden` in the fakes).
+
+| code | when |
+|---|---|
+| `not_pod` | `source != "pod"`; before any adapter call |
+| `wrong_network` | `draw.network != "finney"` or `draw.netuid` isn't chain.toml's; before any call |
+| `malformed` | `draw.block` not an int, `draw.block_hash` not `0x` + 64 hex, `refs` missing, or a ref that isn't `<repo>@sha256:<hex>` of its record's digest; before any call |
+| `block_not_finalized` | `draw.block > chain.finalized_block()` |
+| `block_hash_mismatch` | the chain's hash at `draw.block` differs from `draw.block_hash`, or can't be read |
+| `draw_mismatch` | `gate_suite_for(<the chain's hash>, …)` under the shipped chain.toml, with the evidence's sentinel, isn't `suite` |
+| `pointer_mismatch` | `pointers.at_block(draw.block)` differs from `refs.king_d` or `refs.house` |
+| `ref_unpublished` | `registry.resolve(refs.<role>)` isn't `sha256:<rows.<role>.digest>`, for any role |
+
+The record (schema `laned_w3b2_verify/1`), checked offline by
+`evidence_lib.verified_live_problems`:
+
+```json
+{"schema": "laned_w3b2_verify/1", "verified": true, "body_sha256": "<64 hex>",
+ "network": "finney", "netuid": 91, "block": 9612000, "block_hash": "0x…",
+ "finalized_block": 9612005, "suite": "gift", "sentinel": "time",
+ "refs": {"candidate": "…", "king_d": "…", "house": "…"},
+ "pointers": {"house": "…", "king_d": "…"},
+ "resolved": {"candidate": "sha256:…", "king_d": "sha256:…", "house": "sha256:…"},
+ "verified_at": "<ISO 8601 with a timezone>",
+ "tool": {"module": "cascade.laned.bench_evidence", "git_sha": "<40 hex>", "git_dirty": false}}
+```
+
+- `body_sha256` is W3a's canonical form: the evidence without
+  `verified_live`, `json.dumps(sort_keys=True, separators=(",", ":"),
+  ensure_ascii=True)`, UTF-8. Any edit after verification fails.
+- `network`, `netuid`, `block`, `block_hash` equal `draw`'s;
+  `finalized_block ≥ block`; `suite` / `sentinel` equal the evidence's and
+  `suite` is the draw of the record's hash; `refs` equal the evidence's;
+  `pointers` equal `refs.king_d` / `refs.house`; `resolved.<role>` is
+  `sha256:<rows.<role>.digest>`; `verified_at` is tz-aware and not in the
+  future; `tool.module` is this module, and at L4 `git_sha` is a commit here
+  containing `cascade/laned/bench_evidence.py` with `git_dirty: false`.
+
+**Residual (as W3a, RV5 note 9).** The record is hash-bound, not signed.
+Everything it attests (the hash at a block, the pointers at that block, the
+registry digests) is public, so anyone can re-run `verify` read-only and
+detect a hand-written record; that's stronger than W3a, whose locks expire.
+What stays owner-attested is that the numbers came from a real sweep: a
+writer with the real pinned item ids, real public refs and a real block can
+make up rows and still pass `verify`. Closing that needs a signed bench-host
+attestation or a reproduction by a satellite, which no WP pins yet.
 
 The `test_evidence_*` tests skip when `LANED_EVIDENCE` is unset, and fail
-hard when it's set and the file is bad. The `test_verifier_*` tests prove
-offline that tampering is rejected: the gate, a row, the session, the
-source, the suite, a fault or the WP.
+hard when it's set and the file is bad (`evidence_problems(ev)` with git
+checks and the record required).
 
 ## Not pinned
 
@@ -201,3 +355,13 @@ source, the suite, a fault or the WP.
   identity and partial classification, including FEV scope skips and
   data-revision checks.
 - The exact seed string, the reason text, and extra result keys.
+- **The pod run that writes `evidence/w3b2.json`** (how the sweep is driven
+  on the host). Only its output is pinned.
+- **R12 on-rent evidence for `host`** (RV5 asked for it). R12's evidence
+  schema isn't on main, so there's nothing to bind to yet. When R12 reaches
+  L4, a tests-correction PR can require `host` to name an R12 evidence file.
+- **How the CLI builds its adapters** (which config keys name the registry,
+  and how lane A's king pointer and KING_D at a block are read). Only the
+  adapter reads and the refusal codes are pinned.
+- **The era's sentinel.** It's recorded, not re-derived from the era
+  boundary.
