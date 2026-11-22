@@ -1,12 +1,19 @@
-"""Lane D scorer (LANE_D_PLAN §1.1, §1.5; W5d deepens it).
+"""Lane D scorer (LANE_D_PLAN §1.1, §1.5; W5d).
 
 * **Quantile head, 9-level grid.** The model's own quantile head is read at
   :data:`SCORING_LEVELS` (picked out of the head's Q21 by exact level match,
   nothing interpolated), as lane A does under ``[v2] quantile_head_after``.
   No copula sampling, no Monte-Carlo noise.
+* **Declared contexts.** A forecast runs only at a context in
+  :data:`SCORER_CONTEXTS` and, when the armed ``[lane_d] contexts`` are
+  given, in those too (:func:`declared_context`). Horizons are capped at
+  :data:`MAX_HORIZON` (16 CPM patches × 32: longer spans are outside
+  training). Both are refused before anything is loaded or torch imported.
 * **No padding.** Each history is truncated to the largest patch multiple it
   really has, capped at the declared ``context``; histories of equal length
-  are batched together. The pinned wrapper's edge-pad is never used.
+  are batched together (:func:`batch_plan`, one forward per length). The
+  pinned wrapper's edge-pad is never used, so a 4k model and a declared-128k
+  copy of it score identically on windows with ≤ 4096 history (T7).
 * **Context is scorer-side.** The model is built from the checkpoint's own
   ``config.json`` with ``context_length`` set to the declared context; the
   weights fit any context (non-persistent positional buffers).
@@ -24,6 +31,7 @@ it without torch.
 from __future__ import annotations
 
 import json
+import operator
 import os
 from pathlib import Path
 
@@ -35,6 +43,41 @@ from .mase import mase as mase_one
 SCORING_LEVELS: tuple[float, ...] = tuple(float(q) for q in DEFAULT_QUANTILE_LEVELS)
 MEDIAN_INDEX = SCORING_LEVELS.index(0.5)
 SCORING_METHOD = "quantile_head"
+
+# Every context the scorer builds a model at: the trained 4096 (128 patches)
+# and its 2×…32× extensions. ``[lane_d] contexts`` arms a subset of these
+# (launch: 4k/8k/16k; 32k–128k by overlay at S8 after T7).
+SCORER_CONTEXTS: tuple[int, ...] = (4096, 8192, 16384, 32768, 65536, 131072)
+# CPM masks contiguous spans of at most cpm_c_max = 16 patches of 32 points.
+MAX_HORIZON = 16 * 32
+
+
+def _as_int(value, what: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{what} must be an integer, got {value!r}")
+    try:
+        return operator.index(value)
+    except TypeError:
+        raise ValueError(f"{what} must be an integer, got {value!r}") from None
+
+
+def declared_context(context, contexts) -> int:
+    """``int(context)`` when it is an armed context (in ``contexts``) and a
+    scorer context (in :data:`SCORER_CONTEXTS`); ``ValueError`` otherwise."""
+    c = _as_int(context, "context")
+    armed = {_as_int(x, "armed context") for x in contexts}
+    if c not in armed:
+        raise ValueError(f"context {c} is not an armed [lane_d] context {sorted(armed)}")
+    if c not in SCORER_CONTEXTS:
+        raise ValueError(f"context {c} is not a scorer context {list(SCORER_CONTEXTS)}")
+    return c
+
+
+def _checked_horizon(horizon) -> int:
+    h = _as_int(horizon, "horizon")
+    if not 1 <= h <= MAX_HORIZON:
+        raise ValueError(f"horizon {h} outside [1, {MAX_HORIZON}] (16 CPM patches x 32)")
+    return h
 
 
 def level_indices(head_levels, wanted=SCORING_LEVELS, tol: float = 1e-9) -> list[int]:
@@ -54,7 +97,24 @@ def usable_length(n_points: int, context: int, patch_size: int) -> int:
     return (min(int(n_points), int(context)) // int(patch_size)) * int(patch_size)
 
 
-def _load_model(checkpoint_dir: Path, context: int):
+def batch_plan(history_lengths, *, context: int, patch_size: int) -> dict[int, list[int]]:
+    """The no-pad plan: ``{model input length: [window indices]}``, keys and
+    indices ascending. A window's input length is its :func:`usable_length`;
+    nothing is padded up. A history shorter than one patch is a ``ValueError``."""
+    ps = _as_int(patch_size, "patch_size")
+    ctx = _as_int(context, "context")
+    if ps < 1 or ctx < ps:
+        raise ValueError(f"context {ctx} / patch_size {ps} invalid")
+    plan: dict[int, list[int]] = {}
+    for i, n in enumerate(history_lengths):
+        n = _as_int(n, "history length")
+        if n < ps:
+            raise ValueError(f"window {i}: history of {n} points is shorter than one patch ({ps})")
+        plan.setdefault(usable_length(n, ctx, ps), []).append(i)
+    return {length: plan[length] for length in sorted(plan)}
+
+
+def _load_model(checkpoint_dir: Path, context: int, device: str):
     import torch
     from safetensors.torch import load_file
 
@@ -68,10 +128,10 @@ def _load_model(checkpoint_dir: Path, context: int):
     state = load_file(str(checkpoint_dir / "weights.safetensors"))
     state = {k: (v.to(torch.float32) if v.is_floating_point() else v) for k, v in state.items()}
     model.load_state_dict(state, strict=True)
-    return pm, cfg, model
+    return pm, cfg, model.to(device)
 
 
-def _forward(pm, cfg, model, rows: np.ndarray, horizon: int) -> np.ndarray:
+def _forward(pm, cfg, model, rows: np.ndarray, horizon: int, device: str) -> np.ndarray:
     """``(B, L)`` float64 histories (L a patch multiple) → ``(B, horizon, Q21)``,
     the pyramid head's quantiles in data units (the wrapper's arithmetic,
     without its pad)."""
@@ -80,7 +140,7 @@ def _forward(pm, cfg, model, rows: np.ndarray, horizon: int) -> np.ndarray:
     ps = int(cfg.patch_size)
     b, length = rows.shape
     count = (int(horizon) + ps - 1) // ps
-    context = torch.as_tensor(rows, dtype=torch.float64)[:, None]
+    context = torch.as_tensor(rows, dtype=torch.float64, device=device)[:, None]
     x = torch.cat([context, context.new_zeros(b, 1, count * ps)], -1)
     mask = torch.zeros_like(x, dtype=torch.bool)
     mask[..., length:] = True
@@ -98,34 +158,42 @@ def _forward(pm, cfg, model, rows: np.ndarray, horizon: int) -> np.ndarray:
 
 
 def forecast_quantiles(checkpoint_dir: str | os.PathLike, histories, *, context: int,
-                       horizon: int) -> np.ndarray:
+                       horizon: int, contexts=None, device: str = "cpu") -> np.ndarray:
     """``(n, horizon, 9)`` quantile forecasts of ``histories`` at
-    :data:`SCORING_LEVELS`; raises ``ValueError`` on a history shorter than
-    one patch, a non-finite history or a non-finite forecast."""
+    :data:`SCORING_LEVELS`.
+
+    ``contexts`` is the armed ``[lane_d] contexts``: with it ``context`` must
+    pass :func:`declared_context`; without it ``context`` must still be in
+    :data:`SCORER_CONTEXTS`. ``horizon`` must be in ``[1, MAX_HORIZON]``.
+    Both checks run before anything is loaded or torch is imported. Each
+    window's model input is its last :func:`batch_plan` length points plus
+    ``ceil(h/32)`` masked horizon patches, one forward per length. Raises
+    ``ValueError`` on a history shorter than one patch, a non-finite history
+    or a non-finite forecast."""
+    ctx = declared_context(context, SCORER_CONTEXTS if contexts is None else contexts)
+    h = _checked_horizon(horizon)
+    d = Path(checkpoint_dir)
+    rows = []
+    for i, hist in enumerate(histories):
+        row = np.asarray(hist, dtype=np.float64).reshape(-1)
+        if not np.isfinite(row).all():
+            raise ValueError(f"window {i}: non-finite history")
+        rows.append(row)
+    if not rows:
+        return np.empty((0, h, len(SCORING_LEVELS)), dtype=np.float64)
+    # The patch size is read from the checkpoint's own config (json only), so
+    # a too-short history is refused before torch or the weights load.
+    meta = json.loads((d / "config.json").read_text(encoding="utf-8"))
+    plan = batch_plan([r.size for r in rows], context=ctx, patch_size=int(meta["moe"]["patch_size"]))
+
     import torch
 
-    if int(horizon) < 1 or int(context) < 1:
-        raise ValueError("horizon and context must be positive")
-    d = Path(checkpoint_dir)
-    pm, cfg, model = _load_model(d, int(context))
+    pm, cfg, model = _load_model(d, ctx, device)
     picks = np.asarray(level_indices(pm.QUANTILE_LEVELS), dtype=np.int64)
-    rows = []
-    for h in histories:
-        row = np.asarray(h, dtype=np.float64).reshape(-1)
-        if not np.isfinite(row).all():
-            raise ValueError("non-finite history")
-        n = usable_length(row.size, int(context), int(cfg.patch_size))
-        if n < int(cfg.patch_size):
-            raise ValueError(f"history of {row.size} points is shorter than one patch")
-        rows.append(row[-n:])
-    out = np.empty((len(rows), int(horizon), len(picks)), dtype=np.float64)
-    by_len: dict[int, list[int]] = {}
-    for i, r in enumerate(rows):
-        by_len.setdefault(r.size, []).append(i)
+    out = np.empty((len(rows), h, len(picks)), dtype=np.float64)
     with torch.no_grad():
-        for length in sorted(by_len):
-            idx = by_len[length]
-            q = _forward(pm, cfg, model, np.stack([rows[i] for i in idx]), int(horizon))
+        for length, idx in plan.items():
+            q = _forward(pm, cfg, model, np.stack([rows[i][-length:] for i in idx]), h, device)
             out[idx] = q[:, :, picks]
     if not np.isfinite(out).all():
         raise ValueError("non-finite lane D quantiles")
@@ -151,5 +219,6 @@ def score_window(q: np.ndarray, target: np.ndarray, history: np.ndarray,
     return crps, m
 
 
-__all__ = ["MEDIAN_INDEX", "SCORING_LEVELS", "SCORING_METHOD", "forecast_quantiles",
-           "level_indices", "score_window", "usable_length"]
+__all__ = ["MAX_HORIZON", "MEDIAN_INDEX", "SCORER_CONTEXTS", "SCORING_LEVELS", "SCORING_METHOD",
+           "batch_plan", "declared_context", "forecast_quantiles", "level_indices",
+           "score_window", "usable_length"]
