@@ -16,6 +16,11 @@ On main, every failure is an `AssertionError`:
 `test_inv1_targets_unchanged_when_unarmed` and
 `test_inv1_sentinel_unchanged_when_unarmed` pass on main.
 
+RV6 B4 (`test_wb18_deferral_ttl.py`, item 11): on main, each test fails with
+`funding_expired`, except `test_inv_ttl_unchanged_for_undeferred_entry`,
+which passes on main. The failure shows at the first tick more than 36 h
+after the fund, which is era 4 + 11 h.
+
 ## What runs for real, and what is stubbed
 
 This is the same harness as WB15.
@@ -77,7 +82,38 @@ This is the same harness as WB15.
    same state file) between deferred eras doesn't reset the bound.
 10. **Production wiring.** `RunnerLaneBOps.block_hash(block)` is the chain
     client's `block_hash(block)`.
-11. **Determinism.** The same plan comes out under permuted funding order and
+11. **A deferred funded entry never expires while deferred (RV6 B4).** The
+    funding queue's `expire_stale` runs first in every tick. It fails a
+    `queued` entry idle past `entry_ttl_seconds` (`[round]
+    funded_entry_ttl_hours` = 36 h) as `funding_expired`, and the miner has
+    to fund again, which is a charge. Four deferral eras at 12 h are 48 h,
+    more than the TTL. The rule is **refresh**: each tick that defers an
+    entry (`sentinel_target`, and WB15's `rows_held`, which is also
+    uncharged) re-stamps its liveness, the way lane A's `touch` does for
+    admission-held entries. So the TTL clock doesn't run while the entry is
+    deferred. After the deferral ends, the entry has at least one full TTL
+    from its last deferred tick to start. Pause isn't enough: it keeps the
+    idle time from before the deferral, and §12b.5 says a deferral consumes
+    nothing of the miner's. Extending the TTL by the deferred span also
+    passes, because only the lower bound is pinned. The tests pin:
+    - with ticks at +0 h and +11 h of every 12 h era, the entry is never
+      expired, never re-funded and never charged across
+      `sentinel_max_defer_eras` eras, both at the shipped 4 (48 h) and at a
+      configured 6 (72 h);
+    - a first post-deferral tick at the last deferred tick + TTL − 60 s
+      starts it on its target, whether release comes by rotation or past
+      the bound;
+    - the same holds for a `rows_held` entry across 59 h;
+    - nothing changes across whole restarts (new driver and new queue
+      object at every era), and the result is the same under a permuted
+      funding order and chain order.
+
+    **Invariant:** a never-deferred idle entry (funded, commitment
+    withdrawn) is not refreshed. It stays `queued` up to exactly
+    `active_at + TTL` and fails `funding_expired` at the first tick past
+    that, as before. Paired with this: the same clock, with a deferred entry
+    alongside, which survives.
+12. **Determinism.** The same plan comes out under permuted funding order and
     chain order, and under `PYTHONHASHSEED` 0 / 1 / 4242. The hash-seed check
     runs `python -P -m tests.accept.wb18.helpers` in fresh interpreters.
 
@@ -98,7 +134,15 @@ These are left to the builder:
 - the exact wording of the TB20 log line, beyond the hotkey and the key name;
 - where the era-deferral count lives in the driver state;
 - the lane B guard exclusion for the sentinel, which belongs to W-S2;
-- validator-side judging and pay of suite targets.
+- validator-side judging and pay of suite targets;
+- the mechanism behind item 11 (refresh at each deferred tick, an exemption
+  in `expire_stale`, or a TTL extended by the deferred span). Only the lower
+  bound and the unchanged non-deferred TTL are pinned;
+- **flagged, not pinned:** the payer-key vault's own TTL
+  (`PayerKeyVault.ttl_seconds`, also 36 h, which `vault.refresh` re-stamps).
+  A lane B leg rents on the miner's vault key, so a 48 h deferral can outlive
+  the key as well. The fixture's ops have no vault hook, so this needs its
+  own contract.
 
 ## Files
 
@@ -106,4 +150,5 @@ These are left to the builder:
 |---|---|
 | `PATHS` | the modules WB18 may change |
 | `helpers.py` | the scenario (real intake, queue, driver, W-S1 draw), the stub probe and ops, the torch guard, the hash-seed entry point |
-| `test_wb18_sentinel_deferral.py` | the plan text (WB18 / TB19 / TB20 / TS4 / D35 / LB5 verbatim), contract items 1–11, the invariant pairs |
+| `test_wb18_sentinel_deferral.py` | the plan text (WB18 / TB19 / TB20 / TS4 / D35 / LB5 verbatim), contract items 1–10 and 12, the invariant pairs |
+| `test_wb18_deferral_ttl.py` | item 11 (RV6 B4): a deferred entry never expires while deferred (`sentinel_target` and `rows_held`), a full TTL after the deferral, restarts, determinism, and the unchanged-TTL invariant pair |

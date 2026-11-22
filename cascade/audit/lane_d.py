@@ -56,7 +56,11 @@ def _expected_params(cfg) -> dict:
             "max_mirror_lag_hours": float(cfg.max_mirror_lag_hours),
             "gate_suites": [str(s) for s in cfg.gate_suites],
             "tau_public": float(cfg.tau_public),
-            "lowfreq_freqs": [str(f) for f in cfg.lowfreq_freqs]}
+            "lowfreq_freqs": [str(f) for f in cfg.lowfreq_freqs],
+            # RV4: gate params W7a added to lane-d-report/1 params.
+            "gate_weights": {str(s): float(w) for s, w in cfg.gate_weights},
+            "max_source_share": float(cfg.max_source_share),
+            "min_long_series": int(cfg.min_long_series)}
 
 
 def _signature(report: dict, signer_hotkey: str) -> str | None:

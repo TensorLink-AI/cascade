@@ -29,6 +29,21 @@ Rules for the tests:
   - the three `test_verifier_*` good-evidence cases (artefact schema 2).
 
   Every other test passes on main.
+- **Tests correction (RV6 B5 + B8).** The review found benign repos refused
+  (B5) and the lookup's memory unbounded (B8). These tests fail on main with
+  an `AssertionError`, pending an implementation PR:
+  - `test_wb11_low_info.py` (low-information windows; some cases already
+    pass on main);
+  - `test_wb11_memory.py` (`load_lookup` and its memory budget; the file-size
+    case passes on main);
+  - `test_exact_set_is_sha256_of_float64_sub_windows`,
+    `test_exact_set_skips_nan_..._smallest_window`,
+    `test_every_suite_window_is_in_both_sets`,
+    `test_stride_is_recorded_and_the_scan_is_still_every_offset` and
+    `test_offset_copy_and_int_inputs` (a constant window is no longer in the
+    exact set, and `[3]*40` no longer hits);
+  - every `test_verifier_*` case: `good_evidence` now records the
+    `load_lookup` peak.
 - Nothing is mocked and no data is downloaded. The fixture suites
   (`helpers.fixture_suites`) are four tiny seeded in-memory suites, and no
   test needs torch.
@@ -76,7 +91,8 @@ The artefact:
 
 The sub-windows are taken at offsets `0, stride, 2·stride, …` of each item.
 Only full windows count. A window that contains a missing value is skipped
-in both sets.
+in both sets. So is a **low-information** window (RV6 B5, section
+"Low-information windows" below), constant windows included.
 
 - **exact (pinned to the byte):** each hash is the lower-case hex `sha256`
   of the window's values packed as little-endian IEEE 754 float64
@@ -88,7 +104,8 @@ in both sets.
   promise in "Normalised matching at every scale" below; the recommended
   scheme is there. The exact byte encoding is the builder's choice, fixed by
   `SCHEMA` version 2, and a later change needs a new schema. A **constant** window (std 0) has
-  no z-score, so it has no normalised hash. It still has an exact hash.
+  no z-score, so it has no normalised hash. Since RV6 it has no exact hash
+  either: it is low-information.
   Normalised hashes never equal exact hashes.
 - **`window_id`** is `"<item id>@<offset>"`. When several windows share one
   hash, the value is the smallest `(suite, item, offset)` tuple. That is
@@ -140,7 +157,7 @@ offset (stride 1, whatever the artefact's stride) with the artefact's window:
 
 - **Hits:** the number of submission sub-window positions whose exact or
   normalised hash is in the set. A window with a missing value is skipped,
-  and so is a constant window for the normalised set.
+  and so is a low-information window (constant included), for both sets.
 - **`first`:** the hit at the lowest submission offset `at`, with exact
   checked before normalised at the same offset. It is `None` when nothing
   hits.
@@ -164,8 +181,9 @@ What the tests pin:
   normalised (v1 asked for 50 %: its 4-sig-fig rounding lost about 1 window
   in 7), which makes it contaminated.
 - **TB11 evasions at every scale:** see the next section.
-- **Constant data:** the ints `[3]*40` hit the flat suite series exactly and
-  never normalised.
+- **Constant data:** the ints `[3]*40` equal the flat suite series but hit
+  nothing and are not contaminated (RV6 B5; before RV6 they gave 9 exact
+  hits).
 - **A NaN in the submission** removes only the windows that contain it.
 
 ## Normalised matching at every scale (`test_wb11_scales.py`, schema 2)
@@ -251,6 +269,118 @@ Schema 2 replaces that rounding rule with the scheme above to meet §12b.1's
 own "robust to scale, offset and rounding" and TB11. The plan text should
 follow, as an owner edit outside this PR.
 
+## Low-information windows (`test_wb11_low_info.py`, RV6 B5)
+
+**The problem.** Real GIFT/BOOM data has zero runs (solar at night), sparse
+0/1 counters, exact index counters and values at a level plus float noise.
+Schema 2 as first built hashed every one of these windows. So a benign repo
+holding 1 KB of zero bytes, 32 `x = 0` lines, one-hot list literals or a
+`linspace` ramp was refused (measured on main against `helpers.hazard_suites`:
+the zeros give 97 exact hits, three one-hot lists 65 exact and 48 normalised,
+`range(48)` 17 + 17, a linspace ramp 1 normalised).
+
+**The rule (pinned; `helpers.low_information`).** A 32-point window is
+low-information when **any** of these holds:
+
+| | condition | catches |
+|---|---|---|
+| (a) | fewer than 4 distinct values | constant, one-hot, 0/1 and 3-level steps |
+| (b) | one value fills ≥ 3/4 of the window (24 of 32) | zero runs with a few spikes |
+| (c) | population std ≤ 2⁻⁴⁶ · \|mean\| (std 0 included) | a level plus float noise: the window spans < 64 float64 ulps of its level |
+| (d) | a least-squares line in the index leaves ≤ 1e-6 of the variance | `range`, `arange`, `linspace`, exact counters |
+
+Every rule is invariant under `a·x + b` with `a ≠ 0` (for (c): while the
+shift stays below 2⁴⁶ window stds), so a TB11 copy is low-information exactly
+when its suite window is.
+
+**Decision: both sides apply it.**
+
+- **Build:** a low-information window is in **neither** set. Its exact hash is
+  not evidence: an all-zero window in a suite and in a benign file are the same
+  bytes for unrelated reasons.
+- **Lookup:** a low-information **submission** window is never counted, exact
+  or normalised, whatever the artefact holds. The build rule alone isn't
+  enough. A one-hot list's z-pattern equals that of a *noisy* spike train,
+  and a linspace's equals a noisy trend's. Both are informative suite windows
+  that stay in the normalised set (`boom/spikes/0` and `time/trend/0` in the
+  fixture). The lookup rule also covers an artefact built before the rule.
+
+**What the tests pin:**
+
+- the exact set equals the low-information-filtered reference, and no window
+  of a low-information item is in either set;
+- six benign streams give 0 hits and aren't contaminated: 128 zero f64s, 32
+  int zeros, three one-hot lists, a linspace ramp, `range(48)`, and 1000 plus
+  1e-12 noise;
+- an artefact with hand-injected low-information hashes gives no hit;
+- real suite windows are still detected: every informative window of the
+  zero-run, spike-train and trend items hits both sets, the series is
+  contaminated, and a scaled copy of the spike train still hits ≥ 90 %.
+
+**Residual false negatives** (record them in the decision register with
+WB13's): a benchmark window that is itself low-information can't be caught;
+neither can a copy shifted by ≥ 2⁴⁶ of its window std (rule c). At that
+shift float64 keeps under 6 bits of shape per value, and Guard 4 is the
+backstop.
+
+## Memory budget (`test_wb11_memory.py`, RV6 B8)
+
+**The problem.** `load_artefact` returns the whole artefact as dicts. Measured
+on main at 50 000 windows: a heap peak of 57.6 MB (~1 150 B per window) for
+`load_artefact` plus `artefact_sha256`, and 9.2 MB `.json` / 4.2 MB `.json.gz`
+(183 / 84 B per window) on disk. At the review's "tens of millions" of
+windows (2·10⁷), that's a ~23 GB load. The intake runs on the 7 GB production
+box next to the validator, so this would OOM every service.
+
+**The contract.** `load_artefact` keeps returning the full dict: the CLI,
+the evidence check and `loaded == built` use it. The intake gets a new
+loader:
+
+`load_lookup(path, *, expect_sha256=None)` returns a read-only lookup
+structure.
+
+- `match_series` and `is_contaminated` accept it, and give the same answers
+  as on the dict artefact.
+- It exposes `["schema"]`, `["version"]`, `["window"]`, `["stride"]` and
+  `["suites"]`. Those are the header keys WB13's `scan_repo` reads.
+- It raises `ValueError` in three cases: the file's canonical-JSON sha256 isn't
+  `expect_sha256`, the file is tampered, or the schema isn't 2 (schema 1
+  included).
+- How it is built isn't pinned. It doesn't have to load the JSON into
+  dicts. For example: stream-parse the canonical JSON, whose keys are
+  already sorted, and hash it incrementally. Then keep sorted `array("Q")`
+  64-bit hash prefixes plus an item index and an offset per hash. A
+  throwaway prototype of that measured 50.7 B/window peak, including the
+  fixed buffers, and 60 B/window of RSS growth.
+
+**The bounds (pinned; `helpers`).** They're measured on a synthetic
+50 000-window artefact (4 seeded random walks of 12 531 points). It is built in
+one fresh process and loaded in another, about 3 s of CPU each:
+
+| quantity | bound |
+|---|---|
+| `load_lookup` heap peak (tracemalloc) | ≤ 64 B/window + 1 MiB |
+| process RSS growth over the load (ru_maxrss) | ≤ 128 B/window + 16 MiB |
+| `hashset-v<n>.json.gz` as `write_artefact` writes it | ≤ 96 B/window + 64 KiB (main: 84) |
+| any pinned artefact's lookup peak | ≤ 1.5 GiB, whatever N is |
+
+**What that means at real-suite scale.** 2·10⁷ windows load in ≤ 1.28 GB of
+heap and at most 2.6 GB of RSS growth. The committed `.json.gz` is ≤ 1.9 GB,
+which is large for a git repo: an owner decision at pin time. The 1.5 GiB cap
+admits at most ~2.5·10⁷ suite windows. Above that the pin is refused, and the
+owner decides first: a shorter suite list, a stride > 1, or a host with more
+memory.
+
+**The pin records it.** `verify` also prints `n_exact`, `n_normalised`,
+`file_bytes` and `lookup_peak_bytes`, which is the traced peak of
+`load_lookup` on that file. The evidence carries the same four fields, and
+`helpers.evidence_problems` checks them:
+
+- the counts equal the artefact's set sizes;
+- `file_bytes` is the file's size, within the file bound;
+- `lookup_peak_bytes` is a measured int ≥ 1 within the per-window budget and
+  the 1.5 GiB cap.
+
 ## CLI (the owner runs it on the bench pod)
 
 ```
@@ -289,8 +419,11 @@ The owner runs these steps:
 {"wp": "WB11", "passed": true, "schema": "laned_wb11_pin/1", "source": "bench_pod",
  "artefact": "benchmarks/contamination/hashset-v1.json", "version": 1,
  "sha256": "sha256:<64 hex>", "rebuild_sha256": "sha256:<64 hex>",
- "suites": {"gift": {…identity…}, "boom": {…}, "time": {…}, "fev": {…}}}
+ "suites": {"gift": {…identity…}, "boom": {…}, "time": {…}, "fev": {…}},
+ "n_exact": 123, "n_normalised": 120, "file_bytes": 4567, "lookup_peak_bytes": 8910}
 ```
+
+(The last four fields are from RV6 B8, as `verify` prints them; see "Memory budget".)
 
 Then `scripts/laned/accept WB11 --evidence evidence/wb11.json` exports it as
 `$LANED_EVIDENCE`. The `test_evidence_*` tests **skip** while it is unset,
@@ -316,10 +449,12 @@ return `[]`. It checks these:
 
 The `test_verifier_*` tests build good evidence offline from the fixture
 suites in `tmp_path` and check two things. Good evidence passes. Each of the
-19 `TAMPER` cases fails, for example: a fixture source, a rebuild mismatch, a
+27 `TAMPER` cases fails, for example: a fixture source, a rebuild mismatch, a
 missing suite, a wrong identity, an unpinned or mismatched mainnet pin, a
-mismatched testnet pin, an edited or absent artefact, a `.zst` name, or a
-version mismatch. So do an artefact of other suite versions and a v1 name
+mismatched testnet pin, an edited or absent artefact, a `.zst` name, a
+version mismatch, or (RV6 B8) a missing or wrong `n_exact` /
+`n_normalised` / `file_bytes`, or a `lookup_peak_bytes` that is missing, 0,
+over the per-window budget or over the 1.5 GiB cap. So do an artefact of other suite versions and a v1 name
 on version-2 evidence.
 
 A from-data rebuild in CI isn't possible, because the suite data lives on the
@@ -331,8 +466,8 @@ build as `rebuild_sha256`. CI re-derives the digest from the committed file.
 - The normalised byte encoding and the grid/tolerance values. The scheme in
   "Normalised matching at every scale" is recommended, and only its
   detection and false-positive behaviour is pinned.
-- How hashes are stored in memory for fast lookup, and the probe order or
-  cap, within the 90 % floor.
+- How `load_lookup` stores hashes in memory, within the "Memory budget"
+  bounds, and the probe order or cap, within the 90 % floor.
 - The real-data reader.
 - Extra artefact keys, as long as they're deterministic: no timestamps,
   hosts or paths.

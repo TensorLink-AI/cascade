@@ -295,6 +295,9 @@ class ValidatorRunner(
     _merged_init_ok: set = field(default_factory=set, repr=False)
     # the pool lane-B catch-up / on-demand judging re-draws windows from
     _lane_b_window_source: object = field(default=None, repr=False)
+    # W-S2: the chain client lane B reads a settlement era's §16 sentinel
+    # block hash through (catch-up / on-demand settlements; only when armed)
+    _lane_b_chain: object = field(default=None, repr=False)
     # the payout record of the last vector _apply_weights set (None = the
     # legacy lane-A vector) — stamped on that round's receipt
     _last_lane_b_pay: dict | None = field(default=None, repr=False)
@@ -1028,6 +1031,7 @@ class ValidatorRunner(
         store = open_manifest_store(self.cfg.storage)
         self._lane_b_store = store         # DEC-CA-0050 expert manifests live beside
         self._lane_b_window_source = window_source   # lane-B catch-up re-draws its windows
+        self._lane_b_chain = client        # W-S2: a settlement era's sentinel hash
         if self.bench_report_store is None:
             # Bench reports live in the same bucket — reuse this store (and its
             # R2/HF fallbacks) instead of lazily building a second client.
@@ -1309,6 +1313,7 @@ class ValidatorRunner(
         lane_b_rounds = None
         if reason is None:
             self._lane_b_block = self._epoch_start_block(manifest)
+            self._lane_b_chain = client
             lb_key = f"{rid}|lane_b"
             try:
                 lane_b_rounds = self._lane_b_prepare(manifest)
