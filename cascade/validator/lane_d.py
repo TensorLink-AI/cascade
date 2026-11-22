@@ -29,7 +29,11 @@ validator. Unarmed (``not cfg.active(boundary)``) it returns
    ``(horizon, 9)`` quantile forecasts (``score_window``) into report rows;
 5. decides with the paired cluster bootstrap (clusters = source), max-T over
    the cohort: a member clears iff ``LCB ≥ d_margin`` and its point gain is
-   positive; a first clear goes ``confirm_pending`` and must clear again on a
+   positive. When a miner holds KING_D, every member is also judged, the
+   same way and on the same set, against the current house, and clears only
+   if it clears both (Proposed change 3: the house ranks first on ties, so a
+   copy of the house never clears); the house's rows sit next to the king's.
+   A first clear goes ``confirm_pending`` and must clear again on a
    disjoint set (D20 ``confirm_on_king_change``) before it is crowned;
    each verdict reports the §1.3b A10 low-frequency slice (report-only here:
    W3b5 computes ``pass``/``fail`` and its ``lowfreq_regression`` effect);
@@ -356,13 +360,15 @@ def _eligibility(pools: list[dict], t_entry: int, t_king: int, cfg
     return eligible, dict(sorted(refused.items()))
 
 
-def _cohort_set(index: dict, pools: list[dict], members: list[str], king_digest: str,
+def _cohort_set(index: dict, pools: list[dict], members: list[str], bars: list[str],
                 king_ts: int, state: dict, forecasts: dict, cfg
                 ) -> tuple[list[dict], dict[str, int]]:
     """The cohort's judged window set: the intersection of the members'
     frozen sets that is eligible for ``max(T over cohort ∪ king)``, has a
-    usable target, a usable forecast from the king and every member, and no
-    window a member was already judged on; plus the §1.3 refusal counts."""
+    usable target, a usable forecast from every bar the cohort is judged
+    against (KING_D, plus the house when a miner holds KING_D) and from every
+    member, and no window a member was already judged on; plus the §1.3
+    refusal counts."""
     t_entry = max(int(state["entries"][m]["reveal_ts"]) for m in members)
     h = int(cfg.horizon)
     eligible, refused = _eligibility(pools, t_entry, int(king_ts), cfg)
@@ -373,7 +379,8 @@ def _cohort_set(index: dict, pools: list[dict], members: list[str], king_digest:
         if wid not in eligible or wid not in index:
             continue
         w = index[wid][0]
-        if not _target_usable(w, h) or _forecast_ok(forecasts.get(king_digest), wid, h) is not True:
+        if not _target_usable(w, h) or any(
+                _forecast_ok(forecasts.get(b), wid, h) is not True for b in bars):
             continue
         if any(wid in state["entries"][m]["used_windows"]
                or _forecast_ok(forecasts.get(m), wid, h) is not True for m in members):
@@ -540,7 +547,12 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     crowned: list[dict] = []
     for (kd, stage), members in sorted(groups.items()):
         king_ts = _king_reveal_ts(state, kd)
-        if king_ts is None or forecasts.get(kd) is None:
+        # Change 3: when a miner holds KING_D, the current house is a second
+        # bar on the same set (a copy of a fresh house must not win). Its
+        # forecasts are required: a house that cannot be scored fails closed.
+        hd = str(state["house"]["digest"])
+        bars = [kd] if kd == hd else [kd, hd]
+        if king_ts is None or any(forecasts.get(b) is None for b in bars):
             for m in members:
                 skip(m, "king_unscored")
             continue
@@ -556,16 +568,17 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
         members = frozen
         if not members:
             continue
-        ws, refused = _cohort_set(index, pools, members, kd, king_ts, state, forecasts, cfg)
+        ws, refused = _cohort_set(index, pools, members, bars, king_ts, state, forecasts, cfg)
         while members and not _meets_floors(ws, cfg):
             skip(members.pop(), "pending_floor")
             if members:
-                ws, refused = _cohort_set(index, pools, members, kd, king_ts, state, forecasts,
+                ws, refused = _cohort_set(index, pools, members, bars, king_ts, state, forecasts,
                                           cfg)
         if not members:
             continue
         scores = {}
-        for dg in [kd, *members]:
+        scored = [*bars, *members]
+        for dg in scored:
             pairs = [score_window(forecasts[dg][w["window_id"]], w["target"], w["history"],
                                   w["seasonal_period"]) for w in ws]
             scores[dg] = (np.asarray([p[0] for p in pairs]), np.asarray([p[1] for p in pairs]))
@@ -577,11 +590,21 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
                 "min_target_ts": int(min(w["target_ts"])),
                 "min_first_seen_ts": int(min(w["first_seen_ts"])),
                 "mirror_lag_hours": None if lag is None else float(lag)}
-            for dg in [kd, *members]:
+            for dg in scored:
                 rows.append({"window_id": w["window_id"], "digest": dg, "cohort": len(cohorts),
                              "crps": float(scores[dg][0][i]), "mase": float(scores[dg][1][i])})
+        clusters = [w["source"] for w in ws]
         res = judge_cohort(scores[kd], [scores[m] for m in members],
-                           clusters=[w["source"] for w in ws], cfg=cfg, seed=seed)
+                           clusters=clusters, cfg=cfg, seed=seed)
+        if len(bars) > 1:
+            # The same max-T judgment with the house as the bar: a member
+            # clears only if it clears both. ``judge_cohort`` needs a
+            # positive gain, so an exact tie with the house never clears
+            # (the house ranks first on ties).
+            vs_house = judge_cohort(scores[hd], [scores[m] for m in members],
+                                    clusters=clusters, cfg=cfg, seed=seed)
+            res = [{**r, "cleared": bool(r["cleared"] and rh["cleared"])}
+                   for r, rh in zip(res, vs_house, strict=True)]
         set_sha = hashlib.sha256("\n".join(w["window_id"] for w in ws).encode()).hexdigest()
         t_max = max([king_ts] + [state["entries"][m]["reveal_ts"] for m in members])
         cohorts.append({"index": len(cohorts), "king_digest": kd, "king_reveal_ts": int(king_ts),
