@@ -50,7 +50,13 @@ def _expected_params(cfg) -> dict:
             "max_entries_per_settlement": int(cfg.max_entries_per_settlement),
             "max_judged_per_coldkey_per_settlement":
                 int(cfg.max_judged_per_coldkey_per_settlement),
-            "scoring_levels": list(LEVELS)}
+            "scoring_levels": list(LEVELS),
+            # §14.3 fields W7a added to lane-d-report/1, re-derived from cfg.
+            "horizons": [int(cfg.horizon)],
+            "max_mirror_lag_hours": float(cfg.max_mirror_lag_hours),
+            "gate_suites": [str(s) for s in cfg.gate_suites],
+            "tau_public": float(cfg.tau_public),
+            "lowfreq_freqs": [str(f) for f in cfg.lowfreq_freqs]}
 
 
 def _signature(report: dict, signer_hotkey: str) -> str | None:
