@@ -187,6 +187,50 @@ After human authorization, the full B workflow is:
    every 30–60 seconds with backoff. This joins execution with scientific
    progress; `cascade lane-b status` alone is the intake queue view.
 
+### Lane B: declaring rows and suite targets
+
+Read the effective `[lane_b]` settings from `cascade status --json` first.
+Most lane B track features ship turned off; see
+[MINER.md](MINER.md#lane-b-track-settings) for every key and its default.
+
+**Suite targets.** Only while `suite_targets` is on, the targets also
+include `suite:gift`, `suite:boom`, `suite:time` and `suite:fev`. A
+generator that declares one must not carry any public benchmark series.
+Before you suggest funding, check that the tree has no data files or numeric
+literals copied from GIFT-Eval, BOOM, TIME or fev. The intake refuses such a
+tree with `benchmark_series_embedded` and charges nothing. In an era where
+the target suite is the sentinel, the entry waits as
+`deferred: sentinel_target`.
+
+**Declared rows.** To train rows you chose, rather than the trainer's ESFT
+pick, the fund request carries the `X-Lane-B-Declared-Rows` header.
+`cascade lane-b fund` does not send it, so this is a hand-built signed
+request. Show the human the exact header and get explicit approval before
+sending it. Example:
+
+```text
+X-Lane-B-Declared-Rows: {"0": [3, 17, 40, 90], "3": [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]}
+```
+
+Checklist for the agent:
+
+1. Keys are MoE ordinals 0..6 (MoE layers in order, not block indices).
+2. Rows are expert indices of that layer: `E` is 128 on ordinal 0, 256 on
+   ordinals 1 and 2, and 512 on ordinals 3 to 6.
+3. Under the default `min_experts_frac` / `max_experts_frac`, a declared
+   layer holds 4..19 rows when `E` is 128, 8..38 rows when `E` is 256 and
+   16..76 rows when `E` is 512. Recompute with `ceil(min × E)` and
+   `floor(max × E)` if the effective fractions differ.
+4. Rows are distinct, and at least one layer has rows.
+5. The signed ref field ends in `|rows=<sha256 of the canonical rows>`; see
+   [INTERFACE.md](INTERFACE.md#lane-b-declared-rows-header).
+
+A malformed declaration is refused with a `declared_rows_*` code before
+anything is charged. If the rows overlap rows another leg or pending merge
+holds, the entry waits, uncharged, as `deferred: rows_held`. Poll status as
+above. A `rows_held` or `sentinel_target` deferral is not a failure, so do
+not re-fund or re-commit because of one.
+
 ## Lane C: test a MarketCast recipe
 
 ```bash
