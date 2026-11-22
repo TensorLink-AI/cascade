@@ -68,5 +68,15 @@ owner may choose a later supported row and says why under "Rationale".
 
 - Command, from a clean main checkout with the `HIPPIUS_*` environment set:
   `python -P -m cascade.laned.storage_probe --bucket <throwaway lock-enabled bucket> --prefix <throwaway prefix>/ --other-bucket <bucket outside the sub-token> --out evidence/w3a_probe.json --confirm-live`
+  The bucket must have Object Lock enabled and **no default retention
+  rule**: the probe reads the lock configuration before its first write and
+  refuses such a bucket (exit 2, `bucket_default_retention`), since every
+  object it writes would inherit the lock.
+- Verify, the same day and before the locks expire (read-only; same
+  environment): `python -P -m cascade.laned.storage_probe verify --evidence evidence/w3a_probe.json`
+  It re-reads each COMPLIANCE-locked version from the bucket, lists the run
+  root, and adds the hash-bound `verified_live` record to the file. Only
+  then run `sha256sum evidence/w3a_probe.json` for the Evidence sha256
+  above (of the verified file), and never edit the file afterwards.
 - Run id, endpoint host, bucket and the COMPLIANCE-locked objects left until
   their retain-until date: (owner fills from the probe's stdout)

@@ -20,6 +20,15 @@ Usage (owner, from a clean main checkout, with the ``HIPPIUS_*`` env set)::
         --prefix <throwaway prefix>/ --other-bucket <bucket outside the sub-token> \\
         --out evidence/w3a_probe.json --confirm-live
 
+then, the same day (before the locks expire), the read-only re-check against
+the live bucket, which adds the hash-bound ``verified_live`` record::
+
+    python -P -m cascade.laned.storage_probe verify --evidence evidence/w3a_probe.json
+
+Before its first write the probe reads the bucket's Object Lock configuration
+once and refuses (exit 2, ``bucket_default_retention``) a bucket with a
+default retention rule, which would lock every object the run writes.
+
 Credentials are read from the environment by name only
 (``HIPPIUS_S3_ACCESS_KEY`` / ``HIPPIUS_S3_SECRET_KEY`` and the read-write
 sub-token ``HIPPIUS_PROBE_SUBTOKEN_ACCESS_KEY`` /
@@ -96,7 +105,28 @@ LOCK_MODE = "COMPLIANCE"
 
 
 class UsageError(ValueError):
-    """A refusal before any storage access (exit 2)."""
+    """A refusal before any storage write (exit 2). ``code`` is a typed
+    refusal code (``bucket_default_retention``, ``bucket_lock_unreadable``)
+    when one applies; the message then starts with it."""
+
+    def __init__(self, message: str, code: str | None = None):
+        super().__init__(f"{code}: {message}" if code else message)
+        self.code = code
+
+
+class VerifyRefused(Exception):
+    """``verify_live`` refuses the evidence; ``code`` says why (README
+    "storage_probe verify")."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(f"{code}: {message}")
+        self.code = code
+
+
+DEFAULT_RETENTION_CODE = "bucket_default_retention"
+LOCK_UNREADABLE_CODE = "bucket_lock_unreadable"
+LOCK_NOT_FOUND_CODES = ("ObjectLockConfigurationNotFoundError",)
+VERIFY_SCHEMA = "laned_w3a_verify/1"
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -263,29 +293,90 @@ def _rid_from_headers(headers: dict) -> str | None:
     return None
 
 
+def _rid_from_meta(meta: dict) -> str | None:
+    """A request id from a boto3 ``ResponseMetadata``: ``RequestId``, then
+    the ``x-amz-request-id`` / ``x-amz-id-2`` / ``x-request-id`` header."""
+    meta = meta if isinstance(meta, dict) else {}
+    return meta.get("RequestId") or _rid_from_headers(meta.get("HTTPHeaders") or {})
+
+
+def _error_response(exc: BaseException) -> dict | None:
+    """The ``response`` dict of a botocore ``ClientError``-shaped exception
+    (duck-typed, so botocore is never imported here), else None."""
+    resp = getattr(exc, "response", None)
+    return resp if isinstance(resp, dict) else None
+
+
+def _s3_client(endpoint: str, region: str, access_env: str, secret_env: str):
+    import boto3  # lazy: never imported in --dry-run or before the refusals
+    from botocore.config import Config
+
+    cfg = Config(signature_version="s3v4", s3={"addressing_style": "path"},
+                 connect_timeout=30, read_timeout=600,
+                 retries={"max_attempts": 2, "mode": "standard"},
+                 request_checksum_calculation="when_required",
+                 response_checksum_validation="when_required")
+    return boto3.client("s3", endpoint_url=endpoint, region_name=region,
+                        aws_access_key_id=os.environ[access_env],
+                        aws_secret_access_key=os.environ[secret_env], config=cfg)
+
+
+def bucket_lock_preflight(client, bucket: str) -> dict:
+    """The pre-write Object Lock read (RV4). One call,
+    ``get_object_lock_configuration(Bucket=bucket)``, on a boto3-shaped
+    client. A bucket whose lock rule carries a ``DefaultRetention`` (any mode,
+    any period) would lock every object the run writes, so it is refused
+    (``UsageError`` code ``bucket_default_retention``); an answer that can't
+    tell is refused too (``bucket_lock_unreadable``, fail closed). No lock
+    configuration at all (``ObjectLockConfigurationNotFoundError``) proceeds
+    with ``lock_enabled: False``. Returns the ``bucket_lock`` evidence
+    record."""
+    try:
+        out = client.get_object_lock_configuration(Bucket=bucket)
+    except Exception as e:  # noqa: BLE001 — classified below; anything unknown fails closed
+        resp = _error_response(e)
+        if resp is not None:
+            meta = resp.get("ResponseMetadata") or {}
+            code = (resp.get("Error") or {}).get("Code")
+            status = meta.get("HTTPStatusCode")
+            if code in LOCK_NOT_FOUND_CODES:
+                return {"lock_enabled": False, "default_retention": None,
+                        "http_status": status, "request_id": _rid_from_meta(meta)}
+            raise UsageError(f"GetObjectLockConfiguration on {bucket!r} answered {status} "
+                             f"({code}): cannot tell whether the bucket has a default "
+                             "retention rule, so nothing is written",
+                             code=LOCK_UNREADABLE_CODE) from None
+        raise UsageError(f"GetObjectLockConfiguration on {bucket!r} failed "
+                         f"({scrub(f'{type(e).__name__}: {e}')}): cannot tell whether the "
+                         "bucket has a default retention rule, so nothing is written",
+                         code=LOCK_UNREADABLE_CODE) from None
+    meta = out.get("ResponseMetadata") or {}
+    cfg = out.get("ObjectLockConfiguration") or {}
+    rule = cfg.get("Rule") or {}
+    if rule.get("DefaultRetention") is not None:
+        raise UsageError(f"bucket {bucket!r} has a default Object Lock retention rule "
+                         f"({json.dumps(rule['DefaultRetention'], sort_keys=True, default=str)}): "
+                         "every object the probe writes (about 11 GB) would inherit it and be "
+                         "undeletable; use a lock-enabled bucket with no default rule",
+                         code=DEFAULT_RETENTION_CODE)
+    return {"lock_enabled": cfg.get("ObjectLockEnabled") == "Enabled", "default_retention": None,
+            "http_status": meta.get("HTTPStatusCode"), "request_id": _rid_from_meta(meta)}
+
+
 class LiveBackend:
     """Hippius S3 through boto3 (credentialed ops) and http.client (presigned
     URLs, sent with no Authorization header)."""
 
     def __init__(self, endpoint: str, region: str, bucket: str, timeout: float = 600.0):
-        import boto3  # lazy: never imported in --dry-run
-        from botocore.config import Config
-
         self.bucket = bucket
         self.timeout = timeout
-        cfg = Config(signature_version="s3v4", s3={"addressing_style": "path"},
-                     connect_timeout=30, read_timeout=600,
-                     retries={"max_attempts": 2, "mode": "standard"},
-                     request_checksum_calculation="when_required",
-                     response_checksum_validation="when_required")
+        self._main = _s3_client(endpoint, region, MAIN_ACCESS_ENV, MAIN_SECRET_ENV)
+        self._sub = (_s3_client(endpoint, region, SUB_ACCESS_ENV, SUB_SECRET_ENV)
+                     if self.has_subtoken() else None)
 
-        def client(access_env: str, secret_env: str):
-            return boto3.client("s3", endpoint_url=endpoint, region_name=region,
-                                aws_access_key_id=os.environ[access_env],
-                                aws_secret_access_key=os.environ[secret_env], config=cfg)
-
-        self._main = client(MAIN_ACCESS_ENV, MAIN_SECRET_ENV)
-        self._sub = client(SUB_ACCESS_ENV, SUB_SECRET_ENV) if self.has_subtoken() else None
+    def lock_client(self):
+        """The boto3 client ``bucket_lock_preflight`` reads through."""
+        return self._main
 
     @staticmethod
     def has_subtoken() -> bool:
@@ -428,7 +519,7 @@ class LiveBackend:
             raw = r.data["raw"]
             r.data = {"size": raw.get("ContentLength"), "mode": raw.get("ObjectLockMode"),
                       "retain_until": _iso(raw.get("ObjectLockRetainUntilDate")),
-                      "version_id": raw.get("VersionId")}
+                      "version_id": raw.get("VersionId"), "etag": raw.get("ETag")}
         return r
 
     def copy_object(self, dst_key, src_key):
@@ -528,7 +619,27 @@ def load_fixture(path: Path) -> dict:
                                                   (t is int and isinstance(v, bool)))
         if not ok:
             raise UsageError(f"--fixture: bad value for {k!r}")
+    dr = model.get("default_retention")
+    if dr is not None:
+        periods = [k for k in ("days", "years") if k in dr] if isinstance(dr, dict) else []
+        ok = (isinstance(dr, dict) and set(dr) <= {"mode", "days", "years"}
+              and dr.get("mode") in ("COMPLIANCE", "GOVERNANCE") and len(periods) == 1
+              and isinstance(dr[periods[0]], int) and not isinstance(dr[periods[0]], bool)
+              and dr[periods[0]] > 0)
+        if not ok:
+            raise UsageError("--fixture: bad value for 'default_retention' (want null or "
+                             "{mode: COMPLIANCE|GOVERNANCE, days|years: a positive int})")
+    model["default_retention"] = dr
     return model
+
+
+class FixtureClientError(Exception):
+    """A fixture error in the ``botocore`` ``ClientError`` shape (``response``
+    with ``Error.Code`` and ``ResponseMetadata``)."""
+
+    def __init__(self, code: str, meta: dict):
+        super().__init__(f"fixture error {code}")
+        self.response = {"Error": {"Code": code}, "ResponseMetadata": meta}
 
 
 class FixtureBackend:
@@ -549,6 +660,25 @@ class FixtureBackend:
 
     def has_subtoken(self) -> bool:
         return self.m["subtoken"] is not None
+
+    def lock_client(self):
+        """This backend answers ``get_object_lock_configuration`` itself."""
+        return self
+
+    def get_object_lock_configuration(self, Bucket):  # noqa: N803 — boto3 keyword shape
+        """The model's lock configuration in the boto3 response shape."""
+        self._n += 1
+        meta = {"HTTPStatusCode": 200, "RequestId": f"fixture-{self._n}"}
+        if not self.m["bucket_lock_enabled"]:
+            meta["HTTPStatusCode"] = 404
+            raise FixtureClientError("ObjectLockConfigurationNotFoundError", meta)
+        cfg: dict = {"ObjectLockEnabled": "Enabled"}
+        dr = self.m.get("default_retention")
+        if dr is not None:
+            period = "Days" if "days" in dr else "Years"
+            cfg["Rule"] = {"DefaultRetention": {"Mode": dr["mode"],
+                                                period: dr[period.lower()]}}
+        return {"ObjectLockConfiguration": cfg, "ResponseMetadata": meta}
 
     def _lock_for(self, lock):
         if lock and self.m["bucket_lock_enabled"]:
@@ -648,7 +778,8 @@ class FixtureBackend:
             return self._r(404, "NotFound")
         lock = v["lock"] or {}
         return self._r(200, size=len(v["data"]), mode=lock.get("mode"),
-                       retain_until=_iso(lock.get("retain_until")), version_id=v["vid"])
+                       retain_until=_iso(lock.get("retain_until")), version_id=v["vid"],
+                       etag=f'"{hashlib.md5(v["data"]).hexdigest()}"')
 
     def copy_object(self, dst_key, src_key):
         src = self._latest(src_key)
@@ -887,7 +1018,8 @@ def probe_object_lock_multipart(run: Run, rec: Rec) -> str:
                         run.locked.append({"key": key, "version_id": h.data.get("version_id"),
                                            "mode": LOCK_MODE,
                                            "retain_until": o["head_retain_until"],
-                                           "size": payload.size})
+                                           "size": payload.size, "etag": h.data.get("etag"),
+                                           "sha256": payload.sha256()})
     ok = (o["create_status"] == 200 and o["complete_status"] == 200
           and o["head_mode"] == LOCK_MODE and o["head_retain_until"] is not None
           and abs((datetime.fromisoformat(o["head_retain_until"]) - until).total_seconds()) <= 1)
@@ -1052,7 +1184,9 @@ def probe_compliance_retention(run: Run, rec: Rec) -> str:
     o["retain_until_after"] = h2.data.get("retain_until") if h2.ok else None
     run.locked.append({"key": key, "version_id": vid, "mode": LOCK_MODE,
                        "retain_until": o["retain_until_after"] or o["retain_until"],
-                       "size": payload.size})
+                       "size": payload.size,
+                       "etag": (h2.data.get("etag") if h2.ok else None) or h.data.get("etag"),
+                       "sha256": payload.sha256()})
     refused = all((x or 0) >= 400 for x in (s.status, s2.status, d.status))
     ok = refused and o["retain_until_after"] is not None and abs(
         (datetime.fromisoformat(o["retain_until_after"]) - retain).total_seconds()) <= 1
@@ -1156,6 +1290,225 @@ def would_do(args, params: dict) -> dict:
             "PutObjectRetention earlier, with and without BypassGovernanceRetention; "
             "DeleteObject by version; HEAD the retention again"],
     }
+
+
+# ── verify: re-check evidence against the live bucket (read-only) ───────────
+
+
+def canonical_body(evidence: dict) -> bytes:
+    """The bytes ``verified_live.body_sha256`` hashes: the evidence without
+    its ``verified_live`` key, as sorted-key compact ASCII JSON, UTF-8."""
+    body = {k: v for k, v in evidence.items() if k != "verified_live"}
+    return json.dumps(body, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=True).encode("utf-8")
+
+
+def _as_utc(x, where: str) -> datetime:
+    """A tz-aware UTC datetime from a datetime or an ISO 8601 string (naive
+    values are taken as UTC)."""
+    try:
+        dt = x if isinstance(x, datetime) else datetime.fromisoformat(str(x))
+    except (TypeError, ValueError):
+        raise VerifyRefused("locked_object_mismatch", f"{where}: not an ISO 8601 time") from None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
+
+
+def _read_locked(client, bucket: str, lo: dict) -> dict:
+    """HEAD, GetObjectRetention and a streamed GET of one recorded version;
+    any error or exception is ``locked_object_missing``."""
+    kw = {"Bucket": bucket, "Key": lo.get("key"), "VersionId": lo.get("version_id")}
+    where = f"{lo.get('key')!r} version {lo.get('version_id')!r} in bucket {bucket!r}"
+    try:
+        head = client.head_object(**kw)
+        ret = client.get_object_retention(**kw)
+        got = client.get_object(**kw)
+        h, size, body = hashlib.sha256(), 0, got["Body"]
+        while True:
+            chunk = body.read(CHUNK)
+            if not chunk:
+                break
+            h.update(chunk)
+            size += len(chunk)
+    except Exception as e:  # noqa: BLE001 — any failed read means the bucket does not vouch
+        resp = _error_response(e)
+        what = ((resp.get("Error") or {}).get("Code") if resp is not None
+                else type(e).__name__)
+        raise VerifyRefused("locked_object_missing", f"cannot read {where} ({what})") from None
+    return {"head": head, "retention": ret.get("Retention") or {}, "sha256": h.hexdigest(),
+            "body_size": size,
+            "request_ids": [_rid_from_meta(r.get("ResponseMetadata")) for r in (head, ret, got)]}
+
+
+def _check_locked(lo: dict, got: dict) -> dict:
+    """Compare one bucket version with its evidence entry; the record's
+    ``objects[]`` row, or ``locked_object_mismatch``."""
+    head, ret = got["head"], got["retention"]
+    key = lo.get("key")
+    want_until = _as_utc(lo.get("retain_until"), f"locked object {key!r} retain_until")
+    problems = []
+    if head.get("VersionId") is not None and head["VersionId"] != lo.get("version_id"):
+        problems.append(f"HEAD VersionId {head['VersionId']!r}")
+    if head.get("ETag") != lo.get("etag"):
+        problems.append(f"HEAD ETag {head.get('ETag')!r} != {lo.get('etag')!r}")
+    if head.get("ContentLength") != lo.get("size") or got["body_size"] != lo.get("size"):
+        problems.append(f"size {head.get('ContentLength')!r}/{got['body_size']} != "
+                        f"{lo.get('size')!r}")
+    if head.get("ObjectLockMode") != LOCK_MODE or ret.get("Mode") != LOCK_MODE \
+            or lo.get("mode") != LOCK_MODE:
+        problems.append(f"lock mode {head.get('ObjectLockMode')!r}/{ret.get('Mode')!r}, want "
+                        f"{LOCK_MODE}")
+    until = None
+    if ret.get("RetainUntilDate") is None:
+        problems.append("GetObjectRetention gave no RetainUntilDate")
+    else:
+        until = _as_utc(ret["RetainUntilDate"], f"{key!r} RetainUntilDate")
+        if abs((until - want_until).total_seconds()) > 1:
+            problems.append(f"RetainUntilDate {_iso(until)} != {lo.get('retain_until')}")
+    if head.get("ObjectLockRetainUntilDate") is not None:
+        hu = _as_utc(head["ObjectLockRetainUntilDate"], f"{key!r} ObjectLockRetainUntilDate")
+        if abs((hu - want_until).total_seconds()) > 1:
+            problems.append(f"HEAD ObjectLockRetainUntilDate {_iso(hu)} != "
+                            f"{lo.get('retain_until')}")
+    if got["sha256"] != lo.get("sha256"):
+        problems.append("sha256 of the GET body differs from the evidence")
+    if not all(got["request_ids"]):
+        problems.append("a read answered without a request id")
+    if problems:
+        raise VerifyRefused("locked_object_mismatch",
+                            f"locked object {key!r}: " + "; ".join(problems))
+    return {"key": key, "version_id": lo.get("version_id"), "mode": LOCK_MODE,
+            "retain_until": _iso(until), "size": got["body_size"], "etag": head.get("ETag"),
+            "sha256": got["sha256"], "request_ids": got["request_ids"]}
+
+
+def _list_run_root(client, bucket: str, root: str) -> tuple[list[tuple[str, str | None]], str]:
+    """Every (key, version id) of versions and delete markers under ``root``,
+    and the first page's request id."""
+    pairs: list[tuple[str, str | None]] = []
+    rid = None
+    try:
+        for page in client.get_paginator("list_object_versions").paginate(Bucket=bucket,
+                                                                          Prefix=root):
+            rid = rid or _rid_from_meta(page.get("ResponseMetadata"))
+            for v in (page.get("Versions") or []) + (page.get("DeleteMarkers") or []):
+                pairs.append((v.get("Key"), v.get("VersionId")))
+    except Exception as e:  # noqa: BLE001 — no listing: cleanup can't be confirmed
+        raise VerifyRefused("run_root_not_clean", f"cannot list the versions under {root!r} "
+                            f"({type(e).__name__}): cleanup can't be confirmed") from None
+    if not rid:
+        raise VerifyRefused("run_root_not_clean", f"the listing of {root!r} carried no "
+                            "request id")
+    return pairs, rid
+
+
+def verify_live(evidence: dict, client, *, now: datetime | None = None) -> dict:
+    """Re-read every COMPLIANCE-locked object of ``evidence`` from its bucket
+    through the boto3-shaped ``client`` (read-only: HEAD, GetObjectRetention,
+    GET of the recorded version, and a version listing of the run root) and
+    return the ``verified_live`` record, hash-bound to the evidence body.
+    ``evidence`` is not mutated. Raises :class:`VerifyRefused`."""
+    if not isinstance(evidence, dict) or evidence.get("source") != "live":
+        got = evidence.get("source") if isinstance(evidence, dict) else None
+        raise VerifyRefused("not_live", f"evidence source is {got!r}, not 'live': only a live "
+                            "run's evidence can be verified")
+    locked = evidence.get("locked_objects")
+    if not isinstance(locked, list) or not locked:
+        raise VerifyRefused("no_locked_objects", "the evidence has no COMPLIANCE-locked "
+                            "objects, so nothing in the bucket vouches for the run")
+    if not all(isinstance(lo, dict) for lo in locked):
+        raise VerifyRefused("locked_object_mismatch", "locked_objects entries must be objects")
+    at = _now() if now is None else _as_utc(now, "now").replace(microsecond=0)
+    for lo in locked:
+        until = _as_utc(lo.get("retain_until"), f"locked object {lo.get('key')!r} retain_until")
+        if not at < until:
+            raise VerifyRefused("lock_expired", f"the lock on {lo.get('key')!r} expired at "
+                                f"{_iso(until)} (now {_iso(at)}): the bucket no longer vouches "
+                                "for the run")
+    bucket = evidence.get("bucket")
+    objects = [_check_locked(lo, _read_locked(client, bucket, lo)) for lo in locked]
+    root = f"{evidence.get('prefix')}{evidence.get('run_id')}/"
+    pairs, list_rid = _list_run_root(client, bucket, root)
+    want = {(lo.get("key"), lo.get("version_id")) for lo in locked}
+    extra = sorted({f"{k} ({v})" for k, v in pairs if (k, v) not in want})
+    keys = sorted({k for k, _ in pairs})
+    if extra or set(keys) != {lo.get("key") for lo in locked}:
+        raise VerifyRefused("run_root_not_clean", f"the run root {root!r} holds versions that "
+                            f"are not the locked objects: {extra or keys}")
+    return {"schema": VERIFY_SCHEMA, "verified": True,
+            "body_sha256": hashlib.sha256(canonical_body(evidence)).hexdigest(),
+            "verified_at": _iso(at), "tool": tool_info(),
+            "endpoint_host": evidence.get("endpoint_host"), "bucket": bucket,
+            "run_id": evidence.get("run_id"), "objects": objects,
+            "listing": {"prefix": root, "keys": keys, "request_id": list_rid}}
+
+
+def verify_main(argv: list[str]) -> int:
+    """``storage_probe verify --evidence FILE``: refuses (exit 2) before any
+    network use or boto3 import for missing credentials, an unreadable file or
+    non-live evidence; exit 1 on a ``VerifyRefused``; exit 0 after rewriting
+    FILE with ``verified_live``."""
+    ap = argparse.ArgumentParser(prog=f"python -P -m {MODULE} verify",
+                                 description="re-check W3a evidence against the live bucket "
+                                             "(read-only)")
+    ap.add_argument("--evidence", required=True)
+    ap.add_argument("--endpoint")
+    ap.add_argument("--region")
+    try:
+        args = ap.parse_args(argv)
+    except SystemExit as e:
+        return 2 if e.code else 0
+    missing = [n for n in (MAIN_ACCESS_ENV, MAIN_SECRET_ENV) if not os.environ.get(n)]
+    if missing:
+        print(f"storage_probe verify: missing credentials: set {' and '.join(missing)} in the "
+              "environment", file=sys.stderr)
+        return 2
+    path = Path(args.evidence)
+    try:
+        evidence = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as e:
+        print(f"storage_probe verify: cannot read the evidence file {str(path)!r}: "
+              f"{type(e).__name__}", file=sys.stderr)
+        return 2
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        print(f"storage_probe verify: the evidence file {str(path)!r} is not JSON",
+              file=sys.stderr)
+        return 2
+    if not isinstance(evidence, dict) or evidence.get("source") != "live":
+        got = evidence.get("source") if isinstance(evidence, dict) else None
+        print(f"storage_probe verify: not_live: the evidence source is {got!r}, not 'live'",
+              file=sys.stderr)
+        return 2
+    host = evidence.get("endpoint_host")
+    try:
+        endpoint, ep_host = check_endpoint(args.endpoint or f"https://{host}")
+    except UsageError as e:
+        print(f"storage_probe verify: {e}", file=sys.stderr)
+        return 2
+    if ep_host != host:
+        print(f"storage_probe verify: --endpoint host {ep_host!r} is not the evidence's "
+              f"endpoint_host {host!r}", file=sys.stderr)
+        return 2
+    region = args.region or evidence.get("region") or DEFAULT_REGION
+    try:
+        client = _s3_client(endpoint, region, MAIN_ACCESS_ENV, MAIN_SECRET_ENV)
+        record = verify_live(evidence, client)
+    except VerifyRefused as e:
+        print(f"storage_probe verify: refused: {scrub(str(e))}", file=sys.stderr)
+        return 1
+    except Exception as e:  # noqa: BLE001 — never a traceback that could carry a URL
+        print(f"storage_probe verify: failed: {scrub(f'{type(e).__name__}: {e}')}",
+              file=sys.stderr)
+        return 1
+    evidence["verified_live"] = record
+    tmp = path.with_name(path.name + ".verify-tmp")
+    tmp.write_text(json.dumps(evidence, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    print(json.dumps({"verified": True, "evidence": str(path),
+                      "body_sha256": record["body_sha256"], "verified_at": record["verified_at"],
+                      "objects": [o["key"] for o in record["objects"]]}, indent=2))
+    return 0
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -1263,6 +1616,8 @@ def validate(args) -> tuple[str, str, dict]:
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] == "verify":
+        return verify_main(argv[1:])
     try:
         args = parse_args(argv)
     except SystemExit as e:
@@ -1292,11 +1647,15 @@ def main(argv: list[str] | None = None) -> int:
         if backend.count_prefix(args.prefix) != 0:
             raise UsageError(f"--prefix {args.prefix!r} already holds objects: the probe needs "
                              "an empty throwaway prefix")
+        # RV4: before the first write, refuse a bucket with a default retention rule.
+        bucket_lock = bucket_lock_preflight(backend.lock_client(), args.bucket)
     except UsageError as e:
         print(f"storage_probe: {e}", file=sys.stderr)
+        print(json.dumps(summary, indent=2))  # the refused run: nothing ran, nothing written
         return 2
     except Exception as e:  # noqa: BLE001 — setup failure is an input error
         print(f"storage_probe: cannot start: {scrub(f'{type(e).__name__}: {e}')}", file=sys.stderr)
+        print(json.dumps(summary, indent=2))
         return 2
 
     run = Run(backend, args.bucket, args.prefix, secrets.token_hex(8), args.other_bucket, params)
@@ -1323,7 +1682,8 @@ def main(argv: list[str] | None = None) -> int:
                 "endpoint_host": summary["endpoint_host"], "region": region,
                 "bucket": args.bucket, "prefix": args.prefix, "run_id": run.run_id,
                 "started_at": _iso(started), "finished_at": _iso(finished),
-                "tool": tool_info(), "params": params, "probes": probes,
+                "tool": tool_info(), "params": params, "bucket_lock": bucket_lock,
+                "probes": probes,
                 "locked_objects": run.locked, "cleanup": clean,
                 "recommended_path": recommended_path(results),
                 "passed": complete and source == "live"}
