@@ -1,0 +1,8 @@
+# R6x S0a main PR: the release chain.toml typed with the main-class drift,
+# plus the unit tests that anchor on the old shipped values.
+chain.toml
+tests/unit/test_money_safety.py
+tests/unit/test_money_safety_2.py
+tests/unit/test_operator_lane_billing.py
+tests/unit/test_image_qualification.py
+tests/unit/test_funded_operator_fallback.py
