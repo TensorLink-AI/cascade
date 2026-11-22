@@ -69,10 +69,16 @@ ACCEPTED: dict[str, list[object]] = {
     "sentinel_tau": [0.01, 0.05, 0.5],
 }
 
-# Unarmed goldens, computed on main @ e614e7b (byte-identity, invariant 1).
+# Unarmed goldens, computed on main @ 0bad8b0 (byte-identity, invariant 1) with
+# python 3.11.15, numpy 2.4.6, scipy 1.17.1 (the uv.lock pins). The scored
+# receipt's golden is the canonical body of tests/fixtures/round_receipt_v3.json
+# (pinned by tests/unit/test_receipt.py; the test cross-checks it). Its verdict
+# carries scipy's wilcoxon_p, which degrades to None when scipy can't import
+# (e.g. under a sys.modules["torch"] = None guard), so the golden must never
+# be recomputed under such a guard.
 GOLDEN_GATE_DETAIL_SHA = "e78aad390a8a9f29024f1bc6440b39642aeaf920e1298c800a65f56ec6cd7010"
 GOLDEN_KING_CHECK_DETAIL_SHA = "d9cacd307c9e3073dd506665d502e39495010b37597e5b38eadc0e80c11414ab"
-GOLDEN_SCORED_RECEIPT_SHA = "fe4d5a71be1cac8e26089109ee679fe9f92126842549a6c5c4ec0287958033be"
+GOLDEN_SCORED_RECEIPT_SHA = "14da7493f4c39a8226867391d246903c166a7985b05d614e034fb393fc345f24"
 GOLDEN_REJECTED_RECEIPT_SHA = "4e4151ab26ce0395a5938f0759110a453d41b7ec8e5e3b03b29dc8249be10f62"
 # The per-suite factors of the golden gate fixture (every suite better).
 GOLDEN_FACTORS = {"gift": 0.9, "boom": 0.95, "time": 0.92, "fev": 0.97}
@@ -387,6 +393,15 @@ def body_of(receipt) -> dict:
 
 def body_sha(receipt) -> str:
     return hashlib.sha256(receipt.canonical_body()).hexdigest()
+
+
+def fixture_body_sha() -> str:
+    """sha256 of the committed golden receipt's canonical body (its JSON minus
+    ``signature``, serialised as ``RoundReceipt.canonical_body`` does)."""
+    body = json.loads(GOLDEN_RECEIPT.read_text(encoding="utf-8"))
+    body.pop("signature", None)
+    return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":"),
+                                     allow_nan=False).encode("utf-8")).hexdigest()
 
 
 # ── processes and tools ──────────────────────────────────────────────────────

@@ -115,8 +115,15 @@ pair (invariant 10; the tool's suffix, here meaning the sentinel effect).
 | king check | the same, golden from main | `sentinel="gift"` drops GIFT |
 | receipt | `sentinel_record` is `None`; scored / rejected fixture body sha256 equal the main goldens, also with `sentinel=None`; the committed `tests/fixtures/round_receipt_v3.json` dumps back byte-identically and carries no `sentinel` | the stamped body carries the record, its sha differs |
 
-The goldens (`helpers.py`) were computed on main e614e7b. They rely on the
-`uv.lock` numpy, as `tests/unit/test_receipt.py`'s golden does.
+The goldens (`helpers.py`) were computed on main 0bad8b0 with python 3.11.15,
+numpy 2.4.6 and scipy 1.17.1, the `uv.lock` pins. The scored receipt's golden
+is the canonical body of `tests/fixtures/round_receipt_v3.json`, the file
+`tests/unit/test_receipt.py` pins, and the test cross-checks the two.
+
+**Don't recompute a golden under a `sys.modules["torch"] = None` guard.**
+Its verdict carries scipy's `wilcoxon_p`. The guard breaks scipy's lazy
+torch probe, so `wilcoxon_p` silently becomes `None` and the sha comes out
+wrong (that was the original `fe4d5a71…` value).
 
 ## Draw (`test_w_s1_draw.py`, TS5 and TS1)
 
