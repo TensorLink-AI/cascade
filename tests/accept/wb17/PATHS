@@ -1,0 +1,16 @@
+# WB17: the lane B opening rule (D41 / LB4; TB17, TB18).
+# The driver's tick decides the gate by [lane_b] open_rule:
+#   "cogate"            today's gate_open (routing co-gate), unchanged;
+#   "tokens"            lineage_tokens >= open_tokens (D41 b);
+#   "tokens_king_check" lineage_tokens >= open_tokens AND the latest lane A
+#                       king check (ops.king_check()) has result "pass" (D41 a).
+# While closed it records a typed gate_closed_reason; when it opens it records
+# gate_rule (the configured rule) and gate_evidence (the satisfying facts,
+# strict JSON) in LaneBDriverState, a one-way latch that survives restart.
+# RunnerLaneBOps gains king_check() over the runner's verified receipt read.
+cascade/trainer/lane_b_driver.py
+# The gate predicate lives here today (gate_open); the rule dispatch may too.
+cascade/trainer/expert_lane.py
+# The [lane_b] open_rule parse (WB10) and LaneBConfig.open_rule.
+cascade/shared/config/lane_b.py
+cascade/shared/config/v2.py
