@@ -237,7 +237,10 @@ def entry_of(report, dg) -> dict:
 
 
 def settle(cfg, b, pool_dir, entries, house_rec, fc, uid_of, state_path, prior=()):
-    """`settle_lane_d` with main's keywords only (no gate inputs)."""
+    """`settle_lane_d` with main's keywords only (no gate inputs): the legacy
+    call. Armed, it may only be used where no member reaches a confirming
+    clear (RV5: an armed crowning without the gate inputs is `bench_hold`);
+    unarmed it returns `report=None, pay=None` as on main."""
     from cascade.validator.lane_d import settle_lane_d
 
     kw = {"prior_pool_dirs": [Path(p) for p in prior]} if prior else {}
@@ -336,6 +339,25 @@ def bench_session(host: BenchHost, session_id: str):
     from cascade.validator.lane_d_bench import SweepSession
 
     return SweepSession(session_id, host)
+
+
+def passing_bench(candidates, references, session_id: str):
+    """A healthy bench session on which every `candidates` digest beats every
+    `references` digest (KING_D, the house, a first-clear king) on every gate
+    suite, so a gated crowning candidate passes."""
+    spec = {**{d: 1.0 for d in references}, **{d: 0.9 for d in candidates}}
+    return bench_session(BenchHost(bench_table(spec)), session_id)
+
+
+def settle_crowning(cfg, b, pool_dir, entries, house_rec, fc, uid_of, state_path, *,
+                    candidates, references, tag: str, prior=()):
+    """An ARMED settlement that may crown, so it carries the gate inputs (RV5:
+    an armed crowning without them fails closed). The bench passes every
+    `candidates` digest; `tag` names the block hash and the session."""
+    return settle_gated(cfg, b, pool_dir, entries, house_rec, fc, uid_of, state_path,
+                        hash_=block_hash(tag),
+                        bench=passing_bench(candidates, references, f"sess-{tag}"),
+                        prior=prior)
 
 
 def drawn_suite(cfg, hash_: str, sentinel=None) -> str:

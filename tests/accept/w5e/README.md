@@ -80,9 +80,8 @@ W5b, W5c, W5d, W7a and W3b tests must stay green.
 | `bench` | the bench host session, a `lane_d_bench.SweepSession` |
 
 On main the tests fail on an AssertionError in `helpers.settle_gated`,
-which checks the signature before it calls. The tests don't pin the
-behaviour when these keywords are omitted. The W5b/W5c/W7a fixtures omit
-them and still expect a crown.
+which checks the signature before it calls. What happens when they are
+omitted or `None` is pinned by "Fail closed" below.
 
 - **Who is gated:** every verdict that cleared at `stage: "confirm"` (a
   crowning candidate), nothing else. First clears and losers are never swept.
@@ -118,18 +117,84 @@ them and still expect a crown.
   on the new boundary's draw and crowned. It is not re-duelled: it has no
   rows in that report. Counting holds against `max_bench_holds` is W5g's.
 
+### Fail closed (RV5, plan §1.3b, §3 invariants)
+
+"Armed" is `cfg.active(boundary)`: `[lane_d] from_block > 0` and the
+settlement's boundary is after `from_block` (and not past `until_block`).
+
+- **Unarmed: unchanged.** The legacy call (no gate keywords) returns
+  `report=None, pay=None` and writes no state, with `from_block = 0` or at
+  `boundary == from_block`. Unarmed nothing is judged, so nothing can crown.
+- **Armed, no crowning candidate: unchanged.** The legacy call stays valid
+  for a settlement where no member clears at `stage: "confirm"` (first
+  clears, losers, pending floors). The verdict tests use it that way.
+- **Armed, a crowning candidate, no gate inputs: `bench_hold`.** A member
+  that clears its confirmation would crown, but the settlement has no `bench`
+  session or no `boundary_block_hash`. That covers the legacy call without
+  the keywords, `bench=None`, `boundary_block_hash=None`, and both. The §1.3b
+  gate can't run, so the member is not crowned:
+  - `report.crowned` is `null`, `king_after == king_before`, the state king
+    is unchanged and the king slot still burns;
+  - the entry (state and report) is `bench_hold` with status `hold` or
+    `confirm_pending`: open, not `lost` or `closed`, not the miner's fault;
+  - the verdict outcome is neither `crowned` nor `lost`;
+  - if a `gate` record is written, none of its results is `pass`;
+  - not charged: at the next settlement, with the inputs back and no fresh
+    window, the held clear is re-gated on the new draw and crowned without a
+    new duel (no rows for it).
+- **A crowned report needs a gate record.** `validate_report` must raise
+  `ReportSchemaError` on a `lane-d-report/1` report whose `crowned` is
+  non-null and whose `gate` is absent or `null`, even when it's correctly
+  re-signed. `verify_report`, which validates first, therefore returns
+  `False`. A report with `crowned: null` and no gate still validates. In the
+  schema this means: `gate` stays optional (W7a RV4), and a conditional
+  makes `gate` required and an object whenever `crowned` is a string. W7a's
+  RV4 schema change is pending, so whichever of W5e and W7a lands second
+  carries the rule. Its `results` must hold a `pass` for the crowned digest
+  (W7a pins that, `test_w7a_gate_record.py`).
+- **The audit must refuse it too (W7a/W9, not pinned here).**
+  `cascade/audit/lane_d.py` isn't in W5e's `PATHS` (the owner edit is
+  pending, RV4). `check_lane_d` must FAIL an armed report whose `crowned` is
+  set and whose `gate` is missing or `null`, and one whose `gate.results`
+  has no `pass` for the crowned digest. Satellites (W7d) must refuse it the
+  same way.
+
+#### Fixtures that crown while armed without gate keywords
+
+Every crowning fixture is armed: unarmed, `settle_lane_d` returns nothing.
+On main these settle with the legacy call and expect a crown. Under the rule
+above they become `bench_hold`, so their owners must pass the gate inputs
+(a block hash and a passing bench session, as `helpers.settle_crowning`
+does). This PR doesn't edit them. The list comes from running each
+directory on main with a spy on `settle_lane_d` and `validate_report`.
+
+| WP | fixture (call site) | tests that crown ungated |
+|---|---|---|
+| W5c | `tests/accept/w5c/helpers.py` `settle` | `test_w5c_house.py`: the five `test_house_change3_*` tests |
+| W7a | `tests/accept/w7a/helpers.py` `settle` / `two_settlements` (BOUNDARY_2 crowns) | `test_w7a_validate.py::test_settle_reports_validate`, `test_w7a_report_fields.py::test_e2e_settle_reports_validate_and_state_quantile_head`, `test_w7a_snapshots.py::test_e2e_report_lists_its_snapshots_and_each_windows_version`, `test_w7a_gate_params.py::test_params_carry_the_parsed_gate_and_source_knobs`, `test_w7a_gate_record.py::test_fixture_gate_is_the_w3b1_draw_and_the_w3b2_outcomes`, `test_w7a_inv11_reasons.py::test_inv11_house_king_slot_burns_with_house_king`. In all, 135 W7a tests pass the crowned BOUNDARY_2 report, with no gate, to `validate_report`, which must then refuse it. Those include `test_w7a_gate_record.py::test_gate_is_optional_reports_without_it_validate` and `::test_no_gated_candidate_means_no_gate_key`, which must use an uncrowned report. |
+| W5b | `tests/accept/w5b/helpers.py` (armed, `from_block = ARM_BLOCK`) | none: no W5b test crowns |
+| W5a | `tests/accept/w5a/test_w5a_settle.py` `_settle` | `test_e2e_skeleton_refuses_trap_windows_and_still_pays_the_challenger` |
+| W1.5 | `tests/accept/w1_5/test_w1_5_e2e.py` `_settle` / `_settle_both` | the seven `[synthetic]` e2e/inv tests that crown, including `test_e2e_audit_passes` and `test_inv9_share_zero_vector_armed_nonempty_lane_d_effect`, which also validate the crowned report |
+| W3b3 | `tests/accept/w3b3/helpers.py` `_settle` | `test_w3b3_never_gates.py` (2), `test_w3b3_publish.py::test_the_record_is_published_once_under_its_key`, `test_w3b3_record.py::test_fixture_chain_crowns_y_over_k1_and_k1_over_the_house` |
+| W3b5 | `tests/accept/w3b5/helpers.py` `settle` | every test in `test_w3b5_lowfreq.py` that reaches a confirming clear (about 20) |
+| W5e | `helpers.settle` | corrected here: the four crowning verdict tests use `helpers.settle_crowning` |
+
+W5d, W7b and W8 don't crown through `settle_lane_d`.
+
 ## Not pinned
 
 - The per-verdict gate result fields and the `gate` record's extra keys.
   The W7a RV4 schema change defines them. `validate_report` isn't called on
   gated reports, because the `lane-d-report/1` schema on main has no `gate`
-  field (RV4 BLOCKING W7a). `lane_d_report.py` and the schema file are in
-  `PATHS` only for the `gate_regression` entry reason and the record the
-  wiring needs.
-- What a `bench=None` call does, whether `bench_hold` uses status `hold` or
-  `confirm_pending`, the gate's bootstrap seed string, and what happens to
-  a confirmed non-best member.
-- The low-frequency check (W3b5) and `max_bench_holds` (W5g).
+  field (RV4 BLOCKING W7a). Only the refusal of a crowned report without a
+  gate is pinned (above). `lane_d_report.py` and the schema file are in
+  `PATHS` for the `gate_regression` entry reason, the record the wiring
+  needs and that refusal.
+- Whether `bench_hold` uses status `hold` or `confirm_pending`, whether a
+  held settlement without a block hash writes a `gate` record, the gate's
+  bootstrap seed string, and what happens to a confirmed non-best member.
+- Whether a hold for a missing gate input counts against `max_bench_holds`
+  (W5g), and the low-frequency check (W3b5).
 
 ## Fixtures
 
@@ -168,9 +233,20 @@ them and still expect a crown.
 | losers and first clears not swept | `test_losers_and_first_clears_are_never_swept` |
 | every confirming clear gated | `test_every_confirming_clear_is_gated_and_the_best_passing_one_crowns` |
 | miner king: the house still bars (T3) | `test_t3_with_a_miner_king_the_house_still_bars_the_gate` |
+| armed crowning without bench / block hash → `bench_hold` (RV5) | `test_armed_crowning_without_bench_or_block_hash_is_bench_hold[legacy_call, bench_none, hash_none, both_none]` |
+| unarmed legacy call unchanged | `test_unarmed_legacy_call_is_unchanged` |
+| crowned report without a gate refused | `test_a_crowned_report_without_a_gate_record_is_refused[absent, null]` |
+| uncrowned report needs no gate | `test_an_uncrowned_report_needs_no_gate_record` |
 
 ## On main
 
-- 11 tests fail on an AssertionError: the 10 gate tests (the gate keywords
-  are absent) and D20 `"original"` (`king_unscored`).
-- The other 11 pass. W5b and W5c built those rules, and W5e owns them.
+- 21 tests fail on an AssertionError:
+  - the 10 gate tests and the 3 gated fail-closed tests (bench_none,
+    hash_none, both_none), plus the 2 refusal tests and the uncrowned-report
+    test, because the gate keywords are absent;
+  - the 4 crowning verdict tests (RV5: they now crown through
+    `settle_crowning`). One of them is D20 `"original"`, which also asserts
+    the confirmation isn't skipped as `king_unscored`;
+  - `[legacy_call]`, because main crowns without a gate.
+- The other 9 pass: the 8 non-crowning verdict tests (W5b and W5c built
+  them, and W5e owns them) and the unarmed legacy test.

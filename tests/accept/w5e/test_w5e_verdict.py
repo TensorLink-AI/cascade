@@ -9,6 +9,12 @@ boundary(2). Most of these rules are already on main (W5b/W5c built them);
 W5e owns them as its assertions. The D20 `"original"` rule after a house
 refresh fails on main: the first-clear king is no longer known to the state,
 so the confirmation is skipped as `king_unscored`.
+
+RV5: an armed crowning fails closed without the gate inputs, so every
+settlement here that may crown goes through `helpers.settle_crowning` (a
+passing bench and a block hash); on main those fail on the AssertionError in
+`helpers.settle_gated`. Settlements without a confirming clear keep the
+legacy call.
 """
 
 from __future__ import annotations
@@ -38,6 +44,7 @@ from .helpers import (
     rows_of,
     set_sha,
     settle,
+    settle_crowning,
     snapshot,
     uids,
     verdict_of,
@@ -92,7 +99,8 @@ def test_confirmation_runs_on_the_next_disjoint_set_and_crowns(tmp_path):
     fc = _fc(recs1 + recs2, {h0["digest"]: ("bad", "house-0"), x["digest"]: ("sharp", "x")})
     # Snapshot 1 is still retained: its windows are eligible for X but already
     # used, so the confirmation set must be snapshot 2's windows alone.
-    s2 = settle(cfg, boundary(2), pool2, [x], h0, fc, uids(x), path, prior=[pool1])
+    s2 = settle_crowning(cfg, boundary(2), pool2, [x], h0, fc, uids(x), path, prior=[pool1],
+                         candidates=[x["digest"]], references=[h0["digest"]], tag="b2")
     v = verdict_of(s2.report, x["digest"])
     assert v is not None, "X was not judged on its confirmation set"
     assert v["stage"] == "confirm" and v["cleared"] is True, v
@@ -143,8 +151,11 @@ def test_confirm_pending_persists_until_a_fresh_set_freezes_and_across_restarts(
     shutil.copyfile(path, restarted)
     pool2, recs2 = snapshot(tmp_path, 2)
     fc = _fc(recs1 + recs2, {h0["digest"]: ("bad", "house-0"), x["digest"]: ("sharp", "x")})
-    a = settle(cfg, boundary(3), pool2, [x], h0, fc, uids(x), path, prior=[pool1])
-    b = settle(cfg, boundary(3), pool2, [x], h0, fc, uids(x), restarted, prior=[pool1])
+    gate = {"candidates": [x["digest"]], "references": [h0["digest"]], "tag": "b3"}
+    a = settle_crowning(cfg, boundary(3), pool2, [x], h0, fc, uids(x), path, prior=[pool1],
+                        **gate)
+    b = settle_crowning(cfg, boundary(3), pool2, [x], h0, fc, uids(x), restarted,
+                        prior=[pool1], **gate)
     for s in (a, b):
         v = verdict_of(s.report, x["digest"])
         assert v is not None and v["stage"] == "confirm", v
@@ -210,7 +221,9 @@ def test_max_t_crowns_the_best_of_a_confirming_cohort(tmp_path):
         v = verdict_of(s1.report, x["digest"])
         assert v is not None and v["cleared"] is True, f"fixture: {v}"
     pool2, recs2 = snapshot(tmp_path, 2)
-    s2 = settle(cfg, boundary(2), pool2, [x1, x2], h0, _fc(recs2, models), uids(x1, x2), path)
+    s2 = settle_crowning(cfg, boundary(2), pool2, [x1, x2], h0, _fc(recs2, models),
+                         uids(x1, x2), path, candidates=[x1["digest"], x2["digest"]],
+                         references=[h0["digest"]], tag="b2")
     (cohort,) = s2.report["cohorts"]
     assert cohort["stage"] == "confirm" and len(cohort["members"]) == 2
     vs = {x["digest"]: verdict_of(s2.report, x["digest"]) for x in (x1, x2)}
@@ -266,9 +279,15 @@ def test_t9b_d20_original_confirms_against_the_king_of_the_first_clear(tmp_path)
     pool2, recs2 = snapshot(tmp_path, 2)
     fc = _fc(recs2, {h0["digest"]: ("bad", "house-0"), h1["digest"]: ("bad", "house-1"),
                      x["digest"]: ("sharp", "x")})
-    s2 = settle(cfg, boundary(2), pool2, [x], h1, fc, uids(x), path)
+    s2 = settle_crowning(cfg, boundary(2), pool2, [x], h1, fc, uids(x), path,
+                         candidates=[x["digest"]], references=[h0["digest"], h1["digest"]],
+                         tag="b2")
     v = verdict_of(s2.report, x["digest"])
     skips = [k["reason"] for k in s2.report["skipped"] if k["digest"] == x["digest"]]
+    # The D20 "original" bug on main: H0 is no longer the king, the house or a
+    # prior king, so its T is unknown and the confirmation is skipped.
+    assert "king_unscored" not in skips, \
+        "D20 original: the confirmation against the first-clear king was skipped as king_unscored"
     assert v is not None, f"X's confirmation against H0 did not run (skipped: {skips})"
     assert v["stage"] == "confirm" and v["king_digest"] == h0["digest"]
     assert v["confirmation"]["rule"] == "original"
