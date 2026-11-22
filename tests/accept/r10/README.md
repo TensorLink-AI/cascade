@@ -183,6 +183,31 @@ This checks the T25 testnet evidence (`evidence/t25.json`; `accept R10
 - With `--bundle`, `bundle_sha256` must equal the sha256 of that bundle's
   `manifest.json`.
 
+### L4: the live evidence goes through the real verifier (RV2)
+
+`scripts/laned/accept R10 --evidence evidence/t25.json` exports the file as
+`$LANED_EVIDENCE`. `accept` itself checks only `"wp"` and `"passed"`, so
+`test_r10_live_t25_evidence` (`test_r10_live_evidence.py`) runs the real
+`python -P -m cascade.laned.restore verify-evidence --evidence $LANED_EVIDENCE`
+and requires exit 0 and `OK T25 evidence`. The evidence may also carry an
+optional `bundle_dir` (or `bundle_path` / `bundle`) key naming the snapshot
+bundle. When that dir exists (absolute, or relative to the evidence file or
+the repo root) and holds `manifest.json`, `--bundle <dir>` is passed too, so
+`bundle_sha256` and the source block / netuid are cross-checked against the
+real manifest. `verify-evidence` ignores the extra key.
+
+- `$LANED_EVIDENCE` unset (an ordinary PR run): the test **skips**, with a
+  reason that names the L4 command.
+- `$LANED_EVIDENCE` set: a missing file, a file that doesn't parse, or any
+  `verify-evidence` refusal **fails** the test. A bare
+  `{"wp": "R10", "passed": true}` fails (missing keys).
+
+The `test_live_check_*` self-tests need no env. They set `LANED_EVIDENCE` to
+fixture files and run the same body: the valid fixture passes (with and
+without a recorded bundle), and a bare file, a missing file, an unparseable
+file and hand-edited copies of the valid fixture (verdict, netuid, and
+`bundle_sha256` / `source_block` against a recorded bundle) all fail.
+
 ## Test files
 
 | file | pins |
@@ -192,3 +217,4 @@ This checks the T25 testnet evidence (`evidence/t25.json`; `accept R10
 | `test_r10_restore.py` | byte-identical placement by the target config, `laned_restore.json`, refusing a non-empty target, `--force-target`, refusing a tampered bundle with nothing written, refusing a mainnet target, the `--start-cmd` dry-run |
 | `test_r10_check.py` | `CLEAN START` and real-loader equality with the source; refusals for an unparseable file of each role, a `.bak` fallback, post-restore drift, a missing restore record, and missing validator state |
 | `test_r10_evidence.py` | valid T25 evidence passes; each schema or consistency break is refused; the `--bundle` sha cross-check |
+| `test_r10_live_evidence.py` | with `$LANED_EVIDENCE`, the real `verify-evidence` (plus `--bundle` when recorded) must exit 0; skips when unset; self-tests that bare and hand-edited evidence fail |
