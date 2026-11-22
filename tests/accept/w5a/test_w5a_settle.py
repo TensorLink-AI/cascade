@@ -11,6 +11,10 @@
 
 On main the settlement scores the clock-passing traps (over-lag, forecast
 product, backfill, absent from S0), so these fail on an assertion.
+
+RV3 BLOCKING 1 adds fail-closed traps: a series with no or a null
+`frontier` (refused `absent_from_s0`) and a feed missing from `feeds`
+(refused `unlisted_feed`). Main scores those too: AssertionError.
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ import numpy as np
 
 from .helpers import (
     CLOCK_TRAPS,
+    FAIL_CLOSED_KINDS,
     HORIZON,
     HOUR,
     T0,
@@ -97,7 +102,7 @@ def test_inv4_settle_never_scores_an_ineligible_window(tmp_path):
         for j, src in enumerate(sources):           # always eligible: meets the floors
             for k in range(4):
                 series.append(case("eligible", int(bound_all), f"p{seed}-ok-{j}-{k}", src))
-        kinds = ("eligible", "legacy", *TRAP_KINDS)
+        kinds = ("eligible", *FAIL_CLOSED_KINDS, *TRAP_KINDS)
         for n in range(40):
             kind = str(rng.choice(kinds))
             shift = int(rng.choice([-72, -30, 0, 0, 24])) * HOUR
@@ -156,7 +161,7 @@ def _trap_snapshot(tmp_path, snap: int, chal: str, house: str, bound: int):
         for k in range(8):
             series.append(case("eligible", bound + (snap - 1) * 4 * 86_400,
                                f"s{snap}-{src}-{k}", src))
-    for kind in TRAP_KINDS:
+    for kind in (*TRAP_KINDS, *FAIL_CLOSED_KINDS):
         for k in range(4 if kind in CLOCK_TRAPS else 12):
             rec = case(kind, bound, f"s{snap}-{kind}-{k}", sources[k % 6])
             series.append(rec)

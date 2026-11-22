@@ -18,12 +18,18 @@ house). A window is eligible only if all of these hold:
 
 1. **Clocks recorded.** `target_ts` and `first_seen_ts` each have
    `cfg.horizon` points, and `end_ts` is set and equals `target_ts[-1]`.
+1a. **Feed listed (RV3 BLOCKING 1).** The window's feed (its `feed`, else
+   its `source`) has an entry in the pool's top-level `feeds` block. An
+   unlisted feed, or a pool with no `feeds` block, is `unlisted_feed`: without
+   the entry neither rule 2 nor rule 3 can be judged, so the window fails
+   closed instead of silently switching both off.
 2. **Not a forecast product.** The window's feed is not marked
    `forecast_product`.
 3. **Mirror lag within the limit.** The feed's measured
-   `mirror_lag_hours ≤ cfg.max_mirror_lag_hours`. An unmeasured lag (the feed
-   isn't listed, or its lag is `null`) is not a refusal. W6fs measures lag
-   only "where the feed provides" a publish stamp.
+   `mirror_lag_hours ≤ cfg.max_mirror_lag_hours`. A feed the snapshot LISTS
+   with `mirror_lag_hours: null` is declared unmeasured and is not a refusal
+   (W6fs measures lag only "where the feed provides" a publish stamp; RV3
+   note 7: this is a policy choice for the decision register).
 4. **Data time after the bound.** `min(target_ts) > bound`, strictly, so
    every target point counts.
 5. **First-seen after the bound.** `min(first_seen_ts) > bound`, strictly.
@@ -35,10 +41,12 @@ house). A window is eligible only if all of these hold:
 7. **After S0's frontier (change 1c).** `min(target_ts) > end_ts(S0)`.
    Otherwise the window is a `backfill`.
 
-Rules 6 and 7 apply only to a series whose record has a `frontier` key.
-Without the key (pool_d/1 snapshots built before W6b, which includes the W1.5
-fixture), the series is judged on rules 1–5. With an empty list, it is
-`absent_from_s0`.
+**Fail closed on a missing frontier (RV3 BLOCKING 1).** Rules 6 and 7 apply
+to every series. A series whose `frontier` is absent or `null` has no
+evidence of being in S0 (change 1(a): "present in S0 with a recorded
+`end_ts`"), so it is `absent_from_s0`, exactly like an empty list. There is
+no keyless two-clock path. The W1.5 fixture carries `frontier` and `feeds`
+since #560, so the skeleton stays green.
 
 ## Reasons
 
@@ -48,12 +56,13 @@ rules fail, the reason reported is the first failing one in this order:
 | reason | fails |
 |---|---|
 | `missing_clock` | rule 1 |
+| `unlisted_feed` | rule 1a (feed not in `feeds`, or no `feeds` block) |
 | `forecast_product` | rule 2 |
 | `over_lag` | rule 3 |
 | `before_margin` | rules 4 and 5 both |
 | `publish_ahead` | rule 5 only: future-stamped values that the mirror saw before the bound |
 | `late_mirror` | rule 4 only: values public before T that reached the mirror after the bound |
-| `absent_from_s0` | rule 6 |
+| `absent_from_s0` | rule 6, including a `frontier` that is absent or `null` |
 | `backfill` | rule 7 |
 
 **Note on T8's wording.** T8's parentheticals swap the clocks: "data-time-only
@@ -92,15 +101,16 @@ pass but first-seen fail (late mirror)". The tests pin §1.3's physics instead:
 
 ### pool_d/1 additions (`metadata.json`)
 
-These are optional, so W1.5's fixture format stays valid.
+`load_pool` still parses a snapshot without them, but since RV3 their
+absence fails closed: a window is eligible only with both.
 
 - Top level: `"feeds": {"<feed>": {"mirror_lag_hours": float | null,
-  "forecast_product": bool}}`.
+  "forecast_product": bool}}`, one entry for every feed the series name.
 - Per series:
   - `"feed"`: defaults to the series' `source`;
   - `"frontier"`: `[[as_of_ts, end_ts], ...]`, one pair for each EARLIER
-    pool_d snapshot that held the series. `as_of_ts` is that snapshot's build
-    (wall) time and `end_ts` is the series' `end_ts` in it.
+    pool_d snapshot that held the series (possibly empty). `as_of_ts` is that
+    snapshot's build (wall) time and `end_ts` is the series' `end_ts` in it.
 
 ## Tests
 
@@ -123,6 +133,25 @@ These are optional, so W1.5's fixture format stays valid.
   clock-passing traps (`absent_from_s0`, `backfill`, `over_lag`,
   `forecast_product`).
 - The unarmed test passes.
+
+### RV3 correction (tests-only PR, w0c tests-correction mode)
+
+These tests are new or changed, and they fail on main with an
+`AssertionError` until the W5a impl fix lands:
+
+- `test_refusal_reasons_are_the_typed_enum_in_precedence_order`:
+  `unlisted_feed` is now in the enum;
+- `test_one_verdict_per_window_in_pool_order`: a keyless series is refused;
+- `test_unlisted_feed_is_refused`, `test_pool_without_feeds_block_is_refused`,
+  `test_series_without_frontier_key_is_refused` (this replaces the old
+  keyless-eligible pin) and `test_series_with_null_frontier_is_refused`;
+- `test_reason_precedence`: an unlisted feed beats the clock rules;
+- the three armed settle tests: the oracle fails closed, and the traps now
+  include `no_frontier`, `null_frontier` and `unlisted_feed`.
+
+`test_unmeasured_lag_is_not_a_refusal` is renamed to
+`test_listed_feed_with_null_lag_is_not_a_refusal`, and passes. Every other
+test is unchanged and passes.
 
 Locally (bittensor 10.5, no torch) the W5a tests need neither torch nor
 `bittensor.sp_core`, because they never verify a signature.
