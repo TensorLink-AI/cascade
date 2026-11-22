@@ -4,9 +4,12 @@
   service (the "fixture S3 model" of tests/accept/w3a, made writable). It
   models Object Lock (a locked version refuses a versioned delete), delete
   markers (an unversioned delete on a versioned bucket hides, never removes),
-  pagination (2 items per page), and failure injection (write failure,
-  corrupted write, delete failure). Every call is recorded; any method outside
-  the README's allowed surface is recorded in ``forbidden`` and raises.
+  pagination (2 items per page), legal holds, and failure injection (write
+  failure, corrupted write, delete failure; :meth:`FakeS3.outage`: a latched
+  503 on any operation from a trigger point on; :attr:`FakeS3.retention_override`:
+  an error or a malformed answer from ``GetObjectRetention``). Every call is
+  recorded; any method outside the README's allowed surface is recorded in
+  ``forbidden`` and raises.
 * :func:`scenario` builds the vault and its retention ledger.
 * :func:`run_cli` drives ``python -P -m cascade.laned.vault_sweeper`` with
   ``boto3``/``botocore``/``bittensor`` unimportable and every socket connect
@@ -51,14 +54,19 @@ ARCHIVE_PREFIX = "lane-d-archive"
 TOP_KEYS = ("schema", "run_id", "mode", "now", "started_at", "finished_at", "d16", "policy",
             "ledger_era", "vault", "archive", "actions", "counts")
 ACTION_KEYS = ("store", "key", "op", "outcome", "reason")
-OPS = ("archive", "delete", "keep")
+OPS = ("archive", "delete", "keep", "list")
 OUTCOMES = {"archive": ("done", "planned", "already", "failed"),
             "delete": ("done", "planned", "failed"),
-            "keep": ("kept",)}
+            "keep": ("kept",),
+            "list": ("failed",)}
 KEEP_REASONS = ("object_lock", "open_entry", "settlement_open", "king", "ttl_not_expired",
                 "dispute_open", "unreferenced", "unknown_status", "entry_incomplete",
-                "archive_retention_not_expired", "archive_age_unknown")
-FAIL_REASONS = ("archive_copy_failed", "archive_verify_failed", "delete_failed", "object_lock")
+                "archive_retention_not_expired", "archive_age_unknown",
+                "lock_unknown", "legal_hold", "run_aborted")
+FAIL_REASONS = ("archive_copy_failed", "archive_verify_failed", "delete_failed", "object_lock",
+                "storage_error")
+# keep reasons that mean "may be under Object Lock": never deleted
+LOCK_KEEP_REASONS = ("object_lock", "lock_unknown", "legal_hold")
 COUNT_KEYS = ("archived", "deleted", "expired", "kept", "failed", "planned")
 
 HEX64_RE = re.compile(r"[0-9a-f]{64}")
@@ -258,7 +266,7 @@ class _Paginator:
 WRITE_OPS = ("put_object", "copy_object", "create_multipart_upload", "upload_part",
              "upload_part_copy", "complete_multipart_upload")
 ALLOWED_OPS = ("list_objects_v2", "list_object_versions", "head_object", "get_object",
-               "get_object_retention", "delete_object", "delete_objects",
+               "get_object_retention", "get_object_legal_hold", "delete_object", "delete_objects",
                "abort_multipart_upload", "get_paginator") + WRITE_OPS
 PAGE = 2
 
@@ -267,7 +275,9 @@ class FakeS3:
     """In-memory S3 service holding several versioned buckets. ``clock`` is
     the service's "now" for Object Lock enforcement (the tests set it to the
     sweep's ``now``). Versions: ``{"vid", "data", "mode", "retain_until",
-    "meta", "marker"}`` per key, oldest first."""
+    "meta", "marker", "hold"}`` per key, oldest first (``hold`` is the legal
+    hold, ``"ON"``/``"OFF"``/None; an ``"ON"`` hold refuses a versioned delete
+    like unexpired retention)."""
 
     def __init__(self, buckets=(VAULT_BUCKET, ARCHIVE_BUCKET), clock: datetime = NOW):
         self.buckets: dict[str, dict[str, list[dict]]] = {b: {} for b in buckets}
@@ -278,8 +288,47 @@ class FakeS3:
         self.fail_put: set[tuple[str, str]] = set()
         self.corrupt: set[tuple[str, str]] = set()
         self.fail_delete: set[tuple[str, str]] = set()
+        # (bucket, full key) -> ("error", code, status) | ("response", dict): what
+        # GetObjectRetention answers for every version of that key instead of the
+        # truth (an unreadable or malformed retention answer).
+        self.retention_override: dict[tuple[str, str], tuple] = {}
+        self.rules: list[dict] = []          # outage rules, see outage()
+        self.injected: list[int] = []        # indices into ``calls`` of injected failures
+        self.deleted_ok: list[tuple[str, str, str | None]] = []   # successful deletes
         self._uploads: dict[str, dict] = {}
         self._n = 0
+
+    # failure injection
+    def outage(self, op: str, bucket: str | None = None, *, when=None, code: str = "SlowDown",
+               status: int = 503) -> dict:
+        """From the first ``op`` call (on ``bucket``, if given) at which
+        ``when(self)`` is true (or from the start when ``when`` is None), every
+        such call fails with ``code``/``status`` (latched: a storage outage)."""
+        rule = {"op": op, "bucket": bucket, "when": when, "code": code, "status": status,
+                "armed": when is None}
+        self.rules.append(rule)
+        return rule
+
+    def clear_faults(self) -> None:
+        self.rules.clear()
+        self.retention_override.clear()
+        self.fail_put.clear()
+        self.corrupt.clear()
+        self.fail_delete.clear()
+
+    def _inject(self, op: str, kw: dict) -> None:
+        for rule in self.rules:
+            if rule["op"] != op or (rule["bucket"] is not None and kw.get("Bucket") != rule["bucket"]):
+                continue
+            if not rule["armed"] and rule["when"](self):
+                rule["armed"] = True
+            if rule["armed"]:
+                self.injected.append(len(self.calls) - 1)
+                raise FakeClientError(op, rule["code"], rule["status"])
+
+    def _record(self, op: str, kw: dict) -> None:
+        self.calls.append((op, kw))
+        self._inject(op, kw)
 
     # fixture state
     def _vid(self) -> str:
@@ -287,11 +336,12 @@ class FakeS3:
         return f"v{self._n:06d}"
 
     def seed(self, bucket: str, key: str, data: bytes, *, mode: str | None = None,
-             retain_until: datetime | None = None, meta: dict | None = None) -> str:
+             retain_until: datetime | None = None, meta: dict | None = None,
+             hold: str | None = None) -> str:
         vid = self._vid()
         self.buckets[bucket].setdefault(key, []).append(
             {"vid": vid, "data": data, "mode": mode, "retain_until": retain_until,
-             "meta": dict(meta or {}), "marker": False})
+             "meta": dict(meta or {}), "marker": False, "hold": hold})
         return vid
 
     def live_data(self, bucket: str, key: str) -> bytes | None:
@@ -338,6 +388,8 @@ class FakeS3:
         return self.buckets[b]
 
     def _locked(self, v: dict) -> bool:
+        if v.get("hold") == "ON":
+            return True
         return bool(v["mode"]) and v["retain_until"] is not None and v["retain_until"] > self.clock
 
     def _check_acl(self, op: str, kw: dict) -> None:
@@ -394,7 +446,7 @@ class FakeS3:
 
     # the boto3-shaped surface
     def list_objects_v2(self, **kw):
-        self.calls.append(("list_objects_v2", dict(kw)))
+        self._record("list_objects_v2", dict(kw))
         bucket = self._bucket("ListObjectsV2", kw)
         pre = kw.get("Prefix", "")
         keys = [k for k in sorted(bucket) if k.startswith(pre) and bucket[k]
@@ -409,7 +461,7 @@ class FakeS3:
         return out
 
     def list_object_versions(self, **kw):
-        self.calls.append(("list_object_versions", dict(kw)))
+        self._record("list_object_versions", dict(kw))
         bucket = self._bucket("ListObjectVersions", kw)
         pre = kw.get("Prefix", "")
         items = [(k, i, v) for k in sorted(bucket) if k.startswith(pre)
@@ -434,7 +486,7 @@ class FakeS3:
         return out
 
     def get_paginator(self, name: str):
-        self.calls.append(("get_paginator", {"name": name}))
+        self._record("get_paginator", {"name": name})
         if name == "list_objects_v2":
             return _Paginator(self.list_objects_v2, ("ContinuationToken",),
                               ("NextContinuationToken",))
@@ -444,7 +496,7 @@ class FakeS3:
         raise AssertionError(f"W18: unexpected paginator {name!r}")
 
     def head_object(self, **kw):
-        self.calls.append(("head_object", dict(kw)))
+        self._record("head_object", dict(kw))
         v = self._find("HeadObject", kw)
         out = {"ContentLength": len(v["data"]), "VersionId": v["vid"],
                "ETag": '"' + hashlib.md5(v["data"]).hexdigest() + '"',
@@ -452,18 +504,32 @@ class FakeS3:
         if v["mode"]:
             out["ObjectLockMode"] = v["mode"]
             out["ObjectLockRetainUntilDate"] = v["retain_until"]
+        if v.get("hold"):
+            out["ObjectLockLegalHoldStatus"] = v["hold"]
         return out
 
     def get_object_retention(self, **kw):
-        self.calls.append(("get_object_retention", dict(kw)))
+        self._record("get_object_retention", dict(kw))
         v = self._find("GetObjectRetention", kw)
+        ov = self.retention_override.get((kw.get("Bucket"), kw.get("Key")))
+        if ov is not None:
+            if ov[0] == "error":
+                raise FakeClientError("GetObjectRetention", ov[1], ov[2])
+            return dict(ov[1])
         if not v["mode"]:
             raise FakeClientError("GetObjectRetention", "NoSuchObjectLockConfiguration", 404)
         return {"Retention": {"Mode": v["mode"], "RetainUntilDate": v["retain_until"]},
                 "ResponseMetadata": {"HTTPStatusCode": 200}}
 
+    def get_object_legal_hold(self, **kw):
+        self._record("get_object_legal_hold", dict(kw))
+        v = self._find("GetObjectLegalHold", kw)
+        if not v.get("hold"):
+            raise FakeClientError("GetObjectLegalHold", "NoSuchObjectLockConfiguration", 404)
+        return {"LegalHold": {"Status": v["hold"]}, "ResponseMetadata": {"HTTPStatusCode": 200}}
+
     def get_object(self, **kw):
-        self.calls.append(("get_object", dict(kw)))
+        self._record("get_object", dict(kw))
         v = self._find("GetObject", kw)
         return {"Body": _Body(v["data"]), "ContentLength": len(v["data"]),
                 "VersionId": v["vid"], "Metadata": dict(v["meta"]),
@@ -471,17 +537,17 @@ class FakeS3:
 
     def put_object(self, **kw):
         rec = {k: v for k, v in kw.items() if k != "Body"}
-        self.calls.append(("put_object", rec))
+        self._record("put_object", rec)
         self._check_acl("put_object", kw)
         return self._store("PutObject", kw, self._read_body(kw.get("Body", b"")))
 
     def copy_object(self, **kw):
-        self.calls.append(("copy_object", dict(kw)))
+        self._record("copy_object", dict(kw))
         self._check_acl("copy_object", kw)
         return self._store("CopyObject", kw, self._source("CopyObject", kw.get("CopySource")))
 
     def create_multipart_upload(self, **kw):
-        self.calls.append(("create_multipart_upload", dict(kw)))
+        self._record("create_multipart_upload", dict(kw))
         self._check_acl("create_multipart_upload", kw)
         self._bucket("CreateMultipartUpload", kw)
         self._n += 1
@@ -491,14 +557,14 @@ class FakeS3:
 
     def upload_part(self, **kw):
         rec = {k: v for k, v in kw.items() if k != "Body"}
-        self.calls.append(("upload_part", rec))
+        self._record("upload_part", rec)
         up = self._uploads[kw["UploadId"]]
         data = self._read_body(kw.get("Body", b""))
         up["parts"][int(kw["PartNumber"])] = data
         return {"ETag": '"' + hashlib.md5(data).hexdigest() + '"'}
 
     def upload_part_copy(self, **kw):
-        self.calls.append(("upload_part_copy", dict(kw)))
+        self._record("upload_part_copy", dict(kw))
         up = self._uploads[kw["UploadId"]]
         data = self._source("UploadPartCopy", kw.get("CopySource"))
         rng = kw.get("CopySourceRange")
@@ -509,14 +575,14 @@ class FakeS3:
         return {"CopyPartResult": {"ETag": '"' + hashlib.md5(data).hexdigest() + '"'}}
 
     def complete_multipart_upload(self, **kw):
-        self.calls.append(("complete_multipart_upload", dict(kw)))
+        self._record("complete_multipart_upload", dict(kw))
         up = self._uploads.pop(kw["UploadId"])
         nums = [int(p["PartNumber"]) for p in (kw.get("MultipartUpload") or {}).get("Parts", [])]
         data = b"".join(up["parts"][n] for n in sorted(nums))
         return self._store("CompleteMultipartUpload", up["kw"], data)
 
     def abort_multipart_upload(self, **kw):
-        self.calls.append(("abort_multipart_upload", dict(kw)))
+        self._record("abort_multipart_upload", dict(kw))
         self._uploads.pop(kw.get("UploadId"), None)
         return {}
 
@@ -530,6 +596,7 @@ class FakeS3:
             vs_.append({"vid": self._vid(), "data": b"", "mode": None, "retain_until": None,
                         "meta": {}, "marker": True})
             bucket[key] = vs_
+            self.deleted_ok.append((bucket_name, key, None))
             return
         for i, v in enumerate(vs_):
             if v["vid"] == vid:
@@ -539,10 +606,11 @@ class FakeS3:
                 del vs_[i]
                 if not vs_:
                     bucket.pop(key, None)
+                self.deleted_ok.append((bucket_name, key, vid))
                 return
 
     def delete_object(self, **kw):
-        self.calls.append(("delete_object", dict(kw)))
+        self._record("delete_object", dict(kw))
         self._bucket("DeleteObject", kw)
         if "BypassGovernanceRetention" in kw:
             self.violations.append("delete_object with BypassGovernanceRetention")
@@ -550,7 +618,7 @@ class FakeS3:
         return {"ResponseMetadata": {"HTTPStatusCode": 204}}
 
     def delete_objects(self, **kw):
-        self.calls.append(("delete_objects", dict(kw)))
+        self._record("delete_objects", dict(kw))
         self._bucket("DeleteObjects", kw)
         if "BypassGovernanceRetention" in kw:
             self.violations.append("delete_objects with BypassGovernanceRetention")
@@ -595,6 +663,39 @@ def run_sweep(vault, archive, led: dict, tmp_path: Path, *, now: datetime = NOW,
     log_dir = log_dir or (tmp_path / "logs")
     return m.sweep(vault=vault, archive=archive, ledger=led, policy=pol or policy(), now=now,
                    live=live, plan_path=plan, log_dir=log_dir)
+
+
+def sweep_logged(vault, archive, led: dict, tmp_path: Path, **kw) -> tuple[dict, Exception | None]:
+    """One run that may end on a storage error. ``sweep`` may return the log
+    or raise (anything but ``SweepRefused``), but only AFTER writing exactly
+    one complete strict-JSON action log to its ``log_dir`` (README "Storage
+    errors"). Returns (the log read back from disk, the exception or None)."""
+    m = vs()
+    log_dir = tmp_path / "logs"
+    ret, raised = None, None
+    try:
+        ret = run_sweep(vault, archive, led, tmp_path, log_dir=log_dir, **kw)
+    except AssertionError:
+        raise
+    except m.SweepRefused as e:
+        raise AssertionError(f"W18: a run that touched storage ended in SweepRefused({e.code!r}); "
+                             "a refusal is only ever raised before any storage call") from None
+    except Exception as e:  # noqa: BLE001 - any escape is allowed once the log is on disk
+        raised = e
+    files = sorted(log_dir.glob("vault-sweep-*.json")) if log_dir.is_dir() else []
+    assert len(files) == 1, (
+        f"W18: a storage error must never escape without the action log: {len(files)} "
+        f"log file(s) in {log_dir} (sweep raised {raised!r}). The log of what was already "
+        "archived/deleted is written BEFORE sweep returns or raises (README \"Storage errors\")")
+    try:
+        log = strict_loads(files[0].read_text(encoding="utf-8"))
+    except ValueError as e:
+        raise AssertionError(f"W18: the action log on disk is not strict JSON: {e}") from None
+    assert isinstance(log, dict) and files[0].name == f"vault-sweep-{log.get('run_id')}.json", (
+        files[0].name)
+    if ret is not None:
+        assert ret == log, "sweep returned a log that differs from the one it wrote"
+    return log, raised
 
 
 def by_key(log: dict, store: str = "vault") -> dict[str, list[dict]]:
@@ -821,7 +922,7 @@ def evidence_problems(ev) -> list[str]:
             continue
         if x["op"] == "archive" and x["outcome"] in ("done", "already"):
             archived.add(x["key"])
-        if x["op"] == "keep" and x["reason"] == "object_lock":
+        if x["op"] == "keep" and x["reason"] in LOCK_KEEP_REASONS:
             locked.add(x["key"])
         if x["op"] == "delete" and x["outcome"] == "done":
             if x["key"] not in archived:
