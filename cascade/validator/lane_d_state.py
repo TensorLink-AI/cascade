@@ -30,6 +30,12 @@ W7c pins the file and the digests a settlement's receipt binds:
   (the state as loaded), ``posterior_state_sha256`` (the state written) and
   ``report_sha256``; :func:`verify_receipt` and :func:`verify_receipt_chain`
   check it with a typed :class:`LaneDReceiptError`.
+- Every armed report binds the prior state digest inside its signed body
+  (``extensions.prior_state_sha256``, :data:`PRIOR_STATE_EXTENSION`). After a
+  crash between the report write and the state write, recovery adopts the
+  persisted report only once :func:`check_persisted_report` accepts it
+  (pinned signer ``report_unverified``; boundary and bound prior digest
+  ``report_conflict``); it never re-sweeps the bench (RV7 B1).
 
 No migration from the pre-W7c layout (``indent=1``, a signature in
 ``last_report``): lane D has never been armed on any deployment
@@ -64,7 +70,13 @@ ENTRY_REASONS = tuple(lane_d_report.ENTRY_REASONS) + tuple(
 STATE_ERROR_CODES = ("bad_json", "duplicate_key", "not_canonical", "unknown_schema",
                      "state_digest_mismatch", "stale_boundary", "report_conflict",
                      # RV6 B3: a lost or unreadable state after a settlement
-                     "state_missing", "state_unreadable")
+                     "state_missing", "state_unreadable",
+                     # RV7 B1: a persisted report recovery cannot verify
+                     "report_unverified")
+# RV7 B1: where an armed report binds, inside its signed body, the digest of
+# the state it was settled from (W7a froze the top-level keys, so it sits in
+# the open ``extensions`` map).
+PRIOR_STATE_EXTENSION = "prior_state_sha256"
 # A persisted report's file name under ``report_path``'s directory.
 _REPORT_NAME = re.compile(r"lane_d_report_([0-9]+)\.json")
 RECEIPT_ERROR_CODES = ("not_object", "unknown_schema", "missing_field", "unknown_field",
@@ -378,6 +390,60 @@ def load_report_file(path: str | os.PathLike) -> dict:
     return _parse_object(p.read_bytes(), p)
 
 
+def bound_prior_state(report: dict) -> str | None:
+    """The prior state digest bound in ``report``'s signed body
+    (``extensions.prior_state_sha256``), or ``None`` if it carries none."""
+    ext = report.get("extensions") if isinstance(report, dict) else None
+    got = ext.get(PRIOR_STATE_EXTENSION) if isinstance(ext, dict) else None
+    return got if _is_hex64(got) else None
+
+
+def check_persisted_report(report: dict, *, signer_ss58: str, boundary: int,
+                           prior_state_sha256: str, where) -> None:
+    """RV7 B1: may recovery adopt ``report`` (persisted at ``where``, already
+    parsed strictly by :func:`load_report_file`) for the settlement at
+    ``boundary`` from the state whose digest is ``prior_state_sha256``? In
+    order: its body is signed by ``signer_ss58`` (the settling validator's
+    key; a foreign signer, a bad signature or an edit after signing is
+    ``report_unverified``); its ``boundary`` is ``boundary`` and the prior
+    state digest bound in its signed body is ``prior_state_sha256`` (else
+    ``report_conflict``: a genuine report of another settlement); and it
+    passes the full :func:`~cascade.validator.lane_d_report.verify_report`
+    (a schema defect is ``report_unverified``). Reads only."""
+    if not _signed_by(report, signer_ss58):
+        raise LaneDStateError("report_unverified", f"{where}: the persisted report is not "
+                              f"signed by the settling validator's key {signer_ss58}")
+    if report.get("boundary") != _boundary_int(boundary):
+        raise LaneDStateError("report_conflict", f"{where}: the persisted report's boundary "
+                              f"{report.get('boundary')!r} is not {boundary}")
+    bound = bound_prior_state(report)
+    if bound != prior_state_sha256:
+        raise LaneDStateError("report_conflict", f"{where}: the persisted report was settled "
+                              f"from state {bound!r}, not the loaded state "
+                              f"{prior_state_sha256}")
+    if not lane_d_report.verify_report(report, signer_ss58):
+        raise LaneDStateError("report_unverified", f"{where}: the persisted report does not "
+                              f"verify (lane-d-report/1) against {signer_ss58}")
+
+
+def _signed_by(report: dict, signer_ss58: str) -> bool:
+    """``report["signature"]`` is ``signer_ss58``'s sr25519 signature over
+    the report's canonical body and ``report["signer"]`` names that key
+    (the signature half of ``verify_report``, without the schema)."""
+    sig = report.get("signature")
+    if (not isinstance(signer_ss58, str) or not signer_ss58
+            or report.get("signer") != signer_ss58 or not isinstance(sig, str)
+            or not re.fullmatch(lane_d_report.SIGNATURE_PATTERN, sig)):
+        return False
+    try:
+        body = lane_d_report.canonical_body(report)
+    except (TypeError, ValueError):
+        return False
+    from ..shared.sr25519 import verify_hotkey
+
+    return verify_hotkey(signer_ss58, body, sig)
+
+
 # ── the receipt record ──────────────────────────────────────────────────────
 
 
@@ -467,9 +533,10 @@ def verify_receipt_chain(receipts) -> None:
                                     f"{a['posterior_state_sha256']}")
 
 
-__all__ = ["ENTRY_REASONS", "ENTRY_STATUSES", "RECEIPT_ERROR_CODES", "RECEIPT_FIELDS",
-           "RECEIPT_SCHEMA", "STATE_ERROR_CODES", "STATE_ONLY_REASONS", "STATE_SCHEMA",
-           "LaneDReceiptError", "LaneDStateError", "canonical_state", "genesis",
+__all__ = ["ENTRY_REASONS", "ENTRY_STATUSES", "PRIOR_STATE_EXTENSION", "RECEIPT_ERROR_CODES",
+           "RECEIPT_FIELDS", "RECEIPT_SCHEMA", "STATE_ERROR_CODES", "STATE_ONLY_REASONS",
+           "STATE_SCHEMA", "LaneDReceiptError", "LaneDStateError", "bound_prior_state",
+           "canonical_state", "check_persisted_report", "genesis",
            "load_prior_state", "load_report_file", "load_state", "make_receipt",
            "persisted_report_boundaries", "refresh_house", "report_digest", "report_path",
            "restore_state", "save_report_file", "save_state", "state_digest",

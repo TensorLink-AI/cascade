@@ -36,6 +36,29 @@ new informative integer series, `time/counts/5`, with the same assertions.
 They pass on main and after WB11's B5 implementation. Every other existing
 assertion is unchanged.
 
+## Tests correction (RV7 B3, note 9)
+
+RV7 B3 (RV6 B8 still unwired) found that the intake loads the pinned hash
+set as the full dict, and parses every `hashset-v<n>` file whole until one
+matches. WB11's bounded `load_lookup` had no production caller. RV7 note 9
+found that a load-driven `budget_exceeded` stuck in the result cache.
+`test_wb13_rv7.py` is new, and section "RV7" below is its contract.
+
+- **Fail on main** with an `AssertionError`:
+  - `test_pinned_hashset_is_the_bounded_lookup`;
+  - `test_only_the_pinned_file_is_loaded_and_only_through_load_lookup`;
+  - `test_loader_and_main_use_load_lookup_never_load_artefact`;
+  - `test_large_pinned_hashset_loads_within_the_lookup_rss_bound`;
+  - `test_deadline_budget_exceeded_is_not_cached`.
+- **Pass on main** and guard behaviour that must stay: the tampered or
+  missing pin, the intake on the loaded hash set (clean, embedded, another
+  pin), transient fetch and scan errors, and the cached window-budget
+  overrun.
+
+One existing assertion changed. `test_load_pinned_hashset` compared the
+loaded hash set to the dict with `==`. It now compares the header keys and
+every hash. Every other assertion in it is unchanged.
+
 ## How the tests fail on main
 
 Every failure on main is one of these, inside a test body:
@@ -129,6 +152,7 @@ to an artefact.
   under `root` whose WB11 `artefact_sha256` equals `pin`.
 - No match raises `ValueError`. That includes a file edited after pinning
   and a `root` with no artefacts. It never falls back to another version.
+- Since RV7 it returns WB11's bounded lookup, not the dict. See "RV7" below.
 
 ## The wire point: `POST /v1/lane-b/fund` (`FundingIntake.lane_b_fund`)
 
@@ -290,8 +314,8 @@ on main), run them in a niced child process and kill it on overrun.
   must be content-addressed: the ref (vault and Hub refs are content-pinned)
   plus the hash-set pin, per `FundingIntake`, or the tree's content hash. A
   cache shared across intakes by ref alone would leak between tests and
-  hosts. Whether a `budget_exceeded` result is cached isn't pinned. Caching
-  it is recommended, because repeat funds then cost nothing.
+  hosts. Since RV7 note 9, a window-budget `budget_exceeded` is cached and a
+  deadline-driven one is not (see "RV7").
 
 ### Packaging evasions (`test_wb13_rv6.py`, B7)
 
@@ -330,6 +354,85 @@ Guard 4 is the backstop for them, as for procedural regeneration:
 - noise above ~0.03 σ;
 - container formats other than zip/`.npy`.
 
+## RV7: the bounded hash-set load (B3) and transient refusals (note 9)
+
+### The pinned hash set is loaded bounded (`test_wb13_rv7.py`, B3)
+
+**Pinned (`load_pinned_hashset(pin, root)`):**
+
+- **The return is bounded.** It's a read-only `Mapping`: WB11
+  `ContaminationLookup`, or a wrapper around one (to carry the pin, say). It
+  is never a `dict`, and its `exact` and `normalised` tables aren't `dict`s.
+- **It answers like the artefact.** The header keys (`schema`, `version`,
+  `window`, `stride`, `suites`) are equal. Every hash `.get`s the same
+  `[suite, window_id]`. WB11 `match_series` gives the same result on every
+  fixture embedding.
+- **It loads one file, and only through `load_lookup`.** WB11
+  `load_lookup(<the pinned file>, expect_sha256=pin)` is called exactly
+  once, and WB11 `load_artefact` is never called. The fixture publishes v1,
+  v2 (pinned, `.json.gz`), v3 and a junk `hashset-v4.json`.
+- **How it finds the file.** The pin is the sha256 of the canonical JSON,
+  and `write_artefact` writes exactly those bytes (gzipped for `.gz`). So a
+  streaming sha256 of each candidate's raw (decompressed) bytes finds the
+  file with O(1) memory and no parse. The method isn't pinned. Only the
+  parser calls are pinned.
+- **AST check.** The body of `load_pinned_hashset` names `load_lookup` and
+  not `load_artefact`. `cascade/funding/main.py` names `load_pinned_hashset`
+  and never `load_artefact`. So the claim in
+  `cascade/eval/contamination.py` is true: "the intake check loads the
+  pinned file with load_lookup".
+- **Fail closed, unchanged.** A file edited after pinning, or a `root`
+  without artefacts, raises `ValueError`.
+
+**Memory (measured in a fresh child).**
+
+- **The fixture.** WB11's 50 000-window `synth_suites`, published as
+  `hashset-v1.json.gz` (a decoy) and `hashset-v2.json.gz` (pinned). Each is
+  about 4 MB on disk, and the test refuses anything over 8 MiB.
+- **The bound.** Growth is the child's `VmHWM` after the load minus its
+  `VmRSS` just before. The bound is WB11's:
+  2 × `LOOKUP_PEAK_BYTES_PER_WINDOW` × n + 16 MiB, about 22 MiB here.
+- **Measured on main's WB11 functions:**
+  - `load_lookup` grows about 3.5 MB;
+  - `load_artefact` about 66 MB.
+- **The control.** The test checks that the full load breaks the bound, so
+  the measurement can tell the two loads apart.
+
+**Pinned (intake).**
+
+- `FundingIntake` takes what `load_pinned_hashset` returns. A clean tree
+  gets 202 with the clean receipt. TB10 gets 400 `benchmark_series_embedded`
+  with its receipt, and nothing is queued.
+- A lookup of another pin answers 503 and queues nothing. So the intake has
+  to know the loaded lookup's pin. `ContaminationLookup` carries no sha, so
+  the loader has to attach one, or the intake has to get the pin some other
+  way, never by serialising the lookup.
+
+### A refusal caused only by load is not cached (note 9)
+
+**Not cached:**
+
+- a fetch that raises or returns `None` (503);
+- a `scan_repo` that raises (503);
+- a `budget_exceeded` from the scan deadline (`SCAN_DEADLINE_S`
+  monkeypatched to 1 ns, 413).
+
+In each case, a re-fund after the cause clears is scanned again and gets 202
+with the clean receipt. The deadline test sees exactly two `scan_repo` calls.
+
+**Cached:** a content-determined result is cached as before. A window-budget
+`budget_exceeded` (`MAX_SCAN_WINDOWS` monkeypatched to 8, on a tree of 33
+windows) gives 413 twice, from one `scan_repo` call.
+
+**Not pinned:**
+
+- How the intake tells a deadline overrun from a window-budget overrun (a
+  flag, an exception, an extra return value). The receipt stays
+  `{hashset_version, "result": "budget_exceeded", "suite": null,
+  "window_id": null}` either way, and so does the 413.
+- Whether `clean` and `embedded` share the cache with the window-budget
+  result.
+
 ## Not pinned
 
 - The order of steps 2 to 4 among themselves.
@@ -353,8 +456,9 @@ Guard 4 is the backstop for them, as for procedural regeneration:
 | file | pins |
 |---|---|
 | `PATHS` | the modules WB13 may change |
-| `helpers.py` | the suite fixture, the WB11 artefact, the config through `parse_lane_b`, fixture repos as plain files, the real intake builder, the recording fetch, the torch guard, the hash-seed entry point |
+| `helpers.py` | the suite fixture, the WB11 artefact, the config through `parse_lane_b`, fixture repos as plain files, the real intake builder, the recording fetch, the torch guard, the hash-seed entry point; since RV7: `publish`, `Spy`, `FlakyFetcher` and the 50 000-window build / load children |
 | `test_wb13_plan.py` | the WB13 / TB10–TB12 / LB1 / D38 plan text verbatim, the shipped 8 MB cap, fixture sanity against WB11 (passes on main) |
 | `test_wb13_scan.py` | `scan_repo`: the three sources, TB10, TB11, TB12 versions, the hit rule, never executing, determinism; `load_pinned_hashset` |
 | `test_wb13_rv6.py` | RV6 B6 scan budget (`max_windows`, `deadline_s`, `budget_exceeded`, 413, bounded handler time, result cache) and B7 packaging evasions (str/bytes literals, `.npz`, offsets, big-endian, one-line rows; never unpickled; inflation cap) |
+| `test_wb13_rv7.py` | RV7 B3: `load_pinned_hashset` returns the bounded lookup, built by one `load_lookup(path, expect_sha256=pin)` and never `load_artefact`, within WB11's RSS bound in a child; the intake on it; note 9: transient refusals are not cached, window-budget overruns are |
 | `test_wb13_intake.py` | `main.py` wiring, the invariant pair, TB10 and TB11 refused at intake, TB12 version change, fail closed, the identity gate before the fetch, D38 |
