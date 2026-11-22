@@ -588,6 +588,11 @@ LANE_B_REMAINDERS = ("burn", "lane_a")
 # DEC-CA-0059: a horizon slot's target name (``horizon:64``) and its short
 # commitment code (``h64`` — ``:`` separates the commitment's fields)
 HORIZON_TARGET_PREFIX = "horizon:"
+# DEC-CA-0071 §1: a suite slot's target name (``suite:gift``) and its
+# commitment code (``s-gift``), one per bench suite, in this order
+SUITE_TARGET_PREFIX = "suite:"
+SUITE_CODE_PREFIX = "s-"
+SUITE_TARGET_SUITES: tuple[str, ...] = SENTINEL_SUITES
 
 
 @dataclass(frozen=True)
@@ -767,11 +772,20 @@ class LaneBConfig:
         return tuple(f"{HORIZON_TARGET_PREFIX}{int(h)}" for h in self.horizons)
 
     @property
+    def suite_target_names(self) -> tuple[str, ...]:
+        """``suite:<suite>`` per bench suite (DEC-CA-0071 §1) while
+        ``suite_targets`` is armed; ``()`` otherwise."""
+        if not self.suite_targets:
+            return ()
+        return tuple(f"{SUITE_TARGET_PREFIX}{s}" for s in SUITE_TARGET_SUITES)
+
+    @property
     def targets(self) -> tuple[str, ...]:
-        """The lane-B slot list (DEC-CA-0059): ``domains`` then the horizon
+        """The lane-B slot list (DEC-CA-0059): ``domains``, the horizon
+        targets, then (``suite_targets`` armed, DEC-CA-0071 §1) the suite
         targets. One emission slot each (``share / len(targets)``). Equal to
-        ``domains`` whenever there are no horizon targets."""
-        return tuple(self.domains) + self.horizon_target_names
+        ``domains`` whenever there are no horizon or suite targets."""
+        return tuple(self.domains) + self.horizon_target_names + self.suite_target_names
 
     def verdict_params(self):
         from ...eval.expert_lane import ExpertLaneParams
@@ -942,6 +956,11 @@ def parse_lane_b(lb: dict, *, from_block: int | None = None,
         if not re.fullmatch(r"[a-z0-9_\-]{1,32}", d) or re.fullmatch(r"h[0-9]+", d):
             raise ValueError(f"[lane_b] domain {d!r} must match [a-z0-9_-]{{1,32}} and not "
                              f"look like a horizon code (h<digits>)")
+        if cfg.suite_targets and d.startswith(SUITE_CODE_PREFIX):
+            # DEC-CA-0071 §1: ``s-<suite>`` is a suite target's commitment code
+            raise ValueError(f"[lane_b] domain {d!r} must not start with "
+                             f"{SUITE_CODE_PREFIX!r} while suite_targets is armed (suite "
+                             f"target codes)")
     if len(set(cfg.horizons)) != len(cfg.horizons) or any(h <= 0 for h in cfg.horizons):
         raise ValueError(f"[lane_b] horizons must be unique positive ints; got {cfg.horizons}")
     if cfg.max_domains_per_leg < 1:

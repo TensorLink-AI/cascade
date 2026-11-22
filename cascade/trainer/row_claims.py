@@ -11,7 +11,11 @@ A funded lane B entry may declare the expert rows its leg trains (WB14,
   them), whichever mode (declared or ESFT) planned them (DEC-CA-0059);
 * **deferral** — a declared claim overlapping a holder waits, uncharged, and
   is reported as ``deferred: rows_held`` with the holder's entry and the
-  expected release (the holder's verdict or merge era).
+  expected release (the holder's verdict or merge era);
+* **sentinel targets** (WB18, §12b.5 LB5, D35) — a suite-target entry on the
+  era's sentinel waits, uncharged, as ``deferred: sentinel_target``, in at
+  most ``sentinel_max_defer_eras`` distinct eras; after that it is judged on
+  its target regardless.
 
 Torch-free: the driver calls it under its lock with plain data.
 """
@@ -101,6 +105,43 @@ def deferred_row(hotkey: str, entry_ref: str, holder: Holder, rows) -> dict:
             "holder": holder.public(),
             "expected_release": {"kind": holder.kind, "era": int(holder.era)},
             "overlap": {str(k): v for k, v in overlap.items()}}
+
+
+# ── sentinel targets (WB18; §12b.5 LB5, D35) ─────────────────────────────────
+
+SENTINEL_TARGET = "sentinel_target"
+SENTINEL_HOLD, SENTINEL_PAST_BOUND = "hold", "past_bound"
+
+
+def sentinel_hit(declared, sentinel_target: str | None) -> bool:
+    """Whether an entry declaring ``declared`` targets the era's sentinel
+    suite target (``suite:<sentinel>``; ``None`` = no sentinel this era)."""
+    return sentinel_target is not None and str(sentinel_target) in {str(t) for t in declared}
+
+
+def sentinel_decision(eras_deferred, era_index: int, max_defer_eras: int) -> str:
+    """D35 (a) for an entry on the era's sentinel, given the distinct eras it
+    was already deferred in: ``hold`` (deferred this era: already counted, or
+    still under the bound) or ``past_bound`` (deferred in
+    ``sentinel_max_defer_eras`` other eras — it is judged on its target)."""
+    seen = {int(e) for e in eras_deferred}
+    if int(era_index) in seen or len(seen) < int(max_defer_eras):
+        return SENTINEL_HOLD
+    return SENTINEL_PAST_BOUND
+
+
+def sentinel_row(hotkey: str, entry_ref: str, suite: str, eras_deferred,
+                 max_defer_eras: int, era_index: int) -> dict:
+    """The public ``status/lane_b.json`` row of a sentinel-deferred entry: the
+    era's sentinel suite, the eras it has been deferred in and the last era
+    it can be deferred in before it is judged regardless."""
+    eras = sorted({int(e) for e in eras_deferred})
+    left = max(0, int(max_defer_eras) - len(eras))
+    return {"hotkey": str(hotkey), "entry_ref": str(entry_ref), "deferred": SENTINEL_TARGET,
+            "suite": str(suite), "eras_deferred": eras,
+            "sentinel_max_defer_eras": int(max_defer_eras),
+            "expected_release": {"kind": "sentinel_rotation", "era": int(era_index) + 1,
+                                 "latest_era": int(era_index) + left + 1}}
 
 
 def has_capacity(declared, busy: dict[str, int], legs_per_domain: int) -> bool:

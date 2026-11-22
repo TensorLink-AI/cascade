@@ -7,7 +7,10 @@ domain-expert competition, hooked into the rolling scheduler at three points:
                  current one), check the opening gate (a one-way latch), plan
                  the declared-row entries first (WB15: their own rows, in
                  reveal order; an overlap with held rows is deferred
-                 uncharged, ``deferred: rows_held``), then an ESFT selection
+                 uncharged, ``deferred: rows_held``) — a suite-target entry
+                 on the era's §16 sentinel is deferred uncharged instead
+                 (WB18, D35: ``deferred: sentinel_target``, at most
+                 ``sentinel_max_defer_eras`` eras) — then an ESFT selection
                  on the CURRENT era king excluding every held row, and
                  dispatch at most ``legs_per_domain`` per domain;
 * ``settle``   — after each settlement manifest is published: drop legs that
@@ -68,6 +71,7 @@ from .expert_lane import (
     union_selection,
 )
 from .row_claims import (
+    SENTINEL_HOLD,
     claim_key,
     deferred_row,
     first_overlap,
@@ -112,6 +116,10 @@ class LaneBOps(Protocol):
 
     def merge_scores(self, pointer: str, block: int) -> list:
         """The held-out acceptance scores of ``pointer``."""
+
+    def block_hash(self, block: int) -> str:
+        """The chain's ``0x`` hash of ``block`` (read only while the §16
+        sentinel and suite targets are armed: the era-start draw, WB18)."""
 
     # DEC-CA-0059 item 8 (optional: an ops without them dispatches unfunded,
     # the pre-funding behaviour the unit fakes keep):
@@ -175,9 +183,18 @@ class LaneBDriverState:
     # domain, gen_ref, leg_pointer, base_king_ref, king_pointer, outcome
     # ("stale" | "routing_stale" | "merge_refused"), detail}
     outcomes: list[dict] = field(default_factory=list)
+    # WB18 (D35 (a), TB20): submission key -> the distinct eras the entry was
+    # deferred in because its suite target was that era's sentinel. Durable,
+    # so a restart never resets the ``sentinel_max_defer_eras`` bound; pruned
+    # to the submissions still pending or open
+    sentinel_deferrals: dict[str, list[int]] = field(default_factory=dict)
 
 
 SETTLED_KEEP = 256
+SENTINELS_KEEP = 8
+# a sentinel draw the chain read could not produce this tick: every
+# suite-target entry waits (uncounted) until the era's block hash is readable
+SENTINEL_UNREADABLE = "?"
 KINGS_KEEP = 16
 HISTORY_KEEP = 512
 OUTCOMES_KEEP = 256
@@ -221,6 +238,10 @@ class LaneBDriver:
         # WB15: the declared claims the latest tick deferred (``deferred:
         # rows_held`` rows of ``status/lane_b.json``); re-derived every tick
         self._deferred: list[dict] = []
+        # WB18: era-start block -> the era's sentinel suite (one chain read per
+        # era), and the (submission, era) pairs whose past-bound start is logged
+        self._sentinels: OrderedDict[int, str] = OrderedDict()
+        self._bound_logged: set[tuple[str, int]] = set()
 
     # ── persistence ──────────────────────────────────────────────────────────
 
@@ -435,6 +456,109 @@ class LaneBDriver:
             out.append(merge_holder(hk, ref, m.get("selection") or {}, era_index))
         return out
 
+    # ── sentinel targets (WB18; §12b.5 LB5, D35) ─────────────────────────────
+
+    def _sentinel_target(self, block: int) -> str | None:
+        """The slot name of the era's sentinel suite (``suite:<suite>``), read
+        only while suite targets are armed and the era starting at or before
+        ``block`` holds a sentinel (``sentinel_armed``): W-S1's draw over the
+        era-start block hash (``ops.block_hash``, one chain read per era).
+        ``None`` = no sentinel this era; :data:`SENTINEL_UNREADABLE` = the
+        hash could not be read this tick. Never under ``_lock``."""
+        from ..shared.config.v2 import SUITE_TARGET_PREFIX
+        from ..shared.era import era_start_block
+        from ..shared.sentinel import sentinel_armed, sentinel_for_era, sentinel_from_block
+
+        if not getattr(self.cfg.lane_b, "suite_targets", False) or sentinel_from_block(
+                self.cfg) <= 0:
+            return None
+        start = int(era_start_block(self.cfg.round, int(block)))
+        if not sentinel_armed(self.cfg, start):
+            return None
+        with self._cache_lock:
+            suite = self._sentinels.get(start)
+        if suite is None:
+            try:
+                suite = sentinel_for_era(self.ops.block_hash(start), self.cfg.v2.sentinel_suites)
+            except Exception as e:  # noqa: BLE001 — a chain read failure holds, never raises
+                log.warning("lane B: era-start block %d hash unreadable (%s) — suite-target "
+                            "entries wait for the era's sentinel draw", start, e)
+                return SENTINEL_UNREADABLE
+            with self._cache_lock:
+                self._sentinels[start] = suite
+                while len(self._sentinels) > SENTINELS_KEEP:
+                    self._sentinels.popitem(last=False)
+        return SUITE_TARGET_PREFIX + suite
+
+    def _sentinel_holds(self, sentinel: str | None, era_index: int,
+                        eligible) -> dict[str, tuple[LaneBSubmission, str]]:
+        """hotkey -> (pending submission, D35 decision) for every eligible
+        pending entry on the era's sentinel target: ``hold`` (deferred,
+        uncharged) or ``past_bound`` (deferred in ``sentinel_max_defer_eras``
+        eras already: judged on its target). An unreadable draw holds every
+        suite-target entry. Pure over the driver state; caller holds the lock."""
+        from ..shared.config.v2 import SUITE_TARGET_PREFIX
+        from .expert_lane import submission_key
+        from .row_claims import sentinel_decision, sentinel_hit
+
+        if sentinel is None:
+            return {}
+        bound = int(self.cfg.lane_b.sentinel_max_defer_eras)
+        out: dict[str, tuple[LaneBSubmission, str]] = {}
+        for sub in sorted(self.queue.pending, key=lambda s: (s.commit_block, s.hotkey)):
+            if eligible is not None and not eligible(sub):
+                continue
+            if sentinel == SENTINEL_UNREADABLE:
+                if any(str(t).startswith(SUITE_TARGET_PREFIX) for t in sub.declared):
+                    out[sub.hotkey] = (sub, SENTINEL_HOLD)
+                continue
+            if sentinel_hit(sub.declared, sentinel):
+                eras = self.st.sentinel_deferrals.get(submission_key(sub), [])
+                out[sub.hotkey] = (sub, sentinel_decision(eras, era_index, bound))
+        return out
+
+    def _record_sentinel(self, holds: dict, sentinel: str | None, funded: dict,
+                         era_index: int) -> list[dict]:
+        """Count this era for every held entry (once per distinct era), log
+        each past-bound start (TB20), prune the counts to live submissions and
+        return the ``deferred: sentinel_target`` status rows. Caller holds the
+        lock."""
+        from ..funding.queue import lane_b_entry_ref
+        from ..shared.config.v2 import SUITE_TARGET_PREFIX
+        from .expert_lane import submission_key
+        from .row_claims import sentinel_row
+
+        bound = int(self.cfg.lane_b.sentinel_max_defer_eras)
+        suite = "" if sentinel in (None, SENTINEL_UNREADABLE) else str(sentinel)[
+            len(SUITE_TARGET_PREFIX):]
+        rows: list[dict] = []
+        for hk, (sub, decision) in holds.items():
+            key = submission_key(sub)
+            eras = self.st.sentinel_deferrals.get(key, [])
+            if decision != SENTINEL_HOLD:
+                if (key, int(era_index)) not in self._bound_logged:
+                    self._bound_logged.add((key, int(era_index)))
+                    log.info("lane B: %s/%s deferred in %d era(s) %s = sentinel_max_defer_eras "
+                             "— judged on its target %s although it is era %d's sentinel",
+                             hk[:8], sub.domain, len(eras), sorted(eras), sentinel,
+                             int(era_index))
+                continue
+            if sentinel != SENTINEL_UNREADABLE and int(era_index) not in eras:
+                eras = sorted({*eras, int(era_index)})
+                self.st.sentinel_deferrals[key] = eras
+                log.info("lane B: %s/%s targets era %d's sentinel %s — deferred uncharged "
+                         "(%d of sentinel_max_defer_eras=%d)", hk[:8], sub.domain,
+                         int(era_index), sentinel, len(eras), bound)
+            e = funded.get(hk)
+            ref = e.ref if e is not None else lane_b_entry_ref(sub.declared, sub.gen_ref)
+            rows.append(sentinel_row(hk, ref, suite, eras, bound, int(era_index)))
+        live = {submission_key(s) for s in self.queue.pending}
+        live |= {submission_key(leg.sub) for leg in self.queue.open}
+        for key in [k for k in self.st.sentinel_deferrals if k not in live]:
+            del self.st.sentinel_deferrals[key]
+        self._bound_logged = {p for p in self._bound_logged if p[0] in live}
+        return rows
+
     def _mark_funded(self, fq, funded: dict, sub: LaneBSubmission, era_index: int,
                      block: int) -> dict | None:
         """Move ``sub``'s funded entry in flight; the leg's ``funding`` record,
@@ -575,6 +699,8 @@ class LaneBDriver:
         fq = self._funded_queue() if miner else None
         if fq is not None:
             fq.expire_stale()
+        # WB18 (D35): the era's sentinel suite target (None unless armed)
+        sentinel = self._sentinel_target(int(block))
         with self._lock:
             self._recover_orphans(fq)
             for leg in [x for x in self.queue.open
@@ -628,6 +754,16 @@ class LaneBDriver:
             latched = self.st.gate_opened_block > 0
             funded = self._funded_entries(fq, rows) if miner else {}
             eligible = self._eligible(miner, funded)
+            # WB18 (D35, TB19/TS4): an entry on the era's sentinel target is
+            # held back from both passes (uncharged) until the bound lifts it
+            holds = self._sentinel_holds(sentinel, int(era_index), eligible)
+            held_back = {hk for hk, (_, d) in holds.items() if d == SENTINEL_HOLD}
+            if held_back:
+                base_eligible = eligible
+
+                def eligible(sub: LaneBSubmission) -> bool:
+                    return sub.hotkey not in held_back and (
+                        base_eligible is None or base_eligible(sub))
             # WB15: entries with declared rows are planned first (their own
             # rows, never ESFT); the ESFT pass sees only the rest. With none
             # declared the ESFT pass is exactly the pre-WB15 queue.
@@ -671,12 +807,13 @@ class LaneBDriver:
                 log.info("lane B: gate OPEN at block %d (era %d, king %s vs previous %s; "
                          "lineage %.3g tokens) — latched", block, era_index, king_pointer,
                          prev, self.st.lineage_tokens)
+            sentinel_rows = self._record_sentinel(holds, sentinel, funded, int(era_index))
             started, deferred_rows = [], []
             if declared:
                 started, deferred_rows = self._start_declared(
                     fq, funded, declared, eligible, block=int(block), era_index=int(era_index),
                     king_pointer=king_pointer)
-            self._deferred = deferred_rows
+            self._deferred = sentinel_rows + deferred_rows
             for sub in self.queue.next_dispatchable(lb, esft_eligible):
                 tprobes = [probes.get(t) for t in sub.declared]
                 if any(pr is None for pr in tprobes):   # dispatchable mid-tick: next tick
@@ -1406,6 +1543,11 @@ class RunnerLaneBOps:
                         float(getattr(r, "chain_read_timeout_s", 60.0) or 60.0)))
                 if callable(wd) else list(self.client.poll_commitments()))
         return remember_owners(r, rows)
+
+    def block_hash(self, block: int) -> str:
+        """The chain's hash of ``block`` (read-only): the era-start hash the
+        validators draw the same §16 sentinel from (WB18, D35)."""
+        return str(self.client.block_hash(int(block)))
 
     def contexts(self, domain: str, block: int) -> list:
         from ..validator.expert_lane import affinity_contexts
