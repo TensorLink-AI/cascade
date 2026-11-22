@@ -146,6 +146,23 @@ Rules:
   refreshes to H1 and challenger Y is judged. No state is hand-written.
 - They use numpy quantile forecasts: no torch, no checkpoint, no signature
   verification.
+- **Gate inputs (W5e fail-closed, RV5).** Once W5e wires the §1.3b gate,
+  an armed settlement that would crown without a bench session and a
+  boundary block hash is `bench_hold`, not a crown (see
+  `tests/accept/w5e/README.md`). `helpers.settle` therefore passes
+  `boundary_block_hash`, `sentinel=None` and a healthy `bench`
+  (`lane_d_bench.SweepSession` over `helpers.HealthyBench`) whenever
+  `settle_lane_d` accepts those keywords (`inspect.signature`), and makes
+  the legacy call otherwise, so the tests pass both on today's main and
+  after W5e. The bench is the one external service: every digest but the
+  current house returns the same recorded rows (a tie with a miner KING_D
+  never regresses) and the house is 10% worse, so every crowning candidate
+  passes the gate on any drawn suite and the duel alone decides each
+  outcome. Only the house tests and the house-report tests crown (K1 at
+  BOUNDARY_2). The house-report tests run `check_lane_d` on that crowned
+  report: on main it carries no `gate`; the gate record arrives with W5e
+  (written by the gated settlement, a `pass` for the crowned digest). No
+  assertion changed.
 
 ## Tests
 
