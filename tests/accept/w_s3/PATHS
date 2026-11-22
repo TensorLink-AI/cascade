@@ -1,0 +1,12 @@
+# W-S3: the §16 rule 4 sentinel numbers on the status boards (README.md has
+# the contract).
+# New module: build_sentinel_board (the era's drawn suite and each king's
+# published W3b3 lane-d-sentinel/1 numbers, with the previous KING_D's and the
+# house's; labelled non-gating; missing / unavailable / invalid records shown
+# as such, never as a number; None and no store read when W-S1 is unarmed).
+cascade/shared/sentinel_board.py
+# status/v2.json (the lane A status board): doc["sentinel"] = the board;
+# lane_a_view names the receipt's W-S1 sentinel draw. Unarmed: main's bytes.
+cascade/shared/v2_status.py
+# The board's rendering on the public dashboard (presentational, not pinned).
+cascade/website/index.html
