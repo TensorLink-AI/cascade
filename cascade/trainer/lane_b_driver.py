@@ -863,6 +863,17 @@ class LaneBDriver:
                     fq, funded, declared, eligible, block=int(block), era_index=int(era_index),
                     king_pointer=king_pointer)
             self._deferred = sentinel_rows + deferred_rows
+            if fq is not None:
+                # RV6 B4 (§12b.5 LB5): a deferral (``sentinel_target`` or
+                # ``rows_held``) is uncharged, so it must not run the funded
+                # entry's TTL either. Each deferring tick re-stamps the entry's
+                # liveness, as lane A's ``touch`` does for admission-held
+                # entries; once released it has a full TTL from this tick.
+                # A never-deferred entry is not in these rows: unchanged.
+                deferred_hks = sorted({str(r.get("hotkey")) for r in self._deferred
+                                       if r.get("hotkey") in funded})
+                if deferred_hks:
+                    fq.touch(deferred_hks)
             for sub in self.queue.next_dispatchable(lb, esft_eligible):
                 tprobes = [probes.get(t) for t in sub.declared]
                 if any(pr is None for pr in tprobes):   # dispatchable mid-tick: next tick
