@@ -296,14 +296,70 @@ def entry(digest: str, name: str, *, coldkey: str | None, reveal_offset: int = 0
             "reveal_block": REVEAL_BLOCK, "reveal_ts": T0 + int(reveal_offset)}
 
 
+# ── gate inputs (W5e fail-closed, RV5) ──────────────────────────────────────
+# Once W5e wires the §1.3b gate into `settle_lane_d`, an ARMED settlement that
+# would crown without a bench session and a boundary block hash does not crown
+# (`bench_hold`). `settle` therefore passes a healthy bench and the boundary's
+# block hash WHEN `settle_lane_d` accepts them; on a main without the
+# keywords it makes the legacy call, unchanged. The bench shape follows
+# `tests/accept/w5e/helpers.py` (`passing_bench`, `settle_crowning`).
+
+GATE_KEYWORDS = ("boundary_block_hash", "sentinel", "bench")
+
+
+class HealthyBench:
+    """A stand-in for the bench pod (an external service). Every digest but
+    the current house gets the same rows (a tie, never a regression) and the
+    house is 10% worse on every item, so every crowning candidate passes the
+    paired gate on any drawn suite."""
+
+    def __init__(self, house_digest: str):
+        self.house_digest = house_digest
+        self.calls: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
+
+    def __call__(self, digests, suites) -> dict:
+        digests, suites = tuple(digests), tuple(suites)
+        self.calls.append((digests, suites))
+        return {d: {s: {"status": "ok",
+                        "rows": _sweep_rows(s, "healthy",
+                                            1.0 if d == self.house_digest else 0.9)}
+                    for s in suites} for d in digests}
+
+
+def gate_inputs(boundary: int, house_digest: str) -> dict:
+    """The W5e gate keywords `settle_lane_d` accepts (none on today's main):
+    the boundary's block hash, no §16 sentinel (W-S1 unarmed) and a healthy
+    bench session."""
+    import inspect
+
+    from cascade.validator.lane_d import settle_lane_d
+
+    params = inspect.signature(settle_lane_d).parameters
+    if "bench" not in params and "boundary_block_hash" not in params:
+        return {}
+    kw: dict = {}
+    if "boundary_block_hash" in params:
+        kw["boundary_block_hash"] = gate_block_hash(boundary)
+    if "sentinel" in params:
+        kw["sentinel"] = None
+    if "bench" in params:
+        from cascade.validator.lane_d_bench import SweepSession
+
+        kw["bench"] = SweepSession(f"w7a-sess-{int(boundary)}", HealthyBench(house_digest))
+    return kw
+
+
 def settle(chain: dict, cfg, state_path: Path, signer, *, boundary: int, snap: int,
            entries: list[dict], uid_of: dict):
+    """`settle_lane_d`, with the W5e gate inputs when it accepts them (see
+    `gate_inputs`): `two_settlements` crowns at BOUNDARY_2."""
     from cascade.validator.lane_d import settle_lane_d
 
     return settle_lane_d(cfg=cfg, boundary=boundary, pool_dir=chain["pools"][snap],
                          entries=[dict(e) for e in entries], house=dict(chain["house"]),
                          forecasts=chain["forecasts"][snap], uid_of=dict(uid_of),
-                         state_path=state_path, signer=signer)
+                         state_path=state_path, signer=signer,
+                         **gate_inputs(boundary, chain["house"]["digest"]))
 
 
 _CACHE: dict[str, dict] = {}

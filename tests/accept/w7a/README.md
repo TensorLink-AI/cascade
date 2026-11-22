@@ -288,3 +288,30 @@ them without a `lane-d-report/2` bump. On main these fail on `assert` only:
 check pass on main. A valid report is now checked through
 `helpers.assert_valid`, so a refusal is an `AssertionError` naming the code
 and field.
+
+### Correction (RV5): crowning fixtures pass the gate inputs (W5e fail-closed)
+
+Once W5e lands (`tests/accept/w5e/README.md` "Fail closed"), an armed
+settlement that would crown without a `bench` session and a
+`boundary_block_hash` is `bench_hold`, not a crown, and `validate_report`
+refuses a crowned report whose `gate` is absent or `null`.
+
+- `helpers.settle` passes `boundary_block_hash` (`helpers.gate_block_hash`),
+  `sentinel=None` and a healthy `bench` (`lane_d_bench.SweepSession` over
+  `helpers.HealthyBench`) whenever `settle_lane_d` accepts those keywords
+  (`inspect.signature`), and makes the legacy call otherwise. So
+  `two_settlements` still crowns at BOUNDARY_2 both on today's main and
+  after W5e. The bench is the one external service: every digest but the
+  house returns the same recorded rows and the house is 10% worse, so the
+  crowning candidate passes on any drawn suite and the duel alone decides.
+- Every test that validates the crowned BOUNDARY_2 report keeps its
+  meaning. On main that report has no `gate`; after W5e it carries the
+  gate record W5e writes (a `pass` for the crowned digest), which the RV4
+  schema above accepts. The gate record arrives with W5e: these tests don't
+  splice one in. `_gated` still replaces it with `helpers.build_gate`.
+- `test_gate_is_optional_reports_without_it_validate` and
+  `test_no_gated_candidate_means_no_gate_key` now use uncrowned reports
+  (the BOUNDARY_1 first clear and both W1.5-format settlements): without a
+  gate only an uncrowned report validates, and `gate: null` on it is still
+  `bad_type at gate`. Their pass/fail on main is unchanged (the first
+  passes, the second fails on `unknown_field at gate`, as before).
