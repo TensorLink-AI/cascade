@@ -14,7 +14,10 @@ verifier. Checks, in order (the first failure is the verdict):
 5. per cohort: forward-only on both clocks against ``max(T) + margin``, the
    floors, and exactly one finite row per (window, model);
 6. per cohort: the max-T LCBs, gains, clears and outcomes re-derived from
-   the rows; the crowning and the paid court follow from them.
+   the rows; when a miner holds KING_D the house is a second bar, and its
+   judgement (``cohorts[].house_digest``, ``verdicts[].house``) is
+   re-derived the same way and must be present exactly then; the crowning
+   and the paid court follow from them.
 """
 
 from __future__ import annotations
@@ -86,6 +89,46 @@ def _comp(crps: np.ndarray, mase: np.ndarray):
     return (crps[:, None] / 2.0, np.ones(len(crps)), mase)
 
 
+def _close(got, want: float) -> bool:
+    return (isinstance(got, (int, float)) and not isinstance(got, bool)
+            and math.isclose(float(got), want, rel_tol=1e-9, abs_tol=1e-12))
+
+
+def _judge(report: dict, cfg, scores: dict, bar: str, members: list[str],
+           clusters: list) -> list[tuple[float, float, bool]]:
+    """``(lcb, gain, cleared)`` per member: the max-T judgement of the
+    cohort against ``bar`` on the signed rows and ``report["seed"]``."""
+    lcbs = cohort_maxt_lcbs(_comp(*scores[bar]), [_comp(*scores[m]) for m in members],
+                            alpha=float(cfg.alpha), B=int(cfg.bootstrap_B),
+                            seed=str(report["seed"]), clusters=clusters)
+    bg = _geo(*scores[bar])
+    out = []
+    for m, lcb in zip(members, lcbs, strict=True):
+        gain = (bg - _geo(*scores[m])) / (bg if abs(bg) >= 1e-9 else 1e-9)
+        out.append((float(lcb), float(gain), bool(lcb >= float(cfg.d_margin) and gain > 0.0)))
+    return out
+
+
+def _house_problems(idx: int, m: str, hv, hd: str, want: tuple[float, float, bool]
+                    ) -> list[str]:
+    """The verdict's ``house`` judgement against the one re-derived from the rows."""
+    if not isinstance(hv, dict):
+        return [f"cohort {idx}: {m[:12]} has no house judgement (house {hd[:12]} is a bar)"]
+    if set(hv) != {"digest", "lcb", "gain", "cleared"}:
+        return [f"cohort {idx}: {m[:12]} house judgement keys {sorted(hv)}"]
+    out = []
+    if hv["digest"] != hd:
+        out.append(f"cohort {idx}: {m[:12]} house judgement names {str(hv['digest'])[:12]}, "
+                   f"not the house {hd[:12]}")
+    lcb, gain, cleared = want
+    if not (_close(hv["lcb"], lcb) and _close(hv["gain"], gain)):
+        out.append(f"cohort {idx}: {m[:12]} house lcb/gain {hv['lcb']}/{hv['gain']} != "
+                   f"re-derived {lcb}/{gain}")
+    if hv["cleared"] is not cleared:
+        out.append(f"cohort {idx}: {m[:12]} house cleared={hv['cleared']} != re-derived {cleared}")
+    return out
+
+
 def _cohort_problems(report: dict, cfg, cohort: dict, rows_by: dict, windows: dict,
                      entries: dict) -> list[str]:
     out = []
@@ -116,8 +159,19 @@ def _cohort_problems(report: dict, cfg, cohort: dict, rows_by: dict, windows: di
         out.append(f"cohort {idx}: {len(set(clusters))} clusters < min_clusters {cfg.min_clusters}")
     if out:
         return out
+    # W5c change 3 (RV5): with a miner holding KING_D, the report's house is
+    # a second bar. Whether it applies is re-derived, never read from the
+    # house keys, so an omitted judgement cannot hide the bar.
+    hd = str(report["house"]["digest"])
+    bars = [kd] if kd == hd else [kd, hd]
+    if len(bars) == 1:
+        if "house_digest" in cohort:
+            return [f"cohort {idx}: house_digest where the house holds KING_D"]
+    elif cohort.get("house_digest") != hd:
+        return [f"cohort {idx}: house_digest {cohort.get('house_digest')!r} is not the "
+                f"report's house {hd[:12]} (a miner holds KING_D)"]
     scores = {}
-    for dg in [kd, *members]:
+    for dg in [*bars, *members]:
         crps, mase = [], []
         for wid in wids:
             r = rows_by.get((idx, wid, dg))
@@ -129,21 +183,23 @@ def _cohort_problems(report: dict, cfg, cohort: dict, rows_by: dict, windows: di
             crps.append(c)
             mase.append(m)
         scores[dg] = (np.asarray(crps), np.asarray(mase))
-    lcbs = cohort_maxt_lcbs(_comp(*scores[kd]), [_comp(*scores[m]) for m in members],
-                            alpha=float(cfg.alpha), B=int(cfg.bootstrap_B),
-                            seed=str(report["seed"]), clusters=clusters)
-    kg = _geo(*scores[kd])
+    judged = {b: _judge(report, cfg, scores, b, members, clusters) for b in bars}
     verdicts = {v["digest"]: v for v in report.get("verdicts", []) if int(v["cohort"]) == idx}
     if set(verdicts) != set(members):
         return [f"cohort {idx}: verdicts {sorted(verdicts)} do not cover members {members}"]
-    for m, lcb in zip(members, lcbs, strict=True):
+    for i, m in enumerate(members):
         v = verdicts[m]
-        gain = (kg - _geo(*scores[m])) / (kg if abs(kg) >= 1e-9 else 1e-9)
-        cleared = bool(lcb >= float(cfg.d_margin) and gain > 0.0)
-        if not (math.isclose(float(v["lcb"]), lcb, rel_tol=1e-9, abs_tol=1e-12)
-                and math.isclose(float(v["gain"]), gain, rel_tol=1e-9, abs_tol=1e-12)):
+        lcb, gain, cleared = judged[kd][i]
+        if not (_close(v["lcb"], lcb) and _close(v["gain"], gain)):
             out.append(f"cohort {idx}: {m[:12]} lcb/gain {v['lcb']}/{v['gain']} != "
                        f"re-derived {lcb}/{gain}")
+        if len(bars) == 1:
+            if "house" in v:
+                out.append(f"cohort {idx}: {m[:12]} carries a house judgement where the "
+                           f"house holds KING_D")
+        else:
+            out += _house_problems(idx, m, v.get("house"), hd, judged[hd][i])
+            cleared = bool(cleared and judged[hd][i][2])
         if bool(v["cleared"]) != cleared:
             out.append(f"cohort {idx}: {m[:12]} cleared={v['cleared']} != re-derived {cleared}")
         stage = cohort["stage"]
@@ -191,7 +247,12 @@ def check_lane_d(report: dict, cfg, *, signer_hotkey: str) -> CheckResult:
         windows = {w["window_id"]: w for w in report.get("windows") or []}
         entries = {e["digest"]: e for e in report.get("entries") or []}
         cohorts = list(report.get("cohorts") or [])
-        expected_rows = sum(len(c["window_ids"]) * (1 + len(c["members"])) for c in cohorts)
+        # One row per (window, model): KING_D, the house when it is a second
+        # bar (a miner holds KING_D), and every member.
+        house = report["house"]["digest"]
+        expected_rows = sum(len(c["window_ids"])
+                            * ((1 if c["king_digest"] == house else 2) + len(c["members"]))
+                            for c in cohorts)
         if expected_rows != len(rows):
             return _fail(NAME, f"{len(rows)} rows; the cohorts account for {expected_rows}")
         problems = []
