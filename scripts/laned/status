@@ -15,6 +15,15 @@ Writes DIR/docs/plans/STATUS.md and DIR/status/laned_build.json. With
 laned/build-state on REMOTE, fast-forward only; main is never touched.
 Without --release-tag-glob no tag counts as a capability release (no L6).
 
+Levels follow §17.1 (tests/accept/w0c/README) with one addition for a
+VERIFICATION WP (accept --help, MODE verification): when the ledger has a
+green `verification` run for the WP, the first first-parent commit at or
+after the one adding its PATHS that changes only tests/accept/<wp>/ and whose
+test dir tree equals the run's `tests_tree` (or whose sha is the run's
+`head_sha`) is the merge of that PR and counts as both L1 and L2; the L2
+commit is the earlier of it and the implementation commit. L3 and above
+follow from it as usual (the push-to-main Accept run on or after it).
+
 Ci-only WPs pass L4 automatically (§17.1). L4 for external WPs and an
 execution-stage gate need the evidence blob at REF to
 have been verified by a green push/accept run (`accept <WP> --evidence F`,
@@ -286,6 +295,16 @@ class Board:
         # shared with `accept --check-pr` (tests-only vs tests-correction)
         return lanedlib.impl_commit_index(self.tree.history, wp, paths)
 
+    def verification_commit(self, wp: str, runs: list[dict]) -> int | None:
+        """First-parent index of the merge of a green ``verification`` PR run:
+        the first commit changing only tests/accept/<wp>/ whose test dir tree
+        is a run's ``tests_tree`` (or whose sha is a run's ``head_sha``)."""
+        if not runs:
+            return None
+        trees = {r["tests_tree"] for r in runs if isinstance(r.get("tests_tree"), str)}
+        shas = {r["head_sha"] for r in runs if isinstance(r.get("head_sha"), str)}
+        return lanedlib.verification_commit_index(self.tree.root, self.tree.history, wp, trees, shas)
+
     def evidence_ok(self, wp: str, run: dict) -> tuple[bool, str]:
         """L4 for an external WP: the evidence file at REF passes the field check
         **and** ``run`` (the green push/accept run that gave L3) verified that
@@ -347,15 +366,26 @@ class Board:
         paths_text = self.tree.show(f"tests/accept/{d}/PATHS")
         expect_fail_ok = any(r.get("wp") == wp and r.get("mode") == "expect-fail"
                              and r.get("conclusion") == "success" for r in self.runs)
+        verified = [r for r in self.runs if r.get("wp") == wp and r.get("mode") == "verification"
+                    and r.get("conclusion") == "success"]
         det["paths"] = paths_text is not None
         det["expect_fail_success"] = expect_fail_ok
-        if paths_text is None or not expect_fail_ok:
+        if verified:
+            det["verification_success"] = True
+        if paths_text is None:
             return 0
-        l2 = self.l2_commit(wp, lanedlib.parse_paths(paths_text))
-        if l2 is None:
+        # Verification WP (accept --help, MODE verification): the merge of a
+        # green verification PR is both its L1 and its L2 commit.
+        vf = self.verification_commit(wp, verified)
+        impl = self.l2_commit(wp, lanedlib.parse_paths(paths_text))
+        if not expect_fail_ok and vf is None:
+            return 0
+        if impl is None and vf is None:
             return 1
+        l2 = min(i for i in (impl, vf) if i is not None)
         l2_sha = self.tree.history[l2][0]
         det["l2_commit"] = l2_sha
+        det["l2_via"] = "implementation" if l2 == impl else "verification"
         relevant = [r for r in self.runs
                     if r.get("wp") == wp and r.get("event") == "push" and r.get("mode") == "accept"
                     and self.tree.position.get(r.get("head_sha", ""), -1) >= l2]
@@ -800,6 +830,44 @@ def cmd_selftest() -> int:
         commit("unverified evidence edit")
         lv, _ = level(xf + [run(full, "X1", True, evidence_sha=full_blob)], "X1")
         expect(lv == "L3", f"evidence edited after the verifying run gave {lv}, want L3")
+
+        # (3) a verification WP: V1's PATHS name a file C1 already built. Its
+        # tests-only PR runs `accept --verification` (MODE verification) and is
+        # squash-merged; the merge commit is its L1 and L2 commit, the push run
+        # on it gives L3. A failing verification run never gives L2.
+        put(PLAN, SELFTEST_PLAN + "| V1 | Verification of C1 | C1 | ci | `scripts/laned/accept V1` |\n")
+        put(".gitignore", "__pycache__/\n")
+        commit("plan V1")
+        pre = lanedlib.git(root, "rev-parse", "HEAD").stdout.strip()
+        lanedlib.git(root, "checkout", "-q", "-b", "pr-v1")
+        put("tests/accept/v1/PATHS", "c1/tool.py\n")
+        put("tests/accept/v1/test_v1.py", "def test_v1():\n    assert True\n")
+        pr_head = commit("v1 tests (PR head)")
+        proc = subprocess.run([sys.executable, str(accept), "V1", "--verification", "--base", pre,
+                               "--head", pr_head, "--root", str(root)], capture_output=True, text=True, env=env)
+        expect(proc.returncode == 0 and "MODE verification\n" in proc.stdout,
+               f"accept V1 --verification did not print MODE verification: {proc.stdout[-1500:]}")
+        m = re.search(r"^TESTS-TREE (\S+)$", proc.stdout, re.M)
+        tests_tree = m.group(1) if m else ""
+        lanedlib.git(root, "checkout", "-q", "-")
+        lanedlib.git(root, "merge", "-q", "--squash", "pr-v1")
+        squash = commit("v1 tests (#1)")
+        vrun = {"workflow": "laned-accept", "event": "pull_request", "mode": "verification", "wp": "V1",
+                "head_sha": pr_head, "conclusion": "success", "tests_tree": tests_tree}
+        lv, data = level([vrun], "V1")
+        expect(lv == "L2", f"a merged verification PR gave {lv}, want L2")
+        expect(data["wps"]["V1"].get("l2_commit") == squash and data["wps"]["V1"].get("l2_via") == "verification",
+               f"verification L2 commit {data['wps']['V1'].get('l2_commit')}, want the squash merge {squash}")
+        lv, _ = level([vrun, run(squash, "V1", True)], "V1")
+        expect(lv == "L4", f"verification WP with a green push run gave {lv}, want L4 (ci-only)")
+        lv, _ = level([dict(vrun, conclusion="failure")], "V1")
+        expect(lv == "L0", f"a failed verification run gave {lv}, want L0")
+        lv, _ = level([dict(vrun, tests_tree="0" * 40, head_sha="0" * 40)], "V1")
+        expect(lv == "L0", f"a verification run for another test tree gave {lv}, want L0")
+        # an ordinary expect-fail run (tests-only flow unchanged): L1, no L2
+        lv, _ = level([{"workflow": "laned-accept", "event": "pull_request", "mode": "expect-fail",
+                        "wp": "V1", "head_sha": pr_head, "conclusion": "success"}], "V1")
+        expect(lv == "L1", f"an expect-fail run on a verification WP gave {lv}, want L1")
     for f in failures:
         print(f"status selftest: FAIL {f}", file=sys.stderr)
     if failures:
