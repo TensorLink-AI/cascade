@@ -74,7 +74,8 @@ def test_shipped_suite_target_cap_is_d38_a():
 def test_fixture_windows_are_in_the_hash_set():
     """The WB11 lookup sees every fixture embedding the WB13 tests use:
     TB10's exact window, TB11's scaled and rounded copy, the shifted copy,
-    the float32 copy of ``F32_ITEM`` and the integer flat series. A clean series has no hit."""
+    the float32 copy of ``F32_ITEM`` and the integer event counts (RV6: not
+    the flat series, which is low-information). A clean series has no hit."""
     m = h.wb11()
     art = h.artefact(1)
     seg = h.segment()
@@ -87,8 +88,8 @@ def test_fixture_windows_are_in_the_hash_set():
         assert r["exact_hits"] == 0, name
         assert m.is_contaminated(art, vals), (name, r)
         assert r["first"]["suite"] == "gift", (name, r)
-    flat = m.match_series(art, [h.FLAT_VALUE] * 40)
-    assert flat["exact_hits"] == 9 and flat["first"]["window_id"] == h.FLAT_WINDOW_ID
+    counts = m.match_series(art, h.counts_series())
+    assert counts["exact_hits"] == 9 and counts["first"]["window_id"] == h.COUNTS_WINDOW_ID
     assert m.match_series(art, h.clean_series())["first"] is None
     assert m.match_series(art, h.segment()[:31])["first"] is None
 
