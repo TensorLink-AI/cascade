@@ -10,11 +10,16 @@ if, in this order (the first failing rule names the refusal):
 
 1. ``missing_clock``: ``target_ts`` and ``first_seen_ts`` each hold
    ``cfg.horizon`` points and ``end_ts`` is set and equals ``target_ts[-1]``;
+1a. ``unlisted_feed``: the window's feed (its ``feed``, else its ``source``)
+   has an entry in the pool's top-level ``feeds`` block. An unlisted feed, or
+   a pool with no ``feeds`` block, cannot be judged on rules 2 and 3, so it
+   fails closed;
 2. ``forecast_product``: the window's feed is not a forecast product;
 3. ``over_lag``: the feed's measured ``mirror_lag_hours`` is
-   ``<= cfg.max_mirror_lag_hours`` (an unmeasured lag, i.e. the feed is not
-   listed or its lag is null, is not a refusal: W6fs measures lag only where
-   the feed provides a publish stamp);
+   ``<= cfg.max_mirror_lag_hours``. A feed the snapshot LISTS with
+   ``mirror_lag_hours: null`` is declared unmeasured and is not a refusal
+   (W6fs measures lag only where the feed provides a publish stamp; RV3
+   note 7: a policy choice for the decision register);
 4. both clocks after the bound, strictly, for every target point.
    ``before_margin`` when both fail, ``publish_ahead`` when only first-seen
    fails (future-stamped values the mirror saw before the bound),
@@ -25,13 +30,12 @@ if, in this order (the first failing rule names the refusal):
    first appearance: the first later snapshot holding it is its S0);
 6. ``backfill``: ``min(target_ts) > end_ts(S0)``.
 
-Rules 5 and 6 apply only to a series whose record carries a ``frontier``
-key. A series with NO ``frontier`` key (``pool_d/1`` snapshots built before
-W6b, which includes the W1.5 skeleton fixture) is judged on rules 1-4 only;
-an explicit empty list is ``absent_from_s0``. The production ``pool_d``
-builder (W6b) must always write ``frontier`` for every series, and the audit
-(W9) refuses a production snapshot whose series lack it; the keyless path
-exists only so pre-W6b snapshots keep their two-clock verdicts.
+Fail closed (RV3 BLOCKING 1): rules 5 and 6 apply to every series. A series
+whose ``frontier`` is absent or ``null`` has no evidence of being in S0
+(change 1(a): "present in S0 with a recorded ``end_ts``"), so it is
+``absent_from_s0``, exactly like an empty list. Likewise a missing ``feeds``
+entry is ``unlisted_feed``, never "lag unmeasured". Missing metadata never
+switches a rule off.
 
 Only ``max(T_E, T_K)`` enters the rule, so swapping the two T values yields
 identical verdicts. The snapshot-absence rule of the v2 plan is not used
@@ -51,6 +55,7 @@ class RefusalReason(StrEnum):
     """Typed refusal reasons, declared in precedence order."""
 
     MISSING_CLOCK = "missing_clock"
+    UNLISTED_FEED = "unlisted_feed"
     FORECAST_PRODUCT = "forecast_product"
     OVER_LAG = "over_lag"
     BEFORE_MARGIN = "before_margin"
@@ -94,7 +99,9 @@ def window_reason(w: dict, feeds: dict, bound: float, cfg) -> RefusalReason | No
     """The first failing §1.3 rule for window ``w`` at ``bound``, or ``None``."""
     if not _clocks_recorded(w, int(cfg.horizon)):
         return RefusalReason.MISSING_CLOCK
-    feed = feeds.get(w.get("feed") or w["source"]) or {}
+    feed = feeds.get(w.get("feed") or w["source"])
+    if not isinstance(feed, dict):
+        return RefusalReason.UNLISTED_FEED
     if bool(feed.get("forecast_product", False)):
         return RefusalReason.FORECAST_PRODUCT
     lag = feed.get("mirror_lag_hours")
@@ -108,13 +115,8 @@ def window_reason(w: dict, feeds: dict, bound: float, cfg) -> RefusalReason | No
         return RefusalReason.PUBLISH_AHEAD
     if not data_ok:
         return RefusalReason.LATE_MIRROR
-    frontier = w.get("frontier")
-    if frontier is None:
-        # No frontier key: a pre-W6b snapshot (e.g. the W1.5 fixture), judged on
-        # the two clocks only. W6b always writes the key and W9 refuses its
-        # absence, so production series always reach the S0 rules below.
-        return None
-    s0_end = _s0_end(frontier, bound)
+    # An absent or null frontier is no evidence of S0 presence: fail closed.
+    s0_end = _s0_end(w.get("frontier") or (), bound)
     if s0_end is None:
         return RefusalReason.ABSENT_FROM_S0
     if min(w["target_ts"]) <= s0_end:
@@ -127,9 +129,9 @@ def eligible_windows(pool: dict, *, t_entry: int, t_king: int, cfg) -> Iterator[
     :func:`cascade.validator.lane_d.load_pool` returns), in pool order.
 
     Reads ``cfg.forward_margin_hours``, ``cfg.max_mirror_lag_hours`` and
-    ``cfg.horizon``. A series without a ``frontier`` key skips the S0 rules;
-    the production builder (W6b) must always write it and the audit (W9)
-    refuses series lacking it (see the module docstring)."""
+    ``cfg.horizon``. Fails closed: a series with an absent or ``null``
+    ``frontier`` is ``absent_from_s0`` and a feed missing from ``feeds`` (or
+    a pool with no ``feeds`` block) is ``unlisted_feed``."""
     bound = forward_bound(t_entry, t_king, cfg)
     feeds = pool.get("feeds") or {}
     for w in pool["windows"]:

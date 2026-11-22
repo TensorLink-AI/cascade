@@ -86,7 +86,9 @@ def _file_sha(path: Path) -> str:
 
 def _parse_feeds(raw, where: Path) -> dict:
     """Top-level ``feeds``: ``{feed: {"mirror_lag_hours": float | None,
-    "forecast_product": bool}}`` (optional; absent = every lag unmeasured)."""
+    "forecast_product": bool}}``. An absent block parses to ``{}``: no feed is
+    listed, so every window fails closed as ``unlisted_feed``
+    (``lane_d_forward``)."""
     if raw is None:
         return {}
     if not isinstance(raw, dict):
@@ -109,8 +111,9 @@ def _parse_feeds(raw, where: Path) -> dict:
 
 def _parse_frontier(raw, sid: str, where: Path) -> list[tuple[int, int]] | None:
     """Per-series ``frontier``: ``[[as_of_ts, end_ts], ...]`` for each earlier
-    snapshot holding the series; ``None`` when the key is absent (a pre-W6b
-    snapshot: the S0 rules are skipped, see ``lane_d_forward``)."""
+    snapshot holding the series; ``None`` when the key is absent or ``null``.
+    ``lane_d_forward`` fails closed on ``None``: the series is
+    ``absent_from_s0``, exactly like an empty list."""
     if raw is None:
         return None
     if not isinstance(raw, list):
@@ -145,7 +148,8 @@ def load_pool(pool_dir, horizon: int) -> dict:
     """One ``pool_d/1`` snapshot: ``{"snapshot", "sha256", "feeds",
     "first_seen_roots", "windows": [...]}`` with each window's history,
     target, both clocks, cluster, feed, frequency and frontier (``None`` when
-    the series records no ``frontier`` key)."""
+    the series' ``frontier`` is absent or ``null``; eligibility then fails
+    closed as ``absent_from_s0``)."""
     d = Path(pool_dir)
     meta = json.loads((d / "metadata.json").read_text(encoding="utf-8"))
     if meta.get("schema") != POOL_SCHEMA:
