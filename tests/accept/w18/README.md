@@ -30,6 +30,13 @@ The CLI tests fail on the AssertionError that carries the subprocess's
 `ModuleNotFoundError`. `test_evidence_is_a_clean_live_run_on_the_vault` skips
 while `LANED_EVIDENCE` is unset.
 
+RV6 (`evidence/rv6.md` B1, B2) added `test_w18_storage_errors.py` and
+`test_w18_lock_fail_closed.py` (and the fake's outage, retention-override and
+legal-hold models in `helpers.py`). On the first W18 build they fail on
+AssertionErrors: a storage error after deletions escapes or is typed per
+object and the run goes on; an `InvalidRequest`, an unreadable or malformed
+retention answer is read as "no lock". Both are pending an implementation PR.
+
 ## Module surface (`cascade.laned.vault_sweeper`)
 
 | name | contract |
@@ -78,6 +85,8 @@ object stays, gets no archive copy, and is retried on the next run.
 | condition | reason |
 |---|---|
 | any version of the key under unexpired Object Lock retention (COMPLIANCE **or** GOVERNANCE; `retain_until > now`) | `object_lock` (the record carries `retain_until`, ISO 8601) |
+| any version's lock state can't be established: `GetObjectRetention` fails with anything but `NoSuchObjectLockConfiguration` (`InvalidRequest`, `AccessDenied`, 5xx, ...), or answers without a `Retention.Mode` or without a parseable `RetainUntilDate` | `lock_unknown` (fail closed: an unlocked-looking HEAD doesn't override it; `object_lock` is also accepted when a HEAD shows unexpired retention) |
+| any version under a legal hold `ON` (`GetObjectLegalHold` or HEAD `ObjectLockLegalHoldStatus`) | `legal_hold` |
 | status `submitted` / `ready` / `revealed` / `pending` | `open_entry` |
 | status `judging` (in a settlement not yet settled) | `settlement_open` |
 | status `king` (kings are published and kept permanently, §11.1) | `king` |
@@ -86,6 +95,16 @@ object stays, gets no archive copy, and is retried on the next run.
 | key not `<hotkey>/<digest>/<file>`, or no ledger entry | `unreferenced` (never deleted: fail closed) |
 | any other status | `unknown_status` |
 | another file of the same entry can't be swept this run | `entry_incomplete` |
+| the run stopped on a storage error before reaching this object | `run_aborted` |
+
+**Lock detection fails closed.** A version counts as unlocked only on an
+explicit "no retention configured" answer (`NoSuchObjectLockConfiguration`,
+the code the fake models) or a retention whose `RetainUntilDate <= now`.
+Every other answer is `lock_unknown`: a keep, so the entry gets no archive
+copy and no `delete_object` is ever sent for it, whether the version is in
+truth locked or not. It stalls only its own entry (the run goes on). The same
+holds in the archive phase: an archive copy past its retention whose lock
+state is unknown is kept, `store: "archive"`, `lock_unknown`.
 
 The loser statuses are `lost`, `closed_unjudged`, `ready_expired` (B10) and
 `voided`. A loser is **due** when `era - closed_era >= loser_ttl_eras`, so the
@@ -124,6 +143,44 @@ A re-run that finds a verified copy (`already`) does not reset it. An archive
 object whose archive time the sweeper can't establish is kept with
 `archive_age_unknown`.
 
+## Storage errors (RV6 B1)
+
+Entries are swept one at a time, in order: an entry's archive, verify and
+delete steps finish before the next entry starts.
+
+A **storage error** is any failed storage call other than the per-object
+outcomes above. That is: any error on a listing (`list_objects_v2`,
+`list_object_versions`), a vault read, a HEAD, or the archive read-back, and
+any 503 / `SlowDown` / `ServiceUnavailable` on any call, the archive write
+and the vault delete included. (A non-503 failure of the archive write is
+still `archive_copy_failed`, a sha256 mismatch `archive_verify_failed`, and a
+non-503 failure of a vault delete `delete_failed`; those stall only their
+entry.) A lock-state read (retention, legal hold) is never a storage error: it
+is `lock_unknown` (above).
+
+On a storage error the run stops at once:
+
+- the failing object gets a `failed` record with reason `storage_error`
+  (`op` is the step: `archive` for the vault read, archive write or
+  read-back, `delete` for the delete). A listing failure gets
+  `{"store": "vault"|"archive", "key": "", "op": "list", "outcome": "failed",
+  "reason": "storage_error"}`;
+- no further storage write or delete is made, in either store;
+- every vault object listed at the start that has no record yet gets
+  `keep`/`run_aborted`;
+- every delete made before the error stays on record: a vault object whose
+  delete call succeeded has a `delete`/`done` record (or the
+  `delete`/`failed` `storage_error` record, when the error hit the
+  post-delete check of that very key);
+- the complete strict-JSON action log is written to
+  `log_dir/vault-sweep-<run_id>.json` **before** `sweep` returns or raises.
+  `sweep` may then return the log (with `counts.failed >= 1`) or raise any
+  exception but `SweepRefused`.
+
+A re-run after the outage resumes idempotently: entries already swept leave
+no trace in the vault, the stalled entry is archived (`already` if its
+verified copy is there; never a second archive version) and deleted.
+
 ## Dry-run, live, D16
 
 - `live=False` (dry-run): the same classification, with `archive`/`planned`
@@ -145,7 +202,7 @@ object whose archive time the sweeper can't establish is kept with
   `create_multipart_upload`) carries `ACL="private"` and no `Grant*`
   argument. The sweeper never writes to the vault. The allowed client surface
   is `list_objects_v2`, `list_object_versions`, `head_object`, `get_object`,
-  `get_object_retention`, `put_object`, `copy_object`, the multipart calls
+  `get_object_retention`, `get_object_legal_hold`, `put_object`, `copy_object`, the multipart calls
   (`create_multipart_upload`, `upload_part`, `upload_part_copy`,
   `complete_multipart_upload`, `abort_multipart_upload`), `delete_object`,
   `delete_objects` and `get_paginator`. Anything else, such as ACL, policy or
@@ -179,13 +236,13 @@ per run), `mode` (`dry-run` | `live`), `now`, `started_at` and `finished_at`
 - `vault` and `archive` are `{"kind": "s3", "bucket", "prefix"}` or
   `{"kind": "fs", "root": str(root)}`.
 - `actions` is a list of records with at least `store` (`vault` |
-  `archive`), `key` (relative), `op` (`archive` | `delete` | `keep`),
-  `outcome` and `reason`.
+  `archive`), `key` (relative), `op` (`archive` | `delete` | `keep` |
+  `list`), `outcome` and `reason`.
   - Outcomes: archive `done|planned|already|failed`, delete
-    `done|planned|failed`, keep `kept`.
+    `done|planned|failed`, keep `kept`, list `failed`.
   - `reason` is `null` or a typed reason: a keep reason above, or one of
     `archive_copy_failed`, `archive_verify_failed`, `delete_failed`,
-    `object_lock`.
+    `object_lock`, `storage_error`.
   - Every vault object listed at the start of the run gets at least one
     record.
 - `counts` holds `archived` (archive done), `deleted` (vault delete done),
@@ -211,6 +268,10 @@ python -P -m cascade.laned.vault_sweeper --vault-dir D --archive-dir D --ledger 
   - stdout is the action log, and the exit code is 0, or 1 if any outcome is
     `failed`.
   - A refusal prints `{"refused": "<code>"}` and exits 2.
+  - A run that stopped on a storage error prints
+    `{"error": "storage_failed", "code": "<code>", "log": "<path>"}`, where
+    `log` is the action log file it wrote (`str(Path(--log-dir) / name)`),
+    and exits 1.
 - **`--evidence-out F`** (live only) writes
   `{"schema": "laned_w18_evidence/1", "wp": "W18", "passed": <no failed outcome>, "log": <the log>}`.
 - **The fs mode needs no network and doesn't import boto3.**
