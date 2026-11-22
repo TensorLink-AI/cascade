@@ -24,9 +24,16 @@
 
 LANED_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
-# §10.8 state files (the activation_*_state.json family is globbed).
+# §10.8 state files, all JSON/TOML text (validator_state.db too: the
+# validator writes it with write_text_atomic). activation_state.json is the
+# DEC-CA-0045 main tally, which the activation_*_state.json glob does not
+# match; the .lane_b/.lane_c/.settlement sidecars sit next to the state db.
+# Each file's <name>.bak (the loaders' fallback) is copied when present.
 LANED_STATE_FIXED=(validator_state.db cascade_state.json warm_start_init.json
-  lane_d_state.json netconfig_state.json satellite_state.json decided_votes.toml)
+  lane_d_state.json netconfig_state.json activation_state.json
+  satellite_state.json decided_votes.toml
+  validator_state.db.lane_b.json validator_state.db.lane_c.json
+  validator_state.db.settlement.json)
 
 MODE=""
 ROOT=""
@@ -334,6 +341,14 @@ laned_emit_check() {
   laned_step_shown check "$(laned_quote "${argv[@]}")" laned_run_check "${argv[@]}"
 }
 
+# Copy <path>.bak (the previous good file) into BACKUP when it exists.
+laned_snapshot_bak() {
+  local bak="$1.bak"
+  if [ -e "$bak" ]; then
+    laned_step snapshot cp -a "$bak" "$2/${bak##*/}"
+  fi
+}
+
 laned_emit_snapshot() {
   local backup="$ROOT/_state_backups/$TS" name path found=0
   laned_step snapshot mkdir -p "$ROOT/_state_backups"
@@ -342,16 +357,16 @@ laned_emit_snapshot() {
     path="$ROOT/$name"
     if [ ! -e "$path" ]; then
       printf '%s snapshot %s absent (nothing to copy)\n' "$TAG" "$name"
-    elif [ "$name" = validator_state.db ]; then
-      laned_step snapshot sqlite3 "$path" ".backup $backup/$name"
     else
       laned_step snapshot cp -a "$path" "$backup/$name"
     fi
+    laned_snapshot_bak "$path" "$backup"
   done
   for path in "$ROOT"/activation_*_state.json; do
     [ -e "$path" ] || continue
     found=1
     laned_step snapshot cp -a "$path" "$backup/${path##*/}"
+    laned_snapshot_bak "$path" "$backup"
   done
   if [ "$found" = 0 ]; then
     printf '%s snapshot activation_*_state.json absent (nothing to copy)\n' "$TAG"
