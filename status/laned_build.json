@@ -1,8 +1,8 @@
 {
   "schema": "laned_build/1",
-  "ref": "9fade516386b9144c0fbfb851fe721c317b5774c",
-  "commit": "9fade516386b9144c0fbfb851fe721c317b5774c",
-  "generated_at": "2026-11-22T06:07:50Z",
+  "ref": "91ad8d1711a32e1618327c1336a1a2bae9191eb0",
+  "commit": "91ad8d1711a32e1618327c1336a1a2bae9191eb0",
+  "generated_at": "2026-11-22T06:14:46Z",
   "wps": {
     "W0c": {
       "level": "L4",
@@ -16,7 +16,7 @@
       "l2_commit": "36bb8f2b22f041330521cdff64ddb6568308b974",
       "l2_via": "implementation",
       "last_main_run": {
-        "head_sha": "9fade516386b9144c0fbfb851fe721c317b5774c",
+        "head_sha": "91ad8d1711a32e1618327c1336a1a2bae9191eb0",
         "conclusion": "success"
       },
       "evidence": "ci-only",
@@ -35,7 +35,7 @@
       "l2_commit": "a15368814c031bafd3bf4b329e7e3867c4ab7aee",
       "l2_via": "implementation",
       "last_main_run": {
-        "head_sha": "9fade516386b9144c0fbfb851fe721c317b5774c",
+        "head_sha": "91ad8d1711a32e1618327c1336a1a2bae9191eb0",
         "conclusion": "success"
       },
       "evidence": "evidence/w0.json: evidence file missing",
@@ -54,7 +54,7 @@
       "l2_commit": "0753a61d30175535981e31c444a610b8126f0753",
       "l2_via": "verification",
       "last_main_run": {
-        "head_sha": "9fade516386b9144c0fbfb851fe721c317b5774c",
+        "head_sha": "91ad8d1711a32e1618327c1336a1a2bae9191eb0",
         "conclusion": "success"
       },
       "evidence": "ci-only",
@@ -73,7 +73,7 @@
       "l2_commit": "c95a996c0debc618496478e9d3a817bd6e089a54",
       "l2_via": "implementation",
       "last_main_run": {
-        "head_sha": "9fade516386b9144c0fbfb851fe721c317b5774c",
+        "head_sha": "91ad8d1711a32e1618327c1336a1a2bae9191eb0",
         "conclusion": "success"
       },
       "evidence": "ci-only",
@@ -93,7 +93,7 @@
       "l2_commit": "b366e9b45972077aad7e6085bf3915c383c571b7",
       "l2_via": "implementation",
       "last_main_run": {
-        "head_sha": "9fade516386b9144c0fbfb851fe721c317b5774c",
+        "head_sha": "91ad8d1711a32e1618327c1336a1a2bae9191eb0",
         "conclusion": "success"
       },
       "evidence": "ci-only",
@@ -113,10 +113,10 @@
       "l2_commit": "1ae4eef59f8fdb3bc1703ec6a7243cc944f65abd",
       "l2_via": "implementation",
       "last_main_run": {
-        "head_sha": "9fade516386b9144c0fbfb851fe721c317b5774c",
+        "head_sha": "91ad8d1711a32e1618327c1336a1a2bae9191eb0",
         "conclusion": "success"
       },
-      "evidence": "evidence/s0b_notes.json: ok (verified by the run at 9fade516386b)",
+      "evidence": "evidence/s0b_notes.json: ok (verified by the run at 91ad8d1711a3)",
       "evidence_verified": true,
       "review": null
     },
@@ -132,7 +132,7 @@
       "l2_commit": "487dfc3ecc968c907cec78e54b63537cb2aed077",
       "l2_via": "implementation",
       "last_main_run": {
-        "head_sha": "9fade516386b9144c0fbfb851fe721c317b5774c",
+        "head_sha": "91ad8d1711a32e1618327c1336a1a2bae9191eb0",
         "conclusion": "success"
       },
       "evidence": "ci-only",
@@ -152,7 +152,7 @@
       "l2_commit": "dc6109a2208072ed6b152bf85695ed68566cdca6",
       "l2_via": "implementation",
       "last_main_run": {
-        "head_sha": "9fade516386b9144c0fbfb851fe721c317b5774c",
+        "head_sha": "91ad8d1711a32e1618327c1336a1a2bae9191eb0",
         "conclusion": "success"
       },
       "evidence": "ci-only",
@@ -172,7 +172,7 @@
       "l2_commit": "f8ed2030094d45be9e9e0a6d06494d90d393fdb1",
       "l2_via": "implementation",
       "last_main_run": {
-        "head_sha": "9fade516386b9144c0fbfb851fe721c317b5774c",
+        "head_sha": "91ad8d1711a32e1618327c1336a1a2bae9191eb0",
         "conclusion": "success"
       },
       "evidence": "evidence/r5.json: evidence file missing",
@@ -190,7 +190,7 @@
       "l2_commit": "3c7803adef8e7c719ad593b35e6ec13d42758c05",
       "l2_via": "implementation",
       "last_main_run": {
-        "head_sha": "9fade516386b9144c0fbfb851fe721c317b5774c",
+        "head_sha": "91ad8d1711a32e1618327c1336a1a2bae9191eb0",
         "conclusion": "success"
       },
       "evidence": "ci-only",
@@ -220,7 +220,7 @@
       "l2_commit": "e614e7b4a210ba0d7dd5edbd26abeea63aa51fd0",
       "l2_via": "implementation",
       "last_main_run": {
-        "head_sha": "9fade516386b9144c0fbfb851fe721c317b5774c",
+        "head_sha": "91ad8d1711a32e1618327c1336a1a2bae9191eb0",
         "conclusion": "success"
       },
       "evidence": "ci-only",
@@ -259,7 +259,7 @@
       "l2_commit": "6e84e07fffe31be1ad974fd7f765dc2be9b5a30f",
       "l2_via": "implementation",
       "last_main_run": {
-        "head_sha": "9fade516386b9144c0fbfb851fe721c317b5774c",
+        "head_sha": "91ad8d1711a32e1618327c1336a1a2bae9191eb0",
         "conclusion": "success"
       },
       "evidence": "ci-only",
@@ -289,7 +289,7 @@
       "l2_commit": "b1fcdde9646733c8543f8815322eb09c692a6499",
       "l2_via": "implementation",
       "last_main_run": {
-        "head_sha": "9fade516386b9144c0fbfb851fe721c317b5774c",
+        "head_sha": "91ad8d1711a32e1618327c1336a1a2bae9191eb0",
         "conclusion": "success"
       },
       "evidence": "evidence/t25.json: evidence file missing",
@@ -307,7 +307,7 @@
       "l2_commit": "8131724d4e94f92cc93187a6c0b21999bd82ef91",
       "l2_via": "implementation",
       "last_main_run": {
-        "head_sha": "9fade516386b9144c0fbfb851fe721c317b5774c",
+        "head_sha": "91ad8d1711a32e1618327c1336a1a2bae9191eb0",
         "conclusion": "success"
       },
       "evidence": "ci-only",
@@ -387,7 +387,7 @@
       "l2_commit": "86923de0441948879199cdaeec8106fe8291a35c",
       "l2_via": "implementation",
       "last_main_run": {
-        "head_sha": "9fade516386b9144c0fbfb851fe721c317b5774c",
+        "head_sha": "91ad8d1711a32e1618327c1336a1a2bae9191eb0",
         "conclusion": "success"
       },
       "evidence": "ci-only",
@@ -407,7 +407,7 @@
       "l2_commit": "54ce1628435c70a46c6d799001661b7be39c3771",
       "l2_via": "implementation",
       "last_main_run": {
-        "head_sha": "9fade516386b9144c0fbfb851fe721c317b5774c",
+        "head_sha": "91ad8d1711a32e1618327c1336a1a2bae9191eb0",
         "conclusion": "success"
       },
       "evidence": "ci-only",
@@ -427,7 +427,7 @@
       "l2_commit": "58008bcb80f3a1d134ce295216d03a14fb5686fa",
       "l2_via": "implementation",
       "last_main_run": {
-        "head_sha": "9fade516386b9144c0fbfb851fe721c317b5774c",
+        "head_sha": "91ad8d1711a32e1618327c1336a1a2bae9191eb0",
         "conclusion": "success"
       },
       "evidence": "ci-only",
@@ -446,7 +446,7 @@
       "l2_commit": "45f8b6111b1d5f3cd578e2e20f02f0f85bb16aaf",
       "l2_via": "implementation",
       "last_main_run": {
-        "head_sha": "9fade516386b9144c0fbfb851fe721c317b5774c",
+        "head_sha": "91ad8d1711a32e1618327c1336a1a2bae9191eb0",
         "conclusion": "success"
       },
       "evidence": "evidence/w3a_probe.json: evidence file missing",
@@ -474,7 +474,7 @@
       "l2_commit": "8fbabb13d039ebc8b0dcc474e59b21cabfe9896d",
       "l2_via": "implementation",
       "last_main_run": {
-        "head_sha": "9fade516386b9144c0fbfb851fe721c317b5774c",
+        "head_sha": "91ad8d1711a32e1618327c1336a1a2bae9191eb0",
         "conclusion": "success"
       },
       "evidence": "evidence/w4.json: evidence file missing",
@@ -492,7 +492,7 @@
       "l2_commit": "06376d78c36ee5a9e41d9ad262815cde774b816c",
       "l2_via": "implementation",
       "last_main_run": {
-        "head_sha": "9fade516386b9144c0fbfb851fe721c317b5774c",
+        "head_sha": "91ad8d1711a32e1618327c1336a1a2bae9191eb0",
         "conclusion": "success"
       },
       "evidence": "ci-only",
@@ -511,7 +511,7 @@
       "l2_commit": "d3ca7f223f9bdddc3163d16822fa32efd71d8c82",
       "l2_via": "implementation",
       "last_main_run": {
-        "head_sha": "9fade516386b9144c0fbfb851fe721c317b5774c",
+        "head_sha": "91ad8d1711a32e1618327c1336a1a2bae9191eb0",
         "conclusion": "failure"
       }
     },
@@ -527,7 +527,7 @@
       "l2_commit": "4de547fd1869cd626f76ccf4cf19b1424f0988e6",
       "l2_via": "implementation",
       "last_main_run": {
-        "head_sha": "9fade516386b9144c0fbfb851fe721c317b5774c",
+        "head_sha": "91ad8d1711a32e1618327c1336a1a2bae9191eb0",
         "conclusion": "success"
       },
       "evidence": "ci-only",
@@ -556,7 +556,7 @@
       "l2_commit": "e617901c70e78783424f20568b8f2b3ca81e0a93",
       "l2_via": "implementation",
       "last_main_run": {
-        "head_sha": "9fade516386b9144c0fbfb851fe721c317b5774c",
+        "head_sha": "91ad8d1711a32e1618327c1336a1a2bae9191eb0",
         "conclusion": "success"
       },
       "evidence": "evidence/t7.json: evidence file missing",
@@ -674,7 +674,7 @@
       "l2_commit": "f3c39081233d1d98b9bb7a409d6b90c467d6ae52",
       "l2_via": "implementation",
       "last_main_run": {
-        "head_sha": "9fade516386b9144c0fbfb851fe721c317b5774c",
+        "head_sha": "91ad8d1711a32e1618327c1336a1a2bae9191eb0",
         "conclusion": "success"
       },
       "evidence": "ci-only",
@@ -694,7 +694,7 @@
       "l2_commit": "35f89bd7d876ce5e0533462ed3b5038e40ed61ad",
       "l2_via": "implementation",
       "last_main_run": {
-        "head_sha": "9fade516386b9144c0fbfb851fe721c317b5774c",
+        "head_sha": "91ad8d1711a32e1618327c1336a1a2bae9191eb0",
         "conclusion": "success"
       },
       "evidence": "evidence/w3b2.json: evidence file missing",
@@ -712,7 +712,7 @@
       "l2_commit": "885d37ae93c16e031fca01567d3543e0cdcc2ed3",
       "l2_via": "implementation",
       "last_main_run": {
-        "head_sha": "9fade516386b9144c0fbfb851fe721c317b5774c",
+        "head_sha": "91ad8d1711a32e1618327c1336a1a2bae9191eb0",
         "conclusion": "failure"
       }
     },
@@ -728,7 +728,7 @@
       "l2_commit": "7a37d50c5dc29c0e87db9e86b2f38749c6eb33ef",
       "l2_via": "implementation",
       "last_main_run": {
-        "head_sha": "9fade516386b9144c0fbfb851fe721c317b5774c",
+        "head_sha": "91ad8d1711a32e1618327c1336a1a2bae9191eb0",
         "conclusion": "success"
       },
       "evidence": "ci-only",
@@ -757,7 +757,7 @@
       "l2_commit": "f525be3c45af10d0293e1eb06758b3ab340e11bf",
       "l2_via": "implementation",
       "last_main_run": {
-        "head_sha": "9fade516386b9144c0fbfb851fe721c317b5774c",
+        "head_sha": "91ad8d1711a32e1618327c1336a1a2bae9191eb0",
         "conclusion": "failure"
       }
     },
@@ -773,7 +773,7 @@
       "l2_commit": "e32bfaef4a8c6c0d53343c4e98858d87514aa007",
       "l2_via": "implementation",
       "last_main_run": {
-        "head_sha": "9fade516386b9144c0fbfb851fe721c317b5774c",
+        "head_sha": "91ad8d1711a32e1618327c1336a1a2bae9191eb0",
         "conclusion": "success"
       },
       "evidence": "ci-only",
@@ -812,7 +812,7 @@
       "l2_commit": "5fbfbd70480163088d332e4c36e5f3ad3a4e65c4",
       "l2_via": "implementation",
       "last_main_run": {
-        "head_sha": "9fade516386b9144c0fbfb851fe721c317b5774c",
+        "head_sha": "91ad8d1711a32e1618327c1336a1a2bae9191eb0",
         "conclusion": "success"
       },
       "evidence": "ci-only",
@@ -921,14 +921,14 @@
       "expect_fail_success": false
     },
     "W18": {
-      "level": "L0",
+      "level": "L1",
       "side_state": null,
       "runs_in": "ci (fs adapter) + owner",
       "external": true,
       "evidence_file": "evidence/w18.json",
       "group": "laned_core",
-      "paths": false,
-      "expect_fail_success": false
+      "paths": true,
+      "expect_fail_success": true
     },
     "W19": {
       "level": "L0",
@@ -952,7 +952,7 @@
       "l2_commit": "ecc318a06389cd61277b4fcfc0e26666e7132090",
       "l2_via": "implementation",
       "last_main_run": {
-        "head_sha": "9fade516386b9144c0fbfb851fe721c317b5774c",
+        "head_sha": "91ad8d1711a32e1618327c1336a1a2bae9191eb0",
         "conclusion": "success"
       },
       "evidence": "ci-only",
@@ -972,7 +972,7 @@
       "l2_commit": "9fade516386b9144c0fbfb851fe721c317b5774c",
       "l2_via": "implementation",
       "last_main_run": {
-        "head_sha": "9fade516386b9144c0fbfb851fe721c317b5774c",
+        "head_sha": "91ad8d1711a32e1618327c1336a1a2bae9191eb0",
         "conclusion": "success"
       },
       "evidence": "evidence/wb11.json: evidence file missing",
@@ -1010,7 +1010,7 @@
       "l2_commit": "8f682d9a0df06dee8b7cb0f06c638495eb10a71b",
       "l2_via": "implementation",
       "last_main_run": {
-        "head_sha": "9fade516386b9144c0fbfb851fe721c317b5774c",
+        "head_sha": "91ad8d1711a32e1618327c1336a1a2bae9191eb0",
         "conclusion": "success"
       },
       "evidence": "ci-only",
@@ -1030,7 +1030,7 @@
       "l2_commit": "214add8602f156727645891684c78fa6a847a8d8",
       "l2_via": "implementation",
       "last_main_run": {
-        "head_sha": "9fade516386b9144c0fbfb851fe721c317b5774c",
+        "head_sha": "91ad8d1711a32e1618327c1336a1a2bae9191eb0",
         "conclusion": "success"
       },
       "evidence": "ci-only",
@@ -1129,7 +1129,7 @@
       "l2_commit": "4745817503a8f67d8a7395beea5a025d692fb4b2",
       "l2_via": "implementation",
       "last_main_run": {
-        "head_sha": "9fade516386b9144c0fbfb851fe721c317b5774c",
+        "head_sha": "91ad8d1711a32e1618327c1336a1a2bae9191eb0",
         "conclusion": "success"
       },
       "evidence": "evidence/wb21.json: evidence file missing",
@@ -1147,7 +1147,7 @@
       "l2_commit": "e02cf4227dae22c92a29f6a06da3fde79451195a",
       "l2_via": "implementation",
       "last_main_run": {
-        "head_sha": "9fade516386b9144c0fbfb851fe721c317b5774c",
+        "head_sha": "91ad8d1711a32e1618327c1336a1a2bae9191eb0",
         "conclusion": "success"
       },
       "evidence": "ci-only",
