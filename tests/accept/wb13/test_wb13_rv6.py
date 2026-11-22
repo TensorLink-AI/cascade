@@ -232,6 +232,19 @@ def test_npz_inflation_is_capped(tmp_path):
     assert got["maxrss"] <= 512 * h.MIB, got
 
 
+def test_child_peak_rss_is_its_own():
+    """Control for the 512 MiB bound above: the child's peak RSS is its own
+    (``VmHWM`` of a fresh exec), not the pytest parent's inherited
+    ``ru_maxrss``. A trivial child reads small, and touching 64 MiB more
+    shows up as at least that much more, so the bound can still fail."""
+    small = h.run_child(h.RSS_CHILD, "0", timeout=30)
+    if small["maxrss_method"] != "VmHWM":
+        pytest.skip(f"no /proc/self/status VmHWM here ({small['maxrss_method']})")
+    big = h.run_child(h.RSS_CHILD, "64", timeout=30)
+    assert small["maxrss"] < 128 * h.MIB, small
+    assert big["maxrss"] - small["maxrss"] >= 60 * h.MIB, (small, big)
+
+
 @pytest.mark.parametrize("offset", range(1, 8))
 def test_float64_at_any_byte_offset(tmp_path, art, offset):
     seg = h.segment()
