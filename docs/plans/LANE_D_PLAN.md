@@ -1,10 +1,25 @@
 # Plan: lane D "open weights" (anything goes on our architecture), with lane E and lane A flexibility — v3
 
-Status: **PLAN v3, rev6 (proposed 2026-11-21)**: v2's design, made buildable by an
+Status: **PLAN v3, rev6.2 (proposed 2026-11-22)**: v2's design, made buildable by an
 autonomous loop. A work package is done **only when its Accept command exits
 0**; **(rev6)** its level is only what `scripts/laned/status` computes (§17),
 never a claim. Owner decisions are marked **[DECIDE]**. Nothing is armed. **No calendar
 dates**: stages are gated (§5).
+
+## rev6.2 (owner decisions 2026-11-22; main @ 6108ebd)
+
+Records four decisions the owner approved on 2026-11-22 ("do all ur
+recommendations"). Plan text only; nothing else in the design changes. Every
+changed item is marked **(rev6.2)**. They are build-level rules inside
+existing WPs, not new §6 D-numbers, so the §17.4 table is unchanged; the
+dated entries are listed under it (§17.4, "Owner decisions 2026-11-22").
+
+| Item | Decision | Landed in |
+|---|---|---|
+| (c) | LB1 normalised hashes use the WB11 **schema 2** z-grid rule (`cascade_contamination_hashset/2`, encoding `cascade-zgrid/2`), replacing "rounded to 4 significant figures"; low-information windows are excluded at build and ignored at lookup (RV6). PRs #617/#621, #632 | §12b.1; WB11 row |
+| (d) | While a lane B funded entry is deferred (`sentinel_target` or `rows_held`), its payer key in `PayerKeyVault` gets its TTL refreshed on each deferred tick, the same rule as the entry (WB18 RV6, #629/#633). No WP owns the vault, so it's a follow-up note on WB18 | WB18 row |
+| (e) | The W18 vault ledger `laned_vault_ledger/1` (current era, entries with statuses / `closed_era`, open disputes) is produced by W17 | W17 row |
+| (f) | A W-S2 warm-start acceptance made at an era-init block is governed by the sentinel of the era that init block opens; a follow-up for the acceptance callers (trainer `accept_candidates`, validator `verify_acceptance`) | §16 Work and tests; W-S2 row |
 
 ## rev6 (completion rubric, loop-readiness fixes, stale items; main @ 07117e1, 2026-11-21)
 
@@ -1522,7 +1537,7 @@ Accept command exits 0**, never on a builder's word. Conventions:
 | W14 | ~~**(rev5) blocked: needs owner (Proposed design change 4).**~~ **(rev6) Unblocked:** change 4 was accepted (owner 2026-11-21). Lane D-only fast kill: a `lane_d: {status: "absent"}` receipt state with a lane D-only burn. Today a missing lane D report makes satellites re-assert the old vector for one era (`stale_after_blocks = 3600`) and then burn the whole vector (`satellite.py:30-45`) | W7c | ci + testnet | `scripts/laned/accept W14` |
 | W15 | Prefetch cache, LRU with KING_D and house pinned | W4 | ci + pod | `scripts/laned/accept W15` |
 | W16 | Reference fine-tune script (miner kit) | W10 | ci (CPU tiny run) + pod | `scripts/laned/accept W16` |
-| W17 | `status/lane_d.json` producer (queue, pending progress, king, board; **rev3:** per-entry reason enum including `coldkey_cap_settlement`, `confirm_pending` and reveal deadline) | W5b, W7c | ci | `scripts/laned/accept W17` |
+| W17 | `status/lane_d.json` producer (queue, pending progress, king, board; **rev3:** per-entry reason enum including `coldkey_cap_settlement`, `confirm_pending` and reveal deadline). **(rev6.2, owner 2026-11-22)** Also produces the W18 vault ledger `laned_vault_ledger/1`: the current era, the vault entries with their statuses and `closed_era`, and the open disputes | W5b, W7c | ci | `scripts/laned/accept W17` |
 | W18 | TTL sweeper: vault → owner-only archive → delete (live runs need D16) | W3a | ci (fs adapter) + owner | `scripts/laned/accept W18` |
 | W19 | Lane D work runs **off the weight/poll thread**; the weight-loop keep-alive (#471) is in the release (invariant 6, T15) | W5e | ci + testnet | `scripts/laned/accept W19` (a fixture slow lane D step leaves weight-set timing unchanged) |
 
@@ -1539,14 +1554,14 @@ Every new `[lane_b]` key below ships with:
 | WP | What | Keys / fields | Depends | Runs in | Accept |
 |---|---|---|---|---|---|
 | WB10 | Lane B config keys (parse, digest drop-when-default, overlay, round-trip + mutation tests). **(rev5)** `contamination_hashset` is release-only (added to the `netconfig.py:210` tuple; test: an overlay setting it is refused); new D42 keys `funded_pod_skus`, `max_leg_hours`, `max_leg_seconds`, `guard_factor` | `suite_targets`, `contamination_hashset`, `contamination_min_hits`, `suite_target_max_repo_mb`, `min_experts_frac`, `max_experts_frac`, `router_rows`, `traffic_steal_bound`, `open_rule`, `sentinel_target_rule`, `sentinel_max_defer_eras` | W0c | ci | `scripts/laned/accept WB10` |
-| WB11 | Contamination hash-set builder: exact + normalised sub-window hashes from the pinned suite data; versioned artefact + sha256 | `contamination_hashset` | WB10 | ci + owner (pin) | `scripts/laned/accept WB11` (hash set reproducible from the suite identities) |
+| WB11 | Contamination hash-set builder: exact + normalised sub-window hashes from the pinned suite data; versioned artefact + sha256. **(rev6.2)** Normalisation is schema 2 (`cascade_contamination_hashset/2`, `cascade-zgrid/2`) with RV6's low-information exclusion, per §12b.1 (#617/#621, #632) | `contamination_hashset` | WB10 | ci + owner (pin) | `scripts/laned/accept WB11` (hash set reproducible from the suite identities) |
 | WB12 | Routing information producer (LB3): extend PR #481 telemetry to per-expert counts at phase level; per-suite context-only affinity on the bench host; digest-pinned `status/lane_b_routing-<king8>.json` | `status/lane_b.json` `routing_info` pointer + `stale_since_block` | PR #481 merged | ci + pod | `scripts/laned/accept WB12` |
 | WB13 | Intake contamination check (LB1): AST literals, `config.json`, non-code bytes vs the hash set; typed `benchmark_series_embedded`; `suite_target_max_repo_mb` (D38) | receipt field `contamination: {hashset_version, result, suite, window_id}` | WB11 | ci | `scripts/laned/accept WB13` (TB10–TB12) |
 | WB14 | Declared-rows parsing + per-layer clamps (LB2): **(rev5)** keys = MoE ordinals 0–6 (not block indices); clamp minimum only on layers with ≥ 1 row; validated vs `experts_per_layer`; codes `declared_rows_out_of_range`, `declared_rows_bad_layer`, `declared_rows_count` | manifest field `declared_rows` | WB10 | ci | `scripts/laned/accept WB14` (TB13, TB15, TB15b) |
 | WB15 | Row claims + overlap deferral: earliest reveal; both modes coexist (declared first, then ESFT excluding held rows) | `status/lane_b.json` `deferred: rows_held` | WB14 | ci | `scripts/laned/accept WB15` (TB16) |
 | WB16 | Router-row decision (D40): (a) the frozen path is today's backend, with a test that it stays frozen; if (b): unfreeze the declared router rows, router byte-check, `traffic_steal_bound` guard. **(rev5)** (b) is a worker-image change (shared with lane A): 5-pin repin + wall gate + DEC-CA-0067 qualification, after the scored EMA constant is fixed  **(rev5)** Depends on W-EMA. | receipt field `traffic_share_delta` (b only) | WB14 | ci + pod | `scripts/laned/accept WB16` (TB14) |
 | WB17 | Opening rule (D41, LB4): `open_rule` implementation; driver state records the rule and the satisfying evidence | `lane_b_driver` state `gate_rule`, `gate_evidence` | WB10 | ci + testnet | `scripts/laned/accept WB17` (TB17–TB18) |
-| WB18 | Sentinel interaction (D35/LB5): suite-target deferral, `sentinel_max_defer_eras`, no charge on deferral | `status/lane_b.json` `deferred: sentinel_target` | W-S1, WB10 | ci | `scripts/laned/accept WB18` (TB19–TB20, TS4) |
+| WB18 | Sentinel interaction (D35/LB5): suite-target deferral, `sentinel_max_defer_eras`, no charge on deferral. **(rev6.2, owner 2026-11-22) Follow-up WP note:** while a funded entry is deferred (`sentinel_target` or `rows_held`), its payer key in `PayerKeyVault` (`cascade/funding/vault.py`) has its TTL refreshed on each deferred tick, the same rule as the entry (RV6, #629/#633), so a deferral never outlives the key the leg rents on. No WP owns the vault; the follow-up adds the vault hook and its own test (flagged, not pinned, in `tests/accept/wb18/README.md`) | `status/lane_b.json` `deferred: sentinel_target` | W-S1, WB10 | ci | `scripts/laned/accept WB18` (TB19–TB20, TS4) |
 | WB19 | **(rev5)** Expert-leg measurement (LB6), **per candidate GPU type**: expert-only step rate, leg overhead split from training, peak memory at contract micro-batching, image qualification; plus one full lane A leg on 8×H100 (is 13,600 s training-only?) | `evidence/wb19.json` per-GPU table | — | pod (owner yes, OA8) | `scripts/laned/accept WB19 --evidence evidence/wb19.json` |
 | WB22 | **(rev5)** Lane B GPU list (D42): `[lane_b] funded_pod_skus` separate from `[round]`; `GpuChoice` reads it for lane B legs only; trainer-side per-GPU step-rate table from WB19; audit re-derivation pinned to the recorded `gpu_name` | loader parse + round-trip + mutation test; lane A choice unchanged | WB10, WB19 | ci | `scripts/laned/accept WB22` (TB23, TB24) |
 | WB23 | **(rev5)** Miner-chosen leg length (D42, D42b): `train_hours` on the funding request (0.5–`max_leg_hours`, 0.5 h steps); steps fixed at admission and signed in the leg record; guard = `train_hours × guard_factor` + overhead, capped at `[lane_b] max_leg_seconds` (lane B contract derivation; `[training] max_train_seconds` untouched); expected landing boundary returned to the miner; validator check of recorded steps and guard | keys `max_leg_hours`, `max_leg_seconds`, `guard_factor`; `status/lane_b.json` shows steps, GPU and landing boundary | WB10, WB22 | ci | `scripts/laned/accept WB23` (TB25–TB27) |
@@ -1554,7 +1569,7 @@ Every new `[lane_b]` key below ships with:
 | WB20 | Lane B docs (MINER, INTERFACE, AGENT_MINING, VALIDATOR) | — | WB13–WB18 | ci | `scripts/laned/accept WB20` |
 | WB21 | DEC-CA-0071 amendment (this PR drafts it; owner accepts) | — | — | ci + owner | `scripts/laned/accept WB21` |
 | W-S1 | **(rev4: now in §3)** §16 sentinel draw + lane A gate rule behind `sentinel_from_block` + receipt field + `[v2]` overlay keys (**(rev5)** no shadow logging, D45). **(rev5) Changed consensus code:** the bench gate (`cascade/eval/bench_gate.py`) **and `king_check_gate` (`cascade/validator/king_check.py:93`)**, both of which must drop the sentinel suite from the rule; block-gated by `sentinel_from_block` | `[v2] sentinel_from_block`, `sentinel_suites`, `sentinel_ratchet`, `sentinel_tau` | W0c | ci | `scripts/laned/accept W-S1` (TS1–TS3, TS5) |
-| W-S2 | **(rev4: now in §3)** lane B guard/target exclusion for the sentinel | — | W-S1 | ci | `scripts/laned/accept W-S2` (TS4) |
+| W-S2 | **(rev4: now in §3)** lane B guard/target exclusion for the sentinel. **(rev6.2, owner 2026-11-22) Follow-up:** a warm-start acceptance made at an era-init block is governed by the sentinel of the era that init block opens; applies to the acceptance callers (trainer `accept_candidates`, validator `verify_acceptance`) (§16) | — | W-S1 | ci | `scripts/laned/accept W-S2` (TS4) |
 | W-S3 | **(rev4: now in §3)** sentinel numbers on the status boards | — | W-S1 | ci | `scripts/laned/accept W-S3` |
 
 
@@ -2338,9 +2353,20 @@ The rules below are recorded in the DEC-CA-0071 amendment
 - **What it checks.** Hashes of every GIFT-Eval, BOOM, TIME and FEV **test
   window**, in two forms:
   - **exact:** sha256 of the float64 values;
-  - **normalised:** z-score, rounded to 4 significant figures, then sha256
-    over sliding sub-windows of 32 points. This is robust to scale, offset
-    and rounding.
+  - **normalised (rev6.2, owner 2026-11-22; WB11 schema 2,
+    `cascade_contamination_hashset/2`, encoding `cascade-zgrid/2`; PRs
+    #617/#621, #632):** sha256 over sliding sub-windows of 32 points, each
+    window z-scored with its own mean and **population** std, every value
+    binned as `floor(z / 0.5)`. At lookup, a value within 0.03 of a bin edge
+    also probes the neighbouring bin (nearest edge first, at most 12 such
+    values per window, at most 4096 probes per window); both the window and
+    its negation are looked up. This is robust to scale, offset and
+    rounding. It replaces "rounded to 4 significant figures", which TB11's
+    evasions defeated at some scales.
+  - **low-information windows (RV6):** a window with fewer than 4 distinct
+    values, one value making up ≥ 3/4 of the window, std ≤ 2^-46 · |mean|,
+    or a near-perfect linear ramp is excluded from both hash sets at build
+    and ignored at lookup.
 - **Matched against** everything in the submission:
   - numeric literals in `.py` files (AST walk, all number constants and list
     or array literals);
@@ -2863,6 +2889,13 @@ per new king, roughly as v2.
   no shadow logging, D45).
 - **WP W-S2:** the lane B guard/target exclusion (with the DEC-CA-0071
   amendment).
+  - **(rev6.2, owner 2026-11-22) Era-init acceptances.** A warm-start
+    acceptance made at an era-init block is governed by the sentinel of the
+    **era that init block opens**, not the era it closes. A follow-up for
+    the acceptance callers: the trainer's `accept_candidates`
+    (`cascade/trainer/merge_acceptance.py`) and the validator's
+    `verify_acceptance` (`cascade/validator/merge_acceptance.py`) both pass
+    that era's sentinel.
 - **WP W-S3:** publication on the status boards.
 - **Test rows:**
   - **TS1:** two validators derive the same sentinel from the block hash, and
@@ -3021,6 +3054,16 @@ script parses this table on main; it changes only by an owner-merged plan PR.
 
 **No decision is open, so no WP is blocked on a decision.** Proposed change 22
 asks the owner to confirm the five §15 rows recorded from "all other recs".
+
+**(rev6.2) Owner decisions 2026-11-22** ("do all ur recommendations"). Build
+rules inside existing WPs, not §6 D-numbers, so they aren't table rows:
+
+| Item | Decision | WP | Decided |
+|---|---|---|---|
+| (c) | LB1 normalisation = WB11 schema 2 z-grid with RV6 low-information exclusion (§12b.1; #617/#621, #632) | WB11 | owner, 2026-11-22 |
+| (d) | A deferred lane B funded entry's `PayerKeyVault` key has its TTL refreshed on each deferred tick (#629/#633) | WB18 follow-up | owner, 2026-11-22 |
+| (e) | `laned_vault_ledger/1` is produced by W17 | W17 | owner, 2026-11-22 |
+| (f) | An era-init warm-start acceptance is governed by the sentinel of the era its init block opens | W-S2 follow-up | owner, 2026-11-22 |
 
 **Owner inputs** (moved from Appendix A, rev6). These are inputs to runs, not
 design decisions. They're never guessed: the dependent WP stays
