@@ -237,6 +237,7 @@ class LaneBMixin:
         from .expert_lane import judgements_record
 
         training = self._training_for(manifest)
+        sentinel_kw = self._lane_b_sentinel_kw(manifest)
         try:
             king_scores = self._evaluate(king, windows, training, block=block)
             js = judge_manifest(
@@ -246,10 +247,51 @@ class LaneBMixin:
                 cfg=self.cfg.lane_b, seed=str(base_seed),
                 # DEC-CA-0050 merge guards: refuse a non-finite expert delta
                 strict=self.cfg.lane_b.merge_guard_at_settlement(block),
+                **sentinel_kw,
             )
         except Exception as e:  # noqa: BLE001 — fetch/eval failure: retried, never a verdict
             raise LaneBTransient(f"judging {rid} failed: {type(e).__name__}: {e}") from e
         return _LaneBRound(rid, block, judgements_record(js), js)
+
+    def _lane_b_sentinel_kw(self, manifest: TrainingManifest) -> dict:
+        """W-S2 (LANE_D_PLAN §16 rule 2, D35): ``{"sentinel": suite}`` for a
+        settlement whose era holds a §16 sentinel out of lane B's public
+        guards, ``{}`` unarmed (no chain read; the judge call is then
+        byte-identical to the unarmed one).
+
+        The suite is the settlement's OWN era draw: the recorded W-S1 draw
+        (``_sentinel_for``) when this runner holds it for ``manifest``, else
+        (a catch-up / on-demand settlement, or the current one judged before
+        its lane-A draw) W-S1's ``sentinel_for_era`` over that era's start
+        block hash, read through ``_lane_b_chain``. An unreadable or malformed
+        hash raises :class:`LaneBTransient` — the settlement retries, it is
+        never judged with a guessed sentinel."""
+        from ..shared.sentinel import (
+            sentinel_armed,
+            sentinel_for_era,
+            sentinel_from_block,
+            settlement_era_start,
+        )
+
+        if sentinel_from_block(self.cfg) <= 0:
+            return {}
+        rec = self._sentinel_for(str(manifest.round_id))
+        if rec is not None:
+            return {"sentinel": str(rec["suite"])}
+        era_start = settlement_era_start(self.cfg, self._epoch_start_block(manifest))
+        if not sentinel_armed(self.cfg, era_start):
+            return {}
+        chain = getattr(self, "_lane_b_chain", None)
+        if chain is None:
+            raise LaneBTransient(f"sentinel of era {era_start} unreadable: no chain client "
+                                 "wired for lane B")
+        try:
+            suite = sentinel_for_era(str(chain.block_hash(era_start)),
+                                     self.cfg.v2.sentinel_suites)
+        except Exception as e:  # noqa: BLE001 — any read failure is a transient
+            raise LaneBTransient(f"sentinel of era {era_start} unreadable: "
+                                 f"{type(e).__name__}: {e}") from e
+        return {"sentinel": suite}
 
     def _lane_b_walk_back(self, head: str | None) -> list[_LaneBRound]:
         """Judge the chained settlements this validator has NOT folded, from

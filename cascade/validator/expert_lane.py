@@ -160,7 +160,11 @@ def _arrays(scores) -> dict:
 def judge_entry(entry: ExpertEntry, *, manifest: ExpertManifest, king_pointer: str,
                 king_scores, evaluate: Callable[[str], list], fetch_dir: Callable[[str], Path],
                 cfg, seed: str, recompute_selection: Callable | None = None,
-                strict: bool = False) -> ExpertJudgement:
+                strict: bool = False, sentinel: str | None = None) -> ExpertJudgement:
+    """``sentinel`` is the settlement era's LANE_D_PLAN §16 suite (W-S2, D35):
+    its ``<suite>_crps`` / ``<suite>_mase`` public guards are not built and
+    ``require_public`` minus it is what must pair; every other guard is judged
+    exactly as unarmed. ``None`` (unarmed) is today's judgement."""
     if manifest.king_pointer != king_pointer:
         return ExpertJudgement(entry, False, "stale",
                                f"rebased onto {manifest.king_pointer}, king is {king_pointer}")
@@ -205,12 +209,19 @@ def judge_entry(entry: ExpertEntry, *, manifest: ExpertManifest, king_pointer: s
     public = None
     rows = entry.public_rows or {}
     if rows or cfg.require_public:
-        from ..eval.public_guards import MissingPublicGuard, pair_public_rows
+        from ..eval.public_guards import (
+            MissingPublicGuard,
+            pair_public_rows,
+            sentinel_pairing_kw,
+        )
 
         try:
             public = pair_public_rows(rows.get("king"), rows.get("candidate"),
-                                      require=cfg.require_public,
-                                      min_items=cfg.min_public_items).public
+                                      min_items=cfg.min_public_items,
+                                      **sentinel_pairing_kw(rows.get("king"),
+                                                            rows.get("candidate"),
+                                                            cfg.require_public,
+                                                            sentinel)).public
         except MissingPublicGuard as e:
             return ExpertJudgement(entry, False, "verdict", f"public guard missing: {e}")
     hts = tuple(getattr(cfg, "horizon_target_names", ()) or ())
@@ -242,7 +253,9 @@ def judge_manifest(manifest: ExpertManifest, **kw) -> list[ExpertJudgement]:
     an unconfigured target, or more than ``max_domains_per_leg``, is
     rejected at stage ``targets``. ``strict`` (keyword, default False) arms
     the non-finite refusal of stage ``merge`` — callers pass
-    ``cfg.merge_guard_at_settlement(settlement block)``."""
+    ``cfg.merge_guard_at_settlement(settlement block)``; ``sentinel``
+    (keyword, default None) is the settlement era's §16 suite, left out of
+    the public guards (W-S2, D35)."""
     return [judge_entry(e, manifest=manifest, **kw) for e in manifest.entries
             if e.domain in _targets(kw["cfg"])]
 
