@@ -1,0 +1,12 @@
+# W3b5 always-run low-frequency private-pool non-inferiority check (plan rev6
+# §3.0 W3b5 row, §1.3b A10, §1.5, §1.7, §4 T4b; README.md has the contract).
+# settle_lane_d: the A10 slice, the paired LCBs vs KING_D and the house, the
+# lowfreq_regression outcome and the verdict's lowfreq block.
+cascade/validator/lane_d.py
+# Optional home for the check itself (slice selection + paired LCBs), if the
+# builder keeps it out of lane_d.py. Not imported by the tests.
+cascade/validator/lane_d_lowfreq.py
+# The report validator and schema file: verdicts[].lowfreq gains the optional
+# `lcb` object (present for pass/fail only).
+cascade/validator/lane_d_report.py
+cascade/validator/schemas/lane_d_report_1.json
