@@ -9,13 +9,22 @@ validator. Unarmed (``not cfg.active(boundary)``) it returns
    TTL, duplicate digests, deregistered hotkeys → closed with a typed reason);
 2. selects this settlement's judged entries FIFO by reveal time under the
    per-settlement and per-coldkey caps (the rest wait, ``coldkey_cap_settlement``);
-3. builds each cohort's window set from the §1.3 verdicts of
-   :func:`~cascade.validator.lane_d_forward.eligible_windows` for
-   ``max(T over cohort ∪ king)`` (both clocks after the bound, mirror lag,
-   forecast products, present in S0, no backfill), excluding windows a
-   member was already judged on (the confirmation set is disjoint), and
-   defers the latest-T members until the floors (``min_windows``,
-   ``min_clusters``) are met;
+3. advances each judged entry's ``frozen_set`` (W5b,
+   :mod:`~cascade.validator.lane_d_frozen`): the union over the newest
+   snapshot ``pool_dir`` and the retained ``prior_pool_dirs`` of the windows
+   the §1.3 verdicts of
+   :func:`~cascade.validator.lane_d_forward.eligible_windows` admit for
+   ``max(T_E, T_K)`` (both clocks after the bound, mirror lag, forecast
+   products, present in S0, no backfill), excluding windows the entry was
+   already judged on (the confirmation set is disjoint), capped at
+   ``max_source_share`` with a drop seeded by the boundary, frozen at the
+   floors (``min_windows``, ``min_clusters``). An unfrozen entry stays
+   ``pending_floor``; nothing resets at an era boundary (T18). A cohort is
+   the frozen members, judged on the intersection of their frozen sets that
+   is eligible for ``max(T over cohort ∪ king)`` and has forecasts; the
+   latest-T members are deferred until that intersection meets the floors.
+   At ``until_block`` nothing is judged and every open entry closes
+   (``lane_closed``);
 4. scores every window for the king and each member from the eval host's
    ``(horizon, 9)`` quantile forecasts (``score_window``) into report rows;
 5. decides with the paired cluster bootstrap (clusters = source), max-T over
@@ -49,6 +58,7 @@ import numpy as np
 from ..eval.bootstrap import cohort_maxt_lcbs
 from ..eval.lane_d_scorer import SCORING_LEVELS, SCORING_METHOD, score_window
 from .lane_d_forward import eligible_windows
+from .lane_d_frozen import advance_frozen_set
 from .lane_d_report import REPORT_SCHEMA, rows_sha256, sign_report
 from .lane_d_state import load_state, refresh_house, save_state
 
@@ -234,7 +244,7 @@ def _register(state: dict, entries: list[dict], cfg, uid_of: dict) -> list[dict]
                "context": int(e["context"]), "ready_block": int(e["ready_block"]),
                "reveal_block": int(e["reveal_block"]), "reveal_ts": int(e["reveal_ts"]),
                "status": "pending", "reason": "pending_floor", "used_windows": [],
-               "confirm": None}
+               "confirm": None, "frozen_set": None}
         open_same_hotkey = any(v["hotkey"] == rec["hotkey"] and v["status"] in OPEN_STATUSES
                                for v in known.values())
         if dg in taken:
@@ -296,28 +306,92 @@ def _king_reveal_ts(state: dict, digest: str) -> int | None:
     return None
 
 
-def _window_set(pool: dict, members: list[str], king_digest: str, king_ts: int, state: dict,
-                forecasts: dict, cfg) -> tuple[list[dict], dict[str, int]]:
-    """The cohort's frozen window set, and ``{reason: count}`` of the pool
-    windows the §1.3 eligibility rule refused for ``max(T)`` (windows dropped
-    for any other reason are not counted)."""
+def _load_pools(pool_dir, prior_pool_dirs, horizon: int) -> list[dict]:
+    """The retained snapshots, oldest first and the newest (``pool_dir``)
+    last; a directory listed twice (or equal to ``pool_dir``) loads once."""
+    newest = Path(pool_dir).resolve()
+    seen, dirs = {newest}, []
+    for d in prior_pool_dirs or ():
+        p = Path(d).resolve()
+        if p not in seen:
+            seen.add(p)
+            dirs.append(p)
+    return [load_pool(d, horizon) for d in dirs] + [load_pool(newest, horizon)]
+
+
+def _window_index(pools: list[dict]) -> dict[str, tuple[dict, dict]]:
+    """``{window_id: (window, its pool)}``; a window held by several snapshots
+    resolves to the newest one."""
+    index: dict[str, tuple[dict, dict]] = {}
+    for pool in pools:
+        for w in pool["windows"]:
+            if w["window_id"]:
+                index[w["window_id"]] = (w, pool)
+    return index
+
+
+def _eligibility(pools: list[dict], t_entry: int, t_king: int, cfg
+                 ) -> tuple[set[str], dict[str, int]]:
+    """The ids eligible for ``max(t_entry, t_king)`` in any snapshot, and
+    ``{reason: count}`` of the windows the §1.3 rule refused (a window id
+    counts once, from the newest snapshot holding it, and only when no
+    snapshot admits it)."""
+    verdicts = [list(eligible_windows(p, t_entry=int(t_entry), t_king=int(t_king), cfg=cfg))
+                for p in pools]
+    eligible = {v.window_id for vs in verdicts for v in vs if v.eligible and v.window_id}
+    refused: dict[str, int] = {}
+    seen: set[str] = set()
+    for pool, vs in reversed(list(zip(pools, verdicts, strict=True))):
+        for w, v in zip(pool["windows"], vs, strict=True):
+            wid = w["window_id"]
+            if wid and (wid in seen or wid in eligible):
+                continue
+            if v.reason is not None:
+                refused[str(v.reason)] = refused.get(str(v.reason), 0) + 1
+        seen |= {w["window_id"] for w in pool["windows"] if w["window_id"]}
+    return eligible, dict(sorted(refused.items()))
+
+
+def _cohort_set(index: dict, pools: list[dict], members: list[str], king_digest: str,
+                king_ts: int, state: dict, forecasts: dict, cfg
+                ) -> tuple[list[dict], dict[str, int]]:
+    """The cohort's judged window set: the intersection of the members'
+    frozen sets that is eligible for ``max(T over cohort ∪ king)``, has a
+    usable target, a usable forecast from the king and every member, and no
+    window a member was already judged on; plus the §1.3 refusal counts."""
     t_entry = max(int(state["entries"][m]["reveal_ts"]) for m in members)
     h = int(cfg.horizon)
-    verdicts = eligible_windows(pool, t_entry=t_entry, t_king=int(king_ts), cfg=cfg)
-    out, refused = [], {}
-    for w, v in zip(pool["windows"], verdicts, strict=True):
-        wid = w["window_id"]
-        if v.reason is not None:
-            refused[str(v.reason)] = refused.get(str(v.reason), 0) + 1
-        if not wid or not v.eligible or not _target_usable(w, h):
+    eligible, refused = _eligibility(pools, t_entry, int(king_ts), cfg)
+    common = set.intersection(*(set(state["entries"][m]["frozen_set"]["window_ids"])
+                                for m in members))
+    out = []
+    for wid in sorted(common):
+        if wid not in eligible or wid not in index:
             continue
-        if _forecast_ok(forecasts.get(king_digest), wid, h) is not True:
+        w = index[wid][0]
+        if not _target_usable(w, h) or _forecast_ok(forecasts.get(king_digest), wid, h) is not True:
             continue
         if any(wid in state["entries"][m]["used_windows"]
                or _forecast_ok(forecasts.get(m), wid, h) is not True for m in members):
             continue
         out.append(w)
-    return sorted(out, key=lambda w: w["window_id"]), dict(sorted(refused.items()))
+    return out, refused
+
+
+def _advance_member(rec: dict, pools: list[dict], king_ts: int, cfg, seed: str) -> dict:
+    """Advance one entry's ``frozen_set`` against a king revealed at
+    ``king_ts``. The record carries the bound it was built for
+    (``t_max = max(T_E, T_K)``): a not-yet-judged set built for another bound
+    (the comparison king changed) restarts, since its windows' §1.3 verdicts
+    no longer hold."""
+    t_max = max(int(rec["reveal_ts"]), int(king_ts))
+    prog = rec.get("frozen_set")
+    if prog is not None and int(prog.get("t_max", -1)) != t_max:
+        prog = None
+    prog = advance_frozen_set(prog, pools, t_entry=int(rec["reveal_ts"]), t_king=int(king_ts),
+                              cfg=cfg, seed=seed, exclude=rec["used_windows"])
+    prog["t_max"] = t_max
+    return prog
 
 
 def _meets_floors(ws: list[dict], cfg) -> bool:
@@ -392,9 +466,21 @@ def _not_candidate(cfg) -> dict:
             "n_windows": 0, "tau_public": float(cfg.tau_public)}
 
 
+def _closing(cfg, boundary: int) -> bool:
+    """T18: the settlement at ``until_block`` (the last active one) judges
+    nothing and closes every open entry."""
+    until = int(cfg.until_block)
+    return until > 0 and int(boundary) == until
+
+
 def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: dict,
-                  forecasts: dict, uid_of: dict, state_path, signer) -> LaneDSettlement:
-    """Settle lane D at ``boundary`` (see the module docstring)."""
+                  forecasts: dict, uid_of: dict, state_path, signer,
+                  prior_pool_dirs=()) -> LaneDSettlement:
+    """Settle lane D at ``boundary`` (see the module docstring).
+
+    ``pool_dir`` is the newest ``pool_d`` snapshot; ``prior_pool_dirs`` are
+    the earlier retained ones. They feed every open entry's union and supply
+    the history and targets of windows frozen from them."""
     if not cfg.active(boundary):
         return LaneDSettlement(report=None, pay=None)
     boundary = int(boundary)
@@ -403,24 +489,35 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
         raise ValueError(f"lane D already settled through {state['boundary']}; got {boundary}")
     refresh_house(state, house)
     king_before = _king_record(state["king"])
-    pool = load_pool(pool_dir, int(cfg.horizon))
+    pools = _load_pools(pool_dir, prior_pool_dirs, int(cfg.horizon))
+    pool = pools[-1]
+    index = _window_index(pools)
     seed = f"lane-d/1:{boundary}:{pool['sha256']}"
+    # T18e: the max_source_share drop is seeded by the settlement alone.
+    cap_seed = f"lane-d/1:cap:{boundary}"
     # Every entry considered and not judged is a typed skip, including the
     # entries voided this settlement (invariant 11).
     skipped = _register(state, entries, cfg, uid_of)
-    chosen, capped = _select(state, cfg)
-    skipped += capped
     h = int(cfg.horizon)
 
     def skip(dg: str, reason: str) -> None:
         state["entries"][dg]["reason"] = reason
         skipped.append({"digest": dg, "reason": reason})
 
+    if _closing(cfg, boundary):
+        for dg, rec in sorted(state["entries"].items()):
+            if rec["status"] in OPEN_STATUSES:
+                rec["status"] = "closed"
+                skip(dg, "lane_closed")
+        chosen = []
+    else:
+        chosen, capped = _select(state, cfg)
+        skipped += capped
+
     # A member whose forecasts are malformed on any pool window is the miner's fault.
     for dg in list(chosen):
         fc = forecasts.get(dg)
-        if fc is not None and any(_forecast_ok(fc, w["window_id"], h) is False
-                                  for w in pool["windows"] if w["window_id"]):
+        if fc is not None and any(_forecast_ok(fc, wid, h) is False for wid in index):
             state["entries"][dg]["status"] = "closed"
             skip(dg, "checkpoint_fault")
             chosen.remove(dg)
@@ -429,9 +526,12 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     for dg in chosen:
         stage, kd = _comparison_king(state["entries"][dg], state, cfg)
         if stage == "first" and state["entries"][dg]["status"] == "confirm_pending":
-            state["entries"][dg].update(status="pending", reason="pending_floor", confirm=None)
+            state["entries"][dg].update(status="pending", reason="pending_floor", confirm=None,
+                                        frozen_set=None)
         groups.setdefault((kd, stage), []).append(dg)
 
+    # The first-seen roots the judged windows rely on: every loaded snapshot's.
+    roots = sorted({r for p in pools for r in p["first_seen_roots"]})
     rows, windows_out, cohorts, verdicts = [], {}, [], []
     crowned: list[dict] = []
     for (kd, stage), members in sorted(groups.items()):
@@ -441,11 +541,23 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
                 skip(m, "king_unscored")
             continue
         members = sorted(members, key=lambda m: (state["entries"][m]["reveal_ts"], m))
-        ws, refused = _window_set(pool, members, kd, king_ts, state, forecasts, cfg)
+        frozen = []
+        for m in members:
+            rec = state["entries"][m]
+            rec["frozen_set"] = _advance_member(rec, pools, int(king_ts), cfg, cap_seed)
+            if rec["frozen_set"]["frozen"]:
+                frozen.append(m)
+            else:
+                skip(m, "pending_floor")
+        members = frozen
+        if not members:
+            continue
+        ws, refused = _cohort_set(index, pools, members, kd, king_ts, state, forecasts, cfg)
         while members and not _meets_floors(ws, cfg):
             skip(members.pop(), "pending_floor")
             if members:
-                ws, refused = _window_set(pool, members, kd, king_ts, state, forecasts, cfg)
+                ws, refused = _cohort_set(index, pools, members, kd, king_ts, state, forecasts,
+                                          cfg)
         if not members:
             continue
         scores = {}
@@ -454,7 +566,8 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
                                   w["seasonal_period"]) for w in ws]
             scores[dg] = (np.asarray([p[0] for p in pairs]), np.asarray([p[1] for p in pairs]))
         for i, w in enumerate(ws):
-            lag = (pool["feeds"].get(w["feed"]) or {}).get("mirror_lag_hours")
+            feeds = index[w["window_id"]][1]["feeds"]
+            lag = (feeds.get(w["feed"]) or {}).get("mirror_lag_hours")
             windows_out[w["window_id"]] = {
                 "window_id": w["window_id"], "source": w["source"], "feed": w["feed"],
                 "min_target_ts": int(min(w["target_ts"])),
@@ -470,8 +583,7 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
         cohorts.append({"index": len(cohorts), "king_digest": kd, "king_reveal_ts": int(king_ts),
                         "stage": stage, "members": list(members), "t_max": int(t_max),
                         "window_ids": [w["window_id"] for w in ws], "set_sha256": set_sha,
-                        "first_seen_roots": list(pool["first_seen_roots"]),
-                        "refused": refused})
+                        "first_seen_roots": roots, "refused": refused})
         for m, r in zip(members, res, strict=True):
             rec = state["entries"][m]
             rec["used_windows"] = sorted(set(rec["used_windows"]) | {w["window_id"] for w in ws})
@@ -488,10 +600,13 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
                            reason="lost_confirmation" if stage == "confirm" else "lost_duel")
             elif stage == "first":
                 outcome = "confirm_pending"
+                # The confirmation accumulates a fresh set, disjoint from
+                # ``used_windows`` (D20).
                 rec.update(status="confirm_pending", reason="confirm_pending",
                            confirm={"first_set_sha256": set_sha, "king_digest": kd,
                                     "rule": str(cfg.confirm_on_king_change),
-                                    "boundary": boundary})
+                                    "boundary": boundary},
+                           frozen_set=None)
             else:
                 outcome = "confirmed"
                 crowned.append({"digest": m, "lcb": r["lcb"], "reveal_ts": rec["reveal_ts"]})

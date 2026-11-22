@@ -2,7 +2,8 @@
 
 Holds KING_D, the prior miner kings, the house, and every entry's progress
 (status, typed reason, the windows it has been judged on, its confirmation
-record). Written atomically; protected like ``cascade_state.json`` (snapshot
+record, and ``frozen_set``: the W5b accumulating/frozen window set from
+:func:`~cascade.validator.lane_d_frozen.advance_frozen_set`). Written atomically; protected like ``cascade_state.json`` (snapshot
 before restarts, never hand-edited). A missing file is the genesis state: the
 house holds KING_D.
 """
@@ -14,15 +15,17 @@ import os
 from pathlib import Path
 
 from ..shared.atomic import write_text_atomic
+from . import lane_d_report
 
 STATE_SCHEMA = "lane-d-state/1"
-# §1.5 typed reasons an entry can carry (``None`` while it simply waits).
-ENTRY_STATUSES = ("pending", "confirm_pending", "crowned", "lost", "closed")
-ENTRY_REASONS = ("pending_floor", "confirm_pending", "coldkey_cap_settlement",
-                 "coldkey_unresolved", "reveal_delay_exceeded", "checkpoint_fault",
-                 "ready_expired", "deregistered", "lost_duel", "lost_confirmation", "crowned",
-                 "duplicate_digest", "hotkey_has_open_entry", "context_not_armed",
-                 "king_unscored")
+# §1.5 typed statuses and reasons an entry can carry. One source of truth: the
+# W7a report enums (``lane_d_report``, equal to the schema file), plus the
+# reasons state can hold before the report schema lists them.
+ENTRY_STATUSES = tuple(lane_d_report.ENTRY_STATUSES)
+# ``lane_closed`` (T18, W5b): every open entry closes at ``[lane_d] until_block``.
+STATE_ONLY_REASONS = ("lane_closed",)
+ENTRY_REASONS = tuple(lane_d_report.ENTRY_REASONS) + tuple(
+    r for r in STATE_ONLY_REASONS if r not in lane_d_report.ENTRY_REASONS)
 
 
 def genesis(house: dict) -> dict:
@@ -58,5 +61,5 @@ def refresh_house(state: dict, house: dict) -> None:
         state["king"] = {**h, "hotkey": None, "house": True}
 
 
-__all__ = ["ENTRY_REASONS", "ENTRY_STATUSES", "STATE_SCHEMA", "genesis", "load_state",
-           "refresh_house", "save_state"]
+__all__ = ["ENTRY_REASONS", "ENTRY_STATUSES", "STATE_ONLY_REASONS", "STATE_SCHEMA", "genesis",
+           "load_state", "refresh_house", "save_state"]
