@@ -286,9 +286,20 @@ def reversed_keys(obj):
 
 
 def chain_raw(validator_hotkey: str) -> dict:
-    """The repo chain.toml parsed, with ``[manifest] validator_hotkey`` set."""
+    """The repo chain.toml parsed, with ``[manifest] validator_hotkey`` set.
+
+    The repo config runs ``[v2] bench_source = "validator"``, under which the
+    loader (``check_bench_source``) requires a non-empty ``[manifest]
+    validator_hotkey`` to equal ``[netconfig] owner_hotkey`` (both name the
+    main validator). A non-empty pin is therefore mirrored into
+    ``owner_hotkey`` so the config stays consistent; an empty pin leaves the
+    repo's ``owner_hotkey`` in place (the loader accepts an unset manifest
+    pin), so the refusal under test comes from the W7b code, not the loader.
+    """
     import tomllib
 
     raw = tomllib.loads(CHAIN_TOML.read_text(encoding="utf-8"))
     raw["manifest"]["validator_hotkey"] = validator_hotkey
+    if validator_hotkey.strip():
+        raw.setdefault("netconfig", {})["owner_hotkey"] = validator_hotkey
     return raw
