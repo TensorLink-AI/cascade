@@ -85,12 +85,7 @@ class RefTree:
         self.files = set(lanedlib.git(root, "ls-tree", "-r", "--name-only", self.commit).stdout.split("\n"))
         self.files.discard("")
         self._cache: dict[str, str | None] = {}
-        log = lanedlib.git(root, "log", "--first-parent", "--reverse", "--diff-merges=first-parent",
-                           "--name-only", "--format=%x01%H", self.commit).stdout
-        self.history: list[tuple[str, list[str]]] = []
-        for chunk in log.split("\x01")[1:]:
-            lines = [ln for ln in chunk.split("\n") if ln.strip()]
-            self.history.append((lines[0].strip(), lines[1:]))
+        self.history = lanedlib.first_parent_history(root, self.commit)
         self.position = {sha: i for i, (sha, _) in enumerate(self.history)}
 
     def show(self, path: str) -> str | None:
@@ -287,26 +282,9 @@ class Board:
         self.detail: dict[str, dict] = {}
 
     # -- per-level conditions ------------------------------------------------
-    def paths_commit(self, d: str) -> int | None:
-        rel = f"tests/accept/{d}/PATHS"
-        for i, (_, files) in enumerate(self.tree.history):
-            if rel in files:
-                return i
-        return None
-
     def l2_commit(self, wp: str, paths: list[str]) -> int | None:
-        start = self.paths_commit(lanedlib.wp_dir(wp))
-        if start is None:
-            return None
-        for i in range(start + 1, len(self.tree.history)):
-            files = self.tree.history[i][1]
-            if not files:
-                continue
-            if not any(not f.startswith("tests/accept/") for f in files):
-                continue
-            if all(lanedlib.path_matches(f, paths) for f in files):
-                return i
-        return None
+        # shared with `accept --check-pr` (tests-only vs tests-correction)
+        return lanedlib.impl_commit_index(self.tree.history, wp, paths)
 
     def evidence_ok(self, wp: str, run: dict) -> tuple[bool, str]:
         """L4 for an external WP: the evidence file at REF passes the field check

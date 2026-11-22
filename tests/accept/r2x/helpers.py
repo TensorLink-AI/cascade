@@ -118,9 +118,12 @@ def dry_run(tmp_path: Path, *extra: str, fixture: Path | None = None, cfg: str =
 
 def as_chain_evidence(evidence: dict) -> dict:
     """A fixture-made evidence file relabelled as a chain read, to exercise the
-    verifier offline. ``passed`` is restated from the recomputed rule."""
+    verifier offline. ``passed`` is restated from the recomputed rule, and
+    ``git_dirty`` is cleared as a clean release checkout would record it (the
+    self-tests must not depend on the dev checkout being clean)."""
     ev = copy.deepcopy(evidence)
     ev["source"] = "chain"
+    ev["tool"]["git_dirty"] = False
     ev["passed"] = ev["trimmed_pending"] == [] and ev["counts"]["ok"] >= 1
     return ev
 

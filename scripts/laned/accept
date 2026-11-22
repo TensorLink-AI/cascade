@@ -7,15 +7,39 @@
         With --evidence, pytest and e2e see LANED_EVIDENCE=<abs FILE>: the
         WP's own tests verify the evidence content (plan §3, §17.1 L4).
     accept <WP> --expect-fail [--root R]
-        tests-only PRs: tests collected and failing for a right reason only
+        tests-only PRs for an unbuilt WP: tests collected and failing for a
+        right reason only
+    accept <WP> --tests-correction --base REF --head REF [--root R]
+        tests-only PRs for a WP already built on BASE (see MODE rules below)
     accept <WP> --check-pr --base REF --head REF [--root R]
         rule 1 and the WP's PATHS over `git diff --name-only BASE...HEAD`;
+        prints the MODE the PR job runs next (rules below);
         for a review WP RV<n>: MODE review iff the diff is exactly an add or
         modify of evidence/rv<n>.md (no tests run)
     accept selftest
-        offline check of the review mode
+        offline check of the review and tests-correction modes
     accept --gate <STAGE> [--root R]
         evidence/gates/<stage>.json: right stage, every check passed
+
+MODE rules of --check-pr (the PR job runs the named mode next):
+    MODE implementation   the diff has no tests/accept/ path and stays inside
+                          the WP's PATHS -> full Accept
+    MODE tests-only       the diff touches only tests/accept/<wp>/ and BASE has
+                          no implementation of the WP (no L2 commit on BASE's
+                          first-parent line: a commit after the one adding
+                          PATHS that changes non-test files, all inside PATHS)
+                          -> --expect-fail over the WP's whole test dir
+    MODE tests-correction the diff touches only tests/accept/<wp>/ and BASE
+                          already has the WP's implementation (L2 commit found)
+                          -> --tests-correction: every test file the PR does
+                          NOT change must pass against BASE's implementation;
+                          the test files it changes (adds or edits) run in
+                          expect-fail classification: each failure must be for
+                          a right reason (it is pending a follow-up
+                          implementation PR), and all of them passing is fine.
+                          Any wrong-reason failure, or any failure in an
+                          unchanged test file, fails the PR.
+    MODE review           RV<n> label, the diff is exactly evidence/rv<n>.md
 
 The pytest command is `uv run --frozen pytest` unless LANED_PYTEST_CMD is set
 (shlex-split). It always runs with cwd = --root. Exit 0 means pass.
@@ -91,9 +115,11 @@ def step_invariant10(root: Path, wp: str) -> int:
 # ---------------------------------------------------------------------------
 
 def run_pytest(root: Path, wp: str, extra: list[str],
-               env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
-    rel = f"tests/accept/{lanedlib.wp_dir(wp)}/"
-    cmd = pytest_cmd() + ["-q", *extra, rel]
+               env: dict[str, str] | None = None,
+               targets: list[str] | None = None) -> subprocess.CompletedProcess:
+    """pytest over the WP's test dir, or over ``targets`` (root-relative files)."""
+    rel = targets if targets is not None else [f"tests/accept/{lanedlib.wp_dir(wp)}/"]
+    cmd = pytest_cmd() + ["-q", *extra, *rel]
     print("+ " + shlex.join(cmd), flush=True)
     return subprocess.run(cmd, cwd=str(root), capture_output=True, text=True, env=env)
 
@@ -197,25 +223,20 @@ def classify(kind: str, text: str, paths: list[str]) -> tuple[bool, str]:
     return False, "failure that is not an assertion"
 
 
-def cmd_expect_fail(root: Path, wp: str) -> int:
-    if not test_dir(root, wp).is_dir():
-        return fail("expect-fail", f"no tests at tests/accept/{lanedlib.wp_dir(wp)}/")
-    paths = read_paths(root, wp)
-    if paths is None:
-        return fail("expect-fail", "no PATHS file")
-    if step_invariant10(root, wp):
-        return 1
+def classify_run(root: Path, wp: str, paths: list[str],
+                 targets: list[str] | None = None) -> tuple[int, int, int, int] | str:
+    """Run pytest (whole test dir, or ``targets``) and classify every failure:
+    (collected, passed, right-reason, wrong-reason), or an error string."""
     with tempfile.TemporaryDirectory(prefix="laned-xf-") as tmp:
         junit = Path(tmp) / "junit.xml"
-        proc = run_pytest(root, wp, [f"--junitxml={junit}", "--continue-on-collection-errors"])
+        proc = run_pytest(root, wp, [f"--junitxml={junit}", "--continue-on-collection-errors"],
+                          env=evidence_env(root, None), targets=targets)
         sys.stdout.write(proc.stdout[-20000:])
         if not junit.is_file():
             sys.stderr.write(proc.stderr[-5000:])
-            return fail("expect-fail", f"pytest wrote no report (exit {proc.returncode})")
+            return f"pytest wrote no report (exit {proc.returncode})"
         tree = ET.parse(junit)
     cases = list(tree.iter("testcase"))
-    if not cases:
-        return fail("expect-fail", "no tests collected")
     right = wrong = passed = 0
     for case in cases:
         name = f"{case.get('classname', '')}::{case.get('name', '')}"
@@ -232,7 +253,24 @@ def cmd_expect_fail(root: Path, wp: str) -> int:
                 right += 1
             else:
                 wrong += 1
-    print(f"expect-fail: {len(cases)} collected, {passed} passed, {right} right-reason, {wrong} wrong-reason")
+    return len(cases), passed, right, wrong
+
+
+def cmd_expect_fail(root: Path, wp: str) -> int:
+    if not test_dir(root, wp).is_dir():
+        return fail("expect-fail", f"no tests at tests/accept/{lanedlib.wp_dir(wp)}/")
+    paths = read_paths(root, wp)
+    if paths is None:
+        return fail("expect-fail", "no PATHS file")
+    if step_invariant10(root, wp):
+        return 1
+    res = classify_run(root, wp, paths)
+    if isinstance(res, str):
+        return fail("expect-fail", res)
+    collected, passed, right, wrong = res
+    if not collected:
+        return fail("expect-fail", "no tests collected")
+    print(f"expect-fail: {collected} collected, {passed} passed, {right} right-reason, {wrong} wrong-reason")
     if wrong:
         return fail("expect-fail", f"{wrong} failure(s) for a wrong reason")
     if not right:
@@ -286,7 +324,9 @@ def cmd_check_pr(root: Path, wp: str, base: str, head: str) -> int:
         foreign = [p for p in tests if not p.startswith(own)]
         if foreign:
             return fail("rule1", f"tests-only PR for {wp} touches another WP's tests: " + " ".join(foreign))
-        print("MODE tests-only")
+        # MODE rules (module docstring): a WP already built on BASE gets a
+        # tests-correction run, an unbuilt one the classic expect-fail run.
+        print("MODE tests-correction" if built_on(root, base, wp) else "MODE tests-only")
         return 0
     paths = paths_at(root, base, wp) or paths_at(root, head, wp)
     if not paths:
@@ -298,6 +338,78 @@ def cmd_check_pr(root: Path, wp: str, base: str, head: str) -> int:
     if outside:
         return fail("paths", "outside the WP's PATHS: " + " ".join(sorted(outside)))
     print("MODE implementation")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# tests-correction (a tests-only PR for a WP already built on BASE)
+# ---------------------------------------------------------------------------
+
+def built_on(root: Path, ref: str, wp: str) -> bool:
+    """True when ``ref`` carries the WP's implementation: its first-parent
+    line has the L2 commit (the status board's rule, lanedlib.impl_commit_index)
+    for the PATHS file at ``ref``. No PATHS at ``ref`` means a new WP."""
+    rel = f"tests/accept/{lanedlib.wp_dir(wp)}/PATHS"
+    proc = lanedlib.git(root, "show", f"{ref}:{rel}", check=False)
+    if proc.returncode != 0:
+        return False
+    history = lanedlib.first_parent_history(root, ref)
+    return lanedlib.impl_commit_index(history, wp, lanedlib.parse_paths(proc.stdout)) is not None
+
+
+def is_test_file(rel: str) -> bool:
+    name = rel.rsplit("/", 1)[-1]
+    return name.endswith(".py") and (name.startswith("test_") or name.endswith("_test.py"))
+
+
+def wp_test_files(root: Path, wp: str) -> list[str]:
+    d = test_dir(root, wp)
+    return sorted(p.relative_to(root).as_posix() for p in d.rglob("*.py")
+                  if is_test_file(p.name) and "__pycache__" not in p.parts)
+
+
+def cmd_tests_correction(root: Path, wp: str, base: str, head: str) -> int:
+    """MODE tests-correction (module docstring): unchanged test files must
+    pass; changed test files may fail, but only for a right reason."""
+    step = "tests-correction"
+    if not test_dir(root, wp).is_dir():
+        return fail(step, f"no tests at tests/accept/{lanedlib.wp_dir(wp)}/")
+    paths = read_paths(root, wp)
+    if paths is None:
+        return fail(step, "no PATHS file")
+    if not built_on(root, base, wp):
+        return fail(step, f"{wp} has no implementation on {base}; a tests-only PR runs --expect-fail")
+    if step_invariant10(root, wp):
+        return 1
+    own = f"tests/accept/{lanedlib.wp_dir(wp)}/"
+    diff = lanedlib.git(root, "diff", "--name-only", f"{base}...{head}").stdout.split()
+    all_tests = wp_test_files(root, wp)
+    changed = [p for p in all_tests if p in diff and p.startswith(own)]
+    unchanged = [p for p in all_tests if p not in changed]
+    print(f"{step}: {len(changed)} changed test file(s), {len(unchanged)} unchanged")
+    if unchanged:
+        proc = run_pytest(root, wp, [], env=evidence_env(root, None), targets=unchanged)
+        sys.stdout.write(proc.stdout[-20000:])
+        sys.stderr.write(proc.stderr[-5000:])
+        if proc.returncode not in (0, 5):  # 5: the files collect no test
+            return fail(step, f"a test the PR does not change fails (pytest exit {proc.returncode})")
+        print("ok unchanged tests pass")
+    right = 0
+    if changed:
+        res = classify_run(root, wp, paths, targets=changed)
+        if isinstance(res, str):
+            return fail(step, res)
+        collected, passed, right, wrong = res
+        print(f"{step}: changed tests {collected} collected, {passed} passed, "
+              f"{right} right-reason, {wrong} wrong-reason")
+        if wrong:
+            return fail(step, f"{wrong} failure(s) for a wrong reason")
+    if right:
+        print(f"MODE tests-correction PASS ({right} changed test(s) fail for a right reason, "
+              "pending an implementation PR)")
+    else:
+        print("MODE tests-correction PASS")
+    print(f"PASS {wp} tests-correction")
     return 0
 
 
@@ -316,8 +428,99 @@ def cmd_gate(root: Path, stage: str) -> int:
     return 0
 
 
+SELFTEST_PASSING = "def test_ok():\n    assert 1 + 1 == 2\n"
+SELFTEST_IMPL_PASS = "import pkg_w9\n\n\ndef test_value():\n    assert pkg_w9.VALUE == 9\n"
+SELFTEST_IMPL_FAIL = "import pkg_w9\n\n\ndef test_corrected():\n    assert pkg_w9.VALUE == 10\n"
+
+
+def selftest_tests_correction(ident: tuple[str, ...]) -> list[str]:
+    """The MODE rules for tests-only PRs, on real git repos and real pytest
+    (sys.executable -m pytest; LANED_PYTEST_CMD is overridden for the run)."""
+    failures: list[str] = []
+    saved = os.environ.get("LANED_PYTEST_CMD")
+    os.environ["LANED_PYTEST_CMD"] = shlex.join([sys.executable, "-m", "pytest", "-p", "no:cacheprovider"])
+    try:
+        with tempfile.TemporaryDirectory(prefix="laned-accept-selftest-tc-") as tmp:
+            n = 0
+
+            def repo(built: bool):
+                nonlocal n
+                n += 1
+                root = Path(tmp) / f"repo{n}"
+                root.mkdir()
+
+                def put_commit(files: dict[str, str], msg: str) -> str:
+                    for rel, text in files.items():
+                        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+                        (root / rel).write_text(text)
+                    lanedlib.git(root, "add", "-A")
+                    lanedlib.git(root, *ident, "commit", "-q", "-m", msg)
+                    return lanedlib.git(root, "rev-parse", "HEAD").stdout.strip()
+
+                lanedlib.git(root, "init", "-q")
+                put_commit({"README.md": "x\n", "pkg_w9.py": "VALUE = 1\n"}, "seed")
+                base = put_commit({"tests/accept/w9/PATHS": "pkg_w9.py\n",
+                                   "tests/accept/w9/w9_helper.py": "EXPECTED = 9\n",
+                                   "tests/accept/w9/test_w9_value.py":
+                                       "import w9_helper\nimport pkg_w9\n\n\ndef test_value():\n"
+                                       "    assert pkg_w9.VALUE == w9_helper.EXPECTED\n"},
+                                  "tests-only")
+                if built:
+                    base = put_commit({"pkg_w9.py": "VALUE = 9\n"}, "implementation")
+                return root, base, put_commit
+
+            def case(name: str, built: bool, files: dict[str, str], want_mode: str, want_ok: bool) -> None:
+                root, base, put_commit = repo(built)
+                head = put_commit(files, name)
+                with contextlib.redirect_stdout(io.StringIO()) as buf:
+                    rc = cmd_check_pr(root, "W9", base, head)
+                out = buf.getvalue()
+                if rc != 0 or f"MODE {want_mode}\n" not in out:
+                    failures.append(f"{name}: check-pr rc={rc}, want MODE {want_mode}: {out.strip()}")
+                    return
+                with contextlib.redirect_stdout(io.StringIO()) as buf:
+                    if want_mode == "tests-only":
+                        rc = cmd_expect_fail(root, "W9")
+                    else:
+                        rc = cmd_tests_correction(root, "W9", base, head)
+                out = buf.getvalue()
+                ok = rc == 0 and (want_mode == "tests-only" or "MODE tests-correction PASS" in out)
+                if ok != want_ok:
+                    failures.append(f"{name}: {want_mode} {'passed' if ok else 'failed'}, "
+                                    f"want {'pass' if want_ok else 'fail'}: {out.strip()[-2000:]}")
+
+            # new WP, tests-only PR -> classic expect-fail (unchanged)
+            case("new-wp-tests-only", False, {"tests/accept/w9/test_w9_more.py": SELFTEST_IMPL_FAIL},
+                 "tests-only", True)
+            # built WP + new passing tests -> pass
+            case("built-new-passing", True, {"tests/accept/w9/test_w9_more.py": SELFTEST_PASSING},
+                 "tests-correction", True)
+            # built WP + new tests failing for a right reason -> pass (pending impl fix)
+            case("built-new-failing-right", True, {"tests/accept/w9/test_w9_more.py": SELFTEST_IMPL_FAIL},
+                 "tests-correction", True)
+            # built WP + a corrected (edited) existing test failing for a right reason -> pass
+            case("built-edited-failing-right", True,
+                 {"tests/accept/w9/test_w9_value.py": SELFTEST_IMPL_FAIL}, "tests-correction", True)
+            # built WP + an existing (unchanged) test now failing -> FAIL
+            case("built-existing-now-failing", True,
+                 {"tests/accept/w9/w9_helper.py": "EXPECTED = 10\n",
+                  "tests/accept/w9/test_w9_more.py": SELFTEST_IMPL_PASS}, "tests-correction", False)
+            # built WP + a changed test failing for a wrong reason -> FAIL
+            case("built-new-failing-wrong", True,
+                 {"tests/accept/w9/test_w9_more.py": "import laned_no_such_dep\n\n\ndef test_x():\n"
+                                                     "    assert laned_no_such_dep\n"},
+                 "tests-correction", False)
+    finally:
+        if saved is None:
+            os.environ.pop("LANED_PYTEST_CMD", None)
+        else:
+            os.environ["LANED_PYTEST_CMD"] = saved
+    return failures
+
+
 def cmd_selftest() -> int:
-    """Offline check of the RV<n> review mode of --check-pr."""
+    """Offline check of the RV<n> review mode of --check-pr and of the
+    tests-only / tests-correction MODE rules."""
     failures: list[str] = []
     ident = ("-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false")
     with tempfile.TemporaryDirectory(prefix="laned-accept-selftest-") as tmp:
@@ -359,6 +562,7 @@ def cmd_selftest() -> int:
         case("plus-tests", {"evidence/rv2.md": "r\n", "tests/accept/w1/test_x.py": "x = 1\n"}, "RV2", False)
         case("delete", {"evidence/rv1.md": None}, "RV1", False)
         case("other-file-only", {"docs/notes.md": "n\n"}, "RV3", False)
+    failures += selftest_tests_correction(ident)
     for f in failures:
         print(f"accept selftest: FAIL {f}", file=sys.stderr)
     if failures:
@@ -371,12 +575,18 @@ def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["selftest"]:
         return cmd_selftest()
-    ap = argparse.ArgumentParser(prog="accept", description=__doc__.split("\n\n")[0])
+    ap = argparse.ArgumentParser(prog="accept", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("wp", nargs="?")
     ap.add_argument("--root", default=".")
     ap.add_argument("--evidence")
-    ap.add_argument("--expect-fail", action="store_true")
-    ap.add_argument("--check-pr", action="store_true")
+    ap.add_argument("--expect-fail", action="store_true",
+                    help="MODE tests-only: the whole test dir must fail for a right reason")
+    ap.add_argument("--tests-correction", action="store_true",
+                    help="MODE tests-correction (needs --base/--head): unchanged test files pass, "
+                         "changed ones pass or fail for a right reason")
+    ap.add_argument("--check-pr", action="store_true",
+                    help="rule 1 + PATHS; prints MODE implementation|tests-only|tests-correction|review")
     ap.add_argument("--base")
     ap.add_argument("--head")
     ap.add_argument("--gate", metavar="STAGE")
@@ -390,6 +600,10 @@ def main(argv: list[str] | None = None) -> int:
         if not (args.base and args.head):
             ap.error("--check-pr needs --base and --head")
         return cmd_check_pr(root, args.wp, args.base, args.head)
+    if args.tests_correction:
+        if not (args.base and args.head):
+            ap.error("--tests-correction needs --base and --head")
+        return cmd_tests_correction(root, args.wp, args.base, args.head)
     if args.expect_fail:
         return cmd_expect_fail(root, args.wp)
     return cmd_accept(root, args.wp, args.evidence)
