@@ -146,10 +146,12 @@ def test_float32_bytes(tmp_path, art):
 
 @pytest.mark.parametrize("fmt", ["<40q", "<40i"])
 def test_int_bytes(tmp_path, art, fmt):
-    """Integer arrays (int64 and int32) are read as values: ``[3] * 40``
-    matches the flat TIME series exactly."""
-    r = h.repo_with(tmp_path, {"data/flat.raw": struct.pack(fmt, *([h.FLAT_VALUE] * 40))})
-    assert h.scan(r, art) == h.receipt(1, "embedded", "time", h.FLAT_WINDOW_ID)
+    """Integer arrays (int64 and int32) are read as values: the TIME event
+    counts as ints match that series exactly. (RV6: this used the flat
+    ``[3] * 40`` series, which WB11's B5 rule makes low-information and so
+    never evidence: tests/accept/wb11/README.md "Low-information windows".)"""
+    r = h.repo_with(tmp_path, {"data/counts.raw": struct.pack(fmt, *h.counts_series())})
+    assert h.scan(r, art) == h.receipt(1, "embedded", "time", h.COUNTS_WINDOW_ID)
 
 
 def test_numbers_in_a_text_data_file(tmp_path, art):
@@ -209,7 +211,7 @@ def _two_hit_files() -> dict[str, bytes | str]:
     """Two different embeddings, gift in a literal and time in int bytes,
     so the receipt's suite / window id needs a deterministic choice."""
     return {"zz_gift.py": h.py_list("CURVE", h.segment()),
-            "aa_data/flat.raw": struct.pack("<40q", *([h.FLAT_VALUE] * 40))}
+            "aa_data/counts.raw": struct.pack("<40q", *h.counts_series())}
 
 
 def test_scan_is_deterministic(tmp_path, art):
@@ -220,7 +222,7 @@ def test_scan_is_deterministic(tmp_path, art):
     assert ra == rb
     assert ra["result"] == "embedded"
     assert (ra["suite"], ra["window_id"]) in {("gift", h.SEG_WINDOW_ID),
-                                              ("time", h.FLAT_WINDOW_ID)}
+                                              ("time", h.COUNTS_WINDOW_ID)}
     outs = set()
     for seed in ("0", "1", "4242"):
         env = dict(os.environ, PYTHONPATH=str(h.REPO), PYTHONHASHSEED=seed)
