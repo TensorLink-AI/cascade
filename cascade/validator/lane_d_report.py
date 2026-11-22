@@ -19,7 +19,8 @@ keyword subset the file uses (``type``, ``const``, ``enum``, ``pattern``,
 ``propertyNames``, ``items``, ``$ref`` and ``if``/``then``/``else``), plus the
 checks JSON Schema cannot state: numbers are finite (``extensions``
 included), the cross-field rules of :func:`_cross_field` (snapshot binding,
-the gate record's consistency with the report and the crowned digest, the
+a crowned report carries a gate record (W5e, RV5) holding a ``pass`` for the
+crowned digest, the gate record's consistency with the report, the
 W5c house bar's ``house_digest`` / ``verdicts[].house`` binding,
 ``gate_weights`` keys), and
 ``rows_sha256`` is the canonical digest of ``rows`` (checked last). The
@@ -337,6 +338,10 @@ def _cross_field(report: dict) -> None:
     _check_gate_weights(report)
     _check_snapshots(report)
     _check_house(report)
+    if report["crowned"] is not None and not isinstance(report.get("gate"), dict):
+        # W5e (RV5): nothing crowns ungated (the schema's top-level
+        # conditional states the same rule).
+        raise ReportSchemaError("missing_field", "gate", "a crowned report needs its gate record")
     if "gate" in report:
         _check_gate(report)
 

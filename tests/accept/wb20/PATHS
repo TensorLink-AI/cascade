@@ -1,0 +1,6 @@
+# WB20: lane B docs (plan §3.0 WB20 row, §11.2 "Lane B docs", §12b).
+# Docs only: the four guides below. No code, config or other doc changes.
+docs/MINER.md
+docs/INTERFACE.md
+docs/AGENT_MINING.md
+docs/VALIDATOR.md

@@ -483,17 +483,72 @@ def edge_repo(tmp: Path, n_windows: int, name: str = "edge") -> Path:
     return repo_with(tmp, {"data/edge.f64": struct.pack(f"<{len(vals)}d", *vals)}, name=name)
 
 
+def _vm_hwm_bytes() -> int | None:
+    """``VmHWM`` of ``/proc/self/status`` in bytes, or ``None`` without /proc."""
+    try:
+        with open("/proc/self/status", encoding="ascii") as f:
+            for line in f:
+                if line.startswith("VmHWM:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _ru_maxrss_bytes() -> int:
+    import resource
+
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+
+
+def rss_baseline() -> int:
+    """Call first thing in a child: the inherited ``ru_maxrss`` (bytes)."""
+    return _ru_maxrss_bytes()
+
+
+def own_peak_rss(baseline: int) -> tuple[int, str]:
+    """The calling process's OWN peak RSS (bytes) and the method used.
+
+    ``ru_maxrss`` (RUSAGE_SELF or RUSAGE_CHILDREN) is not it: on Linux the
+    kernel carries the forking parent's peak across fork + exec, so a child of
+    a 2.7 GB pytest process reports 2.7 GB whatever it does. ``VmHWM`` is the
+    high-water mark of the address space exec created, so it is the child's
+    own peak. Without /proc the fallback is the ``ru_maxrss`` growth over the
+    inherited ``baseline`` taken at child start (zero while the child stays
+    under the inherited peak, so it can only under-report); the method is
+    returned so a reader can tell which one was used."""
+    hwm = _vm_hwm_bytes()
+    if hwm is not None:
+        return hwm, "VmHWM"
+    return max(0, _ru_maxrss_bytes() - baseline), "ru_maxrss_delta"
+
+
 SCAN_CHILD = """
+from tests.accept.wb13 import helpers as h
+rss0 = h.rss_baseline()
 import json, sys, time
 from pathlib import Path
-from tests.accept.wb13 import helpers as h
 kw = json.loads(sys.argv[2])
 t0, c0 = time.monotonic(), time.process_time()
 with h.torch_blocked():
     out = h.scan_mod().scan_repo(Path(sys.argv[1]), h.artefact(1), **kw)
-import resource
-print(json.dumps({"receipt": out, "wall": time.monotonic() - t0, "cpu": time.process_time() - c0,
-                  "maxrss": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024}))
+wall, cpu = time.monotonic() - t0, time.process_time() - c0
+peak, method = h.own_peak_rss(rss0)
+print(json.dumps({"receipt": out, "wall": wall, "cpu": cpu,
+                  "maxrss": peak, "maxrss_method": method}))
+"""
+
+# The measurement's own control (no scan): touch ``argv[1]`` MiB, report.
+RSS_CHILD = """
+from tests.accept.wb13 import helpers as h
+rss0 = h.rss_baseline()
+import json, sys
+n = int(sys.argv[1]) * h.MIB
+blob = bytearray(n)
+for i in range(0, n, 4096):
+    blob[i] = 1
+peak, method = h.own_peak_rss(rss0)
+print(json.dumps({"maxrss": peak, "maxrss_method": method}))
 """
 
 INTAKE_CHILD = """
@@ -517,7 +572,9 @@ print(json.dumps({"status": status, "body": body, "wall": wall,
 
 
 def run_child(code: str, *args: str, timeout: float) -> dict:
-    """Run ``code`` in a fresh, niced interpreter; an overrun is a test
+    """Run ``code`` in a fresh, niced interpreter (``subprocess``: a new
+    exec, so a new address space whose ``VmHWM`` starts at zero, never a
+    fork-only child sharing the pytest process's pages); an overrun is a test
     failure (the child is killed), never a hung test."""
     import os
     import subprocess
