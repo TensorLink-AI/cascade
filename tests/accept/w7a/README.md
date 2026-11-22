@@ -234,6 +234,7 @@ below belongs to W5g and W5h.
 | RV4 gate record: optional, closed, outcomes, LCBs, consistency | `test_w7a_gate_record.py` |
 | RV4 `pool.snapshots`, `windows[].snapshot_sha256` | `test_w7a_snapshots.py` |
 | RV4 `params.gate_weights`, `max_source_share`, `min_long_series` | `test_w7a_gate_params.py` (default config, plus one settlement under a non-default overlay), `test_every_params_field_is_required`, `test_e2e_params_carry_every_satellite_value` |
+| W5e gate in the audit: `check_lane_d` re-derives the draw, each result's outcome from its LCBs, the verdicts and the crown; refuses crowns without a passing gate | `test_w7a_audit_gate.py` (see "Correction (W5e gate)") |
 | invariant 11 (exact reasons) | `test_inv11_*` in `test_w7a_inv11_reasons.py`. Covers the coldkey cap (`coldkey_cap_settlement`, the entry stays `pending` with that reason), `deregistered`, `coldkey_unresolved` (`coldkey: null`), `ready_expired`, a floor miss (`pending_floor`, no rows, `rows_sha256` of `[]`), a house-held slot (`house_king`) and a crowned king that deregisters (`deregistered`) |
 
 ## On main
@@ -315,3 +316,58 @@ refuses a crowned report whose `gate` is absent or `null`.
   gate only an uncrowned report validates, and `gate: null` on it is still
   `bad_type at gate`. Their pass/fail on main is unchanged (the first
   passes, the second fails on `unknown_field at gate`, as before).
+
+### Correction (W5e gate): the audit re-derives the gate
+
+W5e wired the §1.3b gate into `settle_lane_d` (`tests/accept/w5e/README.md`
+"Gate wiring", "Fail closed"). A cleared confirmation is no longer always
+`confirmed` / `crowned`, and the W5e README leaves the audit's half of the
+fail-closed rule to W7a ("The audit must refuse it too"). `check_lane_d`
+(`cascade/audit/lane_d.py`, in `PATHS`) today treats the highest-LCB
+`confirmed`/`crowned` verdict as the rightful crown and requires every
+cleared confirmation to read `confirmed`/`crowned`. That rejects honest
+gated reports and accepts crowns the gate never passed. §14.3 items 1-2:
+satellites re-derive every verdict from signed fields, so the audit must
+re-derive the gate's too, from the report and `cfg` alone (invariant 12:
+no import of `cascade.validator.lane_d*`).
+
+`check_lane_d` must re-derive:
+
+| rule | from |
+|---|---|
+| `gate`, when present, is a dict; `gate.block == boundary`; `gate.suite` and `gate.eligible` are the draw `gate_suite_for(gate.block_hash, gate_suites, gate_weights, gate.sentinel)` over `cfg` (the sentinel is never the suite) | W3b1 |
+| a result with LCBs is `pass` iff all four (`king_d`/`house` x `crps`/`mase`) are `>= -tau_public`, else `gate_regression`, with `blocked_by` = the refs that have an LCB below `-tau_public` | W3b2 `paired_gate` |
+| every cleared `stage: "confirm"` verdict has a gate result when `gate` is present; `pass` -> `crowned` or `confirmed`; `gate_regression` / `checkpoint_fault` -> `lost`; `bench_hold` -> `confirmed`, not crowned | W5e outcomes table |
+| without `gate` (the gate could not run, fail closed) a cleared confirmation reads `confirmed` and nothing crowns | W5e "Fail closed" |
+| the crown is the highest-LCB cleared confirmation whose result is `pass`; a `pass` result with no verdict in the report is a held candidate re-gated at this settlement and may be the crown; no `pass` -> `crowned` is `null` and the king is unchanged | W5e "Several candidates", "`bench_hold` keeps the candidate's chance" |
+
+A crowned report whose `gate` is absent or `null`, or whose results hold no
+`pass` for the crowned digest, FAILs. Every FAIL is a typed `CheckResult`.
+
+Tests: `test_w7a_audit_gate.py`. The reports come from real
+`settle_lane_d` calls with the W5e gate inputs, built with W5e's fixtures
+(`tests/accept/w5e/helpers.py`: `settle_gated`, `BenchHost`,
+`bench_table`), plus W7a's own `two_settlements`. Doctored reports are
+re-signed by the validator's key, and each doctored case first requires
+the honest report it starts from to PASS.
+
+| case | expected |
+|---|---|
+| gate `pass` crown (with and without a §16 sentinel); W7a's gated chain | PASS |
+| cleared confirmation `lost` via `gate_regression`; `closed` via `checkpoint_fault`; `bench_hold` (confirmed, not crowned) | PASS |
+| passing runner-up crowned over a regressing max-T best | PASS |
+| held candidate re-gated and crowned at a later settlement, no verdict for it | PASS |
+| ungated (legacy call) reports: a first clear and a loser; an armed crowning candidate held (fail closed, no `gate`) | PASS |
+| crowned with `gate` absent / `null` / no result for the crowned digest / its result `bench_hold` or `gate_regression` | FAIL |
+| `gate.suite` not the draw; `block_hash` that draws another suite; `block != boundary`; the sentinel stated as the suite | FAIL |
+| `pass` with an LCB below `-tau_public`; `gate_regression` with every LCB clear; `blocked_by` naming the wrong ref | FAIL |
+| a `gate_regression` verdict left `confirmed`; a `pass` left uncrowned; a `pass` doctored onto the regressing best (re-derived crown differs); a cleared confirmation missing from `gate.results` | FAIL |
+| a held re-gated crown whose result is `bench_hold` or whose `gate` is gone; an ungated cleared confirmation stated `crowned` | FAIL |
+
+On main (W5e built, the audit not gate-aware) 24 of the 28 tests fail on
+an `assert`: the honest gated outcomes FAIL the audit ("outcome lost not in
+('confirmed', 'crowned')", "crowned None; re-derived ...", "the king changed
+without a confirmed verdict"), and the doctored crowns PASS it because it
+ignores `gate`. Four pass on main: the two honest gate-pass crowns, W7a's
+gated chain and the ungated no-crown reports. Every other W7a test file is
+unchanged.
