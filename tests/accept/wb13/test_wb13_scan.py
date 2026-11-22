@@ -255,8 +255,17 @@ def test_load_pinned_hashset(tmp_path):
     p1, _ = _publish(tmp_path, a1, 1)
     p2, path2 = _publish(tmp_path, a2, 2)
     assert p1 == h.pin_of(a1) and p2 == h.pin_of(a2)
-    assert m.load_pinned_hashset(p1, tmp_path) == a1
-    assert m.load_pinned_hashset(p2, tmp_path) == a2
+    # RV7 B3: the loaded hash set may be WB11's bounded lookup rather than the
+    # dict, so "is that artefact" means: the same header and every hash maps
+    # to the same [suite, window_id] (test_wb13_rv7.py pins that it IS bounded).
+    for pin, a in ((p1, a1), (p2, a2)):
+        lk = m.load_pinned_hashset(pin, tmp_path)
+        for k in ("schema", "version", "window", "stride", "suites"):
+            assert lk[k] == a[k], k
+        for k in ("exact", "normalised"):
+            assert len(lk[k]) == len(a[k]), k
+            for hx, v in a[k].items():
+                assert lk[k].get(hx) == v, (k, hx)
     with pytest.raises(ValueError):
         m.load_pinned_hashset("sha256:" + "0123456789abcdef" * 4, tmp_path)
     tampered = json.loads(path2.read_text())

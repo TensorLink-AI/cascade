@@ -29,6 +29,12 @@
 #                              (the diff is exactly evidence file(s) named in
 #                              the WP's §3.0 Accept cell), ledger mode evidence
 #     MODE review           -> nothing to run (laned:RV<n>)
+#   BATCH (plan rev6.2 (h); BATCH rule in accept --help): check-pr gets every
+#   laned:<WP> label (--pr-wps). A tests-only PR may carry several WPs'
+#   tests/accept/<wp>/ dirs, one label per dir, none of them built on the base;
+#   each WP then runs its own --verification above and is ledger-recorded with
+#   its own tests_tree (every tests-only run records it). A per-WP PASS/FAIL
+#   table is printed and the job fails when any WP fails.
 #   then, every mode but review: `accept <WPs> --cross` re-accepts every OTHER
 #   WP at >= L2 on the base whose tests depend on the PR's changed paths
 #   (imports, string-named paths, PATHS overlap; CROSS rule in accept --help)
@@ -158,18 +164,28 @@ jobs:
           # workflow_dispatch: the entry carries the `sha` input, not the run's
           # head; record the run's head so the harvester can cross-check it.
           run_head=(); [ -n "$RUN_HEAD_SHA" ] && run_head=(--run-head-sha "$RUN_HEAD_SHA")
+          # BATCH rule (accept --help; plan rev6.2 (h)): check-pr sees every
+          # laned:<WP> label, so one tests-only PR may carry several WPs' test
+          # dirs, each only under its own label. Tooling without --pr-wps keeps
+          # the one-WP rule (a batch then fails closed in check-pr).
+          batch_arg=()
+          if grep -q -- '--pr-wps' "$LANED/accept"; then
+            batch_arg=(--pr-wps "$(echo $WPS | tr ' ' ',')")
+          fi
           status=0
+          table=()   # "WP | mode | PASS/FAIL" per WP run, printed below
           for wp in $WPS; do
             echo "::group::$wp"
             if [ "$EVENT" = "workflow_dispatch" ]; then
               mode=tests-only
-            elif out=$(python3 "$LANED/accept" "$wp" --check-pr --base HEAD^1 --head HEAD --root .); then
+            elif out=$(python3 "$LANED/accept" "$wp" --check-pr --base HEAD^1 --head HEAD "${batch_arg[@]}" --root .); then
               echo "$out"
               mode=$(echo "$out" | sed -n 's/^MODE //p')
             else
               echo "$out"
               python3 "$LANED/ci_ledger.py" record --file "$LANED_RESULTS" --wp "$wp" --mode check-pr \
                 --event "$EVENT" --head-sha "$HEAD_SHA" --conclusion failure
+              table+=("$wp | check-pr | FAIL")
               status=1; echo "::endgroup::"; continue
             fi
             # every PR mode but review gets the cross-WP step below
@@ -179,6 +195,7 @@ jobs:
               # evidence/rv<n>.md; a review PR has no tests to run.
               python3 "$LANED/ci_ledger.py" record --file "$LANED_RESULTS" --wp "$wp" --mode check-pr \
                 --event "$EVENT" --head-sha "$HEAD_SHA" --conclusion success
+              table+=("$wp | review | PASS")
               echo "::endgroup::"; continue
             fi
             if [ "$mode" = "evidence" ]; then
@@ -194,6 +211,7 @@ jobs:
                 python3 "$LANED/ci_ledger.py" record --file "$LANED_RESULTS" --wp "$wp" --mode evidence \
                   --event "$EVENT" --head-sha "$HEAD_SHA" --conclusion "$conclusion" \
                   --evidence-sha "$(git rev-parse "HEAD:$ev")"
+                [ "$rc" = 0 ] && table+=("$wp | evidence $ev | PASS") || table+=("$wp | evidence $ev | FAIL")
               done
               echo "::endgroup::"; continue
             fi
@@ -211,9 +229,11 @@ jobs:
               echo "$vout"
               run_mode=$(echo "$vout" | sed -n 's/^LEDGER-MODE //p' | tail -n 1)
               [ -n "$run_mode" ] || run_mode=expect-fail
-              if [ "$run_mode" = "verification" ]; then
-                tree_arg=(--tests-tree "$(echo "$vout" | sed -n 's/^TESTS-TREE //p' | tail -n 1)")
-              fi
+              # this WP's own tests tree, for either ledger mode: the board
+              # attributes the merge commit per WP by it (a batch squash
+              # commit is L1 for each of its WPs through its own tree)
+              tests_tree=$(echo "$vout" | sed -n 's/^TESTS-TREE //p' | tail -n 1)
+              [ -n "$tests_tree" ] && tree_arg=(--tests-tree "$tests_tree")
             elif [ "$mode" = "tests-correction" ]; then
               # tests-only PR for an already-built WP: unchanged tests must pass,
               # changed tests pass or fail for a right reason (accept --help).
@@ -227,8 +247,12 @@ jobs:
             [ "$rc" = 0 ] && conclusion=success || { conclusion=failure; status=1; }
             python3 "$LANED/ci_ledger.py" record --file "$LANED_RESULTS" --wp "$wp" --mode "$run_mode" \
               --event "$EVENT" --head-sha "$HEAD_SHA" --conclusion "$conclusion" "${run_head[@]}" "${tree_arg[@]}"
+            [ "$rc" = 0 ] && table+=("$wp | $run_mode | PASS") || table+=("$wp | $run_mode | FAIL")
             echo "::endgroup::"
           done
+          # per-WP table (a batch tests-only PR fails when any WP fails)
+          { echo "### Accept per WP"; echo; echo "| WP | mode | result |"; echo "|---|---|---|"
+            for row in "${table[@]}"; do echo "| $row |"; done; } | tee -a "$GITHUB_STEP_SUMMARY"
           exit $status
 
       - name: Cross-WP accept (other built WPs whose tests depend on the PR's changes)
