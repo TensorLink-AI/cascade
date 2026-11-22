@@ -86,15 +86,33 @@ FUNDED_REQUEUED, FUNDED_MINER_FAULT = "requeued", "miner_fault"
 
 
 class LaneBOps(Protocol):
-    def commitments(self) -> list: ...                       # chain Commitment rows
-    def contexts(self, domain: str, block: int) -> list: ...  # affinity slice
-    def fetch(self, pointer: str) -> Path: ...
-    def upload(self, ckpt_dir: Path, repo: str) -> str: ...  # -> trained pointer
-    def dispatch_leg(self, leg: OpenLeg, era_index: int, block: int, done) -> None: ...
-    def bench_rows(self, ckpt_dir: Path) -> dict | None: ...
-    def publish_expert_manifest(self, manifest) -> None: ...
-    def judge(self, manifest, round_id: str, block: int) -> list: ...  # ExpertJudgement list
-    def merge_scores(self, pointer: str, block: int) -> list: ...  # held-out acceptance scores
+    def commitments(self) -> list:
+        """The chain's Commitment rows."""
+
+    def contexts(self, domain: str, block: int) -> list:
+        """The domain's affinity slice."""
+
+    def fetch(self, pointer: str) -> Path:
+        """A local directory holding the checkpoint at ``pointer``."""
+
+    def upload(self, ckpt_dir: Path, repo: str) -> str:
+        """Upload ``ckpt_dir``; returns the trained pointer."""
+
+    def dispatch_leg(self, leg: OpenLeg, era_index: int, block: int, done) -> None:
+        """Run ``leg`` on a pod; ``done`` is called when it returns."""
+
+    def bench_rows(self, ckpt_dir: Path) -> dict | None:
+        """The checkpoint's public-benchmark rows (None = unavailable)."""
+
+    def publish_expert_manifest(self, manifest) -> None:
+        """Sign and publish the expert manifest."""
+
+    def judge(self, manifest, round_id: str, block: int) -> list:
+        """The manifest's ExpertJudgement list."""
+
+    def merge_scores(self, pointer: str, block: int) -> list:
+        """The held-out acceptance scores of ``pointer``."""
+
     # DEC-CA-0059 item 8 (optional: an ops without them dispatches unfunded,
     # the pre-funding behaviour the unit fakes keep):
     #   miner_funded: bool                       — legs need a funded entry
