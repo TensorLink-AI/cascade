@@ -21,6 +21,7 @@ dated entries are listed under it (§17.4, "Owner decisions 2026-11-22").
 | (e) | The W18 vault ledger `laned_vault_ledger/1` (current era, entries with statuses / `closed_era`, open disputes) is produced by W17 | W17 row |
 | (f) | A W-S2 warm-start acceptance made at an era-init block is governed by the sentinel of the era that init block opens; a follow-up for the acceptance callers (trainer `accept_candidates`, validator `verify_acceptance`) | §16 Work and tests; W-S2 row |
 | (g) | **Proposed (owner to accept):** new WP W8b wires `settle_lane_d` into the production validator loop (boundary hash, sentinel, bench `SweepSession`, `expect_prior_sha256`, lowfreq, house/king state; then sentinel sweep/board, signed report + receipt, pay into W8 emission only via the report); fail-closed, restart-safe, off or bounded against the weight loop | Lane D core table, W8b row |
+| (h) | **Batch tests-only PRs (owner 2026-11-22).** Implementation, tests-correction, evidence and review PRs stay one WP per PR; a tests-only PR may carry several WPs' `tests/accept/<wp>/` directories, one `laned:<WP>` label per WP, each WP's expect-fail (or verification) accept run executed and ledger-recorded separately, the whole PR failing if any WP's check fails; dependents still only after the dependency's code is on main | §3.1 rule 6 (+ restatements: rev6 change 16, §3.0 Roles, §17 S2 row, risk table "PR hygiene") |
 
 ## rev6.1 (RV1 rubric fixes; main @ bdeed4d, 2026-11-21; RV3 fixes, main @ 45f8b61, 2026-11-22)
 
@@ -381,7 +382,11 @@ and decisions D1–D18 stay as they were in v2. Changes:
     - per-key parse, ALLOWED entry, round-trip and mutation tests, with an
       unread-key script;
     - follower patterns checked by a script;
-    - one PR per WP, dependents only after the dependency is on main;
+    - one PR per WP, dependents only after the dependency is on main
+      **(rev6.2:** implementation, tests-correction, evidence and review PRs
+      stay one WP per PR; a tests-only PR may batch several WPs' tests, one
+      `laned:<WP>` label and one separately recorded accept run per WP;
+      dependents only after the dependency's code is on main**)**;
     - a fresh-context review after every 5 build WPs;
     - blocked beats faked.
 17. **§3 "Services touched"** now lists `deploy_gate` and the trainer
@@ -1506,7 +1511,8 @@ Accept command exits 0**, never on a builder's word. Conventions:
   - **Test author:** writes only `tests/accept/<wp>/` and its `PATHS`, from the
     WP row, its T-rows and the invariants it owns, copied from this plan. The
     tests must fail on main for the right reason (§17.1 L1). Opens a
-    tests-only PR labelled `laned:<WP>`.
+    tests-only PR labelled `laned:<WP>` **(rev6.2:** or one tests-only PR
+    batching several WPs, one `laned:<WP>` label per WP, per §3.1 rule 6**)**.
   - **Builder:** starts from origin/main after L1 and opens ONE implementation
     PR labelled `laned:<WP>`, staged with explicit paths. **A builder never
     edits `tests/accept/`, this plan, `scripts/laned/` or any status file
@@ -1667,9 +1673,15 @@ BLOCKING item, and each finding is either fixed or filed as a WP.
    `follower_patterns.py`.
 6. **(rev6) Each WP has a tests-only PR (`tests/accept/<wp>/`) followed by
    ONE implementation PR.** Explicit paths, no stacks, owner-merged;
-   dependents start only after the dependency is **on main** (verify `git log
+   dependents start only after the dependency's code is **on main** (verify `git log
    origin/main`, never a MERGED badge). This matches rule 1: the tests land
    first and alone, and the implementation PR never touches them.
+   **(rev6.2, owner 2026-11-22)** Implementation, tests-correction, evidence
+   and review PRs stay **one WP per PR**. A **tests-only PR** (new acceptance
+   tests, no implementation yet) MAY carry several WPs' `tests/accept/<wp>/`
+   directories, with one `laned:<WP>` label per WP; each WP's expect-fail (or
+   verification) accept run is executed and ledger-recorded separately, and the
+   whole PR fails if any WP's check fails.
 7. **A fresh-context review WP** after every 5 build WPs reach L3 **(rev6)**.
 8. **Blocked is acceptable; faked completion is not.** If a WP can't be fully
    built, the builder stops and records the blocker in `evidence/blocked/<wp>.md`.
@@ -1899,7 +1911,7 @@ capability release → (rev5) one activation block, live everywhere.**
 | 3 | **S0b Note budget** | Decode the live mainnet readiness notes and add the `cfg-` segment. It's trimmed **last** (`activation.py:1334-1357`), so older pending segments go first | No still-pending segment would be trimmed (type their decided blocks in main first if needed); T22 passes on testnet |
 | 4 | **S0c Overlay bring-up** | Publish a **benign seq-1 overlay** (restates current values only) on testnet, then mainnet. Then a deliberately refused overlay on testnet | The 404-every-poll is gone. Fetched from S3 **and** the HF mirror by our validator, the trainer and satellites. `cfg-` lock ≥ 51% in `status/chain.json`. Receipts stamp `netconfig_seq`; the `cascade-audit` netconfig check passes; the trainer logs the same apply block. The refused overlay applies nothing |
 | 5 | **S1 Measure** | W1, W0b, W3a (live Hippius probe); **(rev5)** start R16 long-history harvest (runs continuously from here, scored only from S8) | Forward floors met at the chosen margin (or re-decided); ≥ 1 context variant has `min_long_series`; storage mechanism chosen |
-| 6 | **S2 Build** | **(rev5) All build WPs**, one PR each: W1.5, W2 (with `ALLOWED["lane_d"]`) then W3–W19, W-S1–W-S3, the WB track (WB10–WB23) and W-EMA | CI green. Receipt replay on the last N mainnet receipts at the release head: **unarmed ⇒ byte-identical; armed ⇒ lane A verdicts, court and lane A weight entries identical, and lane D fields present and schema-valid** (W3b touches `bench_gate.py`/`public_guards.py`, which lane A replays). Startup-gate test of the shipped chain.toml at the live head for validator **and** trainer (T26). Docs gate |
+| 6 | **S2 Build** | **(rev5) All build WPs**, one PR each **(rev6.2: one implementation PR each; tests-only PRs may batch WPs per §3.1 rule 6)**: W1.5, W2 (with `ALLOWED["lane_d"]`) then W3–W19, W-S1–W-S3, the WB track (WB10–WB23) and W-EMA | CI green. Receipt replay on the last N mainnet receipts at the release head: **unarmed ⇒ byte-identical; armed ⇒ lane A verdicts, court and lane A weight entries identical, and lane D fields present and schema-valid** (W3b touches `bench_gate.py`/`public_guards.py`, which lane A replays). Startup-gate test of the shipped chain.toml at the live head for validator **and** trainer (T26). Docs gate |
 | 7 | **S2b Catch-up release** | Ship main-as-of-now **without** lane D code to our validator, trainer and satellites, so the lane D release diffs only the lane D and lane B build WPs (§5 S2) **(rev6)** | 2 settlements with identical vectors; no satellite burn |
 | 8 | **S3 Testnet** | §4 matrix including T22–T29 | §4 exit gate |
 | 9 | **S4 Release** | Cut the **capability release** (lane D unarmed, `lane_d` allow-listed). **(rev5)** Bring up the launch eval host (D11; not valeval-laned, which is rented only at S8) (on-rent check, pinned known_hosts, handshake); dry-run the house. **Stage and review the revert overlay.** Send the announcement (§11.3) | Dry-run within the measured cross-host tolerance; announcement sent; revert overlay reviewed |
@@ -2712,7 +2724,7 @@ type, OA8):**
 | Balance zero / orphan pods | Lium terminated all pods at zero | `runway`; testnet TTLs |
 | Alerts not delivered | `bench_infra` into an empty webhook | delivered test alert in the S6 gate; follower patterns |
 | Contract-digest drift | a runtime field blocked the king leg | lane D touches no contract term; a pending entry is pinned to its `ready` contract |
-| PR hygiene | stacked merges; `git add -u` swept an override | one PR per WP; explicit paths; verify main |
+| PR hygiene | stacked merges; `git add -u` swept an override | one PR per WP (rev6.2: tests-only PRs may batch WPs, §3.1 rule 6); explicit paths; verify main |
 | Identity / disputes | recycled uids | hotkey + digest identity; owner-only archive 14 days |
 | Pool publish fragility | the job died for 6 days | dedicated builder; `pool_d_stale` |
 | Suite identity / partial | FEV scope-skips counted as partial | W3b identity checks |
