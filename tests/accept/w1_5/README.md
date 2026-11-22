@@ -201,10 +201,19 @@ an AREA (for example `ci`).
 
 ### `pool_d` fixture format (`pool_d/1`, one directory per snapshot)
 
-- `metadata.json`: `{"schema": "pool_d/1", "snapshot", "horizon", "series":
-  [{"series_id", "source", "freq", "seasonal_period", "first_target_ts",
-  "end_ts", "target_ts": [h], "first_seen_ts": [h]}]}`. Clusters are
-  `source`.
+- `metadata.json`: `{"schema": "pool_d/1", "snapshot", "horizon", "feeds":
+  {feed: {"mirror_lag_hours", "forecast_product"}}, "series":
+  [{"series_id", "source", "feed", "freq", "seasonal_period",
+  "first_target_ts", "end_ts", "target_ts": [h], "first_seen_ts": [h],
+  "frontier": [[as_of_ts, end_ts]]}]}`. Clusters are `source`.
+- RV3 BLOCKING 1 (accepted change 1(a)): forward-only fails closed on a
+  series with no `frontier` (absent or `null`) and on a feed missing from
+  `feeds`. So every fixture series carries one frontier record (an earlier
+  snapshot taken 3 h before the snapshot's first target, holding data up to
+  1 h before that) and a `feed` listed in `feeds` with a measured
+  `mirror_lag_hours` of 1.0 and `forecast_product = false`. S0 lies after
+  every bound the fixture uses and before every target, so every window stays
+  eligible. `test_fixture_pool_d_carries_end_ts` pins this.
 - `hist.npz` and `tgt.npz`: one float64 array per `series_id`.
 - Window id: `<series_id>:<target_ts[0]>:h64` (§1.3).
 
