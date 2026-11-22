@@ -42,6 +42,16 @@ HOUSE_T = T0 - 2 * 86_400              # the house's T (lane A king published ea
 # max(T_E, T_K) + forward_margin (6 h): every window is forward-eligible.
 SNAPSHOT_START = {1: T0 + 12 * HOUR, 2: T0 + 12 * HOUR + 4 * 86_400}
 FIRST_SEEN_LAG = 1800                  # first-seen = data time + 30 min
+# RV3 BLOCKING 1 (accepted change 1(a)): forward-only fails closed, so every
+# series records its S0 in a ``frontier`` and names a ``feed`` listed in the
+# top-level ``feeds`` block. One frontier record per series, ``[as_of_ts,
+# end_ts]``: the earlier snapshot was taken 3 h before this snapshot's first
+# target (after every bound the fixture uses, max(T0, HOUSE_T) + 6 h), and
+# held data up to 1 h before it was taken, so every target is past end_ts(S0)
+# (no backfill) and every window stays forward-eligible.
+FRONTIER_AS_OF = {snap: start - 3 * HOUR for snap, start in SNAPSHOT_START.items()}
+FRONTIER_END_LAG = HOUR
+FEED_LAG_HOURS = 1.0                   # measured mirror lag, under the 6 h limit
 
 # §1.5 / lane A under quantile_head_after: the 9-level scoring grid.
 SCORING_LEVELS = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
@@ -95,12 +105,21 @@ def make_series(snapshot: int, seed: int) -> list[dict]:
             hist = level + 2.0 * np.sin(2 * np.pi * t / 24 + k) + rng.normal(0, 0.5, HISTORY)
             start = SNAPSHOT_START[snapshot] + (j * PER_SOURCE + k) * HOUR
             target_ts = [int(start + i * HOUR) for i in range(HORIZON)]
+            as_of = FRONTIER_AS_OF[snapshot]
             out.append({
-                "series_id": sid, "source": f"src{j}", "history": hist,
+                "series_id": sid, "source": f"src{j}", "feed": f"src{j}", "history": hist,
                 "target_ts": target_ts,
                 "first_seen_ts": [ts + FIRST_SEEN_LAG for ts in target_ts],
+                "frontier": [[as_of, as_of - FRONTIER_END_LAG]],
             })
     return out
+
+
+def feeds_block(series: list[dict]) -> dict:
+    """The top-level ``feeds`` block: every feed the series name, with a
+    measured lag under the limit and not a forecast product."""
+    return {feed: {"mirror_lag_hours": FEED_LAG_HOURS, "forecast_product": False}
+            for feed in sorted({s["feed"] for s in series})}
 
 
 def write_pool_d(directory: Path, snapshot: int, series: list[dict],
@@ -111,11 +130,13 @@ def write_pool_d(directory: Path, snapshot: int, series: list[dict],
         "schema": "pool_d/1",
         "snapshot": f"w1_5-{snapshot}",
         "horizon": HORIZON,
+        "feeds": feeds_block(series),
         "series": [{
-            "series_id": s["series_id"], "source": s["source"], "freq": "H",
-            "seasonal_period": 24,
+            "series_id": s["series_id"], "source": s["source"], "feed": s["feed"],
+            "freq": "H", "seasonal_period": 24,
             "first_target_ts": s["target_ts"][0], "end_ts": s["target_ts"][-1],
             "target_ts": s["target_ts"], "first_seen_ts": s["first_seen_ts"],
+            "frontier": s["frontier"],
         } for s in series],
     }
     (directory / "metadata.json").write_text(json.dumps(meta, sort_keys=True))

@@ -410,6 +410,12 @@ def test_fixture_pool_d_carries_end_ts(chain_kind):
     for s in meta["series"]:
         assert s["end_ts"] == s["target_ts"][-1] and len(s["target_ts"]) == HORIZON
         assert len(s["first_seen_ts"]) == HORIZON
+        # RV3: forward-only fails closed, so every series records its S0 and
+        # names a feed listed in the snapshot's ``feeds`` block.
+        assert isinstance(s["frontier"], list) and s["frontier"]
+        assert all(end < s["target_ts"][0] for _as_of, end in s["frontier"])
+        assert s["feed"] in meta["feeds"]
+        assert meta["feeds"][s["feed"]]["mirror_lag_hours"] is not None
     with np.load(chain.pool_dirs[1] / "hist.npz") as hist:
         assert all(hist[k].shape == (HISTORY,) for k in hist.files)
     assert file_digest(chain.pool_dirs[1] / "tgt.npz") != file_digest(chain.pool_dirs[2] / "tgt.npz")
