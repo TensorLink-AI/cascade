@@ -60,11 +60,15 @@ import numpy as np
 from ..shared.atomic import read_text_with_backup, write_text_atomic
 from . import expert_lane as _tel
 from .expert_lane import (
+    GATE_TOKENS_SHORT,
+    OPEN_RULE_COGATE,
     LaneBQueue,
     LaneBSubmission,
     OpenLeg,
     RoutingProbe,
     gate_open,
+    needs_king_check,
+    open_rule_verdict,
     routing_metrics,
     routing_stale_union,
     settle_leg,
@@ -126,6 +130,9 @@ class LaneBOps(Protocol):
     #   miner_funded: bool                       — legs need a funded entry
     #   def funded_queue(self): ...              — funding LaneBQueue | None
     #   def hotkey_busy(self, hotkey) -> bool: ...  — a lane-A / lane-C leg runs
+    # WB17 (D41 a; optional: absent reads as no readable check):
+    #   def king_check(self) -> dict | None: ...  — the latest lane A king check
+    #     of the validators' signed receipt (DEC-CA-0055), read only
 
 
 @dataclass
@@ -179,6 +186,17 @@ class LaneBDriverState:
     # re-closes — in-flight legs anchor on the king's routing, and later
     # drift is caught per leg by the rebase ``routing_stale`` check
     gate_opened_block: int = 0
+    # WB17 (D41 / LB4): the ``[lane_b] open_rule`` the gate opened under and
+    # the facts that satisfied it (strict JSON: lineage_tokens, open_tokens,
+    # and the passing receipt king_check under ``tokens_king_check``). Written
+    # once, at opening, and never rewritten (the latch above); "" / {} while
+    # closed and for a state file that latched before WB17
+    gate_rule: str = ""
+    gate_evidence: dict = field(default_factory=dict)
+    # while closed under a token rule: "tokens_short" | "king_check_not_passed"
+    # | "king_check_unavailable" (the co-gate records "tokens_short" when the
+    # lineage is short, else "" with its free-text reason in ``routing``)
+    gate_closed_reason: str = ""
     # legs dropped at settlement without a verdict: {round_id, hotkey, uid,
     # domain, gen_ref, leg_pointer, base_king_ref, king_pointer, outcome
     # ("stale" | "routing_stale" | "merge_refused"), detail}
@@ -775,6 +793,10 @@ class LaneBDriver:
             want = {t for s in self.queue.next_dispatchable(lb, esft_eligible)
                     for t in s.declared}
             self.save()
+        # WB17 (D41 / LB4): the configured opening rule; the co-gate is the
+        # default and runs exactly as before
+        rule = str(getattr(lb, "open_rule", OPEN_RULE_COGATE) or OPEN_RULE_COGATE)
+        cogate = rule == OPEN_RULE_COGATE
         # ── routing saturation + current-king probes: OUTSIDE the lock ──
         routing: dict[str, dict] = {}
         if prev:
@@ -784,29 +806,56 @@ class LaneBDriver:
                                                  self._probe(king_pointer, king_pointer, d, block),
                                                  lb)
             except Exception as e:  # noqa: BLE001
-                if not latched:
-                    raise                # closed gate: surface it (the tick retries)
+                if not latched and cogate:
+                    raise                # closed co-gate: surface it (the tick retries)
+                # a latched gate, or a token rule (routing is telemetry there)
                 log.warning("lane B: routing-saturation measurement failed: %s", e)
                 routing = {}
+        # the lane A king check is a store read: OUTSIDE the lock, only while
+        # a closed tokens_king_check gate has its tokens met
+        check = None
+        if not latched and needs_king_check(rule) \
+                and self.st.lineage_tokens >= lb.open_tokens:
+            check = self._read_king_check()
+        if cogate:
+            may_open = bool(prev and self.st.lineage_tokens >= lb.open_tokens)
+        else:
+            may_open = open_rule_verdict(rule, self.st.lineage_tokens, lb, check)[0]
         probes: dict[str, RoutingProbe] = {}
-        if want and (latched or (prev and self.st.lineage_tokens >= lb.open_tokens)):
+        if want and (latched or may_open):
             for d in sorted(want):
                 probes[d] = self._probe(king_pointer, king_pointer, d, block)
         with self._lock:
             if routing:
                 self._record_routing(era_index, block, prev, king_pointer, routing)
             if not latched:
-                ok, why = gate_open(self.st.lineage_tokens, routing, lb)
-                self.st.routing["open"], self.st.routing["reason"] = ok, why
+                if cogate:
+                    ok, why = gate_open(self.st.lineage_tokens, routing, lb)
+                    self.st.routing["open"], self.st.routing["reason"] = ok, why
+                    reason = (GATE_TOKENS_SHORT if self.st.lineage_tokens < lb.open_tokens
+                              else "")
+                    evidence = {"lineage_tokens": int(self.st.lineage_tokens),
+                                "open_tokens": int(lb.open_tokens),
+                                "king": king_pointer, "prev_king": prev} if ok else {}
+                else:
+                    ok, reason, evidence = open_rule_verdict(
+                        rule, self.st.lineage_tokens, lb, check)
+                    why = reason or "open"
                 if not ok:
+                    self.st.gate_closed_reason = reason
                     self._deferred = []
                     self.save()
-                    log.info("lane B: gate closed (%s)", why)
+                    log.info("lane B: gate closed under open_rule=%s (%s)", rule, why)
                     return []
                 self.st.gate_opened_block = int(block)
-                log.info("lane B: gate OPEN at block %d (era %d, king %s vs previous %s; "
-                         "lineage %.3g tokens) — latched", block, era_index, king_pointer,
-                         prev, self.st.lineage_tokens)
+                self.st.gate_rule = rule
+                self.st.gate_evidence = {**evidence, "block": int(block),
+                                         "era": int(era_index)}
+                self.st.gate_closed_reason = ""
+                log.info("lane B: gate OPEN at block %d under open_rule=%s (era %d, king %s "
+                         "vs previous %s; lineage %.3g tokens; evidence %s) — latched", block,
+                         rule, era_index, king_pointer, prev, self.st.lineage_tokens,
+                         json.dumps(self.st.gate_evidence, sort_keys=True))
             sentinel_rows = self._record_sentinel(holds, sentinel, funded, int(era_index))
             started, deferred_rows = [], []
             if declared:
@@ -862,6 +911,21 @@ class LaneBDriver:
                     f"expert dispatch failed: {e}", miner_fault=False,
                     error_class="operator_transient", burn=False))
         return started
+
+    def _read_king_check(self) -> dict | None:
+        """The ops' latest lane A king check (WB17, D41 a), or ``None`` when
+        the ops has no such read, it returns no record, or the read fails (a
+        closed gate then records ``king_check_unavailable`` and retries next
+        tick)."""
+        read = getattr(self.ops, "king_check", None)
+        if not callable(read):
+            return None
+        try:
+            rec = read()
+        except Exception as e:  # noqa: BLE001 — an unreadable check keeps the gate closed
+            log.warning("lane B: lane A king check unreadable: %s", e)
+            return None
+        return dict(rec) if isinstance(rec, dict) else None
 
     def _prev_king(self, era_index: int, king_pointer: str) -> str | None:
         """The gate's reference: the latest king of an EARLIER era whose
@@ -1213,6 +1277,9 @@ class LaneBDriver:
                 "leg_hours": float(lb.leg_hours),
                 "legs_per_domain": int(lb.legs_per_domain),
                 "gate_opened_block": int(self.st.gate_opened_block),
+                "open_rule": str(getattr(lb, "open_rule", OPEN_RULE_COGATE)),
+                "gate_rule": str(self.st.gate_rule),
+                "gate_closed_reason": str(self.st.gate_closed_reason),
                 "queue": queue,
                 "pending": len(self.queue.pending),
                 "open": [{"hotkey": leg.sub.hotkey, "uid": int(leg.sub.uid),
@@ -1543,6 +1610,13 @@ class RunnerLaneBOps:
                         float(getattr(r, "chain_read_timeout_s", 60.0) or 60.0)))
                 if callable(wd) else list(self.client.poll_commitments()))
         return remember_owners(r, rows)
+
+    def king_check(self) -> dict | None:
+        """The latest lane A king check (DEC-CA-0055 ``king_check`` record)
+        of the validators' signed receipt, through the runner's verified
+        receipt read (WB17, D41 a); ``None`` when none is readable. Read only."""
+        got = self.r._receipt_king_check()
+        return None if got is None else dict(got[0])
 
     def block_hash(self, block: int) -> str:
         """The chain's hash of ``block`` (read-only): the era-start hash the
