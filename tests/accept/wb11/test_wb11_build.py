@@ -17,7 +17,7 @@ from .helpers import (
     HASH,
     NAN_AT,
     SCHEMA,
-    SIG_FIGS,
+    SCHEMA_V1,
     STRIDE,
     SUITE_KEYS,
     WINDOW,
@@ -46,11 +46,29 @@ def test_artefact_schema_and_recorded_parameters():
     norm = a["normalisation"]
     assert norm["method"] == "zscore", norm
     assert norm["scope"] == "subwindow", norm
-    assert norm["sig_figs"] == SIG_FIGS, norm
+    # Schema 2 drops v1's relative rounding: the record must not still claim it.
+    assert "sig_figs" not in norm, f"schema 2 normalisation still records sig_figs: {norm}"
     assert set(a["suites"]) == set(SUITE_KEYS)
     m = mod()
-    assert m.WINDOW == WINDOW and m.STRIDE == STRIDE and m.SIG_FIGS == SIG_FIGS
+    assert m.WINDOW == WINDOW and m.STRIDE == STRIDE
     assert m.SCHEMA == SCHEMA
+
+
+def test_a_schema_1_artefact_is_refused(tmp_path):
+    """v1's normalised encoding (4 significant figures) misses rounded copies at
+    small scales, and no v1 artefact was ever pinned (chain.toml [lane_b]
+    contamination_hashset is ""). Loading one under schema 2 would silently
+    match nothing normalised, so ``load_artefact`` refuses it."""
+    m = mod()
+    a = build()
+    a["schema"] = SCHEMA_V1
+    p = tmp_path / "hashset-v1.json"
+    p.write_bytes(canonical_bytes(a))
+    try:
+        m.load_artefact(p)
+    except ValueError:
+        return
+    raise AssertionError(f"load_artefact accepted a {SCHEMA_V1} artefact; schema 2 must refuse it")
 
 
 def test_artefact_suite_identities_follow_the_w3b4_formula():
