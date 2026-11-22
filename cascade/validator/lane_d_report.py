@@ -283,11 +283,24 @@ def _check_gate(report: dict) -> None:
     if gate["suite"] not in gate["eligible"]:
         raise ReportSchemaError("bad_value", "gate.suite", "not one of gate.eligible")
     seen: set[str] = set()
+    judged = {v["digest"] for v in report["verdicts"]}
     for i, res in enumerate(gate["results"]):
         if res["digest"] in seen:
             raise ReportSchemaError("bad_value", f"gate.results[{i}].digest",
                                     "digest swept twice")
         seen.add(res["digest"])
+        # RV7 B2: only a held candidate (no verdict here) names its hold,
+        # an earlier settlement's. Whether every held result carries one is
+        # the audit's to check (check_lane_d), with the chain behind it.
+        at = f"gate.results[{i}].held_from"
+        if "held_from" not in res:
+            continue
+        if res["digest"] in judged:
+            raise ReportSchemaError("unknown_field", at,
+                                    "a result with a verdict this settlement is not held")
+        if res["held_from"]["boundary"] >= report["boundary"]:
+            raise ReportSchemaError("bad_value", f"{at}.boundary",
+                                    "the hold is not an earlier settlement")
     crowned = report["crowned"]
     if crowned is not None and not any(res["digest"] == crowned and res["outcome"] == "pass"
                                        for res in gate["results"]):

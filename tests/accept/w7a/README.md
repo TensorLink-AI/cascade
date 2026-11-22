@@ -235,6 +235,7 @@ below belongs to W5g and W5h.
 | RV4 `pool.snapshots`, `windows[].snapshot_sha256` | `test_w7a_snapshots.py` |
 | RV4 `params.gate_weights`, `max_source_share`, `min_long_series` | `test_w7a_gate_params.py` (default config, plus one settlement under a non-default overlay), `test_every_params_field_is_required`, `test_e2e_params_carry_every_satellite_value` |
 | W5e gate in the audit: `check_lane_d` re-derives the draw, each result's outcome from its LCBs, the verdicts and the crown; refuses crowns without a passing gate | `test_w7a_audit_gate.py` (see "Correction (W5e gate)") |
+| RV7 B2: held-crown provenance (`held_from`), the confirmation's first clear, the seed, `king_before`, the era sentinel, W3b5 lowfreq fails; chain mode | `test_w7a_audit_provenance.py` (see "Correction (RV7 B2)") |
 | invariant 11 (exact reasons) | `test_inv11_*` in `test_w7a_inv11_reasons.py`. Covers the coldkey cap (`coldkey_cap_settlement`, the entry stays `pending` with that reason), `deregistered`, `coldkey_unresolved` (`coldkey: null`), `ready_expired`, a floor miss (`pending_floor`, no rows, `rows_sha256` of `[]`), a house-held slot (`house_king`) and a crowned king that deregisters (`deregistered`) |
 
 ## On main
@@ -371,3 +372,140 @@ without a confirmed verdict"), and the doctored crowns PASS it because it
 ignores `gate`. Four pass on main: the two honest gate-pass crowns, W7a's
 gated chain and the ungated no-crown reports. Every other W7a test file is
 unchanged.
+
+### Correction (RV7 B2): the crown's provenance, not only its gate
+
+RV7 B2 (`evidence/rv7.md`): #649's `check_lane_d` and `verify_report` PASS
+two forged crowns once the validator key re-signs them:
+
+- (a) any listed entry with a gate `pass` and no verdict is taken as a held
+  candidate, so an entry still `pending` / `pending_floor` that was never
+  judged can be crowned;
+- (b) `cohorts[].stage` is taken on trust, so a first duel relabelled
+  `confirm` crowns in ONE settlement. That skips §1.3's mandatory
+  confirmation duel (the D20 / A2 false-crown bound).
+
+It also takes on trust (c) `report.seed`, the KING_D of a stage-`first`
+cohort and `gate.sentinel`. W3b5 (#651) adds (d): a cleared confirmation
+whose A10 `lowfreq` block reads `fail` is `lost`, so the audit must expect
+that instead of a gate outcome.
+
+§1.5 / §14.3 items 1-2: satellites re-derive every verdict from signed
+fields. A crown therefore needs signed provenance, and the audit checks it.
+
+#### New report field (W7a implementer: schema, producer, validator)
+
+`gate.results[].held_from`: optional and closed. It's present on a result
+**iff** that result is a held candidate re-gated without a verdict at this
+settlement. It's absent (never `null`, which is `bad_type`) on a result
+whose candidate has a verdict here. All five keys are required:
+
+| key | value |
+|---|---|
+| `boundary` | int: the settlement where the entry's confirmation cleared and the gate first held it (`bench_hold`, or no gate record: the fail-closed legacy call). It's the entry's `gate_hold.boundary`, which keeps its first record across later holds |
+| `report_sha256` | 64-hex: that settlement's report body digest (`lane_d_state.report_digest`: sha256 over the canonical body without `signature`) |
+| `set_sha256` | 64-hex: that confirmation cohort's `set_sha256` (`gate_hold.set_sha256`) |
+| `lcb` | number: that confirmation verdict's KING_D `lcb` (`gate_hold.lcb`) |
+| `king_d` | 64-hex: the KING_D the hold was taken under (`gate_hold.king_d`) |
+
+Producer: when `gate_hold` is first written it doesn't know the report
+digest yet. Store it in `gate_hold.report_sha256` once `report_digest` is
+computed and before `save_state`. The W7c state parser must accept the key.
+Then copy the hold into the held candidate's gate result. The schema file
+describes `held_from` as a `$defs` object with
+`additionalProperties: false`. No other report field changes:
+`confirmation.first_set_sha256` / `first_king_digest` already exist, and
+the stage `confirm` rules below apply to them.
+
+#### `check_lane_d` contract
+
+`check_lane_d(report, cfg, *, signer_hotkey, prior_reports=None, era_sentinel=<unset>)`.
+Both new keywords are optional, so every existing caller keeps its
+behaviour.
+
+These single-report rules always apply (FAIL on breach):
+
+| rule | RV7 |
+|---|---|
+| `seed == f"lane-d/1:{boundary}:{pool.sha256}"` | (c) |
+| a stage-`first` cohort's `king_digest == king_before.digest` | (c) |
+| a stage-`confirm` verdict has a 64-hex `first_set_sha256` that differs from its cohort's `set_sha256`, `first_king_digest ==` its cohort's `king_digest`, and `confirmation.stage == "confirm"`. Under `confirm_on_king_change = "restart"`, its cohort's king is `king_before.digest` | (b) |
+| a held result (gate result, no verdict, a listed entry) carries `held_from` with exactly the five keys, `boundary <` the report's boundary, a finite `lcb >= d_margin`, and, under `restart`, `king_d == king_before.digest` (a king change drops a hold). A verdict-backed result carries no `held_from` | (a) |
+| a cleared `confirm` verdict whose `lowfreq.result` is `pass`/`fail` has `lowfreq.lcb`. Its result is re-derived: `fail` iff some LCB `< -tau_public`. A `fail` must read `lost`, needs no gate result (one is a FAIL), and is never in the passing set. `no_windows` / `pass` go to the gate as before | (d) |
+
+**Chain mode** (`prior_reports` given): this is what W9 runs. The list holds
+the earlier signed reports the auditor has, in any order. A prior report
+counts as evidence only if its signature verifies under `signer_hotkey`. In
+chain mode, each of the following must be shown, or the check FAILs:
+
+- **Each confirm verdict's first clear.** Some earlier verified report must
+  have a stage-`first` cohort with `set_sha256 == first_set_sha256` and
+  `king_digest == first_king_digest` that lists the digest as a member. Its
+  verdict there must be cleared and `confirm_pending`, and its `window_ids`
+  must be disjoint from the confirming cohort's.
+- **Each `held_from`.** The verified report at `held_from.boundary` must
+  exist, and its body digest must equal `report_sha256`. In it, the digest's
+  verdict must be stage `confirm`, cleared and `confirmed`, with
+  `lcb == held_from.lcb` and `king_digest == held_from.king_d`. Its cohort's
+  `set_sha256` must equal `held_from.set_sha256`. Its gate record must be
+  absent or hold a `bench_hold` result for the digest.
+
+A structurally valid but invented `held_from` or `first_set_sha256` can only
+be caught here, which is why W9 must always audit with the chain.
+
+**`era_sentinel`** is the era's W-S1 receipt record, `{"suite", "block",
+"block_hash"}`, or `None` when W-S1 is unarmed for the settlement's era. When
+it's given and the report has a `gate`, `gate.sentinel` must equal
+`era_sentinel["suite"]` (or be `null` for `None`). Re-deriving the record
+from its block hash is the receipt audit's job (W-S1). Left unset, nothing
+about the sentinel is checked (today's behaviour).
+
+#### Tests (`test_w7a_audit_provenance.py`)
+
+The reports come from real `settle_lane_d` calls. They reuse the W5e
+scenarios from `test_w7a_audit_gate._build` and add two:
+
+- `pending`: RV7's reproducer, with Y `pending_floor`.
+- `challenger`: Y's first duel against a miner KING_D with the house bar.
+
+W3b5's T4b chain supplies a lowfreq `fail`, and W7a's `two_settlements` is
+used too. Each doctored case first requires its honest report to PASS.
+
+| case | expected |
+|---|---|
+| the hold run's crown carries `held_from` naming the boundary(2) hold (boundary, digest, set, lcb, king); verdict-backed results carry none; the schema describes it closed, optional, `null` / extra / missing keys refused | producer + schema |
+| honest held crown alone and in chain mode; every honest `s2` (pass, sentinel, regression, fault, hold, runner-up, W7a's chain) in chain mode; an honest lowfreq `fail` alone and in chain mode | PASS |
+| RV7 (a): a never-judged entry crowned as held (no `held_from`); the same with an invented `held_from` (chain `[]`) | FAIL |
+| `held_from` absent, `boundary` not earlier, `lcb < d_margin`, `king_d` not `king_before`; `held_from` on a verdict-backed result | FAIL |
+| chain mode: `held_from` naming the first-clear report, wrong `report_sha256` / `set_sha256` / `lcb`, hold report missing, hold report's signature invalid | FAIL |
+| RV7 (b): first duel relabelled `confirm` (null first set); the same with an invented first set (chain `[]`); a confirm verdict with first set null / equal to its own set, first king null / not the cohort king | FAIL |
+| chain mode: first clear's report absent; `first_set_sha256` naming no first-stage cohort; the first clear's report doesn't verify | FAIL |
+| (c): a ground seed with every LCB re-run under it (both settlements); a first duel relabelled as judged against the house instead of `king_before`; `gate.sentinel` against `era_sentinel` (null in an armed era, stated in an unarmed one, another suite, a re-stated self-consistent draw) | FAIL (the matching honest era records PASS) |
+| (d): a lowfreq `fail` doctored to crowned (with a forged gate `pass`), to crowned with `result: "pass"`, to `result: "pass"` still `lost`, to `confirmed` | FAIL |
+
+The (d) tests skip ("W3b5 (#651) not on this base") while the producer
+writes no `verdicts[].lowfreq.lcb`, which means until #651 lands.
+
+**On main** (`4ae3f41`): 29 fail, 2 pass and 5 skip (d).
+
+- Every doctored single-report case fails on an `assert` because main's
+  audit PASSes the forgery.
+- The `held_from` producer and schema tests fail on an `assert` because the
+  field is absent.
+- The chain-mode and `era_sentinel` cases fail on an `assert` that
+  `check_lane_d` takes no `prior_reports` / `era_sentinel`.
+- `test_results_with_a_verdict_carry_no_held_from` and
+  `test_held_from_on_a_verdict_backed_result_fails_the_audit` pass on main.
+  The second passes for an incidental reason: main's closed `_RESULT_KEYS`
+  refuses the extra key.
+
+Once #651 lands on main without this fix, the five (d) cases fail on an
+`assert`. The honest lowfreq `fail` FAILs main's audit with "outcome lost
+!= re-derived confirmed".
+
+A scratch prototype of this contract (not committed) passed every W7a test
+with and without #651 merged, plus the w3b5, w5b, w5c, w5e, w7c, w8 and w1_5
+suites. That shows the contract can be built and that every honest fixture
+report PASSes.
+
+`test_w7a_audit_gate.py` and every other W7a test file are unchanged.

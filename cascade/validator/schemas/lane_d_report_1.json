@@ -360,6 +360,19 @@
         "house": {"$ref": "#/$defs/gate_lcb_pair"}
       }
     },
+    "held_from": {
+      "type": "object",
+      "description": "RV7 B2: present on a gate result iff its candidate is held (re-gated without a verdict at this settlement): the settlement whose confirmation cleared and first went bench_hold, that report's body digest (sha256 of the canonical body without signature), the confirmation cohort's set_sha256, its KING_D lcb and the KING_D the hold was taken under. Absent (never null) otherwise.",
+      "required": ["boundary", "report_sha256", "set_sha256", "lcb", "king_d"],
+      "additionalProperties": false,
+      "properties": {
+        "boundary": {"type": "integer", "minimum": 0},
+        "report_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "set_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "lcb": {"type": "number"},
+        "king_d": {"$ref": "#/$defs/digest"}
+      }
+    },
     "gate_result": {
       "type": "object",
       "description": "W3b2 paired_gate projected (no free text): the four LCBs iff the outcome is pass or gate_regression; blocked_by non-empty iff gate_regression.",
@@ -370,7 +383,8 @@
         "outcome": {"$ref": "#/$defs/gate_outcome"},
         "lcb": {"$ref": "#/$defs/gate_lcbs"},
         "blocked_by": {"type": "array", "items": {"$ref": "#/$defs/gate_ref"}},
-        "session": {"type": "string", "minLength": 1}
+        "session": {"type": "string", "minLength": 1},
+        "held_from": {"$ref": "#/$defs/held_from"}
       },
       "if": {"properties": {"outcome": {"const": "gate_regression"}}},
       "then": {"properties": {"lcb": {"type": "object"}, "blocked_by": {"minItems": 1}}},
