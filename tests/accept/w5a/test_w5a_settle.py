@@ -35,6 +35,7 @@ from .helpers import (
     case,
     feeds_block,
     fixture_key,
+    gate_inputs,
     lane_d_cfg,
     oracle_reason,
     quantiles_around,
@@ -63,12 +64,15 @@ def _entry(name: str, reveal_ts: int) -> dict:
 
 
 def _settle(cfg, boundary, pool_dir, entries, house, forecasts, uid_of, state_path):
+    """`settle_lane_d`, with the W5e gate inputs when it accepts them
+    (`helpers.gate_inputs`): the e2e skeleton crowns at BOUNDARY_2."""
     from cascade.validator.lane_d import settle_lane_d
 
     return settle_lane_d(cfg=cfg, boundary=boundary, pool_dir=pool_dir,
                          entries=[dict(e) for e in entries], house=dict(house),
                          forecasts=forecasts, uid_of=dict(uid_of), state_path=state_path,
-                         signer=fixture_key("signer"))
+                         signer=fixture_key("signer"),
+                         **gate_inputs(boundary, house["digest"]))
 
 
 def _good_forecasts(series, digests, spread=0.5):
