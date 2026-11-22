@@ -22,7 +22,8 @@ included), the cross-field rules of :func:`_cross_field` (snapshot binding,
 a crowned report carries a gate record (W5e, RV5) holding a ``pass`` for the
 crowned digest, the gate record's consistency with the report, the
 W5c house bar's ``house_digest`` / ``verdicts[].house`` binding,
-``gate_weights`` keys), and
+``gate_weights`` keys, the W3b5 ``verdicts[].lowfreq`` LCBs present exactly
+for ``pass``/``fail`` and consistent with ``tau_public``), and
 ``rows_sha256`` is the canonical digest of ``rows`` (checked last). The
 signature is :func:`verify_report`'s job.
 
@@ -282,11 +283,24 @@ def _check_gate(report: dict) -> None:
     if gate["suite"] not in gate["eligible"]:
         raise ReportSchemaError("bad_value", "gate.suite", "not one of gate.eligible")
     seen: set[str] = set()
+    judged = {v["digest"] for v in report["verdicts"]}
     for i, res in enumerate(gate["results"]):
         if res["digest"] in seen:
             raise ReportSchemaError("bad_value", f"gate.results[{i}].digest",
                                     "digest swept twice")
         seen.add(res["digest"])
+        # RV7 B2: only a held candidate (no verdict here) names its hold,
+        # an earlier settlement's. Whether every held result carries one is
+        # the audit's to check (check_lane_d), with the chain behind it.
+        at = f"gate.results[{i}].held_from"
+        if "held_from" not in res:
+            continue
+        if res["digest"] in judged:
+            raise ReportSchemaError("unknown_field", at,
+                                    "a result with a verdict this settlement is not held")
+        if res["held_from"]["boundary"] >= report["boundary"]:
+            raise ReportSchemaError("bad_value", f"{at}.boundary",
+                                    "the hold is not an earlier settlement")
     crowned = report["crowned"]
     if crowned is not None and not any(res["digest"] == crowned and res["outcome"] == "pass"
                                        for res in gate["results"]):
@@ -324,6 +338,39 @@ def _check_house(report: dict) -> None:
                                     "not the cohort's house_digest")
 
 
+def _check_lowfreq(report: dict) -> None:
+    """W3b5 (A10): a verdict's ``lowfreq.lcb`` is present iff its result is
+    ``pass`` or ``fail``; an evaluated block has at least one window and an
+    empty one (``no_windows``) none; ``fail`` iff some LCB is below
+    ``-tau_public``; and a ``fail`` is a cleared confirmation that is
+    ``lost`` (never crowned or held)."""
+    for i, v in enumerate(report["verdicts"]):
+        at = _join(_join("verdicts", i), "lowfreq")
+        lf = v["lowfreq"]
+        evaluated = lf["result"] in ("pass", "fail")
+        if evaluated and "lcb" not in lf:
+            raise ReportSchemaError("missing_field", _join(at, "lcb"))
+        if not evaluated and "lcb" in lf:
+            raise ReportSchemaError("unknown_field", _join(at, "lcb"),
+                                    f"result {lf['result']} carries no LCBs")
+        if evaluated and lf["n_windows"] < 1:
+            raise ReportSchemaError("bad_value", _join(at, "n_windows"),
+                                    "an evaluated slice has at least one window")
+        if lf["result"] == "no_windows" and lf["n_windows"] != 0:
+            raise ReportSchemaError("bad_value", _join(at, "n_windows"), "no_windows is empty")
+        if not evaluated:
+            continue
+        worst = min(float(lf["lcb"][r][m]) for r in GATE_REFS for m in ("crps", "mase"))
+        want = "fail" if worst < -float(lf["tau_public"]) else "pass"
+        if lf["result"] != want:
+            raise ReportSchemaError("bad_value", _join(at, "result"),
+                                    f"the worst LCB {worst} gives {want}")
+        if want == "fail" and not (v["stage"] == "confirm" and v["cleared"]
+                                   and v["outcome"] == "lost"):
+            raise ReportSchemaError("bad_value", _join(_join("verdicts", i), "outcome"),
+                                    "a lowfreq fail is a cleared confirmation that is lost")
+
+
 def _check_gate_weights(report: dict) -> None:
     """``params.gate_weights`` names only ``params.gate_suites`` members."""
     suites = set(report["params"]["gate_suites"])
@@ -338,6 +385,7 @@ def _cross_field(report: dict) -> None:
     _check_gate_weights(report)
     _check_snapshots(report)
     _check_house(report)
+    _check_lowfreq(report)
     if report["crowned"] is not None and not isinstance(report.get("gate"), dict):
         # W5e (RV5): nothing crowns ungated (the schema's top-level
         # conditional states the same rule).

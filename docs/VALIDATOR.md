@@ -673,6 +673,63 @@ keeping `chain.toml` current.
   needs the release supporting these keys once; later supported changes
   need neither a restart nor an update. An overlay cannot install new code.
 
+## Lane B track: what validators check
+
+The lane B track adds suite targets, miner-declared expert rows, a choice of
+opening rule and the sentinel interaction. The checked-in templates ship it
+unarmed: `[lane_b] suite_targets = false`, `[lane_b] contamination_hashset = ""`
+and `open_rule = "cogate"`. At those defaults no consensus surface reads the
+track keys, so no contract, verdict or receipt digest moves. You configure
+nothing beyond keeping `chain.toml` current.
+
+**The hash-set pin is release-only.** `[lane_b] contamination_hashset` pins
+the benchmark hash set the funding intake scans submissions against
+(`sha256:<64 hex>`, or `""` for none). It is release-only. An owner-signed
+overlay that sets it is refused by the network-config loader, the same way
+as the burn destinations. Every other `[lane_b]` track key can change by
+overlay. The pin names a `benchmarks/contamination/hashset-v<n>.json`
+artefact that ships with the release. When no artefact matches the pin, the
+intake fails closed and funds nothing.
+
+**Contamination receipt.** While the pin is set, every lane B fund the intake
+accepts carries a `contamination` receipt, stored on the queue entry:
+`{hashset_version, result, suite, window_id}`. `hashset_version` is the version of
+the pinned artefact, and `result` is `clean` for an accepted entry. An
+`embedded` or `budget_exceeded` tree is refused at intake and never reaches
+a leg, so nothing reaches you to judge.
+
+**Declared rows.** A miner may name the expert rows a leg trains
+(`declared_rows`, keyed by MoE ordinal). The intake checks them against the
+per-layer clamp (`min_experts_frac` / `max_experts_frac`) and binds them to
+the hotkey signature. Declared rows change only which rows the leg trains.
+The leg is judged by the same qualification and merge-acceptance code as a
+leg whose rows the trainer picked.
+
+**The sentinel is neither a guard nor a target for its era.** With the
+cross-lane sentinel armed (`[v2] sentinel_from_block`), the era's sentinel
+suite is left out of the lane B public guards and is not required that era.
+A suite-target entry aimed at it is deferred by the trainer
+(`deferred: sentinel_target`), so it is never judged on that suite in that
+era. Every other suite pairs exactly as when the sentinel is unarmed, and an
+unarmed sentinel leaves the judgement byte-identical.
+
+**The opening rule and the gate record.** `open_rule` selects how lane B
+opens. `cogate` (the default) needs the lineage's `open_tokens` and stable
+routing against the previous king. `tokens` needs only the tokens.
+`tokens_king_check` needs the tokens and a passing lane A king check in your
+signed receipts. The trainer latches the gate once and records:
+
+| Field | Meaning |
+|---|---|
+| `gate_rule` | The `open_rule` the gate opened under; empty while closed. |
+| `gate_evidence` | The facts that satisfied it: `lineage_tokens`, `open_tokens`, the block and era and, under `tokens_king_check`, the receipt's `king_check` record. |
+| `gate_closed_reason` | While closed: `tokens_short`, `king_check_not_passed` or `king_check_unavailable`. |
+
+`status/lane_b.json` publishes `open_rule`, `gate_rule`,
+`gate_closed_reason` and `gate_opened_block`. Under `tokens_king_check`, the
+`king_check` in `gate_evidence` comes from the validators' own receipt, so
+you can compare it with your receipt for the same round.
+
 ## Satellite validators (DEC-CA-0058)
 
 A satellite does not evaluate anything. It replays the main validator's
