@@ -5,8 +5,11 @@ domain-expert competition, hooked into the rolling scheduler at three points:
                  (``metro-v1:expert:<domain>:hippius:<ref>``) into the queue,
                  measure routing saturation (previous era's king vs the
                  current one), check the opening gate (a one-way latch), plan
-                 an ESFT selection on the CURRENT era king and dispatch at
-                 most ``legs_per_domain`` per domain;
+                 the declared-row entries first (WB15: their own rows, in
+                 reveal order; an overlap with held rows is deferred
+                 uncharged, ``deferred: rows_held``), then an ESFT selection
+                 on the CURRENT era king excluding every held row, and
+                 dispatch at most ``legs_per_domain`` per domain;
 * ``settle``   — after each settlement manifest is published: drop legs that
                  are era-stale or ``routing_stale`` (the current king routes
                  their domain to different experts than their base king),
@@ -63,6 +66,16 @@ from .expert_lane import (
     routing_stale_union,
     settle_leg,
     union_selection,
+)
+from .row_claims import (
+    claim_key,
+    deferred_row,
+    first_overlap,
+    has_capacity,
+    leg_holder,
+    merge_holder,
+    normalise_rows,
+    target_load,
 )
 from .runner_generation import leg_corpus
 
@@ -187,6 +200,9 @@ class LaneBDriver:
         # Scientific expiry is not physical termination: a stale worker can
         # still own the hotkey's pod and harvest directory until its callback.
         self._running: dict[int, OpenLeg] = {}
+        # WB15: the declared claims the latest tick deferred (``deferred:
+        # rows_held`` rows of ``status/lane_b.json``); re-derived every tick
+        self._deferred: list[dict] = []
 
     # ── persistence ──────────────────────────────────────────────────────────
 
@@ -356,6 +372,115 @@ class LaneBDriver:
                 out.setdefault(int(li), set()).update(int(r) for r in rows)
         return out
 
+    # ── row claims (WB15, LB2 "Overlaps") ────────────────────────────────────
+
+    def _declared_of(self, funded: dict) -> dict[str, dict[int, list[int]]]:
+        """hotkey -> the non-empty declared rows of its startable funded entry
+        (WB14 ``declared_rows``). Caller holds the lock."""
+        out = {}
+        for hk, e in funded.items():
+            rows = normalise_rows(getattr(e, "declared_rows", None))
+            if rows:
+                out[hk] = rows
+        return out
+
+    def _row_holders(self, era_index: int) -> list:
+        """Every current holder of expert rows, in a fixed order: open legs
+        (start order), finished-but-unsettled legs, pending merges. Caller
+        holds the lock."""
+        from ..funding.queue import lane_b_entry_ref
+
+        lb = self.cfg.lane_b
+        age = int(lb.max_base_age_eras)
+        out = []
+        for leg in self.queue.open:
+            ref = str(leg.funding.get("entry_ref") or "") or lane_b_entry_ref(
+                leg.sub.declared, leg.sub.gen_ref)
+            out.append(leg_holder(leg.sub.hotkey, ref, leg.selection, leg.base_era,
+                                  era_index, age))
+        for f in self.st.finished:
+            leg = f["leg"]
+            sub = leg["sub"]
+            declared = tuple(sub.get("targets") or (sub["domain"],))
+            ref = str((leg.get("funding") or {}).get("entry_ref") or "") or lane_b_entry_ref(
+                declared, sub["gen_ref"])
+            out.append(leg_holder(sub["hotkey"], ref, leg["selection"], int(leg["base_era"]),
+                                  era_index, age))
+        by_pointer = {r.get("leg_pointer"): r for r in self.st.submission_results
+                      if r.get("leg_pointer")}
+        for m in self.st.pending_merges:
+            src = by_pointer.get(m.get("rebased_pointer"), {})
+            hk, ref = str(src.get("hotkey") or ""), ""
+            if src.get("gen_ref"):
+                ref = lane_b_entry_ref(tuple(src.get("targets") or (src.get("domain"),)),
+                                       src["gen_ref"])
+            out.append(merge_holder(hk, ref, m.get("selection") or {}, era_index))
+        return out
+
+    def _mark_funded(self, fq, funded: dict, sub: LaneBSubmission, era_index: int,
+                     block: int) -> dict | None:
+        """Move ``sub``'s funded entry in flight; the leg's ``funding`` record,
+        or None when the queue refused. Caller holds the lock."""
+        e = funded[sub.hotkey]
+        if not fq.mark_in_flight(sub.hotkey, e.ref, target_boundary=0,
+                                 era_index=int(era_index), started_block=int(block)):
+            return None
+        from .progress import funded_attempt_id
+
+        return {"entry_ref": e.ref, "started_block": int(block),
+                "attempt_id": funded_attempt_id(fq, sub.hotkey, e.ref, int(block)),
+                **({"gpu": str(e.gpu),
+                    "gpu_allow_fallback": bool(e.gpu_allow_fallback),
+                    "gpu_max_price_per_hour": float(e.gpu_max_price_per_hour)}
+                   if getattr(e, "gpu", "") else {})}
+
+    def _start_declared(self, fq, funded: dict, declared: dict, eligible, *, block: int,
+                        era_index: int, king_pointer: str) -> tuple[list[OpenLeg], list[dict]]:
+        """Plan the declared claims FIRST, in claim order (funded entry's
+        reveal block, then hotkey): each trains exactly its declared rows
+        unless a holder (open leg, finished-but-unsettled leg, pending merge —
+        either mode) owns one of them, in which case it is deferred: left
+        pending and queued, uncharged, and reported ``rows_held``. A deferred
+        claim holds nothing. Returns ``(started, deferred rows)``. Caller
+        holds the lock."""
+        lb = self.cfg.lane_b
+        subs = sorted((s for s in self.queue.pending
+                       if s.hotkey in declared and (eligible is None or eligible(s))),
+                      key=lambda s: claim_key(funded[s.hotkey].reveal_block, s.hotkey))
+        busy = target_load(self.queue.open)
+        started: list[OpenLeg] = []
+        deferred: list[dict] = []
+        for sub in subs:
+            if not has_capacity(sub.declared, busy, lb.legs_per_domain):
+                continue
+            rows = declared[sub.hotkey]
+            holder = first_overlap(rows, self._row_holders(era_index))
+            if holder is not None:
+                deferred.append(deferred_row(sub.hotkey, funded[sub.hotkey].ref, holder, rows))
+                log.info("lane B: %s/%s declared rows held by %s (%s) — deferred until its "
+                         "%s (era %d)", sub.hotkey[:8], sub.domain, holder.hotkey[:8],
+                         holder.entry_ref, holder.kind, holder.era)
+                continue
+            held = self._held_rows()
+            exclude = self.queue.owned_rows()
+            for li, r in held.items():
+                exclude.setdefault(li, set()).update(r)
+            funding = self._mark_funded(fq, funded, sub, era_index, block)
+            if funding is None:
+                continue
+            try:
+                leg = self.queue.start(sub, rows, king_pointer, era_index, exclude=exclude,
+                                       held=held, funding=funding)
+            except ValueError as err:
+                fq.requeue(sub.hotkey, error=f"lane-B rows unavailable ({err})",
+                           error_class="no_capacity", burn_attempt=False)
+                log.warning("lane B: %s/%s not started: %s", sub.hotkey[:8], sub.domain, err)
+                continue
+            for t in sub.declared:
+                busy[t] = busy.get(t, 0) + 1
+            started.append(leg)
+        return started, deferred
+
     def abandon(self, round_id: str) -> str:
         """The scheduler stopped waiting for ``round_id``'s settlement: from
         now on :meth:`settle` commits nothing for it (its legs stay finished
@@ -426,6 +551,7 @@ class LaneBDriver:
         self.reconcile_lineage()
         lb = self.cfg.lane_b
         if not lb.active(block) or not king_pointer:
+            self._deferred = []
             return []
         miner = self._miner_funded()
         fq = self._funded_queue() if miner else None
@@ -484,7 +610,16 @@ class LaneBDriver:
             latched = self.st.gate_opened_block > 0
             funded = self._funded_entries(fq, rows) if miner else {}
             eligible = self._eligible(miner, funded)
-            want = {t for s in self.queue.next_dispatchable(lb, eligible) for t in s.declared}
+            # WB15: entries with declared rows are planned first (their own
+            # rows, never ESFT); the ESFT pass sees only the rest. With none
+            # declared the ESFT pass is exactly the pre-WB15 queue.
+            declared = self._declared_of(funded)
+            esft_eligible = eligible
+            if declared:
+                def esft_eligible(sub: LaneBSubmission) -> bool:
+                    return sub.hotkey not in declared and eligible(sub)
+            want = {t for s in self.queue.next_dispatchable(lb, esft_eligible)
+                    for t in s.declared}
             self.save()
         # ── routing saturation + current-king probes: OUTSIDE the lock ──
         routing: dict[str, dict] = {}
@@ -510,6 +645,7 @@ class LaneBDriver:
                 ok, why = gate_open(self.st.lineage_tokens, routing, lb)
                 self.st.routing["open"], self.st.routing["reason"] = ok, why
                 if not ok:
+                    self._deferred = []
                     self.save()
                     log.info("lane B: gate closed (%s)", why)
                     return []
@@ -517,8 +653,13 @@ class LaneBDriver:
                 log.info("lane B: gate OPEN at block %d (era %d, king %s vs previous %s; "
                          "lineage %.3g tokens) — latched", block, era_index, king_pointer,
                          prev, self.st.lineage_tokens)
-            started = []
-            for sub in self.queue.next_dispatchable(lb, eligible):
+            started, deferred_rows = [], []
+            if declared:
+                started, deferred_rows = self._start_declared(
+                    fq, funded, declared, eligible, block=int(block), era_index=int(era_index),
+                    king_pointer=king_pointer)
+            self._deferred = deferred_rows
+            for sub in self.queue.next_dispatchable(lb, esft_eligible):
                 tprobes = [probes.get(t) for t in sub.declared]
                 if any(pr is None for pr in tprobes):   # dispatchable mid-tick: next tick
                     continue
@@ -538,18 +679,9 @@ class LaneBDriver:
                     continue
                 funding: dict = {}
                 if miner:
-                    e = funded[sub.hotkey]
-                    if not fq.mark_in_flight(sub.hotkey, e.ref, target_boundary=0,
-                                             era_index=int(era_index), started_block=int(block)):
+                    funding = self._mark_funded(fq, funded, sub, era_index, block)
+                    if funding is None:
                         continue
-                    from .progress import funded_attempt_id
-
-                    funding = {"entry_ref": e.ref, "started_block": int(block),
-                               "attempt_id": funded_attempt_id(fq, sub.hotkey, e.ref, int(block)),
-                               **({"gpu": str(e.gpu),
-                                   "gpu_allow_fallback": bool(e.gpu_allow_fallback),
-                                   "gpu_max_price_per_hour": float(e.gpu_max_price_per_hour)}
-                                  if getattr(e, "gpu", "") else {})}
                 try:
                     leg = self.queue.start(sub, sel, king_pointer, era_index, exclude=exclude,
                                            held=held, funding=funding)
@@ -938,6 +1070,8 @@ class LaneBDriver:
                 "pending_merges": len(self.st.pending_merges),
                 "submission_progress": lane_b_progress(self.st),
                 "outcomes": list(self.st.outcomes[-16:]),
+                # WB15: declared claims waiting on held rows (``rows_held``)
+                "deferred": [dict(r) for r in self._deferred],
             }
 
     def expert_manifest_digest(self, round_id: str) -> str:
