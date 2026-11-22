@@ -171,6 +171,62 @@ def gate_open(lineage_tokens: int, routing: dict[str, dict | None], cfg) -> tupl
     return True, "open"
 
 
+# WB17 (D41 / LB4): ``[lane_b] open_rule`` forms other than the co-gate, and
+# the typed reasons a gate closed under one of them records
+OPEN_RULE_COGATE = "cogate"
+OPEN_RULE_TOKENS = "tokens"
+OPEN_RULE_TOKENS_KING_CHECK = "tokens_king_check"
+GATE_TOKENS_SHORT = "tokens_short"
+GATE_KING_CHECK_NOT_PASSED = "king_check_not_passed"
+GATE_KING_CHECK_UNAVAILABLE = "king_check_unavailable"
+GATE_CLOSED_REASONS = (GATE_TOKENS_SHORT, GATE_KING_CHECK_NOT_PASSED,
+                       GATE_KING_CHECK_UNAVAILABLE)
+# the receipt ``king_check`` keys every evidence copy keeps when the record as
+# a whole is not strict JSON (DEC-CA-0055)
+_KING_CHECK_CORE = ("result", "round_id", "block", "king_pointer", "king_hotkey")
+
+
+def _strict_json_copy(record: dict) -> dict:
+    """``record`` as plain strict JSON (string keys, no NaN/Infinity); when it
+    is not representable, only its scalar core keys (never raises)."""
+    try:
+        return json.loads(json.dumps(record, sort_keys=True, allow_nan=False))
+    except (TypeError, ValueError):
+        return {k: record[k] for k in _KING_CHECK_CORE
+                if k in record and isinstance(record[k], (str, int))
+                and not isinstance(record[k], bool)}
+
+
+def needs_king_check(rule: str) -> bool:
+    return rule == OPEN_RULE_TOKENS_KING_CHECK
+
+
+def open_rule_verdict(rule: str, lineage_tokens: int, cfg,
+                      king_check: dict | None) -> tuple[bool, str, dict]:
+    """The ``tokens`` / ``tokens_king_check`` opening rule (D41 b / a):
+    ``(open, closed_reason, evidence)``.
+
+    ``tokens``: ``lineage_tokens >= open_tokens``. ``tokens_king_check``:
+    that AND ``king_check`` (the latest lane A king check of the validators'
+    signed receipt) has ``result == "pass"``. Tokens are checked first, so
+    ``tokens_short`` wins when both fail. On opening, ``evidence`` is the
+    strict-JSON record of the satisfying facts; while closed it is ``{}`` and
+    ``closed_reason`` one of :data:`GATE_CLOSED_REASONS`."""
+    if rule not in (OPEN_RULE_TOKENS, OPEN_RULE_TOKENS_KING_CHECK):
+        raise ValueError(f"open_rule_verdict: not a token rule: {rule!r}")
+    tokens, need = int(lineage_tokens), int(cfg.open_tokens)
+    if tokens < need:
+        return False, GATE_TOKENS_SHORT, {}
+    evidence: dict = {"lineage_tokens": tokens, "open_tokens": need}
+    if needs_king_check(rule):
+        if not isinstance(king_check, dict):
+            return False, GATE_KING_CHECK_UNAVAILABLE, {}
+        if king_check.get("result") != "pass":
+            return False, GATE_KING_CHECK_NOT_PASSED, {}
+        evidence["king_check"] = _strict_json_copy(king_check)
+    return True, "", evidence
+
+
 def union_selection(selections) -> dict[int, list[int]]:
     """Per-layer union of several expert selections (sorted ids) — the rows a
     multi-target leg trains (DEC-CA-0059). One selection ⇒ itself."""
