@@ -19,9 +19,11 @@
         prints the MODE the PR job runs next (rules below);
         for a review WP RV<n>: MODE review iff the diff is exactly an add or
         modify of evidence/rv<n>.md (no tests run)
+    accept <WP>[,<WP>...] --cross --base REF --head REF [--root R]
+        cross-WP regressions (CROSS rule below); prints `CROSS <WP> PASS|KNOWN|FAIL`
     accept selftest
-        offline check of the review, tests-correction, verification and
-        evidence modes
+        offline check of the review, tests-correction, verification,
+        evidence and cross modes
     accept --gate <STAGE> [--root R]
         evidence/gates/<stage>.json: right stage, every check passed
 
@@ -87,6 +89,35 @@ MODE rules of --check-pr (the PR job runs the named mode next):
                           file the Accept cell does not declare (and PATHS do
                           not cover) -> FAIL evidence.
     MODE review           RV<n> label, the diff is exactly evidence/rv<n>.md
+
+CROSS rule (the PR job runs it after the PR's own WP steps, every mode but
+review): a WP other than the PR's own WP(s) is re-accepted when
+    (a) it is built on BASE: tests/accept/<wp>/PATHS exists at BASE and BASE's
+        first-parent line has its L2 commit (lanedlib.impl_commit_index, the
+        board's L2 rule; the board's L1 ledger precondition is not re-checked,
+        so a WP in doubt is included), and
+    (b) its tests depend on `git diff --name-only BASE...HEAD`: the diff touches
+        a global input (pyproject.toml, uv.lock, tests/conftest.py, ...), its
+        own test dir, a path its PATHS match, a repo module in the static
+        import closure of its test dir (AST, transitive through repo modules
+        and package __init__.py; absolute imports resolve from the repo root,
+        the importing file's dir, tests/accept and tests), or a path named by a
+        string constant in its test files ("cascade/x/y.json", "chain.toml").
+The tests-correction / tests-only / verification WP X of the PR is its own
+main step, so X is never a cross WP. A cross WP runs invariant 10, pytest over
+its test dir (all cross WPs in one pytest run, split only where two
+non-package test dirs share a module basename) and stub_scan over its PATHS;
+no e2e (the main step ran it). A failure the junit report cannot attribute to
+one WP fails every WP of that run.
+A cross WP whose pytest fails on HEAD is re-run at BASE (a temporary detached
+worktree of BASE, same LANED_PYTEST_CMD, removed afterwards) and compared per
+junit test id:
+    CROSS <WP> KNOWN  every test failing on HEAD also fails on BASE (already
+                      red on main; printed with the ids; does not fail the job)
+    CROSS <WP> FAIL   a test that passes on BASE fails on HEAD (a regression),
+                      or either run is not plain test failures (no report,
+                      unattributed failures, a collection error, nothing
+                      collected): fails closed.
 
 The pytest command is `uv run --frozen pytest` unless LANED_PYTEST_CMD is set
 (shlex-split). It always runs with cwd = --root. Exit 0 means pass.
@@ -518,7 +549,8 @@ def _module_files(base: str, dotted: str) -> list[str]:
     return out
 
 
-def _module_refs(rel: str, text: str, own_dir: str) -> tuple[list[str], set[str]]:
+def _module_refs(rel: str, text: str, own_dir: str,
+                 extra_bases: tuple[str, ...] = ()) -> tuple[list[str], set[str]]:
     """(candidate module files ``rel`` imports, its string constants) by AST."""
     try:
         tree = ast.parse(text)
@@ -527,7 +559,7 @@ def _module_refs(rel: str, text: str, own_dir: str) -> tuple[list[str], set[str]
     here = posixpath.dirname(rel)
     # absolute imports resolve against the repo root (package mode), the
     # module's own dir (pytest rootdir-less prepend) and the WP dir
-    bases = ("", here, own_dir.rstrip("/"))
+    bases = ("", here, own_dir.rstrip("/"), *extra_bases)
     cands: list[str] = []
     strings: set[str] = set()
     for node in ast.walk(tree):
@@ -666,6 +698,310 @@ def cmd_tests_correction(root: Path, wp: str, base: str, head: str) -> int:
         print("MODE tests-correction PASS")
     print(f"PASS {wp} tests-correction")
     return 0
+
+
+# ---------------------------------------------------------------------------
+# cross (other built WPs whose tests depend on what the PR changes)
+# ---------------------------------------------------------------------------
+
+# A change to one of these can break any WP's tests: every built WP runs.
+CROSS_GLOBAL = frozenset({"pyproject.toml", "uv.lock", "conftest.py", "tests/conftest.py",
+                          "tests/__init__.py", "tests/accept/__init__.py", "pytest.ini",
+                          "setup.cfg", "tox.ini"})
+# absolute imports in a test or repo module also resolve against these
+# (pytest's rootdir-less prepend puts tests/accept or tests first on sys.path)
+CROSS_BASES = ("tests/accept", "tests")
+
+
+def wp_ids_at(root: Path, ref: str) -> dict[str, str]:
+    """``{tests/accept dir name: WP id}`` from the §3.0 tables of the plan at ``ref``."""
+    text = plan_at(root, ref)
+    out: dict[str, str] = {}
+    for wp in lanedlib.plan_wp_ids(text) if text else []:
+        out.setdefault(lanedlib.wp_dir(wp), wp)
+    return out
+
+
+def built_wps_at(root: Path, ref: str) -> list[tuple[str, list[str]]]:
+    """``[(WP, PATHS at ref)]`` for every WP with an L2 commit on ``ref``'s
+    first-parent line (lanedlib.impl_commit_index, the status board's L2
+    rule). The board's L1 precondition (a green expect-fail run in the
+    ledger) is not re-checked here: without the ledger, include the WP."""
+    out = lanedlib.git(root, "ls-tree", "--name-only", f"{ref}:tests/accept", check=False).stdout.split()
+    ids = wp_ids_at(root, ref)
+    history = lanedlib.first_parent_history(root, ref)
+    built: list[tuple[str, list[str]]] = []
+    for d in sorted(out):
+        proc = lanedlib.git(root, "show", f"{ref}:tests/accept/{d}/PATHS", check=False)
+        if proc.returncode != 0:
+            continue
+        wp = ids.get(d, d)
+        paths = lanedlib.parse_paths(proc.stdout)
+        if lanedlib.impl_commit_index(history, wp, paths) is not None:
+            built.append((wp, paths))
+    return built
+
+
+# (rel path, text) -> _module_refs: one AST parse per file content per run
+_REFS_CACHE: dict[tuple[str, str], tuple[list[str], set[str]]] = {}
+
+
+def import_closure(root: Path, start: list[str]) -> tuple[set[str], set[str]]:
+    """Static import closure (AST, transitive, any repo file) of ``start``:
+    (repo-relative module files reached, string constants of the ``start``
+    files). Package ``__init__.py`` files of every imported module count."""
+    seen: set[str] = set()
+    strings: set[str] = set()
+    firsts = set(start)
+    todo = list(start)
+    while todo:
+        rel = posixpath.normpath(todo.pop())
+        if rel in seen or rel.startswith("..") or not rel.endswith(".py"):
+            continue
+        path = root / rel
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        key = (rel, text)
+        if key not in _REFS_CACHE:
+            _REFS_CACHE[key] = _module_refs(rel, text, "", CROSS_BASES)
+        seen.add(rel)
+        cands, consts = _REFS_CACHE[key]
+        if rel in firsts:
+            strings |= consts
+        todo += [c for c in cands if c not in seen]
+    return seen, strings
+
+
+def _string_names(s: str, changed: str) -> bool:
+    """Does the test-dir string constant ``s`` name the changed path?"""
+    s = s.strip()
+    if not s or "\n" in s or len(s) > 300:
+        return False
+    s = s.strip("/")
+    if not s or s == ".":
+        return False
+    if s == changed or changed.startswith(s + "/") and "/" in s:
+        return True
+    if "/" in s and changed.endswith("/" + s):
+        return True
+    # a bare file name (chain.toml) for a non-module file
+    return not changed.endswith(".py") and "." in s and s == posixpath.basename(changed)
+
+
+def cross_reasons(root: Path, wp: str, paths: list[str], diff: list[str]) -> list[str]:
+    """Why ``wp``'s tests depend on the changed paths (empty: they don't)."""
+    d = f"tests/accept/{lanedlib.wp_dir(wp)}/"
+    why: list[str] = []
+    glob = sorted(p for p in diff if p in CROSS_GLOBAL)
+    if glob:
+        why.append("global input " + " ".join(glob))
+    own = sorted(p for p in diff if p.startswith(d))
+    if own:
+        why.append("its tests " + " ".join(own))
+    overlap = sorted(p for p in diff if lanedlib.path_matches(p, paths))
+    if overlap:
+        why.append("PATHS overlap " + " ".join(overlap))
+    tdir = root / d
+    start = sorted(p.relative_to(root).as_posix() for p in tdir.rglob("*.py")
+                   if "__pycache__" not in p.parts) if tdir.is_dir() else []
+    mods, strings = import_closure(root, start)
+    imported = sorted(p for p in diff if p in mods and not p.startswith(d))
+    if imported:
+        why.append("imports " + " ".join(imported))
+    named = sorted(p for p in diff if p not in mods and not p.startswith(d)
+                   and any(_string_names(s, p) for s in strings))
+    if named:
+        why.append("names " + " ".join(named))
+    return why
+
+
+def cross_select(root: Path, base: str, head: str,
+                 pr_wps: list[str]) -> list[tuple[str, list[str], list[str]]]:
+    """``[(WP, PATHS, reasons)]``: every WP other than the PR's own that is
+    built on BASE and whose tests depend on the PR's changed paths."""
+    diff = lanedlib.git(root, "diff", "--name-only", f"{base}...{head}").stdout.split()
+    own = {lanedlib.wp_dir(w) for w in pr_wps}
+    out = []
+    for wp, paths in built_wps_at(root, base):
+        if lanedlib.wp_dir(wp) in own:
+            continue  # the PR's own WP: its main step already ran it
+        why = cross_reasons(root, wp, paths, diff)
+        if why:
+            out.append((wp, paths, why))
+    return out
+
+
+def _collision_groups(root: Path, wps: list[str]) -> list[list[str]]:
+    """Split WPs so one pytest run never imports two same-named top-level
+    modules (test dirs without ``__init__.py`` import by basename)."""
+    groups: list[tuple[list[str], set[str]]] = []
+    for wp in wps:
+        d = test_dir(root, wp)
+        names = set() if (d / "__init__.py").is_file() else {
+            p.name for p in d.rglob("*.py") if "__pycache__" not in p.parts}
+        for members, used in groups:
+            if not names & used:
+                members.append(wp)
+                used |= names
+                break
+        else:
+            groups.append(([wp], set(names)))
+    return [m for m, _ in groups]
+
+
+def _owner(case: ET.Element, prefixes: dict[str, str]) -> str | None:
+    for field in (case.get("classname") or "", case.get("name") or ""):
+        for wp, pre in prefixes.items():
+            if field == pre or field.startswith(pre + "."):
+                return wp
+    return None
+
+
+class CrossRun:
+    """One WP's share of a shared pytest run. ``why`` is "" when green.
+    ``failed`` holds the failing junit test ids; ``comparable`` is False when
+    the outcome is not just attributed test failures (no report, unattributed
+    failures, nothing collected, a collection error, a bare pytest exit)."""
+
+    def __init__(self, why: str = "", failed: frozenset[str] = frozenset(), comparable: bool = False):
+        self.why, self.failed, self.comparable = why, failed, comparable
+
+
+def _case_id(case: ET.Element) -> str:
+    return f"{case.get('classname', '')}::{case.get('name', '')}"
+
+
+def cross_pytest(root: Path, wps: list[str]) -> dict[str, CrossRun]:
+    """One pytest run per collision group over the WPs' test dirs at ``root``.
+    Fails closed: a failure that cannot be attributed to one WP fails every
+    WP of its run."""
+    res: dict[str, CrossRun] = {}
+    for group in _collision_groups(root, wps):
+        prefixes = {wp: f"tests.accept.{lanedlib.wp_dir(wp)}" for wp in group}
+        with tempfile.TemporaryDirectory(prefix="laned-cross-") as tmp:
+            junit = Path(tmp) / "junit.xml"
+            proc = run_pytest(root, group[0], [f"--rootdir={root}", f"--junitxml={junit}",
+                                               "--continue-on-collection-errors"],
+                              env=evidence_env(root, None),
+                              targets=[f"tests/accept/{lanedlib.wp_dir(w)}/" for w in group])
+            sys.stdout.write(proc.stdout[-20000:])
+            sys.stderr.write(proc.stderr[-5000:])
+            cases = list(ET.parse(junit).iter("testcase")) if junit.is_file() else None
+        if cases is None:
+            for wp in group:
+                res[wp] = CrossRun(f"pytest wrote no report (exit {proc.returncode})")
+            continue
+        collected = {wp: 0 for wp in group}
+        failed: dict[str, set[str]] = {wp: set() for wp in group}
+        collect_err = {wp: False for wp in group}
+        stray = 0
+        for case in cases:
+            bad = [child for child in case if child.tag in ("failure", "error")]
+            wp = _owner(case, prefixes)
+            if wp is None:
+                stray += bool(bad)
+                continue
+            collected[wp] += 1
+            if bad:
+                failed[wp].add(_case_id(case))
+                collect_err[wp] |= any("collection failure" in (c.get("message") or "") for c in bad)
+        any_failed = any(failed.values())
+        for wp in group:
+            ids = frozenset(failed[wp])
+            if stray:
+                res[wp] = CrossRun(f"{stray} unattributed failure(s) in the shared run", ids)
+            elif ids:
+                res[wp] = CrossRun(f"{len(ids)} of {collected[wp]} test(s) failed"
+                                   + (" (collection error)" if collect_err[wp] else ""),
+                                   ids, comparable=not collect_err[wp])
+            elif not collected[wp]:
+                res[wp] = CrossRun("no tests collected")
+            elif proc.returncode != 0 and not any_failed:
+                res[wp] = CrossRun(f"pytest exit {proc.returncode}")
+            else:
+                res[wp] = CrossRun(comparable=True)
+    return res
+
+
+def cross_base_runs(root: Path, base: str, wps: list[str]) -> dict[str, CrossRun]:
+    """The same shared pytest runs for ``wps`` over a temporary detached
+    worktree of BASE (removed afterwards)."""
+    with tempfile.TemporaryDirectory(prefix="laned-cross-base-") as tmp:
+        wt = Path(tmp) / "base"
+        proc = lanedlib.git(root, "worktree", "add", "--detach", "-q", str(wt), base, check=False)
+        if proc.returncode != 0:
+            return {wp: CrossRun(f"no BASE worktree: {proc.stderr.strip()[:200]}") for wp in wps}
+        try:
+            print(f"+ re-running {' '.join(wps)} at BASE {base}", flush=True)
+            missing = [wp for wp in wps if not test_dir(wt, wp).is_dir()]
+            out = {wp: CrossRun("no test dir at BASE") for wp in missing}
+            out.update(cross_pytest(wt, [wp for wp in wps if wp not in missing]))
+            return out
+        finally:
+            lanedlib.git(root, "worktree", "remove", "--force", str(wt), check=False)
+            lanedlib.git(root, "worktree", "prune", check=False)
+
+
+def _ids(ids: frozenset[str] | set[str], n: int = 8) -> str:
+    s = sorted(ids)
+    return " ".join(s[:n]) + (f" ... (+{len(s) - n})" if len(s) > n else "")
+
+
+def cross_against_base(head_run: CrossRun, base_run: CrossRun) -> tuple[str, str]:
+    """(KNOWN|FAIL, detail) for a WP whose HEAD run failed: KNOWN only when
+    both runs are plain test failures and every HEAD failure fails on BASE."""
+    if not head_run.comparable:
+        return "FAIL", f"pytest: {head_run.why}"
+    if not base_run.comparable:
+        return "FAIL", f"pytest: {head_run.why}; BASE run unusable for comparison ({base_run.why})"
+    new = head_run.failed - base_run.failed
+    if new:
+        return "FAIL", f"pytest: {len(new)} regression(s), pass on BASE: {_ids(new)}"
+    return "KNOWN", f"{len(head_run.failed)} tests already red on base: {_ids(head_run.failed)}"
+
+
+def cmd_cross(root: Path, pr_wps: list[str], base: str, head: str) -> int:
+    """For every other WP at >= L2 on BASE whose tests depend on the PR's
+    changes (module docstring): invariant 10, its pytest (shared runs) and
+    stub_scan over its PATHS; no e2e (the main step ran it). A WP whose
+    pytest fails is re-run at BASE: failures that are all red on BASE too
+    are KNOWN. Prints ``CROSS <WP> PASS|KNOWN|FAIL``; exit 1 when any FAIL."""
+    selected = cross_select(root, base, head, pr_wps)
+    if not selected:
+        print("CROSS none (no other built WP depends on the changed paths)")
+        return 0
+    for wp, _, why in selected:
+        print(f"cross {wp}: " + "; ".join(why))
+    verdict: dict[str, tuple[str, str]] = {}  # WP -> (PASS|KNOWN|FAIL, detail)
+    runnable = []
+    for wp, _, _ in selected:
+        if not test_dir(root, wp).is_dir():
+            verdict[wp] = ("FAIL", f"no tests at tests/accept/{lanedlib.wp_dir(wp)}/")
+        elif unpaired_tests(root, wp):
+            verdict[wp] = ("FAIL", "invariant10: unpaired unarmed test(s)")
+        else:
+            runnable.append(wp)
+    head_runs = cross_pytest(root, runnable)
+    red = [wp for wp in runnable if head_runs[wp].why]
+    base_runs = cross_base_runs(root, base, red) if red else {}
+    for wp in runnable:
+        run = head_runs[wp]
+        verdict[wp] = cross_against_base(run, base_runs[wp]) if run.why else ("PASS", "")
+    for wp, paths, _ in selected:
+        if verdict[wp][0] == "FAIL":
+            continue
+        lines, _ = stub_scan.scan(root, paths)
+        for line in lines:
+            print(line)
+        if lines:
+            verdict[wp] = ("FAIL", f"stub_scan: {len(lines)} finding(s)")
+    failed = 0
+    for wp, _, _ in selected:
+        word, why = verdict[wp]
+        failed += word == "FAIL"
+        print(f"CROSS {wp} {word}" + (f" ({why})" if why else ""))
+    return 1 if failed else 0
 
 
 # ---------------------------------------------------------------------------
@@ -1019,6 +1355,110 @@ def selftest_evidence(ident: tuple[str, ...]) -> list[str]:
     return failures
 
 
+SELFTEST_CROSS_PLAN = """# plan
+
+| WP | What | Depends | Runs in | Accept |
+|---|---|---|---|---|
+| A | core | — | ci | `scripts/laned/accept A` |
+| B | uses A | A | ci | `scripts/laned/accept B` |
+| C | unrelated | — | ci | `scripts/laned/accept C` |
+| D | shares a file with A | — | ci | `scripts/laned/accept D` |
+| E | unbuilt, imports A | — | ci | `scripts/laned/accept E` |
+| F | red on base, uses A | A | ci | `scripts/laned/accept F` |
+| G | uncollectable on base, imports C | C | ci | `scripts/laned/accept G` |
+"""
+
+
+def selftest_cross(ident: tuple[str, ...]) -> list[str]:
+    """The CROSS rule on a real git repo and real pytest: A, B, C, D, F, G
+    built, E tests-only; B's tests import pkg_b, which imports A's pkg_a; D's
+    PATHS also cover A's shared_ad.py; C and E must never run for an A PR.
+    F is red on BASE (KNOWN unless the PR adds a failure); G cannot be
+    collected on BASE (always FAIL when selected)."""
+    failures: list[str] = []
+    saved = os.environ.get("LANED_PYTEST_CMD")
+    os.environ["LANED_PYTEST_CMD"] = shlex.join([sys.executable, "-m", "pytest", "-p", "no:cacheprovider"])
+    try:
+        with tempfile.TemporaryDirectory(prefix="laned-accept-selftest-cross-") as tmp:
+            root = Path(tmp) / "repo"
+            root.mkdir()
+
+            def commit(files: dict[str, str], msg: str) -> str:
+                for rel, text in files.items():
+                    (root / rel).parent.mkdir(parents=True, exist_ok=True)
+                    (root / rel).write_text(text)
+                lanedlib.git(root, "add", "-A")
+                lanedlib.git(root, *ident, "commit", "-q", "-m", msg)
+                return lanedlib.git(root, "rev-parse", "HEAD").stdout.strip()
+
+            lanedlib.git(root, "init", "-q")
+            commit({"README.md": "x\n", ".gitignore": "__pycache__/\n", lanedlib.PLAN_PATH: SELFTEST_CROSS_PLAN,
+                    "pkg_a.py": "VALUE = 0\n", "pkg_b.py": "DOUBLE = 0\n", "pkg_c.py": "C = 0\n",
+                    "pkg_d.py": "D = 0\n", "shared_ad.py": "S = 0\n"}, "seed")
+            for wp, paths, test in (
+                    ("a", "pkg_a.py\nshared_ad.py\n", "import pkg_a\n\n\ndef test_a():\n    assert pkg_a.VALUE > 0\n"),
+                    ("b", "pkg_b.py\n", "import pkg_b\n\n\ndef test_b():\n    assert pkg_b.DOUBLE == 2\n"),
+                    ("c", "pkg_c.py\n", "import pkg_c\n\n\ndef test_c():\n    assert pkg_c.C == 3\n"),
+                    ("d", "pkg_d.py\nshared_ad.py\n", "import pkg_d\n\n\ndef test_d():\n    assert pkg_d.D == 4\n"),
+                    ("e", "pkg_e.py\n", "import pkg_a\nimport pkg_e\n\n\ndef test_e():\n    assert pkg_e.E\n"),
+                    # F is red on BASE (test_f_red); test_f_ok reads A's VALUE through pkg_f
+                    ("f", "pkg_f.py\n", "import pkg_f\n\n\ndef test_f_red():\n    assert pkg_f.F == 99\n\n\n"
+                                        "def test_f_ok():\n    assert pkg_f.G == 1\n"),
+                    # G cannot even be collected on BASE; it imports C's pkg_c
+                    ("g", "pkg_g.py\n", "import pkg_c\nfrom pkg_g import MISSING\n\n\ndef test_g():\n"
+                                        "    assert MISSING and pkg_c\n")):
+                commit({f"tests/accept/{wp}/PATHS": paths, f"tests/accept/{wp}/test_{wp}.py": test},
+                       f"tests-only {wp}")
+            commit({"pkg_a.py": "VALUE = 1\n"}, "impl A")
+            commit({"pkg_b.py": "import pkg_a\n\nDOUBLE = pkg_a.VALUE * 2\n"}, "impl B")
+            commit({"pkg_c.py": "C = 3\n"}, "impl C")
+            commit({"pkg_f.py": "import pkg_a\n\nF = 6\nG = pkg_a.VALUE\n"}, "impl F")
+            commit({"pkg_g.py": "X = 1\n"}, "impl G")
+            base = commit({"pkg_d.py": "D = 4\n"}, "impl D")
+
+            def case(name: str, wps: str, files: dict[str, str], want_rc: int,
+                     want: list[str], never: list[str]) -> None:
+                lanedlib.git(root, "checkout", "-q", "-B", name, base)
+                head = commit(files, name)
+                with contextlib.redirect_stdout(io.StringIO()) as buf, \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    rc = cmd_cross(root, wps.split(","), base, head)
+                out = buf.getvalue()
+                lines = [ln for ln in out.splitlines() if ln.startswith("CROSS ")]
+                bad = [w for w in want if not any(ln.startswith(w) for ln in lines)]
+                bad += [n for n in never if any(ln.startswith(f"CROSS {n} ") for ln in lines)]
+                if rc != want_rc or bad:
+                    failures.append(f"cross {name}: rc={rc} want {want_rc}; missing/unexpected {bad}: "
+                                    f"{out.strip()[-2000:]}")
+
+            # implementation PR for A breaks B (imports pkg_a through pkg_b) -> CROSS B FAIL;
+            # D runs only for the PATHS overlap and passes; C (unrelated) and E (unbuilt) never run
+            # ... and F, red on BASE by test_f_red, gains a failure (test_f_ok) -> CROSS F FAIL
+            case("a-breaks-b", "A", {"pkg_a.py": "VALUE = 5\n", "shared_ad.py": "S = 1\n"}, 1,
+                 ["CROSS B FAIL", "CROSS D PASS", "CROSS F FAIL (pytest: 1 regression"], ["A", "C", "E", "G"])
+            # the same PR without the break -> CROSS B PASS; F still red the same
+            # way as on BASE -> CROSS F KNOWN, which does not fail the job
+            case("a-keeps-b", "A", {"pkg_a.py": "VALUE = 1\nEXTRA = 2\n"}, 0,
+                 ["CROSS B PASS", "CROSS F KNOWN (1 tests already red on base: "], ["A", "C", "D", "E", "G"])
+            # tests-correction PR for B: B is the main step, never a cross WP
+            case("b-tests-correction", "B",
+                 {"tests/accept/b/test_b_more.py": "import pkg_b\n\n\ndef test_more():\n"
+                                                   "    assert pkg_b.DOUBLE\n"},
+                 0, ["CROSS none"], ["A", "B", "C", "D", "E", "F", "G"])
+            # a global input re-accepts every built WP except the PR's own (C, G)
+            case("lockfile", "C,G", {"uv.lock": "x\n", "pkg_c.py": "C = 3\n# lock\n"}, 0,
+                 ["CROSS A PASS", "CROSS B PASS", "CROSS D PASS", "CROSS F KNOWN"], ["C", "E", "G"])
+            # G fails on HEAD and cannot be collected on BASE either -> FAIL (fails closed)
+            case("c-touches-g", "C", {"pkg_c.py": "C = 3\n# touch\n"}, 1,
+                 ["CROSS G FAIL"], ["A", "B", "C", "D", "E", "F"])
+    finally:
+        if saved is None:
+            os.environ.pop("LANED_PYTEST_CMD", None)
+        else:
+            os.environ["LANED_PYTEST_CMD"] = saved
+    return failures
+
+
 def cmd_selftest() -> int:
     """Offline check of the RV<n> review mode of --check-pr and of the
     tests-only / tests-correction MODE rules."""
@@ -1066,6 +1506,7 @@ def cmd_selftest() -> int:
     failures += selftest_tests_correction(ident)
     failures += selftest_verification(ident)
     failures += selftest_evidence(ident)
+    failures += selftest_cross(ident)
     for f in failures:
         print(f"accept selftest: FAIL {f}", file=sys.stderr)
     if failures:
@@ -1094,6 +1535,9 @@ def main(argv: list[str] | None = None) -> int:
                          "changed ones pass or fail for a right reason")
     ap.add_argument("--check-pr", action="store_true",
                     help="rule 1 + PATHS; prints MODE implementation|tests-only|tests-correction|evidence|review")
+    ap.add_argument("--cross", action="store_true",
+                    help="(needs --base/--head) accept every other WP at >= L2 on BASE whose tests "
+                         "depend on the PR's changes; WP may list the PR's WPs, comma-separated")
     ap.add_argument("--base")
     ap.add_argument("--head")
     ap.add_argument("--gate", metavar="STAGE")
@@ -1101,6 +1545,10 @@ def main(argv: list[str] | None = None) -> int:
     root = Path(args.root).resolve()
     if args.gate:
         return cmd_gate(root, args.gate)
+    if args.cross:
+        if not (args.wp and args.base and args.head):
+            ap.error("--cross needs the PR's WP(s), --base and --head")
+        return cmd_cross(root, [w for w in re.split(r"[,\s]+", args.wp) if w], args.base, args.head)
     if not args.wp:
         ap.error("a WP id is required (or --gate STAGE)")
     if args.check_pr:

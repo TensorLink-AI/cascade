@@ -29,6 +29,11 @@
 #                              (the diff is exactly evidence file(s) named in
 #                              the WP's §3.0 Accept cell), ledger mode evidence
 #     MODE review           -> nothing to run (laned:RV<n>)
+#   then, every mode but review: `accept <WPs> --cross` re-accepts every OTHER
+#   WP at >= L2 on the base whose tests depend on the PR's changed paths
+#   (imports, string-named paths, PATHS overlap; CROSS rule in accept --help)
+#   and fails the job on any `CROSS <WP> FAIL` (cross-WP regressions surface on
+#   the PR, not after merge on the push job).
 #   The tooling comes from the base
 #   branch once it exists there, so a PR cannot loosen its own gate.
 # push to main: Accept for every WP at >= L2 (with `--evidence <file>` from the
@@ -153,6 +158,8 @@ jobs:
                 --event "$EVENT" --head-sha "$HEAD_SHA" --conclusion failure
               status=1; echo "::endgroup::"; continue
             fi
+            # every PR mode but review gets the cross-WP step below
+            [ "$EVENT" = "pull_request" ] && [ "$mode" != "review" ] && echo "LANED_CROSS=1" >> "$GITHUB_ENV"
             if [ "$mode" = "review" ]; then
               # laned:RV<n>: check-pr already verified the diff is exactly
               # evidence/rv<n>.md; a review PR has no tests to run.
@@ -209,6 +216,29 @@ jobs:
             echo "::endgroup::"
           done
           exit $status
+
+      - name: Cross-WP accept (other built WPs whose tests depend on the PR's changes)
+        # `accept --help`, CROSS rule: every other WP at >= L2 on the base whose
+        # tests import, name or PATHS-cover a changed path re-runs its Accept
+        # (pytest in one shared run + stub_scan, no e2e). The PR's own WP is
+        # its main step above and never runs twice. Any CROSS <WP> FAIL fails the job;
+        # a WP red on HEAD is re-run at the base (temporary worktree) and is
+        # CROSS <WP> KNOWN (job not failed) when every failing test is red there too.
+        if: always() && env.LANED_CROSS == '1'
+        env:
+          WPS: ${{ steps.select.outputs.wps }}
+        run: |
+          if ! grep -q -- '--cross' "$LANED/accept"; then
+            echo "the base branch's loop tooling has no --cross mode yet; cross-WP step skipped"
+            exit 0
+          fi
+          set -o pipefail   # the default `bash -e` would take tee's status
+          out="$RUNNER_TEMP/laned-cross.txt"
+          uv run --frozen python "$LANED/accept" "$WPS" --cross --base HEAD^1 --head HEAD --root . \
+            | tee "$out" && rc=0 || rc=$?
+          { echo "### Cross-WP accept"; echo; echo '```'; grep -E '^(CROSS|cross) ' "$out" || true; echo '```'; } \
+            >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
 
       - name: Loop tooling self-tests (W0c PRs)
         if: contains(format(' {0} ', steps.select.outputs.wps), ' W0c ')
