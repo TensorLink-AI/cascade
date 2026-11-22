@@ -471,7 +471,11 @@ def _run_gate(cands: list[dict], state: dict, cfg, boundary: int,
                               alpha=float(cfg.alpha), tau_public=float(cfg.tau_public),
                               B=int(cfg.bootstrap_B), seed=seed, sentinel=sentinel)
         outcomes[dg] = str(res["outcome"])
-        results.append(_gate_result(res, dg))
+        result = _gate_result(res, dg)
+        if "held_from" in c:
+            # RV7 B2: a held candidate (no verdict here) names its hold.
+            result["held_from"] = dict(c["held_from"])
+        results.append(result)
     return {**record, "results": results}, outcomes
 
 
@@ -927,7 +931,15 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
         hold = state["entries"][dg]["gate_hold"]
         candidates.append({"digest": dg, "lcb": float(hold["lcb"]),
                            "reveal_ts": int(state["entries"][dg]["reveal_ts"]),
-                           "set_sha256": str(hold["set_sha256"]), "held": True})
+                           "set_sha256": str(hold["set_sha256"]), "held": True,
+                           # RV7 B2: the signed provenance of the hold (its
+                           # first record; report_sha256 is that settlement's
+                           # report body digest).
+                           "held_from": {"boundary": int(hold["boundary"]),
+                                         "report_sha256": str(hold["report_sha256"]),
+                                         "set_sha256": str(hold["set_sha256"]),
+                                         "lcb": float(hold["lcb"]),
+                                         "king_d": str(hold["king_d"])}})
     if persisted is None:
         gate, gate_outcomes = _run_gate(candidates, state, cfg, boundary, boundary_block_hash,
                                         sentinel, bench)
@@ -1031,6 +1043,13 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     else:
         # Recovery: the persisted report (its signature too) is the record.
         report = persisted
+    # RV7 B2: a hold first taken at this settlement records the report that
+    # holds it (its body digest is known only now), so a later re-gate can
+    # sign its provenance (``gate.results[].held_from``).
+    for rec in state["entries"].values():
+        hold = rec.get("gate_hold")
+        if hold and hold["boundary"] == boundary and "report_sha256" not in hold:
+            hold["report_sha256"] = body_sha
     state["boundary"] = boundary
     state["last_report"] = {"boundary": boundary, "rows_sha256": report["rows_sha256"],
                             "report_sha256": body_sha, "prior_state_sha256": prior_sha}
