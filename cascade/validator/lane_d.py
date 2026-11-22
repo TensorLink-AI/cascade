@@ -40,6 +40,21 @@ validator. Unarmed (``not cfg.active(boundary)``) it returns
    disjoint set (D20 ``confirm_on_king_change``) before it is crowned;
    each verdict reports the §1.3b A10 low-frequency slice (report-only here:
    W3b5 computes ``pass``/``fail`` and its ``lowfreq_regression`` effect);
+5b. gates the crowning candidates (W5e, §1.3b): every verdict that cleared
+   at stage ``confirm``, plus every entry still holding a cleared
+   confirmation the gate could not decide (``bench_hold``), is swept with
+   KING_D and the house in the settlement's ``bench`` session on the ONE
+   suite drawn from ``boundary_block_hash``
+   (:func:`~cascade.validator.lane_d_gate.gate_record`; the era's
+   ``sentinel`` is swept and recorded, never gates) and decided by
+   :func:`~cascade.validator.lane_d_bench.paired_gate`: ``pass`` is
+   eligible to crown (the best LCB among the passing candidates is crowned),
+   ``gate_regression`` is ``lost``, ``checkpoint_fault`` is ``closed`` and
+   ``bench_hold`` stays open, its clear kept in ``gate_hold`` and re-gated
+   at a later settlement without a new duel. FAIL CLOSED: with no ``bench``
+   or no ``boundary_block_hash`` (the legacy call) every candidate is
+   ``bench_hold``: never crowned, lost or charged. The report carries the
+   ``gate`` record whenever the gate ran; a crowned report always has one;
 6. writes the signed ``lane-d-report/1`` (W7a: the schema file
    ``schemas/lane_d_report_1.json``; every entry considered and not judged is
    a typed skip, court slots that burn name a ``burn_reason``; ``pool.snapshots``
@@ -87,9 +102,17 @@ import numpy as np
 
 from ..eval.bootstrap import cohort_maxt_lcbs
 from ..eval.lane_d_scorer import SCORING_LEVELS, SCORING_METHOD, score_window
+from .lane_d_bench import paired_gate
 from .lane_d_forward import eligible_windows
 from .lane_d_frozen import advance_frozen_set
-from .lane_d_report import REPORT_SCHEMA, rows_sha256, sign_report, validate_report
+from .lane_d_gate import gate_record
+from .lane_d_report import (
+    REPORT_SCHEMA,
+    SKIP_REASONS,
+    rows_sha256,
+    sign_report,
+    validate_report,
+)
 from .lane_d_state import (
     LaneDStateError,
     load_prior_state,
@@ -315,9 +338,13 @@ def _register(state: dict, entries: list[dict], cfg, uid_of: dict) -> list[dict]
     return voided
 
 
-def _select(state: dict, cfg) -> tuple[list[str], list[dict]]:
-    """FIFO by reveal time under the per-settlement / per-coldkey caps."""
-    open_ = sorted((dg for dg, r in state["entries"].items() if r["status"] in OPEN_STATUSES),
+def _select(state: dict, cfg, exclude: frozenset[str] = frozenset()
+            ) -> tuple[list[str], list[dict]]:
+    """FIFO by reveal time under the per-settlement / per-coldkey caps.
+    ``exclude`` (held gate candidates, re-gated without a duel) is never
+    selected and never counts against a cap."""
+    open_ = sorted((dg for dg, r in state["entries"].items()
+                    if r["status"] in OPEN_STATUSES and dg not in exclude),
                    key=lambda dg: (state["entries"][dg]["reveal_ts"], dg))
     chosen, skipped, per_cold = [], [], {}
     for dg in open_:
@@ -352,6 +379,95 @@ def _king_reveal_ts(state: dict, digest: str) -> int | None:
         if k["digest"] == digest:
             return int(k["reveal_ts"])
     return None
+
+
+def _confirm_king_ts(state: dict, members: list[str], digest: str) -> int | None:
+    """D20 ``"original"``: the reveal time of a first-clear king the state no
+    longer knows (not the king, the house or a prior king), from the
+    ``confirm`` record of a member that first-cleared against it."""
+    for m in sorted(members):
+        conf = state["entries"][m].get("confirm") or {}
+        ts = conf.get("king_reveal_ts")
+        if conf.get("king_digest") == digest and isinstance(ts, int) and not isinstance(ts, bool):
+            return int(ts)
+    return None
+
+
+# ── the §1.3b gate (W5e) ────────────────────────────────────────────────────
+
+
+def _held_candidates(state: dict, cfg) -> list[str]:
+    """The open entries holding a cleared confirmation the gate could not
+    decide (``gate_hold``, a ``bench_hold``). They are re-gated without a new
+    duel. If KING_D changed since the hold, D20 decides: ``"original"`` keeps
+    the hold; ``"restart"`` drops it and the entry restarts at stage
+    ``first`` (its windows stay used)."""
+    out = []
+    for dg, rec in sorted(state["entries"].items()):
+        hold = rec.get("gate_hold")
+        if rec["status"] not in OPEN_STATUSES or not hold:
+            continue
+        if (hold["king_d"] != state["king"]["digest"]
+                and cfg.confirm_on_king_change != "original"):
+            rec.pop("gate_hold")
+            rec.update(status="pending", reason="pending_floor", confirm=None, frozen_set=None)
+            continue
+        out.append(dg)
+    return out
+
+
+def _ranked(cands: list[dict]) -> list[dict]:
+    """Max-T order: highest LCB first, then the earlier reveal, then digest."""
+    return sorted(cands, key=lambda c: (-c["lcb"], c["reveal_ts"], c["digest"]))
+
+
+def _gate_result(res: dict, digest: str) -> dict:
+    """A :func:`paired_gate` result projected onto one ``gate.results[]``
+    item (no free text, §14.3 item 4)."""
+    lcb = res.get("lcb") if res["outcome"] in ("pass", "gate_regression") else None
+    return {"digest": digest, "outcome": res["outcome"],
+            "lcb": None if lcb is None else {r: {m: float(lcb[r][m]) for m in ("crps", "mase")}
+                                             for r in ("king_d", "house")},
+            "blocked_by": [str(r) for r in res.get("blocked_by") or []]
+            if res["outcome"] == "gate_regression" else [],
+            "session": str(res["session"])}
+
+
+def _run_gate(cands: list[dict], state: dict, cfg, boundary: int,
+              block_hash: str | None, sentinel: str | None, bench
+              ) -> tuple[dict | None, dict[str, str]]:
+    """``(gate record, {digest: outcome})`` for this settlement's crowning
+    candidates. No candidate: ``(None, {})`` and no host call. No ``bench``
+    or no ``block_hash``: the §1.3b gate cannot run, so every candidate is
+    ``bench_hold`` and no record is written (fail closed). Otherwise one
+    draw (:func:`gate_record`) and, per candidate in max-T order, one paired
+    sweep with KING_D and the house in ``bench``'s session (the drawn suite,
+    plus the sentinel suite when one is given) decided by
+    :func:`paired_gate`. A host sweep that raises is that candidate's
+    ``bench_hold`` (infrastructure, never the miner's fault)."""
+    if not cands:
+        return None, {}
+    if bench is None or block_hash is None:
+        return None, {c["digest"]: "bench_hold" for c in cands}
+    record = gate_record(cfg, int(boundary), block_hash, sentinel=sentinel)
+    suite = record["suite"]
+    suites = [suite] if sentinel is None else [suite, str(sentinel)]
+    king_d, house_d = str(state["king"]["digest"]), str(state["house"]["digest"])
+    seed = f"lane-d/1:gate:{int(boundary)}:{record['block_hash']}"
+    results, outcomes = [], {}
+    for c in _ranked(cands):
+        dg = c["digest"]
+        try:
+            cand_rec, king_rec, house_rec = bench.paired(dg, king_d, house_d, suites=suites)
+        except Exception:  # any host failure is infrastructure: hold, never crown
+            res = {"outcome": "bench_hold", "session": bench.session_id}
+        else:
+            res = paired_gate(cand_rec, king_rec, house_rec, suite=suite,
+                              alpha=float(cfg.alpha), tau_public=float(cfg.tau_public),
+                              B=int(cfg.bootstrap_B), seed=seed, sentinel=sentinel)
+        outcomes[dg] = str(res["outcome"])
+        results.append(_gate_result(res, dg))
+    return {**record, "results": results}, outcomes
 
 
 def _load_pools(pool_dir, prior_pool_dirs, horizon: int) -> list[dict]:
@@ -565,13 +681,22 @@ def _closing(cfg, boundary: int) -> bool:
 
 def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: dict,
                   forecasts: dict, uid_of: dict, state_path, signer,
-                  prior_pool_dirs=(), expect_prior_sha256: str | None = None
-                  ) -> LaneDSettlement:
+                  prior_pool_dirs=(), expect_prior_sha256: str | None = None,
+                  boundary_block_hash: str | None = None, sentinel: str | None = None,
+                  bench=None) -> LaneDSettlement:
     """Settle lane D at ``boundary`` (see the module docstring).
 
     ``pool_dir`` is the newest ``pool_d`` snapshot; ``prior_pool_dirs`` are
     the earlier retained ones. They feed every open entry's union and supply
     the history and targets of windows frozen from them.
+
+    The §1.3b gate inputs (W5e): ``boundary_block_hash`` is the settlement
+    boundary's block hash (``0x`` + 64 hex, the draw's input), ``sentinel``
+    the era's §16 sentinel suite (``None`` = W-S1 unarmed) and ``bench`` the
+    bench host session (a :class:`~cascade.validator.lane_d_bench.SweepSession`).
+    Only a settlement with a crowning candidate uses them; without ``bench``
+    or ``boundary_block_hash`` every crowning candidate is ``bench_hold``
+    (fail closed: nothing crowns ungated).
 
     ``expect_prior_sha256`` (the last published receipt's
     ``posterior_state_sha256``), when given, must equal the digest of the
@@ -613,6 +738,7 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
         state["entries"][dg]["reason"] = reason
         skipped.append({"digest": dg, "reason": reason})
 
+    held: list[str] = []
     if _closing(cfg, boundary):
         for dg, rec in sorted(state["entries"].items()):
             if rec["status"] in OPEN_STATUSES:
@@ -620,7 +746,9 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
                 skip(dg, "lane_closed")
         chosen = []
     else:
-        chosen, capped = _select(state, cfg)
+        # A held gate candidate is re-gated, never re-duelled (W5e).
+        held = _held_candidates(state, cfg)
+        chosen, capped = _select(state, cfg, frozenset(held))
         skipped += capped
 
     # A member whose forecasts are malformed on any pool window is the miner's fault.
@@ -645,9 +773,14 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     # snapshot each already-judged window was scored from.
     pinned: dict[str, str] = {}
     rows, windows_out, cohorts, verdicts = [], {}, [], []
-    crowned: list[dict] = []
+    # The crowning candidates: verdicts that clear at stage ``confirm``.
+    candidates: list[dict] = []
     for (kd, stage), members in sorted(groups.items()):
         king_ts = _king_reveal_ts(state, kd)
+        if king_ts is None and stage == "confirm":
+            # D20 "original" after a king change: the first-clear king's T
+            # comes from the confirm record (not king_unscored).
+            king_ts = _confirm_king_ts(state, members, kd)
         # Change 3: when a miner holds KING_D, the current house is a second
         # bar on the same set (a copy of a fresh house must not win). Its
         # forecasts are required: a house that cannot be scored fails closed.
@@ -745,19 +878,62 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
                 # ``used_windows`` (D20).
                 rec.update(status="confirm_pending", reason="confirm_pending",
                            confirm={"first_set_sha256": set_sha, "king_digest": kd,
+                                    "king_reveal_ts": int(king_ts),
                                     "rule": str(cfg.confirm_on_king_change),
                                     "boundary": boundary},
                            frozen_set=None)
             else:
+                # A crowning candidate: crowned only through the §1.3b gate.
                 outcome = "confirmed"
-                crowned.append({"digest": m, "lcb": r["lcb"], "reveal_ts": rec["reveal_ts"]})
+                candidates.append({"digest": m, "lcb": float(r["lcb"]),
+                                   "reveal_ts": int(rec["reveal_ts"]), "set_sha256": set_sha})
             verdicts.append({"digest": m, "king_digest": kd, "stage": stage,
                              "cohort": len(cohorts) - 1, **r, "outcome": outcome,
                              "confirmation": confirmation, "lowfreq": lowfreq})
 
+    # Held candidates (an earlier bench_hold) are re-gated with the clear
+    # they confirmed, without a duel: no rows, no verdict this settlement.
+    for dg in held:
+        hold = state["entries"][dg]["gate_hold"]
+        candidates.append({"digest": dg, "lcb": float(hold["lcb"]),
+                           "reveal_ts": int(state["entries"][dg]["reveal_ts"]),
+                           "set_sha256": str(hold["set_sha256"]), "held": True})
+    gate, gate_outcomes = _run_gate(candidates, state, cfg, boundary, boundary_block_hash,
+                                    sentinel, bench)
+    by_verdict = {v["digest"]: v for v in verdicts}
+    passing = []
+    for c in candidates:
+        dg, outcome = c["digest"], gate_outcomes[c["digest"]]
+        rec = state["entries"][dg]
+        if outcome == "pass":
+            rec.pop("gate_hold", None)
+            passing.append(c)
+            continue
+        if outcome == "bench_hold":
+            # Infrastructure, never the miner's fault: open, the clear kept
+            # (an existing hold keeps its first record), not crowned or lost.
+            rec["gate_hold"] = rec.get("gate_hold") or {
+                "boundary": boundary, "king_d": str(state["king"]["digest"]),
+                "lcb": c["lcb"], "set_sha256": c["set_sha256"]}
+            rec["status"] = "confirm_pending"
+            reason = "bench_hold"
+        else:
+            rec.pop("gate_hold", None)
+            # gate_regression is a judged loss; checkpoint_fault the miner's fault.
+            rec["status"] = "lost" if outcome == "gate_regression" else "closed"
+            reason = outcome
+            if dg in by_verdict:
+                by_verdict[dg]["outcome"] = "lost"
+        if c.get("held") and reason in SKIP_REASONS:
+            # Considered and not judged this settlement: a typed skip
+            # (gate_regression is a judged loss, an entry reason only).
+            skip(dg, reason)
+        else:
+            rec["reason"] = reason
+
     new_king = None
-    if crowned:
-        best = sorted(crowned, key=lambda c: (-c["lcb"], c["reveal_ts"], c["digest"]))[0]
+    if passing:
+        best = _ranked(passing)[0]
         new_king = best["digest"]
         old = state["king"]
         if not old.get("house"):
@@ -798,6 +974,9 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
         "verdicts": verdicts, "rows": rows, "rows_sha256": rows_sha256(rows),
         "pay": {"share": pay["share"], "court": court},
     }
+    if gate is not None:
+        # Present iff the gate ran (absent, never null, otherwise).
+        report["gate"] = gate
     report = sign_report(report, signer)
     # Fail closed: a report outside lane-d-report/1 is never returned, and
     # neither the report file nor the state is written (ReportSchemaError
