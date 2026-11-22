@@ -23,6 +23,7 @@ from .helpers import (
     HOUR,
     PARAMS_FIELDS,
     ROOTS,
+    assert_valid,
     canonical_rows_sha256,
     coldkey,
     finite,
@@ -38,12 +39,10 @@ def scratch(tmp_path_factory):
 
 
 def _built(scratch, *, rich=True):
-    from cascade.validator.lane_d_report import validate_report
-
     built = two_settlements(scratch / ("rich" if rich else "legacy"), rich=rich)
     for s in (built["s1"], built["s2"]):
         assert s.report is not None, "an armed settlement produced no lane D report"
-        validate_report(s.report)
+        assert_valid(s.report)
     return built
 
 

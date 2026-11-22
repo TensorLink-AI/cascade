@@ -31,6 +31,7 @@ from .helpers import (
     GATE_RESULT_FIELDS,
     GATE_SENTINEL,
     SCHEMA_FILE,
+    assert_valid,
     build_gate,
     text_digest,
     two_settlements,
@@ -70,13 +71,7 @@ def _gated(scratch) -> dict:
 
 
 def _validate(report):
-    from cascade.validator.lane_d_report import ReportSchemaError, validate_report
-
-    try:
-        validate_report(report)
-    except ReportSchemaError as exc:
-        raise AssertionError(f"a valid gated report is refused: {exc.code} at {exc.field}: "
-                             f"{exc}") from exc
+    assert_valid(report)
 
 
 def _refused(report, code, field):
@@ -124,13 +119,11 @@ def test_report_carrying_a_gate_record_validates(scratch):
 
 
 def test_gate_is_optional_reports_without_it_validate(scratch):
-    from cascade.validator.lane_d_report import validate_report
-
     built = two_settlements(scratch)
     for s in (built["s1"], built["s2"]):
         r = copy.deepcopy(s.report)
         r.pop("gate", None)
-        assert validate_report(r) is None
+        assert_valid(r)
 
 
 def test_no_gated_candidate_means_no_gate_key(scratch):

@@ -24,6 +24,7 @@ from .helpers import (
     READY_BLOCK,
     REVEAL_BLOCK,
     SKIP_REASONS,
+    assert_valid,
     build_chain,
     canonical_rows_sha256,
     coldkey,
@@ -43,9 +44,7 @@ def scratch(tmp_path_factory):
 
 def _check_typed(report):
     """Generic invariant 11 over one report."""
-    from cascade.validator.lane_d_report import validate_report
-
-    validate_report(report)
+    assert_valid(report)
     for e in report["entries"]:
         assert e["status"] in ENTRY_STATUSES, e
         assert e["reason"] in ENTRY_REASONS, e

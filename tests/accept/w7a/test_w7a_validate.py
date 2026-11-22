@@ -19,6 +19,7 @@ from .helpers import (
     PARAMS_FIELDS,
     SCHEMA_ERROR_CODES,
     TOP_LEVEL_REQUIRED,
+    assert_valid,
     reseal,
     two_settlements,
 )
@@ -58,17 +59,16 @@ def _s2(scratch) -> dict:
 
 
 def test_settle_reports_validate(scratch):
-    built, validate_report, _ = _reports(scratch)
+    built, _, _ = _reports(scratch)
     for s in (built["s1"], built["s2"]):
         assert s.report is not None
-        assert validate_report(s.report) is None
+        assert_valid(s.report)
 
 
 def test_extensions_map_is_optional_and_open(scratch):
-    _, validate_report, _ = _reports(scratch)
     r = _s2(scratch)
     r["extensions"] = {"operator_note_id": 7, "nested": {"anything": [1, 2]}}
-    assert validate_report(r) is None
+    assert_valid(r)
     r["extensions"] = ["not", "a", "map"]
     _refused(scratch, r, "bad_type", "extensions")
 
@@ -128,6 +128,7 @@ def test_unknown_top_level_field_is_refused(scratch):
 @pytest.mark.parametrize("name", PARAMS_FIELDS)
 def test_every_params_field_is_required(scratch, name):
     r = _s2(scratch)
+    assert name in r["params"], f"the report has no params.{name}"
     del r["params"][name]
     _refused(scratch, r, "missing_field", f"params.{name}")
 
@@ -266,5 +267,4 @@ def test_rows_sha256_mismatch_is_refused(scratch):
     r = _s2(scratch)
     r["rows"][0]["crps"] = float(r["rows"][0]["crps"]) + 1.0
     _refused(scratch, r, "rows_sha256_mismatch", "rows_sha256")
-    _, validate_report, _ = _reports(scratch)
-    assert validate_report(reseal(r)) is None, "a resealed row set is structurally valid"
+    assert_valid(reseal(r))  # a resealed row set is structurally valid

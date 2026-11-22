@@ -61,6 +61,15 @@ enforces it. The tests pin both and tie them together.
   draw (W3b1), `max_source_share` to re-check W5b's T18e drop and
   `min_long_series` to check a context variant's arming (§1.7). An optional
   field would let a report omit a value the cross-check needs.
+- **`pool.snapshots` and `windows[].snapshot_sha256` are required** (RV4,
+  for W5b #581). W5b judges windows from older snapshots of a union, so the
+  signed report must bind every snapshot a scored version came from
+  (invariant 4), and satellites must be able to check it from the report
+  alone (§14.3 item 2). Every report has at least one loaded snapshot, the
+  newest, so there is no "absent" case to express. An optional field would
+  let a report silently drop the binding. The cost is that every producer
+  emits them, which is trivial for one snapshot (`[newest]`, every window
+  from it). See "Snapshots" below.
 - **`lane_closed` is a typed reason** (W5b, T18). At `[lane_d] until_block`
   every open entry closes with status `closed` and reason `lane_closed`, in
   `entries[].reason` and `skipped[].reason`, and that report validates.
@@ -124,17 +133,36 @@ Top level (all required): `schema`, `boundary`, `signer`, `signature`,
 | object | required fields (the tests check these; more are the builder's choice, but they must be in the schema) |
 |---|---|
 | `params` | `share`, `takes_from`, `remainder`, `horizon`, `horizons` (§14.3 horizon list, `[horizon]` today), `contexts`, `forward_margin_hours`, `max_mirror_lag_hours`, `min_windows`, `min_clusters`, `d_margin`, `alpha`, `bootstrap_B`, `king_decay`, `reward_prior_kings`, `confirm_on_king_change`, `max_entries_per_settlement`, `max_judged_per_coldkey_per_settlement`, `scoring_levels`, `gate_suites` (§14.3 suite list), `tau_public`, `lowfreq_freqs`, **(RV4)** `gate_weights` (`{suite: weight}` as parsed: keys ⊆ `gate_suites`, a suite absent from the table is absent here; finite numbers ≥ 0), `max_source_share` (number in (0, 1]), `min_long_series` (int ≥ 0). Each equals the parsed `[lane_d]` value (lists as JSON lists) |
-| `pool` | `snapshot`, `sha256`, `horizon`, `first_seen_roots`: the B12 daily Merkle roots the snapshot relies on, sorted, from pool metadata `first_seen_roots` |
+| `pool` | `snapshot`, `sha256`, `horizon` (the newest snapshot's), `first_seen_roots`: the B12 daily Merkle roots the snapshots rely on, sorted, from pool metadata `first_seen_roots` (the sorted union of `snapshots[].first_seen_roots`), **(RV4)** `snapshots` |
+| `pool.snapshots[]` | **(RV4)** `snapshot`, `sha256` (64-hex), `first_seen_roots` (64-hex list) |
 | `entries[]` | `digest`, `hotkey`, `coldkey` (A8: as recorded at `ready`, `null` if unresolved), `context` (§14.3 per-entry context), `ready_block`, `reveal_block`, `reveal_ts`, `status`, `reason` |
 | `judged` | the digests judged at this settlement, equal to the verdicts' digests |
 | `skipped[]` | `digest`, `reason` ∈ `SKIP_REASONS`. One per entry considered this settlement and not judged, **including entries voided this settlement** (`deregistered`, `coldkey_unresolved`, `ready_expired`, …). Disjoint from `judged` |
 | `cohorts[]` | `index`, `king_digest`, `king_reveal_ts`, `stage`, `members`, `t_max`, `window_ids`, `set_sha256`, `first_seen_roots` (the roots the frozen set relies on: the snapshot's roots today, a union once W5b unions snapshots), `refused`: `{reason: count}` of the pool windows refused by the §1.3 eligibility rule, keys from `WINDOW_REFUSAL_REASONS`, counts ≥ 1. Windows dropped for other reasons (already used, no forecast) aren't counted |
-| `windows[]` | `window_id`, `source`, `feed` (series `feed`, default `source`), `min_target_ts` and `min_first_seen_ts` (both clocks, A1), `mirror_lag_hours` (the feed's `feeds[feed].mirror_lag_hours`, `null` when unmeasured; an unlisted feed's window is refused `unlisted_feed`, so it never appears here) |
+| `windows[]` | `window_id`, `source`, `feed` (series `feed`, default `source`), `min_target_ts` and `min_first_seen_ts` (both clocks, A1), `mirror_lag_hours` (the feed's `feeds[feed].mirror_lag_hours`, `null` when unmeasured; an unlisted feed's window is refused `unlisted_feed`, so it never appears here), **(RV4)** `snapshot_sha256` (64-hex: the snapshot whose version was scored) |
 | `verdicts[]` | `digest`, `king_digest`, `stage`, `cohort`, `lcb`, `gain`, `cleared`, `outcome`, `confirmation`, `lowfreq` |
 | `verdicts[].confirmation` | `stage` (`first`/`confirm`), `rule` (= `confirm_on_king_change`), `first_set_sha256` and `first_king_digest`: `null` on stage `first`; on `confirm`, the first clear's `set_sha256` and king (A2, D20) |
 | `verdicts[].lowfreq` | `result`, `freqs` (= `lowfreq_freqs`), `n_windows`, `tau_public` (A10). The candidate is a verdict that cleared at stage `confirm`: `pass` or `fail` (`fail` means the entry isn't crowned, `lowfreq_regression`), or `no_windows` when the set holds no window at those frequencies. Every other verdict is `not_candidate` with `n_windows = 0`. The test fixture is hourly, so the crowned candidate is `no_windows`. Computing pass and fail is W3b5's job |
 | `rows[]` | `window_id`, `digest`, `cohort`, `crps`, `mase`, all finite |
 | `pay` | `share`, `court[]`: `digest`, `hotkey`, `uid`, `burn_reason` |
+
+### Snapshots (RV4, for W5b #581)
+
+| rule | refused as |
+|---|---|
+| `pool.snapshots` is a list of closed `{snapshot, sha256, first_seen_roots}` objects | `bad_type` at `pool.snapshots`; an extra key is `unknown_field` at `pool.snapshots[i].<key>` |
+| `sha256` and each root are 64 lowercase hex | `bad_value` at `pool.snapshots[i].sha256` / `.first_seen_roots[j]` |
+| each snapshot is listed once, by name and by sha256 (the name is checked first) | `bad_value` at the later item's `snapshot` or `sha256` |
+| the newest snapshot (`pool.snapshot` with `pool.sha256`) is listed | `bad_value` at `pool.snapshots` |
+| `windows[i].snapshot_sha256` is one of `pool.snapshots[].sha256` | `bad_value` at `windows[i].snapshot_sha256` |
+
+Cross-field rules run after the structural checks. The producer also keeps
+`pool.first_seen_roots` equal to the sorted union of the listed roots (the
+e2e test checks it; W5b #581 pins the union across two snapshots). Which
+snapshot a window's version comes from is W5b's rule, not W7a's. The fixture
+for the validator tests is `helpers.with_snapshots`, spliced into a real
+report: one snapshot, or snapshot 1 added as an older member that scores
+the first window.
 
 ### The gate record (RV4)
 
@@ -204,6 +232,7 @@ below belongs to W5g and W5h.
 | §14.3 forward fields, both clocks, mirror lag, roots, judged set, coldkey, confirmation, low-frequency, burn | the other `test_e2e_*` tests in `test_w7a_report_fields.py`. Two settlements: the first clear (house holds the slot, `house_king`), then the confirmation that crowns. One `before_margin` trap window per pool |
 | the W5b `until_block` closing settlement's report validates (`lane_closed`) | `test_e2e_until_block_closing_report_validates` in `test_w7a_lane_closed.py` (W5b's fixture, imported from `tests/accept/w5b/helpers.py`) |
 | RV4 gate record: optional, closed, outcomes, LCBs, consistency | `test_w7a_gate_record.py` |
+| RV4 `pool.snapshots`, `windows[].snapshot_sha256` | `test_w7a_snapshots.py` |
 | RV4 `params.gate_weights`, `max_source_share`, `min_long_series` | `test_w7a_gate_params.py` (default config, plus one settlement under a non-default overlay), `test_every_params_field_is_required`, `test_e2e_params_carry_every_satellite_value` |
 | invariant 11 (exact reasons) | `test_inv11_*` in `test_w7a_inv11_reasons.py`. Covers the coldkey cap (`coldkey_cap_settlement`, the entry stays `pending` with that reason), `deregistered`, `coldkey_unresolved` (`coldkey: null`), `ready_expired`, a floor miss (`pending_floor`, no rows, `rows_sha256` of `[]`), a house-held slot (`house_king`) and a crowned king that deregisters (`deregistered`) |
 
@@ -239,7 +268,8 @@ verify a signature. Run them locally with `-m "not torch"`.
 ### Correction (RV4): the gate record and gate params
 
 RV4 BLOCKING W7a: the closed schema had nowhere for the drawn gate suite,
-the sentinel, the gate results or the gate weights, so W5e couldn't sign
+the sentinel, the gate results or the gate weights (nor, for W5b #581, the
+snapshots a union scores from), so W5e couldn't sign
 them without a `lane-d-report/2` bump. On main these fail on `assert` only:
 
 - every test in `test_w7a_gate_record.py` that inserts a `gate`: main
@@ -251,5 +281,10 @@ them without a `lane-d-report/2` bump. On main these fail on `assert` only:
   property) and `test_schema_enums_match_the_module_tuples_exactly` for
   `entry_reason` (`gate_regression`), `gate_outcome` and `gate_ref`.
 
-`test_gate_is_optional_reports_without_it_validate` and the fixture check
-pass on main.
+- every test in `test_w7a_snapshots.py` (the fields are absent, and the
+  closed schema refuses them as `unknown_field`).
+
+`test_gate_is_optional_reports_without_it_validate` and the gate fixture
+check pass on main. A valid report is now checked through
+`helpers.assert_valid`, so a refusal is an `AssertionError` naming the code
+and field.

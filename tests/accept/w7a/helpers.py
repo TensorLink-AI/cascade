@@ -124,14 +124,18 @@ PARAMS_FIELDS = ("share", "takes_from", "remainder", "horizon", "horizons", "con
                  "gate_weights", "max_source_share", "min_long_series")
 GATE_FIELDS = ("suite", "block", "block_hash", "sentinel", "eligible", "results")
 GATE_RESULT_FIELDS = ("digest", "outcome", "lcb", "blocked_by", "session")
-POOL_FIELDS = ("snapshot", "sha256", "horizon", "first_seen_roots")
+# `snapshots` (RV4, W5b #581): every snapshot a judged window's version came
+# from; `snapshot` / `sha256` / `horizon` stay the newest snapshot's.
+POOL_FIELDS = ("snapshot", "sha256", "horizon", "first_seen_roots", "snapshots")
+POOL_SNAPSHOT_FIELDS = ("snapshot", "sha256", "first_seen_roots")
 ENTRY_FIELDS = ("digest", "hotkey", "coldkey", "context", "ready_block", "reveal_block",
                 "reveal_ts", "status", "reason")
 SKIP_FIELDS = ("digest", "reason")
 COHORT_FIELDS = ("index", "king_digest", "king_reveal_ts", "stage", "members", "t_max",
                  "window_ids", "set_sha256", "first_seen_roots", "refused")
+# `snapshot_sha256` (RV4, W5b #581): the snapshot whose version was scored.
 WINDOW_FIELDS = ("window_id", "source", "feed", "min_target_ts", "min_first_seen_ts",
-                 "mirror_lag_hours")
+                 "mirror_lag_hours", "snapshot_sha256")
 VERDICT_FIELDS = ("digest", "king_digest", "stage", "cohort", "lcb", "gain", "cleared",
                   "outcome", "confirmation", "lowfreq")
 CONFIRMATION_FIELDS = ("stage", "rule", "first_set_sha256", "first_king_digest")
@@ -336,6 +340,40 @@ def reseal(report: dict) -> dict:
     the only remaining defect is the one a test introduced."""
     out = copy.deepcopy(report)
     out["rows_sha256"] = canonical_rows_sha256(out["rows"])
+    return out
+
+
+def assert_valid(report) -> None:
+    """`validate_report(report)`, a refusal surfacing as an `AssertionError`
+    that names the code and field."""
+    from cascade.validator.lane_d_report import ReportSchemaError, validate_report
+
+    try:
+        assert validate_report(report) is None
+    except ReportSchemaError as exc:
+        raise AssertionError(f"report refused: {exc.code} at {exc.field}: {exc}") from exc
+
+
+def with_snapshots(report: dict, older: dict | None = None) -> dict:
+    """``report`` with the RV4 snapshot fields spliced in from its own `pool`
+    (one snapshot, every window scored from it). ``older`` (``{snapshot,
+    sha256, first_seen_roots}``) adds a second, older snapshot that the first
+    window is scored from, as a W5b union would."""
+    out = copy.deepcopy(report)
+    pool = out["pool"]
+    snaps = [{"snapshot": pool["snapshot"], "sha256": pool["sha256"],
+              "first_seen_roots": list(pool["first_seen_roots"])}]
+    for w in out["windows"]:
+        w["snapshot_sha256"] = pool["sha256"]
+    if older is not None:
+        snaps.insert(0, copy.deepcopy(older))
+        pool["first_seen_roots"] = sorted(set(pool["first_seen_roots"])
+                                          | set(older["first_seen_roots"]))
+        for c in out["cohorts"]:
+            c["first_seen_roots"] = list(pool["first_seen_roots"])
+        if out["windows"]:
+            out["windows"][0]["snapshot_sha256"] = older["sha256"]
+    pool["snapshots"] = snaps
     return out
 
 
