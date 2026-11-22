@@ -1,10 +1,19 @@
 # Plan: lane D "open weights" (anything goes on our architecture), with lane E and lane A flexibility — v3
 
-Status: **PLAN v3, rev6.2 (proposed 2026-11-22)**: v2's design, made buildable by an
+Status: **PLAN v3, rev6.3 (proposed 2026-11-22)**: v2's design, made buildable by an
 autonomous loop. A work package is done **only when its Accept command exits
 0**; **(rev6)** its level is only what `scripts/laned/status` computes (§17),
 never a claim. Owner decisions are marked **[DECIDE]**. Nothing is armed. **No calendar
 dates**: stages are gated (§5).
+
+## rev6.3 (owner 2026-11-22; main @ 28a1e98)
+
+Adds one proposed WP. Plan text only; nothing else in the design changes.
+The changed item is marked **(rev6.3)**.
+
+| Item | Decision | Landed in |
+|---|---|---|
+| (a) | **Proposed (owner 2026-11-22 approved adding it):** WB24 lane B miner CLI: `cascade lane-b fund` gains `--declared-rows <file>` (signed WB14 header + `rows=` tag, local refusal with `DECLARED_ROWS_CODES`), `--target suite:<s>` (WB18) and `--train-hours` (WB23, once built); `lane-b status` shows the deferral/refusal reasons; new `lane-b verify-repo <dir>` runs the WB13 scan locally (no upload, never executes the repo) | Lane B table, WB24 row |
 
 ## rev6.2 (owner decisions 2026-11-22; main @ 6108ebd)
 
@@ -1633,6 +1642,7 @@ Every new `[lane_b]` key below ships with:
 | WB19 | **(rev5)** Expert-leg measurement (LB6), **per candidate GPU type**: expert-only step rate, leg overhead split from training, peak memory at contract micro-batching, image qualification; plus one full lane A leg on 8×H100 (is 13,600 s training-only?) | `evidence/wb19.json` per-GPU table | — | pod (owner yes, OA8) | `scripts/laned/accept WB19 --evidence evidence/wb19.json` |
 | WB22 | **(rev5)** Lane B GPU list (D42): `[lane_b] funded_pod_skus` separate from `[round]`; `GpuChoice` reads it for lane B legs only; trainer-side per-GPU step-rate table from WB19; audit re-derivation pinned to the recorded `gpu_name` | loader parse + round-trip + mutation test; lane A choice unchanged | WB10, WB19 | ci | `scripts/laned/accept WB22` (TB23, TB24) |
 | WB23 | **(rev5)** Miner-chosen leg length (D42, D42b): `train_hours` on the funding request (0.5–`max_leg_hours`, 0.5 h steps); steps fixed at admission and signed in the leg record; guard = `train_hours × guard_factor` + overhead, capped at `[lane_b] max_leg_seconds` (lane B contract derivation; `[training] max_train_seconds` untouched); expected landing boundary returned to the miner; validator check of recorded steps and guard | keys `max_leg_hours`, `max_leg_seconds`, `guard_factor`; `status/lane_b.json` shows steps, GPU and landing boundary | WB10, WB22 | ci | `scripts/laned/accept WB23` (TB25–TB27) |
+| WB24 | **(rev6.3, proposed)** Lane B miner CLI. Today `cascade lane-b fund` / `lane-b status` (`cascade/miner/lane_b.py`) do not send the declared-rows header, so the WB20 docs have miners hand-build that request. `cascade lane-b fund` gains `--declared-rows <file>` (builds and signs the WB14 `X-Lane-B-Declared-Rows` header and its signed `rows=` tag; refuses locally with the same `DECLARED_ROWS_CODES` the intake uses), `--target suite:<s>` (suite targets, WB18) and `--train-hours` (WB23, once built). `cascade lane-b status` shows the new deferral and refusal reasons (`rows_held`, `sentinel_target`, the `gate_closed_reason` values, the WB13 contamination codes incl. `contamination_budget_exceeded`) from `status/lane_b.json` and the intake replies. New `cascade lane-b verify-repo <dir>` runs the WB13 scan (`scan_repo`) locally against the pinned hash set (no upload; never executes the repo) so a miner can check before funding. Never prints keys; unarmed defaults unchanged | CLI flags `--declared-rows`, `--target suite:<s>`, `--train-hours`; subcommand `verify-repo` | WB13, WB14, WB15, WB17, WB18 (WB23 for `--train-hours`) | ci | `scripts/laned/accept WB24` |
 | W-EMA | **(rev5)** Score the raw cooled endpoint on every leg (lanes A and B): `power_ema_active` → raw for warm-start legs; keep writing `weights_ema005`/`weights_ema010` unscored; main-validator EMA telemetry off the critical path (§8). Blocks every repin ≥ rc16 and D40(b) | worker image (`pyramid_trainer.py`) | — | ci + testnet | `scripts/laned/accept W-EMA` |
 | WB20 | Lane B docs (MINER, INTERFACE, AGENT_MINING, VALIDATOR) | — | WB13–WB18 | ci | `scripts/laned/accept WB20` |
 | WB21 | DEC-CA-0071 amendment (this PR drafts it; owner accepts) | — | — | ci + owner | `scripts/laned/accept WB21` |
