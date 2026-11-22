@@ -221,7 +221,9 @@ jobs:
         # `accept --help`, CROSS rule: every other WP at >= L2 on the base whose
         # tests import, name or PATHS-cover a changed path re-runs its Accept
         # (pytest in one shared run + stub_scan, no e2e). The PR's own WP is
-        # its main step above and never runs twice. Any CROSS <WP> FAIL fails the job.
+        # its main step above and never runs twice. Any CROSS <WP> FAIL fails the job;
+        # a WP red on HEAD is re-run at the base (temporary worktree) and is
+        # CROSS <WP> KNOWN (job not failed) when every failing test is red there too.
         if: always() && env.LANED_CROSS == '1'
         env:
           WPS: ${{ steps.select.outputs.wps }}

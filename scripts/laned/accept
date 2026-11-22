@@ -20,7 +20,7 @@
         for a review WP RV<n>: MODE review iff the diff is exactly an add or
         modify of evidence/rv<n>.md (no tests run)
     accept <WP>[,<WP>...] --cross --base REF --head REF [--root R]
-        cross-WP regressions (CROSS rule below); prints `CROSS <WP> PASS|FAIL`
+        cross-WP regressions (CROSS rule below); prints `CROSS <WP> PASS|KNOWN|FAIL`
     accept selftest
         offline check of the review, tests-correction, verification,
         evidence and cross modes
@@ -109,6 +109,15 @@ its test dir (all cross WPs in one pytest run, split only where two
 non-package test dirs share a module basename) and stub_scan over its PATHS;
 no e2e (the main step ran it). A failure the junit report cannot attribute to
 one WP fails every WP of that run.
+A cross WP whose pytest fails on HEAD is re-run at BASE (a temporary detached
+worktree of BASE, same LANED_PYTEST_CMD, removed afterwards) and compared per
+junit test id:
+    CROSS <WP> KNOWN  every test failing on HEAD also fails on BASE (already
+                      red on main; printed with the ids; does not fail the job)
+    CROSS <WP> FAIL   a test that passes on BASE fails on HEAD (a regression),
+                      or either run is not plain test failures (no report,
+                      unattributed failures, a collection error, nothing
+                      collected): fails closed.
 
 The pytest command is `uv run --frozen pytest` unless LANED_PYTEST_CMD is set
 (shlex-split). It always runs with cwd = --root. Exit 0 means pass.
@@ -849,11 +858,25 @@ def _owner(case: ET.Element, prefixes: dict[str, str]) -> str | None:
     return None
 
 
-def cross_pytest(root: Path, wps: list[str]) -> dict[str, str]:
-    """One pytest run per collision group over the WPs' test dirs;
-    ``{WP: "" when green, else why}``. Fails closed: a failure that cannot be
-    attributed to one WP fails every WP of its run."""
-    res: dict[str, str] = {}
+class CrossRun:
+    """One WP's share of a shared pytest run. ``why`` is "" when green.
+    ``failed`` holds the failing junit test ids; ``comparable`` is False when
+    the outcome is not just attributed test failures (no report, unattributed
+    failures, nothing collected, a collection error, a bare pytest exit)."""
+
+    def __init__(self, why: str = "", failed: frozenset[str] = frozenset(), comparable: bool = False):
+        self.why, self.failed, self.comparable = why, failed, comparable
+
+
+def _case_id(case: ET.Element) -> str:
+    return f"{case.get('classname', '')}::{case.get('name', '')}"
+
+
+def cross_pytest(root: Path, wps: list[str]) -> dict[str, CrossRun]:
+    """One pytest run per collision group over the WPs' test dirs at ``root``.
+    Fails closed: a failure that cannot be attributed to one WP fails every
+    WP of its run."""
+    res: dict[str, CrossRun] = {}
     for group in _collision_groups(root, wps):
         prefixes = {wp: f"tests.accept.{lanedlib.wp_dir(wp)}" for wp in group}
         with tempfile.TemporaryDirectory(prefix="laned-cross-") as tmp:
@@ -867,68 +890,117 @@ def cross_pytest(root: Path, wps: list[str]) -> dict[str, str]:
             cases = list(ET.parse(junit).iter("testcase")) if junit.is_file() else None
         if cases is None:
             for wp in group:
-                res[wp] = f"pytest wrote no report (exit {proc.returncode})"
+                res[wp] = CrossRun(f"pytest wrote no report (exit {proc.returncode})")
             continue
-        counts = {wp: [0, 0] for wp in group}  # [collected, failed]
+        collected = {wp: 0 for wp in group}
+        failed: dict[str, set[str]] = {wp: set() for wp in group}
+        collect_err = {wp: False for wp in group}
         stray = 0
         for case in cases:
-            bad = any(child.tag in ("failure", "error") for child in case)
+            bad = [child for child in case if child.tag in ("failure", "error")]
             wp = _owner(case, prefixes)
             if wp is None:
-                stray += bad
+                stray += bool(bad)
                 continue
-            counts[wp][0] += 1
-            counts[wp][1] += bad
+            collected[wp] += 1
+            if bad:
+                failed[wp].add(_case_id(case))
+                collect_err[wp] |= any("collection failure" in (c.get("message") or "") for c in bad)
+        any_failed = any(failed.values())
         for wp in group:
-            collected, failed = counts[wp]
-            if failed:
-                res[wp] = f"{failed} of {collected} test(s) failed"
-            elif stray:
-                res[wp] = f"{stray} unattributed failure(s) in the shared run"
-            elif not collected:
-                res[wp] = "no tests collected"
-            elif proc.returncode != 0 and not any(c[1] for c in counts.values()):
-                res[wp] = f"pytest exit {proc.returncode}"
+            ids = frozenset(failed[wp])
+            if stray:
+                res[wp] = CrossRun(f"{stray} unattributed failure(s) in the shared run", ids)
+            elif ids:
+                res[wp] = CrossRun(f"{len(ids)} of {collected[wp]} test(s) failed"
+                                   + (" (collection error)" if collect_err[wp] else ""),
+                                   ids, comparable=not collect_err[wp])
+            elif not collected[wp]:
+                res[wp] = CrossRun("no tests collected")
+            elif proc.returncode != 0 and not any_failed:
+                res[wp] = CrossRun(f"pytest exit {proc.returncode}")
             else:
-                res[wp] = ""
+                res[wp] = CrossRun(comparable=True)
     return res
+
+
+def cross_base_runs(root: Path, base: str, wps: list[str]) -> dict[str, CrossRun]:
+    """The same shared pytest runs for ``wps`` over a temporary detached
+    worktree of BASE (removed afterwards)."""
+    with tempfile.TemporaryDirectory(prefix="laned-cross-base-") as tmp:
+        wt = Path(tmp) / "base"
+        proc = lanedlib.git(root, "worktree", "add", "--detach", "-q", str(wt), base, check=False)
+        if proc.returncode != 0:
+            return {wp: CrossRun(f"no BASE worktree: {proc.stderr.strip()[:200]}") for wp in wps}
+        try:
+            print(f"+ re-running {' '.join(wps)} at BASE {base}", flush=True)
+            missing = [wp for wp in wps if not test_dir(wt, wp).is_dir()]
+            out = {wp: CrossRun("no test dir at BASE") for wp in missing}
+            out.update(cross_pytest(wt, [wp for wp in wps if wp not in missing]))
+            return out
+        finally:
+            lanedlib.git(root, "worktree", "remove", "--force", str(wt), check=False)
+            lanedlib.git(root, "worktree", "prune", check=False)
+
+
+def _ids(ids: frozenset[str] | set[str], n: int = 8) -> str:
+    s = sorted(ids)
+    return " ".join(s[:n]) + (f" ... (+{len(s) - n})" if len(s) > n else "")
+
+
+def cross_against_base(head_run: CrossRun, base_run: CrossRun) -> tuple[str, str]:
+    """(KNOWN|FAIL, detail) for a WP whose HEAD run failed: KNOWN only when
+    both runs are plain test failures and every HEAD failure fails on BASE."""
+    if not head_run.comparable:
+        return "FAIL", f"pytest: {head_run.why}"
+    if not base_run.comparable:
+        return "FAIL", f"pytest: {head_run.why}; BASE run unusable for comparison ({base_run.why})"
+    new = head_run.failed - base_run.failed
+    if new:
+        return "FAIL", f"pytest: {len(new)} regression(s), pass on BASE: {_ids(new)}"
+    return "KNOWN", f"{len(head_run.failed)} tests already red on base: {_ids(head_run.failed)}"
 
 
 def cmd_cross(root: Path, pr_wps: list[str], base: str, head: str) -> int:
     """For every other WP at >= L2 on BASE whose tests depend on the PR's
     changes (module docstring): invariant 10, its pytest (shared runs) and
-    stub_scan over its PATHS; no e2e (the main step ran it). Prints
-    ``CROSS <WP> PASS|FAIL``; exit 1 when any FAIL."""
+    stub_scan over its PATHS; no e2e (the main step ran it). A WP whose
+    pytest fails is re-run at BASE: failures that are all red on BASE too
+    are KNOWN. Prints ``CROSS <WP> PASS|KNOWN|FAIL``; exit 1 when any FAIL."""
     selected = cross_select(root, base, head, pr_wps)
     if not selected:
         print("CROSS none (no other built WP depends on the changed paths)")
         return 0
     for wp, _, why in selected:
         print(f"cross {wp}: " + "; ".join(why))
-    verdict: dict[str, str] = {}
+    verdict: dict[str, tuple[str, str]] = {}  # WP -> (PASS|KNOWN|FAIL, detail)
     runnable = []
     for wp, _, _ in selected:
         if not test_dir(root, wp).is_dir():
-            verdict[wp] = f"no tests at tests/accept/{lanedlib.wp_dir(wp)}/"
+            verdict[wp] = ("FAIL", f"no tests at tests/accept/{lanedlib.wp_dir(wp)}/")
         elif unpaired_tests(root, wp):
-            verdict[wp] = "invariant10: unpaired unarmed test(s)"
+            verdict[wp] = ("FAIL", "invariant10: unpaired unarmed test(s)")
         else:
             runnable.append(wp)
-    for wp, why in cross_pytest(root, runnable).items():
-        verdict[wp] = f"pytest: {why}" if why else ""
+    head_runs = cross_pytest(root, runnable)
+    red = [wp for wp in runnable if head_runs[wp].why]
+    base_runs = cross_base_runs(root, base, red) if red else {}
+    for wp in runnable:
+        run = head_runs[wp]
+        verdict[wp] = cross_against_base(run, base_runs[wp]) if run.why else ("PASS", "")
     for wp, paths, _ in selected:
-        if verdict.get(wp):
+        if verdict[wp][0] == "FAIL":
             continue
         lines, _ = stub_scan.scan(root, paths)
         for line in lines:
             print(line)
         if lines:
-            verdict[wp] = f"stub_scan: {len(lines)} finding(s)"
+            verdict[wp] = ("FAIL", f"stub_scan: {len(lines)} finding(s)")
     failed = 0
     for wp, _, _ in selected:
-        why = verdict.get(wp, "")
-        failed += bool(why)
-        print(f"CROSS {wp} {'FAIL' if why else 'PASS'}" + (f" ({why})" if why else ""))
+        word, why = verdict[wp]
+        failed += word == "FAIL"
+        print(f"CROSS {wp} {word}" + (f" ({why})" if why else ""))
     return 1 if failed else 0
 
 
@@ -1292,13 +1364,17 @@ SELFTEST_CROSS_PLAN = """# plan
 | C | unrelated | — | ci | `scripts/laned/accept C` |
 | D | shares a file with A | — | ci | `scripts/laned/accept D` |
 | E | unbuilt, imports A | — | ci | `scripts/laned/accept E` |
+| F | red on base, uses A | A | ci | `scripts/laned/accept F` |
+| G | uncollectable on base, imports C | C | ci | `scripts/laned/accept G` |
 """
 
 
 def selftest_cross(ident: tuple[str, ...]) -> list[str]:
-    """The CROSS rule on a real git repo and real pytest: A, B, C, D built,
-    E tests-only; B's tests import pkg_b, which imports A's pkg_a; D's PATHS
-    also cover A's shared_ad.py; C and E must never run."""
+    """The CROSS rule on a real git repo and real pytest: A, B, C, D, F, G
+    built, E tests-only; B's tests import pkg_b, which imports A's pkg_a; D's
+    PATHS also cover A's shared_ad.py; C and E must never run for an A PR.
+    F is red on BASE (KNOWN unless the PR adds a failure); G cannot be
+    collected on BASE (always FAIL when selected)."""
     failures: list[str] = []
     saved = os.environ.get("LANED_PYTEST_CMD")
     os.environ["LANED_PYTEST_CMD"] = shlex.join([sys.executable, "-m", "pytest", "-p", "no:cacheprovider"])
@@ -1324,12 +1400,20 @@ def selftest_cross(ident: tuple[str, ...]) -> list[str]:
                     ("b", "pkg_b.py\n", "import pkg_b\n\n\ndef test_b():\n    assert pkg_b.DOUBLE == 2\n"),
                     ("c", "pkg_c.py\n", "import pkg_c\n\n\ndef test_c():\n    assert pkg_c.C == 3\n"),
                     ("d", "pkg_d.py\nshared_ad.py\n", "import pkg_d\n\n\ndef test_d():\n    assert pkg_d.D == 4\n"),
-                    ("e", "pkg_e.py\n", "import pkg_a\nimport pkg_e\n\n\ndef test_e():\n    assert pkg_e.E\n")):
+                    ("e", "pkg_e.py\n", "import pkg_a\nimport pkg_e\n\n\ndef test_e():\n    assert pkg_e.E\n"),
+                    # F is red on BASE (test_f_red); test_f_ok reads A's VALUE through pkg_f
+                    ("f", "pkg_f.py\n", "import pkg_f\n\n\ndef test_f_red():\n    assert pkg_f.F == 99\n\n\n"
+                                        "def test_f_ok():\n    assert pkg_f.G == 1\n"),
+                    # G cannot even be collected on BASE; it imports C's pkg_c
+                    ("g", "pkg_g.py\n", "import pkg_c\nfrom pkg_g import MISSING\n\n\ndef test_g():\n"
+                                        "    assert MISSING and pkg_c\n")):
                 commit({f"tests/accept/{wp}/PATHS": paths, f"tests/accept/{wp}/test_{wp}.py": test},
                        f"tests-only {wp}")
             commit({"pkg_a.py": "VALUE = 1\n"}, "impl A")
             commit({"pkg_b.py": "import pkg_a\n\nDOUBLE = pkg_a.VALUE * 2\n"}, "impl B")
             commit({"pkg_c.py": "C = 3\n"}, "impl C")
+            commit({"pkg_f.py": "import pkg_a\n\nF = 6\nG = pkg_a.VALUE\n"}, "impl F")
+            commit({"pkg_g.py": "X = 1\n"}, "impl G")
             base = commit({"pkg_d.py": "D = 4\n"}, "impl D")
 
             def case(name: str, wps: str, files: dict[str, str], want_rc: int,
@@ -1341,7 +1425,7 @@ def selftest_cross(ident: tuple[str, ...]) -> list[str]:
                     rc = cmd_cross(root, wps.split(","), base, head)
                 out = buf.getvalue()
                 lines = [ln for ln in out.splitlines() if ln.startswith("CROSS ")]
-                bad = [w for w in want if not any(ln.startswith(w + " ") or ln == w for ln in lines)]
+                bad = [w for w in want if not any(ln.startswith(w) for ln in lines)]
                 bad += [n for n in never if any(ln.startswith(f"CROSS {n} ") for ln in lines)]
                 if rc != want_rc or bad:
                     failures.append(f"cross {name}: rc={rc} want {want_rc}; missing/unexpected {bad}: "
@@ -1349,19 +1433,24 @@ def selftest_cross(ident: tuple[str, ...]) -> list[str]:
 
             # implementation PR for A breaks B (imports pkg_a through pkg_b) -> CROSS B FAIL;
             # D runs only for the PATHS overlap and passes; C (unrelated) and E (unbuilt) never run
+            # ... and F, red on BASE by test_f_red, gains a failure (test_f_ok) -> CROSS F FAIL
             case("a-breaks-b", "A", {"pkg_a.py": "VALUE = 5\n", "shared_ad.py": "S = 1\n"}, 1,
-                 ["CROSS B FAIL", "CROSS D PASS"], ["A", "C", "E"])
-            # the same PR without the break -> CROSS B PASS
-            case("a-keeps-b", "A", {"pkg_a.py": "VALUE = 1\nEXTRA = 2\n"}, 0, ["CROSS B PASS"],
-                 ["A", "C", "D", "E"])
+                 ["CROSS B FAIL", "CROSS D PASS", "CROSS F FAIL (pytest: 1 regression"], ["A", "C", "E", "G"])
+            # the same PR without the break -> CROSS B PASS; F still red the same
+            # way as on BASE -> CROSS F KNOWN, which does not fail the job
+            case("a-keeps-b", "A", {"pkg_a.py": "VALUE = 1\nEXTRA = 2\n"}, 0,
+                 ["CROSS B PASS", "CROSS F KNOWN (1 tests already red on base: "], ["A", "C", "D", "E", "G"])
             # tests-correction PR for B: B is the main step, never a cross WP
             case("b-tests-correction", "B",
                  {"tests/accept/b/test_b_more.py": "import pkg_b\n\n\ndef test_more():\n"
                                                    "    assert pkg_b.DOUBLE\n"},
-                 0, ["CROSS none"], ["A", "B", "C", "D", "E"])
-            # a global input re-accepts every built WP except the PR's own
-            case("lockfile", "C", {"uv.lock": "x\n", "pkg_c.py": "C = 3\n# lock\n"}, 0,
-                 ["CROSS A PASS", "CROSS B PASS", "CROSS D PASS"], ["C", "E"])
+                 0, ["CROSS none"], ["A", "B", "C", "D", "E", "F", "G"])
+            # a global input re-accepts every built WP except the PR's own (C, G)
+            case("lockfile", "C,G", {"uv.lock": "x\n", "pkg_c.py": "C = 3\n# lock\n"}, 0,
+                 ["CROSS A PASS", "CROSS B PASS", "CROSS D PASS", "CROSS F KNOWN"], ["C", "E", "G"])
+            # G fails on HEAD and cannot be collected on BASE either -> FAIL (fails closed)
+            case("c-touches-g", "C", {"pkg_c.py": "C = 3\n# touch\n"}, 1,
+                 ["CROSS G FAIL"], ["A", "B", "C", "D", "E", "F"])
     finally:
         if saved is None:
             os.environ.pop("LANED_PYTEST_CMD", None)
