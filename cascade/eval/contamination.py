@@ -6,11 +6,18 @@ window:
 
 - **exact**: sha256 of the window's values packed as little-endian IEEE 754
   float64 (``struct.pack("<32d", ...)``);
-- **normalised**: the window z-scored on its own values (population std),
-  each z-score rounded to :data:`SIG_FIGS` significant figures, hashed with
-  sha256 under a domain tag, so a scaled, shifted or re-rounded copy of a
-  fragment still matches. A constant window has no z-score and no normalised
-  hash.
+- **normalised** (``cascade-zgrid/2``): the window z-scored on its own values
+  (population std), each z-score put on a fixed-point grid
+  (``floor(z / GRID)``, absolute bins of width :data:`GRID`), and the bin
+  ints hashed with sha256 under a domain tag. A constant window has no
+  z-score and no normalised hash.
+
+The lookup is tolerant: a submission value whose z-score lies within
+:data:`TOLERANCE` of a bin edge also probes the neighbouring bin (the
+:data:`MAX_EDGE_VALUES` nearest-to-edge values, so at most
+``2 ** MAX_EDGE_VALUES`` probes), for the window and its negation. So a
+scaled (any sign), shifted, re-rounded or float32-cast copy of a fragment
+still matches whenever every z-score moved by at most :data:`TOLERANCE`.
 
 Each hash maps to ``[suite, "<item id>@<offset>"]``, the smallest
 ``(suite, item, offset)`` that produces it. The artefact records the suites'
@@ -25,8 +32,9 @@ The owner builds the real artefact on the bench pod::
     python -P -m cascade.eval.contamination verify --artefact PATH --sha256 sha256:<hex> [--input SUITES.json]
 
 ``SUITES.json`` is ``{"suites": {suite: {"version": str, "series": {item: [float|null]}}}}``.
-The byte encoding of the normalised hash is fixed by :data:`SCHEMA` version 1;
-changing it needs a new schema.
+The byte encoding of the normalised hash is fixed by :data:`SCHEMA` version 2;
+changing it needs a new schema. Schema 1 (z-scores at 4 significant figures)
+missed rounded copies at small series levels and is refused on load.
 """
 
 from __future__ import annotations
@@ -40,25 +48,36 @@ import os
 import struct
 import sys
 import tempfile
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
 
 from cascade.eval.suite_identity import KNOWN_SUITES, suite_identity
 
-SCHEMA = "cascade_contamination_hashset/1"
+SCHEMA = "cascade_contamination_hashset/2"
+_SCHEMA_V1 = "cascade_contamination_hashset/1"
 WINDOW = 32
 STRIDE = 1
-SIG_FIGS = 4
 HASH = "sha256"
-NORMALISATION = {"method": "zscore", "scope": "subwindow", "sig_figs": SIG_FIGS,
-                 "std": "population", "encoding": "cascade-zscore/1"}
+# Width of the absolute z-score bins.
+GRID = 0.5
+# A lookup value within this distance (in z) of a bin edge also probes the
+# neighbouring bin. Rounding a copy to 3 dp inside the promised bound moves a
+# z-score by at most ~0.02; float32 by ~1e-5.
+TOLERANCE = 0.03
+# At most this many near-edge values get an alternative bin (the nearest to
+# their edge), so a lookup tries at most 2**MAX_EDGE_VALUES probes per
+# orientation.
+MAX_EDGE_VALUES = 12
+NORMALISATION = {"method": "zscore", "scope": "subwindow", "std": "population",
+                 "grid": GRID, "tolerance": TOLERANCE, "orientation": "both",
+                 "encoding": "cascade-zgrid/2"}
 
 # Domain tag of the normalised preimage: a normalised hash can never equal an
 # exact hash of the same window (different preimages).
-_NORM_TAG = b"cascade-contamination-zscore/1\n"
+_NORM_TAG = b"cascade-contamination-zgrid/2\n"
 # |z| below this is taken as 0: a value equal to the window mean in exact
-# arithmetic comes out as ~1e-16 in floating point, whose sign and digits
-# would otherwise depend on the window's scale and shift.
+# arithmetic comes out as ~1e-16 in floating point, whose sign would otherwise
+# depend on the window's scale and shift.
 _ZERO_Z = 1e-9
 
 
@@ -94,9 +113,8 @@ def exact_hash(window: list[float]) -> str:
     return hashlib.sha256(struct.pack(f"<{len(window)}d", *window)).hexdigest()
 
 
-def normalised_hash(window: list[float]) -> str | None:
-    """sha256 of the window's z-scores at :data:`SIG_FIGS` significant
-    figures; ``None`` for a constant window."""
+def _zscores(window: Sequence[float]) -> list[float] | None:
+    """The window's z-scores (population std); ``None`` for a constant window."""
     if max(window) == min(window):
         return None
     n = len(window)
@@ -105,14 +123,70 @@ def normalised_hash(window: list[float]) -> str | None:
     std = math.sqrt(math.fsum(d * d for d in dev) / n)
     if not std > 0.0 or not math.isfinite(std):
         return None
-    parts = []
+    out = []
     for d in dev:
         z = d / std
-        if abs(z) < _ZERO_Z:
-            parts.append("0")
-        else:
-            parts.append(format(z, f".{SIG_FIGS - 1}e"))
+        out.append(0.0 if abs(z) < _ZERO_Z else z)
+    return out
+
+
+def _bins_hash(parts: Sequence[str]) -> str:
     return hashlib.sha256(_NORM_TAG + ",".join(parts).encode("ascii")).hexdigest()
+
+
+def normalised_hash(window: Sequence[float]) -> str | None:
+    """sha256 of the window's z-score bins ``floor(z / GRID)``; ``None`` for a
+    constant window. This is the hash stored at build time and the first
+    probe of a lookup."""
+    z = _zscores(window)
+    if z is None:
+        return None
+    return _bins_hash([str(math.floor(v / GRID)) for v in z])
+
+
+def _probe_hashes(z: Sequence[float]) -> Iterator[str]:
+    """Lookup probes of one orientation of a z-scored window.
+
+    The first probe is the plain floor-bin hash (:func:`normalised_hash`).
+    Every value within :data:`TOLERANCE` of a bin edge has the neighbouring
+    bin as its alternative; the :data:`MAX_EDGE_VALUES` nearest to an edge
+    are kept, and every combination of them is tried, nearest-to-edge
+    alternatives first."""
+    edge = TOLERANCE / GRID
+    parts: list[str] = []
+    alts: list[tuple[float, int, str]] = []
+    for i, v in enumerate(z):
+        q = v / GRID
+        b = math.floor(q)
+        parts.append(str(b))
+        below = q - b          # distance (in bins) to the lower edge
+        above = 1.0 - below    # ... and to the upper edge
+        if below <= edge:
+            alts.append((below, i, str(b - 1)))
+        elif above <= edge:
+            alts.append((above, i, str(b + 1)))
+    alts.sort()
+    chosen = [(i, s) for _, i, s in alts[:MAX_EDGE_VALUES]]
+    yield _bins_hash(parts)
+    for mask in range(1, 1 << len(chosen)):
+        probe = list(parts)
+        for j, (i, s) in enumerate(chosen):
+            if mask >> j & 1:
+                probe[i] = s
+        yield _bins_hash(probe)
+
+
+def _normalised_lookup(normalised: Mapping, window: Sequence[float]) -> object:
+    """The set entry a window hits under the tolerant probe, or ``None``."""
+    z = _zscores(window)
+    if z is None:
+        return None
+    for orientation in (z, [-v for v in z]):
+        for h in _probe_hashes(orientation):
+            hit = normalised.get(h)
+            if hit is not None:
+                return hit
+    return None
 
 
 # ── input validation ─────────────────────────────────────────────────────────
@@ -260,6 +334,9 @@ def load_artefact(path: str | os.PathLike) -> dict:
         raise ValueError(f"{p}: not canonical ASCII JSON: {e}") from None
     if not isinstance(a, dict):
         raise ValueError(f"{p}: artefact is not a JSON object")
+    if a.get("schema") == _SCHEMA_V1:
+        raise ValueError(f"{p}: schema {_SCHEMA_V1!r} uses the retired 4-significant-figure "
+                         f"normalised encoding; rebuild it as {SCHEMA!r}")
     if a.get("schema") != SCHEMA:
         raise ValueError(f"{p}: schema {a.get('schema')!r} is not {SCHEMA!r}")
     for key in ("exact", "normalised", "suites"):
@@ -296,8 +373,7 @@ def match_series(artefact: Mapping, values: Iterable) -> dict:
             exact_hits += 1
             if first is None:
                 first = {"kind": "exact", "suite": hit[0], "window_id": hit[1], "at": off}
-        nh = normalised_hash(w)
-        nhit = normalised.get(nh) if nh is not None else None
+        nhit = _normalised_lookup(normalised, w)
         if nhit is not None:
             normalised_hits += 1
             if first is None:
@@ -405,7 +481,8 @@ def main(argv: list[str] | None = None) -> int:
     return _cmd_build(args) if args.cmd == "build" else _cmd_verify(args)
 
 
-__all__ = ["HASH", "NORMALISATION", "SCHEMA", "SIG_FIGS", "STRIDE", "WINDOW",
+__all__ = ["GRID", "HASH", "MAX_EDGE_VALUES", "NORMALISATION", "SCHEMA", "STRIDE",
+           "TOLERANCE", "WINDOW",
            "artefact_bytes", "artefact_sha256", "build_hashset", "exact_hash",
            "is_contaminated", "load_artefact", "match_series", "normalised_hash",
            "write_artefact"]
