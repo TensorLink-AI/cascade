@@ -7,10 +7,14 @@ trimmed**. It runs in `owner (chain read)`: the owner (or a box with a chain
 endpoint) runs the collector; CI only verifies its evidence. These tests are
 the spec. The builder may touch only `PATHS`: `cascade/laned/s0b_collect.py`.
 
-R2x is external: its Accept is the evidence verifier here, so the
-`test_evidence_*` tests **fail until the evidence exists** (by design, they
-need `$LANED_EVIDENCE`). The `test_verifier_*` and collector tests run
-offline from a fixture and never reach a chain.
+R2x is external: its Accept is the evidence verifier here. The
+`test_evidence_*` tests **skip** (with a clear reason) when `$LANED_EVIDENCE`
+is unset, so the collector can merge and `accept R2x` goes green (L3) before
+the owner's run. L4 needs a green `accept R2x --evidence
+evidence/s0b_notes.json` run on main (W0c). When `$LANED_EVIDENCE` **is**
+set, a missing file, invalid JSON, `source: "fixture"` or any hand-edited
+field fails hard. The `test_verifier_*` and collector tests run offline from
+a fixture and never reach a chain.
 
 ## The collector
 
