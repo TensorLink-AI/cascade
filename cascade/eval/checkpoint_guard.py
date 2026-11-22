@@ -58,6 +58,7 @@ __all__ = [
     "CheckpointTampered",
     "WEIGHTS_FILE",
     "expected_checkpoint_code",
+    "lane_d_state_spec",
     "safetensors_header",
     "verify_checkpoint",
     "verify_checkpoint_code",
@@ -353,3 +354,24 @@ def verify_lane_d_checkpoint(checkpoint_dir: Path | str, contract, *,
     report = verify_checkpoint(checkpoint_dir, contract, float_dtype=dtype)
     verify_weights_finite(checkpoint_dir)
     return report
+
+
+def lane_d_state_spec(contract, *, dtype: str = "BF16"
+                      ) -> tuple[dict[str, tuple[str, tuple[int, ...]]], int]:
+    """Lane D's tensor spec for ``contract`` (W4, D14): lane A's pinned
+    ``{name: (dtype, shape)}`` with every F32 replaced by ``dtype``, plus the
+    tensor-data bytes of lane A's F32 file (the size anchor of lane D's
+    budget). Lane A's own spec and :func:`verify_checkpoint` are unchanged."""
+    if dtype not in FLOAT_DTYPES:
+        raise ValueError(f"dtype must be one of {FLOAT_DTYPES}; got {dtype!r}")
+    spec, _ = _expected_state_spec(contract)
+    f32_bytes = 0
+    for name, (dt, shape) in spec.items():
+        if dt not in _DTYPE_BYTES:
+            raise ValueError(f"tensor {name!r}: no byte width for dtype {dt!r}")
+        n = 1
+        for x in shape:
+            n *= int(x)
+        f32_bytes += n * _DTYPE_BYTES[dt]
+    lane_d = {k: ((dtype if dt == "F32" else dt), tuple(shape)) for k, (dt, shape) in spec.items()}
+    return lane_d, f32_bytes
