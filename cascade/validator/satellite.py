@@ -188,6 +188,31 @@ def fit_vector(vector: list[float], n_uids: int) -> list[float] | None:
 # ── one receipt ──────────────────────────────────────────────────────────────
 
 
+def sentinel_replay(receipt, cfg: ChainConfig, client=None) -> str | None:
+    """LANE_D_PLAN §16 rule 1 / TS1: the sentinel suite this satellite judges
+    the receipt's settlement with. ``None`` when the receipt records no draw.
+    Otherwise the hash of the recorded block is read from the chain
+    (``client.block_hash``): a readable hash must equal the recorded one and
+    draw the recorded suite from ``cfg.v2.sentinel_suites`` (else
+    ``ValueError``). An unreadable hash (no client, or ``ChainError``) replays
+    the recorded suite, which must still be a configured suite."""
+    from ..shared.chain import ChainError
+    from ..shared.sentinel import check_record, verify_record
+
+    record = getattr(receipt, "sentinel", None)
+    if record is None:
+        return None
+    check_record(record, cfg)
+    onchain: str | None = None
+    if client is not None:
+        try:
+            onchain = str(client.block_hash(int(record["block"])))
+        except ChainError as e:
+            log.warning("round=%s sentinel block %s hash unreadable (%s); replaying the "
+                        "recorded suite", receipt.round_id, record["block"], e)
+    return verify_record(record, cfg, onchain)
+
+
 def replay_receipt(receipt, cfg: ChainConfig, *, reader: Any, prev: dict | None,
                    client=None) -> Replay:
     """Replay one main-validator receipt (DEC-CA-0058 §1a-d) against the
@@ -324,6 +349,15 @@ def replay_receipt(receipt, cfg: ChainConfig, *, reader: Any, prev: dict | None,
     else:
         log.warning("round=%s: first receipt this satellite replays — continuity is "
                     "anchored here", rid)
+    # LANE_D_PLAN §16: a recorded sentinel draw is verified against the era
+    # block's hash (or replayed when the hash is unreadable); a receipt with
+    # no draw skips this. The audit's ``sentinel`` row below checks the
+    # record is present exactly when the era is armed, and replays the gate
+    # and king check with the recorded suite.
+    try:
+        sentinel_replay(receipt, cfg_r, client)
+    except ValueError as e:
+        return _fail("sentinel", str(e))
     # d. the audit's tier-0 re-derivation (verdict, cohort, bench gate from the
     # trainer-signed report, king check / ladder, lane payouts, weights)
     rows = audit_receipt(receipt, cfg_audit, tier=0, client=None,

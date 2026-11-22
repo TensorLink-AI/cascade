@@ -92,14 +92,18 @@ def bench_fields(rule: str = RULE_V1) -> tuple[str, ...]:
 
 def king_check_gate(king_rows, init_rows, king_scores, init_scores, params, *,
                     seed: int | str, rule: str = RULE_V2, king_revisions=None,
-                    init_revisions=None):
+                    init_revisions=None, sentinel: str | None = None,
+                    sentinel_ratchet: bool = True, sentinel_tau: float = 0.01):
     """CONSENSUS: the DEC-CA-0061 bench half of the king check — the gate's
     rule (average ratio, per-suite non-regression at ``alpha / 4``, win rate)
     with the KING as the challenger and the INIT as the reference, on their
     task rows. ``params`` = ``cfg.koth_params(block=boundary)``; the bootstrap
     seed is ``{seed}|king-check`` (``seed`` = the settlement's base seed, so
     the audit re-derives it). ``*_revisions`` = the DEC-CA-0063 pinned data
-    revisions (a mismatch is uncomputable, as in the gate). Pure."""
+    revisions (a mismatch is uncomputable, as in the gate). ``sentinel`` /
+    ``sentinel_ratchet`` / ``sentinel_tau`` (LANE_D_PLAN §16, an armed era's
+    drawn suite; ``None`` = unarmed) pass straight through to the gate, which
+    then drops that suite from the rule. Pure."""
     from ..eval.bench_gate import evaluate_bench_gate
 
     return evaluate_bench_gate(
@@ -107,7 +111,8 @@ def king_check_gate(king_rows, init_rows, king_scores, init_scores, params, *,
         B=params.bootstrap_B, seed=f"{seed}|king-check", min_items=params.bench_gate_min_items,
         rule=rule, tolerance=params.bench_gate_tolerance,
         min_win_rate=params.bench_gate_min_win_rate, king_revisions=init_revisions,
-        chal_revisions=king_revisions)
+        chal_revisions=king_revisions, sentinel=sentinel, sentinel_ratchet=sentinel_ratchet,
+        sentinel_tau=sentinel_tau)
 
 
 def king_check_gate_reason(reason: str) -> str:
@@ -391,7 +396,9 @@ class KingCheckMixin:
             gate = king_check_gate(kr, ir, bench_scores_body(kb_scores),
                                    bench_scores_body(ib_scores),
                                    self.cfg.koth_params(block=boundary), seed=base_seed,
-                                   king_revisions=krev, init_revisions=irev)
+                                   king_revisions=krev, init_revisions=irev,
+                                   # LANE_D_PLAN §16: {} unarmed (byte-identical)
+                                   **self._kc_sentinel_kw(str(manifest.round_id), rule))
             if not gate.computed:
                 rec["reasons"].append(KC_GATE_UNCOMPUTABLE + gate.reason)
                 rec["bench"] = {"rule": rule, "gate": gate.detail()}
@@ -409,6 +416,12 @@ class KingCheckMixin:
                         **({"rule": rule, "gate": gate.detail()} if gate is not None else {})}
         return self._v2_king_check_pool(manifest, windows, base_seed, king, ib_pointer,
                                         bench_bad, rec)
+
+    def _kc_sentinel_kw(self, round_id: str, rule: str) -> dict:
+        """The settlement's sentinel keywords for :func:`king_check_gate`
+        (LANE_D_PLAN §16; ``{}`` while unarmed)."""
+        fn = getattr(self, "_sentinel_gate_kw", None)
+        return fn(round_id, rule) if callable(fn) else {}
 
     def _kc_init_unbound(self, manifest: TrainingManifest, init_ptr: str, rec: dict) -> bool:
         """CONSENSUS from ``[v2] init_epoch_bind_from_block`` (off before it —

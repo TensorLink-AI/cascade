@@ -45,6 +45,7 @@ from .training import parse_training_contract
 from .v2 import (
     V2Config,
     check_bench_source,
+    check_sentinel_from_block,
     check_v2_activation,
     parse_lane_b,
     parse_v2_economics,
@@ -812,6 +813,14 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
         if cfg.v2.from_block and _idb < int(cfg.v2.from_block):
             raise ValueError(f"[v2] image_decoupled_from_block={_idb} precedes [v2] "
                              f"from_block={cfg.v2.from_block}")
+    # LANE_D_PLAN §16: the sentinel arms at an era boundary on the grid in
+    # force at it, once the four-suite rule v2 is in force (0 = off).
+    _sfb = int(cfg.v2.sentinel_from_block)
+    if _sfb:
+        _sfb_grid = _ebp if (_eab and _ebp and _sfb < _eab) else _eb
+        check_sentinel_from_block(
+            _sfb, era_blocks=max(1, _sfb_grid) * max(1, _era_settlements),
+            bench_gate_v2_from_block=int(cfg.v2.bench_gate_v2_from_block))
     if cfg.v2.train_image_digest_after:
         if cfg.training.v2_contract is None:
             raise ValueError("[v2] train_image_digest_after needs a [v2.training] contract")
