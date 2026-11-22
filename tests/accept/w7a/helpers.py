@@ -1,0 +1,306 @@
+"""Shared spec and fixture builders for the W7a report-schema tests.
+
+Copied from docs/plans/LANE_D_PLAN.md (rev6): the W7a row, §1.2 (A8 caps,
+coldkey resolution), §1.3 (both clocks, mirror lag, the confirmation duel and
+D20), §1.3b (A10 low-frequency check), §1.4 (D21 house slot burns), §1.5
+(the report's rev3 fields, the typed reason enum, B8, B10), §3.2 invariant 11,
+§14.3 (forward fields), B7 (`scoring_method`) and B12 (first-seen Merkle
+roots). The window refusal reasons are W5a's `REFUSAL_REASONS`
+(tests/accept/w5a/README.md, branch laned/w5a-tests). README.md states the
+module contract.
+
+Nothing here imports a module in PATHS at import time, so on main every test
+fails inside its own body: at its first import of a new name from
+`cascade.validator.lane_d_report` (an `ImportError` for a path in PATHS) or
+at an `assert`.
+"""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import math
+from pathlib import Path
+from statistics import NormalDist
+
+import numpy as np
+
+REPO = Path(__file__).resolve().parents[3]
+SCHEMA_FILE = REPO / "cascade" / "validator" / "schemas" / "lane_d_report_1.json"
+JSON_SCHEMA_DIALECT = "https://json-schema.org/draft/2020-12/schema"
+
+ERA = 3600
+SETTLEMENT = 900
+ARM_BLOCK = 2700 * ERA
+BOUNDARY_1 = ARM_BLOCK + SETTLEMENT
+BOUNDARY_2 = ARM_BLOCK + 2 * SETTLEMENT
+READY_BLOCK = ARM_BLOCK + 40
+REVEAL_BLOCK = ARM_BLOCK + 60
+
+HORIZON = 64
+CONTEXT = 4096
+HISTORY = 256
+N_SOURCES = 6
+PER_SOURCE = 8
+HOUR = 3600
+T0 = 1_790_000_000                     # the first entry's reveal time (unix s)
+HOUSE_T = T0 - 2 * 86_400
+SNAPSHOT_START = {1: T0 + 12 * HOUR, 2: T0 + 12 * HOUR + 4 * 86_400}
+FIRST_SEEN_LAG = 1800
+
+CHALLENGER_UID = 6
+SCORING_LEVELS = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
+_Z = tuple(NormalDist().inv_cdf(level) for level in SCORING_LEVELS)
+
+ARMED = {
+    "from_block": ARM_BLOCK, "share": 0.25, "takes_from": "lane_a", "remainder": "burn",
+    "contexts": [4096, 8192, 16384], "horizon": HORIZON, "forward_margin_hours": 6.0,
+    "min_windows": 24, "min_clusters": 4, "bootstrap_B": 200,
+}
+
+# ── the pinned enums (README "Enums") ───────────────────────────────────────
+
+ENTRY_STATUSES = ("pending", "hold", "confirm_pending", "crowned", "lost", "closed")
+SKIP_REASONS = ("pending_floor", "coldkey_cap_settlement", "coldkey_unresolved",
+                "coldkey_changed", "king_unscored", "bench_hold", "deregistered",
+                "ready_expired", "reveal_delay_exceeded", "duplicate_digest",
+                "hotkey_has_open_entry", "context_not_armed", "checkpoint_fault",
+                "mirror_lag_exceeded")
+ENTRY_REASONS = SKIP_REASONS + ("confirm_pending", "lost_duel", "lost_confirmation",
+                                "lowfreq_regression", "crowned")
+BURN_REASONS = ("house_king", "deregistered")
+# W5a's REFUSAL_REASONS (tests/accept/w5a/README.md "Reasons").
+WINDOW_REFUSAL_REASONS = ("missing_clock", "forecast_product", "over_lag", "before_margin",
+                          "publish_ahead", "late_mirror", "absent_from_s0", "backfill")
+CONFIRMATION_STAGES = ("first", "confirm")
+CONFIRM_RULES = ("restart", "original")
+LOWFREQ_RESULTS = ("pass", "fail", "no_windows", "not_candidate")
+VERDICT_OUTCOMES = ("lost", "confirm_pending", "confirmed", "crowned")
+SCHEMA_ERROR_CODES = ("not_object", "unknown_schema", "missing_field", "unknown_field",
+                      "bad_type", "bad_value", "rows_sha256_mismatch")
+
+# $defs name in the schema file -> the module tuple name and the pinned values.
+ENUM_DEFS = {
+    "entry_status": ("ENTRY_STATUSES", ENTRY_STATUSES),
+    "entry_reason": ("ENTRY_REASONS", ENTRY_REASONS),
+    "skip_reason": ("SKIP_REASONS", SKIP_REASONS),
+    "burn_reason": ("BURN_REASONS", BURN_REASONS),
+    "window_refusal_reason": ("WINDOW_REFUSAL_REASONS", WINDOW_REFUSAL_REASONS),
+    "confirmation_stage": ("CONFIRMATION_STAGES", CONFIRMATION_STAGES),
+    "confirm_rule": ("CONFIRM_RULES", CONFIRM_RULES),
+    "lowfreq_result": ("LOWFREQ_RESULTS", LOWFREQ_RESULTS),
+    "verdict_outcome": ("VERDICT_OUTCOMES", VERDICT_OUTCOMES),
+}
+
+TOP_LEVEL_REQUIRED = ("schema", "boundary", "signer", "signature", "scoring_method", "params",
+                      "seed", "pool", "house", "king_before", "king_after", "crowned",
+                      "prior_kings", "entries", "judged", "skipped", "cohorts", "windows",
+                      "verdicts", "rows", "rows_sha256", "pay")
+TOP_LEVEL_OPTIONAL = ("extensions",)
+PARAMS_FIELDS = ("share", "takes_from", "remainder", "horizon", "horizons", "contexts",
+                 "forward_margin_hours", "max_mirror_lag_hours", "min_windows", "min_clusters",
+                 "d_margin", "alpha", "bootstrap_B", "king_decay", "reward_prior_kings",
+                 "confirm_on_king_change", "max_entries_per_settlement",
+                 "max_judged_per_coldkey_per_settlement", "scoring_levels", "gate_suites",
+                 "tau_public", "lowfreq_freqs")
+POOL_FIELDS = ("snapshot", "sha256", "horizon", "first_seen_roots")
+ENTRY_FIELDS = ("digest", "hotkey", "coldkey", "context", "ready_block", "reveal_block",
+                "reveal_ts", "status", "reason")
+SKIP_FIELDS = ("digest", "reason")
+COHORT_FIELDS = ("index", "king_digest", "king_reveal_ts", "stage", "members", "t_max",
+                 "window_ids", "set_sha256", "first_seen_roots", "refused")
+WINDOW_FIELDS = ("window_id", "source", "feed", "min_target_ts", "min_first_seen_ts",
+                 "mirror_lag_hours")
+VERDICT_FIELDS = ("digest", "king_digest", "stage", "cohort", "lcb", "gain", "cleared",
+                  "outcome", "confirmation", "lowfreq")
+CONFIRMATION_FIELDS = ("stage", "rule", "first_set_sha256", "first_king_digest")
+LOWFREQ_FIELDS = ("result", "freqs", "n_windows", "tau_public")
+ROW_FIELDS = ("window_id", "digest", "cohort", "crps", "mase")
+COURT_FIELDS = ("digest", "hotkey", "uid", "burn_reason")
+
+# Fixture feeds (pool_d/1 "feeds", W5a format): src0's series report through
+# feed-a (lag measured), src1's lag is unmeasured (null), the rest are unlisted.
+FEEDS = {"feed-a": {"mirror_lag_hours": 1.5, "forecast_product": False},
+         "src1": {"mirror_lag_hours": None, "forecast_product": False}}
+
+
+def lane_d_cfg(**over):
+    """The real W2 parse of ``ARMED`` with ``over`` applied."""
+    from cascade.shared.config.lane_d import parse_lane_d
+
+    return parse_lane_d({**ARMED, **over}, era_blocks_at=lambda _block: ERA)
+
+
+def text_digest(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def fs_root(day: str) -> str:
+    """A first-seen log's daily Merkle root (fixture: a sha256 of the day)."""
+    return text_digest(f"w7a first-seen log {day}")
+
+
+ROOTS = {1: sorted([fs_root("2026-09-21"), fs_root("2026-09-22")]),
+         2: sorted([fs_root("2026-09-25"), fs_root("2026-09-26")])}
+
+
+def window_id(series_id: str, target_ts) -> str:
+    return f"{series_id}:{int(target_ts[0])}:h{HORIZON}"
+
+
+def canonical_rows_sha256(rows) -> str:
+    """§1.5 rows digest, re-derived here: sha256 of the canonical JSON."""
+    body = json.dumps(list(rows), sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def quantiles_around(median: np.ndarray, spread: float) -> np.ndarray:
+    return np.stack([median + spread * z for z in _Z], axis=-1)
+
+
+def _series(snapshot: int, seed: int, *, rich: bool) -> list[dict]:
+    rng = np.random.default_rng(seed)
+    t = np.arange(HISTORY, dtype=np.float64)
+    out = []
+    for j in range(N_SOURCES):
+        for k in range(PER_SOURCE):
+            sid = f"src{j}-s{k}"
+            hist = 10.0 + 5.0 * j + k + 2.0 * np.sin(2 * np.pi * t / 24 + k) \
+                + rng.normal(0, 0.5, HISTORY)
+            start = SNAPSHOT_START[snapshot] + (j * PER_SOURCE + k) * HOUR
+            ts = [int(start + i * HOUR) for i in range(HORIZON)]
+            rec = {"series_id": sid, "source": f"src{j}", "history": hist,
+                   "target_ts": ts, "first_seen_ts": [x + FIRST_SEEN_LAG for x in ts]}
+            if rich and j == 0:
+                rec["feed"] = "feed-a"
+            out.append(rec)
+    if rich:
+        # One §1.3 trap: both clocks before the bound (W5a `before_margin`).
+        old = [int(T0 - 70 * HOUR + i * HOUR) for i in range(HORIZON)]
+        out.append({"series_id": "src2-trap", "source": "src2",
+                    "history": 12.0 + rng.normal(0, 0.5, HISTORY), "target_ts": old,
+                    "first_seen_ts": [x + FIRST_SEEN_LAG for x in old]})
+    return out
+
+
+def _write_pool(directory: Path, snapshot: int, series: list[dict], targets: dict, *,
+                rich: bool) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    meta = {"schema": "pool_d/1", "snapshot": f"w7a-{snapshot}", "horizon": HORIZON,
+            "series": []}
+    for s in series:
+        rec = {"series_id": s["series_id"], "source": s["source"], "freq": "H",
+               "seasonal_period": 24, "first_target_ts": s["target_ts"][0],
+               "end_ts": s["target_ts"][-1], "target_ts": s["target_ts"],
+               "first_seen_ts": s["first_seen_ts"]}
+        if "feed" in s:
+            rec["feed"] = s["feed"]
+        meta["series"].append(rec)
+    if rich:
+        meta["feeds"] = copy.deepcopy(FEEDS)
+        meta["first_seen_roots"] = list(ROOTS[snapshot])
+    (directory / "metadata.json").write_text(json.dumps(meta, sort_keys=True))
+    np.savez(directory / "hist.npz", **{s["series_id"]: s["history"] for s in series})
+    np.savez(directory / "tgt.npz", **{s["series_id"]: np.asarray(targets[s["series_id"]])
+                                       for s in series})
+    return directory
+
+
+def keypair_class():
+    try:
+        from bittensor.sp_core import Keypair
+    except ImportError:
+        from bittensor import Keypair
+    return Keypair
+
+
+def fixture_key(name: str):
+    """A deterministic TEST keypair (never a real key)."""
+    return keypair_class().create_from_uri(f"//w7a-{name}")
+
+
+def build_chain(tmp: Path, *, rich: bool = True, n_entries: int = 1) -> dict:
+    """Two pool_d snapshots and the eval host's quantile forecasts (synthetic
+    kind, no torch). Entry 0 is centred on the targets; the house is 3 sd off.
+    Extra entries forecast like entry 0 under their own digests."""
+    digests = [text_digest(f"w7a entry {i}") for i in range(n_entries)]
+    house = text_digest("w7a house")
+    rng = np.random.default_rng(7)
+    pools, forecasts, series_by_snap = {}, {}, {}
+    for snap in (1, 2):
+        series = _series(snap, 100 + snap, rich=rich)
+        targets, fc = {}, {d: {} for d in [*digests, house]}
+        for s in series:
+            sd = float(np.std(s["history"]))
+            target = np.resize(s["history"][-24:], HORIZON) + rng.normal(0, 0.3, HORIZON)
+            targets[s["series_id"]] = target
+            wid = window_id(s["series_id"], s["target_ts"])
+            good = quantiles_around(target + rng.normal(0, 0.05 * sd, HORIZON), 0.3 * sd)
+            for d in digests:
+                fc[d][wid] = good
+            fc[house][wid] = quantiles_around(target + 3.0 * sd, 0.3 * sd)
+        pools[snap] = _write_pool(tmp / f"pool_d_{snap}", snap, series, targets, rich=rich)
+        forecasts[snap] = fc
+        series_by_snap[snap] = series
+    return {"pools": pools, "forecasts": forecasts, "series": series_by_snap,
+            "digests": digests, "house": {"digest": house, "reveal_ts": HOUSE_T}}
+
+
+def entry(digest: str, name: str, *, coldkey: str | None, reveal_offset: int = 0,
+          ready_block: int = READY_BLOCK) -> dict:
+    """A revealed entry as settle_lane_d takes it (W1.5 README)."""
+    return {"hotkey": fixture_key(name).ss58_address, "digest": digest, "context": CONTEXT,
+            "coldkey_at_ready": coldkey, "ready_block": int(ready_block),
+            "reveal_block": REVEAL_BLOCK, "reveal_ts": T0 + int(reveal_offset)}
+
+
+def settle(chain: dict, cfg, state_path: Path, signer, *, boundary: int, snap: int,
+           entries: list[dict], uid_of: dict):
+    from cascade.validator.lane_d import settle_lane_d
+
+    return settle_lane_d(cfg=cfg, boundary=boundary, pool_dir=chain["pools"][snap],
+                         entries=[dict(e) for e in entries], house=dict(chain["house"]),
+                         forecasts=chain["forecasts"][snap], uid_of=dict(uid_of),
+                         state_path=state_path, signer=signer)
+
+
+_CACHE: dict[str, dict] = {}
+
+
+def coldkey(name: str = "coldkey-1") -> str:
+    return fixture_key(name).ss58_address
+
+
+def two_settlements(tmp: Path, *, rich: bool = True) -> dict:
+    """The single-challenger chain settled at BOUNDARY_1 (snapshot 1) and
+    BOUNDARY_2 (snapshot 2): the first clear, then the confirmation that
+    crowns. Built once per scratch dir; called from test bodies only."""
+    key = f"{tmp}:{rich}"
+    if key not in _CACHE:
+        chain = build_chain(tmp / "chain", rich=rich)
+        e = entry(chain["digests"][0], "challenger", coldkey=coldkey())
+        uid_of = {e["hotkey"]: CHALLENGER_UID}
+        cfg = lane_d_cfg()
+        signer = fixture_key("signer")
+        state = tmp / "state" / "lane_d_state.json"
+        state.parent.mkdir(parents=True, exist_ok=True)
+        s1 = settle(chain, cfg, state, signer, boundary=BOUNDARY_1, snap=1, entries=[e],
+                    uid_of=uid_of)
+        s2 = settle(chain, cfg, state, signer, boundary=BOUNDARY_2, snap=2, entries=[e],
+                    uid_of=uid_of)
+        _CACHE[key] = {"chain": chain, "entry": e, "uid_of": uid_of, "cfg": cfg,
+                       "signer": signer, "state": state, "s1": s1, "s2": s2}
+    return _CACHE[key]
+
+
+def reseal(report: dict) -> dict:
+    """``report`` with ``rows_sha256`` recomputed over its (mutated) rows, so
+    the only remaining defect is the one a test introduced."""
+    out = copy.deepcopy(report)
+    out["rows_sha256"] = canonical_rows_sha256(out["rows"])
+    return out
+
+
+def finite(x) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)

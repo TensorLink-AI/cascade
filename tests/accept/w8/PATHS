@@ -1,0 +1,9 @@
+# W8: lane D emission (plan rev6 §3.0 W8 row; README.md has the contract).
+# lane_parts takes lane D's share from lane_pool_shares; court decay, house burn.
+cascade/shared/emission.py
+# lane_pool_shares -> LanePoolShares(b, c, d); lane_c_shares (caller, :605)
+# keeps its (B, C) pair.
+cascade/shared/lane_c.py
+# Callers of lane_pool_shares outside cascade/ that unpack the old pair.
+scripts/check_docs.py
+tests/unit/test_v2_composition.py

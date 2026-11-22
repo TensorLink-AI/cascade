@@ -1,0 +1,13 @@
+{
+  "schema": "laned_r6x_main_values/1",
+  "source": "R6 dedrift run 2026-11-22 on the deployed chain.toml (sha256 2ed6b686d6d60c1c9f65cd083eb89c8fa15b23aaa41e3a3942c32320a0560d2f) against main 37fc8bf: every marker with class main and drift true. Public values only.",
+  "values": {
+    "round": {
+      "funded_operator_fallback": true,
+      "funded_pod_skus": ["8xH100", "8xH200"]
+    },
+    "storage": {
+      "hf_backup_repo": "tensorlink-dev/cascade-backup"
+    }
+  }
+}

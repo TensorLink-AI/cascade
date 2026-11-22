@@ -1,0 +1,8 @@
+# W5a forward eligibility (plan rev6 §1.3, §3.0 W5a row, T8, invariant 4;
+# README.md has the contract).
+# The eligibility function, its typed refusal reasons and the pool_d/1
+# feed / frontier metadata it reads.
+cascade/validator/lane_d_forward.py
+# settle_lane_d builds every cohort's window set through eligible_windows;
+# load_pool parses the new pool_d/1 fields.
+cascade/validator/lane_d.py
