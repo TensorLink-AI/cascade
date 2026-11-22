@@ -245,7 +245,18 @@
         "result": {"$ref": "#/$defs/lowfreq_result"},
         "freqs": {"type": "array", "items": {"type": "string", "minLength": 1}},
         "n_windows": {"type": "integer", "minimum": 0},
-        "tau_public": {"type": "number", "minimum": 0}
+        "tau_public": {"type": "number", "minimum": 0},
+        "lcb": {"$ref": "#/$defs/lowfreq_lcbs"}
+      }
+    },
+    "lowfreq_lcbs": {
+      "type": "object",
+      "description": "W3b5 (A10): the candidate's paired LCB per reference and metric on the low-frequency slice; present iff result is pass or fail.",
+      "required": ["king_d", "house"],
+      "additionalProperties": false,
+      "properties": {
+        "king_d": {"$ref": "#/$defs/gate_lcb_pair"},
+        "house": {"$ref": "#/$defs/gate_lcb_pair"}
       }
     },
     "verdict": {
