@@ -6,6 +6,14 @@ the §14.3 forward fields, B7 (`scoring_method`), B12 (first-seen Merkle roots)
 and §3.2 invariant 11. These tests are the spec. The builder may touch only
 the paths in `PATHS`. W1.5's skeleton must stay green (`make laned-e2e`).
 
+`PATHS` includes the lane D audit, `cascade/audit/lane_d.py`. W1.5's
+`check_lane_d` requires the report's `params` to equal its own
+`_expected_params(cfg)` exactly. So when W7a adds the five new `params`
+fields, `horizons`, `max_mirror_lag_hours`, `gate_suites`, `tau_public` and
+`lowfreq_freqs`, the audit must derive them from config too. Otherwise the
+W1.5 audit tests fail. The audit derives them itself. It never imports them
+from producer code (invariant 12).
+
 The repo has no JSON-schema library, and adding one would be a dependency
 change. So the contract is a **schema file** (the published document
 satellites read) plus a **stdlib validator** in `lane_d_report.py` that
