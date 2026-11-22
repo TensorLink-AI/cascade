@@ -12,6 +12,12 @@
 #                              against the base's implementation; the files it
 #                              changes pass, or fail for a right reason only
 #                              (pending a follow-up implementation PR)
+#                              ("changes" includes a helper, conftest or
+#                              fixture file under the WP dir that the test
+#                              imports or names)
+#     MODE evidence         -> `accept <WP> --evidence <file>` per EVIDENCE line
+#                              (the diff is exactly evidence file(s) named in
+#                              the WP's §3.0 Accept cell), ledger mode evidence
 #     MODE review           -> nothing to run (laned:RV<n>)
 #   The tooling comes from the base
 #   branch once it exists there, so a PR cannot loosen its own gate.
@@ -142,6 +148,22 @@ jobs:
               # evidence/rv<n>.md; a review PR has no tests to run.
               python3 "$LANED/ci_ledger.py" record --file "$LANED_RESULTS" --wp "$wp" --mode check-pr \
                 --event "$EVENT" --head-sha "$HEAD_SHA" --conclusion success
+              echo "::endgroup::"; continue
+            fi
+            if [ "$mode" = "evidence" ]; then
+              # evidence PR: the diff is exactly evidence file(s) named in the
+              # WP's Accept cell (check-pr prints `EVIDENCE <file>` per file);
+              # each must pass `accept <WP> --evidence <file>` (the WP's own
+              # tests verify it via LANED_EVIDENCE). Recorded as mode evidence
+              # with the blob sha; L4 comes from the push/accept --evidence run
+              # the merge triggers on main.
+              for ev in $(echo "$out" | sed -n 's/^EVIDENCE //p'); do
+                uv run --frozen python "$LANED/accept" "$wp" --evidence "$ev" --root . && rc=0 || rc=$?
+                [ "$rc" = 0 ] && conclusion=success || { conclusion=failure; status=1; }
+                python3 "$LANED/ci_ledger.py" record --file "$LANED_RESULTS" --wp "$wp" --mode evidence \
+                  --event "$EVENT" --head-sha "$HEAD_SHA" --conclusion "$conclusion" \
+                  --evidence-sha "$(git rev-parse "HEAD:$ev")"
+              done
               echo "::endgroup::"; continue
             fi
             if [ "$mode" = "tests-only" ]; then

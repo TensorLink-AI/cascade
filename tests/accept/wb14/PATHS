@@ -1,0 +1,12 @@
+# WB14: declared-rows parsing + per-layer clamps (LB2; TB13, TB15, TB15b).
+# The parser/validator: parse_declared_rows, DeclaredRowsError, model_experts_per_layer.
+# It reads experts_per_layer from cascade/trainer/pyramid_model.py's source without
+# importing torch; pyramid_model.py itself is NOT touched.
+cascade/trainer/declared_rows.py
+# The lane B commit intake wire point: POST /v1/lane-b/fund parses the optional
+# X-Lane-B-Declared-Rows field (typed 400 refusals), binds it in the signed message
+# and stores the parsed rows on the lane B funding queue entry.
+cascade/funding/intake.py
+cascade/funding/queue.py
+# Production wiring: FundingIntake(..., lane_b_cfg=cfg.lane_b).
+cascade/funding/main.py
