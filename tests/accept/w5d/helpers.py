@@ -9,7 +9,10 @@ inside their bodies, and only tests marked ``torch`` call them.
 
 :func:`evidence_problems` is the T7 verifier. It never trusts the pod run: it
 re-derives ``fits``, ``armed``, ``short_window.identical`` and ``passed`` from
-the recorded numbers, so a hand-edited ``evidence/t7.json`` fails.
+the recorded numbers, so a hand-edited ``evidence/t7.json`` fails. Since RV3
+it also refuses a row that did not exercise its variant (``input_len`` must
+equal the variant, ``history_min`` must reach it) and a row whose memory is
+not the variant's own CUDA peak (``peak_mem_source``).
 """
 
 from __future__ import annotations
@@ -51,8 +54,15 @@ MAX_BUDGET_WALL_S = SETTLEMENT_BLOCKS * BLOCK_SECONDS * BUDGET_FRACTION   # 5400
 MIN_MODELS = 10                        # up to 8 entries + KING_D + house per settlement (§1.6)
 TOP_KEYS = ("schema", "wp", "source", "torch", "tool", "measured_at", "rows",
             "short_window", "armed", "passed")
-ROW_KEYS = ("host", "gpu", "variant", "wall_s", "peak_mem_gb", "budget", "fits",
-            "n_models", "n_windows")
+ROW_KEYS = ("host", "gpu", "variant", "input_len", "history_min", "history_max", "wall_s",
+            "peak_mem_gb", "peak_mem_source", "budget", "fits", "n_models", "n_windows")
+# RV3: a row's memory is either the device peak of THIS variant's run
+# (torch.cuda.max_memory_allocated after reset_peak_memory_stats) or, on CPU,
+# the process-lifetime ru_maxrss, which every later row inherits. Only the
+# first is a budget input, so only it may appear in pod evidence.
+POD_PEAK_MEM_SOURCES = ("cuda_max_allocated",)
+CPU_PEAK_MEM_SOURCE = "process_peak_rss"
+PEAK_MEM_SOURCES = (*POD_PEAK_MEM_SOURCES, CPU_PEAK_MEM_SOURCE)
 SHORT_KEYS = ("base_context", "declared_context", "n_windows", "max_abs_diff", "identical")
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 
@@ -207,6 +217,22 @@ def _row_problems(i: int, row: object) -> list[str]:
         out.append(f"rows[{i}].n_models: want an int ≥ {MIN_MODELS}, got {row['n_models']!r}")
     if type(row["n_windows"]) is not int or row["n_windows"] < 1:
         out.append(f"rows[{i}].n_windows: want an int ≥ 1, got {row['n_windows']!r}")
+    # RV3: the row must have exercised its variant. The no-pad scorer feeds a
+    # window min(n, context) points, so a variant row is only a measurement of
+    # that variant when every window had ≥ variant points of history and the
+    # model input that ran was exactly ``variant`` points.
+    if type(row["input_len"]) is not int or row["input_len"] != v:
+        out.append(f"rows[{i}].input_len: the model input that ran must be the variant "
+                   f"({v!r} points), got {row['input_len']!r}")
+    hmin, hmax = row["history_min"], row["history_max"]
+    if type(hmin) is not int or type(v) is not int or hmin < v:
+        out.append(f"rows[{i}].history_min: every window needs ≥ {v!r} points of history, "
+                   f"got {hmin!r}")
+    elif type(hmax) is not int or hmax < hmin:
+        out.append(f"rows[{i}].history_max: want an int ≥ history_min {hmin}, got {hmax!r}")
+    if row["peak_mem_source"] not in POD_PEAK_MEM_SOURCES:
+        out.append(f"rows[{i}].peak_mem_source: want one of {list(POD_PEAK_MEM_SOURCES)} "
+                   f"(the variant's own device peak), got {row['peak_mem_source']!r}")
     if out:
         return out
     if row["fits"] is not fits(row):
