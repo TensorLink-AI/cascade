@@ -78,7 +78,9 @@ RECEIPT_KEYS = ("schema", "boundary", "prior_state_sha256", "posterior_state_sha
                 "report_sha256")
 LAST_REPORT_KEYS = ("boundary", "rows_sha256", "report_sha256", "prior_state_sha256")
 STATE_ERROR_CODES = ("bad_json", "duplicate_key", "not_canonical", "unknown_schema",
-                     "state_digest_mismatch", "stale_boundary", "report_conflict")
+                     "state_digest_mismatch", "stale_boundary", "report_conflict",
+                     # RV6 B3: lost state after a settlement fails closed
+                     "state_missing", "state_unreadable")
 RECEIPT_ERROR_CODES = ("not_object", "unknown_schema", "missing_field", "unknown_field",
                        "bad_value", "boundary_mismatch", "report_mismatch", "state_mismatch",
                        "boundary_order", "chain_break")
@@ -341,14 +343,15 @@ class Chain:
         p.parent.mkdir(parents=True, exist_ok=True)
         return p
 
-    def settle(self, n: int, state_path: Path, *, cfg=None, forecasts=None):
+    def settle(self, n: int, state_path: Path, *, cfg=None, forecasts=None, **extra):
         """`settle_lane_d` at boundary(n) on snapshot n (earlier snapshots
         retained). The gate inputs (a passing bench session) are passed
         whenever `settle_lane_d` takes them: an armed crowning without them
-        fails closed (W5e RV5)."""
+        fails closed (W5e RV5). `extra` keywords (e.g. `expect_prior_sha256`)
+        are passed through unchanged."""
         from cascade.validator.lane_d import settle_lane_d
 
-        kw = {}
+        kw = dict(extra)
         if n > 1:
             kw["prior_pool_dirs"] = list(self.pools[:n - 1])
         if settle_takes_gate_inputs():
