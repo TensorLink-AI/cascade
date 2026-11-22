@@ -196,3 +196,31 @@ def git(root: Path, *args: str, check: bool = True,
     if check and proc.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
     return proc
+
+
+def first_parent_history(root: Path, ref: str) -> list[tuple[str, list[str]]]:
+    """``[(sha, changed files)]`` along ``ref``'s first-parent line, oldest first."""
+    log = git(root, "log", "--first-parent", "--reverse", "--diff-merges=first-parent",
+              "--name-only", "--format=%x01%H", ref).stdout
+    history: list[tuple[str, list[str]]] = []
+    for chunk in log.split("\x01")[1:]:
+        lines = [ln for ln in chunk.split("\n") if ln.strip()]
+        history.append((lines[0].strip(), lines[1:]))
+    return history
+
+
+def impl_commit_index(history: list[tuple[str, list[str]]], wp: str, paths: list[str]) -> int | None:
+    """The L2 commit (plan §17.1): the first commit after the one that added
+    the WP's PATHS file that changes something outside tests/accept/ and only
+    paths inside PATHS, i.e. the WP's implementation merge. None when absent."""
+    rel = f"tests/accept/{wp_dir(wp)}/PATHS"
+    start = next((i for i, (_, files) in enumerate(history) if rel in files), None)
+    if start is None:
+        return None
+    for i in range(start + 1, len(history)):
+        files = history[i][1]
+        if not files or all(f.startswith("tests/accept/") for f in files):
+            continue
+        if all(path_matches(f, paths) for f in files):
+            return i
+    return None
