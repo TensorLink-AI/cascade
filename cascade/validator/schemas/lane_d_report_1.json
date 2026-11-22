@@ -38,6 +38,12 @@
       "description": "Open and never consensus: satellites must not read verdict, eligibility or weight inputs from it."
     }
   },
+  "if": {"required": ["crowned"], "properties": {"crowned": {"type": "string"}}},
+  "then": {
+    "description": "W5e (RV5): a crowned report carries its §1.3b gate record (an object, never absent or null); the validator also requires a pass result for the crowned digest.",
+    "required": ["gate"],
+    "properties": {"gate": {"type": "object"}}
+  },
   "$defs": {
     "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "timestamp": {"type": "integer", "minimum": 0},
