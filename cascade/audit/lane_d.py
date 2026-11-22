@@ -16,8 +16,15 @@ verifier. Checks, in order (the first failure is the verdict):
 6. per cohort: the max-T LCBs, gains, clears and outcomes re-derived from
    the rows; when a miner holds KING_D the house is a second bar, and its
    judgement (``cohorts[].house_digest``, ``verdicts[].house``) is
-   re-derived the same way and must be present exactly then; the crowning
-   and the paid court follow from them.
+   re-derived the same way and must be present exactly then;
+7. the §1.3b gate (W5e): the signed ``gate`` record's draw (``block`` is
+   the boundary; ``suite`` / ``eligible`` re-drawn from ``block_hash``, the
+   config's ``gate_suites`` / ``gate_weights`` and the stated sentinel),
+   every result's outcome and ``blocked_by`` from its four LCBs against
+   ``-tau_public``, and each crowning candidate's verdict from its gate
+   outcome. Without a gate record nothing crowns (fail closed). The crown
+   is the highest-LCB passing confirmation or a held candidate re-gated
+   ``pass``; the paid court follows from it.
 """
 
 from __future__ import annotations
@@ -25,6 +32,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from fractions import Fraction
 
 import numpy as np
 
@@ -130,7 +138,10 @@ def _house_problems(idx: int, m: str, hv, hd: str, want: tuple[float, float, boo
 
 
 def _cohort_problems(report: dict, cfg, cohort: dict, rows_by: dict, windows: dict,
-                     entries: dict) -> list[str]:
+                     entries: dict, confirms: dict) -> list[str]:
+    """The cohort's problems. Every member whose re-derived judgement clears
+    stage ``confirm`` (a crowning candidate) is added to ``confirms``; its
+    outcome is the gate's to decide (:func:`_crown_problems`)."""
     out = []
     idx = int(cohort["index"])
     kd, members, wids = cohort["king_digest"], list(cohort["members"]), list(cohort["window_ids"])
@@ -203,11 +214,200 @@ def _cohort_problems(report: dict, cfg, cohort: dict, rows_by: dict, windows: di
         if bool(v["cleared"]) != cleared:
             out.append(f"cohort {idx}: {m[:12]} cleared={v['cleared']} != re-derived {cleared}")
         stage = cohort["stage"]
-        want = ("lost",) if not cleared else (
-            ("confirm_pending",) if stage == "first" else ("confirmed", "crowned"))
-        if v["outcome"] not in want or v["stage"] != stage or v["king_digest"] != kd:
-            out.append(f"cohort {idx}: {m[:12]} outcome {v['outcome']} not in {want}")
+        if v["stage"] != stage or v["king_digest"] != kd:
+            out.append(f"cohort {idx}: {m[:12]} stage/king {v['stage']}/"
+                       f"{str(v['king_digest'])[:12]} != cohort {stage}/{kd[:12]}")
+            continue
+        if cleared and stage == "confirm":
+            confirms[m] = v
+            continue
+        want = "lost" if not cleared else "confirm_pending"
+        if v["outcome"] != want:
+            out.append(f"cohort {idx}: {m[:12]} outcome {v['outcome']} != re-derived {want}")
     return out
+
+
+# ── the §1.3b gate (W5e), re-derived ────────────────────────────────────────
+#
+# The draw is W3b1's consensus function, re-implemented here from its spec
+# (invariant 12: the audit never imports ``cascade.validator.lane_d*``): one
+# suite from the boundary's block hash over ``gate_suites`` minus the era's
+# sentinel, weighted by ``gate_weights`` (absent = 0), by its own tagged
+# sha256 mapped onto the cumulative weights in exact rational arithmetic.
+
+_DRAW_TAG = b"cascade|lane_d|gate_suite|v1|"
+_DRAW_SPACE = 1 << 256
+_HEX = frozenset("0123456789abcdef")
+GATE_OUTCOMES = ("pass", "gate_regression", "checkpoint_fault", "bench_hold")
+GATE_REFS = ("king_d", "house")
+_GATE_METRICS = ("crps", "mase")
+_GATE_KEYS = {"suite", "block", "block_hash", "sentinel", "eligible", "results"}
+_RESULT_KEYS = {"digest", "outcome", "lcb", "blocked_by", "session"}
+
+
+def _gate_weights(cfg, suites: list[str]) -> dict[str, Fraction]:
+    raw = cfg.gate_weights
+    if raw is None:
+        return {s: Fraction(1) for s in suites}
+    pairs = list(raw.items()) if isinstance(raw, dict) else [tuple(p) for p in raw]
+    return {str(s): Fraction(float(w)) for s, w in pairs if str(s) in suites}
+
+
+def _gate_draw(cfg, block_hash, sentinel) -> tuple[str, list[str]] | str:
+    """``(suite, eligible)`` W3b1 draws for ``block_hash`` over ``cfg``, or
+    why the stated hash / sentinel cannot be drawn from."""
+    if not isinstance(block_hash, str) or not block_hash.startswith("0x") \
+            or len(block_hash) != 66 or not set(block_hash[2:]) <= _HEX:
+        return f"gate block_hash {block_hash!r} is not 0x + 64 lowercase hex digits"
+    if sentinel is not None and (not isinstance(sentinel, str) or not sentinel):
+        return f"gate sentinel {sentinel!r} is neither null nor a suite name"
+    suites = [str(s) for s in cfg.gate_suites]
+    weights = _gate_weights(cfg, suites)
+    eligible = [s for s in suites if s != sentinel and weights.get(s, Fraction(0)) > 0]
+    if not eligible:
+        return f"no eligible gate suite once the sentinel {sentinel!r} is removed"
+    total = sum((weights[s] for s in eligible), Fraction(0))
+    d = int.from_bytes(hashlib.sha256(_DRAW_TAG + block_hash[2:].encode("ascii")).digest(),
+                       "big")
+    point = Fraction(d, _DRAW_SPACE) * total
+    acc = Fraction(0)
+    for s in eligible:
+        acc += weights[s]
+        if point < acc:
+            return s, eligible
+    return "the gate draw fell past the cumulative total"
+
+
+def _finite(x) -> bool:
+    return (isinstance(x, (int, float)) and not isinstance(x, bool)
+            and math.isfinite(float(x)))
+
+
+def _result_problem(i: int, res, tau: float) -> str | None:
+    """Why ``gate.results[i]`` disagrees with W3b2's ``paired_gate`` rule
+    re-derived from its own LCBs, or ``None``."""
+    if not isinstance(res, dict) or set(res) != _RESULT_KEYS:
+        keys = sorted(res) if isinstance(res, dict) else type(res).__name__
+        return f"gate result {i}: keys {keys}"
+    dg, outcome = str(res["digest"])[:12], res["outcome"]
+    if outcome not in GATE_OUTCOMES:
+        return f"gate result {i} ({dg}): outcome {outcome!r} not in {GATE_OUTCOMES}"
+    if not isinstance(res["session"], str) or not res["session"]:
+        return f"gate result {i} ({dg}): no bench session"
+    blocked = res["blocked_by"]
+    if not isinstance(blocked, list) or len(set(map(str, blocked))) != len(blocked):
+        return f"gate result {i} ({dg}): blocked_by {blocked!r} is not a list of refs"
+    lcb = res["lcb"]
+    if outcome in ("checkpoint_fault", "bench_hold"):
+        if lcb is not None or blocked:
+            return f"gate result {i} ({dg}): {outcome} carries LCBs or blocked_by"
+        return None
+    if not isinstance(lcb, dict) or set(lcb) != set(GATE_REFS) or any(
+            not isinstance(lcb[r], dict) or set(lcb[r]) != set(_GATE_METRICS)
+            or not all(_finite(lcb[r][m]) for m in _GATE_METRICS) for r in GATE_REFS):
+        return f"gate result {i} ({dg}): {outcome} without four finite LCBs"
+    below = {r for r in GATE_REFS if any(float(lcb[r][m]) < -tau for m in _GATE_METRICS)}
+    want = "gate_regression" if below else "pass"
+    if outcome != want:
+        return (f"gate result {i} ({dg}): outcome {outcome}; its LCBs re-derive {want} "
+                f"(-tau_public={-tau})")
+    if set(map(str, blocked)) != below:
+        return (f"gate result {i} ({dg}): blocked_by {sorted(map(str, blocked))} != "
+                f"re-derived {sorted(below)}")
+    return None
+
+
+def _gate_problems(report: dict, cfg, boundary: int) -> tuple[dict, list[str]]:
+    """``({digest: outcome}, problems)`` for the signed ``gate`` record: the
+    draw and every result's outcome re-derived from the config and its LCBs.
+    No ``gate`` key gives ``({}, [])`` (the gate did not run)."""
+    if "gate" not in report:
+        return {}, []
+    gate = report["gate"]
+    if not isinstance(gate, dict):
+        return {}, [f"gate is {type(gate).__name__}, not a record"]
+    if set(gate) != _GATE_KEYS:
+        return {}, [f"gate keys {sorted(gate)}"]
+    block = gate["block"]
+    if isinstance(block, bool) or not isinstance(block, int) or block != boundary:
+        return {}, [f"gate block {block!r} is not the boundary {boundary}"]
+    drawn = _gate_draw(cfg, gate["block_hash"], gate["sentinel"])
+    if isinstance(drawn, str):
+        return {}, [drawn]
+    suite, eligible = drawn
+    out = []
+    if gate["eligible"] != eligible:
+        out.append(f"gate eligible {gate['eligible']!r} != re-derived {eligible}")
+    if gate["suite"] != suite:
+        out.append(f"gate suite {gate['suite']!r} is not the draw {suite!r} for "
+                   f"block_hash {gate['block_hash']} (sentinel {gate['sentinel']!r})")
+    results = gate["results"]
+    if not isinstance(results, list) or not results:
+        return {}, [*out, "gate results are empty: the gate ran over no candidate"]
+    outcomes: dict = {}
+    tau = float(cfg.tau_public)
+    for i, res in enumerate(results):
+        why = _result_problem(i, res, tau)
+        if why:
+            out.append(why)
+            continue
+        if res["digest"] in outcomes:
+            out.append(f"gate result {i}: digest {str(res['digest'])[:12]} listed twice")
+        outcomes[res["digest"]] = res["outcome"]
+    return outcomes, out
+
+
+def _crown_problems(report: dict, cfg, boundary: int, confirms: dict, entries: dict
+                    ) -> tuple[str | None, list[str]]:
+    """``(re-derived crown, problems)``. ``confirms`` maps every verdict
+    whose re-derived judgement clears stage ``confirm`` (a crowning
+    candidate) to that verdict. W5e: the gate decides each candidate
+    (``pass`` crowns or stays ``confirmed``, ``gate_regression`` /
+    ``checkpoint_fault`` is ``lost``, ``bench_hold`` stays ``confirmed``);
+    without a gate record every candidate is held and nothing crowns; the
+    crown is the highest-LCB passing confirmation, or a held candidate
+    re-gated ``pass`` (it has no verdict this settlement)."""
+    outcomes, out = _gate_problems(report, cfg, boundary)
+    if out:
+        return None, out
+    gated = "gate" in report
+    verdicts = {v["digest"]: v for v in report.get("verdicts") or []}
+    for dg in confirms:
+        if gated and dg not in outcomes:
+            out.append(f"cleared confirmation {dg[:12]} has no gate result")
+    held = []
+    for dg in outcomes:
+        if dg in confirms:
+            continue
+        if dg in verdicts:
+            out.append(f"gate result for {str(dg)[:12]}, whose verdict is not a cleared "
+                       f"confirmation")
+        elif dg not in entries:
+            out.append(f"gate result for {str(dg)[:12]}, neither a verdict nor a listed entry")
+        else:
+            held.append(dg)
+    if out:
+        return None, out
+    passing = sorted((v for dg, v in confirms.items() if outcomes.get(dg) == "pass"),
+                     key=lambda v: (-float(v["lcb"]), int(entries[v["digest"]]["reveal_ts"]),
+                                    v["digest"]))
+    # A held candidate's clear (its LCB) is not in this report, so when one
+    # passes the crown is the best passing confirmation or that candidate.
+    allowed = [v["digest"] for v in passing[:1]] + [dg for dg in held if outcomes[dg] == "pass"]
+    stated = report.get("crowned")
+    crown = stated if stated in allowed else (allowed[0] if allowed else None)
+    for dg, v in confirms.items():
+        o = outcomes.get(dg)
+        if o in (None, "bench_hold"):
+            want = "confirmed"
+        elif o in ("gate_regression", "checkpoint_fault"):
+            want = "lost"
+        else:
+            want = "crowned" if dg == crown else "confirmed"
+        if v["outcome"] != want:
+            out.append(f"{dg[:12]}: outcome {v['outcome']} != re-derived {want} "
+                       f"(gate {o or 'absent'})")
+    return crown, out
 
 
 def check_lane_d(report: dict, cfg, *, signer_hotkey: str) -> CheckResult:
@@ -255,22 +455,25 @@ def check_lane_d(report: dict, cfg, *, signer_hotkey: str) -> CheckResult:
                             for c in cohorts)
         if expected_rows != len(rows):
             return _fail(NAME, f"{len(rows)} rows; the cohorts account for {expected_rows}")
-        problems = []
+        problems, confirms = [], {}
         for c in cohorts:
-            problems += _cohort_problems(report, cfg, c, rows_by, windows, entries)
+            problems += _cohort_problems(report, cfg, c, rows_by, windows, entries, confirms)
         if problems:
             return _fail(NAME, "; ".join(problems[:5]))
-        # The crowning and the paid court follow from the verdicts.
-        confirmed = [v for v in report.get("verdicts", []) if v["outcome"] in ("confirmed", "crowned")]
+        # The §1.3b gate decides every crowning candidate; the crowning and
+        # the paid court follow from it.
+        crown, problems = _crown_problems(report, cfg, boundary, confirms, entries)
+        if problems:
+            return _fail(NAME, "; ".join(problems[:5]))
         before, after = report["king_before"], report["king_after"]
-        if confirmed:
-            best = sorted(confirmed, key=lambda v: (-float(v["lcb"]),
-                                                    int(entries[v["digest"]]["reveal_ts"]),
-                                                    v["digest"]))[0]["digest"]
-            if report.get("crowned") != best or after["digest"] != best or after["house"]:
-                return _fail(NAME, f"crowned {report.get('crowned')!r}; re-derived {best!r}")
+        if crown is not None:
+            if report.get("crowned") != crown or after["digest"] != crown or after["house"]:
+                return _fail(NAME, f"crowned {report.get('crowned')!r}; re-derived {crown!r}")
         elif report.get("crowned") is not None or after["digest"] != before["digest"]:
-            return _fail(NAME, "the king changed without a confirmed verdict")
+            why = ("no gate record (the gate did not run)" if "gate" not in report
+                   else "no gate result passes")
+            return _fail(NAME, f"crowned {report.get('crowned')!r} / king changed, but {why}: "
+                               f"nothing may crown")
         court = (report.get("pay") or {}).get("court") or []
         if float((report.get("pay") or {}).get("share", -1.0)) != float(cfg.share):
             return _fail(NAME, "pay share differs from config")
