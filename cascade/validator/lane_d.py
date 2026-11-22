@@ -22,7 +22,12 @@ validator. Unarmed (``not cfg.active(boundary)``) it returns
    the cohort: a member clears iff ``LCB ≥ d_margin`` and its point gain is
    positive; a first clear goes ``confirm_pending`` and must clear again on a
    disjoint set (D20 ``confirm_on_king_change``) before it is crowned;
-6. writes the signed ``lane-d-report/1``, the new state, and returns the pay
+   A confirmed candidate also runs the §1.3b A10 low-frequency check; a
+   ``fail`` is ``lowfreq_regression`` and the entry is not crowned;
+6. writes the signed ``lane-d-report/1`` (W7a: the schema file
+   ``schemas/lane_d_report_1.json``; every entry considered and not judged is
+   a typed skip, court slots that burn name a ``burn_reason``), the new
+   state, and returns the pay
    record ``{"share", "court_uids"}`` — king first (``None`` while the house
    holds KING_D: that slot burns, D21), then up to ``reward_prior_kings``
    prior MINER kings (an unregistered one is ``None`` and burns).
@@ -41,7 +46,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ..eval.bootstrap import cohort_maxt_lcbs
+from ..eval.bootstrap import cohort_maxt_lcbs, paired_bootstrap_lcb
 from ..eval.lane_d_scorer import SCORING_LEVELS, SCORING_METHOD, score_window
 from .lane_d_forward import eligible_windows
 from .lane_d_report import REPORT_SCHEMA, rows_sha256, sign_report
@@ -109,10 +114,28 @@ def _parse_frontier(raw, sid: str, where: Path) -> list[tuple[int, int]] | None:
     return out
 
 
+_HEX64 = frozenset("0123456789abcdef")
+
+
+def _parse_roots(raw, where: Path) -> list[str]:
+    """Top-level ``first_seen_roots`` (B12): the daily first-seen Merkle roots
+    the snapshot relies on, as sorted 64-hex strings. Absent (a W1.5-format
+    snapshot) = ``[]``; W6fs makes the key mandatory."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError(f"{where}: pool 'first_seen_roots' must be a list")
+    for root in raw:
+        if not (isinstance(root, str) and len(root) == 64 and set(root) <= _HEX64):
+            raise ValueError(f"{where}: first-seen root {root!r} is not a sha256 hex")
+    return sorted(set(raw))
+
+
 def load_pool(pool_dir, horizon: int) -> dict:
-    """One ``pool_d/1`` snapshot: ``{"snapshot", "sha256", "feeds", "windows":
-    [...]}`` with each window's history, target, both clocks, cluster, feed
-    and frontier (``None`` when the series records no ``frontier`` key)."""
+    """One ``pool_d/1`` snapshot: ``{"snapshot", "sha256", "feeds",
+    "first_seen_roots", "windows": [...]}`` with each window's history,
+    target, both clocks, cluster, feed, frequency and frontier (``None`` when
+    the series records no ``frontier`` key)."""
     d = Path(pool_dir)
     meta = json.loads((d / "metadata.json").read_text(encoding="utf-8"))
     if meta.get("schema") != POOL_SCHEMA:
@@ -135,6 +158,7 @@ def load_pool(pool_dir, horizon: int) -> dict:
                 "window_id": window_id(sid, ts, horizon) if ts else "",
                 "series_id": sid, "source": source,
                 "feed": str(s.get("feed") or source),
+                "freq": str(s.get("freq") or ""),
                 "frontier": _parse_frontier(s.get("frontier"), sid, d),
                 "seasonal_period": int(s.get("seasonal_period") or 1),
                 "target_ts": ts, "first_seen_ts": seen,
@@ -142,7 +166,9 @@ def load_pool(pool_dir, horizon: int) -> dict:
                 "history": np.asarray(hist[sid], dtype=np.float64), "target": target,
             })
     return {"snapshot": str(meta.get("snapshot", "")), "sha256": sha,
-            "feeds": _parse_feeds(meta.get("feeds"), d), "windows": windows}
+            "feeds": _parse_feeds(meta.get("feeds"), d),
+            "first_seen_roots": _parse_roots(meta.get("first_seen_roots"), d),
+            "windows": windows}
 
 
 def _target_usable(w: dict, horizon: int) -> bool:
@@ -193,8 +219,12 @@ def _forecast_ok(fc: dict | None, wid: str, horizon: int) -> bool | None:
     return bool(q.shape == (horizon, len(SCORING_LEVELS)) and np.isfinite(q).all())
 
 
-def _register(state: dict, entries: list[dict], cfg, uid_of: dict) -> None:
+def _register(state: dict, entries: list[dict], cfg, uid_of: dict) -> list[dict]:
+    """Register newly revealed entries; returns the entries voided this
+    settlement as ``{"digest", "reason"}`` skips (a new entry refused at
+    registration, or an open entry whose hotkey lost its UID, B8)."""
     known = state["entries"]
+    voided: list[dict] = []
     taken = {state["house"]["digest"], state["king"]["digest"]}
     for e in sorted(entries, key=lambda x: (int(x["reveal_ts"]), str(x["digest"]))):
         dg = str(e["digest"])
@@ -218,9 +248,13 @@ def _register(state: dict, entries: list[dict], cfg, uid_of: dict) -> None:
         elif rec["reveal_block"] - rec["ready_block"] > int(cfg.ready_ttl_blocks):
             rec.update(status="closed", reason="ready_expired")
         known[dg] = rec
-    for rec in known.values():
+        if rec["status"] == "closed":
+            voided.append({"digest": dg, "reason": rec["reason"]})
+    for dg, rec in sorted(known.items()):
         if rec["status"] in OPEN_STATUSES and rec["hotkey"] not in uid_of:
             rec.update(status="closed", reason="deregistered")
+            voided.append({"digest": dg, "reason": "deregistered"})
+    return voided
 
 
 def _select(state: dict, cfg) -> tuple[list[str], list[dict]]:
@@ -232,6 +266,7 @@ def _select(state: dict, cfg) -> tuple[list[str], list[dict]]:
         cold = state["entries"][dg]["coldkey_at_ready"]
         if (len(chosen) >= int(cfg.max_entries_per_settlement)
                 or per_cold.get(cold, 0) >= int(cfg.max_judged_per_coldkey_per_settlement)):
+            state["entries"][dg]["reason"] = "coldkey_cap_settlement"
             skipped.append({"digest": dg, "reason": "coldkey_cap_settlement"})
             continue
         per_cold[cold] = per_cold.get(cold, 0) + 1
@@ -262,13 +297,18 @@ def _king_reveal_ts(state: dict, digest: str) -> int | None:
 
 
 def _window_set(pool: dict, members: list[str], king_digest: str, king_ts: int, state: dict,
-                forecasts: dict, cfg) -> list[dict]:
+                forecasts: dict, cfg) -> tuple[list[dict], dict[str, int]]:
+    """The cohort's frozen window set, and ``{reason: count}`` of the pool
+    windows the §1.3 eligibility rule refused for ``max(T)`` (windows dropped
+    for any other reason are not counted)."""
     t_entry = max(int(state["entries"][m]["reveal_ts"]) for m in members)
     h = int(cfg.horizon)
     verdicts = eligible_windows(pool, t_entry=t_entry, t_king=int(king_ts), cfg=cfg)
-    out = []
+    out, refused = [], {}
     for w, v in zip(pool["windows"], verdicts, strict=True):
         wid = w["window_id"]
+        if v.reason is not None:
+            refused[str(v.reason)] = refused.get(str(v.reason), 0) + 1
         if not wid or not v.eligible or not _target_usable(w, h):
             continue
         if _forecast_ok(forecasts.get(king_digest), wid, h) is not True:
@@ -277,7 +317,7 @@ def _window_set(pool: dict, members: list[str], king_digest: str, king_ts: int, 
                or _forecast_ok(forecasts.get(m), wid, h) is not True for m in members):
             continue
         out.append(w)
-    return sorted(out, key=lambda w: w["window_id"])
+    return sorted(out, key=lambda w: w["window_id"]), dict(sorted(refused.items()))
 
 
 def _meets_floors(ws: list[dict], cfg) -> bool:
@@ -293,6 +333,12 @@ def _court(state: dict, cfg, uid_of: dict) -> list[dict]:
     for s in slots:
         uid = uid_of.get(s["hotkey"]) if s["hotkey"] is not None else None
         s["uid"] = None if uid is None else int(uid)
+        # Invariant 11: a burning slot names why. The house holding KING_D
+        # burns (D21); a court member without a UID burns (B8).
+        if s["uid"] is not None:
+            s["burn_reason"] = None
+        else:
+            s["burn_reason"] = "house_king" if s["hotkey"] is None else "deregistered"
     return slots
 
 
@@ -304,8 +350,10 @@ def _king_record(k: dict) -> dict:
 def _params(cfg) -> dict:
     return {"share": float(cfg.share), "takes_from": str(cfg.takes_from),
             "remainder": str(cfg.remainder), "horizon": int(cfg.horizon),
+            "horizons": [int(cfg.horizon)],
             "contexts": [int(c) for c in cfg.contexts],
             "forward_margin_hours": float(cfg.forward_margin_hours),
+            "max_mirror_lag_hours": float(cfg.max_mirror_lag_hours),
             "min_windows": int(cfg.min_windows), "min_clusters": int(cfg.min_clusters),
             "d_margin": float(cfg.d_margin), "alpha": float(cfg.alpha),
             "bootstrap_B": int(cfg.bootstrap_B), "king_decay": float(cfg.king_decay),
@@ -314,7 +362,48 @@ def _params(cfg) -> dict:
             "max_entries_per_settlement": int(cfg.max_entries_per_settlement),
             "max_judged_per_coldkey_per_settlement":
                 int(cfg.max_judged_per_coldkey_per_settlement),
-            "scoring_levels": [float(q) for q in SCORING_LEVELS]}
+            "scoring_levels": [float(q) for q in SCORING_LEVELS],
+            "gate_suites": [str(s) for s in cfg.gate_suites],
+            "tau_public": float(cfg.tau_public),
+            "lowfreq_freqs": [str(f) for f in cfg.lowfreq_freqs]}
+
+
+def _lowfreq(member: str, king: str, ws: list[dict], scores: dict, house: str,
+             forecasts: dict, cfg, seed: str) -> dict:
+    """§1.3b A10 for a crowning candidate. The slice is the set's windows
+    whose frequency is in ``lowfreq_freqs``; on it the paired bootstrap LCB
+    of the member's relative CRPS and MASE improvement over each anchor must
+    be ``>= -tau_public``. The anchors are the cohort's KING_D (``scores`` holds
+    ``(crps, mase)`` aligned with ``ws`` for it and ``member``) and the house
+    when it is a different model with forecasts on every slice window."""
+    freqs = {str(f) for f in cfg.lowfreq_freqs}
+    idx = [i for i, w in enumerate(ws) if w["freq"] in freqs]
+    out = {"result": "no_windows", "freqs": [str(f) for f in cfg.lowfreq_freqs],
+           "n_windows": len(idx), "tau_public": float(cfg.tau_public)}
+    if not idx:
+        return out
+    h = int(cfg.horizon)
+    mine = (scores[member][0][idx], scores[member][1][idx])
+    anchors = {king: (scores[king][0][idx], scores[king][1][idx])}
+    if house not in anchors and all(_forecast_ok(forecasts.get(house), ws[i]["window_id"], h)
+                                   is True for i in idx):
+        pairs = [score_window(forecasts[house][ws[i]["window_id"]], ws[i]["target"],
+                              ws[i]["history"], ws[i]["seasonal_period"]) for i in idx]
+        anchors[house] = (np.asarray([p[0] for p in pairs]), np.asarray([p[1] for p in pairs]))
+    ok = True
+    for anchor, theirs in sorted(anchors.items()):
+        for k, metric in enumerate(("crps", "mase")):
+            lcb = paired_bootstrap_lcb(theirs[k], mine[k], alpha=float(cfg.alpha),
+                                       B=int(cfg.bootstrap_B),
+                                       seed=f"{seed}:lowfreq:{member}:{anchor}:{metric}")
+            ok = ok and math.isfinite(lcb) and lcb >= -float(cfg.tau_public)
+    out["result"] = "pass" if ok else "fail"
+    return out
+
+
+def _not_candidate(cfg) -> dict:
+    return {"result": "not_candidate", "freqs": [str(f) for f in cfg.lowfreq_freqs],
+            "n_windows": 0, "tau_public": float(cfg.tau_public)}
 
 
 def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: dict,
@@ -330,16 +419,24 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     king_before = _king_record(state["king"])
     pool = load_pool(pool_dir, int(cfg.horizon))
     seed = f"lane-d/1:{boundary}:{pool['sha256']}"
-    _register(state, entries, cfg, uid_of)
-    chosen, skipped = _select(state, cfg)
+    # Every entry considered and not judged is a typed skip, including the
+    # entries voided this settlement (invariant 11).
+    skipped = _register(state, entries, cfg, uid_of)
+    chosen, capped = _select(state, cfg)
+    skipped += capped
     h = int(cfg.horizon)
+
+    def skip(dg: str, reason: str) -> None:
+        state["entries"][dg]["reason"] = reason
+        skipped.append({"digest": dg, "reason": reason})
 
     # A member whose forecasts are malformed on any pool window is the miner's fault.
     for dg in list(chosen):
         fc = forecasts.get(dg)
         if fc is not None and any(_forecast_ok(fc, w["window_id"], h) is False
                                   for w in pool["windows"] if w["window_id"]):
-            state["entries"][dg].update(status="closed", reason="checkpoint_fault")
+            state["entries"][dg]["status"] = "closed"
+            skip(dg, "checkpoint_fault")
             chosen.remove(dg)
 
     groups: dict[tuple[str, str], list[str]] = {}
@@ -354,14 +451,15 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     for (kd, stage), members in sorted(groups.items()):
         king_ts = _king_reveal_ts(state, kd)
         if king_ts is None or forecasts.get(kd) is None:
-            skipped += [{"digest": m, "reason": "king_unscored"} for m in members]
+            for m in members:
+                skip(m, "king_unscored")
             continue
         members = sorted(members, key=lambda m: (state["entries"][m]["reveal_ts"], m))
-        ws = _window_set(pool, members, kd, king_ts, state, forecasts, cfg)
+        ws, refused = _window_set(pool, members, kd, king_ts, state, forecasts, cfg)
         while members and not _meets_floors(ws, cfg):
-            late = members.pop()
-            skipped.append({"digest": late, "reason": "pending_floor"})
-            ws = _window_set(pool, members, kd, king_ts, state, forecasts, cfg) if members else []
+            skip(members.pop(), "pending_floor")
+            if members:
+                ws, refused = _window_set(pool, members, kd, king_ts, state, forecasts, cfg)
         if not members:
             continue
         scores = {}
@@ -370,10 +468,12 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
                                   w["seasonal_period"]) for w in ws]
             scores[dg] = (np.asarray([p[0] for p in pairs]), np.asarray([p[1] for p in pairs]))
         for i, w in enumerate(ws):
+            lag = (pool["feeds"].get(w["feed"]) or {}).get("mirror_lag_hours")
             windows_out[w["window_id"]] = {
-                "window_id": w["window_id"], "source": w["source"],
+                "window_id": w["window_id"], "source": w["source"], "feed": w["feed"],
                 "min_target_ts": int(min(w["target_ts"])),
-                "min_first_seen_ts": int(min(w["first_seen_ts"]))}
+                "min_first_seen_ts": int(min(w["first_seen_ts"])),
+                "mirror_lag_hours": None if lag is None else float(lag)}
             for dg in [kd, *members]:
                 rows.append({"window_id": w["window_id"], "digest": dg, "cohort": len(cohorts),
                              "crps": float(scores[dg][0][i]), "mase": float(scores[dg][1][i])})
@@ -383,14 +483,27 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
         t_max = max([king_ts] + [state["entries"][m]["reveal_ts"] for m in members])
         cohorts.append({"index": len(cohorts), "king_digest": kd, "king_reveal_ts": int(king_ts),
                         "stage": stage, "members": list(members), "t_max": int(t_max),
-                        "window_ids": [w["window_id"] for w in ws], "set_sha256": set_sha})
+                        "window_ids": [w["window_id"] for w in ws], "set_sha256": set_sha,
+                        "first_seen_roots": list(pool["first_seen_roots"]),
+                        "refused": refused})
         for m, r in zip(members, res, strict=True):
             rec = state["entries"][m]
             rec["used_windows"] = sorted(set(rec["used_windows"]) | {w["window_id"] for w in ws})
+            first = rec.get("confirm") if stage == "confirm" else None
+            confirmation = {"stage": stage, "rule": str(cfg.confirm_on_king_change),
+                            "first_set_sha256": first["first_set_sha256"] if first else None,
+                            "first_king_digest": first["king_digest"] if first else None}
+            lowfreq = _not_candidate(cfg)
+            if r["cleared"] and stage == "confirm":
+                lowfreq = _lowfreq(m, kd, ws, scores, state["house"]["digest"], forecasts, cfg,
+                                   seed)
             if not r["cleared"]:
                 outcome = "lost"
                 rec.update(status="lost",
                            reason="lost_confirmation" if stage == "confirm" else "lost_duel")
+            elif lowfreq["result"] == "fail":
+                outcome = "lost"
+                rec.update(status="lost", reason="lowfreq_regression")
             elif stage == "first":
                 outcome = "confirm_pending"
                 rec.update(status="confirm_pending", reason="confirm_pending",
@@ -401,7 +514,8 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
                 outcome = "confirmed"
                 crowned.append({"digest": m, "lcb": r["lcb"], "reveal_ts": rec["reveal_ts"]})
             verdicts.append({"digest": m, "king_digest": kd, "stage": stage,
-                             "cohort": len(cohorts) - 1, **r, "outcome": outcome})
+                             "cohort": len(cohorts) - 1, **r, "outcome": outcome,
+                             "confirmation": confirmation, "lowfreq": lowfreq})
 
     new_king = None
     if crowned:
@@ -423,15 +537,17 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     report = {
         "schema": REPORT_SCHEMA, "boundary": boundary, "scoring_method": SCORING_METHOD,
         "params": _params(cfg), "seed": seed,
-        "pool": {"snapshot": pool["snapshot"], "sha256": pool["sha256"], "horizon": h},
+        "pool": {"snapshot": pool["snapshot"], "sha256": pool["sha256"], "horizon": h,
+                 "first_seen_roots": list(pool["first_seen_roots"])},
         "house": _king_record({**state["house"], "hotkey": None, "house": True}),
         "king_before": king_before, "king_after": _king_record(state["king"]),
         "crowned": new_king,
         "prior_kings": [_king_record(p) for p in state["prior_kings"]],
-        "entries": [{"digest": dg, **{k: r[k] for k in ("hotkey", "coldkey_at_ready", "context",
-                                                        "ready_block", "reveal_block",
-                                                        "reveal_ts", "status", "reason")}}
+        "entries": [{"digest": dg, "hotkey": r["hotkey"], "coldkey": r["coldkey_at_ready"] or None,
+                     **{k: r[k] for k in ("context", "ready_block", "reveal_block", "reveal_ts",
+                                          "status", "reason")}}
                     for dg, r in sorted(state["entries"].items())],
+        "judged": [v["digest"] for v in verdicts],
         "skipped": skipped, "cohorts": cohorts,
         "windows": [windows_out[k] for k in sorted(windows_out)],
         "verdicts": verdicts, "rows": rows, "rows_sha256": rows_sha256(rows),
