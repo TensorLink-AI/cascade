@@ -66,13 +66,17 @@ SKIP_REASONS = ("pending_floor", "coldkey_cap_settlement", "coldkey_unresolved",
                 "coldkey_changed", "king_unscored", "bench_hold", "deregistered",
                 "ready_expired", "reveal_delay_exceeded", "duplicate_digest",
                 "hotkey_has_open_entry", "context_not_armed", "checkpoint_fault",
-                "mirror_lag_exceeded")
+                "mirror_lag_exceeded", "lane_closed")
+# `lane_closed` (W5b, T18): every open entry closes at `[lane_d] until_block`,
+# listed in both entries[].reason and skipped[].reason.
 ENTRY_REASONS = SKIP_REASONS + ("confirm_pending", "lost_duel", "lost_confirmation",
                                 "lowfreq_regression", "crowned")
 BURN_REASONS = ("house_king", "deregistered")
-# W5a's REFUSAL_REASONS (tests/accept/w5a/README.md "Reasons").
-WINDOW_REFUSAL_REASONS = ("missing_clock", "forecast_product", "over_lag", "before_margin",
-                          "publish_ahead", "late_mirror", "absent_from_s0", "backfill")
+# W5a's REFUSAL_REASONS (tests/accept/w5a/README.md "Reasons"), in precedence
+# order: `unlisted_feed` (W5a) comes right after `missing_clock`.
+WINDOW_REFUSAL_REASONS = ("missing_clock", "unlisted_feed", "forecast_product", "over_lag",
+                          "before_margin", "publish_ahead", "late_mirror", "absent_from_s0",
+                          "backfill")
 CONFIRMATION_STAGES = ("first", "confirm")
 CONFIRM_RULES = ("restart", "original")
 LOWFREQ_RESULTS = ("pass", "fail", "no_windows", "not_candidate")
@@ -119,10 +123,23 @@ LOWFREQ_FIELDS = ("result", "freqs", "n_windows", "tau_public")
 ROW_FIELDS = ("window_id", "digest", "cohort", "crps", "mase")
 COURT_FIELDS = ("digest", "hotkey", "uid", "burn_reason")
 
-# Fixture feeds (pool_d/1 "feeds", W5a format): src0's series report through
-# feed-a (lag measured), src1's lag is unmeasured (null), the rest are unlisted.
+# Fixture feeds (pool_d/1 "feeds", W5a format). W5a fails closed (RV3): a feed
+# missing from `feeds` is refused `unlisted_feed`, so the rich pools list every
+# feed their series name. src0's series report through feed-a (lag measured),
+# src1 and src3 are listed with an unmeasured lag (null), the rest measured.
 FEEDS = {"feed-a": {"mirror_lag_hours": 1.5, "forecast_product": False},
-         "src1": {"mirror_lag_hours": None, "forecast_product": False}}
+         "src1": {"mirror_lag_hours": None, "forecast_product": False},
+         "src2": {"mirror_lag_hours": 1.0, "forecast_product": False},
+         "src3": {"mirror_lag_hours": None, "forecast_product": False},
+         "src4": {"mirror_lag_hours": 1.0, "forecast_product": False},
+         "src5": {"mirror_lag_hours": 1.0, "forecast_product": False}}
+# W5a fails closed on a missing `frontier` too (`absent_from_s0`), so every
+# rich series records its S0 as one `[as_of_ts, end_ts]` frontier record, as
+# tests/accept/w1_5/helpers.py does: S0 was taken 3 h before the snapshot's
+# first target (after every bound the fixture uses, T0 + 6 h) and held data
+# up to 1 h before it was taken, so no target is a backfill.
+FRONTIER_AS_OF = {snap: start - 3 * HOUR for snap, start in SNAPSHOT_START.items()}
+FRONTIER_END_LAG = HOUR
 
 
 def lane_d_cfg(**over):
@@ -181,6 +198,9 @@ def _series(snapshot: int, seed: int, *, rich: bool) -> list[dict]:
         out.append({"series_id": "src2-trap", "source": "src2",
                     "history": 12.0 + rng.normal(0, 0.5, HISTORY), "target_ts": old,
                     "first_seen_ts": [x + FIRST_SEEN_LAG for x in old]})
+        as_of = FRONTIER_AS_OF[snapshot]
+        for rec in out:
+            rec["frontier"] = [[as_of, as_of - FRONTIER_END_LAG]]
     return out
 
 
@@ -194,8 +214,9 @@ def _write_pool(directory: Path, snapshot: int, series: list[dict], targets: dic
                "seasonal_period": 24, "first_target_ts": s["target_ts"][0],
                "end_ts": s["target_ts"][-1], "target_ts": s["target_ts"],
                "first_seen_ts": s["first_seen_ts"]}
-        if "feed" in s:
-            rec["feed"] = s["feed"]
+        for key in ("feed", "frontier"):
+            if key in s:
+                rec[key] = s[key]
         meta["series"].append(rec)
     if rich:
         meta["feeds"] = copy.deepcopy(FEEDS)
