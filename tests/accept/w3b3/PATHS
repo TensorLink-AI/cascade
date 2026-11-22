@@ -1,0 +1,8 @@
+# W3b3: the era's §16 sentinel sweep + publish for every new lane D king
+# (plan §1.3b "Held-out suite", §16 rules 1, 2 and 4, T7b; README.md has the
+# contract). New module: sweep_and_publish (the era's drawn sentinel swept for
+# the new king, the previous KING_D and the house in the settlement's bench
+# session; a strict, canonical, self-describing record published idempotently
+# under a deterministic key; errors recorded, never raised; never gating).
+# lane_d.py is NOT in PATHS: the step runs after settle_lane_d on its report.
+cascade/validator/lane_d_sentinel.py
