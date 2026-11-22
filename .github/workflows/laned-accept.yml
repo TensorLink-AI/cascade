@@ -230,6 +230,7 @@ jobs:
             echo "the base branch's loop tooling has no --cross mode yet; cross-WP step skipped"
             exit 0
           fi
+          set -o pipefail   # the default `bash -e` would take tee's status
           out="$RUNNER_TEMP/laned-cross.txt"
           uv run --frozen python "$LANED/accept" "$WPS" --cross --base HEAD^1 --head HEAD --root . \
             | tee "$out" && rc=0 || rc=$?
