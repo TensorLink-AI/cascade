@@ -64,6 +64,7 @@ byte-identical.
   | `state_digest_mismatch` | `expect_sha256` is given and the file's digest differs (for a missing file: the genesis digest) |
   | `stale_boundary` | see `settle_lane_d` below |
   | `report_conflict` | see `settle_lane_d` below |
+  | `report_unverified` | RV7 B1: recovery's persisted report doesn't verify (see `settle_lane_d` below) |
 
 ### The receipt record
 
@@ -140,13 +141,40 @@ Structure, per receipt:
 - **Write order:** the signed report is written atomically to
   `report_path(state_path, boundary)` **before** the state file.
 - **Recovery (state boundary < boundary, report file present):** this is a
-  crash after the report landed and before the state did. The settlement is
-  recomputed, and the recomputed canonical body must equal the persisted
-  file's body. If it does, the file is kept byte-for-byte (its signature too,
-  even a re-signed one), the persisted report is returned and the state is
-  written. If the body differs, it's `LaneDStateError("report_conflict")`
-  and nothing is written. If the file has duplicate keys, it's
-  `duplicate_key`.
+  crash after the report landed and before the state did. **RV7 B1
+  (tests-correction): recovery ADOPTS the persisted report; it never
+  re-sweeps the bench.** The old rule ("recompute, and the recomputed body
+  must equal the persisted one") wedged lane D for good after a crash in a
+  GATED settlement: the bench `session` id and every bench number are in
+  the signed body, a restarted validator has a new session, and its bench
+  may answer differently (pod down, so `pass` becomes `bench_hold`; or
+  numerically different rows). The recompute then never matched, the call
+  was `report_conflict`, and every later boundary was
+  `state_digest_mismatch`. The rule is now, in order:
+  1. the file is parsed strictly (duplicate keys: `duplicate_key`);
+  2. it must verify: `verify_report(report, signer)` with the settling
+     validator's key (`signer`'s ss58, the key `pinned_report_signer` names
+     in production). A foreign signer, a bad signature, an edit after
+     signing or a schema defect is `LaneDStateError("report_unverified")`;
+  3. `report["boundary"]` must equal the boundary being settled, else
+     `report_conflict`;
+  4. the prior state digest bound in the report's **signed body** must equal
+     `state_digest` of the state as loaded (before `refresh_house`), else
+     `report_conflict`. So every armed report carries its
+     `prior_state_sha256` under the signature. Where it sits isn't pinned:
+     W7a freezes the top-level keys, so `extensions` is the open place. The
+     tests find it as a string value anywhere in the body.
+
+  On success the posterior state is derived from the persisted report and
+  saved. The report's gate outcomes are taken as recorded (a `pass` crowns,
+  a `bench_hold` holds), and **no bench call is made**. The file is kept
+  byte-for-byte (its signature too, even a re-signed one), and the persisted
+  report is returned. The state bytes and the receipt are the ones a clean
+  run that produced that report gives, and the next boundary settles
+  normally from them. Every refusal makes no bench call and writes nothing:
+  the state and the refused file stay byte-identical, so the report is never
+  silently overwritten. Recovery may re-read forecasts to re-derive the
+  duel; that isn't pinned.
 - **Re-call (state boundary == boundary):** the boundary is already settled.
   The persisted report is returned with the same `pay` and `receipt`, and
   nothing is re-scored or re-gated: no forecast is read and no bench call is
@@ -219,8 +247,14 @@ implementer's choice and isn't pinned.
 - How a lane A `RoundReceipt` embeds the lane D receipt record. That wiring
   belongs to emission (W8) and the absent state (W14). W7c pins the record
   and its verifiers.
-- The signature check of a report. That's W7b's `verify_report` with
-  `pinned_report_signer`, and `verify_receipt` doesn't call it.
+- The signature check of a report in `verify_receipt`. That's W7b's
+  `verify_report` with `pinned_report_signer`, and `verify_receipt` doesn't
+  call it. (Recovery does call it, see "Recovery". Whether the re-call at a
+  settled boundary does too is RV7 note 11 and isn't pinned: an edited body
+  there may be `report_conflict` or `report_unverified`.)
+- An operator path to retire a persisted report whose receipt was never
+  returned (RV7 B1 "Fix", second bullet). Adoption makes it unnecessary for
+  a verifying report, and W7c doesn't pin one.
 - What a re-call does when the persisted report file is deleted, and what
   `verify_receipt_chain([])` does.
 - Whether `restore_state` refuses to overwrite an existing live state file,
@@ -250,6 +284,23 @@ implementer's choice and isn't pinned.
 | `test_w7c_lost_state.py` (`expect_prior_sha256`) | assert: `settle_lane_d` refuses the keyword (`TypeError`) |
 | `test_w7c_lost_state.py` (restore) | `ImportError`: no `restore_state` |
 | both `test_error_codes_are_exported` / `test_rv6_b3_error_codes_include_the_lost_state_codes` | assert: `STATE_ERROR_CODES` lacks `state_missing`, `state_unreadable` |
+
+### RV7 B1 tests-correction (failing on main at `4ae3f41`)
+
+These 15 tests fail on main, each for the RV7 reason. The other 78 pass.
+
+| test | failure on main |
+|---|---|
+| `test_w7c_gated_recovery.py::test_rv7_b1_recovery_adopts_the_persisted_crowning_report[new_session, pod_down, different_rows, regressed_rows]` | main re-runs the gate in the new session, its recomputed body differs, and recovery is `report_conflict` (the wedge) |
+| `test_w7c_gated_recovery.py::test_rv7_b1_recovery_adopts_a_persisted_bench_hold` | same: a pod that now passes re-gates and crowns, so `report_conflict` |
+| `test_w7c_gated_recovery.py::test_rv7_b1_recovery_in_a_new_process` | same, in a child process |
+| `test_w7c_gated_recovery.py::test_rv7_b1_every_report_binds_its_prior_state_digest_under_the_signature` | the report body carries no prior state digest |
+| `test_w7c_gated_recovery.py::test_rv7_b1_an_unverified_persisted_report_is_refused[foreign_signer, bad_signature, edited_after_signing]` | `report_conflict`, not `report_unverified`: main never verifies the signature |
+| `...[wrong_boundary]` | right code, but the bench is swept before the refusal |
+| `...[wrong_prior]` | there is no prior digest in the body to doctor |
+| `test_w7c_restart.py::test_inv5_t11_crash_after_the_report_lands_recovers_to_the_clean_run[crowning]` | changed: recovery must not sweep the bench (main re-sweeps; this run reuses the session id, so the bodies still matched) |
+| `test_w7c_restart.py::test_inv5_a_defective_persisted_report_is_refused[body-report_conflict-pending]` | changed: an edit after signing on recovery is now `report_unverified` |
+| `test_w7c_state.py::test_error_codes_are_exported` | `STATE_ERROR_CODES` lacks `report_unverified` |
 
 `test_a_crash_at_the_rename_leaves_the_previous_state_intact` passes on main,
 and so do the lost-state tests that pin what must keep working (genesis with
