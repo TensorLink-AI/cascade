@@ -189,15 +189,37 @@ def is_low_information(window: Sequence[float]) -> bool:
         return True
     if max(counts.values()) * MODE_SHARE[1] >= MODE_SHARE[0] * n:
         return True
-    mean = math.fsum(window) / n
-    dev = [x - mean for x in window]
-    ss_tot = math.fsum(d * d for d in dev)
-    std = math.sqrt(ss_tot / n)
-    if not std > STD_REL_FLOOR * abs(mean):
-        return True
-    t, tt = _index_terms(n)
-    slope = math.fsum(ti * d for ti, d in zip(t, dev, strict=True)) / tt
-    ss_res = math.fsum((d - slope * ti) ** 2 for ti, d in zip(t, dev, strict=True))
+    verdict = _spread_rules(window)
+    if verdict is None:
+        # Values near the float64 limit (e.g. random bytes read as f64)
+        # overflow the sums of squares. Rules (c) and (d) are invariant under
+        # scaling, so judge the window scaled by an exact power of two into
+        # [-1, 1]; ordinary windows never take this path.
+        _, e = math.frexp(max(abs(x) for x in window))
+        verdict = _spread_rules([math.ldexp(x, -e) for x in window])
+    return True if verdict is None else verdict
+
+
+def _spread_rules(window: Sequence[float]) -> bool | None:
+    """Rules (c) and (d) of :func:`is_low_information`; ``None`` when an
+    intermediate overflows (the caller rescales)."""
+    n = len(window)
+    try:
+        mean = math.fsum(window) / n
+        dev = [x - mean for x in window]
+        ss_tot = math.fsum(d * d for d in dev)
+        if not math.isfinite(ss_tot):
+            return None
+        std = math.sqrt(ss_tot / n)
+        if not std > STD_REL_FLOOR * abs(mean):
+            return True
+        t, tt = _index_terms(n)
+        slope = math.fsum(ti * d for ti, d in zip(t, dev, strict=True)) / tt
+        ss_res = math.fsum((d - slope * ti) ** 2 for ti, d in zip(t, dev, strict=True))
+    except OverflowError:
+        return None
+    if not math.isfinite(ss_res):
+        return None
     return ss_res <= AFFINE_RESIDUAL * ss_tot
 
 
@@ -218,9 +240,12 @@ def _zscores(window: Sequence[float]) -> list[float] | None:
     if max(window) == min(window):
         return None
     n = len(window)
-    mean = math.fsum(window) / n
-    dev = [x - mean for x in window]
-    std = math.sqrt(math.fsum(d * d for d in dev) / n)
+    try:
+        mean = math.fsum(window) / n
+        dev = [x - mean for x in window]
+        std = math.sqrt(math.fsum(d * d for d in dev) / n)
+    except OverflowError:
+        return None
     if not std > 0.0 or not math.isfinite(std):
         return None
     out = []
