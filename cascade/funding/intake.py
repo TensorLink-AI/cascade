@@ -129,6 +129,16 @@ transfers):
           missing_lium_api_key / stale_timestamp / bad_signature |
           403 not_revealed / not_registered | 409 replayed_timestamp |
           503 lane_b_disabled
+      WB13 / LB1, only while ``[lane_b] contamination_hashset`` is pinned
+      (unpinned: none of this, the reply is unchanged): after the identity
+      gate the committed tree is fetched and statically scanned (never run)
+      against the pinned hash set; the 202/200 reply and the queue entry
+      carry ``"contamination": {hashset_version, result, suite, window_id}``.
+    → 400 benchmark_series_embedded (+ "contamination") |
+      413 repo_too_large (D38: a ``suite:*`` tree over
+          ``[lane_b] suite_target_max_repo_mb``) |
+      503 contamination_hashset_unavailable / repo_unavailable /
+          contamination_scan_failed (fail closed; nothing queued or vaulted)
       Queues into the LANE-B queue (``lane_b_queue.json`` beside the
       challenger queue); the key lands in the shared payer vault. No lane-A
       lifetime submission is consumed; infra faults requeue without burning,
@@ -167,6 +177,7 @@ import threading
 import time
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 from .gpu_choice import GpuCatalog, GpuChoice, parse_gpu_headers, wall_warning
 from .queue import LIVE_LEG_PHASES, FundedQueue
@@ -182,6 +193,10 @@ __all__ = [
 ]
 
 log = logging.getLogger("cascade.funding.intake")
+
+# FundingIntake's default for the WB13 keywords: "not wired" (distinct from
+# an explicit None, which a wired, pinned intake answers 503).
+_UNWIRED = object()
 
 # Replay bound on the signed timestamp. Funding is idempotent, so the only
 # replay of consequence is re-queueing after a withdraw — a five-minute
@@ -422,6 +437,8 @@ class FundingIntake:
         lane_b_targets: tuple[str, ...] | None = None,
         lane_b_max_targets: int | None = None,
         lane_b_cfg: object | None = None,         # loaded [lane_b] (LaneBConfig)
+        lane_b_hashset: object = _UNWIRED,        # WB13: the pinned WB11 hash set
+        fetch_lane_b_repo: object = _UNWIRED,     # WB13: ref -> submitted tree
         lane_a_admission: Callable[[int | None], tuple[int, dict] | None] | None = None,
         pod_live: Callable[[str], bool] | None = None,
         on_withdrawn: Callable[[str], None] | None = None,
@@ -453,6 +470,28 @@ class FundingIntake:
         # / ``max_experts_frac`` clamp a declared-rows header. None (dev, no
         # chain config) = the config's shipped defaults.
         self.lane_b_cfg = lane_b_cfg
+        # WB13 / LB1: while ``[lane_b] contamination_hashset`` is pinned every
+        # lane B fund is scanned (never executed) against ``lane_b_hashset``,
+        # the artefact that pin names, on the tree ``fetch_lane_b_repo(ref)``
+        # materialises (a path or None; it may raise). Unpinned, neither is
+        # used. The artefact's digest is computed once, here. An intake built
+        # with NEITHER keyword (embedders that predate WB13) does not run the
+        # check; one given either runs it and fails closed on a missing
+        # artefact or fetch (None). The production intake (main.py) always
+        # passes both.
+        self._lane_b_check_wired = not (lane_b_hashset is _UNWIRED
+                                        and fetch_lane_b_repo is _UNWIRED)
+        self.lane_b_hashset = None if lane_b_hashset is _UNWIRED else lane_b_hashset
+        self.fetch_lane_b_repo = None if fetch_lane_b_repo is _UNWIRED else fetch_lane_b_repo
+        self._lane_b_hashset_sha: str | None = None
+        if not self._lane_b_check_wired and self._lane_b_pin():
+            log.warning("lane-B intake built without lane_b_hashset / fetch_lane_b_repo: "
+                        "the contamination check is NOT run although [lane_b] "
+                        "contamination_hashset is pinned")
+        if self.lane_b_hashset is not None:
+            from ..eval.contamination import artefact_sha256
+
+            self._lane_b_hashset_sha = artefact_sha256(self.lane_b_hashset)
         # DEC-CA-0060: the SKUs a fund request may choose (``[round]
         # funded_pod_skus``) and the walls behind the fund-time warning. None
         # = no chain config (dev): any well-formed SKU, no warning.
@@ -1215,19 +1254,88 @@ class FundingIntake:
                                     "this hotkey declares these targets and X-Commit-Ref — "
                                     "commit with `cascade deploy --expert-domain`, wait for "
                                     "the reveal, then fund"}
+        receipt_kw: dict = {}
+        if self._lane_b_check_wired and self._lane_b_pin():
+            status, checked = self._lane_b_contamination(ref, targets)
+            if status is not None:
+                return status, checked
+            receipt_kw = {"contamination": checked}
         outcome = self.lane_b_queue.add_lane_b(  # type: ignore[union-attr]
             hotkey, targets, ref, int(reveal_block), label=label, gpu_choice=choice,
-            declared_rows=ctx["declared_rows"])
+            declared_rows=ctx["declared_rows"], **receipt_kw)
         self.vault.insert(hotkey, api_key)
         rows = ctx["declared_rows"]
         log.info("lane-B fund %s: %s targets=%s (reveal_block=%d%s%s)", hotkey, outcome,
                  ",".join(targets), reveal_block, f", gpu={choice.gpu}" if choice.chosen else "",
                  "" if rows is None else ", declared rows "
                  + ",".join(f"{k}:{len(v)}" for k, v in rows.items()))
-        body = {"status": outcome, "lane": "b", "targets": list(targets)}
+        body = {"status": outcome, "lane": "b", "targets": list(targets), **receipt_kw}
         if outcome == "already-queued":
             return 200, self._gpu_reply(body, choice)
         return 202, self._gpu_reply(body, choice)
+
+    def _lane_b_pin(self) -> str:
+        """The ``[lane_b] contamination_hashset`` pin ("" = unpinned: the
+        check is off and the fund is today's, byte for byte)."""
+        cfg = self.lane_b_cfg
+        return str(getattr(cfg, "contamination_hashset", "") or "") if cfg is not None else ""
+
+    def _lane_b_contamination(self, ref: str, targets) -> tuple[int, dict] | tuple[None, dict]:
+        """WB13 / LB1: the intake contamination check of a pinned lane B fund,
+        after the identity gate and before anything is queued or vaulted.
+        ``(None, receipt)`` when the submitted tree is clean; a typed refusal
+        otherwise. Fails closed (503) while the pinned artefact or the tree
+        is unavailable; D38 caps a ``suite:*`` entry's tree at
+        ``suite_target_max_repo_mb``."""
+        from ..interface.contamination_scan import RESULT_EMBEDDED, scan_repo
+        from ..interface.validation import check_repo_size
+
+        cfg = self.lane_b_cfg
+        pin = self._lane_b_pin()
+        if self.lane_b_hashset is None or self._lane_b_hashset_sha != pin:
+            log.error("lane-B fund refused: contamination hash set %s is not loaded "
+                      "(loaded: %s)", pin, self._lane_b_hashset_sha or "none")
+            return 503, {"code": "contamination_hashset_unavailable",
+                         "message": "the pinned contamination hash set is not loaded on this "
+                                    "intake; lane-B funding is closed until it is — retry later"}
+        fetch = self.fetch_lane_b_repo
+        tree = None
+        if fetch is not None:
+            try:
+                tree = fetch(ref)
+            except Exception:  # noqa: BLE001 — any fetch failure fails closed
+                log.exception("lane-B fund: fetch of %s for the contamination check failed", ref)
+                tree = None
+        if tree is None or not Path(tree).is_dir():
+            return 503, {"code": "repo_unavailable",
+                         "message": "the submitted generator could not be fetched for the "
+                                    "intake contamination check — retry later"}
+        tree = Path(tree)
+        if any(str(t).startswith("suite:") for t in targets):
+            cap_mb = int(cfg.suite_target_max_repo_mb)
+            size = check_repo_size(tree, cap_mb)
+            if not size.ok:
+                return 413, {"code": size.reason or "repo_too_large",
+                             "message": f"a suite-target generator must be at most {cap_mb} MiB "
+                                        "([lane_b] suite_target_max_repo_mb)",
+                             **(size.details or {})}
+        try:
+            receipt = scan_repo(tree, self.lane_b_hashset,
+                                min_hits=cfg.contamination_min_hits)
+        except Exception:  # noqa: BLE001 — an unscannable tree fails closed
+            log.exception("lane-B fund: contamination scan of %s failed", ref)
+            return 503, {"code": "contamination_scan_failed",
+                         "message": "the intake contamination check could not complete — "
+                                    "retry later"}
+        if receipt["result"] == RESULT_EMBEDDED:
+            log.warning("lane-B fund refused: %s embeds benchmark window %s (%s)", ref,
+                        receipt["window_id"], receipt["suite"])
+            return 400, {"code": "benchmark_series_embedded",
+                         "message": f"the generator embeds a {receipt['suite']} benchmark test "
+                                    f"window ({receipt['window_id']}); submissions may not ship "
+                                    "public benchmark series",
+                         "contamination": receipt}
+        return None, receipt
 
     def lane_b_withdraw(self, headers) -> tuple[int, dict]:
         """Withdraw a still-queued lane-B entry (``POST /v1/lane-b/withdraw``).
