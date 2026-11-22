@@ -307,6 +307,13 @@ class FundedEntry:
     # ``queued_declared_rows``. Written to the queue file only when set.
     declared_rows: dict | None = field(default=None, hash=False)
     queued_declared_rows: dict | None = field(default=None, hash=False)
+    # WB13 / LB1 lane B intake contamination receipt ``{hashset_version,
+    # result, suite, window_id}`` of the fund that queued this ref (set only
+    # while ``[lane_b] contamination_hashset`` is pinned; None = unchecked).
+    # Follows ``declared_rows``: a re-commit parked behind a flight carries
+    # its receipt as ``queued_contamination``. Written only when set.
+    contamination: dict | None = field(default=None, hash=False)
+    queued_contamination: dict | None = field(default=None, hash=False)
     # Keys a NEWER writer stored on this entry that this code does not know:
     # carried verbatim through every load/save, never interpreted, never
     # compared (money safety II: an old writer must not drop new fields).
@@ -370,6 +377,14 @@ _GPU_FIELD_DEFAULTS = {"gpu": "", "gpu_allow_fallback": False, "gpu_max_price_pe
 # WB14 declared rows, likewise written only when set (lane A entries and
 # undeclared lane B entries serialise exactly as before).
 _ROWS_FIELD_DEFAULTS = {"declared_rows": None, "queued_declared_rows": None}
+# WB13 contamination receipts, likewise written only when set (an unpinned
+# intake's entries serialise exactly as before).
+_CONTAMINATION_FIELD_DEFAULTS = {"contamination": None, "queued_contamination": None}
+
+
+def _receipt_copy(value) -> dict | None:
+    """A contamination receipt as stored (a plain dict copy), or None."""
+    return None if value is None else dict(value)
 
 
 def _rows_from_json(value) -> dict[int, list[int]] | None:
@@ -534,6 +549,8 @@ class FundedQueue:
                     item, "operator_fault_cause", "")) or ""),
                 declared_rows=_rows_from_json(item.get("declared_rows")),
                 queued_declared_rows=_rows_from_json(item.get("queued_declared_rows")),
+                contamination=_receipt_copy(item.get("contamination")),
+                queued_contamination=_receipt_copy(item.get("queued_contamination")),
                 extra=extra,
             )
             entries[entry.hotkey] = entry
@@ -568,7 +585,8 @@ class FundedQueue:
         def _row(e: FundedEntry) -> dict:
             row = asdict(e)
             extra = row.pop("extra", None) or {}
-            for k, default in (*_GPU_FIELD_DEFAULTS.items(), *_ROWS_FIELD_DEFAULTS.items()):
+            for k, default in (*_GPU_FIELD_DEFAULTS.items(), *_ROWS_FIELD_DEFAULTS.items(),
+                               *_CONTAMINATION_FIELD_DEFAULTS.items()):
                 if row.get(k) == default:
                     row.pop(k, None)
             for k, v in extra.items():
@@ -599,7 +617,7 @@ class FundedQueue:
 
     def add(self, hotkey: str, ref: str, reveal_block: int, *,
             label: str = "", gpu_choice=None, max_total_spend_usd=_KEEP,
-            declared_rows=_KEEP) -> str:
+            declared_rows=_KEEP, contamination=_KEEP) -> str:
         """Fund (or re-fund) a submission; returns the outcome for the caller.
 
         ``declared_rows`` (WB14, lane B; parsed rows or None = none declared)
@@ -607,6 +625,10 @@ class FundedQueue:
         in-flight leg: a same-ref re-fund keeps the running leg's rows, a
         re-commit parked behind the flight carries them as
         ``queued_declared_rows``. ``_KEEP`` (lane A, lane C) leaves them.
+
+        ``contamination`` (WB13, lane B; the intake's receipt) follows the
+        same rule (``queued_contamination`` behind a flight); ``_KEEP`` (an
+        unpinned intake, lanes A and C) leaves it.
 
         ``label`` (already normalised) names the entry for dashboards; an
         empty label on a re-fund keeps the one already stored, a non-empty
@@ -630,6 +652,9 @@ class FundedQueue:
                                     if max_total_spend_usd is not None else None)})
         keep_rows = declared_rows is _KEEP
         rows = {} if keep_rows else {"declared_rows": _rows_copy(declared_rows)}
+        keep_receipt = contamination is _KEEP
+        if not keep_receipt:
+            rows["contamination"] = _receipt_copy(contamination)
         with self._locked() as entries:
             now = self.clock()
             prev = entries.get(hotkey)
@@ -641,6 +666,7 @@ class FundedQueue:
                     entries[hotkey] = replace(prev, last_active=now, queued_ref="",
                                               queued_reveal_block=0,
                                               queued_declared_rows=None,
+                                              queued_contamination=None,
                                               label=label or prev.label,
                                               **_gpu_fields(gpu_choice), **budget)
                     self._save(entries)
@@ -650,6 +676,9 @@ class FundedQueue:
                                           queued_declared_rows=(
                                               prev.queued_declared_rows if keep_rows
                                               else _rows_copy(declared_rows)),
+                                          queued_contamination=(
+                                              prev.queued_contamination if keep_receipt
+                                              else _receipt_copy(contamination)),
                                           last_active=now, label=label or prev.label,
                                           **_gpu_fields(gpu_choice), **budget)
                 self._save(entries)
@@ -947,7 +976,8 @@ class FundedQueue:
             gpu_allow_fallback=e.gpu_allow_fallback,
             gpu_max_price_per_hour=e.gpu_max_price_per_hour,
             max_total_spend_usd=e.max_total_spend_usd,
-            declared_rows=_rows_copy(e.queued_declared_rows))
+            declared_rows=_rows_copy(e.queued_declared_rows),
+            contamination=_receipt_copy(e.queued_contamination))
 
     def expire_stale(self, max_age_seconds: float | None = None) -> int:
         """Terminally expire idle queued entries past the payer-key TTL.
@@ -1408,11 +1438,14 @@ class LaneBQueue(FundedQueue):
     module note above)."""
 
     def add_lane_b(self, hotkey: str, targets, ref: str, reveal_block: int, *,
-                   label: str = "", gpu_choice=None, declared_rows=_KEEP) -> str:
+                   label: str = "", gpu_choice=None, declared_rows=_KEEP,
+                   contamination=_KEEP) -> str:
         """``declared_rows``: the parsed WB14 rows of this fund (None = none
-        declared, ESFT picks); see :meth:`FundedQueue.add`."""
+        declared, ESFT picks); ``contamination``: the WB13 intake receipt
+        (``_KEEP`` = unpinned, nothing recorded); see :meth:`FundedQueue.add`."""
         return self.add(hotkey, lane_b_entry_ref(targets, ref), int(reveal_block), label=label,
-                        gpu_choice=gpu_choice, declared_rows=declared_rows)
+                        gpu_choice=gpu_choice, declared_rows=declared_rows,
+                        contamination=contamination)
 
     def queued(self, *, now: float | None = None) -> list[FundedEntry]:
         """Startable entries, earliest reveal first: ``queued`` and not
