@@ -185,13 +185,23 @@ _MULTI_RE = r"^metro-v1:expert:(?P<tg>[a-z0-9_\-+]{1,32}):hippius:(?P<ref>.+)$"
 
 
 def target_code(target: str) -> str:
-    """A target's full commitment code: ``h<h>`` for ``horizon:<h>``, else
-    the domain name."""
-    from .config.v2 import HORIZON_TARGET_PREFIX
+    """A target's full commitment code: ``h<h>`` for ``horizon:<h>``,
+    ``s-<suite>`` for ``suite:<suite>`` (DEC-CA-0071 §1), else the domain
+    name."""
+    from .config.v2 import HORIZON_TARGET_PREFIX, SUITE_CODE_PREFIX, SUITE_TARGET_PREFIX
 
     if target.startswith(HORIZON_TARGET_PREFIX):
         return "h" + target[len(HORIZON_TARGET_PREFIX):]
+    if target.startswith(SUITE_TARGET_PREFIX):
+        return SUITE_CODE_PREFIX + target[len(SUITE_TARGET_PREFIX):]
     return target
+
+
+def _is_domain(target: str) -> bool:
+    """A configured domain (neither a horizon nor a suite target)."""
+    from .config.v2 import HORIZON_TARGET_PREFIX, SUITE_TARGET_PREFIX
+
+    return not target.startswith((HORIZON_TARGET_PREFIX, SUITE_TARGET_PREFIX))
 
 
 def leg_label(targets) -> str:
@@ -203,12 +213,16 @@ def leg_label(targets) -> str:
 def _resolve_code(code: str, targets: tuple[str, ...]) -> str | None:
     import re
 
-    from .config.v2 import HORIZON_TARGET_PREFIX
+    from .config.v2 import HORIZON_TARGET_PREFIX, SUITE_CODE_PREFIX, SUITE_TARGET_PREFIX
 
     if re.fullmatch(r"h[0-9]+", code):
         t = f"{HORIZON_TARGET_PREFIX}{int(code[1:])}"
         return t if t in targets and code == target_code(t) else None
-    domains = [t for t in targets if not t.startswith(HORIZON_TARGET_PREFIX)]
+    if code.startswith(SUITE_CODE_PREFIX):
+        t = SUITE_TARGET_PREFIX + code[len(SUITE_CODE_PREFIX):]
+        if t in targets:
+            return t
+    domains = [t for t in targets if _is_domain(t)]
     if code in domains:
         return code
     if len(code) < MIN_PREFIX:
@@ -244,7 +258,7 @@ def parse_expert_targets(payload: str, targets, *, max_targets: int | None = Non
 def _short_code(target: str, domains: list[str]) -> str:
     code = target_code(target)
     if target not in domains:
-        return code                               # horizon codes are already short
+        return code                               # horizon / suite codes are already short
     for n in range(MIN_PREFIX, len(code) + 1):
         if sum(1 for d in domains if d.startswith(code[:n])) == 1:
             return code[:n]
@@ -257,8 +271,6 @@ def format_expert_targets(declared, ref: str, targets, *, max_targets: int | Non
     One target ⇒ :func:`format_expert_commit` byte for byte. Several ⇒ full
     codes when they fit :data:`TARGET_FIELD_MAX`, else shortest unique
     prefixes; refuses anything that does not round-trip."""
-    from .config.v2 import HORIZON_TARGET_PREFIX
-
     all_t = tuple(targets)
     want = [str(t).strip() for t in declared]
     unknown = [t for t in want if t not in all_t]
@@ -272,7 +284,7 @@ def format_expert_targets(declared, ref: str, targets, *, max_targets: int | Non
     else:
         field_ = TARGET_SEP.join(target_code(t) for t in order)
         if len(field_) > TARGET_FIELD_MAX:
-            domains = [t for t in all_t if not t.startswith(HORIZON_TARGET_PREFIX)]
+            domains = [t for t in all_t if _is_domain(t)]
             field_ = TARGET_SEP.join(_short_code(t, domains) for t in order)
         payload = f"metro-v1:expert:{field_}:hippius:{ref.strip()}"
     got = parse_expert_targets(payload, all_t, max_targets=max_targets)
