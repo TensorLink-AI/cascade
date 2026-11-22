@@ -1,0 +1,10 @@
+# W5g bounded bench holds, checkpoint_fault and exact typed reasons
+# (plan rev6 W5g row, §1.3b Faults, §1.5 State, §3.2 invariant 11, §10.4;
+# README.md has the contract).
+# settle_lane_d: the max_bench_holds count and the re-queue on exhaustion.
+cascade/validator/lane_d.py
+# the state record of the hold count, if the state module validates it.
+cascade/validator/lane_d_state.py
+# report enums and the schema file, only if a reason or record must change.
+cascade/validator/lane_d_report.py
+cascade/validator/schemas/lane_d_report_1.json

@@ -38,10 +38,18 @@ validator. Unarmed (``not cfg.active(boundary)``) it returns
    copy of the house never clears); the house's rows sit next to the king's.
    A first clear goes ``confirm_pending`` and must clear again on a
    disjoint set (D20 ``confirm_on_king_change``) before it is crowned;
-   each verdict reports the §1.3b A10 low-frequency slice (report-only here:
-   W3b5 computes ``pass``/``fail`` and its ``lowfreq_regression`` effect);
+5a. runs the §1.3b A10 low-frequency non-inferiority check (W3b5,
+   :mod:`~cascade.validator.lane_d_lowfreq`) on EVERY verdict that cleared at
+   stage ``confirm``, whatever the gate draw: the slice is the newest
+   snapshot's windows whose ``freq`` is in ``lowfreq_freqs`` (the private
+   pool, not the forward-only set, §1.7), and the candidate's paired CRPS and
+   MASE ``LCB_α`` against the verdict's KING_D and the house must each be
+   ``≥ −tau_public``. ``fail`` is a judged, final loss
+   (``lost``/``lowfreq_regression``, never gated, never crowned);
+   ``no_windows`` (an empty slice) never blocks. The verdict's ``lowfreq``
+   block carries the four LCBs for ``pass``/``fail``;
 5b. gates the crowning candidates (W5e, §1.3b): every verdict that cleared
-   at stage ``confirm``, plus every entry still holding a cleared
+   at stage ``confirm`` and did not fail A10, plus every entry still holding a cleared
    confirmation the gate could not decide (``bench_hold``), is swept with
    KING_D and the house in the settlement's ``bench`` session on the ONE
    suite drawn from ``boundary_block_hash``
@@ -80,9 +88,16 @@ binds it into a receipt record (:mod:`~cascade.validator.lane_d_state`):
   the prior state digest, never the randomized signature;
 - ``receipt`` = ``{schema, boundary, prior_state_sha256,
   posterior_state_sha256, report_sha256}`` (``None`` unarmed);
-- a crash after the report landed is recovered by recomputing: the body must
-  equal the persisted file's (else ``report_conflict``), the file is kept
-  byte-for-byte and the state is written; a re-call at the settled boundary
+- every armed report binds the prior state digest inside its signed body
+  (``extensions.prior_state_sha256``);
+- a crash after the report landed is recovered by ADOPTING the persisted
+  report (RV7 B1), never by re-sweeping the bench: it must verify against the
+  settling validator's key (``report_unverified``), name this boundary and
+  bind the loaded state's digest (``report_conflict``); the settlement is then
+  derived with the report's recorded gate outcomes (a ``pass`` crowns, a
+  ``bench_hold`` holds) and no bench call, its body must equal the persisted
+  one (else ``report_conflict``), the file is kept byte-for-byte and the state
+  is written; every refusal writes nothing; a re-call at the settled boundary
   returns the persisted report, pay and receipt with nothing re-scored,
   re-gated or written; an older boundary is ``stale_boundary``.
 
@@ -106,6 +121,9 @@ from .lane_d_bench import paired_gate
 from .lane_d_forward import eligible_windows
 from .lane_d_frozen import advance_frozen_set
 from .lane_d_gate import gate_record
+from .lane_d_lowfreq import forecast_ok as _forecast_ok
+from .lane_d_lowfreq import lowfreq_check, lowfreq_windows
+from .lane_d_lowfreq import target_usable as _target_usable
 from .lane_d_report import (
     REPORT_SCHEMA,
     SKIP_REASONS,
@@ -114,7 +132,9 @@ from .lane_d_report import (
     validate_report,
 )
 from .lane_d_state import (
+    PRIOR_STATE_EXTENSION,
     LaneDStateError,
+    check_persisted_report,
     load_prior_state,
     load_report_file,
     make_receipt,
@@ -252,13 +272,6 @@ def load_pool(pool_dir, horizon: int) -> dict:
             "windows": windows}
 
 
-def _target_usable(w: dict, horizon: int) -> bool:
-    """The stored target is a finite, non-zero ``(horizon,)`` vector."""
-    t = w["target"]
-    return (t.shape == (horizon,) and bool(np.isfinite(t).all())
-            and float(np.abs(t).sum()) > 0.0)
-
-
 # ── statistic ───────────────────────────────────────────────────────────────
 
 
@@ -290,14 +303,6 @@ def judge_cohort(king: tuple, members: list[tuple], *, clusters: list, cfg, seed
 
 
 # ── settlement ──────────────────────────────────────────────────────────────
-
-
-def _forecast_ok(fc: dict | None, wid: str, horizon: int) -> bool | None:
-    """True = a usable forecast, None = absent, False = malformed (a fault)."""
-    if fc is None or wid not in fc:
-        return None
-    q = np.asarray(fc[wid], dtype=np.float64)
-    return bool(q.shape == (horizon, len(SCORING_LEVELS)) and np.isfinite(q).all())
 
 
 def _register(state: dict, entries: list[dict], cfg, uid_of: dict) -> list[dict]:
@@ -466,8 +471,36 @@ def _run_gate(cands: list[dict], state: dict, cfg, boundary: int,
                               alpha=float(cfg.alpha), tau_public=float(cfg.tau_public),
                               B=int(cfg.bootstrap_B), seed=seed, sentinel=sentinel)
         outcomes[dg] = str(res["outcome"])
-        results.append(_gate_result(res, dg))
+        result = _gate_result(res, dg)
+        if "held_from" in c:
+            # RV7 B2: a held candidate (no verdict here) names its hold.
+            result["held_from"] = dict(c["held_from"])
+        results.append(result)
     return {**record, "results": results}, outcomes
+
+
+def _adopted_gate(cands: list[dict], persisted: dict, where) -> tuple[dict | None, dict[str, str]]:
+    """RV7 B1 recovery: ``(gate record, {digest: outcome})`` as the persisted
+    (verified) report recorded them, with no bench call. A crashed settlement
+    is never re-gated: a restarted validator's bench session differs and its
+    bench may answer differently, so the signed record is the outcome. No
+    candidate: ``(None, {})``. A report without a ``gate`` record held every
+    candidate (the gate could not run). Otherwise the record's results must
+    name exactly this settlement's candidates, else ``report_conflict``."""
+    if not cands:
+        return None, {}
+    gate = persisted.get("gate")
+    if gate is None:
+        return None, {c["digest"]: "bench_hold" for c in cands}
+    results = gate.get("results") if isinstance(gate, dict) else None
+    if not isinstance(results, list) or not all(isinstance(r, dict) for r in results):
+        raise LaneDStateError("report_conflict", f"{where}: the persisted gate record has no "
+                              "results list")
+    outcomes = {str(r.get("digest")): str(r.get("outcome")) for r in results}
+    if len(outcomes) != len(results) or set(outcomes) != {c["digest"] for c in cands}:
+        raise LaneDStateError("report_conflict", f"{where}: the persisted gate results do not "
+                              "name this settlement's crowning candidates")
+    return json.loads(json.dumps(gate)), outcomes
 
 
 def _load_pools(pool_dir, prior_pool_dirs, horizon: int) -> list[dict]:
@@ -648,26 +681,9 @@ def _pool_record(pools: list[dict], windows_out: dict) -> dict:
             "first_seen_roots": roots, "snapshots": snaps}
 
 
-def _lowfreq_candidate(ws: list[dict], cfg) -> dict:
-    """The report's §1.3b A10 ``lowfreq`` block for a crowning candidate (a
-    verdict that cleared at stage ``confirm``): ``n_windows`` counts the
-    frozen set's windows whose frequency is in ``lowfreq_freqs``.
-
-    W7a reports the slice only and never changes a verdict or the crowning.
-    W3b5 owns the non-inferiority test itself (CRPS and MASE
-    ``LCB_α >= -tau_public`` against KING_D and the house) and its
-    ``pass``/``fail`` result (``fail`` = ``lowfreq_regression``, not crowned).
-    Until W3b5 lands, a candidate with no slice window is ``no_windows`` and a
-    candidate with slice windows is ``not_candidate`` (not evaluated) with the
-    true count."""
-    freqs = {str(f) for f in cfg.lowfreq_freqs}
-    n = sum(1 for w in ws if w["freq"] in freqs)
-    return {"result": "no_windows" if n == 0 else "not_candidate",
-            "freqs": [str(f) for f in cfg.lowfreq_freqs], "n_windows": n,
-            "tau_public": float(cfg.tau_public)}
-
-
 def _not_candidate(cfg) -> dict:
+    """The ``lowfreq`` block of a verdict that is not a crowning candidate
+    (a first clear or a loser): never checked by A10."""
     return {"result": "not_candidate", "freqs": [str(f) for f in cfg.lowfreq_freqs],
             "n_windows": 0, "tau_public": float(cfg.tau_public)}
 
@@ -717,10 +733,17 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     if settled >= boundary:
         raise LaneDStateError("stale_boundary", f"lane D already settled through {settled}; "
                               f"got {boundary}")
-    # A report file without its state: a crash between the two writes. It is
-    # parsed strictly now, before any scoring, and must match the recompute.
+    # A report file without its state: a crash between the two writes. RV7
+    # B1: recovery ADOPTS it, never re-sweeps the bench. It is parsed
+    # strictly and checked (the settling validator's signature, the boundary,
+    # the prior state digest bound in its signed body) before anything else
+    # is read; a refusal calls no bench and writes nothing.
     persisted = load_report_file(rp) if rp.exists() else None
     prior_sha = state_digest(state)
+    if persisted is not None:
+        check_persisted_report(persisted,
+                               signer_ss58=str(getattr(signer, "hotkey", signer).ss58_address),
+                               boundary=boundary, prior_state_sha256=prior_sha, where=rp)
     refresh_house(state, house)
     king_before = _king_record(state["king"])
     pools = _load_pools(pool_dir, prior_pool_dirs, int(cfg.horizon))
@@ -775,6 +798,9 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     rows, windows_out, cohorts, verdicts = [], {}, [], []
     # The crowning candidates: verdicts that clear at stage ``confirm``.
     candidates: list[dict] = []
+    # §1.3b A10: the newest private-pool snapshot's low-frequency windows
+    # (not the forward-only frozen set, §1.7), the same for every candidate.
+    lf_slice = lowfreq_windows(pool, cfg)
     for (kd, stage), members in sorted(groups.items()):
         king_ts = _king_reveal_ts(state, kd)
         if king_ts is None and stage == "confirm":
@@ -865,9 +891,12 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
             confirmation = {"stage": stage, "rule": str(cfg.confirm_on_king_change),
                             "first_set_sha256": first["first_set_sha256"] if first else None,
                             "first_king_digest": first["king_digest"] if first else None}
-            # Report-only (W3b5 decides pass/fail): never changes the outcome.
-            lowfreq = (_lowfreq_candidate(ws, cfg) if r["cleared"] and stage == "confirm"
-                       else _not_candidate(cfg))
+            # W3b5 (A10): every crowning candidate is checked on the private
+            # pool's low-frequency slice before the gate; first clears and
+            # losers are not candidates.
+            lowfreq = (lowfreq_check(lf_slice, forecasts, candidate=m, king_d=kd, house=hd,
+                                     cfg=cfg, seed=seed)
+                       if r["cleared"] and stage == "confirm" else _not_candidate(cfg))
             if not r["cleared"]:
                 outcome = "lost"
                 rec.update(status="lost",
@@ -882,8 +911,13 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
                                     "rule": str(cfg.confirm_on_king_change),
                                     "boundary": boundary},
                            frozen_set=None)
+            elif lowfreq["result"] == "fail":
+                # A10 failed: a judged, final loss; never swept by the gate.
+                outcome = "lost"
+                rec.update(status="lost", reason="lowfreq_regression")
             else:
-                # A crowning candidate: crowned only through the §1.3b gate.
+                # A crowning candidate (A10 pass or no_windows): crowned
+                # only through the §1.3b gate.
                 outcome = "confirmed"
                 candidates.append({"digest": m, "lcb": float(r["lcb"]),
                                    "reveal_ts": int(rec["reveal_ts"]), "set_sha256": set_sha})
@@ -897,9 +931,21 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
         hold = state["entries"][dg]["gate_hold"]
         candidates.append({"digest": dg, "lcb": float(hold["lcb"]),
                            "reveal_ts": int(state["entries"][dg]["reveal_ts"]),
-                           "set_sha256": str(hold["set_sha256"]), "held": True})
-    gate, gate_outcomes = _run_gate(candidates, state, cfg, boundary, boundary_block_hash,
-                                    sentinel, bench)
+                           "set_sha256": str(hold["set_sha256"]), "held": True,
+                           # RV7 B2: the signed provenance of the hold (its
+                           # first record; report_sha256 is that settlement's
+                           # report body digest).
+                           "held_from": {"boundary": int(hold["boundary"]),
+                                         "report_sha256": str(hold["report_sha256"]),
+                                         "set_sha256": str(hold["set_sha256"]),
+                                         "lcb": float(hold["lcb"]),
+                                         "king_d": str(hold["king_d"])}})
+    if persisted is None:
+        gate, gate_outcomes = _run_gate(candidates, state, cfg, boundary, boundary_block_hash,
+                                        sentinel, bench)
+    else:
+        # Recovery: the outcomes the persisted, verified report recorded.
+        gate, gate_outcomes = _adopted_gate(candidates, persisted, rp)
     by_verdict = {v["digest"]: v for v in verdicts}
     passing = []
     for c in candidates:
@@ -973,6 +1019,9 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
         "windows": [windows_out[k] for k in sorted(windows_out)],
         "verdicts": verdicts, "rows": rows, "rows_sha256": rows_sha256(rows),
         "pay": {"share": pay["share"], "court": court},
+        # RV7 B1: the state this settlement ran from, under the signature, so
+        # recovery can check a persisted report against the state as loaded.
+        "extensions": {PRIOR_STATE_EXTENSION: prior_sha},
     }
     if gate is not None:
         # Present iff the gate ran (absent, never null, otherwise).
@@ -986,12 +1035,21 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     body_sha = report_digest(report)
     if persisted is None:
         save_report_file(rp, report)
-    elif persisted.get("boundary") != boundary or report_digest(persisted) != body_sha:
+    elif report_digest(persisted) != body_sha:
+        # The posterior derived from the persisted outcomes must be the one
+        # that report records; anything else is refused, never overwritten.
         raise LaneDStateError("report_conflict", f"{rp}: the persisted report's body is not "
-                              f"the recomputed settlement's (sha256 {body_sha})")
+                              f"the settlement derived from its outcomes (sha256 {body_sha})")
     else:
         # Recovery: the persisted report (its signature too) is the record.
         report = persisted
+    # RV7 B2: a hold first taken at this settlement records the report that
+    # holds it (its body digest is known only now), so a later re-gate can
+    # sign its provenance (``gate.results[].held_from``).
+    for rec in state["entries"].values():
+        hold = rec.get("gate_hold")
+        if hold and hold["boundary"] == boundary and "report_sha256" not in hold:
+            hold["report_sha256"] = body_sha
     state["boundary"] = boundary
     state["last_report"] = {"boundary": boundary, "rows_sha256": report["rows_sha256"],
                             "report_sha256": body_sha, "prior_state_sha256": prior_sha}

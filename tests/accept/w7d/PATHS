@@ -1,0 +1,5 @@
+# W7d satellite replay (plan rev6 §3.0 W7d row, §14.3, §3.2 invariants 7
+# and 12; README.md has the contract).
+# The independent replay: cascade/satellite/lane_d_replay.py, in a new
+# package that imports no producer eligibility, verdict or weight code.
+cascade/satellite/
