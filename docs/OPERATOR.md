@@ -3387,6 +3387,34 @@ The trainer runs the same resolver read-only (`netconfig_state.json` in its
 work root). It never signals, and it switches its rolling scheduler and
 promotion engine to the overlay at the same block.
 
+#### `cascade-laned overlay`: lane D bring-up kit (S0c)
+
+`cascade-laned overlay --help` lists four commands. None of them reads a
+wallet, signs, or touches the chain or a store:
+
+- `benign` writes a seq-1 body that restates current `[lane_d]` values of
+  the deployed base. It validates and changes nothing; use it for the fleet's
+  first overlay drill.
+- `refused` writes a seq-1 body that every node must refuse whole: valid
+  restatements plus a release-only burn destination.
+- `kill` writes the lane D kill switch after the body in force (`--previous`):
+  seq N+1, every table restated, `[lane_d] until_block` set to the effective
+  block, so lane D is no longer paid from the first settlement of that era.
+
+Each generator takes the deployed `chain.toml` (`--config`), a live-grid JSON
+(`--grid`) and a head block (`--after`). The effective block is the next era
+start after `--after`, as `cascade-laned blocks next-era-start` computes it,
+and a base whose `[round]` drifted from the grid is refused. Output goes to
+`--out` as `body.json` and `overrides.toml`.
+
+`publish` is the Approve-tier wrapper around step 4. By default it is a dry
+run. It prints the SEQ, PREV, DIGEST, NOTE, DIFF and CHECK lines, the exact
+validator publish command and a CONFIRM token. Show that output to the owner.
+Only after approval, rerun with the same arguments plus `--execute` and
+`--confirm` set to that token. The wrapper then runs the printed command,
+and `cascade-validator` signs with the owner wallet. A refused plan gets no
+command and no token.
+
 ### V2 generator channel policy
 
 The release presets require **exactly 32 channels in every synthetic yield**, including

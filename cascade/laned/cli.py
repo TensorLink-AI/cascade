@@ -16,6 +16,7 @@ import sys
 # command name -> module under cascade.laned
 COMMANDS: dict[str, str] = {
     "blocks": "cascade.laned.blocks",
+    "overlay": "cascade.laned.overlay",
 }
 
 

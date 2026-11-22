@@ -631,6 +631,38 @@ class LaneBConfig:
     # ``/v1/lane-b/fund`` with no operator fallback; "operator" keeps the
     # retired operator lane-pool dispatch (dev / emergency only).
     leg_funding: str = "miner"
+    # Lane B track (LANE_D_PLAN §12b; DEC-CA-0071; parsed by
+    # ``lane_b.parse_lane_b_track``). Shipped at these defaults = unarmed: no
+    # consensus surface reads them, so no digest moves. ``contamination_hashset``
+    # is release-only (``netconfig``); every other key is overlay-settable.
+    # §12b.1 suite targets: off until armed; the contamination hash set (a
+    # ``sha256:`` pin, none until WB11) and the sub-window hit counts that refuse
+    # a suite-target corpus; D38 (a) a stricter repo cap for those entries.
+    suite_targets: bool = False
+    contamination_hashset: str = ""
+    contamination_min_hits: tuple[tuple[str, int], ...] = (("exact", 1), ("normalised", 3))
+    suite_target_max_repo_mb: int = 8
+    # D39 miner-chosen experts: the per-layer clamp is ceil(min_frac E) ..
+    # floor(max_frac E) (8 .. 38 of 256); D40 (a) router rows frozen; §12b.2 the
+    # bound on routing traffic an expert-only leg may pull from other experts.
+    min_experts_frac: float = 0.03125
+    max_experts_frac: float = 0.1484375
+    router_rows: str = "frozen"
+    traffic_steal_bound: float = 0.02
+    # §12b.4 / D41 the opening rule ("cogate" = today's gate, shipped)
+    open_rule: str = "cogate"
+    # §12b.5 / D35 (a): a sentinel-target entry defers, at most this many eras
+    sentinel_target_rule: str = "defer"
+    sentinel_max_defer_eras: int = 4
+    # D42 / §12b.6 leg cost: lane B's own GPU list (the loader defaults it to
+    # the same file's ``[round] funded_pod_skus``; it never changes [round]),
+    # the miner's train_hours cap, and the leg guard
+    # ``train_hours × guard_factor`` + overhead, capped at ``max_leg_seconds``
+    # (``[training] max_train_seconds`` is never edited for it).
+    funded_pod_skus: tuple[str, ...] = ()
+    max_leg_hours: float = 6.0
+    max_leg_seconds: int = 27_000
+    guard_factor: float = 1.25
 
     def active(self, block: int | None) -> bool:
         return self.from_block > 0 and block is not None and int(block) >= self.from_block
@@ -710,7 +742,9 @@ def _merge_guard_block(raw, v2_from_block: int, key="merge_guard_from_block") ->
 def parse_lane_b(lb: dict, *, from_block: int | None = None,
                  era_settlements: int = 0,
                  horizons: tuple[int, ...] | None = None,
-                 v2_from_block: int | None = None) -> LaneBConfig:
+                 v2_from_block: int | None = None,
+                 round_funded_pod_skus: tuple[str, ...] | None = None,
+                 generator_max_repo_mb: int | None = None) -> LaneBConfig:
     """Parse + guard ``[lane_b]`` (absent section ⇒ inert defaults).
 
     ``from_block`` (``load_chain_config``) is the first settlement block,
@@ -721,8 +755,15 @@ def parse_lane_b(lb: dict, *, from_block: int | None = None,
     DEC-CA-0059 horizon targets; ``None`` reads the dict's own ``horizons``
     key (direct construction in tests), absent ⇒ none. ``v2_from_block``
     resolves ``merge_guard_from_block = "v2"``; ``None`` = the launch block the
-    derived ``from_block`` implies (``from_block − 1``; 0 when lane B is off)."""
+    derived ``from_block`` implies (``from_block − 1``; 0 when lane B is off).
+    ``round_funded_pod_skus`` / ``generator_max_repo_mb`` (``load_chain_config``)
+    are the lane B track's ``funded_pod_skus`` default and repo-cap bound
+    (:func:`.lane_b.parse_lane_b_track`)."""
+    from .lane_b import parse_lane_b_track
+
     _refuse_full_rounds(lb, "lane_b")
+    track = parse_lane_b_track(lb, round_funded_pod_skus=round_funded_pod_skus,
+                               generator_max_repo_mb=generator_max_repo_mb)
     ttl = int(lb.get("win_ttl_eras", 28))
     cover = lane_b_replay_cover(ttl, era_settlements)
     if "replay_settlements" in lb:
@@ -781,6 +822,7 @@ def parse_lane_b(lb: dict, *, from_block: int | None = None,
             int(v2_from_block) if v2_from_block is not None else max(0, fb - 1),
             "acceptance_from_block"),
         leg_funding=str(lb.get("leg_funding", "miner")),
+        **track,
     )
     if cfg.leg_funding not in LANE_B_LEG_FUNDING:
         raise ValueError(f"[lane_b] leg_funding must be one of {LANE_B_LEG_FUNDING}; "

@@ -1444,6 +1444,29 @@ acceptance_from_block = "v2"
 # miner's key via /v1/lane-b/fund (no operator fallback); "operator" = the
 # retired operator lane pool (dev / emergency only).
 leg_funding = "miner"
+# Lane B track (LANE_D_PLAN §12b, DEC-CA-0071; WB10). SHIPPED UNARMED: every key
+# at its default, so no digest moves. Arming is one signed overlay after the
+# capability release (D45), never an edit here. contamination_hashset is
+# RELEASE-ONLY (a data pin; overlays refuse it); every other key is overlay-settable.
+suite_targets            = false   # §12b.1: suite targets off
+contamination_hashset    = ""      # sha256:<64 hex> pin; none until WB11 (release-only)
+contamination_min_hits   = { exact = 1, normalised = 3 }   # sub-window hits that refuse a corpus
+suite_target_max_repo_mb = 8       # D38 (a): <= [generator] max_repo_mb
+min_experts_frac         = 0.03125     # D39: 8 / 256 experts per layer
+max_experts_frac         = 0.1484375   # D39: 38 / 256
+router_rows              = "frozen"    # D40 (a)
+traffic_steal_bound      = 0.02        # §12b.2
+open_rule                = "cogate"    # §12b.4: "tokens_king_check" (D41) by overlay after the release
+sentinel_target_rule     = "defer"     # D35 (a)
+sentinel_max_defer_eras  = 4           # §12b.5
+# D42 leg cost: lane B's own GPU list (starts as [round] funded_pod_skus; editing
+# it never opens a GPU to lane A), the miner train_hours cap (0.5 h grid) and the
+# leg guard train_hours x guard_factor + overhead, capped at max_leg_seconds
+# ([training] max_train_seconds is never edited for it).
+funded_pod_skus          = ["8xH200", "8xH100", "4xH200", "4xH100"]
+max_leg_hours            = 6.0
+max_leg_seconds          = 27000       # 6 h x 1.25
+guard_factor             = 1.25
 
 
 [lane_c]

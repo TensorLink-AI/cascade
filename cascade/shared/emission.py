@@ -330,7 +330,8 @@ def emission_policy(cfg: Any, *, boundary: int, king_since_block: int | None,
 def lane_parts(court_uids: Sequence[int], n_uids: int, *, king_decay: float, burn_uid: int,
                lane_b_cfg: Any = None, wins: Iterable[Any] = (),
                lane_c_cfg: Any = None, c_wins: Iterable[Any] = (),
-               c_slot_frac: dict[str, float] | None = None
+               c_slot_frac: dict[str, float] | None = None,
+               lane_d_cfg: Any = None, d_court_uids: Sequence[int | None] = ()
                ) -> tuple[list[float], list[float]]:
     """``(lane_a, lane_b)`` — the lanes of the vector KEPT APART (their sum
     is :func:`cascade.shared.lane_b.combined_weights`'s vector). ``lane_a`` is
@@ -352,7 +353,15 @@ def lane_parts(court_uids: Sequence[int], n_uids: int, *, king_decay: float, bur
     slot only once MarketCast is live).
 
     Lane C taken from A can launch before B. Legacy C taken from B requires B.
-    The shared allocation helper also drives receipt/audit share records."""
+    The shared allocation helper also drives receipt/audit share records.
+
+    ``lane_d_cfg`` (LANE_D_PLAN D1/D48, passed only when lane D PAYS at the
+    settlement — its ``pay`` record exists): lane D's ``share`` is carved
+    from its ``takes_from`` lane (lane A's pool on mainnet, so lane A's court
+    and its relative split are unchanged and only its pool shrinks), and its
+    court part (:func:`lane_d_vector` over ``d_court_uids``, king first,
+    ``None`` = the house's slot, which burns) is ADDED to the second element.
+    ``None`` = exactly the result without lane D (invariant 1)."""
     from .chain import decayed_share_vector
     from .lane_c import lane_pool_shares
 
@@ -360,6 +369,10 @@ def lane_parts(court_uids: Sequence[int], n_uids: int, *, king_decay: float, bur
     b = [0.0] * n_uids
     share_b, share_c = lane_pool_shares(lane_b_cfg, lane_c_cfg)
     pool_a = 1.0 - share_b - share_c
+    share_d = 0.0
+    if lane_d_cfg is not None:
+        share_b, share_c, pool_a, share_d = lane_d_allocation(share_b, share_c, pool_a,
+                                                              lane_d_cfg)
     if lane_b_cfg is not None:
         # DEC-CA-0059: one slot per lane-B target (domains + horizon targets)
         slot = share_b / max(1, len(getattr(lane_b_cfg, "targets", None)
@@ -380,7 +393,62 @@ def lane_parts(court_uids: Sequence[int], n_uids: int, *, king_decay: float, bur
         c = lane_c_vector(n_uids, cfg=lane_c_cfg, wins=list(c_wins), burn_uid=burn_uid,
                           share=share_c, slot_frac=c_slot_frac)
         b = [x + y for x, y in zip(b, c, strict=True)]
+    if lane_d_cfg is not None:
+        d = lane_d_vector(n_uids, share=share_d, court_uids=list(d_court_uids),
+                          king_decay=float(lane_d_cfg.king_decay), burn_uid=burn_uid)
+        b = [x + y for x, y in zip(b, d, strict=True)]
     return [pool_a * w for w in court], b
+
+
+def lane_d_allocation(share_b: float, share_c: float, pool_a: float, lane_d_cfg: Any
+                      ) -> tuple[float, float, float, float]:
+    """``(share_b, share_c, pool_a, share_d)`` once lane D's share is carved
+    from its ``takes_from`` lane (D1/D48: ``lane_a`` on mainnet), capped at
+    what that lane holds."""
+    want = max(0.0, float(lane_d_cfg.share))
+    src = str(lane_d_cfg.takes_from)
+    if src == "lane_a":
+        share_d = min(want, max(0.0, pool_a))
+        return share_b, share_c, pool_a - share_d, share_d
+    if src == "lane_b":
+        share_d = min(want, max(0.0, share_b))
+        return share_b - share_d, share_c, pool_a, share_d
+    if src == "lane_c":
+        share_d = min(want, max(0.0, share_c))
+        return share_b, share_c - share_d, pool_a, share_d
+    raise ValueError(f"[lane_d] takes_from {src!r} is not a lane")
+
+
+def lane_d_vector(n_uids: int, *, share: float, court_uids: Sequence[int | None],
+                  king_decay: float, burn_uid: int) -> list[float]:
+    """Lane D's part of the vector; sums to ``share``. ``court_uids`` is the
+    court king first, then prior miner kings by recency; slot ``i`` is worth
+    ``king_decay**i`` (normalised over the slots). A ``None`` slot (the house
+    holding KING_D, D21, or a deregistered court member), an out-of-range or
+    a repeated uid burns to ``burn_uid``; an empty court burns it all."""
+    if not 0 <= int(burn_uid) < n_uids:
+        raise ValueError(f"burn_uid {burn_uid} out of range [0,{n_uids})")
+    if not 0.0 < float(king_decay) <= 1.0:
+        raise ValueError(f"king_decay must be in (0, 1]; got {king_decay}")
+    s = float(share)
+    out = [0.0] * n_uids
+    if s == 0.0:
+        return out
+    slots = list(court_uids)
+    if not slots:
+        out[burn_uid] = s
+        return out
+    raw = [float(king_decay) ** i for i in range(len(slots))]
+    total = sum(raw)
+    seen: set[int] = set()
+    for uid, w in zip(slots, raw, strict=True):
+        amt = s * w / total
+        if uid is None or not 0 <= int(uid) < n_uids or int(uid) in seen:
+            out[burn_uid] += amt
+        else:
+            seen.add(int(uid))
+            out[int(uid)] += amt
+    return out
 
 
 def emission_vector(lane_a: Sequence[float], lane_b: Sequence[float] | None,

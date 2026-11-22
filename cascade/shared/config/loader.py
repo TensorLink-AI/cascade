@@ -350,7 +350,12 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
                           # DEC-CA-0059 horizon targets = the scored ladder
                           horizons=tuple(int(h) for h in (e.get("scored_horizons", ())
                                                           or ())),
-                          v2_from_block=_v2_from)
+                          v2_from_block=_v2_from,
+                          # D42: lane B's GPU list starts as [round]'s (its own key)
+                          round_funded_pod_skus=validate_funded_pod_skus(
+                              r.get("funded_pod_skus", ())),
+                          # D38: the suite-target cap stays within [generator]'s
+                          generator_max_repo_mb=int(g.get("max_repo_mb", 2048)))
     _mg = int(lane_b.merge_guard_from_block)
     if _mg and _v2_from:
         # a typed merge-guard block is an era boundary at/after the v2 go-live
