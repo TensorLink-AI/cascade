@@ -131,6 +131,13 @@ REFUSED_TABLES: dict[str, str] = {
     "netconfig": "the owner config key is a security root",
     "activation": "the tally that adopts overlays cannot be changed by one",
 }
+# Operator-only: per-deployment knobs no overlay ever carries (each operator
+# sets them on their own box; nothing consensus reads them), with the reason
+# the refusal prints.
+OPERATOR_ONLY_TABLES: dict[str, str] = {
+    "generation": "operator-only generation policy, never an overlay",
+    "lane_d_ops": "operator-only lane D ops table (LANE_D_PLAN §14.2), never an overlay",
+}
 # Block-valued switch keys checked for retroactivity (§4).
 _BLOCK_KEY = re.compile(r"(?:^|_)from_block(?:_v2)?$|activation_block2?$")
 # The DEC-CA-0045 typed blocks: an overlay that SETS one of these makes that
@@ -166,7 +173,7 @@ def overlay_policy() -> dict:
         "wildcard_policy": "Existing parser-supported keys only; loader checks still apply.",
         "lane_c_competitions": "Existing competitions: weight and until_block only.",
         "adoption": "Owner signature, permit-stake lock-in, then an era boundary.",
-        "operator_only": ["generation"],
+        "operator_only": sorted(OPERATOR_ONLY_TABLES),
         "training": "Trainer-declared recipe/budget changes need no fleet update; "
                     "locked training terms and new model code require a release.",
     }
@@ -201,6 +208,9 @@ def check_overrides(overrides: object) -> dict:
     for table, kv in overrides.items():
         if table in REFUSED_TABLES:
             bad.append(f"[{table}] ({REFUSED_TABLES[table]})")
+            continue
+        if table in OPERATOR_ONLY_TABLES:
+            bad.append(f"[{table}] ({OPERATOR_ONLY_TABLES[table]})")
             continue
         if table not in ALLOWED:
             bad.append(f"[{table}] (not on the DEC-CA-0057 allow-list)")
