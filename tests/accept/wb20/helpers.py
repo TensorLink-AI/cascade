@@ -228,14 +228,37 @@ def expiry_codes() -> tuple[str, ...]:
 
 @cache
 def receipt_keys() -> tuple[str, ...]:
-    """WB13: the ``contamination`` receipt field's keys (``scan_repo``'s dict)."""
-    fn = _function(_tree(SCAN_PY), "scan_repo")
+    """WB13: the ``contamination`` receipt field's keys.
+
+    ``scan_repo`` either returns the receipt dict literal directly or returns
+    a call to a same-module helper (``_receipt(...)`` since #643) that builds
+    it; follow such calls one level and read the helper's dict literal."""
+    tree = _tree(SCAN_PY)
+    module_fns = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+
+    def dict_keys(fn: ast.FunctionDef) -> tuple[str, ...]:
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Return) and isinstance(node.value, ast.Dict):
+                keys = tuple(k.value for k in node.value.keys
+                             if isinstance(k, ast.Constant) and isinstance(k.value, str))
+                if keys:
+                    return keys
+        return ()
+
+    fn = _function(tree, "scan_repo")
+    keys = dict_keys(fn)
+    if keys:
+        return keys
     for node in ast.walk(fn):
-        if isinstance(node, ast.Return) and isinstance(node.value, ast.Dict):
-            keys = tuple(k.value for k in node.value.keys if isinstance(k, ast.Constant))
+        if (isinstance(node, ast.Return) and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+                and node.value.func.id in module_fns):
+            keys = dict_keys(module_fns[node.value.func.id])
             if keys:
                 return keys
-    raise AssertionError("code truth: scan_repo receipt keys")
+    raise AssertionError(
+        "code truth: scan_repo receipt keys (no returned dict literal in scan_repo "
+        "nor in a same-module helper it returns a call to)")
 
 
 @cache

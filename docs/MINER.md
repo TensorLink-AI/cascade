@@ -1465,6 +1465,147 @@ in the same batch waits for another warm start. Reward expiry does not undo a
 merge. Mainnet enables this acceptance rule with v2; testnet keeps its older
 rule until separately activated. See the [reward tables](#rewards-allocation-burn-and-progression).
 
+### Lane B track settings
+
+These `[lane_b]` keys control suite targets, declared expert rows, the
+opening rule, the sentinel interaction and leg cost. The checked-in files
+ship them at their defaults, which keeps every new behaviour off: no suite
+targets, no hash set pinned and the existing co-gate. A signed network
+config overlay can change any of them except `contamination_hashset`, which
+only a release can change. Read the effective values with
+`cascade status --json` before you rely on one.
+
+| Key | Default | What it does |
+|---|---|---|
+| `suite_targets` | `false` | Adds one `suite:<suite>` target per bench suite. Arming it requires `contamination_hashset` to be pinned. |
+| `contamination_hashset` | `""` | Pin of the benchmark hash set (`sha256:<64 hex>`). Empty means no pin and no contamination check. |
+| `contamination_min_hits` | `{exact = 1, normalised = 3}` | Sub-window hit counts at which a submitted sequence counts as an embedded benchmark window. |
+| `suite_target_max_repo_mb` | `8` | Size cap in MiB for a generator that declares a `suite:<suite>` target. It is never above `[generator] max_repo_mb`. |
+| `min_experts_frac` | `0.03125` | Lower end of the per-layer clamp for declared rows: `ceil(min_experts_frac × E)`. |
+| `max_experts_frac` | `0.1484375` | Upper end of the per-layer clamp: `floor(max_experts_frac × E)`. |
+| `router_rows` | `"frozen"` | Router rows stay frozen in an expert-only leg. This is the only allowed value. |
+| `traffic_steal_bound` | `0.02` | The most routing traffic an expert-only leg may pull from other experts. |
+| `open_rule` | `"cogate"` | The rule that opens lane B (see below). |
+| `sentinel_target_rule` | `"defer"` | What happens to a suite-target entry whose suite is the era's sentinel. This is the only allowed value. |
+| `sentinel_max_defer_eras` | `4` | The most distinct eras such an entry can be deferred in. |
+| `funded_pod_skus` | the same file's `[round] funded_pod_skus` | Lane B's own GPU list. When the key is absent, it starts as a copy of the lane A list. |
+| `max_leg_hours` | `6.0` | The most training hours a lane B leg may ask for, in 0.5 h steps. |
+| `max_leg_seconds` | `27000` | Hard wall-clock cap on a lane B leg (6 h × 1.25). |
+| `guard_factor` | `1.25` | Leg guard: train hours × this factor plus overhead, capped at `max_leg_seconds`. |
+
+### Lane B suite targets
+
+While `suite_targets = true`, each bench suite becomes a target alongside the
+domains and horizons:
+
+| Bench suite | Target name | Commitment code |
+|---|---|---|
+| GIFT-Eval | `suite:gift` | `s-gift` |
+| BOOM | `suite:boom` | `s-boom` |
+| TIME | `suite:time` | `s-time` |
+| fev | `suite:fev` | `s-fev` |
+
+Use the target name with `cascade lane-b fund --targets` and in the
+`X-Lane-B-Targets` header. The commitment carries the short code, because `:`
+separates commitment fields. While suite targets are on, no domain name may
+start with `s-`. A generator that declares a suite target must not embed any
+window of the public benchmark series. The intake scans the committed tree
+without running it, before anything is queued or charged. See
+[INTERFACE.md](INTERFACE.md#lane-b-submissions-declared-rows-and-the-benchmark-ban)
+for the scan and the size cap.
+
+**The sentinel is never a guard or a target for its era.** When the
+cross-lane sentinel is armed (`[v2] sentinel_from_block`), one suite per era
+is held out as that era's sentinel. That suite is neither a lane B guard nor
+a lane B target for that era. Merge judgement leaves it out of the public
+guards, and a suite-target entry aimed at it is not trained or judged that
+era.
+
+Such an entry is deferred, uncharged, and shown as
+`deferred: sentinel_target` in `status/lane_b.json`, with `suite`,
+`eras_deferred` and `expected_release`. It waits in at most
+`sentinel_max_defer_eras` (default `4`) distinct eras. After that it is
+trained and judged on its target, even if that suite is the sentinel again.
+A new sentinel is drawn from the era-boundary block hash each era, so the
+same suite can come up again.
+
+### Lane B declared expert rows
+
+By default the trainer picks your leg's expert rows (ESFT selection on the
+current king). You can instead declare the rows yourself with the optional
+`X-Lane-B-Declared-Rows` header on `POST /v1/lane-b/fund`. Its value is a
+JSON object keyed by MoE ordinal, and each value is a list of expert
+indices:
+
+```text
+X-Lane-B-Declared-Rows: {"0": [3, 17, 40, 90]}
+X-Lane-B-Declared-Rows: {"7": [1, 2, 3, 4]}    refused: declared_rows_bad_layer (ordinals stop at 6)
+X-Lane-B-Declared-Rows: {"0": [1, 2]}          refused: declared_rows_count (layer 0 needs 4..19 rows)
+```
+
+Each layer that has rows must stay inside the clamp set by
+`min_experts_frac` and `max_experts_frac`. Layers you leave out train no
+declared rows, and at least one row in total is required. When you send the
+header, the hotkey signature also covers the rows. INTERFACE.md gives the
+[ordinals, per-layer limits and signing](INTERFACE.md#lane-b-submissions-declared-rows-and-the-benchmark-ban).
+`cascade lane-b fund` does not send this header. If you omit it, the trainer
+picks the rows.
+
+Declared rows are exclusive, and the earliest reveal holds them. If your
+rows overlap rows held by an open leg, a finished leg awaiting its verdict
+or a pending merge, your entry waits uncharged. It appears as
+`deferred: rows_held` in `status/lane_b.json` with the `holder` entry, the
+`overlap` and the `expected_release` era. It dispatches once those rows are
+free.
+
+### Lane B refusal codes, deferrals and expiry
+
+The intake refuses a fund request before anything is queued, vaulted or
+charged:
+
+| Code | HTTP | Meaning |
+|---|---|---|
+| `declared_rows_malformed` | 400 | The header is not a JSON object, or a layer's value is not a list. |
+| `declared_rows_bad_layer` | 400 | A key is not an MoE ordinal in range, or an ordinal appears twice. |
+| `declared_rows_out_of_range` | 400 | A row is not an expert index of that layer. |
+| `declared_rows_count` | 400 | A layer's row count is outside the clamp, has duplicates, or no rows are declared at all. |
+| `benchmark_series_embedded` | 400 | The tree embeds a public benchmark window. The reply's `contamination` names the `suite` and `window_id`. |
+| `repo_too_large` | 413 | A suite-target tree is over `suite_target_max_repo_mb`. |
+| `contamination_budget_exceeded` | 413 | The tree carries more numeric data than the bounded scan covers. Ship less bulk data. |
+| `contamination_hashset_unavailable` | 503 | The pinned hash set is not loaded on this intake. Retry later. |
+| `repo_unavailable` | 503 | The committed tree could not be fetched for the scan. Retry later. |
+| `contamination_scan_failed` | 503 | The scan could not complete. Retry later. |
+
+The contamination codes and the `contamination` receipt appear only while
+`contamination_hashset` is pinned.
+
+Two deferrals keep a funded entry queued without charging it:
+`deferred: rows_held` (declared rows overlap held rows) and
+`deferred: sentinel_target` (the suite target is this era's sentinel). The
+reason codes are `rows_held` and `sentinel_target`.
+
+An entry that sits idle past the payer-key TTL without entering a leg fails
+with `last_error_class` `funding_expired`. Fund again to re-enter.
+
+### When lane B opens
+
+`open_rule` chooses the gate that opens lane B. The gate latches: once open,
+it never closes again.
+
+| `open_rule` | Opens when |
+|---|---|
+| `cogate` | The lineage has `open_tokens` measured tokens and routing is stable against the previous king (the default). |
+| `tokens` | The lineage has `open_tokens` measured tokens. |
+| `tokens_king_check` | The lineage has `open_tokens` measured tokens and the latest lane A king check in the validators' signed receipt passed. |
+
+While the gate is closed, `status/lane_b.json` shows `open_rule`,
+`gate_rule` (empty until it opens) and `gate_closed_reason`. Possible
+reasons are `tokens_short` (not enough lineage tokens),
+`king_check_not_passed` (the latest king check did not pass) and
+`king_check_unavailable` (no king check could be read). Under `cogate`, the
+reason is `tokens_short` while tokens are short and empty otherwise. Once
+the gate opens, `gate_opened_block` is set and the reason is cleared.
+
 ### As a new v2 king: your starting share (DEC-CA-0055)
 
 The [reward schedule](#rewards-allocation-burn-and-progression) lists the

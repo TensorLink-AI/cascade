@@ -1,10 +1,31 @@
 # Plan: lane D "open weights" (anything goes on our architecture), with lane E and lane A flexibility — v3
 
-Status: **PLAN v3, rev6 (proposed 2026-11-21)**: v2's design, made buildable by an
+Status: **PLAN v3, rev6.1 (proposed 2026-11-21)**: v2's design, made buildable by an
 autonomous loop. A work package is done **only when its Accept command exits
 0**; **(rev6)** its level is only what `scripts/laned/status` computes (§17),
 never a claim. Owner decisions are marked **[DECIDE]**. Nothing is armed. **No calendar
 dates**: stages are gated (§5).
+
+## rev6.1 (RV1 rubric fixes; main @ bdeed4d, 2026-11-21; RV3 fixes, main @ 45f8b61, 2026-11-22)
+
+Plan text only, **no design change** (proposals 23–26 are not applied).
+Every changed item is marked **(rev6.1)**. Sources: RV1 (`evidence/rv1.md`
+on `laned/rv1`), non-blocking notes 1, 2, 10, 12 and the lane A consequence
+of R3's lint (items 1–3); RV3 (`evidence/rv3.md` on main), BLOCKING 1 and
+notes 2, 5, 10, 11, 21 (items 4–10).
+
+| Item | Change | Landed in |
+|---|---|---|
+| 1 | W0 `Runs in` `ci + owner merge` → `ci`. The owner merge is the PR merge every WP has (§3.1 rule 6); as written it made W0 "external", so it needed an `evidence/w0.json` that nothing produces, blocking W0 at L4/L5 and so S2 (RV1 note 1) | §3.0 W0 |
+| 2 | "Build WP" defined for §17.2: the §3.0 WPs whose `Runs in` is ci-only, or ci plus pod/testnet for their CI-checkable parts; owner execution WPs (R2x, R6x, R7t, R7m, R9, R13, R14, R15, R16, X*) are excluded and gate their own stages. Consistent with the §3.0 Review WPs count (RV1 note 2) | §17.2 S2 row |
+| 3 | Proposed design changes 23 (code-enforced stake gate for `[lane_d] from_block`), 24 (`[lane_c] remainder` restatement refused) and 25 (lane A tuning after lane D activation). Not applied: owner decision (RV1 notes 10, 12) | Proposed design changes 23–25 |
+| 4 | W6b must write `frontier` for every series (one record per earlier snapshot holding it) and a `feeds` entry (`mirror_lag_hours`, `forecast_product`) for every feed in `pool_d`; a `pool_d` missing either is invalid (RV3 BLOCKING 1) | §3.0 W6b, §1.3 (W6 metadata bullet), §1.7 Metadata |
+| 5 | W9 refuses any snapshot/series lacking `frontier` or with an unlisted feed, and re-derives S0 / backfill / lag eligibility without importing `cascade/validator/lane_d_forward` (invariant 12) (RV3 BLOCKING 1) | §3.0 W9 |
+| 6 | T8 clock labels corrected to §1.3 and `lane_d_forward.py:103-110`: data time passes, first-seen fails ⇒ `publish_ahead`; first-seen passes, data time fails ⇒ `late_mirror` (data old, mirror saw it late); missing `frontier` / unlisted feed added as refused cases (RV3 note 5) | §4 T8 |
+| 7 | Pre-S5-restart snapshot extended to the trainer state under `/root/cascade/_train_work/` (`era_state.json`, `trainer_submissions.json`, `funded_queue.json`, `trainer_promotion.json`, `champion_publisher.json`, `lane_b_driver.json`, `coldkey_identities.json`, `published_settlements.json`, its `activation_*` / `netconfig` files), `provisioner_state.json`, `pod_monitor_state.json` and the deployed `chain.toml` (live overrides) with `hosts.toml` / `provision.toml` (RV3 note 21) | §10.8, §3.0 R5, §10.5 S5 |
+| 8 | Wiring trap: `validator/weights.py` and the audit pass lane D's element to `emission_vector` only when a B or C pay record exists, so lane D's share would be lost; the WP that wires lane D pay must add the lane D record to that condition, and W9 decides invariant 12 for the shared lane D weight math (RV3 notes 10, 11) | §3.0 W7c, W9 |
+| 9 | W3b5 defines the low-frequency result for a confirm candidate whose frozen set holds low-frequency windows: `pass`/`fail` with the true `n_windows` (replacing W7a's interim `not_candidate`); enum already holds both, extended only for a new value | §3.0 W3b5 |
+| 10 | Proposed design change 26: arming the §16 sentinel (W-S1) gated on R4's observed `cfg-` stake ≥ 2/3 **and** all satellites upgraded. Not applied: owner decision (RV3 note 2) | Proposed design change 26, §16 (pointer) |
 
 ## rev6 (completion rubric, loop-readiness fixes, stale items; main @ 07117e1, 2026-11-21)
 
@@ -590,6 +611,41 @@ the code). Each is verified where marked.
     W5b. Proposed: the owner confirms Option A, or names the Option B rows to
     adopt; any Option B is a structural change to W8 (court pay) and goes in
     as a new WP row.
+23. **(rev6.1) Code-enforced stake gate for activation.** Today only the
+    runbook enforces "observed `cfg-` stake ≥ 2/3 before `effective_block`"
+    (§5 row 11, X6a, D10). `ALLOWED["lane_d"] = None` lets an overlay
+    adopted at the 51% permit-stake lock-in set `[lane_d] from_block`, and
+    old-release nodes refuse that overlay whole (§14.1), so arming early
+    splits the fleet (RV1 note 10). Proposed: R3 (lint) or R7 (publish
+    wrapper) refuses to publish an overlay that sets `[lane_d] from_block`
+    unless R4's tracker output shows ≥ 2/3 observed `cfg-` stake.
+    Affects R3, R4, R7, §5 S6.
+24. **(rev6.1) `[lane_c] remainder` restatement.** It is now release-only
+    (W2, `netconfig.py:213-215`). An overlay that merely restates
+    `[lane_c] remainder = "burn"` would be refused whole by new nodes and
+    accepted by old ones in a mixed fleet (RV1 note 12). R3 already refuses
+    it; proposed: say so in §14.2 and in the operator runbook, so no
+    overlay body ever carries it. Affects §14.2, R3, `docs/OPERATOR.md`.
+25. **(rev6.1) Lane A tuning after lane D activation.** R3's lint, as its
+    row is written, applies to any overlay containing a `[lane_d]` table,
+    and overlays are full snapshots. After S6 every overlay carries
+    `[lane_d]`, so any lane A key change is refused: lane A can no longer be
+    tuned by overlay. Options: (a) accept it (lane A changes go through a
+    release); (b) allow lane A keys to change in a seq that leaves every
+    `[lane_d]` key byte-identical to seq N-1. Affects R3, §5, §14.2.
+26. **(rev6.1) Stake-and-satellite gate for arming the §16 sentinel
+    (W-S1).** `ALLOWED["v2"]` now admits the four `sentinel_*` keys
+    (`netconfig.py:111-112`). A pre-W-S1 node refuses an overlay that
+    carries them, and refuses it whole, so arming by overlay before the
+    fleet upgrades splits the fleet. A pre-W-S1 satellite still verifies an
+    armed receipt's signature (it uses the received body, `receipt.py:1220`),
+    but its replay re-runs the gate on all four suites, the detail
+    mismatches, and every armed settlement with a gate or king check fails
+    replay there (RV3 note 2). Proposed: the R7 publish wrapper refuses an
+    overlay that sets `[v2] sentinel_from_block` (non-zero) unless R4's
+    tracker output shows observed `cfg-` stake ≥ 2/3 **and** every known
+    satellite reports the W-S1 release; §5 states the same gate on the
+    sentinel arming step. Affects R7 (publish wrapper), §5, §16.
 
 ## 0. Summary
 
@@ -943,7 +999,9 @@ Why it's built this way:
   forge source parses timestamps and then discards them
   (`sources/tsbench_forge.py:380-399`). Some feeds have none.
 - So **W6 stamps per-series `end_ts` into `pool_d` metadata**, and a series
-  without timestamps is never eligible. There is no build-time fallback: a
+  without timestamps is never eligible. **(rev6.1)** Likewise a series
+  without `frontier`, or a feed without a `feeds` entry, is never eligible:
+  W6b must write both, and W9 refuses a snapshot that lacks them. There is no build-time fallback: a
   series' tail can be up to `max_stale_days = 4` old, and
   `_freshest_segment` can fall back to an old segment (`:149, :204,
   :446-460`).
@@ -1285,7 +1343,9 @@ every challenger shares one window draw and the king's scores
   series and sources have reached it. S8 arms a rung only when
   `min_long_series` is met.
 - **Metadata:** per-series (per-channel) `end_ts`, `first_target_ts` and the
-  per-point first-seen record (W6fs).
+  per-point first-seen record (W6fs). **(rev6.1)** Plus `frontier` for every
+  series and a `feeds` entry (`mirror_lag_hours`, `forecast_product`) for
+  every feed; a `pool_d` missing either is invalid (W6b).
 - **Artifacts:** two tars from one build.
   - `pool_d_hist`: histories only, **no targets**. It goes to **(rev5)** the eval host (the launch eval host; valeval-laned from S8).
   - `pool_d_tgt`: targets plus timestamps, small. It stays on the box.
@@ -1449,7 +1509,7 @@ Accept command exits 0**, never on a builder's word. Conventions:
 | WP | What | Depends | Runs in | Accept |
 |---|---|---|---|---|
 | W0c | Loop tooling: `scripts/laned/accept`; `stub_scan.py` (refuses `TODO`, `FIXME`, `pass`-only bodies, `NotImplementedError`, `...` bodies, hardcoded sample values and mock imports outside `tests/`); `unread_keys.py` (every `[lane_d]`/`[lane_d_ops]` key is read by a parser); `follower_patterns.py` (every lane D log call has a cascade-ops follower pattern). **(rev6) Also:** (i) `scripts/laned/status` per §17: computes every WP's level, the stage and milestone state, the decision register and the §17.3 counters from `git log origin/main`, GitHub Actions results on main and `evidence/`, and writes `docs/plans/STATUS.md` + `status/laned_build.json` to branch `laned/build-state` (never merged to main); `accept --gate <stage>` verifies a stage's exit-gate evidence (§17.2); (ii) a GitHub Actions workflow `.github/workflows/laned-accept.yml` that runs `scripts/laned/accept <WP>` on every PR labelled `laned:<WP>` and, on push to main, for every WP at ≥ L2. On a tests-only PR it runs in **expect-fail** mode: it passes only if the new tests are collected and fail for the right reason (an assertion failure, or a missing module/attribute named in the WP's `PATHS`), never on a syntax, fixture or import error elsewhere. Today `ci.yml` runs only `pytest tests/unit`, so nothing runs `tests/accept/` yet; (iii) the CI check that fails any PR that edits `tests/accept/` together with a path outside `tests/accept/` (rule 1), and any implementation PR touching a path not in its WP's `PATHS`; (iv) self-tests for (i)–(iii), listed in Accept. Creating the `laned:<WP>` label set is an owner step (`gh label create`); none exists today | — | ci | `scripts/laned/accept W0c` (self-tests: each script fails on a planted violation fixture and passes on a clean one; **(rev6)** `scripts/laned/status` on a fixture repo (fixture git history, CI results and evidence) yields the exact expected level for every fixture WP, including side states and a WP that regresses from L3 to L2; a planted rule-1 violation (tests + implementation in one PR) fails the workflow's check; an expect-fail run passes on correctly failing tests and fails on a syntax-error test file) |
-| W0 | DEC-CA-0070 (supersedes DEC-CA-0062's recipe design) recording **(rev5)** D1–D43, D45–D48 and D42b (D44 withdrawn) (D25–D32 from §15, D33–D35 §16, D36–D42 §12b) | — | ci + owner merge | `scripts/laned/accept W0` (front matter valid; `supersedes: DEC-CA-0062`; **(rev5)** every decision D1–D43, D45–D48 and D42b answered or marked resolved) |
+| W0 | DEC-CA-0070 (supersedes DEC-CA-0062's recipe design) recording **(rev5)** D1–D43, D45–D48 and D42b (D44 withdrawn) (D25–D32 from §15, D33–D35 §16, D36–D42 §12b). **(rev6.1)** Owner-merged like every WP (§3.1 rule 6); that merge doesn't make W0 external | — | ci **(rev6.1)** | `scripts/laned/accept W0` (front matter valid; `supersedes: DEC-CA-0062`; **(rev5)** every decision D1–D43, D45–D48 and D42b answered or marked resolved) |
 | W0b | Context-equivalence test: the lane D scorer at 4096 equals the pinned `pyramid_wrapper` output (within tolerance) on windows with ≥ 4096 history; a 4096 checkpoint loads `strict=True` at every context variant  **(rev5)** It compares **quantile-head** outputs at the 9-level grid (the lane A scoring path under `quantile_head_after`), not samples. | W5d | ci | `scripts/laned/accept W0b` |
 
 **Rollout tooling (prerequisites for S0a–S0c, S4–S6)**
@@ -1461,7 +1521,7 @@ Accept command exits 0**, never on a builder's word. Conventions:
 | R2x | S0b live run: decode mainnet notes | R2 | owner (chain read) | `scripts/laned/accept R2x --evidence evidence/s0b_notes.json` (no pending segment trimmed) |
 | R3 | Overlay lint: refuse any `[lane_d]` overlay that touches non-`lane_d` keys (except a byte-identical restatement of seq N-1) or `remainder` | W2 | ci | `scripts/laned/accept R3` |
 | R4 | Stake-weighted upgrade tracker: per-hotkey `cfg-<hex>` and release from chain notes, stake-weighted %, names the laggards | R2 | ci | `scripts/laned/accept R4` (fixture metagraph + notes ⇒ exact %) |
-| R5 | Previous-release worktrees + restart scripts for validator, intake, trainer and eval host (§10.8), with `--dry-run` | — | ci (scripts) + owner (execute) | `scripts/laned/accept R5` (shellcheck; dry-run prints the exact plan; refuses during a scoring or settlement window fixture) |
+| R5 | Previous-release worktrees + restart scripts for validator, intake, trainer and eval host (§10.8), with `--dry-run`. **(rev6.1)** The pre-restart snapshot covers the full §10.8 list: the validator files, **plus** the trainer state under `/root/cascade/_train_work/` (`era_state.json`, `trainer_submissions.json`, `funded_queue.json`, `trainer_promotion.json`, `champion_publisher.json`, `lane_b_driver.json`, `coldkey_identities.json`, `published_settlements.json`, its `activation_*` and `netconfig` files), `provisioner_state.json`, `pod_monitor_state.json`, and the deployed `chain.toml` (live overrides) with `hosts.toml` / `provision.toml` (RV3 note 21); a file absent on the box is reported as absent | — | ci (scripts) + owner (execute) | `scripts/laned/accept R5` (shellcheck; dry-run prints the exact plan; refuses during a scoring or settlement window fixture) |
 | R6 | De-drift classifier (S0a): classify each `LIVE OVERRIDE` in a deployed chain.toml as main / overlay / operator-only; emit the main PR diff and the overlay body | — | ci | `scripts/laned/accept R6` (fixture with the 21 markers ⇒ deterministic classification) |
 | R6x | S0a execution: main PR merged; deployed file reconciled | R6 | owner | `cascade-audit decided --config /root/cascade/chain.toml --state-dir /root/cascade` exits 0 **and** `scripts/laned/accept R6x --evidence evidence/s0a_diff.json` (consensus-key diff empty) |
 | R7 | Overlay bring-up artefacts (S0c): benign seq-1 body generator, a refused-overlay body, runbook wrapper around `cascade-validator --netconfig-overlay … --netconfig-publish` (Approve-tier, dry-run shown to the owner) | R1 | ci | `scripts/laned/accept R7` (generated bodies pass `validate_overlay` on a fixture base; the refused body is refused whole) |
@@ -1498,7 +1558,7 @@ Accept command exits 0**, never on a builder's word. Conventions:
 | W5g | Holds, `checkpoint_fault`, typed reason enums | W5e | ci | `scripts/laned/accept W5g` (asserts the exact reason enum per case) |
 | W6a | `pool_d` selection = `pool`'s selected series ids (joined, not re-selected). **(rev5) Join rule:** the emitted `series_id` isn't stable. Collision suffixes `-2`, `-3`… are assigned in sort order (`builder.py:361-370, 471-480`), and `content_hash` is the sha256 of the (truncated) values (`:295`), so it changes whenever the tail moves and differs between `pool` and `pool_d` histories. Join on **(source, the pre-suffix source series key, channel)**, both built in the **same builder run** from the same forge records, never by emitted id or content hash. A key collision inside one source refuses the series from `pool_d` (logged) | W1 | ci + builder | `scripts/laned/accept W6a` (`pool` bytes unchanged) |
 | W6fs | **(rev3, launch-blocking)** First-seen recording: an append-only ingest log in the forge mirror path recording, per partition or point, the first time our mirror saw it, plus a per-feed mirror-lag measurement (source publish stamp where available). **Scope:** a recorder + reader used only by the `pool_d` builder. **Invariant:** `pool` bytes and lane A windows byte-identical (the test diffs a `pool` build with and without the recorder). **Tests:** first-seen never later than any snapshot containing the point; rewrites and backfills keep the *first* time; lag computed per feed. Not implemented in this PR  **(rev5) Attestation (B12):** a daily digest (Merkle root) of the ingest log is committed **before** any snapshot uses that day's records: in the signed receipt, or on chain via the main validator's commitment. A snapshot whose first-seen records postdate their committed root is refused. | W1 | builder | `scripts/laned/accept W6fs --evidence evidence/w6fs.json` |
-| W6b | **(rev3)** Extended history **to 16384 + 64** + per-series (per-channel) `end_ts` / `first_target_ts` | W6a | builder | `scripts/laned/accept W6b --evidence evidence/w6b.json` |
+| W6b | **(rev3)** Extended history **to 16384 + 64** + per-series (per-channel) `end_ts` / `first_target_ts`. **(rev6.1)** Also writes, for **every** series, `frontier` (a list, possibly empty: one record per earlier snapshot holding that series), and, for **every** feed in `pool_d`, a `feeds` entry (`mirror_lag_hours`, a number or `null`, and `forecast_product`). A `pool_d` in which any series lacks `frontier` (absent or `null`) or any feed lacks a `feeds` entry is **invalid**; the builder's tests assert that none does (RV3 BLOCKING 1: W5a's eligibility fails open on a missing key) | W6a | builder | `scripts/laned/accept W6b --evidence evidence/w6b.json` |
 | W6c | `pool_d_hist` / `pool_d_tgt` split | W6b | ci + builder | `scripts/laned/accept W6c` |
 | W6d | Pinning on Hippius; digests in reports; retention | W6c, W3a | builder | `scripts/laned/accept W6d --evidence evidence/w6d.json` |
 | W6s-*n* | **(rev3: moved to S8)** One WP per deep-history source (option 3, §1.7), each passing cleaning, domain and source keys | W6b | builder | `scripts/laned/accept W6s-<name> --evidence evidence/w6s_<name>.json` |
@@ -1507,13 +1567,13 @@ Accept command exits 0**, never on a builder's word. Conventions:
 | W3b2 | Paired sweep vs KING_D and house on one host | W3b1 | ci (recorded suite outputs) + pod | `scripts/laned/accept W3b2` |
 | W3b3 | **(rev5)** Sentinel sweep + publish: the era's §16 sentinel suite (not fixed TIME), swept and published for every new king, never gating | W3b2 | ci | `scripts/laned/accept W3b3` |
 | W3b4 | Suite identity + partial classification | W3b2 | ci | `scripts/laned/accept W3b4` |
-| W3b5 | **(rev3)** Always-run low-frequency private-pool non-inferiority check (`lowfreq_freqs`, `tau_public`; `lowfreq_regression`) (A10) | W5d | ci | `scripts/laned/accept W3b5` (T4b) |
+| W3b5 | **(rev3)** Always-run low-frequency private-pool non-inferiority check (`lowfreq_freqs`, `tau_public`; `lowfreq_regression`) (A10). **(rev6.1)** Result for a confirm candidate (a verdict that cleared at stage `confirm`) whose frozen set **does** hold low-frequency windows: `pass` or `fail` (`fail` = `lowfreq_regression`, not crowned), with the true `n_windows`; it is never `not_candidate`. W3b5 replaces W7a's interim path, which emits `not_candidate` with the true count (`validator/lane_d.py:371-387`). `no_windows` stays for a candidate with none; `not_candidate` (with `n_windows = 0`) stays for every non-candidate verdict. The W7a enum (`schemas/lane_d_report_1.json`, `LOWFREQ_RESULTS`) already holds `pass`/`fail`; W3b5 adds a value to it only if it introduces a new one | W5d | ci | `scripts/laned/accept W3b5` (T4b) |
 | W7a | Report schema `lane-d-report/1`, including §14.3 forward fields and **(rev3)** `rows_sha256`, both clocks per window, mirror lag, the judged set and skip reasons, `coldkey`, the `confirmation` block, the low-frequency result, **(rev5)** a `scoring_method: "quantile_head"` field (refused if absent or different)  **(rev5)** Plus the first-seen Merkle root(s) each frozen set relies on (B12). | W1.5 | ci | `scripts/laned/accept W7a` (JSON-schema; unknown version refused) |
 | W7b | Report signing | W7a | ci | `scripts/laned/accept W7b` |
-| W7c | `lane_d_state.json` + receipt prior/posterior digest binding | W7b | ci | `scripts/laned/accept W7c` |
+| W7c | `lane_d_state.json` + receipt prior/posterior digest binding. **(rev6.1)** Wiring trap (RV3 note 10): `validator/weights.py:517-524` passes the second element to `emission_vector` only when a lane B or C pay record exists (`pay is not None or pay_c is not None`); if lane D pays while B and C are off, the lane D share is dropped and `set_weights` normalisation hands it to lane A. The WP that wires lane D pay into weights (W7c, or the one that passes `lane_d_cfg` first) adds the lane D pay record to that condition, with a test for "lane D on, B and C off" | W7b | ci | `scripts/laned/accept W7c` |
 | W7d | Satellite replay: an **independent** implementation, no imports from producer eligibility, verdict or weight code (invariant 12) | W7c | ci | `scripts/laned/accept W7d` (import-graph check included) |
 | W8 | Emission: lane D in `lane_parts` / `lane_pool_shares` (`emission.py:330-383`, `lane_c.py`), court decay, house burn  **(rev5)** A deregistered court member's slot burns (B8). **C3 (D48)** decides where lane D's share comes from inside lane A; W8 also changes `lane_pool_shares` (`shared/lane_c.py:584`, returns a `(B, C)` tuple, callers `emission.py:361`, `lane_c.py:605`), a consensus signature at every caller. | W1.5 | ci | `scripts/laned/accept W8` |
-| W9 | Audit `check_lane_d` + `derive_weights` (**rev3:** re-derives the judged set, coldkey caps, both-clock eligibility, the confirmation rule and `rows_sha256`), independent of producer code | W7c, W8 | ci | `scripts/laned/accept W9` |
+| W9 | Audit `check_lane_d` + `derive_weights` (**rev3:** re-derives the judged set, coldkey caps, both-clock eligibility, the confirmation rule and `rows_sha256`), independent of producer code. **(rev6.1)** Refuses any judged snapshot in which a series lacks `frontier` (absent or `null`) or a feed is not listed in `feeds` (W6b). It re-derives S0 presence (`absent_from_s0`), the backfill rule and mirror-lag eligibility (`over_lag`, `forecast_product`) from the snapshot itself, **without importing `cascade/validator/lane_d_forward`** (invariant 12; RV3 BLOCKING 1); its reason labels follow §1.3 (`publish_ahead` = first-seen fails, `late_mirror` = data time fails). **(rev6.1)** Wiring trap (RV3 note 10): the audit's `emission_vector` call (`audit/checks.py:2834-2841`, `:3660`) passes the second element only when a lane B or C pay record exists, so a lane D share with B and C off would be dropped and handed to lane A by normalisation; W9 must add the lane D pay record to that condition. **(rev6.1)** W9 decides invariant 12 for the shared lane D weight math (`lane_pool_shares` / `lane_parts` / `lane_d_vector`, RV3 note 11) before its tests are written: either re-derive lane D's carve and court vector without these functions, or record them in the plan as shared consensus code exempt from invariant 12 | W7c, W8 | ci | `scripts/laned/accept W9` |
 | W10 | Miner CLI `cascade lane-d export \| verify \| submit \| ready \| status`, **W3a-chosen upload path only**. **(rev5, D43)** The commit reveals immediately (`blocks_until_reveal = min_blocks`), never at boundary − margin; a test asserts the lane D commit path never uses the lane A boundary timing | W3a, W3, W4 | ci + testnet | `scripts/laned/accept W10` |
 | W11 | cascade-ops checks (§10.7) + follower patterns | W5g, W7c | ci (cascade-ops repo) | `scripts/laned/accept W11` (includes `follower_patterns.py`) |
 | W12a | Docs and agent surfaces (§11.2 text surfaces, website; **rev3:** LANE_D.md FAQ on coldkey caps, confirmation latency, both clocks, BF16; VALIDATOR.md on what satellites verify for the new report fields; OPERATOR.md on launch eval host, S8, first-seen recorder) | W10 | ci | `scripts/laned/accept W12a` (every §11.2 surface mentions lane D; links resolve; `llms.txt` lane list matches the status fixture) |
@@ -1712,7 +1772,7 @@ These are pinned by tests in the WPs named.
 | T7 | Each context variant: wall time and memory on **(rev5)** the launch eval host for 4k/8k/16k (valeval-laned for 32k–128k at S8); 4k model vs declared-128k copy on ≤ 4096-history windows | Identical scores on short windows; a variant is armed only if it fits the budget |
 | T7b | Gate: two validators derive the same suite from the block hash; regression vs KING_D or vs house blocks; **(rev5)** the era's sentinel suite swept and published only, never gating | As stated |
 | T7c | 2.5 GB (BF16, rev3) direct upload (multipart or single presigned PUT per W3a); prefetch; box RAM and disk flat | As stated |
-| T8 | **(rev3)** Forward rule, both clocks: data-time-only pass but first-seen fail (late mirror); first-seen-only pass but data-time fail (publish-ahead); a feed over `max_mirror_lag_hours`; entry and king T values in both orders; a forecast-product feed; a backfilled partition | **(rev5)** Eligible only if **both** clocks (data time and first-seen) are after wall(max(T_E, T_K)) + `forward_margin` for every target point, and the feed's mirror lag ≤ `max_mirror_lag_hours`; the late-mirror, publish-ahead, over-lag, forecast-product and backfill cases are all ineligible; the snapshot-absence rule is never used for verdicts |
+| T8 | **(rev3)** Forward rule, both clocks: **(rev6.1, labels corrected to §1.3 and `lane_d_forward.py:103-110`)** data-time-only pass but first-seen fail (publish-ahead, `publish_ahead`: a future-stamped value our mirror saw before T); first-seen-only pass but data-time fail (late mirror, `late_mirror`: data old, mirror saw it late); both fail (`before_margin`); a series lacking `frontier` or a feed not listed in `feeds` (refused); a feed over `max_mirror_lag_hours`; entry and king T values in both orders; a forecast-product feed; a backfilled partition | **(rev5)** Eligible only if **both** clocks (data time and first-seen) are after wall(max(T_E, T_K)) + `forward_margin` for every target point, and the feed's mirror lag ≤ `max_mirror_lag_hours`; the late-mirror, publish-ahead, over-lag, forecast-product and backfill cases are all ineligible; the snapshot-absence rule is never used for verdicts |
 | T9 | Three entries freezing in one settlement with different T | Intersection set; latest-T deferred if below floors; max-T crowns the best |
 | T9b | **(rev3)** Clear, then a house refresh before confirmation | Per D20: restart vs new king (default) — first clear discarded, recorded in state and report |
 | T10 | House pointer swapped to a stronger checkpoint | House retakes; slot burns; prior miner tails keep paying |
@@ -2103,7 +2163,7 @@ recovery, because remote writes are often classifier-blocked.
 | S3 | T3 fine-tune pod and T7 pod just-in-time; terminate after on-pod checks | Owner yes |
 | S4 | **(rev5)** Bring up the launch eval host (D11; valeval-laned is rented only at S8) (on-rent check, known_hosts, handshake); dry-run; add `laned-eval.toml` to **`operator_inventory_host_files`** and **`operator_standing_pods_usd_per_hour`** (that list still names valeval-blackwell2; an Approve-tier chain.toml edit through the Edit tool, typed in main the same day, never left as a live-only override) | Owner yes |
 | S4 | Cut the release; the owner sends the validator announcement (release, activation block, "no new hardware", how to verify) and the miner announcement | Owner |
-| S5 | Snapshot **all 8 state files** first (§10.8: `validator_state.db`, `cascade_state.json`, `warm_start_init.json`, `lane_d_state.json`, `netconfig_state.json`, `activation_*_state.json`, the satellite state file, `decided_votes.toml`). Then restart in order **eval host → validator → lane D intake → trainer** (no legs in flight), each with `python -P`, the code-path guard and `deploy_gate check`/`verify` (R8). **Outside settlement, harvest and scoring windows; never during a bench sweep; never Wed 22:00 – Thu 08:00 UTC.** Satellites upgrade per the announcement | Notify (plan and timing to the owner first) |
+| S5 | Snapshot **all 8 state files** first (§10.8: `validator_state.db`, `cascade_state.json`, `warm_start_init.json`, `lane_d_state.json`, `netconfig_state.json`, `activation_*_state.json`, the satellite state file, `decided_votes.toml`; **(rev6.1)** plus the trainer state under `/root/cascade/_train_work/` (`era_state.json`, `trainer_submissions.json`, `funded_queue.json` and the rest of the §10.8 list), `provisioner_state.json`, `pod_monitor_state.json` and the deployed `chain.toml` with its live overrides, `hosts.toml`, `provision.toml`). Then restart in order **eval host → validator → lane D intake → trainer** (no legs in flight), each with `python -P`, the code-path guard and `deploy_gate check`/`verify` (R8). **Outside settlement, harvest and scoring windows; never during a bench sweep; never Wed 22:00 – Thu 08:00 UTC.** Satellites upgrade per the announcement | Notify (plan and timing to the owner first) |
 | S5 → S6 | Go/no-go on the stake gate; webhook test alert delivered | Owner |
 | S6–S7 | First settlements watched end-to-end; first crowning reported immediately; daily load, cost and vault size | — |
 
@@ -2148,7 +2208,15 @@ delivered test alert is part of the S6 gate.
 - **Snapshots before every S5 restart:** `validator_state.db`,
   `cascade_state.json`, `warm_start_init.json`, `lane_d_state.json`,
   `netconfig_state.json`, `activation_*_state.json`, the satellite state
-  file, `decided_votes.toml`. Copy them under `_state_backups/` with a
+  file, `decided_votes.toml`. **(rev6.1)** Plus (RV3 note 21) the trainer
+  state under `/root/cascade/_train_work/`: `era_state.json`,
+  `trainer_submissions.json`, `funded_queue.json`,
+  `trainer_promotion.json`, `champion_publisher.json`,
+  `lane_b_driver.json`, `coldkey_identities.json`,
+  `published_settlements.json` and its own `activation_*` and `netconfig`
+  files; `provisioner_state.json` and `pod_monitor_state.json`; and the
+  deployed `chain.toml` (with its live overrides) together with
+  `hosts.toml` / `provision.toml`. Copy them under `_state_backups/` with a
   timestamp.
 - **Never restore validator state across a settlement.** A restore is only
   valid back to the last settlement it already covers. Otherwise forward-fix.
@@ -2849,6 +2917,12 @@ per new king, roughly as v2.
   - **(rev5, D45)** It arms by overlay at an era boundary and affects the
     gate from that block, with no shadow eras. Its behaviour is proven on
     testnet first (TS1–TS5).
+  - **(rev6.1) Mixed-fleet hazard (RV3 note 2; not applied, see Proposed
+    design change 26).** A pre-W-S1 node refuses a whole overlay carrying
+    `sentinel_*` keys, and a pre-W-S1 satellite fails replay on every armed
+    receipt with a gate or king check. Change 26 proposes gating the arming
+    overlay on R4's observed `cfg-` stake ≥ 2/3 **and** every known
+    satellite on the W-S1 release.
 - **Lane B:** it's off, so it adopts the sentinel from its first armed era.
   DEC-CA-0071 (pending: PR #482; rev5 renumber) needs a one-paragraph amendment for D35.
 - **Lane D:** built in from launch (§1.3b).
@@ -2932,7 +3006,7 @@ otherwise `evidence/gates/<stage>.json`, checked by
 | S0b | R2x at L4 |
 | S0c | R7t and R7m at L4 |
 | S1 | W1, W0b and W3a at L4; R16 archive growing (R16 evidence) |
-| S2 | Every build WP at L5; the S2 gate evidenced |
+| S2 | Every build WP at L5; the S2 gate evidenced. **(rev6.1)** A **build WP** is a §3.0 WP whose `Runs in` is ci-only, or ci plus pod/testnet for its CI-checkable parts. Owner execution WPs (R2x, R6x, R7t, R7m, R9, R13, R14, R15, R16 and every X*) are **not** build WPs; they belong to their own stages (S0a–S0c, S1, S2b, …). This is the set the §3.0 Review WPs paragraph counts ("W/R build WPs, not owner execution WPs") and the set "all build WPs" means in S4 and S5 |
 | S2b | R9 at L4 |
 | S3 | X3 at L4, with every §4 T-row passed |
 | S4 | X4 at L4; all build WPs at L6 |
