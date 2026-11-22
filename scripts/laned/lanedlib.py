@@ -354,13 +354,17 @@ def wp_tree_at(root: Path, ref: str, wp: str) -> str | None:
     return proc.stdout.strip() if proc.returncode == 0 else None
 
 
-def verification_commit_index(root: Path, history: list[tuple[str, list[str]]], wp: str,
-                              trees: set[str], shas: set[str]) -> int | None:
-    """The L2 commit of a verification WP: the first commit on the first-parent
-    line, at or after the one that added the WP's PATHS, that changes only files
-    under tests/accept/<wp>/ and whose test dir is the one a green
-    ``verification`` run checked (its ``tests_tree``), or whose sha is that
-    run's ``head_sha``. None when absent."""
+def tests_commit_index(root: Path, history: list[tuple[str, list[str]]], wp: str,
+                       trees: set[str], shas: set[str]) -> int | None:
+    """The merge of a green tests-only PR run for ``wp``: the first commit on
+    the first-parent line, at or after the one that added the WP's PATHS, that
+    changes only files under tests/accept/ (some of them under
+    tests/accept/<wp>/) and whose test dir is the one the run checked (its
+    ``tests_tree``), or whose sha is that run's ``head_sha``. A batch
+    tests-only squash commit (several WPs' test dirs, plan rev6.2 (h)) is
+    found for each of its WPs through that WP's own tree. Such a commit never
+    is an L2 implementation commit (impl_commit_index skips tests-only
+    commits). None when absent."""
     own = f"tests/accept/{wp_dir(wp)}/"
     rel = own + "PATHS"
     start = next((i for i, (_, files) in enumerate(history) if rel in files), None)
@@ -368,8 +372,16 @@ def verification_commit_index(root: Path, history: list[tuple[str, list[str]]], 
         return None
     for i in range(start, len(history)):
         sha, files = history[i]
-        if not files or not all(f.startswith(own) for f in files):
+        if not files or not all(f.startswith("tests/accept/") for f in files) \
+                or not any(f.startswith(own) for f in files):
             continue
         if sha in shas or (trees and wp_tree_at(root, sha, wp) in trees):
             return i
     return None
+
+
+def verification_commit_index(root: Path, history: list[tuple[str, list[str]]], wp: str,
+                              trees: set[str], shas: set[str]) -> int | None:
+    """The L2 commit of a verification WP: the merge of its green
+    ``verification`` run (tests_commit_index), batch squash commits included."""
+    return tests_commit_index(root, history, wp, trees, shas)

@@ -79,7 +79,10 @@ def test_inv5_t11_crash_after_the_report_lands_recovers_to_the_clean_run(tmp_pat
     crashed_report = load_report_file(rp)
     assert body_sha(crashed_report) == ref["bodies"][n - 1]
 
+    hosts = len(chain.hosts)
     s = _resettle(chain, n, path)
+    assert all(h.calls == [] for h in chain.hosts[hosts:]), (
+        "recovery adopts the persisted report: the bench is never swept again (RV7 B1)")
     assert read_bytes(rp) == written, "recovery keeps the report already written"
     assert s.report == crashed_report, "recovery returns the persisted report"
     assert body_sha(s.report) == ref["bodies"][n - 1]
@@ -186,6 +189,16 @@ def test_inv5_a_call_at_an_older_boundary_is_refused(tmp_path):
 @pytest.mark.parametrize("defect,code", [("body", "report_conflict"),
                                          ("duplicate", "duplicate_key")])
 def test_inv5_a_defective_persisted_report_is_refused(tmp_path, monkeypatch, phase, defect, code):
+    """RV7 B1: recovery (`pending`) adopts the persisted report only once its
+    signature verifies, so a body edited after signing is `report_unverified`
+    there. A re-call (`settled`) may refuse it as either code."""
+    from cascade.validator.lane_d_state import LaneDStateError
+
+    if defect == "body":
+        codes = {"report_unverified"} if phase == "pending" else {"report_conflict",
+                                                                  "report_unverified"}
+    else:
+        codes = {code}
     from cascade.validator.lane_d_state import report_path
 
     chain = Chain(tmp_path)
@@ -210,7 +223,9 @@ def test_inv5_a_defective_persisted_report_is_refused(tmp_path, monkeypatch, pha
     state_bytes = path.read_bytes()
     with pytest.raises(ValueError) as e:
         chain.settle(2, path)
-    _state_error(e, code)
+    assert isinstance(e.value, LaneDStateError), repr(e.value)
+    assert e.value.code in codes, (e.value.code, str(e.value))
+    assert e.value.code in STATE_ERROR_CODES
     assert path.read_bytes() == state_bytes
     assert rp.read_bytes() == bad, "a defective report file is never silently overwritten"
 
