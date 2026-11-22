@@ -118,10 +118,19 @@ def test_report_carrying_a_gate_record_validates(scratch):
     _validate(json.loads(json.dumps(r, allow_nan=False)))
 
 
-def test_gate_is_optional_reports_without_it_validate(scratch):
+def _uncrowned(scratch) -> list[dict]:
+    """Uncrowned reports: the first clear (BOUNDARY_1) and both settlements
+    of the W1.5-format chain (nothing judged). W5e (RV5) makes a gate record
+    required on a CROWNED report, so the no-gate cases use these."""
     built = two_settlements(scratch)
-    for s in (built["s1"], built["s2"]):
-        r = copy.deepcopy(s.report)
+    legacy = two_settlements(scratch / "legacy", rich=False)
+    out = [copy.deepcopy(s.report) for s in (built["s1"], legacy["s1"], legacy["s2"])]
+    assert all(r["crowned"] is None for r in out), "fixture: an uncrowned report crowned"
+    return out
+
+
+def test_gate_is_optional_reports_without_it_validate(scratch):
+    for r in _uncrowned(scratch):
         r.pop("gate", None)
         assert_valid(r)
 
@@ -133,9 +142,9 @@ def test_no_gated_candidate_means_no_gate_key(scratch):
     legacy = two_settlements(scratch / "legacy", rich=False)
     for s in (legacy["s1"], legacy["s2"]):
         assert s.report["judged"] == [] and "gate" not in s.report
-    r = _gated(scratch)
-    r["gate"] = None
-    _refused(r, "bad_type", "gate")
+    for r in _uncrowned(scratch):
+        r["gate"] = None
+        _refused(r, "bad_type", "gate")
 
 
 def test_schema_file_describes_gate_as_a_closed_object():
