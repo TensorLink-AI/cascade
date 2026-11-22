@@ -88,9 +88,16 @@ binds it into a receipt record (:mod:`~cascade.validator.lane_d_state`):
   the prior state digest, never the randomized signature;
 - ``receipt`` = ``{schema, boundary, prior_state_sha256,
   posterior_state_sha256, report_sha256}`` (``None`` unarmed);
-- a crash after the report landed is recovered by recomputing: the body must
-  equal the persisted file's (else ``report_conflict``), the file is kept
-  byte-for-byte and the state is written; a re-call at the settled boundary
+- every armed report binds the prior state digest inside its signed body
+  (``extensions.prior_state_sha256``);
+- a crash after the report landed is recovered by ADOPTING the persisted
+  report (RV7 B1), never by re-sweeping the bench: it must verify against the
+  settling validator's key (``report_unverified``), name this boundary and
+  bind the loaded state's digest (``report_conflict``); the settlement is then
+  derived with the report's recorded gate outcomes (a ``pass`` crowns, a
+  ``bench_hold`` holds) and no bench call, its body must equal the persisted
+  one (else ``report_conflict``), the file is kept byte-for-byte and the state
+  is written; every refusal writes nothing; a re-call at the settled boundary
   returns the persisted report, pay and receipt with nothing re-scored,
   re-gated or written; an older boundary is ``stale_boundary``.
 
@@ -125,7 +132,9 @@ from .lane_d_report import (
     validate_report,
 )
 from .lane_d_state import (
+    PRIOR_STATE_EXTENSION,
     LaneDStateError,
+    check_persisted_report,
     load_prior_state,
     load_report_file,
     make_receipt,
@@ -466,6 +475,30 @@ def _run_gate(cands: list[dict], state: dict, cfg, boundary: int,
     return {**record, "results": results}, outcomes
 
 
+def _adopted_gate(cands: list[dict], persisted: dict, where) -> tuple[dict | None, dict[str, str]]:
+    """RV7 B1 recovery: ``(gate record, {digest: outcome})`` as the persisted
+    (verified) report recorded them, with no bench call. A crashed settlement
+    is never re-gated: a restarted validator's bench session differs and its
+    bench may answer differently, so the signed record is the outcome. No
+    candidate: ``(None, {})``. A report without a ``gate`` record held every
+    candidate (the gate could not run). Otherwise the record's results must
+    name exactly this settlement's candidates, else ``report_conflict``."""
+    if not cands:
+        return None, {}
+    gate = persisted.get("gate")
+    if gate is None:
+        return None, {c["digest"]: "bench_hold" for c in cands}
+    results = gate.get("results") if isinstance(gate, dict) else None
+    if not isinstance(results, list) or not all(isinstance(r, dict) for r in results):
+        raise LaneDStateError("report_conflict", f"{where}: the persisted gate record has no "
+                              "results list")
+    outcomes = {str(r.get("digest")): str(r.get("outcome")) for r in results}
+    if len(outcomes) != len(results) or set(outcomes) != {c["digest"] for c in cands}:
+        raise LaneDStateError("report_conflict", f"{where}: the persisted gate results do not "
+                              "name this settlement's crowning candidates")
+    return json.loads(json.dumps(gate)), outcomes
+
+
 def _load_pools(pool_dir, prior_pool_dirs, horizon: int) -> list[dict]:
     """The retained snapshots, oldest first and the newest (``pool_dir``)
     last; a directory listed twice (or equal to ``pool_dir``) loads once."""
@@ -696,10 +729,17 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     if settled >= boundary:
         raise LaneDStateError("stale_boundary", f"lane D already settled through {settled}; "
                               f"got {boundary}")
-    # A report file without its state: a crash between the two writes. It is
-    # parsed strictly now, before any scoring, and must match the recompute.
+    # A report file without its state: a crash between the two writes. RV7
+    # B1: recovery ADOPTS it, never re-sweeps the bench. It is parsed
+    # strictly and checked (the settling validator's signature, the boundary,
+    # the prior state digest bound in its signed body) before anything else
+    # is read; a refusal calls no bench and writes nothing.
     persisted = load_report_file(rp) if rp.exists() else None
     prior_sha = state_digest(state)
+    if persisted is not None:
+        check_persisted_report(persisted,
+                               signer_ss58=str(getattr(signer, "hotkey", signer).ss58_address),
+                               boundary=boundary, prior_state_sha256=prior_sha, where=rp)
     refresh_house(state, house)
     king_before = _king_record(state["king"])
     pools = _load_pools(pool_dir, prior_pool_dirs, int(cfg.horizon))
@@ -888,8 +928,12 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
         candidates.append({"digest": dg, "lcb": float(hold["lcb"]),
                            "reveal_ts": int(state["entries"][dg]["reveal_ts"]),
                            "set_sha256": str(hold["set_sha256"]), "held": True})
-    gate, gate_outcomes = _run_gate(candidates, state, cfg, boundary, boundary_block_hash,
-                                    sentinel, bench)
+    if persisted is None:
+        gate, gate_outcomes = _run_gate(candidates, state, cfg, boundary, boundary_block_hash,
+                                        sentinel, bench)
+    else:
+        # Recovery: the outcomes the persisted, verified report recorded.
+        gate, gate_outcomes = _adopted_gate(candidates, persisted, rp)
     by_verdict = {v["digest"]: v for v in verdicts}
     passing = []
     for c in candidates:
@@ -963,6 +1007,9 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
         "windows": [windows_out[k] for k in sorted(windows_out)],
         "verdicts": verdicts, "rows": rows, "rows_sha256": rows_sha256(rows),
         "pay": {"share": pay["share"], "court": court},
+        # RV7 B1: the state this settlement ran from, under the signature, so
+        # recovery can check a persisted report against the state as loaded.
+        "extensions": {PRIOR_STATE_EXTENSION: prior_sha},
     }
     if gate is not None:
         # Present iff the gate ran (absent, never null, otherwise).
@@ -976,9 +1023,11 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     body_sha = report_digest(report)
     if persisted is None:
         save_report_file(rp, report)
-    elif persisted.get("boundary") != boundary or report_digest(persisted) != body_sha:
+    elif report_digest(persisted) != body_sha:
+        # The posterior derived from the persisted outcomes must be the one
+        # that report records; anything else is refused, never overwritten.
         raise LaneDStateError("report_conflict", f"{rp}: the persisted report's body is not "
-                              f"the recomputed settlement's (sha256 {body_sha})")
+                              f"the settlement derived from its outcomes (sha256 {body_sha})")
     else:
         # Recovery: the persisted report (its signature too) is the record.
         report = persisted
