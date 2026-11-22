@@ -5,3 +5,6 @@
 cascade/validator/lane_d.py
 # frozen-set helpers, if the cohort set needs them.
 cascade/validator/lane_d_frozen.py
+# RV5: the audit counts the house's rows and re-derives the house judgement
+# (cohorts[].house_digest, verdicts[].house) from the signed rows.
+cascade/audit/lane_d.py
