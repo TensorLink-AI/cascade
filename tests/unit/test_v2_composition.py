@@ -97,5 +97,5 @@ def test_overlay_mainnet_lane_c_takes_from_lane_a():
     body = {"protocol": "cascade-netconfig/2", "network": {"netuid": 91, "chain": "bittensor:finney"}, "seq": 1, "prev": "", "effective_block": 0,
             "overrides": {"lane_b": {"share": 0.2}, "lane_c": {"share": 0.3}}}
     cfg = build_config(_base(), body)
-    b, c = lane_pool_shares(cfg.lane_b, cfg.lane_c)
-    assert (round(1 - b - c, 6), b, c) == (0.5, 0.2, 0.3)
+    b, c, d = lane_pool_shares(cfg.lane_b, cfg.lane_c)
+    assert (round(1 - b - c - d, 6), b, c, d) == (0.5, 0.2, 0.3, 0.0)

@@ -174,6 +174,55 @@ def gate_path(stage: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Plan Accept cells (§3.0): the evidence files a WP declares
+# ---------------------------------------------------------------------------
+
+PLAN_PATH = "docs/plans/LANE_D_PLAN.md"
+EVIDENCE_ARG = re.compile(r"--evidence\s+([^\s`)|]+)")
+
+
+def _plan_cell(text: str) -> str:
+    return text.replace("**", "").replace("`", "").strip()
+
+
+def _plan_row(line: str) -> list[str]:
+    body = line.strip()
+    if body.startswith("|"):
+        body = body[1:]
+    if body.endswith("|"):
+        body = body[:-1]
+    return [c.strip() for c in body.split("|")]
+
+
+def accept_evidence_files(plan_text: str, wp: str) -> list[str]:
+    """Every ``--evidence <file>`` in the Accept cell of ``wp``'s row in a §3.0
+    WP table (first header cell ``WP``, with ``Runs in`` and ``Accept``
+    columns). The first row naming the WP wins, as on the status board."""
+    lines = plan_text.splitlines()
+    i = 0
+    while i < len(lines):
+        if not lines[i].lstrip().startswith("|"):
+            i += 1
+            continue
+        block = []
+        while i < len(lines) and lines[i].lstrip().startswith("|"):
+            block.append(lines[i])
+            i += 1
+        header = [_plan_cell(c) for c in _plan_row(block[0])]
+        if not header or header[0] != "WP" or "Runs in" not in header or "Accept" not in header:
+            continue
+        k = header.index("Accept")
+        for raw in block[2:]:
+            row = _plan_row(raw)
+            if row and _plan_cell(row[0]) == wp:
+                # Accept is the last column in §3.0; a `a|b` inside it must not
+                # cut it short, so everything from its index on is the cell.
+                accept = " | ".join(row[k:]) if k == len(header) - 1 else (row[k] if k < len(row) else "")
+                return list(dict.fromkeys(m.group(1) for m in EVIDENCE_ARG.finditer(accept)))
+    return []
+
+
+# ---------------------------------------------------------------------------
 # Token matching of WP / decision ids in plan cells
 # ---------------------------------------------------------------------------
 
@@ -196,3 +245,31 @@ def git(root: Path, *args: str, check: bool = True,
     if check and proc.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
     return proc
+
+
+def first_parent_history(root: Path, ref: str) -> list[tuple[str, list[str]]]:
+    """``[(sha, changed files)]`` along ``ref``'s first-parent line, oldest first."""
+    log = git(root, "log", "--first-parent", "--reverse", "--diff-merges=first-parent",
+              "--name-only", "--format=%x01%H", ref).stdout
+    history: list[tuple[str, list[str]]] = []
+    for chunk in log.split("\x01")[1:]:
+        lines = [ln for ln in chunk.split("\n") if ln.strip()]
+        history.append((lines[0].strip(), lines[1:]))
+    return history
+
+
+def impl_commit_index(history: list[tuple[str, list[str]]], wp: str, paths: list[str]) -> int | None:
+    """The L2 commit (plan §17.1): the first commit after the one that added
+    the WP's PATHS file that changes something outside tests/accept/ and only
+    paths inside PATHS, i.e. the WP's implementation merge. None when absent."""
+    rel = f"tests/accept/{wp_dir(wp)}/PATHS"
+    start = next((i for i, (_, files) in enumerate(history) if rel in files), None)
+    if start is None:
+        return None
+    for i in range(start + 1, len(history)):
+        files = history[i][1]
+        if not files or all(f.startswith("tests/accept/") for f in files):
+            continue
+        if all(path_matches(f, paths) for f in files):
+            return i
+    return None

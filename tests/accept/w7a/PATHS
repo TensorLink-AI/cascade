@@ -1,0 +1,14 @@
+# W7a report schema lane-d-report/1 (plan rev6 §3.0 W7a row, §1.5, §14.3,
+# §3.2 invariant 11, B7, B12; README.md has the contract).
+# The versioned JSON schema file satellites read.
+cascade/validator/schemas/lane_d_report_1.json
+# The enums, load_schema, validate_report and ReportSchemaError.
+cascade/validator/lane_d_report.py
+# settle_lane_d emits the new fields (windows' feed and lag, judged/skipped,
+# confirmation, lowfreq, first-seen roots, court burn reasons, params).
+cascade/validator/lane_d.py
+# check_lane_d compares the stated params with config exactly, so the audit
+# must derive the 5 new params fields (horizons, max_mirror_lag_hours,
+# gate_suites, tau_public, lowfreq_freqs) from config itself, never by
+# importing the producer (invariant 12).
+cascade/audit/lane_d.py

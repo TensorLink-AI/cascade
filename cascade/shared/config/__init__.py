@@ -24,6 +24,13 @@ from .generation import (
     GenerationConfig,
     parse_generation,
 )
+from .lane_b import (
+    LANE_B_OPEN_RULES,
+    LANE_B_ROUTER_ROWS,
+    LANE_B_SENTINEL_TARGET_RULES,
+    LANE_B_TRACK_DEFAULTS,
+    parse_lane_b_track,
+)
 from .lane_c import (
     LaneCConfig,
     check_target,
@@ -90,11 +97,14 @@ from .training import (
 )
 from .v2 import (
     LANE_B_REMAINDERS,
+    SENTINEL_SUITES,
     LaneBConfig,
     V2Config,
+    check_sentinel_from_block,
     check_v2_activation,
     lane_b_replay_cover,
     parse_lane_b,
+    parse_sentinel,
 )
 from .validators import _MV_BONUS_RE as _MV_BONUS_RE
 from .validators import _REAL_CORPUS_REF_RE as _REAL_CORPUS_REF_RE
@@ -162,7 +172,11 @@ __all__ = [
     "GeneratorConfig",
     "HEAT_GUARD_FACTOR",
     "HEAT_GUARD_FLOOR_SECONDS",
+    "LANE_B_OPEN_RULES",
     "LANE_B_REMAINDERS",
+    "LANE_B_ROUTER_ROWS",
+    "LANE_B_SENTINEL_TARGET_RULES",
+    "LANE_B_TRACK_DEFAULTS",
     "LaneBConfig",
     "LaneCConfig",
     "LaunchConfigError",
@@ -181,6 +195,9 @@ __all__ = [
     "TelemetryConfig",
     "TrainingContractConfig",
     "V2Config",
+    "SENTINEL_SUITES",
+    "check_sentinel_from_block",
+    "parse_sentinel",
     "GENERATION_PROVIDERS",
     "KING_CORPUS_PUBLISH",
     "GenerationConfig",
@@ -214,6 +231,7 @@ __all__ = [
     "margin_v2_configured",
     "mv_score_active",
     "parse_lane_b",
+    "parse_lane_b_track",
     "parse_lane_c",
     "parse_lane_d",
     "LaneDConfig",

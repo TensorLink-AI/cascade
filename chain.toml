@@ -1311,6 +1311,16 @@ margin_warmup_blocks = 18000
 # increment units, so 0.2 ≈ an LCB of 0.2 % relative improvement over the
 # init (the statistic is capped at 2). 0.0 = follow the dethrone bar.
 king_check_margin = 0.2
+# LANE_D_PLAN §16 cross-lane rotating held-out sentinel (D33/D34). OFF:
+# sentinel_from_block = 0. Arming is ONE signed overlay at an era boundary
+# (D45, no shadow), never an edit here. When armed, one suite of
+# sentinel_suites per era (drawn from the era-boundary block hash) is held out
+# of the lane-A bench gate and king check; with sentinel_ratchet the candidate
+# must not regress on it by more than sentinel_tau (ratio LCB <= 1 + tau).
+sentinel_from_block = 0
+sentinel_suites = ["gift", "boom", "time", "fev"]
+sentinel_ratchet = true
+sentinel_tau = 0.01
 
 [v2.training]
 # The supplied pyramid ladder replaces the earlier v2 candidate.
@@ -1444,6 +1454,29 @@ acceptance_from_block = "v2"
 # miner's key via /v1/lane-b/fund (no operator fallback); "operator" = the
 # retired operator lane pool (dev / emergency only).
 leg_funding = "miner"
+# Lane B track (LANE_D_PLAN §12b, DEC-CA-0071; WB10). SHIPPED UNARMED: every key
+# at its default, so no digest moves. Arming is one signed overlay after the
+# capability release (D45), never an edit here. contamination_hashset is
+# RELEASE-ONLY (a data pin; overlays refuse it); every other key is overlay-settable.
+suite_targets            = false   # §12b.1: suite targets off
+contamination_hashset    = ""      # sha256:<64 hex> pin; none until WB11 (release-only)
+contamination_min_hits   = { exact = 1, normalised = 3 }   # sub-window hits that refuse a corpus
+suite_target_max_repo_mb = 8       # D38 (a): <= [generator] max_repo_mb
+min_experts_frac         = 0.03125     # D39: 8 / 256 experts per layer
+max_experts_frac         = 0.1484375   # D39: 38 / 256
+router_rows              = "frozen"    # D40 (a)
+traffic_steal_bound      = 0.02        # §12b.2
+open_rule                = "cogate"    # §12b.4: "tokens_king_check" (D41) by overlay after the release
+sentinel_target_rule     = "defer"     # D35 (a)
+sentinel_max_defer_eras  = 4           # §12b.5
+# D42 leg cost: lane B's own GPU list (starts as [round] funded_pod_skus; editing
+# it never opens a GPU to lane A), the miner train_hours cap (0.5 h grid) and the
+# leg guard train_hours x guard_factor + overhead, capped at max_leg_seconds
+# ([training] max_train_seconds is never edited for it).
+funded_pod_skus          = ["8xH200", "8xH100", "4xH200", "4xH100"]
+max_leg_hours            = 6.0
+max_leg_seconds          = 27000       # 6 h x 1.25
+guard_factor             = 1.25
 
 
 [lane_c]
@@ -1582,6 +1615,20 @@ poll_seconds = 300                 # how often latest.json is re-read
 stale_after_blocks = 3600          # one era
 poll_seconds       = 60            # how often the main validator's receipts are re-read
 max_walk           = 64            # receipts walked back per poll to reach the last replayed one
+
+[lane_d_ops]
+# Lane D operator settings (LANE_D_PLAN §14.2, W2b) — NON-CONSENSUS. Read only
+# by the main validator and the lane D intake (cascade/shared/config/lane_d_ops.py);
+# satellites never read it; never in a receipt, digest or overlay (operator-only).
+# Names and locations only: credentials are env-only (secret-shaped keys refused).
+vault_bucket       = "cascade-lane-d-vault"   # dedicated private vault bucket (§1.2)
+vault_prefix       = "lane-d"                 # objects at lane-d/<hotkey>/<digest>/ (§11.1)
+pool_d_bucket      = "cascade-lane-d-pool"    # private pool_d snapshots (§1.7)
+pool_d_prefix      = "pool_d"
+eval_host          = ""                       # set on the deployment at the S4 bring-up (D11)
+queue_max_inflight = 1                        # forecast jobs in flight on the eval host
+queue_max_pending  = 64                       # intake backpressure (advisory; caps live in [lane_d])
+queue_poll_seconds = 60                       # ready-queue poll interval
 
 # ── Lane D: open weights (LANE_D_PLAN §1, §14.2; DEC-CA-0062) — SHIPPED OFF ──
 # from_block = 0: never active, no digest/receipt/weight moves (invariant 1).

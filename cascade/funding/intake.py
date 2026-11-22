@@ -114,9 +114,18 @@ transfers):
                          hotkey, "<targets as sent>|<ref>", ts, sha256(key))
         X-Submission-Label, X-Gpu-Type / X-Gpu-Allow-Fallback /
                          X-Gpu-Max-Price (optional, as /v1/fund)
+        X-Lane-B-Declared-Rows (optional, WB14 / LB2): the expert rows the
+                         leg trains, a JSON object keyed by MoE ordinal
+                         (``{"0": [3, 17, 40, 90], "4": [...]}``), each layer
+                         with rows inside the ``[lane_b]`` per-layer clamp;
+                         when sent, the signed ref field gains
+                         ``|rows=<sha256 of the canonical rows>`` (see
+                         :func:`lane_b_signed_ref`). Absent = the trainer picks.
     → 202 {"status": "queued" | "replaced" | "queued-behind", "lane": "b",
            "targets": […]} | 200 "already-queued"
     → 400 missing_targets / bad_targets / unknown_target / too_many_targets /
+          declared_rows_out_of_range / declared_rows_bad_layer /
+          declared_rows_count / declared_rows_malformed /
           missing_lium_api_key / stale_timestamp / bad_signature |
           403 not_revealed / not_registered | 409 replayed_timestamp |
           503 lane_b_disabled
@@ -166,6 +175,7 @@ from .vault import PayerKeyVault
 __all__ = [
     "FRESHNESS_WINDOW_SECONDS",
     "FundingIntake",
+    "LANE_B_DECLARED_ROWS_HEADER",
     "canonical_fund_message",
     "header_key_digest",
     "verify_hotkey_signature",
@@ -186,6 +196,10 @@ _ACTIONS = ("fund", "withdraw", "submit", "credentials",
 
 LANE_C_TARGET_HEADER = "X-Lane-C-Target"
 LANE_B_TARGETS_HEADER = "X-Lane-B-Targets"
+# WB14 / LB2: the optional miner-declared expert rows of a lane B fund, a
+# JSON object keyed by MoE ordinal (``{"0": [3, 17, ...], "4": [...]}``).
+LANE_B_DECLARED_ROWS_HEADER = "X-Lane-B-Declared-Rows"
+_DECLARED_ROWS_SIGNED_TAG = "rows="
 
 
 def lane_b_targets(header_value: str) -> tuple[str, ...]:
@@ -194,14 +208,25 @@ def lane_b_targets(header_value: str) -> tuple[str, ...]:
     return tuple(t.strip() for t in str(header_value or "").split(",") if t.strip())
 
 
-def lane_b_signed_ref(targets, ref: str) -> str:
+def lane_b_signed_ref(targets, ref: str, declared_rows=None) -> str:
     """The ``ref`` field a lane-B request signs: ``"<t1>,<t2>|<ref>"`` with
     the targets EXACTLY as the request lists them — the signature binds the
     declared targets and the ref (and, through the canonical message, the key
-    digest). The queue stores them in the ``[lane_b]`` slot order."""
+    digest). The queue stores them in the ``[lane_b]`` slot order.
+
+    With declared rows (WB14, the parsed ``X-Lane-B-Declared-Rows``) the field
+    is ``"<targets>|<ref>|rows=<sha256 of the canonical rows JSON>"``
+    (:func:`cascade.trainer.declared_rows.declared_rows_digest`), so the
+    signature binds the rows too; without them it is today's field byte for
+    byte. A ref never contains ``|``, so the two forms cannot collide."""
     from .queue import lane_b_entry_ref
 
-    return lane_b_entry_ref(targets, ref)
+    signed = lane_b_entry_ref(targets, ref)
+    if declared_rows is None:
+        return signed
+    from ..trainer.declared_rows import declared_rows_digest
+
+    return f"{signed}|{_DECLARED_ROWS_SIGNED_TAG}{declared_rows_digest(declared_rows)}"
 
 
 def lane_c_signed_ref(target: str, ref: str) -> str:
@@ -396,6 +421,7 @@ class FundingIntake:
         resolve_lane_b_reveal: Callable[[str, tuple, str], int | None] | None = None,
         lane_b_targets: tuple[str, ...] | None = None,
         lane_b_max_targets: int | None = None,
+        lane_b_cfg: object | None = None,         # loaded [lane_b] (LaneBConfig)
         lane_a_admission: Callable[[int | None], tuple[int, dict] | None] | None = None,
         pod_live: Callable[[str], bool] | None = None,
         on_withdrawn: Callable[[str], None] | None = None,
@@ -423,6 +449,10 @@ class FundingIntake:
         self.lane_b_targets = tuple(lane_b_targets) if lane_b_targets is not None else None
         self.lane_b_max_targets = (int(lane_b_max_targets) if lane_b_max_targets is not None
                                    else None)
+        # WB14 / LB2: the loaded ``[lane_b]`` config whose ``min_experts_frac``
+        # / ``max_experts_frac`` clamp a declared-rows header. None (dev, no
+        # chain config) = the config's shipped defaults.
+        self.lane_b_cfg = lane_b_cfg
         # DEC-CA-0060: the SKUs a fund request may choose (``[round]
         # funded_pod_skus``) and the walls behind the fund-time warning. None
         # = no chain config (dev): any well-formed SKU, no warning.
@@ -1096,8 +1126,14 @@ class FundingIntake:
             return 400, {"code": "too_many_targets",
                          "message": f"{len(sent)} targets > [lane_b] max_domains_per_leg = "
                                     f"{self.lane_b_max_targets}"}
+        declared_rows = None
+        if action == "lane-b-fund":
+            status, parsed = self._declared_rows(headers)
+            if status is not None:
+                return status, parsed
+            declared_rows = parsed.get("rows")
         try:
-            signed = lane_b_signed_ref(sent, ref) if ref else None
+            signed = lane_b_signed_ref(sent, ref, declared_rows) if ref else None
         except ValueError as e:
             return 400, {"code": "bad_ref", "message": str(e)}
         status, ctx = self._auth(action, headers, signed_ref=signed, gpu_segment=gpu_segment)
@@ -1105,7 +1141,36 @@ class FundingIntake:
             return status, ctx
         order = self.lane_b_targets
         ctx["targets"] = (tuple(t for t in order if t in sent) if order is not None else sent)
+        ctx["declared_rows"] = declared_rows
         return None, ctx
+
+    def _declared_rows(self, headers) -> tuple[int, dict] | tuple[None, dict]:
+        """WB14 / LB2: the optional ``X-Lane-B-Declared-Rows`` of a lane-B
+        fund, parsed against the model's ``experts_per_layer`` under the
+        ``[lane_b]`` clamp fractions. ``(None, {"rows": None})`` when absent
+        (the trainer picks: ESFT), ``(None, {"rows": parsed})`` when valid,
+        else a typed 400 (``declared_rows_*``)."""
+        raw = headers.get(LANE_B_DECLARED_ROWS_HEADER)
+        if raw is None:
+            return None, {"rows": None}
+        from ..trainer.declared_rows import (
+            DeclaredRowsError,
+            model_experts_per_layer,
+            parse_declared_rows,
+        )
+
+        cfg = self.lane_b_cfg
+        if cfg is None:
+            from ..shared.config import LaneBConfig
+
+            cfg = LaneBConfig()
+        try:
+            rows = parse_declared_rows(
+                raw, experts_per_layer=model_experts_per_layer(),
+                min_frac=float(cfg.min_experts_frac), max_frac=float(cfg.max_experts_frac))
+        except DeclaredRowsError as e:
+            return 400, {"code": e.code, "message": f"{LANE_B_DECLARED_ROWS_HEADER}: {e}"}
+        return None, {"rows": rows}
 
     def lane_b_fund(self, headers) -> tuple[int, dict]:
         """Fund one lane-B domain-expert leg (``POST /v1/lane-b/fund``): the
@@ -1151,10 +1216,14 @@ class FundingIntake:
                                     "commit with `cascade deploy --expert-domain`, wait for "
                                     "the reveal, then fund"}
         outcome = self.lane_b_queue.add_lane_b(  # type: ignore[union-attr]
-            hotkey, targets, ref, int(reveal_block), label=label, gpu_choice=choice)
+            hotkey, targets, ref, int(reveal_block), label=label, gpu_choice=choice,
+            declared_rows=ctx["declared_rows"])
         self.vault.insert(hotkey, api_key)
-        log.info("lane-B fund %s: %s targets=%s (reveal_block=%d%s)", hotkey, outcome,
-                 ",".join(targets), reveal_block, f", gpu={choice.gpu}" if choice.chosen else "")
+        rows = ctx["declared_rows"]
+        log.info("lane-B fund %s: %s targets=%s (reveal_block=%d%s%s)", hotkey, outcome,
+                 ",".join(targets), reveal_block, f", gpu={choice.gpu}" if choice.chosen else "",
+                 "" if rows is None else ", declared rows "
+                 + ",".join(f"{k}:{len(v)}" for k, v in rows.items()))
         body = {"status": outcome, "lane": "b", "targets": list(targets)}
         if outcome == "already-queued":
             return 200, self._gpu_reply(body, choice)

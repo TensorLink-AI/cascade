@@ -23,6 +23,13 @@ if TYPE_CHECKING:
 log = logging.getLogger("cascade.validator")
 
 
+def _sentinel_kw(obj: object, round_id: str, rule: str) -> dict:
+    """LANE_D_PLAN §16: the settlement's sentinel keywords for the lane-A
+    bench gate (``{}`` unarmed — the gate call is then byte-identical)."""
+    fn = getattr(obj, "_sentinel_gate_kw", None)
+    return fn(str(round_id), rule) if callable(fn) else {}
+
+
 class EvaluationMixin:
     """Fetch and score checkpoints; the gift-eval gate and benchmark hook."""
 
@@ -418,6 +425,7 @@ class EvaluationMixin:
                 alpha=p.bootstrap_alpha, B=p.bootstrap_B, seed=seed,
                 min_items=p.bench_gate_min_items, rule=rule,
                 tolerance=p.bench_gate_tolerance, min_win_rate=p.bench_gate_min_win_rate,
+                **_sentinel_kw(self, round_id, rule),
             )
         log.info(
             "bench-gate round=%s mode=%s rule=%s chal=%s computed=%s passed=%s ucb=%s n=%s "
@@ -495,6 +503,7 @@ class EvaluationMixin:
                 tolerance=p.bench_gate_tolerance, min_win_rate=p.bench_gate_min_win_rate,
                 king_revisions=self._vbench_revisions(king_entry),
                 chal_revisions=self._vbench_revisions(chal_entry),
+                **_sentinel_kw(self, round_id, rule),
             )
         log.info("bench-gate round=%s mode=%s rule=%s source=validator chal=%s computed=%s "
                  "passed=%s outcome=%s%s", round_id, mode, rule, chal_entry.miner_hotkey[:12],

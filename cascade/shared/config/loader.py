@@ -45,6 +45,7 @@ from .training import parse_training_contract
 from .v2 import (
     V2Config,
     check_bench_source,
+    check_sentinel_from_block,
     check_v2_activation,
     parse_lane_b,
     parse_v2_economics,
@@ -350,7 +351,12 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
                           # DEC-CA-0059 horizon targets = the scored ladder
                           horizons=tuple(int(h) for h in (e.get("scored_horizons", ())
                                                           or ())),
-                          v2_from_block=_v2_from)
+                          v2_from_block=_v2_from,
+                          # D42: lane B's GPU list starts as [round]'s (its own key)
+                          round_funded_pod_skus=validate_funded_pod_skus(
+                              r.get("funded_pod_skus", ())),
+                          # D38: the suite-target cap stays within [generator]'s
+                          generator_max_repo_mb=int(g.get("max_repo_mb", 2048)))
     _mg = int(lane_b.merge_guard_from_block)
     if _mg and _v2_from:
         # a typed merge-guard block is an era boundary at/after the v2 go-live
@@ -807,6 +813,14 @@ def load_chain_config(path: Path | str | None = None, *, raw: dict | None = None
         if cfg.v2.from_block and _idb < int(cfg.v2.from_block):
             raise ValueError(f"[v2] image_decoupled_from_block={_idb} precedes [v2] "
                              f"from_block={cfg.v2.from_block}")
+    # LANE_D_PLAN §16: the sentinel arms at an era boundary on the grid in
+    # force at it, once the four-suite rule v2 is in force (0 = off).
+    _sfb = int(cfg.v2.sentinel_from_block)
+    if _sfb:
+        _sfb_grid = _ebp if (_eab and _ebp and _sfb < _eab) else _eb
+        check_sentinel_from_block(
+            _sfb, era_blocks=max(1, _sfb_grid) * max(1, _era_settlements),
+            bench_gate_v2_from_block=int(cfg.v2.bench_gate_v2_from_block))
     if cfg.v2.train_image_digest_after:
         if cfg.training.v2_contract is None:
             raise ValueError("[v2] train_image_digest_after needs a [v2.training] contract")

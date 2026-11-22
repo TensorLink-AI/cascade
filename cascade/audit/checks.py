@@ -1481,6 +1481,96 @@ def _same_detail(a, b) -> bool:
     return a == b
 
 
+def _receipt_sentinel_era(receipt: RoundReceipt, cfg: ChainConfig) -> tuple[int, bool]:
+    """``(era start, armed)`` of the receipt's settlement (LANE_D_PLAN §16)."""
+    from ..shared.sentinel import sentinel_armed, settlement_era_start
+
+    era_start = settlement_era_start(cfg, int(receipt.epoch_start_block))
+    return era_start, sentinel_armed(cfg, era_start)
+
+
+def _sentinel_in_play(receipt: RoundReceipt, cfg: ChainConfig) -> bool:
+    return getattr(receipt, "sentinel", None) is not None or _receipt_sentinel_era(
+        receipt, cfg)[1]
+
+
+def _receipt_sentinel_kw(receipt: RoundReceipt, cfg: ChainConfig, rule: str) -> dict:
+    """The gate / king-check sentinel keywords a replay uses: the receipt's
+    recorded suite when its era is armed under rule v2 (verified by
+    :func:`check_sentinel`), ``{}`` otherwise (the unarmed call)."""
+    from ..eval.bench_gate import RULE_V2
+    from ..shared.sentinel import sentinel_gate_kw
+
+    rec = getattr(receipt, "sentinel", None)
+    if rule != RULE_V2 or not isinstance(rec, dict) or not _receipt_sentinel_era(receipt, cfg)[1]:
+        return {}
+    suite = rec.get("suite")
+    return sentinel_gate_kw(cfg, suite) if isinstance(suite, str) else {}
+
+
+def check_sentinel(receipt: RoundReceipt, cfg: ChainConfig,
+                   client: object | None = None) -> CheckResult:
+    """LANE_D_PLAN §16: the receipt's sentinel draw. Recorded exactly on an
+    armed era's settlements (a record on an unarmed era FAILS; a missing one
+    FAILS when a bench gate / king check judged under the sentinel, else
+    WARNS — the stamp is best-effort chain context). The record names the
+    era start, draws its suite from that block's hash (read via ``client``;
+    the recorded suite is replayed when the hash is unreadable), and every
+    recorded gate detail holds out exactly that suite."""
+    from ..shared.chain import ChainError
+    from ..shared.sentinel import verify_record
+
+    name = "sentinel"
+    era_start, armed = _receipt_sentinel_era(receipt, cfg)
+    rec = getattr(receipt, "sentinel", None)
+    v = receipt.verdict
+    kc = receipt.king_check if isinstance(receipt.king_check, dict) else {}
+    details = [d for d in ((v.bench_gate_detail if v is not None else None),
+                           ((kc.get("bench") or {}).get("gate")
+                            if isinstance(kc.get("bench"), dict) else None))
+               if isinstance(d, dict)]
+    if not armed:
+        if rec is not None:
+            return _fail(name, f"sentinel recorded but [v2] sentinel_from_block does not arm "
+                               f"the era starting at {era_start}")
+        return _skip(name, "sentinel not armed")
+    if rec is None:
+        if details:
+            return _fail(name, f"era {era_start} is armed and a bench gate / king check was "
+                               "judged, but the receipt records no sentinel draw")
+        return _warn(name, f"era {era_start} is armed but the receipt records no sentinel "
+                           "draw (chain context unavailable at publish?)")
+    if not isinstance(rec, dict):
+        return _fail(name, f"sentinel record {rec!r} is not an object")
+    if rec.get("block") != era_start:
+        return _fail(name, f"sentinel record block {rec.get('block')!r} is not the era start "
+                           f"{era_start}")
+    onchain = None
+    how = "recorded suite replayed (no chain connection)"
+    if client is not None:
+        try:
+            onchain = str(client.block_hash(era_start))  # type: ignore[attr-defined]
+            how = "drawn from the on-chain block hash"
+        except ChainError as e:
+            how = f"recorded suite replayed (block hash unreadable: {e})"
+    try:
+        suite = verify_record(rec, cfg, onchain)
+    except ValueError as e:
+        return _fail(name, str(e))
+    for d in details:
+        sen = d.get("sentinel")
+        if isinstance(sen, dict):
+            if sen.get("suite") != suite:
+                return _fail(name, f"a recorded gate detail holds out {sen.get('suite')!r}, "
+                                   f"the era's sentinel is {suite!r}")
+        elif d.get("suites"):
+            # judged by the rule (per-suite numbers recorded) without holding
+            # the sentinel out
+            return _fail(name, f"a recorded gate detail was judged on every suite in an "
+                               f"era whose sentinel is {suite!r}")
+    return _ok(name, f"sentinel {suite} for era {era_start}: {how}")
+
+
 def _detail_verdict(detail: dict) -> bool | None:
     """The DEC-CA-0061 outcome the recorded detail itself implies
     (:func:`cascade.eval.bench_gate.detail_verdict`: the three numbers
@@ -1577,7 +1667,9 @@ def check_bench_gate(receipt: RoundReceipt, cfg: ChainConfig,
             min_items=int(params.get("bench_gate_min_items", 10)), rule=rule, **thr,
             # DEC-CA-0063 validator reports: the pinned data revisions
             king_revisions=(bench.get("_revisions") or {}).get(king.trained_pointer),
-            chal_revisions=(bench.get("_revisions") or {}).get(chal.trained_pointer))
+            chal_revisions=(bench.get("_revisions") or {}).get(chal.trained_pointer),
+            # LANE_D_PLAN §16: the recorded draw of an armed era ({} unarmed)
+            **_receipt_sentinel_kw(receipt, cfg, rule))
     replayed = gate.passed if gate.computed else None
     if replayed != v.bench_gate_passed:
         return _fail(name, f"rule {rule}: recorded bench_gate_passed={v.bench_gate_passed} "
@@ -2098,7 +2190,8 @@ def _kc_gate_replay(receipt: RoundReceipt, cfg: ChainConfig, kc: dict, manifest,
     gate = king_check_gate(king_side[0], init_side[0], king_side[1], init_side[1],
                            cfg.koth_params(block=boundary), seed=int(receipt.base_seed),
                            king_revisions=(rows.get("_revisions") or {}).get(ptr),
-                           init_revisions=(rows.get("_revisions") or {}).get(init_ptr))
+                           init_revisions=(rows.get("_revisions") or {}).get(init_ptr),
+                           **_receipt_sentinel_kw(receipt, cfg, want_rule))
     if not _same_detail(gate.detail(), gd):
         return _fail(name, f"{result} recorded but the gate replayed over the signed rows "
                            f"differs from the recorded detail ({gate.reason or 'pass'})")
@@ -4132,6 +4225,9 @@ def run_tier0(
         *([check_marketcast(receipt, cfg, marketcast_reports, **(marketcast_inputs or {}))]
           if cfg.marketcast.active(int(receipt.epoch_start_block)) else []),
         check_king_check(receipt, cfg, king_bench),
+        # LANE_D_PLAN §16: only where a sentinel is in play (armed era or a
+        # recorded draw), so every unarmed receipt's output is unchanged
+        *([check_sentinel(receipt, cfg, client)] if _sentinel_in_play(receipt, cfg) else []),
         check_weights(receipt, cfg, client),
     ]
     return _confirm_rejection(receipt, results)

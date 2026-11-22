@@ -1,0 +1,8 @@
+# W5d no-pad scorer + context variants (plan rev6 §3.0 W5d row, §1.1, §4 T7;
+# README.md has the contract).
+# The scorer: declared contexts, no-pad batch plan, horizon cap, quantile head
+# at the 9-level grid (lane A's method under [v2] quantile_head_after).
+cascade/eval/lane_d_scorer.py
+# The T7 measurement helpers the pod run calls; they build evidence/t7.json
+# (schema laned_t7/1) that tests/accept/w5d/test_w5d_t7_evidence.py verifies.
+cascade/eval/lane_d_t7.py

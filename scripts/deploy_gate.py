@@ -85,7 +85,7 @@ AREAS = {
     "benchmarks": (r"^benchmarks/",),
     "champions": (r"^champions/",),
     "ops_tooling": (r"^cascade/laned/", r"^scripts/"),  # owner-run tools, no service
-    "ci": (r"^\.github/",),
+    "ci": (r"^\.github/", r"^Makefile$"),               # CI targets (make laned-e2e)
 }
 SERVICES = ("trainer", "validator", "intake-laned", "eval-host")
 # Services that serve or depend on the validator's scoring: no restart while a

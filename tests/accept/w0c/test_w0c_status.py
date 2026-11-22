@@ -17,6 +17,7 @@ import pytest
 from .helpers import (
     STATUS_FIXTURE,
     build_status_repo,
+    commit,
     git,
     git_bare,
     materialise_ci_results,
@@ -65,11 +66,42 @@ def test_status_exact_level_for_every_fixture_wp(tmp_path, fixture_repo):
 def test_status_regression_l3_to_l2_after_red_main_run(tmp_path, fixture_repo):
     repo, shas = fixture_repo
     # At the evidence commit the red run (on the later 'docs' commit) is not in
-    # history yet: W1 is accepted.
+    # history yet: W1 is accepted. It runs in `ci` only, so §17.1 passes it
+    # through L4 automatically; no RV covers it, so it stops at L4.
     before, _ = _run_status(tmp_path, repo, shas, ref=shas["evidence"], out_name="before")
-    assert before["wps"]["W1"]["level"] == "L3"
+    assert before["wps"]["W1"]["level"] == "L4"
+    # The red run drops it below L3, so straight to L2 (not L3 or L4).
     after, _ = _run_status(tmp_path, repo, shas, out_name="after")
     assert after["wps"]["W1"]["level"] == "L2"
+
+
+def _review_w1_at_evidence(repo, shas, body: str) -> str:
+    """Branch off the evidence commit (before the red run) and add an RV2."""
+    git(repo, "checkout", "-q", "-b", "rv2", shas["evidence"])
+    write(repo, "evidence/rv2.md", body)
+    sha = commit(repo, "rv2", ["evidence/rv2.md"])
+    git(repo, "checkout", "-q", "main")
+    return sha
+
+
+def test_status_ci_only_accepted_reaches_l5_when_reviewed(tmp_path, fixture_repo):
+    repo, shas = fixture_repo
+    # §17.1: a ci-only WP passes L4 automatically, so an RV with only a closed
+    # BLOCKING item for it lifts it to L5. impl_w1 is after tag cap-1: not L6.
+    _review_w1_at_evidence(repo, shas, "# RV2 review\n\nCovers: W1\n\n"
+                           "- [x] BLOCKING W1: missing unarmed check (fixed)\n")
+    data, _ = _run_status(tmp_path, repo, shas, ref="rv2")
+    assert data["wps"]["W1"]["level"] == "L5"
+    # Still external and unevidenced: W0 is not lifted by the same rule.
+    assert data["wps"]["W0"]["level"] == "L3"
+
+
+def test_status_ci_only_open_blocking_stays_l4(tmp_path, fixture_repo):
+    repo, shas = fixture_repo
+    _review_w1_at_evidence(repo, shas, "# RV2 review\n\nCovers: W1\n\n"
+                           "- [ ] BLOCKING W1: scorer path not exercised\n")
+    data, _ = _run_status(tmp_path, repo, shas, ref="rv2")
+    assert data["wps"]["W1"]["level"] == "L4"
 
 
 def test_status_reads_ref_tree_not_working_tree(tmp_path, fixture_repo):

@@ -98,7 +98,7 @@ def reward_reference(root=ROOT):
     for label, bcfg, ccfg in (("A", None, None), ("A + C", None, cfg.lane_c),
                               ("A + B", cfg.lane_b, None),
                               ("A + B + C", cfg.lane_b, cfg.lane_c)):
-        b, c = lane_pool_shares(bcfg, ccfg)
+        b, c, _ = lane_pool_shares(bcfg, ccfg)
         allocations.append(f"| {label} | {percent(1-b-c)} | {percent(b)} | {percent(c)} |")
     starts = ["| Crowning LCB in increment units | Starting share of A |", "|---|---:|"]
     for threshold, _ in cfg.v2.ladder_start_tiers:
@@ -107,7 +107,7 @@ def reward_reference(root=ROOT):
     for label, policy in (("B: accepted marginal gain", cfg.lane_b), ("C: confirmed MarketCast gain", cfg.marketcast)):
         for threshold, _ in policy.full_pay_tiers:
             tiers.append(f"| {label} | ≥ {threshold:g} | {full_pay(threshold, policy.full_pay_tiers).full_eras} |")
-    b_share, c_share = lane_pool_shares(cfg.lane_b, cfg.lane_c)
+    b_share, c_share, _ = lane_pool_shares(cfg.lane_b, cfg.lane_c)
     b_slot = b_share / len(lane_b_slots(cfg.lane_b))
     full = full_pay(.02, cfg.lane_b.full_pay_tiers).full_eras
     groups = []

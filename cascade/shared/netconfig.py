@@ -83,6 +83,7 @@ MAX_CHAIN_WALK = 1000
 ALLOWED: dict[str, frozenset[str] | None] = {
     "scoring": None,
     "eval": None,
+    # remainder and the WB10 contamination_hashset pin stay release-only below
     "lane_b": None,
     "lane_c": None,
     # LANE_D_PLAN §14.2: every lane D tuning key (activation, kill switch,
@@ -107,6 +108,8 @@ ALLOWED: dict[str, frozenset[str] | None] = {
         "king_ladder", "win_margin_start", "win_margin_end", "margin_warmup_blocks",
         "king_check_margin", "ladder_start_tiers", "ladder_start_level_bp",
         "ladder_step_bp", "ladder_cap_bp", "ladder_fail_bp", "key_slash_bp", "court_bp", "court_blocks", "key_slash_min_eras",
+        # LANE_D_PLAN §16 / §14.2: the cross-lane sentinel arms by overlay
+        "sentinel_from_block", "sentinel_suites", "sentinel_ratchet", "sentinel_tau",
     }),
     # Base, activation, suite/universe, data sources, window construction
     # and recipe bounds remain release-only. These controls change how an
@@ -130,6 +133,13 @@ REFUSED_TABLES: dict[str, str] = {
     "chain": "the SDK pin is consensus-adjacent",
     "netconfig": "the owner config key is a security root",
     "activation": "the tally that adopts overlays cannot be changed by one",
+}
+# Operator-only: per-deployment knobs no overlay ever carries (each operator
+# sets them on their own box; nothing consensus reads them), with the reason
+# the refusal prints.
+OPERATOR_ONLY_TABLES: dict[str, str] = {
+    "generation": "operator-only generation policy, never an overlay",
+    "lane_d_ops": "operator-only lane D ops table (LANE_D_PLAN §14.2), never an overlay",
 }
 # Block-valued switch keys checked for retroactivity (§4).
 _BLOCK_KEY = re.compile(r"(?:^|_)from_block(?:_v2)?$|activation_block2?$")
@@ -166,7 +176,7 @@ def overlay_policy() -> dict:
         "wildcard_policy": "Existing parser-supported keys only; loader checks still apply.",
         "lane_c_competitions": "Existing competitions: weight and until_block only.",
         "adoption": "Owner signature, permit-stake lock-in, then an era boundary.",
-        "operator_only": ["generation"],
+        "operator_only": sorted(OPERATOR_ONLY_TABLES),
         "training": "Trainer-declared recipe/budget changes need no fleet update; "
                     "locked training terms and new model code require a release.",
     }
@@ -202,6 +212,9 @@ def check_overrides(overrides: object) -> dict:
         if table in REFUSED_TABLES:
             bad.append(f"[{table}] ({REFUSED_TABLES[table]})")
             continue
+        if table in OPERATOR_ONLY_TABLES:
+            bad.append(f"[{table}] ({OPERATOR_ONLY_TABLES[table]})")
+            continue
         if table not in ALLOWED:
             bad.append(f"[{table}] (not on the DEC-CA-0057 allow-list)")
             continue
@@ -213,6 +226,9 @@ def check_overrides(overrides: object) -> dict:
             if (table, key) in (("scoring", "burn_uid"), ("lane_b", "remainder"),
                                 ("lane_c", "remainder"), ("lane_d", "remainder")):
                 bad.append(f"[{table}] {key} (burn destination is release-only)")
+            elif (table, key) in (("lane_b", "contamination_hashset"),):
+                # LANE_D_PLAN §14.2 (rev5): an overlay never replaces a data pin
+                bad.append(f"[{table}] {key} (data pin is release-only)")
             elif isinstance(value, dict) and table in ("v2",):
                 bad.append(f"[{table}.{key}] (nested tables are release-only)")
             elif allowed is not None and key not in allowed:

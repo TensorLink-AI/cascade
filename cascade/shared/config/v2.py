@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 # The DEC-CA-0055 margin-tiered start share's defaults (owner 2026-10-20;
@@ -17,6 +18,11 @@ LADDER_START_TIERS: tuple[tuple[float, int], ...] = (
 # decay. UNCALIBRATED placeholders: set them from real win LCBs before arming
 # (lane-B domain LCBs are noisy — few windows / sources per domain).
 FULL_PAY_TIERS: tuple[tuple[float, int], ...] = ((0.05, 10), (0.02, 5), (0.01, 2))
+
+# LANE_D_PLAN §16 rule 1: the suites the cross-lane sentinel is drawn from —
+# the four bench suites of DEC-CA-0061 rule v2 (``cascade.eval.bench_gate.
+# SUITES_V2``; kept as a literal so the config imports nothing from eval).
+SENTINEL_SUITES: tuple[str, ...] = ("gift", "boom", "time", "fev")
 
 
 @dataclass(frozen=True)
@@ -214,6 +220,19 @@ class V2Config:
     # reign keeps it there until the reign ends. 0 = the first lapse lifts
     # with the first king-funded leg. A crowning resets the count.
     key_slash_min_eras: int = 6
+    # LANE_D_PLAN §16 / D33 (CONSENSUS, overlay-settable, release-then-
+    # activate): the cross-lane rotating held-out sentinel. From the ERA
+    # starting at or after ``sentinel_from_block`` (an era boundary; 0 = off)
+    # one suite of ``sentinel_suites`` per era, drawn from the era-boundary
+    # block hash (:func:`cascade.shared.sentinel.sentinel_for_era`), is held
+    # out of the lane-A bench gate and king check: they judge on the other
+    # suites. D34 ``sentinel_ratchet``: the candidate must still not regress
+    # on the sentinel — its ratio LCB vs the reference at most
+    # ``1 + sentinel_tau``. No shadow period (D45).
+    sentinel_from_block: int = 0
+    sentinel_suites: tuple[str, ...] = SENTINEL_SUITES
+    sentinel_ratchet: bool = True
+    sentinel_tau: float = 0.01
 
     def margin_set(self) -> bool:
         return self.win_margin_start > 0.0 and self.win_margin_end > 0.0
@@ -441,7 +460,58 @@ def parse_v2_economics(v2raw: dict) -> dict:
     out["ladder_start_tiers"] = parse_ladder_start_tiers(
         v2raw.get("ladder_start_tiers", LADDER_START_TIERS),
         fail_bp=lad["ladder_fail_bp"], cap_bp=lad["ladder_cap_bp"])
+    out.update(parse_sentinel(v2raw))
     return out
+
+
+def parse_sentinel(v2raw: dict) -> dict:
+    """The LANE_D_PLAN §16 sentinel keys, validated (the era-grid check of
+    ``sentinel_from_block`` runs in the loader, which knows the grid):
+    ``sentinel_from_block`` an integer ``>= 0``; ``sentinel_suites`` a
+    non-empty list of unique names from :data:`SENTINEL_SUITES`
+    (case-sensitive); ``sentinel_ratchet`` a bool; ``sentinel_tau`` a number
+    ``>= 0``. Absent keys keep the inert defaults."""
+    fb = v2raw.get("sentinel_from_block", 0)
+    if isinstance(fb, bool) or not isinstance(fb, int) or fb < 0:
+        raise ValueError(f"[v2] sentinel_from_block must be an integer >= 0; got {fb!r}")
+    suites = v2raw.get("sentinel_suites", list(SENTINEL_SUITES))
+    if isinstance(suites, (str, bytes)) or not isinstance(suites, (list, tuple)) or not suites:
+        raise ValueError(f"[v2] sentinel_suites must be a non-empty list of suite names; "
+                         f"got {suites!r}")
+    for s in suites:
+        if not isinstance(s, str) or s not in SENTINEL_SUITES:
+            raise ValueError(f"[v2] sentinel_suites: {s!r} is not a bench suite "
+                             f"{list(SENTINEL_SUITES)}")
+    if len(set(suites)) != len(suites):
+        raise ValueError(f"[v2] sentinel_suites must not repeat a suite; got {suites!r}")
+    ratchet = v2raw.get("sentinel_ratchet", True)
+    if not isinstance(ratchet, bool):
+        raise ValueError(f"[v2] sentinel_ratchet must be true/false; got {ratchet!r}")
+    tau = v2raw.get("sentinel_tau", 0.01)
+    if (isinstance(tau, bool) or not isinstance(tau, (int, float)) or not math.isfinite(tau)
+            or tau < 0):
+        raise ValueError(f"[v2] sentinel_tau must be a number >= 0; got {tau!r}")
+    return {"sentinel_from_block": int(fb), "sentinel_suites": tuple(suites),
+            "sentinel_ratchet": ratchet, "sentinel_tau": float(tau)}
+
+
+def check_sentinel_from_block(from_block: int, *, era_blocks: int,
+                              bench_gate_v2_from_block: int) -> None:
+    """Refuse a ``[v2] sentinel_from_block`` that is not an era boundary on
+    the grid in force at it (§16: it arms at an era boundary, D45), or that
+    arms before the DEC-CA-0061 four-suite rule it holds a suite out of is in
+    force. 0 = off (always accepted)."""
+    n = int(from_block)
+    if n <= 0:
+        return
+    era = max(1, int(era_blocks))
+    if n % era:
+        raise ValueError(f"[v2] sentinel_from_block={n} must be an era boundary (a multiple "
+                         f"of {era} blocks)")
+    rule = int(bench_gate_v2_from_block)
+    if not rule or n < rule:
+        raise ValueError(f"[v2] sentinel_from_block={n} arms before the DEC-CA-0061 rule v2 "
+                         f"([v2] bench_gate_v2_from_block={rule}) is in force")
 
 
 EVAL_WINDOWS_MAX = 20000
@@ -631,6 +701,38 @@ class LaneBConfig:
     # ``/v1/lane-b/fund`` with no operator fallback; "operator" keeps the
     # retired operator lane-pool dispatch (dev / emergency only).
     leg_funding: str = "miner"
+    # Lane B track (LANE_D_PLAN §12b; DEC-CA-0071; parsed by
+    # ``lane_b.parse_lane_b_track``). Shipped at these defaults = unarmed: no
+    # consensus surface reads them, so no digest moves. ``contamination_hashset``
+    # is release-only (``netconfig``); every other key is overlay-settable.
+    # §12b.1 suite targets: off until armed; the contamination hash set (a
+    # ``sha256:`` pin, none until WB11) and the sub-window hit counts that refuse
+    # a suite-target corpus; D38 (a) a stricter repo cap for those entries.
+    suite_targets: bool = False
+    contamination_hashset: str = ""
+    contamination_min_hits: tuple[tuple[str, int], ...] = (("exact", 1), ("normalised", 3))
+    suite_target_max_repo_mb: int = 8
+    # D39 miner-chosen experts: the per-layer clamp is ceil(min_frac E) ..
+    # floor(max_frac E) (8 .. 38 of 256); D40 (a) router rows frozen; §12b.2 the
+    # bound on routing traffic an expert-only leg may pull from other experts.
+    min_experts_frac: float = 0.03125
+    max_experts_frac: float = 0.1484375
+    router_rows: str = "frozen"
+    traffic_steal_bound: float = 0.02
+    # §12b.4 / D41 the opening rule ("cogate" = today's gate, shipped)
+    open_rule: str = "cogate"
+    # §12b.5 / D35 (a): a sentinel-target entry defers, at most this many eras
+    sentinel_target_rule: str = "defer"
+    sentinel_max_defer_eras: int = 4
+    # D42 / §12b.6 leg cost: lane B's own GPU list (the loader defaults it to
+    # the same file's ``[round] funded_pod_skus``; it never changes [round]),
+    # the miner's train_hours cap, and the leg guard
+    # ``train_hours × guard_factor`` + overhead, capped at ``max_leg_seconds``
+    # (``[training] max_train_seconds`` is never edited for it).
+    funded_pod_skus: tuple[str, ...] = ()
+    max_leg_hours: float = 6.0
+    max_leg_seconds: int = 27_000
+    guard_factor: float = 1.25
 
     def active(self, block: int | None) -> bool:
         return self.from_block > 0 and block is not None and int(block) >= self.from_block
@@ -710,7 +812,9 @@ def _merge_guard_block(raw, v2_from_block: int, key="merge_guard_from_block") ->
 def parse_lane_b(lb: dict, *, from_block: int | None = None,
                  era_settlements: int = 0,
                  horizons: tuple[int, ...] | None = None,
-                 v2_from_block: int | None = None) -> LaneBConfig:
+                 v2_from_block: int | None = None,
+                 round_funded_pod_skus: tuple[str, ...] | None = None,
+                 generator_max_repo_mb: int | None = None) -> LaneBConfig:
     """Parse + guard ``[lane_b]`` (absent section ⇒ inert defaults).
 
     ``from_block`` (``load_chain_config``) is the first settlement block,
@@ -721,8 +825,15 @@ def parse_lane_b(lb: dict, *, from_block: int | None = None,
     DEC-CA-0059 horizon targets; ``None`` reads the dict's own ``horizons``
     key (direct construction in tests), absent ⇒ none. ``v2_from_block``
     resolves ``merge_guard_from_block = "v2"``; ``None`` = the launch block the
-    derived ``from_block`` implies (``from_block − 1``; 0 when lane B is off)."""
+    derived ``from_block`` implies (``from_block − 1``; 0 when lane B is off).
+    ``round_funded_pod_skus`` / ``generator_max_repo_mb`` (``load_chain_config``)
+    are the lane B track's ``funded_pod_skus`` default and repo-cap bound
+    (:func:`.lane_b.parse_lane_b_track`)."""
+    from .lane_b import parse_lane_b_track
+
     _refuse_full_rounds(lb, "lane_b")
+    track = parse_lane_b_track(lb, round_funded_pod_skus=round_funded_pod_skus,
+                               generator_max_repo_mb=generator_max_repo_mb)
     ttl = int(lb.get("win_ttl_eras", 28))
     cover = lane_b_replay_cover(ttl, era_settlements)
     if "replay_settlements" in lb:
@@ -781,6 +892,7 @@ def parse_lane_b(lb: dict, *, from_block: int | None = None,
             int(v2_from_block) if v2_from_block is not None else max(0, fb - 1),
             "acceptance_from_block"),
         leg_funding=str(lb.get("leg_funding", "miner")),
+        **track,
     )
     if cfg.leg_funding not in LANE_B_LEG_FUNDING:
         raise ValueError(f"[lane_b] leg_funding must be one of {LANE_B_LEG_FUNDING}; "
