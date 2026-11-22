@@ -10,6 +10,7 @@ merged history as ``status/ci_runs.json`` on branch ``laned/build-state``
 
     ci_ledger.py record  --file F --wp W --mode M --event E --head-sha S
                          --conclusion C [--run-id N] [--evidence-sha BLOB]
+                         [--tests-tree TREE]
     ci_ledger.py harvest --repo OWNER/NAME --out F [--root R]
                          [--ledger-ref origin/laned/build-state] [--artifact laned-results]
 
@@ -45,7 +46,7 @@ import lanedlib  # noqa: E402
 
 WORKFLOW = "laned-accept"
 LEDGER_PATH = "status/ci_runs.json"
-MODES = ("accept", "expect-fail", "tests-correction", "evidence", "check-pr", "gate")
+MODES = ("accept", "expect-fail", "verification", "tests-correction", "evidence", "check-pr", "gate")
 CONCLUSIONS = ("success", "failure")
 
 
@@ -94,6 +95,10 @@ def cmd_record(args: argparse.Namespace) -> int:
     if args.evidence_sha:
         # the blob sha of the evidence (or gate) file the run verified
         data["runs"][-1]["evidence_sha"] = args.evidence_sha
+    if args.tests_tree:
+        # verification: tree sha of tests/accept/<wp>/ the run checked (status
+        # finds the merge commit on main by it, squash merges included)
+        data["runs"][-1]["tests_tree"] = args.tests_tree
     if args.run_id is not None:
         data["harvested_run_ids"].append(args.run_id)
     save(path, data)
@@ -280,6 +285,7 @@ def main(argv: list[str] | None = None) -> int:
     rec.add_argument("--run-id", type=int)
     rec.add_argument("--run-head-sha", help="the run's own head sha when it differs (workflow_dispatch)")
     rec.add_argument("--evidence-sha", help="blob sha of the evidence/gate file the run verified")
+    rec.add_argument("--tests-tree", help="verification: tree sha of tests/accept/<wp>/ the run checked")
     har = sub.add_parser("harvest")
     har.add_argument("--repo", required=True)
     har.add_argument("--out", required=True)

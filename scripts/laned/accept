@@ -9,6 +9,9 @@
     accept <WP> --expect-fail [--root R]
         tests-only PRs for an unbuilt WP: tests collected and failing for a
         right reason only
+    accept <WP> --verification --base REF --head REF [--root R]
+        the run for MODE tests-only: MODE verification when it applies (rules
+        below), else exactly --expect-fail
     accept <WP> --tests-correction --base REF --head REF [--root R]
         tests-only PRs for a WP already built on BASE (see MODE rules below)
     accept <WP> --check-pr --base REF --head REF [--root R]
@@ -17,7 +20,8 @@
         for a review WP RV<n>: MODE review iff the diff is exactly an add or
         modify of evidence/rv<n>.md (no tests run)
     accept selftest
-        offline check of the review, tests-correction and evidence modes
+        offline check of the review, tests-correction, verification and
+        evidence modes
     accept --gate <STAGE> [--root R]
         evidence/gates/<stage>.json: right stage, every check passed
 
@@ -28,7 +32,31 @@ MODE rules of --check-pr (the PR job runs the named mode next):
                           no implementation of the WP (no L2 commit on BASE's
                           first-parent line: a commit after the one adding
                           PATHS that changes non-test files, all inside PATHS)
-                          -> --expect-fail over the WP's whole test dir
+                          -> --verification (below), which is --expect-fail
+                          over the WP's whole test dir unless the PR is a
+                          verification PR
+    MODE verification     printed by --verification, not by --check-pr: a
+                          tests-only PR for a VERIFICATION WP, one whose row
+                          only asserts properties of code another WP already
+                          built. It applies iff (a) BASE has no L2 commit for
+                          the WP, (b) every non-test entry of the WP's PATHS
+                          already exists on BASE (an exact file; some file
+                          under a dir/ entry; some file matching a glob) and
+                          (c) the full Accept (invariant10, pytest, stub_scan
+                          over PATHS, e2e) passes on the PR's tests over BASE's
+                          code. Then it prints `MODE verification` and passes;
+                          the ledger records mode `verification` with
+                          `tests_tree` (tree sha of tests/accept/<wp>/ at HEAD).
+                          A PATHS entry missing on BASE (or a PATHS file with no
+                          non-test entry) never gives verification; any failing
+                          Accept step falls back to --expect-fail semantics
+                          (at least one right-reason failure), recorded as
+                          mode `expect-fail`, so a normal tests-only PR still
+                          works. On merge the status board treats the merge
+                          commit (the first first-parent commit changing only
+                          tests/accept/<wp>/ whose test dir has that
+                          tests_tree) as both L1 and L2 for the WP; the
+                          push-to-main Accept run then gives L3 as usual.
     MODE tests-correction the diff touches only tests/accept/<wp>/ and BASE
                           already has the WP's implementation (L2 commit found)
                           -> --tests-correction: every test file the PR does
@@ -298,6 +326,48 @@ def cmd_expect_fail(root: Path, wp: str) -> int:
         return fail("expect-fail", "no test fails for a right reason")
     print(f"PASS {wp} expect-fail")
     return 0
+
+
+# ---------------------------------------------------------------------------
+# verification (a tests-only PR whose tests pass on code already built)
+# ---------------------------------------------------------------------------
+
+def cmd_verification(root: Path, wp: str, base: str, head: str) -> int:
+    """The run for MODE tests-only (module docstring, "MODE verification").
+
+    Verification applies only when BASE has no L2 commit for the WP and every
+    non-test PATHS entry already exists on BASE; then the full Accept runs on
+    the working tree (the PR's tests over BASE's code). If it passes this is
+    ``MODE verification``. In every other case (a PATHS file missing on BASE,
+    or any Accept step failing) the run is the classic ``--expect-fail``.
+    The last line before the result names the ledger mode: ``LEDGER-MODE
+    verification`` (with ``TESTS-TREE <sha>`` of tests/accept/<wp>/ at HEAD)
+    or ``LEDGER-MODE expect-fail``."""
+    paths = read_paths(root, wp)
+    if paths is None or not test_dir(root, wp).is_dir():
+        print("LEDGER-MODE expect-fail")
+        return cmd_expect_fail(root, wp)
+    if built_on(root, base, wp):
+        return fail("verification", f"{wp} is already built on {base}; a tests-only PR runs --tests-correction")
+    missing = lanedlib.missing_paths_at(root, base, paths)
+    if missing:
+        print(f"verification: not a verification WP (missing on {base}: {' '.join(missing)}); "
+              "running --expect-fail")
+        print("LEDGER-MODE expect-fail")
+        return cmd_expect_fail(root, wp)
+    print(f"verification: every non-test PATHS entry exists on {base}; running the full Accept")
+    if cmd_accept(root, wp, None) == 0:
+        tree = lanedlib.wp_tree_at(root, head, wp)
+        if tree is None:
+            return fail("verification", f"no tests/accept/{lanedlib.wp_dir(wp)}/ at {head}")
+        print(f"TESTS-TREE {tree}")
+        print("LEDGER-MODE verification")
+        print("MODE verification")
+        print(f"PASS {wp} verification")
+        return 0
+    print("verification: the full Accept failed; falling back to --expect-fail")
+    print("LEDGER-MODE expect-fail")
+    return cmd_expect_fail(root, wp)
 
 
 # ---------------------------------------------------------------------------
@@ -691,11 +761,13 @@ def selftest_tests_correction(ident: tuple[str, ...]) -> list[str]:
                     return
                 with contextlib.redirect_stdout(io.StringIO()) as buf:
                     if want_mode == "tests-only":
-                        rc = cmd_expect_fail(root, "W9")
+                        # the workflow's tests-only run; here it must stay expect-fail
+                        rc = cmd_verification(root, "W9", base, head)
                     else:
                         rc = cmd_tests_correction(root, "W9", base, head)
                 out = buf.getvalue()
-                ok = rc == 0 and (want_mode == "tests-only" or "MODE tests-correction PASS" in out)
+                ok = rc == 0 and (("LEDGER-MODE expect-fail\n" in out and "MODE verification\n" not in out)
+                                  if want_mode == "tests-only" else "MODE tests-correction PASS" in out)
                 if ok != want_ok:
                     failures.append(f"{name}: {want_mode} {'passed' if ok else 'failed'}, "
                                     f"want {'pass' if want_ok else 'fail'}: {out.strip()[-2000:]}")
@@ -739,6 +811,100 @@ def selftest_tests_correction(ident: tuple[str, ...]) -> list[str]:
                  {"tests/accept/w9/test_w9_more.py": "import laned_no_such_dep\n\n\ndef test_x():\n"
                                                      "    assert laned_no_such_dep\n"},
                  "tests-correction", False)
+    finally:
+        if saved is None:
+            os.environ.pop("LANED_PYTEST_CMD", None)
+        else:
+            os.environ["LANED_PYTEST_CMD"] = saved
+    return failures
+
+
+SELFTEST_VERIFY_PASS = "import pkg_w9\n\n\ndef test_built_value():\n    assert pkg_w9.VALUE == 9\n"
+
+
+def selftest_verification(ident: tuple[str, ...]) -> list[str]:
+    """MODE verification of the tests-only run: a repo where another WP already
+    built ``pkg_w9.py`` (VALUE = 9) and a PR adds tests/accept/w9/ only."""
+    failures: list[str] = []
+    saved = os.environ.get("LANED_PYTEST_CMD")
+    os.environ["LANED_PYTEST_CMD"] = shlex.join([sys.executable, "-m", "pytest", "-p", "no:cacheprovider"])
+    try:
+        with tempfile.TemporaryDirectory(prefix="laned-accept-selftest-vf-") as tmp:
+            n = 0
+
+            def case(name: str, base_files: dict[str, str], pr_files: dict[str, str],
+                     want_rc: int, want_verification: bool) -> None:
+                nonlocal n
+                n += 1
+                root = Path(tmp) / f"repo{n}"
+                root.mkdir()
+
+                def put_commit(files: dict[str, str], msg: str) -> str:
+                    for rel, text in files.items():
+                        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+                        (root / rel).write_text(text)
+                    lanedlib.git(root, "add", "-A")
+                    lanedlib.git(root, *ident, "commit", "-q", "-m", msg)
+                    return lanedlib.git(root, "rev-parse", "HEAD").stdout.strip()
+
+                lanedlib.git(root, "init", "-q")
+                base = put_commit({".gitignore": "__pycache__/\n", "pkg_w9.py": "VALUE = 9\n", **base_files},
+                                  "built by another WP")
+                head = put_commit(pr_files, name)
+                with contextlib.redirect_stdout(io.StringIO()) as buf:
+                    rc = cmd_check_pr(root, "W9", base, head)
+                out = buf.getvalue()
+                if rc != 0 or "MODE tests-only\n" not in out:
+                    failures.append(f"verification {name}: check-pr rc={rc}, want MODE tests-only: {out.strip()}")
+                    return
+                with contextlib.redirect_stdout(io.StringIO()) as buf:
+                    rc = cmd_verification(root, "W9", base, head)
+                out = buf.getvalue()
+                got_v = "MODE verification\n" in out and "LEDGER-MODE verification\n" in out
+                if rc != want_rc or got_v != want_verification:
+                    failures.append(f"verification {name}: rc={rc} verification={got_v}, want rc={want_rc} "
+                                    f"verification={want_verification}: {out.strip()[-2000:]}")
+                    return
+                if not want_verification and rc == 0 and "LEDGER-MODE expect-fail\n" not in out:
+                    failures.append(f"verification {name}: fallback not recorded as expect-fail: {out.strip()}")
+                if want_verification:
+                    tree = lanedlib.wp_tree_at(root, head, "W9")
+                    if f"TESTS-TREE {tree}\n" not in out:
+                        failures.append(f"verification {name}: TESTS-TREE {tree} not printed: {out.strip()}")
+
+            paths = {"tests/accept/w9/PATHS": "pkg_w9.py\n"}
+            # every PATHS file exists on BASE and every test passes -> MODE verification
+            case("verify-pass", {}, {**paths, "tests/accept/w9/test_w9.py": SELFTEST_VERIFY_PASS}, 0, True)
+            # one test fails for a right reason -> expect-fail semantics (passes, not verification)
+            case("verify-one-failing", {},
+                 {**paths, "tests/accept/w9/test_w9.py": SELFTEST_VERIFY_PASS,
+                  "tests/accept/w9/test_w9_more.py": SELFTEST_IMPL_FAIL}, 0, False)
+            # a failure for a wrong reason in the fallback -> FAIL
+            case("verify-wrong-reason", {},
+                 {**paths, "tests/accept/w9/test_w9.py": "import laned_no_such_dep\n\n\ndef test_x():\n"
+                                                         "    assert laned_no_such_dep\n"}, 1, False)
+            # a PATHS file missing on BASE -> never verification, even with all
+            # tests passing (expect-fail then fails: nothing fails for a right reason)
+            case("verify-missing-paths-file", {},
+                 {"tests/accept/w9/PATHS": "pkg_w9.py\npkg_w9_new.py\n",
+                  "tests/accept/w9/test_w9.py": SELFTEST_VERIFY_PASS}, 1, False)
+            # a missing dir/ or glob entry counts as missing too
+            case("verify-missing-dir-entry", {},
+                 {"tests/accept/w9/PATHS": "pkg_w9.py\npkg_w9_data/\npkg_w9_*.json\n",
+                  "tests/accept/w9/test_w9.py": SELFTEST_VERIFY_PASS}, 1, False)
+            # present dir/ and glob entries -> verification
+            case("verify-dir-and-glob-present", {"pkg_w9_data/t.json": "{}\n", "pkg_w9_a.json": "{}\n"},
+                 {"tests/accept/w9/PATHS": "pkg_w9.py\npkg_w9_data/\npkg_w9_*.json\n",
+                  "tests/accept/w9/test_w9.py": SELFTEST_VERIFY_PASS}, 0, True)
+            # tests pass but stub_scan over PATHS fails -> not verification, FAIL
+            case("verify-stub-scan", {"pkg_w9.py": "VALUE = 9  # " + "TO" + "DO\n"},
+                 {**paths, "tests/accept/w9/test_w9.py": SELFTEST_VERIFY_PASS}, 1, False)
+            # the classic tests-only flow for a new module (unchanged): right-reason
+            # ModuleNotFoundError -> expect-fail passes
+            case("classic-new-module", {},
+                 {"tests/accept/w9/PATHS": "pkg_w9_new.py\n",
+                  "tests/accept/w9/test_w9.py": "import pkg_w9_new\n\n\ndef test_new():\n"
+                                                "    assert pkg_w9_new.VALUE == 1\n"}, 0, False)
     finally:
         if saved is None:
             os.environ.pop("LANED_PYTEST_CMD", None)
@@ -898,6 +1064,7 @@ def cmd_selftest() -> int:
         case("delete", {"evidence/rv1.md": None}, "RV1", False)
         case("other-file-only", {"docs/notes.md": "n\n"}, "RV3", False)
     failures += selftest_tests_correction(ident)
+    failures += selftest_verification(ident)
     failures += selftest_evidence(ident)
     for f in failures:
         print(f"accept selftest: FAIL {f}", file=sys.stderr)
@@ -918,6 +1085,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--evidence")
     ap.add_argument("--expect-fail", action="store_true",
                     help="MODE tests-only: the whole test dir must fail for a right reason")
+    ap.add_argument("--verification", action="store_true",
+                    help="the MODE tests-only run (needs --base/--head): MODE verification when BASE has "
+                         "no L2 commit, every non-test PATHS entry exists on BASE and the full Accept "
+                         "passes; otherwise --expect-fail")
     ap.add_argument("--tests-correction", action="store_true",
                     help="MODE tests-correction (needs --base/--head): unchanged test files pass, "
                          "changed ones pass or fail for a right reason")
@@ -936,6 +1107,10 @@ def main(argv: list[str] | None = None) -> int:
         if not (args.base and args.head):
             ap.error("--check-pr needs --base and --head")
         return cmd_check_pr(root, args.wp, args.base, args.head)
+    if args.verification:
+        if not (args.base and args.head):
+            ap.error("--verification needs --base and --head")
+        return cmd_verification(root, args.wp, args.base, args.head)
     if args.tests_correction:
         if not (args.base and args.head):
             ap.error("--tests-correction needs --base and --head")

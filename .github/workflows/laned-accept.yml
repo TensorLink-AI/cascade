@@ -4,8 +4,18 @@
 #   (rule 1: tests/accept/ never together with another path; an implementation
 #   PR stays inside the WP's PATHS), then the mode check-pr prints:
 #     MODE implementation   -> full Accept
-#     MODE tests-only       -> --expect-fail over the whole test dir (the WP has
-#                              no implementation (L2 commit) on the base yet)
+#     MODE tests-only       -> --verification (the WP has no implementation (L2
+#                              commit) on the base yet): if every non-test
+#                              PATHS entry already exists on the base and the
+#                              full Accept passes, it prints MODE verification
+#                              (a verification WP, whose row only asserts
+#                              properties of code another WP built) and the
+#                              ledger records mode verification + tests_tree;
+#                              status then counts the merge commit as L1 and
+#                              L2. Otherwise (a PATHS entry missing on the
+#                              base, or any failing step) it is exactly
+#                              --expect-fail over the whole test dir, ledger
+#                              mode expect-fail. Dispatch runs: expect-fail.
 #     MODE tests-correction -> --tests-correction (tests-only PR for a WP already
 #                              built on the base, e.g. a review-driven test fix):
 #                              every test file the PR does not change must PASS
@@ -166,9 +176,23 @@ jobs:
               done
               echo "::endgroup::"; continue
             fi
-            if [ "$mode" = "tests-only" ]; then
+            tree_arg=()
+            if [ "$mode" = "tests-only" ] && [ "$EVENT" = "workflow_dispatch" ]; then
+              # bootstrap dispatch: always the classic expect-fail run
               run_mode=expect-fail
               uv run --frozen python "$LANED/accept" "$wp" --expect-fail --root . && rc=0 || rc=$?
+            elif [ "$mode" = "tests-only" ]; then
+              # --verification: MODE verification when the base has no L2 commit,
+              # every non-test PATHS entry exists on the base and the full Accept
+              # passes; otherwise exactly --expect-fail. It names the ledger mode.
+              vout=$(uv run --frozen python "$LANED/accept" "$wp" --verification --base HEAD^1 --head HEAD \
+                --root . 2>&1) && rc=0 || rc=$?
+              echo "$vout"
+              run_mode=$(echo "$vout" | sed -n 's/^LEDGER-MODE //p' | tail -n 1)
+              [ -n "$run_mode" ] || run_mode=expect-fail
+              if [ "$run_mode" = "verification" ]; then
+                tree_arg=(--tests-tree "$(echo "$vout" | sed -n 's/^TESTS-TREE //p' | tail -n 1)")
+              fi
             elif [ "$mode" = "tests-correction" ]; then
               # tests-only PR for an already-built WP: unchanged tests must pass,
               # changed tests pass or fail for a right reason (accept --help).
@@ -181,7 +205,7 @@ jobs:
             fi
             [ "$rc" = 0 ] && conclusion=success || { conclusion=failure; status=1; }
             python3 "$LANED/ci_ledger.py" record --file "$LANED_RESULTS" --wp "$wp" --mode "$run_mode" \
-              --event "$EVENT" --head-sha "$HEAD_SHA" --conclusion "$conclusion" "${run_head[@]}"
+              --event "$EVENT" --head-sha "$HEAD_SHA" --conclusion "$conclusion" "${run_head[@]}" "${tree_arg[@]}"
             echo "::endgroup::"
           done
           exit $status
