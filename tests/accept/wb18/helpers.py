@@ -72,6 +72,12 @@ HASHSET = "sha256:" + hashlib.sha256(b"wb18 contamination hash set").hexdigest()
 
 ESFT_K = 6
 
+# Wall clock of the TTL scenarios (RV6 B4): the mainnet cadence is 12 h per
+# era (epoch_blocks = 900 at 4 settlements); the funded-entry TTL is the
+# queue's ``entry_ttl_seconds`` (``[round] funded_entry_ttl_hours`` = 36).
+HOUR = 3600.0
+ERA_HOURS = 12.0
+
 # Hotkeys sort A < B < C < E < F.
 HK_A = "5HotkeyAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 HK_B = "5HotkeyBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
@@ -298,6 +304,15 @@ class Scenario:
 
     def restart(self) -> None:
         self.driver = self.new_driver()
+
+    def restart_all(self) -> None:
+        """A whole trainer restart: a new driver AND a new funding-queue
+        object over the same files (nothing in memory survives)."""
+        from cascade.funding.queue import LaneBQueue, lane_b_queue_path
+
+        self.fq = LaneBQueue(lane_b_queue_path(self.tmp / "queue.json"), clock=self.clock)
+        self.ops.fq = self.fq
+        self.restart()
 
     # chain + intake
 
