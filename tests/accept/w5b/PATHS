@@ -1,0 +1,9 @@
+# W5b union across snapshots + freeze at floors + max_source_share cap
+# (plan rev6 §1.3, §3.0 W5b row, T18, T18e; README.md has the contract).
+# The union / freeze / cap functions.
+cascade/validator/lane_d_frozen.py
+# settle_lane_d accumulates, freezes and judges on frozen sets; prior_pool_dirs;
+# until_block closes open entries.
+cascade/validator/lane_d.py
+# the lane_closed typed reason and the per-entry frozen_set record.
+cascade/validator/lane_d_state.py
