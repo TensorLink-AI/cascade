@@ -1,0 +1,7 @@
+# W3b2: the lane D paired gate sweep vs KING_D and the house on one host
+# (plan §1.3b "Rule on the drawn suite" and "Faults", §4 T7b and T17; README.md
+# has the contract). New module: paired_gate (four paired LCBs on the drawn
+# suite, sentinel recorded never gating, checkpoint_fault vs bench_hold,
+# mixed_session refusal) and SweepSession (one paired host sweep per session,
+# rows cached only within the session).
+cascade/validator/lane_d_bench.py
