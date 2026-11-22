@@ -3,10 +3,12 @@ W7a row, §1.5 "(rev3) The report also carries", §14.3 items 1-3, B7, B12).
 
 End to end on the synthetic chain (no torch): W1.5's box-side pipeline on two
 snapshots, the first clear at BOUNDARY_1 and the confirmation that crowns at
-BOUNDARY_2. The pools carry the W5a `feeds` block, a per-series `feed` and
-the B12 `first_seen_roots`, plus one §1.3 trap window. A second run uses the
-W1.5 pool format (none of those keys). On main the tests fail at the import
-of `validate_report` or at an `assert` on a missing field.
+BOUNDARY_2. The pools carry the W5a `feeds` block (every feed listed), a
+per-series `feed` and `frontier` and the B12 `first_seen_roots`, plus one
+§1.3 trap window. A second run uses the W1.5 pool format (none of those
+keys): under W5a's fail-closed rule every window is refused `unlisted_feed`.
+Before that rule lands, the legacy test fails on an `assert` (windows are
+admitted on the two clocks).
 """
 
 from __future__ import annotations
@@ -76,13 +78,31 @@ def test_e2e_settle_reports_validate_and_state_quantile_head(scratch):
 
 
 def test_e2e_legacy_pool_format_report_validates(scratch):
+    """A W1.5-format pool (no `feeds`, `feed`, `frontier` or roots) still gives
+    a valid report. W5a fails closed (RV3): with no `feeds` block every window
+    is refused `unlisted_feed`, so nothing is judged and the entry waits at
+    the floor."""
+    from cascade.validator.lane_d import load_pool
+    from cascade.validator.lane_d_forward import eligible_windows
+
     built = _built(scratch, rich=False)
-    r = built["s1"].report
-    assert r["pool"]["first_seen_roots"] == []
-    assert r["cohorts"] and all(c["first_seen_roots"] == [] for c in r["cohorts"])
-    for w in r["windows"]:
-        assert w["feed"] == w["source"], "a series without `feed` reports through its source"
-        assert w["mirror_lag_hours"] is None, "an unlisted feed's lag is unmeasured (null)"
+    cfg, house, e = built["cfg"], built["chain"]["house"], built["entry"]
+    for snap, s in ((1, built["s1"]), (2, built["s2"])):
+        pool = load_pool(built["chain"]["pools"][snap], int(cfg.horizon))
+        verdicts = list(eligible_windows(pool, t_entry=e["reveal_ts"],
+                                         t_king=house["reveal_ts"], cfg=cfg))
+        assert len(verdicts) == 48
+        reasons = {None if v.reason is None else str(v.reason) for v in verdicts}
+        assert reasons == {"unlisted_feed"}, \
+            f"a window whose feed is not listed must be refused unlisted_feed: {reasons}"
+        r = s.report
+        assert r["pool"]["first_seen_roots"] == []
+        assert r["cohorts"] == [] and r["windows"] == [] and r["rows"] == []
+        assert r["judged"] == [] and r["verdicts"] == []
+        assert r["rows_sha256"] == canonical_rows_sha256([])
+        assert r["skipped"] == [{"digest": e["digest"], "reason": "pending_floor"}]
+        ent = {x["digest"]: x for x in r["entries"]}[e["digest"]]
+        assert (ent["status"], ent["reason"]) == ("pending", "pending_floor")
 
 
 def test_e2e_params_carry_every_satellite_value(scratch):

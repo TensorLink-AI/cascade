@@ -18,6 +18,7 @@ torch) and prove the verifier accepts it and rejects every tampering.
 from __future__ import annotations
 
 import copy
+import inspect
 import json
 import os
 import sys
@@ -27,16 +28,21 @@ import numpy as np
 import pytest
 
 from .helpers import (
+    CPU_PEAK_MEM_SOURCE,
     DECLARED_128K,
     HORIZON,
     LAUNCH_CONTEXTS,
     MAX_BUDGET_WALL_S,
     MIN_MODELS,
+    PATCH,
     PINNED_TORCH,
+    POD_PEAK_MEM_SOURCES,
+    ROW_KEYS,
     S8_HOST,
     T7_SCHEMA,
     TRAINED_CONTEXT,
     WP,
+    ModelInputs,
     evidence_problems,
     pyramid_contract,
     series,
@@ -53,19 +59,61 @@ WALL = {4096: 610.0, 8192: 1490.0, 16384: 4310.0}
 MEM = {4096: 3.1, 8192: 7.4, 16384: 19.8}
 
 
+CUDA_PEAK = POD_PEAK_MEM_SOURCES[0]
+# RV3: the row builder records what actually ran. Fails on an assertion (not a
+# TypeError) where lane_d_t7 predates the RV3 contract.
+RV3_ROW_PARAMS = {"input_len", "history_min", "history_max", "peak_mem_source"}
+
+
 def _t7():
     import cascade.eval.lane_d_t7 as t7
 
     return t7
 
 
+def _rv3(t7):
+    """The RV3 surface of lane_d_t7, asserted before it is called."""
+    have = set(inspect.signature(t7.variant_row).parameters)
+    assert have >= RV3_ROW_PARAMS, (
+        f"variant_row must record what ran (RV3): missing parameters "
+        f"{sorted(RV3_ROW_PARAMS - have)}")
+    err = getattr(t7, "ShortHistoryError", None)
+    assert isinstance(err, type) and issubclass(err, ValueError), (
+        "lane_d_t7.ShortHistoryError (a ValueError) must exist: measure_variant and the "
+        "row builder refuse histories shorter than the variant (RV3)")
+    return t7
+
+
+def _row(t7, *, host=LAUNCH_HOST, gpu=GPU, variant, wall_s, peak_mem_gb, budget,
+         n_windows=2000, **over):
+    kw = {"host": host, "gpu": gpu, "variant": variant, "input_len": variant,
+          "history_min": variant, "history_max": 2 * variant, "wall_s": wall_s,
+          "peak_mem_gb": peak_mem_gb, "peak_mem_source": CUDA_PEAK, "budget": budget,
+          "n_models": MIN_MODELS, "n_windows": n_windows}
+    return _rv3(t7).variant_row(**{**kw, **over})
+
+
 def _rows(t7, wall=None, mem=None, variants=LAUNCH_CONTEXTS, host=LAUNCH_HOST):
     wall = {**WALL, **(wall or {})}
     mem = {**MEM, **(mem or {})}
     budget = t7.settlement_budget(24.0)
-    return [t7.variant_row(host=host, gpu=GPU, variant=v, wall_s=wall[v], peak_mem_gb=mem[v],
-                           budget=budget, n_models=MIN_MODELS, n_windows=2000)
+    return [_row(t7, host=host, variant=v, wall_s=wall[v], peak_mem_gb=mem[v], budget=budget)
             for v in variants]
+
+
+def _fixture() -> dict:
+    """Hand-written pod evidence (verifier-only: no lane_d_t7 involved), with
+    the numbers chosen so every derived field is right."""
+    budget = {"wall_s": MAX_BUDGET_WALL_S, "mem_gb": 24.0}
+    rows = [{"host": LAUNCH_HOST, "gpu": GPU, "variant": v, "input_len": v,
+             "history_min": v, "history_max": v + 4096, "wall_s": WALL[v],
+             "peak_mem_gb": MEM[v], "peak_mem_source": CUDA_PEAK, "budget": dict(budget),
+             "fits": True, "n_models": MIN_MODELS, "n_windows": 2000}
+            for v in LAUNCH_CONTEXTS]
+    return {"schema": T7_SCHEMA, "wp": WP, "source": "pod", "torch": PINNED_TORCH,
+            "tool": dict(TOOL), "measured_at": "2026-11-22T10:00:00+00:00", "rows": rows,
+            "short_window": {**_short(), "identical": True}, "armed": list(LAUNCH_CONTEXTS),
+            "passed": True}
 
 
 def _short(max_abs_diff=0.0):
@@ -135,27 +183,112 @@ def test_builder_row_fits_only_inside_wall_and_memory():
     budget = t7.settlement_budget(24.0)
 
     def row(wall, mem):
-        return t7.variant_row(host=LAUNCH_HOST, gpu=GPU, variant=8192, wall_s=wall,
-                              peak_mem_gb=mem, budget=budget, n_models=MIN_MODELS, n_windows=10)
+        return _row(t7, variant=8192, wall_s=wall, peak_mem_gb=mem, budget=budget, n_windows=10)
 
     r = row(1000.0, 10.0)
     assert r["fits"] is True and r["variant"] == 8192 and r["budget"] == budget
+    assert set(r) == set(ROW_KEYS), sorted(set(r) ^ set(ROW_KEYS))
     assert row(MAX_BUDGET_WALL_S, 24.0)["fits"] is True
     assert row(MAX_BUDGET_WALL_S + 0.5, 10.0)["fits"] is False
     assert row(1000.0, 24.5)["fits"] is False
 
 
 def test_builder_row_refuses_malformed_input():
-    t7 = _t7()
+    t7 = _rv3(_t7())
     budget = t7.settlement_budget(24.0)
-    good = {"host": LAUNCH_HOST, "gpu": GPU, "variant": 4096, "wall_s": 1.0, "peak_mem_gb": 1.0,
-            "budget": budget, "n_models": MIN_MODELS, "n_windows": 1}
-    for bad in ({"variant": 12288}, {"variant": 2048}, {"n_models": MIN_MODELS - 1},
+    good = {"host": LAUNCH_HOST, "gpu": GPU, "variant": 4096, "input_len": 4096,
+            "history_min": 4096, "history_max": 5000, "wall_s": 1.0, "peak_mem_gb": 1.0,
+            "peak_mem_source": CUDA_PEAK, "budget": budget, "n_models": MIN_MODELS,
+            "n_windows": 1}
+    for bad in ({"variant": 12288, "input_len": 12288, "history_min": 12288,
+                 "history_max": 12288},
+                {"variant": 2048, "input_len": 2048, "history_min": 2048},
+                {"n_models": MIN_MODELS - 1},
                 {"n_windows": 0}, {"wall_s": 0.0}, {"peak_mem_gb": float("nan")},
-                {"host": ""}, {"variant": 32768}, {"variant": 8192, "host": S8_HOST}):
+                {"host": ""},
+                {"variant": 32768, "input_len": 32768, "history_min": 32768,
+                 "history_max": 32768},
+                {"variant": 8192, "input_len": 8192, "history_min": 8192, "history_max": 8192,
+                 "host": S8_HOST}):
         with pytest.raises(ValueError):
             t7.variant_row(**{**good, **bad})
-    t7.variant_row(**{**good, "variant": 32768, "host": S8_HOST})
+    t7.variant_row(**{**good, "variant": 32768, "input_len": 32768, "history_min": 32768,
+                      "history_max": 40000, "host": S8_HOST})
+
+
+def test_builder_row_records_the_input_that_ran():
+    """RV3: a row carries the model input length and the history range."""
+    t7 = _t7()
+    budget = t7.settlement_budget(24.0)
+    r = _row(t7, variant=16384, wall_s=4000.0, peak_mem_gb=19.0, budget=budget,
+             history_min=16384, history_max=20000)
+    assert (r["input_len"], r["history_min"], r["history_max"]) == (16384, 16384, 20000), r
+    assert r["peak_mem_source"] == CUDA_PEAK, r
+
+
+@pytest.mark.parametrize("over", [
+    {"input_len": 4096},                       # an 8192 row whose model ran at 4096
+    {"input_len": 8160},                       # one patch short of the variant
+    {"input_len": 16384},                      # longer than the variant: impossible
+    {"history_max": 8000, "history_min": 8192},  # max < min
+])
+def test_builder_row_refuses_an_input_that_is_not_the_variant(over):
+    t7 = _t7()
+    budget = t7.settlement_budget(24.0)
+    with pytest.raises(ValueError):
+        _row(t7, variant=8192, wall_s=1000.0, peak_mem_gb=7.0, budget=budget, **over)
+
+
+@pytest.mark.parametrize("history_min", [64, 4096, 8191])
+def test_builder_row_refuses_short_history_with_a_typed_error(history_min):
+    """RV3: a variant row on windows shorter than the variant is never built
+    (it would silently time a shorter model input)."""
+    t7 = _rv3(_t7())
+    budget = t7.settlement_budget(24.0)
+    with pytest.raises(t7.ShortHistoryError):
+        _row(t7, variant=8192, wall_s=1000.0, peak_mem_gb=7.0, budget=budget,
+             history_min=history_min, history_max=9000)
+
+
+@pytest.mark.parametrize("source", ["", "ru_maxrss", "cuda", None])
+def test_builder_row_refuses_an_unknown_peak_mem_source(source):
+    t7 = _t7()
+    budget = t7.settlement_budget(24.0)
+    with pytest.raises(ValueError):
+        _row(t7, variant=4096, wall_s=600.0, peak_mem_gb=3.0, budget=budget,
+             peak_mem_source=source)
+
+
+def test_builder_pod_evidence_refuses_process_peak_rss():
+    """RV3: CPU process-lifetime ru_maxrss is never a budget input."""
+    t7 = _t7()
+    budget = t7.settlement_budget(24.0)
+    rows = _rows(t7)
+    rows[0] = _row(t7, variant=4096, wall_s=600.0, peak_mem_gb=3.0, budget=budget,
+                   peak_mem_source=CPU_PEAK_MEM_SOURCE)
+    with pytest.raises(ValueError):
+        t7.build_evidence(rows, short_window=_short(), tool=dict(TOOL),
+                          torch_version=PINNED_TORCH, source="pod")
+    ev = t7.build_evidence(rows, short_window=_short(), tool=dict(TOOL),
+                           torch_version=PINNED_TORCH, source="ci")
+    assert ev["rows"][0]["peak_mem_source"] == CPU_PEAK_MEM_SOURCE
+    problems = evidence_problems(ev, check_git=False)
+    assert any(p.startswith("rows[0].peak_mem_source") for p in problems), problems
+
+
+@pytest.mark.parametrize("edit", [
+    {"input_len": 4096},
+    {"history_min": 4096},
+    {"peak_mem_source": CPU_PEAK_MEM_SOURCE},
+])
+def test_builder_refuses_a_hand_edited_row(edit):
+    """build_evidence re-checks rows it is handed, not only variant_row's output."""
+    t7 = _t7()
+    rows = _rows(t7)
+    rows[1] = {**rows[1], **edit}
+    with pytest.raises(ValueError):
+        t7.build_evidence(rows, short_window=_short(), tool=dict(TOOL),
+                          torch_version=PINNED_TORCH, source="pod")
 
 
 def test_verifier_accepts_builder_evidence():
@@ -199,8 +332,8 @@ def test_builder_fails_without_every_launch_variant_or_when_4096_does_not_fit():
 def test_builder_with_s8_rows():
     t7 = _t7()
     budget = t7.settlement_budget(96.0)
-    s8 = [t7.variant_row(host=S8_HOST, gpu="NVIDIA RTX PRO 6000", variant=v, wall_s=w,
-                         peak_mem_gb=m, budget=budget, n_models=MIN_MODELS, n_windows=300)
+    s8 = [_row(t7, host=S8_HOST, gpu="NVIDIA RTX PRO 6000", variant=v, wall_s=w,
+               peak_mem_gb=m, budget=budget, n_windows=300)
           for v, w, m in ((32768, 3100.0, 41.0), (65536, 5300.0, 77.0), (131072, 9800.0, 140.0))]
     ev = _good(rows=_rows(t7) + s8)
     assert ev["armed"] == [4096, 8192, 16384, 32768, 65536]
@@ -210,10 +343,56 @@ def test_builder_with_s8_rows():
 # ── the verifier rejects tampering ───────────────────────────────────────────
 
 
-def _tampered(edit) -> list[str]:
-    ev = copy.deepcopy(_good())
+def _tampered(edit, base="builder") -> list[str]:
+    ev = copy.deepcopy(_fixture() if base == "fixture" else _good())
     edit(ev)
     return evidence_problems(ev, check_git=False)
+
+
+def test_verifier_accepts_the_fixture_evidence():
+    assert evidence_problems(_fixture(), check_git=False) == []
+
+
+def _drop(key, i=1):
+    return lambda e: e["rows"][i].pop(key)
+
+
+def _set(key, value, i=1):
+    return lambda e: e["rows"][i].__setitem__(key, value)
+
+
+# RV3: a variant row must have exercised its variant, and its memory must be
+# the variant's own CUDA peak. rows[1] is the 8192 row.
+RV3_EDITS = [
+    (_drop("input_len"), "rows[1]: missing"),
+    (_drop("history_min"), "rows[1]: missing"),
+    (_drop("history_max"), "rows[1]: missing"),
+    (_drop("peak_mem_source"), "rows[1]: missing"),
+    (_set("input_len", 4096), "rows[1].input_len"),        # ran as a 4k model
+    (_set("input_len", 8160), "rows[1].input_len"),
+    (_set("input_len", 8192.0), "rows[1].input_len"),
+    (_set("input_len", None), "rows[1].input_len"),
+    (_set("history_min", 6000), "rows[1].history_min"),     # windows shorter than 8192
+    (_set("history_min", 8191), "rows[1].history_min"),
+    (_set("history_min", "8192"), "rows[1].history_min"),
+    (_set("history_max", 8191), "rows[1].history_max"),     # below history_min
+    (_set("peak_mem_source", CPU_PEAK_MEM_SOURCE), "rows[1].peak_mem_source"),
+    (_set("peak_mem_source", "ru_maxrss"), "rows[1].peak_mem_source"),
+    (_set("peak_mem_source", None), "rows[1].peak_mem_source"),
+]
+
+
+@pytest.mark.parametrize("edit, prefix", RV3_EDITS)
+def test_verifier_rejects_a_row_that_did_not_exercise_its_variant(edit, prefix):
+    """Verifier-only (the hand-written fixture; no lane_d_t7)."""
+    problems = _tampered(edit, base="fixture")
+    assert any(p.startswith(prefix) for p in problems), problems
+
+
+@pytest.mark.parametrize("edit, prefix", RV3_EDITS)
+def test_verifier_rejects_builder_evidence_that_did_not_exercise_its_variant(edit, prefix):
+    problems = _tampered(edit)
+    assert any(p.startswith(prefix) for p in problems), problems
 
 
 @pytest.mark.parametrize("edit, prefix", [
@@ -237,8 +416,9 @@ def _tampered(edit) -> list[str]:
     (lambda e: e["short_window"].__setitem__("declared_context", 16384), "short_window"),
     (lambda e: e.__setitem__("passed", False), "passed"),
 ])
-def test_verifier_rejects_a_hand_edit(edit, prefix):
-    problems = _tampered(edit)
+@pytest.mark.parametrize("base", ["fixture", "builder"])
+def test_verifier_rejects_a_hand_edit(edit, prefix, base):
+    problems = _tampered(edit, base=base)
     assert any(p.startswith(prefix) for p in problems), problems
 
 
@@ -267,6 +447,26 @@ def test_verifier_rejects_an_unknown_tool_sha():
 # ── measurement helpers ──────────────────────────────────────────────────────
 
 
+@pytest.mark.parametrize("context, lengths", [
+    (8192, (8192, 9000, 4096)),        # one window would silently run at 4096
+    (16384, (16383, 20000)),
+    (4096, (64,)),
+    (32768, (32767,)),
+])
+def test_measure_variant_refuses_short_history_before_loading(monkeypatch, tmp_path,
+                                                              context, lengths):
+    """RV3: never time a variant on windows the no-pad scorer would truncate
+    below it. The refusal is typed and comes before torch or the checkpoint."""
+    t7 = _rv3(_t7())
+    monkeypatch.setitem(sys.modules, "torch", None)
+    host = S8_HOST if context > 16384 else LAUNCH_HOST
+    with pytest.raises(t7.ShortHistoryError):
+        t7.measure_variant(tmp_path / "absent", [series(n, seed=n) for n in lengths],
+                           context=context, horizon=HORIZON, host=host, gpu=GPU,
+                           n_models=MIN_MODELS, budget=t7.settlement_budget(24.0),
+                           device="cuda:0")
+
+
 def test_short_window_check_refuses_history_over_4096_before_loading(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "torch", None)
     t7 = _t7()
@@ -279,19 +479,33 @@ def test_short_window_check_refuses_history_over_4096_before_loading(monkeypatch
 def test_measure_variant_and_short_window_check_on_a_tiny_model(tmp_path):
     import torch
 
-    t7 = _t7()
+    t7 = _rv3(_t7())
     threads = torch.get_num_threads()
     torch.set_num_threads(2)
     try:
         ckpt = tiny_checkpoint(tmp_path / "entry", pyramid_contract(), seed=11,
                                median_shift=0.0, bf16=True)
-        hists = [series(n, seed=n) for n in (64, 900, 4096, 6000)]
+        # RV3: every window reaches the variant, so the model really runs at 8192.
+        hists = [series(n, seed=n) for n in (8192, 8200, 9000, 12000)]
         budget = t7.settlement_budget(24.0)
-        row = t7.measure_variant(ckpt, hists, context=8192, horizon=HORIZON, host=LAUNCH_HOST,
-                                 gpu="cpu", n_models=MIN_MODELS, budget=budget, device="cpu")
-        sw = t7.short_window_check(ckpt, hists[:3], horizon=HORIZON)
+        with ModelInputs() as seen:
+            row = t7.measure_variant(ckpt, hists, context=8192, horizon=HORIZON,
+                                     host=LAUNCH_HOST, gpu="cpu", n_models=MIN_MODELS,
+                                     budget=budget, device="cpu")
+        short = [series(n, seed=n) for n in (64, 900, 4096)]
+        sw = t7.short_window_check(ckpt, short, horizon=HORIZON)
     finally:
         torch.set_num_threads(threads)
+    extra = (HORIZON + PATCH - 1) // PATCH
+    assert seen.shapes and all(s[2] == 8192 // PATCH + extra for s in seen.shapes), seen.shapes
+    assert sum(s[0] for s in seen.shapes) == len(hists), seen.shapes
+    assert row["input_len"] == 8192, row
+    assert (row["history_min"], row["history_max"]) == (8192, 12000), row
+    # CPU: ru_maxrss is the process-lifetime peak, labelled and never a budget input.
+    assert row["peak_mem_source"] == CPU_PEAK_MEM_SOURCE, row
+    with pytest.raises(ValueError):
+        t7.build_evidence([row], short_window=sw, tool=dict(TOOL),
+                          torch_version=PINNED_TORCH, source="pod")
     assert row["variant"] == 8192 and row["n_windows"] == len(hists)
     assert row["n_models"] == MIN_MODELS and row["budget"] == budget
     assert np.isfinite(row["wall_s"]) and row["wall_s"] > 0

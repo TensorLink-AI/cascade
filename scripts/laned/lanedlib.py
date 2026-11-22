@@ -273,3 +273,54 @@ def impl_commit_index(history: list[tuple[str, list[str]]], wp: str, paths: list
         if all(path_matches(f, paths) for f in files):
             return i
     return None
+
+
+# ---------------------------------------------------------------------------
+# Verification WPs (a tests-only PR whose tests pass on code another WP built)
+# ---------------------------------------------------------------------------
+
+def is_test_path(rel: str) -> bool:
+    return rel.split("/", 1)[0] == "tests"
+
+
+def missing_paths_at(root: Path, ref: str, paths: list[str]) -> list[str]:
+    """The non-test PATHS entries with no file at ``ref`` (an exact entry: that
+    file; a ``dir/`` entry: some file under it; a glob: some matching file).
+    A PATHS file with no non-test entry at all has nothing to verify, so it is
+    reported as missing too. Empty list: every non-test entry exists at ``ref``."""
+    entries = [e for e in paths if not is_test_path(e)]
+    if not entries:
+        return ["(no non-test PATHS entry)"]
+    proc = git(root, "ls-tree", "-r", "--name-only", f"{ref}^{{commit}}", check=False)
+    if proc.returncode != 0:
+        return list(entries)
+    files = [f for f in proc.stdout.split("\n") if f]
+    return [e for e in entries if not any(path_matches(f, [e]) for f in files)]
+
+
+def wp_tree_at(root: Path, ref: str, wp: str) -> str | None:
+    """Tree sha of ``tests/accept/<wp>/`` at ``ref``: what a verification run
+    records, so the board can find the merge commit after a squash merge."""
+    proc = git(root, "rev-parse", "-q", "--verify", f"{ref}:tests/accept/{wp_dir(wp)}", check=False)
+    return proc.stdout.strip() if proc.returncode == 0 else None
+
+
+def verification_commit_index(root: Path, history: list[tuple[str, list[str]]], wp: str,
+                              trees: set[str], shas: set[str]) -> int | None:
+    """The L2 commit of a verification WP: the first commit on the first-parent
+    line, at or after the one that added the WP's PATHS, that changes only files
+    under tests/accept/<wp>/ and whose test dir is the one a green
+    ``verification`` run checked (its ``tests_tree``), or whose sha is that
+    run's ``head_sha``. None when absent."""
+    own = f"tests/accept/{wp_dir(wp)}/"
+    rel = own + "PATHS"
+    start = next((i for i, (_, files) in enumerate(history) if rel in files), None)
+    if start is None or not (trees or shas):
+        return None
+    for i in range(start, len(history)):
+        sha, files = history[i]
+        if not files or not all(f.startswith(own) for f in files):
+            continue
+        if sha in shas or (trees and wp_tree_at(root, sha, wp) in trees):
+            return i
+    return None

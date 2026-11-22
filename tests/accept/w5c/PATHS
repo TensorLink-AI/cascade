@@ -1,0 +1,7 @@
+# W5c cohort intersection + latest-T deferral + Proposed change 3 (house bar)
+# (plan rev6 §1.3 Cohorts, §3.0 W5c row, T9; README.md has the contract).
+# settle_lane_d: cohort formation, intersection for max-T, deferral, and the
+# house comparison on the cohort's set.
+cascade/validator/lane_d.py
+# frozen-set helpers, if the cohort set needs them.
+cascade/validator/lane_d_frozen.py
