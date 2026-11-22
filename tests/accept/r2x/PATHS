@@ -1,0 +1,7 @@
+# R2x S0b live run: the owner's read-only mainnet note collector (plan §3.0
+# R2x, §5 row 3 S0b, §17.1 L4). R2x is an owner WP: its Accept is the
+# evidence verifier in this directory, run with
+# `scripts/laned/accept R2x --evidence evidence/s0b_notes.json`.
+# cascade/laned/__init__.py already exists on main (shared with R1, R2, R3,
+# R4, R6, R10, R11); the builder keeps it and every other WP's file intact.
+cascade/laned/s0b_collect.py
