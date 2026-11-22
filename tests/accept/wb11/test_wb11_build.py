@@ -26,6 +26,7 @@ from .helpers import (
     expected_exact,
     expected_identities,
     fixture_suites,
+    informative_count,
     match,
     mod,
     nonconstant_count,
@@ -110,9 +111,10 @@ def test_exact_set_skips_nan_and_short_series_and_ties_break_to_the_smallest_win
     assert sorted(gappy) == list(range(NAN_AT + 1, 48 - WINDOW + 1)), gappy
     # fev/copy/0 duplicates boom's windows: the smallest (suite, item, offset) wins
     assert not any(i.startswith("fev/copy/0@") for i in ids)
-    # the flat series' 9 identical windows collapse to offset 0
+    # RV6 B5: the flat series' windows are constant (low-information), so it
+    # has no exact hash at all (schema 2 as first built kept one, at offset 0)
     flat = [i for i in ids if i.startswith("time/flat/")]
-    assert flat == ["time/flat/0@0"], flat
+    assert flat == [], f"a constant window is in the exact set: {flat}"
 
 
 def test_normalised_set_shape():
@@ -131,15 +133,20 @@ def test_normalised_set_shape():
 
 
 def test_every_suite_window_is_in_both_sets():
-    """The suite's own series hit on every sub-window, exact and normalised."""
+    """The suite's own series hit on every informative sub-window, exact and
+    normalised. RV6 B5: the constant series is low-information, so it is in
+    neither set and hits nothing (it used to hit exactly)."""
     a = build()
     for suite, spec in fixture_suites().items():
         for item, values in spec["series"].items():
             r = match(a, values)
-            assert r["exact_hits"] == window_count(values), (suite, item, r)
-            assert r["normalised_hits"] == nonconstant_count(values), (suite, item, r)
+            assert r["exact_hits"] == informative_count(values), (suite, item, r)
+            assert r["normalised_hits"] == informative_count(values), (suite, item, r)
             if item == "time/flat/0":
-                assert r["normalised_hits"] == 0 and r["exact_hits"] == 40 - WINDOW + 1
+                assert r["normalised_hits"] == 0 and r["exact_hits"] == 0, r
+            else:
+                assert informative_count(values) == window_count(values), (
+                    f"fixture precondition: {item} has a low-information window")
 
 
 def test_artefact_bytes_are_canonical_json_and_sha256_pins_them():

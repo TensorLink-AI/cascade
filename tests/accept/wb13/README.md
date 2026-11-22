@@ -16,6 +16,26 @@ TB10–TB12 (§4), verbatim:
 > | TB11 | **(rev4)** Same window scaled ×3.7, offset +100 and rounded to 3 dp, in `config.json` | Refused (normalised match) |
 > | TB12 | **(rev4)** A clean generator; and a hash-set version change | Passes; the receipt records the hash-set version used |
 
+## Tests correction (RV6 B6, B7)
+
+RV6 found two gaps in WB13 as built: one crafted file could stall the live
+intake for hours (B6), and trivial packaging of an exact benchmark copy
+evaded the scan (B7). `test_wb13_rv6.py` is new, and section "RV6" below
+is its contract. Its tests fail on main with an `AssertionError`, pending an
+implementation PR. A killed child process counts as a failure, never a hung
+test. Three cases already pass on main and guard behaviour that must stay:
+`test_npz_inflation_is_capped`, `test_float64_at_any_byte_offset[1]` (main
+catches it by accident, through the int64 decoding) and
+`test_benign_text_and_binary_stay_clean`.
+
+The flat `[3] * 40` series is low-information under WB11's RV6 B5 rule
+(tests/accept/wb11/README.md "Low-information windows"), so it stops being
+evidence. `test_int_bytes`, `test_scan_is_deterministic` and
+`test_fixture_windows_are_in_the_hash_set` now pin the int decodings on a
+new informative integer series, `time/counts/5`, with the same assertions.
+They pass on main and after WB11's B5 implementation. Every other existing
+assertion is unchanged.
+
 ## How the tests fail on main
 
 Every failure on main is one of these, inside a test body:
@@ -173,7 +193,7 @@ reply and the queue file never contain `contamination`.
 
 So no suite-target entry can exist unpinned. A domain entry is unchecked
 (the unarmed invariant), and nothing is recorded. **`result` is only ever
-`clean` or `embedded`.** There is no "skipped" value. Pinned means checked or
+`clean`, `embedded` or (RV6 B6) `budget_exceeded`.** There is no "skipped" value. Pinned means checked or
 refused (fail closed, above). Unpinned records nothing, so that TB22's
 byte-identity holds.
 
@@ -213,6 +233,103 @@ fixed-point z rounding or a tolerant match. That is out of WB13's PATHS and is
 reported for the plan owner. Guard 4 and the anchor guard remain the
 backstop (§12b.1, §9).
 
+## RV6: scan budget (B6) and packaging evasions (B7)
+
+### Scan budget (`test_wb13_rv6.py`, B6)
+
+**Cost, measured on main.** WB11's tolerant lookup tries up to 2 × 2¹²
+probes for a window whose z-scores all sit within `TOLERANCE` of a bin edge.
+
+- **The crafted window.** `helpers.EDGE_BLOCK` has 32 values with mean 0 and
+  std 1, and every z is a bin edge. Repeating it with period 32 makes every
+  sliding window crafted.
+- **Per window:** ~21 ms crafted against ~0.19 ms random, measured on
+  small inputs (64 and 2 000 windows).
+- **Extrapolated:** 1 MiB of crafted f64 is ~131k windows, ~2 700 s of CPU.
+  The 8 MiB D38 cap is ~6 h. All of it ran in the `ThreadingHTTPServer`
+  handler thread.
+
+The tests never build large files. They take 1 024 crafted windows (~21 s
+on main), run them in a niced child process and kill it on overrun.
+
+**Pinned (scanner):**
+
+- `scan_repo(repo_dir, artefact, *, min_hits=None, max_windows=None, deadline_s=None)`.
+- `RESULT_BUDGET_EXCEEDED = "budget_exceeded"`. Its receipt is
+  `{hashset_version, "result": "budget_exceeded", "suite": null, "window_id": null}`.
+- **`max_windows`** is the most sub-windows matched in one scan, counted over
+  every sequence and decoding. Going past it gives `budget_exceeded`. `None`
+  means the module constant `MAX_SCAN_WINDOWS` (an int ≥ 1), **read when the
+  scan runs**, so the tests can monkeypatch it.
+- **`deadline_s`** is the seconds a scan may run. Going past it gives
+  `budget_exceeded`. `None` means `SCAN_DEADLINE_S`, which is > 0 and ≤ 30,
+  also read at scan time. On the crafted file with `deadline_s = 0.5`, the
+  scan returns within 3.5 s (wall clock, in the child). That needs a check
+  at least every few windows, not every 65 536-value chunk.
+- If the scan finishes in time (for example a cache of repeated windows),
+  `clean` is the correct answer and also passes. The tests pin the time
+  bound and the result's correctness, not a slow path.
+
+**Pinned (intake):**
+
+- **`budget_exceeded` fails closed** as `413 {"code":
+  "contamination_budget_exceeded", "message": …, "contamination": <receipt>}`.
+- **Uncharged:** nothing is queued, no key is vaulted and no lane A
+  submission is consumed, as with every refusal before the queue.
+- **Why 413, not 503.** The window budget is a property of the tree, so a
+  retry can't succeed. The miner has to ship less bulk data, and DEC-CA-0028
+  says there is "no longer any excuse for numbers in `config.json`". A deadline
+  overrun gets the same code, so a miner can't probe load.
+- **Bounded handler time.** With `SCAN_DEADLINE_S = 1`, `lane_b_fund` on the
+  crafted tree returns within 5 s: either that 413, or a correct 202 clean.
+  The scan may run off the request thread or under a deadline. Only the
+  return time is pinned.
+- **Result cache.** Funding the same ref twice under the same pin calls
+  `contamination_scan.scan_repo` once, and both replies carry the same receipt
+  (clean: 202, then 200 `already-queued`; embedded: 400 twice). The cache key
+  must be content-addressed: the ref (vault and Hub refs are content-pinned)
+  plus the hash-set pin, per `FundingIntake`, or the tree's content hash. A
+  cache shared across intakes by ref alone would leak between tests and
+  hosts. Whether a `budget_exceeded` result is cached isn't pinned. Caching
+  it is recommended, because repeat funds then cost nothing.
+
+### Packaging evasions (`test_wb13_rv6.py`, B7)
+
+Each of these exact or float32 copies is a one-line change for the miner, and
+each must now be `embedded` with the TB10 receipt (gift,
+`gift/electricity/7@20`, or the WB11 first hit for float32):
+
+| form | how the scan reads it |
+|---|---|
+| a `.py` **str** constant of numbers, comma- or space-separated | numeric tokens of the string |
+| a `.py` **bytes** constant: number text, or raw f64 bytes (`np.frombuffer`) | as text, and as binary like a data file |
+| an **`.npz`**, `np.savez` (stored) or `np.savez_compressed` (deflated), `<f8` or `>f8` members | zip members inflated, `.npy` headers parsed (descr, shape), data decoded |
+| raw f64 at **byte offset 1–7** of a blob | every alignment |
+| **big-endian** f64, and big-endian f32 of `gift/m4_hourly/0` | both endiannesses |
+| a **one-line** CSV or whitespace row (`,` ` ` tab `;` `, `), after a text label | split on any delimiter; a non-numeric token breaks the run |
+
+**Safety, pinned.**
+
+- **No unpickling.** An object-dtype (`|O`) member whose pickle would write a
+  marker file is never unpickled. The scan still finds the f64 member in the
+  same `.npz`. Parsing never executes.
+- **Inflation cap.** An `.npz` member that inflates to 64 MiB of zeros
+  (< 1 MiB on disk) returns `clean` or `budget_exceeded`, with the scanning
+  process at ≤ 512 MiB peak RSS, within the default deadline. Size and ratio
+  caps on inflation are the builder's choice.
+- **No new false positives.** The new decodings add none on a README with
+  numbers, a small CSV of unrelated values, or 1 KiB of random bytes.
+
+**Residual limits.** Record these in the decision register with WB11's.
+Guard 4 is the backstop for them, as for procedural regeneration:
+
+- delta encoding;
+- interleaving with zeros or another series;
+- base64 or hex text;
+- an outlier every 31 points;
+- noise above ~0.03 σ;
+- container formats other than zip/`.npy`.
+
 ## Not pinned
 
 - The order of steps 2 to 4 among themselves.
@@ -221,8 +338,9 @@ backstop (§12b.1, §9).
   deterministic).
 - Whether hits add up across files or sequences. Every test has one
   embedding with a clear margin.
-- Scalar values spread over `config.json` keys, numbers inside string
-  constants, big-endian and unaligned decodings, and other integer widths.
+- Scalar values spread over `config.json` keys and other integer widths.
+  (Numbers inside str / bytes constants and big-endian and unaligned
+  decodings are pinned since RV6; see "RV6" below.)
 - Exclusions such as `__pycache__/` and `.git/`, and symlink handling. The
   scan must not read outside the tree it is given.
 - Propagating the field from the queue entry into the trainer's leg record
@@ -238,4 +356,5 @@ backstop (§12b.1, §9).
 | `helpers.py` | the suite fixture, the WB11 artefact, the config through `parse_lane_b`, fixture repos as plain files, the real intake builder, the recording fetch, the torch guard, the hash-seed entry point |
 | `test_wb13_plan.py` | the WB13 / TB10–TB12 / LB1 / D38 plan text verbatim, the shipped 8 MB cap, fixture sanity against WB11 (passes on main) |
 | `test_wb13_scan.py` | `scan_repo`: the three sources, TB10, TB11, TB12 versions, the hit rule, never executing, determinism; `load_pinned_hashset` |
+| `test_wb13_rv6.py` | RV6 B6 scan budget (`max_windows`, `deadline_s`, `budget_exceeded`, 413, bounded handler time, result cache) and B7 packaging evasions (str/bytes literals, `.npz`, offsets, big-endian, one-line rows; never unpickled; inflation cap) |
 | `test_wb13_intake.py` | `main.py` wiring, the invariant pair, TB10 and TB11 refused at intake, TB12 version change, fail closed, the identity gate before the fetch, D38 |

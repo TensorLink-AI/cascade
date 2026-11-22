@@ -60,6 +60,27 @@ def _index(rows: Iterable[Mapping]) -> tuple[dict[str, Mapping], set[str]]:
     return by_id, dup
 
 
+def sentinel_pairing_kw(
+    king: Mapping[str, Mapping] | None,
+    chal: Mapping[str, Mapping] | None,
+    require: Iterable[str],
+    sentinel: str | None,
+) -> dict:
+    """The ``require`` / ``benchmarks`` keywords of :func:`pair_public_rows`
+    for an era whose LANE_D_PLAN §16 sentinel is ``sentinel`` (D35: it is not
+    a lane B guard that era). ``None`` (unarmed) gives ``{"require":
+    require}`` — the call is then byte-identical to the unarmed one. Armed,
+    the sentinel suite builds no ``<suite>_*`` key and is not required; every
+    other suite pairs exactly as unarmed (each key is bootstrapped on its own
+    seed, so their LCBs keep their bytes)."""
+    require = tuple(require)
+    if sentinel is None:
+        return {"require": require}
+    s = str(sentinel)
+    names = (set(king or {}) | set(chal or {})) - {s}
+    return {"require": tuple(b for b in require if b != s), "benchmarks": sorted(names)}
+
+
 def pair_public_rows(
     king: Mapping[str, Mapping] | None,
     chal: Mapping[str, Mapping] | None,

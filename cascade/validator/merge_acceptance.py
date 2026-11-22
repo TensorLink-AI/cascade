@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, replace
 
 from ..eval.expert_lane import full_pay, judge_expert_targets
-from ..eval.public_guards import MissingPublicGuard, pair_public_rows
+from ..eval.public_guards import MissingPublicGuard, pair_public_rows, sentinel_pairing_kw
 from .expert_lane import _arrays, window_horizon
 
 
@@ -35,13 +35,15 @@ def acceptance_block(cfg, manifest, runner=None):
 
 
 def judge_acceptance(qualified, *, anchor_scores, before_scores, candidate_scores,
-                     public_rows, cfg, seed):
+                     public_rows, cfg, seed, sentinel=None):
     """Return accepted target wins plus diagnostic evidence.
 
     Gain is marginal against the accepted checkpoint so far. Every domain,
     horizon and public guard is also checked against the ORIGINAL init, so
     small regressions cannot accumulate. Only previously qualified targets
     may earn; the original declaration retains its alpha/k correction.
+    ``sentinel`` (W-S2, D35) is the era's §16 suite: not a public guard nor
+    a required one; ``None`` (unarmed) is the unchanged judgement.
     """
     if not qualified:
         return [], {"reason": "no qualified targets"}
@@ -59,7 +61,10 @@ def judge_acceptance(qualified, *, anchor_scores, before_scores, candidate_score
         raise ValueError("acceptance domain/cluster labels differ")
     try:
         pubs = [pair_public_rows(public_rows.get(key), public_rows.get("candidate"),
-                                 require=cfg.require_public, min_items=cfg.min_public_items).public
+                                 min_items=cfg.min_public_items,
+                                 **sentinel_pairing_kw(public_rows.get(key),
+                                                       public_rows.get("candidate"),
+                                                       cfg.require_public, sentinel)).public
                 if public_rows or cfg.require_public else None for key in ("before", "anchor")]
     except MissingPublicGuard as e:
         return [], {"reason": f"public guard missing: {e}"}

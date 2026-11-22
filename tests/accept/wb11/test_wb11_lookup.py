@@ -85,7 +85,10 @@ def test_offset_copy_and_int_inputs():
     assert r["exact_hits"] == 0 and r["normalised_hits"] >= NORMALISED_FLOOR * 9, r
     flat = [3] * 40                                    # ints equal to the flat suite values
     r = match(a, flat)
-    assert r["exact_hits"] == 9 and r["normalised_hits"] == 0, r
+    # RV6 B5: a constant window is low-information, never contamination
+    # evidence (it used to give 9 exact hits).
+    assert r["exact_hits"] == 0 and r["normalised_hits"] == 0, r
+    assert mod().is_contaminated(a, flat) is False, r
 
 
 def test_constant_submission_never_hits_normalised():
