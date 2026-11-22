@@ -32,8 +32,13 @@ MARGIN_H = 6.0                   # forward_margin_hours (recommended)
 LAG_H = 6.0                      # max_mirror_lag_hours (recommended)
 
 # The precedence order of the typed refusal reasons (README "Reasons").
-REASONS = ("missing_clock", "forecast_product", "over_lag", "before_margin",
-           "publish_ahead", "late_mirror", "absent_from_s0", "backfill")
+# RV3 BLOCKING 1: forward-only fails closed. A feed missing from the pool's
+# `feeds` block (or a pool with no `feeds`) is `unlisted_feed`, checked right
+# after the clocks are recorded (without the entry neither forecast_product
+# nor the lag can be judged). A series whose `frontier` is absent or null has
+# no evidence of being in S0: `absent_from_s0`, at rule 6's place.
+REASONS = ("missing_clock", "unlisted_feed", "forecast_product", "over_lag",
+           "before_margin", "publish_ahead", "late_mirror", "absent_from_s0", "backfill")
 
 SCORING_LEVELS = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
 _Z = tuple(NormalDist().inv_cdf(level) for level in SCORING_LEVELS)
@@ -70,7 +75,9 @@ def spec(series_id: str, source: str, target_ts, first_seen_ts, *, frontier=_ABS
     rec["first_target_ts"] = rec["target_ts"][0] if rec["target_ts"] else None
     rec["end_ts"] = (rec["target_ts"][-1] if rec["target_ts"] else None) \
         if end_ts is _ABSENT else end_ts
-    if frontier is not _ABSENT:
+    if frontier is None:              # an explicit JSON null
+        rec["frontier"] = None
+    elif frontier is not _ABSENT:
         rec["frontier"] = [[int(a), int(e)] for a, e in frontier]
     if feed is not None:
         rec["feed"] = feed
@@ -95,8 +102,13 @@ def case(kind: str, bound: int, series_id: str, source: str) -> dict:
     seen = [t + 1800 for t in ts]
     if kind == "eligible":
         return spec(series_id, source, ts, seen, frontier=ok_frontier(bound))
-    if kind == "legacy":            # no frontier key: judged on the two clocks
+    if kind == "no_frontier":       # no frontier key: no evidence of S0 (RV3)
         return spec(series_id, source, ts, seen)
+    if kind == "null_frontier":     # "frontier": null, the same as absent (RV3)
+        return spec(series_id, source, ts, seen, frontier=None)
+    if kind == "unlisted_feed":     # its feed has no entry in `feeds` (RV3)
+        return spec(series_id, source, ts, seen, frontier=ok_frontier(bound),
+                    feed="unlisted")
     if kind == "before_margin":     # both clocks before the bound
         old = hourly(bound - 70 * HOUR)
         return spec(series_id, source, old, [t + 1800 for t in old],
@@ -122,14 +134,16 @@ def case(kind: str, bound: int, series_id: str, source: str) -> dict:
 
 
 TRAP_KINDS = ("before_margin", "late_mirror", "publish_ahead", "over_lag",
-              "forecast_product", "backfill", "absent_from_s0")
+              "forecast_product", "backfill", "absent_from_s0", "unlisted_feed")
+# Series that fail closed on missing S0 evidence (RV3): refused `absent_from_s0`.
+FAIL_CLOSED_KINDS = ("no_frontier", "null_frontier")
 # The traps today's two-clock `forward_eligible` (W1.5) already refuses.
 CLOCK_TRAPS = ("before_margin", "late_mirror", "publish_ahead")
 
 
 def feeds_block(sources) -> dict:
     """Measured lags: every source within the limit, `laggy` over it,
-    `forecasts` a forecast product."""
+    `forecasts` a forecast product. `unlisted` is never listed."""
     out = {s: {"mirror_lag_hours": 1.0, "forecast_product": False} for s in sources}
     out["laggy"] = {"mirror_lag_hours": LAG_H + 1.0, "forecast_product": False}
     out["forecasts"] = {"mirror_lag_hours": 1.0, "forecast_product": True}
@@ -186,7 +200,10 @@ def oracle_reason(rec: dict, feeds: dict | None, bound: float, cfg) -> str | Non
     if (len(ts) != HORIZON or len(seen) != HORIZON or rec.get("end_ts") is None
             or int(rec["end_ts"]) != ts[-1]):
         return "missing_clock"
-    feed = (feeds or {}).get(rec.get("feed") or rec["source"], {})
+    name = rec.get("feed") or rec["source"]
+    if name not in (feeds or {}):       # unlisted feed, or no feeds block (RV3)
+        return "unlisted_feed"
+    feed = feeds[name]
     if feed.get("forecast_product"):
         return "forecast_product"
     lag = feed.get("mirror_lag_hours")
@@ -199,12 +216,13 @@ def oracle_reason(rec: dict, feeds: dict | None, bound: float, cfg) -> str | Non
         return "publish_ahead"
     if not data_ok:
         return "late_mirror"
-    if "frontier" in rec:
-        after = [e for a, e in sorted(rec["frontier"]) if a > bound]
-        if not after:
-            return "absent_from_s0"
-        if min(ts) <= after[0]:
-            return "backfill"
+    if rec.get("frontier") is None:     # absent or null: no S0 evidence (RV3)
+        return "absent_from_s0"
+    after = [e for a, e in sorted(rec["frontier"]) if a > bound]
+    if not after:
+        return "absent_from_s0"
+    if min(ts) <= after[0]:
+        return "backfill"
     return None
 
 

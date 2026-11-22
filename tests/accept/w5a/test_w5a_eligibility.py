@@ -78,7 +78,7 @@ def test_refusal_reasons_are_the_typed_enum_in_precedence_order():
 
 def test_one_verdict_per_window_in_pool_order(tmp_path):
     series = [case(k, BOUND, f"s{i}", f"src{i % 3}")
-              for i, k in enumerate(("eligible", "late_mirror", "backfill", "legacy"))]
+              for i, k in enumerate(("eligible", "late_mirror", "backfill", "no_frontier"))]
     from cascade.validator.lane_d import load_pool  # noqa: I001
     from cascade.validator.lane_d_forward import eligible_windows
 
@@ -87,7 +87,8 @@ def test_one_verdict_per_window_in_pool_order(tmp_path):
     out = list(eligible_windows(pool, t_entry=T0, t_king=KING_T, cfg=lane_d_cfg()))
     assert [v.window_id for v in out] == [window_id(s["series_id"], s["target_ts"])
                                           for s in series]
-    assert [v.eligible for v in out] == [True, False, False, True]
+    assert [v.eligible for v in out] == [True, False, False, False]
+    assert [str(v.reason) for v in out[1:]] == ["late_mirror", "backfill", "absent_from_s0"]
 
 
 # ── T8 cases, each with its exact reason ────────────────────────────────────
@@ -235,23 +236,57 @@ def test_feed_defaults_to_the_series_source(tmp_path):
     _assert_refused(_one(tmp_path, rec, feeds=feeds, name="pool2"), "forecast_product")
 
 
-def test_unmeasured_lag_is_not_a_refusal(tmp_path):
-    """W6fs measures lag "where the feed provides" a publish stamp: an
-    unlisted feed or a null lag is unmeasured; the two clocks still govern."""
+def test_listed_feed_with_null_lag_is_not_a_refusal(tmp_path):
+    """W6fs measures lag "where the feed provides" a publish stamp: a feed the
+    snapshot LISTS with `mirror_lag_hours: null` is declared unmeasured; the
+    two clocks still govern (RV3: only an explicit null admits)."""
     rec = case("eligible", BOUND, "u", "srcU")
-    _assert_eligible(_one(tmp_path, rec, feeds={}))
-    _assert_eligible(_one(tmp_path, rec, feeds={"srcU": {"mirror_lag_hours": None}},
-                          name="pool2"))
-    _assert_eligible(_one(tmp_path, rec, feeds=None, name="pool3"))
+    _assert_eligible(_one(tmp_path, rec, feeds={"srcU": {"mirror_lag_hours": None}}))
+    _assert_eligible(_one(tmp_path, rec, name="pool2", feeds={
+        "srcU": {"mirror_lag_hours": None, "forecast_product": False}}))
 
 
-def test_series_without_frontier_key_is_judged_on_the_two_clocks(tmp_path):
-    """pool_d/1 snapshots that record no frontier (the W1.5 fixture) keep
-    their two-clock verdicts; an explicit empty list is absent_from_s0."""
-    _assert_eligible(_one(tmp_path, case("legacy", BOUND, "leg", "srcA")))
-    old = case("before_margin", BOUND, "leg-old", "srcA")
+def test_unlisted_feed_is_refused(tmp_path):
+    """RV3 BLOCKING 1: a feed with no `feeds` entry is not "lag unmeasured":
+    the window fails closed as `unlisted_feed`, both for a series' own source
+    and for an explicit `feed`."""
+    rec = case("eligible", BOUND, "u", "srcU")
+    _assert_refused(_one(tmp_path, rec, feeds={}), "unlisted_feed")
+    _assert_refused(_one(tmp_path, rec, name="pool2", feeds={
+        "srcOther": {"mirror_lag_hours": 1.0, "forecast_product": False}}), "unlisted_feed")
+    _assert_refused(_one(tmp_path, case("unlisted_feed", BOUND, "uf", "srcA"), name="pool3"),
+                    "unlisted_feed")
+
+
+def test_pool_without_feeds_block_is_refused(tmp_path):
+    """RV3 BLOCKING 1: a pool with no top-level `feeds` lists no feed, so
+    every window is `unlisted_feed` (over_lag and forecast_product cannot be
+    silently switched off by dropping the block)."""
+    series = [case("eligible", BOUND, f"nf{i}", f"src{i}") for i in range(3)]
+    got = _verdicts(tmp_path, series, feeds=None)
+    assert len(got) == 3
+    for v in got.values():
+        _assert_refused(v, "unlisted_feed")
+
+
+def test_series_without_frontier_key_is_refused(tmp_path):
+    """RV3 BLOCKING 1 (change 1(a): eligible only if the series is present in
+    S0 with a recorded end_ts): a series with no `frontier` key has no
+    evidence of S0 and fails closed as `absent_from_s0`, like an empty list.
+    The clock rules still come first."""
+    _assert_refused(_one(tmp_path, case("no_frontier", BOUND, "nofr", "srcA")),
+                    "absent_from_s0")
+    old = case("before_margin", BOUND, "nofr-old", "srcA")
     del old["frontier"]
     _assert_refused(_one(tmp_path, old, name="pool2"), "before_margin")
+
+
+def test_series_with_null_frontier_is_refused(tmp_path):
+    """RV3 BLOCKING 1: `"frontier": null` (e.g. from a serializer) is the same
+    as absent: `absent_from_s0`, never the two-clock-only verdict."""
+    rec = case("null_frontier", BOUND, "nullfr", "srcA")
+    assert rec["frontier"] is None
+    _assert_refused(_one(tmp_path, rec), "absent_from_s0")
 
 
 # ── precedence and missing clocks ───────────────────────────────────────────
@@ -286,6 +321,19 @@ def test_reason_precedence(tmp_path):
     miss = case("forecast_product", BOUND, "miss-fc", "srcA")
     miss["end_ts"] = None
     _assert_refused(_one(tmp_path, miss, name="pool4"), "missing_clock")
+    # RV3: missing clock beats an unlisted feed ...
+    miss = case("unlisted_feed", BOUND, "miss-uf", "srcA")
+    miss["end_ts"] = None
+    _assert_refused(_one(tmp_path, miss, name="pool5"), "missing_clock")
+    # ... an unlisted feed beats the clock and S0 rules ...
+    uf = case("late_mirror", BOUND, "uf-late", "srcA")
+    uf["feed"] = "unlisted"
+    del uf["frontier"]
+    _assert_refused(_one(tmp_path, uf, name="pool6"), "unlisted_feed")
+    # ... and a missing frontier ranks with absent_from_s0, after the lag rules.
+    lag = case("over_lag", BOUND, "lag-nofr", "srcA")
+    del lag["frontier"]
+    _assert_refused(_one(tmp_path, lag, name="pool7"), "over_lag")
 
 
 # ── the v2 snapshot-only rule is refused ────────────────────────────────────
