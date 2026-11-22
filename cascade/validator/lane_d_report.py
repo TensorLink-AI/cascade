@@ -36,6 +36,16 @@ from pathlib import Path
 REPORT_SCHEMA = "lane-d-report/1"
 SCHEMA_PATH = Path(__file__).resolve().parent / "schemas" / "lane_d_report_1.json"
 
+# ── the signature (versioned by ``schema``: any change is a schema bump) ─────
+
+# schnorrkel sr25519, substrate signing context, via ``cascade.shared.sr25519``.
+SIGNATURE_SCHEME = "sr25519"
+# The 64 signature bytes as lower-case hex; equals the schema file's
+# ``properties.signature.pattern``. One spelling per signature.
+SIGNATURE_PATTERN = r"^[0-9a-f]{128}$"
+_SIGNATURE_BYTES = 64
+_SIGNATURE_RE = re.compile(r"[0-9a-f]{128}")
+
 # ── the typed enums (each equals the schema file's ``$defs.<name>.enum``) ────
 
 ENTRY_STATUSES = ("pending", "hold", "confirm_pending", "crowned", "lost", "closed")
@@ -215,7 +225,9 @@ def validate_report(report) -> None:
 
 
 def canonical_json(obj) -> bytes:
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
+    """``sort_keys``, compact separators, ASCII-escaped, no NaN, UTF-8.
+    A non-finite number raises ``ValueError``."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
                       allow_nan=False).encode("utf-8")
 
 
@@ -225,41 +237,90 @@ def rows_sha256(rows: list) -> str:
 
 
 def canonical_body(report: dict) -> bytes:
-    """The signed bytes: the report without its ``signature``."""
+    """The signed bytes: the report without its ``signature`` (``signer`` and
+    the optional ``extensions`` included), as :func:`canonical_json`. No
+    domain prefix: ``schema`` is inside the body. A non-finite number raises
+    ``ValueError``."""
     body = {k: v for k, v in report.items() if k != "signature"}
     return canonical_json(body)
 
 
+def _signature_hex(sig) -> str:
+    """``sig`` (the keypair's output) in :data:`SIGNATURE_PATTERN` form."""
+    if isinstance(sig, (bytes, bytearray)):
+        raw = bytes(sig)
+    else:
+        text = str(sig)
+        raw = bytes.fromhex(text[2:] if text[:2] in ("0x", "0X") else text)
+    out = raw.hex()
+    if not _SIGNATURE_RE.fullmatch(out):
+        raise ValueError(f"sign_report: the signer produced {len(raw)} signature bytes, "
+                         f"want {_SIGNATURE_BYTES} ({SIGNATURE_SCHEME})")
+    return out
+
+
 def sign_report(report: dict, signer) -> dict:
     """A copy of ``report`` signed by ``signer`` (a keypair, or a wallet whose
-    ``hotkey`` is one). ``signer`` is stamped as the report's ``signer``."""
+    ``hotkey`` is one). The input is never mutated and any old ``signature``
+    is dropped; ``signer`` is stamped with the key's ss58 (so the stated
+    signer is itself signed) and the signature is stored in
+    :data:`SIGNATURE_PATTERN` form."""
     key = getattr(signer, "hotkey", signer)
     out = copy.deepcopy(report)
     out.pop("signature", None)
     out["signer"] = str(key.ss58_address)
-    sig = key.sign(canonical_body(out))
-    out["signature"] = sig.hex() if isinstance(sig, (bytes, bytearray)) else str(sig)
+    out["signature"] = _signature_hex(key.sign(canonical_body(out)))
     return out
 
 
-def verify_report(report: dict, signer_ss58: str) -> bool:
-    """True iff ``report`` carries ``signer_ss58``'s valid signature over its
-    canonical body. Raises ``SignatureVerifierUnavailable`` when the SDK
-    cannot verify (never a silent False)."""
-    from ..shared.sr25519 import verify_hotkey
+def verify_report(report, signer_ss58: str) -> bool:
+    """True iff all hold, in this order: ``report`` passes
+    :func:`validate_report` (schema, signature encoding, ``rows_sha256``);
+    ``signer_ss58`` is a non-empty string equal to ``report["signer"]``; and
+    ``signature`` is ``signer_ss58``'s sr25519 signature over
+    :func:`canonical_body`. Every other input is ``False``, never an exception
+    and never a mutation.
 
-    sig = report.get("signature") if isinstance(report, dict) else None
-    if not sig or not signer_ss58 or report.get("signer") != signer_ss58:
+    Validation runs first, so an invalid report is refused without reaching
+    the sr25519 verifier. A valid report whose signature cannot be checked
+    raises ``SignatureVerifierUnavailable`` (DEC-CA-0051: never a silent
+    False)."""
+    if not isinstance(report, dict) or not isinstance(signer_ss58, str) or not signer_ss58:
+        return False
+    try:
+        validate_report(report)
+    except (TypeError, ValueError):
+        return False
+    sig = report["signature"]
+    if report["signer"] != signer_ss58 or not isinstance(sig, str) \
+            or not _SIGNATURE_RE.fullmatch(sig):
         return False
     try:
         body = canonical_body(report)
     except (TypeError, ValueError):
         return False
-    return verify_hotkey(signer_ss58, body, str(sig))
+    from ..shared.sr25519 import verify_hotkey
+
+    return verify_hotkey(signer_ss58, body, sig)
+
+
+def pinned_report_signer(cfg) -> str:
+    """The only hotkey a lane D report is trusted from: ``[manifest]
+    validator_hotkey`` (the main validator), stripped. A blank pin raises
+    ``ValueError``; there is no fallback to the report's self-declared
+    ``signer``. Callers verify with
+    ``verify_report(report, pinned_report_signer(cfg))``."""
+    manifest = getattr(cfg, "manifest", None)
+    pin = str(getattr(manifest, "validator_hotkey", "") or "").strip()
+    if not pin:
+        raise ValueError("lane D report signer is unpinned: set [manifest] validator_hotkey "
+                         "(the main validator hotkey); the report's own signer is never trusted")
+    return pin
 
 
 __all__ = ["BURN_REASONS", "CONFIRMATION_STAGES", "CONFIRM_RULES", "ENTRY_REASONS",
            "ENTRY_STATUSES", "LOWFREQ_RESULTS", "REPORT_SCHEMA", "SCHEMA_ERROR_CODES",
-           "SCHEMA_PATH", "SKIP_REASONS", "VERDICT_OUTCOMES", "WINDOW_REFUSAL_REASONS",
-           "ReportSchemaError", "canonical_body", "canonical_json", "load_schema", "rows_sha256",
+           "SCHEMA_PATH", "SIGNATURE_PATTERN", "SIGNATURE_SCHEME", "SKIP_REASONS",
+           "VERDICT_OUTCOMES", "WINDOW_REFUSAL_REASONS", "ReportSchemaError", "canonical_body",
+           "canonical_json", "load_schema", "pinned_report_signer", "rows_sha256",
            "sign_report", "validate_report", "verify_report"]
