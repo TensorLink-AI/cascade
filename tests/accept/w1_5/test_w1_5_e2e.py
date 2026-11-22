@@ -305,7 +305,9 @@ def test_e2e_tampered_row_fails(chain_kind, tmp_path):
     assert res.status == FAIL, f"a tampered row passed check_lane_d: {res}"
     # ... and re-signed by the same key: rows_sha256 no longer matches the rows.
     resigned = sign_report(tampered, signer)
-    assert verify_report(resigned, signer.ss58_address)
+    # W7b: verify_report validates the report first; a rows_sha256 mismatch
+    # makes it schema-invalid, so a fresh signature does not rescue it.
+    assert not verify_report(resigned, signer.ss58_address)
     res = check_lane_d(resigned, cfg, signer_hotkey=signer.ss58_address)
     assert res.status == FAIL, f"a re-signed tampered row passed check_lane_d: {res}"
 

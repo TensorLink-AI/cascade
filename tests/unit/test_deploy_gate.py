@@ -127,6 +127,15 @@ def test_every_area_and_new_trees_classify():
     assert "worker_image" not in g.classify(["cascade/website/index.html"])
 
 
+def test_evidence_only_diff_is_go_with_no_restart_notes(tmp_path):
+    paths = ["evidence/s0b_notes.json", "evidence/rv3.md", "evidence/w5.json"]
+    assert g.classify(paths) == {"evidence": paths}
+    for svc in g.SERVICES:
+        v = _gate(tmp_path, service=svc, paths=paths, vlines=CLOCK)
+        assert not v.refuse
+        assert [n for n in v.notes if not n.startswith("next settlement")] == []
+
+
 def _log(tmp_path, *lines):
     p = tmp_path / "validator.log"
     p.write_text("".join(f"{ln}\n" for ln in ("head",) + lines))
