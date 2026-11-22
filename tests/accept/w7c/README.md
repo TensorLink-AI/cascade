@@ -246,8 +246,8 @@ implementer's choice and isn't pinned.
 | `test_state_file_is_exactly_the_canonical_bytes_of_the_state`, `test_save_state_writes_canonical_bytes_via_fsync_then_rename` | assert: `save_state` writes `indent=1` |
 | `test_receipt_unchanged_when_unarmed`, `test_state_binds_the_report_body_and_the_prior_never_the_signature`, `test_inv5_t11_no_double_crown_across_repeated_restarts`, `test_inv5_receipts_are_independent_of_the_hash_seed` | assert: `LaneDSettlement` has no `receipt`, a re-call is refused, and `last_report` carries the randomized signature |
 | `test_w7c_lost_state.py` (RV6 B3; missing/rolled-back state, expected prior) | assert: main settles from genesis (`DID NOT RAISE`; the reproduction shows `king_before` = the house and X re-judged) or rolls back silently |
-| `test_w7c_lost_state.py` (directory at the state path) | `IsADirectoryError` instead of `LaneDStateError("state_unreadable")` |
-| `test_w7c_lost_state.py` (`expect_prior_sha256`) | `TypeError`: `settle_lane_d` has no such keyword |
+| `test_w7c_lost_state.py` (directory at the state path) | assert: a raw `IsADirectoryError` instead of `LaneDStateError("state_unreadable")` |
+| `test_w7c_lost_state.py` (`expect_prior_sha256`) | assert: `settle_lane_d` refuses the keyword (`TypeError`) |
 | `test_w7c_lost_state.py` (restore) | `ImportError`: no `restore_state` |
 | both `test_error_codes_are_exported` / `test_rv6_b3_error_codes_include_the_lost_state_codes` | assert: `STATE_ERROR_CODES` lacks `state_missing`, `state_unreadable` |
 

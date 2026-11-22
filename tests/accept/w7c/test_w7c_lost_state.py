@@ -48,13 +48,31 @@ from .helpers import (
 )
 
 
-def _state_error(excinfo, code: str) -> None:
+def _refuses(fn, code: str) -> None:
+    """`fn()` must raise `LaneDStateError(code)`. Returning normally, or any
+    other exception (a raw `OSError`, a `TypeError` for an absent keyword),
+    is a contract failure: an AssertionError, not an error of the test."""
     from cascade.validator.lane_d_state import LaneDStateError
 
-    assert isinstance(excinfo.value, LaneDStateError), repr(excinfo.value)
-    assert isinstance(excinfo.value, ValueError)
-    assert excinfo.value.code == code, (excinfo.value.code, str(excinfo.value))
-    assert excinfo.value.code in STATE_ERROR_CODES
+    try:
+        out = fn()
+    except LaneDStateError as e:
+        assert isinstance(e, ValueError)
+        assert e.code == code, (e.code, str(e))
+        assert e.code in STATE_ERROR_CODES
+        return
+    except Exception as e:  # noqa: BLE001 - every other outcome is a contract failure
+        raise AssertionError(f"expected LaneDStateError({code!r}), got {e!r}") from e
+    raise AssertionError(f"expected LaneDStateError({code!r}); it returned {out!r:.300}")
+
+
+def _call(fn):
+    """`fn()`, with a raised exception turned into an AssertionError (e.g. a
+    `TypeError` for an absent keyword is a contract failure)."""
+    try:
+        return fn()
+    except Exception as e:  # noqa: BLE001
+        raise AssertionError(f"the call was refused: {e!r}") from e
 
 
 def _tree(directory: Path) -> dict:
@@ -77,9 +95,7 @@ def _refused_untouched(chain: Chain, n: int, path: Path, code: str, **extra) -> 
     before = _tree(path.parent)
     hosts = len(chain.hosts)
     fc = CountingForecasts(chain.forecasts)
-    with pytest.raises(ValueError) as e:
-        chain.settle(n, path, forecasts=fc, **extra)
-    _state_error(e, code)
+    _refuses(lambda: chain.settle(n, path, forecasts=fc, **extra), code)
     assert _tree(path.parent) == before, "a refused settlement writes nothing (no report, " \
         "no state)"
     assert fc.reads == 0, "a refused settlement scores nothing"
@@ -143,9 +159,7 @@ def test_rv6_b3_load_state_never_hides_an_unreadable_file_as_genesis(tmp_path):
     chain = Chain(tmp_path)
     path = chain.state_path("run")
     path.mkdir()
-    with pytest.raises(ValueError) as e:
-        load_state(path, chain.house)
-    _state_error(e, "state_unreadable")
+    _refuses(lambda: load_state(path, chain.house), "state_unreadable")
 
 
 # ── genesis remains only with no prior artefact ─────────────────────────────
@@ -224,7 +238,8 @@ def test_rv6_b3_settle_checks_the_expected_prior(tmp_path):
     chain = Chain(tmp_path)
     ref = _reference(chain)
     path = chain.state_path("run")
-    s1 = chain.settle(1, path, expect_prior_sha256=state_sha(genesis(chain.house)))
+    s1 = _call(lambda: chain.settle(1, path,
+                                    expect_prior_sha256=state_sha(genesis(chain.house))))
     assert receipt_of(s1) == ref["receipts"][0]
     good = receipt_of(s1)["posterior_state_sha256"]
     true_bytes = path.read_bytes()
@@ -238,7 +253,7 @@ def test_rv6_b3_settle_checks_the_expected_prior(tmp_path):
     _refused_untouched(chain, 2, path, "state_digest_mismatch", expect_prior_sha256=good)
     # the true posterior back: the expected prior matches and the chain goes on
     path.write_bytes(true_bytes)
-    s2 = chain.settle(2, path, expect_prior_sha256=good)
+    s2 = _call(lambda: chain.settle(2, path, expect_prior_sha256=good))
     assert receipt_of(s2) == ref["receipts"][1]
     assert receipt_of(s2)["prior_state_sha256"] == good
 
@@ -296,9 +311,7 @@ def _restore_refused(path: Path, backup: Path, expect: str, code: str) -> None:
     from cascade.validator.lane_d_state import restore_state
 
     before = _tree(path.parent)
-    with pytest.raises(ValueError) as e:
-        restore_state(path, backup, expect_sha256=expect)
-    _state_error(e, code)
+    _refuses(lambda: restore_state(path, backup, expect_sha256=expect), code)
     assert _tree(path.parent) == before, "a refused restore writes nothing"
 
 
