@@ -22,6 +22,7 @@ Accept: `scripts/laned/accept W5d` (CI, tiny model) and, for T7,
 | no padding: model input length = available history (largest patch multiple), capped at context | `test_batch_plan_*`, `test_no_pad_model_input_is_real_history_capped_at_context` (torch, a forward pre-hook records the patch tensor), `test_no_pad_truncates_to_the_largest_patch_multiple` (torch) |
 | T7 CI half: a 4k checkpoint and its declared-128k copy score identically on ≤ 4096-history windows | `test_t7_4k_checkpoint_and_declared_128k_copy_identical_on_short_windows` (torch; also 8k and 16k) |
 | T7 pod half: wall time + memory per variant, armed only if it fits | `test_evidence_*` (read `$LANED_EVIDENCE`), `test_builder_*`, `test_verifier_*`, `test_measure_variant_and_short_window_check_on_a_tiny_model` (torch) |
+| (RV3) a variant row is only certified on inputs that exercise it: `input_len == variant`, every history ≥ variant, memory = the variant's own CUDA peak | `test_builder_row_records_the_input_that_ran`, `test_builder_row_refuses_*`, `test_builder_pod_evidence_refuses_process_peak_rss`, `test_builder_refuses_a_hand_edited_row`, `test_measure_variant_refuses_short_history_before_loading`, `test_verifier_rejects_*_that_did_not_exercise_its_variant`, the tiny-model test (torch; a forward pre-hook checks the model input really is 8192 points) |
 
 ## Module contract: `cascade/eval/lane_d_scorer.py`
 
@@ -68,23 +69,51 @@ The pod run calls these and writes `evidence/t7.json` with `json.dump`.
 - `settlement_budget(mem_gb, *, settlement_blocks=900, block_seconds=12.0,
   fraction=0.5) -> {"wall_s": blocks*seconds*fraction, "mem_gb": mem_gb}`
   (§1.6: ≤ 50% of a settlement; mem = the host GPU's memory).
-- `variant_row(*, host, gpu, variant, wall_s, peak_mem_gb, budget, n_models,
-  n_windows) -> dict` with exactly those keys plus `fits = wall_s <=
-  budget["wall_s"] and peak_mem_gb <= budget["mem_gb"]`. `ValueError` when
-  `variant` is not in `LANE_D_CONTEXTS`, `n_models < 10` (8 entries + KING_D
-  + house), `n_windows < 1`, a time/memory is not positive and finite, a
-  host/gpu is empty, or the host rule breaks: variants ≤ 16384 on the launch
-  eval host (never `valeval-laned`), variants > 16384 on `valeval-laned`.
+- `ShortHistoryError`: a `ValueError` subclass. Raised whenever a variant
+  would be measured on a window with fewer than `variant` points of history
+  (RV3: the no-pad scorer would silently run it at `min(n, context)`).
+- `variant_row(*, host, gpu, variant, input_len, history_min, history_max,
+  wall_s, peak_mem_gb, peak_mem_source, budget, n_models, n_windows) -> dict`
+  with exactly those keys plus `fits = wall_s <= budget["wall_s"] and
+  peak_mem_gb <= budget["mem_gb"]`. `ValueError` when `variant` is not in
+  `LANE_D_CONTEXTS`, `n_models < 10` (8 entries + KING_D + house),
+  `n_windows < 1`, a time/memory is not positive and finite, a host/gpu is
+  empty, or the host rule breaks: variants ≤ 16384 on the launch eval host
+  (never `valeval-laned`), variants > 16384 on `valeval-laned`. RV3 adds:
+  - `input_len` is the model input length in points that actually ran (the
+    single `batch_plan` key); `ValueError` unless `input_len == variant`.
+  - `history_min` / `history_max` are the shortest and longest window
+    history; `ShortHistoryError` when `history_min < variant`, `ValueError`
+    when `history_max < history_min`. Since every window reaches the
+    variant, `n_windows` is the count of windows run at the variant.
+  - `peak_mem_source` is `"cuda_max_allocated"` (this variant's own device
+    peak, after `reset_peak_memory_stats`) or `"process_peak_rss"` (CPU
+    `ru_maxrss`, the process-lifetime peak every later row inherits);
+    anything else is a `ValueError`.
 - `build_evidence(rows, *, short_window, tool, torch_version, source) -> dict`
   with keys `schema, wp ("W5d"), source, torch, tool, measured_at (ISO 8601
   UTC, now), rows (sorted by variant), short_window, armed, passed`.
+  - It re-checks every row it is handed (a hand-edited dict too):
+    `input_len != variant` is a `ValueError`, `history_min < variant` a
+    `ShortHistoryError`.
+  - With `source == "pod"`, a row whose `peak_mem_source` is not
+    `"cuda_max_allocated"` is a `ValueError`: process RSS is never a budget
+    input. Other sources (CI) may carry `"process_peak_rss"` rows; the
+    verifier rejects such evidence.
   - `short_window` gets `identical = (max_abs_diff == 0.0)`, recomputed.
   - `armed` = ascending variants whose row fits.
   - `passed` = identical **and** every launch variant measured **and** 4096 armed.
 - `measure_variant(checkpoint_dir, histories, *, context, horizon, host, gpu,
   n_models, budget, device) -> row`: times the lane D scorer on `histories`
-  at `context` and projects the settlement wall time for `n_models`;
-  `peak_mem_gb` is the peak device memory (on CPU, the process peak RSS).
+  at `context` and projects the settlement wall time for `n_models`.
+  - Any history shorter than `context` points is a `ShortHistoryError`
+    **before** `torch` is imported or the checkpoint is read (never a silent
+    truncation).
+  - The row's `input_len` is the model input length that ran (`== context`),
+    `history_min`/`history_max` the window history range.
+  - `peak_mem_gb` is `torch.cuda.max_memory_allocated` after a reset
+    (`peak_mem_source "cuda_max_allocated"`) on CUDA; on CPU it is labelled
+    `"process_peak_rss"`.
 - `short_window_check(checkpoint_dir, histories, *, horizon) ->
   {"base_context": 4096, "declared_context": 131072, "n_windows",
   "max_abs_diff", "identical"}`: the checkpoint at 4096 vs a byte copy at
@@ -93,8 +122,12 @@ The pod run calls these and writes `evidence/t7.json` with `json.dump`.
 ## T7 evidence (`laned_t7/1`) and its verifier
 
 `helpers.evidence_problems` is the verifier (independent of `lane_d_t7`). Per
-row: `host, gpu, variant, wall_s, peak_mem_gb, budget {wall_s ≤ 5400, mem_gb},
-fits, n_models, n_windows`. It requires `source == "pod"` (the builder's CI
+row: `host, gpu, variant, input_len, history_min, history_max, wall_s,
+peak_mem_gb, peak_mem_source, budget {wall_s ≤ 5400, mem_gb}, fits, n_models,
+n_windows`. Per row (RV3) it requires `input_len` an int equal to `variant`,
+`history_min` an int ≥ `variant`, `history_max` an int ≥ `history_min`, and
+`peak_mem_source == "cuda_max_allocated"` (pod evidence; CPU
+`process_peak_rss` is refused). It requires `source == "pod"` (the builder's CI
 runs use `"ci"`), `torch == "2.4.1+cu124"`, a clean `tool.git_sha` commit
 that has `cascade/eval/lane_d_t7.py`, unique variants covering the launch set,
 the host rule, and recomputes `fits`, `armed`, `short_window.identical` and
@@ -108,6 +141,12 @@ keys also satisfy `accept`'s generic evidence step.
   `No module named 'cascade.eval.lane_d_t7'`, or on an assertion (the
   `contexts` keyword / `MAX_HORIZON` checks run before any call).
 - The W1.5-level grid and lane A numpy-equality tests pass on main.
+- RV3 correction (tests-correction mode, W5d built on main): every test that
+  builds rows with `lane_d_t7` asserts the RV3 surface first (`_rv3`:
+  `variant_row` has `input_len, history_min, history_max, peak_mem_source`
+  and `ShortHistoryError` exists), so on main it fails on that
+  `AssertionError`, never a `TypeError`. The verifier-only tests on the
+  hand-written `_fixture()` evidence pass on main.
 - `test_evidence_*` skip while `$LANED_EVIDENCE` is unset.
 - Tests marked `torch` need torch (CI: `uv sync --all-extras`). The
   production box runs only `-m 'not torch'`. `torch` is not registered in
