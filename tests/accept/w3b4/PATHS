@@ -1,0 +1,10 @@
+# W3b4: suite identity + partial classification for the lane D paired gate
+# (plan §1.3b "Faults" / "Suite identity is verified per drawn suite", §13
+# "Suite identity / partial", §4 T17; README.md has the contract).
+# New module: suite_identity / item_set_digest / identity_mismatch /
+# identities_from_rows (name + version + item-list digest of a swept suite).
+cascade/eval/suite_identity.py
+# Extended module: classify_suite (typed ok / checkpoint_fault / bench_hold
+# with a sub-reason code per role), FAULT_CODES / HOLD_CODES, and paired_gate
+# using it (pinned_identity, code, codes, identity in the result).
+cascade/validator/lane_d_bench.py
