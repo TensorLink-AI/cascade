@@ -33,7 +33,6 @@ import tomllib
 from pathlib import Path
 
 from cascade.laned import dedrift as R6
-
 from cascade.shared import decided as D
 from cascade.shared import netconfig as N
 from cascade.shared.config import parse_chain_config

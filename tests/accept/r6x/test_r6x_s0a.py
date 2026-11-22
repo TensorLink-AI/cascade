@@ -17,8 +17,8 @@ import tomllib
 from pathlib import Path
 
 import pytest
-from cascade.laned import dedrift as R6
 
+from cascade.laned import dedrift as R6
 from cascade.shared.config import parse_chain_config
 from cascade.shared.era import next_era_start
 
