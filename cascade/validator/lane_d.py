@@ -48,8 +48,11 @@ validator. Unarmed (``not cfg.active(boundary)``) it returns
 W7c (§1.5 "State", invariant 5, T11) makes the settlement restart-safe and
 binds it into a receipt record (:mod:`~cascade.validator.lane_d_state`):
 
-- the state is read through the strict ``load_state`` (a defective file is
-  refused with its typed code before anything is written);
+- the state is read through the strict ``load_prior_state`` (a defective file
+  is refused with its typed code before anything is written; once a report is
+  persisted, a missing state is ``state_missing`` and a rolled-back one is
+  ``state_digest_mismatch``, never genesis; ``expect_prior_sha256`` pins the
+  prior to the last published posterior; ``restore_state`` is the way back);
 - the signed report is written atomically to ``report_path`` BEFORE the state
   file, and the state's ``last_report`` binds the report's canonical body and
   the prior state digest, never the randomized signature;
@@ -82,8 +85,8 @@ from .lane_d_frozen import advance_frozen_set
 from .lane_d_report import REPORT_SCHEMA, rows_sha256, sign_report
 from .lane_d_state import (
     LaneDStateError,
+    load_prior_state,
     load_report_file,
-    load_state,
     make_receipt,
     refresh_house,
     report_digest,
@@ -516,16 +519,26 @@ def _closing(cfg, boundary: int) -> bool:
 
 def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: dict,
                   forecasts: dict, uid_of: dict, state_path, signer,
-                  prior_pool_dirs=()) -> LaneDSettlement:
+                  prior_pool_dirs=(), expect_prior_sha256: str | None = None
+                  ) -> LaneDSettlement:
     """Settle lane D at ``boundary`` (see the module docstring).
 
     ``pool_dir`` is the newest ``pool_d`` snapshot; ``prior_pool_dirs`` are
     the earlier retained ones. They feed every open entry's union and supply
-    the history and targets of windows frozen from them."""
+    the history and targets of windows frozen from them.
+
+    ``expect_prior_sha256`` (the last published receipt's
+    ``posterior_state_sha256``), when given, must equal the digest of the
+    state as loaded (``state_digest_mismatch``). A lost state after a
+    persisted settlement is ``state_missing`` and a rolled-back one is
+    ``state_digest_mismatch`` (:func:`~cascade.validator.lane_d_state.load_prior_state`);
+    every such refusal comes before any pool or forecast is read and writes
+    nothing."""
     if not cfg.active(boundary):
         return LaneDSettlement(report=None, pay=None, receipt=None)
     boundary = int(boundary)
-    state = load_state(state_path, house)
+    state = load_prior_state(state_path, house, boundary,
+                             expect_prior_sha256=expect_prior_sha256)
     settled = int(state["boundary"])
     rp = report_path(state_path, boundary)
     if settled == boundary and "last_report" in state:
