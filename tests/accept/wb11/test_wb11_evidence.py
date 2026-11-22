@@ -19,7 +19,15 @@ from pathlib import Path
 
 import pytest
 
-from .helpers import REPO, evidence_problems, good_evidence, mod, write_pins
+from .helpers import (
+    BOX_LOOKUP_CAP_BYTES,
+    REPO,
+    evidence_problems,
+    good_evidence,
+    lookup_budget,
+    mod,
+    write_pins,
+)
 
 
 def _evidence() -> dict:
@@ -132,6 +140,16 @@ TAMPER = {
     "testnet_other_pin": _pins(None, OTHER),
     "artefact_tampered": _tamper_artefact,
     "artefact_absent": _remove_artefact,
+    # RV6 B8: the pin records scale, file size and the measured lookup peak
+    "n_exact_missing": _edit("n_exact", None),
+    "n_exact_wrong": lambda ev, root: ev.update(n_exact=ev["n_exact"] + 1),
+    "n_normalised_wrong": lambda ev, root: ev.update(n_normalised=ev["n_normalised"] - 1),
+    "file_bytes_wrong": lambda ev, root: ev.update(file_bytes=ev["file_bytes"] + 1),
+    "lookup_peak_missing": _edit("lookup_peak_bytes", None),
+    "lookup_peak_zero": _edit("lookup_peak_bytes", 0),
+    "lookup_peak_over_budget": lambda ev, root: ev.update(
+        lookup_peak_bytes=lookup_budget(max(ev["n_exact"], ev["n_normalised"])) + 1),
+    "lookup_peak_over_box_cap": _edit("lookup_peak_bytes", BOX_LOOKUP_CAP_BYTES + 1),
 }
 
 
