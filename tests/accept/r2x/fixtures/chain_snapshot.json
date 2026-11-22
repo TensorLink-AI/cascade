@@ -1,0 +1,23 @@
+{
+  "_about": "Offline stand-in for the four ChainClient reads s0b_collect makes (current_block, block_hash, validator_stakes, read_plain_commitments), all at head_block. Shapes as those methods return them. Notes: the main-shipped primary-only shape, the PR #457 shape, a missing note, a non-readiness plain commitment, a hotkey without a permit and a permitted hotkey with zero stake (both not counted).",
+  "network": "finney",
+  "netuid": 91,
+  "head_block": 9600000,
+  "block_hash": "0x3c1d9a7e52b04f8861a2c93de4b7f01a6e58c2d974b3a1f0e6d5c8b7a4930162",
+  "fetched_at": "2026-11-21T12:00:00+00:00",
+  "validators": [
+    {"hotkey": "5E2LP6tqvRkWk3oUfZ8xQyAbcHt1rGmN4sJpLdE7wYvXcB9K", "stake": 480000.0, "validator_permit": true},
+    {"hotkey": "5GsQ8nVr1kTzPq3MwXyLb7cH2dJf6eRtUa9oNiBvCx4mSe1D", "stake": 200000.0, "validator_permit": true},
+    {"hotkey": "5DkR7uWp2qLm9sNvTx3yB8zA4cFh6jKe1gHo5iMr2tUwVb7E", "stake": 50000.0, "validator_permit": true},
+    {"hotkey": "5FhT3wQz8xNc2vBm7nLk4jHg6fDs1aPo9iUy5tRe3wQb8Mn2", "stake": 10000.0, "validator_permit": true},
+    {"hotkey": "5CzX9vBn3mQw7eRt2yUi8oPa4sDf6gHj1kLz5xCv9bNm3Wq4", "stake": 900.0, "validator_permit": false},
+    {"hotkey": "5HbN2mVc8xZq4wEr7tYu1iOp3aSd9fGh6jKl2zXc5vBn8Mq6", "stake": 0.0, "validator_permit": true}
+  ],
+  "commitments": {
+    "5E2LP6tqvRkWk3oUfZ8xQyAbcHt1rGmN4sJpLdE7wYvXcB9K": "cascade-ready:1:rolling-era-king:9374400:9378000",
+    "5GsQ8nVr1kTzPq3MwXyLb7cH2dJf6eRtUa9oNiBvCx4mSe1D": "cascade-ready:1:rolling-era-king:9374400:9378000:prelaunch-95-r2:9486000:9486900",
+    "5FhT3wQz8xNc2vBm7nLk4jHg6fDs1aPo9iUy5tRe3wQb8Mn2": "hippius-hub/cascade-gen@sha256:7a1c",
+    "5CzX9vBn3mQw7eRt2yUi8oPa4sDf6gHj1kLz5xCv9bNm3Wq4": "cascade-ready:1:rolling-era-king:9374400:9378000",
+    "5HbN2mVc8xZq4wEr7tYu1iOp3aSd9fGh6jKl2zXc5vBn8Mq6": "cascade-ready:1:rolling-era-king:9374400:9378000"
+  }
+}
