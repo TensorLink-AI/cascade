@@ -57,6 +57,7 @@ class ReceiptMixin:
         lane_c: list[dict] | None = None,
         lane_c_pay: dict | None = None,
         king_check_scores: tuple = (),
+        sentinel: dict | None = None,
     ) -> RoundReceipt:
         """Assemble the round's public receipt (pure — no I/O, no signing).
 
@@ -99,7 +100,7 @@ class ReceiptMixin:
                 prelaunch_burn_block=self.prelaunch_burn_block,
                 emission=emission, king_check=king_check,
                 king_check_scores=king_check_scores,
-                lane_c=lane_c, lane_c_pay=lane_c_pay,
+                lane_c=lane_c, lane_c_pay=lane_c_pay, sentinel=sentinel,
                 **self._netconfig_receipt_kw(),
                 **self._satellite_receipt_kw(manifest),
                 **self._bench_report_receipt_kw(manifest),
@@ -141,11 +142,35 @@ class ReceiptMixin:
             prelaunch_burn_block=self.prelaunch_burn_block,
             emission=emission, king_check=king_check,
             king_check_scores=king_check_scores,
-            lane_c=lane_c, lane_c_pay=lane_c_pay,
+            lane_c=lane_c, lane_c_pay=lane_c_pay, sentinel=sentinel,
             **self._netconfig_receipt_kw(),
             **self._satellite_receipt_kw(manifest),
             **self._bench_report_receipt_kw(manifest),
         )
+
+    def _receipt_sentinel(self, client: object, manifest: TrainingManifest,
+                          epoch_start: int) -> dict | None:
+        """LANE_D_PLAN §16: the sentinel record stamped on the receipt — the
+        draw the settlement judged with, or (a follow-up resumed after a
+        restart) the same draw re-read from the era-boundary block hash.
+        None while the era is unarmed (no chain read; receipt bytes
+        unchanged) or when the hash is unreadable (best-effort, like the
+        rest of the chain context)."""
+        from ..shared.sentinel import sentinel_armed, sentinel_record, settlement_era_start
+
+        era_start = settlement_era_start(self.cfg, int(epoch_start))
+        if not sentinel_armed(self.cfg, era_start):
+            return None
+        fn = getattr(self, "_sentinel_for", None)
+        rec = fn(str(manifest.round_id)) if callable(fn) else None
+        if rec is not None:
+            return dict(rec)
+        try:
+            return sentinel_record(self.cfg, era_start,
+                                   str(client.block_hash(era_start)))  # type: ignore[attr-defined]
+        except Exception as e:  # noqa: BLE001 — chain context is best-effort
+            log.warning("receipt sentinel unavailable for round=%s: %s", manifest.round_id, e)
+            return None
 
     def _bench_report_receipt_kw(self, manifest: TrainingManifest) -> dict:
         """DEC-CA-0063: the validator bench report a settlement judged on
@@ -289,6 +314,7 @@ class ReceiptMixin:
                 emission=getattr(self, "_last_emission", None),
                 king_check=self._king_check_for(str(manifest.round_id)),
                 king_check_scores=self._king_check_scores_for(str(manifest.round_id)),
+                sentinel=self._receipt_sentinel(client, manifest, epoch_start),
             )
             if wallet is not None:
                 receipt = sign_receipt(receipt, wallet)

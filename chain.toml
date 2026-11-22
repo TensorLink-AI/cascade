@@ -1311,6 +1311,16 @@ margin_warmup_blocks = 18000
 # increment units, so 0.2 ≈ an LCB of 0.2 % relative improvement over the
 # init (the statistic is capped at 2). 0.0 = follow the dethrone bar.
 king_check_margin = 0.2
+# LANE_D_PLAN §16 cross-lane rotating held-out sentinel (D33/D34). OFF:
+# sentinel_from_block = 0. Arming is ONE signed overlay at an era boundary
+# (D45, no shadow), never an edit here. When armed, one suite of
+# sentinel_suites per era (drawn from the era-boundary block hash) is held out
+# of the lane-A bench gate and king check; with sentinel_ratchet the candidate
+# must not regress on it by more than sentinel_tau (ratio LCB <= 1 + tau).
+sentinel_from_block = 0
+sentinel_suites = ["gift", "boom", "time", "fev"]
+sentinel_ratchet = true
+sentinel_tau = 0.01
 
 [v2.training]
 # The supplied pyramid ladder replaces the earlier v2 candidate.

@@ -305,6 +305,10 @@ class ValidatorRunner(
     _king_eval: tuple | None = field(default=None, repr=False)
     _settlement_ladder: tuple | None = field(default=None, repr=False)
     _settlement_king_check: tuple | None = field(default=None, repr=False)
+    # LANE_D_PLAN §16: this settlement's sentinel draw ``(round_id, record)``
+    # — set only while ``[v2] sentinel_from_block`` arms the settlement's era
+    # (None otherwise: the gate, king check and receipt then run unarmed).
+    _settlement_sentinel: tuple | None = field(default=None, repr=False)
     # Lane C (DEC-CA-0056): the per-target slot state (``<state_db>.lane_c.json``),
     # the store its manifests are read from (None = the lane-B / manifest
     # store), the settlement block of the last judged manifest (the payout
@@ -885,6 +889,42 @@ class ValidatorRunner(
                  state.king_hotkey[:8], anchor, state.tenure_rounds, int(block), gate)
         return replace(state, king_since_block=anchor, tenure_anchor_gate=gate)
 
+    def _draw_settlement_sentinel(self, client: object,
+                                  manifest: TrainingManifest) -> tuple | None:
+        """LANE_D_PLAN §16: ``(round_id, record)`` of the sentinel the
+        settlement's era holds out (:func:`cascade.shared.sentinel.
+        sentinel_record` from the era-boundary block hash), or None while
+        ``[v2] sentinel_from_block`` does not arm that era — then the chain
+        is not read at all. Raises ``ChainError`` / ``ValueError`` when the
+        hash cannot be read or is malformed (the caller holds)."""
+        from ..shared.sentinel import sentinel_armed, sentinel_record, settlement_era_start
+
+        era_start = settlement_era_start(self.cfg, self._epoch_start_block(manifest))
+        if not sentinel_armed(self.cfg, era_start):
+            return None
+        record = sentinel_record(self.cfg, era_start,
+                                 str(client.block_hash(era_start)))  # type: ignore[attr-defined]
+        log.info("round=%s sentinel %s held out (era %d, drawn from block hash %s)",
+                 manifest.round_id, record["suite"], era_start, record["block_hash"])
+        return (str(manifest.round_id), record)
+
+    def _sentinel_for(self, round_id: str) -> dict | None:
+        """This settlement's sentinel record (None = unarmed)."""
+        rec = getattr(self, "_settlement_sentinel", None)
+        return rec[1] if rec is not None and rec[0] == str(round_id) else None
+
+    def _sentinel_gate_kw(self, round_id: str, rule: str) -> dict:
+        """The sentinel keywords of the lane-A bench gate / king check for
+        ``round_id`` (``{}`` unarmed, or outside DEC-CA-0061 rule v2 — the
+        call is then byte-identical to the unarmed one)."""
+        from ..shared.era import BENCH_RULE_V2
+        from ..shared.sentinel import sentinel_gate_kw
+
+        rec = self._sentinel_for(round_id)
+        if rec is None or rule != BENCH_RULE_V2:
+            return {}
+        return sentinel_gate_kw(self.cfg, rec["suite"])
+
     def _epoch_start_block(self, manifest: TrainingManifest) -> int:
         """The round's epoch-boundary block: ``created_block`` floored to the
         epoch grid. Monotonic and identical for every validator (from the shared
@@ -1224,6 +1264,7 @@ class ValidatorRunner(
         self._capture_settlement_prior(rid)
         self._settlement_ladder = None
         self._settlement_king_check = None
+        self._settlement_sentinel = None
 
         def _not_recorded() -> bool:
             if rollback is not None:
@@ -1362,6 +1403,17 @@ class ValidatorRunner(
             except StorageError as e:
                 self._hold_read_failure(vb_key, e, gate="validator_bench_unpublished")
                 return _not_recorded()
+            # LANE_D_PLAN §16: an armed era's sentinel is drawn from its
+            # boundary block hash before anything is judged; an unreadable
+            # hash HOLDS the settlement (never a verdict). Unarmed: no read.
+            sn_key = f"{rid}|sentinel"
+            try:
+                self._settlement_sentinel = self._draw_settlement_sentinel(client, manifest)
+            except (ChainError, ValueError, TypeError) as e:
+                self._hold_read_failure(sn_key, e, gate="sentinel_unverifiable")
+                return _not_recorded()
+            if self._settlement_sentinel is not None:
+                self._clear_read_hold(sn_key)
             vb_point = self._rollback_point()
             try:
                 outcome = self.process_settlement(manifest, windows, base_seed)

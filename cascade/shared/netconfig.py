@@ -108,6 +108,8 @@ ALLOWED: dict[str, frozenset[str] | None] = {
         "king_ladder", "win_margin_start", "win_margin_end", "margin_warmup_blocks",
         "king_check_margin", "ladder_start_tiers", "ladder_start_level_bp",
         "ladder_step_bp", "ladder_cap_bp", "ladder_fail_bp", "key_slash_bp", "court_bp", "court_blocks", "key_slash_min_eras",
+        # LANE_D_PLAN §16 / §14.2: the cross-lane sentinel arms by overlay
+        "sentinel_from_block", "sentinel_suites", "sentinel_ratchet", "sentinel_tau",
     }),
     # Base, activation, suite/universe, data sources, window construction
     # and recipe bounds remain release-only. These controls change how an
