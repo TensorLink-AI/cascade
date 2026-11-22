@@ -42,11 +42,34 @@ validator. Unarmed (``not cfg.active(boundary)``) it returns
    W3b5 computes ``pass``/``fail`` and its ``lowfreq_regression`` effect);
 6. writes the signed ``lane-d-report/1`` (W7a: the schema file
    ``schemas/lane_d_report_1.json``; every entry considered and not judged is
-   a typed skip, court slots that burn name a ``burn_reason``), the new
-   state, and returns the pay
+   a typed skip, court slots that burn name a ``burn_reason``; ``pool.snapshots``
+   binds every snapshot a judged window's version came from, the newest
+   always included, and each window names its ``snapshot_sha256``). The
+   signed report is checked by ``validate_report``: a report outside the
+   schema raises and nothing is returned or saved (fail closed). Then it
+   saves the new state and returns the pay
    record ``{"share", "court_uids"}`` — king first (``None`` while the house
    holds KING_D: that slot burns, D21), then up to ``reward_prior_kings``
    prior MINER kings (an unregistered one is ``None`` and burns).
+
+W7c (§1.5 "State", invariant 5, T11) makes the settlement restart-safe and
+binds it into a receipt record (:mod:`~cascade.validator.lane_d_state`):
+
+- the state is read through the strict ``load_prior_state`` (a defective file
+  is refused with its typed code before anything is written; once a report is
+  persisted, a missing state is ``state_missing`` and a rolled-back one is
+  ``state_digest_mismatch``, never genesis; ``expect_prior_sha256`` pins the
+  prior to the last published posterior; ``restore_state`` is the way back);
+- the signed report is written atomically to ``report_path`` BEFORE the state
+  file, and the state's ``last_report`` binds the report's canonical body and
+  the prior state digest, never the randomized signature;
+- ``receipt`` = ``{schema, boundary, prior_state_sha256,
+  posterior_state_sha256, report_sha256}`` (``None`` unarmed);
+- a crash after the report landed is recovered by recomputing: the body must
+  equal the persisted file's (else ``report_conflict``), the file is kept
+  byte-for-byte and the state is written; a re-call at the settled boundary
+  returns the persisted report, pay and receipt with nothing re-scored,
+  re-gated or written; an older boundary is ``stale_boundary``.
 
 Light imports only (numpy + the scorer's numpy half): this module is on the
 validator package's import path.
@@ -66,8 +89,19 @@ from ..eval.bootstrap import cohort_maxt_lcbs
 from ..eval.lane_d_scorer import SCORING_LEVELS, SCORING_METHOD, score_window
 from .lane_d_forward import eligible_windows
 from .lane_d_frozen import advance_frozen_set
-from .lane_d_report import REPORT_SCHEMA, rows_sha256, sign_report
-from .lane_d_state import load_state, refresh_house, save_state
+from .lane_d_report import REPORT_SCHEMA, rows_sha256, sign_report, validate_report
+from .lane_d_state import (
+    LaneDStateError,
+    load_prior_state,
+    load_report_file,
+    make_receipt,
+    refresh_house,
+    report_digest,
+    report_path,
+    save_report_file,
+    save_state,
+    state_digest,
+)
 
 POOL_SCHEMA = "pool_d/1"
 OPEN_STATUSES = ("pending", "confirm_pending")
@@ -75,8 +109,11 @@ OPEN_STATUSES = ("pending", "confirm_pending")
 
 @dataclass(frozen=True)
 class LaneDSettlement:
+    """``receipt`` is the W7c lane D receipt record (``None`` unarmed)."""
+
     report: dict | None
     pay: dict | None
+    receipt: dict | None = None
 
 
 # ── pool_d ──────────────────────────────────────────────────────────────────
@@ -406,25 +443,6 @@ def _cohort_set(pools: list[dict], members: list[str], bars: list[str], king_ts:
     return out, refused
 
 
-def _snapshot_record(pool: dict) -> dict:
-    return {"snapshot": pool["snapshot"], "sha256": pool["sha256"],
-            "first_seen_roots": list(pool["first_seen_roots"])}
-
-
-def _judged_snapshots(pools: list[dict], used: set[str]) -> list[dict]:
-    """The report's ``pool.snapshots``: every loaded snapshot whose sha256
-    supplied the version of a judged window, plus the newest (``pool_dir``,
-    which the seed binds), in load order, each sha256 once."""
-    newest = pools[-1]["sha256"]
-    out, seen = [], set()
-    for p in pools:
-        if p["sha256"] in seen or (p["sha256"] not in used and p["sha256"] != newest):
-            continue
-        seen.add(p["sha256"])
-        out.append(_snapshot_record(p))
-    return out
-
-
 def _advance_member(rec: dict, pools: list[dict], king_ts: int, cfg, seed: str) -> dict:
     """Advance one entry's ``frozen_set`` against a king revealed at
     ``king_ts``. The record carries the bound it was built for
@@ -486,7 +504,32 @@ def _params(cfg) -> dict:
             "scoring_levels": [float(q) for q in SCORING_LEVELS],
             "gate_suites": [str(s) for s in cfg.gate_suites],
             "tau_public": float(cfg.tau_public),
-            "lowfreq_freqs": [str(f) for f in cfg.lowfreq_freqs]}
+            "lowfreq_freqs": [str(f) for f in cfg.lowfreq_freqs],
+            # §1.3b draw weights as parsed (a suite without a weight is absent),
+            # the T18e/B14 source cap and the §1.7 context floor.
+            "gate_weights": {str(s): float(w) for s, w in cfg.gate_weights},
+            "max_source_share": float(cfg.max_source_share),
+            "min_long_series": int(cfg.min_long_series)}
+
+
+def _pool_record(pools: list[dict], windows_out: dict) -> dict:
+    """``pool`` of the report: the newest snapshot's ``snapshot`` /
+    ``sha256``, and ``snapshots``, every loaded snapshot a judged window's
+    version came from plus the newest, oldest first, each once (two loaded
+    snapshots with equal bytes are one, listed as the newer).
+    ``first_seen_roots`` is the sorted union of the listed snapshots' roots."""
+    newest = pools[-1]
+    used = {w["snapshot_sha256"] for w in windows_out.values()} | {newest["sha256"]}
+    snaps, seen = [], set()
+    for p in reversed(pools):
+        if p["sha256"] in used and p["sha256"] not in seen:
+            seen.add(p["sha256"])
+            snaps.append({"snapshot": p["snapshot"], "sha256": p["sha256"],
+                          "first_seen_roots": sorted(p["first_seen_roots"])})
+    snaps.reverse()
+    roots = sorted({r for s in snaps for r in s["first_seen_roots"]})
+    return {"snapshot": newest["snapshot"], "sha256": newest["sha256"],
+            "first_seen_roots": roots, "snapshots": snaps}
 
 
 def _lowfreq_candidate(ws: list[dict], cfg) -> dict:
@@ -522,18 +565,37 @@ def _closing(cfg, boundary: int) -> bool:
 
 def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: dict,
                   forecasts: dict, uid_of: dict, state_path, signer,
-                  prior_pool_dirs=()) -> LaneDSettlement:
+                  prior_pool_dirs=(), expect_prior_sha256: str | None = None
+                  ) -> LaneDSettlement:
     """Settle lane D at ``boundary`` (see the module docstring).
 
     ``pool_dir`` is the newest ``pool_d`` snapshot; ``prior_pool_dirs`` are
     the earlier retained ones. They feed every open entry's union and supply
-    the history and targets of windows frozen from them."""
+    the history and targets of windows frozen from them.
+
+    ``expect_prior_sha256`` (the last published receipt's
+    ``posterior_state_sha256``), when given, must equal the digest of the
+    state as loaded (``state_digest_mismatch``). A lost state after a
+    persisted settlement is ``state_missing`` and a rolled-back one is
+    ``state_digest_mismatch`` (:func:`~cascade.validator.lane_d_state.load_prior_state`);
+    every such refusal comes before any pool or forecast is read and writes
+    nothing."""
     if not cfg.active(boundary):
-        return LaneDSettlement(report=None, pay=None)
+        return LaneDSettlement(report=None, pay=None, receipt=None)
     boundary = int(boundary)
-    state = load_state(state_path, house)
-    if int(state["boundary"]) >= boundary:
-        raise ValueError(f"lane D already settled through {state['boundary']}; got {boundary}")
+    state = load_prior_state(state_path, house, boundary,
+                             expect_prior_sha256=expect_prior_sha256)
+    settled = int(state["boundary"])
+    rp = report_path(state_path, boundary)
+    if settled == boundary and "last_report" in state:
+        return _already_settled(state, rp, boundary)
+    if settled >= boundary:
+        raise LaneDStateError("stale_boundary", f"lane D already settled through {settled}; "
+                              f"got {boundary}")
+    # A report file without its state: a crash between the two writes. It is
+    # parsed strictly now, before any scoring, and must match the recompute.
+    persisted = load_report_file(rp) if rp.exists() else None
+    prior_sha = state_digest(state)
     refresh_house(state, house)
     king_before = _king_record(state["king"])
     pools = _load_pools(pool_dir, prior_pool_dirs, int(cfg.horizon))
@@ -625,13 +687,14 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
             scores[dg] = (np.asarray([p[0] for p in pairs]), np.asarray([p[1] for p in pairs]))
         for i, (w, src_pool) in enumerate(picked):
             lag = (src_pool["feeds"].get(w["feed"]) or {}).get("mirror_lag_hours")
-            pinned[w["window_id"]] = src_pool["sha256"]
+            pinned[w["window_id"]] = str(src_pool["sha256"])
             windows_out[w["window_id"]] = {
                 "window_id": w["window_id"], "source": w["source"], "feed": w["feed"],
                 "min_target_ts": int(min(w["target_ts"])),
                 "min_first_seen_ts": int(min(w["first_seen_ts"])),
                 "mirror_lag_hours": None if lag is None else float(lag),
-                "snapshot_sha256": src_pool["sha256"]}
+                # The snapshot whose version of the window was scored.
+                "snapshot_sha256": str(src_pool["sha256"])}
             for dg in scored:
                 rows.append({"window_id": w["window_id"], "digest": dg, "cohort": len(cohorts),
                              "crps": float(scores[dg][0][i]), "mase": float(scores[dg][1][i])})
@@ -698,19 +761,20 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
         for v in verdicts:
             if v["digest"] == new_king:
                 v["outcome"] = "crowned"
-    # The snapshots the judged windows were scored from, and the first-seen
-    # roots they rely on: the two root lists in the report agree.
-    snapshots = _judged_snapshots(pools, set(pinned.values()))
-    roots = sorted({r for s in snapshots for r in s["first_seen_roots"]})
-    for c in cohorts:
-        c["first_seen_roots"] = list(roots)
     court = _court(state, cfg, uid_of)
-    pay ={"share": float(cfg.share), "court_uids": [s["uid"] for s in court]}
+    pay = {"share": float(cfg.share), "court_uids": [s["uid"] for s in court]}
+    pool_rec = _pool_record(pools, windows_out)
+    # The first-seen roots the frozen sets rely on: the union over the listed
+    # snapshots, known once every cohort is judged, so each cohort takes it
+    # here and the report's two root lists agree.
+    for c in cohorts:
+        c["first_seen_roots"] = list(pool_rec["first_seen_roots"])
     report = {
         "schema": REPORT_SCHEMA, "boundary": boundary, "scoring_method": SCORING_METHOD,
         "params": _params(cfg), "seed": seed,
-        "pool": {"snapshot": pool["snapshot"], "sha256": pool["sha256"], "horizon": h,
-                 "first_seen_roots": roots, "snapshots": snapshots},
+        "pool": {"snapshot": pool_rec["snapshot"], "sha256": pool_rec["sha256"], "horizon": h,
+                 "first_seen_roots": pool_rec["first_seen_roots"],
+                 "snapshots": pool_rec["snapshots"]},
         "house": _king_record({**state["house"], "hotkey": None, "house": True}),
         "king_before": king_before, "king_after": _king_record(state["king"]),
         "crowned": new_king,
@@ -726,11 +790,70 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
         "pay": {"share": pay["share"], "court": court},
     }
     report = sign_report(report, signer)
+    # Fail closed: a report outside lane-d-report/1 is never returned, and
+    # neither the report file nor the state is written (ReportSchemaError
+    # propagates). Checked on the signed form, since ``signer`` and
+    # ``signature`` are required fields.
+    validate_report(report)
+    body_sha = report_digest(report)
+    if persisted is None:
+        save_report_file(rp, report)
+    elif persisted.get("boundary") != boundary or report_digest(persisted) != body_sha:
+        raise LaneDStateError("report_conflict", f"{rp}: the persisted report's body is not "
+                              f"the recomputed settlement's (sha256 {body_sha})")
+    else:
+        # Recovery: the persisted report (its signature too) is the record.
+        report = persisted
     state["boundary"] = boundary
     state["last_report"] = {"boundary": boundary, "rows_sha256": report["rows_sha256"],
-                            "signature": report["signature"]}
+                            "report_sha256": body_sha, "prior_state_sha256": prior_sha}
     save_state(state_path, state)
-    return LaneDSettlement(report=report, pay=pay)
+    receipt = make_receipt(boundary=boundary, prior_state_sha256=prior_sha,
+                           posterior_state_sha256=state_digest(state), report_sha256=body_sha)
+    return LaneDSettlement(report=report, pay=pay, receipt=receipt)
+
+
+def _is_hex64(value) -> bool:
+    return isinstance(value, str) and len(value) == 64 and set(value) <= _HEX64
+
+
+def _persisted_pay(report: dict, where) -> dict:
+    """The pay record ``{"share", "court_uids"}`` a persisted report carries
+    (``report["pay"]``); a malformed one is ``report_conflict``."""
+    pay = report.get("pay")
+    court = pay.get("court") if isinstance(pay, dict) else None
+    share = pay.get("share") if isinstance(pay, dict) else None
+    if (not isinstance(court, list) or isinstance(share, bool)
+            or not isinstance(share, int | float)
+            or not all(isinstance(s, dict) and "uid" in s for s in court)):
+        raise LaneDStateError("report_conflict", f"{where}: the persisted report has no "
+                              "well-formed pay record")
+    uids = [s["uid"] for s in court]
+    if not all(u is None or (isinstance(u, int) and not isinstance(u, bool)) for u in uids):
+        raise LaneDStateError("report_conflict", f"{where}: a court uid is not an int or null")
+    return {"share": float(share), "court_uids": uids}
+
+
+def _already_settled(state: dict, rp: Path, boundary: int) -> LaneDSettlement:
+    """T11 re-call at a settled boundary: the persisted report, its pay and
+    the receipt, with nothing re-scored, re-gated or written."""
+    last = state.get("last_report")
+    if (not isinstance(last, dict) or last.get("boundary") != boundary
+            or not _is_hex64(last.get("report_sha256"))
+            or not _is_hex64(last.get("prior_state_sha256"))):
+        raise LaneDStateError("report_conflict", f"lane D state at {boundary} has no "
+                              "well-formed last_report")
+    if not rp.is_file():
+        raise LaneDStateError("report_conflict", f"{rp}: the settled boundary's report file "
+                              "is missing")
+    report = load_report_file(rp)
+    if report.get("boundary") != boundary or report_digest(report) != last["report_sha256"]:
+        raise LaneDStateError("report_conflict", f"{rp}: the persisted report is not the one "
+                              f"the state bound (report_sha256 {last['report_sha256']})")
+    receipt = make_receipt(boundary=boundary, prior_state_sha256=last["prior_state_sha256"],
+                           posterior_state_sha256=state_digest(state),
+                           report_sha256=last["report_sha256"])
+    return LaneDSettlement(report=report, pay=_persisted_pay(report, rp), receipt=receipt)
 
 
 __all__ = ["LaneDSettlement", "judge_cohort", "load_pool", "settle_lane_d",

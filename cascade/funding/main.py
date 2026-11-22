@@ -57,6 +57,68 @@ def ledger_pod_live(ledger_path: Path):
     return live
 
 
+LANE_B_SCAN_CACHE_DIR = "lane_b_scan_cache"
+LANE_B_SCAN_CACHE_KEEP = 16
+
+
+def lane_b_repo_fetcher(cache_dir: Path, *, store=None, hub=None,
+                        keep: int = LANE_B_SCAN_CACHE_KEEP):
+    """WB13: ``fetch_lane_b_repo(ref) -> tree`` for the intake contamination
+    check. A ``vault/direct@sha256:…`` ref is extracted from the private
+    submission ``store`` (hostile-ZIP safe extraction); any other ref (and a
+    vault ref when no store is configured) is a Hub snapshot
+    (:func:`~cascade.shared.hippius.fetch_from_hub`). Trees land in
+    ``cache_dir/<sha256 of ref>`` (the ref's digest pins the bytes, so a
+    complete tree is reused) and only the ``keep`` newest are kept. Nothing
+    fetched is ever imported or run: the scan parses it."""
+    import hashlib
+    import os
+    import shutil
+    import uuid
+
+    from ..shared.hippius import FETCH_COMPLETE_MARKER, fetch_from_hub
+    from .store import parse_vault_ref
+
+    cache = Path(cache_dir)
+
+    def _prune(current: Path) -> None:
+        try:
+            dirs = [d for d in cache.iterdir()
+                    if d.is_dir() and not d.is_symlink() and d.name != current.name
+                    and not d.name.startswith(".")]
+        except OSError:
+            return
+        dirs.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+        for old in dirs[max(0, keep - 1):]:
+            shutil.rmtree(old, ignore_errors=True)
+
+    def fetch(ref: str) -> Path:
+        dest = cache / hashlib.sha256(ref.encode("utf-8")).hexdigest()
+        digest = parse_vault_ref(ref)
+        if (dest / FETCH_COMPLETE_MARKER).exists():
+            os.utime(dest)
+        elif digest is not None and store is not None:
+            cache.mkdir(parents=True, exist_ok=True)
+            tmp = cache / f".{dest.name}.scan-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+            try:
+                store.extract(digest, tmp)
+                (tmp / FETCH_COMPLETE_MARKER).touch()
+                try:
+                    os.rename(tmp, dest)
+                except OSError:
+                    if not (dest / FETCH_COMPLETE_MARKER).exists():
+                        raise
+            finally:
+                if tmp.exists():
+                    shutil.rmtree(tmp, ignore_errors=True)
+        else:
+            fetch_from_hub(ref, dest, hub)
+        _prune(dest)
+        return dest
+
+    return fetch
+
+
 def withdrawn_clears_approvals(queue_path: Path):
     """``hotkey -> None``: drop the hotkey's PENDING or APPROVED-but-unlaunched
     operator make-good request for this queue (``work_root/operator_approvals
@@ -478,6 +540,29 @@ def main(argv: Sequence[str] | None = None) -> int:
             lane_b_cap = int(lane_b_cfg.max_domains_per_leg)
         log.info("lane-B intake ON: queue %s, targets %s", lane_b_queue.path,
                  ",".join(lane_b_slots) if lane_b_slots else "<any well-formed>")
+    # WB13 / LB1: the intake contamination check, armed only by a [lane_b]
+    # contamination_hashset pin. The artefact ships with the release
+    # (benchmarks/contamination/hashset-v<n>.json); a pin no artefact matches
+    # leaves it unloaded, and the intake then answers every lane-B fund 503
+    # (fail closed) while lanes A and C keep serving.
+    lane_b_hashset, fetch_lane_b_repo = None, None
+    lane_b_pin = str(getattr(lane_b_cfg, "contamination_hashset", "") or "")
+    if lane_b_queue is not None and lane_b_pin:
+        from ..interface.contamination_scan import load_pinned_hashset
+
+        try:
+            lane_b_hashset = load_pinned_hashset(lane_b_pin, Path(__file__).resolve().parents[2])
+        except (OSError, ValueError) as e:
+            log.critical("lane-B contamination hash set NOT loaded (%s): every lane-B fund "
+                         "is refused 503 until the pinned artefact ships", e)
+        else:
+            log.info("lane-B contamination check ARMED: hash set v%s (%s)",
+                     lane_b_hashset["version"], lane_b_pin)
+        from ..shared.hippius import HubConfig
+
+        fetch_lane_b_repo = lane_b_repo_fetcher(
+            Path(args.queue_path).parent / LANE_B_SCAN_CACHE_DIR, store=store,
+            hub=HubConfig.from_storage(cfg.storage))
     # DEC-CA-0060: the GPU types a fund request may choose, and the walls
     # behind the fund-time warning. No chain config (--trust-refs) ⇒ any
     # well-formed SKU is accepted (dev only; the trainer still checks).
@@ -514,6 +599,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         lane_b_targets=lane_b_slots,
         lane_b_max_targets=lane_b_cap,
         lane_b_cfg=lane_b_cfg,
+        lane_b_hashset=lane_b_hashset,
+        fetch_lane_b_repo=fetch_lane_b_repo,
         lane_a_admission=lane_a_admission,
         pod_live=ledger_pod_live(Path(args.queue_path).parent / "funded_pods.json"),
         on_withdrawn=withdrawn_clears_approvals(Path(args.queue_path)),

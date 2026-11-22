@@ -1,0 +1,7 @@
+# WB11: contamination hash-set builder (plan §3.0 WB11 row, §12b.1 LB1).
+# New module: build_hashset / artefact_bytes / artefact_sha256 /
+# write_artefact / load_artefact / match_series / is_contaminated, and the
+# `python -P -m cascade.eval.contamination build|verify` CLI the owner runs on
+# the bench pod. Suite identities come from cascade.eval.suite_identity (W3b4)
+# when it is on main; that module is NOT in WB11's PATHS.
+cascade/eval/contamination.py

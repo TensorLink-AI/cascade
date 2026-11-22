@@ -1,0 +1,8 @@
+# W18: lane D vault TTL sweeper (plan §1.2 "Visibility and retention", D8,
+# D16, §3.0 W18 row; README.md has the contract). One new module: the
+# sweeper (vault -> owner-only archive, sha256-verified, then delete; archive
+# expiry after the dispute window), its filesystem and boto3-shaped storage
+# adapters, the D16 register gate for live runs, the strict JSON action log
+# and the CLI (`python -P -m cascade.laned.vault_sweeper`).
+# No config keys are added: the TTL is the existing [lane_d] loser_ttl_eras.
+cascade/laned/vault_sweeper.py
