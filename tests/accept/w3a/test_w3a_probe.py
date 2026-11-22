@@ -26,7 +26,6 @@ from .helpers import (
     PROBES,
     REPO,
     TEST_PREFIX,
-    as_live_evidence,
     base_args,
     dry_run,
     evidence_problems,
@@ -35,9 +34,14 @@ from .helpers import (
     model_file,
     probe,
     production_buckets,
+    relabel_as_live,
     require_probe,
     run_probe,
 )
+
+
+def _body_problems(ev: dict) -> list[str]:
+    return evidence_problems(ev, check_git=False, live_sizes=False, require_verified=False)
 
 CANARY = {"HIPPIUS_S3_ACCESS_KEY": "W3ACANARYACCESSKEY0001",
           "HIPPIUS_S3_SECRET_KEY": "w3a-canary-secret-value-0002",
@@ -220,11 +224,25 @@ def test_fixture_evidence_schema_and_every_probe(tmp_path):
     assert printed["run_id"] == ev["run_id"]
 
 
-def test_fixture_evidence_relabelled_live_passes_the_verifier(tmp_path):
-    ev = as_live_evidence(fixture_evidence(tmp_path))
+def test_fixture_evidence_relabelled_live_is_refused(tmp_path):
+    """RV4: relabelling a fixture run (source, git_dirty, request ids, passed)
+    gives a self-consistent body, but never acceptable evidence: there is no
+    verified_live record, and only `storage_probe verify` against a bucket
+    that holds the locked objects writes one (test_w3a_live_verify.py)."""
+    ev = relabel_as_live(fixture_evidence(tmp_path))
     assert ev["passed"] is True
+    assert _body_problems(ev) == [], _body_problems(ev)
     problems = evidence_problems(ev, check_git=False, live_sizes=False)
-    assert problems == [], problems
+    assert any(p.startswith("verified_live") for p in problems), problems
+
+
+def test_fixture_evidence_records_the_pre_write_lock_read(tmp_path):
+    ev = fixture_evidence(tmp_path)
+    bl = ev.get("bucket_lock")
+    assert isinstance(bl, dict), f"the evidence records no pre-write lock read: {bl!r}"
+    assert bl.get("lock_enabled") is True and bl.get("default_retention") is None, bl
+    assert bl.get("http_status") == 200, bl
+    assert str(bl.get("request_id")).startswith("fixture-"), bl
 
 
 def test_locked_objects_are_tiny_short_lived_and_the_only_leftovers(tmp_path):
@@ -235,8 +253,16 @@ def test_locked_objects_are_tiny_short_lived_and_the_only_leftovers(tmp_path):
     assert len(locked) == 2 and {lo["key"] for lo in locked} == lock_keys
     started = datetime.fromisoformat(ev["started_at"])
     finished = datetime.fromisoformat(ev["finished_at"])
+    probe_sha = {o["key"]: o["sha256"] for n in ("object_lock_multipart",
+                                                 "compliance_retention_unshortenable")
+                 for o in probe(ev, n)["objects"]}
     for lo in locked:
         assert lo["mode"] == "COMPLIANCE" and lo["size"] <= MAX_LOCKED_BYTES, lo
+        assert isinstance(lo.get("version_id"), str) and lo.get("version_id"), lo
+        assert isinstance(lo.get("etag"), str) and lo.get("etag", "").strip('"'), (
+            "a locked object records its HEAD ETag (storage_probe verify compares it)", lo)
+        assert re.fullmatch(r"[0-9a-f]{64}", str(lo.get("sha256"))), lo
+        assert lo.get("sha256") == probe_sha[lo["key"]], lo
         ru = datetime.fromisoformat(lo["retain_until"])
         assert started < ru <= finished + timedelta(seconds=86400 + 60), lo
     assert ev["cleanup"]["remaining_unlocked"] == []
@@ -276,9 +302,9 @@ def test_each_capability_flip_fails_only_its_probe(tmp_path, name, change, path)
     assert all(r == "pass" for n, r in got.items() if n != name), got
     assert ev["recommended_path"] == path
     assert ev["cleanup"]["remaining_unlocked"] == []
-    live = as_live_evidence(ev)
+    live = relabel_as_live(ev)
     assert live["passed"] is True, "a recorded fail is still a recorded live result"
-    assert evidence_problems(live, check_git=False, live_sizes=False) == []
+    assert _body_problems(live) == []
 
 
 def test_no_presigned_path_at_all_recommends_the_relay(tmp_path):
@@ -308,7 +334,7 @@ def test_missing_subtoken_is_an_error_and_exit_1(tmp_path):
     printed, ev, _ = dry_run(tmp_path, fixture=model, out=tmp_path / "e.json", expect_rc=1)
     assert probe(ev, "subtoken_scope")["result"] == "error"
     assert printed["complete"] is False
-    assert as_live_evidence(ev)["passed"] is False
+    assert relabel_as_live(ev)["passed"] is False
 
 
 def test_preexisting_policy_is_an_error_and_left_untouched(tmp_path):

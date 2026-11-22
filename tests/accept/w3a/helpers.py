@@ -1,15 +1,22 @@
 """Shared helpers for the W3a acceptance tests (live Hippius probe, owner WP).
 
-Three parts:
+Four parts:
 
 * the probe ``python -P -m cascade.laned.storage_probe`` is driven as a
   subprocess in ``--dry-run`` mode ONLY, with ``boto3``/``botocore``/
   ``bittensor`` made unimportable and every socket connect refused, so no
   test can reach Hippius;
+* :class:`FakeS3` is a boto3-shaped, in-memory S3 client (reads only; any
+  write call is recorded in ``forbidden``). The in-process tests hand it to
+  ``storage_probe.bucket_lock_preflight`` and ``storage_probe.verify_live``;
+  it can model a bucket default retention rule;
 * :func:`evidence_problems` is the evidence verifier. It never trusts the
   probe: it re-derives every probe verdict, the recommended path and the
   overall ``passed`` from the recorded observations, so an edited verdict
-  fails;
+  fails. By default it also requires the ``verified_live`` record that
+  ``storage_probe verify`` writes after re-reading the locked objects from
+  the live bucket, hash-bound to the evidence body, so fixture evidence
+  relabelled as live (or evidence edited after verification) is refused;
 * :func:`decision_problems` checks ``decisions/STORAGE-LANE-D.md`` against
   the evidence. Contract: README.md.
 """
@@ -18,11 +25,14 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import importlib
 import importlib.util
+import io
 import json
 import math
 import os
 import re
+import socket
 import subprocess
 import sys
 import tomllib
@@ -66,8 +76,18 @@ LEAK_RES = [re.compile(p, re.I) for p in (
     r"https?://", r"x-amz-signature", r"x-amz-credential", r"x-amz-security-token",
     r"awsaccesskeyid", r"signature=", r"authorization:")]
 TOP_KEYS = ("schema", "wp", "source", "endpoint_host", "region", "bucket", "prefix", "run_id",
-            "started_at", "finished_at", "tool", "params", "probes", "locked_objects",
-            "cleanup", "recommended_path", "passed")
+            "started_at", "finished_at", "tool", "params", "bucket_lock", "probes",
+            "locked_objects", "cleanup", "recommended_path", "passed")
+BUCKET_LOCK_KEYS = ("lock_enabled", "default_retention", "http_status", "request_id")
+LOCKED_KEYS = ("key", "version_id", "mode", "retain_until", "size", "etag", "sha256")
+VERIFY_SCHEMA = "laned_w3a_verify/1"
+VERIFY_KEYS = ("schema", "body_sha256", "verified_at", "tool", "endpoint_host", "bucket",
+               "run_id", "objects", "listing", "verified")
+VERIFY_OBJECT_KEYS = ("key", "version_id", "mode", "retain_until", "size", "etag", "sha256",
+                      "request_ids")
+DEFAULT_RETENTION_CODE = "bucket_default_retention"
+VERIFY_READ_OPS = {"head_object", "get_object_retention", "get_object", "list_object_versions",
+                   "list_objects_v2", "get_object_lock_configuration", "get_paginator"}
 PROBE_KEYS = ("name", "result", "passed", "reason", "requests", "objects", "observations")
 CREDENTIAL_ENV = ("HIPPIUS_S3_ACCESS_KEY", "HIPPIUS_S3_SECRET_KEY",
                   "HIPPIUS_PROBE_SUBTOKEN_ACCESS_KEY", "HIPPIUS_PROBE_SUBTOKEN_SECRET_KEY")
@@ -185,20 +205,264 @@ def probe(ev: dict, name: str) -> dict:
     return rows[0]
 
 
-def as_live_evidence(evidence: dict) -> dict:
-    """A fixture-made evidence file relabelled as a live run, to exercise the
-    verifier offline: source ``live``, a clean tool checkout, ``fixture-``
-    request ids renamed, and ``passed`` restated from the recomputed rule."""
+def relabel_as_live(evidence: dict) -> dict:
+    """A fixture-made evidence file RELABELLED as a live run: source ``live``,
+    a clean tool checkout, ``fixture-`` request ids renamed, and ``passed``
+    restated from the recomputed rule.
+
+    This is the forgery RV4 found. Its body is self-consistent, so the body
+    checks (``evidence_problems(..., require_verified=False)``) still run on
+    it, which is what the tampering tests need; but the FULL verifier refuses
+    it (no ``verified_live`` record), and ``storage_probe.verify_live``
+    refuses it against any bucket that does not hold its locked objects.
+    No test may show relabelled evidence passing the full verifier without a
+    bucket that really holds those objects."""
     ev = copy.deepcopy(evidence)
     ev["source"] = "live"
-    ev["tool"]["git_dirty"] = False
-    for p in ev["probes"]:
-        for r in p.get("requests", []):
-            rid = r.get("request_id")
+    if isinstance(ev.get("tool"), dict):
+        ev["tool"]["git_dirty"] = False
+
+    def rename(rec: object) -> None:
+        if isinstance(rec, dict):
+            rid = rec.get("request_id")
             if isinstance(rid, str) and rid.startswith("fixture-"):
-                r["request_id"] = "relabelled-" + rid[len("fixture-"):]
+                rec["request_id"] = "relabelled-" + rid[len("fixture-"):]
+
+    for p in ev.get("probes", []):
+        for r in p.get("requests", []):
+            rename(r)
+    rename(ev.get("bucket_lock"))
+    ev.pop("verified_live", None)
     ev["passed"] = passed_rule(ev)
     return ev
+
+
+# ── the in-process module, offline ───────────────────────────────────────────
+
+
+def probe_module(monkeypatch=None):
+    """``cascade.laned.storage_probe`` imported in-process. With
+    ``monkeypatch``, every socket connect is refused and boto3/botocore are
+    made unimportable first, so an in-process call can't reach Hippius."""
+    require_probe()
+    if monkeypatch is not None:
+        def _blocked(*a, **k):
+            raise OSError("W3a test: network is blocked in-process")
+        monkeypatch.setattr(socket.socket, "connect", _blocked)
+        monkeypatch.setattr(socket.socket, "connect_ex", _blocked)
+        monkeypatch.setattr(socket, "create_connection", _blocked)
+        monkeypatch.setattr(socket, "getaddrinfo", _blocked)
+        for pkg in ("boto3", "botocore"):
+            monkeypatch.setitem(sys.modules, pkg, None)
+    return importlib.import_module(MODULE)
+
+
+# ── a boto3-shaped fake S3 client (reads only) ───────────────────────────────
+
+
+class FakeClientError(Exception):
+    """Shaped like ``botocore.exceptions.ClientError``: ``.response`` carries
+    ``Error.Code`` and ``ResponseMetadata.HTTPStatusCode``."""
+
+    def __init__(self, op: str, code: str, status: int, request_id: str):
+        super().__init__(f"An error occurred ({code}) when calling the {op} operation")
+        self.operation_name = op
+        self.response = {"Error": {"Code": code, "Message": code},
+                         "ResponseMetadata": {"HTTPStatusCode": status, "RequestId": request_id,
+                                              "HTTPHeaders": {"x-amz-request-id": request_id}}}
+
+
+class _Paginator:
+    def __init__(self, fn):
+        self._fn = fn
+
+    def paginate(self, **kw):
+        yield self._fn(**kw)
+
+
+def _etag(data: bytes) -> str:
+    return '"' + hashlib.md5(data).hexdigest() + '"'
+
+
+def _dt(x) -> datetime:
+    return x if isinstance(x, datetime) else datetime.fromisoformat(str(x))
+
+
+class FakeS3:
+    """An in-memory S3 bucket behind a boto3-shaped client: the read calls
+    ``storage_probe`` may make (HEAD, GetObjectRetention, GET, version
+    listing, GetObjectLockConfiguration). Every call is recorded in
+    ``calls`` as ``(op, kwargs)``; any other attribute (a write such as
+    ``put_object``, ``delete_object``, ``put_object_retention``) is recorded
+    in ``forbidden`` and raises. Request ids are ``live-fake-<n>``.
+
+    ``default_retention`` models the bucket's Object Lock default rule, in
+    the GetObjectLockConfiguration shape (``{"Mode": "COMPLIANCE",
+    "Days": 30}``); ``lock_enabled=False`` answers
+    ``ObjectLockConfigurationNotFoundError`` (404); ``lock_error`` =
+    ``(code, status)`` answers that error instead."""
+
+    def __init__(self, bucket: str, *, lock_enabled: bool = True,
+                 default_retention: dict | None = None, rule_present: bool | None = None,
+                 lock_error: tuple[str, int] | None = None):
+        self.bucket = bucket
+        self.lock_enabled = lock_enabled
+        self.default_retention = default_retention
+        self.rule_present = rule_present if rule_present is not None else default_retention is not None
+        self.lock_error = lock_error
+        self.objects: dict[str, list[dict]] = {}
+        self.calls: list[tuple[str, dict]] = []
+        self.forbidden: list[str] = []
+        self._n = 0
+
+    # state
+    def put_version(self, key: str, version_id: str, data: bytes, *, mode: str | None = None,
+                    retain_until=None, etag: str | None = None) -> None:
+        self.objects.setdefault(key, []).append(
+            {"vid": version_id, "data": data, "mode": mode,
+             "retain_until": _dt(retain_until) if retain_until is not None else None,
+             "etag": etag or _etag(data)})
+
+    def _meta(self, status: int = 200) -> dict:
+        self._n += 1
+        rid = f"live-fake-{self._n}"
+        return {"HTTPStatusCode": status, "RequestId": rid, "HTTPHeaders": {"x-amz-request-id": rid}}
+
+    def _err(self, op: str, code: str, status: int):
+        self._n += 1
+        return FakeClientError(op, code, status, f"live-fake-{self._n}")
+
+    def _check_bucket(self, op: str, bucket) -> None:
+        if bucket != self.bucket:
+            raise self._err(op, "NoSuchBucket", 404)
+
+    def _find(self, op: str, key, version_id) -> dict:
+        vs = self.objects.get(key) or []
+        if version_id is None:
+            if vs:
+                return vs[-1]
+        else:
+            for v in vs:
+                if v["vid"] == version_id:
+                    return v
+        raise self._err(op, "NoSuchKey" if op == "GetObject" else "404", 404)
+
+    # the boto3-shaped read surface
+    def get_object_lock_configuration(self, **kw):
+        self.calls.append(("get_object_lock_configuration", dict(kw)))
+        self._check_bucket("GetObjectLockConfiguration", kw.get("Bucket"))
+        if self.lock_error:
+            raise self._err("GetObjectLockConfiguration", *self.lock_error)
+        if not self.lock_enabled:
+            raise self._err("GetObjectLockConfiguration", "ObjectLockConfigurationNotFoundError", 404)
+        cfg: dict = {"ObjectLockEnabled": "Enabled"}
+        if self.rule_present:
+            cfg["Rule"] = ({"DefaultRetention": dict(self.default_retention)}
+                           if self.default_retention is not None else {})
+        return {"ObjectLockConfiguration": cfg, "ResponseMetadata": self._meta()}
+
+    def head_object(self, **kw):
+        self.calls.append(("head_object", dict(kw)))
+        self._check_bucket("HeadObject", kw.get("Bucket"))
+        v = self._find("HeadObject", kw.get("Key"), kw.get("VersionId"))
+        out = {"ContentLength": len(v["data"]), "ETag": v["etag"], "VersionId": v["vid"],
+               "ResponseMetadata": self._meta()}
+        if v["mode"]:
+            out["ObjectLockMode"] = v["mode"]
+            out["ObjectLockRetainUntilDate"] = v["retain_until"]
+        return out
+
+    def get_object_retention(self, **kw):
+        self.calls.append(("get_object_retention", dict(kw)))
+        self._check_bucket("GetObjectRetention", kw.get("Bucket"))
+        v = self._find("GetObjectRetention", kw.get("Key"), kw.get("VersionId"))
+        if not v["mode"]:
+            raise self._err("GetObjectRetention", "NoSuchObjectLockConfiguration", 404)
+        return {"Retention": {"Mode": v["mode"], "RetainUntilDate": v["retain_until"]},
+                "ResponseMetadata": self._meta()}
+
+    def get_object(self, **kw):
+        self.calls.append(("get_object", dict(kw)))
+        self._check_bucket("GetObject", kw.get("Bucket"))
+        v = self._find("GetObject", kw.get("Key"), kw.get("VersionId"))
+        return {"Body": io.BytesIO(v["data"]), "ContentLength": len(v["data"]),
+                "ETag": v["etag"], "VersionId": v["vid"], "ResponseMetadata": self._meta()}
+
+    def list_object_versions(self, **kw):
+        self.calls.append(("list_object_versions", dict(kw)))
+        self._check_bucket("ListObjectVersions", kw.get("Bucket"))
+        pre = kw.get("Prefix", "")
+        vers = [{"Key": k, "VersionId": v["vid"], "IsLatest": i == len(vs) - 1,
+                 "ETag": v["etag"], "Size": len(v["data"])}
+                for k, vs in sorted(self.objects.items()) if k.startswith(pre)
+                for i, v in enumerate(vs)]
+        return {"Versions": vers, "DeleteMarkers": [], "IsTruncated": False,
+                "ResponseMetadata": self._meta()}
+
+    def list_objects_v2(self, **kw):
+        self.calls.append(("list_objects_v2", dict(kw)))
+        self._check_bucket("ListObjectsV2", kw.get("Bucket"))
+        pre = kw.get("Prefix", "")
+        keys = [k for k in sorted(self.objects) if k.startswith(pre)]
+        return {"Contents": [{"Key": k, "Size": len(self.objects[k][-1]["data"])} for k in keys],
+                "KeyCount": len(keys), "IsTruncated": False, "ResponseMetadata": self._meta()}
+
+    def get_paginator(self, name: str):
+        self.calls.append(("get_paginator", {"name": name}))
+        if name not in ("list_object_versions", "list_objects_v2"):
+            self.forbidden.append(f"get_paginator({name})")
+            raise AssertionError(f"FakeS3: no paginator {name!r}")
+        return _Paginator(getattr(self, name))
+
+    def __getattr__(self, name: str):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        self.forbidden.append(name)
+        raise AssertionError(f"FakeS3: {name} is not a read; W3a verify/preflight are read-only")
+
+    def ops(self) -> list[str]:
+        return [op for op, _ in self.calls]
+
+
+def _object_bytes(key: str, size: int) -> bytes:
+    seed = hashlib.sha256(f"w3a-live-fake:{key}".encode()).digest()
+    return (seed * (size // len(seed) + 1))[:size]
+
+
+def live_pair(evidence: dict) -> tuple[dict, FakeS3]:
+    """A live-shaped evidence body and a :class:`FakeS3` bucket that really
+    holds its COMPLIANCE-locked objects: the offline stand-in for "the owner
+    ran the probe on Hippius". Each locked object gets deterministic bytes of
+    its recorded size; the evidence's ``etag``/``sha256`` (in
+    ``locked_objects`` and in the lock probe's ``objects``) are set to what
+    the bucket holds, and the bucket's version id, mode and retain-until are
+    the evidence's. The run root holds nothing else (cleanup was clean)."""
+    ev = copy.deepcopy(evidence)
+    fake = FakeS3(ev.get("bucket"))
+    for lo in ev.get("locked_objects", []):
+        data = _object_bytes(lo["key"], int(lo.get("size") or 0))
+        sha, etag = hashlib.sha256(data).hexdigest(), _etag(data)
+        lo["sha256"], lo["etag"] = sha, etag
+        for p in ev.get("probes", []):
+            if p.get("name") in LOCK_PROBES:
+                for o in p.get("objects", []):
+                    if o.get("key") == lo["key"]:
+                        o["sha256"] = sha
+        fake.put_version(lo["key"], lo["version_id"], data, mode=lo.get("mode"),
+                         retain_until=lo.get("retain_until"), etag=etag)
+    return ev, fake
+
+
+def canonical_body(evidence: dict) -> bytes:
+    """The bytes ``verified_live.body_sha256`` hashes: the evidence object
+    WITHOUT its ``verified_live`` key, as ``json.dumps(sort_keys=True,
+    separators=(",", ":"), ensure_ascii=True)`` encoded UTF-8."""
+    body = {k: v for k, v in evidence.items() if k != "verified_live"}
+    return json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+
+
+def body_sha256(evidence: dict) -> str:
+    return hashlib.sha256(canonical_body(evidence)).hexdigest()
 
 
 # ── chain.toml buckets ───────────────────────────────────────────────────────
@@ -647,13 +911,25 @@ def _locked_problems(data: dict, rows: dict, started, finished, params: dict) ->
         if not isinstance(lo, dict):
             out.append(f"{where}: must be an object")
             continue
-        miss = [k for k in ("key", "version_id", "mode", "retain_until", "size") if k not in lo]
+        miss = [k for k in LOCKED_KEYS if k not in lo]
         if miss:
             out.append(f"{where}: missing keys {miss}")
             continue
         keys.append(lo["key"])
         if lo["key"] not in lock_keys:
             out.append(f"{where}.key {lo['key']!r} is not an object of the two lock probes")
+        if not (isinstance(lo["version_id"], str) and lo["version_id"]):
+            out.append(f"{where}.version_id: a locked object names its version (verify HEADs it)")
+        if not (isinstance(lo["etag"], str) and lo["etag"].strip('"')):
+            out.append(f"{where}.etag: want the HEAD ETag of the locked version")
+        if not (isinstance(lo["sha256"], str) and HEX64_RE.fullmatch(lo["sha256"])):
+            out.append(f"{where}.sha256: want 64 lowercase hex (verify re-reads the bytes)")
+        else:
+            probe_shas = {o.get("sha256") for n in LOCK_PROBES if n in rows
+                          for o in (rows[n].get("objects") or [])
+                          if isinstance(o, dict) and o.get("key") == lo["key"]}
+            if probe_shas and lo["sha256"] not in probe_shas:
+                out.append(f"{where}.sha256 differs from the lock probe's object sha256")
         if lo["mode"] != "COMPLIANCE":
             out.append(f"{where}.mode: want COMPLIANCE, got {lo['mode']!r}")
         if not (_is_int(lo["size"]) and 0 <= lo["size"] <= MAX_LOCKED_BYTES):
@@ -697,9 +973,149 @@ def _locked_problems(data: dict, rows: dict, started, finished, params: dict) ->
     return out
 
 
+def _bucket_lock_problems(data: dict, rows: dict, live: bool) -> list[str]:
+    """The pre-write GetObjectLockConfiguration read (README "bucket_lock")."""
+    bl = data["bucket_lock"]
+    if not isinstance(bl, dict):
+        return ["bucket_lock must be an object"]
+    miss = [k for k in BUCKET_LOCK_KEYS if k not in bl]
+    if miss:
+        return [f"bucket_lock: missing keys {miss}"]
+    out = []
+    if bl["default_retention"] is not None:
+        out.append(f"bucket_lock.default_retention: the bucket has a default retention rule "
+                   f"({bl['default_retention']!r}); the probe must refuse it before writing "
+                   f"({DEFAULT_RETENTION_CODE})")
+    if not isinstance(bl["lock_enabled"], bool):
+        out.append("bucket_lock.lock_enabled must be a bool")
+    try:
+        st = _status(bl["http_status"], "bucket_lock.http_status")
+    except _Bad as e:
+        return out + [str(e)]
+    if st is None:
+        out.append("bucket_lock.http_status: the pre-write lock read was not made")
+    rid = bl["request_id"]
+    if not (isinstance(rid, str) and rid.strip()):
+        out.append("bucket_lock.request_id: the lock read carries its request id")
+    elif live and rid.startswith("fixture-"):
+        out.append("bucket_lock.request_id: fixture request id in live evidence")
+    for n in LOCK_PROBES:
+        obs = rows.get(n, {}).get("observations")
+        if isinstance(obs, dict) and "bucket_lock_enabled" in obs and \
+                obs["bucket_lock_enabled"] is not bl["lock_enabled"]:
+            out.append(f"bucket_lock.lock_enabled disagrees with {n}.bucket_lock_enabled")
+    return out
+
+
+def _rid_ok(rid: object) -> bool:
+    return isinstance(rid, str) and bool(rid.strip()) and not rid.startswith("fixture-")
+
+
+def verified_live_problems(data: dict, *, check_git: bool = True) -> list[str]:
+    """The ``verified_live`` record (README "storage_probe verify"): written
+    by ``python -P -m cascade.laned.storage_probe verify --evidence FILE``
+    after it re-read every COMPLIANCE-locked object from the live bucket. It
+    is hash-bound to the evidence body (``body_sha256``), so any edit to the
+    evidence after verification fails, and every re-read value must equal
+    what the evidence recorded."""
+    rec = data.get("verified_live")
+    if rec is None:
+        return ["verified_live: missing: the evidence was never re-checked against the live "
+                "bucket (run `python -P -m cascade.laned.storage_probe verify --evidence "
+                "evidence/w3a_probe.json` with the HIPPIUS_* environment set, before the locks "
+                "expire); fixture evidence relabelled as live never gets one"]
+    if not isinstance(rec, dict):
+        return ["verified_live must be an object"]
+    miss = [k for k in VERIFY_KEYS if k not in rec]
+    if miss:
+        return [f"verified_live: missing keys {miss}"]
+    out = []
+    if rec["schema"] != VERIFY_SCHEMA:
+        out.append(f"verified_live.schema: want {VERIFY_SCHEMA!r}, got {rec['schema']!r}")
+    if rec["verified"] is not True:
+        out.append(f"verified_live.verified: want true, got {rec['verified']!r}")
+    want_sha = body_sha256(data)
+    if rec["body_sha256"] != want_sha:
+        out.append(f"verified_live.body_sha256 {rec['body_sha256']!r} is not the sha256 of the "
+                   f"evidence body {want_sha}: the evidence changed after verification")
+    for k in ("endpoint_host", "bucket", "run_id"):
+        if rec[k] != data.get(k):
+            out.append(f"verified_live.{k} {rec[k]!r} != evidence {k} {data.get(k)!r}")
+    out += [f"verified_live.{p}" for p in _tool_problems(rec["tool"], check_git)]
+    locked = {lo.get("key"): lo for lo in data.get("locked_objects") or [] if isinstance(lo, dict)}
+    if not locked:
+        out.append("verified_live: the evidence has no locked objects to verify against the bucket")
+    try:
+        at = _ts(rec["verified_at"], "verified_live.verified_at")
+    except _Bad as e:
+        return out + [str(e)]
+    try:
+        if at < _ts(data.get("finished_at"), "finished_at"):
+            out.append("verified_live.verified_at is before the run finished")
+    except _Bad as e:
+        out.append(str(e))
+    objs = rec["objects"]
+    if not isinstance(objs, list):
+        return out + ["verified_live.objects must be a list"]
+    seen = []
+    for i, o in enumerate(objs):
+        where = f"verified_live.objects[{i}]"
+        if not isinstance(o, dict):
+            out.append(f"{where}: must be an object")
+            continue
+        miss = [k for k in VERIFY_OBJECT_KEYS if k not in o]
+        if miss:
+            out.append(f"{where}: missing keys {miss}")
+            continue
+        seen.append(o["key"])
+        lo = locked.get(o["key"])
+        if lo is None:
+            out.append(f"{where}.key {o['key']!r} is not a locked object of the evidence")
+            continue
+        for k in ("version_id", "etag", "sha256", "size"):
+            if o[k] != lo.get(k):
+                out.append(f"{where}.{k}: the bucket gave {o[k]!r}, the evidence records "
+                           f"{lo.get(k)!r}")
+        if o["mode"] != "COMPLIANCE" or o["mode"] != lo.get("mode"):
+            out.append(f"{where}.mode: want COMPLIANCE as recorded, got {o['mode']!r}")
+        try:
+            if not _same_instant(o["retain_until"], lo.get("retain_until"), f"{where}.retain_until"):
+                out.append(f"{where}.retain_until: the bucket gave {o['retain_until']!r}, the "
+                           f"evidence records {lo.get('retain_until')!r}")
+            elif not at < _ts(o["retain_until"], f"{where}.retain_until"):
+                out.append(f"{where}: verified after the lock expired (verified_at >= "
+                           "retain_until): the bucket no longer vouches for the object")
+        except _Bad as e:
+            out.append(str(e))
+        rids = o["request_ids"]
+        if not (isinstance(rids, list) and rids and all(_rid_ok(r) for r in rids)):
+            out.append(f"{where}.request_ids: want the live HEAD/GetObjectRetention/GET "
+                       f"request ids (non-empty, never fixture-), got {rids!r}")
+    if sorted(seen) != sorted(locked):
+        out.append(f"verified_live.objects {sorted(seen)} must be exactly the locked objects "
+                   f"{sorted(k for k in locked if isinstance(k, str))}")
+    lst = rec["listing"]
+    run_root = f"{data.get('prefix')}{data.get('run_id')}/"
+    if not (isinstance(lst, dict) and all(k in lst for k in ("prefix", "keys", "request_id"))):
+        return out + ["verified_live.listing: want {prefix, keys, request_id}"]
+    if lst["prefix"] != run_root:
+        out.append(f"verified_live.listing.prefix: want the run root {run_root!r}, got "
+                   f"{lst['prefix']!r}")
+    if not isinstance(lst["keys"], list) or set(lst["keys"]) != set(locked):
+        out.append(f"verified_live.listing.keys: the run root must hold exactly the locked "
+                   f"objects, got {lst['keys']!r}")
+    if not _rid_ok(lst["request_id"]):
+        out.append("verified_live.listing.request_id: want the live listing's request id")
+    return out
+
+
 def evidence_problems(data: object, *, check_git: bool = True,
-                      live_sizes: bool = True) -> list[str]:
-    """Every reason ``data`` is not acceptable W3a evidence (``[]`` = pass)."""
+                      live_sizes: bool = True, require_verified: bool = True) -> list[str]:
+    """Every reason ``data`` is not acceptable W3a evidence (``[]`` = pass).
+
+    ``require_verified=False`` checks the evidence BODY only (the offline
+    tampering tests); acceptance (L4) always uses the default, which also
+    requires the hash-bound ``verified_live`` record."""
     if not isinstance(data, dict):
         return ["evidence: top level must be a JSON object"]
     missing = [k for k in TOP_KEYS if k not in data]
@@ -757,6 +1173,7 @@ def evidence_problems(data: object, *, check_git: bool = True,
     for i, row in enumerate(rows_list):
         out += _probe_row_problems(i, row, ctx, params, live=data["source"] == "live")
     rows = {r["name"]: r for r in rows_list}
+    out += _bucket_lock_problems(data, rows, live=data["source"] == "live")
     out += _locked_problems(data, rows, started, finished, params)
     want_path = recommended_path(data)
     if data["recommended_path"] != want_path:
@@ -765,6 +1182,8 @@ def evidence_problems(data: object, *, check_git: bool = True,
     want_pass = passed_rule(data)
     if data["passed"] is not want_pass:
         out.append(f"passed: the rule gives {want_pass}, recorded {data['passed']!r}")
+    if require_verified:
+        out += verified_live_problems(data, check_git=check_git)
     return out
 
 

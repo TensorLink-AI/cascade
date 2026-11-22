@@ -4,6 +4,7 @@
   "region": "decentralized",
   "prefix_object_count": 0,
   "bucket_lock_enabled": true,
+  "default_retention": null,
   "bucket_has_policy": false,
   "presigned_upload_part": "supported",
   "single_put_max_bytes": 5368709120,
