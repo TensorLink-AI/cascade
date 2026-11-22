@@ -705,17 +705,26 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
             # The same max-T judgment with the house as the bar: a member
             # clears only if it clears both. ``judge_cohort`` needs a
             # positive gain, so an exact tie with the house never clears
-            # (the house ranks first on ties).
+            # (the house ranks first on ties). RV5: the signed verdict keeps
+            # the KING_D ``lcb`` / ``gain`` and records the house judgement
+            # as ``house``, so a satellite re-derives both from the rows.
             vs_house = judge_cohort(scores[hd], [scores[m] for m in members],
                                     clusters=clusters, cfg=cfg, seed=seed)
-            res = [{**r, "cleared": bool(r["cleared"] and rh["cleared"])}
+            res = [{**r, "cleared": bool(r["cleared"] and rh["cleared"]),
+                    "house": {"digest": hd, "lcb": rh["lcb"], "gain": rh["gain"],
+                              "cleared": bool(rh["cleared"])}}
                    for r, rh in zip(res, vs_house, strict=True)]
         set_sha = hashlib.sha256("\n".join(w["window_id"] for w in ws).encode()).hexdigest()
         t_max = max([king_ts] + [state["entries"][m]["reveal_ts"] for m in members])
-        cohorts.append({"index": len(cohorts), "king_digest": kd, "king_reveal_ts": int(king_ts),
-                        "stage": stage, "members": list(members), "t_max": int(t_max),
-                        "window_ids": [w["window_id"] for w in ws], "set_sha256": set_sha,
-                        "first_seen_roots": [], "refused": refused})
+        cohort = {"index": len(cohorts), "king_digest": kd, "king_reveal_ts": int(king_ts),
+                  "stage": stage, "members": list(members), "t_max": int(t_max),
+                  "window_ids": [w["window_id"] for w in ws], "set_sha256": set_sha,
+                  "first_seen_roots": [], "refused": refused}
+        if len(bars) > 1:
+            # Present only with a house bar (absent, not null, when the
+            # house holds KING_D: one bar, today's shape).
+            cohort["house_digest"] = hd
+        cohorts.append(cohort)
         for m, r in zip(members, res, strict=True):
             rec = state["entries"][m]
             rec["used_windows"] = sorted(set(rec["used_windows"]) | {w["window_id"] for w in ws})
