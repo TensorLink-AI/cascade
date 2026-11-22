@@ -45,13 +45,19 @@ byte-identical.
 
 ### Strict load: `load_state(path, house, *, expect_sha256=None) -> dict`
 
-- A missing file is `genesis(house)`.
+- A missing file is `genesis(house)` here. `settle_lane_d` adds the
+  lost-state check (below): genesis is only ever settled from when no prior
+  settlement artefact exists.
+- A path that exists but can't be read as a file (a directory, an `OSError`
+  on read) is `state_unreadable`, never genesis.
 - Every refusal is `LaneDStateError(ValueError)` with `.code` in
   `STATE_ERROR_CODES`:
 
   | code | when |
   |---|---|
-  | `bad_json` | not UTF-8, not JSON, or not a JSON object |
+  | `bad_json` | not UTF-8, not JSON, or not a JSON object (empty and truncated files included) |
+  | `state_missing` | the state file (or a restore backup) is absent although a prior settlement was persisted (RV6 B3, below) |
+  | `state_unreadable` | the path exists but can't be read as a file |
   | `duplicate_key` | any object, at any depth, repeats a key (checked while parsing, so `json.loads` never silently keeps the last one) |
   | `not_canonical` | the bytes aren't `canonical_state` of what they parse to (any re-indent, inner space, key reorder or trailing newline) |
   | `unknown_schema` | `schema` isn't `STATE_SCHEMA` |
@@ -148,6 +154,58 @@ Structure, per receipt:
   state's `last_report.report_sha256`, it's `report_conflict`.
 - **Older boundary (state boundary > boundary):**
   `LaneDStateError("stale_boundary")`, and nothing changes.
+
+### Lost state fails closed (RV6 B3, invariant 5)
+
+A *persisted report* is a file `lane_d_report_<int>.json` in
+`report_path(state_path, b).parent`. Every refusal below happens before any
+forecast is read or bench call is made, and leaves the whole state directory
+byte-identical (no report, no state, no crown, no pay).
+
+- **Missing state.** The state file is absent and a persisted report exists
+  at any boundary other than the one being settled:
+  `LaneDStateError("state_missing")`. This holds whatever
+  `expect_prior_sha256` says (an expected genesis digest never licenses it).
+  The one exception is the README "Recovery" of the *first* settlement:
+  the only persisted report is this boundary's, so genesis is the true prior.
+- **Unreadable state.** Empty or truncated bytes are `bad_json`; a path that
+  can't be read as a file is `state_unreadable`. Neither is genesis.
+- **Rolled-back state.** The state's `boundary` is below a persisted report's
+  boundary, and that report isn't the one this call recovers (state at b1,
+  reports b1 and b2, settling b3): `state_digest_mismatch`. State at b1 with
+  b2's report, settling b2, is the normal recovery path (it can't be told
+  apart from a crash between the two writes) and ends on the clean run's
+  bytes.
+- **The caller's expected prior.** `settle_lane_d(..., expect_prior_sha256=
+  None)`: when given, the digest of the state as loaded (the genesis digest
+  only when genesis is allowed) must equal it, else `state_digest_mismatch`.
+  W8/W14 thread the last published receipt's `posterior_state_sha256` here.
+- **Genesis** is settled from only when no persisted report exists (an empty
+  `<stem>_reports/` directory counts as none).
+
+### Explicit restore: `restore_state(state_path, backup_path, *, expect_sha256) -> dict`
+
+The only way back from `state_missing` (a rebuild from the report chain isn't
+defined: reports don't carry `used_windows`, `frozen_set` or `confirm`). The
+operator passes a backup (§10.8 snapshot) and the last published receipt's
+`posterior_state_sha256`. In order:
+
+1. the backup is read with the strict load (`state_missing` if absent,
+   `state_unreadable`, `bad_json`, `duplicate_key`, `not_canonical`,
+   `unknown_schema`);
+2. the sha256 of the backup bytes equals `expect_sha256`, else
+   `state_digest_mismatch`;
+3. when the backup's `boundary` is > 0, its `last_report.report_sha256`
+   equals the body digest of the persisted report at that boundary (and that
+   file exists), else `report_conflict`.
+
+On success the backup bytes are written atomically to `state_path` (byte for
+byte) and the parsed state is returned; persisted reports are never touched.
+On refusal nothing is written. The next settlement then continues the chain:
+its receipt equals the clean run's, and its prior is the restored posterior.
+An operator CLI wrapping it (e.g. `python -P -m cascade.validator.lane_d_state
+restore --state <path> --backup <path> --expect-sha256 <hex>`) is the
+implementer's choice and isn't pinned.
 - **Determinism:** two runs of the same chain on the same pool bytes give
   byte-identical state files and equal receipts at every boundary, under any
   `PYTHONHASHSEED`. A crash at either rename, followed by recovery, ends on
@@ -165,6 +223,11 @@ Structure, per receipt:
   `pinned_report_signer`, and `verify_receipt` doesn't call it.
 - What a re-call does when the persisted report file is deleted, and what
   `verify_receipt_chain([])` does.
+- Whether `restore_state` refuses to overwrite an existing live state file,
+  and what `expect_prior_sha256` does on a re-call at a settled boundary.
+- Whether the lost-state check lives in `load_state` (e.g. behind a keyword)
+  or in `settle_lane_d`; `load_state` on a fresh path with no reports stays
+  genesis.
 - Temp files left behind by a crash.
 - An optional up-front refusal: a settlement given a hand-edited
   (still-canonical) state may raise `state_digest_mismatch` instead of
@@ -182,6 +245,14 @@ Structure, per receipt:
 | most of `test_w7c_state.py`, `test_w7c_receipt.py` and `test_w7c_restart.py` | `ImportError` for a new name in `lane_d_state.py` (in PATHS): `LaneDStateError`, `LaneDReceiptError`, `state_digest`, `canonical_state`, `report_path`, `load_report_file`, `verify_receipt`, `verify_receipt_chain`, `RECEIPT_SCHEMA`, `*_ERROR_CODES` |
 | `test_state_file_is_exactly_the_canonical_bytes_of_the_state`, `test_save_state_writes_canonical_bytes_via_fsync_then_rename` | assert: `save_state` writes `indent=1` |
 | `test_receipt_unchanged_when_unarmed`, `test_state_binds_the_report_body_and_the_prior_never_the_signature`, `test_inv5_t11_no_double_crown_across_repeated_restarts`, `test_inv5_receipts_are_independent_of_the_hash_seed` | assert: `LaneDSettlement` has no `receipt`, a re-call is refused, and `last_report` carries the randomized signature |
+| `test_w7c_lost_state.py` (RV6 B3; missing/rolled-back state, expected prior) | assert: main settles from genesis (`DID NOT RAISE`; the reproduction shows `king_before` = the house and X re-judged) or rolls back silently |
+| `test_w7c_lost_state.py` (directory at the state path) | `IsADirectoryError` instead of `LaneDStateError("state_unreadable")` |
+| `test_w7c_lost_state.py` (`expect_prior_sha256`) | `TypeError`: `settle_lane_d` has no such keyword |
+| `test_w7c_lost_state.py` (restore) | `ImportError`: no `restore_state` |
+| both `test_error_codes_are_exported` / `test_rv6_b3_error_codes_include_the_lost_state_codes` | assert: `STATE_ERROR_CODES` lacks `state_missing`, `state_unreadable` |
 
-`test_a_crash_at_the_rename_leaves_the_previous_state_intact` passes on main.
+`test_a_crash_at_the_rename_leaves_the_previous_state_intact` passes on main,
+and so do the lost-state tests that pin what must keep working (genesis with
+no artefacts, first-settlement recovery, recovery from b1 state with only
+b2's report, empty/truncated state as `bad_json`).
 The atomic write is already there, and W7c keeps it.
