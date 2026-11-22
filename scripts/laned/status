@@ -19,11 +19,22 @@ Levels follow §17.1 (tests/accept/w0c/README) with one addition for a
 VERIFICATION WP (accept --help, MODE verification), i.e. one listed in
 scripts/laned/verification_wps at REF (any other WP's verification runs are
 ignored, RV5): when the ledger has a green `verification` run for the WP, the first first-parent commit at or
-after the one adding its PATHS that changes only tests/accept/<wp>/ and whose
-test dir tree equals the run's `tests_tree` (or whose sha is the run's
+after the one adding its PATHS that changes only tests/accept/ files (some
+under tests/accept/<wp>/) and whose test dir tree equals the run's `tests_tree` (or whose sha is the run's
 `head_sha`) is the merge of that PR and counts as both L1 and L2; the L2
 commit is the earlier of it and the implementation commit. L3 and above
 follow from it as usual (the push-to-main Accept run on or after it).
+
+L1 comes from a green `expect-fail` run of the WP. A run that records
+`tests_tree` (every tests-only PR run) counts only through the commit it
+attributes to: the first first-parent commit at or after the one adding the
+WP's PATHS that changes only tests/accept/ files, some under tests/accept/<wp>/,
+with that tree (`l1_commit`). A batch tests-only squash merge (several WPs'
+test dirs, plan rev6.2 (h)) is thereby L1 for each WP via each WP's own
+tests_tree, and never an L2 implementation commit for any of them (a
+tests-only commit is not one); a verification WP in a batch takes its L2 from
+the same commit. Runs without the field (dispatch bootstrap, older entries)
+count as before.
 
 Ci-only WPs pass L4 automatically (§17.1). L4 for external WPs and an
 execution-stage gate need the evidence blob at REF to
@@ -299,7 +310,7 @@ class Board:
 
     def verification_commit(self, wp: str, runs: list[dict]) -> int | None:
         """First-parent index of the merge of a green ``verification`` PR run:
-        the first commit changing only tests/accept/<wp>/ whose test dir tree
+        the first tests-only commit touching tests/accept/<wp>/ whose test dir tree
         is a run's ``tests_tree`` (or whose sha is a run's ``head_sha``)."""
         if not runs:
             return None
@@ -366,8 +377,20 @@ class Board:
         det: dict = {}
         self.detail[wp] = det
         paths_text = self.tree.show(f"tests/accept/{d}/PATHS")
-        expect_fail_ok = any(r.get("wp") == wp and r.get("mode") == "expect-fail"
-                             and r.get("conclusion") == "success" for r in self.runs)
+        xf_runs = [r for r in self.runs if r.get("wp") == wp and r.get("mode") == "expect-fail"
+                   and r.get("conclusion") == "success"]
+        # BATCH (plan rev6.2 (h)): a run that records the WP's tests_tree gives
+        # L1 only through the commit on REF's first-parent line it attributes
+        # to (tests_commit_index: a tests-only commit, batch squash merges
+        # included, whose tests/accept/<wp>/ tree is that tests_tree). A run
+        # without the field (dispatch bootstrap, older ledger entries) counts
+        # as before.
+        xf_trees = {r["tests_tree"] for r in xf_runs if isinstance(r.get("tests_tree"), str)}
+        l1 = lanedlib.tests_commit_index(self.tree.root, self.tree.history, wp, xf_trees, set()) \
+            if xf_trees and paths_text is not None else None
+        if l1 is not None:
+            det["l1_commit"] = self.tree.history[l1][0]
+        expect_fail_ok = l1 is not None or any("tests_tree" not in r for r in xf_runs)
         verified = [r for r in self.runs if r.get("wp") == wp and r.get("mode") == "verification"
                     and r.get("conclusion") == "success"]
         if verified and wp not in self.verification_wps:
@@ -886,6 +909,88 @@ def cmd_selftest() -> int:
         expect(lv == "L0" and data["wps"]["V1"].get("l2_via") is None
                and data["wps"]["V1"].get("verification_refused"),
                f"an undeclared WP's verification run gave {lv} ({data['wps']['V1']}), want L0, refused")
+
+        # (5) BATCH (plan rev6.2 (h)): one tests-only PR for B1, B2, B3, each
+        # checked and run on its own (accept --check-pr --pr-wps, then
+        # --verification -> expect-fail with its own TESTS-TREE), squash-merged:
+        # the merge commit is L1 for all three, L2 for none.
+        put(PLAN, SELFTEST_PLAN + "| V1 | Verification of C1 | C1 | ci | `scripts/laned/accept V1` |\n"
+            + "".join(f"| {w} | batch {w} | — | ci | `scripts/laned/accept {w}` |\n"
+                      for w in ("B1", "B2", "B3", "B4", "V2")))
+        put(lanedlib.VERIFICATION_WPS_PATH, "# verification WPs\nV2  # checks C1\n")
+        commit("plan batch")
+
+        def batch_pr(name: str, files: dict[str, str], labels: list[str]) -> tuple[str, dict[str, dict]]:
+            """Branch ``name`` off HEAD with ``files``, run the PR job's per-WP
+            steps, squash-merge it; (squash sha, {WP: ledger entry})."""
+            start = lanedlib.git(root, "rev-parse", "HEAD").stdout.strip()
+            branch = lanedlib.git(root, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+            lanedlib.git(root, "checkout", "-q", "-b", name)
+            for rel, text in files.items():
+                put(rel, text)
+            head = commit(f"{name} (PR head)")
+            entries: dict[str, dict] = {}
+            for wp in labels:
+                proc = subprocess.run([sys.executable, str(accept), wp, "--check-pr", "--base", start,
+                                       "--head", head, "--pr-wps", ",".join(labels), "--root", str(root)],
+                                      capture_output=True, text=True, env=env)
+                expect(proc.returncode == 0 and "MODE tests-only\n" in proc.stdout,
+                       f"batch {name}: {wp} check-pr did not print MODE tests-only: {proc.stdout[-1500:]}")
+                proc = subprocess.run([sys.executable, str(accept), wp, "--verification", "--base", start,
+                                       "--head", head, "--root", str(root)], capture_output=True, text=True, env=env)
+                mode = re.findall(r"^LEDGER-MODE (\S+)$", proc.stdout, re.M)
+                tree_m = re.findall(r"^TESTS-TREE (\S+)$", proc.stdout, re.M)
+                expect(proc.returncode == 0 and mode and tree_m
+                       and tree_m[-1] == lanedlib.wp_tree_at(root, head, wp),
+                       f"batch {name}: {wp} --verification failed or printed no TESTS-TREE: {proc.stdout[-1500:]}")
+                entries[wp] = {"workflow": "laned-accept", "event": "pull_request",
+                               "mode": mode[-1] if mode else "expect-fail", "wp": wp, "head_sha": head,
+                               "conclusion": "success" if proc.returncode == 0 else "failure",
+                               "tests_tree": tree_m[-1] if tree_m else ""}
+            lanedlib.git(root, "checkout", "-q", branch)
+            lanedlib.git(root, "merge", "-q", "--squash", name)
+            return commit(f"{name} (#2)"), entries
+
+        three = {}
+        for n in (1, 2, 3):
+            three[f"tests/accept/b{n}/PATHS"] = f"b{n}/\n"
+            three[f"tests/accept/b{n}/test_b{n}.py"] = (f"import b{n}.mod\n\n\ndef test_b{n}():\n"
+                                                        f"    assert b{n}.mod.VALUE\n")
+        squash, entries = batch_pr("pr-batch", three, ["B1", "B2", "B3"])
+        _, data = level(list(entries.values()), "B1")
+        for wp in ("B1", "B2", "B3"):
+            det = data["wps"][wp]
+            expect(entries[wp]["mode"] == "expect-fail", f"batch {wp} ledger mode {entries[wp]['mode']}")
+            expect(det["level"] == "L1" and det.get("l1_commit") == squash and "l2_commit" not in det,
+                   f"batch {wp}: {det['level']} l1_commit={det.get('l1_commit')} l2={det.get('l2_commit')}, "
+                   f"want L1 at the squash merge {squash}, no L2")
+        trees = {entries[w]["tests_tree"] for w in entries}
+        expect(len(trees) == 3, f"batch WPs share a tests tree: {trees}")
+        # a run whose tests_tree is not on REF's first-parent line gives no L1;
+        # neither does another WP's tree
+        lv, _ = level([dict(entries["B1"], tests_tree="0" * 40)], "B1")
+        expect(lv == "L0", f"an expect-fail run for an unmerged tests tree gave {lv}, want L0")
+        lv, _ = level([dict(entries["B1"], tests_tree=entries["B2"]["tests_tree"])], "B1")
+        expect(lv == "L0", f"B1 took L1 from B2's tests tree: {lv}")
+        # a run without tests_tree (dispatch bootstrap) still gives L1 as before
+        lv, _ = level([{k: v for k, v in entries["B1"].items() if k != "tests_tree"}], "B1")
+        expect(lv == "L1", f"an expect-fail run without tests_tree gave {lv}, want L1")
+        # a batch with a declared verification WP: V2 (over C1's built file)
+        # takes L1 and L2 from the batch squash commit, B4 only L1
+        squash2, entries2 = batch_pr("pr-batch2", {
+            "tests/accept/b4/PATHS": "b4/\n",
+            "tests/accept/b4/test_b4.py": "import b4.mod\n\n\ndef test_b4():\n    assert b4.mod.VALUE\n",
+            "tests/accept/v2/PATHS": "c1/tool.py\n",
+            "tests/accept/v2/test_v2.py": "def test_v2():\n    assert True\n"}, ["B4", "V2"])
+        _, data = level(list(entries.values()) + list(entries2.values()), "V2")
+        v2, b4 = data["wps"]["V2"], data["wps"]["B4"]
+        expect(entries2["V2"]["mode"] == "verification" and v2["level"] == "L2"
+               and v2.get("l2_commit") == squash2 and v2.get("l2_via") == "verification",
+               f"batch V2: mode {entries2['V2']['mode']}, {v2}, want L2 via verification at {squash2}")
+        expect(b4["level"] == "L1" and b4.get("l1_commit") == squash2 and "l2_commit" not in b4,
+               f"batch B4: {b4}, want L1 at {squash2}")
+        expect(all(data["wps"][w]["level"] == "L1" for w in ("B1", "B2", "B3")),
+               "a later batch changed B1-B3's level")
     for f in failures:
         print(f"status selftest: FAIL {f}", file=sys.stderr)
     if failures:

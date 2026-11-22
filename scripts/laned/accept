@@ -14,9 +14,10 @@
         below), else exactly --expect-fail
     accept <WP> --tests-correction --base REF --head REF [--root R]
         tests-only PRs for a WP already built on BASE (see MODE rules below)
-    accept <WP> --check-pr --base REF --head REF [--root R]
+    accept <WP> --check-pr --base REF --head REF [--pr-wps WP,WP...] [--root R]
         rule 1 and the WP's PATHS over `git diff --name-only BASE...HEAD`;
-        prints the MODE the PR job runs next (rules below);
+        prints the MODE the PR job runs next (rules below); --pr-wps names
+        every laned:<WP> label of the PR (BATCH rule below);
         for a review WP RV<n>: MODE review iff the diff is exactly an add or
         modify of evidence/rv<n>.md (no tests run)
     accept <WP>[,<WP>...] --cross --base REF --head REF [--root R]
@@ -95,6 +96,20 @@ MODE rules of --check-pr (the PR job runs the named mode next):
                           file the Accept cell does not declare (and PATHS do
                           not cover) -> FAIL evidence.
     MODE review           RV<n> label, the diff is exactly evidence/rv<n>.md
+
+BATCH rule (plan rev6.2 item (h)): a tests-only PR may carry several WPs'
+tests. When --pr-wps names more than one label and the diff is only under
+tests/accept/, check-pr requires: every path is inside some
+tests/accept/<wp>/ dir; each such dir belongs to a label of the set; each
+label's dir is in the diff; every label is a WP (no RV<n>); and no WP of the
+set is built on BASE (L2 commit: its tests PR is a tests-correction, one WP
+per PR). Otherwise `FAIL rule1: batch-<reason>: ...` with reason
+non-wp-label, duplicate-label, stray-tests, unlabelled-tests,
+label-without-tests or built-wp. When it holds, check-pr prints
+`BATCH <WPs>` and `MODE tests-only` for each WP; the PR job then runs each
+WP's --verification separately (its own TESTS-TREE in the ledger) and fails
+when any WP fails. Code + tests is still rule 1 (one diff never mixes them).
+A single label keeps the one-WP rule (another WP's tests dir fails rule 1).
 
 CROSS rule (the PR job runs it after the PR's own WP steps, every mode but
 review): a WP other than the PR's own WP(s) is re-accepted when
@@ -392,7 +407,12 @@ def cmd_verification(root: Path, wp: str, base: str, head: str) -> int:
     or any Accept step failing) the run is the classic ``--expect-fail``.
     The last line before the result names the ledger mode: ``LEDGER-MODE
     verification`` (with ``TESTS-TREE <sha>`` of tests/accept/<wp>/ at HEAD)
-    or ``LEDGER-MODE expect-fail``."""
+    or ``LEDGER-MODE expect-fail``. Every run first prints ``TESTS-TREE <sha>``
+    of tests/accept/<wp>/ at HEAD when it exists: the ledger records it for
+    either mode, so the board attributes the merge commit per WP (BATCH)."""
+    head_tree = lanedlib.wp_tree_at(root, head, wp)
+    if head_tree:
+        print(f"TESTS-TREE {head_tree}")
     paths = read_paths(root, wp)
     if paths is None or not test_dir(root, wp).is_dir():
         print("LEDGER-MODE expect-fail")
@@ -499,7 +519,57 @@ def cmd_check_pr_evidence(root: Path, wp: str, base: str, head: str,
     return None
 
 
-def cmd_check_pr(root: Path, wp: str, base: str, head: str) -> int:
+def cmd_check_pr_batch(root: Path, pr_wps: list[str], base: str,
+                       tests: list[str]) -> int:
+    """BATCH rule (module docstring): a tests-only diff for the label set
+    ``pr_wps`` (more than one WP). Each WP's tests dir is touched only under
+    its own label, every label has its tests dir in the diff, and no batched
+    WP is already built on BASE (that PR is a tests-correction: one WP per
+    PR). Fails closed with ``FAIL rule1: batch-<reason>: ...``."""
+    def refuse(reason: str, detail: str) -> int:
+        return fail("rule1", f"batch-{reason}: {detail}")
+
+    non_wp = [w for w in pr_wps if REVIEW_WP.match(w)]
+    if non_wp:
+        return refuse("non-wp-label", "a batch tests-only PR carries only laned:<WP> labels of the WPs "
+                      "whose tests it adds; it also has: " + " ".join(f"laned:{w}" for w in non_wp))
+    by_dir: dict[str, str] = {}
+    for w in pr_wps:
+        d = lanedlib.wp_dir(w)
+        if d in by_dir:
+            return refuse("duplicate-label", f"laned:{by_dir[d]} and laned:{w} name the same "
+                          f"tests/accept/{d}/")
+        by_dir[d] = w
+    touched: dict[str, list[str]] = {}
+    stray: list[str] = []
+    for p in tests:
+        parts = p.split("/")
+        if len(parts) < 4:  # tests/accept/<file>: not inside a WP's tests dir
+            stray.append(p)
+        else:
+            touched.setdefault(parts[2], []).append(p)
+    if stray:
+        return refuse("stray-tests", "paths under tests/accept/ outside every WP's tests dir: "
+                      + " ".join(sorted(stray)))
+    unlabelled = sorted(d for d in touched if d not in by_dir)
+    if unlabelled:
+        return refuse("unlabelled-tests", "tests dir(s) without their laned:<WP> label: "
+                      + " ".join(f"tests/accept/{d}/" for d in unlabelled))
+    missing = sorted(w for d, w in by_dir.items() if d not in touched)
+    if missing:
+        return refuse("label-without-tests", "label(s) whose tests/accept/<wp>/ the diff does not touch: "
+                      + " ".join(f"laned:{w}" for w in missing))
+    built = [w for w in pr_wps if built_on(root, base, w)]
+    if built:
+        return refuse("built-wp", f"{' '.join(built)} already built on {base} (L2 commit): its tests PR "
+                      "is a tests-correction, one WP per PR")
+    print("BATCH " + " ".join(pr_wps))
+    print("MODE tests-only")
+    return 0
+
+
+def cmd_check_pr(root: Path, wp: str, base: str, head: str,
+                 pr_wps: list[str] | None = None) -> int:
     m = REVIEW_WP.match(wp)
     if m:
         return cmd_check_pr_review(root, wp, m.group(1), base, head)
@@ -513,6 +583,9 @@ def cmd_check_pr(root: Path, wp: str, base: str, head: str) -> int:
     others = [p for p in diff if not p.startswith("tests/accept/")]
     if tests and others:
         return fail("rule1", "tests/accept/ edited together with: " + " ".join(others))
+    labels = list(dict.fromkeys([*(pr_wps or []), wp]))
+    if tests and len(labels) > 1:
+        return cmd_check_pr_batch(root, labels, base, tests)
     if tests:
         own = f"tests/accept/{lanedlib.wp_dir(wp)}/"
         foreign = [p for p in tests if not p.startswith(own)]
@@ -1681,6 +1754,120 @@ def selftest_freshness(ident: tuple[str, ...]) -> list[str]:
     return failures
 
 
+def _batch_test(n: int, wrong: bool = False) -> str:
+    """tests/accept/b<n>/test_b<n>.py: a right-reason failure (missing module
+    in its PATHS), or a wrong-reason one (missing module outside PATHS)."""
+    mod = "laned_no_such_dep" if wrong else f"pkg_b{n}"
+    return f"import {mod}\n\n\ndef test_b{n}():\n    assert {mod}.VALUE == {n}\n"
+
+
+def selftest_batch(ident: tuple[str, ...]) -> list[str]:
+    """The BATCH rule of --check-pr and the per-WP --verification runs the PR
+    job makes for it, on a real git repo and real pytest. B1..B3 are new WPs
+    (PATHS pkg_b<n>.py, not built); K is built on BASE (L2 commit)."""
+    failures: list[str] = []
+    saved = os.environ.get("LANED_PYTEST_CMD")
+    os.environ["LANED_PYTEST_CMD"] = shlex.join([sys.executable, "-m", "pytest", "-p", "no:cacheprovider"])
+    try:
+        with tempfile.TemporaryDirectory(prefix="laned-accept-selftest-batch-") as tmp:
+            root = Path(tmp) / "repo"
+            root.mkdir()
+
+            def commit(files: dict[str, str], msg: str) -> str:
+                for rel, text in files.items():
+                    (root / rel).parent.mkdir(parents=True, exist_ok=True)
+                    (root / rel).write_text(text)
+                lanedlib.git(root, "add", "-A")
+                lanedlib.git(root, *ident, "commit", "-q", "-m", msg)
+                return lanedlib.git(root, "rev-parse", "HEAD").stdout.strip()
+
+            lanedlib.git(root, "init", "-q")
+            commit({"README.md": "x\n", ".gitignore": "__pycache__/\n", "pkg_k.py": "VALUE = 0\n"}, "seed")
+            commit({"tests/accept/k/PATHS": "pkg_k.py\n",
+                    "tests/accept/k/test_k.py": "import pkg_k\n\n\ndef test_k():\n    assert pkg_k.VALUE == 1\n"},
+                   "tests-only K")
+            base = commit({"pkg_k.py": "VALUE = 1\n"}, "impl K")
+
+            def b_files(*ns: int, wrong: int = 0) -> dict[str, str]:
+                out: dict[str, str] = {}
+                for n in ns:
+                    out[f"tests/accept/b{n}/PATHS"] = f"pkg_b{n}.py\n"
+                    out[f"tests/accept/b{n}/test_b{n}.py"] = _batch_test(n, wrong=n == wrong)
+                return out
+
+            def case(name: str, files: dict[str, str], labels: list[str],
+                     want: str | dict[str, bool]) -> None:
+                """``want``: a batch-<reason> refusal every label's check-pr
+                must print, or {WP: verification run passes} per label."""
+                lanedlib.git(root, "checkout", "-q", "-B", name, base)
+                head = commit(files, name)
+                for wp in labels:
+                    with contextlib.redirect_stdout(io.StringIO()) as buf:
+                        rc = cmd_check_pr(root, wp, base, head, labels)
+                    out = buf.getvalue()
+                    if isinstance(want, str):
+                        if REVIEW_WP.match(wp):  # its own check-pr is the review rule: any refusal
+                            if rc == 0:
+                                failures.append(f"batch {name}: {wp} check-pr passed: {out.strip()}")
+                            continue
+                        if rc == 0 or f"FAIL rule1: {want}" not in out:
+                            failures.append(f"batch {name}: {wp} check-pr rc={rc}, want FAIL rule1: {want}: "
+                                            f"{out.strip()}")
+                        continue
+                    if rc != 0 or "MODE tests-only\n" not in out or f"BATCH {' '.join(labels)}\n" not in out:
+                        failures.append(f"batch {name}: {wp} check-pr rc={rc}, want MODE tests-only: {out.strip()}")
+                        continue
+                    with contextlib.redirect_stdout(io.StringIO()) as buf, \
+                            contextlib.redirect_stderr(io.StringIO()):
+                        rc = cmd_verification(root, wp, base, head)
+                    out = buf.getvalue()
+                    tree = lanedlib.wp_tree_at(root, head, wp)
+                    ok = rc == 0 and "LEDGER-MODE expect-fail\n" in out
+                    if ok != want[wp] or f"TESTS-TREE {tree}\n" not in out:
+                        failures.append(f"batch {name}: {wp} verification {'passed' if ok else 'failed'}, "
+                                        f"want {'pass' if want[wp] else 'fail'} with TESTS-TREE {tree}: "
+                                        f"{out.strip()[-1500:]}")
+
+            three = ["B1", "B2", "B3"]
+            # a 3-WP batch: every WP's own expect-fail run passes, each with its own tests tree
+            case("three", b_files(1, 2, 3), three, {"B1": True, "B2": True, "B3": True})
+            # one WP's wrong-reason failure: that WP's run fails (the PR job fails), the others pass
+            case("one-wrong-reason", b_files(1, 2, 3, wrong=2), three, {"B1": True, "B2": False, "B3": True})
+            # a batch including a WP already built on BASE (K, L2) -> refused for every label
+            case("built-wp", {**b_files(1, 2), "tests/accept/k/test_k_more.py": SELFTEST_PASSING},
+                 ["B1", "B2", "K"], "batch-built-wp")
+            # a tests dir without its label -> refused
+            case("unlabelled", b_files(1, 2, 3), ["B1", "B2"], "batch-unlabelled-tests")
+            # a label without its tests dir -> refused
+            case("label-without-tests", b_files(1, 2), three, "batch-label-without-tests")
+            # a review label in a tests batch -> refused
+            case("review-label", b_files(1, 2), ["B1", "B2", "RV9"], "batch-non-wp-label")
+            # a tests/accept/ file outside every WP dir -> refused
+            case("stray", {**b_files(1, 2), "tests/accept/conftest.py": "\n"}, ["B1", "B2"],
+                 "batch-stray-tests")
+            # code + tests in one batch diff: rule 1 as before
+            lanedlib.git(root, "checkout", "-q", "-B", "code-plus-tests", base)
+            head = commit({**b_files(1, 2), "pkg_b1.py": "VALUE = 1\n"}, "code-plus-tests")
+            with contextlib.redirect_stdout(io.StringIO()) as buf:
+                rc = cmd_check_pr(root, "B1", base, head, ["B1", "B2"])
+            if rc == 0 or "FAIL rule1: tests/accept/ edited together with: pkg_b1.py" not in buf.getvalue():
+                failures.append(f"batch code-plus-tests: rc={rc}: {buf.getvalue().strip()}")
+            # one label, another WP's tests too: the single-WP rule is unchanged
+            lanedlib.git(root, "checkout", "-q", "-B", "single-foreign", base)
+            head = commit(b_files(1, 2), "single-foreign")
+            for labels in (None, ["B1"]):
+                with contextlib.redirect_stdout(io.StringIO()) as buf:
+                    rc = cmd_check_pr(root, "B1", base, head, labels)
+                if rc == 0 or "touches another WP's tests" not in buf.getvalue():
+                    failures.append(f"batch single-foreign {labels}: rc={rc}: {buf.getvalue().strip()}")
+    finally:
+        if saved is None:
+            os.environ.pop("LANED_PYTEST_CMD", None)
+        else:
+            os.environ["LANED_PYTEST_CMD"] = saved
+    return failures
+
+
 def cmd_selftest() -> int:
     """Offline check of the RV<n> review mode of --check-pr and of the
     tests-only / tests-correction MODE rules."""
@@ -1730,6 +1917,7 @@ def cmd_selftest() -> int:
     failures += selftest_evidence(ident)
     failures += selftest_cross(ident)
     failures += selftest_freshness(ident)
+    failures += selftest_batch(ident)
     for f in failures:
         print(f"accept selftest: FAIL {f}", file=sys.stderr)
     if failures:
@@ -1764,6 +1952,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--freshness", action="store_true",
                     help="(needs --base/--head/--main) STALE BASE when main moved past the tested base "
                          "with changes the PR's paths touch or import")
+    ap.add_argument("--pr-wps", metavar="WP[,WP...]",
+                    help="--check-pr: every laned:<WP> label of the PR (BATCH rule for tests-only PRs)")
     ap.add_argument("--base")
     ap.add_argument("--head")
     ap.add_argument("--main", metavar="REF", help="--freshness: main's current tip (origin/main)")
@@ -1785,7 +1975,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.check_pr:
         if not (args.base and args.head):
             ap.error("--check-pr needs --base and --head")
-        return cmd_check_pr(root, args.wp, args.base, args.head)
+        pr_wps = [w for w in re.split(r"[,\s]+", args.pr_wps or "") if w]
+        return cmd_check_pr(root, args.wp, args.base, args.head, pr_wps)
     if args.verification:
         if not (args.base and args.head):
             ap.error("--verification needs --base and --head")
