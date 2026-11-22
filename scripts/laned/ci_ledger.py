@@ -96,7 +96,8 @@ def cmd_record(args: argparse.Namespace) -> int:
         # the blob sha of the evidence (or gate) file the run verified
         data["runs"][-1]["evidence_sha"] = args.evidence_sha
     if args.tests_tree:
-        # verification: tree sha of tests/accept/<wp>/ the run checked (status
+        # tests-only runs (verification / expect-fail): tree sha of
+        # tests/accept/<wp>/ the run checked (status
         # finds the merge commit on main by it, squash merges included)
         data["runs"][-1]["tests_tree"] = args.tests_tree
     if args.run_id is not None:
@@ -285,7 +286,8 @@ def main(argv: list[str] | None = None) -> int:
     rec.add_argument("--run-id", type=int)
     rec.add_argument("--run-head-sha", help="the run's own head sha when it differs (workflow_dispatch)")
     rec.add_argument("--evidence-sha", help="blob sha of the evidence/gate file the run verified")
-    rec.add_argument("--tests-tree", help="verification: tree sha of tests/accept/<wp>/ the run checked")
+    rec.add_argument("--tests-tree",
+                     help="tests-only runs (verification, expect-fail): tree sha of tests/accept/<wp>/ the run checked")
     har = sub.add_parser("harvest")
     har.add_argument("--repo", required=True)
     har.add_argument("--out", required=True)
