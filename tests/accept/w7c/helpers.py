@@ -80,7 +80,9 @@ LAST_REPORT_KEYS = ("boundary", "rows_sha256", "report_sha256", "prior_state_sha
 STATE_ERROR_CODES = ("bad_json", "duplicate_key", "not_canonical", "unknown_schema",
                      "state_digest_mismatch", "stale_boundary", "report_conflict",
                      # RV6 B3: lost state after a settlement fails closed
-                     "state_missing", "state_unreadable")
+                     "state_missing", "state_unreadable",
+                     # RV7 B1: a persisted report recovery cannot verify
+                     "report_unverified")
 RECEIPT_ERROR_CODES = ("not_object", "unknown_schema", "missing_field", "unknown_field",
                        "bad_value", "boundary_mismatch", "report_mismatch", "state_mismatch",
                        "boundary_order", "chain_break")
@@ -263,6 +265,15 @@ class BenchHost:
                     for s in suites if s in self.table.get(d, {})} for d in digests}
 
 
+class FlakyHost(BenchHost):
+    """A bench pod that is down: every sweep call is logged, then raises (the
+    settlement records the candidate as ``bench_hold``)."""
+
+    def __call__(self, digests, suites) -> dict:
+        self.calls.append((tuple(digests), tuple(suites)))
+        raise ConnectionError("w7c bench pod unreachable")
+
+
 GATE_KEYWORDS = ("boundary_block_hash", "sentinel", "bench")
 
 
@@ -343,12 +354,20 @@ class Chain:
         p.parent.mkdir(parents=True, exist_ok=True)
         return p
 
-    def settle(self, n: int, state_path: Path, *, cfg=None, forecasts=None, **extra):
+    def passing_host(self, x_factor: float = 0.9) -> BenchHost:
+        """The bench pod answering with X at `x_factor` of the references
+        (0.9 passes the gate; above 1 regresses)."""
+        return BenchHost({self.house["digest"]: 1.0, self.x["digest"]: float(x_factor)})
+
+    def settle(self, n: int, state_path: Path, *, cfg=None, forecasts=None, host=None,
+               session: str | None = None, **extra):
         """`settle_lane_d` at boundary(n) on snapshot n (earlier snapshots
-        retained). The gate inputs (a passing bench session) are passed
-        whenever `settle_lane_d` takes them: an armed crowning without them
-        fails closed (W5e RV5). `extra` keywords (e.g. `expect_prior_sha256`)
-        are passed through unchanged."""
+        retained). The gate inputs are passed whenever `settle_lane_d` takes
+        them: an armed crowning without them fails closed (W5e RV5). The
+        bench session is `session` (default `w7c-sess-b<n>`) over `host`
+        (default a passing pod, `passing_host()`); the host used is appended
+        to `self.hosts`. `extra` keywords (e.g. `expect_prior_sha256`) are
+        passed through unchanged."""
         from cascade.validator.lane_d import settle_lane_d
 
         kw = dict(extra)
@@ -357,10 +376,10 @@ class Chain:
         if settle_takes_gate_inputs():
             from cascade.validator.lane_d_bench import SweepSession
 
-            host = BenchHost({self.house["digest"]: 1.0, self.x["digest"]: 0.9})
+            host = self.passing_host() if host is None else host
             self.hosts.append(host)
             kw.update(boundary_block_hash=block_hash(f"b{n}"), sentinel=None,
-                      bench=SweepSession(f"w7c-sess-b{n}", host))
+                      bench=SweepSession(session or f"w7c-sess-b{n}", host))
         fc = self.forecasts if forecasts is None else forecasts
         return settle_lane_d(cfg=cfg if cfg is not None else lane_d_cfg(), boundary=boundary(n),
                              pool_dir=self.pools[n - 1], entries=[dict(self.x)],
@@ -400,6 +419,28 @@ def crash_on_rename(monkeypatch, target) -> None:
 
     monkeypatch.setattr(os, "replace", wrap(os.replace))
     monkeypatch.setattr(os, "rename", wrap(os.rename))
+
+
+def string_paths(obj, value: str, at: str = "") -> list[str]:
+    """Every JSON path under `obj` whose value is the string `value`."""
+    if isinstance(obj, str):
+        return [at] if obj == value else []
+    if isinstance(obj, dict):
+        return [p for k in sorted(obj) for p in string_paths(obj[k], value, f"{at}/{k}")]
+    if isinstance(obj, list):
+        return [p for i, v in enumerate(obj) for p in string_paths(v, value, f"{at}/{i}")]
+    return []
+
+
+def replace_string(obj, old: str, new: str):
+    """A copy of `obj` with every string value equal to `old` replaced by `new`."""
+    if isinstance(obj, str):
+        return new if obj == old else obj
+    if isinstance(obj, dict):
+        return {k: replace_string(v, old, new) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [replace_string(v, old, new) for v in obj]
+    return obj
 
 
 def chain_fingerprint(chain: Chain, state_path: Path, upto: int) -> dict:
