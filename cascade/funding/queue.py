@@ -298,6 +298,15 @@ class FundedEntry:
     operator_requeues: int = 0
     # The cause the count above is counting (a normalised error prefix).
     operator_fault_cause: str = ""
+    # WB14 / LB2 lane B miner-declared expert rows: ``{MoE ordinal: sorted
+    # expert indices}`` as parsed by
+    # :func:`cascade.trainer.declared_rows.parse_declared_rows` at intake;
+    # None = nothing declared (the trainer picks, ESFT). Set by every lane B
+    # fund (the latest request wins) except onto a running leg, which is
+    # never rebound: a re-commit parked behind a flight carries its rows as
+    # ``queued_declared_rows``. Written to the queue file only when set.
+    declared_rows: dict | None = field(default=None, hash=False)
+    queued_declared_rows: dict | None = field(default=None, hash=False)
     # Keys a NEWER writer stored on this entry that this code does not know:
     # carried verbatim through every load/save, never interpreted, never
     # compared (money safety II: an old writer must not drop new fields).
@@ -358,6 +367,20 @@ def _phase(entry: FundedEntry, phase: str, now: float, reason: str = "", *, forc
 # without a GPU choice serialises exactly as before the fields existed.
 _GPU_FIELD_DEFAULTS = {"gpu": "", "gpu_allow_fallback": False, "gpu_max_price_per_hour": 0.0,
                        "max_total_spend_usd": None}
+# WB14 declared rows, likewise written only when set (lane A entries and
+# undeclared lane B entries serialise exactly as before).
+_ROWS_FIELD_DEFAULTS = {"declared_rows": None, "queued_declared_rows": None}
+
+
+def _rows_from_json(value) -> dict[int, list[int]] | None:
+    """Declared rows as stored (string ordinal keys in JSON) → int keys."""
+    if value is None:
+        return None
+    return {int(k): [int(x) for x in v] for k, v in dict(value).items()}
+
+
+def _rows_copy(rows) -> dict[int, list[int]] | None:
+    return None if rows is None else {int(k): [int(x) for x in v] for k, v in rows.items()}
 
 
 def _gpu_fields(choice) -> dict:
@@ -509,6 +532,8 @@ class FundedQueue:
                     item, "operator_requeues", 0)) or 0),
                 operator_fault_cause=str(item.get("operator_fault_cause", _from_history(
                     item, "operator_fault_cause", "")) or ""),
+                declared_rows=_rows_from_json(item.get("declared_rows")),
+                queued_declared_rows=_rows_from_json(item.get("queued_declared_rows")),
                 extra=extra,
             )
             entries[entry.hotkey] = entry
@@ -543,7 +568,7 @@ class FundedQueue:
         def _row(e: FundedEntry) -> dict:
             row = asdict(e)
             extra = row.pop("extra", None) or {}
-            for k, default in _GPU_FIELD_DEFAULTS.items():
+            for k, default in (*_GPU_FIELD_DEFAULTS.items(), *_ROWS_FIELD_DEFAULTS.items()):
                 if row.get(k) == default:
                     row.pop(k, None)
             for k, v in extra.items():
@@ -573,8 +598,15 @@ class FundedQueue:
     # ── lifecycle ────────────────────────────────────────────────────────────
 
     def add(self, hotkey: str, ref: str, reveal_block: int, *,
-            label: str = "", gpu_choice=None, max_total_spend_usd=_KEEP) -> str:
+            label: str = "", gpu_choice=None, max_total_spend_usd=_KEEP,
+            declared_rows=_KEEP) -> str:
         """Fund (or re-fund) a submission; returns the outcome for the caller.
+
+        ``declared_rows`` (WB14, lane B; parsed rows or None = none declared)
+        REPLACES the entry's rows on every accepted outcome except onto an
+        in-flight leg: a same-ref re-fund keeps the running leg's rows, a
+        re-commit parked behind the flight carries them as
+        ``queued_declared_rows``. ``_KEEP`` (lane A, lane C) leaves them.
 
         ``label`` (already normalised) names the entry for dashboards; an
         empty label on a re-fund keeps the one already stored, a non-empty
@@ -596,6 +628,8 @@ class FundedQueue:
         budget = ({} if max_total_spend_usd is _KEEP else {
             "max_total_spend_usd": (float(max_total_spend_usd)
                                     if max_total_spend_usd is not None else None)})
+        keep_rows = declared_rows is _KEEP
+        rows = {} if keep_rows else {"declared_rows": _rows_copy(declared_rows)}
         with self._locked() as entries:
             now = self.clock()
             prev = entries.get(hotkey)
@@ -606,12 +640,16 @@ class FundedQueue:
                 if prev.ref == ref:
                     entries[hotkey] = replace(prev, last_active=now, queued_ref="",
                                               queued_reveal_block=0,
+                                              queued_declared_rows=None,
                                               label=label or prev.label,
                                               **_gpu_fields(gpu_choice), **budget)
                     self._save(entries)
                     return "already-queued"
                 entries[hotkey] = replace(prev, queued_ref=ref,
                                           queued_reveal_block=int(reveal_block),
+                                          queued_declared_rows=(
+                                              prev.queued_declared_rows if keep_rows
+                                              else _rows_copy(declared_rows)),
                                           last_active=now, label=label or prev.label,
                                           **_gpu_fields(gpu_choice), **budget)
                 self._save(entries)
@@ -629,16 +667,19 @@ class FundedQueue:
                     funded_at=now, last_active=now, status="queued",
                     operator_billed=False, operator_requeues=0, operator_fault_cause="",
                     infra_streak=0, not_before=0.0,
-                    label=label or prev.label, **_gpu_fields(gpu_choice), **budget), "queued", now, force=True)
+                    label=label or prev.label, **_gpu_fields(gpu_choice), **budget, **rows),
+                    "queued", now, force=True)
                 self._save(entries)
                 return "queued" if same else "replaced"
             if prev is not None and prev.status in ("pending_reveal", "queued", "in_round"):
                 if prev.ref == ref and prev.status != "pending_reveal":
                     # Idempotent, but a re-fund is proof of life — refresh so
                     # an actively-tended entry never TTL-expires under you.
+                    # The rows of an entry a live round is training stay put.
                     entries[hotkey] = replace(prev, last_active=now,
                                               label=label or prev.label,
-                                              **_gpu_fields(gpu_choice), **budget)
+                                              **_gpu_fields(gpu_choice), **budget,
+                                              **(rows if prev.status == "queued" else {}))
                     self._save(entries)
                     return "already-queued"
                 if prev.status == "in_round":
@@ -648,12 +689,13 @@ class FundedQueue:
                 entries[hotkey] = replace(
                     prev, ref=ref, reveal_block=int(reveal_block),
                     funded_at=now, last_active=now, status="queued",
-                    label=label or prev.label, **_gpu_fields(gpu_choice), **budget)
+                    label=label or prev.label, **_gpu_fields(gpu_choice), **budget, **rows)
                 self._save(entries)
                 return "replaced" if prev.ref != ref else "queued"
             entries[hotkey] = FundedEntry(
                 hotkey=hotkey, ref=ref, reveal_block=int(reveal_block),
-                funded_at=now, last_active=now, label=label, **_gpu_fields(gpu_choice), **budget)
+                funded_at=now, last_active=now, label=label, **_gpu_fields(gpu_choice), **budget,
+                **rows)
             self._save(entries)
             return "queued"
 
@@ -904,7 +946,8 @@ class FundedQueue:
             funded_at=now, last_active=now, label=e.label, gpu=e.gpu,
             gpu_allow_fallback=e.gpu_allow_fallback,
             gpu_max_price_per_hour=e.gpu_max_price_per_hour,
-            max_total_spend_usd=e.max_total_spend_usd)
+            max_total_spend_usd=e.max_total_spend_usd,
+            declared_rows=_rows_copy(e.queued_declared_rows))
 
     def expire_stale(self, max_age_seconds: float | None = None) -> int:
         """Terminally expire idle queued entries past the payer-key TTL.
@@ -1365,9 +1408,11 @@ class LaneBQueue(FundedQueue):
     module note above)."""
 
     def add_lane_b(self, hotkey: str, targets, ref: str, reveal_block: int, *,
-                   label: str = "", gpu_choice=None) -> str:
+                   label: str = "", gpu_choice=None, declared_rows=_KEEP) -> str:
+        """``declared_rows``: the parsed WB14 rows of this fund (None = none
+        declared, ESFT picks); see :meth:`FundedQueue.add`."""
         return self.add(hotkey, lane_b_entry_ref(targets, ref), int(reveal_block), label=label,
-                        gpu_choice=gpu_choice)
+                        gpu_choice=gpu_choice, declared_rows=declared_rows)
 
     def queued(self, *, now: float | None = None) -> list[FundedEntry]:
         """Startable entries, earliest reveal first: ``queued`` and not
