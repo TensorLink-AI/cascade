@@ -67,8 +67,20 @@ ARMED = {
     "contexts": [4096, 8192, 16384], "horizon": HORIZON, "forward_margin_hours": 6.0,
     "min_windows": 24, "min_clusters": 4, "bootstrap_B": 200,
 }
+# W5a fails closed: a feed missing from `feeds` is `unlisted_feed`, so every
+# feed the series name is listed (as in tests/accept/w7a/helpers.py).
 FEEDS = {"feed-a": {"mirror_lag_hours": 1.5, "forecast_product": False},
-         "src1": {"mirror_lag_hours": None, "forecast_product": False}}
+         "src1": {"mirror_lag_hours": None, "forecast_product": False},
+         "src2": {"mirror_lag_hours": 1.0, "forecast_product": False},
+         "src3": {"mirror_lag_hours": None, "forecast_product": False},
+         "src4": {"mirror_lag_hours": 1.0, "forecast_product": False},
+         "src5": {"mirror_lag_hours": 1.0, "forecast_product": False}}
+# W5a fails closed on a missing `frontier` too (`absent_from_s0`), so every
+# series records its S0 as one `[as_of_ts, end_ts]` frontier record: S0 was
+# taken 3 h before the snapshot's first target (after the bound, T0 + 6 h)
+# and held data up to 1 h before it was taken, so no target is a backfill.
+FRONTIER_AS_OF = SNAPSHOT_START - 3 * HOUR
+FRONTIER_END_LAG = HOUR
 
 
 def text_digest(text: str) -> str:
@@ -147,7 +159,8 @@ def _series(seed: int) -> list[dict]:
             start = SNAPSHOT_START + (j * PER_SOURCE + k) * HOUR
             ts = [int(start + i * HOUR) for i in range(HORIZON)]
             rec = {"series_id": sid, "source": f"src{j}", "history": hist,
-                   "target_ts": ts, "first_seen_ts": [x + FIRST_SEEN_LAG for x in ts]}
+                   "target_ts": ts, "first_seen_ts": [x + FIRST_SEEN_LAG for x in ts],
+                   "frontier": [[FRONTIER_AS_OF, FRONTIER_AS_OF - FRONTIER_END_LAG]]}
             if j == 0:
                 rec["feed"] = "feed-a"
             out.append(rec)
@@ -165,8 +178,9 @@ def _write_pool(directory: Path, series: list[dict], targets: dict) -> Path:
                "seasonal_period": 24, "first_target_ts": s["target_ts"][0],
                "end_ts": s["target_ts"][-1], "target_ts": s["target_ts"],
                "first_seen_ts": s["first_seen_ts"]}
-        if "feed" in s:
-            rec["feed"] = s["feed"]
+        for k in ("feed", "frontier"):
+            if k in s:
+                rec[k] = s[k]
         meta["series"].append(rec)
     (directory / "metadata.json").write_text(json.dumps(meta, sort_keys=True))
     np.savez(directory / "hist.npz", **{s["series_id"]: s["history"] for s in series})
