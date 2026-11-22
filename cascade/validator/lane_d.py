@@ -9,8 +9,10 @@ validator. Unarmed (``not cfg.active(boundary)``) it returns
    TTL, duplicate digests, deregistered hotkeys → closed with a typed reason);
 2. selects this settlement's judged entries FIFO by reveal time under the
    per-settlement and per-coldkey caps (the rest wait, ``coldkey_cap_settlement``);
-3. builds each cohort's window set: forward-only on BOTH clocks against
-   ``max(T over cohort ∪ king) + forward_margin`` (§1.3), excluding windows a
+3. builds each cohort's window set from the §1.3 verdicts of
+   :func:`~cascade.validator.lane_d_forward.eligible_windows` for
+   ``max(T over cohort ∪ king)`` (both clocks after the bound, mirror lag,
+   forecast products, present in S0, no backfill), excluding windows a
    member was already judged on (the confirmation set is disjoint), and
    defers the latest-T members until the floors (``min_windows``,
    ``min_clusters``) are met;
@@ -41,6 +43,7 @@ import numpy as np
 
 from ..eval.bootstrap import cohort_maxt_lcbs
 from ..eval.lane_d_scorer import SCORING_LEVELS, SCORING_METHOD, score_window
+from .lane_d_forward import eligible_windows
 from .lane_d_report import REPORT_SCHEMA, rows_sha256, sign_report
 from .lane_d_state import load_state, refresh_house, save_state
 
@@ -66,9 +69,50 @@ def _file_sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _parse_feeds(raw, where: Path) -> dict:
+    """Top-level ``feeds``: ``{feed: {"mirror_lag_hours": float | None,
+    "forecast_product": bool}}`` (optional; absent = every lag unmeasured)."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"{where}: pool 'feeds' must be an object; got {type(raw).__name__}")
+    out = {}
+    for name, f in raw.items():
+        if not isinstance(f, dict):
+            raise ValueError(f"{where}: feed {name!r} must be an object")
+        lag = f.get("mirror_lag_hours")
+        if lag is not None and (isinstance(lag, bool) or not isinstance(lag, int | float)
+                                or not math.isfinite(float(lag))):
+            raise ValueError(f"{where}: feed {name!r} mirror_lag_hours {lag!r} is not a number")
+        fp = f.get("forecast_product", False)
+        if not isinstance(fp, bool):
+            raise ValueError(f"{where}: feed {name!r} forecast_product {fp!r} is not a bool")
+        out[str(name)] = {"mirror_lag_hours": None if lag is None else float(lag),
+                          "forecast_product": fp}
+    return out
+
+
+def _parse_frontier(raw, sid: str, where: Path) -> list[tuple[int, int]] | None:
+    """Per-series ``frontier``: ``[[as_of_ts, end_ts], ...]`` for each earlier
+    snapshot holding the series; ``None`` when the key is absent (a pre-W6b
+    snapshot: the S0 rules are skipped, see ``lane_d_forward``)."""
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        raise ValueError(f"{where}: series {sid!r} frontier must be a list")
+    out = []
+    for rec in raw:
+        if not isinstance(rec, list | tuple) or len(rec) != 2:
+            raise ValueError(f"{where}: series {sid!r} frontier record {rec!r} "
+                             "is not [as_of_ts, end_ts]")
+        out.append((int(rec[0]), int(rec[1])))
+    return out
+
+
 def load_pool(pool_dir, horizon: int) -> dict:
-    """One ``pool_d/1`` snapshot: ``{"snapshot", "sha256", "windows": [...]}``
-    with each window's history, target, both clocks and cluster."""
+    """One ``pool_d/1`` snapshot: ``{"snapshot", "sha256", "feeds", "windows":
+    [...]}`` with each window's history, target, both clocks, cluster, feed
+    and frontier (``None`` when the series records no ``frontier`` key)."""
     d = Path(pool_dir)
     meta = json.loads((d / "metadata.json").read_text(encoding="utf-8"))
     if meta.get("schema") != POOL_SCHEMA:
@@ -86,27 +130,26 @@ def load_pool(pool_dir, horizon: int) -> dict:
             if sid not in hist.files or sid not in tgt.files:
                 continue
             target = np.asarray(tgt[sid], dtype=np.float64)
+            source = str(s.get("source") or sid)
             windows.append({
                 "window_id": window_id(sid, ts, horizon) if ts else "",
-                "series_id": sid, "source": str(s.get("source") or sid),
+                "series_id": sid, "source": source,
+                "feed": str(s.get("feed") or source),
+                "frontier": _parse_frontier(s.get("frontier"), sid, d),
                 "seasonal_period": int(s.get("seasonal_period") or 1),
                 "target_ts": ts, "first_seen_ts": seen,
                 "end_ts": s.get("end_ts"),
                 "history": np.asarray(hist[sid], dtype=np.float64), "target": target,
             })
-    return {"snapshot": str(meta.get("snapshot", "")), "sha256": sha, "windows": windows}
+    return {"snapshot": str(meta.get("snapshot", "")), "sha256": sha,
+            "feeds": _parse_feeds(meta.get("feeds"), d), "windows": windows}
 
 
-def forward_eligible(w: dict, t_max: int, margin_s: float, horizon: int) -> bool:
-    """§1.3 (rev3): every target point's data time AND first-seen time are
-    after ``t_max + margin``; a series lacking either clock never is."""
-    ts, seen = w["target_ts"], w["first_seen_ts"]
-    if len(ts) != horizon or len(seen) != horizon or w["target"].shape != (horizon,):
-        return False
-    if w["end_ts"] is None or int(w["end_ts"]) != ts[-1]:
-        return False
-    bound = float(t_max) + float(margin_s)
-    return min(ts) > bound and min(seen) > bound and bool(np.isfinite(w["target"]).all())
+def _target_usable(w: dict, horizon: int) -> bool:
+    """The stored target is a finite, non-zero ``(horizon,)`` vector."""
+    t = w["target"]
+    return (t.shape == (horizon,) and bool(np.isfinite(t).all())
+            and float(np.abs(t).sum()) > 0.0)
 
 
 # ── statistic ───────────────────────────────────────────────────────────────
@@ -220,14 +263,13 @@ def _king_reveal_ts(state: dict, digest: str) -> int | None:
 
 def _window_set(pool: dict, members: list[str], king_digest: str, king_ts: int, state: dict,
                 forecasts: dict, cfg) -> list[dict]:
-    t_max = max([king_ts] + [state["entries"][m]["reveal_ts"] for m in members])
+    t_entry = max(int(state["entries"][m]["reveal_ts"]) for m in members)
     h = int(cfg.horizon)
+    verdicts = eligible_windows(pool, t_entry=t_entry, t_king=int(king_ts), cfg=cfg)
     out = []
-    for w in pool["windows"]:
+    for w, v in zip(pool["windows"], verdicts, strict=True):
         wid = w["window_id"]
-        if not wid or not forward_eligible(w, t_max, 3600.0 * float(cfg.forward_margin_hours), h):
-            continue
-        if not float(np.abs(w["target"]).sum()) > 0.0:
+        if not wid or not v.eligible or not _target_usable(w, h):
             continue
         if _forecast_ok(forecasts.get(king_digest), wid, h) is not True:
             continue
@@ -403,5 +445,5 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     return LaneDSettlement(report=report, pay=pay)
 
 
-__all__ = ["LaneDSettlement", "forward_eligible", "judge_cohort", "load_pool", "settle_lane_d",
+__all__ = ["LaneDSettlement", "judge_cohort", "load_pool", "settle_lane_d",
            "window_id"]
