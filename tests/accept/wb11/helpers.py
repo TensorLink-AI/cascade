@@ -2,8 +2,9 @@
 
 Everything here comes from docs/plans/LANE_D_PLAN.md: the WB11 row (§3.0),
 §12b.1 LB1 (exact + normalised sub-window hashes, 32-point sub-windows,
-z-score + 4 significant figures, a versioned digest-pinned artefact refreshed
-only when a suite identity changes) and the W3b4 suite identity formula
+a z-score normalisation robust to scale, offset and rounding — schema 2, see
+README — a versioned digest-pinned artefact refreshed only when a suite
+identity changes) and the W3b4 suite identity formula
 (tests/accept/w3b4/README.md). Contract: README.md.
 
 Nothing here imports the PATHS module ``cascade.eval.contamination`` at module
@@ -31,10 +32,13 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[3]
 MODULE = "cascade.eval.contamination"
 
-SCHEMA = "cascade_contamination_hashset/1"
+# Schema 2: the normalised encoding changed from v1's "z-score at 4 significant
+# figures" (which misses TB11 at small scales: README "Normalised matching at
+# every scale"). A v1 artefact is refused; none was ever pinned.
+SCHEMA = "cascade_contamination_hashset/2"
+SCHEMA_V1 = "cascade_contamination_hashset/1"
 WINDOW = 32          # §12b.1: sliding sub-windows of 32 points
 STRIDE = 1           # §12b.1: sliding
-SIG_FIGS = 4         # §12b.1: z-score, rounded to 4 significant figures
 HASH = "sha256"
 SUITE_KEYS = ("boom", "fev", "gift", "time")   # cascade.eval.benchmarks.ITEM_SUITE_KEY values
 MIN_HITS = {"exact": 1, "normalised": 3}       # §12b.1 recommended / WB10 default
@@ -113,6 +117,52 @@ def shuffled(suites: dict, seed: str) -> dict:
 def clean_series(n: int = 120, seed: str = "cascade wb11 clean") -> list[float]:
     """A series unrelated to any fixture suite."""
     return _walk(random.Random(seed), n, 42.0, 2.0)
+
+
+# ── scale fixture: TB11 evasions at every series level ───────────────────────
+
+# (suite, item, level, step scale): the four levels WB13's fixture embeds
+# (boom 0.4, fev 7, gift 100, gift 5000), with the same walk parameters.
+SCALE_ITEMS = (
+    ("boom", "boom/scale/0.4", 0.4, 0.02),
+    ("fev", "fev/scale/7", 7.0, 0.3),
+    ("gift", "gift/scale/100", 100.0, 3.0),
+    ("time", "time/scale/5000", 5000.0, 40.0),
+)
+SCALE_LEN = 48       # 17 sub-windows per item
+ROUND_DP = 3         # TB11: "rounded to 3 dp"
+ROUND_STEP = 10.0 ** -ROUND_DP
+
+
+def scale_suites() -> dict:
+    """One random-walk item per level, in its own suite (seeded, in memory)."""
+    rng = random.Random("cascade wb11 scale suites")
+    out = {}
+    for suite, item, level, scale in SCALE_ITEMS:
+        out[suite] = {"version": VERSIONS[suite],
+                      "series": {item: _walk(rng, SCALE_LEN, level, scale)}}
+    return out
+
+
+def unrelated_series(level: float, scale: float, k: int) -> list[float]:
+    """The k-th series unrelated to any fixture suite at this level: a random
+    walk with the suite's own walk parameters (even k) or i.i.d. Gaussian noise
+    around the level (odd k). Different seeds from every suite series."""
+    rng = random.Random(f"cascade wb11 unrelated {level} {k}")
+    if k % 2 == 0:
+        return _walk(rng, SCALE_LEN, level, scale)
+    return [level + rng.gauss(0.0, scale * 3.0) for _ in range(SCALE_LEN)]
+
+
+def to_float32(x: float) -> float:
+    return struct.unpack("<f", struct.pack("<f", x))[0]
+
+
+def window_std(w) -> float:
+    """Population std of one window."""
+    n = len(w)
+    mean = math.fsum(w) / n
+    return math.sqrt(math.fsum((x - mean) ** 2 for x in w) / n)
 
 
 def as_float(v) -> float:
@@ -319,7 +369,7 @@ def evidence_problems(ev, root: Path = REPO) -> list[str]:
         probs.append(f"artefact window/stride/hash = {a.get('window')}/{a.get('stride')}/"
                      f"{a.get('hash')}, expected {WINDOW}/{STRIDE}/{HASH}")
     norm = a.get("normalisation") or {}
-    if norm.get("method") != "zscore" or norm.get("sig_figs") != SIG_FIGS:
+    if norm.get("method") != "zscore" or norm.get("scope") != "subwindow":
         probs.append(f"artefact normalisation={norm!r}")
     if not a.get("exact") or not a.get("normalised"):
         probs.append("artefact has an empty exact or normalised set")
