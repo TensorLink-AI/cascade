@@ -33,7 +33,7 @@ from typing import Any
 
 from cascade.shared.hippius import ObjectNotFound, StorageError
 from cascade.shared.sentinel import sentinel_for_era
-from cascade.validator.lane_d_bench import METRICS, _suite_rows
+from cascade.validator.lane_d_bench import METRICS, classify_suite
 
 SCHEMA = "lane-d-sentinel/1"
 ROLES = ("king", "previous_king", "house")
@@ -107,14 +107,41 @@ def _geomean(values: list[float]) -> float:
     return math.exp(math.fsum(math.log(v) for v in values) / len(values))
 
 
-def _model(digest: str, rec: Mapping, suite: str) -> tuple[dict, str | None]:
-    """``(model entry, fault reason or None)`` for one role's sweep record."""
-    rows, fault = _suite_rows(rec, suite)
+# The sentinel's roles in classify_suite's (candidate, king_d, house) order.
+_GATE_ROLE = {"king": "candidate", "previous_king": "king_d", "house": "house"}
+
+
+def _classify(by_role: Mapping[str, Mapping], suite: str) -> dict[str, str]:
+    """``{role: fault code}`` for every faulty role, by the gate's own
+    per-role rules (:func:`classify_suite`, no pin — the sentinel is not the
+    gate suite). Codes are the gate's :data:`~cascade.validator.lane_d_bench.HOLD_CODES`."""
+    cls = classify_suite(by_role["king"], by_role["previous_king"], by_role["house"],
+                         suite=suite)
+    codes = cls["codes"]
+    return {role: codes[g] for role, g in _GATE_ROLE.items() if g in codes}
+
+
+def _clean_rows(rec: Mapping, suite: str) -> dict[str, tuple[float, float]]:
+    """``{item: (crps, mase)}`` of an entry :func:`classify_suite` passed."""
+    return {row["item"]: (float(row["crps"]), float(row["mase"]))
+            for row in rec["suites"][suite]["rows"]}
+
+
+def _model(digest: str, rec: Mapping, suite: str, code: str | None
+           ) -> tuple[dict, str | None]:
+    """``(model entry, fault reason or None)`` for one role's sweep record;
+    ``code`` is the gate classification's fault code for the role."""
+    fault = code
+    rows: dict[str, tuple[float, float]] = {}
     if fault is None:
+        rows = _clean_rows(rec, suite)
+        # The sentinel's extra rule: its geomean needs logs, so a metric <= 0
+        # is a fault here (the gate pairs ratios and never takes a log).
         for item in sorted(rows):
             for j, m in enumerate(METRICS):
                 if rows[item][j] <= 0.0 and fault is None:
-                    fault = f"suite {suite!r} item {item!r} has a non-positive {m!r}"
+                    fault = (f"nonpositive_metric: suite {suite!r} item {item!r} "
+                             f"has a non-positive {m!r}")
     if fault is not None:
         return {"digest": digest, "status": "fault", "items": None,
                 "crps": None, "mase": None}, fault
@@ -212,13 +239,14 @@ def sweep_and_publish(report: Mapping | None, *, era_block: int, era_block_hash:
         recs = bench.paired(roles["king"], roles["previous_king"], roles["house"],
                             suites=(suite,))
         by_role = dict(zip(ROLES, recs, strict=True))
+        codes = _classify(by_role, suite)
     except Exception as e:  # the pod is unreachable or reset: recorded, never raised
         status, reason = "error", f"sweep_failed: {type(e).__name__}: {e}"
         models = _error_models(roles)
     else:
         models, faults = {}, []
         for role in ROLES:
-            models[role], fault = _model(roles[role], by_role[role], suite)
+            models[role], fault = _model(roles[role], by_role[role], suite, codes.get(role))
             if fault is not None:
                 faults.append(f"{role}: {fault}")
         if faults:
