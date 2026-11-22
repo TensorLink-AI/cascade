@@ -34,6 +34,20 @@
 #   (imports, string-named paths, PATHS overlap; CROSS rule in accept --help)
 #   and fails the job on any `CROSS <WP> FAIL` (cross-WP regressions surface on
 #   the PR, not after merge on the push job).
+#   Verification mode is open only to the WPs listed in
+#   scripts/laned/verification_wps on the base (RV5); a declared verification
+#   WP at L2 is cross-eligible like an implemented one.
+#   Last, `freshness` (every PR, RV5): fetches origin/<base> at job time and
+#   fails with `STALE BASE: update-branch and re-run` when main has moved past
+#   the base this run tested (HEAD^1 of the merge commit) with a change that
+#   touches, imports or is imported by the PR's paths, or that a WP test dir
+#   depending on the PR also depends on (FRESHNESS rule in accept --help).
+#   MERGE RULE: a green run is only valid for the base it ran on. Before
+#   merging a laned:* PR the loop must update-branch and re-run this workflow
+#   when origin/main has moved since the run (the orchestrator enforces it;
+#   a STALE BASE result is never merged). Branch protection "require branches
+#   to be up to date before merging" (+ this check as required) is the owner's
+#   repository setting, not something this workflow can turn on.
 #   The tooling comes from the base
 #   branch once it exists there, so a PR cannot loosen its own gate.
 # push to main: Accept for every WP at >= L2 (with `--evidence <file>` from the
@@ -254,6 +268,26 @@ jobs:
           name: laned-results
           path: ${{ env.LANED_RESULTS }}
           if-no-files-found: ignore
+
+      - name: freshness
+        # RV5: a green run on a base main has since moved past must not merge
+        # when main's new commits interact with the PR's paths (FRESHNESS rule
+        # in accept --help). origin/<base> is fetched now, at job time.
+        if: always() && github.event_name == 'pull_request' && steps.select.outputs.wps != ''
+        env:
+          WPS: ${{ steps.select.outputs.wps }}
+          BASE_REF: ${{ github.base_ref }}
+          EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git fetch --no-tags --quiet origin "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF"
+          echo "tested base: $(git rev-parse HEAD^1) (event base.sha $EVENT_BASE_SHA); origin/$BASE_REF now: $(git rev-parse "origin/$BASE_REF")"
+          if ! grep -q -- '--freshness' "$LANED/accept"; then
+            echo "the base branch's loop tooling has no --freshness mode yet; using this PR's"
+            tool=scripts/laned/accept
+          else
+            tool="$LANED/accept"
+          fi
+          python3 "$tool" "$WPS" --freshness --base HEAD^1 --head HEAD --main "origin/$BASE_REF" --root .
 
   main:
     if: github.event_name == 'push'

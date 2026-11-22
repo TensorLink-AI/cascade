@@ -16,8 +16,9 @@ laned/build-state on REMOTE, fast-forward only; main is never touched.
 Without --release-tag-glob no tag counts as a capability release (no L6).
 
 Levels follow §17.1 (tests/accept/w0c/README) with one addition for a
-VERIFICATION WP (accept --help, MODE verification): when the ledger has a
-green `verification` run for the WP, the first first-parent commit at or
+VERIFICATION WP (accept --help, MODE verification), i.e. one listed in
+scripts/laned/verification_wps at REF (any other WP's verification runs are
+ignored, RV5): when the ledger has a green `verification` run for the WP, the first first-parent commit at or
 after the one adding its PATHS that changes only tests/accept/<wp>/ and whose
 test dir tree equals the run's `tests_tree` (or whose sha is the run's
 `head_sha`) is the merge of that PR and counts as both L1 and L2; the L2
@@ -289,6 +290,7 @@ class Board:
             self.tags = [t for t in out.split("\n") if t]
         self.levels: dict[str, int] = {}
         self.detail: dict[str, dict] = {}
+        self.verification_wps = lanedlib.parse_verification_wps(tree.show(lanedlib.VERIFICATION_WPS_PATH))
 
     # -- per-level conditions ------------------------------------------------
     def l2_commit(self, wp: str, paths: list[str]) -> int | None:
@@ -368,6 +370,13 @@ class Board:
                              and r.get("conclusion") == "success" for r in self.runs)
         verified = [r for r in self.runs if r.get("wp") == wp and r.get("mode") == "verification"
                     and r.get("conclusion") == "success"]
+        if verified and wp not in self.verification_wps:
+            # RV5: only a declared verification WP (scripts/laned/verification_wps
+            # at REF) may take L1/L2 from a verification run; for any other WP
+            # such a run counts for nothing (expect-fail semantics: L1 needs a
+            # green expect-fail run, L2 an implementation commit).
+            det["verification_refused"] = f"{wp} not in {lanedlib.VERIFICATION_WPS_PATH}"
+            verified = []
         det["paths"] = paths_text is not None
         det["expect_fail_success"] = expect_fail_ok
         if verified:
@@ -837,6 +846,7 @@ def cmd_selftest() -> int:
         # on it gives L3. A failing verification run never gives L2.
         put(PLAN, SELFTEST_PLAN + "| V1 | Verification of C1 | C1 | ci | `scripts/laned/accept V1` |\n")
         put(".gitignore", "__pycache__/\n")
+        put(lanedlib.VERIFICATION_WPS_PATH, "# verification WPs\nV1  # checks C1\n")
         commit("plan V1")
         pre = lanedlib.git(root, "rev-parse", "HEAD").stdout.strip()
         lanedlib.git(root, "checkout", "-q", "-b", "pr-v1")
@@ -868,6 +878,14 @@ def cmd_selftest() -> int:
         lv, _ = level([{"workflow": "laned-accept", "event": "pull_request", "mode": "expect-fail",
                         "wp": "V1", "head_sha": pr_head, "conclusion": "success"}], "V1")
         expect(lv == "L1", f"an expect-fail run on a verification WP gave {lv}, want L1")
+        # (4) RV5: the same green verification run for a WP that REF's
+        # scripts/laned/verification_wps does not list counts for nothing.
+        put(lanedlib.VERIFICATION_WPS_PATH, "# verification WPs\nW0b\n")
+        commit("V1 not declared")
+        lv, data = level([vrun, run(squash, "V1", True)], "V1")
+        expect(lv == "L0" and data["wps"]["V1"].get("l2_via") is None
+               and data["wps"]["V1"].get("verification_refused"),
+               f"an undeclared WP's verification run gave {lv} ({data['wps']['V1']}), want L0, refused")
     for f in failures:
         print(f"status selftest: FAIL {f}", file=sys.stderr)
     if failures:

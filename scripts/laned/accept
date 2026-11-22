@@ -21,9 +21,12 @@
         modify of evidence/rv<n>.md (no tests run)
     accept <WP>[,<WP>...] --cross --base REF --head REF [--root R]
         cross-WP regressions (CROSS rule below); prints `CROSS <WP> PASS|KNOWN|FAIL`
+    accept [<WP>] --freshness --base REF --head REF --main REF [--root R]
+        stale-base guard (FRESHNESS rule below); prints `FRESH ...` or
+        `STALE BASE: update-branch and re-run` (exit 1)
     accept selftest
         offline check of the review, tests-correction, verification,
-        evidence and cross modes
+        evidence, cross and freshness modes
     accept --gate <STAGE> [--root R]
         evidence/gates/<stage>.json: right stage, every check passed
 
@@ -40,7 +43,10 @@ MODE rules of --check-pr (the PR job runs the named mode next):
     MODE verification     printed by --verification, not by --check-pr: a
                           tests-only PR for a VERIFICATION WP, one whose row
                           only asserts properties of code another WP already
-                          built. It applies iff (a) BASE has no L2 commit for
+                          built. It applies iff (0) the WP is listed in
+                          scripts/laned/verification_wps at BASE (RV5: the
+                          PR cannot declare it; an unlisted WP always runs
+                          --expect-fail), (a) BASE has no L2 commit for
                           the WP, (b) every non-test entry of the WP's PATHS
                           already exists on BASE (an exact file; some file
                           under a dir/ entry; some file matching a glob) and
@@ -92,10 +98,13 @@ MODE rules of --check-pr (the PR job runs the named mode next):
 
 CROSS rule (the PR job runs it after the PR's own WP steps, every mode but
 review): a WP other than the PR's own WP(s) is re-accepted when
-    (a) it is built on BASE: tests/accept/<wp>/PATHS exists at BASE and BASE's
-        first-parent line has its L2 commit (lanedlib.impl_commit_index, the
-        board's L2 rule; the board's L1 ledger precondition is not re-checked,
-        so a WP in doubt is included), and
+    (a) it is built on BASE: tests/accept/<wp>/PATHS exists at BASE and either
+        BASE's first-parent line has its L2 commit (lanedlib.impl_commit_index,
+        the board's L2 rule), or it is a verification WP (listed in
+        scripts/laned/verification_wps at BASE) whose non-test PATHS all exist
+        at BASE (the board's L2 via verification; without the ledger its green
+        verification run is not re-checked, nor is the board's L1 ledger
+        precondition, so a WP in doubt is included), and
     (b) its tests depend on `git diff --name-only BASE...HEAD`: the diff touches
         a global input (pyproject.toml, uv.lock, tests/conftest.py, ...), its
         own test dir, a path its PATHS match, a repo module in the static
@@ -118,6 +127,15 @@ junit test id:
                       or either run is not plain test failures (no report,
                       unattributed failures, a collection error, nothing
                       collected): fails closed.
+
+FRESHNESS rule (the PR job's last step, RV5): BASE is the base the run tested
+(the merge commit's first parent), MAIN is origin/main fetched at job time.
+BASE == MAIN is fresh. Otherwise, with MB = merge-base(BASE, MAIN), the PR is
+STALE when its diff (BASE...HEAD) and main's diff (MB..MAIN) interact, in the
+PR's tree or in MAIN's: a path both touch; a changed module of one side whose
+static import closure reaches a changed path of the other; or a WP test dir
+that depends (CROSS rule (b)) on both diffs. Unrelated main commits leave the
+PR fresh. The loop must update-branch and re-run a STALE PR before merging.
 
 The pytest command is `uv run --frozen pytest` unless LANED_PYTEST_CMD is set
 (shlex-split). It always runs with cwd = --root. Exit 0 means pass.
@@ -366,8 +384,9 @@ def cmd_expect_fail(root: Path, wp: str) -> int:
 def cmd_verification(root: Path, wp: str, base: str, head: str) -> int:
     """The run for MODE tests-only (module docstring, "MODE verification").
 
-    Verification applies only when BASE has no L2 commit for the WP and every
-    non-test PATHS entry already exists on BASE; then the full Accept runs on
+    Verification applies only to a WP listed in scripts/laned/verification_wps
+    at BASE, when BASE has no L2 commit for the WP and every non-test PATHS
+    entry already exists on BASE; then the full Accept runs on
     the working tree (the PR's tests over BASE's code). If it passes this is
     ``MODE verification``. In every other case (a PATHS file missing on BASE,
     or any Accept step failing) the run is the classic ``--expect-fail``.
@@ -380,6 +399,11 @@ def cmd_verification(root: Path, wp: str, base: str, head: str) -> int:
         return cmd_expect_fail(root, wp)
     if built_on(root, base, wp):
         return fail("verification", f"{wp} is already built on {base}; a tests-only PR runs --tests-correction")
+    if wp not in lanedlib.verification_wps_at(root, base):
+        print(f"verification: {wp} is not a declared verification WP "
+              f"({lanedlib.VERIFICATION_WPS_PATH} at {base}); running --expect-fail")
+        print("LEDGER-MODE expect-fail")
+        return cmd_expect_fail(root, wp)
     missing = lanedlib.missing_paths_at(root, base, paths)
     if missing:
         print(f"verification: not a verification WP (missing on {base}: {' '.join(missing)}); "
@@ -723,13 +747,18 @@ def wp_ids_at(root: Path, ref: str) -> dict[str, str]:
 
 
 def built_wps_at(root: Path, ref: str) -> list[tuple[str, list[str]]]:
-    """``[(WP, PATHS at ref)]`` for every WP with an L2 commit on ``ref``'s
-    first-parent line (lanedlib.impl_commit_index, the status board's L2
-    rule). The board's L1 precondition (a green expect-fail run in the
-    ledger) is not re-checked here: without the ledger, include the WP."""
+    """``[(WP, PATHS at ref)]`` for every WP at L2 on ``ref`` by the status
+    board's L2 rule: an implementation commit on the first-parent line
+    (lanedlib.impl_commit_index), or, for a declared verification WP
+    (scripts/laned/verification_wps at ``ref``), every non-test PATHS entry
+    present at ``ref`` (RV5: its L2 came from the verification merge, which
+    has no implementation commit). The board's ledger preconditions (a green
+    expect-fail or verification run) are not re-checked here: without the
+    ledger, include the WP."""
     out = lanedlib.git(root, "ls-tree", "--name-only", f"{ref}:tests/accept", check=False).stdout.split()
     ids = wp_ids_at(root, ref)
     history = lanedlib.first_parent_history(root, ref)
+    verification = lanedlib.verification_wps_at(root, ref)
     built: list[tuple[str, list[str]]] = []
     for d in sorted(out):
         proc = lanedlib.git(root, "show", f"{ref}:tests/accept/{d}/PATHS", check=False)
@@ -737,7 +766,8 @@ def built_wps_at(root: Path, ref: str) -> list[tuple[str, list[str]]]:
             continue
         wp = ids.get(d, d)
         paths = lanedlib.parse_paths(proc.stdout)
-        if lanedlib.impl_commit_index(history, wp, paths) is not None:
+        if lanedlib.impl_commit_index(history, wp, paths) is not None or (
+                wp in verification and not lanedlib.missing_paths_at(root, ref, paths)):
             built.append((wp, paths))
     return built
 
@@ -1005,6 +1035,100 @@ def cmd_cross(root: Path, pr_wps: list[str], base: str, head: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# freshness (a PR green on a base that main has since moved past)
+# ---------------------------------------------------------------------------
+
+def _rev(root: Path, ref: str) -> str | None:
+    proc = lanedlib.git(root, "rev-parse", "-q", "--verify", f"{ref}^{{commit}}", check=False)
+    return proc.stdout.strip() if proc.returncode == 0 else None
+
+
+def _py_closure_hits(root: Path, start: list[str], targets: list[str]) -> list[str]:
+    """``targets`` reached by the static import closure of the .py files in ``start``."""
+    py = [p for p in start if p.endswith(".py")]
+    if not py:
+        return []
+    mods, _ = import_closure(root, py)
+    return sorted(t for t in targets if t in mods and t not in py)
+
+
+def stale_reasons(root: Path, pr_diff: list[str], main_diff: list[str]) -> list[str]:
+    """Why the PR's changes and main's changes since the tested base interact
+    in the tree at ``root`` (empty: they don't). The cross dependency analysis:
+    a path both touched; a changed module of one side importing (statically,
+    transitively) a changed path of the other; or a WP whose tests depend
+    (cross_reasons) on both diffs."""
+    why: list[str] = []
+    both = sorted(set(pr_diff) & set(main_diff))
+    if both:
+        why.append("both touch " + " ".join(both))
+    hits = _py_closure_hits(root, pr_diff, main_diff)
+    if hits:
+        why.append("the PR's modules import " + " ".join(hits))
+    hits = _py_closure_hits(root, main_diff, pr_diff)
+    if hits:
+        why.append("main's changed modules import " + " ".join(hits))
+    dirs = sorted(p.name for p in (root / "tests" / "accept").iterdir()
+                  if (p / "PATHS").is_file()) if (root / "tests" / "accept").is_dir() else []
+    for d in dirs:
+        paths = lanedlib.parse_paths((root / "tests" / "accept" / d / "PATHS").read_text())
+        on_pr = cross_reasons(root, d, paths, pr_diff)
+        if not on_pr:
+            continue
+        on_main = cross_reasons(root, d, paths, main_diff)
+        if on_main:
+            why.append(f"tests/accept/{d}/ depends on the PR ({'; '.join(on_pr)}) "
+                       f"and on main ({'; '.join(on_main)})")
+    return why
+
+
+def cmd_freshness(root: Path, base: str, head: str, main_ref: str) -> int:
+    """The PR job's last step (RV5): the run tested HEAD against BASE (the
+    merge commit's first parent, i.e. github.event.pull_request.base.sha's
+    tree; HEAD must not itself contain main's newer commits, or they count
+    as the PR's changes). When MAIN (origin/main fetched at job time) is BASE, the result is
+    fresh. Otherwise the PR is STALE when its changes (BASE...HEAD) interact
+    with main's commits since the merge-base of BASE and MAIN (stale_reasons,
+    in the PR's tree and in MAIN's tree); a stale PR must update-branch and
+    re-run before it merges. Unrelated main commits do not make it stale."""
+    b, m = _rev(root, base), _rev(root, main_ref)
+    if b is None or m is None:
+        print(f"STALE BASE: update-branch and re-run (cannot resolve {base if b is None else main_ref})")
+        return 1
+    if b == m:
+        print(f"FRESH base {b[:12]} is {main_ref}")
+        return 0
+    mb = lanedlib.git(root, "merge-base", b, m, check=False).stdout.strip()
+    if not mb:
+        print(f"STALE BASE: update-branch and re-run (no merge-base of {base} and {main_ref})")
+        return 1
+    pr_diff = lanedlib.git(root, "diff", "--name-only", f"{b}...{head}").stdout.split()
+    main_diff = lanedlib.git(root, "diff", "--name-only", f"{mb}..{m}").stdout.split()
+    n = lanedlib.git(root, "rev-list", "--count", f"{mb}..{m}").stdout.strip()
+    print(f"freshness: tested base {b[:12]}, {main_ref} {m[:12]} is {n} commit(s) past the merge-base "
+          f"{mb[:12]}; main touched {len(main_diff)} path(s), the PR {len(pr_diff)}")
+    why = stale_reasons(root, pr_diff, main_diff)
+    with tempfile.TemporaryDirectory(prefix="laned-fresh-") as tmp:
+        wt = Path(tmp) / "main"
+        proc = lanedlib.git(root, "worktree", "add", "--detach", "-q", str(wt), m, check=False)
+        if proc.returncode != 0:
+            print(f"STALE BASE: update-branch and re-run (no worktree of {main_ref}: {proc.stderr.strip()[:200]})")
+            return 1
+        try:
+            why += [f"at {main_ref}: {w}" for w in stale_reasons(wt, pr_diff, main_diff)]
+        finally:
+            lanedlib.git(root, "worktree", "remove", "--force", str(wt), check=False)
+            lanedlib.git(root, "worktree", "prune", check=False)
+    if why:
+        for w in dict.fromkeys(why):
+            print(f"stale: {w if len(w) <= 400 else w[:400] + ' ...'}")
+        print("STALE BASE: update-branch and re-run")
+        return 1
+    print(f"FRESH enough: no change on {main_ref} since {mb[:12]} touches or is imported by the PR's paths")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # gate
 # ---------------------------------------------------------------------------
 
@@ -1169,7 +1293,7 @@ def selftest_verification(ident: tuple[str, ...]) -> list[str]:
             n = 0
 
             def case(name: str, base_files: dict[str, str], pr_files: dict[str, str],
-                     want_rc: int, want_verification: bool) -> None:
+                     want_rc: int, want_verification: bool, listed: bool = True) -> None:
                 nonlocal n
                 n += 1
                 root = Path(tmp) / f"repo{n}"
@@ -1184,8 +1308,11 @@ def selftest_verification(ident: tuple[str, ...]) -> list[str]:
                     return lanedlib.git(root, "rev-parse", "HEAD").stdout.strip()
 
                 lanedlib.git(root, "init", "-q")
-                base = put_commit({".gitignore": "__pycache__/\n", "pkg_w9.py": "VALUE = 9\n", **base_files},
-                                  "built by another WP")
+                # W9 is a declared verification WP on BASE unless ``listed`` is False
+                decl = {lanedlib.VERIFICATION_WPS_PATH: "# verification WPs\nW9  # checks pkg_w9\n"} if listed \
+                    else {lanedlib.VERIFICATION_WPS_PATH: "# verification WPs\nW8\n"}
+                base = put_commit({".gitignore": "__pycache__/\n", "pkg_w9.py": "VALUE = 9\n", **decl,
+                                   **base_files}, "built by another WP")
                 head = put_commit(pr_files, name)
                 with contextlib.redirect_stdout(io.StringIO()) as buf:
                     rc = cmd_check_pr(root, "W9", base, head)
@@ -1203,6 +1330,9 @@ def selftest_verification(ident: tuple[str, ...]) -> list[str]:
                     return
                 if not want_verification and rc == 0 and "LEDGER-MODE expect-fail\n" not in out:
                     failures.append(f"verification {name}: fallback not recorded as expect-fail: {out.strip()}")
+                if not listed and ("not a declared verification WP" not in out
+                                   or (rc != 0 and "FAIL expect-fail" not in out)):
+                    failures.append(f"verification {name}: an unlisted WP did not run expect-fail: {out.strip()}")
                 if want_verification:
                     tree = lanedlib.wp_tree_at(root, head, "W9")
                     if f"TESTS-TREE {tree}\n" not in out:
@@ -1232,6 +1362,13 @@ def selftest_verification(ident: tuple[str, ...]) -> list[str]:
             case("verify-dir-and-glob-present", {"pkg_w9_data/t.json": "{}\n", "pkg_w9_a.json": "{}\n"},
                  {"tests/accept/w9/PATHS": "pkg_w9.py\npkg_w9_data/\npkg_w9_*.json\n",
                   "tests/accept/w9/test_w9.py": SELFTEST_VERIFY_PASS}, 0, True)
+            # RV5: W9 not listed in scripts/laned/verification_wps on BASE (another
+            # WP is), every test passes on BASE -> never verification: expect-fail
+            # semantics, which FAIL (no test fails for a right reason)
+            case("verify-unlisted-wp", {}, {**paths, "tests/accept/w9/test_w9.py": SELFTEST_VERIFY_PASS},
+                 1, False, listed=False)
+            # (a tests-only PR cannot list itself: rule 1 refuses tests/accept/
+            # with scripts/laned/, and the list is read at BASE anyway)
             # tests pass but stub_scan over PATHS fails -> not verification, FAIL
             case("verify-stub-scan", {"pkg_w9.py": "VALUE = 9  # " + "TO" + "DO\n"},
                  {**paths, "tests/accept/w9/test_w9.py": SELFTEST_VERIFY_PASS}, 1, False)
@@ -1366,6 +1503,8 @@ SELFTEST_CROSS_PLAN = """# plan
 | E | unbuilt, imports A | — | ci | `scripts/laned/accept E` |
 | F | red on base, uses A | A | ci | `scripts/laned/accept F` |
 | G | uncollectable on base, imports C | C | ci | `scripts/laned/accept G` |
+| V | verification of B (listed) | B | ci | `scripts/laned/accept V` |
+| U | verification-shaped, not listed | B | ci | `scripts/laned/accept U` |
 """
 
 
@@ -1414,7 +1553,16 @@ def selftest_cross(ident: tuple[str, ...]) -> list[str]:
             commit({"pkg_c.py": "C = 3\n"}, "impl C")
             commit({"pkg_f.py": "import pkg_a\n\nF = 6\nG = pkg_a.VALUE\n"}, "impl F")
             commit({"pkg_g.py": "X = 1\n"}, "impl G")
-            base = commit({"pkg_d.py": "D = 4\n"}, "impl D")
+            commit({"pkg_d.py": "D = 4\n"}, "impl D")
+            # RV5: V is a declared verification WP over B's built pkg_b (tests-only
+            # merge, no implementation commit); U has the same shape but is not
+            # declared, so it is not built (L1 at most) and never a cross WP.
+            vtest = "import pkg_b\n\n\ndef test_{w}():\n    assert pkg_b.DOUBLE == 2\n"
+            commit({lanedlib.VERIFICATION_WPS_PATH: "# verification WPs\nV  # checks B\n"}, "declare V")
+            commit({"tests/accept/v/PATHS": "pkg_b.py\n", "tests/accept/v/test_v.py": vtest.format(w="v")},
+                   "verification V")
+            base = commit({"tests/accept/u/PATHS": "pkg_b.py\n", "tests/accept/u/test_u.py": vtest.format(w="u")},
+                          "tests-only U")
 
             def case(name: str, wps: str, files: dict[str, str], want_rc: int,
                      want: list[str], never: list[str]) -> None:
@@ -1434,28 +1582,102 @@ def selftest_cross(ident: tuple[str, ...]) -> list[str]:
             # implementation PR for A breaks B (imports pkg_a through pkg_b) -> CROSS B FAIL;
             # D runs only for the PATHS overlap and passes; C (unrelated) and E (unbuilt) never run
             # ... and F, red on BASE by test_f_red, gains a failure (test_f_ok) -> CROSS F FAIL
+            # ... and V, a verification WP whose tests import pkg_b (-> pkg_a), is
+            # re-run and the break gives CROSS V FAIL (RV5); U is not declared -> never
             case("a-breaks-b", "A", {"pkg_a.py": "VALUE = 5\n", "shared_ad.py": "S = 1\n"}, 1,
-                 ["CROSS B FAIL", "CROSS D PASS", "CROSS F FAIL (pytest: 1 regression"], ["A", "C", "E", "G"])
+                 ["CROSS B FAIL", "CROSS D PASS", "CROSS F FAIL (pytest: 1 regression", "CROSS V FAIL"],
+                 ["A", "C", "E", "G", "U"])
             # the same PR without the break -> CROSS B PASS; F still red the same
             # way as on BASE -> CROSS F KNOWN, which does not fail the job
             case("a-keeps-b", "A", {"pkg_a.py": "VALUE = 1\nEXTRA = 2\n"}, 0,
-                 ["CROSS B PASS", "CROSS F KNOWN (1 tests already red on base: "], ["A", "C", "D", "E", "G"])
+                 ["CROSS B PASS", "CROSS F KNOWN (1 tests already red on base: ", "CROSS V PASS"],
+                 ["A", "C", "D", "E", "G", "U"])
             # tests-correction PR for B: B is the main step, never a cross WP
             case("b-tests-correction", "B",
                  {"tests/accept/b/test_b_more.py": "import pkg_b\n\n\ndef test_more():\n"
                                                    "    assert pkg_b.DOUBLE\n"},
-                 0, ["CROSS none"], ["A", "B", "C", "D", "E", "F", "G"])
+                 0, ["CROSS none"], ["A", "B", "C", "D", "E", "F", "G", "U", "V"])
             # a global input re-accepts every built WP except the PR's own (C, G)
             case("lockfile", "C,G", {"uv.lock": "x\n", "pkg_c.py": "C = 3\n# lock\n"}, 0,
-                 ["CROSS A PASS", "CROSS B PASS", "CROSS D PASS", "CROSS F KNOWN"], ["C", "E", "G"])
+                 ["CROSS A PASS", "CROSS B PASS", "CROSS D PASS", "CROSS F KNOWN", "CROSS V PASS"],
+                 ["C", "E", "G", "U"])
             # G fails on HEAD and cannot be collected on BASE either -> FAIL (fails closed)
             case("c-touches-g", "C", {"pkg_c.py": "C = 3\n# touch\n"}, 1,
-                 ["CROSS G FAIL"], ["A", "B", "C", "D", "E", "F"])
+                 ["CROSS G FAIL"], ["A", "B", "C", "D", "E", "F", "U", "V"])
     finally:
         if saved is None:
             os.environ.pop("LANED_PYTEST_CMD", None)
         else:
             os.environ["LANED_PYTEST_CMD"] = saved
+    return failures
+
+
+def selftest_freshness(ident: tuple[str, ...]) -> list[str]:
+    """The FRESHNESS rule on a real git repo (no pytest): PRs green on BASE0
+    while main moves on. The #593 shape: PR1 (pkg_lib.py) merges, then PR2,
+    W3's implementation (pkg_w3.py) green on the older base, must be refused
+    because W3's tests import pkg_lib; after update-branch it is fresh."""
+    failures: list[str] = []
+    with tempfile.TemporaryDirectory(prefix="laned-accept-selftest-fresh-") as tmp:
+        root = Path(tmp) / "repo"
+        root.mkdir()
+
+        def commit(files: dict[str, str], msg: str) -> str:
+            for rel, text in files.items():
+                (root / rel).parent.mkdir(parents=True, exist_ok=True)
+                (root / rel).write_text(text)
+            lanedlib.git(root, "add", "-A")
+            lanedlib.git(root, *ident, "commit", "-q", "-m", msg)
+            return lanedlib.git(root, "rev-parse", "HEAD").stdout.strip()
+
+        lanedlib.git(root, "init", "-q")
+        base0 = commit({"README.md": "x\n", "pkg_a.py": "A = 1\n", "pkg_b.py": "import pkg_a\n\nB = pkg_a.A\n",
+                        "pkg_c.py": "C = 1\n", "pkg_lib.py": "LIB = 1\n", "pkg_w3.py": "W3 = 0\n",
+                        "tests/accept/w3/PATHS": "pkg_w3.py\n",
+                        "tests/accept/w3/test_w3.py": "import pkg_lib\nimport pkg_w3\n\n\ndef test_w3():\n"
+                                                      "    assert pkg_w3.W3 == pkg_lib.LIB\n"}, "seed")
+
+        def branch(name: str, start: str, files: dict[str, str]) -> str:
+            lanedlib.git(root, "checkout", "-q", "-B", name, start)
+            return commit(files, name)
+
+        def case(name: str, base: str, head: str, main: str, want_stale: bool, want: str = "") -> None:
+            with contextlib.redirect_stdout(io.StringIO()) as buf:
+                rc = cmd_freshness(root, base, head, main)
+            out = buf.getvalue()
+            stale = "STALE BASE: update-branch and re-run\n" in out
+            if (rc != 0) != want_stale or stale != want_stale or (want and want not in out):
+                failures.append(f"freshness {name}: rc={rc} stale={stale}, want stale={want_stale}"
+                                f"{' with ' + repr(want) if want else ''}: {out.strip()[-1500:]}")
+
+        pr_a = branch("pr-a", base0, {"pkg_a.py": "A = 1\nEXTRA = 2\n"})
+        # main has not moved -> fresh
+        case("main-unmoved", base0, pr_a, base0, False, "FRESH base")
+        # main moved with an unrelated change -> fresh enough
+        main_c = branch("main-c", base0, {"pkg_c.py": "C = 2\n"})
+        case("main-unrelated", base0, pr_a, main_c, False, "FRESH enough")
+        # main touched the same file -> stale
+        main_a = branch("main-a", base0, {"pkg_a.py": "A = 3\n"})
+        case("same-file", base0, pr_a, main_a, True, "both touch pkg_a.py")
+        # the PR's module imports what main changed -> stale
+        pr_b = branch("pr-b", base0, {"pkg_b.py": "import pkg_a\n\nB = pkg_a.A + 1\n"})
+        case("pr-imports-main-change", base0, pr_b, main_a, True, "the PR's modules import pkg_a.py")
+        # main's changed module imports what the PR changed -> stale
+        main_b = branch("main-b", base0, {"pkg_b.py": "import pkg_a\n\nB = pkg_a.A * 2\n"})
+        case("main-imports-pr-change", base0, pr_a, main_b, True, "main's changed modules import pkg_a.py")
+        # #593: PR1 changes pkg_lib.py and merges; PR2 (W3's implementation) was
+        # green on BASE0, and W3's tests import pkg_lib -> refused
+        branch("pr1", base0, {"pkg_lib.py": "LIB = 2\n"})
+        lanedlib.git(root, "checkout", "-q", "-B", "main", base0)
+        lanedlib.git(root, "merge", "-q", "--squash", "pr1")
+        main1 = commit({}, "pr1 (#1)")
+        pr2 = branch("pr2", base0, {"pkg_w3.py": "W3 = 1\n"})
+        case("second-pr-older-base", base0, pr2, main1, True, "tests/accept/w3/ depends on the PR")
+        # after update-branch the run tests the PR merged into main's tip -> fresh
+        lanedlib.git(root, "checkout", "-q", "-B", "pr2-updated", pr2)
+        lanedlib.git(root, *ident, "merge", "-q", "--no-edit", "main")
+        updated = lanedlib.git(root, "rev-parse", "HEAD").stdout.strip()
+        case("second-pr-updated", main1, updated, main1, False, "FRESH base")
     return failures
 
 
@@ -1507,6 +1729,7 @@ def cmd_selftest() -> int:
     failures += selftest_verification(ident)
     failures += selftest_evidence(ident)
     failures += selftest_cross(ident)
+    failures += selftest_freshness(ident)
     for f in failures:
         print(f"accept selftest: FAIL {f}", file=sys.stderr)
     if failures:
@@ -1538,13 +1761,21 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--cross", action="store_true",
                     help="(needs --base/--head) accept every other WP at >= L2 on BASE whose tests "
                          "depend on the PR's changes; WP may list the PR's WPs, comma-separated")
+    ap.add_argument("--freshness", action="store_true",
+                    help="(needs --base/--head/--main) STALE BASE when main moved past the tested base "
+                         "with changes the PR's paths touch or import")
     ap.add_argument("--base")
     ap.add_argument("--head")
+    ap.add_argument("--main", metavar="REF", help="--freshness: main's current tip (origin/main)")
     ap.add_argument("--gate", metavar="STAGE")
     args = ap.parse_args(argv)
     root = Path(args.root).resolve()
     if args.gate:
         return cmd_gate(root, args.gate)
+    if args.freshness:
+        if not (args.base and args.head and args.main):
+            ap.error("--freshness needs --base, --head and --main")
+        return cmd_freshness(root, args.base, args.head, args.main)
     if args.cross:
         if not (args.wp and args.base and args.head):
             ap.error("--cross needs the PR's WP(s), --base and --head")

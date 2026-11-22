@@ -1,0 +1,15 @@
+# Verification WPs (accept --help, MODE verification; status, L2 via verification).
+#
+# One WP id per line; `#` starts a comment. Only a WP listed here may get
+# MODE verification (a tests-only PR whose tests pass on code another WP
+# already built gives L1 and L2 in one merge), and only a listed WP's L2 may
+# come from a verification merge on the status board. Every other tests-only
+# PR runs --expect-fail. `accept` and `status` read this file at the base /
+# board ref, never from the PR, and only a W0c PR may edit scripts/laned/, so
+# a test author cannot self-declare a verification WP (RV5, BLOCKING item 3
+# on W0c).
+#
+# W0b: the plan's W0b row is a pure property check of W5d (the lane D scorer's
+# context equivalence over cascade/eval/lane_d_scorer.py, which W5d built);
+# W0b has no implementation of its own (RV5).
+W0b
