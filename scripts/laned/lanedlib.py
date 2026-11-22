@@ -304,6 +304,30 @@ def impl_commit_index(history: list[tuple[str, list[str]]], wp: str, paths: list
 # Verification WPs (a tests-only PR whose tests pass on code another WP built)
 # ---------------------------------------------------------------------------
 
+VERIFICATION_WPS_PATH = "scripts/laned/verification_wps"
+
+
+def parse_verification_wps(text: str | None) -> set[str]:
+    """WP ids in a ``verification_wps`` file: one per line, ``#`` comments
+    (whole-line or trailing) and blank lines ignored."""
+    out: set[str] = set()
+    for line in (text or "").splitlines():
+        line = line.split("#", 1)[0].strip()
+        if line:
+            out.add(line)
+    return out
+
+
+def verification_wps_at(root: Path, ref: str) -> set[str]:
+    """The declared verification WPs at ``ref`` (RV5): only these may take MODE
+    verification or an L2 via verification. The list lives under
+    scripts/laned/, which only a W0c PR may edit, and is read at the base /
+    board ref, so a PR can never declare its own WP a verification WP.
+    No file at ``ref`` means no verification WP."""
+    proc = git(root, "show", f"{ref}:{VERIFICATION_WPS_PATH}", check=False)
+    return parse_verification_wps(proc.stdout) if proc.returncode == 0 else set()
+
+
 def is_test_path(rel: str) -> bool:
     return rel.split("/", 1)[0] == "tests"
 
