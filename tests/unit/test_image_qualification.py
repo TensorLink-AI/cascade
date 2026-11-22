@@ -40,12 +40,17 @@ from tests.unit.test_image_after_repin import (  # noqa: F401
 )
 
 RC15 = "sha256:5d41d94bc0c0d3ae3dfd042b0cc7e4d900c7d1f48173808436c12bf764a67641"
+# The 8x/4x H100/H200 ladder these cases were written for. The shipped mainnet
+# list is 8x only since S0a (R6x typed the deployed value), which needs world 8
+# alone; the fixture pins the wider ladder so the 4-GPU cases stay covered.
+LADDER_SKUS = ("8xH200", "8xH100", "4xH200", "4xH100")
 
 
 @pytest.fixture
 def armed(acfg, tmp_path, monkeypatch):  # noqa: F811
     monkeypatch.setattr(Q, "QUALIFICATIONS_DIR", tmp_path / "qualifications")
-    return A.apply_image_decoupled_activation(acfg, SW)
+    cfg = A.apply_image_decoupled_activation(acfg, SW)
+    return replace(cfg, round=replace(cfg.round, funded_pod_skus=LADDER_SKUS))
 
 
 def _pair(cfg):
@@ -165,7 +170,8 @@ def test_any_gap_in_the_record_refuses(armed, mutate, why):
 
 
 def test_required_worlds_are_the_rentable_skus_gpu_counts(armed):
-    assert Q.required_worlds(armed) == (4, 8)               # mainnet: 8x/4x H100/H200
+    assert Q.required_worlds(armed) == (4, 8)               # the 8x/4x H100/H200 ladder
+    assert Q.required_worlds(load_chain_config(REPO / "chain.toml")) == (8,)  # mainnet: 8x only
     assert Q.required_worlds(load_chain_config(REPO / "chain.testnet.toml")) == (1,)
     assert Q.required_worlds_for_skus(["8xH200", "8xH100"]) == (8,)
     assert Q.required_worlds_for_skus(["8xH200", "H100"]) == (1, 8)
