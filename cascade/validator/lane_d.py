@@ -22,8 +22,8 @@ validator. Unarmed (``not cfg.active(boundary)``) it returns
    the cohort: a member clears iff ``LCB ≥ d_margin`` and its point gain is
    positive; a first clear goes ``confirm_pending`` and must clear again on a
    disjoint set (D20 ``confirm_on_king_change``) before it is crowned;
-   A confirmed candidate also runs the §1.3b A10 low-frequency check; a
-   ``fail`` is ``lowfreq_regression`` and the entry is not crowned;
+   each verdict reports the §1.3b A10 low-frequency slice (report-only here:
+   W3b5 computes ``pass``/``fail`` and its ``lowfreq_regression`` effect);
 6. writes the signed ``lane-d-report/1`` (W7a: the schema file
    ``schemas/lane_d_report_1.json``; every entry considered and not judged is
    a typed skip, court slots that burn name a ``burn_reason``), the new
@@ -46,7 +46,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ..eval.bootstrap import cohort_maxt_lcbs, paired_bootstrap_lcb
+from ..eval.bootstrap import cohort_maxt_lcbs
 from ..eval.lane_d_scorer import SCORING_LEVELS, SCORING_METHOD, score_window
 from .lane_d_forward import eligible_windows
 from .lane_d_report import REPORT_SCHEMA, rows_sha256, sign_report
@@ -368,37 +368,23 @@ def _params(cfg) -> dict:
             "lowfreq_freqs": [str(f) for f in cfg.lowfreq_freqs]}
 
 
-def _lowfreq(member: str, king: str, ws: list[dict], scores: dict, house: str,
-             forecasts: dict, cfg, seed: str) -> dict:
-    """§1.3b A10 for a crowning candidate. The slice is the set's windows
-    whose frequency is in ``lowfreq_freqs``; on it the paired bootstrap LCB
-    of the member's relative CRPS and MASE improvement over each anchor must
-    be ``>= -tau_public``. The anchors are the cohort's KING_D (``scores`` holds
-    ``(crps, mase)`` aligned with ``ws`` for it and ``member``) and the house
-    when it is a different model with forecasts on every slice window."""
+def _lowfreq_candidate(ws: list[dict], cfg) -> dict:
+    """The report's §1.3b A10 ``lowfreq`` block for a crowning candidate (a
+    verdict that cleared at stage ``confirm``): ``n_windows`` counts the
+    frozen set's windows whose frequency is in ``lowfreq_freqs``.
+
+    W7a reports the slice only and never changes a verdict or the crowning.
+    W3b5 owns the non-inferiority test itself (CRPS and MASE
+    ``LCB_α >= -tau_public`` against KING_D and the house) and its
+    ``pass``/``fail`` result (``fail`` = ``lowfreq_regression``, not crowned).
+    Until W3b5 lands, a candidate with no slice window is ``no_windows`` and a
+    candidate with slice windows is ``not_candidate`` (not evaluated) with the
+    true count."""
     freqs = {str(f) for f in cfg.lowfreq_freqs}
-    idx = [i for i, w in enumerate(ws) if w["freq"] in freqs]
-    out = {"result": "no_windows", "freqs": [str(f) for f in cfg.lowfreq_freqs],
-           "n_windows": len(idx), "tau_public": float(cfg.tau_public)}
-    if not idx:
-        return out
-    h = int(cfg.horizon)
-    mine = (scores[member][0][idx], scores[member][1][idx])
-    anchors = {king: (scores[king][0][idx], scores[king][1][idx])}
-    if house not in anchors and all(_forecast_ok(forecasts.get(house), ws[i]["window_id"], h)
-                                   is True for i in idx):
-        pairs = [score_window(forecasts[house][ws[i]["window_id"]], ws[i]["target"],
-                              ws[i]["history"], ws[i]["seasonal_period"]) for i in idx]
-        anchors[house] = (np.asarray([p[0] for p in pairs]), np.asarray([p[1] for p in pairs]))
-    ok = True
-    for anchor, theirs in sorted(anchors.items()):
-        for k, metric in enumerate(("crps", "mase")):
-            lcb = paired_bootstrap_lcb(theirs[k], mine[k], alpha=float(cfg.alpha),
-                                       B=int(cfg.bootstrap_B),
-                                       seed=f"{seed}:lowfreq:{member}:{anchor}:{metric}")
-            ok = ok and math.isfinite(lcb) and lcb >= -float(cfg.tau_public)
-    out["result"] = "pass" if ok else "fail"
-    return out
+    n = sum(1 for w in ws if w["freq"] in freqs)
+    return {"result": "no_windows" if n == 0 else "not_candidate",
+            "freqs": [str(f) for f in cfg.lowfreq_freqs], "n_windows": n,
+            "tau_public": float(cfg.tau_public)}
 
 
 def _not_candidate(cfg) -> dict:
@@ -493,17 +479,13 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
             confirmation = {"stage": stage, "rule": str(cfg.confirm_on_king_change),
                             "first_set_sha256": first["first_set_sha256"] if first else None,
                             "first_king_digest": first["king_digest"] if first else None}
-            lowfreq = _not_candidate(cfg)
-            if r["cleared"] and stage == "confirm":
-                lowfreq = _lowfreq(m, kd, ws, scores, state["house"]["digest"], forecasts, cfg,
-                                   seed)
+            # Report-only (W3b5 decides pass/fail): never changes the outcome.
+            lowfreq = (_lowfreq_candidate(ws, cfg) if r["cleared"] and stage == "confirm"
+                       else _not_candidate(cfg))
             if not r["cleared"]:
                 outcome = "lost"
                 rec.update(status="lost",
                            reason="lost_confirmation" if stage == "confirm" else "lost_duel")
-            elif lowfreq["result"] == "fail":
-                outcome = "lost"
-                rec.update(status="lost", reason="lowfreq_regression")
             elif stage == "first":
                 outcome = "confirm_pending"
                 rec.update(status="confirm_pending", reason="confirm_pending",
