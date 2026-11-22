@@ -8,8 +8,8 @@ dates**: stages are gated (§5).
 
 ## rev6.2 (owner decisions 2026-11-22; main @ 6108ebd)
 
-Records four decisions the owner approved on 2026-11-22 ("do all ur
-recommendations"). Plan text only; nothing else in the design changes. Every
+Records five decisions the owner approved on 2026-11-22, (c)–(f) ("do all ur
+recommendations") and (h), plus one proposed WP, (g). Plan text only; nothing else in the design changes. Every
 changed item is marked **(rev6.2)**. They are build-level rules inside
 existing WPs, not new §6 D-numbers, so the §17.4 table is unchanged; the
 dated entries are listed under it (§17.4, "Owner decisions 2026-11-22").
@@ -3152,6 +3152,7 @@ rules inside existing WPs, not §6 D-numbers, so they aren't table rows:
 | (d) | A deferred lane B funded entry's `PayerKeyVault` key has its TTL refreshed on each deferred tick (#629/#633) | WB18 follow-up | owner, 2026-11-22 |
 | (e) | `laned_vault_ledger/1` is produced by W17 | W17 | owner, 2026-11-22 |
 | (f) | An era-init warm-start acceptance is governed by the sentinel of the era its init block opens | W-S2 follow-up | owner, 2026-11-22 |
+| (h) | Tests-only PRs may batch several WPs (one `laned:<WP>` label and one separately recorded accept run per WP; whole PR fails if any WP fails); implementation, tests-correction, evidence and review PRs stay one WP per PR (§3.1 rule 6) | all build WPs | owner, 2026-11-22 |
 
 **Owner inputs** (moved from Appendix A, rev6). These are inputs to runs, not
 design decisions. They're never guessed: the dependent WP stays
