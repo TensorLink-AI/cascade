@@ -196,3 +196,24 @@ crowns K1 and then Y.
 | store failure | `test_a_store_failure_never_raises` |
 | refusals | `test_a_sentinel_equal_to_the_gate_suite_is_refused`, `test_a_malformed_era_hash_is_refused`, `test_empty_sentinel_suites_are_refused` |
 | never gating | `test_the_sentinel_ran_for_every_crowning_and_only_those`, `test_the_sentinel_saw_the_numbers`, `test_settlements_are_identical_whatever_the_sentinel_numbers`, `test_the_record_declares_it_never_gates`, `test_the_sentinel_step_writes_nothing_but_its_record` |
+
+## RV5 correction: the crowning chain passes the gate inputs (W5e fail-closed)
+
+Once W5e lands (`tests/accept/w5e/README.md` "Fail closed"), an armed
+settlement that would crown without a `bench` session and a
+`boundary_block_hash` is `bench_hold`, not a crown. The fixture chain crowns
+at BOUNDARY_2 (K1 over the house) and BOUNDARY_4 (Y over K1) through
+`helpers._settle`, so `_settle` now passes `boundary_block_hash`
+(`helpers.gate_block_hash`), `sentinel=None` and a healthy `bench`
+(`lane_d_bench.SweepSession` over `helpers.HealthyBench`) whenever
+`settle_lane_d` accepts those keywords (`inspect.signature`), and makes the
+legacy call otherwise. The tests pass both on today's main and after W5e.
+
+- The settlement's gate bench is a session of its own. It is not the
+  sentinel `bench` the tests hand to `sweep_and_publish` (`RecordingHost`),
+  so every host-call assertion on the sentinel sweep is unchanged.
+- Every digest but the house returns the same recorded rows (a tie with
+  the miner KING_D K1 never regresses) and the house is 10% worse, so both
+  crowning candidates pass on any drawn suite and the duel alone decides.
+- No assertion changed. No W3b3 test validates a report, so the gate record
+  W5e writes on a crowned report isn't checked here.

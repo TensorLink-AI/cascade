@@ -155,3 +155,19 @@ test is unchanged and passes.
 
 Locally (bittensor 10.5, no torch) the W5a tests need neither torch nor
 `bittensor.sp_core`, because they never verify a signature.
+
+### RV5 correction: the crowning fixture passes the gate inputs (W5e fail-closed)
+
+Once W5e lands (`tests/accept/w5e/README.md` "Fail closed"), an armed
+settlement that would crown without a `bench` session and a
+`boundary_block_hash` is `bench_hold`, not a crown.
+`test_e2e_skeleton_refuses_trap_windows_and_still_pays_the_challenger`
+crowns at BOUNDARY_2 through `_settle`, so `_settle` now passes
+`boundary_block_hash` (`helpers.gate_block_hash`), `sentinel=None` and a
+healthy `bench` (`lane_d_bench.SweepSession` over `helpers.HealthyBench`)
+whenever `settle_lane_d` accepts those keywords (`inspect.signature`), and
+makes the legacy call otherwise. The tests pass both on today's main and
+after W5e. The bench is the one external service: every digest but the
+house returns the same recorded rows and the house is 10% worse, so the
+crowning candidate passes on any drawn suite and the duel alone decides.
+No assertion changed; every test still passes on main.

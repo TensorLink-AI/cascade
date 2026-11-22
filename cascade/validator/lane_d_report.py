@@ -19,7 +19,9 @@ keyword subset the file uses (``type``, ``const``, ``enum``, ``pattern``,
 ``propertyNames``, ``items``, ``$ref`` and ``if``/``then``/``else``), plus the
 checks JSON Schema cannot state: numbers are finite (``extensions``
 included), the cross-field rules of :func:`_cross_field` (snapshot binding,
-the gate record's consistency with the report, ``gate_weights`` keys), and
+the gate record's consistency with the report and the crowned digest, the
+W5c house bar's ``house_digest`` / ``verdicts[].house`` binding,
+``gate_weights`` keys), and
 ``rows_sha256`` is the canonical digest of ``rows`` (checked last). The
 signature is :func:`verify_report`'s job.
 
@@ -284,6 +286,41 @@ def _check_gate(report: dict) -> None:
             raise ReportSchemaError("bad_value", f"gate.results[{i}].digest",
                                     "digest swept twice")
         seen.add(res["digest"])
+    crowned = report["crowned"]
+    if crowned is not None and not any(res["digest"] == crowned and res["outcome"] == "pass"
+                                       for res in gate["results"]):
+        raise ReportSchemaError("bad_value", "gate.results",
+                                "no pass result for the crowned digest")
+
+
+def _check_house(report: dict) -> None:
+    """W5c change 3: a cohort's ``house_digest`` is the report's house and
+    not its KING_D; a verdict carries ``house`` iff its cohort names a
+    ``house_digest``, and then names that digest."""
+    house = report["house"]["digest"]
+    cohorts = report["cohorts"]
+    for i, c in enumerate(cohorts):
+        if "house_digest" not in c:
+            continue
+        at = _join(_join("cohorts", i), "house_digest")
+        if c["house_digest"] != house:
+            raise ReportSchemaError("bad_value", at, "not the report's house digest")
+        if c["house_digest"] == c["king_digest"]:
+            raise ReportSchemaError("bad_value", at, "the house holds KING_D: no house bar")
+    for i, v in enumerate(report["verdicts"]):
+        at = _join(_join("verdicts", i), "house")
+        if not 0 <= v["cohort"] < len(cohorts):
+            raise ReportSchemaError("bad_value", _join(_join("verdicts", i), "cohort"),
+                                    "not a cohort index")
+        bar = cohorts[v["cohort"]].get("house_digest")
+        if bar is None:
+            if "house" in v:
+                raise ReportSchemaError("unknown_field", at, "the cohort has no house bar")
+        elif "house" not in v:
+            raise ReportSchemaError("missing_field", at)
+        elif v["house"]["digest"] != bar:
+            raise ReportSchemaError("bad_value", _join(at, "digest"),
+                                    "not the cohort's house_digest")
 
 
 def _check_gate_weights(report: dict) -> None:
@@ -299,6 +336,7 @@ def _cross_field(report: dict) -> None:
     """The rules between fields, run after every structural check passes."""
     _check_gate_weights(report)
     _check_snapshots(report)
+    _check_house(report)
     if "gate" in report:
         _check_gate(report)
 

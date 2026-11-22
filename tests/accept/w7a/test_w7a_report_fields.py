@@ -23,6 +23,7 @@ from .helpers import (
     HOUR,
     PARAMS_FIELDS,
     ROOTS,
+    assert_valid,
     canonical_rows_sha256,
     coldkey,
     finite,
@@ -38,12 +39,10 @@ def scratch(tmp_path_factory):
 
 
 def _built(scratch, *, rich=True):
-    from cascade.validator.lane_d_report import validate_report
-
     built = two_settlements(scratch / ("rich" if rich else "legacy"), rich=rich)
     for s in (built["s1"], built["s2"]):
         assert s.report is not None, "an armed settlement produced no lane D report"
-        validate_report(s.report)
+        assert_valid(s.report)
     return built
 
 
@@ -66,6 +65,11 @@ def _expected_params(cfg) -> dict:
         "gate_suites": [str(s) for s in cfg.gate_suites],
         "tau_public": float(cfg.tau_public),
         "lowfreq_freqs": [str(f) for f in cfg.lowfreq_freqs],
+        # RV4: the gate draw's weights as parsed (absent suites weigh 0), the
+        # B14 source cap and the §1.7 context floor.
+        "gate_weights": {str(s): float(w) for s, w in cfg.gate_weights},
+        "max_source_share": float(cfg.max_source_share),
+        "min_long_series": int(cfg.min_long_series),
     }
 
 
@@ -112,6 +116,7 @@ def test_e2e_params_carry_every_satellite_value(scratch):
     for s in (built["s1"], built["s2"]):
         params = s.report["params"]
         for k, v in want.items():
+            assert k in params, f"params.{k} is missing"
             assert params[k] == v, f"params.{k} = {params.get(k)!r}, want {v!r}"
 
 

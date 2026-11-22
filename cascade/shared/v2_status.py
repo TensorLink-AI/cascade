@@ -29,6 +29,7 @@ pulling in the eval stack.
 
 from __future__ import annotations
 
+import copy
 import logging
 import math
 import time
@@ -628,12 +629,14 @@ def build_v2_status(cfg, *, block: int | None, state=None, health: dict | None =
                     era_index: int | None = None, king_pointer: str = "",
                     health_domains: int = 0, as_of: str | None = None,
                     lane_c_state=None, lane_c_trainer: dict | None = None,
-                    lane_a: dict | None = None) -> dict:
+                    lane_a: dict | None = None, sentinel: dict | None = None) -> dict:
     """The whole ``status/v2.json`` document. Pure given its inputs. The
     ``lane_c`` part appears once ``[lane_c] from_block`` is typed (an inert
     lane C leaves the document byte-identical); ``lane_a`` (the latest
     receipt's ladder / court / slash / king check, :func:`lane_a_view`)
-    appears when given."""
+    appears when given. ``sentinel`` (the era's non-gating sentinel board,
+    :func:`cascade.shared.sentinel_board.build_sentinel_board`) is copied to
+    ``doc["sentinel"]`` when given; ``None`` (W-S1 unarmed) adds no key."""
     lb = getattr(cfg, "lane_b", None)
     doc = {
         "schema": SCHEMA,
@@ -662,6 +665,8 @@ def build_v2_status(cfg, *, block: int | None, state=None, health: dict | None =
                 eb = None
         doc["lane_c"] = lane_c_view(lc, lane_c_state, block=block, trainer=lane_c_trainer,
                                     mc=getattr(cfg, "marketcast", None), era_blocks=eb)
+    if sentinel is not None:
+        doc["sentinel"] = copy.deepcopy(sentinel)
     return doc
 
 
@@ -726,16 +731,36 @@ def king_check_fields(check) -> dict | None:
 def lane_a_view(receipt: dict | None) -> dict:
     """The ``status/v2.json`` ``lane_a`` block from a receipt body (signed
     JSON): the ladder share, court and slash, the last king check and the
-    round. ``{}`` when the receipt carries neither record."""
+    round. ``{}`` when the receipt carries neither record. A receipt of an
+    armed W-S1 era adds ``sentinel``: the era's recorded draw (``suite``,
+    ``block``, ``block_hash``, :func:`sentinel_draw_fields`)."""
     if not isinstance(receipt, dict):
         return {}
     ladder = ladder_fields(receipt.get("emission"))
     check = king_check_fields(receipt.get("king_check"))
     if ladder is None and check is None:
         return {}
-    return {"round_id": str(receipt.get("round_id", "")),
+    view = {"round_id": str(receipt.get("round_id", "")),
             "epoch_start_block": receipt.get("epoch_start_block"),
             "ladder": ladder, "king_check": check}
+    draw = sentinel_draw_fields(receipt.get("sentinel"))
+    if draw is not None:
+        view["sentinel"] = draw
+    return view
+
+
+def sentinel_draw_fields(record) -> dict | None:
+    """A receipt's W-S1 ``sentinel`` draw record
+    (:func:`cascade.shared.sentinel.sentinel_record`) as ``{"suite", "block",
+    "block_hash"}``; ``None`` when absent or not that shape."""
+    if not isinstance(record, dict):
+        return None
+    suite, block, block_hash = record.get("suite"), record.get("block"), record.get("block_hash")
+    if not isinstance(suite, str) or not suite or not isinstance(block_hash, str):
+        return None
+    if isinstance(block, bool) or not isinstance(block, int):
+        return None
+    return {"suite": suite, "block": block, "block_hash": block_hash}
 
 
 def lane_c_state_from_receipt(receipt: dict | None) -> dict | None:

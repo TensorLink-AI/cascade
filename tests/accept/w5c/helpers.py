@@ -21,6 +21,7 @@ Nothing here imports a module in PATHS at import time.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 from pathlib import Path
 from statistics import NormalDist
@@ -206,10 +207,82 @@ def uids(*entries) -> dict:
     return {e["hotkey"]: 10 + i for i, e in enumerate(entries)}
 
 
+# ── gate inputs (W5e fail-closed, RV5) ──────────────────────────────────────
+# Once W5e wires the §1.3b gate into `settle_lane_d`, an ARMED settlement that
+# would crown without a bench session and a boundary block hash does not crown
+# (`bench_hold`). `settle` therefore passes a healthy bench and a block hash
+# WHEN `settle_lane_d` accepts them; on a main without the keywords it makes
+# the legacy call, unchanged. The bench shape follows
+# `tests/accept/w5e/helpers.py` (`passing_bench`, `settle_crowning`).
+
+GATE_KEYWORDS = ("boundary_block_hash", "sentinel", "bench")
+BENCH_ITEMS = 40
+
+try:
+    from tests.accept.w5e.helpers import suite_rows as _suite_rows
+except ImportError:  # the minimal shape of W5e's recorded suite outputs
+    def _suite_rows(suite: str, tag: str, factor: float = 1.0) -> list[dict]:
+        out = []
+        for i in range(BENCH_ITEMS):
+            h = hashlib.sha256(f"w5c bench {suite} {i}".encode()).digest()
+            c, m = 0.3 + h[0] / 255.0, 0.8 + h[1] / 255.0
+            out.append({"item": f"{suite}/task-{i:03d}", "crps": c * factor,
+                        "mase": m * factor})
+        return out
+
+
+def block_hash(tag) -> str:
+    """A fixture boundary block hash (0x + 64 hex)."""
+    return "0x" + hashlib.sha256(f"w5c block {tag}".encode()).hexdigest()
+
+
+class HealthyBench:
+    """A stand-in for the bench pod (an external service). Every digest but
+    the current house gets the same rows (a tie, never a regression, so a
+    miner KING_D never blocks), and the house is 10% worse on every item, so
+    every crowning candidate passes the paired gate on any drawn suite."""
+
+    def __init__(self, house_digest: str):
+        self.house_digest = house_digest
+        self.calls: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
+
+    def __call__(self, digests, suites) -> dict:
+        digests, suites = tuple(digests), tuple(suites)
+        self.calls.append((digests, suites))
+        return {d: {s: {"status": "ok",
+                        "rows": _suite_rows(s, "w5c-healthy",
+                                            1.0 if d == self.house_digest else 0.9)}
+                    for s in suites} for d in digests}
+
+
+def gate_inputs(boundary, house_digest: str) -> dict:
+    """The W5e gate keywords `settle_lane_d` accepts (none on today's main):
+    the boundary's block hash, no §16 sentinel (W-S1 unarmed) and a healthy
+    bench session."""
+    from cascade.validator.lane_d import settle_lane_d
+
+    params = inspect.signature(settle_lane_d).parameters
+    if "bench" not in params and "boundary_block_hash" not in params:
+        return {}
+    kw: dict = {}
+    if "boundary_block_hash" in params:
+        kw["boundary_block_hash"] = block_hash(boundary)
+    if "sentinel" in params:
+        kw["sentinel"] = None
+    if "bench" in params:
+        from cascade.validator.lane_d_bench import SweepSession
+
+        kw["bench"] = SweepSession(f"w5c-sess-{boundary}", HealthyBench(house_digest))
+    return kw
+
+
 def settle(cfg, boundary, pool_dir, entries, house_rec, fc, uid_of, state_path, prior=()):
+    """`settle_lane_d`, with the W5e gate inputs when it accepts them (see
+    `gate_inputs`): the house tests crown K1 at BOUNDARY_2."""
     from cascade.validator.lane_d import settle_lane_d
 
     kw = {"prior_pool_dirs": [Path(p) for p in prior]} if prior else {}
+    kw.update(gate_inputs(boundary, house_rec["digest"]))
     return settle_lane_d(cfg=cfg, boundary=boundary, pool_dir=pool_dir,
                          entries=[dict(e) for e in entries], house=dict(house_rec),
                          forecasts=fc, uid_of=dict(uid_of), state_path=state_path,

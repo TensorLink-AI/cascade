@@ -1,0 +1,25 @@
+# W-S2: lane B guard/target exclusion for the era's §16 sentinel (D33 rule 2,
+# D35). The target half (deferral) is WB18's, already on main.
+#
+# The consensus judge: judge_entry / judge_manifest take `sentinel` (the era's
+# suite, None = unarmed); its <suite>_crps / <suite>_mase public guards are not
+# built and require_public minus the sentinel is what must pair.
+cascade/validator/expert_lane.py
+# The warm-start acceptance's public guards: judge_acceptance takes `sentinel`.
+cascade/validator/merge_acceptance.py
+# The validator wiring: _lane_b_judge_experts judges with the settlement's
+# recorded W-S1 draw.
+cascade/validator/lane_b.py
+# Optional: keep/derive the settlement's draw for the lane B judge (and its
+# catch-up walk).
+cascade/validator/loop.py
+# The trainer: settle() reads the settlement era's sentinel (ops.block_hash,
+# independent of suite_targets), relaxes the king/candidate require_public
+# check for it, and self-judges with ops.judge(..., sentinel=); RunnerLaneBOps
+# .judge forwards it to judge_manifest.
+cascade/trainer/lane_b_driver.py
+# Optional: the trainer-side acceptance (accept_candidates) passes the sentinel.
+cascade/trainer/merge_acceptance.py
+# Optional pure helpers: dropping a suite from a guard set, the era's draw.
+cascade/eval/public_guards.py
+cascade/shared/sentinel.py

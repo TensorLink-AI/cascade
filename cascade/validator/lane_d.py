@@ -49,6 +49,22 @@ validator. Unarmed (``not cfg.active(boundary)``) it returns
    holds KING_D: that slot burns, D21), then up to ``reward_prior_kings``
    prior MINER kings (an unregistered one is ``None`` and burns).
 
+W7c (§1.5 "State", invariant 5, T11) makes the settlement restart-safe and
+binds it into a receipt record (:mod:`~cascade.validator.lane_d_state`):
+
+- the state is read through the strict ``load_state`` (a defective file is
+  refused with its typed code before anything is written);
+- the signed report is written atomically to ``report_path`` BEFORE the state
+  file, and the state's ``last_report`` binds the report's canonical body and
+  the prior state digest, never the randomized signature;
+- ``receipt`` = ``{schema, boundary, prior_state_sha256,
+  posterior_state_sha256, report_sha256}`` (``None`` unarmed);
+- a crash after the report landed is recovered by recomputing: the body must
+  equal the persisted file's (else ``report_conflict``), the file is kept
+  byte-for-byte and the state is written; a re-call at the settled boundary
+  returns the persisted report, pay and receipt with nothing re-scored,
+  re-gated or written; an older boundary is ``stale_boundary``.
+
 Light imports only (numpy + the scorer's numpy half): this module is on the
 validator package's import path.
 """
@@ -68,7 +84,18 @@ from ..eval.lane_d_scorer import SCORING_LEVELS, SCORING_METHOD, score_window
 from .lane_d_forward import eligible_windows
 from .lane_d_frozen import advance_frozen_set
 from .lane_d_report import REPORT_SCHEMA, rows_sha256, sign_report, validate_report
-from .lane_d_state import load_state, refresh_house, save_state
+from .lane_d_state import (
+    LaneDStateError,
+    load_report_file,
+    load_state,
+    make_receipt,
+    refresh_house,
+    report_digest,
+    report_path,
+    save_report_file,
+    save_state,
+    state_digest,
+)
 
 POOL_SCHEMA = "pool_d/1"
 OPEN_STATUSES = ("pending", "confirm_pending")
@@ -76,8 +103,11 @@ OPEN_STATUSES = ("pending", "confirm_pending")
 
 @dataclass(frozen=True)
 class LaneDSettlement:
+    """``receipt`` is the W7c lane D receipt record (``None`` unarmed)."""
+
     report: dict | None
     pay: dict | None
+    receipt: dict | None = None
 
 
 # ── pool_d ──────────────────────────────────────────────────────────────────
@@ -522,11 +552,20 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     the earlier retained ones. They feed every open entry's union and supply
     the history and targets of windows frozen from them."""
     if not cfg.active(boundary):
-        return LaneDSettlement(report=None, pay=None)
+        return LaneDSettlement(report=None, pay=None, receipt=None)
     boundary = int(boundary)
     state = load_state(state_path, house)
-    if int(state["boundary"]) >= boundary:
-        raise ValueError(f"lane D already settled through {state['boundary']}; got {boundary}")
+    settled = int(state["boundary"])
+    rp = report_path(state_path, boundary)
+    if settled == boundary and "last_report" in state:
+        return _already_settled(state, rp, boundary)
+    if settled >= boundary:
+        raise LaneDStateError("stale_boundary", f"lane D already settled through {settled}; "
+                              f"got {boundary}")
+    # A report file without its state: a crash between the two writes. It is
+    # parsed strictly now, before any scoring, and must match the recompute.
+    persisted = load_report_file(rp) if rp.exists() else None
+    prior_sha = state_digest(state)
     refresh_house(state, house)
     king_before = _king_record(state["king"])
     pools = _load_pools(pool_dir, prior_pool_dirs, int(cfg.horizon))
@@ -714,15 +753,70 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
         "pay": {"share": pay["share"], "court": court},
     }
     report = sign_report(report, signer)
-    # Fail closed: a report outside lane-d-report/1 is never returned and the
-    # state is not saved (ReportSchemaError propagates). Checked on the
-    # signed form, since ``signer`` and ``signature`` are required fields.
+    # Fail closed: a report outside lane-d-report/1 is never returned, and
+    # neither the report file nor the state is written (ReportSchemaError
+    # propagates). Checked on the signed form, since ``signer`` and
+    # ``signature`` are required fields.
     validate_report(report)
+    body_sha = report_digest(report)
+    if persisted is None:
+        save_report_file(rp, report)
+    elif persisted.get("boundary") != boundary or report_digest(persisted) != body_sha:
+        raise LaneDStateError("report_conflict", f"{rp}: the persisted report's body is not "
+                              f"the recomputed settlement's (sha256 {body_sha})")
+    else:
+        # Recovery: the persisted report (its signature too) is the record.
+        report = persisted
     state["boundary"] = boundary
     state["last_report"] = {"boundary": boundary, "rows_sha256": report["rows_sha256"],
-                            "signature": report["signature"]}
+                            "report_sha256": body_sha, "prior_state_sha256": prior_sha}
     save_state(state_path, state)
-    return LaneDSettlement(report=report, pay=pay)
+    receipt = make_receipt(boundary=boundary, prior_state_sha256=prior_sha,
+                           posterior_state_sha256=state_digest(state), report_sha256=body_sha)
+    return LaneDSettlement(report=report, pay=pay, receipt=receipt)
+
+
+def _is_hex64(value) -> bool:
+    return isinstance(value, str) and len(value) == 64 and set(value) <= _HEX64
+
+
+def _persisted_pay(report: dict, where) -> dict:
+    """The pay record ``{"share", "court_uids"}`` a persisted report carries
+    (``report["pay"]``); a malformed one is ``report_conflict``."""
+    pay = report.get("pay")
+    court = pay.get("court") if isinstance(pay, dict) else None
+    share = pay.get("share") if isinstance(pay, dict) else None
+    if (not isinstance(court, list) or isinstance(share, bool)
+            or not isinstance(share, int | float)
+            or not all(isinstance(s, dict) and "uid" in s for s in court)):
+        raise LaneDStateError("report_conflict", f"{where}: the persisted report has no "
+                              "well-formed pay record")
+    uids = [s["uid"] for s in court]
+    if not all(u is None or (isinstance(u, int) and not isinstance(u, bool)) for u in uids):
+        raise LaneDStateError("report_conflict", f"{where}: a court uid is not an int or null")
+    return {"share": float(share), "court_uids": uids}
+
+
+def _already_settled(state: dict, rp: Path, boundary: int) -> LaneDSettlement:
+    """T11 re-call at a settled boundary: the persisted report, its pay and
+    the receipt, with nothing re-scored, re-gated or written."""
+    last = state.get("last_report")
+    if (not isinstance(last, dict) or last.get("boundary") != boundary
+            or not _is_hex64(last.get("report_sha256"))
+            or not _is_hex64(last.get("prior_state_sha256"))):
+        raise LaneDStateError("report_conflict", f"lane D state at {boundary} has no "
+                              "well-formed last_report")
+    if not rp.is_file():
+        raise LaneDStateError("report_conflict", f"{rp}: the settled boundary's report file "
+                              "is missing")
+    report = load_report_file(rp)
+    if report.get("boundary") != boundary or report_digest(report) != last["report_sha256"]:
+        raise LaneDStateError("report_conflict", f"{rp}: the persisted report is not the one "
+                              f"the state bound (report_sha256 {last['report_sha256']})")
+    receipt = make_receipt(boundary=boundary, prior_state_sha256=last["prior_state_sha256"],
+                           posterior_state_sha256=state_digest(state),
+                           report_sha256=last["report_sha256"])
+    return LaneDSettlement(report=report, pay=_persisted_pay(report, rp), receipt=receipt)
 
 
 __all__ = ["LaneDSettlement", "judge_cohort", "load_pool", "settle_lane_d",

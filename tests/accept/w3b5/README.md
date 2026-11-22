@@ -32,7 +32,9 @@ A10's low-frequency check uses the private pool instead."
 - A **crowning candidate** is a verdict that cleared at `stage: "confirm"`
   (W7a's definition). Each one is checked, in every settlement, whatever
   else happens. It doesn't depend on the gate draw or on the W3b gate being
-  wired: these tests call `settle_lane_d` without W5e's gate keywords.
+  wired: on a main without W5e's gate keywords these tests make the legacy
+  call, and once `settle_lane_d` accepts them they pass a healthy bench (see
+  "Fixtures", RV5).
 - First clears (`stage: "first"`) and losers aren't checked. Their
   `lowfreq` block stays W7a's `not_candidate` with `n_windows: 0`. A first
   clear still goes `confirm_pending`, and a confirmation loser is still
@@ -155,6 +157,20 @@ The report enum has no `insufficient` value, and these tests don't add one.
   slice), then judge X (revealed a day later) against Y and the house at
   boundaries 3 and 4.
 - No service is mocked. No GPU, torch or checkpoint is used.
+- **Gate inputs (W5e fail-closed, RV5).** Once W5e lands
+  (`tests/accept/w5e/README.md` "Fail closed"), an armed settlement that
+  would crown without a `bench` session and a `boundary_block_hash` is
+  `bench_hold`, not a crown, so every test here that reaches a confirming
+  clear would stop crowning for a reason that isn't A10. `helpers.settle`
+  therefore passes `boundary_block_hash` (`helpers.gate_block_hash`),
+  `sentinel=None` and a healthy `bench` (`lane_d_bench.SweepSession` over
+  `helpers.HealthyBench`) whenever `settle_lane_d` accepts those keywords
+  (`inspect.signature`), and makes the legacy call otherwise. The bench is
+  the one external service: every digest but the house returns the same
+  recorded rows (a tie with a miner KING_D never regresses) and the house is
+  10% worse, so the §1.3b gate passes every crowning candidate on any drawn
+  suite and only the A10 check decides. No assertion changed; on main the
+  same 17 fail and 5 pass.
 
 ## Tests
 

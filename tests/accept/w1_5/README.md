@@ -230,3 +230,25 @@ an AREA (for example `ci`).
   mark.
 - Signature verification needs bittensor ≥ 11 (`bittensor.sp_core`), which
   `uv.lock` pins.
+
+## RV5 correction: the crowning fixture passes the gate inputs (W5e fail-closed)
+
+Once W5e lands (`tests/accept/w5e/README.md` "Fail closed"), an armed
+settlement that would crown without a `bench` session and a
+`boundary_block_hash` is `bench_hold`, not a crown, and `validate_report`
+(so `verify_report`) refuses a crowned report without a `gate` record.
+The seven `[synthetic]` e2e/inv tests that crown at BOUNDARY_2 go through
+`_settle` / `_settle_both`, so `_settle` now passes `boundary_block_hash`
+(`helpers.gate_block_hash`), `sentinel=None` and a healthy `bench`
+(`lane_d_bench.SweepSession` over `helpers.HealthyBench`) whenever
+`settle_lane_d` accepts those keywords (`inspect.signature`), and makes the
+legacy call otherwise. The tests pass both on today's main and after W5e.
+
+- The bench is the one external service: every digest but the house
+  returns the same recorded rows and the house is 10% worse, so the
+  crowning candidate passes on any drawn suite and the duel alone decides.
+- `test_e2e_audit_passes` and `test_inv9_share_zero_vector_armed_nonempty_lane_d_effect`
+  still verify and audit the crowned report. On main it carries no `gate`;
+  the gate record arrives with W5e (written by the gated settlement, a
+  `pass` for the crowned digest), which W7a's RV4 schema accepts. These
+  tests don't splice one in, and no assertion changed.

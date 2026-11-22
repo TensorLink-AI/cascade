@@ -1,0 +1,20 @@
+# WB18: sentinel interaction (D35 / LB5; TB19, TB20, TS4).
+# The driver's tick reads the era's §16 sentinel (W-S1 draw over the
+# era-start block hash, read through the injected ops' block_hash), defers a
+# suite-target entry whose suite is the sentinel uncharged
+# (`deferred: sentinel_target` in status()["deferred"] / status/lane_b.json),
+# counts the eras it was deferred (durable driver state) and lets it proceed
+# past [lane_b] sentinel_max_defer_eras, logged. RunnerLaneBOps gains
+# block_hash (the chain read).
+cascade/trainer/lane_b_driver.py
+# Optional pure planning helpers (deferred row shape, claim order), torch-free.
+cascade/trainer/row_claims.py
+# The trainer-side lane B queue (pending submissions, start()).
+cascade/trainer/expert_lane.py
+# DEC-CA-0071 §1: with [lane_b] suite_targets = true the slot list
+# LaneBConfig.targets gains suite:gift, suite:boom, suite:time, suite:fev
+# (unchanged while false).
+cascade/shared/config/v2.py
+# DEC-CA-0071 §1: suite target codes s-gift / s-boom / s-time / s-fev in the
+# lane B commitment (target_code / parse_expert_targets round-trip).
+cascade/shared/expert_manifest.py

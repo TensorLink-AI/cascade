@@ -130,3 +130,50 @@ def test_session_records_feed_the_gate():
 def test_session_id_is_required(bad):
     with pytest.raises((ValueError, TypeError)):
         _session(bad, _host())
+
+
+# ── a digest the host omits (RV5 non-blocking note 1, kept consistent with W3b4) ──
+#
+# SweepSession returns a record with no entry for a digest the host left out.
+# The gate then classifies it as W3b4's classify_suite does: the candidate
+# alone absent while both references are complete is the miner's
+# checkpoint_fault (code "absent"); a reference absent is a bench_hold, whatever
+# the candidate's rows are. A host adapter must report a per-digest infra
+# failure as a status (timeout / error with detail), never by omission.
+
+
+class _OmittingHost(RecordingHost):
+    def __init__(self, table, omit):
+        super().__init__(table)
+        self.omit = set(omit)
+
+    def __call__(self, digests, suites):
+        got = super().__call__(digests, suites)
+        return {d: v for d, v in got.items() if d not in self.omit}
+
+
+def test_host_omitting_the_candidate_alone_is_a_checkpoint_fault():
+    from cascade.validator.lane_d_bench import classify_suite, paired_gate
+
+    host = _OmittingHost(host_table(CAND, KING, HOUSE), omit={CAND})
+    recs = _session(SESSION, host).paired(CAND, KING, HOUSE, suites=SUITES2)
+    assert GATE_SUITE not in recs[0]["suites"], recs[0]
+    res = paired_gate(*recs, **gate_kwargs())
+    cls = classify_suite(*recs, suite=GATE_SUITE)
+    assert res["outcome"] == cls["outcome"] == "checkpoint_fault", (res, cls)
+    assert cls["code"] == "absent" and res["fault_on"] == ["candidate"], (res, cls)
+    assert res["hold"] is False and res["passed"] is False
+
+
+@pytest.mark.parametrize("omit", ["king_d", "house"])
+def test_host_omitting_a_reference_holds(omit):
+    from cascade.validator.lane_d_bench import classify_suite, paired_gate
+
+    dg = {"king_d": KING, "house": HOUSE}[omit]
+    host = _OmittingHost(host_table(CAND, KING, HOUSE), omit={dg})
+    recs = _session(SESSION, host).paired(CAND, KING, HOUSE, suites=SUITES2)
+    res = paired_gate(*recs, **gate_kwargs())
+    cls = classify_suite(*recs, suite=GATE_SUITE)
+    assert res["outcome"] == cls["outcome"] == "bench_hold", (res, cls)
+    assert omit in res["fault_on"] and "candidate" not in res["fault_on"], res
+    assert res["hold"] is True and res["passed"] is None

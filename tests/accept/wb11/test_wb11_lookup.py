@@ -16,10 +16,10 @@ from .helpers import MIN_HITS, WINDOW, build, clean_series, fixture_suites, matc
 
 SERIES = ("gift", "gift/m4_hourly/0")       # 80 points
 NORMALISED_FLOOR = 0.9      # share of windows a scaled + shifted copy must hit
-# float32 rounding moves a z-score across a 4-significant-figure boundary in
-# some windows (about 1 in 7 here, by any rounding rule): half must still hit,
-# far above the min_hits of 3.
-FLOAT32_FLOOR = 0.5
+# float32 moves a z-score by ~1e-6 here, far inside schema 2's tolerance
+# (README "Normalised matching at every scale"): every window must hit. v1's
+# 4-significant-figure rounding lost about 1 window in 7 to this.
+FLOAT32_FLOOR = 1.0
 
 
 def _suite_series(suite: str = SERIES[0], item: str = SERIES[1]) -> list[float]:

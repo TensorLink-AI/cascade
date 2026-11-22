@@ -194,6 +194,8 @@
         "window_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
         "set_sha256": {"$ref": "#/$defs/digest"},
         "first_seen_roots": {"type": "array", "items": {"$ref": "#/$defs/digest"}},
+        "house_digest": {"$ref": "#/$defs/digest",
+                         "description": "W5c change 3: the house digest the members were also judged against; present only in a cohort with a house bar (king_digest is not the house)."},
         "refused": {
           "type": "object",
           "description": "{reason: count} of pool windows refused by the §1.3 eligibility rule.",
@@ -255,7 +257,20 @@
         "cleared": {"type": "boolean"},
         "outcome": {"$ref": "#/$defs/verdict_outcome"},
         "confirmation": {"$ref": "#/$defs/confirmation"},
-        "lowfreq": {"$ref": "#/$defs/lowfreq"}
+        "lowfreq": {"$ref": "#/$defs/lowfreq"},
+        "house": {"$ref": "#/$defs/house_judgement"}
+      }
+    },
+    "house_judgement": {
+      "type": "object",
+      "description": "W5c change 3: the member's max-T judgement with the house as the bar; present only in a cohort with a house bar, digest equal to its house_digest.",
+      "required": ["digest", "lcb", "gain", "cleared"],
+      "additionalProperties": false,
+      "properties": {
+        "digest": {"$ref": "#/$defs/digest"},
+        "lcb": {"type": "number"},
+        "gain": {"type": "number"},
+        "cleared": {"type": "boolean"}
       }
     },
     "row": {
