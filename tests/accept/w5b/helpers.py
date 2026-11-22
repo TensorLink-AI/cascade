@@ -30,6 +30,7 @@ T0 = 1_790_000_000               # the challenger's reveal time (unix s)
 HOUSE_T = T0 - 2 * DAY           # the house's T: earlier, so max(T_E, T_K) = T0
 MARGIN_H = 6.0                   # forward_margin_hours (recommended)
 BOUND = T0 + int(MARGIN_H * HOUR)
+FEED_LAG_HOURS = 1.0             # measured mirror lag, under max_mirror_lag_hours
 
 # Era length 3600 blocks (900 x 4); ARM_BLOCK is an era boundary.
 ERA = 3600
@@ -74,9 +75,11 @@ def hourly(start: int) -> list[int]:
 def record(series_id: str, source: str, start: int) -> dict:
     """One forward-eligible pool_d/1 series record for bound BOUND: both clocks
     after the bound, S0 (the first snapshot after the bound) holds the series
-    with a frontier before the target."""
+    with a frontier before the target, and its feed (named after its source)
+    is listed in the pool's ``feeds`` block (see ``write_pool``)."""
     ts = hourly(start)
-    return {"series_id": series_id, "source": source, "freq": "H", "seasonal_period": 24,
+    return {"series_id": series_id, "source": source, "feed": source,
+            "freq": "H", "seasonal_period": 24,
             "target_ts": ts, "first_seen_ts": [t + 1800 for t in ts],
             "first_target_ts": ts[0], "end_ts": ts[-1],
             "frontier": [[BOUND + 2 * HOUR, BOUND + HOUR]]}
@@ -120,11 +123,23 @@ def target_values(series_id: str, start: int) -> tuple[np.ndarray, np.ndarray]:
     return full[:HISTORY], full[HISTORY:]
 
 
+def feeds_block(records: list[dict]) -> dict:
+    """The top-level ``feeds`` block: every feed the records name (``feed``,
+    else ``source``), with a measured lag under the 6 h limit and not a
+    forecast product. W5a fails closed, so an unlisted feed would be refused
+    ``unlisted_feed``; listing every feed keeps eligibility on the clocks and
+    the frontier alone."""
+    names = sorted({r.get("feed") or r["source"] for r in records})
+    return {f: {"mirror_lag_hours": FEED_LAG_HOURS, "forecast_product": False}
+            for f in names}
+
+
 def write_pool(directory: Path, records: list[dict], snapshot: str) -> Path:
-    """Write one pool_d/1 snapshot (W1.5 README format + the W5a additions)."""
+    """Write one pool_d/1 snapshot (W1.5 README format + the W5a additions:
+    a ``feeds`` block listing every feed, and a ``frontier`` per series)."""
     directory.mkdir(parents=True, exist_ok=True)
     meta = {"schema": "pool_d/1", "snapshot": snapshot, "horizon": HORIZON,
-            "series": records}
+            "feeds": feeds_block(records), "series": records}
     (directory / "metadata.json").write_text(json.dumps(meta, sort_keys=True))
     hist, tgt = {}, {}
     for r in records:
