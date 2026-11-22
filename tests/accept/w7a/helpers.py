@@ -69,8 +69,12 @@ SKIP_REASONS = ("pending_floor", "coldkey_cap_settlement", "coldkey_unresolved",
                 "mirror_lag_exceeded", "lane_closed")
 # `lane_closed` (W5b, T18): every open entry closes at `[lane_d] until_block`,
 # listed in both entries[].reason and skipped[].reason.
+# `checkpoint_fault` and `bench_hold` (W3b2 outcomes) are skip reasons: a
+# faulty candidate is refused, a held one is not judged this settlement.
+# `gate_regression` (RV4) is a judged loss on the §1.3b gate, like
+# `lowfreq_regression`: an entry reason, never a skip reason.
 ENTRY_REASONS = SKIP_REASONS + ("confirm_pending", "lost_duel", "lost_confirmation",
-                                "lowfreq_regression", "crowned")
+                                "lowfreq_regression", "gate_regression", "crowned")
 BURN_REASONS = ("house_king", "deregistered")
 # W5a's REFUSAL_REASONS (tests/accept/w5a/README.md "Reasons"), in precedence
 # order: `unlisted_feed` (W5a) comes right after `missing_clock`.
@@ -81,6 +85,10 @@ CONFIRMATION_STAGES = ("first", "confirm")
 CONFIRM_RULES = ("restart", "original")
 LOWFREQ_RESULTS = ("pass", "fail", "no_windows", "not_candidate")
 VERDICT_OUTCOMES = ("lost", "confirm_pending", "confirmed", "crowned")
+# The §1.3b paired gate (W3b2 `lane_d_bench.OUTCOMES` and `REFS`), RV4.
+GATE_OUTCOMES = ("pass", "gate_regression", "checkpoint_fault", "bench_hold")
+GATE_REFS = ("king_d", "house")
+GATE_METRICS = ("crps", "mase")
 SCHEMA_ERROR_CODES = ("not_object", "unknown_schema", "missing_field", "unknown_field",
                       "bad_type", "bad_value", "rows_sha256_mismatch")
 
@@ -95,19 +103,27 @@ ENUM_DEFS = {
     "confirm_rule": ("CONFIRM_RULES", CONFIRM_RULES),
     "lowfreq_result": ("LOWFREQ_RESULTS", LOWFREQ_RESULTS),
     "verdict_outcome": ("VERDICT_OUTCOMES", VERDICT_OUTCOMES),
+    "gate_outcome": ("GATE_OUTCOMES", GATE_OUTCOMES),
+    "gate_ref": ("GATE_REFS", GATE_REFS),
 }
 
 TOP_LEVEL_REQUIRED = ("schema", "boundary", "signer", "signature", "scoring_method", "params",
                       "seed", "pool", "house", "king_before", "king_after", "crowned",
                       "prior_kings", "entries", "judged", "skipped", "cohorts", "windows",
                       "verdicts", "rows", "rows_sha256", "pay")
-TOP_LEVEL_OPTIONAL = ("extensions",)
+# `gate` (RV4): the §1.3b gate record, present iff a candidate reached the gate.
+TOP_LEVEL_OPTIONAL = ("extensions", "gate")
 PARAMS_FIELDS = ("share", "takes_from", "remainder", "horizon", "horizons", "contexts",
                  "forward_margin_hours", "max_mirror_lag_hours", "min_windows", "min_clusters",
                  "d_margin", "alpha", "bootstrap_B", "king_decay", "reward_prior_kings",
                  "confirm_on_king_change", "max_entries_per_settlement",
                  "max_judged_per_coldkey_per_settlement", "scoring_levels", "gate_suites",
-                 "tau_public", "lowfreq_freqs")
+                 "tau_public", "lowfreq_freqs",
+                 # RV4: the gate draw's weights (W3b1), W5b's source cap (B14),
+                 # the context-arming floor (§1.7).
+                 "gate_weights", "max_source_share", "min_long_series")
+GATE_FIELDS = ("suite", "block", "block_hash", "sentinel", "eligible", "results")
+GATE_RESULT_FIELDS = ("digest", "outcome", "lcb", "blocked_by", "session")
 POOL_FIELDS = ("snapshot", "sha256", "horizon", "first_seen_roots")
 ENTRY_FIELDS = ("digest", "hotkey", "coldkey", "context", "ready_block", "reveal_block",
                 "reveal_ts", "status", "reason")
@@ -325,3 +341,85 @@ def reseal(report: dict) -> dict:
 
 def finite(x) -> bool:
     return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+# ── the §1.3b gate record (RV4) ─────────────────────────────────────────────
+#
+# What W5e will write as `report["gate"]`: W3b1's `gate_record(cfg, boundary,
+# block_hash, sentinel=...)` (`suite`, `block`, `block_hash`, `sentinel`,
+# `eligible`) plus `results`, one per candidate swept at that boundary,
+# projected from W3b2's `paired_gate`: `digest`, `outcome`, `lcb` (the four
+# LCBs, `null` on `checkpoint_fault` / `bench_hold`), `blocked_by` (`[]`
+# unless `gate_regression`) and `session`. No free text (§14.3 item 4), so
+# `paired_gate`'s `reason` string is not carried.
+
+GATE_SENTINEL = "gift"
+GATE_SESSION = "valpriv-4090/w7a/1"
+GATE_ITEMS = 24
+
+
+def gate_block_hash(boundary: int) -> str:
+    """A fixture boundary block hash: ``0x`` + 64 lowercase hex."""
+    return "0x" + text_digest(f"w7a boundary {int(boundary)}")
+
+
+def hash_int(text: str) -> int:
+    return int(text_digest(text)[:12], 16)
+
+
+def _sweep_rows(suite: str, tag: str, factor: float) -> list[dict]:
+    rng = np.random.default_rng(hash_int(f"{suite}|{tag}"))
+    base = np.random.default_rng(hash_int(f"base|{suite}"))
+    out = []
+    for i in range(GATE_ITEMS):
+        c, m = float(np.exp(base.normal(-0.7, 0.5))), float(np.exp(base.normal(0.1, 0.3)))
+        out.append({"item": f"{suite}/task-{i:03d}",
+                    "crps": c * factor * float(np.exp(rng.normal(0.0, 0.01))),
+                    "mase": m * factor * float(np.exp(rng.normal(0.0, 0.01)))})
+    return out
+
+
+def sweep_records(candidate: str, suites, *, cand_factor: float = 1.0,
+                  faulty: str | None = None) -> tuple[dict, dict, dict]:
+    """``(candidate, king_d, house)`` sweep records of one host session.
+    ``cand_factor`` > 1 makes the candidate worse than both references;
+    ``faulty`` (a role) gives that role a NaN CRPS on every suite."""
+    def rec(role: str, dg: str, factor: float) -> dict:
+        suites_out = {}
+        for s in suites:
+            rows = _sweep_rows(s, role, factor)
+            if role == faulty:
+                rows[0]["crps"] = float("nan")
+            suites_out[s] = {"status": "ok", "rows": rows}
+        return {"session": GATE_SESSION, "digest": dg, "suites": suites_out}
+
+    return (rec("candidate", candidate, cand_factor),
+            rec("king_d", text_digest("w7a gate king_d"), 1.0),
+            rec("house", text_digest("w7a gate house"), 1.0))
+
+
+def gate_result(paired: dict, digest: str) -> dict:
+    """A W3b2 `paired_gate` result projected onto one `gate.results[]` item."""
+    lcb = paired.get("lcb")
+    return {"digest": digest, "outcome": paired["outcome"],
+            "lcb": None if lcb is None else {r: {m: float(lcb[r][m]) for m in GATE_METRICS}
+                                             for r in GATE_REFS},
+            "blocked_by": list(paired.get("blocked_by") or []),
+            "session": paired["session"]}
+
+
+def build_gate(cfg, boundary: int, candidates: dict[str, dict]) -> dict:
+    """The gate record for ``boundary`` from the real W3b1 draw and W3b2 gate.
+    ``candidates`` maps a digest to `sweep_records` keyword arguments."""
+    from cascade.validator.lane_d_bench import paired_gate
+    from cascade.validator.lane_d_gate import gate_record
+
+    gate = gate_record(cfg, int(boundary), gate_block_hash(boundary), sentinel=GATE_SENTINEL)
+    results = []
+    for dg, kw in candidates.items():
+        cand, king, house = sweep_records(dg, (gate["suite"], GATE_SENTINEL), **kw)
+        paired = paired_gate(cand, king, house, suite=gate["suite"], alpha=float(cfg.alpha),
+                             tau_public=float(cfg.tau_public), B=200, seed=f"w7a|{boundary}",
+                             sentinel=GATE_SENTINEL)
+        results.append(gate_result(paired, dg))
+    return {**gate, "results": results}
