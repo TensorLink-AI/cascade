@@ -679,6 +679,12 @@ ladder_start_level_bp = 5000
 # "v2" = from_block; inert while [scoring] / [v2] bench_gate_mode stay "off"
 # (the receipt params then only stamp the rule name).
 bench_gate_v2_from_block = "v2"
+# LANE_D_PLAN §16 cross-lane sentinel (D33/D34): OFF (sentinel_from_block =
+# 0); arms by one signed overlay at an era boundary (D45). Mainnet documents it.
+sentinel_from_block = 0
+sentinel_suites = ["gift", "boom", "time", "fev"]
+sentinel_ratchet = true
+sentinel_tau = 0.01
 # DEC-CA-0063 (validator-GPU benches) stays OFF here: bench_source defaults to
 # "trainer", so bench_budget_hours (cap, default 4.0) / bench_sweep_hours
 # (per-checkpoint allowance, default 2.0) are read by nothing on testnet. The

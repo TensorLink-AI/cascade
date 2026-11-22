@@ -13,7 +13,8 @@ never executed. Every command a real run would use to change the box
 (`systemd-run`, `systemctl`, `choom`, `ssh`, `scp`, `rsync`, `pkill`,
 `sqlite3`, `uv`, `busctl`, `nohup`, `sudo`, `docker`, `lium`, `btcli`) is put
 first on `PATH` as a shim that records its argv and exits 97. A dry-run that
-calls any of them fails.
+calls any of them fails. (`sqlite3` is shimmed only so that a stray call gets
+recorded. The snapshot never uses it.)
 
 ## Files
 
@@ -79,13 +80,8 @@ order of steps:
 2. `PLAN check`: the line contains `python -P`,
    `<release-dir>/scripts/deploy_gate.py check --service <gate-svc>`,
    `--from <previous-ref>`, `--to <release-ref>` and each `--ack RULE` given.
-3. `PLAN snapshot` lines, one per §10.8 state file, copying from `<root>` to
-   `<root>/_state_backups/<ts>/`: `validator_state.db`, `cascade_state.json`,
-   `warm_start_init.json`, `lane_d_state.json`, `netconfig_state.json`, every
-   `activation_*_state.json`, `satellite_state.json`, `decided_votes.toml`.
-   A present file's line contains `<root>/<name>` and
-   `<root>/_state_backups/<ts>/<name>`. An absent fixed name's line contains
-   the name and the word `absent`. Every service snapshots, the eval host too.
+3. `PLAN snapshot` lines: the state snapshot (next section). Every service
+   snapshots, the eval host too.
 4. `PLAN restart`: the exact restart command(s).
    - Box services: the command contains `PYTHONPATH=<release-dir>`,
      `<venv>/bin/python -P` and the service's entry point
@@ -102,6 +98,52 @@ order of steps:
 5. `PLAN verify`: the line contains `python -P`,
    `<release-dir>/scripts/deploy_gate.py verify --service <gate-svc>` and
    `--release <release-dir>`.
+
+## The state snapshot (§10.8; RV2 BLOCKING R5)
+
+`test_r5_snapshot.py` and `test_snapshot_lists_every_state_file` pin it. The
+snapshot copies these files from `<root>` into `<root>/_state_backups/<ts>/`,
+keeping each file's name:
+
+- the fixed names (each one is always reported, present or absent):
+  `validator_state.db`, `cascade_state.json`, `warm_start_init.json`,
+  `lane_d_state.json`, `netconfig_state.json`, `activation_state.json`
+  (the DEC-CA-0045 main tally, which the `activation_*_state.json` glob does
+  not match), `satellite_state.json`, `decided_votes.toml`, and the sidecars
+  the validator writes next to `validator_state.db`:
+  `validator_state.db.lane_b.json` (`cascade/validator/lane_b.py:54`),
+  `validator_state.db.lane_c.json` (`lane_c.py:279`) and
+  `validator_state.db.settlement.json` (`settlement_transaction.py:18`);
+- every `activation_*_state.json` that is present;
+- for each file above, its `<name>.bak` when present. This is the previous
+  good file that the loaders fall back to (`cascade/shared/atomic.py`
+  `write_text_atomic(backup=True)` / `read_text_with_backup`). An absent
+  `.bak` may be reported or left out. Dated manual copies
+  (`*.bak-<tag>`) are not pinned.
+
+The rules:
+
+- Every state file is JSON text, `validator_state.db` included. The validator
+  writes `state.dumps` JSON with `write_text_atomic`
+  (`cascade/validator/loop.py` `_persist_state`), and the fixture is JSON too.
+  So each present file is copied with exactly
+  `cp -a <root>/<name> <root>/_state_backups/<ts>/<name>`, one line per file.
+  The copy must be byte-identical, and `cp -a` keeps the mode and mtime.
+- The only snapshot commands are `mkdir` and `cp -a`. **No `sqlite3`**
+  anywhere: not in any plan line, and not in any non-comment line of any file
+  under `deploy/laned/`. The box has no `sqlite3` binary, and the dry-run and
+  the snapshot both work on a `PATH` where `sqlite3` does not exist at all.
+- An absent fixed name gets the line `PLAN snapshot <name> absent …`, and no
+  copy line.
+- Non-state files next to the state (`validator_state.db.lock`,
+  `chain.toml`) are not copied.
+
+The tests check the copy by replaying. After the dry-run, they run the
+printed `PLAN snapshot` command lines (each line's text is the argv it runs),
+against the fixture root only. Every absolute path in a replayed line must be
+under the test's `tmp_path`. They then compare each backup with its source:
+the bytes, the mode and `st_mtime_ns`. The backup dir must hold exactly the
+present state files.
 
 `<gate-svc>` is `eval-host`, `validator`, `intake-laned` or `trainer` (the
 `deploy_gate` names R8 adds for the new services).
@@ -136,5 +178,5 @@ order.
 ## Not pinned here
 
 The exact service argument lines (wallet names, ports, `--chain-toml`), the
-copy tool for the snapshot (`cp -a` or `sqlite3 .backup`), and the bench-sweep
+order of the snapshot lines, and the bench-sweep
 window (no detector exists yet). `deploy_gate.py` itself is R8.

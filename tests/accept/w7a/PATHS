@@ -7,3 +7,8 @@ cascade/validator/lane_d_report.py
 # settle_lane_d emits the new fields (windows' feed and lag, judged/skipped,
 # confirmation, lowfreq, first-seen roots, court burn reasons, params).
 cascade/validator/lane_d.py
+# check_lane_d compares the stated params with config exactly, so the audit
+# must derive the 5 new params fields (horizons, max_mirror_lag_hours,
+# gate_suites, tau_public, lowfreq_freqs) from config itself, never by
+# importing the producer (invariant 12).
+cascade/audit/lane_d.py

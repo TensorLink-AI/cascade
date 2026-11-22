@@ -3,7 +3,7 @@ digests (invariant 1 applies to lane A here), each paired per invariant 10
 with an armed test. The tooling's pairing suffix is
 ``armed_nonempty_lane_d_effect``; here it names the lane A sentinel effect.
 
-The goldens were computed on main (e614e7b) from the shared receipt fixture
+The goldens were computed on main (0bad8b0) from the shared receipt fixture
 (``tests/unit/receipt_fixture.py``), the committed
 ``tests/fixtures/round_receipt_v3.json`` and a fixed bench-row fixture."""
 
@@ -32,6 +32,7 @@ from .helpers import (
     consensus_fingerprint,
     detail_sha,
     field,
+    fixture_body_sha,
     gate,
     king_check,
     lane_a_contract_digests,
@@ -130,7 +131,7 @@ def test_inv1_lane_a_receipt_unchanged_when_unarmed(name):
     """Unarmed, the validator's stamp is ``None`` and every receipt keeps its
     bytes: the shared scored / rejected fixtures, the committed golden
     receipt (dump and load), and a receipt built with ``sentinel=None``."""
-    from cascade.shared.sentinel import sentinel_record
+    from cascade.shared.sentinel import sentinel_record  # noqa: I001
 
     from cascade.shared.receipt import dump_receipt, load_receipt
     from tests.unit.receipt_fixture import make_rejected_receipt, make_scored_receipt
@@ -138,7 +139,7 @@ def test_inv1_lane_a_receipt_unchanged_when_unarmed(name):
     rec = sentinel_record(load_ok(shipped_raw(name)), EFFECTIVE, synth_hash(0))
     assert rec is None, f"unarmed config stamped {rec!r}"
     scored = make_scored_receipt(None)[0]
-    assert body_sha(scored) == GOLDEN_SCORED_RECEIPT_SHA
+    assert body_sha(scored) == GOLDEN_SCORED_RECEIPT_SHA == fixture_body_sha()
     assert body_sha(make_rejected_receipt(None)) == GOLDEN_REJECTED_RECEIPT_SHA
     assert body_sha(rejected_receipt(sentinel=rec)) == GOLDEN_REJECTED_RECEIPT_SHA
     assert body_sha(with_sentinel(scored, rec)) == GOLDEN_SCORED_RECEIPT_SHA
@@ -151,7 +152,7 @@ def test_inv1_lane_a_receipt_unchanged_when_unarmed(name):
 
 @pytest.mark.parametrize("name", SHIPPED)
 def test_inv1_lane_a_receipt_armed_nonempty_lane_d_effect(name):
-    from cascade.shared.sentinel import sentinel_record
+    from cascade.shared.sentinel import sentinel_record  # noqa: I001
 
     from tests.unit.receipt_fixture import make_scored_receipt
 

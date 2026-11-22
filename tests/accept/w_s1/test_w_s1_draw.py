@@ -108,7 +108,7 @@ def test_ts1_validators_armed_by_overlay_or_file_derive_the_same_record(name):
     """A validator armed by the signed overlay and one whose chain.toml carries
     the same keys stamp the same sentinel record for every era hash; the draw
     depends on the hash and the suites only (mainnet and testnet agree)."""
-    from cascade.shared.sentinel import sentinel_record
+    from cascade.shared.sentinel import sentinel_record  # noqa: I001
 
     from cascade.shared.config import parse_chain_config
 
