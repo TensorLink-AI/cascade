@@ -1,0 +1,9 @@
+# W3: the lane D intake service (plan §1.2 "Flow", §3.0 W3 row; README.md has
+# the contract). cascade/lane_d/ already holds intake.py (ready helpers) and
+# storage.py (the vault interface + fs adapter, also W4's); the builder keeps
+# their public names intact and adds the service beside them.
+cascade/lane_d/
+# The systemd unit (code-path guard: python -P, PYTHONPATH, exit 78 stays down).
+deploy/cascade-laned-intake.service
+# The Caddy route snippet for /v1/lane-d/* (imported into the box's site block).
+deploy/caddy/lane-d-intake.caddy

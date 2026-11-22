@@ -32,10 +32,17 @@
     "rows": {"type": "array", "items": {"$ref": "#/$defs/row"}},
     "rows_sha256": {"$ref": "#/$defs/digest"},
     "pay": {"$ref": "#/$defs/pay"},
+    "gate": {"$ref": "#/$defs/gate"},
     "extensions": {
       "type": "object",
       "description": "Open and never consensus: satellites must not read verdict, eligibility or weight inputs from it."
     }
+  },
+  "if": {"required": ["crowned"], "properties": {"crowned": {"type": "string"}}},
+  "then": {
+    "description": "W5e (RV5): a crowned report carries its §1.3b gate record (an object, never absent or null); the validator also requires a pass result for the crowned digest.",
+    "required": ["gate"],
+    "properties": {"gate": {"type": "object"}}
   },
   "$defs": {
     "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
@@ -47,17 +54,22 @@
                              "coldkey_changed", "king_unscored", "bench_hold", "deregistered",
                              "ready_expired", "reveal_delay_exceeded", "duplicate_digest",
                              "hotkey_has_open_entry", "context_not_armed", "checkpoint_fault",
-                             "mirror_lag_exceeded"]},
+                             "mirror_lag_exceeded", "lane_closed"]},
     "entry_reason": {"type": "string",
                      "enum": ["pending_floor", "coldkey_cap_settlement", "coldkey_unresolved",
                               "coldkey_changed", "king_unscored", "bench_hold", "deregistered",
                               "ready_expired", "reveal_delay_exceeded", "duplicate_digest",
                               "hotkey_has_open_entry", "context_not_armed", "checkpoint_fault",
-                              "mirror_lag_exceeded", "confirm_pending", "lost_duel",
-                              "lost_confirmation", "lowfreq_regression", "crowned"]},
+                              "mirror_lag_exceeded", "lane_closed", "confirm_pending",
+                              "lost_duel", "lost_confirmation", "lowfreq_regression",
+                              "gate_regression", "crowned"]},
     "burn_reason": {"type": "string", "enum": ["house_king", "deregistered"]},
+    "gate_outcome": {"type": "string",
+                     "enum": ["pass", "gate_regression", "checkpoint_fault", "bench_hold"]},
+    "gate_ref": {"type": "string", "enum": ["king_d", "house"]},
     "window_refusal_reason": {"type": "string",
-                              "enum": ["missing_clock", "forecast_product", "over_lag",
+                              "enum": ["missing_clock", "unlisted_feed", "forecast_product",
+                                       "over_lag",
                                        "before_margin", "publish_ahead", "late_mirror",
                                        "absent_from_s0", "backfill"]},
     "confirmation_stage": {"type": "string", "enum": ["first", "confirm"]},
@@ -73,7 +85,8 @@
                    "d_margin", "alpha", "bootstrap_B", "king_decay", "reward_prior_kings",
                    "confirm_on_king_change", "max_entries_per_settlement",
                    "max_judged_per_coldkey_per_settlement", "scoring_levels", "gate_suites",
-                   "tau_public", "lowfreq_freqs"],
+                   "tau_public", "lowfreq_freqs", "gate_weights", "max_source_share",
+                   "min_long_series"],
       "additionalProperties": false,
       "properties": {
         "share": {"type": "number", "minimum": 0},
@@ -97,19 +110,41 @@
         "scoring_levels": {"type": "array", "items": {"type": "number"}},
         "gate_suites": {"type": "array", "items": {"type": "string", "minLength": 1}},
         "tau_public": {"type": "number", "minimum": 0},
-        "lowfreq_freqs": {"type": "array", "items": {"type": "string", "minLength": 1}}
+        "lowfreq_freqs": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "gate_weights": {
+          "type": "object",
+          "description": "{suite: weight} as parsed (§1.3b draw, W3b1): keys are gate_suites members; a suite absent from the table weighs 0 and is absent here.",
+          "propertyNames": {"type": "string", "minLength": 1},
+          "additionalProperties": {"type": "number", "minimum": 0}
+        },
+        "max_source_share": {"type": "number", "exclusiveMinimum": 0, "maximum": 1,
+                             "description": "T18e/B14: the most of a frozen union one source may hold."},
+        "min_long_series": {"type": "integer", "minimum": 0,
+                            "description": "§1.7: the long-series floor that arms a context variant."}
       }
     },
     "pool": {
       "type": "object",
-      "required": ["snapshot", "sha256", "horizon", "first_seen_roots"],
+      "description": "snapshot / sha256 / horizon are the newest snapshot's; snapshots lists every snapshot a judged window's version came from, the newest included, each once; first_seen_roots is the sorted union of their roots.",
+      "required": ["snapshot", "sha256", "horizon", "first_seen_roots", "snapshots"],
       "additionalProperties": false,
       "properties": {
         "snapshot": {"type": "string"},
         "sha256": {"$ref": "#/$defs/digest"},
         "horizon": {"type": "integer", "minimum": 1},
         "first_seen_roots": {"type": "array", "items": {"$ref": "#/$defs/digest"},
-                             "description": "B12 daily first-seen Merkle roots the snapshot relies on, sorted."}
+                             "description": "B12 daily first-seen Merkle roots the snapshots rely on, sorted."},
+        "snapshots": {"type": "array", "items": {"$ref": "#/$defs/pool_snapshot"}}
+      }
+    },
+    "pool_snapshot": {
+      "type": "object",
+      "required": ["snapshot", "sha256", "first_seen_roots"],
+      "additionalProperties": false,
+      "properties": {
+        "snapshot": {"type": "string"},
+        "sha256": {"$ref": "#/$defs/digest"},
+        "first_seen_roots": {"type": "array", "items": {"$ref": "#/$defs/digest"}}
       }
     },
     "king": {
@@ -165,6 +200,8 @@
         "window_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
         "set_sha256": {"$ref": "#/$defs/digest"},
         "first_seen_roots": {"type": "array", "items": {"$ref": "#/$defs/digest"}},
+        "house_digest": {"$ref": "#/$defs/digest",
+                         "description": "W5c change 3: the house digest the members were also judged against; present only in a cohort with a house bar (king_digest is not the house)."},
         "refused": {
           "type": "object",
           "description": "{reason: count} of pool windows refused by the §1.3 eligibility rule.",
@@ -176,7 +213,7 @@
     "window": {
       "type": "object",
       "required": ["window_id", "source", "feed", "min_target_ts", "min_first_seen_ts",
-                   "mirror_lag_hours"],
+                   "mirror_lag_hours", "snapshot_sha256"],
       "additionalProperties": false,
       "properties": {
         "window_id": {"type": "string", "minLength": 1},
@@ -184,7 +221,9 @@
         "feed": {"type": "string", "minLength": 1},
         "min_target_ts": {"$ref": "#/$defs/timestamp"},
         "min_first_seen_ts": {"$ref": "#/$defs/timestamp"},
-        "mirror_lag_hours": {"type": ["number", "null"], "minimum": 0}
+        "mirror_lag_hours": {"type": ["number", "null"], "minimum": 0},
+        "snapshot_sha256": {"$ref": "#/$defs/digest",
+                            "description": "The snapshot whose version of the window was scored; one of pool.snapshots[].sha256."}
       }
     },
     "confirmation": {
@@ -224,7 +263,20 @@
         "cleared": {"type": "boolean"},
         "outcome": {"$ref": "#/$defs/verdict_outcome"},
         "confirmation": {"$ref": "#/$defs/confirmation"},
-        "lowfreq": {"$ref": "#/$defs/lowfreq"}
+        "lowfreq": {"$ref": "#/$defs/lowfreq"},
+        "house": {"$ref": "#/$defs/house_judgement"}
+      }
+    },
+    "house_judgement": {
+      "type": "object",
+      "description": "W5c change 3: the member's max-T judgement with the house as the bar; present only in a cohort with a house bar, digest equal to its house_digest.",
+      "required": ["digest", "lcb", "gain", "cleared"],
+      "additionalProperties": false,
+      "properties": {
+        "digest": {"$ref": "#/$defs/digest"},
+        "lcb": {"type": "number"},
+        "gain": {"type": "number"},
+        "cleared": {"type": "boolean"}
       }
     },
     "row": {
@@ -261,6 +313,60 @@
       "properties": {
         "share": {"type": "number", "minimum": 0},
         "court": {"type": "array", "items": {"$ref": "#/$defs/court_slot"}}
+      }
+    },
+    "gate": {
+      "type": "object",
+      "description": "§1.3b gate record (W3b1 gate_record plus results), present iff a candidate reached the gate at this boundary. block equals the report's boundary and suite is one of eligible (checked by the validator).",
+      "required": ["suite", "block", "block_hash", "sentinel", "eligible", "results"],
+      "additionalProperties": false,
+      "properties": {
+        "suite": {"type": "string", "minLength": 1},
+        "block": {"type": "integer", "minimum": 0},
+        "block_hash": {"type": "string", "pattern": "^0x[0-9a-f]{64}$"},
+        "sentinel": {"type": ["string", "null"], "minLength": 1,
+                     "description": "§16 sentinel suite of the era; null when W-S1 is unarmed."},
+        "eligible": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "results": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/gate_result"},
+                    "description": "One per candidate digest swept at this boundary (digests unique)."}
+      }
+    },
+    "gate_lcb_pair": {
+      "type": "object",
+      "required": ["crps", "mase"],
+      "additionalProperties": false,
+      "properties": {
+        "crps": {"type": "number"},
+        "mase": {"type": "number"}
+      }
+    },
+    "gate_lcbs": {
+      "type": ["object", "null"],
+      "required": ["king_d", "house"],
+      "additionalProperties": false,
+      "properties": {
+        "king_d": {"$ref": "#/$defs/gate_lcb_pair"},
+        "house": {"$ref": "#/$defs/gate_lcb_pair"}
+      }
+    },
+    "gate_result": {
+      "type": "object",
+      "description": "W3b2 paired_gate projected (no free text): the four LCBs iff the outcome is pass or gate_regression; blocked_by non-empty iff gate_regression.",
+      "required": ["digest", "outcome", "lcb", "blocked_by", "session"],
+      "additionalProperties": false,
+      "properties": {
+        "digest": {"$ref": "#/$defs/digest"},
+        "outcome": {"$ref": "#/$defs/gate_outcome"},
+        "lcb": {"$ref": "#/$defs/gate_lcbs"},
+        "blocked_by": {"type": "array", "items": {"$ref": "#/$defs/gate_ref"}},
+        "session": {"type": "string", "minLength": 1}
+      },
+      "if": {"properties": {"outcome": {"const": "gate_regression"}}},
+      "then": {"properties": {"lcb": {"type": "object"}, "blocked_by": {"minItems": 1}}},
+      "else": {
+        "if": {"properties": {"outcome": {"const": "pass"}}},
+        "then": {"properties": {"lcb": {"type": "object"}, "blocked_by": {"maxItems": 0}}},
+        "else": {"properties": {"lcb": {"type": "null"}, "blocked_by": {"maxItems": 0}}}
       }
     }
   }

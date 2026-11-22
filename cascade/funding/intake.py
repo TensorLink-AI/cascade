@@ -137,6 +137,8 @@ transfers):
     → 400 benchmark_series_embedded (+ "contamination") |
       413 repo_too_large (D38: a ``suite:*`` tree over
           ``[lane_b] suite_target_max_repo_mb``) |
+      413 contamination_budget_exceeded (+ "contamination"; the bounded
+          scan ran past its window budget or deadline; uncharged) |
       503 contamination_hashset_unavailable / repo_unavailable /
           contamination_scan_failed (fail closed; nothing queued or vaulted)
       Queues into the LANE-B queue (``lane_b_queue.json`` beside the
@@ -170,6 +172,7 @@ requeues without burning.
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import json
 import logging
@@ -197,6 +200,8 @@ log = logging.getLogger("cascade.funding.intake")
 # FundingIntake's default for the WB13 keywords: "not wired" (distinct from
 # an explicit None, which a wired, pinned intake answers 503).
 _UNWIRED = object()
+# RV6 B6: scan receipts an intake remembers (by content-pinned ref + pin).
+_LANE_B_SCAN_CACHE_SIZE = 4096
 
 # Replay bound on the signed timestamp. Funding is idempotent, so the only
 # replay of consequence is re-queueing after a withdraw — a five-minute
@@ -484,6 +489,10 @@ class FundingIntake:
         self.lane_b_hashset = None if lane_b_hashset is _UNWIRED else lane_b_hashset
         self.fetch_lane_b_repo = None if fetch_lane_b_repo is _UNWIRED else fetch_lane_b_repo
         self._lane_b_hashset_sha: str | None = None
+        # RV6 B6: scan receipts by (content-pinned ref, hash-set pin), per
+        # intake, bounded (oldest evicted first).
+        self._lane_b_scan_lock = threading.Lock()
+        self._lane_b_scan_cache: collections.OrderedDict = collections.OrderedDict()
         if not self._lane_b_check_wired and self._lane_b_pin():
             log.warning("lane-B intake built without lane_b_hashset / fetch_lane_b_repo: "
                         "the contamination check is NOT run although [lane_b] "
@@ -1287,7 +1296,8 @@ class FundingIntake:
         otherwise. Fails closed (503) while the pinned artefact or the tree
         is unavailable; D38 caps a ``suite:*`` entry's tree at
         ``suite_target_max_repo_mb``."""
-        from ..interface.contamination_scan import RESULT_EMBEDDED, scan_repo
+        from ..interface import contamination_scan
+        from ..interface.contamination_scan import RESULT_EMBEDDED
         from ..interface.validation import check_repo_size
 
         cfg = self.lane_b_cfg
@@ -1319,14 +1329,37 @@ class FundingIntake:
                              "message": f"a suite-target generator must be at most {cap_mb} MiB "
                                         "([lane_b] suite_target_max_repo_mb)",
                              **(size.details or {})}
-        try:
-            receipt = scan_repo(tree, self.lane_b_hashset,
-                                min_hits=cfg.contamination_min_hits)
-        except Exception:  # noqa: BLE001 — an unscannable tree fails closed
-            log.exception("lane-B fund: contamination scan of %s failed", ref)
-            return 503, {"code": "contamination_scan_failed",
-                         "message": "the intake contamination check could not complete — "
-                                    "retry later"}
+        # RV6 B6: the result cache. A vault / Hub ref is content-pinned, so
+        # (ref, pin) names the scanned content; a re-fund is never re-scanned.
+        # The scan itself is bounded by contamination_scan.SCAN_DEADLINE_S.
+        key = (str(ref), pin)
+        with self._lane_b_scan_lock:
+            receipt = self._lane_b_scan_cache.get(key)
+            if receipt is not None:
+                self._lane_b_scan_cache.move_to_end(key)
+        if receipt is None:
+            try:
+                receipt = contamination_scan.scan_repo(tree, self.lane_b_hashset,
+                                                       min_hits=cfg.contamination_min_hits)
+            except Exception:  # noqa: BLE001 — an unscannable tree fails closed
+                log.exception("lane-B fund: contamination scan of %s failed", ref)
+                return 503, {"code": "contamination_scan_failed",
+                             "message": "the intake contamination check could not complete — "
+                                        "retry later"}
+            receipt = dict(receipt)
+            with self._lane_b_scan_lock:
+                self._lane_b_scan_cache[key] = receipt
+                while len(self._lane_b_scan_cache) > _LANE_B_SCAN_CACHE_SIZE:
+                    self._lane_b_scan_cache.popitem(last=False)
+        receipt = dict(receipt)
+        if receipt["result"] == contamination_scan.RESULT_BUDGET_EXCEEDED:
+            log.warning("lane-B fund refused: the contamination scan of %s ran past its "
+                        "budget", ref)
+            return 413, {"code": "contamination_budget_exceeded",
+                         "message": "the submitted generator carries more numeric data than "
+                                    "the intake contamination check scans; ship less bulk "
+                                    "data (no data files, no numbers in config.json)",
+                         "contamination": receipt}
         if receipt["result"] == RESULT_EMBEDDED:
             log.warning("lane-B fund refused: %s embeds benchmark window %s (%s)", ref,
                         receipt["window_id"], receipt["suite"])

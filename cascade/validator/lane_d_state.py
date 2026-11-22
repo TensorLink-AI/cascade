@@ -5,7 +5,12 @@ Holds KING_D, the prior miner kings, the house, and every entry's progress
 record, and ``frozen_set``: the W5b accumulating/frozen window set from
 :func:`~cascade.validator.lane_d_frozen.advance_frozen_set`). Protected like
 ``cascade_state.json`` (snapshot before restarts, never hand-edited). A
-missing file is the genesis state: the house holds KING_D.
+missing file is the genesis state (the house holds KING_D) only while no
+settlement has been persisted: :func:`load_prior_state` (what
+``settle_lane_d`` reads) refuses a lost state (``state_missing``) or a
+rolled-back one (``state_digest_mismatch``) once a report exists, and
+:func:`restore_state` is the only way back (an operator backup bound to the
+last receipt's posterior and to the persisted report).
 
 W7c pins the file and the digests a settlement's receipt binds:
 
@@ -34,9 +39,12 @@ No migration from the pre-W7c layout (``indent=1``, a signature in
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
+import re
+import sys
 from pathlib import Path
 
 from ..shared.atomic import write_text_atomic
@@ -54,7 +62,11 @@ ENTRY_REASONS = tuple(lane_d_report.ENTRY_REASONS) + tuple(
     r for r in STATE_ONLY_REASONS if r not in lane_d_report.ENTRY_REASONS)
 
 STATE_ERROR_CODES = ("bad_json", "duplicate_key", "not_canonical", "unknown_schema",
-                     "state_digest_mismatch", "stale_boundary", "report_conflict")
+                     "state_digest_mismatch", "stale_boundary", "report_conflict",
+                     # RV6 B3: a lost or unreadable state after a settlement
+                     "state_missing", "state_unreadable")
+# A persisted report's file name under ``report_path``'s directory.
+_REPORT_NAME = re.compile(r"lane_d_report_([0-9]+)\.json")
 RECEIPT_ERROR_CODES = ("not_object", "unknown_schema", "missing_field", "unknown_field",
                        "bad_value", "boundary_mismatch", "report_mismatch", "state_mismatch",
                        "boundary_order", "chain_break")
@@ -158,30 +170,165 @@ def genesis(house: dict) -> dict:
             "prior_kings": [], "entries": {}}
 
 
+def _read_state_file(p: Path) -> tuple[dict, bytes]:
+    """The state file at ``p`` and its exact bytes, strictly: absent is
+    ``state_missing``, not a readable regular file is ``state_unreadable``,
+    then ``bad_json``, ``duplicate_key``, ``not_canonical``, ``unknown_schema``."""
+    if not os.path.lexists(p):
+        raise LaneDStateError("state_missing", f"{p}: the lane D state file is absent")
+    if not p.is_file():
+        raise LaneDStateError("state_unreadable", f"{p}: the lane D state path is not a "
+                              "regular file")
+    try:
+        raw = p.read_bytes()
+    except FileNotFoundError as e:
+        raise LaneDStateError("state_missing", f"{p}: the lane D state file is absent") from e
+    except OSError as e:
+        raise LaneDStateError("state_unreadable", f"{p}: cannot read the lane D state "
+                              f"({e})") from e
+    state = _parse_object(raw, p)
+    if canonical_state(state) != raw:
+        raise LaneDStateError("not_canonical", f"{p}: the bytes are not the canonical "
+                              "serialisation of the state (re-indented or hand-edited)")
+    if state.get("schema") != STATE_SCHEMA:
+        raise LaneDStateError("unknown_schema",
+                              f"{p}: lane D state schema {state.get('schema')!r} "
+                              f"is not {STATE_SCHEMA}")
+    return state, raw
+
+
 def load_state(path: str | os.PathLike, house: dict, *, expect_sha256: str | None = None
                ) -> dict:
-    """The state at ``path`` (``genesis(house)`` when the file is missing),
+    """The state at ``path`` (``genesis(house)`` when nothing is at ``path``),
     refused with a :class:`LaneDStateError` unless the bytes are exactly the
     canonical serialisation of a ``STATE_SCHEMA`` object with no repeated
-    key. With ``expect_sha256`` the file's digest (the genesis digest for a
-    missing file) must equal it (``state_digest_mismatch``)."""
+    key. A path that exists but cannot be read as a file is
+    ``state_unreadable``, never genesis. With ``expect_sha256`` the file's
+    digest (the genesis digest for a missing file) must equal it
+    (``state_digest_mismatch``). The lost-state check (a missing file after a
+    persisted settlement) is :func:`load_prior_state`'s."""
     p = Path(path)
-    if not p.exists():
+    if not os.path.lexists(p):
         state = genesis(house)
         raw = canonical_state(state)
     else:
-        raw = p.read_bytes()
-        state = _parse_object(raw, p)
-        if canonical_state(state) != raw:
-            raise LaneDStateError("not_canonical", f"{p}: the bytes are not the canonical "
-                                  "serialisation of the state (re-indented or hand-edited)")
-        if state.get("schema") != STATE_SCHEMA:
-            raise LaneDStateError("unknown_schema",
-                                  f"{p}: lane D state schema {state.get('schema')!r} "
-                                  f"is not {STATE_SCHEMA}")
+        state, raw = _read_state_file(p)
     if expect_sha256 is not None and _sha256(raw) != expect_sha256:
         raise LaneDStateError("state_digest_mismatch",
                               f"{p}: state digest {_sha256(raw)} != expected {expect_sha256!r}")
+    return state
+
+
+def persisted_report_boundaries(state_path: str | os.PathLike) -> list[int]:
+    """The boundaries of every persisted report (a ``lane_d_report_<int>.json``
+    entry in :func:`report_path`'s directory), ascending. A missing or empty
+    directory is none; a reports path that is not a listable directory is
+    ``state_unreadable`` (fail closed: it may hide a settlement)."""
+    d = report_path(state_path, 0).parent
+    if not os.path.lexists(d):
+        return []
+    if not d.is_dir():
+        raise LaneDStateError("state_unreadable", f"{d}: the lane D reports path is not a "
+                              "directory")
+    try:
+        names = sorted(os.listdir(d))
+    except OSError as e:
+        raise LaneDStateError("state_unreadable", f"{d}: cannot list the lane D reports "
+                              f"({e})") from e
+    return sorted({int(m.group(1)) for m in map(_REPORT_NAME.fullmatch, names) if m})
+
+
+def load_prior_state(state_path: str | os.PathLike, house: dict, boundary: int, *,
+                     expect_prior_sha256: str | None = None) -> dict:
+    """The prior state of the settlement at ``boundary``, failing closed on a
+    lost or rolled-back state (README W7c "Lost state fails closed"), in order:
+
+    1. the state file, strictly (:func:`load_state`'s codes); when nothing is
+       at the path it is genesis only if no report is persisted at a boundary
+       other than ``boundary`` (a first settlement, or its recovery), else
+       ``state_missing``, whatever ``expect_prior_sha256`` says;
+    2. a report persisted above the state's boundary, other than the one this
+       call recovers, is a rolled-back state: ``state_digest_mismatch``;
+    3. with ``expect_prior_sha256``, the loaded state's digest must equal it
+       (``state_digest_mismatch``).
+
+    Nothing is written."""
+    p = Path(state_path)
+    b = _boundary_int(boundary)
+    reports = persisted_report_boundaries(p)
+    if not os.path.lexists(p):
+        others = [r for r in reports if r != b]
+        if others:
+            raise LaneDStateError("state_missing", f"{p}: the lane D state file is absent "
+                                  f"but settlements are persisted at {others}; restore it "
+                                  "from a backup (restore_state), never genesis")
+        state = genesis(house)
+    else:
+        state, _ = _read_state_file(p)
+        settled = state.get("boundary")
+        if isinstance(settled, bool) or not isinstance(settled, int):
+            raise LaneDStateError("state_digest_mismatch", f"{p}: the state boundary "
+                                  f"{settled!r} is not an int")
+        ahead = [r for r in reports if r > settled and r != b]
+        if ahead:
+            raise LaneDStateError("state_digest_mismatch", f"{p}: the state is at boundary "
+                                  f"{settled} but settlements are persisted at {ahead} "
+                                  "(a rolled-back state)")
+    got = state_digest(state)
+    if expect_prior_sha256 is not None and got != expect_prior_sha256:
+        raise LaneDStateError("state_digest_mismatch", f"{p}: state digest {got} != the "
+                              f"expected prior {expect_prior_sha256!r}")
+    return state
+
+
+def restore_state(state_path: str | os.PathLike, backup_path: str | os.PathLike, *,
+                  expect_sha256: str) -> dict:
+    """Install an operator backup of the state at ``state_path`` (the only way
+    back from ``state_missing``). In order:
+
+    1. the backup is read strictly (``state_missing`` if absent,
+       ``state_unreadable``, ``bad_json``, ``duplicate_key``,
+       ``not_canonical``, ``unknown_schema``);
+    2. the sha256 of its bytes equals ``expect_sha256`` (the last published
+       receipt's ``posterior_state_sha256``), else ``state_digest_mismatch``;
+    3. at a boundary > 0, its ``last_report.report_sha256`` equals the body
+       digest of the report persisted at that boundary (which must exist),
+       else ``report_conflict``.
+
+    Then the backup bytes are written atomically, byte for byte, to
+    ``state_path`` and the parsed state is returned. On refusal nothing is
+    written; persisted reports are never touched."""
+    bp = Path(backup_path)
+    state, raw = _read_state_file(bp)
+    got = _sha256(raw)
+    if got != expect_sha256:
+        raise LaneDStateError("state_digest_mismatch", f"{bp}: backup digest {got} != "
+                              f"expected {expect_sha256!r}")
+    b = state.get("boundary")
+    if isinstance(b, bool) or not isinstance(b, int) or b < 0:
+        raise LaneDStateError("report_conflict", f"{bp}: the backup's boundary {b!r} is not "
+                              "a non-negative int")
+    if b > 0:
+        rp = report_path(state_path, b)
+        last = state.get("last_report")
+        want = last.get("report_sha256") if isinstance(last, dict) else None
+        if not _is_hex64(want) or last.get("boundary") != b:
+            raise LaneDStateError("report_conflict", f"{bp}: the backup has no well-formed "
+                                  f"last_report at boundary {b}")
+        if not rp.is_file():
+            raise LaneDStateError("report_conflict", f"{rp}: no report is persisted at the "
+                                  f"backup's boundary {b}")
+        try:
+            report = load_report_file(rp)
+            body = report_digest(report)
+        except (LaneDStateError, OSError, TypeError, ValueError) as e:
+            raise LaneDStateError("report_conflict", f"{rp}: the persisted report cannot be "
+                                  f"read ({e})") from e
+        if report.get("boundary") != b or body != want:
+            raise LaneDStateError("report_conflict", f"{rp}: the persisted report (body "
+                                  f"sha256 {body}) is not the one the backup bound ({want})")
+    # The bytes are canonical, hence ASCII: the encode is byte for byte.
+    write_text_atomic(state_path, raw.decode("ascii"))
     return state
 
 
@@ -323,6 +470,33 @@ def verify_receipt_chain(receipts) -> None:
 __all__ = ["ENTRY_REASONS", "ENTRY_STATUSES", "RECEIPT_ERROR_CODES", "RECEIPT_FIELDS",
            "RECEIPT_SCHEMA", "STATE_ERROR_CODES", "STATE_ONLY_REASONS", "STATE_SCHEMA",
            "LaneDReceiptError", "LaneDStateError", "canonical_state", "genesis",
-           "load_report_file", "load_state", "make_receipt", "refresh_house", "report_digest",
-           "report_path", "save_report_file", "save_state", "state_digest", "verify_receipt",
-           "verify_receipt_chain"]
+           "load_prior_state", "load_report_file", "load_state", "make_receipt",
+           "persisted_report_boundaries", "refresh_house", "report_digest", "report_path",
+           "restore_state", "save_report_file", "save_state", "state_digest",
+           "verify_receipt", "verify_receipt_chain"]
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Operator CLI: ``python -P -m cascade.validator.lane_d_state restore
+    --state <path> --backup <path> --expect-sha256 <hex>``. Exit 0 on a
+    restore, 1 on a typed refusal (printed as ``refused: <code>: ...``)."""
+    ap = argparse.ArgumentParser(prog="python -P -m cascade.validator.lane_d_state")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    rs = sub.add_parser("restore", help="install a backup bound to the last receipt")
+    rs.add_argument("--state", required=True, help="the live lane_d_state.json path")
+    rs.add_argument("--backup", required=True, help="the operator's backup of the state")
+    rs.add_argument("--expect-sha256", required=True,
+                    help="the last published receipt's posterior_state_sha256")
+    args = ap.parse_args(argv)
+    try:
+        state = restore_state(args.state, args.backup, expect_sha256=args.expect_sha256)
+    except LaneDStateError as e:
+        print(f"refused: {e}", file=sys.stderr)
+        return 1
+    print(f"restored {args.state} at boundary {state['boundary']} "
+          f"(sha256 {args.expect_sha256})")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

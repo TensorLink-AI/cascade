@@ -115,8 +115,9 @@ class LaneBOps(Protocol):
     def publish_expert_manifest(self, manifest) -> None:
         """Sign and publish the expert manifest."""
 
-    def judge(self, manifest, round_id: str, block: int) -> list:
-        """The manifest's ExpertJudgement list."""
+    def judge(self, manifest, round_id: str, block: int, sentinel: str | None = None) -> list:
+        """The manifest's ExpertJudgement list; ``sentinel`` (W-S2) is the
+        settlement era's §16 suite, passed only while armed."""
 
     def merge_scores(self, pointer: str, block: int) -> list:
         """The held-out acceptance scores of ``pointer``."""
@@ -485,7 +486,7 @@ class LaneBDriver:
         hash could not be read this tick. Never under ``_lock``."""
         from ..shared.config.v2 import SUITE_TARGET_PREFIX
         from ..shared.era import era_start_block
-        from ..shared.sentinel import sentinel_armed, sentinel_for_era, sentinel_from_block
+        from ..shared.sentinel import sentinel_armed, sentinel_from_block
 
         if not getattr(self.cfg.lane_b, "suite_targets", False) or sentinel_from_block(
                 self.cfg) <= 0:
@@ -493,20 +494,52 @@ class LaneBDriver:
         start = int(era_start_block(self.cfg.round, int(block)))
         if not sentinel_armed(self.cfg, start):
             return None
+        try:
+            suite = self._era_sentinel(start)
+        except Exception as e:  # noqa: BLE001 — a chain read failure holds, never raises
+            log.warning("lane B: era-start block %d hash unreadable (%s) — suite-target "
+                        "entries wait for the era's sentinel draw", start, e)
+            return SENTINEL_UNREADABLE
+        return SUITE_TARGET_PREFIX + suite
+
+    def _era_sentinel(self, start: int) -> str:
+        """W-S1's draw for the era starting at ``start`` (cached; one
+        ``ops.block_hash`` read per era). Raises on a chain read failure or a
+        malformed hash. Never under ``_lock``."""
+        from ..shared.sentinel import sentinel_for_era
+
         with self._cache_lock:
-            suite = self._sentinels.get(start)
+            suite = self._sentinels.get(int(start))
         if suite is None:
-            try:
-                suite = sentinel_for_era(self.ops.block_hash(start), self.cfg.v2.sentinel_suites)
-            except Exception as e:  # noqa: BLE001 — a chain read failure holds, never raises
-                log.warning("lane B: era-start block %d hash unreadable (%s) — suite-target "
-                            "entries wait for the era's sentinel draw", start, e)
-                return SENTINEL_UNREADABLE
+            suite = sentinel_for_era(self.ops.block_hash(int(start)),
+                                     self.cfg.v2.sentinel_suites)
             with self._cache_lock:
-                self._sentinels[start] = suite
+                self._sentinels[int(start)] = suite
                 while len(self._sentinels) > SENTINELS_KEEP:
                     self._sentinels.popitem(last=False)
-        return SUITE_TARGET_PREFIX + suite
+        return suite
+
+    def _settlement_sentinel(self, block: int) -> str | None:
+        """W-S2 (§16 rule 2, D35): the §16 sentinel of the era the settlement
+        at boundary ``block`` belongs to (``settlement_era_start``) — the
+        same draw the validators record for that settlement — or ``None``
+        when ``[v2] sentinel_from_block`` does not arm that era (no chain
+        read). Read whenever armed, with or without ``[lane_b]
+        suite_targets``. An unreadable hash raises ``OSError``: the
+        settlement holds (its legs stay finished), never judged with a
+        guessed sentinel. Never under ``_lock``."""
+        from ..shared.sentinel import sentinel_armed, sentinel_from_block, settlement_era_start
+
+        if sentinel_from_block(self.cfg) <= 0:
+            return None
+        start = settlement_era_start(self.cfg, int(block))
+        if not sentinel_armed(self.cfg, start):
+            return None
+        try:
+            return self._era_sentinel(start)
+        except Exception as e:  # noqa: BLE001 — any read failure holds the settlement
+            raise OSError(f"lane-B settlement sentinel unreadable (era-start block {start}): "
+                          f"{type(e).__name__}: {e}") from e
 
     def _sentinel_holds(self, sentinel: str | None, era_index: int,
                         eligible) -> dict[str, tuple[LaneBSubmission, str]]:
@@ -1083,6 +1116,11 @@ class LaneBDriver:
                 return []
             todo = [dict(f) for f in self.st.finished]
         entries, used, dropped = [], [], []
+        # W-S2 (D35): the settlement era's §16 sentinel is no public guard nor
+        # requirement of lane B; None (unarmed) leaves every call as before
+        sentinel = self._settlement_sentinel(int(block)) if todo else None
+        require = (tuple(lb.require_public) if sentinel is None
+                   else tuple(b for b in lb.require_public if b != sentinel))
         king_dir = self.ops.fetch(king_pointer) if todo else None
         king_rows = (self.ops.bench_rows(king_dir)
                      if todo and lb.require_public else None)
@@ -1090,7 +1128,7 @@ class LaneBDriver:
             from ..eval.public_guards import MissingPublicGuard, pair_public_rows
 
             try:
-                pair_public_rows(king_rows, king_rows, require=lb.require_public,
+                pair_public_rows(king_rows, king_rows, require=require,
                                  min_items=lb.min_public_items)
             except MissingPublicGuard as e:
                 raise OSError(f"lane-B king public benchmarks unavailable: {e}") from e
@@ -1142,7 +1180,7 @@ class LaneBDriver:
             if king_rows is not None:
                 rows = {"king": king_rows, "candidate": self.ops.bench_rows(rebased) or {}}
                 try:
-                    pair_public_rows(rows["king"], rows["candidate"], require=lb.require_public,
+                    pair_public_rows(rows["king"], rows["candidate"], require=require,
                                      min_items=lb.min_public_items)
                 except MissingPublicGuard as e:
                     raise OSError(f"lane-B candidate public benchmarks unavailable: {e}") from e
@@ -1165,7 +1203,8 @@ class LaneBDriver:
                                       lineage_tokens=self.st.lineage_tokens,
                                       entries=tuple(entries))
             self.ops.publish_expert_manifest(manifest)
-            judgements = self.ops.judge(manifest, rid, int(block))
+            judgements = (self.ops.judge(manifest, rid, int(block)) if sentinel is None
+                          else self.ops.judge(manifest, rid, int(block), sentinel=sentinel))
             digest = manifest.digest()
         # DEC-CA-0059: a leg that took at least one slot merges ONCE, however
         # many of its targets won (keyed by its judged checkpoint)
@@ -1833,7 +1872,7 @@ class RunnerLaneBOps:
         self.r.manifest_store().put_text(expert_manifest_key(manifest.round_id),
                                          manifest.to_json(), content_type="application/json")
 
-    def judge(self, manifest, round_id: str, block: int) -> list:
+    def judge(self, manifest, round_id: str, block: int, sentinel: str | None = None) -> list:
         from ..validator.evaluator import evaluate_checkpoint
         from ..validator.expert_lane import judge_manifest, verdict_windows
 
@@ -1862,7 +1901,8 @@ class RunnerLaneBOps:
         return judge_manifest(manifest, king_pointer=manifest.king_pointer,
                               king_scores=_eval(manifest.king_pointer), evaluate=_eval,
                               fetch_dir=self.fetch, cfg=cfg.lane_b, seed=str(round_id),
-                              strict=cfg.lane_b.merge_guard_at_settlement(int(block)))
+                              strict=cfg.lane_b.merge_guard_at_settlement(int(block)),
+                              sentinel=sentinel)
 
     def merge_scores(self, pointer: str, block: int) -> list:
         from ..validator.evaluator import evaluate_checkpoint

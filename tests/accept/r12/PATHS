@@ -1,0 +1,7 @@
+# R12 eval-host provisioning kit (plan §3.0 R12 row, §10.2, §10.4, §10.5 S4;
+# README.md has the contract). One new directory: the Python tool
+# (evalhost.py: on-rent-check, pin-host-key, resolve-endpoint, sync,
+# handshake, evidence), the owner-paste setup and recovery scripts, and the
+# pinned host profiles (profiles/bench_gate.toml, profiles/launch_eval.toml).
+# Shared code may live in other files under it (a sourced lib.sh, a module).
+scripts/evalhost/
