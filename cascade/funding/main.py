@@ -19,6 +19,7 @@ import logging
 import sys
 import threading
 import time
+from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -76,7 +77,7 @@ def withdrawn_clears_approvals(queue_path: Path):
     return clear
 
 
-class _DeadlineCachedPoll:
+class _DeadlineCachedPoll(ABC):
     """A chain read behind a cache and a hard poll deadline (shared plumbing).
 
     The chain poll runs under ``deadline_seconds`` (same shape as the
@@ -103,11 +104,13 @@ class _DeadlineCachedPoll:
         self._poll_thread: threading.Thread | None = None
         self._poll_box: dict = {}
 
+    @abstractmethod
     def _poll(self):  # pragma: no cover — abstract
-        raise NotImplementedError
+        """The blocking chain read (poll-thread side)."""
 
+    @abstractmethod
     def _fold(self, result) -> None:  # pragma: no cover — abstract
-        raise NotImplementedError
+        """Cache a poll result (caller side)."""
 
     @property
     def has_data(self) -> bool:
@@ -510,6 +513,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         resolve_lane_b_reveal=lane_b_resolver,
         lane_b_targets=lane_b_slots,
         lane_b_max_targets=lane_b_cap,
+        lane_b_cfg=lane_b_cfg,
         lane_a_admission=lane_a_admission,
         pod_live=ledger_pod_live(Path(args.queue_path).parent / "funded_pods.json"),
         on_withdrawn=withdrawn_clears_approvals(Path(args.queue_path)),
