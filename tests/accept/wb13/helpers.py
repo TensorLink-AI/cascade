@@ -80,10 +80,23 @@ def fixture_suites() -> dict:
                  "series": {"boom/svc-a/cpu": _walk(rng, 48, 0.4, 0.02)}},
         "time": {"version": VERSIONS["time"],
                  "series": {FLAT_ITEM: [float(FLAT_VALUE)] * 40,
-                            "time/traffic/3": _walk(rng, 56, 300.0, 9.0)}},
+                            "time/traffic/3": _walk(rng, 56, 300.0, 9.0),
+                            COUNTS_ITEM: [float(v) for v in counts_series()]}},
         "fev": {"version": VERSIONS["fev"],
                 "series": {"fev/solar/2": _walk(rng, 44, 7.0, 0.3)}},
     }
+
+
+# RV6: an integer-valued, informative suite series (event counts). The int
+# byte decodings are pinned on it: the flat series is low-information under
+# WB11's RV6 B5 rule, so it is no longer contamination evidence.
+COUNTS_ITEM = "time/counts/5"
+COUNTS_WINDOW_ID = f"{COUNTS_ITEM}@0"
+
+
+def counts_series() -> list[int]:
+    rng = random.Random("cascade wb13 counts")
+    return [rng.randrange(0, 60) for _ in range(40)]
 
 
 def segment() -> list[float]:
@@ -375,6 +388,150 @@ def entry_contamination(lane_b) -> dict | None:
     e = lane_b.get(HK)
     assert e is not None, "no lane B entry queued"
     return getattr(e, "contamination", None)
+
+
+# ── RV6 B7: packaging forms of an embedded window ────────────────────────────
+
+
+def npy_header(descr: str, n: int) -> bytes:
+    """A version-1.0 ``.npy`` header of a 1-D array of ``n`` items (by hand: no numpy)."""
+    header = f"{{'descr': '{descr}', 'fortran_order': False, 'shape': ({n},), }}"
+    header += " " * (63 - (10 + len(header)) % 64) + "\n"
+    return b"\x93NUMPY\x01\x00" + struct.pack("<H", len(header)) + header.encode("latin1")
+
+
+def npy_bytes(values, descr: str = "<f8") -> bytes:
+    """A ``.npy`` of a 1-D float array."""
+    code = {"<f8": "<d", ">f8": ">d", "<f4": "<f", ">f4": ">f"}[descr]
+    return npy_header(descr, len(values)) + struct.pack(f"{code[0]}{len(values)}{code[1]}",
+                                                         *values)
+
+
+def pickle_trap_npy(marker: Path) -> bytes:
+    """An object-dtype ``.npy`` whose payload, IF UNPICKLED, writes
+    ``marker``. The scan must never unpickle (parse, never execute)."""
+    import pickle
+
+    class _Trap:
+        def __reduce__(self):
+            return (exec, (f"import pathlib; pathlib.Path({str(marker)!r}).write_text('x')",))
+
+    return npy_header("|O", 1) + pickle.dumps([_Trap()], protocol=2)
+
+
+def npz_bytes(members: dict[str, bytes], *, compressed: bool) -> bytes:
+    """A ``.npz``: a zip of ``.npy`` members (``np.savez`` /
+    ``np.savez_compressed`` layout), built with :mod:`zipfile`."""
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    method = zipfile.ZIP_DEFLATED if compressed else zipfile.ZIP_STORED
+    with zipfile.ZipFile(buf, "w", compression=method) as z:
+        for name, data in members.items():
+            info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type = method
+            z.writestr(info, data)
+    return buf.getvalue()
+
+
+def zip_bomb_npz(inflated_mib: int) -> bytes:
+    """A deflated ``.npz`` whose one member inflates to ``inflated_mib`` MiB of
+    zeros (header included), built in 1 MiB chunks: small on disk, never
+    held inflated here."""
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        info = zipfile.ZipInfo("big.npy", date_time=(1980, 1, 1, 0, 0, 0))
+        info.compress_type = zipfile.ZIP_DEFLATED
+        n = inflated_mib * MIB // 8 - 16
+        with z.open(info, "w", force_zip64=True) as f:
+            f.write(npy_header("<f8", n))
+            chunk = bytes(MIB)
+            left = n * 8
+            while left > 0:
+                f.write(chunk[:min(MIB, left)])
+                left -= MIB
+    return buf.getvalue()
+
+
+# ── RV6 B6: an adversarial edge-window file ──────────────────────────────────
+
+# 32 values with mean 0 and population std exactly 1 whose z-scores are all
+# bin edges of WB11's cascade-zgrid/2 (GRID 0.5): 6 x 1.5, 10 x 0.5, 10 x -0.5,
+# 6 x -1.5. Every value is within TOLERANCE of an edge, so one window costs the
+# full 2 x 2**12 probes (measured on main: ~21 ms per window vs ~0.19 ms for a
+# random window). Repeated with period 32, every sliding window is a cyclic
+# shift of the same multiset, so every window is crafted. It is not
+# low-information (4 distinct values, mode 10 of 32, not affine).
+EDGE_BLOCK = (1.5, -0.5, 0.5, -1.5, 0.5, 1.5, -0.5, -0.5, 0.5, -1.5, 1.5, 0.5, -0.5, 0.5, -1.5,
+              -0.5, 1.5, 0.5, -0.5, -1.5, 0.5, 1.5, -0.5, 0.5, -1.5, -0.5, 1.5, 0.5, -0.5,
+              -1.5, 0.5, -0.5)
+EDGE_MS_PER_WINDOW_MAIN = 21.0
+RANDOM_MS_PER_WINDOW_MAIN = 0.19
+
+
+def edge_values(n_windows: int) -> list[float]:
+    vals = list(EDGE_BLOCK) * (n_windows // 32 + 2)
+    return vals[:n_windows + 31]
+
+
+def edge_repo(tmp: Path, n_windows: int, name: str = "edge") -> Path:
+    vals = edge_values(n_windows)
+    return repo_with(tmp, {"data/edge.f64": struct.pack(f"<{len(vals)}d", *vals)}, name=name)
+
+
+SCAN_CHILD = """
+import json, sys, time
+from pathlib import Path
+from tests.accept.wb13 import helpers as h
+kw = json.loads(sys.argv[2])
+t0, c0 = time.monotonic(), time.process_time()
+with h.torch_blocked():
+    out = h.scan_mod().scan_repo(Path(sys.argv[1]), h.artefact(1), **kw)
+import resource
+print(json.dumps({"receipt": out, "wall": time.monotonic() - t0, "cpu": time.process_time() - c0,
+                  "maxrss": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024}))
+"""
+
+INTAKE_CHILD = """
+import json, sys, time
+from pathlib import Path
+from tests.accept.wb13 import helpers as h
+tmp, tree, deadline = Path(sys.argv[1]), Path(sys.argv[2]), float(sys.argv[3])
+art = h.artefact(1)
+cfg = h.lane_b_cfg(pin=h.pin_of(art))
+fetch = h.Fetcher(tree)
+with h.torch_blocked():
+    m = h.scan_mod()
+    m.SCAN_DEADLINE_S = deadline
+    t = h.intake(tmp, cfg=cfg, hashset=art, fetch=fetch)
+    t0 = time.monotonic()
+    status, body = t.intake.lane_b_fund(h.headers())
+    wall = time.monotonic() - t0
+print(json.dumps({"status": status, "body": body, "wall": wall,
+                  "queued": t.lane_b.get(h.HK) is not None, "vaulted": t.vault.has(h.HK)}))
+"""
+
+
+def run_child(code: str, *args: str, timeout: float) -> dict:
+    """Run ``code`` in a fresh, niced interpreter; an overrun is a test
+    failure (the child is killed), never a hung test."""
+    import os
+    import subprocess
+
+    env = dict(os.environ, PYTHONPATH=str(REPO))
+    try:
+        p = subprocess.run(["nice", "-n", "19", sys.executable, "-P", "-c", code, *args],
+                           capture_output=True, text=True, env=env, cwd=str(REPO),
+                           timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise AssertionError(f"the scan did not return within {timeout:.0f} s (killed): "
+                             "no scan budget bounds it") from None
+    assert p.returncode == 0, f"child rc={p.returncode}\n{p.stderr[-3000:]}"
+    return json.loads(p.stdout.strip().splitlines()[-1])
 
 
 # ── hash-seed entry point (determinism, fresh interpreters) ──────────────────
