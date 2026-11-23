@@ -328,7 +328,8 @@ with the flag and forbidden without it.
 `verify_live` re-reads the anchor instead: for each anchor `head_object`
 and `get_object` with `Bucket`, `Key` and (only when the evidence has one)
 `VersionId`; it compares ETag, size, sha256 of the GET body and the version
-id (when recorded). Then it lists the run root (`list_object_versions`,
+id (when recorded). The record also carries `path_verdict` (see "The L4
+gate on `--no-object-lock` evidence"). Then it lists the run root (`list_object_versions`,
 falling back to `list_objects_v2` when version listing fails): it must hold
 exactly the anchor keys. Codes: `no_anchor_objects` (empty / missing
 `anchor_objects`), `anchor_object_missing` (a read fails),
@@ -355,6 +356,49 @@ locked (a line naming king(s) with `are/is/get/stay/remain/will be
 preceded by `not`/`never`). The template's "Kings are locked by copy at
 crowning" bullet must therefore be rewritten by the owner in the live-run
 fill. With lock probes that ran, neither rule applies.
+
+### The L4 gate on `--no-object-lock` evidence (owner 2026-11-23, decision #717)
+
+On Hippius some probes that do not decide the upload path end in `error`
+(the owner's run: `single_put_limit` BrokenPipe on the 2.5 GiB PUT,
+`prefix_bucket_policy` GetBucketPolicy 403, `subtoken_scope`
+inconclusive), so the body's `passed` (every probe recorded, an `error` is
+not) is false and stays false: the body rule above is unchanged. The gate
+(`test_evidence_every_probe_has_a_live_result`, `helpers.gate_problems`)
+instead asks for what the Chosen path needs. For evidence whose
+`bucket_lock` is the owner-flag record:
+
+- both lock probes are `skipped` (`no_object_lock`), as pinned above;
+- every probe the decision's `Chosen path:` depends on is `pass`
+  (`helpers.PATH_PROBES`): `presigned_multipart` needs
+  `presigned_upload_part`, `single_presigned_put` needs `single_put_limit`,
+  and every path also needs `upload_part_copy_2_5gb` (the server-side king
+  copy at crowning, W6d);
+- any other probe may be `pass`, `fail` or `error`, but every probe's
+  result is recorded **exactly once, verbatim** in the decision's results
+  table (a row `` | `<probe>` | `<result>` | ... ``, backticks optional);
+- `verified_live.path_verdict` (below) is present, equal to the verdict
+  recomputed from the body, and `passed: true`.
+
+`path_verdict` is `{"path": <recommended_path, recomputed>, "required":
+[<PATH_PROBES[path]>], "passed": <bool>}`; `passed` is true iff the evidence
+is the owner-flag record with both lock probes `skipped`, every `required`
+probe `pass`, `cleanup.remaining_unlocked == []`, a non-empty
+`anchor_objects` and `source: "live"`. `storage_probe verify` writes it into
+the `unlocked_anchor` record (it never refuses for a false verdict; it
+records it), so it is recomputed read-only from an existing evidence file:
+re-running `verify` re-reads the anchor and rewrites only `verified_live`,
+never the hash-bound body. The offline verifier requires it on every
+`unlocked_anchor` record and refuses an edited one. Lock-enabled evidence
+is unchanged: the gate wants every probe `pass`/`fail` and `passed: true`,
+and its verify record carries no `path_verdict`.
+
+**`tool.git_dirty`.** `tool_info()` (the body's `tool` and the verify
+record's) counts a checkout dirty for any tracked change (modified, staged,
+deleted) and any untracked file **except** untracked files under
+`evidence/`, where the probe's `--out` and `verify`'s rewritten file live;
+so `verify --evidence evidence/w3a_probe.json` from a clean checkout
+records `git_dirty: false`.
 
 ## `storage_probe verify`: the check against the live resource (plan §17.1 L4)
 
