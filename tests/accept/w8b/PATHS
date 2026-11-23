@@ -1,0 +1,16 @@
+# W8b: validator production wiring of lane D (plan rev6.2 item (g), W8b row;
+# owner accepted 2026-11-23; README.md has the contract). Builds on W19's
+# off-thread seam (cascade/validator/lane_d_worker.py, ValidatorRunner
+# `lane_d_step` / `_lane_d_tick`), which is W19's, not W8b's.
+#
+# New: build_lane_d_step, the step (settle_lane_d with the row's inputs, the
+# W3b3 sentinel sweep, publish report + receipt + latest + status/lane_d.json,
+# court_for), LaneDInputs, LaneDWiringError, the publish keys.
+cascade/validator/lane_d_wiring.py
+# run_forever builds the step with its own chain reader and sets
+# self.lane_d_step before the poll loop.
+cascade/validator/loop.py
+# The weight fold: lane D armed at the vector's boundary => lane_parts with
+# lane_d_cfg and the step's court_for(boundary) (empty court burns), lane D's
+# part always in emission_vector's second argument (RV3 note 10).
+cascade/validator/weights.py
