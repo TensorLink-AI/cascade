@@ -67,6 +67,12 @@
 #   LANED_EVIDENCE), `accept --gate` for every stage gate file present (both
 #   record the verified blob sha in the ledger), then `scripts/laned/status`
 #   recomputes the board and pushes it to branch laned/build-state (never main).
+# merge_group (GitHub merge queue, 2026-11-23): the same `pr` job, so a check
+#   named `pr` always reports on the group ref and can never sit "expected".
+#   With no PR labels the per-PR steps skip, and the merge-group step runs
+#   `accept <queued WPs> --cross --base <merge_group.base_sha> --head HEAD`
+#   over the whole group. Nothing goes to the ledger (only PR, dispatch and
+#   push runs are harvested). The push job below still runs after the merge.
 # workflow_dispatch: an expect-fail run of one WP at a given commit (bootstrap
 #   for WPs whose tests landed before this workflow existed). The harvester keeps
 #   that result when the commit is an ancestor of the dispatched ref's head.
@@ -78,6 +84,8 @@ name: laned-accept
 on:
   pull_request:
     types: [opened, reopened, labeled, synchronize]
+  merge_group:
+    types: [checks_requested]
   push:
     branches: [main]
   workflow_dispatch:
@@ -94,9 +102,12 @@ permissions:
 
 jobs:
   pr:
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    permissions:
+      contents: read
+      pull-requests: read   # merge_group: read the queued PRs' laned:<WP> labels
     concurrency:
       group: laned-accept-${{ github.event.pull_request.number || github.run_id }}
       cancel-in-progress: true
@@ -118,43 +129,46 @@ jobs:
           if [ -n "$DISPATCH_WP" ]; then
             wps="$DISPATCH_WP"
           else
-            wps=$(python3 -c 'import json, os; print(" ".join(l.split(":", 1)[1] for l in json.loads(os.environ["LABELS"] or "[]") if l.startswith("laned:")))')
+            # merge_group has no PR labels (toJSON gives "null"): wps stays
+            # empty and only the merge-group step below runs.
+            wps=$(python3 -c 'import json, os; print(" ".join(l.split(":", 1)[1] for l in (json.loads(os.environ["LABELS"] or "[]") or []) if l.startswith("laned:")))')
           fi
           echo "wps=$wps" >> "$GITHUB_OUTPUT"
           echo "WPs: ${wps:-none (no laned:<WP> label; nothing to check)}"
 
       - name: Prepare isolated TLS trust for the CI job
-        if: steps.select.outputs.wps != ''
+        if: steps.select.outputs.wps != '' || github.event_name == 'merge_group'
         run: python3 scripts/prepare_ci_tls.py "$RUNNER_TEMP/cascade-ca" >> "$GITHUB_ENV"
 
       - name: Install uv
-        if: steps.select.outputs.wps != ''
+        if: steps.select.outputs.wps != '' || github.event_name == 'merge_group'
         uses: astral-sh/setup-uv@v5
         with:
           version: "0.13.4"
           enable-cache: true
 
       - name: Check system TLS trust before Git dependency fetches
-        if: steps.select.outputs.wps != ''
+        if: steps.select.outputs.wps != '' || github.event_name == 'merge_group'
         run: uv run --no-project --python 3.11 python scripts/check_tls_trust.py --system-only
 
       - name: Sync (frozen, all extras)
-        if: steps.select.outputs.wps != ''
+        if: steps.select.outputs.wps != '' || github.event_name == 'merge_group'
         run: uv sync --frozen --all-extras
 
       - name: Use the base branch's loop tooling when it has one
-        if: steps.select.outputs.wps != ''
+        if: steps.select.outputs.wps != '' || github.event_name == 'merge_group'
         env:
-          BASE_REF: ${{ github.base_ref || 'main' }}
+          # merge_group: the queue's base commit (never the group's own code)
+          BASE_REV: ${{ github.event.merge_group.base_sha || format('origin/{0}', github.base_ref || 'main') }}
         run: |
           tools="$RUNNER_TEMP/laned-tools"
           mkdir -p "$tools"
-          if git cat-file -e "origin/$BASE_REF:scripts/laned/accept" 2>/dev/null; then
-            git archive "origin/$BASE_REF" scripts/laned | tar -x -C "$tools"
-            echo "tooling: origin/$BASE_REF"
+          if git cat-file -e "$BASE_REV:scripts/laned/accept" 2>/dev/null; then
+            git archive "$BASE_REV" scripts/laned | tar -x -C "$tools"
+            echo "tooling: $BASE_REV"
           else
             mkdir -p "$tools/scripts" && cp -r scripts/laned "$tools/scripts/"
-            echo "tooling: this PR (none on origin/$BASE_REF yet)"
+            echo "tooling: this PR (none on $BASE_REV yet)"
           fi
           echo "LANED=$tools/scripts/laned" >> "$GITHUB_ENV"
 
@@ -281,6 +295,44 @@ jobs:
           uv run --frozen python "$LANED/accept" "$WPS" --cross --base HEAD^1 --head HEAD --root . \
             | tee "$out" && rc=0 || rc=$?
           { echo "### Cross-WP accept"; echo; echo '```'; grep -E '^(CROSS|cross) ' "$out" || true; echo '```'; } \
+            >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+
+      - name: Merge-group cross-WP accept (the queue's combined ref against its base)
+        # merge_group: the group has no labels, so the per-PR steps above all
+        # skip. This runs the CROSS rule over the WHOLE group diff
+        # (merge_group.base_sha...HEAD): every WP at >= L2 on the base whose
+        # tests depend on any queued PR's changes re-runs its Accept on the
+        # combined ref. It catches what two individually green PRs break
+        # together. The queued PRs' own WPs (laned:<WP> labels, read from the
+        # `(#N)` squash subjects) are excluded exactly as on their PR, where
+        # their main Accept already ran. It fails closed: an unreadable label
+        # set or base tooling without --cross fails the check.
+        if: github.event_name == 'merge_group'
+        env:
+          GROUP_BASE: ${{ github.event.merge_group.base_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -o pipefail   # the default `bash -e` would take tee's status
+          if ! grep -q -- '--cross' "$LANED/accept"; then
+            echo "::error::the base's loop tooling has no --cross mode; the group cannot be checked"
+            exit 1
+          fi
+          echo "group $GROUP_BASE..$(git rev-parse HEAD):"
+          git log --format='  %h %s' "$GROUP_BASE..HEAD"
+          own=()
+          for n in $(git log --format=%s "$GROUP_BASE..HEAD" | sed -n 's/.*(#\([0-9][0-9]*\))$/\1/p' | sort -u); do
+            labels=$(gh pr view "$n" -R "$GITHUB_REPOSITORY" --json labels \
+              --jq '.labels[].name | select(startswith("laned:"))') \
+              || { echo "::error::cannot read the labels of #$n"; exit 1; }
+            for l in $labels; do own+=("${l#laned:}"); done
+          done
+          wps="${own[*]}"
+          echo "queued PRs' own WPs (their main Accept ran on the PR): ${wps:-none}"
+          out="$RUNNER_TEMP/laned-cross.txt"
+          uv run --frozen python "$LANED/accept" "${wps:-none}" --cross --base "$GROUP_BASE" --head HEAD --root . \
+            | tee "$out" && rc=0 || rc=$?
+          { echo "### Merge-group cross-WP accept"; echo; echo '```'; grep -E '^(CROSS|cross) ' "$out" || true; echo '```'; } \
             >> "$GITHUB_STEP_SUMMARY"
           exit "$rc"
 
