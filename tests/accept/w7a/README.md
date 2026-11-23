@@ -243,12 +243,37 @@ from `cfg.contexts`. `params.contexts` stays the **declarable** set.
   `test_schema_file_top_level_fields_are_exact_and_closed` fails on the new
   `TOP_LEVEL_OPTIONAL`.
 
+### Correction (plan rev6.15, owner 2026-11-23): `context_below_armed`
+
+"Highest ≤ declared, else skip". With the `armed` record given, after the
+W5h queue selection, each chosen member whose declared `context` has no
+armed variant ≤ it (`min(armed_contexts) > context`, computed from the
+record, without importing the scorer) is not judged:
+
+- it gets status `pending` (unchanged) and reason `context_below_armed`, is
+  listed once in `skipped`, and appears in neither `judged` nor `verdicts`;
+- the house challenger is exempt: it declares no context, and W8c always
+  forecasts it (4096, else the highest armed below, else the lowest armed);
+- the legacy call (`armed=None`) and an entry with an armed variant ≤ its
+  context are unchanged.
+
+`context_below_armed` is appended to `SKIP_REASONS` (and so to
+`ENTRY_REASONS`) and to both enums of the schema file. The report stays
+`lane-d-report/1`.
+
+The `validate_report` cross-check is `bad_value` when a
+`context_below_armed` skip has no `armed_contexts`, or when the entry's
+`context` is ≥ some armed variant.
+
+Tests: the last six of `test_w7a_armed.py`. On main they fail on their
+assertions: the reason is not in the enum, and the entry is judged at 8192.
+
 ## Enums (exact sets)
 
 | name | values |
 |---|---|
 | `ENTRY_STATUSES` | `pending`, `hold`, `confirm_pending`, `crowned`, `lost`, `closed` |
-| `SKIP_REASONS` | `pending_floor`, `coldkey_cap_settlement`, `coldkey_unresolved`, `coldkey_changed`, `king_unscored`, `bench_hold`, `deregistered`, `ready_expired`, `reveal_delay_exceeded`, `duplicate_digest`, `hotkey_has_open_entry`, `context_not_armed`, `checkpoint_fault`, `mirror_lag_exceeded`, `lane_closed` (W5b: closed at `until_block`) |
+| `SKIP_REASONS` | `pending_floor`, `coldkey_cap_settlement`, `coldkey_unresolved`, `coldkey_changed`, `king_unscored`, `bench_hold`, `deregistered`, `ready_expired`, `reveal_delay_exceeded`, `duplicate_digest`, `hotkey_has_open_entry`, `context_not_armed`, `checkpoint_fault`, `mirror_lag_exceeded`, `lane_closed` (W5b: closed at `until_block`), `context_below_armed` (rev6.15: no armed variant ≤ the declared context; stays `pending`) |
 | `ENTRY_REASONS` | `SKIP_REASONS` plus `confirm_pending`, `lost_duel`, `lost_confirmation`, `lowfreq_regression`, `gate_regression` (RV4: a judged loss on the §1.3b gate, like `lowfreq_regression`, so not a skip), `crowned` |
 | `BURN_REASONS` | `house_king` (D21: the house holds KING_D), `deregistered` (B8: a court member lost its UID) |
 | `WINDOW_REFUSAL_REASONS` | W5a's `REFUSAL_REASONS`, in precedence order: `missing_clock`, `unlisted_feed` (W5a fail-closed), `forecast_product`, `over_lag`, `before_margin`, `publish_ahead`, `late_mirror`, `absent_from_s0`, `backfill` |

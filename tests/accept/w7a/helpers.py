@@ -69,7 +69,10 @@ SKIP_REASONS = ("pending_floor", "coldkey_cap_settlement", "coldkey_unresolved",
                 "coldkey_changed", "king_unscored", "bench_hold", "deregistered",
                 "ready_expired", "reveal_delay_exceeded", "duplicate_digest",
                 "hotkey_has_open_entry", "context_not_armed", "checkpoint_fault",
-                "mirror_lag_exceeded", "lane_closed")
+                "mirror_lag_exceeded", "lane_closed", "context_below_armed")
+# `context_below_armed` (plan rev6.15, owner 2026-11-23): with the settlement's
+# armed record, a chosen entry whose declared context is below every armed
+# variant is not judged and stays `pending` (never run above its declaration).
 # `lane_closed` (W5b, T18): every open entry closes at `[lane_d] until_block`,
 # listed in both entries[].reason and skipped[].reason.
 # `checkpoint_fault` and `bench_hold` (W3b2 outcomes) are skip reasons: a
