@@ -24,7 +24,7 @@ from .helpers import (
 )
 
 GEN = "alice/metro-gen@sha256:" + "a" * 64
-PTR = "hippius://org/ckpt@sha256:" + "b" * 64
+PTR = "metro-v1:trained:hippius:org/ckpt@sha256:" + "b" * 64
 
 
 def _choice(gpu="", price=0.0):

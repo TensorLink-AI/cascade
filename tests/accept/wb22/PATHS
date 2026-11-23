@@ -20,6 +20,9 @@ cascade/trainer/runner_funded_legs.py
 cascade/trainer/lane_b_driver.py
 # ExpertEntry.gpu_n (0 = not recorded; dropped from the canonical body at 0).
 cascade/shared/expert_manifest.py
+# The existing funded lane B dispatch unit test: done() now takes gpu_n=, and
+# the test runs with no step-rate table wired (lane_b_gpus_from_env patched).
+tests/unit/test_lane_b_funded.py
 # [lane_b] funded_pod_skus: lane B's own list (owner 2026-11-23). Mainnet only;
 # chain.testnet.toml keeps its [round] list.
 chain.toml
