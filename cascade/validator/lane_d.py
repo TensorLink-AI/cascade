@@ -79,6 +79,26 @@ validator. Unarmed (``not cfg.active(boundary)``) it returns
    holds KING_D: that slot burns, D21), then up to ``reward_prior_kings``
    prior MINER kings (an unregistered one is ``None`` and burns).
 
+W5f (§1.4 "The house", §2 items 1-2, T10) is the house's entry and refresh:
+
+- ``house`` is the verified record ``{"digest", "reveal_ts"}`` a signed
+  pointer enters (:mod:`~cascade.validator.lane_d_house`); armed, anything
+  else is a typed ``LaneDHouseError`` before any state, report or pool is
+  read or written;
+- a new house while the house holds KING_D moves the throne in place (no
+  duel; the slot keeps burning, ``prior_kings`` untouched);
+- a new house while a miner holds KING_D is the second bar of every miner
+  cohort from that boundary AND enters as a challenger
+  (``lane_d_state.HOUSE_ENTRY_KEY``): judged forward-only against KING_D in
+  its own cohort (``members == [house]``, no ``house_digest``), first clear
+  then the mandatory confirmation on a disjoint set, A10 and the §1.3b gate
+  (swept with KING_D as its only anchor: the house reference is itself). A
+  confirmed, passing house retakes KING_D: the dethroned miner king becomes
+  the newest prior king, the slot burns (``house_king``) and ``crowned``
+  stays null (a retake is not a miner crowning). A weaker house loses and
+  is never in the court or a prior king. An open miner entry whose digest
+  the new pointer names is a copy of the house (``duplicate_digest``).
+
 W7c (§1.5 "State", invariant 5, T11) makes the settlement restart-safe and
 binds it into a receipt record (:mod:`~cascade.validator.lane_d_state`):
 
@@ -125,6 +145,7 @@ from .lane_d_bench import paired_gate
 from .lane_d_forward import eligible_windows
 from .lane_d_frozen import advance_frozen_set
 from .lane_d_gate import gate_record
+from .lane_d_house import check_house
 from .lane_d_lowfreq import forecast_ok as _forecast_ok
 from .lane_d_lowfreq import lowfreq_check, lowfreq_windows
 from .lane_d_lowfreq import target_usable as _target_usable
@@ -136,6 +157,7 @@ from .lane_d_report import (
     validate_report,
 )
 from .lane_d_state import (
+    HOUSE_ENTRY_KEY,
     PRIOR_STATE_EXTENSION,
     LaneDStateError,
     check_persisted_report,
@@ -347,6 +369,17 @@ def _register(state: dict, entries: list[dict], cfg, uid_of: dict) -> list[dict]
     return voided
 
 
+def _close_house_copies(state: dict, skipped: list[dict]) -> None:
+    """W5f: an open miner entry whose digest a new house pointer now names is
+    a copy of the house (``duplicate_digest``, closed and never judged), as a
+    copy registered after the swap is at :func:`_register`."""
+    rec = state["entries"].get(str(state["house"]["digest"]))
+    if rec is not None and rec["status"] in OPEN_STATUSES:
+        rec.pop("gate_hold", None)
+        rec.update(status="closed", reason="duplicate_digest")
+        skipped.append({"digest": str(state["house"]["digest"]), "reason": "duplicate_digest"})
+
+
 def _select(state: dict, cfg, exclude: frozenset[str] = frozenset()
             ) -> tuple[list[str], list[dict]]:
     """FIFO by reveal time under the per-settlement / per-coldkey caps.
@@ -390,12 +423,12 @@ def _king_reveal_ts(state: dict, digest: str) -> int | None:
     return None
 
 
-def _confirm_king_ts(state: dict, members: list[str], digest: str) -> int | None:
+def _confirm_king_ts(recs: dict[str, dict], members: list[str], digest: str) -> int | None:
     """D20 ``"original"``: the reveal time of a first-clear king the state no
     longer knows (not the king, the house or a prior king), from the
     ``confirm`` record of a member that first-cleared against it."""
     for m in sorted(members):
-        conf = state["entries"][m].get("confirm") or {}
+        conf = recs[m].get("confirm") or {}
         ts = conf.get("king_reveal_ts")
         if conf.get("king_digest") == digest and isinstance(ts, int) and not isinstance(ts, bool):
             return int(ts)
@@ -411,18 +444,22 @@ def _held_candidates(state: dict, cfg) -> list[str]:
     duel. If KING_D changed since the hold, D20 decides: ``"original"`` keeps
     the hold; ``"restart"`` drops it and the entry restarts at stage
     ``first`` (its windows stay used)."""
-    out = []
-    for dg, rec in sorted(state["entries"].items()):
-        hold = rec.get("gate_hold")
-        if rec["status"] not in OPEN_STATUSES or not hold:
-            continue
-        if (hold["king_d"] != state["king"]["digest"]
-                and cfg.confirm_on_king_change != "original"):
-            rec.pop("gate_hold")
-            rec.update(status="pending", reason="pending_floor", confirm=None, frozen_set=None)
-            continue
-        out.append(dg)
-    return out
+    return [dg for dg, rec in sorted(state["entries"].items()) if _keeps_hold(rec, state, cfg)]
+
+
+def _keeps_hold(rec: dict, state: dict, cfg) -> bool:
+    """Is ``rec`` (a miner entry or the house entry) an open holder of a
+    ``gate_hold`` that is re-gated this settlement (see
+    :func:`_held_candidates`)? A hold D20 ``"restart"`` drops is dropped here."""
+    hold = rec.get("gate_hold")
+    if rec["status"] not in OPEN_STATUSES or not hold:
+        return False
+    if (hold["king_d"] != state["king"]["digest"]
+            and cfg.confirm_on_king_change != "original"):
+        rec.pop("gate_hold")
+        rec.update(status="pending", reason="pending_floor", confirm=None, frozen_set=None)
+        return False
+    return True
 
 
 def _ranked(cands: list[dict]) -> list[dict]:
@@ -559,7 +596,7 @@ def _admitted_versions(pools: list[dict], t_entry: int, t_king: int, cfg
 
 
 def _cohort_set(pools: list[dict], members: list[str], bars: list[str], king_ts: int,
-                state: dict, forecasts: dict, cfg, pinned: dict[str, str]
+                recs: dict[str, dict], forecasts: dict, cfg, pinned: dict[str, str]
                 ) -> tuple[list[tuple[dict, dict]], dict[str, int]]:
     """The cohort's judged window set as ``(window, its snapshot)`` pairs: the
     intersection of the members' frozen sets that is eligible for
@@ -574,10 +611,10 @@ def _cohort_set(pools: list[dict], members: list[str], bars: list[str], king_ts:
     so a window whose admitting snapshot for this cohort's bound differs is
     left out of this cohort (fail closed) rather than scored on a second
     version."""
-    t_entry = max(int(state["entries"][m]["reveal_ts"]) for m in members)
+    t_entry = max(int(recs[m]["reveal_ts"]) for m in members)
     h = int(cfg.horizon)
     admitted, refused = _admitted_versions(pools, t_entry, int(king_ts), cfg)
-    common = set.intersection(*(set(state["entries"][m]["frozen_set"]["window_ids"])
+    common = set.intersection(*(set(recs[m]["frozen_set"]["window_ids"])
                                 for m in members))
     out = []
     for wid in sorted(common):
@@ -589,7 +626,7 @@ def _cohort_set(pools: list[dict], members: list[str], bars: list[str], king_ts:
         if not _target_usable(w, h) or any(
                 _forecast_ok(forecasts.get(b), wid, h) is not True for b in bars):
             continue
-        if any(wid in state["entries"][m]["used_windows"]
+        if any(wid in recs[m]["used_windows"]
                or _forecast_ok(forecasts.get(m), wid, h) is not True for m in members):
             continue
         out.append((w, pool))
@@ -727,6 +764,10 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     nothing."""
     if not cfg.active(boundary):
         return LaneDSettlement(report=None, pay=None, receipt=None)
+    # W5f: the house is the verified record a signed pointer enters
+    # (lane_d_house). Anything else is refused before any state, report or
+    # pool is read or written (fail closed).
+    house = check_house(house)
     boundary = int(boundary)
     state = load_prior_state(state_path, house, boundary,
                              expect_prior_sha256=expect_prior_sha256)
@@ -760,31 +801,52 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     # entries voided this settlement (invariant 11).
     skipped = _register(state, entries, cfg, uid_of)
     h = int(cfg.horizon)
+    # W5f: the house entry (§1.4 "It enters at that settlement"), opened by
+    # ``refresh_house`` when a new house meets a miner KING_D. It is judged
+    # like an entry but lives outside ``entries`` (it has no hotkey and is
+    # never paid); ``recs_of`` resolves a digest to the record judged.
+    house_rec = state.get(HOUSE_ENTRY_KEY)
+    hd = str(state["house"]["digest"])
+    _close_house_copies(state, skipped)
 
-    def skip(dg: str, reason: str) -> None:
-        state["entries"][dg]["reason"] = reason
+    def skip(dg: str, reason: str, rec: dict | None = None) -> None:
+        (state["entries"][dg] if rec is None else rec)["reason"] = reason
         skipped.append({"digest": dg, "reason": reason})
 
     held: list[str] = []
+    house_held = False
+    house_open = house_rec is not None and house_rec["status"] in OPEN_STATUSES
     if _closing(cfg, boundary):
         for dg, rec in sorted(state["entries"].items()):
             if rec["status"] in OPEN_STATUSES:
                 rec["status"] = "closed"
                 skip(dg, "lane_closed")
+        if house_open:
+            house_rec["status"] = "closed"
+            skip(hd, "lane_closed", house_rec)
         chosen = []
+        house_open = False
     else:
         # A held gate candidate is re-gated, never re-duelled (W5e).
         held = _held_candidates(state, cfg)
         chosen, capped = _select(state, cfg, frozenset(held))
         skipped += capped
+        house_held = house_open and _keeps_hold(house_rec, state, cfg)
 
-    # A member whose forecasts are malformed on any pool window is the miner's fault.
+    # A member whose forecasts are malformed on any pool window is the miner's fault
+    # (the house's own: its entry closes, fail closed).
     for dg in list(chosen):
         fc = forecasts.get(dg)
         if fc is not None and any(_forecast_ok(fc, wid, h) is False for wid in sorted(pool_ids)):
             state["entries"][dg]["status"] = "closed"
             skip(dg, "checkpoint_fault")
             chosen.remove(dg)
+    if house_open and not house_held:
+        fc = forecasts.get(hd)
+        if fc is not None and any(_forecast_ok(fc, wid, h) is False for wid in sorted(pool_ids)):
+            house_rec["status"] = "closed"
+            skip(hd, "checkpoint_fault", house_rec)
+            house_open = False
 
     groups: dict[tuple[str, str], list[str]] = {}
     for dg in chosen:
@@ -793,6 +855,16 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
             state["entries"][dg].update(status="pending", reason="pending_floor", confirm=None,
                                         frozen_set=None)
         groups.setdefault((kd, stage), []).append(dg)
+    # The miner cohorts, then the house challenger in its own cohort against
+    # KING_D (§2 item 2): the house is never its own second bar.
+    jobs = [(kd, stage, members, {m: state["entries"][m] for m in members}, False)
+            for (kd, stage), members in sorted(groups.items())]
+    if house_open and not house_held and not state["king"].get("house"):
+        stage, kd = _comparison_king(house_rec, state, cfg)
+        if stage == "first" and house_rec["status"] == "confirm_pending":
+            house_rec.update(status="pending", reason="pending_floor", confirm=None,
+                             frozen_set=None)
+        jobs.append((kd, stage, [hd], {hd: house_rec}, True))
 
     # RV4: each judged window is scored from ONE snapshot's version; the
     # report names that snapshot (``windows[].snapshot_sha256``) and lists
@@ -805,39 +877,40 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     # §1.3b A10: the newest private-pool snapshot's low-frequency windows
     # (not the forward-only frozen set, §1.7), the same for every candidate.
     lf_slice = lowfreq_windows(pool, cfg)
-    for (kd, stage), members in sorted(groups.items()):
+    for kd, stage, members, recs, is_house in jobs:
         king_ts = _king_reveal_ts(state, kd)
         if king_ts is None and stage == "confirm":
             # D20 "original" after a king change: the first-clear king's T
             # comes from the confirm record (not king_unscored).
-            king_ts = _confirm_king_ts(state, members, kd)
+            king_ts = _confirm_king_ts(recs, members, kd)
         # Change 3: when a miner holds KING_D, the current house is a second
         # bar on the same set (a copy of a fresh house must not win). Its
         # forecasts are required: a house that cannot be scored fails closed.
-        hd = str(state["house"]["digest"])
-        bars = [kd] if kd == hd else [kd, hd]
+        # The house challenger is judged against KING_D alone.
+        bars = [kd] if kd == hd or is_house else [kd, hd]
         if king_ts is None or any(forecasts.get(b) is None for b in bars):
             for m in members:
-                skip(m, "king_unscored")
+                skip(m, "king_unscored", recs[m])
             continue
-        members = sorted(members, key=lambda m: (state["entries"][m]["reveal_ts"], m))
+        members = sorted(members, key=lambda m: (recs[m]["reveal_ts"], m))
         frozen = []
         for m in members:
-            rec = state["entries"][m]
+            rec = recs[m]
             rec["frozen_set"] = _advance_member(rec, pools, int(king_ts), cfg, cap_seed)
             if rec["frozen_set"]["frozen"]:
                 frozen.append(m)
             else:
-                skip(m, "pending_floor")
+                skip(m, "pending_floor", rec)
         members = frozen
         if not members:
             continue
-        picked, refused = _cohort_set(pools, members, bars, king_ts, state, forecasts, cfg,
+        picked, refused = _cohort_set(pools, members, bars, king_ts, recs, forecasts, cfg,
                                       pinned)
         while members and not _meets_floors([w for w, _ in picked], cfg):
-            skip(members.pop(), "pending_floor")
+            m = members.pop()
+            skip(m, "pending_floor", recs[m])
             if members:
-                picked, refused = _cohort_set(pools, members, bars, king_ts, state, forecasts,
+                picked, refused = _cohort_set(pools, members, bars, king_ts, recs, forecasts,
                                               cfg, pinned)
         if not members:
             continue
@@ -878,7 +951,7 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
                               "cleared": bool(rh["cleared"])}}
                    for r, rh in zip(res, vs_house, strict=True)]
         set_sha = hashlib.sha256("\n".join(w["window_id"] for w in ws).encode()).hexdigest()
-        t_max = max([king_ts] + [state["entries"][m]["reveal_ts"] for m in members])
+        t_max = max([king_ts] + [recs[m]["reveal_ts"] for m in members])
         cohort = {"index": len(cohorts), "king_digest": kd, "king_reveal_ts": int(king_ts),
                   "stage": stage, "members": list(members), "t_max": int(t_max),
                   "window_ids": [w["window_id"] for w in ws], "set_sha256": set_sha,
@@ -889,7 +962,7 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
             cohort["house_digest"] = hd
         cohorts.append(cohort)
         for m, r in zip(members, res, strict=True):
-            rec = state["entries"][m]
+            rec = recs[m]
             rec["used_windows"] = sorted(set(rec["used_windows"]) | {w["window_id"] for w in ws})
             first = rec.get("confirm") if stage == "confirm" else None
             confirmation = {"stage": stage, "rule": str(cfg.confirm_on_king_change),
@@ -924,18 +997,23 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
                 # only through the §1.3b gate.
                 outcome = "confirmed"
                 candidates.append({"digest": m, "lcb": float(r["lcb"]),
-                                   "reveal_ts": int(rec["reveal_ts"]), "set_sha256": set_sha})
+                                   "reveal_ts": int(rec["reveal_ts"]), "set_sha256": set_sha,
+                                   "house": is_house})
             verdicts.append({"digest": m, "king_digest": kd, "stage": stage,
                              "cohort": len(cohorts) - 1, **r, "outcome": outcome,
                              "confirmation": confirmation, "lowfreq": lowfreq})
 
     # Held candidates (an earlier bench_hold) are re-gated with the clear
     # they confirmed, without a duel: no rows, no verdict this settlement.
-    for dg in held:
-        hold = state["entries"][dg]["gate_hold"]
+    held_recs = [(dg, state["entries"][dg], False) for dg in held]
+    if house_held:
+        held_recs.append((hd, house_rec, True))
+    for dg, rec, is_house in held_recs:
+        hold = rec["gate_hold"]
         candidates.append({"digest": dg, "lcb": float(hold["lcb"]),
-                           "reveal_ts": int(state["entries"][dg]["reveal_ts"]),
+                           "reveal_ts": int(rec["reveal_ts"]),
                            "set_sha256": str(hold["set_sha256"]), "held": True,
+                           "house": is_house,
                            # RV7 B2: the signed provenance of the hold (its
                            # first record; report_sha256 is that settlement's
                            # report body digest).
@@ -954,7 +1032,7 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     passing = []
     for c in candidates:
         dg, outcome = c["digest"], gate_outcomes[c["digest"]]
-        rec = state["entries"][dg]
+        rec = house_rec if c["house"] else state["entries"][dg]
         if outcome == "pass":
             rec.pop("gate_hold", None)
             passing.append(c)
@@ -988,24 +1066,34 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
         if c.get("held") and reason in SKIP_REASONS:
             # Considered and not judged this settlement: a typed skip
             # (gate_regression is a judged loss, an entry reason only).
-            skip(dg, reason)
+            skip(dg, reason, rec)
         else:
             rec["reason"] = reason
 
     new_king = None
     if passing:
         best = _ranked(passing)[0]
-        new_king = best["digest"]
         old = state["king"]
         if not old.get("house"):
             state["prior_kings"] = [_king_record(old)] + state["prior_kings"]
             state["prior_kings"] = state["prior_kings"][:max(0, int(cfg.reward_prior_kings))]
-        rec = state["entries"][new_king]
-        rec.update(status="crowned", reason="crowned")
-        state["king"] = {"digest": new_king, "hotkey": rec["hotkey"], "house": False,
-                         "reveal_ts": rec["reveal_ts"], "since_boundary": boundary}
+        if best["house"]:
+            # §2 item 2 / T10: the house retakes KING_D. The dethroned miner
+            # king is the newest prior king; the slot burns (D21). The house
+            # entry ends: the house holds KING_D and is never in the court.
+            # ``crowned`` names a miner crowning only, so it stays null.
+            state["king"] = {"digest": hd, "hotkey": None, "house": True,
+                             "reveal_ts": int(state["house"]["reveal_ts"])}
+            state.pop(HOUSE_ENTRY_KEY, None)
+            house_rec = None
+        else:
+            new_king = best["digest"]
+            rec = state["entries"][new_king]
+            rec.update(status="crowned", reason="crowned")
+            state["king"] = {"digest": new_king, "hotkey": rec["hotkey"], "house": False,
+                             "reveal_ts": rec["reveal_ts"], "since_boundary": boundary}
         for v in verdicts:
-            if v["digest"] == new_king:
+            if v["digest"] == best["digest"]:
                 v["outcome"] = "crowned"
     court = _court(state, cfg, uid_of)
     pay = {"share": float(cfg.share), "court_uids": [s["uid"] for s in court]}
@@ -1061,7 +1149,7 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     # RV7 B2: a hold first taken at this settlement records the report that
     # holds it (its body digest is known only now), so a later re-gate can
     # sign its provenance (``gate.results[].held_from``).
-    for rec in state["entries"].values():
+    for rec in [*state["entries"].values(), *([house_rec] if house_rec is not None else [])]:
         hold = rec.get("gate_hold")
         if hold and hold["boundary"] == boundary and "report_sha256" not in hold:
             hold["report_sha256"] = body_sha
