@@ -153,6 +153,17 @@ Dedup is by the manifest's `weights.safetensors` sha256:
 - An expired entry's weights no longer block.
 - If `published_weights()` fails, the answer is `503 dedup_unavailable`.
 
+The registry file (`<state-dir>/published_weights.json`,
+`{"schema": "lane-d-published-weights/1", "weights_sha256": [...]}`) is
+written by `python -P -m cascade.lane_d.published_weights`
+(`test_w3_published_weights.py`). It uses published sources only. Lane D kings
+come from the signed `champions/lane_d/index.json`, checked against the pinned
+signer, with each king's mirror `manifest.json` re-hashed to the signed
+digest. Lane A legs and kings, and the house, come from checkpoint directories
+fetched from their published refs. The write is atomic, and shas already in
+the file are kept (`--replace` drops them). A source that fails to verify, or
+an existing file that is not a registry, means nothing is written.
+
 ## Ready
 
 The body is `{"licence": <id>, "attestation": <text>}`; unparseable is
