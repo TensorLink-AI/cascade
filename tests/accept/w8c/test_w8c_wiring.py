@@ -16,6 +16,7 @@ from . import helpers as h
 
 
 def test_inv1_unarmed_builds_nothing_and_reads_nothing(tmp_path):
+    h.assert_takes_armed_docs()
     cfg = h.w8b.chain_cfg(tmp_path / "v", armed=False)
     state_dir, intake_dir = tmp_path / "never_state", tmp_path / "never_intake"
     out = h.inputs_mod().build_lane_d_inputs(
@@ -23,7 +24,8 @@ def test_inv1_unarmed_builds_nothing_and_reads_nothing(tmp_path):
         chain_factory=h.Untouchable("chain_factory"), pool=h.Untouchable("pool"),
         eval_host=h.Untouchable("eval_host"), house_pointer=tmp_path / "never_house.json",
         house_signer_ss58=h.house_key().ss58_address,
-        bench_host=h.Untouchable("bench_host"), expected_identity=h.identity())
+        bench_host=h.Untouchable("bench_host"), expected_identity=h.identity(),
+        readiness=h.Untouchable("readiness"), t7=h.Untouchable("t7"))
     assert out is None, "[lane_d] from_block = 0: no source"
     assert not state_dir.exists() and not intake_dir.exists()
 
