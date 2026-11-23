@@ -58,8 +58,13 @@ class ReceiptMixin:
         lane_c_pay: dict | None = None,
         king_check_scores: tuple = (),
         sentinel: dict | None = None,
+        lane_d: dict | None = None,
     ) -> RoundReceipt:
         """Assemble the round's public receipt (pure — no I/O, no signing).
+
+        ``lane_d`` (LANE_D_PLAN W14) is the settlement's lane D receipt record
+        (present, or ``status: "absent"``), passed through to the receipt;
+        ``None`` (unarmed) keeps today's bytes.
 
         ``era_base_seed`` (DEC-CA-0043, era settlements only) is
         ``block_seed(era.seed_block)``: the era's training seeds derive from
@@ -100,7 +105,7 @@ class ReceiptMixin:
                 prelaunch_burn_block=self.prelaunch_burn_block,
                 emission=emission, king_check=king_check,
                 king_check_scores=king_check_scores,
-                lane_c=lane_c, lane_c_pay=lane_c_pay, sentinel=sentinel,
+                lane_c=lane_c, lane_c_pay=lane_c_pay, sentinel=sentinel, lane_d=lane_d,
                 **self._netconfig_receipt_kw(),
                 **self._satellite_receipt_kw(manifest),
                 **self._bench_report_receipt_kw(manifest),
@@ -142,7 +147,7 @@ class ReceiptMixin:
             prelaunch_burn_block=self.prelaunch_burn_block,
             emission=emission, king_check=king_check,
             king_check_scores=king_check_scores,
-            lane_c=lane_c, lane_c_pay=lane_c_pay, sentinel=sentinel,
+            lane_c=lane_c, lane_c_pay=lane_c_pay, sentinel=sentinel, lane_d=lane_d,
             **self._netconfig_receipt_kw(),
             **self._satellite_receipt_kw(manifest),
             **self._bench_report_receipt_kw(manifest),

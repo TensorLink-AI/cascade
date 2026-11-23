@@ -7,8 +7,11 @@ validator. Unarmed (``not cfg.active(boundary)``) it returns
 
 1. registers newly revealed entries in ``lane_d_state.json`` (``ready``
    TTL, duplicate digests, deregistered hotkeys → closed with a typed reason);
-2. selects this settlement's judged entries FIFO by reveal time under the
-   per-settlement and per-coldkey caps (the rest wait, ``coldkey_cap_settlement``);
+2. selects this settlement's judged entries (W5h,
+   :mod:`~cascade.validator.lane_d_queue`): entries pending past
+   ``max_reveal_delay_days`` close, the coldkey re-check at reveal refuses a
+   changed coldkey and holds (bounded) an unreadable one, then FIFO by reveal
+   time under the per-settlement and per-coldkey caps (the rest wait);
 3. advances each judged entry's ``frozen_set`` (W5b,
    :mod:`~cascade.validator.lane_d_frozen`): the union over the newest
    snapshot ``pool_dir`` and the retained ``prior_pool_dirs`` of the windows
@@ -125,6 +128,15 @@ binds it into a receipt record (:mod:`~cascade.validator.lane_d_state`):
   returns the persisted report, pay and receipt with nothing re-scored,
   re-gated or written; an older boundary is ``stale_boundary``.
 
+W14 (the lane D-only fast kill, Proposed design change 4): a settlement with
+no lane D report goes through :func:`absent_settlement` instead. It reads
+the prior state under the same fail-closed rules, writes nothing, refuses a
+boundary already settled or whose report is persisted, and returns the
+absent receipt record with ``pay`` = lane D's share and an empty court: the
+caller pays it with ``lane_parts(..., d_absent=True)``, so only lane D's
+share burns. KING_D, the court and every pending entry are untouched, and
+the next real settlement judges and pays them.
+
 Light imports only (numpy + the scorer's numpy half): this module is on the
 validator package's import path.
 """
@@ -134,6 +146,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -149,6 +162,7 @@ from .lane_d_house import check_house
 from .lane_d_lowfreq import forecast_ok as _forecast_ok
 from .lane_d_lowfreq import lowfreq_check, lowfreq_windows
 from .lane_d_lowfreq import target_usable as _target_usable
+from .lane_d_queue import select_queue
 from .lane_d_report import (
     REPORT_SCHEMA,
     SKIP_REASONS,
@@ -157,12 +171,15 @@ from .lane_d_report import (
     validate_report,
 )
 from .lane_d_state import (
+    ABSENT_REASONS,
     HOUSE_ENTRY_KEY,
     PRIOR_STATE_EXTENSION,
+    LaneDReceiptError,
     LaneDStateError,
     check_persisted_report,
     load_prior_state,
     load_report_file,
+    make_absent_receipt,
     make_receipt,
     refresh_house,
     report_digest,
@@ -378,27 +395,6 @@ def _close_house_copies(state: dict, skipped: list[dict]) -> None:
         rec.pop("gate_hold", None)
         rec.update(status="closed", reason="duplicate_digest")
         skipped.append({"digest": str(state["house"]["digest"]), "reason": "duplicate_digest"})
-
-
-def _select(state: dict, cfg, exclude: frozenset[str] = frozenset()
-            ) -> tuple[list[str], list[dict]]:
-    """FIFO by reveal time under the per-settlement / per-coldkey caps.
-    ``exclude`` (held gate candidates, re-gated without a duel) is never
-    selected and never counts against a cap."""
-    open_ = sorted((dg for dg, r in state["entries"].items()
-                    if r["status"] in OPEN_STATUSES and dg not in exclude),
-                   key=lambda dg: (state["entries"][dg]["reveal_ts"], dg))
-    chosen, skipped, per_cold = [], [], {}
-    for dg in open_:
-        cold = state["entries"][dg]["coldkey_at_ready"]
-        if (len(chosen) >= int(cfg.max_entries_per_settlement)
-                or per_cold.get(cold, 0) >= int(cfg.max_judged_per_coldkey_per_settlement)):
-            state["entries"][dg]["reason"] = "coldkey_cap_settlement"
-            skipped.append({"digest": dg, "reason": "coldkey_cap_settlement"})
-            continue
-        per_cold[cold] = per_cold.get(cold, 0) + 1
-        chosen.append(dg)
-    return chosen, skipped
 
 
 def _comparison_king(rec: dict, state: dict, cfg) -> tuple[str, str]:
@@ -833,8 +829,10 @@ def settle_lane_d(*, cfg, boundary: int, pool_dir, entries: list[dict], house: d
     else:
         # A held gate candidate is re-gated, never re-duelled (W5e).
         held = _held_candidates(state, cfg)
-        chosen, capped = _select(state, cfg, frozenset(held))
-        skipped += capped
+        # W5h (lane_d_queue): the reveal-delay close, the coldkey re-check
+        # at reveal, then FIFO by T under the caps.
+        chosen, queued = select_queue(state, cfg, boundary, entries, frozenset(held))
+        skipped += queued
         house_held = house_open and _keeps_hold(house_rec, state, cfg)
 
     # A member whose forecasts are malformed on any pool window is the miner's fault
@@ -1209,5 +1207,52 @@ def _already_settled(state: dict, rp: Path, boundary: int) -> LaneDSettlement:
     return LaneDSettlement(report=report, pay=_persisted_pay(report, rp), receipt=receipt)
 
 
-__all__ = ["LaneDSettlement", "judge_cohort", "load_pool", "settle_lane_d",
-           "window_id"]
+def absent_settlement(*, cfg, boundary: int, state_path, house: dict, reason: str,
+                      expect_prior_sha256: str | None = None) -> LaneDSettlement:
+    """W14: settle lane D at ``boundary`` with NO lane D report (the operator
+    stopped reports, ``reason="report_absent"``, or the settlement could not
+    run, ``"infra_deferred"``; :data:`~cascade.validator.lane_d_state.ABSENT_REASONS`).
+
+    Unarmed (``not cfg.active(boundary)``): ``LaneDSettlement(None, None,
+    None)``. Armed: ``report`` is ``None``, ``receipt`` the absent record
+    binding the loaded state's digest as prior and posterior, and ``pay``
+    ``{"share": cfg.share, "court_uids": []}`` (the caller burns lane D's
+    whole share with ``lane_parts(..., d_absent=True)``).
+
+    The prior state is read with :func:`~cascade.validator.lane_d_state.load_prior_state`
+    (``state_missing`` / ``state_digest_mismatch``, and ``expect_prior_sha256``
+    as in :func:`settle_lane_d`). It never replaces a judgement: a boundary
+    the state already settled is ``report_conflict`` (that boundary) or
+    ``stale_boundary`` (an older one), and a boundary whose report is
+    persisted (a crash W7c recovery must adopt) is ``report_conflict``. An
+    unknown ``reason`` is ``LaneDReceiptError`` ``bad_value``. Nothing is
+    written, on success or refusal, so a re-call returns the same settlement."""
+    if not cfg.active(boundary):
+        return LaneDSettlement(report=None, pay=None, receipt=None)
+    if not isinstance(reason, str) or reason not in ABSENT_REASONS:
+        raise LaneDReceiptError("bad_value", f"absent reason {reason!r} is not one of "
+                                f"{list(ABSENT_REASONS)}")
+    house = check_house(house)
+    boundary = int(boundary)
+    state = load_prior_state(state_path, house, boundary,
+                             expect_prior_sha256=expect_prior_sha256)
+    settled = int(state["boundary"])
+    if settled == boundary:
+        raise LaneDStateError("report_conflict", f"lane D already settled boundary "
+                              f"{boundary}; it cannot be recorded absent")
+    if settled > boundary:
+        raise LaneDStateError("stale_boundary", f"lane D already settled through {settled}; "
+                              f"got {boundary}")
+    rp = report_path(state_path, boundary)
+    if os.path.lexists(rp):
+        raise LaneDStateError("report_conflict", f"{rp}: a report is persisted for boundary "
+                              f"{boundary}; recovery must adopt it (settle_lane_d), never "
+                              "record it absent")
+    receipt = make_absent_receipt(boundary=boundary, state_sha256=state_digest(state),
+                                  reason=reason)
+    return LaneDSettlement(report=None, pay={"share": float(cfg.share), "court_uids": []},
+                           receipt=receipt)
+
+
+__all__ = ["LaneDSettlement", "absent_settlement", "judge_cohort", "load_pool",
+           "settle_lane_d", "window_id"]

@@ -331,7 +331,8 @@ def lane_parts(court_uids: Sequence[int], n_uids: int, *, king_decay: float, bur
                lane_b_cfg: Any = None, wins: Iterable[Any] = (),
                lane_c_cfg: Any = None, c_wins: Iterable[Any] = (),
                c_slot_frac: dict[str, float] | None = None,
-               lane_d_cfg: Any = None, d_court_uids: Sequence[int | None] = ()
+               lane_d_cfg: Any = None, d_court_uids: Sequence[int | None] = (),
+               d_absent: bool = False
                ) -> tuple[list[float], list[float]]:
     """``(lane_a, lane_b)`` — the lanes of the vector KEPT APART (their sum
     is :func:`cascade.shared.lane_b.combined_weights`'s vector). ``lane_a`` is
@@ -361,7 +362,13 @@ def lane_parts(court_uids: Sequence[int], n_uids: int, *, king_decay: float, bur
     and its relative split are unchanged and only its pool shrinks), and its
     court part (:func:`lane_d_vector` over ``d_court_uids``, king first,
     ``None`` = the house's slot, which burns) is ADDED to the second element.
-    ``None`` = exactly the result without lane D (invariant 1)."""
+    ``None`` = exactly the result without lane D (invariant 1).
+
+    ``d_absent`` (W14, the lane D-only fast kill: the settlement's lane D
+    receipt record is ``status: "absent"``): lane D's share is carved exactly
+    as when it pays, and the WHOLE share goes to ``burn_uid`` whatever
+    ``d_court_uids`` holds; lane A and every lane B / C slot are unchanged.
+    Without ``lane_d_cfg`` it changes nothing."""
     from .chain import decayed_share_vector
     from .lane_c import lane_pool_shares
 
@@ -390,7 +397,9 @@ def lane_parts(court_uids: Sequence[int], n_uids: int, *, king_decay: float, bur
                           share=share_c, slot_frac=c_slot_frac)
         b = [x + y for x, y in zip(b, c, strict=True)]
     if lane_d_cfg is not None:
-        d = lane_d_vector(n_uids, share=share_d, court_uids=list(d_court_uids),
+        # An empty court burns lane D's whole share (lane_d_vector).
+        d_court = [] if d_absent else list(d_court_uids)
+        d = lane_d_vector(n_uids, share=share_d, court_uids=d_court,
                           king_decay=float(lane_d_cfg.king_decay), burn_uid=burn_uid)
         b = [x + y for x, y in zip(b, d, strict=True)]
     return [pool_a * w for w in court], b
