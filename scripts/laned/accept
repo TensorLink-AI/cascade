@@ -2338,7 +2338,9 @@ def selftest_coupled(ident: tuple[str, ...]) -> list[str]:
     code = {f"pkg/{w.lower()}.py": "from pkg.core import VALUE  # noqa: F401\n" for w in wps}
     code["pkg/core.py"] = "VALUE = 1\n"
     members = ["C1", "C2", "C3", "C4"]
-    declared = "# selftest\nC1 C2 C3 C4  # the coupled set\nE1\n"
+    # A second set may share members with the first (lane D coupled set 2):
+    # C3 C4 (C4 depends on C3) is coupled on its own as well.
+    declared = "# selftest\nC1 C2 C3 C4  # the coupled set\nE1\nC3 C4  # a second set\n"
     try:
         with tempfile.TemporaryDirectory(prefix="laned-accept-selftest-coupled-") as tmp:
             root = Path(tmp) / "repo"
@@ -2404,6 +2406,12 @@ def selftest_coupled(ident: tuple[str, ...]) -> list[str]:
                     rc = cmd_accept(root, wp, None)
                 if rc != 0:
                     failures.append(f"coupled accept {wp} failed: {buf.getvalue().strip()[-1500:]}")
+            # a second declared set (sharing members with the first) is
+            # coupled on its own: its dependency is allowed
+            for wp in ("C3", "C4"):
+                rc, out, _ = check(f"second-{wp}", impl("C3", "C4"), ["C3", "C4"], wp, base)
+                if rc != 0 or not out.startswith("COUPLED C3 C4\n") or "MODE implementation" not in out:
+                    failures.append(f"coupled second-set: {wp} rc={rc}: {out.strip()}")
             # the rule keeps every other refusal
             want_refused("subset", impl("C1", "C2"), ["C1", "C2"], "FAIL rule1: batch-dependency")
             want_refused("subset-overlap", impl("C1", "C4"), ["C1", "C4"],
@@ -2435,7 +2443,7 @@ def selftest_coupled(ident: tuple[str, ...]) -> list[str]:
                               "pkg/c4.py": code["pkg/c4.py"]}, "partial")
             if any(built_on(root, partial, w) for w in ("C1", "C3")):
                 failures.append("coupled: a merge missing members counted as their L2")
-            if lanedlib.parse_coupled_batches(declared) != [("C1", "C2", "C3", "C4")]:
+            if lanedlib.parse_coupled_batches(declared) != [("C1", "C2", "C3", "C4"), ("C3", "C4")]:
                 failures.append(f"coupled parse: {lanedlib.parse_coupled_batches(declared)}")
             if lanedlib.coupled_set_of(["C4", "C3", "C2", "C1"], [("C1", "C2", "C3", "C4")]) is None \
                     or lanedlib.coupled_set_of(["C1", "C2"], [("C1", "C2", "C3", "C4")]) is not None:

@@ -14,3 +14,11 @@
 # or must change with it; split, each intermediate main is red (the replay and
 # audit cannot re-derive the per-feed embargo before W7a signs it).
 W5a W5j W7a W7d W9
+#
+# Lane D rev6.14 (orchestrator decision 2026-11-23, coupled set 2): the judging
+# start j = T + eval_delay_hours and the eligibility boundary b = T +
+# forward_margin_hours (default 0): the [lane_d] keys and shipped tables (W2e),
+# the before_eval_delay skip (W5e), the signed b / j and config echo (W7a), and
+# their re-derivation in the replay (W7d) and the audit (W9). W5e, W7a, W7d and
+# W9 share cascade/validator/lane_d.py or must change with it.
+W2e W5e W7a W7d W9
