@@ -1,6 +1,7 @@
-"""W0c (rev6, iii): `scripts/laned/accept <WP> --check-pr` fails a PR that
-edits tests/accept/ together with any other path (rule 1) and an
-implementation PR that touches a path outside the WP's PATHS."""
+"""W0c (rev6, iii; rev6.17): `scripts/laned/accept <WP> --check-pr` lets a PR
+change the WP's tests/accept/<wp>/ together with code inside its PATHS
+(MODE combined, plan rev6.17 rule 1) and fails one that touches a path
+outside the WP's PATHS, with or without tests."""
 
 from __future__ import annotations
 
@@ -40,8 +41,9 @@ CASES = {
     # name: (files, passes, mode)
     "tests_only": ({"tests/accept/w9/test_more.py": "def test_more():\n    assert False\n"},
                    True, "tests-only"),
-    "rule1_tests_plus_impl": ({"tests/accept/w9/test_more.py": "def test_more():\n    assert False\n",
-                               "lanedpkg/w9.py": "VALUE = 9\n"}, False, None),
+    # rev6.17 rule 1: tests + code together is one feature PR
+    "tests_plus_impl": ({"tests/accept/w9/test_more.py": "def test_more():\n    assert False\n",
+                         "lanedpkg/w9.py": "VALUE = 9\n"}, True, "combined"),
     "rule1_tests_plus_docs": ({"tests/accept/w9/test_more.py": "def test_more():\n    assert False\n",
                                "README.md": "edited\n"}, False, None),
     "tests_for_other_wp": ({"tests/accept/w8/test_w8.py": "def test_w8():\n    assert False\n"},
@@ -67,12 +69,14 @@ def test_check_pr(pr_repo, case):
         assert proc.returncode != 0, output(proc)
 
 
-def test_check_pr_rule1_failure_is_named(pr_repo):
-    files, _, _ = CASES["rule1_tests_plus_impl"]
+def test_check_pr_tests_plus_outside_path_is_named(pr_repo):
+    # rev6.17: tests may ride with code, never with a path outside PATHS
+    files, _, _ = CASES["rule1_tests_plus_docs"]
     head = _branch(pr_repo, "pr-named", files)
     proc = _check(pr_repo, head)
     assert proc.returncode != 0
-    assert "FAIL rule1" in output(proc), output(proc)
+    assert "FAIL paths" in output(proc), output(proc)
+    assert "README.md" in output(proc), output(proc)
 
 
 def test_check_pr_paths_failure_is_named(pr_repo):
