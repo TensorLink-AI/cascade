@@ -5,7 +5,8 @@ the intake accepts. Contract: README.md "Contexts (rev6.6)".
 every variant from launch (4k..128k). Arming is computed per settlement by
 the main validator (W5d/W7a) and is not the intake's business: an entry that
 declares an unarmed variant is accepted, and is scored at the highest armed
-variant until its own arms. A context outside ``contexts`` is still refused
+variant below its declared context until its own arms (none below it: not
+scored that settlement, ``context_below_armed``, plan rev6.15). A context outside ``contexts`` is still refused
 (``400 context_not_armed``, the code W3 has always used for it).
 """
 

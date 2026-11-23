@@ -16,7 +16,8 @@ Copied from docs/plans/LANE_D_PLAN.md (rev6):
   weights from the receipt chain."
 - rev6.11 (b): every crown is decided at the first verdict (first clear ∧
   A10 ∧ gate); the replay re-derives no confirmation stage, record or D20
-  rule, and a held first clear is `hold` / `bench_hold`.
+  rule, and a held first clear is `hold` / `bench_hold` (status / reason;
+  its verdict outcome is `cleared`, never `crowned`).
 
 Every honest chain is a sequence of real `settle_lane_d` runs on a synthetic
 pool (numpy only, no torch), published the way W7c persists it: the signed
