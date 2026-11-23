@@ -1,6 +1,8 @@
 """``lane_d_state.json`` (LANE_D_PLAN §1.5 "State"; W7c).
 
-Holds KING_D, the prior miner kings, the house, and every entry's progress
+Holds KING_D, the prior miner kings, the house (and, W5f, the house's entry
+record while it challenges a miner KING_D, :data:`HOUSE_ENTRY_KEY`), and every
+entry's progress
 (status, typed reason, the windows it has been judged on, its confirmation
 record, and ``frozen_set``: the W5b accumulating/frozen window set from
 :func:`~cascade.validator.lane_d_frozen.advance_frozen_set`). Protected like
@@ -77,6 +79,10 @@ STATE_ERROR_CODES = ("bad_json", "duplicate_key", "not_canonical", "unknown_sche
 # the state it was settled from (W7a froze the top-level keys, so it sits in
 # the open ``extensions`` map).
 PRIOR_STATE_EXTENSION = "prior_state_sha256"
+# W5f: the state key of the house's entry record while it challenges a miner
+# KING_D (absent otherwise, so a state with no house challenger keeps its
+# pre-W5f bytes).
+HOUSE_ENTRY_KEY = "house_entry"
 # A persisted report's file name under ``report_path``'s directory.
 _REPORT_NAME = re.compile(r"lane_d_report_([0-9]+)\.json")
 RECEIPT_ERROR_CODES = ("not_object", "unknown_schema", "missing_field", "unknown_field",
@@ -349,15 +355,34 @@ def save_state(path: str | os.PathLike, state: dict) -> None:
     write_text_atomic(path, canonical_state(state).decode("ascii"))
 
 
+def house_entry(house: dict) -> dict:
+    """W5f: a new house's entry record (§1.4 "It enters at that settlement"):
+    the progress fields of an entry, with the house's digest and T and no
+    hotkey, coldkey or context (the house is never paid)."""
+    return {"digest": str(house["digest"]), "reveal_ts": int(house["reveal_ts"]),
+            "status": "pending", "reason": "pending_floor", "used_windows": [],
+            "confirm": None, "frozen_set": None}
+
+
 def refresh_house(state: dict, house: dict) -> None:
     """§1.4: the house follows lane A's king digest. While the house holds
-    KING_D the throne moves with it; a miner KING_D keeps its throne."""
+    KING_D the throne moves with it in place (no duel; ``prior_kings`` is
+    untouched and the old house is never a prior king). A miner KING_D keeps
+    its throne and the new house enters as a challenger: its entry record is
+    :data:`HOUSE_ENTRY_KEY` (replacing an older house's), unless its digest
+    is KING_D's or a prior king's (it is already judged as that). Re-applying
+    the same pointer changes nothing."""
     h = {"digest": str(house["digest"]), "reveal_ts": int(house["reveal_ts"])}
     if state["house"]["digest"] == h["digest"]:
         return
     state["house"] = dict(h)
+    state.pop(HOUSE_ENTRY_KEY, None)
     if state["king"].get("house"):
         state["king"] = {**h, "hotkey": None, "house": True}
+        return
+    known = {state["king"]["digest"], *(p["digest"] for p in state["prior_kings"])}
+    if h["digest"] not in known:
+        state[HOUSE_ENTRY_KEY] = house_entry(h)
 
 
 # ── the persisted report ────────────────────────────────────────────────────
@@ -533,10 +558,11 @@ def verify_receipt_chain(receipts) -> None:
                                     f"{a['posterior_state_sha256']}")
 
 
-__all__ = ["ENTRY_REASONS", "ENTRY_STATUSES", "PRIOR_STATE_EXTENSION", "RECEIPT_ERROR_CODES",
+__all__ = ["ENTRY_REASONS", "ENTRY_STATUSES", "HOUSE_ENTRY_KEY", "PRIOR_STATE_EXTENSION",
+           "RECEIPT_ERROR_CODES",
            "RECEIPT_FIELDS", "RECEIPT_SCHEMA", "STATE_ERROR_CODES", "STATE_ONLY_REASONS",
            "STATE_SCHEMA", "LaneDReceiptError", "LaneDStateError", "bound_prior_state",
-           "canonical_state", "check_persisted_report", "genesis",
+           "canonical_state", "check_persisted_report", "genesis", "house_entry",
            "load_prior_state", "load_report_file", "load_state", "make_receipt",
            "persisted_report_boundaries", "refresh_house", "report_digest", "report_path",
            "restore_state", "save_report_file", "save_state", "state_digest",
