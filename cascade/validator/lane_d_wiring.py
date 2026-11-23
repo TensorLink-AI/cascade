@@ -44,6 +44,7 @@ module (W9 invariant 12). Unarmed (``[lane_d] from_block = 0``)
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -53,9 +54,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ..shared.bench_report import VALIDATOR_BENCH_PREFIX
 from ..shared.hippius import ObjectNotFound
 from ..shared.sentinel import sentinel_armed, sentinel_for_era, settlement_era_start
-from .lane_d import LaneDSettlement, settle_lane_d
+from .lane_d import BENCH_ROWS_ROLES, LaneDSettlement, bench_rows_dir, settle_lane_d
 from .lane_d_report import canonical_json
 from .lane_d_sentinel import sweep_and_publish
 from .lane_d_state import (
@@ -129,6 +131,12 @@ def _armed_of(inp: Any) -> dict | None:
 def report_key(boundary: int) -> str:
     """The published signed report of the settlement at ``boundary``."""
     return f"{REPORT_PREFIX}/lane_d_report_{int(boundary)}.json"
+
+
+def bench_rows_key(boundary: int, digest: str) -> str:
+    """W3b6b: a bound bench record, content-addressed under lane A's
+    ``bench_v/`` prefix (never ``bench_v/round-*`` or ``bench_v/rows/*``)."""
+    return f"{VALIDATOR_BENCH_PREFIX}/lane_d/{int(boundary)}/{digest}.json"
 
 
 def receipt_key(boundary: int) -> str:
@@ -308,10 +316,37 @@ class LaneDStep:
                                    f"settlement {boundary}: persisted report unreadable "
                                    f"({e})") from e
         text = receipt_text(s.receipt)
+        self._publish_bench_rows(boundary, report)
         self._put(report_key(boundary), report)
         self._put(receipt_key(boundary), text)
         self._put(RECEIPT_LATEST_KEY, text)
         self._set_court(boundary, s.report)
+
+    def _publish_bench_rows(self, boundary: int, report_text: str) -> None:
+        """W3b6b: every bench record the report binds, its persisted bytes at
+        ``bench_v/lane_d/<boundary>/<sha256>.json``, before the report."""
+        try:
+            gate = json.loads(report_text).get("gate")
+        except ValueError as e:
+            raise LaneDWiringError("publish_failed",
+                                   f"settlement {boundary}: persisted report unparseable "
+                                   f"({e})") from e
+        digests = sorted({str(r["rows"][role]) for r in (gate or {}).get("results") or []
+                          if isinstance(r, dict) and isinstance(r.get("rows"), dict)
+                          for role in BENCH_ROWS_ROLES})
+        for digest in digests:
+            path = bench_rows_dir(self.state_path) / f"{digest}.json"
+            try:
+                data = path.read_bytes()
+            except OSError as e:
+                raise LaneDWiringError("publish_failed",
+                                       f"settlement {boundary}: bench record {digest[:16]} "
+                                       f"unreadable ({e})") from e
+            if hashlib.sha256(data).hexdigest() != digest:
+                raise LaneDWiringError("publish_failed",
+                                       f"settlement {boundary}: bench record {digest[:16]} "
+                                       "does not hash to its bound digest")
+            self._put(bench_rows_key(boundary, digest), data.decode("ascii"))
 
     def _sentinel_sweep(self, s: LaneDSettlement, *, era: int, era_hash: str,
                         bench: Any) -> None:
