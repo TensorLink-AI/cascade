@@ -105,3 +105,11 @@ exceed `max_windows_per_settlement`.
 `cascade.validator.lane_d_draw` doesn't exist (a `ModuleNotFoundError` for a
 path in `PATHS`); the settlement tests fail on an `assert` (no `draw` record,
 no per-window draw fields, all eligible windows judged).
+
+## Correction: feeds pin `embargo_hours` (W5a fail-closed)
+
+W5a (rev6.10 (a)) refuses every window of a listed feed whose
+`embargo_hours` is missing (`unlisted_feed`). The settlement fixture
+(`settle_helpers.write_pool`) now pins `embargo_hours: 0.0` on every feed, so
+every window stays eligible and fresh once W5a lands; on main the key is
+ignored. No assertion changed.

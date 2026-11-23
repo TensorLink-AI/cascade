@@ -1,0 +1,5 @@
+# W6c pool_d_hist / pool_d_tgt split (plan §3.0 W6c row, §1.7 "Artifacts",
+# invariant 8 "Targets never leave the box"; README.md has the contract).
+# The deterministic two-tar split of one pool_d/1 snapshot, the box-side join
+# and the eval-host history reader.
+cascade/pool/pool_d_split.py

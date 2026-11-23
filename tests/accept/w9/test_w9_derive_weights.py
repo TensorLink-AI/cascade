@@ -62,8 +62,8 @@ def test_weight_error_codes_are_exported():
 
 
 @pytest.mark.parametrize("name,lane_d_uid", [
-    ("s1", None),                    # the house holds KING_D: its slot burns (D21)
-    ("s2", h.CHALLENGER_UID),        # X crowned: lane D's share pays X
+    ("s1", h.CHALLENGER_UID),        # X crowned at its first verdict: pays X (rev6.11)
+    ("s2", h.CHALLENGER_UID),        # nothing judged: X keeps the slot
     ("s3", h.CHALLENGER_UID),        # nothing judged: X keeps the slot
     ("s3d", None),                   # X deregistered: its slot burns (B8)
 ])
@@ -212,10 +212,7 @@ def test_a_report_the_chain_refutes_is_refused(run):
     """b3 forged to undo X's crown (test_w9_chain), re-signed and re-bound:
     with the earlier reports given, its pay is never derived."""
     receipt, _, _ = _honest(run, "s3")
-    forged = copy.deepcopy(run["s3"].report)
-    for key in ("king_before", "king_after", "prior_kings", "pay"):
-        forged[key] = copy.deepcopy(run["s1"].report[key])
-    forged = h.resign(forged)
+    forged = h.resign(h.undo_crown(run["s3"].report, run["s1"].report))
     rebound = dict(run["s3"].receipt, report_sha256=h.body_sha256(forged))
     rec = h.lane_d_record(run["s3"], report=forged, receipt=rebound,
                           prior=[run["s1"].report, run["s2"].report])
