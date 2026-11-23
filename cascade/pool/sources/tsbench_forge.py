@@ -18,10 +18,11 @@ Design notes:
 * **Freshness/determinism** — only parquet files dated ``<= ctx.as_of`` are
   read and rows stamped after ``as_of`` are dropped, so re-building for a past
   ``as_of`` against the same mirror is reproducible (the audit hook).
-* **Staleness guard** — a source is fresh iff BOTH its newest snapshot file
-  and its newest observation (timestamp, post-``as_of`` rows dropped) are
-  within ``max_stale_days × max(1 day, cadence)`` of ``as_of`` (see
-  :func:`is_fresh`); stale sources are skipped, and if *every* catalog source
+* **Staleness guard** — a daily-or-faster source is fresh iff its newest
+  snapshot file is at most ``max_stale_days`` before ``as_of`` (unchanged
+  file-date rule). Slower-than-daily cadences and every rollup series are
+  judged by their newest observation too, within ``max_stale_days ×
+  cadence`` (see :func:`is_fresh`). Stale sources are skipped, and if *every* catalog source
   is stale the harvest raises instead of silently republishing old data (the
   decoupled-cron failure mode).
 * **Rollups** — a catalog entry tagged ``rollup: sum|mean|last`` additionally
@@ -257,6 +258,14 @@ def freshness_window(cadence_sec: float | None, max_stale_days: int) -> dt.timed
     return dt.timedelta(seconds=max_stale_days * cycle)
 
 
+def observation_freshness_applies(cadence_sec: float | None) -> bool:
+    """True iff a series' newest OBSERVATION is checked (not only its file
+    date): cadences slower than daily, plus every rollup series (checked in
+    ``_rollup_values``). Daily-or-faster raw feeds keep the file-date-only rule
+    so publication-lagged feeds stay admitted (owner 2026-11-23)."""
+    return cadence_sec is not None and float(cadence_sec) > 86_400
+
+
 def is_fresh(
     *, as_of: dt.date, cadence_sec: float | None, max_stale_days: int,
     newest_file: dt.date | None, newest_obs: dt.datetime | None,
@@ -267,9 +276,10 @@ def is_fresh(
     timestamp (UTC; ``None`` = unknown, e.g. no parseable timestamps) are at or
     after ``as_of 00:00 UTC − freshness_window(cadence)``. Requiring the file
     too keeps every stale-file skip of the old rule (an observation can't be
-    fresher than the scrape that delivered it); requiring the observation adds
-    the case the file date got strictly wrong — a fresh scrape of a feed whose
-    data stopped updating."""
+    fresher than the scrape that delivered it). Callers pass ``newest_obs``
+    only where :func:`observation_freshness_applies` (slower than daily) and
+    for rollup series; daily-or-faster raw feeds pass ``None`` (file date
+    only, the historical rule)."""
     floor = dt.datetime.combine(as_of, dt.time(), tzinfo=dt.UTC) - freshness_window(
         cadence_sec, max_stale_days)
     if newest_file is not None and dt.datetime.combine(
@@ -368,18 +378,25 @@ class TsbenchForgeSource:
                             max_stale_days=self.max_stale_days,
                             newest_file=newest_file, newest_obs=None):
                 continue  # cron fell behind for this feed; don't serve stale data
+            # Daily-or-faster feeds keep the historical file-date-only rule (owner
+            # 2026-11-23: publication-lagged feeds stay admitted). The newest-
+            # observation rule applies only to slower-than-daily cadences.
+            slow = observation_freshness_applies(raw_sec)
+            if not slow:
+                usable_sources += 1
 
             df = self._load_frame(pd, pq, files)
             if df is None or df.empty:
                 continue
-            newest_obs = self._newest_observation(pd, df, ctx)
-            if not is_fresh(as_of=ctx.as_of, cadence_sec=raw_sec,
-                            max_stale_days=self.max_stale_days,
-                            newest_file=newest_file, newest_obs=newest_obs):
-                log.warning("tsbench_forge: skipping %s — newest observation %s is stale "
-                            "for its cadence (as_of=%s)", sid, newest_obs, ctx.as_of)
-                continue  # fresh scrape of a feed whose data stopped updating
-            usable_sources += 1
+            if slow:
+                newest_obs = self._newest_observation(pd, df, ctx)
+                if not is_fresh(as_of=ctx.as_of, cadence_sec=raw_sec,
+                                max_stale_days=self.max_stale_days,
+                                newest_file=newest_file, newest_obs=newest_obs):
+                    log.warning("tsbench_forge: skipping %s — newest observation %s is "
+                                "stale for its cadence (as_of=%s)", sid, newest_obs, ctx.as_of)
+                    continue
+                usable_sources += 1
 
             agg = rollup_agg(entry)
             targets = [t for t in ROLLUP_TARGETS if agg and raw_sec and raw_sec < t[1]]

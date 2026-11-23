@@ -276,16 +276,17 @@ Properties worth knowing:
 * **Freshness cutoff** — only snapshots dated `<= as_of` are read and rows
   stamped after `as_of` are dropped, so a rebuild against the same mirror is
   reproducible (the dated bucket pins the audit inputs).
-* **Staleness guard** — a feed is fresh iff both its newest snapshot file
-  and its newest *observation* (timestamp, rows after `as_of` dropped) are at
-  or after `as_of 00:00 UTC − max_stale_days × max(1 day, cadence)`
-  (`max_stale_days` default 4: four missed scrape cycles). Daily-and-faster
-  feeds keep the 4-day window; weekly gets 4 weeks, monthly 4 nominal months.
-  A fresh scrape of a feed whose data stopped updating is skipped (logged at
-  WARNING); a feed without parseable timestamps falls back to the file date.
-  If *every* feed is stale the build fails loudly instead of republishing old
-  data. With the crons decoupled, a dead scraper must not silently erode the
-  freshness lever.
+* **Staleness guard** — daily-or-faster feeds: unchanged — a feed whose
+  newest snapshot file is older than `max_stale_days` (default 4) before
+  `as_of` is skipped (file date only, so publication-lagged feeds stay
+  admitted). Slower-than-daily cadences and every rollup series are also
+  judged by their newest *observation*: fresh iff the newest file and the
+  newest observation (rows after `as_of` dropped) are at or after
+  `as_of 00:00 UTC − max_stale_days × cadence` (4 weeks for weekly, 4 nominal
+  months for monthly; a rollup's observation time is the end of its newest
+  complete bucket). If *every* feed is stale the build fails loudly instead of
+  republishing old data. With the crons decoupled, a dead scraper must not
+  silently erode the freshness lever.
 * **Cluster labels** — every series lands in `metadata.json` with
   the catalog feed id. New primary builds replace the bootstrap key with its
   source family and retain the feed as `catalog_source` (see below). The validator's KOTH bootstrap resamples these

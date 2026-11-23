@@ -1,5 +1,6 @@
 """Forge reader rollups (catalog tag ``rollup: sum|mean|last``) and freshness
-by newest observation relative to cadence.
+by newest observation relative to cadence (slower-than-daily cadences and
+rollup series only; daily-or-faster feeds keep the file-date rule).
 
 The bucketing and freshness rules are pure functions (numpy only); the
 harvest-level tests build a miniature forge mirror and need the ``pool-forge``
@@ -17,6 +18,7 @@ from cascade.pool.sources.tsbench_forge import (
     ROLLUP_TARGETS,
     freshness_window,
     is_fresh,
+    observation_freshness_applies,
     rollup_agg,
     rollup_buckets,
 )
@@ -141,12 +143,13 @@ def test_daily_and_fast_file_rule_is_unchanged(cadence):
                         newest_file=newest_file, newest_obs=None) is old, lag
 
 
-@pytest.mark.parametrize("cadence", [10, DAY])
-def test_fresh_file_with_stale_observation_is_stale(cadence):
-    # The case the file-date rule got strictly wrong: today's scrape, old data.
-    kw = dict(as_of=AS_OF, cadence_sec=cadence, max_stale_days=4, newest_file=AS_OF)
-    assert is_fresh(**kw, newest_obs=_utc(2026, 5, 28)) is True     # exactly 4 days
-    assert is_fresh(**kw, newest_obs=_utc(2026, 5, 27, 23)) is False
+def test_observation_rule_only_for_slower_than_daily():
+    # Daily-or-faster raw feeds keep the file-date-only rule (lagged feeds stay).
+    for cadence in (10, 60, H, DAY):
+        assert observation_freshness_applies(cadence) is False, cadence
+    assert observation_freshness_applies(None) is False      # unparseable → file date
+    assert observation_freshness_applies(WEEK) is True
+    assert observation_freshness_applies(2_629_800) is True
 
 
 def test_weekly_freshness_by_observation():
@@ -285,17 +288,88 @@ def test_rollup_harvest_and_build_are_deterministic(tmp_path):
         assert a_bytes == b_bytes, f
 
 
-def test_fresh_file_with_stale_observations_is_skipped(tmp_path):
+def test_fresh_scrape_of_lagged_fast_feed_is_kept(tmp_path):
     """A 10 s feed scraped today whose newest observation is 10 days old is
-    stale (the file-date rule kept it); a 10 s feed with current data is not."""
+    KEPT, as today: daily-or-faster feeds are judged by file date only
+    (publication-lagged feeds stay admitted)."""
     pd = pytest.importorskip("pandas")
     old = pd.date_range("2026-04-10", periods=500, freq="10s", tz="UTC")
     new = pd.date_range("2026-04-26", periods=500, freq="10s", tz="UTC")
     root = _mirror(tmp_path, [
-        {"id": "dead", "domain": "nature", "frequency": "PT10S"},
+        {"id": "lagged", "domain": "nature", "frequency": "PT10S"},
         {"id": "live", "domain": "nature", "frequency": "PT10S"},
     ], {
-        "dead": (ROLL_AS_OF, {"timestamp": old.astype(str), "v": np.sin(np.arange(500.))}),
+        "lagged": (ROLL_AS_OF, {"timestamp": old.astype(str), "v": np.sin(np.arange(500.))}),
         "live": (ROLL_AS_OF, {"timestamp": new.astype(str), "v": np.sin(np.arange(500.))}),
     }, ROLL_AS_OF)
-    assert [s.series_id for s in _harvest(root)] == ["tsforge__live"]
+    assert [s.series_id for s in _harvest(root)] == ["tsforge__lagged", "tsforge__live"]
+
+
+# Daily-or-faster admit/skip matrix. EXPECTED_ADMITTED was produced by running
+# this exact fixture through origin/main's reader (98d7383, file-date-only
+# freshness) — a mismatch means a currently admitted fast/daily feed changed.
+FAST_AS_OF = dt.date(2026, 6, 1)
+FAST_CADENCES = {"PT10S": "10s", "PT1H": "h", "P1D": "D"}
+FAST_CASES = {           # name: (file lag days, newest-observation lag days, has ts)
+    "fresh": (0, 0, True),
+    "lagged": (0, 10, True),
+    "edge": (4, 4, True),
+    "stalefile": (5, 5, True),
+    "nots": (0, 0, False),
+}
+EXPECTED_ADMITTED = sorted(
+    f"tsforge__{c}_{iso.lower()}"
+    for iso in FAST_CADENCES for c in ("fresh", "lagged", "edge", "nots")
+)
+
+
+def _fast_matrix_mirror(tmp_path):
+    pd = pytest.importorskip("pandas")
+    catalog, frames = [], {}
+    for iso, step in FAST_CADENCES.items():
+        for case, (file_lag, obs_lag, has_ts) in FAST_CASES.items():
+            sid = f"{case}_{iso.lower()}"
+            catalog.append({"id": sid, "domain": "energy", "frequency": iso})
+            end = pd.Timestamp(FAST_AS_OF - dt.timedelta(days=obs_lag), tz="UTC")
+            ts = pd.date_range(end=end, periods=300, freq=step)
+            data = {"v": np.sin(np.arange(300.0) / 5.0) + np.arange(300.0) / 100.0}
+            if has_ts:
+                data = {"timestamp": ts.astype(str), **data}
+            frames[sid] = (FAST_AS_OF - dt.timedelta(days=file_lag), data)
+    return _mirror(tmp_path, catalog, frames, FAST_AS_OF)
+
+
+def test_fast_and_daily_admit_skip_matches_main(tmp_path):
+    from cascade.pool.sources.tsbench_forge import TsbenchForgeSource
+
+    root = _fast_matrix_mirror(tmp_path)
+    ctx = HarvestContext(as_of=FAST_AS_OF, context_length=512, horizon=16, max_series=1000)
+    out = list(TsbenchForgeSource(root).harvest(lambda u, p: None, ctx))
+    assert sorted(s.series_id for s in out) == EXPECTED_ADMITTED
+
+
+def test_slow_cadence_observation_freshness_in_harvest(tmp_path, monkeypatch):
+    """Slower-than-daily cadences ARE judged by newest observation: with the
+    cadence admitted (patched, since resolve_frequency still skips weekly+), a
+    weekly feed with a two-week-old scrape is fresh, one whose data stopped
+    5 weeks ago is skipped despite a fresh scrape."""
+    pd = pytest.importorskip("pandas")
+    from cascade.pool.sources import tsbench_forge as tf
+
+    real = tf.resolve_frequency
+    monkeypatch.setattr(tf, "resolve_frequency",
+                        lambda f: ("W", 52) if f == "P1W" else real(f))
+    live = pd.date_range(end="2026-05-18", periods=300, freq="7D", tz="UTC")
+    dead = pd.date_range(end="2026-04-20", periods=300, freq="7D", tz="UTC")
+    vals = np.sin(np.arange(300.0) / 5.0) + np.arange(300.0) / 100.0
+    root = _mirror(tmp_path, [
+        {"id": "wk_live", "domain": "econ_fin", "frequency": "P1W"},
+        {"id": "wk_dead", "domain": "econ_fin", "frequency": "P1W"},
+    ], {
+        "wk_live": (FAST_AS_OF - dt.timedelta(days=14),
+                    {"timestamp": live.astype(str), "v": vals}),
+        "wk_dead": (FAST_AS_OF, {"timestamp": dead.astype(str), "v": vals}),
+    }, FAST_AS_OF)
+    ctx = HarvestContext(as_of=FAST_AS_OF, context_length=512, horizon=16, max_series=100)
+    out = list(tf.TsbenchForgeSource(root).harvest(lambda u, p: None, ctx))
+    assert [s.series_id for s in out] == ["tsforge__wk_live"]
