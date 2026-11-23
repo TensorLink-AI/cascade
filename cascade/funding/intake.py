@@ -454,6 +454,7 @@ class FundingIntake:
         mkt_suites: tuple[str, ...] = (),
         lane_c_closed: Callable[[str], str | None] | None = None,
         gpu_catalog: GpuCatalog | None = None,
+        lane_b_gpus: object | None = None,        # WB22 LaneBGpus; None = lane A's catalog
         lane_b_queue: object | None = None,       # funding LaneBQueue; None = lane B off
         resolve_lane_b_reveal: Callable[[str, tuple, str], int | None] | None = None,
         lane_b_targets: tuple[str, ...] | None = None,
@@ -520,6 +521,11 @@ class FundingIntake:
         # funded_pod_skus``) and the walls behind the fund-time warning. None
         # = no chain config (dev): any well-formed SKU, no warning.
         self.gpu_catalog = gpu_catalog
+        # WB22 (D42): lane B's OWN GPU list (``[lane_b] funded_pod_skus``) and
+        # the WB19 step-rate gate (``lane_b_gpus.LaneBGpus``). None = lane B
+        # funds read ``gpu_catalog`` with no rate gate (unit construction only;
+        # the production intake always wires it, main.gpu_catalogs).
+        self.lane_b_gpus = lane_b_gpus
         # DEC-CA-0056 lane C: the fine-tune queue + its reveal oracle
         # ``(hotkey, target, ref) -> reveal block | None`` (the hotkey's
         # revealed ``metro-v1:ft:`` commitment must name exactly them), and
@@ -1247,7 +1253,15 @@ class FundingIntake:
             self.lane_b_queue.expire_stale()      # type: ignore[union-attr]
         except Exception:  # noqa: BLE001 — housekeeping never fails a request
             log.exception("lane-B queue TTL sweep failed")
-        choice, segment, gpu_err = self._gpu_choice(headers)
+        lb_gpus = self.lane_b_gpus
+        if lb_gpus is None:
+            choice, segment, gpu_err = self._gpu_choice(headers)
+        else:
+            # WB22 (D42): lane B's own list; a type with no measured step rate
+            # (WB19) is refused before anything is queued or vaulted (TB24)
+            choice, segment, gpu_err = parse_gpu_headers(headers, lb_gpus.catalog)
+            if gpu_err is None:
+                gpu_err = lb_gpus.refusal(choice)
         if gpu_err is not None:
             return 400, gpu_err
         status, ctx = self._lane_b_request("lane-b-fund", headers, gpu_segment=segment)
@@ -1294,6 +1308,15 @@ class FundingIntake:
                  "" if rows is None else ", declared rows "
                  + ",".join(f"{k}:{len(v)}" for k, v in rows.items()))
         body = {"status": outcome, "lane": "b", "targets": list(targets), **receipt_kw}
+        if lb_gpus is not None:
+            # lane B's reply: the choice and its measured step rate (lane A's
+            # full-budget wall warning does not apply to an expert leg)
+            if choice.chosen:
+                body.update(choice.as_dict())
+                rate = lb_gpus.rate(choice.gpu)
+                if rate is not None:
+                    body["steps_per_s"] = float(rate.steps_per_s)
+            return (200 if outcome == "already-queued" else 202), body
         if outcome == "already-queued":
             return 200, self._gpu_reply(body, choice)
         return 202, self._gpu_reply(body, choice)

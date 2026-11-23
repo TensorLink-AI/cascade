@@ -57,6 +57,18 @@ def ledger_pod_live(ledger_path: Path):
     return live
 
 
+def gpu_catalogs(cfg, *, env=None):
+    """``(lane A GpuCatalog, lane B LaneBGpus)`` of the production intake.
+
+    Lane A (``/v1/fund``) keeps ``[round] funded_pod_skus``; lane B
+    (``/v1/lane-b/fund``) reads its own ``[lane_b] funded_pod_skus`` with the
+    WB19 step-rate gate (WB22, D42), so a lane B type never opens to lane A."""
+    from .gpu_choice import GpuCatalog
+    from .lane_b_gpus import lane_b_gpus_from_env
+
+    return GpuCatalog.from_config(cfg), lane_b_gpus_from_env(cfg, env=env)
+
+
 LANE_B_SCAN_CACHE_DIR = "lane_b_scan_cache"
 LANE_B_SCAN_CACHE_KEEP = 16
 
@@ -567,12 +579,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     # behind the fund-time warning. No chain config (--trust-refs) ⇒ any
     # well-formed SKU is accepted (dev only; the trainer still checks).
     gpu_catalog = None
+    lane_b_gpus = None
     if cfg is not None:
-        from .gpu_choice import GpuCatalog
-
-        gpu_catalog = GpuCatalog.from_config(cfg)
+        gpu_catalog, lane_b_gpus = gpu_catalogs(cfg)
         log.info("GPU choice: %s", ",".join(gpu_catalog.skus or ()) or
                  "OFF (one locked type)")
+        if lane_b_queue is not None:
+            log.info("lane-B GPU choice ([lane_b] funded_pod_skus): %s; measured (WB19): %s",
+                     ",".join(lane_b_gpus.skus) or "none",
+                     ",".join(lane_b_gpus.rent_skus()) or "NONE (every lane B fund refused "
+                     "gpu_rate_unmeasured)")
     lane_a_admission = None
     if cfg is not None and not args.trust_refs:
         lane_a_admission = ChainLaunchAdmission(cfg, client)
@@ -594,6 +610,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         mkt_suites=(tuple(cfg.marketcast.target_suites) if cfg is not None else ()),
         lane_c_closed=lane_c_closed,
         gpu_catalog=gpu_catalog,
+        lane_b_gpus=lane_b_gpus,
         lane_b_queue=lane_b_queue,
         resolve_lane_b_reveal=lane_b_resolver,
         lane_b_targets=lane_b_slots,

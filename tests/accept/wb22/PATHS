@@ -23,6 +23,9 @@ cascade/shared/expert_manifest.py
 # The existing funded lane B dispatch unit test: done() now takes gpu_n=, and
 # the test runs with no step-rate table wired (lane_b_gpus_from_env patched).
 tests/unit/test_lane_b_funded.py
+# The single-target bytes test rebuilds main's body from asdict(); it drops
+# gpu_n (0 = not recorded) the way canonical_body() does.
+tests/unit/test_lane_b_multi_target.py
 # [lane_b] funded_pod_skus: lane B's own list (owner 2026-11-23). Mainnet only;
 # chain.testnet.toml keeps its [round] list.
 chain.toml
