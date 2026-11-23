@@ -13,7 +13,7 @@ tests must stay green.
 | `embargo_hours` | `48.0` | float, `>= 0` (0 = the rev3 rule) | negative, bool, string |
 | `max_windows_per_settlement` | `5000` | int, `>= min_windows` | below `min_windows`, `<= 0`, bool, non-integer, string |
 | `min_fresh_window_share` | `0.5` | float in `[0, 1]` (1 = fresh windows only, the rev3 rule) | outside `[0, 1]`, bool, string |
-| `backtest_weight_cap` | `0.0` | float in `[0, 1)` (0 = off: nothing built or scored) | negative, `>= 1`, bool, string |
+| `backtest_weight_cap` | `0.05` (owner 2026-11-23: ON at launch) | float in `[0, 1)` (0 = off: nothing built or scored) | negative, `>= 1`, bool, string |
 | `backtest_ratio_floor` | `0.85` | float in `(0, 1)` | `<= 0`, `> 1`, bool, string |
 
 `forward_margin_hours` keeps its default `6.0` (rev6.10 (a), "delay eval by
@@ -52,3 +52,12 @@ validates and lands in the built config.
 The keys aren't parsed, so `getattr(cfg.lane_d, key)` fails an `assert`, a
 refused value loads (an `assert`), `unread_keys.py` reports the keys and the
 overlay check refuses unknown keys (both `assert`s).
+
+## Correction (owner 2026-11-23): `backtest_weight_cap` defaults to 0.05
+
+The owner set the default to **0.05** (ON at launch), not 0. At the default
+floor 0.85 and `d_margin` 0.01 the rev6.9 (a) check admits it
+(`1 - 0.85 ** 0.05 ~ 0.0081 < 0.01`). `W2E_DEFAULTS` and both shipped files
+carry 0.05; `test_w2e_backtest_cap_default_is_on_and_meets_the_inequality`
+pins it; the overlay value moves to 0.03 so it still differs from the
+default. Every other assertion is unchanged.
